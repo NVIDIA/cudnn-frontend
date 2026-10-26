@@ -1,18 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The SM107 LEAN index-list sparse d256 DECODE tile (``sm107/sparse_lean_d256_f16.py``: ``mma.sync`` + ``cp.async``, 128 threads, no TMEM /
-TMA / CLC) and the visible-set helper it shares with the tcgen05 tile (``sm107/_sparse_item_common.py``).
+"""The SM107 LEAN index-list sparse d256 DECODE tile (``sm107/sparse_lean_d256_f16.py``: ``mma.sync`` + ``cp.async``, 128 x n_mt threads,
+no TMEM / TMA / CLC) and the visible-set helper it shares with the tcgen05 tile (``sm107/_sparse_item_common.py``).
 
-Host tier (any box): the config validator pins the body's geometry; the kernel source pins (no tcgen05 / TMEM / TMA / mbarrier token, the
-denominator floor exactly twice and SELECTed, the running-max guard CALL, the PDL pair's order, the one cp.async spelling, the explicit ABI);
-the item-helper LIFT keeps the tcgen05 module's cubins byte-identical (the committed md5 record, host sm_107a trace-compiles at
-PYTHONHASHSEED=0); every S_q = 1 rendering trace-compiles for sm_107a within the register budget (REG <= 128 at k 1, STL 0, LDL 0) with the barrier /
-copy counts the header's tables derive.
+Host tier (any box): the config validator pins the body's geometry (n_mt = ceil(S_q x G / 16) m16 tiles, 128 threads each, S_q in 1..4
+through the lean record ``TemplateParamsLean.decode_seqlen_q``); the kernel source pins (no tcgen05 / TMEM / TMA / mbarrier token, the
+denominator floor exactly twice and SELECTed, the running-max guard CALL, the PDL pair's order, the one cp.async spelling, the explicit ABI,
+the per-ROW valid words, the one loader guard); the item-helper LIFT keeps the tcgen05 module's cubins byte-identical (the committed md5
+record, host sm_107a trace-compiles at PYTHONHASHSEED=0); every rendering (S_q 1 / 2 / 3 / 4 x G 1 / 12 / 16 x dense / paged x k) trace-compiles
+for sm_107a within the register budget (REG <= 128 at k 1, STL 0, LDL 0) with the barrier / copy counts the header's tables derive.
 
 Rubin tier (cc 10.7): the ladder (one / two / three / 65 sub-tiles, B x H > 1, the identity bound, a dead sequence, no block_lens, f16, G 16,
-G 1, k 2 / k 4 with dead trailing sub-tiles, dense == paged bitwise), the degenerate matrix row by row, the chain through the pinned combine
-against the UNSPLIT tcgen05 core within the DERIVED budget, capture-safe replays, the PDL arm bitwise the plain arm.
+G 1, k 2 / k 4 with dead trailing sub-tiles, dense == paged bitwise; the S_q 2 / 4 cells at G 12 / 16 / 1), the degenerate matrix row by row,
+the per-row positions of the shared list (the MTP matrix: a completing block for one row only, the identity bound crossing between rows,
+a dead row beside live rows, two tail blocks), the chain through the pinned combine against the UNSPLIT tcgen05 core within the DERIVED
+budget, capture-safe replays, the PDL arm bitwise the plain arm.
 
 Oracles are the sparse module's (``test_sdpa_fwd_sparse_sm107``: the fp32 reference anchored at the step-0 position, the derived
 split-vs-unsplit budget, the paginator, the tcgen05 launcher) -- imported, never re-derived.  Tolerances: ATOL 2e-2 on O and LSE (the sparse
@@ -75,7 +78,9 @@ def _body(src: str) -> str:
 
 
 def _params(**kw):
-    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    """The lean tile's record: the shared ``TemplateParams`` plus the appended ``decode_seqlen_q`` (S_q, default 1) -- a frozen SUBCLASS,
+    so the shared record gains no field and every other template's digest is what it was."""
+    from cudnn.sdpa.fwd.config_sm107 import TemplateParamsLean
 
     base = dict(
         dtype_qkv=2,
@@ -89,16 +94,33 @@ def _params(**kw):
         qsa_list_per_sequence=True,
     )
     base.update(kw)
-    return TemplateParams(**base)
+    return TemplateParamsLean(**base)
 
 
 # ============================================================================ host: the config pins the body's geometry
+def test_lean_record_is_a_frozen_subclass_with_the_appended_seqlen_q_axis():
+    """``TemplateParamsLean`` appends ``decode_seqlen_q`` (default 1) to the shared record as a SUBCLASS (the 2x2 pattern): the base record
+    carries no new field, a base record renders the S_q 1 geometry, and the two records are different template digests."""
+    import dataclasses
+
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    from cudnn.sdpa.fwd.config_sm107 import TemplateParamsLean, make_cfg_d256_sparse_lean
+
+    assert issubclass(TemplateParamsLean, TemplateParams) and "decode_seqlen_q" not in TemplateParams.__dataclass_fields__
+    assert [f.name for f in dataclasses.fields(TemplateParamsLean)][-1] == "decode_seqlen_q" and TemplateParamsLean().decode_seqlen_q == 1
+    assert TemplateParamsLean() != TemplateParams() and hash(TemplateParamsLean(decode_seqlen_q=4)) != hash(TemplateParamsLean())
+    base = TemplateParams(**{f.name: getattr(_params(), f.name) for f in dataclasses.fields(TemplateParams)})
+    assert make_cfg_d256_sparse_lean(base) == make_cfg_d256_sparse_lean(_params()) and make_cfg_d256_sparse_lean(base).S_Q == 1
+
+
 def test_lean_config_pins_the_body_geometry():
     from cudnn.sdpa.fwd.config_sm107 import (
+        LEAN_SPARSE_MAX_SEQLEN_Q,
         LEAN_SPARSE_MAX_SUB_TILES_PER_CTA,
         SMEM_STANDARD_CARVEOUT_BYTES,
         CfgD256SparseLean,
         _validate_cfg_d256_sparse_lean,
+        lean_sparse_n_mt,
         lean_sparse_n_sub,
         lean_sparse_split,
         make_cfg_d256_sparse_lean,
@@ -107,14 +129,35 @@ def test_lean_config_pins_the_body_geometry():
 
     assert lean_sparse_n_sub(512) == 65 and lean_sparse_n_sub(8) == 2 and lean_sparse_n_sub(16) == 3 and lean_sparse_n_sub(256) == 33
     assert [lean_sparse_split(512, k) for k in (1, 2, 3, 4)] == [65, 33, 22, 17]
+    assert LEAN_SPARSE_MAX_SEQLEN_Q == 4 and [lean_sparse_n_mt(s, 12) for s in (1, 2, 3, 4)] == [1, 2, 3, 3]
+    assert [lean_sparse_n_mt(s, 16) for s in (1, 2, 3, 4)] == [1, 2, 3, 4] and [lean_sparse_n_mt(s, 1) for s in (1, 4)] == [1, 1]
     cfg = make_cfg_d256_sparse_lean(_params())
-    assert (cfg.SPLIT, cfg.SUB_TILES_PER_CTA, cfg.STAGES, cfg.THREADS, cfg.N_MT, cfg.SMEM_TOTAL_BYTES) == (65, 1, 1, 128, 1, 40960)
+    assert (cfg.SPLIT, cfg.SUB_TILES_PER_CTA, cfg.STAGES, cfg.THREADS, cfg.N_MT, cfg.S_Q, cfg.SMEM_TOTAL_BYTES) == (65, 1, 1, 128, 1, 1, 40960)
     assert cfg.SMEM_TOTAL_BYTES == 2 * cfg.STAGES * 32 * 512 + cfg.N_MT * 8192 <= SMEM_STANDARD_CARVEOUT_BYTES
     for k, split in ((2, 33), (3, 22), (4, 17), (8, 9)):
         c = make_cfg_d256_sparse_lean(_params(split_kv=split))
         assert (c.SUB_TILES_PER_CTA, c.SPLIT, c.STAGES, c.SMEM_TOTAL_BYTES) == (k, split, 2, 73728), (k, split)
         assert make_cfg_d256_sparse_lean(_params(), sub_tiles_per_cta=k) == c
     assert make_cfg_d256_sparse_lean(_params(split_kv=33), sub_tiles_per_cta=2).SUB_TILES_PER_CTA == 2
+    # the S_q axis: n_mt = ceil(S_q x G / 16) m16 tiles, 128 threads and 8 KiB of S exchange each; the K / V ring is shared by every m-tile
+    for s_q, g, k, n_mt, threads, smem in (
+        (2, 12, 1, 2, 256, 49152),
+        (3, 12, 1, 3, 384, 57344),
+        (4, 12, 1, 3, 384, 57344),
+        (4, 16, 1, 4, 512, 65536),
+        (2, 16, 1, 2, 256, 49152),
+        (4, 1, 1, 1, 128, 40960),
+        (4, 5, 1, 2, 256, 49152),
+        (4, 12, 2, 3, 384, 90112),
+        (4, 16, 2, 4, 512, 98304),
+        (2, 12, 4, 2, 256, 81920),
+    ):
+        c = make_cfg_d256_sparse_lean(_params(decode_seqlen_q=s_q, qh_per_kh=g), sub_tiles_per_cta=k)
+        assert (c.S_Q, c.N_MT, c.WARPS, c.THREADS, c.SMEM_S_BYTES, c.SMEM_TOTAL_BYTES) == (s_q, n_mt, 4 * n_mt, threads, n_mt * 8192, smem), (s_q, g, k)
+        assert c.SMEM_TOTAL_BYTES == 2 * c.STAGES * 32 * 512 + n_mt * 8192 <= SMEM_STANDARD_CARVEOUT_BYTES
+    for s_q in (0, 5, 8, -1):
+        with pytest.raises(ValueError, match="decode_seqlen_q"):
+            make_cfg_d256_sparse_lean(_params(decode_seqlen_q=s_q))
     # accepted arms: G 1 / 12 / 16, dense + paged (16 / 48 / 64), f16, block_lens is a compile() axis (not a config field), top_k 8 / 64 / 256 / 512
     for kw in (
         dict(qh_per_kh=1),
@@ -173,7 +216,10 @@ def test_lean_config_pins_the_body_geometry():
         (dict(SPLIT=64), "SPLIT must be ceil"),
         (dict(SMEM_TOTAL_BYTES=40959), "SMEM_TOTAL_BYTES"),
         (dict(SEQ_KV_LENS_PRESENT=0), "DECODE form"),
-        (dict(S_Q=2), "S_q = 1"),
+        (dict(S_Q=2), "N_MT must be ceil"),  # 24 rows need two m-tiles: a record edited to S_q 2 with one tile is refused
+        (dict(S_Q=5, N_MT=4, WARPS=16, THREADS=512, SMEM_S_BYTES=32768, SMEM_TOTAL_BYTES=65536), "S_q must be in 1..4"),
+        (dict(S_Q=2, N_MT=2, WARPS=8, THREADS=256, SMEM_S_BYTES=16384), "SMEM_TOTAL_BYTES"),  # the exchange grew, the total did not
+        (dict(S_Q=2, N_MT=2, WARPS=8, THREADS=128, SMEM_S_BYTES=16384, SMEM_TOTAL_BYTES=49152), "THREADS must be 128"),
     ):
         with pytest.raises(ValueError, match=match):
             _validate_cfg_d256_sparse_lean(replace(cfg, **bad))
@@ -217,31 +263,57 @@ def test_lean_kernel_source_pins():
     assert "alpha_lo = cute.math.exp2(cute.math.min(ms_lo_old - ms_lo, ZERO, ftz=True), fastmath=True)" in code
     # the accumulator initialisation: opaque zeros (no constant float into the mma asm), -inf running max, 0 sums
     assert code.count("opaque_f32_zero()") == 2 and "m_lo = NEG_INF" in code and "m_hi = NEG_INF" in code and "l_lo = ZERO" in code and "l_hi = ZERO" in code
-    # the valid WORD mask (frost-tile-dsl 10d): one word per sub-tile, bits tested per lane; no apply_mask_chunk, no per-cell compare on key_abs
-    assert "def _valid_word(" in code and code.count("apply_membership_fragment(") == 1 and "apply_mask_chunk" not in code
+    # the valid WORD mask (frost-tile-dsl 10d): one word per ROW PAIR per sub-tile (a lane's rows g / g + 8 may sit in different tokens), bits
+    # tested per lane through the shared op; no apply_mask_chunk, no per-cell compare on key_abs
+    assert "def _valid_word(" in code and code.count("_valid_word(") == 3 and code.count("apply_membership_fragment(") == 2 and "apply_mask_chunk" not in code
+    assert "word_lo = _valid_word(blks, n_vis_lo)" in code and "word_hi = _valid_word(blks, n_vis_hi)" in code
+    assert "if cutlass.const_expr(S_Q == 1):\n        word_hi = word_lo" in code, "at S_q 1 both rows of a lane share the token: one word"
     assert "bits = word >>" not in code and "_select_f32(v0" not in code, "the membership mask is the shared tile_dsl op, never re-spelled per cell"
     assert "from cudnn.frost.tile_dsl.mask import apply_membership_fragment" in code
-    # the gather: cp_async_gather_row16 is the ONLY cp.async spelling, one commit per sub-tile, the wait immediates fold on k
+    # the gather: cp_async_gather_row16 is the ONLY cp.async spelling, one commit per sub-tile (every thread, loader or not: a uniform group
+    # ledger), the copies issued by the first m-tile's four warps only (ONE loader guard, warp-uniform, no barrier inside it), the wait
+    # immediates fold on k
     assert "cp.async" not in code and code.count("cp_async_gather_row16(") == 2 and code.count("cp_async_commit()") == 1
     assert "cp_async_wait(1)" in code and "cp_async_wait(0)" in code
+    assert code.count("if is_loader:") == 1 and "is_loader = warp < cutlass.Int32(WARPS_PER_MT)" in code and code.count("_issue_warp_rows(") == 3
+    assert "if cutlass.const_expr(N_MT == 1):\n        _issue_warp_rows(" in code, "the S_q 1 rendering issues unconditionally (no guard in its program)"
     # the barrier sites: A, X and the folded F (the refill's guard), nothing else; no `if` on a runtime value encloses one
     assert code.count("nvvm.barrier_cta_sync()") == 3
     i_f = code.index("if cutlass.const_expr(t + 2 < SUB_TILES_PER_CTA):\n            nvvm.barrier_cta_sync()")
     assert i_f > 0
+    assert "barrier_cta_sync" not in code[code.index("def _issue_warp_rows(") : code.index("def _kernel(")], "no barrier inside the loader guard's callee"
     # the loops are compile-time (range_constexpr) -- no runtime trip count anywhere in the body
     assert code.count("cutlass.range_constexpr(") >= 12 and re.search(r"\bcutlass\.range\(", code) is None and re.search(r"\bwhile\b", code) is None
     # PDL: the wait textually before the first global read of the body, the release right after it, both under the constexpr
     kbody = code[code.index("def _kernel(") :]  # the helpers above the kernel hold the load SITES; the ORDER question is the kernel body's
     i_pdl = kbody.index("wait_on_dependent_grids()")
     assert kbody.index("launch_dependent_grids()") > i_pdl
-    first_read = min(
-        kbody.index(s) for s in ("visible_bounds(\n        zero", "ld_global(", "_issue_subtile(")
-    )  # the lengths / counts, Q, the ids + table + pool rows
+    first_read = min(kbody.index(s) for s in ("visible_bounds(", "ld_global(", "_issue_subtile("))  # the lengths / counts, Q, the ids + table + pool rows
     assert i_pdl < first_read, "the PDL wait must precede every global read of the kernel body"
     assert "if cutlass.const_expr(use_pdl):" in kbody
-    # the shared helper: visible_bounds + block_id_at are the only visible-set arithmetic (no local count / tail / dead derivation)
+    # the shared helper: visible_bounds + block_id_at are the only visible-set arithmetic (no local count / tail / dead derivation); the helper
+    # is called ONCE PER TOKEN (row s = tok s of a sequence of S_q rows) and the gather's list is the LAST token's (the union of every row's)
     assert "visible_bounds(" in code and "block_id_at(" in code and "n_sel_default" not in code and "tail_lo + rel" not in code
-    assert "eff_seqlen_kv, n_vis = visible_bounds(" in code and "n_vis = cute.math" not in code, "n_vis comes from the helper, not a copy of its line"
+    assert "for s in cutlass.range_constexpr(S_Q):" in kbody and "eff_seqlen_kv, n_vis_s = visible_bounds(" in kbody and "n_vis_tok.append(n_vis_s)" in kbody
+    assert "n_vis = cute.math" not in code and "n_vis_s = cute.math" not in code, "n_vis comes from the helper, not a copy of its line"
+    assert re.search(r"visible_bounds\(\s*cutlass\.Int32\(s\),\s*batch,\s*batch,\s*cutlass\.Int32\(S_Q\),", kbody), "tok = the token, eff_seqlen_q = S_q"
+    # the row map: token-major rows R = s G + g over the CTA's n_mt m16 tiles; a lane's rows are 16 mt + quad and + 8; padding rows read a clamped row
+    for frag in (
+        "mt = cute.arch.make_warp_uniform(warp // cutlass.Int32(WARPS_PER_MT))",
+        "ds = cute.arch.make_warp_uniform(warp - mt * cutlass.Int32(WARPS_PER_MT))",
+        "r_lo = mt * cutlass.Int32(ROWS_PER_MT) + quad",
+        "r_hi = r_lo + cutlass.Int32(ROWS_PER_MT // 2)",
+        "keep_lo = r_lo < cutlass.Int32(ROWS_LIVE)",
+        "s_lo = rc_lo // cutlass.Int32(G)",
+        "g_lo = rc_lo - s_lo * cutlass.Int32(G)",
+        "n_vis_lo = _sel_tok(s_lo, n_vis_tok)",
+        "cutlass.Int64(s_lo) * q_st",
+        "cutlass.Int64(s_lo) * o_st",
+        "cutlass.Int64(s_hi) * o_st",
+        "cutlass.Int64(s_lo) * lse_st",
+        "lse_lane = (tq == zero) & (ds == zero)",
+    ):
+        assert frag in kbody, frag
     # the dense arm's extent clamp (a length past the tensor never reads past it; the TMA form clips the row to zeros) and the paged arm's page bound
     assert "live = (blk >= zero) & in_range & (tok < seqlen_kv)" in code and "live = (page >= zero) & in_range" in code
     # the zero-column table: the clamped table read is steered onto the ids row (a valid address) when max_pages == 0
@@ -260,6 +332,8 @@ def test_lean_kernel_source_pins():
         "STAGES = CFG.STAGES",
         "THREADS = CFG.THREADS",
         "G = CFG.QH_PER_KH",
+        "S_Q = CFG.S_Q",
+        "N_MT = CFG.N_MT",
     ):
         assert name in code, name
 
@@ -398,7 +472,9 @@ from cudnn.frost.template_loader import load_template
 from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 import cudnn.sdpa.fwd.config_sm107 as c107
 path = os.path.join(os.path.dirname(os.path.abspath(c107.__file__)), "kernels", "sm107", module_file)
-mod = load_template(path, TemplateParams(**json.loads(pjson)), tag="render_gate")
+pkw = json.loads(pjson)
+record = c107.TemplateParamsLean if module_file.startswith("sparse_lean_") else TemplateParams  # the lean tile's appended S_q axis; the tcgen05 module keeps the base record
+mod = load_template(path, record(**pkw), tag="render_gate")
 ckw = json.loads(cjson)
 (mod.compile.__wrapped__ if hasattr(mod.compile, "__wrapped__") else mod.compile)(**ckw)
 cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
@@ -509,7 +585,7 @@ def test_item_helper_lift_keeps_the_tcgen05_cubins_byte_identical(tmp_path, rend
     ), f"{rendering}: cubin md5 {res['md5']} != the pre-lift record's {want[rendering]} -- the lift changed the tcgen05 rendering"
 
 
-# ============================================================================ host: every S_q = 1 rendering within the register budget
+# ============================================================================ host: every rendering within the register budget
 def _lean_pkw(**kw):
     base = dict(
         dtype_qkv=2,
@@ -546,33 +622,58 @@ _LEAN_RENDERINGS = {
     "dense_k1_g12_f16": (_lean_pkw(dtype_qkv=3), dict(has_block_lens=True)),
     "paged16_k1_g12_f16_nolens": (_lean_pkw(dtype_qkv=3, paged_kv=True, page_size=16), dict(has_block_lens=False)),
     "dense_k1_g12_top8": (_lean_pkw(qsa_block_topk=8), dict(has_block_lens=True)),
+    # the S_q 2..4 renderings: n_mt = ceil(S_q x G / 16) m-tiles -> .reqntid 128 x n_mt; the per-warp body (and so REG, HMMA, LDSM per warp) is
+    # the S_q 1 body plus the per-row words; the loader stays the first m-tile's four warps (LDGSTS 16 k)
+    "sq2_dense_k1_g12": (_lean_pkw(decode_seqlen_q=2), dict(has_block_lens=True)),
+    "sq3_dense_k1_g12": (_lean_pkw(decode_seqlen_q=3), dict(has_block_lens=True)),
+    "sq4_dense_k1_g12": (_lean_pkw(decode_seqlen_q=4), dict(has_block_lens=True)),
+    "sq4_paged16_k1_g12": (_lean_pkw(decode_seqlen_q=4, paged_kv=True, page_size=16), dict(has_block_lens=True)),
+    "sq4_paged16_k1_g12_pdl": (_lean_pkw(decode_seqlen_q=4, paged_kv=True, page_size=16), dict(has_block_lens=True, use_pdl=True)),
+    "sq4_dense_k1_g16": (_lean_pkw(decode_seqlen_q=4, qh_per_kh=16), dict(has_block_lens=True)),
+    "sq4_dense_k1_g1": (_lean_pkw(decode_seqlen_q=4, qh_per_kh=1), dict(has_block_lens=False)),
+    "sq4_dense_k2_g12": (_lean_pkw(decode_seqlen_q=4, split_kv=33), dict(has_block_lens=True)),
+    "sq4_paged64_k2_g16_f16": (_lean_pkw(decode_seqlen_q=4, qh_per_kh=16, dtype_qkv=3, paged_kv=True, page_size=64, split_kv=33), dict(has_block_lens=True)),
+    "sq2_paged16_k4_g12": (_lean_pkw(decode_seqlen_q=2, paged_kv=True, page_size=16, split_kv=17), dict(has_block_lens=True)),
 }
 
 
 @pytest.mark.parametrize("rendering", sorted(_LEAN_RENDERINGS))
 def test_lean_renderings_trace_compile_within_the_register_budget(tmp_path, rendering):
-    """Host sm_107a trace-compile of every S_q = 1 rendering: REG <= 128 at k 1 (4 CTAs per SM by registers; the DSL emits .reqntid 128 and no .maxnreg,
-    so ptxas sizes the flat body), STL 0 / LDL 0, no USETMAXREG, the header's counts -- BAR.SYNC = 2 k + max(0, k - 2), LDGSTS = 16 k (the
-    K + V copies of every sub-tile), HMMA = 32 k (16 BMM1 + 16 BMM2 per sub-tile per warp), LDSM = 16 k, the bit-word mask (R2P > 0) --
-    and the griddepcontrol pair present iff use_pdl (the OFF rendering carries no token).  Skips where no nvdisasm decodes the cubin."""
+    """Host sm_107a trace-compile of every rendering: .reqntid 128 x n_mt, REG <= 128 at k 1 at every n_mt (the per-warp body does not grow with the
+    m-tile count: 4 CTAs per SM by registers at n_mt 1, 2 at n_mt 3; the DSL emits .reqntid and no .maxnreg, so ptxas sizes the flat body), STL 0 /
+    LDL 0, no USETMAXREG, the header's counts -- BAR.SYNC = 2 k + max(0, k - 2), LDGSTS = 16 k (the K + V copies of every sub-tile, issued by the
+    loader warps only), HMMA = 32 k (16 BMM1 + 16 BMM2 per sub-tile per warp), LDSM = 16 k, the bit-word mask (R2P > 0) -- and the griddepcontrol
+    pair present iff use_pdl (the OFF rendering carries no token).  Skips where no nvdisasm decodes the cubin."""
     from cudnn.sdpa.fwd.config_sm107 import make_cfg_d256_sparse_lean
 
     pkw, ckw = _LEAN_RENDERINGS[rendering]
-    k = make_cfg_d256_sparse_lean(_params(**{kk: v for kk, v in pkw.items()})).SUB_TILES_PER_CTA
+    cfg = make_cfg_d256_sparse_lean(_params(**{kk: v for kk, v in pkw.items()}))
+    k = cfg.SUB_TILES_PER_CTA
     res = _render(tmp_path, "sparse_lean_d256_f16.py", pkw, dict(has_lse=True, **ckw), f"lean_{rendering}", need_sass=True)
-    assert res.get("PTX_REQNTID") == "['128']" and res.get("PTX_MAXNREG") == "0"
+    assert res.get("PTX_REQNTID") == f"['{cfg.THREADS}']" and res.get("PTX_MAXNREG") == "0", (res, cfg.THREADS)
     assert int(res.get("PTX_CPASYNC", 0)) == 16 * k, res
     assert int(res.get("PTX_GRIDDEPCONTROL", -1)) == (2 if ckw.get("use_pdl") else 0), res
     if res["skip"]:
         pytest.skip(str(res["skip"]))
-    # k = 1 (the launch-bound cells' rendering): REG <= 128 = 4 CTAs / SM by registers (measured 70 dense / 72 paged).  k >= 2: ptxas software-
-    # pipelines the unrolled sub-tiles (the next sub-tile's fragments hoisted over the current one's chain) and takes 104..164 registers at
-    # k 2..4 -- 3 CTAs / SM, the SMEM bound of the 72-KiB two-stage form anyway; the bound here is 168 (a -maxrregcount=128 build is a MEASURED
-    # lever of the gate, never assumed).  k 8 (REG 204, 2 CTAs / SM) is outside the fill rule's range and not pinned.
-    reg_bound = 128 if k == 1 else 168
-    assert res["REG"] <= reg_bound, f"REG {res['REG']} > {reg_bound} at k {k}: the fragment plan no longer fits (the occupancy by registers drops)"
-    assert res["LOCAL"] == 0 and res["STL"] == 0 and res["LDL"] == 0, f"spills: {res}"
-    assert res["USETMAXREG"] == 0 and res["R2P"] > 0
+    # k = 1 (the launch-bound cells' rendering): REG <= 128 at EVERY n_mt (measured 66 at n_mt 1 / 2, 79 at n_mt 3, 64 at n_mt 4, 63 at G 1: the
+    # per-warp body does not grow with the m-tile count).  k >= 2: ptxas software-pipelines the unrolled sub-tiles (the next sub-tile's fragments
+    # hoisted over the current one's chain) and takes 104..164 registers at k 2..4 -- 3 CTAs / SM at n_mt 1, the SMEM bound of the 72-KiB
+    # two-stage form anyway; the bound here is 168, AND the hardware's 65536 / THREADS (170 at 384 threads, 128 at 512): at n_mt 4 (S_q 4 x G 16,
+    # 512 threads) the 128 cap binds the k >= 2 body (136 at 384 threads) and ptxas spills a few words (measured STL 7 / LDL 7 at k 2) -- pinned as a
+    # BOUND (frost_test_utils.SPILL_TOLERANCE above the measured count), the one rendering class with a spill; every other rendering STL 0 / LDL 0.
+    # A -maxrregcount=128 build is a MEASURED lever of the gate, never assumed.  k 8 (REG 204, 2 CTAs / SM) is outside the fill rule's range and
+    # not pinned.
+    from frost_test_utils import SPILL_TOLERANCE
+
+    reg_bound = min(128 if k == 1 else 168, 65536 // cfg.THREADS)
+    assert (
+        res["REG"] <= reg_bound
+    ), f"REG {res['REG']} > {reg_bound} at k {k} / {cfg.THREADS} threads: the fragment plan no longer fits (the occupancy by registers drops)"
+    spill_bound = 7 + SPILL_TOLERANCE if (k >= 2 and cfg.THREADS >= 512) else 0
+    assert res["STL"] <= spill_bound and res["LDL"] <= spill_bound, f"spills beyond the measured bound {spill_bound} at k {k} / {cfg.THREADS} threads: {res}"
+    assert (res["LOCAL"] == 0) == (spill_bound == 0) or res["LOCAL"] == 0, res
+    # the bit-word mask: ONE R2P per n-block per word -- 4 per sub-tile at S_q 1 (both rows share the token's word), 8 at S_q >= 2 (a word per row)
+    assert res["USETMAXREG"] == 0 and res["R2P"] == (4 if cfg.S_Q == 1 else 8) * k, (cfg.S_Q, k, res)
     assert res["BAR.SYNC"] == _lean_bar_syncs(k) and res["LDGSTS"] == 16 * k and res["HMMA"] == 32 * k and res["LDSM"] == 16 * k, (k, res)
 
 
@@ -599,7 +700,8 @@ def _pool_terms(pool):
 
 
 class LeanRun:
-    """One compiled lean rendering bound to one set of operands: ``run()`` launches the kernel ALONE into the sentinel-filled fp32 slabs."""
+    """One compiled lean rendering bound to one set of operands: ``run()`` launches the kernel ALONE into the sentinel-filled fp32 slabs.
+    ``q`` is ``[B, S_q, H, D]``: S_q (1..4) selects the rendering (n_mt m-tiles) and the slabs are ``(B x split, S_q, H, D)`` / ``(B x split, H, S_q)``."""
 
     def __init__(self, q, kv, ids, lens, kv_lens, top_k, scale, *, k=1, pdl=False, sentinel=True):
         from cudnn.frost.template_loader import load_template
@@ -612,8 +714,7 @@ class LeanRun:
         self.q, self.ids, self.lens, self.top_k, self.scale = q, ids, lens, top_k, float(scale)
         dev = q.device
         B, S, H, _ = q.shape
-        assert S == 1
-        self.B, self.H = B, H
+        self.B, self.H, self.S = B, H, S
         self.paged = len(kv) == 4
         if self.paged:
             self.k_pool, self.v_pool, self.table, self.P = kv
@@ -633,14 +734,16 @@ class LeanRun:
             paged_kv=self.paged,
             page_size=self.P if self.paged else 0,
             split_kv=split if split > 1 else 1,
+            decode_seqlen_q=S,
         )
         self.mod = load_template(str(_kernels_dir() / "sparse_lean_d256_f16.py"), params, tag="sdpa_fwd_sm107_sparse_lean")
         assert self.mod.CFG.SPLIT == split and self.mod.CFG.SUB_TILES_PER_CTA == k, (self.mod.CFG.SPLIT, split, self.mod.CFG.SUB_TILES_PER_CTA, k)
+        assert self.mod.CFG.S_Q == S and self.mod.CFG.THREADS == 128 * self.mod.CFG.N_MT == 128 * -(-(S * (H // KH)) // 16), (self.mod.CFG.S_Q, S)
         compile_kernel = getattr(self.mod.compile, "__wrapped__", self.mod.compile)
         self.fn = compile_kernel(has_lse=True, has_block_lens=lens is not None, use_pdl=pdl)
         fill = _SENTINEL if sentinel else 0.0
-        self.o_part = torch.full((B * split, 1, H, D), fill, device=dev, dtype=torch.float32)
-        self.lse_part = torch.full((B * split, H, 1), fill, device=dev, dtype=torch.float32)
+        self.o_part = torch.full((B * split, S, H, D), fill, device=dev, dtype=torch.float32)
+        self.lse_part = torch.full((B * split, H, S), fill, device=dev, dtype=torch.float32)
         gmem = cute.AddressSpace.gmem
         half = cutlass.BFloat16 if q.dtype == torch.bfloat16 else cutlass.Float16
 
@@ -669,12 +772,12 @@ class LeanRun:
             block_ids_ptr=P_(ids, cutlass.Int32, 16),
             block_lens_ptr=P_(lens, cutlass.Int32, 4),
             seq_kv_lens_ptr=P_(self.kv_lens, cutlass.Int32, 4),
-            problem_size=(B, H, KH, 1, skv),
+            problem_size=(B, H, KH, S, skv),
             q_strides=tuple(q.stride()[:3]),
             k_strides=k_strides,
             v_strides=v_strides,
-            o_strides=(1 * H * D, H * D, D),
-            lse_strides=(H * 1, 1, 1),
+            o_strides=(S * H * D, H * D, D),
+            lse_strides=(H * S, S, 1),
             scale_softmax_log2=cutlass.Float32(self.scale * math.log2(math.e)),
             block_table_ptr=t_ptr,
             paged_geom=paged_geom,
@@ -685,16 +788,16 @@ class LeanRun:
 
     def combine_exact(self):
         """The exact torch fp32 combine of the slab: O = sum_s w_s O_s / sum_s w_s, LSE = m + log(sum_s w_s) with w_s = exp(lse_s - m); all-dead
-        rows 0 / -inf.  Returns (O [B, 1, H, D] fp32, LSE [B, H, 1] fp32)."""
-        B, S_, H = self.B, self.split, self.H
-        o = self.o_part.view(S_, B, 1, H, D).double()  # split-major: index b + s B -> [s, b]
-        lse = self.lse_part.view(S_, B, H, 1).double()
-        m = lse.amax(dim=0)  # [B, H, 1]
+        rows 0 / -inf.  Returns (O [B, S_q, H, D] fp32, LSE [B, H, S_q] fp32)."""
+        B, S_, H, SQ = self.B, self.split, self.H, self.S
+        o = self.o_part.view(S_, B, SQ, H, D).double()  # split-major: index b + s B -> [s, b]
+        lse = self.lse_part.view(S_, B, H, SQ).double()
+        m = lse.amax(dim=0)  # [B, H, S_q]
         dead = torch.isinf(m) & (m < 0)
         m_safe = torch.where(dead, torch.zeros_like(m), m)
-        w = torch.exp(lse - m_safe[None])  # [S, B, H, 1]; exp(-inf) = 0 for dead chunks
-        den = w.sum(dim=0)  # [B, H, 1]
-        num = (o * w.permute(0, 1, 3, 2)[..., None]).sum(dim=0)  # [B, 1, H, D]
+        w = torch.exp(lse - m_safe[None])  # [S, B, H, S_q]; exp(-inf) = 0 for dead chunks
+        den = w.sum(dim=0)  # [B, H, S_q]
+        num = (o * w.permute(0, 1, 3, 2)[..., None]).sum(dim=0)  # [B, S_q, H, D]
         den_safe = torch.where(dead, torch.ones_like(den), den)
         o_out = num / den_safe.permute(0, 2, 1)[..., None]
         o_out = torch.where(dead.permute(0, 2, 1)[..., None], torch.zeros_like(o_out), o_out)
@@ -707,12 +810,12 @@ class LeanRun:
         from cudnn.sdpa.fwd.kernels.sm100 import split_combine
         from cudnn.sdpa.fwd.sparse_gqa_sm107 import _sparse_combine_decode_grid
 
-        B, H = self.B, self.H
+        B, H, SQ = self.B, self.H, self.S
         dev = self.q.device
-        o = torch.full((B, 1, H, D), _SENTINEL if dtype == torch.bfloat16 else 6.0e4, device=dev, dtype=dtype)
-        lse = torch.full((B, H, 1), _SENTINEL, device=dev, dtype=torch.float32)
+        o = torch.full((B, SQ, H, D), _SENTINEL if dtype == torch.bfloat16 else 6.0e4, device=dev, dtype=dtype)
+        lse = torch.full((B, H, SQ), _SENTINEL, device=dev, dtype=torch.float32)
         cc = torch.cuda.get_device_capability(dev)
-        form = _sparse_combine_decode_grid(B, H, 1, self.split, cc)
+        form = _sparse_combine_decode_grid(B, H, SQ, self.split, cc)
         tag = "bf16" if dtype == torch.bfloat16 else "f16"
         compile_combine = getattr(split_combine.compile_ptr, "__wrapped__", split_combine.compile_ptr)
         owner = compile_combine(dtype_o=tag, dtype_partial="f32", has_lse=True, stats_log2=False, gate=False, dtype_gate=None, decode_grid=form, use_pdl=False)
@@ -723,7 +826,7 @@ class LeanRun:
             self.lse_part.data_ptr(),
             o.data_ptr(),
             lse.data_ptr(),
-            (B, H, 1, D),
+            (B, H, SQ, D),
             self.split,
             tuple(o.stride()[:4]),
             tuple(lse.stride()[:3]),
@@ -735,21 +838,21 @@ class LeanRun:
 
 def _slab_audit(run: LeanRun, ref_lse):
     """Every (chunk, row) slot the combine reads was WRITTEN (no sentinel survives), every slot finite or exactly -inf, and a dead row's
-    slots are exactly 0 / -inf on every chunk."""
+    slots are exactly 0 / -inf on every chunk (``ref_lse`` is ``[B, H, S_q]``: a dead row is one (sequence, head, token))."""
     o, lse = run.o_part, run.lse_part
     assert not (o == _SENTINEL).any(), "an O partial slot was never written"
     assert not (lse == _SENTINEL).any(), "an LSE partial slot was never written"
     assert torch.isfinite(o).all(), "a non-finite O partial"
     assert (torch.isfinite(lse) | (torch.isinf(lse) & (lse < 0))).all(), "an LSE partial that is neither finite nor -inf"
-    dead = torch.isinf(ref_lse)  # [B, H, 1]
+    dead = torch.isinf(ref_lse)  # [B, H, S_q]
     if dead.any():
-        S_, B = run.split, run.B
-        H_ = run.H
-        o4 = o.view(S_, B, H_, D)  # tok 0 squeezed: [chunk, b, head, d]
-        l4 = lse.view(S_, B, H_, 1)
-        dm = dead.view(1, B, H_, 1).expand(S_, B, H_, 1)
-        assert (l4[dm] == float("-inf")).all(), "a dead row's LSE partial must be -inf on every chunk"
-        assert (o4[dm[..., 0]] == 0).all(), "a dead row's O partial must be 0 on every chunk"
+        S_, B, H_, SQ = run.split, run.B, run.H, run.S
+        o5 = o.view(S_, B, SQ, H_, D)  # [chunk, b, tok, head, d]
+        l4 = lse.view(S_, B, H_, SQ)
+        dm_l = dead.view(1, B, H_, SQ).expand(S_, B, H_, SQ)
+        dm_o = dead.permute(0, 2, 1).reshape(1, B, SQ, H_).expand(S_, B, SQ, H_)
+        assert (l4[dm_l] == float("-inf")).all(), "a dead row's LSE partial must be -inf on every chunk"
+        assert (o5[dm_o] == 0).all(), "a dead row's O partial must be 0 on every chunk"
 
 
 def _check_outputs(o, lse, ref_o, ref_lse, *, what: str):
@@ -784,17 +887,19 @@ def _lean_cell(
     scale=None,
     pdl=False,
     vs_core=True,
+    S_q=1,
 ):
     """One lean cell: two launches bitwise, the slab audit, the exact combine within ATOL of the fp32 oracle, the pinned combine within ATOL
     too, and -- ``vs_core`` -- the lean O / LSE against the UNSPLIT tcgen05 core within the DERIVED budget (never bitwise across tiles); a
-    paged twin (``paged = (P, hnd)``) BITWISE the dense slab."""
+    paged twin (``paged = (P, hnd)``) BITWISE the dense slab.  ``S_q`` (appended) = the step's rows per sequence: the shared list anchored at
+    ``pos_0 = L_b - S_q``, every row at its own position (the oracle is the pos0-anchored reference)."""
     S = _sparse_suite()
-    q, kk, vv, g = S._inputs(B, 1, H, KH, dtype, seed, SKV=SKV)
-    ids, lens = S._decode_lists(list_kind, B, 1, top_k, kv_lens, g)
+    q, kk, vv, g = S._inputs(B, S_q, H, KH, dtype, seed, SKV=SKV)
+    ids, lens = S._decode_lists(list_kind, B, S_q, top_k, kv_lens, g)
     lens_arg = lens if block_lens else None
     scale = (1.0 / math.sqrt(D)) if scale is None else float(scale)
     ref_o, ref_lse, pv_abs = S._reference_decode(q, kk, vv, ids, lens_arg, kv_lens, scale, top_k)
-    with process_watchdog(300, f"lean cell B {B} SKV {SKV} k {k} compile + first dispatch"):
+    with process_watchdog(300, f"lean cell B {B} SKV {SKV} S_q {S_q} k {k} compile + first dispatch"):
         run = LeanRun(q, (kk, vv), ids, lens_arg, kv_lens, top_k, scale, k=k, pdl=pdl)
         run.run()
         torch.cuda.synchronize()
@@ -865,6 +970,174 @@ def test_lean_tile_ladder(B, SKV, kv_lens, H, KH, dtype, top_k, list_kind, k, pa
     print(
         f"\nlean ladder B={B} S_kv={SKV} lens={kv_lens} {H}/{KH} {dtype} top_k={top_k} k={k} split={res['split']} paged={paged}: exact-combine max|dO| {res['max_o']:.5f} max|dLSE| {res['max_lse']:.6f}; "
         f"pinned combine (form {res['combine_form']}) max|dO| {res['combine_max_o']:.5f}; vs unsplit tcgen05 core max|dO| {res['core_max_d']:.3e} = {res['core_ratio']:.3f} of the derived budget, |dLSE| {res['core_lse_d']:.2e}; dead rows {res['dead']}"
+    )
+
+
+# ============================================================================ Rubin: the S_q 2..4 rows (n_mt m-tiles over one gathered sub-tile)
+@requires_rubin
+@pytest.mark.parametrize(
+    "S_q, B, SKV, kv_lens, H, KH, dtype, top_k, k, paged, block_lens",
+    [
+        pytest.param(2, 1, 8192, [8192], 24, 2, torch.bfloat16, 512, 1, None, True, id="Sq2-G12-two-m-tiles"),
+        pytest.param(4, 1, 8192, [8192], 24, 2, torch.bfloat16, 512, 1, None, True, id="Sq4-G12-three-m-tiles-65-sub-tiles"),
+        pytest.param(4, 1, 8192, [8192], 24, 2, torch.bfloat16, 512, 2, None, True, id="Sq4-G12-k2-split33"),
+        pytest.param(3, 1, 8192, [8192], 24, 2, torch.bfloat16, 512, 1, None, True, id="Sq3-G12"),
+        pytest.param(4, 1, 8192, [8192], 16, 1, torch.bfloat16, 512, 1, None, True, id="Sq4-G16-four-m-tiles"),
+        pytest.param(4, 1, 8192, [8192], 2, 2, torch.bfloat16, 512, 1, None, True, id="Sq4-G1-mha-one-m-tile-four-rows"),
+        pytest.param(2, 1, 8192, [8192], 16, 1, torch.float16, 512, 1, None, False, id="Sq2-G16-f16-no-block-lens"),
+        pytest.param(4, 4, 8192, [8192, 2052, 4097, 7000], 24, 2, torch.bfloat16, 512, 1, (16, True), True, id="Sq4-B4-paged16-HND-bitwise-dense"),
+        pytest.param(2, 4, 8192, [8192, 2052, 4097, 7000], 24, 2, torch.bfloat16, 512, 2, (64, False), False, id="Sq2-B4-paged64-NHD-k2-no-block-lens"),
+        pytest.param(4, 2, 8192, [8192, 300], 24, 2, torch.bfloat16, 64, 1, (48, True), True, id="Sq4-top64-paged48-HND"),
+        pytest.param(4, 1, 8192, [8192], 24, 2, torch.bfloat16, 8, 1, None, True, id="Sq4-top8-two-sub-tiles"),
+    ],
+)
+def test_lean_tile_ladder_s_q_rows(S_q, B, SKV, kv_lens, H, KH, dtype, top_k, k, paged, block_lens):
+    """The S_q 2..4 renderings on the ladder's cells: every row at its own position over ONE gathered sub-tile per CTA (n_mt m-tiles, 128 threads
+    each); two launches bitwise, every slot written, the exact and the pinned combine within ATOL of the pos0-anchored oracle, paged == dense
+    bitwise, and the lean O / LSE against the UNSPLIT tcgen05 core (which runs every row as its own item) within the derived budget."""
+    res, _ = _lean_cell(B=B, SKV=SKV, kv_lens=kv_lens, H=H, KH=KH, dtype=dtype, top_k=top_k, k=k, paged=paged, block_lens=block_lens, S_q=S_q)
+    print(
+        f"\nlean S_q={S_q} B={B} S_kv={SKV} lens={kv_lens} {H}/{KH} {dtype} top_k={top_k} k={k} split={res['split']} paged={paged}: exact-combine max|dO| {res['max_o']:.5f} max|dLSE| {res['max_lse']:.6f}; "
+        f"pinned combine (form {res['combine_form']}) max|dO| {res['combine_max_o']:.5f}; vs unsplit tcgen05 core max|dO| {res['core_max_d']:.3e} = {res['core_ratio']:.3f} of the derived budget, |dLSE| {res['core_lse_d']:.2e}; dead rows {res['dead']}"
+    )
+
+
+@requires_rubin
+@pytest.mark.parametrize("B", [1, 4], ids=["B1", "B4"])
+@pytest.mark.parametrize("r", [0, 1, 2, 3], ids=[f"pos0-mod4-{r}" for r in range(4)])
+@pytest.mark.parametrize("S_q", [2, 3, 4], ids=[f"Sq{s}" for s in (2, 3, 4)])
+def test_lean_rows_of_one_sequence_see_their_own_positions(S_q, r, B):
+    """The shared-list semantics PER ROW against ``qsa_visible_mask`` (the sparse module's MTP matrix on the lean route): ``S_q`` rows per sequence
+    share the step-0 list at every residue ``r = pos_0 mod 4`` and ``B`` in {1, 4} (the sparse module's lengths: ``B 4`` = the SHORT sequence, the
+    IDENTITY-BOUND sequence (exactly 512 complete blocks at step 0: the 512-list omits one at r 3), the saturated one and the DEGENERATE
+    ``S_q - 1``-token sequence -- row 0 dead beside the live tail-only rows).  Per live row: the kernel (exact combine) equals the pos0-anchored
+    oracle within ATOL; the per-row-tail oracle (which hides the block completed between ``pos_0`` and ``pos_j``) differs on EXACTLY the rows
+    ``j >= 3 - r`` (r < 3) -- the completing block belongs to one row and not its predecessors -- and on the SHORT sequence the kernel sits
+    beyond the budget from that reading there (natural teeth: the per-row word bites); ``(pos_0 + 1) % 4 == 0`` (r 3) = row 0 without a tail
+    block and rows >= 1 with one; two tail blocks at (r, j) in {(1, 3), (2, 2), (2, 3)}; dead rows exactly 0 / -inf on every chunk; two launches
+    bitwise; vs the UNSPLIT tcgen05 core within the derived budget; B 4: the paged read bitwise the dense read."""
+    S = _sparse_suite()
+    H, KH, top_k = 24, 2, 512
+    dtype = torch.bfloat16
+    kv_lens = S._mtp_kv_lens(S_q, r, B)
+    SKV = max(kv_lens)
+    n_tail, teeth_rows, _row_4k3 = S._mtp_rows(S_q, r)
+    q, kk, vv, g = S._inputs(B, S_q, H, KH, dtype, seed=300 + 16 * S_q + 4 * r + B, SKV=SKV)
+    ids, lens = S._decode_lists("shuffled", B, S_q, top_k, kv_lens, g)
+    scale = 1.0 / math.sqrt(D)
+    ref_o, ref_lse, pv_abs = S._reference_decode(q, kk, vv, ids, lens, kv_lens, scale, top_k)
+    alt_o, alt_lse, _ = S._reference_decode(q, kk, vv, ids, lens, kv_lens, scale, top_k, pos0_anchor=False)
+    run = _lean_direct(q, kk, vv, ids, lens, kv_lens, top_k, scale)
+    _slab_audit(run, ref_lse)
+    o1, l1 = run.o_part.clone(), run.lse_part.clone()
+    run.o_part.fill_(_SENTINEL)
+    run.lse_part.fill_(_SENTINEL)
+    run.run()
+    torch.cuda.synchronize()
+    assert torch.equal(o1, run.o_part) and torch.equal(l1, run.lse_part), "two launches must be bitwise"
+    o, lse = run.combine_exact()
+    max_o, max_lse = _check_outputs(o, lse, ref_o, ref_lse, what=f"MTP S_q {S_q} r {r} B {B}")
+    oracle = S._oracle()
+    dev = q.device
+    t = torch.arange(SKV, device=dev)
+    report = []
+    for b in range(B):
+        L = kv_lens[b]
+        pos0 = L - S_q
+        if pos0 < 0:
+            dead_rows = min(S_q, -pos0)
+            assert torch.isinf(ref_lse[b, :, :dead_rows]).all() and torch.isfinite(ref_lse[b, :, dead_rows:]).all()
+            assert torch.isinf(lse[b, :, :dead_rows]).all() and (o[b, :dead_rows] == 0).all(), "the dead rows of the short sequence"
+            report.append(f"seq {b} L={L}: {dead_rows} dead row(s), the rest tail-only")
+            continue
+        assert pos0 % 4 == r
+        vis0, vis_row = S._row_masks(oracle, ids[b], lens[b], L, S_q, SKV, top_k)
+        tail_start = 4 * ((pos0 + 1) // 4)
+        for j in range(S_q):
+            pos_j = pos0 + j
+            assert torch.equal(vis0[j] & (t >= tail_start), (t >= tail_start) & (t <= pos_j)), f"seq {b} row {j}: the tail must be [{tail_start}, {pos_j}]"
+            assert pos_j // 4 - tail_start // 4 + 1 == n_tail[j], f"seq {b} row {j}: tail blocks"
+            assert not vis0[j][t > pos_j].any(), f"seq {b} row {j}: a key past the row's own position is visible"
+            differs = not torch.equal(vis0[j], vis_row[j])
+            assert differs == (j in teeth_rows), f"seq {b} row {j}: the two readings {'differ' if differs else 'coincide'}"
+            if differs:
+                assert not torch.equal(ref_o[b, j], alt_o[b, j])
+            else:
+                assert torch.equal(ref_o[b, j], alt_o[b, j]) and torch.equal(ref_lse[b, :, j], alt_lse[b, :, j])
+        if L < 100:  # the short sequence: the hidden block's four keys weigh more than the budget -- the per-row word is what keeps them
+            for j in teeth_rows:
+                d = float((o[b, j] - alt_o[b, j]).abs().max())
+                dl = float((lse[b, :, j] - alt_lse[b, :, j]).abs().max())
+                assert (
+                    d > ATOL and dl > ATOL
+                ), f"seq {b} row {j} (pos {pos0 + j}): the kernel must see the block completed before its position ({d:.4f} / {dl:.4f})"
+                report.append(f"seq {b} row {j} teeth {d:.4f}/{dl:.4f}")
+    # vs the UNSPLIT tcgen05 core (every row its own item there; one gathered sub-tile for all rows here): the derived budget, never bitwise
+    core = S._launch_decode(q, (kk, vv), ids, lens, kv_lens, top_k, scale, split=1, launches=1)
+    co, cl = core[0][0], core[0][1]
+    S._check([(co, cl)], ref_o, ref_lse)
+    live = ~torch.isinf(ref_lse).permute(0, 2, 1)
+    d, ratio = S._split_vs_unsplit(o.to(dtype).float(), co.float(), dtype, pv_abs, live)
+    lse_d = float((lse - cl)[~torch.isinf(ref_lse)].abs().max())
+    assert ratio <= 1.0 and lse_d <= ATOL, f"lean vs the unsplit tcgen05 core: {ratio:.3f} of the derived budget (max |dO| {d:.3e}), |dLSE| {lse_d:.2e}"
+    extra = f"; vs tcgen05 core {d:.3e} = {ratio:.3f} of the budget"
+    if B == 4:
+        P, hnd = (16, True) if S_q % 2 == 0 else (64, False)
+        kp, vp, table = S._paginate(kk, vv, kv_lens, P, hnd, "nan", g)
+        with process_watchdog(300, f"lean MTP paged {P} compile + first dispatch"):
+            pr = LeanRun(q, (kp, vp, table, P), ids, lens, kv_lens, top_k, scale)
+            pr.run()
+            torch.cuda.synchronize()
+        assert torch.equal(pr.o_part, run.o_part) and torch.equal(pr.lse_part, run.lse_part), f"MTP S_q {S_q} r {r} paged {P}: differs from the dense read"
+        extra += f"; paged {P} {'HND' if hnd else 'NHD'} bitwise the dense read"
+    print(
+        f"\nlean MTP S_q={S_q} r={r} B={B} lens={kv_lens}: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}; n_tail {n_tail}; teeth rows {teeth_rows}; "
+        + "; ".join(report)
+        + extra
+    )
+
+
+@requires_rubin
+def test_lean_kv_lens_zero_and_shorter_than_s_q_at_s_q_4():
+    """S_q 4 over sequences of 0 / 3 / 4 / 1 tokens (``kv_lens`` below or at the row count): L 0 -> every row dead; L 3 -> row 0 dead (pos -1), rows
+    1..3 at positions 0..2 see the open block 0 only (count 0); L 4 -> every row live, the one block; L 1 -> rows 0..2 dead, row 3 at position 0.
+    Dead rows exactly 0 / -inf on every chunk (the slab audit), the live rows within ATOL, two launches bitwise, and the S_q 4 rendering's
+    captured closure replays bitwise the eager launch with CHANGED inputs."""
+    S = _sparse_suite()
+    B, S_q, H, KH, top_k, SKV = 4, 4, 24, 2, 512, 16
+    kv_lens = [0, 3, 4, 1]
+    q, kk, vv, g = S._inputs(B, S_q, H, KH, torch.bfloat16, 37, SKV=SKV)
+    ids, lens = S._decode_lists("full", B, S_q, top_k, kv_lens, g)
+    scale = 1.0 / math.sqrt(D)
+    ref_o, ref_lse, _ = S._reference_decode(q, kk, vv, ids, lens, kv_lens, scale, top_k)
+    dead = torch.isinf(ref_lse)  # [B, H, S_q]
+    assert dead[0].all() and dead[1, :, 0].all() and not dead[1, :, 1:].any() and not dead[2].any() and dead[3, :, :3].all() and not dead[3, :, 3].any()
+    run = _lean_direct(q, kk, vv, ids, lens, kv_lens, top_k, scale)
+    _slab_audit(run, ref_lse)
+    o1, l1 = run.o_part.clone(), run.lse_part.clone()
+    run.o_part.fill_(_SENTINEL)
+    run.lse_part.fill_(_SENTINEL)
+    run.run()
+    torch.cuda.synchronize()
+    assert torch.equal(o1, run.o_part) and torch.equal(l1, run.lse_part), "two launches must be bitwise"
+    o, lse = run.combine_exact()
+    max_o, max_lse = _check_outputs(o, lse, ref_o, ref_lse, what="kv_lens [0, 3, 4, 1] at S_q 4")
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side):
+        run.run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=side):
+        run.run()
+    for value in (2.0, -0.5):
+        vv.fill_(value)
+        run.o_part.fill_(-17.0)
+        graph.replay()
+        torch.cuda.synchronize()
+        eager = _lean_direct(q, kk, vv, ids, lens, kv_lens, top_k, scale)
+        assert torch.equal(run.o_part, eager.o_part) and torch.equal(run.lse_part, eager.lse_part), f"replay with V = {value} differs from the eager launch"
+    print(
+        f"\nkv_lens {kv_lens} at S_q 4: dead rows {int(dead.sum())} exact, live rows max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}; capture-safe (changed-input replays bitwise eager)"
     )
 
 
