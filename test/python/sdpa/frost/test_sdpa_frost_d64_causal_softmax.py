@@ -33,14 +33,25 @@ def _reference(values, bottom_right, scale):
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("bottom_right,with_sink", [(False, False), (True, False), (True, True)])
 @torch_fork_set_rng(seed=1391)
-def test_d64_causal_softmax_rebind_and_replay(cga, packed, bottom_right, with_sink, cudnn_handle):
+def test_d64_causal_softmax_rebind_and_replay(cga, packed, bottom_right, with_sink, cudnn_handle, monkeypatch):
     import cudnn
     from cudnn.engines.manifest import MANIFEST
+    from cudnn.sdpa.fwd import api_dsl
 
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("native SM100-family D64 prefill")
     original_stream = cudnn.get_stream(cudnn_handle)
     capture = None
+    loaded_modules = []
+    original_load = api_dsl.load_template
+
+    def record_template(path, params, *args, **kwargs):
+        module = original_load(path, params, *args, **kwargs)
+        if path.endswith("/sm100/prefill_d128_f16.py") and params.d_flavor == 64:
+            loaded_modules.append(module)
+        return module
+
+    monkeypatch.setattr(api_dsl, "load_template", record_template)
     b, hq, hk, sq, sk, d = 2, 8, 2, 769, 641, 64
     if bottom_right:
         sq, sk = sk, sq
@@ -84,6 +95,10 @@ def test_d64_causal_softmax_rebind_and_replay(cga, packed, bottom_right, with_si
         graph.select_plan(graph.get_execution_plan_count() - 1)
         graph.check_support()
         graph.build_plans()
+        assert loaded_modules, "the graph must compile the native D64 prefill module"
+        for module in loaded_modules:
+            assert module.CFG.CTA_MMA == cga
+            assert module._E2E_ENABLED is (torch.cuda.get_device_capability() == (10, 0)), "the graph lost its architecture-specific exp2 path"
         workspace = torch.empty(max(1, graph.get_workspace_size()), device="cuda", dtype=torch.uint8)
 
         def bindings():
