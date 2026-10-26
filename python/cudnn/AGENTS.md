@@ -365,10 +365,11 @@ DSL satisfies your kernel.**
 - Check the DSL compiler's CUDA version separately when a kernel depends on
   its toolkit flavor: `from cutlass.base_dsl.version_info import CUDA_VERSION`.
   `torch.version.cuda` and `CUDA_HOME` do not identify the compiler selected by
-  the DSL wheel. QSA's 12Q/1KV two-pass key kernel, for example, compiles with
-  the CUDA 13 flavor but crashes the CUDA 12 compiler in DSL 4.7/4.8; its
-  `check_support` rejects that compiler before JIT compilation, and its tests
-  exercise the rejection rather than crashing or silently skipping the gate.
+  the DSL wheel. QSA's 12Q/1KV key-major kernel, for example, compiles with
+  the CUDA 13 flavor but crashes the CUDA 12 compiler in DSL 4.7/4.8; both
+  QSA backward entries decline that compiler for 12Q/1KV before JIT
+  compilation, and the tests exercise the decline rather than crashing or
+  silently skipping the gate.
 - Known floors — extend this list when you take a dependency on a newer API,
   and say so in the PR body if it raises the floor of a user-facing op:
   `cutlass.experimental.*` (primitives, `cuda.tensor_map`; everything under

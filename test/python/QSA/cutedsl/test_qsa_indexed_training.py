@@ -17,13 +17,6 @@ from QSA.cutedsl.test_qsa import make_inputs, reference, assert_close, supported
 pytestmark = pytest.mark.L0
 
 
-@pytest.fixture(autouse=True)
-def indexed_supported_device():
-    # The shared bitmap-QSA fixture also admits SM107; this indexed API does not.
-    if torch.cuda.is_available() and torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("Indexed QSA requires SM100 or SM103")
-
-
 def indices_for(inputs):
     total, blocks = inputs["sel_blocks"].shape
     tokens = inputs["block_first"][None, :, None] + torch.arange(4, device="cuda", dtype=torch.int32)
@@ -150,11 +143,11 @@ assert not hasattr(cudnn.DSA, "qsa_indexed_backward")
 
 @pytest.fixture
 def canonical_inputs(supported_gpu):
-    from cudnn.QSA.two_pass.api import _dsl_cuda_version
-    from QSA.cutedsl.two_pass_reference import make_inputs as canonical
+    from cudnn.QSA.kernels import bprop_sm100 as engine
+    from QSA.cutedsl.qsa_index_list_reference import make_inputs as canonical
 
-    if _dsl_cuda_version()[0] < 13:
-        pytest.skip("12Q/1KV sparse two-pass requires the CUDA 13 DSL compiler")
+    if engine.dsl_cuda_major() < 13:
+        pytest.skip("12Q/1KV QSA backward requires the CUDA 13 DSL compiler")
     return canonical
 
 
@@ -174,32 +167,22 @@ def _canonical_call(inputs, **kwargs):
 
 
 @pytest.mark.parametrize("total, bounds", [(4099, None), (32769, None), (32769, [0, 3, 3, 32769])])
-def test_public_causal_topk_uses_two_pass_and_native_saved_state(canonical_inputs, monkeypatch, total, bounds):
-    from QSA.cutedsl.two_pass_reference import reference_backward, assert_grads_close
-    from cudnn.QSA.two_pass import api as two_pass
+def test_public_causal_topk_uses_native_saved_state(canonical_inputs, total, bounds):
+    from QSA.cutedsl.qsa_index_list_reference import reference_backward, assert_grads_close
 
     inputs = canonical_inputs(total, 71, h_kv=1, cu_seqlens=bounds, width=2052, saved_output_dtype=torch.float32)
     # Use saved state from the actual public forward, not a private test-only path.
     out = qsa_indexed_forward(inputs["q"], inputs["k"], inputs["v"], inputs["topk_idxs"])
     inputs["out"], inputs["lse"] = out["out_fp32"], out["lse"]
-    calls = []
-    original = two_pass._backward
-
-    def record(*args, **kwargs):
-        calls.append((args[3].data_ptr(), args[5].data_ptr()))
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(two_pass, "_backward", record)
     actual = _canonical_call(inputs)
     expected = reference_backward(**{k: inputs[k] for k in ("q", "k", "v", "out", "dout", "lse", "topk_idxs")})
     for name, value, ref in zip(("dq", "dk", "dv"), actual, expected):
         assert_grads_close(name, value, ref)
-    assert calls == [(inputs["out"].data_ptr(), inputs["lse"].data_ptr())]
     assert tuple(actual.keys()) == ("dq", "dk", "dv")
 
 
 def test_public_causal_topk_graph_refreshes_packed_bounds(canonical_inputs):
-    from QSA.cutedsl.two_pass_reference import reference_backward, assert_grads_close
+    from QSA.cutedsl.qsa_index_list_reference import reference_backward, assert_grads_close
 
     inputs = canonical_inputs(32773, 73, h_kv=1, cu_seqlens=[0, 3, 32773], width=2052, saved_output_dtype=torch.float32)
     _canonical_call(inputs)
@@ -226,13 +209,7 @@ def test_public_causal_topk_graph_refreshes_packed_bounds(canonical_inputs):
         graph.reset()
 
 
-def test_general_selection_never_dispatches_to_two_pass(supported_gpu, monkeypatch):
-    from cudnn.QSA.two_pass import api as two_pass
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("general/empty selections reached the canonical backend")
-
-    monkeypatch.setattr(two_pass, "_backward", forbidden)
+def test_general_selection_keeps_empty_rows(supported_gpu):
     inputs = make_inputs((3, 9), 12, 1, empty=True)
     small = indices_for(inputs)
     indices = torch.full((12, 2052), -1, dtype=torch.int32, device="cuda")

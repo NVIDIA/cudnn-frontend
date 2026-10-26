@@ -83,15 +83,23 @@ visibility and tail handling remain part of the QSA contract; this reuse does
 not make QSA and DeepSeek attention interchangeable. Numerical rounding and
 top-k tie rules must also be checked before replacing an external selector.
 
-The [internal two-pass backend](qsa_two_pass.md) has a different
-saved-state and selection contract: 12Q/1KV or 24Q/2KV, canonical block lists,
-optional packed `cu_seqlens`, and native FP32 saved output / `[Hq, T]` LSE
-(or the earlier BF16 saved output / `[T, Hq]` LSE pair). For 12Q/1KV, the public
-`qsa_indexed_backward(..., selection_mode="causal_topk")` selects this backend
-when the caller declares the stricter [complete-block and causal-tail contract](qsa_indexed.md#complete-blocks-and-causal-tails).
-The default indexed and bitmap calls retain their general selection contracts.
-The implementation remains under `cudnn.QSA`; no public op class or
-algorithm-specific entry is added.
+On every architecture both training entries run one backward engine
+(`cudnn.QSA.kernels.bprop_sm100`): the causal prefix of every sequence
+(its first 20480 queries, or all of them below 22528 tokens) on a dense
+key-tile kernel that masks per key token through a bitmap, the remaining
+queries on a query-major pass that writes P / dS records and a key-major pass
+that accumulates dK / dV through an inverted block-to-query index, so no
+per-pair floating-point atomics are issued. The records are bounded by query
+windows (about 2.7 GiB of scratch at 128K for 12Q/1KV, 5.1 GiB for 24Q/2KV).
+Blocks may start anywhere and the key bounds may cut them. A query past the
+dense prefix holds at most 513 selected blocks (top-512 and the causal tail);
+a longer list contributes nothing and leaves that query's dQ NaN. The 12Q/1KV
+flavor needs the CUDA 13 build of CuTe DSL. The bitmap entry reads the sequences from `tok_base`;
+`qsa_indexed_backward` describes packed documents through
+`selection_mode="causal_topk"` with `cu_seqlens` ([details](qsa_indexed.md#complete-blocks-and-causal-tails))
+and otherwise treats the rows as one sequence, which stays exact for packed
+documents (the selection decides which keys a query sees) but serves only the
+first document on the dense prefix path.
 
 The experimental QSA entries previously under `cudnn.DSA` and
 `cudnn.gated_attention_block.qsa_select*` have moved without compatibility
@@ -150,14 +158,15 @@ Backward compacts the current selection, computes
 `delta = sum(grad_out * out_fp32, dim=-1)`, reconstructs probabilities from QK
 and LSE, and forms dQ/dK/dV. Accumulation uses FP32; output gradients use BF16.
 K/V gradient contributions from all query heads are summed. Floating-point
-atomic reductions can change low bits between runs.
-On Blackwell and Rubin, the 12:1 path pairs adjacent queries and gathers their selected
-block union. Owner bits retain each query's mask while sharing K/V loads.
-A device-side K/V scan selects a per-query fallback when nonfinite values are
-present. The fallback reuses the compact union but applies each query's owner
-bits and bounds before dQ arithmetic, preventing a masked NaN from crossing
-between queries or packed sequences. Both launches test the current device flag;
-only one computes gradients. The flag is rebuilt during CUDA graph replay.
+reductions can change low bits between runs. The dense prefix of each sequence
+runs on a key-tile kernel whose two CTAs share a key tile and accumulate dK / dV
+on chip; the remaining queries write bf16 P / dS records that a key-major pass
+sums per block, so no per-pair floating-point atomics are issued. A nonfinite
+K / V value of a masked token adds exact zeros; one of a selected token poisons
+the queries that select it and that block's dK / dV, nothing else (a
+nonfinite Q or dO value can also reach the dQ of the query pair processed just
+before it). Every content-dependent decision is made on the device, so CUDA
+graph replay follows the current inputs.
 
 For each query head and its shared KV head, the backward equations are:
 
@@ -185,7 +194,9 @@ full score or probability matrices.
 | Backward | Final cast | BF16 `dq`, `dk`, `dv` |
 
 The selection bitmap must include any desired causal tail. The implementation
-does not add a tail automatically and does not truncate selection at 512 blocks.
+does not add a tail automatically. The forward does not truncate selection at
+512 blocks; the backward attends keys up to the query only and caps queries past
+the dense prefix at 513 blocks (above).
 Pass the same Q/K/V, selection, metadata, and scale to both calls. Casting `out`
 back to FP32 does not reconstruct `out_fp32`.
 
@@ -199,8 +210,8 @@ The public functions select one of two architecture families internally:
 
 | Family | Forward kernel | Backward kernel |
 |---|---|---|
-| Blackwell SM100/SM103 | `cudnn_frost_qsa_fprop_sm100` | `cudnn_frost_qsa_bprop_sm100` |
-| Rubin SM107 | `cudnn_frost_qsa_fprop_sm107` | Paired `cudnn_frost_qsa_bprop_sm100` (12:1), `cudnn_frost_qsa_bprop_sm107` (24:2) |
+| Blackwell SM100/SM103 | `cudnn_frost_qsa_fprop_sm100` | `cudnn_qsa_bwd_*` (dense pair, query-major, key-major and index kernels) |
+| Rubin SM107 | `cudnn_frost_qsa_fprop_sm107` | `cudnn_qsa_bwd_*` (the same engine, compiled for SM107) |
 
 Kernel symbols are implementation details; Rubin kernels compile for SM107.
 Rubin compaction scans 16 selection bytes per lane and preserves block order.
@@ -211,12 +222,13 @@ Calls allocate outputs and scratch on the input device and enqueue work on its
 current PyTorch CUDA stream. Warm up the chosen head geometry before CUDA graph
 capture. Compiled kernels reuse symbolic token and block extents; metadata is
 rebuilt from the current bitmap on each call. Forward scratch includes an int32
-`[T, NB]` compact-index buffer and int32 `[T]` counts. The 12:1 backward path on both families
-uses `[ceil(T/2), NB]` indices and `[ceil(T/2)]` counts; other backward paths use
-the forward shapes. Backward also uses FP32 gradient accumulators and `[T, Hq]`
-delta. The paired backward safety scan also uses four int32 flags per 1024
-K/V elements plus one reduced flag. The dense route also uses packed token
-masks, tile ranges and K/V check flags. These buffers are rebuilt on each call.
+`[T, NB]` compact-index buffer and int32 `[T]` counts. Backward uses the same
+compact indices and counts plus one workspace: FP32 dQ / dK / dV accumulators,
+`[T, Hq]` delta, the per-token dense bitmap, the sequence tables and, past the
+dense prefix, the P / dS record windows with their inverted index (about
+0.4 GiB for 12Q/1KV, 0.8 GiB for 24Q/2KV). The dense forward route also uses
+packed token masks, tile ranges and K/V check flags. These buffers are rebuilt
+on each call.
 Full-call benchmarks must include forward preparation, compaction, backward
 preparation, and final gradient casts.
 At `T=131072` and `NB=32768`, the forward compact-index buffer alone uses 16 GiB.

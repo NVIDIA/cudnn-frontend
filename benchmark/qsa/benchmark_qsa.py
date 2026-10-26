@@ -141,7 +141,7 @@ def native_components(inputs, backward_inputs, args):
     fprop, arch = api._implementation(q, "fprop")
     stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     compact_args = (inputs["sel_blocks"], lo, hi, first, last)
-    ids, counts = api._compact(*compact_args, arch, stream)
+    ids, counts = _metadata.compact(*compact_args, arch, stream)
     compact = _metadata.compile_kernel(arch)
     compiled_fwd = fprop.compile_kernel(cutlass.BFloat16, q.shape[1], k.shape[1], arch)
     out, fp32 = torch.empty_like(q), torch.empty_like(q, dtype=torch.float32)
@@ -160,7 +160,7 @@ def native_components(inputs, backward_inputs, args):
 
     result = {
         "boundary": "Diagnostic gather-only launches with warm caches and prebuilt IDs. Public forward may use dense tiles; these components do not describe that route.",
-        "compact_with_allocation": timed(lambda: api._compact(*compact_args, arch, stream)),
+        "compact_with_allocation": timed(lambda: _metadata.compact(*compact_args, arch, stream)),
         "compact_preallocated": timed(lambda: compact(*compact_args, ids, counts, stream)),
         "gather_fprop_preallocated": timed(
             lambda: fprop.launch(compiled_fwd, q, k, v, out, fp32, lse, ids, counts, lo, hi, first, last, inputs["scale"], stream)
@@ -170,57 +170,41 @@ def native_components(inputs, backward_inputs, args):
     }
     if args.directions != "both":
         return result
-    bprop, _ = api._implementation(q, "bprop")
-    compiled = bprop.compile_kernel(cutlass.BFloat16, q.shape[1], k.shape[1], arch)
-    backward_ids, backward_counts = api._compact_backward(*compact_args, arch, stream, k.shape[1])
-    result["backward_compact_with_allocation"] = timed(lambda: api._compact_backward(*compact_args, arch, stream, k.shape[1]))
-    if arch in (100, 103) and k.shape[1] == 1:
-        result["warm_backward_compact_compile_lookup"] = host_timed(lambda: _metadata.compile_group_kernel(arch, bprop.NQ, bprop.BLK_BITS))
-    else:
-        result["warm_backward_compact_compile_lookup"] = host_timed(lambda: _metadata.compile_kernel(arch))
-    result["warm_bprop_compile_lookup"] = host_timed(lambda: bprop.compile_kernel(cutlass.BFloat16, q.shape[1], k.shape[1], arch))
-    scratch = {
-        "delta": torch.empty(q.shape[:2], dtype=torch.float32, device=q.device),
-        "dq_acc": torch.empty_like(q, dtype=torch.float32),
-        "dk_acc": torch.empty_like(k, dtype=torch.float32),
-        "dv_acc": torch.empty_like(v, dtype=torch.float32),
-    }
+    from cudnn.api_base import WorkspaceCarver
+    from cudnn.QSA.kernels import bprop_sm100 as engine
+
+    backward_ids, backward_counts = _metadata.compact(*compact_args, arch, stream)
+    result["backward_compact_with_allocation"] = timed(lambda: _metadata.compact(*compact_args, arch, stream))
+    result["warm_backward_compact_compile_lookup"] = host_timed(lambda: _metadata.compile_kernel(arch))
+    plan = engine.plan_for(q.shape[0], q.device, k.shape[1], engine.SEQ_ORIGIN, num_seqs=min(q.shape[0], first.shape[0]))
+    fns = engine.compile_kernels(plan)
+    result["warm_bprop_compile_lookup"] = host_timed(lambda: engine.compile_kernels(plan))
+    workspace = torch.empty(plan.workspace_bytes(), dtype=torch.uint8, device=q.device)
+    scratch = plan.carve(WorkspaceCarver(workspace, plan.workspace_bytes(), "benchmark"))
     dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
     grad, saved_out, saved_lse = (backward_inputs[name] for name in ("grad_out", "out_fp32", "lse"))
-    sms = torch.cuda.get_device_properties(q.device).multi_processor_count
-    blocks = max(1, min(sms * 8, (q.numel() // 8 + 255) // 256))
-
-    def prep():
-        compiled["prep"](saved_out, grad, scratch["delta"], scratch["dq_acc"], scratch["dk_acc"], scratch["dv_acc"], blocks, stream)
-
-    def main():
-        compiled["main"](
+    result["bprop_preallocated_all_kernels"] = timed(
+        lambda: engine.launch(
+            plan,
+            fns,
             q,
             k,
             v,
+            saved_out,
             grad,
             saved_lse,
-            scratch["delta"],
-            scratch["dq_acc"],
-            scratch["dk_acc"],
-            scratch["dv_acc"],
             backward_ids,
             backward_counts,
+            first,
             lo,
             hi,
-            first,
-            last,
+            dq,
+            dk,
+            dv,
+            scratch,
             inputs["scale"],
-            min(backward_counts.shape[0], sms),
             stream,
-        )
-
-    result["bprop_prep"] = timed(prep)
-    result["bprop_main"] = timed(main, before_each=prep)
-    result["bprop_finish"] = timed(lambda: compiled["finish"](scratch["dq_acc"], scratch["dk_acc"], scratch["dv_acc"], dq, dk, dv, blocks, stream))
-    result["bprop_preallocated_all_kernels"] = timed(
-        lambda: bprop.launch(
-            compiled, grad, q, k, v, saved_out, saved_lse, backward_ids, backward_counts, lo, hi, first, last, dq, dk, dv, scratch, inputs["scale"], stream, sms
+            tok_base=inputs["tok_base"],
         )
     )
     import reference
