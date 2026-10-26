@@ -49,7 +49,7 @@ from cudnn.sdpa.fwd.config_sm90 import (
     head_dims_mismatch as _sm90_head_dims_mismatch,
 )
 from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES as _SM107_F16_THD_SHAPES
-from cudnn.sdpa.fwd.config_sm107 import supports_native_d128_dense_partial_pack, supports_native_d128_narrow_tile
+from cudnn.sdpa.fwd.config_sm107 import supports_native_d128_dense_partial_pack, supports_native_d128_narrow_tile, supports_native_d512_dense_pack_split
 from cudnn.sdpa.fwd.config_sm107 import SM107_F16_SMALL_D_SHAPES as _SM107_F16_SMALL_D_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import SM107_SMALL_D_CGAS as _SM107_SMALL_D_CGAS
 from cudnn.sdpa.fwd.config_sm107 import sm107_small_tile_leg as _sm107_small_tile_leg
@@ -213,8 +213,8 @@ _SM100_KERNEL_FILES = {
 # lines (B1 H128 S8192 +21 % dense / +21 % causal on B200, +21 / +18 % on cc 10.7; GQA 64x1 Sq16384 ladder
 # +22..46 % / +11..24 %; short and small-batch shapes, see the tracker's forward footnote).  False is the
 # role-split A/B arm (the `d512_arm` / `two_by_two` test fixtures set both explicitly): the record keeps
-# mma_2x2=False and every plan renders byte-identically to before the field existed.  Plans the twin does
-# not serve (split_kv > 1, paged, PackGQA G=128, fp8 / mxfp8) take the role split under either value.
+# mma_2x2=False for the original plans. Native Rubin dense packed/split plans require 2x2 under either
+# value. Other plans the twin does not serve (paged, quantized, SM100 split / G128) retain the role split.
 _SM100_D512_2X2_KERNEL_FILE = "sm100/prefill_d512_f16_2x2.py"
 _SM107_D512_2X2_KERNEL_FILE = "sm107/prefill_d512_f16_2x2.py"
 D512_2X2: bool = True
@@ -1578,8 +1578,8 @@ class SdpaFwdDsl(APIBase):
 
         * SM120: its ``sO`` aliases ``sKV``, so there is no room to widen the O
           tile, and it keeps half partials.
-        * SM107 (Rubin) outside half/per-tensor FP8 D128 and D192/V128 and the
-          d256 DECODE tile: the other siblings do not carry the FP32
+        * SM107 (Rubin) outside half/per-tensor FP8 D128 and D192/V128, native
+          half D512 2x2, and the d256 DECODE tile: the other siblings do not carry the FP32
           partial-output slot.  The decode tile (sm107/decode_d256_f16.py) is
           the SM100 body and stores fp32 partials unconditionally under a split
           (its O slot and o_partial slot are both Float32 then), so it takes
@@ -1599,7 +1599,11 @@ class SdpaFwdDsl(APIBase):
         if self.split_kv <= 1:
             return False
         if self._device_cc == (10, 7):
-            return bool((not self._fp8 or self._pertensor) and self.flavor in ((128, 128), (192, 128))) or self._decode_q_tile() > 0
+            return (
+                bool((not self._fp8 or self._pertensor) and self.flavor in ((128, 128), (192, 128)))
+                or self._decode_q_tile() > 0
+                or self._rubin_native_d512_leg()
+            )
         if self._fp8 and not self._pertensor and self.flavor == (512, 512):
             return False  # MXFP8 d512: split-capable, no o_partial_f32 slot
         return True
@@ -2099,6 +2103,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and ((self.flavor == (192, 128) and not self.paged) or (self.flavor == (128, 128) and self.split_kv > 1))
         )
 
+    def _rubin_native_d512_leg(self) -> bool:
+        return supports_native_d512_dense_pack_split(self.flavor, device_cc=self._device_cc, fp8=self._fp8, thd=self.thd, paged=self.paged, cga=self.cga)
+
     def _rubin_shared_dense_leg(self) -> bool:
         """Historical dense D128 decode/packing admission predicate (issue #1472).
 
@@ -2538,9 +2545,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 and not self.paged
                 and not self.packed_thd_split
                 and not self._rubin_shared_thd_pack_leg()
+                and not self._rubin_native_d512_leg()
                 and not (self.flavor == _SM100_DECODE_FLAVOR and not self.thd)
                 and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv)),
-                "Rubin half PackGQA requires paged KV, the D128 packed split, an unsplit dense or ragged D128 GQA graph without the pre-folded scale, or the d256 decode tile (a decode-shaped graph: S_q x G packed rows within its routed envelope)",
+                "Rubin half PackGQA requires paged KV, the D128 packed split, an unsplit dense or ragged D128 GQA graph without the pre-folded scale, dense D512, or the d256 decode tile (a decode-shaped graph: S_q x G packed rows within its routed envelope)",
             )
             self._not_implemented_error_if(
                 self.thd
@@ -2570,6 +2578,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # native and paged D128 routes. Other legs retain whole-group admission.
             _partial = (
                 (not self._fp8 and self._device_cc != (10, 7) and self.flavor in _SM100_PARTIAL_PACK_GQA_FLAVORS)
+                or self._rubin_native_d512_leg()
                 or self._rubin_shared_thd_pack_leg()
                 or supports_paged_d128_partial_pack_gqa(
                     (int(d_qk), int(d_v)),
@@ -3141,14 +3150,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 self._device_cc == (10, 7)
                 and self.pack_gqa
                 and not _rubin_decode_tile
+                and not self._rubin_native_d512_leg()
                 and not (self.packed_thd_split or (self._fp8 and self._pertensor and self.flavor == (128, 128)) or self._rubin_shared_dense_leg()),
-                "split_kv > 1 with PackGQA on cc10.7 requires per-tensor FP8 D128, half D128 paged THD, a dense D128 half graph on the shared SM100 bodies, or the d256 decode tile",
+                "split_kv > 1 with PackGQA on cc10.7 requires per-tensor FP8 D128, half D128 paged THD, a dense D128 half graph, native dense D512 half, or the d256 decode tile",
             )
             self._not_implemented_error_if(
                 self._device_cc == (10, 7)
                 and not _rubin_decode_tile
+                and not self._rubin_native_d512_leg()
                 and not (self.packed_thd_split or ((not self._fp8 or self._pertensor) and self.flavor in ((128, 128), (192, 128)))),
-                "split_kv > 1 on cc10.7 requires half/per-tensor FP8 D128 or D192/V128, half D256 THD, or the d256 decode tile",
+                "split_kv > 1 on cc10.7 requires half/per-tensor FP8 D128 or D192/V128, half D256 THD, native dense D512 half, or the d256 decode tile",
             )
             # The MXFP8 row serves its native d64 leg dense / unsplit / unpaged
             # (split_d_shapes leaves (64, 64) out); mirror it here.
@@ -3870,6 +3881,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # routes the record to sm107/prefill_d512_f16_2x2.py (the Rubin row already declines split / paged /
             # PackGQA on d512, so the domain terms below are no-ops there).  D512_2X2 = False -> the record is untouched.
             two_by_two = D512_2X2 and self.split_kv == 1 and not self.paged and (not self.pack_gqa or 64 % max(1, int(params.qh_per_kh)) == 0)
+            # New native packed/split plans require this body even if the
+            # legacy unpacked A/B seam selects the role-split implementation.
+            two_by_two = two_by_two or (self._rubin_native_d512_leg() and (self.pack_gqa or self.split_kv > 1))
             if two_by_two:
                 params = replace(params, mma_2x2=True)
         return params

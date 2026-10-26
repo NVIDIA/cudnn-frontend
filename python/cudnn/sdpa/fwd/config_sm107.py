@@ -407,6 +407,11 @@ def supports_native_d128_dense_partial_pack(d_shape, *, device_cc, fp8, thd, pag
     return device_cc == (10, 7) and not fp8 and not thd and not paged and d_shape == (128, 128) and cga in (None, 2)
 
 
+def supports_native_d512_dense_pack_split(d_shape, *, device_cc, fp8, thd, paged, cga):
+    """Dense half D512 uses the native 2x2 body for packed and split plans."""
+    return device_cc == (10, 7) and not fp8 and not thd and not paged and d_shape == (512, 512) and cga in (None, 2)
+
+
 def sm107_small_tile_leg(
     *,
     thd: bool = False,

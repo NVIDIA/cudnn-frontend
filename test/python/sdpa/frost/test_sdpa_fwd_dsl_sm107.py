@@ -480,6 +480,49 @@ def test_sm107_d512_2x2_packed_split_records(group, splits, dtype):
             make_sm100(params)
 
 
+@pytest.mark.parametrize("group", [6, 64, 128])
+@pytest.mark.parametrize("splits", [1, 8])
+@pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
+def test_sm107_d512_packed_split_graph_and_adapter_contract(monkeypatch, group, splits, dtype_name):
+    import math
+    import torch
+    import cudnn
+    from cudnn.sdpa.fwd import api_dsl, engines
+
+    _fake_cc(monkeypatch, (10, 7))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    dtype = getattr(torch, dtype_name)
+    api = api_dsl.SdpaFwdDslSm100(
+        _desc((2, 2 * group, 3, 512), dtype, "q"),
+        _desc((2, 2, 257, 512), dtype, "k"),
+        _desc((2, 2, 257, 512), dtype, "v"),
+        _desc((2, 2 * group, 3, 512), dtype, "o"),
+        None,
+        pack_gqa=True,
+        split_kv=splits,
+        cga=2,
+        sched_policy=0,
+        is_causal=True,
+        causal_bottom_right=True,
+        has_sink=True,
+        stats_log2=True,
+    )
+    api.check_support()
+    params = api.template_params()
+    assert params.mma_2x2 and params.pack_gqa and params.split_kv == splits
+    assert api._fp32_partial_split() == (splits > 1)
+    module = _load_sm100_kernel_module((512, 512), params, rubin=True)
+    assert module.__file__.endswith("sm107/prefill_d512_f16_2x2.py")
+    assert module.CFG.PACK_G == math.gcd(group, 64)
+    assert module.FOLD_SINK == (splits == 1)
+    dt = cudnn.data_type.HALF if dtype_name == "float16" else cudnn.data_type.BFLOAT16
+    facts = _f16_facts(d_qk=512, d_v=512, h_q=2 * group, h_kv=2, s_q=3, s_kv=257, dtype=dt, dtype_o=dt, causal=True, bottom_right=True, has_sink=True)
+    knobs = engines.SdpaFwdKnobs(cga=2, pack_gqa=True, split_kv=splits, sched_policy=0)
+    assert engines.mismatch(_caps("sdpa_fwd_prefill_sm107"), facts, knobs) is None
+    for changed in (dict(thd=True, padded=True), dict(has_paged_kv=True, page_size=16), dict(device_cc=(10, 0))):
+        assert engines.mismatch(_caps("sdpa_fwd_prefill_sm107"), dataclasses.replace(facts, **changed), knobs) is not None
+
+
 def test_sm107_d512_2x2_descriptor_version_matches_the_smem_budget():
     """Same assertion as test_sm107_descriptor_version_matches_the_smem_budget, on the 2x2 module: (512, 512) is in
     _NEEDS_DESC_V1 and the module's own constant (what every SmemTile reads) agrees with the Cfg's layout-derived value."""
@@ -880,7 +923,7 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
     assert caps.split_kv_supported is True
     for d_qk, d_v in _FLAVORS:
         why = engines.mismatch(caps, _f16_facts(d_qk=d_qk, d_v=d_v), engines.SdpaFwdKnobs(split_kv=2))
-        assert (why is None) == (d_v == 128), (d_qk, d_v, why)
+        assert (why is None) == (d_v == 128 or (d_qk, d_v) == (512, 512)), (d_qk, d_v, why)
     # The small head-dim tiles carry the dense leg only: a split graph at D <= 64 is selected past them onto the d128 flavor
     # (its pre-tile route) and served there, never declined (engines.Capabilities.dense_only_d_shapes).
     for d in (24, 32, 64):
