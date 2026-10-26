@@ -3075,7 +3075,8 @@ def test_sdpa_thd_output_stride_int64(d_qk, d_v, binder, monkeypatch):
     graph = cudnn.pygraph(io_data_type=bf16, intermediate_data_type=cudnn.data_type.FLOAT,
                           compute_data_type=cudnn.data_type.FLOAT, is_override_shape_enabled=True)
     def lengths(name):
-        return graph.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=i32, name=name)
+        dtype = cudnn.data_type.INT64 if name == "off_o" else i32
+        return graph.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=dtype, name=name)
     cu_q, cu_kv = lengths("cu_q"), lengths("cu_kv")
     off_q, off_k, off_v, off_o, off_lse = [lengths(n) for n in ("off_q", "off_k", "off_v", "off_o", "off_lse")]
     def operand(name, h, s, d, offset):
@@ -3112,7 +3113,7 @@ def test_sdpa_thd_output_stride_int64(d_qk, d_v, binder, monkeypatch):
     ck = torch.arange(b + 1, device="cuda", dtype=torch.int32) * kl
     pack = {q: q_buf, k: k_buf, v: v_buf, o: o_buf, stats: lse_buf, cu_q: cq, cu_kv: ck,
             off_q: cq * hq * d_qk, off_k: ck * hk * d_qk, off_v: ck * hk * d_v,
-            off_o: cq * hq * d_v, off_lse: cq * hq}
+            off_o: cq.to(torch.int64) * row_stride, off_lse: cq * hq}
     workspace = torch.empty(max(graph.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     overrides = dict(override_uids=[o.get_uid()], override_shapes=[[b, hq, ql, d_v]],
                      override_strides=[[hq * d_v, d_v, row_stride, 1]])

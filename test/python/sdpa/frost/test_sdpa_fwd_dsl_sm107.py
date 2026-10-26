@@ -3549,9 +3549,9 @@ def test_shared_d256_body_gate_is_wired_through_every_layer():
     assert "epilogue_gate=EPILOGUE_GATE" in src and src.count("issue_gate_load(") == 0  # the issue sites live in the TMA-LDG group
     assert inspect.getsource(mod._tmaldg_warp_group).count("issue_gate_load(sGate, tma_gate, bars.mb_gate_full") == 2, "both arms of the tile loop"
     kparams = inspect.signature(mod._kernel).parameters
-    assert list(kparams)[-1] == "tma_gate_desc" and kparams["tma_gate_desc"].default is None
+    assert list(kparams)[-2:] == ["tma_gate_desc", "thd_origins"] and kparams["tma_gate_desc"].default is None
     hparams = list(inspect.signature(mod._host).parameters)
-    assert hparams[-3:] == ["gate_ptr", "gate_strides", "stream"]
+    assert hparams[-5:] == ["gate_ptr", "gate_strides", "thd_origin_ptrs", "thd_origin_specs", "stream"]
     # Both slots are REQUIRED (the sm107 d256 body's convention): gate_strides is a runtime tuple slot on every rendering (the binders
     # fill zeros), and a Python default cannot stand in -- None reaches the compiled tuple slot as a type mismatch, a non-None default
     # is one the compiled-plan cache cannot carry (the cc 10.0 direct launches saw both).

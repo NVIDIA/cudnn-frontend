@@ -166,6 +166,7 @@ enum HostSlot : size_t {
     PartialOStrides,
     GatePtr,
     GateStrides,
+    OriginPtrs,
     NumHostSlots
 };
 constexpr std::array<const char *, NumHostSlots> host_slot_names = {"q_ptr",
@@ -195,7 +196,8 @@ constexpr std::array<const char *, NumHostSlots> host_slot_names = {"q_ptr",
                                                                     "lse_partial_ptr",
                                                                     "partial_o_strides",
                                                                     "gate_ptr",
-                                                                    "gate_strides"};
+                                                                    "gate_strides",
+                                                                    "thd_origin_ptrs"};
 constexpr std::array<HostSlot, 4> pointer_slots                  = {QPtr, KPtr, VPtr, OPtr};
 constexpr std::array<HostSlot, 4> stride_slots                   = {QStrides, KStrides, VStrides, OStrides};
 
@@ -331,9 +333,26 @@ class SdpaThdBinder {
                 gate_decl_[4] != 1)
                 invalid("invalid native THD gate declaration");
         }
+        if (py::hasattr(spec, "origin_specs") && !spec.attr("origin_specs").is_none()) {
+            if (quantized_ || paged_ || splits_ != 1 || has_gate_)
+                invalid("physical THD origins require an unsplit nonpaged half plan without a gate");
+            auto specs = py::cast<py::tuple>(spec.attr("origin_specs"));
+            if (specs.size() != 5) invalid("physical THD origins require five ports");
+            has_origins_ = true;
+            for (size_t i = 0; i < 5; ++i) {
+                if (!specs[i].is_none()) {
+                    auto entry = py::cast<std::array<int64_t, 4>>(specs[i]);
+                    if (entry[0] != static_cast<int64_t>(i) || entry[1] <= 0 || entry[2] <= 0 || entry[2] % entry[1] ||
+                        (entry[3] != 32 && entry[3] != 64))
+                        invalid("invalid physical THD origin declaration");
+                    origin_bits_[i] = entry[3];
+                }
+            }
+        }
         auto order = py::cast<std::vector<std::string>>(spec.attr("order"));
         if (order.size() != template_.size()) invalid("native THD host argument template has the wrong size");
         for (size_t slot = 0; slot < NumHostSlots; ++slot) {
+            if (slot == OriginPtrs && !has_origins_) continue;
             // Nonpaged hosts (including SM120) need not expose paged ABI slots.
             if (!paged_ && slot >= KTablePtr && slot <= NumPages) continue;
             if (splits_ == 1 && slot >= OPartialPtr && slot <= PartialOStrides) continue;
@@ -405,7 +424,9 @@ class SdpaThdBinder {
                 py::object stream,
                 py::object scale,
                 int64_t gate_index) const {
-        if (indices.size() != (mx_scales_ ? NumRoles : (quantized_ ? PerTensorNumRoles : HalfNumRoles)))
+        if (indices.size() != (has_origins_
+                                   ? HalfNumRoles + 5
+                                   : (mx_scales_ ? NumRoles : (quantized_ ? PerTensorNumRoles : HalfNumRoles))))
             invalid("native THD binding has the wrong number of role indices");
         const auto facts = read_native_operand_views(pack, indices);
         // The epilogue gate is outside the role pack: its own index (-1 = none), validated both ways like every other
@@ -469,6 +490,27 @@ class SdpaThdBinder {
         }
         check_lens(q_lens, "q_lens", add(b, (lens_form_ & 1) ? 1 : 0));
         check_lens(kv_lens, "kv_lens", nk);
+
+        py::object origin_ptrs = py::none();
+        if (has_origins_) {
+            py::list pointers;
+            for (size_t i = 0; i < 5; ++i) {
+                const auto &offset = facts[HalfNumRoles + i];
+                if (!origin_bits_[i]) {
+                    if (offset.filled) invalid("unexpected THD physical-offset operand");
+                    pointers.append(py::none());
+                    continue;
+                }
+                if (!offset.filled) invalid("THD physical-offset operand is required");
+                on_device(offset, "THD physical offsets");
+                if (!dtype_is(offset, kDLInt, origin_bits_[i]) || !contiguous(offset) || numel(offset) != b + 1 ||
+                    (span(offset) >= 0 && span(offset) < b + 1) || !offset.pointer ||
+                    offset.pointer % (origin_bits_[i] / 8))
+                    invalid("THD physical offsets require contiguous declared-width B+1 storage");
+                pointers.append(py::int_(offset.pointer));
+            }
+            origin_ptrs = py::tuple(pointers);
+        }
 
         const auto &lse         = facts[LSE];
         int64_t lse_capacity    = -1;
@@ -543,6 +585,7 @@ class SdpaThdBinder {
         // Copy references to immutable constants, then replace invocation-local
         // slots. No frame or runtime pointer is ever written into the plan.
         py::list frame(template_);
+        if (has_origins_) put(frame, OriginPtrs, std::move(origin_ptrs));
         for (size_t i = Q; i <= O; ++i) {
             put(frame, pointer_slots[i], py::int_(facts[i].pointer));
             if (!paged_ || i == Q || i == O)
@@ -874,6 +917,8 @@ class SdpaThdBinder {
     std::array<size_t, NumHostSlots> index_;
     std::array<std::array<int64_t, 6>, 4> declarations_;
     std::array<int, 4> dtype_code_, dtype_bits_;
+    bool has_origins_ = false;
+    std::array<int64_t, 5> origin_bits_{};
     bool has_gate_ = false;
     int gate_code_ = kDLBfloat;
     std::array<int64_t, 6> gate_decl_{};
@@ -898,6 +943,7 @@ void
 init_sdpa_thd_binding(py::module_ &m) {
     py::class_<SdpaThdBinder>(m, "_SdpaThdBinder")
         .def(py::init<const py::object &>(), py::arg("spec"))
+        .def_prop_ro_static("supports_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_initial_waves", [](py::object) { return true; })
         .def_prop_ro_static("supports_initial_wave_geometry", [](py::object) { return true; })
         .def_prop_ro_static("supports_stats_stride_override", [](py::object) { return true; })

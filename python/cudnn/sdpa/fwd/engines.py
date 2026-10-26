@@ -301,12 +301,11 @@ class Capabilities:
     # pre-existing allocation on that path, tracked with its other
     # TemplateParams-conversion follow-ups.
     lse_optional: bool = False
-    # THD forward lowerings assume FULLY-PACKED storage: the packed addressing
-    # is re-derived as prefix(lens) x token stride, and the graph's bound
-    # ragged-offset values are never read. TE-style padded THD (offsets
-    # from cu_seqlens_padded != cu_seqlens, gaps between sequences) is NOT
-    # served — and being runtime data, cannot be declined at plan time.
-    # (The SM80 backward reads them: bwd Capabilities.thd_ragged_offsets.)
+    # Most THD forward lowerings derive addresses from compact length prefixes.
+    # The SM100/SM103 ungated, nonpaged, unsplit CGA2 half D128/D256 graph
+    # lowering reads independent Q/K/V/O/Stats physical offsets. See
+    # SUPPORT_MATRIX_TRACKER.md for this scope and the remaining sibling gaps;
+    # thd=True alone does not promise support for padding between sequences.
     thd: bool = False
     # cu_seq_len_q / cu_seq_len_kv (B+1,) prefix sums (cuDNN 9.24+). Serving
     # rows consume the form on THD host-side (lens = adjacent differences of
@@ -3270,6 +3269,20 @@ def lower_dsl_prefill(
         **({"sample_kv_mask": ga.tensor_desc_from_ir(facts.kv_mask_t, name="kv_mask")} if ("sample_kv_mask" in _ctor_params and facts.has_kv_mask) else {}),
     )
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
+    if (
+        facts.thd
+        and not facts.has_paged_kv
+        and facts.epilogue_gate_t is None
+        and not (facts.is_fp8 or facts.is_mxfp8)
+        and facts.device_cc in ((10, 0), (10, 3))
+        and facts.d_qk == facts.d_v
+        and facts.d_qk in (128, 256)
+        and api.split_kv == 1
+        and api.cga in (None, 2)
+    ):
+        from .thd_origins import graph_origin_specs
+
+        api._thd_origin_specs = graph_origin_specs(facts)
     if facts.shape_overrides:
         reason = _prepared_decline_reason(spec.capabilities, facts, getattr(api, "split_kv", 1))
         if reason is not None:
@@ -3338,9 +3351,12 @@ def lower_dsl_prefill(
         score_max=facts.score_max_t if "sample_score_max" in _ctor_params else None,
         score_sum_exp=facts.score_sum_exp_t if "sample_score_max" in _ctor_params else None,
         # THD ragged offsets: bound operands of the decode tile's ragged-Q leg
-        # (read on device as the row bases); the prefill THD leg never reads
-        # them, and a stats-less graph has no Stats offsets.
+        # (read on device as the row bases). The SM100 half D128/D256 unsplit
+        # CGA2 prefill path also binds independent origins for all five ports.
+        # A stats-less graph has no Stats offsets.
         ragged_q=getattr(facts.q_t, "ragged_offset", None) if facts.thd else None,
+        ragged_k=getattr(facts.k_t, "ragged_offset", None) if facts.thd else None,
+        ragged_v=getattr(facts.v_t, "ragged_offset", None) if facts.thd else None,
         ragged_o=getattr(facts.o_t, "ragged_offset", None) if facts.thd else None,
         ragged_stats=getattr(facts.stats_t, "ragged_offset", None) if (facts.thd and facts.stats_t is not None) else None,
     )

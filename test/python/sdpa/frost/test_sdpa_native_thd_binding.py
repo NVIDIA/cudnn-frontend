@@ -58,6 +58,50 @@ def _native(s, facts, workspace=0x30000, stream=17):
     return s.native.bind(prep._native_pack_from_facts(facts), prep._NATIVE_THD_INDICES, workspace, stream)
 
 
+def _physical_origin_fixture():
+    from cudnn.sdpa.fwd.thd_origins import ROLES
+
+    spec, facts, _ = _fixture()
+    bits = (64, 32, 64, 32, 64)
+    strides = (1024, 256, 256, 1024, 8)
+    spec.origin_specs = tuple((i, 1, stride, width) for i, (stride, width) in enumerate(zip(strides, bits)))
+    spec.native = cudnn._pybind_module._SdpaThdBinder(spec)
+    for i, (role, width) in enumerate(zip(ROLES, bits)):
+        facts[role] = prep.BufferFacts(0x50000 + i * 0x1000, f"int{width}", (2, 0), 5, (5,), (1,))
+    return spec, facts, prep._NATIVE_THD_ROLES + ROLES
+
+
+def test_physical_origin_binding_reobserves_all_five_ports():
+    spec, facts, roles = _physical_origin_fixture()
+    indices = tuple(range(len(roles)))
+    first = spec.native.bind(prep._native_pack_from_facts(facts, roles), indices, 0x90000, 17)
+    assert list(first) == binding_reference._bind_thd_python(spec, facts, 0x90000, 17, 17)
+    changed = {name: fact._replace(ptr=fact.ptr + 0x100000) for name, fact in facts.items()}
+    second = spec.native.bind(prep._native_pack_from_facts(changed, roles), indices, 0xA0000, 23)
+    assert list(second) == binding_reference._bind_thd_python(spec, changed, 0xA0000, 23, 23)
+    slot = spec.index["thd_origin_ptrs"]
+    assert first[slot] == tuple(facts[name].ptr for name in roles[-5:])
+    assert second[slot] == tuple(changed[name].ptr for name in roles[-5:])
+    assert spec.template[slot] is None
+    assert first[spec.index["stream"]] == 17
+    assert second[spec.index["stream"]] == 23
+
+
+@pytest.mark.parametrize("role", ["ragged_q", "ragged_k", "ragged_v", "ragged_o", "ragged_stats"])
+@pytest.mark.parametrize("defect", ["missing", "dtype", "device", "short", "strided"])
+def test_physical_origins_revalidate_after_warm_binding(role, defect):
+    spec, facts, roles = _physical_origin_fixture()
+    indices = tuple(range(len(roles)))
+    spec.native.bind(prep._native_pack_from_facts(facts, roles), indices, 0x90000, 17)
+    if defect == "missing":
+        del facts[role]
+    else:
+        update = {"dtype": {"dtype": "float32"}, "device": {"device": (1, 0)}, "short": {"span": 4}, "strided": {"strides": (2,), "span": 9}}[defect]
+        facts[role] = facts[role]._replace(**update)
+    with pytest.raises(ValueError):
+        spec.native.bind(prep._native_pack_from_facts(facts, roles), indices, 0x90000, 17)
+
+
 def _reference(s, facts, workspace=0x30000, stream=17):
     return binding_reference._bind_thd_python(s, facts, workspace, stream, stream)
 
