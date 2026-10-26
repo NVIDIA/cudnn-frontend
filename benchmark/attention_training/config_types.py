@@ -117,6 +117,11 @@ class BenchmarkConfig:
     skip_ref: bool = True
     deterministic_bwd: List[bool] = field(default_factory=lambda: [False])
     sliding_window_size: Optional[int] = None  # None = no sliding window, int = window size
+    # "thd": packed variable-length sequences (cuDNN legs, bfloat16 / float16); batch_size counts sequences and each
+    # seqlens entry is the longest sequence. thd_min_fills: shortest sequence as a fraction of the longest, one case
+    # per entry (1.0 = equal lengths).
+    layout: str = "bshd"
+    thd_min_fills: List[float] = field(default_factory=lambda: [1.0])
     output_dir: str = "../results"
 
 
@@ -180,6 +185,8 @@ class BenchmarkResult:
 
     # Optional fields (must come after required fields)
     sliding_window_size: Optional[int] = None
+    layout: str = "bshd"
+    thd_min_fill: Optional[float] = None
     success: bool = True
     # True when the case was cleanly skipped because the backend does not
     # support this (shape, dtype, pass) combination (always success=False);
@@ -193,6 +200,8 @@ class BenchmarkResult:
     # sampled during the measurement window — the SOL denominator. None on
     # arches without a rate-table entry.
     peak_mma_tflops: Optional[float] = None
+    # The plan the measured pass ran (cuDNN legs), e.g. which engine cudnn_auto picked.
+    backend_detail: Optional[str] = None
 
 
 def fa2_on_ampere():

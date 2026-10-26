@@ -40,8 +40,8 @@ NON_KEY = {
     "peak_mma_tflops",
     "backend_detail",
 }
-SHOW = ("config_name", "model_name", "phase", "profile_pass", "data_type", "kv_cache_dtype", "attn_mask", "batch_size")
-SHAPE = ("q_seqlen", "kv_seqlen", "q_tokens", "kv_len", "num_q_heads", "num_kv_heads", "head_dim_qk", "sliding_window_size")
+SHOW = ("config_name", "model_name", "phase", "profile_pass", "data_type", "kv_cache_dtype", "attn_mask", "batch_size", "layout")
+SHAPE = ("q_seqlen", "kv_seqlen", "q_tokens", "kv_len", "num_q_heads", "num_kv_heads", "head_dim_qk", "sliding_window_size", "thd_min_fill")
 
 
 def _csvs(paths):
