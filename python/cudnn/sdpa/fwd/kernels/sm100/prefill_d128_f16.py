@@ -3483,7 +3483,7 @@ def _host(
     kv_mask_ptr: Optional[cute.Pointer],
     kv_mask_batch_stride: cutlass.Int64,
     inv_scale_softmax: cutlass.Float32,
-    thd_origin_ptrs: Optional[tuple] = None,
+    thd_origin_ptrs=None,
     thd_origin_specs: cutlass.Constexpr = None,
     stream: _cuda_driver.CUstream = None,
 ) -> None:

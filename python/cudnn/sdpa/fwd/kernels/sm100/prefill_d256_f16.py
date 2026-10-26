@@ -2153,7 +2153,7 @@ def _host(
     # (its `gate_slots`), direct launches pass it themselves.  Under THD the gate is the packed [1, T, H_q, D_v] form like Q / O.
     gate_ptr: Optional[cute.Pointer],
     gate_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
-    thd_origin_ptrs: Optional[tuple] = None,
+    thd_origin_ptrs=None,
     thd_origin_specs: cutlass.Constexpr = None,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
