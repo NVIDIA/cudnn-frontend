@@ -1782,7 +1782,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         ``check_support`` declines an explicit 128 for it typed), else 128."""
         if self.tile_n is not None:
             return int(self.tile_n)
-        if self.flavor in dict(_SM107_TILE_NS_BY_D_SHAPE) and self._device_cc == (10, 7):
+        if self.flavor in dict(_SM107_TILE_NS_BY_D_SHAPE) and self._device_cc == (10, 7) and not self._fp8:
             return _sm107_tile_n_pick(
                 self.flavor[0],
                 int(self.k_desc.shape[2]),

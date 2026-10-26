@@ -186,3 +186,63 @@ def test_native_d64_fp8_rebind_replay(in_key, out_dtype, mode, d, packed, splits
                 capture.reset()
         finally:
             cudnn.set_stream(cudnn_handle, original_stream)
+
+
+@requires_dsl
+@pytest.mark.L0
+@pytest.mark.parametrize("sk", [129, 192, 257])
+@pytest.mark.parametrize("in_key,cga", [("e4m3", 1), ("e5m2", 2)])
+@torch_fork_set_rng(seed=1398)
+def test_standalone_d64_padded_default_tile_n(in_key, cga, sk):
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("native SM107 FP8 D64")
+    dt = torch.float8_e4m3fn if in_key == "e4m3" else torch.float8_e5m2
+    b, hq, hk, sq, d = 2, 8, 2, 129, 64
+
+    def inputs():
+        return [(torch.randn(b, s, h, d, device="cuda") * 0.5).to(dt).transpose(1, 2) for s, h in ((sq, hq), (sk, hk), (sk, hk))]
+
+    q, k, v = inputs()
+    out = torch.empty_like(q, dtype=torch.bfloat16)
+    lse = torch.empty((b, hq, sq), device="cuda", dtype=torch.float32)
+    qlens = torch.tensor([sq, 97], device="cuda", dtype=torch.int32)
+    klens = torch.tensor([sk, 0], device="cuda", dtype=torch.int32)
+    api = SdpaFwdDslSm100(q, k, v, out, lse, pertensor_fp8=True, cga=cga, tile_n=None, seq_q_lens_present=True, seq_kv_lens_present=True, scale_softmax=0.125)
+    assert api.check_support()
+    assert api.flavor == (64, 64) and api._effective_tile_n() == 128
+    api.compile()
+    assert api._k_mod.CFG.TILE_K == api._k_mod.CFG.TILE_O == 64
+    assert api._k_mod.CFG.TILE_N == 128
+    unit = torch.ones(1, device="cuda", dtype=torch.float32)
+    workspace = torch.empty(max(1, api.scratch_workspace_bytes()), device="cuda", dtype=torch.uint8)
+
+    def execute():
+        api.execute(q, k, v, out, lse, descale_q=unit, descale_k=unit, descale_v=unit, seq_q_lens=qlens, seq_kv_lens=klens, workspace=workspace)
+
+    def check():
+        ref = _ref(q, k, v, 1.0, 1.0, 1.0, in_key, scale=0.125, seq_lens_q=[sq, 97], seq_lens_kv=[sk, 0], return_stats=True)
+        amax = ref.output.abs().max().item()
+        _check(out, ref.output, torch.bfloat16, in_key, amax, amax)
+        torch.testing.assert_close(lse, ref.stats, atol=0.05, rtol=0.03)
+
+    for _ in range(2):
+        q, k, v = inputs()
+        out.fill_(torch.nan)
+        lse.fill_(torch.nan)
+        execute()
+        check()
+    capture = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(capture):
+            execute()
+        for _ in range(3):
+            for target, fresh in zip((q, k, v), inputs()):
+                target.copy_(fresh)
+            out.fill_(torch.nan)
+            lse.fill_(torch.nan)
+            capture.replay()
+            check()
+    finally:
+        capture.reset()
