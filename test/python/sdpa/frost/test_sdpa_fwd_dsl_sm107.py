@@ -3557,7 +3557,7 @@ def test_shared_d256_body_gate_is_wired_through_every_layer():
     kparams = inspect.signature(mod._kernel).parameters
     assert list(kparams)[-2:] == ["tma_gate_desc", "thd_origins"] and kparams["tma_gate_desc"].default is None
     hparams = list(inspect.signature(mod._host).parameters)
-    assert hparams[-5:] == ["gate_ptr", "gate_strides", "stream", "thd_origin_ptrs", "thd_origin_specs"]
+    assert hparams[-5:] == ["gate_ptr", "gate_strides", "thd_origin_ptrs", "thd_origin_specs", "stream"]
     # Both slots are REQUIRED (the sm107 d256 body's convention): gate_strides is a runtime tuple slot on every rendering (the binders
     # fill zeros), and a Python default cannot stand in -- None reaches the compiled tuple slot as a type mismatch, a non-None default
     # is one the compiled-plan cache cannot carry (the cc 10.0 direct launches saw both).
