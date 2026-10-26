@@ -422,7 +422,8 @@ class Capabilities:
     # None = every flavor keeps the full-ratio contract (the group must divide
     # tile_m, or PACK_GQA=1 is declined; SM120 packs any group up to tile_m:
     # pack_gqa_requires_divisible).  Native on the SM100 d128 / d256 f16
-    # kernels; the d192x128 / d512 kernels pack HEADS_PER_TILE = G.
+    # kernels and the native SM107 dense d512 body; the other d192x128 /
+    # d512 kernels pack HEADS_PER_TILE = G.
     # APPENDED after the epilogue-gate fields (append-only contract above):
     # test_capabilities_positional_prefix_is_append_only pins the tail.
     pack_gqa_partial_d_shapes: Optional[frozenset] = None
@@ -1470,8 +1471,16 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             and not decode_tile
             and not rubin_dense_d128_shared_leg(capabilities, facts, knobs)
             and not ragged_pack
+            and not _config_sm107.supports_native_d512_dense_pack_split(
+                _selected_d_shape(capabilities, facts, knobs),
+                device_cc=facts.device_cc,
+                fp8=facts.is_fp8 or facts.is_mxfp8,
+                thd=facts.thd,
+                paged=facts.has_paged_kv,
+                cga=knobs.cga,
+            )
         ):
-            return "Rubin half PackGQA requires paged KV, the D128 packed split, an unsplit dense or ragged D128 GQA graph without the pre-folded scale, or the d256 decode tile (a decode-shaped graph: S_q x G packed rows within its routed envelope)"
+            return "Rubin half PackGQA requires paged KV, the D128 packed split, an unsplit dense or ragged D128 GQA graph without the pre-folded scale, dense D512, or the d256 decode tile (a decode-shaped graph: S_q x G packed rows within its routed envelope)"
         if (
             facts.attn_scale_prefolded
             and capabilities.sm_lo == 107
@@ -2354,11 +2363,14 @@ def _sm107_spec() -> EngineSpec:
             # (256, 256) = the d256 DECODE tile's whole-group packing (dense or paged, whatever tile_m) and the
             # paged THD d256 prefill's PackGQA (CGA2, unsplit); mismatch declines a packed dense d256 graph the
             # tile does not serve (the dense d256 prefill kernel runs unpacked).
-            pack_gqa_d_shapes=frozenset({(128, 128), (256, 256)}),
+            pack_gqa_d_shapes=frozenset({(128, 128), (256, 256), (512, 512)}),
+            # Native D512 2x2 tiles pack gcd(G,64), including two subgroups
+            # per KV head at G128. THD and paged D512 retain their declines.
+            pack_gqa_partial_d_shapes=frozenset({(512, 512)}),
             thd_pack_gqa_d_shapes=frozenset({(128, 128), (256, 256)}),
             split_kv_supported=True,
             # (256, 256) = the paged THD packed split and the decode tile's dense / paged split.
-            split_d_shapes=frozenset({(128, 128), (192, 128), (256, 256)}),
+            split_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             # NATURAL row-wide; LPT advertised PER D-SHAPE for what is validated.
             #
             # The old note here said the ported decode "does not honor

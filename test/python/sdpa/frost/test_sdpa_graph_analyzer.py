@@ -1058,7 +1058,7 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
     # Capabilities.pack_gqa_partial_d_shapes as a module tuple because the
     # adapter has no engine row in hand when it validates a knob request.  Pin
     # the two together so the gate cannot drift: the f16 SM100 row declares
-    # exactly the adapter's flavors. Other rows keep this static field unset;
+    # exactly the adapter's flavors. Native SM107 additionally admits D512;
     # native SM107 D128 uses a shared route predicate because dense CGA1 still
     # requires whole groups. Quantized and SM120 routes retain their gates.
     from cudnn.sdpa.fwd.api_dsl import _SM100_PARTIAL_PACK_GQA_FLAVORS
@@ -1066,7 +1066,9 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
     by_name = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
     assert by_name[engines.engine_name()].pack_gqa_partial_d_shapes == frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS)
     assert frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS) == frozenset({(128, 128), (256, 256)})
-    others = {name: caps.pack_gqa_partial_d_shapes for name, caps in by_name.items() if name != engines.engine_name()}
+    native_sm107 = engines.engine_name(arch="sm107")
+    assert by_name[native_sm107].pack_gqa_partial_d_shapes == frozenset({(512, 512)})
+    others = {name: caps.pack_gqa_partial_d_shapes for name, caps in by_name.items() if name not in (engines.engine_name(), native_sm107)}
     assert all(v is None for v in others.values()), others
 
 
