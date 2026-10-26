@@ -4901,7 +4901,10 @@ def build_and_pin(graph, plan_name):
     """validate, lower, plan, pin ``plan_name`` and build; declines waive the test."""
     graph.validate()
     graph.build_operation_graph()
-    graph.create_execution_plans([cudnn.heur_mode.A])
+    try:
+        graph.create_execution_plans([cudnn.heur_mode.A])
+    except cudnn.cudnnGraphNotSupportedError as exc:  # no engine at all, e.g. a device outside every row
+        pytest.skip(f"{plan_name} declined: {exc}")
     names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
     if plan_name not in names:
         pytest.skip(f"no {plan_name} plan for this graph (offered: {names})")
@@ -5115,7 +5118,8 @@ MAMBA2_SPAN_BOUNDS = [0, 1024, 1536, 2560, 3000]
 def mamba2_summary(case, *, initial_state=None):
     """``(final_state, transition)`` of a Mamba-2 case through the summary op, pinned to the FROST summary engine."""
     q, k, v, g, cu, A, dt_bias = op_args(case)
-    return la_ops.mamba2_summary(v, g, A, k, cu, initial_state=initial_state, dt_bias=dt_bias, plan_name="mamba2_summary_frost")
+    with waive_declined("mamba2 frost summary engine"):
+        return la_ops.mamba2_summary(v, g, A, k, cu, initial_state=initial_state, dt_bias=dt_bias, plan_name="mamba2_summary_frost")
 
 
 def mamba2_summary_bwd(case, dO, *, d_final_state=None):
@@ -5123,7 +5127,10 @@ def mamba2_summary_bwd(case, dO, *, d_final_state=None):
     q, k, v, g, cu, A, dt_bias = op_args(case)
     scale = 1.0 / math.sqrt(case.K)
     q = (q.float() * scale).to(q.dtype)  # the suite's forward adapter pre-scales C the same way
-    return la_ops.mamba2_summary_bwd(dO, g, A, q, cu, d_final_state=d_final_state, dt_bias=dt_bias, output_transition=True, plan_name="mamba2_summary_frost")
+    with waive_declined("mamba2 frost summary engine"):
+        return la_ops.mamba2_summary_bwd(
+            dO, g, A, q, cu, d_final_state=d_final_state, dt_bias=dt_bias, output_transition=True, plan_name="mamba2_summary_frost"
+        )
 
 
 def mamba2_log2_transition(case):
@@ -5188,8 +5195,9 @@ def test_mamba2_summary_graph_mixed_state_dtypes(backend, variant, shape):
     q, k, v, g, cu, A, dt_bias = op_args(case)
     q = (q.float() / math.sqrt(case.K)).to(q.dtype)
     d_o, _, _ = gradient_chain_inputs(case)
-    fs_op, transition_op = la_ops.mamba2_summary(v, g, A, k, cu, dt_bias=dt_bias, plan_name="mamba2_summary_frost")
-    dstate0_op, transition_bwd_op = la_ops.mamba2_summary_bwd(d_o, g, A, q, cu, dt_bias=dt_bias, output_transition=True, plan_name="mamba2_summary_frost")
+    with waive_declined("mamba2 frost summary engine"):
+        fs_op, transition_op = la_ops.mamba2_summary(v, g, A, k, cu, dt_bias=dt_bias, plan_name="mamba2_summary_frost")
+        dstate0_op, transition_bwd_op = la_ops.mamba2_summary_bwd(d_o, g, A, q, cu, dt_bias=dt_bias, output_transition=True, plan_name="mamba2_summary_frost")
     for state_dtype, transition_dtype in ((torch.float32, torch.bfloat16), (torch.bfloat16, torch.float32)):
         inputs = dict(k=k, v=v, g=g, a=A, dt_bias=dt_bias, cu_seqlens=cu)
         graph = cudnn.pygraph()
