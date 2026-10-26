@@ -278,6 +278,10 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
             barrier_id=6,
             num_threads=32 * self.epilogue_warp_group_size,
         )
+        self.epilog_tile_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=7,
+            num_threads=32 * len(self.epilog_warp_id),
+        )
 
         self.num_smem_capacity = get_smem_capacity_in_bytes("sm_100")
         SM100_TMEM_CAPACITY_COLUMNS = 512
@@ -2397,11 +2401,9 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                     if cutlass.const_expr(self.run_rht):
                         _partial_cta_sync(self.epilog_sync_barrier)
 
-                #
-                # Full epilogue barrier (ACT + RHT must both arrive)
-                #
+                # Keep tile completion separate from RHT's nonblocking subtile arrival.
                 if cutlass.const_expr(self.run_rht):
-                    _partial_cta_sync(self.epilog_sync_barrier)
+                    _partial_cta_sync(self.epilog_tile_sync_barrier)
 
                 #
                 # Async arrive accumulator buffer empty
@@ -2650,18 +2652,8 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                     pingpong_pipeline.consumer_release(pingpong_rht_consumer_state)
                     pingpong_rht_consumer_state.advance()
                     num_prev_d_subtiles = num_prev_d_subtiles + 1
-                    # Lockstep barrier: under run_rht the 128 RHT arrivals already
-                    # happened right after the sD reads (arrive() above); only the
-                    # idle-RHT plain mode still pairs arrive_and_wait here.
-                    if cutlass.const_expr(not self.run_rht):
-                        _partial_cta_sync(self.epilog_sync_barrier)
 
-                #
-                # NVFP4: one contiguous 8-byte scale-row store per thread per tile.
-                # Rowwise: the thread wrote all its own smem slots (no barrier needed).
-                # Colwise: rows were filled ACROSS warps — the loop-end epilog_sync
-                # barrier above already ordered those writes.
-                #
+                # Colwise scale rows are ordered by the RHT group barrier above.
                 _num_sf = self.cta_tile_shape_mnk_d[1] // HADAMARD_SIZE
                 if cutlass.const_expr(self.rht_quant and self.rht_rowwise):
                     self.store_swizzled_sf_row(
@@ -2693,10 +2685,8 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                         epi_tidx,
                     )
 
-                #
-                # Full epilogue barrier (ACT + RHT must both arrive)
-                #
-                _partial_cta_sync(self.epilog_sync_barrier)
+                # RHT can finish before ACT resets the last subtile barrier.
+                _partial_cta_sync(self.epilog_tile_sync_barrier)
 
                 #
                 # Toggle the subtile-column reversal for the next tile.
