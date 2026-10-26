@@ -143,6 +143,8 @@ def test_a_blob_without_kernels_compiles_the_plan(produced, tmp_path):
     assert loose["stats"]["misses"] >= 1 and loose["digest"] == first["digest"], loose
     strict = _child(_CONSUME, tmp_path / "strict_cache", bare, "strict")
     assert "enforce_precompiled" in strict.get("error", ""), strict
+    warm = _child(_CONSUME, tmp_path / "loose_cache", bare, "strict")  # the loose run left the kernels on disk
+    assert "error" not in warm and warm["stats"]["misses"] == 0 and warm["digest"] == first["digest"], warm
 
 
 def test_a_blob_missing_one_kernel_is_refused_strictly_before_anything_compiles(produced_bhsd, tmp_path):
@@ -155,6 +157,6 @@ def test_a_blob_missing_one_kernel_is_refused_strictly_before_anything_compiles(
 
     _rewrite_header(blob, partial, drop_one)
     strict = _child(_CONSUME, tmp_path / "strict_cache", partial, "strict", "retry", layout="bhsd")
-    assert "does not carry every kernel" in strict.get("error", ""), strict
+    assert "neither in the blob nor in the compiled cache" in strict.get("error", ""), strict
     assert strict["stats"]["misses"] == 1, strict  # only the loose retry compiled
     assert strict["digest"] == first["digest"], strict

@@ -256,7 +256,6 @@ def deserialize(graph: "pygraph", data: Any, handle: Any = None, enforce_precomp
     if header.get("format") != FORMAT:
         raise ValueError(f"serialized python-engine plan has format {header.get('format')!r}; this frontend reads format {FORMAT}")
 
-    # Seed (and run the strict check) before touching the graph, so a refusal leaves it empty for a retry.
     device = getattr(getattr(handle if handle is not None else graph._handle, "device", None), "ordinal", None)
     seeded = 0
     for description in header["kernels"]:
@@ -265,23 +264,19 @@ def deserialize(graph: "pygraph", data: Any, handle: Any = None, enforce_precomp
             raise ValueError("serialized python-engine plan is truncated")
         if compiled_cache.seed_entry(description, bytes(payload[offset : offset + size]), device=device):
             seeded += 1
-    if enforce_precompiled and (not header["kernels"] or seeded != len(header["kernels"])):
-        raise cudnn_graph_not_supported(
-            f"enforce_precompiled: {seeded} of {len(header['kernels'])} compiled kernels in the blob match this environment "
-            f"(frontend, CuTe DSL, tvm-ffi, driver, device) or the compiled cache is disabled; the plan would compile"
-        )
+    seeded_note = f"{seeded} of the blob's {len(header['kernels'])} kernels match this environment (frontend, CuTe DSL, tvm-ffi, driver, device)"
 
     # Any later failure restores the empty graph, so the caller can retry on it.
     empty = {k: copy.copy(v) if isinstance(v, (list, dict, set)) else v for k, v in vars(graph).items()}
     try:
-        _rebuild(graph, header, handle, enforce_precompiled)
+        _rebuild(graph, header, handle, enforce_precompiled, seeded_note)
     except BaseException:
         vars(graph).clear()
         vars(graph).update(empty)
         raise
 
 
-def _rebuild(graph: "pygraph", header: Dict[str, Any], handle: Any, enforce_precompiled: bool) -> None:
+def _rebuild(graph: "pygraph", header: Dict[str, Any], handle: Any, enforce_precompiled: bool, seeded_note: str) -> None:
     from .frost import compiled_cache
 
     if handle is not None:
@@ -307,7 +302,9 @@ def _rebuild(graph: "pygraph", header: Dict[str, Any], handle: Any, enforce_prec
             cause = cause.__cause__ or cause.__context__
         if cause is None:
             raise
-        raise cudnn_graph_not_supported(f"enforce_precompiled: the blob does not carry every kernel of the plan; {cause}") from exc
+        raise cudnn_graph_not_supported(
+            f"enforce_precompiled: a kernel of the plan is neither in the blob nor in the compiled cache ({seeded_note}); {cause}"
+        ) from exc
 
 
 def cudnn_graph_not_supported(message: str) -> Exception:
