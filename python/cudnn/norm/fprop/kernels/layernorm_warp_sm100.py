@@ -3,7 +3,7 @@
 
 """LayerNorm/RMSNorm forward, sm_100 — warp-per-row, CUTLASS primitives.
 
-Modeled on cuDNN's ln_fwd kernel. Built on ``cutlass.primitives`` (nvvm):
+Modeled on cuDNN's ln_fwd kernel. Built on ``cutlass.experimental.primitives`` (nvvm):
 
 - ``tpr`` threads own one row. For large C the row is spread over ``wn = tpr//32``
   warps (``THREADS_PER_ROW = wn*32``) so each thread caches only ~``ldgs*V``
@@ -23,7 +23,7 @@ from __future__ import annotations
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-import cutlass.primitives as nvvm
+import cutlass.experimental.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS

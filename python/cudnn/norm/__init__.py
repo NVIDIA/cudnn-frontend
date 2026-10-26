@@ -5,7 +5,7 @@
 
 Five variants (LayerNorm, RMSNorm, GroupNorm, InstanceNorm, BatchNorm), both
 fprop and bprop, bf16 / fp16 / fp32 I/O. Kernels are JIT-compiled with the
-CUTLASS CuTe DSL using CUTLASS primitives (``cutlass.primitives`` / ``nvvm``
+CUTLASS CuTe DSL using CUTLASS primitives (``cutlass.experimental.primitives`` / ``nvvm``
 cp.async staging, ``SmemAllocator`` reductions) and the shared
 ``cudnn.frost.tile_dsl`` library — mirroring ``cudnn.sdpa`` / ``cudnn.gemm.frost``.
 

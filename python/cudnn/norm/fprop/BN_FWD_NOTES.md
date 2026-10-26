@@ -1,6 +1,6 @@
 # BatchNorm / InstanceNorm / GroupNorm forward (sm_100) — design & progress
 
-Kernels are **cutlass primitives** (`cutlass.primitives as nvvm`). Goal: BN/IN/GN forward
+Kernels are **cutlass primitives** (`cutlass.experimental.primitives as nvvm`). Goal: BN/IN/GN forward
 for NCHW **and** NHWC, hitting the copy-kernel ceiling; benchmark BN/IN vs cuDNN (GN has
 no cuDNN reference). Problem sizes: RN50 BN layers (`levels.label:RN50_FP8_BN_LAYERS_FULL`,
 N shrinkable). Benchmark: `benchmark/norms/benchmark_bn_in.py`
