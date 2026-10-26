@@ -3102,6 +3102,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 self.has_sink
                 and (
                     self._fp8
+                    or self.gate_desc is not None
                     or (
                         self.packed_thd_split
                         and not supports_paged_split_sink(
@@ -3114,7 +3115,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                         )
                     )
                 ),
-                "split_kv > 1 with an attention sink requires half-precision sink-free partials; packed THD sinks require the supported paged D128 Q>1 combine",
+                "split_kv > 1 with an attention sink requires half-precision sink-free partials without an epilogue gate; packed THD sinks require the supported paged D128 Q>1 combine",
             )
             if self.has_sink and self.packed_thd_split:
                 from cudnn import _pybind_module

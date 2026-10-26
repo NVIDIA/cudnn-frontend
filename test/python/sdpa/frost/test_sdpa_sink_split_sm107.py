@@ -43,6 +43,23 @@ def test_sink_split_graph_admission(case, monkeypatch):
 
 
 @pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
+def test_sink_gate_split_standalone_declines_at_support(dtype_name, monkeypatch):
+    import torch
+    from test_sdpa_fwd_dsl_sm107 import _fake_cc, _gate_api
+    from cudnn.frost import buffers
+
+    _fake_cc(monkeypatch, (10, 7))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    options = dict(s=4, dtype=getattr(torch, dtype_name), cga=2, pack_gqa=True, split_kv=4, is_causal=True)
+    # Each feature is supported separately; only their combination is absent.
+    assert _gate_api(**options, has_sink=True, with_gate=False).check_support()
+    assert _gate_api(**options, has_sink=False, with_gate=True).check_support()
+    with pytest.raises(ValueError, match="attention sink"):
+        _gate_api(**options, has_sink=True, with_gate=True).check_support()
+
+
+@pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
 @pytest.mark.parametrize("stats", ["none", "natural", "log2"])
 @pytest.mark.parametrize("case", list(CASES))
 def test_sink_split_standalone_replay(case, dtype_name, stats):
