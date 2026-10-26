@@ -9,6 +9,8 @@ _LAZY_EXPORTS = {
     "pooled_cache_update_forward": ("cudnn.deepseek_sparse_attention.pooled.api", "pooled_cache_update_forward"),
     "pooled_indexer_forward": ("cudnn.deepseek_sparse_attention.pooled.api", "pooled_indexer_forward"),
     "pooled_expand_forward": ("cudnn.deepseek_sparse_attention.pooled.api", "pooled_expand_forward"),
+    "pooled_select_forward": ("cudnn.deepseek_sparse_attention.pooled.api", "pooled_select_forward"),
+    "pooled_select_workspace_size": ("cudnn.deepseek_sparse_attention.pooled.api", "pooled_select_workspace_size"),
 }
 
 __all__ = list(_LAZY_EXPORTS)

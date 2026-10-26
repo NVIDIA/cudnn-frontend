@@ -2,7 +2,73 @@
 
 Pooled DSA selects groups of index keys, then expands each selected group to
 individual token IDs. `cudnn.ops.dsa` provides a pooled indexer and separate
-cache-update and index-expansion APIs for Blackwell SM100/SM103.
+selection, cache-update, and index-expansion APIs for Blackwell SM100/SM103.
+
+## Selection from logits
+
+`cudnn.ops.dsa.pooled_select_forward` accepts precomputed BF16 or FP32
+indexer logits. It selects complete causal pools, expands them into token
+IDs, appends incomplete-pool tail tokens, and fills padding with `-1` in
+one CuTe DSL launch. It has separate prefill and decode kernels. It performs
+no scoring, pooling, quantization, or attention softmax.
+
+This is the API used by the vLLM pooled-selection adapter. DeepGEMM supplies
+native BF16 logits; vLLM retains its existing pooled-key cache format.
+
+```python
+from cudnn.ops import dsa
+
+size = dsa.pooled_select_workspace_size(logits, max_pools=32768)
+workspace = torch.empty(size, dtype=torch.uint8, device=logits.device)
+result = dsa.pooled_select_forward(
+    logits, positions, selected_pools=512, pool_size=4,
+    mode="prefill", max_pools=32768,
+    output=output, workspace=workspace, current_stream=stream)
+indices = result["indices"]
+```
+
+| Argument | Contract |
+|---|---|
+| `logits` | BF16/FP32 `(N,C)`, contiguous columns, positive non-overlapping row stride, 32-byte-aligned address |
+| `positions` | INT32/INT64 `(N,)`, zero-based token positions; positive vector stride |
+| `selected_pools` | Multiple of 32, from 32 to 2048; default 512 |
+| `pool_size` | 4 or 16; default 4 |
+| `mode` | `"decode"` or `"prefill"` |
+| `max_pools` | Compile capacity, `C <= max_pools <= 32768`; defaults to `C` |
+| `output` | Optional INT32 matrix, at least `N` rows and `selected_pools * pool_size + pool_size - 1` columns |
+| `workspace` | Optional contiguous UINT8 vector, aligned to 256 bytes, sized with `pooled_select_workspace_size` |
+| `current_stream` | Optional CUDA stream handle or torch stream; defaults to the current stream |
+
+For position `p`, eligible columns are below
+`min(C, floor((p + 1) / pool_size))`. Negative positions and positions at or
+above `2**31 - 1` produce inactive rows. If the causal context fits within
+`selected_pools * pool_size` tokens, the output contains all causal token IDs
+in ascending order. Otherwise, selected pools occupy the fixed history
+region and up to `pool_size - 1` tail tokens follow it. Extra rows and columns
+are filled with `-1`. Tied IDs and selection order are unspecified. Eligible
+logits must not contain NaNs. The caller supplies columns for the history it
+wants ranked; the operation does not access a cache or page table.
+
+All tensors must share a CUDA device and require no autograd. Output rows
+may be padded, with contiguous columns and a positive non-overlapping row
+stride. Output and workspace must not overlap each other or either input.
+The int32 addressing limit requires `2*N*C < 2**31`.
+
+The workspace query reads only tensor metadata. BF16 specializations whose
+`max_pools` rounds up to 8192, 16384, or 32768 use 32 bytes. Other
+specializations use `8*N*C` bytes. The workspace contains selector scratch;
+it excludes input logits and output storage.
+
+With output and workspace supplied, the API allocates no device storage,
+copies or converts no tensors, reads no device values on the host, and does
+not synchronize. It reuses compilation across changing row counts, columns,
+and supported strides within `max_pools`. Warm up before CUDA graph capture.
+The caller keeps buffers live until execution completes on the chosen
+stream. When buffers are omitted, the function allocates them on that stream.
+It returns `TupleDict(indices=output)`. Backward and autograd are unsupported.
+
+`_compile_pooled_select` remains an internal compiler helper. Applications
+should use the public selection and workspace-size functions above.
 
 ## Indexer forward
 
