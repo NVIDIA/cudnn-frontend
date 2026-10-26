@@ -119,7 +119,11 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
         require(not self.thd, "THD / ragged is not supported")
         require(not self.seq_q_lens_present and not self.seq_kv_lens_present, "padding masks are not supported")
         require(not self.causal_bottom_right, "bottom-right causal is not supported")
-        require(self.window_size_left is None and self.window_size_right is None, "sliding windows and right-band widening are not supported")
+        require(self.window_size_right is None, "right-band widening is not supported")
+        require(
+            self.window_size_left is None or (type(self.window_size_left) is int and self.window_size_left >= 0),
+            "sliding window radius must be a nonnegative integer",
+        )
         require(all(d is None for d in (self.sink_desc, self.dsink_desc, self.bias_desc, self.dbias_desc)), "sink / dSink and bias / dBias are not supported")
         require(self.tile_m is None and self.tile_n is None, "the kernel has fixed tile geometry")
         for role in ROLES[:9]:
@@ -128,10 +132,10 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
             require(desc.device == self.q_desc.device, f"{role} must reside on {self.q_desc.device}")
         b, h, sq, d = self.q_desc.shape
         bk, hk, sk, dk = self.k_desc.shape
-        require(d == dk == 128, "D_QK and D_V must equal 128")
+        require(d == dk and d in (64, 128), "D_QK and D_V must equal 64 or 128")
         require(b == bk and h == hk, "Q and KV require equal batch and head counts (dense MHA)")
         try:
-            validate_dense_bounds(b, h, sq, sk)
+            validate_dense_bounds(b, h, sq, sk, self.window_size_left)
         except ValueError as error:
             require(False, str(error))
         self.dtype = self.q_desc.dtype
@@ -143,18 +147,22 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
                 require(desc.is_contiguous(), "Stats must be contiguous")
             else:
                 s = sk if role in ("k", "v", "dk", "dv") else sq
-                expected = (b, h, s, 128)
+                expected = (b, h, s, d)
                 require(tuple(desc.shape) == expected and desc.dtype == self.dtype, f"{role} must have shape {expected} and Q's dtype")
-                require(_same_geometry((desc.shape, desc.stride), (expected, (s * h * 128, 128, h * 128, 1))), f"{role} must use compact BSHD storage")
+                require(_same_geometry((desc.shape, desc.stride), (expected, (s * h * d, d, h * d, 1))), f"{role} must use compact BSHD storage")
         self.batch_size, self.h_q, self.h_kv = b, h, h
         self.s_q_max, self.s_k_max = sq, sk
-        self.head_dim_qk = self.head_dim_v = 128
-        self.scale_softmax = 128**-0.5 if self.scale_softmax is None else float(self.scale_softmax)
+        self.head_dim_qk = self.head_dim_v = d
+        self.scale_softmax = d**-0.5 if self.scale_softmax is None else float(self.scale_softmax)
         require(math.isfinite(self.scale_softmax) and self.scale_softmax != 0, "attn_scale must be finite and nonzero")
         # The recompute body owns each gradient tile in one CTA and visits
         # reduction tiles in a fixed order. The accumulation body uses unordered
         # FP32 dQ reductions, so it cannot serve a deterministic request.
-        self._implementation = RECOMPUTE if self.deterministic else select_implementation(cc, version, int(b), int(h), int(sq), int(sk), self.scale_softmax)
+        self._implementation = (
+            RECOMPUTE
+            if self.deterministic or d != 128 or self.window_size_left is not None
+            else select_implementation(cc, version, int(b), int(h), int(sq), int(sk), self.scale_softmax)
+        )
         self._is_supported = True
         return True
 

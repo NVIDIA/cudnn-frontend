@@ -59,7 +59,7 @@ def compile_plan(api):
     else:
         from .kernels.sm100.prepared_d128_host import compile_host
 
-        compile_args = (tuple(geometry), dtype, api.is_causal, cc[0] * 10 + cc[1])
+        compile_args = (tuple(geometry), dtype, api.is_causal, cc[0] * 10 + cc[1], 0 if api.window_size_left is None else api.window_size_left + 1)
     # compile_cached owns device/context-aware reuse; no argument-only outer cache.
     with torch.cuda.device(device):
         entry = compile_host(*compile_args)
