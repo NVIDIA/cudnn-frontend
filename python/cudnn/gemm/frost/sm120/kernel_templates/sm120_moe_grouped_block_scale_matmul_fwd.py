@@ -1601,8 +1601,12 @@ def _host(
     grid_shape = (grid_num_clusters, 1, 1)
     # Zero the scheduler counter on the launch stream. The PDL main kernel
     # below reads it only after griddepcontrol.wait, i.e. once this has landed.
+    # A runtime that zeroed the counter qword on this stream already (its own
+    # routing kernel, say) renders external_counter_reset True and saves the
+    # one-thread launch; the kernel then relies on that write having landed.
     counter_qword = grid_num_clusters * moe_desc_slots * TENSOR_MAP_QWORDS
-    _dynamic_scheduler_counter_initialization(a_tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
+    if cutlass.const_expr(not external_counter_reset):
+        _dynamic_scheduler_counter_initialization(a_tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     _kernel(
         problem_size[0],
         problem_size[1],

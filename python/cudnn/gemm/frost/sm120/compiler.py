@@ -1072,6 +1072,11 @@ def _render_tile_constants(
         # first_token_offset dtype (int32/int64) drives the compile() fake; the
         # scheduler casts its reads to Int32.
         lines.append(f"offset_cutlass_dtype = {DTYPE_TO_CUTLASS[chain.moe.offset_dtype]}")
+        # The host zeroes the scheduler counter with a one-thread launch before
+        # the PDL main launch, unless the integrating runtime zeroes it on the
+        # stream itself and renders this True (FlashInfer's MoE adapters do, in
+        # their routing kernel, saving the launch).
+        lines.append("external_counter_reset = False")
     lines.extend(_quant_device_imports(chain))
     return "\n".join(lines)
 
@@ -1717,6 +1722,9 @@ def _render_block_scale_tile_constants(
         # the first_token_offset alignment the graph promises (dtypes'
         # _compute_output_vec_bytes); runtime S must keep it.
         lines.append(f"moe_token_alignment = {_pow2_floor(math.gcd(chain.moe.offset_multiple, chain.matmul.N)) if isinstance(chain.moe, MoeSwapAbSpec) else 1}")
+        # As the BF16 MoE constants: the integrating runtime may zero the
+        # scheduler counter itself and render this True to skip the host's launch.
+        lines.append("external_counter_reset = False")
     lines.extend(_quant_device_imports(chain))
     return "\n".join(lines)
 
