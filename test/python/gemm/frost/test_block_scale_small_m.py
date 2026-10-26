@@ -80,6 +80,7 @@ def _run(combo, config_name, M, N, K, split_k=1, run_m=None):
     compiled({t["A"]: a, t["B"]: b, t["SFA"]: sfa, t["SFB"]: sfb, t["C"]: c}, workspace=ws)
     torch.cuda.synchronize()
     torch.testing.assert_close(c[0], ref.to(torch.float16), atol=2e-1, rtol=2e-2)
+    return compiled, c
 
 
 # (M tokens, N weight rows, K, tile width, split-K). M=24 at width 8 walks the
@@ -179,3 +180,55 @@ def test_override_shape_graph_declines_narrow_knobs():
     with pytest.raises(NotImplementedError, match="fixed graph shapes"):
         plan_config(chain, knobs=knobs, narrow_n_ok=False)
     assert plan_config(chain, knobs=knobs, narrow_n_ok=True).cta_tile_n == 8
+
+
+# (combo, tile width, M, N, K, split): the in-cluster reduction against the
+# workspace + reduce kernel the same config otherwise runs. The plan gate takes
+# S=2 only; S=4 / 8 still exercise the kernel through a widened gate.
+_CLUSTER_K_CASES = [
+    ("nvfp4", 8, 8, 512, 2048, 2),
+    ("nvfp4", 32, 32, 1024, 8192, 2),
+    ("mxfp8", 16, 24, 384, 1024, 2),
+    ("nvfp4", 8, 8, 2560, 8192, 4),
+    ("nvfp4", 16, 16, 384, 4096, 8),
+    ("nvfp4", 64, 100, 384, 2048, 2),
+]
+
+
+@requires_sm100
+@pytest.mark.parametrize("combo,width,M,N,K,split", _CLUSTER_K_CASES)
+def test_cluster_k_matches_workspace_split_bitwise(combo, width, M, N, K, split, monkeypatch):
+    import cudnn.gemm.frost.sm100.compiler as sm100_compiler
+
+    monkeypatch.setattr(sm100_compiler, "_CLUSTER_K_SLICES", (2, 4, 8))
+    monkeypatch.setattr(sm100_compiler, "_CLUSTER_K_MAX_MAILBOX_BYTES", 64 * 1024)
+    compiled, c_cluster = _run(combo, _narrow(width), M, N, K, split_k=split)
+    assert compiled.cluster_k_slices == split and compiled.workspace_bytes == 0
+    monkeypatch.setenv("CUDNN_FROST_DISABLE_CLUSTER_K", "1")
+    compiled, c_workspace = _run(combo, _narrow(width), M, N, K, split_k=split)
+    assert compiled.cluster_k_slices == 1 and compiled.workspace_bytes > 0
+    assert torch.equal(c_cluster, c_workspace)
+
+
+@pytest.mark.parametrize(
+    "width,split,expected",
+    [
+        (8, 2, 2),
+        (32, 2, 2),
+        (8, 4, 1),  # S=4 ties the reduce kernel
+        (64, 2, 1),  # a 32 KiB mailbox
+    ],
+)
+def test_cluster_k_eligibility(width, split, expected):
+    from cudnn.gemm.frost.compiler import _cluster_k_slices
+
+    chain = analyze(_build_nvfp4_graph(8, 256, 4096))
+    assert _cluster_k_slices(chain, dataclasses.replace(by_name(_narrow(width)), split_k_slices=split)) == expected
+
+
+def test_cluster_k_declines_two_cta_and_clustered_tiles():
+    from cudnn.gemm.frost.compiler import _cluster_k_slices
+
+    chain = analyze(_build_nvfp4_graph(8, 256, 4096))
+    cfg = dataclasses.replace(by_name("CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma"), split_k_slices=2)
+    assert _cluster_k_slices(chain, cfg) == 1

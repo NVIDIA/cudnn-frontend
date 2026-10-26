@@ -480,6 +480,21 @@ def _assignments_to(root, target):
     return [node for node in ast.walk(root) if isinstance(node, (ast.Assign, ast.AnnAssign)) and target in _assignment_names(node)]
 
 
+_CLUSTER_K_GUARD = _expr_dump("cutlass.const_expr(cluster_k_slices > 1)")
+
+
+def _is_under(node, parents, test_dump):
+    """Whether *node* sits in the body of an ``if`` whose test dumps to *test_dump*."""
+
+    child = node
+    while child in parents:
+        parent = parents[child]
+        if isinstance(parent, ast.If) and ast.dump(parent.test, include_attributes=False) == test_dump and child in parent.body:
+            return True
+        child = parent
+    return False
+
+
 _LIVE_FALLBACK_MISMATCH = _expr_dump("(cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1])")
 
 
@@ -509,7 +524,9 @@ def _check_preferred_fallback_pair(
 ):
     """Validate one source-level preferred/fallback value selection."""
 
-    assignments = _assignments_to(kernel, target)
+    # In-cluster split-K pins the N rank to 0 under its own constant guard: its
+    # (1, 1, S) cluster puts the K slice where the N rank would otherwise be.
+    assignments = [node for node in _assignments_to(kernel, target) if not _is_under(node, parents, _CLUSTER_K_GUARD)]
     preferred_dump = _expr_dump(preferred)
     fallback_dump = _expr_dump(fallback)
     preferred_assignments = [node for node in assignments if ast.dump(node.value, include_attributes=False) == preferred_dump]

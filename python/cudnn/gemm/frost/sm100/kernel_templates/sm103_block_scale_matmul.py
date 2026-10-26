@@ -54,6 +54,10 @@ from cutlass.cute.arch import clc as cute_clc
 
 # @@INJECT_TILE_CONSTANTS@@
 
+# The drain region carries sm100's in-cluster split-K reduction (parity with its group); sm103 never plans it.
+if cluster_k_slices > 1:
+    raise NotImplementedError(f"{__name__}: in-cluster split-K is sm100-template only")
+
 # Rank decomposition below uses shifts and masks instead of runtime integer
 # division.  The catalog satisfies this; keep synthesized configs from silently
 # taking the fast path with a non-power-of-two cluster dimension.
@@ -1510,6 +1514,26 @@ def _kernel(
                         _cv = nvvm.tcgen05_ld(shape, tmem, num=subtile_w)
                         c_rmem_vecs.append(_cv)
                     c_rmem_vec = c_rmem_vecs[0]
+                    if cutlass.const_expr(cluster_k_slices > 1):
+                        if cutlass.const_expr(subtile_idx == 0):
+                            if warp_idx == 0:
+                                if elect_one:
+                                    nvvm.mbarrier_arrive_expect_tx(k_full_mbar_ptr, (cluster_k_slices - 1) * cta_tile_mnk[0] * cta_tile_mnk[1] * 4)
+                            while not nvvm.mbarrier_try_wait_parity(k_full_mbar_ptr, tile_iter % 2, time_limit=10_000_000):
+                                pass
+                        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                        # Slice order 0, 1, ..., S-1: the same sum the split-K reduce kernel forms.
+                        k_sum = list(c_rmem_vec.to_elements())
+                        for k_slot in cutlass.range_constexpr(cluster_k_slices - 1):
+                            for q in cutlass.range_constexpr(subtile_w // 4):
+                                k_v4 = k_mailbox.load(
+                                    k_slot * (cta_tile_mnk[0] * cta_tile_mnk[1]) + (subtile_col_offset + 4 * q) * cta_tile_mnk[0] + tidx * 4,
+                                    vector_size=4,
+                                    alignment=16,
+                                )
+                                for e in cutlass.range_constexpr(4):
+                                    k_sum[4 * q + e] = k_sum[4 * q + e] + k_v4[e]
+                        c_rmem_vec = _cvec.Vector.from_elements(tuple(k_sum), mma_c_dtype)
 
                     if cutlass.const_expr(not use_acc_overlap):
                         if cutlass.const_expr(mi == mma_size_m - 1 and subtile_idx == subtile_cnt - 1):

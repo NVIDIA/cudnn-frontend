@@ -87,6 +87,20 @@ _cta_group_shift = cta_group.bit_length() - 1
 if use_acc_overlap and any(_w != epi_n for _, _w in _epi_subtile_spans(epi_cols_per_mma_m, epi_n)):
     raise NotImplementedError(f"{__name__}: acc overlap reverses subtiles by index, which needs a uniform drain width")
 
+# In-cluster split-K: a (1, 1, S) cluster splits K across its ranks, and rank 0
+# sums the peers' FP32 tiles out of its SMEM mailbox before the epilogue.
+if cluster_k_slices > 1 and (
+    cta_group != 1
+    or cluster_shape_mnk != (1, 1, cluster_k_slices)
+    or fallback_cluster_shape_mnk is not None
+    or mma_size_m != 1
+    or num_gemms != 1
+    or use_acc_overlap
+    or split_k_slices != 1
+    or cta_tile_mnk[0] != 128
+):
+    raise NotImplementedError(f"{__name__}: in-cluster split-K needs a single 1-CTA 128-row GEMM in a (1, 1, S) cluster")
+
 
 # Scheduler ring depth.
 CLC_SCHED_STAGES = 1
@@ -282,6 +296,9 @@ def _kernel(
         pair_leader_rank = cta_rank_in_cluster
 
     is_cluster_leader_cta = cta_rank_in_cluster == 0
+    if cutlass.const_expr(cluster_k_slices > 1):
+        n_rank = 0
+        k_rank = cta_rank_in_cluster
 
     if warp_idx == mma_warp_id:
         for _i in cutlass.range_constexpr(num_a_operands):
@@ -341,6 +358,8 @@ def _kernel(
             ab_empty_arrive_mask = cutlass.Int16((1 << cluster_size) - 1)
         else:
             ab_empty_arrive_mask = a_part_arrive | b_part_arrive
+        if cutlass.const_expr(cluster_k_slices > 1):
+            ab_empty_arrive_mask = cutlass.Int16(1) << cta_rank_in_cluster
     else:
         if cutlass.const_expr(multicast_a):
             tma_mcast_mask_a = cutlass.Int16(a_mcast_pattern << m_rank)
@@ -443,6 +462,13 @@ def _kernel(
     )
     # @@TMA_STORE_ONLY:END@@
 
+    if cutlass.const_expr(cluster_k_slices > 1):
+        # [peer slot][column / 4][tile row][4], peer slot = rank - 1: a warp's
+        # 16-byte stores and loads cover 512 contiguous bytes, free of bank conflicts.
+        k_mailbox = cutlass.Array(cutlass.Float32, (cluster_k_slices - 1) * cta_tile_mnk[0] * cta_tile_mnk[1], space=cutlass.AddressSpace.smem, alignment=16)
+        k_full_mbar_ptr = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem)
+        k_free_mbar_ptr = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem)
+
     if cutlass.const_expr(cta_group == 2):
         acc_empty_count = num_epilogue_warps * 2
     if cutlass.const_expr(ab_empty_full_mask):
@@ -455,6 +481,8 @@ def _kernel(
             ab_empty_count = cluster_m + cluster_n - 1
         else:
             ab_empty_count = (cluster_m // cta_group) + cluster_n - 1
+    if cutlass.const_expr(cluster_k_slices > 1):
+        ab_empty_count = 1
     num_consumer_warps_per_cta = 7
     clc_empty_count = num_consumer_warps_per_cta * cluster_size
     if warp_idx == 0:
@@ -481,6 +509,11 @@ def _kernel(
             if cutlass.const_expr(use_acc_overlap):
                 if elect_one:
                     nvvm.mbarrier_init(tmem_dealloc_mbar_ptr, num_epilogue_warps)
+            if cutlass.const_expr(cluster_k_slices > 1):
+                if elect_one:
+                    nvvm.mbarrier_init(k_full_mbar_ptr, 1)
+                if elect_one:
+                    nvvm.mbarrier_init(k_free_mbar_ptr, num_epilogue_warps)
         if cutlass.const_expr(cta_group == 2):
             for i in range(ab_stages):
                 if elect_one:
@@ -501,7 +534,7 @@ def _kernel(
                 nvvm.mbarrier_init(clc_empty_mbar_ptr.subview(i), clc_empty_count)
     nvvm.fence_mbarrier_init()
     if cutlass.const_expr(cta_group == 1):
-        if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] > 1):
+        if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] * cluster_shape_mnk[2] > 1):
             nvvm.barrier_cluster_arrive_relaxed()
             nvvm.barrier_cluster_wait()
         else:
@@ -594,7 +627,7 @@ def _kernel(
 
             sched_iter += 1
 
-        if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] > 1):
+        if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] * cluster_shape_mnk[2] > 1):
             if is_cluster_leader_cta:
                 for _ in range(CLC_SCHED_STAGES):
                     stage = sched_iter % CLC_SCHED_STAGES
@@ -632,6 +665,13 @@ def _kernel(
                 split_idx = cutlass.Int64(tile_l % split_k_slices)
                 k_tiles_per_split = num_k_tiles // split_k_slices
                 k_tiles_remainder = num_k_tiles % split_k_slices
+                k_begin = split_idx * k_tiles_per_split + cutlass.min(split_idx, k_tiles_remainder)
+                k_end = (split_idx + 1) * k_tiles_per_split + cutlass.min(split_idx + 1, k_tiles_remainder)
+            elif cutlass.const_expr(cluster_k_slices > 1):
+                batch_tile_l = tile_l // cluster_k_slices
+                split_idx = cutlass.Int64(k_rank)
+                k_tiles_per_split = num_k_tiles // cluster_k_slices
+                k_tiles_remainder = num_k_tiles % cluster_k_slices
                 k_begin = split_idx * k_tiles_per_split + cutlass.min(split_idx, k_tiles_remainder)
                 k_end = (split_idx + 1) * k_tiles_per_split + cutlass.min(split_idx + 1, k_tiles_remainder)
             else:
@@ -1159,6 +1199,12 @@ def _kernel(
                     k_tiles_remainder = num_k_tiles % split_k_slices
                     k_begin = split_idx * k_tiles_per_split + cutlass.min(split_idx, k_tiles_remainder)
                     k_end = (split_idx + 1) * k_tiles_per_split + cutlass.min(split_idx + 1, k_tiles_remainder)
+                elif cutlass.const_expr(cluster_k_slices > 1):
+                    split_idx = cutlass.Int64(k_rank)
+                    k_tiles_per_split = num_k_tiles // cluster_k_slices
+                    k_tiles_remainder = num_k_tiles % cluster_k_slices
+                    k_begin = split_idx * k_tiles_per_split + cutlass.min(split_idx, k_tiles_remainder)
+                    k_end = (split_idx + 1) * k_tiles_per_split + cutlass.min(split_idx + 1, k_tiles_remainder)
                 else:
                     k_begin = cutlass.Int64(0)
                     k_end = num_k_tiles
@@ -1300,8 +1346,10 @@ def _kernel(
                 tile_iter += 1
 
             # Dense only: an early-launched reducer would pile its many small CTAs
-            # onto the few idle SMs, so split-K leaves the trigger to grid exit.
-            if cutlass.const_expr(USE_PDL and split_k_slices == 1):
+            # onto the few idle SMs, so split-K leaves the trigger to grid exit. So
+            # does in-cluster split-K: an early dependent's CLC would steal the
+            # clusters still waiting for SMs and run them back to back.
+            if cutlass.const_expr(USE_PDL and split_k_slices == 1 and cluster_k_slices == 1):
                 nvvm.griddepcontrol("launch_dependents")
 
             tail_stage = acc_stage
@@ -1360,7 +1408,7 @@ def _kernel(
                         nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
                     tile_iter += 1
                 # Dense only, same reason as above.
-                if cutlass.const_expr(USE_PDL and split_k_slices == 1):
+                if cutlass.const_expr(USE_PDL and split_k_slices == 1 and cluster_k_slices == 1):
                     nvvm.griddepcontrol("launch_dependents")
                 nvvm.tcgen05_relinquish_alloc_permit(group=_CTA_GROUP)
                 peer_mbar = nvvm.mapa(tmem_dealloc_mbar_ptr, peer_cta_rank)
@@ -1420,6 +1468,64 @@ def _kernel(
         epi_stage_idx = cutlass.Int32(EPI_SMEM_STAGES - 1)
         # @@TMA_STORE_ONLY:END@@
 
+        if cutlass.const_expr(cluster_k_slices > 1):
+            tile_l = init_tile_l // cluster_k_slices
+            # Peer ranks hand their FP32 tile to rank 0 and skip the epilogue.
+            if k_rank != 0:
+                k_tile_bytes = cta_tile_mnk[0] * cta_tile_mnk[1] * 4
+                while is_valid != 0:
+                    acc_stage = tile_iter % acc_stages
+                    if acc_stage == 0 and tile_iter != 0:
+                        acc_full_phase_bit = acc_full_phase_bit ^ 1
+                    while not nvvm.mbarrier_try_wait_parity(acc_full_mbar_ptr.subview(acc_stage), acc_full_phase_bit, time_limit=10_000_000):
+                        pass
+                    acc_base_col = base_col_id_root + acc_stage * acc_region_cols
+                    for subtile_idx in cutlass.range_constexpr(subtile_cnt):
+                        subtile_col_offset, subtile_w = epi_spans[subtile_idx]
+                        tmem = cutlass.inttoptr((row_id_with_warp_offset << 16) | (acc_base_col + subtile_col_offset), 6, mma_c_dtype)
+                        k_part = nvvm.tcgen05_ld(shape, tmem, num=subtile_w)
+                        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                        if cutlass.const_expr(subtile_idx == subtile_cnt - 1):
+                            nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
+                            if elect_one:
+                                nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage))
+                        # Stage in this rank's own (otherwise unused) mailbox, in rank 0's layout.
+                        for q in cutlass.range_constexpr(subtile_w // 4):
+                            k_mailbox.data_ptr((subtile_col_offset + 4 * q) * cta_tile_mnk[0] + tidx * 4).store(k_part[4 * q : 4 * q + 4], alignment=16)
+                    # One bulk copy per tile: per-thread st.async serializes at DSMEM latency.
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    nvvm.barrier_cta_sync(barrier_id=EPI_SYNC_BAR_ID, thread_count=num_epilogue_warps * 32)
+                    if warp_idx == 0:
+                        if elect_one:
+                            nvvm.cp_async_bulk_shared_cluster_shared_cta(
+                                nvvm.mapa(k_mailbox.data_ptr((k_rank - 1) * (cta_tile_mnk[0] * cta_tile_mnk[1])), 0),
+                                k_mailbox.data_ptr(0),
+                                nvvm.mapa(k_full_mbar_ptr, 0),
+                                k_tile_bytes,
+                            )
+                            nvvm.cp_async_bulk_commit_group()
+                            nvvm.cp_async_bulk_wait_group(0, read=True)
+                    # Rank 0 has drained the mailbox before the next send.
+                    while not nvvm.mbarrier_try_wait_parity(k_free_mbar_ptr, tile_iter % 2, time_limit=10_000_000):
+                        pass
+                    consumer_stage = tile_iter % CLC_SCHED_STAGES
+                    if consumer_stage == 0 and tile_iter != 0:
+                        clc_full_phase_epi = clc_full_phase_epi ^ 1
+                    while not nvvm.mbarrier_try_wait_parity(
+                        clc_full_mbar_ptr.subview(consumer_stage),
+                        clc_full_phase_epi,
+                        time_limit=10_000_000,
+                    ):
+                        pass
+                    _m_idx, _n_idx, _l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    is_valid = vld
+                    nvvm.bar_warp_sync(0xFFFFFFFF)
+                    if elect_one:
+                        empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
+                        nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
+                    tile_iter += 1
+
         while is_valid != 0:
             coord_m_tile = tile_m * cgrp_tile_m_cur + m_rank * cta_tile_mnk[0]
             # @@EPILOGUE_DRAIN:BEGIN@@
@@ -1467,6 +1573,26 @@ def _kernel(
                         _cv = nvvm.tcgen05_ld(shape, tmem, num=subtile_w)
                         c_rmem_vecs.append(_cv)
                     c_rmem_vec = c_rmem_vecs[0]
+                    if cutlass.const_expr(cluster_k_slices > 1):
+                        if cutlass.const_expr(subtile_idx == 0):
+                            if warp_idx == 0:
+                                if elect_one:
+                                    nvvm.mbarrier_arrive_expect_tx(k_full_mbar_ptr, (cluster_k_slices - 1) * cta_tile_mnk[0] * cta_tile_mnk[1] * 4)
+                            while not nvvm.mbarrier_try_wait_parity(k_full_mbar_ptr, tile_iter % 2, time_limit=10_000_000):
+                                pass
+                        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                        # Slice order 0, 1, ..., S-1: the same sum the split-K reduce kernel forms.
+                        k_sum = list(c_rmem_vec.to_elements())
+                        for k_slot in cutlass.range_constexpr(cluster_k_slices - 1):
+                            for q in cutlass.range_constexpr(subtile_w // 4):
+                                k_v4 = k_mailbox.load(
+                                    k_slot * (cta_tile_mnk[0] * cta_tile_mnk[1]) + (subtile_col_offset + 4 * q) * cta_tile_mnk[0] + tidx * 4,
+                                    vector_size=4,
+                                    alignment=16,
+                                )
+                                for e in cutlass.range_constexpr(4):
+                                    k_sum[4 * q + e] = k_sum[4 * q + e] + k_v4[e]
+                        c_rmem_vec = _cvec.Vector.from_elements(tuple(k_sum), mma_c_dtype)
 
                     if cutlass.const_expr(not use_acc_overlap):
                         if cutlass.const_expr(mi == mma_size_m - 1 and subtile_idx == subtile_cnt - 1):
@@ -1520,6 +1646,11 @@ def _kernel(
                     # @@STG_ONLY:END@@
 
             # @@EPILOGUE_DRAIN:END@@
+            if cutlass.const_expr(cluster_k_slices > 1):
+                nvvm.bar_warp_sync(0xFFFFFFFF)
+                if elect_one:
+                    for k_peer in cutlass.range_constexpr(1, cluster_k_slices):
+                        nvvm.mbarrier_arrive(nvvm.mapa(k_free_mbar_ptr, k_peer), scope=nvvm.MemScope.CLUSTER)
             consumer_stage = tile_iter % CLC_SCHED_STAGES
             if consumer_stage == 0 and tile_iter != 0:
                 clc_full_phase_epi = clc_full_phase_epi ^ 1
@@ -1550,7 +1681,10 @@ def _kernel(
                 swizzle_w,
                 identity=tile_swizzle_n == 1,
             )
-            tile_l = l_idx
+            if cutlass.const_expr(cluster_k_slices > 1):
+                tile_l = l_idx // cluster_k_slices
+            else:
+                tile_l = l_idx
             nvvm.bar_warp_sync(0xFFFFFFFF)
             if elect_one:
                 empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
@@ -1741,7 +1875,7 @@ def _host(
     num_tile_n_host = (n + cgrp_tile_n - 1) // cgrp_tile_n
     grid_x = num_tile_m_host * cluster_m
     grid_y = num_tile_n_host * cluster_n
-    grid_shape = (grid_x, grid_y, batch * split_k_slices)
+    grid_shape = (grid_x, grid_y, batch * split_k_slices * cluster_k_slices)
     launch = _kernel(
         problem_size[0],
         problem_size[1],

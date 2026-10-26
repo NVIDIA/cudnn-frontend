@@ -1503,6 +1503,8 @@ def _render_block_scale_tile_constants(
     cfg: TileConfig,
     chain: FusionChain,
     tmpl,
+    *,
+    cluster_k_slices: int = 1,
 ) -> str:
     """Emit module-level constants for the tcgen05 block-scale matmul templates
     (the sm100 family, and sm103 through its ``is_sm103`` branches).
@@ -1778,6 +1780,9 @@ def _render_block_scale_tile_constants(
     # sizing the AB pipeline (else SMEM overflows the cap).
     epi_reserved = _smem_d_bytes(cfg, chain) if use_tma_store_epi else 0
     ab_reserved = epi_reserved
+    if cluster_k_slices > 1:
+        # rank 0's peer mailbox, declared after the rings, plus its two mbarriers
+        ab_reserved += _cluster_k_mailbox_bytes(cfg, cluster_k_slices) + 16
     if chain.has_moe and chain.moe.mode == "gather":
         token_rows, token_sfs = (cta_n, real_nb) if isinstance(chain.moe, MoeSwapAbSpec) else (cta_m, real_na)
         ab_reserved += token_rows * 32 * token_sfs
@@ -1916,7 +1921,8 @@ def _render_block_scale_tile_constants(
         f"cgrp_tile_n = {cta_n * cfg.cga_size_n}",
         f"epi_tile_mn = {(cfg.epi_tile_m, _epi_n_for_chain(cfg, chain))}",
         f"threads_per_cta = {cfg.threads_per_cta}",
-        f"cluster_shape_mnk = {cfg.cluster_shape}",
+        f"cluster_shape_mnk = {(1, 1, cluster_k_slices) if cluster_k_slices > 1 else cfg.cluster_shape}",
+        f"cluster_k_slices = {cluster_k_slices}",
         f"matmul_a_batch = {chain.matmul.a_batch}",
         f"matmul_b_batch = {chain.matmul.b_batch}",
         f"ab_stages = {ab_stages}",
@@ -2420,6 +2426,7 @@ def _render_block_scale_template(
     chain: FusionChain,
     snippets: EpilogueSnippets,
     config: TileConfig,
+    cluster_k_slices: int = 1,
 ) -> str:
     """Render the block-scale matmul template. Picks TMA-store when
     _use_tma_store_epi allows, else STG; SF TMA descriptors are hardcoded in the
@@ -2447,7 +2454,7 @@ def _render_block_scale_template(
     host_aux_pass = _aux_call_block(aux_tensors)
     compile_aux_fakes = _aux_fake_block(aux_tensors, dynamic_strides=True, align_reqs=_aux_align_reqs(chain, vec_bytes=_out_vec_bytes(chain, config, use_tma)))
     compile_aux_pass = _aux_call_block(aux_tensors, prefix="fake_")
-    tile_constants = _render_block_scale_tile_constants(config, chain, tmpl)
+    tile_constants = _render_block_scale_tile_constants(config, chain, tmpl, cluster_k_slices=cluster_k_slices)
     tile_constants += f"\nmoe_gather = {chain.has_moe and chain.moe.mode == 'gather'}\nmoe_scatter = {chain.has_moe and chain.moe.mode == 'scatter'}\nmoe_top_k = {chain.moe.top_k if chain.has_moe else 1}"
     tile_constants += f"\nmoe_combine = {chain.has_moe and chain.moe.mode == 'combine'}"
     if plumb.tap_constants:
@@ -2971,10 +2978,12 @@ class CompiledFusedGemm:
     vec_bytes_epi: "int | None" = None
     # workspace for split-K
     workspace_bytes: int = 0
+    # > 1: the config's split-K runs as a (1, 1, S) cluster reduced in SMEM (no workspace)
+    cluster_k_slices: int = 1
 
     def workspace_bytes_for(self, batch: int, m: int, n: int) -> int:
         """workspace for a given shape."""
-        if self.config.split_k_slices == 1:
+        if self.config.split_k_slices == 1 or self.cluster_k_slices > 1:
             return 0
         return align_up(self.config.split_k_slices * batch * m * n * 4)
 
@@ -3120,6 +3129,9 @@ class CompiledFusedGemm:
         split_k_slices = self.config.split_k_slices
         swap_ab = self.config.swap_ab
         narrow_n_limit = self._narrow_n_limit()
+        cluster_k_slices = self.cluster_k_slices
+        if cluster_k_slices > 1:
+            cluster_k_tile = _cta_k_elems(self.chain, self.config)
         packed_scale_slots = frozenset(
             o.index for o in r.outputs if o.role.startswith("quant_scale_") and self.chain.quants[int(o.role.rsplit("_", 1)[1])].scale_reorder == "F8_128x4"
         )
@@ -3163,6 +3175,9 @@ class CompiledFusedGemm:
             m, n, k = a_sh[1], b_sh[1], a_sh[2] * a_kpack
             if narrow_n_limit and n > narrow_n_limit:
                 gave_up["narrow SFB tile past its N extent"] += 1
+                return refuse(operands, graph_order)
+            if cluster_k_slices > 1 and (k + cluster_k_tile - 1) // cluster_k_tile < cluster_k_slices:
+                gave_up["fewer K tiles than cluster K slices"] += 1
                 return refuse(operands, graph_order)
             # permute(1, 2, 0) relabels axes, so the strides the kernel wants are
             # that rotation of the ones each check already read -- no second read.
@@ -3321,6 +3336,13 @@ class CompiledFusedGemm:
                 f"cudnn.frost gemm: plan {self.config.name!r} reads a sub-tile of the 128-row SFB block and "
                 f"serves a kernel N of at most {limit}; this call has N={kernel_n}. Build the plan for this M."
             )
+        if self.cluster_k_slices > 1:
+            k_tiles = -(-mnk[2] // _cta_k_elems(self.chain, self.config))
+            if k_tiles < self.cluster_k_slices:
+                raise ValueError(
+                    f"cudnn.frost gemm: plan {self.config.name!r} splits K across {self.cluster_k_slices} cluster ranks, "
+                    f"but K={mnk[2]} has {k_tiles} K tile(s). Build the plan for this K."
+                )
         check_shapes(recipe, operands, mnk, axes)
         check_alignment(recipe, operands, axes)
         raise RuntimeError(
@@ -5176,6 +5198,42 @@ def _jit_moe(
     )
 
 
+# A (1, 1, S) cluster reduces split-K in rank 0's SMEM. Measured on B200 (PR #1870):
+# S=2 with an N tile <= 32 beats the workspace + reduce kernel on every shape;
+# S=4 ties, S=8 loses (an 8-CTA cluster waits for a free GPC slot), and wider
+# mailboxes are mixed. The template supports S up to 8.
+_CLUSTER_K_SLICES = (2,)
+_CLUSTER_K_MAX_MAILBOX_BYTES = 16 * 1024
+
+
+def _cluster_k_mailbox_bytes(cfg: TileConfig, slices: int) -> int:
+    return (slices - 1) * cfg.cta_tile_m * cfg.cta_tile_n * 4
+
+
+def _cluster_k_slices(chain: FusionChain, config: TileConfig) -> int:
+    """The split-K slices the sm100 block-scale template reduces inside a (1, 1, S)
+    cluster, or 1 when the plan keeps the workspace + reduce kernel."""
+    s = config.split_k_slices
+    if s not in _CLUSTER_K_SLICES or os.environ.get("CUDNN_FROST_DISABLE_CLUSTER_K"):
+        return 1
+    if (
+        config.pipeline != "sm100"
+        or config.cta_group != 1
+        or config.cga_size_m != 1
+        or config.cga_size_n != 1
+        or config.cta_tile_m != 128
+        or config.mma_size_m != 1
+        or chain.num_gemms != 1
+        or chain.has_moe
+        or chain.reductions
+        or chain.quants
+    ):
+        return 1
+    if _cluster_k_mailbox_bytes(config, s) > _CLUSTER_K_MAX_MAILBOX_BYTES:
+        return 1
+    return s
+
+
 def _jit_block_scale(
     chain: FusionChain,
     config: TileConfig,
@@ -5192,23 +5250,27 @@ def _jit_block_scale(
     from ..kernel_registry import select_template
 
     _precheck_block_scale(chain, config)
-    store_modes = _store_modes(chain, config)
-    use_tma = _use_tma_store_epi(chain, config)
-    splitk = config.split_k_slices > 1
+    # The plan keeps its split-K config; only the kernel it renders changes.
+    cluster_k_slices = _cluster_k_slices(chain, config)
+    kernel_config = replace(config, split_k_slices=1) if cluster_k_slices > 1 else config
+    store_modes = _store_modes(chain, kernel_config)
+    use_tma = _use_tma_store_epi(chain, kernel_config)
+    splitk = kernel_config.split_k_slices > 1
     snippets = generate(
         chain,
-        vec_bytes_epi=_epi_chunk_bytes(chain, config, use_tma),
+        vec_bytes_epi=_epi_chunk_bytes(chain, kernel_config, use_tma),
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
         tma_slots=frozenset({0}) if (splitk and use_tma) else frozenset(i for i, m in enumerate(store_modes) if m == "tma"),
-        packed_lanes=_epi_packed_lanes(config),
-        split_k_slices=config.split_k_slices,
+        packed_lanes=_epi_packed_lanes(kernel_config),
+        split_k_slices=kernel_config.split_k_slices,
     )
-    src = _render_block_scale_template(chain, snippets, config)
+    src = _render_block_scale_template(chain, snippets, kernel_config, cluster_k_slices=cluster_k_slices)
     mod = _import_kernel(src)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
     return CompiledFusedGemm(
         chain=chain,
         config=config,
+        cluster_k_slices=cluster_k_slices,
         device=_plan_device(),
         aux_names=[aux.name for aux in chain.aux_tensors],
         generated_path=_cache_dir() / f"gen_{digest}" / "generated_kernel.py",
@@ -5217,8 +5279,8 @@ def _jit_block_scale(
         use_tma_store=use_tma,
         block_scale=True,
         binding=binding,
-        vec_bytes_epi=_out_vec_bytes(chain, config, use_tma),
-        workspace_bytes=_splitk_workspace_bytes(chain, config),
+        vec_bytes_epi=_out_vec_bytes(chain, kernel_config, use_tma),
+        workspace_bytes=_splitk_workspace_bytes(chain, kernel_config),
     )
 
 
