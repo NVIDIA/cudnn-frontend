@@ -301,7 +301,8 @@ _NB_FENCE_P0 = 11
 # cc 10.0 only -- cc 10.3 retains its all-MUFU path) AND a tile/layout gate. Dense bands keep their
 # existing mix. BF16 D128 causal THD also mixes unmasked interior tiles (nonpaged, and paged without bias or an
 # explicit KV mask); diagonal, sliding-window and masked tiles retain MUFU. FP16 causal THD, d64 THD and
-# split-KV builds keep their previous behavior. Padding alone is not a causal/SWA band.
+# split-KV builds keep their previous behavior. Native BF16 D64 nonpaged causal interiors also use the mix.
+# Padding alone is not a causal/SWA band.
 _E2E_FREQ = 16
 _E2E_RES = 4
 _E2E_LIMIT = CFG.TILE_N
@@ -328,7 +329,19 @@ _E2E_THD_INTERIOR = bool(
     and CFG.SPLIT_KV == 1
     and (CFG.MASK_FLAGS & (MASK_CAUSAL | MASK_SWA)) == MASK_CAUSAL
 )
-_E2E_ENABLED = bool(PARAMS.exp2_fma_split) and (_E2E_DENSE_BAND or _E2E_PAGED_INTERIOR or _E2E_THD_INTERIOR)
+# Native BF16 D64 causal interiors share the existing mixed exp2 helper.
+# Keep diagonal tiles, alternate masks/layouts and unmeasured architectures on MUFU.
+_E2E_D64_INTERIOR = bool(
+    PARAMS.d_flavor == 64
+    and CFG.DTYPE_QKV == 2
+    and not CFG.THD_VARLEN
+    and not CFG.PAGED_KV
+    and CFG.SPLIT_KV == 1
+    and not CFG.BIAS_MODE
+    and not CFG.KV_MASK_FORM
+    and (CFG.MASK_FLAGS & (MASK_CAUSAL | MASK_SWA)) == MASK_CAUSAL
+)
+_E2E_ENABLED = bool(PARAMS.exp2_fma_split) and ((PARAMS.d_flavor != 64 and (_E2E_DENSE_BAND or _E2E_PAGED_INTERIOR or _E2E_THD_INTERIOR)) or _E2E_D64_INTERIOR)
 _E2E_EMULATED_COLS = (_E2E_LIMIT // _E2E_FREQ) * _E2E_RES if _E2E_ENABLED else 0
 if _E2E_ENABLED:
     if not (0 <= _E2E_RES <= _E2E_FREQ and _E2E_FREQ % 2 == 0 and _E2E_RES % 2 == 0 and _E2E_LIMIT % _E2E_FREQ == 0):
