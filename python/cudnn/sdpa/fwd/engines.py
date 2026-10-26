@@ -70,6 +70,7 @@ from cudnn.sdpa.fwd.config_sm107 import (
     SM107_F16_SMALL_D_SHAPES,
     SM107_F16_THD_SHAPES,
     SM107_FP8_THD_SHAPES,
+    SM107_FP8_SPLIT_SHAPES,
     SM107_MXFP8_THD_SHAPES,
     SM107_SCORE_STATS_SHAPES,
     SM107_SMALL_D_CGAS,
@@ -2607,16 +2608,9 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             sm_lo=107 if rubin_row else _BLACKWELL[0],
             sm_hi=_BLACKWELL[1] if rubin_row else 106,
             phase="prefill",
-            # Both lines carry the four d >= 128 native flavors: Rubin gained its
-            # d192x128 FP8 sibling (sm107/prefill_d192_d128_fp8.py).
-            # (64, 64) is a NATIVE flavor of the SM100 line only, not an envelope:
-            # the d128 FP8 file at TILE_K = TILE_O = 64 (TemplateParams.d_flavor)
-            # instead of zero-filling a 128-wide tile for gpt-oss-class head dims
-            # (api_dsl._SM100_FP8_KERNEL_FILES).  Rubin has no d64 sibling
-            # (api_dsl._SM107_FP8_KERNEL_FILES), so its row keeps d64 on the d128
-            # envelope -- listing the shape here would make _selected_d_shape name
-            # a flavor the split / PackGQA / scheduler domains below never build.
-            d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)} | (set() if rubin_row else {(64, 64)})),
+            # Both architectures carry native D64 through their d128 FP8 body.
+            # The record selects 64-wide K/O geometry, including packed/split plans.
+            d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)}),
             d_pad_multiple=16,
             # The d512 flavor serves the (256, 512] band on BOTH head dims —
             # the range no smaller FP8 flavor reaches, at most 2x zero-padding.
@@ -2780,6 +2774,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
                     ((256, 256), frozenset({SCHED_NATURAL, SCHED_LPT})),
                     ((192, 128), frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})),
                     ((128, 128), frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})),
+                    ((64, 64), frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})),
                 )
                 if rubin_row
                 else ()
@@ -2787,8 +2782,8 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
-            # (64, 64): cga1 only -- at cga2 the halved V slab would need a 32-byte
-            # swizzle the FP8 P.V descriptors do not model (api_dsl.supported_cgas_for).
+            # Native D64: cga1 on SM100; cga1/2 on Rubin, whose P.V descriptor
+            # models the 32-byte per-CTA V swizzle (api_dsl.supported_cgas_for).
             # (128, 128): the per-tensor FP8 d128 kernel builds at both widths on
             # BOTH legs; the heuristic runs a dense graph at cga1 (heuristics.
             # _auto_sched_cga).  The split leg used to be held at cga2: on a
@@ -2798,7 +2793,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # llama 64/8 e4m3, 128k keys, b=1: 134 us at cga2 x split 8, flat to
             # split 32; b=8 stayed unsplit at 895 us).
             cgas_by_d_shape=(
-                (((256, 256), frozenset({1})),)
+                (((64, 64), frozenset({1, 2})), ((256, 256), frozenset({1})))
                 if rubin_row
                 else (((64, 64), frozenset({1})), ((128, 128), frozenset({1, 2})), ((192, 128), frozenset({1, 2})), ((256, 256), frozenset({1})))
             ),
@@ -2809,15 +2804,15 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # every flavor already runs.
             softmax_precisions=(frozenset({cudnn.data_type.FLOAT, cudnn.data_type.HALF}) if rubin_row else frozenset({cudnn.data_type.FLOAT})),
             split_kv_supported=True,
-            split_d_shapes=(frozenset({(128, 128), (192, 128)}) if rubin_row else frozenset({(64, 64), (128, 128), (192, 128), (256, 256)})),
+            split_d_shapes=(SM107_FP8_SPLIT_SHAPES if rubin_row else frozenset({(64, 64), (128, 128), (192, 128), (256, 256)})),
             pack_gqas=frozenset({False, True}),
-            # SM107: PackGQA is wired in the d128 FP8 BODY, which d192xd128
-            # shares -- but the row keeps it to d128 until the d192 PackGQA
+            # SM107: PackGQA is wired in the d128 FP8 BODY at D64 and D128.
+            # The d192xd128 sibling shares it, but stays declined until its PackGQA
             # path is actually validated on Rubin (a shared body is evidence
             # the code exists, not that it is correct at a wider K).  The
             # ported d256/d512 kernels do not wire it at all, as they do not
             # wire split-KV.
-            pack_gqa_d_shapes=(frozenset({(128, 128)}) if rubin_row else None),
+            pack_gqa_d_shapes=(frozenset({(64, 64), (128, 128)}) if rubin_row else None),
             # Fused epilogue gate on the Rubin d256 FP8 kernel (E4M3 / E5M2 in,
             # any out dtype): G is staged in BF16 (kernel GATE_STORAGE_DTYPE), so
             # the row names that one dtype rather than inheriting Q's.  The FP8

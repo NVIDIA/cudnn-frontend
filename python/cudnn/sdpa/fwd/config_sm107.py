@@ -191,6 +191,7 @@ __all__ = [
     "SMEM_CAP_BYTES",
     "SMEM_USABLE_BYTES",
     "SM107_FP8_THD_SHAPES",
+    "SM107_FP8_SPLIT_SHAPES",
     "SM107_F16_THD_SHAPES",
     "SM107_EPILOGUE_GATE_SHAPES",
     "SM107_SCORE_STATS_SHAPES",
@@ -283,6 +284,8 @@ _O_BLOCK_SCALE_BY_DTYPE = {_DTYPE_O_NVFP4: 16, _DTYPE_O_MXFP8: 32}
 # the shared decode reads 4B+4.  Confirmed on w2u1g-lc-0030: 43 passed / 0
 # failed across the per-tensor FP8 THD suite.
 SM107_FP8_THD_SHAPES = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+# Bodies with FP32 partial stores: shared by factory, admission and prepared workspace.
+SM107_FP8_SPLIT_SHAPES = frozenset({(64, 64), (128, 128), (192, 128)})
 
 # f16/bf16 flavor names whose kernel body HAS been ported to the FROST
 # setup-kernel contract (the 14-arg build_thd_meta_o_descs_kernel + the 4B+4
@@ -1423,7 +1426,17 @@ _EPILOGUE_GATE_FLAVORS = frozenset({"sm107 d256", "sm107 d256 mxfp8"})
 #     scale: wired in the MXFP8 and half bodies of the listed flavors.  Per-tensor FP8 keeps folding
 #     descale_q * descale_k into the softmax scale in-kernel, so the fold is declined there whatever the flavor.
 SM107_SOFTMAX_F16_FLAVORS = frozenset(
-    {"sm107 d128", "sm107 d192xd128", "sm107 d256", "sm107 d512", "sm107 d128 mxfp8", "sm107 d192xd128 mxfp8", "sm107 d256 mxfp8", "sm107 d512 mxfp8"}
+    {
+        "sm107 d64",
+        "sm107 d128",
+        "sm107 d192xd128",
+        "sm107 d256",
+        "sm107 d512",
+        "sm107 d128 mxfp8",
+        "sm107 d192xd128 mxfp8",
+        "sm107 d256 mxfp8",
+        "sm107 d512 mxfp8",
+    }
 )
 SM107_SCALE_PREFOLDED_FLAVORS = frozenset(
     {"sm107 d128", "sm107 d192xd128", "sm107 d256", "sm107 d512", "sm107 d128 mxfp8", "sm107 d192xd128 mxfp8", "sm107 d256 mxfp8", "sm107 d512 mxfp8"}
@@ -2093,9 +2106,10 @@ def _validate_q_in_tmem(cfg, flavor: str) -> None:
 
 
 def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, tile_o: int, mxfp8: bool):
-    # Half and per-tensor FP8 D128/D192 use the shared split protocol.
+    # Per-tensor FP8 D64/D128/D192 and half D128/D192 share FP32 split partials.
     # MXFP8 has no split loop yet.
-    split_wired = not mxfp8 and tile_k in (128, 192) and tile_o == 128
+    split_shapes = SM107_FP8_SPLIT_SHAPES if params.dtype_qkv <= _DTYPE_E5M2 else {(128, 128), (192, 128)}
+    split_wired = not mxfp8 and (tile_k, tile_o) in split_shapes
     # The block-scaled O epilogue lives in the two d128 kernels (per-tensor fp8 and
     # mxfp8); the d192xd128 siblings share this config family but not the epilogue.
     block_scaled_o_wired = tile_k == 128 and tile_o == 128
@@ -2233,10 +2247,10 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
         )
     cls = {192: CfgD192, 128: CfgD128, 64: CfgD64, 32: CfgD32}[tile_k]
     if tile_k <= 64:
-        # The small tiles are the f16/bf16 kernel's: the quantized d128 files keep TILE_K = 128 (their k_dim / SF geometry
-        # is tied to the 128-wide tile), and the body is validated at the widths SM107_SMALL_D_CGAS names.
-        if params.dtype_qkv <= _DTYPE_E5M2:
-            raise ValueError(f"{flavor}: the 32- and 64-wide head-dim tiles are wired on the f16/bf16 prefill kernel only (dtype_qkv={params.dtype_qkv})")
+        # Per-tensor FP8 can issue one Rubin K=64 MMA at the native D64 width.
+        # Block-scaled FP8 and D32 retain their existing larger envelope.
+        if params.dtype_qkv <= _DTYPE_E5M2 and (mxfp8 or tile_k != 64):
+            raise ValueError(f"{flavor}: quantized small head-dim tiles require per-tensor FP8 D64")
         if cta_mma not in SM107_SMALL_D_CGAS[(tile_k, tile_o)]:
             raise ValueError(
                 f"{flavor}: cta_mma={cta_mma} is outside the validated widths {sorted(SM107_SMALL_D_CGAS[(tile_k, tile_o)])} for TILE_O={tile_o}; "
@@ -2347,7 +2361,10 @@ def make_cfg_d32(params: TemplateParams) -> Tuple[CfgD32, TmaIters]:
 def make_cfg_d64(params: TemplateParams) -> Tuple[CfgD64, TmaIters]:
     """The 64-wide head-dim tile of ``sm107/prefill_d128_f16.py`` (``TemplateParams.d_flavor=64``): every f16/bf16 head dim in
     (32, 64] with D % 8 == 0 (40 / 48 / 56 / 64) by TMA zero fill; the same feature set and routing as ``make_cfg_d32`` (cga1
-    and cga2)."""
+    and cga2). Per-tensor FP8 uses the same native width in ``prefill_d128_fp8.py``,
+    including dense PackGQA and split-KV; its THD and paged forms remain unsupported."""
+    if params.dtype_qkv <= _DTYPE_E5M2 and params.thd_varlen:
+        raise ValueError("sm107 d64: per-tensor FP8 THD is not wired at the native D64 width")
     return _make_cfg_d128_family(params, flavor="sm107 d64", tile_k=64, tile_o=64, mxfp8=False)
 
 
