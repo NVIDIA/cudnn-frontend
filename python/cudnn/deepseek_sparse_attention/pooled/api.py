@@ -11,5 +11,6 @@ if cutedsl_too_old(cutedsl_state()[1]):
 from .cache import pool_cache_update_wrapper as pooled_cache_update_forward
 from .forward import indexer_forward_wrapper as pooled_indexer_forward
 from .indices import expand_indices_wrapper as pooled_expand_forward
+from .selection import pooled_select_forward, pooled_select_workspace_size
 
-__all__ = ["pooled_cache_update_forward", "pooled_indexer_forward", "pooled_expand_forward"]
+__all__ = ["pooled_cache_update_forward", "pooled_indexer_forward", "pooled_expand_forward", "pooled_select_forward", "pooled_select_workspace_size"]

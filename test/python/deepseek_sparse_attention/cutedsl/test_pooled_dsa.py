@@ -390,30 +390,38 @@ def _check_indexer_result(args, reference, workspace, selected_pools=32, pool_si
 
 @pytest.mark.parametrize("mode", ["prefill", "decode"])
 @pytest.mark.parametrize("score_dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("columns", [64, 8192, 32768])
-def test_fused_select_boundaries_ties_and_replay(mode, score_dtype, columns):
-    import cuda.bindings.driver as cuda
-    from cudnn.deepseek_sparse_attention.pooled.forward import _compile_pooled_select
-
-    topk = 32 if columns == 64 else 512
-    boundary = topk * 4
+@pytest.mark.parametrize("columns", [65, 8192, 32768])
+@pytest.mark.parametrize("pool_size", [4, 16])
+def test_fused_select_boundaries_ties_and_replay(mode, score_dtype, columns, pool_size):
+    topk = 32 if columns == 65 else 512
+    boundary = topk * pool_size
     positions = torch.tensor(
-        [boundary - 1, boundary, boundary + 1, boundary + 2, boundary + 3, columns * 4 - 1, columns * 4 + 1, -1, 2**31 - 1, columns * 4 + 44],
+        [
+            boundary - 1,
+            boundary,
+            boundary + 1,
+            boundary + 2,
+            boundary + 3,
+            columns * pool_size - 1,
+            columns * pool_size + 1,
+            -1,
+            2**31 - 1,
+            columns * pool_size + 44,
+        ],
         device="cuda",
         dtype=torch.int64,
     )
     rows = positions.numel()
     backing = torch.full((rows, columns + 8), float("nan"), dtype=score_dtype, device="cuda")
     scores = backing[:, :columns].zero_()
-    scratch_shape = (1, 2, 4) if score_dtype == torch.bfloat16 and columns >= 8192 else (rows, 2, columns)
-    scratch = torch.empty(scratch_shape, dtype=torch.int32, device="cuda")
-    width = boundary + 7
+    workspace = torch.empty(dsa.pooled_select_workspace_size(scores), dtype=torch.uint8, device="cuda")
+    width = boundary + pool_size + 3
     storage = torch.full((rows + 2, width + 4), 12345, dtype=torch.int32, device="cuda")
     output = storage[:, :width]
-    kernel = _compile_pooled_select(torch.cuda.current_device(), torch.cuda.get_device_capability(), columns, topk, 4, positions.dtype, mode, score_dtype)
 
     def run():
-        kernel(scores, scratch, positions, output, cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+        result = dsa.pooled_select_forward(scores, positions, selected_pools=topk, pool_size=pool_size, mode=mode, output=output, workspace=workspace)
+        assert result["indices"] is output
 
     run()
     graph = torch.cuda.CUDAGraph()
@@ -428,23 +436,105 @@ def test_fused_select_boundaries_ties_and_replay(mode, score_dtype, columns):
         for row, position in enumerate(positions.cpu().tolist()):
             length = position + 1 if 0 <= position < 2**31 - 1 else 0
             actual = output[row].cpu()
-            if length <= topk * 4:
+            if length <= boundary:
                 expected = torch.full_like(actual, -1)
                 expected[:length] = torch.arange(length)
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
             else:
-                groups = actual[: topk * 4].view(topk, 4)
-                ids = groups[:, 0] // 4
+                groups = actual[:boundary].view(topk, pool_size)
+                ids = groups[:, 0] // pool_size
                 assert ids.unique().numel() == topk
-                assert ids.min() >= 0 and ids.max() < min(length // 4, columns)
+                assert ids.min() >= 0 and ids.max() < min(length // pool_size, columns)
                 values = scores[row].float().cpu()
-                torch.testing.assert_close(values[ids].sort().values, values[: min(length // 4, columns)].topk(topk).values.sort().values, rtol=0, atol=0)
-                torch.testing.assert_close(groups, ids[:, None] * 4 + torch.arange(4, dtype=torch.int32), rtol=0, atol=0)
-                expected = torch.full_like(actual[topk * 4 :], -1)
-                expected[: length % 4] = torch.arange(length // 4 * 4, length)
-                torch.testing.assert_close(actual[topk * 4 :], expected, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    values[ids].sort().values, values[: min(length // pool_size, columns)].topk(topk).values.sort().values, rtol=0, atol=0
+                )
+                torch.testing.assert_close(groups, ids[:, None] * pool_size + torch.arange(pool_size, dtype=torch.int32), rtol=0, atol=0)
+                expected = torch.full_like(actual[boundary:], -1)
+                expected[: length % pool_size] = torch.arange(length // pool_size * pool_size, length)
+                torch.testing.assert_close(actual[boundary:], expected, rtol=0, atol=0)
         assert (output[rows:] == -1).all()
         assert (storage[:, width:] == 12345).all()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_pooled_select_public_dynamic_stream_and_no_allocation(dtype, monkeypatch):
+    from cudnn.deepseek_sparse_attention.pooled.forward import _compile_pooled_select
+
+    stream = torch.cuda.Stream()
+    scores = torch.randn(8, 264, device="cuda", dtype=dtype)[:, :256]
+    positions = torch.full((16,), 1026, device="cuda", dtype=torch.int32)[::2]
+    output = torch.empty(10, 135, device="cuda", dtype=torch.int32)[:, :131]
+    workspace = torch.empty(dsa.pooled_select_workspace_size(scores, max_pools=8192), device="cuda", dtype=torch.uint8)
+    kwargs = dict(selected_pools=32, max_pools=8192, output=output, workspace=workspace)
+    dsa.pooled_select_forward(scores, positions, **kwargs)
+    misses = _compile_pooled_select.cache_info().misses
+    stream.wait_stream(torch.cuda.current_stream())
+    for rows, columns in ((3, 129), (0, 65), (8, 256)):
+        x, p = scores[:rows, :columns], positions[:rows]
+        expected_ids = x.float().topk(32).indices.cpu()
+        expected = _reference(expected_ids, p, 4, output.shape)
+        with monkeypatch.context() as patch:
+
+            def forbidden(*args, **kwargs):
+                raise AssertionError("public selector allocated device storage")
+
+            patch.setattr(torch, "empty", forbidden)
+            patch.setattr(torch, "zeros", forbidden)
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                dsa.pooled_select_forward(x, p, current_stream=stream.cuda_stream, **kwargs)
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+        stream.synchronize()
+        # Ties can change selected IDs; compare selected score values instead.
+        for row in range(rows):
+            ids = output[row, :128:4].long() // 4
+            torch.testing.assert_close(x[row, ids].sort().values, x[row].topk(32).values.sort().values, rtol=0, atol=0)
+        torch.testing.assert_close(output[:rows, 128:].cpu(), expected[:rows, 128:], rtol=0, atol=0)
+        assert (output[rows:] == -1).all()
+    assert _compile_pooled_select.cache_info().misses == misses
+    allocated = dsa.pooled_select_forward(scores, positions, selected_pools=32, current_stream=0)
+    assert allocated["indices"].shape == (8, 131)
+
+
+def test_pooled_select_rejects_invalid_buffers_before_launch(monkeypatch):
+    from cudnn.deepseek_sparse_attention.pooled import selection
+
+    scores = torch.randn(4, 256, device="cuda", dtype=torch.float32)
+    positions = torch.full((4,), 1023, device="cuda", dtype=torch.int64)
+    output = torch.empty(4, 131, device="cuda", dtype=torch.int32)
+    workspace = torch.empty(dsa.pooled_select_workspace_size(scores), device="cuda", dtype=torch.uint8)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("invalid input reached compilation")
+
+    monkeypatch.setattr(selection, "_compile_pooled_select", forbidden)
+    bad = (
+        {"selected_pools": 31},
+        {"pool_size": 8},
+        {"mode": "bad"},
+        {"max_pools": 255},
+        {"logits": scores.half()},
+        {"logits": scores[:, ::2]},
+        {"logits": scores.detach().requires_grad_()},
+    )
+    for override in bad:
+        with pytest.raises(ValueError):
+            dsa.pooled_select_forward(**(dict(logits=scores, positions=positions, selected_pools=32, output=output, workspace=workspace) | override))
+    for override in (
+        {"positions": positions[:3]},
+        {"positions": positions.float()},
+        {"positions": positions.cpu()},
+        {"output": output[:, :128]},
+        {"output": output[:3]},
+        {"output": scores.view(torch.int32)[:, :131]},
+        {"workspace": workspace[:4]},
+        {"workspace": workspace[1:]},
+        {"workspace": scores.view(torch.uint8).flatten()},
+    ):
+        with pytest.raises(ValueError):
+            dsa.pooled_select_forward(**(dict(logits=scores, positions=positions, selected_pools=32, output=output, workspace=workspace) | override))
 
 
 @pytest.mark.parametrize("dtype", ["bf16", "fp8", "fp4"])
