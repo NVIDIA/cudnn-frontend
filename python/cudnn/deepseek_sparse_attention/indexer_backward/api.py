@@ -11,9 +11,10 @@ Combines backend-specific CuTe-DSL kernels:
 
 In ordinary execution, a bf16 ``dIndexK`` output receives a trailing pure-torch
 cast from its FP32 accumulator (kernel 3); an fp32 ``dIndexK`` buffer is the
-accumulator itself. The ordinary fp32 accumulator behind a bf16 ``dIndexK``
-(and the ordinary sm100_v2 ticket counter) is carved from the caller's
-workspace. Deterministic execution instead uses a compile-time-selected set of
+accumulator itself. The ordinary fp32 accumulator behind a bf16 ``dIndexK`` is
+carved from the caller's workspace. The sm100_v2 H64 policy additionally carves
+a ticket counter; native H32 assigns one query row to each CTA and needs no
+counter. Deterministic execution instead uses a compile-time-selected set of
 CTA-private FP32 dK planes and a fixed-order reduction that converts directly to
 the requested output dtype.
 ``scratch_workspace_bytes()`` reports the selected policy's exact size for
@@ -55,7 +56,7 @@ from .indexer_backward_sm90 import indexer_backward_sm90
 
 # Compute-backend selector for the sparse indexer backward. ``"default"`` is
 # the architecture-generic path (SM90 or SM100); ``"sm100_v2"`` is the
-# SM100/SM103 v2 backend (two-term bf16-expansion GEMM, deterministic
+# SM100/SM103 v2 backend (native H32 or two-term H64 GEMM, deterministic
 # d_weights). The value is architecture-explicit on purpose: it names the arch
 # it targets so it is self-evidently capability-gated (``check_support`` is
 # request-or-fail outside its explicit capability set) and the enum can grow new backends without
@@ -234,14 +235,14 @@ class IndexerBackward(APIBase):
        avoid a fail-dirty.
     2. Kernel 1 — in-place score-grad precompute (overwrites ``attn_score``
        with ``grad_signal`` and reads ``index_score`` without modifying it).
-    3. fp32 dK accumulator zero-init — the ordinary dK epilogue atomic-adds, so its
-       fp32 target starts zeroed on the launch stream. An fp32 ``d_index_k``
-       buffer is that target and is zeroed in place (a promised stage, not a
-       hidden op); a bf16 ``d_index_k`` buffer instead accumulates into a
-       ``B * S_k * D`` fp32 view carved from the caller's ``workspace`` and
-       receives a trailing cast (kernel 3). ``scratch_workspace_bytes()``
-       is the size to allocate; ``execute`` raises ``ValueError`` when it is
-       non-zero and no workspace is passed, before ``attn_score`` is touched.
+    3. fp32 dK accumulator zero-init — ordinary execution folds this clear into
+       kernel 1, so the atomic-add epilogue starts from zero without a separate
+       launch. An fp32 ``d_index_k`` buffer is the target directly; a bf16
+       ``d_index_k`` buffer instead accumulates into a ``B * S_k * D`` fp32
+       view carved from the caller's ``workspace`` and receives a trailing cast
+       (kernel 3). ``scratch_workspace_bytes()`` is the size to allocate;
+       ``execute`` raises ``ValueError`` when it is non-zero and no workspace
+       is passed, before ``attn_score`` is touched.
     4. Kernel 2 — warp-specialized backward GEMM producing the gradients.
 
     On SM100 the default backend accepts compact H32 inputs and outputs.
@@ -251,8 +252,8 @@ class IndexerBackward(APIBase):
     H32→H64 padding or output slicing is required.
 
     ``deterministic=True`` is an SM100/SM103 request-or-fail policy for H=32 or
-    H=64 on the default backend (H=64 on ``sm100_v2``), D=128, block_I=128,
-    and 128-multiple top-k in [128, 2048]. It launches up
+    H=64 on either backend, D=128, block_I=128, and 128-multiple top-k in
+    [128, 2048]. It launches up
     to ``deterministic_dk_planes`` persistent CTAs over fixed grid-stride query
     rows and allocates one CTA-private FP32 dK plane for each possible producer.
     The plane count is a compile-time specialization selected from
@@ -267,29 +268,27 @@ class IndexerBackward(APIBase):
     warmed plan with caller-owned outputs and scratch is CUDA Graph compatible.
 
     ``backend="sm100_v2"`` (SM100/SM103, request-or-fail: ``check_support``
-    raises outside the envelope, there is no silent fallback) selects an
-    alternative GEMM stage that upcasts the weights to fp32 in-register and
-    splits the per-slot fp32 gradient matrix into a two-term bf16 expansion
-    (``hi + lo``) before the MMAs, so each individual product in the dQ / dK
-    contractions is exact in the fp32 accumulator when it is finite there (the
-    expansion carries ~16
-    of the 24 fp32 significand bits — measured ~675x lower gradient-matrix
-    representation error than the default single-bf16 rounding);
-    ``d_weights`` is additionally reduced deterministically (bitwise
+    raises outside the envelope, there is no silent fallback) selects one of
+    two compile-time policies. H32 uses a native TCGEN05 N/K=32 mapping, one
+    query row per CTA, TMA Gather4 for K, and bulk-reduce dK stores. It accepts
+    logical top-k in [128, 2176], including CSA's 2049--2051 extents; only the
+    shared operand tail is padded to 128 slots, so callers do not pad to 2176.
+    H64 keeps the persistent ticket schedule and upcasts weights to fp32
+    in-register. It splits the per-slot fp32 gradient matrix into a two-term
+    bf16 expansion (``hi + lo``) before the MMAs, carrying roughly 16 of the 24
+    fp32 significand bits. ``d_weights`` is reduced deterministically (bitwise
     run-to-run, as is ``d_index_q``). With ``deterministic=True``, dK is also
     bitwise reproducible. Same wrapper contract: ``attn_score`` is
     the in-place score scratch and ``index_score`` remains read-only. Output
     dtype selects output precision: ``d_weights``
     and ``d_index_k`` accept fp32 buffers, which receive the fp32
-    accumulators directly — **the headline accuracy gains require fp32
-    output buffers**; bf16 output buffers round the result and keep only the
-    bf16-representation floor. Requires H == 64, D == 128,
-    topk % 128 == 0 with 128 <= topk <= 2048, block_I == 128, sm_scale > 0,
-    contiguous same-device tensors. Ordinarily, its dynamic-ticket counter is
-    8 bytes of the caller's ``workspace`` (the first ``ws_align(8)`` bytes,
-    ahead of the bf16 dK accumulator), zeroed on the launch stream at every
-    ``execute``. Deterministic execution replaces both regions with its dK
-    planes. The plan owns nothing and is bound to no device;
+    accumulators directly; bf16 output buffers round the result to bf16.
+    Requires H in {32, 64}, D == 128, block_I == 128, sm_scale > 0, and
+    contiguous same-device tensors. H64 additionally requires 128-multiple
+    top-k in [128, 2048]. Ordinarily, only H64 uses the 8-byte dynamic-ticket
+    counter at the start of the caller's ``workspace``; H32 with fp32 dK has a
+    zero-byte workspace. Deterministic execution replaces ordinary scratch
+    with its dK planes. The plan owns nothing and is bound to no device;
     executions that share one workspace buffer must not overlap on the device
     (``indexer_backward_wrapper`` allocates a fresh one per call). The
     workspace must live on ``index_q.device``. ``backend`` must be one of
@@ -453,13 +452,19 @@ class IndexerBackward(APIBase):
                 f"(use backend='default' elsewhere)",
             )
             self._value_error_if(
-                h != 64 or d != 128,
-                f"backend='sm100_v2' requires H=64, D=128, got H={h}, D={d}",
+                h not in (32, 64) or d != 128,
+                f"backend='sm100_v2' requires H=32 or H=64, D=128, got H={h}, D={d}",
             )
-            self._value_error_if(
-                topk % 128 != 0 or not (128 <= topk <= 2048),
-                f"backend='sm100_v2' requires topk % 128 == 0 with 128 <= topk <= 2048, got topk={topk}",
-            )
+            if h == 32:
+                self._value_error_if(
+                    not (128 <= topk <= 2176),
+                    f"backend='sm100_v2' requires 128 <= topk <= 2176 for H=32, got topk={topk}",
+                )
+            else:
+                self._value_error_if(
+                    topk % 128 != 0 or not (128 <= topk <= 2048),
+                    f"backend='sm100_v2' requires topk % 128 == 0 with 128 <= topk <= 2048 for H=64, got topk={topk}",
+                )
             self._value_error_if(
                 self.block_I != 128,
                 f"backend='sm100_v2' requires block_I=128, got block_I={self.block_I}",
@@ -529,7 +534,7 @@ class IndexerBackward(APIBase):
                         desc.device != self.iq_desc.device,
                         f"deterministic IndexerBackward requires all tensors on one device: {name} is on {desc.device}, index_q on {self.iq_desc.device}",
                     )
-            deterministic_heads = (64,) if self.use_v2 else (32, 64)
+            deterministic_heads = (32, 64)
             self._value_error_if(
                 self.heads not in deterministic_heads or self.head_dim != 128,
                 f"deterministic IndexerBackward with backend='{self.backend}' requires "
@@ -652,12 +657,13 @@ class IndexerBackward(APIBase):
     def scratch_workspace_bytes(self) -> int:
         """Return caller-owned scratch bytes for the selected dK policy.
 
-        The ordinary sm100_v2 counter region comes first. Deterministic
-        execution instead uses ``deterministic_dk_planes`` dense FP32 CTA
-        planes regardless of output dtype; ordinary execution needs one dense
-        accumulator only for a bf16 ``d_index_k``.
+        The ordinary H64 sm100_v2 counter region comes first.  Native H32 uses
+        fixed one-row-per-CTA ownership and therefore needs no ticket counter.
+        Deterministic execution instead uses ``deterministic_dk_planes`` dense
+        FP32 CTA planes regardless of output dtype; ordinary execution needs
+        one dense accumulator only for a bf16 ``d_index_k``.
         """
-        counter = ws_align(8) if self.use_v2 and not self.deterministic else 0
+        counter = ws_align(8) if self.use_v2 and not self.deterministic and self.heads == 64 else 0
         if self.deterministic:
             accumulator = deterministic_dk_workspace_bytes(self.batch, self.seqlen_k, self.head_dim, self.deterministic_dk_planes)
         else:
@@ -1048,34 +1054,37 @@ def indexer_backward_wrapper(
             slice outputs.
             ``"sm100_v2"`` is the SM100/SM103 opt-in v2 backend,
             **request-or-fail**: it raises (``ValueError``/``RuntimeError``)
-            outside its envelope — SM100/SM103, H == 64, D == 128, block_I == 128,
-            topk % 128 == 0 with 128 <= topk <= 2048, sm_scale > 0, contiguous
-            same-device tensors — and never silently falls back to the default
-            backend. It keeps the wrapper contract (same inputs and outputs:
+            outside its envelope — SM100/SM103, H in {32, 64}, D == 128,
+            block_I == 128, sm_scale > 0, contiguous same-device tensors — and
+            never silently falls back to the default backend. Native H32 accepts
+            logical top-k in [128, 2176], including 2049--2051 without caller
+            padding; H64 requires 128-multiple top-k in [128, 2048]. It keeps
+            the wrapper contract (same inputs and outputs:
             ``attn_score`` is left holding exactly kernel 1's ``grad_signal``,
             ``index_score`` remains read-only, and ``sm_scale`` folds in-kernel)
-            and computes the GEMM stage with fp32 weights and a two-term
-            bf16 expansion of the gradient matrix, plus deterministic
-            (bitwise run-to-run) ``d_weights`` / ``d_index_q``.
+            H32 computes with native TCGEN05 N/K=32 shapes, one row per CTA,
+            TMA Gather4, bulk dK reduction, and single-term bf16 operands. H64
+            keeps the persistent schedule and two-term bf16 expansion. Both
+            produce deterministic (bitwise run-to-run) ``d_weights`` /
+            ``d_index_q``.
             ``backend="sm100_v2"`` selects the compute path only — output
             precision follows the buffers you pass: supply **fp32
             ``d_weights`` / ``d_index_k`` buffers to receive the fp32
-            accumulators directly (required for the headline accuracy
-            gains)**; the default wrapper-allocated buffers keep the input
-            dtypes (bf16), which rounds the extra accuracy back to the bf16
-            representation floor. fp32 ``d_index_k`` is zeroed internally.
-            Ordinarily, the backend's dynamic-ticket counter is 8 bytes of the
-            per-call ``workspace`` below, zeroed on the launch stream at every
-            call; ``deterministic=True`` replaces it with CTA-private dK
-            planes. The plan owns no device memory. The wrapper additionally
+            accumulators directly**; the default wrapper-allocated buffers keep
+            the input dtypes (bf16). Ordinary fp32 ``d_index_k`` zeroing is
+            fused into score-grad. H64's dynamic-ticket counter uses 8 bytes of
+            the per-call ``workspace`` below; H32 uses fixed row ownership and
+            no counter. ``deterministic=True`` replaces ordinary scratch with
+            CTA-private dK planes. The plan owns no device memory. The wrapper additionally
             keys its plan cache on the **resolved** stream (``stream`` when
             given, otherwise ``torch.cuda.current_stream()`` at call time),
             so one cached plan's executes are stream-ordered.
         workspace: keyword-only, optional reusable uint8 buffer of at least
             ``IndexerBackward.scratch_workspace_bytes()`` bytes on
             ``index_q.device`` (the ordinary fp32 dK accumulator behind a
-            bf16 ``d_index_k``, plus the ordinary sm100_v2 ticket counter, or
-            the deterministic CTA planes). When omitted
+            bf16 ``d_index_k``, plus the H64 sm100_v2 ticket counter, or the
+            deterministic CTA planes). Native H32 with fp32 dK requires zero
+            bytes. When omitted
             the wrapper allocates it per call on the launch stream. Calls
             sharing one buffer must not overlap on the device. In deterministic
             mode, the live scratch prefix must not overlap any input or output;
@@ -1083,8 +1092,9 @@ def indexer_backward_wrapper(
         deterministic: keyword-only opt-in for bitwise-reproducible gradients
             on SM100/SM103. Fixed-owner producer CTAs accumulate into
             CTA-private FP32 planes; a fixed CTA-order reduction writes
-            ``d_index_k``. The default backend supports compact H32 and H64;
-            ``sm100_v2`` supports H64. A warmed plan with preallocated outputs
+            ``d_index_k``. Both the default backend and ``sm100_v2`` support H32
+            and H64 for aligned top-k; deterministic mode retains the shared
+            128-multiple top-k contract. A warmed plan with preallocated outputs
             and workspace remains CUDA Graph compatible. Valid top-k indices
             within each query row must be unique.
         deterministic_dk_planes: compile-time deterministic producer-grid and
