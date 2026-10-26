@@ -79,6 +79,12 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 
 ### conftest.py landmines — read before editing
 
+Before releasing Torch's cache, synchronize every device with reserved memory.
+Expandable-segment cleanup can synchronize a default-stream handle on the wrong
+current device, then unmap memory still used by another GPU. The later CuTe launch
+can report that fault. `test_empty_cache_waits_for_other_devices_default_stream`
+checks completion before the unsafe release, so its failing control stays safe.
+
 For a timed subprocess test, arm a child-side `faulthandler` dump before the
 parent deadline and surface `TimeoutExpired.stdout` / `.stderr` in the failure.
 The parent's watchdog shows only `subprocess.communicate()`, and pytest's
