@@ -2798,10 +2798,10 @@ def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD51
         raise ValueError(f"{flavor}: make_cfg_d512_2x2 needs a TemplateParams record with mma_2x2=True (make_cfg_d512 dispatches on it)")
     # The Rubin record guard keys its THD allowlist by FLAVOR NAME (_F16_THD_FLAVORS holds "sm107 d512"): the 2x2 sibling
     # carries the same ported setup-kernel call sites as the role-split d512 body, so it is validated under that name.
-    _validate_params("sm107 d512", params)
-    # The 2x2 record's own domain (d512 only, half inputs, unpaged, whole-group PackGQA) is stated ONCE, in config_sm100;
-    # the pre-folded scale is this twin's own arm (the cc 10.0 line keeps declining it).
-    _validate_params_sm100("d512", params, scale_prefolded_wired=True)
+    _validate_params("sm107 d512", params, split_wired=True)
+    # Share the d512/half/unpaged guards with SM100. This native twin additionally
+    # addresses packed subgroups and supports the pre-folded scale.
+    _validate_params_sm100("d512", params, scale_prefolded_wired=True, d512_partial_pack_wired=True)
     if params.dtype_qkv not in (_DTYPE_BF16, _DTYPE_FP16):
         raise ValueError(f"{flavor}: BF16/FP16 inputs only")
     if params.cta_mma != 2:
@@ -2843,7 +2843,7 @@ def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD51
         SPLIT_KV=int(params.split_kv or 1),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=int(params.qh_per_kh),
-        PACK_G=_pack_g(params, CfgD512X2.TILE_M, partial=False),
+        PACK_G=_pack_g(params, CfgD512X2.TILE_M, partial=True),
     )
     # DESC_VERSION is DERIVED from the layout the fields above describe, never set by hand.
     cfg = dataclasses_replace(base, DESC_VERSION=_d512_2x2_desc_version_for(base))

@@ -373,10 +373,10 @@ from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_descs_kernel as 
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
 
-# === PackGQA === whole-group packing only (G | 64): row r <-> token r // G, head r % G.
+# === PackGQA === row r packs PACK_G heads, a divisor of both the GQA ratio and TILE_M.
 HEADS_PER_TILE = CFG.PACK_G if CFG.PACK_GQA else 1
 TOKENS_PER_TILE = CFG.TILE_M // HEADS_PER_TILE
-_require(not CFG.PACK_GQA or CFG.PACK_G == CFG.QH_PER_KH, "2x2 d512 packs the whole GQA group (PACK_G == QH_PER_KH)")
+_require(not CFG.PACK_GQA or CFG.QH_PER_KH % CFG.PACK_G == 0, "2x2 d512 packed subgroups must divide the GQA ratio")
 
 # === KV split === (phase 1.5: the body carries the half-aware fp32-partials arm; the adapter twin
 # keeps split_kv > 1 on the role-split kernel)
@@ -387,6 +387,8 @@ _split_h = make_split_helpers(
     dispatch_decode_payload=_dispatch_decode_payload,
 )
 SPLIT_KV = _split_h.SPLIT_KV
+# Partial rows contain only real keys; the shared combine folds the sink once.
+FOLD_SINK = CFG.HAS_SINK and SPLIT_KV == 1
 _FP32_PARTIALS = SPLIT_KV > 1
 MAY_BE_EMPTY = _split_h.MAY_BE_EMPTY
 _decode_initial_split = _split_h.decode_initial_split
@@ -816,7 +818,7 @@ def _tmaldg_warp_group(
         sched.bidx_init, sched.bidy_init, sched.bidz_init, cta_id_x, n_q_supers, n_qh, n_batch, seq_kv_lens_tensor, qh_per_kh, seqlen_kv
     )
     q_head_idx = head_idx * cutlass.Int32(HEADS_PER_TILE)
-    kv_head_idx = cute.arch.make_warp_uniform(head_idx if cutlass.const_expr(CFG.PACK_GQA) else head_idx // qh_per_kh)
+    kv_head_idx = cute.arch.make_warp_uniform((head_idx * cutlass.Int32(HEADS_PER_TILE)) // qh_per_kh)
     q_row_base = cute.arch.make_warp_uniform(q_super_idx * cutlass.Int32(CFG.TILES_Q * TOKENS_PER_TILE))
     q_seq_off, kv_seq_off, tma_batch = _thd_tma_offsets(seq_kv_lens_tensor, batch_idx, n_batch)
 
@@ -937,7 +939,7 @@ def _tmaldg_warp_group(
             nxt_q, nxt_hb, cta_id_x, n_q_supers, n_qh, n_batch, seq_kv_lens_tensor, qh_per_kh, seqlen_kv
         )
         q_head_idx = head_idx * cutlass.Int32(HEADS_PER_TILE)
-        kv_head_idx = cute.arch.make_warp_uniform(head_idx if cutlass.const_expr(CFG.PACK_GQA) else head_idx // qh_per_kh)
+        kv_head_idx = cute.arch.make_warp_uniform((head_idx * cutlass.Int32(HEADS_PER_TILE)) // qh_per_kh)
         q_row_base = cute.arch.make_warp_uniform(q_super_idx * cutlass.Int32(CFG.TILES_Q * TOKENS_PER_TILE))
         q_seq_off, kv_seq_off, tma_batch = _thd_tma_offsets(seq_kv_lens_tensor, batch_idx, n_batch)
         is_valid_tile = nxt_v & cutlass.Int32(1)
@@ -1723,7 +1725,7 @@ def _correction_warp_group(
         q_row_global = q_super_idx * cutlass.Int32(CFG.TILES_Q * TOKENS_PER_TILE) + (row_r // cutlass.Int32(HEADS_PER_TILE))
         row_head_idx = head_idx * cutlass.Int32(HEADS_PER_TILE) + (row_r % cutlass.Int32(HEADS_PER_TILE))
         LN2 = cutlass.Float32(0.6931471805599453)
-        if cutlass.const_expr(CFG.HAS_SINK):
+        if cutlass.const_expr(FOLD_SINK):
             sinks_arr = cutlass.make_array_view(sinks_tensor)
             sink_logit = cutlass.Float32(sinks_arr[row_head_idx])
             final_max_nat = final_max * LN2
@@ -1757,7 +1759,7 @@ def _correction_warp_group(
             beta = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(0.0).ir_value(), beta.ir_value()))
             lse = cutlass.Float32(arith.select(row_trim.ir_value(), neg_inf_trim.ir_value(), lse.ir_value()))
             row_dead = row_dead | row_trim
-        if cutlass.const_expr(CFG.STATS_LOG2):
+        if cutlass.const_expr(CFG.STATS_LOG2 and SPLIT_KV == 1):
             lse = lse * cutlass.Float32(1.4426950408889634)
 
         parity_last_rt = cutlass.Int32(0)
