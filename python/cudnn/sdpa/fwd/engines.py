@@ -3271,7 +3271,7 @@ def lower_dsl_prefill(
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
     if (
         facts.thd
-        and not facts.has_paged_kv
+        and not getattr(api, "thd_decode_leg", False)
         and facts.epilogue_gate_t is None
         and not (facts.is_fp8 or facts.is_mxfp8)
         and facts.device_cc in ((10, 0), (10, 3))

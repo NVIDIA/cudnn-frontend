@@ -399,6 +399,8 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
         raise NotImplementedError("cudnn.sdpa: this prepared THD launch requires packed initial-wave geometry; rebuild the extension")
     if s.origin_specs is not None and not getattr(_pybind_module._SdpaThdBinder, "supports_physical_origins", False):
         raise NotImplementedError("physical THD origins require rebuilding the native extension")
+    if s.origin_specs is not None and s.paged and not getattr(_pybind_module._SdpaThdBinder, "supports_paged_physical_origins", False):
+        raise NotImplementedError("paged physical THD origins require rebuilding the native extension")
     s.native = _pybind_module._SdpaThdBinder(s)
     return s
 

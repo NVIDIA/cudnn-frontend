@@ -21,6 +21,8 @@ def graph_origin_specs(facts):
         if offset is None:
             specs.append(None)
             continue
+        if facts.has_paged_kv and name in ("k", "v"):
+            raise NotImplementedError("paged K/V origins are described by the page tables, not THD offsets")
         dtype = offset.get_data_type()
         if dtype not in (cudnn.data_type.INT32, cudnn.data_type.INT64):
             raise NotImplementedError("THD physical offsets must be INT32 or INT64")

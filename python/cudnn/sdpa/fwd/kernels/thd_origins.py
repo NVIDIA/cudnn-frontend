@@ -51,6 +51,8 @@ def build_thd_origins(
     heads: cutlass.Int32,
     tile_rows: cutlass.Int32,
     clusters: cutlass.Int32,
+    paged: cutlass.Constexpr[bool] = False,
+    rank_by_kv: cutlass.Constexpr[bool] = False,
 ):
     """Lengths control work and clipping; physical offsets control addresses.
 
@@ -82,28 +84,29 @@ def build_thd_origins(
         # O keeps the first map array so the existing store pipeline is shared.
         for slot in cutlass.range_constexpr(4):
             port = (3, 0, 1, 2)[slot]
-            cu0 = 2 * batch + 1 if port in (1, 2) else batch
-            emit_seq_descs(
-                base_maps[port],
-                maps,
-                meta,
-                cu0,
-                tensors[port],
-                batch,
-                cutlass.Int64(tensors[port].stride[1]),
-                2,
-                slot_base=slot * (batch + 1),
-                first_batch=warp,
-                batch_step=cutlass.Int32(THD_SETUP_THREADS // 32),
-                origins=origins,
-                origin_row=port if specs[port] is not None else -1,
-            )
+            if cutlass.const_expr(not paged or port not in (1, 2)):
+                cu0 = 2 * batch + 1 if port in (1, 2) else batch
+                emit_seq_descs(
+                    base_maps[port],
+                    maps,
+                    meta,
+                    cu0,
+                    tensors[port],
+                    batch,
+                    cutlass.Int64(tensors[port].stride[1]),
+                    2,
+                    slot_base=slot * (batch + 1),
+                    first_batch=warp,
+                    batch_step=cutlass.Int32(THD_SETUP_THREADS // 32),
+                    origins=origins,
+                    origin_row=port if specs[port] is not None else -1,
+                )
         nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     # Optional packed Stats without offsets keeps the compact-prefix contract.
     if cutlass.const_expr(specs[4] is None):
         for b in cutlass.range(tid, batch, THD_SETUP_THREADS, unroll=1):
             cutlass.make_array_view(origins)[4, b] = cutlass.Int64(meta[batch + b])
-    write_thd_batch_remap(meta, batch, tid, cutlass.Int32(THD_SETUP_THREADS))
+    write_thd_batch_remap(meta, batch, tid, cutlass.Int32(THD_SETUP_THREADS), rank_by_kv=rank_by_kv)
     cute.arch.barrier()
     write_thd_work_prefix(meta, batch, heads, tile_rows, clusters, tid, 1)
 
