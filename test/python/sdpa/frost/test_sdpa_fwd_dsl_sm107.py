@@ -872,8 +872,11 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
         assert engines._selected_d_shape(caps, _f16_facts(d_qk=d, d_v=d), knobs) == (128, 128) and engines._selected_d_shape(
             caps, _f16_facts(d_qk=d, d_v=d)
         ) != (128, 128), d
-    for feature in (dict(thd=True, padded=True), dict(padded=True), dict(has_sink=True)):
+    for feature in (dict(thd=True, padded=True), dict(padded=True)):
         assert engines.mismatch(caps, _f16_facts(**feature), engines.SdpaFwdKnobs(split_kv=2)) is not None
+    assert engines.mismatch(caps, _f16_facts(has_sink=True), engines.SdpaFwdKnobs(split_kv=2)) is None
+    for feature in (dict(thd=True, padded=True), dict(padded=True), dict(has_epilogue_gate=True)):
+        assert engines.mismatch(caps, _f16_facts(has_sink=True, **feature), engines.SdpaFwdKnobs(split_kv=2)) is not None
     # D128 unsplit THD and dense packing share the native two-CTA SM107 body.
     assert engines.mismatch(caps, _f16_facts(thd=True, padded=True), engines.SdpaFwdKnobs(pack_gqa=True)) is None
 
