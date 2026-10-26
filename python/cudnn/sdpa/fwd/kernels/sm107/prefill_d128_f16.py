@@ -1009,11 +1009,6 @@ def _kernel(
     bidy = cute.arch.block_idx()[1]
     bidz = cute.arch.block_idx()[2]
 
-    if cutlass.const_expr(thd_origins is not None):
-        # Physical maps are published only for live sequences. The origins
-        # setup completes before this launch (PDL stays on the compact arm).
-        exit_if_dead_thd_cluster(seq_kv_lens_tensor, n_batch, CFG.CGA_M)
-
     # SMEM allocations in natural Q/K/V/O order — Tcgen05SmemDesc.build truncates
     # start_address past ~256 KiB so this order keeps the data buffers in low SMEM.
     # QO_ALIAS: one Q∪O slab (TILES_Q × max(Q,O) elems); sO points into it and
@@ -1185,12 +1180,18 @@ def _kernel(
         cga_arrive()
         cga_wait()
 
-    if cutlass.const_expr(THD_SETUP_PDL and thd_origins is None):
+    if cutlass.const_expr(THD_SETUP_PDL):
         # Every role waits before its first dependent global read. Everything
         # above is CTA/cluster-local initialization; the scheduler's lengths,
         # live-work counter, sinks and TMA descriptor loads are all below.
         # The setup's early release is only a scheduling hint, not visibility.
         wait_on_dependent_grids()
+
+    if cutlass.const_expr(thd_origins is not None):
+        # Initialization above is entirely CTA/cluster-local and owns no
+        # TMEM or descriptor. After the producer wait, dead clusters leave
+        # before any role allocates TMEM or acquires a sequence-local map.
+        exit_if_dead_thd_cluster(seq_kv_lens_tensor, n_batch, CFG.CGA_M)
 
     # @cute.kernel stages if/else — use Python ternaries so the chosen
     # expression flows into the trace (variables in branches aren't visible outside).
@@ -1829,6 +1830,7 @@ def _tmaldg_warp_group(
                     bars.mb_q_full[0].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
+                    acquire=thd_origins is None,
                 )
 
                 bars.mb_k_empty[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
@@ -1880,6 +1882,7 @@ def _tmaldg_warp_group(
                     bars.mb_q_full[1].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
+                    acquire=thd_origins is None,
                 )
                 q_empty_phase = q_empty_phase ^ 1
 
@@ -5428,6 +5431,7 @@ def _host(
                 n_thd_units,
                 paged=PAGED_KV,
                 rank_by_kv=PAGED_KV and bool(CFG.BOTTOM_RIGHT) and (CFG.MASK_FLAGS & MASK_SWA) == 0,
+                release_dependents=THD_SETUP_PDL,
             ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         else:
             _build_o_descs_kernel(
@@ -5494,7 +5498,7 @@ def _host(
         block=[CFG.THREADS_PER_CTA, 1, 1],
         cluster=(CFG.CTA_MMA, 1, CFG.BIAS_MCAST_CTAS),
         stream=stream,
-        use_pdl=THD_SETUP_PDL and thd_origin_ptrs is None,
+        use_pdl=THD_SETUP_PDL,
     )
 
 
