@@ -54,7 +54,18 @@ def test_sink_split_graph_rebind(case, cudnn_handle):
     _check_sink_split(case, "bfloat16", "log2", graph_api=True, handle=cudnn_handle)
 
 
-def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None):
+@pytest.mark.parametrize("case", ["native128", "keyless"])
+@pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
+def test_sink_split_narrow_standalone_replay(case, dtype_name):
+    _check_sink_split(case, dtype_name, "log2", graph_api=False, tile_n=64)
+
+
+@pytest.mark.parametrize("case", ["native128", "partial6"])
+def test_sink_split_narrow_graph_rebind(case, cudnn_handle):
+    _check_sink_split(case, "bfloat16", "log2", graph_api=True, handle=cudnn_handle, tile_n=64)
+
+
+def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None, tile_n=128):
     import cudnn
     import torch
     from cuda.bindings import driver as cuda
@@ -80,6 +91,7 @@ def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None):
         pack_gqa=packed,
     )
     api.cga = cga
+    api.tile_n = tile_n
     api.sched_policy = 0 if stats == "none" else 1
     api.stats_log2 = stats == "log2"
     assert api.check_support()
@@ -113,7 +125,7 @@ def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None):
         knobs.update(
             {
                 cudnn.knob_type.TILE_M: 128,
-                cudnn.knob_type.TILE_N: 128,
+                cudnn.knob_type.TILE_N: tile_n,
                 cudnn.knob_type.TILE_CGA_M: cga,
                 cudnn.knob_type.SPLIT_KV: splits,
                 cudnn.knob_type.PACK_GQA: int(packed),
@@ -132,6 +144,8 @@ def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None):
         ws_bytes = api.scratch_workspace_bytes()
     assert api._k_mod.__file__.endswith(kernel), api._k_mod.__file__
     assert api._k_mod.CFG.SPLIT_KV == splits
+    if tile_n == 64:
+        assert api._k_mod.CFG.TILE_N == 64 and api._k_mod.CFG.S_SLOTS == 2
     try:
         for ordinal in range(2):
             current = {n: torch.empty_strided(t.shape, t.stride(), dtype=t.dtype, device="cuda") for n, t in bufs.items() if isinstance(t, torch.Tensor)}
