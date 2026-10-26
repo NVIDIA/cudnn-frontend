@@ -312,8 +312,17 @@ def test_config_factories_derive_everything_from_the_tile(width):
     ):
         with pytest.raises(ValueError, match=re.escape(word)):
             c._validate_head_dim_tile(dataclasses.replace(cfg, **{field: value}), "probe")
-    with pytest.raises(ValueError, match="f16/bf16 prefill kernel only"):
-        make(c.TemplateParams(dtype_qkv=0, cta_mma=1))
+    if width == 32:
+        with pytest.raises(ValueError, match="per-tensor FP8 D64"):
+            make(c.TemplateParams(dtype_qkv=0, cta_mma=1))
+    else:
+        for dtype in (0, 1):
+            for cga in (1, 2):
+                quantized, _ = make(c.TemplateParams(dtype_qkv=dtype, dtype_o=2, cta_mma=cga, split_kv=4))
+                assert quantized.TILE_K == quantized.TILE_O == quantized.TILE_K_HW_BMM1 == 64
+                assert quantized.V_SWZ_BYTES == 64 // cga
+                with pytest.raises(ValueError, match="FP8 THD"):
+                    make(c.TemplateParams(dtype_qkv=dtype, cta_mma=cga, thd_varlen=True, seq_kv_lens_present=True))
     with pytest.raises(ValueError, match="THD/varlen"):
         make(c.TemplateParams(dtype_qkv=2, cta_mma=1, thd_varlen=True, seq_kv_lens_present=True))
     with pytest.raises(ValueError, match="epilogue_gate"):

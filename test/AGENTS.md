@@ -874,6 +874,28 @@ intercepting its entry. Hard-coding THD fails once dense prefill becomes native.
 Keep the existing KV-tail and fixed-shape rejection diagnostics, as exercised
 by `test_sdpa_prepared_thd.py`, when changing the binder implementation.
 
+Physical THD offsets are element addresses for each port. A fused K/V slab or
+wide O token stride requires matching offset values, with an independent Int64
+O offset when it exceeds Int32. Keep these fixtures consistent in
+`test_sdpa_prepared_thd.py` and `test_mhas_v2.py`. Compare graph execution with an
+independently prepared standalone API; clearing a graph's private prepared plan
+does not reproduce the standalone compact-prefix contract. Retain poisoned
+outputs and replay after rebinding for both public entry points.
+
+Keep `stream` last in private CuTe host signatures and preserve the
+`_positional_order` guard. Matching named binder slots and a Python wrapper
+signature does not qualify a reordered entry; exercise a real compiled launch
+after ABI changes before considering a change to that convention.
+
+AST-based host frame fixtures must retain unannotated runtime arguments;
+`ast.unparse(None)` fails before binding. Raw positional CuTe entries require
+every runtime slot, including optional `None` pointers and scalar defaults:
+Python signature defaults do not shorten the exported FFI frame. Keep the
+packed combine direct-call and fresh-process artifact tests synchronized with
+that frame. A graph-lowered adapter carrying physical origins is not a public
+standalone plan; construct the standalone API independently and retain its own
+workspace through capture replay, as in `test_paged_thd_split_capture_lengths_and_stats`.
+
 ### Native host ABI differences across architectures
 
 Do not infer a dense host signature from another architecture. SM107 D256 has

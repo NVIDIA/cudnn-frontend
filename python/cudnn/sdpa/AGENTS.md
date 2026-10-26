@@ -154,6 +154,7 @@ ordered after that read.**
   is `ref == 0, gpu != 0` elements on masked configs with `key mod TILE_N`
   in the aliased range — recover the leaked keys by matching
   `O_gpu - O_ref` against `V` rows.
+
 - Prove completion and inter-thread ordering separately for every TMEM reuse
   edge. The specialized synchronization route uses the applicable
   `tcgen05.wait::ld/st`, producer `before_thread_sync`, synchronization, and
@@ -408,6 +409,18 @@ production kernels gain no debug knob or timing-dependent assertion.
   checks changed-input replay, split partials and MHA's bitwise packing fold.
   The ragged changed-length tests cover partial packing and retained captures.
 
+**Rule S11 — THD dead units must not access uninitialized per-sequence maps.**
+
+- A launch uses a declared envelope; live lengths can leave initial clusters
+  with `batch_idx == n_batch`. Allocating `B+1` map slots makes that address
+  in bounds but does not initialize a descriptor there.
+- When setup writes maps only for the `B` real sequences, exit dead initial
+  clusters before acquiring maps or shared resources. Use the cluster-uniform
+  `exit_if_dead_thd_cluster` helper; a role-local exit can strand barrier peers.
+- Exercise overlaunch without total-length hints and replay after changing
+  all query lengths to zero. Check O/Stats canaries and run memcheck; ordinary
+  live-row numerical comparisons do not cover the dead-unit path.
+
 ## 2x2 datapath (cta_group::2, M=128 collective = 64 rows per CTA) lessons
 
 Kernels on this atom: forward `fwd/kernels/sm100/prefill_d512_f16_2x2.py` + `fwd/kernels/sm107/prefill_d512_f16_2x2.py`
@@ -415,6 +428,14 @@ Kernels on this atom: forward `fwd/kernels/sm100/prefill_d512_f16_2x2.py` + `fwd
 `TemplateParams2x2`), backward d256 `bwd/kernels/bprop_d256_2x2_f16.py` (engine `sdpa_bwd_sm100_d256`). Each lesson names
 its runnable detector (forward: `test/python/sdpa/frost/test_sdpa_fwd_d512_2x2_sm100.py`; backward:
 `test_sdpa_bwd_config_sm100_2x2.py`, `test_sdpa_bwd_dsl_sm100.py`, `test_sdpa_bwd_thd_sm100.py`); add to the list, do not restate.
+
+D256 packed backward schedules the **256-row write pair**, even though each
+2x2 compute cluster covers only 128 KV rows. Run both halves of a tail pair:
+stage 3 can read the masked half, so omitting it consumes stale dS after replay.
+Keep physical per-port origins separate from compact workspace prefixes and
+retain barrier arrivals for dead work while suppressing its output stores.
+`test_sdpa_bwd_thd_d256_sm100.py::test_origins_rebind_and_replay` checks this
+with poisoned scratch, one-sided empties and changed device metadata.
 
 Shared protocol (both passes):
 
@@ -780,6 +801,15 @@ for the old message.
 
 
 ## Prepared THD launch bounds and setup
+
+Ragged-offset integer widths are compiled pointer-ABI facts. Include the whole
+per-port dtype tuple in the prepared artifact key, alongside origin strides and
+multipliers. A valid second plan can otherwise read INT64 offsets as INT32 (or
+the reverse) from an earlier cached host. The D256 detector
+`test_origin_integer_types_separate_compiled_artifacts` checks both transitions
+for Q and Stats, distinct artifacts, disk reload with compilation forbidden,
+and numerical output after replay. Check artifact identity before launching a
+known-colliding negative control.
 
 Each compiled host contract has one production binder across graph, standalone,
 and staged entry points. Forward and half backward use native binding. Quantized
@@ -1156,6 +1186,23 @@ credit. Source-level vector loads can be scalarized, so the single-CTA THD
 path reads through lane zero and broadcasts before the release. Validate
 repeated waves with Compute Sanitizer racecheck as well as O/Stats tests.
 
+This also applies to the custom D256 FP8 predecode scheduler: use local
+stores and a release arrive for its single-CTA THD payload, preserving the
+transaction-counted DSMEM arm for multi-CTA renderings. The paged physical
+origin and multiwave cases in `test_sdpa_fwd_paged_thd_fp8.py` exercise this
+composition; numerics alone can pass while memcheck rejects the DSMEM write.
+Broadcast predecoded fields (Q tile, head, batch, bounds and split) as well as
+the original response before returning a slot credit. A vector response read
+alone leaves scalar field loads racing with the next local publication; the
+D256 multiwave racecheck catches the output-store warp reading a reused slot.
+
+The D256 FP8 shared-alpha handoff uses per-lane release arrivals for both
+publication and reuse, with matching barrier counts. Keep elected warp
+credits confined to the TMEM-only handoff: a TMEM wait does not publish the
+other lanes' shared alpha stores. Run the top-left mask/sink case in
+`test_sdpa_fwd_paged_thd_fp8.py` under racecheck, including its dense and
+compact controls, as well as the persistent scheduler case.
+
 Packed split workspace is bounded by declared packed-Q capacity. Every
 partial store and combine read must use live token coordinates, including
 empty sequences and nonaligned tails. `test_paged_thd_split_capture_lengths_and_stats`
@@ -1227,3 +1274,18 @@ otherwise hide a missing attribute restriction. For example, the pre-folded
 scale case in `test_thd_pack_gqa_unsupported_flavors_decline` includes legal
 CGA2 as well as CGA1. Removing only the pre-folded-scale decline must make the
 CGA2 case fail while the unrelated-domain cases still pass.
+
+
+Paged FP8 D256 uses rank-5 TMA maps with more than one dimension subtile.
+When a page is shorter than the KV tile, keep the shared-memory pitch of each
+dimension slab at the full tile height; a short TMA box must not pack the
+next dimension slab directly after the page rows. Use each pool's own strides
+and table. `test_paged_graph_fp8_d256_page_boundaries` exercises both sides
+of the tile/page boundary and independently laid-out K/V pools.
+
+A sink-only row must publish O=0 and LSE=sink even for a very negative finite
+sink. An empty softmax's reset max is a sentinel, not a real score: folding
+`exp(sink - sentinel)` can underflow and turn LSE into -inf. Select the
+sink-only result explicitly and retain the later padded-Q trim override.
+Detectors: `test_paged_graph_fp8_sink_rebind_replay` and
+`test_prepared_fp8_d256_dense_keyless_sink` include sink logits -120/+120.

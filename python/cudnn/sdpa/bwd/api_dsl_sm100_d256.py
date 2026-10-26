@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: MIT
 
 """cuDNN-frontend adapter of the ``sdpa_bwd_sm100_d256`` row: the SM100 / SM103 (cc 10.0-10.6) d=256 bf16 / fp16 SDPA
-backward.
+backward, with a native dense D192x128 specialization. Q/K and V/O keep
+their actual widths in tensor maps; the delta and grouped-gradient reductions use
+separate widths. No head-dimension staging or extra launch is added.
 
 It IS the Rubin half chain (:mod:`cudnn.sdpa.bwd.api_dsl_sm107`: ``delta = rowsum(dO . O)`` -> the main kernel with dV
 in TMEM and a kv-major ``[B, H_chunk, S_kv, S_q]`` dS workspace -> dK = dS . Q and dQ = dS^T . K as the
@@ -27,6 +29,8 @@ SM100-SM119 for the half chain), descriptor version 0.
 
 from __future__ import annotations
 
+from dataclasses import asdict
+
 import torch
 
 from cudnn.sdpa.bwd import api_dsl_sm107 as _sm107
@@ -39,18 +43,25 @@ _SM100_D256_TEMPLATE_TAG = "sdpa_bwd_sm100_d256_main"
 
 
 class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
-    """``sdpa_bwd_sm100_d256``: d_qk = d_v = 256, bf16 / fp16, on the SM100 line (cc 10.0-10.6) over the 2x2-datapath body."""
+    """SM100 half backward: native D256 or dense D192x128 geometry."""
 
     _FAMILY = _cfg.FAMILY_F16
     _NAME = "sdpa_bwd_sm100_d256"
     _BATCH_CHUNKING = True
     _BATCH_PADDED_BSHD = True
-    _THD_SUPPORTED = False
+    _THD_SUPPORTED = True
+    _THD_ORIGINS_SUPPORTED = True
     _IO_DTYPES = SdpaBwdDslSm107._IO_DTYPES
 
     # The half row serves per-batch kv lengths on its standalone surface (its body reads ``seq_kv_lens[b]`` under the
     # padded-mask arm); the 2x2 body's padded arm has not run, so this row keeps the decline (a typed error below).
     _PER_BATCH_KV_LENS = False
+
+    def _check_head_dims(self) -> None:
+        if (self.head_dim_qk, self.head_dim_v) == (192, 128):
+            self._value_error_if(self.thd, f"{self._NAME}: D192x128 backward currently requires dense BSHD storage")
+            return
+        super()._check_head_dims()
 
     def _allow_head_subgroups(self) -> bool:
         """The dense BF16 chain folds global dK/dV partials after all head chunks.
@@ -77,7 +88,11 @@ class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
         plan = super()._family_scratch_shapes(kv_rows, gqa)
         if self._chunk_partials_enabled():
             return [
-                (name, (self._b_chunk, kv_rows, self._qh_chunk, self.head_dim_qk), dtype) if name in ("dv_part", "dk_part") else (name, shape, dtype)
+                (
+                    (name, (self._b_chunk, kv_rows, self._qh_chunk, self.head_dim_v if name == "dv_part" else self.head_dim_qk), dtype)
+                    if name in ("dv_part", "dk_part")
+                    else (name, shape, dtype)
+                )
                 for name, shape, dtype in plan
             ]
         return plan
@@ -94,6 +109,12 @@ class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
         """Profile 1 (one 64-row sub-block per CTA, 128-row kv block, 227 KiB, descriptor version 0) -- NOT the Rubin twin
         constant ``BWD_D256_2X2``: this row has no 4x1 body to fall back to."""
         return _cfg2x2.PROFILE_SM100
+
+    def _template_params(self):
+        params = super()._template_params()
+        if (self.head_dim_qk, self.head_dim_v) == (192, 128):
+            return _cfg2x2.TemplateParams2x2(**asdict(params), head_dim_qk=192, head_dim_v=128)
+        return params
 
     def _kernel_file(self) -> str:
         return _2X2_KERNEL_FILE

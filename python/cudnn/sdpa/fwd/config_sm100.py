@@ -93,6 +93,9 @@ from cudnn.sdpa.fwd.config_d128_family import (
 # Native half THD flavors whose worklist and Stats stores use packed heads.
 SM100_THD_PACK_GQA_SHAPES = frozenset({(128, 128)})
 
+# Native per-tensor FP8 bodies that compose page pools with THD Q/O maps.
+SM100_PAGED_FP8_THD_SHAPES = frozenset({(128, 128), (256, 256)})
+
 # Native half flavors whose PREFILL kernel stores the score side outputs -- the graph's optional
 # ``score_max`` / ``score_sum_exp`` fp32 (B, H_q, S_q, 1) ports: per Q row the softmax max in
 # natural units and the fp32 row-sum of exp(s - max), the two operands the LSE is built from
@@ -508,8 +511,10 @@ def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_sta
 
 
 def supports_scalar_kv_tail_split(d_shape, *, device_cc, fp8, pertensor):
-    """Native scalar-tail masking composes with D128 half/per-tensor FP8 split."""
-    return device_cc in ((10, 0), (10, 3), (10, 7)) and d_shape == (128, 128) and (not fp8 or pertensor)
+    """Scalar-tail masking composes with D128 and native Rubin half D512 split."""
+    return (device_cc in ((10, 0), (10, 3), (10, 7)) and d_shape == (128, 128) and (not fp8 or pertensor)) or (
+        device_cc == (10, 7) and d_shape == (512, 512) and not fp8
+    )
 
 
 def supports_paged_split_sink(d_shape, *, device_cc, fp8, thd, paged, max_q):
@@ -524,8 +529,8 @@ def supports_paged_prefill_cga1(d_shape, *, device_cc, fp8, thd, paged, split_kv
 
 
 def supports_paged_d256_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
-    """The shared D256 packed-head path is qualified on paged Rubin THD only."""
-    return device_cc == (10, 7) and d_shape == (256, 256) and not fp8 and thd and paged and cga in (None, 2) and split_kv == 1
+    """The shared D256 packed-head path serves paged half THD on SM100/103/107."""
+    return device_cc in ((10, 0), (10, 3), (10, 7)) and d_shape == (256, 256) and not fp8 and thd and paged and cga in (None, 2) and split_kv == 1
 
 
 def supports_nonpaged_d128_thd_prefill(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
@@ -552,7 +557,7 @@ def d256_mxfp8_pair_leg(*, device_cc, pertensor, thd, paged, split_kv) -> bool:
     return tuple(device_cc or ()) == (10, 7) and not pertensor and not thd and not paged and (split_kv or 1) == 1
 
 
-def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: bool = False) -> None:
+def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: bool = False, d512_partial_pack_wired: bool = False) -> None:
     if k.qsa_block_topk or k.qsa_block_size or k.qsa_softmax_groups:
         # The loader routes an index-list record (qsa_block_topk != 0) to the cc 10.7 sparse kernel
         # (config_sm107.make_cfg_d256_sparse); a dense template must never consume one -- it would read K/V densely and
@@ -735,7 +740,7 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
             raise ValueError("d512: mma_2x2 is wired for BF16/FP16 inputs only (the fp8 / mxfp8 d512 kernels stay role-split)")
         if k.paged_kv:
             raise ValueError("d512: mma_2x2 does not serve paged KV (the d512 rows decline paged anyway)")
-        if k.pack_gqa and (k.qh_per_kh <= 0 or _D512_2X2_TILE_M % k.qh_per_kh != 0):
+        if k.pack_gqa and not d512_partial_pack_wired and (k.qh_per_kh <= 0 or _D512_2X2_TILE_M % k.qh_per_kh != 0):
             raise ValueError(f"d512: mma_2x2 packs whole GQA groups into its {_D512_2X2_TILE_M}-row tile; qh_per_kh ({k.qh_per_kh}) must divide it")
 
 
@@ -2050,7 +2055,7 @@ class CfgD512X2:
 
     PACK_GQA: int = 0
     QH_PER_KH: int = 1
-    # Whole-group packing only: G must divide TILE_M = 64 (G=128 stays role-split).
+    # SM100 packs whole groups; the native SM107 body also serves divisors of G.
     PACK_G: int = 1
 
 

@@ -138,17 +138,26 @@ def _plot_phase(df, config, phase: str, outdir: Path) -> List[Path]:
     pdf["heads"] = pdf.apply(lambda r: f"{int(r.num_q_heads)}/{int(r.num_kv_heads)}h", axis=1)
     pdf["tick"] = pdf.apply(lambda r: f"tp{r.tp}\n{r.heads}", axis=1)
 
+    # The serving-form rows (paged K/V, mixed cache lengths) get their own clusters rather than averaging into the dense ones.
+    pdf["layout_tag"] = pdf.apply(
+        lambda r: ("  paged" if r.get("kv_layout", "dense") == "paged" else "")
+        + (f" fill{float(r.get('kv_min_fill', 1.0)):g}" if float(r.get("kv_min_fill", 1.0)) < 1 else ""),
+        axis=1,
+    )
     if phase == "context":
         pdf["row_key"] = pdf.apply(lambda r: "full" if r.q_tokens == r.kv_len else "chunked", axis=1)
         pdf["cluster"] = pdf.apply(
-            lambda r: f"{r.base_model}  s{_fmt_len(r.kv_len)}" if r.q_tokens == r.kv_len else f"{r.base_model}  q{_fmt_len(r.q_tokens)}/kv{_fmt_len(r.kv_len)}",
+            lambda r: (
+                f"{r.base_model}  s{_fmt_len(r.kv_len)}" if r.q_tokens == r.kv_len else f"{r.base_model}  q{_fmt_len(r.q_tokens)}/kv{_fmt_len(r.kv_len)}"
+            )
+            + r.layout_tag,
             axis=1,
         )
         row_keys = [k for k in ("full", "chunked") if (pdf.row_key == k).any()]
         row_titles = {"full": "full prefill (s_q = s_kv)", "chunked": "chunked prefill (small s_q, long KV)"}
     else:
         pdf["row_key"] = pdf.q_tokens
-        pdf["cluster"] = pdf.apply(lambda r: f"{r.base_model}  b{r.batch_size} kv{_fmt_len(r.kv_len)}", axis=1)
+        pdf["cluster"] = pdf.apply(lambda r: f"{r.base_model}  b{r.batch_size} kv{_fmt_len(r.kv_len)}{r.layout_tag}", axis=1)
         row_keys = sorted(pdf.q_tokens.unique())
         row_titles = {q: _mtp_title(int(q)) for q in row_keys}
 
@@ -158,7 +167,7 @@ def _plot_phase(df, config, phase: str, outdir: Path) -> List[Path]:
     for m in config.models:
         base_order.setdefault(_base_of(m.name), len(base_order))
     pdf = pdf.sort_values(
-        by=["base_model", "batch_size", "q_tokens", "kv_len", "tp"],
+        by=["base_model", "batch_size", "q_tokens", "kv_len", "layout_tag", "tp"],
         key=lambda col: col.map(base_order) if col.name == "base_model" else col,
     )
     series_order = [b + suf for b in BACKEND_ORDER for suf in ("", " (fp8 kv)")]

@@ -54,6 +54,6 @@ CONFIG = BenchmarkConfig(
     attn_masks=["no_mask"],
     profile_pass="fwd",
     batch_size=1,
-    num_iterations=10,
+    num_iterations=20,
     output_dir="results",
 )

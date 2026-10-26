@@ -2202,11 +2202,14 @@ def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int, split_kv: Optiona
             (facts.d_qk, facts.d_v), device_cc=facts.device_cc, fp8=not half, thd=facts.thd, paged=facts.has_paged_kv, cga=cga, split_kv=split_kv or 1
         )
     )
+    # The flavor the PACKED leg lands on, as mismatch() selects it: a dense-only small tile (Rubin d32 / d64) walks to d128.
+    packed = SdpaFwdKnobs(pack_gqa=True, split_kv=split_kv, cga=cga)
+    packed_shape = _selected_d_shape(caps, facts, packed)
     return (
         True in caps.pack_gqas
-        and (caps.pack_gqa_d_shapes is None or _selected_d_shape(caps, facts) in caps.pack_gqa_d_shapes)
-        and not (caps.sm_lo == 107 and half and not facts.has_paged_kv and not rubin_decode_tile and not rubin_dense_d128_shared_leg(caps, facts))
-        and not (caps.sm_lo == 107 and half and _selected_d_shape(caps, facts) == (256, 256) and not rubin_decode_tile and not rubin_paged_thd_d256)
+        and (caps.pack_gqa_d_shapes is None or packed_shape in caps.pack_gqa_d_shapes)
+        and not (caps.sm_lo == 107 and half and not facts.has_paged_kv and not rubin_decode_tile and not rubin_dense_d128_shared_leg(caps, facts, packed))
+        and not (caps.sm_lo == 107 and half and packed_shape == (256, 256) and not rubin_decode_tile and not rubin_paged_thd_d256)
         and not (facts.thd and not _thd_decode_leg(caps, facts) and (facts.d_qk, facts.d_v) not in caps.thd_pack_gqa_d_shapes)
         and not (facts.has_epilogue_gate and not rubin_decode_tile)
         and facts.h_q != facts.h_kv
@@ -2452,7 +2455,8 @@ def _split_points(
     # for an explicitly REQUESTED split, but this function proposes one on its
     # own, so it has to consult the same set or it hands back a knob the
     # lowering will reject (d64 wires no split; see config_sm100.CfgD64).
-    if caps.split_d_shapes is not None and _selected_d_shape(caps, facts) not in caps.split_d_shapes:
+    # Read on the flavor the SPLIT leg lands on (a dense-only small tile walks to d128), as mismatch() does.
+    if caps.split_d_shapes is not None and _selected_d_shape(caps, facts, SdpaFwdKnobs(split_kv=2, pack_gqa=pack_g > 1, cga=cga)) not in caps.split_d_shapes:
         return [no_split]
     # Paged KV is padded by construction and the split composes with the
     # per-batch lengths (it IS the decode lever there) — see mismatch().

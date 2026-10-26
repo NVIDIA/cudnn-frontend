@@ -47,6 +47,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.experimental import primitives as prims
 
+from cudnn.frost.tile_dsl.thd import thd_port_origin
 from cudnn.frost.tile_dsl.pointwise import atomic_max_f32_bits, fmax_f32, warp_abs_max_f32_shfl
 from cudnn.sdpa.bwd.config_sm120 import ROW_ROUND
 from cudnn.sdpa.bwd.kernels.sm120._common import _COPY_ELEMS, _LOG2E, ceil_div, wide_index
@@ -77,6 +78,10 @@ def dot_do_o_kernel(
     deterministic: cutlass.Constexpr[bool],
     descale_o: Optional[cute.Tensor],  # fp32 [1] device scalar (FP8 O payload); None = half-precision O
     descale_do: Optional[cute.Tensor],  # fp32 [1] device scalar (FP8 dO payload); paired with descale_o
+    thd_meta=None,
+    thd_origins=None,
+    thd_origin_rows: cutlass.Constexpr = (-1, -1),
+    thd_n_batch: cutlass.Int32 = 0,
 ):
     if cutlass.const_expr(use_pdl):
         cute.arch.griddepcontrol_launch_dependents()
@@ -101,7 +106,12 @@ def dot_do_o_kernel(
     o_batch_stride, o_seq_stride, o_head_stride, _ = o.stride
     do_batch_stride, do_seq_stride, do_head_stride, _ = do.stride
     compact = (S_Q * H * D_V, H * D_V, D_V)
-    io_strided = o.shape[3] != D_V or (o_batch_stride, o_seq_stride, o_head_stride) != compact or (do_batch_stride, do_seq_stride, do_head_stride) != compact
+    io_strided = (
+        thd_meta is not None
+        or o.shape[3] != D_V
+        or (o_batch_stride, o_seq_stride, o_head_stride) != compact
+        or (do_batch_stride, do_seq_stride, do_head_stride) != compact
+    )
     if cutlass.const_expr(io_strided):
         o_base = wide_index(batch, o) * o_batch_stride + wide_index(q_block, o) * Q_TILE * o_seq_stride + wide_index(head, o) * o_head_stride
         do_base = wide_index(batch, do) * do_batch_stride + wide_index(q_block, do) * Q_TILE * do_seq_stride + wide_index(head, do) * do_head_stride
@@ -116,6 +126,16 @@ def dot_do_o_kernel(
         base = ((wide_index(batch, o) * S_Q + wide_index(q_block, o) * Q_TILE) * H + wide_index(head, o)) * D_V
     delta_base = (batch * H + head) * S_Q_R + q_block * Q_TILE
     q_left = S_Q - q_block * Q_TILE
+    if cutlass.const_expr(thd_meta is not None):
+        meta = cutlass.make_array_view(thd_meta)
+        start = cutlass.Int32(meta[thd_n_batch + batch])
+        length = cutlass.Int32(meta[thd_n_batch + batch + 1]) - start
+        o_token = thd_port_origin(thd_origins, thd_origin_rows[0], batch, start)
+        do_token = thd_port_origin(thd_origins, thd_origin_rows[1], batch, start)
+        o_base = (o_token + cutlass.Int64(q_block) * Q_TILE) * cutlass.Int64(o_seq_stride) + cutlass.Int64(head) * o_head_stride
+        do_base = (do_token + cutlass.Int64(q_block) * Q_TILE) * cutlass.Int64(do_seq_stride) + cutlass.Int64(head) * do_head_stride
+        delta_base = cutlass.Int64(head) * cutlass.Int64(delta.stride[1]) + cutlass.Int64(start) + cutlass.Int64(q_block) * Q_TILE
+        q_left = length - q_block * Q_TILE
 
     threads_per_row = chunk_elems // _COPY_ELEMS
     rows_per_pass = 256 // threads_per_row
@@ -186,7 +206,13 @@ def dot_do_o_kernel(
         if cutlass.const_expr(descale_o is not None):
             acc = acc * dsc_o_do
         if tidx % threads_per_row == 0:
-            (delta_ptr + delta_base + row).store(acc)
+            if cutlass.const_expr(thd_meta is not None):
+                # Compact scratch has no padding between sequences. Overshooting
+                # rows must never erase the next sequence's live delta.
+                if row < q_left:
+                    (delta_ptr + delta_base + row).store(acc)
+            else:
+                (delta_ptr + delta_base + row).store(acc)
 
     if cutlass.const_expr(use_pdl):
         cute.arch.griddepcontrol_wait()
@@ -270,6 +296,30 @@ def dot_do_o_scaled_host(
         block=(256, 1, 1),
         stream=stream,
     )
+
+
+@cute.jit
+def dot_do_o_thd_origins_host(o, do, delta, meta, origins, n_batch, max_sq, origin_rows: cutlass.Constexpr, D: cutlass.Constexpr, stream):
+    """Stream caller O/dO at independent origins into compact delta scratch."""
+    dot_do_o_kernel(
+        o,
+        do,
+        delta,
+        None,
+        None,
+        DOT_Q_TILE,
+        D,
+        D,
+        DOT_CHUNK_ELEMS,
+        False,
+        False,
+        None,
+        None,
+        meta,
+        origins,
+        origin_rows,
+        cutlass.Int32(n_batch),
+    ).launch(grid=(ceil_div(max_sq, DOT_Q_TILE), o.shape[2], n_batch), block=(256, 1, 1), stream=stream)
 
 
 # ---------------------------------------------------------------------------
