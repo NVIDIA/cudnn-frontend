@@ -553,10 +553,11 @@ def _pick_flavor(d_qk: int, d_v: int, candidates: Optional[tuple[tuple[int, int]
 # CFG.MASK_FLAGS) -- this entry switches the field on, the band gate inside the kernel keeps the causal builds all-MUFU.
 # OFF = MEASURED losses or no measurement: an additional _E2E_* block on ("fp8", (192, 128)) dense +1 % marginal, causal -1.6 %, and one on
 # ("mxfp8", (192, 128)) -3.3..-4.0 % dense -- neither block was merged, and neither is what those entries gate;
-# every d256 / d512 flavor unmeasured.  Widening either set is a per-cc, per-kernel measurement -- never a default.
+# BF16 D64 nonpaged causal interiors also use the existing mix; masked tiles, dense bands and other layouts stay on MUFU.
+# Every d256 / d512 flavor is unmeasured.  Widening either set is a per-cc, per-kernel measurement -- never a default.
 _EXP2_FMA_SPLIT_CC: frozenset[tuple[int, int]] = frozenset({(10, 0)})
 _EXP2_FMA_SPLIT_KERNELS: frozenset[tuple[str, tuple[int, int]]] = frozenset(
-    {("mxfp8", (128, 128)), ("fp8", (128, 128)), ("fp8", (192, 128)), ("mxfp8", (192, 128)), ("f16", (192, 128)), ("f16", (128, 128))}
+    {("mxfp8", (128, 128)), ("fp8", (128, 128)), ("fp8", (192, 128)), ("mxfp8", (192, 128)), ("f16", (192, 128)), ("f16", (128, 128)), ("f16", (64, 64))}
 )
 
 
@@ -573,7 +574,7 @@ def _quant_kind(fp8: bool, pertensor: bool) -> str:
 # all four tp shards): -8..-9 % from 8 sequences x 32K keys up (b=128 x 128K keys 919 -> 841 us at tp8), -3..-6 % at 2K keys, 0 at b=1 x 2K; S_q = 4
 # -4..-5 %.  The kernel folds the split out of the sliding-window builds (a unit there is one or two KV tiles: +2..+5 % at S_q >= 2).  The d128 decode
 # tile keeps the dense path off (HBM-bound where measured). Its THD split form separately uses the existing f16/d128 flag with a kernel-local
-# packed-partials gate; the d64 prefill tile stays off (unmeasured).
+# packed-partials gate. D64 prefill claims its own BF16 causal-interior mix in the prefill set.
 _EXP2_FMA_SPLIT_DECODE_KERNELS: frozenset[tuple[str, tuple[int, int]]] = frozenset({("f16", (64, 64))})
 
 
