@@ -246,7 +246,7 @@ def setup_cudnn(args, dtype, oss=False, auto=False):
         return fn, f"cudnn_oss plan={_require_python_oss_plan(graph)}"
     if auto:
         return fn, f"cudnn_auto plan={_built_plan_name(graph)}"
-    return fn, f"cudnn {cudnn.backend_version_string()}"
+    return fn, f"cudnn {cudnn.backend_version_string()} plan={_built_plan_name(graph)}"
 
 
 def _deselect_frost_sdpa(graph):
@@ -373,7 +373,7 @@ def setup_cudnn_fp8(args, cudnn, oss=False, auto=False):
         return fn, f"cudnn_oss fp8 plan={_require_python_oss_plan(graph)}"
     if auto:
         return fn, f"cudnn_auto fp8 plan={_built_plan_name(graph)}"
-    return fn, f"cudnn fp8 {cudnn.backend_version_string()}"
+    return fn, f"cudnn fp8 {cudnn.backend_version_string()} plan={_built_plan_name(graph)}"
 
 
 def _paged_kv_layout(batch, kv_len, page_size, device="cuda"):

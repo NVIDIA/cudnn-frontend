@@ -52,3 +52,24 @@ def test_repeated_runs_stay_separate(tmp_path):
     )
     out = subprocess.run([sys.executable, "-m", "benchmark.heuristics_regret", str(tmp_path)], capture_output=True, text=True)
     assert "compared cases: 2" in out.stdout and "misranks (regret > 1.05): 1" in out.stdout, out.stdout
+
+
+def test_same_plan_is_noise_not_misrank(tmp_path):
+    """cudnn_auto running the faster leg's own plan is a correct pick; the timing gap is reported as noise."""
+    _write(
+        tmp_path / "r.csv",
+        [
+            # inference details (benchmark_single_attention) and a bare training detail
+            dict(backend="cudnn", q_tokens=1024, kv_len=1024, time_ms="1.0", backend_detail="cudnn 9.29.0 plan=eng10_k24=1"),
+            dict(backend="cudnn_auto", q_tokens=1024, kv_len=1024, time_ms="1.2", backend_detail="cudnn_auto plan=eng10_k24=1"),
+            dict(backend="cudnn", q_tokens=2048, kv_len=2048, time_ms="1.0", backend_detail="eng10_k24=1"),
+            dict(backend="cudnn_oss", q_tokens=2048, kv_len=2048, time_ms="0.5", backend_detail="sdpa_fwd_prefill_sm100[TILE_M=128, TILE_N=128]"),
+            dict(backend="cudnn_auto", q_tokens=2048, kv_len=2048, time_ms="1.1", backend_detail="eng10_k24=1"),
+            # an unrecorded plan identity never counts as the same plan
+            dict(backend="cudnn", q_tokens=4096, kv_len=4096, time_ms="1.0", backend_detail="unknown"),
+            dict(backend="cudnn_auto", q_tokens=4096, kv_len=4096, time_ms="20.0", backend_detail="unknown"),
+        ],
+    )
+    out = subprocess.run([sys.executable, "-m", "benchmark.heuristics_regret", str(tmp_path)], capture_output=True, text=True)
+    assert "misranks (regret > 1.05): 2" in out.stdout and "| 2.20 |" in out.stdout and "| 20.00 |" in out.stdout, out.stdout
+    assert "same plan as the faster leg (regret 1.0): 1" in out.stdout and "max 1.200" in out.stdout, out.stdout
