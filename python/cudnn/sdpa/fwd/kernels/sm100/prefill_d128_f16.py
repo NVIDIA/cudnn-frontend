@@ -3482,9 +3482,9 @@ def _host(
     kv_mask_ptr: Optional[cute.Pointer],
     kv_mask_batch_stride: cutlass.Int64,
     inv_scale_softmax: cutlass.Float32,
-    stream: _cuda_driver.CUstream = None,
     thd_origin_ptrs: Optional[tuple] = None,
     thd_origin_specs: cutlass.Constexpr = None,
+    stream: _cuda_driver.CUstream = None,
 ) -> None:
     """Host entry: device pointers, runtime extents and strides in, TMA encodes and launches out.
 
