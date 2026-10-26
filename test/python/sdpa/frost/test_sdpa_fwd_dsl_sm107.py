@@ -5239,6 +5239,7 @@ def test_sm107_half_split_direct_template_stats_base(d, stats_log2):
                 scale_softmax_log2=math.log2(math.e) / math.sqrt(d),
                 n_thd_units=0,
                 seq_q_lens_addr=0,
+                thd_origin_ptrs=None,
                 thd_q_lens_ptr=None,
                 thd_kv_lens_ptr=None,
                 thd_lens_form=None,

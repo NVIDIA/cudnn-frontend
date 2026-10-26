@@ -90,7 +90,12 @@ body. Packed and unpacked plans share its two softmax warpgroups and four KV
 stages, and declare their persistent THD scheduler to the launch adapter.
 An envelope of up to two resident waves is assigned directly; larger envelopes
 use one resident wave and claim further work on device.
-Decode, paged and single-Q split plans retain their existing bodies.
+Paged D128 half uses the native SM107 body as well, retaining its four KV
+stages at CGA2. Unsplit THD graph plans preserve independent physical Q/O/Stats
+origins, live lengths, and independent K/V page tables and pool strides.
+`test_sdpa_fwd_paged_thd_origins.py` exercises HND/NHD and mixed pools,
+packing, changed offsets and strides, keyless sequences, and empty replay.
+D256 paged and single-Q split plans retain their existing bodies.
 Automatic candidate proposals and placement are unchanged. The THD packing,
 mask/sink, padded-Stats and changed-length replay tests exercise this support.
 
