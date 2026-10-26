@@ -3094,9 +3094,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                             max_q=int(s_qo),
                         )
                     )
-                    or (not self.packed_thd_split and self._device_cc == (10, 7))
                 ),
-                "split_kv > 1 with an attention sink is served by the SM100 half kernels and Rubin paged D128 half packed Q>1 only; FP8 and cc 10.7 dense keep the sink-free split contract",
+                "split_kv > 1 with an attention sink requires half-precision sink-free partials; packed THD sinks require the supported paged D128 Q>1 combine",
             )
             if self.has_sink and self.packed_thd_split:
                 from cudnn import _pybind_module

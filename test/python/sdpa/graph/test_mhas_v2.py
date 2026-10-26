@@ -4835,11 +4835,8 @@ def test_sdpa_fwd_cc107_sink_free_decode_split_pins_L0(env_info, request, cudnn_
 @_cc107_only
 @pytest.mark.L0
 @pytest.mark.parametrize("shape", ["b128_64x8_q8_kv2056", "b4_32x8_q4_kv1024"], ids=lambda x: x)
-def test_sdpa_fwd_cc107_sink_split_declines_L0(request, cudnn_handle, shape):
-    """Lever D's boundary, pinned: with an attention sink the cc 10.7 half row offers the decode tile packed and
-    unpacked (admission through get_engine_and_knobs_at_index) and NO split set, and an explicit sink + split pin is a
-    typed decline naming the sink-free contract (the shared combine folds no sink; a split would count it once per
-    partition).  A direct graph.sdpa graph (bf16 BSHD, bottom-right causal, sinks linspace(7, 10, H_q))."""
+def test_sdpa_fwd_cc107_sink_split_pins_L0(request, cudnn_handle, shape):
+    """The existing sink decode proposals remain legal and an explicit split folds the sink once."""
     engine = _cc107_engine("half")
     _require_frost_sm107(engine)
     b, h_q, h_kv, s_q, s_kv = dict(b128_64x8_q8_kv2056=(128, 64, 8, 8, 2056), b4_32x8_q4_kv1024=(4, 32, 8, 4, 1024))[shape]
@@ -4858,17 +4855,27 @@ def test_sdpa_fwd_cc107_sink_split_declines_L0(request, cudnn_handle, shape):
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-        return g
+        return g, {q_t: q, k_t: k, v_t: v, s_t: sink, o_t: o}
 
-    offered = _cc107_half_plan_sets(build())
+    offered = _cc107_half_plan_sets(build()[0])
     assert {(1, 1, 1), (0, 1, 1)} <= offered, offered
-    assert all(split == 1 for _, _, split in offered), offered
-    g = build()
+    g, bindings = build()
     g.create_execution_plan(_cc107_half_engine_id(), {kt.PACK_GQA: 1, kt.TILE_CGA_M: 1, kt.SPLIT_KV: 2, kt.SCHED_POLICY: 0, kt.TILE_M: 128, kt.TILE_N: 128})
     g.select_plan(g.get_execution_plan_count() - 1)
-    with pytest.raises((cudnn.cudnnGraphNotSupportedError, NotImplementedError, ValueError), match="sink-free"):
-        g.check_support()
-        g.build_plans()
+    g.check_support()
+    g.build_plans()
+    workspace = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    g.execute(bindings, workspace, handle=cudnn_handle)
+    torch.cuda.synchronize()
+    mask = torch.arange(s_kv, device="cuda")[None, :] > torch.arange(s_q, device="cuda")[:, None] + s_kv - s_q
+    for batch in range(b):
+        keys = k[batch].double().repeat_interleave(h_q // h_kv, 0)
+        values = v[batch].double().repeat_interleave(h_q // h_kv, 0)
+        scores = (q[batch].double() @ keys.transpose(-1, -2)) * d ** -0.5
+        scores.masked_fill_(mask, -torch.inf)
+        scores = torch.cat([scores, sink.double().reshape(h_q, 1, 1).expand(h_q, s_q, 1)], dim=-1)
+        ref = scores.softmax(-1)[..., :-1] @ values
+        torch.testing.assert_close(o[batch].double(), ref, atol=4e-3, rtol=4e-3)
 
 
 _P3_PAGED_SINK_KV = [2056, 2048, 1025, 513, 300, 129, 128, 16, 15, 1, 0, 1536, 777, 255, 33, 4, 2047, 64, 17, 1024, 2000, 511, 96, 7]

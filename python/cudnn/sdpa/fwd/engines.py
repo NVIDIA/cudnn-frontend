@@ -1545,12 +1545,16 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # machine underfilled), so it is exempt from the padded exclusion.
             if (
                 (facts.thd and not (ragged_decode or packed_split))
-                # The SM100 and SM120 half flavors write sink-free partials and fold
-                # the sink once in the combine; the FP8 epilogues and the Rubin kernels
-                # still fold it per tile, a gated split's combine carries no sink, and
+                # The SM100, SM107 and SM120 half flavors write sink-free partials and fold
+                # the sink once in the combine; the FP8 epilogues still fold it
+                # per tile, a gated split's combine carries no sink, and
                 # the packed THD split carries one only where thd_split_domain admits
                 # it (supports_paged_split_sink).
-                or (facts.has_sink and not packed_split and (facts.is_fp8 or facts.is_mxfp8 or facts.has_epilogue_gate or capabilities.sm_lo not in (100, 120)))
+                or (
+                    facts.has_sink
+                    and not packed_split
+                    and (facts.is_fp8 or facts.is_mxfp8 or facts.has_epilogue_gate or capabilities.sm_lo not in (100, 107, 120))
+                )
                 or (facts.padded and not facts.has_paged_kv and not packed_split)
                 or facts.seq_q_trim
                 # A split sink over padded query lengths also needs the native dense binder that hands the combine the Q lengths (a padded
@@ -1564,7 +1568,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                     and not getattr(cudnn._pybind_module._SdpaDenseBinder, "supports_combine_q_lens", False)
                 )
             ):
-                return "split_kv > 1 serves sink-free dense graphs (a sink splits on the SM100 and SM120 half flavors only), the decode tile's ragged-Q leg, or native D128/D256 or nonpaged D192 packed split"
+                return "split_kv > 1 serves sink-free dense graphs (a sink splits on the SM100, SM107 and SM120 half flavors only), the decode tile's ragged-Q leg, or native D128/D256 or nonpaged D192 packed split"
             if _synth_kv_padding(capabilities, facts) and not supports_scalar_kv_tail_split(
                 (facts.d_qk, facts.d_v),
                 device_cc=facts.device_cc,
@@ -2226,7 +2230,8 @@ def _sm107_spec() -> EngineSpec:
       descriptors that keep a NaN capacity tail out of BMM2.
     - ``split_kv_supported``: dense d128 and d192x128 use FP32 partials and
       the shared combine. Bounded D128 THD and nonpaged D192 THD
-      also use the shared single-CTA packed partials. Sink split stays declined.
+      also use the shared single-CTA packed partials. Half dense sink splits fold the
+      sink once in the combine; nonpaged THD sink splits stay declined.
       On d256 the split is the decode tile's (dense or paged, packed or not:
       fp32 partials into the split-major workspace the shared combine reduces)
       and the paged THD packed split; the d256 prefill kernel has no dense split.
@@ -2238,8 +2243,9 @@ def _sm107_spec() -> EngineSpec:
       runs unpacked, so ``mismatch`` declines a packed dense d256 graph the tile does not serve).
     - ``paged_kv``: D128/D256 half THD -- with or without an attention sink (the
       per-row epilogue fold; a keyless row stores O := 0 / LSE := sink) -- uses the
-      shared Blackwell paged pipeline, compiled natively for SM107; sink + split-KV stays
-      declined row-wide (the combine is not sink-aware), so a sink decode graph runs unsplit.
+      shared Blackwell paged pipeline, compiled natively for SM107. The D128 paged THD
+      Q>1 sink split uses its sink-aware packed combine; dense D256 decode sink
+      splits use the shared dense combine. Other THD sink splits stay declined.
       Dense (non-THD) paged queries stay declined EXCEPT a DECODE-shaped half d256 graph
       (dense Q, ``S_q x G`` packed rows within the tile's routed envelope -- 16 rows, or the
       32-column tile in up to two token units for a packed MTP step -- sink or not), which
