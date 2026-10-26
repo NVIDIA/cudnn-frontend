@@ -623,6 +623,8 @@ _split_h = make_split_helpers(
     dispatch_decode_payload=_dispatch_decode_payload,
 )
 SPLIT_KV = _split_h.SPLIT_KV
+# Split partials exclude the sink; the shared combine folds it exactly once.
+FOLD_SINK = CFG.HAS_SINK and SPLIT_KV == 1
 _FP32_PARTIALS = SPLIT_KV > 1
 if CFG.SOFTMAX_WARPGROUPS not in (2, 3) or CFG.TILES_Q != CFG.SOFTMAX_WARPGROUPS:
     # One softmax warp group per Q sub-tile: the classic two, or the three of the TILE_N-64 pair arm (config_sm107 derives both from one field).
@@ -4533,7 +4535,7 @@ def _correction_warp_group(
                 LN2 = cutlass.Float32(0.6931471805599453)
                 total_max_nat = total_max_scaled * LN2
                 row_head_idx = head_idx * HEADS_PER_TILE + row_in_tile % HEADS_PER_TILE
-                if cutlass.const_expr(CFG.HAS_SINK):
+                if cutlass.const_expr(FOLD_SINK):
                     sinks_arr = cutlass.make_array_view(sinks_tensor)
                     sink_logit = sinks_arr[row_head_idx]
                     new_max = cute.math.max(total_max_nat, sink_logit)
@@ -4553,7 +4555,7 @@ def _correction_warp_group(
                     # keyless-row SELECTs below override both.
                     true_max_nat = stats_vec[2] * LN2
                     sum_true = total_sum * cute.math.exp2(total_max_scaled - stats_vec[2], fastmath=True)
-                    if cutlass.const_expr(CFG.HAS_SINK):
+                    if cutlass.const_expr(FOLD_SINK):
                         smax_sink = cute.math.max(true_max_nat, sink_logit)
                         score_max_val = smax_sink
                         score_sum_val = sum_true * cute.math.exp(true_max_nat - smax_sink, fastmath=True) + cute.math.exp(sink_logit - smax_sink, fastmath=True)
@@ -4599,7 +4601,7 @@ def _correction_warp_group(
                     # with total_sum == 0 EXACTLY (a live row has sum >= 2^-RESCALE_THRESHOLD): fold it into the empty-row
                     # predicate, so O is SELECTed to 0 and the LSE to -inf (sink: sink_logit) like a geometric empty row.
                     _kv_empty = _kv_empty | (total_sum == cutlass.Float32(0.0))
-                if cutlass.const_expr(not CFG.HAS_SINK):
+                if cutlass.const_expr(not FOLD_SINK):
                     # A sink leaves real mass and the branch above already yields
                     # LSE = sink_logit there; without one an empty row is -inf.
                     lse_val = cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(float("-inf")).ir_value(), lse_val.ir_value()))
@@ -4909,7 +4911,7 @@ def _corr_item_pair(
             inv_sum = cutlass.Float32(0.0)
             lse_val = cutlass.Float32(0.0)
             total_max_nat = total_max_scaled * LN2
-            if cutlass.const_expr(CFG.HAS_SINK):
+            if cutlass.const_expr(FOLD_SINK):
                 sinks_arr = cutlass.make_array_view(sinks_tensor)
                 sink_logit = sinks_arr[head_idx]
                 new_max = cute.math.max(total_max_nat, sink_logit)
@@ -4933,7 +4935,7 @@ def _corr_item_pair(
                     _first_k = cute.math.max(_first_k, q_row_global - cutlass.Int32(CFG.WINDOW_LEFT))
                 _kv_empty = _kv_empty | (_first_k > _last_k)
             _kv_empty = _kv_empty | (total_sum == cutlass.Float32(0.0))
-            if cutlass.const_expr(not CFG.HAS_SINK):
+            if cutlass.const_expr(not FOLD_SINK):
                 lse_val = cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(float("-inf")).ir_value(), lse_val.ir_value()))
             else:
                 lse_val = cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(sink_logit).ir_value(), lse_val.ir_value()))
