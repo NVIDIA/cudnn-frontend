@@ -197,12 +197,23 @@ def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None):
 @pytest.mark.parametrize("s_q", [1, 4])
 @pytest.mark.parametrize("sink_logit", [-2.0, -1000.0])
 def test_sink_split_paged_decode_keyless(s_q, sink_logit):
+    import cudnn
     import torch
     from test_sdpa_fwd_decode_d256_sm107 import _run_graph
     from test_sdpa_fwd_dsl_sm107 import _rubin_only
 
     _rubin_only()
     plan = _run_graph(
-        B=3, H=16, KH=2, s_q=s_q, lens=[700, 0, 1], page=16, sink=sink_logit, causal_br=True, dtype=torch.bfloat16, stats_log2=True, split_kv=8, pack_gqa=True
+        B=3,
+        H=16,
+        KH=2,
+        s_q=s_q,
+        lens=[700, 0, 1],
+        page=16,
+        sink=sink_logit,
+        causal_br=True,
+        dtype=torch.bfloat16,
+        stats_log2=True,
+        explicit_knobs={cudnn.knob_type.SPLIT_KV: 8, cudnn.knob_type.PACK_GQA: 1},
     )
     assert plan.knobs.split_kv == 8 and plan.knobs.pack_gqa is True
