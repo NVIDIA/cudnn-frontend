@@ -81,26 +81,30 @@ def build_thd_origins(
                 destination[port, b] = cutlass.Int64(source[b]) * cutlass.Int64(spec[1]) // token_stride
     cute.arch.barrier()
     if nvvm.elect_sync():
-        # O keeps the first map array so the existing store pipeline is shared.
+        # Stripe warps over ports as well as sequences. A short batch must
+        # not serialize all four maps on one elected writer. O/Q occupy the
+        # first two slots, which are the only maps needed for paged KV.
+        map_count = 2 if cutlass.const_expr(paged) else 4
         for slot in cutlass.range_constexpr(4):
             port = (3, 0, 1, 2)[slot]
             if cutlass.const_expr(not paged or port not in (1, 2)):
-                cu0 = 2 * batch + 1 if port in (1, 2) else batch
-                emit_seq_descs(
-                    base_maps[port],
-                    maps,
-                    meta,
-                    cu0,
-                    tensors[port],
-                    batch,
-                    cutlass.Int64(tensors[port].stride[1]),
-                    2,
-                    slot_base=slot * (batch + 1),
-                    first_batch=warp,
-                    batch_step=cutlass.Int32(THD_SETUP_THREADS // 32),
-                    origins=origins,
-                    origin_row=port if specs[port] is not None else -1,
-                )
+                if warp % map_count == slot:
+                    cu0 = 2 * batch + 1 if port in (1, 2) else batch
+                    emit_seq_descs(
+                        base_maps[port],
+                        maps,
+                        meta,
+                        cu0,
+                        tensors[port],
+                        batch,
+                        cutlass.Int64(tensors[port].stride[1]),
+                        2,
+                        slot_base=slot * (batch + 1),
+                        first_batch=warp // map_count,
+                        batch_step=cutlass.Int32(THD_SETUP_THREADS // 32 // map_count),
+                        origins=origins,
+                        origin_row=port if specs[port] is not None else -1,
+                    )
         nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     # Optional packed Stats without offsets keeps the compact-prefix contract.
     if cutlass.const_expr(specs[4] is None):
