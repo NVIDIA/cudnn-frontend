@@ -2410,8 +2410,9 @@ def test_decode_indexer_steps_on_the_lean_tile_track_the_tcgen05_steps():
     two bodies (the same prepare / scorer / top-k kernels), the ring rows, the compressed-key cache and the pools BITWISE (the same
     write-through), the attention of the step's row within the module's bars of the fp32 oracle fed the kernel's list on BOTH bodies, and
     the two bodies within the same bars of each other (``cos(out) > 0.999``, the gated O and the LSE within 2e-2) -- never bitwise across
-    the bodies (a different summation order), recorded.  The S_q 4 steps of the multi-step test are the S_q 2..4 rendering's; this
-    rendering serves one row per sequence."""
+    the bodies (a different summation order), recorded.  The S_q 4 steps of the multi-step test select PER ROW (the indexer's lists), which
+    the lean body declines by name past one row (its CTA gathers ONE list per sequence); the S_q 4 lean cells are the shared-list block's
+    (the decode module)."""
     import test_block_qsa_decode as _qsa
 
     geom_kw, S0, ps, cap, top_k = GEOM_SMALL, 301, 16, 8, 512

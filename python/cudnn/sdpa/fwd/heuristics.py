@@ -796,8 +796,9 @@ on every other part whatever the tuple above holds."""
 LEAN_SPARSE_DEFAULT_MAX_SUB_TILES_PER_CTA = 1
 """The cap on the DEFAULT ``sub_tiles_per_cta`` (k): 1 -- one 32-key sub-tile per CTA, the kill-line rendering (REG 66-72, 4 CTAs per SM
 by registers).  The fill rule of :func:`sparse_lean_fill_sub_tiles` asks for k 2 / 3 / 4 / 7 at B 8 / B 4 x S_q 4 / B 16 / B 32 units,
-but the k >= 2 renderings trace at 104-164 registers (ptxas software-pipelines the unrolled sub-tiles: 3 CTAs per SM) and their gain
-over k 1 is unmeasured -- a ``-maxrregcount`` build is the gate's lever, not a default.  A caller pins k through the adapter's
+but the k >= 2 renderings trace at 104-164 registers (ptxas software-pipelines the unrolled sub-tiles: 3 CTAs per SM; at 512 threads --
+S_q 4 x G 16, four m-tiles -- the hardware cap 65536 / 512 = 128 binds the k >= 2 body, which then spills 7 words, while k 1 spills
+nothing on any rendering: REG <= 79) and their gain over k 1 is unmeasured -- a ``-maxrregcount`` build is the gate's lever, not a default.  A caller pins k through the adapter's
 ``sub_tiles_per_cta`` (the block's ``sparse_sub_tiles_per_cta``); the gate's measurement raises this cap, never a transcription."""
 _LEAN_FILL_OCCUPANCY_BY_S_Q = {1: 3, 2: 2}
 """The fill rule's CTAs per SM by the step's rows (MODEL, DESIGN 2.2 / 4): 3 at S_q 1 (the 72-KiB two-stage form under the standard
@@ -837,9 +838,9 @@ def sparse_lean_tile_decline(
     """Why the LEAN tile cannot serve a declaration (the arm NAMED), or ``None`` when it can -- the ONE statement the adapter raises for
     an explicit ``tile_form="lean"`` (``NotImplementedError``) and the block's declaration repeats, and the admissibility ``"auto"`` reads
     before the placement rule.  The lean body is the DECODE form only: bottom-right rows at the END of each sequence, ONE gathered list
-    per sequence -- ``list_per_sequence=True`` at ``S_q <= config_sm107.LEAN_SPARSE_SERVED_MAX_S_Q`` (1 today; the S_q 2..4 rendering
-    follows), or the per-row list at ``S_q == 1``, which IS the shared list (one row per sequence, the step-0 anchor the row's own
-    position) --, the per-sequence KV length present (the visible range), dense BSHD or paged pools (never THD), bf16 / f16, a group of
+    per sequence -- ``list_per_sequence=True`` at ``S_q <= config_sm107.LEAN_SPARSE_SERVED_MAX_S_Q`` (4: every row of the step in one CTA,
+    ``n_mt = ceil(S_q x G / 16)`` m16 tiles over one gathered sub-tile), or the per-row list at ``S_q == 1``, which IS the shared list (one
+    row per sequence, the step-0 anchor the row's own position); per-row lists past one row are the core's --, the per-sequence KV length present (the visible range), dense BSHD or paged pools (never THD), bf16 / f16, a group of
     at most 16 query heads per KV head (the m16 tile's rows), ``top_k`` a multiple of 4 in [8, 512] (below 8 the list is ONE sub-tile =
     split 1: the tcgen05 core's cell), the tcgen05 core's ``softmax_groups`` knob at its default.  The epilogue gate rides the combine
     under the lean split (always >= 2), so a gate operand is served.  Every other arm (a sink, a band, log2 stats, a padded-Q trim, a pure
@@ -858,8 +859,8 @@ def sparse_lean_tile_decline(
         )
     if int(s_q) > LEAN_SPARSE_SERVED_MAX_S_Q:
         return (
-            f"the lean tile serves S_q <= {LEAN_SPARSE_SERVED_MAX_S_Q} rows per sequence today (the S_q 2..4 rendering with n_mt m16 tiles "
-            f"follows); got S_q = {int(s_q)} -- the tcgen05 core serves it (tile_form='tcgen05' / 'auto')"
+            f"the lean tile serves S_q <= {LEAN_SPARSE_SERVED_MAX_S_Q} rows per sequence (the serving step's rows under ONE shared list: n_mt m16 "
+            f"tiles over one gathered sub-tile); got S_q = {int(s_q)} -- a longer step is the tcgen05 core's (tile_form='tcgen05' / 'auto')"
         )
     if not list_per_sequence and int(s_q) != 1:
         return (
@@ -950,7 +951,9 @@ SPARSE_LEAN_COMBINE_FORM_CELLS: Tuple[Tuple[int, int, int, int, int, str, str], 
     (1, 24, 1, 65, 1, "decode_grid", "MEASURED 212 SMs: 2.40 us (lean_chain 5.745 - lean 3.341 at B 1 x 8K; the model said 3.1)"),
     (1, 24, 1, 33, 2, "decode_grid", "UNMEASURED (k 2 is off the default)"),
     (4, 24, 1, 65, 1, "decode_grid", "MEASURED 212 SMs: 2.73 us (lean_chain 8.266 - lean 5.538 at B 4 x 8K)"),
-    (1, 24, 4, 33, 2, "decode_grid", "UNMEASURED (the S_q 2..4 rendering): 96 rows, split 33 >= 8"),
+    (1, 24, 4, 65, 1, "decode_grid", "UNMEASURED: the default k at S_q 4 (96 rows, split 65 >= 8; the step's three m-tiles in one CTA)"),
+    (1, 24, 4, 33, 2, "decode_grid", "UNMEASURED: 96 rows, split 33 >= 8 (k 2 is off the default)"),
+    (4, 24, 4, 65, 1, "decode_grid", "UNMEASURED: the default k at B 4 x S_q 4 (384 rows; 96 lean blocks inside the decode-grid bound at split 65)"),
     (4, 24, 4, 22, 3, "own", "UNMEASURED: 384 rows below split 32 -- the one-warp-per-row form past 8 splits (DESIGN 14.3: measure, or k 2 -> split 33)"),
     (8, 24, 1, 33, 2, "auto_past_bound", "UNMEASURED: 192 lean blocks past the decode-grid bound at split 33 > 4 -- the module's own forms"),
     (16, 24, 1, 17, 4, "auto_past_bound", "UNMEASURED: 384 lean blocks, split 17 -- the bound's edge (B 16: 0 .. +5 % modeled)"),

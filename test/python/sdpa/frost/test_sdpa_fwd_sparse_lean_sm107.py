@@ -1592,24 +1592,30 @@ def test_placement_rule_at_the_bound_both_sides_and_the_k_rule():
 def test_lean_tile_declines_by_name_on_the_adapter(monkeypatch):
     """An explicit ``tile_form="lean"`` where the body cannot serve the declaration is a typed decline naming the arm -- the heuristics'
     one statement (``sparse_lean_tile_decline``), raised by the adapter: THD, the top-left prefill form, no ``seq_kv_lens``, ``S_q`` past the
-    served rows (1 today), per-row lists past one row (reachable once the served rows grow: patched here), ``top_k`` below 8, the tcgen05
-    core's ``softmax_groups``; a split that is not a lean split; the k pin's range, its agreement with a pinned split, and the pin refused by
-    name where the resolved body is tcgen05 (explicit or AUTO) -- never silently ignored."""
+    served rows (4 = the kernel's own bound, ONE constant read by the rule), per-row lists past one row (the lean CTA gathers one list per
+    sequence), ``top_k`` below 8, the tcgen05 core's ``softmax_groups``; a split that is not a lean split; the k pin's range, its agreement
+    with a pinned split, and the pin refused by name where the resolved body is tcgen05 (explicit or AUTO) -- never silently ignored."""
     from cudnn.sdpa.fwd import heuristics as H
 
     decl = lambda **kw: H.sparse_lean_tile_decline(**dict(dict(s_q=1, group=12, top_k=512), **kw))  # noqa: E731
     assert decl() is None and decl(list_per_sequence=False) is None and decl(group=16) is None and decl(top_k=8) is None
     assert "thd=True" in decl(thd=True) and "DECODE form only" in decl(bottom_right=False) and "needs seq_kv_lens" in decl(seq_kv_lens_present=False)
-    assert (
-        "S_q <= 1 rows" in decl(s_q=2) and "below 8" in decl(top_k=4) and "multiple of 4" in decl(top_k=12 + 2) and "softmax_groups=2" in decl(softmax_groups=2)
-    )
+    assert "below 8" in decl(top_k=4) and "multiple of 4" in decl(top_k=12 + 2) and "softmax_groups=2" in decl(softmax_groups=2)
     assert "bf16 / f16" in decl(half_dtype=False) and "[1, 16]" in decl(group=17)
-    monkeypatch.setattr(H, "LEAN_SPARSE_SERVED_MAX_S_Q", 4)  # the S_q 2..4 rendering's reading of the same function
-    assert decl(s_q=4) is None and "per-row lists at S_q = 2" in decl(s_q=2, list_per_sequence=False) and "S_q <= 4" in decl(s_q=5)
+    # the served rows: every step width of the shared list (S_q 1..4 = the kernel's own bound; the route reads ONE constant), a longer
+    # step declined by name, a per-row list past one row declined by name (the lean CTA gathers ONE list per sequence)
+    from cudnn.sdpa.fwd.config_sm107 import LEAN_SPARSE_MAX_SEQLEN_Q, LEAN_SPARSE_SERVED_MAX_S_Q
+
+    assert LEAN_SPARSE_SERVED_MAX_S_Q == LEAN_SPARSE_MAX_SEQLEN_Q == 4 == H.LEAN_SPARSE_SERVED_MAX_S_Q
+    assert all(decl(s_q=s) is None for s in (1, 2, 3, 4)) and "S_q <= 4 rows" in decl(s_q=5) and "S_q <= 4 rows" in decl(s_q=64)
+    assert "per-row lists at S_q = 2" in decl(s_q=2, list_per_sequence=False) and "per-row lists at S_q = 4" in decl(s_q=4, list_per_sequence=False)
+    monkeypatch.setattr(H, "LEAN_SPARSE_SERVED_MAX_S_Q", 1)  # the text reads the constant, never a literal: the one-row reading under a patched bound
+    assert "S_q <= 1 rows" in decl(s_q=2) and decl(s_q=1) is None
     monkeypatch.undo()
     for kw, exc, match in (
-        (dict(tile_form="lean", SQ=2), NotImplementedError, "tile_form='lean' -- the lean tile serves S_q <= 1"),
-        (dict(tile_form="lean", list_per_sequence=False, SQ=2), NotImplementedError, "S_q <= 1"),
+        (dict(tile_form="lean", list_per_sequence=False, SQ=5), NotImplementedError, "tile_form='lean' -- the lean tile serves S_q <= 4"),
+        (dict(tile_form="lean", list_per_sequence=False, SQ=2), NotImplementedError, "per-row lists at S_q = 2"),
+        (dict(tile_form="lean", list_per_sequence=False, SQ=4), NotImplementedError, "per-row lists at S_q = 4"),
         (dict(tile_form="lean", top_k=4), NotImplementedError, "below 8"),
         (dict(tile_form="lean", seq_kv_lens=False), NotImplementedError, "needs seq_kv_lens"),
         (dict(tile_form="lean", bottom_right=False, list_per_sequence=False), NotImplementedError, "DECODE form only"),
@@ -1645,10 +1651,16 @@ def test_lean_tile_declines_by_name_on_the_adapter(monkeypatch):
     )
     with pytest.raises(NotImplementedError, match="thd=True .* tcgen05 core's arm"):
         thd.check_support()
-    # the served arms of the lean body: the shared list, the per-row list at ONE row (the same list), top_k 8 (split 2), f16, G 16, a k pin, a lean split
+    # the served arms of the lean body: the shared list at every step width (S_q 1..4), the per-row list at ONE row (the same list), top_k 8
+    # (split 2), f16, G 16, a k pin, a lean split
     for kw, want in (
         (dict(tile_form="lean"), (65, 1)),
         (dict(tile_form="lean", list_per_sequence=False), (65, 1)),
+        (dict(tile_form="lean", SQ=2), (65, 1)),
+        (dict(tile_form="lean", SQ=3, B=4), (65, 1)),
+        (dict(tile_form="lean", SQ=4), (65, 1)),
+        (dict(tile_form="lean", SQ=4, H=16, KH=1), (65, 1)),
+        (dict(tile_form="lean", SQ=4, split=33), (33, 2)),
         (dict(tile_form="lean", top_k=8), (2, 1)),
         (dict(tile_form="lean", top_k=16), (3, 1)),
         (dict(tile_form="lean", sub_tiles_per_cta=3), (22, 3)),
@@ -1659,6 +1671,30 @@ def test_lean_tile_declines_by_name_on_the_adapter(monkeypatch):
     ):
         a = _route_adapter(**kw)
         assert a.check_support() and a.tile_form == "lean" and (a.split_kv, a.sub_tiles_per_cta) == want and a.kernel_template == H.SPARSE_TILE_LEAN, kw
+
+
+def test_lean_route_builds_the_lean_record_with_the_step_rows():
+    """The adapter on the lean body builds the lean tile's OWN record, ``TemplateParamsLean(decode_seqlen_q=S_q)`` -- the compile-time S_q axis:
+    N_MT = ceil(S_q x G / 16) m16 tiles of 128 threads over ONE gathered sub-tile, so the rendering holds exactly the step's rows and the host
+    entry's ``problem_size`` SQ equals CFG.S_Q (its contract); the tcgen05 body keeps the shared ``TemplateParams`` (no appended field: its
+    digest and compiled-plan keys are what they were); the per-row list at one row per sequence is loaded in the shared form at S_q 1."""
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    from cudnn.sdpa.fwd.config_sm107 import TemplateParamsLean, make_cfg_d256_sparse_lean
+
+    for sq, h, kh, n_mt, threads in ((1, 24, 2, 1, 128), (2, 24, 2, 2, 256), (3, 24, 2, 3, 384), (4, 24, 2, 3, 384), (4, 16, 1, 4, 512), (4, 2, 2, 1, 128)):
+        a = _route_adapter(tile_form="lean", SQ=sq, H=h, KH=kh)
+        assert a.check_support() and a.tile_form == "lean" and a._SQ == sq
+        p = a.template_params()
+        assert type(p) is TemplateParamsLean and p.decode_seqlen_q == sq and p.qsa_list_per_sequence and p.split_kv == 65 and p.qh_per_kh == h // kh
+        cfg = make_cfg_d256_sparse_lean(p)
+        assert (cfg.S_Q, cfg.N_MT, cfg.THREADS, cfg.SPLIT) == (sq, n_mt, threads, 65), (sq, h, kh)
+    s33 = _route_adapter(tile_form="lean", SQ=4, split=33)
+    assert s33.check_support() and make_cfg_d256_sparse_lean(s33.template_params()).SUB_TILES_PER_CTA == 2
+    tc = _route_adapter(tile_form="tcgen05", SQ=4)
+    assert tc.check_support() and type(tc.template_params()) is TemplateParams and not hasattr(tc.template_params(), "decode_seqlen_q")
+    per_row = _route_adapter(tile_form="lean", list_per_sequence=False)  # one row per sequence: the lean template in its shared form
+    pr = per_row.check_support() and per_row.template_params()
+    assert type(pr) is TemplateParamsLean and pr.qsa_list_per_sequence and pr.decode_seqlen_q == 1
 
 
 def test_split_bound_and_workspace_per_form():
@@ -1791,21 +1827,25 @@ def _lean_route_cell(
     gate=False,
     pdl=False,
     per_row=False,
+    SQ=1,
 ):
     """The adapter on ``tile_form="lean"``: two launches bitwise, within ATOL of the fp32 oracle, the readbacks (the lean kernel template, the
     lean split, the k), paged BITWISE dense on the lean route, the per-row list at S_q 1 BITWISE the shared one, the PDL arm bitwise the plain
     one, the gate through the combine within ATOL of the gated reference, and -- always -- the lean O / LSE against the tcgen05 route
-    (unsplit) within the DERIVED budget: the two bodies are bitwise different by construction, so the budget is the comparison."""
+    (unsplit) within the DERIVED budget: the two bodies are bitwise different by construction, so the budget is the comparison.  ``SQ``
+    (appended) = the step's rows per sequence under the shared list anchored at ``pos_0 = L_b - S_q`` (the oracle is the pos0-anchored
+    reference; every row at its own position): the S_q 2..4 renderings hold all ``S_q x G`` rows of a sequence in one CTA."""
     from cudnn.sdpa.fwd.heuristics import SPARSE_TILE_LEAN, SPARSE_TILE_TCGEN05, sparse_lean_max_sub_tiles_per_cta
     from cudnn.sdpa.fwd.config_sm107 import lean_sparse_n_sub, lean_sparse_split
 
+    assert SQ == 1 or not per_row, "a per-row list past one row is the tcgen05 core's (a typed decline on the lean route)"
     S = _sparse_suite()
-    q, kk, vv, g = S._inputs(B, 1, H, KH, dtype, seed, SKV=SKV)
-    ids, lens = S._decode_lists(list_kind, B, 1, top_k, kv_lens, g)
+    q, kk, vv, g = S._inputs(B, SQ, H, KH, dtype, seed, SKV=SKV)
+    ids, lens = S._decode_lists(list_kind, B, SQ, top_k, kv_lens, g)
     lens_arg = lens if block_lens else None
     scale = 1.0 / math.sqrt(D)
     ref_o, ref_lse, pv_abs = S._reference_decode(q, kk, vv, ids, lens_arg, kv_lens, scale, top_k)
-    gate_t = (torch.randn(B, 1, H, D, generator=g, device=q.device, dtype=torch.float32) * 2.0).to(dtype) if gate else None
+    gate_t = (torch.randn(B, SQ, H, D, generator=g, device=q.device, dtype=torch.float32) * 2.0).to(dtype) if gate else None
     ref_target = ref_o * torch.sigmoid(gate_t.float()) if gate else ref_o
     outs, a = _launch_route(q, (kk, vv), ids, lens_arg, kv_lens, top_k, scale, tile_form="lean", split=split, k=k, gate=gate_t, pdl=pdl)
     max_o, max_lse = S._check(outs, ref_target, ref_lse)
@@ -1813,6 +1853,7 @@ def _lean_route_cell(
     want_k = k if k is not None else (-(-n_sub // split) if split > 1 else 1)
     assert a.tile_form == "lean" and a.kernel_template == SPARSE_TILE_LEAN and a.sub_tiles_per_cta == want_k and a.split_kv == lean_sparse_split(top_k, want_k)
     assert 1 <= a.sub_tiles_per_cta <= sparse_lean_max_sub_tiles_per_cta(top_k)
+    assert a.template_params().decode_seqlen_q == SQ == a._SQ  # the lean record carries the step's rows: the rendering that ran holds them all
     res = dict(max_o=max_o, max_lse=max_lse, split=a.split_kv, k=a.sub_tiles_per_cta, form=a.combine_form(), dead=int(torch.isinf(ref_lse).sum()))
     o_lean, lse_lean = outs[0]
     if paged is not None:
@@ -1962,4 +2003,65 @@ def test_adapter_lean_route_ladder(B, SKV, kv_lens, H, KH, dtype, top_k, list_ki
         f"\nadapter lean route B={B} lens={kv_lens} {H}/{KH} {dtype} top_k={top_k} split={res['split']} k={res['k']} combine form {res['form']} paged={paged} gate={gate}: "
         f"max|dO| {res['max_o']:.5f} max|dLSE| {res['max_lse']:.6f} vs oracle; vs the tcgen05 route max|dO| {res['core_max_d']:.3e} = {res['core_ratio']:.3f} of the derived "
         f"budget, |dLSE| {res['core_lse_d']:.2e}, bitwise across bodies {res['bitwise_across_bodies']} (not required: the two bodies sum in different orders); dead rows {res['dead']}"
+    )
+
+
+@requires_rubin
+@pytest.mark.parametrize(
+    "SQ, B, SKV, kv_lens, H, KH, dtype, top_k, split, k, paged, block_lens, gate, pdl",
+    [
+        pytest.param(
+            4,
+            1,
+            8192,
+            [8192],
+            24,
+            2,
+            torch.bfloat16,
+            512,
+            1,
+            None,
+            (16, True),
+            True,
+            False,
+            False,
+            id="Sq4-B1-G12-three-m-tiles-split65-paged16-HND-bitwise-dense",
+        ),
+        pytest.param(
+            2,
+            4,
+            8192,
+            [8192, 2052, 4097, 7000],
+            24,
+            2,
+            torch.bfloat16,
+            512,
+            33,
+            None,
+            (64, False),
+            False,
+            True,
+            False,
+            id="Sq2-B4-split33-k2-paged64-NHD-no-block-lens-gate",
+        ),
+        pytest.param(
+            4, 1, 8192, [8192], 16, 1, torch.float16, 512, 1, None, (48, True), True, False, True, id="Sq4-G16-four-m-tiles-f16-paged48-pdl-bitwise-plain"
+        ),
+        pytest.param(3, 3, 8192, [0, 8192, 300], 24, 2, torch.bfloat16, 512, 1, None, None, True, True, False, id="Sq3-B3-dead-sequence-gate-in-the-combine"),
+        pytest.param(4, 2, 8192, [8192, 2], 24, 2, torch.bfloat16, 8, 1, None, None, True, False, False, id="Sq4-top8-split2-a-sequence-shorter-than-the-step"),
+        pytest.param(4, 4, 8192, [8191, 8190, 8189, 8188], 2, 2, torch.bfloat16, 512, 1, 2, None, True, False, False, id="Sq4-G1-mha-every-residue-k2-split33"),
+    ],
+)
+def test_adapter_lean_route_ladder_s_q_rows(SQ, B, SKV, kv_lens, H, KH, dtype, top_k, split, k, paged, block_lens, gate, pdl):
+    """The adapter's lean route at the step widths 2..4 (the shared list; every row of a sequence in one CTA over ONE gathered sub-tile):
+    against the pos0-anchored fp32 oracle, two launches bitwise, paged BITWISE dense, the PDL arm bitwise the plain arm, the gate through the
+    combine, and against the tcgen05 route (every row its own item, unsplit) within the DERIVED budget -- never bitwise across the bodies;
+    a sequence shorter than the step leaves its negative-position rows dead (0 / -inf) on both bodies."""
+    res = _lean_route_cell(
+        B=B, SKV=SKV, kv_lens=kv_lens, H=H, KH=KH, dtype=dtype, top_k=top_k, split=split, k=k, paged=paged, block_lens=block_lens, gate=gate, pdl=pdl, SQ=SQ
+    )
+    print(
+        f"\nadapter lean route S_q={SQ} B={B} lens={kv_lens} {H}/{KH} {dtype} top_k={top_k} split={res['split']} k={res['k']} combine form {res['form']} paged={paged} gate={gate}: "
+        f"max|dO| {res['max_o']:.5f} max|dLSE| {res['max_lse']:.6f} vs oracle; vs the tcgen05 route max|dO| {res['core_max_d']:.3e} = {res['core_ratio']:.3f} of the derived "
+        f"budget, |dLSE| {res['core_lse_d']:.2e}, bitwise across bodies {res['bitwise_across_bodies']} (not required); dead rows {res['dead']}"
     )

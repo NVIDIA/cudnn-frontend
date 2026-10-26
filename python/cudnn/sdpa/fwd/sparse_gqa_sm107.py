@@ -77,11 +77,16 @@ module above, ``kernel_template`` ``"sparse_d256_f16"``) and the LEAN decode til
 m16n8k16 + ``cp.async``, one 128-thread CTA per (sequence, KV head, chunk of ``sub_tiles_per_cta`` 32-key sub-tiles), no TMEM / TMA / CLC,
 ``kernel_template`` ``"sparse_lean_d256_f16"``) compute the same O / LSE -- within the fixed-order-sum budget (a 4 x 64-d split-K sum vs
 one 256-d MMA chain, 32- vs 128-key tiles: never bitwise ACROSS the bodies, bitwise WITHIN each), so a caller may pin either.  The lean
-body serves the DECODE form only (``bottom_right`` + the shared list at ``S_q <= config_sm107.LEAN_SPARSE_SERVED_MAX_S_Q`` -- or the
-per-row list at ``S_q == 1``, which IS the shared list --, ``seq_kv_lens`` present, dense BSHD or paged pools, bf16 / f16, G <= 16,
+body serves the DECODE form only (``bottom_right`` + the shared list at ``S_q <= config_sm107.LEAN_SPARSE_SERVED_MAX_S_Q`` = 4 -- every
+row of the step in ONE CTA: ``n_mt = ceil(S_q x G / 16)`` m16 tiles of 128 threads over one gathered sub-tile, where the tcgen05 core runs
+every row as its own item; the adapter builds the lean tile's own record ``config_sm107.TemplateParamsLean(decode_seqlen_q=S_q)``, the
+compile-time S_q axis -- or the per-row list at ``S_q == 1``, which IS the shared list; per-row lists past one row are the core's --,
+``seq_kv_lens`` present, dense BSHD or paged pools, bf16 / f16, G <= 16,
 ``top_k`` in [8, 512]) and ALWAYS splits: its ``split_kv`` is a LEAN split ``ceil(n_sub / k)`` (``heuristics.sparse_lean_splits``: 65 / 33 /
 22 / 17 / ... at ``top_k`` 512) that SELECTS ``k``, the sub-tiles per CTA (a pinned ``split_kv`` must be one of them; ``split_kv`` unset =
-the default ``k`` of ``heuristics.sparse_lean_sub_tiles_per_cta``, 1 today; ``sub_tiles_per_cta`` pins ``k`` directly), writing the SAME fp32
+the default ``k`` of ``heuristics.sparse_lean_sub_tiles_per_cta``, 1 today; ``sub_tiles_per_cta`` pins ``k`` directly; an explicit ``split_kv=1`` reads as UNSET on the adapter -- 1 is the constructor's default, so the two
+cannot be told apart -- and under ``tile_form="auto"`` on a listed part takes the lean split: an unsplit launch there is pinned with
+``tile_form="tcgen05"``, where the block's ``decode_split_kv`` has a None default and keeps the core for an explicit 1), writing the SAME fp32
 split-major partial slab the tcgen05 core's split store writes, so the combine, its pinned form and the gate riding it are untouched.
 ``tile_form="auto"`` (the default) resolves through ``heuristics.sparse_tile_form_auto``: the tcgen05 core on every part today
 (``heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS`` is EMPTY until the gate measures the lean route) and, on a listed part, the placement rule
@@ -969,7 +974,7 @@ class SparseGqaFwdDslSm107:
 
         if not self._G:
             self.check_support()
-        return TemplateParams(
+        kw = dict(
             dtype_qkv=self._dtype_code,
             cta_mma=1,
             pack_gqa=True,
@@ -992,6 +997,15 @@ class SparseGqaFwdDslSm107:
             qsa_list_per_sequence=self.list_per_sequence or self.lean,
             qsa_softmax_groups=self.softmax_groups,
         )
+        if self.lean:
+            # the lean tile's OWN record (config_sm107.TemplateParamsLean: the shared record plus the appended compile-time S_q axis): the
+            # rendering holds every row of the step -- N_MT = ceil(S_q x G / 16) m16 tiles over ONE gathered sub-tile --, so the host entry's
+            # problem_size SQ equals CFG.S_Q (its contract); the tcgen05 core keeps the shared record (no appended field: its digest and
+            # compiled-plan keys are what they were)
+            from cudnn.sdpa.fwd.config_sm107 import TemplateParamsLean
+
+            return TemplateParamsLean(**kw, decode_seqlen_q=self._SQ)
+        return TemplateParams(**kw)
 
     def combine_form(self) -> int:
         """The split combine entry's kernel FORM this plan compiles (``split_combine.DECODE_GRID_AUTO`` / ``DECODE_GRID_OFF`` /

@@ -8408,8 +8408,9 @@ class GatedAttentionBlockFwd(APIBase):
         # core serves stage (4) on a QsaSpec geometry -- "auto" (the default): the placement rule (cc 10.7, B x H_kv x S_q <= 32 units, the
         # lean body admissible) on the parts of heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS, the tcgen05 core everywhere else (EMPTY until the
         # end-to-end gate measures the lean route: the tcgen05 core on every part today, bitwise the former block); "lean": the lean decode
-        # tile (mma.sync + cp.async, 128 threads per m16 tile, no TMEM / TMA / CLC; the DECODE mode over the pools at S_q 1 -- the shared
-        # list, or the per-row list at one row per sequence --, bf16 / f16, G <= 16, top_k >= 8; it ALWAYS splits: decode_split_kv None =
+        # tile (mma.sync + cp.async, 128 threads per m16 tile, no TMEM / TMA / CLC; the DECODE mode over the pools at S_q <= 4 under the
+        # shared list -- one list per sequence, every row of the step in one CTA -- or the per-row list at one row per sequence, bf16 /
+        # f16, G <= 16, top_k >= 8; it ALWAYS splits: decode_split_kv None =
         # the lean split of the default k, or one of heuristics.sparse_lean_splits(top_k), which SELECTS k), a typed decline naming the arm
         # elsewhere -- never a silent fallback; "tcgen05": the tcgen05 core as before.  The same O / LSE under either body within the
         # fixed-order-sum budget (never bitwise ACROSS the bodies; bitwise WITHIN each: two launches, replay == eager, paged == dense).  A

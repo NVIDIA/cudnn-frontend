@@ -3702,8 +3702,10 @@ replay == eager, paged == dense, the per-row list at one row per sequence == the
 PERFORMANCE knob `tile_form="auto" | "lean" | "tcgen05"` (the block's `sparse_tile_form`; `sub_tiles_per_cta` / `sparse_sub_tiles_per_cta`
 pins `k`), read back as `kernel_template` / `sparse_tile` (`"sparse_lean_d256_f16"` / `"sparse_d256_f16"`; the envelope's `decode.sparse_tiles`
 / `.sparse_tile(s_q, batch)` / `.sparse_tile_lean_default`).  Its envelope: the DECODE form only (`bottom_right` + the shared list at
-`S_q <= 1` -- the S_q 2..4 rendering with `n_mt` m16 tiles follows and raises `config_sm107.LEAN_SPARSE_SERVED_MAX_S_Q` to 4 --, or the
-per-row list at `S_q == 1`, which IS the shared list), `seq_kv_lens` present, dense BSHD or paged pools (HND / NHD, pages 16 / 48 / 64
+`S_q <= 4` -- every row of the step in ONE CTA: `n_mt = ceil(S_q x G / 16)` m16 tiles of 128 threads over one gathered 32-key sub-tile,
+where the tcgen05 core runs every row as its own item and re-gathers the list `S_q` times; `TemplateParamsLean.decode_seqlen_q` is the
+record's compile-time axis and `config_sm107.LEAN_SPARSE_SERVED_MAX_S_Q` = 4 the one constant the route reads --, or the per-row list at
+`S_q == 1`, which IS the shared list; per-row lists past one row are the core's), `seq_kv_lens` present, dense BSHD or paged pools (HND / NHD, pages 16 / 48 / 64
 validated; never THD), bf16 / f16, G 1..16, `top_k` a multiple of 4 in [8, 512] (below 8 the list is one sub-tile: the tcgen05 core's
 cell); it ALWAYS splits -- `split_kv` is a LEAN split `ceil(n_sub / k)` (65 / 33 / 22 / 17 / 13 / 11 / 10 / 9 at `top_k` 512, `n_sub =
 ceil((top_k + 2) x 4 / 32)`; a pinned split SELECTS `k`, 1 <= k <= min(8, n_sub - 1); the default `k` 1) writing the SAME fp32 split-major
@@ -3712,7 +3714,9 @@ split 65 / 33, the module's own forms at 384 rows below split 32, the AUTO entry
 untouched; `heuristics.SPARSE_LEAN_COMBINE_FORM_CELLS` names the measured and the owed cells).  Every other arm is a typed decline naming it
 (`heuristics.sparse_lean_tile_decline`: THD, a prefill / top-left form, no `seq_kv_lens`, `S_q` past the served rows, per-row lists past one
 row, `top_k` below 8, the tcgen05 core's `softmax_groups`; a split that is not a lean split; the `k` pin out of range or under another body)
--- never a silent fallback.  PLACEMENT (`heuristics.sparse_decode_lean_tile_selected`): the lean tile below `B x H_kv x S_q <=
+-- never a silent fallback.  Over e4m3 pools (`kv_cache_dtype=torch.float8_e4m3fn`) NO body of the sparse core runs -- the gathered cast + the
+dense decode tile --, so an explicit body is a typed decline naming the arm and `sparse_tile` / the envelope's `.sparse_tile(..., kv_cache_dtype=e4m3)`
+read None (never the name of a kernel that does not run).  PLACEMENT (`heuristics.sparse_decode_lean_tile_selected`): the lean tile below `B x H_kv x S_q <=
 LEAN_SPARSE_MAX_UNITS = 32` units on cc 10.7 with `top_k >= 8`, the tcgen05 core above -- consulted by `"auto"` ONLY on the parts of
 `heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS`, EMPTY until the end-to-end gate measures the lean route (the measured-default rule: the tuple
 flips to `((10, 7),)` with the gate's table in the gate commit, the bound refit from it), so `"auto"` resolves the tcgen05 core on every part
