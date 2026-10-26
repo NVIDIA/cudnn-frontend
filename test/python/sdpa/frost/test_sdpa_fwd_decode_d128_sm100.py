@@ -695,6 +695,35 @@ def test_decode_kernel_mtp_bottom_right_with_q_trim(s_q):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("s_q,h,kh", [(1, 16, 2), (4, 16, 2), (5, 16, 2), (16, 16, 2), (17, 16, 2), (1, 64, 1), (1, 128, 1), (9, 24, 2)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("splits", [1, 4])
+def test_decode_paged_query_warp_boundaries(s_q, h, kh, dtype, splits):
+    """Whole/partial dead warps across Q tiles, including partial GQA and empty Q.
+
+    Live outputs and Stats retain the masked/sink semantics while inactive
+    warps still contribute every pipeline handshake and zero probability row.
+    """
+    _run_kernel(
+        4,
+        h,
+        kh,
+        16,
+        24,
+        [257, 129, 383, 1],
+        hnd=True,
+        splits=splits,
+        s_q=s_q,
+        q_lens=[s_q, max(1, s_q // 2), 0, 1],
+        causal_br=True,
+        window_left=63,
+        sink=-120.0,
+        dtype=dtype,
+        pack=True,
+    )
+
+
+@pytest.mark.L0
 def test_decode_kernel_mtp_split_kv():
     """MTP s_q=4 bottom-right causal with a forced 4-way split (the small-batch lever)."""
     _run_kernel(2, 8, 2, 16, 64, [1000, 513], hnd=False, splits=4, s_q=4, causal_br=True)
