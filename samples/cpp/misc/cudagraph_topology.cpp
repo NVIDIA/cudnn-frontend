@@ -2016,13 +2016,17 @@ TEST_CASE("186 G08: repeated create/update/instantiate/destroy with growing loop
     // cudaMemGetInfo reports the whole device, so another process on the same GPU or a
     // one-time pool / driver growth moves it as well. A leak that scales with the loop
     // count loses memory on every pass, so each loop count gets up to kAttempts passes
-    // and fails only when every one of them loses more than the slack.
+    // and passes only when one of them is clean: its delta stays within the slack in BOTH
+    // directions. A large gain is another process freeing memory in the window, which
+    // could cancel a leak, so it is retried like a large loss. This assumes the window
+    // is not contaminated by an amount that matches the leak; on a shared GPU the check
+    // stays best-effort.
     int const kAttempts               = 3;
     long long const kDeviceSlackBytes = 32LL * 1024LL * 1024LL;
 
     std::vector<int> loop_counts = {10, 50, 100, 200};
     for (auto loops : loop_counts) {
-        long long smallest_device_loss = 0;
+        bool clean_attempt = false;
         for (int attempt = 1; attempt <= kAttempts; ++attempt) {
             // Warm the allocator / driver caches before taking the baseline.
             for (int i = 0; i < 5; ++i) {
@@ -2083,16 +2087,18 @@ TEST_CASE("186 G08: repeated create/update/instantiate/destroy with growing loop
                std::to_string(static_cast<long long>(rss_after) - static_cast<long long>(rss_before)) +
                " device_free_delta_bytes=" + std::to_string(device_free_delta));
             REQUIRE(checksum_failures == 0);
+            // A failed cudaMemGetInfo reads {0, 0}; never take that as a measurement.
+            REQUIRE(memory_before.second != 0);
+            REQUIRE(memory_after.second != 0);
 
-            smallest_device_loss =
-                (attempt == 1) ? -device_free_delta : std::min(smallest_device_loss, -device_free_delta);
-            if (-device_free_delta <= kDeviceSlackBytes) {
+            if (-kDeviceSlackBytes <= device_free_delta && device_free_delta <= kDeviceSlackBytes) {
+                clean_attempt = true;
                 break;
             }
         }
         // A leak that scales with the loop count would show up as device memory that never
         // comes back on any pass. Allow a small driver-level slack only.
-        REQUIRE(smallest_device_loss <= kDeviceSlackBytes);
+        REQUIRE(clean_attempt);
     }
     ev("[186][G08] PASS, see the per-loop-count deltas above (host and device)");
 #endif
