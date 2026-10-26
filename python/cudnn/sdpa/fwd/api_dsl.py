@@ -4026,6 +4026,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         compile_fn = km.compile_prepared if (getattr(self, "_prepared_fp8", False) or getattr(self, "_prepared_mxfp8", False)) else km.compile
         accepted = _parameter_names(compile_fn)
         kw = dict(has_lse=(self.lse_desc is not None) or self.split_kv > 1, lse_kind=kind)
+        if getattr(self, "_thd_origin_specs", None) is not None:
+            if "thd_origin_specs" not in accepted:
+                raise NotImplementedError("this THD body does not consume independent physical origins")
+            kw["thd_origin_specs"] = self._thd_origin_specs
         if "has_score_max" in accepted:
             # Score side outputs: each store is its own compile-time arm (None folds it out).
             kw["has_score_max"] = self.score_max_desc is not None
@@ -4688,7 +4692,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
     def _thd_workspace_layout(self):
         b, qh = self.batch_size, self.h_q
-        base = ws_align(self._thd_meta_words() * 4) + ws_align((b + 3) * 16 * 8) + (0 if self.has_sink else ws_align(qh * 4))
+        map_bytes = (b + 3) * 16 * 8
+        if getattr(self, "_thd_origin_specs", None) is not None:
+            from .thd_origins import descriptor_bytes
+
+            map_bytes = descriptor_bytes(b)
+        base = ws_align(self._thd_meta_words() * 4) + ws_align(map_bytes) + (0 if self.has_sink else ws_align(qh * 4))
         if self.packed_thd_split:
             from cudnn.sdpa.fwd.prepared import thd_split_workspace
 

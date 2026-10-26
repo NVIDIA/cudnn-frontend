@@ -208,12 +208,13 @@ class ThdLaunchSpec:
         "split_workspace",
         "neg_inf",
         "device_index",
+        "origin_specs",
     )
 
 
 # The host slot vocabulary the prepared launch binds: constants written once at build, and slots the native THD binder writes per call.
 _FILLED_AT_BUILD = frozenset(
-    "q_strides o_strides k_strides v_strides lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_lens_form o_partial_ptr "
+    "q_strides o_strides k_strides v_strides lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_lens_form thd_origin_ptrs o_partial_ptr "
     "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr ragged_q_div "
     "score_max_ptr score_sum_exp_ptr score_max_strides score_sum_exp_strides "
     # The bias / kv_mask slots of the sm107 f16 d128-file host (dense-only arms; a THD plan never requests them).
@@ -289,6 +290,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     s = ThdLaunchSpec()
     s.fn, s.owner, s.order = raw, compiled, order
     s.index = {n: i for i, n in enumerate(order)}
+    s.origin_specs = getattr(api, "_thd_origin_specs", None)
     s.quant = _quant_spec(api)
     s.b, s.qh, s.kh, s.d_qk, s.d_v = api.batch_size, api.h_q, api.h_kv, api.head_dim_qk, api.head_dim_v
     s.paged, s.page_size = bool(api.paged), int(api.paged_page_size or 0)
@@ -395,6 +397,8 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
         raise NotImplementedError("cudnn.sdpa: this prepared THD launch requires runtime initial-wave binding; rebuild the extension")
     if s.wave_geometry is not None and not getattr(_pybind_module._SdpaThdBinder, "supports_initial_wave_geometry", False):
         raise NotImplementedError("cudnn.sdpa: this prepared THD launch requires packed initial-wave geometry; rebuild the extension")
+    if s.origin_specs is not None and not getattr(_pybind_module._SdpaThdBinder, "supports_physical_origins", False):
+        raise NotImplementedError("physical THD origins require rebuilding the native extension")
     s.native = _pybind_module._SdpaThdBinder(s)
     return s
 
@@ -537,6 +541,12 @@ class PreparedThdLaunch:
                 tensor = getattr(binding, name)
                 if tensor is not None:
                     uids[name] = tensor.get_uid()
+        if spec.origin_specs is not None:
+            from .thd_origins import ROLES
+
+            for role, origin in zip(ROLES, spec.origin_specs):
+                if origin is not None:
+                    uids[role] = getattr(binding, role).get_uid()
         self._roles = list(uids)
         self._uids = [uids[r] for r in self._roles]
         self._indices: Optional[List[int]] = None
@@ -552,6 +562,10 @@ class PreparedThdLaunch:
         if self._native_indices is None:
             roles = dict(zip(self._roles, indices))
             native_roles = _NATIVE_THD_ROLES + _native_quant_roles(self.spec.quant)
+            if self.spec.origin_specs is not None:
+                from .thd_origins import ROLES
+
+                native_roles += ROLES
             self._native_indices = tuple(roles.get(role, -1) for role in native_roles)
         self.spec.native.execute(pack.native, self._native_indices, workspace_ptr, stream)
 
@@ -562,7 +576,7 @@ class PreparedThdLaunch:
 
 # Constants written at build, and slots the native dense binder writes per call.
 _FILLED_AT_BUILD_DENSE = frozenset(
-    "lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_q_lens_ptr thd_kv_lens_ptr thd_lens_form o_partial_ptr "
+    "lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_q_lens_ptr thd_kv_lens_ptr thd_lens_form thd_origin_ptrs o_partial_ptr "
     "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr ragged_q_div "
     "score_max_ptr score_sum_exp_ptr score_max_strides score_sum_exp_strides "
     "bias_ptr bias_strides bias_extents kv_mask_ptr kv_mask_batch_stride inv_scale_softmax".split()

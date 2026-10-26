@@ -338,6 +338,25 @@ through to the cuDNN backend. The d512 BPROP column below reads ᵇ for the
 half-precision d512 row and ᵍ for the MXFP8 row; the d256 BPROP column reads ᵇ²
 for the half-precision d256 row and ᵍ for the MXFP8 row.
 
+**Physical THD forward origins (SM100/SM103 half D128 and D256).** The
+nonpaged, unsplit CGA2 graph path reads each bound Q/K/V/O/Stats ragged-offset
+tensor independently on every execution. INT32 and INT64 offsets may be mixed
+across ports; their positive element multipliers must divide the declared token
+stride. Offset values name absolute whole-token rows in the corresponding
+buffer. Valid sequence lengths control work and masks independently from those
+addresses; compact prefixes remain internal metadata. Storage must cover every
+addressed live row, and any `max_total_seq_len_*` bounds the sum of valid lengths,
+not the physical span including holes. These device-value bounds are caller
+contracts; execution performs no device-to-host inspection.
+
+Setup emits sequence-local Q/K/V/O tensor maps in the existing metadata launch.
+Their extents exclude interior padding from loads and stores. Stats uses its own
+origin and preserves the declared token-major or head-major layout; a head-major
+pitch must cover the physical rows, including gaps. Each invocation binds current
+offset pointers, and captured graphs read changed offset values on replay.
+Standalone compact-THD behavior, split/paged/gated paths, other head dimensions
+and other architectures are unchanged; this does not qualify their padded offsets.
+
 The opt-in **d128 backward** (`sdpa_bwd_sm100_d128`, engine 20609) selects
 its implementation at plan build. On SM100 or SM103 with public CuTeDSL >= 4.8 and a
 positive FP32-representable scale it launches row delta plus dQ initialization, the
