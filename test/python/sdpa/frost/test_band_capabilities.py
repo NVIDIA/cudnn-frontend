@@ -73,8 +73,16 @@ def _dims(kind: str, caps):
     if kind == "fwd":
         shapes = sorted(tuple(s) for s in caps.d_shapes)
         return (128, 128) if (128, 128) in shapes else shapes[0]
+    # A backward row lists head dims, not pairs, and may serve only some pairs of
+    # them (the SM100 d256 row: exact (256, 256) and dense (192, 128)). Take the
+    # first pair the row accepts unmasked, so a head-dim rule never stands in
+    # for a band decision.
     dims = sorted(caps.d)
-    return (128, 128) if 128 in dims else (dims[-1], dims[-1])
+    pairs = ([(128, 128)] if 128 in dims else []) + [(d, d) for d in reversed(dims)] + [(a, b) for a in reversed(dims) for b in dims if a != b]
+    for pair in pairs:
+        if _probe(kind)(caps, ga.SdpaGraphFacts(**_values(kind, caps, *pair))) is None:
+            return pair
+    return pairs[0]
 
 
 def legal_facts(kind: str, caps, **overrides) -> ga.SdpaGraphFacts:
@@ -83,7 +91,12 @@ def legal_facts(kind: str, caps, **overrides) -> ga.SdpaGraphFacts:
     The band axes are then varied one at a time on top of this, so an arch /
     dtype / envelope / layout rejection can never stand in for a mask decision.
     """
-    d_qk, d_v = _dims(kind, caps)
+    values = _values(kind, caps, *_dims(kind, caps))
+    values.update(overrides)
+    return ga.SdpaGraphFacts(**values)
+
+
+def _values(kind: str, caps, d_qk: int, d_v: int) -> dict:
     quantized = bool(getattr(caps, "is_mxfp8", False) or getattr(caps, "is_fp8", False))
     dtype = _pick_dtype(caps.dtypes)
     out_dtypes = getattr(caps, "out_dtypes", frozenset())
@@ -110,8 +123,7 @@ def legal_facts(kind: str, caps, **overrides) -> ga.SdpaGraphFacts:
         device_sm_count=1024,
         scale=0.1,
     )
-    values.update(overrides)
-    return ga.SdpaGraphFacts(**values)
+    return values
 
 
 # Band samples in the analyzer's own resolved vocabulary: causal == right_bound
@@ -405,20 +417,24 @@ def test_band_covers_kv_tail_is_the_band_x_geometry_rule():
     # No diagonal at all -> never covered, however the lengths line up.
     assert band.BandFacts().covers_kv_tail(1, 4096) is False
     assert band.BandFacts(left_mode=band.LEFT_WINDOW, left_window=7).covers_kv_tail(1, 4096) is False
-    # The probe's KV-tail rule agrees with the model on the rows where it is live.
+    # The probe's KV-tail rule agrees with the model. Every tiled forward row now
+    # pads a ragged tail instead (skv_tail_via_padding; the SM100 MXFP8 row, the
+    # last one without it, gained it in #1814), so the rule is checked on those
+    # rows with that waiver switched off: the rule is the probe's, not the row's.
     live = [
-        (kind, spec) for kind, spec in _rows() if getattr(spec.capabilities, "skv_tile", 0) and not getattr(spec.capabilities, "skv_tail_via_padding", False)
+        ("fwd", dataclasses.replace(spec.capabilities, skv_tail_via_padding=False), spec.name)
+        for kind, spec in _rows()
+        if kind == "fwd" and getattr(spec.capabilities, "skv_tile", 0)
     ]
-    assert live, "no row exercises the KV-tail rule any more; this test would be vacuous"
-    for kind, spec in live:
-        caps = spec.capabilities
+    assert live, "no tiled forward row left; this test would be vacuous"
+    for kind, caps, name in live:
         tile = int(caps.skv_tile)
         s_kv = tile * 2 - 1  # not a tile multiple: the tail rule is live
         uncovered = legal_facts(kind, caps, s_q=tile * 2, s_kv=s_kv, **band_causal_top_left())
         covered = legal_facts(kind, caps, s_q=2, s_kv=s_kv, **band_causal_top_left())
         reason = _probe(kind)(caps, uncovered)
-        assert reason is not None and "must be a multiple of" in reason, (spec.name, reason)
-        assert _probe(kind)(caps, covered) is None, spec.name
+        assert reason is not None and "must be a multiple of" in reason, (name, reason)
+        assert _probe(kind)(caps, covered) is None, name
 
 
 # ---------------------------------------------------------------------------
