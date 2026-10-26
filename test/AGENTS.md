@@ -882,6 +882,11 @@ independently prepared standalone API; clearing a graph's private prepared plan
 does not reproduce the standalone compact-prefix contract. Retain poisoned
 outputs and replay after rebinding for both public entry points.
 
+Keep `stream` last in private CuTe host signatures and preserve the
+`_positional_order` guard. Matching named binder slots and a Python wrapper
+signature does not qualify a reordered entry; exercise a real compiled launch
+after ABI changes before considering a change to that convention.
+
 ### Native host ABI differences across architectures
 
 Do not infer a dense host signature from another architecture. SM107 D256 has
