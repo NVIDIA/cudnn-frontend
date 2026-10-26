@@ -949,7 +949,9 @@ def test_sm100_fp8_decode_shaped_gqa_leads_inside_the_measured_box():
     assert place(has_paged_kv=True, padded=True, page_size=16) == placement.LEAD
     assert place(d_qk=256, d_v=256, h_q=32, s_q=2) == placement.LEAD
     assert place(**sink, s_q=16) == placement.LEAD
-    assert place(**sink, s_q=4, b=1, h_q=8, h_kv=1, window_left=128, has_paged_kv=True, padded=True, page_size=16) == placement.TRAIL  # 1.09-1.49x
+    paged_swa = {**sink, "h_q": 8, "h_kv": 1, "window_left": 128, "has_paged_kv": True, "padded": True, "page_size": 16}
+    assert place(**{**paged_swa, "s_q": 4, "b": 1}) == placement.TRAIL  # one KV unit: 1.09-1.49x
+    assert place(**{**paged_swa, "s_q": 4, "b": 32}) == placement.LEAD
     assert place(**sink, s_q=1, causal=False, bottom_right=False, b=4) == placement.LEAD  # 32 KV units
     assert place(**sink, s_q=1, causal=False, bottom_right=False, b=1, window_left=128) == placement.LEAD
     assert place(**sink, s_q=1, causal=False, bottom_right=False, b=1) == placement.TRAIL  # 8 units over a full cache: 1.20-1.23x
