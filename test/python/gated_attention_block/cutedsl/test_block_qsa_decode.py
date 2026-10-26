@@ -1653,8 +1653,9 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
         assert d.index_list_forms == ("per_row",) and d.index_list_form_default == "per_row" and d.pdl_stages == () and d.pdl_default is False
         assert set(_INDEXER_DECLINE_TOKENS) <= set(d.declines) and all(tok in d.declines[nm] for nm, tok in _INDEXER_DECLINE_TOKENS.items())
         assert "indexer_e4m3_cache" not in d.declines, "a served form has no decline row"
-        # the record's tail is append-only (a serving stack reads these by name; a new field goes after `fuse_prepare_default`)
-        assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-12:] == [
+        # the record's tail is append-only (a serving stack reads these by name; a new field goes after `device_cc`, the lean tile's rows
+        # being the last appended: `sparse_tiles` / `sparse_tile_lean_default` and the part the per-cell `sparse_tile(...)` reads)
+        assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-15:] == [
             "index_list_forms",
             "index_list_form_default",
             "index_sources",
@@ -1667,6 +1668,9 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
             "index_state_rows_extra",
             "index_page_sizes",
             "fuse_prepare_default",
+            "sparse_tiles",
+            "sparse_tile_lean_default",
+            "device_cc",
         ]
         assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=(10, 0)).decode.fuse_prepare_default is False  # an unmeasured part
         f16 = GatedAttentionBlockFwd.serving_envelope(geom, F16, _DEV, device_cc=_SM107).decode
