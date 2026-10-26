@@ -17,9 +17,10 @@ SM100 resource layout:
      per TMA D-subtile (``CFG.K_SUB`` 16 KiB slots, each released as soon as
      BMM1[sub1] has read it, BMM1 issued per subtile with its full N) and V is
      double-buffered (``CFG.STAGES_V`` = 2): 96 (Q∪O) + 48 (K) + 64 (V) = 208 KiB.
-     Its TMA-LDG warp also prefetches the K/V tiles one kv step ahead and the
-     next tile's Q / first K/V into L2 (``CFG.L2_PREFETCH_*``), runs its kv loop
-     unrolled 1x, and keeps the plain MUFU exp2 on the dense-causal arm.
+     With ``TemplateParams.cga1_l2_prefetch`` (``CFG.L2_PREFETCH_*``, ``LDG_UNROLL``,
+     ``EXP2_TAIL_MIX``) its TMA-LDG warp also prefetches the K/V tiles one kv step
+     ahead and the next tile's Q / first K/V into L2, runs its kv loop unrolled 1x,
+     and keeps the plain MUFU exp2 on the dense-causal arm.
   2. **SMEM stats**: alpha and final (max,sum) use a dedicated 2 KiB mailbox.
      This leaves all 512 TMEM cols to S_acc 0/128 + O 256..511 and removes
      the cross-tile dependency that otherwise delays the next BMM1 until
@@ -148,9 +149,9 @@ _PADDED_CAUSAL = CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_PADDED) and CFG.WINDOW_RI
 # pattern replaces that tail emulation on EVERY mask arm -- the exact form MEASURED on B200.  The tail
 # emulation itself is untouched and still traces wherever the split is off; it runs ungated on cc 10.3
 # today and its own arch gate is a separate follow-up.
-# The dense-causal tail emulation is the pair tile's; the single-CTA tile keeps the plain MUFU exp2 on that arm.
+# The dense-causal tail emulation; CFG.EXP2_TAIL_MIX = 0 (the L2-prefetching cga1 loader) keeps the plain MUFU exp2 on that arm.
 _DENSE_CAUSAL_PUBLIC_EXP2_MIX = (
-    CFG.CTA_MMA == 2 and not CFG.THD_VARLEN and CFG.MASK_FLAGS == MASK_CAUSAL and CFG.WINDOW_RIGHT == 0 and not CFG.BOTTOM_RIGHT and not CFG.HAS_SINK
+    bool(CFG.EXP2_TAIL_MIX) and not CFG.THD_VARLEN and CFG.MASK_FLAGS == MASK_CAUSAL and CFG.WINDOW_RIGHT == 0 and not CFG.BOTTOM_RIGHT and not CFG.HAS_SINK
 )
 _REUSE_BMM2_ISSUE_ELECTION = CFG.THD_VARLEN or _DENSE_CAUSAL_PUBLIC_EXP2_MIX
 
