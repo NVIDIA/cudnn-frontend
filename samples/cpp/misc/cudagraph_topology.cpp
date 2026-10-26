@@ -40,7 +40,6 @@ Set CUDNN186_LOG=<path> to also append every printed line to a raw log file.
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -98,7 +97,7 @@ namespace {
 std::ofstream &
 evidence_file() {
     static std::ofstream file = []() -> std::ofstream {
-        char const *path = std::getenv("CUDNN186_LOG");
+        char const *path = fe::get_environment("CUDNN186_LOG");
         if (path == nullptr || path[0] == '\0') {
             return std::ofstream();
         }
@@ -2663,9 +2662,7 @@ TEST_CASE("186 eligibility comes from node-producing frontend workspace operatio
         }
     }
 
-    // Case 3: SDPA forward with alibi. One node-producing workspace
-    // modification (a memcpy of the alibi slopes) -> ineligible, and the
-    // frontend graph carries that memcpy node.
+    // Case 3: copying alibi slopes adds a frontend node, so direct population is ineligible.
     {
         int64_t const b = 4, h = 4, s_q = 256, s_kv = 256, d = 64;
         auto graph  = make_sdpa_fwd_alibi_graph(b, h, s_q, s_kv, d, 0.5f);
@@ -2680,16 +2677,21 @@ TEST_CASE("186 eligibility comes from node-producing frontend workspace operatio
             auto populate_status =
                 graph->populate_cuda_graph(handle, fixture.variant_pack(), fixture.workspace_ptr(), populated);
             auto topology = analyze_graph(populated, "eligibility case 3");
+            // Backend child graphs may contain their own copies and memsets.
+            auto const memcpy_nodes      = top_level_nodes_of_type(populated, cudaGraphNodeTypeMemcpy).size();
+            auto const memset_nodes      = top_level_nodes_of_type(populated, cudaGraphNodeTypeMemset).size();
+            auto const child_graph_nodes = top_level_nodes_of_type(populated, cudaGraphNodeTypeGraph).size();
             ev("[186][ELIGIBILITY] case=sdpa_fwd_alibi total_workspace_bytes=" + std::to_string(workspace_bytes) +
                " eligible=" + std::string(direct_population_eligible(graph) ? "true" : "false") +
                " frontend_top_level_nodes=" + std::to_string(topology.top_level_nodes) + " frontend_memcpy_nodes=" +
-               std::to_string(topology.memcpys) + " frontend_memset_nodes=" + std::to_string(topology.memsets) +
-               " frontend_child_graph_nodes=" + std::to_string(topology.child_graphs) +
+               std::to_string(memcpy_nodes) + " frontend_memset_nodes=" + std::to_string(memset_nodes) +
+               " frontend_child_graph_nodes=" + std::to_string(child_graph_nodes) +
                " populate_status=" + (populate_status.is_good() ? std::string("OK") : populate_status.get_message()));
             REQUIRE(populate_status.is_good());
             REQUIRE(!direct_population_eligible(graph));
-            REQUIRE(topology.memcpys == 1);
-            REQUIRE(topology.memsets == 0);
+            REQUIRE(memcpy_nodes == 1);
+            REQUIRE(memset_nodes == 0);
+            REQUIRE(child_graph_nodes == 1);
             CUDA_CHECK(cudaGraphDestroy(populated));
         }
     }

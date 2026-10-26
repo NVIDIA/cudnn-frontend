@@ -105,7 +105,8 @@ def test_grouped_packed_layout_uses_each_ports_head_count(packing):
     [
         (True, (10, 0), None, "4.8.0", True),
         (False, (10, 0), 0.125, "4.8.0", True),
-        (False, (10, 3), 0.125, "4.8.0", False),
+        (False, (10, 3), 0.125, "4.8.0", True),
+        (False, (10, 1), 0.125, "4.8.0", False),
         (True, (10, 0), -0.125, "4.8.0", False),
         (False, (10, 0), 1e-100, "4.8.0", False),
         (True, (10, 0), 0.125, "4.7.4", False),
@@ -192,8 +193,8 @@ def test_real_grouped_graph_accepts(monkeypatch, thd, heads, dtype, causal):
 @pytest.mark.parametrize(
     "thd,cc,kwargs,token",
     [
-        (False, (10, 3), {}, "cc 10.0"),
-        (True, (10, 3), {}, "cc 10.0"),
+        (False, (10, 1), {}, "cc 10.0 / 10.3"),
+        (True, (10, 1), {}, "cc 10.0 / 10.3"),
         (False, (10, 0), {"scale": -0.125}, "positive"),
         (True, (10, 0), {"scale": -0.125}, "positive"),
         (False, (10, 0), {"sq": 129}, "multiples of 128"),

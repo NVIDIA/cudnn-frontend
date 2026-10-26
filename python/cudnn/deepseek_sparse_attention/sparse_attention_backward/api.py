@@ -71,6 +71,7 @@ class SparseAttentionBackward(APIBase):
         self._device_major = None
         self._two_cta_split_count = 1
         self._qcluster_plan = None
+        self._wide_addressing = False
 
     def _validate_compiled_inputs(self, q, kv, out, dout, lse, attn_sink, topk_idxs, topk_length) -> None:
         """Require execution inputs to match the plan's compiled contract."""
@@ -222,6 +223,7 @@ class SparseAttentionBackward(APIBase):
         # callers of ``flash_attn_bwd_sm100``.
         self._backend = None
         self._backend_block_tile = None
+        self._wide_addressing = False
         if major == 10:
             self._backend, self._backend_block_tile = _iface_sm100._select_sm100_backend(
                 num_heads,
@@ -232,6 +234,29 @@ class SparseAttentionBackward(APIBase):
                 device_capability=capability,
                 deterministic=self.deterministic,
                 is_contiguous=all(desc.is_contiguous() for desc in descriptors),
+            )
+            self._wide_addressing = _iface_sm100._requires_wide_data_addressing(
+                total_s_q,
+                self.kv_desc.shape[0],
+                head_dim,
+                head_dim_v,
+                num_heads,
+                self.topk_idxs_desc.shape[1],
+                self.deterministic,
+                self._backend,
+                include_workspace=self._backend not in _iface_d576.BACKENDS,
+            )
+        if self.deterministic and self._backend == "generic_m64":
+            # Resolve the shape-dependent policy during support checking so a
+            # relay-only DSL requirement fails before compilation. Ordinary
+            # shard and tuned deterministic routes retain the 4.6.2 floor.
+            _iface_sm100._get_sm100_kernel_class(
+                self._backend,
+                True,
+                total_s_q,
+                self.kv_desc.shape[0],
+                head_dim,
+                num_heads,
             )
         if self._backend in _iface_d576.BACKENDS:
             self._value_error_if(total_s_q <= 0 or self.kv_desc.shape[0] <= 0, "Q and KV sequence extents must be positive")
@@ -296,13 +321,22 @@ class SparseAttentionBackward(APIBase):
                         if self.deterministic
                         else 74
                     ),
+                    self._wide_addressing,
                 )
             return
         if self.deterministic:
             total_s_q, num_heads, head_dim = self.q_desc.shape
             head_dim_v = self.out_desc.shape[2]
-            kernel_cls = _iface_sm100._get_sm100_kernel_class(self._backend, True, total_s_q)
+            kernel_cls = _iface_sm100._get_sm100_kernel_class(
+                self._backend,
+                True,
+                total_s_q,
+                self.kv_desc.shape[0],
+                head_dim,
+                num_heads,
+            )
             shards = kernel_cls.num_dkv_shards
+            relay_cluster_size = getattr(kernel_cls, "dkv_relay_cluster_size", 1)
             with torch.cuda.device(self.q_desc.device):
                 self._compiled_kernel = _iface_sm100._compile_deterministic_sm100(
                     self.q_desc.device.index,
@@ -315,6 +349,8 @@ class SparseAttentionBackward(APIBase):
                     self.topk_idxs_desc.shape[1],
                     self.topk_length_desc is not None,
                     shards,
+                    relay_cluster_size,
+                    self._wide_addressing,
                 )
             return
         if self._device_major == 10:
@@ -331,6 +367,7 @@ class SparseAttentionBackward(APIBase):
                     self.topk_idxs_desc.shape[1],
                     self.topk_length_desc is not None,
                     self._backend_block_tile,
+                    self._wide_addressing,
                 )
             return
         # SM90 owns concrete-tensor caches and retains first-execute JIT.
@@ -340,10 +377,13 @@ class SparseAttentionBackward(APIBase):
         """Return the minimum reusable per-execution workspace in bytes.
 
         Generic deterministic SM100 plans include a query-dependent 32-, 64-,
-        or 128-plane FP32 dKV accumulator. Deterministic H96/H128 D576 two-CTA
-        plans use the compact 96-plane capacity. The returned size is
-        authoritative for this plan; ``execute()`` accepts a larger contiguous
-        uint8 buffer on the plan device but never allocates one.
+        or 128-plane FP32 dKV accumulator. Large-context plans that would
+        exceed 16 GiB instead use 8, 16, or 32 planes plus packed row-relay
+        masks; the eight-plane memory-first tier is selected when the preferred
+        relay would exceed 32 GiB. Deterministic H96/H128 D576 two-CTA plans use
+        the compact 96-plane capacity. The returned size is authoritative for
+        this plan; ``execute()`` accepts a larger contiguous uint8 buffer on the
+        plan device but never allocates one.
         """
         self._ensure_support_checked()
         major, _ = device_capability(self.q_desc.device)

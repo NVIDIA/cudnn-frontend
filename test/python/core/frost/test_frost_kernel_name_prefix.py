@@ -8,6 +8,7 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _KERNEL_ROOTS = (
+    _REPO_ROOT / "python" / "cudnn" / "QSA",
     _REPO_ROOT / "python" / "cudnn" / "conv",
     _REPO_ROOT / "python" / "cudnn" / "gemm",
     _REPO_ROOT / "python" / "cudnn" / "norm",

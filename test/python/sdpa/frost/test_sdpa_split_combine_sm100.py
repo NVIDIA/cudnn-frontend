@@ -169,6 +169,9 @@ def test_packed_combine_live_total_and_runtime_split_boundary(dtype, stats):
                 total.data_ptr(),
                 torch.cuda.current_stream().cuda_stream,
                 None,  # This direct packed entry has no sink.
+                None,  # Compact prefixes: no physical-origin operands.
+                None,
+                0,
             )
 
         def check(live):

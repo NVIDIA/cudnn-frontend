@@ -534,8 +534,10 @@ def test_declaration_facts_on_the_prefill_route_and_the_policy_knob():
     rb = blk_b.decode_route
     assert rb.decode_tile and (rb.n_q, rb.token_units, rb.kv_streams, rb.policy, rb.batch, rb.claimed) == (64, 2, 2, DECODE_ROUTE_SINGLE_UNIT, 4, False), rb
     assert blk_b._sdpa.paged_dense and not blk_b._sdpa.thd and blk_b.gate_fused and blk_b.decode_split_kv >= 2 and blk_b._gate is None
-    # C0: at decode row counts (4 x 5 = 20 rows) the fused declaration lowers stage (1) to the unfused chain
-    assert [s.name for s in blk_b._stages] == ["qkv_gate_proj", "qk_norm_rope", "cache_write", "sdpa", "out_proj"] and not blk_b.fuse_norm_rope_effective
+    # C0: at decode row counts (4 x 5 = 20 rows) the fused declaration lowers stage (1) to the unfused chain, the paged write-through folded
+    # into the norm + RoPE launch (fuse_cache_write_small_m's default below 128 rows; the 160-row chain above keeps the separate launch)
+    assert [s.name for s in blk_b._stages] == ["qkv_gate_proj", "qk_norm_rope", "sdpa", "out_proj"] and not blk_b.fuse_norm_rope_effective
+    assert blk_b.cache_write_in_norm_rope and blk_b._cache_write is None and not blk_l.cache_write_in_norm_rope
     assert _make_block(16, 4, 5, decode_split_kv=2)[0].decode_split_kv == 2
     # the other arm of the A/B: the two-unit decode tile (two units of the 64-column width) at ANY batch under token_units
     blk_t, _ = _make_block(16, 32, 5, fuse_gate=True, fuse_norm_rope=True, decode_route_policy=DECODE_ROUTE_TOKEN_UNITS, decode_split_kv=2)

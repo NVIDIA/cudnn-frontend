@@ -12,7 +12,7 @@
 
 
 import math
-from typing import Type, Tuple, Callable, Optional
+from typing import Tuple, Callable, Optional
 from functools import partial
 
 import cuda.bindings.driver as cuda
@@ -25,7 +25,8 @@ import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass import pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
-from cutlass.cutlass_dsl import BaseDSL
+from cutlass.cutlass_dsl import BaseDSL, dsl_user_op
+from cutlass._mlir.dialects import nvvm
 
 from cudnn.block_sparse_attention.csrc.utils import copy_utils, layout_utils
 
@@ -53,6 +54,38 @@ SAGE_P_QUANT_LOG2_SCALE = math.log2(SAGE_P_QUANT_SCALE)
 SAGE_P_RESCALE_THRESHOLD = math.log2(448.0 / SAGE_P_QUANT_SCALE)
 
 
+class _SubsetNamedBarrier(pipeline_custom.NamedBarrier):
+    """CTA named barrier whose participants occupy only selected warp roles."""
+
+    @dsl_user_op
+    def arrive(self, *, loc=None, ip=None):
+        self.arrive_w_index(Int32(0), loc=loc, ip=ip)
+
+    @dsl_user_op
+    def arrive_and_wait(self, *, loc=None, ip=None):
+        self.arrive_and_wait_w_index(Int32(0), loc=loc, ip=ip)
+
+    @dsl_user_op
+    def arrive_w_index(self, index: Int32, *, loc=None, ip=None):
+        nvvm.barrier_cta_arrive(
+            Int32(self.barrier_id + index).ir_value(loc=loc, ip=ip),
+            Int32(self.num_threads).ir_value(loc=loc, ip=ip),
+            aligned=False,
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def arrive_and_wait_w_index(self, index: Int32, *, loc=None, ip=None):
+        nvvm.barrier_cta_sync(
+            Int32(self.barrier_id + index).ir_value(loc=loc, ip=ip),
+            thread_count=Int32(self.num_threads).ir_value(loc=loc, ip=ip),
+            aligned=False,
+            loc=loc,
+            ip=ip,
+        )
+
+
 class BlockSparseAttnForwardSm100Blk64:
 
     def __init__(
@@ -71,12 +104,16 @@ class BlockSparseAttnForwardSm100Blk64:
         num_splits: cutlass.Constexpr[int] = 1,
         use_exact_kv_layout: cutlass.Constexpr[bool] = False,
         use_int64_kv_strides: cutlass.Constexpr[bool] = False,
+        nonpositive_scale: cutlass.Constexpr[bool] = False,
+        short_tile_opt: cutlass.Constexpr[bool] = True,
     ):
+        # short_tile_opt: ramp/instruction-cache optimisations for short KV lists (single-stage epilogue, shared first
+        # softmax step). Long, near-dense lists hide the ramp and prefer the original schedule.
+        self.short_tile_opt = short_tile_opt
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
         self.head_dim_padded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
         head_dim_v = head_dim_v if head_dim_v is not None else head_dim
-        self.same_hdim_kv = head_dim == head_dim_v
         self.head_dim_v_padded = int(math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of)
         self.same_hdim_kv_padded = self.head_dim_padded == self.head_dim_v_padded
         self.check_hdim_oob = head_dim != self.head_dim_padded
@@ -87,10 +124,12 @@ class BlockSparseAttnForwardSm100Blk64:
         assert sparse_block_size == 64, "blk64 CuTeDSL fwd requires 64-token sparse blocks"
         self.m_block_size = m_block_size
         self.sparse_block_size = sparse_block_size
+        # Zero and negative softmax scales take a separately compiled path: the masking order they need would
+        # otherwise sit in the positive-scale softmax loop as a runtime branch and slow it down.
+        self.nonpositive_scale = nonpositive_scale
         self.sparse_blocks_per_kv = n_block_size // sparse_block_size
         self.n_block_size = n_block_size
         self.kv_mma_k = 128
-        self.output_cols = 128
         self.kv_elems_per_stage = self.n_block_size * self.kv_mma_k
         self.q_stage = 1
         # If split_P_arrive, the softmax warps write some columns of P first, signal to the MMA warp
@@ -177,9 +216,6 @@ class BlockSparseAttnForwardSm100Blk64:
         # elements of the shared K/V allocation, not an offset in bytes.
         self.epi_sO_input_offset = self.epi_exchange_f32_count * 2
 
-        # vec buffer for row_max & row_sum
-        self.tmem_vec_offset = self.tmem_s_offset
-
         if self.head_dim_padded < 96:
             self.num_regs_softmax = 200
             self.num_regs_correction = 64
@@ -208,12 +244,6 @@ class BlockSparseAttnForwardSm100Blk64:
         # small increases, avoiding an O TMEM rescale. The same factor is carried
         # by the softmax sum, so it cancels during normalization and only V's
         # per-channel scale remains.
-        smem_size_q = self.q_stage * self.m_block_size * self.head_dim_padded * self.q_dtype.width // 8
-        smem_size_o = self.s_stage * self.m_block_size * self.head_dim_v_padded * self.o_dtype.width // 8
-        smem_size_q_o = smem_size_q + smem_size_o if not self.overlap_sO_sQ else max(smem_size_q, smem_size_o)
-        smem_size_k_per_stage = self.n_block_size * self.head_dim_padded * self.k_dtype.width // 8
-        smem_size_v_per_stage = self.n_block_size * self.head_dim_v_padded * self.v_dtype.width // 8
-        smem_size_kv_per_stage = max(smem_size_k_per_stage, smem_size_v_per_stage)
         kv_stage = 3
         if self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and kv_stage == 2:
             # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
@@ -272,8 +302,15 @@ class BlockSparseAttnForwardSm100Blk64:
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type
         self.o_dtype = mO.element_type
-        self.epi_sO_input_offset = self.epi_exchange_f32_count * (Float32.width // self.k_dtype.width)
         self.is_sage_fp8 = mQScale is not None
+        # The persistent BF16 path keeps the epilogue exchange buffer + sO inside ONE KV smem stage (two column
+        # passes of 32 KB), so the next tile's K0/K1 can be prefetched into the other two stages.
+        self.epi_single_stage = (
+            self.short_tile_opt and self.is_persistent and not self.is_sage_fp8 and not self.is_split_kv and self.o_dtype == cutlass.BFloat16
+        )
+        if const_expr(self.epi_single_stage):
+            self.epi_exchange_f32_count = 2 * 4 * 32 * 32
+        self.epi_sO_input_offset = self.epi_exchange_f32_count * (Float32.width // self.k_dtype.width)
         if const_expr(self.is_sage_fp8):
             if const_expr(mKScale is None or mVScale is None):
                 raise TypeError("Sage FP8 requires Q, K, and V scale tensors")
@@ -821,7 +858,6 @@ class BlockSparseAttnForwardSm100Blk64:
         self.shared_storage = SharedStorage
 
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale)
-        fastdiv_mods = None
 
         # Launch the kernel synchronously
         self.kernel(
@@ -925,7 +961,7 @@ class BlockSparseAttnForwardSm100Blk64:
         smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        tmem_alloc_barrier = pipeline.NamedBarrier(
+        tmem_alloc_barrier = _SubsetNamedBarrier(
             barrier_id=int(NamedBarrierFwdSm100.TmemPtr),
             num_threads=cute.arch.WARP_SIZE * len((self.mma_warp_id, *self.softmax0_warp_ids, *self.softmax1_warp_ids, *self.correction_warp_ids)),
         )
@@ -996,7 +1032,7 @@ class BlockSparseAttnForwardSm100Blk64:
             defer_sync=True,
         )
         # Should put the NamedBarrier inside the pipeline class so we'll just have pipeline_sm_stats
-        sm_stats_barrier = pipeline_custom.NamedBarrier(barrier_id=int(NamedBarrierFwdSm100.SoftmaxStatsW0), num_threads=cute.arch.WARP_SIZE * 2)
+        sm_stats_barrier = _SubsetNamedBarrier(barrier_id=int(NamedBarrierFwdSm100.SoftmaxStatsW0), num_threads=cute.arch.WARP_SIZE * 2)
         reduce_mbar_ptr = storage.reduce_mbar.data_ptr()
         pipeline_o_epi = pipeline_custom.PipelineAsync.create(
             barrier_storage=storage.mbar_O_epi.data_ptr(),
@@ -1163,7 +1199,7 @@ class BlockSparseAttnForwardSm100Blk64:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
             # Alloc tensor memory buffer
             tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
-            tmem.wait_for_alloc()
+            tmem_alloc_barrier.arrive_and_wait()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             self.mma(
                 tiled_mma_qk,
@@ -1221,7 +1257,7 @@ class BlockSparseAttnForwardSm100Blk64:
             # increase register after decreasing
             cute.arch.setmaxregister_increase(self.num_regs_softmax)
             # sync with mma warp before retrieving tmem ptr
-            tmem.wait_for_alloc()
+            tmem_alloc_barrier.arrive_and_wait()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             softmax_loop = partial(
                 self.softmax_loop,
@@ -1260,7 +1296,7 @@ class BlockSparseAttnForwardSm100Blk64:
         if warp_idx >= self.correction_warp_ids[0] and warp_idx < self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_correction)
             # sync with mma warp before retrieving tmem ptr
-            tmem.wait_for_alloc()
+            tmem_alloc_barrier.arrive_and_wait()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             self.correction_loop(
                 thr_mma_pv,
@@ -1277,7 +1313,7 @@ class BlockSparseAttnForwardSm100Blk64:
                 pipeline_o_epi,
                 gmem_tiled_copy_O,
                 tma_atom_O,
-                Float32(1.0) if const_expr(self.is_sage_fp8) else softmax_scale_log2,
+                Float32(1.0) if const_expr(self.is_sage_fp8 or self.nonpositive_scale) else softmax_scale_log2,
                 oStats,
                 oExchange,
                 mVScale,
@@ -1394,8 +1430,6 @@ class BlockSparseAttnForwardSm100Blk64:
         mBlockNums: Optional[cute.Tensor],
         mSplitOffsets: Optional[cute.Tensor],
     ):
-        num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
-        tidx = cute.arch.thread_idx()[0] % num_load_threads
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         q_producer_phase = Int32(1)
         kv_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.kv_stage)
@@ -1407,7 +1441,10 @@ class BlockSparseAttnForwardSm100Blk64:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             if const_expr(self.prefetch_next_query):
-                kv_stage_offset = Int32(self.kv_stage - 1) - kv_producer_state.index
+                if const_expr(self.epi_single_stage):
+                    kv_stage_offset = Int32(self.kv_stage - 1) + kv_producer_state.index
+                else:
+                    kv_stage_offset = Int32(self.kv_stage - 1) - kv_producer_state.index
             if const_expr(self.is_sage_fp8):
                 mQ_cur = mQ[None, None, None, head_idx, None, batch_idx]
                 gQ_tma = cute.group_modes(mQ_cur, 0, 3)
@@ -1507,6 +1544,22 @@ class BlockSparseAttnForwardSm100Blk64:
                     kv_stage_offset,
                 )
 
+                if const_expr(self.epi_single_stage):
+                    # The epilogue aliases only stage 0: K[N-1] -> stage 2 and K[N-2] -> stage 1 can be loaded
+                    # while the previous tile's epilogue is still running.
+                    kv_producer_state = self.load_K_group(
+                        tma_atom_K,
+                        gK_tma,
+                        sK,
+                        sKV_ptr,
+                        sK_tma_layout,
+                        n_block,
+                        block_iter_count - 2,
+                        kv_producer_state,
+                        pipeline_kv,
+                        kv_stage_offset,
+                    )
+
             if const_expr(self.prefetch_next_query):
                 # K0 lives outside the output alias. Subsequent K/V loads may
                 # overwrite the exchange/O buffer, so retain its epilogue wait.
@@ -1523,19 +1576,20 @@ class BlockSparseAttnForwardSm100Blk64:
                 # Load order: Q, K[N-1], K[N-2], {V[N-1-i], K[N-3-i]}x(N-2), V[1], V[0]
                 block_loop_count = block_iter_count - 2
 
-                # Prologue: K[N-2]
-                kv_producer_state = self.load_K_group(
-                    tma_atom_K,
-                    gK_tma,
-                    sK,
-                    sKV_ptr,
-                    sK_tma_layout,
-                    n_block,
-                    block_iter_count - 2,
-                    kv_producer_state,
-                    pipeline_kv,
-                    kv_stage_offset,
-                )
+                # Prologue: K[N-2] (already issued with K[N-1] when the epilogue lives in a single stage)
+                if const_expr(not self.epi_single_stage):
+                    kv_producer_state = self.load_K_group(
+                        tma_atom_K,
+                        gK_tma,
+                        sK,
+                        sKV_ptr,
+                        sK_tma_layout,
+                        n_block,
+                        block_iter_count - 2,
+                        kv_producer_state,
+                        pipeline_kv,
+                        kv_stage_offset,
+                    )
 
                 # Flat main loop: N-2 iterations, each loads V then K
                 for i in cutlass.range(block_loop_count, unroll=1):
@@ -1646,7 +1700,10 @@ class BlockSparseAttnForwardSm100Blk64:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
 
             if const_expr(self.prefetch_next_query):
-                kv_stage_offset = Int32(self.kv_stage - 1) - mma_kv_consumer_state.index
+                if const_expr(self.epi_single_stage):
+                    kv_stage_offset = Int32(self.kv_stage - 1) + mma_kv_consumer_state.index
+                else:
+                    kv_stage_offset = Int32(self.kv_stage - 1) - mma_kv_consumer_state.index
 
             raw_block_count, split_offset = self.get_tile_block_count_and_offset(
                 mSplitOffsets,
@@ -2008,7 +2065,7 @@ class BlockSparseAttnForwardSm100Blk64:
             )
 
             softmax = SoftmaxSm100.create(
-                Float32(1.0) if const_expr(self.is_sage_fp8) else softmax_scale_log2,
+                Float32(1.0) if const_expr(self.is_sage_fp8 or self.nonpositive_scale) else softmax_scale_log2,
                 rescale_threshold=(SAGE_P_RESCALE_THRESHOLD if const_expr(self.is_sage_fp8) else 8.0 if const_expr(self.q_dtype.width == 16) else 0.0),
                 softmax_scale=softmax_scale,
             )
@@ -2048,26 +2105,31 @@ class BlockSparseAttnForwardSm100Blk64:
                 wg_count = block_iter_count // 2
                 warp_col = warp_idx // 2
 
-                first_bs_lo, first_bs_hi, first_nb_lo, first_nb_hi = self.get_softmax_block_info(
-                    Int32(0), stage, warp_col, block_iter_count, raw_block_count, n_block, mBlockSizes
-                )
-                mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
-                    mma_si_consumer_phase,
-                    sm_stats_producer_phase,
-                    block_size_lo=first_bs_lo,
-                    block_size_hi=first_bs_hi,
-                    n_block_lo=first_nb_lo,
-                    n_block_hi=first_nb_hi,
-                    q_scale=q_scale,
-                    tidx=tidx,
-                    tmem_s_addr=tmem_s_addr,
-                    tmem_p_addr=tmem_p_addr,
-                    sm_stats_bar_index=sm_stats_bar_index,
-                    is_first=True,
-                )
-                for n_tile in cutlass.range(wg_count - 1, unroll=1):
+                # Sage FP8 keeps the is_first specialisation. Otherwise the first step is the generic step started from the
+                # reset state (row_max=-inf, row_sum=0 gives acc_scale == 0, i.e. the is_first result) and shares its code
+                # with the loop: a separate once-per-tile copy of the large softmax step thrashes the instruction cache.
+                if const_expr(self.is_sage_fp8 or not self.short_tile_opt):
+                    first_bs_lo, first_bs_hi, first_nb_lo, first_nb_hi = self.get_softmax_block_info(
+                        Int32(0), stage, warp_col, block_iter_count, raw_block_count, n_block, mBlockSizes
+                    )
+                    mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
+                        mma_si_consumer_phase,
+                        sm_stats_producer_phase,
+                        block_size_lo=first_bs_lo,
+                        block_size_hi=first_bs_hi,
+                        n_block_lo=first_nb_lo,
+                        n_block_hi=first_nb_hi,
+                        q_scale=q_scale,
+                        tidx=tidx,
+                        tmem_s_addr=tmem_s_addr,
+                        tmem_p_addr=tmem_p_addr,
+                        sm_stats_bar_index=sm_stats_bar_index,
+                        is_first=True,
+                    )
+                first_iter = 1 if const_expr(self.is_sage_fp8 or not self.short_tile_opt) else 0
+                for n_tile in cutlass.range(wg_count - first_iter, unroll=1):
                     bs_lo, bs_hi, nb_lo, nb_hi = self.get_softmax_block_info(
-                        n_tile + 1, stage, warp_col, block_iter_count, raw_block_count, n_block, mBlockSizes
+                        n_tile + first_iter, stage, warp_col, block_iter_count, raw_block_count, n_block, mBlockSizes
                     )
                     mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
                         mma_si_consumer_phase,
@@ -2234,6 +2296,13 @@ class BlockSparseAttnForwardSm100Blk64:
             for j in cutlass.range_constexpr(32):
                 tSrS_t2r[c * 32 + j] = vals[j]
 
+        if const_expr(self.nonpositive_scale and not self.is_sage_fp8):
+            # max(scale * S) is not scale * max(S) for negative scales.
+            # Scale finite scores before introducing -inf mask sentinels so
+            # zero scale gives a uniform distribution, including partial K.
+            for i in cutlass.range_constexpr(0, 128, 2):
+                tSrS_t2r[i], tSrS_t2r[i + 1] = cute.arch.mul_packed_f32x2((tSrS_t2r[i], tSrS_t2r[i + 1]), (score_scale_log2, score_scale_log2))
+
         tSrS_blocks = cute.logical_divide(tSrS_t2r, cute.make_layout(self.sparse_block_size))
         bsa_fwd_helpers.apply_block_size_mask_64(tSrS_blocks[None, 0], block_size_lo)
         bsa_fwd_helpers.apply_block_size_mask_64(tSrS_blocks[None, 1], block_size_hi)
@@ -2271,7 +2340,10 @@ class BlockSparseAttnForwardSm100Blk64:
             row_max, acc_scale = softmax.update_row_max(scaled_group_max.load(), is_first)
         else:
             if const_expr(use_ldred_rowmax):
-                full_blocks = (block_size_lo == Int32(self.sparse_block_size)) & (block_size_hi == Int32(self.sparse_block_size))
+                if const_expr(self.nonpositive_scale and not self.is_sage_fp8):
+                    full_blocks = (block_size_lo == Int32(self.sparse_block_size)) & (block_size_hi == Int32(self.sparse_block_size)) & (score_scale_log2 > 0.0)
+                else:
+                    full_blocks = (block_size_lo == Int32(self.sparse_block_size)) & (block_size_hi == Int32(self.sparse_block_size))
                 row_max = Float32(0.0)
                 acc_scale = Float32(0.0)
                 if full_blocks:
@@ -2432,7 +2504,6 @@ class BlockSparseAttnForwardSm100Blk64:
         for stage in cutlass.range_constexpr(self.s_stage):
             pipeline_s_p_o.consumer_release_w_index(stage)
 
-        sm_stats_consumer_phase = Int32(0)
         o_corr_consumer_phase = Int32(0)
         corr_epi_producer_phase = Int32(1)
         tiler_gO = ((self.mma_tiler_pv[0] * self.q_stage), self.head_dim_v_padded)
@@ -2476,7 +2547,6 @@ class BlockSparseAttnForwardSm100Blk64:
                 pipeline_sm_stats.consumer_release_w_index(0)
                 # Wait for both softmax warp groups.
                 sm_stats_barrier.arrive_and_wait_w_index(index=1 * 4 + warp_idx)
-                sm_stats_consumer_phase ^= 1
 
                 # q_stage=1 correction loop
                 block_iter_count = ((raw_block_count + 7) & ~7) // self.sparse_blocks_per_kv
@@ -2491,7 +2561,6 @@ class BlockSparseAttnForwardSm100Blk64:
                             self.correction_rescale(thr_mma_pv, tOtO[None, None, None, stage], tidx, scale)
                         pipeline_s_p_o.consumer_release_w_index(stage)
                         pipeline_sm_stats.consumer_release_w_index(self.s_stage - 1 - stage)
-                    sm_stats_consumer_phase ^= 1
                 # N even: no remainder. Release final sm_stats stage 1.
                 pipeline_sm_stats.consumer_release_w_index(1)
                 # End of seqlen_corr_loop_steps
@@ -2529,7 +2598,9 @@ class BlockSparseAttnForwardSm100Blk64:
                 scale1 = cute.math.exp2((rm1 - max_safe) * softmax_scale_log2, fastmath=True) if valid1 else Float32(0.0)
                 sum_combined = row_sum0 * scale0 + row_sum1 * scale1
                 my_sum = sum_combined
-                my_max = max_safe
+                # Exchange the unclamped max: a half-warp without data must report -inf, not the 0 used for exp safety, or the
+                # partner's rescale exp2((max - 0) * scale) underflows for rows whose logits are all very negative.
+                my_max = max_combined
 
                 # Wait for both O accumulators from MMA warp
                 for stage in cutlass.range_constexpr(self.s_stage):
@@ -2565,7 +2636,6 @@ class BlockSparseAttnForwardSm100Blk64:
                 pipeline_o_epi.producer_commit_w_index(0)
 
                 o_corr_consumer_phase ^= 1
-                sm_stats_consumer_phase ^= 1
                 corr_epi_producer_phase ^= 1
             else:
                 # Empty tile (block_count == 0): sync pipelines and write O=0.
@@ -2573,7 +2643,6 @@ class BlockSparseAttnForwardSm100Blk64:
                 for stage_idx in cutlass.range_constexpr(self.s_stage):
                     sm_stats_barrier.arrive_and_wait_w_index(index=stage_idx * 4 + warp_idx)
                     pipeline_sm_stats.consumer_release_w_index(stage_idx)
-                sm_stats_consumer_phase ^= 1
                 # Write O=0 through the raw WS exchange path without reading stale TMEM.
                 pipeline_o_epi.producer_acquire_w_index_phase(0, corr_epi_producer_phase)
                 mLSE_cur = mLSE[None, out_head_idx, batch_idx] if const_expr(mLSE is not None) else None
@@ -2676,11 +2745,67 @@ class BlockSparseAttnForwardSm100Blk64:
         my_scale0 = scale0 * my_weight
         my_scale1 = scale1 * my_weight
 
-        exchange_warp_base = corr_warp * 4 * 32 * 32
-        exchange_addr = Int32((oExchange.iterator + exchange_warp_base + lane_idx * 4).toint())
-        if const_expr(self.allow_empty_block_nums):
-            is_zero_output = my_scale0 == Float32(0.0) and my_scale1 == Float32(0.0)
-            if not is_zero_output:
+        if const_expr(self.epi_single_stage):
+            # Two column passes of two 32-column chunks each; per pass every warp writes its own 8 KB slice of the
+            # 32 KB exchange buffer, then warps w and w^2 split the pass's two chunks for the reduce/bf16 store.
+            exchange_warp_base = corr_warp * 2 * 32 * 32
+            exchange_addr = Int32((oExchange.iterator + exchange_warp_base + lane_idx * 4).toint())
+            out_row = (corr_warp & 1) * cute.arch.WARP_SIZE + lane_idx
+            own_warp_base = corr_warp * 2 * 32 * 32
+            partner_warp_base = partner_warp * 2 * 32 * 32
+            lane_col_swizzle = lane_idx & 7
+            local_chunk = corr_warp >> 1
+            for pas in cutlass.range_constexpr(2):
+                if const_expr(self.allow_empty_block_nums):
+                    is_zero_output = my_scale0 == Float32(0.0) and my_scale1 == Float32(0.0)
+                    # Aligned TMEM loads require converged participation of the entire warp.
+                    warp_needs_tmem = cute.arch.vote_ballot_sync(not is_zero_output) != 0
+                    if warp_needs_tmem:
+                        bsa_fwd_helpers.tmem_combine_store_exchange_chunks(
+                            Int32(tmem_o0_addr), Int32(tmem_o1_addr), exchange_addr, my_scale0, my_scale1, pas * 2, 2
+                        )
+                    else:
+                        bsa_fwd_helpers.smem_zero_store_exchange_chunks(exchange_addr, 2)
+                else:
+                    bsa_fwd_helpers.tmem_combine_store_exchange_chunks(
+                        Int32(tmem_o0_addr), Int32(tmem_o1_addr), exchange_addr, my_scale0, my_scale1, pas * 2, 2
+                    )
+                bsa_fwd_helpers.mbar_arrive_and_wait(reduce_mbar_addr, Int32(1))
+                c = pas * 2 + local_chunk
+                off = local_chunk * 32 * 32 + lane_idx * 4
+                col0 = (((c * 4) + 0) ^ lane_col_swizzle) * 8
+                col1 = (((c * 4) + 1) ^ lane_col_swizzle) * 8
+                col2 = (((c * 4) + 2) ^ lane_col_swizzle) * 8
+                col3 = (((c * 4) + 3) ^ lane_col_swizzle) * 8
+                bsa_fwd_helpers.smem_exchange_reduce_store_bf16x32(
+                    Int32((oExchange.iterator + own_warp_base + off).toint()),
+                    Int32((oExchange.iterator + partner_warp_base + off).toint()),
+                    Int32((sO.iterator + sO.layout((out_row, col0))).toint()),
+                    Int32((sO.iterator + sO.layout((out_row, col1))).toint()),
+                    Int32((sO.iterator + sO.layout((out_row, col2))).toint()),
+                    Int32((sO.iterator + sO.layout((out_row, col3))).toint()),
+                )
+                if const_expr(pas == 0):
+                    # Both warps of the pair must be done reading pass 0 before pass 1 overwrites the exchange.
+                    bsa_fwd_helpers.mbar_arrive_and_wait(reduce_mbar_addr, Int32(0))
+        else:
+            exchange_warp_base = corr_warp * 4 * 32 * 32
+            exchange_addr = Int32((oExchange.iterator + exchange_warp_base + lane_idx * 4).toint())
+            if const_expr(self.allow_empty_block_nums):
+                is_zero_output = my_scale0 == Float32(0.0) and my_scale1 == Float32(0.0)
+                # Aligned TMEM loads require converged participation of the entire warp.
+                warp_needs_tmem = cute.arch.vote_ballot_sync(not is_zero_output) != 0
+                if warp_needs_tmem:
+                    bsa_fwd_helpers.tmem_combine_store_exchange_4x32dp32b32x(
+                        Int32(tmem_o0_addr),
+                        Int32(tmem_o1_addr),
+                        exchange_addr,
+                        my_scale0,
+                        my_scale1,
+                    )
+                else:
+                    bsa_fwd_helpers.smem_zero_store_exchange_4x32dp32b32x(exchange_addr)
+            else:
                 bsa_fwd_helpers.tmem_combine_store_exchange_4x32dp32b32x(
                     Int32(tmem_o0_addr),
                     Int32(tmem_o1_addr),
@@ -2688,74 +2813,64 @@ class BlockSparseAttnForwardSm100Blk64:
                     my_scale0,
                     my_scale1,
                 )
-            else:
-                bsa_fwd_helpers.smem_zero_store_exchange_4x32dp32b32x(exchange_addr)
-        else:
-            bsa_fwd_helpers.tmem_combine_store_exchange_4x32dp32b32x(
-                Int32(tmem_o0_addr),
-                Int32(tmem_o1_addr),
-                exchange_addr,
-                my_scale0,
-                my_scale1,
-            )
 
-        bsa_fwd_helpers.mbar_arrive_and_wait(reduce_mbar_addr, Int32(1))
+            bsa_fwd_helpers.mbar_arrive_and_wait(reduce_mbar_addr, Int32(1))
 
-        out_row = (corr_warp & 1) * cute.arch.WARP_SIZE + lane_idx
-        if corr_warp < 2 and out_row < self.m_block_size:
-            own_warp_base = corr_warp * 4 * 32 * 32
-            partner_warp_base = partner_warp * 4 * 32 * 32
-            lane_col_swizzle = lane_idx & 7
-            for c in cutlass.range_constexpr(4):
-                off = c * 32 * 32 + lane_idx * 4
-                col0 = (((c * 4) + 0) ^ lane_col_swizzle) * 8
-                col1 = (((c * 4) + 1) ^ lane_col_swizzle) * 8
-                col2 = (((c * 4) + 2) ^ lane_col_swizzle) * 8
-                col3 = (((c * 4) + 3) ^ lane_col_swizzle) * 8
-                if const_expr(self.o_dtype == Float32):
-                    col0 = (((c * 8) + 0) ^ lane_col_swizzle) * 4
-                    col1 = (((c * 8) + 1) ^ lane_col_swizzle) * 4
-                    col2 = (((c * 8) + 2) ^ lane_col_swizzle) * 4
-                    col3 = (((c * 8) + 3) ^ lane_col_swizzle) * 4
-                    col4 = (((c * 8) + 4) ^ lane_col_swizzle) * 4
-                    col5 = (((c * 8) + 5) ^ lane_col_swizzle) * 4
-                    col6 = (((c * 8) + 6) ^ lane_col_swizzle) * 4
-                    col7 = (((c * 8) + 7) ^ lane_col_swizzle) * 4
-                    bsa_fwd_helpers.smem_exchange_reduce_store_f32x32(
-                        Int32((oExchange.iterator + own_warp_base + off).toint()),
-                        Int32((oExchange.iterator + partner_warp_base + off).toint()),
-                        Int32((sO.iterator + sO.layout((out_row, col0))).toint()),
-                        Int32((sO.iterator + sO.layout((out_row, col1))).toint()),
-                        Int32((sO.iterator + sO.layout((out_row, col2))).toint()),
-                        Int32((sO.iterator + sO.layout((out_row, col3))).toint()),
-                        Int32((sO.iterator + sO.layout((out_row, col4))).toint()),
-                        Int32((sO.iterator + sO.layout((out_row, col5))).toint()),
-                        Int32((sO.iterator + sO.layout((out_row, col6))).toint()),
-                        Int32((sO.iterator + sO.layout((out_row, col7))).toint()),
-                    )
-                else:
-                    if const_expr(self.is_sage_fp8):
-                        bsa_fwd_helpers.smem_exchange_reduce_scale_store_bf16x32(
+            out_row = (corr_warp & 1) * cute.arch.WARP_SIZE + lane_idx
+            if corr_warp < 2 and out_row < self.m_block_size:
+                own_warp_base = corr_warp * 4 * 32 * 32
+                partner_warp_base = partner_warp * 4 * 32 * 32
+                lane_col_swizzle = lane_idx & 7
+                for c in cutlass.range_constexpr(4):
+                    off = c * 32 * 32 + lane_idx * 4
+                    col0 = (((c * 4) + 0) ^ lane_col_swizzle) * 8
+                    col1 = (((c * 4) + 1) ^ lane_col_swizzle) * 8
+                    col2 = (((c * 4) + 2) ^ lane_col_swizzle) * 8
+                    col3 = (((c * 4) + 3) ^ lane_col_swizzle) * 8
+                    if const_expr(self.o_dtype == Float32):
+                        col0 = (((c * 8) + 0) ^ lane_col_swizzle) * 4
+                        col1 = (((c * 8) + 1) ^ lane_col_swizzle) * 4
+                        col2 = (((c * 8) + 2) ^ lane_col_swizzle) * 4
+                        col3 = (((c * 8) + 3) ^ lane_col_swizzle) * 4
+                        col4 = (((c * 8) + 4) ^ lane_col_swizzle) * 4
+                        col5 = (((c * 8) + 5) ^ lane_col_swizzle) * 4
+                        col6 = (((c * 8) + 6) ^ lane_col_swizzle) * 4
+                        col7 = (((c * 8) + 7) ^ lane_col_swizzle) * 4
+                        bsa_fwd_helpers.smem_exchange_reduce_store_f32x32(
                             Int32((oExchange.iterator + own_warp_base + off).toint()),
                             Int32((oExchange.iterator + partner_warp_base + off).toint()),
                             Int32((sO.iterator + sO.layout((out_row, col0))).toint()),
                             Int32((sO.iterator + sO.layout((out_row, col1))).toint()),
                             Int32((sO.iterator + sO.layout((out_row, col2))).toint()),
                             Int32((sO.iterator + sO.layout((out_row, col3))).toint()),
-                            Int32((sVScale.iterator + v_scale_warp_base + sVScale.layout(c * 32 + 0)).toint()),
-                            Int32((sVScale.iterator + v_scale_warp_base + sVScale.layout(c * 32 + 8)).toint()),
-                            Int32((sVScale.iterator + v_scale_warp_base + sVScale.layout(c * 32 + 16)).toint()),
-                            Int32((sVScale.iterator + v_scale_warp_base + sVScale.layout(c * 32 + 24)).toint()),
+                            Int32((sO.iterator + sO.layout((out_row, col4))).toint()),
+                            Int32((sO.iterator + sO.layout((out_row, col5))).toint()),
+                            Int32((sO.iterator + sO.layout((out_row, col6))).toint()),
+                            Int32((sO.iterator + sO.layout((out_row, col7))).toint()),
                         )
                     else:
-                        bsa_fwd_helpers.smem_exchange_reduce_store_bf16x32(
-                            Int32((oExchange.iterator + own_warp_base + off).toint()),
-                            Int32((oExchange.iterator + partner_warp_base + off).toint()),
-                            Int32((sO.iterator + sO.layout((out_row, col0))).toint()),
-                            Int32((sO.iterator + sO.layout((out_row, col1))).toint()),
-                            Int32((sO.iterator + sO.layout((out_row, col2))).toint()),
-                            Int32((sO.iterator + sO.layout((out_row, col3))).toint()),
-                        )
+                        if const_expr(self.is_sage_fp8):
+                            bsa_fwd_helpers.smem_exchange_reduce_scale_store_bf16x32(
+                                Int32((oExchange.iterator + own_warp_base + off).toint()),
+                                Int32((oExchange.iterator + partner_warp_base + off).toint()),
+                                Int32((sO.iterator + sO.layout((out_row, col0))).toint()),
+                                Int32((sO.iterator + sO.layout((out_row, col1))).toint()),
+                                Int32((sO.iterator + sO.layout((out_row, col2))).toint()),
+                                Int32((sO.iterator + sO.layout((out_row, col3))).toint()),
+                                Int32((sVScale.iterator + v_scale_warp_base + sVScale.layout(c * 32 + 0)).toint()),
+                                Int32((sVScale.iterator + v_scale_warp_base + sVScale.layout(c * 32 + 8)).toint()),
+                                Int32((sVScale.iterator + v_scale_warp_base + sVScale.layout(c * 32 + 16)).toint()),
+                                Int32((sVScale.iterator + v_scale_warp_base + sVScale.layout(c * 32 + 24)).toint()),
+                            )
+                        else:
+                            bsa_fwd_helpers.smem_exchange_reduce_store_bf16x32(
+                                Int32((oExchange.iterator + own_warp_base + off).toint()),
+                                Int32((oExchange.iterator + partner_warp_base + off).toint()),
+                                Int32((sO.iterator + sO.layout((out_row, col0))).toint()),
+                                Int32((sO.iterator + sO.layout((out_row, col1))).toint()),
+                                Int32((sO.iterator + sO.layout((out_row, col2))).toint()),
+                                Int32((sO.iterator + sO.layout((out_row, col3))).toint()),
+                            )
 
         cute.arch.fence_view_async_shared()
 
@@ -2926,6 +3041,10 @@ class BlockSparseAttnForwardSm100Blk64:
     @cute.jit
     def kv_smem_stage(self, stage: Int32, offset: Int32) -> Int32:
         if const_expr(self.prefetch_next_query):
+            if const_expr(self.epi_single_stage):
+                # Reversed ring: K0 -> stage 2, K1 -> stage 1, V0 -> stage 0 (the epilogue's stage).
+                rotated = offset - stage
+                return rotated - self.kv_stage if rotated >= self.kv_stage else rotated
             rotated = stage + offset
             return rotated - self.kv_stage if rotated >= self.kv_stage else rotated
         return stage

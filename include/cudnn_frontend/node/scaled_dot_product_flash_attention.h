@@ -2672,6 +2672,32 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
         auto unified_sdpa_operation =
             make_shared_backend_pointer((cudnnBackendDescriptorType_t)CUDNN_BACKEND_OPERATION_SDPA_FWD_DESCRIPTOR);
 
+        // FLOAT is the unified backend's historical default. Only a non-default
+        // request needs the new attribute; old headers/libraries keep working for
+        // FLOAT, and must never silently discard a HALF request.
+        auto const compute_type =
+            attributes.compute_data_type == DataType_t::NOT_SET ? DataType_t::FLOAT : attributes.compute_data_type;
+        RETURN_CUDNN_FRONTEND_ERROR_IF(compute_type != DataType_t::FLOAT && compute_type != DataType_t::HALF,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Unified SDPA accumulation type must be FLOAT or HALF");
+        if (compute_type != DataType_t::FLOAT) {
+#if (CUDNN_VERSION >= 92900)
+            auto compute_type_version_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED,
+                                                      "Unified SDPA compute type requires backend attribute support"};
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92900, compute_type_version_error);
+            cudnnDataType_t backend_compute_type;
+            _CUDNN_CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(compute_type, backend_compute_type));
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
+                                                           CUDNN_ATTR_OPERATION_SDPA_FWD_COMP_TYPE,
+                                                           CUDNN_TYPE_DATA_TYPE,
+                                                           1,
+                                                           &backend_compute_type));
+#else
+            return {error_code_t::GRAPH_NOT_SUPPORTED,
+                    "Unified SDPA compute type requires cuDNN 9.29.0 or newer headers"};
+#endif
+        }
+
         auto Q         = attributes.inputs.find(SDPA_attributes::input_names::Q)->second;
         auto backend_q = tensors[Q->get_uid()]->get_desc()->get_backend_descriptor();
         _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),

@@ -20,16 +20,16 @@ def _require_sm120():
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     if interface._cutlass_dsl_version() < (4, 6, 1):
         pytest.skip("Sage FP8 requires CuTe DSL >= 4.6.1")
-    from cudnn import BSA
+    from cudnn import ops
 
-    return BSA
+    return ops
 
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=120128)
 def test_sm120_fp8_blk128_compile_options_are_scoped_and_cached(monkeypatch):
     """Compiler tuning must neither affect blk64 nor alias an untuned callable."""
-    BSA = _require_sm120()
+    ops = _require_sm120()
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     native = importlib.import_module("cudnn.block_sparse_attention.csrc.fwd.sm120_blk128.bsa_fwd_sm120_fp8")
     from cudnn.block_sparse_attention._fp8_quant import _quantize_sage_bhsd
@@ -87,7 +87,7 @@ def test_sm120_fp8_blk128_compile_options_are_scoped_and_cached(monkeypatch):
         assert torch.equal(actual.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8))
 
     indices64 = torch.zeros((1, 1, 4, 1), device="cuda", dtype=torch.int32)
-    BSA.block_sparse_attention_fp8_forward(q, k, v, indices64, sparse_block_size=64)
+    ops.block_sparse_attention_fp8_forward(q, k, v, indices64, sparse_block_size=64)
     torch.cuda.synchronize()
 
 
@@ -96,7 +96,7 @@ def test_sm120_fp8_blk128_compile_options_are_scoped_and_cached(monkeypatch):
 @pytest.mark.parametrize("tail", (0, 19))
 @torch_fork_set_rng(seed=120128)
 def test_sm120_fp8_native_forward(block_size, tail):
-    BSA = _require_sm120()
+    ops = _require_sm120()
     batch, heads, dim, topk = 1, 2, 128, 3
     sq, sk = 2 * block_size + tail, 5 * block_size + tail
     q = torch.randn((batch, heads, sq, dim), device="cuda", dtype=torch.bfloat16) * 0.5
@@ -108,14 +108,14 @@ def test_sm120_fp8_native_forward(block_size, tail):
     sizes[-1] = sk - (nk - 1) * block_size
     mask = block_sparse_mask(indices, topk, sizes, sq, sk, block_size)
     expected, _ = attention_reference(q, k, v, mask)
-    result = BSA.block_sparse_attention_fp8_forward(q, k, v, indices, sparse_block_size=block_size)
+    result = ops.block_sparse_attention_fp8_forward(q, k, v, indices, sparse_block_size=block_size)
     torch.cuda.synchronize()
     actual = result["o_tensor"]
     assert actual.dtype == torch.bfloat16 and actual.shape == q.shape and actual.is_contiguous()
     difference = (actual.float() - expected).abs()
     if block_size == 128 and tail == 0:
         indices64 = torch.stack((indices * 2, indices * 2 + 1), dim=-1).flatten(-2).repeat_interleave(2, dim=2)
-        baseline = BSA.block_sparse_attention_fp8_forward(q, k, v, indices64)["o_tensor"]
+        baseline = ops.block_sparse_attention_fp8_forward(q, k, v, indices64)["o_tensor"]
         baseline_error = (baseline.float() - expected).abs().mean() / expected.abs().mean()
         assert difference.mean() / expected.abs().mean() <= baseline_error * 1.03 + 1e-4
     assert difference.max().item() < 0.2 * max(expected.abs().max().item(), 1.0)
@@ -256,7 +256,7 @@ def test_sm120_fp8_blk128_v_quantization_rounding():
     values = torch.cat((neighbors, -neighbors, torch.tensor([0.0, -0.0], device="cuda", dtype=torch.bfloat16)))
     scales = torch.linspace(0.73, 1.37, 128, device="cuda").view(1, 128)
     v = values.repeat((128 * 128 + values.numel() - 1) // values.numel())[: 128 * 128].view(1, 1, 128, 128)
-    expected = (v * scales.reciprocal().to(torch.bfloat16)).to(torch.float8_e4m3fn)
+    expected = (v.float() * scales.reciprocal()).to(torch.float8_e4m3fn)
     actual = torch.empty((1, 1, 1, 128, 128), device="cuda", dtype=torch.float8_e4m3fn)
     tensors = tuple(from_dlpack(t.view(-1), assumed_align=16) for t in (v, actual, scales))
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -287,7 +287,7 @@ def test_sm120_fp8_blk128_quantizer_has_no_repack_launch():
 
 @pytest.mark.L0
 def test_sm120_fp8_blk128_never_launches_blk64(monkeypatch):
-    BSA = _require_sm120()
+    ops = _require_sm120()
     old = importlib.import_module("cudnn.block_sparse_attention.csrc.fwd.sm120_blk64.bsa_fwd_sm120_fp8")
     native = importlib.import_module("cudnn.block_sparse_attention.csrc.fwd.sm120_blk128.bsa_fwd_sm120_fp8")
 
@@ -305,20 +305,23 @@ def test_sm120_fp8_blk128_never_launches_blk64(monkeypatch):
     assert 256 * kernel.compute_registers + 128 * kernel.load_registers == 64512
     q = torch.ones((1, 1, 128, 128), device="cuda", dtype=torch.bfloat16)
     indices = torch.zeros((1, 1, 1, 1), device="cuda", dtype=torch.int32)
-    actual = BSA.block_sparse_attention_fp8_forward(q, q, q, indices, sparse_block_size=128)["o_tensor"]
+    actual = ops.block_sparse_attention_fp8_forward(q, q, q, indices, sparse_block_size=128)["o_tensor"]
     torch.testing.assert_close(actual, q, atol=0.01, rtol=0.01)
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize(("arch", "block_size", "error", "message"), ((100, 128, NotImplementedError, "requires SM120"), (120, 32, ValueError, "64 or 128")))
+@pytest.mark.parametrize(
+    ("arch", "block_size", "error", "message"),
+    ((110, 128, NotImplementedError, "requires SM90, SM100/SM103, or SM120"), (120, 32, ValueError, "64 or 128")),
+)
 def test_sm120_fp8_blk128_support_validation(monkeypatch, arch, block_size, error, message):
-    BSA = _require_sm120()
+    ops = _require_sm120()
     api = importlib.import_module("cudnn.block_sparse_attention.api")
     monkeypatch.setattr(api, "_device_arch", lambda tensor: arch)
     q = torch.zeros((1, 1, 128, 128), device="cuda", dtype=torch.bfloat16)
     indices = torch.zeros((1, 1, 1, 1), device="cuda", dtype=torch.int32)
     with pytest.raises(error, match=message):
-        BSA.block_sparse_attention_fp8_forward(q, q, q, indices, sparse_block_size=block_size)
+        ops.block_sparse_attention_fp8_forward(q, q, q, indices, sparse_block_size=block_size)
 
 
 @pytest.mark.L0
@@ -333,14 +336,14 @@ def test_sm120_fp8_blk128_dsl_gate_precedes_quantizer_import(monkeypatch):
 @pytest.mark.L0
 @torch_fork_set_rng(seed=128)
 def test_sm120_fp8_blk128_graph_replay_uses_runtime_metadata(monkeypatch):
-    BSA = _require_sm120()
+    ops = _require_sm120()
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     q = torch.randn((1, 1, 256, 128), device="cuda", dtype=torch.bfloat16) * 0.5
     k, v = torch.randn_like(q), torch.randn_like(q)
     indices = torch.zeros((1, 1, 2, 1), device="cuda", dtype=torch.int32)
 
     def run():
-        return BSA.block_sparse_attention_fp8_forward(q, k, v, indices, sparse_block_size=128)["o_tensor"]
+        return ops.block_sparse_attention_fp8_forward(q, k, v, indices, sparse_block_size=128)["o_tensor"]
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())

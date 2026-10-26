@@ -9,6 +9,31 @@ $\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d}}\right)V$
 using the FlashAttention-2 algorithm as described in the paper [FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning](https://arxiv.org/abs/2307.08691). It is applicable for both training and inference phases, with an option to generate a stats tensor to be used for backwards training computation.
 
 
+## Accumulation type for unified forward SDPA
+
+The existing C++ `SDPA_attributes::set_compute_data_type()` and Python
+`compute_data_type` argument specify the requested accumulation type. An unset
+operation inherits the graph's compute type; if both are unset, unified SDPA
+defaults to `FLOAT`. This is independent of Q/K/V/O storage types: `HALF` or
+`BFLOAT16` tensors do not themselves request reduced-precision accumulation.
+
+```cpp
+auto options = cudnn_frontend::graph::SDPA_attributes()
+    .set_implementation(cudnn_frontend::AttentionImplementation_t::UNIFIED)
+    .set_generate_stats(false)
+    .set_compute_data_type(cudnn_frontend::DataType_t::FLOAT);
+```
+
+cuDNN 9.29.0 and newer expose
+`CUDNN_ATTR_OPERATION_SDPA_FWD_COMP_TYPE`. The frontend forwards non-default
+requests through that attribute, gated on the header version and, for dynamic
+loading, the runtime backend version. `FLOAT` retains compatibility with older
+headers and backends; a `HALF` request requires 9.29.0 or newer.
+The matching backend currently rejects `HALF` at descriptor finalization:
+this change adds precision plumbing, not an FP16-accumulator kernel.
+Other accumulation types are rejected. Softmax reductions and statistics
+remain FP32. Composite SDPA and backward SDPA are unchanged.
+
 ## Support Matrix
 
 cudnn SDPA operation requires SM80 (Ampere) or newer architectures and cuda toolkit 12.x or newer.

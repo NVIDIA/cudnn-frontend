@@ -380,6 +380,7 @@ def grouped_gemm_swiglu_wrapper_sm100(
         return tuple(i for i, s in sorted(enumerate(tensor.stride()), key=lambda x: x[1]))
 
     cache_key = (
+        a_tensor.device,
         use_full_dynamic,
         a_tensor.shape[1:] if not use_full_dynamic else None,
         b_tensor.shape if not use_full_dynamic else None,

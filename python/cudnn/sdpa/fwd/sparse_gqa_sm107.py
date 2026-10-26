@@ -50,6 +50,28 @@ lists (``[B, S_q, top_k]``: row ``j``'s list at its bottom-right position).  ``S
 ``ceil((top_k + 1) / 32)`` (a larger split has an empty chunk on every item); ``list_per_sequence`` needs ``bottom_right`` and
 ``S_q <= 4`` (the shared list's tail covers at most two blocks).
 
+The split combine's FORM is a PLAN-TIME pin on the sparse grid ``(B, H_q, S_q)`` (appended 2026-10-21): the adapter compiles the
+``sm100/split_combine`` entry with ``decode_grid=`` :func:`_sparse_combine_decode_grid` -- the dense adapter's rule
+(``prepared._split_combine_decode_grid``) applied to the sparse launch's combine grid, which reduces the same split-major fp32
+``(B x S, S_q, H_q, D)`` + ``(B x S, H_q, S_q)`` partial slabs the dense entry reads.  On cc 10.7 (the one line the rule was measured
+on): the DECODE-GRID kernel inside the lean-grid bound at a split of at least 8 (``heuristics.decode_combine_grid_selected``: B 1 /
+B 4 x 24 heads at split 8 -- the serving decode cells; flat in the partial count), the LEAN GROUP WALK on a lean-grid-overflow launch at
+a split of at most 4 (``heuristics.decode_combine_lean_walk_selected``: B 32 x 24 heads x S_q 1), the module's own forms otherwise
+(``DECODE_GRID_OFF`` where the rule pins them inside the bound -- B 4 x S_q 4 at split 7, any small grid below split 8 --, the AUTO entry
+past the bound, which is the module's own forms there by construction); off cc 10.7 every launch keeps the module's own forms, as
+before.  A PERFORMANCE pin only (the same function): the output is BITWISE the former entry's up to 16 splits -- the forms share one
+arithmetic there, the combine module's order statement -- and within fp32 rounding past 16 (the decode-grid kernel merges its eight
+chain partials with ``exp(m_c - m)`` factors; the final O rounds once either way).  :meth:`SparseGqaFwdDslSm107.combine_form` reads the
+pinned value back.  ``use_pdl`` (appended, default False) is the programmatic-dependent-launch form of the chain's two launches -- a
+PERFORMANCE knob, the same function bitwise: the sparse core launches with the programmatic-stream-serialization attribute and carries
+its ``griddepcontrol`` sites (every role's wait before its first dependent global read; no explicit release -- the CTA exit triggers the
+dependent grid at the core's completion, the measured placement of the kernel header's PDL SITES paragraph), and the combine's entry
+takes the switch too (``compile_ptr(use_pdl=)``: every form's pair).  THD x
+``use_pdl`` is a typed decline by name (:meth:`SparseGqaFwdDslSm107.check_support`; the text is :func:`pdl_decline_reason`'s, the ONE
+statement of the fact that the gated attention block's declaration-time decline carries too): the packed form reads the setup launch's
+metadata above every role wait (the pre-dispatch dead-CTA exit, the claim-counter scheduler), so a dependent launch of it would read
+what the setup launch has not written yet; the switch's scope is the dense BSHD and paged decode chain.
+
 The device does the work (Rule 3): lengths, counts, dead items and the tail block(s) are derived on device from the position
 and the per-row ``block_lens``; nothing below reads device memory.  ``execute`` validates and launches (Rule 1): no
 conversion, no allocation, the caller's stream.  The kernel needs NO GMEM scratch unless split or THD
@@ -275,12 +297,53 @@ def _paged_pool_geometry(name: str, pool, KH: int, page_size: int) -> Tuple[int,
     return s_page, s_tok, col_head, rows_per_page, rows_per_head
 
 
+def _sparse_combine_decode_grid(b: int, h_q: int, s_q: int, split: int, device_cc) -> int:
+    """The split combine entry's kernel FORM for a sparse plan (``split_combine.DECODE_GRID_AUTO`` / ``DECODE_GRID_OFF`` /
+    ``DECODE_GRID_LEAN_WALK``): a plan-time specialization on the sparse grid ``(B, H_q, S_q)`` -- the REAL query-head count, the
+    rows the combine reduces --, the split and the plan's DEVICE, never a runtime value.  The dense adapter's rule
+    (``prepared._split_combine_decode_grid``) with the device passed explicitly (the sparse adapter records ``device_cc`` or reads
+    its Q tensor's capability): on cc 10.7 a lean-grid-OVERFLOW launch at a split of at most
+    ``heuristics.DECODE_COMBINE_LEAN_WALK_MAX_SPLIT`` names the module's LEAN GROUP WALK (``decode_combine_lean_walk_selected``: B 32 x
+    24 heads x S_q 1 at split <= 4), inside the bound the AUTO entry takes the decode-grid kernel on every sink-free launch and the
+    split-aware rule pins the module's own forms where the two disagree (``decode_combine_force_lean``: a split below 8, or a mid-sized
+    grid below 32 -- B 4 x S_q 4 at split 7), a deeper split past the bound keeps the AUTO entry (= the module's own forms there by
+    construction).  Off cc 10.7 (the Blackwell line keeps the module's own three-way rule, measured on B200 / B300; a line the rules
+    were never measured on likewise) a plan never names the walk and never compiles the AUTO entry inside the bound."""
+    from cudnn.sdpa.fwd.heuristics import decode_combine_force_lean, decode_combine_lean_walk_selected
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine
+
+    cc = (int(device_cc[0]), int(device_cc[1]))
+    if decode_combine_lean_walk_selected(b, h_q, s_q, split, device_cc=cc):
+        return split_combine.DECODE_GRID_LEAN_WALK
+    if decode_combine_force_lean(b, h_q, s_q, split, device_cc=cc):
+        return split_combine.DECODE_GRID_OFF
+    return split_combine.DECODE_GRID_AUTO
+
+
 # The softmax SPLIT's module default: CUDNN_FROST_QSA_SOFTMAX_GROUPS = 0 (unset: the kernel's default = TWO 4-warp column groups of 8
 # columns, 20 warps), 2 (the same, explicit) or 1 (ONE 4-warp group of 16 columns, the pre-split body).  A performance knob -- the same
 # function, bitwise, at either value -- read once at import so a whole test tier renders the other form without an edit; the value
 # travels in TemplateParams (the module-cache key), so no two bodies ever share a compiled-plan key.  An explicit softmax_groups=
 # at construction overrides it.
 SOFTMAX_GROUPS_DEFAULT = int(os.environ.get("CUDNN_FROST_QSA_SOFTMAX_GROUPS", "0") or 0)
+
+
+def pdl_decline_reason(*, thd: bool) -> Optional[str]:
+    """The ONE statement of the kernel fact behind the ``thd`` x ``use_pdl`` decline (``None`` = the composition is served).  The packed form's
+    pre-dispatch dead-CTA exit reads the live-unit total ``meta[4B + 2]`` and its claim-counter scheduler ``meta[4B + 3]`` -- the SETUP launch's
+    device values, written by the kernel launched right before the main one on the same stream -- above every role's dependent-grid wait (the
+    kernel header's PDL SITES paragraph), so a dependent launch of the THD rendering would read what the setup launch has not written yet, and
+    a wait above the exit would serialize every CTA behind the predecessor anyway.  :meth:`SparseGqaFwdDslSm107.check_support` raises this
+    text; the gated attention block raises the same text at declaration (``thd=True`` on a ``QsaSpec`` geometry with ``use_pdl=True``) -- one
+    source, pinned equal by both suites, so neither site drifts alone when the kernel's PDL scope moves."""
+    if not thd:
+        return None
+    return (
+        "thd=True with use_pdl=True is not served -- the packed form reads the setup launch's metadata (the live-unit total and the claim "
+        "counter) in its pre-dispatch dead-CTA exit and in its scheduler, above every role's dependent-grid wait, so a dependent launch of it "
+        "would read what the setup launch has not written yet; the programmatic-dependent-launch scope is the dense BSHD and paged decode "
+        "chain -- declare use_pdl=False"
+    )
 
 
 class SparseGqaFwdDslSm107:
@@ -324,8 +387,15 @@ class SparseGqaFwdDslSm107:
         cu_seq_kv_lens: bool = False,
         workspace=None,
         softmax_groups: int = 0,
+        use_pdl: bool = False,
     ):
         self.q, self.k, self.v, self.o, self.lse = q, k, v, o, lse
+        # Programmatic dependent launch (appended 2026-10-21; a PERFORMANCE knob of the chain's two launches -- the same function, bitwise):
+        # the launch attribute plus the griddepcontrol sites in both kernels it reaches -- the sparse core (compile(use_pdl=): every role's
+        # wait before its first dependent global read; no explicit release, the CTA exit triggers the dependent at the core's completion)
+        # and the split combine's entry
+        # (compile_ptr(use_pdl=), every form's pair).  THD x use_pdl is check_support's typed decline (knob honoured or ineligible).
+        self.use_pdl = bool(use_pdl)
         # The softmax SPLIT (appended; a PERFORMANCE knob of the kernel's softmax role, the same function bitwise): 0 = the module
         # default SOFTMAX_GROUPS_DEFAULT (itself 0 = the kernel's two 4-warp column groups), 1 / 2 explicit -- compiled in as
         # TemplateParams.qsa_softmax_groups (the module-cache key: the two renderings never share a compiled artifact).
@@ -372,6 +442,7 @@ class SparseGqaFwdDslSm107:
         self._fns = {}  # {has_block_lens: compiled fn} -- both variants may coexist (compile(has_block_lens=))
         self._combine = None  # split_kv > 1: the split combine's positional entry (+ its owner, kept alive)
         self._combine_owner = None
+        self._combine_form = None  # split_kv > 1: the split_combine.DECODE_GRID_* value the combine entry was compiled with (combine_form())
         self._module = None
         self._B = self._SQ = self._SKV = self._H = self._KH = self._G = 0
         self._NSEQ = 0  # THD: the number of sequences (the lens tensors' shape); == _B on a dense batch
@@ -440,6 +511,14 @@ class SparseGqaFwdDslSm107:
                 f"sparse d256 forward (sm107): softmax_groups must be 0 (the kernel default), 1 (one 4-warp column group) or 2 (the softmax split: two "
                 f"4-warp groups of 8 columns); got {self.softmax_groups}"
             )
+        if self.use_pdl and self.thd:
+            # The packed form's ONE global read above every role's dependent-grid wait: the pre-dispatch dead-CTA exit reads the live-unit
+            # total meta[4B + 2] (and the claim-counter scheduler meta[4B + 3]) -- the SETUP launch's device values, written by the kernel
+            # launched right before the main one on the same stream.  A dependent launch of the THD rendering would read them before that
+            # launch wrote them (the kernel header's PDL SITES paragraph), and a wait above the exit would serialize every CTA behind the
+            # predecessor anyway -- so the composition is declined by name; the dense BSHD and paged chains carry the sites.  The text is
+            # `pdl_decline_reason`'s: ONE statement for this site and for the gated attention block's declaration-time decline.
+            raise NotImplementedError(f"sparse d256 forward (sm107): {pdl_decline_reason(thd=True)}")
         if self.thd:
             for name, requested in (("split_kv", self.split_kv > 1), ("list_per_sequence", self.list_per_sequence), ("bottom_right", self.bottom_right)):
                 if requested:
@@ -756,6 +835,18 @@ class SparseGqaFwdDslSm107:
             qsa_softmax_groups=self.softmax_groups,
         )
 
+    def combine_form(self) -> int:
+        """The split combine entry's kernel FORM this plan compiles (``split_combine.DECODE_GRID_AUTO`` / ``DECODE_GRID_OFF`` /
+        ``DECODE_GRID_LEAN_WALK``): :func:`_sparse_combine_decode_grid` on the declared ``(B, H_q, S_q)``, the split and the device --
+        a plan-time fact, read after ``check_support`` (which it runs when needed); ``DECODE_GRID_OFF`` unsplit (no combine launch)."""
+        from cudnn.sdpa.fwd.kernels.sm100 import split_combine
+
+        if not self._G:
+            self.check_support()
+        if self.split_kv <= 1:
+            return split_combine.DECODE_GRID_OFF
+        return _sparse_combine_decode_grid(self._B, self._H, self._SQ, self.split_kv, self._device_cc())
+
     def compile(self, has_block_lens: Optional[bool] = None):
         """Load the template for this specialization and compile its pointer ABI (one artifact per (dtype, group, top_k,
         KV-lens presence, LSE presence, block_lens presence)).
@@ -791,25 +882,37 @@ class SparseGqaFwdDslSm107:
         # Their outer functools.lru_cache keys only on arguments. Bypass it so compiled_cache's device/context-aware memo
         # owns reuse: the same specialization compiled by another plan on another GPU is a different launchable.
         compile_kernel = getattr(self._module.compile, "__wrapped__", self._module.compile)
-        fn = compile_kernel(has_lse=(self.lse is not None) or self.split_kv > 1, has_block_lens=has_block_lens)
+        # use_pdl: the programmatic-dependent-launch rendering of the core (its launch attribute + griddepcontrol sites; in the compile key)
+        fn = compile_kernel(has_lse=(self.lse is not None) or self.split_kv > 1, has_block_lens=has_block_lens, use_pdl=self.use_pdl)
         self._fns[has_block_lens] = fn
         if has_block_lens == (self.block_lens is not None):
             self._fn = fn
         if self.split_kv > 1 and self._combine is None:
             # The split combine (sm100/split_combine.py): fp32 partials -> the caller's O dtype, ONE rounding; the gate, when
-            # declared, applied to the fp32 merged value (QI01's gate-in-combine entry).  Compiled at plan time like the kernel.
+            # declared, applied to the fp32 merged value (QI01's gate-in-combine entry).  Compiled at plan time like the kernel, with
+            # the kernel FORM pinned per plan (combine_form(): the decode-grid kernel / the lean group walk / the module's own forms on
+            # the sparse grid (B, H_q, S_q) at this split on this device -- the dense adapter's rule) and the programmatic-dependent-
+            # launch switch (use_pdl: every form of the entry carries the griddepcontrol pair; a typed decline above until the core does).
             from cudnn.frost.compiled_cache import positional_entry
             from cudnn.sdpa.fwd.kernels.sm100 import split_combine
 
             tag = "bf16" if self._dtype_code == 2 else "f16"
+            form = self.combine_form()
             compile_combine = getattr(split_combine.compile_ptr, "__wrapped__", split_combine.compile_ptr)
             owner = compile_combine(
-                dtype_o=tag, dtype_partial="f32", has_lse=True, stats_log2=False, gate=self.gate is not None, dtype_gate=tag if self.gate is not None else None
+                dtype_o=tag,
+                dtype_partial="f32",
+                has_lse=True,
+                stats_log2=False,
+                gate=self.gate is not None,
+                dtype_gate=tag if self.gate is not None else None,
+                decode_grid=form,
+                use_pdl=self.use_pdl,
             )
             entry = positional_entry(owner)
             if entry is None:
                 raise RuntimeError("sparse d256 forward (sm107): the split combine artifact exposes no positional tvm-ffi entry")
-            self._combine_owner, self._combine = owner, entry
+            self._combine_owner, self._combine, self._combine_form = owner, entry, form
         return fn
 
     def _bind(self, name: str, given, declared, *, required: bool):

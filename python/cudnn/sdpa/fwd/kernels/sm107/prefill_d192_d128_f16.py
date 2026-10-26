@@ -287,6 +287,8 @@ _split_h = make_split_helpers(
     dispatch_decode_payload=_dispatch_decode_payload,
 )
 SPLIT_KV = _split_h.SPLIT_KV
+# Split partials exclude the sink; the shared combine folds it exactly once.
+FOLD_SINK = CFG.HAS_SINK and SPLIT_KV == 1
 _FP32_PARTIALS = SPLIT_KV > 1
 MAY_BE_EMPTY = _split_h.MAY_BE_EMPTY
 _decode_initial_split = _split_h.decode_initial_split
@@ -1908,7 +1910,7 @@ def _correction_warp_group(
             # With sinks: fold the lift-the-max rescale into threshold_beta so O is scaled by scale/new_sum in one FMUL.
             LN2 = cutlass.Float32(0.6931471805599453)
             total_max_nat = total_max_scaled * LN2
-            if cutlass.const_expr(CFG.HAS_SINK):
+            if cutlass.const_expr(FOLD_SINK):
                 sinks_arr = cutlass.make_array_view(sinks_tensor)
                 sink_logit = sinks_arr[head_idx]
                 new_max = cute.math.max(total_max_nat, sink_logit)
@@ -1951,7 +1953,7 @@ def _correction_warp_group(
                 if cutlass.const_expr(CFG.MASK_FLAGS & MASK_SWA):
                     _first_k = cute.math.max(_first_k, q_row_global + _diag - cutlass.Int32(CFG.WINDOW_LEFT))
                 _kv_empty = _kv_empty | (_first_k > _last_k)
-            if cutlass.const_expr(not CFG.HAS_SINK):
+            if cutlass.const_expr(not FOLD_SINK):
                 # A sink leaves real mass and the branch above already yields
                 # LSE = sink_logit there; without one an empty row is -inf.
                 lse_val = cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(float("-inf")).ir_value(), lse_val.ir_value()))

@@ -11,6 +11,7 @@ from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
 
 from cudnn.tensor_adapter import get_compute_capability
+from ..utils.kernel_utils import warp_prefix_sum
 
 
 @lru_cache(maxsize=None)
@@ -27,7 +28,9 @@ class BucketedK2QCsrUniversal:
         bucket_size_blocks: int,
         has_variable_block_nums: bool,
         max_kv_blocks: int,
+        parallel_offsets: bool = False,
     ):
+        self.parallel_offsets = parallel_offsets
         self.block_sparse_num = block_sparse_num
         self.bucket_size_blocks = bucket_size_blocks
         self.has_variable_block_nums = has_variable_block_nums
@@ -90,7 +93,7 @@ class BucketedK2QCsrUniversal:
             mGroupTotals,
         ).launch(
             grid=group_grid,
-            block=(1, 1, 1),
+            block=(32 if self.parallel_offsets else 1, 1, 1),
             stream=stream,
         )
         self._finalize_offsets_kernel(
@@ -100,7 +103,7 @@ class BucketedK2QCsrUniversal:
             mCursors,
         ).launch(
             grid=group_grid,
-            block=(1, 1, 1),
+            block=(32 if self.parallel_offsets else 1, 1, 1),
             stream=stream,
         )
 
@@ -164,11 +167,27 @@ class BucketedK2QCsrUniversal:
         q_group_idx, head_idx, batch_idx = cute.arch.block_idx()
         num_kv_blocks = mCounts.shape[3]
         running = Int32(0)
-        for kv_block_idx in cutlass.range(num_kv_blocks, unroll=1):
-            mLocalOffsets[batch_idx, head_idx, q_group_idx, kv_block_idx] = running
-            running += mCounts[batch_idx, head_idx, q_group_idx, kv_block_idx]
-        mLocalOffsets[batch_idx, head_idx, q_group_idx, num_kv_blocks] = running
-        mGroupTotals[batch_idx, head_idx, q_group_idx] = running
+        if const_expr(self.parallel_offsets):
+            lane, _, _ = cute.arch.thread_idx()
+            for tile in cutlass.range(cute.ceil_div(num_kv_blocks, 32), unroll=1):
+                kv_block_idx = tile * 32 + lane
+                value = Int32(0)
+                if kv_block_idx < num_kv_blocks:
+                    value = mCounts[batch_idx, head_idx, q_group_idx, kv_block_idx]
+                # All lanes participate, including zero-filled tail lanes.
+                inclusive = warp_prefix_sum(value, lane)
+                if kv_block_idx < num_kv_blocks:
+                    mLocalOffsets[batch_idx, head_idx, q_group_idx, kv_block_idx] = running + inclusive - value
+                running += cute.arch.shuffle_sync(inclusive, 31)
+            if lane == 0:
+                mLocalOffsets[batch_idx, head_idx, q_group_idx, num_kv_blocks] = running
+                mGroupTotals[batch_idx, head_idx, q_group_idx] = running
+        else:
+            for kv_block_idx in cutlass.range(num_kv_blocks, unroll=1):
+                mLocalOffsets[batch_idx, head_idx, q_group_idx, kv_block_idx] = running
+                running += mCounts[batch_idx, head_idx, q_group_idx, kv_block_idx]
+            mLocalOffsets[batch_idx, head_idx, q_group_idx, num_kv_blocks] = running
+            mGroupTotals[batch_idx, head_idx, q_group_idx] = running
 
     @cute.kernel
     def _finalize_offsets_kernel(
@@ -185,11 +204,14 @@ class BucketedK2QCsrUniversal:
         for previous_group_idx in cutlass.range(q_group_idx, unroll=1):
             group_base += mGroupTotals[batch_idx, head_idx, previous_group_idx]
 
-        for kv_block_idx in cutlass.range(num_kv_blocks, unroll=1):
+        lane, _, _ = cute.arch.thread_idx()
+        stride = 32 if const_expr(self.parallel_offsets) else 1
+        for kv_block_idx in cutlass.range(lane, num_kv_blocks, stride, unroll=1):
             offset = group_base + mLocalOffsets[batch_idx, head_idx, q_group_idx, kv_block_idx]
             mBucketedK2qOffsets[batch_idx, head_idx, q_group_idx, kv_block_idx] = offset
             mCursors[batch_idx, head_idx, q_group_idx, kv_block_idx] = offset
-        mBucketedK2qOffsets[batch_idx, head_idx, q_group_idx, num_kv_blocks] = group_base + mLocalOffsets[batch_idx, head_idx, q_group_idx, num_kv_blocks]
+        if lane == 0:
+            mBucketedK2qOffsets[batch_idx, head_idx, q_group_idx, num_kv_blocks] = group_base + mLocalOffsets[batch_idx, head_idx, q_group_idx, num_kv_blocks]
 
     @cute.kernel
     def _scatter_q_indices_kernel(
@@ -238,6 +260,7 @@ def _bucketed_k2q_csr_compile_key(
     bucket_size_blocks: int,
     has_variable_block_nums: bool,
     max_kv_blocks: int,
+    parallel_offsets: bool = False,
 ) -> tuple:
     """Return only the configuration that changes generated device code."""
     edge_width = max_kv_blocks if has_variable_block_nums else block_sparse_num
@@ -246,6 +269,7 @@ def _bucketed_k2q_csr_compile_key(
         int(bucket_size_blocks),
         bool(has_variable_block_nums),
         int(edge_width),
+        bool(parallel_offsets),
     )
 
 
@@ -264,6 +288,7 @@ def build_bucketed_k2q_csr_cutedsl(
     *,
     bucket_size_blocks: int,
     q2k_block_nums: Optional["torch.Tensor"] = None,
+    parallel_offsets: bool = False,
 ) -> Tuple["torch.Tensor", "torch.Tensor", int, int]:
     """Build bucketed K-to-Q CSR metadata with CuTe DSL kernels."""
     import torch
@@ -336,6 +361,7 @@ def build_bucketed_k2q_csr_cutedsl(
         bucket_size_blocks,
         has_variable_block_nums,
         max_kv_blocks,
+        parallel_offsets,
     )
     if compile_key not in build_bucketed_k2q_csr_cutedsl.compile_cache:
         kernel = BucketedK2QCsrUniversal(
@@ -343,6 +369,7 @@ def build_bucketed_k2q_csr_cutedsl(
             int(bucket_size_blocks),
             has_variable_block_nums,
             max_kv_blocks,
+            parallel_offsets,
         )
         build_bucketed_k2q_csr_cutedsl.compile_cache[compile_key] = cute.compile(
             kernel,

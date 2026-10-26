@@ -680,9 +680,8 @@ only to decline is why `closed_under` existed.
 - A missing or too-old DSL is a DECLINE at `check_support()`, probed without
   executing the module (`importlib.util.find_spec`, `importlib.metadata`).
   `CUTEDSL_MIN_VERSION` in `frost/buffers.py` is the floor these engines want;
-  `pyproject`'s required dependency deliberately sits below it (`>=4.6.2`),
-  since pinning that high would make cudnn-frontend incompatible with anything
-  holding the DSL back.
+  `pyproject` requires `>=4.8.0`. The runtime checks still protect environments
+  that bypass dependency resolution and kernels with newer API requirements.
 - `test/python/core/test_import_boundaries.py` holds all of this, in a fresh
   interpreter, measuring the delta against an empty one.
 
@@ -901,9 +900,12 @@ records as `FROST_SOURCE_DIGEST`, joined with the function's name and its
 arguments, which pin shapes, strides and flags the way the params pin dtypes
 and masks (SDPA + GEMM suites: 5867 tests, 53:06 cold, 2:53 warm). An
 argument that is not a plain value (a tensor, a device, a stream) makes the
-key None and the call compiles as before. Not cached: the linear-attention
-templates (their `compile()` takes traced tensors) and the SDPA adapters'
-helper kernels in `api_dsl`, which compile from real tensors at call time. A
+key None and the call compiles as before. The GDN/GDP warmup forwards and GDN2/KDA uncut and piece-chain forwards
+also use this cache, with their existing static specialization tuples as keys.
+Those tuples include dtype, rank/layout specialization, device, schedule and
+gate/state flags; packed token totals remain dynamic. Other linear-attention
+compilers and the SDPA adapters'
+helper kernels in `api_dsl` still compile without persistent artifacts. A
 hit is the same object a miss produced, so the reloaded kernel is called
 exactly as the in-process one.
 
@@ -926,6 +928,16 @@ artifact can never be reused by accident:
   yields a loadable entry without its key.
 - **Anything doubtful is a miss**: missing, malformed, mismatched, or an
   object `load_module` refuses (an arch the device cannot run). Never an error.
+- **Concurrent cold callers share a compilation on POSIX.** A cache miss takes
+  an advisory lock for its environment and artifact key, then checks the cache
+  again before compiling. Different keys can compile concurrently; cache hits
+  do not acquire the lock. The OS releases it when a compiler exits, including
+  after a crash. If locking is unavailable, compilation and best-effort export
+  continue without deduplication. Empty lock files live in `<root>/.locks/`,
+  outside the prunable environments, and are retained to keep one stable lock
+  inode per key while other processes may be waiting. Do not unlink them while
+  the cache is in use. Filesystems must support POSIX advisory locking to
+  deduplicate callers sharing that cache.
 - **A hit and a miss run the same thing.** A reloaded tvm-ffi function is
   positional-only, so it is wrapped with the kwargs wrapper the DSL itself
   uses, rebuilt from the RUNTIME spec the record carries (`arg_names`,
@@ -935,8 +947,10 @@ artifact can never be reused by accident:
   after a constexpr one (the fp8 SDPA kernels have one). The miss path
   exports and then reloads, so a bad artifact fails at build time, not at the
   next start-up. Kernels whose in-process object converts raw pointer
-  arguments, takes a dataclass argument, or has a default JSON cannot carry
-  are not persisted.
+  arguments, takes a runtime dataclass argument, or has a default JSON cannot
+  carry are not persisted. Constexpr dataclasses are exportable when the DSL
+  executor can establish that they are absent from the runtime arguments; their
+  configuration must still be part of the caller's specialization key.
 - **One object per kernel per process.** In front of the files sits an
   in-process memo keyed by the device a build targets, the live CUDA device the
   compile is issued under (the DSL ties a compiled object's executor to a device
@@ -957,7 +971,7 @@ artifact can never be reused by accident:
   `$XDG_CACHE_HOME/cudnn_frontend/compiled_plans`; `set_cache_dir()` for a
   caller that owns a workspace (FlashInfer); `CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1`
   turns it off; `stats()` reports hits / misses / bypassed / invalid / pruned /
-  memo_hits per process. Bump `_SCHEMA` on any incompatible change.
+  memo_hits / seeded / seed_rejected per process. Bump `_SCHEMA` on any incompatible change.
 - **Dead environments are retired.** The manifest hashes the package's source,
   so every edited checkout and every CI commit mints an environment directory
   that will never be hit again — a few hundred MB per commit on a runner with a
@@ -970,9 +984,43 @@ artifact can never be reused by accident:
   is a backstop, not a policy.
 
 Not yet routed: kernels compiled from real tensors at call time (the
-linear-attention `chunk_*` launchers, the SDPA adapters' `_dot_fn` /
+remaining linear-attention `chunk_*` launchers, the SDPA adapters' `_dot_fn` /
 `_reduce_fn` / `_setup_fn` helpers): a key for them has to spell the traced
 tensors' dtype, rank and dynamic marks; same hook once it does.
+
+### Serializing a python-engine plan
+
+`serialize()` / `deserialize()` keep their classic signatures and follow the
+SELECTED plan. A backend plan is the cuDNN backend's blob, as before. A python
+engine's plan is not a blob: it is a deterministic function of the graph and its
+`(engine_id, knobs)`, the pair `create_execution_plan` replays. So its blob
+(`cudnn._plan_serdes`, magic `CUDNN_FE_PYPLAN`) carries:
+
+- **the graph**: every node and tensor of the IR, tensors by uid. A value the
+  format cannot represent exactly (a `score_mod` callback, a framework object)
+  refuses serialization; nothing is dropped. Buffers bound at build time
+  (`_data_bindings`) are not carried; pass them to `execute()`.
+- **the plan**: engine id, engine name (checked on load) and public knobs. Ids
+  and knob values are append-only, so the recipe stays valid on any frontend
+  that still ships the engine.
+- **the kernels** (`include_kernels=True`, the default): the compiled-cache
+  entries the plan's build used (`compiled_cache.record_entries()` around
+  `build_plan`), each with the environment manifest it was compiled under.
+
+`pygraph().deserialize(blob)` rebuilds the IR into an empty graph, installs each
+kernel with `compiled_cache.seed_entry` **only when its manifest equals this
+process's exactly** (the same identity as the cache directory, so a stale
+object is never loaded), then replays `create_execution_plan`, pins it and
+builds it: `compile_cached` hits the seeded entries and still checks each
+record's key. A refused or missing kernel compiles as usual;
+`enforce_precompiled=True` raises instead. Measured on B200 (bf16 SDPA prefill
+b2 h8 s1024 d128): build 3.1 s; deserialize into another process with an
+empty cache 33 ms, with imports already done (a backend plan takes 23-30 ms).
+3 kernels seeded, zero compiles, O bitwise equal.
+
+The kernels are native code: deserialize only blobs from a trusted source. The
+C++ `Graph::deserialize` does not read this format. Running a python-engine
+plan from C++ is a separate problem: the engine's host logic is Python.
 
 ## Key invariants
 

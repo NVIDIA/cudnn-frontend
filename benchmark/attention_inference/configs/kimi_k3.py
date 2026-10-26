@@ -54,5 +54,9 @@ CONFIG = InferenceBenchmarkConfig(
     # (128k) covers the throughput story (B300-measured).
     generation_batch_sizes=[1, 128],
     page_size=32,
-    backends=["cudnn", "cudnn_oss"],
+    backends=["cudnn", "cudnn_oss", "cudnn_auto"],
+    # cudnn legs: also the serving form (paged K/V, per-request lengths, THD prefill), and decode batches whose caches
+    # differ in length (each request at 25-100% of kv_len)
+    kv_layouts=["dense", "paged"],
+    kv_min_fills=[1.0, 0.25],
 )

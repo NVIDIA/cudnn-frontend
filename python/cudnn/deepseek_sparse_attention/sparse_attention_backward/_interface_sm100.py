@@ -12,17 +12,18 @@ import cutlass.cute as cute
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import device_capability as _device_capability, resolve_stream
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
-from cudnn.frost.buffers import memset_zero_async
+from cudnn.frost.buffers import cutedsl_requirement_error, memset_zero_async
 from ._interface_sm100_common import (
     _BLACKWELL_CAPABILITIES,
     _align_workspace_bytes,
+    _requires_wide_data_addressing,
     _workspace_shapes_sm100,
     flash_attn_bwd_sm100_workspace_size,
 )
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 from .dsa_bwd_sm100_deterministic import (
     FlashAttentionDSABackwardSm100Deterministic,
-    _deterministic_kernel_class_for_shards,
+    _deterministic_kernel_class_for_config,
     deterministic_kernel_class,
 )
 
@@ -104,8 +105,9 @@ def _select_sm100_backend(
     selected only for the Blackwell SM100/SM103 BF16 envelopes validated by
     their kernels (H128 D512, and contiguous H96/H128 D576 with D_v512); every other
     supported configuration retains the established backend.
-    Deterministic H96/H128 D576 execution uses the two-CTA Tensor Core kernel;
-    other deterministic envelopes use the established generic M64 kernel.
+    H96/H128 D576 execution uses the two-CTA Tensor Core kernel inside the
+    validated envelope; other deterministic envelopes use the established
+    generic M64 kernel.
     """
     if (
         device_capability in _BLACKWELL_CAPABILITIES
@@ -130,8 +132,7 @@ def _select_sm100_backend(
         # contiguous inputs; strided inputs keep the generic path below.
         return "h128_d576_2cta_m64", 64
     if (
-        deterministic
-        and device_capability in _BLACKWELL_CAPABILITIES
+        device_capability in _BLACKWELL_CAPABILITIES
         and dtype == torch.bfloat16
         and num_heads == 96
         and head_dim == 576
@@ -141,8 +142,8 @@ def _select_sm100_backend(
     ):
         return "h96_d576_2cta_m64", 64
     if num_heads == 96 and head_dim == 576:
-        # Ordinary execution and deterministic configurations outside the
-        # native two-CTA envelope compose H64 with the tuned H32 tail.
+        # Unsupported H96 layouts, top-k widths, and devices compose H64 with
+        # the tuned H32 tail.
         return "h96_h64_h32", 64
     if deterministic:
         return "generic_m64", 64
@@ -155,7 +156,14 @@ def _select_sm100_backend(
     return "generic_m64", 64
 
 
-def _get_sm100_kernel_class(backend: str, deterministic: bool = False, total_s_q: Optional[int] = None):
+def _get_sm100_kernel_class(
+    backend: str,
+    deterministic: bool = False,
+    total_s_q: Optional[int] = None,
+    total_s_kv: Optional[int] = None,
+    head_dim: Optional[int] = None,
+    num_heads: int = 64,
+):
     """Load the selected implementation without perturbing other variants.
 
     Each variant lives in its own CuTe DSL class: embedding variant
@@ -183,9 +191,14 @@ def _get_sm100_kernel_class(backend: str, deterministic: bool = False, total_s_q
 
         return FlashAttentionDSABackwardSm100H96Deterministic if deterministic else FlashAttentionDSABackwardSm100H96
     if deterministic:
-        if total_s_q is None:
-            raise ValueError("deterministic SM100 kernel selection requires total_s_q")
-        return deterministic_kernel_class(total_s_q)
+        if total_s_q is None or total_s_kv is None or head_dim is None:
+            raise ValueError("deterministic SM100 kernel selection requires total_s_q, total_s_kv, and head_dim")
+        kernel_cls = deterministic_kernel_class(total_s_q, total_s_kv, head_dim, num_heads)
+        if getattr(kernel_cls, "dkv_relay_cluster_size", 1) > 1:
+            dsl_error = cutedsl_requirement_error("deterministic DSA backward cluster relay")
+            if dsl_error is not None:
+                raise RuntimeError(dsl_error)
+        return kernel_cls
     return FlashAttentionDSABackwardSm100
 
 
@@ -197,6 +210,15 @@ def _fake_compact_tensor(dtype, shape, alignment=16):
         stride_order=tuple(reversed(range(len(shape)))),
         assumed_align=alignment,
     )
+
+
+def _fake_runtime_tensor(dtype, rank, *, divisibility=1, alignment=16):
+    """Mirror the dynamic DLPack tensor type rebound by the plan executor."""
+    shape = [cute.sym_int() for _ in range(rank)]
+    if divisibility != 1:
+        shape[-1] = cute.sym_int(divisibility=divisibility)
+    stride = [cute.sym_int64(divisibility=divisibility) for _ in range(rank - 1)] + [1]
+    return cute.runtime.make_fake_tensor(dtype, tuple(shape), tuple(stride), assumed_align=alignment)
 
 
 def _compile_sm100_artifact(
@@ -212,18 +234,41 @@ def _compile_sm100_artifact(
     kernel_cls,
     block_tile: int,
     dkv_planes: int,
+    wide_addressing: bool,
 ):
     """Build an SM100 launchable from tensor metadata without allocating storage."""
     total_s_q, total_s_kv = cute.sym_int(), cute.sym_int()
-    q = _fake_compact_tensor(element_dtype, (total_s_q, num_heads, head_dim))
-    kv = _fake_compact_tensor(element_dtype, (total_s_kv, head_dim))
-    out = _fake_compact_tensor(element_dtype, (total_s_q, num_heads, head_dim_v))
-    lse = _fake_compact_tensor(cutlass.Float32, (total_s_q, num_heads), alignment=8)
-    sink = _fake_compact_tensor(cutlass.Float32, (num_heads,))
-    indices = _fake_compact_tensor(cutlass.Int32, (total_s_q, max_topk))
-    lengths = _fake_compact_tensor(cutlass.Int32, (total_s_q,), alignment=4) if has_topk_length else None
-    workspace_lse = _fake_compact_tensor(cutlass.Uint8, (1, num_heads, cute.sym_int(), 8))
-    workspace_dkv = _fake_compact_tensor(cutlass.Uint8, (1, dkv_planes, cute.sym_int(), head_dim * 4))
+    if wide_addressing:
+        q = _fake_runtime_tensor(element_dtype, 3, divisibility=head_dim)
+        kv = _fake_runtime_tensor(element_dtype, 2, divisibility=head_dim)
+        out = _fake_runtime_tensor(element_dtype, 3, divisibility=head_dim_v)
+        dout = _fake_runtime_tensor(element_dtype, 3, divisibility=head_dim_v)
+        lse = _fake_runtime_tensor(cutlass.Float32, 2, alignment=8)
+        sink = _fake_runtime_tensor(cutlass.Float32, 1)
+        lengths = _fake_runtime_tensor(cutlass.Int32, 1, alignment=4) if has_topk_length else None
+        dq = _fake_runtime_tensor(element_dtype, 3, divisibility=head_dim)
+        dkv = _fake_runtime_tensor(element_dtype, 2, divisibility=head_dim)
+        d_sink = _fake_runtime_tensor(cutlass.Float32, 1)
+        workspace_lse = _fake_runtime_tensor(cutlass.Uint8, 4)
+        workspace_dkv = _fake_runtime_tensor(cutlass.Uint8, 4)
+        indices = cute.runtime.make_fake_tensor(
+            cutlass.Int32,
+            (cute.sym_int(), max_topk),
+            (cute.sym_int64(divisibility=max(max_topk, 1)), 1),
+            assumed_align=16,
+        )
+    else:
+        q = _fake_compact_tensor(element_dtype, (total_s_q, num_heads, head_dim))
+        kv = _fake_compact_tensor(element_dtype, (total_s_kv, head_dim))
+        out = _fake_compact_tensor(element_dtype, (total_s_q, num_heads, head_dim_v))
+        dout = out
+        lse = _fake_compact_tensor(cutlass.Float32, (total_s_q, num_heads), alignment=8)
+        sink = _fake_compact_tensor(cutlass.Float32, (num_heads,))
+        lengths = _fake_compact_tensor(cutlass.Int32, (total_s_q,), alignment=4) if has_topk_length else None
+        dq, dkv, d_sink = q, kv, sink
+        workspace_lse = _fake_compact_tensor(cutlass.Uint8, (1, num_heads, cute.sym_int(), 8))
+        workspace_dkv = _fake_compact_tensor(cutlass.Uint8, (1, dkv_planes, cute.sym_int(), head_dim * 4))
+        indices = _fake_compact_tensor(cutlass.Int32, (total_s_q, max_topk))
     problem_shape = (
         cutlass.Int32(1),
         cutlass.Int32(1),
@@ -244,14 +289,14 @@ def _compile_sm100_artifact(
             q,
             kv,
             out,
-            out,
+            dout,
             lse,
             sink,
             indices,
             lengths,
-            q,
-            kv,
-            sink,
+            dq,
+            dkv,
+            d_sink,
             workspace_lse,
             workspace_dkv,
             cutlass.Float32(1.0),
@@ -272,11 +317,14 @@ def _compile_deterministic_sm100(
     max_topk: int,
     has_topk_length: bool,
     deterministic_shards: int,
+    deterministic_relay_cluster_size: int,
+    wide_addressing: bool = False,
 ):
     """Compile one device-owned, shape-dynamic artifact from plan metadata.
 
     Query and KV extents remain symbolic, while dtype, head geometry, top-k
-    width, optional-length presence, and shard count are compile-time facts.
+    width, optional-length presence, plane count, relay width, and address
+    width are compile-time facts.
     The returned launchable belongs to ``device_index``'s CUDA context and may
     be reused only for plans with the same cached signature.
     """
@@ -286,12 +334,17 @@ def _compile_deterministic_sm100(
         raise ValueError(f"unsupported deterministic SM100 dtype {dtype}")
 
     if backend == "generic_m64":
-        kernel_cls = _deterministic_kernel_class_for_shards(deterministic_shards)
+        kernel_cls = _deterministic_kernel_class_for_config(deterministic_shards, deterministic_relay_cluster_size)
     else:
         kernel_cls = _get_sm100_kernel_class(backend, True)
         required_shards = kernel_cls.num_dkv_shards
+        required_relay_cluster_size = getattr(kernel_cls, "dkv_relay_cluster_size", 1)
         if required_shards != deterministic_shards:
             raise ValueError(f"deterministic backend {backend!r} requires {required_shards} workspace planes, got {deterministic_shards}")
+        if required_relay_cluster_size != deterministic_relay_cluster_size:
+            raise ValueError(
+                f"deterministic backend {backend!r} requires relay cluster size {required_relay_cluster_size}, " f"got {deterministic_relay_cluster_size}"
+            )
 
     return _compile_sm100_artifact(
         device_index,
@@ -305,6 +358,7 @@ def _compile_deterministic_sm100(
         kernel_cls=kernel_cls,
         block_tile=64,
         dkv_planes=deterministic_shards,
+        wide_addressing=wide_addressing,
     )
 
 
@@ -320,6 +374,7 @@ def _compile_nondeterministic_sm100(
     max_topk: int,
     has_topk_length: bool,
     block_tile: int,
+    wide_addressing: bool = False,
 ):
     """Compile one ordinary, device-owned, shape-dynamic plan artifact."""
     if backend in ("h96_d576_2cta_m64", "h128_d576_2cta_m64"):
@@ -338,6 +393,7 @@ def _compile_nondeterministic_sm100(
         kernel_cls=_get_sm100_kernel_class(backend),
         block_tile=block_tile,
         dkv_planes=1,
+        wide_addressing=wide_addressing,
     )
 
 
@@ -383,8 +439,10 @@ def flash_attn_bwd_sm100(
         dq: preallocated (total_S_q, nheads, headdim), same dtype as q
         dkv: preallocated (total_S_kv, headdim), same dtype as kv
         d_sink: preallocated (nheads,) float32
-        deterministic: use ordered bounded-wave scratch accumulation; the
-            supported BF16 H96/H128 envelopes retain their two-CTA kernels
+        deterministic: use ordered bounded-wave scratch accumulation; large
+            generic-M64 plans use row-aware four-, eight-, or sixteen-CTA
+            cluster relays, while supported BF16 H96/H128 envelopes retain
+            their two-CTA kernels
         current_stream: CUDA stream handle for all initialization, main, and
             reduction launches; defaults to the current CUDA stream (the plan
             API selects Q's device context before entering this function)
@@ -505,8 +563,9 @@ def flash_attn_bwd_sm100(
             workspace=workspace,
             deterministic=deterministic,
         )
-    kernel_cls = _get_sm100_kernel_class(backend, deterministic, total_S_q)
+    kernel_cls = _get_sm100_kernel_class(backend, deterministic, total_S_q, total_S_kv, head_dim, num_head)
     deterministic_shards = kernel_cls.num_dkv_shards if deterministic else 0
+    deterministic_relay_cluster_size = getattr(kernel_cls, "dkv_relay_cluster_size", 1) if deterministic else 0
     uses_h128_two_cta = backend == "h128_2cta_m64"
     batch_size = 1
 
@@ -556,6 +615,7 @@ def flash_attn_bwd_sm100(
         num_head,
         block_tile,
         deterministic_shards,
+        deterministic_relay_cluster_size,
         device.index,
         max_topk,
         has_topk_length,

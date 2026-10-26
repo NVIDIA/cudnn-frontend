@@ -24,6 +24,7 @@ symbols_to_import = [
     "norm_forward_phase",
     "reduction_mode",
     "behavior_note",
+    "cuda_graph_retention",
     "knob_type",
     "FRONTEND_KNOB_TYPE_BASE",
     "is_frontend_knob_type",
@@ -606,6 +607,22 @@ _LAZY_OPTIONAL_IMPORTS = {
     "grouped_gemm_wgrad_jax_sm100": (
         ".gemm.cutedsl.grouped",
         "grouped_gemm_wgrad_jax_sm100",
+    ),
+    "grouped_gemm_quant_jax_forward": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_quant_jax_forward",
+    ),
+    "grouped_gemm_srelu_jax_forward": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_srelu_jax_forward",
+    ),
+    "grouped_gemm_glu_hadamard_jax_forward": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_glu_hadamard_jax_forward",
+    ),
+    "grouped_gemm_glu_hadamard_quant_jax_forward": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_glu_hadamard_quant_jax_forward",
     ),
     "discrete_grouped_gemm_swiglu_jax_sm100": (
         ".gemm.cutedsl.discrete_grouped",

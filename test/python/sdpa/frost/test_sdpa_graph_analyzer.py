@@ -1058,14 +1058,17 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
     # Capabilities.pack_gqa_partial_d_shapes as a module tuple because the
     # adapter has no engine row in hand when it validates a knob request.  Pin
     # the two together so the gate cannot drift: the f16 SM100 row declares
-    # exactly the adapter's flavors, and no other row (fp8 / mxfp8, the cc 10.7
-    # line, SM120) declares partial packing -- the adapter excludes those too.
+    # exactly the adapter's flavors. Native SM107 additionally admits D512;
+    # native SM107 D128 uses a shared route predicate because dense CGA1 still
+    # requires whole groups. Quantized and SM120 routes retain their gates.
     from cudnn.sdpa.fwd.api_dsl import _SM100_PARTIAL_PACK_GQA_FLAVORS
 
     by_name = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
     assert by_name[engines.engine_name()].pack_gqa_partial_d_shapes == frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS)
     assert frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS) == frozenset({(128, 128), (256, 256)})
-    others = {name: caps.pack_gqa_partial_d_shapes for name, caps in by_name.items() if name != engines.engine_name()}
+    native_sm107 = engines.engine_name(arch="sm107")
+    assert by_name[native_sm107].pack_gqa_partial_d_shapes == frozenset({(512, 512)})
+    others = {name: caps.pack_gqa_partial_d_shapes for name, caps in by_name.items() if name not in (engines.engine_name(), native_sm107)}
     assert all(v is None for v in others.values()), others
 
 
@@ -1107,6 +1110,7 @@ def test_capabilities_positional_prefix_is_append_only():
         "kv_mask",
         "kv_mask_dtypes",
         "tile_ns_by_d_shape",
+        "pack_gqa_requires_divisible",
     )
     legacy_order = [n for n in names if n not in appended]
     caps = engines.Capabilities(*[legacy_value(n) for n in legacy_order])
@@ -1118,6 +1122,7 @@ def test_capabilities_positional_prefix_is_append_only():
     assert caps.dense_only_d_shapes == frozenset()
     assert caps.bias_d_shapes is None and caps.bias_io_dtype_only is False and caps.kv_mask is False and caps.kv_mask_dtypes == frozenset()
     assert caps.tile_ns_by_d_shape == ()
+    assert caps.pack_gqa_requires_divisible is True
     assert caps.zero_scale is False
     assert caps.attn_scale_prefolded_d_shapes is None
     assert caps.epilogue_gate is False
@@ -1127,7 +1132,8 @@ def test_capabilities_positional_prefix_is_append_only():
     start = names.index("pack_gqa_d_shapes")
     assert names[start : start + len(legacy_tail)] == legacy_tail, names[start:]
     # ... and every later field is appended after it, in the order it landed (the zero-scale and pre-folded-scale fields,
-    # then the resident-bias / kv_mask fields of the Rubin small tiles and their per-shape TILE_N domain, last).
+    # then the resident-bias / kv_mask fields of the Rubin small tiles and their per-shape TILE_N domain, then the PackGQA
+    # divisibility rule, last).
     assert names[start + len(legacy_tail) :] == list(appended), names[start:]
 
     bwd_names = [f.name for f in dataclasses.fields(bwd_engines.Capabilities)]
@@ -1348,12 +1354,12 @@ def test_additive_kv_mask_needs_a_whole_granule_extent(monkeypatch):
 
 
 def test_tile_n_knob_domain_is_per_flavor_on_the_sm107_f16_row(monkeypatch):
-    """The TILE_N knob: 64 and 128 on the 32- / 64-wide tiles (``tile_ns_by_d_shape``), 128 only on the d128 rendering of the
+    """The TILE_N knob: 64 and 128 on the 32- / 64-wide tiles (``tile_ns_by_d_shape``), 64 and 128 on the native d128 prefill rendering of the
     same file; 256 is outside every flavor's domain (refused by the TMEM predicate at two sub-tiles) -- a typed decline, never
     a silently degraded width."""
     _rubin(monkeypatch)
     caps = _sm107_f16_caps()
-    for d, ok in ((32, {64, 128}), (64, {64, 128}), (128, {128})):
+    for d, ok in ((32, {64, 128}), (64, {64, 128}), (128, {64, 128})):
         g = _mk_small_d_graph(d=d)
         facts = _facts(g)
         assert engines.effective_tile_ns(caps, facts) == frozenset(ok), d
@@ -1425,6 +1431,79 @@ def test_thd_pack_gqa_admission_agrees_with_adapter(monkeypatch, cc, dtype, h_q,
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "group,cga,split,dim,accepted",
+    [
+        (6, 2, 1, 128, True),
+        (12, 2, 1, 128, True),
+        (24, None, 1, 128, True),
+        (3, 2, 1, 128, False),
+        (6, 1, 1, 128, False),
+        (6, 1, 2, 128, False),
+        (6, 2, 2, 128, False),
+        (6, 2, 1, 256, False),
+    ],
+)
+def test_sm107_paged_partial_pack_admission_agrees_with_adapter(monkeypatch, dtype, group, cga, split, dim, accepted):
+    """Both entry points admit the same paged partial-group domain before compilation."""
+    from cudnn.api_base import TensorDesc
+    from cudnn.frost import buffers
+    from cudnn.sdpa.fwd import api_dsl, config_sm100
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: (10, 7))
+    io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+    facts = ga.SdpaGraphFacts(
+        b=3,
+        h_q=group * 2,
+        h_kv=2,
+        s_q=513,
+        s_kv=640,
+        d_qk=dim,
+        d_v=dim,
+        dtype=io,
+        dtype_o=io,
+        causal=True,
+        thd=True,
+        has_paged_kv=True,
+        padded=True,
+        page_size=16,
+        device_cc=(10, 7),
+    )
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    reason = engines.mismatch(caps, facts, engines.SdpaFwdKnobs(cga=cga, split_kv=split, pack_gqa=True))
+    assert (reason is None) == accepted, reason
+
+    def desc(heads, tokens):
+        return TensorDesc(dtype, (3, heads, tokens, dim), (tokens * heads * dim, dim, heads * dim, 1), (3, 1, 2, 0), "cuda:0")
+
+    q, k = desc(group * 2, 513), desc(2, 16)
+    api = api_dsl.SdpaFwdDslSm100(
+        q,
+        k,
+        k,
+        q,
+        is_causal=True,
+        seq_kv_lens_present=True,
+        cu_seq_q_lens=True,
+        thd=True,
+        cga=cga,
+        split_kv=split,
+        pack_gqa=True,
+        paged_page_size=16,
+        paged_max_seq_len_kv=640,
+    )
+    if accepted:
+        assert api.check_support()
+        cfg, _ = config_sm100.make_cfg_d128(api.template_params())
+        assert cfg.PACK_G == math.gcd(group, 128)
+        assert cfg.PACK_GQA and cfg.PAGED_KV and cfg.THD_VARLEN
+    else:
+        with pytest.raises((ValueError, NotImplementedError), match="PackGQA|split"):
+            api.check_support()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("paged,pack_gqa", [(False, True), (False, False), (True, True), (True, False)])
 def test_packed_thd_split_adapter_declines_nonpaged_pack_gqa(monkeypatch, dtype, paged, pack_gqa):
     """Standalone admission must reject D192 packing before kernel compilation."""
@@ -1464,7 +1543,8 @@ def test_packed_thd_split_adapter_declines_nonpaged_pack_gqa(monkeypatch, dtype,
 @pytest.mark.parametrize(
     "changed,knobs",
     [
-        ({"device_cc": (10, 7)}, {}),
+        ({"device_cc": (10, 7), "attn_scale_prefolded": True}, {"cga": 1}),
+        ({"device_cc": (10, 7), "attn_scale_prefolded": True}, {}),
         ({"d_qk": 64, "d_v": 64}, {}),
         ({"d_qk": 256, "d_v": 256}, {}),
         ({"h_q": 24}, {}),
@@ -2467,7 +2547,12 @@ def test_paged_quantized_rows_mismatch_reasons():
     # The head-dim gate is the SELECTED flavor (Capabilities.paged_d_shapes = {(64, 64), (128, 128)} on the fp8 row).
     assert "wired on the d64, d128 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=256, d_v=256))
     assert "wired on the d64, d128 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=128))
-    assert "attention sink" in engines.mismatch(fp8, paged_facts(is_fp8=True, has_sink=True))
+    for d in (64, 128):
+        sink_facts = paged_facts(is_fp8=True, has_sink=True, d_qk=d, d_v=d)
+        assert engines.mismatch(fp8, sink_facts) is None
+        split_knobs = engines.SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=2)
+        assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=d, d_v=d), split_knobs) is None
+        assert "sink-free dense" in engines.mismatch(fp8, sink_facts, split_knobs)
     # Block-scaled O (#1088) over pools: epilogue and loader are independent, but the pair is not validated.
     assert "block-scaled O" in engines.mismatch(fp8, paged_facts(is_fp8=True, dtype_o=cudnn.data_type.FP8_E4M3, o_block_scale=32))
     assert "block-scaled O" in engines.mismatch(mxfp8, paged_facts(is_mxfp8=True, page_size=128, dtype_o=cudnn.data_type.FP8_E4M3, o_block_scale=32))

@@ -455,8 +455,16 @@ def test_template_params_and_capabilities_are_appended():
         2,
         1,
     ), "a record without the fields renders the legacy tail, the full body, the two-group body and one S slot"
-    # ... followed by the per-shape TILE_N domain (the TILE_N 64 cells of the small tiles), appended after them.
-    assert [f.name for f in dataclasses.fields(Capabilities)][-5:] == ["bias_d_shapes", "bias_io_dtype_only", "kv_mask", "kv_mask_dtypes", "tile_ns_by_d_shape"]
+    # ... followed by the per-shape TILE_N domain (the TILE_N 64 cells of the small tiles), appended after them, then the
+    # PackGQA divisibility rule.
+    assert [f.name for f in dataclasses.fields(Capabilities)][-6:] == [
+        "bias_d_shapes",
+        "bias_io_dtype_only",
+        "kv_mask",
+        "kv_mask_dtypes",
+        "tile_ns_by_d_shape",
+        "pack_gqa_requires_divisible",
+    ]
 
 
 def test_kernel_module_constants_and_mask_sites(monkeypatch):
@@ -1016,7 +1024,7 @@ def _dense_plan_stand_in(kernel_file, *, scale):
     import types
 
     host = next(n for n in ast.parse(kernel_file.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "_host")
-    order = [a.arg for a in host.args.args if "Constexpr" not in ast.unparse(a.annotation)]
+    order = [a.arg for a in host.args.args if a.annotation is None or "Constexpr" not in ast.unparse(a.annotation)]
 
     def entry(*args):
         raise AssertionError("the host pin never launches")

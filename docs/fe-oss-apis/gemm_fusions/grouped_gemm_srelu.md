@@ -4,7 +4,7 @@
 
 ## JAX support
 
-JAX arrays are **not supported**: both dense and discrete modes consume the SFA scale-factor tensor as an MMA-permuted strided cute tensor argument, a layout with no row-major (JAX) equivalent. JAX inputs raise a clear `ValueError` at the entry points. The API is otherwise type-erased and torch-lazy.
+**Canonical block-scaled (dense weights):** the `jax.jit`-compatible entry point `cudnn.grouped_gemm_srelu_jax_forward` takes A `(m, k)`, B `(experts, n, k)`, already MMA-packed `sfa_tensor`/`sfb_tensor` bytes (physical or flat), int32 `padded_offsets`, fp32 alpha and prob `(m,)` fp32/bf16. A/B are MXFP8 with E8M0 scales (`sf_vec_size=32`; uint8 accepted), or packed FP4. Packed FP4 operands travel as `uint8` with two values per byte (JAX has no packed FP4 dtype), so K is twice the array extent; their scale buffers are E4M3 with `sf_vec_size=16` for NVFP4, or E8M0. It returns a `TupleDict` with the eager wrapper's keys: the pre-activation C `(m, n)` and D `(m, n)`. A BF16/FP16 `d_dtype` also returns the per-expert amax `(experts, 1)`; an FP8 `d_dtype`, which needs MXFP8 inputs and `norm_const_tensor` `(1,)`, also returns D_col and the physical 6-D SFD buffers. Outputs are not initialized, so rows at or past `padded_offsets[-1]` are unspecified. `grouped_gemm_srelu_wrapper_sm100` dispatches JAX inputs with a dense `b_tensor` to it; pass `sf_vec_size`. SM100+, as in Torch. Bias, dynamic scheduling, `b_major="n"`, discrete (`b_ptrs`) weights and the `GroupedGemmSreluSm100` class raise `ValueError` for JAX.
 
 ## Overview
 
