@@ -5719,7 +5719,7 @@ def test_prefolded_scale_declines_the_single_cta_half_legs_on_the_adapter(monkey
 
 @requires_dsl
 def test_rubin_d128_prefill_packing_loads_the_native_body():
-    """Packed and unpacked CGA2 share the native pipeline; decode and paged keep their own bodies."""
+    """Packed/unpacked prefill and paged THD use the native pipeline; dense decode keeps its shared body."""
     from cudnn.frost.tile_dsl.constants import DTYPE_BF16
 
     def where(**params):
@@ -5732,7 +5732,7 @@ def test_rubin_d128_prefill_packing_loads_the_native_body():
     assert where(cta_mma=2, pack_gqa=True, qh_per_kh=8, split_kv=2) == ("sm107", "prefill_d128_f16.py")
     assert where(cta_mma=2, pack_gqa=True, qh_per_kh=6, thd_varlen=True) == ("sm107", "prefill_d128_f16.py")
     assert where(cta_mma=2) == ("sm107", "prefill_d128_f16.py")
-    assert where(cta_mma=1, thd_varlen=True, paged_kv=True, page_size=16, seq_kv_lens_present=True, split_kv=1) == ("sm100", "prefill_d128_f16.py")
+    assert where(cta_mma=1, thd_varlen=True, paged_kv=True, page_size=16, seq_kv_lens_present=True, split_kv=1) == ("sm107", "prefill_d128_f16.py")
 
 
 def test_rubin_shared_dense_legs_decline_the_prefolded_scale_on_the_adapter(monkeypatch):
