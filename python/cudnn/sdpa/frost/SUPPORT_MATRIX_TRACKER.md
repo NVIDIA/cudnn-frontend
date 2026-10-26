@@ -684,9 +684,13 @@ cluster (`S_q * PACK_G <= 512`, e.g. a 16-token speculative chunk at 64/4) keep 
 prefill tile and still walk `SCHED_NATURAL` first under a causal band (the one-cluster
 rule). The attention sink (incl. `S_q == 1`) and
 a left sliding window under the bottom-right causal diagonal ride the same paged graph
-on every wired f16/bf16 flavorˢ; on the FP8 row the left window rides it; the sink and
-the block-scaled O epilogue (`sf_o`) over pools are not validated, so those two pairs
-stay declined. The FP8 graph is `sdpa_fp8`
+on every wired f16/bf16 flavorˢ. Per-tensor FP8 d64/d128 also serves the sink with
+the left window on unsplit paged plans, with packed or unpacked GQA, independent
+HND/NHD pools, padded Q, FP16/BF16/E4M3/E5M2 O and optional Stats. A live query
+without keys writes O = 0 and LSE = sink; a trimmed query writes O = 0 and
+LSE = -inf. FP8 sink + split remains declined as on dense KV (the partials would
+count the sink repeatedly); block-scaled O (`sf_o`) over pools remains declined.
+The FP8 graph is `sdpa_fp8`
 with scalar `descale_q/k/v` and `scale_o` (`scale_s`/`descale_s` accepted and ignored),
 O in FP16/BF16/E4M3/E5M2, `Amax_O` out. **The graph must not declare
 `Amax_S`**: every FROST FP8 row declines a graph that requests that output (the kernels

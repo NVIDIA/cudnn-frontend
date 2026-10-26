@@ -1415,7 +1415,26 @@ def _gather_pages_fp8(pool, block_table, lens, hnd, P, s_max):
 
 
 def _ref_fp8(
-    q8, k_pool, v_pool, block_table, seq_lens, hnd, scale, dq, dk, dv, in_key, s_q, s_max, *, diag_align=None, left_bound=None, right_bound=None, v_hnd=None
+    q8,
+    k_pool,
+    v_pool,
+    block_table,
+    seq_lens,
+    hnd,
+    scale,
+    dq,
+    dk,
+    dv,
+    in_key,
+    s_q,
+    s_max,
+    *,
+    diag_align=None,
+    left_bound=None,
+    right_bound=None,
+    v_hnd=None,
+    sinks=None,
+    seq_q_lens=None,
 ):
     """q8 [B, s_q, H, D] fp8 (BSHD); pools in storage layout.  Returns (O [B, H, s_q, D_v]
     fp32, LSE [B, H, s_q] natural log) from sdpa.fp8_ref.compute_ref in fp64.  The band
@@ -1441,7 +1460,8 @@ def _ref_fp8(
         s_descale=1.0 / s_scale,
         torch_itype=_FP8[in_key],
         torch_otype=torch.float16,
-        padding=(torch.full((B,), s_q, dtype=torch.int32, device=q8.device), seq_lens),
+        padding=(torch.full((B,), s_q, dtype=torch.int32, device=q8.device) if seq_q_lens is None else seq_q_lens.reshape(B), seq_lens),
+        sink_token=sinks.view(1, -1, 1, 1) if sinks is not None else None,
         left_bound=left_bound,
         right_bound=right_bound,
         diag_align=diag_align,
@@ -1490,6 +1510,10 @@ def _run_graph_fp8(
     explicit_split=None,
     v_table_layout=None,
     v_hnd=None,
+    sinks=None,
+    q_lens=None,
+    explicit_pack=None,
+    explicit_cga=None,
 ):
     """``causal``: None, "top_left" or "bottom_right" -- a causal upper bound (``right_bound=0``)
     with that diagonal alignment; ``window_left``: W adds the left sliding window (``left_bound=W``).
@@ -1516,7 +1540,7 @@ def _run_graph_fp8(
     o_gpu = torch.empty(B, s_q, H, d, device=dev, dtype=out_dt).transpose(1, 2)
     seq_lens = torch.tensor(lens, dtype=torch.int32, device=dev)
     slk = seq_lens.view(B, 1, 1, 1)
-    slq = torch.full((B, 1, 1, 1), s_q, dtype=torch.int32, device=dev)
+    slq = torch.tensor(q_lens if q_lens is not None else [s_q] * B, dtype=torch.int32, device=dev).view(B, 1, 1, 1)
     s_max = max_pages * P
 
     def _sc(val):
@@ -1542,6 +1566,9 @@ def _run_graph_fp8(
     def _stns():
         return g.tensor(dim=[1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.FLOAT)
 
+    sink_t = g.tensor_like(sinks) if sinks is not None else None
+    if sink_t is not None:
+        mask_kw["sink_token"] = sink_t
     dqn, dkn, dvn, dsn, ssn, son = (_stns() for _ in range(6))
     o, st, _amax_s_unused, amx_o = g.sdpa_fp8(  # Amax_S is not requested (the FROST engines decline graphs that declare it)
         q=q,
@@ -1580,11 +1607,17 @@ def _run_graph_fp8(
         idx = next((i for i, n in enumerate(names) if n.startswith(engine_name(fp8=True)) and g.plans[i].knobs.split_kv == want_split), None)
         assert idx is not None, f"no {engine_name(fp8=True)} plan with split_kv={want_split}; knobs={[p.knobs for p in g.plans]}"
         g.select_plan(idx)
-    if explicit_split is not None:
+    if explicit_split is not None or explicit_pack is not None or explicit_cga is not None:
         from dataclasses import replace
 
         selected = g.plans[g._plan_index]
-        knobs = replace(selected.knobs, split_kv=explicit_split, sched_policy=0)
+        knobs = replace(selected.knobs, sched_policy=0)
+        if explicit_split is not None:
+            knobs = replace(knobs, split_kv=explicit_split)
+        if explicit_pack is not None:
+            knobs = replace(knobs, pack_gqa=explicit_pack)
+        if explicit_cga is not None:
+            knobs = replace(knobs, cga=explicit_cga)
         g.create_execution_plan(selected.engine_id, knobs)
         g.select_plan(len(g.plans) - 1)
     g.check_support()
@@ -1608,6 +1641,8 @@ def _run_graph_fp8(
         ssn: _sc(1.0),
         son: _sc(1.0),
     }
+    if sink_t is not None:
+        vp[sink_t] = sinks
     if stats:
         vp[st] = lse
     # Rule 3: the FROST execute path reads the per-batch lengths and the scales
@@ -1637,6 +1672,8 @@ def _run_graph_fp8(
         left_bound=window_left,
         right_bound=right_bound,
         v_hnd=v_hnd,
+        sinks=sinks,
+        seq_q_lens=slq,
     )
     out = o_gpu.float()
     assert not torch.isnan(out).any(), "NaN in O (a dead page was dereferenced, or a padded row was not masked)"
@@ -1650,6 +1687,14 @@ def _run_graph_fp8(
     keyless = torch.isinf(ref_lse) & live.view(B, 1, 1)
     if keyless.any():
         assert out[keyless].abs().max().item() == 0.0, "a q row with no unmasked key must write O := 0"
+    if sinks is not None:
+        rows = torch.arange(s_q, device=dev).view(1, s_q)
+        dead_q = rows >= slq.view(B, 1)
+        keyless_q = (slk.view(B, 1) == 0).expand(B, s_q)
+        if causal == "bottom_right":
+            keyless_q = keyless_q | (slk.view(B, 1) - slq.view(B, 1) + rows < 0)
+        dead = (dead_q | keyless_q).view(B, 1, s_q).expand(B, H, s_q)
+        assert torch.count_nonzero(out[dead]).item() == 0, "trimmed and sink-only rows must write exact zero O"
     # Amax_O is produced in-kernel (atomicMax over the pre-cast fp32 values; the
     # recombined O's under a split), so it matches the fp32 reference for every O dtype.
     assert abs(amax_o.item() - ref_o.abs().max().item()) <= 0.03, f"amax_o {amax_o.item():.4f} vs ref {ref_o.abs().max().item():.4f}"
@@ -1657,11 +1702,13 @@ def _run_graph_fp8(
         got_lse = lse.view(B, H, s_q)
         torch.testing.assert_close(got_lse[live], ref_lse[live], atol=5e-3, rtol=0)
         if (~live).any():
-            assert torch.isinf(got_lse[~live]).all() and (got_lse[~live] < 0).all(), "empty sequence must write LSE := -inf"
+            torch.testing.assert_close(got_lse[~live], ref_lse[~live], atol=5e-3, rtol=0)
     if return_case:
         tensors = dict(
             q=q, k=k, v=v, k_table=tk, v_table=tv, seq_q=sq_t, seq_kv=sk_t, o=o, amax_o=amx_o, descale_q=dqn, descale_k=dkn, descale_v=dvn, scale_o=son
         )
+        if sink_t is not None:
+            tensors["sinks"] = sink_t
         if stats:
             tensors["lse"] = st
         return g, vp, ws, {name: vp[tensor] for name, tensor in tensors.items()}, tensors
@@ -2909,3 +2956,130 @@ def test_paged_fp8_independent_pool_layouts(hnd, d, in_key, split):
 @pytest.mark.parametrize("dims", [(128, 128), (192, 128), (256, 256), (512, 512)])
 def test_paged_mxfp8_independent_pool_layouts(hnd, dims):
     _run_graph_mxfp8(3, 8, 2, 128, 3, [257, 0, 129], hnd, d_qk=dims[0], d_v=dims[1], stats=True, s_q=3, mixed_layout=True, separate_v=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("in_key", ["e4m3", "e5m2"])
+@pytest.mark.parametrize(
+    "s_q,H,KH,pack,hnd,P,out_key,stats,causal",
+    [
+        (1, 8, 2, True, True, 16, "bf16", True, "bottom_right"),
+        (9, 8, 2, False, False, 128, "fp16", True, "top_left"),
+        (17, 16, 2, True, False, 16, "e4m3", False, "bottom_right"),
+        (3, 8, 8, False, True, 256, "e5m2", True, None),
+    ],
+)
+def test_paged_graph_fp8_sink(d, in_key, s_q, H, KH, pack, hnd, P, out_key, stats, causal):
+    """Sink epilogue composes with paged loading, including trimmed and keyless Q.
+
+    Both FP8 flavors, independent K/V layouts, packed/unpacked GQA, MHA and
+    multiple Q tiles are exercised. Each head's sink has a different magnitude.
+    """
+    sinks = torch.linspace(-120.0, 120.0, H, device="cuda", dtype=torch.float32).view(1, H, 1, 1)
+    _run_graph_fp8(
+        5,
+        H,
+        KH,
+        d,
+        P,
+        -(-513 // P),
+        [513, 127, 257, 0, 1],
+        hnd,
+        in_key=in_key,
+        out_dt=_FP8_OUT[out_key],
+        stats=stats,
+        s_q=s_q,
+        causal=causal,
+        window_left=128,
+        explicit_split=1,
+        explicit_pack=pack,
+        v_hnd=not hnd,
+        sinks=sinks,
+        q_lens=[s_q, max(1, s_q // 2), 0, s_q, s_q],
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d,cga", [(64, 1), (128, 1), (128, 2)])
+def test_paged_graph_fp8_sink_rebind_replay(d, cga):
+    """A retained graph reads changed lengths, sinks and table contents on device.
+
+    Rebinding the graph uses new allocations; poisoning O/Stats/Amax before
+    replay ensures the capture actually writes every output, including dead rows.
+    """
+    import cudnn
+
+    B, H, KH, P, pages, s_q = 4, 8, 2, 16, 20, 4
+    sinks = torch.linspace(-12.0, 12.0, H, device="cuda").view(1, H, 1, 1)
+    g, vp, ws, buffers, tensors = _run_graph_fp8(
+        B,
+        H,
+        KH,
+        d,
+        P,
+        pages,
+        [320] * B,
+        True,
+        s_q=s_q,
+        causal="bottom_right",
+        window_left=128,
+        explicit_split=1,
+        explicit_cga=cga,
+        sinks=sinks,
+        return_case=True,
+    )
+    # Independent storage for every operand, retaining each declared stride.
+    vp = {tensor: value.clone(memory_format=torch.preserve_format) for tensor, value in vp.items()}
+    buffers = {name: vp[tensor] for name, tensor in tensors.items()}
+    stream = torch.cuda.Stream()
+    handle = cudnn.create_handle()
+    cudnn.set_stream(handle, stream.cuda_stream)
+    captured = torch.cuda.CUDAGraph()
+    try:
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            g.execute(vp, ws, handle=handle)
+        stream.synchronize()
+        with torch.cuda.graph(captured, stream=stream):
+            g.execute(vp, ws, handle=handle)
+        for lens, qlens, sink_value in [([1, 0, 129, 257], [4, 4, 0, 2], -120.0), ([320, 127, 0, 17], [1, 4, 4, 0], 120.0)]:
+            buffers["seq_kv"].copy_(torch.tensor(lens, device="cuda", dtype=torch.int32).view(B, 1, 1, 1))
+            buffers["seq_q"].copy_(torch.tensor(qlens, device="cuda", dtype=torch.int32).view(B, 1, 1, 1))
+            buffers["sinks"].fill_(sink_value)
+            buffers["k_table"].copy_(buffers["k_table"].roll(1, dims=2))
+            buffers["v_table"].copy_(buffers["k_table"])
+            ref_o, ref_lse = _ref_fp8(
+                buffers["q"].transpose(1, 2),
+                buffers["k"],
+                buffers["v"],
+                buffers["k_table"].view(B, pages),
+                buffers["seq_kv"].view(B),
+                True,
+                1.0 / math.sqrt(d),
+                buffers["descale_q"].item(),
+                buffers["descale_k"].item(),
+                buffers["descale_v"].item(),
+                "e4m3",
+                s_q,
+                pages * P,
+                diag_align=cudnn.diagonal_alignment.BOTTOM_RIGHT,
+                left_bound=128,
+                right_bound=0,
+                sinks=buffers["sinks"],
+                seq_q_lens=buffers["seq_q"],
+            )
+            for name in ("o", "lse", "amax_o"):
+                buffers[name].fill_(float("nan"))
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                captured.replay()
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+            torch.cuda.synchronize()
+            _check_fp8_o(buffers["o"].float(), ref_o, torch.float16, "e4m3")
+            torch.testing.assert_close(buffers["lse"].view(B, H, s_q), ref_lse, atol=5e-3, rtol=0)
+            assert abs(buffers["amax_o"].item() - ref_o.abs().max().item()) <= 0.03
+    finally:
+        captured.reset()
+        cudnn.destroy_handle(handle)

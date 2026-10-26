@@ -1955,11 +1955,11 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # on the f16/bf16 kernels: the sink is a per-row epilogue fold and
         # PAGED_KV only changes the K/V TMA-LDG warp (validated together in
         # test_sdpa_fwd_paged_sm100, S_q 1..4, PackGQA on/off, HND/NHD, with a
-        # left window, on the d128, d192x128 and d256 flavors). Sink + split-KV
-        # stays declined above (the combine is not sink-aware), so sink decode
-        # runs unsplit. The FP8 kernel's sink fold and its block-scaled O
-        # epilogue (sf_o) over pools are not validated, so those two pairs stay
-        # declined on the fp8 row.
+        # left window, on the d128, d192x128 and d256 flavors). The per-tensor
+        # FP8 d64/d128 epilogue also folds the sink once over paged KV, including
+        # keyless rows and padded Q. FP8 sink + split-KV stays declined above:
+        # those partials still include the sink. The block-scaled O epilogue
+        # (sf_o) over pools remains unvalidated and declined.
         # On cc 10.7 the same composition rides the shared d128 / d256 bodies compiled for sm_107a (the Rubin
         # paged arm of api_dsl._load_sm100_kernel_module); validated there with packed THD queries (1 / 4 / 8
         # tokens per request), PackGQA on / off, cga1 / cga2, HND / NHD pools and keyless rows
@@ -1975,8 +1975,6 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 return "paged MXFP8 KV with THD queries is not wired"
         if facts.is_fp8 and facts.thd:
             return "paged KV with THD (ragged) queries is served by the f16/bf16 kernel only (the FP8 THD path clamps runtime K/V descriptors)"
-        if facts.is_fp8 and facts.has_sink:
-            return "paged KV with an attention sink is served by the f16/bf16 kernel only (the FP8 kernel's sink fold over pools is not validated)"
         if (facts.is_fp8 or facts.is_mxfp8) and facts.o_block_scale:
             return "paged KV with a block-scaled O (sf_o) is served on dense K/V only (the block-scaled epilogue over pools is not validated)"
         if not facts.padded:
