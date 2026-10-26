@@ -1939,7 +1939,10 @@ def _correction_warp_group(
             _cu_q_b = cutlass.Int32(_cu[n_batch + batch_idx])
             _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
             if q_row_global < _s_q_b:
-                _stats_base = thd_port_origin(thd_origins, 4 if thd_origins is not None else -1, batch_idx, _cu_q_b)
+                if cutlass.const_expr(thd_origins is not None):
+                    _stats_base = thd_port_origin(thd_origins, 4, batch_idx, _cu_q_b)
+                else:
+                    _stats_base = _cu_q_b
                 lse_arr = cutlass.make_array_view(lse_tensor)
                 if cutlass.const_expr(SPLIT_KV > 1):
                     lse_arr[split_idx, row_head_idx, _stats_base + q_row_global] = lse_val
@@ -2150,9 +2153,9 @@ def _host(
     # (its `gate_slots`), direct launches pass it themselves.  Under THD the gate is the packed [1, T, H_q, D_v] form like Q / O.
     gate_ptr: Optional[cute.Pointer],
     gate_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
-    thd_origin_ptrs=None,
-    thd_origin_specs: cutlass.Constexpr = None,
     stream: _cuda_driver.CUstream = None,
+    thd_origin_ptrs: Optional[tuple] = None,
+    thd_origin_specs: cutlass.Constexpr = None,
 ) -> None:
     """Host entry: device pointers, runtime extents and strides in, TMA encodes and launches out.
 
