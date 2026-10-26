@@ -73,6 +73,34 @@ def _eligible(facts, offered: Dict[str, int]) -> Iterator[Tuple[int, EngineSpec]
             yield engine_id, spec
 
 
+def _leads(spec: EngineSpec, facts) -> bool:
+    """Whether a default row's plans go ahead of the backend's block.
+
+    ``sdpa_bwd_sm100_d128`` (measured 2026-10-26 against cuDNN 9.28.0.38, 216 cases at 32k tokens: d64/d128, GQA
+    32/8 16/2 and MHA, S 1k-16k, causal / mask-free / SWA1024, BSHD and THD at equal and half-to-full lengths): THD at
+    d128 wins 0.79-0.95 (one 1.07) -> ahead; dense BSHD d128 is parity (0.93-1.27), a window loses ~2x and dense D64
+    loses 1.7-2.3x -> behind the backend. Every other row keeps ours-first."""
+    if spec.name == "sdpa_bwd_sm100_d128":
+        return facts.thd and facts.window_left is None and (facts.d_qk, facts.d_v) == (128, 128)
+    return True
+
+
+def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
+    """The manifest hook: :func:`recommend`'s plans, the backend's block placed after the rows that lead
+    (:func:`_leads`) and before the rest. ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES`` set keeps ours first everywhere."""
+    ours = recommend(kind, facts, offered)
+    from cudnn.engines.manifest import opt_in_engines_enabled
+
+    if not ours or opt_in_engines_enabled():
+        return ours
+    from cudnn.engines.heuristics import BACKEND
+
+    spec_of = {offered[s.name]: s for s in ENGINE_SPECS if s.name in offered}
+    lead = [p for p in ours if _leads(spec_of[p.engine_id], facts)]
+    trail = [p for p in ours if p not in lead]
+    return lead + [BACKEND] + trail if trail else lead
+
+
 def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     """One complete entry per eligible row, in ``ENGINE_SPECS`` order; ``kind``
     does not change the answer (no runner-up candidates to thin out)."""
