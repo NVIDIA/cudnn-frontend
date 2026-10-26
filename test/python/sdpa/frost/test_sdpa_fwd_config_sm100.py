@@ -16,7 +16,9 @@ import pytest
 from cudnn.sdpa.fwd import config_sm100 as c100
 from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
-_E4M3 = 4
+pytestmark = pytest.mark.L0
+
+_E4M3 = c100.DTYPE_E4M3
 
 
 def _cfg(**kw):
