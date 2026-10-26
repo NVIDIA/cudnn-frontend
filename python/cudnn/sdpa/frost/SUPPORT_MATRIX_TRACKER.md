@@ -14,6 +14,16 @@ Prepared scalar-output MXFP8 dense plans can specialize their declared Stats str
 at compilation and retain a generic compiled host branch for other valid runtime
 Stats layouts. THD and split partials retain their existing binding contract.
 
+SM100/SM103 half forward also serves **exact Q/K576, V512**, with dense Q
+and dense or paged K/V. Its native two-CTA body keeps Q resident and streams
+three 192-column K chunks. FP16/BF16, partial PackGQA (largest divisor of the
+head ratio dividing 64), split-KV with FP32 partials, padding, supported bands,
+sinks and optional/base-2 Stats use the existing prepared API. Paged K/V retain
+independent tables, strides and HND/NHD pool layouts, including V as the leading
+512 channels of a 576-wide record. THD, other head dimensions, quantized inputs
+and SM107 do not inherit this flavor. This adds eligibility; no heuristic
+ordering or performance claim is implied.
+
 What the shipped FROST SDPA engines actually serve, one table per architecture.
 Columns are the kernel **flavors** (native head-dim geometry, with the model
 class it was tuned for in brackets) crossed with the pass; rows are features.

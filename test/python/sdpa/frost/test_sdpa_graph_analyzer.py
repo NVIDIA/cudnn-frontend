@@ -1065,7 +1065,7 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
 
     by_name = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
     assert by_name[engines.engine_name()].pack_gqa_partial_d_shapes == frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS)
-    assert frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS) == frozenset({(128, 128), (256, 256)})
+    assert frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS) == frozenset({(128, 128), (256, 256), (576, 512)})
     native_sm107 = engines.engine_name(arch="sm107")
     assert by_name[native_sm107].pack_gqa_partial_d_shapes == frozenset({(512, 512)})
     others = {name: caps.pack_gqa_partial_d_shapes for name, caps in by_name.items() if name not in (engines.engine_name(), native_sm107)}
@@ -1111,6 +1111,7 @@ def test_capabilities_positional_prefix_is_append_only():
         "kv_mask_dtypes",
         "tile_ns_by_d_shape",
         "pack_gqa_requires_divisible",
+        "thd_excluded_d_shapes",
     )
     legacy_order = [n for n in names if n not in appended]
     caps = engines.Capabilities(*[legacy_value(n) for n in legacy_order])
@@ -3385,3 +3386,26 @@ def test_fp8_bwd_d256_admitted_by_the_cpp_node_on_rubin(monkeypatch, d, sm_versi
     else:
         with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="hidden_dim"):
             g.validate()
+
+
+@pytest.mark.parametrize(
+    "shape,thd,admitted",
+    [((576, 512), False, True), ((576, 512), True, False), ((568, 512), False, False), ((576, 504), False, False), ((384, 256), True, True)],
+)
+def test_native_d576_admission_preserves_old_thd_envelope(shape, thd, admitted):
+    from dataclasses import replace
+
+    facts = replace(_facts(_mk_eligible_graph()), d_qk=shape[0], d_v=shape[1], thd=thd)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    reason = engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=2, pack_gqa=False))
+    assert (reason is None) == admitted, reason
+
+
+@pytest.mark.parametrize("shape,admitted", [((576, 512), True), ((512, 512), False)])
+def test_native_d576_dense_padding_split_admission(shape, admitted):
+    from dataclasses import replace
+
+    facts = replace(_facts(_mk_eligible_graph()), d_qk=shape[0], d_v=shape[1], padded=True)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    reason = engines.mismatch(caps, facts, engines.SdpaFwdKnobs(cga=2, split_kv=4, pack_gqa=False))
+    assert (reason is None) == admitted, reason
