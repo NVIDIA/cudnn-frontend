@@ -961,3 +961,5 @@ def test_sm100_fp8_decode_shaped_gqa_leads_inside_the_measured_box():
     assert place(window_left=128) == placement.TRAIL  # a window off the d64 sink graph not measured
     assert place(dtype_o=cudnn.data_type.BFLOAT16) == placement.TRAIL  # measured with E4M3 O only
     assert place(s_kv=512) == placement.TRAIL  # below the measured caches
+    assert place(dtype=cudnn.data_type.FP8_E5M2) == placement.TRAIL  # E5M2 inputs not measured
+    assert place(right_band_widening=True, right_bound=4) == placement.TRAIL  # widened band not measured
