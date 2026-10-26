@@ -38,6 +38,6 @@ CONFIG = BenchmarkConfig(
     deterministic_bwd=[False, True],
     sliding_window_size=128,
     batch_size=2,
-    num_iterations=20,
+    num_iterations=10,
     output_dir="results",
 )

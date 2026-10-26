@@ -76,9 +76,8 @@ class PageSizeTest(unittest.TestCase):
         self.assertEqual(result.page_size, 64)
 
     def test_qwen35_counts_distinct_executed_page_sizes(self):
-        # per cudnn leg: 92 dense + 92 paged + 32 mixed-length paged decodes (batch > 1)
-        self.assertEqual(len(list(self.runner.expand_config(QWEN35))), 648)
-        for backend, count, pages in (("flashinfer", 288, {16, 32, 64}), ("b12x", 64, {64})):
+        self.assertEqual(len(list(self.runner.expand_config(QWEN35))), 276)  # 92 cases x cudnn / cudnn_oss / cudnn_auto
+        for backend, count, pages in (("flashinfer", 192, {16, 32, 64}), ("b12x", 64, {64})):
             with self.subTest(backend=backend):
                 config = replace(QWEN35, backends=[backend], context_seqlens=[], context_chunked_shapes=[])
                 cases = list(self.runner.expand_config(config))
@@ -87,7 +86,7 @@ class PageSizeTest(unittest.TestCase):
 
     def test_kv_layout_and_fill_axes(self):
         """cudnn legs sweep kv_layouts; mixed cache lengths ride only the paged cudnn legs and flashinfer, batch > 1."""
-        base = replace(QWEN35, context_seqlens=[], context_chunked_shapes=[], page_sizes=None)
+        base = replace(QWEN35, context_seqlens=[], context_chunked_shapes=[], page_sizes=None, kv_layouts=["dense", "paged"], kv_min_fills=[1.0, 0.25])
         for backend, layouts, fills in (
             ("cudnn_auto", {"dense", "paged"}, {("paged", 0.25)}),
             ("flashinfer", {"paged"}, {("paged", 0.25)}),

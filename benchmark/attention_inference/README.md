@@ -74,8 +74,8 @@ length: each request's KV length is drawn (seeded) from
 [0.25 * kv_len, kv_len] (batch > 1 only; the paged cudnn legs and flashinfer).
 FLOPs and bytes are counted at each request's own lengths. The CSV carries
 `kv_layout` and `kv_min_fill`, and the charts give those rows their own
-clusters. `llama`, `qwen35`, `gpt_oss`, `deepseek_v4` and `kimi_k3` enable
-both axes.
+clusters. No config enables them by default (they grow a serving config's case
+count about 2.3x); add them to a config or a local copy to run the serving form.
 
 MLA models run **absorbed** in generation (`kind="mla_absorbed"`: K reads the
 full record, V a leading slice of the *same* record, so KV bytes are counted

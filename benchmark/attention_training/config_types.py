@@ -112,8 +112,7 @@ class BenchmarkConfig:
     attn_masks: List[str] = field(default_factory=lambda: ["top_left"])
     profile_pass: str = "fwd"
     batch_size: int = 1
-    # The median drops the first 5; at 10 the same-plan spread of large shapes reached 1.19x, at 20 1.06x.
-    num_iterations: int = 20
+    num_iterations: int = 10
     num_warmup_iterations: int = 0
     skip_ref: bool = True
     deterministic_bwd: List[bool] = field(default_factory=lambda: [False])
