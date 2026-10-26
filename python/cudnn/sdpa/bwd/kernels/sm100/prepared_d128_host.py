@@ -26,6 +26,7 @@ def host(
     geometry: cutlass.Constexpr,
     causal: cutlass.Constexpr[bool],
     stream: driver.CUstream,
+    window_left: cutlass.Constexpr[int] = 0,
 ):
     # The shared backward binder carries a workspace address even for a plan
     # requiring zero bytes. This unused scalar accepts a null address.
@@ -38,10 +39,10 @@ def host(
     dq = cute.make_tensor(dq_ptr, cute.make_layout(geometry[6][0], stride=geometry[6][1]))
     dk = cute.make_tensor(dk_ptr, cute.make_layout(geometry[7][0], stride=geometry[7][1]))
     dv = cute.make_tensor(dv_ptr, cute.make_layout(geometry[8][0], stride=geometry[8][1]))
-    tensor_host(q, k, v, o, do, lse, dq, dk, dv, scale, causal, stream)
+    tensor_host(q, k, v, o, do, lse, dq, dk, dv, scale, causal, stream, window_left)
 
 
-def compile_host(geometry, dtype, causal, sm):
+def compile_host(geometry, dtype, causal, sm, window_left=0):
     """Compile only plan-time geometry; bind storage and scale at execution."""
     types = [dtype] * 5 + [cutlass.Float32] + [dtype] * 3
     args = [cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=4 if i == 5 else 16) for i, t in enumerate(types)]
@@ -53,7 +54,8 @@ def compile_host(geometry, dtype, causal, sm):
         geometry,
         bool(causal),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+        int(window_left),
         options=f"--enable-tvm-ffi --gpu-arch sm_{sm}a",
-        cache_key=repr(("sdpa_bwd_sm100_d128", geometry, str(dtype), bool(causal), sm)),
+        cache_key=repr(("sdpa_bwd_sm100_d128", geometry, str(dtype), bool(causal), sm, int(window_left))),
         symbol="frost_sdpa_bwd_sm100_d128_prepared",
     )

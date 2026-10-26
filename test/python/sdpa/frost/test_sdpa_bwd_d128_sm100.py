@@ -49,6 +49,9 @@ def _reason(monkeypatch, cc=(10, 0), **kw):
     "kw",
     [
         dict(dt=torch.float16),
+        dict(d=64),
+        dict(d=64, use_causal_mask=True, diagonal_band_left_bound=128),
+        dict(use_causal_mask=True, diagonal_band_left_bound=1),
         dict(use_deterministic_algorithm=True),
         dict(sq=1, skv=65),
         dict(sq=257, skv=129),
@@ -61,10 +64,11 @@ def test_dense_graph_accepts(monkeypatch, kw):
 @pytest.mark.parametrize(
     "kw,token",
     [
-        (dict(d=64), "D"),
+        (dict(d=32), "D"),
         (dict(d_v=64), "D_QK"),
         (dict(use_causal_mask_bottom_right=True), "bottom-right"),
-        (dict(use_causal_mask=True, diagonal_band_left_bound=64), "sliding window"),
+        (dict(d=64, hq=4, hkv=2), "dense MHA"),
+        (dict(thd=True, use_causal_mask=True, diagonal_band_left_bound=64), "dense MHA"),
         (dict(diagonal_band_right_bound=8), "right-band"),
         (dict(padded=True), "padding mask"),
         (dict(bias=True), "bias"),
@@ -141,7 +145,20 @@ def test_adapter_backstops_decline_unsupported_declarations(monkeypatch, kw, tok
 
 
 def _case(
-    dt=torch.bfloat16, causal=False, b=1, h=2, sq=65, sk=129, seed=729, check_build=False, accumulation=False, scale=None, allow_zero=False, deterministic=False
+    dt=torch.bfloat16,
+    causal=False,
+    b=1,
+    h=2,
+    sq=65,
+    sk=129,
+    seed=729,
+    check_build=False,
+    accumulation=False,
+    scale=None,
+    allow_zero=False,
+    deterministic=False,
+    d=128,
+    left=None,
 ):
     """``accumulation`` True = the default accumulation route; False = pin the recompute kernel (``_recompute_route``);
     None = leave the selection alone and expect recompute as the natural fallback (e.g. a negative scale).
@@ -150,16 +167,16 @@ def _case(
     gen = torch.Generator(device="cpu").manual_seed(seed)
 
     def draw(s):
-        return torch.randn(b, s, h, 128, generator=gen).to(device="cuda", dtype=dt).permute(0, 2, 1, 3)
+        return torch.randn(b, s, h, d, generator=gen).to(device="cuda", dtype=dt).permute(0, 2, 1, 3)
 
     q, k, v, do = draw(sq), draw(sk), draw(sk), draw(sq)
-    keep = _causal_keep(sq, sk) if causal else None
+    keep = _causal_keep(sq, sk, left=left, causal=causal) if causal or left is not None else None
     o64, lse, _, *expected = _reference64(q, k, v, do, keep, scale=scale)
-    tensors = dict(q=q, k=k, v=v, do=do, o=_bshd_empty(b, sq, h, 128, dt).copy_(o64), stats=lse.float().unsqueeze(-1).contiguous())
+    tensors = dict(q=q, k=k, v=v, do=do, o=_bshd_empty(b, sq, h, d, dt).copy_(o64), stats=lse.float().unsqueeze(-1).contiguous())
     tensors.update(
-        dq=_bshd_empty(b, sq, h, 128, dt, fill=float("nan")),
-        dk=_bshd_empty(b, sk, h, 128, dt, fill=float("nan")),
-        dv=_bshd_empty(b, sk, h, 128, dt, fill=float("nan")),
+        dq=_bshd_empty(b, sq, h, d, dt, fill=float("nan")),
+        dk=_bshd_empty(b, sk, h, d, dt, fill=float("nan")),
+        dv=_bshd_empty(b, sk, h, d, dt, fill=float("nan")),
     )
     # The implementation is chosen while the plans are created, so the pin spans the whole build.
     with _recompute_route() if accumulation is False else nullcontext():
@@ -168,11 +185,12 @@ def _case(
             hq=h,
             sq=sq,
             skv=sk,
-            d=128,
+            d=d,
             dt=dt,
             use_causal_mask=causal,
             scale="default" if scale is None else scale,
             use_deterministic_algorithm=deterministic,
+            **({"diagonal_band_left_bound": left} if left is not None else {}),
         )
         select_engine(graph, _ENGINE)
         before = torch.cuda.memory_allocated()

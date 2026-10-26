@@ -1,10 +1,12 @@
-# SDPA backward, d = 128 (SM100)
+# SDPA backward, d = 64 or 128 (SM100)
 
 The opt-in `sdpa_bwd_sm100_d128` engine serves dense multi-head attention with
 BF16 or FP16 inputs and gradients, compact BSHD physical storage, and
-contiguous FP32 natural-log Stats. It supports unmasked and top-left causal
-attention, including rectangular query and key/value lengths. Packed THD MHA
-supports both dtypes. Dense and THD GQA/MQA initially support BF16 only. Packed
+contiguous FP32 natural-log Stats. Dense MHA supports head dimensions 64 and 128,
+unmasked or top-left causal attention, and a left sliding window, including
+rectangular query and key/value lengths allowed by the shared graph contract.
+Packed THD MHA supports both dtypes at D128. Dense and THD GQA/MQA support
+BF16 at D128, without sliding windows. Packed
 and grouped paths require SM100 or SM103 (cc 10.0 or 10.3), CuTeDSL 4.8 or newer and
 positive FP32 attention scale. Grouped dense lengths must be multiples of 128;
 packed grouped lengths may have tails or empty actual sequences. Other masks,
@@ -21,7 +23,7 @@ graph.execute(variant_pack, workspace)
 
 Plan construction selects the implementation from declarations and the build
 device. On SM100 or SM103 with public CuTeDSL 4.8 or newer and a positive attention
-scale and no deterministic request, the MHA three-kernel chain computes the row delta while initializing FP32 dQ
+scale and no deterministic request or sliding window, the D128 MHA three-kernel chain computes the row delta while initializing FP32 dQ
 scratch, accumulates dQ and writes dK/dV, then converts dQ to the output type.
 Sequence lengths need not be multiples of 128: the tail tiles' loads are zero-filled,
 their stores and dQ reductions are clipped, and the tail Stats rows contribute nothing.
@@ -33,6 +35,16 @@ Dense MHA with `use_deterministic_algorithm=True` selects the one-kernel recompu
 implementation: a single CTA owns each gradient tile and reduces in a fixed order,
 without inter-CTA atomics. It requires zero workspace and supports both unmasked
 and top-left causal attention. The choice is made when the plan is built.
+
+D64 and sliding-window dense MHA use that same recompute implementation,
+whether or not determinism is requested. D64 uses TMA zero-fill and clipped
+stores over the D128 tile. A left window bounds both Q and KV owners' reduction
+loops and masks boundary tiles; rows containing one legal key have zero score
+gradients and contribute no dQ/dK.
+The graph's left bound counts keys, while standalone `window_size_left` counts
+positions before the query, so a graph left bound of 128 corresponds to a
+standalone radius of 127. Window declarations also require
+`max(S_q,S_kv) + window_size_left + 129 <= 2**31-1`.
 
 Other dense MHA declarations in the existing envelope, including negative finite
 nonzero scales and older CuTeDSL releases, retain the one-kernel implementation with
@@ -58,7 +70,7 @@ initializes its scratch each time, and performs no allocation, layout copy or
 device-to-host read. The plan supports CUDA-graph capture and replay. FP32 dQ
 atomic accumulation does not promise bitwise repeatability.
 
-The three-kernel implementation is selected on SM100 and SM103 when determinism is not requested. Existing support
+The three-kernel implementation is selected for D128 without a window on SM100 and SM103 when determinism is not requested. Existing support
 on other pre-Rubin Blackwell devices retains the previous implementation.
 The engine remains opt-in while performance qualification proceeds.
 

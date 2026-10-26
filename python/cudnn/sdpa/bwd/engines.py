@@ -1690,10 +1690,12 @@ def _sm100_d128_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Opt
         from .d128_contract import validate_dense_bounds
 
         try:
-            validate_dense_bounds(facts.b, facts.h_q, facts.s_q, facts.s_kv)
+            validate_dense_bounds(facts.b, facts.h_q, facts.s_q, facts.s_kv, facts.window_left)
         except ValueError as error:
             return str(error)
         return None
+    if facts.d_qk != 128 or facts.d_v != 128 or facts.window_left is not None:
+        return "small head dimensions and sliding windows require dense MHA backward"
     label = "d128 grouped" if grouped else "d128 THD"
     import re
 
@@ -1785,8 +1787,9 @@ def _sm100_d128_spec() -> EngineSpec:
         capabilities=Capabilities(
             sm_lo=100,
             sm_hi=106,
-            d=frozenset({128}),
+            d=frozenset({64, 128}),
             causal=True,
+            swa=True,
             deterministic=True,  # dense MHA only: declaration_check selects the fixed-order recompute contract
             compact_bshd=True,
             thd=True,
