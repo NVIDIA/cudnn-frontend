@@ -118,7 +118,8 @@ def test_capabilities_match_what_is_implemented():
     """The row claims exactly what the accept tests run; every deferral is pinned False with its reject test."""
     c = _spec().capabilities
     assert (c.sm_lo, c.sm_hi) == _SM_RANGE, "SM100 / SM103 (cc 10.0-10.6); the native Rubin row owns 107+"
-    assert c.d == frozenset({_D}) and not c.d_envelope and not c.dqk_ge_dv, "exact d_qk == d_v == 256 (the body hardcodes the 256-wide tiles)"
+    assert c.d == frozenset({128, 192, 256}) and not c.d_envelope and c.dqk_ge_dv
+    assert c.declaration_check is not None, "only D256 and dense D192x128 are qualified"
     assert c.dtypes == frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})
     assert not c.is_fp8 and not c.is_mxfp8 and c.out_dtypes == frozenset()
     assert c.causal and c.bottom_right and c.swa and c.gqa

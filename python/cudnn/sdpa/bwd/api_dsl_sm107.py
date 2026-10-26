@@ -777,6 +777,12 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         self._compiled = None
         self._prepared = None
 
+    def _check_head_dims(self) -> None:
+        self._value_error_if(
+            self.head_dim_qk != _SM107_D or self.head_dim_v != _SM107_D,
+            f"{self._NAME}: d_qk = d_v = {_SM107_D} exactly; got {self.head_dim_qk} / {self.head_dim_v}",
+        )
+
     # --- capability backstop ---------------------------------------------------------
     def check_support(self) -> bool:
         """Re-check what the Capabilities row promised (backstops, never the gate)."""
@@ -787,9 +793,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         if self._thd_ro_spec:
             _prepared.check_thd_origins(self)
 
-        self._value_error_if(
-            self.head_dim_qk != _SM107_D or self.head_dim_v != _SM107_D, f"{n}: d_qk = d_v = {_SM107_D} exactly; got {self.head_dim_qk} / {self.head_dim_v}"
-        )
+        self._check_head_dims()
         self._value_error_if(self.h_kv < 1 or self.h_q % self.h_kv != 0, f"{n}: h_q ({self.h_q}) must be a multiple of h_kv ({self.h_kv})")
         self._value_error_if(self.dtype not in self._IO_DTYPES, f"{n}: Q/K/V/O/dO dtype {self.dtype} not served")
         self._value_error_if(self.s_q_max < 1 or self.s_k_max < 1, f"{n}: empty sequences are not served (S_q={self.s_q_max}, S_kv={self.s_k_max})")
@@ -916,7 +920,8 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         not a caller tensor, as the compact region the pointer host views it as
         (``prepared_sm107._regions``), so :meth:`scratch_workspace_bytes` and the artifact
         cannot disagree."""
-        b, h, hkv, sq, skv, d = self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, _SM107_D
+        b, h, hkv, sq, skv, d = self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, self.head_dim_qk
+        dv = self.head_dim_v
         sqp, skvp = self._sq_pad, self._skv_pad
         kv_rows = skvp if self._kv_padded else skv
         gqa = self._gqa_group > 1
@@ -954,24 +959,25 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
             ("desc_words", (1,), torch.int64),
         ]
         if self._q_padded:
-            plan += [("q_pad", (b, sqp, h, d), self.dtype), ("do_pad", (b, sqp, h, d), self.dtype), ("lse_pad", (b, h, sqp), torch.float32)]
+            plan += [("q_pad", (b, sqp, h, d), self.dtype), ("do_pad", (b, sqp, h, dv), self.dtype), ("lse_pad", (b, h, sqp), torch.float32)]
         if self._kv_padded:
-            plan += [("k_pad", (b, skvp, hkv, d), self.dtype), ("v_pad", (b, skvp, hkv, d), self.dtype)]
+            plan += [("k_pad", (b, skvp, hkv, d), self.dtype), ("v_pad", (b, skvp, hkv, dv), self.dtype)]
         plan += self._family_scratch_shapes(kv_rows, gqa)
         return plan
 
     def _family_scratch_shapes(self, kv_rows: int, gqa: bool):
-        b, h, hkv, d = self.batch_size, self.h_q, self.h_kv, _SM107_D
+        b, h, hkv, d = self.batch_size, self.h_q, self.h_kv, self.head_dim_qk
+        dv = self.head_dim_v
         plan = []
         # stage 2's dV per Q head: the caller's dV only when MHA and no kv padding
         if gqa or self._kv_padded:
-            plan.append(("dv_part", (b, kv_rows, h, d), self.dtype))
+            plan.append(("dv_part", (b, kv_rows, h, dv), self.dtype))
         # stage 3's dK per Q head: the caller's dK when MHA (real rows written)
         if gqa:
             plan.append(("dk_part", (b, kv_rows, h, d), self.dtype))
             if self._kv_padded:
                 # dkv_reduce folds at the workspace's row extent; the real rows are copied out
-                plan += [("dk_fold", (b, kv_rows, hkv, d), self.dtype), ("dv_fold", (b, kv_rows, hkv, d), self.dtype)]
+                plan += [("dk_fold", (b, kv_rows, hkv, d), self.dtype), ("dv_fold", (b, kv_rows, hkv, dv), self.dtype)]
         return plan
 
     def _thd_map_slots(self, b: int) -> int:
