@@ -3,7 +3,7 @@
 
 """Single-launch F8_128x4 scale packing for the SM100 DSA indexer.
 
-The indexer consumes one byte per logical MXFP8 scale in NVIDIA's
+The indexer consumes one byte per logical MXFP8 or MXFP4 scale in NVIDIA's
 F8_128x4 layout.  This module copies those bytes directly from the caller's
 logical BSHD, THD, or MKL tensor into the packed layout.  Padding bytes are
 written as ``0x00`` by the same launch, so callers do not need an index tensor,
@@ -374,7 +374,7 @@ def _launch_pack(
         return
     if layout in (_Q_THD, _K_THD):
         if cu_seqlens is None or cu_seqlens_scale_padded is None:
-            raise ValueError("THD MXFP8 scale packing requires logical and padded cu_seqlens")
+            raise ValueError("THD MXFP8/MXFP4 scale packing requires logical and padded cu_seqlens")
         num_sequences = cu_seqlens.numel() - 1
     else:
         # Non-THD specializations compile the dead pointers out.

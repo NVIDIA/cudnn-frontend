@@ -43,12 +43,15 @@ Each component can be used independently or combined for the full NSA pipeline.
 
 ## Installation
 
-Install the cuDNN Frontend package; the CuTe DSL runtime it JITs through is a
-required dependency and comes with it:
+Install the cuDNN Frontend package; except on Windows ARM64, the CuTe DSL runtime
+it JITs through is a required dependency and comes with it:
 
 ```bash
 pip install nvidia-cudnn-frontend
 ```
+
+On Windows ARM64, the CuTe DSL and TVM-FFI runtime dependencies are excluded
+from the base installation, so the base install does not enable NSA there.
 
 ---
 

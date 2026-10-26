@@ -635,6 +635,7 @@ def _run_graph(
     padded=True,
     capture=None,
     gate=None,
+    explicit_knobs=None,
 ):
     """Build cuDNN's paged (``page`` > 0) or dense SDPA graph -- padded (per-batch
     ``seq_len_kv`` / ``seq_len_q``, the default) or, with ``padded=False`` on a dense cache
@@ -652,7 +653,10 @@ def _run_graph(
     (``sdpa(virtual O_v) -> sigmoid(G) -> mul(O_v, s)``, ``cudnn._sdpa_tail``) with a +-2 sigma
     G in the IO dtype; a number = that gate logit on every element (+-1e4: an exactly
     saturated sigmoid, 0: exactly one half).  The reference is then multiplied by
-    ``sigmoid(G)`` in fp32; the captured ``gate`` is the BSHD fp32 G."""
+    ``sigmoid(G)`` in fp32; the captured ``gate`` is the BSHD fp32 G.
+
+    ``explicit_knobs`` builds a caller-selected public knob configuration, including
+    supported configurations that the default proposal list does not yet contain."""
     import cudnn
     import cudnn.sdpa  # noqa: F401
 
@@ -722,7 +726,15 @@ def _run_graph(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    plan = select_engine(g, _engine(), pack_gqa=pack_gqa, split_kv=split_kv)
+    if explicit_knobs is None:
+        plan = select_engine(g, _engine(), pack_gqa=pack_gqa, split_kv=split_kv)
+    else:
+        select_engine(g, _engine())
+        engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
+        knobs.update(explicit_knobs)
+        g.create_execution_plan(engine, knobs)
+        g.select_plan(g.get_execution_plan_count() - 1)
+        plan = g.plans[g._plan_index]
     idx = g._plan_index
     g.check_support()
     g.build_plans()

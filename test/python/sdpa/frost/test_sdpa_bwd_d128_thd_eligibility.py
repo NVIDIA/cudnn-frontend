@@ -76,7 +76,7 @@ def test_thd_admission_and_ranking(packing, dtype, causal):
 @pytest.mark.parametrize(
     "overrides,token",
     [
-        ({"device_cc": (10, 3)}, "cc 10.0"),
+        ({"device_cc": (10, 1)}, "cc 10.0 / 10.3"),
         ({"scale": float("inf")}, "positive"),
         ({"scale": float("nan")}, "positive"),
         ({"scale": 0.0}, "attn_scale = 0"),
@@ -196,7 +196,13 @@ def test_thd_stats_malformed_descriptor_declines(shape, stride, token):
 
 @pytest.mark.parametrize(
     "cc,scale,missing_totals,token",
-    [((10, 0), 0.125, False, None), ((10, 3), 0.125, False, "cc 10.0"), ((10, 0), -0.125, False, "positive"), ((10, 0), 0.125, True, "positive")],
+    [
+        ((10, 0), 0.125, False, None),
+        ((10, 3), 0.125, False, None),
+        ((10, 1), 0.125, False, "cc 10.0 / 10.3"),
+        ((10, 0), -0.125, False, "positive"),
+        ((10, 0), 0.125, True, "positive"),
+    ],
 )
 def test_real_thd_graph_admission(monkeypatch, cc, scale, missing_totals, token):
     from cudnn.sdpa import graph_analyzer

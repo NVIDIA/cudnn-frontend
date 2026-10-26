@@ -327,9 +327,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
             ("output_mode", output_mode != "dense"),
             ("wgrad_tensor", wgrad_tensor is not None),
             ("wgrad_ptrs", wgrad_ptrs is not None),
-            ("global_scale_a", global_scale_a is not None),
-            ("global_scale_b", global_scale_b is not None),
-            ("sf_vec_size", sf_vec_size != 32),
+            ("sf_vec_size", sf_vec_size not in (16, 32)),
             ("sf_fp8_dtype_override", sf_fp8_dtype_override is not None),
             ("current_stream", current_stream is not None),
             ("descriptor_workspace", descriptor_workspace is not None),
@@ -348,6 +346,9 @@ def grouped_gemm_wgrad_wrapper_sm100(
             input_order=input_order,
             sfa_tensor=sfa_tensor,
             sfb_tensor=sfb_tensor,
+            global_scale_a=global_scale_a,
+            global_scale_b=global_scale_b,
+            sf_vec_size=sf_vec_size,
         )
     memo_key = (
         type(a_tensor),

@@ -19,6 +19,87 @@ from frost_test_utils import requires_blackwell, requires_dsl
 pytestmark = [pytest.mark.L0, requires_dsl, requires_blackwell]
 
 
+@pytest.mark.parametrize("group", [2, 4, 8])
+@pytest.mark.parametrize("sink", [False, True])
+def test_packed_prefetch_excludes_zero_weight_partials(monkeypatch, group, sink):
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+
+    # Select an explicit reducer specialization, independently of placement.
+    original_compile = comb._compile_cached
+
+    def specialized(fn, *args, cache_key=None, **kwargs):
+        assert fn is comb._host_ptr_packed
+        return original_compile(fn, *args, cache_key=None, prefetch_group=group, **kwargs)
+
+    monkeypatch.setattr(comb, "_compile_cached", specialized)
+    comb.compile_ptr.cache_clear()
+    splits, h, rows, d = max(2, group - 1), 2, 3, 128
+    op = torch.arange(splits * rows * h * d, device="cuda", dtype=torch.float32).reshape(splits, rows, h, d) / 1024
+    lp = torch.zeros(splits, h, rows, device="cuda")
+    lp[:, :, 0] = -torch.inf
+    op[:, 0] = torch.nan
+    lp[0, :, 1] = -2048  # Finite LSE, but a zero weight even in the FP64 reference.
+    op[0, 1] = torch.nan
+    sinks = torch.tensor([-torch.inf, 1000.0], device="cuda") if sink else None
+    if sink:
+        op[:, :, 1] = torch.nan  # The sink makes every real split's weight zero on head 1.
+    scores = lp.double()
+    maximum = scores.amax(0)
+    if sink:
+        maximum = torch.maximum(maximum, sinks.double()[:, None])
+    safe_maximum = torch.where(torch.isfinite(maximum), maximum, 0)
+    weights = (scores - safe_maximum).exp()
+    denominator = weights.sum(0)
+    if sink:
+        denominator += (sinks.double()[:, None] - safe_maximum).exp()
+    weighted = weights.permute(0, 2, 1).unsqueeze(-1)
+    safe_o = torch.where(weighted > 0, op.double(), 0)
+    ref_o = (weighted * safe_o).sum(0) / denominator.clamp_min(1).T.unsqueeze(-1)
+    ref_lse = safe_maximum + denominator.log()
+    o = torch.empty(1, rows, h, d, device="cuda", dtype=torch.bfloat16)
+    lse = torch.empty(1, h, rows, device="cuda")
+    total = torch.tensor([rows], device="cuda", dtype=torch.int32)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        owner = comb.compile_ptr(dtype_o="bf16", packed=True, has_lse=True, has_sink=sink)
+        fn = positional_entry(owner)
+        assert fn is not None
+
+        def run():
+            fn(
+                op.data_ptr(),
+                lp.data_ptr(),
+                o.data_ptr(),
+                lse.data_ptr(),
+                (1, h, rows, d),
+                splits,
+                o.stride(),
+                lse.stride(),
+                total.data_ptr(),
+                torch.cuda.current_stream().cuda_stream,
+                sinks.data_ptr() if sink else None,
+                None,
+                None,
+                0,
+            )
+
+        run()
+        with torch.cuda.graph(graph):
+            run()
+        for live in (rows, 1, 0):
+            total.fill_(live)
+            o.fill_(-31)
+            lse.fill_(-31)
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(o[0, :live].double(), ref_o[:live], atol=0.004, rtol=0.004)
+            torch.testing.assert_close(lse[0, :, :live].double(), ref_lse[:, :live], atol=2e-5, rtol=2e-5)
+            assert torch.all(o[0, live:] == -31) and torch.all(lse[0, :, live:] == -31)
+    finally:
+        graph.reset()
+        comb.compile_ptr.cache_clear()
+
+
 def _partials(b, h, sq, d, splits):
     generator = torch.Generator().manual_seed(20261014 + splits)
     o = torch.randn(splits, b, sq, h, d, generator=generator) * 0.4

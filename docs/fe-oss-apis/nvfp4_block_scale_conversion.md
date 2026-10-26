@@ -72,4 +72,4 @@ NVFP4 arithmetic and `F8_128x4` layout contract; they do not embed code copied
 from another framework's quantizer.
 
 Requires CuTeDSL >= 4.7.0. Older installed versions are rejected before the
-kernel module is imported; the package-wide dependency floor remains 4.6.2.
+kernel module is imported; the package-wide dependency floor is 4.8.0.

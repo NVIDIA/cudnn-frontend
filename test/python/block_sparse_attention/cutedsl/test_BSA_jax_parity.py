@@ -21,8 +21,8 @@ def test_bsa_jax_torch_parity(layout):
         pytest.skip(requirement_error)
     jax = pytest.importorskip("jax", minversion="0.9.1")
     import jax.numpy as jnp
-    from cudnn import BSA
-    from cudnn.jax import block_sparse_attention_forward as jax_forward, block_sparse_attention_backward as jax_backward
+    from cudnn import ops
+    from cudnn.ops import block_sparse_attention_forward_jax as jax_forward, block_sparse_attention_backward_jax as jax_backward
 
     rng = np.random.default_rng(19)
     arrays = [rng.normal(size=shape).astype(np.float32) for shape in ((1, 2, 256, 64), (1, 2, 512, 64), (1, 2, 512, 64))]
@@ -32,9 +32,9 @@ def test_bsa_jax_torch_parity(layout):
     jq, jk, jv = [jnp.asarray(x, jnp.bfloat16) for x in arrays]
     index = np.broadcast_to(np.array([0, 3], np.int32), (1, 2, 2, 2)).copy()
     ti, ji = torch.tensor(index, device="cuda"), jnp.asarray(index)
-    tf = BSA.block_sparse_attention_forward(tq, tk, tv, ti, 2, sparse_block_size=128, layout=layout)
+    tf = ops.block_sparse_attention_forward(tq, tk, tv, ti, 2, sparse_block_size=128, layout=layout)
     jf = jax.jit(lambda q, k, v, i: jax_forward(q, k, v, i, 2, layout=layout))(jq, jk, jv, ji)
-    tb = BSA.block_sparse_attention_backward(torch.ones_like(tq), tq, tk, tv, tf[0], tf[1], ti, 2, sparse_block_size=128, layout=layout)
+    tb = ops.block_sparse_attention_backward(torch.ones_like(tq), tq, tk, tv, tf[0], tf[1], ti, 2, sparse_block_size=128, layout=layout)
     jb = jax_backward(jnp.ones_like(jq), jq, jk, jv, jf[0], jf[1], ji, 2, layout=layout, bucket_size_blocks=1)
     for jt, tt in zip((*jf, *jb), (*tf, *tb)):
         np.testing.assert_allclose(np.asarray(jt.astype(jnp.float32)), tt.float().cpu().numpy(), atol=3e-2, rtol=3e-2)
@@ -58,15 +58,16 @@ class NoJax:
 sys.meta_path.insert(0, NoJax())
 import torch
 import cudnn
-import cudnn.torch as ct
+import cudnn.ops
+import cudnn.torch
 assert "cudnn.block_sparse_attention.api" not in sys.modules
 for name in ("block_sparse_attention_forward", "block_sparse_attention_backward", "block_sparse_attention_fp8_forward"):
-    assert name in ct.__all__
-    assert getattr(ct, name) is getattr(cudnn, name) is getattr(cudnn.BSA, name)
+    assert not hasattr(cudnn.torch, name)
+    assert getattr(cudnn.ops, name) is getattr(cudnn, name) is getattr(cudnn.BSA, name)
 q = torch.ones((1, 1, 256, 64), device="cuda", dtype=torch.bfloat16)
 i = torch.arange(2, device="cuda", dtype=torch.int32).expand(1, 1, 2, 2).contiguous()
-o, lse = ct.block_sparse_attention_forward(q, q, q, i, 2)
-dq, dk, dv = ct.block_sparse_attention_backward(q, q, q, q, o, lse, i, 2)
+o, lse = cudnn.ops.block_sparse_attention_forward(q, q, q, i, 2)
+dq, dk, dv = cudnn.ops.block_sparse_attention_backward(q, q, q, q, o, lse, i, 2)
 torch.testing.assert_close(o, q)
 torch.testing.assert_close(dq, torch.zeros_like(q), atol=1e-3, rtol=0)
 torch.testing.assert_close(dk, torch.zeros_like(q), atol=1e-3, rtol=0)

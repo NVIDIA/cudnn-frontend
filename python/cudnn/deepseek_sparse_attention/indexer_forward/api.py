@@ -238,6 +238,11 @@ def indexer_forward_wrapper(
     """High-level wrapper. Allocates the output buffer with TMA padding on S_k.
 
     With ``precision='bf16'``, Q/K are BF16 and per-head W may be BF16 or FP32.
+    The block-scaled SM100 precisions take BF16 W and blockscaled-packed E8M0
+    ``q_scale`` / ``k_scale``, one scale per 32 head_dim values (``head_dim // 32``
+    per row): ``'mxfp8'`` (E4M3 Q/K) or ``'mxfp4'`` (``float4_e2m1fn_x2`` Q/K with
+    last dim ``head_dim // 2``, still ``head_dim // 32`` scales per row).
+    SM90 offers ``'fp8'`` with per-token scales instead.
     Returns ``{'scores': (B, S_q, S_k) FP32}``. The ratio causal mask marks
     positions outside the valid KV range with -inf. ``q_causal_offsets`` may
     specify the global uncompressed token index for each batch/THD segment's
@@ -256,7 +261,7 @@ def indexer_forward_wrapper(
     """
     if device_major() == 9:
         if cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:
-            raise NotImplementedError("MXFP8 scale padded cu_seqlens are only supported on SM100+")
+            raise NotImplementedError("Block-scale padded cu_seqlens are only supported on SM100+")
         unsupported = []
         if m_block_size != 128:
             unsupported.append(f"m_block_size={m_block_size}")
@@ -371,7 +376,9 @@ def indexer_forward_top_k_wrapper(
 ) -> TupleDict:
     """Combined SM100 indexer score generation and Top-K selection API.
 
-    With ``precision='bf16'``, Q/K are BF16 and per-head W may be BF16 or FP32.
+    With ``precision='bf16'``, Q/K are BF16 and per-head W may be BF16 or FP32;
+    ``'mxfp8'`` and ``'mxfp4'`` take block-scaled Q/K and BF16 W as in
+    :func:`indexer_forward_wrapper`.
     Returns ``{'indices', 'logits', 'softmax'}`` by default, plus ``'lse'``
     when requested. Set ``return_softmax=False`` to return only indices and
     logits. Unlike :func:`indexer_forward_wrapper`, this path never

@@ -735,6 +735,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
 
     cache_key = backend_cache_key(
         GroupedGemmBackend.BLOCK_SCALED,
+        a_tensor.device,
         *cache_key,
         wrapper_operand_meta(call.scheduler_counter_tensor),
         is_flat_sf(sfa_tensor),
@@ -1297,7 +1298,7 @@ def grouped_gemm_glu_wrapper_sm100(
     for dense dynamic scheduling. Initialize it to zero on the execution stream
     before each call; use distinct counters for overlapping invocations and GEMMs.
     """
-    if b_tensor is not None and sfa_tensor is not None and detect_framework(a_tensor) == "jax":
+    if b_tensor is not None and detect_framework(a_tensor) == "jax":
         from ..canonical_jax import check_jax_wrapper_options
         from .jax_api import grouped_gemm_glu_jax_sm100
 
@@ -1316,6 +1317,7 @@ def grouped_gemm_glu_wrapper_sm100(
             use_single_group_runtime_offsets=use_single_group_runtime_offsets,
             sf_fp8_dtype_override=sf_fp8_dtype_override,
             scheduler_counter_tensor=scheduler_counter_tensor,
+            sf_vec_sizes=(16, 32),
         )
         return grouped_gemm_glu_jax_sm100(
             a_tensor=a_tensor,
@@ -1337,6 +1339,7 @@ def grouped_gemm_glu_wrapper_sm100(
             glu_clamp_max=glu_clamp_max,
             glu_clamp_min=glu_clamp_min,
             generate_c=generate_c,
+            sf_vec_size=sf_vec_size,
         )
     # Hot-loop memo; see wrapper_operand_meta for the rationale. Everything
     # from here to api.execute() is derivation -- dtype resolution, GluCall construction,

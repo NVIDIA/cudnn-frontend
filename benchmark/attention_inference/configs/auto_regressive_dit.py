@@ -38,5 +38,5 @@ CONFIG = InferenceBenchmarkConfig(
     generation_shapes=[(q, 62208) for q in (1, 2, 3, 4)],
     generation_batch_sizes=[1],
     context_causal=False,
-    backends=["cudnn", "cudnn_oss"],
+    backends=["cudnn", "cudnn_oss", "cudnn_auto"],
 )

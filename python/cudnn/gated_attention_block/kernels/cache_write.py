@@ -24,6 +24,13 @@ two pre-development tables of a FROST kernel (barriers, SMEM buffers) are empty 
 
 Traffic per launch: ``n_ops * T * H * D * elem`` read + the same written, plus ``T`` slot reads.  The roofline term is
 HBM bytes; no perf claim is made here until one is measured on an exclusive GPU.
+
+Programmatic dependent launch (``use_pdl``): the ``griddepcontrol.wait`` precedes the first dependent read (the slot map and the
+source rows, both written by earlier kernels of the stream) and the ``launch_dependents`` release sits RIGHT AFTER it -- the
+streaming-kernel placement: the dependent's own wait still blocks on this grid's full completion and memory flush, so an early
+release costs nothing in correctness and lets the dependent's prologue (the decode tile's TMEM allocation, descriptor prefetch,
+barrier init) overlap this write instead of following it.  It used to sit at the kernel's END, after the stores, which only
+delayed that prologue by the whole write.
 """
 
 import hashlib
@@ -95,7 +102,10 @@ def frost_cache_write(
     ``D``, ``slot_mapping`` and the compile-time ``page_size``; their pools may differ in strides.
     """
     if cutlass.const_expr(use_pdl):
+        # The wait before the first dependent read (the slot map, the source rows); the release right after it (module docstring):
+        # the dependent's wait blocks on this grid's completion + flush regardless, so nothing below needs to precede the release.
         wait_on_dependent_grids()
+        launch_dependent_grids()
 
     lanes = cutlass.const_expr(lanes_per_row(d))
     chunks = cutlass.const_expr(vec_chunks(d))
@@ -173,9 +183,6 @@ def frost_cache_write(
             for c in cutlass.range_constexpr(chunks):
                 coff = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane_off
                 st_global_v4(dsts[r] + coff, srcs[r][c], cutlass.Int32)
-
-    if cutlass.const_expr(use_pdl):
-        launch_dependent_grids()
 
 
 @cute.jit
@@ -349,10 +356,18 @@ def run_cache_write(r: CacheWriteRecipe, src_a, src_b, pool_a, pool_b, slot, *, 
     t = int(src_a.shape[0])
     if src_b is not None and int(src_b.shape[0]) != t:
         raise ValueError(f"src_a and src_b must carry the same T, got {t} and {int(src_b.shape[0])}")
-    check_pool(pool_a, "pool_a", h=r.h, page_size=r.page_size, d=r.d, dtype=r.dtype)
+    # Every operand on ONE CUDA device, src_a's (the kernel reads them through device pointers): a CPU slot_mapping -- a serving
+    # stack's `torch.tensor(slots, dtype=torch.int32)` with no device= -- passed the dtype / rank / length checks and the kernel
+    # dereferenced a host address, an illegal-address fault that is sticky for the process; `is_cuda` alone cannot tell a tensor on
+    # ANOTHER GPU from a local one, so the pools and the slot mapping are compared against src_a's device by name.
+    if not src_a.is_cuda:
+        raise ValueError(f"src_a must be a CUDA tensor (the kernel reads every operand through a device pointer), got device {src_a.device}")
+    if src_b is not None and src_b.device != src_a.device:
+        raise ValueError(f"src_b must be on {src_a.device} with src_a, got {src_b.device}")
+    check_pool(pool_a, "pool_a", h=r.h, page_size=r.page_size, d=r.d, dtype=r.dtype, device=src_a.device)
     if pool_b is not None:
-        check_pool(pool_b, "pool_b", h=r.h, page_size=r.page_size, d=r.d, dtype=r.dtype)
-    check_slot_mapping(slot, "slot_mapping", t=t)
+        check_pool(pool_b, "pool_b", h=r.h, page_size=r.page_size, d=r.d, dtype=r.dtype, device=src_a.device)
+    check_slot_mapping(slot, "slot_mapping", t=t, device=src_a.device)
     if slot.dtype != r.slot_dtype:
         raise ValueError(f"slot_mapping is {slot.dtype} but this artifact was compiled for {r.slot_dtype}; the slot dtype is fixed per artifact")
     n_rows = t * r.h

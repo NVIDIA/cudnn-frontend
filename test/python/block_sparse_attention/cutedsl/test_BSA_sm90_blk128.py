@@ -5,7 +5,7 @@
 
 import pytest
 import torch
-from cudnn import BSA
+from cudnn import ops
 
 pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
@@ -120,7 +120,7 @@ def check(
 
         q, k, v = (row_view(t) for t in (q, k, v))
     opts = dict(block_sparse_num=count, q2k_block_nums=counts, block_sizes=sizes, sparse_block_size=128, softmax_scale=scale, layout=layout)
-    result = BSA.block_sparse_attention_forward(q, k, v, ids, allow_empty_block_nums=variable, kv_splits=splits, **opts)
+    result = ops.block_sparse_attention_forward(q, k, v, ids, allow_empty_block_nums=variable, kv_splits=splits, **opts)
     assert result["o_tensor"].is_contiguous()
     assert result["lse_tensor"].is_contiguous()
     do = torch.randn_like(result["o_tensor"]) if backward else None
@@ -131,7 +131,7 @@ def check(
         # Noncompact output rows exercise native writes, not temporary copies.
         backing = tuple(torch.full((*t.shape[:-1], t.shape[-1] * 2), 17.0, dtype=t.dtype, device=t.device) for t in (q, k, v))
         dest = tuple(storage[..., : t.shape[-1]] for storage, t in zip(backing, (q, k, v)))
-        gradients = BSA.block_sparse_attention_backward(
+        gradients = ops.block_sparse_attention_backward(
             do,
             q,
             k,
@@ -188,21 +188,21 @@ def test_split_partial_gqa(rank, splits):
 @pytest.mark.L0
 def test_graph_mutable_metadata_no_recompile():
     q, k, v, ids, counts, sizes, count = case(variable=True)
-    from cudnn.block_sparse_attention import _sm90_blk128 as native
+    from cudnn.block_sparse_attention import _interface as native
 
     do = torch.randn_like(q)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
 
     def run():
-        f = BSA.block_sparse_attention_forward(q, k, v, ids, count, q2k_block_nums=counts, allow_empty_block_nums=True, sparse_block_size=128)
-        g = BSA.block_sparse_attention_backward(do, q, k, v, f["o_tensor"], f["lse_tensor"], ids, count, q2k_block_nums=counts, sparse_block_size=128)
+        f = ops.block_sparse_attention_forward(q, k, v, ids, count, q2k_block_nums=counts, allow_empty_block_nums=True, sparse_block_size=128)
+        g = ops.block_sparse_attention_backward(do, q, k, v, f["o_tensor"], f["lse_tensor"], ids, count, q2k_block_nums=counts, sparse_block_size=128)
         return f, g
 
     with torch.cuda.stream(stream):
         run()
         run()
-        sizes_before = len(native._FWD_CACHE), len(native._BWD_CACHE)
+        sizes_before = len(native._bsa_attn_fwd_sm90_blk128.compile_cache), len(native._bsa_attn_bwd_sm90_blk128.compile_cache)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
             f, g = run()
@@ -215,7 +215,7 @@ def test_graph_mutable_metadata_no_recompile():
         finally:
             torch.cuda.set_sync_debug_mode("default")
     torch.cuda.current_stream().wait_stream(stream)
-    assert sizes_before == (len(native._FWD_CACHE), len(native._BWD_CACHE))
+    assert sizes_before == (len(native._bsa_attn_fwd_sm90_blk128.compile_cache), len(native._bsa_attn_bwd_sm90_blk128.compile_cache))
     assert torch.count_nonzero(f["o_tensor"]) == 0
     assert torch.isneginf(f["lse_tensor"]).all()
     for t in g:
@@ -230,7 +230,7 @@ def test_graph_mutable_metadata_no_recompile():
     torch.testing.assert_close(f["lse_tensor"].double(), rl, atol=1e-4, rtol=1e-5)
     for got, expected in zip(g, rg):
         torch.testing.assert_close(got.double(), expected, atol=3e-2, rtol=3e-2)
-    assert sizes_before == (len(native._FWD_CACHE), len(native._BWD_CACHE))
+    assert sizes_before == (len(native._bsa_attn_fwd_sm90_blk128.compile_cache), len(native._bsa_attn_bwd_sm90_blk128.compile_cache))
 
 
 @pytest.mark.L1
@@ -276,7 +276,7 @@ def test_forward_partial_prologue(scale, variable):
     ids.copy_(order)
     sizes.fill_(128)
     sizes[:, -1] = 1
-    result = BSA.block_sparse_attention_forward(
+    result = ops.block_sparse_attention_forward(
         q, k, v, ids, count, q2k_block_nums=counts, allow_empty_block_nums=variable, block_sizes=sizes, sparse_block_size=128, softmax_scale=scale
     )
     ro, rl, _ = reference(q, k, v, ids, counts, sizes, count, scale, "bhsd")
@@ -295,10 +295,10 @@ def test_unsupported_contracts(kind):
     if kind == "unaligned_rows":
         q = torch.empty((*q.shape[:-1], 129), device=q.device, dtype=q.dtype)[..., :128]
         with pytest.raises(NotImplementedError, match="aligned"):
-            BSA.block_sparse_attention_forward(q, k, v, ids, count, sparse_block_size=128)
+            ops.block_sparse_attention_forward(q, k, v, ids, count, sparse_block_size=128)
     else:
         with pytest.raises((NotImplementedError, ValueError)):
-            BSA.block_sparse_attention_backward(
+            ops.block_sparse_attention_backward(
                 torch.empty_like(q),
                 q,
                 k,
@@ -334,7 +334,7 @@ def test_dsl_floor_before_kernel_import(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", guarded_import)
     q, k, v, ids, _, _, count = case()
     with pytest.raises(RuntimeError, match="requires nvidia-cutlass-dsl"):
-        BSA.block_sparse_attention_forward(q, k, v, ids, count, sparse_block_size=128)
+        ops.block_sparse_attention_forward(q, k, v, ids, count, sparse_block_size=128)
 
 
 @pytest.mark.L1
@@ -353,13 +353,13 @@ def test_maximum_splits():
 @pytest.mark.parametrize("bucket", [1, 256])
 @pytest.mark.parametrize("layout", ["bhsd", "bshd"])
 def test_dynamic_shape_compile_reuse(monkeypatch, variable, bucket, layout):
-    from cudnn.block_sparse_attention import _sm90_blk128 as native
+    from cudnn.block_sparse_attention import _interface as native
 
-    monkeypatch.setattr(native, "_FWD_CACHE", {})
-    monkeypatch.setattr(native, "_BWD_CACHE", {})
+    monkeypatch.setattr(native._bsa_attn_fwd_sm90_blk128, "compile_cache", {})
+    monkeypatch.setattr(native._bsa_attn_bwd_sm90_blk128, "compile_cache", {})
     for b, h, sq, sk, count, strided in [(2, 4, 193, 385, 2, False), (3, 6, 321, 641, 3, False), (1, 2, 449, 769, 4, True), (2, 4, 577, 897, 5, True)]:
         check(b=b, h=h, sq=sq, sk=sk, active_count=count, variable=variable, bucket=bucket, strided=strided, layout=layout)
         # A strided metadata view has no unit stride and needs a distinct tensor
         # type; subsequent sizes within each layout must reuse the compiled code.
-        assert len(native._FWD_CACHE) == (2 if strided else 1)
-        assert len(native._BWD_CACHE) == 1
+        assert len(native._bsa_attn_fwd_sm90_blk128.compile_cache) == (2 if strided else 1)
+        assert len(native._bsa_attn_bwd_sm90_blk128.compile_cache) == 1

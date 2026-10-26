@@ -3075,7 +3075,8 @@ def test_sdpa_thd_output_stride_int64(d_qk, d_v, binder, monkeypatch):
     graph = cudnn.pygraph(io_data_type=bf16, intermediate_data_type=cudnn.data_type.FLOAT,
                           compute_data_type=cudnn.data_type.FLOAT, is_override_shape_enabled=True)
     def lengths(name):
-        return graph.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=i32, name=name)
+        dtype = cudnn.data_type.INT64 if name == "off_o" else i32
+        return graph.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=dtype, name=name)
     cu_q, cu_kv = lengths("cu_q"), lengths("cu_kv")
     off_q, off_k, off_v, off_o, off_lse = [lengths(n) for n in ("off_q", "off_k", "off_v", "off_o", "off_lse")]
     def operand(name, h, s, d, offset):
@@ -3112,7 +3113,7 @@ def test_sdpa_thd_output_stride_int64(d_qk, d_v, binder, monkeypatch):
     ck = torch.arange(b + 1, device="cuda", dtype=torch.int32) * kl
     pack = {q: q_buf, k: k_buf, v: v_buf, o: o_buf, stats: lse_buf, cu_q: cq, cu_kv: ck,
             off_q: cq * hq * d_qk, off_k: ck * hk * d_qk, off_v: ck * hk * d_v,
-            off_o: cq * hq * d_v, off_lse: cq * hq}
+            off_o: cq.to(torch.int64) * row_stride, off_lse: cq * hq}
     workspace = torch.empty(max(graph.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     overrides = dict(override_uids=[o.get_uid()], override_shapes=[[b, hq, ql, d_v]],
                      override_strides=[[hq * d_v, d_v, row_stride, 1]])
@@ -4754,8 +4755,8 @@ def test_sdpa_fwd_cc107_decode_tile_sink_keyless_rows_L0(env_info, request, cudn
 
 
 _P3_ENVELOPE_CASES = {
-    # GPT-OSS: d64 through the d128 envelope, 64/8, MTP depth 4, a left window of 128 keys, mixed per-batch caches incl. one live key
-    "gpt_oss_d64_sink_swa": dict(cfg=dict(b=4, h_q=64, h_kv=8, s_q=4, s_kv=4096, d=64, left_bound=128, stats=True, seq_len_q=[4] * 4, seq_len_kv=[4096, 4095, 129, 1]), pin=None, cga=1, knobs=None, template="decode_d128_f16"),
+    # GPT-OSS uses the native SM107 d64 tile; pin its unpacked cga1 plan.
+    "gpt_oss_d64_sink_swa": dict(cfg=dict(b=4, h_q=64, h_kv=8, s_q=4, s_kv=4096, d=64, left_bound=128, stats=True, seq_len_q=[4] * 4, seq_len_kv=[4096, 4095, 129, 1]), pin="u1n", cga=None, knobs=None, template="prefill_d128_f16"),
     "mha_q8_sink": dict(cfg=dict(b=8, h_q=8, h_kv=8, s_q=8, s_kv=2048), pin=None, cga=1, knobs=dict(pack_gqa=False), template="decode_d128_f16"),
     "fp16_b64_q8_kv8192": dict(cfg=dict(b=64, h_q=64, h_kv=8, s_q=8, s_kv=8192, dtype=torch.float16), pin=None, cga=1, knobs=None, template="decode_d128_f16"),
     "mha_decode_small": dict(cfg=dict(b=1, h_q=4, h_kv=4, s_q=1, s_kv=128, causal=False, stats=True), pin=None, cga=1, knobs=None, template="decode_d128_f16"),
@@ -4771,9 +4772,8 @@ _P3_ENVELOPE_CASES = {
 @pytest.mark.L0
 @pytest.mark.parametrize("case", sorted(_P3_ENVELOPE_CASES))
 def test_sdpa_fwd_cc107_decode_tile_envelope_pinned_L0(env_info, request, cudnn_handle, case):
-    """Pinned cells at the edges of the dense d128 contract on cc 10.7 (issue #1472): the GPT-OSS geometry (d64 through
-    the d128 envelope, 64/8, left window 128, bottom-right causal, mixed caches incl. a single live key, Stats) on the
-    decode tile; an MHA verify graph (8/8, S_q 8) riding the tile unpacked; an fp16 B64 verify graph over an 8k cache;
+    """Dense attention boundary cases on cc 10.7 (issue #1472): GPT-OSS d64 with a left window, sinks, mixed cache
+    lengths and Stats on its native tile; MHA (8/8, S_q 8) on the unpacked decode tile; fp16 B64 over an 8k cache;
     the smallest decode graph with Stats and no mask (SMOKE); the smallest PackGQA pin at cga2 on the shared prefill
     body (8/2, S_q 64: 256 rows per unit, past the tile; SMOKE); and two over-tile cga1 pins (B1 64/4 Q512, unpacked and
     packed: a decode grid of several Q tiles per unit, which an explicit pin reaches and the heuristics never propose).
@@ -4784,6 +4784,7 @@ def test_sdpa_fwd_cc107_decode_tile_envelope_pinned_L0(env_info, request, cudnn_
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
     test.cfg = _p3_dense_cfg(**c["cfg"])
     knobs, template = _pin_knobs(test.cfg, c["pin"]) if c["pin"] else (c["knobs"], c["template"])
+    template = c["template"] or template
     test.showConfig((request.node.name, 1), request)
 
     with _must_run(request):
@@ -4835,11 +4836,8 @@ def test_sdpa_fwd_cc107_sink_free_decode_split_pins_L0(env_info, request, cudnn_
 @_cc107_only
 @pytest.mark.L0
 @pytest.mark.parametrize("shape", ["b128_64x8_q8_kv2056", "b4_32x8_q4_kv1024"], ids=lambda x: x)
-def test_sdpa_fwd_cc107_sink_split_declines_L0(request, cudnn_handle, shape):
-    """Lever D's boundary, pinned: with an attention sink the cc 10.7 half row offers the decode tile packed and
-    unpacked (admission through get_engine_and_knobs_at_index) and NO split set, and an explicit sink + split pin is a
-    typed decline naming the sink-free contract (the shared combine folds no sink; a split would count it once per
-    partition).  A direct graph.sdpa graph (bf16 BSHD, bottom-right causal, sinks linspace(7, 10, H_q))."""
+def test_sdpa_fwd_cc107_sink_split_pins_L0(request, cudnn_handle, shape):
+    """The existing sink decode proposals remain legal and an explicit split folds the sink once."""
     engine = _cc107_engine("half")
     _require_frost_sm107(engine)
     b, h_q, h_kv, s_q, s_kv = dict(b128_64x8_q8_kv2056=(128, 64, 8, 8, 2056), b4_32x8_q4_kv1024=(4, 32, 8, 4, 1024))[shape]
@@ -4858,17 +4856,27 @@ def test_sdpa_fwd_cc107_sink_split_declines_L0(request, cudnn_handle, shape):
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-        return g
+        return g, {q_t: q, k_t: k, v_t: v, s_t: sink, o_t: o}
 
-    offered = _cc107_half_plan_sets(build())
+    offered = _cc107_half_plan_sets(build()[0])
     assert {(1, 1, 1), (0, 1, 1)} <= offered, offered
-    assert all(split == 1 for _, _, split in offered), offered
-    g = build()
+    g, bindings = build()
     g.create_execution_plan(_cc107_half_engine_id(), {kt.PACK_GQA: 1, kt.TILE_CGA_M: 1, kt.SPLIT_KV: 2, kt.SCHED_POLICY: 0, kt.TILE_M: 128, kt.TILE_N: 128})
     g.select_plan(g.get_execution_plan_count() - 1)
-    with pytest.raises((cudnn.cudnnGraphNotSupportedError, NotImplementedError, ValueError), match="sink-free"):
-        g.check_support()
-        g.build_plans()
+    g.check_support()
+    g.build_plans()
+    workspace = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    g.execute(bindings, workspace, handle=cudnn_handle)
+    torch.cuda.synchronize()
+    mask = torch.arange(s_kv, device="cuda")[None, :] > torch.arange(s_q, device="cuda")[:, None] + s_kv - s_q
+    for batch in range(b):
+        keys = k[batch].double().repeat_interleave(h_q // h_kv, 0)
+        values = v[batch].double().repeat_interleave(h_q // h_kv, 0)
+        scores = (q[batch].double() @ keys.transpose(-1, -2)) * d ** -0.5
+        scores.masked_fill_(mask, -torch.inf)
+        scores = torch.cat([scores, sink.double().reshape(h_q, 1, 1).expand(h_q, s_q, 1)], dim=-1)
+        ref = scores.softmax(-1)[..., :-1] @ values
+        torch.testing.assert_close(o[batch].double(), ref, atol=4e-3, rtol=4e-3)
 
 
 _P3_PAGED_SINK_KV = [2056, 2048, 1025, 513, 300, 129, 128, 16, 15, 1, 0, 1536, 777, 255, 33, 4, 2047, 64, 17, 1024, 2000, 511, 96, 7]
