@@ -457,10 +457,70 @@ def test_sm107_d512_2x2_config_pins_and_ledger():
             _validate_cfg_d512_2x2_sm107(replace(cfg, **bad), "test")
     with pytest.raises(ValueError, match="BF16/FP16"):
         make_cfg_d512(TemplateParams(mma_2x2=True, dtype_qkv=0, dtype_o=2))
-    with pytest.raises(ValueError, match="qh_per_kh"):
-        make_cfg_d512(TemplateParams(mma_2x2=True, pack_gqa=True, qh_per_kh=128))
+    packed, _ = make_cfg_d512(TemplateParams(mma_2x2=True, pack_gqa=True, qh_per_kh=128))
+    assert packed.PACK_G == 64 and packed.QH_PER_KH == 128
     # The default arm is untouched by the dispatch (dataclass-equal with and without the field).
     assert make_cfg_d512(TemplateParams()) == make_cfg_d512(TemplateParams(mma_2x2=False))
+
+
+@pytest.mark.parametrize("group", [1, 6, 12, 64, 128])
+@pytest.mark.parametrize("splits", [1, 2, 8])
+@pytest.mark.parametrize("dtype", [2, 3])
+def test_sm107_d512_2x2_packed_split_records(group, splits, dtype):
+    import math
+    from cudnn.sdpa.fwd.config_sm100 import make_cfg_d512 as make_sm100
+    from cudnn.sdpa.fwd.config_sm107 import make_cfg_d512
+
+    params = TemplateParams(mma_2x2=True, dtype_qkv=dtype, dtype_o=dtype, pack_gqa=True, qh_per_kh=group, split_kv=splits, has_sink=True, stats_log2=True)
+    cfg, _ = make_cfg_d512(params)
+    assert (cfg.PACK_G, cfg.QH_PER_KH, cfg.SPLIT_KV) == (math.gcd(group, 64), group, splits)
+    assert cfg.HAS_SINK and cfg.STATS_LOG2
+    if group in (6, 12, 128):
+        with pytest.raises(ValueError, match="qh_per_kh"):
+            make_sm100(params)
+
+
+@pytest.mark.parametrize("group", [6, 64, 128])
+@pytest.mark.parametrize("splits", [1, 8])
+@pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
+def test_sm107_d512_packed_split_graph_and_adapter_contract(monkeypatch, group, splits, dtype_name):
+    import math
+    import torch
+    import cudnn
+    from cudnn.sdpa.fwd import api_dsl, engines
+
+    _fake_cc(monkeypatch, (10, 7))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    dtype = getattr(torch, dtype_name)
+    api = api_dsl.SdpaFwdDslSm100(
+        _desc((2, 2 * group, 3, 512), dtype, "q"),
+        _desc((2, 2, 257, 512), dtype, "k"),
+        _desc((2, 2, 257, 512), dtype, "v"),
+        _desc((2, 2 * group, 3, 512), dtype, "o"),
+        None,
+        pack_gqa=True,
+        split_kv=splits,
+        cga=2,
+        sched_policy=0,
+        is_causal=True,
+        causal_bottom_right=True,
+        has_sink=True,
+        stats_log2=True,
+    )
+    api.check_support()
+    params = api.template_params()
+    assert params.mma_2x2 and params.pack_gqa and params.split_kv == splits
+    assert api._fp32_partial_split() == (splits > 1)
+    module = _load_sm100_kernel_module((512, 512), params, rubin=True)
+    assert module.__file__.endswith("sm107/prefill_d512_f16_2x2.py")
+    assert module.CFG.PACK_G == math.gcd(group, 64)
+    assert module.FOLD_SINK == (splits == 1)
+    dt = cudnn.data_type.HALF if dtype_name == "float16" else cudnn.data_type.BFLOAT16
+    facts = _f16_facts(d_qk=512, d_v=512, h_q=2 * group, h_kv=2, s_q=3, s_kv=257, dtype=dt, dtype_o=dt, causal=True, bottom_right=True, has_sink=True)
+    knobs = engines.SdpaFwdKnobs(cga=2, pack_gqa=True, split_kv=splits, sched_policy=0)
+    assert engines.mismatch(_caps("sdpa_fwd_prefill_sm107"), facts, knobs) is None
+    for changed in (dict(thd=True, padded=True), dict(has_paged_kv=True, page_size=16), dict(device_cc=(10, 0))):
+        assert engines.mismatch(_caps("sdpa_fwd_prefill_sm107"), dataclasses.replace(facts, **changed), knobs) is not None
 
 
 def test_sm107_d512_2x2_descriptor_version_matches_the_smem_budget():
@@ -863,7 +923,7 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
     assert caps.split_kv_supported is True
     for d_qk, d_v in _FLAVORS:
         why = engines.mismatch(caps, _f16_facts(d_qk=d_qk, d_v=d_v), engines.SdpaFwdKnobs(split_kv=2))
-        assert (why is None) == (d_v == 128), (d_qk, d_v, why)
+        assert (why is None) == (d_v == 128 or (d_qk, d_v) == (512, 512)), (d_qk, d_v, why)
     # The small head-dim tiles carry the dense leg only: a split graph at D <= 64 is selected past them onto the d128 flavor
     # (its pre-tile route) and served there, never declined (engines.Capabilities.dense_only_d_shapes).
     for d in (24, 32, 64):
