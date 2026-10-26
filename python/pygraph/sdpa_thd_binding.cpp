@@ -167,6 +167,7 @@ enum HostSlot : size_t {
     GatePtr,
     GateStrides,
     OriginPtrs,
+    OriginCaps,
     NumHostSlots
 };
 constexpr std::array<const char *, NumHostSlots> host_slot_names = {"q_ptr",
@@ -197,7 +198,8 @@ constexpr std::array<const char *, NumHostSlots> host_slot_names = {"q_ptr",
                                                                     "partial_o_strides",
                                                                     "gate_ptr",
                                                                     "gate_strides",
-                                                                    "thd_origin_ptrs"};
+                                                                    "thd_origin_ptrs",
+                                                                    "thd_origin_caps"};
 constexpr std::array<HostSlot, 4> pointer_slots                  = {QPtr, KPtr, VPtr, OPtr};
 constexpr std::array<HostSlot, 4> stride_slots                   = {QStrides, KStrides, VStrides, OStrides};
 
@@ -365,6 +367,16 @@ class SdpaThdBinder {
         if (order.size() != template_.size()) invalid("native THD host argument template has the wrong size");
         for (size_t slot = 0; slot < NumHostSlots; ++slot) {
             if (slot == OriginPtrs && !has_origins_) continue;
+            if (slot == OriginCaps) {
+                // Optional: only a host that declares it (the SM90 D512 tile, which clamps origins and clips its port
+                // views to each port's own buffer) receives the per-port token capacities. The tq / tkv bounds
+                // below are live-token bounds (max_total_seq_len_*), not the physical spans of gapped buffers.
+                auto found = std::find(order.begin(), order.end(), host_slot_names[slot]);
+                if (!has_origins_ || found == order.end()) continue;
+                has_origin_caps_ = true;
+                index_[slot]     = static_cast<size_t>(found - order.begin());
+                continue;
+            }
             // Nonpaged hosts (including SM120) need not expose paged ABI slots.
             if (!paged_ && slot >= KTablePtr && slot <= NumPages) continue;
             if (splits_ == 1 && slot >= OPartialPtr && slot <= PartialOStrides) continue;
@@ -590,6 +602,19 @@ class SdpaThdBinder {
         } else if (facts[Sinks].filled) {
             invalid("this specialization was compiled without a sink; construct the API with has_sink");
         }
+        py::object origin_caps = py::none();
+        if (has_origin_caps_) {
+            const int64_t stats_tokens =
+                !has_lse_
+                    ? 0
+                    : (lse_capacity >= 0 ? lse_capacity : (lse_head_major_ && lse_head_stride ? lse_head_stride : tq));
+            // Paged K/V carry no origin (their pages are bound through the block table).
+            origin_caps = py::make_tuple(capacity(facts[Q], geometry[Q], "q"),
+                                         paged_ ? 0 : capacity(facts[K], geometry[K], "k"),
+                                         paged_ ? 0 : capacity(facts[V], geometry[V], "v"),
+                                         capacity(facts[O], geometry[O], "o"),
+                                         stats_tokens);
+        }
         if (!workspace) invalid("prepared THD requires a non-null workspace");
         if (workspace % workspace_alignment_ != 0)
             invalid("the workspace must be " + std::to_string(workspace_alignment_) + "-byte aligned");
@@ -598,6 +623,7 @@ class SdpaThdBinder {
         // slots. No frame or runtime pointer is ever written into the plan.
         py::list frame(template_);
         if (has_origins_) put(frame, OriginPtrs, std::move(origin_ptrs));
+        if (has_origin_caps_) put(frame, OriginCaps, std::move(origin_caps));
         for (size_t i = Q; i <= O; ++i) {
             put(frame, pointer_slots[i], py::int_(facts[i].pointer));
             if (!paged_ || i == Q || i == O)
@@ -929,7 +955,8 @@ class SdpaThdBinder {
     std::array<size_t, NumHostSlots> index_;
     std::array<std::array<int64_t, 6>, 4> declarations_;
     std::array<int, 4> dtype_code_, dtype_bits_;
-    bool has_origins_ = false;
+    bool has_origins_     = false;
+    bool has_origin_caps_ = false;
     std::array<int64_t, 5> origin_bits_{};
     bool has_gate_ = false;
     int gate_code_ = kDLBfloat;
@@ -956,6 +983,7 @@ init_sdpa_thd_binding(py::module_ &m) {
     py::class_<SdpaThdBinder>(m, "_SdpaThdBinder")
         .def(py::init<const py::object &>(), py::arg("spec"))
         .def_prop_ro_static("supports_physical_origins", [](py::object) { return true; })
+        .def_prop_ro_static("supports_physical_origin_caps", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_split_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_initial_waves", [](py::object) { return true; })

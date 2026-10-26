@@ -214,7 +214,7 @@ class ThdLaunchSpec:
 
 # The host slot vocabulary the prepared launch binds: constants written once at build, and slots the native THD binder writes per call.
 _FILLED_AT_BUILD = frozenset(
-    "q_strides o_strides k_strides v_strides lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_lens_form thd_origin_ptrs o_partial_ptr "
+    "q_strides o_strides k_strides v_strides lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_lens_form thd_origin_ptrs thd_origin_caps o_partial_ptr "
     "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr ragged_q_div "
     "score_max_ptr score_sum_exp_ptr score_max_strides score_sum_exp_strides "
     # The bias / kv_mask slots of the sm107 f16 d128-file host (dense-only arms; a THD plan never requests them).
@@ -399,6 +399,9 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
         raise NotImplementedError("cudnn.sdpa: this prepared THD launch requires packed initial-wave geometry; rebuild the extension")
     if s.origin_specs is not None and not getattr(_pybind_module._SdpaThdBinder, "supports_physical_origins", False):
         raise NotImplementedError("physical THD origins require rebuilding the native extension")
+    if s.origin_specs is not None and "thd_origin_caps" in s.index and not getattr(_pybind_module._SdpaThdBinder, "supports_physical_origin_caps", False):
+        # The SM90 D512 host clamps origins into each port's own buffer; an older binder would leave the slot at None.
+        raise NotImplementedError("per-port physical THD origin capacities require rebuilding the native extension")
     if s.origin_specs is not None and s.paged and not getattr(_pybind_module._SdpaThdBinder, "supports_paged_physical_origins", False):
         raise NotImplementedError("paged physical THD origins require rebuilding the native extension")
     if (
@@ -584,7 +587,7 @@ class PreparedThdLaunch:
 
 # Constants written at build, and slots the native dense binder writes per call.
 _FILLED_AT_BUILD_DENSE = frozenset(
-    "lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_q_lens_ptr thd_kv_lens_ptr thd_lens_form thd_origin_ptrs o_partial_ptr "
+    "lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_q_lens_ptr thd_kv_lens_ptr thd_lens_form thd_origin_ptrs thd_origin_caps o_partial_ptr "
     "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr ragged_q_div "
     "score_max_ptr score_sum_exp_ptr score_max_strides score_sum_exp_strides "
     "bias_ptr bias_strides bias_extents kv_mask_ptr kv_mask_batch_stride inv_scale_softmax".split()

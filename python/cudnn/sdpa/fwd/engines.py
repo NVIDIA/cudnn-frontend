@@ -304,7 +304,8 @@ class Capabilities:
     lse_optional: bool = False
     # Most THD forward lowerings derive addresses from compact length prefixes.
     # The SM100/SM103 ungated, unsplit CGA2 half D128/D256 graph lowering
-    # reads independent Q/O/Stats origins and nonpaged K/V origins. See
+    # reads independent Q/O/Stats origins and nonpaged K/V origins; the SM90
+    # D512 graph lowering reads independent Q/K/V/O/Stats origins. See
     # SUPPORT_MATRIX_TRACKER.md for this scope and the remaining sibling gaps;
     # thd=True alone does not promise support for padding between sequences.
     thd: bool = False
@@ -3292,10 +3293,17 @@ def lower_dsl_prefill(
         and facts.d_qk == facts.d_v
         and facts.d_qk in (128, 256)
         and ((api.split_kv == 1 and api.cga in (None, 2)) or (facts.has_paged_kv and facts.d_qk == 128 and api.cga == 1))
+    ) or (
+        # The SM90 row (f16/bf16, nonpaged, unsplit, ungated by its capabilities) reads every
+        # port's offsets: its setup launch builds per-sequence K/V/O maps at the origins.
+        facts.thd
+        and spec.name == "sdpa_fwd_prefill_sm90"
     ):
         from .thd_origins import graph_origin_specs
 
         api._thd_origin_specs = graph_origin_specs(facts)
+        if spec.name == "sdpa_fwd_prefill_sm90" and all(origin is None for origin in api._thd_origin_specs):
+            api._thd_origin_specs = None  # no port binds offsets: the packed layout and its B + 3 maps
     if facts.shape_overrides:
         reason = _prepared_decline_reason(spec.capabilities, facts, getattr(api, "split_kv", 1))
         if reason is not None:

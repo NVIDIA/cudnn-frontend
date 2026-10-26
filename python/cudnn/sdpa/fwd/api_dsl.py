@@ -47,6 +47,7 @@ from cudnn.sdpa.fwd.config_sm90 import (
     TILE_N as _SM90_TILE_N,
     TemplateParams as Sm90TemplateParams,
     head_dims_mismatch as _sm90_head_dims_mismatch,
+    validate_params as _sm90_validate_params,
 )
 from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES as _SM107_F16_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import supports_native_d128_dense_partial_pack, supports_native_d128_narrow_tile, supports_native_d512_dense_pack_split
@@ -5302,6 +5303,12 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
+        origin_specs = getattr(self, "_thd_origin_specs", None)
+        if origin_specs is not None and self.params.thd_origins is None:
+            # The graph lowering bound per-port physical offsets (thd_origins.graph_origin_specs): every
+            # (row, multiplier, token stride, bits) entry becomes the template's (bits, multiplier).
+            self.params = replace(self.params, thd_origins=tuple((spec[3], spec[1]) if spec is not None else None for spec in origin_specs))
+            _sm90_validate_params(self.params)
         self._k_mod = template = _load_kernel_template("sm90/prefill_d512_f16.py", self.params, tag="sdpa_fwd_sm90_d512")
         self._compiled_kernel = template.compile(
             self.batch_size,
@@ -5324,13 +5331,14 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
         self._logger.debug("compile completed")
 
     def scratch_workspace_bytes(self) -> int:
-        """THD: the metadata, then the ``B + 3`` tensor maps, bound as ``seq_kv_lens``; a dense plan needs none."""
+        """THD: the metadata, then the tensor maps (and, with physical offsets, the per-port origins),
+        bound as ``seq_kv_lens``; a dense plan needs none."""
         self._ensure_support_checked()
         if not self.thd:
             return 0
-        from cudnn.frost.tile_dsl.thd import THD_MAPS_META_WORDS
+        from cudnn.sdpa.fwd.config_sm90 import thd_meta_words
 
-        return THD_MAPS_META_WORDS(self.batch_size) * 4
+        return thd_meta_words(self.batch_size, getattr(self, "_thd_origin_specs", None) is not None) * 4
 
     def execute(
         self,
