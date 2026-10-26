@@ -199,16 +199,29 @@ def qsa_indexed_forward(q, k, v, indices, scale=1 / 16):
     return TupleDict(zip(("out", "out_fp32", "lse"), outputs))
 
 
-def qsa_indexed_backward(grad_out, q, k, v, out_fp32, lse, indices, scale=1 / 16, cu_seqlens=None):
-    """Return BF16 ``(dq, dk, dv)``; preserve forward's FP32 output and LSE.
+def qsa_indexed_backward(grad_out, q, k, v, out_fp32, lse, indices, scale=1 / 16, *, selection_mode="general", cu_seqlens=None, max_seq_len=None):
+    """Return BF16 ``(dq, dk, dv)`` using forward's FP32 output and LSE.
 
-    ``cu_seqlens`` (int32 ``[B + 1]`` prefix sums) describes the documents of a packed buffer. Without it the rows are
-    one sequence: still exact for packed documents, since the selection says which keys a query sees, but the dense
-    prefix path then serves only the first document.
+    ``general`` preserves arbitrary group ordering, padding holes and empty rows and treats the rows as one sequence,
+    which stays exact for packed documents (the selection says which keys a query sees) but serves only the first
+    document on the dense prefix path. ``causal_topk`` declares the top-512 complete four-token blocks plus causal-tail
+    contract described in ``docs/fe-oss-apis/qsa_indexed.md``; its packed form takes device int32 ``cu_seqlens``
+    (``[B + 1]`` prefix sums) and an optional host ``max_seq_len`` bound. Both modes run the same engine.
     """
+    if not isinstance(selection_mode, str) or selection_mode not in ("general", "causal_topk"):
+        raise ValueError("selection_mode must be 'general' or 'causal_topk'")
+    if selection_mode == "general" and (cu_seqlens is not None or max_seq_len is not None):
+        raise ValueError("cu_seqlens and max_seq_len require selection_mode='causal_topk'; general selection encodes its bounds in indices")
     if grad_out is None:
         raise ValueError("grad_out is required")
     total, width = _validate(q, k, v, indices, scale, grad_out, out_fp32, lse, cu_seqlens)
+    if selection_mode == "causal_topk":
+        if width != 2052 or scale != 1 / 16:
+            raise NotImplementedError("causal_topk requires index width 2052 and scale=1/16")
+        if max_seq_len is not None and (type(max_seq_len) is not int or not 1 <= max_seq_len <= total):
+            raise ValueError(f"max_seq_len must be a host integer in [1, {total}]")
+        if cu_seqlens is None and max_seq_len is not None and max_seq_len != total:
+            raise ValueError("Without cu_seqlens, max_seq_len must equal the single sequence's token count")
     plan = _plan(total, width, q.device, "bprop", 0 if cu_seqlens is None else cu_seqlens.shape[0] - 1)
     with torch.cuda.device(q.device):
         outputs = (torch.empty_like(q), torch.empty_like(k), torch.empty_like(v))

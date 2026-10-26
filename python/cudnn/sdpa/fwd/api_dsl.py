@@ -8,17 +8,18 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 import os
 from abc import abstractmethod
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from types import SimpleNamespace
 from typing import Hashable, Iterator, Optional
 
 import torch
-
 from cudnn._torch_stream import stream_context
 from cuda.bindings import driver as cuda
 
@@ -48,6 +49,7 @@ from cudnn.sdpa.fwd.config_sm90 import (
     head_dims_mismatch as _sm90_head_dims_mismatch,
 )
 from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES as _SM107_F16_THD_SHAPES
+from cudnn.sdpa.fwd.config_sm107 import supports_native_d128_dense_partial_pack
 from cudnn.sdpa.fwd.config_sm107 import SM107_F16_SMALL_D_SHAPES as _SM107_F16_SMALL_D_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import SM107_SMALL_D_CGAS as _SM107_SMALL_D_CGAS
 from cudnn.sdpa.fwd.config_sm107 import sm107_small_tile_leg as _sm107_small_tile_leg
@@ -107,6 +109,8 @@ from cudnn.sdpa.fwd.config_sm100 import (
     supports_paged_split_sink,
     supports_paged_prefill_cga1,
     supports_paged_d256_pack_gqa,
+    supports_nonpaged_d128_thd_prefill,
+    supports_paged_d128_partial_pack_gqa,
     supports_nonpaged_d128_thd_pack_gqa,
     _PAGED_KV_FLAVORS as _SM100_PAGED_KV_FLAVORS,
     TemplateParams as Sm100TemplateParams,
@@ -142,6 +146,17 @@ from cudnn.sdpa.fwd.config_sm120 import (
     smem_bytes as _sm120_smem_bytes,
     tile_domain as _sm120_tile_domain,
 )
+
+
+@lru_cache(maxsize=256)
+def _parameter_names(entry) -> frozenset:
+    """Plan-time names shared across plans of the same adapter/kernel function.
+
+    Key the function itself so a replaced entry is inspected independently.
+    Cache only module/class functions and immutable names, never adapter
+    instances or compiled launchables.
+    """
+    return frozenset(inspect.signature(entry).parameters)
 
 
 def _q_lens_addr(t: Optional[torch.Tensor]) -> int:
@@ -677,7 +692,7 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     path. Rubin uses its SM107 siblings except for the shared half packed
     split and paged pipelines, whose SMEM fits the version-0 descriptor window,
     and, on dense (128, 128) half graphs, the shared d128 decode tile at cga1
-    and the shared d128 prefill body under PackGQA (issue #1472)."""
+    and native D128 prefill under PackGQA."""
 
     tag = _flavor_tag(flavor)
     if rubin and not fp8 and getattr(params, "decode_q_tile", 0):
@@ -705,18 +720,6 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         # version-0 descriptor window) -- the dense twin of the single-CTA THD leg above (issue #1472).  THD_VARLEN at cga1
         # is the two-slab paged prefill (above) or the single-Q split (above); never this body.
         return _load_kernel_template(_SM100_DECODE_KERNEL_FILE, params, f"sdpa_fwd_sm107_{tag}_decode")
-    if (
-        rubin
-        and not fp8
-        and flavor == _SM100_DECODE_FLAVOR
-        and params.pack_gqa
-        and not params.paged_kv
-        and (not params.thd_varlen or (params.cta_mma == 2 and params.split_kv == 1))
-    ):
-        # Dense or unsplit ragged packed d128 half at cga2 on cc 10.7: the shared SM100 prefill body (192 KiB) carries the
-        # PACK_GQA arm and the row_head_idx sink fold the Rubin sibling lacks (issue #1472); unpacked cga2 stays on the
-        # sibling below.  Tag spelling keys the module cache: keep it distinct from the paged and single_q tags.
-        return _load_kernel_template(_SM100_KERNEL_FILES[flavor], params, f"sdpa_fwd_sm107_{tag}_packed")
     if rubin:
         # Tag spelling is load-bearing: it keys the template-module cache, and
         # "sdpa_fwd_sm107_fp8_<flavor>" is what the shipped d128 FP8 row has
@@ -2080,10 +2083,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
 
     def _rubin_shared_dense_leg(self) -> bool:
-        """True when the loader picks a shared SM100 d128 body for a DENSE cc 10.7 half graph (``_load_sm100_kernel_module``):
-        cga=1 (the decode tile) or PackGQA at cga2 (the prefill body).  Those bodies apply the attention scale in-kernel, so
-        the pre-folded scale declines on them here and in engines (mismatch / effective_cgas); they also serve PackGQA with a
-        split as on the SM100 line.  Twin of engines.rubin_dense_d128_shared_leg; keep the three in lockstep (issue #1472)."""
+        """Historical dense D128 decode/packing admission predicate (issue #1472).
+
+        CGA1 uses the shared decode tile; packed CGA2 now uses native SM107 prefill.
+        The existing public pre-folded-scale and split admission gates still use this
+        predicate. Keep those gates in sync with engines.rubin_dense_d128_shared_leg.
+        """
         return bool(
             self._device_cc == (10, 7)
             and not self._fp8
@@ -2093,8 +2098,20 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and (self.cga == 1 or self.pack_gqa)
         )
 
+    def _rubin_native_thd_prefill_leg(self) -> bool:
+        """The exact-D128 native THD prefill domain, shared with graph admission."""
+        return not self.softmax_scale_prefolded and supports_nonpaged_d128_thd_prefill(
+            (int(self.q_desc.shape[-1]), int(self.v_desc.shape[-1])),
+            device_cc=self._device_cc,
+            fp8=self._fp8,
+            thd=self.thd,
+            paged=self.paged,
+            cga=self.cga,
+            split_kv=self.split_kv,
+        )
+
     def _rubin_shared_thd_pack_leg(self) -> bool:
-        """Unsplit nonpaged D128 THD packing on the shared two-CTA body."""
+        """Unsplit nonpaged D128 THD packing on the native prefill body."""
         return self.pack_gqa and supports_nonpaged_d128_thd_pack_gqa(
             self.flavor,
             device_cc=self._device_cc,
@@ -2496,8 +2513,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # half d256 graph packs on cc 10.7 whatever its cache form; every other Rubin half
             # packing rides the paged / packed-split D128 pipelines.  engines.mismatch mirrors this
             # exemption (d256_decode_tile_selected); keep the two in lockstep.
-            # Dense d128 half packs on the shared SM100 prefill body (the loader's packed arm, issue #1472); the pre-folded
-            # scale declines on that body below (routing), every other nonpaged half graph stays on the Rubin sibling.
+            # Dense d128 half packs on native SM107 prefill at CGA2 (shared decode at CGA1).
+            # Its existing pre-folded-scale decline remains below.
             self._not_implemented_error_if(
                 self._device_cc == (10, 7)
                 and not self._fp8
@@ -2506,7 +2523,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 and not self._rubin_shared_thd_pack_leg()
                 and not (self.flavor == _SM100_DECODE_FLAVOR and not self.thd)
                 and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv)),
-                "Rubin half PackGQA requires paged KV, the D128 packed split, an unsplit dense or ragged D128 GQA graph without the pre-folded scale (the shared SM100 body), or the d256 decode tile (a decode-shaped graph: S_q x G packed rows within its routed envelope)",
+                "Rubin half PackGQA requires paged KV, the D128 packed split, an unsplit dense or ragged D128 GQA graph without the pre-folded scale, or the d256 decode tile (a decode-shaped graph: S_q x G packed rows within its routed envelope)",
             )
             self._not_implemented_error_if(
                 self.thd
@@ -2525,15 +2542,29 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     (self._device_cc != (10, 7) or self.paged or self._rubin_shared_thd_pack_leg())
                     and not self._fp8
                     and (int(d_qk), int(d_v)) in SM100_THD_PACK_GQA_SHAPES
-                    and (self.cga in (None, 2) or paged_prefill_cga1)
+                    and (self.cga in (None, 2) or paged_prefill_cga1 or self._rubin_native_thd_prefill_leg())
                     and self.split_kv == 1
                 ),
-                "THD PackGQA requires half D128 cga2 unsplit/cga1 split, Rubin paged D128 cga1 unsplit, or Rubin paged D256 cga2 unsplit",
+                "THD PackGQA requires half D128 cga2 unsplit/cga1 split, native Rubin nonpaged D128 cga1/2 unsplit, "
+                "Rubin paged D128 cga1 unsplit, or Rubin paged D256 cga2 unsplit",
             )
             # Partial PackGQA (the largest divisor of the group that divides the
-            # tile) is wired in the shared SM100 d128 / d256 f16 kernels, including
-            # Rubin's unsplit ragged D128 reuse. Other flavors keep the full-ratio contract.
-            _partial = (not self._fp8 and self._device_cc != (10, 7) and self.flavor in _SM100_PARTIAL_PACK_GQA_FLAVORS) or self._rubin_shared_thd_pack_leg()
+            # tile) is wired in SM100 d128 / d256 half and the qualified Rubin
+            # native and paged D128 routes. Other legs retain whole-group admission.
+            _partial = (
+                (not self._fp8 and self._device_cc != (10, 7) and self.flavor in _SM100_PARTIAL_PACK_GQA_FLAVORS)
+                or self._rubin_shared_thd_pack_leg()
+                or supports_paged_d128_partial_pack_gqa(
+                    (int(d_qk), int(d_v)),
+                    device_cc=self._device_cc,
+                    fp8=self._fp8,
+                    thd=self.thd,
+                    paged=self.paged,
+                    cga=self.cga,
+                    split_kv=self.split_kv,
+                )
+                or supports_native_d128_dense_partial_pack(self.flavor, device_cc=self._device_cc, fp8=self._fp8, thd=self.thd, paged=self.paged, cga=self.cga)
+            )
             # The d256 DECODE tile packs the WHOLE group whenever it fits its Q tile
             # (HEADS_PER_TILE = QH_PER_KH; 24/2 puts its 12 heads in the 16-row tile, four
             # tail rows zero-filled; two tokens x 12 heads in the 32-row tile on cc 10.7), so
@@ -2646,17 +2677,18 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self.flavor == (192, 128) and self.split_kv > 1 and self.cga == 1 and not self.packed_thd_split,
             "D192 split_kv > 1 is validated only with cga=2",
         )
-        # Except for Rubin paged prefill, cga=1 on the d128 half flavor is the DECODE tile
-        # (sm100/decode_d128_f16.py). Paged THD uses either the one-query
-        # ragged-Q leg or the native unpacked packed-split host. Mirrors the
-        # engine row's mismatch line; keep both admissions in lockstep.
+        # D128 half cga1 uses the decode tile for one-query or split THD,
+        # and a two-slab prefill body for the admitted paged or native Rubin
+        # nonpaged unsplit legs. Keep these gates aligned with effective_cgas
+        # and the engine row's mismatch checks.
         self._not_implemented_error_if(
             self.flavor == _SM100_DECODE_FLAVOR
             and self.cga == 1
             and not self._fp8
             and self.thd
-            and not (self.thd_decode_leg or self.packed_thd_split or paged_prefill_cga1),
-            "cga=1 on the d128 flavor selects the decode tile, which serves ragged Q over paged K/V with ragged Stats at S_q == 1, or unpacked exact D128 with split_kv > 1; "
+            and not (self.thd_decode_leg or self.packed_thd_split or paged_prefill_cga1 or self._rubin_native_thd_prefill_leg()),
+            "cga=1 on the d128 half flavor requires an admitted one-query/split THD decode leg, paged prefill, "
+            "or native Rubin nonpaged exact D128 unsplit prefill; "
             "other THD (ragged) graphs run the cga2 prefill tile",
         )
         # The per-tensor FP8 d128 flavor admits cga1 too, as its dense unsplit
@@ -3971,11 +4003,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             kind = "head"
         else:
             kind = "token"
-        import inspect
-
         km = self._k_mod
         compile_fn = km.compile_prepared if (getattr(self, "_prepared_fp8", False) or getattr(self, "_prepared_mxfp8", False)) else km.compile
-        accepted = inspect.signature(compile_fn).parameters
+        accepted = _parameter_names(compile_fn)
         kw = dict(has_lse=(self.lse_desc is not None) or self.split_kv > 1, lse_kind=kind)
         if "has_score_max" in accepted:
             # Score side outputs: each store is its own compile-time arm (None folds it out).
@@ -4604,10 +4634,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         (re)loads the module."""
         kc = getattr(self, "_kernel_accepts", None)
         if kc is None:
-            import inspect
-
             entry = self._k_mod.compile_prepared if self._fp8 else self._k_mod.compile
-            kc = frozenset(inspect.signature(entry).parameters)
+            kc = _parameter_names(entry)
             self._kernel_accepts = kc
         return kc
 
@@ -4659,18 +4687,35 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if plan is not None:
             return plan
         b = self.batch_size
-        # Persistent THD kernels ordinarily launch one resident wave and pull further
-        # units from a device-bounded counter. For the packed family below, assign
-        # all declared work directly when it fits within two waves; otherwise keep
-        # one persistent wave. Page size does not affect this packed work count.
+        # Persistent THD kernels pull work from a device-bounded counter. A body
+        # may assign a small envelope directly across its declared initial waves;
+        # larger envelopes use one resident wave. The packed family below also
+        # tightens the safety envelope to its known token-tile count.
+        wave_policy = None
+        wave_geometry = None
         env = units = self._thd_unit_envelope()
         if self.packed_thd_split:
             env = units = env * self.split_kv
         if getattr(self._k_mod, "THD_PERSISTENT", False):
             cluster_ctas = int(getattr(self._k_mod, "CGA_SIZE", 0) or getattr(self._k_mod, "CTA_MMA", 1))
             resident = max(1, _device_sm_count(self.q_desc.device) // max(1, cluster_ctas))
-            units = min(env, resident)
+            initial_waves = max(1, int(getattr(self._k_mod, "THD_INITIAL_WAVES", 1)))
+            initial_limit = initial_waves * resident
             cfg = self._k_mod.CFG
+            ratio = getattr(self._k_mod, "THD_INITIAL_WORK_RATIO", None)
+            geometry = None
+            if ratio is not None:
+                numerator, denominator = ratio
+                if denominator <= 0 or numerator < denominator or numerator > initial_waves * denominator:
+                    raise ValueError("invalid THD initial-work ratio")
+                initial_limit = resident * numerator // denominator
+                pack_g = int(cfg.PACK_G) if cfg.PACK_GQA else 1
+                tile = int(self._k_mod.CGA_TILE_M)
+                if pack_g <= 0 or tile % pack_g or self.h_q % pack_g:
+                    raise ValueError("invalid THD packed initial-wave geometry")
+                geometry = (tile // pack_g, self.h_q // pack_g, initial_limit)
+            units = env if env <= initial_limit else resident
+            wave_envelope = env
             if (
                 ((self._device_cc == (10, 0) and self.paged) or (self._device_cc == (10, 7) and not self.paged))
                 and self.dtype == torch.bfloat16
@@ -4693,11 +4738,18 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 # a ragged batch's maximum would overestimate its actual work.
                 tile = int(self._k_mod.CGA_TILE_M)
                 packed_units = ((int(self.q_desc.shape[2]) * cfg.PACK_G + tile - 1) // tile) * (self.h_q // cfg.PACK_G)
-                if resident < packed_units <= 2 * resident:
+                if resident < packed_units <= (initial_limit if geometry is not None else 2 * resident):
                     units = min(env, packed_units)
+                    wave_envelope = units
             dbg = int(os.environ.get("FROST_THD_CLUSTERS", "0"))  # debug override
             if dbg > 0:
                 units = min(env, dbg)
+            elif initial_waves > 1:
+                # Re-evaluate the wave choice against each invocation's host-known
+                # capacity. Broad graph declarations must not freeze a one-wave
+                # cap when current storage fits the body's initial waves.
+                wave_policy = (wave_envelope, resident, initial_waves)
+                wave_geometry = geometry
         n_meta = self._thd_meta_words()
         plan = SimpleNamespace(
             q=self._thd_decl(self.q_desc),
@@ -4705,6 +4757,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             v=self._thd_decl(self.v_desc),
             o=self._thd_decl(self.o_desc),
             units=units,
+            wave_policy=wave_policy,
+            wave_geometry=wave_geometry,
             cga_tile_m=int(self._k_mod.CGA_TILE_M),
             n_q_lens=b + 1 if self.cu_seq_q_lens else b,
             n_kv_lens=b + 1 if self.cu_seq_kv_lens else b,

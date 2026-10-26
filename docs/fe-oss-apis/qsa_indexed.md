@@ -7,8 +7,8 @@ for block selection, bitmap training and the SM100 backward engine.
 `cudnn.ops.qsa_indexed_forward` and `qsa_indexed_backward` accept packed token
 indices directly. The implementation lives in `cudnn.QSA.indexed` and shares
 QSA's attention kernels. It supports BF16
-12Q/1KV, head dimension 256, and SM100/SM103 with CuTeDSL >= 4.7 (the backward
-needs the CUDA 13 build of the DSL).
+12Q/1KV, head dimension 256, and SM100/SM103/SM107 with CuTeDSL >= 4.8 (the
+backward needs the CUDA 13 build of the DSL).
 
 ```python
 from cudnn.ops import qsa_indexed_forward, qsa_indexed_backward
@@ -65,6 +65,56 @@ At 128K with W=2052, compact IDs occupy 256.5 MiB in either direction, compared
 with 16 GiB for the bitmap entry's `[T, NB]` IDs. The 4 GiB bitmap is also
 unnecessary. These are metadata sizes, not total process
 memory; saved state, outputs and FP32 gradient accumulators are additional.
+
+## Complete blocks and causal tails
+
+Packed documents and the top-512 selection contract are declared through the
+same public entry point:
+
+```python
+# cu_seqlens is a CUDA int32 tensor, for example [0, 43691, 87382, 131072].
+out, out_fp32, lse = qsa_indexed_forward(q, k, v, indices)
+dq, dk, dv = qsa_indexed_backward(
+    grad_out, q, k, v, out_fp32, lse, indices,
+    selection_mode="causal_topk", cu_seqlens=cu_seqlens,
+    max_seq_len=43691,
+)
+```
+
+`selection_mode="general"` remains the default. The `causal_topk` mode declares
+the following stricter input contract; it is never inferred from tensor shapes:
+
+- Q/K/V, grad_out and saved FP32 output are finite. LSE is finite and comes
+  from forward with the same indices and scale.
+- `W=2052` and `scale=1/16`. For query position `p` within its document, select
+  exactly `min((p + 1) // 4, 512)` distinct, complete four-token blocks from
+  that document's causal prefix, followed by its incomplete causal tail.
+  Complete blocks fill consecutive groups starting at column zero, in any
+  order. No padding holes or empty selections are allowed. Before 512 blocks
+  are available, pad the unused groups with `-1`; the tail may follow the
+  complete blocks or occupy the last four slots, as in Relax. After 512 blocks
+  are available, the tail occupies the last four slots. Invalid tail slots
+  and all unused slots are `-1`.
+- Packed inputs require `cu_seqlens`: contiguous device int32 prefix sums
+  `[B + 1]`, starting at zero, ending at `T`, and nondecreasing. Empty documents
+  and document starts not divisible by four are supported. Indices use
+  absolute packed token IDs; block origins restart at each document boundary.
+  Without `cu_seqlens`, all `T` tokens are one document.
+- Optional `max_seq_len` is a host integer in `[1, T]` bounding every document
+  length. It defaults to `T`. Every replay must respect this bound. The kernel
+  rereads device `cu_seqlens` on replay; boundaries are not cached.
+
+These device-value promises are caller contracts, not host-side checks.
+Use `general` for arbitrary selections. Passing `cu_seqlens` or `max_seq_len`
+with `general` is rejected because that mode obtains its bounds from indices.
+The keyword-only arguments preserve existing positional calls. Both modes run
+the backward engine described in [QSA](qsa.md), which also gives the record and
+workspace sizing.
+
+12Q/1KV backward requires the **CUDA 13 CuTeDSL compiler** in addition to
+CuTeDSL >= 4.8 and SM100/SM103/SM107. A CUDA 13 PyTorch build alone does not
+establish the DSL compiler version; unsupported compiler builds are rejected
+before kernel compilation.
 
 The indexed entry is useful when a producer already has token IDs. Use the unchanged Relax
 comparison in `benchmark/qsa/benchmark_relax.py` for the intended workload;

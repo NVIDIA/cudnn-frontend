@@ -18,8 +18,10 @@ are `<op>_summary` and `<op>_summary_bwd`. The same node types are available on 
 ## Support Matrix
 
 Requires an SM100 / SM103 / SM107 GPU (Blackwell data center) and the CuTe DSL runtime the package depends on
-(`nvidia-cutlass-dsl`, a required dependency rather than an extra; these kernels need 4.7.0 or newer and the engines
-decline with an error that names the installed version otherwise). One linear-attention node per graph.
+(`nvidia-cutlass-dsl`, a required dependency except on Windows ARM64; these kernels need 4.7.0 or newer and the engines
+decline with an error that names the installed version otherwise). On Windows ARM64, the CuTe DSL and TVM-FFI runtime
+dependencies are excluded from the base installation, so the base install does not enable these kernels there.
+One linear-attention node per graph.
 
 | | GDN | KDA | GDN-2 | GDP | Mamba-2 |
 |---|---|---|---|---|---|

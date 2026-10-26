@@ -95,10 +95,11 @@ Blocks may start anywhere and the key bounds may cut them. A query past the
 dense prefix holds at most 513 selected blocks (top-512 and the causal tail);
 a longer list contributes nothing and leaves that query's dQ NaN. The 12Q/1KV
 flavor needs the CUDA 13 build of CuTe DSL. The bitmap entry reads the sequences from `tok_base`;
-`qsa_indexed_backward` takes an optional `cu_seqlens` and otherwise treats the
-rows as one sequence, which stays exact for packed documents (the selection
-decides which keys a query sees) but serves only the first document on the
-dense prefix path.
+`qsa_indexed_backward` describes packed documents through
+`selection_mode="causal_topk"` with `cu_seqlens` ([details](qsa_indexed.md#complete-blocks-and-causal-tails))
+and otherwise treats the rows as one sequence, which stays exact for packed
+documents (the selection decides which keys a query sees) but serves only the
+first document on the dense prefix path.
 
 The experimental QSA entries previously under `cudnn.DSA` and
 `cudnn.gated_attention_block.qsa_select*` have moved without compatibility

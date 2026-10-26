@@ -674,9 +674,11 @@ new operator preparation; caller-address changes require recapture.
 
 - NVIDIA Rubin SM107 GPUs (compute capability 10.7).
 - CUDA and PyTorch execution.
-- `nvidia-cutlass-dsl>=4.8.0` for the Rubin kernels. The package-wide
-  `cutedsl` extra retains its 4.5.0 installation floor so other cuDNN Frontend
-  operations remain usable with older compatible DSL versions.
+- `nvidia-cutlass-dsl[cu13]>=4.8.0`, provided by the package-wide required
+  dependency except on Windows ARM64. The CuTe DSL and TVM-FFI runtime dependencies
+  are excluded from the base installation on Windows ARM64, so the base install
+  does not enable these kernels there. The Rubin kernels also
+  check target support at runtime.
 - Fused SwiGLU with contiguous expert sharding.
 - `apply_topk_in_fc1=True`.
 - `hidden_size` divisible by 128.

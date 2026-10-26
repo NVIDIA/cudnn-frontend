@@ -2526,7 +2526,9 @@ def _host(
     else:
         # B's head extent follows its head group: `n_head // b_head_group` B heads serve `n_head` A/C heads (every A/C head
         # `h` reads B head `h // b_head_group`, `_b_head`); `n_head` itself at the default 1.
-        b_h = n_head if cutlass.const_expr(b_head_group == 1) else n_head // b_head_group
+        # A grouped dQ launch may contain a fraction of one GQA group; its B
+        # descriptor must still contain that group's K head, never zero heads.
+        b_h = n_head if cutlass.const_expr(b_head_group == 1) else (n_head + b_head_group - 1) // b_head_group
         b_b = n_batch
     # THD: `n_batch` is the SEQUENCE count -- it sizes the grid and indexes the
     # metadata -- but the packed operands hold ONE batch element, reached by the

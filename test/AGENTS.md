@@ -79,6 +79,16 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 
 ### conftest.py landmines — read before editing
 
+For a timed subprocess test, arm a child-side `faulthandler` dump before the
+parent deadline and surface `TimeoutExpired.stdout` / `.stderr` in the failure.
+The parent's watchdog shows only `subprocess.communicate()`, and pytest's
+ordinary timeout traceback does not display those captured child streams.
+`prepared_bwd_cache_utils.run_artifact_child` uses this for cold artifact checks.
+Validate with a deliberately blocked child that emits both streams; retain the
+original deadline and do not classify a compilation stall as a GPU hang without
+child-stage evidence.
+
+
 - Source-package subprocess probes must exclude `__pycache__` and bytecode
   when copying a tree shared by xdist workers. Python atomically renames its
   temporary `.pyc` files, so `copytree` can enumerate a file that disappears
@@ -107,6 +117,30 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
       print(item.name, os.environ.get("CUDNN_FRONTEND_ENABLE_FROST_ENGINES"), "_frost_opt_in" in item.fixturenames)
       yield
   ```
+
+### Native flavor routing assertions
+
+PTX hash records also depend on imported helpers and the trace probe's fake
+tensor geometry. A scheduler or shared decoder change can invalidate a record
+even when the kernel file itself is unchanged. Before refreshing a record,
+render its historical source/probe and the current source/probe with the same
+recorded compiler distribution in separate processes, compare the PTX changes,
+and retain the existing SASS checks. Check distribution metadata as well as the
+import path: an internal build may print the public version in `cutlass.__version__`.
+`test_fork_rendering_ptx_md5_is_recorded` covers the SM107 D512 backward record;
+its dense scheduler and shared THD work-prefix changes require different attribution.
+A store-order optimization qualified for one width must not silently move the
+other widths of a shared body. Preserve their established lowering, and compare
+both the historical small-width cubins and the optimized width before landing.
+The SM107 bias/off/streamed records detect D32/D64 epilogue changes that D128
+functional coverage alone misses; keep their hashes and SASS assertions intact.
+
+When a native head-dimension flavor replaces an envelope, update the exact
+template expectation in existing end-to-end routing tests as well as adding
+new flavor tests. Keep the routing assertion, numerical comparisons and shape
+unchanged. The SM107 GPT-OSS D64 case in
+`test_sdpa_fwd_cc107_decode_tile_envelope_pinned_L0` exercises native D64
+prefill; a short query alone does not imply the D128 decode template.
 
 ### Layout
 
@@ -190,6 +224,16 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
   arguments against result metadata. The CPU-only tests in
   `benchmark/attention_inference/tests/test_runner.py` cover b12x's distinct
   paged, absorbed-MLA and contiguous routes without launching kernels.
+- Standalone benchmark summaries must reject non-finite or nonpositive timing
+  medians and non-finite derived measurements before replacing existing output.
+  Use explicit validation rather than `assert`, which Python `-O` removes.
+  Serialize with `allow_nan=False`. Check all expected numerical errors against
+  their tolerance instead of trusting a saved pass flag. The CPU subprocess
+  tests in `linear_attention/test_gdn2_steep_decay_summary.py` cover these cases.
+  Benchmark producers must also use explicit checks for scheduler activation,
+  finite tensors, profiler activity, and numerical acceptance. The CPU tests in
+  `linear_attention/test_gdn2_steep_decay_benchmark.py` exercise the real producer
+  functions with mocked GPU calls under normal and optimized Python.
 - Memo-key regression tests should observe the actual lookup and the selected plan, rather than relying on positional offsets in private key tuples. Appending an independent cache axis must not break an unrelated test; keep the miss count, selected configuration, and A-B-A identity checks. `test_block_scaled_memo_respects_overlap_margin` records the lookup key through its test memo.
 - Workspace device checks compare storage with the declared launch device, not a fixed CUDA ordinal or the ambient current device. Match the diagnostic's actual expected/observed ordinals; the wrong-device message need not contain the word "device". `core/cutedsl/test_workspace_device.py` covers the diagnostic with one GPU and both storage-device directions when two are visible, including DLPack-only and CUDA-array-interface-only buffers.
 - **A dispatch fact that reads the device's SM count is asserted against the live resolver, never as a constant.** The small-M
@@ -849,6 +893,13 @@ the actual host signature, then run output/Stats numerics and changed-input
 replay for FP16 and BF16; `test_sdpa_native_sm120_binding.py` is the detector.
 ### Native backward binding
 
+Exercise the actual standalone adapter as well as the prepared binder. A lower-level
+frame test can miss an incompatible metadata container built by the adapter.
+`test_shared_standalone_adapter_uses_current_native_storage` calls that boundary
+with the native and Python binders, optional external delta, changed storage and
+invalid current inputs; the native geometry transport must accept the adapter
+without falling back to Python.
+
 Derive the runtime frame from each actual host signature: SM80 has a partial
 that binds four launch bounds, SM107 dense and THD have different optional
 slots, and some chains use one scale while others use two. Compare native and
@@ -953,6 +1004,13 @@ physical wide stride/products with changed-input replay.
 that invalid metadata causes no initialization or attention launch.
 
 ### Automatic handle caches
+
+Indexed execution must preserve the graph's selected plan throughout binding,
+not just restore it after returning. Coordinate two prebuilt indexed calls at
+stream resolution and assert which plan each actually executes, plus the retained
+selection after both finish. `core/test_dispatch.py::test_indexed_execution_keeps_each_callers_plan`
+is a CPU-only detector; shared backend/FROST numerical and capture checks remain
+in `core/graph/test_execute_overload.py`.
 
 Automatic cuDNN handle caches must isolate both device and calling thread;
 re-streaming a process-global handle races otherwise. Check A→B→A device reuse,

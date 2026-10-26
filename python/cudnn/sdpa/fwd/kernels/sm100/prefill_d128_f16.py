@@ -29,7 +29,7 @@ SM100 resource layout:
      fuses load and row-max into ``tmem_load_max_reduction_x64``.  Masked
      tiles always take the software path.
   4. **Softmax pipe balance**: the per-KV ring waits spin (``SPIN_RING_WAITS``)
-     and, on cc 10.0 dense-band builds only, 32 of the 128 P columns per row
+     and, on cc 10.0 dense bands and eligible causal THD interior tiles, 32 of the 128 P columns per row
      take the FMA-pipe exp2 (``_E2E_*`` / ``exp2_mixed``) -- both measured
      against the cuDNN SM100 bf16 prefill, see the constants' comments.
   5. SM100 launch: ``cluster=(CTA_MMA, 1, 1)``.
@@ -297,8 +297,9 @@ _NB_FENCE_P0 = 11
 # pipe (``exp2_emul_pair``, a degree-3 polynomial + exponent insert), the rest on MUFU.EX2 -- the sm100 d128
 # MXFP8 / FP8 kernels' pattern.  Two trace-time gates fold it in or out: ``PARAMS.exp2_fma_split`` (api_dsl,
 # cc 10.0 only -- cc 10.3 retains its all-MUFU path) AND a tile/layout gate. Dense bands keep their
-# existing mix. Paged BF16 D128 causal THD mixes only unmasked interior tiles; diagonal, sliding-window,
-# bias and explicit KV-mask tiles retain MUFU. This extension does not change nonpaged or split-KV builds.
+# existing mix. BF16 D128 causal THD also mixes unmasked interior tiles (nonpaged, and paged without bias or an
+# explicit KV mask); diagonal, sliding-window and masked tiles retain MUFU. FP16 causal THD, d64 THD and
+# split-KV builds keep their previous behavior. Padding alone is not a causal/SWA band.
 _E2E_FREQ = 16
 _E2E_RES = 4
 _E2E_LIMIT = CFG.TILE_N
@@ -316,7 +317,16 @@ _E2E_PAGED_INTERIOR = bool(
 )
 if _E2E_PAGED_INTERIOR:
     _E2E_RES = 2
-_E2E_ENABLED = bool(PARAMS.exp2_fma_split) and (_E2E_DENSE_BAND or _E2E_PAGED_INTERIOR)
+# SM100 D128 BF16 nonpaged THD causal interior extension for CP workloads; masked/diagonal tiles stay on MUFU.
+_E2E_THD_INTERIOR = bool(
+    CFG.THD_VARLEN
+    and not CFG.PAGED_KV
+    and CFG.DTYPE_QKV == 2
+    and PARAMS.d_flavor == 128
+    and CFG.SPLIT_KV == 1
+    and (CFG.MASK_FLAGS & (MASK_CAUSAL | MASK_SWA)) == MASK_CAUSAL
+)
+_E2E_ENABLED = bool(PARAMS.exp2_fma_split) and (_E2E_DENSE_BAND or _E2E_PAGED_INTERIOR or _E2E_THD_INTERIOR)
 _E2E_EMULATED_COLS = (_E2E_LIMIT // _E2E_FREQ) * _E2E_RES if _E2E_ENABLED else 0
 if _E2E_ENABLED:
     if not (0 <= _E2E_RES <= _E2E_FREQ and _E2E_FREQ % 2 == 0 and _E2E_RES % 2 == 0 and _E2E_LIMIT % _E2E_FREQ == 0):
@@ -355,7 +365,23 @@ THD_PERSISTENT = True
 # count must be in CGA-tile (cluster) units (q_tiles = n_q_supers // CTA_MMA),
 # not per-CTA super-row units; the legacy default over-counts by CTA_MMA and
 # scrambles LPT tile assignment (cf. ctm_lpt_decode_qtiles_bug; dsv4/qwen sm100).
-_sdpa_h = make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units=True)
+# Qualify this integer-only lookup independently of the attention arithmetic.
+# Keep other geometries on their existing decoder until they are measured.
+# This also selects the shared paged body (including the SM107 paged route):
+# work ownership depends on packed Q tiles, not on K/V pool layout or length.
+_BOUNDED_THD_DECODE = (
+    CFG.THD_VARLEN == 1
+    and CFG.DTYPE_QKV == 2
+    and PARAMS.d_flavor == 128
+    and CFG.TILE_M == 128
+    and CFG.TILE_N == 128
+    and CFG.CGA_M == 2
+    and CFG.CGA_N == 1
+    and CFG.SPLIT_KV == 1
+    and (CFG.MASK_FLAGS & (MASK_CAUSAL | MASK_SWA)) == MASK_CAUSAL
+    and CFG.BOTTOM_RIGHT == 0
+)
+_sdpa_h = make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units=True, bounded_thd_decode=_BOUNDED_THD_DECODE)
 _decode_initial = _sdpa_h.decode_initial
 _decode_payload = _sdpa_h.decode_payload
 # qtrim variant: collapses the KV loop for CGA tiles entirely past the

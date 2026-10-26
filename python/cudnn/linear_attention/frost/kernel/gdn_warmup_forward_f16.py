@@ -32,6 +32,8 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from ..common import split_k
+from cudnn.frost.compiled_cache import compile_cached
+
 from ..common.host import get_dtype, family_slots
 from . import gdn_prefill_f16
 
@@ -321,7 +323,7 @@ def build_warmup_forward(
         state_out_placeholder = None
         if state_out is not None:
             state_out_placeholder = from_dlpack(state_out, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-        warmup_forward_cache[key] = cute.compile(
+        warmup_forward_cache[key] = compile_cached(
             warmup_forward_host,
             facts.split,
             facts.b_t,
@@ -374,6 +376,8 @@ def build_warmup_forward(
             cuda.CUstream(int(stream)),
             k_slots,
             v_slots,
+            cache_key=repr((__name__, key)),
+            symbol="frost_la_gdn_warmup_forward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     compiled = warmup_forward_cache[key]

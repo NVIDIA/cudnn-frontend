@@ -525,6 +525,8 @@ def _kernel(
     attn_scale_log2e: cutlass.Float32,
     head_base: cutlass.Int32,
     batch_base: cutlass.Int32,
+    dv_head_base: cutlass.Int32,
+    dv_batch_base: cutlass.Int32,
 ) -> None:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -819,6 +821,8 @@ def _kernel(
             head_base=head_base,
             batch_base=batch_base,
             cta_in_pair=cta_in_pair,
+            dv_head_base=dv_head_base,
+            dv_batch_base=dv_batch_base,
         )
 
     else:  # warp_idx == CFG.SCHED_WARP_ID
@@ -1478,6 +1482,8 @@ def _tmastg_warp(
     head_base,
     batch_base,
     cta_in_pair,
+    dv_head_base,
+    dv_batch_base,
 ) -> None:
     """TMA-store warp (both CTAs): per q tile the dS slot -> workspace [B_chunk, H_chunk, S_kv, S_q] (one contiguous
     ROWS_PER_CTA-row box at kv_block_base + cta_in_pair * ROWS_PER_CTA); per kv block dV -> [B, S_kv, H_q, d_v]."""
@@ -1485,7 +1491,7 @@ def _tmastg_warp(
     tma_ds = GmemTileTma(tma_ds_desc)
 
     kv_super_idx, head_idx, batch_idx = _boot_tile(sched)
-    full_batch = cute.arch.make_warp_uniform(batch_idx + batch_base)
+    full_batch = cute.arch.make_warp_uniform(batch_idx + dv_batch_base)
     KV_ROW_OFFSET_PEER = cta_in_pair * cutlass.Int32(ROWS_PER_CTA)
 
     is_valid_tile = cutlass.Int32(1)
@@ -1511,10 +1517,10 @@ def _tmastg_warp(
             if nvvm.elect_sync():
                 bars.mb_ds_smem_empty[ds_slot].arrive()
 
-        # dV -> the FULL output [B, S_kv, H_q, d_v] (full-tensor head / batch).
+        # dV uses independent output origins: full tensor or current chunk workspace.
         bars.mb_dv_stg_full.wait(dv_full_state.phase, spin=SPIN_RING_WAITS)
         dv_full_state = advance(dv_full_state, 1)
-        tma_store_tile(sdV[0], tma_dv(cutlass.Int32(0), head_idx + head_base, kv_block_base + KV_ROW_OFFSET_PEER, full_batch))
+        tma_store_tile(sdV[0], tma_dv(cutlass.Int32(0), head_idx + dv_head_base, kv_block_base + KV_ROW_OFFSET_PEER, full_batch))
         tma_store_commit()
         tma_store_wait(0)  # source SMEM reads done -> the TMA-LDG may reload K over sdV
         if nvvm.elect_sync():
@@ -1526,7 +1532,7 @@ def _tmastg_warp(
         nxt_t0, nxt_t1, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
         is_valid_tile = cute.arch.make_warp_uniform(nxt_v)
         kv_super_idx, head_idx, batch_idx = _decode_tile_words(sched, nxt_t0, nxt_t1)
-        full_batch = cute.arch.make_warp_uniform(batch_idx + batch_base)
+        full_batch = cute.arch.make_warp_uniform(batch_idx + dv_batch_base)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
 
 
@@ -1630,8 +1636,15 @@ def _host(
     head_base: cutlass.Int32,
     batch_base: cutlass.Int32,
     stream: _cuda_driver.CUstream = None,
+    dv_head_base=None,
+    dv_batch_base=None,
 ) -> None:
     B, QH, KH, SQ, SKV, QH_CHUNK, B_CHUNK, SQ_REAL, SKV_REAL = problem_size
+    # Inputs retain their full-tensor origins; only the output partial may be local.
+    if cutlass.const_expr(dv_head_base is None):
+        dv_head_base = head_base
+    if cutlass.const_expr(dv_batch_base is None):
+        dv_batch_base = batch_base
 
     # [B, S, H, D] operands: box = (1 batch, S rows, 1 head, D cols); stride_order innermost-first so the kernel's coords
     # are (d, head, seq, batch).  Workspace [B, H, S_kv, S_q]: (q, kv, head, batch).
@@ -1696,6 +1709,8 @@ def _host(
         attn_scale_log2e,
         head_base,
         batch_base,
+        dv_head_base,
+        dv_batch_base,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],

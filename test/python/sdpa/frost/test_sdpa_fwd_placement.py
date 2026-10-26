@@ -492,6 +492,13 @@ def test_sm107_fp8_d128_chunk_placement_structure():
     assert place(**free) == placement.LEAD
     assert place(**{**free, "s_kv": long_kv + 1}) == placement.TRAIL  # off the KV tile: the mask-free graph cannot split
     assert place(**{**free, "s_q": placement.SM107_FP8_D128_MASKFREE_MAX_S_Q + 1}) == placement.TRAIL
+    # MHA: one 2-SM cluster wave of units, causal only, within one 512-row Q tile
+    mha = {"h_q": 108, "h_kv": 108, "s_q": placement.SM107_FP8_D128_MHA_MAX_S_Q}
+    assert place(**mha) == placement.LEAD
+    assert place(**{**mha, "b": 2}) == placement.TRAIL
+    assert place(**{**mha, "device_sm_count": None}) == placement.TRAIL
+    assert place(**{**mha, "s_q": placement.SM107_FP8_D128_MHA_MAX_S_Q + 1}) == placement.TRAIL
+    assert place(**{**mha, **free}) == placement.TRAIL
 
 
 @pytest.mark.L0
@@ -783,3 +790,143 @@ def test_sm107_paged_d256_decode_tile_shard_stays_inside_its_measured_shape(outs
             placement.place(spec, _sm107_paged_d256_decode_facts(h_q=8, h_kv=1, b=64, k_t=_hnd_pool(1, 16))) == placement.LEAD
         )  # one KV head: one in-page order
         assert placement.place(spec, _sm107_paged_d256_decode_facts(h_q=8, h_kv=1, b=64, k_t=_nhd_pool(1, 16))) == placement.LEAD
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "row, cc, sms, quant",
+    [
+        ("sdpa_fwd_prefill_sm100", (10, 0), 148, {}),
+        ("sdpa_fwd_prefill_sm100_fp8", (10, 0), 148, _SM107_FP8_QUANT),
+        ("sdpa_fwd_prefill_sm90", (9, 0), 132, {}),
+        ("sdpa_fwd_prefill_sm107", (10, 7), 216, {}),
+        ("sdpa_fwd_prefill_sm107_fp8", (10, 7), 216, _SM107_FP8_QUANT),
+    ],
+)
+def test_d512_sliding_window_leads_inside_the_measured_box(row, cc, sms, quant, monkeypatch):
+    """Each d512 row admits a dense causal sliding window, proposes only admissible sets for it, and its window gate reads
+    the module's bounds (gate structure, not a measured winner)."""
+    from cudnn.sdpa.fwd import heuristics
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS, mismatch
+
+    if cc == (10, 7):
+        # metadata-only: the synthetic Rubin rows must not depend on the installed DSL's target set
+        from cudnn.frost import buffers
+
+        monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    spec = next(s for s in ENGINE_SPECS if s.name == row)
+    swa = {"b": 2, "h_q": 64, "h_kv": 1, "s_q": 4096, "s_kv": 4096, "d_qk": 512, "d_v": 512, "causal": True, "window_left": 128, **quant}
+    swa.update(device_cc=cc, device_sm_count=sms)
+
+    def facts(**over):
+        return _facts(**{**swa, **over})
+
+    assert mismatch(spec.capabilities, facts()) is None
+    offered = {row: _OFFERED[row]}
+    plans = [p for p in heuristics.recommend("A", facts(), offered) if p.engine_id == _OFFERED[row]]
+    assert plans and all(mismatch(spec.capabilities, facts(), p.knobs) is None for p in plans)
+    assert placement._d512_swa(facts(s_q=placement.D512_SWA_MIN_S_Q, s_kv=32768, bottom_right=True))
+    assert not placement._d512_swa(facts(s_q=placement.D512_SWA_MIN_S_Q - 1, s_kv=32768, bottom_right=True))
+    assert not placement._d512_swa(facts(s_q=placement.D512_SWA_MIN_KV // 2, s_kv=placement.D512_SWA_MIN_KV // 2))
+
+
+def _sm107_paged_facts(**over):
+    from types import SimpleNamespace
+
+    base = dict(
+        b=3,
+        h_q=8,
+        h_kv=2,
+        s_q=864,
+        s_kv=16384,
+        d_qk=128,
+        d_v=128,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        thd=True,
+        padded=True,
+        has_paged_kv=True,
+        page_size=16,
+        k_t=SimpleNamespace(get_stride=lambda: (8192, 4096, 256, 1)),
+        max_total_seq_len_q=3 * 864,
+        device_cc=(10, 7),
+        device_sm_count=216,
+    )
+    base.update(over)
+    return _facts(**base)
+
+
+@pytest.mark.L0
+def test_sm107_paged_gqa_prefill_leads_inside_its_box():
+    """Rubin paged bf16 d128 GQA 4/8/16 prefill chunks (exact or bounded) and full squares lead; MHA, group 2,
+    short queries and out-of-box batches keep the backend."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    place = lambda **over: placement.place(spec, _sm107_paged_facts(**over))
+    assert place() == placement.LEAD
+    assert place(h_q=32, h_kv=8, b=4, s_q=751, s_kv=21650, max_total_seq_len_q=4 * 751) == placement.LEAD
+    assert place(h_q=64, h_kv=64, s_q=628, s_kv=28240) == placement.TRAIL
+    assert place(h_q=64, h_kv=32) == placement.TRAIL
+    assert place(h_q=32, h_kv=2) == placement.LEAD  # GQA16
+    assert place(h_q=32, h_kv=2, shape_overrides=True) == placement.LEAD  # bounded GQA16
+    assert place(h_q=32, h_kv=2, b=1, s_q=2048, s_kv=2048, bottom_right=False, max_total_seq_len_q=2048) == placement.LEAD  # GQA16 square
+    assert place(h_q=32, h_kv=4, shape_overrides=True) == placement.LEAD  # bounded GQA8
+    assert place(h_q=32, h_kv=4, b=1, s_q=2048, s_kv=2048, bottom_right=False, max_total_seq_len_q=2048) == placement.LEAD  # G8 square
+    assert place(h_q=32, h_kv=2, b=1, s_q=1536, s_kv=1536, max_total_seq_len_q=1536) == placement.LEAD  # bottom-right square
+    assert place(h_q=32, h_kv=2, b=1, s_q=1024, s_kv=1024, bottom_right=False, max_total_seq_len_q=1024) == placement.LEAD
+    assert place(h_q=32, h_kv=8, b=1, s_q=2048, s_kv=2048, bottom_right=False, max_total_seq_len_q=2048) == placement.LEAD  # G4 square
+    assert place(h_q=32, h_kv=4, b=1, s_q=8192, s_kv=8192, max_total_seq_len_q=8192) == placement.LEAD
+    assert place(h_q=32, h_kv=8, b=2, s_q=4096, s_kv=4096, shape_overrides=True, max_total_seq_len_q=None) == placement.LEAD  # bounded square
+    assert not placement._sm107_paged_gqa_prefill(_sm107_paged_facts(h_q=32, h_kv=8, b=1, s_q=512, s_kv=512, bottom_right=False))
+    assert not placement._sm107_paged_gqa_prefill(_sm107_paged_facts(h_q=32, h_kv=4, b=1, s_q=12288, s_kv=12288))
+    assert not placement._sm107_paged_gqa_prefill(_sm107_paged_facts(h_q=32, h_kv=16, b=1, s_q=2048, s_kv=2048))  # group 2 square
+    assert placement._sm107_paged_gqa_prefill(_sm107_paged_facts(h_q=32, h_kv=8, shape_overrides=True))  # bounded GQA4
+    assert place(h_q=32, h_kv=16, shape_overrides=True) == placement.TRAIL  # bounded group 2
+    assert place(b=placement.SM107_PAGED_GQA_MAX_B + 1, max_total_seq_len_q=5 * 864) == placement.TRAIL
+    assert place(dtype=cudnn.data_type.HALF) == placement.TRAIL
+    assert place(s_kv=65536) == placement.TRAIL
+
+
+@pytest.mark.L0
+def test_sm100_paged_full_square_leads_inside_its_box():
+    """cc 10.0 paged bf16 d128 full prefill squares lead for GQA 4/8/16, 1024 <= S <= 8192; MHA / group 2 keep the backend."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    base = dict(b=2, s_q=1536, s_kv=1536, bottom_right=False, max_total_seq_len_q=None, device_cc=(10, 0), device_sm_count=148)
+    place = lambda **over: placement.place(spec, _sm107_paged_facts(**{**base, **over}))
+    for h_q, h_kv in ((16, 4), (8, 1), (64, 4)):
+        assert place(h_q=h_q, h_kv=h_kv) == placement.LEAD, (h_q, h_kv)
+    for h_q, h_kv in ((8, 8), (16, 8)):
+        assert not placement._sm100_paged_full_square(_sm107_paged_facts(**{**base, "h_q": h_q, "h_kv": h_kv}))
+    assert place(h_q=8, h_kv=1, b=1, s_q=8192, s_kv=8192) == placement.LEAD
+    assert place(h_q=16, h_kv=4, s_q=512, s_kv=512) == placement.TRAIL
+    assert place(h_q=8, h_kv=1, b=1, s_q=16384, s_kv=16384) == placement.TRAIL
+    assert place(h_q=16, h_kv=4, device_cc=(10, 3), device_sm_count=160) == placement.TRAIL
+
+
+@pytest.mark.L0
+def test_sm100_paged_gqa_prefill_leads_inside_its_box():
+    """cc 10.0 paged bf16 d128 GQA prefill leads for GQA16 (exact or bounded) and bounded GQA 4 / 8; exact G8, MHA, G2,
+    cc 10.3 and out-of-box shapes keep the backend."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    base = dict(h_q=32, h_kv=2, device_cc=(10, 0), device_sm_count=148)
+    place = lambda **over: placement.place(spec, _sm107_paged_facts(**{**base, **over}))
+    assert place() == placement.LEAD
+    assert place(b=1, s_q=4096, s_kv=4096, bottom_right=False, max_total_seq_len_q=4096) == placement.LEAD
+    assert place(bottom_right=False) == placement.TRAIL  # top-left non-square chunk: outside the measured scope
+    assert place(h_q=32, h_kv=4) == placement.TRAIL  # exact G8 with an exact total-Q declaration
+    assert place(h_q=32, h_kv=4, max_total_seq_len_q=None) == placement.LEAD  # exact G8, no total-Q declaration
+    assert place(h_q=32, h_kv=32, max_total_seq_len_q=None) == placement.TRAIL
+    assert place(h_q=32, h_kv=4, shape_overrides=True) == placement.LEAD  # bounded G8
+    assert place(h_q=32, h_kv=8, shape_overrides=True) == placement.LEAD  # bounded G4
+    assert place(shape_overrides=True) == placement.LEAD  # bounded G16
+    assert place(h_q=32, h_kv=32) == placement.TRAIL
+    assert place(h_q=32, h_kv=32, shape_overrides=True) == placement.TRAIL
+    assert place(h_q=32, h_kv=16, shape_overrides=True) == placement.TRAIL
+    assert place(device_cc=(10, 3), device_sm_count=160) == placement.TRAIL
+    assert place(b=placement.SM100_PAGED_GQA16_MAX_B + 1, max_total_seq_len_q=5 * 864) == placement.TRAIL

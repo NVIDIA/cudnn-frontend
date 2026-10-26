@@ -19,12 +19,17 @@ _INPUT_NAMES = ("q", "k", "v", "out", "dout", "lse", "topk_idxs")
 
 @pytest.fixture(autouse=True)
 def supported_device():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
-        pytest.skip("the QSA backward engine requires SM100, SM103 or SM107")
-    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+    from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state, cutedsl_too_old
 
-    if cutedsl_too_old(cutedsl_state()[1]):
-        pytest.skip("QSA backward requires CuTe DSL >= 4.7.0")
+    cc = torch.cuda.get_device_capability() if torch.cuda.is_available() else None
+    if cc not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("the QSA backward engine requires SM100, SM103 or SM107")
+    installed, version = cutedsl_state()
+    if not installed or cutedsl_too_old(version):
+        pytest.skip(cutedsl_requirement_error("QSA") or "QSA backward requires nvidia-cutlass-dsl")
+    reason = cutedsl_arch_requirement_error(cc)
+    if reason:
+        pytest.skip(reason)
 
 
 def _skip_cu12(h_kv):
@@ -72,10 +77,9 @@ def _bitmap_backward(inputs, meta):
 
 
 def _indexed_backward(inputs, cu_seqlens=None):
+    options = {} if cu_seqlens is None else dict(selection_mode="causal_topk", cu_seqlens=cu_seqlens)
     return tuple(
-        qsa_indexed_backward(
-            inputs["dout"], inputs["q"], inputs["k"], inputs["v"], inputs["out"], inputs["lse"], inputs["topk_idxs"], SCALE, cu_seqlens=cu_seqlens
-        )
+        qsa_indexed_backward(inputs["dout"], inputs["q"], inputs["k"], inputs["v"], inputs["out"], inputs["lse"], inputs["topk_idxs"], SCALE, **options)
     )
 
 

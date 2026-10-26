@@ -5,6 +5,7 @@
 
 import subprocess
 import sys
+import inspect
 
 import pytest
 import torch
@@ -138,6 +139,115 @@ assert callable(qsa_indexed_forward) and callable(qsa_indexed_backward)
 assert not hasattr(cudnn.DSA, "qsa_indexed_backward")
 """
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+@pytest.fixture
+def canonical_inputs(supported_gpu):
+    from cudnn.QSA.kernels import bprop_sm100 as engine
+    from QSA.cutedsl.qsa_index_list_reference import make_inputs as canonical
+
+    if engine.dsl_cuda_major() < 13:
+        pytest.skip("12Q/1KV QSA backward requires the CUDA 13 DSL compiler")
+    return canonical
+
+
+def _canonical_call(inputs, **kwargs):
+    return qsa_indexed_backward(
+        inputs["dout"],
+        inputs["q"],
+        inputs["k"],
+        inputs["v"],
+        inputs["out"],
+        inputs["lse"],
+        inputs["topk_idxs"],
+        selection_mode="causal_topk",
+        cu_seqlens=inputs.get("cu_seqlens"),
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize("total, bounds", [(4099, None), (32769, None), (32769, [0, 3, 3, 32769])])
+def test_public_causal_topk_uses_native_saved_state(canonical_inputs, total, bounds):
+    from QSA.cutedsl.qsa_index_list_reference import reference_backward, assert_grads_close
+
+    inputs = canonical_inputs(total, 71, h_kv=1, cu_seqlens=bounds, width=2052, saved_output_dtype=torch.float32)
+    # Use saved state from the actual public forward, not a private test-only path.
+    out = qsa_indexed_forward(inputs["q"], inputs["k"], inputs["v"], inputs["topk_idxs"])
+    inputs["out"], inputs["lse"] = out["out_fp32"], out["lse"]
+    actual = _canonical_call(inputs)
+    expected = reference_backward(**{k: inputs[k] for k in ("q", "k", "v", "out", "dout", "lse", "topk_idxs")})
+    for name, value, ref in zip(("dq", "dk", "dv"), actual, expected):
+        assert_grads_close(name, value, ref)
+    assert tuple(actual.keys()) == ("dq", "dk", "dv")
+
+
+def test_public_causal_topk_graph_refreshes_packed_bounds(canonical_inputs):
+    from QSA.cutedsl.qsa_index_list_reference import reference_backward, assert_grads_close
+
+    inputs = canonical_inputs(32773, 73, h_kv=1, cu_seqlens=[0, 3, 32773], width=2052, saved_output_dtype=torch.float32)
+    _canonical_call(inputs)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            outputs = _canonical_call(inputs)
+        # First remove all sparse rows, then restore them with an empty document.
+        for bounds in ([0, 16385, 32773], [0, 0, 32773]):
+            fresh = canonical_inputs(32773, 79, h_kv=1, cu_seqlens=bounds, width=2052, saved_output_dtype=torch.float32)
+            for name, tensor in inputs.items():
+                if isinstance(tensor, torch.Tensor):
+                    tensor.copy_(fresh[name])
+            for tensor in outputs:
+                tensor.fill_(torch.nan)
+            graph.replay()
+            torch.cuda.synchronize()
+            expected = reference_backward(**{k: inputs[k] for k in ("q", "k", "v", "out", "dout", "lse", "topk_idxs")})
+            for name, value, ref in zip(("dq", "dk", "dv"), outputs, expected):
+                assert_grads_close(name, value, ref)
+    finally:
+        graph.reset()
+
+
+def test_general_selection_keeps_empty_rows(supported_gpu):
+    inputs = make_inputs((3, 9), 12, 1, empty=True)
+    small = indices_for(inputs)
+    indices = torch.full((12, 2052), -1, dtype=torch.int32, device="cuda")
+    indices[:, : small.shape[1]] = small
+    check_case(inputs, indices)
+
+
+def test_causal_topk_options_are_explicit_and_append_only(supported_gpu):
+    signature = inspect.signature(qsa_indexed_backward)
+    assert list(signature.parameters)[:8] == ["grad_out", "q", "k", "v", "out_fp32", "lse", "indices", "scale"]
+    assert all(p.kind == inspect.Parameter.KEYWORD_ONLY for p in list(signature.parameters.values())[8:])
+    inputs = make_inputs((5,), 12, 1, all_selected=True)
+    q, k, v = (inputs[name] for name in ("q", "k", "v"))
+    indices = indices_for(inputs)
+    out = qsa_indexed_forward(q, k, v, indices)
+    args = (q, q, k, v, out["out_fp32"], out["lse"], indices)
+    for kwargs, message in [
+        ({"selection_mode": "two_pass"}, "selection_mode"),
+        ({"selection_mode": None}, "selection_mode"),
+        ({"cu_seqlens": torch.tensor([0, 5], device="cuda", dtype=torch.int32)}, "require selection_mode"),
+        ({"max_seq_len": 5}, "require selection_mode"),
+    ]:
+        with pytest.raises(ValueError, match=message):
+            qsa_indexed_backward(*args, **kwargs)
+    with pytest.raises(NotImplementedError, match="width 2052"):
+        qsa_indexed_backward(*args, selection_mode="causal_topk")
+    padded = torch.full((5, 2052), -1, dtype=torch.int32, device="cuda")
+    padded[:, : indices.shape[1]] = indices
+    args = (*args[:-1], padded)
+    for value in (True, 3.5, 0, 6):
+        with pytest.raises(ValueError, match="host integer"):
+            qsa_indexed_backward(*args, selection_mode="causal_topk", max_seq_len=value)
+    with pytest.raises(ValueError, match="single sequence"):
+        qsa_indexed_backward(*args, selection_mode="causal_topk", max_seq_len=3)
+    with pytest.raises(NotImplementedError, match="scale"):
+        qsa_indexed_backward(*args, scale=0.5, selection_mode="causal_topk")
+    with pytest.raises(ValueError, match="dtype"):
+        qsa_indexed_backward(*args, selection_mode="causal_topk", cu_seqlens=torch.tensor([0, 5], device="cuda", dtype=torch.int64))
 
 
 @pytest.mark.parametrize("version", [None, ("nvidia-cutlass-dsl", "4.6.2")])

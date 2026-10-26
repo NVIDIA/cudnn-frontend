@@ -138,15 +138,39 @@ def dot_do_o_kernel(
                             for kk in cutlass.range_constexpr(_COPY_ELEMS):
                                 acc = acc + ov[kk].to(cutlass.Float32) * dov[kk].to(cutlass.Float32)
                     else:
-                        ov = (o_ptr + o_off + chunk * chunk_elems).load(count=_COPY_ELEMS)
-                        dov = (do_ptr + do_off + chunk * chunk_elems).load(count=_COPY_ELEMS)
+                        if cutlass.const_expr(
+                            (D_V == 256 and o.element_type == cutlass.BFloat16 and do.element_type == cutlass.BFloat16)
+                            and (o.iterator.alignment >= 16 and do.iterator.alignment >= 16)
+                            and (o_batch_stride % 8 == 0 and o_seq_stride % 8 == 0 and o_head_stride % 8 == 0)
+                            and (do_batch_stride % 8 == 0 and do_seq_stride % 8 == 0 and do_head_stride % 8 == 0)
+                        ):
+                            # Pitched BF16 rows retain 16-byte alignment when
+                            # every physical origin and eight-element lane
+                            # offset does. Keep the original arithmetic order.
+                            ov = (o_ptr + o_off + chunk * chunk_elems).load(alignment=16, count=_COPY_ELEMS)
+                            dov = (do_ptr + do_off + chunk * chunk_elems).load(alignment=16, count=_COPY_ELEMS)
+                        else:
+                            ov = (o_ptr + o_off + chunk * chunk_elems).load(count=_COPY_ELEMS)
+                            dov = (do_ptr + do_off + chunk * chunk_elems).load(count=_COPY_ELEMS)
                         for kk in cutlass.range_constexpr(_COPY_ELEMS):
                             acc = acc + ov[kk].to(cutlass.Float32) * dov[kk].to(cutlass.Float32)
             else:
                 g_off = base + row * row_stride + col0
                 for chunk in cutlass.range_constexpr(n_chunks):
-                    ov = (o_ptr + g_off + chunk * chunk_elems).load(count=_COPY_ELEMS)
-                    dov = (do_ptr + g_off + chunk * chunk_elems).load(count=_COPY_ELEMS)
+                    if cutlass.const_expr(
+                        D_V == 256
+                        and o.element_type == cutlass.BFloat16
+                        and do.element_type == cutlass.BFloat16
+                        and o.iterator.alignment >= 16
+                        and do.iterator.alignment >= 16
+                    ):
+                        # Compact D256 BF16 rows and eight-element lane offsets
+                        # preserve each input's declared 16-byte base alignment.
+                        ov = (o_ptr + g_off + chunk * chunk_elems).load(alignment=16, count=_COPY_ELEMS)
+                        dov = (do_ptr + g_off + chunk * chunk_elems).load(alignment=16, count=_COPY_ELEMS)
+                    else:
+                        ov = (o_ptr + g_off + chunk * chunk_elems).load(count=_COPY_ELEMS)
+                        dov = (do_ptr + g_off + chunk * chunk_elems).load(count=_COPY_ELEMS)
                     for kk in cutlass.range_constexpr(_COPY_ELEMS):
                         acc = acc + ov[kk].to(cutlass.Float32) * dov[kk].to(cutlass.Float32)
         # Allreduce over the threads sharing the row (lane-contiguous).
@@ -290,7 +314,12 @@ def _reduce_group_vec(
     for e in cutlass.range_constexpr(VEC):
         acc[e] = cutlass.Float32(0.0)
     for g in cutlass.range_constexpr(group):
-        part = (ws_ptr + ws_base + g * D).load(count=VEC)
+        if cutlass.const_expr(D == 256 and io_dtype == cutlass.BFloat16):
+            # The workspace is aligned; D256 rows and eight-element vectors
+            # preserve 16-byte alignment for both BF16 and FP32 partials.
+            part = (ws_ptr + ws_base + g * D).load(alignment=16, count=VEC)
+        else:
+            part = (ws_ptr + ws_base + g * D).load(count=VEC)
         for e in cutlass.range_constexpr(VEC):
             acc[e] = acc[e] + part[e].to(cutlass.Float32)
     vec = cutlass.Vector.from_elements(tuple(acc[e].to(io_dtype) for e in range(VEC)), io_dtype)

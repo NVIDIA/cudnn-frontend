@@ -243,6 +243,7 @@ def test_forward_large_values(supported_gpu, heads, score, magnitude):
 @pytest.mark.xfail(
     reason="the engine rounds dS to bf16 once before the dQ MMA, so the analytically zero dQ of this construction "
     "keeps a residual above the absolute floor; a multi-part bf16 dS needs SMEM the query kernel does not have",
+    raises=AssertionError,
     strict=False,
 )
 @pytest.mark.parametrize("heads", [(12, 1), (24, 2)])
