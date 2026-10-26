@@ -24,6 +24,7 @@ os.environ.setdefault("NVTE_FRAMEWORK", "pytorch")
 
 import faulthandler
 import gc
+import importlib.util
 import re
 import socket
 import subprocess
@@ -359,6 +360,20 @@ def _apply_tier_markers(config, items):
             item.add_marker(pytest.mark.smoke)
         if item.nodeid in nightly_only:
             item.add_marker(pytest.mark.nightly_only)
+
+
+# =================== JAX absent =====================
+# JAX is optional (pyproject's ``jax`` group). Without it, the test directory
+# gemm/jax -- which has no __init__.py -- imports as a namespace package named
+# ``jax`` as soon as pytest's prepend import mode puts test/python/gemm on
+# sys.path, which it does for gemm/test_*.py. pytest.importorskip("jax") then
+# passes and each gemm/jax module dies at ``import jax.numpy``: a collection
+# error per module, which interrupts the whole session. Record the absence
+# before any test path is added, so every importorskip("jax") skips and the
+# gate below sees no JAX.
+_jax_spec = importlib.util.find_spec("jax")
+if _jax_spec is None or _jax_spec.origin is None:  # not installed, or only a namespace directory
+    sys.modules["jax"] = None
 
 
 # =================== JAX/XLA target gate =====================
