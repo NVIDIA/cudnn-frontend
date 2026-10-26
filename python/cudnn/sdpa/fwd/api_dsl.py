@@ -3616,9 +3616,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # Wired in the quantized kernels (MXFP8, per-tensor FP8 d128 / d192x128) and
         # the f16 d128 kernel's unmasked softmax arm; the other f16 kernels do not
         # read this flag, and the SM107 siblings carry the instruction unconditionally.
-        # Auto-set from the device capability so an SM103 run picks the fused path
-        # with no user action.
-        fused_ldtm_stat = (self._fp8 or tuple(self.flavor) == (128, 128)) and (self._device_cc == (10, 3))
+        # Paged half D128 on SM107 uses the shared SM100 body, so it needs the
+        # same explicit flag as SM103 to avoid a software row-max reduction.
+        fused_ldtm_stat = (self._fp8 or tuple(self.flavor) == (128, 128)) and (
+            self._device_cc == (10, 3) or (self._device_cc == (10, 7) and self.paged and not self._fp8)
+        )
         # The exp2 MUFU / FMA split is on ONLY where it was measured (cc 10.0 x the d128 MXFP8 / d128 FP8 /
         # d192x128 f16 / d192x128 FP8 kernels) -- see _exp2_fma_split_for; the kernels not listed there never
         # read the field.
