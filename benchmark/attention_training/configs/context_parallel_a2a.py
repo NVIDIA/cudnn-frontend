@@ -29,6 +29,6 @@ CONFIG = BenchmarkConfig(
     layout="thd",
     thd_min_fills=[1.0, 0.5],
     batch_size=64,
-    num_iterations=10,
+    num_iterations=20,
     output_dir="results",
 )

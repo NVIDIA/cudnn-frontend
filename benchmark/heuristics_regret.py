@@ -8,7 +8,9 @@ data type included, except the backend and the measurement), the ``cudnn_auto`` 
 only paired within a file: repeated runs in one directory stay separate cases rather than overwriting each other.
 ``regret = t(cudnn_auto) / min(t(cudnn),
 t(cudnn_oss))``: 1.0 means the heuristics picked the faster path; above ``--threshold`` is reported as a misrank.
-A case where ``cudnn_auto`` fails while another leg succeeds is reported as a coverage loss.
+A case where ``cudnn_auto`` fails while another leg succeeds is reported as a coverage loss. When ``cudnn_auto`` ran
+the same plan as the faster leg (``backend_detail``), the case is not a misrank whatever the timings say: their
+spread is run-to-run noise, reported as the noise floor the threshold has to clear.
 
     python -m benchmark.heuristics_regret <results dir or CSV> [...] [--threshold 1.05] [--top 30] [--fail]
 """
@@ -72,6 +74,12 @@ def _load(paths):
     return cases
 
 
+def _plan(detail):
+    """The plan name in a backend_detail ("cudnn_auto plan=X" or a bare name); None when unrecorded."""
+    detail = (detail or "").strip()
+    return detail.split("plan=", 1)[1].strip() if "plan=" in detail else (detail or None)
+
+
 def _label(key):
     d = dict(key[1:])
     head = " ".join(d[k] for k in SHOW if d.get(k))
@@ -88,7 +96,7 @@ def main():
     a = ap.parse_args()
 
     cases = _load(a.paths)
-    regrets, misranks, losses = [], [], []
+    regrets, misranks, losses, same_plan = [], [], [], []
     for key, legs in cases.items():
         auto = legs.get("cudnn_auto")
         ref = {leg: legs[leg][0] for leg in ("cudnn", "cudnn_oss") if leg in legs and legs[leg][0]}
@@ -99,6 +107,10 @@ def main():
             losses.append((key, best_leg, ref[best_leg]))
             continue
         r = auto[0] / ref[best_leg]
+        if _plan(auto[1]) is not None and _plan(auto[1]) == _plan(legs[best_leg][1]):
+            same_plan.append(max(r, 1 / r))
+            regrets.append(1.0)
+            continue
         regrets.append(r)
         if r > a.threshold:
             misranks.append((r, key, auto, best_leg, ref[best_leg]))
@@ -109,7 +121,10 @@ def main():
     gm = math.exp(sum(math.log(r) for r in regrets) / len(regrets)) if regrets else float("nan")
     print(f"## Heuristics regret (cudnn_auto vs the faster of cudnn / cudnn_oss, same data type)\n")
     print(f"- compared cases: {len(regrets)}; geomean regret {gm:.3f}; worst {max(regrets, default=float('nan')):.3f}")
-    print(f"- misranks (regret > {a.threshold:.2f}): {len(misranks)}; coverage losses (cudnn_auto failed, another leg ran): {len(losses)}\n")
+    print(f"- misranks (regret > {a.threshold:.2f}): {len(misranks)}; coverage losses (cudnn_auto failed, another leg ran): {len(losses)}")
+    if same_plan:
+        print(f"- same plan as the faster leg (regret 1.0): {len(same_plan)}; their timing spread, the noise floor: max {max(same_plan):.3f}")
+    print()
     if misranks:
         print(f"| regret | case | default pick | faster leg (ms) | default (ms) |\n|---|---|---|---|---|")
         for r, key, auto, best_leg, tb in sorted(misranks, key=lambda x: -x[0])[: a.top]:

@@ -383,7 +383,7 @@ def parse_args():
         default=1.0,
         type=float,
         help="thd only: each sequence's Q length is drawn (seeded) from [min_fill * q_seqlen, q_seqlen], its KV length "
-        "scaled by kv_seqlen / q_seqlen, and sequences are packed at 64-token slots. 1.0 = equal-length sequences",
+        "scaled by kv_seqlen / q_seqlen; sequences are packed back to back. 1.0 = equal-length sequences",
     )
     return parser.parse_args()
 
@@ -699,11 +699,12 @@ else:
         thd_q_lens = torch.randint(_lo, q_seqlen + 1, (batch_size,), generator=torch.Generator().manual_seed(0))
         thd_kv_lens = torch.clamp((thd_q_lens * kv_seqlen + q_seqlen - 1) // q_seqlen, max=kv_seqlen)
 
-        def _token_offsets(lens, cap):
-            slots = lens if bool((lens == cap).all()) else torch.clamp((lens + 63) // 64 * 64, max=cap)
-            return torch.cat([torch.zeros(1, dtype=torch.int64), torch.cumsum(slots, 0)])
+        # Tightly packed: offsets = prefix(lengths). The FROST THD rows derive sequence bases that way and do not read
+        # the bound offsets yet (issue #737), so padded THD would time wrong results on them.
+        def _token_offsets(lens):
+            return torch.cat([torch.zeros(1, dtype=torch.int64), torch.cumsum(lens, 0)])
 
-        _tok_q, _tok_kv = _token_offsets(thd_q_lens, q_seqlen), _token_offsets(thd_kv_lens, kv_seqlen)
+        _tok_q, _tok_kv = _token_offsets(thd_q_lens), _token_offsets(thd_kv_lens)
         # Packed token totals, declared on the graph as Transformer Engine does for THD.
         thd_totals = dict(max_total_seq_len_q=int(_tok_q[-1]), max_total_seq_len_kv=int(_tok_kv[-1]))
         thd_buffers = {
