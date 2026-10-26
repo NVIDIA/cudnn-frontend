@@ -87,12 +87,13 @@ def build_thd_origins(
     every TMA load. Descriptor writers publish to the tensor-map proxy before
     the consuming launch acquires the maps. Compact prefixes remain unchanged.
 
-    With ``single_maps``, when every live sequence's bound origins equal its
-    compact prefixes, the buffers hold no interior padding, so the load ports
-    publish one map each (clamped to the packed total) and the consumer
-    acquires it once instead of three sequence-local maps per work unit. The
-    word after the origin rows records that choice for the consuming launch;
-    a consumer that does not read it keeps sequence-local maps.
+    With ``single_maps``, when every sequence's bound origins equal its
+    compact prefixes in each port where it occupies rows, the buffers hold no
+    interior padding, so the load ports publish one map each (clamped to the
+    packed total) and the consumer acquires it once instead of three
+    sequence-local maps per work unit. The word after the origin rows records
+    that choice for the consuming launch; a consumer that does not read it
+    keeps sequence-local maps.
     """
     tid = cutlass.Int32(cute.arch.thread_idx()[0])
     if cutlass.const_expr(release_dependents):
@@ -134,11 +135,13 @@ def build_thd_origins(
                 origin = raw[port] * cutlass.Int64(spec[1]) // token_stride
                 destination[port, b] = origin
                 if cutlass.const_expr(single_maps):
-                    # A sequence without query rows owns no work unit and is
-                    # never addressed, so its offsets do not matter; K/V
-                    # offsets matter only when the sequence has keys.
+                    # A port's shared map covers the packed prefix, so every
+                    # sequence that occupies rows in that buffer votes: Q/O/
+                    # Stats when it has query rows, K/V when it has keys. A
+                    # sequence with keys but no query rows still has its K/V
+                    # rows loaded by its predecessor's tile tail.
                     if cutlass.const_expr(port in (1, 2)):
-                        live = (q_len > 0) & (kv_len > 0)
+                        live = kv_len > 0
                         expected = cutlass.Int64(cu_k_b)
                     else:
                         live = q_len > 0

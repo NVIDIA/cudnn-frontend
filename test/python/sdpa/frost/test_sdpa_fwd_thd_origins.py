@@ -226,8 +226,10 @@ def test_independent_thd_origins_rebind_and_capture(dim, dtype_name, stats_layou
 def test_compact_thd_origins_use_single_load_maps(dim):
     """Offsets equal to the compact prefixes publish one map per load port.
 
-    Dead sequences and keyless sequences do not vote. A gap in any bound port
-    switches that launch back to sequence-local maps, also on graph replay.
+    A sequence votes with its Q/O/Stats origins when it has query rows and
+    with its K/V origins when it has keys; other offsets are ignored. A gap
+    in any bound port switches that launch back to sequence-local maps, also
+    on graph replay.
     """
     import inspect
 
@@ -264,20 +266,19 @@ def test_compact_thd_origins_use_single_load_maps(dim):
             total += length
         return rows
 
-    def fill(ql, kl, k_shift=0, q_shift=0, arbitrary=()):
+    def fill(ql, kl, k_shift=0, q_shift=0, elsewhere=()):
         """Bind compact prefixes; shift K/V by ``k_shift`` rows and Q alone by ``q_shift`` rows after the first
-        sequence; overwrite the offsets of ``arbitrary`` (port, b) pairs with a row the compact rule would reject."""
+        sequence; place the ``elsewhere`` (port, b) pairs at a row the compact rule rejects, data included."""
         origins = {name: prefix(ql if name in ("q", "o", "stats") else kl) for name in ports}
         for name, shift in (("k", k_shift), ("v", k_shift), ("q", q_shift)):
             origins[name] = [row + (shift if b else 0) for b, row in enumerate(origins[name])]
+        for port, b in elsewhere:
+            origins[port][b] = 700 + 16 * b
         values["ql"].copy_(torch.tensor(ql, dtype=torch.int32, device="cuda").view(batch, 1, 1, 1))
         values["kl"].copy_(torch.tensor(kl, dtype=torch.int32, device="cuda").view(batch, 1, 1, 1))
         for name, multiplier in zip(ports, multipliers):
             stride = values[name].stride(2) if name != "stats" else heads
             rows = origins[name] + [origins[name][-1] + (ql if name in ("q", "o", "stats") else kl)[-1]]
-            for port, b in arbitrary:
-                if port == name:
-                    rows[b] = 700 + 16 * b
             values["ro_" + name].copy_(torch.tensor([x * stride // multiplier for x in rows], device="cuda", dtype=torch.int32).view(batch + 1, 1, 1, 1))
         for name in ("q", "k", "v"):
             view = flat(values[name])
@@ -368,13 +369,16 @@ def test_compact_thd_origins_use_single_load_maps(dim):
         check(state)
         assert single_maps() == expect_single
 
-    lengths, keyless = ([129, 0, 65, 33], [147, 0, 92, 50]), ([97, 0, 49, 17], [101, 0, 76, 0])
+    lengths, keyless, queryless = ([129, 0, 65, 33], [147, 0, 92, 50]), ([97, 0, 49, 17], [101, 0, 76, 0]), ([129, 0, 65, 33], [147, 83, 92, 50])
     # Compact prefixes in every port: single load maps.
     run(fill(*lengths), 1)
-    # A sequence without query rows does not vote, whatever its offsets say.
-    run(fill(*lengths, arbitrary=[(name, 1) for name in ports]), 1)
+    # A sequence without query rows or keys does not vote, whatever its offsets say.
+    run(fill(*lengths, elsewhere=[(name, 1) for name in ports]), 1)
     # A keyless sequence does not vote with its K/V offsets.
-    run(fill(*keyless, arbitrary=[("k", 3), ("v", 3)]), 1)
+    run(fill(*keyless, elsewhere=[("k", 3), ("v", 3)]), 1)
+    # A sequence with keys but no query rows votes with its K/V offsets: its
+    # rows sit inside the packed KV prefix that its predecessor's tail reads.
+    run(fill(*queryless, elsewhere=[("k", 1), ("v", 1)]), 0)
     # A gap after the first K/V sequence, or after the first Q sequence alone: sequence-local maps.
     run(fill(*lengths, k_shift=8), 0)
     run(fill(*lengths, q_shift=8), 0)
@@ -383,10 +387,11 @@ def test_compact_thd_origins_use_single_load_maps(dim):
         fill(*lengths)
         with torch.cuda.graph(captured):
             graph.execute(pack, workspace)
-        # Replay reads the offsets of each launch: compact, padded K/V, padded Q, compact.
+        # Replay reads the offsets of each launch: compact, padded K/V, padded Q, keys without queries elsewhere, compact.
         run(fill(*lengths), 1, replay=captured)
         run(fill(*lengths, k_shift=8), 0, replay=captured)
         run(fill(*lengths, q_shift=8), 0, replay=captured)
+        run(fill(*queryless, elsewhere=[("k", 1), ("v", 1)]), 0, replay=captured)
         run(fill(*keyless), 1, replay=captured)
     finally:
         captured.reset()

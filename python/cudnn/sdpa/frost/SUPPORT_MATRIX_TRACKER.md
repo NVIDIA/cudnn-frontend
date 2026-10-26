@@ -383,9 +383,9 @@ not the physical span including holes. These device-value bounds are caller
 contracts; execution performs no device-to-host inspection.
 
 With nonpaged K/V, setup emits sequence-local Q/K/V/O tensor maps in the existing metadata launch.
-Their extents exclude interior padding from loads and stores. When every live
-sequence's bound origins equal its compact prefixes (a sequence without query
-rows does not vote, nor do the K/V offsets of a keyless sequence), setup
+Their extents exclude interior padding from loads and stores. When every
+sequence's bound origins equal its compact prefixes in each port where it
+occupies rows (Q/O/Stats when it has query rows, K/V when it has keys), setup
 publishes one map per load port instead, clamped to the packed total, and the
 consumer acquires it once; O keeps a map per sequence. The choice is recorded
 in the workspace per launch, so a captured graph follows the offsets it replays
