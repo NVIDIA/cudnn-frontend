@@ -2717,6 +2717,15 @@ partition on average; the final partition may contain a shorter tail. A full
 first wave keeps the unsplit plan. Packed Stats and bounded shape overrides
 use the same declared envelope; other requests retain their existing policy.
 
+### Native SM107 D128 narrow KV tile
+
+Native SM107 half D128 prefill also accepts explicit `TILE_N=64`, using two
+score/P slots per query subtile. Nonpaged unsplit THD supports CGA1/2; dense
+prefill uses CGA2, including its existing split plans and head-dimension
+envelopes. Bias and per-key-mask graphs, paged plans and the shared dense
+CGA1/split-THD decode body retain their existing tile domains. The D128
+default remains `TILE_N=128`; no placement or shape-selection rule changes.
+
 ### SM107 dense D128 partial PackGQA
 
 Explicit packed CGA2 plans on the native half D128 prefill body admit head
@@ -3593,10 +3602,3 @@ end to end against the fp32 block oracle (the serving-forms section above, `test
 Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): THD and paged pools in one declaration, THD with the in-block indexer (through the block), any of the decode form's three arms under THD, a shared list at `S_q > 4`, a split past the item's tile
 count, the kernel's own epilogue gate under a split (the combine carries it), a sink, a sliding window / band, Q-length trimming
 of a dense batch, log2 stats, a pure caller list without the tail, head dims other than 256, FP8 / MXFP8.
-
-Native SM107 half D128 prefill also accepts explicit `TILE_N=64`, using two
-score/P slots per query subtile. Nonpaged unsplit THD supports CGA1/2; dense
-prefill uses CGA2, including its existing split plans and head-dimension
-envelopes. Bias and per-key-mask graphs, paged plans and the shared dense
-CGA1/split-THD decode body retain their existing tile domains. The D128
-default remains `TILE_N=128`; no placement or shape-selection rule changes.

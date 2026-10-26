@@ -720,7 +720,7 @@ class KernelTmemLayout:
     S_OFF: Tuple[int, ...] = _TMEM.S_OFF
     P_OFF: Tuple[int, ...] = _TMEM.P_OFF
     O_OFF: Tuple[int, ...] = _TMEM.O_OFF
-    # The S / P slot axis (CFG.S_SLOTS; 1 on every rendering but the small tiles' double-buffered S at TILE_N 64): slot p of
+    # The S / P slot axis (CFG.S_SLOTS; two on the half small/D128 tiles with double-buffered S at TILE_N 64): slot p of
     # sub-tile qs sits at S{qs}_OFF + p * S_SLOT_STRIDE, its P at P{qs}_OFF + p * S_SLOT_STRIDE (0 at one slot).
     S_SLOTS: int = _TMEM.S_SLOTS
     S_SLOT_STRIDE: int = _TMEM.S_SLOT_STRIDE
@@ -732,7 +732,7 @@ class KernelTmemLayout:
 
 LAYOUT = KernelTmemLayout()
 
-# === The double-buffered S / P slot (CFG.S_SLOTS == 2; TemplateParams.s_slots; the f16/bf16 32- / 64-wide tiles at TILE_N 64) ===
+# === The double-buffered S / P slot (CFG.S_SLOTS == 2; TemplateParams.s_slots; the f16/bf16 32- / 64- / 128-wide tiles at TILE_N 64) ===
 #
 # Each softmax sub-tile owns TWO S / P TMEM slots and every role walks a depth-2 PipelineState cursor over them, advanced once per
 # NON-EMPTY kv tile (every role iterates the same bounds, so the cursors stay in lockstep across steps and items; an empty step / tile
