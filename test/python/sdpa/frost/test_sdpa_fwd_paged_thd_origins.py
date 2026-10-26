@@ -25,6 +25,7 @@ pytestmark = [requires_dsl]
         pytest.param(128, "bfloat16", "mixed", "token", 1, 1, True, marks=pytest.mark.L1),
         pytest.param(128, "bfloat16", "hnd", "token", None, 1, True, marks=pytest.mark.L0, id="engine_default"),
         pytest.param(128, "bfloat16", "hnd", "token", 1, 2, True, marks=pytest.mark.L0, id="split2_hnd"),
+        pytest.param(128, "bfloat16", "hnd", "token", 1, 5, True, marks=pytest.mark.L0, id="integration_split5"),
         pytest.param(128, "float16", "nhd", "head", 1, 3, True, marks=pytest.mark.L1, id="split3_nhd"),
         pytest.param(128, "bfloat16", "mixed", "token", 1, 8, True, marks=pytest.mark.L1, id="split8_mixed"),
         pytest.param(128, "bfloat16", "hnd", "head", 1, 2, False, marks=pytest.mark.L1, id="split2_unpacked"),
@@ -37,7 +38,7 @@ def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stat
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("SM100/SM103 physical THD origin path")
-    if cga == 1 and torch.cuda.get_device_capability() != (10, 0):
+    if cga == 1 and splits == 1 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("CGA1 paged prefill is currently admitted on SM100")
     torch.manual_seed(261026737)
     batch, heads, kv_heads, maximum, page, kv_max = 2, 16, 4, 320, 16, 8192

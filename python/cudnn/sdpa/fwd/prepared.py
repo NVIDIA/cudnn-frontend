@@ -401,6 +401,12 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
         raise NotImplementedError("physical THD origins require rebuilding the native extension")
     if s.origin_specs is not None and s.paged and not getattr(_pybind_module._SdpaThdBinder, "supports_paged_physical_origins", False):
         raise NotImplementedError("paged physical THD origins require rebuilding the native extension")
+    if (
+        s.origin_specs is not None
+        and s.split_workspace is not None
+        and not getattr(_pybind_module._SdpaThdBinder, "supports_paged_split_physical_origins", False)
+    ):
+        raise NotImplementedError("paged split physical THD origins require rebuilding the native extension")
     s.native = _pybind_module._SdpaThdBinder(s)
     return s
 

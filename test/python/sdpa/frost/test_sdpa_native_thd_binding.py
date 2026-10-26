@@ -717,3 +717,39 @@ def test_native_paged_batch_capacity_survives_geometry_cache_hits(capacity):
         else:
             frame = _equal(s, changed)
             assert frame[s.index["problem_size"]][0] == batch
+
+
+@pytest.mark.parametrize("layout", [None, "NH", "HN"])
+@pytest.mark.parametrize("splits", [3, 5])
+def test_physical_paged_split_origins_bind_independent_frames(layout, splits):
+    from cudnn.sdpa.fwd.thd_origins import ROLES
+
+    s, facts, _ = _paged_fixture(hnd=True, layout=layout)
+    s.cga_tile_m = 128
+    s.order += ["lse_partial_ptr", "partial_o_strides"]
+    s.index = {name: i for i, name in enumerate(s.order)}
+    s.template += [None, None]
+    capacity, off_o = 16, 8192
+    off_lse = off_o + splits * capacity * s.qh * s.d_v * 4
+    s.split_workspace = prep.ThdSplitWorkspace(splits, capacity, off_o, off_lse)
+    s.scratch_bytes = off_lse + splits * capacity * s.qh * 4
+    s.origin_specs = ((0, 128, 1024, 64), None, None, (3, 1, 1024, 32), (4, 1, 1 if layout == "HN" else 8, 64) if layout else None)
+    for i, spec in enumerate(s.origin_specs):
+        if spec is not None:
+            facts[ROLES[i]] = prep.BufferFacts(0x50000 + i * 0x1000, f"int{spec[3]}", (2, 0), 5, (5,), (1,))
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    roles = prep._NATIVE_THD_ROLES + ROLES
+    indices = tuple(range(len(roles)))
+    original = tuple(s.template)
+    for shift, workspace in ((0, 0x4000000), (0x100000, 0x8000000)):
+        current = {name: fact._replace(ptr=fact.ptr + shift) for name, fact in facts.items()}
+        actual = s.native.bind(prep._native_pack_from_facts(current, roles), indices, workspace, 17)
+        assert list(actual) == binding_reference._bind_thd_python(s, current, workspace, 17, 17)
+        assert actual[s.index["o_partial_ptr"]] == workspace + off_o
+        assert actual[s.index["thd_origin_ptrs"]] == tuple(current[name].ptr if name in current else None for name in ROLES)
+    assert tuple(s.template) == original
+    # This still clears the old compact map bound, but overlaps the larger
+    # physical-origin map/row reservation and must be rejected before launch.
+    s.split_workspace = s.split_workspace._replace(off_o=s.off_o_desc + (s.b + 3) * 128)
+    with pytest.raises(ValueError, match="overlap.*physical-origin"):
+        cudnn._pybind_module._SdpaThdBinder(s)
