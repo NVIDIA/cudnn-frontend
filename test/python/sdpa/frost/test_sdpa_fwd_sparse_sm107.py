@@ -2528,7 +2528,8 @@ def _launch_decode(q, kv, ids, lens, kv_lens, top_k, scale, *, split=1, launches
     """Sentinel-filled O / LSE per launch through the adapter's DECODE form (``list_per_sequence=True, bottom_right=True,
     split_kv=split``; ``list_per_sequence=False`` = the per-token bottom-right form, ``block_ids [B, S_q, top_k]``); ``kv`` = ``(k, v)``
     dense or ``(k_pool, v_pool, table, P)`` paged.  A split's workspace is sentinel-filled too: an unwritten partial slot would read
-    as a huge live weight and the oracle comparison would catch it."""
+    as a huge live weight and the oracle comparison would catch it.  The tcgen05 core pinned by name (``tile_form="tcgen05"``): this is
+    the core's launcher and the lean module's reference; under ``"auto"`` the measured part takes the lean body inside its placement bound."""
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
 
     dev = q.device
@@ -2556,6 +2557,7 @@ def _launch_decode(q, kv, ids, lens, kv_lens, top_k, scale, *, split=1, launches
             bottom_right=True,
             split_kv=split,
             epilogue_gate=gate,
+            tile_form="tcgen05",
             **kw,
         )
         assert a.check_support()
