@@ -300,3 +300,71 @@ def test_origins_rebind_and_replay(monkeypatch, dt, token_major, surface):
         stream.synchronize()
         for capture, _ in retained:
             capture.reset()
+
+
+@pytest.mark.parametrize("first_dtype", [torch.int32, torch.int64], ids=["i32-to-i64", "i64-to-i32"])
+@pytest.mark.parametrize("port", ["q", "stats"])
+def test_origin_integer_types_separate_compiled_artifacts(monkeypatch, tmp_path, first_dtype, port):
+    """Offset width changes the compiled pointer ABI even when every stride/multiplier is identical."""
+    from cudnn.frost import compiled_cache
+
+    previous_cache = compiled_cache.get_cache_dir()
+    monkeypatch.setenv("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", "0")
+    monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO", "1")
+    compiled_cache.clear_memo()
+    compiled_cache.set_cache_dir(tmp_path)
+    second_dtype = torch.int64 if first_dtype == torch.int32 else torch.int32
+    plans, payloads, entries = [], [], []
+    captures = []
+    try:
+        for offset_dtype in (first_dtype, second_dtype):
+            p = make_payload(torch.bfloat16, True, (257, 93, 128), (383, 129, 267), 0, False, hq=2, hkv=2)
+            p["offsets"][port] = p["offsets"][port].to(offset_dtype)
+            p["spec"][port] = (offset_dtype, p["spec"][port][1])
+            with compiled_cache.record_entries() as recorded:
+                api = make_adapter(p, True)
+            assert recorded, "the prepared host did not persist an artifact"
+            if plans:
+                # Check BEFORE launching a colliding entry: the old bug could
+                # interpret current valid offsets using the previous pointer width.
+                assert api._compiled.entry is not plans[0]._compiled.entry, "different origin integer widths reused the same compiled host"
+                assert set(recorded).isdisjoint(entries[0]), "different origin integer widths reused the same disk artifact"
+            plans.append(api)
+            payloads.append(p)
+            entries.append(set(recorded))
+            p["ws"] = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
+            p["snapshots"] = snapshots(p)
+            poison(p)
+            run(api, p)
+            torch.cuda.synchronize()
+            check(p)
+
+        # Forget process memoization and require actual disk reload for BOTH
+        # declarations. A previously built launchable cannot satisfy this probe.
+        compiled_cache.clear_memo()
+        monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO", "0")
+        before = compiled_cache.stats()
+        with compiled_cache.refuse_compiles():
+            for p, expected_entries in zip(payloads, entries):
+                with compiled_cache.record_entries() as reloaded_entries:
+                    api = make_adapter(p, True)
+                assert set(reloaded_entries) == expected_entries
+                poison(p)
+                run(api, p)
+                torch.cuda.synchronize()
+                check(p)
+                capture = torch.cuda.CUDAGraph()
+                captures.append(capture)
+                with torch.cuda.graph(capture):
+                    run(api, p)
+                poison(p)
+                capture.replay()
+                torch.cuda.synchronize()
+                check(p)
+        assert compiled_cache.stats()["hits"] >= before["hits"] + 2, "the replan did not reload both disk artifacts"
+    finally:
+        torch.cuda.synchronize()
+        for capture in captures:
+            capture.reset()
+        compiled_cache.clear_memo()
+        compiled_cache.set_cache_dir(previous_cache)
