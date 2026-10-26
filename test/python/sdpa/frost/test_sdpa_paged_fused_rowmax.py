@@ -19,12 +19,15 @@ pytestmark = [pytest.mark.L0, requires_dsl]
 def test_paged_rowmax_architecture_replay(dtype, packed):
     import cudnn
     from cudnn.engines.manifest import family_for
+    from cudnn.frost.buffers import cutedsl_arch_requirement_error
 
     if not torch.cuda.is_available():
         pytest.skip("requires SM100, SM103 or SM107")
     cc = torch.cuda.get_device_capability()
     if cc not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("requires SM100, SM103 or SM107")
+    if cc == (10, 7) and (reason := cutedsl_arch_requirement_error(cc)) is not None:
+        pytest.skip(reason)
     engine = "sdpa_fwd_prefill_sm107" if cc == (10, 7) else "sdpa_fwd_prefill_sm100"
     io_type = cudnn.data_type.BFLOAT16 if dtype == torch.bfloat16 else cudnn.data_type.HALF
     nq, nk, h, hk, d, page = 137, 1155, 8, 2, 128, 16
