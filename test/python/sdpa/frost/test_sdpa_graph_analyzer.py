@@ -2491,10 +2491,9 @@ def _mk_paged_graph_fp8(*, d=128, page_size=16, max_pages=8, hnd=True, thd=False
 
 
 def test_paged_fp8_probe_accepts_and_declines():
-    """Paged per-tensor FP8 is the d128 FP8 kernel's PAGED_KV specialization: the fp8
-    row admits d128 (and d64 on its envelope) pools in HND or NHD, dense Q only; it
-    declines the d256 flavor, THD queries over pools and off-contract page sizes.
-    The f16/bf16 row never serves an sdpa_fp8 graph."""
+    """Paged per-tensor FP8 admits D128 and D256 pools in HND or NHD, dense Q
+    only, with D64 on its envelope. THD queries and off-contract page sizes
+    remain declined. The f16/bf16 row never serves an sdpa_fp8 graph."""
     fp8_name = engines.engine_name(fp8=True)
     for hnd in (True, False):
         facts = _facts(_mk_paged_graph_fp8(hnd=hnd))
@@ -2503,8 +2502,9 @@ def test_paged_fp8_probe_accepts_and_declines():
         assert fp8_name in elig and engines.engine_name() not in elig
     assert fp8_name in _eligible(_mk_paged_graph_fp8(d=64)), "d=64 FP8 rides the d128 FP8 envelope"
     assert fp8_name in _eligible(_mk_paged_graph_fp8(page_size=128))
-    assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=256)), "paged per-tensor FP8 is wired on the d128 flavor only"
-    assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=192)), "(192, 192) would select the d256 FP8 flavor"
+    for hnd in (True, False):
+        assert fp8_name in _eligible(_mk_paged_graph_fp8(d=256, hnd=hnd))
+    assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=192)), "(192, 192) has no supported kernel envelope"
     assert fp8_name not in _eligible(_mk_paged_graph_fp8(page_size=48)), "page_size must divide 128 or be a multiple of it"
     assert fp8_name not in _eligible(_mk_paged_graph_fp8(thd=True)), "THD queries over FP8 pools clamp runtime K/V descriptors; declined"
 
@@ -2513,7 +2513,7 @@ def test_paged_quantized_rows_mismatch_reasons():
     """The row-level reasons, by field: the SM100 MXFP8 row admits F8_128x4 pools at
     page_size % 128 only, the Rubin per-tensor FP8 row does not admit pools (its sibling
     kernel has no PAGED_KV specialization), and the SM100 FP8 row's paged sub-gates name
-    THD and the d128 envelope."""
+    THD and unsupported asymmetric head dimensions."""
 
     def paged_facts(**kw):
         base = dict(
@@ -2544,9 +2544,10 @@ def test_paged_quantized_rows_mismatch_reasons():
     assert "multiple of 128" in engines.mismatch(mxfp8, paged_facts(is_mxfp8=True))
     assert "paged attention" in engines.mismatch(fp8_rubin, paged_facts(is_fp8=True, device_cc=(10, 7)))
     assert "THD" in engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True))
-    # The head-dim gate is the SELECTED flavor (Capabilities.paged_d_shapes = {(64, 64), (128, 128)} on the fp8 row).
-    assert "wired on the d64, d128 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=256, d_v=256))
-    assert "wired on the d64, d128 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=128))
+    # Admission follows the selected flavor; D256 is exact, not a D192 envelope.
+    assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=256, d_v=256)) is None
+    assert "no kernel-flavor envelope" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=192))
+    assert "wired on the d64, d128, d256 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=128))
     for d in (64, 128):
         sink_facts = paged_facts(is_fp8=True, has_sink=True, d_qk=d, d_v=d)
         assert engines.mismatch(fp8, sink_facts) is None
