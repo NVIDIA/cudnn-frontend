@@ -1191,6 +1191,17 @@ stores and a release arrive for its single-CTA THD payload, preserving the
 transaction-counted DSMEM arm for multi-CTA renderings. The paged physical
 origin and multiwave cases in `test_sdpa_fwd_paged_thd_fp8.py` exercise this
 composition; numerics alone can pass while memcheck rejects the DSMEM write.
+Broadcast predecoded fields (Q tile, head, batch, bounds and split) as well as
+the original response before returning a slot credit. A vector response read
+alone leaves scalar field loads racing with the next local publication; the
+D256 multiwave racecheck catches the output-store warp reading a reused slot.
+
+The D256 FP8 shared-alpha handoff uses per-lane release arrivals for both
+publication and reuse, with matching barrier counts. Keep elected warp
+credits confined to the TMEM-only handoff: a TMEM wait does not publish the
+other lanes' shared alpha stores. Run the top-left mask/sink case in
+`test_sdpa_fwd_paged_thd_fp8.py` under racecheck, including its dense and
+compact controls, as well as the persistent scheduler case.
 
 Packed split workspace is bounded by declared packed-Q capacity. Every
 partial store and combine read must use live token coordinates, including
