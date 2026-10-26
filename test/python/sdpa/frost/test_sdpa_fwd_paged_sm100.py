@@ -1916,9 +1916,8 @@ def _build_fp8_paged_graph(P, *, d=D, H=8, KH=2, hnd=False, thd=False, mask_kw=N
 
 @pytest.mark.L0
 def test_paged_graph_fp8_declines_off_contract():
-    """Plan-time declines stay plan-time on the FP8 row: the d128 flavor is offered,
-    the d512 FP8 flavor, THD queries over FP8 pools and an off-contract page size
-    are not (no FP8 plan enters the ranked list, nothing compiles)."""
+    """D128/D256 serve dense or THD queries over FP8 pools. D512, THD D64
+    and off-contract page sizes remain plan-time declines."""
     from cudnn.sdpa.fwd.engines import engine_name
     from frost_test_utils import offers_engine
 
@@ -1930,7 +1929,9 @@ def test_paged_graph_fp8_declines_off_contract():
     assert not _offers(_build_fp8_paged_graph(48)), "page_size 48 neither divides nor is a multiple of the 128-row tile"
     assert _offers(_build_fp8_paged_graph(16, d=256))
     assert not _offers(_build_fp8_paged_graph(16, d=512)), "paged KV for per-tensor FP8 d512 is not wired"
-    assert not _offers(_build_fp8_paged_graph(16, thd=True)), "THD queries over FP8 pools are not wired (the FP8 THD path clamps runtime K/V descriptors)"
+    for d in (128, 256):
+        assert _offers(_build_fp8_paged_graph(16, d=d, thd=True))
+    assert not _offers(_build_fp8_paged_graph(16, d=64, thd=True)), "THD requires an exact native FP8 width"
     # Masks ride the same row: a causal bound (either alignment) and a left window are
     # offered.  Bottom-right alignment is a property of the band's diagonal: with no band
     # at all it is inert (the analyzer records an unmasked graph, which is offered); with a

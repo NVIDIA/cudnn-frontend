@@ -1186,6 +1186,12 @@ credit. Source-level vector loads can be scalarized, so the single-CTA THD
 path reads through lane zero and broadcasts before the release. Validate
 repeated waves with Compute Sanitizer racecheck as well as O/Stats tests.
 
+This also applies to the custom D256 FP8 predecode scheduler: use local
+stores and a release arrive for its single-CTA THD payload, preserving the
+transaction-counted DSMEM arm for multi-CTA renderings. The paged physical
+origin and multiwave cases in `test_sdpa_fwd_paged_thd_fp8.py` exercise this
+composition; numerics alone can pass while memcheck rejects the DSMEM write.
+
 Packed split workspace is bounded by declared packed-Q capacity. Every
 partial store and combine read must use live token coordinates, including
 empty sequences and nonaligned tails. `test_paged_thd_split_capture_lengths_and_stats`
