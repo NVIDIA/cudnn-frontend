@@ -76,6 +76,73 @@ def test_sparse_attn_sm100_tiles_match_reference(num_heads, head_dim, topk, has_
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=96)
+@pytest.mark.parametrize("has_topk_length", [False, True])
+def test_sparse_attn_h96_native_matches_reference(has_topk_length):
+    """H96 uses native head tiles on both SM90 and the SM100 architecture family."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (9, 10):
+        pytest.skip("native H96 sparse attention score recompute requires SM90 or SM100 family")
+    from cudnn import DSA
+
+    cfg = {"b": 1, "s_q": 4, "s_kv": 256, "head_dim": 576, "qhead_per_kv_head": 96, "topk": 128}
+    q, k, lse, local_ids, _ = _allocate(cfg, "attention", has_topk_length=False)
+    lengths = None
+    if has_topk_length:
+        lengths = torch.tensor([[0, 1, 127, 128]], dtype=torch.int32, device="cuda")
+        positions = torch.arange(cfg["topk"], device="cuda", dtype=torch.int32).view(1, 1, -1)
+        local_ids.masked_fill_(positions >= lengths.unsqueeze(-1), -1)
+    else:
+        local_ids[..., -37:] = -1
+
+    scale = 1.0 / math.sqrt(cfg["head_dim"])
+    actual = DSA.sparse_attn_score_recompute_wrapper(
+        q,
+        k,
+        lse,
+        local_ids,
+        scale,
+        qhead_per_kv_head=cfg["qhead_per_kv_head"],
+        topk_length=lengths,
+        topk_indices_global=False,
+    )["target"]
+    check_ref_sparse_score_recompute("attention", q, lse, local_ids, actual, aux=k, softmax_scale=scale, topk_length=lengths)
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=2051)
+@pytest.mark.parametrize("logical_topk", [2048, 2049, 2050, 2051])
+def test_sparse_attn_h96_native_production_topk(logical_topk):
+    """Production top-k boundaries retain empty-row and invalid-suffix semantics."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (9, 10):
+        pytest.skip("native H96 sparse attention score recompute requires SM90 or SM100 family")
+    from cudnn import DSA
+
+    heads, head_dim = 96, 576
+    physical_topk = math.ceil(logical_topk / 128) * 128
+    q = torch.zeros((1, 2, heads, head_dim), dtype=torch.bfloat16, device="cuda")
+    k = torch.zeros((1, physical_topk, head_dim), dtype=torch.bfloat16, device="cuda")
+    lse = torch.zeros((1, 2, heads), dtype=torch.float32, device="cuda")
+    indices = torch.arange(physical_topk, dtype=torch.int32, device="cuda").view(1, 1, -1).expand(1, 2, -1).clone()
+    lengths = torch.tensor([[0, logical_topk]], dtype=torch.int32, device="cuda")
+    positions = torch.arange(physical_topk, dtype=torch.int32, device="cuda").view(1, 1, -1)
+    indices.masked_fill_(positions >= lengths.unsqueeze(-1), -1)
+
+    actual = DSA.sparse_attn_score_recompute_wrapper(
+        q,
+        k,
+        lse,
+        indices,
+        1.0 / math.sqrt(head_dim),
+        qhead_per_kv_head=heads,
+        topk_length=lengths,
+        topk_indices_global=False,
+    )["target"]
+    expected = torch.zeros_like(actual)
+    expected[0, 1, :logical_topk] = 1.0 / logical_topk
+    torch.testing.assert_close(actual, expected, atol=1e-7, rtol=1e-4)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 @with_dsa_sparse_score_recompute_params
 def test_DSA_sparse_score_recompute_wrapper(
