@@ -2,12 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pointer entry for the single-launch dense d128 backward kernel."""
 
+from pathlib import Path
+
 import cutlass
 import cutlass.cute as cute
 from cuda.bindings import driver
 
 from cudnn.frost.compiled_cache import compile_cached
-from .bprop_d128_f16 import host as tensor_host
+from cudnn.frost.template_loader import load_template
+
+from cudnn.sdpa.bwd.kernels.sm100.bprop_d128_f16 import host as tensor_host
+
+HEAD_DIM = globals().get("FROST_TEMPLATE_PARAMS", 128)
 
 
 @cute.jit
@@ -44,6 +50,18 @@ def host(
 
 def compile_host(geometry, dtype, causal, sm, window_left=0):
     """Compile only plan-time geometry; bind storage and scale at execution."""
+    global tensor_host
+    head_dim = geometry[0][0][3]
+    if head_dim == 64 and HEAD_DIM != 64:
+        module = load_template(__file__, 64, tag="sdpa_bwd_d64_host")
+        return module.compile_host(geometry, dtype, causal, sm, window_left)
+    if head_dim != HEAD_DIM:
+        raise ValueError("prepared backward head dimension does not match the kernel specialization")
+    if HEAD_DIM == 64:
+        # Load after this specialized module is initialized: load_template
+        # holds a non-reentrant lock while executing module-level code.
+        # Each host module is fixed to one width, so this assignment is invariant.
+        tensor_host = load_template(str(Path(__file__).with_name("bprop_d128_f16.py")), 64, tag="sdpa_bwd_d64").host
     types = [dtype] * 5 + [cutlass.Float32] + [dtype] * 3
     args = [cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=4 if i == 5 else 16) for i, t in enumerate(types)]
     return compile_cached(
@@ -56,6 +74,6 @@ def compile_host(geometry, dtype, causal, sm, window_left=0):
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         int(window_left),
         options=f"--enable-tvm-ffi --gpu-arch sm_{sm}a",
-        cache_key=repr(("sdpa_bwd_sm100_d128", geometry, str(dtype), bool(causal), sm, int(window_left))),
+        cache_key=repr(("sdpa_bwd_sm100_d128", geometry, str(dtype), bool(causal), sm, int(window_left), HEAD_DIM)),
         symbol="frost_sdpa_bwd_sm100_d128_prepared",
     )

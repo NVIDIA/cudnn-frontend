@@ -1,6 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Dense d128 M128/N128 backward, one launch and no workspace.
+"""Dense D64/D128 M128/N128 backward, one launch and no workspace.
+
+D64 specializes the operand/MMA width and output stores; score/dS stay N128.
+The detailed storage numbers below describe the D128 configuration.
 
 CTA384: compute0..7 form two128-thread groups, each owns row=tid%128 and
 64 columns; loader8, MMA9, stats10+11, output/TMEM control11. Input has two
@@ -78,7 +81,9 @@ from cudnn.frost.tile_dsl.mma import mma_ss, mma_ts_step
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, row_reduction_pair, tmem_load_tile
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
-from cudnn.sdpa.bwd.config_sm100_d128 import CFG
+from cudnn.sdpa.bwd.config_sm100_d128 import make_cfg
+
+CFG = make_cfg(globals().get("FROST_TEMPLATE_PARAMS", 128))
 
 _SWIZZLE = cutlass.Swizzle(3, 4, 3)
 _LOG2E = 1.4426950408889634
@@ -549,12 +554,17 @@ def _mma_q(slab, bars, tmem_base, lo, hi, dtype: cutlass.Constexpr):
 
 @cute.jit
 def _stage_gradient(tmem_base, tmem_offset: cutlass.Constexpr[int], smem, live, dtype: cutlass.Constexpr, group: cutlass.Constexpr[int]):
-    row = cute.arch.thread_idx()[0] % CFG.TILE_M
-    values = cutlass.Vector.from_elements(tuple(cutlass.Float32(0.0) for _ in range(CFG.GROUP_COLS)), cutlass.Float32)
-    if live:
-        values = tmem_load_tile(tmem_base + tmem_offset + group * CFG.GROUP_COLS, num_elems=CFG.GROUP_COLS).vec
-        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-    smem.base.subview(group * CFG.TILE_M * CFG.GROUP_COLS + row * CFG.GROUP_COLS).data_ptr().store_swizzled(values.to(dtype), alignment=128, swizzle=_SWIZZLE)
+    # The second score group still participates in every readiness barrier,
+    # but D64 has no second 64-column gradient slab to read or store.
+    if cutlass.const_expr(group * CFG.GROUP_COLS < CFG.HEAD_DIM):
+        row = cute.arch.thread_idx()[0] % CFG.TILE_M
+        values = cutlass.Vector.from_elements(tuple(cutlass.Float32(0.0) for _ in range(CFG.GROUP_COLS)), cutlass.Float32)
+        if live:
+            values = tmem_load_tile(tmem_base + tmem_offset + group * CFG.GROUP_COLS, num_elems=CFG.GROUP_COLS).vec
+            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+        smem.base.subview(group * CFG.TILE_M * CFG.GROUP_COLS + row * CFG.GROUP_COLS).data_ptr().store_swizzled(
+            values.to(dtype), alignment=128, swizzle=_SWIZZLE
+        )
 
 
 @cute.jit

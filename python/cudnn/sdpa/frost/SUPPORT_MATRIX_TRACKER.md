@@ -376,7 +376,7 @@ query/key lengths (tail tiles are zero-filled on load and clipped on store). The
 kernel writes dK/dV directly and accumulates dQ in FP32 caller workspace. The cast
 applies no additional scale.
 
-Dense MHA at D64 (K/O on the D128 TMA-zero-filled envelope), and D64/D128
+Dense MHA at native D64 (64-wide operands/MMA/output, N128 score/dS), and D64/D128
 left sliding windows, also use the one-launch recompute body. Window traversal
 clips both Q-owner and KV-owner reductions to intersecting tiles; single-key
 rows have exact zero score gradients and contribute no dQ/dK. Dense graph and standalone calls share the prepared
@@ -399,7 +399,7 @@ bytes; the extra 240 bytes align its internal payload to 256 bytes when the
 caller's allocation is only 16-byte aligned. `graph.get_workspace_size()` is
 the allocation contract. All scratch is initialized each execution.
 
-| Feature | d128 BPROP, D64 via the D128 envelope |
+| Feature | D64/D128 BPROP, native head geometry |
 |---|---|
 | FP16 / BF16 | ✅ MHA in both dtypes; grouped attention is BF16 only |
 | Dense MHA, positive S_q / S_kv, rectangular lengths and tails | ✅ exact D64/D128 |

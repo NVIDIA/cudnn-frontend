@@ -76,3 +76,33 @@ def test_small_swa_rebind_replay(dt, d, causal, left, sq, sk, cudnn_handle):
                 capture.reset()
         finally:
             cudnn.set_stream(cudnn_handle, original_stream)
+
+
+def test_native_head_host_specializations(monkeypatch):
+    """The pointer host must compile each width's actual body and retain the window key."""
+    from pathlib import Path
+
+    import cutlass
+
+    from cudnn.frost.template_loader import load_template
+    from cudnn.sdpa.bwd.kernels.sm100 import prepared_d128_host as wide
+
+    narrow = load_template(wide.__file__, 64, tag="sdpa_bwd_d64_host")
+    body = load_template(str(Path(wide.__file__).with_name("bprop_d128_f16.py")), 64, tag="sdpa_bwd_d64")
+    assert body.CFG.HEAD_DIM == 64 and body.CFG.TILE_N == 128
+    assert body.CFG.SLAB_ELEMS >= body.CFG.AUX + body.CFG.TILE_M * body.CFG.TILE_N
+    captured = []
+
+    def compile_host(fn, *args, **kwargs):
+        result = object()
+        captured.append((fn, kwargs["cache_key"], result))
+        return result
+
+    monkeypatch.setattr(wide, "compile_cached", compile_host)
+    monkeypatch.setattr(narrow, "compile_cached", compile_host)
+    for d, window in ((128, 0), (64, 1), (64, 129)):
+        geometry = tuple(((1, 65, 3, d), (65 * 3 * d, 3 * d, d, 1)) if i != 5 else ((1, 3, 65), (195, 65, 1)) for i in range(9))
+        assert wide.compile_host(geometry, cutlass.BFloat16, True, 100, window) is captured[-1][2]
+        assert captured[-1][0] is (narrow.host if d == 64 else wide.host)
+    assert narrow.tensor_host is body.host
+    assert len({key for _, key, _ in captured}) == 3

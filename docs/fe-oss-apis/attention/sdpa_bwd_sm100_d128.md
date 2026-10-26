@@ -37,8 +37,8 @@ without inter-CTA atomics. It requires zero workspace and supports both unmasked
 and top-left causal attention. The choice is made when the plan is built.
 
 D64 and sliding-window dense MHA use that same recompute implementation,
-whether or not determinism is requested. D64 uses TMA zero-fill and clipped
-stores over the D128 tile. A left window bounds both Q and KV owners' reduction
+whether or not determinism is requested. D64 uses native 64-wide operand/MMA tiles and gradient stores; score and dS
+tiles retain their 128-column geometry. A left window bounds both Q and KV owners' reduction
 loops and masks boundary tiles; rows containing one legal key have zero score
 gradients and contribute no dQ/dK.
 The graph's left bound counts keys, while standalone `window_size_left` counts
