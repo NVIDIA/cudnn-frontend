@@ -37,6 +37,10 @@ pytestmark = [pytest.mark.L1, requires_dsl]
 )
 def test_native_d128_packing_dense_replay(dtype_name, sched_policy, with_stats, geometry):
     """Native PackGQA covers every scheduler, per-head sinks, keyless rows and FP32 partials."""
+    _check_native_d128_packing_dense_replay(dtype_name, sched_policy, with_stats, geometry)
+
+
+def _check_native_d128_packing_dense_replay(dtype_name, sched_policy, with_stats, geometry, *, tile_n=None):
     import torch
     from cuda.bindings import driver as cuda
 
@@ -75,12 +79,16 @@ def test_native_d128_packing_dense_replay(dtype_name, sched_policy, with_stats, 
         window_left=window,
         sink=sink,
         pack_gqa=True,
+        tile_n=tile_n,
     )
     api.sched_policy = sched_policy
     assert api.check_support()
     api.compile()
     assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
     cfg = api._k_mod.CFG
+    if tile_n is not None:
+        assert (cfg.TILE_N, cfg.S_SLOTS) == (tile_n, 2 if tile_n == 64 else 1)
+        assert (api._k_mod.PARAMS.tile_n, api._k_mod.PARAMS.s_slots) == (cfg.TILE_N, cfg.S_SLOTS)
     assert (cfg.PACK_G, cfg.STAGES_KV, cfg.SOFTMAX_WARPGROUPS) == (math.gcd(group, 128), 4, 2)
     ws = torch.empty(max(api.scratch_workspace_bytes(), 1), dtype=torch.uint8, device="cuda")
     stream = torch.cuda.Stream()
@@ -124,7 +132,7 @@ def test_native_d128_packing_dense_replay(dtype_name, sched_policy, with_stats, 
     if geometry == "mha":
         # PACK_G=1 must be the unpacked function, including exact rounding.
         plain, u = _half_prefold_api(
-            128, 128, getattr(torch, dtype_name), prefolded=False, with_stats=with_stats, split_kv=1, b=2, hq=2, hkv=2, s_q=sq, s_kv=sk
+            128, 128, getattr(torch, dtype_name), prefolded=False, with_stats=with_stats, split_kv=1, b=2, hq=2, hkv=2, s_q=sq, s_kv=sk, tile_n=tile_n
         )
         plain.sched_policy = sched_policy
         assert plain.check_support()

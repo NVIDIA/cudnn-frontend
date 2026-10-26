@@ -49,7 +49,7 @@ from cudnn.sdpa.fwd.config_sm90 import (
     head_dims_mismatch as _sm90_head_dims_mismatch,
 )
 from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES as _SM107_F16_THD_SHAPES
-from cudnn.sdpa.fwd.config_sm107 import supports_native_d128_dense_partial_pack
+from cudnn.sdpa.fwd.config_sm107 import supports_native_d128_dense_partial_pack, supports_native_d128_narrow_tile
 from cudnn.sdpa.fwd.config_sm107 import SM107_F16_SMALL_D_SHAPES as _SM107_F16_SMALL_D_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import SM107_SMALL_D_CGAS as _SM107_SMALL_D_CGAS
 from cudnn.sdpa.fwd.config_sm107 import sm107_small_tile_leg as _sm107_small_tile_leg
@@ -1873,10 +1873,27 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             natural=self.sched_policy is None or self.sched_policy == SCHED_NATURAL,
         )
 
+    def _native_d128_narrow_tile(self) -> bool:
+        return supports_native_d128_narrow_tile(
+            self.flavor,
+            device_cc=self._device_cc,
+            half_precision=self.q_desc.dtype in (torch.float16, torch.bfloat16),
+            thd=self.thd,
+            paged=self.paged,
+            cga=self.cga,
+            split_kv=self.split_kv,
+            has_bias=self.bias_desc is not None,
+            has_kv_mask=self.kv_mask_desc is not None,
+        )
+
     def _s_slots(self) -> int:
-        """The ``TemplateParams.s_slots`` of this plan: 1 everywhere but the Rubin 32- / 64-wide f16/bf16 tiles, where
+        """The ``TemplateParams.s_slots`` of this plan: Two for the native D128 narrow tile. On Rubin 32- / 64-wide f16/bf16 tiles,
         ``config_sm107.sm107_s_slots_pick`` decides (the MEASURED rule: 2 on the plain body -- no bias, no kv_mask -- at TILE_N 64, 1 on
         every other form; the sweep seam's value verbatim, which the factory validates against TILE_N 64 and the TMEM fit)."""
+        # D128's explicit narrow tile uses the double-buffered score pipeline.
+        # Its default tile width remains 128; this does not choose a plan.
+        if self._native_d128_narrow_tile() and self._effective_tile_n() == 64:
+            return 2
         if self.flavor in _SM107_F16_SMALL_D_SHAPES and self._device_cc == (10, 7) and not self._fp8:
             return _sm107_s_slots_pick(self.flavor[0], self._effective_tile_n(), has_bias=self.bias_desc is not None, has_kv_mask=self.kv_mask_desc is not None)
         return 1
@@ -2641,6 +2658,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 else frozenset({128})
             )
         )
+        if self._native_d128_narrow_tile():
+            _tile_ns = frozenset({64, 128})
         self._value_error_if(
             self.tile_n is not None and self.tile_n not in _tile_ns,
             f"SM100 DSL SDPA serves tile_n in {sorted(_tile_ns)} on the {self.flavor} flavor; got {self.tile_n}",

@@ -75,6 +75,7 @@ from cudnn.sdpa.fwd.config_sm107 import (
     SM107_SMALL_D_CGAS,
     SM107_FP32_VECTOR_WITH_BIAS_TILE_N,
     SM107_TILE_NS_BY_D_SHAPE,
+    supports_native_d128_narrow_tile,
 )
 from cudnn.sdpa.fwd.config_sm120 import (
     D512_FLAVOR,
@@ -1004,8 +1005,20 @@ def effective_sched_policies(capabilities: Capabilities, facts: "ga.SdpaGraphFac
 def effective_tile_ns(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> frozenset[int]:
     """KV tile-width domain of the native flavor the lowering will pick: row-wide ``tile_ns`` is the floor, a
     ``tile_ns_by_d_shape`` entry for the selected flavor replaces it (the Rubin small tiles render 64 and 128, the
-    d128 rendering of the same file 128 only)."""
+    native D128 rendering additionally admits explicit 64 on its double-score pipeline)."""
     selected = _selected_d_shape(capabilities, facts, knobs)
+    if capabilities.sm_lo == 107 and supports_native_d128_narrow_tile(
+        selected,
+        device_cc=facts.device_cc,
+        half_precision=facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16),
+        thd=facts.thd,
+        paged=facts.has_paged_kv,
+        cga=knobs.cga if knobs is not None else None,
+        split_kv=(knobs.split_kv or 1) if knobs is not None else 1,
+        has_bias=facts.has_bias,
+        has_kv_mask=facts.has_kv_mask,
+    ):
+        return frozenset({64, 128})
     if selected is not None:
         for shape, shape_domain in capabilities.tile_ns_by_d_shape:
             if shape == selected:
