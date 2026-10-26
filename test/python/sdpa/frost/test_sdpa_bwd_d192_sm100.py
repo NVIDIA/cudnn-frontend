@@ -6,7 +6,6 @@
 import pytest
 import torch
 
-import cudnn
 from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell, select_engine
 from test_sdpa_bwd_dsl_sm107 import _bshd_empty, _build_graph, _causal_keep, _check, _reference64
 
