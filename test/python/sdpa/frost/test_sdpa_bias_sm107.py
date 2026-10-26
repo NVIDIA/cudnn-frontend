@@ -456,14 +456,15 @@ def test_template_params_and_capabilities_are_appended():
         1,
     ), "a record without the fields renders the legacy tail, the full body, the two-group body and one S slot"
     # ... followed by the per-shape TILE_N domain (the TILE_N 64 cells of the small tiles), appended after them, then the
-    # PackGQA divisibility rule.
-    assert [f.name for f in dataclasses.fields(Capabilities)][-6:] == [
+    # PackGQA divisibility rule and per-shape THD exclusions.
+    assert [f.name for f in dataclasses.fields(Capabilities)][-7:] == [
         "bias_d_shapes",
         "bias_io_dtype_only",
         "kv_mask",
         "kv_mask_dtypes",
         "tile_ns_by_d_shape",
         "pack_gqa_requires_divisible",
+        "thd_excluded_d_shapes",
     ]
 
 
