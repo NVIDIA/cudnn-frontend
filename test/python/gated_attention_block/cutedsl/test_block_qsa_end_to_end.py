@@ -2104,7 +2104,7 @@ def test_a_packed_qsa_block_with_write_through_is_bitwise_the_one_without():
 # ---------------------------------------------------------------------------- the in-block indexer's DECODE step over the pools (2026-10-21)
 
 
-def _decode_indexer_block(geom, inp, s_q, *, ps, k_cache, v_cache, table, icache, ring, ring_table, fuse_prepare, dtype=BF16):
+def _decode_indexer_block(geom, inp, s_q, *, ps, k_cache, v_cache, table, icache, ring, ring_table, fuse_prepare, dtype=BF16, sparse_tile_form=None):
     """One decode-indexer declaration (``QsaSpec(index_source="indexer")`` over the pools; the geometry's ``index_cache_dtype`` names the
     cache's dtype -- ``icache`` is in it) at ``[1, s_q]`` on EMPTY step inputs -- the prefill's weights, the K / V pools + the three side
     caches as samples, the gate fused, the LSE out -- checked, compiled, with its sentinel-filled workspace."""
@@ -2130,6 +2130,7 @@ def _decode_indexer_block(geom, inp, s_q, *, ps, k_cache, v_cache, table, icache
         return_lse=True,
         fuse_gate=True,
         fuse_prepare=fuse_prepare,
+        **({} if sparse_tile_form is None else dict(sparse_tile_form=sparse_tile_form)),  # the sparse core's body (appended; None = the block's "auto")
     )
     assert blk.indexer_decode and blk.fuse_prepare is fuse_prepare and blk.index_cache_dtype == icache.dtype and blk.check_support()
     blk.compile()
@@ -2398,3 +2399,164 @@ def test_decode_indexer_execute_allocates_nothing_and_runs_no_host_sort(fuse_pre
     assert sort_calls[0] == 0, f"fuse_prepare={fuse_prepare}: torch.sort ran {sort_calls[0]} times on the decode path"
     assert torch.equal(_bits(case.out), _bits(out0)) and torch.equal(case.kernel_ids(), ids0), "the re-executes differ"
     print(f"\nR9 census (decode indexer, fuse_prepare={fuse_prepare}): 3 executes, 0 allocations, 0 host sorts")
+
+
+@requires_rubin
+def test_decode_indexer_steps_on_the_lean_tile_track_the_tcgen05_steps():
+    """The end-to-end DECODE step over the lean body: the 301-token prompt through the PREFILL form of the in-block indexer (the pools
+    written through, the compressed rows and the ring primed as the multi-step test does), then FOUR ``S_q`` 1 decode steps on TWO blocks
+    over two copies of that state -- ``sparse_tile_form="lean"`` (the lean decode tile; its ``sparse_tile`` the lean kernel, the split 65 at
+    k 1) and ``"tcgen05"`` (the core) -- fed the same tokens.  After EVERY step: the kernel-produced list and the counts BITWISE between the
+    two bodies (the same prepare / scorer / top-k kernels), the ring rows, the compressed-key cache and the pools BITWISE (the same
+    write-through), the attention of the step's row within the module's bars of the fp32 oracle fed the kernel's list on BOTH bodies, and
+    the two bodies within the same bars of each other (``cos(out) > 0.999``, the gated O and the LSE within 2e-2) -- never bitwise across
+    the bodies (a different summation order), recorded.  The S_q 4 steps of the multi-step test are the S_q 2..4 rendering's; this
+    rendering serves one row per sequence."""
+    import test_block_qsa_decode as _qsa
+
+    geom_kw, S0, ps, cap, top_k = GEOM_SMALL, 301, 16, 8, 512
+    geom = GatedAttentionBlockGeometry(**geom_kw, causal_bottom_right=True, qsa=QsaSpec(top_k=top_k, index_source="indexer", index_band=True))
+    ref_geom = RefGeometry(**geom_kw, causal_bottom_right=True)
+    d_i, h_q, h_kv, d_model, D_ = geom.qsa.index_head_dim, geom.h_q, geom.h_kv, geom.d_model, geom.d_head
+    G, rpp, n_dense = h_q // h_kv, ps // BS, sum(geom.qkvg_block_widths[:4])
+    max_pages = 24
+    n_pos = max_pages * ps
+    gen = torch.Generator(device="cuda").manual_seed(63)
+    pages = (torch.randperm(max_pages, generator=gen, device="cuda") + 1).tolist()
+    table = torch.tensor([pages], dtype=torch.int32, device="cuda")
+    n_pages = max_pages + 1
+    slot_of = lambda p: pages[p // ps] * ps + p % ps  # noqa: E731
+    k_cache, v_cache = _nan_pool(n_pages, h_kv, ps, D_), _nan_pool(n_pages, h_kv, ps, D_)
+    raw_pool = torch.full((n_pages, ps, d_i), float("nan"), device="cuda", dtype=BF16)
+    slots0 = torch.tensor([slot_of(p) for p in range(S0)], dtype=torch.int32, device="cuda")
+    pre = _run(
+        geom_kw,
+        1,
+        S0,
+        indexer=True,
+        indexer_outputs=True,
+        seed=64,
+        paged_kv_page_size=ps,
+        pools=dict(k_cache=k_cache, v_cache=v_cache, slot_mapping=slots0, index_k_raw=raw_pool),
+    )
+    _check(pre, "small8-2 S=301 prefill (the stream's prompt)")
+    inp = pre.inp
+    cos_all, sin_all = build_rope_tables(n_pos, geom.rope_dim, base=ref_geom.rope_base, batch=1, device="cuda", dtype=BF16)
+    lay0 = pre.blk._layout()
+    k_raw_all = torch.full((n_pos, d_i), float("nan"), device="cuda", dtype=BF16)
+    k_raw_all[:S0] = index_k_raw_view(_view(pre.ws, lay0.proj, (S0, pre.geom.n_qkvg), BF16), pre.geom, 1, S0)[0, :, 0]
+    icache = torch.full((n_pages, rpp, 1, d_i), float("nan"), device="cuda", dtype=BF16)
+    nb0 = S0 // BS
+    kbar0 = pre.ix["kbar_out"][0, :nb0]
+    for j in range(nb0):
+        icache[pages[j // rpp], j % rpp, 0] = kbar0[j]
+    ring = torch.full((2, cap, 1, d_i), float("nan"), device="cuda", dtype=BF16)
+    for p in range(S0 - cap, S0):
+        ring[1, p % cap, 0] = k_raw_all[p]
+    ring_table = torch.tensor([[1]], dtype=torch.int32, device="cuda")
+    # two copies of the carried state, one per body
+    state = {}
+    for body in ("tcgen05", "lean"):
+        st = dict(k=k_cache.clone(), v=v_cache.clone(), icache=icache.clone(), ring=ring.clone())
+        blk, ws = _decode_indexer_block(
+            geom,
+            inp,
+            1,
+            ps=ps,
+            k_cache=st["k"],
+            v_cache=st["v"],
+            table=table,
+            icache=st["icache"],
+            ring=st["ring"],
+            ring_table=ring_table,
+            fuse_prepare=True,
+            sparse_tile_form=body,
+        )
+        st.update(blk=blk, ws=ws)
+        state[body] = st
+    assert (
+        state["lean"]["blk"].sparse_tile == "sparse_lean_d256_f16"
+        and state["lean"]["blk"].decode_split_kv == 65
+        and state["lean"]["blk"].sparse_sub_tiles_per_cta == 1
+    )
+    assert state["tcgen05"]["blk"].sparse_tile == "sparse_d256_f16" and state["tcgen05"]["blk"].sparse_sub_tiles_per_cta is None
+    assert state["lean"]["blk"]._sdpa.kernel_template == "sparse_lean_d256_f16" and state["tcgen05"]["blk"]._sdpa.kernel_template == "sparse_d256_f16"
+    L, h_acc = S0, inp["h"].clone()
+    for step in range(1, 5):
+        pos0, Lf = L, L + 1
+        pos = torch.arange(1, device="cuda") + pos0
+        h_step = torch.randn(1, 1, d_model, generator=gen, device="cuda", dtype=torch.float32).to(BF16)
+        h_full = torch.cat([h_acc, h_step], 1)
+        ref = gated_attention_block_reference(
+            h_full, inp["w_qkvg"][:n_dense], inp["w_q_norm"], inp["w_k_norm"], cos_all[:, :Lf], sin_all[:, :Lf], inp["w_o"], ref_geom
+        )
+        res = {}
+        for body, st in state.items():
+            blk, ws = st["blk"], st["ws"]
+            out = torch.full((1, 1, d_model), float("nan"), device="cuda", dtype=BF16)
+            lse = torch.full((1, h_q, 1), float("nan"), device="cuda", dtype=torch.float32)
+            ids_out = torch.full((1, 1, top_k), -7, dtype=torch.int32, device="cuda")
+            lens_out = torch.full((1, 1), -7, dtype=torch.int32, device="cuda")
+            slots = torch.tensor([slot_of(pos0)], dtype=torch.int32, device="cuda")
+            blk.execute(
+                h_step,
+                inp["w_qkvg"],
+                inp["w_q_norm"],
+                inp["w_k_norm"],
+                cos_all[:, pos0:Lf].contiguous(),
+                sin_all[:, pos0:Lf].contiguous(),
+                inp["w_o"],
+                out,
+                ws,
+                lse=lse,
+                k_cache=st["k"],
+                v_cache=st["v"],
+                block_table=table,
+                kv_lens=torch.tensor([Lf], dtype=torch.int32, device="cuda"),
+                slot_mapping=slots,
+                w_iq_norm=inp["w_iq_norm"],
+                w_ik_norm=inp["w_ik_norm"],
+                block_ids_out=ids_out,
+                block_lens_out=lens_out,
+                index_kv_cache=st["icache"],
+                index_state_cache=st["ring"],
+                index_state_block_table=ring_table,
+                cos_pos=cos_all,
+                sin_pos=sin_all,
+            )
+            torch.cuda.synchronize()
+            label = f"step {step} pos {pos0} {body}"
+            counts = blk._indexer_decode.views(ws, blk._ws)["counts"].view(1)
+            want = ((pos + 1) // BS).clamp(max=blk._indexer_decode.n_blocks_max).to(torch.int32)
+            assert torch.equal(counts, want) and torch.equal(lens_out.view(1), torch.minimum(want, torch.full_like(want, top_k))), f"{label}: counts"
+            ids = ids_out.view(1, top_k)
+            allowed = qsa_visible_mask(ids, None, pos, Lf, Lf, BS, top_k=top_k, pos0=None)
+            og, ref_lse = _qsa._attend(ref, allowed, pos, geom.scale, BF16, h_q, G)
+            o = _view(ws, blk._ws.o, (1, h_q, D_), BF16)
+            ref_out = (og.reshape(1, h_q * D_).float() @ inp["w_o"].float().t()).to(BF16)
+            assert torch.isfinite(out.float()).all() and torch.isfinite(lse).all(), f"{label}: non-finite"
+            d_o, d_lse, c = float((o.float() - og.float()).abs().max()), float((lse[0] - ref_lse).abs().max()), _cos(out[0], ref_out)
+            assert d_o <= ATOL and d_lse <= ATOL and c > COS_OUT, f"{label}: O {d_o:.3e} LSE {d_lse:.3e} cos {c:.6f}"
+            res[body] = dict(
+                out=out.clone(), lse=lse.clone(), o=o.clone(), ids=ids.clone(), lens=lens_out.clone(), counts=counts.clone(), d_o=d_o, d_lse=d_lse, cos=c
+            )
+        a, b = res["lean"], res["tcgen05"]
+        assert (
+            torch.equal(a["ids"], b["ids"]) and torch.equal(a["lens"], b["lens"]) and torch.equal(a["counts"], b["counts"])
+        ), f"step {step}: the list differs between the bodies"
+        sl, st_ = state["lean"], state["tcgen05"]
+        assert torch.equal(_bits(sl["ring"]), _bits(st_["ring"])) and torch.equal(
+            _bits(sl["icache"]), _bits(st_["icache"])
+        ), f"step {step}: the side caches differ"
+        assert torch.equal(_bits(sl["k"]), _bits(st_["k"])) and torch.equal(_bits(sl["v"]), _bits(st_["v"])), f"step {step}: the pools differ"
+        c_ab = _cos(a["out"], b["out"])
+        d_o_ab, d_lse_ab = float((a["o"].float() - b["o"].float()).abs().max()), float((a["lse"] - b["lse"]).abs().max())
+        assert c_ab > COS_OUT and d_o_ab <= ATOL and d_lse_ab <= ATOL, f"step {step}: lean vs tcgen05 cos {c_ab:.6f} O {d_o_ab:.3e} LSE {d_lse_ab:.3e}"
+        bitwise = bool(torch.equal(_bits(a["out"]), _bits(b["out"])))
+        print(
+            f"\nstep {step} pos {pos0}: lean vs oracle O {a['d_o']:.3e} LSE {a['d_lse']:.3e} cos {a['cos']:.6f}; tcgen05 vs oracle O {b['d_o']:.3e} LSE {b['d_lse']:.3e} cos {b['cos']:.6f}; "
+            f"lean vs tcgen05 cos {c_ab:.6f} O {d_o_ab:.3e} LSE {d_lse_ab:.3e} (bitwise {bitwise}: not required); list / counts / caches / pools bitwise"
+        )
+        L = Lf
+        h_acc = torch.cat([h_acc, h_step], 1)
+    assert L == S0 + 4

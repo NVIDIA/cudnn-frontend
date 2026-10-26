@@ -1466,3 +1466,500 @@ def test_a_zero_column_block_table_is_never_read_and_the_listed_blocks_are_zero_
     assert (o == 0).all(), "every V row is zero-filled: O must be exactly 0"
     assert torch.allclose(lse, ref_lse, atol=1e-5, rtol=0), f"64 zero keys: LSE must be log(64), got {lse.flatten()[:4].tolist()}"
     print("zero-column table: no read of it, O = 0, LSE = log(64) on every row, slab complete, two launches bitwise")
+
+
+# ============================================================================ host: the adapter's tile_form knob -- the vocabulary, the AUTO pin, the route, the declines
+def _desc(shape, strides, dtype=torch.bfloat16):
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseOperandDesc
+
+    return SparseOperandDesc(tuple(shape), tuple(strides), dtype, None)
+
+
+def _route_adapter(*, B=1, SQ=1, H=24, KH=2, top_k=512, split=1, SKV=8192, list_per_sequence=True, bottom_right=True, seq_kv_lens=True, cc=(10, 7), **kw):
+    """A storage-free declaration of the adapter's decode form (the host pins: shapes / strides / dtypes only, the device named by ``cc``)."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    bshd = lambda b, s, h: _desc((b, s, h, D), (s * h * D, h * D, D, 1))  # noqa: E731
+    ids = _desc((B, top_k), (top_k, 1), torch.int32) if list_per_sequence else _desc((B, SQ, top_k), (SQ * top_k, top_k, 1), torch.int32)
+    lens = _desc((B,), (1,), torch.int32) if list_per_sequence else _desc((B, SQ), (SQ, 1), torch.int32)
+    return SparseGqaFwdDslSm107(
+        q=bshd(B, SQ, H),
+        k=bshd(B, SKV, KH),
+        v=bshd(B, SKV, KH),
+        o=bshd(B, SQ, H),
+        lse=_desc((B, H, SQ), (H * SQ, SQ, 1), torch.float32),
+        block_ids=ids,
+        block_lens=lens,
+        seq_kv_lens=_desc((B,), (1,), torch.int32) if seq_kv_lens else None,
+        top_k=top_k,
+        bottom_right=bottom_right,
+        list_per_sequence=list_per_sequence,
+        split_kv=split,
+        device_cc=cc,
+        **kw,
+    )
+
+
+def test_tile_form_vocabulary_is_one_spelling_and_names_the_two_bodies():
+    """The knob's vocabulary and the two bodies' ``kernel_template`` names live in the heuristics (DSL-free) and the adapter re-exports
+    nothing else: ``("auto", "lean", "tcgen05")``, the module stems of the two kernel files; a bad value is a ``ValueError`` naming the
+    vocabulary at construction, a bad k pin likewise."""
+    from cudnn.sdpa.fwd import heuristics as H
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import KERNEL_FILE, KERNEL_FILE_LEAN
+
+    assert H.SPARSE_TILE_FORMS == (H.SPARSE_TILE_FORM_AUTO, H.SPARSE_TILE_FORM_LEAN, H.SPARSE_TILE_FORM_TCGEN05) == ("auto", "lean", "tcgen05")
+    assert KERNEL_FILE.endswith(H.SPARSE_TILE_TCGEN05 + ".py") and KERNEL_FILE_LEAN.endswith(H.SPARSE_TILE_LEAN + ".py")
+    assert (_kernels_dir() / (H.SPARSE_TILE_LEAN + ".py")).is_file() and (_kernels_dir() / (H.SPARSE_TILE_TCGEN05 + ".py")).is_file()
+    with pytest.raises(ValueError, match="tile_form must be one of"):
+        _route_adapter(tile_form="fast")
+    with pytest.raises(ValueError, match="sub_tiles_per_cta must be None"):
+        _route_adapter(tile_form="lean", sub_tiles_per_cta=0)
+    with pytest.raises(ValueError, match="sub_tiles_per_cta must be None"):
+        _route_adapter(tile_form="lean", sub_tiles_per_cta=True)
+    a = _route_adapter(tile_form="lean")
+    assert a.tile_form is None and a.kernel_template is None and a.tile_form_requested == "lean" and a.split_kv_requested == 1
+
+
+def test_auto_pin_is_empty_until_the_gate_and_the_placement_rule_sits_behind_it(monkeypatch):
+    """The AUTO pin: ``SPARSE_LEAN_TILE_DEFAULT_CCS`` is EMPTY (the gate commit flips it with its table), so ``tile_form="auto"`` resolves the
+    tcgen05 core on every part today (the former function, unsplit by default); with the tuple patched to the measured part AUTO follows
+    the placement rule -- the lean tile at B 1 (2 units: split 65, k 1), the tcgen05 core at B 17 (34 units past the bound of 32), the
+    tcgen05 core where a pinned split is not a lean split (16), the lean tile where it is (33 -> k 2), the tcgen05 core on an unmeasured part."""
+    from cudnn.sdpa.fwd import heuristics as H
+
+    assert H.SPARSE_LEAN_TILE_DEFAULT_CCS == (), "the AUTO pin: EMPTY until the gate measures the lean route"
+    a = _route_adapter()
+    assert a.check_support() and a.tile_form == "tcgen05" and a.kernel_template == H.SPARSE_TILE_TCGEN05 and a.split_kv == 1 and a.sub_tiles_per_cta is None
+    monkeypatch.setattr(H, "SPARSE_LEAN_TILE_DEFAULT_CCS", ((10, 7),))
+    b = _route_adapter()
+    assert b.check_support() and b.tile_form == "lean" and b.kernel_template == H.SPARSE_TILE_LEAN and (b.split_kv, b.sub_tiles_per_cta) == (65, 1)
+    c = _route_adapter(B=17)
+    assert c.check_support() and c.tile_form == "tcgen05" and c.split_kv == 1
+    d = _route_adapter(B=16)
+    assert d.check_support() and d.tile_form == "lean" and d.split_kv == 65  # 32 units: the bound is inclusive
+    e = _route_adapter(split=16)
+    assert e.check_support() and e.tile_form == "tcgen05" and e.split_kv == 16  # the pin is the stronger knob
+    f = _route_adapter(split=33)
+    assert f.check_support() and f.tile_form == "lean" and (f.split_kv, f.sub_tiles_per_cta) == (33, 2)
+    g = _route_adapter(cc=(11, 0))  # a part inside the record's range the lean rule was never measured on (cc 10.0 is the adapter's own decline)
+    assert g.check_support() and g.tile_form == "tcgen05"
+    h = _route_adapter(top_k=4)  # one sub-tile: the tcgen05 core's cell even under the rule
+    assert h.check_support() and h.tile_form == "tcgen05"
+    # check_support re-runs resolve from the PIN, never from the resolved split (compile() calls it again)
+    f.check_support()
+    assert (f.split_kv, f.sub_tiles_per_cta) == (33, 2)
+
+
+def test_placement_rule_at_the_bound_both_sides_and_the_k_rule():
+    """The dense rules from the configuration: ``LEAN_SPARSE_MAX_UNITS`` 32 (B 16 x 2 KV heads x S_q 1 in, B 17 out; B 4 x S_q 4 in, B 5 out),
+    cc 10.7 only, ``top_k >= 8``; the lean splits of ``top_k`` (every entry >= 2: the lean tile always splits) and the largest k; the fill rule
+    of the fill model (1 / 1 / 2 / 3 / 2 / 4 / 7 at B 1 / B 4 x S_q 1, B 1 x S_q 4, B 4 x S_q 4, B 8 / 16 / 32 x S_q 1 on 212 SMs) capped at the
+    DEFAULT k of 1 (the k >= 2 renderings a measured lever); the AUTO resolution matrix."""
+    from cudnn.sdpa.fwd import heuristics as H
+
+    assert H.LEAN_SPARSE_MAX_UNITS == 32 and H.LEAN_SPARSE_DEFAULT_MAX_SUB_TILES_PER_CTA == 1 and H._SPARSE_LEAN_TILE_RULE_CC == (10, 7)
+    sel = lambda b, s, **kw: H.sparse_decode_lean_tile_selected(
+        batch=b, h_kv=kw.get("h_kv", 2), s_q=s, top_k=kw.get("top_k", 512), device_cc=kw.get("cc", (10, 7))
+    )  # noqa: E731
+    assert sel(16, 1) and not sel(17, 1) and sel(4, 4) and not sel(5, 4) and sel(1, 1) and sel(8, 1)
+    assert not sel(1, 1, top_k=4) and sel(1, 1, top_k=8) and not sel(1, 1, cc=(10, 0)) and not sel(1, 1, cc=None) and not sel(1, 1, cc=(12, 0))
+    assert H.sparse_lean_splits(512) == (65, 33, 22, 17, 13, 11, 10, 9) and H.sparse_lean_splits(8) == (2,) and H.sparse_lean_splits(16) == (3, 2)
+    assert H.sparse_lean_max_sub_tiles_per_cta(512) == 8 and H.sparse_lean_max_sub_tiles_per_cta(8) == 1 and H.sparse_lean_max_sub_tiles_per_cta(16) == 2
+    assert all(s >= 2 for k in (8, 12, 16, 64, 256, 512) for s in H.sparse_lean_splits(k))
+    fill = lambda b, s: H.sparse_lean_fill_sub_tiles(batch=b, h_kv=2, s_q=s, group=12, top_k=512, sm_count=212)  # noqa: E731
+    assert [fill(b, s) for b, s in ((1, 1), (4, 1), (1, 4), (4, 4), (8, 1), (16, 1), (32, 1))] == [1, 1, 2, 3, 2, 4, 7]
+    assert H.sparse_lean_fill_sub_tiles(batch=32, h_kv=2, s_q=1, group=12, top_k=512, sm_count=0) == 1
+    for b, s in ((1, 1), (4, 1), (1, 4), (4, 4), (8, 1), (16, 1), (32, 1)):
+        assert H.sparse_lean_sub_tiles_per_cta(batch=b, h_kv=2, s_q=s, group=12, top_k=512, sm_count=212) == 1  # the default cap
+    auto = lambda **kw: H.sparse_tile_form_auto(
+        batch=kw.get("b", 1),
+        h_kv=2,
+        s_q=kw.get("s", 1),
+        top_k=kw.get("top_k", 512),
+        device_cc=kw.get("cc", (10, 7)),
+        admissible=kw.get("ok", True),
+        split_pinned=kw.get("split"),
+    )  # noqa: E731
+    assert auto() == "tcgen05"  # the tuple is empty
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(H, "SPARSE_LEAN_TILE_DEFAULT_CCS", ((10, 7),))
+        assert auto() == "lean" and auto(b=16) == "lean" and auto(b=17) == "tcgen05" and auto(ok=False) == "tcgen05" and auto(cc=(10, 0)) == "tcgen05"
+        assert (
+            auto(split=16) == "tcgen05" and auto(split=65) == "lean" and auto(split=33) == "lean" and auto(split=1) == "tcgen05" and auto(top_k=4) == "tcgen05"
+        )
+
+
+def test_lean_tile_declines_by_name_on_the_adapter(monkeypatch):
+    """An explicit ``tile_form="lean"`` where the body cannot serve the declaration is a typed decline naming the arm -- the heuristics'
+    one statement (``sparse_lean_tile_decline``), raised by the adapter: THD, the top-left prefill form, no ``seq_kv_lens``, ``S_q`` past the
+    served rows (1 today), per-row lists past one row (reachable once the served rows grow: patched here), ``top_k`` below 8, the tcgen05
+    core's ``softmax_groups``; a split that is not a lean split; the k pin's range, its agreement with a pinned split, and the pin refused by
+    name where the resolved body is tcgen05 (explicit or AUTO) -- never silently ignored."""
+    from cudnn.sdpa.fwd import heuristics as H
+
+    decl = lambda **kw: H.sparse_lean_tile_decline(**dict(dict(s_q=1, group=12, top_k=512), **kw))  # noqa: E731
+    assert decl() is None and decl(list_per_sequence=False) is None and decl(group=16) is None and decl(top_k=8) is None
+    assert "thd=True" in decl(thd=True) and "DECODE form only" in decl(bottom_right=False) and "needs seq_kv_lens" in decl(seq_kv_lens_present=False)
+    assert (
+        "S_q <= 1 rows" in decl(s_q=2) and "below 8" in decl(top_k=4) and "multiple of 4" in decl(top_k=12 + 2) and "softmax_groups=2" in decl(softmax_groups=2)
+    )
+    assert "bf16 / f16" in decl(half_dtype=False) and "[1, 16]" in decl(group=17)
+    monkeypatch.setattr(H, "LEAN_SPARSE_SERVED_MAX_S_Q", 4)  # the S_q 2..4 rendering's reading of the same function
+    assert decl(s_q=4) is None and "per-row lists at S_q = 2" in decl(s_q=2, list_per_sequence=False) and "S_q <= 4" in decl(s_q=5)
+    monkeypatch.undo()
+    for kw, exc, match in (
+        (dict(tile_form="lean", SQ=2), NotImplementedError, "tile_form='lean' -- the lean tile serves S_q <= 1"),
+        (dict(tile_form="lean", list_per_sequence=False, SQ=2), NotImplementedError, "S_q <= 1"),
+        (dict(tile_form="lean", top_k=4), NotImplementedError, "below 8"),
+        (dict(tile_form="lean", seq_kv_lens=False), NotImplementedError, "needs seq_kv_lens"),
+        (dict(tile_form="lean", bottom_right=False, list_per_sequence=False), NotImplementedError, "DECODE form only"),
+        (dict(tile_form="lean", softmax_groups=2), NotImplementedError, "softmax_groups=2"),
+        (dict(tile_form="lean", split=16), NotImplementedError, "not a lean split"),
+        (dict(tile_form="lean", split=64), NotImplementedError, r"\(65, 33, 22, 17, 13, 11, 10, 9\)"),
+        (dict(tile_form="lean", sub_tiles_per_cta=9), NotImplementedError, r"must be in \[1, 8\]"),
+        (dict(tile_form="lean", top_k=8, sub_tiles_per_cta=2), NotImplementedError, r"must be in \[1, 1\]"),
+        (dict(tile_form="lean", sub_tiles_per_cta=2, split=65), ValueError, "pin one of the two"),
+        (dict(tile_form="tcgen05", sub_tiles_per_cta=2), NotImplementedError, "the lean tile's pin"),
+        (dict(sub_tiles_per_cta=2), NotImplementedError, "the lean tile's pin"),
+        (dict(tile_form="tcgen05", split=18), NotImplementedError, r"ceil\(\(top_k \+ 1\) / 32\) = 17 .* tcgen05"),
+        (dict(split=18), NotImplementedError, "= 17"),
+    ):
+        with pytest.raises(exc, match=match):
+            _route_adapter(**kw).check_support()
+    # THD: the decode arms are declined under THD before the body; the lean form's own THD decline needs the top-left packed declaration
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    bshd = lambda b, s, h: _desc((b, s, h, D), (s * h * D, h * D, D, 1))  # noqa: E731
+    thd = SparseGqaFwdDslSm107(
+        q=bshd(1, 64, 24),
+        k=bshd(1, 4096, 2),
+        v=bshd(1, 4096, 2),
+        o=bshd(1, 64, 24),
+        block_ids=_desc((64, 512), (512, 1), torch.int32),
+        seq_q_lens=_desc((3,), (1,), torch.int32),
+        seq_kv_lens=_desc((3,), (1,), torch.int32),
+        top_k=512,
+        thd=True,
+        device_cc=(10, 7),
+        tile_form="lean",
+    )
+    with pytest.raises(NotImplementedError, match="thd=True .* tcgen05 core's arm"):
+        thd.check_support()
+    # the served arms of the lean body: the shared list, the per-row list at ONE row (the same list), top_k 8 (split 2), f16, G 16, a k pin, a lean split
+    for kw, want in (
+        (dict(tile_form="lean"), (65, 1)),
+        (dict(tile_form="lean", list_per_sequence=False), (65, 1)),
+        (dict(tile_form="lean", top_k=8), (2, 1)),
+        (dict(tile_form="lean", top_k=16), (3, 1)),
+        (dict(tile_form="lean", sub_tiles_per_cta=3), (22, 3)),
+        (dict(tile_form="lean", split=17), (17, 4)),
+        (dict(tile_form="lean", split=9), (9, 8)),
+        (dict(tile_form="lean", H=16, KH=1), (65, 1)),
+        (dict(tile_form="lean", split=33, sub_tiles_per_cta=2), (33, 2)),
+    ):
+        a = _route_adapter(**kw)
+        assert a.check_support() and a.tile_form == "lean" and (a.split_kv, a.sub_tiles_per_cta) == want and a.kernel_template == H.SPARSE_TILE_LEAN, kw
+
+
+def test_split_bound_and_workspace_per_form():
+    """The split bound is PER BODY (17 = ceil((top_k + 1) / 32) on the tcgen05 core, the lean splits on the lean tile) and so is the
+    workspace: the same split-major slab formula (``_split_workspace_layout``) at each body's split -- 65 partials on the lean route at
+    k 1 against 16 on the tcgen05 route's default cap; the final-LSE scratch when no LSE is declared; the combine form the lean splits
+    take on cc 10.7 (``combine_form``: the decode-grid kernel on the 24- and 96-row grids at split 65 / 33, the AUTO entry past the
+    decode-grid bound at B 16 x split 17)."""
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as sc
+
+    def slab_bytes(B, SQ, H, S, lse=True):
+        al = lambda n: -(-n // 16) * 16  # noqa: E731
+        o = al(B * S * SQ * H * D * 4)
+        l = al(B * S * H * SQ * 4)
+        return o + l + (0 if lse else al(B * H * SQ * 4))
+
+    tc = _route_adapter(tile_form="tcgen05", split=17)
+    assert tc.check_support() and tc.split_kv == 17 and tc.scratch_workspace_bytes() == slab_bytes(1, 1, 24, 17)
+    lean = _route_adapter(tile_form="lean")
+    assert lean.check_support() and lean.split_kv == 65 and lean.scratch_workspace_bytes() == slab_bytes(1, 1, 24, 65) == 65 * slab_bytes(1, 1, 24, 1)
+    assert lean.scratch_workspace_bytes() > tc.scratch_workspace_bytes() and lean.combine_form() == sc.DECODE_GRID_AUTO
+    lean2 = _route_adapter(tile_form="lean", split=33)
+    assert lean2.check_support() and lean2.scratch_workspace_bytes() == slab_bytes(1, 1, 24, 33) and lean2.combine_form() == sc.DECODE_GRID_AUTO
+    b4 = _route_adapter(tile_form="lean", B=4)
+    assert b4.check_support() and b4.scratch_workspace_bytes() == slab_bytes(4, 1, 24, 65) and b4.combine_form() == sc.DECODE_GRID_AUTO
+    b16 = _route_adapter(tile_form="lean", B=16, split=17)
+    assert (
+        b16.check_support() and (b16.split_kv, b16.sub_tiles_per_cta) == (17, 4) and b16.combine_form() == sc.DECODE_GRID_AUTO
+    )  # past the decode-grid bound: the module's own forms by construction
+    from cudnn.sdpa.fwd.heuristics import decode_combine_grid_selected
+
+    assert (
+        decode_combine_grid_selected(1, 24, 1, 65, (10, 7))
+        and decode_combine_grid_selected(4, 24, 1, 65, (10, 7))
+        and not decode_combine_grid_selected(16, 24, 1, 17, (10, 7))
+    )
+    # no LSE declared: the combine's final-LSE scratch rides the workspace on both bodies
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    bshd = lambda b, s, h: _desc((b, s, h, D), (s * h * D, h * D, D, 1))  # noqa: E731
+    kw = dict(
+        q=bshd(1, 1, 24),
+        k=bshd(1, 8192, 2),
+        v=bshd(1, 8192, 2),
+        o=bshd(1, 1, 24),
+        block_ids=_desc((1, 512), (512, 1), torch.int32),
+        seq_kv_lens=_desc((1,), (1,), torch.int32),
+    )
+    nolse = SparseGqaFwdDslSm107(top_k=512, bottom_right=True, list_per_sequence=True, device_cc=(10, 7), tile_form="lean", **kw)
+    assert nolse.check_support() and nolse.scratch_workspace_bytes() == slab_bytes(1, 1, 24, 65, lse=False)
+    unsplit = SparseGqaFwdDslSm107(top_k=512, bottom_right=True, list_per_sequence=True, device_cc=(10, 7), **kw)
+    assert unsplit.check_support() and unsplit.scratch_workspace_bytes() == 0 and unsplit.combine_form() == sc.DECODE_GRID_OFF
+
+
+def test_lean_kernel_carries_its_census_name_and_the_tcgen05_core_keeps_its_own():
+    """The two bodies are told apart BY NAME in a launch census: the lean module names its kernel ``cudnn_sparse_lean`` (the profiler reads
+    ``cudnn_sparse_lean_kernel__kernel_...``), the tcgen05 core keeps ``cudnn`` (``cudnn_kernel__kernel_...``); the dense decode tile's
+    naming is the tcgen05 core's.  A source pin: the serving stacks' census and the block's kernel-name pins read these tokens."""
+    lean, tc = _body(_lean_source()), _body(_tcgen05_source())
+    assert lean.count('_kernel.set_name_prefix("cudnn_sparse_lean", remove_cutlass_symbol=True)') == 1
+    assert tc.count('_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)') == 1 and "cudnn_sparse_lean" not in tc
+
+
+# ============================================================================ Rubin: the adapter on the lean route (tile_form="lean") against the oracle and the tcgen05 route
+def _launch_route(
+    q, kv, ids, lens, kv_lens, top_k, scale, *, tile_form, split=1, launches=2, gate=None, with_lse=True, list_per_sequence=True, pdl=False, k=None
+):
+    """Sentinel-filled O / LSE per launch through the ADAPTER on ``tile_form`` (the sparse suite's ``_launch_decode`` with the knob; the
+    adapter returned for its readbacks).  A split's workspace is sentinel-filled too: an unwritten partial slot would read as a huge live
+    weight and the oracle comparison would catch it."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    S = _sparse_suite()
+    dev = q.device
+    B, SQ, H, _ = q.shape
+    seq_kv = torch.tensor(kv_lens, device=dev, dtype=torch.int32)
+    sent = S._sentinel(q.dtype)
+    paged = len(kv) == 4
+    outs = []
+    a = None
+    for _ in range(launches):
+        o = torch.full((B, SQ, H, D), sent, device=dev, dtype=q.dtype)
+        lse = torch.full((B, H, SQ), sent, device=dev, dtype=torch.float32) if with_lse else None
+        kw = dict(paged_kv=True, page_size=kv[3], block_table=kv[2]) if paged else {}
+        a = SparseGqaFwdDslSm107(
+            q=q,
+            k=kv[0],
+            v=kv[1],
+            o=o,
+            lse=lse,
+            block_ids=ids,
+            block_lens=lens,
+            seq_kv_lens=seq_kv,
+            top_k=top_k,
+            scale=scale,
+            list_per_sequence=list_per_sequence,
+            bottom_right=True,
+            split_kv=split,
+            epilogue_gate=gate,
+            use_pdl=pdl,
+            tile_form=tile_form,
+            sub_tiles_per_cta=k,
+            **kw,
+        )
+        assert a.check_support()
+        with process_watchdog(300, f"adapter {tile_form} route compile + first dispatch"):
+            a.compile()
+            ws = torch.full((max(a.scratch_workspace_bytes(), 16) // 4,), _SENTINEL, device=dev, dtype=torch.float32) if a.split_kv > 1 else None
+            a.execute(stream=_stream(), workspace=ws)
+            torch.cuda.synchronize()
+        outs.append((o, lse))
+    return outs, a
+
+
+def _lean_route_cell(
+    *,
+    B,
+    SKV,
+    kv_lens,
+    H=24,
+    KH=2,
+    dtype=torch.bfloat16,
+    top_k=512,
+    list_kind="shuffled",
+    split=1,
+    k=None,
+    paged=None,
+    seed=0,
+    block_lens=True,
+    gate=False,
+    pdl=False,
+    per_row=False,
+):
+    """The adapter on ``tile_form="lean"``: two launches bitwise, within ATOL of the fp32 oracle, the readbacks (the lean kernel template, the
+    lean split, the k), paged BITWISE dense on the lean route, the per-row list at S_q 1 BITWISE the shared one, the PDL arm bitwise the plain
+    one, the gate through the combine within ATOL of the gated reference, and -- always -- the lean O / LSE against the tcgen05 route
+    (unsplit) within the DERIVED budget: the two bodies are bitwise different by construction, so the budget is the comparison."""
+    from cudnn.sdpa.fwd.heuristics import SPARSE_TILE_LEAN, SPARSE_TILE_TCGEN05, sparse_lean_max_sub_tiles_per_cta
+    from cudnn.sdpa.fwd.config_sm107 import lean_sparse_n_sub, lean_sparse_split
+
+    S = _sparse_suite()
+    q, kk, vv, g = S._inputs(B, 1, H, KH, dtype, seed, SKV=SKV)
+    ids, lens = S._decode_lists(list_kind, B, 1, top_k, kv_lens, g)
+    lens_arg = lens if block_lens else None
+    scale = 1.0 / math.sqrt(D)
+    ref_o, ref_lse, pv_abs = S._reference_decode(q, kk, vv, ids, lens_arg, kv_lens, scale, top_k)
+    gate_t = (torch.randn(B, 1, H, D, generator=g, device=q.device, dtype=torch.float32) * 2.0).to(dtype) if gate else None
+    ref_target = ref_o * torch.sigmoid(gate_t.float()) if gate else ref_o
+    outs, a = _launch_route(q, (kk, vv), ids, lens_arg, kv_lens, top_k, scale, tile_form="lean", split=split, k=k, gate=gate_t, pdl=pdl)
+    max_o, max_lse = S._check(outs, ref_target, ref_lse)
+    n_sub = lean_sparse_n_sub(top_k)
+    want_k = k if k is not None else (-(-n_sub // split) if split > 1 else 1)
+    assert a.tile_form == "lean" and a.kernel_template == SPARSE_TILE_LEAN and a.sub_tiles_per_cta == want_k and a.split_kv == lean_sparse_split(top_k, want_k)
+    assert 1 <= a.sub_tiles_per_cta <= sparse_lean_max_sub_tiles_per_cta(top_k)
+    res = dict(max_o=max_o, max_lse=max_lse, split=a.split_kv, k=a.sub_tiles_per_cta, form=a.combine_form(), dead=int(torch.isinf(ref_lse).sum()))
+    o_lean, lse_lean = outs[0]
+    if paged is not None:
+        P, hnd = paged
+        kp, vp, table = S._paginate(kk, vv, kv_lens, P, hnd, "nan", g)
+        pg, pa = _launch_route(q, (kp, vp, table, P), ids, lens_arg, kv_lens, top_k, scale, tile_form="lean", split=split, k=k, gate=gate_t, launches=1)
+        assert pa.kernel_template == SPARSE_TILE_LEAN
+        S._check([pg[0]], ref_target, ref_lse)
+        S._assert_bitwise(pg[0], outs[0], f"lean route paged page {P} {'HND' if hnd else 'NHD'}")
+    if per_row:
+        pr, pra = _launch_route(
+            q,
+            (kk, vv),
+            ids.view(B, 1, top_k),
+            None if lens_arg is None else lens_arg.view(B, 1),
+            kv_lens,
+            top_k,
+            scale,
+            tile_form="lean",
+            split=split,
+            k=k,
+            gate=gate_t,
+            launches=1,
+            list_per_sequence=False,
+        )
+        assert pra.kernel_template == SPARSE_TILE_LEAN and pra.split_kv == a.split_kv
+        S._assert_bitwise(pr[0], outs[0], "the per-row list at one row per sequence vs the shared list on the lean route")
+    if pdl:
+        plain, _pa = _launch_route(q, (kk, vv), ids, lens_arg, kv_lens, top_k, scale, tile_form="lean", split=split, k=k, gate=gate_t, launches=1, pdl=False)
+        S._assert_bitwise(plain[0], outs[0], "the PDL arm vs the plain arm on the lean route")
+    # the tcgen05 route on the same inputs: the same function, a different order -- within the derived budget, never bitwise
+    tc, ta = _launch_route(q, (kk, vv), ids, lens_arg, kv_lens, top_k, scale, tile_form="tcgen05", split=1, launches=1, gate=gate_t)
+    assert ta.kernel_template == SPARSE_TILE_TCGEN05 and ta.tile_form == "tcgen05"
+    S._check([tc[0]], ref_target, ref_lse)
+    live = ~torch.isinf(ref_lse).permute(0, 2, 1)  # [B, S, H]
+    d, ratio = S._split_vs_unsplit(o_lean.float(), tc[0][0].float(), dtype, pv_abs, live, gate=gate_t)
+    lse_d = float((lse_lean - tc[0][1])[~torch.isinf(ref_lse)].abs().max()) if live.any() else 0.0
+    assert ratio <= 1.0, f"lean route vs the tcgen05 route: {ratio:.3f} of the derived budget (max |dO| {d:.3e})"
+    assert lse_d <= ATOL, f"lean route vs the tcgen05 route: LSE differ by {lse_d}"
+    res.update(core_max_d=d, core_ratio=ratio, core_lse_d=lse_d, bitwise_across_bodies=bool(torch.equal(o_lean, tc[0][0])))
+    return res
+
+
+@requires_rubin
+@pytest.mark.parametrize(
+    "B, SKV, kv_lens, H, KH, dtype, top_k, list_kind, split, k, paged, block_lens, gate, pdl, per_row",
+    [
+        pytest.param(
+            1,
+            8192,
+            [8192],
+            24,
+            2,
+            torch.bfloat16,
+            512,
+            "shuffled",
+            1,
+            None,
+            None,
+            True,
+            False,
+            False,
+            True,
+            id="B1-8K-lean-default-k1-split65-per-row-bitwise-shared",
+        ),
+        pytest.param(
+            2,
+            8192,
+            [8192, 5000],
+            24,
+            2,
+            torch.bfloat16,
+            512,
+            "shuffled",
+            1,
+            None,
+            (16, True),
+            True,
+            True,
+            False,
+            False,
+            id="B2-gate-in-the-combine-paged16-HND-bitwise-dense",
+        ),
+        pytest.param(
+            3,
+            8192,
+            [0, 8192, 300],
+            24,
+            2,
+            torch.bfloat16,
+            512,
+            "shuffled",
+            33,
+            None,
+            None,
+            True,
+            False,
+            True,
+            False,
+            id="B3-dead-sequence-split33-k2-pdl-bitwise-plain",
+        ),
+        pytest.param(
+            1, 8192, [8192], 24, 2, torch.bfloat16, 8, "shuffled", 1, None, None, True, False, False, False, id="top8-split2-one-live-one-dead-sub-tile"
+        ),
+        pytest.param(
+            4,
+            8192,
+            [8192, 2052, 4097, 7000],
+            24,
+            2,
+            torch.bfloat16,
+            512,
+            "shuffled",
+            1,
+            4,
+            (64, False),
+            False,
+            True,
+            False,
+            False,
+            id="B4-k4-split17-paged64-NHD-no-block-lens-gate",
+        ),
+        pytest.param(
+            1, 8192, [8192], 16, 1, torch.float16, 512, "shuffled", 1, None, (48, True), True, False, False, True, id="group16-one-kv-head-f16-paged48"
+        ),
+    ],
+)
+def test_adapter_lean_route_ladder(B, SKV, kv_lens, H, KH, dtype, top_k, list_kind, split, k, paged, block_lens, gate, pdl, per_row):
+    res = _lean_route_cell(
+        B=B,
+        SKV=SKV,
+        kv_lens=kv_lens,
+        H=H,
+        KH=KH,
+        dtype=dtype,
+        top_k=top_k,
+        list_kind=list_kind,
+        split=split,
+        k=k,
+        paged=paged,
+        block_lens=block_lens,
+        gate=gate,
+        pdl=pdl,
+        per_row=per_row,
+    )
+    print(
+        f"\nadapter lean route B={B} lens={kv_lens} {H}/{KH} {dtype} top_k={top_k} split={res['split']} k={res['k']} combine form {res['form']} paged={paged} gate={gate}: "
+        f"max|dO| {res['max_o']:.5f} max|dLSE| {res['max_lse']:.6f} vs oracle; vs the tcgen05 route max|dO| {res['core_max_d']:.3e} = {res['core_ratio']:.3f} of the derived "
+        f"budget, |dLSE| {res['core_lse_d']:.2e}, bitwise across bodies {res['bitwise_across_bodies']} (not required: the two bodies sum in different orders); dead rows {res['dead']}"
+    )
