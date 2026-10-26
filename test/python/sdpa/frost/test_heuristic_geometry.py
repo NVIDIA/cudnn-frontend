@@ -405,6 +405,29 @@ def test_nonpaged_d128_mha_thd_leads_from_512_declared_tokens(device_cc, batch, 
     )  # bounded total under CUDA graphs
 
 
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("h_q,h_kv", [(32, 4), (32, 32), (64, 8)])
+@pytest.mark.parametrize("batch,q,kv,expected", [(1, 8192, 8192, "lead"), (16, 512, 512, "lead"), (64, 256, 256, "trail"), (1, 256, 256, "trail")])
+def test_nonpaged_d64_thd_leads_from_512_declared_tokens(device_cc, h_q, h_kv, batch, q, kv, expected):
+    """Unpacked d64 causal THD leads when the declared Q rows fill the SMs or each sequence carries 512 tokens; small, HALF, non-causal and windowed graphs stay backend-first."""
+    from cudnn.sdpa.fwd import placement
+
+    base = dict(
+        d_qk=64, d_v=64, b=batch, h_q=h_q, h_kv=h_kv, s_q=q, s_kv=kv, causal=True, bottom_right=True, dtype=cudnn.data_type.BFLOAT16, device_cc=device_cc
+    )
+    assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**base)) == getattr(placement, expected.upper())
+    if expected == "lead":
+        assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, "device_cc": (12, 0)})) == placement.TRAIL
+        assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, "dtype": cudnn.data_type.HALF})) == placement.TRAIL
+        assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, "causal": False, "bottom_right": False})) == placement.TRAIL
+        assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, "window_left": 128})) == placement.TRAIL
+    cache = dict(base, b=4096, s_q=65536, s_kv=65536)
+    assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**cache)) == placement.LEAD  # FlashInfer cache-shape declaration
+    assert (
+        placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**cache, "max_total_seq_len_q": 16384})) == placement.LEAD
+    )  # bounded total under CUDA graphs
+
+
 @requires_dsl
 @pytest.mark.parametrize("batch,h_q,h_kv,q,kv", [(2, 8, 2, 128, 16384), (1, 32, 4, 64, 32768), (4, 16, 16, 257, 8192), (2, 16, 2, 8, 16384)])
 @pytest.mark.parametrize("bounded_total", [False, True])
