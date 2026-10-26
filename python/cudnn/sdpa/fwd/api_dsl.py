@@ -2571,7 +2571,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     and self.split_kv == 1
                 ),
                 "THD PackGQA requires half D128 cga2 unsplit/cga1 split, native Rubin nonpaged D128 cga1/2 unsplit, "
-                "Rubin paged D128 cga1 unsplit, or Rubin paged D256 cga2 unsplit",
+                "Rubin paged D128 cga1 unsplit, or SM100/103/107 paged D256 cga2 unsplit",
             )
             # Partial PackGQA (the largest divisor of the group that divides the
             # tile) is wired in SM100 d128 / d256 half and the qualified Rubin
@@ -4023,6 +4023,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 lse_kind="head" if self.thd_stats_head_major else "token",
                 paged_hnd=ps is not None and ps[1] < ps[2],
                 **({"has_sink": True} if self.has_sink else {}),
+                **({"thd_origin_specs": self._thd_origin_specs} if getattr(self, "_thd_origin_specs", None) is not None else {}),
             )
         if not self.thd or self.thd_decode_leg:
             # The ragged-Q decode leg's in-kernel LSE is the dense split-major

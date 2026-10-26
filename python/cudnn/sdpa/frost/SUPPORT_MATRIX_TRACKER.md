@@ -339,7 +339,7 @@ half-precision d512 row and ᵍ for the MXFP8 row; the d256 BPROP column reads �
 for the half-precision d256 row and ᵍ for the MXFP8 row.
 
 **Physical THD forward origins (SM100/SM103 half D128 and D256).** The
-nonpaged, unsplit CGA2 graph path reads each bound Q/K/V/O/Stats ragged-offset
+unsplit CGA2 graph path reads each bound Q/K/V/O/Stats ragged-offset
 tensor independently on every execution. INT32 and INT64 offsets may be mixed
 across ports; their positive element multipliers must divide the declared token
 stride. Offset values name absolute whole-token rows in the corresponding
@@ -349,12 +349,23 @@ addressed live row, and any `max_total_seq_len_*` bounds the sum of valid length
 not the physical span including holes. These device-value bounds are caller
 contracts; execution performs no device-to-host inspection.
 
-Setup emits sequence-local Q/K/V/O tensor maps in the existing metadata launch.
+With nonpaged K/V, setup emits sequence-local Q/K/V/O tensor maps in the existing metadata launch.
 Their extents exclude interior padding from loads and stores. Stats uses its own
 origin and preserves the declared token-major or head-major layout; a head-major
 pitch must cover the physical rows, including gaps. Each invocation binds current
 offset pointers, and captured graphs read changed offset values on replay.
-Standalone compact-THD behavior, split/paged/gated paths, other head dimensions
+With paged K/V, only Q/O/Stats use physical THD origins; K and V keep their
+page-table addressing and page-layout descriptors. The setup retains the paged
+path's original sequence ranking and never clamps a page pool to a packed total.
+The admitted SM100 D128 CGA1 paged legs also consume these origins. For split
+plans, per-sequence Q maps clip physical input slots while scratch partials keep
+the compact live prefix. The final combine places O and Stats at their own
+physical origins, using the current output stride and declared Stats layout.
+The existing one-query ragged decode path keeps its own offset binding.
+Paged half D256 THD also admits explicit PackGQA at CGA2 without splitting on
+SM100/SM103, using the same packed-head body as SM107. Nonpaged D256 THD
+packing remains declined; automatic candidate ranking is unchanged.
+Standalone compact-THD behavior, other split/gated paths, other head dimensions
 and other architectures are unchanged; this does not qualify their padded offsets.
 
 The opt-in **d128 backward** (`sdpa_bwd_sm100_d128`, engine 20609) selects

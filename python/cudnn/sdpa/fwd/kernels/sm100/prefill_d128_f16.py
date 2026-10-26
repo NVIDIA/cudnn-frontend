@@ -1262,7 +1262,7 @@ def _tmaldg_warp_group(
         tma_q = lambda d, h, r, b: origin_tma_slice(o_desc_words, 1, n_batch, b, d, h, r)
     else:
         tma_q = GmemTileTma(tma_q_desc)
-    if cutlass.const_expr(thd_origins is not None):
+    if cutlass.const_expr(thd_origins is not None and not PAGED_KV):
         tma_k = lambda d, h, r, b: origin_tma_slice(o_desc_words, 2, n_batch, b, d, h, r)
         tma_v = lambda d, h, r, b: origin_tma_slice(o_desc_words, 3, n_batch, b, d, h, r)
     elif cutlass.const_expr(CFG.THD_VARLEN and not PAGED_KV):
@@ -1347,11 +1347,12 @@ def _tmaldg_warp_group(
             stride = (n_batch + cutlass.Int32(1)) * cutlass.Int32(TENSOR_MAP_QWORDS)
             base = o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(TENSOR_MAP_QWORDS)
             q_map = (base + stride).tospace(cutlass.AddressSpace.generic)
-            k_map = (base + 2 * stride).tospace(cutlass.AddressSpace.generic)
-            v_map = (base + 3 * stride).tospace(cutlass.AddressSpace.generic)
             tma_tensormap_acquire(q_map)
-            tma_tensormap_acquire(k_map)
-            tma_tensormap_acquire(v_map)
+            if cutlass.const_expr(not PAGED_KV):
+                k_map = (base + 2 * stride).tospace(cutlass.AddressSpace.generic)
+                v_map = (base + 3 * stride).tospace(cutlass.AddressSpace.generic)
+                tma_tensormap_acquire(k_map)
+                tma_tensormap_acquire(v_map)
             q_seq_off, kv_seq_off, tma_batch = cutlass.Int32(0), cutlass.Int32(0), batch_idx
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
@@ -3662,6 +3663,8 @@ def _host(
                 cutlass.Int32(QH // HEADS_PER_TILE),
                 cutlass.Int32(CGA_TILE_M // HEADS_PER_TILE),
                 n_thd_units,
+                paged=PAGED_KV,
+                rank_by_kv=PAGED_KV and bool(CFG.BOTTOM_RIGHT) and (CFG.MASK_FLAGS & MASK_SWA) == 0,
             ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         else:
             _build_thd_meta_o_descs_kernel(
@@ -3768,8 +3771,8 @@ def compile(  # noqa: A001
     8 at 2 bytes/elem — checked here for the envelope, checked by the adapter
     for declared strides."""
     if thd_origin_specs is not None:
-        if not CFG.THD_VARLEN or PAGED_KV or SPLIT_KV != 1:
-            raise ValueError("physical THD origins require the unsplit nonpaged half prefill body")
+        if not CFG.THD_VARLEN or SPLIT_KV != 1:
+            raise ValueError("physical THD origins require the unsplit half prefill body")
         if len(thd_origin_specs) != 5:
             raise ValueError("physical THD origins require five port declarations")
     _cache_key = _template_key(globals(), locals(), "compile")

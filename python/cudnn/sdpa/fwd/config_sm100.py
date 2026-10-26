@@ -526,8 +526,8 @@ def supports_paged_prefill_cga1(d_shape, *, device_cc, fp8, thd, paged, split_kv
 
 
 def supports_paged_d256_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
-    """The shared D256 packed-head path is qualified on paged Rubin THD only."""
-    return device_cc == (10, 7) and d_shape == (256, 256) and not fp8 and thd and paged and cga in (None, 2) and split_kv == 1
+    """The shared D256 packed-head path serves paged half THD on SM100/103/107."""
+    return device_cc in ((10, 0), (10, 3), (10, 7)) and d_shape == (256, 256) and not fp8 and thd and paged and cga in (None, 2) and split_kv == 1
 
 
 def supports_nonpaged_d128_thd_prefill(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):

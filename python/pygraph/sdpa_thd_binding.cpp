@@ -334,13 +334,25 @@ class SdpaThdBinder {
                 invalid("invalid native THD gate declaration");
         }
         if (py::hasattr(spec, "origin_specs") && !spec.attr("origin_specs").is_none()) {
-            if (quantized_ || paged_ || splits_ != 1 || has_gate_)
-                invalid("physical THD origins require an unsplit nonpaged half plan without a gate");
+            const bool paged_d128_split = paged_ && cga_tile_m_ == 128 && integer(spec, "d_qk") == 128 &&
+                                          integer(spec, "d_v") == 128 && splits_ > 1;
+            if (quantized_ || (splits_ != 1 && !paged_d128_split) || has_gate_)
+                invalid("physical THD origins require ungated half unsplit or paged D128 split plans");
             auto specs = py::cast<py::tuple>(spec.attr("origin_specs"));
             if (specs.size() != 5) invalid("physical THD origins require five ports");
+            if (paged_d128_split) {
+                if (specs[static_cast<size_t>(Q)].is_none()) invalid("physical paged split plans require Q offsets");
+                // Origin maps/rows precede compact partials in the same caller workspace.
+                const int64_t origin_bytes =
+                    add(multiply(add(b_, 1), 512), multiply(add(multiply(b_, 40), 127) / 128, 128));
+                if (off_partial_o_ < add(off_o_desc_, origin_bytes))
+                    invalid("packed split partials overlap the physical-origin reservation");
+            }
             has_origins_ = true;
             for (size_t i = 0; i < 5; ++i) {
                 if (!specs[i].is_none()) {
+                    if (paged_ && (i == K || i == V))
+                        invalid("paged K/V origins are described by the page tables, not THD offsets");
                     auto entry = py::cast<std::array<int64_t, 4>>(specs[i]);
                     if (entry[0] != static_cast<int64_t>(i) || entry[1] <= 0 || entry[2] <= 0 || entry[2] % entry[1] ||
                         (entry[3] != 32 && entry[3] != 64))
@@ -944,6 +956,8 @@ init_sdpa_thd_binding(py::module_ &m) {
     py::class_<SdpaThdBinder>(m, "_SdpaThdBinder")
         .def(py::init<const py::object &>(), py::arg("spec"))
         .def_prop_ro_static("supports_physical_origins", [](py::object) { return true; })
+        .def_prop_ro_static("supports_paged_physical_origins", [](py::object) { return true; })
+        .def_prop_ro_static("supports_paged_split_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_initial_waves", [](py::object) { return true; })
         .def_prop_ro_static("supports_initial_wave_geometry", [](py::object) { return true; })
         .def_prop_ro_static("supports_stats_stride_override", [](py::object) { return true; })

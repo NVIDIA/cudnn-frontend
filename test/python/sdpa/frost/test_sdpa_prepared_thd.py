@@ -1818,19 +1818,70 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, cga, causal, window,
         check(bufs)
     finally:
         graph.reset()
-    # The tensor executor uses graph-declared strides and does not accept
-    # overrides. Restore those strides before exercising its native admission.
+    # Construct the actual standalone compact-prefix contract independently.
+    # A graph prepared for physical origins has additional runtime operands.
+    from cuda.bindings import driver as cuda_driver
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
     for n in ("k_table", "v_table"):
         bufs[n] = bufs[n].contiguous()
-    prepared = plan._prepared
-    plan._prepared, plan.takes_variant_pack = None, False
+    _, selected = g.get_engine_and_knobs_at_index(g._plan_index)
+    api = SdpaFwdDslSm100(
+        sample_q=bufs["q"].view(b, ql, h, d).transpose(1, 2),
+        sample_k=bufs["k"],
+        sample_v=bufs["v"],
+        sample_o=bufs["o"].view(b, ql, h, d).transpose(1, 2),
+        sample_lse=bufs["lse"].view(b, ql, h, 1).transpose(1, 2),
+        scale_softmax=1 / math.sqrt(d),
+        is_causal=causal,
+        causal_bottom_right=causal,
+        window_size_left=window,
+        seq_kv_lens_present=True,
+        cu_seq_q_lens=True,
+        thd=True,
+        cga=selected[cudnn.knob_type.TILE_CGA_M],
+        split_kv=selected[cudnn.knob_type.SPLIT_KV],
+        pack_gqa=bool(selected[cudnn.knob_type.PACK_GQA]),
+        sched_policy=selected[cudnn.knob_type.SCHED_POLICY],
+        paged_page_size=page,
+        paged_max_seq_len_kv=page * pages,
+    )
+    assert api.check_support()
+    api.compile()
+    assert api._thd_spec.native is not None
+    standalone_ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=DEV, dtype=torch.uint8)
+    tables = {n: bufs[n][:, 0, :, 0] for n in ("k_table", "v_table")}
+
+    def standalone():
+        api.execute(
+            bufs["q"],
+            bufs["k"],
+            bufs["v"],
+            bufs["o"],
+            lse_tensor=bufs["lse"],
+            seq_q_lens=bufs["cu_q"],
+            seq_kv_lens=bufs["seq_kv"],
+            block_table=tables["k_table"],
+            block_table_v=tables["v_table"],
+            workspace=standalone_ws,
+            current_stream=cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream),
+        )
+
+    standalone_graph = torch.cuda.CUDAGraph()
     try:
         bufs["o"].fill_(float("nan"))
         bufs["lse"].fill_(float("nan"))
-        execute(bufs, ws, override=False)
+        standalone()
+        check(bufs)
+        with torch.cuda.graph(standalone_graph):
+            standalone()
+        bufs["v"].neg_()
+        bufs["o"].fill_(float("nan"))
+        bufs["lse"].fill_(float("nan"))
+        standalone_graph.replay()
         check(bufs)
     finally:
-        plan._prepared, plan.takes_variant_pack = prepared, True
+        standalone_graph.reset()
 
 
 @requires_blackwell

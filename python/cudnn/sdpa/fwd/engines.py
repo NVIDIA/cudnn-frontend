@@ -302,8 +302,8 @@ class Capabilities:
     # TemplateParams-conversion follow-ups.
     lse_optional: bool = False
     # Most THD forward lowerings derive addresses from compact length prefixes.
-    # The SM100/SM103 ungated, nonpaged, unsplit CGA2 half D128/D256 graph
-    # lowering reads independent Q/K/V/O/Stats physical offsets. See
+    # The SM100/SM103 ungated, unsplit CGA2 half D128/D256 graph lowering
+    # reads independent Q/O/Stats origins and nonpaged K/V origins. See
     # SUPPORT_MATRIX_TRACKER.md for this scope and the remaining sibling gaps;
     # thd=True alone does not promise support for padding between sequences.
     thd: bool = False
@@ -1664,6 +1664,15 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 facts.thd
                 and not ragged_decode
                 and not (packed_split and (facts.d_qk, facts.d_v) == (64, 64))
+                and not supports_paged_d256_pack_gqa(
+                    (facts.d_qk, facts.d_v),
+                    device_cc=facts.device_cc,
+                    fp8=facts.is_fp8 or facts.is_mxfp8,
+                    thd=facts.thd,
+                    paged=facts.has_paged_kv,
+                    cga=knobs.cga,
+                    split_kv=knobs.split_kv or 1,
+                )
                 and (facts.d_qk, facts.d_v) not in capabilities.thd_pack_gqa_d_shapes
             ):
                 return "PackGQA is not supported for this THD/ragged flavor (except the decode tile's ragged-Q leg)"
@@ -3283,14 +3292,13 @@ def lower_dsl_prefill(
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
     if (
         facts.thd
-        and not facts.has_paged_kv
+        and not getattr(api, "thd_decode_leg", False)
         and facts.epilogue_gate_t is None
         and not (facts.is_fp8 or facts.is_mxfp8)
         and facts.device_cc in ((10, 0), (10, 3))
         and facts.d_qk == facts.d_v
         and facts.d_qk in (128, 256)
-        and api.split_kv == 1
-        and api.cga in (None, 2)
+        and ((api.split_kv == 1 and api.cga in (None, 2)) or (facts.has_paged_kv and facts.d_qk == 128 and api.cga == 1))
     ):
         from .thd_origins import graph_origin_specs
 

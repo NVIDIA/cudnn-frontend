@@ -1027,8 +1027,14 @@ def test_sm107_paged_d256_pack_gqa_support_contract(dtype_name, group):
         assert engines.mismatch(caps, dataclasses.replace(facts, **changed), knobs) is not None, changed
     for changed in (dict(cga=1), dict(split_kv=2)):
         assert engines.mismatch(caps, facts, dataclasses.replace(knobs, **changed)) is not None, changed
-    blackwell = dataclasses.replace(facts, device_cc=(10, 0))
-    assert engines.mismatch(_caps("sdpa_fwd_prefill_sm100"), blackwell, knobs) is not None
+    blackwell_caps = _caps("sdpa_fwd_prefill_sm100")
+    for cc in ((10, 0), (10, 3)):
+        blackwell = dataclasses.replace(facts, device_cc=cc)
+        assert engines.mismatch(blackwell_caps, blackwell, knobs) is None
+        for changed in (dict(has_paged_kv=False), dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.FP8_E4M3)):
+            assert engines.mismatch(blackwell_caps, dataclasses.replace(blackwell, **changed), knobs) is not None, (cc, changed)
+        for changed in (dict(cga=1), dict(split_kv=2)):
+            assert engines.mismatch(blackwell_caps, blackwell, dataclasses.replace(knobs, **changed)) is not None, (cc, changed)
 
 
 @pytest.mark.parametrize("dtype_name", ["HALF", "BFLOAT16"])

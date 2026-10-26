@@ -230,6 +230,7 @@ CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
 THD_PERSISTENT = True
 from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_descs_kernel as _build_thd_meta_o_descs_kernel, TENSOR_MAP_QWORDS, THD_SETUP_THREADS
 from cudnn.frost.tile_dsl.thd import exit_if_dead_thd_cluster
+from cudnn.sdpa.fwd.kernels.thd_origins import origin_tensors, origin_tma_slice, build_paged_split_q_maps
 from cudnn.sdpa.fwd.kernels._thd_split_host import host as _host_thd_split, compile_host as _compile_thd_split_host
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
@@ -408,6 +409,7 @@ def _kernel(
     ragged_q_i64: cutlass.Constexpr[bool] = False,
     # The final O under DIRECT_O (None-specialized otherwise): the correction warps store the half output straight from TMEM.
     o_direct: Optional[cute.Tensor] = None,
+    thd_origins: Optional[cute.Tensor] = None,
 ) -> None:
     if cutlass.const_expr(PARAMS.thd_batch_one):
         # Fold the generic batch scan and split-index quotient/remainder.
@@ -645,6 +647,7 @@ def _kernel(
             ragged_q_addr=ragged_q_addr,
             ragged_q_div=ragged_q_div,
             ragged_q_i64=ragged_q_i64,
+            thd_origins=thd_origins,
         )
 
     elif warp_idx == CFG.TMASTG_WARP_ID:
@@ -755,6 +758,7 @@ def _tmaldg_warp_group(
     ragged_q_addr: cutlass.Int64 = 0,
     ragged_q_div: cutlass.Int64 = 1,
     ragged_q_i64: cutlass.Constexpr[bool] = False,
+    thd_origins=None,
 ):
     """TMA-LDG warp: one Q slab per tile, then K/V through the STAGES_KV ring."""
     q_empty_phase = cutlass.Int32(1)
@@ -765,7 +769,10 @@ def _tmaldg_warp_group(
     # MMA consumed Q.  Bootstraps consumer-side via q_empty_phase=1.
     mb_q_reload = bars.mb_q_empty if cutlass.const_expr(EARLY_Q) else bars.mb_q_o_alias
 
-    tma_q = GmemTileTma(tma_q_desc)
+    if cutlass.const_expr(thd_origins is not None):
+        tma_q = lambda d, h, row, b: origin_tma_slice(o_desc_words, 1, n_batch, b, d, h, row)
+    else:
+        tma_q = GmemTileTma(tma_q_desc)
     if cutlass.const_expr(CFG.THD_VARLEN and not PAGED_KV):
         # THD: K/V ride the setup kernel's packed-total-clamped runtime
         # descriptors (o_desc_words slots n_batch+1 / n_batch+2), so the last
@@ -860,6 +867,10 @@ def _tmaldg_warp_group(
             # view's token extent zero-fills through TMA OOB.  Dense: the
             # (B, H, S, D) descriptor's batch coord.
             q_seq_off, kv_seq_off, q_tma_batch = _thd_tma_offsets(seq_kv_lens_tensor, batch_idx, n_batch)
+            if cutlass.const_expr(thd_origins is not None):
+                q_map = (o_desc_words.iterator.raw_ptr() + (n_batch + 1 + batch_idx) * TENSOR_MAP_QWORDS).tospace(cutlass.AddressSpace.generic)
+                tma_tensormap_acquire(q_map)
+                q_seq_off, q_tma_batch = cutlass.Int32(0), batch_idx
             if cutlass.const_expr(RAGGED_Q):
                 # Divide in 64 bits: an element offset can exceed 2^31 on a large packed buffer.
                 if cutlass.const_expr(ragged_q_i64):
@@ -2515,6 +2526,8 @@ def _launch(
     ragged_q_addr: cutlass.Int64,
     ragged_q_div: cutlass.Int64,
     ragged_q_i64: cutlass.Constexpr[bool],
+    thd_origin_ptrs=None,
+    thd_origin_specs: cutlass.Constexpr = None,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """TMA construction and launch for the explicit pointer host entry."""
@@ -2605,6 +2618,11 @@ def _launch(
             SPLIT_KV,
             SPLIT_KV > 1 and bool(CFG.BOTTOM_RIGHT) and (CFG.MASK_FLAGS & MASK_SWA) == 0,
         ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
+        if cutlass.const_expr(thd_origin_ptrs is not None):
+            o_desc_words, origins, offsets = origin_tensors(o_desc_words.iterator, thd_origin_ptrs, cutlass.Int32(B))
+            build_paged_split_q_maps(
+                q_tensor, tma_q_desc, o_desc_words, origins, offsets[0], thd_origin_specs[0][1], seq_kv_lens_tensor, cutlass.Int32(B)
+            ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:
         grid_shape = (
@@ -2637,6 +2655,7 @@ def _launch(
         paged_hnd,
         ragged_q_i64,
         o_tensor if cutlass.const_expr(DIRECT_O) else None,
+        thd_origins=origins if cutlass.const_expr(thd_origin_ptrs is not None) else None,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
@@ -2680,6 +2699,8 @@ def _host(
     lse_kind: cutlass.Constexpr[str],
     paged_hnd: cutlass.Constexpr[bool],
     ragged_q_i64: cutlass.Constexpr[bool],
+    thd_origin_ptrs=None,
+    thd_origin_specs: cutlass.Constexpr = None,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """Bind the shared explicit SDPA ABI and launch the existing decode kernel.
@@ -2766,6 +2787,8 @@ def _host(
         ragged_q_addr,
         ragged_q_div,
         ragged_q_i64,
+        thd_origin_ptrs,
+        thd_origin_specs,
         stream,
     )
 
@@ -2777,18 +2800,29 @@ LSE_KINDS = ("token", "head", "padded") if CFG.THD_VARLEN and SPLIT_KV == 1 else
 
 
 @lru_cache(maxsize=None)
-def compile_thd_split(*, has_lse: bool = True, lse_kind: str = "head", paged_hnd: bool = False, has_sink: bool = False) -> Callable:
+def compile_thd_split(*, has_lse: bool = True, lse_kind: str = "head", paged_hnd: bool = False, has_sink: bool = False, thd_origin_specs=None) -> Callable:
     """Compile only from plan facts; every token capacity and stride is dynamic."""
     supported_shape = (CFG.TILE_K == CFG.TILE_O == 64 and PAGED_KV) or (
         CFG.TILE_O == 128 and (CFG.TILE_K == 128 or (CFG.TILE_K == 192 and not PAGED_KV and not CFG.PACK_GQA))
     )
     if not (CFG.THD_VARLEN and SPLIT_KV > 1 and supported_shape):
         raise ValueError("packed split requires paged D64, D128, or unpacked nonpaged D192 THD")
+    if thd_origin_specs is not None and not (PAGED_KV and CFG.TILE_K == CFG.TILE_O == 128 and thd_origin_specs[0] is not None):
+        raise ValueError("physical split origins require paged D128 with Q offsets")
     cache_key = _template_key(globals(), locals(), "compile_thd_split")
     if has_sink and not (CFG.TILE_K == CFG.TILE_O == 128 and PAGED_KV and not CFG.HAS_SINK):
         raise ValueError("packed split sinks require sink-free D128 paged partials")
     return _compile_thd_split_host(
-        _host, CFG, STORAGE_DTYPE, cache_key, has_lse=has_lse, lse_kind=lse_kind, paged_hnd=paged_hnd, ragged_q_slots=True, has_sink=has_sink
+        _host,
+        CFG,
+        STORAGE_DTYPE,
+        cache_key,
+        has_lse=has_lse,
+        lse_kind=lse_kind,
+        paged_hnd=paged_hnd,
+        ragged_q_slots=True,
+        has_sink=has_sink,
+        thd_origin_specs=thd_origin_specs,
     )
 
 
