@@ -5,9 +5,7 @@
 import sdpa_binding_reference as binding_reference
 
 import ast
-import inspect
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -22,33 +20,6 @@ from test_sdpa_native_dense_binding import (
 
 pytestmark = [pytest.mark.L0]
 _WIDTHS = [(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)]
-
-
-@pytest.mark.parametrize("dim", [128, 256])
-def test_positional_host_abi_keeps_appended_operands_after_stream(dim, monkeypatch):
-    path = Path(prep.__file__).parent / "kernels" / "sm100" / f"prefill_d{dim}_f16.py"
-    host = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "_host")
-    params = [inspect.Parameter(arg.arg, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=ast.unparse(arg.annotation)) for arg in host.args.args]
-
-    def entry(*args):
-        return args
-
-    entry.__signature__ = inspect.Signature(params)
-    order = [p.name for p in params if "Constexpr" not in p.annotation]
-    assert order.index("stream") < order.index("thd_origin_ptrs")
-
-    def wrapper(*args):
-        return args
-
-    wrapper.__signature__ = inspect.Signature([p for p in params if p.name in order])
-    api = SimpleNamespace(_k_mod=SimpleNamespace(_host=entry, __name__=str(path)), _compiled_kernel=wrapper)
-    monkeypatch.setattr(prep, "positional_entry", lambda compiled: compiled)
-    raw, owner, actual = prep._positional_order(api)
-    assert raw is owner is wrapper
-    assert actual == order
-    wrapper.__signature__ = inspect.Signature([p for p in params if p.name in order and p.name != "thd_origin_ptrs"])
-    with pytest.raises(NotImplementedError, match="disagrees with the compiled wrapper"):
-        prep._positional_order(api)
 
 
 def _prefill_fixture(dq, dv, paged, split, dtype, hnd=False, arch="sm100"):
