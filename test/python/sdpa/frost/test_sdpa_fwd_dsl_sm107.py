@@ -7390,6 +7390,7 @@ def _half_prefold_api(
     seed=0,
     attn_scale=None,
     pack_gqa=False,
+    tile_n=None,
 ):
     """The adapter of one leg (folded or unfolded) of a dense problem on the cc 10.7 half twin, plus its tensors.
     ``attn_scale`` defaults to d_qk ** -0.5; the leading-dead-tile cells pass 1.0 (scale_log2 > 1)."""
@@ -7418,6 +7419,7 @@ def _half_prefold_api(
         split_kv=split_kv,
         pack_gqa=pack_gqa,
         softmax_scale_prefolded=prefolded,
+        tile_n=tile_n,
     )
     return api, dict(q=q, k=k, v=v, out=out, lse=lse, sinks=sinks, attn_scale=attn_scale)
 
