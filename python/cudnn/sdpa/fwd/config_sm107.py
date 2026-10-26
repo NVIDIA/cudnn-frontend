@@ -3931,7 +3931,8 @@ LEAN_SPARSE_ROWS_PER_MT = 16  # the m16n8k16 M extent: one m-tile = 16 query row
 LEAN_SPARSE_MAX_SEQLEN_Q = 4  # the serving step's rows per sequence under ONE shared list (the sparse function's own S_q <= 4 bound)
 LEAN_SPARSE_MAX_SUB_TILES_PER_CTA = 8  # the sub-tile loop is unrolled at trace time (cutlass.range_constexpr); the fill rule never exceeds 7 (B 32)
 LEAN_SPARSE_TOPK_MIN = 8  # top_k < 8 is ONE sub-tile = split 1: the tcgen05 tile's cell (the adapter routes it there)
-_LEAN_N_TAIL_MAX = 2  # the S_q <= 4 bound on the appended tail blocks (the same host bound at every S_q, so the S_q axis changes no grid)
+LEAN_SPARSE_SERVED_MAX_S_Q = 1  # the step rows per sequence the lean body serves: 1 (this rendering, N_MT 1); the S_q 2..4 rendering raises it to 4 with its config -- the adapter and the heuristics read THIS constant, never a literal
+_LEAN_N_TAIL_MAX = 2  # the S_q <= 4 bound on the appended tail blocks (kept at S_q 1 so the S_q 2..4 rendering changes no grid)
 _LEAN_S_EXCHANGE_BYTES = 4 * 4 * 32 * 16  # sS[4 warps][4 n-blocks][32 lanes][16 B] = 8 KiB per m-tile
 
 

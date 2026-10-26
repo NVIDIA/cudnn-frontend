@@ -1179,6 +1179,11 @@ def _host(
     )
 
 
+# The census NAME of the lean body: the profiler / CUPTI kernel name reads `cudnn_sparse_lean_kernel__kernel_...` against the tcgen05
+# core's `cudnn_kernel__kernel_...`, so a launch census (the block's kernel-name pins, a serving stack's step census) tells the two
+# bodies of the function apart by name.  The SASS is untouched (a symbol, not a program change).
+_kernel.set_name_prefix("cudnn_sparse_lean", remove_cutlass_symbol=True)
+
 EXPLICIT_ABI = True  # pointer/int host entry; the adapter builds the argument list itself
 
 

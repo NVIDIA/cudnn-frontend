@@ -74,7 +74,17 @@ from cudnn.sdpa.fwd.config_sm100 import (
     supports_paged_d256_pack_gqa,
     supports_paged_prefill_cga1,
 )
-from cudnn.sdpa.fwd.config_sm107 import SM107_FP32_VECTOR_WITH_BIAS_TILE_N, sm107_bias_auto_cga, sm107_pair_item_active, sm107_tile_n_pick
+from cudnn.sdpa.fwd.config_sm107 import (
+    LEAN_SPARSE_MAX_SUB_TILES_PER_CTA,
+    LEAN_SPARSE_SERVED_MAX_S_Q,
+    LEAN_SPARSE_TOPK_MIN,
+    SM107_FP32_VECTOR_WITH_BIAS_TILE_N,
+    lean_sparse_n_sub,
+    lean_sparse_split,
+    sm107_bias_auto_cga,
+    sm107_pair_item_active,
+    sm107_tile_n_pick,
+)
 from cudnn.sdpa.fwd.config_sm100 import sm100_bias_auto_cga, sm100_tile_n_pick
 from cudnn.sdpa.fwd.config_sm120 import (
     D512_FLAVOR,
@@ -744,6 +754,208 @@ def decode_combine_force_lean(b: int, h_q: int, s_q: int, split: int, device_cc:
     Outside the bound the module's entry is its own forms by construction, so nothing is forced;
     where the rule says decode-grid the module's entry agrees."""
     return decode_combine_lean_blocks(b, h_q, s_q) <= DECODE_COMBINE_MAX_LEAN_BLOCKS and not decode_combine_grid_selected(b, h_q, s_q, split, device_cc)
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+# The LEAN block-sparse DECODE tile (sm107/sparse_lean_d256_f16.py: mma.sync + cp.async, 128 threads per m16 tile, no TMEM / TMA /
+# CLC) beside the tcgen05 index-list sparse core (sm107/sparse_d256_f16.py) -- the SECOND BODY of ONE function.  The sparse adapter's
+# ``tile_form`` knob ("auto" / "lean" / "tcgen05") is PERFORMANCE-ONLY: the same O / LSE under either body within the fixed-order-sum
+# budget (a 4 x 64-d split-K sum vs one 256-d MMA chain: never bitwise ACROSS the bodies, bitwise WITHIN each), so an autotuner may
+# pick freely.  The rules below are the host reading of WHICH body a launch takes and HOW the lean body is cut; the adapter is the
+# enforcement point and reads them, the gated attention block's block-sparse decode mode reads them through the adapter's vocabulary.
+SPARSE_TILE_FORM_AUTO = "auto"
+SPARSE_TILE_FORM_LEAN = "lean"
+SPARSE_TILE_FORM_TCGEN05 = "tcgen05"
+SPARSE_TILE_FORMS = (SPARSE_TILE_FORM_AUTO, SPARSE_TILE_FORM_LEAN, SPARSE_TILE_FORM_TCGEN05)
+"""The ``tile_form`` vocabulary: ``"auto"`` = the placement rule on the parts of :data:`SPARSE_LEAN_TILE_DEFAULT_CCS` and the tcgen05
+core everywhere else; ``"lean"`` / ``"tcgen05"`` explicit -- honoured where the body serves the declaration, a typed decline naming the
+arm where it does not (never a silent fallback)."""
+SPARSE_TILE_TCGEN05 = "sparse_d256_f16"
+SPARSE_TILE_LEAN = "sparse_lean_d256_f16"
+"""The two bodies' ``kernel_template`` names (the kernel modules' file stems under ``sdpa/fwd/kernels/sm107/``): what the adapter's
+``kernel_template`` and the block's ``sparse_tile`` read back, so a route is PINNED by the kernel that compiled, never transcribed."""
+LEAN_SPARSE_MAX_UNITS = 32
+"""The PLACEMENT bound: the lean tile below ``B x H_kv x S_q <= 32`` units (B <= 16 at S_q 1 and B <= 4 at S_q 4 on two KV heads), the
+tcgen05 core above.  The lean tile's advantage is the ABSENCE of the tcgen05 core's ~4.5-us per-CTA chain on a launch that is
+latency-bound (one wave of small CTAs: the 212-SM class measured the kernel alone 3.34 vs 5.66 us at B 1 x 8K x S_q 1, +69 %, and the
+chain 8.32 -> 5.75 us); it shrinks as the launch becomes HBM-bound, where both tiles move the same bytes and the lean form's shared
+gather forces a split whose combine on a 768-block grid costs more than the tcgen05 core's lean walk at split 4 (B 32 x S_q 1: a
+modeled -2 %).  The crossover sits between 32 and 64 units in the model; the no-loss rule puts the default bound at the last class the
+model calls a sure win widened to the B 16 / B 4 x S_q 4 class (the S_q 4 half a modeled +13 %).  The band 16 < units <= 32 is
+UNMEASURED: the gate's bound sweep (B in 1 / 2 / 4 / 8 / 16 / 32 x S_q 1 / 4) moves this ONE constant -- measured, never transcribed."""
+SPARSE_LEAN_TILE_DEFAULT_CCS: Tuple[Tuple[int, int], ...] = ()
+"""The parts on which ``tile_form="auto"`` consults the placement rule (:func:`sparse_decode_lean_tile_selected`) at all; EMPTY until
+the end-to-end gate measures the lean route against the tcgen05 route on an exclusive part (the measured-default rule of the block's
+``DECODE_PDL_DEFAULT_CCS``: a default ships with its table, in the change that measures it; the bar: no cell loses beyond its control
+band, and >= 1.0 us AND >= 5 % of the step at B 1 x 8K and B 1 x 32K).  Until then ``"auto"`` resolves to the tcgen05 core on EVERY
+part (the former function, bitwise) and the explicit ``"lean"`` is the way to take the lean tile.  The gate commit flips this tuple to
+``((10, 7),)`` and refits :data:`LEAN_SPARSE_MAX_UNITS` from its table; the RED pin on the tuple flips with it."""
+_SPARSE_LEAN_TILE_RULE_CC = (10, 7)
+"""The ONE device line the lean tile exists for (its DSL target is ``sm_107a``; the kernel's own gate): the placement rule answers False
+on every other part whatever the tuple above holds."""
+LEAN_SPARSE_DEFAULT_MAX_SUB_TILES_PER_CTA = 1
+"""The cap on the DEFAULT ``sub_tiles_per_cta`` (k): 1 -- one 32-key sub-tile per CTA, the kill-line rendering (REG 66-72, 4 CTAs per SM
+by registers).  The fill rule of :func:`sparse_lean_fill_sub_tiles` asks for k 2 / 3 / 4 / 7 at B 8 / B 4 x S_q 4 / B 16 / B 32 units,
+but the k >= 2 renderings trace at 104-164 registers (ptxas software-pipelines the unrolled sub-tiles: 3 CTAs per SM) and their gain
+over k 1 is unmeasured -- a ``-maxrregcount`` build is the gate's lever, not a default.  A caller pins k through the adapter's
+``sub_tiles_per_cta`` (the block's ``sparse_sub_tiles_per_cta``); the gate's measurement raises this cap, never a transcription."""
+_LEAN_FILL_OCCUPANCY_BY_S_Q = {1: 3, 2: 2}
+"""The fill rule's CTAs per SM by the step's rows (MODEL, DESIGN 2.2 / 4): 3 at S_q 1 (the 72-KiB two-stage form under the standard
+carveout), 2 at S_q 2 (80 KiB), 1 at S_q 3..4 (the 384-512-thread renderings, by registers)."""
+
+
+def sparse_lean_splits(top_k: int) -> Tuple[int, ...]:
+    """The LEAN SPLITS of ``top_k``: ``ceil(n_sub / k)`` for every k in ``1 .. min(8, n_sub - 1)`` (:func:`sparse_lean_max_sub_tiles_per_cta`)
+    with ``n_sub = ceil((top_k + 2) x 4 / 32)`` (``config_sm107.lean_sparse_n_sub``: 65 at top_k 512), descending -- ``(65, 33, 22, 17, 13,
+    11, 10, 9)`` at top_k 512, ``(2,)`` at top_k 8; every entry >= 2 (the lean tile always splits).  The grid's x extent and the combine's
+    partial count; a pinned ``split_kv`` on the lean route must be one of them (it SELECTS k), any other value is a typed decline naming
+    this list."""
+    n_sub = lean_sparse_n_sub(int(top_k))
+    return tuple(sorted({lean_sparse_split(int(top_k), k) for k in range(1, sparse_lean_max_sub_tiles_per_cta(top_k) + 1)}, reverse=True))
+
+
+def sparse_lean_max_sub_tiles_per_cta(top_k: int) -> int:
+    """The largest k a lean launch may pin at ``top_k``: ``min(8, n_sub - 1)`` -- the sub-tile loop is unrolled at trace time
+    (``config_sm107.LEAN_SPARSE_MAX_SUB_TILES_PER_CTA``), and the lean tile ALWAYS splits (its O / LSE are the fp32 partials the combine
+    reduces), so k = n_sub, one chunk = split 1, is not a lean rendering: 8 at top_k 512 (n_sub 65), 1 at top_k 8 (n_sub 2)."""
+    n_sub = lean_sparse_n_sub(int(top_k))
+    return max(1, min(LEAN_SPARSE_MAX_SUB_TILES_PER_CTA, n_sub - 1))
+
+
+def sparse_lean_tile_decline(
+    *,
+    s_q: int,
+    group: int,
+    top_k: int,
+    thd: bool = False,
+    bottom_right: bool = True,
+    list_per_sequence: bool = True,
+    seq_kv_lens_present: bool = True,
+    half_dtype: bool = True,
+    softmax_groups: int = 0,
+) -> Optional[str]:
+    """Why the LEAN tile cannot serve a declaration (the arm NAMED), or ``None`` when it can -- the ONE statement the adapter raises for
+    an explicit ``tile_form="lean"`` (``NotImplementedError``) and the block's declaration repeats, and the admissibility ``"auto"`` reads
+    before the placement rule.  The lean body is the DECODE form only: bottom-right rows at the END of each sequence, ONE gathered list
+    per sequence -- ``list_per_sequence=True`` at ``S_q <= config_sm107.LEAN_SPARSE_SERVED_MAX_S_Q`` (1 today; the S_q 2..4 rendering
+    follows), or the per-row list at ``S_q == 1``, which IS the shared list (one row per sequence, the step-0 anchor the row's own
+    position) --, the per-sequence KV length present (the visible range), dense BSHD or paged pools (never THD), bf16 / f16, a group of
+    at most 16 query heads per KV head (the m16 tile's rows), ``top_k`` a multiple of 4 in [8, 512] (below 8 the list is ONE sub-tile =
+    split 1: the tcgen05 core's cell), the tcgen05 core's ``softmax_groups`` knob at its default.  The epilogue gate rides the combine
+    under the lean split (always >= 2), so a gate operand is served.  Every other arm (a sink, a band, log2 stats, a padded-Q trim, a pure
+    list) is the record's own decline, raised before this one."""
+    if thd:
+        return "thd=True (packed sequences) is the tcgen05 core's arm: the lean tile has no claim-counter form -- declare tile_form='tcgen05' or 'auto'"
+    if not bottom_right:
+        return (
+            "the lean tile serves the DECODE form only (bottom_right=True: the step's rows at the end of each sequence); a top-left / prefill "
+            "declaration is the tcgen05 core's -- declare tile_form='tcgen05' or 'auto'"
+        )
+    if not seq_kv_lens_present:
+        return (
+            "the lean tile needs seq_kv_lens (the per-sequence KV length is the decode form's visible range); the tcgen05 core serves a dense "
+            "bottom-right declaration without it -- pass seq_kv_lens or declare tile_form='tcgen05' / 'auto'"
+        )
+    if int(s_q) > LEAN_SPARSE_SERVED_MAX_S_Q:
+        return (
+            f"the lean tile serves S_q <= {LEAN_SPARSE_SERVED_MAX_S_Q} rows per sequence today (the S_q 2..4 rendering with n_mt m16 tiles "
+            f"follows); got S_q = {int(s_q)} -- the tcgen05 core serves it (tile_form='tcgen05' / 'auto')"
+        )
+    if not list_per_sequence and int(s_q) != 1:
+        return (
+            f"per-row lists at S_q = {int(s_q)} > 1: the lean CTA gathers ONE list per sequence (the shared step-0 list, index_list_form='shared'); "
+            "a per-row list is the tcgen05 core's (tile_form='tcgen05' / 'auto')"
+        )
+    if not half_dtype:
+        return "the lean tile serves bf16 / f16 Q / K / V (the mma.sync m16n8k16 half body); the e4m3 pools arm is not wired"
+    if not 1 <= int(group) <= 16:
+        return f"the lean tile packs the token's query-head group on one m16 tile: H_q / H_kv must be in [1, 16], got {int(group)}"
+    if int(top_k) < LEAN_SPARSE_TOPK_MIN or int(top_k) % 4 != 0:
+        return (
+            f"the lean tile serves top_k a multiple of 4 in [{LEAN_SPARSE_TOPK_MIN}, 512] (below {LEAN_SPARSE_TOPK_MIN} the list is one 32-key "
+            f"sub-tile = split 1, the tcgen05 core's cell); got top_k = {int(top_k)}"
+        )
+    if int(softmax_groups or 0) != 0:
+        return (
+            f"softmax_groups={int(softmax_groups)} is the tcgen05 core's softmax-split knob (the lean tile's softmax is per warp on one m16 tile); "
+            "leave it at 0 or declare tile_form='tcgen05'"
+        )
+    return None
+
+
+def sparse_decode_lean_tile_selected(*, batch: int, h_kv: int, s_q: int, top_k: int, device_cc: Optional[Tuple[int, int]]) -> bool:
+    """The PLACEMENT rule (DESIGN 7): True iff the lean tile is the body the route prefers for an ADMISSIBLE block-sparse decode
+    launch -- the cc 10.7 line (:data:`_SPARSE_LEAN_TILE_RULE_CC`, the one part the kernel exists for), ``top_k >= 8`` (at least two
+    sub-tiles: a one-sub-tile list is the tcgen05 core's) and ``B x H_kv x S_q <= LEAN_SPARSE_MAX_UNITS`` units; False above the bound
+    (the tcgen05 core with today's split rule) and on every other part.  A dense rule from the configuration (the bound is the one
+    constant the gate moves); admissibility is :func:`sparse_lean_tile_decline`'s business, the AUTO reading's gate on the part is
+    :func:`sparse_tile_form_auto`'s."""
+    if device_cc is None or tuple(device_cc)[:2] != _SPARSE_LEAN_TILE_RULE_CC:
+        return False
+    if int(top_k) < LEAN_SPARSE_TOPK_MIN:
+        return False
+    return int(batch) * int(h_kv) * int(s_q) <= LEAN_SPARSE_MAX_UNITS
+
+
+def sparse_lean_fill_sub_tiles(*, batch: int, h_kv: int, s_q: int, group: int, top_k: int, sm_count: int) -> int:
+    """DESIGN 2.2's FILL RULE for the sub-tiles per CTA, k (MODEL, information): ``units = B x H_kv`` (the S_q rows share one CTA: the
+    shared list), ``k_fill = ceil(n_sub x units / (occ x SMs))`` -- one wave of resident CTAs at the rendering's CTAs per SM
+    (:data:`_LEAN_FILL_OCCUPANCY_BY_S_Q`) --, ``k_bytes = ceil(S_q x G x 1 KiB / 32 KiB)`` -- the fp32 partial a CTA WRITES never exceeds
+    the K + V it READS --, ``k = clamp(max(1, k_fill, k_bytes), 1, min(8, n_sub))``: 1 at B 1 / B 4 x S_q 1, 2 at B 1 x S_q 4 and B 8 x
+    S_q 1, 3 at B 4 x S_q 4, 4 at B 16 x S_q 1, 7 at B 32 x S_q 1 on 212 SMs.  ``sm_count <= 0`` (no CUDA reading) gives 1.  The DEFAULT
+    k is this value capped at :data:`LEAN_SPARSE_DEFAULT_MAX_SUB_TILES_PER_CTA` (:func:`sparse_lean_sub_tiles_per_cta`)."""
+    k_max = sparse_lean_max_sub_tiles_per_cta(top_k)
+    n_sub = lean_sparse_n_sub(int(top_k))
+    if int(sm_count) <= 0:
+        return 1
+    units = max(1, int(batch) * int(h_kv))
+    occ = _LEAN_FILL_OCCUPANCY_BY_S_Q.get(int(s_q), 1)
+    k_fill = _ceil_div(n_sub * units, occ * int(sm_count))
+    k_bytes = _ceil_div(int(s_q) * max(1, int(group)) * 1024, 32 * 1024)
+    return max(1, min(k_max, max(k_fill, k_bytes)))
+
+
+def sparse_lean_sub_tiles_per_cta(*, batch: int, h_kv: int, s_q: int, group: int, top_k: int, sm_count: int) -> int:
+    """The DEFAULT sub-tiles per CTA of a lean launch: the fill rule (:func:`sparse_lean_fill_sub_tiles`) capped at
+    :data:`LEAN_SPARSE_DEFAULT_MAX_SUB_TILES_PER_CTA` = 1 today -- the k >= 2 rows stay off the default until the register lever is
+    measured; a pinned ``sub_tiles_per_cta`` (any k in ``1 .. min(8, n_sub)``) outranks it, the same function under every value."""
+    fill = sparse_lean_fill_sub_tiles(batch=batch, h_kv=h_kv, s_q=s_q, group=group, top_k=top_k, sm_count=sm_count)
+    return max(1, min(fill, LEAN_SPARSE_DEFAULT_MAX_SUB_TILES_PER_CTA, sparse_lean_max_sub_tiles_per_cta(top_k)))
+
+
+def sparse_tile_form_auto(
+    *, batch: int, h_kv: int, s_q: int, top_k: int, device_cc: Optional[Tuple[int, int]], admissible: bool, split_pinned: Optional[int] = None
+) -> str:
+    """What ``tile_form="auto"`` resolves to: :data:`SPARSE_TILE_FORM_LEAN` iff the part is in :data:`SPARSE_LEAN_TILE_DEFAULT_CCS` (the
+    measured default: EMPTY today, so the tcgen05 core everywhere), the declaration is ``admissible`` on the lean body
+    (:func:`sparse_lean_tile_decline` returned None), the placement rule selects it (:func:`sparse_decode_lean_tile_selected`) and a
+    pinned split, if any, is a lean split of ``top_k`` (a caller who pinned ``split_kv`` to a tcgen05 split, or to 1 = unsplit, keeps the
+    body that honours the pin: the pin is the stronger knob and the resolved form reads back); :data:`SPARSE_TILE_FORM_TCGEN05` otherwise."""
+    if device_cc is None or tuple(device_cc)[:2] not in SPARSE_LEAN_TILE_DEFAULT_CCS:
+        return SPARSE_TILE_FORM_TCGEN05
+    if not admissible or not sparse_decode_lean_tile_selected(batch=batch, h_kv=h_kv, s_q=s_q, top_k=top_k, device_cc=device_cc):
+        return SPARSE_TILE_FORM_TCGEN05
+    if split_pinned is not None and int(split_pinned) not in sparse_lean_splits(top_k):
+        return SPARSE_TILE_FORM_TCGEN05
+    return SPARSE_TILE_FORM_LEAN
+
+
+# The COMBINE FORM the lean splits take on the cc 10.7 line (``sparse_gqa_sm107._sparse_combine_decode_grid`` = the split-aware rule
+# above applied to the lean split), per (B, H_q, S_q, lean split, k) on the 24 / 2 geometry at top_k 512 -- the table DESIGN 2.2 / 14.3
+# asks for, with the measured cells NAMED (212-SM class, the kill-line record: the combine term = lean_chain - lean) and the unmeasured
+# ones owed to the gate.  "decode_grid" = the decode-grid kernel inside its bound (the AUTO entry), "own" = the module's own forms
+# (DECODE_GRID_OFF), "auto_past_bound" = the AUTO entry past the decode-grid bound (= the module's own forms by construction), "lean_walk"
+# = the lean group walk.  The test suite pins every row against the rule.
+SPARSE_LEAN_COMBINE_FORM_CELLS: Tuple[Tuple[int, int, int, int, int, str, str], ...] = (
+    (1, 24, 1, 65, 1, "decode_grid", "MEASURED 212 SMs: 2.40 us (lean_chain 5.745 - lean 3.341 at B 1 x 8K; the model said 3.1)"),
+    (1, 24, 1, 33, 2, "decode_grid", "UNMEASURED (k 2 is off the default)"),
+    (4, 24, 1, 65, 1, "decode_grid", "MEASURED 212 SMs: 2.73 us (lean_chain 8.266 - lean 5.538 at B 4 x 8K)"),
+    (1, 24, 4, 33, 2, "decode_grid", "UNMEASURED (the S_q 2..4 rendering): 96 rows, split 33 >= 8"),
+    (4, 24, 4, 22, 3, "own", "UNMEASURED: 384 rows below split 32 -- the one-warp-per-row form past 8 splits (DESIGN 14.3: measure, or k 2 -> split 33)"),
+    (8, 24, 1, 33, 2, "auto_past_bound", "UNMEASURED: 192 lean blocks past the decode-grid bound at split 33 > 4 -- the module's own forms"),
+    (16, 24, 1, 17, 4, "auto_past_bound", "UNMEASURED: 384 lean blocks, split 17 -- the bound's edge (B 16: 0 .. +5 % modeled)"),
+    (32, 24, 1, 10, 7, "auto_past_bound", "outside the placement bound (the tcgen05 core's cell: its lean walk at split 3)"),
+)
 
 
 def _decode_tile_combine_cost(split: int, *, grid: Optional[Tuple[int, int, int]], per_partial: Optional[float] = None) -> float:
