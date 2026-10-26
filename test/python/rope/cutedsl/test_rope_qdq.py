@@ -319,9 +319,9 @@ def test_unsupported_format_combinations(quantization, group_size, scale_format)
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("cc", [(9, 0), (8, 0), (10, 3)])
+@pytest.mark.parametrize("cc", [(9, 0), (8, 0), (10, 3), (12, 0), (12, 1)])
 def test_architecture_gate_fp4_and_fp8(cc, monkeypatch):
-    """fp8 is served on every portable part; fp4 (e2m1x2 converts) only on SM100 / SM103."""
+    """fp8 is served on every portable part; fp4 (e2m1x2 converts) on SM100 / SM103 / SM120. SM121 is not served yet."""
     from cudnn.rope import qdq
 
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: cc)

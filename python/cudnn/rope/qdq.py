@@ -136,7 +136,7 @@ class RopeQDQInplace(APIBase):
             raise NotImplementedError("FROST RoPE QDQ requires CUDA SM100")
         self._validate_layouts(self._descs)
         self._capability = torch.cuda.get_device_capability(self._device)
-        # fp8 converts (e4m3x2) exist on every portable part; the fp4 ones (e2m1x2) need SM100.
+        # fp8 converts (e4m3x2) exist on every portable part; the fp4 ones (e2m1x2) need FP4_CONVERT_CCS.
         served = PORTABLE_ELEMENTWISE_CCS if self._quantization == "fp8" else FP4_CONVERT_CCS
         if self._capability not in served:
             raise NotImplementedError(f"FROST RoPE QDQ {self._quantization} supports cc {served}; got {self._capability}")

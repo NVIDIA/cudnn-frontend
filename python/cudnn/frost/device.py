@@ -31,9 +31,9 @@ from cudnn._device import device_count, is_available  # noqa: F401 — re-export
 #: elementwise math, warp shuffles and plain loads/stores, nothing from tcgen05, TMA
 #: multicast or the FP4 converts: tail and vision RoPE, the fp8 RoPE QDQ and the
 #: Engram gate. A part joins once those kernels have been run on it.
-PORTABLE_ELEMENTWISE_CCS = ((9, 0), (10, 0), (10, 3))
-#: Parts with the FP4 (e2m1x2) converts the fp4 RoPE QDQ emits: the Blackwell datacenter parts.
-FP4_CONVERT_CCS = ((10, 0), (10, 3))
+PORTABLE_ELEMENTWISE_CCS = ((9, 0), (10, 0), (10, 3), (12, 0))
+#: Parts with the FP4 (e2m1x2) converts the fp4 RoPE QDQ emits, run on each: B200, B300 and RTX PRO 6000.
+FP4_CONVERT_CCS = ((10, 0), (10, 3), (12, 0))
 
 # The device a frost BUILD targets, scoped in by build_device() from the
 # cudnn.Handle the graph was built with. Every device-derived kernel constant
