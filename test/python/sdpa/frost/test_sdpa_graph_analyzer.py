@@ -2547,7 +2547,12 @@ def test_paged_quantized_rows_mismatch_reasons():
     # The head-dim gate is the SELECTED flavor (Capabilities.paged_d_shapes = {(64, 64), (128, 128)} on the fp8 row).
     assert "wired on the d64, d128 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=256, d_v=256))
     assert "wired on the d64, d128 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=128))
-    assert "attention sink" in engines.mismatch(fp8, paged_facts(is_fp8=True, has_sink=True))
+    for d in (64, 128):
+        sink_facts = paged_facts(is_fp8=True, has_sink=True, d_qk=d, d_v=d)
+        assert engines.mismatch(fp8, sink_facts) is None
+        split_knobs = engines.SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=2)
+        assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=d, d_v=d), split_knobs) is None
+        assert "sink-free dense" in engines.mismatch(fp8, sink_facts, split_knobs)
     # Block-scaled O (#1088) over pools: epilogue and loader are independent, but the pair is not validated.
     assert "block-scaled O" in engines.mismatch(fp8, paged_facts(is_fp8=True, dtype_o=cudnn.data_type.FP8_E4M3, o_block_scale=32))
     assert "block-scaled O" in engines.mismatch(mxfp8, paged_facts(is_mxfp8=True, page_size=128, dtype_o=cudnn.data_type.FP8_E4M3, o_block_scale=32))
