@@ -61,13 +61,16 @@ TMA-store epilogue; the workspace is the scheduler counter alone
 (``moe_desc_slots = 0``).
 
 Per-side operand forms, as the non-swapped kernel: a mixed MXFP4 x MXFP8 pair
-(``kind::mxf8f6f4`` m16n8k32, either operand e2m1) keeps its e2m1 side packed
-(TMA ``.b4x16`` into 64-byte ``s64b`` rows, any K a multiple of 32) and builds
-that side's fragment registers from two packed words per lane
-(``_fp4_frag_regs``: the nibbles spread to bits [5:2] of the fp8 fragment
-layout's bytes), and a one-sided graph's raw-FP8 side (after the swap the
-weight is A, the token B) reads the constant identity scale ``sf_one_word``
-with no SF descriptor, TMA box, SMEM ring or GATHER repack.
+(``kind::mxf8f6f4`` m16n8k32, either operand e2m1) loads its e2m1 side either
+padded -- K a multiple of 128: TMA ``.b4x16_p64`` into one-byte containers in
+128-byte ``s128b`` rows, ``ldmatrix ... .b8x16.b4x16_p64`` expanding the
+fragment and one shift per register (``_ldm_frags``) -- or packed (TMA
+``.b4x16`` into 64-byte ``s64b`` rows, any K a multiple of 32) with that side's
+fragment registers built from two packed words per lane (``_fp4_frag_regs``:
+the nibbles spread to bits [5:2] of the fp8 fragment layout's bytes); see
+``kernel_registry.sm120_padded_e2m1_sides``. A one-sided graph's raw-FP8 side
+(after the swap the weight is A, the token B) reads the constant identity scale
+``sf_one_word`` with no SF descriptor, TMA box, SMEM ring or GATHER repack.
 
 FP4 scale corners, as the non-swapped kernel: fp4 + E8M0 at block 16
 (``kind::mxf4nvf4`` scale_vec::4X ``.ue8m0``) goes out as inline PTX, the DSL's
@@ -200,12 +203,37 @@ _A_KBLK_BYTES = _A_ROW_BYTES // _NUM_K_BLOCKS
 _B_KBLK_BYTES = _B_ROW_BYTES // _NUM_K_BLOCKS
 _ELEMS_16B = 16  # packed bytes per 16-byte ldmatrix row
 # The e2m1 operand of a mixed pair: kind::mxf8f6f4 reads e2m1 from bits [5:2]
-# of an 8-bit container (the fp8 fragment layout), but SMEM holds it packed
-# (TMA .b4x16, two values a byte, any K a multiple of 32): its fragment
-# registers are built from the packed words (_fp4_frag_regs), not by ldmatrix.
+# of an 8-bit container (the fp8 fragment layout). Two SMEM forms, chosen per
+# side by the renderer (kernel_registry.sm120_padded_e2m1_sides):
+# * PADDED (TMA .b4x16_p64; a 128-element K tile of a K that is a multiple of
+#   128): every 16 values land in a 16-byte chunk (8 B payload + 8 B zero), so
+#   the row is the fp8 side's 128 bytes, one byte per value, and
+#   ldmatrix.m8n16.x4.shared.b8x16.b4x16_p64 expands the lane's fragment in
+#   hardware with the nibble in bits [3:0]; one shift per register moves it to
+#   bits [5:2] (_ldm_frags).
+# * PACKED (TMA .b4x16; any K a multiple of 32): two values a byte in a 64-byte
+#   s64b row; the fragment registers are built from the packed words
+#   (_fp4_frag_regs), not by ldmatrix.
 _A_FP4_TO_BYTES = mma_block_scale_kind == "MXF8F6F4" and mma_a_ptx_type == "e2m1"
 _B_FP4_TO_BYTES = mma_block_scale_kind == "MXF8F6F4" and mma_b_ptx_type == "e2m1"
-assert (_A_KBLK_BYTES, _B_KBLK_BYTES) == (16 if _A_FP4_TO_BYTES else 32, 16 if _B_FP4_TO_BYTES else 32), (_A_ROW_BYTES, _B_ROW_BYTES, _NUM_K_BLOCKS)
+_A_FP4_PADDED = _A_FP4_TO_BYTES and a_tma_format is _tma.TensorMapDataFormat.B4X16_P64
+_B_FP4_PADDED = _B_FP4_TO_BYTES and b_tma_format is _tma.TensorMapDataFormat.B4X16_P64
+_A_FP4_PACKED = _A_FP4_TO_BYTES and not _A_FP4_PADDED
+_B_FP4_PACKED = _B_FP4_TO_BYTES and not _B_FP4_PADDED
+assert (_A_KBLK_BYTES, _B_KBLK_BYTES) == (16 if _A_FP4_PACKED else 32, 16 if _B_FP4_PACKED else 32), (_A_ROW_BYTES, _B_ROW_BYTES, _NUM_K_BLOCKS)
+# A padded side: one-byte containers in 128-byte rows, half of them GMEM payload.
+assert not _A_FP4_PADDED or (_A_ROW_BYTES == 128 and a_smem_dtype is cutlass.Uint8 and sA_tma_bytes * 2 == sA_packed_elems), (
+    _A_ROW_BYTES,
+    a_smem_dtype,
+    sA_tma_bytes,
+    sA_packed_elems,
+)
+assert not _B_FP4_PADDED or (_B_ROW_BYTES == 128 and b_smem_dtype is cutlass.Uint8 and sB_tma_bytes * 2 == sB_packed_elems), (
+    _B_ROW_BYTES,
+    b_smem_dtype,
+    sB_tma_bytes,
+    sB_packed_elems,
+)
 
 _WARP_TILE_M = cta_tile_mnk[0] // WARPS_M
 _WARP_TILE_N = cta_tile_mnk[1] // WARPS_N
@@ -223,12 +251,12 @@ _B_SWIZZLE = cutlass.Swizzle((_B_ROW_BYTES // 16).bit_length() - 1, 4, 3)
 _TMA_SWIZZLE_BY_ROW = {128: _tma.TensorMapSwizzle.s128b, 64: _tma.TensorMapSwizzle.s64b}
 assert (
     _TMA_SWIZZLE_BY_ROW.get(_A_ROW_BYTES) == a_tma_swizzle and _TMA_SWIZZLE_BY_ROW.get(_B_ROW_BYTES) == b_tma_swizzle
-), "block-scale K rows are one swizzle span: 128 B, 64 B for a mixed pair's e2m1 side (validate_block_scale_config_sm120)"
+), "block-scale K rows are one swizzle span: 128 B, 64 B for a mixed pair's packed e2m1 side (validate_block_scale_config_sm120)"
 # The packed e2m1 side folds its rows' s64b XOR into lane constants
 # (fp4_lane_words): 64-byte rows, and every stage a whole number of 512-byte
 # swizzle periods (the rings themselves are 1024-aligned).
-assert not _A_FP4_TO_BYTES or (_A_ROW_BYTES == 64 and sA_packed_elems % 512 == 0), (_A_ROW_BYTES, sA_packed_elems)
-assert not _B_FP4_TO_BYTES or (_B_ROW_BYTES == 64 and sB_packed_elems % 512 == 0), (_B_ROW_BYTES, sB_packed_elems)
+assert not _A_FP4_PACKED or (_A_ROW_BYTES == 64 and sA_packed_elems % 512 == 0), (_A_ROW_BYTES, sA_packed_elems)
+assert not _B_FP4_PACKED or (_B_ROW_BYTES == 64 and sB_packed_elems % 512 == 0), (_B_ROW_BYTES, sB_packed_elems)
 
 # ---- Transposed STG epilogue staging (fort "Sheet3" scheme) -----------------
 _STG_EPI_LANE_QUAD = 4  # one STS.128 = 4 x 32-bit acc regs per lane
@@ -406,6 +434,21 @@ def _fp4_frag_regs(words, sel):
         nvvm.prmt(even, 0x5140, nvvm.PermuteMode.DEFAULT, hi=odd),
         nvvm.prmt(even, 0x7362, nvvm.PermuteMode.DEFAULT, hi=odd),
     )
+
+
+def _ldm_frags(ptr, num, padded):
+    """``num`` ldmatrix 8-row tiles of one byte-per-element operand row, in
+    ldmatrix register order: the plain .b16 form of an fp8 (or packed fp4 x fp4)
+    row, or the ``.b8x16.b4x16_p64`` expansion of a padded e2m1 side -- the 16
+    values of each 16-byte chunk into 16 bytes, the nibble in bits [3:0] --
+    followed by the one shift that puts it at bits [5:2], where kind::mxf8f6f4
+    reads e2m1 (the upper nibble is zero, so the shift carries nothing across
+    bytes). Both forms hand the lane the bytes of the fp8 fragment layout."""
+    if padded:
+        regs = nvvm.ldmatrix(ptr, num, nvvm.MMALayout.ROW, shape=nvvm.LoadShape.M8N16, src_format=nvvm.LoadSrcFormat.B4X16_P64)
+        return tuple(regs[i] << 2 for i in range(num))
+    regs = nvvm.ldmatrix(ptr, num, nvvm.MMALayout.ROW)
+    return tuple(regs[i] for i in range(num))
 
 
 def _sf_word_offset(r, r_in_block):
@@ -1148,7 +1191,7 @@ def _kernel(
                                         src_format=nvvm.LoadSrcFormat.B8,
                                     )
                                 )
-                        elif cutlass.const_expr(_A_FP4_TO_BYTES):
+                        elif cutlass.const_expr(_A_FP4_PACKED):
                             # A mixed pair's packed e2m1 weight: rows g (a0, a2) and
                             # g + 8 (a1, a3) of each m-frag, built in registers.
                             sA_words = cutlass.inttoptr(sA_ptr.toint(), 3, cutlass.Uint32)
@@ -1161,20 +1204,14 @@ def _kernel(
                             for mf in cutlass.range_constexpr(_M_FRAGS):
                                 a_row = warp_row * _WARP_TILE_M + mf * 16 + a_ldm_row
                                 a_off = a_row * _A_ROW_BYTES + k_blk * _A_KBLK_BYTES + a_ldm_col16 * _ELEMS_16B
-                                a_frags.append(
-                                    nvvm.ldmatrix(
-                                        _apply_smem_swizzle(sA_ptr + a_off, _A_SWIZZLE),
-                                        4,
-                                        nvvm.MMALayout.ROW,
-                                    )
-                                )
+                                a_frags.append(_ldm_frags(_apply_smem_swizzle(sA_ptr + a_off, _A_SWIZZLE), 4, _A_FP4_PADDED))
                         a_frags_list.append(a_frags)
                     for _bj in cutlass.range_constexpr(num_b_operands):
                         sB_ptr = sB_ptrs[_bj]
                         b_frags = []
                         # The token is K-major (checked at import): plain ldmatrix, or
                         # registers built from a mixed pair's packed e2m1 token.
-                        if cutlass.const_expr(_B_FP4_TO_BYTES):
+                        if cutlass.const_expr(_B_FP4_PACKED):
                             sB_words = cutlass.inttoptr(sB_ptr.toint(), 3, cutlass.Uint32)
                             for nf in cutlass.range_constexpr(_N_FRAGS):
                                 b_frags.append(
@@ -1184,21 +1221,13 @@ def _kernel(
                             for npair in cutlass.range_constexpr(_N_FRAG_PAIRS):
                                 b_row = warp_col * _WARP_TILE_N + npair * 16 + b_ldm_pair_row
                                 b_off = b_row * _B_ROW_BYTES + k_blk * _B_KBLK_BYTES + b_ldm_pair_col16 * _ELEMS_16B
-                                bv = nvvm.ldmatrix(
-                                    _apply_smem_swizzle(sB_ptr + b_off, _B_SWIZZLE),
-                                    4,
-                                    nvvm.MMALayout.ROW,
-                                )
+                                bv = _ldm_frags(_apply_smem_swizzle(sB_ptr + b_off, _B_SWIZZLE), 4, _B_FP4_PADDED)
                                 b_frags.append((bv[0], bv[1]))
                                 b_frags.append((bv[2], bv[3]))
                             if cutlass.const_expr(_N_FRAGS % 2 == 1):
                                 b_row = warp_col * _WARP_TILE_N + (_N_FRAGS - 1) * 8 + b_ldm_tail_row
                                 b_off = b_row * _B_ROW_BYTES + k_blk * _B_KBLK_BYTES + b_ldm_tail_col16 * _ELEMS_16B
-                                bt = nvvm.ldmatrix(
-                                    _apply_smem_swizzle(sB_ptr + b_off, _B_SWIZZLE),
-                                    2,
-                                    nvvm.MMALayout.ROW,
-                                )
+                                bt = _ldm_frags(_apply_smem_swizzle(sB_ptr + b_off, _B_SWIZZLE), 2, _B_FP4_PADDED)
                                 b_frags.append((bt[0], bt[1]))
 
                         # Every GEMM fed by this B operand (trace-time selection); its

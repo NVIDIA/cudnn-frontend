@@ -1760,11 +1760,20 @@ def test_e2e_mx_combos(combo) -> None:
 )
 def test_e2e_mixed_mxfp8_mxfp4(fp8_on_a, config_name) -> None:
     """Grouped K32 padded and Rubin K64 native-packed mixed block-scale MMA."""
+    _run_e2e_mixed(fp8_on_a, config_name)
+
+
+def _run_e2e_mixed(fp8_on_a, config_name, *, K=256, swap_ab=False, expect_form=None) -> None:
+    """One mixed MXFP8 x MXFP4 grouped block-scale GEMM against a dequantized
+    reference. ``expect_form`` names the TMA data format (``B4X16`` /
+    ``B4X16_P64``) the rendered source must give the e2m1 side, in the kernel's
+    own orientation (the weight is A after the swap-AB lowering)."""
     dev = "cuda"
     torch.manual_seed(0)
-    E, S, N, K = 2, 256, 128, 256
+    E, S, N = 2, 256, 128
     offsets_list = [0, 128, S]
     bs, sf_k = 32, K // 32
+    sf_cols = _ceil_div(sf_k, 4) * 4  # the F8_128x4 blob pads K scales to whole words
     fp4, fp8 = cudnn.data_type.FP4_E2M1, cudnn.data_type.FP8_E4M3
     a_dt, b_dt = (fp8, fp4) if fp8_on_a else (fp4, fp8)
     lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
@@ -1792,12 +1801,22 @@ def test_e2e_mixed_mxfp8_mxfp4(fp8_on_a, config_name) -> None:
         a_dt_override=a_dt,
         b_dt_override=b_dt,
     )
-    compiled = _plan(g, config=by_name(config_name))
+    # Only an explicit swap reaches _plan: the sm100 swap-AB tests patch _plan
+    # with a partial that already carries swap_ab=True.
+    compiled = _plan(g, config=by_name(config_name), **({"swap_ab": True} if swap_ab else {}))
     assert compiled.chain.block_scale.mma_block_scale_kind == "MXF8F6F4"
+    if expect_form is not None:
+        fp4_side = "b" if fp8_on_a else "a"
+        if swap_ab:
+            fp4_side = {"a": "b", "b": "a"}[fp4_side]
+        source = pathlib.Path(compiled.generated_path).read_text()
+        assert f"{fp4_side}_tma_format = _tma.TensorMapDataFormat.{expect_form}" in source
+        smem_dtype = "cutlass.Uint8" if expect_form == "B4X16_P64" else "cutlass.Float4E2M1FNx2"
+        assert f"{fp4_side}_smem_dtype = {smem_dtype}" in source
 
     sfa_blk = torch.cat([_to_blocked(sfa_log[b : offsets_list[i + 1]]) for i, b in enumerate(offsets_list[:-1])])
-    sfa_blk = _with_static_segmented_capacity(sfa_blk, S, len(offsets_list) - 1, sf_k)
-    sfb_blk = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, sf_k, N)
+    sfa_blk = _with_static_segmented_capacity(sfa_blk, S, len(offsets_list) - 1, sf_cols)
+    sfb_blk = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, sf_cols, N)
     offsets = torch.tensor(offsets_list, dtype=torch.int32, device=dev)
     output = torch.zeros(1, S, N, dtype=torch.bfloat16, device=dev)
     compiled(_vp_bs(compiled, tok_rt, w_rt, output, sfa_blk, sfb_blk, fto=offsets))
@@ -1810,6 +1829,35 @@ def test_e2e_mixed_mxfp8_mxfp4(fp8_on_a, config_name) -> None:
         end = offsets_list[i + 1]
         ref[begin:end] = tok_deq[begin:end] @ w_deq[i % E].T
     torch.testing.assert_close(output[0], ref.to(torch.bfloat16), atol=2e-1, rtol=2e-2)
+
+
+@requires_sm120
+@pytest.mark.parametrize("fp8_on_a", [True, False], ids=["mxfp8_x_mxfp4", "mxfp4_x_mxfp8"])
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["normal", "swap_ab"])
+@pytest.mark.parametrize("K,form", [(256, "B4X16_P64"), (160, "B4X16")], ids=["k128_padded", "k32_packed"])
+def test_e2e_mixed_mxfp8_mxfp4_sm120(fp8_on_a, swap_ab, K, form) -> None:
+    """The sm120 mixed pair's e2m1 side rides TMA .b4x16_p64 (one-byte SMEM
+    containers, ldmatrix b4x16_p64 expansion) when K is a multiple of 128 and
+    stays packed (.b4x16, register-built fragments) otherwise, in both kernel
+    orientations."""
+    _run_e2e_mixed(fp8_on_a, _SM120_BS_CFG, K=K, swap_ab=swap_ab, expect_form=form)
+
+
+def test_sm120_padded_e2m1_sides_rule() -> None:
+    """The renderer's per-side form choice (no GPU): a mixed pair's e2m1 side is
+    padded at K % 128 == 0 only, never when it is the gathered token, and never for
+    a same-width pair."""
+    from cudnn.gemm.frost.kernel_registry import sm120_padded_e2m1_sides
+
+    fp4, fp8 = cudnn.data_type.FP4_E2M1, cudnn.data_type.FP8_E4M3
+    mixed = analyze(_build_graph(2, 256, 128, 256, 2, combo="mxfp8", a_dt_override=fp8, b_dt_override=fp4))
+    assert sm120_padded_e2m1_sides(mixed) == (False, True)
+    mixed_a = analyze(_build_graph(2, 256, 128, 256, 2, combo="mxfp8", a_dt_override=fp4, b_dt_override=fp8))
+    assert sm120_padded_e2m1_sides(mixed_a) == (True, False)
+    tail = analyze(_build_graph(2, 256, 128, 160, 2, combo="mxfp8", a_dt_override=fp8, b_dt_override=fp4))
+    assert sm120_padded_e2m1_sides(tail) == (False, False)
+    same = analyze(_build_graph(2, 256, 128, 256, 2, combo="mxfp4"))
+    assert sm120_padded_e2m1_sides(same) == (False, False)
 
 
 @requires_sm100
