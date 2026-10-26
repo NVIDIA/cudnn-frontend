@@ -1014,8 +1014,9 @@ object is never loaded), then replays `create_execution_plan`, pins it and
 builds it: `compile_cached` hits the seeded entries and still checks each
 record's key. A refused or missing kernel compiles as usual;
 `enforce_precompiled=True` raises instead. Measured on B200 (bf16 SDPA prefill
-b2 h8 s1024 d128): build 3.2 s; deserialize in a fresh process with an empty
-cache 0.9 s, 3 kernels seeded, zero compiles, O bitwise equal.
+b2 h8 s1024 d128): build 3.1 s; deserialize into another process with an
+empty cache 33 ms, with imports already done (a backend plan takes 23-30 ms).
+3 kernels seeded, zero compiles, O bitwise equal.
 
 The kernels are native code: deserialize only blobs from a trusted source. The
 C++ `Graph::deserialize` does not read this format. Running a python-engine
