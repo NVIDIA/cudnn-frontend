@@ -213,8 +213,12 @@ class IndexerBackwardV2Sm100:
         # test_DSA_indexer_backward_wrapper_v2 in
         # test/python/deepseek_sparse_attention/cutedsl/test_DSA_indexer_backward.py.
         assert self.num_tiles >= 1, self.num_tiles
-        # metadata parity slots (sIdx/sG double buffer + pipe_M stages)
-        self.meta_stage = 2
+        # Ordinary H32 owns exactly one row per CTA. It never restages another
+        # row, so Q, metadata, and dW partials need no cross-row parity slot.
+        # Persistent H64 and deterministic H32 retain the proven two-slot
+        # schedule and its metadata WAR protection.
+        self.row_stage = 1 if self.static_rows else 2
+        self.meta_stage = self.row_stage
 
         # Persistent schedule parameters. ``num_ctas`` is the grid size;
         # every CTA runs exactly ``ticket_slots`` ring slots, so
@@ -245,25 +249,30 @@ class IndexerBackwardV2Sm100:
         self.tiler_dK = (self.n_block, head_dim, num_heads)  # dKp  = A @ Q^T-view
 
         # Pipeline depths. The single MMA warp issues the S contraction as
-        # an async producer running ``mma_lookahead`` (= 2) tiles ahead of
-        # the S-epilogue consumer, so the S TMEM accumulators and the K
-        # gather pipe are 3 deep; the A and dK pipes stay 2 deep (TMEM is
-        # exactly full at 512 columns). sQ is double-buffered so the TMA
-        # fetch of row i+1 only waits on the MMA-warp release from row i-1,
-        # keeping the Q fetch off the row-boundary critical chain.
+        # an async producer running ``mma_lookahead`` tiles ahead of the
+        # S-epilogue consumer. Static H32 uses a one-tile lead to shorten its
+        # single-row circular dependency; persistent execution keeps the
+        # established two-tile lead. The S TMEM accumulators and K gather pipe
+        # are 3 deep; the A and dK pipes stay 2 deep (TMEM is exactly full at
+        # 512 columns). Persistent execution double-buffers sQ
+        # so the TMA fetch of row i+1 only waits on the MMA-warp release from
+        # row i-1. Static H32 has no next row and therefore uses one Q stage.
         # For T >= 3 (topk >= 384) these min-clamps are all no-ops, so the
         # schedule is the unclamped one; for
-        # T < 3 (topk 128/256) the S/K pipes and the lookahead shrink to the
-        # tile count so a whole row is resident at once. a_stage/dk_stage stay
-        # 2 unconditionally: the odd-tile dK drain references tAccdK[1] and the
+        # T < 3 (topk 128/256) the S/K pipes and persistent lookahead shrink to
+        # the tile count so a whole row is resident at once. a_stage/dk_stage
+        # stay 2 unconditionally: the odd-tile dK drain references tAccdK[1] and the
         # T==2 paired drain rolls by dk_stage==2, so both need two dK
         # accumulators even at T in {1, 2}.
-        self.q_stage = 2
+        self.q_stage = self.row_stage
         self.kv_stage = min(3, self.num_tiles)
         self.a_stage = 2
         self.s_stage = min(3, self.num_tiles)
         self.dk_stage = 2
-        self.mma_lookahead = min(2, self.num_tiles)
+        # A static one-row CTA has no next-row latency to amortize. Keep only
+        # one S tile ahead of its epilogue to shorten the circular S -> A ->
+        # dQ/dK startup chain; persistent modes retain their two-tile lead.
+        self.mma_lookahead = min(1 if self.static_rows else 2, self.num_tiles)
         # Explicit metadata WAR barrier gate. The implicit K->S->A->DK chain
         # orders the gather warpgroup's restage of valid row i+2 behind the
         # dK warpgroup's completed sIdx reads of tile (i+2)*T - kv_stage -
@@ -276,7 +285,7 @@ class IndexerBackwardV2Sm100:
         # recompute, 5 of 5 runs at S_q = 512 / S_k = 4096; see the module
         # docstring), which is what makes the explicit barrier load-bearing
         # here.
-        self.meta_war_explicit = self.num_tiles < self.kv_stage + self.dk_stage + 3
+        self.meta_war_explicit = not self.static_rows and self.num_tiles < self.kv_stage + self.dk_stage + 3
 
         self.load_warp_id = 0
         self.mma_warp_id = 1
@@ -532,19 +541,20 @@ class IndexerBackwardV2Sm100:
             DK_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.dk_stage]
             DQ_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
             # sIdx/sG parity-slot WAR pipe (gather WG producer / dK WG
-            # consumer); inert 32B unless meta_war_explicit
+            # consumer); inert 16B (static) / 32B (persistent) unless
+            # meta_war_explicit
             M_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.meta_stage]
             tmem_holding_buf: cutlass.Int32
-            # sIdx/sG parity double-buffered: the dK warpgroup (and the
-            # S-epilogue's late sG reads) still consume row i while the
-            # gather warpgroup restages row i+1.
+            # Persistent schedules double-buffer metadata while the dK and
+            # S-epilogue warpgroups consume row i and gather restages row i+1.
+            # Static H32 owns one row and specializes this extent to one.
             # No sW: the S-epilogue loads its weights row straight from gmem.
-            sIdx: cute.struct.Align[cute.struct.MemRange[Int32, 2 * self.topk_padded], 16]
-            sG: cute.struct.Align[cute.struct.MemRange[Float32, 2 * self.topk_padded], 16]
-            # per-epi-warp dW partials, parity double-buffered (row i's
-            # fixed-order combine reads vs row i+1's restage)
+            sIdx: cute.struct.Align[cute.struct.MemRange[Int32, self.meta_stage * self.topk_padded], 16]
+            sG: cute.struct.Align[cute.struct.MemRange[Float32, self.meta_stage * self.topk_padded], 16]
+            # Per-epi-warp dW partials. Persistent schedules use parity slots;
+            # static H32 only needs the current row.
             sdWp: cute.struct.Align[
-                cute.struct.MemRange[Float32, 2 * self.num_heads * len(self.epi_warp_ids)],
+                cute.struct.MemRange[Float32, self.row_stage * self.num_heads * len(self.epi_warp_ids)],
                 16,
             ]
             # Ticket ring (mbar pairs + row ids). Placed HERE — between
@@ -687,9 +697,9 @@ class IndexerBackwardV2Sm100:
             sdKStage = storage.sdKStage.get_tensor(
                 cute.make_layout((self.DK_STAGE_ELEMENTS,)),
             )
-        sIdx = storage.sIdx.get_tensor(cute.make_layout((self.topk_padded, 2)))
-        sG = storage.sG.get_tensor(cute.make_layout((self.topk_padded, 2)))
-        sdWp = storage.sdWp.get_tensor(cute.make_layout((self.num_heads, len(self.epi_warp_ids), 2)))
+        sIdx = storage.sIdx.get_tensor(cute.make_layout((self.topk_padded, self.meta_stage)))
+        sG = storage.sG.get_tensor(cute.make_layout((self.topk_padded, self.meta_stage)))
+        sdWp = storage.sdWp.get_tensor(cute.make_layout((self.num_heads, len(self.epi_warp_ids), self.row_stage)))
         sRowQ = storage.sRowQ.get_tensor(cute.make_layout((self.ring_depth,)))
 
         pipeline.pipeline_init_wait()
@@ -1008,7 +1018,7 @@ class IndexerBackwardV2Sm100:
                         pipe_T.consumer_release(pe_tst)
                     pe_tst.advance()
                 pe_ok = pe_rowi >= 0
-                pe_buf = pe_vcnt % 2
+                pe_buf = pe_vcnt % self.row_stage
                 pe_vcnt = pe_vcnt + (Int32(1) if pe_ok else Int32(0))
                 if pe_ok:
                     # rW straight from gmem (mW is a read-only input; a smem
@@ -1234,7 +1244,7 @@ class IndexerBackwardV2Sm100:
                         pipe_T.consumer_release(pg_tst)
                     pg_tst.advance()
                 pg_ok = pg_rowi >= 0
-                pg_buf = pg_vcnt % 2
+                pg_buf = pg_vcnt % self.meta_stage
                 pg_vcnt = pg_vcnt + (Int32(1) if pg_ok else Int32(0))
                 if pg_ok:
                     # local-id mode: per-row batch offset, applied AFTER the
@@ -1441,7 +1451,7 @@ class IndexerBackwardV2Sm100:
                             pipe_T.consumer_release(bulk_tst)
                         bulk_tst.advance()
                     bulk_ok = bulk_ticket_row >= 0
-                    bulk_buf = bulk_vcnt % 2
+                    bulk_buf = bulk_vcnt % self.meta_stage
                     bulk_vcnt = bulk_vcnt + (Int32(1) if bulk_ok else Int32(0))
                     if bulk_ok:
                         bulk_off = Int32(0)
@@ -1546,7 +1556,7 @@ class IndexerBackwardV2Sm100:
                     pipe_T.consumer_release(pk_tst)
                 pk_tst.advance()
                 pk_ok = pk_ticket_row >= 0
-                pk_buf = pk_vcnt % 2
+                pk_buf = pk_vcnt % self.meta_stage
                 pk_vcnt = pk_vcnt + (Int32(1) if pk_ok else Int32(0))
                 if pk_ok:
                     # local-id mode: this row's batch offset (the ticket row
