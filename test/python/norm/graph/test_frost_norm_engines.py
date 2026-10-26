@@ -202,3 +202,21 @@ def test_frost_norm_engines():
         main()
     except SystemExit as exc:
         assert not exc.code, "checks failed -- see captured stdout"
+
+
+@pytest.mark.L0
+def test_has_tmem_follows_the_current_device(monkeypatch):
+    """The BatchNorm TMEM tier follows the current device: with an SM100 and an SM90
+    part in one process, each gets its own answer, in either query order."""
+    from cudnn.norm import utils
+
+    caps = {0: (10, 0), 1: (9, 0)}
+    current = [0]
+    monkeypatch.setattr(utils, "_HAS_TMEM", {})
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: current[0])
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: caps[current[0] if device is None else device])
+    for order in ((0, 1), (1, 0)):
+        utils._HAS_TMEM.clear()
+        for device in order:
+            current[0] = device
+            assert utils.has_tmem() is (caps[device][0] == 10), (order, device)

@@ -117,18 +117,21 @@ def coop_launch_too_large(exc):
     return "COOPERATIVELAUNCHTOOLARGE" in str(exc).upper().replace("_", "")
 
 
-_HAS_TMEM = None
+_HAS_TMEM = {}
 
 
 def has_tmem():
     """Whether the current device has tensor memory (``tcgen05``): the SM10x/SM11x
-    parts. On SM90 the TMEM cache tiers are disabled and the smem tiers serve."""
-    global _HAS_TMEM
-    if _HAS_TMEM is None:
-        import torch
+    parts. On SM90 the TMEM cache tiers are disabled and the smem tiers serve.
 
-        _HAS_TMEM = torch.cuda.get_device_capability()[0] in (10, 11)
-    return _HAS_TMEM
+    Cached per device ordinal: the kernels launch on the current device, and a
+    process can hold an SM100 and an SM90 part."""
+    import torch
+
+    device = torch.cuda.current_device()
+    if device not in _HAS_TMEM:
+        _HAS_TMEM[device] = torch.cuda.get_device_capability(device)[0] in (10, 11)
+    return _HAS_TMEM[device]
 
 
 _SMEM_PER_SM = None
