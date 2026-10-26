@@ -139,6 +139,8 @@ TMA_O_ITERS_HOST = (CFG.TILE_O * CFG.BPE) // CFG.O_SWZ_BYTES
 
 from typing import NamedTuple
 
+from cudnn.frost.tile_dsl.thd import exit_if_dead_thd_cluster
+
 from cudnn.frost.tile_dsl.barrier import (
     PipelineState,
     advance,
@@ -732,6 +734,11 @@ def _kernel(
     bidx = cute.arch.block_idx()[0]
     bidy = cute.arch.block_idx()[1]
     bidz = cute.arch.block_idx()[2]
+
+    if cutlass.const_expr(thd_origins is not None):
+        # Origin maps exist only for live batches. Reject dead initial units
+        # before any role acquires maps, TMEM, or cluster barriers.
+        exit_if_dead_thd_cluster(seq_kv_lens_tensor, n_batch, CFG.CGA_M)
 
     # SMEM allocations in natural Q/K/V/O order — Tcgen05SmemDesc.build truncates
     # start_address past ~256 KiB so this order keeps the data buffers in low SMEM.

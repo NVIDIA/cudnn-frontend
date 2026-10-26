@@ -301,12 +301,11 @@ class Capabilities:
     # pre-existing allocation on that path, tracked with its other
     # TemplateParams-conversion follow-ups.
     lse_optional: bool = False
-    # THD forward lowerings assume FULLY-PACKED storage: the packed addressing
-    # is re-derived as prefix(lens) x token stride, and the graph's bound
-    # ragged-offset values are never read. TE-style padded THD (offsets
-    # from cu_seqlens_padded != cu_seqlens, gaps between sequences) is NOT
-    # served — and being runtime data, cannot be declined at plan time.
-    # (The SM80 backward reads them: bwd Capabilities.thd_ragged_offsets.)
+    # Most THD forward lowerings derive addresses from compact length prefixes.
+    # The SM100/SM103 ungated, nonpaged, unsplit CGA2 half D128/D256 graph
+    # lowering reads independent Q/K/V/O/Stats physical offsets. See
+    # SUPPORT_MATRIX_TRACKER.md for this scope and the remaining sibling gaps;
+    # thd=True alone does not promise support for padding between sequences.
     thd: bool = False
     # cu_seq_len_q / cu_seq_len_kv (B+1,) prefix sums (cuDNN 9.24+). Serving
     # rows consume the form on THD host-side (lens = adjacent differences of

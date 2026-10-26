@@ -154,6 +154,18 @@ ordered after that read.**
   is `ref == 0, gpu != 0` elements on masked configs with `key mod TILE_N`
   in the aliased range — recover the leaked keys by matching
   `O_gpu - O_ref` against `V` rows.
+
+**Rule S4 — THD dead units must not access uninitialized per-sequence maps.**
+
+- A launch uses a declared envelope; live lengths can leave initial clusters
+  with `batch_idx == n_batch`. Allocating `B+1` map slots makes that address
+  in bounds but does not initialize a descriptor there.
+- When setup writes maps only for the `B` real sequences, exit dead initial
+  clusters before acquiring maps or shared resources. Use the cluster-uniform
+  `exit_if_dead_thd_cluster` helper; a role-local exit can strand barrier peers.
+- Exercise overlaunch without total-length hints and replay after changing
+  all query lengths to zero. Check O/Stats canaries and run memcheck; ordinary
+  live-row numerical comparisons do not cover the dead-unit path.
 - Prove completion and inter-thread ordering separately for every TMEM reuse
   edge. The specialized synchronization route uses the applicable
   `tcgen05.wait::ld/st`, producer `before_thread_sync`, synchronization, and

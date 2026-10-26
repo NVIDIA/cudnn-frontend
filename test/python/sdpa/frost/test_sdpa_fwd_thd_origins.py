@@ -62,8 +62,10 @@ def test_independent_thd_origins_rebind_and_capture(dim, dtype_name, stats_layou
     def flat(t):
         return t.as_strided((capacity, t.shape[1], dim), (t.stride(2), t.stride(1), t.stride(3)))
 
-    def fill(values, shift, short=False):
+    def fill(values, shift, short=False, empty=False):
         ql = [97, 0, 49, 17] if short else q_lengths
+        if empty:
+            ql = [0] * batch
         # Replay also turns a live query sequence into a keyless row.
         kl = [101, 0, 76, 0] if short else kv_lengths
         origins = {name: [shift + port * 16 + x for x in (0, 176, 224, 384)] for port, name in enumerate(ports)}
@@ -182,6 +184,13 @@ def test_independent_thd_origins_rebind_and_capture(dim, dtype_name, stats_layou
         # Both captures survive a later pointer bind; mutate all metadata in place.
         for captured, values, shift in reversed(captures):
             state = fill(values, shift + 32, short=True)
+            poison(values)
+            captured.replay()
+            torch.cuda.synchronize()
+            check(values, state)
+            # The launch envelope stays nonzero after live query work reaches
+            # zero. No dead cluster may acquire the unwritten sentinel maps.
+            state = fill(values, shift + 32, short=True, empty=True)
             poison(values)
             captured.replay()
             torch.cuda.synchronize()
