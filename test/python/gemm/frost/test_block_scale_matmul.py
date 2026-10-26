@@ -867,6 +867,32 @@ def test_block_scale_sf_ring_budget_distinct_operands(na, nb, budget, stages, mo
     assert f"ab_stages = {stages}\n" in src
 
 
+@pytest.mark.parametrize(
+    "config_name,moe,resident",
+    [
+        ("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma", False, True),
+        ("CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma", False, True),
+        ("CONFIG_sm100_128x256x128_128x256x32_cluster2x4_2ctamma", False, False),
+        ("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma", True, False),
+    ],
+)
+def test_block_scale_sf_words_resident_only_when_they_fit(config_name, moe, resident, monkeypatch):
+    from cudnn.gemm.frost.fusion_ir import MoeSpec
+
+    monkeypatch.setattr(C, "_current_arch", lambda: 100)
+    chain = analyze(_build_nvfp4_graph(256, 256, 512))
+    if moe:
+        chain = dataclasses.replace(chain, moe=MoeSpec(num_experts=1, num_groups=3))
+    cfg = by_name(config_name)
+    src = C._render_block_scale_tile_constants(cfg, chain, select_template(chain, cfg))
+    v = {k: eval(x) for k, x in re.findall(r"^(sf\w*_cols|sf\w*_col_bases|num_sf_atoms|num_tmem_alloc_cols) = (.*)$", src, re.M)}
+    stride = v["sf_word_stride_cols"]
+    assert (stride > 0) == resident
+    if resident:
+        assert stride == len(v["sfa_col_bases"]) * v["sfa_tmem_cols"] + len(v["sfb_col_bases"]) * v["sfb_tmem_cols"]
+        assert max(v["sfb_col_bases"]) + v["sfb_tmem_cols"] + (v["num_sf_atoms"] - 1) * stride <= v["num_tmem_alloc_cols"]
+
+
 @requires_sm100
 @pytest.mark.parametrize("K", (128, 2048))
 def test_block_scale_stg_sf_ring_alignment(K):

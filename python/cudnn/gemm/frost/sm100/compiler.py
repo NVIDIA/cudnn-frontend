@@ -1720,8 +1720,8 @@ def _render_block_scale_tile_constants(
             na * sfa_tmem_cols + (nb - 1) * sfb_tmem_cols + max(off + cols for off, cols in sfb_spans),
         )
     else:
-        # Every SF word is re-utccp'd into the same columns and the scale base is fixed,
-        # so an instruction reads exactly its own operand's region.
+        # An instruction's scale base is its own word's operand region (the word stride,
+        # chosen below, is a whole SF set), so it reads exactly that region.
         sf_reserved_cols = sf_total_cols
     per_gemm = (total_tmem - sf_reserved_cols) // num_gemms
     if per_gemm < acc_cols_per_stage:
@@ -1758,6 +1758,14 @@ def _render_block_scale_tile_constants(
     # tcgen05.alloc requires a power-of-2 column count; allocate the full TMEM.
     used_cols = sf_region_base + sf_total_cols
     num_tmem_alloc_cols = total_tmem
+    # When the TMEM left after the accumulators holds every word of a K-tile, word w's
+    # SF set sits w * sf_word_stride_cols further in: the MMA warp then copies all words
+    # before the K-tile's MMAs instead of making each copy wait for the previous word's
+    # MMA to read the shared columns. 0 = one reused word (sm103 and MoE templates).
+    sf_word_stride_cols = 0
+    if tmpl.file == "sm100_block_scale_matmul.py" and num_sf_words > 1 and used_cols + (num_sf_words - 1) * sf_total_cols <= num_tmem_alloc_cols:
+        sf_word_stride_cols = sf_total_cols
+        used_cols += (num_sf_words - 1) * sf_total_cols
     if used_cols > num_tmem_alloc_cols:
         raise NotImplementedError(
             f"block-scale {cfg.name!r}: the accumulator + SF regions need {used_cols} TMEM columns but only {num_tmem_alloc_cols} are allocated"
@@ -1965,6 +1973,7 @@ def _render_block_scale_tile_constants(
         f"sfb_col_bases = {tuple(sfb_col_bases)}",
         f"sfa_tmem_cols = {sfa_tmem_cols}",
         f"sfb_tmem_cols = {sfb_tmem_cols}",
+        f"sf_word_stride_cols = {sf_word_stride_cols}",
         # Mixed CGA pins the walk to the identity map: the super-block
         # rasterization is not invariant across the two cluster shapes.
         f"tile_swizzle_n = {1 if fallback_cluster is not None else 0}",
