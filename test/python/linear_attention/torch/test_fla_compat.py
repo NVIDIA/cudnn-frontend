@@ -542,16 +542,17 @@ def test_kda_sm90_cached_backward_decline_keeps_no_inputs():
     master = _kda_leaves(B=B, T=128, H=4, HV=4, K=128, V=128, dtype=torch.bfloat16, seed=5)
     do = torch.randn(B, 128, 4, 128, device="cuda", dtype=torch.bfloat16)
     refs = []
+    kda_mod._BWD_CHECKED.clear()
     for _ in range(3):
         lv = _kda_clone(master, torch.bfloat16)
         o = _run_kda(kda_shim, lv, "softplus")
-        assert kda_last_path().startswith("fallback") and kda_last_path() != "fallback:underfilled", kda_last_path()
+        assert kda_last_path() == "fallback:_Decline", kda_last_path()
         o.backward(do)
         refs.append(weakref.ref(lv["q"]))
         del lv, o
     gc.collect()
     assert all(r() is None for r in refs), "a declined call's q is still referenced after it returned"
-    assert all(v is None or isinstance(v, str) for v in kda_mod._BWD_CHECKED.values())
+    assert len(kda_mod._BWD_CHECKED) == 1 and all(isinstance(v, str) for v in kda_mod._BWD_CHECKED.values()), kda_mod._BWD_CHECKED
 
 
 @sm90
