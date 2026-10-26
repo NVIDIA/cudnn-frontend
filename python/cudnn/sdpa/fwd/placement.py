@@ -108,7 +108,15 @@ lose up to 33x. THD, sliding window, sinks and envelope widths below 512 were no
 SM100 per-tensor FP8 row (B200, E4M3 Q/K/V/O, Amax_O; FROST does not produce Amax_S, so graphs
 requesting it keep the backend): prefill d256 0.47-0.58 and d512 0.34-0.49 -> LEAD; d192 0.92-0.99 and
 d128 0.98-1.03 squares -> TRAIL. ``s_q == 1``: d128 loses 1.3-2.7x; for d192-d512 the backend has no
-engine. ``2 <= s_q <= 16``, THD, paged, window, sinks and block-scaled O were not measured -> TRAIL.
+engine. Decode-shaped GQA (``s_q <= 16``, dense or paged, measured 2026-10-26 against cuDNN 9.28.0.38, 540
+cases: d64 sink +/- SWA128, d128, d256; q 1-16; kv 4k/64k; b 1/32/128; plus the 120 paged d64 sink cases
+FROST serves since #1874): ``2 <= s_q <= 16`` FROST wins every d128 (0.03-0.37) and d256 (0.01-0.25) cell ->
+LEAD. d64 with a sink wins from 32 KV units (0.06-0.98) and a single SWA query row wins at any batch
+(0.06-0.90) -> LEAD; below 32 units the full-cache single row loses 1.20-1.23 and paged SWA ``s_q >= 2``
+1.09-1.49 (dense ``s_q >= 2`` is 0.88-1.06 parity) -> TRAIL. d128 ``s_q == 1`` still loses (1.48 dense, 1.88
+paged geo) -> TRAIL. THD, MHA, d64 without a sink, a window off the d64 sink graph and block-scaled O were not measured
+-> TRAIL, as do other O dtypes than E4M3 and caches below 1k. FROST declines paged d256 today, so leading it
+changes nothing.
 Short prefill (s_q 17-512, s_kv 64-8192, b 1/8; GPU replay and eager back-to-back submission): FROST
 submits in ~16-18 us against the backend's ~13 us, so a single-wave launch with a cache below 1k is
 host-bound and loses eager 1.03-1.37 while winning GPU time; d512 with >= 32 query heads wins both at
@@ -426,6 +434,8 @@ FP8_D512_WIDE_Q_HEADS = 32  # d512 with >= 32 query heads wins at every measured
 FP8_MIN_KV_TOKENS = 1024  # below, a single-wave launch is host-bound: FROST's ~4 us extra submit cost loses eager 1.03-1.37
 FP8_D192_MAX_Q_TILES = 64  # d192 chunks: 16-64 tiles win 0.34-0.90; 128 tiles lose 1.19-1.72
 FP8_D128_ANY_TILES_MAX_S_Q = 128  # d128 chunks with s_q <= 128 win at 64-512 tiles (0.21-0.68)
+SM100_FP8_DECODE_MIN_KV = 1024  # the measured decode caches: 4k / 64k grid, 1k-128k hold-out
+SM100_FP8_SINK_DECODE_MIN_KV_UNITS = 32  # d64 sink below 32 KV units: full-cache s_q == 1 loses 1.20-1.23, paged SWA s_q >= 2 1.09-1.49
 FP8_SYNTH_KV_MIN_TILE_KV = 2**21  # S_kv off the KV tile, mask-free: Q tiles * s_kv from which FROST wins (0.41-0.89)
 SM100_PAGED_GQA16_MAX_B = 4  # SM100 paged bf16 GQA prefill: measured batch range (module docstring)
 SM107_PAGED_GQA_MAX_B = 4  # Rubin paged bf16 GQA prefill chunks: measured batch range (module docstring)
@@ -668,8 +678,29 @@ def _place_sm107_mxfp8(caps: Capabilities, facts) -> str:
     return LEAD if facts.device_cc == (10, 7) else TRAIL
 
 
+def _sm100_fp8_decode_leads(facts) -> bool:
+    """SM100 per-tensor FP8 decode-shaped GQA graphs FROST leads (module docstring, "SM100 per-tensor FP8 row")."""
+    shape = (facts.d_qk, facts.d_v)
+    sink_d64 = shape == (64, 64) and facts.has_sink
+    if facts.thd or facts.o_block_scale or facts.has_epilogue_gate or not facts.h_kv or facts.h_q <= facts.h_kv:
+        return False
+    if facts.dtype != cudnn.data_type.FP8_E4M3 or facts.dtype_o != cudnn.data_type.FP8_E4M3 or facts.s_kv < SM100_FP8_DECODE_MIN_KV:
+        return False  # measured E4M3 in and out, from a 1k cache
+    if facts.right_band_widening:
+        return False  # measured causal (diagonal right bound 0) or mask-free
+    if (facts.window_left is not None and not sink_d64) or (facts.has_sink and not sink_d64):
+        return False
+    if sink_d64:
+        # a single SWA query row wins at any batch; otherwise a few KV units lose (paged SWA b=1 to 1.49x)
+        return facts.b * facts.h_kv >= SM100_FP8_SINK_DECODE_MIN_KV_UNITS or (facts.s_q == 1 and facts.window_left is not None)
+    return facts.s_q >= 2 and shape in ((128, 128), (256, 256))
+
+
 def _place_sm100_fp8(caps: Capabilities, facts) -> str:
-    # Measured: dense per-tensor E4M3, O E4M3 + Amax_O, no sink / block-scaled O, a window only inside _d512_swa.
+    # Measured: dense per-tensor E4M3, O E4M3 + Amax_O, no sink / block-scaled O, a window only inside _d512_swa;
+    # decode-shaped GQA (s_q <= 16) also paged and with a d64 sink.
+    if facts.s_q <= DECODE_SHAPED_MAX_S_Q and _sm100_fp8_decode_leads(facts):
+        return LEAD
     if facts.thd or facts.has_paged_kv or (facts.window_left is not None and not _d512_swa(facts)) or facts.has_sink or facts.o_block_scale:
         return TRAIL
     flavor = _selected_d_shape(caps, facts)
