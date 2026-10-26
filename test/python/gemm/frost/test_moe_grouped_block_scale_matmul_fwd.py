@@ -1760,11 +1760,21 @@ def test_e2e_mx_combos(combo) -> None:
 )
 def test_e2e_mixed_mxfp8_mxfp4(fp8_on_a, config_name) -> None:
     """Grouped K32 padded and Rubin K64 native-packed mixed block-scale MMA."""
+    _run_e2e_mixed(fp8_on_a, config_name)
+
+
+def _run_e2e_mixed(fp8_on_a, config_name, *, K=256, swap_ab=False, check_sm120_source=False) -> None:
+    """One mixed MXFP8 x MXFP4 grouped block-scale GEMM against a dequantized
+    reference. ``check_sm120_source`` also pins the sm120 rendering: the e2m1
+    side stays TMA ``.b4x16`` (two values a byte) and every data descriptor
+    carries the 128-byte L2 promotion hint (in the kernel's own orientation:
+    the weight is A after the swap-AB lowering)."""
     dev = "cuda"
     torch.manual_seed(0)
-    E, S, N, K = 2, 256, 128, 256
+    E, S, N = 2, 256, 128
     offsets_list = [0, 128, S]
     bs, sf_k = 32, K // 32
+    sf_cols = _ceil_div(sf_k, 4) * 4  # the F8_128x4 blob pads K scales to whole words
     fp4, fp8 = cudnn.data_type.FP4_E2M1, cudnn.data_type.FP8_E4M3
     a_dt, b_dt = (fp8, fp4) if fp8_on_a else (fp4, fp8)
     lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
@@ -1792,12 +1802,23 @@ def test_e2e_mixed_mxfp8_mxfp4(fp8_on_a, config_name) -> None:
         a_dt_override=a_dt,
         b_dt_override=b_dt,
     )
-    compiled = _plan(g, config=by_name(config_name))
+    # Only an explicit swap reaches _plan: the sm100 swap-AB tests patch _plan
+    # with a partial that already carries swap_ab=True.
+    compiled = _plan(g, config=by_name(config_name), **({"swap_ab": True} if swap_ab else {}))
     assert compiled.chain.block_scale.mma_block_scale_kind == "MXF8F6F4"
+    if check_sm120_source:
+        fp4_side = "b" if fp8_on_a else "a"
+        if swap_ab:
+            fp4_side = {"a": "b", "b": "a"}[fp4_side]
+        source = pathlib.Path(compiled.generated_path).read_text()
+        assert f"{fp4_side}_tma_format = _tma.TensorMapDataFormat.B4X16" in source
+        assert f"{fp4_side}_smem_dtype = cutlass.Float4E2M1FNx2" in source
+        # Two A descriptor variants (M-major / K-major) and one B descriptor.
+        assert source.count("l2_promotion=_tma.TensorMapL2Promotion.l2_128b") == 3
 
     sfa_blk = torch.cat([_to_blocked(sfa_log[b : offsets_list[i + 1]]) for i, b in enumerate(offsets_list[:-1])])
-    sfa_blk = _with_static_segmented_capacity(sfa_blk, S, len(offsets_list) - 1, sf_k)
-    sfb_blk = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, sf_k, N)
+    sfa_blk = _with_static_segmented_capacity(sfa_blk, S, len(offsets_list) - 1, sf_cols)
+    sfb_blk = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, sf_cols, N)
     offsets = torch.tensor(offsets_list, dtype=torch.int32, device=dev)
     output = torch.zeros(1, S, N, dtype=torch.bfloat16, device=dev)
     compiled(_vp_bs(compiled, tok_rt, w_rt, output, sfa_blk, sfb_blk, fto=offsets))
@@ -1810,6 +1831,35 @@ def test_e2e_mixed_mxfp8_mxfp4(fp8_on_a, config_name) -> None:
         end = offsets_list[i + 1]
         ref[begin:end] = tok_deq[begin:end] @ w_deq[i % E].T
     torch.testing.assert_close(output[0], ref.to(torch.bfloat16), atol=2e-1, rtol=2e-2)
+
+
+@requires_sm120
+@pytest.mark.parametrize("fp8_on_a", [True, False], ids=["mxfp8_x_mxfp4", "mxfp4_x_mxfp8"])
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["normal", "swap_ab"])
+@pytest.mark.parametrize("K", [256, 160], ids=["k256", "k160_tail"])
+def test_e2e_mixed_mxfp8_mxfp4_sm120(fp8_on_a, swap_ab, K) -> None:
+    """The sm120 mixed pair in both kernel orientations and operand orders, at a
+    whole number of K-tiles and with a K tail: packed e2m1 operand, every data
+    descriptor with the 128-byte TMA L2 promotion hint, numerics against the
+    dequantized reference."""
+    _run_e2e_mixed(fp8_on_a, _SM120_BS_CFG, K=K, swap_ab=swap_ab, check_sm120_source=True)
+
+
+def test_sm120_mixed_pair_smem_footprint_budgets_packed_rows() -> None:
+    """The sm120 SMEM footprint check (multi_gemm_smem_bytes) sizes the packed e2m1
+    side of a mixed pair at its real 64-byte row, as multi_gemm_ab_stages does and
+    as the kernel lays its ring out, instead of the fp8 side's 128 bytes (no GPU)."""
+    from cudnn.gemm.frost.kernel_registry import select_template
+
+    fp4, fp8 = cudnn.data_type.FP4_E2M1, cudnn.data_type.FP8_E4M3
+    cfg = by_name(_SM120_BS_CFG)
+    mixed = analyze(_build_graph(2, 256, 128, 256, 2, combo="mxfp8", a_dt_override=fp8, b_dt_override=fp4))
+    same = analyze(_build_graph(2, 256, 128, 256, 2, combo="mxfp8"))
+    assert mixed.block_scale.mixed_width and not same.block_scale.mixed_width
+    t_mixed, t_same = select_template(mixed, cfg), select_template(same, cfg)
+    for stages in (1, 2, 3):
+        saved = t_same.multi_gemm_smem_bytes(same, cfg, stages) - t_mixed.multi_gemm_smem_bytes(mixed, cfg, stages)
+        assert saved == stages * cfg.cta_tile_n * (cfg.cta_tile_k_bytes // 2) * mixed.num_b_operands
 
 
 @requires_sm100
@@ -2497,6 +2547,11 @@ def test_sm120_moe_block_scale_render_smoke(combo: str, mode: str) -> None:
     assert chain.moe.num_groups == 4
     assert re.search(r"^grid_num_clusters = \d+$", src, re.M) and re.search(r"^offset_cutlass_dtype = cutlass\.Int32$", src, re.M)
     assert "moe_desc_slots = 0" in src and "tensormap_replace" not in src and "fallback_cluster_shape_mnk" not in src
+    # Every data descriptor (two A variants, one B) carries the 128-byte TMA L2 promotion.
+    assert src.count("l2_promotion=_tma.TensorMapL2Promotion.l2_128b") == 3
+    # The host's scheduler-counter launch stays unless a runtime renders this True.
+    assert re.search(r"^external_counter_reset = False$", src, re.M)
+    assert "if cutlass.const_expr(not external_counter_reset):" in src
     assert "if row < group_end:" in src
     m = re.search(r"^def _host\(\n(.*?)^\) -> None:", src, re.S | re.M)
     params = [ln.strip().split(":")[0] for ln in m.group(1).splitlines() if ln.strip()]

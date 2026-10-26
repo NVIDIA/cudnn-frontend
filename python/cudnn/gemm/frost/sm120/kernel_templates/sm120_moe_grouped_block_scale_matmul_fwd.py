@@ -1468,6 +1468,13 @@ def _host(
     # segmented blob; the kernel offsets its block coordinate. Strides arrive in
     # one-byte storage elements (a_fake_dtype). The data and SF lists are built
     # separately: a raw-FP8 token (one-sided dequant) has no SFA operand.
+    # The A and B data descriptors carry CUTLASS's default TMA L2 promotion
+    # (128 B). Their box rows are 64 B for the packed e2m1 side of a mixed MXFP4 x
+    # MXFP8 pair (a 128-element fp8 K-tile holds 128 e2m1 values), and without the
+    # hint each 64-byte row is its own DRAM request: on an RTX PRO 6000 (SM120) the
+    # weight stream then tops out near 0.85 TB/s against 1.19 TB/s with it, which
+    # was the whole gap between the W4A8 and NVFP4 kernels of one tile. 128-byte
+    # rows (fp8, and e2m1 at the fp4 K-tile) measure the same with or without it.
     tma_a_desc_list = []
     for _a_idx, _a_op in enumerate(_a_operands):
         a_stride_m, a_stride_k, a_stride_l = _a_stride_sets[_a_idx]
@@ -1488,6 +1495,7 @@ def _host(
                 box_dims=a_box,
                 swizzle=a_tma_swizzle,
                 tma_format=a_tma_format,
+                l2_promotion=_tma.TensorMapL2Promotion.l2_128b,
             )
         )
     tma_sfa_desc_list = []
@@ -1544,6 +1552,7 @@ def _host(
                     box_dims=[b_tma_group_elems, cta_tile_mnk[2], 1],
                     swizzle=b_tma_swizzle,
                     tma_format=b_tma_format,
+                    l2_promotion=_tma.TensorMapL2Promotion.l2_128b,
                 )
             )
         else:
@@ -1559,6 +1568,7 @@ def _host(
                     box_dims=[cta_tile_mnk[2], cta_tile_mnk[1], 1],
                     swizzle=b_tma_swizzle,
                     tma_format=b_tma_format,
+                    l2_promotion=_tma.TensorMapL2Promotion.l2_128b,
                 )
             )
     tma_sfb_desc_list = []
@@ -1591,8 +1601,12 @@ def _host(
     grid_shape = (grid_num_clusters, 1, 1)
     # Zero the scheduler counter on the launch stream. The PDL main kernel
     # below reads it only after griddepcontrol.wait, i.e. once this has landed.
+    # A runtime that zeroed the counter qword on this stream already (its own
+    # routing kernel, say) renders external_counter_reset True and saves the
+    # one-thread launch; the kernel then relies on that write having landed.
     counter_qword = grid_num_clusters * moe_desc_slots * TENSOR_MAP_QWORDS
-    _dynamic_scheduler_counter_initialization(a_tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
+    if cutlass.const_expr(not external_counter_reset):
+        _dynamic_scheduler_counter_initialization(a_tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     _kernel(
         problem_size[0],
         problem_size[1],
