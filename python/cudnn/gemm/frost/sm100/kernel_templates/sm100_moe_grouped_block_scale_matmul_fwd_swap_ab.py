@@ -18,6 +18,7 @@ from cudnn.gemm.frost.tile_helpers import (
     moe_gather_scales,
     moe_scatter_row,
     moe_combine_add,
+    moe_combine_swap_bulk,
     tma_scatter4,
     copy_tensormap_to_workspace as _copy_tensormap_to_workspace,
     epi_subtile_spans as _epi_subtile_spans,
@@ -241,6 +242,8 @@ def _kernel(
             tma_mcast_mask_b = cutlass.Int16(1 << cta_rank_in_cluster)
 
     _smem_sys_reserved = cutlass.Array(cutlass.Int8, 1024, space=cutlass.AddressSpace.smem, alignment=1)
+    if cutlass.const_expr(moe_combine_swap_bulk_enabled):
+        combine_staging = cutlass.Array(cutlass.BFloat16, 128 * mma_size_m * epi_n, space=cutlass.AddressSpace.smem, alignment=16)
 
     ab_full_mbar_ptr = cutlass.Array(cutlass.Int64, ab_stages, space=cutlass.AddressSpace.smem)
     sf_full_mbar_ptr = cutlass.Array(cutlass.Int64, ab_stages, space=cutlass.AddressSpace.smem)
@@ -447,7 +450,8 @@ def _kernel(
     first_token_arr = cutlass.make_array_view(first_token_offset)
 
     if warp_idx == scheduler_warp_id:
-        nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
+        if cutlass.const_expr(not moe_combine_swap_bulk_enabled):
+            nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
         full_warp_mask = 0xFFFFFFFF
         shfl_idx_clamp = 0x1F
         shfl_up_clamp = 0
@@ -727,7 +731,8 @@ def _kernel(
                     pass
 
     if warp_idx == tma_warp_id:
-        nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
+        if cutlass.const_expr(not moe_combine_swap_bulk_enabled):
+            nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
         if cutlass.const_expr(USE_PDL):
             nvvm.griddepcontrol("wait")
         ab_empty_phase_bit = cutlass.Int32(1)
@@ -762,13 +767,13 @@ def _kernel(
         ]
         sfb_block_bytes = 512 * (((k // block_size) + 3) // 4)
         previous_group_begin = cutlass.Int32(-1)
-        if cutlass.const_expr(moe_aligned_offsets or moe_gather):
+        if cutlass.const_expr(moe_aligned_offsets or moe_gather or moe_combine_swap_bulk_enabled):
             b_desc_load_list = [tma_b_descs[_ai].get_ptr() for _ai in range(num_b_operands)]
             sfb_desc_load_list = [tma_sfb_descs[_ai].get_ptr() for _ai in range(num_sfb_operands)]
         else:
             b_desc_load_list = b_desc_tma_ptr_list
             sfb_desc_load_list = sfb_desc_tma_ptr_list
-        if elect_one and cutlass.const_expr(not moe_aligned_offsets and not moe_gather):
+        if elect_one and cutlass.const_expr(not moe_aligned_offsets and not moe_gather and not moe_combine_swap_bulk_enabled):
             for _ai in cutlass.range_constexpr(num_b_operands):
                 _copy_tensormap_to_workspace(tma_b_descs[_ai].get_ptr(), tma_b_desc_smem_list[_ai])
             for _ai in cutlass.range_constexpr(num_sfb_operands):
@@ -802,15 +807,18 @@ def _kernel(
             if is_valid != 0:
                 coord_m_weight = tile_m * cgrp_tile_mnk[0] + m_rank * cta_tile_mnk[0]
                 coord_n_group = tile_n * cgrp_tile_mnk[1] + n_rank * (cta_tile_mnk[1] * cta_group)
-                if cutlass.const_expr(moe_aligned_offsets or moe_gather):
+                if cutlass.const_expr(moe_aligned_offsets or moe_gather or moe_combine_swap_bulk_enabled):
                     coord_n_desc = group_begin + coord_n_group
                 else:
                     coord_n_desc = coord_n_group
                 coord_n_per_cta = coord_n_desc + pair_member * cta_tile_mnk[1]
                 sfa_m_block = coord_m_weight // 128
-                sfb_n_block = coord_n_desc // 128
+                if cutlass.const_expr(moe_combine_swap_bulk_enabled):
+                    sfb_n_block = start_sf_block_n + coord_n_group // 128
+                else:
+                    sfb_n_block = coord_n_desc // 128
 
-                if group_begin != previous_group_begin and cutlass.const_expr(not moe_aligned_offsets and not moe_gather):
+                if group_begin != previous_group_begin and cutlass.const_expr(not moe_aligned_offsets and not moe_gather and not moe_combine_swap_bulk_enabled):
                     previous_group_begin = group_begin
                     for _ai in cutlass.range_constexpr(num_b_operands):
                         _fence_tensormap_acquire(b_desc_tma_ptr_list[_ai])
@@ -1012,7 +1020,8 @@ def _kernel(
         else:
             ab_empty_arrive_mask = cutlass.Int16(a_part | b_part)
     if warp_idx == mma_warp_id:
-        nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
+        if cutlass.const_expr(not moe_combine_swap_bulk_enabled):
+            nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
         _tcgen05_alloc(
             tmem_ptr_i32,
             cutlass.Int32(num_tmem_alloc_cols),
@@ -1633,7 +1642,8 @@ def _kernel(
                 )
 
     if warp_idx < num_epilogue_warps:
-        nvvm.setmaxregister(epi_reg_count, nvvm.SetMaxRegisterAction.INCREASE)
+        if cutlass.const_expr(not moe_combine_swap_bulk_enabled):
+            nvvm.setmaxregister(epi_reg_count, nvvm.SetMaxRegisterAction.INCREASE)
         nvvm.barrier_cta_sync(barrier_id=TMEM_ALLOC_BARRIER_ID, thread_count=tmem_alloc_bar_count)
         tmem_raw_addr = tmem_ptr_i32.load()
         base_col_id_root = tmem_raw_addr & 0xFFFF
@@ -1764,37 +1774,106 @@ def _kernel(
                     acc_buf_parity = cutlass.Int32(0)
                     acc_base_col = base_col_id_root + acc_stage * acc_region_cols
 
-                for mi in cutlass.range_constexpr(mma_size_m):
-                    if cutlass.const_expr(use_acc_overlap and mma_size_m > 1):
-                        _mi = mi + (1 - acc_buf_parity) * (mma_size_m - 1 - 2 * mi)
-                    else:
-                        _mi = mi
-                    coord_m = coord_m_tile + _mi * epi_rows_per_mma_m
-                    mi_col_base = acc_base_col + _mi * epi_cols_per_mma_m
-                    tmem_col_addr_gemms = [(row_id_with_warp_offset << 16) | (mi_col_base + g * acc_gemm_stride) for g in range(num_gemms)]
-
-                    row = coord_m + tidx
-                    row_active = True
-
-                    # @@INJECT_AUX_VIEWS@@
-
-                    for subtile_idx in cutlass.range_constexpr(subtile_cnt):
-                        if cutlass.const_expr(use_acc_overlap):
-                            _sub = subtile_idx + (1 - acc_buf_parity) * (subtile_cnt - 1 - 2 * subtile_idx)
-                            subtile_col_offset = _sub * epi_n
-                            subtile_w = epi_n
+                if cutlass.const_expr(moe_combine_swap_bulk_enabled):
+                    # Complete both 128-feature M fragments before reducing a
+                    # token row. Metadata is loaded once per warp/token batch.
+                    for combine_subtile in cutlass.range_constexpr(subtile_cnt):
+                        combine_col = coord_n_c + combine_subtile * epi_n
+                        combine_weights = []
+                        for combine_batch in cutlass.range_constexpr(epi_n // 32):
+                            combine_route = combine_col + combine_batch * 32 + lane
+                            combine_weight = cutlass.Float32(0.0)
+                            if combine_route < group_end:
+                                combine_token = token_index[combine_route]
+                                combine_slot = token_ks[combine_route]
+                                if (combine_token >= 0) & (combine_token < top_k_scores.shape[0]) & (combine_slot >= 0) & (combine_slot < moe_top_k):
+                                    combine_weight = top_k_scores[combine_token, combine_slot]
+                            combine_weights.append(combine_weight)
+                        for combine_mi in cutlass.range_constexpr(mma_size_m):
+                            # Two 64-column loads avoid keeping 128 accumulators
+                            # live alongside routing metadata and spilling.
+                            for combine_chunk in cutlass.range_constexpr(epi_n // 64):
+                                combine_tmem_col = acc_base_col + combine_mi * epi_cols_per_mma_m + combine_subtile * epi_n + combine_chunk * 64
+                                combine_tmem_addr = (row_id_with_warp_offset << 16) | combine_tmem_col
+                                combine_tmem = cutlass.inttoptr(combine_tmem_addr, 6, mma_c_dtype)
+                                combine_values = nvvm.tcgen05_ld(shape, combine_tmem, num=64)
+                                if cutlass.const_expr(combine_mi == mma_size_m - 1 and combine_subtile == subtile_cnt - 1 and combine_chunk == epi_n // 64 - 1):
+                                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                                    nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
+                                    if elect_one:
+                                        nvvm.mbarrier_arrive(
+                                            nvvm.mapa(acc_empty_mbar_ptr.subview(acc_stage), pair_leader_rank),
+                                            scope=nvvm.MemScope.CLUSTER,
+                                            relaxed=True,
+                                        )
+                                for combine_j in cutlass.range_constexpr(64):
+                                    combine_logical_j = combine_chunk * 64 + combine_j
+                                    combine_score = cute.arch.shuffle_sync(combine_weights[combine_logical_j // 32], cutlass.Int32(combine_logical_j % 32))
+                                    combine_value = combine_values[combine_j] * combine_score
+                                    combine_offset = combine_logical_j * (128 * mma_size_m) + combine_mi * 128 + tidx
+                                    combine_staging.data_ptr(combine_offset).store(combine_value.to(cutlass.BFloat16))
+                        moe_combine_swap_bulk(
+                            combine_staging.data_ptr(0),
+                            gC_tap_0_ptr,
+                            token_index,
+                            token_ks,
+                            top_k_scores,
+                            coord_m_tile,
+                            combine_col,
+                            group_end,
+                            M,
+                            out_stride_m_0,
+                            out_stride_n_0,
+                            tidx,
+                            moe_top_k,
+                            epi_n,
+                            128 * mma_size_m,
+                        )
+                else:
+                    for mi in cutlass.range_constexpr(mma_size_m):
+                        if cutlass.const_expr(use_acc_overlap and mma_size_m > 1):
+                            _mi = mi + (1 - acc_buf_parity) * (mma_size_m - 1 - 2 * mi)
                         else:
-                            subtile_col_offset, subtile_w = epi_spans[subtile_idx]
-                        c_rmem_vecs = []
-                        for g in cutlass.range_constexpr(num_gemms):
-                            subtile_tmem_addr = tmem_col_addr_gemms[g] + subtile_col_offset
-                            tmem = cutlass.inttoptr(subtile_tmem_addr, 6, mma_c_dtype)
-                            _cv = nvvm.tcgen05_ld(shape, tmem, num=subtile_w)
-                            c_rmem_vecs.append(_cv)
-                        c_rmem_vec = c_rmem_vecs[0]
+                            _mi = mi
+                        coord_m = coord_m_tile + _mi * epi_rows_per_mma_m
+                        mi_col_base = acc_base_col + _mi * epi_cols_per_mma_m
+                        tmem_col_addr_gemms = [(row_id_with_warp_offset << 16) | (mi_col_base + g * acc_gemm_stride) for g in range(num_gemms)]
 
-                        if cutlass.const_expr(not use_acc_overlap):
-                            if cutlass.const_expr(mi == mma_size_m - 1 and subtile_idx == subtile_cnt - 1):
+                        row = coord_m + tidx
+                        row_active = True
+
+                        # @@INJECT_AUX_VIEWS@@
+
+                        for subtile_idx in cutlass.range_constexpr(subtile_cnt):
+                            if cutlass.const_expr(use_acc_overlap):
+                                _sub = subtile_idx + (1 - acc_buf_parity) * (subtile_cnt - 1 - 2 * subtile_idx)
+                                subtile_col_offset = _sub * epi_n
+                                subtile_w = epi_n
+                            else:
+                                subtile_col_offset, subtile_w = epi_spans[subtile_idx]
+                            c_rmem_vecs = []
+                            for g in cutlass.range_constexpr(num_gemms):
+                                subtile_tmem_addr = tmem_col_addr_gemms[g] + subtile_col_offset
+                                tmem = cutlass.inttoptr(subtile_tmem_addr, 6, mma_c_dtype)
+                                _cv = nvvm.tcgen05_ld(shape, tmem, num=subtile_w)
+                                c_rmem_vecs.append(_cv)
+                            c_rmem_vec = c_rmem_vecs[0]
+
+                            if cutlass.const_expr(not use_acc_overlap):
+                                if cutlass.const_expr(mi == mma_size_m - 1 and subtile_idx == subtile_cnt - 1):
+                                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                                    nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
+                                    if elect_one:
+                                        if cutlass.const_expr(cta_group == 2):
+                                            nvvm.mbarrier_arrive(
+                                                nvvm.mapa(acc_empty_mbar_ptr.subview(acc_stage), pair_leader_rank),
+                                                scope=nvvm.MemScope.CLUSTER,
+                                                relaxed=True,
+                                            )
+                                        else:
+                                            nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage))
+
+                            if use_acc_overlap and mi * subtile_cnt + subtile_idx == acc_overlap_subtiles - 1:
                                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                                 nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                                 if elect_one:
@@ -1807,42 +1886,29 @@ def _kernel(
                                     else:
                                         nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage))
 
-                        if use_acc_overlap and mi * subtile_cnt + subtile_idx == acc_overlap_subtiles - 1:
-                            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                            nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                            if elect_one:
-                                if cutlass.const_expr(cta_group == 2):
-                                    nvvm.mbarrier_arrive(
-                                        nvvm.mapa(acc_empty_mbar_ptr.subview(acc_stage), pair_leader_rank),
-                                        scope=nvvm.MemScope.CLUSTER,
-                                        relaxed=True,
-                                    )
-                                else:
-                                    nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage))
+                            col = coord_n_c + subtile_col_offset
 
-                        col = coord_n_c + subtile_col_offset
+                            # @@TMA_STORE_ONLY:BEGIN@@
+                            vec_f32 = c_rmem_vec
+                            col_j = col
+                            linear_idx = tile_l * out_stride_l_0 + row * out_stride_m_0 + col_j * out_stride_n_0
 
-                        # @@TMA_STORE_ONLY:BEGIN@@
-                        vec_f32 = c_rmem_vec
-                        col_j = col
-                        linear_idx = tile_l * out_stride_l_0 + row * out_stride_m_0 + col_j * out_stride_n_0
+                            # @@INJECT_EPILOGUE@@
 
-                        # @@INJECT_EPILOGUE@@
+                            # @@INJECT_TMA_STORE_SEQUENCE@@
+                            # @@TMA_STORE_ONLY:END@@
 
-                        # @@INJECT_TMA_STORE_SEQUENCE@@
-                        # @@TMA_STORE_ONLY:END@@
+                            # @@STG_ONLY:BEGIN@@
+                            if row_active and row < M:
+                                for j in cutlass.range_constexpr(subtile_w // vsize):
+                                    col_j = col + j * vsize
+                                    if col_j < group_end:
+                                        vec_f32 = c_rmem_vec[j * vsize : (j + 1) * vsize]
 
-                        # @@STG_ONLY:BEGIN@@
-                        if row_active and row < M:
-                            for j in cutlass.range_constexpr(subtile_w // vsize):
-                                col_j = col + j * vsize
-                                if col_j < group_end:
-                                    vec_f32 = c_rmem_vec[j * vsize : (j + 1) * vsize]
+                                        # @@INJECT_STG_VEC_BINDINGS@@
 
-                                    # @@INJECT_STG_VEC_BINDINGS@@
-
-                                    # @@INJECT_EPILOGUE@@
-                        # @@STG_ONLY:END@@
+                                        # @@INJECT_EPILOGUE@@
+                            # @@STG_ONLY:END@@
 
                 # The M-major TMA path loads its accumulator inside the store loop, so its release cannot move up.
                 # @@EPILOGUE_DRAIN:END@@
@@ -1855,7 +1921,8 @@ def _kernel(
                 nvvm.mbarrier_arrive(tmem_dealloc_mbar_ptr)
 
     if warp_idx == unused_warp_id:
-        nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
+        if cutlass.const_expr(not moe_combine_swap_bulk_enabled):
+            nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
 
 
 _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -1961,7 +2028,12 @@ def _host(
         )
     rest_k = ((k_sym // block_size) + 3) // 4
     rest_m = (m + 127) // 128
-    rest_n = (n + 127) // 128 + num_groups
+    if cutlass.const_expr(moe_combine_swap_bulk_enabled):
+        # Sum ceil(group_rows / 128), bounded using at most min(n, G) nonempty groups.
+        nonempty = cutlass.min(n, num_groups)
+        rest_n = nonempty + (n - nonempty) // 128
+    else:
+        rest_n = (n + 127) // 128 + num_groups
     tma_sfa_desc_list = []
     for _sfa_op in _sfa_operands:
         sfa_fp16_tensor = cute.make_tensor(
@@ -2048,6 +2120,7 @@ def _host(
         block=(threads_per_cta, 1, 1),
         cluster=cluster_shape_mnk,
         use_pdl=USE_PDL,
+        # @@INJECT_SWAP_COMBINE_LAUNCH@@
         stream=stream,
     )
 

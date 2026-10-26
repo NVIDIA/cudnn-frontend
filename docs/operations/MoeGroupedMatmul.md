@@ -193,6 +193,24 @@ groups and repeated CUDA Graph replays. Out-of-range token/slot indices are
 ignored. Repeated destinations accumulate; destinations without contributions
 are zero. N-major and M-major output layouts, including padding, are supported.
 
+For NVFP4 on SM107, the non-swap, single-CTA/singleton-cluster FROST path can
+read compact token rows through immutable tensor maps. Expert token counts do
+not need additional padding: COMBINE masks group-tail rows before reading
+routing metadata or accumulating outputs. Token scales retain their existing
+per-group 128-row blocked layout and use independent scale-block offsets. The
+scale tensor map is bounded by the declared segmented-capacity contract,
+including when the last TMA box extends beyond that capacity. Other layouts
+and configurations retain their existing descriptor path.
+
+The SM107 NVFP4 swapped `256x256x128`, `128x256x64` MMA, cluster `2x1`,
+2-CTA tile also reuses immutable B/SFB maps with BF16 feature-contiguous output.
+It transposes weighted fragments into a 128-token by 256-feature shared tile,
+then bulk-reduces each token's contiguous feature segment. Warp-shared routing
+loads and 64-column TMEM loads limit metadata traffic and live registers. The
+compiler reserves this staging space before sizing the AB pipeline. Partial
+feature segments or unaligned destinations use scalar reductions. This path
+does not require expert token counts or output widths to match the tile.
+
 ```python
 output = graph.moe_grouped_matmul(
     fc2_input, fc2_weight, first_token_offset,
@@ -220,9 +238,13 @@ it does not materialize `[T*k,N]` results or launch a separate finalizer.
 For token-by-weight GEMM with contiguous output features, each lane packs up to
 eight BF16/FP16 or four FP32 contributions into a 16-byte vector atomic add.
 The destination address selects narrower accesses when the output pointer or
-row stride is unaligned. Weight-by-token (`SWAP_AB`) and M-major outputs retain
+row stride is unaligned. SM100 block-scaled token-by-weight kernels with
+128-row per-CTA MMA slices instead stage weighted feature tiles in shared memory
+and issue `cp.reduce.async.bulk` once per row. Unaligned destinations and partial
+feature tiles retain vector/scalar atomics. Shared-memory staging is included
+in the GEMM pipeline budget. Weight-by-token (`SWAP_AB`) and M-major outputs retain
 scalar atomics because adjacent registers do not address adjacent features of
-the same token. Vectorization preserves per-element atomicity and output-dtype
+the same token. Both paths preserve per-element atomicity and output-dtype
 accumulation.
 Output zeroing uses `cudaMemsetAsync` for contiguous storage and
 `cudaMemset2DAsync` for padded row/column-major storage, preserving padding.
