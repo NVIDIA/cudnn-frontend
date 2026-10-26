@@ -8,7 +8,7 @@ from contextlib import nullcontext
 import torch
 
 from cudnn.sdpa.bwd.api_dsl import SdpaBwdDsl
-from .d128_contract import ACCUMULATION, select_implementation, validate_dense_bounds, workspace_layout
+from .d128_contract import ACCUMULATION, RECOMPUTE, select_implementation, validate_dense_bounds, workspace_layout
 
 
 class SdpaBwdDslSm100D128(SdpaBwdDsl):
@@ -120,7 +120,6 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
         require(not self.seq_q_lens_present and not self.seq_kv_lens_present, "padding masks are not supported")
         require(not self.causal_bottom_right, "bottom-right causal is not supported")
         require(self.window_size_left is None and self.window_size_right is None, "sliding windows and right-band widening are not supported")
-        require(not self.deterministic, "use_deterministic_algorithm is not claimed")
         require(all(d is None for d in (self.sink_desc, self.dsink_desc, self.bias_desc, self.dbias_desc)), "sink / dSink and bias / dBias are not supported")
         require(self.tile_m is None and self.tile_n is None, "the kernel has fixed tile geometry")
         for role in ROLES[:9]:
@@ -152,7 +151,10 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
         self.head_dim_qk = self.head_dim_v = 128
         self.scale_softmax = 128**-0.5 if self.scale_softmax is None else float(self.scale_softmax)
         require(math.isfinite(self.scale_softmax) and self.scale_softmax != 0, "attn_scale must be finite and nonzero")
-        self._implementation = select_implementation(cc, version, int(b), int(h), int(sq), int(sk), self.scale_softmax)
+        # The recompute body owns each gradient tile in one CTA and visits
+        # reduction tiles in a fixed order. The accumulation body uses unordered
+        # FP32 dQ reductions, so it cannot serve a deterministic request.
+        self._implementation = RECOMPUTE if self.deterministic else select_implementation(cc, version, int(b), int(h), int(sq), int(sk), self.scale_softmax)
         self._is_supported = True
         return True
 

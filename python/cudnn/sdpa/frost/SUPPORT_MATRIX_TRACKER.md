@@ -370,14 +370,19 @@ and other architectures are unchanged; this does not qualify their padded offset
 
 The opt-in **d128 backward** (`sdpa_bwd_sm100_d128`, engine 20609) selects
 its implementation at plan build. On SM100 or SM103 with public CuTeDSL >= 4.8 and a
-positive FP32-representable scale it launches row delta plus dQ initialization, the
+positive FP32-representable scale, when determinism is not requested it launches row delta plus dQ initialization, the
 five-product main kernel, then an FP32 to output-dtype dQ conversion, for any
 query/key lengths (tail tiles are zero-filled on load and clipped on store). The main
 kernel writes dK/dV directly and accumulates dQ in FP32 caller workspace. The cast
 applies no additional scale.
 
-Other dense MHA declarations in the existing envelope retain the one-launch recompute
-implementation with zero workspace, including negative scales and older CuTeDSL.
+Dense MHA requests for `use_deterministic_algorithm=True` use the one-launch
+recompute implementation with zero workspace: one CTA owns each gradient tile
+and visits its reduction tiles in a fixed order, without inter-CTA accumulation.
+Other dense MHA declarations in the existing envelope retain that implementation
+for negative scales and older CuTeDSL. Unrequested determinism retains the usual
+implementation selection. THD and grouped dQ accumulation remain unordered and
+decline deterministic requests.
 Both dense paths decline declarations beyond safe Int32 tile rounding, Stats
 indexing or combined Q/KV grid bounds, or the tensor-map byte-stride range;
 the exact conservative limits are documented in the d128 backward API page.
@@ -394,11 +399,12 @@ the allocation contract. All scratch is initialized each execution.
 | Unmasked / top-left causal | ✅ |
 | IO layout | Compact BSHD rows; THD uses each port's ragged origins and ignores logical batch pitch |
 | Stats | Dense: contiguous FP32 natural-log LSE; THD: packed token-major or head-major with declared physical capacity |
-| Workspace / kernel launches | MHA: dense accumulation (any lengths) / 3, retained dense recompute (older CuTeDSL, negative scale) / 1, THD accumulation / 4. GQA/MQA: append native dK/dV partials and an FP32 group fold; dense / 4, THD / 5 |
+| Workspace / kernel launches | MHA: dense accumulation (any lengths) / 3, dense recompute (deterministic request, older CuTeDSL, negative scale) / 1, THD accumulation / 4. GQA/MQA: append native dK/dV partials and an FP32 group fold; dense / 4, THD / 5 |
 | THD MHA | ✅ cc 10.0 or 10.3, public CuTeDSL >= 4.8, positive FP32 scale, positive declared capacities; actual empty sequences and tails supported |
 | GQA / MQA | ✅ BF16 only, cc 10.0 or 10.3, public CuTeDSL >= 4.8, positive FP32 scale, Hq > Hkv with integral ratio; dense Sq/Skv must be multiples of 128, THD accepts tails and empty actual sequences |
 | Bottom-right causal, sliding window, dense padding mask, right-band widening | ❌ |
-| Bias / dBias, sink / dSink, dropout, deterministic request | ❌ |
+| Deterministic request | ✅ dense MHA, via fixed-order recompute; ❌ THD / GQA / MQA |
+| Bias / dBias, sink / dSink, dropout | ❌ |
 | Zero attention scale | ❌ |
 
 A compiled accumulation plan accepts runtime scalar overrides only when both
