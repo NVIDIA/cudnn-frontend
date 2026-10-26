@@ -3072,12 +3072,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # on the flavors config_sm100._PAGED_KV_FLAVORS names (the same set
             # its _validate_params backstops, and engines' paged_d_shapes) and of
             # the d64/d128/d256 per-tensor FP8 and the MXFP8 kernels; every kernel file without it (
-            # the SM107 half and per-tensor FP8 siblings and the SM107 d192x128 / d512
+            # the unwired SM107 half and per-tensor FP8 siblings and the SM107 d192x128 / d512
             # MXFP8 siblings, the d192x128 / d512 FP8 flavors, the d512
             # 2x2-datapath twin) backstops
             # with a module-scope guard on paged_kv, and these declines keep that
             # guard unreachable from here.  On cc 10.7: half pools serve THD queries
-            # (the shared SM100 bodies), MXFP8 pools serve dense queries on d128 / d256
+            # (native D128 or the remaining shared SM100 bodies), MXFP8 pools serve dense queries on d128 / d256
             # (the sm107 siblings' own PAGED_KV loader); per-tensor FP8 pools and dense
             # half queries are not wired (engines.mismatch's Rubin clause is the twin).
             # The d256 DECODE tile (sm107/decode_d256_f16.py) walks the block table itself and
