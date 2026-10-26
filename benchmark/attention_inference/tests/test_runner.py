@@ -5,7 +5,9 @@
 
 from dataclasses import replace
 import subprocess
+import importlib.util
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -105,6 +107,28 @@ class PageSizeTest(unittest.TestCase):
         cmd = run.call_args.args[0]
         self.assertEqual((cmd[cmd.index("--kv_layout") + 1], cmd[cmd.index("--kv_min_fill") + 1]), ("paged", "0.25"))
         self.assertEqual((result.kv_layout, result.kv_min_fill), ("paged", 0.25))
+
+    def test_b12x_sliding_window_generation_is_dense(self):
+        swa = replace(QWEN35.models[0], sliding_window_size=128)
+        cases = list(self.runner.expand_config(replace(QWEN35, models=[swa], backends=["b12x"], context_seqlens=[], context_chunked_shapes=[])))
+        self.assertEqual({c["kv_layout"] for c in cases}, {"dense"})
+
+
+@unittest.skipUnless(importlib.util.find_spec("torch"), "request_lens builds torch tensors")
+class RequestLensTest(unittest.TestCase):
+    def test_request_lens_is_deterministic_and_bounded(self):
+        from benchmark.attention_inference.benchmark_single_attention import request_lens
+
+        args = SimpleNamespace(batch_size=64, q_tokens=4, kv_len=8192, phase="generation", kv_min_fill=0.25)
+        q, kv = request_lens(args)
+        q2, kv2 = request_lens(args)
+        self.assertTrue(bool((kv == kv2).all()) and bool((q == q2).all()))  # setup and the FLOP count see the same batch
+        self.assertTrue(bool(((kv >= 2048) & (kv <= 8192)).all()) and bool((q == 4).all()))
+        self.assertGreater(len(set(kv.tolist())), 1)
+        _, kv_full = request_lens(SimpleNamespace(**{**vars(args), "kv_min_fill": 1.0}))
+        self.assertTrue(bool((kv_full == 8192).all()))
+        q_ctx, kv_ctx = request_lens(SimpleNamespace(batch_size=2, q_tokens=4096, kv_len=4096, phase="context", kv_min_fill=0.25))
+        self.assertTrue(bool((q_ctx == 4096).all()) and bool((kv_ctx == 4096).all()))  # fill is a generation axis
 
 
 if __name__ == "__main__":

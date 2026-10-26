@@ -36,11 +36,13 @@ PAGED_BACKENDS = ("flashinfer", "flash_mla", "b12x")
 CUDNN_LEGS = ("cudnn", "cudnn_oss", "cudnn_auto")
 
 
-def kv_layouts_for(config, backend, phase) -> List[str]:
+def kv_layouts_for(config, backend, phase, model=None) -> List[str]:
     """The cudnn legs sweep ``config.kv_layouts``; every other backend runs its native layout once (the paged-KV backends
-    page their generation cache; their prefill reads contiguous K/V)."""
+    page their generation cache, except b12x's dense sliding-window GQA fallback; their prefill reads contiguous K/V)."""
     if backend in CUDNN_LEGS:
         return list(config.kv_layouts)
+    if backend == "b12x" and model is not None and model.kind == "gqa" and model.sliding_window_size:
+        return ["dense"]
     return ["paged" if backend in PAGED_BACKENDS and phase == "generation" else "dense"]
 
 
@@ -132,7 +134,7 @@ class InferenceBenchmarkRunner:
                                 "kv_layout": kv_layout,
                                 "kv_min_fill": 1.0,
                             }
-                    for kv_layout in kv_layouts_for(config, backend, "generation"):
+                    for kv_layout in kv_layouts_for(config, backend, "generation", model):
                         for q_tokens, kv_len in config.generation_shapes:
                             for batch in config.generation_batch_sizes:
                                 # mixed cache lengths need a batch to mix

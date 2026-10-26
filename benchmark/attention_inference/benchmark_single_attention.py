@@ -379,6 +379,7 @@ def setup_cudnn_fp8(args, cudnn, oss=False, auto=False):
     # note in setup_cudnn.
     q_gpu = (torch.randn(b, sq, hq, dqk, device="cuda") * 0.1).to(f8).transpose(1, 2)
     paged = args.kv_layout == "paged"
+    q_lens = kv_lens = table = None
     if paged:
         q_lens, kv_lens = request_lens(args)
         k_gpu, v_gpu, table = _paged_pool(args, kv_lens, lambda shape: (torch.randn(*shape, device="cuda") * 0.1).to(f8))
