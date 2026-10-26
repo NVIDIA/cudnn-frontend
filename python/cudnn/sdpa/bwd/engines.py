@@ -1684,6 +1684,8 @@ def _sm107_d512_spec() -> EngineSpec:
 def _sm100_d128_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
     """Pure declaration bounds shared with the dense, THD and grouped adapters."""
     grouped = facts.h_q != facts.h_kv
+    if facts.deterministic and (facts.thd or grouped):
+        return "d128 deterministic backward requires dense MHA; THD and grouped dQ accumulation is unordered"
     if not facts.thd and not grouped:
         from .d128_contract import validate_dense_bounds
 
@@ -1785,6 +1787,7 @@ def _sm100_d128_spec() -> EngineSpec:
             sm_hi=106,
             d=frozenset({128}),
             causal=True,
+            deterministic=True,  # dense MHA only: declaration_check selects the fixed-order recompute contract
             compact_bshd=True,
             thd=True,
             thd_declared_totals=True,

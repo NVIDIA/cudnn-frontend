@@ -49,6 +49,7 @@ def _reason(monkeypatch, cc=(10, 0), **kw):
     "kw",
     [
         dict(dt=torch.float16),
+        dict(use_deterministic_algorithm=True),
         dict(sq=1, skv=65),
         dict(sq=257, skv=129),
     ],
@@ -68,7 +69,8 @@ def test_dense_graph_accepts(monkeypatch, kw):
         (dict(padded=True), "padding mask"),
         (dict(bias=True), "bias"),
         (dict(sink=True), "Sink"),
-        (dict(use_deterministic_algorithm=True), "deterministic"),
+        (dict(hq=4, hkv=2, use_deterministic_algorithm=True), "deterministic"),
+        (dict(thd=True, use_deterministic_algorithm=True), "deterministic"),
     ],
 )
 def test_dense_graph_declines(monkeypatch, kw, token):
@@ -138,7 +140,9 @@ def test_adapter_backstops_decline_unsupported_declarations(monkeypatch, kw, tok
         api.check_support()
 
 
-def _case(dt=torch.bfloat16, causal=False, b=1, h=2, sq=65, sk=129, seed=729, check_build=False, accumulation=False, scale=None, allow_zero=False):
+def _case(
+    dt=torch.bfloat16, causal=False, b=1, h=2, sq=65, sk=129, seed=729, check_build=False, accumulation=False, scale=None, allow_zero=False, deterministic=False
+):
     """``accumulation`` True = the default accumulation route; False = pin the recompute kernel (``_recompute_route``);
     None = leave the selection alone and expect recompute as the natural fallback (e.g. a negative scale).
     ``allow_zero`` = compare an identically-zero oracle gradient by absolute tolerance instead of demanding exact zeros
@@ -159,7 +163,17 @@ def _case(dt=torch.bfloat16, causal=False, b=1, h=2, sq=65, sk=129, seed=729, ch
     )
     # The implementation is chosen while the plans are created, so the pin spans the whole build.
     with _recompute_route() if accumulation is False else nullcontext():
-        graph, refs, outputs = _build_graph(b=b, hq=h, sq=sq, skv=sk, d=128, dt=dt, use_causal_mask=causal, scale="default" if scale is None else scale)
+        graph, refs, outputs = _build_graph(
+            b=b,
+            hq=h,
+            sq=sq,
+            skv=sk,
+            d=128,
+            dt=dt,
+            use_causal_mask=causal,
+            scale="default" if scale is None else scale,
+            use_deterministic_algorithm=deterministic,
+        )
         select_engine(graph, _ENGINE)
         before = torch.cuda.memory_allocated()
         if check_build:
@@ -240,8 +254,9 @@ def test_one_launch_without_workspace_allocation_or_sync():
 
 @requires_pre_rubin_blackwell
 @pytest.mark.parametrize("dt,causal", [(torch.bfloat16, False), (torch.float16, True)], ids=["bf16-unmasked", "fp16-causal"])
-def test_rebind_and_replay(dt, causal):
-    case = _case(dt=dt, causal=causal, b=2, h=3)
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_rebind_and_replay(dt, causal, deterministic):
+    case = _case(dt=dt, causal=causal, b=2, h=3, deterministic=deterministic, accumulation=None if deterministic else False)
     tensors = {name: value.clone() for name, value in case.tensors.items()}
     pack = {case.refs[name]: value for name, value in tensors.items()}
     stream, other = torch.cuda.Stream(), torch.cuda.Stream()
@@ -309,3 +324,48 @@ def test_replan_reloads_artifact_without_compilation(monkeypatch, tmp_path):
         _check_case(case)
     finally:
         capture.reset()
+
+
+@requires_pre_rubin_blackwell
+@pytest.mark.parametrize("dt", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("sq,sk", [(257, 193), (1024, 1153)])
+def test_deterministic_dense_mha_repeated_eager_and_replay(dt, causal, sq, sk, cudnn_handle):
+    """Request determinism through the public graph without pinning its implementation.
+
+    Each gradient has one owner and a fixed reduction order. Verify all three
+    against FP64, then require bitwise repeatability after output poisoning in
+    eager execution and retained CUDA-graph replay.
+    """
+    original_stream = cudnn.get_stream(cudnn_handle)
+    capture = None
+    try:
+        case = _case(dt=dt, causal=causal, b=2, h=3, sq=sq, sk=sk, deterministic=True, accumulation=None)
+        expected_bits = {name: case.tensors[name].clone() for name in ("dq", "dk", "dv")}
+        stream = torch.cuda.Stream()
+        cudnn.set_stream(cudnn_handle, stream.cuda_stream)
+        capture = torch.cuda.CUDAGraph()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.graph(capture, stream=stream):
+            case.graph.execute(case.pack, None, handle=cudnn_handle)
+        for replay in (False, True):
+            for _ in range(3):
+                for name in expected_bits:
+                    case.tensors[name].fill_(float("nan"))
+                torch.cuda.set_sync_debug_mode("error")
+                try:
+                    if replay:
+                        capture.replay()
+                    else:
+                        case.graph.execute(case.pack, None)
+                finally:
+                    torch.cuda.set_sync_debug_mode("default")
+                torch.cuda.synchronize()
+                for name, expected in expected_bits.items():
+                    assert torch.equal(case.tensors[name], expected), f"{name} changed across identical deterministic executions"
+    finally:
+        try:
+            if capture is not None:
+                capture.reset()
+        finally:
+            cudnn.set_stream(cudnn_handle, original_stream)

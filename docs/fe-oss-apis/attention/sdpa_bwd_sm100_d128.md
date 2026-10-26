@@ -8,7 +8,8 @@ supports both dtypes. Dense and THD GQA/MQA initially support BF16 only. Packed
 and grouped paths require SM100 or SM103 (cc 10.0 or 10.3), CuTeDSL 4.8 or newer and
 positive FP32 attention scale. Grouped dense lengths must be multiples of 128;
 packed grouped lengths may have tails or empty actual sequences. Other masks,
-bias, sinks, dropout and deterministic requests are declined.
+bias, sinks and dropout are declined. Dense MHA supports deterministic requests;
+the packed and grouped paths still decline them.
 
 Use the ordinary cuDNN graph preparation and execution API. After building
 and selecting a plan, allocate the size reported by that plan:
@@ -20,13 +21,18 @@ graph.execute(variant_pack, workspace)
 
 Plan construction selects the implementation from declarations and the build
 device. On SM100 or SM103 with public CuTeDSL 4.8 or newer and a positive attention
-scale, the MHA three-kernel chain computes the row delta while initializing FP32 dQ
+scale and no deterministic request, the MHA three-kernel chain computes the row delta while initializing FP32 dQ
 scratch, accumulates dQ and writes dK/dV, then converts dQ to the output type.
 Sequence lengths need not be multiples of 128: the tail tiles' loads are zero-filled,
 their stores and dQ reductions are clipped, and the tail Stats rows contribute nothing.
 The output conversion applies no extra scale. Its scratch size is
 `4 * B * H * round_up(S_q, 128) * 129 + 240` bytes. The final 240 bytes cover internal
 alignment for any valid 16-byte-aligned caller workspace.
+
+Dense MHA with `use_deterministic_algorithm=True` selects the one-kernel recompute
+implementation: a single CTA owns each gradient tile and reduces in a fixed order,
+without inter-CTA atomics. It requires zero workspace and supports both unmasked
+and top-left causal attention. The choice is made when the plan is built.
 
 Other dense MHA declarations in the existing envelope, including negative finite
 nonzero scales and older CuTeDSL releases, retain the one-kernel implementation with
@@ -52,7 +58,7 @@ initializes its scratch each time, and performs no allocation, layout copy or
 device-to-host read. The plan supports CUDA-graph capture and replay. FP32 dQ
 atomic accumulation does not promise bitwise repeatability.
 
-The three-kernel implementation is selected on SM100 and SM103. Existing support
+The three-kernel implementation is selected on SM100 and SM103 when determinism is not requested. Existing support
 on other pre-Rubin Blackwell devices retains the previous implementation.
 The engine remains opt-in while performance qualification proceeds.
 
