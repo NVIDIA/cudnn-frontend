@@ -333,7 +333,7 @@ def test_block_scale_default_folds_out_of_the_template():
         ]
     ), f"a read of block_scale outside the const_expr fold reached the template: {census}"
     assert len(guards) == src.count("if cutlass.const_expr(_BLOCK_SCALE):") >= 2, "every guard is a plain `if cutlass.const_expr(_BLOCK_SCALE):` statement"
-    assert {traced_function(g) for g in guards} == {"_bprop_matmul_bh_sm100_kernel", "_host"}
+    assert {traced_function(g) for g in guards} == {"_bprop_matmul_bh_sm100_kernel", "_host_chain"}
 
     # (3) every use of the arm's machinery inside a traced function sits inside one of those guard bodies
     spans = [(g.body[0].lineno, g.body[-1].end_lineno) for g in guards]
@@ -361,9 +361,12 @@ def test_block_scale_default_folds_out_of_the_template():
                 if isinstance(p, ast.Attribute) and p.attr == "get_ptr":  # the descriptor's use: prefetch, TMA load
                     assert guarded(n), f"line {n.lineno} ({fn}): {n.id}.get_ptr() outside a const_expr(_BLOCK_SCALE) body"
                 else:  # the bare name is the kernel launch argument (None at the default)
-                    assert fn == "_host" and isinstance(p, ast.Call), f"line {n.lineno} ({fn}): {n.id} read outside its guard and not as the launch argument"
+                    assert fn == "_host_chain" and isinstance(
+                        p, ast.Call
+                    ), f"line {n.lineno} ({fn}): {n.id} read outside its guard and not as the launch argument"
             elif n.id in ("sfa_0", "sfb_0"):
-                if not (isinstance(p, ast.Call) and isinstance(p.func, ast.Name) and p.func.id == "_require_epi_operands"):
+                passthrough = fn == "_host" and isinstance(p, ast.Call) and isinstance(p.func, ast.Name) and p.func.id == "_host_chain"
+                if not (passthrough or (isinstance(p, ast.Call) and isinstance(p.func, ast.Name) and p.func.id == "_require_epi_operands")):
                     assert guarded(n), f"line {n.lineno} ({fn}): {n.id} used outside a const_expr(_BLOCK_SCALE) body"
             else:
                 continue
@@ -404,13 +407,18 @@ def test_block_scale_default_folds_out_of_the_template():
         assert {k.arg: ast.unparse(k.value) for k in on.keywords}.get("is_exclusive") == "True"
         assert "is_exclusive" not in {k.arg for k in off.keywords}, "the default allocation must not trace the kwarg (the pre-arm form, the 4.7.0 floor)"
 
-    # (5) the two SF tensor maps are the kernel's LAST parameters (the THD leg's SF tile-prefix operand sits right ahead of them, and
-    # is _host's LAST, defaulted parameter) and the host's else arm passes None for both maps
+    # (5) the SF tensor maps retain their appended positions before the newer
+    # per-sequence-input flag. The compact host keeps its SF-prefix ABI and
+    # forwards unchanged operands; the full host's else arm passes None maps.
     kernel = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_bprop_matmul_bh_sm100_kernel")
-    assert [a.arg for a in kernel.args.args][-3:] == ["sf_meta_t", "tma_sfa_desc_0", "tma_sfb_desc_0"], "appended last (the kernel ABI is append-only)"
+    assert [a.arg for a in kernel.args.args][-4:] == ["sf_meta_t", "tma_sfa_desc_0", "tma_sfb_desc_0", "thd_per_sequence_inputs"]
+    assert ast.unparse(kernel.args.defaults[-1]) == "False", "compact launches retain their previous addressing by default"
     host_fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_host")
     assert host_fn.args.args[-1].arg == "sf_meta_t" and ast.unparse(host_fn.args.defaults[-1]) == "None", "sf_meta_t is _host's last, defaulted parameter"
-    (host_guard,) = [g for g in guards if traced_function(g) == "_host"]
+    host_calls = [n for n in ast.walk(host_fn) if isinstance(n, ast.Call)]
+    assert len(host_calls) == 1 and ast.unparse(host_calls[0].func) == "_host_chain", "the compact host only forwards to the full implementation"
+    assert [ast.unparse(a) for a in host_calls[0].args] == [a.arg for a in host_fn.args.args] and not host_calls[0].keywords
+    (host_guard,) = [g for g in guards if traced_function(g) == "_host_chain"]
     assert [ast.unparse(s) for s in host_guard.orelse] == ["tma_sfa_desc_0 = None", "tma_sfb_desc_0 = None"], ast.unparse(host_guard)
 
     # (6) a record that never carried the field renders the same module constants as the default record

@@ -34,7 +34,7 @@ pytestmark = [pytest.mark.L0]
 # the SM120 line and a hypothetical later sm10x part -- only the MEASURED cc may switch the split on.
 _CCS = [(10, 0), (10, 3), (10, 7), (11, 0), (12, 0)]
 _KINDS = ["mxfp8", "fp8", "f16"]
-_FLAVORS = [(128, 128), (192, 128), (256, 256), (512, 512)]
+_FLAVORS = [(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)]
 # The kernels that carry the split AND measured a win on B200: three on 2026-09-22 (A/B/A x3, CUPTI medians), plus
 # d192x128 per-tensor FP8 on 2026-09-28, where the field gates the kernel's own pre-existing _exp2_* helper mix
 # (+7.0 % causal / +5.7 % dense at the DSv3 layer, B=2 H=128/128 S=2K; -10 % / -6 % with it left on at cc 10.3),
@@ -42,8 +42,9 @@ _FLAVORS = [(128, 128), (192, 128), (256, 256), (512, 512)]
 # it, its tuned default; off at cc 10.3: DSv3 dense S=2K 1.17x -> 1.02x of cuDNN, kimi-K3 1.16x -> 1.00x).
 # d128 bf16 / fp16 (2026-10-05, B200 / cuDNN 9.28 control): the kernel's _E2E_* block is a dense-band win and a causal
 # loss (dense +3.9 % alone, causal -1 .. -2.4 %), so the field is ON for the kernel and the kernel itself folds the split
-# out of the causal / sliding-window builds (``_E2E_DENSE_BAND``, see test_d128_f16_folds_the_split_out_of_the_band_builds).
-_ON = {("mxfp8", (128, 128)), ("fp8", (128, 128)), ("fp8", (192, 128)), ("mxfp8", (192, 128)), ("f16", (192, 128)), ("f16", (128, 128))}
+# out of dense causal / sliding-window builds; BF16 causal THD mixes only interior tiles (paged: RES 2, nonpaged: RES 4).
+# See test_d128_f16_folds_the_split_out_of_the_band_builds and the independent FP64 interior/replay tests.
+_ON = {("mxfp8", (128, 128)), ("fp8", (128, 128)), ("fp8", (192, 128)), ("mxfp8", (192, 128)), ("f16", (192, 128)), ("f16", (128, 128)), ("f16", (64, 64))}
 # Measured on B200 and deliberately OFF.  The ADDITIONAL _E2E_*
 # blocks measured on d192x128 fp8 (dense +1 %, causal -1.6 %) and d192x128 mxfp8 (-3.3..-4.0 % dense) were never
 # merged -- neither is what those kernels' ON entries gate (their own pre-existing emulation mixes, see _ON).
@@ -91,14 +92,14 @@ def test_exp2_fma_split_is_claimed_only_by_the_kernels_that_measured_a_win():
 def test_exp2_fma_split_of_the_d64_decode_tile_has_its_own_set():
     """The d64 decode tile (``decode_tile``: sm100/decode_d128_f16.py at d_flavor 64) shares the f16 (64, 64) key with the d64 prefill tile but is
     another kernel: it claims the split through ``_EXP2_FMA_SPLIT_DECODE_KERNELS`` on the measured cc only, and the prefill spelling of the same
-    flavor stays off (never measured), as does every other flavor and kind on the decode spelling."""
+    flavor now admits measured BF16 causal interiors; other decode flavors and kinds stay off."""
     assert _EXP2_FMA_SPLIT_DECODE_KERNELS == frozenset({("f16", (64, 64))}), "widening the decode set is a per-kernel A/B, never a default"
     for cc in _CCS:
         for kind in _KINDS:
             for flavor in _FLAVORS + [(64, 64)]:
                 want = cc == (10, 0) and (kind, flavor) in _EXP2_FMA_SPLIT_DECODE_KERNELS
                 assert _exp2_fma_split_for(cc, kind=kind, flavor=flavor, decode_tile=True) is want, (cc, kind, flavor)
-    assert _exp2_fma_split_for((10, 0), kind="f16", flavor=(64, 64)) is False
+    assert _exp2_fma_split_for((10, 0), kind="f16", flavor=(64, 64)) is True
     assert _exp2_fma_split_for((10, 0), kind="f16", flavor=[64, 64], decode_tile=True) is True
 
 
@@ -147,23 +148,44 @@ def test_gated_kernel_module_folds_the_split_on_the_param(kind, flavor, load_kw,
 
 
 @requires_dsl
+@pytest.mark.parametrize("enabled", [True, False], ids=["cc100_on", "cc103_off"])
+@pytest.mark.parametrize("dtype_qkv", [2, 3], ids=["bf16", "fp16"])
 @pytest.mark.parametrize(
-    "band_kw",
-    [dict(window_right=0), dict(window_left=128, window_right=0), dict(window_right=0, thd_varlen=True, seq_kv_lens_present=True)],
-    ids=["causal", "causal_swa", "causal_thd"],
+    "band_kw,cta_mma",
+    [
+        pytest.param(kw, cga, id=f"{label}-cga{cga}")
+        for label, kw in [
+            ("causal", dict(window_right=0)),
+            ("causal_swa", dict(window_left=128, window_right=0)),
+            ("causal_thd", dict(window_right=0, thd_varlen=True, seq_kv_lens_present=True)),
+            ("causal_thd_swa", dict(window_left=128, window_right=0, thd_varlen=True, seq_kv_lens_present=True)),
+            ("causal_paged_thd", dict(window_right=0, thd_varlen=True, seq_kv_lens_present=True, paged_kv=True, page_size=128)),
+        ]
+        for cga in ((1, 2) if kw.get("thd_varlen") else (2,))
+    ],
 )
-def test_d128_f16_folds_the_split_out_of_the_band_builds(band_kw):
-    """The d128 f16 kernel takes the cc 10.0 field like the other gated kernels but folds its split OUT of every build
-    with a causal / sliding-window bit in CFG.MASK_FLAGS (``_E2E_DENSE_BAND``): the split measured a loss on those
-    builds on B200.  Padding alone is not a band and keeps the split.  Trace-time only."""
+def test_d128_f16_folds_the_split_out_of_the_band_builds(band_kw, cta_mma, dtype_qkv, enabled):
+    """Only BF16 causal THD interior tiles extend the existing dense-band mix.
+
+    THD prefill at both cluster widths preserves the architecture gate. Dense
+    cga1 uses the separate decode tile, so dense controls use cga2. Sliding windows, dense
+    causal and FP16 causal THD keep every column on MUFU; paged BF16 causal THD mixes interior
+    tiles at its own lighter ratio; padding alone retains the existing dense-band mix. GPU tests
+    separately verify masked tiles and changed-length replay against FP64, so this host matrix is
+    not a numerics oracle.
+    """
     from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
 
-    base = dict(dtype_qkv=2, dtype_o=2, cta_mma=2, qh_per_kh=8, exp2_fma_split=True)
+    base = dict(dtype_qkv=dtype_qkv, dtype_o=dtype_qkv, cta_mma=cta_mma, qh_per_kh=8, exp2_fma_split=enabled)
     band = _load_sm100_kernel_module((128, 128), TemplateParams(**base, **band_kw), rubin=False, fp8=False, pertensor=False)
-    assert band._E2E_DENSE_BAND is False and band._E2E_ENABLED is False and band._E2E_EMULATED_COLS == 0
-    assert all(len(p) == 0 for p in band._E2E_PAIRS), band._E2E_PAIRS
+    interior = bool(band_kw.get("thd_varlen") and "window_left" not in band_kw and dtype_qkv == 2)
+    want = enabled and interior
+    assert band._E2E_DENSE_BAND is False and band._E2E_ENABLED is want
+    assert band._E2E_EMULATED_COLS == ((16 if band_kw.get("paged_kv") else 32) if want else 0)
+    assert 2 * sum(len(p) for p in band._E2E_PAIRS) == band._E2E_EMULATED_COLS
     padded = _load_sm100_kernel_module((128, 128), TemplateParams(**base, thd_varlen=True, seq_kv_lens_present=True), rubin=False, fp8=False, pertensor=False)
-    assert padded._E2E_DENSE_BAND is True and padded._E2E_ENABLED is True and padded._E2E_EMULATED_COLS == 32
+    assert padded._E2E_DENSE_BAND is True and padded._E2E_ENABLED is enabled
+    assert padded._E2E_EMULATED_COLS == (32 if enabled else 0)
 
 
 @requires_dsl
@@ -197,3 +219,21 @@ def test_d192_fp8_folds_its_helper_mix_and_ldtm_stat_on_the_params(enabled):
     assert mod._E2E_ENABLED is enabled
     assert mod.FUSED_LDTM_STAT == (0 if enabled else 1)
     assert callable(mod._exp2_chunk0_mask_aware) and callable(mod._exp2_mixed_late) and callable(mod._exp2_emulated_scalar)
+
+
+@requires_dsl
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3), (10, 7)])
+@pytest.mark.parametrize("dtype", [2, 3])
+@pytest.mark.parametrize("band", ["causal", "dense", "swa", "thd"])
+def test_d64_prefill_mix_requires_bf16_dense_causal_interior(cc, dtype, band):
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
+
+    kw = {} if band == "dense" else dict(window_right=0)
+    if band == "swa":
+        kw["window_left"] = 128
+    if band == "thd":
+        kw.update(thd_varlen=True, seq_kv_lens_present=True)
+    enabled = _exp2_fma_split_for(cc, kind="f16", flavor=(64, 64))
+    params = TemplateParams(d_flavor=64, dtype_qkv=dtype, dtype_o=dtype, cta_mma=2, qh_per_kh=4, exp2_fma_split=enabled, **kw)
+    mod = _load_sm100_kernel_module((64, 64), params, fp8=False, pertensor=False, rubin=False)
+    assert mod._E2E_ENABLED is (cc == (10, 0) and dtype == 2 and band == "causal")

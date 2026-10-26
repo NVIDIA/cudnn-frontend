@@ -255,23 +255,95 @@ update a fixed accumulation order. Stream ordering serializes slot reuse
 between waves, and fixed-order reductions produce `dKV` and `d_sink`. Both
 specializations keep the public workspace capacity of 128 FP32 dKV planes.
 
-Other deterministic envelopes with H16/H32/H64/H96/H128 keep the bounded-wave
-M64 implementation. It selects 32 dKV shards for `total_S_q <= 128`, 64 for
-`129..256`, and 128 for larger query batches. Queries run in same-stream waves
-with one CTA per shard; CTA lane `i` is the sole writer of FP32 dKV shard `i`
-in each wave. H16/H32 use a masked M64 head tile. H96/H128 split each query
-wave into ordered M64 head-block launches, preserving single-writer ownership
-without multiplying the number of shards. Kernel launch ordering serializes
-both head blocks and shard reuse across waves, so the protocol needs neither
-semaphores nor cooperative launch. The 32-shard specialization converts with
-one fixed-order reduction; the 64- and 128-shard specializations first fold
-groups of eight and then combine those groups in fixed order. One CTA per head
-reduces `d_sink`. The additional dKV workspace is
-`selected_shards * round_up(total_S_kv, 8) * round_up(D, 8) * sizeof(float)`
-bytes. Use `scratch_workspace_bytes()` as the authoritative full scratch size;
-a larger reusable workspace remains valid.
+Other deterministic envelopes with H16/H32/H64/H96/H128 use the bounded-wave
+M64 implementation. Ordinary extents select 32 dKV shards for
+`total_S_q <= 128`, 64 for `129..256`, and 128 for larger query batches.
+Queries run in same-stream waves with one CTA per shard; CTA lane `i` is the
+sole writer of FP32 dKV shard `i` in each wave. H16/H32 use a masked M64 head
+tile. H96/H128 split each query wave into ordered M64 head-block launches,
+preserving single-writer ownership without multiplying the number of shards.
+Kernel launch ordering serializes both head blocks and shard reuse across
+waves. The 32-shard specialization converts with one fixed-order reduction;
+the 64- and 128-shard specializations first fold groups of eight and then
+combine those groups in fixed order.
+
+If the selected bounded-wave layout would exceed 16 GiB, the generic M64 plan
+keeps each query wave at 128 CTAs and assigns one FP32 dKV plane to each
+cluster. Queries below 8192 rows prefer sixteen eight-CTA clusters; longer
+queries prefer thirty-two four-CTA clusters for additional reducer parallelism.
+If that preferred layout's complete FP32-plane and packed-mask allocation would
+exceed 32 GiB, the plan selects an eight-plane, sixteen-CTA memory-first relay.
+The long-query policy deliberately skips cluster-8: GB200 sweeps at 393K, 512K,
+and 768K KV found it slower than cluster-16 while retaining twice as many FP32
+planes. A setup kernel builds packed 16-bit, 8-bit, or 4-bit rank masks for every
+`(query wave, head block, KV row)`. Reducer threads wait only for lower cluster
+ranks that actually update the same KV row, then publish that row with
+GPU-scope release/acquire ordering. Disjoint sparse rows continue in parallel;
+the fixed rank order handles both low- and high-overlap top-k rows without a
+global semaphore dependency on non-resident CTAs. The selected planes are
+folded in a fixed order. Duplicate top-k indices within one query row remain
+outside the deterministic contract, as in the bounded-wave path.
+
+For the ordinary policy, additional dKV workspace is
+`selected_shards * K8 * D8 * sizeof(float)`, where
+`K8 = round_up(total_S_kv, 8)` and `D8 = round_up(D, 8)`. The cluster relay
+uses `relay_planes * (K8 + mask_rows) * D8 * sizeof(float)`, where
+`relay_planes` is 8, 16, or 32, `relay_width` is 16, 8, or 4, and
+`mask_rows = ceil(ceil(total_S_q / 128) * ceil(H / 64) *
+(K8 / (32 / relay_width)) / D8)`.
+One CTA per head reduces `d_sink`. Use `scratch_workspace_bytes()` as the
+authoritative full scratch size; a larger reusable workspace remains valid.
 Treat this as a reproducibility requirement rather than a performance-tuning
 knob: keep the default `False` when bitwise run-to-run stability is not needed.
+
+On GB200 with BF16, `total_S_q=16384`, `top_k=2048`, `H=64`, `D_qk=576`, and
+`D_v=512`, the memory-first cluster-16 route reduces full scratch from
+288.008 GiB to 20.008 GiB at `total_S_kv=1048576`. The upstream allocation
+does not fit on the 185.0 GiB test GPU. At `total_S_kv=524288`, where both
+implementations fit, scratch falls from 144.008 GiB to 10.008 GiB and warmed
+`execute()` latency changes from 99.973 ms to 98.999 ms.
+
+At `total_S_kv=1048576` with CP64 (`total_S_q=16384` per launch), BF16,
+top-k 2048, D576/Dv512, and contiguous inputs, the official upstream baseline
+and this change require:
+
+| Heads | Upstream scratch | This change scratch | Scratch reduction |
+|---:|---:|---:|---:|
+| 16 | 288.002 GiB | 20.002 GiB | 268.000 GiB (93.1%) |
+| 32 | 288.004 GiB | 20.004 GiB | 268.000 GiB (93.1%) |
+| 64 | 288.008 GiB | 20.008 GiB | 268.000 GiB (93.1%) |
+
+The upstream 128-plane baseline does not fit in the test system's 185.0 GiB
+usable memory, so its 1M-KV latency cannot be measured. The following direct
+A/B covers every deterministic dispatch selected by the adaptive policy, plus
+the unchanged H128/D576 two-CTA control. All rows use BF16, D576/Dv512,
+top-k 2048, and contiguous inputs; H is 64 except for the H128 control.
+
+| Dispatch | Q | KV | Upstream scratch | This change scratch | Scratch change | Upstream latency | This change latency | Latency change |
+|:---|---:|---:|---:|---:|---:|---:|---:|---:|
+| ordinary 32-plane | 128 | 32768 | 2.250 GiB | 2.250 GiB | 0.0% | 1.737 ms | 1.737 ms | +0.01% |
+| ordinary 64-plane | 256 | 32768 | 4.500 GiB | 4.500 GiB | 0.0% | 2.845 ms | 2.844 ms | -0.03% |
+| ordinary 128-plane | 16384 | 32768 | 9.008 GiB | 9.008 GiB | 0.0% | 38.566 ms | 38.551 ms | -0.04% |
+| cluster-8 / 16-plane | 4096 | 65536 | 18.002 GiB | 2.283 GiB | -87.3% | 16.967 ms | 23.618 ms | +39.2% |
+| cluster-4 / 32-plane | 16384 | 131072 | 36.008 GiB | 9.258 GiB | -74.3% | 49.858 ms | 57.753 ms | +15.8% |
+| cluster-16 / 8-plane | 16384 | 524288 | 144.008 GiB | 10.008 GiB | -93.1% | 99.973 ms | 98.999 ms | -1.0% |
+| H128/D576 two-CTA | 16384 | 32768 | 6.766 GiB | 6.766 GiB | 0.0% | 58.482 ms | 58.651 ms | +0.3% |
+
+Latency values are medians of three alternating-order A/B rounds, each with
+three warm-ups and 20 timed, allocation-free `execute()` calls. The unchanged
+ordinary and two-CTA routes stay within 0.3%. Cluster-8 and cluster-4 trade
+39.2% and 15.8% latency, respectively, for substantial workspace reduction;
+at 512K KV, cluster-16 is 1.0% faster than upstream while using 93.1% less
+scratch.
+
+For H64, a three-round, 20-call, reversed-order A/B measured prepared-plan
+eager execution at 104.579 ms and CUDA Graph replay at 104.225 ms (0.997x).
+Capture completed with PyTorch synchronization-debug error mode enabled. The
+cluster-16 regression also passed 100 repeated bitwise executions, graph
+capture/replay with poisoned outputs and workspace, and changed device-side
+`topk_length` values. Compilation and allocation remain plan-time operations;
+capture uses caller-owned outputs and workspace, and replay requires the same
+declared tensor shapes and storage addresses while their contents may change.
 
 `SparseAttentionBackward.scratch_workspace_bytes()` reports the full scratch
 requirement on every backend: the SM100 FP32 statistics and dKV-accumulator
@@ -324,16 +396,16 @@ The K columns are assumed to be a compressed-KV prefix starting at global
 compressed column 0.
 
 - **Inputs**
-  - `q`: `(B, S_q, H_q, D)` BF16, or the architecture-specific FP8 format
-    described below.
-  - `k`: `(B, S_k, H_kv, D)` BF16, or the architecture-specific FP8 format
-    described below.
+  - `q`: `(B, S_q, H_q, D)` BF16, or the architecture-specific FP8 or FP4
+    format described below (packed FP4 stores `D // 2` per row).
+  - `k`: `(B, S_k, H_kv, D)` BF16, or the architecture-specific FP8 or FP4
+    format described below.
   - `w`: `(B, S_q, H_q)` BF16 or FP32 with BF16 Q/K, on SM90 and SM100.
     FP32 head weights retain their precision through score generation, without
     changing the Q/K dtype; FP32 W requires unit stride in its last dimension.
     Unsupported strides are rejected instead of copied. The SM90 FP8 path also
     accepts FP32 when weights have already been pre-scaled by
-    `q_scale * sm_scale`; SM100 MXFP8 requires BF16 weights.
+    `q_scale * sm_scale`; SM100 MXFP8 and MXFP4 require BF16 weights.
   - `q_causal_offsets` (optional): CUDA INT32 tensor with one entry per
     batch/THD segment, on the same device as `q`.
 - **Output** — `scores`: `(B, S_q, S_k)` FP32. On SM100 this is the
@@ -356,7 +428,9 @@ compressed column 0.
 - **Scope** — FP32 weights are supported by Indexer Forward and Combined
   Indexer Forward + Top-K. The separate indexer score-recompute and backward
   APIs still require BF16 weights.
-- **Precision paths**
+- **Precision paths** — selected by `precision` on `indexer_forward_wrapper`
+  and `indexer_forward_top_k_wrapper`; the `IndexerForward` class is
+  BF16-only.
   - SM90 `precision="fp8"`: Q/K use E4M3 and `q_scale`/`k_scale` are FP32
     descales with one value per token/head. Set `return_lse=True` (or provide
     `lse_out`) to compute LSE in the same kernel invocation.
@@ -374,15 +448,32 @@ compressed column 0.
     packed-row alignment (each Q span times `qhead_per_kv_head` is a multiple
     of 128 rows; each K span is a multiple of 128 tokens), and stays within
     the packed scale storage.
+  - SM100 `precision="mxfp4"`: Q/K are `torch.float4_e2m1fn_x2`, two E2M1
+    values per byte with element `2i` in the low nibble, so their last dim is
+    `D // 2` (64); a packed `uint8` buffer passes zero-copy through
+    `.view(torch.float4_e2m1fn_x2)`. `q_scale`/`k_scale` are the MXFP8 E8M0
+    scales unchanged: one per 32 head_dim values, so `D // 32` (4) per row
+    although the last dim is `D // 2`, in the same packed layout, built
+    from logical `(..., D // 32)` scales by the packers in
+    `cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_utils`:
+    `pack_q_scale_bshd`/`pack_k_scale_bshd` for BSHD, and
+    `pack_q_scale_thd`/`pack_k_scale_thd` into a caller-provided `out` with
+    prefixes from `make_scale_cu_seqlens_padded` for THD.
+    `sf_vec_size` is fixed at 32, and THD inputs take the same
+    `cu_seqlens_q_scale_padded`/`cu_seqlens_k_scale_padded` scale-prefix
+    contract. Its kernel differs from the MXFP8 one only in the MMA:
+    tcgen05 `kind::mxf4`, K = 64 per MMA. Requires a PyTorch build with
+    `torch.float4_e2m1fn_x2`; otherwise `precision="mxfp4"` raises
+    `NotImplementedError`.
 - **Constraints** — `head_dim == 128`. The SM90 direct path supports
   `qhead_per_kv_head ∈ {16, 32, 64}` and currently requires `H_kv == 1`;
   SM100 BF16 dense and combined Top-K paths support
   `qhead_per_kv_head ∈ {4, 8, 16, 32, 64}` (a group packs up to 8 query
   tokens per MMA tile: 4 heads x 8 tokens = 32 columns, ..., 64 heads x 2
-  tokens = 128), their MXFP8 paths the same set at a fixed 128-row tile
-  (4 heads x 32 tokens, ..., 64 heads x 2 tokens). All currently require
-  `H_kv == 1` (MQA). A query may be up to `ratio - 1` tokens longer than
-  `ratio * seqlen_k` (its trailing tokens have not completed a compressed
+  tokens = 128), their MXFP8 and MXFP4 paths the same set at a fixed
+  128-row tile (4 heads x 32 tokens, ..., 64 heads x 2 tokens). All currently
+  require `H_kv == 1` (MQA). A query may be up to `ratio - 1` tokens longer
+  than `ratio * seqlen_k` (its trailing tokens have not completed a compressed
   block and score the complete blocks only); a longer one is refused.
 
 ```python
@@ -408,25 +499,27 @@ reproducible across launches. This does not sort the output slots; the default
 `False` path retains the faster scheduling-dependent tie-break.
 
 The combined compressed path is SM100-only. Both BSHD and THD support
-BF16 Q/K with BF16 or FP32 weights, and MXFP8 Q/K with BF16 weights.
+BF16 Q/K with BF16 or FP32 weights, and MXFP8 or MXFP4 Q/K with BF16 weights.
 `topk_indices_global=True` is the default. Optional caller-owned
 candidate/output/softmax/LSE buffers avoid per-call allocations; size the
 candidate buffer with `compress_topk_cand_buffer_size` for BSHD or
 `compress_topk_cand_buffer_size_thd` for THD. LSE is supported for BSHD and THD
-with both BF16 and MXFP8. Explicit microbatching is BF16 BSHD-only and cannot
+with BF16, MXFP8, and MXFP4. Explicit microbatching is BF16 BSHD-only and cannot
 be combined with LSE or explicit `q_causal_offsets`. BSHD with explicit
 `q_causal_offsets` currently computes its per-batch candidate offsets eagerly
 and is not CUDA-graph-capturable; THD capture requires the caller-provided
 offsets and buffers returned by `compress_topk_cand_buffer_size_thd`. Compact
 addressing requires `0 <= q_causal_offsets[b]`; rows extending beyond the KV
-prefix are clamped to `seqlen_k_b`. THD MXFP8 uses the same caller-guaranteed
-device-side scale-prefix contract described in §3; the interface does not
-validate prefix values with a device-to-host copy.
+prefix are clamped to `seqlen_k_b`. THD MXFP8 and MXFP4 use the same
+caller-guaranteed device-side scale-prefix contract described in §3; the
+interface does not validate prefix values with a device-to-host copy.
 
 Leave `microbatch_rows=-1` to use the BSHD long-sequence memory policy; it
 enables windowing only for compatible BF16 shapes. Pass `0` to force one
 launch, or a positive value only when deliberately controlling the scratch
-footprint, and pass the same value to `compress_topk_cand_buffer_size`.
+footprint. Size the buffer with the launch's `microbatch_rows` and
+`precision`: `compress_topk_cand_buffer_size` sizes MXFP8 and MXFP4 launches,
+which never microbatch, for one full launch.
 
 Global versus local ids is primarily an interoperability and allocation
 choice, not an Indexer Backward tuning choice. Keep the default global ids
@@ -442,6 +535,7 @@ conversion when comparing end-to-end performance.
 ```python
 cand_floats = DSA.compress_topk_cand_buffer_size(
     B, S_q, S_k, ratio=4, return_lse=True,
+    precision="bf16",  # must match the launch
 )
 cand = torch.empty(cand_floats, dtype=torch.float32, device=q.device)
 
@@ -623,6 +717,13 @@ while dense indexer score recompute runs it with `compute_lse=True` and a live
 Dense Attention Score Recompute has a separate MXFP8 kernel because its score
 and normalization semantics differ from the indexer path.
 
+- **Precision** — on SM100, `dense_indexer_score_recompute_wrapper` takes
+  `precision="bf16"`, `"mxfp8"`, or `"mxfp4"` with the Q/K and scale
+  contract of Indexer Forward (§3); its block-scaled precisions require
+  `qhead_per_kv_head ∈ {32, 64}`. `dense_attn_score_recompute_wrapper` takes
+  `"bf16"` or `"mxfp8"` and rejects `"mxfp4"`. The
+  `DenseIndexerScoreRecompute` and `DenseAttnScoreRecompute` classes, and
+  SM90, are BF16-only.
 - **Layouts** — BSHD on SM90 and SM100+. THD packed (`cu_seqlens_q`/`cu_seqlens_k`
   with `q`: `(total_q, H_q, D)`, `out`: `(total_q, max_seqlen_k)`) on SM100+ only:
   SM90 declines THD in `check_support()` with `NotImplementedError` because its
@@ -726,8 +827,8 @@ forward used `topk_indices_global=False`. The public sparse
 `indexer_backward_wrapper` has a
 BSHD-shaped interface; BF16 THD tensors can use zero-copy `B=1` views (squeeze
 the singleton K head and add a batch dimension) together with global Top-K
-indices. FP8 and MXFP8 indexer backward are not currently supported because
-the backward wrapper requires BF16 Q/K/W inputs.
+indices. FP8, MXFP8, and MXFP4 indexer backward are not currently supported
+because the backward wrapper requires BF16 Q/K/W inputs.
 
 For the default SM100 backend, `topk_indices_global` describes the input
 encoding; it is not a performance-tuning switch. When Gather4 is available,
@@ -916,16 +1017,17 @@ result = DSA.dense_indexer_backward_wrapper(
   uses a feature-local LLVM inline-assembly bridge with the compiler-owned TMA
   descriptor; the issued data movement remains hardware TMA `gather4`.
 - **Indexer Forward only supports `head_dim = 128`**. SM90 supports
-  `qhead_per_kv_head ∈ {16, 32, 64}` with `H_kv = 1`; SM100 BF16 and MXFP8
-  support `qhead_per_kv_head ∈ {4, 8, 16, 32, 64}`. Both the dense and
-  combined Top-K paths require `H_kv = 1`.
+  `qhead_per_kv_head ∈ {16, 32, 64}` with `H_kv = 1`; SM100 BF16, MXFP8, and
+  MXFP4 support `qhead_per_kv_head ∈ {4, 8, 16, 32, 64}`. Both the dense and
+  combined Top-K paths require `H_kv = 1`. MXFP4 runs on the SM100-family
+  capabilities 10.0, 10.3, and 10.7 (no SM90 path).
 - **Standalone Top-K only up to 2048**; `top_k > 2048` is not supported by
   its radix Top-K kernel. The combined compressed path uses a separate stage-2
   implementation.
 - **Compressed-path limits** — the stage-1 compact score kernel is MQA-only
-  (`H_kv = 1`); MXFP8 keeps its 128-row tile for every head group; explicit
-  microbatching cannot be combined with MXFP8, LSE, or explicit per-batch
-  causal offsets.
+  (`H_kv = 1`); MXFP8 and MXFP4 keep their 128-row tile for every head
+  group; explicit microbatching cannot be combined with MXFP8, MXFP4, LSE, or
+  explicit per-batch causal offsets.
 
 
 ## Native PyTorch training composition

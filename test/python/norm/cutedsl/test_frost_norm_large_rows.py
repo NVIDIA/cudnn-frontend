@@ -81,6 +81,12 @@ if __name__ == "__main__":
 
 pytest.importorskip("cudnn.norm", reason="frost norm kernels require a built cudnn frontend")
 
+from cudnn.norm._lazy import dsl_unavailable
+
+requirement_error = dsl_unavailable("FROST norm tests")
+if requirement_error:
+    pytest.skip(requirement_error, allow_module_level=True)
+
 from cudnn.norm import NormVariant, norm_bprop, norm_fprop  # noqa: E402
 
 LN, RMS = NormVariant.LAYER_NORM, NormVariant.RMS_NORM

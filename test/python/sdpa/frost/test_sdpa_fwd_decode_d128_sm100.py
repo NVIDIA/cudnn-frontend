@@ -227,14 +227,14 @@ def test_adapter_d64_decode_quad_gate():
 @pytest.mark.L0
 def test_adapter_decode_early_q_is_claimed_on_the_measured_cc_only():
     """Early Q (``TemplateParams.early_q``) is a positive per-arch claim like the exp2 split: cc 10.0 / 10.3 take it on the decode tile (the d64 decode tile
-    and the d128 cga1 tile), cc 10.7 -- which loads the same tile -- and every unmeasured part keep the staged TMA store, as do THD and FP8 plans."""
+    and the d128 cga1 tile), cc 10.7 -- which loads the same tile -- and every unmeasured part keep the staged TMA store, as do unsplit THD and FP8 plans."""
     from types import SimpleNamespace
 
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     def early_q(cc, *, flavor=(128, 128), cta_mma=1, decode_tile=False, thd=False, fp8=False):
         me = SimpleNamespace(_device_cc=cc, flavor=flavor, thd=thd, _fp8=fp8)
-        return SdpaFwdDslSm100._decode_early_q(me, SimpleNamespace(decode_tile=decode_tile, cta_mma=cta_mma))
+        return SdpaFwdDslSm100._decode_early_q(me, SimpleNamespace(decode_tile=decode_tile, cta_mma=cta_mma, split_kv=1))
 
     assert early_q((10, 0)) and early_q((10, 3)) and early_q((10, 0), flavor=(64, 64), decode_tile=True)
     assert not early_q((10, 7)) and not early_q((11, 0)) and not early_q((12, 0))
@@ -692,6 +692,35 @@ def test_decode_kernel_mtp_bottom_right_with_q_trim(s_q):
     O := 0 / LSE := -inf, and the diagonal anchors at (q_len_b, L_b))."""
     q_lens = [s_q, max(1, s_q // 2), s_q, 1]
     _run_kernel(4, 16, 4, 16, 30, [400, 77, 1, 129], hnd=True, splits=1, s_q=s_q, q_lens=q_lens, causal_br=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_q,h,kh", [(1, 16, 2), (4, 16, 2), (5, 16, 2), (16, 16, 2), (17, 16, 2), (1, 64, 1), (1, 128, 1), (9, 24, 2)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("splits", [1, 4])
+def test_decode_paged_query_warp_boundaries(s_q, h, kh, dtype, splits):
+    """Whole/partial dead warps across Q tiles, including partial GQA and empty Q.
+
+    Live outputs and Stats retain the masked/sink semantics while inactive
+    warps still contribute every pipeline handshake and zero probability row.
+    """
+    _run_kernel(
+        4,
+        h,
+        kh,
+        16,
+        24,
+        [257, 129, 383, 1],
+        hnd=True,
+        splits=splits,
+        s_q=s_q,
+        q_lens=[s_q, max(1, s_q // 2), 0, 1],
+        causal_br=True,
+        window_left=63,
+        sink=-120.0,
+        dtype=dtype,
+        pack=True,
+    )
 
 
 @pytest.mark.L0

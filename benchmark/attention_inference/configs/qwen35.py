@@ -42,5 +42,9 @@ CONFIG = InferenceBenchmarkConfig(
     # (the TP 4 deployment) and 64; the cudnn graph paths are dense and run each
     # case once at page_size.
     page_sizes=[16, 32, 64],
-    backends=["cudnn", "cudnn_oss"],
+    backends=["cudnn", "cudnn_oss", "cudnn_auto"],
+    # cudnn legs: also the serving form (paged K/V, per-request lengths, THD prefill), and decode batches whose caches
+    # differ in length (each request at 25-100% of kv_len)
+    kv_layouts=["dense", "paged"],
+    kv_min_fills=[1.0, 0.25],
 )

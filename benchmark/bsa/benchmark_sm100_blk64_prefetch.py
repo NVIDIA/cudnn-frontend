@@ -68,7 +68,7 @@ class Runner:
         cache.clear()
 
         def api():
-            return cudnn.BSA.block_sparse_attention_forward(*inputs, indices, sparse_block_size=64, layout="bshd", kv_splits=1)
+            return cudnn.ops.block_sparse_attention_forward(*inputs, indices, sparse_block_size=64, layout="bshd", kv_splits=1)
 
         try:
             _interface.BlockSparseAttnForwardSm100Blk64 = cls

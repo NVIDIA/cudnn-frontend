@@ -24,7 +24,7 @@ def check_support(api):
     from cudnn.frost.buffers import cutedsl_state
     from cudnn.frost.device import compute_capability, resolve_device
     from cudnn.sdpa.graph_analyzer import thd_stats_packing
-    from .d128_contract import validate_accumulation_scale
+    from .d128_contract import ACCUMULATION_CCS, validate_accumulation_scale
 
     def require(condition, reason):
         if not condition:
@@ -35,7 +35,7 @@ def check_support(api):
     require(match is not None and tuple(map(int, match.groups())) >= (4, 8, 0), f"requires nvidia-cutlass-dsl >= 4.8.0; found {version}")
     require(api.q_desc.device.type == "cuda", "Q must reside on CUDA")
     cc = compute_capability(resolve_device(api.q_desc.device))
-    require(tuple(cc) == (10, 0), f"requires SM100; got {cc}")
+    require(tuple(cc) in ACCUMULATION_CCS, f"requires SM100 or SM103; got {cc}")
     require(getattr(getattr(_pybind_module, "_SdpaBwdBinder", None), "supports_zero_workspace", False), "requires prepared backward native binding support")
     require(not api.seq_q_lens_present and not api.seq_kv_lens_present, "lengths use the packed metadata path, not dense padding flags")
     require(not api.causal_bottom_right, "bottom-right causal is not supported")
@@ -147,7 +147,7 @@ def compile_plan(api):
     import cutlass
     import torch
 
-    from cudnn.frost.device import resolve_device
+    from cudnn.frost.device import compute_capability, resolve_device
     from .kernels.sm100.prepared_d128_thd_host import compile_host
 
     b, h = api.batch_size, api.h_q
@@ -173,10 +173,11 @@ def compile_plan(api):
         width = 8 if name == "int64" else 4
         operands.append(None if name is None else Operand(name, (b + 1,), (1,), b + 1, width, width))
     device = resolve_device(api.q_desc.device)
+    cc = compute_capability(device)
     dtype = cutlass.BFloat16 if api.dtype == torch.bfloat16 else cutlass.Float16
     config = (b, h, bool(api.thd_stats_token_major))
     with torch.cuda.device(device):
-        entry = compile_host(config, api._thd_origins, api._thd_origin_dtypes, dtype, api.is_causal, 100)
+        entry = compile_host(config, api._thd_origins, api._thd_origin_dtypes, dtype, api.is_causal, cc[0] * 10 + cc[1])
     fn = positional_entry(entry)
     if fn is None:
         raise NotImplementedError("d128 THD requires a positional tvm-ffi entry")

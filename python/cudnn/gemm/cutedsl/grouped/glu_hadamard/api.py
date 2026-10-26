@@ -731,7 +731,44 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
 ) -> TupleDict:
     """High-level wrapper for grouped GEMM GLU + Hadamard forward fusion."""
     from cudnn.gemm.cutedsl.discrete_grouped.discrete_kernel_utils import _require_pointer_tensor
+    from cudnn.tensor_adapter import detect_framework
 
+    if b_tensor is not None and detect_framework(a_tensor) == "jax":
+        from ..canonical_jax import check_jax_wrapper_options
+        from .jax_api import grouped_gemm_glu_hadamard_jax_forward
+
+        check_jax_wrapper_options(
+            acc_dtype=acc_dtype,
+            cd_major=cd_major,
+            sf_vec_size=sf_vec_size,
+            vector_f32=vector_f32,
+            m_aligned=m_aligned,
+            current_stream=current_stream,
+            bias_tensor=bias_tensor,
+            b_ptrs=b_ptrs,
+            sfb_ptrs=sfb_ptrs,
+            b_major=b_major,
+            use_dynamic_sched=use_dynamic_sched,
+            sf_vec_sizes=(16, 32),
+        )
+        for name, rejected in (("n", n is not None), ("b_dtype", b_dtype is not None), ("use_tmem_post_rht_amax", use_tmem_post_rht_amax)):
+            if rejected:
+                raise ValueError(f"{name} is unsupported for the JAX block-scaled path")
+        return grouped_gemm_glu_hadamard_jax_forward(
+            a_tensor,
+            b_tensor,
+            sfa_tensor,
+            sfb_tensor,
+            padded_offsets,
+            alpha_tensor,
+            prob_tensor,
+            c_dtype=c_dtype if c_dtype is not None else cutlass.BFloat16,
+            d_dtype=d_dtype if d_dtype is not None else cutlass.BFloat16,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            sf_vec_size=sf_vec_size,
+            act_func=act_func,
+        )
     if a_tensor is not None:
         _require_torch_inputs(a_tensor, "grouped_gemm_glu_hadamard_wrapper_sm100")
     import torch
@@ -759,6 +796,7 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
     check_canonical_contiguous(a_tensor, b_tensor, prob_tensor)
     k_physical = a_tensor.shape[1]
     if is_dense:
+        b_shape = None  # the discrete-mode B shape; the dense branch passes sample_b instead
         weight_mode = MoEWeightMode.DENSE
         n_full, _, l = b_nkl(b_tensor)
         if sfb_tensor is None:
@@ -812,6 +850,7 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
 
     situ_beta1_cache_signature = float(situ_beta1) if act_func == "situglu" else None
     cache_key = (
+        a_tensor.device,
         weight_mode,
         act_func,
         situ_beta1_cache_signature,
@@ -851,42 +890,44 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
     if cache_key in _cache_of_GroupedGemmGluHadamardSm100Objects:
         api = _cache_of_GroupedGemmGluHadamardSm100Objects[cache_key]
     else:
-        common_kwargs = dict(
-            sample_a=a_tensor,
-            sample_c=c_tensor,
-            sample_d=d_tensor,
-            sample_sfa=sfa_tensor,
-            sample_padded_offsets=padded_offsets,
-            sample_alpha=alpha_tensor,
-            sample_prob=prob_tensor,
-            sample_amax=amax_tensor,
-            sample_post_rht_amax=post_rht_amax_tensor,
-            sample_bias=bias_tensor,
-            acc_dtype=acc_dtype,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-            sf_vec_size=sf_vec_size,
-            vector_f32=vector_f32,
-            m_aligned=m_aligned,
-            act_func=act_func,
-            situ_beta1=situ_beta1,
-            situ_beta2=situ_beta2,
-            use_dynamic_sched=use_dynamic_sched,
-            use_tmem_post_rht_amax=use_tmem_post_rht_amax,
-        )
-        if is_dense:
-            api = GroupedGemmGluHadamardSm100(sample_b=b_tensor, sample_sfb=sfb_tensor, **common_kwargs)
-        else:
-            api = GroupedGemmGluHadamardSm100(
-                num_experts=l,
-                b_shape=b_shape,
-                b_dtype=b_dtype,
-                b_major=b_major,
-                **common_kwargs,
+        # Compile where the operands live: check_support() reads the current device and compile() allocates the workspace on it.
+        with torch.cuda.device(a_tensor.device):
+            common_kwargs = dict(
+                sample_a=a_tensor,
+                sample_c=c_tensor,
+                sample_d=d_tensor,
+                sample_sfa=sfa_tensor,
+                sample_padded_offsets=padded_offsets,
+                sample_alpha=alpha_tensor,
+                sample_prob=prob_tensor,
+                sample_amax=amax_tensor,
+                sample_post_rht_amax=post_rht_amax_tensor,
+                sample_bias=bias_tensor,
+                acc_dtype=acc_dtype,
+                mma_tiler_mn=mma_tiler_mn,
+                cluster_shape_mn=cluster_shape_mn,
+                sf_vec_size=sf_vec_size,
+                vector_f32=vector_f32,
+                m_aligned=m_aligned,
+                act_func=act_func,
+                situ_beta1=situ_beta1,
+                situ_beta2=situ_beta2,
+                use_dynamic_sched=use_dynamic_sched,
+                use_tmem_post_rht_amax=use_tmem_post_rht_amax,
             )
-        api.check_support()
-        api.compile()
-        _cache_of_GroupedGemmGluHadamardSm100Objects[cache_key] = api
+            if is_dense:
+                api = GroupedGemmGluHadamardSm100(sample_b=b_tensor, sample_sfb=sfb_tensor, **common_kwargs)
+            else:
+                api = GroupedGemmGluHadamardSm100(
+                    num_experts=l,
+                    b_shape=b_shape,
+                    b_dtype=b_dtype,
+                    b_major=b_major,
+                    **common_kwargs,
+                )
+            api.check_support()
+            api.compile()
+            _cache_of_GroupedGemmGluHadamardSm100Objects[cache_key] = api
 
     if is_dense:
         api.execute(

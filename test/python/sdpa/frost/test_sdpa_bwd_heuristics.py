@@ -144,7 +144,7 @@ def test_sm100_d128_dense_row_lists_one_knobless_entry(monkeypatch, cc):
     facts = _facts(device_cc=cc)
     assert [(p.engine_id, p.knobs) for p in recommend("A", facts, _OFFERED)] == [(20609, None)]
     grouped = recommend("A", _facts(device_cc=cc, h_kv=2, dtype=cudnn.data_type.BFLOAT16), _OFFERED)
-    assert [(p.engine_id, p.knobs) for p in grouped] == ([(20609, None)] if cc == (10, 0) else [])
+    assert [(p.engine_id, p.knobs) for p in grouped] == ([(20609, None)] if cc in ((10, 0), (10, 3)) else [])
     assert recommend("A", _facts(device_cc=cc, h_kv=2, dtype=cudnn.data_type.HALF), _OFFERED) == []
 
 

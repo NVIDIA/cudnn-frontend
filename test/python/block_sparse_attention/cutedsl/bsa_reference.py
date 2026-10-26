@@ -81,3 +81,15 @@ def attention_backward_reference(
     lse = torch.logsumexp(scores, dim=-1)
     output.backward(do.float())
     return output.detach(), lse.detach(), q_ref.grad, k_ref.grad, v_ref.grad
+
+
+def assert_fp8_quantization_matches_fp32(actual: torch.Tensor, scaled: torch.Tensor) -> None:
+    """Allow only FP32 one-ULP midpoint flips, never a general FP8 tolerance."""
+    expected = scaled.to(actual.dtype).float()
+    different = actual.float() != expected
+    if different.any():
+        midpoint = scaled[different]
+        lower = torch.nextafter(midpoint, torch.full_like(midpoint, -torch.inf))
+        upper = torch.nextafter(midpoint, torch.full_like(midpoint, torch.inf))
+        values = actual.float()[different]
+        assert ((values == lower.to(actual.dtype).float()) | (values == upper.to(actual.dtype).float())).all()

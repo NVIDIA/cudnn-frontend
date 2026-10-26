@@ -15,7 +15,7 @@ Use this skill to add or update a CuTeDSL frontend-only API in cuDNN Frontend. T
 4. Classify the kernel before choosing a template:
    - Kernel family: dense GEMM, GEMM fusion, grouped GEMM, discrete grouped GEMM, MoE, attention, sparse attention, or another frontend-only API family.
    - Execution topology: single kernel, paired forward/backward APIs, multi-kernel orchestrator, helper-kernel setup, distributed/runtime-coordinated execution, or internal scheduler.
-   - Public surface: `<op_name>_<direction>` / `<op_name>_<direction>_jax` functions (see `docs/fe-oss-apis/api_conventions.md`), returned tensors, optional outputs, workspace ownership, and import/export namespace.
+   - Public surface: `cudnn.ops.<op_name>_<direction>` / `cudnn.ops.<op_name>_<direction>_jax` functions (see `docs/fe-oss-apis/api_conventions.md`), returned tensors, optional outputs, workspace ownership, and import/export namespace.
    - Internal support: source helper modules, schedulers, metadata utilities, and generated descriptors that must stay private to the package.
    - Architecture variant: whether the public API needs transparent dispatch to an alternate CuTeDSL module for a newer GPU (for example Rubin `sm107` vs the default SM100 kernel). Keep the public functions unchanged when dispatch is internal.
 5. Read `references/integration-pattern.md` for the detailed repo conventions before implementing.
@@ -24,7 +24,7 @@ Use this skill to add or update a CuTeDSL frontend-only API in cuDNN Frontend. T
 
 1. Add or update the operation package under the closest existing family, such as `python/cudnn/<operation>/`, `python/cudnn/gemm/cutedsl/dense/<operation>/`, `python/cudnn/gemm/cutedsl/grouped/<operation>/`, `python/cudnn/gemm/cutedsl/discrete_grouped/<operation>/`, or `python/cudnn/sdpa/<direction>/`.
 2. Implement the public functions in `api.py`: validate the configuration, allocate outputs, cache/reuse compiled kernels where the template does, and return a `TupleDict` (PyTorch) or a plain tuple or dict (JAX).
-3. Export the public functions through the operation/family `__init__.py` files and `_LAZY_OPTIONAL_IMPORTS` in `python/cudnn/__init__.py`.
+3. Export the public functions through `_LAZY_EXPORTS` in `python/cudnn/ops/__init__.py`, or in `python/cudnn/ops/<family>/__init__.py` for an op in a family.
 4. Reuse the existing CuTeDSL dependencies in `[project] dependencies` unless the new kernel truly needs an additional package. The `cutedsl` extra now holds only `cuda-python`.
 5. Add FE OSS documentation and update the relevant overview or operation index links.
 6. Add tests under `test/python/<operation>/cutedsl/`, including support validation and numerical/reference coverage when executable.

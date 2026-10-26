@@ -160,6 +160,9 @@ def test_parallel_bwd_setup_prefixes(parallel_bwd_setup, batch, lens_form, gran)
     remap = sorted(range(batch), key=lambda i: (-q[i], i))
     live = sum((value + 127) // 128 for value in q) * 3
     rounded = prefix([((value + gran - 1) // gran) * gran for value in q])
-    expected = k + cu_q + cu_k + remap + [live, 8] + rounded
+    # The remap-ordered unit prefix (THD_BWD_WORK_PREFIX_OFF): cumulative ceil(q / 128) * n_qh along the remap, the
+    # table stage 2's decode binary-searches. A single sequence publishes only the live total, so its slot keeps the fill.
+    unit_prefix = prefix([((q[i] + 127) // 128) * 3 for i in remap]) if batch > 1 else [-999] * (batch + 1)
+    expected = k + cu_q + cu_k + remap + [live, 8] + rounded + unit_prefix
     assert len(expected) == words
     assert meta.cpu().tolist() == expected + [-999] * 16

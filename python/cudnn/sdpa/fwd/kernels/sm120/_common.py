@@ -7,7 +7,8 @@
 and the D=256 specialization ``sm120/prefill_d256_f16.py`` are self-contained
 kernels that differ in head-tile geometry, MMA shape, and warp roles; the
 lane-level primitives below are shared between them (``sfo_atom_offset`` by the
-two block-scaled-O kernels, FP8 and MXFP8) and live here so a fix lands once.
+two block-scaled-O kernels, FP8 and MXFP8; ``zero_dead_q_rows`` by the three D=512
+templates) and live here so a fix lands once.
 """
 
 from typing import Type
@@ -79,6 +80,17 @@ def pack_to_i32(
 def ceil_div(a: int, b: int) -> int:
     """Return the ceiling division of a by b."""
     return (a + b - 1) // b
+
+
+@cute.jit
+def zero_dead_q_rows(frag, row_lo, live_rows: cutlass.Constexpr[int]):
+    """Zero a packed tile's dead rows in one ``ldmatrix.x4`` A fragment of a TMA-staged
+    Q tile: the packed TMA box holds only the live rows, so theirs are stale slab bytes.
+    Registers 0 and 2 hold row ``row_lo`` (the warp's first row + ``lane // 4``),
+    registers 1 and 3 that row + 8."""
+    keep_lo = cutlass.Int32(-1) if row_lo < live_rows else cutlass.Int32(0)
+    keep_hi = cutlass.Int32(-1) if row_lo + 8 < live_rows else cutlass.Int32(0)
+    return cutlass.Vector.from_elements((frag[0] & keep_lo, frag[1] & keep_hi, frag[2] & keep_lo, frag[3] & keep_hi), cutlass.Int32)
 
 
 def sfo_atom_offset(plane, r, c, cols):

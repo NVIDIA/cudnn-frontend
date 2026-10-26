@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Torch-dependent cuDNN operation helpers.
+"""cuDNN operations for PyTorch and JAX.
 
 Public symbols resolve on first attribute access so importing ``cudnn.ops``
-does not require PyTorch.
+requires neither PyTorch nor JAX.
 """
 
 import importlib
@@ -15,6 +15,13 @@ from typing import Any
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
 
 _LAZY_EXPORTS = {
+    "qsa_select_forward": ("cudnn.QSA.selection", "qsa_select_forward"),
+    "qsa_select_decode_forward": ("cudnn.QSA.selection", "qsa_select_decode_forward"),
+    "qsa_select_decode_paged_forward": ("cudnn.QSA.selection_paged", "qsa_select_decode_paged_forward"),
+    "qsa_indexed_forward": ("cudnn.QSA.indexed", "qsa_indexed_forward"),
+    "qsa_indexed_backward": ("cudnn.QSA.indexed", "qsa_indexed_backward"),
+    "qsa_forward": ("cudnn.QSA.api", "qsa_forward"),
+    "qsa_backward": ("cudnn.QSA.api", "qsa_backward"),
     "causal_conv1d": (".causal_conv1d", "causal_conv1d"),
     "causal_conv1d_nwh": (".causal_conv1d", "causal_conv1d_nwh"),
     "b2b_causal_conv1d": (".causal_conv1d", "b2b_causal_conv1d"),
@@ -24,6 +31,13 @@ _LAZY_EXPORTS = {
     "Nvfp4BlockScaleDequantizer": (".nvfp4", "Nvfp4BlockScaleDequantizer"),
     "nvfp4_block_scale_quantize": (".nvfp4", "nvfp4_block_scale_quantize"),
     "nvfp4_block_scale_dequantize": (".nvfp4", "nvfp4_block_scale_dequantize"),
+    "block_sparse_attention_forward": ("cudnn.block_sparse_attention", "block_sparse_attention_forward"),
+    "block_sparse_attention_backward": ("cudnn.block_sparse_attention", "block_sparse_attention_backward"),
+    "block_sparse_attention_fp8_forward": ("cudnn.block_sparse_attention", "block_sparse_attention_fp8_forward"),
+    "kimi_delta_attention_forward_jax": ("cudnn.linear_attention.jax_api", "kimi_delta_attention_fwd"),
+    "kimi_delta_attention_backward_jax": ("cudnn.linear_attention.jax_api", "kimi_delta_attention_bwd"),
+    "block_sparse_attention_forward_jax": ("cudnn.block_sparse_attention.jax_api", "block_sparse_attention_forward"),
+    "block_sparse_attention_backward_jax": ("cudnn.block_sparse_attention.jax_api", "block_sparse_attention_backward"),
 }
 
 __all__ = list(_LAZY_EXPORTS)

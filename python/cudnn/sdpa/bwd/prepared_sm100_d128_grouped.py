@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 from cudnn.frost.compiled_cache import positional_entry
 from .prepared import ATTRIBUTES, ROLES, BwdLaunchSpec, Operand, _same_geometry
-from .d128_contract import validate_accumulation_scale
+from .d128_contract import ACCUMULATION_CCS, validate_accumulation_scale
 from .d128_grouped_contract import DENSE, THD, dense_workspace_layout, thd_workspace_layout, validate_dimensions, validate_dense_bounds, validate_thd_bounds
 from .d128_thd_contract import KV_PORTS, ORIGIN_PORTS, Q_PORTS, validate_stats_span
 from .prepared_sm100_d128 import _GuardedAccumulationEntry
@@ -32,7 +32,7 @@ def check_support(api):
     require(match is not None and tuple(map(int, match.groups())) >= (4, 8, 0), f"requires nvidia-cutlass-dsl >= 4.8.0; found {version}")
     require(api.q_desc.device.type == "cuda", "Q must reside on CUDA")
     cc = compute_capability(resolve_device(api.q_desc.device))
-    require(tuple(cc) == (10, 0), f"requires SM100; got {cc}")
+    require(tuple(cc) in ACCUMULATION_CCS, f"requires SM100 or SM103; got {cc}")
     require(getattr(getattr(_pybind_module, "_SdpaBwdBinder", None), "supports_zero_workspace", False), "requires prepared backward native binding support")
     require(not api.seq_q_lens_present and not api.seq_kv_lens_present, "dense padding flags are not supported; THD lengths use packed metadata")
     require(not api.causal_bottom_right, "bottom-right causal is not supported")
@@ -158,7 +158,7 @@ def compile_plan(api):
     import cutlass
     import torch
 
-    from cudnn.frost.device import resolve_device
+    from cudnn.frost.device import compute_capability, resolve_device
 
     b, h, hk = api.batch_size, api.h_q, api.h_kv
     geometry, operands = [], []
@@ -191,6 +191,8 @@ def compile_plan(api):
         operands.append(Operand(str(desc.dtype).split(".")[-1], shape, strides, span, 4 if role == "stats" else 16, desc.dtype.itemsize))
     dtype = cutlass.BFloat16 if api.dtype == torch.bfloat16 else cutlass.Float16
     device = resolve_device(api.q_desc.device)
+    cc = compute_capability(device)
+    sm = cc[0] * 10 + cc[1]
     regions, required = api._grouped_workspace_regions, api._grouped_workspace_bytes
     if required != api.scratch_workspace_bytes():
         raise RuntimeError("grouped d128 compiled workspace disagrees with its advertised size")
@@ -201,11 +203,11 @@ def compile_plan(api):
         for name in api._thd_origin_dtypes:
             width = 8 if name == "int64" else 4
             operands.append(None if name is None else Operand(name, (b + 1,), (1,), b + 1, width, width))
-        args = ((b, h, hk, bool(api.thd_stats_token_major)), api._thd_origins, api._thd_origin_dtypes, dtype, api.is_causal, 100)
+        args = ((b, h, hk, bool(api.thd_stats_token_major)), api._thd_origins, api._thd_origin_dtypes, dtype, api.is_causal, sm)
     else:
         from .kernels.sm100.prepared_d128_grouped_host import compile_host
 
-        args = (tuple(geometry), regions, dtype, api.is_causal, 100)
+        args = (tuple(geometry), regions, dtype, api.is_causal, sm)
     with torch.cuda.device(device):
         entry = compile_host(*args)
     fn = positional_entry(entry)
