@@ -887,6 +887,15 @@ Keep `stream` last in private CuTe host signatures and preserve the
 signature does not qualify a reordered entry; exercise a real compiled launch
 after ABI changes before considering a change to that convention.
 
+AST-based host frame fixtures must retain unannotated runtime arguments;
+`ast.unparse(None)` fails before binding. Raw positional CuTe entries require
+every runtime slot, including optional `None` pointers and scalar defaults:
+Python signature defaults do not shorten the exported FFI frame. Keep the
+packed combine direct-call and fresh-process artifact tests synchronized with
+that frame. A graph-lowered adapter carrying physical origins is not a public
+standalone plan; construct the standalone API independently and retain its own
+workspace through capture replay, as in `test_paged_thd_split_capture_lengths_and_stats`.
+
 ### Native host ABI differences across architectures
 
 Do not infer a dense host signature from another architecture. SM107 D256 has

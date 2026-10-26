@@ -31,7 +31,7 @@ def _fixture(dtype="bfloat16", paged=False, hnd=False, lse=True, lengths=True, d
     s.expect = dict.fromkeys(("q", "k", "v", "o"), dtype)
     host_path = Path(prep.__file__).parent / f"kernels/sm100/decode_d{256 if d == 256 else 128}_f16.py"
     host = next(n for n in ast.parse(host_path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "_host")
-    s.order = [arg.arg for arg in host.args.args if "Constexpr" not in ast.unparse(arg.annotation)]
+    s.order = [arg.arg for arg in host.args.args if arg.annotation is None or "Constexpr" not in ast.unparse(arg.annotation)]
     s.index = {name: i for i, name in enumerate(s.order)}
     s.template = [None] * len(s.order)
     s.template[s.index["seq_q_lens_addr"]] = 0

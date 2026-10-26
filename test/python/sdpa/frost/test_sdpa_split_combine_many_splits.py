@@ -78,6 +78,9 @@ def test_packed_prefetch_excludes_zero_weight_partials(monkeypatch, group, sink)
                 total.data_ptr(),
                 torch.cuda.current_stream().cuda_stream,
                 sinks.data_ptr() if sink else None,
+                None,
+                None,
+                0,
             )
 
         run()

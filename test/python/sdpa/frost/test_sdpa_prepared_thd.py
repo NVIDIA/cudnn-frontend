@@ -2795,8 +2795,38 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
         workspaces.append(ws)
         from cuda.bindings import driver as cuda_driver
 
+        # Graph lowering binds physical origins. Build the public standalone
+        # compact-prefix contract independently, with the same selected knobs.
+        standalone_api = type(api)(
+            sample_q=api.q_desc,
+            sample_k=api.k_desc,
+            sample_v=api.v_desc,
+            sample_o=api.o_desc,
+            sample_lse=api.lse_desc,
+            is_causal=api.is_causal,
+            causal_bottom_right=api.causal_bottom_right,
+            scale_softmax=api.scale_softmax,
+            seq_kv_lens_present=True,
+            cu_seq_q_lens=True,
+            has_sink=has_sink,
+            thd=True,
+            max_total_seq_len_q=api.max_total_seq_len_q,
+            sched_policy=api.sched_policy,
+            cga=api.cga,
+            split_kv=api.split_kv,
+            pack_gqa=api.pack_gqa,
+            paged_page_size=page,
+            paged_max_seq_len_kv=kcap,
+            thd_stats_padded=stats_layout == "padded",
+            stats_log2=stats_log2,
+        )
+        assert standalone_api.check_support()
+        standalone_api.compile()
+        standalone_ws = torch.empty(max(standalone_api.scratch_workspace_bytes(), 1), device=DEV, dtype=torch.uint8)
+        workspaces.append(standalone_ws)
+
         def standalone(workspace):
-            api.execute(
+            standalone_api.execute(
                 bufs["q"],
                 bufs["k"],
                 bufs["v"],
@@ -2815,11 +2845,11 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
             with pytest.raises(ValueError, match="caller-owned workspace"):
                 standalone(None)
         with pytest.raises(ValueError, match="requires a .* workspace"):
-            standalone(ws[:-1])
-        standalone(ws)
+            standalone(standalone_ws[:-1])
+        standalone(standalone_ws)
         standalone_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(standalone_graph):
-            standalone(ws)
+            standalone(standalone_ws)
         captures.append(standalone_graph)
     try:
         lengths = (
