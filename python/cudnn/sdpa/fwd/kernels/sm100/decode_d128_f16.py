@@ -432,6 +432,11 @@ def _kernel(
     sO_raw = sQ_raw
     sK_raw = cutlass.Array(STORAGE_DTYPE, CFG.STAGES_KV * kBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
     sV_raw = cutlass.Array(STORAGE_DTYPE, CFG.STAGES_KV * vBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
+    # Packed plans exchange per-KV alpha through the existing stat_full/empty
+    # handshake. Unpacked plans retain their TMEM exchange and shared footprint.
+    sAlpha = None
+    if cutlass.const_expr(CFG.PACK_GQA):
+        sAlpha = cutlass.Array(cutlass.Float32, CFG.SOFTMAX_LANES, alignment=128, space=cutlass.AddressSpace.smem)
     # Quadrant softmax: the correction warps' (max, sum, O) merge staging -- two buffers (one per unit parity) of four warps x 32 rows.
     sMerge = None
     if cutlass.const_expr(QUAD):
@@ -546,6 +551,7 @@ def _kernel(
     if warp_idx >= CFG.SOFTMAX_WG0_BASE and warp_idx < CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS:
         nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
         _softmax_warp_group(
+            sAlpha=sAlpha,
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
             scale_log2=scale_softmax_log2,
@@ -565,6 +571,7 @@ def _kernel(
     elif warp_idx >= CFG.CORR_WARP_BASE and warp_idx < CFG.CORR_WARP_BASE + CFG.CORRECTION_WARPS:
         nvvm.setmaxregister(CFG.CORRECTION_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         _correction_warp_group(
+            sAlpha=sAlpha,
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
             sO=sO,
@@ -1368,6 +1375,7 @@ def _softmax_kv_body(
     stat_empty_phase,
     leader_cta_id,
     warp_w=None,
+    sAlpha=None,
 ):
     """Per-iter kv body for the (single) softmax warp group.
 
@@ -1462,9 +1470,14 @@ def _softmax_kv_body(
     )
     total_max_safe = new_total_max_safe
 
-    alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
-    nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
-    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+    if cutlass.const_expr(CFG.PACK_GQA):
+        alpha_lane = cute.arch.thread_idx()[0] - cutlass.Int32(CFG.SOFTMAX_WG0_BASE * 32)
+        sAlpha.subview(alpha_lane).data_ptr().store(alpha)
+        # Every producing lane arrives with release ordering after its shared store.
+    else:
+        alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
+        nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
     bars.mb_stat_full[0].arrive()
 
     reg_S = reg_S * scale_log2 - total_max_safe
@@ -1528,6 +1541,7 @@ def _softmax_kv_body_quad(
     stat_empty_phase,
     leader_cta_id,
     warp_w,
+    sAlpha=None,
 ):
     """Per-iter kv body of the quadrant-cooperative softmax (see QUAD): this warp's two 16-column pieces of the S tile (keys 16w.. and 64+16w..), its
     own online softmax over them, and its quarter of P -- zeros in the other three 8-word blocks of each 32-word P chunk, so the PV MMA's partial over
@@ -1594,9 +1608,14 @@ def _softmax_kv_body_quad(
     )
     total_max_safe = new_total_max_safe
 
-    alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
-    nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
-    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+    if cutlass.const_expr(CFG.PACK_GQA):
+        alpha_lane = cute.arch.thread_idx()[0] - cutlass.Int32(CFG.SOFTMAX_WG0_BASE * 32)
+        sAlpha.subview(alpha_lane).data_ptr().store(alpha)
+        # Every producing lane arrives with release ordering after its shared store.
+    else:
+        alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
+        nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
     bars.mb_stat_full[0].arrive()
 
     reg_S = reg_S * scale_log2 - total_max_safe
@@ -1652,6 +1671,7 @@ def _softmax_warp_group(
     leader_cta_id,
     cta_in_pair,
     qh_per_kh,
+    sAlpha=None,
 ):
     """The softmax warp group: online softmax per kv iter over the 128 x 128 S tile.
 
@@ -1740,6 +1760,7 @@ def _softmax_warp_group(
                     stat_empty_phase,
                     leader_cta_id,
                     warp_w,
+                    sAlpha,
                 )
         else:
             for kv_loop in cutlass.range(bounds.left, bounds.unmasked_lo, 1, unroll=1):
@@ -1760,6 +1781,7 @@ def _softmax_warp_group(
                     stat_empty_phase,
                     leader_cta_id,
                     warp_w,
+                    sAlpha,
                 )
             for kv_loop in cutlass.range(bounds.unmasked_lo, bounds.unmasked_hi, 1, unroll=1):
                 total_max, total_max_safe, total_sum, s_idx, s_phase, stat_empty_phase = _softmax_step(
@@ -1779,6 +1801,7 @@ def _softmax_warp_group(
                     stat_empty_phase,
                     leader_cta_id,
                     warp_w,
+                    sAlpha,
                 )
             for kv_loop in cutlass.range(bounds.unmasked_hi, bounds.right, 1, unroll=1):
                 total_max, total_max_safe, total_sum, s_idx, s_phase, stat_empty_phase = _softmax_step(
@@ -1798,6 +1821,7 @@ def _softmax_warp_group(
                     stat_empty_phase,
                     leader_cta_id,
                     warp_w,
+                    sAlpha,
                 )
 
         # End-of-kv: publish (total_max, total_sum_final) to TMEM Stats — corr reads it for LSE.
@@ -2078,6 +2102,7 @@ def _correction_warp_group(
     o_partial_f32=None,
     o_direct=None,
     sMerge=None,
+    sAlpha=None,
 ):
     """Correction warp group: 4 warps x 32 lanes = 128 lanes, 1 lane per O row.
 
@@ -2144,14 +2169,19 @@ def _correction_warp_group(
 
             bars.mb_stat_full[0].wait(stat_full_phase)
 
-            stats_addr = tmem_base_iter + cutlass.Int32(LAYOUT.STATS_OFF)
-            stats_vec = nvvm.tcgen05_ld(
-                "32x32b",
-                nvvm.make_tmem_ptr(stats_addr, cutlass.Float32),
-                num=2,
-            )
-            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-            alpha = stats_vec[0]
+            if cutlass.const_expr(CFG.PACK_GQA):
+                # stat_full acquires the producer stores; stat_empty below
+                # returns the same slot only after alpha has been loaded.
+                alpha = sAlpha.subview(tid_in_wg).data_ptr().load()
+            else:
+                stats_addr = tmem_base_iter + cutlass.Int32(LAYOUT.STATS_OFF)
+                stats_vec = nvvm.tcgen05_ld(
+                    "32x32b",
+                    nvvm.make_tmem_ptr(stats_addr, cutlass.Float32),
+                    num=2,
+                )
+                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                alpha = stats_vec[0]
 
             alpha_is_one = alpha == cutlass.Float32(1.0)
             all_alpha_one = vote_sync(0xFFFFFFFF, alpha_is_one, VoteSync.ALL)
