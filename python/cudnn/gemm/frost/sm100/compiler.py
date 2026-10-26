@@ -5208,11 +5208,11 @@ def _jit_moe(
 
 
 # A (1, 1, S) cluster reduces split-K in rank 0's SMEM. Measured on B200 (PR #1870):
-# S=2 with an N tile <= 32 beats the workspace + reduce kernel on every shape;
-# S=4 ties, S=8 loses (an 8-CTA cluster waits for a free GPC slot), and wider
-# mailboxes are mixed. The template supports S up to 8.
-_CLUSTER_K_SLICES = (2,)
-_CLUSTER_K_MAX_MAILBOX_BYTES = 16 * 1024
+# with an N tile <= 32 it beats or ties the workspace + reduce kernel at every S;
+# wider N tiles were mixed.
+_CLUSTER_K_SLICES = (2, 4, 8)
+_CLUSTER_K_MAX_N_TILE = 32
+_CLUSTER_K_MAX_MAILBOX_BYTES = 48 * 1024
 
 
 def _cluster_k_mailbox_bytes(cfg: TileConfig, slices: int) -> int:
@@ -5231,6 +5231,7 @@ def _cluster_k_slices(chain: FusionChain, config: TileConfig) -> int:
         or config.cga_size_m != 1
         or config.cga_size_n != 1
         or config.cta_tile_m != 128
+        or config.cta_tile_n > _CLUSTER_K_MAX_N_TILE
         or config.mma_size_m != 1
         or chain.num_gemms != 1
         or chain.has_moe

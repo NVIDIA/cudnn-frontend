@@ -202,6 +202,7 @@ def test_cluster_k_matches_workspace_split_bitwise(combo, width, M, N, K, split,
 
     monkeypatch.setattr(sm100_compiler, "_CLUSTER_K_SLICES", (2, 4, 8))
     monkeypatch.setattr(sm100_compiler, "_CLUSTER_K_MAX_MAILBOX_BYTES", 64 * 1024)
+    monkeypatch.setattr(sm100_compiler, "_CLUSTER_K_MAX_N_TILE", 64)
     compiled, c_cluster = _run(combo, _narrow(width), M, N, K, split_k=split)
     assert compiled.cluster_k_slices == split and compiled.workspace_bytes == 0
     monkeypatch.setenv("CUDNN_FROST_DISABLE_CLUSTER_K", "1")
@@ -215,8 +216,11 @@ def test_cluster_k_matches_workspace_split_bitwise(combo, width, M, N, K, split,
     [
         (8, 2, 2),
         (32, 2, 2),
-        (8, 4, 1),  # S=4 ties the reduce kernel
-        (64, 2, 1),  # a 32 KiB mailbox
+        (8, 4, 4),
+        (8, 8, 8),
+        (32, 4, 4),
+        (32, 8, 1),  # a 112 KiB mailbox
+        (64, 2, 1),  # N tile > 32
     ],
 )
 def test_cluster_k_eligibility(width, split, expected):
