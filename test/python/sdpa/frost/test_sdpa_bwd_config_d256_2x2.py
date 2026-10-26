@@ -78,7 +78,8 @@ def test_2x2_factory_rejects_other_families():
         (dict(window_right=64), r"window_right must be 0 when set"),
         (dict(bottom_right=True), r"bottom_right alignment requires a causal band"),
         (dict(seq_q_lens_present=True), r"seq_q_lens_present is not implemented"),
-        (dict(thd_varlen=True), r"thd_varlen is not implemented"),
+        (dict(thd_varlen=True, seq_kv_lens_present=True), r"thd_varlen is mutually exclusive"),
+        (dict(thd_varlen=True, sched_policy=SCHED_LPT), r"thd_varlen requires sched_policy NATURAL"),
         (dict(dtype_o=DTYPE_E4M3), r"dtype_o must be -1"),
         (dict(dtype_ds=DTYPE_FP16), r"dtype_ds must be -1 or the io dtype"),
         (dict(ds_sf_policy=1), r"ds_sf_policy is the MXFP8 family's"),
@@ -87,6 +88,22 @@ def test_2x2_factory_rejects_other_families():
 def test_2x2_factory_shares_the_record_guards(kw, match):
     with pytest.raises(ValueError, match=match):
         _cfg(**kw)
+
+
+@pytest.mark.parametrize("dtype", [DTYPE_BF16, DTYPE_FP16])
+def test_thd_retains_the_complete_stage3_write_pair(dtype):
+    cfg = _cfg(dtype_qkv=dtype, thd_varlen=True, window_right=0, bottom_right=True)
+    assert cfg.THD_VARLEN == 1 and cfg.SEQ_KV_LENS_PRESENT == 0
+    assert cfg.MASK_FLAGS == MASK_CAUSAL | MASK_PADDED
+    assert cfg.KV_BLOCK_ROWS == 128
+    assert cfg.WS_BLOCK_ROWS == cfg.STAGE3_GRAN_ROWS == 256
+    with pytest.raises(ValueError, match="THD workspace rows must preserve"):
+        c2._validate_cfg_d256_2x2(dataclasses.replace(cfg, WS_BLOCK_ROWS=128))
+
+
+def test_interleaved_2x2_thd_stays_declined():
+    with pytest.raises(ValueError, match="THD is implemented only on the SM100 profile"):
+        _cfg(profile=P2, thd_varlen=True)
 
 
 # --------------------------------------------------------------------------- the two profiles, pinned as values
@@ -375,3 +392,22 @@ def test_mma_order_default_per_profile():
     dense, 2020 vs 1974 us causal); profile 2 keeps the design's lookahead order until the Rubin lane measures it."""
     assert _cfg(P1).MMA_LOOKAHEAD == 0
     assert _cfg(P2).MMA_LOOKAHEAD == 1
+
+
+def test_thd_work_bound_covers_each_sequences_write_pair():
+    import itertools
+
+    cfg = _cfg(P1, thd_varlen=True)
+    for lengths in itertools.product((0, 1, 127, 128, 129, 255, 256, 257), repeat=3):
+        for heads in (1, 4):
+            live = sum(2 * -(-length // 256) * heads for length in lengths)
+            assert c2.thd_units_upper_bound_2x2(cfg, sum(lengths), len(lengths), heads) >= live
+    # Rounding to compute blocks loses one masked half for each short sequence.
+    assert c4.thd_units_upper_bound(cfg, 16, 16, 1) < 32
+    assert c2.thd_units_upper_bound_2x2(cfg, 16, 16, 1) >= 32
+
+
+@pytest.mark.parametrize("capacity,batch,heads", [(-1, 1, 1), (0, 0, 1), (0, 1, 0)])
+def test_thd_work_bound_rejects_invalid_geometry(capacity, batch, heads):
+    with pytest.raises(ValueError, match="THD work bound"):
+        c2.thd_units_upper_bound_2x2(_cfg(P1, thd_varlen=True), capacity, batch, heads)

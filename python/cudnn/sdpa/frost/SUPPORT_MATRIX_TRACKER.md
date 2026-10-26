@@ -478,15 +478,15 @@ MMA as d=512.
 | **Layout** | | | | | | | |  |
 | BSHD | ✅ᵗ⁰ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵍ |  ✅ᵇ² ᵍ  |
 | Arbitrary dense B/H/S stride order (`dense_flex`) | f16 onlyᵗ⁰ | f16 only | f16 only | f16 only | ✅ | f16 only | ✅ᵇ ᶜ · ❌ᵍ |  ❌ᵇ² · ❌ᵍ  |
-| THD / ragged (packed varlen)ᵏ | via the native d64 flavorᵗ⁰ | f16 only⁹ | ✅ | f16 + fp8 + mxfp8³ | f16 + fp8 + mxfp8⁹ | f16 + fp8 + mxfp8³ | ✅ᵇ ʰ · ❌ᵍ |  ❌ᵇ² · ❌ᵍ  |
+| THD / ragged (packed varlen)ᵏ | via the native d64 flavorᵗ⁰ | f16 only⁹ | ✅ | f16 + fp8 + mxfp8³ | f16 + fp8 + mxfp8⁹ | f16 + fp8 + mxfp8³ | ✅ᵇ ʰ · ❌ᵍ | ✅ᵇ² · ❌ᵍ |
 | `cu_seq_len_q/kv` prefix sums (THD only) | via the native d64 flavorᵗ⁰ | f16 only⁹ | ✅ | ✅ | ✅ | ✅ | ❌ʲ |  ❌ʲ  |
 | **Masks / features** | | | | | | | |  |
 | Causal (top-left) | ✅ᵗ⁰ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵈ ᵍ |  ✅ᵇ² ᵍ  |
 | Causal bottom-right | ✅ᵗ⁰ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵈ · ❌ᵍ |  ✅ᵇ² · ❌ᵍ  |
 | Causal right-band widening | ✅ᵗ⁰ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ · ❌ᵍ |  ❌ᵇ² · ❌ᵍ  |
 | Sliding window (left) | ✅ᵗ⁰ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ · ❌ᵍ |  ✅ᵇ² · ❌ᵍ  |
-| Padding mask (`seq_len_q/kv`) | ✅ᵗ⁰ | ✅ | ✅ | ✅ | ✅ | ✅ | THD onlyᵇ ʰ · ❌ᵍ |  ❌ᵇ² · ❌ᵍ  |
-| THD + causal family (top-left / bottom-right / SWA / band) | via the native d64 flavorᵗ⁰ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ʰ · ❌ᵍ |  ❌  |
+| Padding mask (`seq_len_q/kv`) | ✅ᵗ⁰ | ✅ | ✅ | ✅ | ✅ | ✅ | THD onlyᵇ ʰ · ❌ᵍ | THD onlyᵇ² · ❌ᵍ |
+| THD + causal family (top-left / bottom-right / SWA / band) | via the native d64 flavorᵗ⁰ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ʰ · ❌ᵍ | top-left / bottom-right / SWAᵇ²; no band |
 | Padding mask + stats (per-batch LSE trim) | ✅ᵗ⁰ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |  ❌  |
 | Dense padded-Q trim (O:=0, LSE:=−inf) | ✅ᵗ⁰ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |  ❌  |
 | Attention sink (incl. `S_q == 1` decode)ˢ | ✅ᵗ⁰ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |  ❌  |
@@ -1023,12 +1023,22 @@ dense, top-left and bottom-right causal (ragged S_q included), sliding window
 io, contiguous fp32 Stats. The dense BSHD declaration also accepts a nonoverlapping,
 16-byte aligned physical batch pitch with compact head/token/element strides. Existing
 padding and copy-out helpers preserve the declared pitch; no additional layout-repack
-kernel is inserted. This is a dense-layout contract, not THD/ragged support. The pinned
+kernel is inserted. The pinned
 `test_batch_pitch_rebind_and_replay` checks MHA/GQA, BF16/FP16, rectangular bottom-right
 calls, Q/KV tails, fresh bindings, explicit streams, poisoned-workspace replay and
 untouched physical padding. Other architecture/quantized rows keep their existing
-compact-layout checks. Declined, each asserted by a test: dense padding
-masks, sink / dSink, bias / dBias, right-band widening, THD, `dense_flex`, decode
+compact-layout checks. Packed THD also serves BF16/FP16 MHA/GQA with declared
+Q/KV token capacities, top-left or bottom-right causal masking and a left sliding
+window. Each of Q/K/V/O/dO/dQ/dK/dV/Stats has its own optional INT32/INT64
+ragged offset and multiplier; absent origins use compact length prefixes. Stats
+may be token-major or head-major. Device metadata and per-sequence TMA maps
+preserve physical gaps without repacking; internal dS/delta and GQA partials
+remain compact. The persistent scheduler covers both 128-row halves of each
+256-row stage-3 write pair, including masked tails and empty sequences.
+`test_sdpa_bwd_thd_d256_sm100.py` pins this graph row and checks FP64 gradients,
+padding canaries, changing offsets/lengths, buffer rebinding and retained captures.
+Dense padding masks remain declined. Declined, each asserted by a test: dense padding
+masks, sink / dSink, bias / dBias, right-band widening, `dense_flex`, decode
 shapes, `use_deterministic_algorithm` (no atomics in the chain; the two-launch
 bitwise test passes, the claim waits on the bring-up sweep). **The native
 competitor on B200 / cuDNN 9.26 is backend engine 5**

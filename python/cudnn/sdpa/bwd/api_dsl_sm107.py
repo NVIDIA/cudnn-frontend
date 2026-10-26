@@ -666,6 +666,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
     # dS workspace, per-sequence lengths and the device claim counter from the metadata buffer -- ``sm107/bprop_d256_f16.py``
     # "THD / varlen"; the fp8 and MXFP8 bodies carry the same leg -- the MXFP8 one over packed per-sequence-tile-padded scale factors).
     _THD_SUPPORTED = True
+    _THD_ORIGINS_SUPPORTED = False
 
     def __init__(
         self,
@@ -676,6 +677,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         max_total_seq_len_kv: Optional[int] = None,
         thd_stats_token_major: bool = False,
         thd_stats_head_stride: Optional[int] = None,
+        thd_ragged_offsets=None,
         **kwargs,
     ) -> None:
         """``external_delta`` (appended, default off): the caller computes stage 1's ``delta = rowsum(dO * O)`` and hands it to
@@ -688,6 +690,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         filters its extra constructor arguments by ``inspect.signature(adapter_cls.__init__)``, and a bare ``**kwargs`` hides them --
         the same rule the SM100 adapter's constructor spells out): without them a ragged graph would reach ``check_support`` as a
         DENSE plan and fail its Stats-layout check instead of being served."""
+        self._thd_ro_spec = dict(thd_ragged_offsets or {})
         self.external_delta = bool(external_delta)
         super().__init__(
             *args,
@@ -778,6 +781,12 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
     def check_support(self) -> bool:
         """Re-check what the Capabilities row promised (backstops, never the gate)."""
         n = self._NAME
+        self._value_error_if(
+            bool(self._thd_ro_spec) and (not self.thd or not self._THD_ORIGINS_SUPPORTED), f"{n}: independent THD origins are not implemented on this row"
+        )
+        if self._thd_ro_spec:
+            _prepared.check_thd_origins(self)
+
         self._value_error_if(
             self.head_dim_qk != _SM107_D or self.head_dim_v != _SM107_D, f"{n}: d_qk = d_v = {_SM107_D} exactly; got {self.head_dim_qk} / {self.head_dim_v}"
         )
@@ -927,8 +936,10 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
             plan += [
                 ("ds_ws", (1, self._qh_chunk, self._ws_rows_cap, sqp), self._ds_dtype),
                 ("seq_kv", (THD_BWD_MAPS_META_WORDS(b, self._thd_map_slots(b)),), torch.int32),
-                ("desc_words", ((b + 1) * 16,), torch.int64),
+                ("desc_words", ((2 * b if self._thd_ro_spec else b + 1) * 16,), torch.int64),
             ]
+            if self._thd_ro_spec:
+                plan.append(("thd_origins", (9, b), torch.int64))
             return plan + self._thd_family_scratch_shapes(tq, tkv, gqa)
         plan = []
         if not self.external_delta:
@@ -968,7 +979,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         packed-total-clamped input descriptors (Q, dO, dO_dv, K, V) + one clipped dV descriptor per sequence on the half and fp8
         bodies (``sm107/bprop_d256_f16.py`` ``THD_MAP_SLOTS``).  A body with more clamped inputs (the MXFP8 one's five scale-factor
         maps) overrides; the scratch plan and the host's maps view must agree, so it is spelled once, here."""
-        return 5 + b
+        return 5 + (6 if self._thd_ro_spec else 1) * b
 
     def _thd_family_scratch_shapes(self, tq: int, tkv: int, gqa: bool):
         """The family's regions of a THD plan, after the four shared ones (``[(name, shape, dtype)]`` over the PACKED token
@@ -1109,7 +1120,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
                 _DTYPE_CODE[self._ds_dtype],
                 bool(self.is_causal),
                 0,
-                _cfg.kv_pad_rows(mod.CFG),
+                self._stage3_gran(mod),
                 cgrp_tile_mn=tile_mn,
                 window=self.window_size_left,
                 gqa_group=self._gqa_group,
@@ -1158,10 +1169,11 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
             # grid: min(the unit upper bound, the device's cluster count) -- occupancy-sized, a cluster whose first unit is past
             # the device live total runs one forced fully-masked tile.
             self._zero_ws = _stage3_thd_needs_zero_fill(bool(self.is_causal), self.window_size_left, _SM107_KV_PAD, cgrp_tile_m=tile_mn[0])
+            unit_bound = _cfg2x2.thd_units_upper_bound_2x2 if self._datapath_2x2_profile() else _cfg.thd_units_upper_bound
             self._thd_units = max(
                 1,
                 min(
-                    _cfg.thd_units_upper_bound(mod.CFG, self._t_kv_cap, self.batch_size, self._qh_chunk),
+                    unit_bound(mod.CFG, self._t_kv_cap, self.batch_size, self._qh_chunk),
                     _sm100_device_clusters(self.q_desc.device, mod.CFG.CGA_M),
                 ),
             )
@@ -1233,6 +1245,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         bias_tensor: Optional[torch.Tensor] = None,
         dbias_tensor: Optional[torch.Tensor] = None,
         delta_tensor: Optional[torch.Tensor] = None,
+        thd_ragged_offsets=None,
     ) -> None:
         """The standalone twin of the graph plan: the same prepared artifact, bound from torch
         tensors (``prepared_sm107.execute_standalone``).  Every operand must carry the plan's
@@ -1246,6 +1259,8 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         The two are independent plan facts: a plan built with both takes both."""
         self._refuse_unclaimed(seq_q_lens, seq_kv_lens, sink_tensor, dsink_tensor, bias_tensor, dbias_tensor)
         self._check_external_delta(delta_tensor)
+        offsets = dict(thd_ragged_offsets or {})
+        self._value_error_if(set(offsets) != set(self._thd_ro_spec), f"{self._NAME}: bind exactly the declared THD ragged-offset ports")
         self.compile()
         if self.thd:
             # The THD spec's slots 9 / 10 are the two length tensors, slot 11 the delta (`prepared_sm107.ROLES_F16_THD`): bound exactly
@@ -1253,6 +1268,8 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
             tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor, seq_q_lens, seq_kv_lens, delta_tensor)
         else:
             tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor, seq_kv_lens, delta_tensor)
+        if self._thd_ro_spec:
+            tensors += tuple(offsets.get(port) for port in _prepared.THD_ORIGIN_PORTS)
         _prepared.execute_standalone(self, tensors, workspace, current_stream, scale_softmax)
 
 

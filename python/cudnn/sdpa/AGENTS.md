@@ -429,6 +429,14 @@ Kernels on this atom: forward `fwd/kernels/sm100/prefill_d512_f16_2x2.py` + `fwd
 its runnable detector (forward: `test/python/sdpa/frost/test_sdpa_fwd_d512_2x2_sm100.py`; backward:
 `test_sdpa_bwd_config_sm100_2x2.py`, `test_sdpa_bwd_dsl_sm100.py`, `test_sdpa_bwd_thd_sm100.py`); add to the list, do not restate.
 
+D256 packed backward schedules the **256-row write pair**, even though each
+2x2 compute cluster covers only 128 KV rows. Run both halves of a tail pair:
+stage 3 can read the masked half, so omitting it consumes stale dS after replay.
+Keep physical per-port origins separate from compact workspace prefixes and
+retain barrier arrivals for dead work while suppressing its output stores.
+`test_sdpa_bwd_thd_d256_sm100.py::test_origins_rebind_and_replay` checks this
+with poisoned scratch, one-sided empties and changed device metadata.
+
 Shared protocol (both passes):
 
 - **An end-of-kernel ring drain walks the WHOLE ring, never `min(total, stages)` steps.**  A consumer started at
@@ -793,6 +801,15 @@ for the old message.
 
 
 ## Prepared THD launch bounds and setup
+
+Ragged-offset integer widths are compiled pointer-ABI facts. Include the whole
+per-port dtype tuple in the prepared artifact key, alongside origin strides and
+multipliers. A valid second plan can otherwise read INT64 offsets as INT32 (or
+the reverse) from an earlier cached host. The D256 detector
+`test_origin_integer_types_separate_compiled_artifacts` checks both transitions
+for Q and Stats, distinct artifacts, disk reload with compilation forbidden,
+and numerical output after replay. Check artifact identity before launching a
+known-colliding negative control.
 
 Each compiled host contract has one production binder across graph, standalone,
 and staged entry points. Forward and half backward use native binding. Quantized
