@@ -33,6 +33,17 @@ def test_rectangular_backward_replay_and_rebind(monkeypatch, dt, sq, sk, hk, cau
         from cudnn.sdpa.bwd import api_dsl_sm107
 
         monkeypatch.setattr(api_dsl_sm107, "_SM107_WS_BUDGET_BYTES", budget)
+    from cudnn.sdpa.bwd.api_dsl_sm100_d256 import SdpaBwdDslSm100D256
+
+    compiled_geometry = []
+    original_compile = SdpaBwdDslSm100D256._compile_plan
+
+    def record_compile(api, main, mm_dk, mm_dq):
+        compiled_geometry.append((main.CFG.TILE_K, main.CFG.TILE_O))
+        assert compiled_geometry[-1] == (192, 128), "the actual compiled body must use native rectangular geometry"
+        return original_compile(api, main, mm_dk, mm_dq)
+
+    monkeypatch.setattr(SdpaBwdDslSm100D256, "_compile_plan", record_compile)
     b, hq, d, dv = 2, 4, 192, 128
     keep = _causal_keep(sq, sk, causal=causal, bottom_right=br, left=left)
     kwargs = {}
@@ -44,6 +55,7 @@ def test_rectangular_backward_replay_and_rebind(monkeypatch, dt, sq, sk, hk, cau
     select_engine(g, _ENGINE)
     g.check_support()
     g.build_plans()
+    assert compiled_geometry
     assert g._compiled_plans[g._plan_index]._prepared is not None
     ws = torch.empty(max(1, g.get_workspace_size()), dtype=torch.uint8, device="cuda")
     grads = (_bshd_empty(b, sq, hq, d, dt), _bshd_empty(b, sk, hk, d, dt), _bshd_empty(b, sk, hk, dv, dt))
@@ -107,3 +119,12 @@ def test_exact_head_pair_admission(monkeypatch, d, dv, thd, served):
 
     reason = _decline_reason(monkeypatch, d=d, d_v=dv, thd=thd)
     assert (reason is None) == served, reason
+
+
+@pytest.mark.parametrize("profile,thd,dqk,dv", [(2, False, 192, 128), (1, True, 192, 128), (1, False, 128, 128), (1, False, 256, 128)])
+def test_unqualified_native_geometry_is_rejected(profile, thd, dqk, dv):
+    from cudnn.sdpa.bwd.config_d256_2x2 import FAMILY_F16, TemplateParams2x2, make_cfg_d256_2x2
+
+    params = TemplateParams2x2(datapath_2x2_profile=profile, thd_varlen=thd, head_dim_qk=dqk, head_dim_v=dv)
+    with pytest.raises(ValueError, match="head geometry"):
+        make_cfg_d256_2x2(params, FAMILY_F16)

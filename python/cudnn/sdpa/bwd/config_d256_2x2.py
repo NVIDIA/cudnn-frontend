@@ -59,6 +59,7 @@ __all__ = [
     "TmemLayout2x2",
     "FAMILY_F16",
     "TemplateParams",
+    "TemplateParams2x2",
     "MMA_M",
     "SUB_ROWS",
     "TMEM_ALLOC_COLS",
@@ -116,6 +117,14 @@ _FLAVOR = "bwd d256 2x2 f16"
 # ---------------------------------------------------------------------------
 # The Cfg record: the 4x1 vocabulary plus the 2x2 axis (append-only)
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TemplateParams2x2(TemplateParams):
+    """Append-only head geometry for the SM100 2x2 body; legacy D256 records remain valid."""
+
+    head_dim_qk: int = 256
+    head_dim_v: int = 256
 
 
 @dataclass(frozen=True)
@@ -268,7 +277,7 @@ def buffer_elems_2x2(cfg: CfgBwdD256x2) -> BufferElems2x2:
         vTmaTransactionBytes=cfg.KV_SUBBLOCKS * v_sub * cfg.BPE * cfg.CTA_MMA,
         LEADING_BYTE_OFFSET_QK=0,
         STRIDE_BYTE_OFFSET_QK=8 * cfg.Q_SWZ_BYTES,
-        LEADING_BYTE_OFFSET_dO_SG1=cfg.TILE_N * cfg.dO_SWZ_BYTES,
+        LEADING_BYTE_OFFSET_dO_SG1=cfg.TILE_N * cfg.dO_SWZ_BYTES if cfg.TILE_O // cfg.CTA_MMA > granu else 0,
         STRIDE_BYTE_OFFSET_dO_SG1=8 * cfg.dO_SWZ_BYTES,
         LEADING_BYTE_OFFSET_P=0,
         STRIDE_BYTE_OFFSET_P=8 * cfg.P_SWZ_BYTES,
@@ -305,13 +314,14 @@ def tmem_layout_2x2(cfg: CfgBwdD256x2) -> TmemLayout2x2:
     s_base = 0
     dp_base = cfg.STAGES_TMEM_S * _S_COLS
     dv_base = 2 * cfg.STAGES_TMEM_S * _S_COLS
-    sub_used = dv_base + _DV_COLS
+    dv_cols = cfg.TILE_O // 2
+    sub_used = dv_base + dv_cols
     sub_stride = sub_used if cfg.KV_SUBBLOCKS > 1 else 0
     used = cfg.KV_SUBBLOCKS * sub_used
     return TmemLayout2x2(
         TOTAL_COLS=cfg.TMEM_ALLOC_COLS,
         S_COLS=_S_COLS,
-        DV_COLS=_DV_COLS,
+        DV_COLS=dv_cols,
         STAGES_TMEM_S=cfg.STAGES_TMEM_S,
         S_BASE=s_base,
         dP_BASE=dp_base,
@@ -520,8 +530,12 @@ def _validate_cfg_d256_2x2(cfg: CfgBwdD256x2) -> None:
                 f"{f}: TILE_M = 64 kv rows per CTA per sub-block, MMA_M = TILE_M * CTA_MMA = 128 (the 2x2 collective M)",
             ),
             (
-                cfg.TILE_N == 128 and cfg.TILE_K == 256 and cfg.TILE_O == 256,
-                f"{f}: TILE_N = 128 q cols, d_qk = d_v = 256 exactly; got {cfg.TILE_N}/{cfg.TILE_K}/{cfg.TILE_O}",
+                cfg.TILE_N == 128
+                and (
+                    (cfg.TILE_K, cfg.TILE_O) == (256, 256)
+                    or ((cfg.TILE_K, cfg.TILE_O) == (192, 128) and cfg.DATAPATH_2X2_PROFILE == PROFILE_SM100 and not cfg.THD_VARLEN)
+                ),
+                f"{f}: TILE_N = 128 q cols; native D256 or dense SM100 D192x128 required; got {cfg.TILE_N}/{cfg.TILE_K}/{cfg.TILE_O}",
             ),
             (
                 cfg.CGA_M == 2 and cfg.CGA_N == 1 and cfg.CTA_MMA == 2,
@@ -685,8 +699,8 @@ def _validate_cfg_d256_2x2(cfg: CfgBwdD256x2) -> None:
                 f"{f}: profile {cfg.DATAPATH_2X2_PROFILE} renders descriptor version {want_v} (every root under 256 KiB on SM100; the Rubin sP root past it); the layout tally says {desc_version_2x2(cfg)}",
             ),
             (
-                b.dVBufferElems * cfg.BPE_O == b.kBufferElems * cfg.BPE,
-                f"{f}: the dV staging aliases sK exactly (dVBufferElems * BPE_O == kBufferElems * BPE); got {b.dVBufferElems * cfg.BPE_O} vs {b.kBufferElems * cfg.BPE}",
+                b.dVBufferElems * cfg.BPE_O <= b.kBufferElems * cfg.BPE,
+                f"{f}: the dV staging fits within sK (dVBufferElems * BPE_O <= kBufferElems * BPE); got {b.dVBufferElems * cfg.BPE_O} vs {b.kBufferElems * cfg.BPE}",
             ),
         ]
     )
@@ -710,6 +724,9 @@ def make_cfg_d256_2x2(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
         )
     if getattr(params, "thd_varlen", False) and profile != PROFILE_SM100:
         raise ValueError(f"{_FLAVOR}: THD is implemented only on the SM100 profile")
+    d_qk, d_v = getattr(params, "head_dim_qk", 256), getattr(params, "head_dim_v", 256)
+    if (d_qk, d_v) != (256, 256) and not ((d_qk, d_v) == (192, 128) and profile == PROFILE_SM100 and not getattr(params, "thd_varlen", False)):
+        raise ValueError(f"{_FLAVOR}: head geometry must be D256 or dense SM100 D192x128; got {d_qk}/{d_v}")
     _c._validate_params(_FLAVOR, FAMILY_F16, params, datapath_2x2=True)
     dtype_o = getattr(params, "dtype_o", -1)
     if dtype_o < 0:
@@ -742,8 +759,8 @@ def make_cfg_d256_2x2(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
     cfg = CfgBwdD256x2(
         TILE_M=SUB_ROWS,
         TILE_N=128,
-        TILE_K=256,
-        TILE_O=256,
+        TILE_K=d_qk,
+        TILE_O=d_v,
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
         BPE=bpe(params.dtype_qkv),
@@ -827,7 +844,7 @@ def make_cfg_d256_2x2(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
         SMEM_CAP=SMEM_CAP_BYTES_SM100 if profile == PROFILE_SM100 else SMEM_CAP_BYTES_SM107,
         # Profile 1 ships the NATURAL order (measured, see the field); profile 2 keeps the design's lookahead until the Rubin A/B.
         MMA_LOOKAHEAD=0 if profile == PROFILE_SM100 else 1,
-        SUBBLOCK_STRIDE_COLS=(2 * stages_tmem_s * _S_COLS + _DV_COLS) if subblocks > 1 else 0,
+        SUBBLOCK_STRIDE_COLS=(2 * stages_tmem_s * _S_COLS + d_v // 2) if subblocks > 1 else 0,
     )
     _validate_cfg_d256_2x2(cfg)
     return cfg

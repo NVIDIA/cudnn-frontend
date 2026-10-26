@@ -699,7 +699,7 @@ def _kernel(
     sP_raw = cutlass.Array(STORAGE_DTYPE, N_P_BARS * pSlabElems, alignment=1024, space=cutlass.AddressSpace.smem)
     sStats_raw = cutlass.Array(cutlass.Float32, CFG.STATS_STAGES * STATS_SLOT_ELEMS, alignment=1024, space=cutlass.AddressSpace.smem)
     sdS_raw = cutlass.Array(DS_STORAGE_DTYPE, CFG.XFER_STAGES * dSBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
-    # dV epilogue staging: an OUT_STORAGE_DTYPE view of sK (dVBufferElems * BPE_O == kBufferElems * BPE, config-pinned), live
+    # dV epilogue staging: an OUT_STORAGE_DTYPE view of sK (dVBufferElems * BPE_O <= kBufferElems * BPE, config-pinned), live
     # only after the q loop (the TMA-LDG waits mb_dv_stg_empty before the next block's K load).
     sdV_raw = cutlass.Array(sK_raw.data_ptr(), shape=dVBufferElems, dtype=OUT_STORAGE_DTYPE)
 
@@ -1363,6 +1363,19 @@ def _mma_warp(
         idesc=idesc_bmm1,
         kind=MMA_KIND,
     )
+    # dP contracts the value width, independently of the score contraction.
+    dp_desc = MmaDesc(
+        M=CFG.MMA_M,
+        N=CFG.TILE_N,
+        K=CFG.TILE_O,
+        bpe_a=CFG.BPE,
+        bpe_b=CFG.BPE,
+        tile_k_hw=CFG.TILE_K_HW_BMM1,
+        btranspose=False,
+        cta_group=CFG.CTA_MMA,
+        idesc=idesc_bmm1,
+        kind=MMA_KIND,
+    )
     # BMM2 dV += P . dO (A = P in SMEM [64 kv x 128 q] K-major, 2 subtiles of 8 KiB; B = dO_dv BT [128 q x 128 d_v per CTA],
     # N = d_v = 256 collective, K = q = 128: 8 k-steps of 2 KiB B advances inside one 16 KiB column subtile).
     idesc_bmm2 = prims.Tcgen05InstrDesc.build(
@@ -1465,7 +1478,7 @@ def _mma_warp(
                 dp_bar = s * CFG.STAGES_TMEM_S + dp_empty_state.idx
                 bars.mb_dp_empty[dp_bar].wait(dp_empty_state.phase, spin=SPIN_RING_WAITS)
                 mma_ss(
-                    bmm1_desc,
+                    dp_desc,
                     desc_V[s],
                     desc_dO,
                     tmem_dP.subview(cutlass.Int32(s * LAYOUT.SUB_STRIDE) + dp_empty_state.idx * cutlass.Int32(LAYOUT.S_COLS)),
@@ -1718,15 +1731,18 @@ def _compute_warp(
         # + [0, 64) = the 128-B-row store subtile gblk = 2*q_half + cs*DV_LOADS_PER_LANE + b, at row stg_row.
         bars.mb_dv_ready.wait(dv_ready_state.phase, spin=SPIN_RING_WAITS)
         dv_ready_state = advance(dv_ready_state, 1)
-        for _b in cutlass.range_constexpr(DV_LOADS_PER_LANE):
-            dcol = cs * cutlass.Int32(DV_LOADS_PER_LANE * DV_LOAD_COLS) + cutlass.Int32(_b * DV_LOAD_COLS)
-            reg_dV = tmem_load_tile(tmem_base + cutlass.Int32(LAYOUT.dV_BASE) + sub_base + dcol, num_elems=DV_LOAD_COLS)
-            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-            dV_out = reg_dV.vec.to(OUT_STORAGE_DTYPE)
-            gblk = q_half * cutlass.Int32(2) + cs * cutlass.Int32(DV_LOADS_PER_LANE) + cutlass.Int32(_b)
-            sdV_raw.subview(gblk * cutlass.Int32(DV_BLOCK_SLAB) + stg_row * cutlass.Int32(DV_D_BLOCK)).data_ptr().store_swizzled(
-                dV_out, alignment=128, swizzle=P_SMEM_SWIZZLE
-            )
+        # N128 occupies one 64-column half per lane quadrant. The other
+        # compute group skips its dV load/store but retains every arrival.
+        if cutlass.const_expr(CFG.TILE_O == 256) or cs == cutlass.Int32(0):
+            for _b in cutlass.range_constexpr(DV_LOADS_PER_LANE):
+                dcol = cs * cutlass.Int32(DV_LOADS_PER_LANE * DV_LOAD_COLS) + cutlass.Int32(_b * DV_LOAD_COLS)
+                reg_dV = tmem_load_tile(tmem_base + cutlass.Int32(LAYOUT.dV_BASE) + sub_base + dcol, num_elems=DV_LOAD_COLS)
+                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                dV_out = reg_dV.vec.to(OUT_STORAGE_DTYPE)
+                gblk = q_half * cutlass.Int32(CFG.TILE_O // 128) + cs * cutlass.Int32(DV_LOADS_PER_LANE) + cutlass.Int32(_b)
+                sdV_raw.subview(gblk * cutlass.Int32(DV_BLOCK_SLAB) + stg_row * cutlass.Int32(DV_D_BLOCK)).data_ptr().store_swizzled(
+                    dV_out, alignment=128, swizzle=P_SMEM_SWIZZLE
+                )
         nvvm.fence_proxy("async.shared", space="cta")
         bars.mb_dv_stg_full.arrive()
         # dV read -> the next block's BMM2(q_lo) (accumulate=False) may overwrite it.

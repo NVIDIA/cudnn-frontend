@@ -1614,7 +1614,7 @@ def _sm100_d256_spec() -> EngineSpec:
     no-zero-fill contract are the Rubin row's.
 
     Packed THD accepts independent per-port physical origins and both packed Stats layouts, with declared token capacities.
-    Exact ``d_qk == d_v == 256``, plus dense-only ``(d_qk, d_v) == (192, 128)`` through the D256 compute envelope.
+    Exact ``d_qk == d_v == 256``, plus dense-only ``(d_qk, d_v) == (192, 128)`` through native 192/128 stage-2 geometry.
     Tensor maps retain each operand's actual width; delta and GQA fold use the value width. Any S_q / S_kv (padded to 128 / 256 and masked), dense, top-left and bottom-right causal,
     sliding window (left), MHA / GQA / MQA, BSHD-physical io, contiguous fp32 Stats, bf16 / fp16.  Declined, each asserted
     by a test (``test_sdpa_bwd_d256_sm100.py``): dense padding masks, sink / dSink, bias / dBias, right-band widening,

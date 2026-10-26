@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 """cuDNN-frontend adapter of the ``sdpa_bwd_sm100_d256`` row: the SM100 / SM103 (cc 10.0-10.6) d=256 bf16 / fp16 SDPA
-backward, with dense D192x128 served by the same compute tile. Q/K and V/O keep
+backward, with a native dense D192x128 specialization. Q/K and V/O keep
 their actual widths in tensor maps; the delta and grouped-gradient reductions use
 separate widths. No head-dimension staging or extra launch is added.
 
@@ -29,6 +29,8 @@ SM100-SM119 for the half chain), descriptor version 0.
 
 from __future__ import annotations
 
+from dataclasses import asdict
+
 import torch
 
 from cudnn.sdpa.bwd import api_dsl_sm107 as _sm107
@@ -41,7 +43,7 @@ _SM100_D256_TEMPLATE_TAG = "sdpa_bwd_sm100_d256_main"
 
 
 class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
-    """SM100 half backward: native D256 or dense D192x128 over the D256 compute envelope."""
+    """SM100 half backward: native D256 or dense D192x128 geometry."""
 
     _FAMILY = _cfg.FAMILY_F16
     _NAME = "sdpa_bwd_sm100_d256"
@@ -107,6 +109,12 @@ class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
         """Profile 1 (one 64-row sub-block per CTA, 128-row kv block, 227 KiB, descriptor version 0) -- NOT the Rubin twin
         constant ``BWD_D256_2X2``: this row has no 4x1 body to fall back to."""
         return _cfg2x2.PROFILE_SM100
+
+    def _template_params(self):
+        params = super()._template_params()
+        if (self.head_dim_qk, self.head_dim_v) == (192, 128):
+            return _cfg2x2.TemplateParams2x2(**asdict(params), head_dim_qk=192, head_dim_v=128)
+        return params
 
     def _kernel_file(self) -> str:
         return _2X2_KERNEL_FILE
