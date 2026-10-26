@@ -122,7 +122,8 @@ def test_capabilities_match_what_is_implemented():
     assert c.dtypes == frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})
     assert not c.is_fp8 and not c.is_mxfp8 and c.out_dtypes == frozenset()
     assert c.causal and c.bottom_right and c.swa and c.gqa
-    assert not c.right_band_widening and not c.thd and not c.thd_declared_totals and not c.cu_seq_len
+    assert c.thd and c.thd_declared_totals and c.thd_ragged_offsets
+    assert not c.right_band_widening and not c.cu_seq_len
     assert not c.bias and not c.dbias and not c.decode
     assert c.layouts == frozenset({"bshd"})
     assert not c.tile_ms and not c.tile_ns, "fixed geometry: no tile axis, the heuristics list {} as the complete record"
@@ -251,22 +252,23 @@ def test_reject_sink(monkeypatch):
     assert _decline_reason(monkeypatch, sink=True) is not None
 
 
-def test_reject_thd(monkeypatch):
-    assert _decline_reason(monkeypatch, thd=True) is not None
+def test_accept_thd(monkeypatch):
+    """The shared graph builder supplies declared capacities and ragged offsets."""
+    assert _decline_reason(monkeypatch, thd=True) is None
+    assert _decline_reason(monkeypatch, thd=True, use_causal_mask=True, hq=8, hkv=2) is None
 
 
 @pytest.mark.parametrize("dt", _DTYPES, ids=_DTYPE_IDS)
 @pytest.mark.parametrize("kv_heads", [4, 2], ids=["mha", "gqa"])
-def test_standalone_adapter_rejects_thd(dt, kv_heads):
-    """A direct adapter must decline packed THD even when no graph capability filter runs."""
+def test_standalone_adapter_accepts_thd(dt, kv_heads):
+    """Both half adapters admit the same declared packed THD geometry."""
     from cudnn.sdpa.bwd.api_dsl_sm100_d256 import SdpaBwdDslSm100D256
     from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
 
     options = dict(hq=4, hkv=kv_heads, dt=dt, thd=True, max_total_seq_len_q=1024, max_total_seq_len_kv=1024)
     # These descriptors are valid for the parent row that implements packed THD.
     assert _adapter(SdpaBwdDslSm107, **options).check_support()
-    with pytest.raises(ValueError, match="sdpa_bwd_sm100_d256: THD / ragged is not implemented"):
-        _adapter(SdpaBwdDslSm100D256, **options).check_support()
+    assert _adapter(SdpaBwdDslSm100D256, **options).check_support()
 
 
 def test_reject_decode_shaped(monkeypatch):
