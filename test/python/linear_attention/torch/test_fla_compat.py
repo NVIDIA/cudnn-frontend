@@ -529,6 +529,32 @@ def test_kda_sm90_fused_training_falls_back(gate):
 
 
 @sm90
+def test_kda_sm90_cached_backward_decline_keeps_no_inputs():
+    """The backward-check cache holds the decline's text, not the exception: a
+    re-raised cached exception grows its traceback and keeps every declined call's
+    frames, and so its CUDA inputs, alive for the life of the process."""
+    import gc
+    import weakref
+
+    import cudnn.fla.kda as kda_mod
+
+    B = _filled_batch(4)
+    master = _kda_leaves(B=B, T=128, H=4, HV=4, K=128, V=128, dtype=torch.bfloat16, seed=5)
+    do = torch.randn(B, 128, 4, 128, device="cuda", dtype=torch.bfloat16)
+    refs = []
+    for _ in range(3):
+        lv = _kda_clone(master, torch.bfloat16)
+        o = _run_kda(kda_shim, lv, "softplus")
+        assert kda_last_path().startswith("fallback") and kda_last_path() != "fallback:underfilled", kda_last_path()
+        o.backward(do)
+        refs.append(weakref.ref(lv["q"]))
+        del lv, o
+    gc.collect()
+    assert all(r() is None for r in refs), "a declined call's q is still referenced after it returned"
+    assert all(v is None or isinstance(v, str) for v in kda_mod._BWD_CHECKED.values())
+
+
+@sm90
 @pytest.mark.parametrize("with_initial_state", [False, True], ids=["zero_state", "initial_state"])
 def test_kda_sm90_training_native(with_initial_state):
     """A training call inside the Hopper backward's envelope (bf16 io, head dim

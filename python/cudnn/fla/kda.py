@@ -114,7 +114,10 @@ def _check_bwd(plan_name, q, k, v, g, beta, cu, scale, h0, output_final_state, f
 
     The autograd backward reuses the forward's ``plan_name`` and has no fallback, so
     a backward decline found after the forward would fail the training step. The
-    result is cached per graph signature, as the op caches its graphs."""
+    result is cached per graph signature, as the op caches its graphs: the decline's
+    text only, raised as a fresh ``_Decline`` each call. A cached exception object
+    would grow its traceback on every re-raise and keep each call's frames, and with
+    them its input tensors, alive for the life of the process."""
     total, H, K = q.shape
     HK, (HV, V) = k.shape[1], v.shape[1:]
     use_qk_l2norm, use_beta_sigmoid, allow_neg_eigval, safe_gate, gate_lb = flags
@@ -171,9 +174,9 @@ def _check_bwd(plan_name, q, k, v, g, beta, cu, scale, h0, output_final_state, f
             select_plan(graph, plan_name)
             _BWD_CHECKED[key] = None
         except _DECLINE as e:
-            _BWD_CHECKED[key] = e
+            _BWD_CHECKED[key] = f"{type(e).__name__}: {e}"
     if _BWD_CHECKED[key] is not None:
-        raise _BWD_CHECKED[key]
+        raise _Decline(_BWD_CHECKED[key])
 
 
 class _Decline(Exception):
