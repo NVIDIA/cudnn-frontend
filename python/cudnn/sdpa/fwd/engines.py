@@ -423,7 +423,8 @@ class Capabilities:
     # None = every flavor keeps the full-ratio contract (the group must divide
     # tile_m, or PACK_GQA=1 is declined; SM120 packs any group up to tile_m:
     # pack_gqa_requires_divisible).  Native on the SM100 d128 / d256 f16
-    # kernels; the d192x128 / d512 kernels pack HEADS_PER_TILE = G.
+    # kernels and the native SM107 dense d512 body; the other d192x128 /
+    # d512 kernels pack HEADS_PER_TILE = G.
     # APPENDED after the epilogue-gate fields (append-only contract above):
     # test_capabilities_positional_prefix_is_append_only pins the tail.
     pack_gqa_partial_d_shapes: Optional[frozenset] = None

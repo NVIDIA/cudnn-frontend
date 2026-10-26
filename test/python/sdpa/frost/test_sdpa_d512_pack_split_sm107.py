@@ -81,6 +81,12 @@ def test_d512_packed_split_rebind_replay(case, graph_api, cudnn_handle):
             if stats != "none":
                 buffers["lse"] = buffers["lse"].unsqueeze(-1)
                 nodes["lse"] = lse.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim(buffers["lse"].shape).set_stride(buffers["lse"].stride())
+            if causal and sq > sk:
+                # The common graph contract rejects this geometry before engine
+                # selection. The standalone case still exercises keyless rows.
+                with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="max_s_q > max_s_kv"):
+                    graph.validate()
+                return
             graph.validate()
             graph.build_operation_graph()
             graph.create_execution_plan(

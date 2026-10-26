@@ -378,8 +378,7 @@ HEADS_PER_TILE = CFG.PACK_G if CFG.PACK_GQA else 1
 TOKENS_PER_TILE = CFG.TILE_M // HEADS_PER_TILE
 _require(not CFG.PACK_GQA or CFG.QH_PER_KH % CFG.PACK_G == 0, "2x2 d512 packed subgroups must divide the GQA ratio")
 
-# === KV split === (phase 1.5: the body carries the half-aware fp32-partials arm; the adapter twin
-# keeps split_kv > 1 on the role-split kernel)
+# === KV split === FP32 partials, finalized by the shared packed-aware combine.
 _split_h = make_split_helpers(
     CFG,
     bounds_for_tile=_bounds_for_tile,
