@@ -3319,7 +3319,8 @@ def _former_combine_entry(gate: bool):
 def _pinned_form_cell(B, S_q, split, gate, with_lse, seed, use_pdl=False):
     """One decode cell through the adapter with the pinned combine form (and, ``use_pdl``, the programmatic-dependent-launch form of both
     launches): returns ``(adapter, o, lse, ws, gate_t, ref_o, ref_lse, run)`` -- ``run`` executes the adapter once more into the same O /
-    LSE / workspace (the census hook)."""
+    LSE / workspace (the census hook).  The tcgen05 core pinned by name (``tile_form="tcgen05"``): the core's pinned combine forms and its
+    PDL arm are under test; under ``"auto"`` the measured part takes the lean body inside its placement bound (the lean module's cells)."""
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
 
     H, KH, top_k, dtype = 24, 2, 512, torch.bfloat16
@@ -3352,6 +3353,7 @@ def _pinned_form_cell(B, S_q, split, gate, with_lse, seed, use_pdl=False):
         split_kv=split,
         epilogue_gate=gate_t,
         use_pdl=use_pdl,
+        tile_form="tcgen05",
     )
     assert a.check_support()
     a.compile()
