@@ -140,29 +140,32 @@ def test_native_d576_prepared_replay(heads, kh, page, hnd, v_hnd, split, dtype, 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        old_debug = torch.cuda.get_sync_debug_mode()
-        torch.cuda.set_sync_debug_mode("error")
-        try:
-            launch()
-        finally:
-            torch.cuda.set_sync_debug_mode(old_debug)
-    graph.replay()
-    check()
-    q.mul_(0.5)
-    k.mul_(0.75)
-    if page and hnd != v_hnd:
-        v.mul_(0.6)
-    qlens.copy_(torch.tensor(([sq - 1, sq, 1] * ((b + 2) // 3))[:b], device="cuda", dtype=torch.int32))
-    klens.copy_(torch.tensor(([0, skv, 65] * ((b + 2) // 3))[:b], device="cuda", dtype=torch.int32))
-    if page:
-        table.copy_((table + 1) % npool)
-        table_v.copy_((table_v + 3) % npool)
-    o.fill_(float("nan"))
-    if lse is not None:
-        lse.fill_(float("nan"))
-    graph.replay()
-    check()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            old_debug = torch.cuda.get_sync_debug_mode()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                launch()
+            finally:
+                torch.cuda.set_sync_debug_mode(old_debug)
+        graph.replay()
+        check()
+        q.mul_(0.5)
+        k.mul_(0.75)
+        if page and hnd != v_hnd:
+            v.mul_(0.6)
+        qlens.copy_(torch.tensor(([sq - 1, sq, 1] * ((b + 2) // 3))[:b], device="cuda", dtype=torch.int32))
+        klens.copy_(torch.tensor(([0, skv, 65] * ((b + 2) // 3))[:b], device="cuda", dtype=torch.int32))
+        if page:
+            table.copy_((table + 1) % npool)
+            table_v.copy_((table_v + 3) % npool)
+        o.fill_(float("nan"))
+        if lse is not None:
+            lse.fill_(float("nan"))
+        graph.replay()
+        check()
+    finally:
+        graph.reset()
 
 
 @pytest.mark.L0
@@ -254,14 +257,17 @@ def test_native_d576_long_cache_split_replay():
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        launch()
-    qlens.fill_(1)
-    klens.fill_(32769)
-    q.mul_(0.5)
-    pool.mul_(0.75)
-    graph.replay()
-    check(1, 32769)
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            launch()
+        qlens.fill_(1)
+        klens.fill_(32769)
+        q.mul_(0.5)
+        pool.mul_(0.75)
+        graph.replay()
+        check(1, 32769)
+    finally:
+        graph.reset()
 
 
 @pytest.mark.L0
