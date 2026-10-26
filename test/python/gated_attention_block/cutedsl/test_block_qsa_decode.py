@@ -3281,27 +3281,29 @@ def _lse_delta(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 def test_sparse_tile_form_declaration_facts_and_the_auto_pin(monkeypatch):
-    """The knob's declaration facts (host, no device): ``sparse_tile_form="auto"`` (the default) resolves the TCGEN05 core on every part today
-    (``heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS`` is EMPTY: the AUTO pin, flipped by the gate commit with its table), the explicit ``"lean"``
-    declares the lean body -- the lean split (65 at the default k 1; a pinned lean split SELECTS k: 33 -> 2, 17 -> 4; a pinned k picks the
-    split: 4 -> 17), the stage's own readback (``_sdpa.tile_form`` / ``sub_tiles_per_cta``) --, the explicit ``"tcgen05"`` the core with the
-    fill rule's split; with the tuple patched to the measured part the AUTO reading follows the placement rule (B 4 x S_q 1 = 8 units ->
-    lean; B 17 = 34 units -> tcgen05; a pinned tcgen05 split keeps the core; S_q 4 under the shared list takes the lean tile (32 units; B 5 x
-    S_q 4 = 40 is past the bound), per-row lists past one row keep the core, and the served rows are ONE constant the rule reads --
-    ``LEAN_SPARSE_SERVED_MAX_S_Q``, patched down to 1 the core returns at S_q 4), the dense QsaSpec block over its own K / V is the core's."""
+    """The knob's declaration facts (host, no device): ``sparse_tile_form="auto"`` (the default) follows the placement rule on the measured
+    part (``heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS`` = cc 10.7 since the gate's table; the lean tile at B 1 x S_q 1 = 2 units, the bound
+    ``LEAN_SPARSE_MAX_UNITS`` = 4 inclusive: B 2 in, B 3 out, the S_q 4 shared list out (8 units); a pinned tcgen05
+    split keeps the core, a pinned lean split is honoured by the lean body, per-row lists past one row keep the core, the served rows are ONE
+    constant the rule reads -- ``LEAN_SPARSE_SERVED_MAX_S_Q`` --, an unmeasured part keeps the core) and the tcgen05 core everywhere with the
+    tuple patched EMPTY (the former function); the explicit ``"lean"`` declares the lean body -- the lean split (65 at the default k 1; a pinned
+    lean split SELECTS k: 33 -> 2, 17 -> 4; a pinned k picks the split: 4 -> 17), the stage's own readback (``_sdpa.tile_form`` /
+    ``sub_tiles_per_cta``) --, the explicit ``"tcgen05"`` the core with the fill rule's split; the dense QsaSpec block over its own K / V is the core's."""
     from cudnn.gated_attention_block import api as _api
     from cudnn.sdpa.fwd import heuristics as _H
 
-    assert _H.SPARSE_LEAN_TILE_DEFAULT_CCS == (), "the AUTO pin: EMPTY until the gate measures the lean route"
+    assert _H.SPARSE_LEAN_TILE_DEFAULT_CCS == (_SM107,), "the AUTO pin: the measured part"
     with _no_host_sync():
-        auto, _ = _declare(GEOM_SMALL, 4, 1)
-        assert (auto.sparse_tile_form_requested, auto.sparse_tile_form, auto.sparse_tile, auto.sparse_sub_tiles_per_cta) == (
-            "auto",
-            "tcgen05",
-            _TILE_TCGEN05,
-            None,
-        )
-        assert auto._sdpa.tile_form == "tcgen05" and auto._sdpa.sub_tiles_per_cta is None and auto.sparse_sub_tiles_per_cta_requested is None
+        with pytest.MonkeyPatch.context() as mp:  # the pin EMPTY: the former function, the core on every part
+            mp.setattr(_H, "SPARSE_LEAN_TILE_DEFAULT_CCS", ())
+            auto, _ = _declare(GEOM_SMALL, 4, 1)
+            assert (auto.sparse_tile_form_requested, auto.sparse_tile_form, auto.sparse_tile, auto.sparse_sub_tiles_per_cta) == (
+                "auto",
+                "tcgen05",
+                _TILE_TCGEN05,
+                None,
+            )
+            assert auto._sdpa.tile_form == "tcgen05" and auto._sdpa.sub_tiles_per_cta is None and auto.sparse_sub_tiles_per_cta_requested is None
         lean, _ = _declare(GEOM_SMALL, 4, 1, sparse_tile_form="lean")
         assert (lean.sparse_tile_form, lean.sparse_tile, lean.decode_split_kv, lean.sparse_sub_tiles_per_cta) == ("lean", _TILE_LEAN, 65, 1)
         assert lean._sdpa.tile_form == "lean" and lean._sdpa.sub_tiles_per_cta == 1 and lean._sdpa.split_kv == 65 and lean.gate_fused is False
@@ -3327,35 +3329,36 @@ def test_sparse_tile_form_declaration_facts_and_the_auto_pin(monkeypatch):
             assert rows.qsa_shared_list and rows._sdpa.tile_form == "lean" and rows._sdpa.list_per_sequence and rows.seq_len == s_q
         sq4_k2, _ = _declare(GEOM_SMALL, 1, 4, sparse_tile_form="lean", decode_split_kv=33)
         assert (sq4_k2.decode_split_kv, sq4_k2.sparse_sub_tiles_per_cta, sq4_k2.sparse_tile) == (33, 2, _TILE_LEAN)
-        # AUTO behind the pin: the measured part + the placement rule
+        # AUTO behind the pin on the measured part (the device read patched so the reading is the same on any host): the placement rule
         monkeypatch.setattr(_api, "_device_cc_of", lambda device: _SM107)
-        monkeypatch.setattr(_H, "SPARSE_LEAN_TILE_DEFAULT_CCS", (_SM107,))
-        flipped, _ = _declare(GEOM_SMALL, 4, 1)
+        flipped, _ = _declare(GEOM_SMALL, 1, 1)  # 2 units: the lean tile
         assert (flipped.sparse_tile_form, flipped.sparse_tile, flipped.decode_split_kv, flipped.sparse_sub_tiles_per_cta) == ("lean", _TILE_LEAN, 65, 1)
-        assert flipped.sparse_tile_form_requested == "auto"
-        at_bound, _ = _declare(GEOM_SMALL, 16, 1)  # 16 x 2 x 1 = 32 units: inside
+        assert flipped.sparse_tile_form_requested == "auto" and flipped._sdpa.tile_form == "lean"
+        at_bound, _ = _declare(GEOM_SMALL, 2, 1)  # 4 units: inside (the bound is inclusive)
         assert at_bound.sparse_tile == _TILE_LEAN
-        past, _ = _declare(GEOM_SMALL, 17, 1)  # 34 units: the tcgen05 core
+        past, _ = _declare(GEOM_SMALL, 3, 1)  # 6 units: the tcgen05 core
         assert past.sparse_tile == _TILE_TCGEN05 and past.sparse_tile_form == "tcgen05"
-        pinned, _ = _declare(GEOM_SMALL, 4, 1, decode_split_kv=16)  # a tcgen05 split keeps the core under AUTO (the pin is the stronger knob)
+        pinned, _ = _declare(GEOM_SMALL, 1, 1, decode_split_kv=16)  # a tcgen05 split keeps the core under AUTO (the pin is the stronger knob)
         assert pinned.sparse_tile == _TILE_TCGEN05 and pinned.decode_split_kv == 16
-        pinned_lean, _ = _declare(GEOM_SMALL, 4, 1, decode_split_kv=33)  # a lean split is honoured by the lean body
+        pinned_lean, _ = _declare(GEOM_SMALL, 1, 1, decode_split_kv=33)  # a lean split is honoured by the lean body
         assert pinned_lean.sparse_tile == _TILE_LEAN and (pinned_lean.decode_split_kv, pinned_lean.sparse_sub_tiles_per_cta) == (33, 2)
-        sq4, _ = _declare(GEOM_SMALL, 4, 4)  # the shared list at S_q 4 (every row of the step in one lean CTA), 32 units: the lean tile
-        assert sq4.sparse_tile == _TILE_LEAN and sq4.qsa_shared_list and sq4.decode_split_kv == 65 and sq4.sparse_sub_tiles_per_cta == 1
+        sq4, _ = _declare(GEOM_SMALL, 1, 4)  # the shared list at S_q 4 under AUTO: 8 units past the bound of 4: the core (the explicit lean serves it, above)
+        assert sq4.sparse_tile == _TILE_TCGEN05 and sq4.sparse_tile_form == "tcgen05" and sq4.qsa_shared_list
         sq4_b5, _ = _declare(GEOM_SMALL, 5, 4)  # 40 units: past the bound
         assert sq4_b5.sparse_tile == _TILE_TCGEN05
         sq4_per_row, _ = _declare(
-            GEOM_SMALL, 4, 4, index_list_form="per_row"
+            GEOM_SMALL, 1, 4, index_list_form="per_row"
         )  # per-row lists past one row: the core (the lean CTA gathers one list per sequence)
         assert sq4_per_row.sparse_tile == _TILE_TCGEN05 and not sq4_per_row.qsa_shared_list
         monkeypatch.setattr(
             _H, "LEAN_SPARSE_SERVED_MAX_S_Q", 1
-        )  # the served rows are ONE constant the rule reads (never a literal): one row -> the core at S_q 4
-        assert _declare(GEOM_SMALL, 4, 4)[0].sparse_tile == _TILE_TCGEN05 and _declare(GEOM_SMALL, 4, 1)[0].sparse_tile == _TILE_LEAN
+        )  # the served rows are ONE constant the rule reads (never a literal): one row -> the explicit lean declines S_q 2, AUTO keeps the lean tile at one row
+        with pytest.raises(NotImplementedError, match="S_q <= 1"):
+            _declare(GEOM_SMALL, 1, 2, sparse_tile_form="lean")
+        assert _declare(GEOM_SMALL, 1, 1)[0].sparse_tile == _TILE_LEAN
         monkeypatch.setattr(_H, "LEAN_SPARSE_SERVED_MAX_S_Q", 4)
         monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 0))
-        other, _ = _declare(GEOM_SMALL, 4, 1)  # an unmeasured part: the core
+        other, _ = _declare(GEOM_SMALL, 1, 1)  # an unmeasured part: the core
         assert other.sparse_tile == _TILE_TCGEN05
     # a dense QsaSpec block over its own K / V (kv_source="self"): the tcgen05 core, every knob reading
     from cudnn.gated_attention_block import GatedAttentionBlockFwd
@@ -3548,9 +3551,10 @@ def test_sparse_tile_form_over_e4m3_pools_names_no_body():
 
 def test_the_envelope_reads_the_sparse_tile_route_back(monkeypatch):
     """``serving_envelope().decode``: ``sparse_tiles`` names the bodies the part serves (the tcgen05 core everywhere; the lean tile on cc 10.7
-    only), ``sparse_tile_lean_default`` the AUTO pin's reading (False until the gate), and ``sparse_tile(s_q, batch, ...)`` the body a step
-    takes -- the same arithmetic the constructor runs: pinned equal to a declared block's ``sparse_tile`` cell by cell, None where the
-    explicit "lean" would be a typed decline; empty / None on a dense geometry."""
+    only), ``sparse_tile_lean_default`` the AUTO pin's reading (True on the measured part, cc 10.7; False with the pin patched EMPTY and on every
+    other part), and ``sparse_tile(s_q, batch, ...)`` the body a step takes -- the same arithmetic the constructor runs (the placement bound
+    ``LEAN_SPARSE_MAX_UNITS`` = 4 under AUTO): pinned equal to a declared block's ``sparse_tile`` cell by cell, None where the explicit "lean"
+    would be a typed decline; empty / None on a dense geometry."""
     from cudnn.gated_attention_block import GatedAttentionBlockFwd, GatedAttentionBlockGeometry
     from cudnn.gated_attention_block import api as _api
     from cudnn.sdpa.fwd import heuristics as _H
@@ -3558,14 +3562,17 @@ def test_the_envelope_reads_the_sparse_tile_route_back(monkeypatch):
     geom, _ = _geom(GEOM_SMALL)
     dev = torch.device(_DEV)
     env = GatedAttentionBlockFwd.serving_envelope(geom, BF16, dev, device_cc=_SM107).decode
-    assert env.sparse_core and env.sparse_tiles == (_TILE_TCGEN05, _TILE_LEAN) and env.sparse_tile_lean_default is False
-    assert env.sparse_tile(1, 4) == _TILE_TCGEN05 and env.sparse_tile(1, 4, sparse_tile_form="tcgen05") == _TILE_TCGEN05
+    assert env.sparse_core and env.sparse_tiles == (_TILE_TCGEN05, _TILE_LEAN) and env.sparse_tile_lean_default is True  # the measured part
+    assert (
+        env.sparse_tile(1, 1) == _TILE_LEAN and env.sparse_tile(1, 2) == _TILE_LEAN and env.sparse_tile(1, 3) == _TILE_TCGEN05
+    )  # the bound (4 units) under AUTO
+    assert env.sparse_tile(1, 4, sparse_tile_form="tcgen05") == _TILE_TCGEN05 and env.sparse_tile(1, 1, sparse_tile_form="tcgen05") == _TILE_TCGEN05
     assert env.sparse_tile(1, 4, sparse_tile_form="lean") == _TILE_LEAN and env.sparse_tile(1, 16, sparse_tile_form="lean") == _TILE_LEAN
     assert (
         env.sparse_tile(4, 4, sparse_tile_form="lean") == _TILE_LEAN and env.sparse_tile(4, 5, sparse_tile_form="lean") == _TILE_LEAN
     )  # the S_q rows share one CTA
     assert env.sparse_tile(5, 4, sparse_tile_form="lean") is None and env.sparse_tile(1, 4, sparse_tile_form="lean", decode_split_kv=16) is None
-    assert env.sparse_tile(4, 4) == _TILE_TCGEN05  # the AUTO pin: the core until the gate
+    assert env.sparse_tile(4, 4) == _TILE_TCGEN05  # 32 units under AUTO: past the bound, the core
     assert env.sparse_tile(1, 4, sparse_tile_form="lean", decode_split_kv=33) == _TILE_LEAN
     other = GatedAttentionBlockFwd.serving_envelope(geom, BF16, dev, device_cc=(10, 0)).decode  # the form is not served off cc 10.7: no body, no route
     assert not other.served and other.sparse_tiles == () and other.sparse_tile(1, 1) is None and other.sparse_tile(1, 1, sparse_tile_form="lean") is None
@@ -3575,8 +3582,7 @@ def test_the_envelope_reads_the_sparse_tile_route_back(monkeypatch):
     pr = GatedAttentionBlockFwd.serving_envelope(per_row_geom, BF16, dev, device_cc=_SM107).decode
     assert pr.sparse_tile(1, 4, sparse_tile_form="lean") == _TILE_LEAN and pr.sparse_tile(2, 4, sparse_tile_form="lean") is None
     assert pr.sparse_tile(4, 4, sparse_tile_form="lean") is None  # per-row lists past one row: the core
-    monkeypatch.setattr(_H, "SPARSE_LEAN_TILE_DEFAULT_CCS", (_SM107,))
-    monkeypatch.setattr(_api, "_device_cc_of", lambda device: _SM107)
+    monkeypatch.setattr(_api, "_device_cc_of", lambda device: _SM107)  # the constructor reads the measured part on any host
     flipped = GatedAttentionBlockFwd.serving_envelope(geom, BF16, dev, device_cc=_SM107).decode
     assert flipped.sparse_tile_lean_default is True
     with _no_host_sync():
@@ -3589,12 +3595,20 @@ def test_the_envelope_reads_the_sparse_tile_route_back(monkeypatch):
             (5, 4, None),
             (1, 2, None),
             (4, 1, 16),
-            (4, 1, 33),
-            (1, 4, 33),
+            (1, 1, 33),
+            (2, 1, 33),
+            (1, 2, 33),  # a lean split under AUTO inside the bound (2 / 4 / 4 units: k 2); past the bound a pinned 33 is the core's typed decline, not a cell
         ):
             blk, _ = _declare(GEOM_SMALL, b, s_q, decode_split_kv=split)
             assert flipped.sparse_tile(s_q, b, decode_split_kv=split) == blk.sparse_tile, (b, s_q, split, blk.sparse_tile)
     assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, dev, device_cc=(10, 0)).decode.sparse_tile_lean_default is False
+    monkeypatch.setattr(_H, "SPARSE_LEAN_TILE_DEFAULT_CCS", ())  # the pin EMPTY: the former function on the same part
+    former = GatedAttentionBlockFwd.serving_envelope(geom, BF16, dev, device_cc=_SM107).decode
+    assert (
+        former.sparse_tile_lean_default is False
+        and former.sparse_tile(1, 1) == _TILE_TCGEN05
+        and former.sparse_tile(1, 1, sparse_tile_form="lean") == _TILE_LEAN
+    )
 
 
 # (geometry, S_q, kv_lens, page, layout, dtype, split, k, fuse_gate, return_lse, block_lens, seed)

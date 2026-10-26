@@ -88,10 +88,10 @@ the default ``k`` of ``heuristics.sparse_lean_sub_tiles_per_cta``, 1 today; ``su
 cannot be told apart -- and under ``tile_form="auto"`` on a listed part takes the lean split: an unsplit launch there is pinned with
 ``tile_form="tcgen05"``, where the block's ``decode_split_kv`` has a None default and keeps the core for an explicit 1), writing the SAME fp32
 split-major partial slab the tcgen05 core's split store writes, so the combine, its pinned form and the gate riding it are untouched.
-``tile_form="auto"`` (the default) resolves through ``heuristics.sparse_tile_form_auto``: the tcgen05 core on every part today
-(``heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS`` is EMPTY until the gate measures the lean route) and, on a listed part, the placement rule
-``heuristics.sparse_decode_lean_tile_selected`` (cc 10.7, ``B x H_kv x S_q <= LEAN_SPARSE_MAX_UNITS`` units); an explicit ``"lean"`` is
-honoured where the body serves the declaration and a typed decline naming the arm where it does not (``heuristics.sparse_lean_tile_decline``:
+``tile_form="auto"`` (the default) resolves through ``heuristics.sparse_tile_form_auto``: on the measured part
+(``heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS`` = cc 10.7 since the gate's table) the placement rule
+``heuristics.sparse_decode_lean_tile_selected`` (``B x H_kv x S_q <= LEAN_SPARSE_MAX_UNITS`` = 4 units), the tcgen05 core on every
+other part; an explicit ``"lean"`` is honoured where the body serves the declaration and a typed decline naming the arm where it does not (``heuristics.sparse_lean_tile_decline``:
 THD, a prefill / top-left form, no ``seq_kv_lens``, ``S_q`` past the served rows, per-row lists past one row, a group past 16, ``top_k`` below
 8, a non-default ``softmax_groups``), never a silent fallback; ``sub_tiles_per_cta`` is the lean body's pin and is refused by name where the
 resolved body is the tcgen05 core.  :attr:`SparseGqaFwdDslSm107.tile_form` / :attr:`kernel_template` read the resolved body back after

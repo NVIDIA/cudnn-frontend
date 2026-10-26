@@ -1520,23 +1520,21 @@ def test_tile_form_vocabulary_is_one_spelling_and_names_the_two_bodies():
     assert a.tile_form is None and a.kernel_template is None and a.tile_form_requested == "lean" and a.split_kv_requested == 1
 
 
-def test_auto_pin_is_empty_until_the_gate_and_the_placement_rule_sits_behind_it(monkeypatch):
-    """The AUTO pin: ``SPARSE_LEAN_TILE_DEFAULT_CCS`` is EMPTY (the gate commit flips it with its table), so ``tile_form="auto"`` resolves the
-    tcgen05 core on every part today (the former function, unsplit by default); with the tuple patched to the measured part AUTO follows
-    the placement rule -- the lean tile at B 1 (2 units: split 65, k 1), the tcgen05 core at B 17 (34 units past the bound of 32), the
-    tcgen05 core where a pinned split is not a lean split (16), the lean tile where it is (33 -> k 2), the tcgen05 core on an unmeasured part."""
+def test_auto_pin_names_the_measured_part_and_the_placement_rule_sits_behind_it():
+    """The AUTO pin: ``SPARSE_LEAN_TILE_DEFAULT_CCS`` names cc 10.7 (the gate measured the lean route end to end against the tcgen05 route on
+    the 212-SM class; the table in the gate commit), so ``tile_form="auto"`` follows the placement rule there -- the lean tile at B 1 (2 units:
+    split 65, k 1), the bound ``LEAN_SPARSE_MAX_UNITS`` = 4 inclusive (B 2 in, B 3 out), the tcgen05 core where a pinned split is not a
+    lean split (16), the lean tile where it is (33 -> k 2), the tcgen05 core on an unmeasured part; with the tuple patched EMPTY the former
+    function returns (the tcgen05 core on every part, unsplit by default)."""
     from cudnn.sdpa.fwd import heuristics as H
 
-    assert H.SPARSE_LEAN_TILE_DEFAULT_CCS == (), "the AUTO pin: EMPTY until the gate measures the lean route"
-    a = _route_adapter()
-    assert a.check_support() and a.tile_form == "tcgen05" and a.kernel_template == H.SPARSE_TILE_TCGEN05 and a.split_kv == 1 and a.sub_tiles_per_cta is None
-    monkeypatch.setattr(H, "SPARSE_LEAN_TILE_DEFAULT_CCS", ((10, 7),))
+    assert H.SPARSE_LEAN_TILE_DEFAULT_CCS == ((10, 7),), "the AUTO pin: the measured part"
     b = _route_adapter()
     assert b.check_support() and b.tile_form == "lean" and b.kernel_template == H.SPARSE_TILE_LEAN and (b.split_kv, b.sub_tiles_per_cta) == (65, 1)
-    c = _route_adapter(B=17)
-    assert c.check_support() and c.tile_form == "tcgen05" and c.split_kv == 1
-    d = _route_adapter(B=16)
-    assert d.check_support() and d.tile_form == "lean" and d.split_kv == 65  # 32 units: the bound is inclusive
+    c = _route_adapter(B=3)
+    assert c.check_support() and c.tile_form == "tcgen05" and c.split_kv == 1  # 6 units: past the bound
+    d = _route_adapter(B=2)
+    assert d.check_support() and d.tile_form == "lean" and d.split_kv == 65  # 4 units: the bound is inclusive
     e = _route_adapter(split=16)
     assert e.check_support() and e.tile_form == "tcgen05" and e.split_kv == 16  # the pin is the stronger knob
     f = _route_adapter(split=33)
@@ -1548,20 +1546,26 @@ def test_auto_pin_is_empty_until_the_gate_and_the_placement_rule_sits_behind_it(
     # check_support re-runs resolve from the PIN, never from the resolved split (compile() calls it again)
     f.check_support()
     assert (f.split_kv, f.sub_tiles_per_cta) == (33, 2)
+    with pytest.MonkeyPatch.context() as mp:  # the pin EMPTY: the former function (the core everywhere, unsplit by default)
+        mp.setattr(H, "SPARSE_LEAN_TILE_DEFAULT_CCS", ())
+        a = _route_adapter()
+        assert a.check_support() and a.tile_form == "tcgen05" and a.kernel_template == H.SPARSE_TILE_TCGEN05 and a.split_kv == 1 and a.sub_tiles_per_cta is None
 
 
 def test_placement_rule_at_the_bound_both_sides_and_the_k_rule():
-    """The dense rules from the configuration: ``LEAN_SPARSE_MAX_UNITS`` 32 (B 16 x 2 KV heads x S_q 1 in, B 17 out; B 4 x S_q 4 in, B 5 out),
+    """The dense rules from the configuration: ``LEAN_SPARSE_MAX_UNITS`` 4 (B 2 x 2 KV heads x S_q 1 in, B 3 out; B 1 x S_q 2 in, B 1 x S_q 4 out),
     cc 10.7 only, ``top_k >= 8``; the lean splits of ``top_k`` (every entry >= 2: the lean tile always splits) and the largest k; the fill rule
     of the fill model (1 / 1 / 2 / 3 / 2 / 4 / 7 at B 1 / B 4 x S_q 1, B 1 x S_q 4, B 4 x S_q 4, B 8 / 16 / 32 x S_q 1 on 212 SMs) capped at the
     DEFAULT k of 1 (the k >= 2 renderings a measured lever); the AUTO resolution matrix."""
     from cudnn.sdpa.fwd import heuristics as H
 
-    assert H.LEAN_SPARSE_MAX_UNITS == 32 and H.LEAN_SPARSE_DEFAULT_MAX_SUB_TILES_PER_CTA == 1 and H._SPARSE_LEAN_TILE_RULE_CC == (10, 7)
+    assert H.LEAN_SPARSE_MAX_UNITS == 4 and H.LEAN_SPARSE_DEFAULT_MAX_SUB_TILES_PER_CTA == 1 and H._SPARSE_LEAN_TILE_RULE_CC == (10, 7)
     sel = lambda b, s, **kw: H.sparse_decode_lean_tile_selected(
         batch=b, h_kv=kw.get("h_kv", 2), s_q=s, top_k=kw.get("top_k", 512), device_cc=kw.get("cc", (10, 7))
     )  # noqa: E731
-    assert sel(16, 1) and not sel(17, 1) and sel(4, 4) and not sel(5, 4) and sel(1, 1) and sel(8, 1)
+    assert (
+        sel(2, 1) and not sel(3, 1) and sel(1, 2) and not sel(1, 4) and sel(1, 1) and not sel(4, 1)
+    )  # 4 units inclusive: B 2 x S_q 1 and B 1 x S_q 2 in; B 4 x S_q 1 and B 1 x S_q 4 (8 units) out
     assert not sel(1, 1, top_k=4) and sel(1, 1, top_k=8) and not sel(1, 1, cc=(10, 0)) and not sel(1, 1, cc=None) and not sel(1, 1, cc=(12, 0))
     assert H.sparse_lean_splits(512) == (65, 33, 22, 17, 13, 11, 10, 9) and H.sparse_lean_splits(8) == (2,) and H.sparse_lean_splits(16) == (3, 2)
     assert H.sparse_lean_max_sub_tiles_per_cta(512) == 8 and H.sparse_lean_max_sub_tiles_per_cta(8) == 1 and H.sparse_lean_max_sub_tiles_per_cta(16) == 2
@@ -1580,13 +1584,12 @@ def test_placement_rule_at_the_bound_both_sides_and_the_k_rule():
         admissible=kw.get("ok", True),
         split_pinned=kw.get("split"),
     )  # noqa: E731
-    assert auto() == "tcgen05"  # the tuple is empty
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(H, "SPARSE_LEAN_TILE_DEFAULT_CCS", ((10, 7),))
-        assert auto() == "lean" and auto(b=16) == "lean" and auto(b=17) == "tcgen05" and auto(ok=False) == "tcgen05" and auto(cc=(10, 0)) == "tcgen05"
-        assert (
-            auto(split=16) == "tcgen05" and auto(split=65) == "lean" and auto(split=33) == "lean" and auto(split=1) == "tcgen05" and auto(top_k=4) == "tcgen05"
-        )
+    assert auto() == "lean"  # the measured part (the gate commit's tuple)
+    assert auto(b=2) == "lean" and auto(b=3) == "tcgen05" and auto(ok=False) == "tcgen05" and auto(cc=(10, 0)) == "tcgen05"
+    assert auto(split=16) == "tcgen05" and auto(split=65) == "lean" and auto(split=33) == "lean" and auto(split=1) == "tcgen05" and auto(top_k=4) == "tcgen05"
+    with pytest.MonkeyPatch.context() as mp:  # the pin EMPTY: the former function
+        mp.setattr(H, "SPARSE_LEAN_TILE_DEFAULT_CCS", ())
+        assert auto() == "tcgen05" and auto(b=2) == "tcgen05"
 
 
 def test_lean_tile_declines_by_name_on_the_adapter(monkeypatch):
@@ -1626,7 +1629,7 @@ def test_lean_tile_declines_by_name_on_the_adapter(monkeypatch):
         (dict(tile_form="lean", top_k=8, sub_tiles_per_cta=2), NotImplementedError, r"must be in \[1, 1\]"),
         (dict(tile_form="lean", sub_tiles_per_cta=2, split=65), ValueError, "pin one of the two"),
         (dict(tile_form="tcgen05", sub_tiles_per_cta=2), NotImplementedError, "the lean tile's pin"),
-        (dict(sub_tiles_per_cta=2), NotImplementedError, "the lean tile's pin"),
+        (dict(sub_tiles_per_cta=2, B=3), NotImplementedError, "the lean tile's pin"),  # AUTO past the bound (6 units): the core, the pin refused by name
         (dict(tile_form="tcgen05", split=18), NotImplementedError, r"ceil\(\(top_k \+ 1\) / 32\) = 17 .* tcgen05"),
         (dict(split=18), NotImplementedError, "= 17"),
     ):
@@ -1745,8 +1748,12 @@ def test_split_bound_and_workspace_per_form():
     )
     nolse = SparseGqaFwdDslSm107(top_k=512, bottom_right=True, list_per_sequence=True, device_cc=(10, 7), tile_form="lean", **kw)
     assert nolse.check_support() and nolse.scratch_workspace_bytes() == slab_bytes(1, 1, 24, 65, lse=False)
-    unsplit = SparseGqaFwdDslSm107(top_k=512, bottom_right=True, list_per_sequence=True, device_cc=(10, 7), **kw)
+    unsplit = SparseGqaFwdDslSm107(
+        top_k=512, bottom_right=True, list_per_sequence=True, device_cc=(10, 7), tile_form="tcgen05", **kw
+    )  # the unsplit core, pinned by name (AUTO on the measured part takes the lean split)
     assert unsplit.check_support() and unsplit.scratch_workspace_bytes() == 0 and unsplit.combine_form() == sc.DECODE_GRID_OFF
+    auto_k2 = _route_adapter(sub_tiles_per_cta=2)  # AUTO inside the bound honours the lean body's k pin: split 33
+    assert auto_k2.check_support() and auto_k2.tile_form == "lean" and (auto_k2.split_kv, auto_k2.sub_tiles_per_cta) == (33, 2)
 
 
 def test_lean_kernel_carries_its_census_name_and_the_tcgen05_core_keeps_its_own():

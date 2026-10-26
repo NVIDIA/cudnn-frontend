@@ -433,7 +433,9 @@ def test_adapter_accepts_the_paged_form_and_derives_the_pool_geometry(P, hnd, sm
 
 def _decode_operands(B=1, S=1, H=24, KH=2, SKV=8192, dtype="torch.bfloat16", top_k=512, split_kv=1, **paged):
     """The decode form's stand-ins: ``S`` rows per sequence at the END of the sequence (bottom-right), ONE list per sequence
-    (``block_ids [B, top_k]``, ``block_lens [B]``), per-batch KV lengths, an optional split; ``paged`` = the paged form's extras."""
+    (``block_ids [B, top_k]``, ``block_lens [B]``), per-batch KV lengths, an optional split; ``paged`` = the paged form's extras.  The
+    tcgen05 core pinned by name (``tile_form="tcgen05"``): this module tests the core; under ``"auto"`` the measured part takes the lean
+    body inside its placement bound (``heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS``), whose route is the lean module's."""
     o = (
         _paged_operands(B=B, S=S, H=H, KH=KH, dtype=dtype, top_k=top_k, **paged)
         if paged
@@ -446,6 +448,7 @@ def _decode_operands(B=1, S=1, H=24, KH=2, SKV=8192, dtype="torch.bfloat16", top
         list_per_sequence=True,
         bottom_right=True,
         split_kv=split_kv,
+        tile_form="tcgen05",
     )
     return o
 

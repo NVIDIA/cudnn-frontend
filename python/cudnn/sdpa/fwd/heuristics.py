@@ -774,22 +774,39 @@ SPARSE_TILE_TCGEN05 = "sparse_d256_f16"
 SPARSE_TILE_LEAN = "sparse_lean_d256_f16"
 """The two bodies' ``kernel_template`` names (the kernel modules' file stems under ``sdpa/fwd/kernels/sm107/``): what the adapter's
 ``kernel_template`` and the block's ``sparse_tile`` read back, so a route is PINNED by the kernel that compiled, never transcribed."""
-LEAN_SPARSE_MAX_UNITS = 32
-"""The PLACEMENT bound: the lean tile below ``B x H_kv x S_q <= 32`` units (B <= 16 at S_q 1 and B <= 4 at S_q 4 on two KV heads), the
+LEAN_SPARSE_MAX_UNITS = 4
+"""The PLACEMENT bound: the lean tile below ``B x H_kv x S_q <= 4`` units (B <= 2 at S_q 1 and B 1 at S_q 2 on two KV heads), the
 tcgen05 core above.  The lean tile's advantage is the ABSENCE of the tcgen05 core's ~4.5-us per-CTA chain on a launch that is
 latency-bound (one wave of small CTAs: the 212-SM class measured the kernel alone 3.34 vs 5.66 us at B 1 x 8K x S_q 1, +69 %, and the
 chain 8.32 -> 5.75 us); it shrinks as the launch becomes HBM-bound, where both tiles move the same bytes and the lean form's shared
 gather forces a split whose combine on a 768-block grid costs more than the tcgen05 core's lean walk at split 4 (B 32 x S_q 1: a
-modeled -2 %).  The crossover sits between 32 and 64 units in the model; the no-loss rule puts the default bound at the last class the
-model calls a sure win widened to the B 16 / B 4 x S_q 4 class (the S_q 4 half a modeled +13 %).  The band 16 < units <= 32 is
-UNMEASURED: the gate's bound sweep (B in 1 / 2 / 4 / 8 / 16 / 32 x S_q 1 / 4) moves this ONE constant -- measured, never transcribed."""
-SPARSE_LEAN_TILE_DEFAULT_CCS: Tuple[Tuple[int, int], ...] = ()
-"""The parts on which ``tile_form="auto"`` consults the placement rule (:func:`sparse_decode_lean_tile_selected`) at all; EMPTY until
-the end-to-end gate measures the lean route against the tcgen05 route on an exclusive part (the measured-default rule of the block's
-``DECODE_PDL_DEFAULT_CCS``: a default ships with its table, in the change that measures it; the bar: no cell loses beyond its control
-band, and >= 1.0 us AND >= 5 % of the step at B 1 x 8K and B 1 x 32K).  Until then ``"auto"`` resolves to the tcgen05 core on EVERY
-part (the former function, bitwise) and the explicit ``"lean"`` is the way to take the lean tile.  The gate commit flips this tuple to
-``((10, 7),)`` and refits :data:`LEAN_SPARSE_MAX_UNITS` from its table; the RED pin on the tuple flips with it."""
+modeled -2 %).  The model put the crossover between 32 and 64 units; the gate's bound sweep (B in 1 / 2 / 4 / 8 / 16 / 32 x S_q 1 at 8K / 32K,
+the S_q 4 shared-list cells at B 1 / 4 / 32, every cell the lean body vs the tcgen05 core in the same process) moved this ONE constant to
+the last class that wins inside its control band.
+The gate's table by units level (the lean lever per step, POSITIVE = the lean body faster): 2 units: B 1 x S_q 1 (the e2e block)
++6.8 % / +5.7 % / +4.8 % at 8K / 32K / 128K; 4 units: B 2 x S_q 1 (the e2e block) +1.8 % / +1.3 % at 8K / 32K; 8 units: B 4 x S_q
+1 (the e2e block) -2.6 % / -3.5 % / -2.0 % / -2.2 % at 2K / 8K / 32K / 128K; B 1 x S_q 4 (the shared-list block) +6.4 % / +6.6 % /
++6.8 % at 8K / 32K / 128K; 16 units: B 8 x S_q 1 (the e2e block) -17.2 % / -16.3 % at 8K / 32K; 32 units: B 16 x S_q 1 (the e2e
+block) -44.1 % / -43.6 % at 8K / 32K; B 4 x S_q 4 (the shared-list block) -9.7 % / -8.8 % / -9.2 % at 8K / 32K / 128K; 64 units: B
+32 x S_q 1 (the e2e block) -60.8 % / -58.7 % / -51.3 % at 8K / 32K / 128K; 256 units: B 32 x S_q 4 (the shared-list block) -36.4 %
+/ -36.5 % / -35.7 % at 8K / 32K / 128K; a route class losing beyond its control band excludes every level from it up -> 4."""
+SPARSE_LEAN_TILE_DEFAULT_CCS: Tuple[Tuple[int, int], ...] = ((10, 7),)
+"""The parts on which ``tile_form="auto"`` consults the placement rule (:func:`sparse_decode_lean_tile_selected`) at all: cc 10.7,
+the one line the lean tile exists for, since the end-to-end gate measured the lean route against the tcgen05 route there (the
+measured-default rule of the block's ``DECODE_PDL_DEFAULT_CCS``: a default ships with its table, in the change that measures it; the bar:
+>= 1.0 us AND >= 5 % of the step at B 1 x 8K and B 1 x 32K on the row of record and on the symmetric reading with the arms built in the
+other order, and no route class losing beyond its control band -- a losing class lowers :data:`LEAN_SPARSE_MAX_UNITS` to the last class
+that wins).
+MEASURED 2026-10-26 on an exclusive 212-SM cc 10.7 part at the 2376 MHz lock (CUDA-graph replay, one process per cell with every
+arm, A/B/A x 3 x 100, the control pair within 1 %, every oracle before timing): the lean body vs the tcgen05 core in the same
+block, B 1 x 8K x S_q 1 34.8 -> 32.5 us per decode step (+6.8 %, 2.22 us; +5.9 % / 1.93 us symmetric with the arms built in the
+other order) and B 1 x 32K 36.6 -> 34.6 us (+5.7 %, 1.98 us; +5.6 % symmetric); B 1 x S_q 1 geomean +5.8 %, B 4 x S_q 1 -2.6 %, B
+32 x S_q 1 -57.1 % past the bound; the shared-list caller block at S_q 4 (one list per sequence) B 1 +6.6 %, B 4 -9.2 %;
+route-class cells losing beyond their band: B 4 x 2K x S_q 1 -2.6 %; B 4 x 8K x S_q 1 -3.5 %; B 4 x 32K x S_q 1 -2.0 %; B 4 x 128K
+x S_q 1 -2.2 %; B 4 x 8K x S_q 4 -9.7 %; B 4 x 32K x S_q 4 -8.8 %; B 4 x 128K x S_q 4 -9.2 %; B 8 x 8K x S_q 1 -17.2 %; B 8 x 32K
+x S_q 1 -16.3 %; B 16 x 8K x S_q 1 -44.1 %; B 16 x 32K x S_q 1 -43.6 % -> LEAN_SPARSE_MAX_UNITS 32 -> 4.
+Every other part keeps the tcgen05 core under ``"auto"`` until measured there; the explicit ``"tcgen05"`` keeps the former function on
+the measured part, the explicit ``"lean"`` takes the lean tile wherever the body serves the declaration (past the bound too)."""
 _SPARSE_LEAN_TILE_RULE_CC = (10, 7)
 """The ONE device line the lean tile exists for (its DSL target is ``sm_107a``; the kernel's own gate): the placement rule answers False
 on every other part whatever the tuple above holds."""
@@ -928,7 +945,7 @@ def sparse_tile_form_auto(
     *, batch: int, h_kv: int, s_q: int, top_k: int, device_cc: Optional[Tuple[int, int]], admissible: bool, split_pinned: Optional[int] = None
 ) -> str:
     """What ``tile_form="auto"`` resolves to: :data:`SPARSE_TILE_FORM_LEAN` iff the part is in :data:`SPARSE_LEAN_TILE_DEFAULT_CCS` (the
-    measured default: EMPTY today, so the tcgen05 core everywhere), the declaration is ``admissible`` on the lean body
+    measured default: cc 10.7), the declaration is ``admissible`` on the lean body
     (:func:`sparse_lean_tile_decline` returned None), the placement rule selects it (:func:`sparse_decode_lean_tile_selected`) and a
     pinned split, if any, is a lean split of ``top_k`` (a caller who pinned ``split_kv`` to a tcgen05 split, or to 1 = unsplit, keeps the
     body that honours the pin: the pin is the stronger knob and the resolved form reads back); :data:`SPARSE_TILE_FORM_TCGEN05` otherwise."""

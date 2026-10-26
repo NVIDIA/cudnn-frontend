@@ -1101,9 +1101,10 @@ class DecodeEnvelope:
     fuse_prepare_default: bool = False
     # appended (the lean block-sparse decode tile): the sparse core's BODIES this part serves on a QsaSpec geometry, by ``kernel_template``
     # (``heuristics.SPARSE_TILE_TCGEN05`` everywhere the form is served; ``SPARSE_TILE_LEAN`` too on cc 10.7, the lean tile's one part), and
-    # the AUTO pin's reading on this part (``heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS``: EMPTY until the gate measures the lean route, so
-    # ``sparse_tile_form="auto"`` resolves the tcgen05 core everywhere today; the explicit ``"lean"`` is served where the body admits the
-    # declaration).  The per-CELL reading is :meth:`sparse_tile` (the route reads B x S_q, which a static envelope cannot carry in one field).
+    # the AUTO pin's reading on this part (``heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS``: cc 10.7 since the gate measured the lean route, so
+    # ``sparse_tile_form="auto"`` follows the placement rule there and resolves the tcgen05 core on every other part; the explicit ``"lean"``
+    # is served where the body admits the declaration).  The per-CELL reading is :meth:`sparse_tile` (the route reads B x S_q, which a
+    # static envelope cannot carry in one field).
     sparse_tiles: Tuple[str, ...] = ()
     sparse_tile_lean_default: bool = False
     device_cc: Optional[Tuple[int, int]] = dataclasses.field(default=None, compare=False)  # the part :meth:`sparse_tile` reads the AUTO pin and the rule on
@@ -8406,8 +8407,8 @@ class GatedAttentionBlockFwd(APIBase):
         rope_position_tables_only: bool = False,
         # APPENDED (the lean block-sparse decode tile; performance-only, the block-sparse stage's knob): WHICH BODY of the index-list sparse
         # core serves stage (4) on a QsaSpec geometry -- "auto" (the default): the placement rule (cc 10.7, B x H_kv x S_q <= 32 units, the
-        # lean body admissible) on the parts of heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS, the tcgen05 core everywhere else (EMPTY until the
-        # end-to-end gate measures the lean route: the tcgen05 core on every part today, bitwise the former block); "lean": the lean decode
+        # lean body admissible) on the parts of heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS (cc 10.7 since the end-to-end gate measured the lean
+        # route; the bound LEAN_SPARSE_MAX_UNITS = 4 units refit from its table), the tcgen05 core everywhere else; "lean": the lean decode
         # tile (mma.sync + cp.async, 128 threads per m16 tile, no TMEM / TMA / CLC; the DECODE mode over the pools at S_q <= 4 under the
         # shared list -- one list per sequence, every row of the step in one CTA -- or the per-row list at one row per sequence, bf16 /
         # f16, G <= 16, top_k >= 8; it ALWAYS splits: decode_split_kv None =
@@ -10701,7 +10702,7 @@ class GatedAttentionBlockFwd(APIBase):
     def _sparse_tile_envelope_fields(sparse_served: bool, cc) -> dict:
         """The lean tile's rows of :class:`DecodeEnvelope` for a SERVED block-sparse decode form: the bodies this part serves by
         ``kernel_template`` (the tcgen05 core everywhere; the lean tile on cc 10.7, its one part -- ``heuristics._SPARSE_LEAN_TILE_RULE_CC``),
-        the AUTO pin's reading on this part (``SPARSE_LEAN_TILE_DEFAULT_CCS``: EMPTY until measured) and the part itself for the per-cell
+        the AUTO pin's reading on this part (``SPARSE_LEAN_TILE_DEFAULT_CCS``: cc 10.7, the measured part) and the part itself for the per-cell
         :meth:`DecodeEnvelope.sparse_tile`; empty off the sparse form."""
         from cudnn.sdpa.fwd import heuristics as _H
 
