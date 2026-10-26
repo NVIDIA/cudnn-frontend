@@ -802,6 +802,15 @@ for the old message.
 
 ## Prepared THD launch bounds and setup
 
+Ragged-offset integer widths are compiled pointer-ABI facts. Include the whole
+per-port dtype tuple in the prepared artifact key, alongside origin strides and
+multipliers. A valid second plan can otherwise read INT64 offsets as INT32 (or
+the reverse) from an earlier cached host. The D256 detector
+`test_origin_integer_types_separate_compiled_artifacts` checks both transitions
+for Q and Stats, distinct artifacts, disk reload with compilation forbidden,
+and numerical output after replay. Check artifact identity before launching a
+known-colliding negative control.
+
 Each compiled host contract has one production binder across graph, standalone,
 and staged entry points. Forward and half backward use native binding. Quantized
 backward and standalone compact-GQA backward remain Python until migrated as a

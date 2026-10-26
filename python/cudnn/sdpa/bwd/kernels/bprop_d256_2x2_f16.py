@@ -165,7 +165,6 @@ from cudnn.frost.tile_dsl.mma import desc_opaque, mma_ss
 from cudnn.frost.tile_dsl.pointwise import tmem_load_tile
 from cudnn.frost.tile_dsl.scheduler import SCHED_NATURAL, Sched, read_clc_payload, read_tile_id_arrive
 from cudnn.frost.tile_dsl.thd import (
-    TENSOR_MAP_ALIGN,
     TENSOR_MAP_QWORDS,
     THD_BWD_META_WORDS,
     THD_BWD_MAPS_META_WORDS,
@@ -222,7 +221,6 @@ _THD = bool(CFG.THD_VARLEN)
 THD_Q_SLOT, THD_DO_SLOT, THD_DODV_SLOT, THD_K_SLOT, THD_V_SLOT = 0, 1, 2, 3, 4
 THD_DV_SLOT_BASE = 5  # dV descriptor of sequence b at slot THD_DV_SLOT_BASE + b
 THD_INPUT_SLOTS = 5
-THD_MAP_SLOTS = lambda b: THD_INPUT_SLOTS + b  # noqa: E731
 _THD_SEQ_ORD = 2  # (d, head, seq, batch): the sequence axis of every packed descriptor
 _THD_MAP_WORDS = TENSOR_MAP_QWORDS * 2  # int32 words per 128-B tensor map
 

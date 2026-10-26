@@ -2799,6 +2799,3 @@ def _host(
 ) -> None:
     """Preserve the compact exported runtime frame."""
     _host_chain(problem_size, a_0, b_0, c_0, meta_t, desc_words, stream, epi_descale_0, epi_descale_1, epi_scale_out, epi_amax, sfa_0, sfb_0, sf_meta_t)
-
-
-_host_origins = _host_chain

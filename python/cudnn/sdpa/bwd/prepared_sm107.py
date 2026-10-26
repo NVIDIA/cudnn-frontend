@@ -21,7 +21,7 @@ from types import SimpleNamespace
 from cudnn.frost.compiled_cache import positional_entry
 from cudnn.sdpa.fwd.api_dsl import ws_align
 from .prepared import ATTRIBUTES, BwdLaunchSpec, Operand, ROLES
-from .d128_thd_contract import ORIGIN_PORTS as THD_ORIGIN_PORTS, RAGGED_ROLES, Q_PORTS, KV_PORTS
+from .d128_thd_contract import ORIGIN_PORTS as THD_ORIGIN_PORTS, RAGGED_ROLES, KV_PORTS
 
 # Every dense row binds the nine tensor operands plus two APPENDED slots -- the LAST two of its role list, in the order they
 # landed, each an operand exactly when its plan fact says so and None-specialized otherwise (the fixed-ABI rule the fp8 row's
@@ -456,13 +456,14 @@ def compile_plan_thd(api, main, mm_dk, mm_dq):
             sm,
             external,
             api._thd_origins if origins else None,
+            api._thd_origin_dtypes if origins else None,
         )
     )
     extra = dict(origin_specs=api._thd_origins, origin_dtypes=api._thd_origin_dtypes) if origins else {}
     entry = compile_host_f16_thd(
         main._host_origins if origins else main._host,
-        mm_dk._host_origins if origins else mm_dk._host,
-        mm_dq._host_origins if origins else mm_dq._host,
+        mm_dk._host_chain if origins else mm_dk._host,
+        mm_dq._host_chain if origins else mm_dq._host,
         config,
         geometry,
         regions,
