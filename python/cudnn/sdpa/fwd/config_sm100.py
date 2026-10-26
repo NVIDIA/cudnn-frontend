@@ -3669,6 +3669,14 @@ class CfgD192(CfgD128):
     # K sub-stages per tile: the TMA D-subtile count (3 x 16 KiB for half input) on the cga1 tile, so each subtile
     # is reloaded for the next tile as soon as BMM1 has read it, instead of after the whole 48 KiB tile; 1 elsewhere.
     K_SUB: int = 1
+    # L2 prefetch issued by the TMA-LDG warp on the half-input cga1 tile: the K/V tiles L2_PREFETCH_KV kv steps ahead
+    # of their SMEM load and, with L2_PREFETCH_NEXT_TILE, the next tile's Q slabs and first K/V tile.  Tiles with fewer
+    # than L2_PREFETCH_MIN_STEPS kv steps issue no prefetch.  Both distances are 0 on the pair tile.
+    L2_PREFETCH_KV: int = 0
+    L2_PREFETCH_NEXT_TILE: int = 0
+    L2_PREFETCH_MIN_STEPS: int = 4
+    # Unroll factor of the TMA-LDG warp's kv loop.
+    LDG_UNROLL: int = 6
 
 
 def _d192_smem_bytes(cfg) -> int:
@@ -3713,6 +3721,15 @@ def _validate_cfg_d192(cfg: CfgD192) -> None:
         (
             cfg.K_SUB == ((cfg.TILE_K * cfg.BPE) // 128 if (not fp8 and cfg.CTA_MMA == 1) else 1),
             "d192: K is released per TMA D-subtile on the half-input cga1 tile only",
+        ),
+        (
+            cfg.L2_PREFETCH_KV == (1 if (not fp8 and cfg.CTA_MMA == 1) else 0) and cfg.L2_PREFETCH_NEXT_TILE == cfg.L2_PREFETCH_KV,
+            "d192: the K/V L2 prefetch (one kv step ahead, plus the next tile) belongs to the half-input cga1 tile only",
+        ),
+        (cfg.L2_PREFETCH_MIN_STEPS >= 1, "d192: L2_PREFETCH_MIN_STEPS must be at least 1"),
+        (
+            cfg.LDG_UNROLL == (1 if (not fp8 and cfg.CTA_MMA == 1) else 6),
+            "d192: the TMA-LDG kv loop is unrolled 1x on the half-input cga1 tile and 6x elsewhere",
         ),
         (
             _d192_smem_bytes(cfg) <= _SM100_MAX_DYN_SMEM,
@@ -3863,6 +3880,7 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
     # reload then overlaps a whole iteration instead of the PV->PV window a single stage leaves it.
     stages_v = 2 if (not fp8 and params.cta_mma == 1) else stages_kv
     k_sub = (192 * b) // 128 if (not fp8 and params.cta_mma == 1) else 1  # one slot per 128 B TMA D-subtile
+    half_input_cga1 = not fp8 and params.cta_mma == 1
     cfg = CfgD192(
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
@@ -3886,6 +3904,9 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         STAGES_K=stages_kv,
         STAGES_V=stages_v,
         K_SUB=k_sub,
+        L2_PREFETCH_KV=1 if half_input_cga1 else 0,
+        L2_PREFETCH_NEXT_TILE=1 if half_input_cga1 else 0,
+        LDG_UNROLL=1 if half_input_cga1 else 6,
         SCHEDULER_STAGES=3 if e4_thd_swa and not params.bottom_right else 2,
         MASK_FLAGS=mask_flags,
         WINDOW_LEFT=params.window_left or 0,

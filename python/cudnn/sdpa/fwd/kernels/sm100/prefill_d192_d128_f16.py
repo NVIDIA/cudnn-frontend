@@ -17,6 +17,9 @@ SM100 resource layout:
      per TMA D-subtile (``CFG.K_SUB`` 16 KiB slots, each released as soon as
      BMM1[sub1] has read it, BMM1 issued per subtile with its full N) and V is
      double-buffered (``CFG.STAGES_V`` = 2): 96 (Q∪O) + 48 (K) + 64 (V) = 208 KiB.
+     Its TMA-LDG warp also prefetches the K/V tiles one kv step ahead and the
+     next tile's Q / first K/V into L2 (``CFG.L2_PREFETCH_*``), runs its kv loop
+     unrolled 1x, and keeps the plain MUFU exp2 on the dense-causal arm.
   2. **SMEM stats**: alpha and final (max,sum) use a dedicated 2 KiB mailbox.
      This leaves all 512 TMEM cols to S_acc 0/128 + O 256..511 and removes
      the cross-tile dependency that otherwise delays the next BMM1 until
@@ -124,7 +127,7 @@ from cudnn.frost.tile_dsl.pointwise import (
 )
 from cudnn.frost.tile_dsl.regtile import RegTile
 from cudnn.frost.tile_dsl.mma import desc_opaque, mma_ss, mma_ts_step
-from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_commit, tma_store_wait, tma_tensormap_acquire
+from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_prefetch_boxes, tma_store_tile, tma_store_commit, tma_store_wait, tma_tensormap_acquire
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.mask import (
@@ -145,7 +148,10 @@ _PADDED_CAUSAL = CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_PADDED) and CFG.WINDOW_RI
 # pattern replaces that tail emulation on EVERY mask arm -- the exact form MEASURED on B200.  The tail
 # emulation itself is untouched and still traces wherever the split is off; it runs ungated on cc 10.3
 # today and its own arch gate is a separate follow-up.
-_DENSE_CAUSAL_PUBLIC_EXP2_MIX = not CFG.THD_VARLEN and CFG.MASK_FLAGS == MASK_CAUSAL and CFG.WINDOW_RIGHT == 0 and not CFG.BOTTOM_RIGHT and not CFG.HAS_SINK
+# The dense-causal tail emulation is the pair tile's; the single-CTA tile keeps the plain MUFU exp2 on that arm.
+_DENSE_CAUSAL_PUBLIC_EXP2_MIX = (
+    CFG.CTA_MMA == 2 and not CFG.THD_VARLEN and CFG.MASK_FLAGS == MASK_CAUSAL and CFG.WINDOW_RIGHT == 0 and not CFG.BOTTOM_RIGHT and not CFG.HAS_SINK
+)
 _REUSE_BMM2_ISSUE_ELECTION = CFG.THD_VARLEN or _DENSE_CAUSAL_PUBLIC_EXP2_MIX
 
 # exp2 split between MUFU and the FMA pipe.  With 128 exps per row per KV step the MUFU pipe
@@ -272,6 +278,14 @@ if CFG.K_SUB not in (1, TMA_QK_ITERS) or (CFG.TILE_K // CFG.TILE_K_HW_BMM1) % CF
 kSubElems = kBufferElems // CFG.K_SUB
 K_SUB_STAGES = CFG.STAGES_K * CFG.K_SUB
 K_STEPS_PER_SUB = (CFG.TILE_K // CFG.TILE_K_HW_BMM1) // CFG.K_SUB
+# TMA-LDG kv-loop unroll factor and the L2 prefetch of the K/V stream (CFG.L2_PREFETCH_*): the K/V tiles _PF_DIST kv
+# steps ahead of their SMEM load and, with _PF_Q, the next tile's Q slabs and first K/V tile; tiles shorter than
+# _PF_MIN kv steps issue none.  Dense loads only -- paged K/V walks a block table.
+_LDG_UNROLL = CFG.LDG_UNROLL
+_PF_DIST = CFG.L2_PREFETCH_KV
+_PF_KV = _PF_DIST > 0 and not bool(CFG.PAGED_KV)
+_PF_Q = bool(CFG.L2_PREFETCH_NEXT_TILE) and not bool(CFG.PAGED_KV)
+_PF_MIN = CFG.L2_PREFETCH_MIN_STEPS
 oBufferElems = CFG.TILE_M * CFG.TILE_O
 
 # Q∪O alias (dsv3 TF32): O reuses Q's SMEM slab once BMM1 has consumed Q.
@@ -1258,6 +1272,11 @@ def _tmaldg_warp_group(
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
+        # L2 prefetch only on tiles with at least _PF_MIN kv steps.
+        if cutlass.const_expr(_PF_KV or _PF_Q):
+            pf_short = (kv_right - kv_left) < cutlass.Int32(_PF_MIN)
+            pf_right = cutlass.Int32(arith.select(pf_short.ir_value(), kv_left.ir_value(), kv_right.ir_value()))
+
         if cutlass.const_expr(MAY_BE_EMPTY) and (kv_right <= kv_left):
             if cutlass.const_expr(CAN_HAVE_EMPTY_KV and IS_QO_ALIAS):
                 # TMA-STG advances the Q/O alias gate for every tile, including
@@ -1402,7 +1421,20 @@ def _tmaldg_warp_group(
             )
             q_empty_phase = q_empty_phase ^ 1
 
-            for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=6):
+            # L2 prefetch of the next _PF_DIST K/V tiles of this tile's kv range, issued behind the Q loads.
+            if cutlass.const_expr(_PF_KV):
+                for pf in cutlass.range_constexpr(_PF_DIST):
+                    kv_pf = kv_left + cutlass.Int32(pf + 1)
+                    if kv_pf < pf_right:
+                        pf_row = kv_pf * CFG.TILE_N
+                        tma_prefetch_boxes(
+                            tma_k(cutlass.Int32(0), kv_head_idx, pf_row + K_ROW_OFFSET_PEER + kv_seq_off, tma_batch), TMA_QK_ITERS, TMA_QK_GRANU_ELEMS
+                        )
+                        tma_prefetch_boxes(
+                            tma_v(V_COL_OFFSET_PEER, kv_head_idx, pf_row + kv_seq_off, tma_batch), TMA_VO_ITERS // CFG.CTA_MMA, TMA_VO_GRANU_ELEMS
+                        )
+
+            for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=_LDG_UNROLL):
                 kv_row_base = kv_loop * CFG.TILE_N
 
                 for k_d in cutlass.range_constexpr(CFG.K_SUB):
@@ -1478,6 +1510,18 @@ def _tmaldg_warp_group(
                 if cutlass.const_expr(CFG.CTA_MMA == 2 and CFG.MASK_FLAGS != MASK_NONE):
                     k_state = v_state
 
+                # L2 prefetch of the K/V tiles _PF_DIST kv steps ahead.
+                if cutlass.const_expr(_PF_KV):
+                    kv_pf = kv_loop + cutlass.Int32(_PF_DIST)
+                    if kv_pf < pf_right:
+                        pf_row = kv_pf * CFG.TILE_N
+                        tma_prefetch_boxes(
+                            tma_k(cutlass.Int32(0), kv_head_idx, pf_row + K_ROW_OFFSET_PEER + kv_seq_off, tma_batch), TMA_QK_ITERS, TMA_QK_GRANU_ELEMS
+                        )
+                        tma_prefetch_boxes(
+                            tma_v(V_COL_OFFSET_PEER, kv_head_idx, pf_row + kv_seq_off, tma_batch), TMA_VO_ITERS // CFG.CTA_MMA, TMA_VO_GRANU_ELEMS
+                        )
+
         if cutlass.const_expr(_PREDECODE_THD_SWA_SEGMENTS):
             wait(sched.mb_decoded.subview(sched_state.idx), sched_state.phase)
             decoded_base = sched_state.idx * cutlass.Int32(11)
@@ -1523,6 +1567,22 @@ def _tmaldg_warp_group(
                 # page count with its bounds (PAGED_KV folds the predecoded
                 # THD+SWA path off, so this branch is the one taken).
                 n_pages_b = (eff_seqlen_kv + cutlass.Int32(PAGE_SIZE - 1)) // cutlass.Int32(PAGE_SIZE)
+
+        # L2 prefetch of the next tile's Q slabs and its first K/V tile (skipped behind a short tile).
+        if cutlass.const_expr(_PF_Q):
+            if (is_valid_tile > cutlass.Int32(0)) & (~pf_short):
+                for qs in cutlass.range_constexpr(CFG.TILES_Q):
+                    tma_prefetch_boxes(
+                        tma_q(cutlass.Int32(0), q_head_idx, q_row_base + cutlass.Int32(qs * TOKENS_PER_TILE) + q_seq_off, tma_batch),
+                        TMA_QK_ITERS,
+                        TMA_QK_GRANU_ELEMS,
+                    )
+                if kv_left < kv_right:
+                    pf_row = kv_left * CFG.TILE_N
+                    tma_prefetch_boxes(
+                        tma_k(cutlass.Int32(0), kv_head_idx, pf_row + K_ROW_OFFSET_PEER + kv_seq_off, tma_batch), TMA_QK_ITERS, TMA_QK_GRANU_ELEMS
+                    )
+                    tma_prefetch_boxes(tma_v(V_COL_OFFSET_PEER, kv_head_idx, pf_row + kv_seq_off, tma_batch), TMA_VO_ITERS // CFG.CTA_MMA, TMA_VO_GRANU_ELEMS)
 
     # cga2: drain trailing empty mbar arrives so SMEM isn't torn down while
     # leader's multicast commits are still in-flight.
