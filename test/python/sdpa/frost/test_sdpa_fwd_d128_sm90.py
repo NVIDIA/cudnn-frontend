@@ -1208,12 +1208,14 @@ _SASS_PROBE = textwrap.dedent(r"""
     from cudnn.sdpa.fwd.config_sm90 import TemplateParams
     # The heaviest D128 body: GQA and Stats, causal (three masked phases) or dense (a persistent record's dense body is
     # different code); ``fields`` is the variant's switch record, ``ctas`` a persistent record's CTA count, ``shape``
-    # the declared (b, h_q, h_kv, s_q, s_kv).
+    # the declared (b, h_q, h_kv, s_q, s_kv), whose head counts give the GQA ratio, and ``sched`` an order other than
+    # TemplateParams' NATURAL, where the case names one.
     fields = case["switches"]
-    params = dataclasses.replace(TemplateParams(dtype_qkv=DTYPE_BF16, causal=case["causal"], has_lse=True, qh_per_kh=4), **fields)
+    b, h_q, h_kv, s_q, s_kv = case["shape"]
+    order = {"sched_policy": case["sched"]} if "sched" in case else {}
+    params = dataclasses.replace(TemplateParams(dtype_qkv=DTYPE_BF16, causal=case["causal"], has_lse=True, qh_per_kh=h_q // h_kv, **order), **fields)
     mod = _load_kernel_template("sm90/prefill_d128_f16.py", params, tag="sass_sm90_d128")
     print("SWITCHES", *(int(getattr(mod, name.upper())) for name in sorted(fields)))
-    b, h_q, h_kv, s_q, s_kv = case["shape"]
     if fields.get("causal_walk"):
         # The walk the record takes: the template's rule over the probe's record, shape and CTA count, as the kernel's
         # constructor calls it (bf16: 2 bytes). Light rows, pairs, middles and the lone middle; -1 for the stride.
@@ -1256,6 +1258,51 @@ _SASS_PROBE = textwrap.dedent(r"""
     dealloc = [int(ln.split()[-2], 16) for ln in sass if "USETMAXREG.DEALLOC" in ln]
     print("SASS USETMAXREG_ALLOC", alloc[0] if alloc else -1)
     print("SASS USETMAXREG_DEALLOC", dealloc[0] if dealloc else -1)
+    # FP64 instructions on the narrow path of the compute KV loop, which softmax_setup and online_softmax keep free of
+    # them: there an FP64 instruction waits behind the other warpgroup's WGMMA on every step. A loop is a backward
+    # branch; a KV loop holds an HGMMA, no EXIT (the try-wait retry stubs past the kernel's end also branch back) and no
+    # O store (UTMASTG or STG: past a fully peeled KV loop the item loop would be the innermost), and no smaller such
+    # loop. Its narrow path takes each predicated branch on a predicate operand forward (the wide test, so the wide arms
+    # and their FP64 exponents are left out) over the whole loop: the head that issues QK and PV, and both row halves.
+    # Counted: DMUL, DADD, DFMA, DSETP, DMNMX, an F2F to or from F64, MUFU.RCP64H and MUFU.RSQ64H.
+    labels, ins, pend = {}, [], []
+    for ln in sass:
+        m = re.match(r"\s*(\.L_x_\d+):", ln)
+        if m:
+            pend.append(m.group(1))
+            continue
+        m = re.match(r"\s*/\*([0-9a-f]{4,})\*/\s+(.*?)\s*;\s*$", ln)
+        if m:
+            addr, body = int(m.group(1), 16), m.group(2)
+            labels.update((p, addr) for p in pend)
+            pend = []
+            pred, rest = body.split(None, 1) if body.startswith("@") else ("", body)
+            ins.append((addr, pred, rest.split()[0] if rest else "", body))
+    spans = []
+    for addr, pred, op, body in ins:
+        m = re.search(r"\(\s*(\.L_x_\d+)\s*\)", body)
+        if op == "BRA" and m and labels.get(m.group(1), addr + 1) <= addr:
+            span = [i for i in ins if labels[m.group(1)] <= i[0] <= addr]
+            if any(i[2].startswith("HGMMA") for i in span) and not any(i[2] == "EXIT" or i[2].startswith(("UTMASTG", "STG")) for i in span):
+                spans.append((labels[m.group(1)], addr))
+    loops = [s for s in spans if not any(t != s and s[0] <= t[0] and t[1] <= s[1] for t in spans)]
+    fp64 = []
+    for lo, hi in loops:
+        path, skip = [], None
+        for addr, pred, op, body in ins:
+            if not lo <= addr <= hi or (skip is not None and addr < skip):
+                continue
+            skip = None
+            path.append((addr, op, body))
+            m = re.search(r"BRA (!?P\d), `\((\.L_x_\d+)\)", body)
+            if op == "BRA" and pred and m and labels.get(m.group(2), -1) > addr:
+                skip = labels[m.group(2)]
+        for addr, op, body in path:
+            if re.match(r"(DMUL|DADD|DFMA|DSETP|DMNMX|MUFU\.RCP64H|MUFU\.RSQ64H)\b", op) or (op.startswith("F2F") and "F64" in op):
+                fp64.append(f"{op}@{addr:#x}")
+    print("SASS KV_LOOPS", len(loops))
+    print("SASS FP64_KV_LOOP", len(fp64))
+    print("FP64", *fp64)
     ptx = open(ptxs[-1], encoding="utf-8", errors="replace").read()
     pred = r"^\s*(?:@!?%p\d+\s+)?"
     aligned = re.findall(pred + r"(?:bar(?:\.cta)?\.(?:sync|arrive)\b|barrier(?:\.cta)?\.(?:sync|arrive)\.aligned\b)", ptx, re.M)
@@ -1284,6 +1331,9 @@ _SPILL_PIN = {"STL": 0, "LDL": 0}
 # S_kv 300 at 3 CTAs: middle tiles only, two groups to a unit), the branch whose Q tile walk_item writes as a division
 # so that the item's loop bounds stay run-time values (as a trace-time constant it spilled; walk_item's comment), and
 # the stride on that one-Q-tile body (NATURAL, 3 CTAs), whose Q tile work_of writes the same way (work_of's comment).
+# The last two are both walks on a chunked prefill body with two Q tiles (b8 h24/8 S_q 256 S_kv 2048 bottom-right,
+# LPT_L2 as the adapter orders it): the stride at 132 CTAs and the paired walk at 3 CTAs (one pair per unit), the
+# records on which NVVM had recomputed the FP64 log2 scale inside the KV loop (softmax_setup's comment).
 _SASS_CASES = {
     "v1": ("v1", True),
     "ov": ("ov", True),
@@ -1291,6 +1341,8 @@ _SASS_CASES = {
     "pw-causal": ("pw", True),
     "pw-causal-t1": ("pw", True),
     "pa-causal-t1": ("pa", True),
+    "pa-causal-t2": ("pa", True),
+    "pw-causal-t2": ("pw", True),
 }
 # A persistent record's CTA count in the probe: below the probe's 128 items, so each CTA walks two. With the count at or
 # above the items every CTA runs one item, and LLVM could fold the item loop away if it ever proved that (the warp-uniform
@@ -1299,11 +1351,26 @@ _SASS_CTAS = 64
 # The probe's declared problem (b, h_q, h_kv, s_q, s_kv), and the cases that compile another one at their own CTA
 # count.
 _SASS_SHAPE = (2, 8, 2, 1024, 1024)
-_SASS_SHAPES = {"pw-causal-t1": ((2, 8, 2, 100, 300), 3), "pa-causal-t1": ((2, 8, 2, 100, 300), 3)}
+_SASS_SHAPES = {
+    "pw-causal-t1": ((2, 8, 2, 100, 300), 3),
+    "pa-causal-t1": ((2, 8, 2, 100, 300), 3),
+    "pa-causal-t2": ((8, 24, 8, 256, 2048), 132),
+    "pw-causal-t2": ((8, 24, 8, 256, 2048), 3),
+}
+# The cases compiled in another order than TemplateParams' NATURAL: the chunked prefill ones in the adapter's LPT_L2.
+_SASS_ORDERS = {"pa-causal-t2": SCHED_LPT_L2, "pw-causal-t2": SCHED_LPT_L2}
 # The walk each paired-walk case compiles (the probe's WALK line: light rows, pairs, middles, lone middle), so that a
 # rule or constant change that moves a case to another branch, or to the stride (-1), fails here instead of pinning
 # another body.
-_SASS_WALKS = {"pw-causal": (0, 4, 0, 0), "pw-causal-t1": (0, 0, 1, 0)}
+_SASS_WALKS = {"pw-causal": (0, 4, 0, 0), "pw-causal-t1": (0, 0, 1, 0), "pw-causal-t2": (0, 1, 0, 0)}
+# The causal persistent cases, held to no FP64 instruction on the narrow path of the compute KV loop (the probe's
+# FP64_KV_LOOP), with the KV loops their bodies keep (KV_LOOPS, measured in the same offline compile as _CODEGEN_PINS),
+# so that the count reads the loops it is about: two on pw-causal, three on the one-Q-tile stride, one on each chunked
+# prefill body (the one-Q-tile paired walk was not compiled offline, so its count is not pinned). In that compile of the
+# kernel before softmax_setup pinned the scale, both chunked prefill cases held a conversion and a multiply on that path
+# (F2F.F64.F32 and DMUL), pw-causal and pa-causal-t1 none.
+_FP64_GUARD = ("pw-causal", "pw-causal-t1", "pa-causal-t1", "pa-causal-t2", "pw-causal-t2")
+_KV_LOOPS = {"pw-causal": 2, "pa-causal-t1": 3, "pa-causal-t2": 1, "pw-causal-t2": 1}
 # Per-case structure of the probe body (GQA 4, Stats, bf16), measured in an offline sm_90a compile (ptxas 13.4 V13.4.92,
 # CuTe DSL 4.8.0): v1 = 3 step instances x (8 SS + 8 RS); ov = prologue QK 8 + 2 step instances x 16 + drain PV 8, one
 # wait_group(1) per step instance; pa-dense is one copy of ov's dense item body inside the item loop, one step instance
@@ -1313,7 +1380,8 @@ _SASS_WALKS = {"pw-causal": (0, 4, 0, 0), "pw-causal-t1": (0, 0, 1, 0)}
 # item loop (48, 6, 2) with pa-dense's five barriers; it peaks at R232, where the stride peaks at R236 on this body.
 # pw-causal-t1 is the same loop over the one-Q-tile body, whose partial Q tile and ragged KV trace one more step
 # instance (64, 8, 3; ov's one-tile kernel on that shape has the same three); pa-causal-t1, the stride over that body,
-# has the same counts (R234).
+# has the same counts (R234). pa-causal-t2 and pw-causal-t2, the chunked prefill body (GQA 3, LPT_L2) under the stride
+# and the paired walk, have pw-causal's counts.
 # Body counts are a toolchain fact (python/cudnn/sdpa/AGENTS.md, the LDTM lesson): re-measure on a new toolchain and
 # record it next to the numbers.
 _CODEGEN_PINS = {
@@ -1323,6 +1391,8 @@ _CODEGEN_PINS = {
     "pw-causal": dict(HGMMA=48, DEPBAR=6, DEPBAR_1=2, BAR_SYNC=5, BAR_ARV=0),
     "pw-causal-t1": dict(HGMMA=64, DEPBAR=8, DEPBAR_1=3, BAR_SYNC=5, BAR_ARV=0),
     "pa-causal-t1": dict(HGMMA=64, DEPBAR=8, DEPBAR_1=3, BAR_SYNC=5, BAR_ARV=0),
+    "pa-causal-t2": dict(HGMMA=48, DEPBAR=6, DEPBAR_1=2, BAR_SYNC=5, BAR_ARV=0),
+    "pw-causal-t2": dict(HGMMA=48, DEPBAR=6, DEPBAR_1=2, BAR_SYNC=5, BAR_ARV=0),
 }
 
 
@@ -1341,7 +1411,8 @@ def test_d128_register_split_no_spills_and_no_wgmma_serialization(tmp_path, case
     python/cudnn/AGENTS.md: ptxas otherwise drops it silently), the compute body does not spill and stays
     under the 240-register budget, and ptxas keeps the QK and PV WGMMA groups pipelined (no C7511/C7513
     serialization advisory), for every switch record and body in _SASS_CASES. The switch must really
-    compile: a wait_group(1) appears exactly under overlap."""
+    compile: a wait_group(1) appears exactly under overlap. A causal persistent case (_FP64_GUARD) holds no FP64
+    instruction on the narrow path of its compute KV loop, in the loops _KV_LOOPS counts."""
     cands = nvdisasm_candidates()
     if not cands:
         pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
@@ -1351,7 +1422,8 @@ def test_d128_register_split_no_spills_and_no_wgmma_serialization(tmp_path, case
     switches = _switches(variant)
     overlap = switches["intra_wg_overlap"]
     shape, ctas = _SASS_SHAPES.get(case, (_SASS_SHAPE, _SASS_CTAS))
-    arg = json.dumps({"switches": switches, "causal": causal, "ctas": ctas, "shape": shape})
+    order = {"sched": _SASS_ORDERS[case]} if case in _SASS_ORDERS else {}
+    arg = json.dumps({"switches": switches, "causal": causal, "ctas": ctas, "shape": shape, **order})
     proc = subprocess.run([sys.executable, "-c", _SASS_PROBE, str(dump), arg, _ptxas() or "-", *cands], capture_output=True, text=True, timeout=1800)
     assert proc.returncode == 0, f"sm_90a trace-compile of the D128 template ({case}) failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
     out = proc.stdout.splitlines()
@@ -1375,6 +1447,14 @@ def test_d128_register_split_no_spills_and_no_wgmma_serialization(tmp_path, case
     assert stats["MAXREG"] < 240, f"{case}: register R{stats['MAXREG']} is past the 240-register budget"
     assert (stats["DEPBAR_1"] > 0) == overlap, f"{case}: wait_group(1) count {stats['DEPBAR_1']}"
     assert {key: stats[key] for key in _CODEGEN_PINS[case]} == _CODEGEN_PINS[case], (case, stats)
+    if case in _FP64_GUARD:
+        if case in _KV_LOOPS:
+            assert stats["KV_LOOPS"] == _KV_LOOPS[case], f"{case}: {stats['KV_LOOPS']} compute KV loops, not {_KV_LOOPS[case]}: the FP64 count reads other code"
+        fp64 = next((ln.split()[1:] for ln in out if ln.split()[:1] == ["FP64"]), None)
+        assert stats["FP64_KV_LOOP"] == 0, (
+            f"{case}: FP64 instructions on the narrow path of the compute KV loop, where each waits behind the other warpgroup's WGMMA on every step "
+            f"(softmax_setup's comment): {fp64}"
+        )
     ptxas = {ln.split()[1]: ln.split()[2] for ln in out if ln.startswith("PTXAS ") and len(ln.split()) == 3}
     if "serialized" in ptxas:
         assert ptxas["rc"] == "0" and ptxas["serialized"] == "0", [ln for ln in out if ln.startswith("PTXAS")]
