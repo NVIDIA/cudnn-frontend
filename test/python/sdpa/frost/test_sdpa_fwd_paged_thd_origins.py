@@ -12,23 +12,29 @@ pytestmark = [requires_dsl]
 
 
 @pytest.mark.parametrize(
-    "dim,dtype_name,pool_layout,stats_layout",
+    "dim,dtype_name,pool_layout,stats_layout,cga",
     [
-        pytest.param(128, "bfloat16", "hnd", "token", marks=pytest.mark.L0),
-        pytest.param(128, "float16", "nhd", "head", marks=pytest.mark.L1),
-        pytest.param(128, "bfloat16", "mixed", "token", marks=pytest.mark.L1),
-        pytest.param(256, "bfloat16", "hnd", "head", marks=pytest.mark.L0),
-        pytest.param(256, "float16", "nhd", "token", marks=pytest.mark.L1),
-        pytest.param(256, "bfloat16", "mixed", "head", marks=pytest.mark.L1),
+        pytest.param(128, "bfloat16", "hnd", "token", 2, marks=pytest.mark.L0),
+        pytest.param(128, "float16", "nhd", "head", 2, marks=pytest.mark.L1),
+        pytest.param(128, "bfloat16", "mixed", "token", 2, marks=pytest.mark.L1),
+        pytest.param(256, "bfloat16", "hnd", "head", 2, marks=pytest.mark.L0),
+        pytest.param(256, "float16", "nhd", "token", 2, marks=pytest.mark.L1),
+        pytest.param(256, "bfloat16", "mixed", "head", 2, marks=pytest.mark.L1),
+        pytest.param(128, "bfloat16", "hnd", "token", 1, marks=pytest.mark.L0),
+        pytest.param(128, "float16", "nhd", "head", 1, marks=pytest.mark.L1),
+        pytest.param(128, "bfloat16", "mixed", "token", 1, marks=pytest.mark.L1),
+        pytest.param(128, "bfloat16", "hnd", "token", None, marks=pytest.mark.L0, id="engine_default"),
     ],
 )
-def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stats_layout):
+def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stats_layout, cga):
     import cudnn
     import torch
     from cudnn.engines.manifest import family_for
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("SM100/SM103 physical THD origin path")
+    if cga == 1 and torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("CGA1 paged prefill is currently admitted on SM100")
     torch.manual_seed(261026737)
     batch, heads, kv_heads, maximum, page, kv_max = 2, 16, 4, 320, 16, 8192
     pages_per_sequence, page_count = kv_max // page, batch * kv_max // page
@@ -129,14 +135,19 @@ def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stat
     )
     graph.validate()
     graph.build_operation_graph()
-    graph.create_execution_plan(
-        family_for(graph).offered_ids()["sdpa_fwd_prefill_sm100"],
-        {cudnn.knob_type.TILE_CGA_M: 2, cudnn.knob_type.SPLIT_KV: 1, cudnn.knob_type.PACK_GQA: 1},
-    )
-    graph.select_plan(0)
+    if cga is None:
+        graph.create_execution_plans([cudnn.heur_mode.A])
+        graph.select_plan(next(i for i in range(len(graph.plans)) if graph.get_plan_name_at_index(i).startswith("sdpa_fwd_prefill_sm100")))
+    else:
+        graph.create_execution_plan(
+            family_for(graph).offered_ids()["sdpa_fwd_prefill_sm100"],
+            {cudnn.knob_type.TILE_CGA_M: cga, cudnn.knob_type.SPLIT_KV: 1, cudnn.knob_type.PACK_GQA: 1},
+        )
+        graph.select_plan(0)
     graph.check_support()
     graph.build_plans()
     assert graph.get_plan_name_at_index(graph._plan_index).startswith("sdpa_fwd_prefill_sm100")
+    print("ORIGIN_PLAN", graph.get_plan_name_at_index(graph._plan_index), flush=True)
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
 
     def poison(values):

@@ -3287,7 +3287,7 @@ def lower_dsl_prefill(
         and facts.d_qk == facts.d_v
         and facts.d_qk in (128, 256)
         and api.split_kv == 1
-        and api.cga in (None, 2)
+        and (api.cga in (None, 2) or (facts.has_paged_kv and facts.d_qk == 128 and api.cga == 1))
     ):
         from .thd_origins import graph_origin_specs
 

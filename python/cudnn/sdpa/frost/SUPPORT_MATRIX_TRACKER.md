@@ -357,6 +357,7 @@ offset pointers, and captured graphs read changed offset values on replay.
 With paged K/V, only Q/O/Stats use physical THD origins; K and V keep their
 page-table addressing and page-layout descriptors. The setup retains the paged
 path's original sequence ranking and never clamps a page pool to a packed total.
+The admitted unsplit SM100 D128 CGA1 prefill leg also consumes these origins.
 The existing one-query ragged decode path keeps its own offset binding.
 Paged half D256 THD also admits explicit PackGQA at CGA2 without splitting on
 SM100/SM103, using the same packed-head body as SM107. Nonpaged D256 THD

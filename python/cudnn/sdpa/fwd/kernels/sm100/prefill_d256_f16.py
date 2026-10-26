@@ -324,7 +324,7 @@ def _kernel(
     bidy = cute.arch.block_idx()[1]
     bidz = cute.arch.block_idx()[2]
 
-    if cutlass.const_expr(CFG.THD_VARLEN and SPLIT_KV > 1):
+    if cutlass.const_expr(CFG.THD_VARLEN and (SPLIT_KV > 1 or thd_origins is not None)):
         exit_if_dead_thd_cluster(seq_kv_lens_tensor, n_batch, CFG.CGA_M)
 
     sQO_raw = cutlass.Array(STORAGE_DTYPE, qBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
