@@ -1006,6 +1006,10 @@ def _host(
     tma_sfa_desc_list = []
     for _a_op, _sfa_op in zip(_a_operands, _sfa_operands):
         if cutlass.const_expr(a_is_m_major):
+            # Data descriptors carry CUTLASS's default TMA L2 promotion (128 B): a
+            # 64-byte K row (a 64-byte K tile, or the packed e2m1 side of a mixed pair)
+            # is otherwise its own DRAM request and streams ~30% slower on SM120; 128-byte
+            # rows measure the same either way.
             tma_a_desc_list.append(
                 _tma.create_tensor_map_tiled(
                     global_address=_a_op.iterator.toint(),
@@ -1017,6 +1021,7 @@ def _host(
                     ],
                     box_dims=[a_tma_group_elems, cta_tile_mnk[2], 1],
                     swizzle=ab_tma_swizzle,
+                    l2_promotion=_tma.TensorMapL2Promotion.l2_128b,
                     tma_format=ab_tma_format,
                 )
             )
@@ -1032,6 +1037,7 @@ def _host(
                     ],
                     box_dims=[cta_tile_mnk[2], cta_tile_mnk[0], 1],
                     swizzle=ab_tma_swizzle,
+                    l2_promotion=_tma.TensorMapL2Promotion.l2_128b,
                     tma_format=ab_tma_format,
                 )
             )
@@ -1071,6 +1077,7 @@ def _host(
                     ],
                     box_dims=[b_tma_group_elems, cta_tile_mnk[2], 1],
                     swizzle=ab_tma_swizzle,
+                    l2_promotion=_tma.TensorMapL2Promotion.l2_128b,
                     tma_format=ab_tma_format,
                 )
             )
@@ -1086,6 +1093,7 @@ def _host(
                     ],
                     box_dims=[cta_tile_mnk[2], cta_tile_mnk[1], 1],
                     swizzle=ab_tma_swizzle,
+                    l2_promotion=_tma.TensorMapL2Promotion.l2_128b,
                     tma_format=ab_tma_format,
                 )
             )
