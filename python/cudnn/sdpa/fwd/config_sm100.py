@@ -467,7 +467,8 @@ class TemplateParams:
 # Flavor tags as make_cfg_* / _validate_params spell them ("d192" is the
 # d192x128 kernel, whose K and V pools differ in row width). engines'
 # ``paged_d_shapes`` and the adapter's check_support name the same set.
-_PAGED_KV_FLAVORS = frozenset({"d64", "d128", "d192", "d256", "d512"})
+SM100_NATIVE_D576_SHAPE = (576, 512)
+_PAGED_KV_FLAVORS = frozenset({"d64", "d128", "d192", "d256", "d512", "d576"})
 
 # The fused epilogue gate (TemplateParams.epilogue_gate) is a RUBIN feature.  ONE body of this line reads
 # CFG.EPILOGUE_GATE: the SHARED f16/bf16 d256 prefill (sm100/prefill_d256_f16.py), whose paged / THD / PackGQA
@@ -735,8 +736,8 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
             raise ValueError(f"{flavor}: mma_2x2 selects the d512 2x2-datapath kernel; the other flavors do not consume it")
         if fp8:
             raise ValueError("d512: mma_2x2 is wired for BF16/FP16 inputs only (the fp8 / mxfp8 d512 kernels stay role-split)")
-        if k.paged_kv:
-            raise ValueError("d512: mma_2x2 does not serve paged KV (the d512 rows decline paged anyway)")
+        if k.paged_kv and k.d_flavor != 576:
+            raise ValueError("d512: mma_2x2 does not serve paged KV; the three-chunk d576 specialization is required")
         if k.pack_gqa and not d512_partial_pack_wired and (k.qh_per_kh <= 0 or _D512_2X2_TILE_M % k.qh_per_kh != 0):
             raise ValueError(f"d512: mma_2x2 packs whole GQA groups into its {_D512_2X2_TILE_M}-row tile; qh_per_kh ({k.qh_per_kh}) must divide it")
 
@@ -1815,7 +1816,7 @@ def make_cfg_d512(params: TemplateParams) -> Tuple[CfgD512, TmaIters]:
     # The 2x2-datapath record (TemplateParams.mma_2x2, appended, default False) is read through
     # getattr so a record built before the field existed takes the role-split arm unchanged.
     if getattr(params, "mma_2x2", False):
-        return make_cfg_d512_2x2(params)
+        return make_cfg_d512_2x2(params, cga_m=2 if params.d_flavor == 576 else 4)
     _validate_params("d512", params)
     b = bpe(params.dtype_qkv)
     fp8 = params.dtype_qkv <= DTYPE_E5M2  # E4M3/E5M2 inputs → the fp8 kernel file
@@ -2055,6 +2056,12 @@ class CfgD512X2:
     # SM100 packs whole groups; the native SM107 body also serves divisors of G.
     PACK_G: int = 1
 
+    # D512 has two 256-column K chunks. Native D576 uses three 192-column
+    # chunks so resident Q and both K/V rings fit under the SM100 SMEM cap.
+    N_BMM1_CHUNKS: int = 2
+    PAGED_KV: int = 0
+    PAGE_SIZE: int = 0
+
 
 def d512_2x2_smem_bytes(cfg: CfgD512X2, n_o_chunks: int = 8) -> dict:
     """The kernel's SMEM allocation from the SAME constants its arrays are declared with.
@@ -2066,7 +2073,7 @@ def d512_2x2_smem_bytes(cfg: CfgD512X2, n_o_chunks: int = 8) -> dict:
     """
     bpe = cfg.BPE
     q = cfg.TILE_M * cfg.TILE_K * bpe
-    k_sub = (cfg.TILE_N // cfg.CTA_MMA) * (cfg.TILE_K // 2) * bpe  # 64 kv rows x 256 d
+    k_sub = (cfg.TILE_N // cfg.CTA_MMA) * (cfg.TILE_K // cfg.N_BMM1_CHUNKS) * bpe
     v_sub = cfg.TILE_N * (cfg.TILE_O // cfg.CTA_MMA // cfg.N_BMM2_CHUNKS) * bpe  # 128 kv rows x 128 d_v
     o = cfg.TILE_M * cfg.TILE_O * cfg.BPE_O
     p = cfg.TILE_M * cfg.TILE_N * bpe
@@ -2119,7 +2126,11 @@ def d512_2x2_geometry_checks(cfg: CfgD512X2) -> tuple:
     n_pairs = cfg.CGA_M // cfg.CTA_MMA
     return (
         (cfg.TILE_M == 64 and cfg.TILE_N == 128, "d512 2x2: TILE_M=64 (cta_group::2 M=128 atom) / TILE_N=128"),
-        (cfg.TILE_K == 512 and cfg.TILE_O == 512, "d512 2x2: d_qk = d_v = 512"),
+        (
+            (cfg.TILE_K == 512 and cfg.N_BMM1_CHUNKS == 2) or (cfg.TILE_K == 576 and cfg.N_BMM1_CHUNKS == 3 and cfg.CGA_M == 2),
+            "2x2 QK geometry requires D512 with two K chunks or D576 with three K chunks and one CTA pair",
+        ),
+        (cfg.TILE_O == 512, "2x2 wide-head geometry requires D_V=512"),
         (cfg.CTA_MMA == 2 and cfg.CGA_N == 1, "d512 2x2: cta_group::2 pairs, CGA_N=1"),
         (cfg.CGA_M in (2, 4) and cfg.CGA_M % cfg.CTA_MMA == 0, f"d512 2x2: CGA_M must be 2 (bring-up arm) or 4; got {cfg.CGA_M}"),
         (cfg.KV_SHARE == n_pairs, f"d512 2x2: KV_SHARE ({cfg.KV_SHARE}) must equal CGA_M // CTA_MMA ({n_pairs})"),
@@ -2197,13 +2208,20 @@ def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD51
     the kernel file reads."""
     if not getattr(params, "mma_2x2", False):
         raise ValueError("d512 2x2: make_cfg_d512_2x2 needs a TemplateParams record with mma_2x2=True (make_cfg_d512 dispatches on it)")
-    _validate_params("d512", params)
+    native_d576 = params.d_flavor == 576
+    if native_d576 and params.thd_varlen:
+        raise ValueError("d576: native 2x2 attention requires dense Q; THD origins are not wired")
+    _validate_params("d512", params, d512_partial_pack_wired=native_d576)
     if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
         raise ValueError("d512 2x2: BF16/FP16 inputs only")
     b = bpe(params.dtype_qkv)
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     n_pairs = cga_m // CfgD512X2.CTA_MMA
     cfg = CfgD512X2(
+        TILE_K=576 if native_d576 else 512,
+        N_BMM1_CHUNKS=3 if native_d576 else 2,
+        PAGED_KV=int(params.paged_kv),
+        PAGE_SIZE=int(params.page_size) if params.paged_kv else 0,
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
         BPE=b,
@@ -2229,7 +2247,7 @@ def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD51
         SPLIT_KV=int(params.split_kv),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=int(params.qh_per_kh),
-        PACK_G=_pack_g(params, CfgD512X2.TILE_M, partial=False),
+        PACK_G=_pack_g(params, CfgD512X2.TILE_M, partial=native_d576),
     )
     _validate_cfg_d512_2x2(cfg)
     return cfg, _tma_iters(cfg)

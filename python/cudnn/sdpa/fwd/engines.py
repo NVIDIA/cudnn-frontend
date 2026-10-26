@@ -54,6 +54,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
 from cudnn.sdpa.fwd.config_sm100 import (
     SM100_BIAS_D_SHAPES,
     SM100_DENSE_ONLY_D_SHAPES,
+    SM100_NATIVE_D576_SHAPE,
     SM100_FP32_VECTOR_WITH_BIAS_TILE_N,
     SM100_SMALL_D_CGAS,
     SM100_TILE_NS_BY_D_SHAPE,
@@ -528,6 +529,9 @@ class Capabilities:
     # (config_sm100.pack_gqa_group_size).  APPENDED after tile_ns_by_d_shape
     # (append-only contract above).
     pack_gqa_requires_divisible: bool = True
+    # Native flavors with dense Q only. Unlike thd_d_shapes, this preserves
+    # the THD envelope of every other flavor on the row. Append-only.
+    thd_excluded_d_shapes: frozenset[tuple[int, int]] = frozenset()
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
@@ -1577,8 +1581,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                     and not packed_split
                     and (facts.is_fp8 or facts.is_mxfp8 or facts.has_epilogue_gate or capabilities.sm_lo not in (100, 107, 120))
                 )
-                or (facts.padded and not facts.has_paged_kv and not packed_split)
-                or facts.seq_q_trim
+                or (facts.padded and not facts.has_paged_kv and not packed_split and _selected_d_shape(capabilities, facts, knobs) != SM100_NATIVE_D576_SHAPE)
+                or (facts.seq_q_trim and not (facts.padded and _selected_d_shape(capabilities, facts, knobs) == SM100_NATIVE_D576_SHAPE))
                 # A split sink over padded query lengths also needs the native dense binder that hands the combine the Q lengths (a padded
                 # row must stay O := 0 / LSE := -inf): an older extension declines it here rather than at the spec build.
                 or (
@@ -1768,6 +1772,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             )
     elif not capabilities.d_pad_multiple and (facts.d_qk, facts.d_v) not in capabilities.d_shapes:
         return f"serves exact native shapes {shapes} (no envelope padding); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+    if _selected_d_shape(capabilities, facts, knobs) == SM100_NATIVE_D576_SHAPE and not getattr(
+        cudnn._pybind_module._SdpaDenseBinder, "supports_native_d576", False
+    ):
+        return "native D576x512 requires the matching cuDNN Frontend native extension"
+    if facts.thd and _selected_d_shape(capabilities, facts, knobs) in capabilities.thd_excluded_d_shapes:
+        return "this native head-dimension flavor requires dense Q; THD origins are not wired"
     if facts.thd and capabilities.thd_d_shapes is not None and (facts.d_qk, facts.d_v) not in capabilities.thd_d_shapes:
         return f"THD (ragged) rides the packed native-tile leg on this engine (shapes {sorted(capabilities.thd_d_shapes)}); the head-dim envelope is dense-only"
     if facts.thd and capabilities.sm_lo == capabilities.sm_hi == 80 and capabilities.phase == "prefill":
@@ -2080,7 +2090,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if capabilities.skv_tile and facts.s_kv % capabilities.skv_tile != 0 and not capabilities.skv_tail_via_padding:
         if not (facts.padded or _band_covers_kv_tail(facts)):
             return f"S_kv ({facts.s_kv}) must be a multiple of {capabilities.skv_tile} unless a padding mask is given or the causal mask covers the KV tail"
-    if facts.shape_overrides:
+    if facts.shape_overrides or _selected_d_shape(capabilities, facts, knobs) == SM100_NATIVE_D576_SHAPE:
         return _prepared_decline_reason(capabilities, facts, knobs.split_kv if knobs is not None else None)
     return None
 
@@ -2119,7 +2129,9 @@ def _sm100_spec() -> EngineSpec:
             # (dense_only_d_shapes below) -- THD / paged / split-KV / PackGQA / the score
             # side outputs walk past it onto the native d64 flavor, exactly the route
             # a d <= 32 graph took before the tile existed.
-            d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)}) | SM100_DENSE_ONLY_D_SHAPES,
+            d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512), SM100_NATIVE_D576_SHAPE}) | SM100_DENSE_ONLY_D_SHAPES,
+            d_envelope_floors=((SM100_NATIVE_D576_SHAPE, 512),),
+            thd_excluded_d_shapes=frozenset({SM100_NATIVE_D576_SHAPE}),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             bottom_right=True,
@@ -2145,7 +2157,7 @@ def _sm100_spec() -> EngineSpec:
             # S_q == 1 by default). Decode tiles for both are the follow-up, as
             # the d128 tile was: parity is a kernel's job, not an ordering rule's.
             paged_kv=True,
-            paged_d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)}),
+            paged_d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512), SM100_NATIVE_D576_SHAPE}),
             sink=True,
             stats=True,
             stats_log2=True,
@@ -2212,7 +2224,7 @@ def _sm100_spec() -> EngineSpec:
             # the 128-row tile by its largest divisor that does (Cfg.PACK_G:
             # 96/8 -> 4 heads per token row-group); d192x128 / d512 pack the
             # whole group only.
-            pack_gqa_partial_d_shapes=frozenset({(128, 128), (256, 256)}),
+            pack_gqa_partial_d_shapes=frozenset({(128, 128), (256, 256), SM100_NATIVE_D576_SHAPE}),
             thd_pack_gqa_d_shapes=SM100_THD_PACK_GQA_SHAPES,
             # Score side outputs (score_max / score_sum_exp): the d128 f16/bf16 prefill kernel stores
             # them from its correction epilogue (dense / unsplit / unpaged, the cga2 tile); the

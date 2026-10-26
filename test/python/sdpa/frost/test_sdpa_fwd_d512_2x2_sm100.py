@@ -78,7 +78,8 @@ def test_two_by_two_host_slots_match_role_split():
         return [a.arg for a in host.args.args if not (a.annotation is not None and "Constexpr" in ast.unparse(a.annotation))]
 
     parent = runtime_slots("sm100/prefill_d512_f16.py")
-    assert runtime_slots(_KERNEL_FILE) == parent
+    # The SM100 twin appends independent V-table strides for native D576.
+    assert runtime_slots(_KERNEL_FILE) == parent[:-1] + ["table_v_strides", parent[-1]]
     assert runtime_slots("sm107/prefill_d512_f16_2x2.py") == parent
 
 
