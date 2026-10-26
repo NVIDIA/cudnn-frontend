@@ -417,6 +417,7 @@ def test_paged_thd_fp8_binds_scales_and_origins_without_role_aliasing():
     assert frames == []
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("defect", ["offset_width", "offset_span", "offset_workspace", "offset_amax", "pool_stride", "scalar_shape"])
 def test_paged_thd_fp8_rejects_bad_bindings_before_writes(defect, monkeypatch):
     writes = []
