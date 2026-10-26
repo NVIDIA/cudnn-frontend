@@ -133,6 +133,10 @@ DESC_VERSION: int = 0
 # +0.3 % on one) and is a no-op on every cga1 rendering by construction (the cluster arm folds out at CGA_SIZE 1; the cubins
 # are byte-identical), so this kernel carries no constant for it.
 SPIN_RING_WAITS: bool = True
+# Overlap THD setup with the main kernel's independent barrier initialization.
+# This internal dependency changes neither admission nor the caller's PDL
+# contract. Dense and other head-size bodies stay unchanged.
+THD_SETUP_PDL: bool = bool(CFG.THD_VARLEN and CFG.TILE_K == 128 and CFG.TILE_O == 128)
 # exp2 MUFU / FMA split -- the Rubin small-D PROBE (an experiment, never a default on cc 10.7).  ``tile_dsl.pointwise.exp2_emul_pair``
 # evaluates a compile-time subset of every row's exp2 on the FMA pipe (6 packed FP32 / INT instructions per pair, no MUFU.EX2): the
 # sm100 d128 kernels' ``_E2E_*`` block (pattern (16, 4, TILE_N): the LAST 4 of every 16 columns; shipped there on cc 10.0 only), which
@@ -190,6 +194,7 @@ from cudnn.frost.tile_dsl.barrier import (
     advance,
     cga_arrive,
     cga_wait,
+    wait_on_dependent_grids,
     # `wait` (free fn) — still used for sched.mb_* (Sched is not in Bars yet;
     # only the per-kernel Bars NamedTuple was migrated to MBarrier in this step).
     wait,
@@ -1162,6 +1167,13 @@ def _kernel(
     if cutlass.const_expr(CFG.CTA_MMA == 2 or _BIAS_MCAST):
         cga_arrive()
         cga_wait()
+
+    if cutlass.const_expr(THD_SETUP_PDL):
+        # Every role waits before its first dependent global read. Everything
+        # above is CTA/cluster-local initialization; the scheduler's lengths,
+        # live-work counter, sinks and TMA descriptor loads are all below.
+        # The setup's early release is only a scheduling hint, not visibility.
+        wait_on_dependent_grids()
 
     # @cute.kernel stages if/else — use Python ternaries so the chosen
     # expression flows into the trace (variables in branches aren't visible outside).
@@ -5215,6 +5227,7 @@ def _host(
             cutlass.Int32(CGA_TILE_M // HEADS_PER_TILE),
             n_thd_units,
             small_batch_meta=True,
+            release_dependents=THD_SETUP_PDL,
         ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:
@@ -5256,6 +5269,7 @@ def _host(
         block=[CFG.THREADS_PER_CTA, 1, 1],
         cluster=(CFG.CTA_MMA, 1, CFG.BIAS_MCAST_CTAS),
         stream=stream,
+        use_pdl=THD_SETUP_PDL,
     )
 
 

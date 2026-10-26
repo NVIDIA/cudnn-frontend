@@ -11,6 +11,7 @@ import cutlass.cute as cute
 import cuda.bindings.driver as _cuda_driver
 
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
+from cudnn.frost.tile_dsl.barrier import launch_dependent_grids
 
 from cudnn.frost.tile_dsl.thd import (
     TENSOR_MAP_QWORDS,
@@ -293,6 +294,7 @@ def build_thd_meta_o_descs_kernel(
     splits: cutlass.Constexpr[int] = 1,
     rank_by_kv: cutlass.Constexpr[bool] = False,
     small_batch_meta: cutlass.Constexpr[bool] = False,
+    release_dependents: cutlass.Constexpr[bool] = False,
 ) -> None:
     """Per-execute f16/bf16 THD metadata, O descriptors, and scheduler bounds.
 
@@ -316,6 +318,13 @@ def build_thd_meta_o_descs_kernel(
     sequence, so the metadata buffer holds ``THD_WORK_META_WORDS(B)`` words.
     """
     tidx, _, _ = cute.arch.thread_idx()
+    if cutlass.const_expr(release_dependents):
+        # This setup launch retains ordinary stream ordering with its input
+        # producers. Only its consumer opts into PDL: allow that consumer's
+        # independent prologue to start, then require griddepcontrol.wait
+        # before it reads any metadata or runtime tensor-map descriptor.
+        if tidx == 0:
+            launch_dependent_grids()
     nthreads, _, _ = cute.arch.block_dim()
     meta = cutlass.make_array_view(meta_t)
     fused_meta = cutlass.Boolean(False)
