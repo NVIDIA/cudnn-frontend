@@ -112,7 +112,7 @@ python -m benchmark.attention_training.runner --config llama --dtype bfloat16
        data_types=["bfloat16", "fp8"],
        attn_masks=["top_left", "no_mask"],
        profile_pass="fwd",  # "fwd", "bwd", or "both"
-       num_iterations=10,
+       num_iterations=20,
    )
    ```
 
@@ -132,7 +132,7 @@ python -m benchmark.attention_training.runner --config llama --dtype bfloat16
 | `attn_masks` | Attention masks (`top_left`, `no_mask`) | `["top_left"]` |
 | `profile_pass` | Which pass to profile (`fwd`, `bwd`, `both`) | `"fwd"` |
 | `batch_size` | Batch size | `1` |
-| `num_iterations` | Iterations per benchmark | `10` |
+| `num_iterations` | Iterations per benchmark (the median drops the first 5) | `20` |
 | `deterministic_bwd` | Deterministic modes for backward | `[False]` |
 | `sliding_window_size` | Sliding window attention size (requires `top_left` mask) | `None` |
 | `layout` | `bshd`, or `thd` for packed variable-length sequences (cuDNN legs, bf16/fp16; `batch_size` counts sequences, each `seqlens` entry is the longest) | `"bshd"` |

@@ -61,8 +61,21 @@ batches. The 9-head video DiT is not head-shardable and runs whole-model
 additionally sweeps the KV-cache dtype (`kv_cache_dtypes`): this corresponds
 to the fp8-KV-cache serving configuration, realized on the cudnn paths as
 the full fp8 attention graph (q/k/v/o e4m3 with unit descales). Sinks
-(`has_sink`) add per-head attention-sink logits (gpt-oss-style; not wired
-into the fp8 graph — those cases record as unsupported).
+(`has_sink`) add per-head attention-sink logits (gpt-oss-style), in the bf16
+and the fp8 graph alike.
+
+**Serving form of the cuDNN call.** `kv_layouts=["dense", "paged"]` runs each
+cudnn leg twice. `dense` is contiguous K/V. `paged` is what a serving stack
+hands cuDNN (FlashInfer's cudnn backend): K/V in an HND page pool behind a
+*shuffled* block table (a live cache is fragmented), per-request
+`seq_len_q/kv` with a padding mask, and THD Q/O (ragged offsets) for a
+prefill. `kv_min_fills=[1.0, 0.25]` adds decode batches whose caches differ in
+length: each request's KV length is drawn (seeded) from
+[0.25 * kv_len, kv_len] (batch > 1 only; the paged cudnn legs and flashinfer).
+FLOPs and bytes are counted at each request's own lengths. The CSV carries
+`kv_layout` and `kv_min_fill`, and the charts give those rows their own
+clusters. `llama`, `qwen35`, `gpt_oss`, `deepseek_v4` and `kimi_k3` enable
+both axes.
 
 MLA models run **absorbed** in generation (`kind="mla_absorbed"`: K reads the
 full record, V a leading slice of the *same* record, so KV bytes are counted
