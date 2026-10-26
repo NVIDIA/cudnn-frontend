@@ -3691,6 +3691,46 @@ Not served (typed declines by name; each lands with its accept cell and flips th
 count, the kernel's own epilogue gate under a split (the combine carries it), a sink, a sliding window / band, Q-length trimming
 of a dense batch, log2 stats, a pure caller list without the tail, head dims other than 256, FP8 / MXFP8.
 
+**The SECOND BODY of the function -- the LEAN decode tile** (`python/cudnn/sdpa/fwd/kernels/sm107/sparse_lean_d256_f16.py`: `mma.sync`
+m16n8k16 + `cp.async`, one 128-thread CTA per (sequence, KV head, chunk of `k` 32-key sub-tiles), four warps each owning a 64-wide
+d-slice -- BMM1 split-K over the warps with an 8-KiB SMEM exchange and a fixed-order sum, the softmax redundant per warp, BMM2 on the
+warp's own 16 x 64 O slice --, the one-shot zero-filled `cp.async` gather of the rows the list names, no TMEM / TMA / CLC / mbarrier /
+warp specialization; the visible set from the ONE helper it shares with the tcgen05 core, `sm107/_sparse_item_common.py`, whose cubins
+stayed byte-identical through the lift).  A kernel-INVENTORY fact, not a capability: the `SparseCapabilities` record gains NO field (the
+function is the tcgen05 core's, within the fixed-order-sum budget -- never bitwise ACROSS the bodies, bitwise WITHIN each: two launches,
+replay == eager, paged == dense, the per-row list at one row per sequence == the shared list).  Reached through the adapter's
+PERFORMANCE knob `tile_form="auto" | "lean" | "tcgen05"` (the block's `sparse_tile_form`; `sub_tiles_per_cta` / `sparse_sub_tiles_per_cta`
+pins `k`), read back as `kernel_template` / `sparse_tile` (`"sparse_lean_d256_f16"` / `"sparse_d256_f16"`; the envelope's `decode.sparse_tiles`
+/ `.sparse_tile(s_q, batch)` / `.sparse_tile_lean_default`).  Its envelope: the DECODE form only (`bottom_right` + the shared list at
+`S_q <= 1` -- the S_q 2..4 rendering with `n_mt` m16 tiles follows and raises `config_sm107.LEAN_SPARSE_SERVED_MAX_S_Q` to 4 --, or the
+per-row list at `S_q == 1`, which IS the shared list), `seq_kv_lens` present, dense BSHD or paged pools (HND / NHD, pages 16 / 48 / 64
+validated; never THD), bf16 / f16, G 1..16, `top_k` a multiple of 4 in [8, 512] (below 8 the list is one sub-tile: the tcgen05 core's
+cell); it ALWAYS splits -- `split_kv` is a LEAN split `ceil(n_sub / k)` (65 / 33 / 22 / 17 / 13 / 11 / 10 / 9 at `top_k` 512, `n_sub =
+ceil((top_k + 2) x 4 / 32)`; a pinned split SELECTS `k`, 1 <= k <= min(8, n_sub - 1); the default `k` 1) writing the SAME fp32 split-major
+partial slab the tcgen05 core's split store writes (the combine, its pinned form -- the decode-grid kernel on the 24- / 96-row grids at
+split 65 / 33, the module's own forms at 384 rows below split 32, the AUTO entry past the decode-grid bound -- and the gate riding it
+untouched; `heuristics.SPARSE_LEAN_COMBINE_FORM_CELLS` names the measured and the owed cells).  Every other arm is a typed decline naming it
+(`heuristics.sparse_lean_tile_decline`: THD, a prefill / top-left form, no `seq_kv_lens`, `S_q` past the served rows, per-row lists past one
+row, `top_k` below 8, the tcgen05 core's `softmax_groups`; a split that is not a lean split; the `k` pin out of range or under another body)
+-- never a silent fallback.  PLACEMENT (`heuristics.sparse_decode_lean_tile_selected`): the lean tile below `B x H_kv x S_q <=
+LEAN_SPARSE_MAX_UNITS = 32` units on cc 10.7 with `top_k >= 8`, the tcgen05 core above -- consulted by `"auto"` ONLY on the parts of
+`heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS`, EMPTY until the end-to-end gate measures the lean route (the measured-default rule: the tuple
+flips to `((10, 7),)` with the gate's table in the gate commit, the bound refit from it), so `"auto"` resolves the tcgen05 core on every part
+today and the explicit `"lean"` is the way to take the lean tile.  Kernel-alone evidence on the Rubin performance class (212 SMs at the 2376
+MHz lock, one process, A/B/A x 3 rounds x 10 replays of 100 launches, the control pair within 0.32 %, the oracle green before timing):
+B 1 x 8K x S_q 1 at `top_k` 512 on page-16 pools 3.341 us (3.352 with the build order rotated) against the tcgen05 core's 5.655 (+69.3 %),
+B 1 x 32K 3.302 vs 5.648 (+71.0 %), B 4 x 8K 5.538 vs 6.417 (+15.9 %, informative); the chain (tile + the pinned decode-grid combine at
+split 65 vs the core + its combine at split 16) 8.32 -> 5.75 us and 8.31 -> 5.69 us at the two B 1 cells (+44.9 % / +46.0 %; 7.0 % / 6.8 %
+of the 36.8 / 38.3-us decode step).  **The measured table of the lean route end to end (the 19 decode cells, the bound sweep B 1 .. 32 x
+S_q 1 / 4, the PDL arm, the k 2 register lever) is OWED to the gate; no end-to-end perf claim before it lands.**  Validated functionally
+on the Rubin development class (204 SMs): the adapter's lean route (the ladder against the fp32 oracle anchored at the step-0 position,
+the gate through the combine, paged == dense bitwise, the per-row == the shared list bitwise, the PDL arm bitwise the plain arm, a dead
+sequence, `top_k` 8, G 16 / one KV head, f16, `k` 2 / 4 by a pinned split or a pinned `k`) and the block's (`sparse_tile_form="lean"` vs
+`"tcgen05"`: `out` within the module's bars, the gated O and the LSE within 2e-2, the list bitwise; the kernel-name census -- one
+`cudnn_sparse_lean_kernel`, no `cudnn_kernel__kernel` core, the launch count equal --; the in-block indexer's decode step on the lean
+route, list / counts / side caches bitwise the core's; the workspace honest under the lean split; the first execute captured on the lean
+route replaying bitwise; four end-to-end decode steps after a prefill tracking the core's within the bars).
+
 ### SM107 half D512 packed and split plans
 
 Dense exact D512 FP16/BF16 plans use the native 2x2 body for explicit PackGQA and split-KV. The 64-row tile packs gcd(G,64) heads; G128 uses two subgroups per KV head. Split partials are FP32 with natural-log LSE; the shared combine folds a sink once and applies the requested Stats log base. Scalar KV tails are masked natively. These additions do not widen paged D512, THD packing/splitting, FP8/MXFP8, or scheduler domains. `test_sdpa_d512_pack_split_sm107.py` covers both graph and standalone execution, independent FP64 references, rebinding and retained CUDA Graph replay.
