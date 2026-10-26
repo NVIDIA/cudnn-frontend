@@ -311,7 +311,8 @@ def test_l2_identity_fastpath_is_compile_time_and_used_by_every_mixed_cga_call()
                 offenders.append(f"{path.name}: MoE must keep its separate swizzle path")
             continue
 
-        expected_count = 4 if path.name.startswith("sm103_") else 3
+        # sm103 and the sm100 block-scale MMA warp (SFB sub-tile) also walk the tile raster.
+        expected_count = 4 if path.name.startswith("sm103_") or path.name == "sm100_block_scale_matmul.py" else 3
         if len(calls) != expected_count:
             offenders.append(f"{path.name} (cta_group={cta_group}): expected {expected_count} L2-swizzle calls, found {len(calls)}")
         for call in calls:

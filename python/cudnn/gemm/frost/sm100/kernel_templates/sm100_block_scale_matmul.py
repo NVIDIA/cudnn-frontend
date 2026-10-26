@@ -1269,20 +1269,20 @@ def _kernel(
                     time_limit=10_000_000,
                 ):
                     pass
-                _m_idx, _n_idx, _l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
+                m_idx, n_idx, l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
                 cute.arch.fence_proxy("async.shared", space="cta")
                 is_valid = vld
                 if cutlass.const_expr(split_k_slices > 1):
-                    tile_l = _l_idx
+                    tile_l = l_idx
                 if cutlass.const_expr(sfb_sub_tile_n > 0):
-                    mma_raw_m = _m_idx >> _preferred_cluster_m_shift
-                    mma_raw_n = _n_idx >> _preferred_cluster_n_shift
+                    mma_raw_m = m_idx >> _preferred_cluster_m_shift
+                    mma_raw_n = n_idx >> _preferred_cluster_n_shift
                     mma_nt_m = gridx >> _preferred_cluster_m_shift
                     mma_nt_n = gridy >> _preferred_cluster_n_shift
                     if cutlass.const_expr(fallback_cluster_shape_mnk is not None):
                         if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
-                            mma_raw_m = _m_idx >> _fallback_cluster_m_shift
-                            mma_raw_n = _n_idx >> _fallback_cluster_n_shift
+                            mma_raw_m = m_idx >> _fallback_cluster_m_shift
+                            mma_raw_n = n_idx >> _fallback_cluster_n_shift
                             mma_nt_m = gridx >> _fallback_cluster_m_shift
                             mma_nt_n = gridy >> _fallback_cluster_n_shift
                     _unused_m, sfb_tile_n = _l2_swizzle_tile(

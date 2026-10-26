@@ -457,6 +457,11 @@ class KernelTemplate:
                 data_elem_bits = max(C.DTYPE_BITS[bs.a_dtype], C.DTYPE_BITS[bs.b_dtype])
                 cta_k_elems = config.cta_tile_k_bytes * 8 // data_elem_bits
                 validate_block_scale_config(config, bs.block_size, cta_k_elems)
+                if chain.moe is not None and config.mma_tile_n % 128:
+                    raise NotImplementedError(
+                        f"block-scaled MoE matmul requires mma_tile_n % 128 == 0 (its templates do not address an SFB sub-tile); "
+                        f"config {config.name!r} has mma_tile_n={config.mma_tile_n}"
+                    )
             else:
                 C._check_dtype_config_compat(chain, config)
         except (ValueError, NotImplementedError) as e:

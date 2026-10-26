@@ -1199,6 +1199,7 @@ def block_scale_narrow_n_ok(cfg: TileConfig) -> bool:
     return (
         cfg.mma_tile_n in BLOCK_SCALE_NARROW_N
         and cfg.cta_tile_n == cfg.mma_tile_n
+        and cfg.cta_tile_m == cfg.mma_tile_m == 128
         and getattr(cfg, "cta_group", 1) == 1
         and cfg.cga_size_n == 1
         and cfg.pipeline == "sm100"

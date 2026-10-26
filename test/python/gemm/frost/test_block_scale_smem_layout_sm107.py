@@ -476,9 +476,11 @@ def test_every_k64_catalog_geometry_renders_below_the_line(rubin, combo):
         _cross_check(rendered, _model_roots(_consts(txt), tmpl.file, tma_store=False), slack=1024)
     # The block-scale pipeline plans 128-multiple tiles only (the SF 128x4 swizzle
     # rejects the other 372 geometries up front) and 512x256 exceeds the TMEM budget:
-    # cta_m in {128, 256, 512} x cta_n in {128, 256} x cta_group in {1, 2} minus two.
+    # cta_m in {128, 256, 512} x cta_n in {128, 256} x cta_group in {1, 2} minus two,
+    # plus the 1-CTA 128x64 SFB sub-tile geometry (tile_config.block_scale_narrow_n_ok;
+    # the 8/16/32 tiles decline here because this chain's N exceeds 32).
     # Pinned exactly so a catalog widening re-reads this sweep instead of diluting it.
-    assert rendered_n == 10, rendered_n
+    assert rendered_n == 11, rendered_n
 
 
 @pytest.mark.parametrize("combo", sorted(_COMBOS))
@@ -500,7 +502,7 @@ def test_sm100_budget_never_reaches_the_line(blackwell, combo):
         rendered = _rendered_roots(txt)
         assert max(rendered.values()) < SM100_BUDGET, (name, rendered)
         assert not _wrapped(rendered), (name, combo, rendered)
-    assert rendered_n == 6, rendered_n  # 128-multiple tiles minus the 5 the 227 KiB TMEM/SMEM budget declines
+    assert rendered_n == 7, rendered_n  # 128-multiple tiles minus the 5 the 227 KiB TMEM/SMEM budget declines, plus the 128x64 SFB sub-tile
 
 
 def test_guard_names_the_wrapping_root():
