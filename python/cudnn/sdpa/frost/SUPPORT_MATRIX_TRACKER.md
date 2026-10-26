@@ -420,8 +420,8 @@ the allocation contract. All scratch is initialized each execution.
 A compiled accumulation plan accepts runtime scalar overrides only when both
 scale and scale*log2(e) remain finite and positive in FP32. Changing the scale
 never silently changes implementation. SM100 and SM103 are the runtime
-qualification targets. The row remains opt-in, and
-performance qualification is separate from capability tests. The graph tests
+qualification targets. The row is a default candidate, ranked ahead of the backend only for d128 THD without a window
+(`sdpa/bwd/heuristics.py`); performance qualification is separate from capability tests. The graph tests
 in `test_sdpa_bwd_d128_sm100.py` and `test_sdpa_bwd_d128_accum_sm100.py` cover
 all three gradients, launch counts, workspace bounds, buffer rebinding and
 capture/replay. Native frame tests cover the prepared hosts.
