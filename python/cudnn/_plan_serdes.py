@@ -256,7 +256,7 @@ def deserialize(graph: "pygraph", data: Any, handle: Any = None, enforce_precomp
         raise ValueError(f"serialized python-engine plan has format {header.get('format')!r}; this frontend reads format {FORMAT}")
 
     # Seed (and run the strict check) before touching the graph, so a refusal leaves it empty for a retry.
-    device = getattr(getattr(handle, "device", None), "ordinal", None)
+    device = getattr(getattr(handle if handle is not None else graph._handle, "device", None), "ordinal", None)
     seeded = 0
     for description in header["kernels"]:
         offset, size = int(description.pop("offset")), int(description.pop("size"))
