@@ -1257,3 +1257,18 @@ otherwise hide a missing attribute restriction. For example, the pre-folded
 scale case in `test_thd_pack_gqa_unsupported_flavors_decline` includes legal
 CGA2 as well as CGA1. Removing only the pre-folded-scale decline must make the
 CGA2 case fail while the unrelated-domain cases still pass.
+
+
+Paged FP8 D256 uses rank-5 TMA maps with more than one dimension subtile.
+When a page is shorter than the KV tile, keep the shared-memory pitch of each
+dimension slab at the full tile height; a short TMA box must not pack the
+next dimension slab directly after the page rows. Use each pool's own strides
+and table. `test_paged_graph_fp8_d256_page_boundaries` exercises both sides
+of the tile/page boundary and independently laid-out K/V pools.
+
+A sink-only row must publish O=0 and LSE=sink even for a very negative finite
+sink. An empty softmax's reset max is a sentinel, not a real score: folding
+`exp(sink - sentinel)` can underflow and turn LSE into -inf. Select the
+sink-only result explicitly and retain the later padded-Q trim override.
+Detectors: `test_paged_graph_fp8_sink_rebind_replay` and
+`test_prepared_fp8_d256_dense_keyless_sink` include sink logits -120/+120.

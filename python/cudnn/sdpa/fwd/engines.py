@@ -2668,22 +2668,13 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             thd_padded_stats=True,
             cu_seq_len=True,
             padded_stats=True,
-            # Paged KV caches (issue #920) on the SM100 line only: the d128
-            # per-tensor FP8 kernel carries the PAGED_KV specialization (block
-            # table indirection on the K/V TMA loads, HND/NHD pools, per-batch
-            # lengths on device, KV split + combine with the recombined amax);
-            # d64 rides its envelope. paged_d_shapes keeps the fp8 paged
-            # selection to the d128 flavor (d_qk, d_v <= 128: the d192x128 /
-            # d256 / d512 FP8 kernels carry no PAGED_KV specialization) and
-            # mismatch() keeps it to dense, sink-free, plain-O Q (the fp8 THD path
-            # clamps runtime K/V descriptors to a packed total a pool does not
-            # have; neither the sink fold nor the block-scaled O epilogue (sf_o)
-            # over pools is validated on this kernel).
-            # The Rubin sibling kernel has no PAGED_KV specialization, so that
-            # row stays off (a module-scope guard in the kernel file backstops
-            # it).
+            # Native per-tensor FP8 page pools on SM100/103: D64, D128 and
+            # D256 use independent K/V block tables and pool strides. Dense Q,
+            # scalar-scaled O, padding/causal/windows, sink and legal KV splits
+            # compose with the loader. THD Q, block-scaled O and the Rubin
+            # siblings retain their existing declines.
             paged_kv=not rubin_row,
-            paged_d_shapes=None if rubin_row else frozenset({(64, 64), (128, 128)}),
+            paged_d_shapes=None if rubin_row else frozenset({(64, 64), (128, 128), (256, 256)}),
             # Multi-wave launches are served: the former single_wave_only gate
             # (wrong O past one wave) was removed after the kernel's TMEM stats
             # race was fixed with the mb_stats_read barrier (verified on the
