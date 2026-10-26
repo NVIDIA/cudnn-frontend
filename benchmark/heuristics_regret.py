@@ -75,9 +75,10 @@ def _load(paths):
 
 
 def _plan(detail):
-    """The plan name in a backend_detail ("cudnn_auto plan=X" or a bare name); None when unrecorded."""
+    """The plan name in a backend_detail ("cudnn_auto plan=X" or a bare name); None when unrecorded or unknown."""
     detail = (detail or "").strip()
-    return detail.split("plan=", 1)[1].strip() if "plan=" in detail else (detail or None)
+    plan = detail.split("plan=", 1)[1].strip() if "plan=" in detail else detail
+    return None if plan in ("", "unknown") else plan
 
 
 def _label(key):
