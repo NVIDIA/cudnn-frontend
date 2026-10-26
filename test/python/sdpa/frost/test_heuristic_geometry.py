@@ -612,5 +612,8 @@ def test_rubin_d64_decode_proposes_the_packed_leg(monkeypatch, s_q, window, sink
     )
     plans = heur.recommend("A", facts, {spec.name: 20505})
     assert plans[0].knobs.pack_gqa
-    assert (plans[0].knobs.split_kv or 1) > 1 if not sink else plans[0].knobs.split_kv == 1
+    if sink:
+        assert plans[0].knobs.split_kv == 1  # no sink split on this row
+    else:
+        assert any((p.knobs.split_kv or 1) > 1 for p in plans)  # the split leg is proposed again; its rank is the wave model's
     assert all(mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
