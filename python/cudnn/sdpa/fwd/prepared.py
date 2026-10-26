@@ -269,10 +269,8 @@ def _positional_order(api) -> Tuple[Any, Any, List[str]]:
     if raw is None:
         raise NotImplementedError("the compiled artifact exposes no positional tvm-ffi entry")
     order = list(_host_parameter_order(host))
-    if "stream" not in order:
-        raise NotImplementedError(f"{km.__name__}: the host entry is missing the stream parameter: {order}")
-    # The binder addresses named slots. Appended optional operands may follow
-    # the original stream slot; validate the complete compiled ABI below.
+    if order[-1] != "stream":
+        raise NotImplementedError(f"{km.__name__}: the host entry does not end with the stream parameter: {order[-3:]}")
     wrapper_sig = getattr(compiled, "_kwargs_wrapper", None) or compiled
     try:
         seen = list(inspect.signature(wrapper_sig).parameters)
