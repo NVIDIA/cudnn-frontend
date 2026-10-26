@@ -1352,12 +1352,12 @@ def test_additive_kv_mask_needs_a_whole_granule_extent(monkeypatch):
 
 
 def test_tile_n_knob_domain_is_per_flavor_on_the_sm107_f16_row(monkeypatch):
-    """The TILE_N knob: 64 and 128 on the 32- / 64-wide tiles (``tile_ns_by_d_shape``), 128 only on the d128 rendering of the
+    """The TILE_N knob: 64 and 128 on the 32- / 64-wide tiles (``tile_ns_by_d_shape``), 64 and 128 on the native d128 prefill rendering of the
     same file; 256 is outside every flavor's domain (refused by the TMEM predicate at two sub-tiles) -- a typed decline, never
     a silently degraded width."""
     _rubin(monkeypatch)
     caps = _sm107_f16_caps()
-    for d, ok in ((32, {64, 128}), (64, {64, 128}), (128, {128})):
+    for d, ok in ((32, {64, 128}), (64, {64, 128}), (128, {64, 128})):
         g = _mk_small_d_graph(d=d)
         facts = _facts(g)
         assert engines.effective_tile_ns(caps, facts) == frozenset(ok), d
