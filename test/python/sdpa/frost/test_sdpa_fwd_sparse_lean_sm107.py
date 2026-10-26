@@ -49,7 +49,7 @@ _SENTINEL = 1.5e30
 
 
 def _kernels_dir() -> Path:
-    import cudnn.sdpa.fwd.config_sm107 as c107
+    from cudnn.sdpa.fwd import config_sm107 as c107
 
     return Path(c107.__file__).resolve().parent / "kernels" / "sm107"
 
@@ -470,7 +470,7 @@ os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
 os.environ["CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO"] = "0"
 from cudnn.frost.template_loader import load_template
 from cudnn.sdpa.fwd.config_sm100 import TemplateParams
-import cudnn.sdpa.fwd.config_sm107 as c107
+from cudnn.sdpa.fwd import config_sm107 as c107
 path = os.path.join(os.path.dirname(os.path.abspath(c107.__file__)), "kernels", "sm107", module_file)
 pkw = json.loads(pjson)
 record = c107.TemplateParamsLean if module_file.startswith("sparse_lean_") else TemplateParams  # the lean tile's appended S_q axis; the tcgen05 module keeps the base record
@@ -717,10 +717,10 @@ class LeanRun:
         self.B, self.H, self.S = B, H, S
         self.paged = len(kv) == 4
         if self.paged:
-            self.k_pool, self.v_pool, self.table, self.P = kv
+            self.k_pool, self.v_pool, self.table, self.P = kv[0], kv[1], kv[2], kv[3]
             KH = self.k_pool.shape[1]
         else:
-            self.k, self.v = kv
+            self.k, self.v = kv[0], kv[1]
             KH = self.k.shape[2]
         self.KH = KH
         self.kv_lens = torch.tensor(kv_lens, device=dev, dtype=torch.int32)

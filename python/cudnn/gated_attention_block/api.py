@@ -1142,6 +1142,8 @@ class DecodeEnvelope:
             form = _H.SPARSE_TILE_FORM_LEAN
         else:
             form = _H.SPARSE_TILE_FORM_TCGEN05
+        if form == _H.SPARSE_TILE_FORM_TCGEN05 and decode_split_kv is not None and not 1 <= int(decode_split_kv) <= _H.sparse_tcgen05_max_split(q.top_k):
+            return None  # the core's split bound [1, ceil((top_k + 1) / 32)]: outside it the declaration is rejected, so no body is read
         return _H.SPARSE_TILE_LEAN if form == _H.SPARSE_TILE_FORM_LEAN else _H.SPARSE_TILE_TCGEN05
 
 

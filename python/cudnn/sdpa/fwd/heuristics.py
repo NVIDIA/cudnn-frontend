@@ -830,6 +830,12 @@ def sparse_lean_splits(top_k: int) -> Tuple[int, ...]:
     return tuple(sorted({lean_sparse_split(int(top_k), k) for k in range(1, sparse_lean_max_sub_tiles_per_cta(top_k) + 1)}, reverse=True))
 
 
+def sparse_tcgen05_max_split(top_k: int) -> int:
+    """The tcgen05 core's split bound at ``top_k``: ``ceil((top_k + 1) / 32)`` = the item's tile count (17 at top_k 512; a larger split has an
+    empty chunk on every item).  The adapter's check and the envelope's readback read ONE copy."""
+    return -(-(int(top_k) + 1) // 32)
+
+
 def sparse_lean_max_sub_tiles_per_cta(top_k: int) -> int:
     """The largest k a lean launch may pin at ``top_k``: ``min(8, n_sub - 1)`` -- the sub-tile loop is unrolled at trace time
     (``config_sm107.LEAN_SPARSE_MAX_SUB_TILES_PER_CTA``), and the lean tile ALWAYS splits (its O / LSE are the fp32 partials the combine

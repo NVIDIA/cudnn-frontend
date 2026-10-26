@@ -3578,6 +3578,16 @@ def test_the_envelope_reads_the_sparse_tile_route_back(monkeypatch):
     assert env.sparse_tile(5, 4, sparse_tile_form="lean") is None and env.sparse_tile(1, 4, sparse_tile_form="lean", decode_split_kv=16) is None
     assert env.sparse_tile(4, 4) == _TILE_TCGEN05  # 32 units under AUTO: past the bound, the core
     assert env.sparse_tile(1, 4, sparse_tile_form="lean", decode_split_kv=33) == _TILE_LEAN
+    # a tcgen05 split pin outside the core's bound [1, ceil((top_k + 1) / 32)] = [1, 17] at top_k 512 is a declaration-time rejection,
+    # so the envelope reads None there (never "the core"); inside the bound the core; under AUTO the pin is the stronger knob and the same bound holds
+    assert env.sparse_tile(1, 4, sparse_tile_form="tcgen05", decode_split_kv=17) == _TILE_TCGEN05 and env.sparse_tile(1, 4, decode_split_kv=16) == _TILE_TCGEN05
+    assert (
+        env.sparse_tile(1, 4, sparse_tile_form="tcgen05", decode_split_kv=18) is None
+        and env.sparse_tile(1, 4, sparse_tile_form="tcgen05", decode_split_kv=0) is None
+    )
+    assert (
+        env.sparse_tile(1, 1, decode_split_kv=18) is None and env.sparse_tile(1, 1, decode_split_kv=1) == _TILE_TCGEN05
+    )  # AUTO: the pin keeps the core; split 1 = unsplit core
     other = GatedAttentionBlockFwd.serving_envelope(geom, BF16, dev, device_cc=(10, 0)).decode  # the form is not served off cc 10.7: no body, no route
     assert not other.served and other.sparse_tiles == () and other.sparse_tile(1, 1) is None and other.sparse_tile(1, 1, sparse_tile_form="lean") is None
     dense = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**GEOM_SMALL), BF16, dev, device_cc=_SM107).decode

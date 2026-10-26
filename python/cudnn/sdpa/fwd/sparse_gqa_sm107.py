@@ -581,7 +581,9 @@ class SparseGqaFwdDslSm107:
                 "sparse d256 forward (sm107): list_per_sequence=True needs bottom_right=True -- the shared list is anchored at the step-0 position "
                 "kv_len - S_q (the decode / MTP form); a top-left per-sequence list has no serving meaning"
             )
-        max_tiles = -(-(self.top_k + 1) // 32) if _TOPK_MIN <= self.top_k <= _TOPK_MAX else 0
+        from cudnn.sdpa.fwd.heuristics import sparse_tcgen05_max_split  # one copy of the core's split bound (the envelope reads the same)
+
+        max_tiles = sparse_tcgen05_max_split(self.top_k) if _TOPK_MIN <= self.top_k <= _TOPK_MAX else 0
 
         # the index list's FORM (the kernel's staging is sized by it)
         if self.block_size != _BLOCK_SIZE:
