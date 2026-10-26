@@ -726,6 +726,17 @@ Shared helpers (schedulers, metadata utils, e.g. `gemm/cutedsl/grouped/moe_*.py`
 
 ## CuTeDSL kernel bodies
 
+Named barriers inside warp-specific branches need unaligned sync and arrive
+instructions. CuTeDSL 4.8's `NamedBarrier.arrive_and_wait()` emits an aligned
+barrier, including through `TmemAllocator.wait_for_alloc()`. Check the launch
+with Compute Sanitizer `--tool synccheck`; ordinary parity tests can pass despite
+divergent-barrier errors. The SM100 GLU/Hadamard/quant JAX parity tests cover this.
+
+A nonblocking barrier arrival must complete before the same warp uses that
+barrier again. Use a separate barrier for tile completion when consumers can
+outrun producers after a subtile arrival. Synccheck alone can miss this hang;
+`test_canonical_jax_glu_hadamard_quant_delayed_act` delays ACT warps to expose it.
+
 **Do not factor code out of a `@cute.kernel` body into a plain Python helper.**
 The DSL AST-transforms only the decorated function's own source: `for` becomes
 an `ir_loop`, `if` becomes an `scf` region. A helper called from the kernel is
