@@ -24,6 +24,37 @@ CASES = {
 }
 
 
+def _cpu_oracle(q, k, v, scale, mask, sinks):
+    """Independent FP64 reference using bounded ordinary CPU matrix products."""
+    import numpy as np
+    import torch
+
+    q, k, v = (tensor.double().numpy() for tensor in (q, k, v))
+    mask = None if mask is None else mask.numpy()
+    sinks = None if sinks is None else sinks.double().numpy()
+    batch, heads, sq, dim = q.shape
+    group = heads // k.shape[1]
+    out = np.empty_like(q)
+    lse = np.empty((batch, heads, sq), dtype=np.float64)
+    for b in range(batch):
+        for kv_head in range(k.shape[1]):
+            for first in range(kv_head * group, (kv_head + 1) * group, 8):
+                last = min(first + 8, (kv_head + 1) * group)
+                scores = (q[b, first:last].reshape(-1, dim) @ k[b, kv_head].T) * scale
+                if mask is not None:
+                    scores = np.where(np.broadcast_to(mask, (last - first, *mask.shape)).reshape(scores.shape), -np.inf, scores)
+                full = scores if sinks is None else np.concatenate((scores, np.repeat(sinks[first:last], sq)[:, None]), axis=1)
+                maximum = full.max(axis=1, keepdims=True)
+                safe_maximum = np.where(np.isfinite(maximum), maximum, 0)
+                weights = np.exp(full - safe_maximum)
+                denominator = weights.sum(axis=1, keepdims=True)
+                probabilities = np.divide(weights, denominator, out=np.zeros_like(weights), where=denominator != 0)
+                out[b, first:last] = (probabilities[:, : k.shape[2]] @ v[b, kv_head]).reshape(last - first, sq, dim)
+                with np.errstate(divide="ignore"):
+                    lse[b, first:last] = (safe_maximum + np.log(denominator)).reshape(last - first, sq)
+    return torch.from_numpy(out), torch.from_numpy(lse)
+
+
 @pytest.mark.parametrize("graph_api", [False, True], ids=["standalone", "graph"])
 @pytest.mark.parametrize("case", [pytest.param(name, marks=pytest.mark.L0 if name == "g128_split" else pytest.mark.L1) for name in CASES])
 def test_d512_packed_split_rebind_replay(case, graph_api, cudnn_handle):
@@ -31,7 +62,7 @@ def test_d512_packed_split_rebind_replay(case, graph_api, cudnn_handle):
     import torch
     from cuda.bindings import driver as cuda
     from cudnn.engines.manifest import family_for
-    from test_sdpa_fwd_dsl_sm107 import _dense_mask, _half_oracle, _half_prefold_api, _rubin_only
+    from test_sdpa_fwd_dsl_sm107 import _dense_mask, _half_prefold_api, _rubin_only
 
     _rubin_only()
     group, sq, sk, splits, packed, causal, window, sink, stats, dtype_name = CASES[case]
@@ -114,22 +145,12 @@ def test_d512_packed_split_rebind_replay(case, graph_api, cudnn_handle):
             cpu = {name: tensor.cpu() for name, tensor in values.items()}
             mask = _dense_mask(sq, sk, causal=causal, bottom_right=causal, window_left=window)
             mask = None if mask is None else mask.cpu()
-            for kv_head in range(2):
-                for first in range(kv_head * group, (kv_head + 1) * group, 8):
-                    heads = slice(first, min(first + 8, (kv_head + 1) * group))
-                    expected_o, expected_lse = _half_oracle(
-                        cpu["q"][:, heads],
-                        cpu["k"][:, kv_head : kv_head + 1],
-                        cpu["v"][:, kv_head : kv_head + 1],
-                        logit_scale=buffers["attn_scale"],
-                        masked=mask,
-                        sinks=cpu["sinks"][heads] if sink else None,
-                    )
-                    torch.testing.assert_close(cpu["out"][:, heads].double(), expected_o, atol=4e-3, rtol=4e-3)
-                    if stats != "none":
-                        if stats == "log2":
-                            expected_lse = expected_lse / math.log(2)
-                        torch.testing.assert_close(cpu["lse"].reshape(2, 2 * group, sq)[:, heads].double(), expected_lse, atol=6e-4, rtol=0)
+            expected_o, expected_lse = _cpu_oracle(cpu["q"], cpu["k"], cpu["v"], buffers["attn_scale"], mask, cpu.get("sinks"))
+            torch.testing.assert_close(cpu["out"].double(), expected_o, atol=4e-3, rtol=4e-3)
+            if stats != "none":
+                if stats == "log2":
+                    expected_lse = expected_lse / math.log(2)
+                torch.testing.assert_close(cpu["lse"].reshape_as(expected_lse).double(), expected_lse, atol=6e-4, rtol=0)
 
         for ordinal in range(2):
             values = {
