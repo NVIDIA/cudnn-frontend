@@ -505,6 +505,39 @@ def test_canonical_jax_glu_hadamard_quant_parity(d_quant, rht, shared_wrapper):
     assert_outputs(compiled(**inputs), reference)
 
 
+def test_canonical_jax_glu_hadamard_quant_delayed_act(monkeypatch):
+    skip_unless_sm100()
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass._mlir.dialects import nvvm
+    from cutlass.cutlass_dsl import dsl_user_op
+    from cudnn.tensor_adapter import get_compute_capability
+    from cudnn.gemm.cutedsl.grouped.glu_hadamard_quant import api, jax_api
+    from cudnn.gemm.cutedsl.grouped.glu_hadamard_quant import moe_blockscaled_grouped_gemm_glu_hadamard_quant as kernel_module
+
+    if get_compute_capability() != (10, 0):
+        pytest.skip("Exercises the SM100 epilogue barriers")
+    original_sync = kernel_module._partial_cta_sync
+
+    @dsl_user_op
+    def pause(*, loc=None, ip=None):
+        nvvm.nanosleep(cutlass.Int32(100_000).ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
+
+    @cute.jit
+    def delayed_sync(barrier: cutlass.Constexpr):
+        if cutlass.const_expr(barrier.barrier_id == 2):
+            if cute.arch.warp_idx() < 4:
+                for _ in cutlass.range(16):
+                    pause()
+        original_sync(barrier)
+
+    # Let RHT reach tile completion before ACT finishes its subtile barrier.
+    monkeypatch.setattr(kernel_module, "_partial_cta_sync", delayed_sync)
+    monkeypatch.setattr(api, "_cache_of_GroupedGemmGluHadamardQuantSm100Objects", {})
+    monkeypatch.setattr(jax_api, "kernel_cache", {})
+    test_canonical_jax_glu_hadamard_quant_parity(False, "colwise", False)
+
+
 @pytest.mark.parametrize("data_format,fp8_output", [("mxfp8", True), ("mxfp8", False), ("nvfp4", False), ("mxfp4", False)])
 @pytest.mark.parametrize("shared_wrapper", [False, True], ids=["jax_entry", "wrapper"])
 def test_canonical_jax_srelu_parity(data_format, fp8_output, shared_wrapper):
