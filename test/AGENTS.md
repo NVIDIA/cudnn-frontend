@@ -874,6 +874,14 @@ intercepting its entry. Hard-coding THD fails once dense prefill becomes native.
 Keep the existing KV-tail and fixed-shape rejection diagnostics, as exercised
 by `test_sdpa_prepared_thd.py`, when changing the binder implementation.
 
+Physical THD offsets are element addresses for each port. A fused K/V slab or
+wide O token stride requires matching offset values, with an independent Int64
+O offset when it exceeds Int32. Keep these fixtures consistent in
+`test_sdpa_prepared_thd.py` and `test_mhas_v2.py`. Compare graph execution with an
+independently prepared standalone API; clearing a graph's private prepared plan
+does not reproduce the standalone compact-prefix contract. Retain poisoned
+outputs and replay after rebinding for both public entry points.
+
 ### Native host ABI differences across architectures
 
 Do not infer a dense host signature from another architecture. SM107 D256 has

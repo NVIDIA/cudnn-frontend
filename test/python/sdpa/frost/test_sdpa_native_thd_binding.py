@@ -75,8 +75,10 @@ def test_physical_origin_binding_reobserves_all_five_ports():
     spec, facts, roles = _physical_origin_fixture()
     indices = tuple(range(len(roles)))
     first = spec.native.bind(prep._native_pack_from_facts(facts, roles), indices, 0x90000, 17)
+    assert list(first) == binding_reference._bind_thd_python(spec, facts, 0x90000, 17, 17)
     changed = {name: fact._replace(ptr=fact.ptr + 0x100000) for name, fact in facts.items()}
     second = spec.native.bind(prep._native_pack_from_facts(changed, roles), indices, 0xA0000, 23)
+    assert list(second) == binding_reference._bind_thd_python(spec, changed, 0xA0000, 23, 23)
     slot = spec.index["thd_origin_ptrs"]
     assert first[slot] == tuple(facts[name].ptr for name in roles[-5:])
     assert second[slot] == tuple(changed[name].ptr for name in roles[-5:])
