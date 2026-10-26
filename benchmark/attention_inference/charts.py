@@ -15,7 +15,7 @@ counts under each tick), separated by light vertical rules.
 
 Every expanded case owns an x slot whether or not it ran: an unsupported
 (model, shape, backend) combination is a blank slot, not a dropped tick, so
-coverage gaps are visible at a glance. Series are cudnn and cudnn_oss only
+coverage gaps are visible at a glance. Series are cudnn, cudnn_oss and cudnn_auto only
 (hatched = fp8 KV cache).
 """
 
@@ -23,12 +23,13 @@ import re
 from pathlib import Path
 from typing import List
 
-BACKEND_ORDER = ["cudnn", "cudnn_oss"]
+BACKEND_ORDER = ["cudnn", "cudnn_oss", "cudnn_auto"]
 # Two-hue categorical palette, fixed order, CVD-validated (ΔE 30.3 worst
 # adjacent pair); fp8-kv variants reuse the base hue with a hatch texture.
 BACKEND_COLORS = {
     "cudnn": "#76B900",
     "cudnn_oss": "#5B8DEF",
+    "cudnn_auto": "#E69F00",  # the frontend's default pick
 }
 
 CLUSTER_GAP = 0.7  # x-units of air between shape clusters

@@ -74,7 +74,7 @@ class PageSizeTest(unittest.TestCase):
         self.assertEqual(result.page_size, 64)
 
     def test_qwen35_counts_distinct_executed_page_sizes(self):
-        self.assertEqual(len(list(self.runner.expand_config(QWEN35))), 184)
+        self.assertEqual(len(list(self.runner.expand_config(QWEN35))), 276)  # 92 cases x cudnn / cudnn_oss / cudnn_auto
         for backend, count, pages in (("flashinfer", 192, {16, 32, 64}), ("b12x", 64, {64})):
             with self.subTest(backend=backend):
                 config = replace(QWEN35, backends=[backend], context_seqlens=[], context_chunked_shapes=[])

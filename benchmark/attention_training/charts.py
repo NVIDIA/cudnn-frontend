@@ -24,6 +24,8 @@ BACKEND_CONFIG = {
     # cuDNN Frontend FROST engines: open-source CuTe-DSL kernels, pinned via
     # cudnn.frost so no native cuDNN kernel serves the measured graph.
     "cudnn_oss": {"name": "cuDNN OSS (FROST)", "color": "#2E8B57", "color_fp8": "#1F5F3B", "color_mxfp8": "#143D26", "order": 1},
+    # cuDNN Frontend default dispatch: the plan the heuristics pick (backend or FROST) with nothing pinned.
+    "cudnn_auto": {"name": "cuDNN default (heuristics)", "color": "#E69F00", "color_fp8": "#B07A00", "color_mxfp8": "#7A5500", "order": 1.5},
     "pyt_cudnn": {"name": "cuDNN (PyTorch)", "color": "#90EE90", "color_fp8": "#228B22", "color_mxfp8": "#006400", "order": 2},
     "pyt_flash_attention": {"name": "FAv2 (PyTorch)", "color": "#6495ED", "color_fp8": "#0000CD", "color_mxfp8": "#00008B", "order": 3},
     "pyt_efficient_attention": {"name": "xFormers (PyTorch)", "color": "#FF00FF", "color_fp8": "#8B008B", "color_mxfp8": "#4B0082", "order": 4},
@@ -95,7 +97,7 @@ def get_backend_display_name(backend: str, data_type: str, cudnn_backend_version
         v = _format_cudnn_backend_version(cudnn_backend_version)
         if v:
             base_name = f"{base_name} {v}"
-    elif backend == "cudnn_oss" and cudnn_frontend_version:
+    elif backend in ("cudnn_oss", "cudnn_auto") and cudnn_frontend_version:
         base_name = f"{base_name} {cudnn_frontend_version}"
     if data_type == "fp8":
         return f"{base_name} (FP8)"

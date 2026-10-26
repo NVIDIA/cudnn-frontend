@@ -349,6 +349,7 @@ def parse_args():
             "flash_attention_4",
             "cudnn",
             "cudnn_oss",
+            "cudnn_auto",
         ],
     )
     parser.add_argument("--format_output", action="store_true", help="Format output to be used in benchmark")
@@ -575,9 +576,13 @@ else:
     # numbers always come from the native cuDNN backend, even if the caller's
     # environment has FROST enabled globally. The env var is read live by the
     # engine manifest, so setting it here (before any graph is built) suffices.
-    is_cudnn_fe = args.sdpa_backend in ("cudnn", "cudnn_oss")
+    # `cudnn_auto` measures the frontend's default dispatch: opt-in unset, nothing deselected or pinned, so the plan
+    # the heuristics rank first for a user is what runs.
+    is_cudnn_fe = args.sdpa_backend in ("cudnn", "cudnn_oss", "cudnn_auto")
     if args.sdpa_backend == "cudnn_oss":
         os.environ["CUDNN_FRONTEND_ENABLE_FROST_ENGINES"] = "1"
+    elif args.sdpa_backend == "cudnn_auto":
+        os.environ.pop("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", None)
     elif is_cudnn_fe:
         os.environ["CUDNN_FRONTEND_ENABLE_FROST_ENGINES"] = "0"
 
@@ -657,7 +662,7 @@ else:
     enable_gqa = num_q_heads != num_kv_heads
     if args.data_type == "mxfp8":
         if not is_cudnn_fe:
-            raise ValueError("mxfp8 is only supported with the 'cudnn'/'cudnn_oss' backends")
+            raise ValueError("mxfp8 is only supported with the 'cudnn'/'cudnn_oss'/'cudnn_auto' backends")
         if not HAS_CUTLASS:
             raise RuntimeError("CUTLASS is required for mxfp8 but is not installed")
     # if args.sdpa_backend in ["flash_attention", "flash_attention_3", "pyt_flash_attention"]:
@@ -1542,14 +1547,14 @@ else:
             return flash_attention_3_sdpa
         elif backend == "flash_attention_4":
             return flash_attention_4_sdpa
-        elif backend in ("cudnn", "cudnn_oss"):
+        elif backend in ("cudnn", "cudnn_oss", "cudnn_auto"):
             return None  # Will be set up separately
         else:
             raise ValueError(f"Invalid backend: {backend}")
 
     # Util function for addressing different qkv formats for each backend
     def preprocess_qkv(query, key, value, backend):
-        if backend.startswith("pyt_") or backend in ("cudnn", "cudnn_oss"):
+        if backend.startswith("pyt_") or backend in ("cudnn", "cudnn_oss", "cudnn_auto"):
             return query, key, value
         elif backend.startswith("flash_attention"):
             query = torch.swapaxes(query, 1, 2)
@@ -1561,7 +1566,7 @@ else:
 
     # Util function addressing different qkvo formats for each backend
     def postprocess_qkvo(query, key, value, output, backend):
-        if backend.startswith("pyt_") or backend in ("cudnn", "cudnn_oss"):
+        if backend.startswith("pyt_") or backend in ("cudnn", "cudnn_oss", "cudnn_auto"):
             return query, key, value, output
         elif backend.startswith("flash_attention"):
             output = torch.swapaxes(output, 1, 2)
@@ -1573,7 +1578,7 @@ else:
             raise ValueError(f"Invalid backend: {backend}")
 
     def postprocess_dqdkdvdo(dQuery, dKey, dValue, dOutput, backend):
-        if backend.startswith("pyt_") or backend in ("cudnn", "cudnn_oss"):
+        if backend.startswith("pyt_") or backend in ("cudnn", "cudnn_oss", "cudnn_auto"):
             return dQuery, dKey, dValue, dOutput
         elif backend.startswith("flash_attention"):
             dQuery = torch.swapaxes(dQuery, 1, 2)

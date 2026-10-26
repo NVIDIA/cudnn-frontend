@@ -36,5 +36,5 @@ CONFIG = InferenceBenchmarkConfig(
     generation_batch_sizes=[1, 128],
     kv_cache_dtypes=["bfloat16", "fp8_e4m3"],
     page_size=16,
-    backends=["cudnn", "cudnn_oss"],
+    backends=["cudnn", "cudnn_oss", "cudnn_auto"],
 )

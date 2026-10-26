@@ -149,7 +149,7 @@ class BenchmarkRunner:
                 # inputs outright, so emitting those cases just produces
                 # tracebacks in the CSV.
                 if data_type in ("fp8", "mxfp8"):
-                    if backend not in ("cudnn", "cudnn_oss"):
+                    if backend not in ("cudnn", "cudnn_oss", "cudnn_auto"):
                         continue
                 # Block-scaled O modes (fp8 or mxfp8 inputs, FP4 / MXFP8 O + sf_o): a
                 # forward-only inference epilogue of the FROST OSS fp8 / mxfp8 kernels.

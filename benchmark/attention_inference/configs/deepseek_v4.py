@@ -59,5 +59,5 @@ CONFIG = InferenceBenchmarkConfig(
     generation_batch_sizes=[1, 128],
     # fp8 shared-KV record: the serving config for the d=512 dense core.
     kv_cache_dtypes=["bfloat16", "fp8_e4m3"],
-    backends=["cudnn", "cudnn_oss"],
+    backends=["cudnn", "cudnn_oss", "cudnn_auto"],
 )

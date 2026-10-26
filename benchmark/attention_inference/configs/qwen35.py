@@ -42,5 +42,5 @@ CONFIG = InferenceBenchmarkConfig(
     # (the TP 4 deployment) and 64; the cudnn graph paths are dense and run each
     # case once at page_size.
     page_sizes=[16, 32, 64],
-    backends=["cudnn", "cudnn_oss"],
+    backends=["cudnn", "cudnn_oss", "cudnn_auto"],
 )
