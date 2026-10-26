@@ -46,6 +46,7 @@ class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
     _BATCH_CHUNKING = True
     _BATCH_PADDED_BSHD = True
     _THD_SUPPORTED = False
+    _THD_ORIGINS_SUPPORTED = True
     _IO_DTYPES = SdpaBwdDslSm107._IO_DTYPES
 
     # The half row serves per-batch kv lengths on its standalone surface (its body reads ``seq_kv_lens[b]`` under the

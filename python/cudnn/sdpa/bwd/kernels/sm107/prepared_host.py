@@ -57,10 +57,12 @@ from cudnn.sdpa.bwd.kernels.bprop_chain_common import (
     dkv_reduce_bounded_host,
     dkv_reduce_host,
     dot_do_o_host,
+    dot_do_o_thd_origins_host,
     dot_do_o_scaled_host,
     fold_quant_host,
     fold_quant_pair_host,
 )
+from cudnn.sdpa.bwd.kernels.bprop_thd_reduce import dkv_reduce_thd_origins_host
 from cudnn.sdpa.bwd.kernels.sm120.prepared_host import _scratch, _view
 from cudnn.sdpa.bwd.kernels import thd_helpers as _thd_helpers
 from cudnn.sdpa.bwd.kernels.thd_helpers import thd_bwd_setup_host
@@ -75,6 +77,7 @@ _THD_KV_BLOCK = 256
 # Half row: 0..12; fp8 row: 0..8 then its own 9..14.  Names match ``api_dsl_sm107._scratch_plan``.
 R_DELTA, R_DS, R_SEQ_KV, R_DESC, R_Q_PAD, R_DO_PAD, R_LSE_PAD, R_K_PAD, R_V_PAD = range(9)
 R_DV_PART, R_DK_PART, R_DK_FOLD, R_DV_FOLD = 9, 10, 11, 12  # half row
+R_F16_THD_ORIGINS = 13
 R_FP8_DV_PART, R_FP8_DK_PART, R_DQ_WS, R_Q_BF16, R_K_BF16, R_AMAX_SCRATCH = 9, 10, 11, 12, 13, 14  # fp8 row
 # MXFP8 row (both dS chains): 0..8 shared, then the dO_T staging copy, the five zero-filled SF pad slabs (Q side: rows / groups past
 # S_q_real; kv side: rows past S_kv_real up to the kernel's 256-row pad), the two dequantized bf16 stage-3 operands (the bf16-dS
@@ -502,6 +505,8 @@ def _matmul(
     sf: cutlass.Constexpr = None,
     grid_m: cutlass.Constexpr = None,
     sf_meta: cutlass.Constexpr = None,
+    thd_origins=None,
+    thd_origin_rows: cutlass.Constexpr = (-1, -1),
 ):
     """One ``(batch, head)``-batched stage-3 GEMM: ``a`` / ``b`` / ``output`` already in the template's ``(M|N, K, H, B)`` / ``(M, N, H, B)``
     order.  The problem tuple is the retired ``matmul_bh``'s, widened to Int64 before the descriptor's byte products; the grid's M
@@ -519,7 +524,9 @@ def _matmul(
         cutlass.Int64(x)
         for x in (m_grid, b.shape[0], a.shape[1], heads, batches, *a.stride, *b.stride, *output.stride, b.shape[1], a.shape[0], output.shape[0])
     )
-    if cutlass.const_expr(sf is not None and sf_meta is not None):
+    if cutlass.const_expr(thd_origins is not None):
+        entry(problem, a, b, output, meta, desc, stream, thd_origins=thd_origins, thd_origin_rows=thd_origin_rows)
+    elif cutlass.const_expr(sf is not None and sf_meta is not None):
         entry(problem, a, b, output, meta, desc, stream, None, None, None, None, sf[0], sf[1], sf_meta)
     elif cutlass.const_expr(sf is not None):
         entry(problem, a, b, output, meta, desc, stream, None, None, None, None, sf[0], sf[1])
@@ -818,6 +825,8 @@ def _stage3_thd(
     dq_b_head_group: cutlass.Constexpr = 1,
     dk_epi: cutlass.Constexpr = None,
     dq_epi: cutlass.Constexpr = None,
+    thd_origins=None,
+    thd_origin_rows: cutlass.Constexpr = (-1,) * 9,
 ):
     """The THD twin of :func:`_stage3`: dK = dS . Q and dQ = dS^T . K over the kv-BLOCKED workspace ``ds`` (``[1, hc, R_kv_cap,
     S_q_pad]``, the chunk's view), the PACKED ``q`` / ``k`` (``[1, T, H, D]``) and the packed ``dk_out`` (``[1, T_kv, H_q, D]``, the
@@ -837,7 +846,19 @@ def _stage3_thd(
     dk_c = _window(dk_out, 2, hb, hc)  # [1, T_kv, hc, D]
     # dK = dS . Q: A = dS[kv rows, q cols] (M, K, H, 1) K-major; B = Q (D, T_q, H, 1) packed; out (T_kv, D, H, 1) packed.
     _matmul(
-        mm_dk, _permuted(ds, (2, 3, 1, 0)), _permuted(q_c, (3, 1, 2, 0)), _permuted(dk_c, (1, 3, 2, 0)), hc, n_seq, meta, desc, stream, dk_epi, grid_m=grid_m_kv
+        mm_dk,
+        _permuted(ds, (2, 3, 1, 0)),
+        _permuted(q_c, (3, 1, 2, 0)),
+        _permuted(dk_c, (1, 3, 2, 0)),
+        hc,
+        n_seq,
+        meta,
+        desc,
+        stream,
+        dk_epi,
+        grid_m=grid_m_kv,
+        thd_origins=thd_origins,
+        thd_origin_rows=(thd_origin_rows[0], -1 if group > 1 else thd_origin_rows[6]),
     )
     kv_n = hc // group
     n_launch = _dq_launches(group, dq_b_head_group)
@@ -859,6 +880,8 @@ def _stage3_thd(
             stream,
             dq_epi,
             grid_m=grid_m_q,
+            thd_origins=thd_origins,
+            thd_origin_rows=(thd_origin_rows[1], thd_origin_rows[5]),
         )
 
 
@@ -1183,7 +1206,7 @@ def host_f16(
 
 
 @cute.jit
-def host_f16_thd(
+def _host_f16_thd_chain(
     q_ptr: cute.Pointer,
     k_ptr: cute.Pointer,
     v_ptr: cute.Pointer,
@@ -1207,6 +1230,8 @@ def host_f16_thd(
     regions: cutlass.Constexpr,
     dtype: cutlass.Constexpr,
     stream: driver.CUstream,
+    origin_ptrs=None,
+    origin_specs: cutlass.Constexpr = None,
 ):
     """The half row's THD / varlen chain (``SdpaBwdDslSm107(thd=True)``): PACKED ``[1, T, H, D]`` operands at the plan's token
     capacities, a kv-BLOCKED dS workspace, the per-sequence lengths from the caller's two length tensors, and -- APPENDED, optional,
@@ -1252,7 +1277,29 @@ def host_f16_thd(
     meta = _scratch(workspace, regions[R_SEQ_KV], cutlass.Int32)  # the metadata words + the main kernel's tensor maps
     desc3 = _scratch(workspace, regions[R_DESC], cutlass.Int64)  # stage 3's (B + 1) descriptors, patched per GEMM launch
     ds_full = _scratch(workspace, regions[R_DS], dtype)  # [1, hc, R_kv_cap, S_q_pad]
-    thd_bwd_setup_host(meta, q_lens, kv_lens, lens_form, hc, b, _THD_KV_BLOCK, _THD_KV_BLOCK, units, stream, kv_blocked=True)
+    origins = _scratch(workspace, regions[R_F16_THD_ORIGINS], cutlass.Int64) if cutlass.const_expr(origin_specs is not None) else None
+    offsets = (
+        tuple(_view(ptr, ((b + 1,), (1,))) if cutlass.const_expr(ptr is not None) else None for ptr in origin_ptrs)
+        if cutlass.const_expr(origin_specs is not None)
+        else None
+    )
+    origin_rows = tuple(spec[0] if spec is not None else -1 for spec in origin_specs) if cutlass.const_expr(origin_specs is not None) else (-1,) * 9
+    thd_bwd_setup_host(
+        meta,
+        q_lens,
+        kv_lens,
+        lens_form,
+        hc,
+        b,
+        _THD_KV_BLOCK,
+        _THD_KV_BLOCK,
+        units,
+        stream,
+        kv_blocked=True,
+        org_t=origins,
+        origin_offsets=offsets,
+        origin_specs=origin_specs,
+    )
     if cutlass.const_expr(zero_ws):
         n16 = hc * rcap * sqp * itemsize // 16
         _zero_bytes(ds_full, n16).launch(grid=(min((n16 + _THREADS - 1) // _THREADS, 4096), 1, 1), block=(_THREADS, 1, 1), stream=stream)
@@ -1265,22 +1312,188 @@ def host_f16_thd(
     # STAGE 1: one streaming pass over the packed O and dO -- unless the caller computed delta (external_delta: a producer that
     # already reads O and dO writes rowsum(dO * O) in this kernel's order over the packed tokens, so the launch and the read go).
     if cutlass.const_expr(not external_delta):
-        dot_do_o_host(o, do, delta, None, None, DOT_Q_TILE, d, d, DOT_CHUNK_ELEMS, False, False, stream)
+        if cutlass.const_expr(origins is not None):
+            dot_do_o_thd_origins_host(o, do, delta, meta, origins, b, sq_env, (origin_rows[3], origin_rows[4]), d, stream)
+        else:
+            dot_do_o_host(o, do, delta, None, None, DOT_Q_TILE, d, d, DOT_CHUNK_ELEMS, False, False, stream)
 
     grid_m_kv = -(-skv_env // _THD_KV_BLOCK) * _THD_KV_BLOCK  # the kv envelope's M tiles (dK); dQ's is the padded q envelope (sqp)
     for ci in range(h // hc):
         hb = ci * hc
         # STAGE 2: packed operands, the kv-blocked workspace, this launch's heads; batch_base 0 (one packed batch).
-        main(q, do, k, v, dv_k, ds_full, stats, delta, meta, (b, h, hk, sqp, rcap, hc, 1, sq_env, skv_env, units), scale, hb, 0, stream)
+        if cutlass.const_expr(origins is not None):
+            main(
+                q,
+                do,
+                k,
+                v,
+                dv_k,
+                ds_full,
+                stats,
+                delta,
+                meta,
+                (b, h, hk, sqp, rcap, hc, 1, sq_env, skv_env, units),
+                scale,
+                hb,
+                0,
+                stream,
+                thd_origins=origins,
+                thd_origin_rows=origin_rows[:7] + ((-1 if group > 1 else origin_rows[7]),) + origin_rows[8:],
+            )
+        else:
+            main(q, do, k, v, dv_k, ds_full, stats, delta, meta, (b, h, hk, sqp, rcap, hc, 1, sq_env, skv_env, units), scale, hb, 0, stream)
         # STAGE 3: the THD arm over the chunk's workspace; the outputs' head slice, every sequence through its own descriptor.
-        _stage3_thd(mm_dk, mm_dq, ds, q, k, dk_tgt, dq, hb, hc, group, b, meta, desc3, stream, grid_m_kv, sqp, dq_b_head_group=dq_bhg)
+        _stage3_thd(
+            mm_dk,
+            mm_dq,
+            ds,
+            q,
+            k,
+            dk_tgt,
+            dq,
+            hb,
+            hc,
+            group,
+            b,
+            meta,
+            desc3,
+            stream,
+            grid_m_kv,
+            sqp,
+            dq_b_head_group=dq_bhg,
+            thd_origins=origins,
+            thd_origin_rows=origin_rows,
+        )
 
     # STAGE 4: fold the per-Q-head partials onto the KV heads over the packed kv axis (fixed order), rows [0, cu_k[B]) ONLY.
     # The partials past the live total were never written (the kernel's dV and the dK GEMM store through per-sequence clipped
     # descriptors), so an unbounded fold would copy the 0xFF-poisoned workspace (NaN) into the caller's dK / dV capacity tail;
     # the limit is the metadata's cu_k[B] word read on device, so a rebind with new lengths needs no host work.
     if cutlass.const_expr(group > 1):
-        dkv_reduce_bounded_host(dk_tgt, dv_k, dk, dv, d, d, group, dtype, False, _window(meta, 0, THD_CU_K_TOTAL_OFF(b), 1), stream)
+        if cutlass.const_expr(origins is not None):
+            dkv_reduce_thd_origins_host(dk_tgt, dv_k, dk, dv, meta, origins, b, skv_env, origin_rows[6], origin_rows[7], d, group, dtype, stream)
+        else:
+            dkv_reduce_bounded_host(dk_tgt, dv_k, dk, dv, d, d, group, dtype, False, _window(meta, 0, THD_CU_K_TOTAL_OFF(b), 1), stream)
+
+
+@cute.jit
+def host_f16_thd(
+    q_ptr: cute.Pointer,
+    k_ptr: cute.Pointer,
+    v_ptr: cute.Pointer,
+    o_ptr: cute.Pointer,
+    do_ptr: cute.Pointer,
+    stats_ptr: cute.Pointer,
+    dq_ptr: cute.Pointer,
+    dk_ptr: cute.Pointer,
+    dv_ptr: cute.Pointer,
+    seq_q_ptr: cute.Pointer,
+    seq_kv_ptr: cute.Pointer,
+    delta_ptr: Optional[cute.Pointer],
+    workspace: cute.Pointer,
+    scale: cutlass.Float32,
+    lens_form: cutlass.Int32,
+    main: cutlass.Constexpr,
+    mm_dk: cutlass.Constexpr,
+    mm_dq: cutlass.Constexpr,
+    config: cutlass.Constexpr,
+    geometry: cutlass.Constexpr,
+    regions: cutlass.Constexpr,
+    dtype: cutlass.Constexpr,
+    stream: driver.CUstream,
+):
+    """Compact THD exported frame; physical origins use the sibling entry."""
+    _host_f16_thd_chain(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        o_ptr,
+        do_ptr,
+        stats_ptr,
+        dq_ptr,
+        dk_ptr,
+        dv_ptr,
+        seq_q_ptr,
+        seq_kv_ptr,
+        delta_ptr,
+        workspace,
+        scale,
+        lens_form,
+        main,
+        mm_dk,
+        mm_dq,
+        config,
+        geometry,
+        regions,
+        dtype,
+        stream,
+    )
+
+
+@cute.jit
+def host_f16_thd_origins(
+    q_ptr: cute.Pointer,
+    k_ptr: cute.Pointer,
+    v_ptr: cute.Pointer,
+    o_ptr: cute.Pointer,
+    do_ptr: cute.Pointer,
+    stats_ptr: cute.Pointer,
+    dq_ptr: cute.Pointer,
+    dk_ptr: cute.Pointer,
+    dv_ptr: cute.Pointer,
+    seq_q_ptr: cute.Pointer,
+    seq_kv_ptr: cute.Pointer,
+    delta_ptr: Optional[cute.Pointer],
+    ro_q_ptr: Optional[cute.Pointer],
+    ro_k_ptr: Optional[cute.Pointer],
+    ro_v_ptr: Optional[cute.Pointer],
+    ro_o_ptr: Optional[cute.Pointer],
+    ro_do_ptr: Optional[cute.Pointer],
+    ro_dq_ptr: Optional[cute.Pointer],
+    ro_dk_ptr: Optional[cute.Pointer],
+    ro_dv_ptr: Optional[cute.Pointer],
+    ro_stats_ptr: Optional[cute.Pointer],
+    workspace: cute.Pointer,
+    scale: cutlass.Float32,
+    lens_form: cutlass.Int32,
+    main: cutlass.Constexpr,
+    mm_dk: cutlass.Constexpr,
+    mm_dq: cutlass.Constexpr,
+    config: cutlass.Constexpr,
+    geometry: cutlass.Constexpr,
+    regions: cutlass.Constexpr,
+    dtype: cutlass.Constexpr,
+    origin_specs: cutlass.Constexpr,
+    stream: driver.CUstream,
+):
+    """THD frame with nine independent runtime ragged-offset ports."""
+    _host_f16_thd_chain(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        o_ptr,
+        do_ptr,
+        stats_ptr,
+        dq_ptr,
+        dk_ptr,
+        dv_ptr,
+        seq_q_ptr,
+        seq_kv_ptr,
+        delta_ptr,
+        workspace,
+        scale,
+        lens_form,
+        main,
+        mm_dk,
+        mm_dq,
+        config,
+        geometry,
+        regions,
+        dtype,
+        stream,
+        (ro_q_ptr, ro_k_ptr, ro_v_ptr, ro_o_ptr, ro_do_ptr, ro_dq_ptr, ro_dk_ptr, ro_dv_ptr, ro_stats_ptr),
+        origin_specs,
+    )
 
 
 # --- the per-tensor FP8 row ---------------------------------------------------------------------------------------------
@@ -2368,18 +2581,40 @@ def compile_host_f16(
     )
 
 
-def compile_host_f16_thd(main, mm_dk, mm_dq, config, geometry, regions, dtype, sm, cache_key, external_delta=False):
+def compile_host_f16_thd(
+    main,
+    mm_dk,
+    mm_dq,
+    config,
+    geometry,
+    regions,
+    dtype,
+    sm,
+    cache_key,
+    external_delta=False,
+    symbol="frost_sdpa_bwd_sm107_thd_prepared",
+    origin_specs=None,
+    origin_dtypes=None,
+):
     """The half row's THD artifact (:func:`host_f16_thd`): the nine packed tensor operands, the two ``[B]`` / ``[B+1]`` int32
     length operands, the appended delta slot (``external_delta``, default False: the caller's PACKED ``[1, H, ceil128(T_q)]`` fp32
     delta, 16-B aligned; None-specialized otherwise -- the slot stays in the positional ABI either way, as on the dense entry), the
     workspace, the scale and the host-derived ``lens_form``.  Its own entry and cache key (the caller folds the THD config and the
     delta fact into ``cache_key``): the dense ``host_f16`` artifact's ABI and key are untouched."""
-    _check_target(sm)
+    # Both half bodies use this chain: the SM100 2x2 body and the Rubin 4x1 body.
+    # Quantized chains retain their separate Rubin-only target check.
+    _check_target(sm, lo=100)
     args = [_ptr(dtype) for _ in range(5)] + [_ptr(cutlass.Float32, 4)] + [_ptr(dtype) for _ in range(3)]
     args += [_ptr(cutlass.Int32, 4), _ptr(cutlass.Int32, 4)]
     args += [_ptr(cutlass.Float32, 16) if external_delta else None]
+    entry = host_f16_thd
+    tail = []
+    if origin_specs is not None:
+        entry = host_f16_thd_origins
+        args += [None if name is None else _ptr(cutlass.Int64 if name == "int64" else cutlass.Int32, 8 if name == "int64" else 4) for name in origin_dtypes]
+        tail = [origin_specs]
     return compile_cached(
-        host_f16_thd,
+        entry,
         *args,
         _ptr(cutlass.Uint8),
         cutlass.Float32(1),
@@ -2391,10 +2626,11 @@ def compile_host_f16_thd(main, mm_dk, mm_dq, config, geometry, regions, dtype, s
         geometry,
         regions,
         dtype,
+        *tail,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options=f"--enable-tvm-ffi --gpu-arch sm_{sm}a",
         cache_key=cache_key,
-        symbol="frost_sdpa_bwd_sm107_thd_prepared",
+        symbol=symbol,
     )
 
 
