@@ -264,12 +264,12 @@ def test_compact_thd_origins_use_single_load_maps(dim):
             total += length
         return rows
 
-    def fill(ql, kl, k_shift=0, arbitrary=()):
-        """Bind compact prefixes; shift K/V by ``k_shift`` rows after the first sequence; overwrite the offsets of
-        ``arbitrary`` (port, b) pairs with a row the compact rule would reject."""
+    def fill(ql, kl, k_shift=0, q_shift=0, arbitrary=()):
+        """Bind compact prefixes; shift K/V by ``k_shift`` rows and Q alone by ``q_shift`` rows after the first
+        sequence; overwrite the offsets of ``arbitrary`` (port, b) pairs with a row the compact rule would reject."""
         origins = {name: prefix(ql if name in ("q", "o", "stats") else kl) for name in ports}
-        for name in ("k", "v"):
-            origins[name] = [row + (k_shift if b else 0) for b, row in enumerate(origins[name])]
+        for name, shift in (("k", k_shift), ("v", k_shift), ("q", q_shift)):
+            origins[name] = [row + (shift if b else 0) for b, row in enumerate(origins[name])]
         values["ql"].copy_(torch.tensor(ql, dtype=torch.int32, device="cuda").view(batch, 1, 1, 1))
         values["kl"].copy_(torch.tensor(kl, dtype=torch.int32, device="cuda").view(batch, 1, 1, 1))
         for name, multiplier in zip(ports, multipliers):
@@ -375,16 +375,18 @@ def test_compact_thd_origins_use_single_load_maps(dim):
     run(fill(*lengths, arbitrary=[(name, 1) for name in ports]), 1)
     # A keyless sequence does not vote with its K/V offsets.
     run(fill(*keyless, arbitrary=[("k", 3), ("v", 3)]), 1)
-    # A gap after the first K/V sequence: sequence-local maps.
+    # A gap after the first K/V sequence, or after the first Q sequence alone: sequence-local maps.
     run(fill(*lengths, k_shift=8), 0)
+    run(fill(*lengths, q_shift=8), 0)
     captured = torch.cuda.CUDAGraph()
     try:
         fill(*lengths)
         with torch.cuda.graph(captured):
             graph.execute(pack, workspace)
-        # Replay reads the offsets of each launch: compact, padded, compact.
+        # Replay reads the offsets of each launch: compact, padded K/V, padded Q, compact.
         run(fill(*lengths), 1, replay=captured)
         run(fill(*lengths, k_shift=8), 0, replay=captured)
+        run(fill(*lengths, q_shift=8), 0, replay=captured)
         run(fill(*keyless), 1, replay=captured)
     finally:
         captured.reset()

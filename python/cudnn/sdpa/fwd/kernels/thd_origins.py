@@ -169,13 +169,17 @@ def build_thd_origins(
                 origins=origins,
                 origin_row=3 if specs[3] is not None else -1,
             )
+            # A zero extent would make a map invalid rather than empty; an
+            # all-empty side is never loaded, so one row keeps the map valid.
+            total_q = cute.math.max(cutlass.Int32(meta[2 * batch]), cutlass.Int32(1))
+            total_kv = cute.math.max(cutlass.Int32(meta[3 * batch + 1]), cutlass.Int32(1))
             if warp == 0:
-                emit_clamped_desc(q_desc, maps, 1 * (batch + 1) + COMPACT_MAP_SEQUENCE, cutlass.Int32(meta[2 * batch]), 2)
+                emit_clamped_desc(q_desc, maps, 1 * (batch + 1) + COMPACT_MAP_SEQUENCE, total_q, 2)
             if cutlass.const_expr(not paged):
                 if warp == 1:
-                    emit_clamped_desc(k_desc, maps, 2 * (batch + 1) + COMPACT_MAP_SEQUENCE, cutlass.Int32(meta[3 * batch + 1]), 2)
+                    emit_clamped_desc(k_desc, maps, 2 * (batch + 1) + COMPACT_MAP_SEQUENCE, total_kv, 2)
                 if warp == 2:
-                    emit_clamped_desc(v_desc, maps, 3 * (batch + 1) + COMPACT_MAP_SEQUENCE, cutlass.Int32(meta[3 * batch + 1]), 2)
+                    emit_clamped_desc(v_desc, maps, 3 * (batch + 1) + COMPACT_MAP_SEQUENCE, total_kv, 2)
         else:
             # Stripe warps over ports as well as sequences. A short batch must
             # not serialize all four maps on one elected writer. O/Q occupy the
