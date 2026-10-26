@@ -346,8 +346,9 @@ S = 2048 lost and group 2 was not covered.
 Rows with no measurement (SM80, SM100 mxfp8) keep the historical order (LEAD); they are still
 opt-in, so the order is only observable with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``.
 SM100 / SM103 nonpaged BF16 d128 MHA causal THD (2026-10-25, ``NONPAGED_D128_MHA_THD_*``): one Q head per KV head cannot
-pack, so the lead is the unpacked FROST plan; it leads the backend when the declared Q rows fill the SMs or each
-sequence carries at least 512 declared tokens (Q and KV), on cc 10.0 and cc 10.3, and trails below that. FlashInfer's
+pack, so the lead is the unpacked FROST plan; it leads the backend over a declared cache of at least 4096 tokens when
+the declared Q rows fill the SMs or each sequence carries at least 512 declared Q tokens, on cc 10.0 and cc 10.3, and
+trails below that (a chunk over a shorter cache -- Q 256 over KV 1024 at 4 x 32 heads -- keeps the backend). FlashInfer's
 ragged declaration is one graph per shape class at its cache shape (or a bounded total under CUDA graphs), so the rule
 decides once per class.
 SM100 / SM103 nonpaged BF16 d64 causal THD (2026-10-26, ``NONPAGED_D64_THD_*``): d64 THD cannot pack, so the lead is the
@@ -395,7 +396,8 @@ THD_PACKED_GQA2_MIN_KV_TOKENS = 4096  # GQA2 packs two heads a tile: large batch
 THD_PACKED_MIN_Q_ROWS_PER_SM = 110  # h_q * (b * s_q, or a smaller declared token total) per SM
 THD_PACKED_LONG_Q = 256  # ... except long sequences (by declared total / b): Q256 KV1024 at 4096-8192 rows ran 0.79-0.81
 THD_PACKED_LONG_Q_MIN_KV = 1024
-NONPAGED_D128_MHA_THD_MIN_TOKENS = 512  # unpacked MHA d128 THD: declared per-sequence Q and KV extent from which FROST leads
+NONPAGED_D128_MHA_THD_MIN_TOKENS = 512  # unpacked MHA d128 THD: declared per-sequence Q extent from which FROST leads
+NONPAGED_D128_MHA_THD_MIN_KV_TOKENS = 4096  # ... over a declared cache of at least this many tokens
 NONPAGED_D128_MHA_THD_CCS = ((10, 0), (10, 3))
 NONPAGED_D64_THD_MIN_TOKENS = 512  # unpacked d64 THD: declared per-sequence Q and KV extent from which FROST leads
 NONPAGED_D64_THD_CCS = ((10, 0), (10, 3))
@@ -994,8 +996,9 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
     ):
         return LEAD  # unsplit d256 THD prefill
     if (
-        # nonpaged BF16 d128 causal THD with one Q head per KV head (unpacked): declared per-sequence Q and KV extent
-        # of at least NONPAGED_D128_MHA_THD_MIN_TOKENS on the measured parts
+        # nonpaged BF16 d128 causal THD with one Q head per KV head (unpacked): a declared cache of at least
+        # NONPAGED_D128_MHA_THD_MIN_KV_TOKENS and Q rows that fill the SMs or NONPAGED_D128_MHA_THD_MIN_TOKENS per sequence,
+        # on the measured parts
         facts.thd
         and not facts.has_paged_kv
         and facts.dtype == cudnn.data_type.BFLOAT16
@@ -1006,7 +1009,7 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
         and facts.window_left is None
         and not (facts.has_sink or facts.right_band_widening or facts.has_epilogue_gate)
         and facts.device_cc in NONPAGED_D128_MHA_THD_CCS
-        and facts.s_kv >= NONPAGED_D128_MHA_THD_MIN_TOKENS
+        and facts.s_kv >= NONPAGED_D128_MHA_THD_MIN_KV_TOKENS
         and (
             # the declared Q rows fill the SMs (a bounded or cache-shape declaration), or each sequence is long
             facts.h_q * min(facts.b * facts.s_q, facts.max_total_seq_len_q or facts.b * facts.s_q)
