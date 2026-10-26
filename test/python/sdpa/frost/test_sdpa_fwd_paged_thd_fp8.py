@@ -351,7 +351,9 @@ def test_paged_thd_fp8_origins_rebind_and_capture(
                     stats[ss + lo : ss + hi].double(),
                     expected_stats,
                     atol=(0.01 if dim == 256 else 0.005) * (math.log2(math.e) if stats_layout == "head" else 1),
-                    rtol=0,
+                    # D256 uses the existing prepared FP8 Stats budget.
+                    # Its dense/compact controls still require exact equality.
+                    rtol=0.01 if dim == 256 else 0,
                 )
             live_o[starts["o"][b] : starts["o"][b] + nq] = True
             stats_start = b * maximum if stats_layout == "padded" else starts["stats"][b]
