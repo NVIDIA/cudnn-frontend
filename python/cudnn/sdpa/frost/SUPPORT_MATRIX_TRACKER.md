@@ -330,7 +330,7 @@ Engines: `sdpa_fwd_prefill_sm100` (f16/bf16), `sdpa_fwd_prefill_sm100_fp8`,
 `sdpa_bwd_sm100_d256`, `sdpa_bwd_sm100_d128`. The half-precision d512 backward engine serves **only
 the large-head-dim band, d ∈ (256, 512]**, the half-precision d256 backward
 engine (`sdpa_bwd_sm100_d256`, the 2x2-datapath body, 2026-10-01, opt_in) serves
-**exactly d = 256**, the d128 engine serves **exactly d = 128** for
+**exactly d = 256 plus native dense D192x128**, the d128 engine serves **exactly d = 128** for
 half-precision MHA and, on SM100 or SM103, BF16 GQA/MQA within the restrictions
 below. The MXFP8 backward engine serves **exactly d = 256** —
 every other `sdpa_backward()` / `sdpa_mxfp8_backward()` shape still falls
@@ -1036,6 +1036,13 @@ that fits SM100's 227 KiB / 512 columns where the 4x1 Rubin body needs 576 /
 one pair-rounded q range, so the stage-3 renderings, the two-sided K-trim and
 the no-zero-fill contract are the Rubin row's (poisoned-workspace tests in
 `test/python/sdpa/frost/test_sdpa_bwd_d256_sm100.py`). Exact (256, 256), f16/bf16;
+D192x128 is also served natively for dense BSHD storage, including MHA/GQA/MQA
+and the same masks. Stage 2 contracts scores at QK192 and dP at V128, with
+128-column dV accumulation/stores. Both compute groups retain all barriers.
+Tensor maps, delta and GQA fold use the actual QK/V widths; packed D192x128 stays declined.
+The native stage-2 configuration uses 148 KiB shared memory including scaffolding;
+its stage-3 GEMMs and materialized dS workspace retain the existing contract.
+The D256 contract remains:
 dense, top-left and bottom-right causal (ragged S_q included), sliding window
 (left), MHA/GQA/MQA, any S_q / S_kv (padded to 128 / 256 and masked), BSHD-physical
 io, contiguous fp32 Stats. The dense BSHD declaration also accepts a nonoverlapping,

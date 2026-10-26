@@ -1119,6 +1119,7 @@ def host_f16(
     q = _view(q_ptr, geometry[0])
     k = _view(k_ptr, geometry[1])
     v = _view(v_ptr, geometry[2])
+    d_v = geometry[2][0][3]
     o = _view(o_ptr, geometry[3])
     do = _view(do_ptr, geometry[4])
     stats = _view(stats_ptr, geometry[5])  # [B, H, S_q] fp32
@@ -1151,7 +1152,7 @@ def host_f16(
     # STAGE 1, hoisted out of the chunk loop: one streaming pass over O and dO -- unless the caller computed it
     # (external_delta: the producer of dO writes rowsum(dO * O) in this kernel's order, so the launch and the read go).
     if cutlass.const_expr(not external_delta):
-        dot_do_o_host(o, do, delta, None, None, DOT_Q_TILE, d, d, DOT_CHUNK_ELEMS, False, False, stream)
+        dot_do_o_host(o, do, delta, None, None, DOT_Q_TILE, d_v, d_v, DOT_CHUNK_ELEMS, False, False, stream)
 
     for bi in range(b // bc):
         bb = bi * bc
@@ -1187,7 +1188,7 @@ def host_f16(
                 # whole GQA group is consumed before its workspace is reused.
                 dk_out = _window(_window(dk, 0, bb, bc), 2, hb // group, hc // group)
                 dv_out = _window(_window(dv, 0, bb, bc), 2, hb // group, hc // group)
-                dkv_reduce_host(dk_tgt, dv_k, dk_out, dv_out, d, d, group, dtype, False, stream)
+                dkv_reduce_host(dk_tgt, dv_k, dk_out, dv_out, d, d_v, group, dtype, False, stream)
             else:
                 main(q_k, do_k, k_k, v_k, dv_k, ds_full, lse_k, delta, seq_kv, (b, h, hk, sqp, skvp, hc, bc, sq, skv), scale, hb, bb, stream)
                 # STAGE 3: consume the chunk's workspace, write the outputs' (batch, head) slice.
@@ -1197,7 +1198,7 @@ def host_f16(
     if cutlass.const_expr(group > 1 and not chunk_partials):
         dk_out = _scratch(workspace, regions[R_DK_FOLD], dtype) if cutlass.const_expr(kv_padded) else dk
         dv_out = _scratch(workspace, regions[R_DV_FOLD], dtype) if cutlass.const_expr(kv_padded) else dv
-        dkv_reduce_host(dk_tgt, dv_k, dk_out, dv_out, d, d, group, dtype, False, stream)
+        dkv_reduce_host(dk_tgt, dv_k, dk_out, dv_out, d, d_v, group, dtype, False, stream)
         if cutlass.const_expr(kv_padded):
             _pad_copy(dk_out, dk, itemsize, stream)
             _pad_copy(dv_out, dv, itemsize, stream)
