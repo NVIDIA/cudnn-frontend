@@ -121,6 +121,8 @@ _pruned_this_process = False
 _MEMO: Dict[tuple, Any] = {}
 # Per-thread stack of lists that record_entries() hands out; compile_cached appends to the innermost.
 _RECORDING = threading.local()
+# Per-thread depth of refuse_compiles() scopes; nonzero makes a cache miss raise instead of compiling.
+_REFUSING = threading.local()
 
 
 # ---------------------------------------------------------------------------
@@ -653,6 +655,7 @@ def compile_cached(fn: Callable, *args: Any, cache_key: Optional[str], symbol: s
 
     options = str(kwargs.get("options") or "")
     if cache_key is None:
+        _refuse_compile(symbol)
         _count("bypassed")
         return cute.compile(fn, *args, **kwargs)
     memo_key = (*_memo_device(), cache_key, symbol, options) if memo_enabled() else None
@@ -678,12 +681,14 @@ def _compile_persistent(fn: Callable, args: tuple, kwargs: Dict[str, Any], *, ca
     import cutlass.cute as cute
 
     if not enabled() or "--enable-tvm-ffi" not in options:
+        _refuse_compile(symbol)
         _count("bypassed")
         return cute.compile(fn, *args, **kwargs)
     manifest = environment_manifest()
     if any(v == "unknown" for v in manifest.values()):
         # An environment that cannot identify itself shares nothing: two
         # incompatible stacks with the same unknowns would otherwise hash alike.
+        _refuse_compile(symbol)
         _count("bypassed")
         return cute.compile(fn, *args, **kwargs)
     root = get_cache_dir()  # one root for the export and the prune that follows it
@@ -700,6 +705,7 @@ def _compile_persistent(fn: Callable, args: tuple, kwargs: Dict[str, Any], *, ca
         if loaded is not None:
             _count("hits")
             return loaded
+        _refuse_compile(symbol)
         return _compile_and_export(fn, args, kwargs, root, entry, cache_key, symbol, manifest)
 
 
@@ -765,6 +771,25 @@ def _compile_and_export(fn, args, kwargs, root, entry, cache_key, symbol, manife
 # ---------------------------------------------------------------------------
 # Carrying entries to another process (plan serialization)
 # ---------------------------------------------------------------------------
+
+
+class CompileRefused(RuntimeError):
+    """A kernel had to compile inside :func:`refuse_compiles`."""
+
+
+def _refuse_compile(symbol: str) -> None:
+    if getattr(_REFUSING, "depth", 0):
+        raise CompileRefused(f"{symbol} is not in the compiled cache and compiling is refused here")
+
+
+@contextlib.contextmanager
+def refuse_compiles():
+    """Make a ``compile_cached`` miss in this thread raise :class:`CompileRefused` instead of compiling."""
+    _REFUSING.depth = getattr(_REFUSING, "depth", 0) + 1
+    try:
+        yield
+    finally:
+        _REFUSING.depth -= 1
 
 
 @contextlib.contextmanager

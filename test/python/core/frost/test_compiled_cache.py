@@ -343,6 +343,25 @@ def test_the_memo_hands_out_the_same_object_without_a_second_compile(monkeypatch
     assert cc.memo_enabled()
 
 
+def test_refuse_compiles_raises_on_every_compile_path_but_serves_the_memo(monkeypatch, tmp_path):
+    calls = []
+    _fake_compile(monkeypatch, calls)
+    monkeypatch.setenv(cc._ENV_DISABLE, "1")
+    memo = cc.compile_cached(lambda: None, cache_key="memo", options="--enable-tvm-ffi")
+    with cc.refuse_compiles():
+        assert cc.compile_cached(lambda: None, cache_key="memo", options="--enable-tvm-ffi") is memo
+        for key, options in (("disabled", "--enable-tvm-ffi"), (None, "--enable-tvm-ffi"), ("k", "")):
+            with pytest.raises(cc.CompileRefused):
+                cc.compile_cached(lambda: None, cache_key=key, options=options)
+        monkeypatch.delenv(cc._ENV_DISABLE)
+        monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE", str(tmp_path))
+        monkeypatch.setattr(cc, "environment_manifest", lambda device=None: {"schema": cc._SCHEMA, "cudnn_frontend": "1.30.0"})
+        with pytest.raises(cc.CompileRefused):  # a miss on an enabled on-disk cache
+            cc.compile_cached(lambda: None, cache_key="miss", options="--enable-tvm-ffi")
+    assert len(calls) == 1
+    assert cc.compile_cached(lambda: None, cache_key="after", options="") is not None and len(calls) == 2
+
+
 def test_the_memo_sits_in_front_of_an_enabled_on_disk_cache(monkeypatch, tmp_path):
     """With the files ON, the second call never reaches them."""
     calls, loads = [], []

@@ -17,16 +17,19 @@ from frost_test_utils import requires_blackwell, requires_dsl
 pytestmark = [pytest.mark.L0, requires_blackwell, requires_dsl]
 
 _PRELUDE = r"""
-import hashlib, json, math, sys, torch, cudnn
+import hashlib, json, math, os, sys, torch, cudnn
 from cudnn.frost import compiled_cache as cc
 sys.path.insert(0, %(tests)r)
 from frost_test_utils import select_engine, _SM
 from cudnn.sdpa.fwd.engines import engine_name
 b, h, s, d = 2, 8, 256, 128
 torch.manual_seed(0)
-mk = lambda: torch.randn(b, s, h, d, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+# BSHD binds in place; contiguous BHSD adds the staged-copy kernels, so its plan carries several.
+BHSD = os.environ.get("PLAN_TEST_LAYOUT") == "bhsd"
+alloc = (lambda f: f(b, h, s, d)) if BHSD else (lambda f: f(b, s, h, d).transpose(1, 2))
+mk = lambda: alloc(lambda *shape: torch.randn(*shape, device="cuda", dtype=torch.bfloat16))
 q_gpu, k_gpu, v_gpu = mk(), mk(), mk()
-o_gpu = torch.full((b, s, h, d), float("nan"), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+o_gpu = alloc(lambda *shape: torch.full(shape, float("nan"), device="cuda", dtype=torch.bfloat16))
 UIDS = dict(q=1, k=2, v=3, o=4)
 
 def run(g):
@@ -63,8 +66,8 @@ print(json.dumps({"digest": run(g), "plan": g.get_plan_name_at_index(g._plan_ind
 """
 
 
-def _child(source, cache_dir, *argv):
-    env = dict(os.environ, CUDNN_FRONTEND_COMPILED_CACHE=str(cache_dir))
+def _child(source, cache_dir, *argv, layout="bshd"):
+    env = dict(os.environ, CUDNN_FRONTEND_COMPILED_CACHE=str(cache_dir), PLAN_TEST_LAYOUT=layout)
     env.pop("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", None)
     code = (_PRELUDE % {"tests": os.path.dirname(os.path.abspath(__file__))}) + source
     out = subprocess.run([sys.executable, "-c", code, *map(str, argv)], env=env, capture_output=True, text=True, timeout=900)
@@ -79,19 +82,34 @@ def produced(tmp_path_factory):
     return blob, _child(_PRODUCE, root / "producer_cache", blob)
 
 
-def _with_foreign_environment(blob_path, out_path):
-    """The same blob, its kernels claimed by another driver version."""
-    from cudnn import _plan_serdes as ps
+@pytest.fixture(scope="module")
+def produced_bhsd(tmp_path_factory):
+    root = tmp_path_factory.mktemp("plan_serdes_bhsd")
+    blob = root / "plan.bin"
+    return blob, _child(_PRODUCE, root / "producer_cache", blob, layout="bhsd")
+
+
+def _rewrite_header(blob_path, out_path, edit):
+    import cudnn._plan_serdes as ps
 
     data = blob_path.read_bytes()
     start = len(ps.MAGIC) + ps._LEN.size
     (length,) = ps._LEN.unpack_from(data, len(ps.MAGIC))
     header = json.loads(data[start : start + length])
     assert header["kernels"], "the producer's plan carried no kernels"
-    for kernel in header["kernels"]:
-        kernel["environment"]["cuda_driver"] = "1"
+    edit(header)
     text = json.dumps(header).encode()
     out_path.write_bytes(ps.MAGIC + ps._LEN.pack(len(text)) + text + data[start + length :])
+
+
+def _with_foreign_environment(blob_path, out_path):
+    """The same blob, its kernels claimed by another driver version."""
+
+    def edit(header):
+        for kernel in header["kernels"]:
+            kernel["environment"]["cuda_driver"] = "1"
+
+    _rewrite_header(blob_path, out_path, edit)
 
 
 def test_frost_plan_round_trips_without_compiling(produced, tmp_path):
@@ -125,3 +143,18 @@ def test_a_blob_without_kernels_compiles_the_plan(produced, tmp_path):
     assert loose["stats"]["misses"] >= 1 and loose["digest"] == first["digest"], loose
     strict = _child(_CONSUME, tmp_path / "strict_cache", bare, "strict")
     assert "enforce_precompiled" in strict.get("error", ""), strict
+
+
+def test_a_blob_missing_one_kernel_is_refused_strictly_before_anything_compiles(produced_bhsd, tmp_path):
+    blob, first = produced_bhsd
+    partial = tmp_path / "partial.bin"
+
+    def drop_one(header):
+        assert len(header["kernels"]) >= 2, header["kernels"]
+        header["kernels"].pop()
+
+    _rewrite_header(blob, partial, drop_one)
+    strict = _child(_CONSUME, tmp_path / "strict_cache", partial, "strict", "retry", layout="bhsd")
+    assert "does not carry every kernel" in strict.get("error", ""), strict
+    assert strict["stats"]["misses"] == 1, strict  # only the loose retry compiled
+    assert strict["digest"] == first["digest"], strict

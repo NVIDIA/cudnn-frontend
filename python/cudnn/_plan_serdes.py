@@ -25,6 +25,7 @@ Deserializing loads native code from the blob: only deserialize blobs from a tru
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import enum
 import importlib
@@ -270,10 +271,22 @@ def deserialize(graph: "pygraph", data: Any, handle: Any = None, enforce_precomp
             f"(frontend, CuTe DSL, tvm-ffi, driver, device) or the compiled cache is disabled; the plan would compile"
         )
 
+    # Any later failure restores the empty graph, so the caller can retry on it.
+    empty = {k: copy.copy(v) if isinstance(v, (list, dict, set)) else v for k, v in vars(graph).items()}
+    try:
+        _rebuild(graph, header, handle, enforce_precompiled)
+    except BaseException:
+        vars(graph).clear()
+        vars(graph).update(empty)
+        raise
+
+
+def _rebuild(graph: "pygraph", header: Dict[str, Any], handle: Any, enforce_precompiled: bool) -> None:
+    from .frost import compiled_cache
+
     if handle is not None:
         graph._handle = handle
     _decode_graph(graph, header["graph"])
-
     plan = header["plan"]
     knobs = {_decode(k, {}): int(v) for k, v in plan["knobs"]}
     graph.validate()
@@ -282,11 +295,19 @@ def deserialize(graph: "pygraph", data: Any, handle: Any = None, enforce_precomp
     engine = graph.selected_engine
     if engine is None or engine.name != plan["engine_name"]:
         raise ValueError(f"engine id {plan['engine_id']} is {getattr(engine, 'name', 'the backend')!r} here, not {plan['engine_name']!r}")
-    before = compiled_cache.stats()
-    graph.build_plans()
-    after = compiled_cache.stats()
-    if enforce_precompiled and (after["misses"] > before["misses"] or after["bypassed"] > before["bypassed"]):
-        raise cudnn_graph_not_supported("enforce_precompiled: building the deserialized plan compiled a kernel the blob did not carry")
+    if not enforce_precompiled:
+        graph.build_plans()
+        return
+    try:
+        with compiled_cache.refuse_compiles():
+            graph.build_plans()
+    except Exception as exc:
+        cause: Any = exc
+        while cause is not None and not isinstance(cause, compiled_cache.CompileRefused):
+            cause = cause.__cause__ or cause.__context__
+        if cause is None:
+            raise
+        raise cudnn_graph_not_supported(f"enforce_precompiled: the blob does not carry every kernel of the plan; {cause}") from exc
 
 
 def cudnn_graph_not_supported(message: str) -> Exception:
