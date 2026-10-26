@@ -3195,3 +3195,30 @@ def test_paged_graph_fp8_d256_matches_dense_arithmetic():
     torch.testing.assert_close(o.float(), bufs["o"].float(), atol=0, rtol=0)
     torch.testing.assert_close(lse, bufs["lse"].squeeze(-1), atol=0, rtol=0)
     torch.testing.assert_close(amax, bufs["amax_o"], atol=0, rtol=0)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("page_size,pack,split,has_sink", [(16, True, 1, True), (256, False, 2, False)])
+def test_paged_graph_fp8_d256_persistent_batch_lengths(page_size, pack, split, has_sink):
+    """Later work on a persistent CTA must load its new batch's live pages."""
+    sinks = torch.linspace(-120.0, 120.0, 32, device="cuda").view(1, 32, 1, 1) if has_sink else None
+    _run_graph_fp8(
+        10,
+        32,
+        8,
+        256,
+        page_size,
+        -(-513 // page_size),
+        [513, 0, 1, 129, 256] * 2,
+        pack,
+        v_hnd=not pack,
+        s_q=257,
+        stats=True,
+        causal="bottom_right",
+        window_left=256,
+        explicit_split=split,
+        explicit_cga=1,
+        explicit_pack=pack,
+        q_lens=[257, 1, 0, 17, 257] * 2,
+        sinks=sinks,
+    )
