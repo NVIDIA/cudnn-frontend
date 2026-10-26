@@ -817,6 +817,10 @@ def test_block_scale_sf_ring_budget(moe, force_stg, budget, stages, monkeypatch)
 
     monkeypatch.setattr(C, "_current_arch", lambda: 100)
     monkeypatch.setattr(tile_config, "_sm_smem_budget_bytes", lambda device=None: budget)
+    # The rendered grid size asks the active GPU how many 2-CTA clusters fit; a part
+    # without clusters (pre-SM90) has none. The stage budget checked here does not
+    # depend on it.
+    monkeypatch.setattr(C, "_grid_num_clusters", lambda cfg, device=None: 1)
     chain = analyze(_build_nvfp4_graph(256, 256, 512, block_size=32, sf_dt=_DT_E8M0, a_dt=_DT_E4M3))
     if moe:
         chain = dataclasses.replace(chain, moe=MoeSpec(num_experts=1, num_groups=3))
