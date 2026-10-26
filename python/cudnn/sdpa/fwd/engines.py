@@ -302,8 +302,8 @@ class Capabilities:
     # TemplateParams-conversion follow-ups.
     lse_optional: bool = False
     # Most THD forward lowerings derive addresses from compact length prefixes.
-    # The SM100/SM103 ungated, nonpaged, unsplit CGA2 half D128/D256 graph
-    # lowering reads independent Q/K/V/O/Stats physical offsets. See
+    # The SM100/SM103 ungated, unsplit CGA2 half D128/D256 graph lowering
+    # reads independent Q/O/Stats origins and nonpaged K/V origins. See
     # SUPPORT_MATRIX_TRACKER.md for this scope and the remaining sibling gaps;
     # thd=True alone does not promise support for padding between sequences.
     thd: bool = False
