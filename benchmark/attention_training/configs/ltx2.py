@@ -50,12 +50,12 @@ CONFIG = BenchmarkConfig(
         (30240, 30240),  # 161 frames, 960x1536
         (37632, 37632),  # 161 frames, 1024x1792
     ],
-    backends=["cudnn", "cudnn_oss", "flash_attention_4"] + fa2_on_ampere(),
+    backends=["cudnn", "cudnn_oss", "cudnn_auto", "flash_attention_4"] + fa2_on_ampere(),
     data_types=["bfloat16"],  # Video DiTs are typically bf16-trained
     attn_masks=["no_mask"],  # Bidirectional diffusion DiT
     profile_pass="both",  # Forward and backward for training
     deterministic_bwd=[False, True],
     batch_size=1,
-    num_iterations=10,
+    num_iterations=20,
     output_dir="results",
 )

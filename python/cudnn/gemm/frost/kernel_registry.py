@@ -584,7 +584,12 @@ class Sm120KernelTemplate(KernelTemplate):
         if self.block_scale:
             bs = chain.block_scale
             sf_k = kb * 8 // (4 if bs.is_fp4 else 8) // bs.block_size
-            a_tile, b_tile = config.cta_tile_m * kb, config.cta_tile_n * kb
+            # The same per-side rows as multi_gemm_ab_stages: the packed e2m1 side
+            # of a mixed pair holds the fp8 K-tile in half the bytes, and the ring
+            # this sizes (sA_elems * ab_stages) is laid out in those bytes.
+            a_kb = kb // 2 if bs.mixed_width and bs.a_dtype == "fp4_e2m1" else kb
+            b_kb = kb // 2 if bs.mixed_width and bs.b_dtype == "fp4_e2m1" else kb
+            a_tile, b_tile = config.cta_tile_m * a_kb, config.cta_tile_n * b_kb
             sf_tiles = (-(-config.cta_tile_m // 128) * 128 * sf_k, -(-config.cta_tile_n // 128) * 128 * sf_k)
         else:
             cta_smem_m, cta_smem_n, _k = config.cta_smem_tile_mnk(DTYPE_BYTES[chain.matmul.a_dtype])

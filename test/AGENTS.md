@@ -129,6 +129,11 @@ and retain the existing SASS checks. Check distribution metadata as well as the
 import path: an internal build may print the public version in `cutlass.__version__`.
 `test_fork_rendering_ptx_md5_is_recorded` covers the SM107 D512 backward record;
 its dense scheduler and shared THD work-prefix changes require different attribution.
+A store-order optimization qualified for one width must not silently move the
+other widths of a shared body. Preserve their established lowering, and compare
+both the historical small-width cubins and the optimized width before landing.
+The SM107 bias/off/streamed records detect D32/D64 epilogue changes that D128
+functional coverage alone misses; keep their hashes and SASS assertions intact.
 
 When a native head-dimension flavor replaces an envelope, update the exact
 template expectation in existing end-to-end routing tests as well as adding
@@ -868,6 +873,28 @@ A launch recorder must reconstruct the plan's actual native binder type after
 intercepting its entry. Hard-coding THD fails once dense prefill becomes native.
 Keep the existing KV-tail and fixed-shape rejection diagnostics, as exercised
 by `test_sdpa_prepared_thd.py`, when changing the binder implementation.
+
+Physical THD offsets are element addresses for each port. A fused K/V slab or
+wide O token stride requires matching offset values, with an independent Int64
+O offset when it exceeds Int32. Keep these fixtures consistent in
+`test_sdpa_prepared_thd.py` and `test_mhas_v2.py`. Compare graph execution with an
+independently prepared standalone API; clearing a graph's private prepared plan
+does not reproduce the standalone compact-prefix contract. Retain poisoned
+outputs and replay after rebinding for both public entry points.
+
+Keep `stream` last in private CuTe host signatures and preserve the
+`_positional_order` guard. Matching named binder slots and a Python wrapper
+signature does not qualify a reordered entry; exercise a real compiled launch
+after ABI changes before considering a change to that convention.
+
+AST-based host frame fixtures must retain unannotated runtime arguments;
+`ast.unparse(None)` fails before binding. Raw positional CuTe entries require
+every runtime slot, including optional `None` pointers and scalar defaults:
+Python signature defaults do not shorten the exported FFI frame. Keep the
+packed combine direct-call and fresh-process artifact tests synchronized with
+that frame. A graph-lowered adapter carrying physical origins is not a public
+standalone plan; construct the standalone API independently and retain its own
+workspace through capture replay, as in `test_paged_thd_split_capture_lengths_and_stats`.
 
 ### Native host ABI differences across architectures
 

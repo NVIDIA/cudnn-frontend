@@ -1,6 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Dense d128 M128/N128 backward, one launch and no workspace.
+"""Dense D64/D128 M128/N128 backward, one launch and no workspace.
+
+D64 specializes the operand/MMA width and output stores; score/dS stay N128.
+The detailed storage numbers below describe the D128 configuration.
 
 CTA384: compute0..7 form two128-thread groups, each owns row=tid%128 and
 64 columns; loader8, MMA9, stats10+11, output/TMEM control11. Input has two
@@ -78,7 +81,9 @@ from cudnn.frost.tile_dsl.mma import mma_ss, mma_ts_step
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, row_reduction_pair, tmem_load_tile
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
-from cudnn.sdpa.bwd.config_sm100_d128 import CFG
+from cudnn.sdpa.bwd.config_sm100_d128 import make_cfg
+
+CFG = make_cfg(globals().get("FROST_TEMPLATE_PARAMS", 128))
 
 _SWIZZLE = cutlass.Swizzle(3, 4, 3)
 _LOG2E = 1.4426950408889634
@@ -159,33 +164,71 @@ def _write_stats(s_o, s_do, stats, lse, batch, head, q_base, sq, rows: cutlass.C
 
 
 @cute.jit
+def _probability_words(
+    stats,
+    owner_base,
+    stream_base,
+    sq,
+    skv,
+    causal: cutlass.Constexpr[bool],
+    q_owner: cutlass.Constexpr[bool],
+    col: cutlass.Constexpr[int],
+    window_left: cutlass.Constexpr[int],
+):
+    tid = cute.arch.thread_idx()[0] % CFG.TILE_M
+    lo = cutlass.Int32(0)
+    if cutlass.const_expr(q_owner):
+        query = owner_base + tid
+        hi = skv
+        if cutlass.const_expr(causal):
+            hi = cute.math.min(hi, query + 1)
+        if cutlass.const_expr(window_left > 0):
+            lo = cute.math.max(lo, query - window_left + 1)
+        live = (query < sq) & (stats.subview(tid).load() != cutlass.Float32(float("-inf")))
+        hi = cutlass.Int32(arith.select(live.ir_value(), hi.ir_value(), stream_base.ir_value()))
+        ds_lo = lo
+        ds_hi = cutlass.Int32(arith.select((hi - lo > 1).ir_value(), hi.ir_value(), stream_base.ir_value()))
+    else:
+        key = owner_base + tid
+        hi = sq
+        if cutlass.const_expr(causal):
+            lo = key
+        if cutlass.const_expr(window_left > 0):
+            hi = cute.math.min(hi, key + window_left)
+        hi = cutlass.Int32(arith.select((key < skv).ir_value(), hi.ir_value(), stream_base.ir_value()))
+        ds_lo = cute.math.max(lo, cutlass.Int32(1)) if cutlass.const_expr(causal) else lo
+        ds_hi = cutlass.Int32(arith.select((skv > 1).ir_value(), hi.ir_value(), stream_base.ir_value()))
+        if cutlass.const_expr(window_left > 0):
+            # At query skv + W - 2 only the last key remains; its dS is zero.
+            ds_hi = cute.math.min(ds_hi, skv + window_left - 2)
+            if cutlass.const_expr(causal and window_left == 1):
+                ds_hi = stream_base
+    return band_mask_words(lo, hi, stream_base + col, CFG.POINTWISE_COLS), band_mask_words(ds_lo, ds_hi, stream_base + col, CFG.POINTWISE_COLS)
+
+
+@cute.jit
 def _probability_masked(
-    s, dp, stats, owner_base, stream_base, sq, skv, scale, causal: cutlass.Constexpr[bool], q_owner: cutlass.Constexpr[bool], col: cutlass.Constexpr[int]
+    s,
+    dp,
+    stats,
+    owner_base,
+    stream_base,
+    sq,
+    skv,
+    scale,
+    causal: cutlass.Constexpr[bool],
+    q_owner: cutlass.Constexpr[bool],
+    col: cutlass.Constexpr[int],
+    window_left: cutlass.Constexpr[int] = 0,
 ):
     tid = cute.arch.thread_idx()[0] % CFG.TILE_M
     if cutlass.const_expr(q_owner):
         lse = stats.subview(tid).load()
         delta = stats.subview(CFG.Q_STATS_DELTA + tid).load()
-        hi = skv
-        if cutlass.const_expr(causal):
-            hi = cute.math.min(hi, owner_base + tid + 1)
-        live = (owner_base + tid < sq) & (lse != cutlass.Float32(float("-inf")))
-        hi = cutlass.Int32(arith.select(live.ir_value(), hi.ir_value(), stream_base.ir_value()))
-        words = band_mask_words(None, hi, stream_base + col, CFG.POINTWISE_COLS)
-        ds_live = skv > 1
-        if cutlass.const_expr(causal):
-            ds_live = ds_live & (owner_base + tid > 0)
-        ds_hi = cutlass.Int32(arith.select(ds_live.ir_value(), hi.ir_value(), stream_base.ir_value()))
-        ds_words = band_mask_words(None, ds_hi, stream_base + col, CFG.POINTWISE_COLS)
     else:
         lse = cutlass.Vector.from_elements(tuple(stats.subview(col + i).load() for i in range(CFG.POINTWISE_COLS)), cutlass.Float32)
         delta = cutlass.Vector.from_elements(tuple(stats.subview(CFG.KV_STATS_DELTA + col + i).load() for i in range(CFG.POINTWISE_COLS)), cutlass.Float32)
-        lo = owner_base + tid if cutlass.const_expr(causal) else None
-        hi = cutlass.Int32(arith.select((owner_base + tid < skv).ir_value(), sq.ir_value(), stream_base.ir_value()))
-        words = band_mask_words(lo, hi, stream_base + col, CFG.POINTWISE_COLS)
-        ds_lo = cute.math.max(lo, cutlass.Int32(1)) if cutlass.const_expr(causal) else None
-        ds_hi = cutlass.Int32(arith.select((skv > 1).ir_value(), hi.ir_value(), stream_base.ir_value()))
-        ds_words = band_mask_words(ds_lo, ds_hi, stream_base + col, CFG.POINTWISE_COLS)
+    words, ds_words = _probability_words(stats, owner_base, stream_base, sq, skv, causal, q_owner, col, window_left)
     p = cute.math.exp2((s * scale - lse) * _LOG2E, fastmath=True)
     p = apply_mask_words(p, words, mask_value=0.0, n_cols=CFG.POINTWISE_COLS)
     # A row with exactly one legal key has softmax derivative exactly zero.
@@ -213,7 +256,18 @@ def _probability_full(s, dp, stats, scale, q_owner: cutlass.Constexpr[bool], col
 
 @cute.jit
 def _probability(
-    s, dp, stats, owner_base, stream_base, sq, skv, scale, causal: cutlass.Constexpr[bool], q_owner: cutlass.Constexpr[bool], col: cutlass.Constexpr[int]
+    s,
+    dp,
+    stats,
+    owner_base,
+    stream_base,
+    sq,
+    skv,
+    scale,
+    causal: cutlass.Constexpr[bool],
+    q_owner: cutlass.Constexpr[bool],
+    col: cutlass.Constexpr[int],
+    window_left: cutlass.Constexpr[int] = 0,
 ):
     tid = cute.arch.thread_idx()[0] % CFG.TILE_M
     if cutlass.const_expr(q_owner):
@@ -231,61 +285,69 @@ def _probability(
             full = full & (stream_base >= owner_base + CFG.TILE_M - 1)
     # Seed staged-control-flow result types; both branches overwrite them.
     p, ds = s, dp
-    if full:
+    if full & (window_left == 0):
         p, ds = _probability_full(s, dp, stats, scale, q_owner, col)
     else:
-        p, ds = _probability_masked(s, dp, stats, owner_base, stream_base, sq, skv, scale, causal, q_owner, col)
+        p, ds = _probability_masked(s, dp, stats, owner_base, stream_base, sq, skv, scale, causal, q_owner, col, window_left)
     return p, ds
 
 
 @cute.jit
-def _kv_full(owner_base, stream_base, sq, skv, causal: cutlass.Constexpr[bool]):
+def _kv_full(owner_base, stream_base, sq, skv, causal: cutlass.Constexpr[bool], window_left: cutlass.Constexpr[int] = 0):
     full = (owner_base + CFG.TILE_M <= skv) & (stream_base + CFG.TILE_N <= sq)
     if cutlass.const_expr(causal):
         full = full & (stream_base >= owner_base + CFG.TILE_M - 1)
-    return full
+    return full & (window_left == 0)
 
 
 @cute.jit
-def _kv_probability_p(s, stats, owner_base, stream_base, sq, skv, scale, causal: cutlass.Constexpr[bool], col: cutlass.Constexpr[int]):
+def _kv_probability_p(
+    s, stats, owner_base, stream_base, sq, skv, scale, causal: cutlass.Constexpr[bool], col: cutlass.Constexpr[int], window_left: cutlass.Constexpr[int] = 0
+):
     tid = cute.arch.thread_idx()[0] % CFG.TILE_M
     lse = cutlass.Vector.from_elements(tuple(stats.subview(col + i).load() for i in range(CFG.POINTWISE_COLS)), cutlass.Float32)
     p = s
-    if _kv_full(owner_base, stream_base, sq, skv, causal):
+    if _kv_full(owner_base, stream_base, sq, skv, causal, window_left):
         p = cute.math.exp2((s * scale - lse) * _LOG2E, fastmath=True)
     else:
-        lo = owner_base + tid if cutlass.const_expr(causal) else None
-        hi = cutlass.Int32(arith.select((owner_base + tid < skv).ir_value(), sq.ir_value(), stream_base.ir_value()))
-        words = band_mask_words(lo, hi, stream_base + col, CFG.POINTWISE_COLS)
+        words, _ = _probability_words(stats, owner_base, stream_base, sq, skv, causal, False, col, window_left)
         p = cute.math.exp2((s * scale - lse) * _LOG2E, fastmath=True)
         p = apply_mask_words(p, words, mask_value=0.0, n_cols=CFG.POINTWISE_COLS)
     return p
 
 
 @cute.jit
-def _kv_probability_ds(dp, p, stats, owner_base, stream_base, sq, skv, scale, causal: cutlass.Constexpr[bool], col: cutlass.Constexpr[int]):
+def _kv_probability_ds(
+    dp, p, stats, owner_base, stream_base, sq, skv, scale, causal: cutlass.Constexpr[bool], col: cutlass.Constexpr[int], window_left: cutlass.Constexpr[int] = 0
+):
     tid = cute.arch.thread_idx()[0] % CFG.TILE_M
     delta = cutlass.Vector.from_elements(tuple(stats.subview(CFG.KV_STATS_DELTA + col + i).load() for i in range(CFG.POINTWISE_COLS)), cutlass.Float32)
     ds = dp
-    if _kv_full(owner_base, stream_base, sq, skv, causal):
+    if _kv_full(owner_base, stream_base, sq, skv, causal, window_left):
         ds = (dp - delta) * p * scale
     else:
-        lo = owner_base + tid if cutlass.const_expr(causal) else None
-        hi = cutlass.Int32(arith.select((owner_base + tid < skv).ir_value(), sq.ir_value(), stream_base.ir_value()))
-        ds_lo = cute.math.max(lo, cutlass.Int32(1)) if cutlass.const_expr(causal) else None
-        ds_hi = cutlass.Int32(arith.select((skv > 1).ir_value(), hi.ir_value(), stream_base.ir_value()))
-        ds_words = band_mask_words(ds_lo, ds_hi, stream_base + col, CFG.POINTWISE_COLS)
+        _, ds_words = _probability_words(stats, owner_base, stream_base, sq, skv, causal, False, col, window_left)
         ds = apply_mask_words((dp - delta) * p * scale, ds_words, mask_value=0.0, n_cols=CFG.POINTWISE_COLS)
     return ds
 
 
 @cute.jit
 def _kv_p_chunk(
-    score_base, stats, owner_base, stream_base, sq, skv, scale, causal: cutlass.Constexpr[bool], dtype: cutlass.Constexpr, col: cutlass.Constexpr[int]
+    score_base,
+    stats,
+    owner_base,
+    stream_base,
+    sq,
+    skv,
+    scale,
+    causal: cutlass.Constexpr[bool],
+    dtype: cutlass.Constexpr,
+    col: cutlass.Constexpr[int],
+    window_left: cutlass.Constexpr[int] = 0,
 ):
     s = tmem_load_tile(score_base + CFG.TMEM_S + col, num_elems=CFG.POINTWISE_COLS, ld_num=CFG.POINTWISE_COLS).vec
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-    p = _kv_probability_p(s, stats, owner_base, stream_base, sq, skv, scale, causal, col)
+    p = _kv_probability_p(s, stats, owner_base, stream_base, sq, skv, scale, causal, col, window_left)
     packed_col = (col // CFG.GROUP_COLS) * CFG.GROUP_COLS + (col % CFG.GROUP_COLS) * CFG.BPE // CFG.TMEM_WORD_BYTES
     nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(score_base + CFG.TMEM_S + packed_col, cutlass.Float32), p.to(dtype))
     return p  # The original FP32 vector remains live; native conversion is a copy.
@@ -293,11 +355,22 @@ def _kv_p_chunk(
 
 @cute.jit
 def _kv_ds_chunk(
-    score_base, p, stats, owner_base, stream_base, sq, skv, scale, causal: cutlass.Constexpr[bool], dtype: cutlass.Constexpr, col: cutlass.Constexpr[int]
+    score_base,
+    p,
+    stats,
+    owner_base,
+    stream_base,
+    sq,
+    skv,
+    scale,
+    causal: cutlass.Constexpr[bool],
+    dtype: cutlass.Constexpr,
+    col: cutlass.Constexpr[int],
+    window_left: cutlass.Constexpr[int] = 0,
 ):
     dp = tmem_load_tile(score_base + CFG.TMEM_DP + col, num_elems=CFG.POINTWISE_COLS, ld_num=CFG.POINTWISE_COLS).vec
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-    ds = _kv_probability_ds(dp, p, stats, owner_base, stream_base, sq, skv, scale, causal, col)
+    ds = _kv_probability_ds(dp, p, stats, owner_base, stream_base, sq, skv, scale, causal, col, window_left)
     packed_col = (col // CFG.GROUP_COLS) * CFG.GROUP_COLS + (col % CFG.GROUP_COLS) * CFG.BPE // CFG.TMEM_WORD_BYTES
     nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(score_base + CFG.TMEM_DP + packed_col, cutlass.Float32), ds.to(dtype))
 
@@ -481,17 +554,35 @@ def _mma_q(slab, bars, tmem_base, lo, hi, dtype: cutlass.Constexpr):
 
 @cute.jit
 def _stage_gradient(tmem_base, tmem_offset: cutlass.Constexpr[int], smem, live, dtype: cutlass.Constexpr, group: cutlass.Constexpr[int]):
-    row = cute.arch.thread_idx()[0] % CFG.TILE_M
-    values = cutlass.Vector.from_elements(tuple(cutlass.Float32(0.0) for _ in range(CFG.GROUP_COLS)), cutlass.Float32)
-    if live:
-        values = tmem_load_tile(tmem_base + tmem_offset + group * CFG.GROUP_COLS, num_elems=CFG.GROUP_COLS).vec
-        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-    smem.base.subview(group * CFG.TILE_M * CFG.GROUP_COLS + row * CFG.GROUP_COLS).data_ptr().store_swizzled(values.to(dtype), alignment=128, swizzle=_SWIZZLE)
+    # The second score group still participates in every readiness barrier,
+    # but D64 has no second 64-column gradient slab to read or store.
+    if cutlass.const_expr(group * CFG.GROUP_COLS < CFG.HEAD_DIM):
+        row = cute.arch.thread_idx()[0] % CFG.TILE_M
+        values = cutlass.Vector.from_elements(tuple(cutlass.Float32(0.0) for _ in range(CFG.GROUP_COLS)), cutlass.Float32)
+        if live:
+            values = tmem_load_tile(tmem_base + tmem_offset + group * CFG.GROUP_COLS, num_elems=CFG.GROUP_COLS).vec
+            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+        smem.base.subview(group * CFG.TILE_M * CFG.GROUP_COLS + row * CFG.GROUP_COLS).data_ptr().store_swizzled(
+            values.to(dtype), alignment=128, swizzle=_SWIZZLE
+        )
 
 
 @cute.jit
 def _compute_kv(
-    slab, stats, bars, tmem_base, owner_base, lo, hi, sq, skv, scale, causal: cutlass.Constexpr[bool], dtype: cutlass.Constexpr, group: cutlass.Constexpr[int]
+    slab,
+    stats,
+    bars,
+    tmem_base,
+    owner_base,
+    lo,
+    hi,
+    sq,
+    skv,
+    scale,
+    causal: cutlass.Constexpr[bool],
+    dtype: cutlass.Constexpr,
+    group: cutlass.Constexpr[int],
+    window_left: cutlass.Constexpr[int] = 0,
 ):
     s_state = PipelineState.start()
     dp_state = PipelineState.start()
@@ -503,15 +594,19 @@ def _compute_kv(
         bars.s_full[s_state.idx].wait(s_state.phase)
         bars.stats_full[stats_full_state.idx].wait(stats_full_state.phase)
         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
-        p0 = _kv_p_chunk(tmem_base, stats, owner_base, tile * CFG.TILE_N, sq, skv, scale, causal, dtype, group * CFG.GROUP_COLS)
-        p1 = _kv_p_chunk(tmem_base, stats, owner_base, tile * CFG.TILE_N, sq, skv, scale, causal, dtype, group * CFG.GROUP_COLS + CFG.POINTWISE_COLS)
+        p0 = _kv_p_chunk(tmem_base, stats, owner_base, tile * CFG.TILE_N, sq, skv, scale, causal, dtype, group * CFG.GROUP_COLS, window_left)
+        p1 = _kv_p_chunk(
+            tmem_base, stats, owner_base, tile * CFG.TILE_N, sq, skv, scale, causal, dtype, group * CFG.GROUP_COLS + CFG.POINTWISE_COLS, window_left
+        )
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
         bars.p_full[p_state.idx].arrive()
         bars.dp_full[dp_state.idx].wait(dp_state.phase)
         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
-        _kv_ds_chunk(tmem_base, p0, stats, owner_base, tile * CFG.TILE_N, sq, skv, scale, causal, dtype, group * CFG.GROUP_COLS)
-        _kv_ds_chunk(tmem_base, p1, stats, owner_base, tile * CFG.TILE_N, sq, skv, scale, causal, dtype, group * CFG.GROUP_COLS + CFG.POINTWISE_COLS)
+        _kv_ds_chunk(tmem_base, p0, stats, owner_base, tile * CFG.TILE_N, sq, skv, scale, causal, dtype, group * CFG.GROUP_COLS, window_left)
+        _kv_ds_chunk(
+            tmem_base, p1, stats, owner_base, tile * CFG.TILE_N, sq, skv, scale, causal, dtype, group * CFG.GROUP_COLS + CFG.POINTWISE_COLS, window_left
+        )
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
         bars.stats_empty[stats_empty_state.idx].arrive()
@@ -534,7 +629,20 @@ def _compute_kv(
 
 @cute.jit
 def _compute_q(
-    slab, stats, bars, tmem_base, owner_base, lo, hi, sq, skv, scale, causal: cutlass.Constexpr[bool], dtype: cutlass.Constexpr, group: cutlass.Constexpr[int]
+    slab,
+    stats,
+    bars,
+    tmem_base,
+    owner_base,
+    lo,
+    hi,
+    sq,
+    skv,
+    scale,
+    causal: cutlass.Constexpr[bool],
+    dtype: cutlass.Constexpr,
+    group: cutlass.Constexpr[int],
+    window_left: cutlass.Constexpr[int] = 0,
 ):
     row = cute.arch.thread_idx()[0] % CFG.TILE_M
     s_state = PipelineState.start()
@@ -551,7 +659,7 @@ def _compute_q(
             s = tmem_load_tile(tmem_base + CFG.TMEM_S + col, num_elems=CFG.POINTWISE_COLS, ld_num=CFG.POINTWISE_COLS).vec
             dp = tmem_load_tile(tmem_base + CFG.TMEM_DP + col, num_elems=CFG.POINTWISE_COLS, ld_num=CFG.POINTWISE_COLS).vec
             nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-            p, ds = _probability(s, dp, stats, owner_base, tile * CFG.TILE_N, sq, skv, scale, causal, True, col)
+            p, ds = _probability(s, dp, stats, owner_base, tile * CFG.TILE_N, sq, skv, scale, causal, True, col, window_left)
             _q_ds(slab).base.subview(group * CFG.TILE_M * CFG.GROUP_COLS + row * CFG.GROUP_COLS + chunk * CFG.POINTWISE_COLS).data_ptr().store_swizzled(
                 ds.to(dtype), alignment=CFG.POINTWISE_COLS * CFG.BPE, swizzle=_SWIZZLE
             )
@@ -677,6 +785,7 @@ def _owner(
     causal: cutlass.Constexpr[bool],
     q_owner: cutlass.Constexpr[bool],
     dtype: cutlass.Constexpr,
+    window_left: cutlass.Constexpr[int] = 0,
 ):
     warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     if warp == CFG.TMA_WARP:
@@ -693,21 +802,25 @@ def _owner(
         hi = cute.ceil_div(skv, CFG.TILE_N)
         if cutlass.const_expr(causal):
             hi = cute.math.min(hi, cute.ceil_div(owner_base + CFG.TILE_M, CFG.TILE_N))
+        if cutlass.const_expr(window_left > 0):
+            lo = cute.math.min(hi, cute.math.max(cutlass.Int32(0), owner_base - window_left + 1) // CFG.TILE_N)
     else:
         hi = cute.ceil_div(sq, CFG.TILE_N)
         if cutlass.const_expr(causal):
             lo = cute.math.min(owner_base // CFG.TILE_N, hi)
+        if cutlass.const_expr(window_left > 0):
+            hi = cute.math.min(hi, cute.ceil_div(owner_base + CFG.TILE_M + window_left - 1, CFG.TILE_N))
     if warp < CFG.COMPUTE_WARPS:
         if warp < CFG.COMPUTE_WARPS // 2:
             if cutlass.const_expr(q_owner):
-                _compute_q(slab, stats, bars, tmem_base, owner_base, lo, hi, sq, skv, scale, causal, dtype, 0)
+                _compute_q(slab, stats, bars, tmem_base, owner_base, lo, hi, sq, skv, scale, causal, dtype, 0, window_left)
             else:
-                _compute_kv(slab, stats, bars, tmem_base, owner_base, lo, hi, sq, skv, scale, causal, dtype, 0)
+                _compute_kv(slab, stats, bars, tmem_base, owner_base, lo, hi, sq, skv, scale, causal, dtype, 0, window_left)
         else:
             if cutlass.const_expr(q_owner):
-                _compute_q(slab, stats, bars, tmem_base, owner_base, lo, hi, sq, skv, scale, causal, dtype, 1)
+                _compute_q(slab, stats, bars, tmem_base, owner_base, lo, hi, sq, skv, scale, causal, dtype, 1, window_left)
             else:
-                _compute_kv(slab, stats, bars, tmem_base, owner_base, lo, hi, sq, skv, scale, causal, dtype, 1)
+                _compute_kv(slab, stats, bars, tmem_base, owner_base, lo, hi, sq, skv, scale, causal, dtype, 1, window_left)
     elif warp == CFG.TMA_WARP:
         _tma_warp(slab, bars, stream0_desc, stream1_desc, o_desc, lo, hi, head, batch, q_owner)
     elif warp == CFG.MMA_WARP:
@@ -744,6 +857,7 @@ def bprop_d128_kernel(
     scale: cutlass.Float32,
     causal: cutlass.Constexpr[bool],
     dtype: cutlass.Constexpr,
+    window_left: cutlass.Constexpr[int] = 0,
 ):
     flat = cute.arch.block_idx()[0]
     q_tiles = cute.ceil_div(sq, CFG.TILE_M)
@@ -788,7 +902,30 @@ def bprop_d128_kernel(
     nvvm.barrier_cta_sync()
     tmem_base = tmem_slot.load()
     if owner < q_tiles:
-        _owner(q128, do128, o128, k64, v64, dq, dv, lse, slab, stats, bars, tmem_base, owner * CFG.TILE_M, batch, head, sq, skv, scale, causal, True, dtype)
+        _owner(
+            q128,
+            do128,
+            o128,
+            k64,
+            v64,
+            dq,
+            dv,
+            lse,
+            slab,
+            stats,
+            bars,
+            tmem_base,
+            owner * CFG.TILE_M,
+            batch,
+            head,
+            sq,
+            skv,
+            scale,
+            causal,
+            True,
+            dtype,
+            window_left,
+        )
     else:
         _owner(
             k128,
@@ -812,6 +949,7 @@ def bprop_d128_kernel(
             causal,
             False,
             dtype,
+            window_left,
         )
     nvvm.barrier_cta_sync()
     if warp == CFG.CONTROL_WARP:
@@ -842,11 +980,12 @@ def host(
     scale: cutlass.Float32,
     causal: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
+    window_left: cutlass.Constexpr[int] = 0,
 ):
     if cutlass.const_expr(q.element_type not in (cutlass.BFloat16, cutlass.Float16)):
         raise ValueError("dense d128 backward supports only BF16 and FP16")
-    if cutlass.const_expr(q.shape[3] != CFG.HEAD_DIM or k.shape[3] != CFG.HEAD_DIM):
-        raise ValueError("dense d128 backward requires head dimension 128")
+    if cutlass.const_expr(q.shape[3] not in (64, 128) or k.shape[3] != q.shape[3]):
+        raise ValueError("dense d128 backward requires equal head dimensions 64 or 128")
     if cutlass.const_expr(q.shape[2] != k.shape[2]):
         raise ValueError("dense d128 backward requires equal Q and KV head counts")
     if cutlass.const_expr(q.shape[1] <= 0 or k.shape[1] <= 0):
@@ -873,6 +1012,7 @@ def host(
         scale,
         causal,
         q.element_type,
+        window_left,
     ).launch(grid=((q_tiles + kv_tiles) * q.shape[2] * q.shape[0], 1, 1), block=(CFG.THREADS, 1, 1), stream=stream)
 
 

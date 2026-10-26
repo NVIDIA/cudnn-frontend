@@ -32,10 +32,12 @@ first tile.  The d128 geometry of the same file is byte-pinned to its one-geomet
 it is not re-oracled here.
 """
 
+import ast
 import dataclasses
 import math
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -310,8 +312,17 @@ def test_config_factories_derive_everything_from_the_tile(width):
     ):
         with pytest.raises(ValueError, match=re.escape(word)):
             c._validate_head_dim_tile(dataclasses.replace(cfg, **{field: value}), "probe")
-    with pytest.raises(ValueError, match="f16/bf16 prefill kernel only"):
-        make(c.TemplateParams(dtype_qkv=0, cta_mma=1))
+    if width == 32:
+        with pytest.raises(ValueError, match="per-tensor FP8 D64"):
+            make(c.TemplateParams(dtype_qkv=0, cta_mma=1))
+    else:
+        for dtype in (0, 1):
+            for cga in (1, 2):
+                quantized, _ = make(c.TemplateParams(dtype_qkv=dtype, dtype_o=2, cta_mma=cga, split_kv=4))
+                assert quantized.TILE_K == quantized.TILE_O == quantized.TILE_K_HW_BMM1 == 64
+                assert quantized.V_SWZ_BYTES == 64 // cga
+                with pytest.raises(ValueError, match="FP8 THD"):
+                    make(c.TemplateParams(dtype_qkv=dtype, cta_mma=cga, thd_varlen=True, seq_kv_lens_present=True))
     with pytest.raises(ValueError, match="THD/varlen"):
         make(c.TemplateParams(dtype_qkv=2, cta_mma=1, thd_varlen=True, seq_kv_lens_present=True))
     with pytest.raises(ValueError, match="epilogue_gate"):
@@ -364,12 +375,33 @@ def test_expect_tx_is_the_full_box_and_every_box_is_the_tile():
         "qTmaTransactionBytes = qBufferElems * CFG.BPE * CFG.CTA_MMA",
         "kTmaTransactionBytes = kBufferElems * CFG.BPE * CFG.CTA_MMA",
         "vTmaTransactionBytes = vBufferElems * CFG.BPE * CFG.CTA_MMA",
-        "qk_box_q = (1, CFG.TILE_M, 1, TMA_QK_GRANU_ELEMS)",
+        "HEADS_PER_TILE = CFG.PACK_G if CFG.PACK_GQA else 1",
+        "TOKENS_PER_TILE = CFG.TILE_M // HEADS_PER_TILE",
+        "qk_box_q = (1, TOKENS_PER_TILE, HEADS_PER_TILE, TMA_QK_GRANU_ELEMS)",
         "qk_box_k = (1, CFG.TILE_N // CFG.CTA_MMA, 1, TMA_QK_GRANU_ELEMS)",
         "vo_box_v = (1, CFG.TILE_N, 1, TMA_VO_GRANU_ELEMS)",
-        "vo_box_o = (1, CFG.TILE_M, 1, _O_GRANU_ELEMS)",
+        "vo_box_o = (1, TOKENS_PER_TILE, HEADS_PER_TILE, _O_GRANU_ELEMS)",
     ):
         assert line in code, line
+    # Evaluate the kernel's box expressions: packing trades token rows for
+    # heads without changing the transfer volume or the unpacked geometry.
+    names = ("HEADS_PER_TILE", "TOKENS_PER_TILE", "qk_box_q", "vo_box_o")
+    expressions = {
+        target.id: node.value
+        for node in ast.walk(ast.parse(code))
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name) and target.id in names
+    }
+    for packed, pack_g in ((False, 1), (True, 1), (True, 2), (True, 4), (True, 8), (True, 16)):
+        for granularity in (16, 32, 64):
+            env = dict(CFG=SimpleNamespace(TILE_M=128, PACK_GQA=packed, PACK_G=pack_g), TMA_QK_GRANU_ELEMS=granularity, _O_GRANU_ELEMS=granularity)
+            for name in names:
+                env[name] = eval(compile(ast.Expression(expressions[name]), str(_KERNEL), "eval"), {"__builtins__": {}}, env)
+            for name in ("qk_box_q", "vo_box_o"):
+                assert math.prod(env[name]) == 128 * granularity, (packed, pack_g, name, env[name])
+                if not packed or pack_g == 1:
+                    assert env[name] == (1, 128, 1, granularity)
     for bad in (r"TransactionBytes\s*=.*\bd_(qk|v)\b", r"box_[qkvo]\s*=.*\bd_(qk|v)\b", r"BufferElems\s*=.*\bd_(qk|v)\b"):
         assert not re.search(bad, code), bad
     assert "_MAKE_CFG = {32: make_cfg_d32, 64: make_cfg_d64, 128: make_cfg_d128}" in code

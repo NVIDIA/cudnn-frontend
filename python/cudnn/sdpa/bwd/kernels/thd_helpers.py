@@ -148,6 +148,9 @@ def build_thd_bwd_setup_kernel(
     n_clusters: cutlass.Int32,
     kv_blocked: cutlass.Constexpr[bool] = False,
     sf_meta_t: Optional[cute.Tensor] = None,
+    org_t=None,
+    origin_offsets=None,
+    origin_specs: cutlass.Constexpr = None,
 ) -> None:
     """Metadata, blocked-workspace row offsets, live-unit total, claim counter.
 
@@ -223,6 +226,11 @@ def build_thd_bwd_setup_kernel(
                 _write_thd_sf_tile_prefix_warp(
                     cutlass.make_array_view(sf_meta_t), cutlass.make_array_view(kv_lens_t), n_batch, THD_SF_CU_K_OFF(n_batch), (lens_form & 2) != 0, lane
                 )
+    if cutlass.const_expr(org_t is not None):
+        for port in cutlass.range_constexpr(len(origin_specs)):
+            if cutlass.const_expr(origin_specs[port] is not None):
+                row, mult, stride = origin_specs[port]
+                write_thd_port_origins(org_t, origin_offsets[port], row, mult, stride, n_batch, cutlass.Int32(tidx), cutlass.Int32(nthreads))
     # Outside the elect: every thread helps rank the batches.  The barrier makes
     # the cu_seqlens_q written above visible to the whole block first.  Stage 2's
     # decode walks this permutation, so skipping it leaves the region
@@ -254,6 +262,9 @@ def thd_bwd_setup_host(
     stream=None,
     kv_blocked: cutlass.Constexpr[bool] = False,
     sf_meta_t=None,
+    org_t=None,
+    origin_offsets=None,
+    origin_specs: cutlass.Constexpr = None,
 ):
     """One-block launch of the metadata builder (``kv_blocked`` / ``sf_meta_t``: see the kernel; both appended, both default to
     the pre-existing chains' behaviour).  The tensor parameters are unannotated like the three before them: this entry is
@@ -263,9 +274,9 @@ def thd_bwd_setup_host(
     method closes over the kernel and its block width, and the DSL requires a
     code object with no free variables.
     """
-    build_thd_bwd_setup_kernel(meta_t, q_lens_t, kv_lens_t, lens_form, n_qh, n_batch, ws_gran, cga_tile_m, n_clusters, kv_blocked, sf_meta_t).launch(
-        grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream
-    )
+    build_thd_bwd_setup_kernel(
+        meta_t, q_lens_t, kv_lens_t, lens_form, n_qh, n_batch, ws_gran, cga_tile_m, n_clusters, kv_blocked, sf_meta_t, org_t, origin_offsets, origin_specs
+    ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
 
 
 @cute.kernel

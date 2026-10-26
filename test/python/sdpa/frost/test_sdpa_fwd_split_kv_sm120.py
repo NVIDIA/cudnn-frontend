@@ -331,7 +331,7 @@ def test_sm120_split_sink_is_eligible_on_the_half_row_only(d):
     if d <= 256:
         fp8 = _sink_decode_facts(d_qk=d, d_v=d, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True)
         reason = mismatch(rows["sdpa_fwd_prefill_sm120_fp8"], fp8, knobs)
-        assert reason is not None and "a sink splits on the SM100 and SM120 half flavors only" in reason, reason
+        assert reason is not None and "a sink splits on the SM100, SM107 and SM120 half flavors only" in reason, reason
     validate_params(TemplateParams(has_sink=True, split_kv=4))
     with pytest.raises(ValueError, match="served by the FP16/BF16 templates only"):
         validate_params(TemplateParams(dtype_qkv=DTYPE_E4M3, has_sink=True, split_kv=4), allowed_dtypes=(DTYPE_E4M3,))

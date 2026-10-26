@@ -1024,7 +1024,7 @@ def _dense_plan_stand_in(kernel_file, *, scale):
     import types
 
     host = next(n for n in ast.parse(kernel_file.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "_host")
-    order = [a.arg for a in host.args.args if "Constexpr" not in ast.unparse(a.annotation)]
+    order = [a.arg for a in host.args.args if a.annotation is None or "Constexpr" not in ast.unparse(a.annotation)]
 
     def entry(*args):
         raise AssertionError("the host pin never launches")

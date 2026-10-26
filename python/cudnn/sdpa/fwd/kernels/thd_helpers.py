@@ -11,6 +11,7 @@ import cutlass.cute as cute
 import cuda.bindings.driver as _cuda_driver
 
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
+from cudnn.frost.tile_dsl.barrier import launch_dependent_grids
 
 from cudnn.frost.tile_dsl.thd import (
     TENSOR_MAP_QWORDS,
@@ -31,6 +32,7 @@ from cudnn.frost.tile_dsl.thd import (
     write_thd_live_and_ctr,
     write_thd_meta,
     write_thd_prefix_warp,
+    write_thd_small_batch_meta,
 )
 
 # The THD metadata layout, the batch ranking, the unit decode, the claim counter
@@ -291,11 +293,14 @@ def build_thd_meta_o_descs_kernel(
     clamp_kv: cutlass.Constexpr[bool] = True,
     splits: cutlass.Constexpr[int] = 1,
     rank_by_kv: cutlass.Constexpr[bool] = False,
+    small_batch_meta: cutlass.Constexpr[bool] = False,
+    release_dependents: cutlass.Constexpr[bool] = False,
 ) -> None:
     """Per-execute f16/bf16 THD metadata, O descriptors, and scheduler bounds.
 
-    A single request keeps the elected-thread path. For larger batches, one
-    warp builds each side's prefix and elected warp leaders patch disjoint O
+    Opted-in batches of one through 32 requests build metadata in one warp.
+    Other callers keep the elected-thread path for a single request. Larger
+    batches use one warp per prefix. Elected leaders patch disjoint O
     descriptors. The final two warps also patch the packed K/V extents; paged
     pools retain their pool-shaped descriptors. All work stays in the existing
     setup launch, before the attention kernel on the same stream.
@@ -313,9 +318,70 @@ def build_thd_meta_o_descs_kernel(
     sequence, so the metadata buffer holds ``THD_WORK_META_WORDS(B)`` words.
     """
     tidx, _, _ = cute.arch.thread_idx()
+    if cutlass.const_expr(release_dependents):
+        # This setup launch retains ordinary stream ordering with its input
+        # producers. Only its consumer opts into PDL: allow that consumer's
+        # independent prologue to start, then require griddepcontrol.wait
+        # before it reads any metadata or runtime tensor-map descriptor.
+        if tidx == 0:
+            launch_dependent_grids()
     nthreads, _, _ = cute.arch.block_dim()
     meta = cutlass.make_array_view(meta_t)
-    if n_batch <= cutlass.Int32(1):
+    fused_meta = cutlass.Boolean(False)
+    if cutlass.const_expr(small_batch_meta):
+        fused_meta = (n_batch >= 1) & (n_batch <= 32)
+    # Cumulative inputs already provide the prefix needed by every descriptor.
+    # Keep the metadata warp independent of descriptor writers instead of
+    # publishing that prefix to GMEM only to read it back after a CTA barrier.
+    direct_prefix = fused_meta & ((lens_form & 1) != 0)
+    direct_prefix = direct_prefix & (cutlass.Int32(nthreads) >= cutlass.Int32(128 if clamp_kv else 64))
+    if cutlass.const_expr(clamp_kv):
+        direct_prefix = direct_prefix & ((lens_form & 2) != 0)
+    if direct_prefix:
+        warp = cutlass.Int32(tidx) // cutlass.Int32(32)
+        lane = cutlass.Int32(tidx) % cutlass.Int32(32)
+        nwarps = cutlass.Int32(nthreads) // cutlass.Int32(32)
+        if warp == 0:
+            write_thd_small_batch_meta(
+                meta,
+                cutlass.make_array_view(q_lens_t),
+                cutlass.make_array_view(kv_lens_t),
+                lens_form,
+                n_batch,
+                n_qh,
+                cga_tile_m,
+                n_clusters,
+                lane,
+                splits,
+                rank_by_kv,
+            )
+        else:
+            if nvvm.elect_sync():
+                descriptor_warps = nwarps - cutlass.Int32(3 if clamp_kv else 1)
+                if warp <= descriptor_warps:
+                    q_prefix = cutlass.make_array_view(q_lens_t)
+                    emit_seq_descs(
+                        base_o_desc,
+                        o_desc_words,
+                        q_prefix,
+                        cutlass.Int32(0),
+                        o_tensor,
+                        n_batch,
+                        o_row_stride,
+                        seq_ord=2,
+                        first_batch=warp - cutlass.Int32(1),
+                        batch_step=descriptor_warps,
+                        compact_origin=cutlass.Int32(q_prefix[0]),
+                    )
+                if cutlass.const_expr(clamp_kv):
+                    kv_prefix = cutlass.make_array_view(kv_lens_t)
+                    t_kv = cutlass.Int32(kv_prefix[n_batch]) - cutlass.Int32(kv_prefix[0])
+                    if warp == nwarps - cutlass.Int32(2):
+                        emit_clamped_desc(base_k_desc, o_desc_words, n_batch + cutlass.Int32(1), t_kv, seq_ord=2)
+                    if warp == nwarps - cutlass.Int32(1):
+                        emit_clamped_desc(base_v_desc, o_desc_words, n_batch + cutlass.Int32(2), t_kv, seq_ord=2)
+                nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+    elif (n_batch <= cutlass.Int32(1)) & ~fused_meta:
         if nvvm.elect_sync() and tidx < cutlass.Int32(32):
             write_thd_meta(meta, cutlass.make_array_view(q_lens_t), cutlass.make_array_view(kv_lens_t), lens_form, n_batch)
             emit_seq_descs(base_o_desc, o_desc_words, meta, n_batch, o_tensor, n_batch, o_row_stride, seq_ord=2)
@@ -328,10 +394,26 @@ def build_thd_meta_o_descs_kernel(
         warp = cutlass.Int32(tidx) // cutlass.Int32(32)
         lane = cutlass.Int32(tidx) % cutlass.Int32(32)
         nwarps = cutlass.Int32(nthreads) // cutlass.Int32(32)
-        if warp == cutlass.Int32(0):
-            write_thd_prefix_warp(meta, cutlass.make_array_view(q_lens_t), n_batch, n_batch, (lens_form & 1) != 0, lane, store_lengths=False)
-        if warp == cutlass.Int32(1):
-            write_thd_prefix_warp(meta, cutlass.make_array_view(kv_lens_t), n_batch, 2 * n_batch + 1, (lens_form & 2) != 0, lane, store_lengths=True)
+        if fused_meta:
+            if warp == cutlass.Int32(0):
+                write_thd_small_batch_meta(
+                    meta,
+                    cutlass.make_array_view(q_lens_t),
+                    cutlass.make_array_view(kv_lens_t),
+                    lens_form,
+                    n_batch,
+                    n_qh,
+                    cga_tile_m,
+                    n_clusters,
+                    lane,
+                    splits,
+                    rank_by_kv,
+                )
+        else:
+            if warp == cutlass.Int32(0):
+                write_thd_prefix_warp(meta, cutlass.make_array_view(q_lens_t), n_batch, n_batch, (lens_form & 1) != 0, lane, store_lengths=False)
+            if warp == cutlass.Int32(1):
+                write_thd_prefix_warp(meta, cutlass.make_array_view(kv_lens_t), n_batch, 2 * n_batch + 1, (lens_form & 2) != 0, lane, store_lengths=True)
         cute.arch.barrier()
         if nvvm.elect_sync():
             emit_seq_descs(base_o_desc, o_desc_words, meta, n_batch, o_tensor, n_batch, o_row_stride, seq_ord=2, first_batch=warp, batch_step=nwarps)
@@ -344,14 +426,15 @@ def build_thd_meta_o_descs_kernel(
                 if warp == nwarps - cutlass.Int32(1):
                     emit_clamped_desc(base_v_desc, o_desc_words, n_batch + cutlass.Int32(2), t_kv, seq_ord=2)
             nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
-    cute.arch.barrier()
-    write_thd_batch_remap(cutlass.make_array_view(meta_t), n_batch, cutlass.Int32(tidx), cutlass.Int32(nthreads), rank_by_kv=rank_by_kv)
-    # Live unit total + claim counter for the persistent scheduler. The host
-    # cannot know Sigma_b ceil(s_b/tile)*QH without a D2H (issue #552), so the
-    # kernel reads its own bound from here. The counter starts at n_clusters:
-    # cluster c takes unit c from its blockIdx, then pulls from the counter.
-    cute.arch.barrier()
-    write_thd_work_prefix(cutlass.make_array_view(meta_t), n_batch, n_qh, cga_tile_m, n_clusters, cutlass.Int32(tidx), splits)
+    if not fused_meta:
+        cute.arch.barrier()
+        write_thd_batch_remap(cutlass.make_array_view(meta_t), n_batch, cutlass.Int32(tidx), cutlass.Int32(nthreads), rank_by_kv=rank_by_kv)
+        # Live unit total + claim counter for the persistent scheduler. The host
+        # cannot know Sigma_b ceil(s_b/tile)*QH without a D2H (issue #552), so the
+        # kernel reads its own bound from here. The counter starts at n_clusters:
+        # cluster c takes unit c from its blockIdx, then pulls from the counter.
+        cute.arch.barrier()
+        write_thd_work_prefix(cutlass.make_array_view(meta_t), n_batch, n_qh, cga_tile_m, n_clusters, cutlass.Int32(tidx), splits)
 
 
 build_thd_meta_o_descs_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
