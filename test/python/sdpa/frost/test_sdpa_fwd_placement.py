@@ -930,3 +930,29 @@ def test_sm100_paged_gqa_prefill_leads_inside_its_box():
     assert place(h_q=32, h_kv=16, shape_overrides=True) == placement.TRAIL
     assert place(device_cc=(10, 3), device_sm_count=160) == placement.TRAIL
     assert place(b=placement.SM100_PAGED_GQA16_MAX_B + 1, max_total_seq_len_q=5 * 864) == placement.TRAIL
+
+
+@pytest.mark.L0
+def test_sm100_fp8_decode_shaped_gqa_leads_inside_the_measured_box():
+    """SM100 per-tensor FP8 decode-shaped GQA (module docstring): 2 <= s_q <= 16 leads at d128 / d256 and d64 with a sink,
+    s_q == 1 only for the d64 sink graph under a window or from 32 KV units; outside the measured box the backend leads."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100_fp8")
+    base = dict(b=32, h_q=16, h_kv=2, s_q=4, s_kv=8192, d_qk=128, d_v=128, causal=True, bottom_right=True, device_cc=(10, 0), device_sm_count=148)
+
+    def place(**over):
+        return placement.place(spec, _facts(**{**base, **_SM107_FP8_QUANT, **over}))
+
+    sink = dict(d_qk=64, d_v=64, h_q=64, h_kv=8, has_sink=True)
+    assert place() == placement.LEAD
+    assert place(has_paged_kv=True, padded=True, page_size=16) == placement.LEAD
+    assert place(d_qk=256, d_v=256, h_q=32, s_q=2) == placement.LEAD
+    assert place(**sink, s_q=16) == placement.LEAD
+    assert place(**sink, s_q=1, causal=False, bottom_right=False, b=4) == placement.LEAD  # 32 KV units
+    assert place(**sink, s_q=1, causal=False, bottom_right=False, b=1, window_left=128) == placement.LEAD
+    assert place(**sink, s_q=1, causal=False, bottom_right=False, b=1) == placement.TRAIL  # 8 units over a full cache: 1.20-1.23x
+    assert place(s_q=1, causal=False, bottom_right=False) == placement.TRAIL  # d128 decode still loses
+    assert place(h_q=2) == placement.TRAIL  # MHA not measured
+    assert place(d_qk=64, d_v=64, h_q=64, h_kv=8) == placement.TRAIL  # d64 without a sink not measured
+    assert place(window_left=128) == placement.TRAIL  # a window off the d64 sink graph not measured
