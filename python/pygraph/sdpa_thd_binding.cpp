@@ -210,6 +210,9 @@ class SdpaThdBinder {
    public:
     explicit SdpaThdBinder(const py::object &spec)
         : fn_(spec.attr("fn")), owner_(spec.attr("owner")), template_(py::tuple(py::object(spec.attr("template")))) {
+        // Metadata-only callers predating ordered execution may omit scratch.
+        // Such a binder can still bind frames, but cannot bypass plan guards.
+        scratch_bytes_   = py::hasattr(spec, "scratch_bytes") ? integer(spec, "scratch_bytes") : -1;
         lse_padded_      = py::cast<bool>(spec.attr("lse_padded"));
         py::object quant = py::none();
         if (py::hasattr(spec, "quant")) quant = spec.attr("quant");
@@ -691,6 +694,60 @@ class SdpaThdBinder {
         return true;
     }
 
+    int64_t
+    ordered_workspace_bytes() const {
+        return scratch_bytes_;
+    }
+
+    py::object
+    execute_ordered(py::handle schema,
+                    py::handle buffers,
+                    py::handle tensor_uids,
+                    const py::dict &auto_bindings,
+                    py::handle workspace,
+                    py::handle override_uids,
+                    py::handle override_shapes,
+                    py::handle override_strides,
+                    const std::vector<int64_t> &indices,
+                    py::object stream) const {
+        auto read = read_ordered_binding(
+            schema, buffers, tensor_uids, auto_bindings, workspace, override_uids, override_shapes, override_strides);
+        // Complete unsupported producer protocols in the existing shared Python
+        // normalizer. Never re-read supported operands or discard observations.
+        if (scratch_bytes_ < 0 || !py::cast<py::list>(read[1]).empty() || read[2].is_none()) return read;
+        const auto extent = py::cast<py::tuple>(read[2]);
+        const int64_t ptr = py::cast<int64_t>(extent[0]);
+        if (scratch_bytes_) {
+            if (!ptr)
+                invalid("requires a " + std::to_string(scratch_bytes_) +
+                        "-byte workspace but execute() received none; allocate graph.get_workspace_size() bytes");
+            const int64_t bytes = py::cast<int64_t>(extent[1]);
+            if (bytes < scratch_bytes_)
+                invalid("needs a " + std::to_string(scratch_bytes_) + "-byte workspace, got " + std::to_string(bytes) +
+                        " bytes (size it with graph.get_workspace_size())");
+            // Preserve the graph plan's observable placement contract on every
+            // call, independently of the schema's immutable geometry cache.
+            auto device  = py::getattr(workspace, "__dlpack_device__", py::none());
+            bool matches = true;
+            if (!device.is_none()) {
+                matches = py::tuple(device()).equal(py::make_tuple(2, device_));
+            } else {
+                auto observed = py::steal<py::object>(PyObject_GetAttrString(workspace.ptr(), "device"));
+                if (observed.is_valid()) {
+                    matches = py::getattr(observed, "type", py::none()).equal(py::str("cuda")) &&
+                              py::getattr(observed, "index", py::none()).equal(py::int_(device_));
+                } else if (PyErr_ExceptionMatches(PyExc_AttributeError)) {
+                    PyErr_Clear();
+                } else {
+                    throw py::python_error();
+                }
+            }
+            if (!matches) invalid("workspace must be on CUDA device " + std::to_string(device_));
+        }
+        execute(read[0], indices, ptr, std::move(stream), py::none(), -1);
+        return py::none();
+    }
+
    private:
     void
     bind_quantized_scalars(const std::vector<NativeOperandView> &facts, BoundLaunch &bound, int64_t workspace) const {
@@ -955,7 +1012,8 @@ class SdpaThdBinder {
     std::array<size_t, 5> quant_indices_;
     size_t table_v_strides_index_ = 0;
     std::unique_ptr<SdpaMxScaleBinding> mx_scales_;
-    int64_t quant_offset_ = 0;
+    int64_t scratch_bytes_ = 0;
+    int64_t quant_offset_  = 0;
     bool quantized_ = false, has_amax_ = false;
     int64_t b_, qh_, kh_, device_, lens_form_, off_o_desc_, total_q_, total_kv_, lse_head_stride_;
     int64_t cga_tile_m_, units_, page_size_, workspace_alignment_;
@@ -974,6 +1032,19 @@ void
 init_sdpa_thd_binding(py::module_ &m) {
     py::class_<SdpaThdBinder>(m, "_SdpaThdBinder")
         .def(py::init<const py::object &>(), py::arg("spec"))
+        .def_prop_ro("ordered_workspace_bytes", &SdpaThdBinder::ordered_workspace_bytes)
+        .def("execute_ordered",
+             &SdpaThdBinder::execute_ordered,
+             py::arg("schema"),
+             py::arg("buffers"),
+             py::arg("tensor_uids"),
+             py::arg("auto_bindings"),
+             py::arg("workspace").none(),
+             py::arg("override_uids").none(),
+             py::arg("override_shapes").none(),
+             py::arg("override_strides").none(),
+             py::arg("indices"),
+             py::arg("stream").none())
         .def_prop_ro_static("supports_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_fp8_physical_origins", [](py::object) { return true; })

@@ -562,21 +562,22 @@ class PreparedThdLaunch:
         self._indices: Optional[List[int]] = None
         self._native_indices = None
 
-    def execute(self, pack, workspace_ptr: int, stream, stream_int: int) -> None:
-        indices = self._indices
-        if indices is None:
-            try:
-                indices = self._indices = [pack.index_of(u) for u in self._uids]
-            except KeyError as exc:
-                raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
-        if self._native_indices is None:
-            roles = dict(zip(self._roles, indices))
-            native_roles = _NATIVE_THD_ROLES + _native_quant_roles(self.spec.quant)
-            if self.spec.origin_specs is not None:
-                from .thd_origins import ROLES
+    def _prepare_indices(self, index_of):
+        try:
+            self._indices = [index_of(u) for u in self._uids]
+        except KeyError as exc:
+            raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
+        roles = dict(zip(self._roles, self._indices))
+        native_roles = _NATIVE_THD_ROLES + _native_quant_roles(self.spec.quant)
+        if self.spec.origin_specs is not None:
+            from .thd_origins import ROLES
 
-                native_roles += ROLES
-            self._native_indices = tuple(roles.get(role, -1) for role in native_roles)
+            native_roles += ROLES
+        self._native_indices = tuple(roles.get(role, -1) for role in native_roles)
+
+    def execute(self, pack, workspace_ptr: int, stream, stream_int: int) -> None:
+        if self._native_indices is None:
+            self._prepare_indices(pack.index_of)
         self.spec.native.execute(pack.native, self._native_indices, workspace_ptr, stream)
 
 

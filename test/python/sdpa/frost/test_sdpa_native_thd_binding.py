@@ -106,6 +106,57 @@ def _reference(s, facts, workspace=0x30000, stream=17):
     return binding_reference._bind_thd_python(s, facts, workspace, stream, stream)
 
 
+def test_ordered_thd_rebinds_storage_and_validates_workspace_before_launch():
+    spec, facts, frames = _fixture()
+    spec.scratch_bytes = 8192
+    spec.native = cudnn._pybind_module._SdpaThdBinder(spec)
+    native = cudnn._pybind_module
+    roles = tuple(facts)
+    uids = tuple(range(1, len(roles) + 1))
+    indices = tuple(roles.index(role) if role in roles else -1 for role in prep._NATIVE_THD_ROLES)
+    layout = native.DeclaredLayout(len(roles))
+    for i, role in enumerate(roles):
+        fact = facts[role]
+        code, bits = prep._buffers.DTYPES[fact.dtype]
+        layout.set(i, fact.shape, fact.strides, fact.span * (bits // 8), code, bits)
+    schema = native._OrderedBindingSchema(uids, layout, False)
+
+    def buffers(current):
+        result = []
+        for role, fact in current.items():
+            shape = fact.shape
+            if len(shape) == 4:
+                b, h, s, d = shape
+                shape = (b * s, h) if role == "lse" else (b * s, h, d)
+            result.append(native.make_operand_buffer(fact.ptr, shape, *prep._buffers.DTYPES[fact.dtype], fact.device[1]))
+        return tuple(result)
+
+    def call(current, workspace, stream=17):
+        return spec.native.execute_ordered(schema, buffers(current), uids, {}, workspace, None, None, None, indices, stream)
+
+    for offset, stream in ((0, 17), (2**33, 23)):
+        current = {role: fact._replace(ptr=fact.ptr + offset) for role, fact in facts.items()}
+        address = 0x30000 + offset
+        ws = native.make_operand_buffer(address, [spec.scratch_bytes], 1, 8, 0)
+        assert call(current, ws, stream) is None
+        assert list(frames.pop()) == _reference(spec, current, address, stream)
+        for bad, message in (
+            (None, "received none"),
+            (native.make_operand_buffer(address, [0], 1, 8, 0), "got 0 bytes"),
+            (native.make_operand_buffer(address, [spec.scratch_bytes - 1], 1, 8, 0), "got 8191 bytes"),
+            (native.make_operand_buffer(address, [spec.scratch_bytes], 1, 8, 1), "workspace must be on CUDA device 0"),
+        ):
+            with pytest.raises(ValueError, match=message):
+                call(current, bad, stream)
+            assert not frames
+        # Unknown-capacity raw pointers use the normal Python completion path;
+        # the native entry must not launch before that path validates the call.
+        result = call(current, address, stream)
+        assert result[2] is None and not frames
+        assert call(current, ws, stream) is None
+        assert list(frames.pop()) == _reference(spec, current, address, stream)
+
+
 def _equal(s, facts, **kwargs):
     actual, reference = _native(s, facts, **kwargs), _reference(s, facts, **kwargs)
     assert (actual is None) == (reference is None)
