@@ -582,3 +582,35 @@ def test_split_chooser_receives_the_row_cost_profile(monkeypatch, row, device_cc
     for kw in seen:
         assert kw.get("min_tiles") == (heur._SM120_SPLIT_KV_MIN_TILES if sm120 else None)
         assert kw.get("combine_floor") == (heur._SM120_SPLIT_KV_COMBINE_FLOOR if sm120 else None)
+
+
+@requires_dsl
+@pytest.mark.parametrize("s_q,window", [(1, None), (1, 128), (4, None), (4, 128)])
+@pytest.mark.parametrize("sink", [True, False])
+def test_rubin_d64_decode_proposes_the_packed_leg(monkeypatch, s_q, window, sink):
+    """A packed or split D64 leg lands on the d128 flavor (the native 64-wide tile is dense-only), so the proposal
+    reads that flavor as mismatch() does; reading the knob-less native d64 dropped every packed plan."""
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    causal = s_q > 1 or window is not None
+    facts = _facts(
+        b=128,
+        h_q=64,
+        h_kv=8,
+        s_q=s_q,
+        s_kv=131072,
+        d_qk=64,
+        d_v=64,
+        causal=causal,
+        bottom_right=causal,
+        window_left=window,
+        has_sink=sink,
+        device_cc=(10, 7),
+        device_sm_count=204,
+    )
+    plans = heur.recommend("A", facts, {spec.name: 20505})
+    assert plans[0].knobs.pack_gqa
+    assert (plans[0].knobs.split_kv or 1) > 1 if not sink else plans[0].knobs.split_kv == 1
+    assert all(mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
