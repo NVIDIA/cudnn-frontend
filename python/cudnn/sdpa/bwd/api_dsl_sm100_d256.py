@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: MIT
 
 """cuDNN-frontend adapter of the ``sdpa_bwd_sm100_d256`` row: the SM100 / SM103 (cc 10.0-10.6) d=256 bf16 / fp16 SDPA
-backward.
+backward, with dense D192x128 served by the same compute tile. Q/K and V/O keep
+their actual widths in tensor maps; the delta and grouped-gradient reductions use
+separate widths. No head-dimension staging or extra launch is added.
 
 It IS the Rubin half chain (:mod:`cudnn.sdpa.bwd.api_dsl_sm107`: ``delta = rowsum(dO . O)`` -> the main kernel with dV
 in TMEM and a kv-major ``[B, H_chunk, S_kv, S_q]`` dS workspace -> dK = dS . Q and dQ = dS^T . K as the
@@ -39,7 +41,7 @@ _SM100_D256_TEMPLATE_TAG = "sdpa_bwd_sm100_d256_main"
 
 
 class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
-    """``sdpa_bwd_sm100_d256``: d_qk = d_v = 256, bf16 / fp16, on the SM100 line (cc 10.0-10.6) over the 2x2-datapath body."""
+    """SM100 half backward: native D256 or dense D192x128 over the D256 compute envelope."""
 
     _FAMILY = _cfg.FAMILY_F16
     _NAME = "sdpa_bwd_sm100_d256"
@@ -52,6 +54,12 @@ class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
     # The half row serves per-batch kv lengths on its standalone surface (its body reads ``seq_kv_lens[b]`` under the
     # padded-mask arm); the 2x2 body's padded arm has not run, so this row keeps the decline (a typed error below).
     _PER_BATCH_KV_LENS = False
+
+    def _check_head_dims(self) -> None:
+        if (self.head_dim_qk, self.head_dim_v) == (192, 128):
+            self._value_error_if(self.thd, f"{self._NAME}: D192x128 backward currently requires dense BSHD storage")
+            return
+        super()._check_head_dims()
 
     def _allow_head_subgroups(self) -> bool:
         """The dense BF16 chain folds global dK/dV partials after all head chunks.
@@ -78,7 +86,11 @@ class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
         plan = super()._family_scratch_shapes(kv_rows, gqa)
         if self._chunk_partials_enabled():
             return [
-                (name, (self._b_chunk, kv_rows, self._qh_chunk, self.head_dim_qk), dtype) if name in ("dv_part", "dk_part") else (name, shape, dtype)
+                (
+                    (name, (self._b_chunk, kv_rows, self._qh_chunk, self.head_dim_v if name == "dv_part" else self.head_dim_qk), dtype)
+                    if name in ("dv_part", "dk_part")
+                    else (name, shape, dtype)
+                )
                 for name, shape, dtype in plan
             ]
         return plan
