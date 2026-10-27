@@ -325,6 +325,9 @@ _thd_tma_offsets = _sdpa_h.thd_tma_offsets
 from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_descs_kernel as _build_thd_meta_o_descs_kernel, TENSOR_MAP_QWORDS, THD_SETUP_THREADS
 from cudnn.sdpa.fwd.kernels.thd_origins import build_thd_origins, origin_tensors, origin_tma_slice
 from cudnn.sdpa.fwd.kernels._thd_split_host import compile_host as _compile_thd_split_host
+
+# prepared._positional_order reads this export to bind the compiled split host.
+from cudnn.sdpa.fwd.kernels._thd_split_host import host_independent_kv as _host_thd_split  # noqa: F401
 from cudnn.frost.tile_dsl.thd import exit_if_dead_thd_cluster, thd_port_origin
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
