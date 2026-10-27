@@ -133,7 +133,7 @@ Grid: NATURAL ``(ceil(SKV / KV_BLOCK_ROWS) * 2, QH_CHUNK, B_CHUNK)``, cluster (2
 """
 
 from functools import lru_cache
-from typing import Callable, NamedTuple, Optional, Tuple
+from typing import Callable, NamedTuple, Optional
 
 import cuda.bindings.driver as _cuda_driver  # noqa: F401
 import cutlass
