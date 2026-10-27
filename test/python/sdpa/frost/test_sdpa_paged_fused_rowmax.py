@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The shared paged D128 body retains the build architecture's row-max instruction."""
+"""Paged D128 retains the architecture-specific route and row-max instruction."""
 
 import inspect
 import math
@@ -82,9 +82,15 @@ def test_paged_rowmax_architecture_replay(dtype, packed):
     graph.build_plans()
     api = inspect.getclosurevars(graph._compiled_plans[graph._plan_index]._compiled.default_stream).nonlocals["api"]
     route = api._k_mod.__file__
-    assert route.endswith("sm100/prefill_d128_f16.py"), route
     assert api._k_mod.CFG.PAGED_KV and api._k_mod.CFG.THD_VARLEN
-    assert bool(api._k_mod.FUSED_LDTM_STAT) == (cc in ((10, 3), (10, 7)))
+    if cc == (10, 7):
+        assert route.endswith("sm107/prefill_d128_f16.py"), route
+        native_source = inspect.getsource(api._k_mod)
+        assert "tmem_load_max_reduction_tile(" in native_source
+        assert "_tmem_load_max_reduction(" in native_source
+    else:
+        assert route.endswith("sm100/prefill_d128_f16.py"), route
+        assert bool(api._k_mod.FUSED_LDTM_STAT) == (cc == (10, 3))
     pack = {qn: q, kn: k, vn: v, on: o, sn: lse, tn: table, qln: qlens, kln: klens, qon: qo, son: so}
     workspace = torch.empty(max(1, graph.get_workspace_size()), device="cuda", dtype=torch.uint8)
 
