@@ -778,3 +778,54 @@ def test_physical_paged_split_origins_bind_independent_frames(layout, splits):
     s.split_workspace = s.split_workspace._replace(off_o=s.off_o_desc + (s.b + 3) * 128)
     with pytest.raises(ValueError, match="overlap.*physical-origin"):
         cudnn._pybind_module._SdpaThdBinder(s)
+
+
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("layout", [None, "NH", "HN"])
+@pytest.mark.parametrize("splits", [2, 5])
+def test_native_d576_thd_split_frames(paged, layout, splits):
+    """Asymmetric partial widths, origins and independent tables survive rebinding."""
+    from cudnn.sdpa.fwd.thd_origins import ROLES
+
+    s, facts, _ = _paged_fixture(hnd=True, layout=layout, v_hnd=False) if paged else _fixture(layout=layout)
+    s.d_qk, s.d_v, s.cga_tile_m = 576, 512, 128
+    for role, dim in (("q", 576), ("k", 576), ("v", 512), ("o", 512)):
+        h, _, ts, hs, _, span = s.decl[role]
+        s.decl[role] = (h, dim, ts * dim // 128, hs * dim // 128, 1, span * dim // 128)
+        f = facts[role]
+        facts[role] = f._replace(shape=(*f.shape[:-1], dim), strides=tuple(x * dim // 128 for x in f.strides[:-1]) + (1,), span=f.span * dim // 128)
+    s.order += ["lse_partial_ptr", "partial_o_strides"] + (["table_v_strides"] if "table_v_strides" not in s.order else [])
+    s.index = {name: i for i, name in enumerate(s.order)}
+    s.template += [None] * (len(s.order) - len(s.template))
+    capacity, off_o = 16, 8192
+    off_lse = off_o + splits * capacity * s.qh * s.d_v * 4
+    s.split_workspace = prep.ThdSplitWorkspace(splits, capacity, off_o, off_lse)
+    s.scratch_bytes = off_lse + splits * capacity * s.qh * 4
+    s.origin_specs = tuple(
+        (
+            None
+            if (paged and i in (1, 2)) or (i == 4 and layout is None)
+            else (i, 1, s.decl[role][2] if i < 4 else (1 if layout == "HN" else s.qh), 64 if i % 2 == 0 else 32)
+        )
+        for i, role in enumerate(("q", "k", "v", "o", "stats"))
+    )
+    for i, spec in enumerate(s.origin_specs):
+        if spec is not None:
+            facts[ROLES[i]] = prep.BufferFacts(0x500000 + i * 0x1000, f"int{spec[3]}", (2, 0), 5, (5,), (1,))
+    roles = prep._NATIVE_THD_ROLES + ROLES
+    indices = tuple(range(len(roles)))
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    for shift, step in ((0, 2), (0x1000000, 3)):
+        current = {name: fact._replace(ptr=fact.ptr + shift) for name, fact in facts.items()}
+        if paged:
+            table = current["block_table_v"]
+            current["block_table_v"] = table._replace(shape=(4, 1, 4, 1), strides=(4 * step + 5, 1, step, 1), span=3 * (4 * step + 5) + 3 * step + 1)
+        frame = s.native.bind(prep._native_pack_from_facts(current, roles), indices, 0x4000000, 17)
+        assert list(frame) == binding_reference._bind_thd_python(s, current, 0x4000000, 17, 17)
+        assert frame[s.index["partial_o_strides"]] == (capacity * s.qh * 512, s.qh * 512, 512)
+        assert frame[s.index["o_partial_ptr"]] == 0x4000000 + off_o
+        if paged:
+            assert frame[s.index["table_v_strides"]] == (4 * step + 5, step)
+    s.split_workspace = s.split_workspace._replace(off_o=s.off_o_desc + (s.b + 3) * 128)
+    with pytest.raises(ValueError, match="overlap.*physical-origin"):
+        cudnn._pybind_module._SdpaThdBinder(s)

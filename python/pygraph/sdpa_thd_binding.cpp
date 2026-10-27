@@ -286,9 +286,10 @@ class SdpaThdBinder {
             const bool d128_split =
                 cga_tile_m_ == 128 && split_dv == 128 && (split_dq == 128 || (!paged_ && split_dq == 192));
             const bool d256_split = cga_tile_m_ == 256 && split_dq == 256 && split_dv == 256;
-            if ((has_sink_ && !(paged_ && d128_split && split_dq == 128)) || splits_ <= 1 || split_capacity_ <= 0 ||
-                split_capacity_ > INT32_MAX || off_partial_o_ < 0 || off_partial_lse_ < 0 || off_partial_o_ % 16 ||
-                off_partial_lse_ % 16 || !(d64_split || d128_split || d256_split))
+            const bool d576_split = cga_tile_m_ == 128 && split_dq == 576 && split_dv == 512;
+            if ((has_sink_ && !(d576_split || (paged_ && d128_split && split_dq == 128))) || splits_ <= 1 ||
+                split_capacity_ <= 0 || split_capacity_ > INT32_MAX || off_partial_o_ < 0 || off_partial_lse_ < 0 ||
+                off_partial_o_ % 16 || off_partial_lse_ % 16 || !(d64_split || d128_split || d256_split || d576_split))
                 invalid("invalid prepared packed split geometry");
             const int64_t partial_rows = multiply(multiply(splits_, split_capacity_), qh_);
             if (off_partial_o_ < add(off_o_desc_, multiply(add(b_, 3), 128)) ||
@@ -338,14 +339,19 @@ class SdpaThdBinder {
         if (py::hasattr(spec, "origin_specs") && !spec.attr("origin_specs").is_none()) {
             const bool paged_d128_split = paged_ && cga_tile_m_ == 128 && integer(spec, "d_qk") == 128 &&
                                           integer(spec, "d_v") == 128 && splits_ > 1;
-            if ((quantized_ && (!paged_ || mx_scales_)) || (splits_ != 1 && !paged_d128_split) || has_gate_)
+            const bool d576_split = !quantized_ && cga_tile_m_ == 128 && integer(spec, "d_qk") == 576 &&
+                                    integer(spec, "d_v") == 512 && splits_ > 1;
+            if ((quantized_ && (!paged_ || mx_scales_)) || (splits_ != 1 && !paged_d128_split && !d576_split) ||
+                has_gate_)
                 invalid(
-                    "physical THD origins require ungated half unsplit/paged D128 split or unsplit per-tensor FP8 "
+                    "physical THD origins require ungated half unsplit/paged D128 split/native D576 split or unsplit "
+                    "per-tensor FP8 "
                     "paged plans");
             auto specs = py::cast<py::tuple>(spec.attr("origin_specs"));
             if (specs.size() != 5) invalid("physical THD origins require five ports");
-            if (paged_d128_split) {
-                if (specs[static_cast<size_t>(Q)].is_none()) invalid("physical paged split plans require Q offsets");
+            if (paged_d128_split || d576_split) {
+                if (paged_d128_split && specs[static_cast<size_t>(Q)].is_none())
+                    invalid("physical paged split plans require Q offsets");
                 // Origin maps/rows precede compact partials in the same caller workspace.
                 const int64_t origin_bytes =
                     add(multiply(add(b_, 1), 512), multiply(add(multiply(b_, 40), 127) / 128, 128));
@@ -979,6 +985,7 @@ init_sdpa_thd_binding(py::module_ &m) {
         .def(py::init<const py::object &>(), py::arg("spec"))
         .def_prop_ro_static("supports_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_native_d576", [](py::object) { return true; })
+        .def_prop_ro_static("supports_native_d576_packed_split", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_fp8_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_split_physical_origins", [](py::object) { return true; })

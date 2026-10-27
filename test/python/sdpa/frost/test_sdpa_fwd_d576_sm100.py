@@ -274,8 +274,8 @@ def test_native_d576_long_cache_split_replay():
 @requires_dsl
 @requires_pre_rubin_blackwell
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
-@pytest.mark.parametrize("thd", [False, True])
-def test_native_d576_register_split_sass(tmp_path, arch, monkeypatch, thd):
+@pytest.mark.parametrize("thd,splits", [(False, 4), (True, 1), (True, 5)])
+def test_native_d576_register_split_sass(tmp_path, arch, monkeypatch, thd, splits):
     import os
     import sys
     from frost_test_utils import assert_no_new_spills, run_sass_probe, sass_probe_source
@@ -286,15 +286,19 @@ def test_native_d576_register_split_sass(tmp_path, arch, monkeypatch, thd):
         """
         thd = params_kw["thd"]
         params = TemplateParams(dtype_qkv=2, d_flavor=576, mma_2x2=True,
-            pack_gqa=True, qh_per_kh=12 if thd else 96, split_kv=1 if thd else 4,
+            pack_gqa=True, qh_per_kh=12 if thd else 96, split_kv=params_kw["splits"],
             thd_varlen=thd, seq_q_lens_present=not thd,
             seq_kv_lens_present=True, paged_kv=True, page_size=32,
             window_right=0, bottom_right=True)
         mod = _load_sm100_kernel_module((576, 512), params)
         print("SMEM_TOTAL", mod._SMEM["total"])
         origins = ((0, 1, 24*576, 64), None, None, (3, 1, 24*512, 32), (4, 1, 1, 64)) if thd else None
-        mod.compile(d_qk=576, d_v=512, paged_hnd=False, paged_v_hnd=True,
-            lse_kind="head" if thd else "dense", thd_origin_specs=origins)
+        if thd and params_kw["splits"] > 1:
+            mod.compile_thd_split(paged_hnd=False, paged_v_hnd=True,
+                lse_kind="head", thd_origin_specs=origins)
+        else:
+            mod.compile(d_qk=576, d_v=512, paged_hnd=False, paged_v_hnd=True,
+                lse_kind="head" if thd else "dense", thd_origin_specs=origins)
         """,
         counts={
             "ALLOC_192": ("USETMAXREG.TRY_ALLOC", "0xc0"),
@@ -304,7 +308,7 @@ def test_native_d576_register_split_sass(tmp_path, arch, monkeypatch, thd):
             "STL": ("STL",),
         },
     )
-    result = run_sass_probe(tmp_path, probe_src=probe, arch=arch, params={"thd": thd}, tag="native_d576", timeout=180)
+    result = run_sass_probe(tmp_path, probe_src=probe, arch=arch, params={"thd": thd, "splits": splits}, tag="native_d576", timeout=180)
     assert result.expect["SMEM_TOTAL"] == 224120
     assert result.stats["ALLOC_192"] == result.stats["ALLOC_208"] == 1
     assert result.stats["DEALLOC_40"] == 4
@@ -315,15 +319,18 @@ def test_native_d576_register_split_sass(tmp_path, arch, monkeypatch, thd):
 @requires_dsl
 @requires_pre_rubin_blackwell
 @pytest.mark.parametrize(
-    "dtype,packed,stats,sink,padded_stats",
+    "dtype,packed,stats,sink,padded_stats,splits",
     [
-        (torch.bfloat16, False, True, False, False),
-        (torch.bfloat16, True, True, True, False),
-        (torch.float16, True, False, False, False),
-        (torch.bfloat16, True, True, True, True),
+        (torch.bfloat16, False, True, False, False, 1),
+        (torch.bfloat16, True, True, True, False, 1),
+        (torch.float16, True, False, False, False, 1),
+        (torch.bfloat16, True, True, True, True, 1),
+        pytest.param(torch.bfloat16, False, True, False, False, 2, id="split2_unpacked"),
+        pytest.param(torch.bfloat16, True, True, True, False, 5, id="split5_partial_pack_sink"),
+        pytest.param(torch.float16, True, False, False, False, 9, id="split9_fp16_no_stats"),
     ],
 )
-def test_native_d576_compact_thd_rebind_and_capture(dtype, packed, stats, sink, padded_stats):
+def test_native_d576_compact_thd_rebind_and_capture(dtype, packed, stats, sink, padded_stats, splits):
     """Standalone compact THD uses current device prefixes without caller offsets."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
@@ -356,7 +363,8 @@ def test_native_d576_compact_thd_rebind_and_capture(dtype, packed, stats, sink, 
         scale_softmax=scale,
         pack_gqa=packed,
         cga=2,
-        split_kv=1,
+        split_kv=splits,
+        stats_log2=splits > 1,
     )
     api.check_support()
     api.compile()
@@ -406,7 +414,7 @@ def test_native_d576_compact_thd_rebind_and_capture(dtype, packed, stats, sink, 
                 torch.testing.assert_close(o[off_q : off_q + nq].double(), ref, atol=0.005, rtol=0.005)
                 if stats:
                     actual_lse = lse[b, :nq] if padded_stats else lse.flatten(0, 1)[off_q : off_q + nq]
-                    torch.testing.assert_close(actual_lse.double(), score.logsumexp(-1).T, atol=0.003, rtol=0)
+                    torch.testing.assert_close(actual_lse.double(), score.logsumexp(-1).T * (math.log2(math.e) if splits > 1 else 1), atol=0.003, rtol=0)
             if padded_stats:
                 assert torch.isneginf(lse[b, nq:]).all()
             off_q += nq

@@ -324,6 +324,7 @@ _thd_tma_offsets = _sdpa_h.thd_tma_offsets
 
 from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_descs_kernel as _build_thd_meta_o_descs_kernel, TENSOR_MAP_QWORDS, THD_SETUP_THREADS
 from cudnn.sdpa.fwd.kernels.thd_origins import build_thd_origins, origin_tensors, origin_tma_slice
+from cudnn.sdpa.fwd.kernels._thd_split_host import host_independent_kv as _host_thd_split, compile_host as _compile_thd_split_host
 from cudnn.frost.tile_dsl.thd import exit_if_dead_thd_cluster, thd_port_origin
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
@@ -1903,7 +1904,7 @@ def _correction_warp_group(
             beta = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(0.0).ir_value(), beta.ir_value()))
             lse = cutlass.Float32(arith.select(row_trim.ir_value(), neg_inf_trim.ir_value(), lse.ir_value()))
             row_dead = row_dead | row_trim
-        if cutlass.const_expr(CFG.STATS_LOG2):
+        if cutlass.const_expr(CFG.STATS_LOG2 and SPLIT_KV == 1):
             lse = lse * cutlass.Float32(1.4426950408889634)
 
         parity_last_rt = cutlass.Int32(0)
@@ -1932,7 +1933,15 @@ def _correction_warp_group(
             _op32 = cutlass.make_array_view(o_partial_f32)
             _d_v32 = cutlass.const_expr(o_partial_f32.shape[3])
             _o_b32 = _partial_batch(batch_idx, split_idx, n_batch)
+            _o_row32 = q_row_global
             _valid32 = q_row_global < seqlen_q
+            if cutlass.const_expr(CFG.THD_VARLEN):
+                _partial_cu = cutlass.make_array_view(seq_kv_lens_tensor)
+                _partial_q_base = cutlass.Int32(_partial_cu[n_batch + batch_idx])
+                _partial_q_len = cutlass.Int32(_partial_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _partial_q_base
+                _o_b32 = split_idx
+                _o_row32 = _partial_q_base + q_row_global
+                _valid32 = q_row_global < _partial_q_len
             for b in cutlass.range_constexpr(N_O_EPI_BLOCKS):
                 o_fp32 = cutlass.Vector.from_elements(tuple(cutlass.Float32(0.0) for _ in range(O_EPI_BLOCK_COLS)), cutlass.Float32)
                 if tile_live:
@@ -1942,11 +1951,12 @@ def _correction_warp_group(
                 o_scaled = o_fp32 * beta
                 col_base = half_h * cutlass.Int32(LAYOUT.O_COLS) + cutlass.Int32(b * O_EPI_BLOCK_COLS)
                 if _valid32:
-                    _row_out = _op32[_o_b32, q_row_global, row_head_idx, :]
                     for _j in cutlass.range_constexpr(O_EPI_BLOCK_COLS):
                         col = col_base + cutlass.Int32(_j)
                         if col < cutlass.Int32(_d_v32):
-                            _row_out[col] = cutlass.Float32(arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), o_scaled[_j].ir_value()))
+                            _op32[_o_b32, _o_row32, row_head_idx, col] = cutlass.Float32(
+                                arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), o_scaled[_j].ir_value())
+                            )
                 if cutlass.const_expr(b % 2 == 1):
                     nvvm.fence_proxy("async.shared", space="cta")
                     bars.mb_o_full[half_h * cutlass.Int32(N_O_CHUNKS // 2) + cutlass.Int32(b // 2)].arrive()
@@ -2005,7 +2015,9 @@ def _correction_warp_group(
                 if q_row_global < _s_q_b:
                     _stats_base = thd_port_origin(thd_origins, 4, batch_idx, _cu_q_b) if cutlass.const_expr(thd_origins is not None) else _cu_q_b
                     lse_arr = cutlass.make_array_view(lse_tensor)
-                    if cutlass.const_expr(len(lse_tensor.shape) == 2):
+                    if cutlass.const_expr(SPLIT_KV > 1):
+                        lse_arr[split_idx, row_head_idx, _cu_q_b + q_row_global] = lse
+                    elif cutlass.const_expr(len(lse_tensor.shape) == 2):
                         lse_arr[_stats_base + q_row_global, row_head_idx] = lse  # token-major packed (T, H)
                     else:
                         if cutlass.const_expr(len(lse_tensor.shape) == 4):
@@ -2170,6 +2182,9 @@ def _host(
         # the persistent scheduler's live-unit total / claim counter.  Units are CGA_TILE_M rows tall.
         if cutlass.const_expr(thd_origin_ptrs is not None):
             o_desc_words, origins, offsets = origin_tensors(o_desc_ptr, thd_origin_ptrs, cutlass.Int32(B))
+            # The split body reads physical inputs but writes compact scratch.
+            # Caller O/Stats origins belong exclusively to the final combine.
+            setup_specs = thd_origin_specs[:3] + (None, None) if cutlass.const_expr(SPLIT_KV > 1) else thd_origin_specs
             build_thd_origins(
                 (q_tensor, k_tensor, v_tensor, o_tensor),
                 tma_q_desc,
@@ -2179,7 +2194,7 @@ def _host(
                 o_desc_words,
                 origins,
                 offsets,
-                thd_origin_specs,
+                setup_specs,
                 seq_kv_lens_tensor,
                 thd_q_lens_tensor,
                 thd_kv_lens_tensor,
@@ -2189,6 +2204,7 @@ def _host(
                 cutlass.Int32(CGA_TILE_M // HEADS_PER_TILE),
                 n_thd_units,
                 paged=PAGED_KV,
+                splits=SPLIT_KV,
             ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         else:
             _build_thd_meta_o_descs_kernel(
@@ -2204,8 +2220,10 @@ def _host(
                 cutlass.Int32(QH // HEADS_PER_TILE),
                 cutlass.Int32(B),
                 cutlass.Int64(o_tensor.stride[1]),
-                cutlass.Int32(CGA_TILE_M),
+                cutlass.Int32(CGA_TILE_M // HEADS_PER_TILE),
                 n_thd_units,  # persistent cluster count; also seeds the claim counter
+                clamp_kv=not PAGED_KV,
+                splits=SPLIT_KV,
             ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:
@@ -2250,6 +2268,35 @@ def _host(
 
 EXPLICIT_ABI = True  # pointer/int host entry; the adapter builds the argument list itself
 LSE_KINDS = ("dense", "token", "head", "padded")
+
+
+@lru_cache(maxsize=None)
+def compile_thd_split(*, has_lse=True, lse_kind="head", paged_hnd=False, paged_v_hnd=None, has_sink=False, thd_origin_specs=None) -> Callable:
+    """Native D576 packed partials and final physical-output combine."""
+    if not (CFG.THD_VARLEN and SPLIT_KV > 1 and CFG.TILE_K == 576 and CFG.TILE_O == 512):
+        raise ValueError("native D576 packed split requires THD and split_kv > 1")
+    if thd_origin_specs is None:
+        thd_origin_specs = (None,) * 5
+    if len(thd_origin_specs) != 5:
+        raise ValueError("physical THD origins require five port declarations")
+    if paged_v_hnd is None:
+        paged_v_hnd = paged_hnd
+    if (paged_hnd or paged_v_hnd) and not PAGED_KV:
+        raise ValueError("paged_hnd is a paged-KV specialization")
+    cache_key = _template_key(globals(), locals(), "compile_thd_split")
+    return _compile_thd_split_host(
+        _host,
+        CFG,
+        STORAGE_DTYPE,
+        cache_key,
+        has_lse=has_lse,
+        lse_kind=lse_kind,
+        paged_hnd=paged_hnd,
+        paged_v_hnd=paged_v_hnd,
+        ragged_q_slots=False,
+        has_sink=has_sink,
+        thd_origin_specs=thd_origin_specs,
+    )
 
 
 @lru_cache(maxsize=None)

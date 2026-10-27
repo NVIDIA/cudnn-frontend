@@ -12,7 +12,7 @@ pytestmark = [requires_dsl]
 
 
 @pytest.mark.parametrize(
-    "dim,dtype_name,stats_layout,total_hints,pack_gqa",
+    "dim,dtype_name,stats_layout,total_hints,pack_gqa,splits",
     [
         pytest.param(
             dim,
@@ -20,6 +20,7 @@ pytestmark = [requires_dsl]
             stats,
             totals,
             False,
+            1,
             marks=pytest.mark.L0 if dtype == "bfloat16" and stats == "token" and totals else pytest.mark.L1,
         )
         for dim in (128, 256)
@@ -28,12 +29,15 @@ pytestmark = [requires_dsl]
         for totals in (False, True)
     ]
     + [
-        pytest.param((576, 512), "bfloat16", "token", True, False, marks=pytest.mark.L0, id="d576_unpacked"),
-        pytest.param((576, 512), "bfloat16", "head", True, True, marks=pytest.mark.L0, id="d576_partial_pack"),
-        pytest.param((576, 512), "float16", "token", False, True, marks=pytest.mark.L1, id="d576_fp16_partial_pack"),
+        pytest.param((576, 512), "bfloat16", "token", True, False, 1, marks=pytest.mark.L0, id="d576_unpacked"),
+        pytest.param((576, 512), "bfloat16", "head", True, True, 1, marks=pytest.mark.L0, id="d576_partial_pack"),
+        pytest.param((576, 512), "float16", "token", False, True, 1, marks=pytest.mark.L1, id="d576_fp16_partial_pack"),
+        pytest.param((576, 512), "bfloat16", "token", True, False, 2, marks=pytest.mark.L0, id="d576_split2_unpacked"),
+        pytest.param((576, 512), "bfloat16", "head", True, True, 5, marks=pytest.mark.L0, id="d576_split5_partial_pack"),
+        pytest.param((576, 512), "float16", "token", False, True, 9, marks=pytest.mark.L1, id="d576_split9_fp16_partial_pack"),
     ],
 )
-def test_independent_thd_origins_rebind_and_capture(dim, dtype_name, stats_layout, total_hints, pack_gqa):
+def test_independent_thd_origins_rebind_and_capture(dim, dtype_name, stats_layout, total_hints, pack_gqa, splits):
     import cudnn
     import torch
 
@@ -131,7 +135,7 @@ def test_independent_thd_origins_rebind_and_capture(dim, dtype_name, stats_layou
 
         graph.create_execution_plan(
             family_for(graph).offered_ids()["sdpa_fwd_prefill_sm100"],
-            {cudnn.knob_type.TILE_CGA_M: 2, cudnn.knob_type.PACK_GQA: int(pack_gqa), cudnn.knob_type.SPLIT_KV: 1},
+            {cudnn.knob_type.TILE_CGA_M: 2, cudnn.knob_type.PACK_GQA: int(pack_gqa), cudnn.knob_type.SPLIT_KV: splits},
         )
         graph.select_plan(0)
     else:

@@ -3422,3 +3422,81 @@ def test_native_d576_dense_padding_split_admission(shape, admitted):
     caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
     reason = engines.mismatch(caps, facts, engines.SdpaFwdKnobs(cga=2, split_kv=4, pack_gqa=False))
     assert (reason is None) == admitted, reason
+
+
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("splits", [2, 5])
+def test_native_d576_thd_split_admission(monkeypatch, cc, packed, splits):
+    from dataclasses import replace
+
+    facts = replace(_facts(_mk_eligible_graph()), device_cc=cc, d_qk=576, d_v=512, thd=True, stats_t=None)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    reason = engines.mismatch(caps, facts, engines.SdpaFwdKnobs(cga=2, split_kv=splits, pack_gqa=packed))
+    assert reason is None, reason
+
+    from cudnn.api_base import TensorDesc
+    from cudnn.sdpa.fwd import api_dsl, config_sm100
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: cc)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(api_dsl, "_device_sm_count", lambda device: 148)
+
+    def desc(heads, tokens, width):
+        return TensorDesc(torch.bfloat16, (3, heads, tokens, width), (tokens * heads * width, width, heads * width, 1), (3, 1, 2, 0), "cuda:0")
+
+    api = api_dsl.SdpaFwdDslSm100(
+        desc(24, 256, 576),
+        desc(2, 384, 576),
+        desc(2, 384, 512),
+        desc(24, 256, 512),
+        thd=True,
+        cga=2,
+        split_kv=splits,
+        pack_gqa=packed,
+        seq_kv_lens_present=True,
+        cu_seq_q_lens=True,
+        cu_seq_kv_lens=True,
+    )
+    assert api.check_support()
+    cfg = config_sm100.make_cfg_d512_2x2(api.template_params(), cga_m=2)[0]
+    assert cfg.THD_VARLEN and cfg.SPLIT_KV == splits
+    assert cfg.TILE_K == 576 and cfg.TILE_O == 512
+    bounded_override = replace(facts, shape_overrides=True, max_total_seq_len_q=None)
+    assert engines.mismatch(caps, bounded_override, engines.SdpaFwdKnobs(cga=2, split_kv=splits, pack_gqa=packed)) is None
+
+
+def test_native_d576_thd_split_requires_matching_extension(monkeypatch):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    facts = replace(_facts(_mk_eligible_graph()), d_qk=576, d_v=512, thd=True, stats_t=None)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    knobs = engines.SdpaFwdKnobs(cga=2, split_kv=5, pack_gqa=True)
+    assert engines.mismatch(caps, facts, knobs) is None
+    # Preserve every parent extension capability; omit only this new ABI.
+    previous_features = {
+        name: getattr(cudnn._pybind_module._SdpaThdBinder, name)
+        for name in dir(cudnn._pybind_module._SdpaThdBinder)
+        if name.startswith("supports_") and name != "supports_native_d576_packed_split"
+    }
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", SimpleNamespace(**previous_features))
+    assert "native D576x512 THD split requires the matching" in engines.mismatch(caps, facts, knobs)
+    # The unsplit parent remains supported by this older extension.
+    assert engines.mismatch(caps, facts, engines.SdpaFwdKnobs(cga=2, split_kv=1, pack_gqa=True)) is None
+
+
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("sink", [False, True])
+def test_native_d576_thd_split_scope(paged, sink):
+    from dataclasses import replace
+
+    graph = _mk_paged_graph(d=576, d_v=512, sink=sink) if paged else _mk_eligible_graph()
+    facts = replace(_facts(graph), d_qk=576, d_v=512, thd=True, stats_t=None, has_sink=sink)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    knobs = engines.SdpaFwdKnobs(cga=2, split_kv=5, pack_gqa=True)
+    assert engines.mismatch(caps, facts, knobs) is None
+    assert engines.mismatch(caps, facts, replace(knobs, cga=1)) is not None
+    assert engines.mismatch(caps, replace(facts, has_epilogue_gate=True), knobs) is not None
+    assert not engines.thd_split_domain(caps, replace(facts, shape_overrides=True, max_total_seq_len_q=facts.b * facts.s_q + 1))

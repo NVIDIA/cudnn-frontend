@@ -53,6 +53,7 @@ def build_thd_origins(
     clusters: cutlass.Int32,
     paged: cutlass.Constexpr[bool] = False,
     rank_by_kv: cutlass.Constexpr[bool] = False,
+    splits: cutlass.Constexpr[int] = 1,
 ):
     """Lengths control work and clipping; physical offsets control addresses.
 
@@ -112,7 +113,7 @@ def build_thd_origins(
             cutlass.make_array_view(origins)[4, b] = cutlass.Int64(meta[batch + b])
     write_thd_batch_remap(meta, batch, tid, cutlass.Int32(THD_SETUP_THREADS), rank_by_kv=rank_by_kv)
     cute.arch.barrier()
-    write_thd_work_prefix(meta, batch, heads, tile_rows, clusters, tid, 1)
+    write_thd_work_prefix(meta, batch, heads, tile_rows, clusters, tid, splits)
 
 
 build_thd_origins.set_name_prefix("cudnn", remove_cutlass_symbol=True)
