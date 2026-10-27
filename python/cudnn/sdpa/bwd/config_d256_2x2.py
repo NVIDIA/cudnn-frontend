@@ -160,10 +160,12 @@ class CfgBwdD256x2(CfgBwdD256):
     SMEM_CAP: int = SMEM_CAP_BYTES_SM100
     # 0 = the NATURAL MMA order (S(i), dP(i), BMM2(i) per q tile); 1 = the lookahead order (S(i+1) between dP(i) and
     # BMM2(i), the fp8 twin's form).  The body binds its module constant MMA_LOOKAHEAD from this field.  Profile 1
-    # ships NATURAL: measured on B200 (2026-10-01, B=1 H_q=32 H_kv=2 S=8192 bf16, whole backward, clean CUPTI
+    # ships NATURAL at D256: measured on B200 (2026-10-01, B=1 H_q=32 H_kv=2 S=8192 bf16, whole backward, clean CUPTI
     # medians) stage 2 is 3781 us NATURAL vs 4525 us lookahead dense (-16%) and 2020 vs 1974 us causal (+2%); the
     # lookahead's S(i+1) sits in the MMA queue ahead of BMM2(i) and the dV accumulate waits on it every tile.  Profile 2
     # keeps the design's lookahead (unmeasured here: no Rubin board on this box) -- the A/B is the Rubin lane's.
+    # Native D192x128 uses lookahead; its dense path pairs it with two-deep operand rings so S(i+1)'s Q can prefetch
+    # while the current dP/P work proceeds. The THD descriptor-patched pipeline retains compact one-deep operands.
     MMA_LOOKAHEAD: int = 0
     # TMEM columns between sub-block 0's and sub-block 1's regions (profile 2); 0 with one sub-block.
     SUBBLOCK_STRIDE_COLS: int = 0
@@ -736,13 +738,18 @@ def make_cfg_d256_2x2(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
     rows_per_cta = SUB_ROWS * subblocks
     stages_tmem_s = 2 if profile == PROFILE_SM100 else 1
     stages_smem_p = 2 if profile == PROFILE_SM100 else 1
-    stages_q = 1 if profile == PROFILE_SM100 else 2
+    native_d192 = (d_qk, d_v) == (192, 128)
+    prefetch_d192 = native_d192 and not params.thd_varlen
+    # Dense D192 leaves room for the next Q, dO and dO-for-dV operands (208896 B including scaffold, below 227 KiB).
+    # Together with lookahead this overlaps the next S MMA with the current P production; the D256 slabs do not fit it.
+    stages_q = 2 if prefetch_d192 or profile != PROFILE_SM100 else 1
+    stages_do = 2 if prefetch_d192 else 1
     subblock_wgs = 2 // subblocks
     cols_per_lane = 64 // subblock_wgs
     soft_lanes = 2 * 4 * 32
     # Register split per profile, 8 x softmax + 4 x service = 2016 = reg_entry_pool(12).
-    #   Profile 1 (32 q columns per compute lane): 176 / 152.  NOT the 4x1 body's 224 / 56: the Q / dO / dO_dv rings are
-    #   1-deep, so their slab addresses are STATIC and ptxas hoists every k-step descriptor of the three B operands
+    #   Profile 1 (32 q columns per compute lane): 176 / 152.  NOT the 4x1 body's 224 / 56: at D256 the Q / dO / dO_dv
+    #   rings are 1-deep, so their slab addresses are STATIC and ptxas hoists every k-step descriptor of the three B operands
     #   (16 + 16 + 8 64-bit values; desc_opaque's mov is transparent to ptxas) into the MMA warp's preamble as kernel
     #   invariants -- at 56 registers it parked them in local memory (70 STL / 79 LDL sm_100a 2026-10-01; 74 / 81 at
     #   sm_107a on the board's ptxas).  The 32-column compute lanes need ~135 registers (max R134 on the causal build).
@@ -780,8 +787,8 @@ def make_cfg_d256_2x2(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
         IDESC_K_DIM=0,
         K_SPLIT_UTCCP=0,
         STAGES_Q=stages_q,
-        STAGES_dO=1,
-        STAGES_dO_DV=1,
+        STAGES_dO=stages_do,
+        STAGES_dO_DV=stages_do,
         STAGES_KV=1,
         STAGES_TMEM_S=stages_tmem_s,
         STAGES_TMEM_P=0,
@@ -839,8 +846,8 @@ def make_cfg_d256_2x2(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
         L_CNT=(soft_lanes // subblocks) * 2,
         TMEM_ALLOC_COLS=TMEM_ALLOC_COLS,
         SMEM_CAP=SMEM_CAP_BYTES_SM100 if profile == PROFILE_SM100 else SMEM_CAP_BYTES_SM107,
-        # Profile 1 ships the NATURAL order (measured, see the field); profile 2 keeps the design's lookahead until the Rubin A/B.
-        MMA_LOOKAHEAD=0 if profile == PROFILE_SM100 else 1,
+        # Keep D256's measured order; native D192 uses lookahead with layout-specific operand rings.
+        MMA_LOOKAHEAD=int(native_d192 or profile != PROFILE_SM100),
         SUBBLOCK_STRIDE_COLS=(2 * stages_tmem_s * _S_COLS + d_v // 2) if subblocks > 1 else 0,
     )
     _validate_cfg_d256_2x2(cfg)
