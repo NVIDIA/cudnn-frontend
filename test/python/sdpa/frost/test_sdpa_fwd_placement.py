@@ -204,6 +204,8 @@ def test_paged_d576_mla_decode_leads_past_its_work_floor():
     assert placement.place(spec, _facts(s_q=1, **lead, **mla)) == placement.LEAD
     assert placement.place(spec, _facts(s_q=1, **lead, **{**mla, "has_paged_kv": False, "page_size": 0})) == placement.TRAIL
     assert placement.place(spec, _facts(s_q=1, dtype=cudnn.data_type.HALF, **lead, **mla)) == placement.TRAIL
+    assert placement.place(spec, _facts(s_q=1, window_left=128, **lead, **mla)) == placement.TRAIL
+    assert placement.place(spec, _facts(s_q=1, has_sink=True, **lead, **mla)) == placement.TRAIL
     assert placement.place(spec, _facts(s_q=1, h_q=16, b=1, s_kv=32768, **mla)) == placement.TRAIL  # 2**19
     assert placement.place(spec, _facts(s_q=4, h_q=16, b=1, s_kv=2048, **mla)) == placement.LEAD
 

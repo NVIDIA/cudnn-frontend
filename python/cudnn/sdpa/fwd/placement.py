@@ -899,9 +899,9 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
         units = facts.b * facts.h_kv
         if flavor == (576, 512):
             # Paged bf16 D576x512 MLA decode (2026-10-27, full-power B200, frozen 64-cell s_q == 1 grid: h_q 16-128, b 1-128,
-            # S_kv 2k-128k, page 64): FROST's split decode leads past a total-work floor; dense K/V was not measured.
-            paged_bf16 = facts.has_paged_kv and facts.dtype == cudnn.data_type.BFLOAT16
-            return LEAD if paged_bf16 and facts.h_q * facts.b * facts.s_kv >= SQ1_D576_MIN_WORK else TRAIL
+            # S_kv 2k-128k, page 64): FROST's split decode leads past a total-work floor; dense K/V, windows and sinks were not measured.
+            measured = facts.has_paged_kv and facts.dtype == cudnn.data_type.BFLOAT16 and facts.window_left is None and not facts.has_sink
+            return LEAD if measured and facts.h_q * facts.b * facts.s_kv >= SQ1_D576_MIN_WORK else TRAIL
         if facts.has_paged_kv and flavor == (512, 512):
             # Paged d512 decode runs the role-split PREFILL tile (no d512 decode tile yet) and measures
             # behind the backend's paged decode engine (module docstring: 77.8 vs 65.1 us
