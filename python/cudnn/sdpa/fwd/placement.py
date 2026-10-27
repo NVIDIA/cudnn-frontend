@@ -369,6 +369,9 @@ SQ1_D512_MIN_KV_TOKENS_WIDE = 2**14  # h_q >= 32: 0.57-0.94 at the bound, 1.02-1
 SQ1_D512_MIN_KV_TOKENS_NARROW = 2**15  # h_q < 32: 0.56-0.92 at the bound, 1.09-1.13 below
 SQ1_D512_WIDE_Q_HEADS = 32
 SQ1_D512_UNSPLIT_MIN_UNITS = 16  # s_q == 1, d512, S_kv off the KV tile (no split): 24 units 0.10-0.66, 12 units 0.96, 2-3 units 1.01-2.17
+SQ1_D576_MIN_WORK = (
+    2**20
+)  # s_q == 1, paged bf16 D576x512 MLA: h_q * b * S_kv from which FROST wins on every measured cell (0.08-0.74); at or below 2**19 the backend's decode engine is ahead (1.11-3.08, one 0.72)
 D512_PREFILL_MIN_Q_ROWS = 4096  # d512 prefill below a 2k cache: b * h_q * s_q from which FROST wins (0.39-0.88); 2048 rows lose 1.14-1.24
 # chunked prefill (a chunk attending to a longer cache), by launch size in 128-row Q tiles (b * h_q * ceil(s_q / 128)):
 CHUNKED_MAX_Q_TILES = 128  # <= 128 tiles wins from a 4k cache (0.30-0.89, d64-d256); 256 tiles loses 1.02-1.07 for d64/d128
@@ -894,6 +897,11 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
     flavor = _selected_d_shape(caps, facts)
     if dense and facts.s_q == 1:
         units = facts.b * facts.h_kv
+        if flavor == (576, 512):
+            # Paged bf16 D576x512 MLA decode (2026-10-27, full-power B200, frozen 64-cell s_q == 1 grid: h_q 16-128, b 1-128,
+            # S_kv 2k-128k, page 64): FROST's split decode leads past a total-work floor; dense K/V was not measured.
+            paged_bf16 = facts.has_paged_kv and facts.dtype == cudnn.data_type.BFLOAT16
+            return LEAD if paged_bf16 and facts.h_q * facts.b * facts.s_kv >= SQ1_D576_MIN_WORK else TRAIL
         if facts.has_paged_kv and flavor == (512, 512):
             # Paged d512 decode runs the role-split PREFILL tile (no d512 decode tile yet) and measures
             # behind the backend's paged decode engine (module docstring: 77.8 vs 65.1 us
