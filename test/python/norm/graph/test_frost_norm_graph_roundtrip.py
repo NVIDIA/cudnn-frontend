@@ -174,25 +174,12 @@ if __name__ == "__main__":
     main()
 
 
-def _norm_rows_offered_here():
-    """Whether a forward and a backward norm row on offer (opt-in rows only under
-    CUDNN_FRONTEND_ENABLE_FROST_ENGINES) list the current device's cc."""
-    from cudnn.engines import manifest as mf
-    from cudnn.norm.bprop import engines as be
-    from cudnn.norm.fprop import engines as fe
-
-    cc = torch.cuda.get_device_capability()
-    offered = set()
-    for fam in mf.MANIFEST:
-        if fam.name.startswith("frost_norm"):
-            offered |= set(fam.offered_ids())
-    return all(any(s.name in offered and cc in s.capabilities.archs for s in specs) for specs in (fe.ENGINE_SPECS, be.ENGINE_SPECS))
-
-
 @pytest.mark.L0
 def test_frost_norm_graph_roundtrip():
     """pytest entry point; this module also runs standalone via ``__main__``."""
-    if not torch.cuda.is_available() or not _norm_rows_offered_here():
+    from norm_test_utils import frost_norm_rows_offered_here
+
+    if not torch.cuda.is_available() or not frost_norm_rows_offered_here():
         pytest.skip("no norm engine row on offer serves this device")
     try:
         main()

@@ -25,6 +25,7 @@ import pytest
 import torch
 
 import cudnn
+from norm_test_utils import frost_norm_rows_offered_here
 
 pytest.importorskip("cudnn.norm", reason="frost norm engines require a built cudnn frontend")
 
@@ -69,8 +70,10 @@ def _select(graph):
     graph.build_operation_graph()
     try:
         graph.create_execution_plans(_HEUR)
-    except cudnn.cudnnGraphNotSupportedError as exc:  # no engine at all on this device
-        pytest.skip(f"no engine proposed a plan for this graph: {exc}")
+    except cudnn.cudnnGraphNotSupportedError as exc:
+        if frost_norm_rows_offered_here():
+            raise  # a FROST norm row serves this device: no plan at all is a regression
+        pytest.skip(f"no norm engine row on offer serves this device, and no other engine planned this graph: {exc}")
     idx = next((i for i, p in enumerate(graph.plans) if p.engine_id >= _PY_ENGINE_FLOOR), None)
     if idx is None:
         pytest.skip("frost norm engine proposed no plan for this graph")
