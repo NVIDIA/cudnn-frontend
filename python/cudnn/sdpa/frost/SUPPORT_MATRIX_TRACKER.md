@@ -2591,7 +2591,7 @@ envelope and fused bias/sinks remain unavailable to THD.
 | Backward sink / dSink, bias / dBias | SM100, SM103 |
 | f16/bf16 d = 256 backward: dense padding mask, right-band widening, THD, `dense_flex`, decode, deterministic; the 4-CTA multicast arm (perf) | SM100, SM103 — the ᵇ² row serves dense / causal (top-left, bottom-right) / sliding window / GQA on BSHD only |
 | Backward deterministic | SM100, SM103 — served by the MXFP8 d=256 row only |
-| d128 grouped THD `cta_group::2` pair body below `S` 8192, on cc 10.3, on dense GQA / MQA and on MHA | SM100, SM103 — the per-S heuristic (`cta_pair = auto`) serves the one-CTA grouped body there (below the threshold the pair has no measured win; cc 10.3 and the 2K / 4K cells are unmeasured; the pair has no dense twin and no MHA body); `cta_pair = on` declines by name |
+| d128 grouped THD `cta_group::2` pair body below `S` 8192, on cc 10.3, on dense GQA / MQA and on MHA | SM100, SM103 — the per-S heuristic (`cta_pair = auto`) serves the one-CTA grouped body there (below the threshold the pair has no measured win: the 2K / 4K cells are MEASURED as a loss for the pair on the step, -3.9 % / -3.5 %; cc 10.3 is unmeasured; the pair has no dense twin and no MHA body); `cta_pair = on` declines by name |
 | Backward decode-shaped S_q = 1 | SM100, SM103 — served by the MXFP8 d=256 row and the dense MHA f16/bf16 d128 row |
 | MXFP8 backward: E5M2, bottom-right / band-widened / sliding-window masks, non-BSHD strides, `amax_*` outputs | SM100, SM103 |
 | f16/bf16 forward split-KV | SM90, SM80; SM107 D512 and dense D256; THD outside D128/D256 and nonpaged D192 |

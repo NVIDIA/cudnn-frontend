@@ -13,7 +13,6 @@ Armed, dQ stays zero BY DESIGN: it is a timing-only ceiling for the L2 reduce-ad
 * the record field, the kernel, the host and the ``compile_host`` entries all default to ``False`` (no GPU, no render).
 """
 
-import hashlib
 import inspect
 import json
 import re

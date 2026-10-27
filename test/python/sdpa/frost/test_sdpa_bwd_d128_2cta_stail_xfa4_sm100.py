@@ -23,9 +23,17 @@ import torch
 
 from d128_grouped_test_utils import adapter_arguments, check_case, make_case, make_workspace, poison
 from frost_test_utils import requires_dsl
-from d128_2cta_test_utils import _CELLS, _CHILD_TIMEOUT_S, _GLOBAL_PREFIX, _LEVER_LINE, _SKV, _WATCHDOG_S, _adapter_class, _require_2cta, _setmaxnreg_of
+from d128_2cta_test_utils import CELLS, CHILD_TIMEOUT_S, GLOBAL_PREFIX, LEVER_LINE, SKV, WATCHDOG_S, _adapter_class, _require_2cta, _setmaxnreg_of
 from test_sdpa_bwd_d128_2cta_stail_sm100 import _BODY_MODULE, _CHILD, _EXPECTED, _RECORD, SITES
-from test_sdpa_bwd_d128_2cta_stail_sm100 import _bitwise_twin, _body_source, _function_code, _record_md5, _render, make_adapter_2cta_stail
+from test_sdpa_bwd_d128_2cta_stail_sm100 import (
+    _bitwise_twin,
+    _body_source,
+    _function_code,
+    _record_md5,
+    _render,
+    _skip_unless_record_dsl,
+    make_adapter_2cta_stail,
+)
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
@@ -202,12 +210,8 @@ def test_xfa4_host_renders_for_sm_100a_and_matches_its_record(tmp_path):
     assert census == _EXPECTED_XFA4, {k: (census.get(k), v) for k, v in _EXPECTED_XFA4.items() if census.get(k) != v}
     assert sorted(regs) == _setmaxnreg_of(), regs  # the split is UNCHANGED
     dsl, want = _record_md5(_RECORD_XFA4, "d128_accum_grouped_2cta_stail_xfa4")
-    assert want is not None, _RECORD_XFA4
-    import importlib.metadata as md
-
-    have = f"nvidia-cutlass-dsl {md.version('nvidia-cutlass-dsl')}"
-    if dsl != have:
-        pytest.skip(f"the md5 record was rendered with {dsl}; installed {have}: PTX text differs by DSL build, re-render the record")
+    assert dsl and want, (dsl, want, _RECORD_XFA4)
+    _skip_unless_record_dsl(dsl)
     assert md5 == want, f"PTX md5 {md5} != the record's {want} -- the 16w_fa4 rendering changed"
 
 
@@ -221,10 +225,8 @@ def test_xfa4_default_rendering_is_unchanged_and_16w_named_is_the_default(tmp_pa
     assert census_d == dict(_EXPECTED, **_EXPECTED_16W_EXTRA) == census_n, census_d
     assert sorted(regs_d) == _setmaxnreg_of()
     dsl, want = _record_md5(_RECORD, "d128_accum_grouped_2cta_stail")
-    import importlib.metadata as md
-
-    if dsl == f"nvidia-cutlass-dsl {md.version('nvidia-cutlass-dsl')}":
-        assert md5_d == want, f"the default S-tail rendering moved: {md5_d} != {want}"
+    _skip_unless_record_dsl(dsl)
+    assert md5_d == want, f"the default S-tail rendering moved: {md5_d} != {want}"
 
 
 # ------------------------------------------------------------------------------------------------------------ host: the audit's section-12 punch list as SOURCE assertions
@@ -373,7 +375,7 @@ def test_xfa4_skew_levers_keep_one_site_each_and_the_new_dq_war_lever_exists():
     from both role shapes' bodies; the NEW SOFTMAX_DQ_WAR lever sits in `_dq_issue` between the three gate waits and the dQ issue (leader-only by
     construction); every lever keeps the house form (the sibling module's row) and is a SITES row here."""
     src = _body_source()
-    exposed = set(_LEVER_LINE.findall(src))
+    exposed = set(LEVER_LINE.findall(src))
     assert "SOFTMAX_DQ_WAR" in exposed and exposed == {row["lever"] for row in SITES.values()}, (sorted(exposed), sorted(r["lever"] for r in SITES.values()))
     for helper, lever in (
         ("_skew_leader_ship", "LEADER_SHIP"),
@@ -468,7 +470,7 @@ def test_xfa4_role_shapes_agree_bitwise_on_dk_dv():
     tiles per pair so the lookahead, the in-tile dQ and the tail are all exercised."""
     _require_2cta()
     case = make_case((256, 512), (256, 512), hq=4, hkv=2, thd=True, dtype=torch.bfloat16, causal=True, stats_layout="TH1")
-    _bitwise_twin(case, lambda c: make_adapter_2cta_stail(c), lambda c: make_adapter_2cta_stail(c, warp_roles=_ROLES), "the two role shapes (16w vs 16w_fa4)")
+    _bitwise_twin(case, make_adapter_2cta_stail, lambda c: make_adapter_2cta_stail(c, warp_roles=_ROLES), "the two role shapes (16w vs 16w_fa4)")
 
 
 @pytest.mark.parametrize("site", list(SITES))
@@ -480,7 +482,7 @@ def test_sdpa_bwd_d128_2cta_stail_xfa4_survives_pair_skew(site, tmp_path):
     the run stays clean (SKEW_OK); an over-arrival fault = STOP, the barrier audit reads it.  Exit 70 or a subprocess timeout = HANG -> the barrier AUDIT, never a bigger
     budget; a gate miss = the RED form's wrong rows, named by ``check_case``.  Budget class: ``skew_module``."""
     row = SITES[site]
-    assert row["lever"] in set(_LEVER_LINE.findall(_body_source())), f"the body must expose {row['lever']}"
+    assert row["lever"] in set(LEVER_LINE.findall(_body_source())), f"the body must expose {row['lever']}"
     _require_2cta()
     _adapter_class()
     import cudnn
@@ -488,13 +490,13 @@ def test_sdpa_bwd_d128_2cta_stail_xfa4_survives_pair_skew(site, tmp_path):
     script = _CHILD_XFA4.format(
         testdir=str(pathlib.Path(__file__).resolve().parent),
         body=_BODY_MODULE,
-        global_name=f"{_GLOBAL_PREFIX}{row['lever']}_DELAY_US",
+        global_name=f"{GLOBAL_PREFIX}{row['lever']}_DELAY_US",
         attr=f"DEBUG_{row['lever']}_DELAY_US",
         delay=row["delay_us"],
         expected_fe=cudnn.__file__,
-        skv=_SKV,
-        cell=_CELLS[row["cell"]],
-        watchdog=_WATCHDOG_S,
+        skv=SKV,
+        cell=CELLS[row["cell"]],
+        watchdog=WATCHDOG_S,
         site=site,
         fields={},  # the stail template's fp32_reduce keys: the default form under 16w_fa4 (fp32_reduce declines there by name)
         dkv=_DKV_ACCUM_DEFAULT,
@@ -503,16 +505,16 @@ def test_sdpa_bwd_d128_2cta_stail_xfa4_survives_pair_skew(site, tmp_path):
     print(f"\n[{site}] 16w_fa4: {row['role']} sleeps {row['delay_us']} us at {row['site']}; isolates {row['isolates']}; RED = {row['red']}")
     try:
         proc = subprocess.run(
-            [sys.executable, str(tmp_path / f"skew_xfa4_{site}.py")], capture_output=True, text=True, timeout=_CHILD_TIMEOUT_S, env=dict(os.environ)
+            [sys.executable, str(tmp_path / f"skew_xfa4_{site}.py")], capture_output=True, text=True, timeout=CHILD_TIMEOUT_S, env=dict(os.environ)
         )
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
         (tmp_path / f"skew_xfa4_{site}.log").write_text(out)
-        pytest.fail(f"[{site}] HANG: the child did not return within {_CHILD_TIMEOUT_S} s (RED form: {row['red']}) -> barrier AUDIT, never a bigger budget")
+        pytest.fail(f"[{site}] HANG: the child did not return within {CHILD_TIMEOUT_S} s (RED form: {row['red']}) -> barrier AUDIT, never a bigger budget")
     (tmp_path / f"skew_xfa4_{site}.log").write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
     if proc.returncode == 70:
         pytest.fail(
-            f"[{site}] HANG: process_watchdog killed the child after {_WATCHDOG_S:.0f} s (RED form: {row['red']})\n{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}"
+            f"[{site}] HANG: process_watchdog killed the child after {WATCHDOG_S:.0f} s (RED form: {row['red']})\n{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}"
         )
     assert proc.returncode == 0 and f"SKEW_OK {site} {row['delay_us']}" in proc.stdout, f"rc={proc.returncode}\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
 

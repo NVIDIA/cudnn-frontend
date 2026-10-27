@@ -522,7 +522,7 @@ only (NOTE [2CTA schedules], the pipelined MMA loop, the deferred dS commit, ``Q
     is retained internally)
     lever | result | verdict | stands?
     this body (the pair, warp_roles 16w, mask_form fsel, dkv_accum bf16_partials) vs the one-CTA grouped THD body at the backward STEP | 8K
-    +4.9 %, 16K +7.0..7.5 %, 32K +8.5..8.8 %, 64K +10.4 %, varlen ramps +7..+8.5 %; 2K -3.9 %, 4K a loss on the step | the pair serves S >= 8K
+    +4.9 %, 16K +7.9 %, 32K +8.5 %, 64K +8.8 %, varlen ramps +6.5 % (16K) / +8.3 % (32K); 2K -3.9 %, 4K -3.5 % (losses on the step) | the pair serves S >= 8K
     (`CTA_PAIR_MIN_SEQ`), the one-CTA body below | yes: the heuristic's threshold
     mask_form predicated vs fsel | 16K +0.4 / +0.8 %, 32K +0.6 %, 16K ramp +0.2 %, 8K inside noise; ceiling (diag_mask_off) +0.97 % | neutral
     inside the band -> fsel stays the default, predicated selectable | yes
@@ -580,6 +580,7 @@ from cudnn.frost.tile_dsl.tma import (
 )
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 
+from ...config_sm100_d128_accum_2cta import diag_2cta_code
 from ...config_sm100_d128_accum_2cta_stail import (
     ALIASES,
     BAR_LAYOUT,
@@ -592,7 +593,6 @@ from ...config_sm100_d128_accum_2cta_stail import (
     DELETED_BARRIERS_XFA4,
     UNSERVED_BARRIERS_XFA4,
     bar_layout_for_roles,
-    diag_2cta_code,
     mask_form_code,
     warp_roles_code,
 )

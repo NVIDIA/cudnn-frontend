@@ -45,7 +45,7 @@ What the body does against the base geometry:
 from dataclasses import dataclass
 
 from .config_sm100_d128_accum_2cta import CFG as CFG_BASE
-from .config_sm100_d128_accum_2cta import Config, diag_2cta_code, resolve_diag_2cta  # noqa: F401  (re-exported for the body)
+from .config_sm100_d128_accum_2cta import Config, resolve_diag_2cta
 
 
 @dataclass(frozen=True)

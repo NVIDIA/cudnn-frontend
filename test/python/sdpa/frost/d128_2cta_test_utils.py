@@ -30,9 +30,10 @@ def _adapter_class():
     import cudnn
 
     try:
-        return importlib.import_module(_ADAPTER_MODULE).SdpaBwdDslSm100D128Cta2
+        module = importlib.import_module(_ADAPTER_MODULE)
     except ImportError as error:
         pytest.skip(f"{_ADAPTER_MODULE} is not importable from {cudnn.__file__}: this venv's cudnn is not the tree under test ({error})")
+    return module.SdpaBwdDslSm100D128Cta2
 
 
 def _require_2cta():
@@ -122,7 +123,7 @@ for action, imm in re.findall(rb"setmaxnreg\\.(inc|dec)\\.sync\\.aligned\\.u32\\
 print("RENDER_OK")
 """
 # The PTX census of the pair chain (every row a regex over the sm_100a PTX text; the expected counts live beside each module's record).
-_CENSUS = {
+CENSUS = {
     "mma_cta_group_2": r"tcgen05\.mma\.cta_group::2",
     "mma_cta_group_1": r"tcgen05\.mma\.cta_group::1",
     "commit_multicast": r"tcgen05\.commit\.cta_group::2\.mbarrier::arrive::one\.shared::cluster\.multicast::cluster",
@@ -141,7 +142,7 @@ _CENSUS = {
 # The pair chain's default counts (the body's header section 5 / 11): the base MMA count of the one-pass form plus the dQ issue at TWO
 # sites (in-tile dQ(t-1) + the tail dQ(hi-1)) = 72, the nine MMA_COMMIT rows + the S^T lookahead pair + the zero-trip dq_done + the tail's
 # dq_done commit = 13, twelve cga2 loads, one DSMEM ship, four dQ reduce-adds per tile.
-_EXPECTED_BASE = {
+EXPECTED_BASE = {
     "mma_cta_group_2": 56,
     "mma_cta_group_1": 0,  # never mixed
     "commit_multicast": 12,
@@ -179,19 +180,19 @@ def render_2cta(tmp_path, form_kw, census):
 
 
 # ------------------------------------------------------------------------------------------------------------ the pair-skew detectors (fresh child)
-_GLOBAL_PREFIX = "FROST_D128_2CTA_DEBUG_"
-_LEVER_LINE = re.compile(r'^DEBUG_(\w+)_DELAY_US: int = int\(globals\(\)\.get\("FROST_D128_2CTA_DEBUG_\1_DELAY_US", 0\)\)', re.M)
-_CHILD_TIMEOUT_S = 900  # import (~100 s cold) + JIT + the CPU fp64 reference + the watchdog budget; a TimeoutExpired is read as a HANG
-_WATCHDOG_S = 240.0  # execute x2 + capture + replay x4 on the skewed body; compile is outside it (a slow compiler is not a hang)
+GLOBAL_PREFIX = "FROST_D128_2CTA_DEBUG_"
+LEVER_LINE = re.compile(r'^DEBUG_(\w+)_DELAY_US: int = int\(globals\(\)\.get\("FROST_D128_2CTA_DEBUG_\1_DELAY_US", 0\)\)', re.M)
+CHILD_TIMEOUT_S = 900  # import (~100 s cold) + JIT + the CPU fp64 reference + the watchdog budget; a TimeoutExpired is read as a HANG
+WATCHDOG_S = 240.0  # execute x2 + capture + replay x4 on the skewed body; compile is outside it (a slow compiler is not a hang)
 # Cells (the suite's CPU generator, seed 149: one dataset on every SM count; the SM count is printed by the child as the dataset class).
 # ``skew``: uniform-ish causal with lq == lk so EVERY pair has live q tiles (1..n per item), pairs x heads x batch > SMs (a cluster runs
 # 2-3 LIVE items -> tile 0 of a second item with a populated sDS / recv half), the second sequence one pair shorter, and the half-dead last
 # pair (seq_k % 256 == 128).  ``p14``: n_q == 1, items > SMs, zero-trip kv blocks past seq_q.
-_CELLS = {
+CELLS = {
     "skew": "make_case((skv, skv - 256), (skv, skv - 256), hq=8, hkv=1, dtype=torch.bfloat16, causal=True, stats_layout='TH1')",
     "p14": "make_case((128, 64), (skv, skv - 256), hq=8, hkv=1, dtype=torch.bfloat16, causal=True, stats_layout='TH1')",
 }
-_SKV = "256 * ((sms // (8 * 2)) + 2) + 128"  # pairs x (hq=8) x (b=2) > sms, last pair half-dead
+SKV = "256 * ((sms // (8 * 2)) + 2) + 128"  # pairs x (hq=8) x (b=2) > sms, last pair half-dead
 # The four pair-skew sites every pair body carries (the barrier audit's lever forms).  ``lever`` = <SITE>; ``cell`` names the case builder
 # above; ``red`` = what the detector shows on the unsound protocol; ``green`` = the expected PASS.  Line anchors are function names.
 SITES_BASE = {

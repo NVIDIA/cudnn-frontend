@@ -24,7 +24,7 @@ import sys
 import pytest
 import torch
 
-from d128_2cta_test_utils import _CELLS, _CENSUS as _CENSUS_BASE, _CHILD_TIMEOUT_S, _EXPECTED_BASE, _GLOBAL_PREFIX, _LEVER_LINE, _SKV, _WATCHDOG_S
+from d128_2cta_test_utils import CELLS, CENSUS as CENSUS_BASE, CHILD_TIMEOUT_S, EXPECTED_BASE, GLOBAL_PREFIX, LEVER_LINE, SKV, WATCHDOG_S
 from d128_2cta_test_utils import SITES_BASE, _adapter_class, _require_2cta, _setmaxnreg_of, make_adapter_2cta, render_2cta
 from d128_grouped_test_utils import adapter_arguments, check_case, make_case, make_workspace, poison
 from frost_test_utils import requires_dsl
@@ -61,14 +61,14 @@ _PROBE_CENSUS = {
     "tcgen05_fence_after": r"tcgen05\.fence::after_thread_sync",
     "mapa": r"mapa\.",
 }
-_CENSUS = dict(_CENSUS_BASE, entry_stail=r"\.entry\s+cudnn_kernel_bprop_d128_accum_grouped_2cta_stail_kernel", **_PROBE_CENSUS)
+_CENSUS = dict(CENSUS_BASE, entry_stail=r"\.entry\s+cudnn_kernel_bprop_d128_accum_grouped_2cta_stail_kernel", **_PROBE_CENSUS)
 # The body's census against the base counts (kernel header section 5 / 11): dQ is issued at TWO sites (in-tile dQ(t-1) + the tail dQ(hi-1):
 # 16 + 16 k-steps -> mma 56 + 16 = 72), the tail's dq_done commit (+1), the arrive sites 41 - 4 (a dq_empty bootstrap + two per-slot sites of a
 # 4-slice ring -> 2 slots x 2 rounds) + 1 (dq_full per round, 3 sites) + 1 (s_read) + 1 (s_tail_empty) = 40, the wait sites 63 - 2 (dq_empty:
 # 3 rounds x 2 slots vs 4 + 4 terminal) - 1 (the q1 drain, one stage) + 1 (s_read) + 4 (s_tail_empty: prologue, lookahead, tail, drain) + 3 (the
 # tail's dS gates) = 68.  The entry is this body's kernel.
 _EXPECTED = dict(
-    _EXPECTED_BASE,
+    EXPECTED_BASE,
     mma_cta_group_2=72,
     commit_multicast=13,
     mbarrier_arrive=40,
@@ -349,12 +349,21 @@ def _record_md5(path, body_token):
     return dsl, md5
 
 
+def _skip_unless_record_dsl(dsl):
+    """A record's PTX md5 holds for the DSL build that rendered it (its ``dsl=`` line): another installed build is a SKIP before the md5
+    assertion -- never a widened or a conditional pin (PR 1943 review)."""
+    from cudnn.frost.buffers import cutedsl_state
+
+    _installed, version = cutedsl_state()
+    have = " ".join(version) if version else None
+    if have != dsl:
+        pytest.skip(f"the md5 record was rendered with {dsl}; installed {have}: PTX text differs by DSL build, re-render the record")
+
+
 def test_2cta_stail_host_renders_for_sm_100a_and_matches_its_record(tmp_path):
     """Host trace-compile of the chain with every field unset (no device): the body's PTX census is the header's (sections 5 / 11), no local
     memory, no nanosleep, the 144 / 144 / 80 register split; the md5 matches the committed record at this geometry (skips, never widens, on
     another DSL build)."""
-    from cudnn.frost.buffers import cutedsl_state
-
     md5, census, regs = _render(tmp_path, {})
     print(f"\n2-CTA s_tail sm_100a: PTX md5 {md5} census {census} setmaxnreg {regs}")
     assert census == _EXPECTED, census
@@ -362,10 +371,7 @@ def test_2cta_stail_host_renders_for_sm_100a_and_matches_its_record(tmp_path):
     assert _RECORD.is_file(), _RECORD
     dsl, want = _record_md5(_RECORD, "d128_accum_grouped_2cta_stail")
     assert dsl and want, (dsl, want)
-    _installed, version = cutedsl_state()
-    have = " ".join(version) if version else None
-    if have != dsl:
-        pytest.skip(f"the md5 record was rendered with {dsl}; installed {have}: PTX text differs by DSL build, re-render the record")
+    _skip_unless_record_dsl(dsl)
     assert md5 == want, f"PTX md5 {md5} != the record's {want} -- the s_tail rendering changed"
 
 
@@ -445,7 +451,8 @@ def test_2cta_stail_host_renders_debug_clk_for_sm_100a(tmp_path):
     md5_off, census_off, _ = _render(tmp_path, {"debug_clk": False})
     assert census_off == _EXPECTED and md5_off != md5_on, "debug_clk=False is the default rendering; True must differ (the clock reads)"
     dsl, want = _record_md5(_RECORD, "d128_accum_grouped_2cta_stail")
-    assert md5_off == want or dsl, "debug_clk=False renders the record's md5 (a DSL build difference is a skip, not a widen)"
+    _skip_unless_record_dsl(dsl)
+    assert md5_off == want, f"debug_clk=False must render the record's md5 {want}; got {md5_off}"
 
 
 # ------------------------------------------------------------------------------------------------------------ host: the audit's deterministic-hang topologies as SOURCE assertions
@@ -465,10 +472,6 @@ def test_2cta_stail_host_renders_mask_forms_for_sm_100a(tmp_path):
         f"\n2-CTA s_tail mask forms sm_100a: default {md5_d} fsel {md5_f} predicated {md5_p} diag_mask_off {md5_o}; census {census_d} | {census_p} | {census_o}"
     )
     assert md5_f == md5_d and census_f == census_d and regs_f == regs_d, "fsel named explicitly is the default rendering"
-    dsl, want = _record_md5(_RECORD, "d128_accum_grouped_2cta_stail")
-    have = __import__("cutlass").__version__ if hasattr(__import__("cutlass"), "__version__") else None
-    if dsl is not None and have is not None and dsl.endswith(have):
-        assert md5_d == want, f"the default (fsel) rendering {md5_d} != the record's {want}: the mask-form chain must leave the default byte-identical"
     assert len({md5_d, md5_p, md5_o}) == 3, "the three mask forms must render three different PTX texts"
     for census in (census_d, census_p, census_o):
         assert {k: v for k, v in census.items() if k not in _MASK_CENSUS} == _EXPECTED, census  # no barrier, TMA or TMEM op moves under any form
@@ -477,6 +480,9 @@ def test_2cta_stail_host_renders_mask_forms_for_sm_100a(tmp_path):
     assert census_p["bra"] - census_d["bra"] == CFG.QUARTERS_PER_GROUP, (census_d["bra"], census_p["bra"])
     assert census_d["selp_f32"] - census_o["selp_f32"] == CFG.MASK_SELECTS_PER_LANE_PER_TILE, (census_d, census_o)
     assert census_d["shr_u32"] - census_o["shr_u32"] == CFG.MASK_WORDS_PER_LANE_PER_TILE, (census_d, census_o)
+    dsl, want = _record_md5(_RECORD, "d128_accum_grouped_2cta_stail")
+    _skip_unless_record_dsl(dsl)
+    assert md5_d == want, f"the default (fsel) rendering {md5_d} != the record's {want}: the mask-form chain must leave the default byte-identical"
 
 
 def test_2cta_stail_dp_empty_is_arrived_at_the_ds_readout_before_the_recv_arm():
@@ -602,15 +608,15 @@ def test_2cta_stail_skew_levers_follow_the_house_form():
     """The body exposes the four base levers plus SOFTMAX_S_READ / EPILOGUE_DQ_READOUT / SOFTMAX_DQ_WAR, each in the house form (module global +
     const_expr nanosleep loop, default 0 = no traced code: the default render's census pins nanosleep == 0)."""
     source = _body_source()
-    exposed = set(_LEVER_LINE.findall(source))
+    exposed = set(LEVER_LINE.findall(source))
     known = {row["lever"] for row in SITES.values()}
     assert exposed == known, (sorted(exposed), sorted(known))
     for lever in sorted(exposed):
         name = f"DEBUG_{lever}_DELAY_US"
         assert re.search(rf"cutlass\.const_expr\({name} > 0\)", source), name
         assert re.search(rf"cutlass\.range\({name}, unroll=1\)", source), name
-        assert source.count(f'globals().get("{_GLOBAL_PREFIX}{lever}_DELAY_US", 0)') == 1, name
-        assert f"{_GLOBAL_PREFIX}{lever}" not in os.environ, name
+        assert source.count(f'globals().get("{GLOBAL_PREFIX}{lever}_DELAY_US", 0)') == 1, name
+        assert f"{GLOBAL_PREFIX}{lever}" not in os.environ, name
     assert source.count('nvvm.inline_ptx("nanosleep.u32 1000;"') == len(exposed)
 
 
@@ -781,7 +787,7 @@ def test_2cta_stail_debug_clk_dump_accounts_the_waits():
     W = d.WORD
     hq, hkv = 4, 2
     case = make_case((256, 512), (256, 512), hq=hq, hkv=hkv, thd=True, dtype=torch.bfloat16, causal=True, stats_layout="TH1")
-    _bitwise_twin(case, lambda c: make_adapter_2cta_stail(c), lambda c: make_adapter_2cta_stail(c, debug_clk=True), "the stamps lever (off vs on)")
+    _bitwise_twin(case, make_adapter_2cta_stail, lambda c: make_adapter_2cta_stail(c, debug_clk=True), "the stamps lever (off vs on)")
     plain = make_adapter_2cta_stail(case)
     api = make_adapter_2cta_stail(case, debug_clk=True)
     n_rec = cfgmod.dbg_clk_records(case.batch, hq, api.s_k_max)
@@ -883,30 +889,30 @@ def test_2cta_stail_exchange_off_is_clean_under_the_leader_ship_skew(tmp_path):
     import cudnn
 
     lever, delay = "LEADER_SHIP", 300
-    assert lever in set(_LEVER_LINE.findall(_body_source()))
+    assert lever in set(LEVER_LINE.findall(_body_source()))
     script = _CHILD_PROBE_SKEW.format(
         testdir=str(pathlib.Path(__file__).resolve().parent),
         body=_BODY_MODULE,
-        global_name=f"{_GLOBAL_PREFIX}{lever}_DELAY_US",
+        global_name=f"{GLOBAL_PREFIX}{lever}_DELAY_US",
         attr=f"DEBUG_{lever}_DELAY_US",
         delay=delay,
         expected_fe=cudnn.__file__,
         probe="exchange_off",
-        watchdog=_WATCHDOG_S,
+        watchdog=WATCHDOG_S,
     )
     (tmp_path / "probe_skew_exchange_off.py").write_text(script)
     try:
         proc = subprocess.run(
-            [sys.executable, str(tmp_path / "probe_skew_exchange_off.py")], capture_output=True, text=True, timeout=_CHILD_TIMEOUT_S, env=dict(os.environ)
+            [sys.executable, str(tmp_path / "probe_skew_exchange_off.py")], capture_output=True, text=True, timeout=CHILD_TIMEOUT_S, env=dict(os.environ)
         )
     except subprocess.TimeoutExpired:
         pytest.fail(
-            f"[exchange_off + leader_ship {delay} us] HANG: the child did not return within {_CHILD_TIMEOUT_S} s -> barrier AUDIT, never a bigger budget"
+            f"[exchange_off + leader_ship {delay} us] HANG: the child did not return within {CHILD_TIMEOUT_S} s -> barrier AUDIT, never a bigger budget"
         )
     (tmp_path / "probe_skew_exchange_off.log").write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
     if proc.returncode == 70:
         pytest.fail(
-            f"[exchange_off + leader_ship] HANG: process_watchdog killed the child after {_WATCHDOG_S:.0f} s\n{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}"
+            f"[exchange_off + leader_ship] HANG: process_watchdog killed the child after {WATCHDOG_S:.0f} s\n{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}"
         )
     assert proc.returncode == 0 and f"PROBE_SKEW_OK exchange_off {delay}" in proc.stdout, f"rc={proc.returncode}\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
 
@@ -1028,7 +1034,7 @@ def test_sdpa_bwd_d128_2cta_stail_survives_pair_skew(site, dkv_accum, tmp_path):
     fields = {} if dkv_accum is None else {"dkv_accum": dkv_accum}
     form = "bf16_partials" if dkv_accum is None else dkv_accum
     seam = _DKV_ACCUM_SEAM_ROWS.get(site, "(the field does not move this lever's bytes)") if dkv_accum else ""
-    assert row["lever"] in set(_LEVER_LINE.findall(_body_source())), f"the second body must expose {row['lever']}"
+    assert row["lever"] in set(LEVER_LINE.findall(_body_source())), f"the second body must expose {row['lever']}"
     _require_2cta()
     _adapter_class()
     import cudnn
@@ -1036,13 +1042,13 @@ def test_sdpa_bwd_d128_2cta_stail_survives_pair_skew(site, dkv_accum, tmp_path):
     script = _CHILD.format(
         testdir=str(pathlib.Path(__file__).resolve().parent),
         body=_BODY_MODULE,
-        global_name=f"{_GLOBAL_PREFIX}{row['lever']}_DELAY_US",
+        global_name=f"{GLOBAL_PREFIX}{row['lever']}_DELAY_US",
         attr=f"DEBUG_{row['lever']}_DELAY_US",
         delay=row["delay_us"],
         expected_fe=cudnn.__file__,
-        skv=_SKV,
-        cell=_CELLS[row["cell"]],
-        watchdog=_WATCHDOG_S,
+        skv=SKV,
+        cell=CELLS[row["cell"]],
+        watchdog=WATCHDOG_S,
         site=site,
         fields=fields,
         dkv=form,
@@ -1054,16 +1060,16 @@ def test_sdpa_bwd_d128_2cta_stail_survives_pair_skew(site, dkv_accum, tmp_path):
         print(f"[{site}] dkv_accum={form}: {seam}")
     try:
         proc = subprocess.run(
-            [sys.executable, str(tmp_path / f"skew_stail_{tag}.py")], capture_output=True, text=True, timeout=_CHILD_TIMEOUT_S, env=dict(os.environ)
+            [sys.executable, str(tmp_path / f"skew_stail_{tag}.py")], capture_output=True, text=True, timeout=CHILD_TIMEOUT_S, env=dict(os.environ)
         )
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
         (tmp_path / f"skew_stail_{tag}.log").write_text(out)
-        pytest.fail(f"[{site}] HANG: the child did not return within {_CHILD_TIMEOUT_S} s (RED form: {row['red']}) -> barrier AUDIT, never a bigger budget")
+        pytest.fail(f"[{site}] HANG: the child did not return within {CHILD_TIMEOUT_S} s (RED form: {row['red']}) -> barrier AUDIT, never a bigger budget")
     (tmp_path / f"skew_stail_{tag}.log").write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
     if proc.returncode == 70:
         pytest.fail(
-            f"[{site}] HANG: process_watchdog killed the child after {_WATCHDOG_S:.0f} s (RED form: {row['red']})\n{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}"
+            f"[{site}] HANG: process_watchdog killed the child after {WATCHDOG_S:.0f} s (RED form: {row['red']})\n{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}"
         )
     assert (
         proc.returncode == 0 and f"SKEW_OK {site} {row['delay_us']} dkv_accum={form}" in proc.stdout
