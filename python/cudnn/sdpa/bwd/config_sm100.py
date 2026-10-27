@@ -202,6 +202,8 @@ class MatmulTemplateParams:
     #               mainloop) -- no padding at d = 256; the sm107 d256 chain.
     #   (512, 256)  cluster (2,1,1), CTA tile 256 x 128, 4 stages, one 512-col
     #               accumulator -- an A/B alternate, selected by no adapter.
+    #   (128, 192)  cluster (1,1,1), CTA tile 128 x 192, 5 stages, two 192-col
+    #               accumulators -- native SM100 D192 half backward, 32-column epilogue.
     # Append-only, defaulted: the SM100 adapter never sets it, so its records
     # render exactly the constants they always did.
     cgrp_tile_mn: tuple = (512, 512)
@@ -307,7 +309,7 @@ class MatmulTemplateParams:
 
 
 # The cluster tiles the stage-3 template renders (see ``MatmulTemplateParams.cgrp_tile_mn``).
-STAGE3_CGRP_TILES = ((512, 512), (256, 256), (512, 256))
+STAGE3_CGRP_TILES = ((512, 512), (256, 256), (512, 256), (128, 192))
 # The fp8 arm is rendered at this row only (see ``MatmulTemplateParams.dtype_qkv``).
 STAGE3_FP8_CGRP_TILE = (256, 256)
 STAGE3_EPI_MODES = (EPI_NONE, EPI_DESCALE, EPI_QUANT)

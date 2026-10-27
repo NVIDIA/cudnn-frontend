@@ -46,6 +46,9 @@ def check_backward_replay_and_rebind(monkeypatch, dt, sq, sk, hk, causal, br, le
     def record_compile(api, main, mm_dk, mm_dq):
         compiled_geometry.append((main.CFG.TILE_K, main.CFG.TILE_O))
         assert compiled_geometry[-1] == (d, dv), "the actual compiled body must use native geometry"
+        for stage3 in (mm_dk, mm_dq):
+            assert stage3.PARAMS.cgrp_tile_mn == ((128, 192) if d == 192 else (256, 256))
+            assert stage3.cta_group == (1 if d == 192 else 2)
         return original_compile(api, main, mm_dk, mm_dq)
 
     monkeypatch.setattr(SdpaBwdDslSm100D256, "_compile_plan", record_compile)
@@ -152,3 +155,26 @@ def test_unqualified_native_geometry_is_rejected(profile, thd, dqk, dv):
     params = TemplateParams2x2(datapath_2x2_profile=profile, thd_varlen=thd, head_dim_qk=dqk, head_dim_v=dv)
     with pytest.raises(ValueError, match="head geometry"):
         make_cfg_d256_2x2(params, FAMILY_F16)
+
+
+@pytest.mark.parametrize("sm", [100, 103, 106, 107, 119])
+@pytest.mark.parametrize("d,dv", [(192, 128), (256, 256)])
+def test_stage3_native_width_stays_on_the_sm100_half_line(sm, d, dv):
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.bwd.api_dsl_sm100_d256 import SdpaBwdDslSm100D256
+
+    api = SimpleNamespace(head_dim_qk=d, head_dim_v=dv)
+    tile = SdpaBwdDslSm100D256._stage3_tile_mn(api, sm)
+    if sm <= 106 and d == 192:
+        assert tile == (128, 192)
+    else:
+        assert tile == (256, 256), "D256 and other architecture lines retain their existing stage3 tile"
+
+
+def test_stage3_native_width_keeps_fp8_on_its_validated_tile():
+    from cudnn.frost.tile_dsl.constants import DTYPE_E4M3
+    from cudnn.sdpa.bwd.config_sm100 import EPI_QUANT, MatmulTemplateParams, validate_matmul_params
+
+    with pytest.raises(ValueError, match=r"\(256, 256\) row only"):
+        validate_matmul_params(MatmulTemplateParams(dtype_qkv=DTYPE_E4M3, cgrp_tile_mn=(128, 192), epi_mode=EPI_QUANT))
