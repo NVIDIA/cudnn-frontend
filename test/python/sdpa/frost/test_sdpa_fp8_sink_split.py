@@ -139,3 +139,57 @@ def test_standalone_fp8_sink_split_default_scales(d, dv, output):
     from test_sdpa_prepared_fp8_split import test_prepared_fp8_split_standalone_default_scales
 
     test_prepared_fp8_split_standalone_default_scales("sm100", d, dv, output, sink=True)
+
+
+@pytest.mark.parametrize("splits", [2, 9])
+@pytest.mark.parametrize("dtype,tag", [(torch.bfloat16, "bf16"), (torch.float8_e4m3fn, "e4m3")])
+def test_quantized_sink_combine_excludes_zero_weight_payload(splits, dtype, tag):
+    import math
+    from cudnn.frost.compiled_cache import positional_entry
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine
+
+    # Head 0 checks live weighted values; head 1 has finite partial LSE but
+    # a dominant sink makes every real split weight zero, even in float64.
+    op = torch.ones((splits, 5, 2, 128), device="cuda")
+    lp = torch.zeros((splits, 2, 5), device="cuda")
+    sinks = torch.tensor([0.0, 1000.0], device="cuda")
+    o = torch.empty((1, 5, 2, 128), dtype=dtype, device="cuda")
+    lse = torch.empty((1, 2, 5), device="cuda")
+    amax = torch.zeros(1, device="cuda")
+    scale = torch.ones(1, device="cuda")
+    owner = split_combine.compile_ptr(dtype_o=tag, has_lse=True, quantized=True, has_amax=True, has_scale_o=tag == "e4m3", has_sink=True)
+    fn = positional_entry(owner)
+
+    def run():
+        fn(
+            op.data_ptr(),
+            lp.data_ptr(),
+            o.data_ptr(),
+            lse.data_ptr(),
+            (1, 2, 5, 128),
+            splits,
+            o.stride(),
+            lse.stride(),
+            amax.data_ptr(),
+            scale.data_ptr(),
+            torch.cuda.current_stream().cuda_stream,
+            sinks.data_ptr(),
+            None,
+        )
+
+    run()
+    with dense._cuda_graph() as graph:
+        with torch.cuda.graph(graph):
+            run()
+        for payload in (float("nan"), float("inf"), -float("inf")):
+            op[:, :, 1].fill_(payload)
+            o.fill_(float("nan"))
+            lse.fill_(float("nan"))
+            amax.zero_()
+            graph.replay()
+            ref = torch.full_like(o, splits / (splits + 1)).float()
+            ref[:, :, 1] = 0
+            torch.testing.assert_close(o.float(), ref, atol=0, rtol=0)
+            torch.testing.assert_close(lse[:, 0], torch.full_like(lse[:, 0], math.log(splits + 1)), atol=2e-6, rtol=2e-6)
+            torch.testing.assert_close(lse[:, 1], torch.full_like(lse[:, 1], 1000), atol=0, rtol=0)
+            torch.testing.assert_close(amax, torch.full_like(amax, splits / (splits + 1)), atol=2e-6, rtol=2e-6)
