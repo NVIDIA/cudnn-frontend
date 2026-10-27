@@ -99,7 +99,6 @@ def _half_p_output_bound(parts, v, input_dtype, descale_v):
     tolerance; packed/unpacked bitwise checks independently protect row mapping.
     This helper is for the unsplit D256/D512 register-sum, Stats-present path.
     """
-    import torch
     from sdpa.fp16_ref import _pv
 
     p = parts["p_scaled"]
