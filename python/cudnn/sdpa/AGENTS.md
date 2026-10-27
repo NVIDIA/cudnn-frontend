@@ -238,6 +238,14 @@ read the wrong K/V at batch one. The detector is
 `test_sdpa_bwd_d256_sm100.py::test_batch_pitch_rebind_and_replay`, including
 both source padding and output copy-out with canaries in unused physical rows.
 
+A TMA view split into fixed head chunks must retain the logical head bound.
+A rank-5 `(chunk, row, inner)` view can treat storage slack as live columns even
+when Q is correctly zero-padded; `0 * NaN` still poisons BMM1. Keep the bounded
+rank-4 loads for partial head chunks, and preserve the exact-head lowering.
+`test_sdpa_fwd_fp8_sm100.py::TestD192Fp8HeadPadding` and the native SM107
+`TestNativeD192Fp8HeadPadding` bridge poison Q/K/V head slack and check full
+O/Stats/Amax, output canaries, rebinding and retained replay on both arch lines.
+
 **Rule S6 — A kernel feature lands on every arch line's test file, and its
 other-arch lowerings are smoke-compiled from whatever GPU you have.**
 
@@ -256,6 +264,8 @@ other-arch lowerings are smoke-compiled from whatever GPU you have.**
   `staticmethod`; retain the architecture guard because the helper module's
   `pytestmark` does not transfer with its functions. The SM107 sink/split
   detector is `test_sdpa_fp8_sm107.py::TestNativeFp8SinkSplit`.
+  Put shared implementations in modules without the `test_` prefix so directory
+  sweeps collect each architecture entry once, rather than also collecting helpers.
 - The DSL traces the kernel in Python before any arch-specific codegen, so a
   lowering for an arch you do not have still fails or passes its trace here:
   `_load_sm120_kernel_module(None, TemplateParams(dtype_qkv=0, dtype_o=5),

@@ -1237,16 +1237,14 @@ none could be tested. Ragged backward lengths arrive as per-batch `seq_len_q/kv`
 SM100 per-tensor FP8 and MXFP8 rows both list
 `{(128,128), (192,128), (256,256), (512,512)}`, so d=64 **THD on FP8/MXFP8 is declined**. f16/bf16 THD rides the
 envelope (`thd_d_shapes=None`) and works.
-¹⁰ The per-tensor FP8 d192×d128 and d256 flavors are **floored to their exact
-shapes** (`d_envelope_floors` `((192,128),128), ((256,256),255)`, mirrored in
-`fwd/api_dsl._SM100_FP8_ENVELOPE_FLOORS`): with d_qk zero-padded into d192×d128
-the kernel's output is wrong (4–19 % of elements off by O(1) in `test_mhas_v2`),
-and the d256 padded envelope is run-to-run nondeterministic on long causal
-e5m2/GQA/sink graphs. So an FP8 graph with head dims in (128, 256) that is not
-exactly (192, 128) or (256, 256) is declined by the engine and takes the classic
-backend verdict — the same envelope the C++ `validate()` always enforced. The
-d128 flavor's ×16 envelope and the d512 band² are unaffected. Lift the floors
-once the kernels' padded paths pass the battery.
+¹⁰ The per-tensor FP8 D192×128 flavor serves 16-aligned dense heads within
+its tile on SM100/SM103 and native SM107. Partial Q/K heads use bounded rank-4
+K TMA loads, preserving zero-fill even when physical storage slack contains NaN;
+SM100 exact D192 retains its rank-5 chunk load. V loads and O stores retain the
+logical V width. Non-native THD heads remain declined. D256 is still exact-only
+(`d_envelope_floors` `((256,256),255)`, mirrored in the adapter): its padded
+envelope's long causal E5M2/GQA/sink nondeterminism is an independent gap.
+D128's ×16 envelope and the D512 band² are unchanged.
 ᵍ **`sdpa_bwd_sm100_mxfp8` only — `sdpa_mxfp8_backward()` with E4M3 payloads,
 d_qk = d_v = 256 exactly, fp16/bf16 `o_f16`/`dO_f16`/dQ/dK/dV.** Serves MHA /
 GQA / MQA, any fixed S_q / S_kv (the kernels mask tile tails; S_q = 1 works),
@@ -2003,12 +2001,12 @@ per-tensor FP8 flavor now carries the contract and serves it.
 ᵛⁱⁱ FP16/BF16 and per-tensor FP8 D128/V128 and D192/V128 serve dense,
 unpadded split-KV with FP32 partial O and the shared combine. Smaller head
 dimensions can use the D128 envelope; half also supports the existing
-D192/V128 envelope. Dense split with PackGQA is served for per-tensor FP8 D64/D128; D64 uses its native64 body.
+D192/V128 envelope. Per-tensor FP8 also serves the dense D192/V128 envelope. Dense split with PackGQA is served for per-tensor FP8 D64/D128/D192x128; D64 uses its native64 body.
 Half exact D128 THD also supports split with PackGQA, using the prepared packed
 path described below; half nonpaged D192 THD supports unpacked split. Quantized
 THD and nonpaged dense padded split graphs remain declined. Half dense sink splits are
-served through sink-free partials and one sink fold in the shared combine; quantized sinks
-and nonpaged THD sinks retain their split restriction.
+served through sink-free partials and one sink fold in the shared combine. The same composition
+serves per-tensor FP8 D64/D128/D192x128; MXFP8 and nonpaged THD sinks retain their split restriction.
 ᵛⁱⁱⁱ **Fused epilogue gate `O := O * sigmoid(G)`** — a production feature of the
 d256 f16/bf16, per-tensor FP8 and block-scale MXFP8 Rubin kernels
 (`TemplateParams.epilogue_gate`; rows `sdpa_fwd_prefill_sm107`,
@@ -3786,9 +3784,13 @@ Dense graph plans admit split-KV for the D512 flavor and its existing 16-aligned
 
 ### Native SM107 per-tensor FP8 sink with split-KV
 
-The existing dense-Q D64/D128/D192x128 native split domain can fold an attention sink once in the final combine. The main kernel is compiled without a sink and retains its native SM107 body, FP32 partials and runtime split count. Existing head-envelope, scheduler, CGA, PackGQA, paged and THD constraints remain; native D256/D512 splits and MXFP8 sink splits are independent follow-ups. `test_sdpa_fp8_sink_split_sm107.py` checks actual native source routing, both FP8 inputs, half/FP8 outputs, empty split chunks, O/Stats/Amax, fresh buffers and retained graph replay, plus the standalone omitted-scale path. Target qualification passes 32 new native tests, 75 existing architecture controls and two targeted memcheck cases with zero errors; the new suite is included by default FROST collection. No heuristics or placement changes.
+The existing dense-Q D64/D128/D192x128 native split domain can fold an attention sink once in the final combine. The main kernel is compiled without a sink and retains its native SM107 body, FP32 partials and runtime split count. Existing head-envelope, scheduler, CGA, PackGQA, paged and THD constraints remain; native D256/D512 splits and MXFP8 sink splits are independent follow-ups. `test_sdpa_fp8_sm107.py::TestNativeFp8SinkSplit` checks actual native source routing, both FP8 inputs, half/FP8 outputs, empty split chunks, O/Stats/Amax, fresh buffers and retained graph replay, plus the standalone omitted-scale path. Target qualification passes 32 new native tests, 75 existing architecture controls and two targeted memcheck cases with zero errors; the new suite is included by default FROST collection. No heuristics or placement changes.
 
 
 ### Native SM107 per-tensor FP8 D192x128 PackGQA
 
-The exact D192x128 native body admits whole-group PackGQA for unsplit and existing split-KV plans. This composes with the qualified sink/combine path. Existing scheduler, CGA, THD, paged, output and group-divisibility restrictions remain; D256/D512 packing is still declined. The target suite covers multiple batches, both FP8 inputs, half/FP8 output, every scheduler, sink/split composition and retained graph replay. The existing non-native head-padding decline is retained and tested. Existing D192 causal GQA2/4/8, grouped-LPT and E5M2 sink tests are enabled on SM107. Target qualification passes 58 new/updated feature tests, six existing controls and three targeted memcheck cases with zero errors. A bounded six-case, 108-plan packed/unpacked comparison checks O/Stats/Amax before and after retained graph replay. No heuristics or placement change.
+The exact D192x128 native body admits whole-group PackGQA for unsplit and existing split-KV plans. This composes with the qualified sink/combine path. Existing scheduler, CGA, THD, paged, output and group-divisibility restrictions remain; D256/D512 packing is still declined. The target suite covers multiple batches, both FP8 inputs, half/FP8 output, every scheduler, sink/split composition and retained graph replay. The dense head-padding envelope is documented below; non-native THD heads remain declined. Existing D192 causal GQA2/4/8, grouped-LPT and E5M2 sink tests are enabled on SM107. Target qualification passes 58 new/updated feature tests, six existing controls and three targeted memcheck cases with zero errors. A bounded six-case, 108-plan packed/unpacked comparison checks O/Stats/Amax before and after retained graph replay. No heuristics or placement change.
+
+### Dense D192 per-tensor FP8 head padding
+
+The graph and prepared launcher serve aligned dense heads with Q/K width up to 192 and V width up to 128, selecting smaller native flavors where they cover the shape. No materialized padding copy is added. SM100 preserves the exact D192 rank-5 K load and specializes padded Q/K onto rank-4 TMA; native SM107 already uses bounded rank-4 loads. `test_sdpa_fwd_fp8_sm100.py::TestD192Fp8HeadPadding` (with a native SM107 CI bridge) covers both FP8 inputs, all four scalar output types, PackGQA, split/sink composition, poisoned input slack, output canaries, fresh bindings and retained replay. The same class’s `test_masks` covers top-left/bottom-right causal and sliding windows. D256 padding and non-native THD heads remain separate declines; no heuristics or placement changes.

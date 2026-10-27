@@ -64,8 +64,8 @@ def test_native_d192_fp8_pack_rebind_replay(b, split, sched, sink, dtype, output
         shared._check(bufs, thd=False, b=b, sq=sq, skv=256)
 
 
-@pytest.mark.parametrize("d,dv", [(160, 112), (176, 128)])
-def test_native_d192_pack_retains_head_padding_decline(d, dv):
+@pytest.mark.parametrize("d,dv", [(160, 160), (224, 208)])
+def test_native_d192_pack_retains_d256_padding_decline(d, dv):
     import cudnn
 
     with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="no kernel-flavor envelope covers"):
