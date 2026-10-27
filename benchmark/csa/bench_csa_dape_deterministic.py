@@ -67,8 +67,8 @@ def _fragmented_lengths(tokens):
         lengths.append(length)
         remaining -= length
         index += 1
-    # Exercise repeated compressed prefixes without changing the token count.
-    lengths.append(0)
+    # Place a valid row after the repeated prefix without changing the token count.
+    lengths.insert(1, 0)
     return lengths
 
 
@@ -223,6 +223,7 @@ def _bench_shape(name, lens, d, ratio, coff, args):
 
 
 def main():
+    """Benchmark atomic and deterministic backward for the selected shape suite."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=30)
