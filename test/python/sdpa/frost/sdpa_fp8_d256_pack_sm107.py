@@ -89,8 +89,9 @@ def _run_packed(case, dtype, output, monkeypatch, half=False, adapter=False, spl
         value.copy_((value.float() * 2.5).to(dtype))
     # Split chunks use independent maxima before FP8 P quantization. Compare
     # them to a partitioned FP64 reference, not one unsplit rounding trajectory.
-    # Keep the same O/Stats/Amax bounds; unsplit checks retain their FP8 oracle.
-    check = dict(causal=causal, bottom_right=bottom_right, window=window, split=split, pack=pack, softmax_f16=half and split == 1)
+    # HALF uses its independent per-partition P-rounding allowance; FLOAT and
+    # Stats/Amax keep their existing bounds.
+    check = dict(causal=causal, bottom_right=bottom_right, window=window, split=split, pack=pack, softmax_f16=half)
     g.execute(vp, ws)
     _check(bufs, **check)
     if half and split == 1:
