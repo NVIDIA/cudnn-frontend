@@ -887,6 +887,15 @@ def test_sm107_paged_gqa_prefill_leads_inside_its_box():
     assert place(b=placement.SM107_PAGED_GQA_MAX_B + 1, max_total_seq_len_q=5 * 864) == placement.TRAIL
     assert place(dtype=cudnn.data_type.HALF) == placement.TRAIL
     assert place(s_kv=65536) == placement.TRAIL
+    # long-prefix chunks: the measured grid's corners lead for every group, its edges bound the box
+    for h_q, h_kv in ((32, 8), (32, 4), (64, 4)):
+        for b, s_q, s_kv in ((1, 1536, 6144), (4, 1536, 32768), (1, 4096, 6144), (4, 4096, 32768)):
+            assert place(h_q=h_q, h_kv=h_kv, b=b, s_q=s_q, s_kv=s_kv, max_total_seq_len_q=b * s_q) == placement.LEAD, (h_q, h_kv, b, s_q, s_kv)
+    long = dict(b=1, s_q=2048, max_total_seq_len_q=2048)
+    assert place(h_q=32, h_kv=8, s_kv=placement.SM107_PAGED_GQA_LONG_CHUNK_MIN_KV - 1, **long) == placement.TRAIL
+    assert place(h_q=32, h_kv=8, b=1, s_q=4097, s_kv=8192, max_total_seq_len_q=4097) == placement.TRAIL
+    assert place(h_q=32, h_kv=16, s_kv=8192, **long) == placement.TRAIL  # group 2
+    assert place(h_q=32, h_kv=32, s_kv=8192, **long) == placement.TRAIL  # MHA
 
 
 @pytest.mark.L0

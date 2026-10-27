@@ -29,6 +29,11 @@ _ENGINE = "sdpa_bwd_sm100_d256"
     ids=["dense", "gqa-tail-br", "mqa-window", "window-noncausal", "mha-tail", "chunk-partials", "head-subgroups"],
 )
 def test_rectangular_backward_replay_and_rebind(monkeypatch, dt, sq, sk, hk, causal, br, left, budget):
+    check_backward_replay_and_rebind(monkeypatch, dt, sq, sk, hk, causal, br, left, budget)
+
+
+def check_backward_replay_and_rebind(monkeypatch, dt, sq, sk, hk, causal, br, left, budget, *, d=192, dv=128, deterministic=False):
+    """Check native geometry, FP64 gradients and replay after changing data/pointers."""
     if budget is not None:
         from cudnn.sdpa.bwd import api_dsl_sm107
 
@@ -40,13 +45,13 @@ def test_rectangular_backward_replay_and_rebind(monkeypatch, dt, sq, sk, hk, cau
 
     def record_compile(api, main, mm_dk, mm_dq):
         compiled_geometry.append((main.CFG.TILE_K, main.CFG.TILE_O))
-        assert compiled_geometry[-1] == (192, 128), "the actual compiled body must use native rectangular geometry"
+        assert compiled_geometry[-1] == (d, dv), "the actual compiled body must use native geometry"
         return original_compile(api, main, mm_dk, mm_dq)
 
     monkeypatch.setattr(SdpaBwdDslSm100D256, "_compile_plan", record_compile)
-    b, hq, d, dv = 2, 4, 192, 128
+    b, hq = 2, 4
     keep = _causal_keep(sq, sk, causal=causal, bottom_right=br, left=left)
-    kwargs = {}
+    kwargs = dict(use_deterministic_algorithm=deterministic)
     if causal:
         kwargs["use_causal_mask_bottom_right" if br else "use_causal_mask"] = True
     if left is not None:
@@ -91,6 +96,15 @@ def test_rectangular_backward_replay_and_rebind(monkeypatch, dt, sq, sk, hk, cau
     g.execute(bindings, ws)
     torch.cuda.synchronize()
     check(refs)
+    if deterministic:
+        expected = [grad.clone() for grad in grads]
+        for _ in range(2):
+            poison()
+            g.execute(bindings, ws)
+            torch.cuda.synchronize()
+            check(refs)
+            for got, want in zip(grads, expected):
+                assert torch.equal(got.view(torch.int16), want.view(torch.int16))
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     capture = torch.cuda.CUDAGraph()
@@ -104,10 +118,20 @@ def test_rectangular_backward_replay_and_rebind(monkeypatch, dt, sq, sk, hk, cau
     capture.replay()
     torch.cuda.synchronize()
     check(fresh_refs)
+    expected = [grad.clone() for grad in grads] if deterministic else None
     poison()
     g.execute(pack(fresh), ws)
     torch.cuda.synchronize()
     check(fresh_refs)
+    if deterministic:
+        for got, want in zip(grads, expected):
+            assert torch.equal(got.view(torch.int16), want.view(torch.int16)), "rebind differs from retained replay"
+        poison()
+        capture.replay()
+        torch.cuda.synchronize()
+        check(fresh_refs)
+        for got, want in zip(grads, expected):
+            assert torch.equal(got.view(torch.int16), want.view(torch.int16)), "retained replay changed raw gradient bits"
 
 
 @pytest.mark.parametrize(

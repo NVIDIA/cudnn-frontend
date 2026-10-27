@@ -543,7 +543,7 @@ MMA as d=512.
 | PackGQA (`PACK_GQA` knob: the GQA group packed into the Q tile)ᵐ | via the native d64 flavorᵗ⁰ | whole group onlyᵐ | ✅ᵐ partial | whole group onlyᵐ | ✅ᵐ partial | whole group onlyᵐ | — |  —  |
 | THD prefill + PackGQA (f16/bf16, CGA2, unsplit)ᵐ | ❌ (via the d128 flavor) | ❌ | ✅ native, partial | ❌ | ❌ | ❌ | — | — |
 | Bias / dBias | ✅ᵗ⁰ / ❌ (the RESIDENT block, S_kv ≤ 256 at cga1 (≤ 320 at the 64-wide KV tile), the STREAMED ring above it at any S_kv (2 stages at TILE_N 128, 3 at 64); `kv_mask` any S_kv, bool / 16-bit / fp32 (the fp32 vector WITH a bias at TILE_N 64 only); TILE_N 128 unless the pick (the padded bias leg inside the 64-wide block's budget, the fp32 vector with a bias) or the TILE_N knob says 64; one-batch-entry item; the pre-masked tail and the quiet body) | ✅ᵗ⁰ / ❌ (TILE_N 128: the cga2 block, S_kv ≤ 128; above it the 64-wide KV tile at cga1 by the budget rule -- the block to S_kv ≤ 192, the 3-stage STREAMED ring above it at any S_kv; `kv_mask` any S_kv) | ❌ | ❌ | ❌ | ❌ | ❌ |  ❌  |
-| `use_deterministic_algorithm` | — | — | — | — | — | — | ❌ᵇ · ✅ᵍ |  ❌ᵇ² · ✅ᵍ  |
+| `use_deterministic_algorithm` | — | — | — | — | — | — | ❌ᵇ · ✅ᵍ |  ✅ᵇ² · ✅ᵍ  |
 | Ragged `S_kv` (non-multiple of 128) | ✅⁶ ᵗ⁰ | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅ᵇ ᵉ ᵍ |  ✅ᵇ² ᵍ  |
 | Decode-shaped (`S_q == 1`; with sink / sliding window: ˢ) | ✅ᵗ⁰ | ✅ | ✅ | ✅ | ✅ᵈ (decode tile) | ✅ | ❌ᵇ · ✅ᵍ |  ❌ᵇ² · ✅ᵍ  |
 | **Decode tile** (decode + MTP; f16/bf16, dense or paged: d128 `S_q · PACK_G ≤ 128`ᵈᵗ, d256 `S_q · G` within the routed rowsᵈ) | ❌ (prefill tile) | ✅ᵈ⁶⁴ **native** (f16/bf16; an explicit cga2 runs the prefill tile) | ✅ᵈᵗ **native** | ❌ (prefill tile) | ✅ᵈ (d256 decode tile, swap-AB) | ❌ (prefill tile) | — |  —  |
@@ -1104,8 +1104,14 @@ remain compact. The persistent scheduler covers both 128-row halves of each
 padding canaries, changing offsets/lengths, buffer rebinding and retained captures.
 Dense padding masks remain declined. Declined, each asserted by a test: dense padding
 masks, sink / dSink, bias / dBias, right-band widening, `dense_flex`, decode
-shapes, `use_deterministic_algorithm` (no atomics in the chain; the two-launch
-bitwise test passes, the claim waits on the bring-up sweep). **The native
+shapes. `use_deterministic_algorithm=True` is supported for both native head
+pairs, FP16/BF16, dense and packed THD. The existing chain assigns each output
+tile to one owner and reduces dQ/dK and GQA partials in fixed order; scheduler
+work claims do not change the summation order. No extra workspace or launches
+are added by the request. `test_sdpa_bwd_half_deterministic_sm100.py` checks raw
+gradient bits across repeated eager execution, fresh bindings and retained replay,
+including mask/tail cases, workspace head chunks, physical origins and empty
+sequences. Other backward rows retain their own deterministic capability gates. **The native
 competitor on B200 / cuDNN 9.26 is backend engine 5**
 (`eng5_k14=3_k24=2_k27=0_k38=0_k40=3_k41=2`, the FORT flash_bprop 128x128x256
 cga2x1x1 three-kernel chain), not engine 17: pin the FROST plan by name when
