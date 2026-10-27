@@ -158,7 +158,7 @@ _ARRIVE_SITE_PINS = {
     "mb_tmem_dealloc.arrive": 1,  # local ...
     "mb_tmem_dealloc.arrive_on_peer": 1,  # ... + on-peer = PAIR_LANES per CTA
     "mb_q_empty.arrive": 1,  # MMA commit after the tile's last BMM1
-    "mb_bmm1_done[": 1,
+    "mb_bmm1_done[": 2,  # mutually exclusive two-/three-chunk arms, one commit after the final QK chunk
     "mb_bmm2_done[": 2,  # per-iteration (last N-block) + empty-tile commit
 }
 

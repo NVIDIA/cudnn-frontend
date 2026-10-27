@@ -33,6 +33,20 @@ def test_sm107_native_matches_actual_host_abi_and_rebinds(dq, dv, dtype):
     assert len(frames) == 2
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("hnd", [False, True])
+def test_sm107_paged_d128_matches_actual_host_abi(dtype, hnd):
+    s, facts, frames, _ = _prefill_fixture(128, 128, True, 1, dtype, hnd=hnd, arch="sm107")
+    for offset in (0, 0x100000):
+        fresh = {role: f._replace(ptr=f.ptr + offset) for role, f in facts.items()}
+        expected = binding_reference.bind_dense(s, fresh, 17, 17)
+        actual = s.native.bind(_pack(fresh), prep._NATIVE_DENSE_INDICES, 17)
+        assert list(actual) == expected
+        s.native.execute(_pack(fresh), prep._NATIVE_DENSE_INDICES, 17)
+    assert len(frames) == 2
+
+
 @pytest.mark.parametrize("slot", ["q_ptr", "lse_ptr", "seq_q_lens_addr", "problem_size", "stream"])
 def test_missing_required_host_argument_still_rejects(slot):
     s, _, _, _ = _prefill_fixture(256, 256, False, 1, "bfloat16", arch="sm107")

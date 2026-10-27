@@ -408,6 +408,18 @@ compressed column 0.
     `q_scale * sm_scale`; SM100 MXFP8 and MXFP4 require BF16 weights.
   - `q_causal_offsets` (optional): CUDA INT32 tensor with one entry per
     batch/THD segment, on the same device as `q`.
+  - `block_table` + `kv_lens` (optional, SM100 BF16): read `k` straight from
+    a paged key cache instead of a dense tensor, with the block-table
+    contract of the QSA compressed-key cache. `k` is the page pool
+    `(num_pages, page_size, H_kv, D)` or `(num_pages, page_size, D)`;
+    `page_size` is a multiple of 8 that divides 128 or is a multiple of it
+    (16, 32, 64, 128, 256 all work). `block_table[b, i]` (`(B, max_pages)` INT32, unit column
+    stride) is the pool row of sequence `b`'s `i`-th page and `kv_lens[b]`
+    (`(B,)` INT32) its compressed-key count; the ratio-causal limit still
+    applies on top. `cu_seqlens_k` must be `None` (THD queries keep
+    `cu_seqlens_q`), and the score width is `max_seqlen_k`, which defaults to
+    `max_pages * page_size`; keys at or past it are never scored, nor are pool
+    rows past `kv_lens[b]` inside the last live page.
 - **Output** — `scores`: `(B, S_q, S_k)` FP32. On SM100 this is the
   `[..., :S_k]` view over a `(B, S_q, ceil4(S_k))` (THD:
   `(total_q, ceil4(max_seqlen_k))`) allocation: the kernel binds `out` through
@@ -520,6 +532,14 @@ launch, or a positive value only when deliberately controlling the scratch
 footprint. Size the buffer with the launch's `microbatch_rows` and
 `precision`: `compress_topk_cand_buffer_size` sizes MXFP8 and MXFP4 launches,
 which never microbatch, for one full launch.
+
+Paged K (`block_table` + `kv_lens`, the §3 contract) serves BSHD and THD
+queries with BF16 Q/K in one launch and returns local key ids
+(`topk_indices_global=False`), which is what serving engines consume before
+mapping ids to physical cache rows. THD capture preallocates through
+`compress_topk_cand_buffer_size_thd(cu_seqlens_q, None, ratio, q_causal_offsets)`,
+since a paged pool has no key prefix. No explicit microbatching and no MXFP8
+yet.
 
 Global versus local ids is primarily an interoperability and allocation
 choice, not an Indexer Backward tuning choice. Keep the default global ids

@@ -415,8 +415,13 @@ production kernels gain no debug knob or timing-dependent assertion.
   with `batch_idx == n_batch`. Allocating `B+1` map slots makes that address
   in bounds but does not initialize a descriptor there.
 - When setup writes maps only for the `B` real sequences, exit dead initial
-  clusters before acquiring maps or shared resources. Use the cluster-uniform
+  clusters before acquiring maps, allocating TMEM, or entering role-specific
+  barrier protocols. Use the cluster-uniform
   `exit_if_dead_thd_cluster` helper; a role-local exit can strand barrier peers.
+- Under programmatic dependent launch, wait for setup before the dead-unit
+  check reads its metadata. Uniform CTA/cluster-local initialization may
+  overlap setup if all roles finish it before the exit and it owns no TMEM
+  or tensor maps. The SM107 paged physical-origin replay tests cover this order.
 - Exercise overlaunch without total-length hints and replay after changing
   all query lengths to zero. Check O/Stats canaries and run memcheck; ordinary
   live-row numerical comparisons do not cover the dead-unit path.

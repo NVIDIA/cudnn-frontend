@@ -199,3 +199,29 @@ def test_sm107_mxfp8_row_lists_one_knobless_entry_on_the_rubin_line(cc, want):
     plans = recommend("A", facts, _OFFERED)
     assert [p.engine_id for p in plans] == want
     assert all(p.knobs is None for p in plans if p.engine_id == 20606), "the Rubin MXFP8 row has no tile axis: {} is the complete record"
+
+
+def test_sm100_d128_leads_the_backend_only_on_unwindowed_d128_thd(monkeypatch):
+    """The default d128 backward row ranks ahead of the backend for d128 THD without a window and behind it elsewhere;
+    the FROST opt-in keeps it first everywhere (cudnn.sdpa.bwd.heuristics._leads)."""
+    from cudnn.engines.base import PlanConfig
+    from cudnn.engines.heuristics import is_backend_block
+    from cudnn.engines.manifest import MANIFEST
+    from cudnn.sdpa.bwd import heuristics
+
+    family = next(f for f in MANIFEST if f.name == "frost_sdpa_bwd")
+    assert not family.slots["sdpa_bwd_sm100_d128"].opt_in
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    eid = _OFFERED["sdpa_bwd_sm100_d128"]
+    monkeypatch.setattr(heuristics, "recommend", lambda kind, facts, offered: [PlanConfig(eid, None)])
+
+    def order(**over):
+        plans = heuristics.propose("A", _facts(device_cc=(10, 0), **over), _OFFERED)
+        return ["backend" if is_backend_block(p) else "frost" for p in plans]
+
+    assert order(thd=True) == ["frost"]
+    assert order() == ["backend", "frost"]  # dense d128: parity
+    assert order(thd=True, window_left=1024) == ["backend", "frost"]  # a window loses ~2x
+    assert order(thd=True, d_qk=64, d_v=64) == ["backend", "frost"]
+    monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+    assert order() == ["frost"]

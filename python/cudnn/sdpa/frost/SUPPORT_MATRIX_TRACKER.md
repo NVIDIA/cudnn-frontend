@@ -77,7 +77,9 @@ only (the graph attribute is forward-only).
 (block-scale MXFP8, exact cc 10.7) are default candidates, ranked against the backend per measured shard or qualification verdict
 (`sdpa/fwd/placement.py`).
 `sdpa_bwd_sm100` (f16/bf16, d in (256, 512]) is a default candidate too: the backend has no SM100
-engine for that band, so it is the only provider there. Every other FROST SDPA engine is `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before
+engine for that band, so it is the only provider there. `sdpa_bwd_sm100_d128` is a default candidate that ranks
+ahead of the backend for d128 THD without a window and behind it elsewhere (`sdpa/bwd/heuristics.py`). Every other
+FROST SDPA engine is `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before
 `import cudnn` or the graph runs a cuDNN backend plan. The flag also ranks FROST first everywhere.
 
 **Execute-time shape/stride overrides:** graphs created with
@@ -103,7 +105,12 @@ body. Packed and unpacked plans share its two softmax warpgroups and four KV
 stages, and declare their persistent THD scheduler to the launch adapter.
 An envelope of up to two resident waves is assigned directly; larger envelopes
 use one resident wave and claim further work on device.
-Decode, paged and single-Q split plans retain their existing bodies.
+Paged D128 half uses the native SM107 body as well, retaining its four KV
+stages at CGA2. Unsplit THD graph plans preserve independent physical Q/O/Stats
+origins, live lengths, and independent K/V page tables and pool strides.
+`test_sdpa_fwd_paged_thd_origins.py` exercises HND/NHD and mixed pools,
+packing, changed offsets and strides, keyless sequences, and empty replay.
+D256 paged and single-Q split plans retain their existing bodies.
 Automatic candidate proposals and placement are unchanged. The THD packing,
 mask/sink, padded-Stats and changed-length replay tests exercise this support.
 
@@ -391,7 +398,7 @@ packing remains declined; automatic candidate ranking is unchanged.
 Standalone compact-THD behavior, other split/gated paths, other head dimensions
 and other architectures are unchanged; this does not qualify their padded offsets.
 
-The opt-in **d128 backward** (`sdpa_bwd_sm100_d128`, engine 20609) selects
+The default **d128 backward** (`sdpa_bwd_sm100_d128`, engine 20609) selects
 its implementation at plan build. On SM100 or SM103 with public CuTeDSL >= 4.8 and a
 positive FP32-representable scale, when determinism is not requested it launches row delta plus dQ initialization, the
 five-product main kernel, then an FP32 to output-dtype dQ conversion, for any
@@ -441,8 +448,8 @@ the allocation contract. All scratch is initialized each execution.
 A compiled accumulation plan accepts runtime scalar overrides only when both
 scale and scale*log2(e) remain finite and positive in FP32. Changing the scale
 never silently changes implementation. SM100 and SM103 are the runtime
-qualification targets. The row remains opt-in, and
-performance qualification is separate from capability tests. The graph tests
+qualification targets. The row is a default candidate, ranked ahead of the backend only for d128 THD without a window
+(`sdpa/bwd/heuristics.py`); performance qualification is separate from capability tests. The graph tests
 in `test_sdpa_bwd_d128_sm100.py` and `test_sdpa_bwd_d128_accum_sm100.py` cover
 all three gradients, launch counts, workspace bounds, buffer rebinding and
 capture/replay. Native frame tests cover the prepared hosts.
@@ -3703,6 +3710,50 @@ end to end against the fp32 block oracle (the serving-forms section above, `test
 Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): THD and paged pools in one declaration, THD with the in-block indexer (through the block), any of the decode form's three arms under THD, a shared list at `S_q > 4`, a split past the item's tile
 count, the kernel's own epilogue gate under a split (the combine carries it), a sink, a sliding window / band, Q-length trimming
 of a dense batch, log2 stats, a pure caller list without the tail, head dims other than 256, FP8 / MXFP8.
+
+**The SECOND BODY of the function -- the LEAN decode tile** (`python/cudnn/sdpa/fwd/kernels/sm107/sparse_lean_d256_f16.py`: `mma.sync`
+m16n8k16 + `cp.async`, one 128-thread CTA per (sequence, KV head, chunk of `k` 32-key sub-tiles), four warps each owning a 64-wide
+d-slice -- BMM1 split-K over the warps with an 8-KiB SMEM exchange and a fixed-order sum, the softmax redundant per warp, BMM2 on the
+warp's own 16 x 64 O slice --, the one-shot zero-filled `cp.async` gather of the rows the list names, no TMEM / TMA / CLC / mbarrier /
+warp specialization; the visible set from the ONE helper it shares with the tcgen05 core, `sm107/_sparse_item_common.py`, whose cubins
+stayed byte-identical through the lift).  A kernel-INVENTORY fact, not a capability: the `SparseCapabilities` record gains NO field (the
+function is the tcgen05 core's, within the fixed-order-sum budget -- never bitwise ACROSS the bodies, bitwise WITHIN each: two launches,
+replay == eager, paged == dense, the per-row list at one row per sequence == the shared list).  Reached through the adapter's
+PERFORMANCE knob `tile_form="auto" | "lean" | "tcgen05"` (the block's `sparse_tile_form`; `sub_tiles_per_cta` / `sparse_sub_tiles_per_cta`
+pins `k`), read back as `kernel_template` / `sparse_tile` (`"sparse_lean_d256_f16"` / `"sparse_d256_f16"`; the envelope's `decode.sparse_tiles`
+/ `.sparse_tile(s_q, batch)` / `.sparse_tile_lean_default`).  Its envelope: the DECODE form only (`bottom_right` + the shared list at
+`S_q <= 4` -- every row of the step in ONE CTA: `n_mt = ceil(S_q x G / 16)` m16 tiles of 128 threads over one gathered 32-key sub-tile,
+where the tcgen05 core runs every row as its own item and re-gathers the list `S_q` times; `TemplateParamsLean.decode_seqlen_q` is the
+record's compile-time axis and `config_sm107.LEAN_SPARSE_SERVED_MAX_S_Q` = 4 the one constant the route reads --, or the per-row list at
+`S_q == 1`, which IS the shared list; per-row lists past one row are the core's), `seq_kv_lens` present, dense BSHD or paged pools (HND / NHD, pages 16 / 48 / 64
+validated; never THD), bf16 / f16, G 1..16, `top_k` a multiple of 4 in [8, 512] (below 8 the list is one sub-tile: the tcgen05 core's
+cell); it ALWAYS splits -- `split_kv` is a LEAN split `ceil(n_sub / k)` (65 / 33 / 22 / 17 / 13 / 11 / 10 / 9 at `top_k` 512, `n_sub =
+ceil((top_k + 2) x 4 / 32)`; a pinned split SELECTS `k`, 1 <= k <= min(8, n_sub - 1); the default `k` 1) writing the SAME fp32 split-major
+partial slab the tcgen05 core's split store writes (the combine, its pinned form -- the decode-grid kernel on the 24- / 96-row grids at
+split 65 / 33, the module's own forms at 384 rows below split 32, the AUTO entry past the decode-grid bound -- and the gate riding it
+untouched; `heuristics.SPARSE_LEAN_COMBINE_FORM_CELLS` names the measured and the owed cells).  Every other arm is a typed decline naming it
+(`heuristics.sparse_lean_tile_decline`: THD, a prefill / top-left form, no `seq_kv_lens`, `S_q` past the served rows, per-row lists past one
+row, `top_k` below 8, the tcgen05 core's `softmax_groups`; a split that is not a lean split; the `k` pin out of range or under another body)
+-- never a silent fallback.  Over e4m3 pools (`kv_cache_dtype=torch.float8_e4m3fn`) NO body of the sparse core runs -- the gathered cast + the
+dense decode tile --, so an explicit body is a typed decline naming the arm and `sparse_tile` / the envelope's `.sparse_tile(..., kv_cache_dtype=e4m3)`
+read None (never the name of a kernel that does not run).  PLACEMENT (`heuristics.sparse_decode_lean_tile_selected`): the lean tile below `B x H_kv x S_q <=
+LEAN_SPARSE_MAX_UNITS = 32` units on cc 10.7 with `top_k >= 8`, the tcgen05 core above -- consulted by `"auto"` ONLY on the parts of
+`heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS` = `((10, 7),)` since the end-to-end gate (2026-10-26; the measured-default rule: the tuple
+flipped with the gate's table, the bound `LEAN_SPARSE_MAX_UNITS` refit from it to 4), so `"auto"` takes the lean tile on cc 10.7 inside the
+bound and the tcgen05 core on every other part / past the bound; the explicit `"lean"` takes it anywhere the body serves the declaration.
+Kernel-alone evidence on the Rubin performance class (212 SMs at the 2376
+MHz lock, one process, A/B/A x 3 rounds x 10 replays of 100 launches, the control pair within 0.32 %, the oracle green before timing):
+B 1 x 8K x S_q 1 at `top_k` 512 on page-16 pools 3.341 us (3.352 with the build order rotated) against the tcgen05 core's 5.655 (+69.3 %),
+B 1 x 32K 3.302 vs 5.648 (+71.0 %), B 4 x 8K 5.538 vs 6.417 (+15.9 %, informative); the chain (tile + the pinned decode-grid combine at
+split 65 vs the core + its combine at split 16) 8.32 -> 5.75 us and 8.31 -> 5.69 us at the two B 1 cells (+44.9 % / +46.0 %; 7.0 % / 6.8 %
+of the 36.8 / 38.3-us decode step).  **End to end (the gate, 2026-10-26; the table in the gate commit): MEASURED 2026-10-26 on an exclusive 212-SM cc 10.7 part at the 2376 MHz lock (CUDA-graph replay, one process per cell with every arm, A/B/A x 3 x 100, the control pair within 1 %, every oracle before timing): the lean body vs the tcgen05 core in the same block, B 1 x 8K x S_q 1 34.8 -> 32.5 us per decode step (+6.8 %, 2.22 us; +5.9 % / 1.93 us symmetric with the arms built in the other order) and B 1 x 32K 36.6 -> 34.6 us (+5.7 %, 1.98 us; +5.6 % symmetric); B 1 x S_q 1 geomean +5.8 %, B 4 x S_q 1 -2.6 %, B 32 x S_q 1 -57.1 % past the bound; the shared-list caller block at S_q 4 (one list per sequence) B 1 +6.6 %, B 4 -9.2 %; route-class cells losing beyond their band: B 4 x 2K x S_q 1 -2.6 %; B 4 x 8K x S_q 1 -3.5 %; B 4 x 32K x S_q 1 -2.0 %; B 4 x 128K x S_q 1 -2.2 %; B 4 x 8K x S_q 4 -9.7 %; B 4 x 32K x S_q 4 -8.8 %; B 4 x 128K x S_q 4 -9.2 %; B 8 x 8K x S_q 1 -17.2 %; B 8 x 32K x S_q 1 -16.3 %; B 16 x 8K x S_q 1 -44.1 %; B 16 x 32K x S_q 1 -43.6 % -> LEAN_SPARSE_MAX_UNITS 32 -> 4.  The refit: The gate's table by units level (the lean lever per step, POSITIVE = the lean body faster): 2 units: B 1 x S_q 1 (the e2e block) +6.8 % / +5.7 % / +4.8 % at 8K / 32K / 128K; 4 units: B 2 x S_q 1 (the e2e block) +1.8 % / +1.3 % at 8K / 32K; 8 units: B 4 x S_q 1 (the e2e block) -2.6 % / -3.5 % / -2.0 % / -2.2 % at 2K / 8K / 32K / 128K; B 1 x S_q 4 (the shared-list block) +6.4 % / +6.6 % / +6.8 % at 8K / 32K / 128K; 16 units: B 8 x S_q 1 (the e2e block) -17.2 % / -16.3 % at 8K / 32K; 32 units: B 16 x S_q 1 (the e2e block) -44.1 % / -43.6 % at 8K / 32K; B 4 x S_q 4 (the shared-list block) -9.7 % / -8.8 % / -9.2 % at 8K / 32K / 128K; 64 units: B 32 x S_q 1 (the e2e block) -60.8 % / -58.7 % / -51.3 % at 8K / 32K / 128K; 256 units: B 32 x S_q 4 (the shared-list block) -36.4 % / -36.5 % / -35.7 % at 8K / 32K / 128K; a route class losing beyond its control band excludes every level from it up -> 4.**  Validated functionally
+on the Rubin development class (204 SMs): the adapter's lean route (the ladder against the fp32 oracle anchored at the step-0 position,
+the gate through the combine, paged == dense bitwise, the per-row == the shared list bitwise, the PDL arm bitwise the plain arm, a dead
+sequence, `top_k` 8, G 16 / one KV head, f16, `k` 2 / 4 by a pinned split or a pinned `k`) and the block's (`sparse_tile_form="lean"` vs
+`"tcgen05"`: `out` within the module's bars, the gated O and the LSE within 2e-2, the list bitwise; the kernel-name census -- one
+`cudnn_sparse_lean_kernel`, no `cudnn_kernel__kernel` core, the launch count equal --; the in-block indexer's decode step on the lean
+route, list / counts / side caches bitwise the core's; the workspace honest under the lean split; the first execute captured on the lean
+route replaying bitwise; four end-to-end decode steps after a prefill tracking the core's within the bars).
 
 ### SM107 half D512 packed and split plans
 
