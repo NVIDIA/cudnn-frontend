@@ -29,6 +29,7 @@ from cutlass.memory import SmemAllocator
 from cudnn.norm.utils import ws_bytes, ws_empty, ws_zeros, cur_stream, dyn, fake_stream, smem_capacity
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from cudnn.norm._common_sm100 import (
+    affine_gamma,
     STAGE_BULK,
     STAGE_NONE,
     block_reduce_sum2,
@@ -59,9 +60,17 @@ def _ln_bwd_kernel(
     vec: cutlass.Constexpr,
     has_mean: cutlass.Constexpr,
     has_beta: cutlass.Constexpr,
+    affine: cutlass.Constexpr = None,
 ) -> None:
     tid, _, _ = cute.arch.thread_idx()
     r, _, _ = cute.arch.block_idx()
+    per_row: cutlass.Constexpr = affine is not None and affine[3]
+    gamma_step: cutlass.Constexpr = 0 if per_row else 1
+    gamma_base = cutlass.Int64(0)
+    if cutlass.const_expr(per_row):
+        gamma_base = cutlass.Int64(r)
+    elif cutlass.const_expr(affine is not None):
+        gamma_base = cutlass.Int64((r // affine[1]) % affine[0]) * M
     staged: cutlass.Constexpr = stage_mode != STAGE_NONE
     nv: cutlass.Constexpr = M // V
 
@@ -95,14 +104,18 @@ def _ln_bwd_kernel(
         while j < M:
             x = sX[j].to(cutlass.Float32)
             dy = sDY[j].to(cutlass.Float32)
-            g = mGamma[j].to(cutlass.Float32)
+            g = affine_gamma(mGamma[gamma_base + j * gamma_step], affine)
             xhat = (x - mean) * rstd
             dxhat = dy * g
-            s_dxhat = s_dxhat + dxhat
-            s_dxhat_xhat = s_dxhat_xhat + dxhat * xhat
-            cute.arch.atomic_add(mDGamma.iterator + j, dy * xhat)
-            if cutlass.const_expr(has_beta):
-                cute.arch.atomic_add(mDBeta.iterator + j, dy)
+            if cutlass.const_expr(per_row):
+                s_dxhat = s_dxhat + dy
+                s_dxhat_xhat = s_dxhat_xhat + dy * xhat
+            else:
+                s_dxhat = s_dxhat + dxhat
+                s_dxhat_xhat = s_dxhat_xhat + dxhat * xhat
+                cute.arch.atomic_add(mDGamma.iterator + gamma_base + j * gamma_step, dy * xhat)
+                if cutlass.const_expr(has_beta):
+                    cute.arch.atomic_add(mDBeta.iterator + gamma_base + j * gamma_step, dy)
             j = j + bt
     elif cutlass.const_expr(vec):
         xv = cute.zipped_divide(mX[r, None], (V,))
@@ -117,31 +130,49 @@ def _ln_bwd_kernel(
             for e in cutlass.range_constexpr(V):
                 x = xf[e].to(cutlass.Float32)
                 dy = dyf[e].to(cutlass.Float32)
-                g = mGamma[j0 + e].to(cutlass.Float32)
+                g = affine_gamma(mGamma[gamma_base + (j0 + e) * gamma_step], affine)
                 xhat = (x - mean) * rstd
                 dxhat = dy * g
-                s_dxhat = s_dxhat + dxhat
-                s_dxhat_xhat = s_dxhat_xhat + dxhat * xhat
-                cute.arch.atomic_add(mDGamma.iterator + (j0 + e), dy * xhat)
-                if cutlass.const_expr(has_beta):
-                    cute.arch.atomic_add(mDBeta.iterator + (j0 + e), dy)
+                if cutlass.const_expr(per_row):
+                    s_dxhat = s_dxhat + dy
+                    s_dxhat_xhat = s_dxhat_xhat + dy * xhat
+                else:
+                    s_dxhat = s_dxhat + dxhat
+                    s_dxhat_xhat = s_dxhat_xhat + dxhat * xhat
+                    cute.arch.atomic_add(mDGamma.iterator + gamma_base + (j0 + e) * gamma_step, dy * xhat)
+                    if cutlass.const_expr(has_beta):
+                        cute.arch.atomic_add(mDBeta.iterator + gamma_base + (j0 + e) * gamma_step, dy)
             vi = vi + bt
     else:
         j = tid
         while j < M:
             x = mX[r, j].to(cutlass.Float32)
             dy = mDY[r, j].to(cutlass.Float32)
-            g = mGamma[j].to(cutlass.Float32)
+            g = affine_gamma(mGamma[gamma_base + j * gamma_step], affine)
             xhat = (x - mean) * rstd
             dxhat = dy * g
-            s_dxhat = s_dxhat + dxhat
-            s_dxhat_xhat = s_dxhat_xhat + dxhat * xhat
-            cute.arch.atomic_add(mDGamma.iterator + j, dy * xhat)
-            if cutlass.const_expr(has_beta):
-                cute.arch.atomic_add(mDBeta.iterator + j, dy)
+            if cutlass.const_expr(per_row):
+                s_dxhat = s_dxhat + dy
+                s_dxhat_xhat = s_dxhat_xhat + dy * xhat
+            else:
+                s_dxhat = s_dxhat + dxhat
+                s_dxhat_xhat = s_dxhat_xhat + dxhat * xhat
+                cute.arch.atomic_add(mDGamma.iterator + gamma_base + j * gamma_step, dy * xhat)
+                if cutlass.const_expr(has_beta):
+                    cute.arch.atomic_add(mDBeta.iterator + gamma_base + j * gamma_step, dy)
             j = j + bt
 
     s_dxhat, s_dxhat_xhat = block_reduce_sum2(s_dxhat, s_dxhat_xhat, tid, red, bt)
+    if cutlass.const_expr(per_row):
+        # One CTA owns this sample/channel, so write its spatial reductions
+        # directly. Multiplying afterward also handles zero effective gamma.
+        if tid == 0:
+            mDGamma[gamma_base] = s_dxhat_xhat
+            if cutlass.const_expr(has_beta):
+                mDBeta[gamma_base] = s_dxhat
+        row_gamma = affine_gamma(mGamma[gamma_base], affine)
+        s_dxhat = s_dxhat * row_gamma
+        s_dxhat_xhat = s_dxhat_xhat * row_gamma
     a = cutlass.Float32(0.0)
     if cutlass.const_expr(has_mean):
         a = s_dxhat / Mf
@@ -164,7 +195,7 @@ def _ln_bwd_kernel(
             for e in cutlass.range_constexpr(V):
                 x = (sX[j0 + e] if cutlass.const_expr(staged) else xf[e]).to(cutlass.Float32)
                 dy = (sDY[j0 + e] if cutlass.const_expr(staged) else dyf[e]).to(cutlass.Float32)
-                g = mGamma[j0 + e].to(cutlass.Float32)
+                g = affine_gamma(mGamma[gamma_base + (j0 + e) * gamma_step], affine)
                 xhat = (x - mean) * rstd
                 dxhat = dy * g
                 dxf[e] = (rstd * (dxhat - a - xhat * b)).to(mDX.element_type)
@@ -175,7 +206,7 @@ def _ln_bwd_kernel(
         while j < M:
             x = (sX[j] if cutlass.const_expr(staged) else mX[r, j]).to(cutlass.Float32)
             dy = (sDY[j] if cutlass.const_expr(staged) else mDY[r, j]).to(cutlass.Float32)
-            g = mGamma[j].to(cutlass.Float32)
+            g = affine_gamma(mGamma[gamma_base + j * gamma_step], affine)
             xhat = (x - mean) * rstd
             dxhat = dy * g
             mDX[r, j] = (rstd * (dxhat - a - xhat * b)).to(mDX.element_type)

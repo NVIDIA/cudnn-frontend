@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional
 
 import cudnn
@@ -89,6 +89,7 @@ class NormGraphFacts:
     normalized_shape: Optional[tuple] = None  # LayerNorm/RMSNorm
     num_groups: Optional[int] = None  # GroupNorm
     dtype: Optional[torch.dtype] = None  # X dtype
+    compute_dtype: Any = None
     uniform_dtype: bool = True  # scale/bias (and DY) share X's dtype; stats are always fp32
 
     # requested features / scalars
@@ -100,6 +101,16 @@ class NormGraphFacts:
     momentum: float = 0.1
     momentum_t: Any = None
     wants_running_stats: bool = False
+    adaptive: bool = False
+    affine_batches: int = 1
+    affine_row_divisor: int = 1
+    zero_centered_gamma: bool = False
+    scale_add_dtype: Any = None
+    scale_one_t: Any = None
+
+    @property
+    def extended_affine(self):
+        return self.adaptive or self.zero_centered_gamma
 
     device_cc: Optional[tuple] = None
 
@@ -127,12 +138,10 @@ def _norm_node(graph: "cudnn.pygraph") -> Optional[Any]:
         nodes = graph.nodes
     except Exception:  # noqa: BLE001 — non-IR graph objects
         return None
-    if len(nodes) != 1:
+    norms = [node for node in nodes if _node_variant(node) is not None]
+    if len(norms) != 1 or len(nodes) > 2:
         return None
-    node = nodes[0]
-    if _node_variant(node) is None:
-        return None
-    return node
+    return norms[0]
 
 
 def _node_type_name(node: Any) -> str:
@@ -208,11 +217,40 @@ def _extract_facts(node: Any) -> NormGraphFacts:
     if variant == NormVariant.GROUP_NORM and num_groups is None:
         return _invalid("GroupNorm node missing num_groups")
 
-    # LayerNorm/RMSNorm normalize over scale's shape (trailing dims).
+    adaptive = "ADA" in _node_type_name(node) or bool(params.get("adaptive", False))
+    affine_batches, affine_row_divisor = 1, 1
+    if adaptive:
+        if scale is None:
+            return _invalid("adaptive normalization requires scale")
+        ss = tuple(scale.get_dim())
+        if variant == NormVariant.INSTANCE_NORM:
+            if len(x_shape) not in (3, 4, 5):
+                return _invalid("adaptive InstanceNorm requires NCL, NCHW, or NCDHW input")
+            if ss != (*x_shape[:2], *((1,) * (len(x_shape) - 2))):
+                return _invalid("adaptive InstanceNorm scale must be per sample/channel with singleton spatial dimensions")
+            affine_batches = x_shape[0] * x_shape[1]
+        elif variant in (NormVariant.LAYER_NORM, NormVariant.RMS_NORM):
+            if len(x_shape) != 3:
+                return _invalid("adaptive LayerNorm/RMSNorm requires rank-3 X")
+            a, b, d = x_shape
+            if ss == (a, 1, d):
+                affine_batches, affine_row_divisor = a, b
+            elif ss == (1, b, d):
+                affine_batches, affine_row_divisor = b, 1
+            else:
+                return _invalid("adaptive scale must be [B,1,D] or [1,B,D] matching X")
+        else:
+            return _invalid(f"adaptive affine is not supported for {variant.value}")
+        if bias is not None and tuple(bias.get_dim()) != ss:
+            return _invalid("adaptive bias must have the scale shape")
+
+    # LayerNorm/RMSNorm normalize over scale's trailing feature dimensions.
     normalized_shape = None
     if variant in (NormVariant.LAYER_NORM, NormVariant.RMS_NORM) and scale is not None:
         sshape = tuple(d for d in tuple(scale.get_dim()) if d != 1)
-        normalized_shape = sshape or x_shape[-1:]
+        normalized_shape = x_shape[-1:] if adaptive else (sshape or x_shape[-1:])
+    elif variant == NormVariant.INSTANCE_NORM and adaptive:
+        normalized_shape = x_shape[2:]
 
     # epsilon is an input TENSOR on a cuDNN graph, not a node param: reading it from
     # params alone silently yields the 1e-5 default for every graph that passes a
@@ -265,10 +303,14 @@ def _extract_facts(node: Any) -> NormGraphFacts:
     return NormGraphFacts(
         variant=variant,
         phase=phase,
+        adaptive=adaptive,
+        affine_batches=affine_batches,
+        affine_row_divisor=affine_row_divisor,
         x_shape=x_shape,
         normalized_shape=normalized_shape,
         num_groups=int(num_groups) if num_groups is not None else None,
         dtype=x_dtype,
+        compute_dtype=getattr(node, "compute_data_type", None),
         uniform_dtype=uniform,
         has_beta=(bias is not None) if phase == "fprop" else (dbias_out is not None),
         has_mean=HAS_MEAN[variant],
@@ -296,26 +338,53 @@ def _extract_facts(node: Any) -> NormGraphFacts:
     )
 
 
+def _analyze(graph: "cudnn.pygraph") -> Optional[NormGraphFacts]:
+    """Describe a norm and its optional scalar-add scale prologue.
+
+    Mutable graphs are analyzed afresh. The graph lifecycle caches facts after
+    freezing the declaration, alongside the other engine families.
+    """
+    node = _norm_node(graph)
+    if node is None:
+        return None
+    facts = _extract_facts(node)
+    if facts.invalid or len(graph.nodes) == 1:
+        return facts
+    add = next(n for n in graph.nodes if n is not node)
+    mode = getattr(add, "params", {}).get("mode")
+    if _node_type_name(add) != "POINTWISE" or str(getattr(mode, "name", mode)).lower() != "add":
+        return None
+    if facts.variant not in (NormVariant.LAYER_NORM, NormVariant.RMS_NORM) and not (facts.variant == NormVariant.INSTANCE_NORM and facts.adaptive):
+        return None
+    if getattr(add, "compute_data_type", None) not in (None, cudnn.data_type.FLOAT):
+        return None
+    outputs = list(add.outputs.values())
+    if len(outputs) != 1 or outputs[0] is not facts.scale_t or not outputs[0].get_is_virtual():
+        return None
+    operands = list(add.inputs.values())
+    if len(operands) != 2:
+        return None
+    for gamma, one in (operands, operands[::-1]):
+        if tuple(gamma.get_dim()) != tuple(facts.scale_t.get_dim()):
+            continue
+        if not one.get_is_pass_by_value() or any(d != 1 for d in one.get_dim()):
+            continue
+        value = getattr(one, "pass_by_value", None)
+        if value is not None and value != 1.0:
+            continue
+        return replace(facts, scale_t=gamma, scale_one_t=one, zero_centered_gamma=True, scale_add_dtype=outputs[0].get_data_type())
+    return None
+
+
 _FACTS_CACHE: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 
 
 def analyze(graph: "cudnn.pygraph") -> Optional[NormGraphFacts]:
-    """Facts for a single-norm graph, or None if the graph is anything else."""
-    node = _norm_node(graph)
-    if node is None:
-        return None
-    try:
-        cached = _FACTS_CACHE.get(graph)
-    except TypeError:
-        cached = None
-    if cached is not None and cached[0] == len(graph.nodes):
-        return cached[1]
-    facts = _extract_facts(node)
-    try:
-        _FACTS_CACHE[graph] = (len(graph.nodes), facts)
-    except TypeError:
-        pass
-    return facts
+    if not getattr(graph, "_frozen", False):
+        return _analyze(graph)
+    if graph not in _FACTS_CACHE:
+        _FACTS_CACHE[graph] = _analyze(graph)
+    return _FACTS_CACHE[graph]
 
 
 # ---------------------------------------------------------------------------
