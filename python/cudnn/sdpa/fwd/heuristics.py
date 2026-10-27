@@ -2734,8 +2734,9 @@ def _d128_thd_split_units(facts, pack_g: int) -> int:
     return tiles * (facts.h_q // pack_g)
 
 
-def _d128_thd_split_wave_choice(facts, *, extra_waves: int = 1) -> Tuple[int, bool]:
-    """Score the physical packed/unpacked grids, preserving first-wave wins."""
+def _d128_thd_split_wave_choice(facts, *, extra_waves: int = 1, prefer_pack: bool = False) -> Tuple[int, bool]:
+    """Score the physical packed/unpacked grids, preserving first-wave wins. ``prefer_pack`` breaks equal-work ties toward the
+    packed grid (Rubin: see :func:`paged_thd_split_choice`)."""
     kv_tiles = _ceil_div(facts.s_kv, 128)
     sm_count = facts.device_sm_count or 128
     for waves in ((1, extra_waves) if extra_waves > 1 else (1,)):
@@ -2748,9 +2749,9 @@ def _d128_thd_split_wave_choice(facts, *, extra_waves: int = 1) -> Tuple[int, bo
             budget = min(16, waves * sm_count // units, kv_tiles // 4)
             for splits in range(2, budget + 1):
                 work = _ceil_div(units * splits, sm_count) * _ceil_div(kv_tiles, splits)
-                choices.append((work, splits, pack))
+                choices.append((work, splits, pack != prefer_pack, pack))
         if choices:
-            _, splits, pack = min(choices)
+            _, splits, _, pack = min(choices)
             return splits, pack
     return 1, False
 
@@ -2825,15 +2826,16 @@ def paged_thd_split_choice(caps: Capabilities, facts, *, first_wave: bool = Fals
         splits = _ceil_div(kv_tiles, loop_tiles)
         if splits > 1:
             work = _ceil_div(units * splits, sm_count) * loop_tiles
-            # Equal loop work prefers fewer partials, then fewer physical CTAs.
-            choices.append((work, splits, units, pack))
+            # Equal loop work prefers fewer partials, then fewer physical CTAs, then the packed grid: the declaration bounds
+            # the live tokens from above, and packed tiles shrink with them while unpacked ones keep a tile per head.
+            choices.append((work, splits, units, not pack, pack))
     if choices:
-        _, splits, _, pack = min(choices)
+        _, splits, _, _, pack = min(choices)
         return splits, pack
     if caps.sm_lo == 107 and facts.b <= 4 and facts.s_q <= 128 and facts.s_kv >= 8192:
         # Preserve first-wave choices. One-tile queries can use more waves;
         # longer queries can already use an efficient backend prefill tile.
-        return _d128_thd_split_wave_choice(facts, extra_waves=3)
+        return _d128_thd_split_wave_choice(facts, extra_waves=3, prefer_pack=True)
     return 1, False
 
 
