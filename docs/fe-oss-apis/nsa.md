@@ -550,6 +550,35 @@ topk.execute(
 
 ---
 
+## JAX
+
+The `cudnn.ops.nsa` family runs the selection, compression and top-k kernels
+on JAX arrays, eagerly or under `jax.jit`, without PyTorch:
+
+| JAX op | PyTorch wrapper |
+| --- | --- |
+| `cudnn.ops.nsa.selection_attention_forward_jax` | `NSA.selection_attention_wrapper` |
+| `cudnn.ops.nsa.compression_attention_forward_jax` | `NSA.compression_attention_wrapper` (with LSE) |
+| `cudnn.ops.nsa.top_k_reduction_forward_jax` | `NSA.topk_reduction_wrapper` |
+
+Each returns a dict with the wrapper's keys. The JAX ops take packed (T, H, D)
+inputs only, compute in FP32, and take `max_s_q` / `max_s_k` as static
+per-sequence maxima, because they never read sequence offsets on the host.
+Compression always returns the LSE, stored head-major as top-k reads it.
+Selection runs on SM90/SM100/SM103; compression and top-k on SM100/SM103.
+Sliding window attention runs on the cuDNN graph API and has no JAX op here; use
+JAX's cuDNN attention (`jax.nn.dot_product_attention(..., implementation="cudnn",
+local_window_size=...)`).
+
+```python
+import jax
+from cudnn.ops import nsa
+
+cmp = jax.jit(nsa.compression_attention_forward_jax)(q, k_cmp, v_cmp, cu_q, cu_k)
+topk = jax.jit(lambda *a: nsa.top_k_reduction_forward_jax(*a, max_s_q, max_s_k))(q, k_cmp, cmp["lse_tensor"], cu_q, cu_k)
+sel = jax.jit(lambda *a: nsa.selection_attention_forward_jax(*a, max_s_q, block_size))(q, k, v, block_indices, block_counts, cu_q)
+```
+
 ## Tensor Formats
 
 ### Supported Layouts
