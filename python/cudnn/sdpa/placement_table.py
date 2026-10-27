@@ -4,7 +4,7 @@
 """Measured placement table: FROST row vs the backend, per shape class, generated from frozen sweeps.
 
 A class is read off the graph facts (row, device, dtype, head pair, phase, layout, mask, sink, MHA vs GQA). Each entry
-is a monotone rule on ONE work scalar, ``log2(h_q * b * s_q * s_kv)``: ``always``, ``never``, ``ge T`` (FROST leads
+is a monotone rule on ONE work scalar, :func:`log2_work` (a roofline-shaped cost proxy): ``always``, ``never``, ``ge T`` (FROST leads
 from T up) or ``le T`` (FROST leads up to T). Entries are produced by ``benchmark/placement_gen`` from a training grid
 and qualified on a frozen holdout; every entry names its study. Do not edit entries by hand -- regenerate.
 
@@ -79,8 +79,19 @@ def class_key(row: str, facts) -> Optional[Tuple]:
     return (row, tuple(facts.device_cc or ()), dtype, (facts.d_qk, facts.d_v), phase, layout, mask, bool(facts.has_sink), group)
 
 
+COST_BALANCE = 16.0
+"""FLOPs per byte at which the cost proxy switches from bytes to FLOPs. Chosen from the data, not the part's peak: with
+16, one threshold per class fits the three B200 studies at once (prefill-shaped backward is FLOP-bound, d256 decode is
+KV-byte-bound and independent of h_q, D576 MLA decode with up to 128 query heads is FLOP-bound); 8, 32 and the
+part's ~280 each lose one of them."""
+
+
 def log2_work(facts) -> float:
-    return math.log2(max(1, facts.h_q * facts.b * facts.s_q * facts.s_kv))
+    """log2 of a roofline-shaped cost proxy, max(FLOPs / COST_BALANCE, bytes), for bf16 / f16 Q, K, V, O."""
+    width = facts.d_qk + facts.d_v
+    flops = 2.0 * facts.b * facts.h_q * facts.s_q * facts.s_kv * width
+    nbytes = 2.0 * facts.b * (facts.h_kv * facts.s_kv + facts.h_q * facts.s_q) * width
+    return math.log2(max(1.0, flops / COST_BALANCE, nbytes))
 
 
 def lookup(row: str, facts) -> Optional[bool]:
@@ -97,7 +108,10 @@ def lookup(row: str, facts) -> Optional[bool]:
 # ---------------------------------------------------------------------------------------------------------------- generated
 # benchmark/placement_gen/gen.py --emit; one block per study, keys sorted. Do not edit by hand.
 TABLE: Dict[Tuple, Entry] = {
+    # study sm100_d256_decode_20261027 (full-power B200, cuDNN 9.28.0.38; frozen 200-case grid, 40-case holdout)
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "dense", "none", False, "gqa"): Entry("ge", 26.001, "sm100_d256_decode_20261027"),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa"): Entry("ge", 26.002, "sm100_d256_decode_20261027"),
     # study sm100_d576_decode_20261027 (full-power B200, cuDNN 9.28.0.38; frozen 128-case grid, 40-case holdout)
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "mtp", "paged", "causal_br", False, "gqa"): Entry("always", None, "sm100_d576_decode_20261027"),
-    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "q1", "paged", "none", False, "gqa"): Entry("ge", 19.5, "sm100_d576_decode_20261027"),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "q1", "paged", "none", False, "gqa"): Entry("ge", 26.588, "sm100_d576_decode_20261027"),
 }

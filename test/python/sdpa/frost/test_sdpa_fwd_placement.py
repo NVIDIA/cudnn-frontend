@@ -190,7 +190,7 @@ def test_paged_d512_decode_trails_until_its_decode_tile():
 @pytest.mark.L0
 def test_paged_d576_mla_decode_leads_past_its_work_floor():
     """Paged bf16 D576x512 MLA decode leads at s_q == 1 once log2(h_q * b * S_kv) passes the generated table's threshold
-    (study sm100_d576_decode_20261027, cc 10.0); dense K/V, a window, a sink or f16 keep the backend's decode engine;
+    (study sm100_d576_decode_20261027, cc 10.0; log2_work is the table's cost proxy); dense K/V, a window, a sink or f16 keep the backend's decode engine;
     multi-token decode keeps the decode-shaped LEAD; graphs outside the table keep the #1933 hand floor."""
     import math
 
@@ -204,8 +204,9 @@ def test_paged_d576_mla_decode_leads_past_its_work_floor():
     for h_q in (16, 32, 64, 128):
         for b in (1, 8, 32, 128):
             for s_kv in (2048, 8192, 32768, 131072):
-                want = placement.LEAD if math.log2(h_q * b * s_kv) >= entry.log2_work else placement.TRAIL
-                assert placement.place(spec, _facts(s_q=1, h_q=h_q, b=b, s_kv=s_kv, **mla)) == want, (h_q, b, s_kv)
+                facts = _facts(s_q=1, h_q=h_q, b=b, s_kv=s_kv, **mla)
+                want = placement.LEAD if placement_table.log2_work(facts) >= entry.log2_work else placement.TRAIL
+                assert placement.place(spec, facts) == want, (h_q, b, s_kv)
     lead = dict(h_q=64, b=64, s_kv=8192)
     assert placement.place(spec, _facts(s_q=1, **lead, **mla)) == placement.LEAD
     assert placement.place(spec, _facts(s_q=1, **lead, **{**mla, "has_paged_kv": False, "page_size": 0})) == placement.TRAIL

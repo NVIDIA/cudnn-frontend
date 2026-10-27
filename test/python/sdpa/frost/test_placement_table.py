@@ -76,7 +76,16 @@ def test_threshold_entries_split_on_log2_work():
     row = "sdpa_fwd_prefill_sm100"
     entry = pt.TABLE[pt.class_key(row, _facts())]
     assert entry.direction == "ge"
-    low = _facts(h_q=16, b=1, s_kv=2 ** math.floor(entry.log2_work) // 16)
-    high = _facts(h_q=16, b=1, s_kv=2 ** math.ceil(entry.log2_work + 0.5) // 16)
+    low, high = _facts(h_q=16, b=1, s_kv=2048), _facts(h_q=128, b=128, s_kv=131072)
+    assert pt.log2_work(low) < entry.log2_work < pt.log2_work(high)
     assert pt.lookup(row, low) is False and pt.lookup(row, high) is True
     assert pt.lookup(row, _facts(device_cc=(10, 3))) is None  # another part: no study, hand rules decide
+
+
+@pytest.mark.L0
+def test_cost_proxy_is_byte_bound_for_decode_and_flop_bound_for_prefill():
+    """Decode cost follows KV bytes (independent of h_q at a fixed group of KV heads); prefill follows FLOPs."""
+    dec = dict(d_qk=256, d_v=256, s_q=1, h_kv=1, b=16, s_kv=32768)
+    assert pt.log2_work(_facts(h_q=4, **dec)) == pytest.approx(pt.log2_work(_facts(h_q=16, **dec)), abs=0.01)
+    pre = dict(d_qk=256, d_v=256, s_kv=4096, h_kv=2, b=1, h_q=32)
+    assert pt.log2_work(_facts(s_q=4096, **pre)) == pytest.approx(pt.log2_work(_facts(s_q=2048, **pre)) + 1)
