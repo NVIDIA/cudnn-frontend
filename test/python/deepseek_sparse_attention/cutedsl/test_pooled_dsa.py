@@ -321,7 +321,7 @@ def _quantize_index_values(value, dtype):
     return code[..., ::2] | (code[..., 1::2] << 4), (exponent + 127).byte(), decoded
 
 
-def _indexer_case(dtype, packed_scales=False, selected_pools=32, pool_size=4, page_size=64):
+def _indexer_case(dtype, packed_scales=False, selected_pools=32, pool_size=4, page_size=64, native=False, folded=False):
     pytest.importorskip("triton", minversion="3.7.0")
     torch.manual_seed(109)
     requests, pages = 3, 13
@@ -332,7 +332,26 @@ def _indexer_case(dtype, packed_scales=False, selected_pools=32, pool_size=4, pa
     k, ks, decoded_k = _quantize_index_values(torch.randn(requests, capacity, 128, device="cuda", dtype=torch.bfloat16), dtype)
     weights = torch.randn(rows, 32, device="cuda") / 64
     reference_weights = weights.clone()
-    if dtype == "fp8":
+    if native:
+        if dtype == "fp8":
+            ks = (ks.log2() + 127).byte().expand(*ks.shape[:-1], 4).contiguous()
+            if folded:
+                weights *= qs.squeeze(-1)
+                decoded_q = q.float()
+                qs = None
+            else:
+                qs = (qs.log2() + 127).byte().expand(*qs.shape[:-1], 4).contiguous()
+                qs += torch.randint(0, 3, qs.shape, device="cuda", dtype=torch.uint8)
+                ks += torch.randint(0, 3, ks.shape, device="cuda", dtype=torch.uint8)
+                decoded_q = q.float() * (qs.float() - 127).exp2().repeat_interleave(32, -1)
+                decoded_k = k.float() * (ks.float() - 127).exp2().repeat_interleave(32, -1)
+        weights = weights.bfloat16()
+        reference_weights = weights.clone()
+        if packed_scales and qs is not None:
+            qs = qs.view(torch.int32).squeeze(-1)
+        if dtype == "fp4" and packed_scales:
+            q = q.view(torch.int8)
+    elif dtype == "fp8":
         weights *= qs.squeeze(-1)
         qs = None
     elif dtype == "fp4" and packed_scales:
@@ -356,19 +375,36 @@ def _indexer_case(dtype, packed_scales=False, selected_pools=32, pool_size=4, pa
     return args, reference, backing, output_storage
 
 
+def _native_head_reduction(dots, weights):
+    """BF16 FMA chains in SM100 DeepGEMM head order, using exact FP64 products."""
+    positive = dots.relu().bfloat16().double()
+    sums = torch.zeros(4, dots.shape[1], device=dots.device, dtype=torch.float64)
+    for head in range(32):
+        lane = head % 4
+        sums[lane] = (positive[head] * weights[head].double() + sums[lane]).bfloat16().double()
+    pairs = (sums[:2] + sums[2:]).bfloat16().double()
+    return (pairs[0] + pairs[1]).bfloat16().double()
+
+
 def _check_indexer_result(args, reference, workspace, selected_pools=32, pool_size=4, page_size=64):
     q, weights, cache, table, cu, positions, output, scales = args
     decoded_q, decoded_k, ref_weights = reference
     capacity = table.shape[1] * page_size
-    scores = workspace[: q.shape[0] * capacity * 4].view(torch.float32).view(q.shape[0], capacity)
+    scores = workspace[: q.shape[0] * capacity * weights.element_size()].view(weights.dtype).view(q.shape[0], capacity)
     offsets, host_positions = cu.cpu().tolist(), positions.cpu().tolist()
     topk = selected_pools * pool_size
     for request, (start, end) in enumerate(zip(offsets, offsets[1:])):
         for row in range(start, end):
             length = host_positions[row] + 1
             pools = max(length // pool_size, 0)
-            expected = ((decoded_q[row] @ decoded_k[request].T).relu() * ref_weights[row, :, None]).sum(0)
-            torch.testing.assert_close(scores[row, :pools].double(), expected[:pools], rtol=3e-5, atol=2e-4)
+            dots = decoded_q[row] @ decoded_k[request].T
+            expected = _native_head_reduction(dots, ref_weights[row]) if weights.dtype == torch.bfloat16 else (dots.relu() * ref_weights[row, :, None]).sum(0)
+            torch.testing.assert_close(
+                scores[row, :pools].double(),
+                expected[:pools],
+                rtol=0 if weights.dtype == torch.bfloat16 else 3e-5,
+                atol=0 if weights.dtype == torch.bfloat16 else 2e-4,
+            )
             assert scores[row, pools:].isneginf().all().item()
             actual = output[row].cpu()
             if length <= topk:
@@ -569,11 +605,12 @@ def test_pooled_indexer_large_pools_and_pages(dtype, page_size):
 
 @pytest.mark.parametrize("dtype", ["bf16", "fp8", "fp4"])
 @pytest.mark.parametrize("padding", [1, 8])
-def test_pooled_indexer_dynamic_layouts_graph_and_explicit_stream(dtype, padding):
+@pytest.mark.parametrize("native", [False, True])
+def test_pooled_indexer_dynamic_layouts_graph_and_explicit_stream(dtype, padding, native):
     from cudnn.deepseek_sparse_attention.pooled.forward import _compile_pooled_select, _compile_scores
 
-    args, reference, _, _ = _indexer_case(dtype)
-    plan = pooled.IndexerForward(*args, selected_pools=32, cache_dtype=dtype, mode="prefill")
+    args, reference, _, _ = _indexer_case(dtype, native=native)
+    plan = pooled.IndexerForward(*args, selected_pools=32, cache_dtype=dtype, mode="prefill", fp8_scale_format="ue8m0" if native and dtype == "fp8" else "fp32")
     plan.compile()
     changed = list(args)
     q = torch.empty(6, 32, args[0].shape[2] + padding, device="cuda", dtype=args[0].dtype)[:, :, : args[0].shape[2]]
@@ -617,10 +654,60 @@ def test_pooled_indexer_dynamic_layouts_graph_and_explicit_stream(dtype, padding
         plan.execute(*changed[:7], workspace[:1], changed[7], max_query_tokens=3)
 
 
+@pytest.mark.parametrize("dtype,folded", [("bf16", False), ("fp8", False), ("fp8", True), ("fp4", False)])
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+def test_pooled_indexer_native_bf16_contract(dtype, folded, mode):
+    args, reference, backing, output_storage = _indexer_case(dtype, native=True, folded=folded, packed_scales=mode == "decode")
+    kwargs = dict(selected_pools=32, cache_dtype=dtype, mode=mode, fp8_scale_format="ue8m0" if dtype == "fp8" else "fp32")
+    plan = pooled.IndexerForward(*args, **kwargs)
+    plan.compile()
+    workspace = torch.empty(plan.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
+    dsa.pooled_indexer_forward(*args[:6], args[7], output=args[6], workspace=workspace, max_query_tokens=6, **kwargs)
+    _check_indexer_result(args, reference, workspace)
+    assert (backing[:, args[2].shape[1] :] == 0xA5).all().item()
+    assert (output_storage[:, args[6].shape[1] :] == 999).all().item()
+    with pytest.raises(ValueError, match="dtype"):
+        plan.execute(args[0], args[1].float(), *args[2:7], workspace, args[7], max_query_tokens=6)
+
+
+def test_pooled_indexer_bf16_weights_with_fp32_cache_scales():
+    args, reference, _, _ = _indexer_case("fp8")
+    args = list(args)
+    args[1] = args[1].bfloat16()
+    reference = args[0].double(), reference[1], args[1].double()
+    plan = pooled.IndexerForward(*args, selected_pools=32)
+    plan.compile()
+    workspace = torch.empty(plan.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
+    dsa.pooled_indexer_forward(*args[:6], output=args[6], workspace=workspace, selected_pools=32, max_query_tokens=6)
+    _check_indexer_result(args, reference, workspace)
+    with pytest.raises(ValueError, match="fp8_scale_format"):
+        dsa.pooled_indexer_forward(*args[:6], selected_pools=32, max_query_tokens=6, fp8_scale_format="invalid")
+
+
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+def test_pool_cache_update_native_ue8m0_bytes(mode):
+    args = list(_cache_args())
+    args[0].normal_()
+    args[1].normal_()
+    args[3] = torch.full((1, 64 * 132), 0xA5, device="cuda", dtype=torch.uint8)
+    kwargs = dict(mode=mode)
+    if mode == "decode":
+        args += [torch.arange(4, device="cuda", dtype=torch.int64), torch.tensor([0, 4], device="cuda", dtype=torch.int32)]
+    dsa.pooled_cache_update_forward(*args, **kwargs)
+    reference = args[3].clone()
+    args[3].fill_(0xA5)
+    dsa.pooled_cache_update_forward(*args, fp8_scale_format="ue8m0", **kwargs)
+    torch.testing.assert_close(args[3][:, : 64 * 128], reference[:, : 64 * 128], rtol=0, atol=0)
+    scale = reference[0, 64 * 128 : 64 * 128 + 4].contiguous().view(torch.float32)
+    expected = (scale.log2() + 127).byte().expand(4)
+    torch.testing.assert_close(args[3][0, 64 * 128 : 64 * 128 + 4], expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("dtype", ["bf16", "fp8", "fp4"])
 @pytest.mark.parametrize("mode", ["prefill", "decode"])
-def test_pooled_indexer_updates_cache_before_scoring(dtype, mode):
-    args, reference, _, _ = _indexer_case(dtype)
+@pytest.mark.parametrize("native", [False, True])
+def test_pooled_indexer_updates_cache_before_scoring(dtype, mode, native):
+    args, reference, _, _ = _indexer_case(dtype, native=native)
     args[5].copy_(torch.tensor([3072, 3073, 3074, 2048, 2049, 2050, 2051, 2052, 2053], device="cuda"))
     torch.manual_seed(179)
     keys = torch.randn(9, 128, device="cuda", dtype=torch.bfloat16)
@@ -635,6 +722,8 @@ def test_pooled_indexer_updates_cache_before_scoring(dtype, mode):
     updates = dict(keys=keys, gates=gates, ape=ape, tail=tail, pool_slots=slots, tail_slots=tail_slots)
     value = _pool_reference(keys[3:7].cpu(), gates[3:7].cpu(), ape.cpu())
     values, scales = _quantized_pool(value, dtype)
+    if native and dtype == "fp8":
+        scales = (scales.view(torch.float32).log2() + 127).byte().expand(4)
     expected_cache = args[2].cpu().clone()
     page = int(args[3][2, 8].item())
     expected_cache[page, : values.numel()] = values
@@ -647,7 +736,9 @@ def test_pooled_indexer_updates_cache_before_scoring(dtype, mode):
         block, phase = divmod(slot, 4)
         expected_tail[block, 0, phase] = keys[row].cpu()
         expected_tail[block, 1, phase] = gates[row].cpu()
-    plan = pooled.IndexerForward(*args, selected_pools=32, cache_dtype=dtype, mode=mode, **updates)
+    plan = pooled.IndexerForward(
+        *args, selected_pools=32, cache_dtype=dtype, mode=mode, fp8_scale_format="ue8m0" if native and dtype == "fp8" else "fp32", **updates
+    )
     plan.compile()
     workspace = torch.empty(plan.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
     plan.execute(*args[:7], workspace, args[7], max_query_tokens=6, **updates)

@@ -25,7 +25,7 @@ def _require_triton():
 
 
 @lru_cache(maxsize=128)
-def _compile_scores(device, capability, dtype, position_dtype, scale_dtype, pool_size, page_size, mode):
+def _compile_scores(device, capability, dtype, position_dtype, scale_dtype, pool_size, page_size, mode, weight_dtype, q_dtype, fp8_scale_format):
     _require_triton()
     import triton
     from triton.backends.compiler import GPUTarget
@@ -36,19 +36,21 @@ def _compile_scores(device, capability, dtype, position_dtype, scale_dtype, pool
         POOL_SIZE=pool_size,
         PAGE_SIZE=page_size,
         DTYPE=dtype,
-        QUERY_TILE=4 if mode == "prefill" else 1,
-        POOL_TILE=256 if mode == "prefill" and dtype != "fp4" else 128,
+        QUERY_TILE=(2 if weight_dtype == torch.bfloat16 else 4) if mode == "prefill" else 1,
+        POOL_TILE=256 if mode == "prefill" and dtype != "fp4" and weight_dtype == torch.float32 else 128,
+        BF16_REDUCTION=weight_dtype == torch.bfloat16,
+        FP8_SCALE_FORMAT=fp8_scale_format,
     )
     signature = {name: "i64" for name in cudnn_pooled_scores.arg_names}
     signature.update(
-        Q={"bf16": "*bf16", "fp8": "*fp8e4nv", "fp4": "*u8"}[dtype],
+        Q="*i8" if q_dtype == torch.int8 else {"bf16": "*bf16", "fp8": "*fp8e4nv", "fp4": "*u8"}[dtype],
         QSCALE="*i32" if scale_dtype == torch.int32 else "*u8",
-        WEIGHTS="*fp32",
+        WEIGHTS="*bf16" if weight_dtype == torch.bfloat16 else "*fp32",
         CACHE="*u8",
         BLOCK_TABLE="*i32",
         CU_QUERY="*i32",
         POSITIONS="*i64" if position_dtype == torch.int64 else "*i32",
-        SCORES="*fp32",
+        SCORES="*bf16" if weight_dtype == torch.bfloat16 else "*fp32",
     )
     if scale_dtype is None:
         constants["QSCALE"] = None
@@ -144,7 +146,8 @@ class IndexerForward(APIBase):
 
     Inputs use packed queries, per-request page tables, and absolute token
     positions. Query projection, rotation, and quantization happen upstream.
-    FP8 query scales are folded into weights. MXFP4 scales remain separate.
+    BF16 weights select DeepGEMM's BF16 head reduction and logits.
+    FP8/FP4 accept packed UE8M0 query scales without conversion.
     Execute launches scoring and fused selection/expansion into caller buffers.
     """
 
@@ -171,10 +174,13 @@ class IndexerForward(APIBase):
         tail=None,
         pool_slots=None,
         tail_slots=None,
+        fp8_scale_format="fp32",
     ):
         super().__init__()
         self.pool_size, self.page_size, self.selected_pools = int(pool_size), int(page_size), int(selected_pools)
         self.cache_dtype, self.mode = cache_dtype, mode
+        self.fp8_scale_format = fp8_scale_format
+        self._weight_dtype, self._q_dtype = weights.dtype, q.dtype
         self.max_pools = int(max_pools) if max_pools is not None else block_table.shape[1] * self.page_size
         tensors = (q, weights, cache, block_table, cu_query, positions, output, q_scale)
         self._descs = tuple(self._make_tensor_desc(t) for t in tensors)
@@ -206,6 +212,7 @@ class IndexerForward(APIBase):
                 page_size=page_size,
                 cache_dtype=cache_dtype,
                 mode=mode,
+                fp8_scale_format=fp8_scale_format,
             )
 
     def _validate(self, tensors, *, descriptors=False):
@@ -216,11 +223,13 @@ class IndexerForward(APIBase):
             raise ValueError("expected Q [N,32,D], matrix weights/cache/table/output, and vector offsets/positions")
         rows, heads, dim = q.shape
         qdim = 64 if self.cache_dtype == "fp4" else 128
-        qdtype = {"bf16": torch.bfloat16, "fp8": torch.float8_e4m3fn, "fp4": torch.uint8}[self.cache_dtype]
-        if (heads, dim) != (32, qdim) or q.dtype != qdtype or rows >= 2**31:
-            raise ValueError(f"q must have shape [N,32,{qdim}] and dtype {qdtype}, with N < 2**31")
+        qdtypes = {"bf16": (torch.bfloat16,), "fp8": (torch.float8_e4m3fn,), "fp4": (torch.uint8, torch.int8)}[self.cache_dtype]
+        if (heads, dim) != (32, qdim) or q.dtype not in qdtypes or q.dtype != self._q_dtype or rows >= 2**31:
+            raise ValueError(f"q must have shape [N,32,{qdim}] and planned dtype in {qdtypes}, with N < 2**31")
+        if self._weight_dtype not in (torch.bfloat16, torch.float32):
+            raise ValueError("weights must be BF16 or FP32")
         expected = (
-            (weights, (rows, 32), torch.float32),
+            (weights, (rows, 32), self._weight_dtype),
             (cache, (cache.shape[0], self.page_size * _BYTES[self.cache_dtype]), torch.uint8),
             (cu, (table.shape[0] + 1,), torch.int32),
             (positions, (rows,), self._position_dtype),
@@ -236,12 +245,14 @@ class IndexerForward(APIBase):
             raise ValueError("output must be INT32 and cover expanded pools, tail slots, and all query rows")
         if output.shape[0] >= 2**31 or output.shape[1] > 65535 * 256:
             raise ValueError("output exceeds the CUDA launch grid limits")
-        if self.cache_dtype == "fp4":
+        if self.cache_dtype == "fp4" or self._scale_dtype is not None:
             shape = (rows, 32) if self._scale_dtype == torch.int32 else (rows, 32, 4)
             if scales is None or scales.dtype != self._scale_dtype or self._scale_dtype not in (torch.int32, torch.uint8) or scales.shape != shape:
-                raise ValueError("MXFP4 requires planned INT32 [N,32] or UINT8 [N,32,4] UE8M0 query scales")
+                raise ValueError("expected planned INT32 [N,32] or UINT8 [N,32,4] UE8M0 query scales")
+            if self.cache_dtype != "fp4" and not (self.cache_dtype == "fp8" and self.fp8_scale_format == "ue8m0"):
+                raise ValueError("q_scale requires FP4 or FP8 with fp8_scale_format='ue8m0'")
         elif scales is not None:
-            raise ValueError("q_scale is only accepted for MXFP4; fold FP8 query scales into weights")
+            raise ValueError("q_scale presence must match the plan")
         for name, tensor in zip(_NAMES, tensors):
             if tensor is None:
                 continue
@@ -267,8 +278,10 @@ class IndexerForward(APIBase):
             raise ValueError("supported pool sizes are 4/16 and page sizes are 64/128/256")
         if self.mode not in ("prefill", "decode") or self.cache_dtype not in _BYTES:
             raise ValueError("expected prefill/decode mode and bf16/fp8/fp4 cache_dtype")
-        if not 1 <= self.selected_pools <= 2048 or self.selected_pools % 32 or self.max_pools < 1:
-            raise ValueError("selected_pools must be a multiple of 32 up to 2048, and max_pools positive")
+        if self.fp8_scale_format not in ("fp32", "ue8m0") or (self.cache_dtype != "fp8" and self.fp8_scale_format != "fp32"):
+            raise ValueError("fp8_scale_format must be fp32, or ue8m0 with an FP8 cache")
+        if not 1 <= self.selected_pools <= 2048 or self.selected_pools % 32 or not 1 <= self.max_pools <= 32768:
+            raise ValueError("selected_pools must be a multiple of 32 up to 2048, and max_pools in 1..32768")
         rows, columns = self._validate(self._descs, descriptors=True)
         self._workspace_layout(rows, columns)
         if self._update is not None:
@@ -292,9 +305,12 @@ class IndexerForward(APIBase):
             self.pool_size,
             self.page_size,
             self.mode,
+            self._weight_dtype,
+            self._q_dtype,
+            self.fp8_scale_format,
         )
         self._select = _compile_pooled_select(
-            self._device.index, self._capability, self.max_pools, self.selected_pools, self.pool_size, self._position_dtype, self.mode
+            self._device.index, self._capability, self.max_pools, self.selected_pools, self.pool_size, self._position_dtype, self.mode, self._weight_dtype
         )
         self._compiled_kernel = True
 
@@ -302,15 +318,17 @@ class IndexerForward(APIBase):
         if rows < 0 or columns < 1 or columns > self.max_pools or rows * columns * 2 >= 2**31:
             raise ValueError("workspace dimensions must fit max_pools and the top-k int32 addressing limit")
         offset, layout = 0, []
-        for dtype, shape in (
-            (torch.float32, (rows, columns)),
-            (torch.int32, (rows, 2, columns)),
+        bucket = 1 << (self.max_pools - 1).bit_length()
+        scratch_shape = (1, 2, 4) if self._weight_dtype == torch.bfloat16 and 8192 <= bucket <= 32768 else (rows, 2, columns)
+        for dtype, shape, item_bytes in (
+            (self._weight_dtype, (rows, columns), 2 if self._weight_dtype == torch.bfloat16 else 4),
+            (torch.int32, scratch_shape, 4),
         ):
             count = 1
             for size in shape:
                 count *= size
-            layout.append((offset, count * 4, dtype, shape))
-            offset = (offset + count * 4 + 255) // 256 * 256
+            layout.append((offset, count * item_bytes, dtype, shape))
+            offset = (offset + count * item_bytes + 255) // 256 * 256
         return offset, layout
 
     def scratch_workspace_bytes(self, num_queries=None, num_pools=None):
@@ -423,6 +441,8 @@ class IndexerForward(APIBase):
                     self.cache_dtype,
                     query_tile,
                     pool_tile,
+                    self._weight_dtype == torch.bfloat16,
+                    self.fp8_scale_format,
                     stream=stream,
                 )
             if output.shape[0]:
@@ -455,6 +475,7 @@ def indexer_forward_wrapper(
     tail=None,
     pool_slots=None,
     tail_slots=None,
+    fp8_scale_format="fp32",
 ):
     """Allocate optional output/workspace and run the prepared indexer."""
     with stream_context(current_stream, q.device):
@@ -481,6 +502,7 @@ def indexer_forward_wrapper(
             tail=tail,
             pool_slots=pool_slots,
             tail_slots=tail_slots,
+            fp8_scale_format=fp8_scale_format,
         )
         plan.compile()
         if workspace is None:
