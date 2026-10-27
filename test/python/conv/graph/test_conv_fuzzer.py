@@ -34,7 +34,7 @@ import sys
 import signal
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple, Union, overload
 from enum import IntEnum
 from sdpa.helpers import create_sparse_int_tensor, print_tensor_stats, compare_tensors
 
@@ -622,11 +622,48 @@ def create_tensors(config: ConvConfig, rng: random.Random):
     return X, W, Y, bias
 
 
+def _validate_fusion_arguments(config, bias, prior_output, intermediate_dtype, expose_intermediate):
+    if config.conv_type != ConvType.FPROP and config.epilogue in (EpilogueType.BIAS, EpilogueType.BIAS_RELU):
+        raise ValueError("Backward convolution does not support bias epilogues")
+    has_intermediate = (
+        prior_output is not None
+        or config.epilogue == EpilogueType.RELU
+        or (bias is not None and config.epilogue in (EpilogueType.BIAS, EpilogueType.BIAS_RELU))
+    )
+    if not has_intermediate and (intermediate_dtype is not None or expose_intermediate):
+        raise ValueError("An intermediate dtype or output requires an epilogue or residual add")
+    return torch.float32 if intermediate_dtype is None else intermediate_dtype
+
+
+@overload
 def compute_reference(config: ConvConfig, X: torch.Tensor, W: torch.Tensor,
                       Y: torch.Tensor, bias: Optional[torch.Tensor],
                       prior_output: Optional[torch.Tensor] = None,
-                      *, intermediate_dtype: torch.dtype = torch.float32,
-                      return_intermediate: bool = False):
+                      *, intermediate_dtype: Optional[torch.dtype] = None,
+                      return_intermediate: Literal[False] = False) -> torch.Tensor: ...
+
+
+@overload
+def compute_reference(config: ConvConfig, X: torch.Tensor, W: torch.Tensor,
+                      Y: torch.Tensor, bias: Optional[torch.Tensor],
+                      prior_output: Optional[torch.Tensor] = None,
+                      *, intermediate_dtype: Optional[torch.dtype] = None,
+                      return_intermediate: Literal[True]) -> Tuple[torch.Tensor, torch.Tensor]: ...
+
+
+@overload
+def compute_reference(config: ConvConfig, X: torch.Tensor, W: torch.Tensor,
+                      Y: torch.Tensor, bias: Optional[torch.Tensor],
+                      prior_output: Optional[torch.Tensor] = None,
+                      *, intermediate_dtype: Optional[torch.dtype] = None,
+                      return_intermediate: bool) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]: ...
+
+
+def compute_reference(config: ConvConfig, X: torch.Tensor, W: torch.Tensor,
+                      Y: torch.Tensor, bias: Optional[torch.Tensor],
+                      prior_output: Optional[torch.Tensor] = None,
+                      *, intermediate_dtype: Optional[torch.dtype] = None,
+                      return_intermediate: bool = False) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Compute an independent PyTorch reference with FP32 accumulation.
 
@@ -636,16 +673,18 @@ def compute_reference(config: ConvConfig, X: torch.Tensor, W: torch.Tensor,
       WGRAD: compute dW from X and dY(=Y)
 
     intermediate_dtype controls rounding before optional residual addition,
-    FPROP bias, and ReLU (including backward convolution outputs).
-    It does not change accumulation precision.
+    FPROP bias, and ReLU applied to the convolution output (not ReLU backward).
+    None preserves FP32 intermediates and plain-convolution defaults.
+    This does not change accumulation precision.
 
     Return the final output, or (output, intermediate) when return_intermediate
     is enabled. The intermediate precedes residual addition and all epilogues.
     """
+    intermediate_dtype = _validate_fusion_arguments(config, bias, prior_output, intermediate_dtype, return_intermediate)
     compute_dtype = torch.float32
 
     def finalize_reference(result, output_dtype):
-        # A typed graph edge rounds before its consumer, even when virtual.
+        # Model the declared convolution edge before the residual/bias/activation.
         intermediate = result.to(intermediate_dtype)
         result = intermediate.to(compute_dtype)
         if prior_output is not None:
@@ -771,7 +810,7 @@ def run_cudnn_conv(config: ConvConfig, X: torch.Tensor, W: torch.Tensor, Y: torc
                    bias: Optional[torch.Tensor], cudnn_handle,
                    prior_output: Optional[torch.Tensor] = None,
                    *, raise_on_unsupported: bool = False,
-                   intermediate_dtype: torch.dtype = torch.float32,
+                   intermediate_dtype: Optional[torch.dtype] = None,
                    intermediate_output: Optional[torch.Tensor] = None) -> Tuple[bool, str]:
     """
     Run convolution using cuDNN and return success status and message.
@@ -781,11 +820,16 @@ def run_cudnn_conv(config: ConvConfig, X: torch.Tensor, W: torch.Tensor, Y: torc
       DGRAD: inputs=Y(dY),W, output=X (compute dX into X)
       WGRAD: inputs=X,Y(dY), output=W (compute dW into W)
 
-    If prior_output is provided, it is added before the FPROP epilogue or to the computed dX/dW.
+    Add prior_output to Y/dX/dW before any bias or output ReLU. ReLU on dX/dW
+    is a pointwise output epilogue, not the derivative of a forward ReLU.
     raise_on_unsupported exposes planning-time support rejections to fixed-case callers.
-    intermediate_dtype applies only to the raw convolution edge. Add/bias edges stay FP32.
+    intermediate_dtype overrides only a fused raw convolution edge; None preserves FP32.
+    Add/bias edges stay FP32. Plain convolution accepts no intermediate override.
     intermediate_output optionally materializes that raw edge in a separate output buffer.
     """
+    intermediate_dtype = _validate_fusion_arguments(config, bias, prior_output, intermediate_dtype, intermediate_output is not None)
+    if intermediate_output is not None and intermediate_output.dtype != intermediate_dtype:
+        raise ValueError("Intermediate buffer dtype does not match the graph edge")
     planning = False
     try:
         stream = torch.cuda.current_stream().cuda_stream
@@ -944,11 +988,7 @@ def run_cudnn_conv(config: ConvConfig, X: torch.Tensor, W: torch.Tensor, Y: torc
             raw_output.set_data_type(convert_to_cudnn_type(intermediate_dtype))
 
         if intermediate_output is not None:
-            if raw_output is conv_output:
-                raise ValueError("An intermediate output requires an epilogue or residual add")
-            if intermediate_output.dtype != intermediate_dtype:
-                raise ValueError("Intermediate buffer dtype does not match the graph edge")
-            raw_output.set_output(True).set_data_type(convert_to_cudnn_type(intermediate_dtype))
+            raw_output.set_output(True)
             raw_output.set_dim(list(intermediate_output.size())).set_stride(list(intermediate_output.stride()))
             exec_dict[raw_output] = intermediate_output
 

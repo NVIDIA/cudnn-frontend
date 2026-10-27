@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import pytest
@@ -19,7 +19,7 @@ class FixedConvCase:
     rtol: float = 1e-2
     atol: float = 1e-2
     accumulate_output: bool = False
-    intermediate_dtype: torch.dtype = torch.float32
+    intermediate_dtype: Optional[torch.dtype] = None
     materialize_intermediate: bool = False
     min_device_capability: tuple = (0, 0)
 
@@ -46,7 +46,7 @@ def _fixed_conv_case(
     rtol: float = 1e-2,
     atol: float = 1e-2,
     accumulate_output: bool = False,
-    intermediate_dtype: torch.dtype = torch.float32,
+    intermediate_dtype: Optional[torch.dtype] = None,
     materialize_intermediate: bool = False,
     min_device_capability: tuple = (0, 0),
     rng_seed: int,
@@ -198,7 +198,7 @@ FIXED_CONV_EXPANSION_CASES_L1 = tuple(
             dtype=dtype,
             epilogue=epilogue,
             accumulate_output=accumulate_output,
-            intermediate_dtype=dtype,
+            intermediate_dtype=dtype if topology != "plain" else None,
             materialize_intermediate=materialize_intermediate,
             min_device_capability=min_device_capability,
             rtol=5e-3,
@@ -207,7 +207,7 @@ FIXED_CONV_EXPANSION_CASES_L1 = tuple(
         ),
         id=f"conv2d_{conv_fuzzer.conv_type_name(conv_type)}_{topology}_{dtype_name}",
     )
-    for dtype, dtype_name, min_device_capability, dtype_seed_offset in ((torch.float16, "f16", (7, 0), 0), (torch.float32, "f32", (8, 0), 6))
+    for dtype, dtype_name, min_device_capability, dtype_seed_offset in ((torch.float16, "f16", (7, 0), 0), (torch.float32, "f32", (0, 0), 6))
     for conv_type, epilogue, accumulate_output, materialize_intermediate, topology, seed_base in (
         (conv_fuzzer.ConvType.FPROP, conv_fuzzer.EpilogueType.NONE, False, False, "plain", 200),
         (conv_fuzzer.ConvType.FPROP, conv_fuzzer.EpilogueType.RELU, False, False, "relu", 201),
@@ -244,7 +244,7 @@ FIXED_CONV_EXPANSION_CASES_L1 = tuple(
     for dtype, dtype_name, min_device_capability, rtol, atol, dtype_seed_offset in (
         (torch.float16, "f16", (7, 0), 5e-3, 5e-3, 0),
         (torch.bfloat16, "bf16", (8, 0), 2.1e-2, 5e-2, 2),
-        (torch.float32, "f32", (8, 0), 5e-3, 5e-3, 4),
+        (torch.float32, "f32", (0, 0), 5e-3, 5e-3, 4),
     )
     for materialize_intermediate in (False, True)
 )
@@ -453,3 +453,89 @@ def test_fixed_reference_defaults(conv_type):
     actual = conv_fuzzer.compute_reference(config, X, W, Y, None)
     assert isinstance(actual, torch.Tensor)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("path", ("reference", "graph"))
+@pytest.mark.parametrize(
+    "conv_type,epilogue,intermediate_dtype,expose",
+    (
+        (conv_fuzzer.ConvType.DGRAD, conv_fuzzer.EpilogueType.BIAS, None, False),
+        (conv_fuzzer.ConvType.DGRAD, conv_fuzzer.EpilogueType.BIAS_RELU, None, False),
+        (conv_fuzzer.ConvType.WGRAD, conv_fuzzer.EpilogueType.BIAS, None, False),
+        (conv_fuzzer.ConvType.WGRAD, conv_fuzzer.EpilogueType.BIAS_RELU, None, False),
+        (conv_fuzzer.ConvType.FPROP, conv_fuzzer.EpilogueType.NONE, torch.float16, False),
+        (conv_fuzzer.ConvType.FPROP, conv_fuzzer.EpilogueType.NONE, None, True),
+    ),
+)
+def test_fixed_invalid_fusion_arguments(path, conv_type, epilogue, intermediate_dtype, expose, cudnn_handle):
+    config = replace(FIXED_CONV_CASES_L0[0].values[0].config, conv_type=conv_type, epilogue=epilogue)
+    tensor = torch.ones(1)
+    message = "Backward convolution does not support bias" if conv_type != conv_fuzzer.ConvType.FPROP else "requires an epilogue or residual add"
+    original_stream = cudnn.get_stream(handle=cudnn_handle)
+    try:
+        with pytest.raises(ValueError, match=message):
+            if path == "reference":
+                conv_fuzzer.compute_reference(config, tensor, tensor, tensor, None, intermediate_dtype=intermediate_dtype, return_intermediate=expose)
+            else:
+                conv_fuzzer.run_cudnn_conv(
+                    config,
+                    tensor,
+                    tensor,
+                    tensor,
+                    None,
+                    cudnn_handle,
+                    intermediate_dtype=intermediate_dtype,
+                    intermediate_output=tensor if expose else None,
+                )
+        assert cudnn.get_stream(handle=cudnn_handle) == original_stream
+    finally:
+        cudnn.set_stream(handle=cudnn_handle, stream=original_stream)
+
+
+@pytest.mark.L0
+def test_fixed_intermediate_buffer_dtype(cudnn_handle):
+    config = FIXED_CONV_CASES_L0[0].values[0].config
+    tensor = torch.ones(1)
+    original_stream = cudnn.get_stream(handle=cudnn_handle)
+    try:
+        with pytest.raises(ValueError, match="Intermediate buffer dtype"):
+            conv_fuzzer.run_cudnn_conv(
+                config,
+                tensor,
+                tensor,
+                tensor,
+                None,
+                cudnn_handle,
+                prior_output=tensor,
+                intermediate_dtype=torch.float16,
+                intermediate_output=tensor,
+            )
+        assert cudnn.get_stream(handle=cudnn_handle) == original_stream
+    finally:
+        cudnn.set_stream(handle=cudnn_handle, stream=original_stream)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("epilogue", (conv_fuzzer.EpilogueType.BIAS, conv_fuzzer.EpilogueType.BIAS_RELU))
+def test_fixed_reference_bias_order(epilogue):
+    config = replace(
+        FIXED_CONV_CASES_L0[0].values[0].config,
+        batch=1,
+        in_channels=1,
+        out_channels=1,
+        input_spatial=(1, 2),
+        filter_spatial=(1, 1),
+        padding=(0, 0),
+        epilogue=epilogue,
+    )
+    X = torch.tensor([1.0003, -1.0003]).reshape(1, 1, 1, 2)
+    W = torch.full((1, 1, 1, 1), 1.3)
+    Y = torch.empty_like(X)
+    prior_output = torch.full_like(X, 0.00013)
+    bias = torch.full((1, 1, 1, 1), 0.00017)
+    expected = (X * W).half().float() + prior_output + bias
+    if epilogue == conv_fuzzer.EpilogueType.BIAS_RELU:
+        expected = expected.relu()
+    actual = conv_fuzzer.compute_reference(config, X, W, Y, bias, prior_output, intermediate_dtype=torch.float16)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=1e-7)
