@@ -62,6 +62,11 @@ must first contain reverse-CSC metadata, for example:
 graph = graph.with_reverse_csc()
 ```
 
+Backward with the default `deterministic=False` does not guarantee repeatable
+gradients. For repeatability, pass `deterministic=True` with reverse-CSC
+metadata. `torch.use_deterministic_algorithms(True)` does not automatically
+enable this option.
+
 For FP16 or BF16 inputs, `high_precision_dgrad=True` asks the backend to compute
 key, query, value, and edge gradients in FP32. PyTorch separately controls the
 dtype used to accumulate leaf gradients.
