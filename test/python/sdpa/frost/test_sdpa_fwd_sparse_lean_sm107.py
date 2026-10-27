@@ -145,6 +145,14 @@ def test_the_explicit_sub_tile_pin_survives_template_lowering():
         make_cfg_d256_sparse_lean(dataclasses.replace(d.template_params(), split_kv=33, sub_tiles_per_cta=4))
     # a record without the k (0 = unset: the doc-default record / an older caller) derives it from the split as before
     assert make_cfg_d256_sparse_lean(dataclasses.replace(sp.template_params(), sub_tiles_per_cta=0)).SUB_TILES_PER_CTA == 2
+    # BOTH pins given: the explicit k is THE k and the split must be ITS lean split -- top_k 32 (n_sub 5): k 4 and k 3 both have split 2,
+    # so (split 2, k 4) is consistent although ceil(5 / 2) = 3 (the derivation is not the inverse); a disagreeing pair is rejected by name
+    both4 = _route_adapter(tile_form="lean", top_k=32, split=2, sub_tiles_per_cta=4)
+    assert both4.check_support() and (both4.split_kv, both4.sub_tiles_per_cta) == (2, 4) and both4.template_params().sub_tiles_per_cta == 4
+    both3 = _route_adapter(tile_form="lean", top_k=32, split=2, sub_tiles_per_cta=3)
+    assert both3.check_support() and (both3.split_kv, both3.sub_tiles_per_cta) == (2, 3)
+    with pytest.raises(ValueError, match="pin one of the two"):
+        _route_adapter(tile_form="lean", top_k=512, split=33, sub_tiles_per_cta=4).check_support()  # ceil(65 / 4) = 17, not 33
 
 
 def test_lean_config_pins_the_body_geometry():

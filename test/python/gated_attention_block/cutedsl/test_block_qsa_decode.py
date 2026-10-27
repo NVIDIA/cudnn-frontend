@@ -3413,6 +3413,11 @@ def test_sparse_tile_form_typed_declines_equal_the_heuristics_text():
             _declare(GEOM_SMALL, 4, 1, sparse_tile_form="lean", sparse_sub_tiles_per_cta=9)
         with pytest.raises(ValueError, match="pin one of the two"):
             _declare(GEOM_SMALL, 4, 1, sparse_tile_form="lean", sparse_sub_tiles_per_cta=2, decode_split_kv=65)
+        both4, _ = _declare(GEOM_SMALL, 1, 1, top_k=32, sparse_tile_form="lean", sparse_sub_tiles_per_cta=4, decode_split_kv=2)
+        assert (both4.decode_split_kv, both4.sparse_sub_tiles_per_cta) == (
+            2,
+            4,
+        )  # the explicit k is THE k: ceil(5 / 4) = 2 (ceil(5 / 2) = 3 is not its inverse)
         for form in ("auto", "tcgen05"):
             with pytest.raises(ValueError, match="needs sparse_tile_form='lean'"):
                 _declare(GEOM_SMALL, 4, 1, sparse_tile_form=form, sparse_sub_tiles_per_cta=2)

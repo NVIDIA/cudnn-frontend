@@ -828,11 +828,13 @@ class SparseGqaFwdDslSm107:
                         f"(ceil(n_sub / k) at n_sub = {n_sub}; the split SELECTS k, the sub-tiles per CTA) -- pin one of them, or leave split_kv unset for the "
                         f"default k; the tcgen05 core (tile_form='tcgen05') takes any split in [1, {max_tiles}]"
                     )
-                k = -(-n_sub // split_req)
-                if k_pin is not None and int(k_pin) != k:
+                # the explicit k is THE k when given (ceil(n_sub / split) is not its inverse: at top_k 32 the splits of k 3 and k 4 are both 2);
+                # the split must then be ITS lean split
+                k = int(k_pin) if k_pin is not None else -(-n_sub // split_req)
+                if k_pin is not None and lean_sparse_split(self.top_k, k) != split_req:
                     raise ValueError(
-                        f"sparse d256 forward (sm107): split_kv={split_req} selects k = ceil({n_sub} / {split_req}) = {k} sub-tiles per CTA, but "
-                        f"sub_tiles_per_cta={k_pin} was given -- pin one of the two"
+                        f"sparse d256 forward (sm107): sub_tiles_per_cta={k} and split_kv={split_req} disagree: the lean split of k {k} at top_k "
+                        f"{self.top_k} is ceil({n_sub} / {k}) = {lean_sparse_split(self.top_k, k)} -- pin one of the two"
                     )
             else:
                 k = (

@@ -10491,7 +10491,7 @@ class GatedAttentionBlockFwd(APIBase):
             if form == _H.SPARSE_TILE_FORM_LEAN:
                 if reason is not None:
                     raise NotImplementedError(f"sparse_tile_form='lean' -- {reason}")
-                from cudnn.sdpa.fwd.config_sm107 import lean_sparse_n_sub
+                from cudnn.sdpa.fwd.config_sm107 import lean_sparse_n_sub, lean_sparse_split
 
                 n_sub, splits, k_max = lean_sparse_n_sub(top_k), _H.sparse_lean_splits(top_k), _H.sparse_lean_max_sub_tiles_per_cta(top_k)
                 if decode_split_kv is None:
@@ -10507,11 +10507,12 @@ class GatedAttentionBlockFwd(APIBase):
                             f"at n_sub = {n_sub}; the split SELECTS k, the sub-tiles per CTA) -- pin one of them, or None for the default k; a split of 1 is the "
                             "tcgen05 core's (the lean tile always splits), as is any other value (sparse_tile_form='tcgen05' / 'auto')"
                         )
-                    k = -(-n_sub // int(decode_split_kv))
-                    if sparse_sub_tiles_per_cta is not None and int(sparse_sub_tiles_per_cta) != k:
+                    # the explicit k is THE k when given (the adapter's rule: ceil(n_sub / split) is not its inverse); the split must be ITS lean split
+                    k = int(sparse_sub_tiles_per_cta) if sparse_sub_tiles_per_cta is not None else -(-n_sub // int(decode_split_kv))
+                    if sparse_sub_tiles_per_cta is not None and lean_sparse_split(top_k, k) != int(decode_split_kv):
                         raise ValueError(
-                            f"decode_split_kv={decode_split_kv} selects k = ceil({n_sub} / {decode_split_kv}) = {k} sub-tiles per CTA, but sparse_sub_tiles_per_cta="
-                            f"{sparse_sub_tiles_per_cta} was given -- pin one of the two"
+                            f"sparse_sub_tiles_per_cta={k} and decode_split_kv={decode_split_kv} disagree: the lean split of k {k} at top_k {top_k} is "
+                            f"ceil({n_sub} / {k}) = {lean_sparse_split(top_k, k)} -- pin one of the two"
                         )
                 if not 1 <= k <= k_max:
                     raise NotImplementedError(
