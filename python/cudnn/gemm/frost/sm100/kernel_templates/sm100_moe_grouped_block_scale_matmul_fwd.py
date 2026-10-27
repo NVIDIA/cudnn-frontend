@@ -164,6 +164,7 @@ def _kernel(
     # @@INJECT_KERNEL_TMA_C_PARAMS@@
     # @@TMA_STORE_ONLY:END@@
 ) -> None:
+    """Run persistent block-scaled MoE GEMM with the selected output epilogue."""
     # @@INJECT_AB_DESC_LISTS@@
 
     # @@INJECT_MOE_MA_LIST@@
@@ -1922,9 +1923,42 @@ def _kernel(
                                     # @@INJECT_EPILOGUE@@
                         # @@STG_ONLY:END@@
 
-                        # @@INJECT_COMBINE_STAGE_SEQUENCE@@
+                        if cutlass.const_expr(moe_combine_bulk_enabled):
+                            moe_combine_stage(
+                                combine_staging.data_ptr(tidx * epi_cols_per_mma_m + subtile_col_offset),
+                                c_rmem_vec,
+                                gC_tap_0_ptr,
+                                token_index,
+                                token_ks,
+                                top_k_scores,
+                                row,
+                                group_end,
+                                coord_n_c,
+                                col,
+                                N,
+                                out_stride_m_0,
+                                moe_top_k,
+                                epi_cols_per_mma_m,
+                                subtile_w,
+                                cd_dtype,
+                            )
 
-                    # @@INJECT_COMBINE_STORE_SEQUENCE@@
+                    if cutlass.const_expr(moe_combine_bulk_enabled):
+                        moe_combine_bulk(
+                            combine_staging.data_ptr(tidx * epi_cols_per_mma_m),
+                            gC_tap_0_ptr,
+                            token_index,
+                            token_ks,
+                            top_k_scores,
+                            row,
+                            group_end,
+                            coord_n_c,
+                            N,
+                            out_stride_m_0,
+                            moe_top_k,
+                            epi_cols_per_mma_m,
+                            cd_dtype,
+                        )
 
                 # The M-major TMA path loads its accumulator inside the store loop, so its release cannot move up.
                 # @@EPILOGUE_DRAIN:END@@
@@ -1956,6 +1990,7 @@ def _host(
     # @@TMA_STORE_ONLY:END@@
     stream: _cuda.CUstream,
 ) -> None:
+    """Bind token and scale tensor maps, then launch grouped block-scale GEMM."""
     # @@INJECT_HOST_AB_LISTS@@
 
     m = problem_size[0]

@@ -1824,6 +1824,7 @@ def _render_block_scale_tile_constants(
         # nvfp4 (3 -> 2: a 192 KiB A ring behind its 32 KiB staging buffer) and 256x128
         # 2-CTA mxfp8 (7 -> 6) -- then refuse anything a single stage still cannot fit.
         def _desc_roots(stages: int) -> dict[str, int]:
+            """Mirror shared-memory allocation order for descriptor validation."""
             return _block_scale_smem_desc_roots(
                 header_bytes=tmpl.smem_fixed_reserve
                 + (epi_reserved if tmpl.file in _SMEM_D_BEFORE_RINGS_TEMPLATES or _use_swap_bulk_combine(chain, cfg) else 0),
@@ -2642,29 +2643,9 @@ def _render_block_scale_template(
             }
         )
 
-    if "@@INJECT_COMBINE_STORE_SEQUENCE@@" in src:
-        replacements["INJECT_COMBINE_STAGE_SEQUENCE"] = "pass"
-        replacements["INJECT_COMBINE_STORE_SEQUENCE"] = "pass"
-        if _use_bulk_combine(chain, config):
-            # COMBINE has exactly one GEMM/output and no post-GEMM operations.
-            # Stage register fragments separately, then reduce the whole tile
-            # with one bulk operation per row.
-            replacements["INJECT_EPILOGUE"] = "pass"
-            replacements["INJECT_COMBINE_STAGE_SEQUENCE"] = (
-                "moe_combine_stage(\n"
-                "    combine_staging.data_ptr(tidx * epi_cols_per_mma_m + subtile_col_offset),\n"
-                "    c_rmem_vec, gC_tap_0_ptr, token_index, token_ks, top_k_scores,\n"
-                "    row, group_end, coord_n_c, col, N, out_stride_m_0,\n"
-                "    moe_top_k, epi_cols_per_mma_m, subtile_w, cd_dtype,\n"
-                ")"
-            )
-            replacements["INJECT_COMBINE_STORE_SEQUENCE"] = (
-                "moe_combine_bulk(\n"
-                "    combine_staging.data_ptr(tidx * epi_cols_per_mma_m), gC_tap_0_ptr,\n"
-                "    token_index, token_ks, top_k_scores, row, group_end, coord_n_c, N,\n"
-                "    out_stride_m_0, moe_top_k, epi_cols_per_mma_m, cd_dtype,\n"
-                ")"
-            )
+    if _use_bulk_combine(chain, config):
+        # The template stages COMBINE fragments and reduces each complete row.
+        replacements["INJECT_EPILOGUE"] = "pass"
 
     if "@@INJECT_SWAP_COMBINE_LAUNCH@@" in src:
         replacements["INJECT_SWAP_COMBINE_LAUNCH"] = "min_blocks_per_mp=1," if _use_swap_bulk_combine(chain, config) else ""
@@ -3745,7 +3726,12 @@ _EPI_STAGE_ROWS = _EPI_WARPS * 32
 
 
 def _use_bulk_combine(chain: FusionChain, cfg: TileConfig) -> bool:
-    """SM100 block-scaled normal MoE owns one complete feature row per lane."""
+    """Use the qualified single-CTA block-scaled COMBINE epilogue.
+
+    The normal 2-CTA BF16 route fails memcheck on SM100 (#1942). Keep
+    normal 2-CTA configurations on atomics until independently qualified.
+    The separately qualified SM107 swapped route has its own predicate.
+    """
     return (
         not _FORCE_STG_EPI
         and chain.has_moe
@@ -3754,6 +3740,7 @@ def _use_bulk_combine(chain: FusionChain, cfg: TileConfig) -> bool:
         and not isinstance(chain.moe, MoeSwapAbSpec)
         and not cfg.swap_ab
         and cfg.pipeline == "sm100"
+        and cfg.cta_group == 1
         and cfg.mma_tile_m == 128
         and chain.output_specs[0].major == "n"
         and chain.output_dtype in ("fp32", "fp16", "bf16")
@@ -3761,6 +3748,7 @@ def _use_bulk_combine(chain: FusionChain, cfg: TileConfig) -> bool:
 
 
 def _combine_smem_bytes(chain: FusionChain, cfg: TileConfig) -> int:
+    """Reserve the weighted staging tile and its alignment padding."""
     if _use_swap_bulk_combine(chain, cfg):
         return 128 * cfg.cta_tile_m * DTYPE_BYTES[chain.output_dtype] + 16
     if not _use_bulk_combine(chain, cfg):

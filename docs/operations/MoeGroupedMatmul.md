@@ -238,14 +238,25 @@ it does not materialize `[T*k,N]` results or launch a separate finalizer.
 For token-by-weight GEMM with contiguous output features, each lane packs up to
 eight BF16/FP16 or four FP32 contributions into a 16-byte vector atomic add.
 The destination address selects narrower accesses when the output pointer or
-row stride is unaligned. SM100 block-scaled token-by-weight kernels with
-128-row per-CTA MMA slices instead stage weighted feature tiles in shared memory
+row stride is unaligned. Single-CTA SM100-family block-scaled token-by-weight
+kernels with 128-row MMA slices instead stage weighted feature tiles in shared memory
 and issue `cp.reduce.async.bulk` once per row. Unaligned destinations and partial
 feature tiles retain vector/scalar atomics. Shared-memory staging is included
-in the GEMM pipeline budget. Weight-by-token (`SWAP_AB`) and M-major outputs retain
+in the GEMM pipeline budget. Normal 2-CTA configurations retain the existing
+atomic path pending memory-safety qualification. Outside the SM107 swapped bulk
+path described above, weight-by-token (`SWAP_AB`) and M-major outputs retain
 scalar atomics because adjacent registers do not address adjacent features of
-the same token. Both paths preserve per-element atomicity and output-dtype
+the same token. All paths preserve per-element atomicity and output-dtype
 accumulation.
+
+Bulk reduction trades shared-memory staging and synchronization for fewer
+global atomics; it does not guarantee a speedup for every workload. A
+[review spot check](https://github.com/NVIDIA/cudnn-frontend/pull/1942#pullrequestreview-5671615964)
+on SM100 with NVFP4, two experts, top-k 2 and a single-CTA 128x256
+tile measured BF16 COMBINE at 18.96 us versus 18.33 us for forced atomics at
+S/N/K = 258/256/256, and 59.57 us versus 66.37 us at 8192/2048/2048.
+These warmed CUDA Graph measurements include output zeroing and compare fixed
+configurations, rather than end-to-end serving performance.
 Output zeroing uses `cudaMemsetAsync` for contiguous storage and
 `cudaMemset2DAsync` for padded row/column-major storage, preserving padding.
 The execute-time stream orders output memset, the existing scheduler-counter

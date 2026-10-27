@@ -131,6 +131,7 @@ def _kernel(
     # @@INJECT_KERNEL_TMA_C_PARAMS@@
     # @@TMA_STORE_ONLY:END@@
 ) -> None:
+    """Run weight-by-token MoE GEMM, including the qualified bulk COMBINE tile."""
     # @@INJECT_AB_DESC_LISTS@@
 
     # @@INJECT_MOE_MA_LIST@@
@@ -1891,7 +1892,6 @@ def _kernel(
                             # @@TMA_STORE_ONLY:BEGIN@@
                             vec_f32 = c_rmem_vec
                             col_j = col
-                            linear_idx = tile_l * out_stride_l_0 + row * out_stride_m_0 + col_j * out_stride_n_0
 
                             # @@INJECT_EPILOGUE@@
 
@@ -1941,6 +1941,7 @@ def _host(
     # @@TMA_STORE_ONLY:END@@
     stream: _cuda.CUstream,
 ) -> None:
+    """Bind expert weights and routed token maps for the swapped GEMM launch."""
     # @@INJECT_HOST_AB_LISTS@@
 
     m = problem_size[0]
