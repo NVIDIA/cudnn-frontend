@@ -1597,9 +1597,9 @@ def _sm100_d256_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[s
     pair = (facts.d_qk, facts.d_v)
     if pair == (256, 256):
         return None
-    if pair == (192, 128) and not facts.thd:
+    if pair == (192, 128):
         return None
-    return "D256 backward serves exact (256, 256) and dense BSHD (192, 128) head dimensions"
+    return "D256 backward serves exact (256, 256) and (192, 128) head dimensions"
 
 
 def _sm100_d256_spec() -> EngineSpec:
@@ -1614,7 +1614,7 @@ def _sm100_d256_spec() -> EngineSpec:
     no-zero-fill contract are the Rubin row's.
 
     Packed THD accepts independent per-port physical origins and both packed Stats layouts, with declared token capacities.
-    Exact ``d_qk == d_v == 256``, plus dense-only ``(d_qk, d_v) == (192, 128)`` through native 192/128 stage-2 geometry.
+    Exact ``d_qk == d_v == 256``, plus dense and THD ``(d_qk, d_v) == (192, 128)`` through native 192/128 stage-2 geometry.
     Tensor maps retain each operand's actual width; delta and GQA fold use the value width. Any S_q / S_kv (padded to 128 / 256 and masked), dense, top-left and bottom-right causal,
     sliding window (left), MHA / GQA / MQA, BSHD-physical io, contiguous fp32 Stats, bf16 / fp16.  Declined, each asserted
     by a test (``test_sdpa_bwd_d256_sm100.py``): dense padding masks, sink / dSink, bias / dBias, right-band widening,

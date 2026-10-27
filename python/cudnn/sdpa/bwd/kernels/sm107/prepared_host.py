@@ -1259,6 +1259,7 @@ def _host_f16_thd_chain(
     kernel branches on it before reading the prefix tail, so both tensors are viewed ``(B+1,)``.
     """
     b, h, hk, d, t_q, t_kv, sqp, rcap, hc, zero_ws, itemsize, units, sq_env, skv_env, dq_bhg = config
+    d_v = geometry[2][0][3]
     q = _view(q_ptr, geometry[0])  # packed [1, T_q, H_q, D]
     k = _view(k_ptr, geometry[1])  # packed [1, T_kv, H_kv, D]
     v = _view(v_ptr, geometry[2])
@@ -1314,9 +1315,9 @@ def _host_f16_thd_chain(
     # already reads O and dO writes rowsum(dO * O) in this kernel's order over the packed tokens, so the launch and the read go).
     if cutlass.const_expr(not external_delta):
         if cutlass.const_expr(origins is not None):
-            dot_do_o_thd_origins_host(o, do, delta, meta, origins, b, sq_env, (origin_rows[3], origin_rows[4]), d, stream)
+            dot_do_o_thd_origins_host(o, do, delta, meta, origins, b, sq_env, (origin_rows[3], origin_rows[4]), d_v, stream)
         else:
-            dot_do_o_host(o, do, delta, None, None, DOT_Q_TILE, d, d, DOT_CHUNK_ELEMS, False, False, stream)
+            dot_do_o_host(o, do, delta, None, None, DOT_Q_TILE, d, d_v, DOT_CHUNK_ELEMS, False, False, stream)
 
     grid_m_kv = -(-skv_env // _THD_KV_BLOCK) * _THD_KV_BLOCK  # the kv envelope's M tiles (dK); dQ's is the padded q envelope (sqp)
     for ci in range(h // hc):
@@ -1374,7 +1375,7 @@ def _host_f16_thd_chain(
         if cutlass.const_expr(origins is not None):
             dkv_reduce_thd_origins_host(dk_tgt, dv_k, dk, dv, meta, origins, b, skv_env, origin_rows[6], origin_rows[7], d, group, dtype, stream)
         else:
-            dkv_reduce_bounded_host(dk_tgt, dv_k, dk, dv, d, d, group, dtype, False, _window(meta, 0, THD_CU_K_TOTAL_OFF(b), 1), stream)
+            dkv_reduce_bounded_host(dk_tgt, dv_k, dk, dv, d, d_v, group, dtype, False, _window(meta, 0, THD_CU_K_TOTAL_OFF(b), 1), stream)
 
 
 @cute.jit

@@ -22,9 +22,24 @@ pytestmark = [pytest.mark.L0, requires_dsl, requires_pre_rubin_blackwell]
 _ENGINE = "sdpa_bwd_sm100_d256"
 
 
-def make_payload(dt, token_major, lq, lk, phase, prefix, *, hq=8, hkv=2, causal=True, bottom_right=True, window_left=None):
+def make_payload(
+    dt, token_major, lq, lk, phase, prefix, *, hq=8, hkv=2, causal=True, bottom_right=True, window_left=None, d=256, d_v=256, physical_origins=True
+):
     c = checks._thd_case(
-        lq, lk, hq, 256, dt, cap_q=1000, cap_kv=1500, poison=True, seed=19 + phase, causal=causal, bottom_right=bottom_right, window_left=window_left, hkv=hkv
+        lq,
+        lk,
+        hq,
+        d,
+        dt,
+        cap_q=1000,
+        cap_kv=1500,
+        poison=True,
+        seed=19 + phase,
+        causal=causal,
+        bottom_right=bottom_right,
+        window_left=window_left,
+        hkv=hkv,
+        d_v=d_v,
     )
     data = {}
     starts = {}
@@ -35,8 +50,14 @@ def make_payload(dt, token_major, lq, lk, phase, prefix, *, hq=8, hkv=2, causal=
         kv = port in ("k", "v", "dk", "dv")
         lens = lk if kv else lq
         cap = 1500 if kv else 1000
+        if not physical_origins:
+            # Compact bindings use the plan's packed capacity, tightened by
+            # the fixed three-sequence envelope. Physical origins retain holes.
+            cap = min(cap, 3 * (383 if kv else 257))
         heads = hkv if kv else hq
         org = [13 + 3 * row + phase * 7 + i * ((383 if kv else 257) + 17 + row * 5) for i in range(3)]
+        if not physical_origins:
+            org = (c.cu_k if kv else c.cu_q)[:-1]
         starts[port] = org
         mask = torch.zeros(cap, dtype=torch.bool, device="cuda")
         for start, n in zip(org, lens):
@@ -52,7 +73,8 @@ def make_payload(dt, token_major, lq, lk, phase, prefix, *, hq=8, hkv=2, causal=
                     t[0, :, start : start + n] = values
             stride = hq if token_major else 1
         else:
-            t = torch.full((1, cap, heads, 256), -31 if port in ("dq", "dk", "dv") else float("nan"), device="cuda", dtype=dt)
+            width = d if port in ("q", "k", "dq", "dk") else d_v
+            t = torch.full((1, cap, heads, width), -31 if port in ("dq", "dk", "dv") else float("nan"), device="cuda", dtype=dt)
             if port in ("dq", "dk", "dv"):
                 t[0, mask] = float("nan")
             else:
@@ -60,12 +82,14 @@ def make_payload(dt, token_major, lq, lk, phase, prefix, *, hq=8, hkv=2, causal=
                 cu = c.cu_k if kv else c.cu_q
                 for i, (start, n) in enumerate(zip(org, lens)):
                     t[0, start : start + n] = src[0, cu[i] : cu[i] + n]
-            stride = heads * 256
+            stride = heads * width
         data[port] = t
         mult = 2 if stride % 2 == 0 else 1
         ro_dtype = torch.int32 if row % 2 == 0 else torch.int64
         offsets[port] = torch.tensor([x * stride // mult for x in org] + [(org[-1] + lens[-1]) * stride // mult], dtype=ro_dtype, device="cuda")
         spec[port] = (ro_dtype, mult)
+    if not physical_origins:
+        offsets, spec = {}, {}
     ql = torch.tensor(c.cu_q if prefix else lq, dtype=torch.int32, device="cuda")
     kl = torch.tensor(c.cu_k if prefix else lk, dtype=torch.int32, device="cuda")
     return dict(c=c, data=data, starts=starts, offsets=offsets, spec=spec, live=live, ql=ql, kl=kl, prefix=prefix)
@@ -105,16 +129,18 @@ def snapshots(p):
 def make_adapter(p, token_major):
     c = p["c"]
     eq, ek, es = checks._envelope_samples(c)
+    eo = torch.empty(c.b, eq.shape[2], c.h, c.d_v, device=eq.device, dtype=c.dtype).permute(0, 2, 1, 3)
+    ev = torch.empty(c.b, ek.shape[2], c.hkv, c.d_v, device=ek.device, dtype=c.dtype).permute(0, 2, 1, 3)
     api = SdpaBwdDslSm100D256(
         sample_q=eq,
         sample_k=ek,
-        sample_v=ek,
-        sample_o=eq,
-        sample_do=eq,
+        sample_v=ev,
+        sample_o=eo,
+        sample_do=eo,
         sample_stats=es,
         sample_dq=eq,
         sample_dk=ek,
-        sample_dv=ek,
+        sample_dv=ev,
         scale_softmax=c.scale,
         is_causal=c.causal,
         causal_bottom_right=c.bottom_right,
@@ -130,16 +156,17 @@ def make_adapter(p, token_major):
     return api
 
 
-def make_graph(p, token_major):
+def make_graph(p, token_major, cudnn_handle=None):
     c = p["c"]
     io = cudnn.data_type.HALF if c.dtype == torch.float16 else cudnn.data_type.BFLOAT16
-    g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, handle=cudnn_handle)
     tensors, ragged = {}, {}
 
     def describe(port, tensor=None):
         kv = port in ("k", "v", "dk", "dv")
         heads, seq = (c.hkv, 383) if kv else (c.h, 257)
-        dim, stride, dtype = [3, heads, seq, 256], [seq * heads * 256, 256, heads * 256, 1], io
+        width = c.d if port in ("q", "k", "dq", "dk") else c.d_v
+        dim, stride, dtype = [3, heads, seq, width], [seq * heads * width, width, heads * width, 1], io
         if port == "stats":
             dim, dtype = [3, c.h, 257, 1], cudnn.data_type.FLOAT
             stride = [257 * c.h, 1, c.h, 1] if token_major else [c.h * 1000, 1000, 1, 1]
@@ -195,7 +222,9 @@ def make_graph(p, token_major):
         vp = {tensors[port]: payload["data"][port] for port in THD_ORIGIN_PORTS}
         vp.update({ragged[port]: payload["offsets"][port] for port in THD_ORIGIN_PORTS})
         vp.update({ql: payload["ql"], kl: payload["kl"]})
-        g.execute(vp, payload["ws"])
+        if cudnn_handle is not None:
+            cudnn.set_stream(cudnn_handle, torch.cuda.current_stream().cuda_stream)
+        g.execute(vp, payload["ws"], handle=cudnn_handle)
 
     return g, execute
 
@@ -223,19 +252,26 @@ def test_graph_independent_origins(dt, token_major, hq, hkv, causal, bottom_righ
 @pytest.mark.parametrize("dt,token_major", [(torch.bfloat16, True), (torch.float16, False)], ids=["bf16-token-stats", "fp16-head-stats"])
 @pytest.mark.parametrize("surface", ["standalone", "graph"])
 def test_origins_rebind_and_replay(monkeypatch, dt, token_major, surface):
+    check_origins_rebind_and_replay(monkeypatch, dt, token_major, surface)
+
+
+def check_origins_rebind_and_replay(monkeypatch, dt, token_major, surface, *, d=256, d_v=256, physical_origins=True, cudnn_handle=None):
     import cutlass.cute as cute
+    from functools import partial
+
+    payload = partial(make_payload, d=d, d_v=d_v, physical_origins=physical_origins)
 
     # Force two complete GQA groups through reused scratch to expose cross-chunk
     # addressing. The production workspace policy is not under test here.
     monkeypatch.setattr(SdpaBwdDslSm100D256, "_ws_budget_bytes", lambda self: 1 << 20)
-    p = make_payload(dt, token_major, (257, 93, 128), (383, 129, 267), 0, False)
+    p = payload(dt, token_major, (257, 93, 128), (383, 129, 267), 0, False)
     if surface == "standalone":
         plan = make_adapter(p, token_major)
         assert plan._qh_chunk == 4
         execute = lambda payload: run(plan, payload)
         ws_bytes = plan.scratch_workspace_bytes()
     else:
-        plan, execute = make_graph(p, token_major)
+        plan, execute = make_graph(p, token_major, cudnn_handle)
         ws_bytes = plan.get_workspace_size()
     p["ws"] = torch.empty(ws_bytes, dtype=torch.uint8, device="cuda")
     poison(p)
@@ -252,7 +288,7 @@ def test_origins_rebind_and_replay(monkeypatch, dt, token_major, surface):
     retained = []
     try:
         for binding in range(2):
-            p = make_payload(dt, token_major, (257, 93, 128), (383, 129, 267), binding, surface == "standalone" and bool(binding))
+            p = payload(dt, token_major, (257, 93, 128), (383, 129, 267), binding, surface == "standalone" and bool(binding))
             p["ws"] = torch.empty(ws_bytes, dtype=torch.uint8, device="cuda")
             poison(p)
             p["snapshots"] = snapshots(p)
@@ -272,9 +308,10 @@ def test_origins_rebind_and_replay(monkeypatch, dt, token_major, surface):
                     torch.cuda.set_sync_debug_mode(previous_sync_mode)
         for phase, (lq, lk) in enumerate([((129, 0, 17), (0, 259, 127)), ((0, 0, 0), (0, 0, 0)), ((17, 93, 128), (127, 129, 267))], 2):
             for capture, p in retained:
-                changed = make_payload(dt, token_major, lq, lk, phase, p["prefix"])
+                changed = payload(dt, token_major, lq, lk, phase, p["prefix"])
                 for port in THD_ORIGIN_PORTS:
                     p["data"][port].copy_(changed["data"][port])
+                for port in p["offsets"]:
                     p["offsets"][port].copy_(changed["offsets"][port])
                 p["ql"].copy_(changed["ql"])
                 p["kl"].copy_(changed["kl"])

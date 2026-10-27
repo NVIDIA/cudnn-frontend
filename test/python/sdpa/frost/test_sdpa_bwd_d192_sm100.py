@@ -112,7 +112,7 @@ def test_rectangular_backward_replay_and_rebind(monkeypatch, dt, sq, sk, hk, cau
 
 @pytest.mark.parametrize(
     "d,dv,thd,served",
-    [(192, 128, False, True), (192, 128, True, False), (128, 128, False, False), (192, 192, False, False), (256, 128, False, False), (256, 256, False, True)],
+    [(192, 128, False, True), (192, 128, True, True), (128, 128, False, False), (192, 192, False, False), (256, 128, False, False), (256, 256, False, True)],
 )
 def test_exact_head_pair_admission(monkeypatch, d, dv, thd, served):
     from test_sdpa_bwd_d256_sm100 import _decline_reason
@@ -121,7 +121,7 @@ def test_exact_head_pair_admission(monkeypatch, d, dv, thd, served):
     assert (reason is None) == served, reason
 
 
-@pytest.mark.parametrize("profile,thd,dqk,dv", [(2, False, 192, 128), (1, True, 192, 128), (1, False, 128, 128), (1, False, 256, 128)])
+@pytest.mark.parametrize("profile,thd,dqk,dv", [(2, False, 192, 128), (1, False, 128, 128), (1, False, 256, 128)])
 def test_unqualified_native_geometry_is_rejected(profile, thd, dqk, dv):
     from cudnn.sdpa.bwd.config_d256_2x2 import FAMILY_F16, TemplateParams2x2, make_cfg_d256_2x2
 

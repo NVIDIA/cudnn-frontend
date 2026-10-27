@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 """cuDNN-frontend adapter of the ``sdpa_bwd_sm100_d256`` row: the SM100 / SM103 (cc 10.0-10.6) d=256 bf16 / fp16 SDPA
-backward, with a native dense D192x128 specialization. Q/K and V/O keep
+backward, with a native D192x128 specialization. Q/K and V/O keep
 their actual widths in tensor maps; the delta and grouped-gradient reductions use
 separate widths. No head-dimension staging or extra launch is added.
 
@@ -43,7 +43,7 @@ _SM100_D256_TEMPLATE_TAG = "sdpa_bwd_sm100_d256_main"
 
 
 class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
-    """SM100 half backward: native D256 or dense D192x128 geometry."""
+    """SM100 half backward: native D256 or D192x128 geometry."""
 
     _FAMILY = _cfg.FAMILY_F16
     _NAME = "sdpa_bwd_sm100_d256"
@@ -59,7 +59,6 @@ class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
 
     def _check_head_dims(self) -> None:
         if (self.head_dim_qk, self.head_dim_v) == (192, 128):
-            self._value_error_if(self.thd, f"{self._NAME}: D192x128 backward currently requires dense BSHD storage")
             return
         super()._check_head_dims()
 

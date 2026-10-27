@@ -884,6 +884,12 @@ binding. `test_sdpa_native_prefill_binding.py` covers D192/V128 alongside the
 equal-width flavors, fresh storage, invalid current spans and physical wide
 output strides through both split and unsplit execution.
 
+For unequal-width dK/dV reductions, a vector rejected by the device row limit
+still belongs to its original output interval. Do not let a masked dK vector
+fall through to dV with a negative index. The compact cases in
+`test_sdpa_bwd_thd_d192_sm100.py` check live gradients and untouched capacity
+tails after changing lengths under capture, including an all-empty replay.
+
 A launch recorder must reconstruct the plan's actual native binder type after
 intercepting its entry. Hard-coding THD fails once dense prefill becomes native.
 Keep the existing KV-tail and fixed-shape rejection diagnostics, as exercised
