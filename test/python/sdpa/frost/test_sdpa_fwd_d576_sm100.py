@@ -426,13 +426,13 @@ def test_native_d576_compact_thd_rebind_and_capture(dtype, packed, stats, sink, 
             check(values, qlens, klens)
             graph = torch.cuda.CUDAGraph()
             captures.append((graph, values))
-            old_debug = torch.cuda.get_sync_debug_mode()
-            torch.cuda.set_sync_debug_mode("error")
-            try:
-                with torch.cuda.graph(graph):
+            with torch.cuda.graph(graph):
+                old_debug = torch.cuda.get_sync_debug_mode()
+                torch.cuda.set_sync_debug_mode("error")
+                try:
                     launch(values)
-            finally:
-                torch.cuda.set_sync_debug_mode(old_debug)
+                finally:
+                    torch.cuda.set_sync_debug_mode(old_debug)
         for qlens, klens in (([65, 17, 0], [97, 0, 31]), ([0, 0, 0], [0, 0, 0])):
             for graph, values in reversed(captures):
                 fill(values, qlens, klens)
