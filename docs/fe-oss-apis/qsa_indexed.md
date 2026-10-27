@@ -7,7 +7,10 @@ for block selection, bitmap training and the internal two-pass backend.
 `cudnn.ops.qsa_indexed_forward` and `qsa_indexed_backward` accept packed token
 indices directly. The implementation lives in `cudnn.QSA.indexed` and shares
 QSA's attention kernels. It supports BF16
-12Q/1KV, head dimension 256, and SM100/SM103 with CuTeDSL >= 4.7.
+12Q/1KV and head dimension 256 on SM100/SM103 (CuTeDSL >= 4.7) and
+SM107 (CuTeDSL >= 4.8 with native SM107 compiler support). The architecture
+coverage here applies to forward and general-selection backward; the stricter
+`causal_topk` backward has the requirements listed below.
 
 ```python
 from cudnn.ops import qsa_indexed_forward, qsa_indexed_backward
