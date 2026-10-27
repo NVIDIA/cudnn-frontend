@@ -667,6 +667,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
     # "THD / varlen"; the fp8 and MXFP8 bodies carry the same leg -- the MXFP8 one over packed per-sequence-tile-padded scale factors).
     _THD_SUPPORTED = True
     _THD_ORIGINS_SUPPORTED = False
+    _DETERMINISTIC_SUPPORTED = False
 
     def __init__(
         self,
@@ -878,7 +879,8 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
             f"{n}: per-batch kv lengths (seq_kv_lens) are not implemented -- this body takes ONE uniform real kv length (seqlen_kv_real)",
         )
         self._value_error_if(
-            self.deterministic, f"{n}: use_deterministic_algorithm is not claimed yet (the chain has no atomics; the two-run bitwise test decides)"
+            self.deterministic and not self._DETERMINISTIC_SUPPORTED,
+            f"{n}: use_deterministic_algorithm is not claimed yet (the chain has no atomics; the two-run bitwise test decides)",
         )
         self._value_error_if(self.sink_desc is not None or self.dsink_desc is not None, f"{n}: sink / dSink are not implemented")
         self._value_error_if(self.bias_desc is not None or self.dbias_desc is not None, f"{n}: bias / dBias are not implemented")

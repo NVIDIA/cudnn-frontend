@@ -51,6 +51,9 @@ class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
     _BATCH_PADDED_BSHD = True
     _THD_SUPPORTED = True
     _THD_ORIGINS_SUPPORTED = True
+    # dV owns each KV tile; dQ/dK GEMMs and the GQA fold reduce in fixed order.
+    # Persistent work claims only choose output ownership, never summation order.
+    _DETERMINISTIC_SUPPORTED = True
     _IO_DTYPES = SdpaBwdDslSm107._IO_DTYPES
 
     # The half row serves per-batch kv lengths on its standalone surface (its body reads ``seq_kv_lens[b]`` under the
