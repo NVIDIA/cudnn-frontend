@@ -80,6 +80,11 @@ def _leads(spec: EngineSpec, facts) -> bool:
     32/8 16/2 and MHA, S 1k-16k, causal / mask-free / SWA1024, BSHD and THD at equal and half-to-full lengths): THD at
     d128 wins 0.79-0.95 (one 1.07) -> ahead; dense BSHD d128 is parity (0.93-1.27), a window loses ~2x and dense D64
     loses 1.7-2.3x -> behind the backend. Every other row keeps ours-first."""
+    from cudnn.sdpa import placement_table
+
+    measured = placement_table.lookup(spec.name, facts)
+    if measured is not None:
+        return measured
     if spec.name == "sdpa_bwd_sm100_d128":
         return facts.thd and facts.window_left is None and (facts.d_qk, facts.d_v) == (128, 128)
     return True
