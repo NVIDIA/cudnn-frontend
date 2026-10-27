@@ -3,6 +3,7 @@
 """Shared D256 FP8 envelope cases, collected by the architecture CI entries."""
 
 from dataclasses import replace
+import math
 
 import pytest
 import torch
@@ -37,8 +38,57 @@ def _clone_with_slack(value, fill):
     return clone
 
 
-def _check(bufs, *, page=0, causal=False, bottom_right=False, window=None):
+def _split_reference(q, k, v, *, split, pack, **kwargs):
+    """FP64 blocked reference with FP8 P rounded at each split's own maximum.
+
+    Partition logical score columns with a PyTorch bias mask; do not call the
+    kernel's scheduler, index helpers or combine. Full-attention Stats provide
+    an independent check that the partitions cover the same mathematical op.
+    """
     from sdpa.fp8_ref import compute_ref
+
+    if split == 1:
+        return compute_ref(q, k, v, **kwargs)
+    b, sq, heads, _ = q.shape
+    skv = k.shape[1]
+    qlens, klens = kwargs["padding"] or (torch.full((b,), sq, device=q.device), torch.full((b,), skv, device=q.device))
+    rows = torch.arange(sq, device=q.device).view(1, sq)
+    tile_q = 128 // (heads // k.shape[2] if pack else 1)
+    first_q = rows // tile_q * tile_q
+    diagonal = (klens - qlens).view(b, 1) if kwargs["diag_align"] == cudnn.diagonal_alignment.BOTTOM_RIGHT else 0
+    first_key = torch.zeros((b, sq), device=q.device, dtype=torch.int64)
+    if kwargs["left_bound"] is not None:
+        first_key = (first_q + diagonal - kwargs["left_bound"]).clamp(min=0) // 128
+    last_key = ((klens.view(b, 1) + 127) // 128).expand(b, sq)
+    if kwargs["right_bound"] is not None:
+        last_key = torch.minimum(last_key, (first_q + tile_q + diagonal + kwargs["right_bound"] + 127) // 128)
+    count = (last_key - first_key).clamp(min=0)
+    count = torch.where(first_q < qlens.view(b, 1), count, 0)
+    columns = torch.arange(skv, device=q.device).view(1, 1, 1, skv)
+    outputs, logs = [], []
+    for index in range(split):
+        start = first_key + index * (count // split) + (count % split).clamp(max=index)
+        end = start + count // split + (index < count % split)
+        included = (columns >= start[:, None, :, None] * 128) & (columns < end[:, None, :, None] * 128)
+        bias = torch.where(included, 0.0, -torch.inf)
+        partial, stats, _ = compute_ref(q, k, v, **dict(kwargs, bias=bias, sink_token=None))
+        outputs.append(partial.transpose(1, 2).double())
+        logs.append(stats.double())
+    terms = logs
+    sink = kwargs["sink_token"]
+    if sink is not None:
+        terms = logs + [sink.double().expand(b, heads, sq, 1)]
+    combined_stats = torch.logsumexp(torch.stack(terms), dim=0)
+    output = sum(partial * torch.exp(log - combined_stats).nan_to_num() for partial, log in zip(outputs, logs))
+    dead = rows[:, None, :, None] >= qlens.view(b, 1, 1, 1)
+    combined_stats = combined_stats.masked_fill(dead, -torch.inf)
+    output = output.masked_fill(dead, 0)
+    _, full_stats, _ = compute_ref(q, k, v, **dict(kwargs, torch_itype=torch.float64))
+    torch.testing.assert_close(combined_stats.float(), full_stats, atol=1e-5, rtol=1e-6)
+    return output.transpose(1, 2).float(), full_stats, output.abs().max().item()
+
+
+def _check(bufs, *, page=0, causal=False, bottom_right=False, window=None, split=1, pack=False, stats_log2=False):
     import test_sdpa_fwd_paged_sm100 as paged
 
     q, k, v = (bufs[n] for n in ("q", "k", "v"))
@@ -56,7 +106,7 @@ def _check(bufs, *, page=0, causal=False, bottom_right=False, window=None):
         padding = (bufs["seq_q"].view(b), lens)
     # D256 casts P without D128's extra 2**4 factor, even for a narrow Q/K
     # head paired with wide V. The FP64 oracle follows that native pipeline.
-    ref, stats, _ = compute_ref(
+    ref, stats, _ = _split_reference(
         q.transpose(1, 2),
         k.transpose(1, 2),
         v.transpose(1, 2),
@@ -67,6 +117,8 @@ def _check(bufs, *, page=0, causal=False, bottom_right=False, window=None):
         s_scale=16.0,
         s_descale=1.0 / 16.0,
         torch_itype=q.dtype,
+        split=split,
+        pack=pack,
         torch_otype=torch.float16,
         padding=padding,
         left_bound=window,
@@ -83,8 +135,12 @@ def _check(bufs, *, page=0, causal=False, bottom_right=False, window=None):
     paged._check_fp8_o(bufs["o"], ref * bufs["scale_o"], bufs["o"].dtype, in_key)
     # Match the existing prepared-dense Stats bound; paged cases retain their
     # existing absolute bound.
-    torch.testing.assert_close(bufs["lse"].reshape(b, h, sq), stats.reshape(b, h, sq), atol=0.01, rtol=0 if page else 0.01)
-    assert abs(bufs["amax_o"].item() - ref.abs().max().item()) <= 0.03
+    if "lse" in bufs:
+        if stats_log2:
+            stats = stats / math.log(2)
+        torch.testing.assert_close(bufs["lse"].reshape(b, h, sq), stats.reshape(b, h, sq), atol=0.01, rtol=0 if page else 0.01)
+    if "amax_o" in bufs:
+        assert abs(bufs["amax_o"].item() - ref.abs().max().item()) <= 0.03
 
 
 def _check_dense(d, dv, dtype, output, monkeypatch, *, causal=False, bottom_right=False, window=None, softmax_precision=None):

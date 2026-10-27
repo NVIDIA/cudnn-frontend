@@ -22,7 +22,7 @@ _CASES = [
 ]
 
 
-def _run_packed(case, dtype, output, monkeypatch, half=False, adapter=False):
+def _run_packed(case, dtype, output, monkeypatch, half=False, adapter=False, split=1, pack=True):
     d, dv, group, sq, skv, causal, bottom_right, window, sink, sched = case
     heads = 2 * group
     seen = _record_route(monkeypatch)
@@ -50,18 +50,21 @@ def _run_packed(case, dtype, output, monkeypatch, half=False, adapter=False):
         sdpa_kwargs=kwargs,
     )
     selected = g.plans[g._plan_index]
-    g.create_execution_plan(selected.engine_id, replace(selected.knobs, pack_gqa=True, split_kv=1, sched_policy=sched, cga=1))
+    g.create_execution_plan(selected.engine_id, replace(selected.knobs, pack_gqa=pack, split_kv=split, sched_policy=sched, cga=1))
     g.select_plan(len(g.plans) - 1)
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(1, g.get_workspace_size()), dtype=torch.uint8, device="cuda")
     assert seen and set(seen) == {"sm107/prefill_d256_fp8.py"}, seen
-    assert g.plans[g._plan_index].knobs.pack_gqa
+    assert g.plans[g._plan_index].knobs.pack_gqa == pack
     for name in ("q", "k", "v"):
         value = bufs[name]
         value._base[..., value.shape[-1] :].fill_(float("nan"))
         value.copy_((value.float() * 2.5).to(dtype))
-    check = dict(causal=causal, bottom_right=bottom_right, window=window)
+    # Split chunks use independent maxima before FP8 P quantization. Compare
+    # them to a partitioned FP64 reference, not one unsplit rounding trajectory.
+    # Keep the same O/Stats/Amax bounds; unsplit checks retain their FP8 oracle.
+    check = dict(causal=causal, bottom_right=bottom_right, window=window, split=split, pack=pack)
     g.execute(vp, ws)
     _check(bufs, **check)
     if adapter:

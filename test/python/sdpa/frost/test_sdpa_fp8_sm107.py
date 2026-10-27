@@ -828,13 +828,14 @@ def test_sm107_split_is_wired_only_for_supported_flavors():
     # The wired cell builds.
     cfg.make_cfg_d128(tp(dtype_qkv=_E4M3, dtype_o=_BF16_OUT))
     cfg.make_cfg_d192(tp(dtype_qkv=_E4M3, dtype_o=_BF16_OUT))
+    cfg.make_cfg_d256(tp(dtype_qkv=_E4M3, dtype_o=_BF16_OUT))
     cfg.make_cfg_d128(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
     cfg.make_cfg_d192(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
 
-    # Wider per-tensor and block-scaled Rubin cells still refuse split.
+    # D512 per-tensor and block-scaled Rubin cells still refuse split.
     unwired = [
         ("d128 mxfp8", cfg.make_cfg_d128_mxfp8, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
-        ("d256", cfg.make_cfg_d256, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
+        ("d256 mxfp8", cfg.make_cfg_d256_mxfp8, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
         ("d512", cfg.make_cfg_d512, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
     ]
     for name, make, params in unwired:
@@ -1878,9 +1879,9 @@ def test_sm107_fp8_direct_split_keeps_partial_stats_natural(d, monkeypatch):
     torch.testing.assert_close(lse.double(), scores.logsumexp(-1) * math.log2(math.e), atol=2e-4, rtol=2e-5)
 
 
-@pytest.mark.parametrize("d,pack,accepted", [(128, True, True), (192, False, True), (192, True, True), (256, True, False)])
+@pytest.mark.parametrize("d,pack,accepted", [(128, True, True), (192, False, True), (192, True, True), (256, True, True)])
 def test_sm107_fp8_split_standalone_pack_domain(d, pack, accepted):
-    """D192 packing is served; the independent D256 packed-split decline remains."""
+    """D192 and D256 native per-tensor FP8 packed splits share adapter admission."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     if torch.cuda.get_device_capability() != (10, 7):
@@ -2069,3 +2070,24 @@ class TestNativeD256Fp8Pack:
     test_half_softmax = staticmethod(_half)
     test_large_group_adapter = staticmethod(_adapter)
     test_declines = staticmethod(_declines)
+
+
+@requires_rubin
+class TestNativeD256Fp8Split:
+    """Native split partials and the shared final combine preserve one contract."""
+
+    from sdpa_fp8_d256_split_sm107 import (
+        test_native_d256_split_rebind_replay as _replay,
+        test_native_d256_split_half_adapter as _adapter,
+        test_native_d256_split_nomask_optional as _optional,
+        test_native_d256_split_omitted_scales as _scales,
+        test_native_d256_split_scalar_kv_tail as _tail,
+    )
+
+    test_rebind_and_replay = staticmethod(_replay)
+    test_half_adapter = staticmethod(_adapter)
+
+    test_nomask_optional = staticmethod(_optional)
+    test_omitted_scales = staticmethod(_scales)
+
+    test_scalar_kv_tail = staticmethod(_tail)

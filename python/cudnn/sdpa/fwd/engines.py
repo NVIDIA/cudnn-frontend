@@ -74,6 +74,7 @@ from cudnn.sdpa.fwd.config_sm107 import (
     SM107_F16_THD_SHAPES,
     SM107_FP8_THD_SHAPES,
     SM107_FP8_SPLIT_SHAPES,
+    supports_fp8_d256_padded_split,
     SM107_FP8_PACK_GQA_SHAPES,
     SM107_MXFP8_THD_SHAPES,
     SM107_SCORE_STATS_SHAPES,
@@ -1575,6 +1576,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 # d256 decode tile, whose split carries the gate IN the combine
                 # (sm100/split_combine gate=True; api_dsl._gate_in_combine).
                 return "split_kv > 1 cannot ride the fused epilogue gate (the combine would write the un-gated O); only the d256 decode tile's split applies the gate in its combine"
+            native_fp8_padded_split = supports_fp8_d256_padded_split(
+                _selected_d_shape(capabilities, facts, knobs),
+                device_cc=facts.device_cc,
+                pertensor=facts.is_fp8,
+                thd=facts.thd,
+                paged=facts.has_paged_kv,
+            )
             # Facts x knobs: the split path is structurally dense-only (the
             # per-split LSE is the combine weight; the THD/sink/padded paths
             # do not produce per-split partials). Declined HERE so a split
@@ -1601,8 +1609,17 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                         or capabilities.sm_lo not in (100, 107, 120)
                     )
                 )
-                or (facts.padded and not facts.has_paged_kv and not packed_split and _selected_d_shape(capabilities, facts, knobs) != SM100_NATIVE_D576_SHAPE)
-                or (facts.seq_q_trim and not (facts.padded and _selected_d_shape(capabilities, facts, knobs) == SM100_NATIVE_D576_SHAPE))
+                or (
+                    facts.padded
+                    and not facts.has_paged_kv
+                    and not packed_split
+                    and not native_fp8_padded_split
+                    and _selected_d_shape(capabilities, facts, knobs) != SM100_NATIVE_D576_SHAPE
+                )
+                or (
+                    facts.seq_q_trim
+                    and not (facts.padded and (native_fp8_padded_split or _selected_d_shape(capabilities, facts, knobs) == SM100_NATIVE_D576_SHAPE))
+                )
                 # A split sink over padded query lengths also needs the native dense binder that hands the combine the Q lengths (a padded
                 # row must stay O := 0 / LSE := -inf): an older extension declines it here rather than at the spec build.
                 or (
@@ -1621,11 +1638,15 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 and not getattr(cudnn._pybind_module._SdpaDenseBinder, "supports_quantized_split_sink", False)
             ):
                 return "FP8 split attention with a sink needs the native quantized sink-combine binder; rebuild the extension"
-            if _synth_kv_padding(capabilities, facts) and not supports_scalar_kv_tail_split(
-                (facts.d_qk, facts.d_v),
-                device_cc=facts.device_cc,
-                fp8=facts.is_fp8 or facts.is_mxfp8,
-                pertensor=facts.is_fp8,
+            if (
+                _synth_kv_padding(capabilities, facts)
+                and not native_fp8_padded_split
+                and not supports_scalar_kv_tail_split(
+                    (facts.d_qk, facts.d_v),
+                    device_cc=facts.device_cc,
+                    fp8=facts.is_fp8 or facts.is_mxfp8,
+                    pertensor=facts.is_fp8,
+                )
             ):
                 return "split_kv > 1 cannot ride the KV-tail mask this S_kv needs"
             # No gate on the O dtype: the partials are never narrower than it,
@@ -1637,9 +1658,15 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # cannot serve, so the plan would clear eligibility and then die in
             # the lowering (contract rule 8b'). Mirrors the pack_gqa gate below.
             # ... plus the d256 decode tile's dense / paged split (fp32 partials into the split-major
-            # workspace the shared combine reduces, packed or not); the d256 PREFILL kernel's only split
-            # stays the half THD packed split (paged or not).
-            if capabilities.sm_lo == 107 and _selected_d_shape(capabilities, facts, knobs) == (256, 256) and not packed_split and not decode_tile:
+            # workspace the shared combine reduces, packed or not). Native per-tensor FP8
+            # D256 prefill also has dense FP32 partials; half prefill keeps its THD split.
+            if (
+                capabilities.sm_lo == 107
+                and not facts.is_fp8
+                and _selected_d_shape(capabilities, facts, knobs) == (256, 256)
+                and not packed_split
+                and not decode_tile
+            ):
                 return "SM107 D256 split is qualified for half THD and the d256 decode tile (a decode-shaped graph: S_q x G packed rows within its routed envelope) only"
             # With the knobs: a dense-only tile (the Rubin d32 / d64) is walked
             # past, so a split graph at D <= 64 selects the d128 flavor it
@@ -2673,7 +2700,8 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # a partial Q/K head uses rank-4 K TMA so storage slack zero-fills;
             # exact D192 retains the rank-5 chunk load. SM107 already uses rank-4.
             # D256 also preserves actual K/V widths, including paged SM100 pools;
-            # partial heads use bounded rank-4 loads and exact heads keep rank-5.
+            # SM100/SM103 partial heads use bounded rank-4 loads and exact heads
+            # keep rank-5. Native SM107 uses rank-4 for both exact and partial heads.
             # Both architecture rows mirror api_dsl._SM100_FP8_ENVELOPE_FLOORS
             # so graph admission and prepared lowering agree.
             d_envelope_floors=(((512, 512), 256),),
