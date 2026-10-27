@@ -138,8 +138,11 @@ def test_ordered_thd_rebinds_storage_and_validates_workspace_before_launch():
         current = {role: fact._replace(ptr=fact.ptr + offset) for role, fact in facts.items()}
         address = 0x30000 + offset
         ws = native.make_operand_buffer(address, [spec.scratch_bytes], 1, 8, 0)
-        assert call(current, ws, stream) is None
-        assert list(frames.pop()) == _reference(spec, current, address, stream)
+        result = call(current, ws, stream)
+        frame = frames.pop()
+        expected = _reference(spec, current, address, stream)
+        assert result is None
+        assert list(frame) == expected
         for bad, message in (
             (None, "received none"),
             (native.make_operand_buffer(address, [0], 1, 8, 0), "got 0 bytes"),
@@ -153,8 +156,11 @@ def test_ordered_thd_rebinds_storage_and_validates_workspace_before_launch():
         # the native entry must not launch before that path validates the call.
         result = call(current, address, stream)
         assert result[2] is None and not frames
-        assert call(current, ws, stream) is None
-        assert list(frames.pop()) == _reference(spec, current, address, stream)
+        result = call(current, ws, stream)
+        frame = frames.pop()
+        expected = _reference(spec, current, address, stream)
+        assert result is None
+        assert list(frame) == expected
 
 
 def _equal(s, facts, **kwargs):
