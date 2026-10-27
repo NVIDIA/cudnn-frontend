@@ -24,6 +24,8 @@ def test_rectangular_thd_rebind_and_replay(monkeypatch, cudnn_handle, dt, token_
     def record(api, main, mm_dk, mm_dq):
         geometry.append((main.CFG.TILE_K, main.CFG.TILE_O))
         assert geometry[-1] == (192, 128)
+        for stage3 in (mm_dk, mm_dq):
+            assert stage3.PARAMS.cgrp_tile_mn == (128, 192) and stage3.cta_group == 1
         return original(api, main, mm_dk, mm_dq)
 
     monkeypatch.setattr(thd.SdpaBwdDslSm100D256, "_compile_plan", record)
