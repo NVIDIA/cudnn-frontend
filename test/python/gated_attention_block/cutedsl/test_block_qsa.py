@@ -398,7 +398,7 @@ def test_decode_indexer_declines_are_published_row_by_row_and_the_envelope_names
     assert dense.index_sources == () and dense.index_page_sizes == () and dense.index_query_rows_max == 0 and dense.fuse_prepare_default is False
     assert GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=(10, 0)).decode.fuse_prepare_default is False  # an unmeasured part
     assert not (set(tokens) & set(dense.declines))
-    assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-10:] == [
+    assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-13:] == [
         "index_sources",
         "index_cache_dtypes",
         "index_head_dims",
@@ -409,6 +409,9 @@ def test_decode_indexer_declines_are_published_row_by_row_and_the_envelope_names
         "index_state_rows_extra",
         "index_page_sizes",
         "fuse_prepare_default",
+        "sparse_tiles",
+        "sparse_tile_lean_default",
+        "device_cc",
     ]
 
 

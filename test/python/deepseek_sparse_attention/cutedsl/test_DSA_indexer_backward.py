@@ -34,6 +34,13 @@ def _require_exact_sm100():
         pytest.skip("this hardware-validation case requires an SM100 (10, 0) GPU")
 
 
+def _require_indexer_backward_v2_gpu():
+    """Skip unless the v2 backend supports the current GPU capability."""
+    supported_capabilities = ((10, 0), (10, 3))
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in supported_capabilities:
+        pytest.skip(f"IndexerBackward v2 requires capability in {supported_capabilities}")
+
+
 def _allocate(cfg, sm_scale: float):
     b = cfg["b"]
     s_q = cfg["s_q"]
@@ -1735,6 +1742,204 @@ def test_DSA_indexer_backward_v2_accepts_sm103_capability(monkeypatch):
     )
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 3))
     assert plan.check_support()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("capability,supported", [((10, 0), True), ((10, 3), True), ((10, 7), False)])
+def test_indexer_backward_v2_test_guard_matches_backend_capabilities(monkeypatch, capability, supported):
+    """The H32 runtime tests skip major-10 GPUs outside the v2 support set."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+
+    if supported:
+        _require_indexer_backward_v2_gpu()
+    else:
+        with pytest.raises(pytest.skip.Exception):
+            _require_indexer_backward_v2_gpu()
+
+
+@torch_fork_set_rng(seed=1710)
+@pytest.mark.parametrize(
+    "topk,b,topk_indices_global,dw_dtype,dk_dtype",
+    [
+        pytest.param(129, 2, False, torch.float32, torch.float32, marks=pytest.mark.L0, id="tail-129-local-b2-fp32dw-fp32dk"),
+        pytest.param(2048, 2, False, torch.bfloat16, torch.float32, marks=pytest.mark.L1, id="aligned-2048-local-b2-bf16dw-fp32dk"),
+        pytest.param(2051, 2, True, torch.float32, torch.bfloat16, marks=pytest.mark.L1, id="csa-tail-2051-global-b2-fp32dw-bf16dk"),
+        pytest.param(2051, 2, False, torch.float32, torch.float32, marks=pytest.mark.L1, id="csa-tail-2051-local-b2-fp32dw-fp32dk"),
+    ],
+)
+def test_DSA_indexer_backward_wrapper_v2_native_h32(topk, b, topk_indices_global, dw_dtype, dk_dtype):
+    """Native H32 accepts both production logical extents without caller padding.
+
+    The established backend remains the numeric control: for the CSA case it
+    receives an internal-tile-equivalent 2176-slot tensor whose tail is invalid
+    and zero.  The native plan uses no ticket-counter workspace with FP32 dK.
+    """
+    _require_indexer_backward_v2_gpu()
+    DSA = None
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    assert DSA is not None
+
+    padded_topk = ((topk + 127) // 128) * 128
+    cfg = dict(b=b, s_q=16, s_kv=2176, head_dim=128, qhead_per_kv_head=32, topk=topk)
+    index_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
+    if topk_indices_global:
+        batch_offsets = torch.arange(cfg["b"], dtype=torch.int32, device="cuda").view(cfg["b"], 1, 1) * cfg["s_kv"]
+        topk_indices = torch.where(topk_indices >= 0, topk_indices + batch_offsets, topk_indices)
+    grad_loss = torch.ones((), dtype=torch.float32, device="cuda")
+    loss_coeff = float(cfg["b"] * cfg["s_q"])
+
+    d_index_q = torch.empty_like(index_q)
+    d_weights = torch.empty_like(weights, dtype=dw_dtype)
+    d_index_k = torch.empty_like(index_k, dtype=dk_dtype)
+    plan = DSA.IndexerBackward(
+        sample_index_q=index_q,
+        sample_weights=weights,
+        sample_index_k=index_k,
+        sample_d_index_q=d_index_q,
+        sample_d_weights=d_weights,
+        sample_d_index_k=d_index_k,
+        sample_attn_score=attn_score,
+        sample_index_score=index_score,
+        sample_topk_indices=topk_indices,
+        sm_scale=1.0,
+        block_I=128,
+        topk_indices_global=topk_indices_global,
+        backend="sm100_v2",
+    )
+    assert plan.check_support()
+    expected_workspace_bytes = 0 if dk_dtype == torch.float32 else ws_align(index_k.numel() * 4)
+    assert plan.scratch_workspace_bytes() == expected_workspace_bytes
+    workspace = torch.empty(expected_workspace_bytes, dtype=torch.uint8, device="cuda") if expected_workspace_bytes else None
+    plan.compile()
+    native_attn = attn_score.clone()
+    plan.execute(
+        index_q,
+        weights,
+        index_k,
+        d_index_q,
+        d_weights,
+        d_index_k,
+        native_attn,
+        index_score,
+        topk_indices,
+        grad_loss,
+        loss_coeff=loss_coeff,
+        workspace=workspace,
+    )
+
+    pad = padded_topk - topk
+    default_attn = F.pad(attn_score, (0, pad))
+    default_index_score = F.pad(index_score, (0, pad))
+    default_indices = F.pad(topk_indices, (0, pad), value=-1)
+    default_dq = torch.empty_like(index_q)
+    default_dw = torch.empty_like(weights)
+    default_dk = torch.empty_like(index_k, dtype=dk_dtype)
+    DSA.indexer_backward_wrapper(
+        index_q,
+        weights,
+        index_k,
+        default_attn,
+        default_index_score,
+        default_indices,
+        grad_loss,
+        sm_scale=1.0,
+        loss_coeff=loss_coeff,
+        block_I=128,
+        topk_indices_global=topk_indices_global,
+        d_index_q=default_dq,
+        d_weights=default_dw,
+        d_index_k=default_dk,
+        backend="default",
+    )
+    torch.cuda.synchronize()
+
+    # The native and padded paths reduce different physical extents. Their
+    # softmax updates need numerical agreement, not bitwise identity; the
+    # deterministic test below owns the bitwise-stability contract.
+    torch.testing.assert_close(native_attn, default_attn[..., :topk], rtol=3e-6, atol=2e-7)
+    torch.testing.assert_close(d_index_q, default_dq, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(d_weights.float(), default_dw.float(), rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(d_index_k, default_dk, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=1712)
+def test_DSA_indexer_backward_wrapper_v2_native_h32_deterministic():
+    """The public deterministic H32 policy is bitwise stable and accurate."""
+    _require_indexer_backward_v2_gpu()
+    DSA = None
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    assert DSA is not None
+
+    cfg = dict(b=1, s_q=3, s_kv=128, head_dim=128, qhead_per_kv_head=32, topk=128)
+    index_q, weights, index_k, attn_source, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
+    d_index_q = torch.empty_like(index_q)
+    d_weights = torch.empty_like(weights, dtype=torch.float32)
+    d_index_k = torch.empty_like(index_k, dtype=torch.float32)
+    grad_loss = torch.ones((), dtype=torch.float32, device="cuda")
+    loss_coeff = float(cfg["b"] * cfg["s_q"])
+    plan = DSA.IndexerBackward(
+        sample_index_q=index_q,
+        sample_weights=weights,
+        sample_index_k=index_k,
+        sample_d_index_q=d_index_q,
+        sample_d_weights=d_weights,
+        sample_d_index_k=d_index_k,
+        sample_attn_score=attn_source,
+        sample_index_score=index_score,
+        sample_topk_indices=topk_indices,
+        sm_scale=1.0,
+        block_I=128,
+        backend="sm100_v2",
+        deterministic=True,
+    )
+    assert plan.check_support()
+    plan.compile()
+    workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
+
+    def run():
+        attn = attn_source.clone()
+        workspace.fill_(0xA5)
+        plan.execute(
+            index_q,
+            weights,
+            index_k,
+            d_index_q,
+            d_weights,
+            d_index_k,
+            attn,
+            index_score,
+            topk_indices,
+            grad_loss,
+            loss_coeff=loss_coeff,
+            workspace=workspace,
+        )
+        torch.cuda.synchronize()
+        return tuple(t.clone() for t in (d_index_q, d_weights, d_index_k, attn))
+
+    assert_bitwise_runs(run, label="sm100_v2 deterministic H32")
+    check_ref_indexer_backward(
+        index_q,
+        weights,
+        index_k,
+        attn_source,
+        index_score,
+        topk_indices,
+        d_index_q,
+        d_weights,
+        d_index_k,
+        sm_scale=1.0,
+        grad_scale=1.0,
+        cos_min=0.99,
+        rms_rel_max=0.02,
+    )
 
 
 @torch_fork_set_rng(seed=0)

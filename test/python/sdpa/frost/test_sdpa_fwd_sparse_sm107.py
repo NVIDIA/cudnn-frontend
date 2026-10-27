@@ -85,10 +85,20 @@ INDEX_LISTS_ENV = "CUDNN_FROST_QSA_INDEX_LISTS_DIR"
 
 
 def _kernel_source() -> str:
-    import cudnn.sdpa.fwd.config_sm107 as c107
+    from cudnn.sdpa.fwd import config_sm107 as c107
 
     path = os.path.join(os.path.dirname(os.path.abspath(c107.__file__)), "kernels", "sm107", "sparse_d256_f16.py")
-    return open(path).read()
+    with open(path) as f:
+        return f.read()
+
+
+def _item_common_source() -> str:
+    """The visible-set helper both sparse bodies share (sm107/_sparse_item_common.py; the arithmetic that lived in this kernel)."""
+    from cudnn.sdpa.fwd import config_sm107 as c107
+
+    path = os.path.join(os.path.dirname(os.path.abspath(c107.__file__)), "kernels", "sm107", "_sparse_item_common.py")
+    with open(path) as f:
+        return f.read()
 
 
 def _adapter_source() -> str:
@@ -425,7 +435,9 @@ def test_adapter_accepts_the_paged_form_and_derives_the_pool_geometry(P, hnd, sm
 
 def _decode_operands(B=1, S=1, H=24, KH=2, SKV=8192, dtype="torch.bfloat16", top_k=512, split_kv=1, **paged):
     """The decode form's stand-ins: ``S`` rows per sequence at the END of the sequence (bottom-right), ONE list per sequence
-    (``block_ids [B, top_k]``, ``block_lens [B]``), per-batch KV lengths, an optional split; ``paged`` = the paged form's extras."""
+    (``block_ids [B, top_k]``, ``block_lens [B]``), per-batch KV lengths, an optional split; ``paged`` = the paged form's extras.  The
+    tcgen05 core pinned by name (``tile_form="tcgen05"``): this module tests the core; under ``"auto"`` the measured part takes the lean
+    body inside its placement bound (``heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS``), whose route is the lean module's."""
     o = (
         _paged_operands(B=B, S=S, H=H, KH=KH, dtype=dtype, top_k=top_k, **paged)
         if paged
@@ -438,6 +450,7 @@ def _decode_operands(B=1, S=1, H=24, KH=2, SKV=8192, dtype="torch.bfloat16", top
         list_per_sequence=True,
         bottom_right=True,
         split_kv=split_kv,
+        tile_form="tcgen05",
     )
     return o
 
@@ -900,32 +913,41 @@ def test_sparse_kernel_decode_form_source_pins():
     pointer is fp32 under a split and the per-split LSE is required; no new barrier, SMEM tile or ring wait (the counts stay 15 /
     4 / 11)."""
     code = _code(_kernel_source())
+    common = _code(_item_common_source())  # the visible-set arithmetic lives in the shared helper (one helper for both bodies)
     for name in ("SPLIT_KV = CFG.SPLIT_KV", "LIST_PER_SEQUENCE = CFG.LIST_PER_SEQUENCE", "BOTTOM_RIGHT = CFG.BOTTOM_RIGHT"):
         assert name in code, name
     assert code.count("cutlass.const_expr(SPLIT_KV > 1)") >= 5, "the split arm folds at the decode, the bounds, both list-read sites and the store"
-    assert code.count("cutlass.const_expr(LIST_PER_SEQUENCE == 1)") >= 4 and code.count("cutlass.const_expr(BOTTOM_RIGHT == 1)") == 3
+    # the per-sequence / bottom-right arms fold in the kernel (the decode, the host, the store) AND in the shared helper (as constexpr parameters)
+    assert code.count("cutlass.const_expr(LIST_PER_SEQUENCE == 1)") >= 2 and code.count("cutlass.const_expr(BOTTOM_RIGHT == 1)") == 1
+    assert common.count("cutlass.const_expr(list_per_sequence == 1)") >= 2 and common.count("cutlass.const_expr(bottom_right == 1)") == 2
     assert "live_row = tok < eff_seqlen_q" in code, "under the bottom-right diagonal the store predicate is the Q row's liveness"
     # the prefill form keeps its own tail spelling (one tail id at most) so the dense rendering traces the same program as before
     assert (
-        "n_tail = _select_i32((n_vis % bs) != zero, 1, 0)" in code
-        and "tail = _select_i32((idx == count) & (n_tail != cutlass.Int32(0)), tail_lo, cutlass.Int32(-1))" in code
+        "n_tail = _select_i32((n_vis % bs) != zero, 1, 0)" in common
+        and "tail = _select_i32((idx == count) & (n_tail != cutlass.Int32(0)), tail_lo, cutlass.Int32(-1))" in common
     )
     assert "split = cute.arch.make_warp_uniform(x // seqlen_q)" in code and "tok = x - split * seqlen_q" in code
     assert "return tok, head, batch, item_row, kv_row_base, eff_seqlen_q, out_tok, out_batch, split" in code
-    # the one helper: anchor / tail count / chunk
-    i_ib = code.index("def _item_bounds(")
-    ib = code[i_ib : code.index("\ndef ", i_ib + 1)]
+    # the one helper: the anchor / tail count in the shared helper, the chunk cut here (the tcgen05 geometry)
     for frag in (
         "pos = tok + (eff_seqlen_kv - eff_seqlen_q)",
         "anchor = eff_seqlen_kv - eff_seqlen_q",
         "n_tail = cute.math.max((n_vis + bs - one) // bs - tail_lo, zero)",
+        "return pos, count, n_tail, tail_lo, dead, n_listed, eff_seqlen_kv",
+    ):
+        assert frag in common, frag
+    i_ib = code.index("def _item_bounds(")
+    ib = code[i_ib : code.index("\ndef ", i_ib + 1)]
+    for frag in (
+        "= visible_bounds(",
         "tile0 = split * per + cute.math.min(split, rem)",
         "dead = dead | (n_sp == zero)",
         "n_tiles = cute.math.max(cutlass.Int32(1), n_sp)",
         "return pos, count, n_tail, tail_lo, dead, n_tiles, eff_seqlen_kv, tile0",
     ):
         assert frag in ib, frag
-    assert "tail = _select_i32((rel >= cutlass.Int32(0)) & (rel < n_tail), tail_lo + rel, cutlass.Int32(-1))" in code
+    assert "tail = _select_i32((rel >= cutlass.Int32(0)) & (rel < n_tail), tail_lo + rel, cutlass.Int32(-1))" in common
+    assert "from cudnn.sdpa.fwd.kernels.sm107._sparse_item_common import _select_f32, _select_i32, block_id_at, visible_bounds" in code
     # the list reads offset by the chunk's first tile; the stores at the partial batch
     assert "_gather_block_ids(sIds_raw, slot_base, tile0, w, count, n_tail, tail_lo, dead)" in code
     assert "t_next = tile0 + t_next" in code and "t_abs = tile0 + i" in code
@@ -2508,7 +2530,8 @@ def _launch_decode(q, kv, ids, lens, kv_lens, top_k, scale, *, split=1, launches
     """Sentinel-filled O / LSE per launch through the adapter's DECODE form (``list_per_sequence=True, bottom_right=True,
     split_kv=split``; ``list_per_sequence=False`` = the per-token bottom-right form, ``block_ids [B, S_q, top_k]``); ``kv`` = ``(k, v)``
     dense or ``(k_pool, v_pool, table, P)`` paged.  A split's workspace is sentinel-filled too: an unwritten partial slot would read
-    as a huge live weight and the oracle comparison would catch it."""
+    as a huge live weight and the oracle comparison would catch it.  The tcgen05 core pinned by name (``tile_form="tcgen05"``): this is
+    the core's launcher and the lean module's reference; under ``"auto"`` the measured part takes the lean body inside its placement bound."""
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
 
     dev = q.device
@@ -2536,6 +2559,7 @@ def _launch_decode(q, kv, ids, lens, kv_lens, top_k, scale, *, split=1, launches
             bottom_right=True,
             split_kv=split,
             epilogue_gate=gate,
+            tile_form="tcgen05",
             **kw,
         )
         assert a.check_support()
@@ -3297,7 +3321,8 @@ def _former_combine_entry(gate: bool):
 def _pinned_form_cell(B, S_q, split, gate, with_lse, seed, use_pdl=False):
     """One decode cell through the adapter with the pinned combine form (and, ``use_pdl``, the programmatic-dependent-launch form of both
     launches): returns ``(adapter, o, lse, ws, gate_t, ref_o, ref_lse, run)`` -- ``run`` executes the adapter once more into the same O /
-    LSE / workspace (the census hook)."""
+    LSE / workspace (the census hook).  The tcgen05 core pinned by name (``tile_form="tcgen05"``): the core's pinned combine forms and its
+    PDL arm are under test; under ``"auto"`` the measured part takes the lean body inside its placement bound (the lean module's cells)."""
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
 
     H, KH, top_k, dtype = 24, 2, 512, torch.bfloat16
@@ -3330,6 +3355,7 @@ def _pinned_form_cell(B, S_q, split, gate, with_lse, seed, use_pdl=False):
         split_kv=split,
         epilogue_gate=gate_t,
         use_pdl=use_pdl,
+        tile_form="tcgen05",
     )
     assert a.check_support()
     a.compile()

@@ -7,6 +7,7 @@ import cutlass.cute as cute
 from cutlass.experimental import primitives as nvvm
 from cutlass.experimental.cuda import tensor_map as tmap
 from cudnn.frost.tile_dsl.handles import tma_slice_runtime_desc
+from cudnn.frost.tile_dsl.barrier import launch_dependent_grids
 
 from cudnn.frost.tile_dsl.thd import (
     THD_SETUP_THREADS,
@@ -53,6 +54,7 @@ def build_thd_origins(
     clusters: cutlass.Int32,
     paged: cutlass.Constexpr[bool] = False,
     rank_by_kv: cutlass.Constexpr[bool] = False,
+    release_dependents: cutlass.Constexpr[bool] = False,
     splits: cutlass.Constexpr[int] = 1,
 ):
     """Lengths control work and clipping; physical offsets control addresses.
@@ -62,6 +64,11 @@ def build_thd_origins(
     the consuming launch acquires the maps. Compact prefixes remain unchanged.
     """
     tid = cutlass.Int32(cute.arch.thread_idx()[0])
+    if cutlass.const_expr(release_dependents):
+        # The consumer may initialize CTA-local state while these maps are
+        # built. It must wait for this grid before reading metadata or maps.
+        if tid == 0:
+            launch_dependent_grids()
     warp, lane = tid // 32, tid % 32
     meta = cutlass.make_array_view(meta_t)
     base_maps = (q_desc, k_desc, v_desc, o_desc)

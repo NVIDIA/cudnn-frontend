@@ -3314,7 +3314,10 @@ def lower_dsl_prefill(
         facts.thd
         and not getattr(api, "thd_decode_leg", False)
         and facts.epilogue_gate_t is None
-        and facts.device_cc in ((10, 0), (10, 3))
+        and (
+            facts.device_cc in ((10, 0), (10, 3))
+            or (facts.device_cc == (10, 7) and facts.has_paged_kv and facts.d_qk == 128 and api.split_kv == 1 and not (facts.is_fp8 or facts.is_mxfp8))
+        )
         and (facts.d_qk, facts.d_v) in ((128, 128), (256, 256), SM100_NATIVE_D576_SHAPE)
         and (
             (

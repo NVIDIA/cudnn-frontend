@@ -21,6 +21,7 @@ pytestmark = [requires_dsl]
         pytest.param((576, 512), "bfloat16", "mixed", "token", 2, 5, True, marks=pytest.mark.L0, id="d576_split5_partial_pack_mixed"),
         pytest.param((576, 512), "bfloat16", "hnd", "head", 2, 2, False, marks=pytest.mark.L0, id="d576_split2_unpacked_hnd"),
         pytest.param((576, 512), "float16", "nhd", "head", 2, 9, True, marks=pytest.mark.L1, id="d576_split9_fp16_partial_pack"),
+        pytest.param(128, "bfloat16", "nhd", "head", 2, 1, False, marks=pytest.mark.L1, id="unpacked_origins"),
         pytest.param(128, "float16", "nhd", "head", 2, 1, True, marks=pytest.mark.L1),
         pytest.param(128, "bfloat16", "mixed", "token", 2, 1, True, marks=pytest.mark.L1),
         pytest.param(256, "bfloat16", "hnd", "head", 2, 1, True, marks=pytest.mark.L0),
@@ -37,24 +38,33 @@ pytestmark = [requires_dsl]
         pytest.param(128, "bfloat16", "hnd", "head", 1, 2, False, marks=pytest.mark.L1, id="split2_unpacked"),
     ],
 )
-def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stats_layout, cga, splits, pack_gqa):
+def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stats_layout, cga, splits, pack_gqa, page_size=16, window_left=None, sink=None):
     import cudnn
     import torch
     from cudnn.engines.manifest import family_for
+    from cudnn.frost.buffers import cutedsl_arch_requirement_error
 
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("SM100/SM103 physical THD origin path")
-    if cga == 1 and splits == 1 and torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("CGA1 paged prefill is currently admitted on SM100")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("SM100/SM103/SM107 physical THD origin path")
+    rubin = torch.cuda.get_device_capability() == (10, 7)
+    if rubin and (reason := cutedsl_arch_requirement_error((10, 7))) is not None:
+        pytest.skip(reason)
+    if rubin and (dim != 128 or splits != 1 or cga not in (1, 2)):
+        pytest.skip("native SM107 paged origins: D128 unsplit CGA1/2")
+    engine = "sdpa_fwd_prefill_sm107" if rubin else "sdpa_fwd_prefill_sm100"
+    if cga == 1 and splits == 1 and torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
+        pytest.skip("CGA1 paged prefill is currently admitted on SM100/SM107")
     torch.manual_seed(261026737)
     d_qk, d_v = dim if isinstance(dim, tuple) else (dim, dim)
-    batch, heads, kv_heads, maximum, page, kv_max = 2, (24 if d_qk == 576 else 16), (2 if d_qk == 576 else 4), 320, 16, (1024 if d_qk == 576 else 8192)
+    batch, heads, kv_heads, maximum, page, kv_max = 2, (24 if d_qk == 576 else 16), (2 if d_qk == 576 else 4), 320, page_size, (1024 if d_qk == 576 else 8192)
     pages_per_sequence, page_count = kv_max // page, batch * kv_max // page
     dtype = getattr(torch, dtype_name)
     io_type = cudnn.data_type.HALF if dtype_name == "float16" else cudnn.data_type.BFLOAT16
     widths = {"q": torch.int64, "o": torch.int32, "stats": torch.int64}
     multipliers = {"q": heads * (16 if d_qk == 576 else d_qk), "o": d_v, "stats": 1}
     graph_ports = ("q", "k", "v", "o", "stats", "ql", "kl", "kt", "vt", "ro_q", "ro_o", "ro_stats")
+    if sink is not None:
+        graph_ports += ("sink",)
 
     def buffers(wide=False):
         q_capacity, o_capacity, stats_capacity = (640 if wide else 512), 640, 672
@@ -67,6 +77,8 @@ def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stat
             "kl": torch.empty(batch, 1, 1, 1, device="cuda", dtype=torch.int32),
         }
         result["o"] = result["backing_o"][..., :d_v]
+        if sink is not None:
+            result["sink"] = torch.full((1, heads, 1, 1), sink, device="cuda", dtype=torch.float32)
         if pool_layout != "mixed":
             shape = (page_count + 1, kv_heads, page, 2 * d_qk) if pool_layout == "hnd" else (page_count + 1, page, kv_heads, 2 * d_qk)
             interleaved = torch.empty(shape, device="cuda", dtype=dtype)
@@ -138,6 +150,8 @@ def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stat
         is_inference=False,
         attn_scale=d_qk**-0.5,
         use_causal_mask_bottom_right=True,
+        diagonal_band_left_bound=window_left,
+        sink_token=nodes.get("sink"),
         use_padding_mask=True,
         seq_len_q=nodes["ql"],
         seq_len_kv=nodes["kl"],
@@ -158,16 +172,23 @@ def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stat
     graph.build_operation_graph()
     if cga is None:
         graph.create_execution_plans([cudnn.heur_mode.A])
-        graph.select_plan(next(i for i in range(len(graph.plans)) if graph.get_plan_name_at_index(i).startswith("sdpa_fwd_prefill_sm100")))
+        graph.select_plan(next(i for i in range(len(graph.plans)) if graph.get_plan_name_at_index(i).startswith(engine)))
     else:
         graph.create_execution_plan(
-            family_for(graph).offered_ids()["sdpa_fwd_prefill_sm100"],
+            family_for(graph).offered_ids()[engine],
             {cudnn.knob_type.TILE_CGA_M: cga, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.PACK_GQA: int(pack_gqa)},
         )
         graph.select_plan(0)
     graph.check_support()
     graph.build_plans()
-    assert graph.get_plan_name_at_index(graph._plan_index).startswith("sdpa_fwd_prefill_sm100")
+    assert graph.get_plan_name_at_index(graph._plan_index).startswith(engine)
+    if rubin:
+        import inspect
+
+        api = inspect.getclosurevars(graph._compiled_plans[graph._plan_index]._compiled.default_stream).nonlocals["api"]
+        assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
+        assert api._k_mod.CFG.STAGES_KV == 2 * cga
+        assert api._thd_origin_specs is not None
     print("ORIGIN_PLAN", graph.get_plan_name_at_index(graph._plan_index), flush=True)
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
 
@@ -192,7 +213,14 @@ def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stat
                 q = values["q"][starts["q"][b] + lo : starts["q"][b] + hi].double().transpose(0, 1)
                 scores = q @ k.transpose(-1, -2) * d_qk**-0.5
                 scores.masked_fill_(torch.arange(nk, device="cuda")[None, :] > torch.arange(nk - nq + lo, nk - nq + hi, device="cuda")[:, None], -torch.inf)
-                expected = (scores.softmax(-1) @ v).transpose(0, 1)
+                if window_left is not None:
+                    scores.masked_fill_(
+                        torch.arange(nk, device="cuda")[None, :] <= torch.arange(nk - nq + lo, nk - nq + hi, device="cuda")[:, None] - window_left,
+                        -torch.inf,
+                    )
+                if sink is not None:
+                    scores = torch.cat((scores, values["sink"].reshape(heads, 1, 1).double().expand(heads, hi - lo, 1)), dim=-1)
+                expected = (scores.softmax(-1)[..., :nk] @ v).transpose(0, 1)
                 expected_stats = scores.logsumexp(-1).T * (math.log2(math.e) if stats_layout == "head" else 1)
                 os, ss = starts["o"][b], starts["stats"][b]
                 torch.testing.assert_close(values["o"][os + lo : os + hi].double(), expected, atol=0.004, rtol=0.004)
@@ -241,3 +269,23 @@ def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stat
     finally:
         for captured, _, _ in captures:
             captured.reset()
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("page_size", [8, 256])
+def test_native_sm107_paged_origin_page_boundaries(page_size):
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("native SM107 paged D128")
+    test_paged_thd_origins_rebind_and_capture(128, "bfloat16", "mixed", "head", 2, 1, True, page_size=page_size)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("cga,sink", [(1, -120.0), (2, 3.0)])
+def test_native_sm107_paged_origins_window_and_sink(cga, sink):
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("native SM107 paged D128")
+    test_paged_thd_origins_rebind_and_capture(128, "bfloat16", "mixed", "head", cga, 1, True, window_left=32, sink=sink)
