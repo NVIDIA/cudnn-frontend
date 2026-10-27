@@ -402,6 +402,14 @@ NONPAGED_D128_MHA_THD_MIN_KV_TOKENS = 4096  # ... over a declared cache of at le
 NONPAGED_D128_MHA_THD_CCS = ((10, 0), (10, 3))
 NONPAGED_D64_THD_MIN_TOKENS = 512  # unpacked d64 THD: declared per-sequence Q and KV extent from which FROST leads
 NONPAGED_D64_THD_CCS = ((10, 0), (10, 3))
+
+
+def _declared_q_total(facts) -> int:
+    """The declared Q token total of a THD graph: ``max_total_seq_len_q`` when the graph declares one (an explicit
+    zero included), else the dense envelope ``b * s_q``."""
+    return facts.b * facts.s_q if facts.max_total_seq_len_q is None else facts.max_total_seq_len_q
+
+
 CHUNKED_SQUARE_MIN_KV_TOKENS = 32768  # s_q == s_kv at <= 128 tiles: kept from the 2026-09-18 bound, not re-measured
 
 # B200 paged THD prefill shard; conservative bounds on graph declarations.
@@ -1013,9 +1021,8 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
         and facts.s_kv >= NONPAGED_D128_MHA_THD_MIN_KV_TOKENS
         and (
             # the declared Q rows fill the SMs (a bounded or cache-shape declaration), or each sequence is long
-            facts.h_q * min(facts.b * facts.s_q, facts.max_total_seq_len_q or facts.b * facts.s_q)
-            >= THD_PACKED_MIN_Q_ROWS_PER_SM * (facts.device_sm_count or 148)
-            or min(facts.s_q, -(-(facts.max_total_seq_len_q or facts.b * facts.s_q) // max(facts.b, 1))) >= NONPAGED_D128_MHA_THD_MIN_TOKENS
+            facts.h_q * min(facts.b * facts.s_q, _declared_q_total(facts)) >= THD_PACKED_MIN_Q_ROWS_PER_SM * (facts.device_sm_count or 148)
+            or min(facts.s_q, -(-_declared_q_total(facts) // max(facts.b, 1))) >= NONPAGED_D128_MHA_THD_MIN_TOKENS
         )
     ):
         return LEAD  # unpacked causal MHA d128 THD
@@ -1035,9 +1042,8 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
         and facts.device_cc in NONPAGED_D64_THD_CCS
         and facts.s_kv >= NONPAGED_D64_THD_MIN_TOKENS
         and (
-            facts.h_q * min(facts.b * facts.s_q, facts.max_total_seq_len_q or facts.b * facts.s_q)
-            >= THD_PACKED_MIN_Q_ROWS_PER_SM * (facts.device_sm_count or 148)
-            or min(facts.s_q, -(-(facts.max_total_seq_len_q or facts.b * facts.s_q) // max(facts.b, 1))) >= NONPAGED_D64_THD_MIN_TOKENS
+            facts.h_q * min(facts.b * facts.s_q, _declared_q_total(facts)) >= THD_PACKED_MIN_Q_ROWS_PER_SM * (facts.device_sm_count or 148)
+            or min(facts.s_q, -(-_declared_q_total(facts) // max(facts.b, 1))) >= NONPAGED_D64_THD_MIN_TOKENS
         )
     ):
         return LEAD  # unpacked causal d64 THD

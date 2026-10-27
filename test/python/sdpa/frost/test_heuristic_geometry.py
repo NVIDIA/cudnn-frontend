@@ -410,6 +410,9 @@ def test_nonpaged_d128_mha_thd_leads_from_512_declared_tokens(device_cc, batch, 
         assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, "causal": False, "bottom_right": False})) == placement.TRAIL
         assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, "window_left": 128})) == placement.TRAIL
         assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, "max_total_seq_len_q": 128})) == placement.TRAIL
+        assert (
+            placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, "max_total_seq_len_q": 0})) == placement.TRAIL
+        )  # an explicit zero total
     cache = dict(base, b=4096, s_q=65536, s_kv=65536)
     assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**cache)) == placement.LEAD  # FlashInfer cache-shape declaration
     assert (
@@ -436,6 +439,9 @@ def test_nonpaged_d64_thd_leads_from_512_declared_tokens(device_cc, h_q, h_kv, b
         assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, "dtype": cudnn.data_type.HALF})) == placement.TRAIL
         assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, "causal": False, "bottom_right": False})) == placement.TRAIL
         assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, "window_left": 128})) == placement.TRAIL
+        assert (
+            placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, "max_total_seq_len_q": 0})) == placement.TRAIL
+        )  # an explicit zero total
     cache = dict(base, b=4096, s_q=65536, s_kv=65536)
     assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**cache)) == placement.LEAD  # FlashInfer cache-shape declaration
     assert (
