@@ -513,6 +513,7 @@ def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_sta
             or (d_shape == (128, 128) and max_q > (1 if paged else 0))
             or (not paged and d_shape == (192, 128) and max_q > 0)
             or (d_shape == (256, 256) and max_q > 0)
+            or (device_cc in ((10, 0), (10, 3)) and d_shape == SM100_NATIVE_D576_SHAPE and max_q > 0)
         )
     )
 
@@ -527,6 +528,13 @@ def supports_scalar_kv_tail_split(d_shape, *, device_cc, fp8, pertensor):
 def supports_paged_split_sink(d_shape, *, device_cc, fp8, thd, paged, max_q):
     """Sink-aware packed combine, qualified on Rubin D128 paged half Q>1."""
     return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and paged and max_q > 1
+
+
+def supports_thd_split_sink(d_shape, *, device_cc, fp8, thd, paged, max_q):
+    """Half partials fold the sink once in the final packed combine."""
+    return supports_paged_split_sink(d_shape, device_cc=device_cc, fp8=fp8, thd=thd, paged=paged, max_q=max_q) or (
+        device_cc in ((10, 0), (10, 3)) and d_shape == SM100_NATIVE_D576_SHAPE and not fp8 and thd and max_q > 0
+    )
 
 
 def supports_paged_prefill_cga1(d_shape, *, device_cc, fp8, thd, paged, split_kv, max_q):
@@ -657,6 +665,7 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
         if k.thd_varlen and not (
             (flavor == "d64" and k.decode_tile and k.cta_mma == 1 and k.paged_kv and not fp8)
             or (flavor == "d256" and k.cta_mma == 2 and not fp8 and not k.pack_gqa)
+            or (flavor == "d512" and k.d_flavor == 576 and k.cta_mma == 2 and not fp8)
             or (
                 flavor == "d128"
                 and k.cta_mma == 1
@@ -688,12 +697,12 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
                     )
                 )
                 or (flavor == "d256" and k.paged_kv and k.cta_mma == 2 and k.split_kv == 1)
-                or (flavor == "d512" and k.d_flavor == 576 and k.cta_mma == 2 and k.split_kv == 1)
+                or (flavor == "d512" and k.d_flavor == 576 and k.cta_mma == 2)
             )
         ):
             raise ValueError(
                 f"{flavor}: THD PackGQA requires half d128 cga2 unsplit/cga1 split, paged half d64 cga1 split, "
-                "paged half d256 cga2 unsplit, or native half d576 cga2 unsplit"
+                "paged half d256 cga2 unsplit, or native half d576 cga2"
             )
     if k.ragged_q:
         # The decode tile's ragged-Q leg (sm100/decode_d128_f16.py): dense grid

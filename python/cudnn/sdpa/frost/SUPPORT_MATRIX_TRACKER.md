@@ -23,8 +23,11 @@ independent tables, strides and HND/NHD pool layouts, including V as the leading
 512 channels of a 576-wide record. Unsplit THD also uses the native body,
 with packed or unpacked GQA, sequence-local Q/K/V/O maps and independent
 physical Q/K/V/O/Stats offsets. Paged THD retains independent K/V tables and
-pool layouts. THD split, other head dimensions, quantized inputs and SM107
-do not inherit this flavor. This adds eligibility; no heuristic
+pool layouts. Native THD split also serves packed/unpacked half inputs, independent
+physical origins and paged K/V layouts. Partial O/Stats use compact FP32 scratch;
+the final combine applies caller O/Stats offsets, folds the sink once and converts
+optional final Stats to base 2. THD split padded Stats remains unsupported.
+Other head dimensions, quantized inputs and SM107 do not inherit this flavor. This adds eligibility; no heuristic
 ordering or performance claim is implied.
 
 What the shipped FROST SDPA engines actually serve, one table per architecture.

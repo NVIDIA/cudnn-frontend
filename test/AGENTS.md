@@ -902,6 +902,13 @@ Keep `stream` last in private CuTe host signatures and preserve the
 signature does not qualify a reordered entry; exercise a real compiled launch
 after ABI changes before considering a change to that convention.
 
+Kernel host imports can also be dynamic module exports: prepared execution
+reads `_host_thd_split` through the loaded template module. Before removing an
+apparently unused import, inspect attribute consumers and compile a plan using
+that host. `test_native_d576_compact_thd_rebind_and_capture[split2_unpacked]`
+catches a missing D576 split-host export before launch; a source-only import
+check or binder fixture with a synthetic module does not exercise this boundary.
+
 AST-based host frame fixtures must retain unannotated runtime arguments;
 `ast.unparse(None)` fails before binding. Raw positional CuTe entries require
 every runtime slot, including optional `None` pointers and scalar defaults:
