@@ -1118,6 +1118,47 @@ _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
+def _load_q_tile(
+    sQ,
+    bars,
+    q_state,
+    tma_q_desc,
+    seq_kv_lens_tensor,
+    n_batch,
+    batch_idx,
+    physical_origins: cutlass.Constexpr,
+    full_head,
+    q_row,
+    tma_batch,
+    is_leader,
+    tma_mcast_mask,
+):
+    """Issue one Q tile after its last reader and advance the producer ring."""
+    bars.mb_q_empty[q_state.idx].wait(q_state.phase, spin=SPIN_RING_WAITS)
+    bars.mb_q_full[q_state.idx].arrive(n_bytes=qTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
+    tma_load_tile(
+        sQ[q_state.idx],
+        _input_slice(
+            tma_q_desc,
+            seq_kv_lens_tensor,
+            n_batch,
+            THD_Q_SLOT,
+            batch_idx,
+            physical_origins,
+            cutlass.Int32(0),
+            full_head,
+            q_row,
+            tma_batch,
+        ),
+        bars.mb_q_full[q_state.idx].smem_ptr,
+        cta_group=CFG.CTA_MMA,
+        mcast_mask=tma_mcast_mask,
+        acquire=not _THD,
+    )
+    return advance(q_state, CFG.STAGES_Q)
+
+
+@cute.jit
 def _tmaldg_warp(
     tma_q_desc,
     tma_do_desc,
@@ -1287,31 +1328,43 @@ def _tmaldg_warp(
         v_empty_state = advance(v_empty_state, CFG.STAGES_KV)
 
         # ---- Q + dO + dO_dv, per q tile of the pair-rounded range ----
-        for q_iter in cutlass.range(q_lo, q_hi, 1, unroll=1):
-            q_row_base = q_iter * cutlass.Int32(CFG.TILE_N)
-
-            bars.mb_q_empty[q_empty_state.idx].wait(q_empty_state.phase, spin=SPIN_RING_WAITS)
-            bars.mb_q_full[q_empty_state.idx].arrive(n_bytes=qTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
-            tma_load_tile(
-                sQ[q_empty_state.idx],
-                _input_slice(
+        if cutlass.const_expr(MMA_LOOKAHEAD):
+            if q_lo < q_hi:
+                q_empty_state = _load_q_tile(
+                    sQ,
+                    bars,
+                    q_empty_state,
                     tma_q_desc,
                     seq_kv_lens_tensor,
                     n_batch,
-                    THD_Q_SLOT,
                     batch_idx,
                     physical_origins,
-                    cutlass.Int32(0),
+                    full_head,
+                    q_seq_off + q_lo * cutlass.Int32(CFG.TILE_N) + Q_ROW_OFFSET_PEER,
+                    tma_batch,
+                    is_leader,
+                    tma_mcast_mask,
+                )
+
+        for q_iter in cutlass.range(q_lo, q_hi, 1, unroll=1):
+            q_row_base = q_iter * cutlass.Int32(CFG.TILE_N)
+
+            if cutlass.const_expr(not MMA_LOOKAHEAD):
+                q_empty_state = _load_q_tile(
+                    sQ,
+                    bars,
+                    q_empty_state,
+                    tma_q_desc,
+                    seq_kv_lens_tensor,
+                    n_batch,
+                    batch_idx,
+                    physical_origins,
                     full_head,
                     q_seq_off + q_row_base + Q_ROW_OFFSET_PEER,
                     tma_batch,
-                ),
-                bars.mb_q_full[q_empty_state.idx].smem_ptr,
-                cta_group=CFG.CTA_MMA,
-                mcast_mask=tma_mcast_mask,
-                acquire=not _THD,
-            )
-            q_empty_state = advance(q_empty_state, CFG.STAGES_Q)
+                    is_leader,
+                    tma_mcast_mask,
+                )
 
             bars.mb_do_empty[do_empty_state.idx].wait(do_empty_state.phase, spin=SPIN_RING_WAITS)
             bars.mb_do_full[do_empty_state.idx].arrive(n_bytes=dOTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
@@ -1335,6 +1388,26 @@ def _tmaldg_warp(
                 acquire=not _THD,
             )
             do_empty_state = advance(do_empty_state, CFG.STAGES_dO)
+
+            if cutlass.const_expr(MMA_LOOKAHEAD):
+                # Match the MMA's S(i+1)-before-dV(i) order. Waiting for the
+                # dO_dV slot first would delay the next Q even with a deeper ring.
+                if q_iter + cutlass.Int32(1) < q_hi:
+                    q_empty_state = _load_q_tile(
+                        sQ,
+                        bars,
+                        q_empty_state,
+                        tma_q_desc,
+                        seq_kv_lens_tensor,
+                        n_batch,
+                        batch_idx,
+                        physical_origins,
+                        full_head,
+                        q_seq_off + (q_iter + cutlass.Int32(1)) * cutlass.Int32(CFG.TILE_N) + Q_ROW_OFFSET_PEER,
+                        tma_batch,
+                        is_leader,
+                        tma_mcast_mask,
+                    )
 
             bars.mb_dodv_empty[dodv_empty_state.idx].wait(dodv_empty_state.phase, spin=SPIN_RING_WAITS)
             bars.mb_dodv_full[dodv_empty_state.idx].arrive(n_bytes=dOdvTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
