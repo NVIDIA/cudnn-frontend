@@ -2441,19 +2441,16 @@ def _correction_warp_group(
                             chunk_idx = 2 * chunk_pair + chunk_j
                             o_chunk = o_pair[chunk_j]
                             o_scaled = o_chunk * inv_sum
-                            # Dead-row sanitize: an empty mainloop never writes O TMEM,
-                            # so o_chunk is garbage (possibly NaN) and `* inv_sum(=0)`
-                            # cannot zero it — select 0 explicitly (keeps amax_o clean).
-                            _zero_f = cutlass.Float32(0.0)
-                            o_elems = [cutlass.Float32(arith.select(row_dead.ir_value(), _zero_f.ir_value(), o_scaled[i].ir_value())) for i in range(O_CHUNK)]
+                            o_elems = [o_scaled[i] for i in range(O_CHUNK)]
 
                             if cutlass.const_expr(amax_o_tensor is not None):
                                 _amax_o_local = fmax_f32(_amax_o_local, abs_max_tree(o_elems))
 
-                            # Plain range (not range_constexpr) — extraction at Python trace time.
-                            o_packed_v = fp32_to_fp8_pack(
-                                [o_elems[i] for i in range(16)],
-                                dtype=OUT_STORAGE_DTYPE,
+                            o_packed_raw = fp32_to_fp8_pack(o_elems, dtype=OUT_STORAGE_DTYPE)
+                            _zero_i = cutlass.Int32(0)
+                            o_packed_v = cutlass.Vector.from_elements(
+                                tuple(cutlass.Int32(arith.select(row_dead.ir_value(), _zero_i.ir_value(), o_packed_raw[i].ir_value())) for i in range(4)),
+                                cutlass.Int32,
                             )
 
                             col_elems = chunk_idx * O_CHUNK
