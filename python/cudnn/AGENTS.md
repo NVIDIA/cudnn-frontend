@@ -822,6 +822,21 @@ repository benchmark shapes or a documented target workload. A favorable
 synthetic shape establishes a local effect, not representative benefit; it does
 not by itself justify another compile-cache specialization.
 
+Resident block-scale SF words use only TMEM left after the accumulator staging
+decision. Account for every distinct operand, M block and word; fake-dequant
+sides continue to read their initialized slot zero. Keep the SF-ready/AB-ready
+waits and producer-stage release intact when moving the copies. Detectors:
+`test_block_scale_resident_sf_tmem_budget`, `test_block_scale_resident_sf_exact_fit`
+and the existing one-sided-dequant numerics in `gemm/frost/test_block_scale_matmul.py`.
+
+An `empty` mailbox acknowledgement must order prior reads before a producer
+overwrites the slot. Read-only consumers still need this write-after-read
+ordering; `bar.warp.sync` alone does not establish it with a producer outside
+that warp. Keep the MoE scheduler's release arrives unless a separate ordering
+proof covers every slot load. Numeric/racecheck success alone is not that proof.
+`test_moe_block_scale_mailbox_acknowledgements_order_prior_reads` in the existing
+`gemm/frost/test_template_epilogue_parity.py` pins this until such a proof exists.
+
 ## The public function contract
 
 Public functions (`cudnn.ops.<op>_<direction>(...)` / `cudnn.ops.<op>_<direction>_jax(...)`, see `docs/fe-oss-apis/api_conventions.md`) allocate outputs and return them in a stable, documented order. PyTorch functions return a **`TupleDict`** (dict that also unpacks as a tuple). JAX functions return a plain tuple or dict: `jax.jit` rejects `TupleDict`, which is not a registered pytree.

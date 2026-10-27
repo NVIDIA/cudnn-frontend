@@ -85,6 +85,25 @@ def _narrow_n_config(width, *, mma_k=32, cluster="1x1", m_blocks=1):
     return f"CONFIG_sm100_{128 * m_blocks}x{width}x128_128x{width}x{mma_k}_cluster{cluster}_1ctamma"
 
 
+@requires_sm100
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("cta_m,cta_n,cta_group", [(256, 128, 1), (256, 128, 2), (512, 32, 1)])
+def test_moe_block_scale_resident_sf_multi_mma_m(combo, swap_ab, cta_m, cta_n, cta_group):
+    cluster, mode = ("1x1", "1ctamma") if cta_group == 1 else ("2x1", "2ctamma")
+    _run_e2e(
+        E=2,
+        S=811,
+        N=264,
+        K=1024,
+        offsets_list=[0, 1, 1, 304, 433, 807, 811],
+        combo=combo,
+        config_name=f"CONFIG_sm100_{cta_m}x{cta_n}x128_128x{cta_n}x32_cluster{cluster}_{mode}",
+        cta_group=cta_group,
+        swap_ab=swap_ab,
+    )
+
+
 @pytest.mark.parametrize("width", range(8, 128, 8))
 @pytest.mark.parametrize("swap_ab", [False, True])
 def test_moe_block_scale_narrow_n_support(width, swap_ab):

@@ -728,3 +728,20 @@ def test_moe_swap_ab_preserves_mma_and_producer_barriers(stem):
         return warp_regions, barriers
 
     assert pipeline(f"{stem}_swap_ab.py") == pipeline(f"{stem}.py")
+
+
+@pytest.mark.parametrize("suffix", ["", "_swap_ab"])
+def test_moe_block_scale_mailbox_acknowledgements_order_prior_reads(suffix):
+    # Empty slots still have a write-after-read hazard. Warp-local convergence
+    # alone does not replace the release/acquire handoff with the scheduler.
+    path = template_path(f"sm100_moe_grouped_block_scale_matmul_fwd{suffix}.py")
+    acknowledgements = []
+    for call in ast.walk(ast.parse(path.read_text())):
+        if not isinstance(call, ast.Call) or ast.unparse(call.func) != "nvvm.mbarrier_arrive":
+            continue
+        names = {node.id for node in ast.walk(call.args[0]) if isinstance(node, ast.Name)}
+        if names & {"sched_empty_mbar_ptr", "sched_bcast_empty_mbar_ptr"}:
+            acknowledgements.append(call)
+            relaxed = next((kw.value for kw in call.keywords if kw.arg == "relaxed"), ast.Constant(False))
+            assert isinstance(relaxed, ast.Constant) and relaxed.value is False, f"{path.name}:{call.lineno}: mailbox reuse needs release ordering"
+    assert len(acknowledgements) == 6

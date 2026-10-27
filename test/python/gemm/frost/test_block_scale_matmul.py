@@ -915,6 +915,86 @@ def test_narrow_n_pair_mma_stays_declined(width):
 _SPLITK_BS_CFG = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
 
 
+@pytest.mark.parametrize("arch", [100, 107])
+@pytest.mark.parametrize("cta_m,cta_n", [(128, 24), (128, 128), (128, 256), (256, 128), (512, 32)])
+@pytest.mark.parametrize("kind", ["dense", "moe", "moe_swap_ab", "dual"])
+def test_block_scale_resident_sf_tmem_budget(arch, cta_m, cta_n, kind, monkeypatch):
+    import ast
+    from cudnn.gemm.frost.fusion_ir import MoeSpec, swap_ab
+
+    monkeypatch.setattr(C100, "_current_arch", lambda: arch)
+    chain = analyze(_build_nvfp4_graph(512, 512, 1024))
+    if kind.startswith("moe"):
+        chain = dataclasses.replace(chain, moe=MoeSpec(num_experts=1, num_groups=3))
+        if kind == "moe_swap_ab":
+            chain = swap_ab(chain)
+    elif kind == "dual":
+        chain = dataclasses.replace(chain, num_b_operands=2, gemm_operands=[(0, 0), (0, 1)])
+    cfg = by_name(f"CONFIG_sm100_{cta_m}x{cta_n}x128_128x{cta_n}x32_cluster1x1_1ctamma")
+    try:
+        src = C100._render_block_scale_tile_constants(cfg, chain, select_template(chain, cfg))
+    except NotImplementedError as exc:
+        # Two accumulators can already exceed TMEM before any resident scales.
+        if kind == "dual" and "per-GEMM TMEM budget" in str(exc):
+            one_acc = (cta_m // 128) * cta_n
+            one_sf_set = 4 * (cta_m // 128 + 2 * _ceil_div(cta_n, 128))
+            assert 2 * one_acc + one_sf_set > (512 if arch == 100 else 576)
+            return
+        raise
+    v = {
+        k: ast.literal_eval(x)
+        for k, x in re.findall(r"^(\w+) = (.*)$", src, re.M)
+        if k
+        in {
+            "sf_word_stride_cols",
+            "sfa_col_bases",
+            "sfb_col_bases",
+            "sfa_tmem_cols",
+            "sfb_tmem_cols",
+            "num_sf_atoms",
+            "num_tmem_alloc_cols",
+            "num_gemms",
+            "acc_gemm_stride",
+        }
+    }
+    acc_end = v["num_gemms"] * v["acc_gemm_stride"]
+    word_cols = len(v["sfa_col_bases"]) * v["sfa_tmem_cols"] + len(v["sfb_col_bases"]) * v["sfb_tmem_cols"]
+    fits = acc_end + v["num_sf_atoms"] * word_cols <= v["num_tmem_alloc_cols"]
+    assert (v["sf_word_stride_cols"] > 0) == fits
+    if fits:
+        assert v["sf_word_stride_cols"] == word_cols
+    intervals = [(0, acc_end)]
+    for word in range(v["num_sf_atoms"] if fits else 1):
+        for side in ("a", "b"):
+            for base in v[f"sf{side}_col_bases"]:
+                start = base + word * v["sf_word_stride_cols"]
+                intervals.append((start, start + v[f"sf{side}_tmem_cols"]))
+    intervals.sort()
+    assert all(left[1] <= right[0] for left, right in zip(intervals, intervals[1:]))
+    assert intervals[-1][1] <= v["num_tmem_alloc_cols"]
+
+
+@pytest.mark.parametrize("budget,resident", [(79, False), (80, True)])
+def test_block_scale_resident_sf_exact_fit(budget, resident, monkeypatch):
+    monkeypatch.setattr(C100, "_tmem_cols_for_arch", lambda: budget)
+    chain = analyze(_build_nvfp4_graph(256, 256, 1024))
+    cfg = by_name(_narrow_n_config(24))
+    src = C100._render_block_scale_tile_constants(cfg, chain, select_template(chain, cfg))
+    v = dict(re.findall(r"^(\w+) = (.*)$", src, re.M))
+    # Two 24-column accumulators stay intact; four SF sets need 32 columns.
+    assert v["acc_gemm_stride"] == "48" and v["acc_stages"] == "2"
+    assert int(v["sf_word_stride_cols"]) == (8 if resident else 0)
+
+
+@requires_sm100
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
+@pytest.mark.parametrize("cta_m,cta_n,cta_group", [(256, 128, 1), (256, 128, 2), (512, 32, 1)])
+def test_block_scale_resident_sf_multi_mma_m(combo, cta_m, cta_n, cta_group):
+    cluster, mode = ("1x1", "1ctamma") if cta_group == 1 else ("2x1", "2ctamma")
+    cfg = f"CONFIG_sm100_{cta_m}x{cta_n}x128_128x{cta_n}x32_cluster{cluster}_{mode}"
+    _run_bs_numeric(combo, cfg, 1024, 512, 2048)
+
+
 @pytest.mark.parametrize(
     "moe,force_stg,budget,stages",
     [
