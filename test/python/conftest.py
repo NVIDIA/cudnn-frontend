@@ -469,10 +469,15 @@ def _under_xdist():
 
 
 def _torch_empty_cache():
-    # No-op unless torch (and thus its caching allocator) is loaded.
     torch = sys.modules.get("torch")
-    if torch is not None:
-        torch.cuda.empty_cache()
+    if torch is None or not torch.cuda.is_initialized():
+        return
+    # Expandable-segment cleanup can synchronize stream 0 on the wrong device.
+    # Finish each populated device before empty_cache() unmaps its memory.
+    for device in range(torch.cuda.device_count()):
+        if torch.cuda.memory_reserved(device):
+            torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
 
 
 def _wait_for_free_gpu_memory(context):

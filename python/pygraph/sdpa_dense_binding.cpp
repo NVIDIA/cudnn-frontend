@@ -166,7 +166,8 @@ class SdpaDenseBinder {
                 "native dense binding does not split FP8 attention with a sink (the FP8 epilogues fold the sink per "
                 "tile)");
         const auto dq = integer("d_qk"), dv = integer("d_v");
-        if (dq <= 0 || dv <= 0 || dq > 512 || dv > 512 || dq % 8 || dv % 8)
+        const bool native_d576 = !quantized_ && dq == 576 && dv == 512;
+        if (!native_d576 && (dq <= 0 || dv <= 0 || dq > 512 || dv > 512 || dq % 8 || dv % 8))
             invalid("native dense binding requires a supported half attention head dimension pair");
         fp32_partial_ = flag("fp32_partial");
         ragged_       = flag("ragged");
@@ -890,6 +891,7 @@ init_sdpa_dense_binding(py::module_ &m) {
         // The split sink combine takes the per-batch Q lengths (python: SplitCombineSpec /
         // DenseLaunchSpec.combine_q_lens).
         .def_prop_ro_static("supports_combine_q_lens", [](py::object) { return true; })
+        .def_prop_ro_static("supports_native_d576", [](py::object) { return true; })
         .def("bind", &SdpaDenseBinder::bind, py::arg("pack"), py::arg("indices"), py::arg("stream"))
         .def("bind_split",
              &SdpaDenseBinder::bind_split,

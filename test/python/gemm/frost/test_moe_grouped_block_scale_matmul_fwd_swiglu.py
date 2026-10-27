@@ -11,6 +11,8 @@ covering nvfp4 / mxfp4 / mxfp8, checked vs a torch dequant + group-loop referenc
 
 from __future__ import annotations
 
+import pathlib
+
 import cudnn
 import pytest
 import torch
@@ -18,6 +20,7 @@ import torch
 from gemm_test_utils import (
     requires_sm100,
     requires_sm107,
+    requires_sm120,
     Plan as _plan,
     E2M1 as _E2M1,
     to_blocked as _to_blocked,
@@ -90,8 +93,13 @@ def _build_graph(
     reduction_mode=None,
     reduction_dims=None,
     quant_block=None,
+    weight_combo=None,
 ):
+    """``weight_combo`` gives the two weights (and their scales) another combo's
+    dtypes -- a mixed MXFP8 token x MXFP4 weight pair when it differs from ``combo``."""
     block_size, a_dt, sf_dt = _COMBOS[combo]
+    _w_block, w_dt, w_sf_dt = _COMBOS[weight_combo or combo]
+    assert _w_block == block_size, "mixed pairs share one block size"
     sf_k = K // block_size
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -99,8 +107,8 @@ def _build_graph(
         compute_data_type=cudnn.data_type.FLOAT,
     )
     tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=a_dt)
-    w0 = g.tensor(name="weight0", dim=[E, K, N], stride=[K * N, 1, K], data_type=a_dt)
-    w1 = g.tensor(name="weight1", dim=[E, K, N], stride=[K * N, 1, K], data_type=a_dt)
+    w0 = g.tensor(name="weight0", dim=[E, K, N], stride=[K * N, 1, K], data_type=w_dt)
+    w1 = g.tensor(name="weight1", dim=[E, K, N], stride=[K * N, 1, K], data_type=w_dt)
     SFA = g.tensor(
         name="SFA",
         dim=[1, S, sf_k],
@@ -112,14 +120,14 @@ def _build_graph(
         name="SFB0",
         dim=[E, sf_k, N],
         stride=[sf_k * N, 1, sf_k],
-        data_type=sf_dt,
+        data_type=w_sf_dt,
         reordering_type=cudnn.tensor_reordering.F8_128x4,
     )
     SFB1 = g.tensor(
         name="SFB1",
         dim=[E, sf_k, N],
         stride=[sf_k * N, 1, sf_k],
-        data_type=sf_dt,
+        data_type=w_sf_dt,
         reordering_type=cudnn.tensor_reordering.F8_128x4,
     )
     fto = g.tensor(
@@ -300,6 +308,87 @@ def test_dual_moe_grouped_block_scale_matmul_fwd_swiglu(combo, cfg_name, cta_gro
     assert (_bs.sf_dtype, _bs.block_size) == (_DTYPE_FROM_CUDNN[_sf_dt], _blk)
 
     # SFA padded to 128 rows PER GROUP, then concatenated; SFB per-expert.
+    sfa_parts = [_to_blocked(sfa_log[offsets_list[gi] : offsets_list[gi + 1]]) for gi in range(num_groups)]
+    sfa_blk = _with_static_segmented_capacity(torch.cat(sfa_parts), S, num_groups, sf_k)
+    sfb0_blk = torch.cat([_to_blocked(sfb0_log[e]) for e in range(E)]).view(E, sf_k, N)
+    sfb1_blk = torch.cat([_to_blocked(sfb1_log[e]) for e in range(E)]).view(E, sf_k, N)
+    offsets = torch.tensor(offsets_list, dtype=torch.int32, device=dev)
+    output = torch.zeros(1, S, N, dtype=torch.bfloat16, device=dev)
+
+    compiled(
+        _vp_moe_bs_mg(
+            compiled,
+            [
+                ((tok_rt, sfa_blk), (w0_rt, sfb0_blk)),
+                ((tok_rt, sfa_blk), (w1_rt, sfb1_blk)),
+            ],
+            offsets,
+            output,
+            scale,
+        )
+    )
+    torch.cuda.synchronize()
+
+    tok_s = tok_deq * sfa_log.float().repeat_interleave(block_size, 1)
+    w0_s = w0_deq * sfb0_log.float().repeat_interleave(block_size, 2)
+    w1_s = w1_deq * sfb1_log.float().repeat_interleave(block_size, 2)
+    ref = torch.zeros((S, N), dtype=torch.float32, device=dev)
+    for gi in range(num_groups):
+        b = offsets_list[gi]
+        e = offsets_list[gi + 1]
+        if b == e:
+            continue
+        ex = gi % E
+        c0 = tok_s[b:e] @ w0_s[ex].T
+        c1 = tok_s[b:e] @ w1_s[ex].T
+        ref[b:e] = torch.nn.functional.silu(c0) * c1 * 0.5
+    torch.testing.assert_close(output[0], ref.to(torch.bfloat16), atol=5e-2, rtol=5e-2)
+
+
+@requires_sm120
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["normal", "swap_ab"])
+@pytest.mark.parametrize("padded_e2m1", [False, True], ids=["packed", "padded"])
+def test_dual_moe_grouped_block_scale_matmul_fwd_swiglu_mixed_sm120(swap_ab, padded_e2m1) -> None:
+    """Gated mixed pair on sm120: an MXFP8 token against two MXFP4 weights, in
+    both kernel orientations and both e2m1 forms -- packed by default (128-byte
+    TMA L2 promotion on every data descriptor) and the opt-in padded form whose
+    e2m1 tiles ride TMA ``.b4x16_p64`` (K a multiple of 128)."""
+    dev = "cuda"
+    torch.manual_seed(0)
+    E, S, N, K = 2, 1024, 256, 512
+    offsets_list = [0, 256, 384, 512, S]
+    num_groups = len(offsets_list) - 1
+    block_size = _COMBOS["mxfp8"][0]
+    sf_k = K // block_size
+    lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
+
+    tok_rt, tok_deq = _mk_operand("mxfp8", 1, S, K, dev, lut)
+    w0_rt, w0_deq = _mk_operand("mxfp4", E, N, K, dev, lut)
+    w1_rt, w1_deq = _mk_operand("mxfp4", E, N, K, dev, lut)
+    tok_deq = tok_deq.view(S, K)
+    sfa_log = _mk_sf("mxfp8", (S, sf_k), dev)
+    sfb0_log = _mk_sf("mxfp4", (E, N, sf_k), dev)
+    sfb1_log = _mk_sf("mxfp4", (E, N, sf_k), dev)
+    scale = torch.tensor([[[0.5]]], dtype=torch.float32, device=dev)
+
+    cfg = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    compiled = _plan(
+        _build_graph(E, S, N, K, num_groups, "mxfp8", weight_combo="mxfp4"),
+        config=cfg,
+        **({"swap_ab": True} if swap_ab else {}),
+        **({"padded_e2m1": True} if padded_e2m1 else {}),
+    )
+    _bs = compiled.chain.block_scale
+    assert _bs.mixed_width and _bs.mma_block_scale_kind == "MXF8F6F4" and _bs.padded_e2m1 is padded_e2m1
+    source = pathlib.Path(compiled.generated_path).read_text()
+    weight_side = "a" if swap_ab else "b"
+    if padded_e2m1:
+        assert f"{weight_side}_tma_format = _tma.TensorMapDataFormat.B4X16_P64" in source
+        assert f"{weight_side}_smem_dtype = cutlass.Uint8" in source
+    else:
+        assert f"{weight_side}_tma_format = _tma.TensorMapDataFormat.B4X16" in source
+    assert source.count("l2_promotion=_tma.TensorMapL2Promotion.l2_128b") == 3
+
     sfa_parts = [_to_blocked(sfa_log[offsets_list[gi] : offsets_list[gi + 1]]) for gi in range(num_groups)]
     sfa_blk = _with_static_segmented_capacity(torch.cat(sfa_parts), S, num_groups, sf_k)
     sfb0_blk = torch.cat([_to_blocked(sfb0_log[e]) for e in range(E)]).view(E, sf_k, N)

@@ -1065,7 +1065,7 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
 
     by_name = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
     assert by_name[engines.engine_name()].pack_gqa_partial_d_shapes == frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS)
-    assert frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS) == frozenset({(128, 128), (256, 256)})
+    assert frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS) == frozenset({(128, 128), (256, 256), (576, 512)})
     native_sm107 = engines.engine_name(arch="sm107")
     assert by_name[native_sm107].pack_gqa_partial_d_shapes == frozenset({(512, 512)})
     others = {name: caps.pack_gqa_partial_d_shapes for name, caps in by_name.items() if name not in (engines.engine_name(), native_sm107)}
@@ -1111,6 +1111,7 @@ def test_capabilities_positional_prefix_is_append_only():
         "kv_mask_dtypes",
         "tile_ns_by_d_shape",
         "pack_gqa_requires_divisible",
+        "thd_excluded_d_shapes",
     )
     legacy_order = [n for n in names if n not in appended]
     caps = engines.Capabilities(*[legacy_value(n) for n in legacy_order])
@@ -2491,10 +2492,9 @@ def _mk_paged_graph_fp8(*, d=128, page_size=16, max_pages=8, hnd=True, thd=False
 
 
 def test_paged_fp8_probe_accepts_and_declines():
-    """Paged per-tensor FP8 is the d128 FP8 kernel's PAGED_KV specialization: the fp8
-    row admits d128 (and d64 on its envelope) pools in HND or NHD, dense Q only; it
-    declines the d256 flavor, THD queries over pools and off-contract page sizes.
-    The f16/bf16 row never serves an sdpa_fp8 graph."""
+    """Paged per-tensor FP8 admits native D128/D256 with dense or THD Q.
+    D64 serves dense Q only. Off-contract pages remain declined, and the
+    f16/bf16 row never serves an sdpa_fp8 graph."""
     fp8_name = engines.engine_name(fp8=True)
     for hnd in (True, False):
         facts = _facts(_mk_paged_graph_fp8(hnd=hnd))
@@ -2503,17 +2503,21 @@ def test_paged_fp8_probe_accepts_and_declines():
         assert fp8_name in elig and engines.engine_name() not in elig
     assert fp8_name in _eligible(_mk_paged_graph_fp8(d=64)), "d=64 FP8 rides the d128 FP8 envelope"
     assert fp8_name in _eligible(_mk_paged_graph_fp8(page_size=128))
-    assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=256)), "paged per-tensor FP8 is wired on the d128 flavor only"
-    assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=192)), "(192, 192) would select the d256 FP8 flavor"
+    for hnd in (True, False):
+        assert fp8_name in _eligible(_mk_paged_graph_fp8(d=256, hnd=hnd))
+    assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=192)), "(192, 192) has no supported kernel envelope"
     assert fp8_name not in _eligible(_mk_paged_graph_fp8(page_size=48)), "page_size must divide 128 or be a multiple of it"
-    assert fp8_name not in _eligible(_mk_paged_graph_fp8(thd=True)), "THD queries over FP8 pools clamp runtime K/V descriptors; declined"
+    for d in (128, 256):
+        for hnd in (True, False):
+            assert fp8_name in _eligible(_mk_paged_graph_fp8(d=d, hnd=hnd, thd=True))
+    assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=64, thd=True))
 
 
 def test_paged_quantized_rows_mismatch_reasons():
     """The row-level reasons, by field: the SM100 MXFP8 row admits F8_128x4 pools at
     page_size % 128 only, the Rubin per-tensor FP8 row does not admit pools (its sibling
     kernel has no PAGED_KV specialization), and the SM100 FP8 row's paged sub-gates name
-    THD and the d128 envelope."""
+    THD and unsupported asymmetric head dimensions."""
 
     def paged_facts(**kw):
         base = dict(
@@ -2543,10 +2547,15 @@ def test_paged_quantized_rows_mismatch_reasons():
     assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=64, d_v=64)) is None
     assert "multiple of 128" in engines.mismatch(mxfp8, paged_facts(is_mxfp8=True))
     assert "paged attention" in engines.mismatch(fp8_rubin, paged_facts(is_fp8=True, device_cc=(10, 7)))
-    assert "THD" in engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True))
-    # The head-dim gate is the SELECTED flavor (Capabilities.paged_d_shapes = {(64, 64), (128, 128)} on the fp8 row).
-    assert "wired on the d64, d128 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=256, d_v=256))
-    assert "wired on the d64, d128 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=128))
+    for cc in ((10, 0), (10, 3)):
+        for d in (128, 256):
+            assert engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True, d_qk=d, d_v=d, device_cc=cc)) is None
+    assert "dense-only" in engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True, d_qk=64, d_v=64))
+    assert "native per-tensor D128/D256" in engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True, d_qk=512, d_v=512))
+    # Admission follows the selected flavor; D256 is exact, not a D192 envelope.
+    assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=256, d_v=256)) is None
+    assert "no kernel-flavor envelope" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=192))
+    assert "wired on the d64, d128, d256 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=128))
     for d in (64, 128):
         sink_facts = paged_facts(is_fp8=True, has_sink=True, d_qk=d, d_v=d)
         assert engines.mismatch(fp8, sink_facts) is None
@@ -3377,3 +3386,117 @@ def test_fp8_bwd_d256_admitted_by_the_cpp_node_on_rubin(monkeypatch, d, sm_versi
     else:
         with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="hidden_dim"):
             g.validate()
+
+
+@pytest.mark.parametrize(
+    "shape,thd,admitted",
+    [((576, 512), False, True), ((576, 512), True, True), ((568, 512), False, False), ((576, 504), False, False), ((384, 256), True, True)],
+)
+def test_native_d576_admission_preserves_other_head_envelopes(shape, thd, admitted):
+    from dataclasses import replace
+
+    facts = replace(_facts(_mk_eligible_graph()), d_qk=shape[0], d_v=shape[1], thd=thd)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    reason = engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=2, pack_gqa=False))
+    assert (reason is None) == admitted, reason
+
+
+def test_native_d576_thd_requires_matching_native_extension(monkeypatch):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    facts = replace(_facts(_mk_eligible_graph()), d_qk=576, d_v=512, thd=True)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    knobs = engines.SdpaFwdKnobs(cga=2, pack_gqa=False)
+    assert engines.mismatch(caps, facts, knobs) is None
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", SimpleNamespace(supports_physical_origins=True))
+    reason = engines.mismatch(caps, facts, knobs)
+    assert "native D576x512 THD requires the matching" in reason
+
+
+@pytest.mark.parametrize("shape,admitted", [((576, 512), True), ((512, 512), False)])
+def test_native_d576_dense_padding_split_admission(shape, admitted):
+    from dataclasses import replace
+
+    facts = replace(_facts(_mk_eligible_graph()), d_qk=shape[0], d_v=shape[1], padded=True)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    reason = engines.mismatch(caps, facts, engines.SdpaFwdKnobs(cga=2, split_kv=4, pack_gqa=False))
+    assert (reason is None) == admitted, reason
+
+
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("splits", [2, 5])
+def test_native_d576_thd_split_admission(monkeypatch, cc, packed, splits):
+    from dataclasses import replace
+
+    facts = replace(_facts(_mk_eligible_graph()), device_cc=cc, d_qk=576, d_v=512, thd=True, stats_t=None)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    reason = engines.mismatch(caps, facts, engines.SdpaFwdKnobs(cga=2, split_kv=splits, pack_gqa=packed))
+    assert reason is None, reason
+
+    from cudnn.api_base import TensorDesc
+    from cudnn.sdpa.fwd import api_dsl, config_sm100
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: cc)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(api_dsl, "_device_sm_count", lambda device: 148)
+
+    def desc(heads, tokens, width):
+        return TensorDesc(torch.bfloat16, (3, heads, tokens, width), (tokens * heads * width, width, heads * width, 1), (3, 1, 2, 0), "cuda:0")
+
+    api = api_dsl.SdpaFwdDslSm100(
+        desc(24, 256, 576),
+        desc(2, 384, 576),
+        desc(2, 384, 512),
+        desc(24, 256, 512),
+        thd=True,
+        cga=2,
+        split_kv=splits,
+        pack_gqa=packed,
+        seq_kv_lens_present=True,
+        cu_seq_q_lens=True,
+        cu_seq_kv_lens=True,
+    )
+    assert api.check_support()
+    cfg = config_sm100.make_cfg_d512_2x2(api.template_params(), cga_m=2)[0]
+    assert cfg.THD_VARLEN and cfg.SPLIT_KV == splits
+    assert cfg.TILE_K == 576 and cfg.TILE_O == 512
+    bounded_override = replace(facts, shape_overrides=True, max_total_seq_len_q=None)
+    assert engines.mismatch(caps, bounded_override, engines.SdpaFwdKnobs(cga=2, split_kv=splits, pack_gqa=packed)) is None
+
+
+def test_native_d576_thd_split_requires_matching_extension(monkeypatch):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    facts = replace(_facts(_mk_eligible_graph()), d_qk=576, d_v=512, thd=True, stats_t=None)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    knobs = engines.SdpaFwdKnobs(cga=2, split_kv=5, pack_gqa=True)
+    assert engines.mismatch(caps, facts, knobs) is None
+    # Preserve every parent extension capability; omit only this new ABI.
+    previous_features = {
+        name: getattr(cudnn._pybind_module._SdpaThdBinder, name)
+        for name in dir(cudnn._pybind_module._SdpaThdBinder)
+        if name.startswith("supports_") and name != "supports_native_d576_packed_split"
+    }
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", SimpleNamespace(**previous_features))
+    assert "native D576x512 THD split requires the matching" in engines.mismatch(caps, facts, knobs)
+    # The unsplit parent remains supported by this older extension.
+    assert engines.mismatch(caps, facts, engines.SdpaFwdKnobs(cga=2, split_kv=1, pack_gqa=True)) is None
+
+
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("sink", [False, True])
+def test_native_d576_thd_split_scope(paged, sink):
+    from dataclasses import replace
+
+    graph = _mk_paged_graph(d=576, d_v=512, sink=sink) if paged else _mk_eligible_graph()
+    facts = replace(_facts(graph), d_qk=576, d_v=512, thd=True, stats_t=None, has_sink=sink)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    knobs = engines.SdpaFwdKnobs(cga=2, split_kv=5, pack_gqa=True)
+    assert engines.mismatch(caps, facts, knobs) is None
+    assert engines.mismatch(caps, facts, replace(knobs, cga=1)) is not None
+    assert engines.mismatch(caps, replace(facts, has_epilogue_gate=True), knobs) is not None
+    assert not engines.thd_split_domain(caps, replace(facts, shape_overrides=True, max_total_seq_len_q=facts.b * facts.s_q + 1))

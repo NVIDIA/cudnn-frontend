@@ -14,8 +14,9 @@ from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cuda.bindings import driver as cuda
 
 from cudnn.frost.compiled_cache import compile_cached, template_key
+from . import _metadata_fast
 
-FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
+FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes() + Path(_metadata_fast.__file__).read_bytes()).hexdigest()[:16]
 
 
 @cute.jit
@@ -127,9 +128,19 @@ frost_qsa_compact.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 @cute.jit
 def _compact_host(sel, lo, hi, first, last, ids, counts, stream: cuda.CUstream, vectorized: cutlass.Constexpr = False):
-    frost_qsa_compact(sel, lo, hi, first, last, ids, counts, None, vectorized).launch(
-        grid=(cute.ceil_div(sel.shape[0], 4), 1, 1), block=(128, 1, 1), stream=stream
-    )
+    if cutlass.const_expr(vectorized):
+        # The bit scan is tuned for long sparse rows. Preserve short-row dispatch.
+        use_fast = (sel.shape[1] >= 8192) & (sel.shape[1] % 16 == 0) & (sel.iterator.toint() % 16 == 0)
+        if use_fast:
+            _metadata_fast.frost_qsa_fast_compact_host(sel, lo, hi, first, last, ids, counts, stream)
+        else:
+            frost_qsa_compact(sel, lo, hi, first, last, ids, counts, None, vectorized).launch(
+                grid=(cute.ceil_div(sel.shape[0], 4), 1, 1), block=(128, 1, 1), stream=stream
+            )
+    else:
+        frost_qsa_compact(sel, lo, hi, first, last, ids, counts, None, vectorized).launch(
+            grid=(cute.ceil_div(sel.shape[0], 4), 1, 1), block=(128, 1, 1), stream=stream
+        )
 
 
 @cute.jit

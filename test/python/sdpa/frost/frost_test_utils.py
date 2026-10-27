@@ -287,6 +287,7 @@ def launch_f16(
         block_table_ptr=P(block_table_tensor, 4),
         block_table_v_ptr=P(block_table_v_tensor, 4),
         table_strides=t_st,
+        table_v_strides=(tuple(block_table_v_tensor.stride()) if block_table_v_tensor is not None else t_st) if paged else None,
         n_pages=n_pages,
         # The d128 decode tile's ragged-Q leg slots (dense launches leave them
         # dead: RAGGED_Q is off in every direct test's params); filtered out for

@@ -335,6 +335,7 @@ def mamba2_la_op(
     plan_name=None,
     D=None,
     z=None,
+    checkpoint_dtype=None,
 ):
     """``mamba2`` behind the suite's delta-rule calling convention: ``q`` = C, ``k`` = B, ``v`` = x, ``g`` = raw dt;
     the per-head ``A`` and ``dt_bias`` follow ``cu_seqlens``.  ``scale`` (the suite's ``1 / sqrt(K)`` default) and the
@@ -363,6 +364,7 @@ def mamba2_la_op(
         state_indices=state_indices,
         overwrite_initial_state=overwrite_initial_state,
         plan_name=plan_name,
+        checkpoint_dtype=checkpoint_dtype,
     )
 
 
@@ -1696,8 +1698,6 @@ def test_checkpoints_varlen_tight_capacity(backend, variant, recipe):
 def test_checkpoints_coarse_cadence(backend, variant, K, V, ckpt_mult, rows):
     """Coarser cadences (multiples of the base chunk) keep the prefix contract in io-dtype rows (the default) and in fp32
     rows (``checkpoint_dtype``), which the io rows round from bitwise; the d_v 64 case covers the paired-element row path."""
-    if rows == "fp32" and variant == "mamba2":
-        pytest.skip("mamba2 has no fp32 rows")
     ckpt = CHUNK[variant] * ckpt_mult
     T = 5 * ckpt
     case = make_case(variant, torch.bfloat16, T=T, K=K, V=DEFAULT_V.get(variant, V))
@@ -2747,8 +2747,6 @@ def test_bwd_coarse_checkpoint_seeded_recompute(backend, variant, ckpt_mult, K, 
     """With a coarse checkpoint cadence the backward reconstructs the dense series by recompute started from the coarse
     rows: from io-dtype rows (the default) the grads track the recompute path from a zero initial state within 2e-3, from
     fp32 rows (``checkpoint_dtype``) they match it bitwise; both arms batch-invariant."""
-    if rows == "fp32" and variant == "mamba2":
-        pytest.skip("mamba2 has no fp32 rows")
     case = make_case(variant, torch.bfloat16, seq_lens=[497, 16, 1, 480, 0, 253], K=K)
     row_dtype = dict(checkpoint_dtype=torch.float32) if rows == "fp32" else {}
     grads_by_mode = []
@@ -2771,7 +2769,7 @@ def test_bwd_coarse_checkpoint_seeded_recompute(backend, variant, ckpt_mult, K, 
 
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("K", [64, 128])
-@pytest.mark.parametrize("variant", [v for v in VARIANTS if v != "mamba2"])
+@pytest.mark.parametrize("variant", VARIANTS)
 def test_fp32_checkpoints_at_chunk_cadence(backend, variant, K):
     """``checkpoint_dtype=torch.float32`` stores fp32 rows at the chunk cadence: they round to the io-dtype rows bitwise, and
     the backward, which regenerates the dense series from them instead of reusing them, matches the io-row path bitwise."""

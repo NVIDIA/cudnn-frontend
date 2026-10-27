@@ -1072,6 +1072,11 @@ def _render_tile_constants(
         # first_token_offset dtype (int32/int64) drives the compile() fake; the
         # scheduler casts its reads to Int32.
         lines.append(f"offset_cutlass_dtype = {DTYPE_TO_CUTLASS[chain.moe.offset_dtype]}")
+        # The host zeroes the scheduler counter with a one-thread launch before
+        # the PDL main launch, unless the integrating runtime zeroes it on the
+        # stream itself and renders this True (FlashInfer's MoE adapters do, in
+        # their routing kernel, saving the launch).
+        lines.append("external_counter_reset = False")
     lines.extend(_quant_device_imports(chain))
     return "\n".join(lines)
 
@@ -1475,9 +1480,11 @@ def _render_block_scale_tile_constants(
     # is_fp4: both operands e2m1 -- the packed 4-bit MMA kinds (mxf4nvf4 / mxf4),
     # 64 elements per 32-byte K. Anything else runs kind::mxf8f6f4 at the fp8 K
     # (32 elements, a 128-element K-tile): the e2m1 operand of a mixed MXFP4 x
-    # MXFP8 pair stays packed in SMEM (TMA .b4x16, the parent's native packed
-    # form) in a 64-byte row, and the template builds its 8-bit-container
-    # fragment registers from the packed words.
+    # MXFP8 pair either lands padded (TMA .b4x16_p64, one byte per value in a
+    # 128-byte row, ldmatrix-expanded; K a multiple of 128) or stays packed in
+    # SMEM (TMA .b4x16, the parent's native packed form) in a 64-byte row with
+    # the template building its 8-bit-container fragment registers from the
+    # packed words (kernel_registry.sm120_padded_e2m1_sides).
     is_fp4 = bs.is_fp4
     data_elem_bits = 4 if is_fp4 else 8
     cta_k_elems = cfg.cta_tile_k_bytes * 8 // data_elem_bits
@@ -1504,32 +1511,47 @@ def _render_block_scale_tile_constants(
     a_tma_group_elems = group_elems if a_major == "m" else 1
     b_tma_group_elems = group_elems if b_major == "n" else 1
 
-    # Packed (Float4E2M1FNx2 / Float8) element count per K row in SMEM, per side
-    # (the parent's a/b_packed_per_row): 128 B, but 64 B for the e2m1 side of a
-    # mixed pair -- 128 packed values at the fp8 K-tile.
-    a_packed_per_row = cta_k_elems * DTYPE_BITS[bs.a_dtype] // 8
-    b_packed_per_row = cta_k_elems * DTYPE_BITS[bs.b_dtype] // 8
+    # SMEM bytes per K row, per side (the parent's a/b_packed_per_row): 128 B --
+    # one byte per fp8 value, or two packed e2m1 values a byte at the fp4 K tile
+    # -- except the e2m1 side of a mixed pair, which runs the fp8 K tile: 64 B
+    # packed (TMA .b4x16) or, in its padded form (TMA .b4x16_p64: 16 values per
+    # 16-byte chunk, 8 B payload + 8 B zero; sm120_padded_e2m1_sides), the fp8
+    # side's 128 B. The TMA completion counts GMEM payload bytes, which the
+    # padded form halves against its SMEM footprint.
+    from ..kernel_registry import sm120_padded_e2m1_sides
+
+    padded_a, padded_b = sm120_padded_e2m1_sides(chain)
+
+    def _row_bytes(dtype: str, padded: bool) -> int:
+        return cta_k_elems if padded else cta_k_elems * DTYPE_BITS[dtype] // 8
+
+    a_packed_per_row = _row_bytes(bs.a_dtype, padded_a)
+    b_packed_per_row = _row_bytes(bs.b_dtype, padded_b)
     sA_packed_elems = cta_m * a_packed_per_row
     sB_packed_elems = cta_n * b_packed_per_row
+    sA_tma_bytes = cta_m * cta_k_elems * DTYPE_BITS[bs.a_dtype] // 8
+    sB_tma_bytes = cta_n * cta_k_elems * DTYPE_BITS[bs.b_dtype] // 8
 
-    # Per-side TMA facts. An e2m1 side is native packed e2m1 (Float4E2M1FN + the
-    # explicit B4X16 format, two values a byte); fp8 auto-derives. Each K row is
-    # one swizzle span: s128b for a 128-byte row, s64b for a 64-byte one.
-    def _tma_side(dtype: str) -> tuple[str, str]:
+    # Per-side TMA facts. A packed e2m1 side is native e2m1 (Float4E2M1FN + the
+    # explicit B4X16 format, two values a byte); a padded one is the packed-pair
+    # Float4E2M1FNx2 + B4X16_P64 (dims and box still count logical fp4 lanes; the
+    # hardware expands the SMEM destination) landing as one-byte containers
+    # (Uint8); fp8 auto-derives. Each K row is one swizzle span: s128b for a
+    # 128-byte row, s64b for a 64-byte one.
+    def _tma_side(dtype: str, padded: bool) -> tuple[str, str]:
         if dtype == "fp4_e2m1":
+            if padded:
+                return "cutlass.Float4E2M1FNx2", "_tma.TensorMapDataFormat.B4X16_P64"
             return "cutlass.Float4E2M1FN", "_tma.TensorMapDataFormat.B4X16"
         return DTYPE_TO_CUTLASS[dtype], "None"
 
-    a_tma_desc_dtype, a_tma_format = _tma_side(bs.a_dtype)
-    b_tma_desc_dtype, b_tma_format = _tma_side(bs.b_dtype)
+    a_tma_desc_dtype, a_tma_format = _tma_side(bs.a_dtype, padded_a)
+    b_tma_desc_dtype, b_tma_format = _tma_side(bs.b_dtype, padded_b)
     _row_swizzle = {128: "s128b", 64: "s64b"}
     a_tma_swizzle = _row_swizzle[a_packed_per_row]
     b_tma_swizzle = _row_swizzle[b_packed_per_row]
-    a_smem_dtype = DTYPE_TO_CUTLASS[bs.a_dtype]
-    b_smem_dtype = DTYPE_TO_CUTLASS[bs.b_dtype]
-    # GMEM payload bytes per stage = the SMEM tile (every side lands as stored).
-    sA_tma_bytes = sA_packed_elems
-    sB_tma_bytes = sB_packed_elems
+    a_smem_dtype = "cutlass.Uint8" if padded_a else DTYPE_TO_CUTLASS[bs.a_dtype]
+    b_smem_dtype = "cutlass.Uint8" if padded_b else DTYPE_TO_CUTLASS[bs.b_dtype]
 
     # --- Scale factors ---------------------------------------------------------
     # F8_128x4 atoms: 128 rows x 4 K-scales = 512 B. The per-stage TMA box holds
@@ -1615,7 +1637,7 @@ def _render_block_scale_tile_constants(
         f"mma_size_m = {cfg.mma_size_m}",
         f"mma_size_n = {cfg.mma_size_n}",
         # Each side's packed K row is one swizzle span (validate_block_scale_config_sm120):
-        # 128 B, or 64 B for the e2m1 side of a mixed pair.
+        # 128 B, or 64 B for the packed e2m1 side of a mixed pair.
         f"a_tma_swizzle = _tma.TensorMapSwizzle.{a_tma_swizzle}",
         f"b_tma_swizzle = _tma.TensorMapSwizzle.{b_tma_swizzle}",
         "",
@@ -1637,9 +1659,10 @@ def _render_block_scale_tile_constants(
         # GMEM payload bytes one stage's TMA box of each operand delivers.
         f"sA_tma_bytes = {sA_tma_bytes}",
         f"sB_tma_bytes = {sB_tma_bytes}",
-        # TMA-descriptor element dtype + format per side: e2m1 is the 4-bit
+        # TMA-descriptor element dtype + format per side: packed e2m1 is the 4-bit
         # Float4E2M1FN (cute scales the descriptor by width=4 itself) with the
-        # explicit B4X16 format; fp8 auto-derives.
+        # explicit B4X16 format, padded e2m1 the packed-pair Float4E2M1FNx2 with
+        # B4X16_P64; fp8 auto-derives.
         f"a_tma_desc_dtype = {a_tma_desc_dtype}",
         f"b_tma_desc_dtype = {b_tma_desc_dtype}",
         f"a_tma_format = {a_tma_format}",
@@ -1717,6 +1740,9 @@ def _render_block_scale_tile_constants(
         # the first_token_offset alignment the graph promises (dtypes'
         # _compute_output_vec_bytes); runtime S must keep it.
         lines.append(f"moe_token_alignment = {_pow2_floor(math.gcd(chain.moe.offset_multiple, chain.matmul.N)) if isinstance(chain.moe, MoeSwapAbSpec) else 1}")
+        # As the BF16 MoE constants: the integrating runtime may zero the
+        # scheduler counter itself and render this True to skip the host's launch.
+        lines.append("external_counter_reset = False")
     lines.extend(_quant_device_imports(chain))
     return "\n".join(lines)
 
@@ -3166,6 +3192,30 @@ def _alignment_reject(named_buffers) -> "str | None":
     return None
 
 
+def _padded_e2m1_operand_reject(named_buffers) -> "str | None":
+    """PTX tensor-copy rule for the padded ``.b4x16_p64`` form (and the other
+    sub-byte padded types): the tensor's global address and its stride in every
+    dimension must be 32-byte aligned, twice the 16 bytes the packed ``.b4x16``
+    descriptors need. Entries are ``(role, buffer)`` of the operands the kernel
+    loads padded, in kernel orientation; ``None`` buffers are skipped. Checked
+    before any descriptor is encoded: the encode otherwise fails with an opaque
+    ``cudaErrorInvalidValue``, or mis-strides. Returns a reason, or ``None``."""
+    bad = []
+    for role, buf in named_buffers:
+        if buf is None:
+            continue
+        ptr = int(buf.data_ptr())
+        elem = buf.element_size()
+        if ptr % 32:
+            bad.append(f"{role}: base address 0x{ptr:x} is {_pow2_floor(ptr)}-byte aligned")
+        strides = [s * elem for s, n in zip(buf.stride(), buf.shape) if n != 1 and s != 1]
+        if any(s % 32 for s in strides):
+            bad.append(f"{role}: strides {tuple(buf.stride())} x {elem} B are not all multiples of 32 bytes")
+    if bad:
+        return "padded e2m1 operands (TMA .b4x16_p64) need a 32-byte aligned base address and 32-byte aligned strides: " + "; ".join(bad)
+    return None
+
+
 def _mixed_width_operand_reject(chain: FusionChain, a_bufs, b_bufs) -> "str | None":
     """Runtime K rule of a mixed fp4 x fp8 block-scale pair (MoE; the buffers in
     kernel orientation, ``(batch, rows, packed K)``, K-major for the fp4 side).
@@ -3190,6 +3240,16 @@ def _mixed_width_operand_reject(chain: FusionChain, a_bufs, b_bufs) -> "str | No
         packed += [(f"{role}[{i}] ({dtype})", int(buf.shape[-1]) * per_elem) for i, buf in enumerate(bufs)]
     if len({k for _, k in packed}) > 1:
         return "mixed fp4 x fp8 block-scale operands must unpack to one K: " + ", ".join(f"{name} K={k}" for name, k in packed)
+    from ..kernel_registry import sm120_padded_e2m1_sides
+
+    if any(sm120_padded_e2m1_sides(chain)) and packed and packed[0][1] % 128:
+        # The compiled kernel loads its e2m1 side through TMA's padded .b4x16_p64
+        # form, whose box is exactly 64 payload bytes: a 128-element K tile.
+        return (
+            f"this mixed fp4 x fp8 block-scale kernel was compiled for a K that is a multiple of 128 "
+            f"(padded e2m1 operand form, TMA .b4x16_p64) and cannot run K={packed[0][1]}; "
+            "compile the graph at that K to select the packed e2m1 form"
+        )
     return None
 
 
@@ -4776,6 +4836,8 @@ def _splitk_reject_reason(chain: FusionChain, config: TileConfig) -> "str | None
 def jit_from_cudnn_graph(
     graph: cudnn.pygraph,
     config: TileConfig = DEFAULT_CONFIG,
+    *,
+    padded_e2m1: bool = False,
 ) -> CompiledFusedGemm:
     """End-to-end: cuDNN frontend graph -> rendered + cute-compiled GEMM kernel.
 
@@ -4793,6 +4855,15 @@ def jit_from_cudnn_graph(
     PREFERRED shape plus the smallest fallback the MMA mode allows, so the device
     fills the SMs a wide fixed cluster leaves idle (:func:`_mixed_cga_fallback`).
     Everywhere else the launch is the plain fixed cluster it always was.
+
+    ``padded_e2m1`` (sm120 MoE block-scale, mixed MXFP4 x MXFP8 pairs only) opts
+    the e2m1 operand into TMA's padded ``.b4x16_p64`` form -- one byte per value
+    in SMEM, hardware fragment expansion, twice the SMEM of the packed default
+    -- on every side the form allows (K a multiple of 128, not the gathered
+    token). It is an experimental candidate to measure against the packed
+    default, never chosen on its own; a request no side can honor is declined
+    (``NotImplementedError``), not snapped to the packed form
+    (``kernel_registry.sm120_padded_e2m1_sides`` / ``sm120_padded_e2m1_reject``).
     """
     chain, binding = _analyze_graph(graph)
     if config.swap_ab:
@@ -4800,6 +4871,15 @@ def jit_from_cudnn_graph(
 
         chain = swap_ab(chain)
         binding = swap_ab_binding(binding)
+    if padded_e2m1:
+        from ..kernel_registry import sm120_padded_e2m1_reject
+
+        if chain.block_scale is None:
+            raise NotImplementedError("padded_e2m1 needs a block-scale matmul (the e2m1 side of a mixed MXFP4 x MXFP8 pair)")
+        chain = replace(chain, block_scale=replace(chain.block_scale, padded_e2m1=True))
+        _padded_reason = sm120_padded_e2m1_reject(chain)
+        if _padded_reason is not None:
+            raise NotImplementedError(_padded_reason)
     _dtype_reason = dtype_arch_reject(chain, _current_arch())
     if _dtype_reason is not None:
         raise NotImplementedError(_dtype_reason)
@@ -5887,9 +5967,15 @@ class CompiledMoeBlockScaleGemm:
         _mixed = _mixed_width_operand_reject(self.chain, a_bufs, b_bufs)
         if _mixed is not None:
             raise ValueError(_mixed)
+        from ..kernel_registry import sm120_padded_e2m1_sides
+
+        _padded_a, _padded_b = sm120_padded_e2m1_sides(self.chain)
+        _padded = _padded_e2m1_operand_reject([("token", x) for x in (a_bufs if _padded_a else ())] + [("weight", x) for x in (b_bufs if _padded_b else ())])
+        if _padded is not None:
+            raise ValueError(_padded)
         _named = (
-            [("token", x, 16, "ptr") for x in a_bufs]
-            + [("weight", x, 16, "ptr") for x in b_bufs]
+            [("token", x, 32 if _padded_a else 16, "ptr") for x in a_bufs]
+            + [("weight", x, 32 if _padded_b else 16, "ptr") for x in b_bufs]
             + [(f"output[{i}]", x, _out_reqs[i], "full") for i, x in enumerate(out_bufs)]
             + [(f"aux {self.chain.aux_tensors[i].name!r}", x, _aux_reqs[self.chain.aux_tensors[i].name], "full") for i, x in enumerate(aux_bufs)]
             + [("SFA", x, 16, "ptr") for x in (sfa or [])]
