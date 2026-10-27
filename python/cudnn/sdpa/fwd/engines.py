@@ -74,7 +74,7 @@ from cudnn.sdpa.fwd.config_sm107 import (
     SM107_F16_THD_SHAPES,
     SM107_FP8_THD_SHAPES,
     SM107_FP8_SPLIT_SHAPES,
-    supports_fp8_d256_padded_split,
+    supports_fp8_padded_split,
     SM107_FP8_PACK_GQA_SHAPES,
     SM107_MXFP8_THD_SHAPES,
     SM107_SCORE_STATS_SHAPES,
@@ -1576,7 +1576,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 # d256 decode tile, whose split carries the gate IN the combine
                 # (sm100/split_combine gate=True; api_dsl._gate_in_combine).
                 return "split_kv > 1 cannot ride the fused epilogue gate (the combine would write the un-gated O); only the d256 decode tile's split applies the gate in its combine"
-            native_fp8_padded_split = supports_fp8_d256_padded_split(
+            native_fp8_padded_split = supports_fp8_padded_split(
                 _selected_d_shape(capabilities, facts, knobs),
                 device_cc=facts.device_cc,
                 pertensor=facts.is_fp8,

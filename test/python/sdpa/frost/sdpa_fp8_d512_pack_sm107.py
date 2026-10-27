@@ -24,7 +24,7 @@ _CASES = [
 ]
 
 
-def _run(case, dtype, output, monkeypatch, *, half=False, pack=True, adapter=False):
+def _run(case, dtype, output, monkeypatch, *, half=False, pack=True, adapter=False, split=1):
     d, dv, group, sq, skv, causal, bottom_right, window, sink, sched = case
     heads = 2 * group
     seen = _record_route(monkeypatch)
@@ -51,7 +51,7 @@ def _run(case, dtype, output, monkeypatch, *, half=False, pack=True, adapter=Fal
         sdpa_kwargs=kwargs,
     )
     selected = g.plans[g._plan_index]
-    g.create_execution_plan(selected.engine_id, replace(selected.knobs, pack_gqa=pack, split_kv=1, sched_policy=sched, cga=2))
+    g.create_execution_plan(selected.engine_id, replace(selected.knobs, pack_gqa=pack, split_kv=split, sched_policy=sched, cga=2))
     g.select_plan(len(g.plans) - 1)
     g.check_support()
     g.build_plans()
@@ -62,10 +62,10 @@ def _run(case, dtype, output, monkeypatch, *, half=False, pack=True, adapter=Fal
         value = bufs[name]
         value._base[..., value.shape[-1] :].fill_(float("nan"))
         value.copy_((value.float() * 2.5).to(dtype))
-    check = dict(causal=causal, bottom_right=bottom_right, window=window, softmax_f16=half)
+    check = dict(causal=causal, bottom_right=bottom_right, window=window, softmax_f16=half, split=split, pack=pack, q_tile_rows=256)
     g.execute(vp, ws)
     _check(bufs, **check)
-    if half:
+    if half and split == 1:
         _check_half_unpacked_control(g, bufs, tensors, check)
     if adapter:
         plan = g._compiled_plans[g._plan_index]
@@ -88,7 +88,7 @@ def _run(case, dtype, output, monkeypatch, *, half=False, pack=True, adapter=Fal
             fresh["sinks"].copy_(sinks.flip(1))
         g.execute({t: fresh[n] for n, t in tensors.items()}, torch.empty_like(ws))
         _check(fresh, **check)
-        if half:
+        if half and split == 1:
             _check_half_unpacked_control(g, fresh, tensors, check)
         bufs["seq_q"].copy_(torch.tensor([min(sq, 7), 0], device="cuda", dtype=torch.int32).view(2, 1, 1, 1))
         bufs["seq_kv"].copy_(torch.tensor([min(skv, 129), 0], device="cuda", dtype=torch.int32).view(2, 1, 1, 1))
@@ -99,7 +99,7 @@ def _run(case, dtype, output, monkeypatch, *, half=False, pack=True, adapter=Fal
             bufs[name].fill_(float("nan"))
         capture.replay()
         _check(bufs, **check)
-        if half:
+        if half and split == 1:
             _check_half_unpacked_control(g, bufs, tensors, check)
         assert torch.all(bufs["o_storage"][..., dv:] == 12)
 
@@ -130,7 +130,6 @@ def test_native_d512_unpacked_lpt(case, dtype, monkeypatch):
         ({"qh_per_kh": 3}, "whole head group"),
         ({"qh_per_kh": 256}, "whole head group"),
         ({"thd_varlen": True, "seq_kv_lens_present": True}, "dense-only"),
-        ({"split_kv": 2}, "split_kv"),
         ({"sched_policy": 2}, "NATURAL/LPT"),
     ],
 )
