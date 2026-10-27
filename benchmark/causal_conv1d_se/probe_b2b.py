@@ -14,10 +14,11 @@ from cutlass import cute
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
 from probe import reference
-from tune import measure
+import tune
 
 
 def main():
+    """Validate fused forward and backward against the saved-output reference and backend."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--shape", default="2,7,65")
     parser.add_argument("--projection-width", type=int, default=3)
@@ -33,6 +34,7 @@ def main():
     gen = torch.Generator().manual_seed(20261022)
 
     def rand(shape):
+        """Generate seeded scaled CUDA inputs in the requested dtype."""
         return (torch.randn(shape, generator=gen) * 0.25).to(device="cuda", dtype=dtype)
 
     x, wp, wm, skip = rand((B, 3 * D, L)), rand((3 * D, Kp)), rand((D, Km)), rand((D,))
@@ -59,9 +61,11 @@ def main():
     )
 
     def fwd():
+        """Launch candidate fused forward and retain both ungated and gated outputs."""
         forward(x, wp, wm, skip, y, yg, cuda.CUstream(torch.cuda.current_stream().cuda_stream))
 
     def bwd():
+        """Launch candidate fused backward using the saved ungated output."""
         backward(x, wp, wm, skip, y, dy, dx, dwp, dwm, ds, cuda.CUstream(torch.cuda.current_stream().cuda_stream))
 
     fwd()
@@ -97,11 +101,13 @@ def main():
     bb.restype = ctypes.c_int
 
     def be_fwd():
+        """Run fused backend forward and report a nonzero backend status."""
         status = bf(torch.cuda.current_stream().cuda_stream, *(t.data_ptr() for t in (x, wp, wm, skip, be_y, be_yg)), B, D, L, Kp, Km, typecode)
         if status:
             raise RuntimeError(f"backend forward status {status}")
 
     def be_bwd():
+        """Clear parameter gradients and run fused backend backward with the shared saved output."""
         for t in be_out[1:]:
             t.zero_()
         status = bb(
@@ -124,7 +130,7 @@ def main():
     for name, out, ref in zip(("y", "yg", "dx", "dwp", "dwm", "ds"), (y, yg, dx, dwp, dwm, ds), (be_y, be_yg, *be_out)):
         torch.testing.assert_close(out, ref, atol=tol[0], rtol=tol[1])
         errors[name] = (out.double() - ref.double()).abs().max().item()
-    measurements = measure({"candidate_fwd": fwd, "backend_fwd": be_fwd, "candidate_bwd": bwd, "backend_bwd": be_bwd}) if args.timing else {}
+    measurements = tune.measure({"candidate_fwd": fwd, "backend_fwd": be_fwd, "candidate_bwd": bwd, "backend_bwd": be_bwd}) if args.timing else {}
     print(
         json.dumps(
             {

@@ -20,6 +20,7 @@ ROUTINES = {
 
 
 def extract(source):
+    """Parse the six direct causal-convolution routines into uniquely named workload records."""
     cases = []
     for line_number, line in enumerate(source.splitlines(), 1):
         match = re.match(r'"([^"]+)"\s*=\s*(.*)', line)
@@ -54,6 +55,7 @@ def extract(source):
 
 
 def main():
+    """Export workloads from a pinned backend revision and optionally verify an active subset."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend-root", type=Path, required=True)
     parser.add_argument("--ref", required=True, help="Backend revision containing scripts/levels.layer")

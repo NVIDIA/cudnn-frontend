@@ -4,17 +4,16 @@
 
 import argparse
 import csv
-import hashlib
+import importlib
 import json
-import os
 from pathlib import Path
-import runpy
 import subprocess
 import sys
 import time
 
 
 def worker(args):
+    """Replay one regression while recording candidate compilation and backend first-dispatch costs."""
     import torch
     import cutlass
     from cutlass import cute
@@ -29,6 +28,7 @@ def worker(args):
     original_compile = cute.compile
 
     def timed_compile(fn, *values, **kwargs):
+        """Record wall time around the original CuTe compilation call."""
         torch.cuda.synchronize()
         start = time.perf_counter()
         result = original_compile(fn, *values, **kwargs)
@@ -41,6 +41,7 @@ def worker(args):
         original = getattr(Backend, direction)
 
         def timed_dispatch(self, *values, _original=original, _direction=direction, **kwargs):
+            """Record the first synchronized backend dispatch for each direction."""
             if any(r["direction"] == _direction for r in dispatch_records):
                 return _original(self, *values, **kwargs)
             torch.cuda.synchronize()
@@ -56,6 +57,7 @@ def worker(args):
 
     def measured(functions, **kwargs):
         # This range is also usable with nsys; all compilation precedes it.
+        """Optionally emit profiler ranges before running the standard timing protocol."""
         if args.profile:
             torch.cuda.synchronize()
             torch.cuda.cudart().cudaProfilerStart()
@@ -94,7 +96,7 @@ def worker(args):
             command.extend(["--" + key.replace("_", "-"), str(value)])
     sys.argv = command
     try:
-        runpy.run_path(str(Path(__file__).with_name(script)), run_name="__main__")
+        importlib.import_module(Path(script).stem).main()
     finally:
         (args.output / "compilation.json").write_text(
             json.dumps(
@@ -116,6 +118,7 @@ def worker(args):
 
 
 def main():
+    """Select slower cases for this GPU and replay each in an isolated subprocess."""
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--source-csv", type=Path)
     p.add_argument("--output", type=Path, required=True)
@@ -138,6 +141,8 @@ def main():
         command = [sys.executable, __file__, "--evidence", evidence, "--output", str(folder)]
         if args.sweep:
             command.append("--sweep")
+        if args.profile:
+            command.append("--profile")
         folder.mkdir(parents=True, exist_ok=True)
         with (folder / "run.log").open("w") as log:
             result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=1200)

@@ -11,6 +11,7 @@ from cutlass.utils import SmemAllocator
 
 @cute.jit
 def _activate(value, silu: cutlass.Constexpr, low_precision: cutlass.Constexpr = False):
+    """Apply identity or SiLU with the arithmetic selected for the backend path."""
     if cutlass.const_expr(silu):
         if cutlass.const_expr(low_precision):
             value = value * (0.5 + 0.5 * cute.tanh(0.5 * value, fastmath=True))
@@ -220,6 +221,7 @@ def causal_conv1d_fwd_nwc_vec(
     packed: cutlass.Constexpr,
     threads: cutlass.Constexpr = 128,
 ):
+    """Convolve channel vectors with a register window and optional paired FP32 FMA."""
     tid = cute.arch.thread_idx()[0]
     channel = (cute.arch.block_idx()[0] * threads + tid) * vector
     start = cute.arch.block_idx()[1] * rows
@@ -372,6 +374,7 @@ causal_conv1d_fwd_nwc_grouped.set_name_prefix("cudnn", remove_cutlass_symbol=Tru
 
 @cute.jit
 def _nwh_async_vector(src, dst, offset, target, valid, vector: cutlass.Constexpr):
+    """Issue one predicated 128-bit global-to-shared copy for an NWH tile."""
     safe = cutlass.Int64(0)
     if valid:
         safe = offset
@@ -386,6 +389,7 @@ def _nwh_async_vector(src, dst, offset, target, valid, vector: cutlass.Constexpr
 
 @cute.jit
 def _nwh_load_vector(src, offset, vector: cutlass.Constexpr):
+    """Load one aligned 128-bit vector into registers."""
     raw = cute.make_rmem_tensor((vector,), src.element_type)
     view = cute.make_tensor((src.iterator + offset).align(16), cute.make_layout((vector,)))
     atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), src.element_type, num_bits_per_copy=128)
@@ -394,6 +398,7 @@ def _nwh_load_vector(src, offset, vector: cutlass.Constexpr):
 
 
 def _uses_packed_f32():
+    """Return whether the compile target supports the selected paired FP32 path."""
     from cutlass.cutlass_dsl import CuTeDSL
 
     return CuTeDSL._get_dsl().get_arch_enum().major >= 10
@@ -401,6 +406,7 @@ def _uses_packed_f32():
 
 @cute.jit
 def _nwh_fwd_stage(x, sx, batch, h0, tile, stage: cutlass.Constexpr, width: cutlass.Constexpr, ts: cutlass.Constexpr, th: cutlass.Constexpr):
+    """Stage an input tile and its causal halo, then commit its asynchronous copies."""
     vector = 128 // x.element_type.width
     tpr = th // vector
     xr = ts + width - 1
@@ -430,6 +436,7 @@ def _nwh_fwd_tile(
     ts: cutlass.Constexpr,
     th: cutlass.Constexpr,
 ):
+    """Compute one staged NWH tile with cached weights and store valid outputs."""
     vector = 128 // y.element_type.width
     tpr = th // vector
     rows = ts // (128 // tpr)
@@ -472,6 +479,7 @@ def _nwh_fwd_tile(
 
 @cute.jit
 def _nwh_fwd_payload(x, sx, batch, h0, tile, stage: cutlass.Constexpr, width: cutlass.Constexpr, ts: cutlass.Constexpr, th: cutlass.Constexpr):
+    """Stage only new sequence rows; the pipeline carries the causal halo separately."""
     vector = 128 // x.element_type.width
     tpr = th // vector
     rows = ts // (128 // tpr)
@@ -491,6 +499,7 @@ def _nwh_fwd_payload(x, sx, batch, h0, tile, stage: cutlass.Constexpr, width: cu
 
 @cute.jit
 def _nwh_fwd_carry(sx, source: cutlass.Constexpr, target: cutlass.Constexpr, width: cutlass.Constexpr, ts: cutlass.Constexpr, th: cutlass.Constexpr):
+    """Copy the previous tile tail into the next shared-memory stage halo."""
     vector = 128 // sx.element_type.width
     tpr = th // vector
     xr = ts + width - 1
@@ -517,6 +526,7 @@ def nwh_fwd_pipeline3(
     ts: cutlass.Constexpr,
     th: cutlass.Constexpr,
 ):
+    """Pipeline NWH tiles through three shared-memory stages while reusing halo rows."""
     vector = 128 // x.element_type.width
     tpr = th // vector
     tid = cute.arch.thread_idx()[0]
@@ -572,6 +582,7 @@ def nwh_fwd_pipeline(
     ts: cutlass.Constexpr,
     th: cutlass.Constexpr,
 ):
+    """Alternate two shared-memory stages while loading each tile with its full halo."""
     vector = 128 // x.element_type.width
     tpr = th // vector
     tid = cute.arch.thread_idx()[0]
@@ -631,6 +642,7 @@ def nwh_wide_shared(
     threads: cutlass.Constexpr,
 ):
     # Store wide filters once per CTA; registers retain the input window and 16 outputs.
+    """Reuse wide filters in shared memory and compute paired output rows in registers."""
     tid = cute.arch.thread_idx()[0]
     channel = cute.arch.block_idx()[0] * threads + tid
     start = cute.arch.block_idx()[1] * rows
@@ -679,6 +691,7 @@ def launch_fwd(
     vector: cutlass.Constexpr,
     packed: cutlass.Constexpr,
 ):
+    """Select and launch the direct-convolution schedule for the layout, shape, and GPU."""
     from cutlass.cutlass_dsl import CuTeDSL
 
     if cutlass.const_expr(

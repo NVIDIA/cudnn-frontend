@@ -20,6 +20,7 @@ from backend import Backend
 
 
 def measure(functions, repeats=100, rounds=21, cold=False):
+    """Measure preallocated CUDA graphs in randomized order, optionally evicting cache before samples."""
     eviction = torch.empty(512 * 1024 * 1024, device="cuda", dtype=torch.uint8) if cold else None
     if cold:
         repeats = 1
@@ -42,11 +43,12 @@ def measure(functions, repeats=100, rounds=21, cold=False):
         torch.cuda.synchronize()
     rng = random.Random(20261022)
     samples = {name: [] for name in graphs}
+    positions = {name: [] for name in graphs}
     begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     for _ in range(rounds):
         order = list(graphs)
         rng.shuffle(order)
-        for name in order:
+        for position, name in enumerate(order):
             if eviction is not None:
                 eviction.zero_()
             begin.record()
@@ -54,10 +56,12 @@ def measure(functions, repeats=100, rounds=21, cold=False):
             end.record()
             end.synchronize()
             samples[name].append(begin.elapsed_time(end) * 1000 / repeats)
-    return {name: {"median_us": statistics.median(vals), "samples_us": vals} for name, vals in samples.items()}
+            positions[name].append(position)
+    return {name: {"median_us": statistics.median(vals), "samples_us": vals, "round_positions": positions[name]} for name, vals in samples.items()}
 
 
 def main():
+    """Validate and time forward schedules against the backend and optional existing frontend."""
     p = argparse.ArgumentParser()
     p.add_argument("--shape", default="2,768,4096")
     p.add_argument("--width", type=int, default=4)
@@ -83,6 +87,7 @@ def main():
     by = torch.empty_like(x)
 
     def be_run():
+        """Run backend forward into its retained output buffer."""
         backend.forward(x, w, b, by, channel_last=nwh, silu=not args.identity)
 
     be_run()
@@ -100,6 +105,7 @@ def main():
         old.compile()
 
         def fe_run():
+            """Execute the compiled existing frontend forward implementation."""
             old.execute(x, old_w, old_y, bias_tensor=b)
 
         fe_run()
@@ -142,6 +148,7 @@ def main():
             )
 
             def run(fn=fn, y=y):
+                """Launch one compiled forward schedule with its retained output buffer."""
                 fn(x, w, b, y, cuda.CUstream(torch.cuda.current_stream().cuda_stream))
 
             run()

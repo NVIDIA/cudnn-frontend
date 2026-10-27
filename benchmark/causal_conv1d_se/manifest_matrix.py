@@ -12,10 +12,12 @@ import torch
 
 
 def key(case, direction):
+    """Build a workload identity from the manifest case and requested direction."""
     return (case["family"], case["dtype"], tuple(case["shape"]), case["width"], case.get("mixer_width"), case["silu"], direction)
 
 
 def measured_key(data):
+    """Recover a workload identity from retained warm-cache benchmark arguments."""
     a = data.get("args", {})
     if "projection_width" in a:
         return ("b2b", a["dtype"], tuple(map(int, a["shape"].split(","))), a["projection_width"], a["mixer_width"], False, "both")
@@ -26,6 +28,7 @@ def measured_key(data):
 
 
 def main():
+    """Run the manifest grid, reusing only results with matching GPU, backend, source, and schedule."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--backend-library", required=True)
@@ -135,9 +138,7 @@ def main():
             entry.update(
                 command=command,
                 exit_code=proc.returncode,
-                status=(
-                    "pass" if proc.returncode == 0 else ("backend_unsupported" if "returned 3010" in log or "backend forward status 3010" in log else "failed")
-                ),
+                status=("pass" if proc.returncode == 0 else ("backend_unsupported" if "returned 3010" in log or "status 3010" in log else "failed")),
             )
             if direction == "both" and proc.returncode == 0:
                 data = json.loads(next(line for line in reversed(proc.stdout.splitlines()) if line.startswith("{")))

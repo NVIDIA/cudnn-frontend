@@ -14,6 +14,7 @@ from cutlass import cute
 
 
 def main():
+    """Check disk and in-process artifact reuse, output correctness, and CUDA-graph replay."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--require-disk-hit", action="store_true")
@@ -49,9 +50,11 @@ def main():
                 launch = {}
 
                 def forbidden(*values, **kwargs):
+                    """Fail if a cache-hit path attempts to compile a new kernel."""
                     raise AssertionError("Cache reuse attempted to invoke cute.compile")
 
                 def cached(fn, *values, **kwargs):
+                    """Measure a cache lookup or compilation and retain the compiled launch for replay."""
                     before = compiled_cache.stats()
                     cute.compile = forbidden if args.require_disk_hit or repeat else original
                     torch.cuda.synchronize()
@@ -64,6 +67,7 @@ def main():
                     launch["function"] = result
 
                     def invoke(*runtime):
+                        """Record runtime arguments while invoking the cached compiled function."""
                         launch["arguments"] = runtime
                         return result(*runtime)
 

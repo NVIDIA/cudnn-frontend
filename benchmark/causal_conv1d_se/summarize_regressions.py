@@ -12,6 +12,7 @@ import statistics
 
 
 def interval(candidate, backend):
+    """Estimate a paired-round 95% bootstrap interval for candidate/backend median latency."""
     rng = random.Random(20261026)
     n = len(candidate)
     assert n == len(backend)
@@ -24,6 +25,7 @@ def interval(candidate, backend):
 
 
 def category(row):
+    """Assign a schedule category from the workload layout, direction, dtype, and sequence length."""
     if row["family"] == "b2b":
         return "fused_forward_halo_reuse" if row["direction"] == "forward" else "fused_backward_recomputation"
     if row["dtype"] == "float64":
@@ -38,13 +40,17 @@ def category(row):
 
 
 def main():
+    """Compare every original slowdown with its replay and export uncertainty and compilation evidence."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", type=Path, required=True)
     parser.add_argument("--replay", action="append", required=True, help="smNN=directory")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     replay = dict(item.split("=", 1) for item in args.replay)
-    rows = [r for r in csv.DictReader(args.baseline.open()) if float(r["candidate_us"]) > float(r["backend_us"])]
+    with args.baseline.open() as source:
+        reader = csv.DictReader(source)
+        baseline_fields = reader.fieldnames or []
+        rows = [r for r in reader if float(r["candidate_us"]) > float(r["backend_us"])]
     records, compile_records = [], []
     for row in rows:
         folder = Path(replay[row["cc"]]) / Path(row["evidence"]).stem
@@ -72,8 +78,8 @@ def main():
         compile_data = json.loads((folder / "compilation.json").read_text())
         compile_records.append({"cc": row["cc"], "case": Path(row["evidence"]).stem, **compile_data})
     args.output.mkdir(parents=True, exist_ok=True)
-    with (args.output / "regressions.csv").open("w") as f:
-        writer = csv.DictWriter(f, fieldnames=list(records[0]))
+    with (args.output / "regressions.csv").open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(records[0]) if records else baseline_fields)
         writer.writeheader()
         writer.writerows(records)
     summary = {

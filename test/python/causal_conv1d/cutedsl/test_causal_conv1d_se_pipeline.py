@@ -15,6 +15,7 @@ pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group
 
 
 def _check(case):
+    """Run a boundary case, retain optional diagnostics, and require its acceptance contract."""
     result = run_case(case)
     if root := os.environ.get("CUDNN_SE_BITWISE_RESULTS"):
         path = Path(root)
@@ -46,6 +47,7 @@ def test_forward_pipeline_partial_tiles(monkeypatch, dtype, silu, tiles):
         vector: cutlass.Constexpr,
         packed: cutlass.Constexpr,
     ):
+        """Force the selected pipeline configuration to exercise partial tiles below its tuning threshold."""
         kernel.nwh_fwd_pipeline(x, w, b, y, width, activation, tiles, 64, 128).launch(
             grid=(cute.ceil_div(x.shape[2], 128), cute.ceil_div(x.shape[1], 64 * tiles), x.shape[0]),
             block=(128, 1, 1),
@@ -72,6 +74,7 @@ def test_forward_pipeline_partial_tiles(monkeypatch, dtype, silu, tiles):
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 @pytest.mark.parametrize("silu", [False, True])
 def test_backward_pipeline_partial_tiles(dtype, silu):
+    """Check backward sequence and channel tails across the pipelined NWH path."""
     _dsl()
     _check(
         dict(
@@ -91,6 +94,7 @@ def test_backward_pipeline_partial_tiles(dtype, silu):
 
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_fused_backward_partial_warp_group(dtype):
+    """Check fused backward with a partial group of feature warps."""
     _dsl()
     _check(
         dict(
@@ -203,6 +207,7 @@ def test_forward_triple_buffer_partial_tiles(monkeypatch, dtype, width, tiles, t
         vector: cutlass.Constexpr,
         packed: cutlass.Constexpr,
     ):
+        """Force the selected pipeline configuration to exercise partial tiles below its tuning threshold."""
         kernel.nwh_fwd_pipeline3(x, w, b, y, width, activation, tiles, tile_s, tile_h).launch(
             grid=(cute.ceil_div(x.shape[2], tile_h), cute.ceil_div(x.shape[1], tile_s * tiles), x.shape[0]), block=(128, 1, 1), stream=stream
         )

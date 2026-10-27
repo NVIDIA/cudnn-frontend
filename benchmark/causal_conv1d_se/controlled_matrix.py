@@ -13,6 +13,7 @@ import torch
 
 
 def main():
+    """Run fixed-source comparisons with shared output addresses and retain every job result."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--backend-library", required=True)
@@ -74,10 +75,19 @@ def main():
                 command.append("--accumulate")
             if not args.accumulate and not b2b and case["family"] == "nwc" and case["dtype"] == "bfloat16" and case["width"] == 4 and case["silu"]:
                 command.append("--frontend")
-            result = subprocess.run(command, capture_output=True, text=True, timeout=900)
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, timeout=900)
+            except subprocess.TimeoutExpired as error:
+                stdout = error.stdout or ""
+                stderr = error.stderr or ""
+                if isinstance(stdout, bytes):
+                    stdout = stdout.decode(errors="replace")
+                if isinstance(stderr, bytes):
+                    stderr = stderr.decode(errors="replace")
+                result = subprocess.CompletedProcess(command, 124, stdout=stdout, stderr="Timed out after 900 seconds\n" + stderr)
             log = result.stdout + result.stderr
             (args.output / (stem + ".log")).write_text(log)
-            unsupported = "status 3010" in log or "SHARED_MEMORY_INSUFFICIENT" in log
+            unsupported = result.returncode != 124 and ("returned 3010" in log or "status 3010" in log or "SHARED_MEMORY_INSUFFICIENT" in log)
             status = "pass" if result.returncode == 0 else ("backend_unsupported" if unsupported else "failed")
             records.append(dict(case=case, direction=selected, status=status, returncode=result.returncode, evidence=str(target.resolve()), command=command))
             current = {name: hashlib.sha256((kernel_dir / name).read_bytes()).hexdigest() for name in names}

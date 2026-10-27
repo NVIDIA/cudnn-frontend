@@ -18,6 +18,7 @@ import cuda.bindings.driver as cuda
 
 
 def load_kernel(backward=False):
+    """Load the forward or backward candidate module from this worktree."""
     path = Path(__file__).resolve().parents[2] / "python/cudnn/causal_conv1d_se" / ("backward_kernel.py" if backward else "kernel.py")
     spec = importlib.util.spec_from_file_location("causal_se_backward" if backward else "causal_se_candidate", path)
     module = importlib.util.module_from_spec(spec)
@@ -27,6 +28,7 @@ def load_kernel(backward=False):
 
 
 def reference(x, w, bias, silu, nwh):
+    """Compute causal depthwise convolution and optional SiLU with FP64 PyTorch operations."""
     xx = x.transpose(1, 2) if nwh else x
     ww = w.T if nwh else w
     acc = bias.double()[None, :, None].expand_as(xx).clone()
@@ -40,6 +42,7 @@ def reference(x, w, bias, silu, nwh):
 
 
 def graph_time(fn):
+    """Return median device microseconds per call from repeated CUDA-graph replays."""
     for _ in range(3):
         fn()
     torch.cuda.synchronize()
@@ -61,6 +64,7 @@ def graph_time(fn):
 
 
 def main():
+    """Check one candidate against the FP64 reference and optional backend and frontend comparisons."""
     p = argparse.ArgumentParser()
     p.add_argument("--shape", default="2,7,65")
     p.add_argument("--width", type=int, default=4)
@@ -115,6 +119,7 @@ def main():
         )
 
         def run_bwd():
+            """Launch candidate backward into the preallocated gradient buffers."""
             fn(x, w, b, dy, dz, y, dw, db, cuda.CUstream(torch.cuda.current_stream().cuda_stream))
 
         run_bwd()
@@ -139,6 +144,7 @@ def main():
             be_out = [torch.empty_like(t) for t in (y, dw, db)]
 
             def be_run():
+                """Run backend backward with the selected layout and activation."""
                 be.backward(x, w, b, dy, *be_out, channel_last=nwh, silu=not args.identity)
 
             be_run()
@@ -175,6 +181,7 @@ def main():
     )
 
     def run():
+        """Launch candidate forward into the preallocated output buffer."""
         fn(x, w, b, y, cuda.CUstream(torch.cuda.current_stream().cuda_stream))
 
     run()
@@ -191,6 +198,7 @@ def main():
         backend_output = torch.empty_like(x)
 
         def backend_run():
+            """Run backend forward into its comparison output."""
             backend.forward(x, w, b, backend_output, channel_last=nwh, silu=not args.identity)
 
         backend_run()
@@ -209,6 +217,7 @@ def main():
         old.compile()
 
         def frontend_run():
+            """Run the existing frontend forward implementation into its comparison output."""
             old.execute(x, old_w, old_y, bias_tensor=b)
 
         frontend_run()

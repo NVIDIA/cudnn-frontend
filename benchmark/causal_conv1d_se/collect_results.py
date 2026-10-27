@@ -10,11 +10,13 @@ from pathlib import Path
 
 
 def spread(samples):
+    """Return the lower and upper quartile samples from the measured timings."""
     ordered = sorted(samples)
     return ordered[len(ordered) // 4], ordered[(3 * len(ordered)) // 4]
 
 
 def records(path, data, expected):
+    """Yield comparison rows only for matching kernel hashes and the fixed schedule policy."""
     args = data.get("args", {})
     if "gpu" not in data or "shape" not in args:
         return
@@ -70,10 +72,12 @@ def records(path, data, expected):
 
 
 def identity(row):
+    """Build the workload key used to retain the first supplied matching result."""
     return tuple(row[k] for k in ("gpu", "cc", "family", "direction", "dtype", "B", "D", "L", "K", "Km", "silu", "cache"))
 
 
 def main():
+    """Export matching performance comparisons and preserve failed or unsupported jobs separately."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, action="append", required=True, help="Result directory or JSON file; first matching case wins")
     parser.add_argument("--output", type=Path, required=True)

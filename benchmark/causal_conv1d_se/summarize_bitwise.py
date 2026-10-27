@@ -10,6 +10,7 @@ from pathlib import Path
 
 
 def main():
+    """Export per-output bitwise results and report missing cases, failures, and repeatability."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, action="append", required=True)
     parser.add_argument("--output", type=Path, required=True)

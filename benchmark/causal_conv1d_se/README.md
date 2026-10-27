@@ -1,12 +1,12 @@
-# Direct causal-convolution SE candidates
+# CuTe DSL causal-convolution SE kernels
 
-This directory compares private CuTe DSL candidates in `python/cudnn/causal_conv1d_se` with the cuDNN SE implementation and the existing frontend kernels. These are **pre-integration candidates**. The public `cudnn.ops` routing has not changed. Architecture coverage and performance gates must pass before a default route is added.
+This directory compares CuTe DSL implementations in `python/cudnn/causal_conv1d_se` with the cuDNN SE implementation and the existing frontend kernels. These are **pre-integration candidates**. The public `cudnn.ops` routing has not changed. Architecture coverage and performance gates must pass before a default route is added.
 
 ## Validation status
 
-The measured candidate uses CuTe DSL 4.7.0. With backend NVRTC 13.6 and cuDNN 9.29.0.2, the seven-architecture sweep accepted 506/518 named manifest comparisons; the backend rejected the remaining 12. The focused suite passed 175/175 and the boundary suite passed 926/938.
+The measured candidate uses CuTe DSL 4.7.0. With backend NVRTC 13.6 and cuDNN 9.29.0.2, the seven-architecture sweep accepted 506/518 named manifest comparisons; 12/518 were backend-unsupported because FP64 NWH exceeded shared-memory admission on SM86/89/120. Separately, the focused suite passed 175/175 and the boundary suite passed 926/938, with 12 exact-bit data-check failures. Backend-unsupported manifest cases and boundary accuracy failures are different cases.
 
-The 12 boundary failures are exact-bit FP32 NWH input-gradient mismatches at B=2, D=1032, L=1031, for K2 identity, K3 identity, and K3 SiLU on SM80/86/89/90. Same-GPU controls pass these cases with backend NVRTC 13.0 and fail with 13.6. The contraction profiles in `_nwh_pair_masks` therefore need revalidation for the newer backend compiler. Do not waive these failures or relax the data-output comparison.
+The 12 boundary failures are exact-bit FP32 NWH input-gradient mismatches at B=2, D=1032, L=1031, for K2 identity, K3 identity, and K3 SiLU on SM80/86/89/90. The previous same-GPU controls pass these cases with backend NVRTC 13.0. Focused follow-up controls with NVRTC 13.5 and 13.6 each pass 44/56 rounding cases and reproduce the same 12 failures. This is not a full NVRTC 13.5 workload sweep. The contraction profiles in `_nwh_pair_masks` therefore need revalidation for the newer backend compiler. Do not waive these failures or relax the data-output comparison.
 
 The fixed device matrix retains six slower candidate medians against the backend among 1,088 supported comparisons. The candidate wins all 84 measured directions against existing FE. These results do not establish complete backend replacement. The prepared PR is based on a newer `develop` that requires CuTe DSL 4.8.0; the seven-architecture 4.7.0 results are historical evidence, not validation of that dependency update or the full rebased tree.
 
@@ -36,6 +36,16 @@ Back-to-back backward receives the gradient of `y_gated` and uses the saved, inp
 Parameter-gradient accumulation uses atomics and is not bitwise deterministic. The backward launchers reset parameter outputs by default. Compile with the final `accumulate=True` argument to preserve existing parameter gradients and add to them, matching the backend ABI. Data gradients are overwritten in either mode. The fused back-to-back kernels need no global intermediate workspace. Standard backward retains a caller-owned compute-dtype `dz` workspace for the wide-filter NWH path; the fused NCW and short-filter NWH paths do not use that workspace.
 
 The candidate launchers perform no allocation, tensor conversion, or synchronization. Compile outside capture and pass the active CUDA stream at execution. Full public API integration, including argument checks and architecture admission, is still required.
+
+## Existing API contracts and replacement scope
+
+The existing `causal_conv1d_bulk_sm100` package processes complete dense or packed sequences for prefill and training. Its autograd adapter supports input, filter, bias, and initial-state gradients; a returned final state can also receive a gradient. The semantic `cudnn.ops.causal_conv1d` API adapts public `[B,D,L]` tensors and `K-1` history states to the native package's layouts. Its native route also has mixed FP32-filter support, reusable compiled plans, and a deterministic bias-free backward mode.
+
+The `causal_conv1d_update_sm100` package processes one new token per active sequence during decoding. It updates history in place, can route tokens to cache slots through `conv_state_indices`, and supports padding slots. It is inference-only and explicitly rejects autograd inputs. Preserving this decode path does not require implementing decode in the dense SE kernels. The folder suffixes do not define the complete admitted architecture set.
+
+The existing generic NCW, NWH, and fused back-to-back functions in `python/cudnn/ops/causal_conv1d.py` already register autograd and FakeTensor implementations around their backend calls. The added SE launchers provide the underlying forward/backward computations but are not connected to these registrations. Replacing the backend should reuse that API layer and preserve parameter-gradient casts, optional-bias handling, saved fused outputs, stream behavior, `torch.compile` support, and allocation/cache ownership. Atomic SE parameter reductions do not provide the native bulk path's deterministic guarantee.
+
+The dense SE comparisons do not establish parity for packed sequences, initial/final states, mixed filter dtypes, activation checkpointing, or prefill-to-decode handoff. Integration must retain the existing native routes for these contracts and run the semantic API, autograd, and prefill/decode seam tests. These are direct operator APIs; no cuDNN graph API integration is required. CUDA Graph capture/replay remains an execution contract tested separately.
 
 ## Run
 

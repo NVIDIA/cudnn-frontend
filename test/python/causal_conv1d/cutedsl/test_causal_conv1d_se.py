@@ -11,11 +11,12 @@ pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group
 
 
 def _dsl():
-    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+    """Require the installed DSL version and an architecture admitted by the candidate checks."""
+    from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_state, cutedsl_too_old
 
     installed, version = cutedsl_state()
     if not installed or cutedsl_too_old(version):
-        pytest.skip("requires nvidia-cutlass-dsl>=4.7.0")
+        pytest.skip(f"requires nvidia-cutlass-dsl>={'.'.join(map(str, CUTEDSL_MIN_VERSION))}")
     if torch.cuda.get_device_capability() not in {(8, 0), (8, 6), (8, 9), (9, 0), (10, 0), (10, 3), (12, 0)}:
         pytest.skip("architecture has not been admitted by the candidate GPU checks")
     from cutlass import cute
@@ -26,6 +27,7 @@ def _dsl():
 
 
 def _reference(x, weight, bias, silu, nwh):
+    """Evaluate dense causal convolution in FP64 with optional SiLU."""
     xx = x.transpose(1, 2) if nwh else x
     ww = weight.T if nwh else weight
     result = bias.double()[None, :, None].expand_as(xx).clone()
@@ -42,6 +44,7 @@ def _reference(x, weight, bias, silu, nwh):
 @pytest.mark.parametrize("nwh", [False, True])
 @pytest.mark.parametrize("silu", [False, True])
 def test_direct_forward_and_all_gradients(dtype, nwh, silu):
+    """Compare every output with an independent reference and verify gradient reset on reuse."""
     cute, dlpack, cuda = _dsl()
     from cudnn.causal_conv1d_se.kernel import launch_fwd
     from cudnn.causal_conv1d_se.backward_kernel import launch_bwd
@@ -87,6 +90,7 @@ def test_direct_forward_and_all_gradients(dtype, nwh, silu):
     ],
 )
 def test_causality_tail_and_mutable_graph_replay(nwh, width, length, channels, vector, rows):
+    """Check causal tails, a nondefault stream, and changed inputs during graph replay."""
     cute, dlpack, cuda = _dsl()
     from cudnn.causal_conv1d_se.kernel import launch_fwd
 
@@ -119,24 +123,28 @@ def test_causality_tail_and_mutable_graph_replay(nwh, width, length, channels, v
     else:
         x[:, :, split:].add_(3)
     graph = torch.cuda.CUDAGraph()
-    with warnings.catch_warnings():
-        warnings.filterwarnings("error", message="The CUDA Graph is empty.*")
-        with torch.cuda.graph(graph):
-            fn(x, w, b, y, cuda.CUstream(torch.cuda.current_stream().cuda_stream))
-    graph.replay()
-    torch.testing.assert_close(y, _reference(x, w, b, True, nwh).to(y.dtype), atol=0.03, rtol=0.02)
-    if nwh:
-        torch.testing.assert_close(y[:, :split], before[:, :split], atol=0, rtol=0)
-    else:
-        torch.testing.assert_close(y[:, :, :split], before[:, :, :split], atol=0, rtol=0)
-    x.zero_()
-    b.fill_(2)
-    graph.replay()
-    torch.testing.assert_close(y, torch.full_like(y, torch.nn.functional.silu(torch.tensor(2.0)).item()), atol=0, rtol=0)
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", message="The CUDA Graph is empty.*")
+            with torch.cuda.graph(graph):
+                fn(x, w, b, y, cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+        graph.replay()
+        torch.testing.assert_close(y, _reference(x, w, b, True, nwh).to(y.dtype), atol=0.03, rtol=0.02)
+        if nwh:
+            torch.testing.assert_close(y[:, :split], before[:, :split], atol=0, rtol=0)
+        else:
+            torch.testing.assert_close(y[:, :, :split], before[:, :, :split], atol=0, rtol=0)
+        x.zero_()
+        b.fill_(2)
+        graph.replay()
+        torch.testing.assert_close(y, torch.full_like(y, torch.nn.functional.silu(torch.tensor(2.0)).item()), atol=0, rtol=0)
+    finally:
+        graph.reset()
 
 
 @pytest.mark.parametrize("projection_width,mixer_width", [(3, 8), (32, 256)])
 def test_back_to_back_saved_output_backward(projection_width, mixer_width):
+    """Check fused outputs and gradients using the saved ungated output."""
     cute, dlpack, cuda = _dsl()
     from cudnn.causal_conv1d_se.b2b_kernel import launch_b2b_fwd, launch_b2b_bwd
 
@@ -222,3 +230,34 @@ def test_parameter_gradient_accumulation(family):
     clear(*tensors, stream)
     for value, reference in zip(outputs[1:], first[1:]):
         assert parameter_difference(value, reference, length)["accepted"]
+
+
+@pytest.mark.parametrize("rows", [0, -8, 4, 12, 8, 16])
+def test_nwh_backward_row_tiling(rows):
+    """Reject incomplete chunks and check all gradients for admitted row counts with a sequence tail."""
+    cute, dlpack, cuda = _dsl()
+    from cudnn.causal_conv1d_se.backward_kernel import launch_bwd
+
+    torch.manual_seed(73)
+    x = torch.randn(1, 17, 8, device="cuda", dtype=torch.float32)
+    w = torch.randn(3, 8, device="cuda", dtype=x.dtype)
+    b = torch.randn(8, device="cuda", dtype=x.dtype)
+    dy = torch.randn_like(x)
+    dz, dx, dw, db = (torch.full_like(t, float("nan")) for t in (x, x, w, b))
+    tensors = (x, w, b, dy, dz, dx, dw, db)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    def compile_backward():
+        """Compile the same fused NWH specialization with the requested row count."""
+        return cute.compile(launch_bwd, *(dlpack(t, assumed_align=16) for t in tensors), stream, 3, True, True, rows, options="--enable-tvm-ffi")
+
+    if rows <= 0 or rows % 8:
+        with pytest.raises(ValueError, match="rows.*(positive|multiple of 8)"):
+            compile_backward()
+        return
+    backward = compile_backward()
+    backward(*tensors, stream)
+    xx, ww, bb = (t.double().requires_grad_() for t in (x, w, b))
+    refs = torch.autograd.grad(_reference(xx, ww, bb, True, True), (xx, ww, bb), dy.double())
+    for value, reference in zip((dx, dw, db), refs):
+        torch.testing.assert_close(value, reference.float(), atol=2e-4, rtol=2e-4)

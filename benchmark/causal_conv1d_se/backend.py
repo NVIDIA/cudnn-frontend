@@ -3,7 +3,6 @@
 """Explicit backend C ABI used only by the comparison harness."""
 
 import ctypes
-import os
 from pathlib import Path
 
 import torch
@@ -11,10 +10,12 @@ import torch
 
 class Backend:
     def __init__(self, library):
+        """Load the explicitly selected cuDNN library for direct SE calls."""
         self.path = str(Path(library).resolve(strict=True))
         self.lib = ctypes.CDLL(self.path)
 
     def forward(self, x, w, bias, y, *, channel_last, silu):
+        """Run NCW or NWH forward into the supplied output on the current CUDA stream."""
         B, D, L = (x.shape[0], x.shape[2], x.shape[1]) if channel_last else x.shape
         K = w.shape[0] if channel_last else w.shape[1]
         name = "cudnnCausalConv1dNwhForward" if channel_last else "cudnnCausalConv1dForward"
@@ -27,6 +28,7 @@ class Backend:
             raise RuntimeError(f"{name} returned {status} from {self.path}")
 
     def backward(self, x, w, bias, dy, dx, dw, db, *, channel_last, silu):
+        """Clear parameter gradients and run NCW or NWH backward into supplied outputs."""
         B, D, L = (x.shape[0], x.shape[2], x.shape[1]) if channel_last else x.shape
         K = w.shape[0] if channel_last else w.shape[1]
         name = "cudnnCausalConv1dNwhBackward" if channel_last else "cudnnCausalConv1dBackward"

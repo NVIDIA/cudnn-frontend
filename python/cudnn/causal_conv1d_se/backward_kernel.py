@@ -9,6 +9,7 @@ from cutlass.utils import SmemAllocator
 
 
 def _uses_packed_nwh():
+    """Return whether the target supports the packed NWH arithmetic route."""
     from cutlass.cutlass_dsl import CuTeDSL
 
     return int(CuTeDSL._get_dsl().get_arch_enum().major) >= 10
@@ -42,6 +43,7 @@ def _nwh_seqpar(dtype, width, silu, shape):
 
 @cute.jit
 def _sigmoid(value):
+    """Evaluate sigmoid with the backend-compatible reciprocal policy."""
     denominator = 1.0 + cute.exp(-value, fastmath=True)
     if cutlass.const_expr(value.dtype == cutlass.Float64):
         return 1.0 / denominator
@@ -51,6 +53,7 @@ def _sigmoid(value):
 
 @cute.kernel
 def causal_conv1d_dz(x: cute.Tensor, w: cute.Tensor, b: cute.Tensor, dy: cute.Tensor, dz: cute.Tensor, width: cutlass.Constexpr, nwh: cutlass.Constexpr):
+    """Recompute convolution and apply the SiLU derivative to the incoming gradient."""
     index = cutlass.Int64(cute.arch.block_idx()[0]) * 256 + cute.arch.thread_idx()[0]
     D = x.shape[1]
     L = x.shape[2]
@@ -95,6 +98,7 @@ causal_conv1d_dz.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 @cute.kernel
 def causal_conv1d_zero_grad(dw: cute.Tensor, db: cute.Tensor):
+    """Clear parameter-gradient buffers before an overwrite-mode backward launch."""
     i = cutlass.Int64(cute.arch.block_idx()[0]) * 256 + cute.arch.thread_idx()[0]
     flat = cute.make_tensor(dw.iterator, cute.make_layout((cute.size(dw),)))
     if i < cute.size(dw):
@@ -117,6 +121,7 @@ def causal_conv1d_bwd_nwc(
     width: cutlass.Constexpr,
     rows: cutlass.Constexpr,
 ):
+    """Compute NWH data and parameter gradients from a materialized activation gradient."""
     channel = cute.arch.block_idx()[0] * 128 + cute.arch.thread_idx()[0]
     start = cute.arch.block_idx()[1] * rows
     batch = cute.arch.block_idx()[2]
@@ -180,7 +185,10 @@ def _nwh_pair_masks(width, element_bits, silu):
 def _nwh_first_pair(
     g0, w0, g1, w1, channel, position, shape: cutlass.Constexpr, width: cutlass.Constexpr, element_bits: cutlass.Constexpr, silu: cutlass.Constexpr
 ):
+    """Contract the first two gradient products in the selected backend rounding order."""
     masks: cutlass.Constexpr = _nwh_pair_masks(width, element_bits, silu)
+    # CuTe needs a prebound result for the nested dynamic region; removing this
+    # initialization raises UnboundLocalError while tracing the masked-tile path.
     value = cutlass.Float32(0)
     if cutlass.const_expr(not any(masks) or (shape[1] % 64 == 0 and shape[2] % 64 == 0 and masks[0] == masks[2] == 0)):
         value = cute.math.fma(g0, w0, g1 * w1)
@@ -201,6 +209,7 @@ def _nwh_first_pair(
 
 
 def _nwh_center_only(dtype, width, silu, shape):
+    """Select the short Hopper identity path that loads only the central input window."""
     from cutlass.cutlass_dsl import CuTeDSL
 
     return CuTeDSL._get_dsl().get_arch_enum().major == 9 and dtype.width == 16 and width == 7 and not silu and shape[1] <= 256 and shape[2] >= 768
@@ -290,6 +299,7 @@ causal_conv1d_bwd_nwc_fused.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 @cute.jit
 def _tail_load(x, batch, channel, tile, lane, compute: cutlass.Constexpr, scratch: cute.Tensor, halo: cutlass.Constexpr = 256):
+    """Coalesce an unaligned NCW tile through warp-local shared memory, zeroing out-of-range positions."""
     values = cute.make_rmem_tensor((8,), compute)
     values.fill(0)
     warp = cute.arch.thread_idx()[0] // 32
@@ -310,6 +320,7 @@ def _tail_load(x, batch, channel, tile, lane, compute: cutlass.Constexpr, scratc
 
 @cute.jit
 def _tail_store(y, batch, channel, start, values, scratch: cute.Tensor):
+    """Transpose register values through shared memory for coalesced masked NCW stores."""
     warp = cute.arch.thread_idx()[0] // 32
     lane = cute.arch.thread_idx()[0] % 32
     tile_start = start - lane * 8
@@ -326,6 +337,7 @@ def _tail_store(y, batch, channel, start, values, scratch: cute.Tensor):
 
 @cute.jit
 def _ncw_load(x, batch, channel, tile, lane, compute: cutlass.Constexpr, scratch, halo: cutlass.Constexpr = 256):
+    """Load eight NCW values per lane using aligned vectors or the shared-memory tail path."""
     if cutlass.const_expr(x.shape[2] % 8 != 0):
         values = _tail_load(x, batch, channel, tile, lane, compute, scratch, halo)
     else:
@@ -351,6 +363,7 @@ def _ncw_load(x, batch, channel, tile, lane, compute: cutlass.Constexpr, scratch
 
 @cute.jit
 def _ncw_dz(x, w, weights, bias_value, dy, batch, channel, tile, lane, width: cutlass.Constexpr, silu: cutlass.Constexpr, compute: cutlass.Constexpr, scratch):
+    """Load an NCW tile and compute its activation gradient while retaining original inputs."""
     current = _ncw_load(x, batch, channel, tile, lane, compute, scratch)
     original = cute.make_rmem_tensor((8,), compute)
     original.store(current.load())
@@ -391,6 +404,7 @@ def _ncw_dz(x, w, weights, bias_value, dy, batch, channel, tile, lane, width: cu
 
 
 def _is_sm86():
+    """Identify the SM86 target for its schedule-specific launch choices."""
     from cutlass.cutlass_dsl import CuTeDSL
 
     arch = CuTeDSL._get_dsl().get_arch_enum()
@@ -398,6 +412,7 @@ def _is_sm86():
 
 
 def _ncw_batch_group(dtype, silu, shape):
+    """Choose a divisible batch grouping for short FP32 NCW reductions."""
     from cutlass.cutlass_dsl import CuTeDSL
 
     arch = CuTeDSL._get_dsl().get_arch_enum()
@@ -412,6 +427,7 @@ def _ncw_batch_group(dtype, silu, shape):
 
 
 def _ncw_warps(dtype, shape, width):
+    """Choose the number of independent channel warps in an NCW block."""
     from cutlass.cutlass_dsl import CuTeDSL
 
     # Short K32 tiles need more independent CTAs on SM100/103, including additive gradients.
@@ -434,6 +450,7 @@ def causal_conv1d_bwd_ncw_fused(
     silu: cutlass.Constexpr,
     tiles: cutlass.Constexpr,
 ):
+    """Fuse NCW activation recomputation, data gradients, and parameter reductions."""
     warps: cutlass.Constexpr = _ncw_warps(x.element_type, x.shape, width)
     tid = cute.arch.thread_idx()[0]
     lane = tid % 32
@@ -547,6 +564,7 @@ causal_conv1d_bwd_ncw_fused.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 @cute.jit
 def _nwh_async_vector(src, dst, offset, target, valid, vector: cutlass.Constexpr):
+    """Stage one predicated 128-bit global vector with an asynchronous copy."""
     safe = cutlass.Int64(0)
     if valid:
         safe = offset
@@ -575,6 +593,7 @@ def _nwh_stage(
     threads: cutlass.Constexpr,
     silu: cutlass.Constexpr,
 ):
+    """Stage an NWH input/gradient tile and halos, then commit its asynchronous copies."""
     vector = 128 // x.element_type.width
     tpr = tile_h // vector
     halo = width - 1
@@ -601,6 +620,7 @@ def _nwh_stage(
 
 @cute.jit
 def _nwh_load_vector(src, offset, vector: cutlass.Constexpr):
+    """Load an aligned 128-bit vector into registers."""
     raw = cute.make_rmem_tensor((vector,), src.element_type)
     view = cute.make_tensor((src.iterator + offset).align(16), cute.make_layout((vector,)))
     atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), src.element_type, num_bits_per_copy=128)
@@ -626,6 +646,7 @@ def _nwh_compute(
     tile_h: cutlass.Constexpr,
     threads: cutlass.Constexpr,
 ):
+    """Consume a staged NWH tile and accumulate parameter partials using scalar FP32 arithmetic."""
     vector = 128 // dx.element_type.width
     tpr = tile_h // vector
     rows = tile_s // (threads // tpr)
@@ -651,7 +672,6 @@ def _nwh_compute(
                 z = bias[v]
                 for k in cutlass.range_constexpr(width):
                     z = cute.math.fma(window[(j + k) % width, v], weights[k, v], z)
-                sig = cutlass.Float32(0)
                 if cutlass.const_expr(dx.element_type.width == 16):
                     sig = 0.5 + 0.5 * cute.tanh(0.5 * z, fastmath=True)
                 else:
@@ -712,6 +732,7 @@ def _nwh_compute_packed(
     tile_h: cutlass.Constexpr,
     threads: cutlass.Constexpr,
 ):
+    """Consume a staged NWH tile with packed FP32 arithmetic and retained parameter partials."""
     vector = 128 // dx.element_type.width
     tpr = tile_h // vector
     rows = tile_s // (threads // tpr)
@@ -787,6 +808,7 @@ def _nwh_compute_pending(
     tile_h: cutlass.Constexpr,
     threads: cutlass.Constexpr,
 ):
+    """Compute a staged NWH tile while retaining pending data-gradient contributions."""
     vector = 128 // dx.element_type.width
     tpr = tile_h // vector
     rows = tile_s // (threads // tpr)
@@ -874,6 +896,7 @@ def nwh_pipeline(
     tile_s: cutlass.Constexpr,
     tile_h: cutlass.Constexpr,
 ):
+    """Double-buffer NWH tiles, retain parameter partials, and reduce once per block."""
     threads = 128
     vector = 128 // x.element_type.width
     tpr = tile_h // vector
@@ -989,6 +1012,9 @@ def launch_bwd(
     rows: cutlass.Constexpr,
     accumulate: cutlass.Constexpr = False,
 ):
+    """Validate row tiling and launch backward, clearing parameter gradients unless accumulation is requested."""
+    if cutlass.const_expr(rows <= 0):
+        raise ValueError(f"Backward rows must be positive, got {rows}")
     if cutlass.const_expr(not nwh and _is_sm86() and x.shape[2] >= 1024 and rows == 4):
         rows = 16
     if cutlass.const_expr(nwh and x.element_type == cutlass.Float64 and x.shape[1] <= 256 and rows == 32):
@@ -1054,6 +1080,8 @@ def launch_bwd(
             grid=(cute.ceil_div(x.shape[2], tile_h), cute.ceil_div(x.shape[1], tile_s * nt), x.shape[0]), block=(128, 1, 1), stream=stream
         )
     elif cutlass.const_expr(width <= 16):
+        if cutlass.const_expr(rows % 8 != 0):
+            raise ValueError(f"NWH fused backward requires rows to be a multiple of 8, got {rows}")
         causal_conv1d_bwd_nwc_fused(x, w, b, dy, dx, dw, db, width, silu, rows).launch(
             grid=(cute.ceil_div(x.shape[2], 128), cute.ceil_div(x.shape[1], rows), x.shape[0]), block=(128, 1, 1), stream=stream
         )

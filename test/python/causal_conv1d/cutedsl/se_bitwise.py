@@ -14,6 +14,7 @@ CASES = MANIFEST["cases"]
 
 
 def bitwise_difference(actual, expected):
+    """Compare raw element bits, reject nonfinite values, and report the first mismatches."""
     assert actual.shape == expected.shape and actual.dtype == expected.dtype
     integer = {2: torch.int16, 4: torch.int32, 8: torch.int64}[actual.element_size()]
     a, b = actual.detach().contiguous().flatten(), expected.detach().contiguous().flatten()
@@ -72,6 +73,7 @@ def parameter_difference(actual, expected, reduction_size):
 
 
 def run_case(case):
+    """Compare repeated backend and candidate executions with exact data and atomic-gradient tolerances."""
     import cudnn
     from cutlass import cute
     from cutlass.cute.runtime import from_dlpack
@@ -83,6 +85,7 @@ def run_case(case):
     kernel_dir = Path(__file__).resolve().parents[4] / "python/cudnn/causal_conv1d_se"
 
     def kernel_hashes():
+        """Hash the three candidate source modules to detect changes during the case."""
         return {name: hashlib.sha256((kernel_dir / name).read_bytes()).hexdigest() for name in ("kernel.py", "backward_kernel.py", "b2b_kernel.py")}
 
     source_hashes = kernel_hashes()
@@ -98,6 +101,7 @@ def run_case(case):
     gen = torch.Generator().manual_seed(seed)
 
     def rand(shape):
+        """Generate case-seeded inputs on CPU before transferring them to the CUDA dtype."""
         return (torch.randn(shape, generator=gen) * (0.25 if b2b else 1.0)).to(device="cuda", dtype=dtype)
 
     x = rand((B, 3 * D, L) if b2b else ((B, L, D) if nwh else (B, D, L)))
@@ -145,6 +149,7 @@ def run_case(case):
     compiled = cute.compile(function, *(from_dlpack(t, assumed_align=16) for t in tensors), stream, *constants, options="--enable-tvm-ffi")
 
     def backend_run():
+        """Reset parameter gradients and invoke the selected backend routine into reference buffers."""
         if backward:
             for name, value in reference.items():
                 if name != "dx":

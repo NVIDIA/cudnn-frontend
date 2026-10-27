@@ -16,6 +16,7 @@ from cudnn.causal_conv1d_se import kernel, backward_kernel, b2b_kernel
 
 
 def main():
+    """Verify additive parameter gradients and the large-batch NCW launch contract."""
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output", type=Path, required=True)
     args = p.parse_args()
@@ -27,6 +28,7 @@ def main():
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     def rand(shape):
+        """Generate seeded BF16 CUDA inputs at the scale used by the contract probes."""
         return (torch.randn(shape, generator=generator) * 0.25).cuda().bfloat16()
 
     for family in ("ncw", "nwh", "b2b"):

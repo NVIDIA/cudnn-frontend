@@ -13,10 +13,12 @@ from summarize_regressions import interval
 
 
 def key(row):
+    """Build a common workload identity for matching original and repeated measurements."""
     return tuple(str(row[name]) for name in ("cc", "family", "direction", "dtype", "B", "D", "L", "K", "Km", "silu"))
 
 
 def write_csv(path, rows):
+    """Write nonempty records as a CSV using the first record field order."""
     if not rows:
         return
     with path.open("w", newline="") as stream:
@@ -26,6 +28,7 @@ def write_csv(path, rows):
 
 
 def main():
+    """Validate complete controlled sweeps and export timing, compilation, and regression summaries."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", action="append", type=Path, required=True)
     parser.add_argument("--source-hashes", type=Path, required=True)

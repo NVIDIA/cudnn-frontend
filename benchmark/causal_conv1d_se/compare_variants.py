@@ -15,10 +15,11 @@ import cudnn
 from cutlass import cute
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
-from tune import measure
+import tune
 
 
 def main():
+    """Validate kernel variants against backend outputs, then measure paired device timings."""
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--case", type=Path, required=True, help="One retained timing JSON")
     p.add_argument("--direction", choices=["forward", "backward"])
@@ -49,6 +50,7 @@ def main():
     generator = torch.Generator().manual_seed(args.seed)
 
     def rand(shape):
+        """Generate seeded inputs on CPU and transfer them to the selected CUDA dtype."""
         return (torch.randn(shape, generator=generator) * (0.25 if b2b else 1.0)).to(device="cuda", dtype=dtype)
 
     x = rand((B, 3 * D, L) if b2b else ((B, L, D) if nwh else (B, D, L)))
@@ -89,6 +91,7 @@ def main():
     backend_fn = getattr(cudnn, binding)
 
     def backend():
+        """Run the backend into reference buffers, resetting gradients unless accumulation is requested."""
         if backward and not args.accumulate:
             for name, value in expected.items():
                 if name in ATOMIC_OUTPUTS:
@@ -132,6 +135,7 @@ def main():
         compile_s = time.perf_counter() - start
 
         def run(compiled=compiled):
+            """Launch the bound candidate variant with shared tensors on the current CUDA stream."""
             compiled(*tensors, cuda.CUstream(torch.cuda.current_stream().cuda_stream))
 
         checks = []
@@ -165,13 +169,14 @@ def main():
     if args.shared_output_timing:
 
         def shared_backend():
+            """Run the backend into candidate output addresses for the allocation control."""
             if backward and not args.accumulate:
                 for name, value in actual.items():
                     if name in ATOMIC_OUTPUTS:
                         value.zero_()
             backend_fn(torch.cuda.current_stream().cuda_stream, *(t.data_ptr() for t in inputs + list(actual.values())), *dimensions)
 
-        output_address_control = measure({"backend_reference_outputs": backend, "backend_candidate_outputs": shared_backend})
+        output_address_control = tune.measure({"backend_reference_outputs": backend, "backend_candidate_outputs": shared_backend})
         backend = shared_backend
         functions["backend"] = shared_backend
     frontend_checks = None
@@ -189,6 +194,7 @@ def main():
             frontend_workspace = torch.empty(frontend.dweight_workspace_numel, device="cuda", dtype=torch.float32) if frontend.dweight_workspace_numel else None
 
             def frontend_run():
+                """Execute the existing frontend implementation into the comparison buffers."""
                 frontend.execute(x, frontend_w, dy, actual["dx"], frontend_dw, bias=bias, db_accum=actual["db"], dweight_workspace=frontend_workspace)
 
             frontend_run()
@@ -208,6 +214,7 @@ def main():
             frontend.compile()
 
             def frontend_run():
+                """Execute the existing frontend implementation into the comparison buffers."""
                 frontend.execute(x, frontend_w, actual["y"], bias_tensor=bias)
 
             frontend_run()
@@ -224,9 +231,9 @@ def main():
             torch.cuda.synchronize()
             torch.cuda.nvtx.range_pop()
         torch.cuda.cudart().cudaProfilerStop()
-    measurements = measure(functions)
-    paired = {label: measure({"backend": backend, label: fn}) for label, fn in functions.items() if label != "backend"}
-    frontend_paired = {label: measure({"frontend": functions["frontend"], label: functions[label]}) for label in records} if args.frontend else None
+    measurements = tune.measure(functions)
+    paired = {label: tune.measure({"backend": backend, label: fn}) for label, fn in functions.items() if label != "backend"}
+    frontend_paired = {label: tune.measure({"frontend": functions["frontend"], label: functions[label]}) for label in records} if args.frontend else None
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         json.dumps(

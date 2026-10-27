@@ -9,11 +9,13 @@ from pathlib import Path
 import pytest
 import torch
 from causal_conv1d.cutedsl.se_bitwise import CASES, MANIFEST, bitwise_difference, parameter_difference, run_case
+from causal_conv1d.cutedsl.test_causal_conv1d_se import _dsl
 
 pytestmark = [pytest.mark.L1, pytest.mark.gpu_exclusive, pytest.mark.xdist_group("causal_se_bitwise")]
 
 
 def _write(name, result):
+    """Persist optional per-case diagnostics with the pinned backend manifest metadata."""
     if destination := os.environ.get("CUDNN_SE_BITWISE_RESULTS"):
         folder = Path(destination)
         folder.mkdir(parents=True, exist_ok=True)
@@ -22,12 +24,14 @@ def _write(name, result):
 
 
 def test_representation_comparison():
+    """Reject signed-zero mismatches and nonfinite values in exact data comparisons."""
     assert not bitwise_difference(torch.tensor([-0.0]), torch.tensor([0.0]))["equal"]
     assert not bitwise_difference(torch.tensor([float("nan")]), torch.tensor([float("nan")]))["equal"]
     assert bitwise_difference(torch.tensor([1.0]), torch.tensor([1.0]))["equal"]
 
 
 def test_parameter_tolerance_contract():
+    """Check both accepted rounding differences and rejected parameter-gradient errors."""
     reference = torch.tensor([0.0, 1.0], dtype=torch.float32)
     assert parameter_difference(reference + 1e-5, reference, 1)["accepted"]
     assert not parameter_difference(reference + 1e-2, reference, 1)["accepted"]
@@ -38,11 +42,8 @@ def test_parameter_tolerance_contract():
 
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case["name"])
 def test_levels_bitwise(case):
-    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
-
-    installed, version = cutedsl_state()
-    if not installed or cutedsl_too_old(version):
-        pytest.skip("CuTe DSL >= 4.7 is required")
+    """Compare each named backend case with exact data bits and bounded atomic-gradient differences."""
+    _dsl()
     cc = torch.cuda.get_device_capability()
     if cc[0] * 100 + cc[1] * 10 < case["min_device_version"]:
         pytest.skip("Below the backend manifest's architecture floor")

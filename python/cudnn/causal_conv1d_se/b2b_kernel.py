@@ -10,6 +10,7 @@ from cutlass.utils import SmemAllocator
 
 @cute.jit
 def _shift_left(current, previous, tap: cutlass.Constexpr, lane):
+    """Advance a causal register window using warp shuffles and the previous tile halo."""
     elements = cute.size(current)
     shifted = cute.arch.shuffle_sync(current[(elements - 1)], (lane + 31) % 32)
     halo = cute.arch.shuffle_sync(previous[(elements - 1) - (tap - 1) % elements], 31 - (tap - 1) // elements)
@@ -22,6 +23,7 @@ def _shift_left(current, previous, tap: cutlass.Constexpr, lane):
 
 @cute.jit
 def _shift_right(current, following, tap: cutlass.Constexpr, lane):
+    """Advance a backward register window using warp shuffles and the following tile halo."""
     elements = cute.size(current)
     shifted = cute.arch.shuffle_sync(current[0], (lane + 1) % 32)
     halo = cute.arch.shuffle_sync(following[(tap - 1) % elements], (tap - 1) // elements)
@@ -34,6 +36,7 @@ def _shift_right(current, following, tap: cutlass.Constexpr, lane):
 
 @cute.jit
 def _warp_sum(value):
+    """Reduce a scalar across all 32 warp lanes with butterfly shuffles."""
     for i in cutlass.range_constexpr(5):
         value += cute.arch.shuffle_sync_bfly(value, 1 << i)
     return value
@@ -41,6 +44,7 @@ def _warp_sum(value):
 
 @cute.kernel
 def b2b_zero_grad(dwp: cute.Tensor, dwm: cute.Tensor, ds: cute.Tensor):
+    """Clear projection, mixer, and skip gradients before nonaccumulating backward runs."""
     i = cutlass.Int64(cute.arch.block_idx()[0]) * 256 + cute.arch.thread_idx()[0]
     fp = cute.make_tensor(dwp.iterator, cute.make_layout((cute.size(dwp),)))
     fm = cute.make_tensor(dwm.iterator, cute.make_layout((cute.size(dwm),)))
@@ -57,6 +61,7 @@ b2b_zero_grad.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 @cute.jit
 def _load_tile(x, batch, channel, tile, lane, compute: cutlass.Constexpr, halo: cutlass.Constexpr = 0, elements: cutlass.Constexpr = 8):
+    """Load a sequence tile or halo into registers, zeroing positions outside the input."""
     halo = 32 * elements if cutlass.const_expr(halo == 0) else halo
     values = cute.make_rmem_tensor((elements,), compute)
     values.fill(0)
@@ -85,6 +90,7 @@ def _load_tile(x, batch, channel, tile, lane, compute: cutlass.Constexpr, halo: 
 
 @cute.jit
 def _tail_load(x, batch, channel, tile, lane, compute: cutlass.Constexpr, scratch: cute.Tensor, halo: cutlass.Constexpr = 0, elements: cutlass.Constexpr = 8):
+    """Coalesce a partial tile through swizzled per-warp scratch and zero invalid positions."""
     halo = 32 * elements if cutlass.const_expr(halo == 0) else halo
     values = cute.make_rmem_tensor((elements,), compute)
     values.fill(0)
@@ -106,6 +112,7 @@ def _tail_load(x, batch, channel, tile, lane, compute: cutlass.Constexpr, scratc
 
 @cute.jit
 def _tail_store(y, batch, channel, start, values, scratch: cute.Tensor):
+    """Store a partial register tile through per-warp scratch, masking sequence bounds."""
     elements = cute.size(values)
     warp = cute.arch.thread_idx()[0] // 32
     lane = cute.arch.thread_idx()[0] % 32
@@ -123,6 +130,7 @@ def _tail_store(y, batch, channel, start, values, scratch: cute.Tensor):
 
 @cute.jit
 def _bwd_load(x, batch, channel, tile, lane, compute: cutlass.Constexpr, scratch, elements: cutlass.Constexpr):
+    """Choose aligned or scratch-backed tile loads for the backward sequence length."""
     if cutlass.const_expr(x.shape[2] % elements != 0):
         return _tail_load(x, batch, channel, tile, lane, compute, scratch, elements=elements)
     else:
@@ -131,6 +139,7 @@ def _bwd_load(x, batch, channel, tile, lane, compute: cutlass.Constexpr, scratch
 
 @cute.jit
 def _bwd_store(y, batch, channel, start, values, scratch):
+    """Choose aligned or scratch-backed tile stores for the backward sequence length."""
     elements = cute.size(values)
     if cutlass.const_expr(y.shape[2] % elements != 0):
         _tail_store(y, batch, channel, start, values, scratch)
@@ -153,6 +162,7 @@ def _bwd_projection(
     elements: cutlass.Constexpr,
     register_weights: cutlass.Constexpr,
 ):
+    """Recompute one projection tile from the input and cached or global filter weights."""
     current = _bwd_load(x, batch, channel, tile, lane, compute, scratch, elements)
     previous = _bwd_load(x, batch, channel, tile - 1, lane, compute, scratch, elements)
     result = cute.make_rmem_tensor((elements,), compute)
@@ -171,6 +181,7 @@ def _bwd_projection(
 
 @cute.jit
 def _store_tile(y, batch, channel, start, values):
+    """Store a register tile with vector copies when aligned, otherwise mask scalar stores."""
     elements = cute.size(values)
     if cutlass.const_expr(y.shape[2] % elements == 0):
         if start < y.shape[2]:
@@ -205,6 +216,7 @@ def _persistent_projection(
     shared_weights: cutlass.Constexpr,
     packed: cutlass.Constexpr,
 ):
+    """Accumulate one projection tile and retain its input as the next causal halo."""
     if cutlass.const_expr(x.shape[2] % elements != 0):
         current = _tail_load(x, batch, 3 * channel + component, tile, lane, compute, scratch, elements=elements)
     else:
@@ -243,6 +255,7 @@ def b2b_fwd_persistent(
     warps: cutlass.Constexpr = 4,
     elements: cutlass.Constexpr = 8,
 ):
+    """Fuse three projections, gating, and mixer convolution with intermediates in registers."""
     from cutlass.cutlass_dsl import CuTeDSL
 
     arch = CuTeDSL._get_dsl().get_arch_enum()
@@ -418,6 +431,7 @@ def _projection_backward(
     weight_channel,
     register_weights: cutlass.Constexpr,
 ):
+    """Write one projection input gradient and accumulate its filter-gradient contributions."""
     elements = cute.size(grad)
     keep = cute.make_rmem_tensor((elements,), compute)
     keep.store(grad.load())
@@ -467,6 +481,7 @@ def _backward_split_halo(
     register_weights: cutlass.Constexpr,
 ):
     # Recompute only the future data-gradient halo; parameter sums belong to core tiles.
+    """Reconstruct future data-gradient halos without accumulating their parameter gradients."""
     following = cute.make_rmem_tensor((elements,), compute)
     following.fill(0)
     if tile + 1 < cute.ceil_div(x.shape[2], 32 * elements):
@@ -732,6 +747,7 @@ def launch_b2b_fwd(
     proj_width: cutlass.Constexpr,
     mixer_width: cutlass.Constexpr,
 ):
+    """Choose warp and sequence tiling, then launch fused projection and mixer forward."""
     from cutlass.cutlass_dsl import CuTeDSL
 
     arch = CuTeDSL._get_dsl().get_arch_enum()
@@ -783,6 +799,7 @@ def launch_b2b_bwd(
     mixer_width: cutlass.Constexpr,
     accumulate: cutlass.Constexpr = False,
 ):
+    """Optionally clear parameter gradients, select a schedule, and launch fused backward."""
     if cutlass.const_expr(not accumulate):
         b2b_zero_grad(dwp, dwm, ds).launch(grid=(cute.ceil_div(max(cute.size(dwp), cute.size(dwm)), 256), 1, 1), block=(256, 1, 1), stream=stream)
     from cutlass.cutlass_dsl import CuTeDSL

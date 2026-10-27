@@ -12,10 +12,11 @@ from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
 from probe import load_kernel, reference
 from backend import Backend
-from tune import measure
+import tune
 
 
 def main():
+    """Validate and time backward schedules using channel-chunked FP64 gradient references."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--shape", default="2,768,4096")
     parser.add_argument("--layout", choices=["ncw", "nwc"], default="nwc")
@@ -38,6 +39,7 @@ def main():
     generator = torch.Generator().manual_seed(20261022)
 
     def rand(shape):
+        """Generate seeded CUDA inputs in the requested dtype."""
         return torch.randn(shape, generator=generator).to(device="cuda", dtype=dtype)
 
     x = rand((B, L, D) if nwh else (B, D, L))
@@ -65,6 +67,7 @@ def main():
     tol = {"bfloat16": (0.03, 0.02), "float16": (0.003, 0.002), "float32": (2e-4, 2e-4), "float64": (1e-10, 1e-10)}[args.dtype]
 
     def check(outputs):
+        """Check all three gradients against FP64 references with compute-dtype parameter tolerances."""
         errors = {}
         for name, out, ref in zip(("dx", "dw", "db"), outputs, refs):
             # Parameter gradients stay FP32: allow summation error proportional to sqrt(B*L).
@@ -78,6 +81,7 @@ def main():
     bo = (torch.empty_like(x), torch.empty_like(w, dtype=compute), torch.empty_like(b, dtype=compute))
 
     def be_run():
+        """Run backend backward into its retained gradient buffers."""
         backend.backward(x, w, b, dy, *bo, channel_last=nwh, silu=not args.identity)
 
     be_run()
@@ -101,6 +105,7 @@ def main():
         )
 
         def run(fn=fn, dz=dz, outputs=outputs):
+            """Launch one compiled backward schedule with its retained scratch and output buffers."""
             fn(x, w, b, dy, dz, *outputs, cuda.CUstream(torch.cuda.current_stream().cuda_stream))
 
         run()
@@ -122,12 +127,13 @@ def main():
         workspace = torch.empty(old.dweight_workspace_numel, device="cuda", dtype=torch.float32) if old.dweight_workspace_numel else None
 
         def fe_run():
+            """Execute the existing frontend backward implementation with preallocated workspace."""
             old.execute(x, ow, dy, outputs[0], outputs[1], bias=b, db_accum=outputs[2], dweight_workspace=workspace)
 
         fe_run()
         errors["frontend"] = check((outputs[0], outputs[1].T, outputs[2]))
         functions["frontend"] = fe_run
-    results = measure(functions, cold=args.cold)
+    results = tune.measure(functions, cold=args.cold)
     result = {
         "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         "gpu": torch.cuda.get_device_name(),

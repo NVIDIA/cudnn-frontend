@@ -10,6 +10,7 @@ import sys
 
 
 def main():
+    """Run the forward workload grid with fixed or exploratory schedules and retain each result."""
     p = argparse.ArgumentParser()
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--backend-library", required=True)

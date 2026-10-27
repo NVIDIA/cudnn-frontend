@@ -12,6 +12,7 @@ import sys
 
 
 def main():
+    """Run isolated boundary and dtype correctness probes with commands, hashes, and failure logs."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--backend-library", required=True)

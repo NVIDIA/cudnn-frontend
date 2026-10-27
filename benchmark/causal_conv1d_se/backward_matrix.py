@@ -10,6 +10,7 @@ import sys
 
 
 def main():
+    """Run the fixed backward and fused workload grid, retaining subprocess logs and timings."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--backend-library", required=True)

@@ -12,6 +12,7 @@ from se_bitwise import run_case
 
 
 def main():
+    """Check candidate/backend equality on the shared frontend BF16 K4 SiLU workload shapes."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
