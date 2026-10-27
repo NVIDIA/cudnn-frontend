@@ -9,7 +9,6 @@ import torch
 
 from frost_test_utils import requires_blackwell, requires_dsl
 from test_utils import torch_fork_set_rng
-import test_sdpa_fwd_fp8_sm100 as shared
 
 pytestmark = [pytest.mark.L0, requires_blackwell, requires_dsl]
 
@@ -29,6 +28,8 @@ pytestmark = [pytest.mark.L0, requires_blackwell, requires_dsl]
 )
 @torch_fork_set_rng(seed=827)
 def test_fp8_d192_head_envelope_masks(d, dv, dtype, mask, pack):
+    import test_sdpa_fwd_fp8_sm100 as shared
+
     result = shared._run(
         2,
         8,

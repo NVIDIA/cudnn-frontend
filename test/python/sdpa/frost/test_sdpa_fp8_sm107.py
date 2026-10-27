@@ -2013,7 +2013,7 @@ def test_sm107_d256_mxfp8_pair_is_bitwise_the_one_cta_build(causal):
 class TestNativeFp8SinkSplit:
     """Keep the native regressions in the explicitly selected SM107 CI entry."""
 
-    from test_sdpa_fp8_sink_split_sm107 import (
+    from sdpa_fp8_sink_split_sm107 import (
         test_native_fp8_sink_split_rebind_replay as _rebind,
         test_native_fp8_sink_split_standalone as _standalone,
         test_native_fp8_sink_keeps_independent_split_domain as _domain,
@@ -2028,7 +2028,7 @@ class TestNativeFp8SinkSplit:
 class TestNativeD192Fp8Pack:
     """Expose packing and decline regressions through the selected CI file."""
 
-    from test_sdpa_fp8_d192_pack_sm107 import (
+    from sdpa_fp8_d192_pack_sm107 import (
         test_native_d192_fp8_pack_rebind_replay as _rebind,
         test_native_d192_pack_retains_d256_padding_decline as _decline,
     )
@@ -2041,8 +2041,8 @@ class TestNativeD192Fp8Pack:
 class TestNativeD192Fp8HeadPadding:
     """Run both dense-envelope suites from the selected SM107 CI entry."""
 
-    from test_sdpa_fp8_d192_padding import test_fp8_d192_padded_heads_rebind_replay as _rebind
-    from test_sdpa_fp8_d192_padding_masks import test_fp8_d192_head_envelope_masks as _masks
+    from sdpa_fp8_d192_padding import test_fp8_d192_padded_heads_rebind_replay as _rebind
+    from sdpa_fp8_d192_padding_masks import test_fp8_d192_head_envelope_masks as _masks
 
     test_rebind_and_replay = staticmethod(_rebind)
     test_masks = staticmethod(_masks)

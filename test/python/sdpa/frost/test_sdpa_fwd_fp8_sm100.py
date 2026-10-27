@@ -27,7 +27,16 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import _SM, assert_no_new_spills, make_dense_stats, requires_blackwell, requires_dsl, run_sass_probe, sass_probe_source
+from frost_test_utils import (
+    _SM,
+    assert_no_new_spills,
+    make_dense_stats,
+    requires_blackwell,
+    requires_dsl,
+    requires_pre_rubin_blackwell,
+    run_sass_probe,
+    sass_probe_source,
+)
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
@@ -2530,3 +2539,15 @@ def test_fp8_negative_descale_product(scale_sign, d_qk, d_v, mask):
     assert not flipped.output.isnan().any()
     assert torch.equal(flipped.output, plain.output)
     assert flipped.amax == plain.amax
+
+
+@pytest.mark.L0
+@requires_pre_rubin_blackwell
+class TestD192Fp8HeadPadding:
+    """Collect the shared head-padding checks once on the SM100/SM103 line."""
+
+    from sdpa_fp8_d192_padding import test_fp8_d192_padded_heads_rebind_replay as _rebind
+    from sdpa_fp8_d192_padding_masks import test_fp8_d192_head_envelope_masks as _masks
+
+    test_rebind_and_replay = staticmethod(_rebind)
+    test_masks = staticmethod(_masks)
