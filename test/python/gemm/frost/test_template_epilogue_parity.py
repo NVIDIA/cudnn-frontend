@@ -605,7 +605,11 @@ def test_mixed_cga_uses_host_constant_masks_and_shifts_at_every_use_site():
             kernel=kernel,
             parents=parents,
             target="n_rank",
-            preferred="cta_rank_in_cluster >> _preferred_cluster_m_shift",
+            preferred=(
+                "(cta_rank_in_cluster >> _preferred_cluster_m_shift) & (cluster_shape_mnk[1] - 1)"
+                if path.name in ("sm100_matmul.py", "sm100_block_scale_matmul.py")
+                else "cta_rank_in_cluster >> _preferred_cluster_m_shift"
+            ),
             fallback="cta_rank_in_cluster >> _fallback_cluster_m_shift",
             site="N rank",
             offenders=offenders,

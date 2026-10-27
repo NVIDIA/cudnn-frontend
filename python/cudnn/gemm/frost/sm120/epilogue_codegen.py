@@ -1997,7 +1997,7 @@ def generate(
     output_elem_bytes: int = 2,
     tma_slots: "frozenset[int]" = frozenset(),
     packed_lanes: bool = False,
-    split_k_slices: int = 1,
+    workspace_split_k: bool = False,
     drain_hooks: bool = False,
     bounded_rows: bool = False,
     lane_run_tile: "tuple[int, int] | None" = None,
@@ -2232,7 +2232,7 @@ def generate(
         # (sm100 #1090): fold reductions at the alignment so a chunk straddling a
         # group boundary still contributes its in-group columns.
         red_chunk = gcd(red_chunk, chain.moe.offset_multiple, chain.matmul.N)
-    use_partials = drain_hooks and split_k_slices == 1
+    use_partials = drain_hooks and not workspace_split_k
     part_slot = {k: None for k in range(len(chain.reductions))}
     if use_partials:
         for red_idx, red in enumerate(chain.reductions):
@@ -2273,7 +2273,7 @@ def generate(
     aux_views = "\n".join(aux_lines) if aux_lines else "pass"
 
     # Split-K partial store handling
-    if split_k_slices > 1:
+    if workspace_split_k:
         if tma_slots:
             body_lines = ["vec_out = vec_f32", tma_out_ready_marker(0)]
         else:

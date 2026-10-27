@@ -837,6 +837,40 @@ proof covers every slot load. Numeric/racecheck success alone is not that proof.
 `test_moe_block_scale_mailbox_acknowledgements_order_prior_reads` in the existing
 `gemm/frost/test_template_epilogue_parity.py` pins this until such a proof exists.
 
+Small-M block-scale planning uses `GemmFacts.shapes_fixed` to distinguish fixed
+graphs from override-enabled graphs. Only fixed shapes select token widths
+8/16/32 after swapAB; overrides keep width 64 and at most 48 weight tiles.
+Dynamic shapes bypass strategy selection, and explicit knob replay bypasses
+automatic choices. Keep this bounded rule in shared `gemm/frost/planning.py`,
+probe both its proposed plan and any retained baseline, and leave fitted cost
+coefficients unchanged. Automatic candidates still use workspace reduction.
+The B200-targeted rule leads on SM100; other GPUs retain the existing first
+choice and include the new geometry as an autotuning candidate. A four-shape
+SM107 comparison found both wins and regressions from unconditional preference.
+
+`TileConfig.cluster_k_reduce` explicitly selects the split-K reduction mode.
+False (including old knob records) uses workspace plus a separate reducer;
+True puts all slices in one cluster and reports zero partial workspace.
+The K cluster dimension is derived from this flag and `split_k_slices`, never
+an independent tuning axis. Reject unsupported templates, unlaunchable clusters
+and insufficient SMEM; never change a requested mode during build or execute.
+Automatic planning retains False. Keep the flag in canonical names and public
+knob round-trips. Epilogue codegen takes `workspace_split_k` directly; do not
+rewrite the config's split count or wrap template regions through source regexes.
+For the SM100 dense and block-scale cluster implementations, every
+epilogue lane, including masked output lanes, stages its fragment before an
+async-proxy fence and CTA rendezvous. Elected bulk copies register their byte
+counts at the root before issue. The root waits for transaction completion,
+reads local receive slots and gathers all readers before a release/acquire
+acknowledgement at cluster scope. Budget S fragment slots (S-1 receive plus one
+local source), not S full accumulator tiles. Keep the cluster exit
+rendezvous: `test_cluster_splitk_persistent_mailbox_reuse` exposed both slot
+reuse hazards with an elected-only handoff and premature DSMEM lifetime under
+racecheck. Gate TMA compute and stores together in one SSA region; separate
+guards leave the store's vectors undefined. For mixed-width block-scale inputs,
+CTA-K elements use the wider operand's bit width after either orientation;
+`test_cluster_splitk_mixed_width_k_tiles_after_swap` covers shallow legal K.
+
 ## The public function contract
 
 Public functions (`cudnn.ops.<op>_<direction>(...)` / `cudnn.ops.<op>_<direction>_jax(...)`, see `docs/fe-oss-apis/api_conventions.md`) allocate outputs and return them in a stable, documented order. PyTorch functions return a **`TupleDict`** (dict that also unpacks as a tuple). JAX functions return a plain tuple or dict: `jax.jit` rejects `TupleDict`, which is not a registered pytree.

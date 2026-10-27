@@ -893,7 +893,6 @@ def _splitk_reduce_snippets(chain: FusionChain, config: TileConfig) -> EpilogueS
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
         tma_slots=frozenset(),
         packed_lanes=False,
-        split_k_slices=1,
         # The reducer's per-chunk epilogue function has no row guard or
         # converged post-drain point to host the hooks.
         drain_hooks=False,
@@ -3916,6 +3915,12 @@ def _graph_dynamic_shapes(graph) -> bool:
     return bool(getattr(graph, "_cpp_graph_kwargs", {}).get("is_dynamic_shape_enabled", False))
 
 
+def _graph_shapes_fixed(graph) -> bool:
+    """Whether planning may specialize geometry to the declared token count."""
+    options = getattr(graph, "_cpp_graph_kwargs", {})
+    return not any(options.get(key, False) for key in ("is_dynamic_shape_enabled", "is_override_shape_enabled"))
+
+
 def _baseline_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
     if knobs is not None:
         try:
@@ -4394,24 +4399,24 @@ def _dense_plain_config(chain: FusionChain, config: TileConfig) -> TileConfig:
     return pick if pick is not None else config
 
 
-def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
+def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None, shapes_fixed: bool = False) -> TileConfig:
     """Choose one strategy, or replay the exact supplied knobs."""
     config = _baseline_config(chain, dynamic_shapes=dynamic_shapes, knobs=knobs)
     if knobs is not None or dynamic_shapes:
         return config
     from ..planning import select_strategy
 
-    return select_strategy(chain, config, probe=probe_chain)
+    return select_strategy(chain, config, probe=probe_chain, shapes_fixed=shapes_fixed)
 
 
-def plan_configs(chain: FusionChain, *, dynamic_shapes: bool = False) -> list[TileConfig]:
+def plan_configs(chain: FusionChain, *, dynamic_shapes: bool = False, shapes_fixed: bool = False) -> list[TileConfig]:
     """Choose a bounded list with the single-plan recommendation first."""
     config = _baseline_config(chain, dynamic_shapes=dynamic_shapes)
     if dynamic_shapes:
         return [config]
     from ..planning import select_strategies
 
-    return select_strategies(chain, config, probe=probe_chain)
+    return select_strategies(chain, config, probe=probe_chain, shapes_fixed=shapes_fixed)
 
 
 def _precheck_plain(
@@ -4761,7 +4766,7 @@ def probe_supported(graph: cudnn.pygraph, config: "TileConfig | None" = None) ->
     probe_cutedsl()
     chain, _binding = _analyze_graph(graph)
     if config is None:
-        config = plan_config(chain, dynamic_shapes=_graph_dynamic_shapes(graph))
+        config = plan_config(chain, dynamic_shapes=_graph_dynamic_shapes(graph), shapes_fixed=_graph_shapes_fixed(graph))
     probe_chain(chain, config)
 
 
@@ -4812,6 +4817,12 @@ def _splitk_reject_reason(chain: FusionChain, config: TileConfig) -> "str | None
     if config.split_k_slices == 1:
         return None
     reasons = []
+    if config.cluster_k_reduce:
+        from ..kernel_registry import select_template
+
+        template = select_template(chain, config)
+        if not template.supports_cluster_k_reduce:
+            reasons.append(f"template {template.file} does not support cluster_k_reduce")
     if chain.has_moe:
         reasons.append("MoE grouped matmul")
     if chain.is_multi_gemm:
@@ -4926,7 +4937,7 @@ def jit_from_cudnn_graph(
         # For splitK, only the partials buffer (slot 0) uses the TMA
         tma_slots=frozenset({0}) if (splitk and use_tma) else frozenset(i for i, m in enumerate(store_modes) if m == "tma"),
         packed_lanes=_epi_packed_lanes(config),
-        split_k_slices=config.split_k_slices,
+        workspace_split_k=config.workspace_split_k,
         drain_hooks=True,
         bounded_rows=_row_per_lane_bounded_rows(chain, config),
         lane_run_tile=_lane_run_tile(chain, config, select_template(chain, config)),
@@ -5761,7 +5772,7 @@ def _jit_block_scale(
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
         tma_slots=frozenset({0}) if (splitk and use_tma) else frozenset(i for i, m in enumerate(store_modes) if m == "tma"),
         packed_lanes=_epi_packed_lanes(config),
-        split_k_slices=config.split_k_slices,
+        workspace_split_k=config.workspace_split_k,
         drain_hooks=True,
         lane_run_tile=_lane_run_tile(chain, config, select_template(chain, config)),
     )

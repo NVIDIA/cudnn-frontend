@@ -1,13 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Tile config catalog — PURE GEOMETRY for the fused GEMM kernels.
+"""Tile geometry and explicit execution strategies for the fused GEMM kernels.
 
-A ``TileConfig`` describes ONLY dtype-independent tile geometry (cta tile,
-MMA-inst tile, cluster shape, pipeline). It does NOT carry ``cta_group`` /
-``ab_stages`` — those are execution strategy chosen by the
-kernel template. K is stored in *bytes*, so one config covers every dtype.
-Name: ``CONFIG_<pipeline>_<CTA_M>x<CTA_N>x<K_BYTES>_<MMA_M>x<MMA_N>x<MMA_K_BYTES>_cluster<cgrp_m>x<cgrp_n>[_swapAB]``.
+A ``TileConfig`` describes dtype-independent tile geometry and the split-K,
+reduction and A/B orientation choices. Resource-derived staging counts are
+owned by the compiler. K is stored in *bytes*, so one config covers every dtype.
+Names end in ``_cluster<cgrp_m>x<cgrp_n>``, the family-specific axes, and
+optional ``_splitK<S>``, ``_clusterKReduce`` and ``_swapAB`` suffixes.
 A warp-scoped family (sm120) additionally ALWAYS names its compute-warp grid
 via a ``_warpsMxN`` suffix — no grid is implied by an unsuffixed spelling.
 See ``kernel_registry`` for the template registry and the support funnel.
@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import functools
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import ClassVar
 
 from cudnn.frost.occupancy import MAX_CLUSTER_SIZE
@@ -97,7 +97,7 @@ def smem_ab_stages(per_stage_bytes: int, *, smem_fixed_reserve: int, extra_smem_
 
 @dataclass(frozen=True)
 class TileConfig:
-    """One pure-geometry tile config. Dtype- AND execution-independent.
+    """One dtype-independent tile geometry and explicit execution strategy.
 
     Four nested tiles, outermost first -- CGA (a cluster of CTAs), CTA, warp,
     MMA instruction -- plus the K-split and logical A/B-orientation axes. Each
@@ -137,7 +137,6 @@ class TileConfig:
 
     cga_size_m: int
     cga_size_n: int
-    cga_size_k: int
 
     warps_per_cta: int
 
@@ -145,11 +144,17 @@ class TileConfig:
 
     swap_ab: bool
 
+    cluster_k_reduce: bool = field(default=False, kw_only=True)
+
     def __post_init__(self) -> None:
         name = self.name
 
         if not isinstance(self.swap_ab, bool):
             raise ValueError(f"TileConfig {name!r}: swap_ab must be bool; got {self.swap_ab!r}")
+        if not isinstance(self.cluster_k_reduce, bool):
+            raise ValueError(f"TileConfig {name!r}: cluster_k_reduce must be bool; got {self.cluster_k_reduce!r}")
+        if self.cluster_k_reduce and self.split_k_slices == 1:
+            raise NotImplementedError(f"TileConfig {name!r}: cluster_k_reduce needs at least two split-K slices")
 
         for label, v in (
             ("cta_tile_m", self.cta_tile_m),
@@ -196,15 +201,9 @@ class TileConfig:
             if got != want:
                 raise NotImplementedError(f"TileConfig {name!r}: mma_size_{axis}={got} but the tiles say {want}")
 
-        # K is never split across CTAs of a cluster -- an axis reserved for later.
-        if self.cga_size_k != 1:
-            raise NotImplementedError(f"TileConfig {name!r}: cga_size_k={self.cga_size_k} — cross-CTA K reduction is not implemented")
-
         cga = self.cga_size_m * self.cga_size_n * self.cga_size_k
         if cga > MAX_CLUSTER_SIZE:
-            raise NotImplementedError(
-                f"TileConfig {name!r}: cluster {self.cga_size_m}x{self.cga_size_n} is {cga} CTAs — the architecture CGA limit is {MAX_CLUSTER_SIZE}"
-            )
+            raise NotImplementedError(f"TileConfig {name!r}: cluster {self.cluster_shape} is {cga} CTAs — the architecture CGA limit is {MAX_CLUSTER_SIZE}")
 
     # -- derived -------------------------------------------------------------
 
@@ -249,12 +248,17 @@ class TileConfig:
         cannot fill: the smallest this geometry is legal in. An MMA that spans
         several CTAs must keep them inside one cluster, so it can never fall
         back below its own span."""
-        return (self.ctas_per_mma, 1, 1)
+        return (self.ctas_per_mma, 1, self.cga_size_k)
 
     @property
     def geometry_name(self) -> str:
         """Canonical geometry token used in the TileConfig name."""
-        return self._geometry_base + (f"_splitK{self.split_k_slices}" if self.split_k_slices > 1 else "") + ("_swapAB" if self.swap_ab else "")
+        return (
+            self._geometry_base
+            + (f"_splitK{self.split_k_slices}" if self.split_k_slices > 1 else "")
+            + ("_clusterKReduce" if self.cluster_k_reduce else "")
+            + ("_swapAB" if self.swap_ab else "")
+        )
 
     @property
     def _geometry_base(self) -> str:
@@ -285,9 +289,19 @@ class TileConfig:
         return (self.cga_size_m, self.cga_size_n)
 
     @property
+    def cga_size_k(self) -> int:
+        """All K slices occupy one cluster, or each cluster owns one slice."""
+        return self.split_k_slices if self.cluster_k_reduce else 1
+
+    @property
+    def workspace_split_k(self) -> bool:
+        """Write partial planes for a separate reduction kernel."""
+        return self.split_k_slices > 1 and not self.cluster_k_reduce
+
+    @property
     def cga_size_mnk(self) -> tuple[int, int, int]:
         """cga_size as a cluster_shape-style triple."""
-        return (self.cga_size_m, self.cga_size_n, 1)
+        return (self.cga_size_m, self.cga_size_n, self.cga_size_k)
 
     @property
     def cga_tile_mn(self) -> tuple[int, int]:
@@ -314,7 +328,7 @@ class TileConfig:
     def cga_tile_mnk(self, elem_bytes: int) -> tuple[int, int, int]:
         """Cluster aggregate tile in elements (M, N, K)."""
         m, n = self.cga_tile_mn
-        return (m, n, self.cta_tile_k(elem_bytes))
+        return (m, n, self.cta_tile_k(elem_bytes) * self.cga_size_k)
 
     def cta_smem_tile_mnk(self, elem_bytes: int) -> tuple[int, int, int]:
         """Per-CTA SMEM tile in elements."""
@@ -607,7 +621,6 @@ def _geom_sm100(
         mma_size_k=cta_tile_k_bytes // mma_tile_k_bytes,
         cga_size_m=cga_size_m,
         cga_size_n=cga_size_n,
-        cga_size_k=1,
         warps_per_cta=_TCGEN05_WARPS_PER_CTA,
         split_k_slices=1,
         swap_ab=False,
@@ -634,7 +647,6 @@ def _geom_sm103(cta_tile_m: int, cta_tile_n: int, cga_size_m: int, cga_size_n: i
         mma_size_k=_SM103_CTA_TILE_K_BYTES // _SM103_MMA_TILE_K_BYTES,
         cga_size_m=cga_size_m,
         cga_size_n=cga_size_n,
-        cga_size_k=1,
         warps_per_cta=_TCGEN05_WARPS_PER_CTA,
         split_k_slices=1,
         swap_ab=False,
@@ -671,7 +683,6 @@ def _geom_sm120(
         mma_size_k=cta_tile_k_bytes // mma_tile_k_bytes,
         cga_size_m=cga_size_m,
         cga_size_n=cga_size_n,
-        cga_size_k=1,
         warps_per_cta=ConfigSm120.DEFAULT_WARPS_PER_CTA,
         split_k_slices=1,
         swap_ab=False,
@@ -769,7 +780,8 @@ _CONFIG_NAME_RE = re.compile(
     r"(?P<cta_m>\d+)x(?P<cta_n>\d+)x(?P<k_bytes>\d+)_"
     r"(?P<mma_m>\d+)x(?P<mma_n>\d+)x(?P<mma_k_bytes>\d+)_"
     r"cluster(?P<cga_m>\d+)x(?P<cga_n>\d+)(?:_(?P<cta_group>\d+)ctamma)?"
-    r"(?:_warps(?P<warps_m>\d+)x(?P<warps_n>\d+))?(?:_splitK(?P<split_k>\d+))?(?P<swap_ab>_swapAB)?$"
+    r"(?:_warps(?P<warps_m>\d+)x(?P<warps_n>\d+))?(?:_splitK(?P<split_k>\d+))?"
+    r"(?P<cluster_k_reduce>_clusterKReduce)?(?P<swap_ab>_swapAB)?$"
 )
 
 
@@ -807,11 +819,11 @@ def _synthesize_config(name: str) -> TileConfig:
         mma_size_k=int(m.group("k_bytes")) // int(m.group("mma_k_bytes")),
         cga_size_m=int(m.group("cga_m")),
         cga_size_n=int(m.group("cga_n")),
-        cga_size_k=1,
         # Not spelled by the name; a family with its own block size declares it.
         warps_per_cta=getattr(cls, "DEFAULT_WARPS_PER_CTA", _TCGEN05_WARPS_PER_CTA),
         split_k_slices=int(m.group("split_k") or 1),
         swap_ab=bool(m.group("swap_ab")),
+        cluster_k_reduce=bool(m.group("cluster_k_reduce")),
         # Only where the family HAS the axis; a name for one that does not
         # carries no such token either.
         **({"cta_group": int(m.group("cta_group") or 1)} if "cta_group" in cls.__dataclass_fields__ else {}),
@@ -1172,10 +1184,10 @@ def as_pipeline(cfg: TileConfig, pipeline: str) -> TileConfig:
         mma_size_k=cfg.cta_tile_k_bytes // mma_kb,
         cga_size_m=cga_m,
         cga_size_n=cga_n,
-        cga_size_k=cfg.cga_size_k,
         warps_per_cta=getattr(cls, "DEFAULT_WARPS_PER_CTA", cfg.warps_per_cta),
         split_k_slices=cfg.split_k_slices,
         swap_ab=cfg.swap_ab,
+        cluster_k_reduce=cfg.cluster_k_reduce,
         **({"cta_group": getattr(cfg, "cta_group", 1)} if "cta_group" in cls.__dataclass_fields__ else {}),
     )
 

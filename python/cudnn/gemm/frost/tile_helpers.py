@@ -19,6 +19,7 @@ from __future__ import annotations
 import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
+import cutlass._mlir_helpers.vector as _cvec
 from cutlass._mlir.dialects import llvm
 
 
@@ -57,6 +58,56 @@ def epi_subtile_spans(cols, epi_n=32):
 
 
 TENSOR_MAP_QWORDS = 16
+
+
+@cute.jit
+def cluster_split_k_reduce(partial, mailbox, ready, free, iteration, k_rank, root_rank, plane_ctas: cutlass.Constexpr, slices: cutlass.Constexpr):
+    """Bulk-copy one fragment per peer to reusable slots on its K-rank-zero CTA.
+
+    All epilogue lanes participate before output masking. A producer publishes
+    its CTA-local staging before the elected bulk copy; transaction completion
+    makes the root's local reads safe. Root lanes rendezvous before the release
+    acknowledgement, so neither receive nor source slots can be reused early.
+    """
+    tid = cute.arch.thread_idx()[0]
+    warp = cute.arch.warp_idx()
+    elected = nvvm.elect_sync()
+    values = partial.to_elements()
+    chunk_elems = 128 * len(values)
+    phase = iteration & 1
+    result = partial
+    if k_rank != 0:
+        staging = mailbox.subview((slices - 1) * chunk_elems)
+        for q in cutlass.range_constexpr(len(values) // 4):
+            staging.data_ptr(tid * len(values) + q * 4).store(partial[q * 4 : q * 4 + 4], alignment=16)
+        cute.arch.fence_proxy("async.shared", space="cta")
+        nvvm.barrier_cta_sync(barrier_id=4, thread_count=128)
+        if warp == 0:
+            remote_ready = nvvm.mapa(ready, root_rank)
+            if elected:
+                nvvm.mbarrier_arrive_expect_tx(remote_ready, chunk_elems * 4, scope=nvvm.MemScope.CLUSTER)
+            if elected:
+                nvvm.cp_async_bulk_shared_cluster_shared_cta(
+                    nvvm.mapa(mailbox.subview((k_rank - 1) * chunk_elems), root_rank), staging, remote_ready, chunk_elems * 4
+                )
+        while not nvvm.mbarrier_try_wait_parity(free, phase, time_limit=10_000_000, scope=nvvm.MBarrierScope.CLUSTER):
+            pass
+    else:
+        while not nvvm.mbarrier_try_wait_parity(ready, phase, time_limit=10_000_000, scope=nvvm.MBarrierScope.CLUSTER):
+            pass
+        summed = list(values)
+        for peer in cutlass.range_constexpr(1, slices):
+            for q in cutlass.range_constexpr(len(values) // 4):
+                incoming = mailbox.load((peer - 1) * chunk_elems + tid * len(values) + q * 4, vector_size=4, alignment=16)
+                for e in cutlass.range_constexpr(4):
+                    summed[q * 4 + e] = summed[q * 4 + e] + incoming[e]
+        result = _cvec.Vector.from_elements(tuple(summed), cutlass.Float32)
+        nvvm.barrier_cta_sync(barrier_id=4, thread_count=128)
+        if warp == 0:
+            for peer in cutlass.range_constexpr(1, slices):
+                if elected:
+                    nvvm.mbarrier_arrive(nvvm.mapa(free, root_rank + peer * plane_ctas), scope=nvvm.MemScope.CLUSTER)
+    return result
 
 
 @cute.jit

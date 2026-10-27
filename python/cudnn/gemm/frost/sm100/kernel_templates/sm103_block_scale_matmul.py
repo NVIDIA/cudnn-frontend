@@ -36,6 +36,7 @@ from typing import Callable
 
 import cutlass.experimental.primitives as nvvm
 from cudnn.gemm.frost.tile_helpers import (
+    cluster_split_k_reduce,
     epi_subtile_spans as _epi_subtile_spans,
     l2_swizzle_tile as _l2_swizzle_tile,
     tcgen05_alloc as _tcgen05_alloc,
@@ -1450,6 +1451,11 @@ def _kernel(
         is_valid = cutlass.Int32(1)
         clc_full_phase_epi = cutlass.Int32(0)
 
+        write_epilogue = True
+        if cutlass.const_expr(cluster_k_reduce):
+            write_epilogue = k_rank == 0
+            cluster_reduce_iter = cutlass.Int32(0)
+
         # @@EPILOGUE_SETUP:BEGIN@@
         row_id_with_warp_offset = base_row_id + warp_idx * 32
 
@@ -1511,6 +1517,21 @@ def _kernel(
                         c_rmem_vecs.append(_cv)
                     c_rmem_vec = c_rmem_vecs[0]
 
+                    if cutlass.const_expr(cluster_k_reduce):
+                        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                        c_rmem_vec = cluster_split_k_reduce(
+                            c_rmem_vec,
+                            cluster_mailbox,
+                            cluster_ready_mbar_ptr,
+                            cluster_free_mbar_ptr,
+                            cluster_reduce_iter,
+                            k_rank,
+                            k_root_rank,
+                            cluster_shape_mnk[0] * cluster_shape_mnk[1],
+                            split_k_slices,
+                        )
+                        cluster_reduce_iter += 1
+
                     if cutlass.const_expr(not use_acc_overlap):
                         if cutlass.const_expr(mi == mma_size_m - 1 and subtile_idx == subtile_cnt - 1):
                             nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
@@ -1541,17 +1562,18 @@ def _kernel(
                     col = coord_n_c + subtile_col_offset
 
                     # @@TMA_STORE_ONLY:BEGIN@@
-                    vec_f32 = c_rmem_vec
-                    col_j = col
-                    linear_idx = tile_l * out_stride_l_0 + row * out_stride_m_0 + col_j * out_stride_n_0
+                    if write_epilogue:
+                        vec_f32 = c_rmem_vec
+                        col_j = col
+                        linear_idx = tile_l * out_stride_l_0 + row * out_stride_m_0 + col_j * out_stride_n_0
 
-                    # @@INJECT_EPILOGUE@@
+                        # @@INJECT_EPILOGUE@@
 
-                    # @@INJECT_TMA_STORE_SEQUENCE@@
+                        # @@INJECT_TMA_STORE_SEQUENCE@@
                     # @@TMA_STORE_ONLY:END@@
 
                     # @@STG_ONLY:BEGIN@@
-                    if row_active and row < M:
+                    if write_epilogue and row_active and row < M:
                         for j in cutlass.range_constexpr(subtile_w // vsize):
                             col_j = col + j * vsize
                             if col_j + vsize <= N:

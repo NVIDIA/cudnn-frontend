@@ -491,26 +491,46 @@ def test_both_compilers_delegate_joint_selection_but_replay_and_dynamic_bypass_i
 
     compiler = importlib.import_module(f"cudnn.gemm.frost.{family}.compiler")
     calls = []
+    shape_facts = []
 
-    def select(chain, baseline, *, probe):
+    def select(chain, baseline, *, probe, shapes_fixed):
         assert probe == compiler.probe_chain
         calls.append(baseline)
+        shape_facts.append(shapes_fixed)
         return replace(baseline, split_k_slices=3)
 
     monkeypatch.setattr(planning, "select_strategy", select)
     chain = _plain_strategy_chain()
-    assert compiler.plan_config(chain).split_k_slices == 3
+    assert compiler.plan_config(chain, shapes_fixed=True).split_k_slices == 3
     assert len(calls) == 1
-    assert compiler.plan_config(chain, dynamic_shapes=True).split_k_slices == 1
+    assert compiler.plan_config(chain, dynamic_shapes=True, shapes_fixed=True).split_k_slices == 1
     config = replace(calls[0], split_k_slices=7, swap_ab=True)
     assert compiler.plan_config(None, knobs=GemmKnobs.from_config(config)) == config
     assert len(calls) == 1
-    monkeypatch.setattr(planning, "select_strategies", lambda chain, baseline, *, probe: [select(chain, baseline, probe=probe), baseline])
-    assert compiler.plan_configs(chain)[0].split_k_slices == 3
+    monkeypatch.setattr(
+        planning,
+        "select_strategies",
+        lambda chain, baseline, *, probe, shapes_fixed: [select(chain, baseline, probe=probe, shapes_fixed=shapes_fixed), baseline],
+    )
+    assert compiler.plan_configs(chain, shapes_fixed=True)[0].split_k_slices == 3
     assert len(calls) == 2
-    dynamic = compiler.plan_configs(chain, dynamic_shapes=True)
+    dynamic = compiler.plan_configs(chain, dynamic_shapes=True, shapes_fixed=True)
     assert len(dynamic) == 1 and dynamic[0].split_k_slices == 1
     assert len(calls) == 2
+    assert shape_facts == [True, True]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("family", ["sm100", "sm120"])
+@pytest.mark.parametrize("dynamic,override", [(False, False), (False, True), (True, False), (True, True)])
+def test_planner_graph_shape_facts(family, dynamic, override):
+    import importlib
+    from types import SimpleNamespace
+
+    compiler = importlib.import_module(f"cudnn.gemm.frost.{family}.compiler")
+    graph = SimpleNamespace(_cpp_graph_kwargs={"is_dynamic_shape_enabled": dynamic, "is_override_shape_enabled": override})
+    assert compiler._graph_dynamic_shapes(graph) == dynamic
+    assert compiler._graph_shapes_fixed(graph) == (not dynamic and not override)
 
 
 @pytest.mark.L0
@@ -695,6 +715,117 @@ def _block_scaled_chain(*, M, N=5120, K=2048, batch=1, quantized=True, moe_group
     output = OutputSpec(source_ref=source, dtype="fp4_e2m1", quant_idx=0) if quantized else OutputSpec(source_ref=source, dtype="bf16")
     moe = None if moe_groups is None else MoeSpec(num_experts=moe_groups, num_groups=moe_groups)
     return FusionChain(matmul=matmul, block_scale=block_scale, moe=moe, quants=quants, output_specs=[output])
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("tokens,width", [(1, 8), (8, 8), (9, 16), (16, 16), (17, 32), (32, 32)])
+@pytest.mark.parametrize("shapes_fixed", [False, True])
+def test_small_m_block_scale_plan_uses_token_width_and_one_wave(tokens, width, shapes_fixed):
+    from cudnn.gemm.frost import planning
+    from cudnn.gemm.frost.knobs import GemmKnobs
+
+    chain = _block_scaled_chain(M=tokens, N=5120, K=8192, quantized=False)
+    baseline = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma")
+    device = _strategy_device()
+    configs = planning.select_strategies(chain, baseline, device=device, shapes_fixed=shapes_fixed, probe=lambda chain, config: None)
+    chosen = configs[0]
+    assert chosen.swap_ab and not chosen.cluster_k_reduce
+    assert chosen.cta_tile_m == 128 and chosen.cta_tile_n == (width if shapes_fixed else 64)
+    assert chosen.cta_group == 1 and chosen.cluster_shape == (1, 1, 1)
+    assert chosen.split_k_slices == 2  # 40 weight tiles * 2 = 80; * 4 exceeds 148 SMs.
+    assert configs == [chosen, baseline]
+    assert planning.select_strategy(chain, baseline, device=device, shapes_fixed=shapes_fixed, probe=lambda chain, config: None) == chosen
+    assert GemmKnobs.from_public(GemmKnobs.from_config(chosen).to_public()).to_config() == chosen
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("shapes_fixed,weight_n,expected", [(False, 6144, 64), (False, 6145, None), (True, 14336, 8)])
+def test_small_m_override_rule_bounds_weight_tiles(shapes_fixed, weight_n, expected):
+    from cudnn.gemm.frost import planning
+
+    chain = _block_scaled_chain(M=8, N=weight_n, quantized=False)
+    baseline = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma")
+    selected = planning.select_strategy(chain, baseline, device=_strategy_device(), shapes_fixed=shapes_fixed, probe=lambda chain, config: None)
+    assert selected == baseline if expected is None else selected.swap_ab and selected.cta_tile_n == expected
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("shapes_fixed", [False, True])
+def test_small_m_other_gpus_retain_incumbent_and_offer_candidate(shapes_fixed):
+    from cudnn.gemm.frost import planning
+
+    chain = _block_scaled_chain(M=8, N=4096, K=4096, quantized=False)
+    baseline = by_name("CONFIG_sm100_128x128x128_128x128x64_cluster2x4_2ctamma")
+    device = _strategy_device(107, "NVIDIA Graphics Device", 208)
+    configs = planning.select_strategies(chain, baseline, device=device, shapes_fixed=shapes_fixed, probe=lambda chain, config: None)
+    assert len(configs) == 2 and configs[0] == baseline
+    assert configs[1].swap_ab and configs[1].cta_tile_n == (8 if shapes_fixed else 64)
+    assert planning.select_strategy(chain, baseline, device=device, shapes_fixed=shapes_fixed, probe=lambda chain, config: None) == baseline
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("K,slices", [(256, 1), (512, 2), (768, 2), (1024, 4), (8192, 16)])
+def test_small_m_split_k_respects_k_tiles(K, slices):
+    from cudnn.gemm.frost import planning
+
+    chain = _block_scaled_chain(M=8, N=128, K=K, quantized=False)
+    baseline = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma")
+    selected = planning.select_strategy(chain, baseline, device=_strategy_device(), shapes_fixed=True, probe=lambda chain, config: None)
+    assert selected.split_k_slices == slices and not selected.cluster_k_reduce
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("reject", ["candidate", "baseline", "both", "bug"])
+def test_small_m_plan_support_probe_and_fallback(reject):
+    from cudnn.gemm.frost import planning
+
+    chain = _block_scaled_chain(M=8, quantized=False)
+    baseline = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma")
+
+    def probe(original, config):
+        assert original is chain
+        if reject == "bug":
+            raise RuntimeError("probe bug")
+        if reject == "both" or (config.swap_ab and reject == "candidate") or (config == baseline and reject == "baseline"):
+            raise NotImplementedError("test rejection")
+
+    if reject == "bug":
+        with pytest.raises(RuntimeError, match="probe bug"):
+            planning.select_strategies(chain, baseline, device=_strategy_device(), shapes_fixed=True, probe=probe)
+    else:
+        selected = planning.select_strategies(chain, baseline, device=_strategy_device(), shapes_fixed=True, probe=probe)
+        if reject in ("candidate", "both"):
+            assert selected == [baseline]
+        else:
+            assert len(selected) == 1 and selected[0].swap_ab
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("case", ["plain", "large_m", "batch", "moe", "quant", "fake_sf", "compact_sf", "n_major_b", "sm103", "sm120"])
+def test_small_m_rule_preserves_other_paths(case):
+    from cudnn.gemm.frost import planning
+
+    chain = _block_scaled_chain(M=8, quantized=False)
+    baseline = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma")
+    if case == "plain":
+        chain = replace(chain, block_scale=None)
+    elif case == "large_m":
+        chain = replace(chain, matmul=replace(chain.matmul, M=33))
+    elif case == "batch":
+        chain = _block_scaled_chain(M=8, batch=2, quantized=False)
+    elif case == "moe":
+        chain = _block_scaled_chain(M=8, moe_groups=2, quantized=False)
+    elif case == "quant":
+        chain = _block_scaled_chain(M=8)
+    elif case in ("fake_sf", "compact_sf"):
+        chain = replace(chain, block_scale=replace(chain.block_scale, **({"fake_dequant_a": True} if case == "fake_sf" else {"sfa_reorder": None})))
+    elif case == "n_major_b":
+        chain = replace(chain, matmul=replace(chain.matmul, b_major="n"))
+    elif case == "sm103":
+        baseline = by_name("CONFIG_sm103_128x128x384_128x128x48_cluster1x1_1ctamma")
+    else:
+        baseline = as_pipeline(baseline, case)
+    assert planning.select_strategies(chain, baseline, device=_strategy_device(), shapes_fixed=True, probe=lambda chain, config: None) == [baseline]
 
 
 @pytest.mark.L0

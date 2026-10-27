@@ -80,6 +80,77 @@ def test_split_k_and_swap_ab_round_trip():
     assert GemmKnobs.from_public(public).to_config() == cfg
 
 
+def test_cluster_k_reduce_config_and_knobs():
+    from dataclasses import replace
+
+    workspace = replace(DEFAULT_CONFIG, split_k_slices=4)
+    cluster = replace(workspace, cluster_k_reduce=True)
+    assert workspace.cluster_shape == (2, 1, 1) and workspace.workspace_split_k
+    assert cluster.cluster_shape == (2, 1, 4) and not cluster.workspace_split_k
+    assert cluster.cga_tile_mnk(2)[2] == 4 * cluster.cta_tile_k(2)
+    assert workspace.name != cluster.name
+    assert by_name(cluster.name) == cluster
+    knobs = GemmKnobs.from_config(cluster)
+    public = knobs.to_public()
+    assert public[cudnn.knob_type.CLUSTER_K_REDUCE] == 1
+    assert GemmKnobs.from_public(public).to_config() == cluster
+    legacy = GemmKnobs.from_config(workspace).to_public()
+    assert legacy.pop(cudnn.knob_type.CLUSTER_K_REDUCE) == 0
+    assert GemmKnobs.from_public(legacy).to_config() == workspace
+    with pytest.raises(ValueError, match="CLUSTER_K_REDUCE must be 0 or 1"):
+        GemmKnobs.from_public({**public, cudnn.knob_type.CLUSTER_K_REDUCE: 2})
+
+
+def test_cluster_k_reduce_config_rejects_invalid_combinations():
+    from dataclasses import replace
+
+    with pytest.raises(ValueError, match="cluster_k_reduce must be bool"):
+        replace(DEFAULT_CONFIG, cluster_k_reduce=1)
+    with pytest.raises(NotImplementedError, match="at least two"):
+        replace(DEFAULT_CONFIG, cluster_k_reduce=True)
+    with pytest.raises(NotImplementedError, match="CGA limit"):
+        replace(DEFAULT_CONFIG, split_k_slices=16, cluster_k_reduce=True)
+
+
+@requires_sm100
+def test_cluster_k_reduce_declines_sm120_before_compiling(monkeypatch):
+    from dataclasses import replace
+    from cudnn.gemm.frost.sm120 import compiler
+    from cudnn.gemm.frost.tile_config import as_pipeline
+
+    graph, _ = _build_matmul_bias_relu()
+    cfg = replace(as_pipeline(DEFAULT_CONFIG, "sm120"), split_k_slices=4, cluster_k_reduce=True)
+
+    def unexpected_compile(*args, **kwargs):
+        pytest.fail("an unsupported cluster reduction must be declined before compilation")
+
+    monkeypatch.setattr(compiler, "_import_kernel", unexpected_compile)
+    with pytest.raises(NotImplementedError, match="cluster_k_reduce"):
+        compiler.jit_from_cudnn_graph(graph, cfg)
+
+
+@requires_sm100
+@pytest.mark.parametrize("slices", [1, 4])
+def test_sm120_workspace_split_k_executes_on_sm100_family(slices):
+    from dataclasses import replace
+    from cudnn.gemm.frost.sm120 import compiler
+    from cudnn.gemm.frost.tile_config import as_pipeline
+    from cudnn.frost.workspace import Workspace
+
+    graph, (A, B, bias, Y) = _build_matmul_bias_relu()
+    cfg = replace(as_pipeline(DEFAULT_CONFIG, "sm120"), split_k_slices=slices)
+    plan = compiler.jit_from_cudnn_graph(graph, cfg)
+    assert not plan.config.cluster_k_reduce
+    assert plan.workspace_bytes == (0 if slices == 1 else slices * M * N * 4)
+    scratch = torch.empty(max(plan.workspace_bytes, 1), dtype=torch.uint8, device="cuda")
+    workspace = Workspace(scratch, plan.workspace_bytes, "sm120 workspace split-K") if plan.workspace_bytes else None
+    a, b, bias_t, reference = _operands()
+    out = torch.full_like(reference, float("nan"))
+    plan({A: a, B: b, bias: bias_t, Y: out}, workspace=workspace)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, reference, atol=0, rtol=0)
+
+
 def test_from_public_rejects_foreign_or_incomplete_records():
     kt = cudnn.knob_type
     good = GemmKnobs.from_config(DEFAULT_CONFIG).to_public()
@@ -131,6 +202,7 @@ def test_calibrated_heuristic_lists_eight_unique_configs(monkeypatch):
     facts = GemmFacts(chain, dynamic_shapes=False)
     plans = recommend("A", facts, {ENGINE: 42})
     assert len(plans) == 8
+    assert all(not p.knobs.cluster_k_reduce for p in plans)
     assert len({p.knobs for p in plans}) == 8
     assert all(p.engine_id == 42 for p in plans)
     assert plans[0].knobs.to_config() == compiler.plan_config(chain)
@@ -302,6 +374,42 @@ def test_frost_gemm_knobs_replay_and_run():
     g2.execute_plan_at_index({A: a, B: b, bias: bias_t, Y: y}, ws, index=last)
     torch.cuda.synchronize()
     torch.testing.assert_close(y, ref, atol=2e-2, rtol=2e-2)
+
+
+@requires_sm100
+@pytest.mark.parametrize("cluster_reduce", [False, True])
+def test_cluster_splitk_public_replay_workspace(cluster_reduce):
+    from dataclasses import replace
+
+    g, _ = _build_matmul_bias_relu()
+    g.create_execution_plans([cudnn.heur_mode.A])
+    engine_id, _ = g.get_engine_and_knobs_at_index(_frost_indices(g)[0])
+    geometry = "128x128x128_128x128x32_cluster1x1_1ctamma"
+    cfg = replace(by_name("CONFIG_sm100_" + geometry), split_k_slices=4, cluster_k_reduce=cluster_reduce)
+    knobs = GemmKnobs.from_config(cfg).to_public()
+    replay, (A, B, bias, Y) = _build_matmul_bias_relu()
+    replay.create_execution_plan(engine_id, knobs)
+    index = replay.get_execution_plan_count() - 1
+    replay.select_plan(index)
+    replay.check_support()
+    replay.build_plans()
+    assert replay.get_engine_and_knobs_at_index(index) == (engine_id, knobs)
+    expected_workspace = 0 if cluster_reduce else 4 * M * N * 4
+    assert replay.get_workspace_size() == expected_workspace
+    workspace = torch.empty(max(expected_workspace, 1), dtype=torch.uint8, device="cuda")
+    a, b, bias_t, _ = _operands()
+    y = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
+    for _ in range(2):
+        reference = torch.relu(torch.einsum("bmk,bnk->bmn", a.float(), b.float()) + bias_t.float()).to(torch.bfloat16)
+        y.fill_(float("nan"))
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            replay.execute({A: a, B: b, bias: bias_t, Y: y}, workspace)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        torch.cuda.synchronize()
+        torch.testing.assert_close(y, reference, rtol=0, atol=0)
+        a.mul_(2)
 
 
 @requires_sm100
