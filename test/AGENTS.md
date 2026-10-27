@@ -1019,6 +1019,12 @@ Q. An empty Q still clears the current Amax_O word. Frame recorders must rebuild
 entries. `test_sdpa_native_thd_fp8_binding.py` checks these contracts against the
 actual host signature. When patching a newly allocated pybind tuple, move its
 unique ownership; an additional owning cast makes PyTuple_SetItem reject it.
+When an ordered graph test substitutes the independent Python binding oracle,
+also clear the plan's retained native ordered entry. Replacing `spec.native`
+alone does not change that entry and would silently compare native execution
+against itself. The measured-empty-workspace test exercises both transports.
+Keep launches and recorder consumption such as `frames.pop()` outside assertions;
+assert on their saved results so optimized Python cannot remove test state changes.
 
 MXFP8 split partials follow their own host ABI: SM100 D512 and SM107 MXFP8
 write half partials, even though other FP8 flavors on those architectures use
