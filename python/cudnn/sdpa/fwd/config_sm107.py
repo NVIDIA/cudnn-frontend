@@ -298,7 +298,7 @@ SM107_FP8_THD_SHAPES = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)
 # Bodies with FP32 partial stores: shared by factory, admission and prepared workspace.
 SM107_FP8_SPLIT_SHAPES = frozenset({(64, 64), (128, 128), (192, 128)})
 # Packing and splitting are separate domains; both graph and adapter read this one.
-SM107_FP8_PACK_GQA_SHAPES = frozenset({(64, 64), (128, 128), (192, 128)})
+SM107_FP8_PACK_GQA_SHAPES = frozenset({(64, 64), (128, 128), (192, 128), (256, 256)})
 
 # f16/bf16 flavor names whose kernel body HAS been ported to the FROST
 # setup-kernel contract (the 14-arg build_thd_meta_o_descs_kernel + the 4B+4
@@ -2446,6 +2446,11 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     """The cc 10.7 d256 config (per-tensor FP8 or MXFP8): tile geometry, ring depths, warp layout and the SMEM / descriptor-window
     checks for the one-CTA and the 2-CTA-pair builds (``params.cta_mma``); raises with the failing tally on an impossible layout."""
     _validate_params(flavor, params)
+    if params.pack_gqa and not mxfp8:
+        if params.thd_varlen:
+            raise ValueError(f"{flavor}: per-tensor FP8 PackGQA is dense-only")
+        if 128 % params.qh_per_kh:
+            raise ValueError(f"{flavor}: PackGQA requires a whole head group dividing TILE_M=128; got {params.qh_per_kh}")
     cta_mma = params.cta_mma
     dtype_o = resolve_dtype_o(params)
     b, b_o = bpe(params.dtype_qkv), bpe(dtype_o)

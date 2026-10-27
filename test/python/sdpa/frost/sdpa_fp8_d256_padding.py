@@ -39,16 +39,16 @@ def _clone_with_slack(value, fill):
 
 def _check(bufs, *, page=0, causal=False, bottom_right=False, window=None):
     from sdpa.fp8_ref import compute_ref
-    from test_sdpa_fwd_paged_sm100 import _check_fp8_o, _gather_pages_fp8
+    import test_sdpa_fwd_paged_sm100 as paged
 
     q, k, v = (bufs[n] for n in ("q", "k", "v"))
     b, h, sq, d = q.shape
-    padding = None
+    padding = (bufs["seq_q"].view(b), bufs["seq_kv"].view(b)) if "seq_q" in bufs else None
     if page:
         lens = bufs["seq_kv"].view(b)
         for name in ("k", "v"):
             table = bufs[name + "_table"].view(b, -1)
-            gathered = _gather_pages_fp8(bufs[name], table, lens.tolist(), True, page, table.shape[1] * page)
+            gathered = paged._gather_pages_fp8(bufs[name], table, lens.tolist(), True, page, table.shape[1] * page)
             if name == "k":
                 k = gathered
             else:
@@ -80,7 +80,7 @@ def _check(bufs, *, page=0, causal=False, bottom_right=False, window=None):
     )
     ref = ref.transpose(1, 2)
     in_key = "e4m3" if q.dtype == torch.float8_e4m3fn else "e5m2"
-    _check_fp8_o(bufs["o"], ref * bufs["scale_o"], bufs["o"].dtype, in_key)
+    paged._check_fp8_o(bufs["o"], ref * bufs["scale_o"], bufs["o"].dtype, in_key)
     # Match the existing prepared-dense Stats bound; paged cases retain their
     # existing absolute bound.
     torch.testing.assert_close(bufs["lse"].reshape(b, h, sq), stats.reshape(b, h, sq), atol=0.01, rtol=0 if page else 0.01)

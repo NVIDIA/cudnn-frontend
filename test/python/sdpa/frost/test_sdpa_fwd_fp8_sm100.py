@@ -48,11 +48,9 @@ pytestmark = [requires_blackwell, requires_dsl]
 # under test.  Both lines carry all four native flavors -- d128, d192xd128,
 # d256 and d512 (api_dsl._SM107_FP8_KERNEL_FILES mirrors _SM100_FP8_KERNEL_FILES)
 # -- so every flavor test below runs on both. Rubin D64/D128/D192x128 now
-# serve PackGQA; the D256 packing cases retain their declared decline, pinned
-# by test_sm107_fp8_pack_gqa_serves_native_split_flavors.
+# serve PackGQA, as does the native D256 pipeline. D512 remains unpacked.
 # Per-tensor FP8 Stats strides are runtime Int64 slots on all four flavors.
 _D128_ARCH = "sm107" if _SM == 107 else "sm100"
-_skip_pack_gqa_wide_on_rubin = pytest.mark.skipif(_SM == 107, reason="the Rubin per-tensor FP8 D256 row does not serve PackGQA")
 # Five e5m2 ids read `max|O-ref|` 0.0404-0.0423 against the shared 4e-2 e5m2 bound
 # (`_half_atol`, tightened by #971) on the 204-SM Rubin part -- a DATASET edge
 # (torch's Philox lays draws out by SM count, so the cc 10.7 tensors are not the
@@ -80,11 +78,11 @@ def _known_e5m2_edge_scope(request):
 
 
 _D128_D256 = [pytest.param(128, id="d128"), pytest.param(256, id="d256")]
-_D128_D256_PACK_GQA = [pytest.param(128, id="d128"), pytest.param(256, id="d256", marks=_skip_pack_gqa_wide_on_rubin)]
+_D128_D256_PACK_GQA = [pytest.param(128, id="d128"), pytest.param(256, id="d256")]
 # test_fp8_pack_gqa_e5m2 only: its d128 combo is one of the five e5m2 edges.
 _D128_D256_PACK_GQA_E5M2 = [
     pytest.param(128, id="d128", marks=_known_e5m2_edge_on_rubin),
-    pytest.param(256, id="d256", marks=_skip_pack_gqa_wide_on_rubin),
+    pytest.param(256, id="d256"),
 ]
 
 _FP8 = {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}

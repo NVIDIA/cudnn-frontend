@@ -2833,8 +2833,8 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             split_kv_supported=True,
             split_d_shapes=(SM107_FP8_SPLIT_SHAPES if rubin_row else frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})),
             pack_gqas=frozenset({False, True}),
-            # Native SM107 per-tensor FP8 D64/D128/D192x128 pack whole GQA
-            # groups. D256/D512 retain their independent packing decline.
+            # Native SM107 per-tensor FP8 D64/D128/D192x128/D256 pack whole
+            # GQA groups. D512 retains its independent packing decline.
             pack_gqa_d_shapes=(SM107_FP8_PACK_GQA_SHAPES if rubin_row else None),
             # Fused epilogue gate on the Rubin d256 FP8 kernel (E4M3 / E5M2 in,
             # any out dtype): G is staged in BF16 (kernel GATE_STORAGE_DTYPE), so
