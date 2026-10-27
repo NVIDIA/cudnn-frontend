@@ -298,7 +298,7 @@ SM107_FP8_THD_SHAPES = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)
 # Bodies with FP32 partial stores: shared by factory, admission and prepared workspace.
 SM107_FP8_SPLIT_SHAPES = frozenset({(64, 64), (128, 128), (192, 128), (256, 256)})
 # Packing and splitting are separate domains; both graph and adapter read this one.
-SM107_FP8_PACK_GQA_SHAPES = frozenset({(64, 64), (128, 128), (192, 128), (256, 256)})
+SM107_FP8_PACK_GQA_SHAPES = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
 
 
 def supports_fp8_d256_padded_split(d_shape, *, device_cc, pertensor, thd, paged):
@@ -2680,6 +2680,14 @@ _D512_READ_TILE_ARRIVERS = (
 
 def _make_cfg_d512_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     _validate_params(flavor, params)
+    if not mxfp8 and params.dtype_qkv in (_DTYPE_E4M3, _DTYPE_E5M2):
+        if params.sched_policy not in (None, SCHED_NATURAL, SCHED_LPT):
+            raise ValueError(f"{flavor}: per-tensor FP8 supports NATURAL/LPT schedulers only")
+        if params.pack_gqa:
+            if params.thd_varlen:
+                raise ValueError(f"{flavor}: per-tensor FP8 PackGQA is dense-only")
+            if 128 % params.qh_per_kh:
+                raise ValueError(f"{flavor}: PackGQA requires a whole head group dividing TILE_M=128; got {params.qh_per_kh}")
     if params.cta_mma != _D512_CTA_MMA:
         raise ValueError(f"{flavor}: the role-split pipeline is cga4x1 / CTA_MMA=2 only (got cta_mma={params.cta_mma})")
     dtype_o = resolve_dtype_o(params)

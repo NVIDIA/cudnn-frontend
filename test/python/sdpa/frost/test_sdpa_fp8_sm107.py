@@ -147,13 +147,11 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     # (192, 128) since 2026-09-11, LPT + LPT_L2 at (192, 128) and (128, 128)
     # since 2026-09-14 (LPT_L2's decode needs qh_per_kh / seqlen_kv at every
     # call site, which the d128 and d192x128 kernels thread and the d256 /
-    # d512 kernels do not) -- each validated bit-identical to NATURAL; d512
-    # stays out (its role-split kernel
-    # still lacks the #1001 `lpt_q_tiles_in_cga_units` argument and writes
-    # nothing under LPT, which is what the old "causal d512 FP8 under LPT
-    # returns NaN" report was).
+    # d512 kernels do not). D512 now counts LPT Q tiles in CGA units;
+    # its two role pairs share rows, and both packed/unpacked plans use it.
     assert sm107.sched_policies == frozenset({SCHED_NATURAL})
     assert dict(sm107.sched_policies_by_d_shape) == {
+        (512, 512): frozenset({SCHED_NATURAL, SCHED_LPT}),
         (64, 64): frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
         (256, 256): frozenset({SCHED_NATURAL, SCHED_LPT}),
         (192, 128): frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
@@ -2091,3 +2089,20 @@ class TestNativeD256Fp8Split:
     test_omitted_scales = staticmethod(_scales)
 
     test_scalar_kv_tail = staticmethod(_tail)
+
+
+@requires_rubin
+class TestNativeD512Fp8Pack:
+    """Collect native role-split D512 packing and scheduling on the target architecture."""
+
+    from sdpa_fp8_d512_pack_sm107 import (
+        test_native_d512_pack_rebind_replay as _dense,
+        test_native_d512_pack_half_adapter as _half,
+        test_native_d512_unpacked_lpt as _lpt,
+        test_native_d512_pack_declines as _declines,
+    )
+
+    test_rebind_and_replay = staticmethod(_dense)
+    test_half_adapter = staticmethod(_half)
+    test_unpacked_lpt = staticmethod(_lpt)
+    test_declines = staticmethod(_declines)

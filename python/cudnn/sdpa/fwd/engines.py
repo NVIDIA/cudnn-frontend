@@ -2819,13 +2819,11 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # rule picks LPT at few waves (+16 % at S=4K) and NATURAL at many
             # (LPT -6.5 / -13 / -7.9 % at S=8K/16K/32K).  Every policy in the
             # domain stays an autotune runner.
-            # NOT claimed: (512, 512) -- the cga4x1 role-split kernel
-            # still calls make_sdpa_helpers(CFG) WITHOUT lpt_q_tiles_in_cga_units
-            # (the #1001 bug, left on the d512 line), so under LPT it writes
-            # NOTHING (sentinel on 100 % of cells; the old "NaN" report was that
-            # unwritten output being read).
+            # D512 counts LPT Q tiles in CGA units: its two role pairs share
+            # the same query rows. Packed and unpacked plans use that decode.
             sched_policies_by_d_shape=(
                 (
+                    ((512, 512), frozenset({SCHED_NATURAL, SCHED_LPT})),
                     ((256, 256), frozenset({SCHED_NATURAL, SCHED_LPT})),
                     ((192, 128), frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})),
                     ((128, 128), frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})),
@@ -2861,8 +2859,8 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             split_kv_supported=True,
             split_d_shapes=(SM107_FP8_SPLIT_SHAPES if rubin_row else frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})),
             pack_gqas=frozenset({False, True}),
-            # Native SM107 per-tensor FP8 D64/D128/D192x128/D256 pack whole
-            # GQA groups. D512 retains its independent packing decline.
+            # Native SM107 per-tensor FP8 flavors pack whole GQA groups,
+            # including the D512 role-split pipeline.
             pack_gqa_d_shapes=(SM107_FP8_PACK_GQA_SHAPES if rubin_row else None),
             # Fused epilogue gate on the Rubin d256 FP8 kernel (E4M3 / E5M2 in,
             # any out dtype): G is staged in BF16 (kernel GATE_STORAGE_DTYPE), so
