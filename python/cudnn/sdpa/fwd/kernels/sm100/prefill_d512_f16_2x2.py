@@ -324,7 +324,7 @@ _thd_tma_offsets = _sdpa_h.thd_tma_offsets
 
 from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_descs_kernel as _build_thd_meta_o_descs_kernel, TENSOR_MAP_QWORDS, THD_SETUP_THREADS
 from cudnn.sdpa.fwd.kernels.thd_origins import build_thd_origins, origin_tensors, origin_tma_slice
-from cudnn.sdpa.fwd.kernels._thd_split_host import host_independent_kv as _host_thd_split, compile_host as _compile_thd_split_host
+from cudnn.sdpa.fwd.kernels._thd_split_host import compile_host as _compile_thd_split_host
 from cudnn.frost.tile_dsl.thd import exit_if_dead_thd_cluster, thd_port_origin
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
@@ -876,12 +876,12 @@ def _tmaldg_warp_group(
     o_empty_for_v_state = PipelineState.start(phase=1)
 
     if cutlass.const_expr(thd_origins is not None):
-        tma_q = lambda d, h, r, b: origin_tma_slice(o_desc_words, 1, n_batch, b, d, h, r)
+        tma_q = lambda d, h, r, b: origin_tma_slice(o_desc_words, 1, n_batch, b, d, h, r)  # noqa: E731
     else:
         tma_q = GmemTileTma(tma_q_desc)
     if cutlass.const_expr(thd_origins is not None and not PAGED_KV):
-        tma_k = lambda d, h, r, b: origin_tma_slice(o_desc_words, 2, n_batch, b, d, h, r)
-        tma_v = lambda d, h, r, b: origin_tma_slice(o_desc_words, 3, n_batch, b, d, h, r)
+        tma_k = lambda d, h, r, b: origin_tma_slice(o_desc_words, 2, n_batch, b, d, h, r)  # noqa: E731
+        tma_v = lambda d, h, r, b: origin_tma_slice(o_desc_words, 3, n_batch, b, d, h, r)  # noqa: E731
     elif cutlass.const_expr(CFG.THD_VARLEN and not PAGED_KV):
         # THD: K/V ride the setup kernel's packed-total-clamped runtime descriptors (o_desc_words
         # slots n_batch+1 / n_batch+2) so the last sequence's tile tail lands as exact zeros.
