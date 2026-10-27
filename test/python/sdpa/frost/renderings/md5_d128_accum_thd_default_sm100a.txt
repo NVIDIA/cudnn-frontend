@@ -1,0 +1,6 @@
+# sm_100a PTX md5 of the d128 accumulation THD hosts (prepared_d128_thd_host / prepared_d128_grouped_thd_host.compile_host)
+# rendered from the tree BEFORE the diag_delete_dq_reduce_add lever landed (develop fc472d3d; host trace-compile, no device;
+# the probe geometry is in test_sdpa_bwd_d128_diag_dq_reduce_add_sm100.py).  Re-render deliberately on a protocol change.
+dsl=nvidia-cutlass-dsl 4.8.1
+d128_accum sm_100a thd rc=0 ptx_md5=0b0bbfa815cfcc9c1cc7a759cc9b43bd
+d128_accum sm_100a grouped_thd rc=0 ptx_md5=a8149f92270ebd4fef3caf5b05668256

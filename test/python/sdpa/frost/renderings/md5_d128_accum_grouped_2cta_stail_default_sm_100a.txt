@@ -1,0 +1,9 @@
+# sm_100a PTX md5 of the d128 grouped THD cta_group::2 chain's ARM (ii) rendering (prepared_d128_grouped_2cta_host.compile_host with
+# tmem_map="s_tail" and every other typed field unset: the second pair body bprop_d128_accum_grouped_2cta_stail_f16.py, order fa4; host
+# trace-compile, no device; the probe geometry B, H, HK = 2, 8, 2 is in test_sdpa_bwd_d128_2cta_stail_sm100.py).  Rendered 2026-10-27 by
+# code-writer-dsl (lane A step 5) at the tree that added the body.  The task driver's 4 / 32 / 4 geometry renders 4b3d0bbb91d93d1939d57a246030eeed
+# for the same body (kernel header section 11).  The first body's record (md5_d128_accum_grouped_2cta_default_sm_100a.txt, 28b0eba0) is
+# UNCHANGED by the arm-(ii) chain: tmem_map unset renders the first body byte-identically.  Re-render deliberately on a protocol change
+# and say so here.
+dsl=nvidia-cutlass-dsl 4.8.1
+d128_accum_grouped_2cta_stail sm_100a default rc=0 ptx_md5=645f8a240225a22501df58215ffe6937

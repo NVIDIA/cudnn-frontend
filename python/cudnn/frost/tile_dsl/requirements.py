@@ -20,6 +20,9 @@ from ..buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 #: The PART floor of the gather4 TMA mode: ``cp.async.bulk.tensor ... .tile::gather4`` exists from ``sm_100a`` (cc 10.0) on.  A
 #: pre-Blackwell part passes the DSL version gate and would fail only at kernel compilation, so the host gate refuses it by name.
 TMA_GATHER4_MIN_CC = (10, 0)
+#: The PART floor of the vector global reduce ``red.global.add.v4.f32`` (``tile_dsl.atomic``): the ``.v2 / .v4`` forms exist from
+#: sm_90 (PTX ISA 8.1).  Every current FROST consumer is an sm_100 body, so the gate is a backstop that refuses a Hopper-minus part by name.
+RED_GLOBAL_V4_F32_MIN_CC = (9, 0)
 
 
 def requirement_error(what, device_cc=None, *, min_cc=None):
@@ -46,3 +49,9 @@ def tma_gather4_requirement_error(device_cc=None):
     module on a host path -- ``tma.py`` re-exports the name for callers that already hold the DSL, but importing ``tma``
     below the floor is the failure this gate exists to pre-empt."""
     return requirement_error("tile_dsl.tma.tma_gather4", device_cc, min_cc=TMA_GATHER4_MIN_CC)
+
+
+def red_global_v4_requirement_error(device_cc=None):
+    """The host half of the Rule-7 gate of :func:`tile_dsl.atomic.red_global_add_v4_f32` (plus the part floor ``RED_GLOBAL_V4_F32_MIN_CC``):
+    import it from THIS module on a host path (``atomic.py`` re-exports the name for callers that already hold the DSL)."""
+    return requirement_error("tile_dsl.atomic.red_global_add_v4_f32", device_cc, min_cc=RED_GLOBAL_V4_F32_MIN_CC)

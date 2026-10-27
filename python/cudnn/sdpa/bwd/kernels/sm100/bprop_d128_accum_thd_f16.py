@@ -6,6 +6,27 @@ Sequence-local tensor maps clip every input and output tail, including caller
 ports with independent ragged origins. The dense five-product pipeline and all
 33 mbarriers retain their lane counts. Natural CLC visits a declared envelope;
 invalid owners take the complete zero-trip protocol without touching a map.
+
+DIAGNOSTIC lever ``diag_delete_dq_reduce_add`` (``Constexpr[bool]``, default False = the shipped kernel, rendered
+PTX-identical; pinned by ``test_sdpa_bwd_d128_diag_dq_reduce_add_sm100.py``): the store warp skips the four
+``tma_reduce_add_subtile`` issues of the fp32 dQ slices per q tile and nothing else -- every ``dq_full`` wait,
+``tma_store_commit``, ``tma_store_wait`` and ``dq_empty`` arrive stays, so the barrier table (arrive / wait sites and
+their lane sums) is unchanged.  Armed, the OUTPUT IS WRONG BY DESIGN (dQ stays zero): a timing-only ceiling for the
+L2 reduce-add term, never selected by a graph, never shipped armed.  Threaded from the adapter record
+(``SdpaBwdDslSm100D128.diag_delete_dq_reduce_add``) through ``compile_host`` -> ``host`` -> the kernel.
+
+Op-level field ``dkv_accum = "fp32_reduce"`` (``Constexpr[bool]`` ``dkv_fp32`` on ``_epilogue_loop`` / ``_store_loop``, default False = the
+shipped kernel, rendered PTX-identical; set by the GROUPED THD kernel only, threaded from ``SdpaBwdDslSm100D128.dkv_accum`` through the grouped
+chain; the MHA kernel never sets it): the epilogue stages the fp32 dV then dK accumulator tiles as the four [M x DQ_BOX] fp32 SW128 slices of
+the ALIAS slab (the dQ staging image, ``_native_epilogue_fp32``) instead of the bf16 pack, and the store warp reduce-adds each slice
+(``tma_reduce_add_subtile`` add.f32, the dQ slices' primitive) into the per-KV-head fp32 workspace maps carried by the MAP_DV / MAP_DK slots
+(kv head = head // ratio).  Barrier rows touched: dv_full / dk_full keep their lanes and sites (the published bytes are fp32 slices); dq_empty
+gains ONE release per item on both sides -- the store warp arrives dq_empty[i] after the dV slice i source read (``tma_store_wait(3 - i)``, P7)
+and the epilogue's dK round waits dq_empty[i] at that phase before overwriting slice i (the dK staging's WAR edge), advancing its empty_state
+once more per item; the bootstrap, the terminal observation, dvk_empty and every other row are unchanged.  A zero-trip owner stages zeros and
+issues no reduce-add (the workspace is zero-filled); every commit / wait / arrive is kept.  A ROUNDING CHANGE at the chain level (fp32 group
+accumulation in hardware order replaces 8 bf16 partials summed in a fixed order), an op attribute: the test module
+``test_sdpa_bwd_d128_dkv_accum_sm100.py`` pins the default rendering and the fp32 census.
 """
 
 from typing import NamedTuple
@@ -345,6 +366,34 @@ def _native_epilogue(slab, tmem_base, bars, row, live, empty_phase, dtype: cutla
 
 
 @cute.jit
+def _native_epilogue_fp32(slab, tmem_base, bars, row, live, empty_phase, dk: cutlass.Constexpr[bool]):
+    """dkv_accum = fp32_reduce (the grouped THD kernel only): the lane's kv row of the fp32 dV (TMEM plane CFG.DV_COL) or dK (CFG.DK_COL)
+    accumulator as the FOUR [M x DQ_BOX] fp32 SW128 slices of the ALIAS slab (the dQ staging image, `_store_dq_slice`), published through
+    dv_full / dk_full for the store warp's reduce-adds.  The dV round's WAR (the last dQ slice reads) is the caller's terminal dq_empty waits;
+    the dK round waits dq_empty[i] (the store warp's credit after its dV slice i source read) before overwriting slice i -- the SAME ring
+    object, one more completion per item on both sides.  A zero-trip owner stages zeros (its reduce-adds are skipped by the store warp)."""
+    # RESOURCE-NOTE: ALIAS 64 KiB = one fp32 tensor (4 dQ-slice boxes): dV round, dK round; dq_empty x4
+    plane = CFG.DK_COL if cutlass.const_expr(dk) else CFG.DV_COL
+    lo_vals = cutlass.Vector.from_elements(tuple(cutlass.Float32(0.0) for _ in range(CFG.D_HALF)), cutlass.Float32)
+    hi_vals = cutlass.Vector.from_elements(tuple(cutlass.Float32(0.0) for _ in range(CFG.D_HALF)), cutlass.Float32)
+    if live:
+        lo_vals = _tmem_load(tmem_base + plane, CFG.D_HALF)
+        hi_vals = _tmem_load(tmem_base + plane + CFG.D_HALF, CFG.D_HALF)
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+    vals = cutlass.Vector.from_elements(tuple(lo_vals[i] for i in range(CFG.D_HALF)) + tuple(hi_vals[i] for i in range(CFG.D_HALF)), cutlass.Float32)
+    for i in cutlass.range_constexpr(CFG.DKV_ACC_SLICES):
+        if cutlass.const_expr(dk):
+            _wait(bars.dq_empty[i], empty_phase)  # WAR: the store warp read the dV slice out of these bytes (its post-read credit)
+        _store_dq_slice(slab, row, vals, i)
+    nvvm.fence_proxy("async.shared", space="cta")
+    nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
+    if cutlass.const_expr(dk):
+        bars.dk_full.arrive()
+    else:
+        bars.dv_full.arrive()
+
+
+@cute.jit
 def _epilogue_loop(
     slab,
     bars,
@@ -357,6 +406,7 @@ def _epilogue_loop(
     n_batch,
     causal: cutlass.Constexpr[bool],
     dtype: cutlass.Constexpr,
+    dkv_fp32: cutlass.Constexpr[bool] = False,
 ):
     nvvm.setmaxregister(CFG.EPILOGUE_REGS, nvvm.SetMaxRegisterAction.INCREASE)
     row = cute.arch.thread_idx()[0] % CFG.M
@@ -405,8 +455,15 @@ def _epilogue_loop(
         # wait before an arrival in its next phase.
         for i in cutlass.range_constexpr(4):
             _wait(bars.dq_empty[i], empty_state.phase)
-        _native_epilogue(slab, tmem_base, bars, row, lo < hi, empty_state.phase, dtype, False)
-        _native_epilogue(slab, tmem_base, bars, row, lo < hi, empty_state.phase, dtype, True)
+        if cutlass.const_expr(dkv_fp32):
+            # dkv_accum = fp32_reduce: dV then dK as fp32 slices over the ALIAS slab -- two ring rounds per item (the store warp credits dq_empty
+            # after the dV slices' source reads; the dK round waits them at the advanced phase)
+            _native_epilogue_fp32(slab, tmem_base, bars, row, lo < hi, empty_state.phase, False)
+            empty_state = advance(empty_state, 1)
+            _native_epilogue_fp32(slab, tmem_base, bars, row, lo < hi, empty_state.phase, True)
+        else:
+            _native_epilogue(slab, tmem_base, bars, row, lo < hi, empty_state.phase, dtype, False)
+            _native_epilogue(slab, tmem_base, bars, row, lo < hi, empty_state.phase, dtype, True)
         empty_state = advance(empty_state, 1)
         block, head, batch, valid, sched_state = _next_tile(sched, bars, sched_state)
 
@@ -581,6 +638,9 @@ def _store_loop(
     n_batch,
     causal: cutlass.Constexpr[bool],
     dtype: cutlass.Constexpr,
+    diag_delete_dq_reduce_add: cutlass.Constexpr[bool] = False,
+    dkv_fp32: cutlass.Constexpr[bool] = False,
+    ratio: cutlass.Constexpr[int] = 1,
 ):
     nvvm.setmaxregister(CFG.SERVICE_REGS, nvvm.SetMaxRegisterAction.DECREASE)
     dq_state = PipelineState.start()
@@ -598,24 +658,62 @@ def _store_loop(
         for qtile in cutlass.range(lo, hi, 1, unroll=1):
             for i in cutlass.range_constexpr(4):
                 _wait(bars.dq_full[i], dq_state.phase)
-                tma_reduce_add_subtile(
-                    _operand(slab, CFG.ALIAS, cutlass.Float32, fp32=True), tma_slice_runtime_desc(dq_desc, 0, qtile * CFG.N, head, 0), i, acquire=False
-                )
+                # DIAGNOSTIC D2 (default off = the shipped code): the armed rendering deletes ONLY the reduce-add issue;
+                # the commit, the wait_group and both dq_* arrives stay, so the barrier table is unchanged.
+                if cutlass.const_expr(not diag_delete_dq_reduce_add):
+                    tma_reduce_add_subtile(
+                        _operand(slab, CFG.ALIAS, cutlass.Float32, fp32=True), tma_slice_runtime_desc(dq_desc, 0, qtile * CFG.N, head, 0), i, acquire=False
+                    )
                 tma_store_commit()
             for i in cutlass.range_constexpr(4):
                 tma_store_wait(3 - i)
                 bars.dq_empty[i].arrive()  # all32 after corresponding source read
             dq_state = advance(dq_state, 1)
         _wait(bars.dv_full, out_state.phase)
-        # Invalid envelope owners still consume both native publications and
-        # return every source credit, but never acquire/use an empty map.
-        if block * CFG.M < seq_k:
+        if cutlass.const_expr(dkv_fp32):
+            # dkv_accum = fp32_reduce: four fp32 reduce-adds per tensor from the ALIAS slices into the per-KV-head workspace maps (the MAP_DV / MAP_DK
+            # slots carry fp32 [M x DQ_BOX]-box maps; kv head = head // ratio); the per-slice bulk groups credit dq_empty[i] after the dV slice's
+            # source read (the dK staging's WAR edge, P7), then dK.  A zero-trip owner issues nothing (the workspace is zero-filled) and never
+            # acquires a map, but keeps every commit / wait / arrive.
+            live = lo < hi
             dv_desc = _map_ptr(maps, batch, n_batch, MAP_DV)
-            tma_store_tile(_operand(slab, CFG.ALIAS, dtype), tma_slice_runtime_desc(dv_desc, 0, block * CFG.M, head, 0))
-        _wait(bars.dk_full, out_state.phase)
-        if block * CFG.M < seq_k:
+            if live:
+                tma_tensormap_acquire(dv_desc)
+            for i in cutlass.range_constexpr(CFG.DKV_ACC_SLICES):
+                if live:
+                    tma_reduce_add_subtile(
+                        _operand(slab, CFG.ALIAS, cutlass.Float32, fp32=True),
+                        tma_slice_runtime_desc(dv_desc, 0, block * CFG.M, head // ratio, 0),
+                        i,
+                        acquire=False,
+                    )
+                tma_store_commit()
+            for i in cutlass.range_constexpr(CFG.DKV_ACC_SLICES):
+                tma_store_wait(CFG.DKV_ACC_SLICES - 1 - i)
+                bars.dq_empty[i].arrive()  # all32 after the dV slice's source read: the epilogue's dK round may overwrite slice i
+            _wait(bars.dk_full, out_state.phase)
             dk_desc = _map_ptr(maps, batch, n_batch, MAP_DK)
-            tma_store_tile(_operand(slab, CFG.ALIAS + CFG.OPERAND_BYTES, dtype), tma_slice_runtime_desc(dk_desc, 0, block * CFG.M, head, 0))
+            if live:
+                tma_tensormap_acquire(dk_desc)
+            for i in cutlass.range_constexpr(CFG.DKV_ACC_SLICES):
+                if live:
+                    tma_reduce_add_subtile(
+                        _operand(slab, CFG.ALIAS, cutlass.Float32, fp32=True),
+                        tma_slice_runtime_desc(dk_desc, 0, block * CFG.M, head // ratio, 0),
+                        i,
+                        acquire=False,
+                    )
+                tma_store_commit()
+        else:
+            # Invalid envelope owners still consume both native publications and
+            # return every source credit, but never acquire/use an empty map.
+            if block * CFG.M < seq_k:
+                dv_desc = _map_ptr(maps, batch, n_batch, MAP_DV)
+                tma_store_tile(_operand(slab, CFG.ALIAS, dtype), tma_slice_runtime_desc(dv_desc, 0, block * CFG.M, head, 0))
+            _wait(bars.dk_full, out_state.phase)
+            if block * CFG.M < seq_k:
+                dk_desc = _map_ptr(maps, batch, n_batch, MAP_DK)
+                tma_store_tile(_operand(slab, CFG.ALIAS + CFG.OPERAND_BYTES, dtype), tma_slice_runtime_desc(dk_desc, 0, block * CFG.M, head, 0))
         out_state = advance(out_state, 1)
         tma_store_commit()
         tma_store_wait(0)
@@ -652,6 +750,7 @@ def bprop_d128_accum_thd_kernel(
     scale: cutlass.Float32,
     causal: cutlass.Constexpr[bool],
     dtype: cutlass.Constexpr,
+    diag_delete_dq_reduce_add: cutlass.Constexpr[bool] = False,
 ):
     warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     x, y, z = cute.arch.block_idx()
@@ -682,7 +781,7 @@ def bprop_d128_accum_thd_kernel(
     elif warp == 13:
         _load_loop(slab, bars, sched, maps, block, head, batch, meta, n_batch, causal, dtype)
     elif warp == 14:
-        _store_loop(slab, bars, sched, maps, block, head, batch, meta, n_batch, causal, dtype)
+        _store_loop(slab, bars, sched, maps, block, head, batch, meta, n_batch, causal, dtype, diag_delete_dq_reduce_add)
     else:
         _scheduler_loop(bars, sched)
     nvvm.barrier_cta_sync()
@@ -709,9 +808,10 @@ def host(
     causal: cutlass.Constexpr[bool],
     dtype: cutlass.Constexpr,
     stream,
+    diag_delete_dq_reduce_add: cutlass.Constexpr[bool] = False,
 ):
     """Launch the native THD body on a host-declared KV envelope, never live totals."""
     nk = cute.math.max((max_skv + CFG.M - 1) // CFG.M, cutlass.Int32(1))
-    bprop_d128_accum_thd_kernel(maps, lse, delta, meta, origins, n_batch, stats_origin, scale, causal, dtype).launch(
+    bprop_d128_accum_thd_kernel(maps, lse, delta, meta, origins, n_batch, stats_origin, scale, causal, dtype, diag_delete_dq_reduce_add).launch(
         grid=(nk, nheads, n_batch), block=(CFG.THREADS, 1, 1), stream=stream, min_blocks_per_mp=1
     )

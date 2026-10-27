@@ -638,9 +638,17 @@ def opaque_i32_zero():
 
 
 @cutlass.cute.jit
-def opaque_i32(value: cutlass.Int32) -> cutlass.Int32:
-    """Identity mov.b32 that pins a per-lane loop invariant in its register."""
-    return inline_ptx("mov.b32 $0, $1;", write_only_types=[cutlass.Int32], read_only_args=[value])
+def opaque_i32(value: cutlass.Int32, anchor=None) -> cutlass.Int32:
+    """Identity mov.b32 that pins a per-lane loop invariant in its register.
+
+    ``anchor`` (optional, append-only): a loop-VARIANT ``Int32`` (the q-tile counter) passed as an extra, unreferenced asm operand -- the
+    :func:`~cudnn.frost.tile_dsl.mma.desc_opaque` form for a 32-bit address term.  Without it an item-invariant SMEM address and every
+    ``base + vec`` add derived from it are hoisted by LLVM's LICM to the item loop's preheader and stay live across the whole tile body
+    (the sm100 d128 2-CTA softmax's 8 dS STS addresses: 8 registers, 4 of them spilled at the 144-register split, 2026-10-27); anchored,
+    the mov and the adds that depend on it sit inside the tile next to the STS that consumes them, so their live range is one tile.  The
+    default path (no anchor) emits exactly the asm it always did."""
+    args = [value] if cutlass.const_expr(anchor is None) else [value, anchor]
+    return inline_ptx("mov.b32 $0, $1;", write_only_types=[cutlass.Int32], read_only_args=args)
 
 
 @cutlass.cute.jit
