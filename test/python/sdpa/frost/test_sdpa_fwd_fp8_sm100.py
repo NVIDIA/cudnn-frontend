@@ -2541,13 +2541,50 @@ def test_fp8_negative_descale_product(scale_sign, d_qk, d_v, mask):
     assert flipped.amax == plain.amax
 
 
+@pytest.mark.parametrize(
+    "d,dv,dtype,mask,pack",
+    [
+        (144, 128, "e4m3", "causal", False),
+        (144, 128, "e5m2", "causal_br", True),
+        (160, 112, "e4m3", "swa", True),
+        (160, 112, "e5m2", "causal", False),
+        (176, 64, "e4m3", "causal_br", False),
+        (176, 64, "e5m2", "swa", True),
+        (192, 16, "e4m3", "causal", True),
+        (192, 16, "e5m2", "causal_br", False),
+    ],
+)
+@torch_fork_set_rng(seed=827)
+def _check_fp8_d192_head_envelope_masks(d, dv, dtype, mask, pack):
+    result = _run(
+        2,
+        8,
+        2,
+        129,
+        256,
+        dtype,
+        torch.bfloat16,
+        scale=1 / math.sqrt(d),
+        sdpa_kwargs=_MASKS[mask],
+        d_qk=d,
+        d_v=dv,
+        pack_gqa=pack,
+        seq_lens_kv=[256, 217],
+        return_lse=True,
+        poison_tmem_before_execute=True,
+    )
+    _check(result.output, result.reference, torch.bfloat16, dtype, result.amax, result.reference_amax)
+    torch.testing.assert_close(result.stats, result.reference_stats, atol=_half_atol(dtype), rtol=3e-2)
+
+
 @pytest.mark.L0
 @requires_pre_rubin_blackwell
 class TestD192Fp8HeadPadding:
     """Collect the shared head-padding checks once on the SM100/SM103 line."""
 
     from sdpa_fp8_d192_padding import test_fp8_d192_padded_heads_rebind_replay as _rebind
-    from sdpa_fp8_d192_padding_masks import test_fp8_d192_head_envelope_masks as _masks
+
+    _masks = _check_fp8_d192_head_envelope_masks
 
     test_rebind_and_replay = staticmethod(_rebind)
     test_masks = staticmethod(_masks)

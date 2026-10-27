@@ -2042,7 +2042,7 @@ class TestNativeD192Fp8HeadPadding:
     """Run both dense-envelope suites from the selected SM107 CI entry."""
 
     from sdpa_fp8_d192_padding import test_fp8_d192_padded_heads_rebind_replay as _rebind
-    from sdpa_fp8_d192_padding_masks import test_fp8_d192_head_envelope_masks as _masks
+    from test_sdpa_fwd_fp8_sm100 import _check_fp8_d192_head_envelope_masks as _masks
 
     test_rebind_and_replay = staticmethod(_rebind)
     test_masks = staticmethod(_masks)
