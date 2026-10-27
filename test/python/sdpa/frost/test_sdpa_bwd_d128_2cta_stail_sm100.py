@@ -25,9 +25,9 @@ import pytest
 import torch
 
 from d128_2cta_test_utils import CELLS, CENSUS as CENSUS_BASE, CHILD_TIMEOUT_S, EXPECTED_BASE, GLOBAL_PREFIX, LEVER_LINE, SKV, WATCHDOG_S
-from d128_2cta_test_utils import SITES_BASE, _adapter_class, _require_2cta, _setmaxnreg_of, make_adapter_2cta, render_2cta
+from d128_2cta_test_utils import SITES_BASE, _adapter_class, _require_2cta, _setmaxnreg_of, make_adapter_2cta, render_2cta, render_2cta_kernels
 from d128_grouped_test_utils import adapter_arguments, check_case, make_case, make_workspace, poison
-from frost_test_utils import requires_dsl
+from frost_test_utils import D128_THD_SHARED_KERNELS, assert_kernel_record, read_kernel_record, requires_dsl
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
@@ -50,6 +50,10 @@ _BODY_MODULE = "cudnn.sdpa.bwd.kernels.sm100.bprop_d128_accum_grouped_2cta_stail
 _BODY_REL = pathlib.Path("python/cudnn/sdpa/bwd/kernels/sm100/bprop_d128_accum_grouped_2cta_stail_f16.py")
 _TREE = pathlib.Path(__file__).resolve().parents[4]  # test/python/sdpa/frost/<file> -> the checkout
 _RECORD = pathlib.Path(__file__).resolve().parent / "renderings" / "md5_d128_accum_grouped_2cta_stail_default_sm_100a.txt"
+_RECORD_TOKEN = "d128_accum_grouped_2cta_stail"
+# The kernels the pair chain OWNS (one record row each; the group fold dkv_reduce_thd_origins_kernel is shared with the one-CTA chain: rendered,
+# never pinned here -- frost_test_utils.D128_THD_SHARED_KERNELS).
+_OWN_KERNELS = ("setup_thd_d128_2cta_kernel", "delta_zero_thd_d128_kernel", "bprop_d128_accum_grouped_2cta_stail_kernel", "cast_dq_thd_d128_kernel")
 # The probes' purity census: the stats / delta LDS.128 (`ld.shared.v4.b32`: stats_one_chunk removes exactly CFG.DIAG_STATS_LDS_REMOVED_PER_LANE
 # static sites), the expect_tx arms (exchange_off keeps the count), the %clock64 reads (0 unless `debug_clk`), and the three counts every probe
 # must leave untouched: `bar.warp.sync`, `tcgen05.fence::after_thread_sync`, `mapa` (exchange_off loses the ship's own two).
@@ -338,15 +342,24 @@ def _render(tmp_path, form_kw, extra_census=None):
     return render_2cta(tmp_path, form_kw, dict(_CENSUS, **(extra_census or {})))
 
 
-def _record_md5(path, body_token):
-    dsl, md5 = None, None
-    for ln in path.read_text().splitlines():
-        if ln.startswith("dsl="):
-            dsl = ln[len("dsl=") :].strip()
-        m = re.match(rf"{body_token} sm_100a default rc=0 ptx_md5=([0-9a-f]{{32}})", ln)
-        if m:
-            md5 = m.group(1)
-    return dsl, md5
+def _render_kernels(tmp_path, form_kw, extra_census=None):
+    """``_render`` plus the per-kernel md5s of the dumped module -> (PTX md5, census, setmaxnreg pairs, {kernel: md5})."""
+    return render_2cta_kernels(tmp_path, form_kw, dict(_CENSUS, **(extra_census or {})))
+
+
+def _record_kernels(path, token):
+    """(dsl line, {kernel: md5}) of a per-kernel record's ``default`` variant (frost_test_utils.read_kernel_record)."""
+    dsl, want = read_kernel_record(path, token)
+    return dsl, want.get("default", {})
+
+
+def _assert_record(kernels, path, token, what):
+    """The skip-then-assert pin: a SKIP on another DSL build, else every kernel the chain owns renders the record's md5 and every rendered kernel
+    outside the shared set is recorded (the fold is excluded by name) -- never a widened or a conditional pin."""
+    dsl, want = _record_kernels(path, token)
+    assert dsl and want, (dsl, want, path)
+    _skip_unless_record_dsl(dsl)
+    assert_kernel_record(kernels, want, token=token, variant="default", excluded=D128_THD_SHARED_KERNELS, what=what)
 
 
 def _skip_unless_record_dsl(dsl):
@@ -364,15 +377,13 @@ def test_2cta_stail_host_renders_for_sm_100a_and_matches_its_record(tmp_path):
     """Host trace-compile of the chain with every field unset (no device): the body's PTX census is the header's (sections 5 / 11), no local
     memory, no nanosleep, the 144 / 144 / 80 register split; the md5 matches the committed record at this geometry (skips, never widens, on
     another DSL build)."""
-    md5, census, regs = _render(tmp_path, {})
-    print(f"\n2-CTA s_tail sm_100a: PTX md5 {md5} census {census} setmaxnreg {regs}")
+    md5, census, regs, kernels = _render_kernels(tmp_path, {})
+    print(f"\n2-CTA s_tail sm_100a: PTX md5 {md5} census {census} setmaxnreg {regs} kernels {kernels}")
     assert census == _EXPECTED, census
     assert sorted(regs) == _setmaxnreg_of(), regs
+    assert set(kernels) == set(_OWN_KERNELS) | set(D128_THD_SHARED_KERNELS), kernels  # the chain's five launches: four own + the shared fold
     assert _RECORD.is_file(), _RECORD
-    dsl, want = _record_md5(_RECORD, "d128_accum_grouped_2cta_stail")
-    assert dsl and want, (dsl, want)
-    _skip_unless_record_dsl(dsl)
-    assert md5 == want, f"PTX md5 {md5} != the record's {want} -- the s_tail rendering changed"
+    _assert_record(kernels, _RECORD, _RECORD_TOKEN, "the s_tail default rendering")
 
 
 @pytest.mark.parametrize("probe", _PROBES)
@@ -448,11 +459,9 @@ def test_2cta_stail_host_renders_debug_clk_for_sm_100a(tmp_path):
     assert census_on["clock64"] > 0 and census_on["lds_v4_b32"] >= _EXPECTED["lds_v4_b32"], census_on
     assert census_on == dict(_EXPECTED, clock64=census_on["clock64"], lds_v4_b32=census_on["lds_v4_b32"]), census_on
     assert sorted(regs_on) == _setmaxnreg_of(), regs_on
-    md5_off, census_off, _ = _render(tmp_path, {"debug_clk": False})
+    md5_off, census_off, _, kernels_off = _render_kernels(tmp_path, {"debug_clk": False})
     assert census_off == _EXPECTED and md5_off != md5_on, "debug_clk=False is the default rendering; True must differ (the clock reads)"
-    dsl, want = _record_md5(_RECORD, "d128_accum_grouped_2cta_stail")
-    _skip_unless_record_dsl(dsl)
-    assert md5_off == want, f"debug_clk=False must render the record's md5 {want}; got {md5_off}"
+    _assert_record(kernels_off, _RECORD, _RECORD_TOKEN, "debug_clk=False (the default rendering)")
 
 
 # ------------------------------------------------------------------------------------------------------------ host: the audit's deterministic-hang topologies as SOURCE assertions
@@ -464,7 +473,7 @@ def test_2cta_stail_host_renders_mask_forms_for_sm_100a(tmp_path):
     upper-edge shifts (the whole mask body) under the same census; the three md5s differ."""
     from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import CFG
 
-    md5_d, census_d, regs_d = _render(tmp_path, {}, _MASK_CENSUS)
+    md5_d, census_d, regs_d, kernels_d = _render_kernels(tmp_path, {}, _MASK_CENSUS)
     md5_f, census_f, regs_f = _render(tmp_path, {"mask_form": "fsel"}, _MASK_CENSUS)
     md5_p, census_p, regs_p = _render(tmp_path, {"mask_form": "predicated"}, _MASK_CENSUS)
     md5_o, census_o, regs_o = _render(tmp_path, {"mask_form": "diag_mask_off"}, _MASK_CENSUS)
@@ -480,9 +489,7 @@ def test_2cta_stail_host_renders_mask_forms_for_sm_100a(tmp_path):
     assert census_p["bra"] - census_d["bra"] == CFG.QUARTERS_PER_GROUP, (census_d["bra"], census_p["bra"])
     assert census_d["selp_f32"] - census_o["selp_f32"] == CFG.MASK_SELECTS_PER_LANE_PER_TILE, (census_d, census_o)
     assert census_d["shr_u32"] - census_o["shr_u32"] == CFG.MASK_WORDS_PER_LANE_PER_TILE, (census_d, census_o)
-    dsl, want = _record_md5(_RECORD, "d128_accum_grouped_2cta_stail")
-    _skip_unless_record_dsl(dsl)
-    assert md5_d == want, f"the default (fsel) rendering {md5_d} != the record's {want}: the mask-form chain must leave the default byte-identical"
+    _assert_record(kernels_d, _RECORD, _RECORD_TOKEN, "the default (fsel) rendering: the mask-form chain must leave the default byte-identical")
 
 
 def test_2cta_stail_dp_empty_is_arrived_at_the_ds_readout_before_the_recv_arm():
