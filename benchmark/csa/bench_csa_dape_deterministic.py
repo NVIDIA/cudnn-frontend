@@ -56,6 +56,30 @@ LONG_CONTEXT_SHAPES = (
 )
 
 
+def _fragmented_lengths(tokens):
+    """Build a deterministic unequal pack that stresses compressed-row lookup."""
+    pattern = (31, 777, 2048, 4093, 8192, 16385, 1021, 6144)
+    lengths = []
+    remaining = tokens
+    index = 0
+    while remaining:
+        length = min(pattern[index % len(pattern)], remaining)
+        lengths.append(length)
+        remaining -= length
+        index += 1
+    # Exercise repeated compressed prefixes without changing the token count.
+    lengths.append(0)
+    return lengths
+
+
+PACKED_METADATA_SHAPES = (
+    ("r4-c1-d128-plain256k", [1 << 18], 128, 4, 1),
+    ("r4-c1-d128-fragmented256k", _fragmented_lengths(1 << 18), 128, 4, 1),
+    ("r4-c1-d128-plain1m", [1 << 20], 128, 4, 1),
+    ("r4-c1-d128-fragmented1m", _fragmented_lengths(1 << 20), 128, 4, 1),
+)
+
+
 def _make_inputs(lens, d, ratio, coff):
     """Seeded, contiguous class-API inputs."""
     total = sum(lens)
@@ -211,8 +235,18 @@ def main():
         action="store_true",
         help="Run the unequal packed 256K/CP32-or-64 and 1M/CP64 production shapes",
     )
+    shape_group.add_argument(
+        "--packed-metadata",
+        action="store_true",
+        help="A/B plain and highly fragmented THD packs at 256K and 1M tokens",
+    )
     args = parser.parse_args()
-    shapes = LONG_CONTEXT_SHAPES if args.long_context else (SHAPES[::4] if args.quick else SHAPES)
+    if args.long_context:
+        shapes = LONG_CONTEXT_SHAPES
+    elif args.packed_metadata:
+        shapes = PACKED_METADATA_SHAPES
+    else:
+        shapes = SHAPES[::4] if args.quick else SHAPES
     results = [_bench_shape(*shape, args) for shape in shapes]
     print(json.dumps({"construct_order": args.construct_order, "results": results}, indent=2))
 
