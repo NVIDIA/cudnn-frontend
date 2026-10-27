@@ -1161,7 +1161,9 @@ def _tmaldg_warp(
         tma_tensormap_acquire(_dodv_rt)
         tma_tensormap_acquire(_k_rt)
         tma_tensormap_acquire(_v_rt)
-        # Same closure shape as GmemTileTma, so the load sites stay branch-free.
+        # Each loader warp acquires these immutable maps on both CTAs on every
+        # launch. Physical-origin maps are acquired below at each work item.
+        # The tile helpers therefore suppress only their redundant THD acquire.
 
     kv_super_idx, head_idx, batch_idx = _boot_tile(sched, seq_kv_lens_tensor, n_batch, n_qh_grid)
     full_head = cute.arch.make_warp_uniform(head_idx + head_base)
@@ -1256,6 +1258,7 @@ def _tmaldg_warp(
                 bars.mb_k_full[k_empty_state.idx].smem_ptr,
                 cta_group=CFG.CTA_MMA,
                 mcast_mask=tma_mcast_mask,
+                acquire=not _THD,
             )
         k_empty_state = advance(k_empty_state, CFG.STAGES_KV)
 
@@ -1279,6 +1282,7 @@ def _tmaldg_warp(
                 bars.mb_v_full[v_empty_state.idx].smem_ptr,
                 cta_group=CFG.CTA_MMA,
                 mcast_mask=tma_mcast_mask,
+                acquire=not _THD,
             )
         v_empty_state = advance(v_empty_state, CFG.STAGES_KV)
 
@@ -1305,6 +1309,7 @@ def _tmaldg_warp(
                 bars.mb_q_full[q_empty_state.idx].smem_ptr,
                 cta_group=CFG.CTA_MMA,
                 mcast_mask=tma_mcast_mask,
+                acquire=not _THD,
             )
             q_empty_state = advance(q_empty_state, CFG.STAGES_Q)
 
@@ -1327,6 +1332,7 @@ def _tmaldg_warp(
                 bars.mb_do_full[do_empty_state.idx].smem_ptr,
                 cta_group=CFG.CTA_MMA,
                 mcast_mask=tma_mcast_mask,
+                acquire=not _THD,
             )
             do_empty_state = advance(do_empty_state, CFG.STAGES_dO)
 
@@ -1349,6 +1355,7 @@ def _tmaldg_warp(
                 bars.mb_dodv_full[dodv_empty_state.idx].smem_ptr,
                 cta_group=CFG.CTA_MMA,
                 mcast_mask=tma_mcast_mask,
+                acquire=not _THD,
             )
             dodv_empty_state = advance(dodv_empty_state, CFG.STAGES_dO_DV)
 
@@ -1986,6 +1993,13 @@ def _tmastg_warp(
         batch_ws = cutlass.Int32(0) if cutlass.const_expr(_THD) else batch_idx
         if cutlass.const_expr(CFG.FUSE_DK):
             q_seq_off, _kv_seq_off, qdk_batch = _thd_tma_offsets(ctx, batch_idx + batch_base)
+            if cutlass.const_expr(_THD):
+                # Qdk belongs to this store warp. Acquire its current descriptor
+                # on each CTA before the q loop, including the dead-unit map.
+                qdk_slot = cutlass.Int32(0)
+                if cutlass.const_expr(physical_origins):
+                    qdk_slot = batch_idx + cutlass.Int32(1) if batch_idx < n_batch else cutlass.Int32(0)
+                tma_tensormap_acquire(_dk_map_ptr(dk_maps, qdk_slot))
 
         for q_iter in cutlass.range(q_lo, q_hi, 1, unroll=1):
             q_col_base = q_iter * cutlass.Int32(CFG.TILE_N)
@@ -2009,6 +2023,7 @@ def _tmastg_warp(
                     bars.mb_qdk_full.smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
+                    acquire=not _THD,
                 )
                 qdk_empty_state = advance(qdk_empty_state, 1)
             ds_slot = ds_full_state.idx

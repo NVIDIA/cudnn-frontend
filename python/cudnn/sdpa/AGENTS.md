@@ -367,6 +367,14 @@ on the address path shows the wrap before any GPU run.
   with the existing `thd_over_launched_units_are_dead` and
   `thd_multi_unit_per_cta` regressions.
 
+A caller that explicitly acquires an immutable runtime map must also disable
+its tile helper's default acquire for that lifetime. Otherwise every q tile
+repeats the tensor-map invalidation and flush despite the outer acquire.
+In 2x2 backward, loaders acquire compact maps at entry and physical maps per
+work item; the fused Qdk map belongs to the store warp and needs its own acquire
+on both CTAs. Preserve the initialized dead-unit fallback. The D192/D256 THD
+origin/rebind suites and their empty replay cases exercise these boundaries.
+
 **Rule S9 — Every scheduler reader needs a reuse back-edge; match output-phase cadence.**
 
 Every scheduler payload reader must either return a reuse credit or have a
