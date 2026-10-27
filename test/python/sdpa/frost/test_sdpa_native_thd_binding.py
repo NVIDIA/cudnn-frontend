@@ -29,8 +29,8 @@ def _fixture(dtype="bfloat16", layout="NH", rank=4):
     s.total_q, s.total_kv, s.off_o_desc = 16, 512, 4096
     s.expect = dict.fromkeys(("q", "k", "v", "o"), dtype)
     s.decl = {name: (h, 128, h * 128, 128, 1, h * 128) for name, h in (("q", 8), ("k", 2), ("v", 2), ("o", 8))}
-    # The native binder serves half hosts, whose K/V tables share one stride
-    # pair. The global prepared vocabulary also includes quantized-only slots.
+    # Model the existing half host ABI with one shared K/V table stride pair.
+    # Hosts declaring a separate V slot are exercised independently below.
     s.order = sorted((prep._FILLED_AT_BUILD | prep._FILLED_PER_CALL) - {"table_v_strides"})
     s.index = {name: i for i, name in enumerate(s.order)}
     s.template = [None] * len(s.order)
@@ -436,6 +436,31 @@ def test_native_paged_shared_table_stride_contract(hnd, table_rank):
     for bind in (_reference, _native):
         with pytest.raises(ValueError):
             bind(s, changed)
+
+
+@pytest.mark.parametrize("hnd", [False, True])
+@pytest.mark.parametrize("table_rank", [2, 4])
+def test_native_half_host_binds_declared_independent_table_strides(hnd, table_rank):
+    """A half host with a V-stride slot receives each table's current geometry."""
+    spec, facts, _ = _paged_fixture(hnd=hnd, table_rank=table_rank)
+    spec.index["table_v_strides"] = len(spec.order)
+    spec.order.append("table_v_strides")
+    spec.template.append(None)
+    spec.native = cudnn._pybind_module._SdpaThdBinder(spec)
+    first = _native(spec, facts)
+    assert first[spec.index["table_v_strides"]] == (4, 1)
+    stride = 2**33
+    shape, strides = ((4, 1, 4, 1), (1, 1, stride, 1)) if table_rank == 4 else ((4, 4), (1, stride))
+    value_table = facts["block_table_v"]._replace(ptr=0x90000, shape=shape, strides=strides, span=3 * stride + 4)
+    changed = dict(facts, block_table_v=value_table)
+    second = _native(spec, changed)
+    assert second[spec.index["table_strides"]] == (4, 1)
+    assert second[spec.index["table_v_strides"]] == (1, stride)
+    assert first[spec.index["table_v_strides"]] == (4, 1)
+    assert spec.template[spec.index["table_v_strides"]] is None
+    changed["block_table_v"] = value_table._replace(span=value_table.span - 1)
+    with pytest.raises(ValueError):
+        _native(spec, changed)
 
 
 def test_native_nonpaged_host_does_not_require_paged_slots():

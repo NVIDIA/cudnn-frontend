@@ -91,7 +91,7 @@ from cudnn.sdpa.fwd.config_d128_family import (
 )
 
 # Native half THD flavors whose worklist and Stats stores use packed heads.
-SM100_THD_PACK_GQA_SHAPES = frozenset({(128, 128)})
+SM100_THD_PACK_GQA_SHAPES = frozenset({(128, 128), (576, 512)})
 
 # Native per-tensor FP8 bodies that compose page pools with THD Q/O maps.
 SM100_PAGED_FP8_THD_SHAPES = frozenset({(128, 128), (256, 256)})
@@ -688,9 +688,13 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
                     )
                 )
                 or (flavor == "d256" and k.paged_kv and k.cta_mma == 2 and k.split_kv == 1)
+                or (flavor == "d512" and k.d_flavor == 576 and k.cta_mma == 2 and k.split_kv == 1)
             )
         ):
-            raise ValueError(f"{flavor}: THD PackGQA requires half d128 cga2 unsplit/cga1 split, paged half d64 cga1 split, or paged half d256 cga2 unsplit")
+            raise ValueError(
+                f"{flavor}: THD PackGQA requires half d128 cga2 unsplit/cga1 split, paged half d64 cga1 split, "
+                "paged half d256 cga2 unsplit, or native half d576 cga2 unsplit"
+            )
     if k.ragged_q:
         # The decode tile's ragged-Q leg (sm100/decode_d128_f16.py): dense grid
         # over the declared batch, Q rows at the ragged offsets, final O / Stats
@@ -2218,8 +2222,6 @@ def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD51
     if not getattr(params, "mma_2x2", False):
         raise ValueError("d512 2x2: make_cfg_d512_2x2 needs a TemplateParams record with mma_2x2=True (make_cfg_d512 dispatches on it)")
     native_d576 = params.d_flavor == 576
-    if native_d576 and params.thd_varlen:
-        raise ValueError("d576: native 2x2 attention requires dense Q; THD origins are not wired")
     _validate_params("d512", params, d512_partial_pack_wired=native_d576)
     if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
         raise ValueError("d512 2x2: BF16/FP16 inputs only")

@@ -387,10 +387,12 @@ class SdpaThdBinder {
             if (found == order.end()) invalid(std::string("native THD host has no argument ") + host_slot_names[slot]);
             index_[slot] = static_cast<size_t>(found - order.begin());
         }
-        if (quantized_ && paged_) {
+        if (paged_) {
             const auto found = std::find(order.begin(), order.end(), "table_v_strides");
-            if (found == order.end()) invalid("native paged THD FP8 host has no independent V table strides");
-            table_v_strides_index_ = static_cast<size_t>(found - order.begin());
+            if (quantized_ && found == order.end())
+                invalid("native paged THD FP8 host has no independent V table strides");
+            has_v_table_strides_ = found != order.end();
+            if (has_v_table_strides_) table_v_strides_index_ = static_cast<size_t>(found - order.begin());
         }
         if (quantized_) {
             for (size_t role = mx_scales_ ? AmaxO : DescaleQ; role <= AmaxO; ++role) {
@@ -922,9 +924,9 @@ class SdpaThdBinder {
         const auto &kt = required(facts, KTable), &vt = required(facts, VTable);
         const auto kg = table_geometry(kt, KTable, b), vg = table_geometry(vt, VTable, b);
         if (kg.pages != vg.pages) invalid("paged K/V tables must share max_pages");
-        if (!quantized_ && (kg.batch_stride != vg.batch_stride || kg.page_stride != vg.page_stride))
+        if (!has_v_table_strides_ && (kg.batch_stride != vg.batch_stride || kg.page_stride != vg.page_stride))
             invalid("paged K/V tables must share strides on this host");
-        if (quantized_) frame[table_v_strides_index_] = py::make_tuple(vg.batch_stride, vg.page_stride);
+        if (has_v_table_strides_) frame[table_v_strides_index_] = py::make_tuple(vg.batch_stride, vg.page_stride);
         const auto ks = pool_geometry(facts[K], K), vs = pool_geometry(facts[V], V);
         if (facts[K].shape[0] != facts[V].shape[0]) invalid("K and V pools must hold the same number of pages");
         put(frame, KStrides, py::make_tuple(ks[0], ks[1], ks[2]));
@@ -953,6 +955,7 @@ class SdpaThdBinder {
     int gate_code_ = kDLBfloat;
     std::array<int64_t, 6> gate_decl_{};
     std::array<size_t, 5> quant_indices_;
+    bool has_v_table_strides_     = false;
     size_t table_v_strides_index_ = 0;
     std::unique_ptr<SdpaMxScaleBinding> mx_scales_;
     int64_t quant_offset_ = 0;
@@ -975,6 +978,7 @@ init_sdpa_thd_binding(py::module_ &m) {
     py::class_<SdpaThdBinder>(m, "_SdpaThdBinder")
         .def(py::init<const py::object &>(), py::arg("spec"))
         .def_prop_ro_static("supports_physical_origins", [](py::object) { return true; })
+        .def_prop_ro_static("supports_native_d576", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_fp8_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_split_physical_origins", [](py::object) { return true; })

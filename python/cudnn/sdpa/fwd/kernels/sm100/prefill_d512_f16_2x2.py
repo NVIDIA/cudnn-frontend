@@ -107,8 +107,6 @@ DEBUG_STG_DELAY_US: int = int(globals().get("FROST_D512_2X2_DEBUG_STG_DELAY_US",
 # FROST_D512_2X2_POLL_CROSS_PAIR_WAITS=0 to render the pre-fix parking form -- never a knob.
 POLL_CROSS_PAIR_WAITS: bool = bool(int(globals().get("FROST_D512_2X2_POLL_CROSS_PAIR_WAITS", 1)))
 CFG, _TMA = make_cfg_d512_2x2(PARAMS, cga_m=CGA_M_ARM)
-if CFG.PAGED_KV and CFG.THD_VARLEN:
-    raise ValueError("native D576 paged KV currently requires dense Q")
 if not POLL_CROSS_PAIR_WAITS and "FROST_D512_2X2_POLL_CROSS_PAIR_WAITS" not in globals():
     raise ValueError("prefill_sdpa_d512_f16_2x2_sm100: cross-pair-released barriers must be polled with mbarrier.test_wait.parity (poll-wait rule)")
 Cfg = type(CFG)
@@ -148,6 +146,7 @@ from cudnn.frost.tile_dsl.pointwise import (
 )
 from cudnn.frost.tile_dsl.regtile import RegTile
 from cudnn.frost.tile_dsl.mma import mma_ss
+from cudnn.frost.tile_dsl.tma import tma_tensormap_acquire
 from cudnn.frost.tile_dsl.tma import (
     tma_load_tile,
     tma_load_subtiles,
@@ -324,6 +323,8 @@ _dispatch_decode_payload = _sdpa_h.dispatch_decode_payload
 _thd_tma_offsets = _sdpa_h.thd_tma_offsets
 
 from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_descs_kernel as _build_thd_meta_o_descs_kernel, TENSOR_MAP_QWORDS, THD_SETUP_THREADS
+from cudnn.sdpa.fwd.kernels.thd_origins import build_thd_origins, origin_tensors, origin_tma_slice
+from cudnn.frost.tile_dsl.thd import exit_if_dead_thd_cluster, thd_port_origin
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
 
@@ -373,6 +374,7 @@ def _kernel(
     block_table_v_tensor: Optional[cute.Tensor] = None,
     paged_hnd: cutlass.Constexpr[bool] = False,
     paged_v_hnd: cutlass.Constexpr[bool] = False,
+    thd_origins: Optional[cute.Tensor] = None,
 ) -> None:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
@@ -380,6 +382,9 @@ def _kernel(
     bidx = cute.arch.block_idx()[0]
     bidy = cute.arch.block_idx()[1]
     bidz = cute.arch.block_idx()[2]
+
+    if cutlass.const_expr(CFG.THD_VARLEN and thd_origins is not None):
+        exit_if_dead_thd_cluster(seq_kv_lens_tensor, n_batch, CFG.CGA_M)
 
     # SMEM, in the order of the budget ledger (every array a multiple of 1 KiB, so no inter-array pad).
     sQ_raw = cutlass.Array(STORAGE_DTYPE, qBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
@@ -539,6 +544,7 @@ def _kernel(
     elif warp_idx >= cutlass.Int32(CFG.CORR_WARP_BASE) and warp_idx < cutlass.Int32(CFG.CORR_WARP_BASE + CFG.CORRECTION_WARPS):
         nvvm.setmaxregister(CFG.CORRECTION_REGS, nvvm.SetMaxRegisterAction.INCREASE)
         _correction_warp_group(
+            thd_origins=thd_origins,
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
             sO=sO,
@@ -590,6 +596,7 @@ def _kernel(
         nvvm.prefetch_tensormap(tma_k_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_v_desc.get_ptr())
         _tmaldg_warp_group(
+            thd_origins=thd_origins,
             tma_q_desc=tma_q_desc,
             tma_k_desc=tma_k_desc,
             tma_v_desc=tma_v_desc,
@@ -860,14 +867,21 @@ def _tmaldg_warp_group(
     block_table_v_tensor,
     paged_hnd: cutlass.Constexpr[bool],
     paged_v_hnd: cutlass.Constexpr[bool],
+    thd_origins=None,
 ):
     q_empty_state = PipelineState.start(phase=1)
     k_state = PipelineState.start(phase=1)
     v_state = PipelineState.start(phase=1)
     o_empty_for_v_state = PipelineState.start(phase=1)
 
-    tma_q = GmemTileTma(tma_q_desc)
-    if cutlass.const_expr(CFG.THD_VARLEN):
+    if cutlass.const_expr(thd_origins is not None):
+        tma_q = lambda d, h, r, b: origin_tma_slice(o_desc_words, 1, n_batch, b, d, h, r)
+    else:
+        tma_q = GmemTileTma(tma_q_desc)
+    if cutlass.const_expr(thd_origins is not None and not PAGED_KV):
+        tma_k = lambda d, h, r, b: origin_tma_slice(o_desc_words, 2, n_batch, b, d, h, r)
+        tma_v = lambda d, h, r, b: origin_tma_slice(o_desc_words, 3, n_batch, b, d, h, r)
+    elif cutlass.const_expr(CFG.THD_VARLEN and not PAGED_KV):
         # THD: K/V ride the setup kernel's packed-total-clamped runtime descriptors (o_desc_words
         # slots n_batch+1 / n_batch+2) so the last sequence's tile tail lands as exact zeros.
         _k_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(1)) * cutlass.Int32(TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
@@ -926,6 +940,15 @@ def _tmaldg_warp_group(
     v_share_smem = v_share_first * cutlass.Int32(V_SUBTILE_STRIDE_ELEMS)
 
     while is_valid_tile > cutlass.Int32(0):
+        if cutlass.const_expr(thd_origins is not None):
+            # Each work item can name a new sequence and independent port bases.
+            stride = (n_batch + cutlass.Int32(1)) * cutlass.Int32(TENSOR_MAP_QWORDS)
+            base = o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(TENSOR_MAP_QWORDS)
+            tma_tensormap_acquire((base + stride).tospace(cutlass.AddressSpace.generic))
+            if cutlass.const_expr(not PAGED_KV):
+                tma_tensormap_acquire((base + 2 * stride).tospace(cutlass.AddressSpace.generic))
+                tma_tensormap_acquire((base + 3 * stride).tospace(cutlass.AddressSpace.generic))
+            q_seq_off, kv_seq_off, tma_batch = cutlass.Int32(0), cutlass.Int32(0), batch_idx
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
         if cutlass.const_expr(MAY_BE_EMPTY) and (kv_right <= kv_left):
@@ -1755,6 +1778,7 @@ def _correction_warp_group(
     cta_id_x,
     qh_per_kh,
     o_partial_f32=None,
+    thd_origins=None,
 ):
     nvvm.barrier_cta_sync(barrier_id=2, thread_count=32 * (CFG.CORRECTION_WARPS + 1))
     tmem_base = tmem_ptr_i32.load()
@@ -1979,14 +2003,15 @@ def _correction_warp_group(
                 _cu_q_b = cutlass.Int32(_cu[n_batch + batch_idx])
                 _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
                 if q_row_global < _s_q_b:
+                    _stats_base = thd_port_origin(thd_origins, 4, batch_idx, _cu_q_b) if cutlass.const_expr(thd_origins is not None) else _cu_q_b
                     lse_arr = cutlass.make_array_view(lse_tensor)
                     if cutlass.const_expr(len(lse_tensor.shape) == 2):
-                        lse_arr[_cu_q_b + q_row_global, head_idx] = lse  # token-major packed (T, H)
+                        lse_arr[_stats_base + q_row_global, row_head_idx] = lse  # token-major packed (T, H)
                     else:
                         if cutlass.const_expr(len(lse_tensor.shape) == 4):
-                            lse_arr[batch_idx, head_idx, q_row_global, 0] = lse  # per-batch padded Stats
+                            lse_arr[batch_idx, row_head_idx, q_row_global, 0] = lse  # per-batch padded Stats
                         else:
-                            lse_arr[cutlass.Int32(0), head_idx, _cu_q_b + q_row_global] = lse  # head-major packed
+                            lse_arr[cutlass.Int32(0), row_head_idx, _stats_base + q_row_global] = lse  # head-major packed
             else:
                 if q_row_global < seqlen_q:
                     lse_arr = cutlass.make_array_view(lse_tensor)
@@ -2046,10 +2071,12 @@ def _host(
     paged_hnd: cutlass.Constexpr[bool],
     paged_v_hnd: cutlass.Constexpr[bool] = False,
     table_v_strides: Optional[Tuple[cutlass.Int64, cutlass.Int64]] = None,
+    thd_origin_ptrs=None,
+    thd_origin_specs: cutlass.Constexpr = None,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
-    """Host entry (same positional ABI as sm100/prefill_d512_f16.py so the prepared binder serves both):
-    device pointers, runtime extents and Int64 strides in, TMA encodes and launches out.  ``problem_size``
+    """Host entry for the shared prepared binder, with its final stream slot preserved:
+    device pointers, runtime extents and Int64 strides in, TMA encodes and launches out. ``problem_size``
     = (B, QH, KH, SQ, SKV, 0); ``lse_kind`` in dense / token / head / padded; ``lse_ptr`` None compiles the
     Stats store out. D576 binds the independent paged K/V slots; D512 keeps them dead."""
     B, QH, KH, SQ, SKV, _ = problem_size
@@ -2141,22 +2168,45 @@ def _host(
     if cutlass.const_expr(CFG.THD_VARLEN):
         # THD setup launch (the one declared auxiliary launch): metadata + per-batch O descriptors +
         # the persistent scheduler's live-unit total / claim counter.  Units are CGA_TILE_M rows tall.
-        _build_thd_meta_o_descs_kernel(
-            o_tensor,
-            tma_o_desc,
-            tma_k_desc,
-            tma_v_desc,
-            o_desc_words,
-            seq_kv_lens_tensor,
-            thd_q_lens_tensor,
-            thd_kv_lens_tensor,
-            thd_lens_form,
-            cutlass.Int32(QH // HEADS_PER_TILE),
-            cutlass.Int32(B),
-            cutlass.Int64(o_tensor.stride[1]),
-            cutlass.Int32(CGA_TILE_M),
-            n_thd_units,  # persistent cluster count; also seeds the claim counter
-        ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
+        if cutlass.const_expr(thd_origin_ptrs is not None):
+            o_desc_words, origins, offsets = origin_tensors(o_desc_ptr, thd_origin_ptrs, cutlass.Int32(B))
+            build_thd_origins(
+                (q_tensor, k_tensor, v_tensor, o_tensor),
+                tma_q_desc,
+                tma_k_desc,
+                tma_v_desc,
+                tma_o_desc,
+                o_desc_words,
+                origins,
+                offsets,
+                thd_origin_specs,
+                seq_kv_lens_tensor,
+                thd_q_lens_tensor,
+                thd_kv_lens_tensor,
+                thd_lens_form,
+                cutlass.Int32(B),
+                cutlass.Int32(QH // HEADS_PER_TILE),
+                cutlass.Int32(CGA_TILE_M // HEADS_PER_TILE),
+                n_thd_units,
+                paged=PAGED_KV,
+            ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
+        else:
+            _build_thd_meta_o_descs_kernel(
+                o_tensor,
+                tma_o_desc,
+                tma_k_desc,
+                tma_v_desc,
+                o_desc_words,
+                seq_kv_lens_tensor,
+                thd_q_lens_tensor,
+                thd_kv_lens_tensor,
+                thd_lens_form,
+                cutlass.Int32(QH // HEADS_PER_TILE),
+                cutlass.Int32(B),
+                cutlass.Int64(o_tensor.stride[1]),
+                cutlass.Int32(CGA_TILE_M),
+                n_thd_units,  # persistent cluster count; also seeds the claim counter
+            ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:
         grid_shape = (
@@ -2186,6 +2236,7 @@ def _host(
         block_table_v_tensor,
         paged_hnd,
         paged_v_hnd,
+        thd_origins=origins if cutlass.const_expr(thd_origin_ptrs is not None) else None,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
@@ -2209,9 +2260,15 @@ def compile(  # noqa: A001
     lse_kind: str = "dense",
     paged_hnd: bool = False,
     paged_v_hnd: Optional[bool] = None,
+    thd_origin_specs=None,
 ) -> Callable:
     """Compile the host entry for one layout kind (same key surface as sm100/prefill_d512_f16.py: the
     head-dim ENVELOPE, whether the Stats store exists, the Stats layout kind)."""
+    if thd_origin_specs is not None:
+        if not CFG.THD_VARLEN or SPLIT_KV != 1 or CFG.TILE_K != 576:
+            raise ValueError("physical origins require native unsplit D576 THD")
+        if len(thd_origin_specs) != 5:
+            raise ValueError("physical THD origins require five port declarations")
     if paged_v_hnd is None:
         paged_v_hnd = paged_hnd
     _cache_key = _template_key(globals(), locals(), "compile")
@@ -2271,6 +2328,12 @@ def compile(  # noqa: A001
         paged_hnd,
         paged_v_hnd,
         (cutlass.Int64(0), cutlass.Int64(0)) if PAGED_KV else None,
+        thd_origin_ptrs=(
+            tuple(P(cutlass.Int64 if spec[3] == 64 else cutlass.Int32, spec[3] // 8) if spec is not None else None for spec in thd_origin_specs)
+            if thd_origin_specs is not None
+            else None
+        ),
+        thd_origin_specs=thd_origin_specs,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=_cache_key,

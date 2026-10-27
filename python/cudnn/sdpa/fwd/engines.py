@@ -305,7 +305,7 @@ class Capabilities:
     # TemplateParams-conversion follow-ups.
     lse_optional: bool = False
     # Most THD forward lowerings derive addresses from compact length prefixes.
-    # The SM100/SM103 ungated, unsplit CGA2 half D128/D256 graph lowering
+    # The SM100/SM103 ungated, unsplit CGA2 half D128/D256/D576 graph lowering
     # reads independent Q/O/Stats origins and nonpaged K/V origins. See
     # SUPPORT_MATRIX_TRACKER.md for this scope and the remaining sibling gaps;
     # thd=True alone does not promise support for padding between sequences.
@@ -1777,6 +1777,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         cudnn._pybind_module._SdpaDenseBinder, "supports_native_d576", False
     ):
         return "native D576x512 requires the matching cuDNN Frontend native extension"
+    if (
+        facts.thd
+        and _selected_d_shape(capabilities, facts, knobs) == SM100_NATIVE_D576_SHAPE
+        and not getattr(cudnn._pybind_module._SdpaThdBinder, "supports_native_d576", False)
+    ):
+        return "native D576x512 THD requires the matching cuDNN Frontend native extension"
     if facts.thd and _selected_d_shape(capabilities, facts, knobs) in capabilities.thd_excluded_d_shapes:
         return "this native head-dimension flavor requires dense Q; THD origins are not wired"
     if facts.thd and capabilities.thd_d_shapes is not None and (facts.d_qk, facts.d_v) not in capabilities.thd_d_shapes:
@@ -2132,7 +2138,6 @@ def _sm100_spec() -> EngineSpec:
             # a d <= 32 graph took before the tile existed.
             d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512), SM100_NATIVE_D576_SHAPE}) | SM100_DENSE_ONLY_D_SHAPES,
             d_envelope_floors=((SM100_NATIVE_D576_SHAPE, 512),),
-            thd_excluded_d_shapes=frozenset({SM100_NATIVE_D576_SHAPE}),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             bottom_right=True,
@@ -3295,8 +3300,7 @@ def lower_dsl_prefill(
             facts.device_cc in ((10, 0), (10, 3))
             or (facts.device_cc == (10, 7) and facts.has_paged_kv and facts.d_qk == 128 and api.split_kv == 1 and not (facts.is_fp8 or facts.is_mxfp8))
         )
-        and facts.d_qk == facts.d_v
-        and facts.d_qk in (128, 256)
+        and (facts.d_qk, facts.d_v) in ((128, 128), (256, 256), SM100_NATIVE_D576_SHAPE)
         and (
             (
                 not (facts.is_fp8 or facts.is_mxfp8)
