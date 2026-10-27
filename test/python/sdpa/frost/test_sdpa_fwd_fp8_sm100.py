@@ -802,21 +802,18 @@ def test_fp8_head_dim_envelope(dims, mask):
 
 
 @pytest.mark.L0
-def test_fp8_d256_retains_exact_shape_floor():
-    """D192 serves aligned dense heads; the independent D256 floor remains.
-
-    Pin the shared adapter/graph domain on both native architecture lines.
-    """
+def test_fp8_d256_dense_envelope_matches_adapter():
+    """Pin the shared D256 dense-envelope domain on both native arch lines."""
     from cudnn.sdpa.fwd import engines as eng
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100, _SM100_FP8_ENVELOPE_FLOORS, _fp8_envelope_covers
 
-    assert (192, 128) not in _SM100_FP8_ENVELOPE_FLOORS and _SM100_FP8_ENVELOPE_FLOORS[(256, 256)] == 255
+    assert _SM100_FP8_ENVELOPE_FLOORS == {(512, 512): 256}
     for arch in ("sm100", "sm107"):
         spec = next(sp for sp in eng.ENGINE_SPECS if sp.name == f"sdpa_fwd_prefill_{arch}_fp8")
-        assert dict(spec.capabilities.d_envelope_floors) == {(256, 256): 255, (512, 512): 256}, arch
+        assert dict(spec.capabilities.d_envelope_floors) == {(512, 512): 256}, arch
     shapes = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
-    for d_qk, d_v in ((160, 160), (224, 208)):
-        assert not _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
+    for d_qk, d_v in ((16, 144), (224, 16), (160, 160), (224, 208)):
+        assert _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
     for d_qk, d_v in ((96, 96), (128, 64), (160, 96), (176, 128), (192, 96), (320, 320)):
         assert _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
 
@@ -834,14 +831,10 @@ def test_fp8_d256_retains_exact_shape_floor():
         api = _api(d_qk, d_v)
         assert api.check_support(), (d_qk, d_v)
         assert tuple(api.flavor) == want, (d_qk, d_v, api.flavor)
-    for d_qk, d_v in ((160, 160), (224, 208)):
+    for d_qk, d_v in ((16, 144), (224, 16), (160, 160), (224, 208)):
         api = _api(d_qk, d_v)
-        try:
-            supported = api.check_support()
-        except ValueError as exc:  # the adapter may surface the envelope gate as a raise
-            supported = False
-            assert "floors" in str(exc), str(exc)
-        assert not supported, (d_qk, d_v)
+        assert api.check_support(), (d_qk, d_v)
+        assert tuple(api.flavor) == (256, 256), (d_qk, d_v, api.flavor)
 
 
 @pytest.mark.L0
@@ -2121,19 +2114,16 @@ def test_fp8_d512_head_dim_envelope(d_qk, d_v, mask):
 @pytest.mark.L0
 def test_fp8_d512_envelope_floor_declines_straddling_shapes():
     """The D512 flavor serves the (256, 512] band on both head dims; shapes
-    straddling its floor decline.  Below it the D256 flavor is exact-shape only
-    (its padded envelope is non-deterministic, see
-    test_fp8_d256_retains_exact_shape_floor), so a shape such as
-    (160, 160) -- too wide for D192/128, not the D256 shape -- is declined too.
-    Both device lines carry the flavor, so both shape maps are pinned.
+    straddling its floor decline. Below it D256 serves aligned dense heads.
+    Both device lines carry the flavors, so both shape maps are pinned.
     """
     from cudnn.sdpa.fwd.api_dsl import _fp8_envelope_covers, _sm100_fp8_shapes
 
     for device_cc in ((10, 0), (10, 7)):
         shapes = _sm100_fp8_shapes(pertensor=True, device_cc=device_cc)
-        for d_qk, d_v in [(256, 256), (384, 448), (464, 368), (272, 272), (512, 512)]:
+        for d_qk, d_v in [(160, 160), (256, 256), (384, 448), (464, 368), (272, 272), (512, 512)]:
             assert _fp8_envelope_covers(d_qk, d_v, shapes), (device_cc, d_qk, d_v)
-        for d_qk, d_v in [(160, 160), (272, 256), (384, 128), (512, 256)]:
+        for d_qk, d_v in [(272, 256), (384, 128), (512, 256)]:
             assert not _fp8_envelope_covers(d_qk, d_v, shapes), (device_cc, d_qk, d_v)
 
 
@@ -2623,3 +2613,15 @@ class TestD192Fp8HeadPadding:
 
     test_rebind_and_replay = staticmethod(_rebind)
     test_masks = staticmethod(_masks)
+
+
+@pytest.mark.L0
+@requires_pre_rubin_blackwell
+class TestD256Fp8HeadPadding:
+    """Collect bounded dense and paged D256 cases in the selected CI entry."""
+
+    from sdpa_fp8_d256_padding import test_dense_rebind_replay as _dense, test_dense_masks as _masks, test_paged_rebind_replay as _paged
+
+    test_dense_rebind_replay = staticmethod(_dense)
+    test_dense_masks = staticmethod(_masks)
+    test_paged_rebind_replay = staticmethod(_paged)

@@ -245,6 +245,12 @@ rank-4 loads for partial head chunks, and preserve the exact-head lowering.
 `test_sdpa_fwd_fp8_sm100.py::TestD192Fp8HeadPadding` and the native SM107
 `TestNativeD192Fp8HeadPadding` bridge poison Q/K/V head slack and check full
 O/Stats/Amax, output canaries, rebinding and retained replay on both arch lines.
+For paged head chunks, the descriptor box may cover only one page slice while
+the MMA operand still uses the full tile-height pitch between dimension slabs.
+Preserve that pitch and step dimensions in exactly one layer: a paged helper
+that loops dimension subtiles must not also request multiple loads per subtile.
+`TestD256Fp8HeadPadding::test_paged_rebind_replay` covers partial K/V heads,
+short and wide pages, independent pools/tables, sinks and changed-length replay.
 
 **Rule S6 — A kernel feature lands on every arch line's test file, and its
 other-arch lowerings are smoke-compiled from whatever GPU you have.**

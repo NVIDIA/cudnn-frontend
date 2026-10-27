@@ -128,18 +128,9 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     # so a row that gains a flavor must gain its floor in the same commit --
     # otherwise mismatch() admits a graph check_support kills (contract 8b').
     assert dict(sm107.d_envelope_floors) == dict(sm100.d_envelope_floors)
-    # Envelope FLOORS keep an inexact graph off a flavor whose padded path is
-    # not validated.  BOTH rows carry them, and the Rubin one differs only by
-    # the (192, 128) entry it has no flavor for -- the floors' rationale is the
-    # kernel geometry (a cga4x1 d512 role-split; an unvalidated d256 padded
-    # path), which the Rubin ports inherit unchanged.  They must also match
-    # api_dsl._SM100_FP8_ENVELOPE_FLOORS, which the adapter enforces on BOTH
-    # arch lines -- a row that admits what the adapter rejects is a plan that
-    # enters the ranked list only to die in check_support.
-    assert sm100.d_envelope_floors == (((256, 256), 255), ((512, 512), 256))
-    # INVERTED 2026-09-09: Rubin gained the d192 flavor, so it gained that
-    # flavor's floor too -- the two rows' floor tables are now identical.
-    assert sm107.d_envelope_floors == (((256, 256), 255), ((512, 512), 256))
+    # Both rows keep the D512 role-split floor; smaller flavors serve their
+    # qualified aligned dense envelopes through bounded TMA descriptors.
+    assert sm100.d_envelope_floors == sm107.d_envelope_floors == (((512, 512), 256),)
 
     # The f16x2 exponent arm is Rubin-row data, not a notch.
     assert sm100.softmax_precisions == frozenset({_c.data_type.FLOAT})
@@ -749,11 +740,15 @@ def test_fp8_envelope_mismatch_rules():
     sm100 = caps[engines.engine_name(fp8=True)]
     assert engines.mismatch(sm100, _fp8_facts()) is None
     assert engines.mismatch(sm100, _fp8_facts(d_qk=96, d_v=64)) is None
-    # D192 now serves dense head padding; D256 remains exact-only.
+    # D192 and D256 serve their aligned dense head envelopes.
     assert engines.mismatch(sm100, _fp8_facts(d_qk=192, d_v=128)) is None
     assert engines.mismatch(sm100, _fp8_facts(d_qk=256, d_v=256)) is None
-    for dq, dv in ((160, 160), (224, 208)):
-        assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=dq, d_v=dv)), (dq, dv)
+    for dq, dv in ((16, 144), (224, 16), (160, 160), (224, 208)):
+        for arch, cc in (("sm100", (10, 0)), ("sm107", (10, 7))):
+            row = caps[engines.engine_name(arch=arch, fp8=True)]
+            facts = _fp8_facts(device_cc=cc, d_qk=dq, d_v=dv)
+            assert engines.mismatch(row, facts) is None, (arch, dq, dv)
+            assert engines._selected_d_shape(row, facts) == (256, 256)
     for dq, dv in ((160, 96), (176, 128), (192, 96)):
         assert engines.mismatch(sm100, _fp8_facts(d_qk=dq, d_v=dv)) is None
     assert engines._selected_d_shape(sm100, _fp8_facts(d_qk=192, d_v=128)) == (192, 128)
@@ -2030,11 +2025,11 @@ class TestNativeD192Fp8Pack:
 
     from sdpa_fp8_d192_pack_sm107 import (
         test_native_d192_fp8_pack_rebind_replay as _rebind,
-        test_native_d192_pack_retains_d256_padding_decline as _decline,
+        test_native_d192_pack_retains_thd_padding_decline as _decline,
     )
 
     test_rebind_and_replay = staticmethod(_rebind)
-    test_d256_padding_decline = staticmethod(_decline)
+    test_thd_padding_decline = staticmethod(_decline)
 
 
 @requires_rubin
@@ -2046,3 +2041,14 @@ class TestNativeD192Fp8HeadPadding:
 
     test_rebind_and_replay = staticmethod(_rebind)
     test_masks = staticmethod(_masks)
+
+
+@requires_rubin
+class TestNativeD256Fp8HeadPadding:
+    """Collect the native D256 dense envelope through the selected CI entry."""
+
+    from sdpa_fp8_d256_padding import test_dense_rebind_replay as _dense, test_dense_masks as _masks, test_dense_half_softmax as _half
+
+    test_dense_rebind_replay = staticmethod(_dense)
+    test_dense_masks = staticmethod(_masks)
+    test_dense_half_softmax = staticmethod(_half)
