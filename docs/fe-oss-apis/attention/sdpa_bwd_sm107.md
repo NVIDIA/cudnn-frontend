@@ -13,8 +13,9 @@ forward activations (`Q/K/V/O`), the loss gradient `dO` and the forward `Stats`
 
 Three FROST engines serve the d = 256 pass on cc 10.7 (`cudnn.sdpa.bwd.engines`), and two
 more rows share the chain (the SM100 / SM103 d = 256 row and the cc 10.7 d in (256, 512]
-row, both described further down); all five are `opt_in` — set
-`CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before `import cudnn`, and pin the
+row, both described further down). Four are `opt_in`. The SM100 / SM103 d = 256 row is a default
+candidate that the backward heuristics rank against the backend. For the opt-in rows, set
+`CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before `import cudnn`; for any of the five, pin the
 engine from the ranked plan list (`graph.plans` / `graph.select_plan(i)`) when
 validating or measuring, because the bf16 d256 graph also has a native backend
 plan:
@@ -29,9 +30,9 @@ plan:
   [MXFP8](#mxfp8-numerics-sdpa_bwd_sm107_mxfp8)). The sole provider of that
   graph on Rubin: cuDNN 9.27 has no MXFP8 d = 256 backward kernel there.
 
-A fourth engine, `sdpa_bwd_sm100_d256` (bf16 / fp16, SM100 / SM103, cc 10.0-10.6,
-`opt_in`), runs the SAME chain on the Blackwell line over the 2x2-datapath main
-kernel (see "The 2x2-datapath body" below); pin it the same way
+A fourth engine, `sdpa_bwd_sm100_d256` (bf16 / fp16, SM100 / SM103, cc 10.0-10.6; a default
+candidate, ranked against the backend in `sdpa/bwd/heuristics.py`), runs the SAME chain on the Blackwell line over the 2x2-datapath main
+kernel (see "The 2x2-datapath body" below); pin it by name without the opt-in flag
 (`startswith("sdpa_bwd_sm100_d256")`), because the bf16 d256 graph also has a
 native backend plan there (cuDNN engine 5 on B200 / 9.26).
 
