@@ -171,6 +171,8 @@ from cudnn.frost.tile_dsl.scheduler import (
 from cudnn.frost.tile_dsl.pointwise import (
     opaque_f32_zero,
     fmax_f32,
+    abs_max_tree,
+    warp_abs_max_f32,
     # SM107 fuses the MASK_NONE S load + row-max into one LDTM.STAT,
     # (tmem_load_max_reduction_x64); masked iters keep the software reduction.,
     row_max_reduction,
@@ -2440,10 +2442,8 @@ def _correction_warp_group(
                         _zero_f = cutlass.Float32(0.0)
                         o_elems = [cutlass.Float32(arith.select(row_dead.ir_value(), _zero_f.ir_value(), o_scaled[i].ir_value())) for i in range(O_CHUNK)]
 
-                        for _i in cutlass.range_constexpr(O_CHUNK):
-                            _e = o_elems[_i]
-                            if cutlass.const_expr(amax_o_tensor is not None):
-                                _amax_o_local = fmax_f32(_amax_o_local, cute.math.abs(_e))
+                        if cutlass.const_expr(amax_o_tensor is not None):
+                            _amax_o_local = fmax_f32(_amax_o_local, abs_max_tree(o_elems))
 
                         # Plain range (not range_constexpr) — extraction at Python trace time.
                         o_packed_v = fp32_to_fp8_pack(
@@ -2584,10 +2584,8 @@ def _correction_warp_group(
                             ),
                             cutlass.Float32,
                         )
-                        for _i in cutlass.range_constexpr(O_EPI_BLOCK_SIZE):
-                            _e = o_scaled_h[_i]
-                            if cutlass.const_expr(amax_o_tensor is not None):
-                                _amax_o_local = fmax_f32(_amax_o_local, cute.math.abs(_e))
+                        if cutlass.const_expr(amax_o_tensor is not None):
+                            _amax_o_local = fmax_f32(_amax_o_local, abs_max_tree([o_scaled_h[_i] for _i in range(O_EPI_BLOCK_SIZE)]))
                         o_half = o_scaled_h.to(OUT_STORAGE_DTYPE)
 
                         col_offset_const = (b * O_EPI_BLOCK_SIZE) % O_D_BLOCK
@@ -2605,7 +2603,9 @@ def _correction_warp_group(
                 # sm100/split_combine computes it over the recombined O instead;
                 # this write has to stay out of the way, since atomicMax only grows.
                 if cutlass.const_expr(SPLIT_KV == 1 and amax_o_tensor is not None):
-                    if _row_valid:
+                    _amax_o_local = cutlass.Float32(arith.select(_row_valid.ir_value(), _amax_o_local.ir_value(), cutlass.Float32(0.0).ir_value()))
+                    _amax_o_local = warp_abs_max_f32(_amax_o_local)
+                    if (tid_in_wg & cutlass.Int32(31)) == cutlass.Int32(0):
                         nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_o_ptr, _amax_o_local.bitcast(cutlass.Int32))
 
                 # fence_proxy needed before TMA reads SMEM written by stores above.
