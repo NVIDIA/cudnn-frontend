@@ -74,7 +74,9 @@ only (the graph attribute is forward-only).
 (block-scale MXFP8, exact cc 10.7) are default candidates, ranked against the backend per measured shard or qualification verdict
 (`sdpa/fwd/placement.py`).
 `sdpa_bwd_sm100` (f16/bf16, d in (256, 512]) is a default candidate too: the backend has no SM100
-engine for that band, so it is the only provider there. Every other FROST SDPA engine is `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before
+engine for that band, so it is the only provider there. `sdpa_bwd_sm100_d128` is a default candidate that ranks
+ahead of the backend for d128 THD without a window and behind it elsewhere (`sdpa/bwd/heuristics.py`). Every other
+FROST SDPA engine is `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before
 `import cudnn` or the graph runs a cuDNN backend plan. The flag also ranks FROST first everywhere.
 
 **Execute-time shape/stride overrides:** graphs created with
@@ -393,7 +395,7 @@ packing remains declined; automatic candidate ranking is unchanged.
 Standalone compact-THD behavior, other split/gated paths, other head dimensions
 and other architectures are unchanged; this does not qualify their padded offsets.
 
-The opt-in **d128 backward** (`sdpa_bwd_sm100_d128`, engine 20609) selects
+The default **d128 backward** (`sdpa_bwd_sm100_d128`, engine 20609) selects
 its implementation at plan build. On SM100 or SM103 with public CuTeDSL >= 4.8 and a
 positive FP32-representable scale, when determinism is not requested it launches row delta plus dQ initialization, the
 five-product main kernel, then an FP32 to output-dtype dQ conversion, for any
@@ -443,8 +445,8 @@ the allocation contract. All scratch is initialized each execution.
 A compiled accumulation plan accepts runtime scalar overrides only when both
 scale and scale*log2(e) remain finite and positive in FP32. Changing the scale
 never silently changes implementation. SM100 and SM103 are the runtime
-qualification targets. The row remains opt-in, and
-performance qualification is separate from capability tests. The graph tests
+qualification targets. The row is a default candidate, ranked ahead of the backend only for d128 THD without a window
+(`sdpa/bwd/heuristics.py`); performance qualification is separate from capability tests. The graph tests
 in `test_sdpa_bwd_d128_sm100.py` and `test_sdpa_bwd_d128_accum_sm100.py` cover
 all three gradients, launch counts, workspace bounds, buffer rebinding and
 capture/replay. Native frame tests cover the prepared hosts.
