@@ -1078,8 +1078,10 @@ class DecodeEnvelope:
     # not served (another part, an unserved dtype, a geometry row, no DSL target); under ``sparse_core`` the parts of
     # :data:`SPARSE_DECODE_PDL_DEFAULT_CCS` (cc 10.7 since 2026-10-27, where the switched sparse chain was measured bitwise and never slower
     # than the plain one; False on every other part, the explicit ``True`` served everywhere; never under the in-block indexer).  A FORM-level
-    # reading: the per-step one is ``pdl_default and route(s_q, batch).pdl_capable`` (stage (4) takes the
-    # switch on a decode-tile route only; a prefill-route step launches plain and resolves False).  An explicit ``use_pdl`` outranks it.
+    # reading: on the DENSE form the per-step one is ``pdl_default and route(s_q, batch).pdl_capable`` (stage (4) takes the switch on a
+    # decode-tile route only; a prefill-route step launches plain and resolves False); under ``sparse_core`` it is ``pdl_default`` itself for a
+    # served step (the sparse core and its combine carry the sites at every served step width; ``route(s_q, batch)`` is the dense table's and
+    # does not apply there).  An explicit ``use_pdl`` outranks it.
     pdl_default: bool = False
     # appended (the list form, ``QsaSpec.index_list_form``; a QsaSpec geometry only, empty otherwise): the forms the block-sparse decode
     # mode serves at this geometry -- ``("shared", "per_row")`` under caller lists (``"shared"`` at ``S_q <= 4``: the record's shared-list
@@ -10600,8 +10602,9 @@ class GatedAttentionBlockFwd(APIBase):
         reading of ``use_pdl`` on this part for a served form (:data:`DECODE_PDL_DEFAULT_CCS` on the dense form,
         :data:`SPARSE_DECODE_PDL_DEFAULT_CCS` under ``sparse_core`` -- cc 10.7 on both since their measurements, never under the in-block
         indexer; False where ``decode.served`` is False) -- the
-        per-step reading is ``decode.pdl_default and decode.route(s_q, batch).pdl_capable``; ``decode.pdl_stages`` names the switched stage
-        kinds on both forms."""
+        per-step reading is ``decode.pdl_default and decode.route(s_q, batch).pdl_capable`` on the dense form and ``decode.pdl_default`` itself
+        under ``sparse_core`` (the sparse core carries the sites at every served step width; the dense route table does not apply there);
+        ``decode.pdl_stages`` names the switched stage kinds on both forms."""
         from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 
         policy = _resolve_decode_route_policy(decode_route_policy)
@@ -10693,6 +10696,7 @@ class GatedAttentionBlockFwd(APIBase):
             # 2026-10-27, for the sparse core's caller-list form -- its own tuple; never under the indexer): False wherever the form is not
             # served (`decode_reason`:
             # another part, an unserved dtype, a geometry row, no DSL target); the per-step reading is `pdl_default and route(s_q, batch).pdl_capable`
+            # on the dense form and `pdl_default` itself under `sparse_core` (the dense route table does not apply to the sparse core's step)
             pdl_default=(decode_reason is None) and not indexer and cc in (SPARSE_DECODE_PDL_DEFAULT_CCS if sparse else DECODE_PDL_DEFAULT_CCS),
             # the list form (QsaSpec.index_list_form) at this geometry: the indexer over the pools selects per row; caller lists take the
             # shared step-0 list at S_q <= the record's cap (requires spells it) or the per-row list at any S_q
