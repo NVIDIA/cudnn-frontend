@@ -2668,31 +2668,15 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # the range no smaller FP8 flavor reaches, at most 2x zero-padding.
             # Below that floor it declines rather than swallowing e.g. a d256
             # graph onto a kernel whose cga4x1 role-split geometry is tuned for
-            # d = 512.  The d192x128 flavor serves ONLY its exact shape: with
-            # d_qk zero-padded into it (144/160/176) the kernel's output is wrong
-            # (4-19% of elements off by O(1) against the fp32 reference on
-            # SM100; d_v padding and the d128/d512 flavors' padding are exact),
-            # so a floor of 128 (min(d_qk, d_v) > 128 is unreachable at d_v <=
-            # 128) keeps every inexact graph off it until the kernel's Q/K
-            # padding is fixed.  Mirrored by api_dsl._SM100_FP8_ENVELOPE_FLOORS.
-            # The D256 flavor (#860) likewise serves only its exact shape for now: the
-            # classic battery routed onto its padded envelope (d_qk in (128, 256))
-            # shows run-to-run nondeterminism on long causal e5m2/GQA/sink graphs;
-            # min(d_qk, d_v) > 255 admits nothing inexact. Lift both floors once the
-            # kernels' padded paths are validated through test_mhas_v2.
-            # The Rubin row carries the SAME floors, (192, 128) included since it
-            # gained that flavor -- the table is arch-INDEPENDENT
-            # (api_dsl._SM100_FP8_ENVELOPE_FLOORS), and a row that omits an entry
-            # the adapter still enforces ADMITS a graph the lowering then kills
-            # with a bare ValueError (contract rule 8b').  It previously declared () -- which made
-            # mismatch() ADMIT e.g. (512, 256) and (192, 128) that
-            # api_dsl._SM100_FP8_ENVELOPE_FLOORS then rejected with a bare
-            # ValueError inside check_support: a plan that enters the ranked
-            # list only to die in the lowering (contract rule 1).  The floors'
-            # rationale transfers unchanged -- the Rubin d512 kernel is the same
-            # cga4x1 role-split geometry, and the d256 padded envelope is no
-            # more validated here than on Blackwell.
-            d_envelope_floors=(((192, 128), 128), ((256, 256), 255), ((512, 512), 256)),
+            # d = 512. D192x128 serves its 16-aligned dense head envelope:
+            # Q/K and V descriptors retain the actual logical widths. On SM100,
+            # a partial Q/K head uses rank-4 K TMA so storage slack zero-fills;
+            # exact D192 retains the rank-5 chunk load. SM107 already uses rank-4.
+            # D256 remains exact-only: its padded envelope showed nondeterminism
+            # on long causal E5M2/GQA/sink graphs. That independent decline stays.
+            # Both architecture rows mirror api_dsl._SM100_FP8_ENVELOPE_FLOORS
+            # so graph admission and prepared lowering agree.
+            d_envelope_floors=(((256, 256), 255), ((512, 512), 256)),
             # Both lines serve THD at every native flavor.  The Rubin arm keeps a
             # NAMED constant (shared with the standalone adapter's gate, rule 8b')
             # rather than collapsing to `d_shapes`, so a future partial arch line

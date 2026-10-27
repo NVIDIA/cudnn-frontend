@@ -238,6 +238,13 @@ read the wrong K/V at batch one. The detector is
 `test_sdpa_bwd_d256_sm100.py::test_batch_pitch_rebind_and_replay`, including
 both source padding and output copy-out with canaries in unused physical rows.
 
+A TMA view split into fixed head chunks must retain the logical head bound.
+A rank-5 `(chunk, row, inner)` view can treat storage slack as live columns even
+when Q is correctly zero-padded; `0 * NaN` still poisons BMM1. Keep the bounded
+rank-4 loads for partial head chunks, and preserve the exact-head lowering.
+`test_sdpa_fp8_d192_padding.py` poisons Q/K/V head slack and checks full
+O/Stats/Amax, output canaries, rebinding and retained replay on both arch lines.
+
 **Rule S6 — A kernel feature lands on every arch line's test file, and its
 other-arch lowerings are smoke-compiled from whatever GPU you have.**
 

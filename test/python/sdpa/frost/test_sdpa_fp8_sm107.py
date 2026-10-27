@@ -136,10 +136,10 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     # api_dsl._SM100_FP8_ENVELOPE_FLOORS, which the adapter enforces on BOTH
     # arch lines -- a row that admits what the adapter rejects is a plan that
     # enters the ranked list only to die in check_support.
-    assert sm100.d_envelope_floors == (((192, 128), 128), ((256, 256), 255), ((512, 512), 256))
+    assert sm100.d_envelope_floors == (((256, 256), 255), ((512, 512), 256))
     # INVERTED 2026-09-09: Rubin gained the d192 flavor, so it gained that
     # flavor's floor too -- the two rows' floor tables are now identical.
-    assert sm107.d_envelope_floors == (((192, 128), 128), ((256, 256), 255), ((512, 512), 256))
+    assert sm107.d_envelope_floors == (((256, 256), 255), ((512, 512), 256))
 
     # The f16x2 exponent arm is Rubin-row data, not a notch.
     assert sm100.softmax_precisions == frozenset({_c.data_type.FLOAT})
@@ -749,14 +749,13 @@ def test_fp8_envelope_mismatch_rules():
     sm100 = caps[engines.engine_name(fp8=True)]
     assert engines.mismatch(sm100, _fp8_facts()) is None
     assert engines.mismatch(sm100, _fp8_facts(d_qk=96, d_v=64)) is None
-    # The d192xd128 and D256 flavors serve ONLY their exact shapes (floors 128 / 255):
-    # d_qk zero-padded into d192 is numerically wrong and the D256 padded envelope is
-    # nondeterministic in test_mhas_v2, so the row declines the whole (128, 256) inexact
-    # region and the classic backend verdict applies there.
+    # D192 now serves dense head padding; D256 remains exact-only.
     assert engines.mismatch(sm100, _fp8_facts(d_qk=192, d_v=128)) is None
     assert engines.mismatch(sm100, _fp8_facts(d_qk=256, d_v=256)) is None
-    for dq, dv in ((160, 96), (176, 128), (192, 96), (160, 160), (224, 208)):
+    for dq, dv in ((160, 160), (224, 208)):
         assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=dq, d_v=dv)), (dq, dv)
+    for dq, dv in ((160, 96), (176, 128), (192, 96)):
+        assert engines.mismatch(sm100, _fp8_facts(d_qk=dq, d_v=dv)) is None
     assert engines._selected_d_shape(sm100, _fp8_facts(d_qk=192, d_v=128)) == (192, 128)
     assert engines._selected_d_shape(sm100, _fp8_facts(d_qk=256, d_v=256)) == (256, 256)
     assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=272, d_v=256))
@@ -784,14 +783,11 @@ def test_fp8_envelope_mismatch_rules():
     # The Rubin row serves the same dense envelope (the ViT d=72-in-80 case).
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
     assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7))) is None
-    # INVERTED 2026-09-09: the Rubin d192 FP8 sibling landed, so the EXACT
-    # shape is now served on both rows.  Its floor (128) came with it, so the
-    # inexact region below stays declined -- d_qk zero-padded into d192 is
-    # numerically wrong, and that is a kernel property, not an arch one.
+    # Native SM107 serves the same aligned dense D192 envelope.
     assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128)) is None
     assert engines._selected_d_shape(sm107, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128)) == (192, 128)
     for dq, dv in ((160, 96), (176, 128), (192, 96)):
-        assert "no kernel-flavor envelope" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=dq, d_v=dv)), (dq, dv)
+        assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=dq, d_v=dv)) is None, (dq, dv)
     assert "dense-only" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), thd=True, padded=True))
     # INVERTED: the Rubin line gained a d512 per-tensor FP8 kernel, so the
     # native d512 shape is now SERVED rather than declined, and the (256, 512]

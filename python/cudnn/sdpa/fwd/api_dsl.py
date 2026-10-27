@@ -349,7 +349,7 @@ def _sm100_fp8_shapes(pertensor: bool, device_cc: tuple[int, int]) -> frozenset[
 # smaller FP8 flavor reaches, at most 2x zero-padding. A smaller graph is
 # declined rather than routed onto a kernel whose cga4x1 role-split geometry is
 # tuned for d = 512.
-_SM100_FP8_ENVELOPE_FLOORS = {(192, 128): 128, (256, 256): 255, (512, 512): 256}  # (192,128)/(256,256): exact shape only, see engines._sm100_fp8_spec
+_SM100_FP8_ENVELOPE_FLOORS = {(256, 256): 255, (512, 512): 256}  # D256 stays exact-shape-only; see engines._sm100_fp8_spec
 
 
 def _fp8_envelope_covers(d_qk: int, d_v: int, shapes) -> bool:

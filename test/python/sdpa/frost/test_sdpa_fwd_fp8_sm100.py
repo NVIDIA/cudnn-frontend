@@ -793,27 +793,22 @@ def test_fp8_head_dim_envelope(dims, mask):
 
 
 @pytest.mark.L0
-def test_fp8_large_flavors_serve_exact_shapes_only():
-    """The d192xd128 and D256 per-tensor FP8 flavors serve ONLY their exact shapes.
-    With d_qk zero-padded into d192 (144/160/176) the output is wrong (test_mhas_v2
-    fp8 fwd: 4-19% of elements off by O(1)); the D256 padded envelope shows
-    run-to-run nondeterminism on long causal e5m2/GQA/sink graphs (a case passes
-    alone and fails in the battery). The engine row floors both (128 / 255), the
-    adapter mirrors the floors, and both flavor selections honour them, so the
-    inexact (128, 256) region is declined everywhere -- the classic backend verdict
-    applies -- while the d128 flavor's envelope and the d512 band are unchanged.
-    The floor table is arch-independent (contract rule 8b'), so both rows are pinned."""
+def test_fp8_d256_retains_exact_shape_floor():
+    """D192 serves aligned dense heads; the independent D256 floor remains.
+
+    Pin the shared adapter/graph domain on both native architecture lines.
+    """
     from cudnn.sdpa.fwd import engines as eng
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100, _SM100_FP8_ENVELOPE_FLOORS, _fp8_envelope_covers
 
-    assert _SM100_FP8_ENVELOPE_FLOORS[(192, 128)] == 128 and _SM100_FP8_ENVELOPE_FLOORS[(256, 256)] == 255
+    assert (192, 128) not in _SM100_FP8_ENVELOPE_FLOORS and _SM100_FP8_ENVELOPE_FLOORS[(256, 256)] == 255
     for arch in ("sm100", "sm107"):
         spec = next(sp for sp in eng.ENGINE_SPECS if sp.name == f"sdpa_fwd_prefill_{arch}_fp8")
-        assert dict(spec.capabilities.d_envelope_floors) == {(192, 128): 128, (256, 256): 255, (512, 512): 256}, arch
+        assert dict(spec.capabilities.d_envelope_floors) == {(256, 256): 255, (512, 512): 256}, arch
     shapes = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
-    for d_qk, d_v in ((160, 96), (176, 128), (192, 96), (160, 160), (224, 208)):
+    for d_qk, d_v in ((160, 160), (224, 208)):
         assert not _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
-    for d_qk, d_v in ((96, 96), (128, 64), (320, 320)):
+    for d_qk, d_v in ((96, 96), (128, 64), (160, 96), (176, 128), (192, 96), (320, 320)):
         assert _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
 
     B, H, S, dev = 2, 4, 384, "cuda"
@@ -826,11 +821,11 @@ def test_fp8_large_flavors_serve_exact_shapes_only():
         lse = torch.empty(B, H, S, device=dev, dtype=torch.float32)
         return SdpaFwdDslSm100(sample_q=Q8, sample_k=K8, sample_v=V8, sample_o=out, sample_lse=lse, scale_softmax=1.0 / math.sqrt(d_qk), pertensor_fp8=True)
 
-    for d_qk, d_v, want in ((192, 128, (192, 128)), (256, 256, (256, 256)), (96, 96, (128, 128))):
+    for d_qk, d_v, want in ((160, 96, (192, 128)), (176, 128, (192, 128)), (192, 128, (192, 128)), (256, 256, (256, 256)), (96, 96, (128, 128))):
         api = _api(d_qk, d_v)
         assert api.check_support(), (d_qk, d_v)
         assert tuple(api.flavor) == want, (d_qk, d_v, api.flavor)
-    for d_qk, d_v in ((160, 96), (224, 208)):
+    for d_qk, d_v in ((160, 160), (224, 208)):
         api = _api(d_qk, d_v)
         try:
             supported = api.check_support()
@@ -2119,7 +2114,7 @@ def test_fp8_d512_envelope_floor_declines_straddling_shapes():
     """The D512 flavor serves the (256, 512] band on both head dims; shapes
     straddling its floor decline.  Below it the D256 flavor is exact-shape only
     (its padded envelope is non-deterministic, see
-    test_fp8_large_flavors_serve_exact_shapes_only), so a shape such as
+    test_fp8_d256_retains_exact_shape_floor), so a shape such as
     (160, 160) -- too wide for D192/128, not the D256 shape -- is declined too.
     Both device lines carry the flavor, so both shape maps are pinned.
     """
