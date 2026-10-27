@@ -54,21 +54,27 @@ SPARSE_TILE_LEAN = "sparse_lean_d256_f16"
 """The two bodies' ``kernel_template`` names (the kernel modules' file stems under ``sdpa/fwd/kernels/sm107/``): what the adapter's
 ``kernel_template`` and the block's ``sparse_tile`` read back, so a route is PINNED by the kernel that compiled, never transcribed."""
 LEAN_SPARSE_MAX_UNITS = 4
-"""The PLACEMENT bound: the lean tile below ``B x H_kv x S_q <= 4`` units (B <= 2 at S_q 1 and B 1 at S_q 2 on two KV heads), the
-tcgen05 core above.  The lean tile's advantage is the ABSENCE of the tcgen05 core's ~4.5-us per-CTA chain on a launch that is
+"""The PLACEMENT bound, in CTAs PER CHUNK: the lean tile below ``B x H_kv <= 4`` (B <= 2 on two KV heads, at EVERY served step width
+S_q 1..4), the tcgen05 core above.  The unit is the lean grid's own: one 128-thread CTA per (sequence, KV head, chunk of k sub-tiles),
+the step's S_q rows riding INSIDE the CTA as ``N_MT = ceil(S_q x G / 16)`` m16 tiles -- the grid is ``B x H_kv x split``, so S_q
+changes no grid and is NOT in the bound (the served rows are :func:`sparse_lean_tile_decline`'s business: ``S_q <= 4`` under one
+shared list).  The lean tile's advantage is the ABSENCE of the tcgen05 core's ~4.5-us per-CTA chain on a launch that is
 latency-bound (one wave of small CTAs: the 212-SM class measured the kernel alone 3.34 vs 5.66 us at B 1 x 8K x S_q 1, +69 %, and the
 chain 8.32 -> 5.75 us); it shrinks as the launch becomes HBM-bound, where both tiles move the same bytes and the lean form's shared
 gather forces a split whose combine on a 768-block grid costs more than the tcgen05 core's lean walk at split 4 (B 32 x S_q 1: a
-modeled -2 %).  The model put the crossover between 32 and 64 units; the gate's bound sweep (B in 1 / 2 / 4 / 8 / 16 / 32 x S_q 1 at 8K / 32K,
-the S_q 4 shared-list cells at B 1 / 4 / 32, every cell the lean body vs the tcgen05 core in the same process) moved this ONE constant to
-the last class that wins inside its control band.
-The gate's table by units level (the lean lever per step, POSITIVE = the lean body faster): 2 units: B 1 x S_q 1 (the e2e block)
-+6.8 % / +5.7 % / +4.8 % at 8K / 32K / 128K; 4 units: B 2 x S_q 1 (the e2e block) +1.8 % / +1.3 % at 8K / 32K; 8 units: B 4 x S_q
-1 (the e2e block) -2.6 % / -3.5 % / -2.0 % / -2.2 % at 2K / 8K / 32K / 128K; B 1 x S_q 4 (the shared-list block) +6.4 % / +6.6 % /
-+6.8 % at 8K / 32K / 128K; 16 units: B 8 x S_q 1 (the e2e block) -17.2 % / -16.3 % at 8K / 32K; 32 units: B 16 x S_q 1 (the e2e
-block) -44.1 % / -43.6 % at 8K / 32K; B 4 x S_q 4 (the shared-list block) -9.7 % / -8.8 % / -9.2 % at 8K / 32K / 128K; 64 units: B
-32 x S_q 1 (the e2e block) -60.8 % / -58.7 % / -51.3 % at 8K / 32K / 128K; 256 units: B 32 x S_q 4 (the shared-list block) -36.4 %
-/ -36.5 % / -35.7 % at 8K / 32K / 128K; a route class losing beyond its control band excludes every level from it up -> 4."""
+modeled -2 %).  The model put the crossover between 32 and 64 CTAs per chunk; the gate's bound sweep (B in 1 / 2 / 4 / 8 / 16 / 32 x S_q 1
+at 8K / 32K, the S_q 4 shared-list cells at B 1 / 4 / 32, every cell the lean body vs the tcgen05 core in the same process) moved this
+ONE constant to the last class that wins inside its control band, and its S_q 4 rows fix the UNIT: at the same CTAs per chunk the S_q 1
+and the S_q 4 cells land on the same side (2 per chunk: B 1 wins at S_q 1 AND at S_q 4; 8 per chunk: B 4 loses at S_q 1 AND at S_q 4),
+where a ``B x H_kv x S_q`` count (the first merged form of this bound, 2026-10-26) put the winning B 1 x S_q 3..4 cells on the core's side.
+The gate's table by CTAs per chunk (the lean lever per step, POSITIVE = the lean body faster): 2 per chunk: B 1 x S_q 1 (the e2e
+block) +6.8 % / +5.7 % / +4.8 % at 8K / 32K / 128K and B 1 x S_q 4 (the shared-list block) +6.4 % / +6.6 % / +6.8 % at 8K / 32K /
+128K; 4 per chunk: B 2 x S_q 1 (the e2e block) +1.8 % / +1.3 % at 8K / 32K; 8 per chunk: B 4 x S_q 1 (the e2e block) -2.6 % /
+-3.5 % / -2.0 % / -2.2 % at 2K / 8K / 32K / 128K and B 4 x S_q 4 (the shared-list block) -9.7 % / -8.8 % / -9.2 % at 8K / 32K /
+128K; 16 per chunk: B 8 x S_q 1 (the e2e block) -17.2 % / -16.3 % at 8K / 32K; 32 per chunk: B 16 x S_q 1 (the e2e block) -44.1 % /
+-43.6 % at 8K / 32K; 64 per chunk: B 32 x S_q 1 (the e2e block) -60.8 % / -58.7 % / -51.3 % and B 32 x S_q 4 (the shared-list
+block) -36.4 % / -36.5 % / -35.7 % at 8K / 32K / 128K; a route class losing beyond its control band excludes every level from it up
+-> 4."""
 SPARSE_LEAN_TILE_DEFAULT_CCS: Tuple[Tuple[int, int], ...] = ((10, 7),)
 """The parts on which ``tile_form="auto"`` consults the placement rule (:func:`sparse_decode_lean_tile_selected`) at all: cc 10.7,
 the one line the lean tile exists for, since the end-to-end gate measured the lean route against the tcgen05 route there (the
@@ -83,7 +89,9 @@ other order) and B 1 x 32K 36.6 -> 34.6 us (+5.7 %, 1.98 us; +5.6 % symmetric); 
 32 x S_q 1 -57.1 % past the bound; the shared-list caller block at S_q 4 (one list per sequence) B 1 +6.6 %, B 4 -9.2 %;
 route-class cells losing beyond their band: B 4 x 2K x S_q 1 -2.6 %; B 4 x 8K x S_q 1 -3.5 %; B 4 x 32K x S_q 1 -2.0 %; B 4 x 128K
 x S_q 1 -2.2 %; B 4 x 8K x S_q 4 -9.7 %; B 4 x 32K x S_q 4 -8.8 %; B 4 x 128K x S_q 4 -9.2 %; B 8 x 8K x S_q 1 -17.2 %; B 8 x 32K
-x S_q 1 -16.3 %; B 16 x 8K x S_q 1 -44.1 %; B 16 x 32K x S_q 1 -43.6 % -> LEAN_SPARSE_MAX_UNITS 32 -> 4.
+x S_q 1 -16.3 %; B 16 x 8K x S_q 1 -44.1 %; B 16 x 32K x S_q 1 -43.6 % -> LEAN_SPARSE_MAX_UNITS 32 -> 4 (counted over B x H_kv x S_q
+in the gate commit; the unit is the CTAs per chunk, B x H_kv, since the follow-up that read the same table's S_q 4 rows: the B 1 x S_q 4
+win stays on the default route, the B 4 x S_q 4 loss off it).
 Every other part keeps the tcgen05 core under ``"auto"`` until measured there; the explicit ``"tcgen05"`` keeps the former function on
 the measured part, the explicit ``"lean"`` takes the lean tile wherever the body serves the declaration (past the bound too)."""
 _SPARSE_LEAN_TILE_RULE_CC = (10, 7)
@@ -188,15 +196,17 @@ def sparse_lean_tile_decline(
 def sparse_decode_lean_tile_selected(*, batch: int, h_kv: int, s_q: int, top_k: int, device_cc: Optional[Tuple[int, int]]) -> bool:
     """The PLACEMENT rule (DESIGN 7): True iff the lean tile is the body the route prefers for an ADMISSIBLE block-sparse decode
     launch -- the cc 10.7 line (:data:`_SPARSE_LEAN_TILE_RULE_CC`, the one part the kernel exists for), ``top_k >= 8`` (at least two
-    sub-tiles: a one-sub-tile list is the tcgen05 core's) and ``B x H_kv x S_q <= LEAN_SPARSE_MAX_UNITS`` units; False above the bound
-    (the tcgen05 core with today's split rule) and on every other part.  A dense rule from the configuration (the bound is the one
-    constant the gate moves); admissibility is :func:`sparse_lean_tile_decline`'s business, the AUTO reading's gate on the part is
-    :func:`sparse_tile_form_auto`'s."""
+    sub-tiles: a one-sub-tile list is the tcgen05 core's) and ``B x H_kv <= LEAN_SPARSE_MAX_UNITS`` CTAs per chunk -- the lean grid's own
+    unit: the step's ``s_q`` rows ride inside the CTA as m16 tiles, so ``s_q`` is NOT in the bound (it is the admissibility's,
+    :func:`sparse_lean_tile_decline`: at most 4 rows under one shared list; the gate's S_q 4 rows win at B 1 and lose at B 4 exactly as
+    its S_q 1 rows do) --; False above the bound (the tcgen05 core with today's split rule) and on every other part.  A dense rule from
+    the configuration (the bound is the one constant the gate moves); the AUTO reading's gate on the part is :func:`sparse_tile_form_auto`'s.
+    ``s_q`` stays in the signature (every caller passes the step width) and is deliberately unread here."""
     if device_cc is None or tuple(device_cc)[:2] != _SPARSE_LEAN_TILE_RULE_CC:
         return False
     if int(top_k) < LEAN_SPARSE_TOPK_MIN:
         return False
-    return int(batch) * int(h_kv) * int(s_q) <= LEAN_SPARSE_MAX_UNITS
+    return int(batch) * int(h_kv) <= LEAN_SPARSE_MAX_UNITS
 
 
 def sparse_lean_fill_sub_tiles(*, batch: int, h_kv: int, s_q: int, group: int, top_k: int, sm_count: int) -> int:
