@@ -25,7 +25,8 @@ import pytest
 import torch
 
 from d128_2cta_test_utils import CELLS, CENSUS as CENSUS_BASE, CHILD_TIMEOUT_S, EXPECTED_BASE, GLOBAL_PREFIX, LEVER_LINE, SKV, WATCHDOG_S
-from d128_2cta_test_utils import SITES_BASE, _adapter_class, _require_2cta, _setmaxnreg_of, make_adapter_2cta, render_2cta, render_2cta_kernels
+from d128_2cta_test_utils import CHILD_EXIT_HANG, SITES_BASE, _adapter_class, _require_2cta, _setmaxnreg_of, make_adapter_2cta, render_2cta
+from d128_2cta_test_utils import render_2cta_kernels, skip_if_child_declined
 from d128_grouped_test_utils import adapter_arguments, check_case, make_case, make_workspace, poison
 from frost_test_utils import D128_THD_SHARED_KERNELS, assert_kernel_record, read_kernel_record, requires_dsl
 
@@ -500,6 +501,24 @@ def test_2cta_stail_host_renders_for_sm_100a_and_matches_its_record(tmp_path):
     assert set(kernels) == set(_OWN_KERNELS) | set(D128_THD_SHARED_KERNELS), kernels  # the chain's five launches: four own + the shared fold
     assert _RECORD.is_file(), _RECORD
     _assert_record(kernels, _RECORD, _RECORD_TOKEN, "the s_tail default rendering")
+
+
+def test_2cta_stail_host_renders_for_sm_103a_and_matches_the_record(tmp_path):
+    """The GB300 target (cc 10.3 -> the prepared module's ``sm`` = 103 -> ``--gpu-arch sm_103a`` in the host, the same selection as the one-CTA
+    body; the sm103 CI lane): the chain trace-compiles for sm_103a on the host (no device) with the SAME census and register split as the sm_100a
+    rendering, and every kernel's `.entry` region hashes to the committed (sm_100a) record -- the body has no per-part branch, so only the module's
+    `.target` line differs between the two targets (the module md5 does, the per-kernel rows do not).  Like the one-CTA body's records, one record
+    file serves; skips by name on a DSL without the target or another DSL build."""
+    from frost_test_utils import arch_known_to_the_dsl
+
+    if not arch_known_to_the_dsl("sm_103a"):
+        pytest.skip("this cutlass-dsl has no sm_103a target")
+    md5, census, regs, kernels = render_2cta_kernels(tmp_path, {}, _CENSUS, arch="sm_103a")
+    print(f"\n2-CTA s_tail sm_103a: PTX md5 {md5} census {census} setmaxnreg {regs} kernels {kernels}")
+    assert census == _EXPECTED, census
+    assert sorted(regs) == _setmaxnreg_of(), regs
+    assert set(kernels) == set(_OWN_KERNELS) | set(D128_THD_SHARED_KERNELS), kernels
+    _assert_record(kernels, _RECORD, _RECORD_TOKEN, "the s_tail default rendering for sm_103a (per-kernel `.entry` md5s are target-independent)")
 
 
 @pytest.mark.parametrize("probe", _PROBES)
@@ -1177,8 +1196,9 @@ assert Path(cudnn.__file__).resolve() == Path({expected_fe!r}).resolve(), cudnn.
 from d128_grouped_test_utils import adapter_arguments, make_case, make_workspace, poison
 from frost_test_utils import process_watchdog
 from test_sdpa_bwd_d128_2cta_stail_sm100 import make_adapter_2cta_stail
+from d128_2cta_test_utils import child_adapter
 case = make_case((1024, 1024), (1024, 1024), hq=4, hkv=2, thd=True, dtype=torch.bfloat16, causal=True, stats_layout="TH1")
-api = make_adapter_2cta_stail(case, diag_2cta={probe!r})
+api = child_adapter(make_adapter_2cta_stail, case, diag_2cta={probe!r})  # exit CHILD_EXIT_SKIP on a typed decline (the parent skips)
 workspace = make_workspace(api.scratch_workspace_bytes())
 args = adapter_arguments(case)
 with process_watchdog({watchdog}, "2-CTA s_tail probe {probe} under leader_ship skew"):
@@ -1194,7 +1214,8 @@ def test_2cta_stail_exchange_off_is_clean_under_the_leader_ship_skew(tmp_path):
     """The mechanism's repro pair: a probe that skipped the three dS gates + `LEADER_SHIP` 300 us at s=1024 FAULTED (an over-arrival) at tile lo+1
     of every item -- the leader's late ship let the follower's ds_recv_full arm(t+1) land on the tx-pending phase t.  `exchange_off` under the
     SAME lever must run clean: no copy exists, every phase completes at its own arm (output wrong by design, not checked).  A fresh process arms
-    the lever before the body executes; exit 70 / a timeout = HANG, a CUDA error = the fault class."""
+    the lever before the body executes; exit 70 / a timeout = HANG, a CUDA error = the fault class, exit 77 = the pair body declined on this
+    device (the row SKIPS with the decline)."""
     _require_2cta()
     _adapter_class()
     import cudnn
@@ -1221,7 +1242,8 @@ def test_2cta_stail_exchange_off_is_clean_under_the_leader_ship_skew(tmp_path):
             f"[exchange_off + leader_ship {delay} us] HANG: the child did not return within {CHILD_TIMEOUT_S} s -> barrier AUDIT, never a bigger budget"
         )
     (tmp_path / "probe_skew_exchange_off.log").write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
-    if proc.returncode == 70:
+    skip_if_child_declined(proc, "exchange_off + leader_ship")
+    if proc.returncode == CHILD_EXIT_HANG:
         pytest.fail(
             f"[exchange_off + leader_ship] HANG: process_watchdog killed the child after {WATCHDOG_S:.0f} s\n{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}"
         )
@@ -1287,11 +1309,12 @@ assert Path(cudnn.__file__).resolve() == Path({expected_fe!r}).resolve(), cudnn.
 from d128_grouped_test_utils import adapter_arguments, check_case, make_case, make_workspace, poison
 from frost_test_utils import process_watchdog
 from test_sdpa_bwd_d128_2cta_stail_sm100 import make_adapter_2cta_stail
+from d128_2cta_test_utils import child_adapter
 sms = torch.cuda.get_device_properties(0).multi_processor_count
 skv = {skv}
 print("DATASET sms=%d skv=%d (inputs: the suite's CPU generator, seed 149)" % (sms, skv), flush=True)
 case = {cell}
-api = make_adapter_2cta_stail(case, **{fields!r})  # the typed op-level field(s) through the suite's factory, as the driver sets them
+api = child_adapter(make_adapter_2cta_stail, case, **{fields!r})  # the typed op-level field(s) through the suite's factory, as the driver sets them; exit 77 on a typed decline
 assert api._prepared.artifact.dkv_accum == {dkv!r}, api._prepared.artifact.dkv_accum  # the configuration under test ran (G13 section 6)
 print("DKV_ACCUM %s" % api._prepared.artifact.dkv_accum, flush=True)
 workspace = make_workspace(api.scratch_workspace_bytes())
@@ -1345,7 +1368,8 @@ def test_sdpa_bwd_d128_2cta_stail_survives_pair_skew(site, dkv_accum, stats_form
     """One lever per id on the SECOND body (``SITES[site]``: role, site, delay, what it isolates, the RED form, the expected PASS): a fresh process
     arms ``FROST_D128_2CTA_DEBUG_<SITE>_DELAY_US`` before the body executes, runs the skew / p14 cell (more pairs than SMs) under ``process_watchdog``
     and asserts the fp64 gate eagerly and under capture / replay.  Exit 70 or a subprocess timeout = HANG -> the barrier AUDIT, never a bigger
-    budget; a gate miss = the RED form's wrong rows, named by ``check_case``.  ``dkv_accum = "fp32_reduce"`` (the ``-fp32_reduce`` ids, the two
+    budget; exit 77 = the pair body declined on this device -> the row SKIPS with the decline (the sm80 / sm120 lanes); a gate miss = the RED
+    form's wrong rows, named by ``check_case``.  ``dkv_accum = "fp32_reduce"`` (the ``-fp32_reduce`` ids, the two
     ``_DKV_ACCUM_SEAM_ROWS`` levers) sets the typed op-level field in the child exactly as the driver does and pins ``artifact.dkv_accum``; the
     pass criterion is the SAME gate (the fp32 form is tighter on every validated cell) -- never a widened tolerance."""
     row = SITES[site]
@@ -1387,7 +1411,8 @@ def test_sdpa_bwd_d128_2cta_stail_survives_pair_skew(site, dkv_accum, stats_form
         (tmp_path / f"skew_stail_{tag}.log").write_text(out)
         pytest.fail(f"[{site}] HANG: the child did not return within {CHILD_TIMEOUT_S} s (RED form: {row['red']}) -> barrier AUDIT, never a bigger budget")
     (tmp_path / f"skew_stail_{tag}.log").write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
-    if proc.returncode == 70:
+    skip_if_child_declined(proc, site)
+    if proc.returncode == CHILD_EXIT_HANG:
         pytest.fail(
             f"[{site}] HANG: process_watchdog killed the child after {WATCHDOG_S:.0f} s (RED form: {row['red']})\n{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}"
         )

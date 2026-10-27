@@ -57,9 +57,10 @@ CTA_PAIR_MODE_DEFAULT = "auto"
 # Both declared extents (S_q and S_kv: the batch's LONGEST sequence on each side) must reach it: the measured cells have them equal, so a
 # lopsided batch serves the measured-safe one-CTA body.
 CTA_PAIR_MIN_SEQ = 8192
-# The measured part.  SM103 (cc 10.3) is admitted by the pair body's own support check but has no measurement: it serves the one-CTA body
-# under ``auto`` and declines ``on`` by name until a row is measured there.
-CTA_PAIR_CCS = ((10, 0),)
+# The SM100 line: GB200 (cc 10.0, the measured part) and GB300 (cc 10.3: the same tcgen05 / cta_group::2 / TMEM / CLC features, the same
+# per-S rule; the compile target follows the device -- ``--gpu-arch sm_{cc}a`` in the prepared host, as for the one-CTA body).  Hopper, SM120
+# and any other line have no pair body: ``auto`` serves the one-CTA body there and ``on`` declines by name.
+CTA_PAIR_CCS = ((10, 0), (10, 3))
 CTA_PAIR_CLUSTER = CFG.CGA_M  # the pair = one cluster of two CTAs; the device must admit at least one such cluster (the occupancy query)
 CTA_PAIR_BODY = "s_tail"  # the pair body's identity (its TMEM map: the dQ image in S^T's dead tail) = config_sm100_d128_accum_2cta_stail.CFG.TMEM_MAP
 PAIR_BODY = "2cta"
@@ -132,7 +133,13 @@ def select_cta_pair(mode, *, thd, s_q_max, s_kv_max, cc, max_active_pairs):
     if not thd:
         failures.append(("thd", "requires THD (the pair body has no dense twin)", "a dense declaration"))
     if cc not in CTA_PAIR_CCS:
-        failures.append(("cc", f"requires cc in {CTA_PAIR_CCS} (the measured part)", "a device that is not CUDA" if cc is None else str(cc)))
+        failures.append(
+            (
+                "cc",
+                f"requires cc in {CTA_PAIR_CCS} (the SM100 line; the per-S threshold was measured on GB200, cc 10.0)",
+                "a device that is not CUDA" if cc is None else str(cc),
+            )
+        )
     if mode == "auto" and min(s_q_max, s_kv_max) < CTA_PAIR_MIN_SEQ:
         failures.append(("seq", f"both declared S_q and S_kv >= {CTA_PAIR_MIN_SEQ}", f"({s_q_max}, {s_kv_max})"))
     admitted = None
