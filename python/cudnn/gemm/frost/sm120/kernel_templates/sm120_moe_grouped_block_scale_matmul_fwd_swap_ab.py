@@ -62,10 +62,11 @@ TMA-store epilogue; the workspace is the scheduler counter alone
 
 Per-side operand forms, as the non-swapped kernel: a mixed MXFP4 x MXFP8 pair
 (``kind::mxf8f6f4`` m16n8k32, either operand e2m1) loads its e2m1 side either
-padded -- K a multiple of 128: TMA ``.b4x16_p64`` into one-byte containers in
+padded -- opt-in (``jit_from_cudnn_graph(..., padded_e2m1=True)``) and K a
+multiple of 128: TMA ``.b4x16_p64`` into one-byte containers in
 128-byte ``s128b`` rows, ``ldmatrix ... .b8x16.b4x16_p64`` expanding the
-fragment and one shift per register (``_ldm_frags``) -- or packed (TMA
-``.b4x16`` into 64-byte ``s64b`` rows, any K a multiple of 32) with that side's
+fragment and one shift per register (``_ldm_frags``) -- or packed, the default
+(TMA ``.b4x16`` into 64-byte ``s64b`` rows, any K a multiple of 32) with that side's
 fragment registers built from two packed words per lane (``_fp4_frag_regs``:
 the nibbles spread to bits [5:2] of the fp8 fragment layout's bytes); see
 ``kernel_registry.sm120_padded_e2m1_sides``. A one-sided graph's raw-FP8 side
@@ -204,7 +205,8 @@ _B_KBLK_BYTES = _B_ROW_BYTES // _NUM_K_BLOCKS
 _ELEMS_16B = 16  # packed bytes per 16-byte ldmatrix row
 # The e2m1 operand of a mixed pair: kind::mxf8f6f4 reads e2m1 from bits [5:2]
 # of an 8-bit container (the fp8 fragment layout). Two SMEM forms, chosen per
-# side by the renderer (kernel_registry.sm120_padded_e2m1_sides):
+# side by the renderer (kernel_registry.sm120_padded_e2m1_sides; packed is the
+# default, padded an opt-in: jit_from_cudnn_graph(..., padded_e2m1=True)):
 # * PADDED (TMA .b4x16_p64; a 128-element K tile of a K that is a multiple of
 #   128): every 16 values land in a 16-byte chunk (8 B payload + 8 B zero), so
 #   the row is the fp8 side's 128 bytes, one byte per value, and
@@ -1495,6 +1497,13 @@ def _host(
     # [group_elems, K_tile] boxes, one per M group. Strides arrive in one-byte
     # storage elements (a_fake_dtype). The data and SF lists are built
     # separately: a raw-FP8 weight (one-sided dequant) has no SFA operand.
+    # The A and B data descriptors carry CUTLASS's default TMA L2 promotion
+    # (128 B). Their box rows are 64 B for the packed e2m1 side of a mixed MXFP4 x
+    # MXFP8 pair (a 128-element fp8 K-tile holds 128 e2m1 values), and without the
+    # hint each 64-byte row is its own DRAM request: on an RTX PRO 6000 (SM120) the
+    # weight stream then tops out near 0.85 TB/s against 1.19 TB/s with it, which
+    # was the whole gap between the W4A8 and NVFP4 kernels of one tile. 128-byte
+    # rows (fp8, and e2m1 at the fp4 K-tile) measure the same with or without it.
     tma_a_desc_list = []
     for _a_idx, _a_op in enumerate(_a_operands):
         a_stride_m, a_stride_k, a_stride_l = _a_stride_sets[_a_idx]
@@ -1511,6 +1520,7 @@ def _host(
                     box_dims=[a_tma_group_elems, cta_tile_mnk[2], 1],
                     swizzle=a_tma_swizzle,
                     tma_format=a_tma_format,
+                    l2_promotion=_tma.TensorMapL2Promotion.l2_128b,
                 )
             )
         else:
@@ -1526,6 +1536,7 @@ def _host(
                     box_dims=[cta_tile_mnk[2], cta_tile_mnk[0], 1],
                     swizzle=a_tma_swizzle,
                     tma_format=a_tma_format,
+                    l2_promotion=_tma.TensorMapL2Promotion.l2_128b,
                 )
             )
     tma_sfa_desc_list = []
@@ -1576,6 +1587,7 @@ def _host(
                 box_dims=b_box,
                 swizzle=b_tma_swizzle,
                 tma_format=b_tma_format,
+                l2_promotion=_tma.TensorMapL2Promotion.l2_128b,
             )
         )
     # The SF list is its own loop: a raw-FP8 token (one-sided dequant) has no SFB operand.
@@ -1621,8 +1633,12 @@ def _host(
     grid_shape = (grid_num_clusters, 1, 1)
     # Zero the scheduler counter on the launch stream. The PDL main kernel
     # below reads it only after griddepcontrol.wait, i.e. once this has landed.
+    # A runtime that zeroed the counter qword on this stream already (its own
+    # routing kernel, say) renders external_counter_reset True and saves the
+    # one-thread launch; the kernel then relies on that write having landed.
     counter_qword = grid_num_clusters * moe_desc_slots * TENSOR_MAP_QWORDS
-    _dynamic_scheduler_counter_initialization(tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
+    if cutlass.const_expr(not external_counter_reset):
+        _dynamic_scheduler_counter_initialization(tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     _kernel(
         problem_size[0],
         problem_size[1],

@@ -473,6 +473,31 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
 
     q, k, v, o = operand("q"), operand("k"), operand("v"), operand("o")
     geo = resolve_thd_geometry(spec, facts)
+    if getattr(spec, "origin_specs", None) is not None:
+        from cudnn.sdpa.fwd.thd_origins import ROLES
+
+        pointers = []
+        for role, origin in zip(ROLES, spec.origin_specs):
+            offset = facts.get(role)
+            if origin is None:
+                if offset is not None:
+                    raise ValueError("unexpected THD physical-offset operand")
+                pointers.append(None)
+                continue
+            if offset is None:
+                raise ValueError("THD physical-offset operand is required")
+            on_plan_device(role, offset)
+            if (
+                offset.dtype != f"int{origin[3]}"
+                or not offset.contiguous
+                or offset.numel != geo.b + 1
+                or 0 <= offset.span < geo.b + 1
+                or not offset.ptr
+                or offset.ptr % (origin[3] // 8)
+            ):
+                raise ValueError("THD physical offsets require contiguous declared-width B+1 storage")
+            pointers.append(offset.ptr)
+        frame[ix["thd_origin_ptrs"]] = tuple(pointers)
     frame[ix["q_ptr"]], frame[ix["k_ptr"]], frame[ix["v_ptr"]], frame[ix["o_ptr"]] = q.ptr, k.ptr, v.ptr, o.ptr
     for name, slot in (("q", "q_strides"), ("o", "o_strides")) + (() if spec.paged else (("k", "k_strides"), ("v", "v_strides"))):
         ts, hs, _es, _row = geo.roles[name]
@@ -964,7 +989,12 @@ class ReferenceThdBinder(_ReferenceBinder):
         from cudnn.sdpa.fwd.prepared import _NATIVE_THD_ROLES
 
         spec = self.spec
-        facts = self.facts(pack, indices, _NATIVE_THD_ROLES + _native_quant_roles(spec.quant))
+        roles = _NATIVE_THD_ROLES + _native_quant_roles(spec.quant)
+        if getattr(spec, "origin_specs", None) is not None:
+            from cudnn.sdpa.fwd.thd_origins import ROLES
+
+            roles += ROLES
+        facts = self.facts(pack, indices, roles)
         if spec.quant is not None:
             return execute_quantized(spec, facts, workspace, stream, int(stream), scale_softmax_log2=scale)
         return execute_thd(spec, facts, workspace, stream, int(stream), scale)

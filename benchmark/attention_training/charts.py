@@ -174,6 +174,15 @@ def _draw_peak_lines(ax, dtypes, peak_tflops):
         ax.axhline(peak, linestyle="--", linewidth=1.3, color=style["color"], alpha=0.85, label=style["label"], zorder=1)
 
 
+def _case_label(r, multi_model: bool) -> str:
+    """x-axis label: the shape, plus the model when a config has several and the fill when sequences are ragged."""
+    label = f"{r['model_name']} {r['q_seqlen']}x{r['kv_seqlen']}" if multi_model else f"{r['q_seqlen']}x{r['kv_seqlen']}"
+    if r.get("layout") == "thd":
+        fill = r.get("thd_min_fill")
+        label += " thd" + (f" fill{float(fill):g}" if fill is not None and float(fill) < 1 else "")
+    return label
+
+
 def generate_charts_by_mask(
     df: "pd.DataFrame",
     config: "BenchmarkConfig",
@@ -244,7 +253,7 @@ def generate_charts_by_mask(
             ),
             axis=1,
         )
-        mask_df["seqlen_label"] = mask_df.apply(lambda r: f"{r['q_seqlen']}x{r['kv_seqlen']}", axis=1)
+        mask_df["seqlen_label"] = mask_df.apply(lambda r: _case_label(r, multi_model=mask_df["model_name"].nunique() > 1), axis=1)
 
         # Build palette
         unique_combos = mask_df[["backend", "data_type", "backend_display"]].drop_duplicates()

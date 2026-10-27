@@ -13,10 +13,12 @@ WORKSPACE_SLACK = WORKSPACE_ALIGNMENT - 16
 ABI_VERSION = 3
 
 
-def validate_dense_bounds(batch, heads, sq, skv):
+def validate_dense_bounds(batch, heads, sq, skv, window_left=None):
     """Bound dense MHA declarations before either implementation is selected."""
     if any(type(n) is not int or n <= 0 for n in (batch, heads, sq, skv)):
         raise ValueError("dense d128 dimensions must be positive integers")
+    if window_left is not None and (type(window_left) is not int or window_left < 0 or max(sq, skv) + window_left + 129 > 2**31 - 1):
+        raise ValueError("dense d128 sliding-window envelope exceeds safe Int32 tile rounding")
     # The recompute body uses Int32 sequence coordinates, including the
     # one-past-tile endpoint and ceil_div(endpoint, 128) in the causal bound.
     if max(sq, skv) > 2**31 - 128:

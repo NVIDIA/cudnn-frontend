@@ -370,6 +370,21 @@ def parse_args():
         type=int,
         help="Sliding window attention size (number of tokens to look back from diagonal)",
     )
+    parser.add_argument(
+        "--layout",
+        default="bshd",
+        choices=["bshd", "thd"],
+        help="thd: packed variable-length (ragged) Q/K/V/O/Stats with per-sequence lengths and a padding mask; "
+        "cudnn / cudnn_oss / cudnn_auto at bfloat16 / float16 only. --batch_size is the sequence count, "
+        "--q_seqlen / --kv_seqlen the longest sequence",
+    )
+    parser.add_argument(
+        "--thd_min_fill",
+        default=1.0,
+        type=float,
+        help="thd only: each sequence's Q length is drawn (seeded) from [min_fill * q_seqlen, q_seqlen], its KV length "
+        "scaled by kv_seqlen / q_seqlen; sequences are packed back to back. 1.0 = equal-length sequences",
+    )
     return parser.parse_args()
 
 
@@ -393,6 +408,8 @@ def run_benchmark(
     sliding_window_size: Optional[int] = None,
     verbose: bool = False,
     fa4_num_splits: Optional[int] = None,
+    layout: str = "bshd",
+    thd_min_fill: float = 1.0,
 ) -> Dict[str, Any]:
     """
     Run a single SDPA benchmark.
@@ -419,6 +436,8 @@ def run_benchmark(
         deterministic_bwd: Use deterministic backward algorithm
         sliding_window_size: Sliding window attention size (None = no sliding window)
         verbose: Print verbose output
+        layout: "bshd" (dense) or "thd" (packed variable-length; cuDNN legs only)
+        thd_min_fill: THD only; shortest sequence as a fraction of the longest (1.0 = equal lengths)
 
     Returns:
         Dict with keys:
@@ -486,6 +505,8 @@ def run_benchmark(
         cmd.append("--verbose")
     if fa4_num_splits is not None:
         cmd.extend(["--fa4_num_splits", str(fa4_num_splits)])
+    if layout != "bshd":
+        cmd.extend(["--layout", layout, "--thd_min_fill", str(thd_min_fill)])
 
     # Run benchmark
     result = subprocess.run(
@@ -544,6 +565,7 @@ def run_benchmark(
             pass
 
     return {
+        "backend_detail": ",".join(parts[15:]) or None,
         "time_ms": time_ms,
         "tflops": tflops,
         "max_diff": float(parts[12]) if len(parts) > 12 else 0.0,
@@ -665,6 +687,42 @@ else:
             raise ValueError("mxfp8 is only supported with the 'cudnn'/'cudnn_oss'/'cudnn_auto' backends")
         if not HAS_CUTLASS:
             raise RuntimeError("CUTLASS is required for mxfp8 but is not installed")
+
+    # THD reuses the BSHD capacity buffers: ragged offsets pack each sequence into their front, Stats is token-major.
+    thd = args.layout == "thd"
+    thd_buffers = {}
+    if thd:
+        if not is_cudnn_fe or args.data_type not in ("bfloat16", "float16"):
+            exit_unsupported("--layout thd is wired for the cudnn / cudnn_oss / cudnn_auto legs at bfloat16 / float16 only")
+        args.skip_ref = True  # the reference path is dense
+        _lo = max(1, math.ceil(args.thd_min_fill * q_seqlen))
+        thd_q_lens = torch.randint(_lo, q_seqlen + 1, (batch_size,), generator=torch.Generator().manual_seed(0))
+        thd_kv_lens = torch.clamp((thd_q_lens * kv_seqlen + q_seqlen - 1) // q_seqlen, max=kv_seqlen)
+
+        # Tightly packed: offsets = prefix(lengths). The FROST THD rows derive sequence bases that way and do not read
+        # the bound offsets yet (issue #737), so padded THD would time wrong results on them.
+        def _token_offsets(lens):
+            return torch.cat([torch.zeros(1, dtype=torch.int64), torch.cumsum(lens, 0)])
+
+        _tok_q, _tok_kv = _token_offsets(thd_q_lens), _token_offsets(thd_kv_lens)
+        # Packed token totals, declared on the graph as Transformer Engine does for THD.
+        thd_totals = dict(max_total_seq_len_q=int(_tok_q[-1]), max_total_seq_len_kv=int(_tok_kv[-1]))
+        thd_buffers = {
+            "seq_len_q": thd_q_lens.to(torch.int32),
+            "seq_len_kv": thd_kv_lens.to(torch.int32),
+            "q": _tok_q * num_q_heads * head_dim_qk,
+            "k": _tok_kv * num_kv_heads * head_dim_qk,
+            "v": _tok_kv * num_kv_heads * head_dim_vo,
+            "o": _tok_q * num_q_heads * head_dim_vo,
+            "stats": _tok_q * num_q_heads,
+        }
+        thd_buffers = {name: t.view(-1, 1, 1, 1).to(device) for name, t in thd_buffers.items()}
+
+    def _new_stats():
+        if thd:
+            return torch.empty(batch_size, q_seqlen, num_q_heads, 1, dtype=torch.float32, device=device).transpose(1, 2)
+        return torch.empty(batch_size, num_q_heads, q_seqlen, 1, dtype=torch.float32, device=device)
+
     # if args.sdpa_backend in ["flash_attention", "flash_attention_3", "pyt_flash_attention"]:
     #     assert args.attn_mask != "top_left", "Flash Attention does not support top left causal mask"
 
@@ -799,7 +857,7 @@ else:
         # allocate BHSD-contiguous and hand every backward a gradient laid out
         # differently from the activations.
         dOutput = torch.randn(batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=randn_dtype, device=device).to(target_dtype).transpose(1, 2)
-        stats = torch.empty(batch_size, num_q_heads, q_seqlen, 1, dtype=torch.float32, device=device)
+        stats = _new_stats()
         if is_dropout:
             dropout_seed = torch.full((1, 1, 1, 1), 123456, dtype=torch.int64, device="cuda")
             dropout_offset = torch.full((1, 1, 1, 1), 789, dtype=torch.int64, device="cuda")
@@ -910,6 +968,12 @@ else:
             q_fwd = graph_fwd.tensor_like(query)
             k_fwd = graph_fwd.tensor_like(key)
             v_fwd = graph_fwd.tensor_like(value)
+            thd_kwargs = {}
+            if thd:
+                thd_fwd = {name: graph_fwd.tensor_like(t) for name, t in thd_buffers.items()}
+                for t, name in ((q_fwd, "q"), (k_fwd, "k"), (v_fwd, "v")):
+                    t.set_ragged_offset(thd_fwd[name])
+                thd_kwargs = dict(use_padding_mask=True, seq_len_q=thd_fwd["seq_len_q"], seq_len_kv=thd_fwd["seq_len_kv"], **thd_totals)
             o_fwd, stats_fwd = graph_fwd.sdpa(
                 q=q_fwd,
                 k=k_fwd,
@@ -921,6 +985,7 @@ else:
                 diagonal_band_left_bound=left_bound,
                 diagonal_band_right_bound=right_bound,
                 dropout=dropout_tuple if is_dropout else None,
+                **thd_kwargs,
             )
 
         if run_bwd:
@@ -966,6 +1031,10 @@ else:
             else:
                 o_fwd.set_output(True).set_dim(output.size()).set_stride(output.stride())
                 (stats_fwd.set_output(True).set_dim(stats.size()).set_stride(stats.stride()).set_data_type(cudnn.data_type.FLOAT) if not is_infer else None)
+
+        if thd:
+            o_fwd.set_ragged_offset(thd_fwd["o"])
+            stats_fwd.set_ragged_offset(thd_fwd["stats"])
 
         if args.data_type == "fp8":
             amax_o_fwd.set_output(True).set_dim(amax_o_gpu.size()).set_stride(amax_o_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
@@ -1216,6 +1285,12 @@ else:
                 v_bwd = graph_bwd.tensor_like(value)
                 o_bwd = graph_bwd.tensor_like(output)
                 dO_bwd = graph_bwd.tensor_like(dOutput)
+                thd_kwargs = {}
+                if thd:
+                    thd_bwd = {name: graph_bwd.tensor_like(t) for name, t in thd_buffers.items()}
+                    for t, name in ((q_bwd, "q"), (k_bwd, "k"), (v_bwd, "v"), (o_bwd, "o"), (dO_bwd, "o"), (stats_bwd, "stats")):
+                        t.set_ragged_offset(thd_bwd[name])
+                    thd_kwargs = dict(use_padding_mask=True, seq_len_q=thd_bwd["seq_len_q"], seq_len_kv=thd_bwd["seq_len_kv"], **thd_totals)
 
                 dQ_bwd, dK_bwd, dV_bwd = graph_bwd.sdpa_backward(
                     q=q_bwd,
@@ -1230,6 +1305,7 @@ else:
                     diagonal_band_right_bound=right_bound,
                     dropout=dropout_tuple if is_dropout else None,
                     use_deterministic_algorithm=args.deterministic_bwd,
+                    **thd_kwargs,
                 )
 
             if args.data_type == "fp8":
@@ -1259,6 +1335,9 @@ else:
                 dQ_bwd.set_output(True).set_dim(dQuery.size()).set_stride(dQuery.stride())
                 dK_bwd.set_output(True).set_dim(dKey.size()).set_stride(dKey.stride())
                 dV_bwd.set_output(True).set_dim(dValue.size()).set_stride(dValue.stride())
+                if thd:
+                    for t, name in ((dQ_bwd, "q"), (dK_bwd, "k"), (dV_bwd, "v")):
+                        t.set_ragged_offset(thd_bwd[name])
 
             graph_bwd.validate()
             graph_bwd.build_operation_graph()
@@ -1450,6 +1529,10 @@ else:
                 if not is_infer:
                     variant_pack_fwd[stats_fwd] = stats
                 workspace = torch.empty(graph_fwd.get_workspace_size(), device="cuda", dtype=torch.uint8)
+        if thd:
+            variant_pack_fwd.update({thd_fwd[name]: t for name, t in thd_buffers.items()})
+            if run_bwd:
+                variant_pack_bwd.update({thd_bwd[name]: t for name, t in thd_buffers.items()})
         if is_dropout:
             variant_pack_fwd[seed_fwd] = dropout_seed
             variant_pack_fwd[offset_fwd] = dropout_offset
@@ -1603,17 +1686,24 @@ else:
     ):
         assert mode in ["fwd", "bwd", "fwd_bwd"]
 
-        if attn_mask == "no_mask":
-            num_nonmasked_elems = q_seqlen * kv_seqlen
-        elif attn_mask in ("top_left", "bottom_right"):
-            num_nonmasked_elems = count_causal_nonmasked_elems(q_seqlen, kv_seqlen, attn_mask, sliding_window_size)
-        else:
+        @functools.lru_cache(maxsize=None)
+        def nonmasked_elems(s_q, s_kv):
+            if attn_mask == "no_mask":
+                return s_q * s_kv
+            if attn_mask in ("top_left", "bottom_right"):
+                return count_causal_nonmasked_elems(s_q, s_kv, attn_mask, sliding_window_size)
             raise ValueError(f"Unknown attn_mask: {attn_mask}")
+
+        # THD counts each sequence at its own lengths.
+        if thd:
+            num_nonmasked_elems = sum(nonmasked_elems(int(s_q), int(s_kv)) for s_q, s_kv in zip(thd_q_lens, thd_kv_lens))
+        else:
+            num_nonmasked_elems = batch_size * nonmasked_elems(q_seqlen, kv_seqlen)
         # BMM FLOPs: 2 * M * N * K.
-        # Here, M*N = num_nonmasked_elems per head; add batch_size * num_q_heads multiplier.
+        # Here, M*N = num_nonmasked_elems per head, summed over the batch; add the num_q_heads multiplier.
         # Forward: 2 BMMs => (1 x head_dim_qk) + (1 x head_dim_vo)
         # Backward: 5 BMMs => (3 x head_dim_qk) + (2 x head_dim_vo)
-        base = batch_size * num_q_heads * num_nonmasked_elems * 2
+        base = num_q_heads * num_nonmasked_elems * 2
         if mode == "fwd":
             result = base * (head_dim_qk + head_dim_vo)
         elif mode == "bwd":
@@ -1736,7 +1826,7 @@ else:
                 dQuery = torch.empty_like(query)
                 dKey = torch.empty_like(key)
                 dValue = torch.empty_like(value)
-            stats = torch.empty(batch_size, num_q_heads, q_seqlen, 1, dtype=torch.float32, device=device)
+            stats = _new_stats()
             if is_dropout:
                 dropout_seed = torch.full((1, 1, 1, 1), 123456, dtype=torch.int64, device="cuda")
                 dropout_offset = torch.full((1, 1, 1, 1), 789, dtype=torch.int64, device="cuda")
@@ -1898,6 +1988,10 @@ else:
                         variant_pack_fwd[stats_fwd] = stats
                 workspace = torch.empty(graph_fwd.get_workspace_size(), device="cuda", dtype=torch.uint8)
 
+            if thd:
+                variant_pack_fwd.update({thd_fwd[name]: t for name, t in thd_buffers.items()})
+                if run_bwd:
+                    variant_pack_bwd.update({thd_bwd[name]: t for name, t in thd_buffers.items()})
             if is_dropout:
                 variant_pack_fwd[seed_fwd] = dropout_seed
                 variant_pack_fwd[offset_fwd] = dropout_offset
@@ -2158,8 +2252,16 @@ else:
     bwd_sol_str = _sol(bwd_tflops)
 
     if args.format_output:
+        # Trailing field: the plan the measured pass ran (cuDNN legs; may itself contain commas, so it goes last).
+        _plan = ""
+        if is_cudnn_fe:
+            _g = graph_fwd if run_fwd else graph_bwd
+            try:
+                _plan = _g.get_plan_name_at_index(_g._plan_index)
+            except Exception:
+                _plan = "unknown"
         print(
-            f"{args.case_tag},{args.sdpa_backend},{args.batch_size},{args.q_seqlen},{args.kv_seqlen},{args.num_q_heads},{args.num_kv_heads},{head_dim_qk},{fwd_median_time:.3f},{bwd_median_time:.3f},{fwd_tflops:.0f},{bwd_tflops:.0f},{(np.max(np.array(forward_diffs[5:])) if len(forward_diffs) > 5 else (np.max(np.array(forward_diffs)) if len(forward_diffs) > 0 else 0.0)):.6f},{num_iters},{f'{_peak_mma_tflops:.0f}' if _peak_mma_tflops else ''}"
+            f"{args.case_tag},{args.sdpa_backend},{args.batch_size},{args.q_seqlen},{args.kv_seqlen},{args.num_q_heads},{args.num_kv_heads},{head_dim_qk},{fwd_median_time:.3f},{bwd_median_time:.3f},{fwd_tflops:.0f},{bwd_tflops:.0f},{(np.max(np.array(forward_diffs[5:])) if len(forward_diffs) > 5 else (np.max(np.array(forward_diffs)) if len(forward_diffs) > 0 else 0.0)):.6f},{num_iters},{f'{_peak_mma_tflops:.0f}' if _peak_mma_tflops else ''},{_plan}"
         )
     else:
         _tt = " [cuda-events]" if _EVENT_TIMING else ""

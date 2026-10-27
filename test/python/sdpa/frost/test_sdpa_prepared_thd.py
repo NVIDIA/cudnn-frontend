@@ -103,6 +103,7 @@ def _thd_graph(
     padded_stats=False,
     bottom_right=False,
     window_left=None,
+    independent_o_offsets=False,
 ):
     """A THD bf16 graph the way FlashInfer declares it: BHSD dims with ragged offsets, cu_seq_len
     lengths, token-major Stats. ``ragged_batch_stride`` mimics FlashInfer's small declared batch
@@ -124,6 +125,7 @@ def _thd_graph(
     off_q = g.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=i32, name="off_q")
     off_kv = g.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=i32, name="off_kv")
     off_lse = g.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=i32, name="off_lse")
+    off_o = g.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64, name="off_o") if independent_o_offsets else off_q
     tq.set_ragged_offset(off_q)
     tk.set_ragged_offset(off_kv)
     tv.set_ragged_offset(off_kv)
@@ -146,7 +148,7 @@ def _thd_graph(
         max_total_seq_len_q=b * ql,
         max_total_seq_len_kv=b * kl,
     )
-    to.set_output(True).set_dim([b, hq, ql, d]).set_stride([q_bs, d, hq * d, 1]).set_ragged_offset(off_q)
+    to.set_output(True).set_dim([b, hq, ql, d]).set_stride([q_bs, d, hq * d, 1]).set_ragged_offset(off_o)
     ts.set_output(True).set_dim([b, hq, ql, 1]).set_stride([ql * hq, 1, hq, 1]).set_data_type(cudnn.data_type.FLOAT)
     if padded_stats:
         ts.set_stride([hq * ql, ql, 1, 1])
@@ -163,6 +165,8 @@ def _thd_graph(
     g.check_support()
     g.build_plans()
     tensors = dict(q=tq, k=tk, v=tv, o=to, stats=ts, cu_q=t_cu_q, cu_kv=t_cu_kv, off_q=off_q, off_kv=off_kv, off_lse=off_lse)
+    if independent_o_offsets:
+        tensors["off_o"] = off_o
     if has_sink:
         tensors["sink"] = sink
     return g, tensors
@@ -194,6 +198,7 @@ def _buffers(b, ql, kl, hq, hk, d, seed=0, dtype=torch.bfloat16, *, generator=No
 
 def _pack(t, bufs):
     return {
+        **({t["off_o"]: bufs["off_o"]} if "off_o" in t else {}),
         t["q"]: bufs["q"],
         t["k"]: bufs["k"],
         t["v"]: bufs["v"],
@@ -229,6 +234,48 @@ def _reference(bufs, b, ql, kl, hq, hk, d, causal=True):
 
 def _plan(g):
     return g._compiled_plans[g._plan_index]
+
+
+def _compact_thd_api(bufs, b, ql, kl, hq, hk, d):
+    """Prepare the actual standalone compact-prefix contract independently of a graph plan."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    api = SdpaFwdDslSm100(
+        sample_q=bufs["q"].view(b, ql, hq, d).transpose(1, 2),
+        sample_k=bufs["k"].view(b, kl, hk, d).transpose(1, 2),
+        sample_v=bufs["v"].view(b, kl, hk, d).transpose(1, 2),
+        sample_o=bufs["o"].view(b, ql, hq, d).transpose(1, 2),
+        sample_lse=bufs["lse"].view(b, ql, hq, 1).transpose(1, 2),
+        scale_softmax=1 / math.sqrt(d),
+        is_causal=True,
+        seq_kv_lens_present=True,
+        cu_seq_q_lens=True,
+        cu_seq_kv_lens=True,
+        thd=True,
+        cga=2,
+        split_kv=1,
+        pack_gqa=False,
+    )
+    assert api.check_support()
+    api.compile()
+    assert api._thd_spec.native is not None
+    return api
+
+
+def _execute_compact_thd(api, bufs, workspace):
+    from cuda.bindings import driver as cuda_driver
+
+    api.execute(
+        bufs["q"],
+        bufs["k"],
+        bufs["v"],
+        bufs["o"],
+        lse_tensor=bufs["lse"],
+        seq_q_lens=bufs["cu_q"],
+        seq_kv_lens=bufs["cu_kv"],
+        workspace=workspace,
+        current_stream=cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
 
 
 class _Recorder:
@@ -282,7 +329,7 @@ def test_rubin_ragged_pack_rebind_and_changed_lengths_replay(dtype, stats_layout
 
 
 def _check_rubin_ragged_pack_rebind(
-    dtype, stats_layout, stats_log2, geometry, *, cga, causal=True, bottom_right=False, window_left=None, packed=None, sched_policy=1
+    dtype, stats_layout, stats_log2, geometry, *, cga, causal=True, bottom_right=False, window_left=None, packed=None, sched_policy=1, tile_n=None
 ):
     import inspect
 
@@ -325,12 +372,17 @@ def _check_rubin_ragged_pack_rebind(
             cudnn.knob_type.SCHED_POLICY: sched_policy,
         }
     )
+    if tile_n is not None:
+        knobs[cudnn.knob_type.TILE_N] = tile_n
     g.create_execution_plan(engine, knobs)
     g.select_plan(g.get_execution_plan_count() - 1)
     g.check_support()
     g.build_plans()
     api = inspect.getclosurevars(_plan(g)._compiled.default_stream).nonlocals["api"]
     assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
+    if tile_n is not None:
+        assert api._k_mod.PARAMS.tile_n == api._k_mod.CFG.TILE_N == tile_n
+        assert api._k_mod.PARAMS.s_slots == api._k_mod.CFG.S_SLOTS == (2 if tile_n == 64 else 1)
     assert api._k_mod.CFG.CTA_MMA == cga
     assert api._k_mod.CFG.SOFTMAX_WARPGROUPS == 2
     assert api._k_mod.THD_PERSISTENT
@@ -689,7 +741,7 @@ def test_zero_kv_clamp_and_runtime_strides(monkeypatch):
     # K / V sliced out of a fused (T, 2*H_kv, D) slab: a runtime token stride of 2*H_kv*D, bound as such
     slab = torch.randn(b * kl, 2 * hk, d, device=DEV, dtype=torch.bfloat16)
     k_view, v_view = slab[:, :hk], slab[:, hk:]
-    fused = dict(bufs, k=k_view, v=v_view)
+    fused = dict(bufs, k=k_view, v=v_view, off_kv=bufs["off_kv"] * 2)
     fused["o"].fill_(float("nan"))
     rec = _Recorder(spec)
     try:
@@ -840,31 +892,48 @@ def test_execute_allocates_nothing_and_never_synchronizes():
 
 @requires_pre_rubin_blackwell
 @requires_dsl
-def test_graph_and_standalone_execute_bind_the_same_frame():
-    """The graph plan and the adapter's execute() are the same core: identical frames, up to the stream."""
+def test_graph_and_standalone_execute_bind_the_same_operands():
+    """Physical-origin graph and compact standalone hosts bind the same operand geometry."""
     b, ql, kl, hq, hk, d = 4, 4, 64, 8, 2, 128
     g, t = _thd_graph(b, ql, kl, hq, hk, d)
     ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
     bufs = _buffers(b, ql, kl, hq, hk, d)
-    plan = _plan(g)
-    rec = _Recorder(plan._prepared.spec)
+    api = _compact_thd_api(bufs, b, ql, kl, hq, hk, d)
+    standalone_ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=DEV, dtype=torch.uint8)
+    recorders = [_Recorder(_plan(g)._prepared.spec), _Recorder(api._thd_spec)]
+    o_ref, lse_ref = _reference(bufs, b, ql, kl, hq, hk, d)
     try:
         g.execute(_pack(t, bufs), ws)
         torch.cuda.synchronize()
-        prepared_frame = rec.frames[-1]
-        plan._prepared, plan.takes_variant_pack = None, False
-        try:
-            g.execute(_pack(t, bufs), ws)
-            torch.cuda.synchronize()
-        finally:
-            plan._prepared, plan.takes_variant_pack = rec.spec and plan._compiled.prepared, True
-        standalone_frame = rec.frames[-1]
+        torch.testing.assert_close(bufs["o"].float(), o_ref, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(bufs["lse"], lse_ref, atol=1e-3, rtol=1e-3)
+        bufs["o"].fill_(float("nan"))
+        bufs["lse"].fill_(float("nan"))
+        _execute_compact_thd(api, bufs, standalone_ws)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(bufs["o"].float(), o_ref, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(bufs["lse"], lse_ref, atol=1e-3, rtol=1e-3)
     finally:
-        rec.restore()
-    assert len(rec.frames) == 2
-    for name in rec.spec.order:
-        if name == "stream":
-            continue
+        for recorder in recorders:
+            recorder.restore()
+    assert all(len(recorder.frames) == 1 for recorder in recorders)
+    prepared_frame, standalone_frame = (recorder.frames[0] for recorder in recorders)
+    # Descriptors and scratch are independently owned; origin slots deliberately
+    # differ, while both public entry points must bind the current operands.
+    for name in (
+        "q_ptr",
+        "k_ptr",
+        "v_ptr",
+        "o_ptr",
+        "lse_ptr",
+        "q_strides",
+        "k_strides",
+        "v_strides",
+        "o_strides",
+        "lse_strides",
+        "problem_size",
+        "scale_softmax_log2",
+    ):
         assert str(prepared_frame[name]) == str(standalone_frame[name]), name
 
 
@@ -1418,6 +1487,8 @@ def test_native_thd_rebind_stream_capture_and_standalone(dtype, ordered, monkeyp
     plan = _plan(g)
     assert plan._prepared.spec.native is not None
     bufs = _buffers(b, ql, kl, hq, hk, d, dtype=dtype)
+    api = _compact_thd_api(bufs, b, ql, kl, hq, hk, d)
+    standalone_ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=DEV, dtype=torch.uint8)
     ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -1446,17 +1517,12 @@ def test_native_thd_rebind_stream_capture_and_standalone(dtype, ordered, monkeyp
         # could leave the preceding graph's correct outputs untouched.
         bufs["o"].fill_(float("nan"))
         bufs["lse"].fill_(float("nan"))
-        # The tensor/standalone route must share the same native evaluator.
-        prepared = plan._prepared
-        plan._prepared, plan.takes_variant_pack = None, False
-        try:
-            execute(bufs, ws)
-        finally:
-            plan._prepared, plan.takes_variant_pack = prepared, True
+        _execute_compact_thd(api, bufs, standalone_ws)
     stream.synchronize()
     verify()
     bufs = _buffers(b, ql, kl, hq, hk, d, seed=4, dtype=dtype)
     ws = torch.empty_like(ws)
+    standalone_ws = torch.empty_like(standalone_ws)
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         bufs["o"].fill_(float("nan"))
@@ -1464,15 +1530,23 @@ def test_native_thd_rebind_stream_capture_and_standalone(dtype, ordered, monkeyp
         execute(bufs, ws)
     stream.synchronize()
     verify()
-    graph = torch.cuda.CUDAGraph()
+    graph, standalone_graph = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
     try:
         with torch.cuda.graph(graph, stream=stream):
             execute(bufs, ws)
+        with torch.cuda.graph(standalone_graph, stream=stream):
+            _execute_compact_thd(api, bufs, standalone_ws)
         with torch.cuda.stream(stream):
             bufs["q"].mul_(0.5)
             bufs["o"].fill_(float("nan"))
             bufs["lse"].fill_(float("nan"))
             graph.replay()
+        stream.synchronize()
+        verify()
+        with torch.cuda.stream(stream):
+            bufs["o"].fill_(float("nan"))
+            bufs["lse"].fill_(float("nan"))
+            standalone_graph.replay()
         stream.synchronize()
         verify()
         # Replacement/replanning state must never patch an earlier captured frame.
@@ -1481,6 +1555,8 @@ def test_native_thd_rebind_stream_capture_and_standalone(dtype, ordered, monkeyp
         replacement = _buffers(b, ql, kl, hq, hk, d, seed=9, dtype=dtype)
         new_ws = torch.empty_like(ws)
         execute(replacement, new_ws)
+        new_standalone_ws = torch.empty_like(standalone_ws)
+        _execute_compact_thd(api, replacement, new_standalone_ws)
         torch.cuda.synchronize()
         with torch.cuda.stream(stream):
             old_bufs["q"].mul_(0.5)
@@ -1488,8 +1564,15 @@ def test_native_thd_rebind_stream_capture_and_standalone(dtype, ordered, monkeyp
         stream.synchronize()
         assert old_ws is ws  # retain capture's metadata/workspace owners through replay
         verify()
+        with torch.cuda.stream(stream):
+            old_bufs["o"].fill_(float("nan"))
+            old_bufs["lse"].fill_(float("nan"))
+            standalone_graph.replay()
+        stream.synchronize()
+        verify()
     finally:
         graph.reset()
+        standalone_graph.reset()
 
 
 @requires_pre_rubin_blackwell
@@ -1551,10 +1634,11 @@ def test_thd_output_row_stride_above_int32_reaches_device_descriptors(d):
     row_stride = 2**32 + hq * d
     if torch.cuda.mem_get_info()[0] < 2 * row_stride + 2**30:
         pytest.skip("wide physical row-stride regression needs 9 GiB free")
-    g, t = _thd_graph(b, ql, kl, hq, hk, d, causal=False, override_enabled=True)
+    g, t = _thd_graph(b, ql, kl, hq, hk, d, causal=False, override_enabled=True, independent_o_offsets=True)
     assert _plan(g)._prepared.spec.native is not None
     bufs = _buffers(b, ql, kl, hq, hk, d)
     bufs["o"] = torch.empty_strided((b * ql, hq, d), (row_stride, d, 1), device=DEV, dtype=torch.bfloat16)
+    bufs["off_o"] = torch.arange(b + 1, device=DEV, dtype=torch.int64) * row_stride
     ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
     overrides = dict(override_uids=[t["o"].get_uid()], override_shapes=[[b, hq, ql, d]], override_strides=[[hq * d, d, row_stride, 1]])
     graph = torch.cuda.CUDAGraph()
@@ -1734,19 +1818,70 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, cga, causal, window,
         check(bufs)
     finally:
         graph.reset()
-    # The tensor executor uses graph-declared strides and does not accept
-    # overrides. Restore those strides before exercising its native admission.
+    # Construct the actual standalone compact-prefix contract independently.
+    # A graph prepared for physical origins has additional runtime operands.
+    from cuda.bindings import driver as cuda_driver
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
     for n in ("k_table", "v_table"):
         bufs[n] = bufs[n].contiguous()
-    prepared = plan._prepared
-    plan._prepared, plan.takes_variant_pack = None, False
+    _, selected = g.get_engine_and_knobs_at_index(g._plan_index)
+    api = SdpaFwdDslSm100(
+        sample_q=bufs["q"].view(b, ql, h, d).transpose(1, 2),
+        sample_k=bufs["k"],
+        sample_v=bufs["v"],
+        sample_o=bufs["o"].view(b, ql, h, d).transpose(1, 2),
+        sample_lse=bufs["lse"].view(b, ql, h, 1).transpose(1, 2),
+        scale_softmax=1 / math.sqrt(d),
+        is_causal=causal,
+        causal_bottom_right=causal,
+        window_size_left=window,
+        seq_kv_lens_present=True,
+        cu_seq_q_lens=True,
+        thd=True,
+        cga=selected[cudnn.knob_type.TILE_CGA_M],
+        split_kv=selected[cudnn.knob_type.SPLIT_KV],
+        pack_gqa=bool(selected[cudnn.knob_type.PACK_GQA]),
+        sched_policy=selected[cudnn.knob_type.SCHED_POLICY],
+        paged_page_size=page,
+        paged_max_seq_len_kv=page * pages,
+    )
+    assert api.check_support()
+    api.compile()
+    assert api._thd_spec.native is not None
+    standalone_ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=DEV, dtype=torch.uint8)
+    tables = {n: bufs[n][:, 0, :, 0] for n in ("k_table", "v_table")}
+
+    def standalone():
+        api.execute(
+            bufs["q"],
+            bufs["k"],
+            bufs["v"],
+            bufs["o"],
+            lse_tensor=bufs["lse"],
+            seq_q_lens=bufs["cu_q"],
+            seq_kv_lens=bufs["seq_kv"],
+            block_table=tables["k_table"],
+            block_table_v=tables["v_table"],
+            workspace=standalone_ws,
+            current_stream=cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream),
+        )
+
+    standalone_graph = torch.cuda.CUDAGraph()
     try:
         bufs["o"].fill_(float("nan"))
         bufs["lse"].fill_(float("nan"))
-        execute(bufs, ws, override=False)
+        standalone()
+        check(bufs)
+        with torch.cuda.graph(standalone_graph):
+            standalone()
+        bufs["v"].neg_()
+        bufs["o"].fill_(float("nan"))
+        bufs["lse"].fill_(float("nan"))
+        standalone_graph.replay()
         check(bufs)
     finally:
-        plan._prepared, plan.takes_variant_pack = prepared, True
+        standalone_graph.reset()
 
 
 @requires_blackwell
@@ -2660,8 +2795,38 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
         workspaces.append(ws)
         from cuda.bindings import driver as cuda_driver
 
+        # Graph lowering binds physical origins. Build the public standalone
+        # compact-prefix contract independently, with the same selected knobs.
+        standalone_api = type(api)(
+            sample_q=api.q_desc,
+            sample_k=api.k_desc,
+            sample_v=api.v_desc,
+            sample_o=api.o_desc,
+            sample_lse=api.lse_desc,
+            is_causal=api.is_causal,
+            causal_bottom_right=api.causal_bottom_right,
+            scale_softmax=api.scale_softmax,
+            seq_kv_lens_present=True,
+            cu_seq_q_lens=True,
+            has_sink=has_sink,
+            thd=True,
+            max_total_seq_len_q=api.max_total_seq_len_q,
+            sched_policy=api.sched_policy,
+            cga=api.cga,
+            split_kv=api.split_kv,
+            pack_gqa=api.pack_gqa,
+            paged_page_size=page,
+            paged_max_seq_len_kv=kcap,
+            thd_stats_padded=stats_layout == "padded",
+            stats_log2=stats_log2,
+        )
+        assert standalone_api.check_support()
+        standalone_api.compile()
+        standalone_ws = torch.empty(max(standalone_api.scratch_workspace_bytes(), 1), device=DEV, dtype=torch.uint8)
+        workspaces.append(standalone_ws)
+
         def standalone(workspace):
-            api.execute(
+            standalone_api.execute(
                 bufs["q"],
                 bufs["k"],
                 bufs["v"],
@@ -2680,11 +2845,11 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
             with pytest.raises(ValueError, match="caller-owned workspace"):
                 standalone(None)
         with pytest.raises(ValueError, match="requires a .* workspace"):
-            standalone(ws[:-1])
-        standalone(ws)
+            standalone(standalone_ws[:-1])
+        standalone(standalone_ws)
         standalone_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(standalone_graph):
-            standalone(ws)
+            standalone(standalone_ws)
         captures.append(standalone_graph)
     try:
         lengths = (

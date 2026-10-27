@@ -1072,6 +1072,11 @@ def _render_tile_constants(
         # first_token_offset dtype (int32/int64) drives the compile() fake; the
         # scheduler casts its reads to Int32.
         lines.append(f"offset_cutlass_dtype = {DTYPE_TO_CUTLASS[chain.moe.offset_dtype]}")
+        # The host zeroes the scheduler counter with a one-thread launch before
+        # the PDL main launch, unless the integrating runtime zeroes it on the
+        # stream itself and renders this True (FlashInfer's MoE adapters do, in
+        # their routing kernel, saving the launch).
+        lines.append("external_counter_reset = False")
     lines.extend(_quant_device_imports(chain))
     return "\n".join(lines)
 
@@ -1735,6 +1740,9 @@ def _render_block_scale_tile_constants(
         # the first_token_offset alignment the graph promises (dtypes'
         # _compute_output_vec_bytes); runtime S must keep it.
         lines.append(f"moe_token_alignment = {_pow2_floor(math.gcd(chain.moe.offset_multiple, chain.matmul.N)) if isinstance(chain.moe, MoeSwapAbSpec) else 1}")
+        # As the BF16 MoE constants: the integrating runtime may zero the
+        # scheduler counter itself and render this True to skip the host's launch.
+        lines.append("external_counter_reset = False")
     lines.extend(_quant_device_imports(chain))
     return "\n".join(lines)
 
@@ -4804,6 +4812,8 @@ def _splitk_reject_reason(chain: FusionChain, config: TileConfig) -> "str | None
 def jit_from_cudnn_graph(
     graph: cudnn.pygraph,
     config: TileConfig = DEFAULT_CONFIG,
+    *,
+    padded_e2m1: bool = False,
 ) -> CompiledFusedGemm:
     """End-to-end: cuDNN frontend graph -> rendered + cute-compiled GEMM kernel.
 
@@ -4821,6 +4831,15 @@ def jit_from_cudnn_graph(
     PREFERRED shape plus the smallest fallback the MMA mode allows, so the device
     fills the SMs a wide fixed cluster leaves idle (:func:`_mixed_cga_fallback`).
     Everywhere else the launch is the plain fixed cluster it always was.
+
+    ``padded_e2m1`` (sm120 MoE block-scale, mixed MXFP4 x MXFP8 pairs only) opts
+    the e2m1 operand into TMA's padded ``.b4x16_p64`` form -- one byte per value
+    in SMEM, hardware fragment expansion, twice the SMEM of the packed default
+    -- on every side the form allows (K a multiple of 128, not the gathered
+    token). It is an experimental candidate to measure against the packed
+    default, never chosen on its own; a request no side can honor is declined
+    (``NotImplementedError``), not snapped to the packed form
+    (``kernel_registry.sm120_padded_e2m1_sides`` / ``sm120_padded_e2m1_reject``).
     """
     chain, binding = _analyze_graph(graph)
     if config.swap_ab:
@@ -4828,6 +4847,15 @@ def jit_from_cudnn_graph(
 
         chain = swap_ab(chain)
         binding = swap_ab_binding(binding)
+    if padded_e2m1:
+        from ..kernel_registry import sm120_padded_e2m1_reject
+
+        if chain.block_scale is None:
+            raise NotImplementedError("padded_e2m1 needs a block-scale matmul (the e2m1 side of a mixed MXFP4 x MXFP8 pair)")
+        chain = replace(chain, block_scale=replace(chain.block_scale, padded_e2m1=True))
+        _padded_reason = sm120_padded_e2m1_reject(chain)
+        if _padded_reason is not None:
+            raise NotImplementedError(_padded_reason)
     _dtype_reason = dtype_arch_reject(chain, _current_arch())
     if _dtype_reason is not None:
         raise NotImplementedError(_dtype_reason)

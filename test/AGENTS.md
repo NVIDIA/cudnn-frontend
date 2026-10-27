@@ -79,6 +79,12 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 
 ### conftest.py landmines — read before editing
 
+Before releasing Torch's cache, synchronize every device with reserved memory.
+Expandable-segment cleanup can synchronize a default-stream handle on the wrong
+current device, then unmap memory still used by another GPU. The later CuTe launch
+can report that fault. `test_empty_cache_waits_for_other_devices_default_stream`
+checks completion before the unsafe release, so its failing control stays safe.
+
 For a timed subprocess test, arm a child-side `faulthandler` dump before the
 parent deadline and surface `TimeoutExpired.stdout` / `.stderr` in the failure.
 The parent's watchdog shows only `subprocess.communicate()`, and pytest's
@@ -873,6 +879,28 @@ A launch recorder must reconstruct the plan's actual native binder type after
 intercepting its entry. Hard-coding THD fails once dense prefill becomes native.
 Keep the existing KV-tail and fixed-shape rejection diagnostics, as exercised
 by `test_sdpa_prepared_thd.py`, when changing the binder implementation.
+
+Physical THD offsets are element addresses for each port. A fused K/V slab or
+wide O token stride requires matching offset values, with an independent Int64
+O offset when it exceeds Int32. Keep these fixtures consistent in
+`test_sdpa_prepared_thd.py` and `test_mhas_v2.py`. Compare graph execution with an
+independently prepared standalone API; clearing a graph's private prepared plan
+does not reproduce the standalone compact-prefix contract. Retain poisoned
+outputs and replay after rebinding for both public entry points.
+
+Keep `stream` last in private CuTe host signatures and preserve the
+`_positional_order` guard. Matching named binder slots and a Python wrapper
+signature does not qualify a reordered entry; exercise a real compiled launch
+after ABI changes before considering a change to that convention.
+
+AST-based host frame fixtures must retain unannotated runtime arguments;
+`ast.unparse(None)` fails before binding. Raw positional CuTe entries require
+every runtime slot, including optional `None` pointers and scalar defaults:
+Python signature defaults do not shorten the exported FFI frame. Keep the
+packed combine direct-call and fresh-process artifact tests synchronized with
+that frame. A graph-lowered adapter carrying physical origins is not a public
+standalone plan; construct the standalone API independently and retain its own
+workspace through capture replay, as in `test_paged_thd_split_capture_lengths_and_stats`.
 
 ### Native host ABI differences across architectures
 

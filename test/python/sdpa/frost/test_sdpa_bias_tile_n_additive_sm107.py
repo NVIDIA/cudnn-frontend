@@ -95,8 +95,8 @@ def test_tile_n_and_kv_mask_form_constants_are_shared_by_row_adapter_and_factory
         c.make_cfg_d32(TemplateParams(dtype_qkv=2, cta_mma=1, kv_mask_form=4))
     with pytest.raises(ValueError, match="STATS"):
         c.make_cfg_d32(TemplateParams(dtype_qkv=2, cta_mma=1, tile_n=256))
-    with pytest.raises(ValueError, match="TILE_N"):
-        c.make_cfg_d128(TemplateParams(dtype_qkv=2, cta_mma=2, tile_n=64))
+    cfg128, _ = c.make_cfg_d128(TemplateParams(dtype_qkv=2, cta_mma=2, tile_n=64, s_slots=2))
+    assert (cfg128.TILE_N, cfg128.S_SLOTS) == (64, 2)
 
 
 def _add_kw(b=2, s_kv=256, dt=None, stride0=None):
@@ -127,7 +127,8 @@ def _cells():
         ("tile_n 64 on d64 cga1", dict(d_qk=64, d_v=64), dict(tile_n=64, cga=1), True),
         ("tile_n 64 on d64 cga2", dict(d_qk=64, d_v=64), dict(tile_n=64, cga=2), True),
         ("tile_n 64 + bias + bool mask d32", dict(**_bias_kw(), **_mask_kw()), dict(tile_n=64), True),
-        ("tile_n 64 on the d128 flavor", dict(d_qk=128, d_v=128), dict(tile_n=64), False),
+        ("tile_n 64 on the d128 flavor", dict(d_qk=128, d_v=128), dict(tile_n=64), True),
+        ("tile_n 64 on dense d128 cga1", dict(d_qk=128, d_v=128), dict(tile_n=64, cga=1), False),
         ("tile_n 256 on d32", dict(), dict(tile_n=256), False),
         ("tile_n 96 on d32", dict(), dict(tile_n=96), False),
         # the additive kv_mask
@@ -200,7 +201,8 @@ _ADAPTER_CELLS = [
     ("tile_n 64 d32", dict(tile_n=64), True, (64, 0, 1)),
     ("tile_n 64 d32 + bias + bool mask", dict(tile_n=64, bias=(1, 4, 256, 256), kv_mask=(2, 1, 1, 256)), True, (64, 1, 1)),
     ("tile_n 64 d64 cga2 + bias", dict(d=64, tile_n=64, cga=2, bias=(1, 4, 256, 256)), True, (64, 0, 2)),
-    ("tile_n 64 d128", dict(d=128, tile_n=64), False, None),
+    ("tile_n 64 d128", dict(d=128, tile_n=64), True, (64, 0, 2)),
+    ("tile_n 64 dense d128 cga1", dict(d=128, tile_n=64, cga=1), False, None),
     ("tile_n 256 d32", dict(tile_n=256), False, None),
     # the 64-wide block holds 7 tiles = 448 columns (a factory fact pinned above), but the row AND the adapter ask the budget at the
     # default TILE_N 128 -- conservative, never wrong -- so S_kv 448 with the TILE_N 64 knob is a typed decline on both (the sweep that

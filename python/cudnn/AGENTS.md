@@ -241,6 +241,8 @@ not become a compile key.
   without clearing caches and replays captures from each after changing inputs.
   Use an explicit per-device capture stream in that detector: Torch's implicit
   `graph.default_capture_stream` can retain the first device's stream.
+  `test_quant_cache_keeps_each_devices_workspace` checks the grouped quant
+  cache before a foreign workspace can reach a CUDA launch.
 - **Issue #604 is closed**: SM80 THD compiles use symbolic packed extents.
   The prepared backward host takes Int64 capacities and launch bounds at
   runtime, including the compact Stats head pitch and deterministic-counter
@@ -725,6 +727,17 @@ python/cudnn/gemm/
 Shared helpers (schedulers, metadata utils, e.g. `gemm/cutedsl/grouped/moe_*.py`) stay internal to the family package — never exported through `cudnn`.
 
 ## CuTeDSL kernel bodies
+
+Named barriers inside warp-specific branches need unaligned sync and arrive
+instructions. CuTeDSL 4.8's `NamedBarrier.arrive_and_wait()` emits an aligned
+barrier, including through `TmemAllocator.wait_for_alloc()`. Check the launch
+with Compute Sanitizer `--tool synccheck`; ordinary parity tests can pass despite
+divergent-barrier errors. The SM100 GLU/Hadamard/quant JAX parity tests cover this.
+
+A nonblocking barrier arrival must complete before the same warp uses that
+barrier again. Use a separate barrier for tile completion when consumers can
+outrun producers after a subtile arrival. Synccheck alone can miss this hang;
+`test_canonical_jax_glu_hadamard_quant_delayed_act` delays ACT warps to expose it.
 
 **Do not factor code out of a `@cute.kernel` body into a plain Python helper.**
 The DSL AST-transforms only the decorated function's own source: `for` becomes

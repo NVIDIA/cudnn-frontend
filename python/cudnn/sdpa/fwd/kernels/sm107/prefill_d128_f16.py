@@ -623,6 +623,8 @@ _split_h = make_split_helpers(
     dispatch_decode_payload=_dispatch_decode_payload,
 )
 SPLIT_KV = _split_h.SPLIT_KV
+# Split partials exclude the sink; the shared combine folds it exactly once.
+FOLD_SINK = CFG.HAS_SINK and SPLIT_KV == 1
 _FP32_PARTIALS = SPLIT_KV > 1
 if CFG.SOFTMAX_WARPGROUPS not in (2, 3) or CFG.TILES_Q != CFG.SOFTMAX_WARPGROUPS:
     # One softmax warp group per Q sub-tile: the classic two, or the three of the TILE_N-64 pair arm (config_sm107 derives both from one field).
@@ -720,7 +722,7 @@ class KernelTmemLayout:
     S_OFF: Tuple[int, ...] = _TMEM.S_OFF
     P_OFF: Tuple[int, ...] = _TMEM.P_OFF
     O_OFF: Tuple[int, ...] = _TMEM.O_OFF
-    # The S / P slot axis (CFG.S_SLOTS; 1 on every rendering but the small tiles' double-buffered S at TILE_N 64): slot p of
+    # The S / P slot axis (CFG.S_SLOTS; two on the half small/D128 tiles with double-buffered S at TILE_N 64): slot p of
     # sub-tile qs sits at S{qs}_OFF + p * S_SLOT_STRIDE, its P at P{qs}_OFF + p * S_SLOT_STRIDE (0 at one slot).
     S_SLOTS: int = _TMEM.S_SLOTS
     S_SLOT_STRIDE: int = _TMEM.S_SLOT_STRIDE
@@ -732,7 +734,7 @@ class KernelTmemLayout:
 
 LAYOUT = KernelTmemLayout()
 
-# === The double-buffered S / P slot (CFG.S_SLOTS == 2; TemplateParams.s_slots; the f16/bf16 32- / 64-wide tiles at TILE_N 64) ===
+# === The double-buffered S / P slot (CFG.S_SLOTS == 2; TemplateParams.s_slots; the f16/bf16 32- / 64- / 128-wide tiles at TILE_N 64) ===
 #
 # Each softmax sub-tile owns TWO S / P TMEM slots and every role walks a depth-2 PipelineState cursor over them, advanced once per
 # NON-EMPTY kv tile (every role iterates the same bounds, so the cursors stay in lockstep across steps and items; an empty step / tile
@@ -770,9 +772,9 @@ LAYOUT = KernelTmemLayout()
 _S2: bool = CFG.S_SLOTS == 2
 if CFG.S_SLOTS not in (1, 2):
     raise ValueError(f"prefill_d128_f16_sm107: the body walks a 1- or 2-slot S / P cursor (CFG.S_SLOTS={CFG.S_SLOTS})")
-if _S2 and (CFG.TILE_N != 64 or CFG.TILE_K > 64 or IS_TF32):
+if _S2 and (CFG.TILE_N != 64 or CFG.TILE_K > 128 or IS_TF32):
     # config_sm107._validate_tile_n pins the same couplings at config-build time; this is the kernel's own backstop.
-    raise ValueError(f"prefill_d128_f16_sm107: the double-buffered S is the f16/bf16 small tiles' TILE_N 64 form (TILE_N={CFG.TILE_N}, TILE_K={CFG.TILE_K})")
+    raise ValueError(f"prefill_d128_f16_sm107: the double-buffered S requires f16/bf16, TILE_N 64 and TILE_K <= 128 (TILE_N={CFG.TILE_N}, TILE_K={CFG.TILE_K})")
 if _S2 and CFG.SOFTMAX_WARPGROUPS != 2:
     # config_sm107._validate_tile_n pins it too: `_mma_tile_s2` / `_mma_item_pair_s2` hand-unroll TWO sub-tiles (BMM1(k) x 2 ahead of
     # BMM2(k - 1) x 2) and the slot cursors' barrier audit is the two-group one; the third softmax warp group keeps one slot per sub-tile.
@@ -4533,7 +4535,7 @@ def _correction_warp_group(
                 LN2 = cutlass.Float32(0.6931471805599453)
                 total_max_nat = total_max_scaled * LN2
                 row_head_idx = head_idx * HEADS_PER_TILE + row_in_tile % HEADS_PER_TILE
-                if cutlass.const_expr(CFG.HAS_SINK):
+                if cutlass.const_expr(FOLD_SINK):
                     sinks_arr = cutlass.make_array_view(sinks_tensor)
                     sink_logit = sinks_arr[row_head_idx]
                     new_max = cute.math.max(total_max_nat, sink_logit)
@@ -4553,7 +4555,7 @@ def _correction_warp_group(
                     # keyless-row SELECTs below override both.
                     true_max_nat = stats_vec[2] * LN2
                     sum_true = total_sum * cute.math.exp2(total_max_scaled - stats_vec[2], fastmath=True)
-                    if cutlass.const_expr(CFG.HAS_SINK):
+                    if cutlass.const_expr(FOLD_SINK):
                         smax_sink = cute.math.max(true_max_nat, sink_logit)
                         score_max_val = smax_sink
                         score_sum_val = sum_true * cute.math.exp(true_max_nat - smax_sink, fastmath=True) + cute.math.exp(sink_logit - smax_sink, fastmath=True)
@@ -4599,7 +4601,7 @@ def _correction_warp_group(
                     # with total_sum == 0 EXACTLY (a live row has sum >= 2^-RESCALE_THRESHOLD): fold it into the empty-row
                     # predicate, so O is SELECTed to 0 and the LSE to -inf (sink: sink_logit) like a geometric empty row.
                     _kv_empty = _kv_empty | (total_sum == cutlass.Float32(0.0))
-                if cutlass.const_expr(not CFG.HAS_SINK):
+                if cutlass.const_expr(not FOLD_SINK):
                     # A sink leaves real mass and the branch above already yields
                     # LSE = sink_logit there; without one an empty row is -inf.
                     lse_val = cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(float("-inf")).ir_value(), lse_val.ir_value()))
@@ -4909,7 +4911,7 @@ def _corr_item_pair(
             inv_sum = cutlass.Float32(0.0)
             lse_val = cutlass.Float32(0.0)
             total_max_nat = total_max_scaled * LN2
-            if cutlass.const_expr(CFG.HAS_SINK):
+            if cutlass.const_expr(FOLD_SINK):
                 sinks_arr = cutlass.make_array_view(sinks_tensor)
                 sink_logit = sinks_arr[head_idx]
                 new_max = cute.math.max(total_max_nat, sink_logit)
@@ -4933,7 +4935,7 @@ def _corr_item_pair(
                     _first_k = cute.math.max(_first_k, q_row_global - cutlass.Int32(CFG.WINDOW_LEFT))
                 _kv_empty = _kv_empty | (_first_k > _last_k)
             _kv_empty = _kv_empty | (total_sum == cutlass.Float32(0.0))
-            if cutlass.const_expr(not CFG.HAS_SINK):
+            if cutlass.const_expr(not FOLD_SINK):
                 lse_val = cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(float("-inf")).ir_value(), lse_val.ir_value()))
             else:
                 lse_val = cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(sink_logit).ir_value(), lse_val.ir_value()))
