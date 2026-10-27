@@ -15,6 +15,7 @@ import torch
 
 from d128_grouped_test_utils import adapter_arguments, check_case, make_workspace, poison
 from d128_thd_test_utils import ROLES, SCALE
+from frost_test_utils import ptx_kernel_md5s
 from test_sdpa_bwd_d128_accum_sm100 import _require_accumulation
 
 _ADAPTER_MODULE = "cudnn.sdpa.bwd.api_dsl_sm100_d128_2cta"
@@ -114,9 +115,11 @@ B, H, HK = 2, 8, 2
 ts = lambda p: H if p == "stats" else (HK if p in ("k", "v", "dk", "dv") else H) * 128
 specs = tuple((i, 1, ts(p), "int32") for i, p in enumerate(ports))
 compile_host((B, H, HK, True), specs, tuple("int32" for _ in ports), cutlass.BFloat16, True, 100, **{form_kw})
-ptx = open(sorted(glob.glob(os.path.join(sys.argv[1], "*.ptx")), key=os.path.getmtime)[-1], "rb").read()
+ptx_file = sorted(glob.glob(os.path.join(sys.argv[1], "*.ptx")), key=os.path.getmtime)[-1]
+ptx = open(ptx_file, "rb").read()
 import hashlib
 print("PTX_MD5", hashlib.md5(ptx).hexdigest())
+print("PTX_FILE", ptx_file)
 for name, pat in {census}.items():
     print("CENSUS", name, len(re.findall(pat.encode(), ptx)))
 for action, imm in re.findall(rb"setmaxnreg\\.(inc|dec)\\.sync\\.aligned\\.u32\\s+(\\d+)", ptx):
@@ -168,8 +171,9 @@ def _setmaxnreg_of():
     return sorted([("inc", CFG.SOFTMAX_REGS), ("inc", CFG.EPILOGUE_REGS)] + [("dec", CFG.SERVICE_REGS)] * (CFG.SERVICE_WARPS + 1))
 
 
-def render_2cta(tmp_path, form_kw, census):
-    """Host trace-compile of the pair chain for sm_100a in a fresh process -> (PTX md5, census, [(setmaxnreg action, immediate), ...])."""
+def render_2cta_kernels(tmp_path, form_kw, census):
+    """Host trace-compile of the pair chain for sm_100a in a fresh process -> (PTX md5 of the module, census, [(setmaxnreg action, immediate), ...],
+    {kernel: md5 of its `.entry` region} in entry order -- the per-kernel record form, frost_test_utils.ptx_kernel_md5s)."""
     _adapter_class()  # the tree under test must be the one this venv imports
     script = _RENDER.format(host=_HOST_MODULE, census=repr(census), form_kw=repr(form_kw))
     proc = subprocess.run([sys.executable, "-c", script, str(tmp_path)], capture_output=True, text=True, timeout=600, env=dict(os.environ))
@@ -177,7 +181,14 @@ def render_2cta(tmp_path, form_kw, census):
     md5 = re.search(r"PTX_MD5 ([0-9a-f]{32})", proc.stdout).group(1)
     counts = {m.group(1): int(m.group(2)) for m in re.finditer(r"CENSUS (\S+) (\d+)", proc.stdout)}
     regs = [(m.group(1), int(m.group(2))) for m in re.finditer(r"SETMAXNREG (inc|dec) (\d+)", proc.stdout)]
-    return md5, counts, regs
+    with open(re.search(r"PTX_FILE (\S+)", proc.stdout).group(1)) as f:
+        kernels = ptx_kernel_md5s(f.read())
+    return md5, counts, regs, kernels
+
+
+def render_2cta(tmp_path, form_kw, census):
+    """Host trace-compile of the pair chain for sm_100a in a fresh process -> (PTX md5, census, [(setmaxnreg action, immediate), ...])."""
+    return render_2cta_kernels(tmp_path, form_kw, census)[:3]
 
 
 # ------------------------------------------------------------------------------------------------------------ the pair-skew detectors (fresh child)

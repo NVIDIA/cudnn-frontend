@@ -30,14 +30,14 @@ import pytest
 import torch
 
 from d128_grouped_test_utils import adapter_arguments, check_case, make_adapter, make_case, make_workspace, poison
-from frost_test_utils import arch_known_to_the_dsl, requires_dsl
+from frost_test_utils import D128_THD_SHARED_KERNELS, arch_known_to_the_dsl, assert_kernel_record, ptx_kernel_md5s, read_kernel_record, requires_dsl
 from test_sdpa_bwd_d128_2cta_stail_sm100 import make_adapter_2cta_stail
 from test_sdpa_bwd_d128_accum_sm100 import _require_accumulation
 from test_sdpa_bwd_d128_diag_dq_reduce_add_sm100 import _RECORD as _RECORD_1CTA
-from test_sdpa_bwd_d128_diag_dq_reduce_add_sm100 import _parse_record as _parse_record_1cta
+from test_sdpa_bwd_d128_diag_dq_reduce_add_sm100 import _RECORD_TOKEN as _RECORD_TOKEN_1CTA
 from test_sdpa_bwd_d128_diag_dq_reduce_add_sm100 import _skip_unless_recorded_dsl
 from test_sdpa_bwd_d128_2cta_stail_sm100 import _RECORD as _RECORD_STAIL
-from test_sdpa_bwd_d128_2cta_stail_sm100 import _record_md5 as _record_md5_stail
+from test_sdpa_bwd_d128_2cta_stail_sm100 import _RECORD_TOKEN as _RECORD_TOKEN_STAIL
 from test_sdpa_bwd_dsl_sm107 import _TOL
 
 pytestmark = [pytest.mark.L0, requires_dsl]
@@ -92,13 +92,14 @@ _PROBE = textwrap.dedent(r"""
         print("FAIL no ptx dumped into", dump, os.listdir(dump)); sys.exit(3)
     txt = open(ptxs[-1], "rb").read()
     print("PTX_MD5", hashlib.md5(txt).hexdigest())
+    print("PTX_FILE", ptxs[-1])
     for key, pat in census.items():
         print("CENSUS", key, len(re.findall(pat.encode(), txt)))
     """)
 
 
-def _render(tmp_path, chain, **fields):
-    """Host trace-compile ONE chain (1cta | pair) for sm_100a in a fresh process with the typed fields -> (PTX md5, census)."""
+def _render_kernels(tmp_path, chain, **fields):
+    """Host trace-compile ONE chain (1cta | pair) for sm_100a in a fresh process with the typed fields -> (PTX md5, census, {kernel: md5})."""
     if not arch_known_to_the_dsl("sm_100a"):
         pytest.skip("this cutlass-dsl has no sm_100a")
     tag = "_".join(f"{k}_{v}" for k, v in sorted(fields.items())) or "default"
@@ -109,23 +110,36 @@ def _render(tmp_path, chain, **fields):
     cmd = [sys.executable, str(script), str(dump), chain, json.dumps(fields), json.dumps(_GEOMETRY[chain]), json.dumps(_CENSUS)]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
     assert proc.returncode == 0, f"sm_100a trace-compile of the {chain} chain ({fields}) failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
-    md5, census = None, {}
+    md5, ptx_file, census = None, None, {}
     for ln in proc.stdout.splitlines():
         if ln.startswith("PTX_MD5 "):
             md5 = ln.split()[1]
+        elif ln.startswith("PTX_FILE "):
+            ptx_file = ln.split(" ", 1)[1]
         elif ln.startswith("CENSUS "):
             _, key, n = ln.split()
             census[key] = int(n)
-    assert md5 and set(census) == set(_CENSUS), proc.stdout[-2000:]
-    return md5, census
+    assert md5 and ptx_file and set(census) == set(_CENSUS), proc.stdout[-2000:]
+    with open(ptx_file) as f:
+        kernels = ptx_kernel_md5s(f.read())
+    return md5, census, kernels
+
+
+def _render(tmp_path, chain, **fields):
+    """Host trace-compile ONE chain (1cta | pair) for sm_100a in a fresh process with the typed fields -> (PTX md5, census)."""
+    return _render_kernels(tmp_path, chain, **fields)[:2]
+
+
+# The per-kernel default records of the two chains (token, variant, file): the pair chain's in the S-tail module, the one-CTA chain's in the
+# diag module; both exclude the shared group fold (frost_test_utils.D128_THD_SHARED_KERNELS).
+_RECORDS = {"pair": (_RECORD_TOKEN_STAIL, "default", _RECORD_STAIL), "1cta": (_RECORD_TOKEN_1CTA, "grouped_thd", _RECORD_1CTA)}
 
 
 def _record(chain):
-    """(dsl line, md5) of the chain's committed default record."""
-    if chain == "pair":
-        return _record_md5_stail(_RECORD_STAIL, "d128_accum_grouped_2cta_stail")
-    dsl, want = _parse_record_1cta(_RECORD_1CTA)
-    return dsl, want["grouped_thd"]
+    """(dsl line, {kernel: md5}) of the chain's committed default record."""
+    token, variant, path = _RECORDS[chain]
+    dsl, want = read_kernel_record(path, token)
+    return dsl, want.get(variant, {})
 
 
 # ------------------------------------------------------------------------------------------------------------ host (no GPU)
@@ -182,11 +196,13 @@ def test_dkv_accum_default_renderings_are_unchanged_and_bf16_partials_named_is_t
     the S-tail record at 2 / 8 / 2), and ``dkv_accum="bf16_partials"`` named explicitly renders the SAME bytes (skips, never widens, on a DSL
     build that differs from the record's)."""
     dsl, want = _record(chain)
+    assert dsl and want, (chain, dsl, want)
     _skip_unless_recorded_dsl(dsl)
-    md5_default, census_default = _render(tmp_path, chain)
+    md5_default, census_default, kernels_default = _render_kernels(tmp_path, chain)
     md5_named, census_named = _render(tmp_path, chain, **{FIELD: "bf16_partials"})
-    print(f"\n{chain} default: {md5_default} {census_default}")
-    assert md5_default == want, f"{chain}: the DEFAULT rendering moved: {md5_default} != the record's {want}"
+    print(f"\n{chain} default: {md5_default} {census_default} kernels {kernels_default}")
+    token, variant, _path = _RECORDS[chain]
+    assert_kernel_record(kernels_default, want, token=token, variant=variant, excluded=D128_THD_SHARED_KERNELS, what=f"{chain}: the DEFAULT rendering")
     assert md5_named == md5_default and census_named == census_default, f"{chain}: bf16_partials named must render the default bytes"
     assert census_default["ENTRY_FOLD"] == 1 and census_default["ENTRIES"] == 5
 

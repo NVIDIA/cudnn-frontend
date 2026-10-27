@@ -24,14 +24,14 @@ import torch
 from d128_grouped_test_utils import adapter_arguments, check_case, make_case, make_workspace, poison
 from frost_test_utils import requires_dsl
 from d128_2cta_test_utils import CELLS, CHILD_TIMEOUT_S, GLOBAL_PREFIX, LEVER_LINE, SKV, WATCHDOG_S, _adapter_class, _require_2cta, _setmaxnreg_of
-from test_sdpa_bwd_d128_2cta_stail_sm100 import _BODY_MODULE, _CHILD, _EXPECTED, _RECORD, SITES
+from test_sdpa_bwd_d128_2cta_stail_sm100 import _BODY_MODULE, _CHILD, _EXPECTED, _RECORD, _RECORD_TOKEN, SITES
 from test_sdpa_bwd_d128_2cta_stail_sm100 import (
+    _assert_record,
     _bitwise_twin,
     _body_source,
     _function_code,
-    _record_md5,
     _render,
-    _skip_unless_record_dsl,
+    _render_kernels,
     make_adapter_2cta_stail,
 )
 
@@ -39,6 +39,7 @@ pytestmark = [pytest.mark.L0, requires_dsl]
 
 _ROLES = "16w_fa4"
 _RECORD_XFA4 = pathlib.Path(__file__).resolve().parent / "renderings" / "md5_d128_accum_grouped_2cta_stail_xfa4_sm_100a.txt"
+_RECORD_TOKEN_XFA4 = "d128_accum_grouped_2cta_stail_xfa4"
 # The role shape's census beside the module census (the audit record keys): the dS^T readout LDTMs (4 x16 gone), the proxy fences
 # (the epilogue's two -> the softmax's one; one _dq_round site fewer), the sDQ slice STS (3 -> 2 round sites x 8), the XCHG named barrier's thread
 # count (128 -> 256), the dp_empty relaxed.cluster arrive, the plain arrives (ds_tmem + the third dq_full site), the leader's `.release` /
@@ -205,28 +206,23 @@ def test_xfa4_host_renders_for_sm_100a_and_matches_its_record(tmp_path):
     table row (arrive 40 -> 37, try_wait 68 -> 65, `bar.sync 2, 256` and no `2, 128`, 4 LDTM fewer, 2 proxy fences fewer, 8 slice STS fewer, one
     relaxed.cluster arrive fewer, the ship and the expect_tx arm count unchanged), no local memory, no nanosleep, the default register split; the md5
     matches the committed record at this geometry (skips, never widens, on a DSL build difference)."""
-    md5, census, regs = _render(tmp_path, {"warp_roles": _ROLES}, _XFA4_CENSUS)
-    print(f"\n2-CTA s_tail 16w_fa4 sm_100a: PTX md5 {md5} census {census} setmaxnreg {regs}")
+    md5, census, regs, kernels = _render_kernels(tmp_path, {"warp_roles": _ROLES}, _XFA4_CENSUS)
+    print(f"\n2-CTA s_tail 16w_fa4 sm_100a: PTX md5 {md5} census {census} setmaxnreg {regs} kernels {kernels}")
     assert census == _EXPECTED_XFA4, {k: (census.get(k), v) for k, v in _EXPECTED_XFA4.items() if census.get(k) != v}
     assert sorted(regs) == _setmaxnreg_of(), regs  # the split is UNCHANGED
-    dsl, want = _record_md5(_RECORD_XFA4, "d128_accum_grouped_2cta_stail_xfa4")
-    assert dsl and want, (dsl, want, _RECORD_XFA4)
-    _skip_unless_record_dsl(dsl)
-    assert md5 == want, f"PTX md5 {md5} != the record's {want} -- the 16w_fa4 rendering changed"
+    _assert_record(kernels, _RECORD_XFA4, _RECORD_TOKEN_XFA4, "the 16w_fa4 rendering")
 
 
 def test_xfa4_default_rendering_is_unchanged_and_16w_named_is_the_default(tmp_path):
     """The field ABSENT and ``warp_roles = "16w"`` render the SAME PTX = the S-tail record (645f8a24 @ 2/8/2: the pin of the sibling module), with the
     16w census (arrive 40 / try_wait 68 / `bar.sync 2, 128` / 13 LDTM / 15 proxy fences / 24 slice STS); nothing of the alternate role shape reaches the default.
     """
-    md5_d, census_d, regs_d = _render(tmp_path, {}, _XFA4_CENSUS)
+    md5_d, census_d, regs_d, kernels_d = _render_kernels(tmp_path, {}, _XFA4_CENSUS)
     md5_n, census_n, _ = _render(tmp_path, {"warp_roles": "16w"}, _XFA4_CENSUS)
     assert md5_d == md5_n, "warp_roles named '16w' must be the default rendering"
     assert census_d == dict(_EXPECTED, **_EXPECTED_16W_EXTRA) == census_n, census_d
     assert sorted(regs_d) == _setmaxnreg_of()
-    dsl, want = _record_md5(_RECORD, "d128_accum_grouped_2cta_stail")
-    _skip_unless_record_dsl(dsl)
-    assert md5_d == want, f"the default S-tail rendering moved: {md5_d} != {want}"
+    _assert_record(kernels_d, _RECORD, _RECORD_TOKEN, "the default S-tail rendering (the alternate role shape must not reach it)")
 
 
 # ------------------------------------------------------------------------------------------------------------ host: the audit's section-12 punch list as SOURCE assertions
