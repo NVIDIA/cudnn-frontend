@@ -306,36 +306,39 @@ def test_sm90_thd_cuda_graph_replay_reads_new_offsets():
     packed, stor, geom, h = _run_padded_full(_LENS_Q, _LENS_KV, pads_a, gap="nan", stats="token_major", slack=96, handles=True)
     _check(_LENS_Q, _LENS_KV, packed, stor, geom, "none", stats="token_major")
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        h.g.execute(h.vp, h.workspace)
+    try:
+        with torch.cuda.graph(graph):
+            h.g.execute(h.vp, h.workspace)
 
-    def replay():
-        stor["o"].fill_(_SENTINEL)
-        stor["stats"].fill_(_SENTINEL)
-        graph.replay()
-        torch.cuda.synchronize()
+        def replay():
+            stor["o"].fill_(_SENTINEL)
+            stor["stats"].fill_(_SENTINEL)
+            graph.replay()
+            torch.cuda.synchronize()
 
-    replay()
-    _check(_LENS_Q, _LENS_KV, packed, stor, geom, "none", stats="token_major")
+        replay()
+        _check(_LENS_Q, _LENS_KV, packed, stor, geom, "none", stats="token_major")
 
-    # A new step: other lengths, other gaps, the same buffers rewritten in place.
-    lens_q, lens_kv = [64, 130, 30], [100, 7, 200]
-    pads_b = {"q": [0, 33, 2], "o": [12, 0, 1], "k": [40, 0, 5], "v": [0, 9, 9], "stats": [0, 3, 30]}
-    geom_b = {port: _starts(lens_q if port in ("q", "o", "stats") else lens_kv, pads_b[port]) for port in pads_b}
-    gen = torch.Generator(device="cuda").manual_seed(3)
-    packed_b = {}
-    for port in ("q", "k", "v"):
-        lens = lens_q if port == "q" else lens_kv
-        packed_b[port] = torch.randn(sum(lens), stor[port].shape[1], _D, generator=gen, device="cuda", dtype=stor[port].dtype)
-        assert geom_b[port][1] <= stor[port].shape[0]
-        stor[port].fill_(float("nan"))
-        cu = 0
-        for start, n in zip(geom_b[port][0], lens):
-            stor[port][start : start + n] = packed_b[port][cu : cu + n]
-            cu += n
-    for port, ro in h.ro.items():
-        ro.copy_((torch.tensor(geom_b[port][0] + [geom_b[port][1]], device="cuda") * h.ts[port]).view_as(ro))
-    h.slq.copy_(torch.tensor(lens_q, dtype=torch.int32, device="cuda").view_as(h.slq))
-    h.slk.copy_(torch.tensor(lens_kv, dtype=torch.int32, device="cuda").view_as(h.slk))
-    replay()
-    _check(lens_q, lens_kv, packed_b, stor, geom_b, "none", stats="token_major")
+        # A new step: other lengths, other gaps, the same buffers rewritten in place.
+        lens_q, lens_kv = [64, 130, 30], [100, 7, 200]
+        pads_b = {"q": [0, 33, 2], "o": [12, 0, 1], "k": [40, 0, 5], "v": [0, 9, 9], "stats": [0, 3, 30]}
+        geom_b = {port: _starts(lens_q if port in ("q", "o", "stats") else lens_kv, pads_b[port]) for port in pads_b}
+        gen = torch.Generator(device="cuda").manual_seed(3)
+        packed_b = {}
+        for port in ("q", "k", "v"):
+            lens = lens_q if port == "q" else lens_kv
+            packed_b[port] = torch.randn(sum(lens), stor[port].shape[1], _D, generator=gen, device="cuda", dtype=stor[port].dtype)
+            assert geom_b[port][1] <= stor[port].shape[0]
+            stor[port].fill_(float("nan"))
+            cu = 0
+            for start, n in zip(geom_b[port][0], lens):
+                stor[port][start : start + n] = packed_b[port][cu : cu + n]
+                cu += n
+        for port, ro in h.ro.items():
+            ro.copy_((torch.tensor(geom_b[port][0] + [geom_b[port][1]], device="cuda") * h.ts[port]).view_as(ro))
+        h.slq.copy_(torch.tensor(lens_q, dtype=torch.int32, device="cuda").view_as(h.slq))
+        h.slk.copy_(torch.tensor(lens_kv, dtype=torch.int32, device="cuda").view_as(h.slk))
+        replay()
+        _check(lens_q, lens_kv, packed_b, stor, geom_b, "none", stats="token_major")
+    finally:
+        graph.reset()
