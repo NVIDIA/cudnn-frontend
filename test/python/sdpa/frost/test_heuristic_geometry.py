@@ -387,18 +387,20 @@ def test_nonpaged_d128_thd_lead_serves_a_valid_packed_first_plan(group, causal, 
     "batch,q,kv,expected",
     [
         (1, 8192, 8192, "lead"),
-        (16, 512, 4096, "lead"),
+        (16, 4096, 4096, "lead"),
         (4, 4096, 4096, "lead"),
+        (16, 512, 4096, "trail"),  # a chunk: the declared Q extent below the KV extent
+        (4, 256, 4096, "trail"),  # the chunks that measured behind the backend
+        (4, 256, 1024, "trail"),
         (16, 512, 512, "trail"),  # cache below 4096 tokens
-        (16, 256, 1024, "trail"),
-        (4, 256, 1024, "trail"),  # the chunk that measured behind the backend
         (64, 256, 256, "trail"),
         (1, 256, 256, "trail"),
     ],
 )
 def test_nonpaged_d128_mha_thd_leads_from_512_declared_tokens(device_cc, batch, q, kv, expected):
-    """Unpacked MHA d128 causal THD leads over a cache of at least 4096 declared tokens when the declared Q rows fill the SMs or each
-    sequence carries 512 declared Q tokens; shorter caches, HALF, non-causal and windowed graphs stay backend-first."""
+    """Unpacked MHA d128 causal THD leads with equal declared Q and KV extents over a cache of at least 4096 declared tokens when the
+    declared Q rows fill the SMs or each sequence carries 512 declared Q tokens; chunks, shorter caches, HALF, non-causal and windowed
+    graphs stay backend-first."""
     from cudnn.sdpa.fwd import placement
 
     base = dict(d_qk=128, b=batch, h_q=32, h_kv=32, s_q=q, s_kv=kv, causal=True, bottom_right=True, dtype=cudnn.data_type.BFLOAT16, device_cc=device_cc)
@@ -417,7 +419,10 @@ def test_nonpaged_d128_mha_thd_leads_from_512_declared_tokens(device_cc, batch, 
 
 @pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
 @pytest.mark.parametrize("h_q,h_kv", [(32, 4), (32, 32), (64, 8)])
-@pytest.mark.parametrize("batch,q,kv,expected", [(1, 8192, 8192, "lead"), (16, 512, 512, "lead"), (64, 256, 256, "trail"), (1, 256, 256, "trail")])
+@pytest.mark.parametrize(
+    "batch,q,kv,expected",
+    [(1, 8192, 8192, "lead"), (16, 512, 512, "lead"), (16, 512, 4096, "trail"), (64, 256, 256, "trail"), (1, 256, 256, "trail")],  # (16, 512, 4096): a chunk
+)
 def test_nonpaged_d64_thd_leads_from_512_declared_tokens(device_cc, h_q, h_kv, batch, q, kv, expected):
     """Unpacked d64 causal THD leads when the declared Q rows fill the SMs or each sequence carries 512 tokens; small, HALF, non-causal and windowed graphs stay backend-first."""
     from cudnn.sdpa.fwd import placement

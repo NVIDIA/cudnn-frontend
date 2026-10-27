@@ -346,14 +346,15 @@ S = 2048 lost and group 2 was not covered.
 Rows with no measurement (SM80, SM100 mxfp8) keep the historical order (LEAD); they are still
 opt-in, so the order is only observable with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``.
 SM100 / SM103 nonpaged BF16 d128 MHA causal THD (2026-10-25, ``NONPAGED_D128_MHA_THD_*``): one Q head per KV head cannot
-pack, so the lead is the unpacked FROST plan; it leads the backend over a declared cache of at least 4096 tokens when
-the declared Q rows fill the SMs or each sequence carries at least 512 declared Q tokens, on cc 10.0 and cc 10.3, and
-trails below that (a chunk over a shorter cache -- Q 256 over KV 1024 at 4 x 32 heads -- keeps the backend). FlashInfer's
-ragged declaration is one graph per shape class at its cache shape (or a bounded total under CUDA graphs), so the rule
-decides once per class.
+pack, so the lead is the unpacked FROST plan; it leads the backend when the declared Q and KV extents are equal (a ragged
+batch without a prefix), the declared cache holds at least 4096 tokens, and the declared Q rows fill the SMs or each
+sequence carries at least 512 declared Q tokens, on cc 10.0 and cc 10.3; it trails below that, and a chunk over a longer
+cache (a declared Q extent below the KV extent) keeps the backend. FlashInfer's ragged declaration is one graph per shape
+class at its cache shape for both Q and KV (or a bounded total under CUDA graphs), so the rule decides once per class.
 SM100 / SM103 nonpaged BF16 d64 causal THD (2026-10-26, ``NONPAGED_D64_THD_*``): d64 THD cannot pack, so the lead is the
-unpacked FROST plan for any whole-number head ratio; it leads the backend when the declared Q rows fill the SMs or each
-sequence carries at least 512 declared tokens (Q and KV), on cc 10.0 and cc 10.3, and trails below that.
+unpacked FROST plan for any whole-number head ratio; it leads the backend when the declared Q and KV extents are equal and
+the declared Q rows fill the SMs or each sequence carries at least 512 declared tokens, on cc 10.0 and cc 10.3, and trails
+below that; a chunk over a longer cache keeps the backend.
 
 """
 
@@ -1005,7 +1006,7 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
         and (facts.d_qk, facts.d_v) == (128, 128)
         and facts.h_q == facts.h_kv
         and facts.causal
-        and (facts.bottom_right or facts.s_q == facts.s_kv)
+        and facts.s_q == facts.s_kv  # equal declared extents: a ragged batch without a prefix, either diagonal alignment
         and facts.window_left is None
         and not (facts.has_sink or facts.right_band_widening or facts.has_epilogue_gate)
         and facts.device_cc in NONPAGED_D128_MHA_THD_CCS
@@ -1028,7 +1029,7 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
         and facts.h_kv > 0
         and facts.h_q % facts.h_kv == 0
         and facts.causal
-        and (facts.bottom_right or facts.s_q == facts.s_kv)
+        and facts.s_q == facts.s_kv  # equal declared extents: a ragged batch without a prefix, either diagonal alignment
         and facts.window_left is None
         and not (facts.has_sink or facts.right_band_widening or facts.has_epilogue_gate)
         and facts.device_cc in NONPAGED_D64_THD_CCS
