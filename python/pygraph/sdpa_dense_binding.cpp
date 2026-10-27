@@ -158,13 +158,7 @@ class SdpaDenseBinder {
             fill_word_ = py::module_::import_("cudnn.frost.buffers").attr("fill_word_async");
         }
         if (integer("split") < 1) invalid("native dense binding requires split >= 1");
-        // The half flavors fold an attention sink once in the combine pass (the
-        // sink combine entries take the fp32 [H] pointer); the FP8 epilogues
-        // still fold it per tile, so a quantized sink cannot split.
-        if (integer("split") > 1 && flag("has_sink") && quantized_)
-            invalid(
-                "native dense binding does not split FP8 attention with a sink (the FP8 epilogues fold the sink per "
-                "tile)");
+        // Admitted split plans produce sink-free partials; combine folds it once.
         const auto dq = integer("d_qk"), dv = integer("d_v");
         const bool native_d576 = !quantized_ && dq == 576 && dv == 512;
         if (!native_d576 && (dq <= 0 || dv <= 0 || dq > 512 || dv > 512 || dq % 8 || dv % 8))
@@ -193,10 +187,10 @@ class SdpaDenseBinder {
         // A split sink over padded query lengths: the combine folds the sink and needs the per-batch Q lengths to
         // keep the padded rows dead (O := 0 / LSE := -inf), so its frame carries their address after the sink's.
         combine_q_lens_ = py::hasattr(spec, "combine_q_lens") && flag("combine_q_lens");
-        if (combine_q_lens_ && (split_ < 2 || !has_sink_ || !seq_q_ || ragged_ || quantized_))
+        if (combine_q_lens_ && (split_ < 2 || !has_sink_ || !seq_q_ || ragged_))
             invalid(
                 "native dense binding passes the Q lengths to the combine only for a split sink over padded queries");
-        if (!combine_q_lens_ && split_ > 1 && has_sink_ && seq_q_ && !ragged_ && !quantized_)
+        if (!combine_q_lens_ && split_ > 1 && has_sink_ && seq_q_ && !ragged_)
             invalid("a split sink over padded query lengths needs the combine specialization that takes them");
         dense_flex_   = py::hasattr(spec, "dense_flex") && flag("dense_flex");
         shape_fixed_  = flag("shape_fixed");
@@ -509,8 +503,10 @@ class SdpaDenseBinder {
                 cf.append(ragged_divs_);
                 cf.append(py::make_tuple(std::min(o_cap, max_tokens), std::min(lse_cap, max_tokens)));
             }
-            if (has_sink_) cf.append(facts[Sinks].pointer);
-            if (combine_q_lens_) cf.append(q_lens_address);
+            // Quantized optional sink operands trail that entry's stream; its
+            // scalar binding below appends them after Amax/scale are bound.
+            if (has_sink_ && !quantized_) cf.append(facts[Sinks].pointer);
+            if (combine_q_lens_ && !quantized_) cf.append(q_lens_address);
             cf.append(stream);
             combine_frame = py::tuple(cf);
             put(frame, OPtr, py::int_(workspace));
@@ -668,6 +664,10 @@ class SdpaDenseBinder {
             expanded[combine.size() - 1] = has_amax_ ? py::cast(amax) : py::none();
             expanded.append(mx_scales_ ? py::none() : py::cast(pointers[ScaleO - DescaleQ]));
             expanded.append(stream);
+            if (has_sink_) {
+                expanded.append(facts[Sinks].pointer);
+                expanded.append(combine_q_lens_ ? py::cast(lengths(facts[QLens], QLens, b_)) : py::none());
+            }
             combine = py::tuple(expanded);
             if (!mx_scales_ && dtype_bits_[O] == 8) frame[quant_indices_[ScaleO - DescaleQ]] = py::none();
         }
@@ -891,6 +891,7 @@ init_sdpa_dense_binding(py::module_ &m) {
         // The split sink combine takes the per-batch Q lengths (python: SplitCombineSpec /
         // DenseLaunchSpec.combine_q_lens).
         .def_prop_ro_static("supports_combine_q_lens", [](py::object) { return true; })
+        .def_prop_ro_static("supports_quantized_split_sink", [](py::object) { return true; })
         .def_prop_ro_static("supports_native_d576", [](py::object) { return true; })
         .def("bind", &SdpaDenseBinder::bind, py::arg("pack"), py::arg("indices"), py::arg("stream"))
         .def("bind_split",

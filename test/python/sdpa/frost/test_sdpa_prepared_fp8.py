@@ -45,6 +45,7 @@ def _case(
     arch="sm100",
     split_kv=1,
     gate=None,
+    sink=None,
 ):
     dv = d if dv is None else dv
     torch.manual_seed(827)
@@ -84,6 +85,10 @@ def _case(
         buf = torch.full((1,), val, device="cuda", dtype=torch.float32)
         buffers[name], tensors[name], vp[t] = buf, t, buf
         kwargs[name] = t
+    if sink is not None:
+        t = g.tensor_like(sink)
+        buffers["sinks"], tensors["sinks"], vp[t] = sink, t, sink
+        kwargs["sink_token"] = t
     o, lse, _, am = g.sdpa_fp8(q=tensors["q"], k=tensors["k"], v=tensors["v"], attn_scale=1 / math.sqrt(d), generate_stats=stats, **kwargs)
     out_type = {
         torch.bfloat16: cudnn.data_type.BFLOAT16,
@@ -170,8 +175,13 @@ def _reference(bufs, *, thd, b=2, sq=128, skv=128):
     k = dense(bufs["k"], 2, skv).repeat_interleave(2, 1) * bufs["descale_k"]
     v = dense(bufs["v"], 2, skv).repeat_interleave(2, 1) * bufs["descale_v"]
     scores = q @ k.transpose(-1, -2) / math.sqrt(bufs["q"].shape[-1])
-    out = scores.softmax(-1) @ v
-    lse = scores.logsumexp(-1)
+    if "sinks" in bufs:
+        scores_with_sink = torch.cat((scores, bufs["sinks"].view(1, 4, 1, 1).expand(b, 4, sq, 1)), dim=-1)
+        out = scores_with_sink.softmax(-1)[..., :-1] @ v
+        lse = scores_with_sink.logsumexp(-1)
+    else:
+        out = scores.softmax(-1) @ v
+        lse = scores.logsumexp(-1)
     am = out.abs().amax()
     out *= bufs["scale_o"]
     if "gate" in bufs:

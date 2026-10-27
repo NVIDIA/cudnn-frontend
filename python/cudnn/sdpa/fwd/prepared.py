@@ -892,7 +892,9 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
         from cudnn.sdpa.fwd.kernels.sm100 import split_combine
         from cudnn import _pybind_module
 
-        s.combine_q_lens = bool(s.has_sink) and s.quant is None and s.seq_q_present and not s.ragged
+        if s.has_sink and s.quant is not None and not getattr(_pybind_module._SdpaDenseBinder, "supports_quantized_split_sink", False):
+            raise NotImplementedError("cudnn.sdpa: FP8 split attention with a sink needs the native quantized sink-combine binder; rebuild the extension")
+        s.combine_q_lens = bool(s.has_sink) and s.seq_q_present and not s.ragged
         if s.combine_q_lens and not getattr(_pybind_module._SdpaDenseBinder, "supports_combine_q_lens", False):
             raise NotImplementedError(
                 "cudnn.sdpa: a split attention sink over padded query lengths needs the native binder that passes them to the combine; rebuild the extension"
@@ -918,8 +920,8 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
             # compiled with its griddepcontrol sites releases this pass early, and this pass waits before its first read).
             **({"use_pdl": True} if getattr(api, "use_pdl", False) else {}),
             decode_grid=decode_grid,
-            # Half flavors fold the attention sink in the combine (sink-free partials).
-            has_sink=bool(s.has_sink) and s.quant is None,
+            # Every admitted split sink is folded once over sink-free partials.
+            has_sink=bool(s.has_sink),
             has_q_lens=s.combine_q_lens,
         )
         fn = positional_entry(owner)

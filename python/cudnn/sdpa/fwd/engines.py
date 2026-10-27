@@ -50,6 +50,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     supports_nonpaged_d128_thd_pack_gqa,
     supports_thd_split,
     supports_scalar_kv_tail_split,
+    supports_quantized_split_sink,
     supports_thd_split_sink,
 )
 from cudnn.sdpa.fwd.config_sm100 import (
@@ -1583,14 +1584,21 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             if (
                 (facts.thd and not (ragged_decode or packed_split))
                 # The SM100, SM107 and SM120 half flavors write sink-free partials and fold
-                # the sink once in the combine; the FP8 epilogues still fold it
-                # per tile, a gated split's combine carries no sink, and
+                # the sink once in the combine. Qualified per-tensor FP8 plans
+                # compile sink-free partials too; a gated split carries no sink, and
                 # the packed THD split carries one only where thd_split_domain admits
                 # it (supports_thd_split_sink).
                 or (
                     facts.has_sink
                     and not packed_split
-                    and (facts.is_fp8 or facts.is_mxfp8 or facts.has_epilogue_gate or capabilities.sm_lo not in (100, 107, 120))
+                    and (
+                        (
+                            (facts.is_fp8 or facts.is_mxfp8)
+                            and not supports_quantized_split_sink(device_cc=facts.device_cc, pertensor=facts.is_fp8, thd=facts.thd)
+                        )
+                        or facts.has_epilogue_gate
+                        or capabilities.sm_lo not in (100, 107, 120)
+                    )
                 )
                 or (facts.padded and not facts.has_paged_kv and not packed_split and _selected_d_shape(capabilities, facts, knobs) != SM100_NATIVE_D576_SHAPE)
                 or (facts.seq_q_trim and not (facts.padded and _selected_d_shape(capabilities, facts, knobs) == SM100_NATIVE_D576_SHAPE))
@@ -1605,7 +1613,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                     and not getattr(cudnn._pybind_module._SdpaDenseBinder, "supports_combine_q_lens", False)
                 )
             ):
-                return "split_kv > 1 serves sink-free dense graphs (a sink splits on the SM100, SM107 and SM120 half flavors only), the decode tile's ragged-Q leg, or native D128/D256 or nonpaged D192 packed split"
+                return "split_kv > 1 serves sink-free dense graphs (sinks also split on SM100/SM103 per-tensor FP8 and SM100/SM107/SM120 half), the decode tile's ragged-Q leg, or supported native packed splits"
+            if (
+                facts.has_sink
+                and (facts.is_fp8 or facts.is_mxfp8)
+                and not getattr(cudnn._pybind_module._SdpaDenseBinder, "supports_quantized_split_sink", False)
+            ):
+                return "FP8 split attention with a sink needs the native quantized sink-combine binder; rebuild the extension"
             if _synth_kv_padding(capabilities, facts) and not supports_scalar_kv_tail_split(
                 (facts.d_qk, facts.d_v),
                 device_cc=facts.device_cc,
