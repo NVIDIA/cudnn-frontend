@@ -763,6 +763,41 @@ def tma_gather4(desc, dst_smem, mbar, col, r0, r1, r2, r3, *, cta_group: int = 1
     )
 
 
+_PREFETCH_TEMPLATES = {
+    2: "cp.async.bulk.prefetch.tensor.2d.L2.global.tile [$0, {$1, $2}];",
+    3: "cp.async.bulk.prefetch.tensor.3d.L2.global.tile [$0, {$1, $2, $3}];",
+    4: "cp.async.bulk.prefetch.tensor.4d.L2.global.tile [$0, {$1, $2, $3, $4}];",
+    5: "cp.async.bulk.prefetch.tensor.5d.L2.global.tile [$0, {$1, $2, $3, $4, $5}];",
+}
+
+
+@cute.jit
+def tma_prefetch_boxes(gmem_slice, num_iters: int, granu_elems: int):
+    """Prefetch into L2 the ``num_iters`` TMA boxes a tiled load of ``gmem_slice`` issues (innermost coordinate stepped
+    by ``granu_elems``).  One elected lane issues; nothing lands in SMEM and no mbarrier is involved."""
+    from cutlass._mlir.dialects import llvm
+
+    if cutlass.const_expr(gmem_slice.desc_ptr is not None):
+        desc = _desc_addr_i64(gmem_slice.desc_ptr)
+    else:
+        desc = _desc_addr_i64(gmem_slice.tma_desc)
+    rank = len(gmem_slice.coords)
+    outer = [cutlass.Int32(c) for c in gmem_slice.coords[1:]]
+    coord_d = cutlass.Int32(gmem_slice.coord_d)
+    if nvvm.elect_sync():
+        for i in cutlass.range_constexpr(num_iters):
+            d = coord_d + cutlass.Int32(i * granu_elems)
+            llvm.inline_asm(
+                None,
+                [desc.ir_value(), d.ir_value()] + [c.ir_value() for c in outer],
+                _PREFETCH_TEMPLATES[rank],
+                "l" + ",r" * rank,
+                has_side_effects=True,
+                is_align_stack=False,
+                asm_dialect=llvm.AsmDialect.AD_ATT,
+            )
+
+
 def ldg_int32x4(addr):
     """One 16-B read-only global load: four ``Int32`` from the 16-B-ALIGNED byte address ``addr``
     (``Int64`` or a generic ``Pointer``).  ``ld.global.nc`` -- the index / membership feeds are

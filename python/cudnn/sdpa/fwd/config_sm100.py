@@ -247,6 +247,12 @@ class TemplateParams:
     # cc / kernel.  Off, the kernel traces the plain MUFU exp2 (the develop spelling).  Only those
     # kernels read it.
     exp2_fma_split: bool = False
+    # The L2-prefetching loader of the half-input single-CTA d192x128 tile (sm100/prefill_d192_d128_f16.py at cta_mma=1,
+    # half precision): the TMA-LDG warp prefetches the K/V tiles one kv step ahead and the next tile's Q / first K/V
+    # into L2, runs its kv loop unrolled 1x, and the dense-causal arm keeps the plain MUFU exp2.  Claimed per arch like
+    # exp2_fma_split: set by the adapter (api_dsl._cga1_l2_prefetch_for) on the cc it is measured on; off, the tile
+    # keeps the develop loader.  Only that kernel reads it.
+    cga1_l2_prefetch: bool = False
     # sdpa(softmax_precision=cudnn.data_type.HALF) op attribute: exponent + P-cast run as
     # f16x2 pairs (MUFU EX2.F16x2 + cvt.rn.satfinite.*x2.f16x2) instead of
     # scalar f32 ex2. The cc 10.7 FP8 / MXFP8 kernels (every flavor; see
@@ -3690,6 +3696,17 @@ class CfgD192(CfgD128):
     # K sub-stages per tile: the TMA D-subtile count (3 x 16 KiB for half input) on the cga1 tile, so each subtile
     # is reloaded for the next tile as soon as BMM1 has read it, instead of after the whole 48 KiB tile; 1 elsewhere.
     K_SUB: int = 1
+    # The L2-prefetching loader (TemplateParams.cga1_l2_prefetch on the half-input cga1 tile): the TMA-LDG warp
+    # prefetches the K/V tiles L2_PREFETCH_KV kv steps ahead of their SMEM load and, with L2_PREFETCH_NEXT_TILE, the
+    # next tile's Q slabs and first K/V tile; tiles with fewer than L2_PREFETCH_MIN_STEPS kv steps issue no prefetch.
+    # Both distances are 0 elsewhere.
+    L2_PREFETCH_KV: int = 0
+    L2_PREFETCH_NEXT_TILE: int = 0
+    L2_PREFETCH_MIN_STEPS: int = 4
+    # Unroll factor of the TMA-LDG warp's kv loop (1 with the L2-prefetching loader, 6 otherwise).
+    LDG_UNROLL: int = 6
+    # The dense-causal exp2 tail emulation of the softmax (0 with the L2-prefetching loader, 1 otherwise).
+    EXP2_TAIL_MIX: int = 1
 
 
 def _d192_smem_bytes(cfg) -> int:
@@ -3734,6 +3751,20 @@ def _validate_cfg_d192(cfg: CfgD192) -> None:
         (
             cfg.K_SUB == ((cfg.TILE_K * cfg.BPE) // 128 if (not fp8 and cfg.CTA_MMA == 1) else 1),
             "d192: K is released per TMA D-subtile on the half-input cga1 tile only",
+        ),
+        (
+            cfg.L2_PREFETCH_KV in (0, 1) and (cfg.L2_PREFETCH_KV == 0 or (not fp8 and cfg.CTA_MMA == 1)),
+            "d192: the L2-prefetching loader (one kv step ahead) belongs to the half-input cga1 tile only",
+        ),
+        (cfg.L2_PREFETCH_NEXT_TILE == cfg.L2_PREFETCH_KV, "d192: the next-tile L2 prefetch comes with the K/V L2 prefetch"),
+        (cfg.L2_PREFETCH_MIN_STEPS >= 1, "d192: L2_PREFETCH_MIN_STEPS must be at least 1"),
+        (
+            cfg.LDG_UNROLL == (1 if cfg.L2_PREFETCH_KV else 6),
+            "d192: the TMA-LDG kv loop is unrolled 1x with the L2-prefetching loader and 6x otherwise",
+        ),
+        (
+            cfg.EXP2_TAIL_MIX == (0 if cfg.L2_PREFETCH_KV else 1),
+            "d192: the dense-causal exp2 tail emulation is folded out with the L2-prefetching loader and kept otherwise",
         ),
         (
             _d192_smem_bytes(cfg) <= _SM100_MAX_DYN_SMEM,
@@ -3884,6 +3915,8 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
     # reload then overlaps a whole iteration instead of the PV->PV window a single stage leaves it.
     stages_v = 2 if (not fp8 and params.cta_mma == 1) else stages_kv
     k_sub = (192 * b) // 128 if (not fp8 and params.cta_mma == 1) else 1  # one slot per 128 B TMA D-subtile
+    half_input_cga1 = not fp8 and params.cta_mma == 1
+    cga1_loader = half_input_cga1 and bool(params.cga1_l2_prefetch)
     cfg = CfgD192(
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
@@ -3907,6 +3940,10 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         STAGES_K=stages_kv,
         STAGES_V=stages_v,
         K_SUB=k_sub,
+        L2_PREFETCH_KV=1 if cga1_loader else 0,
+        L2_PREFETCH_NEXT_TILE=1 if cga1_loader else 0,
+        LDG_UNROLL=1 if cga1_loader else 6,
+        EXP2_TAIL_MIX=0 if cga1_loader else 1,
         SCHEDULER_STAGES=3 if e4_thd_swa and not params.bottom_right else 2,
         MASK_FLAGS=mask_flags,
         WINDOW_LEFT=params.window_left or 0,
