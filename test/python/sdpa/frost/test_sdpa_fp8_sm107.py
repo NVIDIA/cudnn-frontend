@@ -2018,7 +2018,7 @@ class TestNativeFp8SinkSplit:
 
     test_rebind_and_replay = staticmethod(_rebind)
     test_standalone = staticmethod(_standalone)
-    test_domain_declines = staticmethod(_domain)
+    test_split_domain = staticmethod(_domain)
 
 
 @requires_rubin

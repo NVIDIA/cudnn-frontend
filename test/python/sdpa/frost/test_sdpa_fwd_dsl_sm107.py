@@ -363,8 +363,11 @@ def test_sm107_d512_o_store_levers_are_module_constants(kind, load_kw):
         code = _code_lines(fh.read())
     for name in _O_STORE_LEVERS:
         assert len(re.findall(rf"^{name}: bool = (?:True|False)$", code, re.M)) == 1, f"{mod.__name__}: exactly one {name} definition"
-        assert f"const_expr({name})" in code, f"{mod.__name__}: {name} is not folded at a site"
-    assert "const_expr(not O_STORE_STREAM)" in code, f"{mod.__name__}: the whole-tile store arm is gone -- the lever is no longer an A/B"
+        # FP8 split partials bypass final-O TMA stores; both unsplit store arms still fold the module lever.
+        predicate = f"{name} and not _FP32_PARTIALS" if kind == "fp8" and name == "O_STORE_STREAM" else name
+        assert f"const_expr({predicate})" in code, f"{mod.__name__}: {name} is not folded at a site"
+    whole_tile = "not O_STORE_STREAM and not _FP32_PARTIALS" if kind == "fp8" else "not O_STORE_STREAM"
+    assert f"const_expr({whole_tile})" in code, f"{mod.__name__}: the whole-tile store arm is gone -- the lever is no longer an A/B"
     assert re.search(r"\btma_store_tile\(", code) and re.search(r"\btma_store_subtile\(", code), f"{mod.__name__}: both store forms must trace"
     assert "    tma_store_subtile," in code, f"{mod.__name__}: tma_store_subtile must come from cudnn.frost.tile_dsl.tma"
     assert (
