@@ -9,6 +9,7 @@ production fallback for native plans. No test pins a heuristic or timing.
 import sdpa_binding_reference as binding_reference
 
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 
@@ -107,19 +108,36 @@ def _reference(s, facts, workspace=0x30000, stream=17):
 
 
 def test_ordered_thd_rebinds_storage_and_validates_workspace_before_launch():
+    from cudnn.engines.base import ExecutionContext
+    from cudnn.sdpa._plan import _FrostSdpaPlan
+
     spec, facts, frames = _fixture()
     spec.scratch_bytes = 8192
+    spec.quant = spec.origin_specs = None
     spec.native = cudnn._pybind_module._SdpaThdBinder(spec)
     native = cudnn._pybind_module
     roles = tuple(facts)
     uids = tuple(range(1, len(roles) + 1))
-    indices = tuple(roles.index(role) if role in roles else -1 for role in prep._NATIVE_THD_ROLES)
     layout = native.DeclaredLayout(len(roles))
     for i, role in enumerate(roles):
         fact = facts[role]
         code, bits = prep._buffers.DTYPES[fact.dtype]
         layout.set(i, fact.shape, fact.strides, fact.span * (bits // 8), code, bits)
     schema = native._OrderedBindingSchema(uids, layout, False)
+    tensors = {role: SimpleNamespace(get_uid=lambda uid=uid: uid) for role, uid in zip(roles, uids)}
+    binding = SimpleNamespace(
+        **{role: tensors[role] for role in ("q", "k", "v", "o")},
+        cu_seq_len_q=tensors["q_lens"],
+        cu_seq_len_kv=tensors["kv_lens"],
+        stats=tensors["lse"],
+        bound_tensors=lambda: tensors.values(),
+    )
+    launch = prep.PreparedThdLaunch(spec, binding)
+    plan = _FrostSdpaPlan("thd-test", SimpleNamespace(binding=binding, prepared=launch, workspace_bytes=spec.scratch_bytes))
+    assert plan._ordered_native is spec.native
+    graph = cudnn.pygraph()
+    graph._ordered_binding_uids = uids
+    graph._slot_of_uid = dict(zip(uids, range(len(uids))))
 
     def buffers(current):
         result = []
@@ -132,15 +150,16 @@ def test_ordered_thd_rebinds_storage_and_validates_workspace_before_launch():
         return tuple(result)
 
     def call(current, workspace, stream=17):
-        return spec.native.execute_ordered(schema, buffers(current), uids, {}, workspace, None, None, None, indices, stream)
+        return plan._execute_ordered(graph, schema, buffers(current), uids, workspace, None, None, None, stream)
 
     for offset, stream in ((0, 17), (2**33, 23)):
         current = {role: fact._replace(ptr=fact.ptr + offset) for role, fact in facts.items()}
         address = 0x30000 + offset
+        expected = _reference(spec, current, address, plan._stream_handle(stream))
+        assert int(expected[spec.index["stream"]]) == stream
         ws = native.make_operand_buffer(address, [spec.scratch_bytes], 1, 8, 0)
         result = call(current, ws, stream)
         frame = frames.pop()
-        expected = _reference(spec, current, address, stream)
         assert result is None
         assert list(frame) == expected
         for bad, message in (
@@ -156,9 +175,12 @@ def test_ordered_thd_rebinds_storage_and_validates_workspace_before_launch():
         # the native entry must not launch before that path validates the call.
         result = call(current, address, stream)
         assert result[2] is None and not frames
+        pack = graph._finish_ordered(schema, result, address, None)
+        plan.execute(graph, pack, ExecutionContext(stream=stream, workspace=address))
+        frame = frames.pop()
+        assert list(frame) == expected
         result = call(current, ws, stream)
         frame = frames.pop()
-        expected = _reference(spec, current, address, stream)
         assert result is None
         assert list(frame) == expected
 
