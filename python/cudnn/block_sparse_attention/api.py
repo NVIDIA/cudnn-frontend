@@ -7,16 +7,24 @@ from __future__ import annotations
 
 import math
 from functools import lru_cache
-from typing import Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
 from cudnn.api_base import TupleDict
 
+if TYPE_CHECKING:
+    from .kpage import KPageLayout
+
 
 def _validate_layout(layout: str) -> None:
     if layout not in {"bhsd", "bshd"}:
         raise ValueError(f"layout must be 'bhsd' or 'bshd', got {layout!r}")
+
+
+def _as_bhsd(t: Optional[torch.Tensor], layout: str) -> Optional[torch.Tensor]:
+    """View a tensor of the given layout as BHSD."""
+    return t if t is None or layout == "bhsd" else t.transpose(1, 2)
 
 
 def _canonical_shapes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layout: str):
@@ -190,6 +198,7 @@ def block_sparse_attention_forward(
     layout: str = "bhsd",
     kv_splits: int | str = 1,
     use_clc: Optional[bool] = None,
+    kpage: Union[bool, "KPageLayout"] = False,
 ) -> TupleDict:
     """Run non-causal block-sparse scaled dot-product attention.
 
@@ -199,6 +208,12 @@ def block_sparse_attention_forward(
 
     Sparse metadata values are a caller contract; see the "Sparse metadata"
     section of ``docs/fe-oss-apis/bsa.md`` for the required value ranges.
+
+    ``kpage`` selects the SM100/SM103 blk128 KPage kernels, which gather the
+    valid 16-row pages of partially occupied K/V blocks into full MMA tiles.
+    Pass ``True`` to build the page layout from the metadata on this call, or
+    a :class:`KPageLayout` from :func:`kpage_prepare_layout` to reuse one.
+    See "KPage" in ``docs/fe-oss-apis/bsa.md`` for the contract.
     """
 
     batch, num_q_heads, num_kv_heads, seqlen_q, seqlen_k, head_dim, value_dim = _canonical_shapes(q_tensor, k_tensor, v_tensor, layout)
@@ -211,6 +226,11 @@ def block_sparse_attention_forward(
         sparse_block_size = 64 if arch_family in {9, 12} else 128
     if sparse_block_size not in {64, 128}:
         raise ValueError("sparse_block_size must be 64 or 128")
+    if kpage is not False:
+        if pack_gqa is True or kv_splits != 1 or use_clc is not None:
+            raise NotImplementedError("kpage does not take pack_gqa, kv_splits, or use_clc")
+        if sparse_block_size != 128:
+            raise NotImplementedError("kpage requires sparse_block_size=128")
     if arch_family == 9:
         if kv_splits != "auto" and (isinstance(kv_splits, str) or not 1 <= int(kv_splits) <= 256):
             raise ValueError("SM90 kv_splits must be 'auto' or an integer in [1, 256]")
@@ -237,7 +257,11 @@ def block_sparse_attention_forward(
     if pack_gqa is True and 128 % gqa_ratio:
         raise ValueError("pack_gqa=True requires the GQA ratio to divide 128")
     pack_gqa_effective = (
-        arch_family in {10, 11} and sparse_block_size == 128 and (gqa_ratio > 1 if pack_gqa is None else bool(pack_gqa)) and 128 % gqa_ratio == 0
+        arch_family in {10, 11}
+        and sparse_block_size == 128
+        and (gqa_ratio > 1 if pack_gqa is None else bool(pack_gqa))
+        and 128 % gqa_ratio == 0
+        and kpage is False  # kpage metadata is per query head
     )
     if pack_gqa_effective:
         metadata_heads = num_kv_heads
@@ -261,12 +285,33 @@ def block_sparse_attention_forward(
     if block_sparse_num is None:
         block_sparse_num = int(q2k_block_index.shape[-1])
     if q2k_block_nums is None:
-        require_even = arch_family in {10, 11} and sparse_block_size == 128
+        require_even = arch_family in {10, 11} and sparse_block_size == 128 and kpage is False
         _validate_fixed_block_count(
             block_sparse_num,
             q2k_block_index.shape[-1],
             require_even=require_even,
         )
+
+    if kpage is not False:
+        from . import _kpage_api
+
+        q_bhsd, k_bhsd, v_bhsd = (_as_bhsd(t, layout) for t in (q_tensor, k_tensor, v_tensor))
+        layout_obj = _kpage_api.resolve_layout(
+            kpage,
+            q_bhsd,
+            k_bhsd,
+            v_bhsd,
+            q2k_block_index,
+            block_sparse_num,
+            block_sizes,
+            q2k_block_nums,
+            arch=arch,
+            sparse_block_size=sparse_block_size,
+            allow_empty_block_nums=allow_empty_block_nums,
+        )
+        with torch.cuda.device(q_tensor.device):
+            out, lse = _kpage_api.forward(q_bhsd, k_bhsd, v_bhsd, layout_obj, softmax_scale)
+        return TupleDict(o_tensor=_as_bhsd(out, layout), lse_tensor=lse)
 
     with torch.cuda.device(q_tensor.device):
         from . import _interface
@@ -422,11 +467,16 @@ def block_sparse_attention_backward(
     bucket_size_blocks: Optional[int] = None,
     sparse_block_size: Optional[int] = None,
     layout: str = "bhsd",
+    kpage: Union[bool, "KPageLayout"] = False,
 ) -> TupleDict:
     """Compute explicit dQ, dK, and dV for block-sparse attention.
 
     Sparse metadata values are a caller contract; see the "Sparse metadata"
     section of ``docs/fe-oss-apis/bsa.md`` for the required value ranges.
+
+    ``kpage`` selects the KPage backward (see ``block_sparse_attention_forward``);
+    it takes ``block_sizes`` and requires ``do_tensor`` to be zero on padding
+    rows.  The forward may have run with or without ``kpage``.
     """
 
     batch, num_q_heads, num_kv_heads, seqlen_q, seqlen_k, head_dim, value_dim = _canonical_shapes(q_tensor, k_tensor, v_tensor, layout)
@@ -436,8 +486,8 @@ def block_sparse_attention_backward(
         raise RuntimeError(f"block sparse attention backward requires SM90-SM110, found SM{arch}")
     if q_tensor.dtype != torch.bfloat16:
         raise NotImplementedError("block sparse attention backward requires BF16")
-    if num_q_heads != num_kv_heads:
-        raise NotImplementedError("block sparse attention backward supports MHA only")
+    if num_q_heads != num_kv_heads and kpage is False:
+        raise NotImplementedError("block sparse attention backward supports MHA only; kpage=True supports GQA")
     if head_dim != value_dim:
         raise NotImplementedError("block sparse attention backward requires equal QK and V dimensions")
 
@@ -445,13 +495,18 @@ def block_sparse_attention_backward(
         sparse_block_size = 64 if arch_family == 9 else 128
     if sparse_block_size not in {64, 128}:
         raise ValueError("sparse_block_size must be 64 or 128")
+    if kpage is not False:
+        if bucket_size_blocks is not None:
+            raise NotImplementedError("kpage does not take bucket_size_blocks; use kpage_prepare_layout(bwd_kv_groups=...)")
+        if sparse_block_size != 128:
+            raise NotImplementedError("kpage requires sparse_block_size=128")
     if arch_family == 9 and head_dim != 128:
         raise NotImplementedError("SM90 backward requires head_dim=128")
     if sparse_block_size == 64 and head_dim != 128:
         raise NotImplementedError("blk64 backward requires head_dim=128")
     if sparse_block_size == 128 and head_dim not in {64, 128}:
         raise NotImplementedError("SM100/SM110 blk128 backward requires head_dim=64 or 128")
-    if arch_family != 9 and arch not in (100, 103) and sparse_block_size == 128 and block_sizes is not None:
+    if arch_family != 9 and arch not in (100, 103) and sparse_block_size == 128 and block_sizes is not None and kpage is False:
         raise NotImplementedError(f"SM{arch} blk128 backward does not yet support block_sizes; use full physical KV blocks and pass block_sizes=None")
 
     expected_prefix = (
@@ -492,6 +547,30 @@ def block_sparse_attention_backward(
         v_tensor,
     )
 
+    if kpage is not False:
+        from . import _kpage_api
+
+        do_bhsd, q_bhsd, k_bhsd, v_bhsd, o_bhsd = (_as_bhsd(t, layout) for t in (do_tensor, q_tensor, k_tensor, v_tensor, o_tensor))
+        dq_bhsd, dk_bhsd, dv_bhsd = (_as_bhsd(t, layout) for t in (dq_tensor, dk_tensor, dv_tensor))
+        layout_obj = _kpage_api.resolve_layout(
+            kpage,
+            q_bhsd,
+            k_bhsd,
+            v_bhsd,
+            q2k_block_index,
+            block_sparse_num,
+            block_sizes,
+            q2k_block_nums,
+            arch=arch,
+            sparse_block_size=sparse_block_size,
+            allow_empty_block_nums=True,
+            extra=(do_bhsd, o_bhsd, lse_tensor, dq_bhsd, dk_bhsd, dv_bhsd),
+        )
+        with torch.cuda.device(q_tensor.device):
+            dq, dk, dv = _kpage_api.backward(do_bhsd, q_bhsd, k_bhsd, v_bhsd, o_bhsd, lse_tensor, layout_obj, softmax_scale, dq_bhsd, dk_bhsd, dv_bhsd)
+        dq, dk, dv = (given if given is not None else _as_bhsd(t, layout) for given, t in zip((dq_tensor, dk_tensor, dv_tensor), (dq, dk, dv)))
+        return TupleDict(dq_tensor=dq, dk_tensor=dk, dv_tensor=dv)
+
     with torch.cuda.device(q_tensor.device):
         from . import _interface
 
@@ -517,8 +596,64 @@ def block_sparse_attention_backward(
     return TupleDict(dq_tensor=dq, dk_tensor=dk, dv_tensor=dv)
 
 
+def kpage_prepare_layout(
+    q2k_block_index: torch.Tensor,
+    block_sparse_num: Optional[int] = None,
+    block_sizes: Optional[torch.Tensor] = None,
+    q2k_block_nums: Optional[torch.Tensor] = None,
+    *,
+    q_block_sizes: Optional[torch.Tensor] = None,
+    seqlen_q: Optional[int] = None,
+    seqlen_k: Optional[int] = None,
+    validate: bool = True,
+    allow_empty_block_nums: bool = False,
+    bwd_kv_groups: Optional[int] = None,
+    with_backward: bool = False,
+) -> "KPageLayout":
+    """Build a reusable :class:`KPageLayout` from BSA blk128 sparse metadata.
+
+    The positional arguments have the same meaning as in
+    ``block_sparse_attention_forward``: ``block_sizes[j]`` is the number of
+    valid keys of KV block ``j`` and every query row is valid.  The layout
+    depends on the metadata only, so it can be passed as ``kpage=`` to any
+    number of forward and backward calls that use the same metadata tensors.
+
+    ``q_block_sizes`` (int32, one entry per query block) marks query rows at
+    or past ``q_block_sizes[i]`` in block ``i`` as padding: they are skipped
+    and their ``o``, ``lse`` and ``dq`` rows are written as zero.  This is the
+    page-compacted counterpart of ``block_sizes`` for inputs whose query side
+    carries the same per-block padding, e.g. ``q_block_sizes=block_sizes``.
+    ``seqlen_q`` / ``seqlen_k`` are needed only when the sequences are not
+    multiples of 128 (the rows past them become padding of the final block,
+    as on the base path) or when ``block_sizes`` is omitted and the key
+    sequence is not as long as the query sequence.  ``validate=False`` skips
+    the metadata contract check (one extra device readback);
+    ``allow_empty_block_nums`` has the forward meaning (query blocks with
+    ``q2k_block_nums == 0`` get ``O = 0``, ``LSE = -inf`` and ``dQ = 0``).
+    ``with_backward=True`` builds the backward tables here instead of on the
+    first backward call.  ``bwd_kv_groups`` overrides the number of Q groups
+    the backward walk of each K/V tile is split into.
+    """
+    from . import _kpage_api
+
+    return _kpage_api.prepare_layout(
+        q2k_block_index,
+        block_sparse_num,
+        block_sizes,
+        q2k_block_nums,
+        q_block_sizes=q_block_sizes,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        validate=validate,
+        allow_empty_block_nums=allow_empty_block_nums,
+        bwd_kv_groups=bwd_kv_groups,
+        with_backward=with_backward,
+    )
+
+
 __all__ = [
     "block_sparse_attention_forward",
     "block_sparse_attention_fp8_forward",
     "block_sparse_attention_backward",
+    "kpage_prepare_layout",
 ]
