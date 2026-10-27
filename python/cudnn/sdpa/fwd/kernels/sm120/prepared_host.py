@@ -11,6 +11,7 @@ from cuda.bindings import driver as cuda_driver
 from cudnn.frost.compiled_cache import compile_cached
 from cudnn.sdpa.fwd.kernels._common_blackwell import _bshd
 from cudnn.sdpa.fwd.kernels._quantized import _reset_amax_kernel, _unscale_amax_kernel
+from cudnn.frost.tile_dsl.thd import THD_WORK_META_WORDS
 
 
 @cute.jit
@@ -64,7 +65,7 @@ def _operands(
         sinks = cute.make_tensor(sinks_ptr, cute.make_layout((qh,), stride=(1,)))
     q_lens_ptr = cute.make_ptr(cutlass.Int32, seq_q_lens_addr, cute.AddressSpace.gmem, assumed_align=4)
     q_lens = cute.make_tensor(q_lens_ptr, cute.make_layout((b,), stride=(1,)))
-    kv_lens = cute.make_tensor(meta_ptr, cute.make_layout((4 * b + 4 if kernel.thd_varlen else b,), stride=(1,)))
+    kv_lens = cute.make_tensor(meta_ptr, cute.make_layout((THD_WORK_META_WORDS(b) if kernel.thd_varlen else b,), stride=(1,)))
     thd_q_lens = None
     thd_kv_lens = None
     n_ctas = cutlass.Int32(persistent_ctas)

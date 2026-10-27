@@ -489,12 +489,20 @@ def test_gate_bwd_delta_geometry_is_the_chains():
 @requires_cuda
 @_DTYPES
 @pytest.mark.parametrize("d", [64, 128, 256])
-@pytest.mark.parametrize("b, s", [(1, 128), (3, 100), (2, 257)], ids=["b1-aligned", "b3-ragged", "b2-two-tiles-ragged"])
+@pytest.mark.parametrize(
+    "b, s",
+    [(1, 128), (3, 100), (2, 257), (1, 628), (1, 300)],
+    ids=["b1-aligned", "b3-ragged", "b2-two-tiles-ragged", "b1-thd-628", "b1-thd-300"],
+)
 def test_gate_bwd_delta_is_bitwise_the_chains_dot_do_o(dtype, d, b, s):
     """``delta`` (fp32 ``[B, H, S_pad]``) equals the chain's own ``dot_do_o`` over the dO this kernel STORED -- bit for bit,
     pad tail included (zeros past ``S``; both buffers NaN-poisoned first), on every CUDA device: the same fp32 products
     summed in the same order (module docstring).  ``d`` walks 1, 2 and 4 chain hand-off rounds; a ragged ``S`` exercises
-    the pad tail and a two-tile ``S`` the chain's second q tile."""
+    the pad tail and a two-tile ``S`` the chain's second q tile.  The two ``B = 1`` ragged multi-tile cells are the PACKED
+    (THD) identity's own shape: at ``s = T`` the ``(token // s, token % s)`` decode is ``(0, token)`` and the buffer is the
+    head-major ``[1, H, ceil128(T)]`` delta the packed SDPA backward reads, its tail ``[T, ceil128(T))`` zeroed from the row at
+    ``T - 1`` -- so the fused packed block is bitwise the unfused one without a packed producer arm (628 = 300 + 128 + 200,
+    the packed suites' lengths; 300 = a lone tail tile)."""
     h = 4
     t = b * s
     s_pad = -(-s // 128) * 128

@@ -13,6 +13,39 @@ from cudnn.sdpa.fwd.api_dsl import SdpaFwdDsl, SdpaFwdDslSm80, SdpaFwdDslSm100, 
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("fp8", [False, True])
+def test_compile_parameter_names_reused_across_plans_and_refreshed_for_new_entry(monkeypatch, fp8):
+    """New plans share immutable function metadata, but a replaced entry cannot reuse it."""
+    from types import SimpleNamespace
+
+    def compile_entry(*, has_lse):
+        pass
+
+    def replacement(*, has_lse, has_amax):
+        pass
+
+    replacement.__name__ = compile_entry.__name__
+    signature = inspect.signature
+    inspected = []
+
+    def track(entry):
+        inspected.append(entry)
+        return signature(entry)
+
+    monkeypatch.setattr(inspect, "signature", track)
+    km = SimpleNamespace(compile=compile_entry, compile_prepared=compile_entry)
+    for _ in range(2):
+        plan = SimpleNamespace(_k_mod=km, _fp8=fp8)
+        assert SdpaFwdDslSm100._kernel_compile_accepts(plan) == {"has_lse"}
+    assert inspected == [compile_entry]
+
+    setattr(km, "compile_prepared" if fp8 else "compile", replacement)
+    plan._kernel_accepts = None  # compile() resets this when reloading the module
+    assert SdpaFwdDslSm100._kernel_compile_accepts(plan) == {"has_lse", "has_amax"}
+    assert inspected == [compile_entry, replacement]
+
+
+@pytest.mark.L0
 def test_new_constructor_parameters_follow_the_legacy_positional_prefix():
     """New optional operands must not change legacy positional bindings."""
     params = list(inspect.signature(SdpaFwdDsl.__init__).parameters)
@@ -81,9 +114,27 @@ def test_mxfp8_omitted_scale_o_is_compiled_out_not_a_cached_dummy(monkeypatch):
     assert arguments["sf_o_ptr"] is not None
     assert arguments["scale_o_ptr"] is None
     # Append-only public signature: sample_scale_o closes the block-scale tail; the
-    # ragged-Q decode leg's plan-time facts (defaulted) follow it.
+    # ragged-Q decode leg's plan-time facts (defaulted) follow it, then the Rubin decode
+    # route's width cap and the programmatic-dependent-launch switch (the public tree's
+    # tail), then the score side outputs (sample_score_max / sample_score_sum_exp), then
+    # the Rubin small tiles' resident-block operands and their knobs in landing order --
+    # the newest tail.
     params = list(inspect.signature(SdpaFwdDsl.__init__).parameters)
-    assert params[-3:] == ["sample_scale_o", "ragged_divisors", "ragged_offsets_int64"], params[-4:]
+    i = params.index("sample_scale_o")
+    assert params[i : i + 5] == ["sample_scale_o", "ragged_divisors", "ragged_offsets_int64", "decode_q_tile_max", "use_pdl"], params[i : i + 6]
+    j = params.index("sample_score_max")
+    assert params[j - 1] == "use_pdl" and params[j : j + 2] == ["sample_score_max", "sample_score_sum_exp"], params[j - 1 : j + 2]
+    assert params[j + 2 :] == [
+        "sample_bias",
+        "sample_kv_mask",
+        "n_chunk",
+        "bias_mode",
+        "bias_stages",
+        "padded_tail_form",
+        "dead_subtile_quiet",
+        "bias_max_form",
+        "softmax_wgs",
+    ], params[j + 2 :]
 
 
 def _prepared_mxfp8_compile_arguments(monkeypatch, *, pv_bf16=False):
@@ -125,7 +176,7 @@ def test_block_scaled_o_keyword_reaches_every_lowering_that_advertises_it(api_cl
     passes check_support and compile, then fails every block-scaled draw at
     execute time with ``TypeError: unexpected keyword argument 'sf_o'`` -- the
     SM120 CI lane caught exactly that, invisible from an SM100 box."""
-    # SM100 also lowers sdpa_mxfp8 (block-scaled O on the MXFP8-input kernel); SM120 has no MXFP8 path.
+    # SM100 and SM120 also lower sdpa_mxfp8 with a block-scaled O.
     # Prepared per-tensor routes carry auxiliary buffers in their binding map;
     # only retained tensor lowerings have individual sf_o keyword arguments.
     fns = (api_cls.execute,)
@@ -137,7 +188,11 @@ def test_block_scaled_o_keyword_reaches_every_lowering_that_advertises_it(api_cl
     # decode leg's offset operands (defaulted None) follow it.
     exec_params = list(inspect.signature(api_cls.execute).parameters)
     tail = exec_params[exec_params.index("sf_o") :]
-    assert tail in (["sf_o"], ["sf_o", "ragged_q", "ragged_o", "ragged_lse"]), tail  # SM100 carries the leg; SM120 does not
+    # SM100 carries the leg and, appended after it, the score side outputs and the resident-block operands (bias / kv_mask); SM120 does not.
+    assert tail in (
+        ["sf_o"],
+        ["sf_o", "ragged_q", "ragged_o", "ragged_lse", "score_max_tensor", "score_sum_exp_tensor", "bias_tensor", "kv_mask_tensor"],
+    ), tail
 
 
 @pytest.mark.L0

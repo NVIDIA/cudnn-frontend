@@ -62,6 +62,7 @@ class KdaFrostEngine(BaseEngine):
         if facts.gate_channels != facts.d_qk:
             raise NotImplementedError(f"KdaFrostEngine: g must carry d_qk = {facts.d_qk} channels, got {facts.gate_channels}")
         checkpoint = facts.checkpoint_every_n_tokens
+        checkpoint_dtypes = (cudnn.data_type.FLOAT, facts.io_dtype)
         if checkpoint and checkpoint % 16 != 0:
             raise NotImplementedError(f"KdaFrostEngine: checkpoint_every_n_tokens must be a positive multiple of 16 (got {checkpoint})")
         if not facts.gates_at_ho:
@@ -76,10 +77,10 @@ class KdaFrostEngine(BaseEngine):
         beta_wants = (cudnn.data_type.FLOAT, facts.io_dtype)
         if facts.beta_dtype not in beta_wants + (None,):
             raise NotImplementedError(f"KdaFrostEngine: 'beta' must be {' or '.join(str(w) for w in beta_wants)}, got {facts.beta_dtype}")
-        state_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16)
+        state_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
         for port, got in (("initial_state", facts.state_dtype), ("final_state", facts.final_state_dtype)):
             if got not in state_dtypes + (None,):
-                raise NotImplementedError(f"KdaFrostEngine: '{port}' must be fp32/bf16, got {got}")
+                raise NotImplementedError(f"KdaFrostEngine: '{port}' must be fp32/bf16/fp16, got {got}")
         if not facts.state_pair_match:
             raise NotImplementedError("KdaFrostEngine: initial_state and final_state dtypes must match")
         gate_param_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
@@ -100,13 +101,18 @@ class KdaFrostEngine(BaseEngine):
                 raise NotImplementedError(f"KdaFrostEngine: 'd_initial_state' must mirror initial_state ({state_grad_want}), got an unset dtype")
             if facts.dg_dtype not in (facts.g_dtype, None):
                 raise NotImplementedError(f"KdaFrostEngine: 'dG' must match 'g' ({facts.g_dtype}), got {facts.dg_dtype}")
-            for port, got in (("dO", facts.do_dtype), ("state_checkpoints", facts.state_checkpoints_dtype)):
-                if got not in (facts.io_dtype, None):
-                    raise NotImplementedError(f"KdaFrostEngine: '{port}' must match the io dtype")
+            if facts.do_dtype not in (facts.io_dtype, None):
+                raise NotImplementedError("KdaFrostEngine: 'dO' must match the io dtype")
+            if facts.state_checkpoints_dtype not in checkpoint_dtypes + (None,):
+                raise NotImplementedError(
+                    f"KdaFrostEngine: 'state_checkpoints' must be {' or '.join(str(w) for w in checkpoint_dtypes)}, got {facts.state_checkpoints_dtype}"
+                )
             if facts.dbeta_dtype not in (facts.beta_dtype, None):
                 raise NotImplementedError(f"KdaFrostEngine: 'dBeta' must match 'beta' ({facts.beta_dtype}), got {facts.dbeta_dtype}")
-        elif facts.io_dtype is not None and facts.state_checkpoints_out_dtype not in (facts.io_dtype, None):
-            raise NotImplementedError("KdaFrostEngine: 'state_checkpoints' must match the io dtype")
+        elif facts.io_dtype is not None and facts.state_checkpoints_out_dtype not in checkpoint_dtypes + (None,):
+            raise NotImplementedError(
+                f"KdaFrostEngine: 'state_checkpoints' must be {' or '.join(str(w) for w in checkpoint_dtypes)}, got {facts.state_checkpoints_out_dtype}"
+            )
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:
         handle = ctx.handle if ctx is not None else None
@@ -128,7 +134,7 @@ class CompiledKda:
         from cuda.bindings.driver import CUstream
 
         from .common.host import tensormap_workspace_bytes
-        from .common.piece_chain import DV_SPLIT_TILES, chain_rows_per_cta, choose_pieces, is_dv_split, piece_table_layout
+        from .common.piece_chain import DV_SPLIT_TILES, chain_rows_per_cta, chain_min_tokens, choose_pieces, is_dv_split, piece_table_layout
         from .kernel.kda_chain_forward_f16 import CHAIN_FORWARD_BUFFERS, build_chain_forward, run_chain_forward
         from .kernel.kda_uncut_forward_f16 import build_uncut_forward, run_uncut_forward
         from .common.split_k import WORK_ITEM_FIELDS
@@ -179,6 +185,7 @@ class CompiledKda:
             cadence_tokens=self.checkpoint if self.has_state_checkpoints else 0,
             batch_invariant=self.batch_invariant,
             expand_num=1,
+            min_tokens=chain_min_tokens(reverse=False),
         )
         self.chain = self.pieces > 0
         self.dv_split = (
@@ -465,7 +472,7 @@ class CompiledKdaBwd:
         from .common.gate_bwd import GATE_BWD_BLOCKS, channel_gate_bwd
         from .common.head_reduce import head_group_reduce
         from .common.host import tensormap_workspace_bytes
-        from .common.piece_chain import chain_rows_per_cta, choose_pieces, piece_table_layout
+        from .common.piece_chain import chain_rows_per_cta, chain_min_tokens, choose_pieces, piece_table_layout
         from .kernel.kda_chain_backward_f16 import build_chain_backward, run_chain_backward
         from .kernel.kda_uncut_backward_f16 import build_uncut_backward, run_uncut_backward
         from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks
@@ -501,7 +508,9 @@ class CompiledKdaBwd:
         q, g, v = node.inputs["q"], node.inputs["g"], node.inputs["v"]
         self.b_t = bwd_module.CFG.B_T
         self.checkpoint_cadence = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
-        self.coarse_checkpoints = self.has_state_checkpoints and self.checkpoint_cadence > self.b_t
+        self.coarse_checkpoints = self.has_state_checkpoints and (
+            self.checkpoint_cadence > self.b_t or node.inputs["state_checkpoints"].get_data_type().name == "FLOAT"
+        )
         self.needs_recompute = not self.has_state_checkpoints or self.coarse_checkpoints
         total = q.dim[0]
         HQ, HV = q.dim[1], v.dim[1]
@@ -526,6 +535,7 @@ class CompiledKdaBwd:
             batch_invariant=self.batch_invariant,
             reverse=True,
             expand_num=1,
+            min_tokens=chain_min_tokens(reverse=True),
         )
         self.chain = self.pieces > 0
         self.length_rule = self.chain and self.batch_invariant

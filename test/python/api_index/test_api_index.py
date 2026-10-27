@@ -94,6 +94,49 @@ class ApiIndexTest(unittest.TestCase):
         self.write("cudnn/_impl.py", "class Builder:\n    def build(self): pass")
         self.assertEqual(self.names(), {"cudnn", "cudnn.Builder", "cudnn.Builder.build"})
 
+    def test_lazy_optional_imports_are_recorded_by_name(self):
+        self.write(
+            "cudnn/__init__.py",
+            """
+            __all__ = []
+            _LAZY_OPTIONAL_IMPORTS = {'Builder': ('._impl', 'Builder'), '_hidden': ('._impl', 'Builder')}
+            def __getattr__(name):
+                if name in _LAZY_OPTIONAL_IMPORTS:
+                    from ._impl import Builder
+                    return Builder
+                raise AttributeError(name)
+            """,
+        )
+        self.write("cudnn/_impl.py", "class Builder:\n    def build(self): pass")
+        self.assertEqual(self.names(), {"cudnn", "cudnn.Builder"})
+
+    def test_enum_instance_properties_and_export_aliases(self):
+        for base in ("Enum", "IntEnum"):
+            with self.subTest(base=base):
+                self.write(
+                    "cudnn/__init__.py",
+                    f"""
+                    from enum import {base}
+                    from types import DynamicClassAttribute
+                    class Mode({base}):
+                        FAST = 1
+                        @DynamicClassAttribute
+                        def description(self): raise RuntimeError('must not evaluate')
+                        @DynamicClassAttribute
+                        def _private(self): raise RuntimeError('must not evaluate')
+                    Alias = Mode
+                    __all__ = ['Mode', 'Alias']
+                    """,
+                )
+                expected = {"cudnn"}
+                for name in ("Mode", "Alias"):
+                    expected.update(f"cudnn.{name}{suffix}" for suffix in ("", ".FAST", ".name", ".value", ".description"))
+                actual = self.names()
+                # IntEnum exposes additional int methods on newer Python versions.
+                self.assertTrue(expected <= actual, expected - actual)
+                self.assertNotIn("cudnn.Mode._private", actual)
+                self.assertNotIn("cudnn.Alias._private", actual)
+
     def test_module_aliases_and_external_classes_do_not_expand_scope(self):
         self.write("cudnn/__init__.py", "import os\nfrom pathlib import Path\nfrom . import api\n__all__ = ['os', 'Path', 'api']")
         self.write("cudnn/api.py", "__all__ = ['run']\ndef run(): pass")
@@ -110,6 +153,7 @@ class ApiIndexTest(unittest.TestCase):
             "__all__ = 'invalid'",
             "__all__ = [1]",
             "def unlisted(): pass",
+            "__all__ = []\n_LAZY_OPTIONAL_IMPORTS = {'gone': ('._impl', 'gone')}",
         ):
             with self.subTest(source=source):
                 self.write("cudnn/__init__.py", source)

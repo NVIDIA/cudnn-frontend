@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import itertools
 import logging
 import os
 import subprocess
@@ -28,6 +29,28 @@ from .config_types import BenchmarkResult, InferenceBenchmarkConfig, ModelPreset
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+
+# The backends whose generation phase reads a paged KV cache, and so sweep ``config.page_sizes``; the cudnn graph paths and fa4
+# attend over dense K / V and take one case per shape at ``config.page_size``.
+PAGED_BACKENDS = ("flashinfer", "flash_mla", "b12x")
+CUDNN_LEGS = ("cudnn", "cudnn_oss", "cudnn_auto")
+
+
+def kv_layouts_for(config, backend, phase, model=None) -> List[str]:
+    """The cudnn legs sweep ``config.kv_layouts``; every other backend runs its native layout once (the paged-KV backends
+    page their generation cache, except b12x's dense sliding-window GQA fallback; their prefill reads contiguous K/V)."""
+    if backend in CUDNN_LEGS:
+        return list(config.kv_layouts)
+    if backend == "b12x" and model is not None and model.kind == "gqa" and model.sliding_window_size:
+        return ["dense"]
+    return ["paged" if backend in PAGED_BACKENDS and phase == "generation" else "dense"]
+
+
+def kv_min_fills_for(config, backend, kv_layout) -> List[float]:
+    """Per-request KV lengths are wired for the paged cudnn legs and flashinfer; the rest run equal lengths."""
+    if (backend in CUDNN_LEGS and kv_layout == "paged") or backend == "flashinfer":
+        return list(config.kv_min_fills)
+    return [1.0]
 
 
 def _device_cc() -> tuple:
@@ -74,36 +97,63 @@ class InferenceBenchmarkRunner:
     def __init__(self, verbose: bool = True):
         self.verbose = verbose
 
+    @staticmethod
+    def page_sizes_for(config: InferenceBenchmarkConfig, backend: str, model: Optional[ModelPreset] = None) -> List[int]:
+        """Generation pages, deduplicated after applying the model's backend layout constraints.
+
+        Without a model, return the requested backend axis. Case expansion supplies
+        the model so subprocess arguments, logs and result rows use effective sizes.
+        """
+        pages = config.page_sizes if backend in PAGED_BACKENDS and config.page_sizes else [config.page_size]
+        if backend == "b12x" and model is not None:
+            # Match setup_b12x: sliding-window GQA uses contiguous K/V; d576 MLA
+            # honors the requested page; the remaining paged paths require >=64.
+            if model.kind == "gqa" and model.sliding_window_size:
+                return [config.page_size]
+            if not (model.kind == "mla_absorbed" and model.head_dim_qk == 576):
+                pages = [max(int(p), 64) for p in pages]
+        return list(dict.fromkeys(int(p) for p in pages))
+
     def expand_config(self, config: InferenceBenchmarkConfig) -> Iterator[Dict[str, Any]]:
         for model in config.models:
             for backend in config.backends:
                 for data_type in config.data_types:
-                    for s_q, s_kv in [(s, s) for s in config.context_seqlens] + list(config.context_chunked_shapes):
-                        yield {
-                            "config": config,
-                            "model": model,
-                            "backend": backend,
-                            "data_type": data_type,
-                            "kv_cache_dtype": data_type,
-                            "phase": "context",
-                            "batch_size": config.context_batch_size,
-                            "q_tokens": s_q,
-                            "kv_len": s_kv,
-                        }
-                    for q_tokens, kv_len in config.generation_shapes:
-                        for batch in config.generation_batch_sizes:
-                            for kv_dtype in config.kv_cache_dtypes:
-                                yield {
-                                    "config": config,
-                                    "model": model,
-                                    "backend": backend,
-                                    "data_type": data_type,
-                                    "kv_cache_dtype": kv_dtype,
-                                    "phase": "generation",
-                                    "batch_size": batch,
-                                    "q_tokens": q_tokens,
-                                    "kv_len": kv_len,
-                                }
+                    for kv_layout in kv_layouts_for(config, backend, "context"):
+                        for s_q, s_kv in [(s, s) for s in config.context_seqlens] + list(config.context_chunked_shapes):
+                            yield {
+                                "config": config,
+                                "model": model,
+                                "backend": backend,
+                                "data_type": data_type,
+                                "kv_cache_dtype": data_type,
+                                "phase": "context",
+                                "batch_size": config.context_batch_size,
+                                "q_tokens": s_q,
+                                "kv_len": s_kv,
+                                "page_size": config.page_size,
+                                "kv_layout": kv_layout,
+                                "kv_min_fill": 1.0,
+                            }
+                    for kv_layout in kv_layouts_for(config, backend, "generation", model):
+                        for q_tokens, kv_len in config.generation_shapes:
+                            for batch in config.generation_batch_sizes:
+                                # mixed cache lengths need a batch to mix
+                                fills = kv_min_fills_for(config, backend, kv_layout) if batch > 1 else [1.0]
+                                for kv_dtype, page_size, fill in itertools.product(config.kv_cache_dtypes, self.page_sizes_for(config, backend, model), fills):
+                                    yield {
+                                        "config": config,
+                                        "model": model,
+                                        "backend": backend,
+                                        "data_type": data_type,
+                                        "kv_cache_dtype": kv_dtype,
+                                        "phase": "generation",
+                                        "batch_size": batch,
+                                        "q_tokens": q_tokens,
+                                        "kv_len": kv_len,
+                                        "page_size": page_size,
+                                        "kv_layout": kv_layout,
+                                        "kv_min_fill": fill,
+                                    }
 
     def run_single(self, case: Dict[str, Any], cc: tuple) -> BenchmarkResult:
         config: InferenceBenchmarkConfig = case["config"]
@@ -124,8 +174,10 @@ class InferenceBenchmarkRunner:
             head_dim_vo=model.head_dim_vo,
             kind=model.kind,
             sliding_window_size=model.sliding_window_size,
-            page_size=config.page_size,
+            page_size=case.get("page_size", config.page_size),
             num_iterations=config.num_iterations,
+            kv_layout=case.get("kv_layout", "dense"),
+            kv_min_fill=case.get("kv_min_fill", 1.0),
         )
 
         skip = backend_supported(case["backend"], model, case["phase"], cc)
@@ -157,7 +209,7 @@ class InferenceBenchmarkRunner:
             "--kind",
             model.kind,
             "--page_size",
-            str(config.page_size),
+            str(case.get("page_size", config.page_size)),
             "--data_type",
             case["data_type"],
             "--kv_cache_dtype",
@@ -166,6 +218,10 @@ class InferenceBenchmarkRunner:
             str(config.num_iterations),
             "--num_warmup_iterations",
             str(config.num_warmup_iterations),
+            "--kv_layout",
+            case.get("kv_layout", "dense"),
+            "--kv_min_fill",
+            str(case.get("kv_min_fill", 1.0)),
         ]
         if case["phase"] == "context" and config.context_causal:
             cmd.append("--causal")
@@ -211,9 +267,14 @@ class InferenceBenchmarkRunner:
         for i, case in enumerate(cases, 1):
             m = case["model"]
             kvd = "" if case["kv_cache_dtype"] == case["data_type"] else f" | kv={case['kv_cache_dtype']}"
+            pg = f" | page={case['page_size']}" if case["phase"] == "generation" and case["backend"] in PAGED_BACKENDS else ""
+            if case["backend"] in CUDNN_LEGS and case.get("kv_layout") == "paged":
+                pg += " | paged"
+            if case.get("kv_min_fill", 1.0) < 1.0:
+                pg += f" | kv_fill={case['kv_min_fill']:g}"
             logger.info(
                 f"[{i}/{len(cases)}] {m.name} | {case['phase']} | b={case['batch_size']} "
-                f"q={case['q_tokens']} kv={case['kv_len']} | {case['backend']} | {case['data_type']}{kvd}"
+                f"q={case['q_tokens']} kv={case['kv_len']} | {case['backend']} | {case['data_type']}{kvd}{pg}"
             )
             r = self.run_single(case, cc)
             results.append(r)
@@ -267,6 +328,11 @@ def main():
     config = load_config(args.config)
     if args.output_dir:
         config.output_dir = str(args.output_dir)
+    if args.filter_backend and args.filter_backend not in config.backends:
+        # a backend the config does not list (a paged-KV reference backend on a cudnn-only config) runs ALONE over the
+        # config's models, shapes and page sizes; a listed one is filtered as before
+        logger.info(f"backend '{args.filter_backend}' is not in config '{config.name}' ({config.backends}); running it alone over the config's axes")
+        config.backends = [args.filter_backend]
     runner = InferenceBenchmarkRunner()
 
     if args.dry_run:
@@ -279,7 +345,12 @@ def main():
             cases = [c for c in cases if c["phase"] == args.filter_phase]
         print(f"Would run {len(cases)} cases from '{config.name}':")
         for i, c in enumerate(cases, 1):
-            print(f"  [{i}] {c['model'].name} | {c['phase']} | b={c['batch_size']} q={c['q_tokens']} kv={c['kv_len']} | {c['backend']} | {c['data_type']}")
+            pg = f" | page={c['page_size']}" if c["phase"] == "generation" and c["backend"] in PAGED_BACKENDS else ""
+            if c["backend"] in CUDNN_LEGS and c.get("kv_layout") == "paged":
+                pg += " | paged"
+            if c.get("kv_min_fill", 1.0) < 1.0:
+                pg += f" | kv_fill={c['kv_min_fill']:g}"
+            print(f"  [{i}] {c['model'].name} | {c['phase']} | b={c['batch_size']} q={c['q_tokens']} kv={c['kv_len']} | {c['backend']} | {c['data_type']}{pg}")
         return
 
     results = runner.run_config(config, args.filter_backend, args.filter_model, args.filter_phase)

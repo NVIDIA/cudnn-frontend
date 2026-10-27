@@ -14,24 +14,39 @@ forward/backward in `../attention_training`):
 
 ## Backends
 
-The configs sweep the two cuDNN frontend paths only:
+The configs sweep three cuDNN frontend paths:
 
 | Backend | What it measures |
 |---|---|
 | `cudnn` | cuDNN frontend graph API, native backend engines only (heur A + FALLBACK; the FROST SDPA engines are deselected by name, since the SM100/SM120 f16 rows are default candidates), contiguous KV |
+| `cudnn_auto` | the same graph with the frontend's **default dispatch**: no engine deselected or pinned, FROST opt-in unset, so graduated FROST rows compete through placement exactly as for a user; the plan the heuristics picked is recorded per case. Compare it with the faster of `cudnn` / `cudnn_oss` (`python -m benchmark.heuristics_regret`) |
 | `cudnn_oss` | the same graph planned with `heur_mode.OPENSOURCE` and `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`: only the frontend's open-source engines (frost python engines + the backend's OSS candidates) may serve it; the winning plan is recorded per case |
 
 Unsupported combinations are recorded (not hidden) and show up as blank slots
 in the charts. Additional reference backends (`flashinfer`, `flash_mla`,
 `b12x`, `flash_attention_4`) remain implemented in
-`benchmark_single_attention.py` for ad-hoc runs via `--backend`.
+`benchmark_single_attention.py` for ad-hoc runs via `--backend` -- on the
+single-case script, or on the runner, where a backend the config does not
+list runs alone over the config's models, shapes and (for the paged-KV
+backends) `page_sizes`, e.g. `--config qwen35 --backend flashinfer --phase
+generation` sweeps the Qwen 3.5 shards at pages 16 / 32 / 64. Cases, logs and
+CSV rows use the effective backend page size: b12x paged GQA/shared-KV rounds
+pages below 64 up to 64 and runs each resulting size once. Its 576-wide MLA
+path retains the requested pages; its dense sliding-window GQA fallback runs
+once without a page sweep.
+
+CPU-only case-expansion and result-metadata tests:
+
+```bash
+python -m unittest discover -s benchmark/attention_inference/tests -v
+```
 
 ## Model configs
 
 | Config | Attention | Notes |
 |---|---|---|
 | `llama` | GQA d=128: 64/8 | bf16 + fp8 KV |
-| `qwen35` | GQA d=256: 32/2 | wide-head GQA; bf16 + fp8 KV |
+| `qwen35` | GQA d=256: 32/2 (TP shards 16/1, 8/1, 4/1) | wide-head GQA; bf16 + fp8 KV; requests pages 16 / 32 / 64 (`page_sizes`), with b12x using page 64 once |
 | `gpt_oss` | GQA d=64 + per-head sinks: SWA-128 and full-attention layer types | bf16 + fp8 KV, page 16 |
 | `deepseek_v4` | shared-K=V MQA, 64 or 128 q-heads, d=512 | official HF configs; dense core only (CSA/HCA pools out of scope) |
 | `kimi_k3` | absorbed MLA, 96 heads, 576/512, scale 1/√192, page 32 | context swept but structurally unabsorbed at prefill → blank slots (see training suite) |
@@ -46,8 +61,21 @@ batches. The 9-head video DiT is not head-shardable and runs whole-model
 additionally sweeps the KV-cache dtype (`kv_cache_dtypes`): this corresponds
 to the fp8-KV-cache serving configuration, realized on the cudnn paths as
 the full fp8 attention graph (q/k/v/o e4m3 with unit descales). Sinks
-(`has_sink`) add per-head attention-sink logits (gpt-oss-style; not wired
-into the fp8 graph — those cases record as unsupported).
+(`has_sink`) add per-head attention-sink logits (gpt-oss-style), in the bf16
+and the fp8 graph alike.
+
+**Serving form of the cuDNN call.** `kv_layouts=["dense", "paged"]` runs each
+cudnn leg twice. `dense` is contiguous K/V. `paged` is what a serving stack
+hands cuDNN (FlashInfer's cudnn backend): K/V in an HND page pool behind a
+*shuffled* block table (a live cache is fragmented), per-request
+`seq_len_q/kv` with a padding mask, and THD Q/O (ragged offsets) for a
+prefill. `kv_min_fills=[1.0, 0.25]` adds decode batches whose caches differ in
+length: each request's KV length is drawn (seeded) from
+[0.25 * kv_len, kv_len] (batch > 1 only; the paged cudnn legs and flashinfer).
+FLOPs and bytes are counted at each request's own lengths. The CSV carries
+`kv_layout` and `kv_min_fill`, and the charts give those rows their own
+clusters. `llama`, `qwen35`, `gpt_oss`, `deepseek_v4` and `kimi_k3` enable
+both axes.
 
 MLA models run **absorbed** in generation (`kind="mla_absorbed"`: K reads the
 full record, V a leading slice of the *same* record, so KV bytes are counted

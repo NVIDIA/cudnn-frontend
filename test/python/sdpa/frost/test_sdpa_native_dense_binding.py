@@ -18,19 +18,22 @@ from cudnn.sdpa.fwd import prepared as prep
 pytestmark = [pytest.mark.L0]
 
 
-def _fixture(dtype="bfloat16", paged=False, hnd=False, lse=True, lengths=True, d=128, sq=1):
+def _fixture(dtype="bfloat16", paged=False, hnd=False, lse=True, lengths=True, d=128, sq=1, v_hnd=None, d_v=None):
+    d_v = d if d_v is None else d_v
     s = prep.DenseLaunchSpec()
-    s.b, s.qh, s.kh, s.d_qk, s.d_v = 4, 8, 2, d, d
+    s.b, s.qh, s.kh, s.d_qk, s.d_v = 4, 8, 2, d, d_v
     s.s_q_max, s.s_k_max, s.page_size, s.tile_n = sq, 128, 16, 128
     s.paged, s.paged_hnd, s.has_lse, s.has_sink = paged, hnd, lse, False
+    s.paged_v_hnd = hnd if v_hnd is None else v_hnd
     s.seq_kv_present, s.seq_q_present = lengths, lengths
     s.device_index, s.split, s.window_right = 0, 1, 0
     s.ragged = s.fp32_partial = s.shape_fixed = s.lpt_grid_fixed = s.kv_tail_native = s.causal = s.causal_bottom_right = False
     s.gate_expect = s.quant = s.combine = None
     s.expect = dict.fromkeys(("q", "k", "v", "o"), dtype)
-    host_path = Path(prep.__file__).parent / f"kernels/sm100/decode_d{256 if d == 256 else 128}_f16.py"
+    host_name = "prefill_d512_f16_2x2.py" if d == 576 else f"decode_d{256 if d == 256 else 128}_f16.py"
+    host_path = Path(prep.__file__).parent / "kernels/sm100" / host_name
     host = next(n for n in ast.parse(host_path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "_host")
-    s.order = [arg.arg for arg in host.args.args if "Constexpr" not in ast.unparse(arg.annotation)]
+    s.order = [arg.arg for arg in host.args.args if arg.annotation is None or "Constexpr" not in ast.unparse(arg.annotation)]
     s.index = {name: i for i, name in enumerate(s.order)}
     s.template = [None] * len(s.order)
     s.template[s.index["seq_q_lens_addr"]] = 0
@@ -39,10 +42,12 @@ def _fixture(dtype="bfloat16", paged=False, hnd=False, lse=True, lengths=True, d
     s.fn = lambda *frame: frames.append(frame)
     facts = {}
     for i, (role, h, seq) in enumerate((("q", 8, sq), ("k", 2, 128), ("v", 2, 128), ("o", 8, sq))):
-        shape, strides = (4, h, seq, d), (seq * h * d, d, h * d, 1)
+        width = d if role in ("q", "k") else d_v
+        shape, strides = (4, h, seq, width), (seq * h * width, width, h * width, 1)
         if paged and role in ("k", "v"):
-            shape = (32, h, 16, d)
-            strides = (16 * h * d, 16 * d, d, 1) if hnd else (16 * h * d, d, h * d, 1)
+            shape = (32, h, 16, width)
+            pool_hnd = s.paged_v_hnd if role == "v" else hnd
+            strides = (16 * h * width, 16 * width, width, 1) if pool_hnd else (16 * h * width, width, h * width, 1)
         span = sum((n - 1) * st for n, st in zip(shape, strides)) + 1
         facts[role] = prep.BufferFacts(0x1000 * (i + 1), dtype, (2, 0), span, shape, strides)
     if lengths:
@@ -77,12 +82,12 @@ def _equal(s, facts, stream=17):
 
 
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
-@pytest.mark.parametrize("paged,hnd", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("paged,hnd,v_hnd", [(False, False, False), (True, False, False), (True, True, True), (True, False, True), (True, True, False)])
 @pytest.mark.parametrize("lse", [False, True])
 @pytest.mark.parametrize("lengths", [False, True])
 @pytest.mark.parametrize("d,sq", [(64, 1), (128, 1), (256, 1), (256, 4)])
-def test_native_dense_matches_python_and_rebinds(dtype, paged, hnd, lse, lengths, d, sq):
-    s, facts, _ = _fixture(dtype, paged, hnd, lse, lengths, d=d, sq=sq)
+def test_native_dense_matches_python_and_rebinds(dtype, paged, hnd, lse, lengths, d, sq, v_hnd):
+    s, facts, _ = _fixture(dtype, paged, hnd, lse, lengths, d=d, sq=sq, v_hnd=v_hnd)
     first = _equal(s, facts)
     changed = {name: f._replace(ptr=f.ptr + 0x100000) for name, f in facts.items()}
     second = _equal(s, changed, stream=23)
@@ -761,3 +766,16 @@ def test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, 
 @pytest.mark.parametrize("d", [64, 256])
 def test_native_decode_new_flavors_keep_int64_table_stride(d, monkeypatch, request):
     test_native_dense_graph_fresh_bindings_and_changed_replay(True, d, 1, "bfloat16", monkeypatch, request, wide_tables=True)
+
+
+@pytest.mark.parametrize("paged,hnd,v_hnd", [(False, False, False), (True, False, True), (True, True, False)])
+def test_native_d576_dense_binding(paged, hnd, v_hnd):
+    spec, facts, frames = _fixture(d=576, d_v=512, paged=paged, hnd=hnd, v_hnd=v_hnd)
+    _equal(spec, facts)
+    assert not frames
+
+
+@pytest.mark.parametrize("d,d_v", [(576, 504), (568, 512), (576, 576), (584, 512)])
+def test_native_d576_binding_keeps_exact_geometry(d, d_v):
+    with pytest.raises(ValueError, match="supported half attention head dimension pair"):
+        _fixture(d=d, d_v=d_v)

@@ -169,7 +169,7 @@ def test_probe_accepts_dsv4_causal():
     assert engines.engine_name() in _eligible(g)
 
 
-@pytest.mark.parametrize("unsupported", ["sm80", "synth_kv"])
+@pytest.mark.parametrize("unsupported", ["sm80"])
 @pytest.mark.parametrize("opt_in", [False, True])
 def test_fwd_override_legacy_graph_declines_before_lowering(monkeypatch, unsupported, opt_in):
     """Graph admission declines legacy executors before loading a DSL adapter."""
@@ -191,9 +191,6 @@ def test_fwd_override_legacy_graph_declines_before_lowering(monkeypatch, unsuppo
     for enabled in (False, True):
         graph = _mk_graph(is_override_shape_enabled=enabled)
         q, k, v, dims, strides = _mk_qkv(graph, d=128)
-        if unsupported == "synth_kv":
-            k.set_dim((B, H, 129, 128))
-            v.set_dim((B, H, 129, 128))
         o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
         _finish_output(o, dims, strides)
         if not enabled:
@@ -274,7 +271,7 @@ def test_override_filter_preserves_compatible_split_candidates(monkeypatch, d):
     assert engines.mismatch(spec.capabilities, fresh, split) is None
 
 
-@pytest.mark.parametrize("feature", ["mxfp8", "bias", "synth_kv"])
+@pytest.mark.parametrize("feature", ["mxfp8", "bias"])
 def test_prepared_override_capability_declines_legacy_features(feature):
     """The same pure predicate serves candidate filtering and runtime executor selection."""
     from dataclasses import replace
@@ -285,9 +282,18 @@ def test_prepared_override_capability_declines_legacy_features(feature):
     _finish_output(o, dims, strides)
     facts = _facts(graph)
     caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name())
-    changed = dict(mxfp8=dict(is_mxfp8=True), bias=dict(has_bias=True), synth_kv=dict(s_kv=129))[feature]
+    changed = dict(mxfp8=dict(is_mxfp8=True), bias=dict(has_bias=True))[feature]
     assert engines._prepared_decline_reason(caps, facts, 1) is None
-    assert engines._prepared_decline_reason(caps, replace(facts, **changed), 1) is not None
+    # The predicate's bias branch is the ROW's prepared bias binder: a row without one (``bias_d_shapes`` None) declines a bias on the
+    # prepared path; the resident-block rows (the SM107 row, and the SM100 row since its small-tile port) bind the bias through the
+    # prepared binder, so their own capabilities admit it here and the head-dim envelope is ``_bias_arm_decline``'s decision.
+    legacy_caps = replace(caps, bias_d_shapes=None) if feature == "bias" else caps
+    assert engines._prepared_decline_reason(legacy_caps, replace(facts, **changed), 1) is not None
+    if feature == "bias" and caps.bias_d_shapes is not None:
+        assert engines._prepared_decline_reason(caps, replace(facts, **changed), 1) is None
+        assert engines._bias_arm_decline(caps, replace(facts, **changed), None) is not None  # d 128 is outside the row's bias tiles
+    # A mask-free S_kv off the KV tile masks its tail in-kernel, so overrides keep the prepared launch (#1425).
+    assert engines._prepared_decline_reason(caps, replace(facts, s_kv=129), 1) is None
 
 
 @pytest.mark.parametrize("dtype_o", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2])
@@ -801,8 +807,8 @@ def test_probe_rejects_bottom_right_swa_only():
 
 def test_probe_accepts_ragged_skv_via_synth_padding():
     # KV tail (S_kv % 128 != 0) with no covering mask: the f16 rows opt into
-    # skv_tail_via_padding — the lowering synthesizes full-length per-batch KV
-    # lengths and the padded path masks the tail (the FP8 row's mechanism).
+    # skv_tail_via_padding — the adapter compiles the padded mask against the
+    # scalar S_kv (kv_tail_mask, #1425).
     g = _mk_graph()
     s_kv = 300
     q = g.tensor(dim=(B, H, S, D), stride=(S * H * D, D, H * D, 1), data_type=DTYPE, name="q")
@@ -1052,14 +1058,17 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
     # Capabilities.pack_gqa_partial_d_shapes as a module tuple because the
     # adapter has no engine row in hand when it validates a knob request.  Pin
     # the two together so the gate cannot drift: the f16 SM100 row declares
-    # exactly the adapter's flavors, and no other row (fp8 / mxfp8, the cc 10.7
-    # line, SM120) declares partial packing -- the adapter excludes those too.
+    # exactly the adapter's flavors. Native SM107 additionally admits D512;
+    # native SM107 D128 uses a shared route predicate because dense CGA1 still
+    # requires whole groups. Quantized and SM120 routes retain their gates.
     from cudnn.sdpa.fwd.api_dsl import _SM100_PARTIAL_PACK_GQA_FLAVORS
 
     by_name = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
     assert by_name[engines.engine_name()].pack_gqa_partial_d_shapes == frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS)
-    assert frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS) == frozenset({(128, 128), (256, 256)})
-    others = {name: caps.pack_gqa_partial_d_shapes for name, caps in by_name.items() if name != engines.engine_name()}
+    assert frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS) == frozenset({(128, 128), (256, 256), (576, 512)})
+    native_sm107 = engines.engine_name(arch="sm107")
+    assert by_name[native_sm107].pack_gqa_partial_d_shapes == frozenset({(512, 512)})
+    others = {name: caps.pack_gqa_partial_d_shapes for name, caps in by_name.items() if name not in (engines.engine_name(), native_sm107)}
     assert all(v is None for v in others.values()), others
 
 
@@ -1088,13 +1097,33 @@ def test_capabilities_positional_prefix_is_append_only():
             return f.default_factory()
         return required[name]
 
-    appended = ["pack_gqa_partial_d_shapes", "paged_d_shapes", "thd_pack_gqa_d_shapes", "zero_scale", "attn_scale_prefolded_d_shapes"]
+    appended = (
+        "pack_gqa_partial_d_shapes",
+        "paged_d_shapes",
+        "thd_pack_gqa_d_shapes",
+        "zero_scale",
+        "attn_scale_prefolded_d_shapes",
+        "score_stats_d_shapes",
+        "dense_only_d_shapes",
+        "bias_d_shapes",
+        "bias_io_dtype_only",
+        "kv_mask",
+        "kv_mask_dtypes",
+        "tile_ns_by_d_shape",
+        "pack_gqa_requires_divisible",
+        "thd_excluded_d_shapes",
+    )
     legacy_order = [n for n in names if n not in appended]
     caps = engines.Capabilities(*[legacy_value(n) for n in legacy_order])
     assert caps.thd_padded_stats is True
     assert caps.pack_gqa_partial_d_shapes is None
     assert caps.paged_d_shapes is None
     assert caps.thd_pack_gqa_d_shapes == frozenset()
+    assert caps.score_stats_d_shapes is None
+    assert caps.dense_only_d_shapes == frozenset()
+    assert caps.bias_d_shapes is None and caps.bias_io_dtype_only is False and caps.kv_mask is False and caps.kv_mask_dtypes == frozenset()
+    assert caps.tile_ns_by_d_shape == ()
+    assert caps.pack_gqa_requires_divisible is True
     assert caps.zero_scale is False
     assert caps.attn_scale_prefolded_d_shapes is None
     assert caps.epilogue_gate is False
@@ -1103,13 +1132,244 @@ def test_capabilities_positional_prefix_is_append_only():
     legacy_tail = ["pack_gqa_d_shapes", "thd_padded_stats", "epilogue_gate", "epilogue_gate_d_shapes", "epilogue_gate_dtypes"]
     start = names.index("pack_gqa_d_shapes")
     assert names[start : start + len(legacy_tail)] == legacy_tail, names[start:]
-    # ... and every later field is appended after it, in the order it landed.
-    assert names[start + len(legacy_tail) :] == appended, names[start:]
-
-    from cudnn.sdpa.bwd import engines as bwd_engines
+    # ... and every later field is appended after it, in the order it landed (the zero-scale and pre-folded-scale fields,
+    # then the resident-bias / kv_mask fields of the Rubin small tiles and their per-shape TILE_N domain, then the PackGQA
+    # divisibility rule, last).
+    assert names[start + len(legacy_tail) :] == list(appended), names[start:]
 
     bwd_names = [f.name for f in dataclasses.fields(bwd_engines.Capabilities)]
-    assert bwd_names[-3:] == ["bottom_right_s_q_multiple", "thd_head_stride", "zero_scale"], bwd_names
+    assert bwd_names[-6:] == [
+        "bottom_right_s_q_multiple",
+        "thd_head_stride",
+        "zero_scale",
+        "thd_ragged_offsets",
+        "compact_bshd",
+        "declaration_check",
+    ], bwd_names
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+# The forward bias and the per-key kv_mask: what the ANALYZER accepts as facts and rejects as malformed (``invalid``), and the typed
+# declines of the one row that serves them (the Rubin f16/bf16 32- / 64-wide tiles) against every other row.  GPU-free.
+# ---------------------------------------------------------------------------------------------------------------------------------
+
+_SM107_F16_ROW = "sdpa_fwd_prefill_sm107"
+
+
+def _mk_small_d_graph(d: int = 32, *, s_q: int = 256, s_kv: int = 256, dtype=cudnn.data_type.BFLOAT16, bias=None, kv_mask=None, **sdpa_kwargs):
+    """A dense (B, H, S, d) forward graph at a small head dim with an optional ``bias`` / ``kv_mask`` tensor spec
+    (``(dims, strides, data_type)``); the O geometry is set directly (``_finish_output``)."""
+    g = cudnn.pygraph(io_data_type=dtype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    dims_q, dims_kv = (B, H, s_q, d), (B, H, s_kv, d)
+    q = g.tensor(dim=dims_q, stride=(s_q * H * d, d, H * d, 1), data_type=dtype, name="q")
+    k = g.tensor(dim=dims_kv, stride=(s_kv * H * d, d, H * d, 1), data_type=dtype, name="k")
+    v = g.tensor(dim=dims_kv, stride=(s_kv * H * d, d, H * d, 1), data_type=dtype, name="v")
+    kw = dict(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, **sdpa_kwargs)
+    if bias is not None:
+        kw["bias"] = g.tensor(dim=bias[0], stride=bias[1], data_type=bias[2], name="bias")
+    if kv_mask is not None:
+        kw["kv_mask"] = g.tensor(dim=kv_mask[0], stride=kv_mask[1], data_type=kv_mask[2], name="kv_mask")
+    o, _ = g.sdpa(**kw)
+    _finish_output(o, dims_q, (s_q * H * d, d, H * d, 1), dtype=dtype)
+    return g
+
+
+def _compact(dims):
+    """Compact (row-major) strides of ``dims``."""
+    st, acc = [], 1
+    for n in reversed(dims):
+        st.append(acc)
+        acc *= n
+    return tuple(reversed(st))
+
+
+_BIAS_ACCEPT = {
+    "per_head [1, H, S, S]": ((1, H, S, S), _compact((1, H, S, S))),
+    "per_batch_head [B, H, S, S]": ((B, H, S, S), _compact((B, H, S, S))),
+    "head_broadcast [1, 1, S, S]": ((1, 1, S, S), _compact((1, 1, S, S))),
+    "batch_head_broadcast [B, 1, S, S]": ((B, 1, S, S), _compact((B, 1, S, S))),
+    # the strided OUTER axes: a [B, S_q, H, S_kv]-physical bias (the head stride below the row stride) and a padded row stride
+    "outer_permuted [B, S_q, H, S_kv]-physical": ((B, H, S, S), (S * H * S, S, H * S, 1)),
+    "padded_row_stride": ((1, H, S, S), (H * S * (S + 64), S * (S + 64), S + 64, 1)),
+}
+
+
+@pytest.mark.parametrize("name", list(_BIAS_ACCEPT))
+def test_fwd_bias_is_described_as_facts_in_every_broadcast_form_and_outer_layout(name):
+    """The analyzer DESCRIBES a well-formed forward bias (the four broadcast forms, any outer stride order, a padded row
+    stride) -- dims, strides and dtype as facts, never a judgment; a permuted outer layout is a fact the rows judge, not a
+    reshape the analyzer performs."""
+    dims, strides = _BIAS_ACCEPT[name]
+    facts = _facts(_mk_small_d_graph(bias=(dims, strides, cudnn.data_type.BFLOAT16)))
+    assert facts.has_bias and facts.bias_dim == dims and facts.bias_stride == strides and facts.bias_dtype == cudnn.data_type.BFLOAT16
+    assert facts.bias_t is not None
+
+
+_BIAS_REJECT = {
+    "rank_3": ((H, S, S), _compact((H, S, S))),
+    "rank_5": ((1, 1, H, S, S), _compact((1, 1, H, S, S))),
+    "wrong_s_kv": ((1, H, S, S // 2), _compact((1, H, S, S // 2))),
+    "wrong_s_q": ((1, H, S // 2, S), _compact((1, H, S // 2, S))),
+    "batch_not_1_or_B": ((B + 1, H, S, S), _compact((B + 1, H, S, S))),
+    "heads_not_1_or_H": ((1, H - 1, S, S), _compact((1, H - 1, S, S))),
+}
+
+
+@pytest.mark.parametrize("name", list(_BIAS_REJECT))
+def test_fwd_bias_of_another_rank_or_score_extent_is_invalid_for_every_engine(name):
+    """A forward bias that is not ``[1|B, 1|H_q, S_q, S_kv]`` is malformed for EVERY engine (plan risk 9: the validation the graph
+    layer lacked): ``invalid`` names the bias, and no FROST row is eligible."""
+    dims, strides = _BIAS_REJECT[name]
+    g = _mk_small_d_graph(bias=(dims, strides, cudnn.data_type.BFLOAT16))
+    facts = ga.analyze(g)
+    assert facts is not None and facts.invalid is not None and "bias" in facts.invalid, (name, facts.invalid)
+    assert not _eligible(g)
+
+
+@pytest.mark.parametrize(
+    "dtype_name, dt",
+    [("bool", cudnn.data_type.BOOLEAN), ("bf16", cudnn.data_type.BFLOAT16), ("fp32", cudnn.data_type.FLOAT), ("fp16", cudnn.data_type.HALF)],
+)
+def test_kv_mask_is_described_with_its_dtype_and_makes_the_node_python_only(dtype_name, dt):
+    """``kv_mask`` is a python-only ``sdpa`` input: described with dims / strides / dtype (BOOLEAN = the bit word; a 16-bit or
+    fp32 tensor = the additive per-key vector) and the node is python-engines-only once bound (the backend has no field); it is
+    the ONE python-only ``sdpa`` input registered, and a graph without it reads ``has_kv_mask`` False."""
+    from cudnn import _pygraph
+
+    assert _pygraph._CAPTURED_OPS["sdpa"]["python_only_in_kwargs"] == ("kv_mask",)
+    assert _facts(_mk_small_d_graph()).has_kv_mask is False
+    for dims in ((B, 1, 1, S), (1, 1, 1, S)):
+        g = _mk_small_d_graph(kv_mask=(dims, _compact(dims), dt))
+        assert g._unlowerable_node() is not None
+        facts = _facts(g)
+        assert facts.has_kv_mask and facts.kv_mask_dim == dims and facts.kv_mask_dtype == dt and facts.kv_mask_stride[3] == 1
+    # a padded batch stride is a fact too (the rows judge its alignment)
+    facts = _facts(_mk_small_d_graph(kv_mask=((B, 1, 1, S), (S + 64, S + 64, S + 64, 1), dt)))
+    assert facts.kv_mask_stride[0] == S + 64
+
+
+@pytest.mark.parametrize("dims", [(B, 1, 1, S // 2), (B, H, 1, S), (B, 1, S, S), (B + 1, 1, 1, S), (B, S)], ids=["s_kv", "heads", "rows", "batch", "rank2"])
+def test_kv_mask_of_another_shape_is_invalid(dims):
+    g = _mk_small_d_graph(kv_mask=(dims, _compact(dims), cudnn.data_type.BOOLEAN))
+    facts = ga.analyze(g)
+    assert facts is not None and facts.invalid is not None and "kv_mask" in facts.invalid, facts.invalid
+
+
+def _sm107_f16_caps():
+    return {s.name: s.capabilities for s in engines.ENGINE_SPECS}[_SM107_F16_ROW]
+
+
+@pytest.mark.parametrize(
+    "name, bias, kv_mask, reason",
+    [
+        ("fp32 bias on the io-dtype-only row", ((1, H, S, S), _compact((1, H, S, S)), cudnn.data_type.FLOAT), None, "bias dtype"),
+        ("non-16-byte outer bias stride", ((1, H, S, S), (H * S * (S + 4), S * (S + 4), S + 4, 1), cudnn.data_type.BFLOAT16), None, "16-byte"),
+        ("bias key dim not contiguous", ((1, H, S, S), (H * S * S, S * S, 1, S), cudnn.data_type.BFLOAT16), None, "contiguous"),
+        ("kv_mask key dim not contiguous", None, ((B, 1, 1, S), (S, S, S, 2), cudnn.data_type.BOOLEAN), "contiguous"),
+        ("fp16 additive kv_mask on a bf16 graph", None, ((B, 1, 1, S), _compact((B, 1, 1, S)), cudnn.data_type.HALF), "Q/K/V dtype"),
+        ("additive kv_mask batch stride not 16-byte", None, ((B, 1, 1, S), (S + 4, S + 4, S + 4, 1), cudnn.data_type.BFLOAT16), "16-byte"),
+        ("int8 kv_mask", None, ((B, 1, 1, S), _compact((B, 1, 1, S)), cudnn.data_type.INT8), "kv_mask dtype"),
+    ],
+)
+def test_sm107_small_tile_row_declines_the_bias_and_kv_mask_typed(monkeypatch, name, bias, kv_mask, reason):
+    """Every decline of the serving row is TYPED (a reason string from ``mismatch``), and no other FROST row picks the graph up
+    (an fp32 bias is a typed decline on these rows -- plan D-5; the backend may serve it, the kv_mask forms nobody else)."""
+    _rubin(monkeypatch)
+    g = _mk_small_d_graph(bias=bias, kv_mask=kv_mask)
+    facts = _facts(g)
+    why = engines.mismatch(_sm107_f16_caps(), facts)
+    assert why is not None and reason in why, (name, why)
+    assert not _eligible(g), name
+
+
+def test_sm107_small_tile_row_accepts_the_bias_and_kv_mask_in_their_served_forms(monkeypatch):
+    """The accept side of the same row: every broadcast form, the permuted / padded outer bias layouts, the bool word and the
+    additive bf16 / fp32 vectors (with a 16-byte padded batch stride), alone and together."""
+    _rubin(monkeypatch)
+    caps = _sm107_f16_caps()
+    for name, (dims, strides) in _BIAS_ACCEPT.items():
+        g = _mk_small_d_graph(bias=(dims, strides, cudnn.data_type.BFLOAT16))
+        assert engines.mismatch(caps, _facts(g)) is None, name
+        assert _SM107_F16_ROW in _eligible(g), name
+    for dt in (cudnn.data_type.BOOLEAN, cudnn.data_type.BFLOAT16, cudnn.data_type.FLOAT):
+        for strides in (_compact((B, 1, 1, S)), (S + 64, S + 64, S + 64, 1)):
+            g = _mk_small_d_graph(kv_mask=((B, 1, 1, S), strides, dt))
+            assert engines.mismatch(caps, _facts(g)) is None, (dt, strides)
+            assert _eligible(g) == {_SM107_F16_ROW}, (dt, strides)
+    g = _mk_small_d_graph(
+        bias=((1, H, S, S), _compact((1, H, S, S)), cudnn.data_type.BFLOAT16), kv_mask=((B, 1, 1, S), _compact((B, 1, 1, S)), cudnn.data_type.BFLOAT16)
+    )
+    assert _eligible(g) == {_SM107_F16_ROW}, "the io-dtype vector together with the bias (the fast path)"
+    # The fp32 vector WITH the bias: its 128-wide rendering spills on the softmax role (MEASURED -- the rendering pins of
+    # test_sdpa_bias_tile_n_additive_sm107.py), so the form is served at TILE_N 64 only: the knob-less probe accepts (the heuristics pick
+    # 64 for it, heuristics._resident_arm_tile_n), the TILE_N 64 knob accepts, an EXPLICIT 128 is a typed decline naming the two routes.
+    g = _mk_small_d_graph(
+        bias=((1, H, S, S), _compact((1, H, S, S)), cudnn.data_type.BFLOAT16), kv_mask=((B, 1, 1, S), _compact((B, 1, 1, S)), cudnn.data_type.FLOAT)
+    )
+    assert engines.mismatch(caps, _facts(g)) is None
+    assert _eligible(g) == {_SM107_F16_ROW}
+    assert engines.mismatch(caps, _facts(g), engines.SdpaFwdKnobs(tile_n=64)) is None
+    why = engines.mismatch(caps, _facts(g), engines.SdpaFwdKnobs(tile_n=128))
+    assert why is not None and "TILE_N 64" in why and "fp32" in why, why
+    from cudnn.sdpa.fwd import heuristics as heur
+
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _SM107_F16_ROW)
+    assert heur._resident_arm_tile_n(spec, _facts(g), 128) == 64, "the heuristics' pick for the form"
+    plain = _mk_small_d_graph(bias=((1, H, S, S), _compact((1, H, S, S)), cudnn.data_type.BFLOAT16))
+    assert (
+        heur._resident_arm_tile_n(spec, _facts(plain), 128) == 128
+    ), "a bias alone at two kv tiles keeps the wide tile on the 32-wide tile (its one-batch-entry item streams there)"
+    one_tile = _mk_small_d_graph(s_q=128, s_kv=128, bias=((1, H, 128, 128), _compact((1, H, 128, 128)), cudnn.data_type.BFLOAT16))
+    assert (
+        heur._resident_arm_tile_n(spec, _facts(one_tile), 128) == 64
+    ), "a bias alone at one kv tile takes the narrow tile (the measured width table: +24..+35 %)"
+    # A Q/K/V/O layout the prepared launch cannot bind zero-copy (a 72-byte head stride) with a resident-arm operand bound: the row
+    # declines at plan time (the staging-copy executor carries neither the bias nor the kv_mask -- it used to fail at EXECUTE time).
+    g = _mk_small_d_graph(kv_mask=((B, 1, 1, S), _compact((B, 1, 1, S)), cudnn.data_type.BOOLEAN))
+    f = _facts(g)
+    assert engines._resident_arm_layout_decline(f) is None, "a compact BSHD-physical graph binds without a copy"
+    d, dt = 32, cudnn.data_type.BFLOAT16
+    pad = cudnn.pygraph(io_data_type=dt, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    st = (S * H * (d + 4), d + 4, H * (d + 4), 1)  # a head stride of d + 4 bf16 = 72 bytes: BSHD-physical, not a 16-byte multiple
+    pq = pad.tensor(dim=(B, H, S, d), stride=st, data_type=dt, name="q")
+    pk = pad.tensor(dim=(B, H, S, d), stride=st, data_type=dt, name="k")
+    pv = pad.tensor(dim=(B, H, S, d), stride=st, data_type=dt, name="v")
+    pm = pad.tensor(dim=(B, 1, 1, S), stride=_compact((B, 1, 1, S)), data_type=cudnn.data_type.BOOLEAN, name="kv_mask")
+    po, _ = pad.sdpa(name="s", q=pq, k=pk, v=pv, attn_scale=0.1, is_inference=True, kv_mask=pm)
+    _finish_output(po, (B, H, S, d), (S * H * d, d, H * d, 1), dtype=dt)
+    why = engines.mismatch(caps, _facts(pad))
+    assert why is not None and "prepared launch" in why and "bind without a copy" in why, why
+
+
+def test_additive_kv_mask_needs_a_whole_granule_extent(monkeypatch):
+    """An additive vector is read as 16-byte granules: S_kv % 8 != 0 is a typed decline for it while the bool word (byte loads,
+    an in-range clamp per key) serves the same S_kv."""
+    _rubin(monkeypatch)
+    caps = _sm107_f16_caps()
+    s = 100
+    add = _mk_small_d_graph(s_q=s, s_kv=s, kv_mask=((B, 1, 1, s), _compact((B, 1, 1, s)), cudnn.data_type.BFLOAT16))
+    why = engines.mismatch(caps, _facts(add))
+    assert why is not None and "% 8" in why, why
+    word = _mk_small_d_graph(s_q=s, s_kv=s, kv_mask=((B, 1, 1, s), _compact((B, 1, 1, s)), cudnn.data_type.BOOLEAN))
+    assert engines.mismatch(caps, _facts(word)) is None
+
+
+def test_tile_n_knob_domain_is_per_flavor_on_the_sm107_f16_row(monkeypatch):
+    """The TILE_N knob: 64 and 128 on the 32- / 64-wide tiles (``tile_ns_by_d_shape``), 64 and 128 on the native d128 prefill rendering of the
+    same file; 256 is outside every flavor's domain (refused by the TMEM predicate at two sub-tiles) -- a typed decline, never
+    a silently degraded width."""
+    _rubin(monkeypatch)
+    caps = _sm107_f16_caps()
+    for d, ok in ((32, {64, 128}), (64, {64, 128}), (128, {64, 128})):
+        g = _mk_small_d_graph(d=d)
+        facts = _facts(g)
+        assert engines.effective_tile_ns(caps, facts) == frozenset(ok), d
+        for tile_n in (64, 128, 256):
+            why = engines.mismatch(caps, facts, engines.SdpaFwdKnobs(tile_n=tile_n))
+            assert (why is None) == (tile_n in ok), (d, tile_n, why)
+            if why is not None:
+                assert "tile_n" in why
+    assert min(caps.tile_ns) == 128, "the heuristics' default width stays 128 (min of the row-wide floor)"
 
 
 @pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
@@ -1172,6 +1432,79 @@ def test_thd_pack_gqa_admission_agrees_with_adapter(monkeypatch, cc, dtype, h_q,
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "group,cga,split,dim,accepted",
+    [
+        (6, 2, 1, 128, True),
+        (12, 2, 1, 128, True),
+        (24, None, 1, 128, True),
+        (3, 2, 1, 128, False),
+        (6, 1, 1, 128, False),
+        (6, 1, 2, 128, False),
+        (6, 2, 2, 128, False),
+        (6, 2, 1, 256, False),
+    ],
+)
+def test_sm107_paged_partial_pack_admission_agrees_with_adapter(monkeypatch, dtype, group, cga, split, dim, accepted):
+    """Both entry points admit the same paged partial-group domain before compilation."""
+    from cudnn.api_base import TensorDesc
+    from cudnn.frost import buffers
+    from cudnn.sdpa.fwd import api_dsl, config_sm100
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: (10, 7))
+    io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+    facts = ga.SdpaGraphFacts(
+        b=3,
+        h_q=group * 2,
+        h_kv=2,
+        s_q=513,
+        s_kv=640,
+        d_qk=dim,
+        d_v=dim,
+        dtype=io,
+        dtype_o=io,
+        causal=True,
+        thd=True,
+        has_paged_kv=True,
+        padded=True,
+        page_size=16,
+        device_cc=(10, 7),
+    )
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    reason = engines.mismatch(caps, facts, engines.SdpaFwdKnobs(cga=cga, split_kv=split, pack_gqa=True))
+    assert (reason is None) == accepted, reason
+
+    def desc(heads, tokens):
+        return TensorDesc(dtype, (3, heads, tokens, dim), (tokens * heads * dim, dim, heads * dim, 1), (3, 1, 2, 0), "cuda:0")
+
+    q, k = desc(group * 2, 513), desc(2, 16)
+    api = api_dsl.SdpaFwdDslSm100(
+        q,
+        k,
+        k,
+        q,
+        is_causal=True,
+        seq_kv_lens_present=True,
+        cu_seq_q_lens=True,
+        thd=True,
+        cga=cga,
+        split_kv=split,
+        pack_gqa=True,
+        paged_page_size=16,
+        paged_max_seq_len_kv=640,
+    )
+    if accepted:
+        assert api.check_support()
+        cfg, _ = config_sm100.make_cfg_d128(api.template_params())
+        assert cfg.PACK_G == math.gcd(group, 128)
+        assert cfg.PACK_GQA and cfg.PAGED_KV and cfg.THD_VARLEN
+    else:
+        with pytest.raises((ValueError, NotImplementedError), match="PackGQA|split"):
+            api.check_support()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("paged,pack_gqa", [(False, True), (False, False), (True, True), (True, False)])
 def test_packed_thd_split_adapter_declines_nonpaged_pack_gqa(monkeypatch, dtype, paged, pack_gqa):
     """Standalone admission must reject D192 packing before kernel compilation."""
@@ -1211,7 +1544,8 @@ def test_packed_thd_split_adapter_declines_nonpaged_pack_gqa(monkeypatch, dtype,
 @pytest.mark.parametrize(
     "changed,knobs",
     [
-        ({"device_cc": (10, 7)}, {}),
+        ({"device_cc": (10, 7), "attn_scale_prefolded": True}, {"cga": 1}),
+        ({"device_cc": (10, 7), "attn_scale_prefolded": True}, {}),
         ({"d_qk": 64, "d_v": 64}, {}),
         ({"d_qk": 256, "d_v": 256}, {}),
         ({"h_q": 24}, {}),
@@ -2158,10 +2492,9 @@ def _mk_paged_graph_fp8(*, d=128, page_size=16, max_pages=8, hnd=True, thd=False
 
 
 def test_paged_fp8_probe_accepts_and_declines():
-    """Paged per-tensor FP8 is the d128 FP8 kernel's PAGED_KV specialization: the fp8
-    row admits d128 (and d64 on its envelope) pools in HND or NHD, dense Q only; it
-    declines the d256 flavor, THD queries over pools and off-contract page sizes.
-    The f16/bf16 row never serves an sdpa_fp8 graph."""
+    """Paged per-tensor FP8 admits native D128/D256 with dense or THD Q.
+    D64 serves dense Q only. Off-contract pages remain declined, and the
+    f16/bf16 row never serves an sdpa_fp8 graph."""
     fp8_name = engines.engine_name(fp8=True)
     for hnd in (True, False):
         facts = _facts(_mk_paged_graph_fp8(hnd=hnd))
@@ -2170,17 +2503,21 @@ def test_paged_fp8_probe_accepts_and_declines():
         assert fp8_name in elig and engines.engine_name() not in elig
     assert fp8_name in _eligible(_mk_paged_graph_fp8(d=64)), "d=64 FP8 rides the d128 FP8 envelope"
     assert fp8_name in _eligible(_mk_paged_graph_fp8(page_size=128))
-    assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=256)), "paged per-tensor FP8 is wired on the d128 flavor only"
-    assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=192)), "(192, 192) would select the d256 FP8 flavor"
+    for hnd in (True, False):
+        assert fp8_name in _eligible(_mk_paged_graph_fp8(d=256, hnd=hnd))
+    assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=192)), "(192, 192) has no supported kernel envelope"
     assert fp8_name not in _eligible(_mk_paged_graph_fp8(page_size=48)), "page_size must divide 128 or be a multiple of it"
-    assert fp8_name not in _eligible(_mk_paged_graph_fp8(thd=True)), "THD queries over FP8 pools clamp runtime K/V descriptors; declined"
+    for d in (128, 256):
+        for hnd in (True, False):
+            assert fp8_name in _eligible(_mk_paged_graph_fp8(d=d, hnd=hnd, thd=True))
+    assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=64, thd=True))
 
 
 def test_paged_quantized_rows_mismatch_reasons():
     """The row-level reasons, by field: the SM100 MXFP8 row admits F8_128x4 pools at
     page_size % 128 only, the Rubin per-tensor FP8 row does not admit pools (its sibling
     kernel has no PAGED_KV specialization), and the SM100 FP8 row's paged sub-gates name
-    THD and the d128 envelope."""
+    THD and unsupported asymmetric head dimensions."""
 
     def paged_facts(**kw):
         base = dict(
@@ -2210,11 +2547,21 @@ def test_paged_quantized_rows_mismatch_reasons():
     assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=64, d_v=64)) is None
     assert "multiple of 128" in engines.mismatch(mxfp8, paged_facts(is_mxfp8=True))
     assert "paged attention" in engines.mismatch(fp8_rubin, paged_facts(is_fp8=True, device_cc=(10, 7)))
-    assert "THD" in engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True))
-    # The head-dim gate is the SELECTED flavor (Capabilities.paged_d_shapes = {(64, 64), (128, 128)} on the fp8 row).
-    assert "wired on the d64, d128 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=256, d_v=256))
-    assert "wired on the d64, d128 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=128))
-    assert "attention sink" in engines.mismatch(fp8, paged_facts(is_fp8=True, has_sink=True))
+    for cc in ((10, 0), (10, 3)):
+        for d in (128, 256):
+            assert engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True, d_qk=d, d_v=d, device_cc=cc)) is None
+    assert "dense-only" in engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True, d_qk=64, d_v=64))
+    assert "native per-tensor D128/D256" in engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True, d_qk=512, d_v=512))
+    # Admission follows the selected flavor; D256 is exact, not a D192 envelope.
+    assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=256, d_v=256)) is None
+    assert "no kernel-flavor envelope" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=192))
+    assert "wired on the d64, d128, d256 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=128))
+    for d in (64, 128):
+        sink_facts = paged_facts(is_fp8=True, has_sink=True, d_qk=d, d_v=d)
+        assert engines.mismatch(fp8, sink_facts) is None
+        split_knobs = engines.SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=2)
+        assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=d, d_v=d), split_knobs) is None
+        assert "sink-free dense" in engines.mismatch(fp8, sink_facts, split_knobs)
     # Block-scaled O (#1088) over pools: epilogue and loader are independent, but the pair is not validated.
     assert "block-scaled O" in engines.mismatch(fp8, paged_facts(is_fp8=True, dtype_o=cudnn.data_type.FP8_E4M3, o_block_scale=32))
     assert "block-scaled O" in engines.mismatch(mxfp8, paged_facts(is_mxfp8=True, page_size=128, dtype_o=cudnn.data_type.FP8_E4M3, o_block_scale=32))
@@ -2712,9 +3059,16 @@ def test_prepared_mxfp8_override_contract(thd, override, split, accepted, rubin_
     if accepted:
         for changed in (dict(o_block_scale=32), dict(has_epilogue_gate=True)):
             assert engines._prepared_decline_reason(caps, replace(facts, **changed), split) is not None
-        rubin = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name(arch="sm107", mxfp8=True))
-        rubin_facts = replace(facts, device_cc=rubin_cc)
-        assert (engines._prepared_decline_reason(rubin, rubin_facts, split) is None) == (rubin_cc == (10, 7) and not thd and not override and split == 1)
+    # The Rubin row's prepared MXFP8 contract, on every row of the table: the executor is device cc 10.7 only;
+    # it serves fixed dense plans (a dense shape override is declined) or bounded THD (the override rides the
+    # per-sequence lengths, as on SM100); split-KV is declined dense and THD alike.  So on cc 10.7 the row
+    # accepts exactly what the SM100 row accepts at split 1.
+    rubin = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name(arch="sm107", mxfp8=True))
+    rubin_facts = replace(facts, device_cc=rubin_cc)
+    rubin_accepts = rubin_cc == (10, 7) and split == 1 and (thd or not override)
+    assert rubin_accepts == (rubin_cc == (10, 7) and accepted and split == 1)
+    rubin_reason = engines._prepared_decline_reason(rubin, rubin_facts, split)
+    assert (rubin_reason is None) == rubin_accepts, (thd, override, split, rubin_cc, rubin_reason)
 
 
 # --- paged MXFP8 (block-scale pools behind the block tables) ------------------
@@ -2800,9 +3154,11 @@ def test_paged_mxfp8_probe_accepts_and_declines():
     assert reason is not None and "BSHD" in reason, reason
 
 
-def test_paged_mxfp8_mixed_pool_layouts_are_invalid():
-    facts = ga.analyze(_mk_paged_mxfp8(v_nhd=True))
-    assert facts is not None and facts.invalid is not None and "in-page layout" in facts.invalid, facts.invalid
+def test_paged_mxfp8_accepts_mixed_pool_layouts():
+    g = _mk_paged_mxfp8(v_nhd=True)
+    facts = _facts(g)
+    assert facts.is_mxfp8 and facts.has_paged_kv
+    assert MXFP8_ENGINE in _eligible(g)
 
 
 # ---------------------------------------------------------------------------
@@ -3030,3 +3386,26 @@ def test_fp8_bwd_d256_admitted_by_the_cpp_node_on_rubin(monkeypatch, d, sm_versi
     else:
         with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="hidden_dim"):
             g.validate()
+
+
+@pytest.mark.parametrize(
+    "shape,thd,admitted",
+    [((576, 512), False, True), ((576, 512), True, False), ((568, 512), False, False), ((576, 504), False, False), ((384, 256), True, True)],
+)
+def test_native_d576_admission_preserves_old_thd_envelope(shape, thd, admitted):
+    from dataclasses import replace
+
+    facts = replace(_facts(_mk_eligible_graph()), d_qk=shape[0], d_v=shape[1], thd=thd)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    reason = engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=2, pack_gqa=False))
+    assert (reason is None) == admitted, reason
+
+
+@pytest.mark.parametrize("shape,admitted", [((576, 512), True), ((512, 512), False)])
+def test_native_d576_dense_padding_split_admission(shape, admitted):
+    from dataclasses import replace
+
+    facts = replace(_facts(_mk_eligible_graph()), d_qk=shape[0], d_v=shape[1], padded=True)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    reason = engines.mismatch(caps, facts, engines.SdpaFwdKnobs(cga=2, split_kv=4, pack_gqa=False))
+    assert (reason is None) == admitted, reason

@@ -113,12 +113,16 @@ quantize passes) -- from device pointers and the caller's workspace, and records
 straight into it (``engines.lower_dsl_bwd*`` -> ``PreparedBwdLaunch``); :meth:`execute` is
 the standalone twin over torch tensors.  No torch op runs on the execute path.
 
-**An externally computed delta (every row, dense plans).**  ``external_delta=True`` at
+**An externally computed delta (every row, every plan).**  ``external_delta=True`` at
 construction declares that the caller hands stage 1's result to ``execute(..., delta_tensor=)``:
-a contiguous fp32 ``[B, H_q, S_q_pad]`` tensor (``external_delta_shape``; ``S_q_pad`` =
-``S_q`` rounded up to the 128-row q tile, zeros past ``S_q``) on the plan's device, 16-B
-aligned, holding ``rowsum(dO * O)`` -- the gated attention block's sigmoid-gate backward
-produces it while it already reads O and dO, in ``dot_do_o``'s own reduction order
+a contiguous fp32 tensor of ``external_delta_shape`` -- ``[B, H_q, S_q_pad]`` on a dense plan
+(``S_q_pad`` = ``S_q`` rounded up to the 128-row q tile, zeros past ``S_q``); on a THD plan the
+PACKED head-major ``[1, H_q, ceil128(T_q)]`` the THD main kernel reads (``T_q`` the plan's token
+capacity -- the declared packed total tightened to the envelope's ``B * S_max``, ``_thd_total`` --,
+zeros past ``T_q``: the dense layout at ``B = 1, S = T_q``, so a dense producer run over the
+packed tokens writes it as is) -- on the plan's device, 16-B aligned, holding
+``rowsum(dO * O)`` -- the gated attention block's sigmoid-gate backward produces it while it
+already reads O and dO, in ``dot_do_o``'s own reduction order
 (``gated_attention_block/kernels/sigmoid_gate_bwd.py``), so the fused and the unfused block are
 bitwise equal.  Under the flag the chain launches no ``dot``, reads O once less, and the
 workspace carve has no ``delta`` region (``scratch_workspace_bytes()`` shrinks by it); the
@@ -140,9 +144,10 @@ on every row: the kernels read them (``0 * NaN``), and under the MXFP8 row's blo
 32-element q block straddling the pad folds them into the REAL columns' E8M0 scale -- device
 data no host check can see.  The ``o`` / ``descale_o`` (fp8) and ``o_f16`` / ``dO_f16``
 (MXFP8) operands stay required under the flag and are read by nothing (append-only ABI; the
-gated block's training record saves O anyway).  Declined under THD on every row: the THD
-chain's delta is PACKED head-major and computed by its own pre-pass, and no producer emits
-the packed layout yet.
+gated block's training record saves O anyway).  Served under THD on every row in the packed
+form above: the appended, standalone-only ``delta`` slot of each THD launch record
+(``prepared_sm107.ROLES_*_THD``), the THD host viewing a caller's tensor from the plan's token
+capacity exactly as it views its own carved region, and the chain's packed ``dot`` not launched.
 
 FP8 (cuDNN ``sdpa_fp8_backward``): the twelve scalar descales / scales are 1-element
 fp32 DEVICE tensors, read by the kernels -- never folded on the host.  Stage 2 consumes
@@ -222,8 +227,9 @@ buffer and the device claim counter, per-sequence clipped dV stores, the kv-BLOC
 workspace (bf16 under P-c, the two block-scaled e4m3 payloads + E8M0 atoms under P-b), the
 stage-3 GEMMs trimmed PER SEQUENCE (P-c: the bf16 renderings over the exactly dequantized
 packed q_T / k_T; P-b: the block-scale arm's THD leg over the kv-blocked payloads + atoms and
-the packed columnwise q_T / k_T scale factors, dQ once per GQA group member as on the dense
-P-b chain) and the GQA fold bounded ON DEVICE at the live kv total.  **The seven scale-factor
+the packed columnwise q_T / k_T scale factors, dQ once per head chunk under GQA as on the dense
+P-b chain: the dQ record's ``b_head_group`` is the group) and the GQA fold bounded ON DEVICE at
+the live kv total.  **The seven scale-factor
 tensors travel PACKED per-sequence-TILE-padded**, the forward's convention
 (``fwd/prepared._bind_mxfp8_scales``): per head, every sequence's ``ceil(s_b / 128)`` F8_128x4
 tiles in cu_seqlens order -- sequence b's tiles start at ``cu_sf[b] = SUM_{i<b} ceil(s_i / 128)``,
@@ -379,7 +385,17 @@ BWD_D256_2X2: bool = False
 BWD_D256_2X2_PROFILE: int = _cfg2x2.PROFILE_SM107_INTERLEAVED
 
 
-def _sm107_chunks(b: int, h_q: int, group: int, s_q_pad: int, s_kv_pad: int, bpe_ds: int, budget: int = _SM107_WS_BUDGET_BYTES, batch_chunking: bool = True):
+def _sm107_chunks(
+    b: int,
+    h_q: int,
+    group: int,
+    s_q_pad: int,
+    s_kv_pad: int,
+    bpe_ds: int,
+    budget: int = _SM107_WS_BUDGET_BYTES,
+    batch_chunking: bool = True,
+    allow_subgroups: bool = False,
+):
     """``(b_chunk, qh_chunk)`` for one stage-2 launch: the LARGEST (batch, head) chunk whose dS
     workspace ``b_chunk * qh_chunk * S_kv * S_q * bpe`` fits ``budget``.
 
@@ -390,6 +406,10 @@ def _sm107_chunks(b: int, h_q: int, group: int, s_q_pad: int, s_kv_pad: int, bpe
     when even ``group`` heads at the full batch do not fit, and only on the half row
     (``batch_chunking``): the fp8 body walks the whole batch in-grid.  When nothing
     fits the smallest legal chunk is returned and the size is still honest.
+    An explicitly eligible dense chain can then divide a single GQA group:
+    preserve every existing choice that fits, and shrink below the group only
+    when its one-batch slab already exceeds the budget. One Q head is the
+    minimum, so the budget remains a target, not a hard allocation cap.
     """
     per = s_q_pad * s_kv_pad * bpe_ds
     heads = [c for c in range(h_q, 0, -1) if h_q % c == 0 and c % group == 0]
@@ -398,6 +418,11 @@ def _sm107_chunks(b: int, h_q: int, group: int, s_q_pad: int, s_kv_pad: int, bpe
         for hc in heads:
             if bc * hc * per <= budget:
                 return bc, hc
+    if allow_subgroups and batch_chunking:
+        for hc in range(group - 1, 0, -1):
+            if group % hc == 0 and hc * per <= budget:
+                return 1, hc
+        return 1, 1
     return batches[-1], group
 
 
@@ -604,10 +629,13 @@ def _stage3_trim_window(window: Optional[int], causal: bool, bottom_right: bool,
     return window
 
 
-def _bshd_physical_ok(desc: TensorDesc) -> bool:
-    """True when a logical-BHSD desc sits on compact BSHD storage (the rows' layout claim)."""
+def _bshd_physical_ok(desc: TensorDesc, *, allow_batch_padding: bool = False) -> bool:
+    """Compact BSHD rows, optionally separated by a nonoverlapping, 16-byte aligned batch pitch."""
     b, h, s, d = (int(x) for x in desc.shape)
-    return tuple(int(x) for x in desc.stride) == (s * h * d, d, h * d, 1)
+    bs, hs, ss, ds = (int(x) for x in desc.stride)
+    if (hs, ss, ds) != (d, h * d, 1):
+        return False
+    return bs >= s * h * d and bs % 8 == 0 if allow_batch_padding else bs == s * h * d
 
 
 def _thd_packed_ok(desc: TensorDesc) -> bool:
@@ -629,6 +657,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
     _FAMILY = _cfg.FAMILY_F16
     _NAME = "sdpa_bwd_sm107"
     _BATCH_CHUNKING = True
+    _BATCH_PADDED_BSHD = False
     _IO_DTYPES = (torch.bfloat16, torch.float16)
     # The body reads ``seq_kv_lens[batch]`` under its padded-mask arm (``_resolve_seqlen_kv``), so the caller's per-batch kv
     # lengths are served (module doc) -- on all three rows.
@@ -637,6 +666,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
     # dS workspace, per-sequence lengths and the device claim counter from the metadata buffer -- ``sm107/bprop_d256_f16.py``
     # "THD / varlen"; the fp8 and MXFP8 bodies carry the same leg -- the MXFP8 one over packed per-sequence-tile-padded scale factors).
     _THD_SUPPORTED = True
+    _THD_ORIGINS_SUPPORTED = False
 
     def __init__(
         self,
@@ -647,6 +677,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         max_total_seq_len_kv: Optional[int] = None,
         thd_stats_token_major: bool = False,
         thd_stats_head_stride: Optional[int] = None,
+        thd_ragged_offsets=None,
         **kwargs,
     ) -> None:
         """``external_delta`` (appended, default off): the caller computes stage 1's ``delta = rowsum(dO * O)`` and hands it to
@@ -659,6 +690,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         filters its extra constructor arguments by ``inspect.signature(adapter_cls.__init__)``, and a bare ``**kwargs`` hides them --
         the same rule the SM100 adapter's constructor spells out): without them a ragged graph would reach ``check_support`` as a
         DENSE plan and fail its Stats-layout check instead of being served."""
+        self._thd_ro_spec = dict(thd_ragged_offsets or {})
         self.external_delta = bool(external_delta)
         super().__init__(
             *args,
@@ -731,6 +763,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
                 self._ds_chunk_bytes_per_elem(),
                 budget=self._ws_budget_bytes(),
                 batch_chunking=self._BATCH_CHUNKING,
+                allow_subgroups=self._allow_head_subgroups(),
             )
         # Whether the dS workspace is zero-filled per execute: decided in `compile()`, where the stage-3 cluster tile is
         # known (`_stage3_needs_zero_fill` / `_stage3_thd_needs_zero_fill`: the two-sided K-trim -- per sequence under THD --
@@ -744,13 +777,23 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         self._compiled = None
         self._prepared = None
 
+    def _check_head_dims(self) -> None:
+        self._value_error_if(
+            self.head_dim_qk != _SM107_D or self.head_dim_v != _SM107_D,
+            f"{self._NAME}: d_qk = d_v = {_SM107_D} exactly; got {self.head_dim_qk} / {self.head_dim_v}",
+        )
+
     # --- capability backstop ---------------------------------------------------------
     def check_support(self) -> bool:
         """Re-check what the Capabilities row promised (backstops, never the gate)."""
         n = self._NAME
         self._value_error_if(
-            self.head_dim_qk != _SM107_D or self.head_dim_v != _SM107_D, f"{n}: d_qk = d_v = {_SM107_D} exactly; got {self.head_dim_qk} / {self.head_dim_v}"
+            bool(self._thd_ro_spec) and (not self.thd or not self._THD_ORIGINS_SUPPORTED), f"{n}: independent THD origins are not implemented on this row"
         )
+        if self._thd_ro_spec:
+            _prepared.check_thd_origins(self)
+
+        self._check_head_dims()
         self._value_error_if(self.h_kv < 1 or self.h_q % self.h_kv != 0, f"{n}: h_q ({self.h_q}) must be a multiple of h_kv ({self.h_kv})")
         self._value_error_if(self.dtype not in self._IO_DTYPES, f"{n}: Q/K/V/O/dO dtype {self.dtype} not served")
         self._value_error_if(self.s_q_max < 1 or self.s_k_max < 1, f"{n}: empty sequences are not served (S_q={self.s_q_max}, S_kv={self.s_k_max})")
@@ -772,7 +815,10 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
                     f"elements); got stride {tuple(desc.stride)}",
                 )
             else:
-                self._value_error_if(not _bshd_physical_ok(desc), f"{n}: {name} must be BSHD-physical (stride order 3,1,2,0); got stride {tuple(desc.stride)}")
+                self._value_error_if(
+                    not _bshd_physical_ok(desc, allow_batch_padding=self._BATCH_PADDED_BSHD),
+                    f"{n}: {name} must be BSHD-physical (stride order 3,1,2,0); got stride {tuple(desc.stride)}",
+                )
         st_shape, st_stride = tuple(int(x) for x in self.stats_desc.shape), tuple(int(x) for x in self.stats_desc.stride)
         if self.thd:
             # Packed Stats: the ctor's packing flags (token-major (T, H) / head-major (1, QH, head_stride)) decide how the kernel
@@ -790,16 +836,10 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
                 self.seq_kv_lens_present or self.seq_q_lens_present,
                 f"{n} THD: THD carries its per-sequence lengths in the metadata buffer, not as seq_*_lens_present tensors (mutually exclusive)",
             )
-            # The externally computed delta is a DENSE contract ([B, H_q, S_q_pad] fp32, one row per envelope position): the THD
-            # chain's delta is PACKED head-major at ceil128(T_q) and computed by its own dot_do_o over the packed O / dO, and no
-            # producer emits the packed layout.  Declined typed here, before any plan is built; a delta_tensor at execute is then
-            # refused by the plan-fact check (external_delta=False) -- never silently ignored.
-            self._value_error_if(
-                self.external_delta,
-                f"{n} THD: external_delta is not served on the packed chain -- its delta is dot_do_o over the packed O / dO in the head-major "
-                f"[1, H_q, ceil128(T_q)] layout the THD main kernel reads, and a caller's dense [B, H_q, S_q_pad] delta has no packed twin; "
-                f"build the THD plan without external_delta (the chain launches its own pre-pass)",
-            )
+            # The externally computed delta is SERVED under THD: the contract is the PACKED head-major [1, H_q, ceil128(T_q)] fp32
+            # layout the THD main kernel reads (`external_delta_shape`), which IS the dense [B, H_q, S_q_pad] layout at B = 1, S = T_q
+            # -- a dense producer run over the packed tokens writes it as is, tail included.  The slot is the THD specs' LAST,
+            # standalone-only operand; a delta_tensor of the dense envelope shape is refused by `_check_external_delta`.
             # The declared totals are REQUIRED, and the reason is the workspace: scratch_workspace_bytes() is a BUILD-time function,
             # and the blocked dS row count, delta's row stride and the GQA partials are all fixed from the packed token capacity
             # before any buffer exists.  Undeclared, that capacity falls back to B * S_max -- more tokens than a packed buffer holds.
@@ -870,30 +910,41 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         every row and every dS policy -- one constant, one place (the MXFP8 row used to carry its own)."""
         return _SM107_WS_BUDGET_BYTES
 
+    def _allow_head_subgroups(self) -> bool:
+        """Only an explicitly qualified dense chain may split a GQA group."""
+        return False
+
     # --- workspace: ONE ordered plan, carved identically by the prepared host ----------
     def _scratch_shapes(self):
         """``[(name, shape, dtype)]`` in carve order -- every buffer the chain touches that is
         not a caller tensor, as the compact region the pointer host views it as
         (``prepared_sm107._regions``), so :meth:`scratch_workspace_bytes` and the artifact
         cannot disagree."""
-        b, h, hkv, sq, skv, d = self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, _SM107_D
+        b, h, hkv, sq, skv, d = self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, self.head_dim_qk
+        dv = self.head_dim_v
         sqp, skvp = self._sq_pad, self._skv_pad
         kv_rows = skvp if self._kv_padded else skv
         gqa = self._gqa_group > 1
         if self.thd:
-            # THD: delta packed head-major at ceil128(T_q) -- always the chain's own (every THD row declines ``external_delta``: a
-            # caller's dense [B, H_q, S_q_pad] delta has no packed twin, ``check_support``); ONE head chunk of the kv-BLOCKED dS
+            # THD: delta packed head-major at ceil128(T_q) -- unless ``external_delta`` (the caller's tensor of that same shape,
+            # ``external_delta_shape``, replaces the region, as on the dense plans); ONE head chunk of the kv-BLOCKED dS
             # workspace; the metadata buffer (5B+5 words) followed by the main kernel's tensor maps on the next 128-B boundary
             # (``tile_dsl.thd.THD_BWD_MAPS_META_WORDS``; the slot count is the body's, ``_thd_map_slots``); stage 3's (B + 1)
             # patched descriptors; then the family's regions over the PACKED token axes (``_thd_family_scratch_shapes``).  No
             # staging (the packed path reads the caller's buffers).
             tq, tkv = self._t_q_cap, self._t_kv_cap
-            plan = [
-                ("delta", (1, h, -(-tq // 128) * 128), torch.float32),
+            plan = []
+            if not self.external_delta:
+                # stage 1's delta, PACKED head-major: [1, H_q, ceil128(T_q)] fp32 -- dot_do_o over the packed O / dO writes the rounded
+                # extent, zeros past T_q.  Under external_delta the caller's tensor of the same shape (`external_delta_shape`) replaces it.
+                plan.append(("delta", self.external_delta_shape, torch.float32))
+            plan += [
                 ("ds_ws", (1, self._qh_chunk, self._ws_rows_cap, sqp), self._ds_dtype),
                 ("seq_kv", (THD_BWD_MAPS_META_WORDS(b, self._thd_map_slots(b)),), torch.int32),
-                ("desc_words", ((b + 1) * 16,), torch.int64),
+                ("desc_words", ((2 * b if self._thd_ro_spec else b + 1) * 16,), torch.int64),
             ]
+            if self._thd_ro_spec:
+                plan.append(("thd_origins", (9, b), torch.int64))
             return plan + self._thd_family_scratch_shapes(tq, tkv, gqa)
         plan = []
         if not self.external_delta:
@@ -908,24 +959,25 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
             ("desc_words", (1,), torch.int64),
         ]
         if self._q_padded:
-            plan += [("q_pad", (b, sqp, h, d), self.dtype), ("do_pad", (b, sqp, h, d), self.dtype), ("lse_pad", (b, h, sqp), torch.float32)]
+            plan += [("q_pad", (b, sqp, h, d), self.dtype), ("do_pad", (b, sqp, h, dv), self.dtype), ("lse_pad", (b, h, sqp), torch.float32)]
         if self._kv_padded:
-            plan += [("k_pad", (b, skvp, hkv, d), self.dtype), ("v_pad", (b, skvp, hkv, d), self.dtype)]
+            plan += [("k_pad", (b, skvp, hkv, d), self.dtype), ("v_pad", (b, skvp, hkv, dv), self.dtype)]
         plan += self._family_scratch_shapes(kv_rows, gqa)
         return plan
 
     def _family_scratch_shapes(self, kv_rows: int, gqa: bool):
-        b, h, hkv, d = self.batch_size, self.h_q, self.h_kv, _SM107_D
+        b, h, hkv, d = self.batch_size, self.h_q, self.h_kv, self.head_dim_qk
+        dv = self.head_dim_v
         plan = []
         # stage 2's dV per Q head: the caller's dV only when MHA and no kv padding
         if gqa or self._kv_padded:
-            plan.append(("dv_part", (b, kv_rows, h, d), self.dtype))
+            plan.append(("dv_part", (b, kv_rows, h, dv), self.dtype))
         # stage 3's dK per Q head: the caller's dK when MHA (real rows written)
         if gqa:
             plan.append(("dk_part", (b, kv_rows, h, d), self.dtype))
             if self._kv_padded:
                 # dkv_reduce folds at the workspace's row extent; the real rows are copied out
-                plan += [("dk_fold", (b, kv_rows, hkv, d), self.dtype), ("dv_fold", (b, kv_rows, hkv, d), self.dtype)]
+                plan += [("dk_fold", (b, kv_rows, hkv, d), self.dtype), ("dv_fold", (b, kv_rows, hkv, dv), self.dtype)]
         return plan
 
     def _thd_map_slots(self, b: int) -> int:
@@ -933,7 +985,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         packed-total-clamped input descriptors (Q, dO, dO_dv, K, V) + one clipped dV descriptor per sequence on the half and fp8
         bodies (``sm107/bprop_d256_f16.py`` ``THD_MAP_SLOTS``).  A body with more clamped inputs (the MXFP8 one's five scale-factor
         maps) overrides; the scratch plan and the host's maps view must agree, so it is spelled once, here."""
-        return 5 + b
+        return 5 + (6 if self._thd_ro_spec else 1) * b
 
     def _thd_family_scratch_shapes(self, tq: int, tkv: int, gqa: bool):
         """The family's regions of a THD plan, after the four shared ones (``[(name, shape, dtype)]`` over the PACKED token
@@ -955,9 +1007,14 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
 
     @property
     def external_delta_shape(self) -> tuple:
-        """The delta's contract, ``(B, H_q, S_q_pad)``: what stage 1 writes into the workspace region, and what
-        ``execute(delta_tensor=)`` must carry under ``external_delta`` -- fp32, contiguous, zeros on the pad rows
-        ``[S_q, S_q_pad)``, 16-B aligned, on the plan's device."""
+        """The delta's contract: what stage 1 writes into the workspace region, and what ``execute(delta_tensor=)`` must carry
+        under ``external_delta`` -- fp32, contiguous, 16-B aligned, on the plan's device.  Dense: ``(B, H_q, S_q_pad)``, zeros on
+        the pad rows ``[S_q, S_q_pad)``.  THD: the PACKED head-major ``(1, H_q, ceil128(T_q))`` the THD main kernel reads at the
+        packed token index, zeros past ``T_q`` -- the dense layout at ``B = 1, S = T_q``.  ``T_q`` is the plan's TOKEN CAPACITY:
+        the declared packed total tightened to the envelope's ``B * S_max`` (``_thd_total``, a MIN), so an oversized declaration
+        does not widen the shape -- the refusal below names the capacity's shape, never the declaration."""
+        if self.thd:
+            return (1, self.h_q, -(-self._t_q_cap // _SM107_Q_PAD) * _SM107_Q_PAD)
         return (self.batch_size, self.h_q, self._sq_pad)
 
     def _check_external_delta(self, delta_tensor) -> None:
@@ -980,10 +1037,20 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
             delta_tensor.dtype != torch.float32,
             f"{n}: delta_tensor must be fp32 (the chain's dot_do_o layout), got {delta_tensor.dtype}",
         )
+        # The dense message is unchanged word for word (its regex pins); the THD plan names its packed form instead.
+        layout, note = (
+            (
+                "[1, H_q, ceil128(T_q)]",
+                "the PACKED head-major layout the THD main kernel reads: T_q = the plan's token capacity (the declared packed total, tightened "
+                "to B*S_max), zeros past T_q",
+            )
+            if self.thd
+            else ("[B, H_q, S_q_pad]", f"S_q_pad = S_q rounded up to {_SM107_Q_PAD}, zeros past S_q")
+        )
         self._value_error_if(
             shape != tuple(self.external_delta_shape) or not delta_tensor.is_contiguous(),
-            f"{n}: delta_tensor must be a CONTIGUOUS [B, H_q, S_q_pad] = {self.external_delta_shape} tensor (S_q_pad = S_q rounded up to {_SM107_Q_PAD}, zeros past "
-            f"S_q), got shape {shape} with strides {tuple(delta_tensor.stride())}",
+            f"{n}: delta_tensor must be a CONTIGUOUS {layout} = {self.external_delta_shape} tensor ({note}), got shape {shape} with strides "
+            f"{tuple(delta_tensor.stride())}",
         )
         self._value_error_if(
             not delta_tensor.is_cuda or delta_tensor.device != self.q_desc.device,
@@ -1059,7 +1126,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
                 _DTYPE_CODE[self._ds_dtype],
                 bool(self.is_causal),
                 0,
-                _cfg.kv_pad_rows(mod.CFG),
+                self._stage3_gran(mod),
                 cgrp_tile_mn=tile_mn,
                 window=self.window_size_left,
                 gqa_group=self._gqa_group,
@@ -1096,7 +1163,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
             return self._compiled
         mod = load_template(_sm100_kernel_path(self._kernel_file()), self._template_params(), tag=self._template_tag())
         # The bodies' own geometry guards (tile multiples, chunk divisors) -- cheap, and the plan is wrong if they fire.
-        _cfg.validate_head_chunk(self.h_q, self.h_kv, self._qh_chunk)
+        _cfg.validate_head_chunk(self.h_q, self.h_kv, self._qh_chunk, allow_subgroups=self._allow_head_subgroups())
         # Stage 3 reads the dS workspace in ITS dtype (`_stage3_records`: the io dtype on the half chain; on the fp8 chain the
         # e4m3 workspace through the fp8 K64 arm + its epilogue, or the bf16 twin through the bf16 renderings).
         # The d = 256 cluster tile (no N padding) on the Rubin line; `prepared_sm107._sm` resolves the same device the
@@ -1108,10 +1175,11 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
             # grid: min(the unit upper bound, the device's cluster count) -- occupancy-sized, a cluster whose first unit is past
             # the device live total runs one forced fully-masked tile.
             self._zero_ws = _stage3_thd_needs_zero_fill(bool(self.is_causal), self.window_size_left, _SM107_KV_PAD, cgrp_tile_m=tile_mn[0])
+            unit_bound = _cfg2x2.thd_units_upper_bound_2x2 if self._datapath_2x2_profile() else _cfg.thd_units_upper_bound
             self._thd_units = max(
                 1,
                 min(
-                    _cfg.thd_units_upper_bound(mod.CFG, self._t_kv_cap, self.batch_size, self._qh_chunk),
+                    unit_bound(mod.CFG, self._t_kv_cap, self.batch_size, self._qh_chunk),
                     _sm100_device_clusters(self.q_desc.device, mod.CFG.CGA_M),
                 ),
             )
@@ -1130,6 +1198,10 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         # The host launches dQ the way its rendering indexes B: ONE source of truth, the record (`prepared_host._dq_launches`
         # refuses a value that is neither 1 nor the group).
         self._dq_b_head_group = int(p_dq.b_head_group)
+        self._value_error_if(
+            self._qh_chunk < self._gqa_group and self._dq_b_head_group != self._gqa_group,
+            f"{self._NAME}: a head subgroup requires the single-launch grouped dQ rendering",
+        )
         mm_dk = load_template(_sm100_kernel_path(_SM100_MATMUL_FILE), p_dk, tag=_SM107_MM_TAGS["dk"])
         mm_dq = load_template(_sm100_kernel_path(_SM100_MATMUL_FILE), p_dq, tag=_SM107_MM_TAGS["dq"])
         self._prepared = self._compile_plan(mod, mm_dk, mm_dq)
@@ -1179,6 +1251,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         bias_tensor: Optional[torch.Tensor] = None,
         dbias_tensor: Optional[torch.Tensor] = None,
         delta_tensor: Optional[torch.Tensor] = None,
+        thd_ragged_offsets=None,
     ) -> None:
         """The standalone twin of the graph plan: the same prepared artifact, bound from torch
         tensors (``prepared_sm107.execute_standalone``).  Every operand must carry the plan's
@@ -1188,17 +1261,21 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         satisfy ``0 <= len <= S_kv`` -- device data, not validated here.  ``delta_tensor``
         (appended) is required exactly when the plan was built with ``external_delta=True``:
         fp32 contiguous ``external_delta_shape`` on the plan's device (module docstring, "An
-        externally computed delta").  The two are independent plan facts: a plan built with
-        both takes both."""
+        externally computed delta"; under THD the PACKED head-major ``[1, H_q, ceil128(T_q)]``).
+        The two are independent plan facts: a plan built with both takes both."""
         self._refuse_unclaimed(seq_q_lens, seq_kv_lens, sink_tensor, dsink_tensor, bias_tensor, dbias_tensor)
         self._check_external_delta(delta_tensor)
+        offsets = dict(thd_ragged_offsets or {})
+        self._value_error_if(set(offsets) != set(self._thd_ro_spec), f"{self._NAME}: bind exactly the declared THD ragged-offset ports")
         self.compile()
         if self.thd:
-            # The THD plan's two appended slots are the two length tensors; a delta never reaches here (`_check_external_delta`
-            # refused it above: the THD row is built with external_delta=False, `check_support`).
-            tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor, seq_q_lens, seq_kv_lens)
+            # The THD spec's slots 9 / 10 are the two length tensors, slot 11 the delta (`prepared_sm107.ROLES_F16_THD`): bound exactly
+            # when the plan was built with external_delta (`_check_external_delta` above), None-specialized otherwise.
+            tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor, seq_q_lens, seq_kv_lens, delta_tensor)
         else:
             tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor, seq_kv_lens, delta_tensor)
+        if self._thd_ro_spec:
+            tensors += tuple(offsets.get(port) for port in _prepared.THD_ORIGIN_PORTS)
         _prepared.execute_standalone(self, tensors, workspace, current_stream, scale_softmax)
 
 
@@ -1275,8 +1352,9 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
         for name, desc in (("k", self.k_desc), ("v", self.v_desc), ("o", self.o_desc), ("dO", self.do_desc)):
             self._value_error_if(desc.dtype != self.dtype, f"{n}: {name} is an FP8 payload and must share Q's dtype {self.dtype}; got {desc.dtype}")
         # Bottom-right causal at a ragged S_q is served: the body takes the REAL q length (``seqlen_q_real``) for the diagonal and
-        # the q-tile trim (``Capabilities.bottom_right_s_q_multiple = 1``).  The external delta is served DENSE (TRUE units,
-        # module doc) and declined under THD by the shared check_support.
+        # the q-tile trim (``Capabilities.bottom_right_s_q_multiple = 1``).  The external delta is served on both forms (TRUE
+        # units, module doc): dense ``[B, H_q, S_q_pad]`` and, under THD, the PACKED head-major ``[1, H_q, ceil128(T_q)]``; the
+        # shared check_support keeps the two-directional plan-fact guard (``_check_external_delta``).
         if self.thd and not self._ds_fp8:
             # The bf16-dS twin upcasts Q / K exactly (e4m3 -> bf16) over COMPACT packed rows -- ``prepared_host._cast_fp8_to_bf16``
             # walks ``T * H * D`` contiguous elements -- so a padded token stride (admitted by the packed-rows rule) would scramble
@@ -1449,8 +1527,8 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
         ``seq_kv_lens_present=True`` (every entry ``0 <= len <= S_kv``, the K / V rows past it
         FINITE -- device data, not validated here); ``delta_tensor`` (appended) exactly when it
         was built with ``external_delta=True``: fp32 contiguous ``external_delta_shape`` in TRUE
-        units (module doc).  Under THD both length tensors are required instead and no delta is
-        taken."""
+        units (module doc; under THD the PACKED head-major ``[1, H_q, ceil128(T_q)]``).  Under THD
+        both length tensors are required in place of the per-batch kv lengths."""
         self._refuse_unclaimed(seq_q_lens, seq_kv_lens, sink_tensor, dsink_tensor, bias_tensor, dbias_tensor)
         self._check_external_delta(delta_tensor)
         given = dict(
@@ -1479,8 +1557,9 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
         tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor)
         quant = tuple(given[name] for name in _prepared.FP8_SCALARS) + tuple(amaxes[name] for name in _prepared.FP8_AMAX)
         if self.thd:
-            # The THD spec's slots 9 / 10 are the two length tensors, then the scalars and the amax (`prepared_sm107.ROLES_FP8_THD`).
-            tensors += (seq_q_lens, seq_kv_lens) + quant
+            # The THD spec's slots 9 / 10 are the two length tensors, then the scalars and the amax, then the delta LAST (slot 27,
+            # `prepared_sm107.ROLES_FP8_THD`): bound exactly when the plan was built with external_delta, None-specialized otherwise.
+            tensors += (seq_q_lens, seq_kv_lens) + quant + (delta_tensor,)
         else:
             # The dense spec's two appended slots (25 / 26) follow the scalars and the amax (`prepared_sm107.ROLES_FP8`).
             tensors += quant + (seq_kv_lens, delta_tensor)
@@ -1795,7 +1874,10 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
         over the e4m3 payloads -- dK reads ``ds_dk`` [kv, q] K-major with the ``sf_ds_dk`` atoms, dQ reads ``ds_dq`` as [q, kv]
         M-major with ``sf_ds_dq``; B is the columnwise q_T / k_T payload with its D-plane-major SF.  EPI_NONE on both (the MMA
         dequantizes; the fp32 accumulator is the true-unit gradient): dQ stored bf16 (the caller's dQ, per head); dK stored fp32 under
-        GQA (``_dk_part_fp32``: the per-Q-head partial the fold sums and rounds once) and bf16 at MHA (the caller's dK)."""
+        GQA (``_dk_part_fp32``: the per-Q-head partial the fold sums and rounds once) and bf16 at MHA (the caller's dK).  dQ once per
+        head chunk under GQA exactly like the plain renderings (``b_head_group = group`` through ``DQ_SINGLE_LAUNCH``, read at call
+        time): the template indexes B AND its scale-factor descriptor by ``h // b_head_group``, the host windows the SFB view to the
+        chunk's kv heads (``prepared_host._stage3_block_scale``), and the single launch is bitwise the per-member launches."""
         if not self._ds_block_scaled:
             return super()._stage3_records(mod, tile_mn)  # the bf16 renderings, dense or the half row's THD arm
         if self.thd:
@@ -1805,8 +1887,9 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
             shift = (self.s_k_max - self.s_q_max) if (self.is_causal and self.causal_bottom_right) else 0
             # Per-batch kv lengths under bottom-right read the plain bottom-right band: the window edge is the kernel's alone.
             window = _stage3_trim_window(self.window_size_left, bool(self.is_causal), bool(self.causal_bottom_right), bool(self.seq_kv_lens_present))
-        # The block-scale arm launches dQ once per GQA group member (its SFB descriptor is indexed per A / C head), so its dQ record
-        # keeps b_head_group == 1 whatever DQ_SINGLE_LAUNCH says; the single launch is the plain renderings' form (a follow-up here).
+        # The block-scale arm's dQ record takes the GQA group like the plain renderings (`dq_single_launch=None` = the module constant
+        # DQ_SINGLE_LAUNCH, read at call time so the bitwise pin can flip it): the SFB load uses the same grouped head coordinate as the
+        # B load (`_b_head`), so one launch over the whole dS / atom / dQ chunk pairs every Q head with its K head and its K scales.
         p_dk, p_dq = _stage3_params(
             DTYPE_E4M3,
             bool(self.is_causal),
@@ -1816,7 +1899,7 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
             window=window,
             block_scale=True,
             gqa_group=self._gqa_group,
-            dq_single_launch=False,
+            dq_single_launch=None,
             dk_fp32_out=self._dk_part_fp32,
         )
         if not self.thd:
@@ -1960,8 +2043,9 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
         ``do_tensor`` the rowwise e4m3 dO; the SF tensors are the F8_128x4 uint8 blobs (byte count checked, dims free).
         ``seq_kv_lens`` ([B] int32) is required exactly when the plan was built with ``seq_kv_lens_present=True`` (the K / V
         rows past a length FINITE -- device data, not validated here); ``delta_tensor`` (appended) exactly when it was built with
-        ``external_delta=True``: fp32 contiguous ``external_delta_shape``, zeros past ``S_q`` (module doc).  Under THD both length
-        tensors are required instead and no delta is taken; the SF tensors are the PACKED per-sequence-tile-padded blobs whose
+        ``external_delta=True``: fp32 contiguous ``external_delta_shape``, zeros past ``S_q`` (module doc; under THD the PACKED
+        head-major ``[1, H_q, ceil128(T_q)]``, zeros past ``T_q``).  Under THD both length tensors are required in place of the
+        per-batch kv lengths; the SF tensors are the PACKED per-sequence-tile-padded blobs whose
         live tile count is derived from their byte size per call (whole tile rows, one count per side, at most the plan's
         capacity -- each a typed ``ValueError`` at bind)."""
         self._refuse_unclaimed(seq_q_lens, seq_kv_lens, sink_tensor, dsink_tensor, bias_tensor, dbias_tensor)
@@ -1984,8 +2068,9 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
         self.compile()
         tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor)
         if self.thd:
-            # The THD spec's slots 9 / 10 are the two length tensors, then the payloads and the packed SF blobs (`prepared_sm107.ROLES_MXFP8_THD`).
-            tensors += (seq_q_lens, seq_kv_lens) + tuple(extras[name] for name in _prepared.MXFP8_PAYLOADS + _prepared.MXFP8_SF)
+            # The THD spec's slots 9 / 10 are the two length tensors, then the payloads and the packed SF blobs, then the delta LAST
+            # (slot 22, `prepared_sm107.ROLES_MXFP8_THD`): bound exactly when the plan was built with external_delta.
+            tensors += (seq_q_lens, seq_kv_lens) + tuple(extras[name] for name in _prepared.MXFP8_PAYLOADS + _prepared.MXFP8_SF) + (delta_tensor,)
         else:
             tensors += tuple(extras[name] for name in _prepared.MXFP8_PAYLOADS + _prepared.MXFP8_SF)
             # The two appended slots (20 / 21): the per-batch kv lengths, then the delta (`prepared_sm107.ROLES_MXFP8`).

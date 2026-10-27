@@ -352,7 +352,7 @@ def _thd_desc_ptr(desc_words, slot):
 
 
 @cute.jit
-def _thd_acquire_descs(desc_words, n_batch):
+def _thd_acquire_descs(desc_words, n_batch, per_sequence_inputs: cutlass.Constexpr = False):
     """Acquire EVERY patched descriptor into the TMA proxy, once per warp.
 
     ``fence.proxy.tensormap::generic.acquire`` takes a size operand whose ONLY
@@ -364,7 +364,8 @@ def _thd_acquire_descs(desc_words, n_batch):
     loop, because the patch launch writes these once before this kernel starts
     and never rewrites them.
     """
-    for _slot in cutlass.range(n_batch + cutlass.Int32(1)):
+    slots = n_batch * 2 if cutlass.const_expr(per_sequence_inputs) else n_batch + cutlass.Int32(1)
+    for _slot in cutlass.range(slots):
         nvvm.fence_proxy_acquire(
             nvvm.MemScope.GPU,
             _thd_desc_ptr(desc_words, _slot),
@@ -956,6 +957,7 @@ def _bprop_matmul_bh_sm100_kernel(
     # operand's F8_128x4 atoms, SFB over the D-plane-major columnwise Q / K SF -- both 5-D, built by `_host`.
     tma_sfa_desc_0: cutlass.GridConstant[_tma.TensorMap],
     tma_sfb_desc_0: cutlass.GridConstant[_tma.TensorMap],
+    thd_per_sequence_inputs: cutlass.Constexpr = False,
 ) -> None:
     tma_a_descs = [tma_a_desc_0]
     tma_b_descs = [tma_b_desc_0]
@@ -1344,7 +1346,7 @@ def _bprop_matmul_bh_sm100_kernel(
         # it here would multiply A's padding zeros by whatever the caller left
         # past `cu_*[B]` -- and `0 * NaN` is NaN.
         if cutlass.const_expr(_THD_MM):
-            _thd_acquire_descs(desc_words, n_batch)
+            _thd_acquire_descs(desc_words, n_batch, thd_per_sequence_inputs)
         while is_valid != 0:
             coord_m_per_cta = tile_m * cgrp_tile_m_cur + m_rank * cta_tile_mnk[0]
             if cutlass.const_expr(cta_group == 1):
@@ -1368,6 +1370,8 @@ def _bprop_matmul_bh_sm100_kernel(
                 tile_b_b = tile_b
 
             _a_k_off, _a_m_off, _b_k_off, _nkt = _thd_group(meta_t, tile_b, n_batch, num_k_tiles)
+            if cutlass.const_expr(thd_per_sequence_inputs):
+                _b_k_off = cutlass.Int32(0)
             if cutlass.const_expr(_THD_MM):
                 # Packed operands have ONE batch element; the sequence is
                 # reached by the coordinate offsets above, not by this axis.
@@ -1497,7 +1501,11 @@ def _bprop_matmul_bh_sm100_kernel(
                     # See the note above the persistent loop: THD substitutes
                     # the packed-total-clamped descriptor for the capacity-sized
                     # GridConstant one.  Dense folds back to `.get_ptr()`.
-                    _b_desc_ptr = _thd_desc_ptr(desc_words, B_CLAMP_SLOT(n_batch)) if cutlass.const_expr(_THD_MM) else tma_b_desc.get_ptr()
+                    _b_desc_ptr = (
+                        _thd_desc_ptr(desc_words, n_batch + (tile_b if cutlass.const_expr(thd_per_sequence_inputs) else cutlass.Int32(0)))
+                        if cutlass.const_expr(_THD_MM)
+                        else tma_b_desc.get_ptr()
+                    )
                     if cutlass.const_expr(b_mcast_slices > 1):
                         _b_rows = cta_tile_mnk[1] // b_mcast_slices
                         if cutlass.const_expr(fallback_cluster_shape_mnk is None):
@@ -2044,7 +2052,7 @@ def _bprop_matmul_bh_sm100_kernel(
             # one acquire PER SLOT -- the fence's size operand only accepts 128,
             # i.e. a single descriptor, so acquiring the base would order slot 0
             # alone while this warp goes on to select slot `tile_b`.
-            _thd_acquire_descs(desc_words, n_batch)
+            _thd_acquire_descs(desc_words, n_batch, thd_per_sequence_inputs)
         # The C-side cu_seqlens prefix inside the metadata buffer: dV/dK write
         # kv rows, dQ writes q rows -- the same choice `_thd_patch_descs_kernel`
         # makes when it bases each sequence's descriptor.
@@ -2349,6 +2357,9 @@ def _thd_patch_descs_kernel(
     meta_t: cute.Tensor,
     n_batch: cutlass.Int32,
     c_row_stride: cutlass.Int64,
+    b_tensor,
+    thd_origins,
+    thd_origin_rows: cutlass.Constexpr,
 ) -> None:
     """This GEMM's own THD descriptors, patched from the published metadata.
 
@@ -2389,11 +2400,29 @@ def _thd_patch_descs_kernel(
             n_batch,
             c_row_stride,
             seq_ord=_THD_MM_SEQ_ORD,
+            origins=thd_origins,
+            origin_row=thd_origin_rows[1],
             first_batch=warp,
             batch_step=cutlass.Int32(nthreads) // 32,
         )
         b_total = cutlass.Int32(meta[b_cu0 + n_batch])
-        if warp == cutlass.Int32(0):
+        if cutlass.const_expr(thd_origins is not None):
+            emit_seq_descs(
+                base_b_desc,
+                desc_words,
+                meta,
+                b_cu0,
+                b_tensor,
+                n_batch,
+                cutlass.Int64(b_tensor.stride[1]),
+                seq_ord=_THD_MM_SEQ_ORD,
+                slot_base=n_batch,
+                first_batch=warp,
+                batch_step=cutlass.Int32(nthreads) // 32,
+                origins=thd_origins,
+                origin_row=thd_origin_rows[0],
+            )
+        elif warp == cutlass.Int32(0):
             emit_clamped_desc(base_b_desc, desc_words, n_batch, b_total, seq_ord=_THD_MM_SEQ_ORD)
         nvvm.fence_proxy_release(
             nvvm.MemScope.GPU,
@@ -2429,7 +2458,7 @@ def _require_epi_operands(d0, d1, s_out, sfa=None, sfb=None, sf_meta=None) -> No
 
 
 @cute.jit
-def _host(
+def _host_chain(
     problem_size: tuple,
     a_0: cute.Tensor,
     b_0: cute.Tensor,
@@ -2450,13 +2479,18 @@ def _host(
     # strides are in BYTES:
     #   sfa_0  (512 B atom, K tiles, M tiles, H, B)   over the A operand's F8_128x4 atoms [B, H, M/128, K/128, 512]
     #   sfb_0  (512 B atom, D planes, K tiles, H, B)  over the columnwise B SF, D-plane-major (plane stride = B*H*tiles atoms)
-    #          -- or, under THD, the PACKED per-sequence-tile view `_sf_planes_view_thd` (plane stride one atom, B = 1)
+    #          -- or, under THD, the PACKED per-sequence-tile view `_sf_planes_view_thd` (plane stride one atom, B = 1).
+    #          Its H is B's OWN head extent, `n_head // b_head_group`: under a grouped dQ record the host hands the view windowed
+    #          to the kv heads and the SFB coordinate takes `tile_h_b = _b_head(tile_h)` exactly like B's (dense and THD alike),
+    #          so one launch covers a whole head chunk; the tensor map is sized from this view's shape.
     sfa_0: Optional[cute.Tensor] = None,
     sfb_0: Optional[cute.Tensor] = None,
     # The block-scale arm's THD leg (TRAILING, defaulted): the int32 `[cu_sf_q(B+1) | cu_sf_k(B+1)]` per-sequence SF TILE prefixes
     # (`config_sm100.STAGE3_THD_SF_META_WORDS(B)` words, `STAGE3_THD_SF_CU_*_OFF`) the TMA warp's SFB coordinate takes its tile
     # base from; required iff the rendering block-scales under `thd_varlen`, refused otherwise.
     sf_meta_t: Optional[cute.Tensor] = None,
+    thd_origins=None,
+    thd_origin_rows: cutlass.Constexpr = (-1, -1),
 ) -> None:
     _require_epi_operands(epi_descale_0, epi_descale_1, epi_scale_out, sfa_0, sfb_0, sf_meta_t)
     _a_operands = [a_0]
@@ -2523,7 +2557,9 @@ def _host(
     else:
         # B's head extent follows its head group: `n_head // b_head_group` B heads serve `n_head` A/C heads (every A/C head
         # `h` reads B head `h // b_head_group`, `_b_head`); `n_head` itself at the default 1.
-        b_h = n_head if cutlass.const_expr(b_head_group == 1) else n_head // b_head_group
+        # A grouped dQ launch may contain a fraction of one GQA group; its B
+        # descriptor must still contain that group's K head, never zero heads.
+        b_h = n_head if cutlass.const_expr(b_head_group == 1) else (n_head + b_head_group - 1) // b_head_group
         b_b = n_batch
     # THD: `n_batch` is the SEQUENCE count -- it sizes the grid and indexes the
     # metadata -- but the packed operands hold ONE batch element, reached by the
@@ -2676,6 +2712,9 @@ def _host(
             meta_t,
             n_batch,
             out_stride_m_0,
+            b_0,
+            thd_origins,
+            thd_origin_rows,
         ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
 
     launch = _bprop_matmul_bh_sm100_kernel(
@@ -2700,6 +2739,7 @@ def _host(
         sf_meta_t,
         tma_sfa_desc_0,
         tma_sfb_desc_0,
+        thd_origins is not None,
     )
     # Mixed CGA: `cluster` is the preferred (wide) shape and `fallback_cluster`
     # the regular one the device groups blocks into when a preferred cluster does
@@ -2722,3 +2762,40 @@ def _host(
             use_pdl=USE_PDL,
             stream=stream,
         )
+
+
+@cute.jit
+def _host(
+    problem_size: tuple,
+    a_0: cute.Tensor,
+    b_0: cute.Tensor,
+    c_0: cute.Tensor,
+    # Dense: 1-element dummies.  THD: the setup launch's metadata and this
+    # GEMM's descriptor scratch.
+    meta_t: cute.Tensor,
+    desc_words: cute.Tensor,
+    stream: _cuda.CUstream,
+    # The fp8 arm's epilogue operands, TRAILING and defaulted so the SM100 chain's positional 7-argument call is unchanged:
+    # fp32 [1] device tensors descale_dP (0) and descale_{q|k} (1) for EPI_DESCALE / EPI_QUANT, the output scale and the
+    # amax target for EPI_QUANT (None = the graph left that amax virtual; its fold and atomic fold out).
+    epi_descale_0: Optional[cute.Tensor] = None,
+    epi_descale_1: Optional[cute.Tensor] = None,
+    epi_scale_out: Optional[cute.Tensor] = None,
+    epi_amax: Optional[cute.Tensor] = None,
+    # The block-scale arm's scale factors (TRAILING, defaulted: every earlier call shape is unchanged), uint8 5-D views whose
+    # strides are in BYTES:
+    #   sfa_0  (512 B atom, K tiles, M tiles, H, B)   over the A operand's F8_128x4 atoms [B, H, M/128, K/128, 512]
+    #   sfb_0  (512 B atom, D planes, K tiles, H, B)  over the columnwise B SF, D-plane-major (plane stride = B*H*tiles atoms)
+    #          -- or, under THD, the PACKED per-sequence-tile view `_sf_planes_view_thd` (plane stride one atom, B = 1).
+    #          Its H is B's OWN head extent, `n_head // b_head_group`: under a grouped dQ record the host hands the view windowed
+    #          to the kv heads and the SFB coordinate takes `tile_h_b = _b_head(tile_h)` exactly like B's (dense and THD alike),
+    #          so one launch covers a whole head chunk; the tensor map is sized from this view's shape.
+    sfa_0: Optional[cute.Tensor] = None,
+    sfb_0: Optional[cute.Tensor] = None,
+    # The block-scale arm's THD leg (TRAILING, defaulted): the int32 `[cu_sf_q(B+1) | cu_sf_k(B+1)]` per-sequence SF TILE prefixes
+    # (`config_sm100.STAGE3_THD_SF_META_WORDS(B)` words, `STAGE3_THD_SF_CU_*_OFF`) the TMA warp's SFB coordinate takes its tile
+    # base from; required iff the rendering block-scales under `thd_varlen`, refused otherwise.
+    sf_meta_t: Optional[cute.Tensor] = None,
+) -> None:
+    """Preserve the compact exported runtime frame."""
+    _host_chain(problem_size, a_0, b_0, c_0, meta_t, desc_words, stream, epi_descale_0, epi_descale_1, epi_scale_out, epi_amax, sfa_0, sfb_0, sf_meta_t)

@@ -670,3 +670,130 @@ def test_grouped_gemm_glu_hadamard_wrapper_cache_specializes_situ_beta1_only(req
     assert compile_count["value"] == 2
     assert len(grouped_gemm_glu_hadamard_api._cache_of_GroupedGemmGluHadamardSm100Objects) == 2
     grouped_gemm_glu_hadamard_api._cache_of_GroupedGemmGluHadamardSm100Objects.clear()
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_glu_hadamard_wrapper_cache_separates_devices(request, monkeypatch):
+    from cudnn import grouped_gemm_glu_hadamard_wrapper_sm100
+    from cudnn.gemm.cutedsl.grouped.glu_hadamard import api as grouped_gemm_glu_hadamard_api
+    from gemm.cutedsl.test_grouped_gemm_canonical_layouts import assert_same
+
+    first = torch.cuda.current_device()
+    other = next((i for i in range(torch.cuda.device_count()) if i != first and torch.cuda.get_device_capability(i)[0] >= 10), None)
+    if other is None:
+        pytest.skip("two SM100+ CUDA devices are required")
+    monkeypatch.setattr(grouped_gemm_glu_hadamard_api, "_cache_of_GroupedGemmGluHadamardSm100Objects", {})
+
+    cfg = _make_cfg(request, ab_dtype=torch.float4_e2m1fn_x2, sf_dtype=torch.float8_e8m0fnu, sf_vec_size=16)
+    source = allocate_grouped_gemm_input_tensors(
+        n=cfg["n"],
+        k=cfg["k"],
+        l=cfg["l"],
+        group_m_list=cfg["group_m_list"],
+        ab_dtype=cfg["ab_dtype"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        m_aligned=cfg["m_aligned"],
+        b_major=cfg["b_major"],
+    )
+    host = {name: value.cpu() if isinstance(value, torch.Tensor) else value for name, value in source.items()}
+
+    def call(inputs):
+        return grouped_gemm_glu_hadamard_wrapper_sm100(
+            a_tensor=inputs["a_tensor"],
+            b_tensor=inputs["b_tensor"],
+            sfa_tensor=inputs["sfa_tensor"],
+            sfb_tensor=inputs["sfb_tensor"],
+            padded_offsets=inputs["padded_offsets_tensor"],
+            alpha_tensor=inputs["alpha_tensor"],
+            prob_tensor=inputs["prob_tensor"],
+            c_dtype=cfg["c_dtype"],
+            d_dtype=cfg["d_dtype"],
+            mma_tiler_mn=cfg["mma_tiler_mn"],
+            cluster_shape_mn=cfg["cluster_shape_mn"],
+            sf_vec_size=cfg["sf_vec_size"],
+        )
+
+    retained = {}
+    graphs = []
+    try:
+        for device in (first, other):
+            with torch.cuda.device(device):
+                inputs = {name: value.to(device=device) if isinstance(value, torch.Tensor) else value for name, value in host.items()}
+                call(inputs)  # Compile once on each device, without clearing the shared cache.
+                stream = torch.cuda.Stream(device=device)
+                stream.wait_stream(torch.cuda.current_stream(device))
+                graph = torch.cuda.CUDAGraph()
+                graphs.append((device, graph))
+                with torch.cuda.graph(graph, stream=stream):
+                    captured = call(inputs)
+                retained[device] = inputs, graph, captured
+
+        for device in (first, other, first):
+            with torch.cuda.device(device):
+                inputs, graph, captured = retained[device]
+                inputs["alpha_tensor"].mul_(0.5)
+                expected = call(inputs)
+                graph.replay()
+                torch.cuda.synchronize()
+                for name in ("c_tensor", "d_tensor", "amax_tensor", "post_rht_amax_tensor"):
+                    assert_same(name, captured[name], expected[name])
+    finally:
+        for device, graph in graphs:
+            with torch.cuda.device(device):
+                graph.reset()
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize("ab_dtype,sf_dtype,sf_vec_size", FP4_EXECUTION_CASES[:3])
+@pytest.mark.parametrize("flat_sf", [False, True], ids=["physical_sf", "flat_sf"])
+def test_grouped_gemm_glu_hadamard_wrapper_canonical_matches_legacy(request, ab_dtype, sf_dtype, sf_vec_size, flat_sf):
+    from cudnn import grouped_gemm_glu_hadamard_wrapper_sm100
+    from gemm.cutedsl.test_grouped_gemm_canonical_layouts import SF_PHYSICAL_PERMUTE, assert_same
+
+    cfg = _make_cfg(request, ab_dtype=ab_dtype, sf_dtype=sf_dtype, sf_vec_size=sf_vec_size)
+    inputs = allocate_grouped_gemm_input_tensors(
+        n=cfg["n"],
+        k=cfg["k"],
+        l=cfg["l"],
+        group_m_list=cfg["group_m_list"],
+        ab_dtype=cfg["ab_dtype"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        m_aligned=cfg["m_aligned"],
+        b_major=cfg["b_major"],
+    )
+
+    def call(canonical):
+        a, b, prob = inputs["a_tensor"], inputs["b_tensor"], inputs["prob_tensor"]
+        sfa, sfb = inputs["sfa_tensor"], inputs["sfb_tensor"]
+        if canonical:
+            a, b, prob = a.squeeze(-1), b.permute(2, 0, 1), prob.view(-1)
+            sfa, sfb = sfa.permute(*SF_PHYSICAL_PERMUTE), sfb.permute(*SF_PHYSICAL_PERMUTE)
+            assert b.is_contiguous() and sfa.is_contiguous() and sfb.is_contiguous()
+            if flat_sf:
+                sfa, sfb = sfa.reshape(-1), sfb.reshape(-1)
+        return grouped_gemm_glu_hadamard_wrapper_sm100(
+            a_tensor=a,
+            b_tensor=b,
+            sfa_tensor=sfa,
+            sfb_tensor=sfb,
+            padded_offsets=inputs["padded_offsets_tensor"],
+            alpha_tensor=inputs["alpha_tensor"],
+            prob_tensor=prob,
+            c_dtype=cfg["c_dtype"],
+            d_dtype=cfg["d_dtype"],
+            mma_tiler_mn=cfg["mma_tiler_mn"],
+            cluster_shape_mn=cfg["cluster_shape_mn"],
+            sf_vec_size=cfg["sf_vec_size"],
+        )
+
+    legacy = call(canonical=False)
+    for _ in range(2):
+        canonical = call(canonical=True)
+        assert canonical["c_tensor"].shape == (inputs["tensor_m"], cfg["n"])
+        assert canonical["d_tensor"].ndim == 2
+        for name in ("c_tensor", "d_tensor", "amax_tensor", "post_rht_amax_tensor"):
+            assert_same(name, canonical[name], legacy[name])

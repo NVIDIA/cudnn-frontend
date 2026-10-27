@@ -119,6 +119,19 @@ class InferenceBenchmarkConfig:
     num_iterations: int = 20
     num_warmup_iterations: int = 5
     output_dir: str = "results"
+    # Generation-phase page-size axis for the PAGED-KV backends (flashinfer / flash_mla / b12x): one case per page in this
+    # list -- the kernel block sizes the serving stacks allocate -- with ``None`` meaning ``[page_size]``. The cudnn graph
+    # paths attend over dense K / V and run each case once at ``page_size`` whatever this says (a page they do not read
+    # would only repeat the row). Backend layout constraints are applied before deduplication; the effective page size
+    # lands in the CSV's ``page_size`` column. Appended, defaulted.
+    page_sizes: Optional[List[int]] = None
+    # cudnn legs: "dense" K/V, and/or "paged" -- the form serving stacks hand cuDNN (FlashInfer's cudnn backend): paged
+    # K/V with a shuffled block table, per-request lengths and a padding mask, THD Q/O for a prefill. Other backends keep
+    # their native layout. One case per entry.
+    kv_layouts: List[str] = field(default_factory=lambda: ["dense"])
+    # Generation: per-request KV lengths drawn (seeded) from [fill * kv_len, kv_len], one case per entry; 1.0 = every
+    # request at kv_len. Applies to the paged cudnn legs and flashinfer.
+    kv_min_fills: List[float] = field(default_factory=lambda: [1.0])
 
 
 @dataclass
@@ -151,3 +164,5 @@ class BenchmarkResult:
     gpu_name: Optional[str] = None
     backend_detail: Optional[str] = None  # e.g. flashinfer kernel backend / num_splits used
     cudnn_backend_version: Optional[str] = None
+    kv_layout: str = "dense"
+    kv_min_fill: float = 1.0

@@ -42,6 +42,9 @@ except (ImportError, OSError):
 
 import cudnn
 
+# Caller-owned DSA plan contracts: host-sync and compile-allocation detectors.
+from rule8_detector import _execute_never_blocks_the_host, compile_allocates_nothing  # noqa: E402,F401
+
 # cudart via cuda-python instead of torch: torch is optional, and startup must
 # not create a CUDA context so per-worker CUDA_VISIBLE_DEVICES routing works.
 import cuda.bindings.driver as cuda_driver
@@ -466,10 +469,15 @@ def _under_xdist():
 
 
 def _torch_empty_cache():
-    # No-op unless torch (and thus its caching allocator) is loaded.
     torch = sys.modules.get("torch")
-    if torch is not None:
-        torch.cuda.empty_cache()
+    if torch is None or not torch.cuda.is_initialized():
+        return
+    # Expandable-segment cleanup can synchronize stream 0 on the wrong device.
+    # Finish each populated device before empty_cache() unmaps its memory.
+    for device in range(torch.cuda.device_count()):
+        if torch.cuda.memory_reserved(device):
+            torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
 
 
 def _wait_for_free_gpu_memory(context):
@@ -582,6 +590,16 @@ def pytest_configure(config):
         print(f"PyTorch Path: {torch.__file__}")
         print(f"PyTorch CUDA Version: {torch.version.cuda}")
         print(f"PyTorch cuDNN Version: {torch.backends.cudnn.version()}")
+    try:
+        # The CuTe DSL wheel and the CUDA toolchain it bound (its cu12 / cu13 flavour, picked by the driver): the compiler floors of the
+        # OSS kernels (python/cudnn/AGENTS.md Rule 7) read THIS, never torch.version.cuda, so a lane's log names the compiler it ran.
+        import cutlass as _cutlass
+        from cutlass.base_dsl.version_info import CUDA_VERSION as _dsl_cuda
+    except Exception as e:  # noqa: BLE001 -- no DSL, or an unusable one: the OSS tests decline or skip for themselves
+        print(f"CuTe DSL: not available ({type(e).__name__}: {str(e)[:160]})")
+    else:
+        print(f"CuTe DSL Version: {_cutlass.__version__} (compiles with CUDA {_dsl_cuda.major}.{_dsl_cuda.minor})")
+        print(f"CuTe DSL Path: {_cutlass.__file__}")
 
 # fmt: off
 def pytest_addoption(parser):
@@ -746,6 +764,15 @@ def _frost_routing_counts():
         return None
 
 
+def _frost_routing_measured():
+    try:
+        import frost_routing
+
+        return dict(frost_routing.MEASURED)
+    except Exception:
+        return None
+
+
 def _sweep_stale_routing_dirs(now=None):
     """Drop what a crashed earlier run left beside this file: a per-run directory of THIS host whose controller pid is gone, the
     shared directory of the previous layout, and a directory of another host (or without a pid in its name) older than
@@ -791,19 +818,26 @@ def pytest_sessionstart(session):
 
 def pytest_sessionfinish(session, exitstatus):
     counts = _frost_routing_counts()
+    measured = _frost_routing_measured()
     worker = os.environ.get("PYTEST_XDIST_WORKER")
-    if counts and worker is not None:
-        import json
+    if worker is None:
+        return
+    import json
 
-        os.makedirs(_FROST_ROUTING_DIR, exist_ok=True)
-        with open(os.path.join(_FROST_ROUTING_DIR, f"{worker}.json"), "w") as f:
-            json.dump(counts, f)
+    # `<worker>.json` = the routing counts, `<worker>.measured.json` = the measurements (frost_routing.measured); the
+    # controller tells them apart by the suffix.
+    for payload, suffix in ((counts, ".json"), (measured, ".measured.json")):
+        if payload:
+            os.makedirs(_FROST_ROUTING_DIR, exist_ok=True)
+            with open(os.path.join(_FROST_ROUTING_DIR, f"{worker}{suffix}"), "w") as f:
+                json.dump(payload, f)
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
     if os.environ.get("PYTEST_XDIST_WORKER") is not None:
         return  # workers report via files; only the controller prints
     counts = dict(_frost_routing_counts() or {})
+    measured = dict(_frost_routing_measured() or {})
     if os.path.isdir(_FROST_ROUTING_DIR):
         import json
         import shutil
@@ -811,16 +845,23 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
         for fname in sorted(os.listdir(_FROST_ROUTING_DIR)):
             try:
                 with open(os.path.join(_FROST_ROUTING_DIR, fname)) as f:
-                    for key, n in json.load(f).items():
+                    payload = json.load(f)
+                if fname.endswith(".measured.json"):
+                    measured.update(payload)
+                else:
+                    for key, n in payload.items():
                         counts[key] = counts.get(key, 0) + n
             except Exception:
                 pass
         shutil.rmtree(_FROST_ROUTING_DIR, ignore_errors=True)
-    if not counts:
-        return
-    total = sum(counts.values())
-    frost_total = sum(n for key, n in counts.items() if key.startswith("frost:"))
-    terminalreporter.section("FROST routing")
-    terminalreporter.write_line(f"graphs on FROST engines: {frost_total}/{total} ({100.0 * frost_total / total:.1f}%) -- transition goal is all-FROST")
-    for key in sorted(counts):
-        terminalreporter.write_line(f"  {key}: {counts[key]}")
+    if counts:
+        total = sum(counts.values())
+        frost_total = sum(n for key, n in counts.items() if key.startswith("frost:"))
+        terminalreporter.section("FROST routing")
+        terminalreporter.write_line(f"graphs on FROST engines: {frost_total}/{total} ({100.0 * frost_total / total:.1f}%) -- transition goal is all-FROST")
+        for key in sorted(counts):
+            terminalreporter.write_line(f"  {key}: {counts[key]}")
+    if measured:
+        terminalreporter.section("measured")  # frost_routing.measured: records a passing test wants in this log
+        for key in sorted(measured):
+            terminalreporter.write_line(f"  {key}: {measured[key]}")

@@ -2418,8 +2418,9 @@ def test_p_b_ds_payloads_and_atoms_dequantize_to_the_oracles_quantized_ds(monkey
 def test_p_b_runs_no_dequant_pass_and_p_c_runs_two(monkeypatch):
     """The launch census of one execute (torch.profiler / CUPTI): the bf16-dS chain runs the two SF-aware dequant kernels (q_T, k_T)
     ahead of its bf16 GEMMs; the block-scaled chain runs NONE -- its GEMMs read the e4m3 payloads and scale factors directly.  Stage-3
-    launches: dK once per chunk on both; dQ once per GQA group member on the block-scale arm (its B scale-factor descriptor is
-    indexed per A / C head) and, under ``DQ_SINGLE_LAUNCH``, once per chunk on the bf16 twin's plain rendering."""
+    launches: dK once per chunk on both; dQ once per chunk on BOTH under ``DQ_SINGLE_LAUNCH`` (the block-scale arm's dQ record takes
+    ``b_head_group = group`` like the plain rendering: B and its scale-factor descriptor are indexed by ``h // group``), once per GQA
+    group member on the per-member twin."""
     from cudnn.sdpa.bwd import api_dsl_sm107 as sm107, config_sm107 as cfg
 
     counts = {}
@@ -2442,9 +2443,143 @@ def test_p_b_runs_no_dequant_pass_and_p_c_runs_two(monkeypatch):
     group = 4 // 2  # the cell's H_q / H_kv
     assert counts[cfg.DS_SF_P_C]["dequant"] == 2, counts
     assert counts[cfg.DS_SF_P_B]["dequant"] == 0 and cfg.DS_SF_POLICY_DEFAULT == cfg.DS_SF_P_B, "the shipped default launches no dequant pass"
-    assert counts[cfg.DS_SF_P_B]["gemm"] == 1 + group, counts  # dK + one dQ launch per GQA group member (the block-scale arm)
+    assert counts[cfg.DS_SF_P_B]["gemm"] == 1 + (1 if sm107.DQ_SINGLE_LAUNCH else group), counts  # dK + ONE dQ launch per chunk (the block-scale arm too)
     assert counts[cfg.DS_SF_P_C]["gemm"] == 1 + (1 if sm107.DQ_SINGLE_LAUNCH else group), counts  # the plain rendering's single dQ launch
     assert counts[cfg.DS_SF_P_B]["main"] == counts[cfg.DS_SF_P_C]["main"] >= 1, counts
+
+
+# The block-scale single-launch dQ pin's cells: the GQA geometries of the row suites (8/2) and of the 397B block (32/2), S a tile
+# multiple (512), q- AND kv-padded (992 = 31 x 32, S % 128 = 96: the row's SF re-stagings and both pad terms) and 8K (several
+# M tiles per head, the causal trim thinning the k walk); dense and causal -- the full 2 x 3 x 2 matrix, twelve cells.  EVERY
+# cell runs the e4m3-dS oracle on both arms, the two 32-head 8K cells included: ``compute_ref_backward`` walks the scores in
+# 128-wide kv blocks, so its live set at 32 heads x 8K is a few hundred MiB per block over the [B, H, S, D] fp32 operands and
+# accumulators (the test's own torch forward holds the full [1, 32, 8K, 8K] fp32 score matrix, ~8 GiB -- well inside a 200+ GiB
+# part); the first version of this table ran those two cells finite + bitwise only on an unmeasured memory estimate.
+_BS_DQ_TWIN_CELLS = {
+    "gqa8-2_s512_dense": dict(hq=8, hkv=2, s=512),
+    "gqa8-2_s512_causal": dict(hq=8, hkv=2, s=512, causal=True),
+    "gqa32-2_s512_dense": dict(hq=32, hkv=2, s=512),
+    "gqa32-2_s512_causal": dict(hq=32, hkv=2, s=512, causal=True),
+    "gqa8-2_s992_dense": dict(hq=8, hkv=2, s=992),
+    "gqa8-2_s992_causal": dict(hq=8, hkv=2, s=992, causal=True),
+    "gqa32-2_s992_dense": dict(hq=32, hkv=2, s=992),
+    "gqa32-2_s992_causal": dict(hq=32, hkv=2, s=992, causal=True),
+    "gqa8-2_s8192_dense": dict(hq=8, hkv=2, s=8192),
+    "gqa8-2_s8192_causal": dict(hq=8, hkv=2, s=8192, causal=True),
+    "gqa32-2_s8192_dense": dict(hq=32, hkv=2, s=8192),
+    "gqa32-2_s8192_causal": dict(hq=32, hkv=2, s=8192, causal=True),
+}
+
+
+def _bs_dq_arm(monkeypatch, single, *, hq, hkv, s, causal=False, check=True):
+    """One arm of the block-scale single-launch pin on THIS row (P-b): ``api_dsl_sm107.DQ_SINGLE_LAUNCH = single`` (read when the
+    adapter's ``_stage3_records`` runs at compile), the row built + pinned + executed through ``_run_mxfp8`` into NaN-poisoned outputs
+    (the oracle on the arm unless ``check=False``), and what the plan did: the adapter (captured off the row's inherited ``compile``),
+    its dQ record's ``b_head_group`` and head chunking, the host trace's ``_dq_launches`` calls (the compiled-plan cache is switched
+    off for the arm so the host traces in-process -- a cache HIT would skip the trace the spy watches; the chunk loop is one
+    ``scf.for`` body, so the spy sees the arithmetic once per trace, not once per launch -- the compiled-plan cache AND its in-process
+    memo are switched off for the arm, so every build traces), and the RUNTIME kernel launches of one
+    execute from a CUDA-graph capture (the d512 suite's ``_captured_kernel_launches``: every launch a node, nothing runs)."""
+    from test_sdpa_bwd_d512_sm107 import _captured_kernel_launches
+
+    from cudnn.sdpa.bwd import api_dsl_sm107 as sm107
+    from cudnn.sdpa.bwd.kernels.sm107 import prepared_host
+
+    monkeypatch.setattr(sm107, "DQ_SINGLE_LAUNCH", single)
+    monkeypatch.setenv("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", "1")
+    # the host-trace spy below needs a TRACE: the in-process memo in front of the compiled-plan cache hands a plan whose
+    # (device, key, symbol, options) this process already built the first build's object WITHOUT re-tracing the host body, and
+    # `_dq_launches` is called inside that trace -- the arm's cell is the suite's default shape, so an earlier test's plan would
+    # serve it and the spy would see nothing (0 calls, not the 1 per trace this pin asserts)
+    monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO", "0")
+    apis, dq_calls = [], []
+    original_compile = sm107.SdpaBwdDslSm107.compile
+
+    def compile_spy(adapter):
+        apis.append(adapter)
+        return original_compile(adapter)
+
+    original_dq = prepared_host._dq_launches
+
+    def dq_spy(group, bhg):
+        n = original_dq(group, bhg)
+        dq_calls.append((group, bhg, n))
+        return n
+
+    monkeypatch.setattr(sm107.SdpaBwdDslSm107, "compile", compile_spy)
+    monkeypatch.setattr(prepared_host, "_dq_launches", dq_spy)
+    run = _run_mxfp8(hq=hq, hkv=hkv, sq=s, skv=s, causal=causal, poison=float("nan"), check=check)
+    assert len(apis) == 1 and type(apis[0]).__name__ == "SdpaBwdDslSm107Mxfp8", [type(a).__name__ for a in apis]
+    api = apis[0]
+    assert api._ds_block_scaled, "the pin is the block-scale arm's (P-b)"
+    for x in run.outs[0].values():
+        assert torch.isfinite(x.float()).all(), "a non-finite gradient on the arm"
+    outs = {n: x.clone() for n, x in run.outs[0].items()}
+    kernels, nodes, names = _captured_kernel_launches(lambda: run.graph.execute(run.pack, run.workspace))
+    torch.cuda.synchronize()
+    facts = dict(
+        dq_bhg=int(api._dq_b_head_group),
+        chunk=int(api._qh_chunk),
+        chunks=-(-run.shape[0] // int(api._b_chunk)) * (hq // int(api._qh_chunk)),
+        dq_calls=list(dq_calls),  # a snapshot: the next arm's spy wraps this one and would append to the same list
+        kernel_launches=kernels,
+        graph_nodes=nodes,
+        gemm_launches_by_name=sum(1 for n in names if n and "bprop_matmul" in n) if names and all(names) else None,
+        kernel_names=names,
+    )
+    return outs, facts
+
+
+@requires_rubin
+@pytest.mark.parametrize("cell", list(_BS_DQ_TWIN_CELLS), ids=list(_BS_DQ_TWIN_CELLS))
+def test_stage3_block_scale_dq_single_launch_is_bitwise_the_per_member_launches(monkeypatch, cell):
+    """Under GQA the block-scale arm's dQ GEMM is ONE launch per head chunk, like the plain renderings': its dQ record takes
+    ``MatmulTemplateParams.b_head_group = group``, the template indexes B = k_T AND its scale-factor descriptor by ``h // group``
+    (``_b_head``), and the host binds the whole dS / atom / dQ chunk against the kv-head windows of ``k_T`` and of its scale-factor
+    planes view -- where the arm used to run one launch per group MEMBER over every ``group``-th Q head (sixteen under-one-wave
+    launches at the 397B geometry).  Both forms pair every Q head with the same K head and the same K scales and walk the same k
+    tiles per output tile into an fp32 accumulator, so dQ must be the SAME BITS -- and dK / dV, which the change never touches.
+    ``DQ_SINGLE_LAUNCH = False`` is the twin (``b_head_group = 1``, the per-member loop); both arms are held to the e4m3-dS fp64
+    oracle with NaN-poisoned outputs (``_run_mxfp8``) on every one of the twelve cells (``_BS_DQ_TWIN_CELLS``).
+    The LAUNCH COUNT is pinned from a CUDA-graph capture of one execute -- ``group - 1`` fewer kernels per head chunk on the
+    shipped arm, and by kernel name ``2 * chunks`` stage-3 GEMM launches (dK + dQ per chunk; the main kernel is not one) against
+    ``(1 + group) * chunks`` -- and from the host trace's ``_dq_launches`` call (1 vs ``group`` launches per chunk)."""
+    from cudnn.sdpa.bwd import api_dsl_sm107 as sm107
+
+    assert sm107.DQ_SINGLE_LAUNCH, "one dQ launch per chunk is what ships; the pin flips it OFF for the twin"
+    kw = dict(_BS_DQ_TWIN_CELLS[cell])
+    group = kw["hq"] // kw["hkv"]
+    _p_b(monkeypatch)
+    single, f_single = _bs_dq_arm(monkeypatch, True, **kw)
+    members, f_members = _bs_dq_arm(monkeypatch, False, **kw)
+    n_chunks = f_single["chunks"]
+    assert f_single["chunk"] % group == 0 and f_members["chunks"] == n_chunks, (f_single, f_members)
+    # the records' b_head_group, copied off the dQ record at compile: the group on the shipped arm, 1 on the twin
+    assert (f_single["dq_bhg"], f_members["dq_bhg"]) == (group, 1), (f_single, f_members)
+    # the host trace: `_dq_launches(group, b_head_group)` exactly once per trace -> 1 dQ launch per chunk on the shipped arm, `group` on the twin
+    assert f_single["dq_calls"] == [(group, group, 1)], f_single
+    assert f_members["dq_calls"] == [(group, 1, group)], f_members
+    # the runtime launches of one execute: every node a kernel; the per-member arm launches (group - 1) more dQ GEMMs per chunk
+    assert f_single["kernel_launches"] == f_single["graph_nodes"] and f_members["kernel_launches"] == f_members["graph_nodes"], (f_single, f_members)
+    assert f_members["kernel_launches"] - f_single["kernel_launches"] == (group - 1) * n_chunks, (
+        f"single-launch arm {f_single['kernel_launches']} kernels vs per-member {f_members['kernel_launches']}: expected {group - 1} x {n_chunks} chunks "
+        f"fewer; facts {f_single} / {f_members}"
+    )
+    if f_single["gemm_launches_by_name"] is not None:
+        assert (f_single["gemm_launches_by_name"], f_members["gemm_launches_by_name"]) == (2 * n_chunks, (1 + group) * n_chunks), (f_single, f_members)
+    print(
+        f"\n{_ENGINE} block-scale dQ launches {cell} chunks={n_chunks}: single {f_single['kernel_launches']} kernels, per-member "
+        f"{f_members['kernel_launches']}; stage-3 GEMMs by name {f_single['gemm_launches_by_name']} / {f_members['gemm_launches_by_name']}"
+    )
+    # the bits: dQ, and dK / dV which the change never touches
+    for name in ("dQ", "dK", "dV"):
+        x, y = single[name], members[name]
+        xi, yi = x.contiguous().view(torch.int16), y.contiguous().view(torch.int16)
+        n_diff = (xi != yi).sum().item()
+        assert n_diff == 0, (
+            f"{name}: the single dQ launch vs the per-member launches differ in {n_diff} of {xi.numel()} int16 words "
+            f"(max|diff|={(x.float() - y.float()).abs().max().item():.3e})"
+        )
 
 
 @requires_rubin
@@ -2476,7 +2611,8 @@ def test_unserved_amax_graph_declines_typed_end_to_end():
 #
 # The MXFP8 row's twins of the half suite's ``_run_adapter`` cells over ``_Quant`` operands: ``SdpaBwdDslSm107Mxfp8(seq_kv_lens_present=True)``
 # against ``mxfp8_ref.compute_ref_backward`` composing the SAME per-batch lengths INSIDE itself (``padding=``: slicing a quantized operand
-# per batch entry would re-block its columnwise 1x32 scale factors), the appended ``external_delta`` plan fact (DENSE only; the delta is
+# per batch entry would re-block its columnwise 1x32 scale factors), the appended ``external_delta`` plan fact (the dense plans here,
+# the THD twins in test_sdpa_bwd_thd_mxfp8_sm107.py; the delta is
 # the dot of the bf16 ``o_f16`` / ``dO_f16`` ports, so a caller's tensor is BITWISE the row's own pre-pass when it holds the same fp32
 # values), and bottom-right at a ragged S_q through the graph (served now).  The K / V rows past a batch entry's kv length hold FINITE
 # data in every cell (the finite-data contract of the per-batch arm); a NaN pad in the delta is the contract's, not the kernel's, to
@@ -2990,7 +3126,7 @@ def test_mxfp8_gqa_dk_partials_are_fp32_on_the_block_scale_chain_and_dv_bf16(mon
         "main", "mm_dk", "mm_dq", "config", "geometry", "regions", "sm", "cache_key", "stage_sf_pads", "ds_sf_policy", "seq_kv_present", "external_delta",
     ]  # fmt: skip
     assert list(inspect.signature(ph.compile_host_mxfp8_thd).parameters) == [
-        "main", "mm_dk", "mm_dq", "config", "geometry", "regions", "sm", "cache_key", "stage_sf_pads", "ds_sf_policy",
+        "main", "mm_dk", "mm_dq", "config", "geometry", "regions", "sm", "cache_key", "stage_sf_pads", "ds_sf_policy", "external_delta",
     ]  # fmt: skip
 
 

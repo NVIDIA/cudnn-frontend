@@ -3,20 +3,20 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <array>
+#include <functional>
+#include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 #include <unordered_map>
 #include <vector>
 
-#include "pybind11/pybind11.h"
-#include "pybind11/functional.h"
-#include "pybind11/cast.h"
-#include "pybind11/stl.h"
+#include <nanobind/nanobind.h>
 
 #include "cudnn_frontend.h"
 
-namespace py = pybind11;
-using namespace pybind11::literals;
+namespace py = nanobind;
 
 namespace cudnn_frontend::python_bindings {
 
@@ -70,7 +70,8 @@ class PyGraph {
             std::shared_ptr<KernelCache> kernel_cache,
             std::shared_ptr<cudnn_frontend::DeviceProperties> device_properties,
             bool is_dynamic_shape_enabled,
-            bool is_override_shape_enabled)
+            bool is_override_shape_enabled,
+            std::optional<cudnn_frontend::CudaGraphRetention_t> cuda_graph_retention = std::nullopt)
         : graph(std::make_shared<cudnn_frontend::graph::Graph>()) {
         graph->set_compute_data_type(compute_data_type)
             .set_intermediate_data_type(intermediate_data_type)
@@ -91,11 +92,15 @@ class PyGraph {
         }
 
         if (sm_count.is(py::none()) == false) {
-            graph->set_sm_count(sm_count.cast<int32_t>());
+            graph->set_sm_count(py::cast<int32_t>(sm_count));
+        }
+
+        if (cuda_graph_retention.has_value()) {
+            graph->set_cuda_graph_retention(*cuda_graph_retention);
         }
 
         if (sm_version.is(py::none()) == false) {
-            graph->set_sm_version(sm_version.cast<int32_t>());
+            graph->set_sm_version(py::cast<int32_t>(sm_version));
         }
 
         if (is_dynamic_shape_enabled) {
@@ -790,7 +795,7 @@ class PyGraph {
     }
 
     // Takes a pointer to a contiguous array of device pointers, ordered as
-    // get_variant_pack_uids_sorted() reports — no pybind11 container copy and no
+    // get_variant_pack_uids_sorted() reports — no nanobind container copy and no
     // per-operand uid->pointer hash lookup. ``plan_index`` selects the plan;
     // -1 means the graph's own candidate.
     void

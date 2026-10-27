@@ -388,6 +388,72 @@ def test_compiled_plan_lifecycle_knobs_and_reuse(monkeypatch):
     assert compiled_log == [{"tile": 256}, {"tile": 128}]  # g2 compiled its own plan
 
 
+def test_indexed_execution_keeps_each_callers_plan(monkeypatch):
+    """Overlapping indexed calls must not borrow or change shared selection."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from cudnn.engines import CompiledPlan, PlanConfig
+
+    executed = []
+
+    class Plan(CompiledPlan):
+        def __init__(self, tag):
+            self.tag = tag
+
+        def execute(self, graph, tensor_data, ctx):
+            executed.append((ctx.workspace, self.tag))
+
+    class Engine(BaseEngine):
+        name = "indexed_recording"
+        engine_id = _FAKE + 40
+
+        def build_plan(self, graph, config, ctx=None):
+            return Plan(config.knobs["tile"])
+
+    engine = Engine()
+    _offer(monkeypatch, engine)
+    _ranking(monkeypatch, lambda *args: [PlanConfig(engine.engine_id, {"tile": tile}) for tile in (128, 256, 512)])
+    graph = pygraph()
+    output = graph.matmul(torch.randn(2, 2), torch.randn(2, 2))
+    graph.create_execution_plans()
+    indices = _python_indices(graph)
+    for index in indices:
+        graph.build_plan_at_index(index)
+    retained = (graph._plan_index, graph._plan_pinned, graph._is_built)
+
+    first_entered, second_entered, first_finished = (threading.Event() for _ in range(3))
+    local = threading.local()
+
+    def stream(handle):
+        if local.first:
+            first_entered.set()
+            assert second_entered.wait(10)
+        else:
+            second_entered.set()
+            assert first_finished.wait(10)
+        return None
+
+    monkeypatch.setattr(graph, "_resolve_stream", stream)
+
+    def call(index, first):
+        local.first = first
+        tag = graph.plans[index].knobs["tile"]
+        try:
+            graph.execute_plan_at_index({output: torch.empty(2, 2)}, workspace=tag, index=index)
+        finally:
+            if first:
+                first_finished.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(call, indices[0], True)
+        assert first_entered.wait(10)
+        second = pool.submit(call, indices[1], False)
+        first.result(timeout=20)
+        second.result(timeout=20)
+    assert executed == [(128, 128), (256, 256)]
+    assert (graph._plan_index, graph._plan_pinned, graph._is_built) == retained
+
+
 def _ranking(monkeypatch, fn):
     """Replace the ranking policy for one graph's planning.
 
@@ -577,6 +643,66 @@ def test_empty_ranking_output_rejected(monkeypatch):
     # rebuilding the graph is the documented path, but the graph must not be
     # left half-planned either
     assert not g._planning_done
+
+
+def _any_facts(graph):
+    """A family analyzer for the empty-plan-list test: any record, so the family hook is consulted."""
+    return object()
+
+
+def _no_proposals(kind, facts, offered):
+    """A family hook that proposes nothing for every mode."""
+    return []
+
+
+def test_an_empty_plan_list_names_every_side(monkeypatch):
+    """When nothing proposes a plan the error says WHY on both sides: the backend's own rejection, every
+    python engine's decline reason, and the engines that accepted the graph but whose family proposed
+    nothing -- the failure-path twin of accepts() (heuristics.decline_reasons)."""
+    import cudnn
+    from cudnn._pygraph import cudnn_graph_not_supported
+    from cudnn._pygraph import pygraph as _graph_cls
+
+    class _Declines(StubEngine):
+        name = "stub_a"
+        engine_id = _FAKE + 1
+
+        def check_support(self, graph):
+            raise NotImplementedError("stub_a: no")
+
+    class _Accepts(StubEngine):
+        name = "stub_b"
+        engine_id = _FAKE + 2
+
+    _offer(monkeypatch, _Declines(), _Accepts(), analyzer=(__name__, "_any_facts"), heuristics=(__name__, "_no_proposals"))
+
+    def declining_backend(self):
+        raise cudnn_graph_not_supported("fake backend: no engine for this graph")
+
+    monkeypatch.setattr(_graph_cls, "_lower_backend_graph", declining_backend)
+    g = pygraph()
+    g.matmul(torch.randn(2, 2), torch.randn(2, 2))
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError) as exc:
+        g.create_execution_plans()
+    msg = str(exc.value)
+    assert msg.startswith("no engine — python or backend — proposed a plan for this graph"), msg
+    assert "the backend declined: fake backend: no engine for this graph" in msg, msg
+    assert "python engines declined: stub_a: no" in msg, msg
+    assert "python engines that accepted the graph but proposed no plan: stub_b" in msg, msg
+    assert not g._planning_done
+
+
+def test_decline_reasons_splits_the_decliners_from_the_accepters():
+    from unittest.mock import Mock
+
+    from cudnn.engines.heuristics import decline_reasons
+
+    a, b, c = Mock(), Mock(), Mock()
+    a.name, b.name, c.name = "a", "b", "c"
+    a.check_support.side_effect = NotImplementedError("a: nope")
+    b.check_support.return_value = None
+    c.check_support.side_effect = ImportError("c: no cutedsl extra")
+    assert decline_reasons([a, b, c], object()) == ({"a": "a: nope", "c": "c: no cutedsl extra"}, ["b"])
 
 
 def test_plan_count_is_the_whole_ranked_list(monkeypatch):

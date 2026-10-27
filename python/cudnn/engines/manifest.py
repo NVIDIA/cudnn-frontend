@@ -37,6 +37,8 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 from .engine_ids import (
     FAMILY_BLOCK,
     FROST_GEMM_ID_BASE,
+    FROST_NORM_BWD_ID_BASE,
+    FROST_NORM_FWD_ID_BASE,
     FROST_SDPA_BWD_ID_BASE,
     FROST_SDPA_FWD_ID_BASE,
     GDN2_ID_BASE,
@@ -44,6 +46,7 @@ from .engine_ids import (
     GDP_ID_BASE,
     KDA_ID_BASE,
     FROST_CONV_ID_BASE,
+    MAMBA2_ID_BASE,
 )
 
 _LOG = logging.getLogger("cudnn.engines.manifest")
@@ -109,6 +112,13 @@ class EngineFamily:
     # pygraph.validate() takes the classic eager C++ lowering instead. None means
     # the family has no native validator and always validates classically.
     validator: Optional[Tuple[str, str]] = None
+    # ("module", "callable") naming ``backend_guard(graph, facts) -> Optional[str]``: a reason the cuDNN
+    # backend must NOT be consulted for this graph at planning (a backend whose heuristics take the
+    # process down on a contract a python engine serves). Planning records the reason as the backend's
+    # decline and ranks the family's own proposals alone; a graph nothing serves then fails with that
+    # reason instead of a dead process. None: the backend is always queried. Rare by contract: a
+    # documented backend defect on a measured domain, never placement policy.
+    backend_guard: Optional[Tuple[str, str]] = None
 
     @property
     def id_end(self) -> int:
@@ -132,6 +142,14 @@ class EngineFamily:
 # ignored when classifying, so `matmul + pointwise` is a gemm graph. Names, not
 # enum members, so this file imports no engine code.
 _ANCHOR_NODE_TO_FAMILY = {
+    "LAYERNORM": "frost_norm_fwd",
+    "RMSNORM": "frost_norm_fwd",
+    "INSTANCENORM": "frost_norm_fwd",
+    "BATCHNORM": "frost_norm_fwd",
+    "LAYERNORM_BWD": "frost_norm_bwd",
+    "RMSNORM_BWD": "frost_norm_bwd",
+    "INSTANCENORM_BWD": "frost_norm_bwd",
+    "BATCHNORM_BWD": "frost_norm_bwd",
     "MATMUL": "frost_gemm",
     "MATMUL_FP8": "frost_gemm",
     "MOE_GROUPED_MATMUL": "frost_gemm",
@@ -158,6 +176,10 @@ _ANCHOR_NODE_TO_FAMILY = {
     "GDP_BWD": "gdp",
     "GDP_SUMMARY": "gdp",
     "GDP_SUMMARY_BWD": "gdp",
+    "MAMBA2": "mamba2",
+    "MAMBA2_BWD": "mamba2",
+    "MAMBA2_SUMMARY": "mamba2",
+    "MAMBA2_SUMMARY_BWD": "mamba2",
 }
 
 # ---------------------------------------------------------------------------
@@ -213,6 +235,14 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
     ),
     EngineFamily(
+        MAMBA2_ID_BASE,
+        "mamba2",
+        "cudnn.linear_attention",
+        "Mamba2Engines",
+        slots={"mamba2_frost": EngineSlot(0), "mamba2_summary_frost": EngineSlot(1)},
+        analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
+    ),
+    EngineFamily(
         FROST_GEMM_ID_BASE,
         "frost_gemm",
         "cudnn.gemm.frost.engine",
@@ -243,14 +273,16 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_fwd_prefill_sm100": EngineSlot(11),
             "sdpa_fwd_prefill_sm100_mxfp8": EngineSlot(12, opt_in=True),
             "sdpa_fwd_prefill_sm100_fp8": EngineSlot(13),
-            "sdpa_fwd_prefill_sm107_fp8": EngineSlot(14, opt_in=True),
+            "sdpa_fwd_prefill_sm107_fp8": EngineSlot(14),
             "sdpa_fwd_prefill_sm107": EngineSlot(15),
-            "sdpa_fwd_prefill_sm107_mxfp8": EngineSlot(16, opt_in=True),
+            "sdpa_fwd_prefill_sm107_mxfp8": EngineSlot(16),
             "sdpa_fwd_prefill_sm90": EngineSlot(17),
+            "sdpa_fwd_prefill_sm120_mxfp8": EngineSlot(18, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         heuristics=("cudnn.sdpa.fwd.heuristics", "propose"),
         validator=("cudnn._sdpa_validate", "validate_graph"),
+        backend_guard=("cudnn.sdpa.fwd.backend_guard", "backend_guard"),
     ),
     EngineFamily(
         FROST_SDPA_BWD_ID_BASE,
@@ -267,6 +299,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_bwd_sm107_mxfp8": EngineSlot(6, opt_in=True),
             "sdpa_bwd_sm100_d256": EngineSlot(7, opt_in=True),
             "sdpa_bwd_sm107_d512": EngineSlot(8, opt_in=True),
+            "sdpa_bwd_sm100_d128": EngineSlot(9, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         # One entry per eligible row, WITH the tiles the lowering would pick
@@ -280,6 +313,23 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "cudnn.conv.frost.engine",
         "FrostConvEngines",
         slots={"frost_conv": EngineSlot(0, opt_in=True)},
+    ),
+    EngineFamily(
+        FROST_NORM_FWD_ID_BASE,
+        "frost_norm_fwd",
+        "cudnn.norm.fprop.engine",
+        "FrostNormFwdEngines",
+        # Slots are FIXED FOREVER; append the next free one, never reorder.
+        slots={"norm_fprop_sm100": EngineSlot(0)},
+        analyzer=("cudnn.norm.graph_analyzer", "analyze"),
+    ),
+    EngineFamily(
+        FROST_NORM_BWD_ID_BASE,
+        "frost_norm_bwd",
+        "cudnn.norm.bprop.engine",
+        "FrostNormBwdEngines",
+        slots={"norm_bprop_sm100": EngineSlot(0)},
+        analyzer=("cudnn.norm.graph_analyzer", "analyze"),
     ),
 )
 
@@ -356,6 +406,12 @@ def resolve_validator(family: EngineFamily):
     """The family's python-native graph validator, or None (see EngineFamily.validator)."""
 
     return _resolve(family, family.validator, "validator")
+
+
+def resolve_backend_guard(family: EngineFamily):
+    """The family's backend-query guard, or None (see EngineFamily.backend_guard)."""
+
+    return _resolve(family, family.backend_guard, "backend_guard")
 
 
 def instantiate(family: EngineFamily, ids: Dict[str, int]):

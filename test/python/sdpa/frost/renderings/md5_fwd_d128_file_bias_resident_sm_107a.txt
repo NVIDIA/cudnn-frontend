@@ -1,0 +1,12 @@
+# The sm107 f16/bf16 d128-file kernel's cubin md5 in the RESIDENT bias form at the (n, n+1) pair work item (TemplateParams.bias_mode = 1,
+# n_chunk = 4; the 128-wide KV tile), host trace-compiled with test_sdpa_bias_streamed_sm107.py's probe body.  The pin that reads it
+# (test_sdpa_bias_streamed_sm107.py): the streamed ring's seams fold OUT of the resident form, and every later lever of the small tiles
+# (the ring-depth seam, the two-slot S, Q in TMEM, the third softmax warp group) adds no instruction to the resident rendering, so these
+# renderings must stay byte-identical to the record.  First rendered BEFORE the
+# streamed ring landed (the tree at 5edff220); RE-RENDERED when BIAS_PRELOAD_CHUNKS became the per-rendering constant
+# config_sm107.sm107_bias_preload_chunks(CFG.TILE_N) -- 0 on this 128-wide tile (one chunk ahead of the bmm1_done wait before), which
+# moves the softmax lanes' bias-row read behind the wait and so the instruction stream of exactly these two renderings (numerics unchanged).
+# Lines: dsl=<distribution> <version>; fwd_d128_file sm_107a <arm> rc=0 cubin_md5=<md5>.  A record stays valid for the DSL build it names.
+dsl=nvidia-cutlass-dsl 4.8.0
+fwd_d128_file sm_107a d32_pair4 rc=0 cubin_md5=848fe763552fb3cff5de7246e703d1be
+fwd_d128_file sm_107a d32_pair4_mask_padded_causal rc=0 cubin_md5=b3e44ba855fd63404f23a1c9a4e77380

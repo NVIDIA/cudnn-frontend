@@ -287,8 +287,9 @@ def test_grouped_gemm_dsrelu_jax_errors():
     sfa_j = jnp.asarray(sfa_np)
     offsets_j, alpha_j, prob_j = (jnp.asarray(x) for x in (offsets_np, alpha_np, prob_np))
 
-    # Dense weight mode: the expert-outermost strided (n, k, l) B layout is inexpressible.
-    with pytest.raises(ValueError, match="not expressible as JAX arrays"):
+    # Dense weight mode takes the canonical layouts (covered in test_grouped_gemm_canonical_jax.py),
+    # not the kernel-facing (m, k, 1) / (n, k, l) shapes.
+    with pytest.raises(ValueError, match="JAX requires canonical A"):
         grouped_gemm_dsrelu_wrapper_sm100(
             a_tensor=a_j,
             c_tensor=c_j,

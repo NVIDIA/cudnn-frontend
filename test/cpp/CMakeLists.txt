@@ -34,6 +34,8 @@ add_executable(
     get_engine_and_knobs.cpp
     kernel_cache.cpp
     plan_selection.cpp
+    legacy_slice.cpp
+    cuda_graph_lifetime.cpp
 )
 
 if (MSVC)

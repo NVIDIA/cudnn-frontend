@@ -1,21 +1,592 @@
 ---
 title: "NVIDIA cuDNN"
+subtitle: "GPU-accelerated building blocks for deep learning."
 ---
-The NVIDIA CUDA Deep Neural Network library (cuDNN) is a GPU-accelerated library of primitives for deep neural networks. It provides highly tuned implementations of operations arising frequently in deep neural network (DNN) applications:
 
-- Scaled dot-product attention
-- Convolution, including cross-correlation
-- Matrix multiplication
-- Normalizations, softmax, and pooling
-- Arithmetic, mathematical, relational, and logical pointwise operations
+The NVIDIA CUDA Deep Neural Network library (cuDNN) provides optimized operations for training and inference on NVIDIA GPUs. Use attention, matrix multiplication, convolution, and multi-operation fusion through your framework or the cuDNN Python and C++ APIs.
 
-Beyond just providing high-performance implementations of individual operations, cuDNN also supports a flexible set of multi-operation fusion patterns for further optimization. The goal is to achieve the best available performance on NVIDIA GPUs for important deep learning use cases.
+## Integrations
 
-In cuDNN, both single-operation and multi-operation computations are expressed as operation graphs. The following APIs are available for constructing these graphs:
+Use cuDNN through the tools in your AI stack, or build directly on its graph APIs. These paths show how selected frameworks and libraries reach cuDNN. Support depends on the operation, selected backend, library versions, and GPU.
 
-- Python API
-- C++ API
+<IntegrationMap>
+  <div className="cudnn-map-toolbar">
+    <span className="cudnn-map-label">EXPLORE AN INTEGRATION</span>
+    <div
+      className="cudnn-filters"
+      role="group"
+      aria-label="Highlight integration paths"
+    >
+      <button type="button" data-cudnn-filter="all" aria-pressed="true">
+        All paths
+      </button>
+      <button type="button" data-cudnn-filter="training" aria-pressed="false">
+        Training
+      </button>
+      <button type="button" data-cudnn-filter="inference" aria-pressed="false">
+        Inference
+      </button>
+      <button type="button" data-cudnn-filter="direct" aria-pressed="false">
+        Direct API
+      </button>
+    </div>
+  </div>
+  <div className="cudnn-map">
+    <div className="cudnn-lane cudnn-training" data-cudnn-lane="training">
+      <p className="cudnn-lane-label">FRAMEWORKS &amp; TRAINING</p>
+      <div className="cudnn-training-grid">
+        <button
+          className="cudnn-node cudnn-pytorch"
+          type="button"
+          data-cudnn-route="pytorch"
+          aria-pressed="false"
+        >
+          <span className="cudnn-node-mark" aria-hidden="true">
+            ◒
+          </span>
+          PyTorch
+        </button>
+        <button
+          className="cudnn-node cudnn-jax"
+          type="button"
+          data-cudnn-route="jax"
+          aria-pressed="false"
+        >
+          <span className="cudnn-node-mark" aria-hidden="true">
+            J
+          </span>
+          JAX / XLA
+        </button>
+        <button
+          className="cudnn-node cudnn-megatron"
+          type="button"
+          data-cudnn-route="megatron"
+          aria-pressed="false"
+        >
+          <span className="cudnn-node-mark" aria-hidden="true">
+            M
+          </span>
+          Megatron Core
+        </button>
+      </div>
+      <div className="cudnn-training-bridges">
+        <span className="cudnn-direct-line" aria-hidden="true"></span>
+        <div className="cudnn-te-bridge">
+          <span className="cudnn-branch-lines" aria-hidden="true"></span>
+          <button
+            className="cudnn-node cudnn-bridge-node"
+            type="button"
+            data-cudnn-route="te"
+            aria-pressed="false"
+          >
+            Transformer Engine <span aria-hidden="true">↓</span>
+          </button>
+        </div>
+      </div>
+      <p className="cudnn-lane-note">PyTorch &amp; JAX also connect directly</p>
+      <div className="cudnn-lane-stem" aria-hidden="true"></div>
+    </div>
+    <div className="cudnn-lane cudnn-inference" data-cudnn-lane="inference">
+      <p className="cudnn-lane-label">LLM INFERENCE</p>
+      <div className="cudnn-inference-grid">
+        <button
+          className="cudnn-node"
+          type="button"
+          data-cudnn-route="vllm"
+          aria-pressed="false"
+        >
+          <span className="cudnn-node-mark" aria-hidden="true">
+            v
+          </span>
+          vLLM
+        </button>
+        <button
+          className="cudnn-node"
+          type="button"
+          data-cudnn-route="sglang"
+          aria-pressed="false"
+        >
+          <span className="cudnn-node-mark" aria-hidden="true">
+            S
+          </span>
+          SGLang
+        </button>
+      </div>
+      <div className="cudnn-flashinfer-bridge">
+        <span className="cudnn-branch-lines" aria-hidden="true"></span>
+        <button
+          className="cudnn-node cudnn-bridge-node"
+          type="button"
+          data-cudnn-route="flashinfer"
+          aria-pressed="false"
+        >
+          <span className="cudnn-flash" aria-hidden="true">
+            ϟ
+          </span>
+          FlashInfer <span aria-hidden="true">↓</span>
+        </button>
+      </div>
+      <p className="cudnn-lane-note">cuDNN attention backend</p>
+      <div className="cudnn-lane-stem" aria-hidden="true"></div>
+    </div>
+    <div className="cudnn-lane cudnn-direct" data-cudnn-lane="direct">
+      <p className="cudnn-lane-label">BUILD &amp; EXPERIMENT</p>
+      <button
+        className="cudnn-node cudnn-custom-node"
+        type="button"
+        data-cudnn-route="direct"
+        aria-pressed="false"
+      >
+        <span className="cudnn-code-mark" aria-hidden="true">
+          &lt;/&gt;
+        </span>
+        <strong>Your application</strong>
+        <small>Python &amp; C++</small>
+      </button>
+      <p className="cudnn-lane-note">AI labs, research &amp; benchmarks</p>
+      <div className="cudnn-lane-stem" aria-hidden="true"></div>
+    </div>
+    <div className="cudnn-foundation">
+      <div>
+        <span className="cudnn-foundation-brand">cuDNN</span>
+        <span className="cudnn-foundation-description">
+          Graph APIs &amp; optimized kernels
+        </span>
+      </div>
+      <div className="cudnn-foundation-ops">
+        <span>Attention</span>
+        <span>Matmul</span>
+        <span>Convolution</span>
+        <span>Fusion</span>
+      </div>
+    </div>
+    <div className="cudnn-more-integrations">
+      <span>ALSO IN THE ECOSYSTEM</span>
+      <button type="button" data-cudnn-route="rtx" aria-pressed="false">
+        TensorRT for RTX <span aria-hidden="true">↗</span>
+      </button>
+      <button type="button" data-cudnn-route="tokamax" aria-pressed="false">
+        Tokamax <span aria-hidden="true">↗</span>
+      </button>
+    </div>
+  </div>
+  <div className="cudnn-route-detail" aria-live="polite" aria-atomic="true">
+    <div data-cudnn-detail="all">
+      <div>
+        <strong>Find your path to cuDNN</strong>
+        <p>
+          Select a framework or library to see how it connects and where to get
+          started.
+        </p>
+      </div>
+      <a href="/developer/overview">
+        Developer guide
+      </a>
+    </div>
+    <div data-cudnn-detail="training" hidden>
+      <div>
+        <strong>Frameworks and training</strong>
+        <p>
+          PyTorch and JAX connect directly to cuDNN. JAX and Megatron Core also
+          connect through Transformer Engine.
+        </p>
+      </div>
+      <a href="/samples">
+        Browse samples
+      </a>
+    </div>
+    <div data-cudnn-detail="inference" hidden>
+      <div>
+        <strong>LLM inference</strong>
+        <p>
+          Explore the vLLM and SGLang paths through FlashInfer to the cuDNN
+          attention backend.
+        </p>
+      </div>
+      <a href="/operations/Attention">
+        Attention API
+      </a>
+    </div>
+    <div data-cudnn-detail="pytorch" hidden>
+      <div>
+        <strong>PyTorch → cuDNN</strong>
+        <p>
+          Use cuDNN-backed operations through PyTorch, or integrate the frontend
+          directly with your tensors.
+        </p>
+      </div>
+      <a href="/samples">
+        Python samples
+      </a>
+    </div>
+    <div data-cudnn-detail="jax" hidden>
+      <div>
+        <strong>JAX / XLA → cuDNN</strong>
+        <p>
+          JAX has a direct cuDNN attention path and a path through Transformer
+          Engine.
+        </p>
+      </div>
+      <a href="https://docs.jax.dev/en/latest/_autosummary/jax.nn.dot_product_attention.html">
+        JAX attention API
+      </a>
+    </div>
+    <div data-cudnn-detail="megatron" hidden>
+      <div>
+        <strong>Megatron Core → Transformer Engine → cuDNN</strong>
+        <p>
+          Transformer Engine connects Megatron training workloads to cuDNN
+          attention kernels.
+        </p>
+      </div>
+      <a href="https://docs.nvidia.com/megatron-core/developer-guide/latest/index.html">
+        Megatron Core docs
+      </a>
+    </div>
+    <div data-cudnn-detail="te" hidden>
+      <div>
+        <strong>Transformer Engine → cuDNN</strong>
+        <p>Explore fused attention support for PyTorch and JAX workloads.</p>
+      </div>
+      <a href="https://docs.nvidia.com/deeplearning/transformer-engine/examples/attention/attention.html">
+        Transformer Engine docs
+      </a>
+    </div>
+    <div data-cudnn-detail="vllm" hidden>
+      <div>
+        <strong>vLLM → FlashInfer → cuDNN</strong>
+        <p>
+          Use cuDNN through the FlashInfer integration. Execution depends on the
+          selected backend and supported workload.
+        </p>
+      </div>
+      <a href="https://docs.flashinfer.ai/generated/flashinfer.prefill.cudnn_batch_prefill_with_kv_cache.html">
+        FlashInfer cuDNN API
+      </a>
+    </div>
+    <div data-cudnn-detail="sglang" hidden>
+      <div>
+        <strong>SGLang → FlashInfer → cuDNN</strong>
+        <p>
+          Use cuDNN through the FlashInfer integration. Execution depends on the
+          selected backend and supported workload.
+        </p>
+      </div>
+      <a href="https://docs.flashinfer.ai/generated/flashinfer.prefill.cudnn_batch_prefill_with_kv_cache.html">
+        FlashInfer cuDNN API
+      </a>
+    </div>
+    <div data-cudnn-detail="flashinfer" hidden>
+      <div>
+        <strong>FlashInfer → cuDNN</strong>
+        <p>
+          FlashInfer exposes batched prefill attention with paged KV cache
+          backed by cuDNN SDPA.
+        </p>
+      </div>
+      <a href="https://docs.flashinfer.ai/generated/flashinfer.prefill.cudnn_batch_prefill_with_kv_cache.html">
+        Explore the API
+      </a>
+    </div>
+    <div data-cudnn-detail="direct" hidden>
+      <div>
+        <strong>Your application → cuDNN</strong>
+        <p>
+          Use the Python or C++ graph API for custom applications, research, and
+          benchmarks.
+        </p>
+      </div>
+      <a href="/quickstart">
+        Start building
+      </a>
+    </div>
+    <div data-cudnn-detail="rtx" hidden>
+      <div>
+        <strong>TensorRT for RTX → cuDNN</strong>
+        <p>
+          Explore cuDNN within the RTX inference stack. Check the TensorRT for
+          RTX documentation for supported computations.
+        </p>
+      </div>
+      <a href="https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/index.html">
+        TensorRT for RTX docs
+      </a>
+    </div>
+    <div data-cudnn-detail="tokamax" hidden>
+      <div>
+        <strong>Tokamax → JAX → cuDNN</strong>
+        <p>
+          Tokamax can select the cuDNN implementation of dot-product attention
+          through JAX.
+        </p>
+      </div>
+      <a href="https://github.com/openxla/tokamax">
+        Tokamax
+      </a>
+    </div>
+  </div>
+  <noscript>
+    Selecting paths requires JavaScript. Use the{" "}
+    <a href="/developer/overview">developer guide</a> to explore the APIs.
+  </noscript>
+</IntegrationMap>
 
-The [NVIDIA cuDNN frontend API](/developer/overview) provides a simplified programming model that is sufficient for most use cases.
+## Get started
 
-Use the [NVIDIA cuDNN backend API](https://docs.nvidia.com/deeplearning/cudnn/backend/latest/api/overview.html#api-overview) only if you want to use the legacy fixed-function routines that are not graph-based interfaces and are not exposed by the frontend API layers, or if you need a C-only interface.
+Set up a compatible NVIDIA GPU, CUDA, and cuDNN backend before using the frontend. Check the [supported products](/reference/support-matrix) and [installation guide](/installation/frontend) for your environment.
+
+<Tabs>
+  <Tab title="Python">
+    Install the Python frontend:
+
+    ```bash
+    pip install nvidia-cudnn-frontend
+    ```
+
+    Check that Python can load the cuDNN backend:
+
+    ```python
+    import cudnn
+
+    print(cudnn.backend_version())
+    ```
+
+    Follow the [Python installation guide](/installation/frontend/python-frontend-install), then [build and execute your first graph](/quickstart).
+
+  </Tab>
+  <Tab title="C++">
+    Set up the headers and libraries with the [C++ installation guide](/installation/frontend/cpp-frontend-install). Include the frontend and create an empty graph:
+
+    ```cpp
+    #include <cudnn_frontend.h>
+
+    auto graph = cudnn_frontend::graph::Graph();
+    ```
+
+    Follow the [quick start](/quickstart) for a complete example that defines tensors, adds an operation, builds an execution plan, and runs the graph.
+
+  </Tab>
+</Tabs>
+
+For most applications, start with the frontend APIs. Use the [cuDNN backend API](https://docs.nvidia.com/deeplearning/cudnn/backend/latest/api/overview.html#api-overview) if you need a C-only interface or legacy fixed-function routines that the frontend does not expose.
+
+## Operations
+
+cuDNN supports individual operations and flexible fusion patterns. Describe a computation as an [operation graph](/developer/graph-api) so cuDNN can select an execution plan for your GPU.
+
+<CardGroup cols={2}>
+  <Card title="Attention" href="/operations/Attention">
+    Scaled dot-product attention for transformer training and inference.
+  </Card>
+  <Card title="Matrix multiplication" href="/operations/Matmul">
+    Matrix products and supported fusion patterns.
+  </Card>
+  <Card title="Convolution" href="/operations/Convolutions">
+    Convolution and cross-correlation for vision and other workloads.
+  </Card>
+  <Card title="Normalization" href="/operations/Normalizations">
+    Batch, layer, instance, and RMS normalization.
+  </Card>
+  <Card title="Mixture of experts" href="/operations/MoeGroupedMatmul">
+    Grouped matrix multiplication for expert workloads.
+  </Card>
+  <Card title="Pointwise and reduction" href="/operations/Pointwise">
+    Arithmetic, activations, comparisons, and reductions.
+  </Card>
+</CardGroup>
+
+cuDNN also supports softmax and [pooling](/operations/Resampling).
+
+<CardGroup cols={3}>
+  <Card title="Quick start" icon="rocket" href="/quickstart">
+    Build and run your first computation graph in Python or C++.
+  </Card>
+  <Card title="Samples" icon="code" href="/samples">
+    Explore examples for attention, matrix multiplication, and more.
+  </Card>
+  <Card
+    title="Open-source kernels"
+    icon="microchip"
+    href="/fe-oss-apis/overview"
+  >
+    Explore specialized attention, GEMM fusions, and normalization kernels.
+  </Card>
+</CardGroup>
+
+## Contribute and get help
+
+The cuDNN frontend is open source. [Explore the code](https://github.com/NVIDIA/cudnn-frontend), [contribute](https://github.com/NVIDIA/cudnn-frontend/blob/develop/CONTRIBUTING.md), or [report an issue](https://github.com/NVIDIA/cudnn-frontend/issues). See the [release notes](https://github.com/NVIDIA/cudnn-frontend/releases) for updates and [support resources](/reference/support) for help.
+
+export function IntegrationMap({ children }) {
+  const related = {
+    jax: ["jax", "te"],
+    megatron: ["megatron", "te"],
+    vllm: ["vllm", "flashinfer"],
+    sglang: ["sglang", "flashinfer"],
+    tokamax: ["tokamax", "jax"],
+  };
+
+  function selectPath(event) {
+    if (!(event.target instanceof Element)) return;
+    const control = event.target.closest(
+      "button[data-cudnn-filter], button[data-cudnn-route]",
+    );
+    if (!control) return;
+    const root = event.currentTarget;
+    const filter = control.dataset.cudnnFilter || "all";
+    const route = control.dataset.cudnnRoute;
+    const selected =
+      route && control.getAttribute("aria-pressed") !== "true" ? route : null;
+    const active = selected ? related[selected] || [selected] : [];
+
+    root.querySelectorAll("[data-cudnn-filter]").forEach((button) => {
+      button.setAttribute(
+        "aria-pressed",
+        String(button.dataset.cudnnFilter === filter),
+      );
+    });
+    root.querySelectorAll("[data-cudnn-route]").forEach((button) => {
+      button.setAttribute(
+        "aria-pressed",
+        String(button.dataset.cudnnRoute === selected),
+      );
+      button.toggleAttribute(
+        "data-cudnn-active",
+        active.includes(button.dataset.cudnnRoute),
+      );
+    });
+    root.querySelectorAll("[data-cudnn-lane]").forEach((lane) => {
+      lane.classList.toggle(
+        "cudnn-muted-lane",
+        filter !== "all" && lane.dataset.cudnnLane !== filter,
+      );
+      lane.toggleAttribute(
+        "data-cudnn-highlight",
+        lane.dataset.cudnnLane === filter ||
+          Boolean(lane.querySelector("[data-cudnn-active]")),
+      );
+    });
+    root.querySelectorAll("[data-cudnn-detail]").forEach((panel) => {
+      panel.hidden = panel.dataset.cudnnDetail !== (selected || filter);
+    });
+  }
+
+  const styles = `#cudnn-integrations {
+--cn-bg: var(--background, #fff);
+--cn-surface: var(--grayscale-2, #f8f8f8);
+--cn-ink: var(--grayscale-12, #202020);
+--cn-muted: var(--grayscale-11, #606060);
+--cn-line: var(--grayscale-a6, #ddd);
+--cn-wire: var(--grayscale-a8, #aaa);
+--cn-green: var(--accent-track, #76b900);
+--cn-green-ink: var(--accent-12, #304b00);
+--cn-tint: var(--accent-a3, #eef8df);
+container: cudnn-map / inline-size;
+color: var(--cn-ink);
+font: inherit;
+line-height: 1.5;
+}
+#cudnn-integrations \* { box-sizing: border-box; }
+#cudnn-integrations :where(p, strong, small) { margin: 0; padding: 0; }
+#cudnn-integrations button { font-family: inherit; color: inherit; cursor: pointer; }
+#cudnn-integrations :where(button, a):focus-visible { outline: 2px solid var(--cn-green); outline-offset: 3px; }
+#cudnn-integrations [hidden] { display: none !important; }
+#cudnn-integrations { border: 1px solid var(--cn-line); border-radius: 7px; margin-top: 26px; overflow: hidden; }
+#cudnn-integrations .cudnn-map-toolbar { background: var(--cn-bg); border-bottom: 1px solid var(--cn-line); padding: 12px 22px; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+#cudnn-integrations .cudnn-map-label, #cudnn-integrations .cudnn-lane-label { font-size: 11px; letter-spacing: 1.2px; color: var(--cn-muted); font-weight: 600; }
+#cudnn-integrations .cudnn-filters { display: flex; gap: 3px; }
+#cudnn-integrations .cudnn-filters button { background: transparent; border: 0; border-radius: 4px; padding: 6px 11px; font-size: 11px; white-space: nowrap; }
+#cudnn-integrations .cudnn-filters button:hover { background: var(--cn-surface); }
+#cudnn-integrations .cudnn-filters button[aria-pressed="true"] { background: var(--cn-tint); color: var(--cn-green-ink); font-weight: 600; }
+#cudnn-integrations .cudnn-map { display: grid; grid-template-columns: 1.62fr 1fr .92fr; gap: 0 24px; padding: 26px 24px 0; background: var(--cn-surface); }
+#cudnn-integrations .cudnn-lane { min-width: 0; position: relative; display: flex; flex-direction: column; }
+#cudnn-integrations .cudnn-lane[data-cudnn-highlight] { --cn-wire: var(--cn-green); }
+#cudnn-integrations .cudnn-lane.cudnn-muted-lane .cudnn-node { background: var(--cn-surface); }
+#cudnn-integrations .cudnn-lane:not(.cudnn-muted-lane) .cudnn-lane-label { color: var(--cn-green-ink); }
+#cudnn-integrations .cudnn-lane-label { text-align: center; margin-bottom: 17px; font-size: 11px; }
+#cudnn-integrations .cudnn-training-grid, #cudnn-integrations .cudnn-inference-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; }
+#cudnn-integrations .cudnn-inference-grid { grid-template-columns: repeat(2,1fr); }
+#cudnn-integrations .cudnn-node { position: relative; min-width: 0; display: flex; align-items: center; justify-content: center; gap: 5px; font-size: 12px; font-weight: 500; padding: 12px 5px; line-height: 1.3; background: var(--cn-bg); border: 1px solid var(--cn-line); border-radius: 4px; min-height: 45px; transition: border-color 140ms, box-shadow 140ms; }
+#cudnn-integrations .cudnn-node:hover, #cudnn-integrations .cudnn-node[aria-pressed="true"] { border-color: var(--cn-green); box-shadow: 0 0 0 2px var(--cn-tint); }
+#cudnn-integrations .cudnn-node-mark { font-size: 13px; color: var(--cn-green-ink); font-weight: 700; }
+#cudnn-integrations .cudnn-training-bridges { display: grid; grid-template-columns: 1fr 2fr; height: 79px; }
+#cudnn-integrations .cudnn-direct-line { width: 1px; height: 121px; background: var(--cn-wire); justify-self: center; }
+#cudnn-integrations .cudnn-te-bridge, #cudnn-integrations .cudnn-flashinfer-bridge { position: relative; padding-top: 26px; }
+#cudnn-integrations .cudnn-te-bridge::after, #cudnn-integrations .cudnn-flashinfer-bridge::after { content: ''; position: absolute; width: 1px; top: 65px; height: 29px; left: 50%; background: var(--cn-wire); }
+#cudnn-integrations .cudnn-training .cudnn-lane-stem { margin-left: 66.6667%; }
+#cudnn-integrations .cudnn-branch-lines { position: absolute; left: 24%; right: 24%; top: 0; height: 13px; border: 1px solid var(--cn-wire); border-top: 0; border-radius: 0 0 3px 3px; }
+#cudnn-integrations .cudnn-branch-lines::after { content: ''; position: absolute; left: 50%; top: 12px; height: 13px; width: 1px; background: var(--cn-wire); }
+#cudnn-integrations .cudnn-bridge-node { min-height: 39px; padding: 9px 5px; width: 100%; font-size: 12px; }
+#cudnn-integrations .cudnn-bridge-node > span:last-child { color: var(--cn-green-ink); margin-left: auto; margin-right: 5px; }
+#cudnn-integrations .cudnn-te-bridge .cudnn-bridge-node { padding-left: 10px; }
+#cudnn-integrations .cudnn-flashinfer-bridge { height: 79px; }
+#cudnn-integrations .cudnn-flashinfer-bridge .cudnn-node { width: 81%; margin-inline: auto; padding-left: 14px; }
+#cudnn-integrations .cudnn-flash { color: var(--cn-green-ink); font-size: 21px; line-height: .6; }
+#cudnn-integrations .cudnn-lane-note { position: relative; z-index: 1; background: var(--cn-surface); font-size: 11px; color: var(--cn-muted); text-align: center; line-height: 1.4; margin-top: 3px; min-height: 12px; }
+#cudnn-integrations .cudnn-lane-stem { width: 1px; min-height: 27px; flex: 1; background: var(--cn-wire); margin-inline: auto; position: relative; }
+#cudnn-integrations .cudnn-lane-stem::after { content: ''; position: absolute; bottom: 0; left: -3px; width: 7px; height: 7px; border-bottom: 1px solid var(--cn-wire); border-right: 1px solid var(--cn-wire); transform: rotate(45deg); }
+#cudnn-integrations .cudnn-custom-node { height: 124px; width: 100%; flex-direction: column; gap: 6px; }
+#cudnn-integrations .cudnn-code-mark { color: var(--cn-green-ink); font: 19px monospace; margin-bottom: 4px; }
+#cudnn-integrations .cudnn-custom-node strong { font-weight: 500; font-size: 12px; }
+#cudnn-integrations .cudnn-custom-node small { font-size: 11px; color: var(--cn-muted); }
+#cudnn-integrations .cudnn-foundation { grid-column: 1/-1; background: var(--cn-tint); border: 1px solid var(--cn-green); border-radius: 4px; padding: 15px 20px; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+#cudnn-integrations .cudnn-foundation > div:first-child { display: flex; align-items: center; gap: 16px; }
+#cudnn-integrations .cudnn-foundation-brand { font-size: 23px; font-weight: 700; letter-spacing: -.8px; }
+#cudnn-integrations .cudnn-foundation-description { font-size: 12px; color: var(--cn-green-ink); }
+#cudnn-integrations .cudnn-foundation-ops { display: flex; gap: 7px; }
+#cudnn-integrations .cudnn-foundation-ops span { font: 11px monospace; background: var(--cn-bg); color: var(--cn-green-ink); border: 1px solid var(--cn-line); border-radius: 3px; padding: 4px 8px; }
+#cudnn-integrations .cudnn-more-integrations { grid-column: 1/-1; padding: 15px 0; display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
+#cudnn-integrations .cudnn-more-integrations > span { color: var(--cn-muted); font-size: 11px; letter-spacing: 1px; }
+#cudnn-integrations .cudnn-more-integrations button { border: 0; background: transparent; padding: 3px 0; font-size: 12px; }
+#cudnn-integrations .cudnn-more-integrations button:hover, #cudnn-integrations .cudnn-more-integrations button[aria-pressed="true"] { color: var(--cn-green-ink); text-decoration: underline; text-underline-offset: 3px; }
+#cudnn-integrations .cudnn-more-integrations button > span { margin-left: 8px; color: var(--cn-muted); }
+
+#cudnn-integrations .cudnn-node[data-cudnn-active] { background: var(--cn-tint); border-color: var(--cn-green); }
+#cudnn-integrations .cudnn-route-detail { border-top: 1px solid var(--cn-line); background: var(--cn-bg); padding: 18px 22px; min-height: 120px; }
+#cudnn-integrations [data-cudnn-detail] { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
+#cudnn-integrations [data-cudnn-detail] > div { flex: 1; }
+#cudnn-integrations [data-cudnn-detail] strong { font-size: 14px; font-weight: 600; }
+#cudnn-integrations [data-cudnn-detail] p { font-size: 13px; color: var(--cn-muted); margin-top: 6px; }
+#cudnn-integrations [data-cudnn-detail] a { font-size: 13px; color: var(--cn-green-ink); flex-shrink: 0; text-decoration: none; }
+#cudnn-integrations [data-cudnn-detail] a:hover { text-decoration: underline; }
+#cudnn-integrations noscript { display: block; padding: 16px; }
+@container cudnn-map (max-width: 720px) {
+#cudnn-integrations .cudnn-map { grid-template-columns: 1.5fr 1fr; gap: 0 20px; }
+#cudnn-integrations .cudnn-direct { grid-column: 1/-1; padding: 20px 0; }
+#cudnn-integrations .cudnn-custom-node { height: auto; min-height: 54px; flex-direction: row; gap: 10px; }
+#cudnn-integrations .cudnn-direct .cudnn-lane-stem { display: none; }
+#cudnn-integrations .cudnn-foundation { flex-wrap: wrap; }
+#cudnn-integrations [data-cudnn-detail] { flex-direction: column; align-items: flex-start; gap: 10px; }
+}
+@container cudnn-map (max-width: 500px) {
+#cudnn-integrations .cudnn-map-toolbar { flex-direction: column; align-items: stretch; padding: 16px; }
+#cudnn-integrations .cudnn-filters { flex-wrap: wrap; }
+#cudnn-integrations .cudnn-filters button { flex: 1; padding: 8px 6px; }
+#cudnn-integrations .cudnn-map { padding: 20px 16px 0; grid-template-columns: 1fr; gap: 18px; }
+#cudnn-integrations .cudnn-lane-label { text-align: left; }
+#cudnn-integrations .cudnn-direct { padding: 0; }
+#cudnn-integrations .cudnn-custom-node { flex-wrap: wrap; }
+#cudnn-integrations .cudnn-foundation { padding: 15px; }
+#cudnn-integrations .cudnn-foundation > div:first-child { flex-direction: column; align-items: flex-start; gap: 2px; }
+#cudnn-integrations .cudnn-foundation-ops { flex-wrap: wrap; }
+#cudnn-integrations .cudnn-more-integrations { gap: 10px 20px; }
+#cudnn-integrations .cudnn-more-integrations > span { width: 100%; }
+#cudnn-integrations .cudnn-route-detail { padding: 16px; }
+}
+@media (prefers-reduced-motion: reduce) { #cudnn-integrations \* { transition: none !important; } }
+@media (pointer: coarse) { #cudnn-integrations :where(button, a) { min-height: 44px; } }
+`;
+
+  return (
+    <div
+      id="cudnn-integrations"
+      className="cudnn-ecosystem"
+      role="group"
+      aria-label="cuDNN integration paths"
+      onClick={selectPath}
+    >
+      <style>{styles}</style>
+      {children}
+    </div>
+  );
+}

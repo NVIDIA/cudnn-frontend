@@ -402,6 +402,8 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         scale_softmax: Float32,
         tile_count: Int32,
         pipelines,
+        token_idx: Int32,
+        head_block_idx: Int32,
     ):
         """Stream each M64 score/dP result through one physical M64 slot."""
         (
@@ -417,7 +419,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         tdQtdQ0, tdQtdQ1, tdQtdQ2, tdQtdQ3, tdQtdQ4 = tdQtdQ
 
         tidx, _, _ = cute.arch.thread_idx()
-        token_idx, head_block_idx, batch_idx = cute.arch.block_idx()
+        _, _, batch_idx = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         mma_compute_S_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.mma_compute_S_stage)
         mma_compute_dP_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.mma_compute_dP_stage)
@@ -748,6 +750,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         tile_count: Int32,
         topk: Int32,
         mma_reduce_dKV_pipeline,
+        token_idx: Int32,
     ):
         """Consume three reducer generations for each M64 tile."""
         tdKVtdKV0, tdKVtdKV1, tdKVtdKV2, tdKVtdKV3, tdKVtdKV4 = tdKVtdKV
@@ -758,7 +761,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         tdKVtdKV4 = tdKVtdKV4[(None, None), 0, 0]
 
         tidx, _, _ = cute.arch.thread_idx()
-        token_idx, _, batch_idx = cute.arch.block_idx()
+        _, _, batch_idx = cute.arch.block_idx()
         tidx_in_wg = tidx - self.reduce_warp_id[0] * self.threads_per_warp
         dp_idx = tidx_in_wg % 128
         wg_idx = tidx_in_wg // (4 * self.threads_per_warp)

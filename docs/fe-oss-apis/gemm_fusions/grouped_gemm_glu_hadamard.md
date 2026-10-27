@@ -4,7 +4,7 @@
 
 ## JAX support
 
-JAX arrays are **not supported**: this fusion is block-scaled-only and its mandatory scale-factor inputs use an MMA-interleaved layout with no row-major (JAX) equivalent. JAX inputs raise a clear `ValueError` at the entry points. The API is otherwise type-erased and torch-lazy.
+**Canonical FP4 (dense weights):** the `jax.jit`-compatible entry point `cudnn.grouped_gemm_glu_hadamard_jax_forward` takes packed FP4 A `(m, k/2)` and B `(experts, n, k/2)` as `uint8` with two values per byte, already MMA-packed `sfa_tensor`/`sfb_tensor` bytes (physical or flat; E4M3 with `sf_vec_size=16` for NVFP4, or E8M0), int32 `padded_offsets`, fp32 alpha and prob `(m,)` fp32/bf16. It returns a `TupleDict` with the eager wrapper's keys: the pre-activation C `(m, n)`, D `(m, n/2)` (or `(m, n)` for `act_func="srelu"`) in a BF16/FP16 `d_dtype`, and the per-expert amax and post-Hadamard amax `(experts, 1)`. Rows at or past `padded_offsets[-1]` are unspecified. `grouped_gemm_glu_hadamard_wrapper_sm100` dispatches JAX inputs with a dense `b_tensor` to it. SM100+, as in Torch, with the default 256x256 tile. Bias, dynamic scheduling, discrete (`b_ptrs`) weights and the class API raise `ValueError` for JAX.
 
 ## Overview
 
@@ -38,6 +38,15 @@ This kernel performs:
   - `PostRhtAmax`: per-expert amax after the normalized Hadamard transform, shape `(L, 1)` when `D` is fp16/bf16
 
 `L` is the expert count and `valid_m = padded_offsets[-1]`.
+
+### Canonical layouts
+
+The wrapper and API class also accept contiguous `A` `(valid_m, K)`, dense `B`
+`(L, N, K)`, and `prob` `(valid_m,)` with `torch.float4_e2m1fn_x2` operands. Scale
+buffers may be contiguous tensors of any rank, provided their bytes are already
+packed in the required MMA-tiled physical order. With 2-D `A`, the wrapper returns
+`C` `(valid_m, N)` and a 2-D `D`. Legacy layouts are unchanged. The wrapper
+advertises `supports_canonical_layouts`.
 
 ### Equations
 

@@ -52,6 +52,17 @@ def fmax_f32(a, b, *, loc=None, ip=None):
     return Float32(result)
 
 
+@cute.jit
+def _row_tile(m: cute.Tensor, row: Int32, n: cutlass.Constexpr):
+    """Row ``row`` of a compact row-major ``(M, n)`` tensor as a ``(1, n)`` tile (``m``'s own strides are not read).
+
+    The element offset ``row * n`` is formed in 64 bits: ``M * n`` may exceed 2^31. ``n`` is a multiple of the
+    8-element (128-bit) copy vector, so the row start keeps the base pointer's 16-byte alignment.
+    """
+    offset = cute.assume(cutlass.Int64(row) * n, divby=8)
+    return cute.make_tensor(m.iterator + offset, cute.make_ordered_layout((1, n), order=(1, 0)))
+
+
 class RMSNormRHTAmaxKernel:
     """Fused RMSNorm + block-diagonal Hadamard + running per-CTA amax."""
 
@@ -80,10 +91,7 @@ class RMSNormRHTAmaxKernel:
         self.tv_stride = ((self.vec_size, 1), (1, self.vec_size * num_threads))
         self.tiler_mn = (1, n)
 
-        tile_bytes = n * 2
-        reduce_bytes = self.warps_per_row * 4
-        amax_bytes = self.warps_per_row * 4
-        self.smem_bytes = tile_bytes + reduce_bytes + amax_bytes + 128
+        self.smem_bytes = self.smem_bytes_for(n, num_threads)
 
         self.intra_butterfly_pairs = []
         for stage in range(self.num_intra_stages):
@@ -94,6 +102,15 @@ class RMSNormRHTAmaxKernel:
                 j_idx = i_idx + delta
                 pairs.append((i_idx, j_idx))
             self.intra_butterfly_pairs.append(pairs)
+
+    @staticmethod
+    def smem_bytes_for(n, num_threads):
+        """Dynamic shared memory of one CTA: the bf16 row tile, two per-row reduction slots per warp, the amax slots."""
+        warps_per_row = num_threads // 32
+        tile_bytes = n * 2
+        reduce_bytes = 2 * warps_per_row * 4
+        amax_bytes = warps_per_row * 4
+        return tile_bytes + reduce_bytes + amax_bytes + 128
 
     @cute.kernel
     def kernel(self, m_x: cute.Tensor, m_w: cute.Tensor, m_o: cute.Tensor, m_amax: cute.Tensor, eps: Float32, tv_layout: cute.Layout, tiler_mn: cute.Shape):
@@ -108,7 +125,9 @@ class RMSNormRHTAmaxKernel:
             cute.make_ordered_layout(tiler_mn, order=(1, 0)),
             byte_alignment=16,
         )
-        reduction_buffer = smem.allocate_tensor(Float32, cute.make_layout((1, cfg.warps_per_row)), byte_alignment=4)
+        # Per-row warp partial sums, double-buffered by row parity. Row r + 2 reuses row r's slots; every warp has read
+        # row r's slots before it reaches row r + 1's barrier, and no warp writes row r + 2's sums before that barrier.
+        reduction_buffer = smem.allocate_tensor(Float32, cute.make_ordered_layout((2, cfg.warps_per_row), order=(1, 0)), byte_alignment=4)
         amax_buffer = smem.allocate_tensor(Float32, cute.make_layout((1, cfg.warps_per_row)), byte_alignment=4)
 
         copy_atom_g2s = cute.make_copy_atom(cute.nvgpu.cpasync.CopyG2SOp(), cutlass.BFloat16, num_bits_per_copy=cfg.COPY_BITS)
@@ -134,7 +153,7 @@ class RMSNormRHTAmaxKernel:
         t_xr_w = thr_load.retile(t_wr_w)
 
         row_base = bid * cfg.rows_per_cta
-        g_x_first = cute.local_tile(m_x, tiler_mn, (row_base, 0))
+        g_x_first = _row_tile(m_x, row_base, cfg.n)
         t_xg_x_first = thr_load.partition_S(g_x_first)
         t_xr_x = cute.make_fragment_like(t_xg_x_first)
 
@@ -151,7 +170,7 @@ class RMSNormRHTAmaxKernel:
             cute.autovec_copy(t_xs_x, t_xr_x)
 
             if row_idx < cfg.rows_per_cta - 1:
-                g_x_next = cute.local_tile(m_x, tiler_mn, (row_base + (row_idx + 1), 0))
+                g_x_next = _row_tile(m_x, row_base + (row_idx + 1), cfg.n)
                 t_xg_x_next = thr_load.partition_S(g_x_next)
                 cute.copy(copy_atom_g2s, t_xg_x_next, t_xs_x)
                 cute.arch.cp_async_commit_group()
@@ -161,12 +180,12 @@ class RMSNormRHTAmaxKernel:
             local_sum = x_sq.reduce(cute.ReductionOp.ADD, init_val=Float32(0.0), reduction_profile=0)
             warp_sum = cute.arch.warp_reduction(local_sum, operator.add)
             if lane_id == 0:
-                reduction_buffer[0, warp_id] = warp_sum
+                reduction_buffer[row_idx % 2, warp_id] = warp_sum
             cute.arch.barrier()
 
             block_val = Float32(0.0)
             if lane_id < cfg.warps_per_row:
-                block_val = reduction_buffer[0, lane_id]
+                block_val = reduction_buffer[row_idx % 2, lane_id]
             sum_sq = cute.arch.warp_reduction(block_val, operator.add)
 
             mean_sq = sum_sq / cfg.n
@@ -205,7 +224,7 @@ class RMSNormRHTAmaxKernel:
                 running_max = fmax_f32(running_max, abs_val)
                 t_xr_x[elem_idx] = scaled.to(cutlass.BFloat16)
 
-            g_o_r = cute.local_tile(m_o, tiler_mn, (row_base + row_idx, 0))
+            g_o_r = _row_tile(m_o, row_base + row_idx, cfg.n)
             t_xg_o_r = thr_store.partition_D(g_o_r)
             cute.copy(copy_atom_store, t_xr_x, t_xg_o_r)
 

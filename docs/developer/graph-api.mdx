@@ -361,8 +361,8 @@ There are three operation nodes that represent different types of convolutions n
 |  | Input Tensor Attribute Name | Output Tensor Attribute Name |
 | --- | --- | --- |
 | `ConvolutionFwd` | `CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_X`, `CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_W` | `CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_Y` |
-| `ConvolutionBwdFilter` | `CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX`, `CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY` | `CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_W` |
-| `ConvolutionBwdData` | `CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_DW`, `CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_DY` | `CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_X` |
+| `ConvolutionBwdFilter` | `CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_X`, `CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_DY` | `CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_DW` |
+| `ConvolutionBwdData` | `CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_W`, `CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY` | `CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX` |
 
 The FP8 data type since NVIDIA Ada Lovelace architecture has two variants: `CUDNN_DATA_FP8_E4M3` and `CUDNN_DATA_FP8_E5M2` as I/O data types. Using them as inputs to the operation will result in FP8 Tensor Cores being used. The precision of the accumulation inside the FP8 Tensor Cores is controlled by the compute type, which may have one of two possible values: `CUDNN_DATA_FLOAT` and `CUDNN_DATA_FAST_FLOAT_FOR_FP8`.
 

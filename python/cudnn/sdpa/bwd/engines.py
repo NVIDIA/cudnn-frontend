@@ -40,9 +40,14 @@ _SM107_FP8 = "SdpaBwdDslSm107Fp8"
 _SM107_MXFP8 = "SdpaBwdDslSm107Mxfp8"
 _SM100_D256 = "SdpaBwdDslSm100D256"
 _SM107_D512 = "SdpaBwdDslSm107D512"
+_SM100_D128 = "SdpaBwdDslSm100D128"
 
 
 def _adapter(name: str):
+    if name == _SM100_D128:
+        from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
+
+        return SdpaBwdDslSm100D128
     if name == _SM100_MXFP8:
         # Its own module: the MXFP8 lowering's imports stay out of the
         # half-precision adapters' way.
@@ -257,8 +262,19 @@ class Capabilities:
     # THD ports may be head-interleaved (head stride >= D, a multiple of 8
     # elements); rows without it require head stride == D.
     thd_head_stride: bool = False
-    # attn_scale = 0, claimed by rows qualified on GPU at zero scale, masked and unmasked (#1435). Appended last.
+    # attn_scale = 0, claimed by rows qualified on GPU at zero scale, masked and unmasked (#1435).
     zero_scale: bool = False
+    # THD caller buffers are addressed at the bound ragged offsets (per-port
+    # token origins, whole tokens by precondition), not at prefix(lengths).
+    # Appended last: Capabilities is positional-append-only.
+    thd_ragged_offsets: bool = False
+    # A stricter subset of BSHD-physical: no padding between rows, heads or
+    # batches. The single-launch d128 body reconstructs compact tensor maps.
+    compact_bshd: bool = False
+    # Declaration-only constraints shared by a row's implementation variants.
+    # Appended for positional compatibility; no graph parsing, kernel imports,
+    # allocation or compilation. The row supplies the verdict from pure facts.
+    declaration_check: Optional[Callable[["ga.SdpaGraphFacts", Any], Optional[str]]] = None
 
 
 def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: Any = None) -> Optional[str]:
@@ -346,6 +362,18 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
     elif not facts.bshd_layout:
         ports = "Q/K/V/O/dO/dQ/dK/dV" + ("/q_T/k_T/dO_T/dO_f16" if facts.is_mxfp8 else "")
         return f"{ports} must be BSHD-physical (stride order 3,1,2,0)"
+    if capabilities.compact_bshd:
+        for name, dim, stride in facts.port_layouts:
+            b, h, s, d = (int(n) for n in dim)
+            expected = (s * h * d, d, h * d, 1)
+            if facts.thd:
+                # Ragged offsets own sequence origins, so batch pitch is not
+                # addressed. Token pitch still matters for S_max == 1.
+                compact = int(stride[2]) == h * d and (h == 1 or int(stride[1]) == d) and int(stride[3]) == 1
+            else:
+                compact = not any(int(n) != 1 and int(st) != want for n, st, want in zip(dim, stride, expected))
+            if not compact:
+                return f"{name} must use compact BSHD storage; got stride {tuple(stride)}"
 
     for fact, cap, label in (
         # Row-neutral reason: the sm120 / sm80 rows accumulate dQ through fp32 atomics, but the sm107 chains have no atomics at
@@ -424,6 +452,11 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         # dense one. Dense-only on every THD row.
         if facts.has_bias or facts.has_dbias:
             return "bias / dBias is dense-only under THD (a packed graph has no [B, H, S_q, S_kv] bias)"
+
+    if capabilities.declaration_check is not None:
+        reason = capabilities.declaration_check(facts, version)
+        if reason is not None:
+            return reason
 
     if facts.has_dsink and not facts.has_sink:
         return "dSink_token output requires a sink_token input"
@@ -665,6 +698,27 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
     dbias_geom = (tuple(facts.dbias_t.get_dim()), tuple(facts.dbias_t.get_stride())) if facts.has_dbias else None
 
     adapter_cls = _adapter(api_type)
+    # Bound ragged offsets, read on device by rows that declare it: per port,
+    # the IR tensor's offset tensor, dtype and multiplier.
+    _ragged = {}
+    if thd and spec.capabilities.thd_ragged_offsets:
+        _ro_dtypes = {cudnn.data_type.INT32: torch.int32, cudnn.data_type.INT64: torch.int64}
+        for port, t in (
+            ("q", facts.q_t),
+            ("k", facts.k_t),
+            ("v", facts.v_t),
+            ("o", facts.o_t),
+            ("do", facts.do_t),
+            ("dq", facts.dq_t),
+            ("dk", facts.dk_t),
+            ("dv", facts.dv_t),
+            ("stats", facts.stats_t),
+        ):
+            ro = getattr(t, "ragged_offset", None) if t is not None else None
+            if ro is not None:
+                if ro.get_data_type() not in _ro_dtypes:
+                    raise NotImplementedError(f"{port} ragged offset must be INT32 or INT64; got {ro.get_data_type()}")
+                _ragged[port] = (ro, _ro_dtypes[ro.get_data_type()], int(getattr(t, "ragged_offset_multiplier", 1) or 1))
     # SM80-only plan-time facts, forwarded only to adapters declaring them.
     _extra_ctor = {
         # THD / ragged (base-ctor parameters, so every adapter declares them;
@@ -674,6 +728,7 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         "bias_is_fp32": (facts.bias_t.get_data_type() == cudnn.data_type.FLOAT) if facts.bias_t is not None else True,
         "bias_batch": int(facts.bias_t.get_dim()[0]) if facts.bias_t is not None else 1,
         "has_rope": False,  # RoPE-fused multi-node graphs never reach the analyzer
+        "thd_ragged_offsets": {port: (dtype, mult) for port, (_, dtype, mult) in _ragged.items()},
     }
     _extra_ctor = {k: v for k, v in _extra_ctor.items() if k in inspect.signature(adapter_cls.__init__).parameters}
     api = adapter_cls(
@@ -727,6 +782,7 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         dsink=facts.dsink_t if facts.has_dsink else None,
         bias=facts.bias_t if facts.has_bias else None,
         dbias=facts.dbias_t if facts.has_dbias else None,
+        **{"ragged_" + port: ro for port, (ro, _, _) in _ragged.items()},
     )
 
     # Every adapter that records a prepared spec is launched through it (SM120, SM100, SM80 native, SM107); the
@@ -838,6 +894,7 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
             # engine plan passes ctx.stream); None keeps the adapter's
             # torch-current-stream fallback.
             current_stream=_cuda_driver().CUstream(stream) if stream is not None else None,
+            **({"thd_ragged_offsets": {port: resolved[id(ro)].reshape(-1) for port, (ro, _, _) in _ragged.items()}} if _ragged else {}),
         )
         return None
 
@@ -869,10 +926,11 @@ def _sm80_spec() -> EngineSpec:
     launch, Stats read in either packed packing, declared totals sizing
     the carved scratch -- hence ``thd_declared_totals``).  Deterministic dQ,
     sinks, GQA, the causal family and head-dim envelope padding all ride it;
-    bias / dBias is dense-only (a path property, see mismatch()).  As on every
-    FROST THD row the packed addressing is ``prefix(lengths) x token stride``
-    and the bound ragged-offset values are not read: sequences must be
-    adjacent (padded THD with inter-sequence gaps is issue #737).
+    bias / dBias is dense-only (a path property, see mismatch()).  The
+    setup launch also reads every port's bound ragged offsets into per-port
+    token origins (``thd_ragged_offsets``), so padded THD with gaps between
+    sequences (TE's ``cu_seqlens_padded``) is served; whole-token offsets are
+    a supported-input precondition.
     """
     return EngineSpec(
         name="sdpa_bwd_sm80",
@@ -903,6 +961,7 @@ def _sm80_spec() -> EngineSpec:
             # than any packed buffer.
             thd_declared_totals=True,
             thd_head_stride=True,
+            thd_ragged_offsets=True,
             decode=False,  # prefill kernels only
             layouts=frozenset({"bshd", "dense_flex"}),
             # The kernels READ the declared stats strides natively (the
@@ -1386,7 +1445,7 @@ def _sm107_fp8_spec() -> EngineSpec:
     amax folds on them, so the adapter serves ``seq_kv_lens_present=True`` +
     ``execute(seq_kv_lens=)`` on the standalone surface (the K / V rows past a length
     must be finite), and takes a caller's TRUE-unit delta under ``external_delta=True``
-    (dense plans; ``api_dsl_sm107`` module doc).
+    (dense and THD plans; ``api_dsl_sm107`` module doc).
 
     THD / ragged is served on the packed path exactly as on the half row (the same
     kv-blocked workspace, metadata, claim counter and per-sequence clipped stores, in
@@ -1534,6 +1593,15 @@ def _sm107_mxfp8_spec() -> EngineSpec:
     )
 
 
+def _sm100_d256_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
+    pair = (facts.d_qk, facts.d_v)
+    if pair == (256, 256):
+        return None
+    if pair == (192, 128) and not facts.thd:
+        return None
+    return "D256 backward serves exact (256, 256) and dense BSHD (192, 128) head dimensions"
+
+
 def _sm100_d256_spec() -> EngineSpec:
     """SM100 / SM103 (cc 10.0-10.6) d=256 bf16 / fp16 backward row (``api_dsl_sm100_d256.SdpaBwdDslSm100D256``).
 
@@ -1545,9 +1613,11 @@ def _sm100_d256_spec() -> EngineSpec:
     columns / 327 KiB).  The kv WRITE PAIR stays 256 rows (``STAGE3_GRAN_ROWS``), so the stage-3 renderings and the
     no-zero-fill contract are the Rubin row's.
 
-    Exact ``d_qk == d_v == 256``, any S_q / S_kv (padded to 128 / 256 and masked), dense, top-left and bottom-right causal,
+    Packed THD accepts independent per-port physical origins and both packed Stats layouts, with declared token capacities.
+    Exact ``d_qk == d_v == 256``, plus dense-only ``(d_qk, d_v) == (192, 128)`` through native 192/128 stage-2 geometry.
+    Tensor maps retain each operand's actual width; delta and GQA fold use the value width. Any S_q / S_kv (padded to 128 / 256 and masked), dense, top-left and bottom-right causal,
     sliding window (left), MHA / GQA / MQA, BSHD-physical io, contiguous fp32 Stats, bf16 / fp16.  Declined, each asserted
-    by a test (``test_sdpa_bwd_d256_sm100.py``): dense padding masks, sink / dSink, bias / dBias, right-band widening, THD,
+    by a test (``test_sdpa_bwd_d256_sm100.py``): dense padding masks, sink / dSink, bias / dBias, right-band widening,
     decode shapes, ``dense_flex``, ``deterministic``.  ``sm_hi = 106`` like the SM100 MXFP8 row: 107+ is the native Rubin
     row's.  The native competitor on this box is cuDNN backend ENGINE 5 (``eng5_k14=3_k24=2_k27=0_k38=0_k40=3_k41=2``, the
     FORT flash_bprop 128x128x256 cga2x1x1 chain) -- opt_in, and every test / benchmark pins the FROST plan by name.
@@ -1558,13 +1628,18 @@ def _sm100_d256_spec() -> EngineSpec:
             zero_scale=True,
             sm_lo=100,
             sm_hi=106,
-            d=frozenset({256}),
+            d=frozenset({128, 192, 256}),
+            dqk_ge_dv=True,
+            declaration_check=_sm100_d256_head_mismatch,
             d_envelope=False,
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             gqa=True,
             causal=True,
             bottom_right=True,
             swa=True,
+            thd=True,
+            thd_declared_totals=True,
+            thd_ragged_offsets=True,
             decode=False,  # prefill body: a 128-row q tile per iteration
             layouts=frozenset({"bshd"}),
         ),
@@ -1618,6 +1693,127 @@ def _sm107_d512_spec() -> EngineSpec:
     )
 
 
+def _sm100_d128_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
+    """Pure declaration bounds shared with the dense, THD and grouped adapters."""
+    grouped = facts.h_q != facts.h_kv
+    if facts.deterministic and (facts.thd or grouped):
+        return "d128 deterministic backward requires dense MHA; THD and grouped dQ accumulation is unordered"
+    if not facts.thd and not grouped:
+        from .d128_contract import validate_dense_bounds
+
+        try:
+            validate_dense_bounds(facts.b, facts.h_q, facts.s_q, facts.s_kv, facts.window_left)
+        except ValueError as error:
+            return str(error)
+        return None
+    if facts.d_qk != 128 or facts.d_v != 128 or facts.window_left is not None:
+        return "small head dimensions and sliding windows require dense MHA backward"
+    label = "d128 grouped" if grouped else "d128 THD"
+    import re
+
+    from .d128_contract import ACCUMULATION_CCS, validate_accumulation_scale
+
+    if facts.device_cc not in ACCUMULATION_CCS:
+        return f"{label} requires SM100 or SM103 (cc 10.0 / 10.3)"
+    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version[1]) if version and version[0] == "nvidia-cutlass-dsl" else None
+    if match is None or tuple(map(int, match.groups())) < (4, 8, 0):
+        return f"{label} requires nvidia-cutlass-dsl >= 4.8.0; found {version}"
+    try:
+        validate_accumulation_scale(128**-0.5 if facts.scale is None else facts.scale)
+    except ValueError as error:
+        return label + ": " + str(error)
+    b, h, sq, sk = facts.b, facts.h_q, facts.s_q, facts.s_kv
+    if grouped:
+        if facts.dtype != cudnn.data_type.BFLOAT16:
+            return "d128 supports BF16 grouped attention only; FP16 requires wider dK/dV partial storage"
+        # These helpers contain only declaration arithmetic, and are also
+        # called by standalone check_support. Keep heavy host/kernel imports lazy.
+        from .d128_grouped_contract import validate_dense_bounds, validate_thd_bounds
+
+        try:
+            if facts.thd:
+                validate_thd_bounds(
+                    b,
+                    h,
+                    facts.h_kv,
+                    sq,
+                    sk,
+                    min(b * sq, facts.max_total_seq_len_q),
+                    min(b * sk, facts.max_total_seq_len_kv),
+                    facts.max_total_seq_len_q,
+                    facts.max_total_seq_len_kv,
+                )
+            else:
+                validate_dense_bounds(b, h, facts.h_kv, sq, sk)
+        except ValueError as error:
+            return label + ": " + str(error)
+        if not facts.thd:
+            return None
+    if not grouped:
+        if max(sq, sk) > 2**31 - 128:
+            return "d128 THD sequence envelope exceeds safe Int32 tile rounding"
+        if b > 65535 or h > 65535 or b * h * ((sk + 127) // 128) > 2**31 - 1:
+            return "d128 THD launch envelope exceeds the grid or Int32 work-id range"
+        tq, tk = min(b * sq, facts.max_total_seq_len_q), min(b * sk, facts.max_total_seq_len_kv)
+        if max(tq, tk) > 2**31 - 1:
+            return "d128 THD compact packed capacity exceeds the Int32 prefix ABI"
+        # A THD graph has explicit Q/K/V origins. Its physical spans use the
+        # declared capacities, including gaps beyond the compact B*S envelope.
+        physical = max(facts.max_total_seq_len_q, facts.max_total_seq_len_kv)
+        if physical > 2**32 - 1:
+            return "d128 THD physical token capacity exceeds the tensor-map dimension range"
+        if physical * h * 128 * 2 >= 2**40:
+            return "d128 THD physical BSHD byte stride exceeds the tensor-map stride range"
+        if ((tq + 127) // 128 * 128) * h * 128 * 4 >= 2**40:
+            return "d128 THD FP32 dQ byte stride exceeds the tensor-map stride range"
+    if facts.stats_t is not None:
+        # Shared validation below owns the logical Stats shape error. Do not
+        # index a malformed descriptor before it can report that typed decline.
+        if tuple(facts.stats_t.get_dim()) != (b, h, sq, 1):
+            return None
+        stride = tuple(facts.stats_t.get_stride())
+        if len(stride) != 4:
+            return "d128 THD Stats strides must have rank 4"
+        packing = ga.thd_stats_packing(stride[1], stride[2], h)
+        if packing == "head_major" and stride[1] < facts.max_total_seq_len_q:
+            return "d128 THD Stats head stride must cover the physical Q-token capacity"
+        if packing is not None:
+            from .d128_thd_contract import validate_stats_span
+
+            try:
+                validate_stats_span(h, facts.max_total_seq_len_q if packing == "token_major" else stride[1])
+            except ValueError as error:
+                return label + ": " + str(error)
+    return None
+
+
+def _sm100_d128_spec() -> EngineSpec:
+    """Dense and packed d128 with plan-time prepared implementation selection.
+
+    Dense MHA declarations retain the SM100-106 envelope. Packed or grouped
+    accumulation requires SM100 or SM103, DSL >= 4.8 and positive FP32 scale.
+    Grouped variants fold native per-Q-head dK/dV partials in FP32.
+    """
+    return EngineSpec(
+        name="sdpa_bwd_sm100_d128",
+        capabilities=Capabilities(
+            sm_lo=100,
+            sm_hi=106,
+            d=frozenset({64, 128}),
+            causal=True,
+            swa=True,
+            deterministic=True,  # dense MHA only: declaration_check selects the fixed-order recompute contract
+            compact_bshd=True,
+            thd=True,
+            thd_declared_totals=True,
+            thd_ragged_offsets=True,
+            gqa=True,
+            declaration_check=_sm100_d128_declaration_mismatch,
+        ),
+        lower=partial(lower_dsl_bwd, api_type=_SM100_D128),
+    )
+
+
 # Append-only: a row's position in this tuple is its rank in the ranked plan list, never its id (the manifest slot is).
 ENGINE_SPECS = (
     _sm120_spec(),
@@ -1629,6 +1825,7 @@ ENGINE_SPECS = (
     _sm107_mxfp8_spec(),
     _sm100_d256_spec(),
     _sm107_d512_spec(),
+    _sm100_d128_spec(),
 )
 
 __all__ = [

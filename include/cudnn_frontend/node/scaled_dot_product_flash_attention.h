@@ -599,6 +599,20 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
                 "max_total_seq_len_q/kv is only supported with packed (ragged) layout");
         }
 
+        CHECK_CUDNN_FRONTEND_ERROR(validate_sdpa_operand_stride_alignment(attributes.inputs.at(input_names::Q), "Q"));
+        CHECK_CUDNN_FRONTEND_ERROR(validate_sdpa_operand_stride_alignment(attributes.inputs.at(input_names::K), "K"));
+        CHECK_CUDNN_FRONTEND_ERROR(validate_sdpa_operand_stride_alignment(attributes.inputs.at(input_names::V), "V"));
+        CHECK_CUDNN_FRONTEND_ERROR(validate_sdpa_operand_stride_alignment(attributes.outputs.at(output_names::O), "O"));
+
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    collect_aligned_operands_node(AlignedOperands& aligned_operands) const override final {
+        add_sdpa_aligned_operand(attributes.inputs.at(input_names::Q), aligned_operands);
+        add_sdpa_aligned_operand(attributes.inputs.at(input_names::K), aligned_operands);
+        add_sdpa_aligned_operand(attributes.inputs.at(input_names::V), aligned_operands);
+        add_sdpa_aligned_operand(attributes.outputs.at(output_names::O), aligned_operands);
         return {error_code_t::OK, ""};
     }
 
@@ -1642,6 +1656,34 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
     }
 
     error_t
+    post_validate_node() const override final {
+        for (auto const& [port, name] : {std::make_pair(input_names::Q, "Q"),
+                                         std::make_pair(input_names::K, "K"),
+                                         std::make_pair(input_names::V, "V"),
+                                         std::make_pair(input_names::O, "O"),
+                                         std::make_pair(input_names::dO, "dO")}) {
+            CHECK_CUDNN_FRONTEND_ERROR(validate_sdpa_operand_stride_alignment(attributes.inputs.at(port), name));
+        }
+        for (auto const& [port, name] : {std::make_pair(output_names::dQ, "dQ"),
+                                         std::make_pair(output_names::dK, "dK"),
+                                         std::make_pair(output_names::dV, "dV")}) {
+            CHECK_CUDNN_FRONTEND_ERROR(validate_sdpa_operand_stride_alignment(attributes.outputs.at(port), name));
+        }
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    collect_aligned_operands_node(AlignedOperands& aligned_operands) const override final {
+        for (auto port : {input_names::Q, input_names::K, input_names::V, input_names::O, input_names::dO}) {
+            add_sdpa_aligned_operand(attributes.inputs.at(port), aligned_operands);
+        }
+        for (auto port : {output_names::dQ, output_names::dK, output_names::dV}) {
+            add_sdpa_aligned_operand(attributes.outputs.at(port), aligned_operands);
+        }
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
     expand_node() override final {
         CUDNN_FE_LOG_LABEL_ENDL("INFO:     Inferrencing properties for CompositeSDPABackwardNode " << attributes.name);
 
@@ -2629,6 +2671,32 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
         NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(91301, cudnn_ver_error);
         auto unified_sdpa_operation =
             make_shared_backend_pointer((cudnnBackendDescriptorType_t)CUDNN_BACKEND_OPERATION_SDPA_FWD_DESCRIPTOR);
+
+        // FLOAT is the unified backend's historical default. Only a non-default
+        // request needs the new attribute; old headers/libraries keep working for
+        // FLOAT, and must never silently discard a HALF request.
+        auto const compute_type =
+            attributes.compute_data_type == DataType_t::NOT_SET ? DataType_t::FLOAT : attributes.compute_data_type;
+        RETURN_CUDNN_FRONTEND_ERROR_IF(compute_type != DataType_t::FLOAT && compute_type != DataType_t::HALF,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Unified SDPA accumulation type must be FLOAT or HALF");
+        if (compute_type != DataType_t::FLOAT) {
+#if (CUDNN_VERSION >= 92900)
+            auto compute_type_version_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED,
+                                                      "Unified SDPA compute type requires backend attribute support"};
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92900, compute_type_version_error);
+            cudnnDataType_t backend_compute_type;
+            _CUDNN_CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(compute_type, backend_compute_type));
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
+                                                           CUDNN_ATTR_OPERATION_SDPA_FWD_COMP_TYPE,
+                                                           CUDNN_TYPE_DATA_TYPE,
+                                                           1,
+                                                           &backend_compute_type));
+#else
+            return {error_code_t::GRAPH_NOT_SUPPORTED,
+                    "Unified SDPA compute type requires cuDNN 9.29.0 or newer headers"};
+#endif
+        }
 
         auto Q         = attributes.inputs.find(SDPA_attributes::input_names::Q)->second;
         auto backend_q = tensors[Q->get_uid()]->get_desc()->get_backend_descriptor();

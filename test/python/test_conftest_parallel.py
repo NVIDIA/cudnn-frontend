@@ -1,10 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Host-only pins of what test/python/conftest.py does for SEVERAL pytest processes on one tree or one GPU (test/AGENTS.md):
-the per-run FROST routing directory (no two runs share one -- a session a test starts with a worker's environment included; the
-session-start sweep judges a pid only on the host that minted it, so another host's live run on a shared tree is never swept) and the
-shared-GPU switch of the memory gate."""
+"""Parallel pytest routing, memory cleanup and worker isolation contracts."""
 
 import os
 import re
@@ -265,6 +262,40 @@ def test_the_sweep_never_removes_this_runs_own_directory(top_conftest, monkeypat
 # ---- the memory gate's shared-GPU switch
 
 
+def test_empty_cache_waits_for_other_devices_default_stream(top_conftest, monkeypatch):
+    import torch
+
+    if torch.cuda.device_count() < 2 or not hasattr(torch.cuda, "_sleep"):
+        pytest.skip("needs two CUDA devices and torch.cuda._sleep")
+    current = torch.cuda.current_device()
+    other = (current + 1) % torch.cuda.device_count()
+    pending = torch.cuda.Event()
+    empty_cache = torch.cuda.empty_cache
+
+    def checked_empty_cache():
+        assert pending.query(), "cache cleanup reached another device before its writes finished"
+        empty_cache()
+
+    try:
+        with torch.cuda.device(other), torch.cuda.stream(torch.cuda.default_stream(other)):
+            buffer = torch.zeros(1, device="cuda")
+            torch.cuda._sleep(1)
+            pending.record()
+            pending.synchronize()
+            torch.cuda._sleep(2_000_000_000)
+            buffer.zero_()
+            pending.record()
+            del buffer
+        assert not pending.query(), "the other device must still have pending work"
+        with monkeypatch.context() as patch:
+            patch.setattr(torch.cuda, "empty_cache", checked_empty_cache)
+            top_conftest._torch_empty_cache()
+        assert torch.cuda.current_device() == current
+    finally:
+        # Drain the write even when the guard fails, before fixture cleanup.
+        torch.cuda.synchronize(other)
+
+
 def test_under_xdist_flips_with_the_shared_gpu_switch(top_conftest, monkeypatch):
     monkeypatch.setenv("PYTEST_XDIST_WORKER_COUNT", "1")
     monkeypatch.delenv("CUDNN_TEST_SHARED_GPU", raising=False)
@@ -282,3 +313,37 @@ def test_the_armed_gate_announces_itself_once_per_test_process():
     out = child.communicate(timeout=900)[0]
     assert child.returncode == 0, out[-2000:]
     assert out.count("[mem-gate] armed by CUDNN_TEST_SHARED_GPU=1") == 1, out[-2000:]
+
+
+# ---- the measured channel (frost_routing.measured -> the controller's terminal summary)
+
+
+@pytest.mark.parametrize("workers", ["0", "2"], ids=["one_process", "xdist"])
+def test_a_measurement_reaches_the_controllers_summary(workers):
+    """frost_routing.measured(key, text) is printed under "measured" in the run's terminal summary -- from the single process and,
+    aggregated through the per-run directory, from an xdist worker -- while the test that took it PASSES (its captured stdout is
+    not in the log).  The child module lives under test/python so this tree's conftest governs it; it is removed afterwards."""
+    tag = f"{os.getpid()}_{workers}"
+    folder = os.path.join(_HERE, f".measured_pin_{tag}")
+    os.makedirs(folder, exist_ok=True)
+    module = os.path.join(folder, "test_measured_pin.py")
+    try:
+        with open(module, "w") as f:
+            f.write(
+                "import frost_routing\n"
+                "import pytest\n"
+                "pytestmark = pytest.mark.L0\n"
+                "def test_records_a_measurement():\n"
+                f"    frost_routing.measured('pin {tag}', 'alpha=crash   beta=planned(3)\\n  gamma=declined')\n"
+                "    print('CAPTURED STDOUT OF A PASSING TEST')\n"
+            )
+        child_env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_XDIST_") and k != "CUDNN_TEST_RUN_ID"}
+        cmd = [sys.executable, "-m", "pytest", "-q", "-o", "addopts=", "-p", "no:cacheprovider", "-p", "no:randomly", "-n", workers, module]
+        child = subprocess.Popen(cmd, cwd=_HERE, env=child_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        out = child.communicate(timeout=900)[0]
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    assert child.returncode == 0 and "1 passed" in out, out[-3000:]
+    assert re.search(r"^=+ measured =+$", out, re.M), f"no 'measured' section:\n{out[-3000:]}"
+    assert f"  pin {tag}: alpha=crash beta=planned(3) gamma=declined" in out, out[-3000:]  # one line, whitespace collapsed
+    assert "CAPTURED STDOUT OF A PASSING TEST" not in out, "the channel exists because this line is NOT in the log"

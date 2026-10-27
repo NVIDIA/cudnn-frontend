@@ -29,9 +29,15 @@ from .dense_score_recompute_sm100 import (
 
 
 class IndexerScoreUnifiedSm100(DenseScoreRecomputeSm100):
-    """Dense indexer-score kernel with optional LSE output."""
+    """Dense indexer-score kernel with optional LSE output.
 
-    max_q_tokens_per_tile = 4
+    The packed M tile holds ``q_tokens_per_tile = m_block_size // qhead_per_kvhead`` query tokens of
+    ``qhead_per_kvhead`` heads each; the epilogue reduces the ReLU(QK) * W products of every token
+    independently and writes one score per (token, key). Head groups of 4 .. 64 are served: a 4-head
+    group packs 8 tokens into a 32-column tile, a 64-head group 2 tokens into a 128-column one.
+    """
+
+    max_q_tokens_per_tile = 8
 
     def __init__(
         self,
@@ -78,7 +84,7 @@ class IndexerScoreUnifiedSm100(DenseScoreRecomputeSm100):
         S_mbar_ptr,
         reduce_sync_mbar_ptr,
         mOut,
-        mDenom,
+        mDenom: cute.Tensor | None,
         num_n_blocks_compute,
         seqlen_k,
         seqlen_q,
@@ -93,7 +99,11 @@ class IndexerScoreUnifiedSm100(DenseScoreRecomputeSm100):
         batch_idx=None,
         cand_batch_offsets=None,
     ):
-        """Indexer epilogue shared by score-only and score+LSE modes."""
+        """Indexer epilogue shared by score-only and score+LSE modes.
+
+        ``mDenom`` is ``None`` when ``compute_lse`` is off; every read of it
+        sits below the ``const_expr(self.compute_lse)`` early return.
+        """
         tidx_wg = tidx % self.WARPGROUP_SIZE
 
         sW_off = Int32(0) if per_head_offset is None else per_head_offset
@@ -103,7 +113,10 @@ class IndexerScoreUnifiedSm100(DenseScoreRecomputeSm100):
 
         # Epilogue setup: map the packed M tile back to logical q-token rows,
         # compute each row's ratio-causal limit, and cache W in registers.
-        W_ILP = 8
+        # The head reduce walks the group's columns in pairs, W_ILP pairs per
+        # unrolled step: 8 pairs for the 16+ head groups, the whole (even) group
+        # for the 4- and 8-head ones so no column is left outside the loop.
+        W_ILP = min(8, qhpkv // 2)
         sW_1d = cute.make_tensor(
             sW.iterator + sW_off,
             cute.make_layout((self.m_block_size,), stride=(1,)),

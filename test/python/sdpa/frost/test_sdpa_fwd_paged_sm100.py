@@ -39,13 +39,14 @@ pytestmark = [requires_pre_rubin_blackwell, requires_dsl]
 D = 128
 
 
-def _ref_rows(q, k_pool, v_pool, block_table, seq_lens, hnd, scale, *, sink=None, window_left=None, causal_br=False):
+def _ref_rows(q, k_pool, v_pool, block_table, seq_lens, hnd, scale, *, sink=None, window_left=None, causal_br=False, v_hnd=None):
     """q [B, H, S_q, D]; pools in their storage layout; returns (O [B, H, S_q, D_v],
     LSE [B, H, S_q]) fp32 with the kernel's semantics. ``causal_br``: bottom-right
     causal -- row r of batch b has its diagonal at key ``seq_lens[b] - S_q + r``.
     ``window_left``: cuDNN ``diagonal_band_left_bound`` -- visible keys INCLUDING the
     diagonal (FA-style w maps to w + 1). ``sink`` [H] fp32: one extra softmax column
     with V = 0, so a keyless row is O = 0 / LSE = sink (O = 0 / LSE = -inf without one)."""
+    v_hnd = hnd if v_hnd is None else v_hnd
     B, H, S_q, d = q.shape
     KH = k_pool.shape[1] if hnd else k_pool.shape[2]
     P = k_pool.shape[2] if hnd else k_pool.shape[1]
@@ -60,7 +61,9 @@ def _ref_rows(q, k_pool, v_pool, block_table, seq_lens, hnd, scale, *, sink=None
         pages = block_table[b, : (L + P - 1) // P].long()
         k, v = k_pool[pages], v_pool[pages]
         if hnd:
-            k, v = k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3)
+            k = k.permute(0, 2, 1, 3)
+        if v_hnd:
+            v = v.permute(0, 2, 1, 3)
         k = k.reshape(-1, KH, d)[:L].repeat_interleave(H // KH, dim=1).float()
         v = v.reshape(-1, KH, Dv)[:L].repeat_interleave(H // KH, dim=1).float()
         s = torch.einsum("hrd,lhd->hrl", q[b].float(), k) * scale
@@ -90,7 +93,7 @@ def _ref(q, k_pool, v_pool, block_table, seq_lens, hnd, scale):
     return out[:, :, 0], lse[:, :, 0]
 
 
-def _pools(B, KH, d, P, max_pages, hnd, dtype, seed=0, d_v=None, *, generator=None):
+def _pools(B, KH, d, P, max_pages, hnd, dtype, seed=0, d_v=None, *, generator=None, v_hnd=None):
     """Page pools + a scattered block table.  Returns (k_pool, v_pool, k_container,
     v_container, block_table[B, 1, max_pages, 1]) — the containers are the
     [num_pages, H_kv, page_size, D]-dim views the graph declares.  ``d_v``
@@ -101,14 +104,13 @@ def _pools(B, KH, d, P, max_pages, hnd, dtype, seed=0, d_v=None, *, generator=No
     dev = "cuda"
     d_v = d if d_v is None else d_v
     num_pages = B * max_pages + 5
-    if hnd:
-        k_pool = torch.randn(num_pages, KH, P, d, device=dev, dtype=dtype, generator=generator)
-        v_pool = torch.randn(num_pages, KH, P, d_v, device=dev, dtype=dtype, generator=generator)
-        k_c, v_c = k_pool, v_pool
-    else:
-        k_pool = torch.randn(num_pages, P, KH, d, device=dev, dtype=dtype, generator=generator)
-        v_pool = torch.randn(num_pages, P, KH, d_v, device=dev, dtype=dtype, generator=generator)
-        k_c, v_c = k_pool.permute(0, 2, 1, 3), v_pool.permute(0, 2, 1, 3)
+    v_hnd = hnd if v_hnd is None else v_hnd
+    k_shape = (num_pages, KH, P, d) if hnd else (num_pages, P, KH, d)
+    v_shape = (num_pages, KH, P, d_v) if v_hnd else (num_pages, P, KH, d_v)
+    k_pool = torch.randn(k_shape, device=dev, dtype=dtype, generator=generator)
+    v_pool = torch.randn(v_shape, device=dev, dtype=dtype, generator=generator)
+    k_c = k_pool if hnd else k_pool.permute(0, 2, 1, 3)
+    v_c = v_pool if v_hnd else v_pool.permute(0, 2, 1, 3)
     bt = torch.randperm(num_pages, device=dev, generator=generator)[: B * max_pages].to(torch.int32).view(B, 1, max_pages, 1).contiguous()
     return k_pool, v_pool, k_c, v_c, bt
 
@@ -135,6 +137,10 @@ def _run_graph(
     d_v=None,
     want_cga=None,
     lead_split=None,
+    v_hnd=None,
+    replay=False,
+    explicit_knobs=None,
+    arch="sm100",
 ):
     """Build, pin the FROST engine, execute, compare every Q row against ``_ref_rows``.
 
@@ -156,7 +162,7 @@ def _run_graph(
     dev = "cuda"
     d_v = d if d_v is None else d_v
     scale = 1.0 / math.sqrt(d)
-    k_pool, v_pool, k_c, v_c, bt = _pools(B, KH, d, P, max_pages, hnd, dtype, d_v=d_v)
+    k_pool, v_pool, k_c, v_c, bt = _pools(B, KH, d, P, max_pages, hnd, dtype, d_v=d_v, v_hnd=v_hnd)
     q_gpu = torch.randn(B, s_q, H, d, device=dev, dtype=dtype).transpose(1, 2)
     o_gpu = torch.empty(B, s_q, H, d_v, device=dev, dtype=dtype).transpose(1, 2)
     seq_lens = torch.tensor(lens, dtype=torch.int32, device=dev)
@@ -206,14 +212,19 @@ def _run_graph(
         st.set_output(True).set_dim(stats_gpu.shape).set_stride(stats_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
     g.validate()
     g.build_operation_graph()
-    g.create_execution_plans([cudnn.heur_mode.A])
-    plan = select_engine(g, engine_name(), pack_gqa=pack_gqa)
+    if explicit_knobs is None:
+        g.create_execution_plans([cudnn.heur_mode.A])
+    else:
+        from cudnn.engines.manifest import family_for
+
+        g.create_execution_plan(family_for(g).offered_ids()[engine_name(arch=arch)], explicit_knobs)
+    plan = select_engine(g, engine_name(arch=arch), pack_gqa=pack_gqa)
     if lead_split is not None:
         assert plan.knobs.split_kv == lead_split, f"expected the heuristics to lead with split_kv={lead_split}; got {plan.knobs}"
     if want_split is not None:
         names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-        idx = next((i for i, n in enumerate(names) if n.startswith(engine_name()) and g.plans[i].knobs.split_kv == want_split), None)
-        assert idx is not None, f"no {engine_name()} plan with split_kv={want_split}; knobs={[p.knobs for p in g.plans]}"
+        idx = next((i for i, n in enumerate(names) if n.startswith(engine_name(arch=arch)) and g.plans[i].knobs.split_kv == want_split), None)
+        assert idx is not None, f"no {engine_name(arch=arch)} plan with split_kv={want_split}; knobs={[p.knobs for p in g.plans]}"
         g.select_plan(idx)
         plan = g.plans[idx]
     if want_cga is not None:
@@ -234,7 +245,9 @@ def _run_graph(
     torch.cuda.synchronize()
 
     sink_ref = sink_gpu.flatten() if sink_gpu is not None else None
-    ref_o, ref_lse = _ref_rows(q_gpu, k_pool, v_pool, bt.view(B, max_pages), seq_lens, hnd, scale, sink=sink_ref, window_left=window_left, causal_br=causal_br)
+    ref_o, ref_lse = _ref_rows(
+        q_gpu, k_pool, v_pool, bt.view(B, max_pages), seq_lens, hnd, scale, sink=sink_ref, window_left=window_left, causal_br=causal_br, v_hnd=v_hnd
+    )
     out = o_gpu.float()
     assert not torch.isnan(out).any(), "NaN in O"
     torch.testing.assert_close(out, ref_o, atol=2e-2 if dtype == torch.float16 else 1e-1, rtol=0)
@@ -258,6 +271,35 @@ def _run_graph(
                 torch.testing.assert_close(got_lse[keyless], want[keyless], atol=1e-4, rtol=0)
             else:
                 assert torch.isneginf(got_lse[keyless]).all(), "a keyless row must write LSE := -inf"
+    if replay:
+        captured = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(captured):
+            g.execute(vp, ws)
+        q_gpu.normal_()
+        k_pool.normal_()
+        v_pool.normal_()
+        o_gpu.fill_(torch.nan)
+        if stats:
+            stats_gpu.fill_(torch.nan)
+        captured.replay()
+        torch.cuda.synchronize()
+        ref_o, ref_lse = _ref_rows(
+            q_gpu,
+            k_pool,
+            v_pool,
+            bt.view(B, max_pages),
+            seq_lens,
+            hnd,
+            scale,
+            sink=sink_ref,
+            window_left=window_left,
+            causal_br=causal_br,
+            v_hnd=v_hnd,
+        )
+        torch.testing.assert_close(o_gpu.float(), ref_o, atol=2e-2 if dtype == torch.float16 else 1e-1, rtol=0)
+        if stats:
+            torch.testing.assert_close(stats_gpu.view(B, H, s_q), ref_lse, atol=5e-3, rtol=0)
+        captured.reset()
     return plan
 
 
@@ -1062,11 +1104,12 @@ def test_paged_adapter_cuda_graph_replay_no_host_sync():
 # --- THD (ragged) queries over a paged cache: chunked prefill -----------------
 
 
-def _ref_thd_sequence(q_seq, k_pool, v_pool, pages, L, hnd, scale, causal_window=None):
+def _ref_thd_sequence(q_seq, k_pool, v_pool, pages, L, hnd, scale, causal_window=None, v_hnd=None):
     """One packed sequence's rows against its own pages: ``q_seq`` [S_q, H, d],
     ``pages`` that sequence's block-table row, ``L`` its live KV length.  Full
     attention over the L keys, or (``causal_window`` = W) top-left causal with a
     left window -- row r sees keys r - W <= j <= r.  Returns O [S_q, H, D_v] fp32."""
+    v_hnd = hnd if v_hnd is None else v_hnd
     S_q, H, d = q_seq.shape
     KH = k_pool.shape[1] if hnd else k_pool.shape[2]
     P = k_pool.shape[2] if hnd else k_pool.shape[1]
@@ -1074,7 +1117,9 @@ def _ref_thd_sequence(q_seq, k_pool, v_pool, pages, L, hnd, scale, causal_window
     idx = pages[: (L + P - 1) // P].long()
     k, v = k_pool[idx], v_pool[idx]
     if hnd:
-        k, v = k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+    if v_hnd:
+        v = v.permute(0, 2, 1, 3)
     k = k.reshape(-1, KH, d)[:L].repeat_interleave(H // KH, dim=1).float()
     v = v.reshape(-1, KH, D_v)[:L].repeat_interleave(H // KH, dim=1).float()
     s = torch.einsum("qhd,lhd->hql", q_seq.float(), k) * scale
@@ -1085,7 +1130,7 @@ def _ref_thd_sequence(q_seq, k_pool, v_pool, pages, L, hnd, scale, causal_window
     return torch.einsum("hql,lhd->qhd", torch.softmax(s, -1), v)
 
 
-def _run_thd_graph(dims, hnd, *, q_lens, kv_lens, H=8, KH=2, P=16, max_pages=20, causal_window=None, pack_gqa=None):
+def _run_thd_graph(dims, hnd, *, q_lens, kv_lens, H=8, KH=2, P=16, max_pages=20, causal_window=None, pack_gqa=None, v_hnd=None, arch="sm100"):
     """Ragged Q/O (packed [T, H, D] storage + ragged offsets, per-sequence
     ``seq_len_q``) attending K/V page pools through block tables, optionally under
     top-left causal + a left window of ``causal_window`` keys.  Checks every packed
@@ -1101,7 +1146,7 @@ def _run_thd_graph(dims, hnd, *, q_lens, kv_lens, H=8, KH=2, P=16, max_pages=20,
     for s in q_lens:
         cu.append(cu[-1] + s)
     scale = 1.0 / math.sqrt(d)
-    k_pool, v_pool, k_c, v_c, bt = _pools(B, KH, d, P, max_pages, hnd, dtype, d_v=d_v)
+    k_pool, v_pool, k_c, v_c, bt = _pools(B, KH, d, P, max_pages, hnd, dtype, d_v=d_v, v_hnd=v_hnd)
     torch.manual_seed(7)
     q_pk = torch.randn(T, H, d, device=dev, dtype=dtype)
     stride = (S_max * H * d, d, H * d, 1)
@@ -1145,7 +1190,7 @@ def _run_thd_graph(dims, hnd, *, q_lens, kv_lens, H=8, KH=2, P=16, max_pages=20,
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    plan = select_engine(g, engine_name(), pack_gqa=pack_gqa)
+    plan = select_engine(g, engine_name(arch=arch), pack_gqa=pack_gqa)
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
@@ -1159,7 +1204,7 @@ def _run_thd_graph(dims, hnd, *, q_lens, kv_lens, H=8, KH=2, P=16, max_pages=20,
     o_out = o_stor[: T * H * d_v].reshape(T, H, d_v).float()
     assert not torch.isnan(o_out).any(), "NaN in O"
     for b in range(B):
-        ref_o = _ref_thd_sequence(q_pk[cu[b] : cu[b + 1]], k_pool, v_pool, bt.view(B, max_pages)[b], kv_lens[b], hnd, scale, causal_window)
+        ref_o = _ref_thd_sequence(q_pk[cu[b] : cu[b + 1]], k_pool, v_pool, bt.view(B, max_pages)[b], kv_lens[b], hnd, scale, causal_window, v_hnd=v_hnd)
         torch.testing.assert_close(o_out[cu[b] : cu[b + 1]], ref_o, atol=2e-2, rtol=0)
     return plan
 
@@ -1322,7 +1367,7 @@ def _fp8_cudnn_dtype(torch_dtype):
     }[torch_dtype]
 
 
-def _pools_fp8(B, KH, d, P, max_pages, hnd, in_key, lens, seed=0):
+def _pools_fp8(B, KH, d, P, max_pages, hnd, in_key, lens, seed=0, v_hnd=None):
     """FP8 page pools + a scattered block table + per-tensor descales.  Returns
     (k_pool, v_pool, k_container, v_container, block_table[B, 1, max_pages, 1], dk, dv);
     the pools keep their storage layout, the containers are the graph's
@@ -1332,9 +1377,11 @@ def _pools_fp8(B, KH, d, P, max_pages, hnd, in_key, lens, seed=0):
     torch.manual_seed(seed)
     dev = "cuda"
     num_pages = B * max_pages + 5
+    v_hnd = hnd if v_hnd is None else v_hnd
+    v_shape = (num_pages, KH, P, d) if v_hnd else (num_pages, P, KH, d)
     shape = (num_pages, KH, P, d) if hnd else (num_pages, P, KH, d)
     k_pool, dk = _fp8_quant(torch.randn(*shape, device=dev) * 0.5, in_key)
-    v_pool, dv = _fp8_quant(torch.randn(*shape, device=dev) * 0.5, in_key)
+    v_pool, dv = _fp8_quant(torch.randn(*v_shape, device=dev) * 0.5, in_key)
     bt = torch.randperm(num_pages, device=dev)[: B * max_pages].to(torch.int32).view(B, 1, max_pages, 1).contiguous()
     live = set()
     for b, L in enumerate(lens):
@@ -1344,7 +1391,8 @@ def _pools_fp8(B, KH, d, P, max_pages, hnd, in_key, lens, seed=0):
         dead_t = torch.tensor(dead, device=dev, dtype=torch.long)
         k_pool[dead_t] = float("nan")
         v_pool[dead_t] = float("nan")
-    k_c, v_c = (k_pool, v_pool) if hnd else (k_pool.permute(0, 2, 1, 3), v_pool.permute(0, 2, 1, 3))
+    k_c = k_pool if hnd else k_pool.permute(0, 2, 1, 3)
+    v_c = v_pool if v_hnd else v_pool.permute(0, 2, 1, 3)
     return k_pool, v_pool, k_c, v_c, bt, dk, dv
 
 
@@ -1366,7 +1414,28 @@ def _gather_pages_fp8(pool, block_table, lens, hnd, P, s_max):
     return out.to(pool.dtype)
 
 
-def _ref_fp8(q8, k_pool, v_pool, block_table, seq_lens, hnd, scale, dq, dk, dv, in_key, s_q, s_max, *, diag_align=None, left_bound=None, right_bound=None):
+def _ref_fp8(
+    q8,
+    k_pool,
+    v_pool,
+    block_table,
+    seq_lens,
+    hnd,
+    scale,
+    dq,
+    dk,
+    dv,
+    in_key,
+    s_q,
+    s_max,
+    *,
+    diag_align=None,
+    left_bound=None,
+    right_bound=None,
+    v_hnd=None,
+    sinks=None,
+    seq_q_lens=None,
+):
     """q8 [B, s_q, H, D] fp8 (BSHD); pools in storage layout.  Returns (O [B, H, s_q, D_v]
     fp32, LSE [B, H, s_q] natural log) from sdpa.fp8_ref.compute_ref in fp64.  The band
     (``left_bound`` / ``right_bound``) and ``diag_align`` are the graph's own spelling;
@@ -1377,8 +1446,10 @@ def _ref_fp8(q8, k_pool, v_pool, block_table, seq_lens, hnd, scale, dq, dk, dv, 
     lens = seq_lens.tolist()
     P = k_pool.shape[2] if hnd else k_pool.shape[1]
     kd = _gather_pages_fp8(k_pool, block_table, lens, hnd, P, s_max)
-    vd = _gather_pages_fp8(v_pool, block_table, lens, hnd, P, s_max)
-    s_scale = 2.0 ** (_FP8_P_CAST_LOG2_SCALE + _FP8_RESCALE_THRESHOLD_LOG2)
+    vd = _gather_pages_fp8(v_pool, block_table, lens, hnd if v_hnd is None else v_hnd, P, s_max)
+    # D64/D128 scale P before its FP8 cast; native D256 casts P directly.
+    p_cast_log2_scale = _FP8_P_CAST_LOG2_SCALE if q8.shape[-1] <= 128 else 0.0
+    s_scale = 2.0 ** (p_cast_log2_scale + _FP8_RESCALE_THRESHOLD_LOG2)
     o, lse, _ = compute_ref(
         q8,
         kd.transpose(1, 2),
@@ -1391,7 +1462,8 @@ def _ref_fp8(q8, k_pool, v_pool, block_table, seq_lens, hnd, scale, dq, dk, dv, 
         s_descale=1.0 / s_scale,
         torch_itype=_FP8[in_key],
         torch_otype=torch.float16,
-        padding=(torch.full((B,), s_q, dtype=torch.int32, device=q8.device), seq_lens),
+        padding=(torch.full((B,), s_q, dtype=torch.int32, device=q8.device) if seq_q_lens is None else seq_q_lens.reshape(B), seq_lens),
+        sink_token=sinks.view(1, -1, 1, 1) if sinks is not None else None,
         left_bound=left_bound,
         right_bound=right_bound,
         diag_align=diag_align,
@@ -1413,6 +1485,12 @@ def _check_fp8_o(out, o_ref, out_dt, in_key):
         atol = max(atol, 3.0 * floor)
     diff = (out.float() - o_ref).abs().max().item()
     assert diff <= atol, f"max|O-ref|={diff:.4f} > {atol:.4f} ({in_key} -> {out_dt})"
+
+
+def _fp8_lse_atol(d):
+    # Match prepared D256's absolute Stats bound, with no relative allowance.
+    # The identical-input dense/paged control below pins loader equivalence.
+    return 1e-2 if d == 256 else 5e-3
 
 
 def _run_graph_fp8(
@@ -1439,6 +1517,11 @@ def _run_graph_fp8(
     override=False,
     explicit_split=None,
     v_table_layout=None,
+    v_hnd=None,
+    sinks=None,
+    q_lens=None,
+    explicit_pack=None,
+    explicit_cga=None,
 ):
     """``causal``: None, "top_left" or "bottom_right" -- a causal upper bound (``right_bound=0``)
     with that diagonal alignment; ``window_left``: W adds the left sliding window (``left_bound=W``).
@@ -1452,7 +1535,7 @@ def _run_graph_fp8(
 
     dev = "cuda"
     scale = 1.0 / math.sqrt(d)
-    k_pool, v_pool, k_c, v_c, bt, dk, dv = _pools_fp8(B, KH, d, P, max_pages, hnd, in_key, lens)
+    k_pool, v_pool, k_c, v_c, bt, dk, dv = _pools_fp8(B, KH, d, P, max_pages, hnd, in_key, lens, v_hnd=v_hnd)
     mask_kw = {}
     right_bound = 0 if causal is not None else None
     diag_align = cudnn.diagonal_alignment.BOTTOM_RIGHT if causal == "bottom_right" else cudnn.diagonal_alignment.TOP_LEFT
@@ -1465,7 +1548,7 @@ def _run_graph_fp8(
     o_gpu = torch.empty(B, s_q, H, d, device=dev, dtype=out_dt).transpose(1, 2)
     seq_lens = torch.tensor(lens, dtype=torch.int32, device=dev)
     slk = seq_lens.view(B, 1, 1, 1)
-    slq = torch.full((B, 1, 1, 1), s_q, dtype=torch.int32, device=dev)
+    slq = torch.tensor(q_lens if q_lens is not None else [s_q] * B, dtype=torch.int32, device=dev).view(B, 1, 1, 1)
     s_max = max_pages * P
 
     def _sc(val):
@@ -1491,6 +1574,9 @@ def _run_graph_fp8(
     def _stns():
         return g.tensor(dim=[1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.FLOAT)
 
+    sink_t = g.tensor_like(sinks) if sinks is not None else None
+    if sink_t is not None:
+        mask_kw["sink_token"] = sink_t
     dqn, dkn, dvn, dsn, ssn, son = (_stns() for _ in range(6))
     o, st, _amax_s_unused, amx_o = g.sdpa_fp8(  # Amax_S is not requested (the FROST engines decline graphs that declare it)
         q=q,
@@ -1529,11 +1615,17 @@ def _run_graph_fp8(
         idx = next((i for i, n in enumerate(names) if n.startswith(engine_name(fp8=True)) and g.plans[i].knobs.split_kv == want_split), None)
         assert idx is not None, f"no {engine_name(fp8=True)} plan with split_kv={want_split}; knobs={[p.knobs for p in g.plans]}"
         g.select_plan(idx)
-    if explicit_split is not None:
+    if explicit_split is not None or explicit_pack is not None or explicit_cga is not None:
         from dataclasses import replace
 
         selected = g.plans[g._plan_index]
-        knobs = replace(selected.knobs, split_kv=explicit_split, sched_policy=0)
+        knobs = replace(selected.knobs, sched_policy=0)
+        if explicit_split is not None:
+            knobs = replace(knobs, split_kv=explicit_split)
+        if explicit_pack is not None:
+            knobs = replace(knobs, pack_gqa=explicit_pack)
+        if explicit_cga is not None:
+            knobs = replace(knobs, cga=explicit_cga)
         g.create_execution_plan(selected.engine_id, knobs)
         g.select_plan(len(g.plans) - 1)
     g.check_support()
@@ -1557,6 +1649,8 @@ def _run_graph_fp8(
         ssn: _sc(1.0),
         son: _sc(1.0),
     }
+    if sink_t is not None:
+        vp[sink_t] = sinks
     if stats:
         vp[st] = lse
     # Rule 3: the FROST execute path reads the per-batch lengths and the scales
@@ -1585,6 +1679,9 @@ def _run_graph_fp8(
         diag_align=diag_align,
         left_bound=window_left,
         right_bound=right_bound,
+        v_hnd=v_hnd,
+        sinks=sinks,
+        seq_q_lens=slq,
     )
     out = o_gpu.float()
     assert not torch.isnan(out).any(), "NaN in O (a dead page was dereferenced, or a padded row was not masked)"
@@ -1598,18 +1695,29 @@ def _run_graph_fp8(
     keyless = torch.isinf(ref_lse) & live.view(B, 1, 1)
     if keyless.any():
         assert out[keyless].abs().max().item() == 0.0, "a q row with no unmasked key must write O := 0"
+    if sinks is not None:
+        rows = torch.arange(s_q, device=dev).view(1, s_q)
+        dead_q = rows >= slq.view(B, 1)
+        keyless_q = (slk.view(B, 1) == 0).expand(B, s_q)
+        if causal == "bottom_right":
+            keyless_q = keyless_q | (slk.view(B, 1) - slq.view(B, 1) + rows < 0)
+        dead = (dead_q | keyless_q).view(B, 1, s_q).expand(B, H, s_q)
+        assert torch.count_nonzero(out[dead]).item() == 0, "trimmed and sink-only rows must write exact zero O"
     # Amax_O is produced in-kernel (atomicMax over the pre-cast fp32 values; the
     # recombined O's under a split), so it matches the fp32 reference for every O dtype.
     assert abs(amax_o.item() - ref_o.abs().max().item()) <= 0.03, f"amax_o {amax_o.item():.4f} vs ref {ref_o.abs().max().item():.4f}"
     if stats:
         got_lse = lse.view(B, H, s_q)
-        torch.testing.assert_close(got_lse[live], ref_lse[live], atol=5e-3, rtol=0)
+        lse_atol = _fp8_lse_atol(d)
+        torch.testing.assert_close(got_lse[live], ref_lse[live], atol=lse_atol, rtol=0)
         if (~live).any():
-            assert torch.isinf(got_lse[~live]).all() and (got_lse[~live] < 0).all(), "empty sequence must write LSE := -inf"
+            torch.testing.assert_close(got_lse[~live], ref_lse[~live], atol=lse_atol, rtol=0)
     if return_case:
         tensors = dict(
             q=q, k=k, v=v, k_table=tk, v_table=tv, seq_q=sq_t, seq_kv=sk_t, o=o, amax_o=amx_o, descale_q=dqn, descale_k=dkn, descale_v=dvn, scale_o=son
         )
+        if sink_t is not None:
+            tensors["sinks"] = sink_t
         if stats:
             tensors["lse"] = st
         return g, vp, ws, {name: vp[tensor] for name, tensor in tensors.items()}, tensors
@@ -1808,9 +1916,8 @@ def _build_fp8_paged_graph(P, *, d=D, H=8, KH=2, hnd=False, thd=False, mask_kw=N
 
 @pytest.mark.L0
 def test_paged_graph_fp8_declines_off_contract():
-    """Plan-time declines stay plan-time on the FP8 row: the d128 flavor is offered,
-    the d256 FP8 flavor, THD queries over FP8 pools and an off-contract page size
-    are not (no FP8 plan enters the ranked list, nothing compiles)."""
+    """D128/D256 serve dense or THD queries over FP8 pools. D512, THD D64
+    and off-contract page sizes remain plan-time declines."""
     from cudnn.sdpa.fwd.engines import engine_name
     from frost_test_utils import offers_engine
 
@@ -1820,8 +1927,11 @@ def test_paged_graph_fp8_declines_off_contract():
     assert _offers(_build_fp8_paged_graph(16))
     assert _offers(_build_fp8_paged_graph(128, hnd=True))
     assert not _offers(_build_fp8_paged_graph(48)), "page_size 48 neither divides nor is a multiple of the 128-row tile"
-    assert not _offers(_build_fp8_paged_graph(16, d=256)), "paged KV for per-tensor FP8 is wired on the d128 flavor only"
-    assert not _offers(_build_fp8_paged_graph(16, thd=True)), "THD queries over FP8 pools are not wired (the FP8 THD path clamps runtime K/V descriptors)"
+    assert _offers(_build_fp8_paged_graph(16, d=256))
+    assert not _offers(_build_fp8_paged_graph(16, d=512)), "paged KV for per-tensor FP8 d512 is not wired"
+    for d in (128, 256):
+        assert _offers(_build_fp8_paged_graph(16, d=d, thd=True))
+    assert not _offers(_build_fp8_paged_graph(16, d=64, thd=True)), "THD requires an exact native FP8 width"
     # Masks ride the same row: a causal bound (either alignment) and a left window are
     # offered.  Bottom-right alignment is a property of the band's diagonal: with no band
     # at all it is inert (the analyzer records an unmasked graph, which is offered); with a
@@ -1848,15 +1958,14 @@ def test_paged_graph_fp8_declines_off_contract():
 # names "d192" for the f16/bf16 kernel, so their config no longer refuses paged_kv.
 _PAGED_UNWIRED_KERNELS = [
     ("sm100/prefill_d192_d128_fp8.py", 0, 1),
-    ("sm100/prefill_d256_fp8.py", 0, 1),
     ("sm100/prefill_d512_fp8.py", 0, 2),
     ("sm100/prefill_d512_f16_2x2.py", 2, 2),
     ("sm107/prefill_d128_f16.py", 2, 2),
     ("sm107/prefill_d128_fp8.py", 0, 2),
-    ("sm107/prefill_d128_mxfp8.py", 0, 2),
+    ("sm107/prefill_d192_d128_mxfp8.py", 0, 2),
     ("sm107/prefill_d256_f16.py", 2, 2),
     ("sm107/prefill_d256_fp8.py", 0, 1),
-    ("sm107/prefill_d256_mxfp8.py", 0, 1),
+    ("sm107/prefill_d512_mxfp8.py", 0, 2),
 ]
 
 
@@ -1866,10 +1975,11 @@ def test_paged_unwired_kernels_refuse_paged_params(rel, dtype_qkv, cta_mma):
     """config_sm100._validate_params no longer keys the paged backstop off the dtype
     family (per-tensor FP8 d128 is wired now, MXFP8 shares its dtype codes) and names
     the d192 flavor for the f16/bf16 kernel, so each d128 / d192x128 / d256 / d512 kernel
-    file WITHOUT the PAGED_KV specialization -- the d192x128 / d256 / d512 FP8 flavors, the
-    d512 2x2-datapath twin and all six SM107 d128 / d256 siblings -- must refuse a paged
-    TemplateParams itself, at module scope -- never load its dense K/V descriptors over
-    a page pool."""
+    file WITHOUT the PAGED_KV specialization -- the d192x128 / d512 FP8 flavors, the
+    d512 2x2-datapath twin, the four SM107 d128 / d256 half and per-tensor FP8 siblings and
+    the SM107 d192x128 / d512 MXFP8 siblings (the SM107 d128 / d256 MXFP8 siblings carry
+    their own PAGED_KV loader) -- must refuse a paged TemplateParams itself, at module scope
+    (or in its config backstop) -- never load its dense K/V descriptors over a page pool."""
     from cudnn.frost.template_loader import load_template
     from cudnn.sdpa.fwd import api_dsl
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
@@ -1925,12 +2035,13 @@ def test_paged_adapter_declines_sm107_device(monkeypatch, fp8):
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 7))
-    with pytest.raises(NotImplementedError, match="Rubin paged KV requires half D128/D256 THD"):
+    with pytest.raises(NotImplementedError, match="Rubin paged KV serves half THD queries, MXFP8 pools on D128/D256"):
         _api().check_support()
 
 
 @pytest.mark.L0
-def test_paged_adapter_fp8_cuda_graph_replay_no_host_sync_and_plan_time_key():
+@pytest.mark.parametrize("d", [128, 256])
+def test_paged_adapter_fp8_cuda_graph_replay_no_host_sync_and_plan_time_key(d):
     """FP8 twin of test_paged_adapter_cuda_graph_replay_no_host_sync (Rule 3), plus
     Rule 4: one compiled artifact serves a bigger pool and a wider block table
     (num_pages / max_pages are dynamic extents), so the SECOND execute takes no
@@ -1940,11 +2051,11 @@ def test_paged_adapter_fp8_cuda_graph_replay_no_host_sync_and_plan_time_key():
     B, H, KH, P, max_pages = 8, 16, 4, 16, 64
     dev, in_key = "cuda", "e4m3"
     lens0 = [1000] * B
-    k_pool, v_pool, k_c, v_c, bt4, dk, dv = _pools_fp8(B, KH, D, P, max_pages, False, in_key, [max_pages * P] * B, seed=1)
+    k_pool, v_pool, k_c, v_c, bt4, dk, dv = _pools_fp8(B, KH, d, P, max_pages, False, in_key, [max_pages * P] * B, seed=1)
     bt = bt4.view(B, max_pages)
-    q8, dq = _fp8_quant(torch.randn(B, 1, H, D, device=dev) * 0.5, in_key)
+    q8, dq = _fp8_quant(torch.randn(B, 1, H, d, device=dev) * 0.5, in_key)
     q_gpu = q8.transpose(1, 2)
-    o_gpu = torch.empty(B, 1, H, D, device=dev, dtype=torch.float16).transpose(1, 2)
+    o_gpu = torch.empty(B, 1, H, d, device=dev, dtype=torch.float16).transpose(1, 2)
     lse = torch.empty(B, H, 1, device=dev, dtype=torch.float32)
     amax = torch.zeros(1, device=dev, dtype=torch.float32)
     seq_lens = torch.tensor(lens0, dtype=torch.int32, device=dev)
@@ -1967,6 +2078,8 @@ def test_paged_adapter_fp8_cuda_graph_replay_no_host_sync_and_plan_time_key():
     )
     api.check_support()
     api.compile()
+    assert api._k_mod.CFG.TILE_K == api._k_mod.CFG.TILE_O == d
+    assert api._k_mod.CFG.PAGED_KV
     ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=dev, dtype=torch.uint8)
     ex = dict(
         lse_tensor=lse,
@@ -1993,7 +2106,7 @@ def test_paged_adapter_fp8_cuda_graph_replay_no_host_sync_and_plan_time_key():
                 api.execute(q_gpu, k_c, v_c, o_gpu, **ex)
             finally:
                 torch.cuda.set_sync_debug_mode(prev_sync_mode)
-        scale = 1.0 / math.sqrt(D)
+        scale = 1.0 / math.sqrt(d)
         for new_lens in ([5, 1024, 77, 128, 129, 1, 512, 1000], [1024] * B, [0, 1, 2, 3, 4, 5, 6, 7]):
             seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32))
             g.replay()
@@ -2001,7 +2114,7 @@ def test_paged_adapter_fp8_cuda_graph_replay_no_host_sync_and_plan_time_key():
             ref_o, ref_lse = _ref_fp8(q8, k_pool, v_pool, bt, seq_lens, False, scale, dq, dk, dv, in_key, 1, max_pages * P)
             live = seq_lens > 0
             _check_fp8_o(o_gpu.float(), ref_o, torch.float16, in_key)
-            torch.testing.assert_close(lse.view(B, H)[live], ref_lse.view(B, H)[live], atol=5e-3, rtol=0)
+            torch.testing.assert_close(lse.view(B, H)[live], ref_lse.view(B, H)[live], atol=_fp8_lse_atol(d), rtol=0)
         # Rule 4: a WIDER block table (more max_pages than the plan saw -- the static KV
         # maximum the kernel derives grows with it) over the same declared pool binds
         # the same artifact: no new compile() miss.  The extra slots are dead (never
@@ -2032,13 +2145,14 @@ def test_paged_adapter_fp8_cuda_graph_replay_no_host_sync_and_plan_time_key():
         ref_o, ref_lse = _ref_fp8(q8, k_pool, v_pool, bt2, lens2, False, scale, dq, dk, dv, in_key, 1, wide_pages * P)
         live = lens2 > 0
         _check_fp8_o(o_gpu.float(), ref_o, torch.float16, in_key)
-        torch.testing.assert_close(lse.view(B, H)[live], ref_lse.view(B, H)[live], atol=5e-3, rtol=0)
+        torch.testing.assert_close(lse.view(B, H)[live], ref_lse.view(B, H)[live], atol=_fp8_lse_atol(d), rtol=0)
     finally:
         g.reset()
 
 
 @pytest.mark.L0
-def test_paged_adapter_fp8_rejects_unequal_table_extents():
+@pytest.mark.parametrize("d", [128, 256])
+def test_paged_adapter_fp8_rejects_unequal_table_extents(d):
     """Direct API: K and V block tables of different page-axis extents are declined
     by name in execute() before any launch (the kernel compiles both tables on one
     dynamic extent and reads its KV maximum from the K table); equal extents --
@@ -2049,11 +2163,11 @@ def test_paged_adapter_fp8_rejects_unequal_table_extents():
     B, H, KH, P, max_pages = 8, 16, 4, 16, 64
     dev, in_key = "cuda", "e4m3"
     lens = [1000, 1024, 77, 0, 1, 640, 999, 300]
-    k_pool, v_pool, k_c, v_c, bt4, dk, dv = _pools_fp8(B, KH, D, P, max_pages, False, in_key, [max_pages * P] * B, seed=1)
+    k_pool, v_pool, k_c, v_c, bt4, dk, dv = _pools_fp8(B, KH, d, P, max_pages, False, in_key, [max_pages * P] * B, seed=1)
     bt = bt4.view(B, max_pages)
-    q8, dq = _fp8_quant(torch.randn(B, 1, H, D, device=dev) * 0.5, in_key)
+    q8, dq = _fp8_quant(torch.randn(B, 1, H, d, device=dev) * 0.5, in_key)
     q_gpu = q8.transpose(1, 2)
-    o_gpu = torch.empty(B, 1, H, D, device=dev, dtype=torch.float16).transpose(1, 2)
+    o_gpu = torch.empty(B, 1, H, d, device=dev, dtype=torch.float16).transpose(1, 2)
     lse = torch.empty(B, H, 1, device=dev, dtype=torch.float32)
     amax = torch.zeros(1, device=dev, dtype=torch.float32)
     seq_lens = torch.tensor(lens, dtype=torch.int32, device=dev)
@@ -2076,6 +2190,8 @@ def test_paged_adapter_fp8_rejects_unequal_table_extents():
     )
     api.check_support()
     api.compile()
+    assert api._k_mod.CFG.TILE_K == api._k_mod.CFG.TILE_O == d
+    assert api._k_mod.CFG.PAGED_KV
     ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=dev, dtype=torch.uint8)
     ex = dict(lse_tensor=lse, seq_kv_lens=seq_lens, seq_q_lens=seq_q, workspace=ws, descale_q=dqt, descale_k=dkt, descale_v=dvt, scale_o=sot, amax_o=amax)
     # Reject: a V table 24 pages wider than the K table (both otherwise valid).
@@ -2088,11 +2204,11 @@ def test_paged_adapter_fp8_rejects_unequal_table_extents():
     # Accept: a distinct V table of the SAME extent (a copy) binds and computes.
     api.execute(q_gpu, k_c, v_c, o_gpu, block_table=bt, block_table_v=bt.clone(), **ex)
     torch.cuda.synchronize()
-    scale = 1.0 / math.sqrt(D)
+    scale = 1.0 / math.sqrt(d)
     ref_o, ref_lse = _ref_fp8(q8, k_pool, v_pool, bt, seq_lens, False, scale, dq, dk, dv, in_key, 1, max_pages * P)
     live = seq_lens > 0
     _check_fp8_o(o_gpu.float(), ref_o, torch.float16, in_key)
-    torch.testing.assert_close(lse.view(B, H)[live], ref_lse.view(B, H)[live], atol=5e-3, rtol=0)
+    torch.testing.assert_close(lse.view(B, H)[live], ref_lse.view(B, H)[live], atol=_fp8_lse_atol(d), rtol=0)
 
 
 @pytest.mark.L0
@@ -2338,13 +2454,14 @@ def _build_mxfp8(
     poison_dead_pages=True,
     q_bhsd=False,
     mixed_layout=False,
+    attn_scale=None,
 ):
-    """-> (graph, variant pack, O, Stats, amax, reference inputs)."""
+    """-> (graph, variant pack, O, Stats, amax, reference inputs).  ``attn_scale`` None = 1 / sqrt(d_qk)."""
     import cudnn
 
     dev = "cuda"
     fp8 = _FP8[in_key]
-    scale = 1.0 / math.sqrt(d_qk)
+    scale = 1.0 / math.sqrt(d_qk) if attn_scale is None else float(attn_scale)
     pools = _pools_mxfp8(B, KH, P, max_pages, hnd, fp8, d_qk=d_qk, d_v=d_v, separate_v=separate_v, batch_inner=batch_inner)
     if mixed_layout:  # HND K pool next to an NHD V pool
         pools["v_c"] = pools["v_c"].permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3) if hnd else pools["v_c"].contiguous()
@@ -2666,19 +2783,22 @@ def test_paged_mxfp8_graph_other_flavors(dims, hnd):
 
 
 @pytest.mark.L0
-def test_paged_mxfp8_adapter_declines_sm107_device(monkeypatch):
-    """check_support declines paged MXFP8 KV on a cc10.7 device (Rubin paged KV is half
-    THD only); the same adapter accepts the graph on the real SM100 device."""
-    import re
-
-    from cudnn.frost.buffers import cutedsl_arch_requirement_error
+@pytest.mark.parametrize("dims", [(128, 128), (256, 256), (192, 128), (512, 512)], ids=["d128", "d256", "d192x128", "d512"])
+def test_paged_mxfp8_adapter_sm107_device_contract(monkeypatch, dims):
+    """check_support on a mocked cc 10.7 device: MXFP8 pools are ACCEPTED on d128 / d256 (the cc 10.7 row's
+    paged_d_shapes -- the sm107 d128 / d256 MXFP8 kernels carry their own PAGED_KV loader) and declined on
+    d192x128 / d512 by the Rubin paged clause; the same adapter accepts every flavor on the real SM100 device.
+    The DSL's sm_107a model is monkeypatched (as the f16 twin does), so the paged capability boundary itself
+    is what is checked, not the worker's release DSL."""
+    from cudnn.frost import buffers
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
+    d_qk, d_v = dims
     B, H, KH, P, max_pages = 2, 8, 2, 128, 4
     dev = "cuda"
-    pools = _pools_mxfp8(B, KH, P, max_pages, False, _FP8["e4m3"])
-    Qb = torch.zeros(B, 1, H, D_MXFP8, device=dev, dtype=torch.float8_e4m3fn).transpose(1, 2)
-    Ob = torch.empty(B, 1, H, D_MXFP8, device=dev, dtype=torch.bfloat16).transpose(1, 2)
+    pools = _pools_mxfp8(B, KH, P, max_pages, False, _FP8["e4m3"], d_qk=d_qk, d_v=d_v)
+    Qb = torch.zeros(B, 1, H, d_qk, device=dev, dtype=torch.float8_e4m3fn).transpose(1, 2)
+    Ob = torch.empty(B, 1, H, d_v, device=dev, dtype=torch.bfloat16).transpose(1, 2)
     lse = torch.empty(B, H, 1, device=dev, dtype=torch.float32)
 
     def _api():
@@ -2695,12 +2815,18 @@ def test_paged_mxfp8_adapter_declines_sm107_device(monkeypatch):
             paged_max_seq_len_kv=max_pages * P,
         )
 
-    _api().check_support()
+    _api().check_support()  # the real SM100 device: every flavor
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 7))
-    # A DSL without sm_107a declines first; only a DSL that can target SM107 reaches the paged rule.
-    dsl_error = cutedsl_arch_requirement_error((10, 7))
-    with pytest.raises(NotImplementedError, match=re.escape(dsl_error) if dsl_error else "Rubin paged KV requires half D128/D256 THD"):
-        _api().check_support()
+    if dims in ((128, 128), (256, 256)):
+        try:
+            _api().check_support()
+        except NotImplementedError as e:  # an unrelated mocked-device decline fails visibly with its own text
+            assert "Rubin paged KV" not in str(e), e
+            raise
+    else:
+        with pytest.raises(NotImplementedError, match="Rubin paged KV serves half THD queries, MXFP8 pools on D128/D256"):
+            _api().check_support()
 
 
 @pytest.mark.L0
@@ -2781,4 +2907,319 @@ def test_paged_mxfp8_graph_declines_off_contract():
     assert not _offers(_plans(64)), "F8_128x4 pools hold whole 128-row SF atoms: page_size 64 is off-contract"
     assert not _offers(_plans(128, d_qk=64, d_v=64)), "MXFP8 is exact-native: no d64 envelope"
     assert not _offers(_plans(128, q_bhsd=True, s_q=4)), "the MXFP8 row serves BSHD-physical Q/O only (at s_q == 1 the layouts coincide)"
-    assert not _offers(_plans(128, mixed_layout=True)), "K and V pools must share an in-page layout"
+    assert _offers(_plans(128, mixed_layout=True)), "K and V layout kinds are independent"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("k_hnd,v_hnd", [(False, True), (True, False)])
+@pytest.mark.parametrize("kh", [1, 4])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "d,d_v,cga,s_q,split",
+    [
+        (64, 64, 1, 3, 2),
+        (128, 128, 1, 3, 2),
+        (128, 128, 2, 3, 1),
+        (192, 128, 2, 3, 1),
+        (256, 256, 2, 33, 1),
+        (256, 256, 2, 3, 2),
+        (512, 512, 2, 3, 1),
+    ],
+)
+def test_paged_independent_pool_layouts(k_hnd, v_hnd, kh, dtype, d, d_v, cga, s_q, split):
+    """Each pool keeps its own strides, including ambiguous singleton head layouts."""
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+    _run_graph(
+        2,
+        8,
+        kh,
+        d,
+        16,
+        16,
+        [251, 129],
+        k_hnd,
+        d_v=d_v,
+        dtype=dtype,
+        stats=True,
+        s_q=s_q,
+        pack_gqa=False,
+        causal_br=True,
+        v_hnd=v_hnd,
+        replay=True,
+        explicit_knobs=SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=cga, pack_gqa=False, split_kv=split),
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("hnd", [False, True])
+@pytest.mark.parametrize("dims", [(128, 128), (192, 128), (256, 256), (512, 512)])
+def test_paged_thd_independent_pool_layouts(hnd, dims):
+    _run_thd_graph(dims, hnd, v_hnd=not hnd, q_lens=[37, 130, 5], kv_lens=[300, 77, 129], pack_gqa=False)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("hnd", [False, True])
+@pytest.mark.parametrize("d", [64, 128, 256])
+@pytest.mark.parametrize("in_key", ["e4m3", "e5m2"])
+@pytest.mark.parametrize("split", [1, 2])
+def test_paged_fp8_independent_pool_layouts(hnd, d, in_key, split):
+    _run_graph_fp8(3, 8, 2, d, 16, 20, [300, 0, 129], hnd, v_hnd=not hnd, in_key=in_key, stats=True, s_q=3, explicit_split=split, causal="bottom_right")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("hnd", [False, True])
+@pytest.mark.parametrize("dims", [(128, 128), (192, 128), (256, 256), (512, 512)])
+def test_paged_mxfp8_independent_pool_layouts(hnd, dims):
+    _run_graph_mxfp8(3, 8, 2, 128, 3, [257, 0, 129], hnd, d_qk=dims[0], d_v=dims[1], stats=True, s_q=3, mixed_layout=True, separate_v=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [64, 128, 256])
+@pytest.mark.parametrize("in_key", ["e4m3", "e5m2"])
+@pytest.mark.parametrize(
+    "s_q,H,KH,pack,hnd,P,out_key,stats,causal",
+    [
+        (1, 8, 2, True, True, 16, "bf16", True, "bottom_right"),
+        (9, 8, 2, False, False, 128, "fp16", True, "top_left"),
+        (17, 16, 2, True, False, 16, "e4m3", False, "bottom_right"),
+        (3, 8, 8, False, True, 256, "e5m2", True, None),
+    ],
+)
+def test_paged_graph_fp8_sink(d, in_key, s_q, H, KH, pack, hnd, P, out_key, stats, causal):
+    """Sink epilogue composes with paged loading, including trimmed and keyless Q.
+
+    Both FP8 flavors, independent K/V layouts, packed/unpacked GQA, MHA and
+    multiple Q tiles are exercised. Each head's sink has a different magnitude.
+    """
+    sinks = torch.linspace(-120.0, 120.0, H, device="cuda", dtype=torch.float32).view(1, H, 1, 1)
+    _run_graph_fp8(
+        5,
+        H,
+        KH,
+        d,
+        P,
+        -(-513 // P),
+        [513, 127, 257, 0, 1],
+        hnd,
+        in_key=in_key,
+        out_dt=_FP8_OUT[out_key],
+        stats=stats,
+        s_q=s_q,
+        causal=causal,
+        window_left=128,
+        explicit_split=1,
+        explicit_pack=pack,
+        v_hnd=not hnd,
+        sinks=sinks,
+        q_lens=[s_q, max(1, s_q // 2), 0, s_q, s_q],
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d,cga", [(64, 1), (128, 1), (128, 2), (256, 1)])
+def test_paged_graph_fp8_sink_rebind_replay(d, cga):
+    """A retained graph reads changed lengths, sinks and table contents on device.
+
+    Rebinding the graph uses new allocations; poisoning O/Stats/Amax before
+    replay ensures the capture actually writes every output, including dead rows.
+    """
+    import cudnn
+
+    B, H, KH, P, pages, s_q = 4, 8, 2, 16, 20, 4
+    sinks = torch.linspace(-12.0, 12.0, H, device="cuda").view(1, H, 1, 1)
+    g, vp, ws, buffers, tensors = _run_graph_fp8(
+        B,
+        H,
+        KH,
+        d,
+        P,
+        pages,
+        [320] * B,
+        True,
+        s_q=s_q,
+        causal="bottom_right",
+        window_left=128,
+        explicit_split=1,
+        explicit_cga=cga,
+        sinks=sinks,
+        return_case=True,
+    )
+    # Independent storage for every operand, retaining each declared stride.
+    vp = {tensor: value.clone(memory_format=torch.preserve_format) for tensor, value in vp.items()}
+    buffers = {name: vp[tensor] for name, tensor in tensors.items()}
+    stream = torch.cuda.Stream()
+    handle = cudnn.create_handle()
+    cudnn.set_stream(handle, stream.cuda_stream)
+    captured = torch.cuda.CUDAGraph()
+    try:
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            g.execute(vp, ws, handle=handle)
+        stream.synchronize()
+        with torch.cuda.graph(captured, stream=stream):
+            g.execute(vp, ws, handle=handle)
+        for lens, qlens, sink_value in [([1, 0, 129, 257], [4, 4, 0, 2], -120.0), ([320, 127, 0, 17], [1, 4, 4, 0], 120.0)]:
+            buffers["seq_kv"].copy_(torch.tensor(lens, device="cuda", dtype=torch.int32).view(B, 1, 1, 1))
+            buffers["seq_q"].copy_(torch.tensor(qlens, device="cuda", dtype=torch.int32).view(B, 1, 1, 1))
+            buffers["sinks"].fill_(sink_value)
+            buffers["k_table"].copy_(buffers["k_table"].roll(1, dims=2))
+            buffers["v_table"].copy_(buffers["k_table"])
+            ref_o, ref_lse = _ref_fp8(
+                buffers["q"].transpose(1, 2),
+                buffers["k"],
+                buffers["v"],
+                buffers["k_table"].view(B, pages),
+                buffers["seq_kv"].view(B),
+                True,
+                1.0 / math.sqrt(d),
+                buffers["descale_q"].item(),
+                buffers["descale_k"].item(),
+                buffers["descale_v"].item(),
+                "e4m3",
+                s_q,
+                pages * P,
+                diag_align=cudnn.diagonal_alignment.BOTTOM_RIGHT,
+                left_bound=128,
+                right_bound=0,
+                sinks=buffers["sinks"],
+                seq_q_lens=buffers["seq_q"],
+            )
+            for name in ("o", "lse", "amax_o"):
+                buffers[name].fill_(float("nan"))
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                captured.replay()
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+            torch.cuda.synchronize()
+            _check_fp8_o(buffers["o"].float(), ref_o, torch.float16, "e4m3")
+            torch.testing.assert_close(buffers["lse"].view(B, H, s_q), ref_lse, atol=_fp8_lse_atol(d), rtol=0)
+            assert abs(buffers["amax_o"].item() - ref_o.abs().max().item()) <= 0.03
+    finally:
+        captured.reset()
+        cudnn.destroy_handle(handle)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("page_size,hnd,split", [(8, False, 1), (64, True, 2), (128, False, 1), (256, True, 2)])
+def test_paged_graph_fp8_d256_page_boundaries(page_size, hnd, split):
+    """Rank-5 dimension slabs keep their tile pitch across short/long pages."""
+    _run_graph_fp8(
+        5,
+        8,
+        2,
+        256,
+        page_size,
+        -(-513 // page_size),
+        [513, 129, 128, 1, 0],
+        hnd,
+        v_hnd=not hnd,
+        s_q=17,
+        stats=True,
+        causal="bottom_right",
+        window_left=200,
+        explicit_split=split,
+        explicit_cga=1,
+        explicit_pack=True,
+        q_lens=[17, 3, 0, 17, 17],
+    )
+
+
+@pytest.mark.L0
+def test_paged_graph_fp8_d256_matches_dense_arithmetic():
+    """Independent paged loads preserve D256's existing arithmetic exactly."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    sinks = torch.linspace(-120.0, 120.0, 8, device="cuda").view(1, 8, 1, 1)
+    _, _, _, bufs, _ = _run_graph_fp8(
+        5,
+        8,
+        8,
+        256,
+        256,
+        3,
+        [513, 127, 257, 0, 1],
+        True,
+        in_key="e4m3",
+        out_dt=torch.float8_e5m2,
+        s_q=3,
+        window_left=128,
+        explicit_split=1,
+        explicit_pack=False,
+        v_hnd=False,
+        sinks=sinks,
+        q_lens=[3, 1, 0, 3, 3],
+        return_case=True,
+    )
+    table, lengths = bufs["k_table"].view(5, 3), bufs["seq_kv"].view(5)
+    # Both containers have logical PHND axes, regardless of physical storage.
+    k, v = (_gather_pages_fp8(bufs[n], table, lengths.tolist(), True, 256, 768).transpose(1, 2).contiguous().transpose(1, 2) for n in ("k", "v"))
+    o, lse, amax = torch.empty_like(bufs["o"]), torch.empty_like(bufs["lse"].squeeze(-1)), torch.empty_like(bufs["amax_o"])
+    api = SdpaFwdDslSm100(
+        sample_q=bufs["q"],
+        sample_k=k,
+        sample_v=v,
+        sample_o=o,
+        sample_lse=lse,
+        seq_kv_lens_present=True,
+        seq_q_lens_present=True,
+        has_sink=True,
+        window_size_left=128,
+        pertensor_fp8=True,
+        dtype_o=o.dtype,
+        sched_policy=0,
+        cga=1,
+        pack_gqa=False,
+        split_kv=1,
+    )
+    api.check_support()
+    api.compile()
+    assert api._k_mod.CFG.TILE_K == 256 and not api._k_mod.CFG.PAGED_KV
+    ws = torch.empty(max(1, api.scratch_workspace_bytes()), device="cuda", dtype=torch.uint8)
+    api.execute(
+        bufs["q"],
+        k,
+        v,
+        o,
+        lse_tensor=lse,
+        sinks=sinks,
+        seq_kv_lens=lengths,
+        seq_q_lens=bufs["seq_q"].view(5),
+        workspace=ws,
+        descale_q=bufs["descale_q"],
+        descale_k=bufs["descale_k"],
+        descale_v=bufs["descale_v"],
+        scale_o=bufs["scale_o"],
+        amax_o=amax,
+    )
+    torch.testing.assert_close(o.float(), bufs["o"].float(), atol=0, rtol=0)
+    torch.testing.assert_close(lse, bufs["lse"].squeeze(-1), atol=0, rtol=0)
+    torch.testing.assert_close(amax, bufs["amax_o"], atol=0, rtol=0)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("page_size,pack,split,has_sink", [(16, True, 1, True), (256, False, 2, False)])
+def test_paged_graph_fp8_d256_persistent_batch_lengths(page_size, pack, split, has_sink):
+    """Later work on a persistent CTA must load its new batch's live pages."""
+    sinks = torch.linspace(-120.0, 120.0, 32, device="cuda").view(1, 32, 1, 1) if has_sink else None
+    _run_graph_fp8(
+        10,
+        32,
+        8,
+        256,
+        page_size,
+        -(-513 // page_size),
+        [513, 0, 1, 129, 256] * 2,
+        pack,
+        v_hnd=not pack,
+        s_q=257,
+        stats=True,
+        causal="bottom_right",
+        window_left=256,
+        explicit_split=split,
+        explicit_cga=1,
+        explicit_pack=pack,
+        q_lens=[257, 1, 0, 17, 257] * 2,
+        sinks=sinks,
+    )

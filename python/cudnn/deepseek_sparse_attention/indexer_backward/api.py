@@ -9,14 +9,20 @@ Combines backend-specific CuTe-DSL kernels:
 * IndexerBackwardSm90 or IndexerBackwardSm100 -- warp-specialized backward (kernel 2).
 * DenseIndexerBackward uses the dense full-KV score-grad + GEMM factories.
 
-When the ``dIndexK`` output buffer is bf16, a trailing pure-torch cast
-(FP32 accumulator → bf16) finishes the pipeline (kernel 3); an fp32
-``dIndexK`` buffer receives the accumulator directly, with no cast.
+In ordinary execution, a bf16 ``dIndexK`` output receives a trailing pure-torch
+cast from its FP32 accumulator (kernel 3); an fp32 ``dIndexK`` buffer is the
+accumulator itself. The ordinary fp32 accumulator behind a bf16 ``dIndexK``
+(and the ordinary sm100_v2 ticket counter) is carved from the caller's
+workspace. Deterministic execution instead uses a compile-time-selected set of
+CTA-private FP32 dK planes and a fixed-order reduction that converts directly to
+the requested output dtype.
+``scratch_workspace_bytes()`` reports the selected policy's exact size for
+``execute(..., workspace=)``; the plans own no device memory (Rule 8, R2).
 """
 
 from __future__ import annotations
 
-import threading
+import math
 from typing import Optional
 
 import torch
@@ -24,7 +30,9 @@ import cuda.bindings.driver as cuda
 
 from cudnn.deepseek_sparse_attention.utils.runtime import device_capability
 
-from cudnn.api_base import APIBase, TupleDict
+from cudnn._torch_stream import contiguous_on_stream, copy_into_on_stream
+from cudnn.api_base import APIBase, TupleDict, WorkspaceCarver, ws_align
+from cudnn.frost.buffers import memset_zero_async
 from cudnn.tensor_adapter import canonicalize_unit_dim_strides
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     resolve_stream as _resolve_stream,
@@ -34,25 +42,25 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
 
 from .dense_indexer_backward_sm100 import dense_indexer_backward_sm100
 from .dense_indexer_backward_sm90 import dense_indexer_backward_sm90
+from .deterministic_dk_sm100 import (
+    DEFAULT_DK_PLANES,
+    INDEXER_BACKWARD_SM100_CAPABILITIES,
+    deterministic_dk_producer_ctas,
+    deterministic_dk_workspace_bytes,
+    validate_deterministic_dk_plane_policy,
+)
 from .indexer_backward_v2_sm100 import indexer_backward_v2_sm100
 from .indexer_backward_sm100 import indexer_backward_sm100
 from .indexer_backward_sm90 import indexer_backward_sm90
 
 # Compute-backend selector for the sparse indexer backward. ``"default"`` is
 # the architecture-generic path (SM90 or SM100); ``"sm100_v2"`` is the
-# SM100-only v2 backend (two-term bf16-expansion GEMM, deterministic
+# SM100/SM103 v2 backend (two-term bf16-expansion GEMM, deterministic
 # d_weights). The value is architecture-explicit on purpose: it names the arch
 # it targets so it is self-evidently capability-gated (``check_support`` is
-# request-or-fail on non-SM100) and the enum can grow new backends without
+# request-or-fail outside its explicit capability set) and the enum can grow new backends without
 # overloading a boolean. It is part of the wrapper plan-cache key.
 INDEXER_BACKWARD_BACKENDS = ("default", "sm100_v2")
-
-# CUDA's magic per-thread default-stream handle (``cudaStreamPerThread`` /
-# ``CU_STREAM_PER_THREAD``): the integer 2 in every host thread, each time
-# denoting that thread's own stream. Handles 0 and 1 (the legacy default
-# stream) are global rather than per-thread, so this is the only handle value
-# that needs a thread discriminator in the plan-cache key.
-_CUDA_STREAM_PER_THREAD = 2
 
 
 def _validate_indexer_backward_backend(backend: str) -> None:
@@ -68,14 +76,33 @@ def _validate_grad_loss_tensor(grad_loss: torch.Tensor, device: torch.device) ->
     return grad_loss.detach().view(1)
 
 
-def _contiguous_input(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor if tensor.is_contiguous() else tensor.contiguous()
+def _validate_deterministic_workspace_disjoint(workspace: torch.Tensor, required: int, **operands: torch.Tensor) -> None:
+    """Reject overlap between the live deterministic scratch and any operand.
+
+    Only the ``required``-byte prefix is live scratch. This permits disjoint
+    views of one allocation and avoids treating empty tensors as aliases.
+    """
+    WorkspaceCarver(workspace, required, "deterministic IndexerBackward")
+    workspace_begin = workspace.data_ptr()
+    workspace_end = workspace_begin + required
+    for name, tensor in operands.items():
+        if tensor is None or tensor.numel() == 0:
+            continue
+        tensor_begin = tensor.data_ptr()
+        tensor_end = tensor_begin + tensor.numel() * tensor.element_size()
+        if workspace_begin < tensor_end and tensor_begin < workspace_end:
+            raise ValueError(f"deterministic IndexerBackward workspace must not overlap {name}")
 
 
-def _contiguous_mutable(tensor: torch.Tensor) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+def _contiguous_input(tensor: torch.Tensor, stream) -> torch.Tensor:
+    # Wrapper-surface staging on the launch stream; the original is record_stream'ed there first (R1).
+    return contiguous_on_stream(tensor, stream, tensor.device)
+
+
+def _contiguous_mutable(tensor: torch.Tensor, stream) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     if tensor.is_contiguous():
         return tensor, None
-    return tensor.contiguous(), tensor
+    return contiguous_on_stream(tensor, stream, tensor.device), tensor
 
 
 def _contiguous_output(tensor: torch.Tensor) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -84,9 +111,9 @@ def _contiguous_output(tensor: torch.Tensor) -> tuple[torch.Tensor, Optional[tor
     return torch.empty_like(tensor, memory_format=torch.contiguous_format), tensor
 
 
-def _copy_back_if_needed(tensor: torch.Tensor, original: Optional[torch.Tensor]) -> None:
+def _copy_back_if_needed(tensor: torch.Tensor, original: Optional[torch.Tensor], stream) -> None:
     if original is not None:
-        original.copy_(tensor)
+        copy_into_on_stream(original, tensor, stream, original.device)  # R1 staging: the destination is recorded first
 
 
 def _max_from_cu_seqlens(cu_seqlens: torch.Tensor, name: str) -> int:
@@ -154,6 +181,37 @@ def _dense_shapes(
     return False, batch, batch * seqlen_q, batch * seqlen_k, heads, head_dim, seqlen_q, seqlen_k
 
 
+def _check_execute_signature(wrapper_name: str, *entries) -> None:
+    """Validate runtime tensors against the descriptors captured at plan-build
+    time, before any kernel launch.
+
+    Each entry is ``(tensor, descriptor, name)``. Guards against reusing a
+    directly-built/exported plan with a tensor whose dtype, shape, or
+    stride/layout differs from what it was compiled for — kernel 1 overwrites
+    ``attn_score`` in place, so a mismatch must raise *before* the pipeline
+    starts (no fail-dirty).
+    """
+    for tensor, desc, name in entries:
+        if desc is None:
+            continue
+        if tensor.dtype != desc.dtype:
+            raise ValueError(
+                f"{name} dtype mismatch: this plan was compiled for {desc.dtype}, got {tensor.dtype}. Build a new plan (or use {wrapper_name}) for a different signature."
+            )
+        tensor_shape = tuple(tensor.shape)
+        desc_shape = tuple(desc.shape)
+        if tensor_shape != desc_shape:
+            raise ValueError(f"{name} shape mismatch: this plan was compiled for {desc_shape}, got {tensor_shape}.")
+        # Compare layouts with the same unit-dim canonicalization the framework
+        # uses for compile-equality (extent-1 dims carry an unobservable stride):
+        # the compiled kernel bakes in the sample stride/layout.
+        tensor_stride = tuple(tensor.stride())
+        if tensor_stride != tuple(desc.stride) and canonicalize_unit_dim_strides(tensor_shape, tensor_stride) != canonicalize_unit_dim_strides(
+            desc_shape, tuple(desc.stride)
+        ):
+            raise ValueError(f"{name} stride/layout mismatch: this plan was compiled for stride {tuple(desc.stride)}, got {tensor_stride}.")
+
+
 class IndexerBackward(APIBase):
     """End-to-end indexer backward (staged pipeline).
 
@@ -176,14 +234,39 @@ class IndexerBackward(APIBase):
        avoid a fail-dirty.
     2. Kernel 1 — in-place score-grad precompute (overwrites ``attn_score``
        with ``grad_signal`` and reads ``index_score`` without modifying it).
-    3. (conditional) fp32 ``d_index_k`` zero-init — when the ``d_index_k``
-       output buffer is fp32, ``execute`` zeroes it on the selected stream
-       before the GEMM, because the dK epilogue atomic-adds into it. This is a
-       promised stage, not a hidden op; a bf16 ``d_index_k`` buffer instead
-       gets an internally-allocated zeroed fp32 scratch + trailing cast.
+    3. fp32 dK accumulator zero-init — the ordinary dK epilogue atomic-adds, so its
+       fp32 target starts zeroed on the launch stream. An fp32 ``d_index_k``
+       buffer is that target and is zeroed in place (a promised stage, not a
+       hidden op); a bf16 ``d_index_k`` buffer instead accumulates into a
+       ``B * S_k * D`` fp32 view carved from the caller's ``workspace`` and
+       receives a trailing cast (kernel 3). ``scratch_workspace_bytes()``
+       is the size to allocate; ``execute`` raises ``ValueError`` when it is
+       non-zero and no workspace is passed, before ``attn_score`` is touched.
     4. Kernel 2 — warp-specialized backward GEMM producing the gradients.
 
-    ``backend="sm100_v2"`` (SM100 only, request-or-fail: ``check_support``
+    On SM100 the default backend accepts compact H32 inputs and outputs.
+    TCGEN05 still executes its minimum legal M64 tile internally: TMA
+    zero-fills the out-of-bounds Q rows, the kernel zero-fills the matching
+    weights, and stores are clipped to the caller's H32 tensors. No caller-side
+    H32→H64 padding or output slicing is required.
+
+    ``deterministic=True`` is an SM100/SM103 request-or-fail policy for H=32 or
+    H=64 on the default backend (H=64 on ``sm100_v2``), D=128, block_I=128,
+    and 128-multiple top-k in [128, 2048]. It launches up
+    to ``deterministic_dk_planes`` persistent CTAs over fixed grid-stride query
+    rows and allocates one CTA-private FP32 dK plane for each possible producer.
+    The plane count is a compile-time specialization selected from
+    ``{96, 128, 148}`` (default 96). A final kernel folds the planes in CTA
+    order.
+    dQ/dW remain single-writer. The deterministic scratch is
+    ``deterministic_dk_planes * B * S_k * D * 4`` bytes,
+    independent of output dtype. Its live byte range must not overlap any input
+    or output and is validated before the scratch is cleared. As with a top-k
+    result, valid indices within each query row must be unique; duplicate
+    scatter targets inside one row are outside the deterministic contract. A
+    warmed plan with caller-owned outputs and scratch is CUDA Graph compatible.
+
+    ``backend="sm100_v2"`` (SM100/SM103, request-or-fail: ``check_support``
     raises outside the envelope, there is no silent fallback) selects an
     alternative GEMM stage that upcasts the weights to fp32 in-register and
     splits the per-slot fp32 gradient matrix into a two-term bf16 expansion
@@ -193,7 +276,8 @@ class IndexerBackward(APIBase):
     of the 24 fp32 significand bits — measured ~675x lower gradient-matrix
     representation error than the default single-bf16 rounding);
     ``d_weights`` is additionally reduced deterministically (bitwise
-    run-to-run, as is ``d_index_q``). Same wrapper contract: ``attn_score`` is
+    run-to-run, as is ``d_index_q``). With ``deterministic=True``, dK is also
+    bitwise reproducible. Same wrapper contract: ``attn_score`` is
     the in-place score scratch and ``index_score`` remains read-only. Output
     dtype selects output precision: ``d_weights``
     and ``d_index_k`` accept fp32 buffers, which receive the fp32
@@ -201,14 +285,15 @@ class IndexerBackward(APIBase):
     output buffers**; bf16 output buffers round the result and keep only the
     bf16-representation floor. Requires H == 64, D == 128,
     topk % 128 == 0 with 128 <= topk <= 2048, block_I == 128, sm_scale > 0,
-    contiguous same-device tensors. Executions of one object must not
-    overlap on the device (per-plan ticket-counter workspace; see the
-    backend module docstring — the ``indexer_backward_wrapper`` keys its
-    cache on the device and on the resolved stream, so wrapper users get
-    one object per device/stream automatically). One object serves one
-    device: the per-plan workspace lives on the sample tensors' device, and
-    ``execute`` rejects tensors on any other device. ``backend`` must be one
-    of ``{"default", "sm100_v2"}``.
+    contiguous same-device tensors. Ordinarily, its dynamic-ticket counter is
+    8 bytes of the caller's ``workspace`` (the first ``ws_align(8)`` bytes,
+    ahead of the bf16 dK accumulator), zeroed on the launch stream at every
+    ``execute``. Deterministic execution replaces both regions with its dK
+    planes. The plan owns nothing and is bound to no device;
+    executions that share one workspace buffer must not overlap on the device
+    (``indexer_backward_wrapper`` allocates a fresh one per call). The
+    workspace must live on ``index_q.device``. ``backend`` must be one of
+    ``{"default", "sm100_v2"}``.
     """
 
     def __init__(
@@ -226,7 +311,10 @@ class IndexerBackward(APIBase):
         block_I: int = 128,
         topk_indices_global: bool = False,
         backend: str = "default",
+        deterministic: bool = False,
+        deterministic_dk_planes: int = DEFAULT_DK_PLANES,
     ):
+        """Capture a shape-specialized plan and its execution policy."""
         super().__init__()
         self.iq_desc = self._make_tensor_desc(sample_index_q, name="sample_index_q")
         self.w_desc = self._make_tensor_desc(sample_weights, name="sample_weights")
@@ -266,6 +354,8 @@ class IndexerBackward(APIBase):
         self.topk_indices_global = bool(topk_indices_global)
         _validate_indexer_backward_backend(backend)
         self.backend = backend
+        self.deterministic = bool(deterministic)
+        self.deterministic_dk_planes = validate_deterministic_dk_plane_policy(self.deterministic, deterministic_dk_planes)
         # Derived gate kept so the internal dispatch/validation sites read a
         # single boolean; ``backend`` remains the public, cache-keyed selector.
         self.use_v2 = backend == "sm100_v2"
@@ -332,26 +422,35 @@ class IndexerBackward(APIBase):
         self._plan_layout_validated = True
 
     def check_support(self) -> bool:
+        """Validate the common tensor contract and selected backend envelope."""
+        if self.deterministic:
+            deterministic_dk_producer_ctas(self.batch * self.seqlen, self.deterministic_dk_planes)
         # The generic gate reads the plan's own device for backend="sm100_v2"
-        # (its kernel and workspace are bound to that device, and a param-less
-        # query would reject a valid plan whenever an unrelated pre-SM90 device
+        # (its kernel is compiled under that device, and a param-less query
+        # would reject a valid plan whenever an unrelated pre-SM90 device
         # happens to be current, masking the specific v2 gate below). The
         # default path keeps the pre-existing current-device query, so it stays
         # self-consistent with the sm90/sm100 factories, which check the
         # current device themselves.
-        major, _ = torch.cuda.get_device_capability(self.iq_desc.device if self.use_v2 else None)
+        capability = torch.cuda.get_device_capability(self.iq_desc.device if self.use_v2 or self.deterministic else None)
+        major, _ = capability
         self._runtime_error_if(
             major != 9 and major < 10,
             f"IndexerBackward requires SM90 or SM100+, found SM{major}",
         )
+        if not self.use_v2 and major >= 10:
+            self._value_error_if(
+                self.heads != 32 and self.heads < 64,
+                f"the default SM100 IndexerBackward requires H=32 or H>=64, got H={self.heads}",
+            )
         if self.use_v2:
             b, s_q, s_k = self.batch, self.seqlen, self.seqlen_k
             h, d, topk = self.heads, self.head_dim, self.topk
             self._runtime_error_if(
-                torch.cuda.get_device_capability(self.iq_desc.device) != (10, 0),
-                f"backend='sm100_v2' requires an SM100 device (capability (10, 0)); the plan device "
-                f"{self.iq_desc.device} reports {torch.cuda.get_device_capability(self.iq_desc.device)} "
-                f"(use backend='default' on non-SM100)",
+                capability not in INDEXER_BACKWARD_SM100_CAPABILITIES,
+                f"backend='sm100_v2' requires capability in {INDEXER_BACKWARD_SM100_CAPABILITIES}; the plan device "
+                f"{self.iq_desc.device} reports {capability} "
+                f"(use backend='default' elsewhere)",
             )
             self._value_error_if(
                 h != 64 or d != 128,
@@ -408,6 +507,42 @@ class IndexerBackward(APIBase):
                     desc.device != self.iq_desc.device,
                     f"backend='sm100_v2' requires all tensors on one device: {name} is on {desc.device}, index_q on {self.iq_desc.device}",
                 )
+        self._value_error_if(
+            self.deterministic and capability not in INDEXER_BACKWARD_SM100_CAPABILITIES,
+            f"deterministic IndexerBackward requires capability in {INDEXER_BACKWARD_SM100_CAPABILITIES}, " f"found {capability}",
+        )
+        if self.deterministic:
+            if not self.use_v2:
+                deterministic_descs = (
+                    ("index_q", self.iq_desc),
+                    ("weights", self.w_desc),
+                    ("index_k", self.ik_desc),
+                    ("d_index_q", self.diq_desc),
+                    ("d_weights", self.dw_desc),
+                    ("d_index_k", self.dik_desc),
+                    ("attn_score", self.attn_desc),
+                    ("index_score", self.idx_score_desc),
+                    ("topk_indices", self.topk_desc),
+                )
+                for name, desc in deterministic_descs:
+                    self._value_error_if(
+                        desc.device != self.iq_desc.device,
+                        f"deterministic IndexerBackward requires all tensors on one device: {name} is on {desc.device}, index_q on {self.iq_desc.device}",
+                    )
+            deterministic_heads = (64,) if self.use_v2 else (32, 64)
+            self._value_error_if(
+                self.heads not in deterministic_heads or self.head_dim != 128,
+                f"deterministic IndexerBackward with backend='{self.backend}' requires "
+                f"H in {deterministic_heads}, D=128, got H={self.heads}, D={self.head_dim}",
+            )
+            self._value_error_if(
+                self.block_I != 128,
+                f"deterministic IndexerBackward requires block_I=128, got block_I={self.block_I}",
+            )
+            self._value_error_if(
+                self.topk % 128 != 0 or not (128 <= self.topk <= 2048),
+                "deterministic IndexerBackward requires topk % 128 == 0 with " f"128 <= topk <= 2048, got topk={self.topk}",
+            )
         self._check_dtype(self.iq_desc, torch.bfloat16, name="index_q")
         self._check_dtype(self.w_desc, torch.bfloat16, name="weights")
         self._check_dtype(self.ik_desc, torch.bfloat16, name="index_k")
@@ -449,6 +584,7 @@ class IndexerBackward(APIBase):
         return True
 
     def compile(self) -> None:
+        """Compile the selected backend on the sample tensors' CUDA device."""
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
@@ -458,7 +594,7 @@ class IndexerBackward(APIBase):
         # part of the cache key, and it's been removed from the factory
         # signature on both backends.
         if self.use_v2:
-            # SM100-only v2 backend (check_support gated). The
+            # SM100/SM103 v2 backend (check_support gated). The
             # d_weights output dtype is a compile-time kernel variant (the
             # deterministic accumulator is stored directly in the output
             # dtype); d_index_k dtype is handled at execute time. Build
@@ -477,10 +613,28 @@ class IndexerBackward(APIBase):
                     block_I=self.block_I,
                     topk_indices_global=self.topk_indices_global,
                     dw_out_dtype=self.dw_desc.dtype,
+                    deterministic=self.deterministic,
+                    deterministic_dk_planes=self.deterministic_dk_planes,
                 )
             return
-        # Default path: capability from the current device, unchanged from
-        # the pre-v2 code (the v2 branch above never reaches here).
+        if self.deterministic:
+            with torch.cuda.device(self.iq_desc.device):
+                self._compiled_kernel = indexer_backward_sm100(
+                    self.batch,
+                    self.seqlen,
+                    self.seqlen_k,
+                    self.heads,
+                    self.head_dim,
+                    self.topk,
+                    sm_scale=self.sm_scale,
+                    block_I=self.block_I,
+                    topk_indices_global=self.topk_indices_global,
+                    deterministic=True,
+                    deterministic_dk_planes=self.deterministic_dk_planes,
+                )
+            return
+        # Ordinary default path: capability from the current device, unchanged
+        # from the pre-deterministic code (the specialized branches returned).
         major, _ = torch.cuda.get_device_capability()
         kernel_factory = indexer_backward_sm90 if major == 9 else indexer_backward_sm100
         self._compiled_kernel = kernel_factory(
@@ -495,37 +649,23 @@ class IndexerBackward(APIBase):
             topk_indices_global=self.topk_indices_global,
         )
 
-    def _check_execute_signature(self, *entries) -> None:
-        """Validate runtime tensors against the descriptors captured at
-        plan-build time, before any kernel launch.
+    def scratch_workspace_bytes(self) -> int:
+        """Return caller-owned scratch bytes for the selected dK policy.
 
-        Each entry is ``(tensor, descriptor, name)``. Guards against reusing a
-        directly-built/exported plan with a tensor whose dtype, shape, or
-        stride/layout differs from what it was compiled for — kernel 1
-        overwrites ``attn_score`` in place, so a mismatch must raise *before*
-        the pipeline starts (no fail-dirty).
+        The ordinary sm100_v2 counter region comes first. Deterministic
+        execution instead uses ``deterministic_dk_planes`` dense FP32 CTA
+        planes regardless of output dtype; ordinary execution needs one dense
+        accumulator only for a bf16 ``d_index_k``.
         """
-        for tensor, desc, name in entries:
-            if desc is None:
-                continue
-            if tensor.dtype != desc.dtype:
-                raise ValueError(
-                    f"{name} dtype mismatch: this plan was compiled for {desc.dtype}, got {tensor.dtype}. Build a new plan (or use indexer_backward_wrapper) for a different signature."
-                )
-            tensor_shape = tuple(tensor.shape)
-            desc_shape = tuple(desc.shape)
-            if tensor_shape != desc_shape:
-                raise ValueError(f"{name} shape mismatch: this plan was compiled for {desc_shape}, got {tensor_shape}.")
-            # Compare layouts with the same unit-dim canonicalization the
-            # framework uses for compile-equality (extent-1 dims carry an
-            # unobservable stride): the compiled kernel bakes in the sample
-            # stride/layout, so a different stride would run the kernel against
-            # a layout it was not compiled for.
-            tensor_stride = tuple(tensor.stride())
-            if tensor_stride != tuple(desc.stride) and canonicalize_unit_dim_strides(tensor_shape, tensor_stride) != canonicalize_unit_dim_strides(
-                desc_shape, tuple(desc.stride)
-            ):
-                raise ValueError(f"{name} stride/layout mismatch: this plan was compiled for stride {tuple(desc.stride)}, got {tensor_stride}.")
+        counter = ws_align(8) if self.use_v2 and not self.deterministic else 0
+        if self.deterministic:
+            accumulator = deterministic_dk_workspace_bytes(self.batch, self.seqlen_k, self.head_dim, self.deterministic_dk_planes)
+        else:
+            accumulator = 0 if self.dik_desc.dtype == torch.float32 else ws_align(self.batch * self.seqlen_k * self.head_dim * 4)
+        return counter + accumulator
+
+    def _check_execute_signature(self, *entries) -> None:
+        _check_execute_signature("indexer_backward_wrapper", *entries)
 
     def execute(
         self,
@@ -541,7 +681,17 @@ class IndexerBackward(APIBase):
         grad_loss: torch.Tensor,
         loss_coeff: float = 1.0,
         current_stream: Optional[cuda.CUstream] = None,
+        workspace: Optional[torch.Tensor] = None,
     ) -> None:
+        """Run a compiled plan using caller-owned tensors and scratch.
+
+        This method allocates no device storage and revalidates the runtime
+        signature before launching. It overwrites ``attn_score`` with the
+        score gradient and preserves ``index_score``. ``workspace`` must cover
+        ``scratch_workspace_bytes()``; deterministic scratch must also be
+        disjoint from every operand. A warmed plan with stable outputs and
+        workspace is safe to capture and replay on ``current_stream``.
+        """
         self._logger.debug("Entering execute")
         # Stage 1: runtime signature re-validation against the descriptors
         # captured at plan-build time, BEFORE any kernel launch. The plan is
@@ -569,22 +719,33 @@ class IndexerBackward(APIBase):
             (index_score, self.idx_score_desc, "index_score"),
             (topk_indices, self.topk_desc, "topk_indices"),
         )
-        # One plan serves one device: the v2 backend's per-plan
-        # workspace (the ticket counter) lives on the sample tensors'
-        # device, so reject cross-device execution before kernel 1 overwrites
-        # ``attn_score``. The backend re-checks every
-        # tensor against index_q.device, so validating index_q covers all.
-        if self.use_v2 and index_q.device != self.iq_desc.device:
-            raise ValueError(
-                f"backend='sm100_v2' requires execute on the plan's device: index_q is on {index_q.device}, "
-                f"but this plan (and its per-plan workspace) is bound to {self.iq_desc.device} — "
-                f"build one IndexerBackward per device (the wrapper keys its plan cache on the device)"
+        # The scratch is carved from ``workspace`` on index_q's device; a
+        # missing or undersized buffer is a WorkspaceCarver error raised before
+        # kernel 1 overwrites ``attn_score``. Deterministic execution also
+        # rejects overlap between its live scratch prefix and every operand
+        # before the backend clears the planes.
+        if workspace is not None and workspace.device != index_q.device:
+            raise ValueError(f"IndexerBackward workspace must be on index_q's device {index_q.device}, got {workspace.device}")
+        grad_loss_tensor = _validate_grad_loss_tensor(grad_loss, index_q.device)
+        if self.deterministic:
+            _validate_deterministic_workspace_disjoint(
+                workspace,
+                self.scratch_workspace_bytes(),
+                index_q=index_q,
+                weights=weights,
+                index_k=index_k,
+                d_index_q=d_index_q,
+                d_weights=d_weights,
+                d_index_k=d_index_k,
+                attn_score=attn_score,
+                index_score=index_score,
+                topk_indices=topk_indices,
+                grad_loss=grad_loss_tensor,
             )
         # ``grad_scale`` is forwarded as a runtime ``Float32`` arg; the
         # compiled kernel is reused when loss_coeff changes for the same
         # cached tensor shape.
         grad_scale = float(loss_coeff) / (int(self.batch) * int(self.seqlen))
-        grad_loss_tensor = _validate_grad_loss_tensor(grad_loss, index_q.device)
         self._compiled_kernel(
             index_q,
             weights,
@@ -598,6 +759,7 @@ class IndexerBackward(APIBase):
             grad_loss_tensor,
             grad_scale,
             current_stream,
+            workspace=workspace,
         )
 
 
@@ -607,6 +769,13 @@ class DenseIndexerBackward(APIBase):
     Consumes raw dense attention/indexer score tensors and their denominators,
     computes the dense KL score gradient, then runs the indexer GEMM backward
     to produce ``d_index_q``, ``d_weights``, and ``d_index_k``.
+
+    The dK epilogue reduce-adds into an fp32 target zeroed on the launch
+    stream: an fp32 ``d_index_k`` in place, a bf16 ``d_index_k`` through an
+    fp32 accumulator carved from the caller's ``workspace``
+    (``scratch_workspace_bytes()``; ``execute(..., workspace=)``) followed by
+    a trailing cast. ``execute`` raises ``ValueError`` when the workspace is
+    required and absent, before any buffer is mutated.
     """
 
     def __init__(
@@ -687,6 +856,32 @@ class DenseIndexerBackward(APIBase):
         self._value_error_if(self.block_I <= 0, f"block_I must be positive, got {self.block_I}")
         self._value_error_if(self.ratio < 1, f"ratio must be >= 1, got {self.ratio}")
         self._value_error_if(self.heads < 64, f"DenseIndexerBackward requires heads >= 64, got {self.heads}")
+        # Cross-tensor shape contract (the wrapper's ``_dense_shapes``, restated on the
+        # descriptors): a directly built plan may pair tensors that each match their own
+        # descriptor yet disagree with each other, and the kernel sizes its grid and the
+        # dK store from index_q / index_k, not from the gradient buffers -- a smaller
+        # d_index_k would be written past its end. Rejected here, before compile.
+        t_q, t_k, h, d = self.normalization_tokens, self.total_k, self.heads, self.head_dim
+        if self.is_thd:
+            q_shape, w_shape, k_shape = (t_q, h, d), (t_q, h), (t_k, d)
+            score_shape, denom_shape = (t_q, self.max_seqlen_k), (t_q,)
+        else:
+            b, s_q, s_k = self.batch, self.max_seqlen_q, self.max_seqlen_k
+            q_shape, w_shape, k_shape = (b, s_q, h, d), (b, s_q, h), (b, s_k, d)
+            score_shape, denom_shape = (b, s_q, s_k), (b, s_q)
+        for name, desc, shape in (
+            ("index_q", self.iq_desc, q_shape),
+            ("weights", self.w_desc, w_shape),
+            ("index_k", self.ik_desc, k_shape),
+            ("d_index_q", self.diq_desc, q_shape),
+            ("d_weights", self.dw_desc, w_shape),
+            ("d_index_k", self.dik_desc, k_shape),
+            ("attn_score", self.attn_desc, score_shape),
+            ("attn_l1norm", self.attn_denom_desc, denom_shape),
+            ("index_score", self.idx_score_desc, score_shape),
+            ("index_lse", self.idx_lse_desc, denom_shape),
+        ):
+            self._check_tensor_shape(desc, shape, name=name)
         self._is_supported = True
         return True
 
@@ -709,6 +904,13 @@ class DenseIndexerBackward(APIBase):
             has_q_causal_offsets=self.has_q_causal_offsets,
         )
 
+    def scratch_workspace_bytes(self) -> int:
+        """Bytes of caller scratch ``execute`` carves (R2): the fp32 dK
+        accumulator behind a bf16 ``d_index_k``; zero for an fp32 ``d_index_k``."""
+        if self.dik_desc.dtype == torch.float32:
+            return 0
+        return ws_align(math.prod(self.dik_desc.shape) * 4)
+
     def execute(
         self,
         index_q: torch.Tensor,
@@ -727,18 +929,37 @@ class DenseIndexerBackward(APIBase):
         cu_seqlens_k: Optional[torch.Tensor] = None,
         q_causal_offsets: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        workspace: Optional[torch.Tensor] = None,
     ) -> None:
-        with _torch_stream_context(current_stream):
-            grad_loss_tensor = _validate_grad_loss_tensor(grad_loss, index_q.device)
-            grad_scale = float(loss_coeff) / max(int(self.normalization_tokens), 1)
+        launch_stream = _resolve_stream(current_stream)
+        # A directly-built plan may be handed tensors it was not compiled for:
+        # validate every runtime tensor against its descriptor before the carve
+        # and the first (in-place) kernel.
+        _check_execute_signature(
+            "dense_indexer_backward_wrapper",
+            (index_q, self.iq_desc, "index_q"),
+            (weights, self.w_desc, "weights"),
+            (index_k, self.ik_desc, "index_k"),
+            (d_index_q, self.diq_desc, "d_index_q"),
+            (d_weights, self.dw_desc, "d_weights"),
+            (d_index_k, self.dik_desc, "d_index_k"),
+            (attn_score, self.attn_desc, "attn_score"),
+            (attn_l1norm, self.attn_denom_desc, "attn_l1norm"),
+            (index_score, self.idx_score_desc, "index_score"),
+            (index_lse, self.idx_lse_desc, "index_lse"),
+        )
+        grad_loss_tensor = _validate_grad_loss_tensor(grad_loss, index_q.device)
+        grad_scale = float(loss_coeff) / max(int(self.normalization_tokens), 1)
 
-            # Dense backward's dK path uses atomic/bulk reductions into fp32.
-            d_index_k_target = d_index_k
-            if d_index_k.dtype == torch.float32:
-                d_index_k_f32 = d_index_k
-                d_index_k_f32.zero_()
-            else:
-                d_index_k_f32 = torch.zeros_like(d_index_k, dtype=torch.float32)
+        # Both dense factories reduce-add dK into a pre-zeroed fp32 target.
+        if d_index_k.dtype == torch.float32:
+            d_index_k_f32 = d_index_k
+        else:
+            carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "DenseIndexerBackward")
+            if workspace.device != index_q.device:
+                raise ValueError(f"DenseIndexerBackward workspace must be on index_q's device {index_q.device}, got {workspace.device}")
+            d_index_k_f32 = carver.take(d_index_k.numel(), torch.float32).view(d_index_k.shape)
+        memset_zero_async(d_index_k_f32.data_ptr(), d_index_k_f32.numel() * 4, launch_stream)
 
         self._compiled_kernel(
             index_q,
@@ -759,9 +980,8 @@ class DenseIndexerBackward(APIBase):
             current_stream,
         )
 
-        if d_index_k_f32 is not d_index_k_target:
-            with _torch_stream_context(current_stream):
-                d_index_k_target.copy_(d_index_k_f32)
+        if d_index_k_f32 is not d_index_k:
+            copy_into_on_stream(d_index_k, d_index_k_f32, current_stream, d_index_k.device)
 
 
 _cache_of_IndexerBackwardObjects: dict = {}
@@ -785,6 +1005,9 @@ def indexer_backward_wrapper(
     stream: Optional[cuda.CUstream] = None,
     *,
     backend: str = "default",
+    workspace: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
+    deterministic_dk_planes: int = DEFAULT_DK_PLANES,
 ) -> TupleDict:
     """High-level wrapper. Returns ``{'d_index_q', 'd_weights', 'd_index_k'}``.
 
@@ -820,9 +1043,12 @@ def indexer_backward_wrapper(
             argument order (``d_index_q``/``d_weights``/``d_index_k``/
             ``stream``) is preserved for legacy callers.
             ``"default"`` is the architecture-generic path (SM90 or SM100).
-            ``"sm100_v2"`` is the SM100-only opt-in v2 backend,
+            Its SM100 specialization accepts compact H32 tensors and pads only
+            the internal TCGEN05 tile to M64; callers do not pad inputs or
+            slice outputs.
+            ``"sm100_v2"`` is the SM100/SM103 opt-in v2 backend,
             **request-or-fail**: it raises (``ValueError``/``RuntimeError``)
-            outside its envelope — SM100, H == 64, D == 128, block_I == 128,
+            outside its envelope — SM100/SM103, H == 64, D == 128, block_I == 128,
             topk % 128 == 0 with 128 <= topk <= 2048, sm_scale > 0, contiguous
             same-device tensors — and never silently falls back to the default
             backend. It keeps the wrapper contract (same inputs and outputs:
@@ -838,19 +1064,36 @@ def indexer_backward_wrapper(
             gains)**; the default wrapper-allocated buffers keep the input
             dtypes (bf16), which rounds the extra accuracy back to the bf16
             representation floor. fp32 ``d_index_k`` is zeroed internally.
-            The backend owns a per-plan workspace (the dynamic-ticket
-            counter; a bf16 ``d_index_k`` additionally takes a
-            ``B * S_k * D`` fp32 accumulator from the caching allocator on
-            every call), so one plan must never have two executions in flight
-            at once. The wrapper keys
-            its plan cache on the CUDA device and on the **resolved** stream
-            (``stream`` when given, otherwise ``torch.cuda.current_stream()``
-            at call time), so calls that differ in device or stream get
-            private plans and therefore private workspace; calls that land on
-            the same cache entry (the identical full cache key) must not be
-            allowed to overlap on the device.
+            Ordinarily, the backend's dynamic-ticket counter is 8 bytes of the
+            per-call ``workspace`` below, zeroed on the launch stream at every
+            call; ``deterministic=True`` replaces it with CTA-private dK
+            planes. The plan owns no device memory. The wrapper additionally
+            keys its plan cache on the **resolved** stream (``stream`` when
+            given, otherwise ``torch.cuda.current_stream()`` at call time),
+            so one cached plan's executes are stream-ordered.
+        workspace: keyword-only, optional reusable uint8 buffer of at least
+            ``IndexerBackward.scratch_workspace_bytes()`` bytes on
+            ``index_q.device`` (the ordinary fp32 dK accumulator behind a
+            bf16 ``d_index_k``, plus the ordinary sm100_v2 ticket counter, or
+            the deterministic CTA planes). When omitted
+            the wrapper allocates it per call on the launch stream. Calls
+            sharing one buffer must not overlap on the device. In deterministic
+            mode, the live scratch prefix must not overlap any input or output;
+            ``execute`` rejects such aliases before clearing the planes.
+        deterministic: keyword-only opt-in for bitwise-reproducible gradients
+            on SM100/SM103. Fixed-owner producer CTAs accumulate into
+            CTA-private FP32 planes; a fixed CTA-order reduction writes
+            ``d_index_k``. The default backend supports compact H32 and H64;
+            ``sm100_v2`` supports H64. A warmed plan with preallocated outputs
+            and workspace remains CUDA Graph compatible. Valid top-k indices
+            within each query row must be unique.
+        deterministic_dk_planes: compile-time deterministic producer-grid and
+            FP32-plane specialization, one of ``{96, 128, 148}`` (default
+            ``96``). The caller-owned workspace is this many times the dense
+            FP32 dK size. Values other than 96 require ``deterministic=True``.
     """
     _validate_indexer_backward_backend(backend)
+    deterministic_dk_planes = validate_deterministic_dk_plane_policy(deterministic, deterministic_dk_planes)
     # Validate ranks explicitly before any allocation or the dimension
     # derivation below, so a wrong-rank tensor surfaces as a clean ValueError
     # instead of a cryptic tuple-unpack/indexing error (or a mis-shaped
@@ -862,17 +1105,20 @@ def indexer_backward_wrapper(
         raise ValueError(f"indexer_backward index_k must be 3D (B, S_k, D), got {index_k.ndim}D shape {tuple(index_k.shape)}")
     if topk_indices.ndim != 3:
         raise ValueError(f"indexer_backward topk_indices must be 3D (B, S_q, topk), got {topk_indices.ndim}D shape {tuple(topk_indices.shape)}")
-    with _torch_stream_context(stream):
+
+    b, s_q, h, d = index_q.shape
+    s_k = index_k.shape[1]
+    topk = topk_indices.shape[-1]
+    if deterministic:
+        deterministic_dk_producer_ctas(b * s_q, deterministic_dk_planes)
+
+    with _torch_stream_context(stream, index_q.device):
         if d_index_q is None:
             d_index_q = torch.empty_like(index_q)
         if d_weights is None:
             d_weights = torch.empty_like(weights)
         if d_index_k is None:
             d_index_k = torch.empty_like(index_k)
-
-    b, s_q, h, d = index_q.shape
-    s_k = index_k.shape[1]
-    topk = topk_indices.shape[-1]
 
     # ``grad_scale = loss_coeff / (B * S_q)`` is a runtime arg (forwarded
     # into the score-grad kernel as a runtime ``Float32``), so it is not
@@ -883,40 +1129,25 @@ def indexer_backward_wrapper(
     # output-dtype validation cannot be skipped on a cache hit (no fail-dirty);
     # the sm100_v2 backend additionally compiles a d_weights-dtype variant
     # and validates the output dtype matrix. The CUDA device is keyed: the
-    # sm100_v2 backend owns device-resident per-plan workspace (the
-    # ticket counter), so a cached plan must never be
-    # reused on another device — execute() additionally enforces the plan
-    # device.
+    # plan's descriptors and the device its kernels were compiled under are
+    # that device's.
     #
-    # For backend="sm100_v2" the *resolved* stream is keyed too, so that a
-    # plan (and thus its ticket-counter workspace) is never
-    # shared by two different streams. It must be the resolved stream, not
+    # For backend="sm100_v2" the *resolved* stream is keyed too, so that one
+    # cached plan's executes are stream-ordered (its scratch is per call, so
+    # this is ordering hygiene, not workspace ownership). It must be the
+    # resolved stream, not
     # the ``stream`` argument: ``stream=None`` does not mean "the default
     # stream", it means "whatever ``torch.cuda.current_stream()`` is at call
     # time" (see ``resolve_stream``, which the backend itself uses to pick
     # the launch stream). Keying the raw argument would map every
     # ``stream=None`` call onto one cache entry even when the callers sit in
     # different ``torch.cuda.stream(...)`` contexts. Two caveats on the
-    # handle: (a) handles are not unique across devices — the legacy default
-    # stream is handle 0 on every device — so ``index_q.device`` above stays
-    # load-bearing and is what keeps per-device plans apart; (b) CUDA's magic
-    # handles are not unique across host threads either — ``cudaStreamPerThread``
-    # is the integer 2 in every thread while denoting a different stream in
-    # each. The handle itself carries no thread information, but the caller
-    # does: that value means "the calling thread's own stream" by definition, so
-    # the calling thread's id is exactly the missing discriminator and is
-    # appended to the key for that one value. Real handles (and 0 / 1, which are
-    # global rather than per-thread) are keyed as-is, so threads that share a
-    # real stream keep sharing one plan, as they should.
-    # ``threading.get_ident()`` is only unique among live threads — an id can
-    # be reused after its thread exits — which is harmless here: that thread's
-    # per-thread stream died with it, so nothing can still be running on the
-    # plan the reused id reaches.
+    # handle: handles are not unique across devices, so index_q.device stays
+    # part of the key. Torch interop rejects CUstream(2) before this point;
+    # callers needing per-thread execution use concrete torch streams.
     stream_key = None
     if backend == "sm100_v2":
         stream_key = int(_resolve_stream(stream))
-        if stream_key == _CUDA_STREAM_PER_THREAD:
-            stream_key = (stream_key, threading.get_ident())
     key = (
         index_q.device,
         index_q.dtype,
@@ -936,6 +1167,8 @@ def indexer_backward_wrapper(
         bool(topk_indices_global),
         backend,
         stream_key,
+        bool(deterministic),
+        deterministic_dk_planes,
     )
     obj = _cache_of_IndexerBackwardObjects.get(key)
     if obj is None:
@@ -953,10 +1186,20 @@ def indexer_backward_wrapper(
             block_I=block_I,
             topk_indices_global=topk_indices_global,
             backend=backend,
+            deterministic=deterministic,
+            deterministic_dk_planes=deterministic_dk_planes,
         )
         assert obj.check_support()
         obj.compile()
         _cache_of_IndexerBackwardObjects[key] = obj
+
+    if workspace is None:
+        ws_bytes = obj.scratch_workspace_bytes()
+        if ws_bytes:
+            # R1/R2: per-call scratch allocated on the launch stream, so the
+            # caching allocator orders its reuse against that stream.
+            with torch.cuda.device(index_q.device), _torch_stream_context(stream):
+                workspace = torch.empty(ws_bytes, dtype=torch.uint8, device=index_q.device)
 
     obj.execute(
         index_q,
@@ -971,6 +1214,7 @@ def indexer_backward_wrapper(
         loss_coeff=loss_coeff,
         grad_loss=grad_loss,
         current_stream=stream,
+        workspace=workspace,
     )
     return TupleDict(d_index_q=d_index_q, d_weights=d_weights, d_index_k=d_index_k)
 
@@ -1000,6 +1244,7 @@ def dense_indexer_backward_wrapper(
     d_weights: Optional[torch.Tensor] = None,
     d_index_k: Optional[torch.Tensor] = None,
     stream: Optional[cuda.CUstream] = None,
+    workspace: Optional[torch.Tensor] = None,
 ) -> TupleDict:
     """Dense full-KV indexer backward. Returns ``{'d_index_q', 'd_weights', 'd_index_k'}``.
 
@@ -1011,20 +1256,26 @@ def dense_indexer_backward_wrapper(
     ``grad_loss`` must be a single-element float32 tensor on the same CUDA
     device as ``index_q``. The kernel reads its value at runtime, including on
     CUDA Graph replay.
+
+    ``workspace`` is an optional reusable uint8 buffer of at least
+    ``DenseIndexerBackward.scratch_workspace_bytes()`` bytes on
+    ``index_q.device`` (the fp32 dK accumulator behind a bf16 ``d_index_k``;
+    zero bytes for an fp32 ``d_index_k``). When omitted it is allocated per
+    call on the launch stream. Calls sharing one buffer must not overlap.
     """
     current_stream = stream  # the SM90 closures take the caller's stream too (Rule 5)
 
-    with _torch_stream_context(current_stream):
-        cu_seqlens_q = _contiguous_input(cu_seqlens_q) if cu_seqlens_q is not None else None
-        cu_seqlens_k = _contiguous_input(cu_seqlens_k) if cu_seqlens_k is not None else None
+    with _torch_stream_context(current_stream, index_q.device):
+        cu_seqlens_q = _contiguous_input(cu_seqlens_q, current_stream) if cu_seqlens_q is not None else None
+        cu_seqlens_k = _contiguous_input(cu_seqlens_k, current_stream) if cu_seqlens_k is not None else None
 
-        index_q_exec = _contiguous_input(index_q)
-        weights_exec = _contiguous_input(weights)
-        index_k_exec = _contiguous_input(index_k)
-        attn_l1norm_exec = _contiguous_input(attn_l1norm)
-        index_lse_exec = _contiguous_input(index_lse)
-        attn_score_exec, attn_score_original = _contiguous_mutable(attn_score)
-        index_score_exec, index_score_original = _contiguous_mutable(index_score)
+        index_q_exec = _contiguous_input(index_q, current_stream)
+        weights_exec = _contiguous_input(weights, current_stream)
+        index_k_exec = _contiguous_input(index_k, current_stream)
+        attn_l1norm_exec = _contiguous_input(attn_l1norm, current_stream)
+        index_lse_exec = _contiguous_input(index_lse, current_stream)
+        attn_score_exec, attn_score_original = _contiguous_mutable(attn_score, current_stream)
+        index_score_exec, index_score_original = _contiguous_mutable(index_score, current_stream)
 
         (
             is_thd,
@@ -1108,6 +1359,13 @@ def dense_indexer_backward_wrapper(
         obj.compile()
         _cache_of_DenseIndexerBackwardObjects[key] = obj
 
+    if workspace is None:
+        ws_bytes = obj.scratch_workspace_bytes()
+        if ws_bytes:
+            # R1/R2: per-call scratch allocated on the launch stream.
+            with torch.cuda.device(index_q_exec.device), _torch_stream_context(current_stream):
+                workspace = torch.empty(ws_bytes, dtype=torch.uint8, device=index_q_exec.device)
+
     obj.execute(
         index_q_exec,
         weights_exec,
@@ -1125,12 +1383,13 @@ def dense_indexer_backward_wrapper(
         cu_seqlens_k=cu_seqlens_k,
         q_causal_offsets=q_causal_offsets,
         current_stream=current_stream,
+        workspace=workspace,
     )
-    with _torch_stream_context(current_stream):
-        _copy_back_if_needed(attn_score_exec, attn_score_original)
-        _copy_back_if_needed(index_score_exec, index_score_original)
-        _copy_back_if_needed(d_index_q_exec, d_index_q_original)
-        _copy_back_if_needed(d_weights_exec, d_weights_original)
-        _copy_back_if_needed(d_index_k_exec, d_index_k_original)
+    with _torch_stream_context(current_stream, index_q_exec.device):
+        _copy_back_if_needed(attn_score_exec, attn_score_original, current_stream)
+        _copy_back_if_needed(index_score_exec, index_score_original, current_stream)
+        _copy_back_if_needed(d_index_q_exec, d_index_q_original, current_stream)
+        _copy_back_if_needed(d_weights_exec, d_weights_original, current_stream)
+        _copy_back_if_needed(d_index_k_exec, d_index_k_original, current_stream)
 
     return TupleDict(d_index_q=d_index_q_result, d_weights=d_weights_result, d_index_k=d_index_k_result)

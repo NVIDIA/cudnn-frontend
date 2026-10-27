@@ -33,6 +33,8 @@ from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.buffers import DeviceView
 
+from cudnn.frost.compiled_cache import compile_cached
+
 from ..common.host import get_dtype
 from ..common.piece_chain import dtype_name, launch_state_chain
 from . import kda_chain_prologue_f16, kda_prefill_f16, kda_summary_f16
@@ -230,7 +232,7 @@ def chain_forward_host(
     )
 
 
-def build_configs(io_dtype, state_dtype, gate_dtype, *, store_final_state, enable_checkpoints, **flags):
+def build_configs(io_dtype, state_dtype, gate_dtype, *, store_final_state, enable_checkpoints, checkpoint_dtype=None, **flags):
     summary_cfg = kda_summary_f16.build_cfg(io_dtype, gate_dtype, use_initial_state=False, **flags)
     prefill_cfg = kda_prefill_f16.build_cfg(
         io_dtype,
@@ -239,6 +241,7 @@ def build_configs(io_dtype, state_dtype, gate_dtype, *, store_final_state, enabl
         use_initial_state=True,
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
+        checkpoint_dtype=checkpoint_dtype,
         **flags,
     )
     return summary_cfg, prefill_cfg
@@ -335,6 +338,7 @@ def build_chain_forward(
         bool(use_beta_sigmoid),
         bool(allow_neg_eigval),
         int(checkpoint_every_n_tokens) > 0,
+        str(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else "none",
         final_state is not None,
         has_seed,
         seed_indices is not None,
@@ -348,6 +352,7 @@ def build_chain_forward(
             gate_dtype,
             store_final_state=final_state is not None,
             enable_checkpoints=int(checkpoint_every_n_tokens) > 0,
+            checkpoint_dtype=get_dtype(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else None,
             l2norm=use_qk_l2norm,
             safe_gate=safe_gate,
             gate_scale_log2=gate_scale_log2,
@@ -363,7 +368,7 @@ def build_chain_forward(
         work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         work_items_summary_placeholder = from_dlpack(work_items_summary, assumed_align=16)
         work_items_summary_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        chain_forward_cache[key] = cute.compile(
+        chain_forward_cache[key] = compile_cached(
             chain_forward_host,
             int(unit_chunks),
             int(b_t),
@@ -413,6 +418,8 @@ def build_chain_forward(
             from_dlpack(final_indices, assumed_align=4).mark_layout_dynamic() if final_indices is not None else None,
             from_dlpack(checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=3) if checkpoints is not None else None,
             cuda.CUstream(int(stream)),
+            cache_key=repr((__name__, key)),
+            symbol="frost_la_kda_chain_forward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     return chain_forward_cache[key]

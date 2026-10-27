@@ -97,6 +97,7 @@ from ..recipe import (
     check_shapes,
     contiguous_modulus,
     expected_shape,
+    moe_weight_sf_reject,
 )
 from ..graph_analyzer import (
     GemmBinding,
@@ -4076,16 +4077,14 @@ def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None"
         return config
     sm = sm_count if sm_count is not None else _sm_count()
     output_tiles = mm.batch * -(-mm.M // config.cta_tile_m) * -(-mm.N // config.cta_tile_n)
-    # On MMA_INST_K64_ARCH_RANGES silicon the one-wave target overshoots for
-    # nvfp4 block-scale: measured split-K curves pay only below 1/8 grid fill,
-    # near 64 total CTAs, with power-of-two S >= 4. fp8 keeps one-wave sizing
-    # (its shallow narrow-tile splits measure as real wins).
-    from cudnn.gemm.frost.kernel_registry import MMA_INST_K64_ARCH_RANGES
-
-    arch = _current_arch()
-    _k64_part = any(lo <= arch < hi for lo, hi in MMA_INST_K64_ARCH_RANGES) if arch is not None else sm >= 190
+    # For nvfp4 block-scale the one-wave target overshoots: measured split-K
+    # curves pay only below 1/8 grid fill, near 64 total CTAs, with
+    # power-of-two S >= 4. First measured on MMA_INST_K64_ARCH_RANGES silicon
+    # and gated there; the weekly sweep shows the same curve on sm100/sm103
+    # (+15 layers / -5, net +0.5% fp4 geomean on both), so the gate is now
+    # dtype-driven, not arch-driven. fp8 keeps one-wave sizing.
     _fp4_bs = chain.has_block_scale and mm.a_dtype == mm.b_dtype == "fp4_e2m1"
-    eager_fill = not (_k64_part and _fp4_bs)
+    eager_fill = not _fp4_bs
     if output_tiles >= (sm if eager_fill else -(-sm // 8)):
         return config
     cta_k_elems = _cta_k_elems(chain, config)
@@ -4105,10 +4104,12 @@ def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None"
         slices = 1 << (slices.bit_length() - 1)  # snap down to a power of two
     if slices <= 1:
         return config
-    # For matched FP4 operands, a two-way split does not amortize the
-    # partial-output traffic and reduction launch. Keep the unsplit tile;
-    # larger automatic splits and explicitly supplied knobs remain available.
-    if slices == 2 and chain.has_block_scale and mm.a_dtype == mm.b_dtype == "fp4_e2m1":
+    # A two-way split does not amortize the partial-output traffic and the
+    # reduction launch: the weekly exhaustive sweep measures every dense S=2
+    # pick as a loss on every architecture measured, while S>=3 keeps its
+    # wins, matching what was already measured for matched FP4 operands.
+    # Larger automatic splits and explicitly supplied knobs remain available.
+    if slices == 2:
         return config
     return replace(config, split_k_slices=slices)
 
@@ -5187,7 +5188,8 @@ class CompiledMoeBlockScaleGemm:
       * ``weight`` — (E, N, Kp) packed FP4/FP8 (B, per-expert).
       * ``sfa``    — token SF, F8_128x4-reordered + padded to 128 rows PER GROUP,
         then concatenated (Σ ceil(group_m/128) blocks).
-      * ``sfb``    — weight SF, F8_128x4-reordered, per-expert.
+      * ``sfb``    — weight SF, F8_128x4-reordered dense byte planes with E
+        outermost; the runtime expert stride is 16-byte aligned and may include padding.
       * ``first_token_offset`` — (num_groups+1,) int32/int64; group g spans token
         rows ``[fto[g], fto[g+1])``. Group sizes arbitrary (NOT
         128-aligned); the scheduler tracks each group's start SF-block.
@@ -5298,8 +5300,8 @@ class CompiledMoeBlockScaleGemm:
         if scale_blob_reason is not None:
             raise ValueError(scale_blob_reason)
         _initialize_reduction_outputs(self.chain, outputs, stream)
-        # Permute to inner-plane layouts (batch last). The host rebuilds SF
-        # descriptors from .iterator, so the SF permute just preserves the base ptr.
+        # Permute to inner-plane layouts (batch last). SF descriptors rebuild
+        # blocked row/K geometry and retain the validated weight expert stride.
         a_perm = token.permute(1, 2, 0)
         b_perm = weight.permute(1, 2, 0)
         c_perms = [t.permute(1, 2, 0) for t in outputs]
@@ -5381,9 +5383,8 @@ class CompiledMoeBlockScaleGemm:
                 token_sf = []  # Linear inputs do not use segmented F8_128x4 capacity.
             _sf_k4 = ((_K // self.chain.block_scale.block_size) + 3) // 4
             _segmented_sfa_rows = segmented_row_scale_capacity_rows(int(_S), _moe_num_groups(fto, int(weights[0].shape[0])))
-            _r_sf = _sf_blob_reject(
-                [(f"SFA[{i}]", x, 4 * _sf_k4 * _segmented_sfa_rows) for i, x in enumerate(token_sf or [])]
-                + [(f"SFB[{j}]", x, 512 * _sf_k4 * ((_N + 127) // 128) * int(weights[j].shape[0])) for j, x in enumerate(weight_sf or [])]
+            _r_sf = _sf_blob_reject([(f"token SF[{i}]", x, 4 * _sf_k4 * _segmented_sfa_rows) for i, x in enumerate(token_sf or [])]) or moe_weight_sf_reject(
+                [(f"weight SF[{j}]", x, 512 * _sf_k4 * ((_N + 127) // 128), int(weights[j].shape[0])) for j, x in enumerate(weight_sf or [])]
             )
             if _r_sf is not None:
                 raise ValueError(_r_sf)

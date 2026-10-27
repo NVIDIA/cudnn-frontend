@@ -14,6 +14,44 @@ from frost_test_utils import launch_f16, requires_blackwell, requires_dsl, requi
 pytestmark = [pytest.mark.L0, requires_dsl]
 
 
+@pytest.mark.parametrize(
+    "host_attr,flag", [("_host", None), ("_host_prepared", "_prepared_fp8"), ("_host_prepared", "_prepared_mxfp8"), ("_host_thd_split", "packed_thd_split")]
+)
+def test_host_order_reused_but_each_compiled_wrapper_still_checked(monkeypatch, host_attr, flag):
+    """Template metadata may be shared; mutable plan lists and compiled ABI checks may not."""
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.fwd import prepared
+
+    def host(q, tile: "Constexpr", stream):
+        pass
+
+    def compiled(q, stream):
+        pass
+
+    def new_entry(q, extra, stream):
+        pass
+
+    km = SimpleNamespace(__name__="test_host", _host=host, _host_prepared=host, _host_thd_split=host)
+    api = SimpleNamespace(_k_mod=km, _compiled_kernel=compiled, **({flag: True} if flag else {}))
+    monkeypatch.setattr(prepared, "positional_entry", lambda fn: fn)
+    _, _, order = prepared._positional_order(api)
+    order.clear()
+    signature = prepared.inspect.signature
+
+    def no_repeat_host(entry):
+        assert entry is not host, "Repeated immutable template-host inspection"
+        return signature(entry)
+
+    monkeypatch.setattr(prepared.inspect, "signature", no_repeat_host)
+    assert prepared._positional_order(api) == (compiled, compiled, ["q", "stream"])
+    api._compiled_kernel = new_entry
+    with pytest.raises(NotImplementedError, match="disagrees with the compiled wrapper"):
+        prepared._positional_order(api)
+    setattr(km, host_attr, new_entry)
+    assert prepared._positional_order(api) == (new_entry, new_entry, ["q", "extra", "stream"])
+
+
 def _load(arch, template, d_qk, d_v, **overrides):
     from cudnn.frost.template_loader import load_template
     from cudnn.sdpa.fwd import api_dsl
@@ -27,21 +65,69 @@ def _load(arch, template, d_qk, d_v, **overrides):
     return load_template(str(path), TemplateParams(**values), tag=f"pointer_abi_{arch}_{template}_{d_qk}_{d_v}")
 
 
+# The f16/bf16 hosts the direct tests drive through ``launch_f16``: (arch tree, kernel file, d_qk, d_v).
+_F16_HOSTS = [
+    ("sm100", "decode_d128_f16", 128, 128),
+    ("sm100", "decode_d256_f16", 256, 256),
+    ("sm100", "prefill_d128_f16", 128, 128),
+    ("sm100", "prefill_d192_d128_f16", 192, 128),
+    ("sm100", "prefill_d256_f16", 256, 256),
+    ("sm100", "prefill_d512_f16", 512, 512),
+    ("sm107", "prefill_d128_f16", 128, 128),
+    ("sm107", "prefill_d192_d128_f16", 192, 128),
+    ("sm107", "prefill_d512_f16", 512, 512),
+    ("sm107", "decode_d256_f16", 256, 256),
+]
+
+
+@pytest.mark.parametrize("arch,template,d_qk,d_v", _F16_HOSTS)
+def test_direct_launcher_fills_every_required_slot_of_the_host(arch, template, d_qk, d_v):
+    """``launch_f16`` is the direct tests' binder for the explicit host ABI.  Its signature filter DROPS a keyword the host
+    does not carry, but it cannot invent one the host requires: a slot appended to a host without a Python default (the
+    d128 prefill hosts' ten score / bias / kv_mask / inv_scale slots, explicit so the compiled host persists) is a
+    ``TypeError`` at the call unless the launcher names it.  Pinned on the host for every f16 host of both arch trees:
+    the keyword set is captured through a recorder standing in for the compiled callable (CPU tensors supply the strides
+    and addresses; nothing is compiled or launched) and compared with the host's required runtime slots."""
+    import inspect
+
+    try:
+        mod = _load(arch, template, d_qk, d_v)
+    except NotImplementedError as e:
+        if "sm_107a" in str(e):
+            pytest.skip(str(e))  # Rule 7: below the sm_107a DSL floor the Rubin host declines typed; the pin runs where it loads
+        raise
+    host_params = inspect.signature(mod._host).parameters
+    required = [n for n, p in host_params.items() if "Constexpr" not in str(p.annotation) and p.default is inspect.Parameter.empty]
+    b, h, sq, skv = 1, 2, 4, 256  # the decode tiles' row guard: S_q x HEADS_PER_TILE <= N_Q
+    q = torch.zeros((b, sq, h, d_qk), dtype=torch.float16)
+    k = torch.zeros((b, skv, h, d_qk), dtype=torch.float16)
+    v = torch.zeros((b, skv, h, d_v), dtype=torch.float16)
+    o = torch.zeros((b, sq, h, d_v), dtype=torch.float16)
+    lse = torch.zeros((b, h, sq), dtype=torch.float32)
+    captured = {}
+    launch_f16(
+        lambda **kw: captured.update(kw),
+        q,
+        k,
+        v,
+        o,
+        lse,
+        torch.zeros(h, dtype=torch.float32),
+        torch.zeros(b, dtype=torch.int32),
+        torch.zeros(1, dtype=torch.int64),
+        (b, h, h, sq, skv, 0),
+        1.0,
+        0,
+        0,
+        host=mod._host,
+    )
+    assert set(captured) <= set(host_params), sorted(set(captured) - set(host_params))  # the filter passes nothing the host lacks
+    missing = [n for n in required if n not in captured]
+    assert not missing, f"{arch}/{template}: launch_f16 names no value for the host's required slots {missing}"
+
+
 @requires_blackwell
-@pytest.mark.parametrize(
-    "arch,template,d_qk,d_v",
-    [
-        ("sm100", "decode_d128_f16", 128, 128),
-        ("sm100", "decode_d256_f16", 256, 256),
-        ("sm100", "prefill_d128_f16", 128, 128),
-        ("sm100", "prefill_d192_d128_f16", 192, 128),
-        ("sm100", "prefill_d256_f16", 256, 256),
-        ("sm100", "prefill_d512_f16", 512, 512),
-        ("sm107", "prefill_d128_f16", 128, 128),
-        ("sm107", "prefill_d192_d128_f16", 192, 128),
-        ("sm107", "prefill_d512_f16", 512, 512),
-    ],
-)
+@pytest.mark.parametrize("arch,template,d_qk,d_v", _F16_HOSTS)
 def test_page_table_singleton_batch_stride_is_int64(arch, template, d_qk, d_v):
     """An unused singleton stride above int32 is legal without a huge allocation.
 
@@ -55,7 +141,8 @@ def test_page_table_singleton_batch_stride_is_int64(arch, template, d_qk, d_v):
 
     import cuda.bindings.driver as cuda_driver
 
-    paged = arch == "sm100" and template != "prefill_d512_f16"
+    # Every SM100 template but the d512 prefill wires paged KV; on the Rubin line only the decode tile does.
+    paged = template.startswith("decode") or (arch == "sm100" and template != "prefill_d512_f16")
     mod = _load(arch, template, d_qk, d_v, **(dict(paged_kv=True, page_size=128) if paged else {}))
     fn = mod.compile(d_qk=d_qk, d_v=d_v, has_lse=True, paged_hnd=False)
     gen = torch.Generator(device="cuda").manual_seed(17)
@@ -101,6 +188,32 @@ def test_page_table_singleton_batch_stride_is_int64(arch, template, d_qk, d_v):
     torch.testing.assert_close(lse[0], scores.logsumexp(-1).float(), atol=2e-3, rtol=2e-3)
 
 
+def test_gate_in_combine_binding_keeps_the_plans_device_check():
+    """The d256 decode tile's gated split binds G outside the native dense binder (prepared.CombineGate), whose
+    operand check therefore never sees it: the binding keeps the plan's CUDA device itself -- a gate observed on the
+    CPU or on another CUDA device is the native binder's own typed error before any launch, an unknown device (a bare
+    address) stays admitted, and the bound frame carries G's address with its strides in the combine's BSHD order."""
+    from cudnn.sdpa.fwd.prepared import _DLPACK_CPU, _DLPACK_CUDA, BufferFacts, CombineGate
+
+    seen = []
+    gate = CombineGate(lambda *frame: seen.append(frame), "bfloat16", (2, 4, 1, 256), (_DLPACK_CUDA, 1))
+    shape, strides = (2, 4, 1, 256), (1024, 256, 1024, 1)  # BHSD facts of a (B, S_q, H, D)-contiguous gate
+
+    def facts(device, ptr=4096):
+        return BufferFacts(ptr, "bfloat16", device, 2048, shape, strides)
+
+    for off in ((_DLPACK_CPU, 0), (_DLPACK_CUDA, 0)):
+        with pytest.raises(ValueError, match="gate must be on this plan's CUDA device"):
+            gate.bind(facts(off))
+        with pytest.raises(RuntimeError, match="no gate bound"):
+            gate(1, 2, 3, 4, 5, 6, 7, 8, 9)  # a refused bind leaves nothing for the launch to consume
+    gate.bind(facts((_DLPACK_CUDA, 1)))
+    gate(1, 2, 3, 4, 5, 6, 7, 8, 9)
+    gate.bind(facts((-1, -1)))  # a bare address: device unknown, admitted as the native binder admits it
+    gate(1, 2, 3, 4, 5, 6, 7, 8, 9)
+    assert [f[8:10] for f in seen] == [(4096, (1024, 1024, 256, 1))] * 2, seen
+
+
 @requires_pre_rubin_blackwell
 @pytest.mark.parametrize("d", [128, 256])
 def test_direct_decode_launch_rejects_wrong_packed_head_ratio(d):
@@ -110,11 +223,44 @@ def test_direct_decode_launch_rejects_wrong_packed_head_ratio(d):
         launch_f16(None, *([None] * 8), (1, 4, 2, 1, 128, 0), 1.0, 0, 0, host=mod._host)
 
 
-@requires_pre_rubin_blackwell
-def test_direct_d256_decode_launch_rejects_rows_outside_tile():
-    mod = _load("sm100", "decode_d256_f16", 256, 256)
+def _fixed_tile_host(n_q, heads_per_tile, token_units):
+    """A stand-in host entry whose module namespace carries the three fields the row guard reads."""
+    namespace = {"N_Q": n_q, "HEADS_PER_TILE": heads_per_tile}
+    if token_units is not None:
+        namespace["Q_TOKEN_UNITS"] = token_units
+    exec("def host():\n    pass", namespace)
+    return namespace["host"]
+
+
+def test_direct_decode_row_guard_yields_to_the_token_unit_axis():
+    """The direct driver's row guard is the fixed-tile contract: a body without ``Q_TOKEN_UNITS`` rejects
+    ``S_q x HEADS_PER_TILE > N_Q``; a body that declares the axis covers the same shape as token units."""
+    from frost_test_utils import check_decode_q_rows
+
+    check_decode_q_rows(_fixed_tile_host(16, 2, None), 8)
+    with pytest.raises(ValueError, match="decode Q rows exceed the compiled 16-row tile"):
+        check_decode_q_rows(_fixed_tile_host(16, 2, None), 17)
     with pytest.raises(ValueError, match="decode Q rows exceed"):
-        launch_f16(None, *([None] * 8), (1, 2, 2, 17, 128, 0), 1.0, 0, 0, host=mod._host)
+        check_decode_q_rows(_fixed_tile_host(16, 2, False), 17)
+    check_decode_q_rows(_fixed_tile_host(16, 2, True), 17)
+
+
+@requires_pre_rubin_blackwell
+def test_direct_d256_decode_launch_follows_the_token_unit_contract(monkeypatch):
+    """The compiled d256 decode body declares the token-unit axis, so ``S_q = 17`` on the 16-row tile is served as
+    ``ceil(17 / Q_BOX_TOKENS)`` units and the direct driver does not reject it; with the flag cleared on the same
+    namespace (a fixed-tile body) the old rejection holds."""
+    import inspect
+
+    from frost_test_utils import check_decode_q_rows
+
+    mod = _load("sm100", "decode_d256_f16", 256, 256)
+    namespace = inspect.unwrap(mod._host).__globals__
+    assert namespace["Q_TOKEN_UNITS"] is True and 17 * namespace["HEADS_PER_TILE"] > namespace["N_Q"]
+    check_decode_q_rows(mod._host, 17)
+    monkeypatch.setitem(namespace, "Q_TOKEN_UNITS", False)
+    with pytest.raises(ValueError, match="decode Q rows exceed"):
+        check_decode_q_rows(mod._host, 17)
 
 
 @requires_pre_rubin_blackwell

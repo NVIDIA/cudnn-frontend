@@ -28,7 +28,7 @@ _JAX_SF_LAYOUT_ERROR = (
     "the block scale-factor tensors (sfa/sfb and the sfd outputs) are MMA-tiled "
     "(32, 4, m//128, 4, rest_k, l) strided views that are not expressible as JAX arrays "
     "(a row-major JAX array of that shape has different memory); pass torch tensors. "
-    "For canonical MXFP8 JAX arrays, use cudnn.jax.grouped_gemm_swiglu"
+    "For canonical MXFP8 JAX arrays, use cudnn.grouped_gemm_glu_jax_sm100"
 )
 
 
@@ -284,7 +284,12 @@ def grouped_gemm_swiglu_wrapper_sm100(
     """
     framework = detect_framework(a_tensor)
     if framework == "jax":
-        from cudnn.jax import grouped_gemm_swiglu
+        from cudnn.frost.buffers import cutedsl_requirement_error
+
+        requirement = cutedsl_requirement_error("grouped_gemm_swiglu")
+        if requirement:
+            raise ImportError(requirement)
+        from .jax_api import grouped_gemm_swiglu
         from ..canonical_jax import check_jax_wrapper_options
 
         check_jax_wrapper_options(
@@ -293,7 +298,6 @@ def grouped_gemm_swiglu_wrapper_sm100(
             sf_vec_size=sf_vec_size,
             vector_f32=vector_f32,
             m_aligned=m_aligned,
-            discrete_col_sfd=discrete_col_sfd,
             current_stream=current_stream,
         )
         return grouped_gemm_swiglu(
@@ -309,6 +313,7 @@ def grouped_gemm_swiglu_wrapper_sm100(
             d_dtype=d_dtype if d_dtype is not None else cutlass.BFloat16,
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
+            discrete_col_sfd=discrete_col_sfd,
         )
     if framework != "torch":
         raise ValueError(f"Unsupported tensor framework '{framework}' for grouped_gemm_swiglu_wrapper_sm100; pass torch tensors")
@@ -375,6 +380,7 @@ def grouped_gemm_swiglu_wrapper_sm100(
         return tuple(i for i, s in sorted(enumerate(tensor.stride()), key=lambda x: x[1]))
 
     cache_key = (
+        a_tensor.device,
         use_full_dynamic,
         a_tensor.shape[1:] if not use_full_dynamic else None,
         b_tensor.shape if not use_full_dynamic else None,

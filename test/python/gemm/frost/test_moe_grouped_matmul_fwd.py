@@ -423,8 +423,7 @@ def test_combine_shape_binding_and_support():
     assert binding.top_k_scores is scores and scores in binding.bound_tensors()
     assert y.get_dim() == [1, 129, 96]
     C._check_executable(chain)
-    with pytest.raises(NotImplementedError, match="COMBINE"):
-        C120._check_executable(chain)
+    C120._check_executable(chain)
     # The frontend can represent the enum; native operation construction declines.
     cpp = _build_combine_graph()[0]._lower_to_cpp()
     cpp.validate()
@@ -2042,6 +2041,8 @@ def test_sm120_moe_render_smoke(weight_major: str, gather: bool) -> None:
     src = C120._render_template(chain, snippets, cfg)
     assert "@@" not in "\n".join(line for line in src.splitlines() if not line.lstrip().startswith(("#", '"""')) and "marker" not in line)
     ast.parse(src)
+    assert re.search(r"^external_counter_reset = False$", src, re.M)
+    assert "if cutlass.const_expr(not external_counter_reset):" in src
     assert "frost_sm120_moe_grouped_matmul_fwd_" in src
     assert re.search(r"^grid_num_clusters = \d+$", src, re.M) and re.search(r"^offset_cutlass_dtype = cutlass\.Int32$", src, re.M)
     assert "moe_desc_slots = 0" in src  # the workspace is the scheduler counter alone

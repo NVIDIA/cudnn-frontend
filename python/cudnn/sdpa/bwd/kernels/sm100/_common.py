@@ -21,7 +21,7 @@ from __future__ import annotations
 import cutlass
 import cutlass.cute as cute
 
-from cudnn.frost.tile_dsl.thd import thd_decode_unit
+from cudnn.frost.tile_dsl.thd import THD_BWD_WORK_PREFIX_OFF, thd_decode_unit_prefix
 
 
 def make_bwd_decode(CFG):
@@ -96,7 +96,7 @@ def make_bwd_decode(CFG):
     def _thd_decode(linear_cta, meta_t, n_batch, n_qh, row_key):
         u = linear_cta // cutlass.Int32(CFG.CGA_M)
         meta = cutlass.make_array_view(meta_t)
-        q_tile_idx, batch, head = thd_decode_unit(meta, n_batch, u, n_qh, cutlass.Int32(_CGA_TILE_M), False)
+        q_tile_idx, batch, head = thd_decode_unit_prefix(meta, n_batch, u, n_qh, cutlass.Int32(_CGA_TILE_M), False, prefix0=THD_BWD_WORK_PREFIX_OFF(n_batch))
         return q_tile_idx * cutlass.Int32(_QB) + row_key, head, batch
 
     @cute.jit

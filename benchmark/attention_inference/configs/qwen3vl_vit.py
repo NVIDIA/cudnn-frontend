@@ -51,5 +51,5 @@ CONFIG = InferenceBenchmarkConfig(
     # restoring them here needs fp8-context support in
     # benchmark_single_attention first.
     data_types=["bfloat16"],
-    backends=["cudnn", "cudnn_oss"],
+    backends=["cudnn", "cudnn_oss", "cudnn_auto"],
 )

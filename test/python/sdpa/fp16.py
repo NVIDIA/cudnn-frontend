@@ -320,12 +320,21 @@ def allocate_tensors(cfg, rng_data_gen, perf=False):
         allocs[TensorUid.rng_dump] = (torch.zeros((cfg.batches, cfg.h_q, cfg.s_q, cfg.s_kv), dtype=torch.float32, device="cuda"), None, None)
     if cfg.with_sink_token:
         allocs[TensorUid.sink_token] = alloc_tensor((1, cfg.h_q, 1, 1), torch.float32, rng=rng_data_gen, mean=0.0, std=0.5, sparse_int=si)
+        if getattr(cfg, "sink_token_value", None) is not None:
+            # One fixed sink logit on every head (ExecConfig.sink_token_value): the keyless-row pins at the far
+            # ends of the sink fold.  The reference reads this same tensor (compute_and_compare_reference).
+            allocs[TensorUid.sink_token][0].fill_(float(cfg.sink_token_value))
     if cfg.is_train and cfg.with_sink_token:
         allocs[TensorUid.dSink_token] = alloc_tensor((1, cfg.h_q, 1, 1), torch.float32)
 
     if cfg.is_paged:
-        container_k, page_table_k = create_container_and_page_table(allocs[TensorUid.k][0], cfg.block_size)
-        container_v, page_table_v = create_container_and_page_table(allocs[TensorUid.v][0], cfg.block_size)
+        # Dead-page poison (ExecConfig.paged_nan_dead_pages, a FROST-route promise) needs the per-batch KV
+        # lengths; the pool layout (HND, or the token-major NHD pools) is declared through the container's
+        # strides at graph build.  The reference reads the dense K/V, so neither changes it.
+        poison = cfg.seq_len_kv if (getattr(cfg, "paged_nan_dead_pages", False) and cfg.is_padding) else None
+        pool_layout = getattr(cfg, "paged_pool_layout", None) or "hnd"
+        container_k, page_table_k = create_container_and_page_table(allocs[TensorUid.k][0], cfg.block_size, seq_lens=poison, layout=pool_layout)
+        container_v, page_table_v = create_container_and_page_table(allocs[TensorUid.v][0], cfg.block_size, seq_lens=poison, layout=pool_layout)
         allocs[TensorUid.container_k] = (container_k, None, None)
         allocs[TensorUid.container_v] = (container_v, None, None)
         allocs[TensorUid.page_table_k] = (page_table_k, None, None)
@@ -354,7 +363,50 @@ def allocate_tensors(cfg, rng_data_gen, perf=False):
     return allocs, tensors, max_t_q, max_t_kv
 
 
-def create_forward_graph(cfg, tensors, cudnn_handle):
+def _apply_plan_pin(graph, cfg):
+    """``cfg.plan_pin`` (ExecConfig): select the first backend plan, or append ONE explicit FROST knob set
+    through graph.create_execution_plan and select it.  select_plan is strict, so a decline of the pinned plan
+    raises at check_support / build_plans instead of walking on -- the harness turns that into a FAIL."""
+    pin = getattr(cfg, "plan_pin", None)
+    if not pin:
+        return
+    from cudnn.engines.engine_ids import is_backend_engine
+
+    pairs = []  # (index, engine_id, {knob_type: int}); the backend's delegating entry (OPENSOURCE) has no replayable pair
+    for i in range(graph.get_execution_plan_count()):
+        try:
+            engine_id, knobs = graph.get_engine_and_knobs_at_index(i)
+        except NotImplementedError:
+            continue
+        pairs.append((i, engine_id, knobs))
+    if pin["engine"] == "backend":
+        index = next((i for i, eid, _ in pairs if is_backend_engine(eid)), None)
+        if index is None:
+            names = [graph.get_plan_name_at_index(i) for i in range(graph.get_execution_plan_count())]
+            pytest.fail(f"plan_pin backend: the unified list holds no backend plan for this graph (the backend declined it); plans: {names}", pytrace=False)
+        graph.select_plan(index)
+        return
+    from cudnn.engines.manifest import MANIFEST
+
+    family = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd")
+    engine_id = family.offered_ids().get(pin["engine"])
+    if engine_id is None:
+        raise ValueError(f"FROST engine {pin['engine']!r} is not offered here (an opt-in row needs CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1)")
+    base = next((knobs for _, eid, knobs in pairs if eid == engine_id), {})
+    knobs = {**base, **{getattr(cudnn.knob_type, name): int(value) for name, value in (pin.get("knobs") or {}).items()}}
+    graph.create_execution_plan(engine_id, knobs)
+    graph.select_plan(graph.get_execution_plan_count() - 1)
+    print(f"@@@@ plan pin: {graph.get_plan_name_at_index(graph.get_execution_plan_count() - 1)}")
+
+
+def create_forward_graph(cfg, tensors, cudnn_handle, plan=True, plan_hook=None):
+    """Declare the forward graph and its variant pack.  ``plan=True`` (the default) also validates, plans
+    (heur A + FALLBACK, then ``cfg.plan_pin``), checks support and builds, turning a decline into the
+    harness's WAIVED skip; ``plan=False`` returns the declared, un-planned graph for a caller that plans
+    itself (a decline cell asserting the typed reason).  ``plan_hook(graph)`` runs after
+    ``cfg.plan_pin`` and before check_support: a test-side plan pin (graph.create_execution_plan +
+    select_plan, strict) or a recorder of the offered plan list (``hook.pins = False`` keeps the
+    default walk's WAIVED skip for it; a pin's decline FAILS the case)."""
     cudnn_dtype = convert_to_cudnn_type(cfg.data_type)
     stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=cudnn_handle, stream=stream)
@@ -495,21 +547,35 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
         if cfg.is_ragged:
             stats.set_ragged_offset(stats_ragged_offset)
 
-    try:
-        graph.validate()
-        graph.build_operation_graph()
-        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-        graph.check_support()
-        graph.build_plans()
-        # FROST auto-selection resolved at build_plans (first eligible engine,
-        # native fallback on build failure); tally the outcome.
-        note_frost_routing(graph, label="fp16-fwd")
-    except cudnn.cudnnGraphNotSupportedError as e:
-        print(f"@@@@ Overall result: WAIVED, not supported forward graph. {e}")
-        pytest.skip("not supported forward graph")
-    except Exception as e:
-        print(f"@@@@ Overall result: FAILED, unexpected '{e.__class__.__name__}' exception during forward graph build. {e}")
-        pytest.fail("unexpected exception during forward graph build", pytrace=False)
+    if plan:
+        # A pin is strict: once ``cfg.plan_pin`` or a pinning ``plan_hook`` selected a plan, a decline is a FAIL, never
+        # the WAIVED skip of the default walk (so a ``--repro`` replay of a pinned config cannot look green); a hook
+        # that only records the offered plans says so with ``hook.pins = False``.
+        pinned = False
+        try:
+            graph.validate()
+            graph.build_operation_graph()
+            graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+            _apply_plan_pin(graph, cfg)
+            pinned = bool(getattr(cfg, "plan_pin", None))
+            if plan_hook is not None:
+                # Test-side plan pin: append / select an explicit plan (strict -- a declined pin raises in check_support / build_plans).
+                plan_hook(graph)
+                pinned = pinned or bool(getattr(plan_hook, "pins", True))
+            graph.check_support()
+            graph.build_plans()
+            # FROST auto-selection resolved at build_plans (first eligible engine,
+            # native fallback on build failure); tally the outcome.
+            note_frost_routing(graph, label="fp16-fwd")
+        except cudnn.cudnnGraphNotSupportedError as e:
+            if pinned:
+                print(f"@@@@ Overall result: FAILED, the pinned plan declined. {e}")
+                pytest.fail(f"pinned plan declined (a pin is strict): {e}", pytrace=False)
+            print(f"@@@@ Overall result: WAIVED, not supported forward graph. {e}")
+            pytest.skip("not supported forward graph")
+        except Exception as e:
+            print(f"@@@@ Overall result: FAILED, unexpected '{e.__class__.__name__}' exception during forward graph build. {e}")
+            pytest.fail("unexpected exception during forward graph build", pytrace=False)
 
     variant_pack = {
         int(TensorUid.q): tensors.get(TensorUid.q),
@@ -1008,7 +1074,7 @@ def cleanup_tensors(allocs):
     torch.cuda.empty_cache()
 
 
-def exec_sdpa(cfg, request, cudnn_handle, tensor_initializer=None, tensor_checker=None):
+def exec_sdpa(cfg, request, cudnn_handle, tensor_initializer=None, tensor_checker=None, plan_hook=None):
     if request.config.option.dryrun:
         pytest.skip("dry run mode")
 
@@ -1020,7 +1086,7 @@ def exec_sdpa(cfg, request, cudnn_handle, tensor_initializer=None, tensor_checke
     if tensor_initializer is not None:
         tensor_initializer(tensors, rng_data_gen)
 
-    fwd_graph, fwd_pack = create_forward_graph(cfg, tensors, cudnn_handle)
+    fwd_graph, fwd_pack = create_forward_graph(cfg, tensors, cudnn_handle, plan_hook=plan_hook)
     bwd_graph, bwd_pack = create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv) if cfg.is_train else (None, None)
 
     execute_graph(fwd_graph, fwd_pack, allocs, tensors, cudnn_handle, request, label="Forward")

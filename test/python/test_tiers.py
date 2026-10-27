@@ -70,6 +70,11 @@ def test_every_listed_cell_collects(name, collected_ids):
     ids = _ids(name)
     assert ids, f"tiers/{name} lists nothing"
     stale = sorted(ids - collected_ids)
+    arch = name[len("smoke_") : -len(".txt")] if name.startswith("smoke_") else None
+    if stale and arch:
+        # Cells a module collects only on that arch (test_mhas_v2's cc 10.7 functions) collect under the tiers' own
+        # override (CUDNN_TEST_TIER_ARCH): re-collect just their modules under it before calling them stale.
+        stale = sorted(set(stale) - _collect(sorted({s.split("::")[0] for s in stale}), env={"CUDNN_TEST_TIER_ARCH": arch}))
     assert not stale, f"{len(stale)} id(s) in tiers/{name} no longer collect (renamed / re-parametrized? fix the list in the same commit):\n" + "\n".join(
         stale[:25]
     )

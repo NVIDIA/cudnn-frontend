@@ -1494,10 +1494,18 @@ class BlockSparseAttnBackwardSm90Blk64:
                     tdVrP = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_S), self.dtype)
                     copy_P_r2s(tdVrP, dst_idx=smem_idx_PdS)
                     cute.arch.fence_view_async_shared()
-                    cute.arch.barrier_arrive(
-                        barrier_id=int(NamedBarrierBwd.PReady) + smem_idx_PdS,
-                        number_of_threads=self.num_mma_threads,
-                    )
+                    # WG2 loads V into registers before reaching PReady.
+                    # Wait once before sV can be reused as FP32 dV scratch.
+                    if pds_iter == 0:
+                        cute.arch.barrier(
+                            barrier_id=int(NamedBarrierBwd.PReady) + smem_idx_PdS,
+                            number_of_threads=self.num_mma_threads,
+                        )
+                    else:
+                        cute.arch.barrier_arrive(
+                            barrier_id=int(NamedBarrierBwd.PReady) + smem_idx_PdS,
+                            number_of_threads=self.num_mma_threads,
+                        )
 
                     pipeline_dO.consumer_wait(
                         consumer_state_dO_cur,

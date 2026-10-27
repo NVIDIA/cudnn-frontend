@@ -866,6 +866,203 @@ def test_gather_linear_sf_support():
     C.probe_chain(chain, by_name(_CFG_1CTA))
 
 
+@pytest.mark.parametrize("family,swap_ab", [("sm100", False), ("sm100", True), ("sm120", False), ("sm120", True)])
+@pytest.mark.parametrize(
+    "layout,accepted",
+    [
+        ("compact", True),
+        ("inner_transpose", True),
+        ("padded_experts", True),
+        ("visible_padding", True),
+        ("interleaved_experts", False),
+        ("overlapping_experts", False),
+        ("misaligned_experts", False),
+        ("short_plane", False),
+        ("wrong_expert_count", False),
+        ("inner_holes", False),
+        ("inner_aliases", False),
+    ],
+)
+def test_moe_weight_sf_plane_binding(family, swap_ab, layout, accepted, monkeypatch):
+    """Exercise each family's actual binding guard without launching a kernel."""
+    from importlib import import_module
+    from cudnn.gemm.frost.fusion_ir import swap_ab as swap_chain
+    from cudnn.gemm.frost.graph_analyzer import swap_ab_binding
+
+    compiler = import_module(f"cudnn.gemm.frost.{family}.compiler")
+    E, S, N, K = 3, 173, 256, 256
+    graph = _build_graph(E, S, N, K, E)
+    chain, binding = analyze_with_binding(graph)
+    cfg = replace(by_name(_CFG_1CTA if family == "sm100" else _SM120_BS_CFG), swap_ab=swap_ab)
+    if swap_ab:
+        chain, binding = swap_chain(chain), swap_ab_binding(binding)
+    launches = []
+    compiled = compiler.CompiledMoeBlockScaleGemm(chain, cfg, pathlib.Path("unused"), lambda *a, **kw: None, binding=binding, vec_bytes_epi=16)
+    monkeypatch.setattr(compiled, "_launch_single", lambda *a, **kw: launches.append(True))
+    monkeypatch.setattr(compiler, "_launch_moe_swap_ab", lambda *a, **kw: launches.append(True), raising=False)
+    token = torch.empty(1, S, K // 2, device="cuda", dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+    weight = torch.empty(E, N, K // 2, device="cuda", dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+    output = torch.full((1, S, N), 123, device="cuda", dtype=torch.bfloat16)
+    sfa = torch.empty(1, segmented_row_scale_capacity_rows(S, E), K // 16, device="cuda", dtype=torch.float8_e4m3fn)
+    storage = torch.empty(3 * 8192, device="cuda", dtype=torch.uint8)
+    if layout == "compact":
+        sfb = storage[: E * 4096].view(E, 16, 256)
+    elif layout == "inner_transpose":
+        sfb = storage[: E * 4096].view(E, 16, 256).transpose(1, 2)
+    elif layout == "padded_experts":
+        sfb = storage.as_strided((E, 1, 4096), (4608, 4096, 1))
+    elif layout == "visible_padding":
+        sfb = storage[: E * 4608].view(E, 18, 256)
+    elif layout == "interleaved_experts":
+        sfb = storage[: E * 4096].view(16, E, 256).transpose(0, 1)
+    elif layout == "overlapping_experts":
+        sfb = storage.as_strided((E, 16, 256), (256, 256, 1))
+    elif layout == "misaligned_experts":
+        sfb = storage.as_strided((E, 1, 4096), (4097, 4096, 1))
+    elif layout == "short_plane":
+        sfb = storage.as_strided((E, 1, 3072), (8192, 3072, 1))
+    elif layout == "wrong_expert_count":
+        sfb = storage[: E * 4096].view(1, 16, E * 256)
+    elif layout == "inner_holes":
+        sfb = storage.as_strided((E, 16, 256), (8192, 512, 1))
+    else:
+        # numel == span is insufficient: these inner strides alias and leave holes.
+        sfb = storage.as_strided((E, 64, 64), (4096, 32, 33))
+    sfb = sfb.view(torch.float8_e4m3fn)
+    offsets = torch.tensor([0, 7, 80, S], device="cuda", dtype=torch.int32)
+    vp = _vp_bs(compiled, token, weight, output, sfa, sfb, fto=offsets)
+    if accepted:
+        compiled._call_variant_pack(vp)
+        assert launches == [True]
+    else:
+        with pytest.raises(ValueError, match="packed expert planes"):
+            compiled._call_variant_pack(vp)
+        assert not launches
+    assert torch.all(output == 123)
+
+
+@pytest.mark.parametrize(
+    "family,swap_ab",
+    [
+        pytest.param("sm100", False, marks=requires_sm100),
+        pytest.param("sm100", True, marks=requires_sm100),
+        pytest.param("sm120", False, marks=requires_sm120),
+        pytest.param("sm120", True, marks=requires_sm120),
+    ],
+)
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
+@pytest.mark.parametrize("public", [False, True], ids=["direct", "public"])
+def test_moe_weight_sf_runtime_stride(family, swap_ab, combo, public, cudnn_handle):
+    """Rebind one plan across compact/padded planes and reject the review's view."""
+    from importlib import import_module
+    from cudnn.engines.manifest import MANIFEST
+    from cudnn.gemm.frost.knobs import GemmKnobs
+
+    compiler = import_module(f"cudnn.gemm.frost.{family}.compiler")
+    E, S, N, K = 3, 173, 256, 256
+    block_size, _, _ = _COMBOS[combo]
+    sf_k = K // block_size
+    graph = _build_graph(E, S, N, K, E, combo=combo)
+    _, binding = analyze_with_binding(graph)
+    cfg = replace(by_name(_CFG_1CTA if family == "sm100" else _SM120_BS_CFG), swap_ab=swap_ab)
+    if combo == "mxfp8":
+        token = torch.randint(-3, 4, (1, S, K), device="cuda").to(torch.float8_e4m3fn)
+        weight = torch.randint(-3, 4, (E, N, K), device="cuda").to(torch.float8_e4m3fn)
+        token_ref, weight_ref = token[0].float(), weight.float()
+    else:
+        token = torch.randint(0, 256, (1, S, K // 2), device="cuda", dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+        weight = torch.randint(0, 256, (E, N, K // 2), device="cuda", dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+        lut = torch.tensor(_E2M1, device="cuda")
+        token_ref = _unpack_fp4(token.view(torch.uint8), lut)[0]
+        weight_ref = _unpack_fp4(weight.view(torch.uint8), lut)
+    sf_dtype = torch.float8_e4m3fn if combo == "nvfp4" else torch.float8_e8m0fnu
+    token_scales = (2.0 ** torch.randint(-2, 2, (S, sf_k), device="cuda")).to(sf_dtype)
+    weight_scales = (2.0 ** torch.randint(-2, 2, (E, N, sf_k), device="cuda")).to(sf_dtype)
+    bounds = [0, 7, 80, S]
+    offsets = torch.tensor(bounds, device="cuda", dtype=torch.int32)
+    sfa_live = torch.cat([_to_blocked(token_scales[a:b]).view(torch.uint8) for a, b in zip(bounds, bounds[1:])]).view(sf_dtype)
+    sfa = _with_static_segmented_capacity(sfa_live, S, E, sf_k)
+    compact = torch.stack([_to_blocked(weight_scales[e]).view(torch.uint8) for e in range(E)]).view(E, sf_k, N)
+    plane_bytes = compact[0].numel()
+    token_ref *= token_scales.float().repeat_interleave(block_size, 1)
+    weight_ref *= weight_scales.float().repeat_interleave(block_size, 2)
+    expected = torch.empty(1, S, N, device="cuda", dtype=torch.bfloat16)
+    for e, (a, b) in enumerate(zip(bounds, bounds[1:])):
+        expected[0, a:b] = token_ref[a:b] @ weight_ref[e].T
+    output = torch.empty_like(expected)
+    vp = {
+        binding.a_operands[0]: token,
+        binding.b_operands[0]: weight,
+        binding.sfa_operands[0]: sfa,
+        binding.sfb_operands[0]: compact.view(sf_dtype),
+        binding.first_token_offset: offsets,
+        binding.outputs[0]: output,
+    }
+    if public:
+        graph.validate()
+        graph.build_operation_graph()
+        engine_id = next(row.engine_id for row in MANIFEST if row.name == "frost_gemm")
+        graph.create_execution_plan(engine_id, GemmKnobs.from_config(cfg).to_public())
+        graph.check_support()
+        graph.build_plans()
+        assert graph.selected_engine.name == "frost_gemm"
+        workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
+
+        def launch():
+            cudnn.set_stream(cudnn_handle, torch.cuda.current_stream().cuda_stream)
+            graph.execute(vp, workspace, handle=cudnn_handle)
+
+    else:
+        compiled = compiler.jit_from_cudnn_graph(graph, config=cfg)
+        workspace = torch.empty(compiled.workspace_bytes, device="cuda", dtype=torch.uint8)
+
+        def launch():
+            compiled(vp, workspace=workspace, stream=torch.cuda.current_stream().cuda_stream)
+
+    old_stream = cudnn.get_stream(cudnn_handle)
+    capture = torch.cuda.CUDAGraph()
+    try:
+        launch()
+        torch.testing.assert_close(output, expected, atol=0.5, rtol=0.02)
+        baseline = output.clone()
+        vp[binding.sfb_operands[0]] = compact.transpose(1, 2).view(sf_dtype)
+        launch()
+        torch.testing.assert_close(output, baseline, atol=0, rtol=0)
+        for padding in (512, 1536):
+            storage = torch.full((E, plane_bytes + padding), 0xA5, device="cuda", dtype=torch.uint8)
+            padded = storage[:, :plane_bytes]
+            padded.copy_(compact.view(E, -1))
+            vp[binding.sfb_operands[0]] = storage.view(E, sf_k + padding // N, N).view(sf_dtype)
+            launch()
+            torch.testing.assert_close(output, baseline, atol=0, rtol=0)
+            vp[binding.sfb_operands[0]] = padded.view(E, sf_k, N).view(sf_dtype)
+            launch()
+            torch.testing.assert_close(output, baseline, atol=0, rtol=0)
+            with torch.cuda.graph(capture):
+                launch()
+            # Change the scale payload under replay, with the same padded addresses.
+            doubled = torch.stack([_to_blocked((weight_scales[e].float() * 2).to(sf_dtype)).view(torch.uint8) for e in range(E)])
+            padded.copy_(doubled)
+            capture.replay()
+            torch.testing.assert_close(output, baseline * 2, atol=0, rtol=0)
+            assert torch.all(storage[:, plane_bytes:] == 0xA5)
+            capture.reset()
+        vp[binding.sfb_operands[0]] = compact.view(sf_dtype)
+        launch()
+        torch.testing.assert_close(output, baseline, atol=0, rtol=0)
+        output.fill_(123)
+        workspace.fill_(0xA5)
+        # Identical bytes, dense overall, but the expert-labelled axis is interleaved.
+        vp[binding.sfb_operands[0]] = compact.flatten().view(sf_k, E, N).transpose(0, 1).view(sf_dtype)
+        with pytest.raises(ValueError, match="packed expert planes"):
+            launch()
+        assert torch.all(output == 123)
+        assert torch.all(workspace == 0xA5)
+    finally:
+        capture.reset()
+        cudnn.set_stream(cudnn_handle, old_stream)
+
+
 @pytest.mark.parametrize("swap_ab", [False, True])
 @pytest.mark.parametrize("bad,match", [("reorder", "reorder=NONE"), ("shape", "linear scale shape"), ("stride", "row stride"), ("weight", "mma type")])
 def test_gather_block_scale_rejects_sf_layout(bad, match, swap_ab):
@@ -1563,11 +1760,21 @@ def test_e2e_mx_combos(combo) -> None:
 )
 def test_e2e_mixed_mxfp8_mxfp4(fp8_on_a, config_name) -> None:
     """Grouped K32 padded and Rubin K64 native-packed mixed block-scale MMA."""
+    _run_e2e_mixed(fp8_on_a, config_name)
+
+
+def _run_e2e_mixed(fp8_on_a, config_name, *, K=256, swap_ab=False, check_sm120_source=False) -> None:
+    """One mixed MXFP8 x MXFP4 grouped block-scale GEMM against a dequantized
+    reference. ``check_sm120_source`` also pins the sm120 rendering: the e2m1
+    side stays TMA ``.b4x16`` (two values a byte) and every data descriptor
+    carries the 128-byte L2 promotion hint (in the kernel's own orientation:
+    the weight is A after the swap-AB lowering)."""
     dev = "cuda"
     torch.manual_seed(0)
-    E, S, N, K = 2, 256, 128, 256
+    E, S, N = 2, 256, 128
     offsets_list = [0, 128, S]
     bs, sf_k = 32, K // 32
+    sf_cols = _ceil_div(sf_k, 4) * 4  # the F8_128x4 blob pads K scales to whole words
     fp4, fp8 = cudnn.data_type.FP4_E2M1, cudnn.data_type.FP8_E4M3
     a_dt, b_dt = (fp8, fp4) if fp8_on_a else (fp4, fp8)
     lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
@@ -1595,12 +1802,23 @@ def test_e2e_mixed_mxfp8_mxfp4(fp8_on_a, config_name) -> None:
         a_dt_override=a_dt,
         b_dt_override=b_dt,
     )
-    compiled = _plan(g, config=by_name(config_name))
+    # Only an explicit swap reaches _plan: the sm100 swap-AB tests patch _plan
+    # with a partial that already carries swap_ab=True.
+    compiled = _plan(g, config=by_name(config_name), **({"swap_ab": True} if swap_ab else {}))
     assert compiled.chain.block_scale.mma_block_scale_kind == "MXF8F6F4"
+    if check_sm120_source:
+        fp4_side = "b" if fp8_on_a else "a"
+        if swap_ab:
+            fp4_side = {"a": "b", "b": "a"}[fp4_side]
+        source = pathlib.Path(compiled.generated_path).read_text()
+        assert f"{fp4_side}_tma_format = _tma.TensorMapDataFormat.B4X16" in source
+        assert f"{fp4_side}_smem_dtype = cutlass.Float4E2M1FNx2" in source
+        # Two A descriptor variants (M-major / K-major) and one B descriptor.
+        assert source.count("l2_promotion=_tma.TensorMapL2Promotion.l2_128b") == 3
 
     sfa_blk = torch.cat([_to_blocked(sfa_log[b : offsets_list[i + 1]]) for i, b in enumerate(offsets_list[:-1])])
-    sfa_blk = _with_static_segmented_capacity(sfa_blk, S, len(offsets_list) - 1, sf_k)
-    sfb_blk = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, sf_k, N)
+    sfa_blk = _with_static_segmented_capacity(sfa_blk, S, len(offsets_list) - 1, sf_cols)
+    sfb_blk = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, sf_cols, N)
     offsets = torch.tensor(offsets_list, dtype=torch.int32, device=dev)
     output = torch.zeros(1, S, N, dtype=torch.bfloat16, device=dev)
     compiled(_vp_bs(compiled, tok_rt, w_rt, output, sfa_blk, sfb_blk, fto=offsets))
@@ -1613,6 +1831,35 @@ def test_e2e_mixed_mxfp8_mxfp4(fp8_on_a, config_name) -> None:
         end = offsets_list[i + 1]
         ref[begin:end] = tok_deq[begin:end] @ w_deq[i % E].T
     torch.testing.assert_close(output[0], ref.to(torch.bfloat16), atol=2e-1, rtol=2e-2)
+
+
+@requires_sm120
+@pytest.mark.parametrize("fp8_on_a", [True, False], ids=["mxfp8_x_mxfp4", "mxfp4_x_mxfp8"])
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["normal", "swap_ab"])
+@pytest.mark.parametrize("K", [256, 160], ids=["k256", "k160_tail"])
+def test_e2e_mixed_mxfp8_mxfp4_sm120(fp8_on_a, swap_ab, K) -> None:
+    """The sm120 mixed pair in both kernel orientations and operand orders, at a
+    whole number of K-tiles and with a K tail: packed e2m1 operand, every data
+    descriptor with the 128-byte TMA L2 promotion hint, numerics against the
+    dequantized reference."""
+    _run_e2e_mixed(fp8_on_a, _SM120_BS_CFG, K=K, swap_ab=swap_ab, check_sm120_source=True)
+
+
+def test_sm120_mixed_pair_smem_footprint_budgets_packed_rows() -> None:
+    """The sm120 SMEM footprint check (multi_gemm_smem_bytes) sizes the packed e2m1
+    side of a mixed pair at its real 64-byte row, as multi_gemm_ab_stages does and
+    as the kernel lays its ring out, instead of the fp8 side's 128 bytes (no GPU)."""
+    from cudnn.gemm.frost.kernel_registry import select_template
+
+    fp4, fp8 = cudnn.data_type.FP4_E2M1, cudnn.data_type.FP8_E4M3
+    cfg = by_name(_SM120_BS_CFG)
+    mixed = analyze(_build_graph(2, 256, 128, 256, 2, combo="mxfp8", a_dt_override=fp8, b_dt_override=fp4))
+    same = analyze(_build_graph(2, 256, 128, 256, 2, combo="mxfp8"))
+    assert mixed.block_scale.mixed_width and not same.block_scale.mixed_width
+    t_mixed, t_same = select_template(mixed, cfg), select_template(same, cfg)
+    for stages in (1, 2, 3):
+        saved = t_same.multi_gemm_smem_bytes(same, cfg, stages) - t_mixed.multi_gemm_smem_bytes(mixed, cfg, stages)
+        assert saved == stages * cfg.cta_tile_n * (cfg.cta_tile_k_bytes // 2) * mixed.num_b_operands
 
 
 @requires_sm100
@@ -1854,7 +2101,7 @@ def _run_e2e_segmented_row_quant_matches_bridge_and_down_output(config_name: str
     assert not bad_sf.is_contiguous()
     with pytest.raises(ValueError, match="packed blob"):
         direct(_vp_bs(direct, token, weight, [q_direct, bad_sf], sfa, sfb, fto=offsets))
-    with pytest.raises(ValueError, match=r"SFA\[0\].*kernel reads"):
+    with pytest.raises(ValueError, match=r"token SF\[0\].*kernel reads"):
         direct(_vp_bs(direct, token, weight, [q_direct, sf_direct], sfa_live.view(1, -1, 1), sfb, fto=offsets))
 
     # A compiled plan admits runtime N from the weight/output shapes. The
@@ -2224,7 +2471,7 @@ def test_sm120_moe_block_scale_template_is_registered_in_the_sm120_tree() -> Non
 
     (tmpl,) = [t for t in TEMPLATES if t.pipeline == "sm120" and t.graph_type is GraphType.MOE_BLOCK_SCALE]
     assert tmpl.file == "sm120_moe_grouped_block_scale_matmul_fwd.py" and tmpl.family == "sm120"
-    assert isinstance(tmpl, Sm120KernelTemplate) and not tmpl.supports_multi_gemm
+    assert isinstance(tmpl, Sm120KernelTemplate) and tmpl.supports_multi_gemm
     assert tmpl.path.is_file()
 
     chain = analyze(_build_graph(2, 1024, 256, 512, num_groups=4))
@@ -2238,6 +2485,33 @@ def test_sm120_moe_block_scale_template_is_registered_in_the_sm120_tree() -> Non
         assert preferred_pipeline(chain) == "sm100"
     with pytest.raises(NotImplementedError, match="served by the sm120 arch tree"):
         C100._render_block_scale_tile_constants(cfg, chain, tmpl)
+
+
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
+@pytest.mark.parametrize("swap_ab", [False, True])
+def test_sm120_moe_weight_sf_stride_render(combo, swap_ab):
+    """Both SM120 orientations retain the validated runtime weight SF pitch."""
+    import ast
+    from cudnn.gemm.frost.dtypes import DTYPE_BYTES
+    from cudnn.gemm.frost.fusion_ir import swap_ab as swap_chain
+    from cudnn.gemm.frost.sm120 import compiler as C120
+    from cudnn.gemm.frost.sm120.epilogue_codegen import generate
+
+    chain = analyze(_build_graph(3, 173, 256, 256, num_groups=3, combo=combo))
+    cfg = replace(by_name(_SM120_BS_CFG), swap_ab=swap_ab)
+    if swap_ab:
+        chain = swap_chain(chain)
+    snippets = generate(
+        chain,
+        vec_bytes_epi=C120._epi_chunk_bytes(chain, cfg, False),
+        output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
+        tma_slots=frozenset(),
+        packed_lanes=C120._epi_packed_lanes(cfg),
+    )
+    src = C120._render_block_scale_template(chain, snippets, cfg)
+    ast.parse(src)
+    side = "a" if swap_ab else "b"
+    assert f"cute.assume(_sf{side}_op.stride[2] // 2, 8)" in src
 
 
 @pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
@@ -2273,6 +2547,11 @@ def test_sm120_moe_block_scale_render_smoke(combo: str, mode: str) -> None:
     assert chain.moe.num_groups == 4
     assert re.search(r"^grid_num_clusters = \d+$", src, re.M) and re.search(r"^offset_cutlass_dtype = cutlass\.Int32$", src, re.M)
     assert "moe_desc_slots = 0" in src and "tensormap_replace" not in src and "fallback_cluster_shape_mnk" not in src
+    # Every data descriptor (two A variants, one B) carries the 128-byte TMA L2 promotion.
+    assert src.count("l2_promotion=_tma.TensorMapL2Promotion.l2_128b") == 3
+    # The host's scheduler-counter launch stays unless a runtime renders this True.
+    assert re.search(r"^external_counter_reset = False$", src, re.M)
+    assert "if cutlass.const_expr(not external_counter_reset):" in src
     assert "if row < group_end:" in src
     m = re.search(r"^def _host\(\n(.*?)^\) -> None:", src, re.S | re.M)
     params = [ln.strip().split(":")[0] for ln in m.group(1).splitlines() if ln.strip()]

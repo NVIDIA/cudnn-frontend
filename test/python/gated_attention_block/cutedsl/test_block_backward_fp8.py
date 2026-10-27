@@ -45,8 +45,10 @@ oracle's own fp64 attention O and exact projection instead: the fp8 forward's P 
 3.8-5.3x the bound on every cell, and the gate's bf16 rounding alone still flipped 0.1-0.6 % of the og8 codes; the second run
 fed its own cast of its fp64 Q / K / V to the modelled SDPA stage: a few per cent of the codes flipped against the record's,
 and a P recomputed from them under the record's LSE put the modelled dh at cos 0.996 -- composition gaps of the reference,
-not kernel margins) -- ``dh / dW_o`` under the bf16 block's bound (``rtol 2^-6``, ``atol 2^-7 * max|ref|``,
-``cos >= 0.999``; ``dW_norm``: ``2^-5 * mass + 1e-2 * |ref|``) and ``dW_qkvg`` in the module's row-budgeted form WITH its attribution
+not kernel margins) -- ``dh`` under the bf16 block's bound (``rtol 2^-6``, ``atol 2^-7 * max|ref|``,
+``cos >= 0.999``; ``dW_norm``: ``2^-5 * mass + 1e-2 * |ref|``), ``dW_o`` in the e4m3 flip-class form (``_assert_dw_o_flip_structured``:
+every cell outside that bound in a column an ``og8`` flip touched, the residual after the flips' exact rank-1 term inside it, the
+flip class capped) and ``dW_qkvg`` in the module's row-budgeted form WITH its attribution
 (``_assert_seeded_dw_qkvg_row_budgeted``: the rows with a cell outside that bound against ``1e-5 x rows x keys``, keys = T -- the
 statistic ``assert_close_fp8_grad`` and the (M) layer are judged by -- and every such row BOTH a row a ``dqkvg8`` code flip touched
 AND a slab column whose PRE-cast bf16 band is itself inside that bound against the seeded oracle (the bands sit at 0.08-0.24 of
@@ -65,9 +67,10 @@ summed, where the reference rounds once (relative RMS 2.7e-3 on dK / dV under GQ
 ``dW_qkvg`` rows and the ``dh`` of the three dense cells outside the bf16 bound against row budgets of 13-52 (OVER on 10 of 15
 cells, every one under GQA; the two MHA cells inside).  The row now folds from fp32 partials (the kernel's dK is bitwise the
 once-rounded reference's under GQA, dV within 1.4e-4 relative RMS of it), and every cell is inside its budget (the table at the end:
-at most 18 dw_qkvg rows outside of a 41.9-row budget, 0 dh rows).  The row budget is asserted on every output of every cell --
-``dw_o`` everywhere and ``dh / dw_qkvg`` on the MHA cells in ``test_fp8_end_to_end_modelled_is_row_budgeted``, ``dh / dw_qkvg`` of
-the 13 GQA cells (the chain the fold sits in) in ``test_fp8_end_to_end_modelled_gqa_fold_is_row_budgeted`` -- plainly: the strict
+at most 18 dw_qkvg rows outside of a 41.9-row budget, 0 dh rows).  The row budget is asserted on ``dh / dw_qkvg`` of every cell --
+the MHA cells in ``test_fp8_end_to_end_modelled_is_row_budgeted``, the 13 GQA cells (the chain the fold sits in) in
+``test_fp8_end_to_end_modelled_gqa_fold_is_row_budgeted`` -- and ``dw_o`` is held on every cell to the e4m3 flip-class form of
+``_assert_dw_o_flip_structured`` (its row count printed: the og8 cast's one-code flips are COLUMN events) -- plainly: the strict
 ``xfail`` the 10 over-budget cells carried while the fold rounded ``group`` times is gone; never widened.  The margins are a property
 of ONE dataset: the forward inputs and dY are device-Philox draws (``torch.Generator(device="cuda")`` in the reference's input
 builder and in ``_make_dy``), which torch lays out by grid size -- the part's SM count -- so a Rubin part with another SM count (the
@@ -76,10 +79,16 @@ this layer on another SM count is the dataset moving a cell, not the kernel: re-
 fix -- drawing this module's dataset on a CPU generator, SM-independent, and re-recording both tables -- is a follow-up.
 The SDPA
 stage's kernel-vs-reference difference is characterised per cell (``_report_stage_difference``: relative RMS, d-rows outside the
-bf16 bound form, the d-rows carrying 90 % of the squared difference) AND asserted under the bf16 block's bound form
-(``_assert_grad_close`` on the stage's bf16 dQ / dK / dV: 0 d-rows outside on every cell of both regimes), because the row
-recipe's absolute ``atol 0.08`` is at or above ``max|dQ| / max|dK|`` at this geometry in true units (at any ``scale_dp``): it
-cannot tell a sparse flip class from a diffuse miss, nor an all-zero output from the right one.
+bf16 bound form, the d-rows carrying 90 % of the squared difference) AND asserted under the bf16 block's bound form in its e4m3
+FLIP-STRUCTURED shape (``_assert_sdpa_stage_flip_structured`` on the stage's bf16 dQ / dK / dV: 0 d-rows outside on every cell of
+both regimes on the 204-SM dataset, where the form is ``_assert_grad_close`` itself; a d-row outside the bound must be ONE proven
+e4m3 P / dS flip of the reference's own intermediates -- a valid position of its reduction, within 1/32 of a code spacing of a
+midpoint, the exact rank-1 term reproducing the row within the UNCHANGED bound, the fit 1 +- 1/2 -- the flipped rows under the row
+recipe's budget and the residual after the term inside the bound on every cell; measured: one dV d-row of one 128-token sequence of
+the packed dense GQA cell on a 212-SM part's dataset at 1.357 of the bound, two bf16 ulps at |ref| 0.33, cos 1.000000), because the
+row recipe's absolute ``atol 0.08`` is at or above ``max|dQ| / max|dK|`` at this geometry in true units (at any ``scale_dp``): it
+cannot tell a sparse flip class from a diffuse miss, nor an all-zero output from the right one, and a per-cell bound cannot describe
+one e4m3 flip of a P / dS value, which moves a whole d-row by one code step times an operand row.
 
 Launch count: ``expected_fp8_launches`` (host-checkable) -- the block's own launches (10 with every gradient: the fused
 PROLOGUE (scalar init -- the zeroing, ``descale_dp`` and the plan-time constants from its kernel arguments -- + dY amax partials + the
@@ -110,8 +119,8 @@ bf16 dO.  The ``dw_qkvg`` cells above 1.0 (7 of 15, 1.021-1.649x) are near-amax 
 ``32 / scale_dqkvg``), each moving one ``dW_qkvg`` row by ``flip * h[t, :]``: 1-18 rows outside against row budgets of 13-102, every one
 a row a flip touched whose pre-cast slab column sits inside its band's bound (the bands at 0.08-0.24 of it).  ``dw_qkvg`` is
 therefore judged in the module's row-budgeted form with that attribution asserted (``_assert_seeded_dw_qkvg_row_budgeted``: budget,
-flip-touched, pre-cast band inside -- counts of this run, conditions of the form), ``dh / dw_o / dW_norm`` under the per-cell
-bound::
+flip-touched, pre-cast band inside -- counts of this run, conditions of the form), ``dw_o`` in the e4m3 flip-class form (its
+per-cell worst printed), ``dh / dW_norm`` under the per-cell bound::
 
     cell                            dO    B1    B7    B8   bands dq_pre/dg/dk_pre  dqkvg8 flips  og8 flips  dh    dw_qkvg dw_o   dWq_n dWk_n  rows outside dh / dw_qkvg / dw_o (budget)
     s256_causal_b1-norm             0.245 0.213 0.204 0.155 0.122/0.193/0.116      12467         0          0.273 1.056   -      -     -      0/256 (13.1) / 2/5120 (13.1) / 0/512 (1.31)
@@ -130,8 +139,9 @@ bound::
     s512_causal_b2_scale_dp_1-norm  0.245 0.170 0.184 0.155 0.149/0.201/0.118      51144         0          0.474 1.514   -      -     -      0/1024 (52.4) / 3/5120 (52.4) / 0/512 (5.24)
     s1000_causal_b1_dgrad_only-norm 0.245 -     -     0.152 0.149/0.211/0.141      47875         -          0.224 -       -      0.140 0.144  0/1000 (51.2) / - / -
 
-(M) end-to-end in the row-budget form (``test_fp8_end_to_end_modelled_is_row_budgeted`` on ``dw_o`` everywhere and on ``dh /
-dw_qkvg`` of the MHA cells, ``test_fp8_end_to_end_modelled_gqa_fold_is_row_budgeted`` on ``dh / dw_qkvg`` of the 13 GQA cells; the
+(M) end-to-end in the row-budget form (``test_fp8_end_to_end_modelled_is_row_budgeted`` on ``dh / dw_qkvg`` of the MHA cells, with
+``dw_o`` in the flip-class form and its count printed; ``test_fp8_end_to_end_modelled_gqa_fold_is_row_budgeted`` on ``dh / dw_qkvg``
+of the 13 GQA cells; the
 modelled oracle fed the record's LSE, O, gate band, e4m3 q8 / k8 / v8 and the block's bf16 dO): cos and rows outside the bf16 bound /
 rows (budget ``1e-5 x rows x keys``) per output -- INSIDE the budget on every cell since the SDPA row folds its GQA dK / dV from fp32
 per-Q-head partials (one rounding, like the reference; with bf16 partials 10 of 15 cells were over it, 14-81 dw_qkvg rows outside and
@@ -159,6 +169,7 @@ import dataclasses
 import gc
 import inspect
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -177,7 +188,7 @@ if requirement_error:
 
 pytestmark = pytest.mark.L0
 
-from cudnn.gated_attention_block import GatedAttentionBlockBwd, SavedForBackward, gated_attention_block_backward  # noqa: E402
+from cudnn.gated_attention_block import GatedAttentionBlockBwd, GatedAttentionBlockGeometry, SavedForBackward, gated_attention_block_backward  # noqa: E402
 from cudnn.gated_attention_block import api_bwd as _api_bwd  # noqa: E402
 from cudnn.gated_attention_block.api import Fp4Format, MxQuantSpec, _cols, _view  # noqa: E402
 from cudnn.gated_attention_block.kernels import fp8_bwd_fused as _fused  # noqa: E402
@@ -190,6 +201,7 @@ from gated_block_stream_probe import park_the_default_stream  # noqa: E402
 from test_block_backward import (  # noqa: E402
     _ATOL_FRAC,
     _COMMON,
+    _COS_MIN,
     _KNOBS,
     _RTOL,
     _alloc_grads,
@@ -199,7 +211,7 @@ from test_block_backward import (  # noqa: E402
     _declare_bwd,
     _make_dy,
 )
-from test_block_training_forward import _alloc_saved, _declare_quant, _dense_tail_declined, _dequantized_bf16_inputs, _run_training_quant  # noqa: E402
+from test_block_training_forward import _alloc_saved, _declare_quant, _dequantized_bf16_inputs, _run_training_quant  # noqa: E402
 
 _SM107 = (10, 7)
 _E4M3 = torch.float8_e4m3fn
@@ -220,6 +232,7 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs 
 # The appended keyword-only parameters of the quantized backward (append-only, defaulted): the per-tensor fp8 tail, which the MXFP8
 # backward's four artifacts (``test_block_backward_mxfp8.py``) follow as the LAST parameters of ``execute`` and the wrapper.
 _FP8_INIT_KWARGS = ("quant", "grad_scaling")
+_MARGIN_INIT_KWARGS = ("grad_scale_margin_log2",)  # the gradient-scale margin: appended after grad_scaling on __init__, LAST on the wrapper
 _FP8_EXECUTE_KWARGS = ("scale_dp", "scale_dy", "scale_do", "scale_dqkvg")
 _MX_EXECUTE_KWARGS = ("h_t", "h_t_sf", "w_qkvg_t", "w_qkvg_t_sf")
 _FP4_EXECUTE_KWARGS = ("w_o_t", "w_o_t_sf")  # the fp4 weight modes' appended pair, after the MXFP8 artifacts
@@ -228,11 +241,12 @@ _FP4_EXECUTE_KWARGS = ("w_o_t", "w_o_t_sf")  # the fp4 weight modes' appended pa
 def test_the_fp8_surface_is_an_appended_keyword_only_tail():
     """Host, no GPU: the quantized backward's parameters are the LAST parameters of ``__init__``, ``execute`` and the convenience
     wrapper -- the fp8 tail directly followed by the MXFP8 backward's four appended artifacts and the fp4 weight modes' two on
-    ``execute`` and the wrapper -- keyword-only and defaulted, in the declared order (public signatures evolve append-only)."""
+    ``execute`` and the wrapper, then the gradient-scale margin ``grad_scale_margin_log2`` (after ``grad_scaling`` on ``__init__``, LAST on
+    the wrapper) -- keyword-only and defaulted, in the declared order (public signatures evolve append-only)."""
     for fn, names in (
-        (GatedAttentionBlockBwd.__init__, _FP8_INIT_KWARGS),
+        (GatedAttentionBlockBwd.__init__, _FP8_INIT_KWARGS + _MARGIN_INIT_KWARGS),
         (GatedAttentionBlockBwd.execute, _FP8_EXECUTE_KWARGS + _MX_EXECUTE_KWARGS + _FP4_EXECUTE_KWARGS),
-        (gated_attention_block_backward, _FP8_INIT_KWARGS + _FP8_EXECUTE_KWARGS + _MX_EXECUTE_KWARGS + _FP4_EXECUTE_KWARGS),
+        (gated_attention_block_backward, _FP8_INIT_KWARGS + _FP8_EXECUTE_KWARGS + _MX_EXECUTE_KWARGS + _FP4_EXECUTE_KWARGS + _MARGIN_INIT_KWARGS),
     ):
         tail = list(inspect.signature(fn).parameters.values())[-len(names) :]
         assert [p.name for p in tail] == list(names), (fn.__qualname__, [p.name for p in tail])
@@ -340,6 +354,9 @@ _LAUNCH_ONLY_CELLS = [
 _BY_ID = {c.id: c for c in _CELLS + _LAUNCH_ONLY_CELLS}
 assert len(_CELLS) == 15 and len(_BY_ID) == len(_CELLS) + len(_LAUNCH_ONLY_CELLS), "the cell ids must be unique: 12 matrix rows, three in both qk_norm arms"
 _MATRIX = pytest.mark.parametrize("cell", _CELLS, ids=[c.id for c in _CELLS])
+# A dense S % 128 != 0 (the forward's kv_tail_mask record, #1520): outside the matrix, but through the stage-localised oracles.
+_DENSE_TAIL_CELL = _Cell("s992_dense_b1", 992, False, 1, 2, True, note="dense KV tail: the forward's kv_tail_mask record")
+_STAGE_MATRIX = pytest.mark.parametrize("cell", _CELLS + [_DENSE_TAIL_CELL], ids=[c.id for c in _CELLS + [_DENSE_TAIL_CELL]])
 _BITWISE_CELL = _BY_ID["s512_causal_b2-norm"]
 # The matrix's default scale_dp: the CALIBRATED one (the chart recipe -- one warm-up execute at 1.0, then get_fp8_scale_factor(amax_dP),
 # then the measured run), because at scale_dp = 1.0 the row tolerance is near-vacuous for dQ / dK (module docstring); one cell
@@ -738,10 +755,30 @@ def _report_close(got: torch.Tensor, ref64: torch.Tensor, what: str) -> float:
     return worst
 
 
+_ROW_BUDGET_FLOOR = 1.0  # the least a row budget is (one row): ``_row_budget``'s floor and ``_row_budget_floored``'s test
+
+
 def _row_budget(rows: int, keys: int) -> float:
     """``assert_close_fp8_grad``'s row budget -- ``1e-5 x rows x keys``, at least 1 (``keys`` = the reduction length feeding a
     row) -- the ONE formula every row-budgeted statistic of this module is judged against (printed and asserted alike)."""
-    return max(1.0, 1e-5 * rows * keys)
+    return max(_ROW_BUDGET_FLOOR, 1e-5 * rows * keys)
+
+
+def _row_budget_floored(rows: int, keys: int) -> bool:
+    """Whether ``_row_budget`` is its FLOOR at this geometry: ``rows x keys <= 1e5`` (``1e-5 x rows x keys <= 1``) -- for the 5120 rows
+    of the test geometry's ``dW_qkvg`` that is fewer than 20 tokens, for 8192 rows 12 tokens or fewer.  The row count the e4m3 cast's
+    flip class leaves outside the bf16 bound is a small dataset-dependent integer at EVERY reduction length -- one near-amax ``dqkvg8``
+    flip moves one weight row by ``flip * h[t, :]`` whatever the length, while the bound grows with it -- measured 0-16 over the dense
+    and the packed suites' cells from 5 to 1024 tokens (3-9 rows at 5-13 tokens, 6 at 33, 3 at 64, 0-16 at 384-1024).  The proportional
+    budget describes the class where it exceeds that handful; at its floor it is not a bound of the class, so the row-budgeted
+    assertions REPORT the count there and hold every row outside to the flip attribution instead (conditions (2) and (3) of
+    ``_assert_seeded_dw_qkvg_row_budgeted``) plus the magnitude guard (4) of ``_assert_dw_qkvg_floor_guard``.  Only ``dW_qkvg`` takes
+    this form: at a 5-token packing ``dh`` (5 rows x 4608 keys) is at its floor too and KEEPS the count form -- a single row outside fails
+    those cells against a budget of one row (measured 0 on every cell and probe of both suites; the ``dqkvg8`` class does not reach it);
+    ``dW_o`` (512 rows x 5 keys) is at its floor as well but takes the e4m3 flip-class form of ``_assert_dw_o_flip_structured`` at EVERY
+    length instead -- the og8 cast's one-code flips are COLUMN events there (17 of 512 rows from ONE flip at 5 tokens), which no row
+    count describes."""
+    return _row_budget(rows, keys) <= _ROW_BUDGET_FLOOR
 
 
 def _rows_outside_mask(got: torch.Tensor, ref64: torch.Tensor) -> torch.Tensor:
@@ -823,13 +860,109 @@ def _qkvg_band(g, n: int) -> str:
     return "?"
 
 
+def _flip_rank1_residuals(res, v: dict, got: torch.Tensor, ref64: torch.Tensor, rows_out: torch.Tensor, flip_ev: dict) -> tuple:
+    """Per ``dW_qkvg`` row outside the bf16 bound: its worst cell as a fraction of the bound BEFORE and AFTER the ``dqkvg8`` flips'
+    rank-1 term ``sum_t (dqkvg8 - dqkvg8_ref)[t, n] / scale_dqkvg . h[t, :]`` is removed (the oracle casts at the block's scale, so
+    the remainder is GEMM rounding when the flips are the whole story), and the number of flips in its slab column -- printed by
+    ``_assert_seeded_dw_qkvg_row_budgeted`` at every length, asserted by ``_assert_dw_qkvg_floor_guard`` where the row budget floors."""
+    g, sp, t = res.geom, res.spec, res.batch * res.seq_len
+    got64, r64 = got.detach().double(), ref64.detach().double()
+    bound = _ATOL_FRAC[got.dtype] * r64.abs().max() + _RTOL[got.dtype] * r64.abs()
+    h64 = res.saved.h.view(t, g.d_model).double() * sp.descale_h
+    code_diff = (v["dqkvg8"].float()[:, rows_out].double() - flip_ev["dqkvg8_ref"].float()[:, rows_out].double()) / res.scalars["scale_dqkvg"]
+    flip_term = code_diff.t() @ h64  # [rows outside, d_model]: the flips' rank-1 contributions to each row
+    before = ((got64[rows_out] - r64[rows_out]).abs() / bound[rows_out]).amax(dim=1)
+    after = ((got64[rows_out] - r64[rows_out] - flip_term).abs() / bound[rows_out]).amax(dim=1)
+    n_flips = flip_ev["flips"][:, rows_out].sum(dim=0)
+    return before, after, n_flips
+
+
+def _assert_dw_qkvg_floor_guard(res, v: dict, got: torch.Tensor, rows_out: torch.Tensor, after: Optional[torch.Tensor], what: str) -> None:
+    """Condition (4) of the row-budgeted ``dW_qkvg`` form where its row budget is the FLOOR (``_row_budget_floored``) -- the MAGNITUDE
+    guard the count bound provides above the floor.  (2) and (3) only establish that a row outside is one a cast flip touched and that
+    its pre-cast column was inside its band: they do not bound the row's error, so a flip-touched row replaced by garbage would pass
+    them.  (4a) when the flips' rank-1 residuals are given (the seeded layer: ``_flip_rank1_residuals``), every row outside is INSIDE
+    the bf16 bound once that term is removed -- the flips explain the row's whole excess; (4b) the whole ``dW_qkvg`` is within the GEMM
+    suite's bound of ``dqkvg8^T . h8`` on the block's OWN dequantized codes (``test_fp8_stage_localised_bounds``'s B7 check, independent
+    of either oracle's codes).  ``test_fp8_floored_row_budget_guard_rejects_a_corrupted_row`` is the mutation pin: a legitimate flip
+    passes, two corrupted flip-touched rows fail."""
+    if after is not None and after.numel():
+        over = rows_out[after > 1.0]
+        assert over.numel() == 0, (
+            f"{what}: rows {over.tolist()} stay outside the bf16 bound after the dqkvg8 flips' rank-1 term is removed "
+            f"({[round(x, 3) for x in after[after > 1.0].tolist()]} of the bound): the flips do not explain the row -- not the cast's flip class"
+        )
+    g, sp, t = res.geom, res.spec, res.batch * res.seq_len
+    dqkvg8_64 = v["dqkvg8"].double() * (1.0 / res.scalars["scale_dqkvg"])
+    h8_64 = res.saved.h.view(t, g.d_model).double() * sp.descale_h
+    _gemm_bound(got, dqkvg8_64.t() @ h8_64, f"{what}: dW_qkvg = dqkvg8^T . h8 on the block's own codes (the floor's magnitude guard)")
+
+
+def _floored_flip_fixture(flip_cols: tuple = (7, 4000), *, t: int = 5, seed: int = 0) -> tuple:
+    """A CPU fixture of the tiny-``T`` form's inputs (no device): the test geometry's ``dW_qkvg = dqkvg8^T . h8`` at ``t`` tokens (the
+    row budget's FLOOR), the block's codes = the oracle's e4m3 codes with ONE single-step flip in each of ``flip_cols`` (a near-amax
+    pre-cast value of 196 cast to 192, the block's code one step up at 208: the ``flip * h[t, :]`` class), the block's ``dW_qkvg`` the
+    fp64 GEMM of its own codes rounded to bf16, the reference the oracle's codes' GEMM in fp64.  Returns ``(res, v, ref, flip_ev)`` in
+    the shapes ``_assert_seeded_dw_qkvg_row_budgeted`` and the packed module's ``_assert_m_row_budgeted`` consume."""
+    torch.manual_seed(seed)
+    g = GatedAttentionBlockGeometry(**_COMMON)
+    n, dm, scale = g.n_qkvg, g.d_model, 1.0  # scale 1: the codes are the bf16 values rounded to e4m3 (|x| <= 448)
+    pre = (torch.randn(t, n, dtype=torch.float32) * 64.0).to(torch.bfloat16)  # the pre-cast slab, well inside the e4m3 range
+    for i, col in enumerate(flip_cols):
+        pre[i % t, col] = 196.0  # exact in bf16; rounds to the e4m3 code 192 (the [128, 256) binade's step is 16)
+    codes_ref = quant_e4m3(pre, scale)
+    codes = codes_ref.clone()
+    u8 = codes.view(torch.uint8)
+    for i, col in enumerate(flip_cols):
+        u8[i % t, col] += 1  # one e4m3 step up: 192 -> 208, the cast's single-step flip
+    h8 = quant_e4m3(torch.randn(t, dm, dtype=torch.float32), 1.0)
+    ref64 = (codes_ref.double() / scale).t() @ h8.double()
+    got = ((codes.double() / scale).t() @ h8.double()).to(torch.bfloat16)
+    flips = codes.view(torch.uint8) != codes_ref.view(torch.uint8)
+    rows_t, cols_n = torch.nonzero(flips, as_tuple=True)
+    flip_ev = dict(
+        flips=flips, dqkvg8_ref=codes_ref, dw_qkvg_rows=torch.unique(cols_n), dh_rows=torch.unique(rows_t), band_col_worst=torch.zeros(n, dtype=torch.float64)
+    )
+    res = SimpleNamespace(
+        grads={"dw_qkvg": got},
+        geom=g,
+        spec=SimpleNamespace(descale_h=1.0),
+        batch=1,
+        seq_len=t,
+        saved=SimpleNamespace(h=h8.view(1, t, dm)),
+        scalars={"scale_dqkvg": scale},
+    )
+    return res, {"dqkvg8": codes}, {"dw_qkvg": ref64}, flip_ev
+
+
+def test_fp8_floored_row_budget_guard_rejects_a_corrupted_row():
+    """The tiny-``T`` form's mutation pin (host, no device).  At the row budget's FLOOR the count bound is not asserted, so the
+    attribution conditions alone would accept ANY error in a flip-touched row: two legitimate single-step flips (``_floored_flip_fixture``)
+    put exactly their two ``dW_qkvg`` rows outside the bf16 bound -- the count form would reject them (2 rows against a budget of 1) --
+    and pass the floored form; the same inputs with those two rows replaced by 1e6 (every upstream tensor and the flip evidence
+    unchanged) must be REJECTED by the magnitude guard (``_assert_dw_qkvg_floor_guard``: the post-flip residual, then the GEMM bound on
+    the block's own codes)."""
+    res, v, ref, flip_ev = _floored_flip_fixture()
+    assert _row_budget_floored(res.grads["dw_qkvg"].shape[0], _row_keys(res)["dw_qkvg"]), "the fixture must sit at the floor"
+    outside = torch.nonzero(_rows_outside_mask(res.grads["dw_qkvg"], ref["dw_qkvg"])).flatten().tolist()
+    assert outside == [7, 4000], f"the two flipped rows (and only they) must be outside the bf16 bound, got {outside}"
+    _assert_seeded_dw_qkvg_row_budgeted(res, v, ref, flip_ev, "floor control (two legitimate flips)")
+    bad = SimpleNamespace(**{**vars(res), "grads": {"dw_qkvg": res.grads["dw_qkvg"].clone()}})
+    bad.grads["dw_qkvg"][[7, 4000]] = 1e6
+    with pytest.raises(AssertionError, match="rank-1 term is removed"):
+        _assert_seeded_dw_qkvg_row_budgeted(bad, v, ref, flip_ev, "floor mutant (two corrupted flip-touched rows)")
+
+
 def _assert_seeded_dw_qkvg_row_budgeted(res, v: dict, ref: dict, flip_ev: dict, what: str) -> float:
     """The SEEDED ``dW_qkvg`` in the module's row-budgeted form WITH its attribution.  ``dW_qkvg = dqkvg8^T . h8`` is where the
     slab's single near-amax ``dqkvg8`` e4m3 flips land (an ulp there is ``32 / scale_dqkvg``; 1.02-1.65x the per-cell bound on 7 of
     15 cells of the calibrated run), and a flip at ``[t, n]`` moves exactly ``dW_qkvg`` row ``n`` (by ``flip * h[t, :]``) -- so the form
     that describes the class is the one ``assert_close_fp8_grad`` and the (M) layer use, with the attribution the mechanism
     implies, three conditions on top of finiteness: (1) the rows with a cell outside the bf16 block's bound stay within
-    ``_row_budget`` (``1e-5 x rows x keys``, keys = T); (2) EVERY such row is a row a ``dqkvg8`` flip touched
+    ``_row_budget`` (``1e-5 x rows x keys``, keys = T) -- asserted where the budget is above its floor, REPORTED where it is the floor
+    (``_row_budget_floored``: a floor of one row is not the flip class's bound; (2), (3) and the MAGNITUDE guard (4) of
+    ``_assert_dw_qkvg_floor_guard`` carry the pin there); (2) EVERY such row is a
+    row a ``dqkvg8`` flip touched
     (``flip_ev["dw_qkvg_rows"]``); (3) for EVERY such row ``n`` the PRE-cast slab column ``dqkvg[:, n]`` is itself inside the bf16
     block's bound of its band against the seeded oracle (``flip_ev["band_col_worst"][n] <= 1``; the bands sit at 0.08-0.24 of it) --
     the flip is the CAST's rounding, not a band's miss.  (2) alone is weak at the matrix's flip counts (8016-96030 flips over the
@@ -838,28 +971,23 @@ def _assert_seeded_dw_qkvg_row_budgeted(res, v: dict, ref: dict, flip_ev: dict, 
     catches a diffuse miss, (2) a row no flip reaches.  Printed: the per-cell worst (``_report_close``, the magnitude the per-cell
     bound would judge), and per row outside its band, its flip count, its pre-cast column's worst, and its worst before / after the
     flips' rank-1 term ``sum_t (dqkvg8 - dqkvg8_ref)[t, n] / scale_dqkvg . h[t, :]`` is removed (the oracle casts at the block's
-    scale, so what remains is GEMM rounding whatever caused the flips: a magnitude, not a discriminator).  Returns the per-cell
-    worst."""
+    scale, so what remains is GEMM rounding when the flips are the whole story -- a magnitude above the floor, where the count bound
+    discriminates; at the floor it is asserted, (4a), with the GEMM bound on the block's own codes, (4b)).  Returns the per-cell worst."""
     got, ref64 = res.grads["dw_qkvg"], ref["dw_qkvg"]
     assert torch.isfinite(got).all(), f"{what}: non-finite cells"  # _rows_outside_mask is NaN-blind: NaN > bound is False
     worst = _report_close(got, ref64, what)
     outside = _rows_outside_mask(got, ref64)
     rows_out = torch.nonzero(outside).flatten()
     n_out, n_rows = int(rows_out.numel()), int(outside.numel())
-    budget = _row_budget(n_rows, _row_keys(res)["dw_qkvg"])
+    keys = _row_keys(res)["dw_qkvg"]
+    budget, floored = _row_budget(n_rows, keys), _row_budget_floored(n_rows, keys)
     unexplained = rows_out[~torch.isin(rows_out, flip_ev["dw_qkvg_rows"].to(rows_out.device))]
     band_worst = flip_ev["band_col_worst"].to(rows_out.device)[rows_out]  # each row's PRE-cast slab column: worst cell / its band's bound
     not_the_casts = rows_out[band_worst > 1.0]
+    after = None
     if n_out:
-        g, sp, t = res.geom, res.spec, res.batch * res.seq_len
-        got64, r64 = got.detach().double(), ref64.detach().double()
-        bound = _ATOL_FRAC[got.dtype] * r64.abs().max() + _RTOL[got.dtype] * r64.abs()
-        h64 = res.saved.h.view(t, g.d_model).double() * sp.descale_h
-        code_diff = (v["dqkvg8"].float()[:, rows_out].double() - flip_ev["dqkvg8_ref"].float()[:, rows_out].double()) / res.scalars["scale_dqkvg"]
-        flip_term = code_diff.t() @ h64  # [rows outside, d_model]: the flips' rank-1 contributions to each row
-        before = ((got64[rows_out] - r64[rows_out]).abs() / bound[rows_out]).amax(dim=1)
-        after = ((got64[rows_out] - r64[rows_out] - flip_term).abs() / bound[rows_out]).amax(dim=1)
-        n_flips = flip_ev["flips"][:, rows_out].sum(dim=0)
+        g = res.geom
+        before, after, n_flips = _flip_rank1_residuals(res, v, got, ref64, rows_out, flip_ev)
         for i, n in enumerate(rows_out.tolist()):
             print(
                 f"{what}: row {n} ({_qkvg_band(g, n)}) outside the bf16 bound -- worst {before[i].item():.3f} of the bound, {int(n_flips[i])} dqkvg8 "
@@ -867,10 +995,11 @@ def _assert_seeded_dw_qkvg_row_budgeted(res, v: dict, ref: dict, flip_ev: dict, 
                 f"{band_worst[i].item():.3f} of its band's bound"
             )
     print(
-        f"{what}: {n_out} of {n_rows} rows outside the bf16 bound (row budget 1e-5 x rows x keys = {budget:.3g}), {int(unexplained.numel())} of them untouched "
+        f"{what}: {n_out} of {n_rows} rows outside the bf16 bound (row budget 1e-5 x rows x keys = {budget:.3g}"
+        f"{' -- its FLOOR: the count is reported, not asserted' if floored else ''}), {int(unexplained.numel())} of them untouched "
         f"by a dqkvg8 flip, {int(not_the_casts.numel())} with the pre-cast slab column itself outside its band's bound"
     )
-    assert n_out <= budget, (
+    assert floored or n_out <= budget, (
         f"{what}: {n_out} of {n_rows} rows outside the bf16 bound exceed the 1e-5 x rows x keys row budget {budget:.3g} -- rows {rows_out.tolist()}; "
         f"untouched by a dqkvg8 flip: {unexplained.tolist()}; pre-cast slab column outside its band's bound: {not_the_casts.tolist()}"
     )
@@ -883,12 +1012,139 @@ def _assert_seeded_dw_qkvg_row_budgeted(res, v: dict, ref: dict, flip_ev: dict, 
         f"bound against the seeded oracle ({[round(x, 3) for x in band_worst[band_worst > 1.0].tolist()]} of it): a miss of the band upstream of "
         f"the cast, not the cast's flip class -- rows outside {rows_out.tolist()}, row budget {budget:.3g}"
     )
+    if floored:
+        _assert_dw_qkvg_floor_guard(res, v, got, rows_out, after, what)
+    return worst
+
+
+# The kernels' bf16 ``O_gated`` differs from torch's ``bf16(O * sigmoid(G))`` where the tanh-identity sigmoid's last fp32 bit falls on a bf16
+# rounding midpoint.  Measured over the recorded per-tensor fp8 cells: 3.8e-5..1.63e-4 of the elements on 71 dense cells of 10-2016 tokens
+# (median 1.25e-4; 54-79 of 524288, 80-122 of 786432, 241-283 of 2097152, 552 of 4128768) and 0-4 of 10240 at a 5-token packing (a Poisson
+# count of mean ~1.3).  The cap -- a fraction with a count floor for the tiny cells -- sits 3.0x above the measured maximum fraction, its
+# floor 2x above the maximum tiny-cell count, three orders of magnitude below a sigmoid that moves EVERY element by one ulp (a gate-kernel
+# regression the per-flip conditions of ``_assert_dw_o_flip_structured`` cannot see: every such flip is one adjacent code on a one-ulp
+# element and its rank-1 term is exact by construction) and ~20x below a shift on 1 % of the elements.  PER FAMILY: one recorded MXFP8
+# block cell (``test_block_backward_mxfp8.py``, 2048 tokens) read 7.0e-4 (2927 of 4194304) -- 1.4x this cap -- so the form is wired to the
+# per-tensor fp8 modules only, and a port to that module re-measures its own rate first.  A declared cap, not a fitted calibration.
+_OG16_DIFFERS_FRAC_CAP = 2.0**-11
+_OG16_DIFFERS_COUNT_FLOOR = 8
+_OG8_FLIPS_PRINTED = 64  # the per-flip lines printed (the measured class is 0-163 flips per cell; a systematic shift would print thousands)
+
+
+def _assert_dw_o_flip_structured(res, v: dict, ref: dict, what: str) -> float:
+    """``dW_o`` in the e4m3 FLIP-CLASS form.  ``dW_o = (dy8 / scale_dy)^T . (og8 / scale_o)``: an fp32 accumulation of exact e4m3 products,
+    written bf16.  Its one legitimate disagreement with the oracle is the og8 CAST -- the oracle composes torch's sigmoid, the kernels the tanh
+    identity, whose last fp32 bit moves a handful of bf16 ``O_gated`` elements by one bf16 ulp, and the few of those on an e4m3 midpoint round to
+    the adjacent code (``_assert_og8_bitwise_the_kernels_o_gated``: every differing code sits on such an element).  One flipped code at ``(t, j)``
+    moves COLUMN ``j`` of ``dW_o`` by ``(code_k - code_ref)[t, j] / scale_o x dy8[t, :] / scale_dy``: a column event of one e4m3 step times |dy|,
+    whatever the token count, while the bf16 bound's atol grows with max|ref| -- at the dense suite's lengths the bound absorbs it, at a short
+    packing one flip puts rows of one column outside (measured on a 212-SM part's dataset: 17 of 512 rows at 5 tokens, 1 of 512 at 384 tokens, one
+    flip each, the residual after it <= 0.04 of the bound), so neither the per-cell bound nor the ROW-budgeted count (``1e-5 x rows x keys``, its
+    floor of one row) describes the class.  This form does, at every length, and widens nothing:
+
+      (1) finite, ``cos >= _COS_MIN``;
+      (2) ``dy8`` is bitwise torch's cast of ``dy`` at the read-back scale (the bitwise layer asserts it; re-read here: the ROW axis carries no flip
+          class, so a row outside is explained through its column or not at all);
+      (3) the kernels' bf16 ``O_gated`` differs from torch's composition on at most ``max(_OG16_DIFFERS_COUNT_FLOOR, _OG16_DIFFERS_FRAC_CAP x
+          elements)`` elements -- the COUNT cap on the class (measured 3.8e-5..1.6e-4 of the elements at every dense length): the per-flip
+          conditions below hold for ANY number of one-ulp flips, so a sigmoid that moved every element by one ulp would pass them;
+      (4) every og8 code that differs from the oracle's is ONE adjacent e4m3 code on an element whose bf16 ``O_gated`` differs from torch's by
+          exactly one bf16 ulp -- the tanh identity's last bit (a gate-kernel defect moves more than that);
+      (5) every cell outside the bf16 bound (``_ATOL_FRAC max|ref| + _RTOL |ref|``) lies in a column an og8 flip touched;
+      (6) the residual after the EXACT flip term ``(dy8 / scale_dy)^T . ((og8 - og8_ref) / scale_o)`` is inside the bf16 bound on EVERY cell --
+          the GEMM's fp32 accumulation + the bf16 output rounding (measured <= 1.07 half-ulps of bf16 at |got|, <= 0.16 of the bound): the
+          magnitude cap a kernel defect fails (a band of wrong weights is a sum over many positions, not one code on one column).
+
+    (5) and (6) are keyed on cells OUTSIDE the bf16 bound: a deviation INSIDE it on a column no flip touched passes here exactly as it passes
+    the per-cell bound today -- the form widens nothing and catches nothing new below the bound.  Asserted in the order (1), (2), (3), (4),
+    (5), (6), so a gross gate-stage shift is named before its per-flip details.  Printed: the per-cell worst (``_report_close``), the cells /
+    rows / columns outside, the bf16 ``O_gated`` differing count against its cap, every flip (position, codes, step, ulps), the residual's max.
+    Returns the per-cell worst (the magnitude the per-cell bound would have judged)."""
+    from test_sigmoid_gate_bwd import _forward_og
+
+    g, sc, sp = res.geom, res.scalars, res.spec
+    t, d = res.batch * res.seq_len, g.d_head
+    got = res.grads["dw_o"]
+    assert ref.get("og8") is not None, f"{what}: the flip-class form attributes by the ORACLE's og8 -- a kernel-vs-kernel reference keeps the row-budgeted form"
+    assert torch.isfinite(got).all(), f"{what}: non-finite cells"
+    got64, ref64 = got.detach().double(), ref["dw_o"].detach().double()
+    bound = _ATOL_FRAC[got.dtype] * ref64.abs().max() + _RTOL[got.dtype] * ref64.abs()
+    diff = got64 - ref64
+    outside = diff.abs() > bound
+    worst = _report_close(got, ref64, what)
+    cos = _cos(got64, ref64)
+    # (2) dy8 bitwise torch's cast
+    dy8 = v["dy8"].reshape(t, g.d_model)
+    assert torch.equal(
+        dy8.view(torch.uint8), quant_e4m3(res.dy.reshape(t, g.d_model), sc["scale_dy"]).view(torch.uint8)
+    ), f"{what}: dy8 is not torch's cast of dy at scale_dy"
+    # (3) the og8 flips: one adjacent code each, on a one-ulp bf16 O_gated element
+    og8_k = v["og8"].reshape(t, g.h_q * d)
+    og8_ref = ref["og8"].reshape(t, g.h_q * d)
+    flips = og8_k.view(torch.uint8) != og8_ref.view(torch.uint8)
+    f_t, f_j = torch.nonzero(flips, as_tuple=True)
+    _o_q, o_g, _o_k, _o_v = g.qkvg_offsets
+    gate = _cols(res.saved.proj_slab.view(t, g.n_qkvg), o_g, g.h_q, d)
+    og16_k = _forward_og(res.saved.o.view(t, g.h_q, d), gate, g.h_q, d).reshape(t, g.h_q * d).float()
+    og16_t = (res.saved.o.view(t, g.h_q, d).float() * torch.sigmoid(gate.float())).to(torch.bfloat16).reshape(t, g.h_q * d).float()
+    ck, cr = og8_k.float()[f_t, f_j], og8_ref.float()[f_t, f_j]
+
+    def grid(x, mantissa_bits, min_normal):  # the code spacing of a (mantissa_bits, min_normal) binary format at |x|, subnormals a flat grid
+        sp_ = torch.ldexp(torch.ones_like(x), torch.frexp(x.abs())[1] - 1) * 2.0**-mantissa_bits
+        return torch.where(x.abs() < min_normal, torch.full_like(sp_, min_normal * 2.0**-mantissa_bits), sp_)
+
+    o_lo = torch.minimum(og16_k[f_t, f_j].abs(), og16_t[f_t, f_j].abs())  # adjacent codes differ by the spacing at the LOWER magnitude
+    ulps = (og16_k[f_t, f_j] - og16_t[f_t, f_j]).abs() / grid(o_lo, 7, 2.0**-126)
+    one_code = ((ck - cr).abs() - grid(torch.minimum(ck.abs(), cr.abs()), 3, 2.0**-6)).abs() <= 1e-6
+    bad_ulps = (ulps - 1.0).abs() > 1e-6
+    n_differ, n_elems = int((og16_k != og16_t).sum()), og16_k.numel()  # (3): the class's COUNT, upstream of the cast
+    differ_cap = max(_OG16_DIFFERS_COUNT_FLOOR, _OG16_DIFFERS_FRAC_CAP * n_elems)
+    # (5) + (6)
+    delta_og = (og8_k.float().double() - og8_ref.float().double()) / float(sp.scale_o)
+    flip_term = (dy8.float().double() / float(sc["scale_dy"])).t() @ delta_og
+    residual = (diff - flip_term).abs()
+    cols_out = torch.nonzero(outside.any(dim=0)).flatten()
+    cols_touched = torch.unique(f_j)
+    cols_untouched = cols_out[~torch.isin(cols_out, cols_touched)]
+    res_worst = (residual / bound).max().item()
+    print(
+        f"{what} (flip-class form): {int(outside.sum())} cells outside the bf16 bound in {int(outside.any(dim=1).sum())} of {got.shape[0]} rows and "
+        f"{int(cols_out.numel())} of {got.shape[1]} columns; og8 flips {int(f_t.numel())} of {flips.numel()} codes touching {int(cols_touched.numel())} columns "
+        f"(bf16 O_gated ulps {ulps.min().item() if ulps.numel() else 0:.1f}..{ulps.max().item() if ulps.numel() else 0:.1f}; non-adjacent steps {int((~one_code).sum())}); "
+        f"the kernels' bf16 O_gated differs from torch's on {n_differ} of {n_elems} elements ({n_differ / n_elems:.2e}; cap {differ_cap:.0f}); "
+        f"columns outside untouched by a flip {int(cols_untouched.numel())}; the flip term reaches {(flip_term.abs() / bound).max().item():.3f} of the bound, "
+        f"the residual after it {res_worst:.4f} ({int((residual > bound).sum())} cells outside after); cos={cos:.6f}"
+    )
+    for i in range(min(int(f_t.numel()), _OG8_FLIPS_PRINTED)):  # every flip when the class is what it should be; a gross shift is counted above
+        tt, jj = int(f_t[i]), int(f_j[i])
+        print(
+            f"{what}: og8 flip at (t={tt}, j={jj}): code {cr[i].item():+g} -> {ck[i].item():+g}; bf16 O_gated torch {og16_t[tt, jj].item():+.6f} "
+            f"kernel {og16_k[tt, jj].item():+.6f} ({ulps[i].item():.1f} ulp)"
+        )
+    if int(f_t.numel()) > _OG8_FLIPS_PRINTED:
+        print(f"{what}: ... and {int(f_t.numel()) - _OG8_FLIPS_PRINTED} more og8 flips not printed")
+    assert cos >= _COS_MIN, f"{what}: cos {cos:.6f} below {_COS_MIN}"
+    assert n_differ <= differ_cap, (
+        f"{what}: the kernels' bf16 O_gated differs from torch's composition on {n_differ} of {n_elems} elements ({n_differ / n_elems:.2e}), over the "
+        f"cap {differ_cap:.0f} = max({_OG16_DIFFERS_COUNT_FLOOR}, {_OG16_DIFFERS_FRAC_CAP:.2e} x elements) -- the gate stage's sigmoid, not the cast's flip class"
+    )
+    assert not bool(bad_ulps.any()), (
+        f"{what}: {int(bad_ulps.sum())} og8 flip(s) sit on elements whose bf16 O_gated differs from torch's by "
+        f"{[round(u, 2) for u in ulps[bad_ulps].tolist()[:8]]} bf16 ulps at (t, j) {list(zip(f_t[bad_ulps].tolist()[:8], f_j[bad_ulps].tolist()[:8]))} "
+        f"(exactly one is the tanh identity's last bit)"
+    )
+    assert bool(one_code.all()), f"{what}: an og8 flip is not one adjacent e4m3 code (steps {(ck - cr)[~one_code].tolist()})"
+    assert cols_untouched.numel() == 0, f"{what}: dW_o columns {cols_untouched.tolist()} are outside the bf16 bound and no og8 flip touched them"
+    assert bool((residual <= bound).all()), (
+        f"{what}: after removing the og8 flips' exact term the residual is {res_worst:.3f} of the bf16 bound on {int((residual > bound).sum())} cells -- "
+        f"the GEMM, not the cast"
+    )
     return worst
 
 
 def _report_stage_difference(got: torch.Tensor, ref: torch.Tensor, what: str) -> None:
     """The SDPA stage's kernel-vs-reference difference CHARACTERISED (printed; the bf16 bound FORM it reports is then asserted by
-    the caller through ``_assert_grad_close``).  The row recipe's absolute ``atol 0.08`` is at or above ``max|dQ| / max|dK|`` at
+    the caller through ``_assert_sdpa_stage_flip_structured``).  The row recipe's absolute ``atol 0.08`` is at or above ``max|dQ| / max|dK|`` at
     this geometry in TRUE units -- at any ``scale_dp`` -- so the row pin alone cannot tell the row's flip class (SPARSE: a few
     d-rows, each one e4m3 step of a dS / P value times an operand row) from a diffuse miss (every row off by a few percent), nor
     an all-zero output from the right one; this print characterises the difference, and the bf16 bound form is the pin with
@@ -908,6 +1164,422 @@ def _report_stage_difference(got: torch.Tensor, ref: torch.Tensor, what: str) ->
         f"{what} kernel vs the row's reference: rel RMS {rel_rms:.3g}, max|diff|/max|ref| {diff.abs().max().item() / max(ref_max, 1e-300):.3g}, "
         f"{int(outside.sum())} of {g2.shape[0]} d-rows outside the bf16 bound form, {n90} d-rows carry 90 % of the squared difference (the form is asserted next)"
     )
+
+
+def _assert_sdpa_stage_flip_structured(
+    got: torch.Tensor,
+    ref: torch.Tensor,
+    what: str,
+    *,
+    kind: str,
+    keys: int,
+    operand: torch.Tensor,
+    flip_unit: float,
+    intermediates,
+    fp8_dtype=_E4M3,
+    out_dtype=torch.bfloat16,
+) -> float:
+    """The SDPA stage's bf16 ``dQ / dK / dV`` under the bf16 block's bound FORM in its e4m3 FLIP-STRUCTURED shape -- the stricter pin
+    beside the fp8 row's recipe: the recipe's absolute ``atol 0.08`` is at or above ``max|dQ| / max|dK|`` at this geometry in true
+    units, so it cannot reject an all-zero dQ / dK; the per-cell bound can, and it is what every cell of both regimes measured green
+    against on the 204-SM dataset -- but a per-cell bound is not a bound of the e4m3 flip class.  The kernel and the reference
+    quantize ``P * 2^FP8_SCALE_S_LOG2`` and ``dS * scale_dp`` to e4m3 independently from fp32 values a few 1e-6 apart; where the two
+    straddle a rounding midpoint the codes differ by one step ``u`` and ONE WHOLE d-row of the output moves by the exact rank-1 term
+    ``u x flip_unit x operand_row`` -- dV row ``j`` by ``u / s_scale x dO[i, hq, :]``, dK row ``j`` by ``u / scale_dp x Q[i, hq, :]``, dQ row
+    ``i`` by ``u / scale_dp x K[j, hk, :]`` -- a magnitude set by the e4m3 spacing at that value and by the operand row, not by
+    ``max|ref|`` or ``|ref|``, so the bound absorbs it on most datasets and not on others (measured: one dV d-row of one 128-token
+    sequence of the packed dense GQA cell on a 212-SM part's dataset, ``max|diff| = 0.003906 = 2^-8`` = one code step (spacing 1 in
+    ``[8, 16)``) x ``1 / 256`` x ``|dO| = 1``, two bf16 ulps at ``|ref| 0.33``, 1.357 of the bound on a cell with ``|ref| ~ 0.017``,
+    ``cos 1.000000``, 1 of 256 d-rows; 0 d-rows outside on the 204-SM and 216-SM datasets; the fp8 recipe saw ``n_bad = 0`` at
+    ``atol 0.08`` so its flip proof never ran).  The flip count per cell is a dataset property, never a kernel property.
+
+    The form, asserted in this order (the bound ``_ATOL_FRAC max|ref| + _RTOL |ref|`` per cell is UNCHANGED throughout):
+
+      (0) finite; with NO d-row outside the bound the cell takes ``_assert_grad_close`` ITSELF -- same code path, same print, same
+          cosine floor, same return -- so a cell inside the bound passes exactly as before and the form adds nothing below it;
+      (1) the old statistics line is printed and ``cos >= _COS_MIN`` (a gross shift is named before its per-row details);
+      (2) the d-rows outside stay within the row recipe's budget ``_row_budget(rows, keys)`` = ``1e-5 x rows x keys``, at least 1
+          (``keys`` = the reduction length feeding each d-row: the sequence length) -- a systematic shift is many rows, each "one flip";
+      (3) EVERY d-row outside is PROVEN one flip from the reference's own intermediates by the fp8 row's own proof
+          (``sdpa.fp8.flip_evidence``, the engine behind ``assert_close_fp8_grad``) run with THIS bound as its ordinary tolerance: a
+          VALID position of the row's own reduction (same batch, a q head of the kv head's GQA group, unmasked -- ``intermediates`` is
+          the reference re-run on the bad rows, ``ref_bwd(selection)[8]``), the reference's scaled intermediate within 1/32 of a code
+          spacing of the midpoint of two ADJACENT e4m3 codes, the exact term reproducing the row within the bound on every cell and
+          within bf16's own rounding (``atol`` + half a bf16 code spacing from each side: each side rounded its fp32 row once), and the
+          least-squares flip count ``1 +- 1/2``; a row that is not one flip fails with the diagnosis printed (``_explain_unfit_row``:
+          the closest operand row and the FIRST condition it lacks);
+      (4) the proven flips' exact rank-1 terms are removed in fp64 and the residual is inside the unchanged bound on EVERY cell --
+          the proof's own tolerance condition restated in the suite's arithmetic and message: the magnitude cap a defect fails, and
+          the sentence a reader of the log needs.
+
+    Under this narrow bound the tolerance condition is the sharp one: three flips fail it before the fit (the two-flip residual is
+    twice the visible term), a corrupted cell fails it, a band of wrong weights fails it; the fit band protects the window where a
+    fraction of a flip hides inside the bound, and the midpoint / validity conditions reject a scalar-multiple look-alike.  Nothing
+    finer than bf16's spacing is observable; a kernel defect that is EXACTLY one adjacent code at a midpoint position is the class
+    itself.  (3) and (4) are keyed on rows OUTSIDE the bound: the form widens nothing and catches nothing new below it.  Printed on a
+    cell with rows outside: the statistics line, the rows and the budget, one ``describe_flip`` line per proven flip, the flip term's
+    and the residual's worst as fractions of the bound.  The host pins (``_sdpa_flip_fixture`` and its tests) are the RED halves of
+    every condition.  Returns the per-cell worst (the magnitude the per-cell bound would have judged), like ``_assert_dw_o_flip_structured``."""
+    _test_python_root()
+    from sdpa.fp8 import describe_flip, flip_evidence
+
+    got64, ref64 = got.detach().double(), ref.detach().double()
+    assert torch.isfinite(got64).all(), f"{what}: non-finite cells"  # a NaN compares False against the bound: never a row "outside"
+    rtol, atol_frac = _RTOL[got.dtype], _ATOL_FRAC[got.dtype]
+    ref_max = ref64.abs().max().item()
+    atol = atol_frac * ref_max
+    bound = atol + rtol * ref64.abs()
+    diff = (got64 - ref64).abs()
+    d = got.shape[-1]
+    rows_out = (diff > bound).reshape(-1, d).any(dim=1)
+    n_out, n_rows = int(rows_out.sum()), int(rows_out.numel())
+    if n_out == 0:
+        return _assert_grad_close(got, ref64, what)  # (0): the identical path -- print, cosine floor, assert_close, return
+    worst = (diff / bound).max().item()
+    cos = _cos(got64, ref64)
+    stats = (
+        f"{what}: max|diff|={diff.max().item():.4g} max|ref|={ref_max:.4g} worst cell {worst:.3f} of the bound "
+        f"(rtol={rtol}, atol={atol_frac}*max|ref|) cos={cos:.6f} {got.dtype}"
+    )
+    print(stats)
+    assert cos >= _COS_MIN, stats
+    budget = _row_budget(n_rows, keys)
+    rows = torch.nonzero(rows_out).flatten()
+    coords = [tuple(int(x) for x in torch.unravel_index(r, got.shape[:-1])) for r in rows[:8]]
+    which = "P" if kind == "dV" else "dS"
+    print(
+        f"{what} (flip-structured form): {n_out} of {n_rows} d-rows outside the bf16 bound {coords}{' ...' if n_out > 8 else ''} "
+        f"(row budget {budget:.3g} = max(1, 1e-5 x {n_rows} x {keys})); every one must be ONE proven {fp8_dtype} {which} flip"
+    )
+    assert (
+        n_out <= budget
+    ), f"{stats} -- {n_out} of {n_rows} d-rows outside the bf16 bound, over the row budget {budget:.3g} (1e-5 x rows x keys, at least 1): not the flip class"
+    fits = flip_evidence(
+        got.float(),
+        ref.float(),
+        rows_out,
+        atol,
+        rtol,
+        tag=what,
+        kind=kind,
+        operand=operand,
+        flip_unit=flip_unit,
+        fp8_dtype=fp8_dtype,
+        out_dtype=out_dtype,
+        intermediates=intermediates,
+    )
+    assert (
+        fits is not None
+    ), f"{stats} -- a d-row outside the bf16 bound is NOT one {fp8_dtype} {which} flip of the reference's own intermediates (the diagnosis is printed above)"
+    term = torch.zeros_like(got64)
+    op64 = operand.detach().double().to(got64.device)
+    for f in fits:
+        print(describe_flip(what, f, fp8_dtype, flip_unit))
+        b_, s_, h_ = f["operand_row"]
+        term[f["row"]] += f["u"] * float(flip_unit) * f["gain"] * op64[b_, s_, h_]
+    residual = (got64 - ref64 - term).abs()
+    res_worst = (residual / bound).max().item()
+    n_after = int((residual > bound).sum())
+    print(
+        f"{what} (flip-structured form): the flip term reaches {(term.abs() / bound).max().item():.3f} of the bound; "
+        f"the residual after it {res_worst:.3f} ({n_after} cells outside after)"
+    )
+    assert n_after == 0, (
+        f"{stats} -- after removing the proven flip's exact rank-1 term the residual is {res_worst:.3f} of the bf16 bound on {n_after} cells: "
+        f"the flip does not explain the row"
+    )
+    return worst
+
+
+# ---------------------------------------------------------------------------
+# The SDPA-stage flip-structured form's host pins (CPU, no device): a seeded fixture of the stage's own reduction with the reference's
+# intermediates PLANTED -- one e4m3 midpoint flip at a known position -- and the mutants each condition of the form was built to reject.
+# ---------------------------------------------------------------------------
+
+_SDPA_FLIP_POS = (1, 3, 5)  # (q head, query i, key j) of the planted flip
+_SDPA_FLIP_MIDPOINT = 12.5  # the midpoint of the adjacent e4m3 codes 12 and 13 (spacing 1 in [8, 16)): torch's RNE rounds it to 12
+_SDPA_FLIP_KINDS = ("dV", "dK", "dQ")
+_SDPA_FLIP_MATRIX = pytest.mark.parametrize("kind", _SDPA_FLIP_KINDS)
+
+
+def _sdpa_flip_fixture(
+    kind: str, *, factor=1.0, op_amp=2.0, midpoint=True, off_midpoints=False, garbage=0.0, second_flip=None, seed=0, s=32, h_q=2, h_kv=1, d=256
+):
+    """A CPU fixture of the SDPA stage's reduction for ``_assert_sdpa_stage_flip_structured`` (no device, no reference run): the
+    DEQUANTIZED operand as e4m3-exact values (``dO [1, s, h_q, d]`` for dV, ``Q`` for dK, ``K [1, s, h_kv, d]`` for dQ; the row the flip
+    multiplies set to ``+-op_amp``, an e4m3-exact amplitude), the reference's SCALED fp32 intermediate ``x [1, h_q, s, s]`` (``softmax *
+    2^FP8_SCALE_S_LOG2`` for P, ``randn * 6`` for dS at a ``scale_dp`` of 64) with the planted position ``(0, *_SDPA_FLIP_POS)`` set to
+    ``_SDPA_FLIP_MIDPOINT`` (``12.25``, a quarter spacing off, with ``midpoint=False``; ``off_midpoints=True`` moves EVERY other value a
+    quarter spacing off its own midpoint so no tie exists anywhere), ``valid`` all True (dense).  The reference's codes are torch's
+    cast of ``x``; the kernel's are the same with the planted code moved by ``factor x u`` (1 = one flip, 3 = three, 1.6 = a fraction),
+    ``second_flip = (q head, i, j)`` plants a second midpoint flip (its operand row amplified too).  ``ref`` is the stage's own
+    contraction of the reference's codes in fp64 rounded to bf16 (held fp32 like ``_row_reference`` returns it), ``got`` the kernel's
+    codes' contraction rounded to bf16, ``garbage`` added to the first three cells of the flipped row.  ``intermediates(selection)``
+    slices the planted ``x`` / ``valid`` into the reference's gathered layout (``kv_cols`` -> ``[n, g, s_q]`` per ``(b, kv head, j)``,
+    ``q_rows`` -> ``[n, s_kv]`` per ``(b, q head, i)``).  Returns a namespace with ``got / ref / operand / flip_unit / intermediates /
+    keys``, the planted ``row`` (of the output) and ``pos`` (b, hq, i, j), the exact one-flip ``term`` on that row, ``factor``, ``seed``."""
+    _test_python_root()
+    from sdpa.fp8 import _fp8_codes_around  # the proof's own code-neighbour arithmetic: the fixture plants what it will be asked to find
+
+    assert float(torch.tensor(op_amp).to(_E4M3)) == op_amp, f"op_amp {op_amp} is not e4m3-exact"
+    g = torch.Generator().manual_seed(seed)
+    grp = h_q // h_kv
+    hq, i, j = _SDPA_FLIP_POS
+    by_q_row = kind == "dQ"
+    s_scale, scale_dp = 2.0 ** _api_const("FP8_SCALE_S_LOG2"), 64.0
+    if kind == "dV":
+        op = (torch.randn(1, s, h_q, d, generator=g) * 0.5).to(_E4M3).float()
+        x, unit = torch.softmax(torch.randn(1, h_q, s, s, generator=g), dim=-1) * s_scale, 1.0 / s_scale
+    elif kind == "dK":
+        op = (torch.randn(1, s, h_q, d, generator=g) * 0.5).to(_E4M3).float()
+        x, unit = torch.randn(1, h_q, s, s, generator=g) * 6.0, 1.0 / scale_dp
+    else:
+        op = (torch.randn(1, s, h_kv, d, generator=g) * 0.5).to(_E4M3).float()
+        x, unit = torch.randn(1, h_q, s, s, generator=g) * 6.0, 1.0 / scale_dp
+    flips = [(hq, i, j)] + ([tuple(second_flip)] if second_flip is not None else [])
+    for fh, fi, fj in flips:  # the operand row the flip multiplies: +-op_amp (K row j of the kv head for dQ; the dO / Q row i of q head fh otherwise)
+        signs = torch.sign(torch.randn(d, generator=g))
+        if by_q_row:
+            op[0, fj, fh // grp] = (op_amp * signs).to(_E4M3).float()
+        else:
+            op[0, fi, fh] = (op_amp * signs).to(_E4M3).float()
+    if off_midpoints:
+        c_ref0, c_alt0, u0 = _fp8_codes_around(x, _E4M3)
+        x = torch.where(u0 != 0, c_ref0 + 0.25 * (c_alt0 - c_ref0), x)
+    for fh, fi, fj in flips:
+        x[0, fh, fi, fj] = _SDPA_FLIP_MIDPOINT if midpoint else _SDPA_FLIP_MIDPOINT - 0.25
+    c_ref, c_alt, u = _fp8_codes_around(x, _E4M3)
+    valid = torch.ones_like(x, dtype=torch.bool)
+    codes_k = c_ref.clone()
+    for fh, fi, fj in flips:
+        codes_k[0, fh, fi, fj] = c_ref[0, fh, fi, fj] + factor * u[0, fh, fi, fj]
+
+    def reduce(codes):  # the stage's own contraction, in fp64 (exact: e4m3 codes times e4m3-exact operands)
+        if by_q_row:
+            out = torch.zeros(1, s, h_q, d, dtype=torch.float64)
+            for q_ in range(h_q):
+                out[0, :, q_, :] = codes[0, q_].double() @ op[0, :, q_ // grp, :].double()
+        else:
+            out = torch.zeros(1, s, h_kv, d, dtype=torch.float64)
+            for hk in range(h_kv):
+                for q_ in range(hk * grp, (hk + 1) * grp):
+                    out[0, :, hk, :] += codes[0, q_].double().t() @ op[0, :, q_, :].double()
+        return out * unit
+
+    ref64, got64 = reduce(c_ref), reduce(codes_k)
+    row = (0, i, hq) if by_q_row else (0, j, hq // grp)
+    if garbage:
+        got64[row][:3] += garbage
+    ref, got = ref64.to(torch.bfloat16).float(), got64.to(torch.bfloat16)
+    key = "p_scaled" if kind == "dV" else "ds_scaled"
+
+    def intermediates(selection):
+        mode, coords = next(iter(selection.items()))
+        coords = torch.as_tensor(coords).reshape(-1, 3).tolist()
+        if mode == "kv_cols":
+            xs = torch.stack([x[b_, hk * grp : (hk + 1) * grp, :, jj] for b_, hk, jj in coords])
+            vs = torch.stack([valid[b_, hk * grp : (hk + 1) * grp, :, jj] for b_, hk, jj in coords])
+        else:
+            xs = torch.stack([x[b_, q_, ii, :] for b_, q_, ii in coords])
+            vs = torch.stack([valid[b_, q_, ii, :] for b_, q_, ii in coords])
+        return {key: xs, "valid": vs, "gain": None, "h_q": h_q, "h_kv": h_kv, "mode": mode}
+
+    op_row = op[0, j, hq // grp] if by_q_row else op[0, i, hq]
+    term = (u[0, hq, i, j] * unit * op_row).double()
+    operand_row = (0, j, hq // grp) if by_q_row else (0, i, hq)
+    return SimpleNamespace(
+        kind=kind, got=got, ref=ref, operand=op, flip_unit=unit, intermediates=intermediates, keys=s, row=row, pos=(0, hq, i, j), operand_row=operand_row,
+        term=term, factor=factor, seed=seed, what=f"{kind} fixture (seed {seed})"
+    )  # fmt: skip
+
+
+def _sdpa_flip_preconditions(f) -> tuple:
+    """What the fixture must satisfy for a pin to mean what it says (the fp8 self-tests' ``_is_bad_row`` / ``_decisive`` pattern):
+    ``visible`` -- ONE flip puts a cell of the planted row outside the bf16 bound; ``hidden`` -- the ``(factor - 1)`` residual against
+    one flip is inside the bound AND inside ``atol`` + half a bf16 spacing from each side on every cell (so only the flip COUNT can
+    reject it).  Also returns the one-flip term and that residual as fractions of the row's bound."""
+    _test_python_root()
+    from sdpa.fp8 import _grid_spacing
+
+    ref64 = f.ref.double()
+    atol = _ATOL_FRAC[torch.bfloat16] * ref64.abs().max().item()
+    bound_row = atol + _RTOL[torch.bfloat16] * ref64[f.row].abs()
+    one = f.term.abs()
+    resid = ((f.factor - 1.0) * f.term).abs()
+    a_row, e_row = f.got[f.row].float(), f.ref[f.row]
+    tol_out = atol + (_grid_spacing(a_row, torch.bfloat16) + _grid_spacing(e_row, torch.bfloat16)).double() / 2
+    visible = bool((one > bound_row).any())
+    hidden = bool((resid <= bound_row).all() and (resid <= tol_out).all())
+    return visible, hidden, (one / bound_row).max().item(), (resid / bound_row).max().item()
+
+
+def _sdpa_flip_case(kind: str, *, want_visible=True, want_hidden=None, seeds=range(16), **kw):
+    """The first seed whose fixture satisfies the pin's preconditions (``_sdpa_flip_preconditions``), printed; a torch RNG-stream change
+    surfaces here as a precondition failure with every tried seed listed, never as a pin that passes for the wrong reason."""
+    tried = []
+    for seed in seeds:
+        f = _sdpa_flip_fixture(kind, seed=seed, **kw)
+        visible, hidden, one_r, res_r = _sdpa_flip_preconditions(f)
+        tried.append((seed, visible, hidden, round(one_r, 3), round(res_r, 3)))
+        if visible == want_visible and (want_hidden is None or hidden == want_hidden):
+            print(f"{f.what}: one flip {one_r:.3f} of the bound (visible={visible}); the (factor - 1) residual {res_r:.3f} (hidden={hidden}); {kw}")
+            return f
+    raise AssertionError(
+        f"no seed in {list(seeds)} builds the {kind} fixture with visible={want_visible} hidden={want_hidden} for {kw}: (seed, visible, hidden, one, resid) {tried}"
+    )
+
+
+def _run_sdpa_flip_form(f, what_suffix="(the bf16 bound form)") -> float:
+    return _assert_sdpa_stage_flip_structured(
+        f.got, f.ref, f"{f.what} {what_suffix}", kind=f.kind, keys=f.keys, operand=f.operand, flip_unit=f.flip_unit, intermediates=f.intermediates
+    )
+
+
+@_SDPA_FLIP_MATRIX
+def test_sdpa_stage_flip_form_accepts_one_proven_flip(kind, capsys):
+    """The control, with its RED half: one planted e4m3 midpoint flip (``x = 12.5``, codes ``+12 -> +13``, step ``+1 x flip_unit``) times an
+    operand row of amplitude 2 puts ONE d-row outside the bf16 bound -- the plain bound form (``_assert_grad_close``, the pin as it
+    stood) REJECTS it with the statistics line -- and the flip-structured form PROVES it: the printed attribution names the planted
+    position, the two codes and the operand row, fits it as one flip within 5 %, and the residual after the exact term leaves no cell
+    outside; the returned worst is the magnitude the plain form judged (> 1)."""
+    f = _sdpa_flip_case(kind, want_visible=True)
+    with pytest.raises(AssertionError, match=r"worst cell [1-9][0-9]*\.[0-9]+ of the bound") as red:
+        _assert_grad_close(f.got, f.ref.double(), f"{f.what} (the bf16 bound form, plain)")
+    print(f"RED half (the plain bound form): {red.value}")
+    capsys.readouterr()
+    worst = _run_sdpa_flip_form(f)
+    out = capsys.readouterr().out
+    assert worst > 1.0, worst
+    assert "(flip-structured form): 1 of" in out and "d-rows outside the bf16 bound" in out and "(row budget 1 =" in out, out
+    assert f"is ONE flipped fp8 intermediate at (b, hq, i, j)={f.pos}: x=+12.5 rounds to {_E4M3} code +12, the kernel to +13" in out, out
+    assert f"x operand row {f.operand_row} reproduces the row" in out, out
+    fit = float(re.search(r"and fits it as ([0-9.]+) flips", out).group(1))
+    assert abs(fit - 1.0) < 0.05, fit
+    assert re.search(r"the residual after it 0\.[0-9]+ \(0 cells outside after\)", out), out
+
+
+@_SDPA_FLIP_MATRIX
+def test_sdpa_stage_flip_form_catches_nothing_new_below_the_bound(kind, capsys):
+    """An operand row of amplitude 0.25 keeps the same flip INSIDE the bound (0 d-rows outside): the form returns exactly what
+    ``_assert_grad_close`` returns and prints nothing of its own -- keyed on rows OUTSIDE the bound, it widens nothing and catches
+    nothing new below it."""
+    f = _sdpa_flip_case(kind, want_visible=False, op_amp=0.25)
+    assert int(_rows_outside_mask(f.got, f.ref.double()).sum()) == 0
+    plain = _assert_grad_close(f.got, f.ref.double(), f"{f.what} (the bf16 bound form, plain)")
+    capsys.readouterr()
+    worst = _run_sdpa_flip_form(f)
+    out = capsys.readouterr().out
+    assert worst == plain and 0 < worst < 1.0, (worst, plain)
+    assert "flip-structured" not in out and "%%%%" not in out, out
+
+
+@_SDPA_FLIP_MATRIX
+@pytest.mark.parametrize(
+    "off_midpoints, said",
+    [(False, "lies 0.2500 code spacings from the midpoint"), (True, "No valid position of the row's reduction has an intermediate within the midpoint window")],
+    ids=["planted_value_off_the_midpoint", "every_value_off_every_midpoint"],
+)
+def test_sdpa_stage_flip_form_rejects_a_row_with_no_near_midpoint_intermediate(kind, off_midpoints, said, capsys):
+    """The same shifted row with the planted intermediate a quarter spacing OFF the midpoint (12.25) is a power-of-two multiple of an
+    operand row and nothing more: rejected at the midpoint condition, the diagnosis naming the distance; with EVERY intermediate off
+    every midpoint no candidate of the reduction is left at all."""
+    f = _sdpa_flip_case(kind, want_visible=True, midpoint=False, off_midpoints=off_midpoints)
+    with pytest.raises(AssertionError, match=rf"is NOT one {re.escape(str(_E4M3))} (P|dS) flip of the reference's own intermediates"):
+        _run_sdpa_flip_form(f)
+    out = capsys.readouterr().out
+    assert "is NOT one flipped fp8 intermediate" in out and said in out, out
+
+
+@_SDPA_FLIP_MATRIX
+def test_sdpa_stage_flip_form_rejects_three_flips(kind, capsys):
+    """Three flips of the planted code: the one-flip candidate leaves a two-flip residual -- twice the visible term -- so the row fails
+    the tolerance condition (the exact term must reproduce the row within the UNCHANGED bound) before any fit is weighed."""
+    f = _sdpa_flip_case(kind, want_visible=True, want_hidden=False, factor=3.0)
+    with pytest.raises(AssertionError, match="is NOT one"):
+        _run_sdpa_flip_form(f)
+    out = capsys.readouterr().out
+    assert "which predicts the row to max |residual| / tol = " in out, out
+
+
+def test_sdpa_stage_flip_form_rejects_a_fraction_of_a_flip_by_the_fit_alone(capsys):
+    """dV, the finest step (``1 / 2^FP8_SCALE_S_LOG2``): 1.6 flips of the planted code with the 0.6-flip residual HIDDEN inside the bound and
+    inside bf16's rounding on every cell (the precondition), so the tolerance and the rounding conditions both hold and ONLY the
+    least-squares flip count (``1 +- 1/2``) rejects it.  1.5 is the band's knife edge; dK / dQ at these amplitudes fail the tolerance
+    instead (their step is 1.7-2.6x the bound), so this pin is dV's."""
+    f = _sdpa_flip_case("dV", want_visible=True, want_hidden=True, factor=1.6, op_amp=2.0)
+    with pytest.raises(AssertionError, match="is NOT one"):
+        _run_sdpa_flip_form(f)
+    out = capsys.readouterr().out
+    assert re.search(r"which fits the row as 1\.6[0-9] flips of itself", out), out
+
+
+@_SDPA_FLIP_MATRIX
+def test_sdpa_stage_flip_form_rejects_a_flip_touched_row_with_a_corrupted_cell(kind, capsys):
+    """A legitimate flip plus 0.05 of garbage on three cells of its row: the proof's tolerance condition fails on those cells -- a flip
+    explains a row entirely or not at all."""
+    f = _sdpa_flip_case(kind, want_visible=True, garbage=0.05)
+    with pytest.raises(AssertionError, match="is NOT one"):
+        _run_sdpa_flip_form(f)
+    out = capsys.readouterr().out
+    assert "which predicts the row to max |residual| / tol = " in out, out
+
+
+@_SDPA_FLIP_MATRIX
+def test_sdpa_stage_flip_form_residual_guard_rejects_what_a_permissive_proof_accepts(kind, monkeypatch, capsys):
+    """Condition (4) stands on its own.  With the proof REPLACED by one that attributes every bad row to the planted flip whatever the
+    row holds (the failure mode of a proof that is too permissive), the legitimate flip still passes and the flip-touched row with a
+    corrupted cell is still rejected -- by the fp64 residual after the exact rank-1 term against the unchanged bound."""
+    import sdpa.fp8 as fp8_module
+
+    f_ok = _sdpa_flip_case(kind, want_visible=True)
+    f_bad = _sdpa_flip_fixture(kind, seed=f_ok.seed, garbage=0.05)
+    fake = dict(
+        row=f_ok.row, position=f_ok.pos, x=_SDPA_FLIP_MIDPOINT, c_ref=12.0, c_alt=13.0, u=1.0, off_mid_spacings=0.0, step=f_ok.flip_unit, gain=1.0,
+        worst=0.0, rounding=0.0, flips=1.0, n_tied=0, operand_row=f_ok.operand_row
+    )  # fmt: skip
+    monkeypatch.setattr(fp8_module, "flip_evidence", lambda *a, **k: [fake])
+    worst = _run_sdpa_flip_form(f_ok, "(permissive proof, legitimate flip)")
+    assert worst > 1.0 and "0 cells outside after" in capsys.readouterr().out
+    with pytest.raises(AssertionError, match="after removing the proven flip's exact rank-1 term the residual is"):
+        _run_sdpa_flip_form(f_bad, "(permissive proof, corrupted row)")
+
+
+@_SDPA_FLIP_MATRIX
+def test_sdpa_stage_flip_form_holds_the_row_budget_floor(kind, capsys):
+    """Two legitimate flips in two d-rows at the row budget's FLOOR (32 d-rows x 32 keys: ``1e-5 x rows x keys < 1``, budget 1): the
+    count condition rejects the cell before any proof runs -- a systematic shift is many rows, each 'one flip', and the budget is
+    where it is named."""
+    for seed in range(16):
+        f = _sdpa_flip_fixture(kind, seed=seed, second_flip=(0, 7, 11))
+        rows = torch.nonzero(_rows_outside_mask(f.got, f.ref.double())).flatten().tolist()
+        if len(rows) == 2:
+            break
+    else:
+        raise AssertionError(f"no seed puts exactly the two flipped {kind} rows outside the bound")
+    n_rows = f.got.shape[0] * f.got.shape[1] * f.got.shape[2]
+    assert _row_budget(n_rows, f.keys) == _ROW_BUDGET_FLOOR, _row_budget(n_rows, f.keys)
+    with pytest.raises(AssertionError, match=r"2 of \d+ d-rows outside the bf16 bound, over the row budget 1"):
+        _run_sdpa_flip_form(f)
+    assert "%%%%" not in capsys.readouterr().out  # no proof ran
+
+
+def test_both_sdpa_stage_pins_take_the_flip_structured_form():
+    """The dense and the packed suites hold the SDPA stage's bf16 output to ONE form: each stage block calls
+    ``_assert_sdpa_stage_flip_structured`` with ``kind=`` and ``keys=``, and no plain ``_assert_grad_close`` on the ``(the bf16 bound
+    form)`` string survives in either (host, no device: reads both modules' source)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for module, head in (
+        ("test_block_backward_fp8.py", "def test_fp8_stage_localised_bounds("),
+        ("test_block_thd_backward_fp8.py", "def _assert_sdpa_stage_per_sequence("),
+    ):
+        src = open(os.path.join(here, module)).read()
+        start = src.index("\n" + head) + 1  # the column-0 definition, not this test's own mention of it
+        end = src.find("\ndef ", start + 1)
+        block = src[start : end if end > 0 else len(src)]
+        assert "_assert_sdpa_stage_flip_structured(" in block and "kind=tag," in block and "keys=" in block, module
+        assert "(the bf16 bound form)" in block, module
+        plain = [ln for ln in block.splitlines() if "_assert_grad_close(" in ln and "bf16 bound form" in ln]
+        assert not plain, (module, plain)
 
 
 def _row_tol() -> tuple:
@@ -1110,7 +1782,7 @@ def _assert_quantizers_scalars_delta_bitwise(res) -> dict:
 
 
 @requires_rubin
-@_MATRIX
+@_STAGE_MATRIX
 def test_fp8_stage_localised_bounds(cell):
     """Every stage of the quantized backward against the bound calibrated FOR IT, on the block's own operands (module docstring):
 
@@ -1127,10 +1799,13 @@ def test_fp8_stage_localised_bounds(cell):
     ``saved.lse``, the block's ``delta`` and scalars under ``_FP8_GRAD_TOL`` + the flip budget -- a bad d-row above the magnitude
     cap PROVED one e4m3 midpoint flip from the reference's own intermediates (``operand`` / ``flip_unit`` / ``intermediates``),
     at the calibrated ``scale_dp`` the matrix runs at (module docstring) -- AND under the bf16 block's bound form on the stage's
-    bf16 output (``_assert_grad_close``: the stricter pin the characterisation measured green on every cell; the row recipe's
-    absolute ``atol 0.08`` alone cannot reject an all-zero dQ / dK at this geometry) -- ``amax_dP`` under
-    ``_AMAX_DS_TOL``; ``dh / dW_o / dW_*_norm`` vs the oracle SEEDED with the block's own dQ / dK / dV under the bf16 block's
-    bound, and ``dW_qkvg`` in the module's row-budgeted form with its attribution (``_assert_seeded_dw_qkvg_row_budgeted``: the rows
+    bf16 output in its e4m3 flip-structured shape (``_assert_sdpa_stage_flip_structured``: the stricter pin the characterisation
+    measured green on every cell of the 204-SM dataset; the row recipe's absolute ``atol 0.08`` alone cannot reject an all-zero dQ /
+    dK at this geometry, and a d-row outside the bound must be ONE proven e4m3 P / dS flip of the reference's own intermediates,
+    the bound unchanged) -- ``amax_dP`` under
+    ``_AMAX_DS_TOL``; ``dh / dW_*_norm`` vs the oracle SEEDED with the block's own dQ / dK / dV under the bf16 block's bound,
+    ``dW_o`` in the e4m3 flip-class form (``_assert_dw_o_flip_structured``), and ``dW_qkvg`` in the module's row-budgeted form with
+    its attribution (``_assert_seeded_dw_qkvg_row_budgeted``: the rows
     with a cell outside that bound within ``1e-5 x rows x T``, every one a row a ``dqkvg8`` code flip touched AND a slab column whose
     pre-cast band is itself inside the bound, the cast's rounding and not a band's miss -- the per-cell bound sat at 1.02-1.65x on 7
     of 15 cells of the calibrated run, each a single near-amax flip moving one row; the per-cell worst stays printed)."""
@@ -1187,11 +1862,20 @@ def test_fp8_stage_localised_bounds(cell):
             out_dtype=torch.bfloat16,
         )
         _report_stage_difference(v[name].view(b, s, h, d), refs[name], tag)
-        # The stricter pin the characterisation measured green on every cell of both regimes (0 d-rows outside): the bf16
-        # block's bound FORM (atol 2^-7 max|ref| + rtol 2^-6 |ref|, cos >= 0.999) on the stage's bf16 output -- an all-zero dQ
-        # / dK passes the row recipe's absolute atol 0.08 at this geometry (max|dQ| <= 0.08 in true units at any scale_dp);
-        # it does not pass this.
-        _assert_grad_close(v[name].view(b, s, h, d), refs[name].double(), f"{tag} vs the row's reference (the bf16 bound form)")
+        # The stricter pin: the bf16 block's bound FORM (atol 2^-7 max|ref| + rtol 2^-6 |ref|, cos >= 0.999) on the stage's bf16
+        # output -- an all-zero dQ / dK passes the row recipe's absolute atol 0.08 at this geometry (max|dQ| <= 0.08 in true units
+        # at any scale_dp); it does not pass this -- in the e4m3 flip-structured shape: a d-row outside the bound must be ONE
+        # proven P / dS flip of the reference's own intermediates (the helper's docstring), the bound itself unchanged.
+        _assert_sdpa_stage_flip_structured(
+            v[name].view(b, s, h, d),
+            refs[name],
+            f"{tag} vs the row's reference (the bf16 bound form)",
+            kind=tag,
+            keys=s,
+            operand=operands[name],
+            flip_unit=flip_unit[name],
+            intermediates=lambda sel: ref_bwd(sel)[8],
+        )
     amax_dp = sc["amax_dp"]
     print(f"amax_dP {amax_dp:.6g} vs the reference's max|dS| {amax_ds_ref:.6g} (scale_dp {res.scale_dp:g}, amax_dP * scale_dp = {amax_dp * res.scale_dp:.4g})")
     assert abs(amax_dp - amax_ds_ref) <= amax_tol["atol"] + amax_tol["rtol"] * amax_ds_ref, (amax_dp, amax_ds_ref)
@@ -1199,9 +1883,10 @@ def test_fp8_stage_localised_bounds(cell):
     ref = _oracle_seeded(res)
     flip_ev = _report_seeded_intermediates(res, v, ref)
     worst = {}
-    for name in ("dh", "dw_o"):
-        if res.grads[name] is not None:
-            worst[name] = _assert_grad_close(res.grads[name], ref[name], f"{name} vs the seeded oracle")
+    if res.grads["dh"] is not None:
+        worst["dh"] = _assert_grad_close(res.grads["dh"], ref["dh"], "dh vs the seeded oracle")
+    if res.grads["dw_o"] is not None:
+        worst["dw_o"] = _assert_dw_o_flip_structured(res, v, ref, "dw_o vs the seeded oracle")  # the e4m3 flip-class form
     if res.grads["dw_qkvg"] is not None:
         # dW_qkvg = dqkvg8^T . h8 is where the slab's single near-amax e4m3 flips land (1.02-1.65x the per-cell bound on 7 of 15
         # cells), one dW_qkvg row per flip: judged in the row-budgeted form the (M) layer uses, every row outside a flip-touched row
@@ -1265,21 +1950,28 @@ def _m_over_the_row_budget(cell: _Cell, res, ref: dict, names: tuple) -> dict:
 def test_fp8_end_to_end_modelled_is_row_budgeted(cell):
     """The (M) end-to-end asserted in the ONE form named for it: the bf16 block's bound with the SDPA stage's flip class propagated
     linearly and budgeted by ROWS like ``assert_close_fp8_grad`` (``1e-5 x rows x keys``, at least 1; ``keys`` = the reduction
-    length feeding a row), on every output whose chain has NO fold -- ``dw_o`` on every cell (``dy8^T . og8``: nothing of the
-    SDPA backward in it) and ``dh / dw_qkvg`` on the MHA cells (``group == 1``: the row writes dK / dV once) -- never widened.
+    length feeding a row), on every output whose chain has NO fold and whose class is a ROW event -- ``dh / dw_qkvg`` on the MHA cells
+    (``group == 1``: the row writes dK / dV once) -- never widened; ``dw_o`` on every cell (``dy8^T . og8``: nothing of the SDPA
+    backward in it) is held to the e4m3 flip-class form of ``_assert_dw_o_flip_structured`` with its row count printed (the og8 cast's
+    one-code flips are COLUMN events, which a row count at a short reduction does not describe).
     The modelled oracle's SDPA stage is fed the kernel's own inputs (the record's LSE, ``q8 / k8 / v8`` and the block's bf16 dO; its
     ``delta`` is that dO's row-sum), so what this layer measures is the SDPA stage's kernel-vs-reference difference propagated through
-    the modelled casts -- inside the budget on every output asserted here (``dw_o`` 0 rows outside on every cell; the MHA cells' ``dh``
-    0 and ``dw_qkvg`` 0 / 18 of 8192 against 83.9 / 41.9).  Fed its own cast of its fp64 chain instead, the oracle's ``q8 / k8 / v8``
+    the modelled casts -- inside the budget on every output asserted here (``dw_o`` 0 cells outside the bf16 bound on every dense
+    cell; the MHA cells' ``dh`` 0 and ``dw_qkvg`` 0 / 18 of 8192 against 83.9 / 41.9).  Fed its own cast of its fp64 chain instead, the
+    oracle's ``q8 / k8 / v8``
     and ``do8`` flipped a few per cent of their codes against the record's LSE / delta and this layer read 75 % of the rows outside --
     a composition gap, removed, not a margin.  ``dh / dw_qkvg`` of the GQA cells -- the chain WITH the fold, over fp32 per-Q-head
     partials rounded once -- are ``test_fp8_end_to_end_modelled_gqa_fold_is_row_budgeted``."""
     res = _cell_backward(cell)
-    fold_free = ("dh", "dw_qkvg", "dw_o") if cell.group == 1 else ("dw_o",)
-    over = _m_over_the_row_budget(cell, res, _oracle_m(res), fold_free)
+    ref_m = _oracle_m(res)
+    fold_free = ("dh", "dw_qkvg") if cell.group == 1 else ()
+    over = _m_over_the_row_budget(cell, res, ref_m, fold_free)
     assert (
         not over
     ), f"{cell.id}: (M) rows outside the bf16 bound exceed the 1e-5 x rows x keys row budget on an output with no fold in its chain (rows outside, rows, budget): {over}"
+    # dW_o: the e4m3 flip-class form on every cell that produces it (its row count stays printed above; the dgrad-only cell has none)
+    if res.grads["dw_o"] is not None:
+        _assert_dw_o_flip_structured(res, _slots(res), ref_m, f"{cell.id} (M) dw_o")
 
 
 @requires_rubin
@@ -1722,10 +2414,15 @@ def test_fp8_execute_scalar_contracts_are_typed():
 
 
 @requires_rubin
-def test_fp8_dense_tail_has_no_record():
-    """A dense ``S % 128 != 0`` has no quantized record to run a backward over: the quantized forward declines it typed at
-    ``check_support`` (no padding mask and no causal mask covering the KV tail) -- the complement of the padded causal cells."""
-    _dense_tail_declined({**_COMMON, "qk_norm": True, "is_causal": False}, 1, 992, "fp8")
+def test_fp8_dense_tail_backward_is_finite_and_quantizes_bitwise():
+    """A dense ``S % 128 != 0`` has a quantized record: the forward masks the KV tail in-kernel (kv_tail_mask, #1520), so the
+    backward runs over it -- every gradient finite and the bitwise layer of the matrix cells, as the launch-only cells; its
+    gradients against the oracles are ``test_fp8_stage_localised_bounds[s992_dense_b1-...]``."""
+    res = _cell_backward(_DENSE_TAIL_CELL)
+    for name, ten in res.grads.items():
+        if ten is not None:
+            assert torch.isfinite(ten).all(), f"s992_dense_b1: {name} has non-finite cells"
+    _assert_quantizers_scalars_delta_bitwise(res)
 
 
 # ---------------------------------------------------------------------------
@@ -1792,11 +2489,15 @@ def test_fp8_reject_bf16_weights_with_quant():
 
 
 @requires_cuda
-def test_fp8_reject_thd_with_quant():
-    """``thd=True`` with ``quant``: dense-only for now (the fp8 row's packed chain serves no external delta, and the block's delta
-    contract forbids the row's own pre-pass) -- declined typed AT DECLARATION, naming BOTH attributes, and the message does NOT
-    tell the caller to build the plan without ``external_delta`` (the adapter's text must never surface here).  Host-side, over
-    placeholders shaped like a packed record (``[T, d_model]`` bf16 dy, e4m3 ``saved.h``, int32 ``saved.seq_lens``)."""
+def test_fp8_thd_with_quant_is_served_at_declaration():
+    """``thd=True`` with ``quant=QuantSpec`` CONSTRUCTS (it used to be the typed dense-only decline): the packed per-tensor fp8
+    backward is the dense stage list at ``B = 1, S = T`` with the SDPA stage's packed declaration over the fp8 row -- ``thd``
+    passed through, the envelope ``(num_sequences, max_seq_len)``, ``external_delta=True`` with the adapter's PACKED head-major
+    ``[1, H_q, ceil128(T)]`` delta shape, ``amax_dP`` requested, both packed totals at ``T`` -- read off the declared stage without
+    a compile and without a device read (the declaration and every assertion run under ``set_sync_debug_mode("error")``: the
+    lengths tensor's presence is the fact, never its values).  Host-side, over placeholders shaped like a packed record
+    (``[T, d_model]`` bf16 dy, e4m3 ``saved.h``, int32 ``saved.seq_lens``); the record's buffers are the packed suite's business
+    (``test_block_thd_backward_fp8.py``)."""
     r = _fp8_decl(dict(_COMMON), 1, 256, quant=None)
     t, dm = 256, _COMMON["d_model"]
     dy = torch.empty(t, dm, dtype=torch.bfloat16, device="cuda")
@@ -1804,10 +2505,41 @@ def test_fp8_reject_thd_with_quant():
     lens = torch.tensor([128, 128], dtype=torch.int32, device="cuda")
     z = torch.empty(0, device="cuda")
     saved = SavedForBackward(h=h8, gate=z, o=z, lse=z, rstd_q=z, rstd_k=z, seq_lens=lens, seq_lens_form="lengths")
+    prev = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        blk = _declare_fp8_bwd(dy, saved, r.inp, r.geom, quant=r.spec, thd=True, num_sequences=2, max_seq_len=256)
+        assert blk.thd and blk.quant is r.spec and (blk.batch, blk.seq_len) == (1, t) and (blk.num_sequences, blk.max_seq_len) == (2, 256)
+        st = blk._sdpa
+        assert type(st).__name__ == "_SdpaBwdFp8" and st.thd and (st.num_sequences, st.max_seq_len, st.cu_seqlens) == (2, 256, False)
+        impl = st._ensure_impl()
+        assert impl.thd is True and impl.external_delta is True and impl.seq_kv_lens_present is False and impl.amax_requested == frozenset({"amax_dP"})
+        assert (impl.max_total_seq_len_q, impl.max_total_seq_len_kv) == (t, t)
+        assert tuple(impl.external_delta_shape) == st.delta_shape == (1, r.geom.h_q, -(-t // 128) * 128), "the packed delta: the dense layout at B = 1, S = T"
+        assert tuple(int(x) for x in impl.stats_desc.shape) == (2, r.geom.h_q, 256, 1), "Stats declared over the envelope (B, H_q, S_max, 1)"
+        assert impl.q_desc.dtype == _E4M3 and impl.dq_desc.dtype == torch.bfloat16
+    finally:
+        torch.cuda.set_sync_debug_mode(prev)
+
+
+@requires_cuda
+def test_fp8_reject_thd_with_mxquantspec():
+    """``thd=True`` with an ``MxQuantSpec`` stays the typed dense-only decline AT DECLARATION, naming BOTH attributes (the
+    backward's SDPA-layout MX quantizes run the quantizer's dense arm only; the packed MXFP8 training record exists, the packed
+    MXFP8 backward is a follow-up), while the per-tensor fp8 sibling is served packed (the test above).  The message does NOT
+    tell the caller to build the plan without ``external_delta`` (the adapter's text must never surface here)."""
+    r = _fp8_decl(dict(_COMMON), 1, 256, quant=None)
+    t, dm = 256, _COMMON["d_model"]
+    dy = torch.empty(t, dm, dtype=torch.bfloat16, device="cuda")
+    h8 = torch.empty(t, dm, dtype=_E4M3, device="cuda")
+    lens = torch.tensor([128, 128], dtype=torch.int32, device="cuda")
+    z = torch.empty(0, device="cuda")
+    saved = SavedForBackward(h=h8, gate=z, o=z, lse=z, rstd_q=z, rstd_k=z, seq_lens=lens, seq_lens_form="lengths")
+    mx = MxQuantSpec(descale_w_o=r.spec.descale_w_o, scale_o=r.spec.scale_o)
     with pytest.raises(ValueError, match="thd") as ei:
-        _declare_then_check(lambda: _declare_fp8_bwd(dy, saved, r.inp, r.geom, quant=r.spec, thd=True, num_sequences=2, max_seq_len=256))
+        _declare_then_check(lambda: _declare_fp8_bwd(dy, saved, r.inp, r.geom, quant=mx, thd=True, num_sequences=2, max_seq_len=256))
     msg = str(ei.value)
-    assert "quant" in msg, msg
+    assert "MxQuantSpec" in msg and "quant" in msg, msg
     assert "external_delta" not in msg, msg
 
 
@@ -1819,9 +2551,13 @@ def test_fp8_reject_mxquantspec():
     r = _fp8_decl(dict(_COMMON), 1, 256, quant=None)
     mx = MxQuantSpec(descale_w_o=r.spec.descale_w_o, scale_o=r.spec.scale_o)
     blk = _declare_fp8_bwd(r.dy, r.saved, r.inp, r.geom, quant=mx)
-    assert isinstance(blk.quant, MxQuantSpec) and blk._prologue is None and blk._epilogue is None and type(blk._sdpa).__name__ == "_SdpaBwdMxfp8"
+    assert isinstance(blk.quant, MxQuantSpec) and type(blk._sdpa).__name__ == "_SdpaBwdMxfp8"
+    assert (
+        type(blk._prologue).__name__ == "_MxQuantPrologue" and type(blk._epilogue).__name__ == "_MxQuantEpilogue"
+    )  # the MXFP8 fused launches, not the fp8 ones
     blk4 = _declare_fp8_bwd(r.dy, r.saved, r.inp, r.geom, quant=MxQuantSpec(descale_w_o=1.0, scale_o=1.0, o_fp4=Fp4Format.NVFP4))
-    assert blk4.o_fp4 is Fp4Format.NVFP4 and blk4._out_proj_dgrad.block_scale and blk4._prologue is None and blk4._gate_bwd.want_dy_descale
+    assert blk4.o_fp4 is Fp4Format.NVFP4 and blk4._out_proj_dgrad.block_scale and blk4._gate_bwd.want_dy_descale
+    assert type(blk4._prologue).__name__ == "_MxQuantPrologue"
     with pytest.raises(ValueError, match="w_o"):
         blk4.check_support()
 
@@ -1946,7 +2682,7 @@ def test_the_matrix_declares_what_the_module_says():
     runs at ``scale_dp = 1.0``; the (M) GQA layer's parametrization is the 13 GQA matrix cells (the fold is a GQA mechanism: no MHA
     cell), every one a PLAIN assertion -- the fold rounds once, so no cell carries an ``xfail``."""
     for c in _CELLS + _LAUNCH_ONLY_CELLS:
-        assert c.causal or c.s % 128 == 0, f"{c.id}: a dense S % 128 != 0 has no record"
+        assert c.causal or c.s % 128 == 0, f"{c.id}: the matrix keeps a dense S % 128 != 0 out (s992_dense_b1 covers it)"
     for c in _LAUNCH_ONLY_CELLS:  # launch-count arms the matrix does not reach, and nothing it already runs
         assert c.causal and c.id not in {m.id for m in _CELLS}, c.id
     pad_mha, kv_only = _BY_ID["s992_causal_b1_mha-norm"], _BY_ID["s384_causal_b1-norm"]
@@ -2112,6 +2848,7 @@ def test_fp8_first_use_on_an_explicit_stream_reads_nothing_the_ambient_stream_wr
         blk.check_support()
         ws = torch.empty_like(res.ws).fill_(0xFF)
         grads = _alloc_grads(res.blk, fill=float("nan"))
+        gc.collect()  # an earlier test's cyclic garbage freed mid-compile() moves the counter down (PR #1522, sm107 CI)
         torch.cuda.synchronize()
         before = torch.cuda.memory_allocated()
         with profile(activities=[ProfilerActivity.CUDA]) as prof:
