@@ -2030,8 +2030,19 @@ class TestNativeD192Fp8Pack:
 
     from test_sdpa_fp8_d192_pack_sm107 import (
         test_native_d192_fp8_pack_rebind_replay as _rebind,
-        test_native_d192_pack_retains_head_padding_decline as _decline,
+        test_native_d192_pack_retains_d256_padding_decline as _decline,
     )
 
     test_rebind_and_replay = staticmethod(_rebind)
-    test_head_padding_decline = staticmethod(_decline)
+    test_d256_padding_decline = staticmethod(_decline)
+
+
+@requires_rubin
+class TestNativeD192Fp8HeadPadding:
+    """Run both dense-envelope suites from the selected SM107 CI entry."""
+
+    from test_sdpa_fp8_d192_padding import test_fp8_d192_padded_heads_rebind_replay as _rebind
+    from test_sdpa_fp8_d192_padding_masks import test_fp8_d192_head_envelope_masks as _masks
+
+    test_rebind_and_replay = staticmethod(_rebind)
+    test_masks = staticmethod(_masks)
