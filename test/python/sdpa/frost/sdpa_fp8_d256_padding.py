@@ -231,7 +231,7 @@ def _check_dense(d, dv, dtype, output, monkeypatch, *, causal=False, bottom_righ
         value = bufs[name]
         value._base[..., value.shape[-1] :].fill_(float("nan"))
         value.copy_((value.float() * 2.5).to(dtype))
-    check = dict(causal=causal, bottom_right=bottom_right, window=window)
+    check = dict(causal=causal, bottom_right=bottom_right, window=window, softmax_f16=softmax_precision == cudnn.data_type.HALF and split == 1)
     g.execute(vp, ws)
     _check(bufs, **check)
     assert torch.all(bufs["o_storage"][..., dv:] == 12)
