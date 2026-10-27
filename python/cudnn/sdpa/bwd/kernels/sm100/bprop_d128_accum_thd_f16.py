@@ -372,7 +372,7 @@ def _native_epilogue_fp32(slab, tmem_base, bars, row, live, empty_phase, dk: cut
     dv_full / dk_full for the store warp's reduce-adds.  The dV round's WAR (the last dQ slice reads) is the caller's terminal dq_empty waits;
     the dK round waits dq_empty[i] (the store warp's credit after its dV slice i source read) before overwriting slice i -- the SAME ring
     object, one more completion per item on both sides.  A zero-trip owner stages zeros (its reduce-adds are skipped by the store warp)."""
-    # RESOURCE-NOTE: ALIAS 64 KiB = one fp32 tensor (4 dQ-slice boxes): dV round, dK round; dq_empty x4
+    # ALIAS 64 KiB = one fp32 tensor (4 dQ-slice boxes): dV round, dK round; dq_empty x4
     plane = CFG.DK_COL if cutlass.const_expr(dk) else CFG.DV_COL
     lo_vals = cutlass.Vector.from_elements(tuple(cutlass.Float32(0.0) for _ in range(CFG.D_HALF)), cutlass.Float32)
     hi_vals = cutlass.Vector.from_elements(tuple(cutlass.Float32(0.0) for _ in range(CFG.D_HALF)), cutlass.Float32)

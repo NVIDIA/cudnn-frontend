@@ -69,16 +69,16 @@ def _select(mode, s_max, form, **over):
 def test_cta_pair_config_is_the_truth():
     """Every number the heuristic reads is ONE named constant of the contract module (G10 config-as-truth): the typed domain and its
     default, the S threshold (a multiple of the pair's kv unit and of the q tile), the measured part, the cluster width = the pair body's
-    CGA_M, the heuristic's pair body = a name of the pair bodies' TMEM maps, the two body tokens."""
+    CGA_M, the pair body's identity = the pair body's TMEM-map name, the two body tokens."""
     c = _contract()
     from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta import CFG
-    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import TMEM_MAPS
+    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import CFG as STAIL_CFG
 
     assert c.CTA_PAIR_MODES == ("auto", "off", "on") and c.CTA_PAIR_MODE_DEFAULT == "auto"
     assert c.CTA_PAIR_MIN_SEQ == 8192 and c.CTA_PAIR_MIN_SEQ % c.UNIT_ROWS == 0 and c.CTA_PAIR_MIN_SEQ % CFG.PAIR_KV_ROWS == 0
     assert c.CTA_PAIR_CCS == ((10, 0),) and all(tuple(cc) in c.ACCUMULATION_CCS for cc in c.CTA_PAIR_CCS)
     assert c.CTA_PAIR_CLUSTER == CFG.CGA_M == 2
-    assert c.CTA_PAIR_BODY == "s_tail" and c.CTA_PAIR_BODY in TMEM_MAPS
+    assert c.CTA_PAIR_BODY == "s_tail" == STAIL_CFG.TMEM_MAP
     assert (c.PAIR_BODY, c.ONE_CTA_BODY) == ("2cta", "1cta")
     assert "smallest S where the pair body won" in c.__doc__ or "smallest S where the pair body won" in open(c.__file__).read()
 
@@ -86,7 +86,7 @@ def test_cta_pair_config_is_the_truth():
 def test_cta_pair_field_is_typed_and_the_record_defaults_are_pinned():
     """``cta_pair`` is a typed op-level field: ``None`` resolves to the default ``auto``; anything outside the domain declines BY NAME (a
     ValueError naming the field and the domain); the adapter reader prefixes the engine name; the shipping class defaults to ``auto``, the
-    direct 2-CTA entry pins ``on``; the day-1 bool ``datapath_2cta`` is folded into it (no class carries it any more)."""
+    direct 2-CTA entry pins ``on``; no class carries a bool body selector (``datapath_2cta``)."""
     c = _contract()
     p = _prepared()
     from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
@@ -103,7 +103,7 @@ def test_cta_pair_field_is_typed_and_the_record_defaults_are_pinned():
         p.cta_pair(SimpleNamespace(_NAME=_ENGINE, cta_pair=True))
     assert SdpaBwdDslSm100D128.cta_pair == "auto" and SdpaBwdDslSm100D128Cta2.cta_pair == "on"
     assert not hasattr(SdpaBwdDslSm100D128, "datapath_2cta") and not hasattr(SdpaBwdDslSm100D128Cta2, "datapath_2cta")
-    assert not hasattr(p, "datapath_2cta"), "the day-1 reader is folded into cta_pair_resolution"
+    assert not hasattr(p, "datapath_2cta"), "the bool reader is folded into cta_pair_resolution"
 
 
 @pytest.mark.parametrize("s_max, body", _SELECTION_TABLE)

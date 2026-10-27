@@ -31,7 +31,7 @@ pytestmark = [pytest.mark.L0, requires_dsl]
 FLAG = "diag_delete_dq_reduce_add"
 _RECORD = Path(__file__).resolve().parent / "renderings" / "md5_d128_accum_thd_default_sm100a.txt"
 _HOSTS = ("thd", "grouped_thd")
-# The probe geometry (B, Hq, Hkv) of the record: the bar cell's heads; a render is a function of the declared heads only.
+# The probe geometry (B, Hq, Hkv) of the record: the 16K / 32K cells' heads; a render is a function of the declared heads only.
 _B, _H, _HK = 4, 32, 4
 # PTX instruction census: the lever deletes REDUCE_ADD only; every other row must be equal between the two renderings.
 _CENSUS = {

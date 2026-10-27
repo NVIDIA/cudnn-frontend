@@ -133,7 +133,7 @@ def compile_host(config, origin_specs, origin_dtypes, dtype, causal, sm, *, diag
     ``diag_delete_dq_reduce_add`` (DIAGNOSTIC, default False) renders the shipped kernels under the unchanged cache key; the
     armed build (dQ stays zero by design) is keyed apart so it can never be served to a default plan.  ``dkv_accum`` (the op-level
     field: a ``DKV_ACCUM_FORMS`` name or ``None`` = ``bf16_partials``, the shipped chain under the unchanged key; typed, a ``ValueError``
-    by name) keys the ``fp32_reduce`` chain apart (RULE-GAPS 203: every threaded Constexpr is in the key)."""
+    by name) keys the ``fp32_reduce`` chain apart (every threaded Constexpr is in the key)."""
     form = resolve_dkv_accum(dkv_accum)
     fp32 = dkv_accum_fp32(form)
     if fp32:

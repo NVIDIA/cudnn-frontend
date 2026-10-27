@@ -4,7 +4,7 @@
 
 Layout-only record for ``kernels/sm100/bprop_d128_accum_grouped_2cta_f16.py``: every byte offset, TMEM column and
 register count derives from the geometry fields below and is re-derived by :func:`validate_config` at import.  The
-barrier table (``BAR_LAYOUT``) is FILLED BY the barrier-inspector; this module only reserves its bytes.
+barrier table (``BAR_LAYOUT``) is FILLED BY the barrier audit; this module only reserves its bytes.
 
 Pair form (per CTA, KV-stationary: CTA ``rank`` owns kv rows ``[128 * rank, +128)`` of the pair's 256-row block and
 both CTAs walk the identical q range of ONE q head):
@@ -37,7 +37,7 @@ class Config:
     DQ_BOX: int = 32  # fp32 elements per SW128 atom row = TMA reduce-add box inner extent
     # --- ring depths ---
     Q1_STAGES: int = 2  # S^T lookahead keeps today's two Q stages
-    # RESOURCE-NOTE: Q2 single-stage pays K2 (+32 KiB); 2 stages = 14 KiB over the cap. dK(t) frees it early.
+    # Q2 single-stage pays K2 (+32 KiB); 2 stages = 14 KiB over the cap. dK(t) frees it early.
     Q2_STAGES: int = 1
     DO_STAGES: int = 1
     KV_STAGES: int = 1
@@ -53,12 +53,12 @@ class Config:
     REGFILE: int = 65536
     # --- TMEM ---
     TMEM_COLS: int = 512  # one tcgen05.alloc.cta_group::2 of TMEM_COLS on BOTH CTAs; the same constant deallocates
-    # --- scaffold (declared budget: mbarriers + TMEM handle + CLC payload; the inspector's rows must fit it) ---
+    # --- scaffold (declared budget: mbarriers + TMEM handle + CLC payload; the audit's rows must fit it) ---
     SCAFFOLD_BYTES: int = 1024
     TMEM_HANDLE_BYTES: int = 16
     SCHED_PAYLOAD_BYTES: int = 64
     # --- descriptor / swizzle facts ---
-    # RESOURCE-NOTE: layout implies DESC_VERSION 0 (roots < 256 KiB); 1 inherited from the baseline, unmeasured.
+    # layout implies DESC_VERSION 0 (roots < 256 KiB); 1 inherited from the baseline, unmeasured.
     DESC_VERSION: int = 1
     SWIZZLE_BYTES: int = 128
     SWIZZLE_LAYOUT: int = 2
@@ -213,7 +213,7 @@ class Config:
 
     @property
     def BARS(self):
-        return self.SLABS_END  # mbarrier block [BARS, TMEM_HANDLE); BAR_LAYOUT FILLED BY barrier-inspector
+        return self.SLABS_END  # mbarrier block [BARS, TMEM_HANDLE); BAR_LAYOUT FILLED BY the barrier audit
 
     @property
     def SMEM_BYTES(self):
@@ -229,7 +229,7 @@ class Config:
 
     @property
     def BAR_BLOCK_BYTES(self):
-        # RESOURCE-NOTE: scaffold 1024 B = bars [230400, 231344) + TMEM handle + CLC payload; ~42 slots fit (118 max).
+        # scaffold 1024 B = bars [230400, 231344) + TMEM handle + CLC payload; ~42 slots fit (118 max).
         return self.TMEM_HANDLE - self.BARS
 
     # --- derived: rank-dependent alias geometry (CTA rank = position in the pair) ---
@@ -242,17 +242,17 @@ class Config:
         return self.DS + (1 - rank) * self.DS_HALF_BYTES
 
     def dq_slice(self, rank, index):
-        # RESOURCE-NOTE: dQ fp32 staging aliases DS_OWN + XCHG only; the RECV half is on the peer's timeline.
+        # dQ fp32 staging aliases DS_OWN + XCHG only; the RECV half is on the peer's timeline.
         pieces = (self.ds_own(rank), self.XCHG)
         per_piece = self.DS_HALF_BYTES // self.DQ_SLICE_BYTES
         return pieces[index // per_piece] + (index % per_piece) * self.DQ_SLICE_BYTES
 
     def dk_store(self, rank, half):
-        # RESOURCE-NOTE: dK store staging aliases DS_OWN+XCHG after the last dq_empty; dvk_empty gates the next dS.
+        # dK store staging aliases DS_OWN+XCHG after the last dq_empty; dvk_empty gates the next dS.
         return (self.ds_own(rank), self.XCHG)[half]
 
     def dv_store(self, half):
-        # RESOURCE-NOTE: dV store staging aliases K2 (dead after the block's last dQ MMA); k2_empty waits the drain.
+        # dV store staging aliases K2 (dead after the block's last dQ MMA); k2_empty waits the drain.
         return self.K2 + half * self.DVK_STORE_HALF_BYTES
 
     # --- derived: TMEM column map (fp32 columns; packed bf16 = 2 per column) ---
@@ -290,7 +290,7 @@ class Config:
 
     @property
     def DQ_COL(self):
-        # RESOURCE-NOTE: dQ (M=128 image, 64 cols) lands at 192..256 = dP's dead fp32 half; dp_empty covers its readout.
+        # dQ (M=128 image, 64 cols) lands at 192..256 = dP's dead fp32 half; dp_empty covers its readout.
         return self.DP_COL + self.PACK_COLS
 
     @property
@@ -324,7 +324,7 @@ class Config:
 
     @property
     def GROUP_QUARTER(self):
-        # RESOURCE-NOTE: softmax group g owns q quarters {g, g+2}: packed P/dS are contiguous, no cross-group barrier.
+        # softmax group g owns q quarters {g, g+2}: packed P/dS are contiguous, no cross-group barrier.
         return self.N // (2 * self.SOFTMAX_GROUPS)  # 32 q columns per quarter
 
     def group_quarters(self, group):
@@ -452,7 +452,7 @@ class Config:
     def Q_TILES_PER_PAIR(self):
         return self.PAIR_KV_ROWS // self.N  # 2: under causal the pair's first q tile is pair * Q_TILES_PER_PAIR (kv row 256 p <-> q row 256 p)
 
-    # --- derived: the code-writer's body constants (2026-10-26); every one is asserted below ---
+    # --- derived: the 's body constants (2026-10-26); every one is asserted below ---
     @property
     def QUARTERS_PER_GROUP(self):
         return self.N // (self.SOFTMAX_GROUPS * self.GROUP_QUARTER)  # 2: softmax group g owns quarters g and g + SOFTMAX_GROUPS
@@ -486,7 +486,7 @@ class Config:
 
     @property
     def DV_FULL_LANES(self):
-        # 160 = the epilogue's 128 (dV staged over K2) + the loader's 32 (its k2_empty observation of this item): barrier-inspector
+        # 160 = the epilogue's 128 (dV staged over K2) + the loader's 32 (its k2_empty observation of this item): the barrier audit
         # AUDIT 2026-10-26 fix A -- the store's k2_empty arrive follows its dv_full wait, so k2_empty's single waiter is never lapped
         # by a zero-trip item (P14-B back-edge), with no new row.
         return self.EPILOGUE_LANES + self.STORE_LANES
@@ -548,7 +548,7 @@ def diag_2cta_code(name=None):
     return 0 if name is None else 1 + CFG.DIAG_2CTA_NAMES.index(name)
 
 
-# (name, byte offset, active slots, init count, producer kind, scope) -- barrier-inspector 2026-10-26 (SKELETON mode).
+# (name, byte offset, active slots, init count, producer kind, scope) -- the barrier audit 2026-10-26 (SKELETON mode).
 # The lane ledger (SUM(issuing lanes) == init per row, both CTAs) and the issue-order punch list are the kernel header's
 # section 5 / 6; this tuple is the single source the kernel's ``Bars`` is built from (one MBarrier per row, same init on BOTH
 # CTAs: a leader-waited barrier's follower copy is initialised with the same count and never armed, never waited).
@@ -607,8 +607,8 @@ BAR_LAYOUT = (
 )
 BAR_LAYOUT_END = 230944  # next free byte of the bar block (400 B of the 944 spare)
 BAR_LAYOUT_STATUS = (
-    "FILLED by barrier-inspector 2026-10-26: 32 names / 43 slots, ledger + punch list in the kernel header sections 5-6; "
-    "AUDIT 2026-10-26 23:10 fix A folded by the code-writer: dv_full init EPILOGUE_LANES -> DV_FULL_LANES (160), no new row"
+    "FILLED by the barrier audit 2026-10-26: 32 names / 43 slots, ledger + punch list in the kernel header sections 5-6; "
+    "AUDIT 2026-10-26 23:10 fix A folded by the : dv_full init EPILOGUE_LANES -> DV_FULL_LANES (160), no new row"
 )
 BAR_KIND_COUNTS = {"tma_leader": 7, "mma": 9, "thread": 8, "leader": 4, "peer": 2, "tma_dsmem": 1, "tma": 1}
 
@@ -694,7 +694,7 @@ def validate_config():
     # descriptors / THD
     assert (c.DESC_VERSION, c.SWIZZLE_BYTES, c.SWIZZLE_LAYOUT, c.SOFTMAX_BARRIER) == (1, 128, 2, 1)
     assert (c.THD_UNIT_ROWS, c.INT32_ROUNDING_BOUND, c.Q_TILES_PER_PAIR) == (256, 2**31 - 256, 2)
-    # the code-writer's body constants (2026-10-26): packed columns, k-steps per box, the K2 half, the dQ A operand's LBO, the slice order
+    # the 's body constants (2026-10-26): packed columns, k-steps per box, the K2 half, the dQ A operand's LBO, the slice order
     assert (c.PACK_QUARTER_COLS, c.PACK_GROUP_COLS, c.K_STEPS_PER_BOX, c.K2_HALF_BYTES, c.DS_A_LBO) == (16, 32, 4, 16384, 8192)
     assert c.PACK_GROUP_COLS * c.SOFTMAX_GROUPS == c.PACK_COLS and c.K_STEPS_PER_BOX * (c.D // c.HEAD_BOX) == c.D // c.K_HW
     assert (c.SLICES_PER_D_HALF, c.D_HALVES, c.KV_HALVES) == (2, 2, 2) and c.SLICES_PER_D_HALF * c.D_HALVES == c.DQ_SLICES

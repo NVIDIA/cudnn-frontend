@@ -311,7 +311,7 @@ def delta_zero_thd_d128_kernel(
         (delta.iterator.raw_ptr() + delta_offset).store(dot)
     if cutlass.const_expr(dk_acc is not None):
         # dkv_accum = fp32_reduce: an exact-zero fp32 image for the main kernel's reduce-adds; kv rows past the sequence are never written.
-        # RESOURCE-NOTE: fill dk/dv_acc (token_k, head) for head < Hkv (one CTA per kv head and row block); grid x = max(q, kv)
+        # fill dk/dv_acc (token_k, head) for head < Hkv (one CTA per kv head and row block); grid x = max(q, kv)
         kv_length = cutlass.Int32(data[batch])
         kv_start = cutlass.Int32(data[2 * n_batch + 1 + batch])
         if head < dk_acc.shape[2] and row < kv_length:
@@ -369,7 +369,7 @@ def cast_dq_thd_d128_kernel(
         )
         Pointer(cutlass.make_array_view(dq_out).data_ptr() + dst_offset, dtype=cutlass.Int32).store(packed, alignment=16)
     if cutlass.const_expr(dk_acc is not None):
-        # RESOURCE-NOTE: convert 2x512 B fp32 -> 2x256 B bf16 per (token_k, kv head) at the fold's origins
+        # convert 2x512 B fp32 -> 2x256 B bf16 per (token_k, kv head) at the fold's origins
         kv_length = cutlass.Int32(data[batch])
         kv_start = cutlass.Int32(data[2 * n_batch + 1 + batch])
         if head < dk_acc.shape[2] and row < kv_length:

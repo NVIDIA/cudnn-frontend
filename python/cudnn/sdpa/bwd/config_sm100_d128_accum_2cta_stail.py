@@ -1,59 +1,45 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Grouped THD d128 accumulation geometry on the cta_group::2 datapath, ARM (ii): the TMEM re-plan with FAv4's rotated MMA order.
+"""Grouped THD d128 accumulation geometry on the cta_group::2 datapath: the dQ image in S^T's dead tail with FAv4's rotated MMA order.
 
-Layout-only record for ``kernels/sm100/bprop_d128_accum_grouped_2cta_stail_f16.py`` -- the SECOND pair body, kept beside the
-first (``bprop_d128_accum_grouped_2cta_f16.py`` on ``config_sm100_d128_accum_2cta.CFG``, UNTOUCHED) for the one-process A/B.  The
-two bodies are selected by the typed adapter field ``tmem_map``: ``"dp_tail"`` (the default = the first body) | ``"s_tail"``
-(this one).  Every byte offset, TMEM column and ring depth derives from the geometry below and is re-derived by
-:func:`validate_config` at import; the barrier table (``BAR_LAYOUT``) is the barrier-inspector's 34-row SKELETON for the arm
-(resources/arm2-barrier-table.md, 2026-10-27 01:05 UTC), pasted, never re-derived.
+Layout-only record for ``kernels/sm100/bprop_d128_accum_grouped_2cta_stail_f16.py`` (the pair body of the grouped THD route) on top of the
+base pair geometry ``config_sm100_d128_accum_2cta.Config``.  Every byte offset, TMEM column and ring depth derives from the geometry below
+and is re-derived by :func:`validate_config` at import; the barrier tables (``BAR_LAYOUT``, ``BAR_LAYOUT_XFA4``) are the barrier audit's
+tables, pasted, never re-derived.
 
-What moves against the first body (resource-manager 2026-10-27 00:53 UTC tables 1-6 + the inspector's deviations D1-D5):
+What the body does against the base geometry:
 
-* TMEM: the dQ half-row image (64 fp32 columns, the M = 128 pair MMA's D image) moves from dP^T's dead half [192, 256) to
-  S^T's dead tail [64, 128) (the 64 columns the packed P^T does not reuse): ``DQ_COL = S_COL + PACK_COLS``; 192..256 is DEAD.
-  Two alias edges on the S tail: the WRITE edge dQ(t-1) <- the softmax's read of S^T(t) (NEW barrier ``s_read``) and the REUSE
-  edge S^T(t+1) <- the epilogue's readout of dQ(t-1) (NEW barrier ``s_tail_empty``); ``dp_empty`` keeps its count and waiter, its
-  arrive moves to the dS^T readout.
+* TMEM: the dQ half-row image (64 fp32 columns, the M = 128 pair MMA's D image) sits in S^T's dead tail [64, 128) (the 64 columns the
+  packed P^T does not reuse): ``DQ_COL = S_COL + PACK_COLS``; [192, 256) is DEAD.  Two alias edges on the S tail: the WRITE edge dQ(t-1) <-
+  the softmax's read of S^T(t) (barrier ``s_read``) and the REUSE edge S^T(t+1) <- the epilogue's readout of dQ(t-1) (barrier
+  ``s_tail_empty``); ``dp_empty`` keeps its count and waiter, its arrive sits at the dS^T readout.
 * ORDER: the leader issues FAv4's rotated stream per q tile: dP^T(t), dQ(t-1), dV(t), S^T(t+1), dK(t); the tail issues dQ(hi-1).
-  TWO orders on this map (``PAIR_MMA_ORDERS == ("fa4", "fa4b")``, default ``fa4`` until measured): ``fa4b`` issues dQ(t-1) AFTER dV(t)
-  (code-writer step 6, 2026-10-27: +512 clk of cover for the dS exchange at zero SMEM, the same barrier table and sites; the kernel's
-  ``dq_after_dv`` Constexpr via :func:`dq_after_dv_for_map`); s_first / dk_first are declined BY NAME here (their s_read / s_tail_empty
-  site sets differ, inspector section 11).
-* SMEM: Q1 2 -> 1 stage (FAv4's ``Q_stage = 1`` under 2-CTA; -16 KiB) funds a DEDICATED dQ fp32 staging ring ``sDQ`` of
-  ``DQ_SLOTS`` = 2 x [64 q x 32 d] SW128 slices (today's reduce-add box), two rounds per tile; the dQ staging alias on
-  ds_own + XCHG is DELETED (under the rotated order dq_done(t) lands ~150 clk before the dS(t+1) STS, so the alias would gate
-  the dS exchange by the reduce-add drain).  Total unchanged: 231424 B (vs-smem predict PASS, banks PASS: resources/*-arm2.*).
-* dQ ROUTE (code-writer step 8, 2026-10-27; optimizer 05:15 rank 1 "#3-dry"): the typed field ``dq_route_pair`` = ``"tma"`` (THE default: the
-  sDQ ring STS + the store warp's four ``tma_reduce_add`` per tile) | ``"red_global"`` (the fp32 dQ partial leaves the CTA as
-  ``red.global.add.v4.f32`` straight from the epilogue warps' registers right after the dQ tcgen05.ld; the sDQ ring PROTOCOL -- dq_full /
-  dq_empty arrives and waits, the store warp's per-round loop -- stays, so NO barrier row moves; the STS and the UTMAREDG issue are skipped) |
-  ``"red_global_pair"`` (the same reds with lane pairs ``2k / 2k+1`` exchanging one v4 per sector through ``shfl.sync.bfly`` so every
-  warp-level red carries FULL 32-B L2 sectors, RULE-GAPS 396).  The address of a lane's words derives from the SAME carriers as the
-  TMA route's per-sequence descriptor: the meta prefix ``cu_q[b]`` (``_item_bounds``' ``q_start``, the descriptor's GLOBAL_ADDRESS origin
-  in ``emit_seq_descs``) and the ``dq_accum`` tensor's strides (``cast_dq_thd``'s spelling); rows >= ``seq_q`` are skipped by a branch
-  (the descriptor's GLOBAL_DIM clip).  The first body (dp_tail) has no red route: every other value declines BY NAME there.
-* DAY-3 PROBES + STAMPS (code-writer 2026-10-27 lane A day 3, optimizer 07:45 rank 0, barrier-inspector 08:01): three more ``diag_2cta``
-  values defined on THIS map only -- ``"exchange_off"`` (D8s, the inspector's "D8x bytes faked": the XCHG ship skipped and ds_recv_full
-  armed with 0 tx bytes, EVERY wait kept = the SAFE exchange-family ceiling; ``"ds_gates_off"`` (D8) is RETIRED here: it removed the arm's
-  only back-edge and FAULTED 719), ``"stats_one_chunk"`` (D10: one LDS.128 stats / delta chunk per quarter reused for all eight) and
-  ``"sdq_sts_off"`` (D9: the sDQ slice STS + its proxy fence skipped) -- and the typed bool field ``debug_clk`` (the STAMPS lever, the d512
-  bodies' ``debug_clk`` pattern): every mbarrier wait of ONE representative warp per role is bracketed by %clock64 and accumulated per
-  (role, barrier) into the 100 Int32 words of the bar block's spare (``DBG_CLK``, below), with the epilogue's per-tile hand-off segments,
-  dumped per CTA at exit into a workspace region the adapter carves only under the lever; output CORRECT, timing diagnostic; default
-  False = no traced code (the default rendering stays byte-identical).
-* ROLE SHAPE (code-writer B, 2026-10-27, day 3 rank 1 "X-FA4" = FAv4's role shape on this body; barrier-inspector SKELETON
-  resources/x-fa4-barrier-table.md 08:45 UTC, resource-manager resources/xfa4-budgets.md 08:15 UTC): the typed field ``warp_roles`` =
-  ``"16w"`` (THE default: today's rendering, byte-identical) | ``"16w_fa4"`` (the SOFTMAX writes sDS own half + the XCHG half straight from
-  its 32 packed dS^T words -- today's LDTM image word for word, the same SW128 ``(row % 8) ^ vec`` STS form -- fences ONCE, arrives ``ds_smem``
-  (256 = SOFTMAX_LANES), passes the 256-lane XCHG named barrier and its lead warp's elected lane arms ``ds_recv_full`` + ships; a NEW softmax
-  ``dq_done`` WAR wait (``dq_war`` st(1), +1 per wait) precedes the first dS STS of every tile; the EPILOGUE warps 8-11 become the REDUCE group
-  (dq_done -> x64 dQ ld -> s_tail_empty -> rounds A, B; the item-end dV / dK staging kept; no dS work); ``ds_tmem`` AND ``dp_empty`` are
-  DELETED (``BAR_LAYOUT_XFA4``: 32 names / 37 slots, END 230912, re-packed); the dQ ring keeps form A (the store warp issues); s_read kept;
-  TMEM / SMEM / the 144-144-80 split UNCHANGED).  Resolved PER MAP (``dp_tail`` serves ``16w`` only); the kernel's ``warp_roles_code``
-  Constexpr[int] (``WARP_ROLES_CODES``); the compile key carries the NAME.  Under ``16w_fa4`` the register-direct dQ routes are NOT BUILT and
-  ``ds_gates_off`` (D8) is RETIRED (the ds_recv_full arm's back-edge runs through the leader's gate waits): both decline BY NAME.
+* SMEM: Q1 one stage (FAv4's ``Q_stage = 1`` under 2-CTA; -16 KiB) funds a DEDICATED dQ fp32 staging ring ``sDQ`` of ``DQ_SLOTS`` = 2 x
+  [64 q x 32 d] SW128 slices (the reduce-add box), two rounds per tile; no dQ staging alias on ds_own + XCHG (under the rotated order
+  dq_done(t) lands ~150 clk before the dS(t+1) STS, so an alias would gate the dS exchange by the reduce-add drain).  Total 231424 B
+  (the SMEM audit PASS, bank check PASS).
+* dQ ROUTE: the sDQ ring STS + the store warp's four ``tma_reduce_add`` per tile into the fp32 ``dq_accum`` workspace (the one-CTA chain's
+  route); the fp32 partial is summed in a non-deterministic order across the pairs and folded by ``cast_dq_thd`` in the next launch.
+* DIAGNOSTIC PROBES + STAMPS: the ``diag_2cta`` values this body has code for (the code space ``config_sm100_d128_accum_2cta.CFG.DIAG_2CTA_NAMES``)
+  -- ``"dq_reduce_add_off"`` (the store warp's reduce-add issues skipped), ``"exchange_off"`` (the XCHG ship skipped and ds_recv_full armed
+  with 0 tx bytes, EVERY wait kept = the SAFE exchange-family ceiling), ``"stats_one_chunk"`` (one LDS.128 stats / delta chunk per quarter
+  reused for all eight) and ``"sdq_sts_off"`` (the sDQ slice STS + its proxy fence skipped) -- and the typed bool field ``debug_clk`` (the
+  STAMPS lever, the d512 bodies' ``debug_clk`` pattern): every mbarrier wait of ONE representative warp per role is bracketed by %clock64
+  and accumulated per (role, barrier) into the Int32 words of the bar block's spare (``DBG_CLK``, below), with the epilogue's per-tile
+  hand-off segments, dumped per CTA at exit into a workspace region the adapter carves only under the lever; output CORRECT, timing
+  diagnostic; default False = no traced code (the default rendering stays byte-identical).
+* MASK FORM: the typed field ``mask_form`` = ``"fsel"`` (THE default: the keep-word mask selected on every tile) | ``"predicated"`` (the same
+  mask body only on a tile that can hold a masked cell; measured neutral) | ``"diag_mask_off"`` (DIAGNOSTIC: the mask body skipped everywhere).
+* ROLE SHAPE: the typed field ``warp_roles`` = ``"16w"`` (THE default: the shipped rendering, byte-identical) | ``"16w_fa4"`` (an alternate
+  shape kept for follow-up work: the SOFTMAX writes sDS own half + the XCHG half straight from its 32 packed dS^T words -- the LDTM image
+  word for word, the same SW128 ``(row % 8) ^ vec`` STS form -- fences ONCE, arrives ``ds_smem`` (256 = SOFTMAX_LANES), passes the 256-lane
+  XCHG named barrier and its lead warp's elected lane arms ``ds_recv_full`` + ships; a softmax WAR wait on ``dq_war_done`` (``dq_war`` st(1),
+  one wait per live tile) precedes the first dS STS of every tile; the EPILOGUE warps 8-11 become the REDUCE group (dq_done -> x64 dQ ld ->
+  s_tail_empty -> rounds A, B; the item-end dV / dK staging kept; no dS work); ``ds_tmem`` AND ``dp_empty`` are DELETED and ``dq_war_done`` is
+  ADDED (``BAR_LAYOUT_XFA4``: 33 names / 38 slots, END 230928, re-packed); the dQ ring keeps form A (the store warp issues); s_read kept;
+  TMEM / SMEM / the 144-144-80 split UNCHANGED; measured slower than 16w on GB200 at 8K-64K).  The kernel's ``warp_roles_code``
+  Constexpr[int] (``WARP_ROLES_CODES``); the compile key carries the NAME.  Under ``16w_fa4`` the STAMPS lever and ``dkv_accum =
+  "fp32_reduce"`` are not built: both decline BY NAME.
 """
 
 from dataclasses import dataclass
@@ -66,10 +52,10 @@ from .config_sm100_d128_accum_2cta import Config, diag_2cta_code, resolve_diag_2
 class ConfigSTail(Config):
     """The first body's geometry with the arm-(ii) deltas; every inherited property re-derives from the fields below."""
 
-    # RESOURCE-NOTE: Q1 single stage (FAv4 2-CTA form) funds sDQ 16 KiB; Q1(t+1) window ~2000 clk
+    # Q1 single stage (FAv4 2-CTA form) funds sDQ 16 KiB; Q1(t+1) window ~2000 clk
     Q1_STAGES: int = 1
     # --- the dedicated dQ staging ring: DQ_SLOTS slices of DQ_SLICE_BYTES, DQ_ROUNDS rounds per tile (DQ_SLOTS * DQ_ROUNDS == DQ_SLICES) ---
-    # RESOURCE-NOTE: sDQ 16 KiB dedicated ring, 2 x [64 q x 32 d] fp32 SW128; dS STS waits no dq_empty
+    # sDQ 16 KiB dedicated ring, 2 x [64 q x 32 d] fp32 SW128; dS STS waits no dq_empty
     DQ_SLOTS: int = 2
     DQ_ROUNDS: int = 2
     # --- the softmax's MASK FORM: fsel (default; measured neutral against predicated) | predicated | diag_mask_off (diagnostic) ---
@@ -78,18 +64,18 @@ class ConfigSTail(Config):
     TMEM_MAP: str = "s_tail"  # the body's identity: the dQ image lives in S^T's dead tail (the resolution token `tmem_map=s_tail`, the record names)
     # --- the STAMPS lever (typed adapter field ``debug_clk``; header section 11): default OFF = the shipped rendering, byte-identical ---
     DEBUG_CLK_DEFAULT: bool = False
-    DBG_CLK_WORDS: int = 96  # Int32 words per CTA record = the WHOLE bar-block spare [BAR_LAYOUT_END, TMEM_HANDLE) = 384 B since the C2b row
+    DBG_CLK_WORDS: int = 96  # Int32 words per CTA record = the WHOLE bar-block spare [BAR_LAYOUT_END, TMEM_HANDLE) = 384 B since the fp32_reduce row
     # dvk_stage_empty took 16 B of it (was 100 words / 400 B at the 34-row layout); validate_config pins the exact fit, the layout uses 82 words
     DBG_CLK_BLOCKED_THRESH: int = 128  # a wait above this many clk really waited (a first-test pass costs ~30-60 clk of issue): the d512 bodies' value
     DBG_CLK_HIST_EDGES: tuple = (100, 400, 1600)  # clk bins of the per-tile "ship issue - ds_tmem pass" segment (bin 0 = under 100 clk)
     DBG_CLK_MAGIC: int = 0x5354414D  # "STAM": the record's first word (a decoder refuses a record without it)
     DBG_CLK_RECORD_ALIGN: int = 256  # the stamps region starts at the first 256-B boundary past the chain's workspace regions
     # --- the DIAGNOSTIC probes' constants (header section 11; OUTPUT WRONG BY DESIGN under a probe) ---
-    DIAG_EXCHANGE_OFF_TX: int = 0  # D8s: ds_recv_full armed with ZERO tx bytes -> every phase completes at its own arm (no copy is ever in flight)
-    DIAG_STATS_CHUNK: int = 0  # D10: the ONE 4-wide stats / delta chunk of each quarter that is loaded and reused for all GROUP_QUARTER // 4 chunks
-    # --- the ROLE SHAPE on this map (day 3 rank 1 "X-FA4"): 16w (default = today's rendering) | 16w_fa4 (FAv4's role shape; module docstring) ---
+    DIAG_EXCHANGE_OFF_TX: int = 0  # exchange_off: ds_recv_full armed with ZERO tx bytes -> every phase completes at its own arm (no copy is ever in flight)
+    DIAG_STATS_CHUNK: int = 0  # stats_one_chunk: the ONE 4-wide stats / delta chunk of each quarter that is loaded and reused for all GROUP_QUARTER // 4 chunks
+    # --- the ROLE SHAPE: 16w (default = the shipped rendering) | 16w_fa4 (the alternate shape; module docstring) ---
     WARP_ROLES_DEFAULT: str = "16w"
-    # RESOURCE-NOTE: XCHG_BARRIER lanes: SOFTMAX_LANES 256 under 16w_fa4, EPILOGUE_LANES 128 under 16w
+    # XCHG_BARRIER lanes: SOFTMAX_LANES 256 under 16w_fa4, EPILOGUE_LANES 128 under 16w
     SOFTMAX_LEAD_WARP: int = 0  # 16w_fa4: the softmax warp whose elected lane arms ds_recv_full and ships XCHG (FAv4's tidx 0; inspector X4)
 
     @property
@@ -98,18 +84,18 @@ class ConfigSTail(Config):
         # Two probes of an earlier pair body are NOT defined here: a skipped dp_empty wait measures nothing on this map (dp_empty is arrived at
         # the dS^T readout, four GEMMs before dP^T(t+1) needs it) and skipping the three dS gates removes the ONLY back-edge of the ds_recv_full
         # expect_tx arm (the arm of tile t+1 lands on a tx-pending phase = an over-arrival fault); the safe exchange ceiling is exchange_off.
-        #   dq_reduce_add_off (D2-pair): the store warp's four reduce-add ISSUES skipped (ring protocol kept; dQ zero)
-        #   exchange_off      (D8s):     the epilogue's XCHG ship skipped + ds_recv_full armed with DIAG_EXCHANGE_OFF_TX = 0 bytes; the three dS
+        #   dq_reduce_add_off (dq_reduce_add_off): the store warp's four reduce-add ISSUES skipped (ring protocol kept; dQ zero)
+        #   exchange_off      (exchange_off):     the epilogue's XCHG ship skipped + ds_recv_full armed with DIAG_EXCHANGE_OFF_TX = 0 bytes; the three dS
         #                                gates, the relay, the XCHG STS / proxy fence / named barrier and every other wait KEPT (the recv half
         #                                is never written: dQ wrong) = the exchange family's ceiling {lever 1, lever 2's exchange part, #4}
-        #   stats_one_chunk   (D10):     _p_values / _ds_values load ONE stats / delta chunk per quarter (DIAG_STATS_CHUNK) and reuse it for all
+        #   stats_one_chunk   (stats_one_chunk):     _p_values / _ds_values load ONE stats / delta chunk per quarter (DIAG_STATS_CHUNK) and reuse it for all
         #                                eight: -DIAG_STATS_LDS_REMOVED_PER_LANE of DIAG_STATS_LDS_PER_LANE LDS.128 per lane per tile, registers /
         #                                compute / waits unchanged (the byte-removal-only residual test of the SMEM-pipe reading; I1's ceiling)
-        #   sdq_sts_off       (D9):      _dq_round skips the sDQ slice STS + its proxy fence (the UTMAREDG reads stale staging; -256 wavefronts;
+        #   sdq_sts_off       (sdq_sts_off):      _dq_round skips the sDQ slice STS + its proxy fence (the UTMAREDG reads stale staging; -256 wavefronts;
         #                                the dq_empty waits and the dq_full arrive stay) = the second point of the wavefront -> time slope
         return ("dq_reduce_add_off", "exchange_off", "stats_one_chunk", "sdq_sts_off")
 
-    # --- derived: the D10 probe's counts (the softmax's stats / delta reads of header section 4: 4-wide chunks per q quarter, two quarters per group) ---
+    # --- derived: the stats_one_chunk probe's counts (the softmax's stats / delta reads of header section 4: 4-wide chunks per q quarter, two quarters per group) ---
     @property
     def DIAG_STATS_CHUNKS_PER_QUARTER(self):
         return self.GROUP_QUARTER // 4  # 8 LDS.128 per quarter per lane: one 16-B chunk per 4 q columns
@@ -140,7 +126,7 @@ class ConfigSTail(Config):
 
     @property
     def MASK_FORM_DIAGNOSTIC(self):
-        return "diag_mask_off"  # the one OUTPUT-WRONG-BY-DESIGN value of MASK_FORMS (the deletion probe of lever L5)
+        return "diag_mask_off"  # the one OUTPUT-WRONG-BY-DESIGN value of MASK_FORMS (the deletion probe of the mask-form lever)
 
     # --- derived: the softmax lane's per-tile mask cost (header section 11; the FSEL / R2P census rows and the PTX selp delta of the forms) ---
     @property
@@ -155,10 +141,10 @@ class ConfigSTail(Config):
     def WARP_ROLES(self):
         # 16w: softmax 0-7 / epilogue 8-11 (dS hop + dQ) / 4 service warps = today.  16w_fa4: softmax 0-7 (dS^T -> TMEM AND sDS own + XCHG from the
         # same registers, the ship) / REDUCE 8-11 (dQ readout + rounds + the item-end dV / dK staging) / the same 4 service warps.  The 20-warp
-        # lever-2 shape (rank 2) is NOT built here (its split 144/64/64/64 at entry 96: resource-manager tables 5-6).
+        # lever-2 shape (rank 2) is NOT built here (its split 144/64/64/64 at entry 96: the resource plan).
         return ("16w", "16w_fa4")
 
-    # --- derived: the 16w_fa4 role names and lane counts (the SAME warps 8-11 and lanes; renamed: inspector section 1 "RENAMED" rows) ---
+    # --- derived: the 16w_fa4 role names and lane counts (the SAME warps 8-11 and lanes; renamed: the barrier audit "RENAMED" rows) ---
     @property
     def REDUCE_WARPS(self):
         return self.EPILOGUE_WARPS  # 4: warps 8-11 = the reduce group under 16w_fa4
@@ -184,14 +170,14 @@ class ConfigSTail(Config):
         """``ds_smem``'s init = its bare arrivers: the 4 epilogue warps (``16w``) or the 8 softmax warps (``16w_fa4``; inspector X2)."""
         return {"16w": self.EPILOGUE_LANES, "16w_fa4": self.SOFTMAX_LANES}[roles]
 
-    # --- derived: the softmax's dS STS image under 16w_fa4 (resource-manager table 1: group g writes vec 4g .. 4g+3 of BOTH 64-q halves) ---
+    # --- derived: the softmax's dS STS image under 16w_fa4 (the resource plan: group g writes vec 4g .. 4g+3 of BOTH 64-q halves) ---
     @property
     def DS_STS_VECS_PER_QUARTER(self):
         return self.PACK_QUARTER_COLS // 4  # 4: a 32-q quarter = 16 packed Int32 words = four 16-B vectors of the lane's 128-B SW128 row
 
     @property
     def DS_STS_PER_LANE_PER_TILE(self):
-        # RESOURCE-NOTE: dS STS from the 32 packed words = today's LDTM image; 4 own + 4 XCHG STS.128/lane
+        # dS STS from the 32 packed words = today's LDTM image; 4 own + 4 XCHG STS.128/lane
         return self.QUARTERS_PER_GROUP * self.DS_STS_VECS_PER_QUARTER  # 8 per softmax lane per tile = 64 warp-STS per CTA per tile (today's 4 x 16)
 
     # --- derived: the slab chain gains the sDQ ring between XCHG and STATS (Q -16384, +DQ 16384: SLABS_END unchanged) ---
@@ -229,7 +215,7 @@ class ConfigSTail(Config):
     def dq_slice(self, rank, index):
         raise ValueError("the s_tail map has no dQ staging alias on ds_own + XCHG (the dedicated sDQ ring: dq_slot(slot)); dq_slice is the dp_tail map's")
 
-    # --- dkv_accum = fp32_reduce (C2b; resource-manager 08:25 table 9 form (i)): fp32 [M x DQ_BOX] staging slots over the dV / dK bf16 staging
+    # --- dkv_accum = fp32_reduce (fp32_reduce; the resource plan): fp32 [M x DQ_BOX] staging slots over the dV / dK bf16 staging
     # bytes + the dS slab, two rounds per item: R1 = dV's four slices + dK's slice 0 (80 KiB) -> the store warp's drain -> dvk_stage_empty -> R2 = dK's
     # slices 1..3 (48 KiB).  The dq_empty ring is NOT touched (its pre-armed wait k <-> release k-1 accounting cannot carry an item-end credit). ---
     @property
@@ -260,7 +246,7 @@ class ConfigSTail(Config):
     # --- derived: TMEM column map -- the dQ image in S^T's dead tail ---
     @property
     def DQ_COL(self):
-        # RESOURCE-NOTE: dQ @64..128 = S^T dead tail: s_read gates dQ(t-1), s_tail_empty gates S^T(t+1)
+        # dQ @64..128 = S^T dead tail: s_read gates dQ(t-1), s_tail_empty gates S^T(t+1)
         return self.S_COL + self.PACK_COLS  # 64
 
     @property
@@ -302,11 +288,11 @@ def resolve_debug_clk(value=None):
 
 # The role shape's kernel code space (``Constexpr[int]`` ``warp_roles_code``; the body names WARP_ROLES_16W / WARP_ROLES_16W_FA4 from these).
 WARP_ROLES_CODES = {"16w": 0, "16w_fa4": 1}
-# The barrier rows that have neither producer nor consumer under 16w_fa4 (barrier-inspector X5 / section 6: ds_tmem -- no dS^T readout; dp_empty --
+# The barrier rows that have neither producer nor consumer under 16w_fa4 (the barrier audit / section 6: ds_tmem -- no dS^T readout; dp_empty --
 # its ONLY arrive site was that readout; dP^T(t+1)'s overwrite of the packed dS^T(t) is ordered by the in-order tensor pipe after dK(t), of dP^T(t)'s
 # fp32 by ds_ready(t) -> dK(t)).  Deleted from BAR_LAYOUT_XFA4 with their states, waits and drains.
 DELETED_BARRIERS_XFA4 = ("ds_tmem", "dp_empty")
-# The barrier row ADDED under 16w_fa4 (barrier-inspector section 15, 2026-10-27 10:55 UTC, after the a90d6521 hang): `dq_war_done` = the softmax's sDS
+# The barrier row ADDED under 16w_fa4 (the barrier audit, 2026-10-27 10:55 UTC, after the the pre-fix tree hang): `dq_war_done` = the softmax's sDS
 # WAR signal, an MMA_COMMIT committed INSIDE `_dq_issue` at the two dQ issue sites only (BEFORE dq_done; never at the zero-trip empty-commit site),
 # waited ONLY by the softmax (st(1) pre-armed, one wait per live tile, no zero-trip wait or advance, one unconditional post-loop drain): every flip
 # depends on the softmax's own preceding STS, so the pre-armed waiter can never find a flip landed early (F in {w-1, w}) -- the shared `dq_done`
@@ -358,8 +344,8 @@ def validate_fields_for_roles(roles, diag_2cta=None, debug_clk=False, dkv_accum=
     return roles
 
 
-# (name, byte offset, active slots, init count, producer kind, scope) -- barrier-inspector 2026-10-26 (SKELETON) + 2026-10-27 (ARM (ii) rows).
-# Pasted from resources/arm2-barrier-table.md section 10 (34 rows / 39 slots, re-packed in declaration order, 16 B per row; END 230944 = 544 B
+# (name, byte offset, active slots, init count, producer kind, scope) -- the barrier audit 2026-10-26 (SKELETON) + 2026-10-27 (ARM (ii) rows).
+# Pasted from the audit record section 10 (34 rows / 39 slots, re-packed in declaration order, 16 B per row; END 230944 = 544 B
 # of the 944-B block [230400, 231344), 400 B spare -- FITS).  The lane ledger (SUM(issuing lanes) == init per row, both CTAs), the states
 # and the per-item flips are the kernel header's section 5 / 6; ``Bars`` is built from this tuple (one MBarrier per row, same init on BOTH
 # CTAs: a leader-waited barrier's follower copy is initialised with the same count and never armed, never waited).  Kinds as the first body's.
@@ -399,7 +385,7 @@ BAR_LAYOUT = (
     ("ds_recv_full", 230784, 1, CFG.ONE_LANE, "tma_dsmem", "LOCAL"),
     ("ds_pair_ready", 230800, 1, CFG.ONE_LANE, "peer", "LEADER"),  # follower MMA warp (ds_smem + ds_recv_full observed) -> leader; waited on xchg_state
     # dQ staging ring (epilogue -> store -> epilogue): the dedicated sDQ slab, 2 slots, 2 rounds per tile
-    # dq_empty: store warp after each slot's reduce-add source read per round (D4 closed release); epilogue pre-armed, NO bootstrap (D3)
+    # dq_empty: store warp after each slot's reduce-add source read per round (the closed per-round release); epilogue pre-armed, NO bootstrap (D3)
     ("dq_empty", 230816, 2, CFG.STORE_LANES, "thread", "LOCAL"),
     ("dq_full", 230832, 2, CFG.DQ_SLICE_LANES, "thread", "LOCAL"),  # 64 = the two epilogue warps of ONE d half per slot per round
     # native dV / dK stores
@@ -411,17 +397,17 @@ BAR_LAYOUT = (
     ("sched_empty", 230912, 2, CFG.PAIR_SCHED_CREDIT_WARPS, "peer", "LEADER"),  # 15 warps x 2 CTAs, one release arrive per warp
     # teardown
     ("tmem_dealloc", 230928, 1, CFG.TMEM_DEALLOC_ARRIVERS, "thread", "LOCAL"),  # local elect arrive + the peer's arrive_on_peer
-    # C2b (dkv_accum = fp32_reduce; code-writer C 2026-10-27, resource-manager 08:25 table 9 form (i)): the store warp after round 1's fp32 reduce-add
+    # fp32_reduce (dkv_accum = fp32_reduce; , the resource plan): the store warp after round 1's fp32 reduce-add
     # source reads drained -> the epilogue's round-2 staging may overwrite the five slots; 1 per item incl. zero-trip; INIT ONLY under dkv_fp32 (no
-    # user under the default rendering, which stays byte-identical); AUDIT owed with the X-FA4 AUDIT
+    # user under the default rendering, which stays byte-identical); AUDIT owed with the the alternate role shape AUDIT
     ("dvk_stage_empty", 230944, 1, CFG.STORE_LANES, "thread", "LOCAL"),
 )
 BAR_LAYOUT_END = 230960  # next free byte of the bar block (384 B of the 944 spare); 35 names / 40 slots, 560 B
 BAR_LAYOUT_STATUS = (
-    "FILLED by barrier-inspector 2026-10-27 01:05 UTC (SKELETON, ARM (ii), resources/arm2-barrier-table.md sections 1-10): 34 names / 39 slots; "
+    "FILLED by the barrier audit (SKELETON, ARM (ii), the audit record sections 1-10): 34 names / 39 slots; "
     "NEW s_read (512) + s_tail_empty (256), dp_empty arrive MOVED to the dS^T readout, xchg_state split (P2), q1 ring 1 stage, dq rings 2 slots "
     "x 2 rounds (D4 per-round release), dq_empty pre-armed without bootstrap (D3), dv_full 160 (fix A) carried; AUDIT from the committed source owed; "
-    "+ dvk_stage_empty (C2b, code-writer C 2026-10-27: THREAD 32 store -> epilogue, fp32 rounds only, init under dkv_fp32; AUDIT owed with X-FA4)"
+    "+ dvk_stage_empty (THREAD 32 store -> epilogue, fp32_reduce rounds only, init under dkv_fp32; audited with the role shape)"
 )
 BAR_KIND_COUNTS = {"tma_leader": 7, "mma": 9, "thread": 9, "leader": 6, "peer": 2, "tma_dsmem": 1, "tma": 1}
 
@@ -454,7 +440,7 @@ DBG_CLK_ROLE_WAITS = {
         "sched_full",
     ),
     "softmax": ("s_done", "dp_done", "sched_full"),  # warp 0 of the 8
-    "epilogue": ("ds_tmem", "dq_empty", "dq_done", "sched_full"),  # the lead warp (dq_empty = both slots of a round, one word)
+    "epilogue": ("ds_tmem", "dq_empty", "dq_done", "sched_full"),  # the leading warp (dq_empty = both slots of a round, one word)
     "follower": ("ds_smem", "ds_recv_full", "sched_full"),  # the follower's MMA warp (rank 1): the relay
     "loader": ("k1_empty", "v_empty", "k2_empty", "q1_empty", "do1_empty", "do2_empty", "q2_empty", "sched_full"),
     "store": ("dq_full", "dv_full", "dk_full", "sched_full"),
@@ -562,14 +548,14 @@ def dbg_clk_region_offset(regions_end):
 
 
 # Alias tenants of the time-shared bytes: (tenant, bytes it occupies, the seam the inspector owns).  The first body's dq_staging row is DELETED:
-# RESOURCE-NOTE: dq_staging alias on ds_own+XCHG dropped: dq_done(t) lands ~150 clk before dS(t+1)
+# dq_staging alias on ds_own+XCHG dropped: dq_done(t) lands ~150 clk before dS(t+1)
 ALIASES = (
     ("dk_store", "ds_own(rank) + XCHG", "dq_done(t_last) (the dQ MMA read sDS; the ship read XCHG) + dvk_empty before the next item's first dS write"),
     ("dv_store", "K2", "last tile's dq_done -> k2_empty before the next block's K2 load"),
     ("ds_recv(rank)", "DS, the peer-rank half", "written ONLY by the peer's bulk copy; its next write waits the peer's dq_done(t)"),
 )
 
-# (name, byte offset, active slots, init count, producer kind, scope) -- barrier-inspector 2026-10-27 08:45 UTC (X-FA4 16w, resources/x-fa4-barrier-table.md
+# (name, byte offset, active slots, init count, producer kind, scope) -- the barrier audit (the alternate role shape 16w, the audit record
 # section 8, PASTED): the S-tail table minus ds_tmem / dp_empty, ds_smem counted from the softmax; re-packed in declaration order, 16 B per row;
 # 32 names / 37 slots / 512 B; END 230912 (432 B spare of [230400, 231344)).  `validate_config` re-derives it from BAR_LAYOUT (filter + count + re-pack)
 # and asserts equality, so the delta against the audited 34-row table is exactly the two deletions and ds_smem's count.  Selected by ``warp_roles``.
@@ -641,7 +627,7 @@ BAR_LAYOUT_XFA4 = (
 BAR_LAYOUT_XFA4_END = 230928  # 33 names / 38 slots, 528 B (416 B of the 944 spare)
 BAR_KIND_COUNTS_XFA4 = {"tma_leader": 7, "mma": 10, "thread": 7, "leader": 5, "peer": 2, "tma_dsmem": 1, "tma": 1}  # 33
 BAR_LAYOUT_XFA4_STATUS = (
-    "FILLED by barrier-inspector 2026-10-27 08:45 UTC (SKELETON, X-FA4 16w, resources/x-fa4-barrier-table.md sections 0-14) + the section-15 ZERO-TRIP "
+    "FILLED by the barrier audit (SKELETON, the alternate role shape 16w, the audit record sections 0-14) + the section-15 ZERO-TRIP "
     "CORRECTION 10:55 UTC: 33 names / 38 slots; ds_tmem + dp_empty DELETED (X5 / section 6), ds_smem 128 -> 256 from the SOFTMAX (X2), ds_recv_full armed "
     "by softmax warp 0 after the 256-lane XCHG bar.sync (X3 / X4), dq_war_done NEW = the softmax's WAR signal (section 15.3; dq_done back to the reduce "
     "group alone), s_read kept (X1), dQ ring form A (X6); AUDIT from the committed source owed (section 12 + 15.5 punch lists)"
@@ -649,7 +635,7 @@ BAR_LAYOUT_XFA4_STATUS = (
 
 
 def bar_layout_for_roles(roles):
-    """The barrier table a (resolved) role shape renders with: the audited 34-row ``BAR_LAYOUT`` (``16w``) or the inspector's 32-row ``BAR_LAYOUT_XFA4``."""
+    """The barrier table a (resolved) role shape renders with: the audited 34-row ``BAR_LAYOUT`` (``16w``) or the audit's 32-row ``BAR_LAYOUT_XFA4``."""
     return {"16w": BAR_LAYOUT, "16w_fa4": BAR_LAYOUT_XFA4}[roles]
 
 
@@ -703,7 +689,7 @@ def validate_config():
         for s in slots:
             assert s >= c.XCHG + c.XCHG_BYTES  # never inside the dS / XCHG bytes
     assert (c.dv_store(0), c.dv_store(1)) == (c.K2, c.K2 + 16384)
-    # dkv_accum = fp32_reduce (C2b, form (i)): 5 + 3 fp32 16 KiB slots over [K2, DQ) = the dV / dK bf16 staging bytes + the dS slab; 1024-B aligned,
+    # dkv_accum = fp32_reduce (form (i)): 5 + 3 fp32 16 KiB slots over [K2, DQ) = the dV / dK bf16 staging bytes + the dS slab; 1024-B aligned,
     # disjoint, never the sDQ ring; round 2 reuses three of round 1's slots after dvk_stage_empty
     assert c.DKV_ACC_SLICES == c.D // c.DQ_BOX == 4 and (c.DKV_ACC_R1_SLICES, c.DKV_ACC_R2_SLICES) == (5, 3)
     assert c.DKV_ACC_R1_SLICES + c.DKV_ACC_R2_SLICES == 2 * c.DKV_ACC_SLICES  # dV's four + dK's four slices, once each
@@ -890,7 +876,7 @@ def validate_config():
     assert c.xchg_barrier_lanes("16w_fa4") == c.ds_smem_lanes("16w_fa4") == c.SOFTMAX_LANES == 256
     assert (c.SOFTMAX_LEAD_WARP, c.REDUCE_LEAD_WARP, c.REDUCE_WARPS, c.REDUCE_LANES, c.PAIR_REDUCE_LANES) == (0, 8, 4, 128, 256)
     assert 0 <= c.SOFTMAX_LEAD_WARP < c.SOFTMAX_WARPS and c.REDUCE_LEAD_WARP == c.SOFTMAX_WARPS and c.PAIR_REDUCE_LANES == c.PAIR_EPILOGUE_LANES
-    # the softmax's dS STS image (resource-manager table 1 / 2): 4 vecs per 32-q quarter, 2 quarters per group = 8 STS.128 per lane per tile; the two
+    # the softmax's dS STS image (the resource plan / 2): 4 vecs per 32-q quarter, 2 quarters per group = 8 STS.128 per lane per tile; the two
     # groups' 4-vec slots (vec 4g .. 4g+3) tile the 128-B SW128 row; 128 lanes x 2 groups x 8 x 16 B = the 32 KiB of sDS own + XCHG per CTA per tile
     assert (c.DS_STS_VECS_PER_QUARTER, c.DS_STS_PER_LANE_PER_TILE) == (4, 8) and c.DS_STS_VECS_PER_QUARTER * c.SOFTMAX_GROUPS * 16 == c.SWIZZLE_BYTES
     assert c.M * c.SOFTMAX_GROUPS * c.DS_STS_PER_LANE_PER_TILE * 16 == c.DS_HALF_BYTES + c.XCHG_BYTES == 32768

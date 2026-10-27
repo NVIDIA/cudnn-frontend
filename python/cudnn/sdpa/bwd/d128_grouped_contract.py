@@ -10,7 +10,7 @@ DENSE = "accumulation_grouped_dense"
 THD = "accumulation_grouped_thd"
 PARTIAL_ITEMSIZE = 2  # BF16 for BF16 IO, FP16 for FP16 IO; final group accumulation is FP32.
 ACCUM_ITEMSIZE = 4  # the fp32 dK / dV accumulation workspace under dkv_accum = "fp32_reduce" (one buffer per KV head)
-# The typed op-level field ``SdpaBwdDslSm100D128.dkv_accum`` (C2b, 2026-10-27): how the GQA group's dK / dV are accumulated on the THD chain.
+# The typed op-level field ``SdpaBwdDslSm100D128.dkv_accum``: how the GQA group's dK / dV are accumulated on the THD chain.
 # A ROUNDING CHANGE between the two forms, hence an op ATTRIBUTE the caller sets (never a knob): "bf16_partials" = one bf16 partial per Q
 # head + the fp32 ``dkv_reduce`` fold launch (a FIXED summation order; the shipping chain, byte-identical when the field is unset);
 # "fp32_reduce" = every Q-head owner reduce-adds its fp32 dK / dV tile (``cp.reduce.async.bulk.tensor`` add.f32) into ONE per-KV-head fp32

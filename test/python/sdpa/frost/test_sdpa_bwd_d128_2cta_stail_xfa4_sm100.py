@@ -1,26 +1,13 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-"""BF16 grouped THD d128 backward on the cta_group::2 datapath: the S-tail pair body under FAv4's ROLE SHAPE -- the typed adapter field
-``warp_roles = "16w_fa4"`` ("X-FA4", day-3 rank 1; barrier-inspector SKELETON resources/x-fa4-barrier-table.md 2026-10-27 08:45 UTC, resource-manager
-resources/xfa4-budgets.md 08:15 UTC).  The SOFTMAX writes sDS own + XCHG straight from its 32 packed dS^T words (today's LDTM image word for word),
-fences ONCE, arrives ``ds_smem`` (256), passes the 256-lane XCHG named barrier and its lead warp's elected lane arms ``ds_recv_full`` + ships; a NEW
-softmax ``dq_done`` WAR wait (``dq_war`` st(1)) precedes the first dS STS of every tile; warps 8-11 become the REDUCE group (``_reduce_loop``:
-dq_done -> x64 dQ ld -> s_tail_empty -> rounds A, B; the item-end dV / dK staging kept); ``ds_tmem`` AND ``dp_empty`` are DELETED (``BAR_LAYOUT_XFA4``
-32 names / 37 slots / END 230912); s_read kept; the dQ ring keeps form A; TMEM / SMEM / the 144-144-80 split UNCHANGED.  The default (``warp_roles``
-unset = "16w") stays pinned byte-identical by ``test_sdpa_bwd_d128_2cta_stail_sm100.py`` (645f8a24 @ 2/8/2) and re-asserted here.
+"""L0 tests of the pair body's alternate role shape, the typed field ``warp_roles = "16w_fa4"`` (the softmax writes the dS^T halves from its
+registers and ships the exchange; warps 8-11 are the reduce group; ds_tmem and dp_empty deleted, dq_war_done added: 33 barriers).
 
-RED-first: the GPU rows below were committed with the body's first host trace-compile, before it ran; every one is the grouped suite's independent
-FP64 gate (``check_case``: per-sequence atol / rtol + cosine, storage canaries, exact zeros for empty attention), dQ / dK / dV apart.
-
-Rows: host -- config = truth for the role shape (the typed domain PER MAP, the two declines by name (red dQ routes, ``ds_gates_off``), the 32-row
-table pasted == derived, the role-derived lane counts), the host renders (16w_fa4 census vs 16w with EVERY delta a table row; the md5 record; the
-default unchanged), the inspector's section-12 punch list as SOURCE assertions (the softmax site ORDER, the reduce group's order, ds_tmem / dp_empty
-absent from the 16w_fa4 paths, the arm's back-edge in program order, ONE proxy fence and no tcgen05 fence before ds_smem, the leader's two deletions,
-the one-site skew levers); GPU -- the 8-cell matrix, all-empty, the P14 rows (n_q == 1 with more pairs than SMs, a half-dead last pair, the zero-trip
-MIX) under both leader orders, the launch census, the dK / dV BITWISE twin 16w vs 16w_fa4 (the same accumulation chain per GEMM; dQ by the gate),
-the fa4 / fa4b twin under 16w_fa4, and the seven pair-skew detectors run with ``warp_roles="16w_fa4"`` (incl. ``leader_ship`` at 300 us = the D8
-mechanism's deterministic repro, which MUST stay clean under the correct protocol, and the NEW ``softmax_dq_war``).  Budget: the skew rows are the
-``skew_module`` class (one cold child per row).
+Rows: host -- config = truth for the role shape (the typed domain, the declines by name under 16w_fa4 (the STAMPS lever, fp32_reduce), the
+33-row ``BAR_LAYOUT_XFA4`` pasted AND re-derived from the audited 35-row table, the kind counts, the role-derived lane counts, the bundles the
+body builds), the host render against the committed md5 record + the default rendering unchanged, the punch list as SOURCE assertions (the
+softmax's site order, the reduce group's order, dp_empty / ds_tmem absent from the 16w_fa4 paths, one site per skew lever); GPU -- the 8-cell
+THD matrix, all-empty, the P14 rows, the launch census, the 16w vs 16w_fa4 BITWISE twin on dK / dV, the pair-skew detectors under 16w_fa4
+(incl. the SOFTMAX_DQ_WAR lever) and the zero-trip HANG repro rows (RED-first) in fresh child processes under the short kernel-stage watchdog.
+Budget: the skew and hang rows name ``skew_module``.
 """
 
 import os
@@ -42,7 +29,7 @@ pytestmark = [pytest.mark.L0, requires_dsl]
 
 _ROLES = "16w_fa4"
 _RECORD_XFA4 = pathlib.Path(__file__).resolve().parent / "renderings" / "md5_d128_accum_grouped_2cta_stail_xfa4_sm_100a.txt"
-# The role shape's census beside the module census (resources/render_2cta_stail_x86.py keys): the dS^T readout LDTMs (4 x16 gone), the proxy fences
+# The role shape's census beside the module census (the audit record keys): the dS^T readout LDTMs (4 x16 gone), the proxy fences
 # (the epilogue's two -> the softmax's one; one _dq_round site fewer), the sDQ slice STS (3 -> 2 round sites x 8), the XCHG named barrier's thread
 # count (128 -> 256), the dp_empty relaxed.cluster arrive, the plain arrives (ds_tmem + the third dq_full site), the leader's `.release` /
 # `.relaxed` cluster arrives, the softmax's dS STS.128 (st.shared.v4.b32: the epilogue's 16 per lane -> the softmax's 8).
@@ -57,7 +44,7 @@ _XFA4_CENSUS = {
     "expect_tx": r"mbarrier\.arrive\.expect_tx",
     "dsmem_ship": r"cp\.async\.bulk\.shared::cluster\.shared::cta",
 }
-# 16w (the audited S-tail body; AUDIT 04:17: arrive 40 / try_wait 68) and 16w_fa4 (the inspector's section 12 item 11; the writer's record 2026-10-27):
+# 16w (the audited S-tail body; AUDIT 04:17: arrive 40 / try_wait 68) and 16w_fa4 the barrier audit; the writer's record 2026-10-27):
 #   arrive 40 -> 37 = -1 ds_tmem (plain) -1 dp_empty (relaxed.cluster) -1 the item-end `_dq_round` site (dq_full plain: 3 -> 2 sites);
 #   try_wait 68 -> 65 = -1 ds_tmem wait -2 dp_empty (the slot-1 wait + the P15 drain) +2 `dq_war` (the per-tile wait + the zero-trip wait)
 #                       -2 dq_empty (3 -> 2 `_dq_round` sites x 2 slots);  commit 13, mma 72, the ship 1, expect_tx 11 (the arm MOVED), `.local` 0 unchanged.
@@ -88,17 +75,17 @@ _EXPECTED_XFA4 = dict(
     plain_arrive=_EXPECTED_16W_EXTRA["plain_arrive"] - 2,
     expect_tx=11,
     dsmem_ship=1,
-    # the stack fold: the stail module's census (writer A) also counts these; the 16w_fa4 deltas are writer B's measured ones (three `_wait_tcgen`
+    # the merge: the stail module's census (the author's) also counts these; the 16w_fa4 deltas are the author's measured ones (three `_wait_tcgen`
     # sites gone: -3 tcgen05 fences / -3 warp syncs net; the epilogue's XCHG address mapa gone with its ship site: 17 -> 16)
     bar_warp_sync=_EXPECTED["bar_warp_sync"] - 3,
     tcgen05_fence_after=_EXPECTED["tcgen05_fence_after"] - 3,
     mapa=_EXPECTED["mapa"] - 1,
 )
-# the stack fold: the stail module's template carries writer C's `**{fields!r}` / `dkv_accum={dkv}` keys (426a5442); the role shape is set beside them
+# the merge: the stail module's template carries the author's `**{fields!r}` / `dkv_accum={dkv}` keys (an earlier tree); the role shape is set beside them
 _CHILD_XFA4 = _CHILD.replace(
     "api = make_adapter_2cta_stail(case, **{fields!r})", f"api = make_adapter_2cta_stail(case, warp_roles={_ROLES!r}, **{{fields!r}})"
-).replace('"2-CTA s_tail pair-skew {site} dkv_accum={dkv}"', '"2-CTA s_tail X-FA4 pair-skew {site} dkv_accum={dkv}"')
-assert "warp_roles=" in _CHILD_XFA4 and "X-FA4" in _CHILD_XFA4 and "{fields!r}" in _CHILD_XFA4 and "dkv_accum={dkv}" in _CHILD_XFA4
+).replace('"2-CTA s_tail pair-skew {site} dkv_accum={dkv}"', '"2-CTA s_tail the alternate role shape pair-skew {site} dkv_accum={dkv}"')
+assert "warp_roles=" in _CHILD_XFA4 and "the alternate role shape" in _CHILD_XFA4 and "{fields!r}" in _CHILD_XFA4 and "dkv_accum={dkv}" in _CHILD_XFA4
 from cudnn.sdpa.bwd.d128_grouped_contract import DKV_ACCUM_DEFAULT as _DKV_ACCUM_DEFAULT  # noqa: E402  (the artifact's recorded form under the default)
 
 
@@ -115,8 +102,8 @@ def _run_case(case, repeats=2, **fields):
 
 # ------------------------------------------------------------------------------------------------------------ host (no GPU)
 def test_xfa4_role_shape_config_is_the_truth():
-    """Every number the X-FA4 header block quotes is a derived, asserted field of ``config_sm100_d128_accum_2cta_stail`` (G10 config-as-truth): the
-    typed domain, the 32-row ``BAR_LAYOUT_XFA4`` (pasted from the inspector's section 8 AND re-derived from the audited 34-row table: the two deletions +
+    """Every number the the alternate role shape header block quotes is a derived, asserted field of ``config_sm100_d128_accum_2cta_stail`` (G10 config-as-truth): the
+    typed domain, the 32-row ``BAR_LAYOUT_XFA4`` (pasted from the barrier audit AND re-derived from the audited 34-row table: the two deletions +
     ds_smem counted from the softmax, re-packed, END 230912), the kind counts, the role-derived lane counts (XCHG named barrier 256, ds_smem 256), the
     lead warp, the dS STS image counts, and the bundles the body builds from them (``Bars`` 34 fields, ``BarsXFA4`` 32)."""
     import importlib
@@ -129,7 +116,7 @@ def test_xfa4_role_shape_config_is_the_truth():
     assert len(cfgmod.BAR_LAYOUT_XFA4) == 33 and sum(r[2] for r in cfgmod.BAR_LAYOUT_XFA4) == 38 and cfgmod.BAR_LAYOUT_XFA4_END == 230928 <= c.TMEM_HANDLE
     names = [r[0] for r in cfgmod.BAR_LAYOUT_XFA4]
     assert "ds_tmem" not in names and "dp_empty" not in names
-    # section 15: appended after tmem_dealloc; the stack fold: writer C's dvk_stage_empty is UNSERVED under 16w_fa4 (fp32_reduce declines by name)
+    # section 15: appended after tmem_dealloc; the merge: the author's dvk_stage_empty is UNSERVED under 16w_fa4 (fp32_reduce declines by name)
     assert names == [r[0] for r in cfgmod.BAR_LAYOUT if r[0] not in cfgmod.DELETED_BARRIERS_XFA4 and r[0] not in cfgmod.UNSERVED_BARRIERS_XFA4] + [
         "dq_war_done"
     ]
@@ -143,7 +130,7 @@ def test_xfa4_role_shape_config_is_the_truth():
     assert cfgmod.BAR_KIND_COUNTS == {
         "tma_leader": 7,
         "mma": 9,
-        "thread": 9,  # the stack: + writer C's dvk_stage_empty (THREAD 32) on the 16w table
+        "thread": 9,  # the merged tree: + the author's dvk_stage_empty (THREAD 32) on the 16w table
         "leader": 6,
         "peer": 2,
         "tma_dsmem": 1,
@@ -204,7 +191,7 @@ def test_xfa4_warp_roles_is_typed_and_declines_by_name():
 
 
 def test_xfa4_host_renders_for_sm_100a_and_matches_its_record(tmp_path):
-    """Host trace-compile of the chain with ``warp_roles = "16w_fa4"`` (no device): the census is the inspector's section-12 item 11 with EVERY delta a
+    """Host trace-compile of the chain with ``warp_roles = "16w_fa4"`` (no device): the census is the audit's section-12 item 11 with EVERY delta a
     table row (arrive 40 -> 37, try_wait 68 -> 65, `bar.sync 2, 256` and no `2, 128`, 4 LDTM fewer, 2 proxy fences fewer, 8 slice STS fewer, one
     relaxed.cluster arrive fewer, the ship and the expect_tx arm count unchanged), no local memory, no nanosleep, the default register split; the md5
     matches the committed record at this geometry (skips, never widens, on a DSL build difference)."""
@@ -224,7 +211,8 @@ def test_xfa4_host_renders_for_sm_100a_and_matches_its_record(tmp_path):
 
 def test_xfa4_default_rendering_is_unchanged_and_16w_named_is_the_default(tmp_path):
     """The field ABSENT and ``warp_roles = "16w"`` render the SAME PTX = the S-tail record (645f8a24 @ 2/8/2: the pin of the sibling module), with the
-    16w census (arrive 40 / try_wait 68 / `bar.sync 2, 128` / 13 LDTM / 15 proxy fences / 24 slice STS); nothing of X-FA4 reaches the default."""
+    16w census (arrive 40 / try_wait 68 / `bar.sync 2, 128` / 13 LDTM / 15 proxy fences / 24 slice STS); nothing of the alternate role shape reaches the default.
+    """
     md5_d, census_d, regs_d = _render(tmp_path, {}, _XFA4_CENSUS)
     md5_n, census_n, _ = _render(tmp_path, {"warp_roles": "16w"}, _XFA4_CENSUS)
     assert md5_d == md5_n, "warp_roles named '16w' must be the default rendering"
@@ -237,7 +225,7 @@ def test_xfa4_default_rendering_is_unchanged_and_16w_named_is_the_default(tmp_pa
         assert md5_d == want, f"the default S-tail rendering moved: {md5_d} != {want}"
 
 
-# ------------------------------------------------------------------------------------------------------------ host: the inspector's section-12 punch list as SOURCE assertions
+# ------------------------------------------------------------------------------------------------------------ host: the audit's section-12 punch list as SOURCE assertions
 def _stmt(ln):
     """The statement of a code line without its trailing comment (the bodies carry `# RESOURCE-NOTE` / `# skew lever` comments inline)."""
     return ln.strip().split("  #")[0].strip()
@@ -250,7 +238,7 @@ def _xfa4_block(code, start_token, end_token):
     return code[start + 1 : end]
 
 
-def test_xfa4_softmax_site_order_is_the_inspectors_stub_order():
+def test_xfa4_softmax_site_order_is_the_audited_stub_order():
     """Punch list item 2: per tile under ``fa4_roles`` -- ... STTM -> wait(STORE) -> fence -> ds_ready -> `_wait(dq_done, dq_war)` -> advance -> 8 STS
     (two `_store_words_quarter` calls = 4 own + 4 XCHG) -> ONE `fence.proxy.async` -> `ds_smem.arrive()` -> `bar.sync 2, 256` -> the elected arm ->
     the ship; `ds_tmem.arrive()` only under `not fa4_roles`; `dq_war = PipelineState.start(phase=1)`; `ship_pred` computed ONCE per item from
@@ -268,7 +256,7 @@ def test_xfa4_softmax_site_order_is_the_inspectors_stub_order():
     fa4 = _xfa4_block(sm, "bars.ds_tmem.arrive()", "if qtile + 1 < hi:")
     fa4 = fa4[1:]  # drop the `else:` line
     order = [
-        "_wait(bars.dq_war_done, dq_war.phase, None, 0)",  # the stack: the STAMPS arity, dbg=None (debug_clk declines under 16w_fa4)
+        "_wait(bars.dq_war_done, dq_war.phase, None, 0)",  # the merged tree: the STAMPS arity, dbg=None (debug_clk declines under 16w_fa4)
         "dq_war = advance(dq_war, 1)",
         "_skew_follower_own_half(rank)",
         "xor_t = opaque_i32(xor_lane, anchor=qtile)",
@@ -278,8 +266,8 @@ def test_xfa4_softmax_site_order_is_the_inspectors_stub_order():
         "bars.ds_smem.arrive()",
         "named_barrier_fence(CFG.XCHG_BARRIER, XCHG_BARRIER_LANES_16W_FA4)",
         "_skew_leader_ship(rank)",
-        "bars.ds_recv_full.arrive(n_bytes=xchg_tx, pred=ship_pred)",  # the stack: D8s re-sited -- the config-selected byte count (0 under the probe)
-        "if cutlass.const_expr(not exchange_off):",  # the stack: the ship is the ONLY statement under the D8s guard (as at the 16w site)
+        "bars.ds_recv_full.arrive(n_bytes=xchg_tx, pred=ship_pred)",  # the merged tree: exchange_off re-sited -- the config-selected byte count (0 under the probe)
+        "if cutlass.const_expr(not exchange_off):",  # the merged tree: the ship is the ONLY statement under the exchange_off guard (as at the 16w site)
         "_ship_xchg(slab, bars, rank, ship_pred)",
     ]
     assert [_stmt(ln) for ln in fa4] == order, fa4
@@ -312,7 +300,7 @@ def test_xfa4_softmax_site_order_is_the_inspectors_stub_order():
     zt = [ln for ln in leader if "_commit_pair(bars.dq_done, elect_p)" in ln]
     assert len(zt) == 1, zt  # the zero-trip empty commit (the dQ sites commit through _dq_issue)
     assert len(re.findall(r"^\s+_wait\(bars\.dq_war_done, dq_war\.phase, None, 0\)", src, re.M)) == 2, "two waits: the per-tile wait + the drain"
-    # the quarter -> slab map of resource-manager table 1: lo = quarter g (q half 0) -> own on rank 0 / XCHG on rank 1; hi = quarter g+2 -> the other
+    # the quarter -> slab map of the resource plan: lo = quarter g (q half 0) -> own on rank 0 / XCHG on rank 1; hi = quarter g+2 -> the other
     assert any("lo_base = cutlass.Int32(arith.select(is_leader_cta.ir_value(), own_base.ir_value(), xchg_base.ir_value()))" in ln for ln in sm)
     assert any("hi_base = cutlass.Int32(arith.select(is_leader_cta.ir_value(), xchg_base.ir_value(), own_base.ir_value()))" in ln for ln in sm)
     helper = _function_code(src, "_store_words_quarter", "_store_dq_slice")
@@ -335,7 +323,7 @@ def test_xfa4_reduce_group_order_and_no_ds_work():
     assert (
         "_dq_half(dq, 0)" in rd[rounds[0]] and "_dq_half(dq, CFG.DQ_BOX)" in rd[rounds[1]]
     ), "round A = cols [0, 32), round B = cols [32, 64) of the x64 readout"
-    assert all(", False, sts_off, None)" in rd[i] for i in rounds), "the tma route only (route_red False), the sdq_sts_off probe's flag, no stamps (dbg None)"
+    assert all(", sts_off, None)" in rd[i] for i in rounds), "the sdq_sts_off probe's flag, no stamps (dbg None)"
     assert sum("_wait_tcgen(bars.dq_done, dq_state.phase, None, 0)" in ln for ln in rd) == 2, "the per-tile wait + the zero-trip observation"
     assert any(_stmt(ln) == "if lo >= hi:" for ln in rd) and any(_stmt(ln) == "dq_state = advance(dq_state, 1)" for ln in rd)
     assert not any("carried" in ln for ln in rd) and not any(
@@ -485,9 +473,9 @@ def test_xfa4_role_shapes_agree_bitwise_on_dk_dv():
 def test_sdpa_bwd_d128_2cta_stail_xfa4_survives_pair_skew(site, tmp_path):
     """One lever per id on the S-tail body under ``warp_roles = "16w_fa4"`` (``SITES`` of the sibling module incl. the NEW ``softmax_dq_war``): a fresh
     process arms ``FROST_D128_2CTA_DEBUG_<SITE>_DELAY_US`` before the body executes, runs the skew / p14 cell (more pairs than SMs) under
-    ``process_watchdog`` and asserts the fp64 gate eagerly and under capture / replay.  ``leader_ship`` at 300 us = the barrier-inspector's deterministic
-    repro of the D8 TX-PENDING over-arrival (08:01): under the correct protocol the arm's back-edge (the softmax's `dq_war` wait) holds on both CTAs and
-    the run stays clean (SKEW_OK); a 719 = STOP, the inspector reads it.  Exit 70 or a subprocess timeout = HANG -> the barrier AUDIT, never a bigger
+    ``process_watchdog`` and asserts the fp64 gate eagerly and under capture / replay.  ``leader_ship`` at 300 us = the barrier audit deterministic
+    repro of the the gate-skip probe TX-PENDING over-arrival (08:01): under the correct protocol the arm's back-edge (the softmax's `dq_war` wait) holds on both CTAs and
+    the run stays clean (SKEW_OK); an over-arrival fault = STOP, the barrier audit reads it.  Exit 70 or a subprocess timeout = HANG -> the barrier AUDIT, never a bigger
     budget; a gate miss = the RED form's wrong rows, named by ``check_case``.  Budget class: ``skew_module``."""
     row = SITES[site]
     assert row["lever"] in set(_LEVER_LINE.findall(_body_source())), f"the body must expose {row['lever']}"
@@ -506,7 +494,7 @@ def test_sdpa_bwd_d128_2cta_stail_xfa4_survives_pair_skew(site, tmp_path):
         cell=_CELLS[row["cell"]],
         watchdog=_WATCHDOG_S,
         site=site,
-        fields={},  # the stail template's C2b keys: the default form under 16w_fa4 (fp32_reduce declines there by name)
+        fields={},  # the stail template's fp32_reduce keys: the default form under 16w_fa4 (fp32_reduce declines there by name)
         dkv=_DKV_ACCUM_DEFAULT,
     )
     (tmp_path / f"skew_xfa4_{site}.py").write_text(script)
@@ -588,9 +576,9 @@ print("REPRO_OK {name}", flush=True)
 
 @pytest.mark.parametrize("name", list(_HANG_CASES))
 def test_xfa4_zero_trip_items_do_not_hang(name, tmp_path):
-    """RULE-GAPS 649 (RED-first): the zero-trip repro rows of the 16w_fa4 body in a FRESH child process with the short kernel-stage watchdog
+    """a recorded tooling note (RED-first): the zero-trip repro rows of the 16w_fa4 body in a FRESH child process with the short kernel-stage watchdog
     (`_HANG_WATCHDOG_S` = budgets `validate_multihead`): a zero-trip item as a cluster's ONLY / FIRST item, a full item after a zero-trip one, and
-    two consecutive zero-trip items after a live one (the lap).  Exit 70 = the watchdog fired inside the executes = HANG (RED on a90d6521: the
+    two consecutive zero-trip items after a live one (the lap).  Exit 70 = the watchdog fired inside the executes = HANG (RED on the pre-fix tree: the
     softmax's pre-armed dq_war wait vs the leader's empty dq_done commit); rc 0 + REPRO_OK = green; any other rc = the child's own error."""
     row = _HANG_CASES[name]
     _require_2cta()
@@ -608,11 +596,11 @@ def test_xfa4_zero_trip_items_do_not_hang(name, tmp_path):
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
         (tmp_path / f"hang_xfa4_{name}.log").write_text(out)
-        pytest.fail(f"[{name}] HANG: the child did not return within {timeout_s} s -> barrier AUDIT (RULE-GAPS 649), never a bigger budget")
+        pytest.fail(f"[{name}] HANG: the child did not return within {timeout_s} s -> barrier AUDIT , never a bigger budget")
     (tmp_path / f"hang_xfa4_{name}.log").write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
     if proc.returncode == 70:
         pytest.fail(
             f"[{name}] HANG: process_watchdog killed the child after {_HANG_WATCHDOG_S:.0f} s inside the executes (RED: the softmax's pre-armed dq_war "
-            f"wait vs the zero-trip empty dq_done commit, RULE-GAPS 649)\n{proc.stdout[-1500:]}\n{proc.stderr[-1500:]}"
+            f"wait vs the zero-trip empty dq_done commit)\n{proc.stdout[-1500:]}\n{proc.stderr[-1500:]}"
         )
     assert proc.returncode == 0 and f"REPRO_OK {name}" in proc.stdout, f"rc={proc.returncode}\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"

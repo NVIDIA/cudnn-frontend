@@ -42,7 +42,7 @@ class Config:
     DESC_VERSION: int = 1
     SWIZZLE_BYTES: int = 128
     SWIZZLE_LAYOUT: int = 2
-    # --- dkv_accum = fp32_reduce (C2b, the grouped THD kernel only): the fp32 dV / dK staging over the ALIAS slab and the TMEM planes it reads ---
+    # --- dkv_accum = fp32_reduce (the grouped THD kernel only): the fp32 dV / dK staging over the ALIAS slab and the TMEM planes it reads ---
     BPE_ACC: int = 4  # fp32 accumulator bytes (the dQ image and the fp32 dK / dV staging)
     D_HALF: int = 64  # one TMEM readout half of a 128-column accumulator plane
     DV_COL: int = 256  # TMEM column of the dV accumulator plane (the bodies' `tmem_base + 256`)
@@ -122,7 +122,7 @@ def validate_config():
     assert CFG.TMEM_HANDLE + 4 <= CFG.SCHED_PAYLOAD
     assert CFG.SCHED_PAYLOAD + 64 == 230880
     assert (230880 + 1023) // 1024 * 1024 == CFG.SMEM_BYTES
-    # dkv_accum = fp32_reduce (C2b): the fp32 dV / dK staging = the dQ fp32 image's four [M x DQ_BOX] SW128 slices over the ALIAS slab (one fp32
+    # dkv_accum = fp32_reduce (fp32_reduce): the fp32 dV / dK staging = the dQ fp32 image's four [M x DQ_BOX] SW128 slices over the ALIAS slab (one fp32
     # [M x D] tile per round; dV then dK), one dq_empty ring slot per slice (the dK round's WAR waits), the TMEM planes the staging reads.
     assert (CFG.BPE_ACC, CFG.D_HALF, CFG.DKV_ACC_SLICES, CFG.DKV_ACC_SLICE_BYTES) == (4, CFG.D // 2, CFG.D // CFG.DQ_BOX, CFG.M * CFG.DQ_BOX * CFG.BPE_ACC)
     assert CFG.DKV_ACC_SLICE_BYTES == CFG.SLICE_BYTES and CFG.DKV_ACC_SLICES * CFG.DKV_ACC_SLICE_BYTES == 2 * CFG.OPERAND_BYTES == CFG.M * CFG.D * CFG.BPE_ACC

@@ -149,7 +149,7 @@ def mask_form(api):
 
 def warp_roles(api):
     """The adapter record's ROLE SHAPE of the pair body (``SdpaBwdDslSm100D128.warp_roles``: a name of the s_tail body's ``CFG.WARP_ROLES`` -- "16w"
-    (default: today's rendering) | "16w_fa4" (X-FA4: the softmax ships the dS exchange from its registers; warps 8-11 = the reduce group) -- or
+    (default: today's rendering) | "16w_fa4" (the alternate role shape: the softmax ships the dS exchange from its registers; warps 8-11 = the reduce group) -- or
     ``None`` = "16w"; "16w_fa4" exists on the s_tail map only), typed: a ``ValueError`` names the field, the domain and the map."""
     try:
         return resolve_warp_roles(getattr(api, "warp_roles", None))

@@ -193,7 +193,7 @@ _CELLS = {
 }
 _SKV = "256 * ((sms // (8 * 2)) + 2) + 128"  # pairs x (hq=8) x (b=2) > sms, last pair half-dead
 # The four pair-skew sites every pair body carries (the barrier audit's lever forms).  ``lever`` = <SITE>; ``cell`` names the case builder
-# above; ``red`` = what the detector shows on the broken protocol; ``green`` = the expected PASS.  Line anchors are function names.
+# above; ``red`` = what the detector shows on the unsound protocol; ``green`` = the expected PASS.  Line anchors are function names.
 SITES_BASE = {
     "follower_own_half": dict(
         lever="FOLLOWER_OWN_HALF",

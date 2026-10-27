@@ -409,7 +409,7 @@ the allocation contract. All scratch is initialized each execution.
 | Workspace / kernel launches | MHA: dense accumulation (any lengths) / 3, dense recompute (D64, left window, deterministic request, older CuTeDSL, negative scale) / 1, THD accumulation / 4. GQA/MQA: append native dK/dV partials and an FP32 group fold; dense / 4, THD / 5 |
 | THD MHA | ✅ cc 10.0 or 10.3, public CuTeDSL >= 4.8, positive FP32 scale, positive declared capacities; actual empty sequences and tails supported |
 | GQA / MQA | ✅ BF16 only, cc 10.0 or 10.3, public CuTeDSL >= 4.8, positive FP32 scale, Hq > Hkv with integral ratio; dense Sq/Skv must be multiples of 128, THD accepts tails and empty actual sequences |
-| `cta_group::2` pair body (grouped THD BF16, top-left causal or unmasked, GQA / MQA), selected by the per-S heuristic | ✅ **native**, cc 10.0: served when both declared `S_q` and `S_kv` (the batch's longest sequence per side) are `>= 8192` (`d128_grouped_2cta_contract.CTA_PAIR_MIN_SEQ`) and the device admits a cluster of two (occupancy query); below the threshold, on cc 10.3 and on dense GQA the one-CTA grouped body serves. Op-level field `cta_pair`: `auto` (default, the rule) / `off` (one-CTA always) / `on` (the pair at any S; a failing predicate -- THD, cc, cluster, grouped heads -- declines by name). Same contract, workspace sizing and 5 launches as the one-CTA THD GQA chain; dQ accumulation unordered either way |
+| `cta_group::2` pair body (grouped THD BF16, top-left causal or unmasked, GQA / MQA), selected by the per-S heuristic | ✅ **native**, cc 10.0: served when both declared `S_q` and `S_kv` (the batch's longest sequence per side) are `>= 8192` (`d128_grouped_2cta_contract.CTA_PAIR_MIN_SEQ`) and the device admits a cluster of two (occupancy query); below the threshold, on cc 10.3 and on dense GQA the one-CTA grouped body serves. Op-level field `cta_pair`: `auto` (default, the rule) / `off` (one-CTA always) / `on` (the pair at any S; a failing predicate -- THD, cc, cluster, grouped heads -- declines by name). Same contract, workspace sizing and 5 launches as the one-CTA THD GQA chain; dQ accumulation unordered either way. Op-level field `dkv_accum` (both grouped THD bodies): `bf16_partials` (default: one bf16 partial per q head + the fp32 fold launch, a fixed summation order) / `fp32_reduce` (opt-in: fp32 accumulation across the q heads of a kv head in hardware order with one bf16 rounding at the output, four launches; a rounding change -- dK / dV are not bitwise reproducible across runs; declined by name on dense GQA, MHA and under `warp_roles="16w_fa4"`). Op-level fields `mask_form` (`fsel` default / `predicated`) and `warp_roles` (`16w` default / `16w_fa4`, an alternate role shape kept for follow-up work) select bitwise-identical dK / dV renderings of the pair body |
 | Left sliding window | ✅ dense MHA D64/D128, with or without top-left causal |
 | Bottom-right causal, dense padding mask, right-band widening | ❌ |
 | Deterministic request | ✅ dense MHA, via fixed-order recompute; ❌ THD / GQA / MQA |
@@ -475,8 +475,9 @@ uniform and the varlen ramps, every cell by more than the measurement band. **Pe
 class, clock, commit) and the 2K / 4K cells>`; cc 10.3 and the 2K / 4K cells are unmeasured and
 serve the one-CTA body until a row is added here. `test_sdpa_bwd_d128_cta_pair_heuristic.py`
 pins the constants, the selection table, the declines and the launch census per selection;
-`test_sdpa_bwd_d128_2cta_stail_sm100.py` / `test_sdpa_bwd_d128_2cta_sm100.py` cover the pair
-bodies' numerics, degenerate rows and renderings.
+`test_sdpa_bwd_d128_2cta_stail_sm100.py` / `test_sdpa_bwd_d128_2cta_stail_xfa4_sm100.py` cover the
+pair body's numerics, degenerate rows and renderings; `test_sdpa_bwd_d128_dkv_accum_sm100.py` the
+`dkv_accum` field on both bodies (fp64 ladder, launch census, the dQ twin).
 
 The MXFP8 backward is a **two-kernel chain with a scale-factor repack in
 front**: the seven F8_128x4 scale tensors are repacked into the kernels'

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The grouped THD d128 backward's typed op-level field ``dkv_accum`` (C2b): how the GQA group's dK / dV are accumulated.
+"""The grouped THD d128 backward's typed op-level field ``dkv_accum`` (fp32_reduce): how the GQA group's dK / dV are accumulated.
 
 ``"bf16_partials"`` (the default; the field unset renders BYTE-IDENTICALLY): the main kernel stores one bf16 dK / dV partial per Q head and
 the ``dkv_reduce_thd_origins`` fold launch sums the group in fp32 (five launches).  ``"fp32_reduce"``: a per-KV-head fp32 dK / dV workspace
@@ -227,7 +227,7 @@ def _code_lines(text):
 
 
 def test_dkv_accum_fp32_store_path_credits_the_ring_after_the_dv_reads():
-    """SOURCE assertion (the inspector's rows): the 1-CTA store path issues the dV slices, then ``tma_store_wait`` -> the ``dq_empty[i].arrive()``
+    """SOURCE assertion (the audit's rows): the 1-CTA store path issues the dV slices, then ``tma_store_wait`` -> the ``dq_empty[i].arrive()``
     releases BEFORE the dk_full wait (its bootstrapped ring carries the dK staging's WAR edge) and its epilogue's dK round waits them before it
     stores; the pair's rounds go through the NEW row ``dvk_stage_empty`` (commit -> drain -> arrive -> the dk_full wait; the epilogue waits it
     between dv_full and dk_full) and never touch the pre-armed dq_empty ring; the pair's new row is initialised only under the field."""

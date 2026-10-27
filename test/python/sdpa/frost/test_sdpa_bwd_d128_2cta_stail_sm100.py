@@ -1,35 +1,16 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-"""BF16 grouped THD d128 backward on the cta_group::2 datapath, ARM (ii): the SECOND pair body ``bprop_d128_accum_grouped_2cta_stail_f16.py``
-(typed adapter field ``tmem_map = "s_tail"``: the dQ half-row image in S^T's dead tail, FAv4's rotated leader order ``fa4`` -- or ``fa4b`` =
-dQ(t-1) issued after dV(t), the exchange-cover order of code-writer step 6 on the SAME barrier table (``pair_mma_order``) -- the dedicated sDQ
-ring, 34 barriers).  The first body (``tmem_map`` unset = "dp_tail") is UNTOUCHED and stays pinned by ``test_sdpa_bwd_d128_2cta_sm100.py``.
+"""L0 tests of the d128 grouped THD cta_group::2 pair body (``bprop_d128_accum_grouped_2cta_stail_f16``: the dQ half-row image in S^T's dead
+tail, FAv4's rotated leader order, the dedicated sDQ ring, 35 barriers).
 
-RED-first: the GPU rows below were committed with the body's first host trace-compile, before it ran; every one is the grouped suite's
-independent FP64 gate (``check_case``: per-sequence atol / rtol + cosine, storage canaries, exact zeros for empty attention), dQ / dK / dV apart.
-
-Rows: the first body's matrix (uniform pairs, GQA 8, a varlen ramp, non-causal, the suite's degenerate THD row, a half-dead pair, pair tail 300),
-all-empty, the P14 rows of the barrier-inspector's ARM (ii) table (n_q == 1 with more pairs than SMs; a half-dead last pair; a zero-trip MIX of
-N = 1 / 2 / 3 / 4 / 6 / 8 and dead blocks), the launch census (the stail MAIN kernel), the TMEM maps' BITWISE dK / dV twin (the same
-accumulation chain per GEMM on both bodies), the load-form / knob bitwise twins on this body, the typed field tests (tmem_map, the order
-and probe domains PER MAP), the host renders (census + md5 record; the first body's record unchanged through this chain), the
-deterministic-hang topologies of the inspector's section 8 as SOURCE assertions (RED 3: dp_empty at the first body's site; RED 4: the dS
-gates on ready_state; RED 5: the unguarded lookahead wait; D4: the ring release cadence), and the pair-skew detectors (the four carried
-levers + the two NEW ones, SOFTMAX_S_READ / EPILOGUE_DQ_READOUT, in the skew module's fresh-process watchdog form; the C2b arm
-``dkv_accum = "fp32_reduce"`` as a twin row on the two levers that reach its staging seams, ``_DKV_ACCUM_SEAM_ROWS``).
-
-Day 3 (code-writer 2026-10-27 on optimizer 07:45 rank 0 + barrier-inspector 08:01): the three s_tail-only probes `exchange_off` (D8s, the
-safe exchange ceiling: the ship skipped, the arm with 0 tx bytes, every wait kept), `stats_one_chunk` (D10) and `sdq_sts_off` (D9) with their
-PTX census deltas from the config; `ds_gates_off` (D8) RETIRED on this map (declined by name: it faulted); the SOURCE assertion that D8s
-keeps every wait and arrive and only fakes the bytes; the D8s-under-leader-skew child (the mechanism's repro pair: D8 faulted there, D8s must
-stay clean); the STAMPS lever `debug_clk` (typed bool; the render differs by the %clock64 reads only, the default stays byte-identical) and
-its GPU accounting row (every role accumulates exactly the barriers it waits on; dK / dV bitwise vs the default; the dump's record layout).
-
-Lever L5 rows (code-writer D, 2026-10-27; the typed field ``mask_form``): the per-map typed domain and the kernel codes, the EXACTNESS of the
-interior-tile predicate `tile_may_mask` against the per-cell mask on host ints (the bitwise claim's construction), the three forms' host renders
-(fsel = the default rendering byte-identical; predicated / diag_mask_off under the SAME mbarrier census and setmaxnreg split with the designed selp /
-keep-word / branch deltas), and the GPU twin: dQ / dK / dV BITWISE between fsel and predicated on the cells that exercise the diagonal, the THD
-edges (S % 256 != 0, a ramp with a sequence shorter than one tile and an empty one, all-empty, the zero-trip mix) and the uniform case.
+Rows: the THD matrix (uniform pairs, GQA 8, a varlen ramp, non-causal, the suite's degenerate THD row, a half-dead pair, pair tail 300),
+all-empty, the P14 rows (n_q == 1 with more pairs than SMs; a half-dead last pair; a zero-trip MIX of N = 1 / 2 / 3 / 4 / 6 / 8 and dead
+blocks), the launch census (the pair MAIN kernel), the typed field tests (the probe domain, the STAMPS lever, the mask form), the host renders
+(census + md5 record; every probe's purity delta), the deterministic-hang topologies as SOURCE assertions (RED 3: dp_empty after the dQ
+readout; RED 4: the dS gates on ready_state; RED 5: an unguarded lookahead wait; D4: the ring release cadence), the pair-skew detectors
+(the four base levers + SOFTMAX_S_READ / EPILOGUE_DQ_READOUT, in the fresh-process watchdog form; the fp32_reduce arm on the two seam levers),
+the probes' launch rows, the exchange_off-under-leader-skew child (the mechanism's repro pair), the STAMPS dump accounting row, and the
+mask-form rows (the typed domain and the kernel codes, the EXACTNESS of `tile_may_mask` against the per-cell mask on host ints, the three
+renderings' census, the fsel / predicated BITWISE twins on dK / dV (dQ bitwise on the order-free cells, by the fp64 gate beyond)).
+Budget: the skew rows and the probe-skew child name ``skew_module`` (every row is a fresh child = cold import + JIT).
 """
 
 import os
@@ -49,7 +30,7 @@ from frost_test_utils import requires_dsl
 pytestmark = [pytest.mark.L0, requires_dsl]
 
 _MASK_FORMS = ("fsel", "predicated", "diag_mask_off")  # None = the default "fsel" (the keep-word mask selected on every tile)
-# The MASK FORM census (L5; rendered beside the module census): the per-cell selects of the keep-word mask (arith.select -> selp.f32: the body's
+# The MASK FORM census (the mask-form lever; rendered beside the module census): the per-cell selects of the keep-word mask (arith.select -> selp.f32: the body's
 # CFG.MASK_SELECTS_PER_LANE_PER_TILE = 64 plus two others), the keep-word upper-edge shifts (keep_below_word -> shr.u32: CFG.MASK_WORDS_PER_LANE_PER_TILE
 # = 2 of the body's), the branches (the predicated form adds ONE CTA-uniform `if mask_tile:` per q quarter = CFG.QUARTERS_PER_GROUP).
 _MASK_CENSUS = {"selp_f32": r"selp\.f32", "shr_u32": r"shr\.u32", "bra": r"\bbra(\.uni)?\s"}
@@ -106,10 +87,16 @@ def _probe_census_delta(probe, c, default):
     """What each probe removes from the DEFAULT rendering's census and nothing else (the arrive / try_wait / bar.warp.sync / tcgen05.fence counts
     are identical by construction: a probe moves no barrier row); the counts come from the config, never a literal."""
     return {
-        "dq_reduce_add_off": {"reduce_add": 0},  # D2-pair: the four reduce-add ISSUES (the per-round dq_empty arrives stay)
-        "exchange_off": {"dsmem_ship": 0, "mapa": default["mapa"] - 2},  # D8s: the ONE bulk copy + its two mapa (dst pointer, peer mbar); the arm's tx operand
-        "stats_one_chunk": {"lds_v4_b32": default["lds_v4_b32"] - c.DIAG_STATS_LDS_REMOVED_PER_LANE},  # D10: 28 of the 32 stats LDS.128
-        "sdq_sts_off": {"sts_dq_v2_b64": 0, "fence_proxy_async": default["fence_proxy_async"] - c.DQ_ROUNDS - 1},  # D9: the 3 _dq_round STS sites + fences
+        "dq_reduce_add_off": {"reduce_add": 0},  # dq_reduce_add_off: the four reduce-add ISSUES (the per-round dq_empty arrives stay)
+        "exchange_off": {
+            "dsmem_ship": 0,
+            "mapa": default["mapa"] - 2,
+        },  # exchange_off: the ONE bulk copy + its two mapa (dst pointer, peer mbar); the arm's tx operand
+        "stats_one_chunk": {"lds_v4_b32": default["lds_v4_b32"] - c.DIAG_STATS_LDS_REMOVED_PER_LANE},  # stats_one_chunk: 28 of the 32 stats LDS.128
+        "sdq_sts_off": {
+            "sts_dq_v2_b64": 0,
+            "fence_proxy_async": default["fence_proxy_async"] - c.DQ_ROUNDS - 1,
+        },  # sdq_sts_off: the 3 _dq_round STS sites + fences
     }[probe]
 
 
@@ -247,7 +234,7 @@ def test_2cta_stail_config_is_the_truth():
 def test_2cta_stail_fields_are_typed():
     """The typed fields decline BY NAME: ``diag_2cta`` resolves the four probes of the code space and nothing else (two probes of an earlier pair
     body are outside the domain); ``debug_clk`` is a bool (False by default); the adapter readers prefix the engine name; the record defaults are
-    None / False; the pruned perf knobs of the measurement campaign are not fields of the adapter (one body, one order, one load form)."""
+    None / False; the pruned perf knobs of the measurement measurement series are not fields of the adapter (one body, one order, one load form)."""
     from types import SimpleNamespace
 
     from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta as base
@@ -312,7 +299,7 @@ def test_2cta_stail_mask_form_is_typed():
 
 
 def test_2cta_stail_tile_mask_predicate_is_exact_against_the_per_cell_mask():
-    """Lever L5's interior-tile skip is bitwise ONLY if `tile_may_mask` is never FALSE on a tile that holds a masked cell (kernel header section 7).
+    """Lever the mask-form lever's interior-tile skip is bitwise ONLY if `tile_may_mask` is never FALSE on a tile that holds a masked cell (kernel header section 7).
     The kernel's own plain-Python helper runs here on host ints against the per-cell mask _p_values applies -- keep column c of the lane with key k iff
     c >= k under causal and c < (seq_q if k < seq_k else 0) -- over EVERY cell of every (pair, rank, q tile) the roles visit (lo = 2 pair under causal,
     hi = ceil(seq_q / N)) on a grid of sequence lengths covering the THD edges (empty, shorter than one tile, partial tiles on both axes, exact
@@ -361,7 +348,7 @@ def _record_md5(path, body_token):
 
 
 def test_2cta_stail_host_renders_for_sm_100a_and_matches_its_record(tmp_path):
-    """Host trace-compile of the chain with every field unset (no device): the body's PTX census is the design (header section 5 / 11), no local
+    """Host trace-compile of the chain with every field unset (no device): the body's PTX census is the header's (sections 5 / 11), no local
     memory, no nanosleep, the 144 / 144 / 80 register split; the md5 matches the committed record at this geometry (skips, never widens, on
     another DSL build)."""
     from cudnn.frost.buffers import cutedsl_state
@@ -459,9 +446,9 @@ def test_2cta_stail_host_renders_debug_clk_for_sm_100a(tmp_path):
     assert md5_off == want or dsl, "debug_clk=False renders the record's md5 (a DSL build difference is a skip, not a widen)"
 
 
-# ------------------------------------------------------------------------------------------------------------ host: the inspector's deterministic-hang topologies as SOURCE assertions
+# ------------------------------------------------------------------------------------------------------------ host: the audit's deterministic-hang topologies as SOURCE assertions
 def test_2cta_stail_host_renders_mask_forms_for_sm_100a(tmp_path):
-    """Lever L5's three mask forms on this body (header section 11): "fsel" named explicitly IS the default rendering (the record's md5); "predicated"
+    """Lever the mask-form lever's three mask forms on this body (header section 11): "fsel" named explicitly IS the default rendering (the record's md5); "predicated"
     renders a DIFFERENT PTX under the SAME mbarrier census (no wait, arrive or fence moves), the same setmaxnreg split, the SAME number of per-cell
     selects and keep-word shifts (the mask body is kept, inside the branch) and exactly CFG.QUARTERS_PER_GROUP more branches (one CTA-uniform
     `if mask_tile:` per q quarter); "diag_mask_off" drops exactly CFG.MASK_SELECTS_PER_LANE_PER_TILE selects and CFG.MASK_WORDS_PER_LANE_PER_TILE
@@ -589,11 +576,11 @@ def test_2cta_stail_exchange_off_keeps_every_wait_and_fakes_the_bytes():
     assert arms == [ln for ln in arms if "n_bytes=xchg_tx, pred=ship_pred" in ln] and len(arms) == 1, arms
     assert any(
         ln.strip() == "xchg_tx = CFG.DIAG_EXCHANGE_OFF_TX if cutlass.const_expr(diag_2cta_code == DIAG_EXCHANGE_OFF) else CFG.XCHG_TX" for ln in epi
-    ), "the arm's byte count is the config-selected constant (0 under D8s)"
+    ), "the arm's byte count is the config-selected constant (0 under exchange_off)"
     guard = [i for i, ln in enumerate(epi) if ln.split("#")[0].strip() == "if cutlass.const_expr(not exchange_off):"]
     assert len(guard) == 1 and "_ship_xchg(slab, bars, rank, ship_pred)" in epi[guard[0] + 1], epi[guard[0] : guard[0] + 2]
     depth = len(epi[guard[0]]) - len(epi[guard[0]].lstrip())
-    assert len(epi[guard[0] + 2]) - len(epi[guard[0] + 2].lstrip()) <= depth, "only the ship sits under the D8s guard"
+    assert len(epi[guard[0] + 2]) - len(epi[guard[0] + 2].lstrip()) <= depth, "only the ship sits under the exchange_off guard"
     for token in (
         "_store_words(slab, CFG.XCHG",
         "named_barrier_fence(CFG.XCHG_BARRIER",
@@ -678,7 +665,7 @@ def test_2cta_stail_persistent_reuse_more_pairs_than_sms():
 
 
 def test_2cta_stail_zero_trip_mix():
-    """The barrier-inspector's N-walk as one case: seq_q < seq_k under causal makes the kv blocks past the last q tile zero-trip, so one launch runs
+    """The the barrier audit N-walk as one case: seq_q < seq_k under causal makes the kv blocks past the last q tile zero-trip, so one launch runs
     items with N = 3, 1 and 0 (seq_q 300 / seq_k 2000), N = 1 and 0 (128 / 700), N = 8, 6, 4, 2 (1000 / 1000): every s_tail_empty wait-site guard
     (prologue always, lookahead iff qtile > lo, tail iff hi - 1 > lo) and the pending-completion carry across zero-trip items are exercised."""
     _require_2cta()
@@ -763,7 +750,7 @@ def test_2cta_stail_mask_forms_agree_bitwise(spec):
         assert torch.equal(grads["fsel"][role].view(torch.int16), grads["predicated"][role].view(torch.int16)), f"{role}: fsel vs predicated differ bitwise"
 
 
-# ------------------------------------------------------------------------------------------------------------ GPU: the day-3 probes + the STAMPS lever
+# ------------------------------------------------------------------------------------------------------------ GPU: the the later probes + the STAMPS lever
 def _expected_tile_visits(case, hq):
     """Tile visits per launch over BOTH CTAs of every pair (header section 7): per sequence, pair p (256 kv rows) walks q tiles [lo, hi) with lo =
     2 p under causal (0 otherwise) and hi = ceil(seq_q / 128); a pair past seq_k is dead (0); x the q heads x the 2 CTAs."""
@@ -842,7 +829,7 @@ def test_2cta_stail_debug_clk_dump_accounts_the_waits():
 @pytest.mark.parametrize("probe", _PROBES)
 def test_2cta_stail_probes_launch_and_return(probe):
     """Each DIAGNOSTIC probe of this map builds, launches and returns (no fault, no hang: the probes delete bytes / a transfer, never a wait); the
-    output is WRONG BY DESIGN and is NOT checked here -- `--validate` refuses them by name in the driver.  D8s is the SAFE form (every wait kept)."""
+    output is WRONG BY DESIGN and is NOT checked here -- `--validate` refuses them by name in the driver.  exchange_off is the SAFE form (every wait kept)."""
     _require_2cta()
     case = make_case((256, 512), (256, 512), hq=4, hkv=2, thd=True, dtype=torch.bfloat16, causal=True, stats_layout="TH1")
     api = make_adapter_2cta_stail(case, diag_2cta=probe)
@@ -955,7 +942,7 @@ SITES = dict(
         site="_dq_issue: between the three dS-gate waits and the dQ MMA issue (the gates are consumed, the issue -- hence dq_done -- is held)",
         delay_us=300,
         isolates="dq_done's waiters as the ONLY gate of the sDS writers: under warp_roles=16w_fa4 both softmaxes' dS(t) STS wait their `dq_war` "
-        "observation of dq_done(t-1) ALONE (X-FA4 X7; barrier-inspector x-fa4 table section 12 item 12); under 16w the epilogue's dq_done(t-1) "
+        "observation of dq_done(t-1) ALONE (the alternate role shape X7; the barrier audit x-fa4 table section 12 item 12); under 16w the epilogue's dq_done(t-1) "
         "readout wait before its dS(t) STS (the same WAR by program order)",
         red="the softmax `dq_war` wait removed (16w_fa4): the dS(t) STS lands under dQ(t-1)'s async A read of sDS own + recv -> dQ rows wrong, dK / dV green",
         green="fp64 gate on dQ / dK / dV, eager x2 + capture / replay x4, no hang",
