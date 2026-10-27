@@ -37,7 +37,45 @@ def _clone_with_slack(value, fill):
     return clone
 
 
-def _check(bufs, *, page=0, causal=False, bottom_right=False, window=None, output_check=None):
+def _half_p_output_bound(parts, v, input_dtype, descale_v):
+    """Bound HALF + Stats output error from the independent FP64 reference.
+
+    The f16 input conversion and approximate exp2 can cross FP8 P midpoints.
+    PTX specifies relative error <= 2**-9.9 for ex2.approx.f16(x2):
+    https://docs.nvidia.com/cuda/parallel-thread-execution/#half-precision-floating-point-instructions-ex2
+    Propagate the possible P-code changes through |V| and the online-softmax
+    gains. This is an input-dependent bound, not a fitted tensor coordinate or
+    tolerance; packed/unpacked bitwise checks independently protect row mapping.
+    This helper is for the unsplit D256/D512 register-sum, Stats-present path.
+    """
+    import torch
+    from sdpa.fp16_ref import _pv
+
+    p = parts["p_scaled"]
+    shifted = torch.log2(p).to(torch.float16)
+    # Adjacent f16 arguments cover rounding of the f32 QK scale/shift.
+    lo = torch.nextafter(shifted, torch.full_like(shifted, -torch.inf)).double()
+    hi = torch.nextafter(shifted, torch.full_like(shifted, torch.inf)).double()
+    relative = 2.0**-9.9  # PTX ISA, ex2.approx.f16(x2) maximum relative error
+    lower = (torch.exp2(lo) * (1 - relative)).to(input_dtype).double()
+    upper = (torch.exp2(hi) * (1 + relative)).to(input_dtype).double()
+    nominal = p.to(input_dtype).double()
+    delta = torch.maximum((lower - nominal).abs(), (upper - nominal).abs())
+    delta = delta.masked_fill(~parts["valid"], 0)
+    return _pv(delta * parts["gain"] / 16.0, v.double().abs(), v.shape[1]) * descale_v
+
+
+def _check_half_fp8_o(output, reference, output_dtype, input_key, bound):
+    """Retain the ordinary residual bound after accounting for HALF P rounding."""
+    atol = 0.04
+    if output_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        floor = (reference - reference.to(output_dtype).float()).abs().max().item()
+        atol = max(atol, 3.0 * floor)
+    error = (output.float() - reference).abs()
+    assert torch.all(error <= bound + atol), f"HALF P-bound exceeded: max excess={(error - bound).max().item():.6f} > {atol} ({input_key})"
+
+
+def _check(bufs, *, page=0, causal=False, bottom_right=False, window=None, output_check=None, softmax_f16=False):
     from sdpa.fp8_ref import compute_ref
     import test_sdpa_fwd_paged_sm100 as paged
 
@@ -56,7 +94,7 @@ def _check(bufs, *, page=0, causal=False, bottom_right=False, window=None, outpu
         padding = (bufs["seq_q"].view(b), lens)
     # D256 casts P without D128's extra 2**4 factor, even for a narrow Q/K
     # head paired with wide V. The FP64 oracle follows that native pipeline.
-    ref, stats, _ = compute_ref(
+    result = compute_ref(
         q.transpose(1, 2),
         k.transpose(1, 2),
         v.transpose(1, 2),
@@ -77,10 +115,17 @@ def _check(bufs, *, page=0, causal=False, bottom_right=False, window=None, outpu
         dtype=torch.float64,
         quantize_o=False,
         sink_in_max=False,
+        return_intermediates=softmax_f16,
     )
+    ref, stats, _ = result[:3]
     ref = ref.transpose(1, 2)
     in_key = "e4m3" if q.dtype == torch.float8_e4m3fn else "e5m2"
-    output_result = (output_check or paged._check_fp8_o)(bufs["o"], ref * bufs["scale_o"], bufs["o"].dtype, in_key)
+    if softmax_f16:
+        assert output_check is None
+        bound = _half_p_output_bound(result[3], v, q.dtype, bufs["descale_v"].item()) * bufs["scale_o"].abs()
+        output_result = _check_half_fp8_o(bufs["o"], ref * bufs["scale_o"], bufs["o"].dtype, in_key, bound)
+    else:
+        output_result = (output_check or paged._check_fp8_o)(bufs["o"], ref * bufs["scale_o"], bufs["o"].dtype, in_key)
     # Match the existing prepared-dense Stats bound; paged cases retain their
     # existing absolute bound.
     torch.testing.assert_close(bufs["lse"].reshape(b, h, sq), stats.reshape(b, h, sq), atol=0.01, rtol=0 if page else 0.01)
