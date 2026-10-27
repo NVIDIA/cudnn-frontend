@@ -46,7 +46,7 @@ from .test_la import (
     run_summary_bwd,
     thd_tensors,
     state_pool,
-    waive_declined,
+    waive_engine_less,
 )
 
 pytestmark = [pytest.mark.L0, pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")]
@@ -212,7 +212,7 @@ def test_steep_summary_matches_reference(backend, K, output_transition):
     case = steep_gate(make_case("gdn2", torch.bfloat16, K=K, seq_lens=[96, 0, 32, 160]), "alternating")
     state = random_state(case)
     _, expected = reference(case, initial_state=state)
-    with waive_declined("gdn2 frost summary engine"):
+    with waive_engine_less("gdn2 frost summary engine"):
         final_state, transition = torch.ops.cudnn.gated_delta_net_v2_summary(
             *op_args(case)[1:],
             initial_state=state,
@@ -513,7 +513,7 @@ def test_steep_cuda_graph_gate_transitions(backend, built_plans, dtype, K, shape
 
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side), waive_declined("gdn2 frost engine"):
+    with torch.cuda.stream(side), waive_engine_less("gdn2 frost engine"):
         for _ in range(3):
             launch()
     torch.cuda.current_stream().wait_stream(side)
