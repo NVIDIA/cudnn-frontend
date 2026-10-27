@@ -2985,7 +2985,7 @@ def test_paged_mxfp8_independent_pool_layouts(hnd, dims):
         (3, 8, 8, False, True, 256, "e5m2", True, None),
     ],
 )
-def test_paged_graph_fp8_sink(d, in_key, s_q, H, KH, pack, hnd, P, out_key, stats, causal):
+def test_paged_graph_fp8_sink(d, in_key, s_q, H, KH, pack, hnd, P, out_key, stats, causal, split=1):
     """Sink epilogue composes with paged loading, including trimmed and keyless Q.
 
     Both FP8 flavors, independent K/V layouts, packed/unpacked GQA, MHA and
@@ -3007,7 +3007,7 @@ def test_paged_graph_fp8_sink(d, in_key, s_q, H, KH, pack, hnd, P, out_key, stat
         s_q=s_q,
         causal=causal,
         window_left=128,
-        explicit_split=1,
+        explicit_split=split,
         explicit_pack=pack,
         v_hnd=not hnd,
         sinks=sinks,
@@ -3017,7 +3017,7 @@ def test_paged_graph_fp8_sink(d, in_key, s_q, H, KH, pack, hnd, P, out_key, stat
 
 @pytest.mark.L0
 @pytest.mark.parametrize("d,cga", [(64, 1), (128, 1), (128, 2), (256, 1)])
-def test_paged_graph_fp8_sink_rebind_replay(d, cga):
+def test_paged_graph_fp8_sink_rebind_replay(d, cga, split=1):
     """A retained graph reads changed lengths, sinks and table contents on device.
 
     Rebinding the graph uses new allocations; poisoning O/Stats/Amax before
@@ -3039,7 +3039,7 @@ def test_paged_graph_fp8_sink_rebind_replay(d, cga):
         s_q=s_q,
         causal="bottom_right",
         window_left=128,
-        explicit_split=1,
+        explicit_split=split,
         explicit_cga=cga,
         sinks=sinks,
         return_case=True,
