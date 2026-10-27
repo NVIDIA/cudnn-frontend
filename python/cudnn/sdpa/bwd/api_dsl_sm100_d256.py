@@ -24,6 +24,12 @@ EXPLICITLY here -- ``api_dsl_sm107._stage3_cgrp_tile_mn`` keys on the Rubin line
 stage-3 granularity comes from the 2x2 config's ``kv_pad_rows_2x2`` (the pair, NOT the 128-row block). D192 uses a
 single-CTA (128, 192) tile; D256 retains the (256, 256) pair. Both M tiles fit within one workspace write pair.
 
+Native D192 folds dK into the main kernel, alongside dV; only dQ uses stage 3.
+The main kernel reuses dS in shared memory for dK and loads Q through its
+transposed tensor map on the existing store warp. THD uses the same fusion,
+with independent per-port origins and caller-owned descriptor scratch reused
+by dQ after main completes. The D256 chain retains both stage-3 GEMMs.
+
 Codegen: ``--gpu-arch sm_{sm}a`` of the device the plan is built for (100 / 103; ``prepared_host._check_target`` admits
 SM100-SM119 for the half chain), descriptor version 0.
 """
@@ -101,6 +107,14 @@ class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
             ]
         return plan
 
+    def _scratch_shapes(self):
+        plan = super()._scratch_shapes()
+        if self.thd and (self.head_dim_qk, self.head_dim_v) == (192, 128):
+            # Main: one compact/dead Q map, B physical Q maps and B dK maps.
+            # Stage-3 dQ reuses these words only after main completes.
+            return [(name, ((2 * self.batch_size + 1) * 16,), dtype) if name == "desc_words" else (name, shape, dtype) for name, shape, dtype in plan]
+        return plan
+
     def check_support(self) -> bool:
         """This row's own declines first (what the 2x2 body has not run), then the half row's backstops."""
         self._value_error_if(
@@ -117,7 +131,7 @@ class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
     def _template_params(self):
         params = super()._template_params()
         if (self.head_dim_qk, self.head_dim_v) == (192, 128):
-            return _cfg2x2.TemplateParams2x2(**asdict(params), head_dim_qk=192, head_dim_v=128)
+            return _cfg2x2.TemplateParams2x2(**asdict(params), head_dim_qk=192, head_dim_v=128, fuse_dk=True)
         return params
 
     def _kernel_file(self) -> str:
