@@ -531,7 +531,9 @@ class Capabilities:
     # (append-only contract above).
     pack_gqa_requires_divisible: bool = True
     # Native flavors with dense Q only. Unlike thd_d_shapes, this preserves
-    # the THD envelope of every other flavor on the row. Append-only.
+    # the THD envelope of every other flavor on the row. APPENDED after
+    # pack_gqa_requires_divisible to preserve the positional Capabilities
+    # constructor contract.
     thd_excluded_d_shapes: frozenset[tuple[int, int]] = frozenset()
 
 
