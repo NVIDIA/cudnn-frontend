@@ -1,10 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Host-only pins of what test/python/conftest.py does for SEVERAL pytest processes on one tree or one GPU (test/AGENTS.md):
-the per-run FROST routing directory (no two runs share one -- a session a test starts with a worker's environment included; the
-session-start sweep judges a pid only on the host that minted it, so another host's live run on a shared tree is never swept) and the
-shared-GPU switch of the memory gate."""
+"""Parallel pytest routing, memory cleanup and worker isolation contracts."""
 
 import os
 import re
@@ -263,6 +260,40 @@ def test_the_sweep_never_removes_this_runs_own_directory(top_conftest, monkeypat
 
 
 # ---- the memory gate's shared-GPU switch
+
+
+def test_empty_cache_waits_for_other_devices_default_stream(top_conftest, monkeypatch):
+    import torch
+
+    if torch.cuda.device_count() < 2 or not hasattr(torch.cuda, "_sleep"):
+        pytest.skip("needs two CUDA devices and torch.cuda._sleep")
+    current = torch.cuda.current_device()
+    other = (current + 1) % torch.cuda.device_count()
+    pending = torch.cuda.Event()
+    empty_cache = torch.cuda.empty_cache
+
+    def checked_empty_cache():
+        assert pending.query(), "cache cleanup reached another device before its writes finished"
+        empty_cache()
+
+    try:
+        with torch.cuda.device(other), torch.cuda.stream(torch.cuda.default_stream(other)):
+            buffer = torch.zeros(1, device="cuda")
+            torch.cuda._sleep(1)
+            pending.record()
+            pending.synchronize()
+            torch.cuda._sleep(2_000_000_000)
+            buffer.zero_()
+            pending.record()
+            del buffer
+        assert not pending.query(), "the other device must still have pending work"
+        with monkeypatch.context() as patch:
+            patch.setattr(torch.cuda, "empty_cache", checked_empty_cache)
+            top_conftest._torch_empty_cache()
+        assert torch.cuda.current_device() == current
+    finally:
+        # Drain the write even when the guard fails, before fixture cleanup.
+        torch.cuda.synchronize(other)
 
 
 def test_under_xdist_flips_with_the_shared_gpu_switch(top_conftest, monkeypatch):

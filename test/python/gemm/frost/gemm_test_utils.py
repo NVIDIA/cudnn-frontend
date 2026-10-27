@@ -114,9 +114,11 @@ class Plan:
     FROST engine's auto-select). Exposes chain / binding / block_scale /
     aux_names; callable with a variant pack."""
 
-    def __init__(self, graph, config=None, cta_group=None, force_stg_epi=False, swap_ab=False):
+    def __init__(self, graph, config=None, cta_group=None, force_stg_epi=False, swap_ab=False, padded_e2m1=False):
         self.g = graph
         kw = {}
+        if padded_e2m1:
+            kw["padded_e2m1"] = True
         if swap_ab:
             config = replace(config or DEFAULT_CONFIG, swap_ab=True)
         if config is not None:

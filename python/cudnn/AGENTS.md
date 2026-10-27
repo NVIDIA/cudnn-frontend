@@ -241,6 +241,8 @@ not become a compile key.
   without clearing caches and replays captures from each after changing inputs.
   Use an explicit per-device capture stream in that detector: Torch's implicit
   `graph.default_capture_stream` can retain the first device's stream.
+  `test_quant_cache_keeps_each_devices_workspace` checks the grouped quant
+  cache before a foreign workspace can reach a CUDA launch.
 - **Issue #604 is closed**: SM80 THD compiles use symbolic packed extents.
   The prepared backward host takes Int64 capacities and launch bounds at
   runtime, including the compact Stats head pitch and deterministic-counter

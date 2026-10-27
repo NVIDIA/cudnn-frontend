@@ -584,6 +584,37 @@ def exit_slot_table_body(b_t: cutlass.Constexpr[int], tidx, n_threads: cutlass.C
         row = row + cutlass.Int32(n_threads)
 
 
+@cute.jit
+def exit_base_table_body(
+    b_t: cutlass.Constexpr[int],
+    tidx,
+    n_threads: cutlass.Constexpr[int],
+    heads_out: cutlass.Int32,
+    n_pieces: cutlass.Int32,
+    mCu,
+    mCuPieces,
+    mMainRows,
+    mExitBase,
+):
+    """Every thread of one CTA fills ``mExitBase`` [pieces]: the exit slot of piece ``p``'s first chunk,
+    ``cu[b] // b_t + 2 b`` plus the piece's chunk offset from the start of its sequence ``b``; ``mMainRows``
+    [num_seqs + 1] holds each sequence's first main-table row, ``heads_out`` rows per filled slot."""
+    p = cutlass.Int32(tidx)
+    while p < n_pieces:
+        row = p * heads_out
+        lo = cutlass.Int32(0)
+        hi = cutlass.Int32(mMainRows.shape[0]) - cutlass.Int32(2)
+        while lo < hi:
+            mid = (lo + hi + cutlass.Int32(1)) >> cutlass.Int32(1)
+            if cutlass.Int32(mMainRows[mid]) <= row:
+                lo = mid
+            else:
+                hi = mid - cutlass.Int32(1)
+        start = cutlass.Int32(mCu[lo])
+        mExitBase[p] = start // cutlass.Int32(b_t) + cutlass.Int32(2) * lo + (cutlass.Int32(mCuPieces[p]) - start) // cutlass.Int32(b_t)
+        p = p + cutlass.Int32(n_threads)
+
+
 @cute.kernel
 def frost_mamba2_zgate_bwd(
     mDoOut: cute.Tensor,

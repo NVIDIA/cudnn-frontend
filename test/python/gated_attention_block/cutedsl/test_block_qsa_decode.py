@@ -812,7 +812,7 @@ class _CaseBase:
 
     def label(self):
         form = f"{'shared' if self.shared else 'per-row'}{'' if self.index_list_form is None else ' (declared)'}"
-        return f"[{self.geom.h_q}/{self.geom.h_kv} S_q={self.s_q} {form} p{self.page} {self.layout} {self.dtype} split={self.blk.decode_split_kv} gate={'fused' if self.fuse_gate else 'launch'} lse={self.return_lse} pdl={self.blk.use_pdl} lens={self.kv_lens}]"
+        return f"[{self.geom.h_q}/{self.geom.h_kv} S_q={self.s_q} {form} p{self.page} {self.layout} {self.dtype} split={self.blk.decode_split_kv} tile={self.blk.sparse_tile} gate={'fused' if self.fuse_gate else 'launch'} lse={self.return_lse} pdl={self.blk.use_pdl} lens={self.kv_lens}]"
 
     def check(self, out=None, ws=None, lse=None, *, what="out"):
         """The standard assertions: finite, no sentinel, dead rows exact, within the budget vs the oracle (out, the gated O slot, the
@@ -894,10 +894,13 @@ class _Case(_CaseBase):
         index_list_form=None,
         fuse_prepare=None,
         use_pdl=None,
+        sparse_tile_form=None,  # the sparse core's BODY knob (None = the block's "auto"; "lean" / "tcgen05" explicit)
+        sparse_sub_tiles_per_cta=None,  # the lean tile's k pin (with sparse_tile_form="lean")
     ):
         self.s_q, self.kv_lens, self.page, self.layout, self.dtype, self.top_k = int(s_q), [int(x) for x in kv_lens], page, layout, dtype, top_k
         self.fuse_prepare = fuse_prepare
         self.use_pdl = use_pdl
+        self.sparse_tile_form, self.sparse_sub_tiles_per_cta = sparse_tile_form, sparse_sub_tiles_per_cta
         self.block_lens_given, self.return_lse, self.fuse_gate, self.index_band = bool(block_lens), bool(return_lse), bool(fuse_gate), bool(index_band)
         # the list form: the S_q rule (one list per sequence up to the shared-list cap), or QsaSpec.index_list_form as declared
         self.index_list_form = index_list_form
@@ -1013,6 +1016,10 @@ class _Case(_CaseBase):
         )
         if fuse_prepare is not None:
             kw["fuse_prepare"] = fuse_prepare
+        if sparse_tile_form is not None:
+            kw["sparse_tile_form"] = sparse_tile_form
+        if sparse_sub_tiles_per_cta is not None:
+            kw["sparse_sub_tiles_per_cta"] = sparse_sub_tiles_per_cta
         self.blk_kw = kw
         self.out = torch.empty(B, s_q, d_model, dtype=dtype, device=_DEV)
         self.lse = torch.empty(B, h_q, s_q, dtype=torch.float32, device=_DEV) if return_lse else None
@@ -1227,13 +1234,21 @@ def _written(pool):
 
 
 @requires_rubin
-def test_capture_of_the_first_execute_replays_bitwise_and_takes_new_lengths_tables_lists_slots_and_inputs():
+@pytest.mark.parametrize("tile", [None, "lean"], ids=["auto-tcgen05-split4", "lean-split65"])
+def test_capture_of_the_first_execute_replays_bitwise_and_takes_new_lengths_tables_lists_slots_and_inputs(tile):
     """The serving stack's defaults: the FIRST execute of a fresh declaration captured on a NEW stream with no eager warm-up under
     ``set_sync_debug_mode("error")`` (no host sync in the path: lengths, tables, lists and slots are device data); the capture
     launches nothing, the replay is BITWISE a fresh eager run; new ``kv_lens`` / ``block_table`` / ``block_ids`` / ``block_lens`` /
     ``slot_mapping`` / ``h`` / RoPE rows through the captured tensors replay bitwise the eager run over them (a split plan: the
     partials in the captured workspace)."""
-    case = _Case(GEOM_SMALL, 2, (300, 0, 1000, 77), page=16, seed=41, split=4, fuse_gate=True, return_lse=True)  # fresh: never executed
+    # the lean body (appended): the same shape of cell on the lean route at ONE row per sequence (this rendering's step width) -- its default
+    # split (65 at k 1; 4 is not a lean split), the same contract
+    split, s_q = (4, 2) if tile is None else (None, 1)
+    case = _Case(
+        GEOM_SMALL, s_q, (300, 0, 1000, 77), page=16, seed=41, split=split, fuse_gate=True, return_lse=True, sparse_tile_form=tile
+    )  # fresh: never executed
+    if tile is not None:
+        assert case.blk.sparse_tile_form == tile and case.blk.sparse_tile == "sparse_lean_d256_f16" and case.blk.decode_split_kv == 65
     case.blk.check_support()
     case.blk.compile()
     case.ws = torch.full((case.blk.get_workspace_size(),), 0x7F, dtype=torch.uint8, device=_DEV)
@@ -1266,7 +1281,9 @@ def test_capture_of_the_first_execute_replays_bitwise_and_takes_new_lengths_tabl
         ), "the replay of the captured first execute differs from the eager run"
         # a NEW step through the captured tensors: new lengths (one entry a token longer: its slot and its list move), a re-laid-out
         # table, new lists / counts / slots / h / RoPE rows -- the oracle of the new step through a sibling case over the same shapes
-        sib = _Case(GEOM_SMALL, 2, (301, 0, 1000, 77), page=16, seed=43, split=4, fuse_gate=True, return_lse=True, n_pages=case.n_pages)
+        sib = _Case(
+            GEOM_SMALL, s_q, (301, 0, 1000, 77), page=16, seed=43, split=split, fuse_gate=True, return_lse=True, n_pages=case.n_pages, sparse_tile_form=tile
+        )
         assert sib.block_table.shape == case.block_table.shape and sib.k_cache.shape == case.k_cache.shape
         case.k_cache.copy_(sib.k_cache)
         case.v_cache.copy_(sib.v_cache)
@@ -1636,8 +1653,9 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
         assert d.index_list_forms == ("per_row",) and d.index_list_form_default == "per_row" and d.pdl_stages == () and d.pdl_default is False
         assert set(_INDEXER_DECLINE_TOKENS) <= set(d.declines) and all(tok in d.declines[nm] for nm, tok in _INDEXER_DECLINE_TOKENS.items())
         assert "indexer_e4m3_cache" not in d.declines, "a served form has no decline row"
-        # the record's tail is append-only (a serving stack reads these by name; a new field goes after `fuse_prepare_default`)
-        assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-12:] == [
+        # the record's tail is append-only (a serving stack reads these by name; a new field goes after `device_cc`, the lean tile's rows
+        # being the last appended: `sparse_tiles` / `sparse_tile_lean_default` and the part the per-cell `sparse_tile(...)` reads)
+        assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-15:] == [
             "index_list_forms",
             "index_list_form_default",
             "index_sources",
@@ -1650,6 +1668,9 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
             "index_state_rows_extra",
             "index_page_sizes",
             "fuse_prepare_default",
+            "sparse_tiles",
+            "sparse_tile_lean_default",
+            "device_cc",
         ]
         assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=(10, 0)).decode.fuse_prepare_default is False  # an unmeasured part
         f16 = GatedAttentionBlockFwd.serving_envelope(geom, F16, _DEV, device_cc=_SM107).decode
@@ -1979,10 +2000,13 @@ class _IndexerCase(_CaseBase):
         outputs=True,
         lens_out=True,
         index_cache_dtype=None,
+        sparse_tile_form=None,  # the sparse core's BODY knob (None = the block's "auto"; "lean" / "tcgen05" explicit)
+        sparse_sub_tiles_per_cta=None,
     ):
         self.s_q, self.kv_lens, self.page, self.layout, self.dtype, self.top_k = int(s_q), [int(x) for x in kv_lens], page, layout, dtype, top_k
         self.block_lens_given, self.return_lse, self.fuse_gate, self.index_band = False, bool(return_lse), bool(fuse_gate), True
         self.index_list_form, self.shared, self.fuse_prepare = None, False, fuse_prepare
+        self.sparse_tile_form, self.sparse_sub_tiles_per_cta = sparse_tile_form, sparse_sub_tiles_per_cta
         self.slot_form, self.rope_tables_only, self.outputs, self.lens_out = bool(slot_form), bool(rope_tables_only), bool(outputs), bool(lens_out)
         # the indexer CACHE dtype (QsaSpec.index_cache_dtype): the paged compressed-key cache, ix_q and the prefix priming in it (e4m3 = the e4m3
         # indexer cache, 2026-10-21: the compress kernel's e4m3 store arm primes the prefix exactly as a prefill form's cast would); the ring bf16
@@ -2109,6 +2133,10 @@ class _IndexerCase(_CaseBase):
             index_state_slot_mapping_present=self.slot_form,
             rope_position_tables_only=self.rope_tables_only,
         )
+        if sparse_tile_form is not None:
+            kw["sparse_tile_form"] = sparse_tile_form
+        if sparse_sub_tiles_per_cta is not None:
+            kw["sparse_sub_tiles_per_cta"] = sparse_sub_tiles_per_cta
         self.blk_kw = kw
         self.out = torch.empty(B, s_q, d_model, dtype=dtype, device=_DEV)
         self.lse = torch.empty(B, h_q, s_q, dtype=torch.float32, device=_DEV) if return_lse else None
@@ -3234,3 +3262,524 @@ def test_detector_turns_red_when_the_sparse_core_launches_with_the_attribute_but
         monkeypatch.undo()
         retrace(mod.compile)  # the memo held the no-wait object under the shipped key
         compiled_cache.clear_memo()
+
+
+# ---------------------------------------------------------------------------
+# The sparse core's BODY knob (sparse_tile_form): the lean decode tile beside the tcgen05 core -- host pins and Rubin cells
+# ---------------------------------------------------------------------------
+
+_TILE_LEAN, _TILE_TCGEN05 = "sparse_lean_d256_f16", "sparse_d256_f16"
+
+
+def _lse_delta(a: torch.Tensor, b: torch.Tensor) -> float:
+    """max |a - b| over the LIVE rows of two LSE tensors, after pinning that the two bodies agree on WHICH rows are dead (-inf on both: a dead
+    entry's -inf minus -inf is NaN, not a difference)."""
+    dead_a, dead_b = torch.isinf(a) & (a < 0), torch.isinf(b) & (b < 0)
+    assert torch.equal(dead_a, dead_b), "the two bodies disagree on the dead rows"
+    live = ~dead_a
+    return float((a[live] - b[live]).abs().max()) if live.any() else 0.0
+
+
+def test_sparse_tile_form_declaration_facts_and_the_auto_pin(monkeypatch):
+    """The knob's declaration facts (host, no device): ``sparse_tile_form="auto"`` (the default) follows the placement rule on the measured
+    part (``heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS`` = cc 10.7 since the gate's table; the lean tile at B 1 x S_q 1 = 2 units, the bound
+    ``LEAN_SPARSE_MAX_UNITS`` = 4 inclusive: B 2 in, B 3 out, the S_q 4 shared list out (8 units); a pinned tcgen05
+    split keeps the core, a pinned lean split is honoured by the lean body, per-row lists past one row keep the core, the served rows are ONE
+    constant the rule reads -- ``LEAN_SPARSE_SERVED_MAX_S_Q`` --, an unmeasured part keeps the core) and the tcgen05 core everywhere with the
+    tuple patched EMPTY (the former function); the explicit ``"lean"`` declares the lean body -- the lean split (65 at the default k 1; a pinned
+    lean split SELECTS k: 33 -> 2, 17 -> 4; a pinned k picks the split: 4 -> 17), the stage's own readback (``_sdpa.tile_form`` /
+    ``sub_tiles_per_cta``) --, the explicit ``"tcgen05"`` the core with the fill rule's split; the dense QsaSpec block over its own K / V is the core's."""
+    from cudnn.gated_attention_block import api as _api
+    from cudnn.sdpa.fwd import heuristics as _H
+
+    assert _H.SPARSE_LEAN_TILE_DEFAULT_CCS == (_SM107,), "the AUTO pin: the measured part"
+    with _no_host_sync():
+        with pytest.MonkeyPatch.context() as mp:  # the pin EMPTY: the former function, the core on every part
+            mp.setattr(_H, "SPARSE_LEAN_TILE_DEFAULT_CCS", ())
+            auto, _ = _declare(GEOM_SMALL, 4, 1)
+            assert (auto.sparse_tile_form_requested, auto.sparse_tile_form, auto.sparse_tile, auto.sparse_sub_tiles_per_cta) == (
+                "auto",
+                "tcgen05",
+                _TILE_TCGEN05,
+                None,
+            )
+            assert auto._sdpa.tile_form == "tcgen05" and auto._sdpa.sub_tiles_per_cta is None and auto.sparse_sub_tiles_per_cta_requested is None
+        lean, _ = _declare(GEOM_SMALL, 4, 1, sparse_tile_form="lean")
+        assert (lean.sparse_tile_form, lean.sparse_tile, lean.decode_split_kv, lean.sparse_sub_tiles_per_cta) == ("lean", _TILE_LEAN, 65, 1)
+        assert lean._sdpa.tile_form == "lean" and lean._sdpa.sub_tiles_per_cta == 1 and lean._sdpa.split_kv == 65 and lean.gate_fused is False
+        assert lean.qsa_shared_list and lean._sdpa.list_per_sequence
+        s33, _ = _declare(GEOM_SMALL, 4, 1, sparse_tile_form="lean", decode_split_kv=33)
+        assert (s33.decode_split_kv, s33.sparse_sub_tiles_per_cta) == (33, 2)
+        k4, _ = _declare(GEOM_SMALL, 4, 1, sparse_tile_form="lean", sparse_sub_tiles_per_cta=4)
+        assert (k4.decode_split_kv, k4.sparse_sub_tiles_per_cta) == (17, 4) and k4.sparse_sub_tiles_per_cta_requested == 4
+        both, _ = _declare(GEOM_SMALL, 4, 1, sparse_tile_form="lean", sparse_sub_tiles_per_cta=2, decode_split_kv=33)
+        assert (both.decode_split_kv, both.sparse_sub_tiles_per_cta) == (33, 2)
+        tc, _ = _declare(GEOM_SMALL, 4, 1, sparse_tile_form="tcgen05")
+        assert tc.sparse_tile_form == "tcgen05" and tc.sparse_tile == _TILE_TCGEN05 and tc.decode_split_kv == auto.decode_split_kv
+        gated, _ = _declare(GEOM_SMALL, 4, 1, sparse_tile_form="lean", fuse_gate=True)
+        assert gated.gate_fused and gated._gate is None and gated._sdpa.fuse_gate  # the gate rides the combine under the lean split
+        # the per-row list at ONE row per sequence (the indexer's form, or index_list_form="per_row") is the shared list: the lean body serves it
+        per_row, _ = _declare(GEOM_SMALL, 4, 1, sparse_tile_form="lean", index_list_form="per_row")
+        assert per_row.sparse_tile == _TILE_LEAN and not per_row.qsa_shared_list and per_row.decode_split_kv == 65
+        # the step's rows 2..4 on the explicit lean body: the shared list (one list per sequence, every row of the step in one CTA), the lean
+        # split rule unchanged (65 at k 1; a pinned lean split selects k), the stage's readback
+        for s_q in (2, 3, 4):
+            rows, _ = _declare(GEOM_SMALL, 2, s_q, sparse_tile_form="lean")
+            assert (rows.sparse_tile_form, rows.sparse_tile, rows.decode_split_kv, rows.sparse_sub_tiles_per_cta) == ("lean", _TILE_LEAN, 65, 1), s_q
+            assert rows.qsa_shared_list and rows._sdpa.tile_form == "lean" and rows._sdpa.list_per_sequence and rows.seq_len == s_q
+        sq4_k2, _ = _declare(GEOM_SMALL, 1, 4, sparse_tile_form="lean", decode_split_kv=33)
+        assert (sq4_k2.decode_split_kv, sq4_k2.sparse_sub_tiles_per_cta, sq4_k2.sparse_tile) == (33, 2, _TILE_LEAN)
+        # AUTO behind the pin on the measured part (the device read patched so the reading is the same on any host): the placement rule
+        monkeypatch.setattr(_api, "_device_cc_of", lambda device: _SM107)
+        flipped, _ = _declare(GEOM_SMALL, 1, 1)  # 2 units: the lean tile
+        assert (flipped.sparse_tile_form, flipped.sparse_tile, flipped.decode_split_kv, flipped.sparse_sub_tiles_per_cta) == ("lean", _TILE_LEAN, 65, 1)
+        assert flipped.sparse_tile_form_requested == "auto" and flipped._sdpa.tile_form == "lean"
+        at_bound, _ = _declare(GEOM_SMALL, 2, 1)  # 4 units: inside (the bound is inclusive)
+        assert at_bound.sparse_tile == _TILE_LEAN
+        past, _ = _declare(GEOM_SMALL, 3, 1)  # 6 units: the tcgen05 core
+        assert past.sparse_tile == _TILE_TCGEN05 and past.sparse_tile_form == "tcgen05"
+        pinned, _ = _declare(GEOM_SMALL, 1, 1, decode_split_kv=16)  # a tcgen05 split keeps the core under AUTO (the pin is the stronger knob)
+        assert pinned.sparse_tile == _TILE_TCGEN05 and pinned.decode_split_kv == 16
+        pinned_lean, _ = _declare(GEOM_SMALL, 1, 1, decode_split_kv=33)  # a lean split is honoured by the lean body
+        assert pinned_lean.sparse_tile == _TILE_LEAN and (pinned_lean.decode_split_kv, pinned_lean.sparse_sub_tiles_per_cta) == (33, 2)
+        sq4, _ = _declare(GEOM_SMALL, 1, 4)  # the shared list at S_q 4 under AUTO: 8 units past the bound of 4: the core (the explicit lean serves it, above)
+        assert sq4.sparse_tile == _TILE_TCGEN05 and sq4.sparse_tile_form == "tcgen05" and sq4.qsa_shared_list
+        sq4_b5, _ = _declare(GEOM_SMALL, 5, 4)  # 40 units: past the bound
+        assert sq4_b5.sparse_tile == _TILE_TCGEN05
+        sq4_per_row, _ = _declare(
+            GEOM_SMALL, 1, 4, index_list_form="per_row"
+        )  # per-row lists past one row: the core (the lean CTA gathers one list per sequence)
+        assert sq4_per_row.sparse_tile == _TILE_TCGEN05 and not sq4_per_row.qsa_shared_list
+        sq2_per_row, _ = _declare(
+            GEOM_SMALL, 1, 2, index_list_form="per_row"
+        )  # inside the 4-unit bound (B 1 x H_kv 2 x S_q 2 = 4 units): ONLY the list-form rule keeps the core here (review of the first PR round)
+        assert sq2_per_row.sparse_tile == _TILE_TCGEN05 and sq2_per_row.sparse_tile_form == "tcgen05" and not sq2_per_row.qsa_shared_list
+        monkeypatch.setattr(
+            _H, "LEAN_SPARSE_SERVED_MAX_S_Q", 1
+        )  # the served rows are ONE constant the rule reads (never a literal): one row -> the explicit lean declines S_q 2, AUTO keeps the lean tile at one row
+        with pytest.raises(NotImplementedError, match="S_q <= 1"):
+            _declare(GEOM_SMALL, 1, 2, sparse_tile_form="lean")
+        assert _declare(GEOM_SMALL, 1, 1)[0].sparse_tile == _TILE_LEAN
+        monkeypatch.setattr(_H, "LEAN_SPARSE_SERVED_MAX_S_Q", 4)
+        monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 0))
+        other, _ = _declare(GEOM_SMALL, 1, 1)  # an unmeasured part: the core
+        assert other.sparse_tile == _TILE_TCGEN05
+    # a dense QsaSpec block over its own K / V (kv_source="self"): the tcgen05 core, every knob reading
+    from cudnn.gated_attention_block import GatedAttentionBlockFwd
+
+    geom, _ = _geom(GEOM_SMALL, causal_bottom_right=False)
+    mk = lambda *shape: torch.empty(*shape, dtype=BF16, device=_DEV)  # noqa: E731
+    own = GatedAttentionBlockFwd(
+        mk(1, 64, 512),
+        mk(geom.n_qkvg, 512),
+        torch.ones(D, dtype=BF16, device=_DEV),
+        torch.ones(D, dtype=BF16, device=_DEV),
+        mk(1, 64, ROPE),
+        mk(1, 64, ROPE),
+        mk(512, 8 * D),
+        mk(1, 64, 512),
+        geom,
+    )
+    assert own.sparse_tile_form == "tcgen05" and own.sparse_tile == _TILE_TCGEN05 and not own.sparse_decode
+
+
+def test_sparse_tile_form_typed_declines_equal_the_heuristics_text():
+    """Every request the lean body cannot serve, declined at DECLARATION with the arm named -- the text the heuristics state once
+    (``sparse_lean_tile_decline``), so the block and the adapter cannot drift: the explicit ``"lean"`` under per-row lists past one row (the
+    lean CTA gathers ONE list per sequence) and past the shared list's S_q bound, with a split that is not a lean split (16, or 1 = unsplit), over the block's OWN K / V (the DECODE form only), on the packed form
+    (THD is the core's); the k pin out of range, disagreeing with a pinned split, or under ``"auto"`` / ``"tcgen05"`` (a lean-only pin, never
+    silently ignored); the vocabulary; the knobs off a QsaSpec geometry."""
+    from cudnn.gated_attention_block import GatedAttentionBlockFwd
+    from cudnn.sdpa.fwd import heuristics as _H
+
+    with _no_host_sync():
+        with pytest.raises(NotImplementedError) as e:
+            _declare(
+                GEOM_SMALL, 4, 4, sparse_tile_form="lean", index_list_form="per_row"
+            )  # per-row lists past one row: the lean CTA gathers ONE list per sequence
+        reason = _H.sparse_lean_tile_decline(s_q=4, group=4, top_k=512, list_per_sequence=False)
+        assert str(e.value) == f"sparse_tile_form='lean' -- {reason}" and "per-row lists at S_q = 4" in reason
+        with pytest.raises(NotImplementedError) as e:
+            _declare(
+                GEOM_SMALL, 4, 5, sparse_tile_form="lean"
+            )  # a step past the shared list's bound (per-row lists by the S_q rule): the S_q reading comes first
+        reason = _H.sparse_lean_tile_decline(s_q=5, group=4, top_k=512, list_per_sequence=False)
+        assert str(e.value) == f"sparse_tile_form='lean' -- {reason}" and "S_q <= 4" in reason
+        with pytest.raises(NotImplementedError, match=r"splits at top_k 512 are \(65, 33, 22, 17, 13, 11, 10, 9\)"):
+            _declare(GEOM_SMALL, 4, 1, sparse_tile_form="lean", decode_split_kv=16)
+        with pytest.raises(NotImplementedError, match="a split of 1 is the tcgen05 core's"):
+            _declare(GEOM_SMALL, 4, 1, sparse_tile_form="lean", decode_split_kv=1)
+        with pytest.raises(NotImplementedError, match=r"must be in \[1, 8\]"):
+            _declare(GEOM_SMALL, 4, 1, sparse_tile_form="lean", sparse_sub_tiles_per_cta=9)
+        with pytest.raises(ValueError, match="pin one of the two"):
+            _declare(GEOM_SMALL, 4, 1, sparse_tile_form="lean", sparse_sub_tiles_per_cta=2, decode_split_kv=65)
+        both4, _ = _declare(GEOM_SMALL, 1, 1, top_k=32, sparse_tile_form="lean", sparse_sub_tiles_per_cta=4, decode_split_kv=2)
+        assert (both4.decode_split_kv, both4.sparse_sub_tiles_per_cta) == (
+            2,
+            4,
+        )  # the explicit k is THE k: ceil(5 / 4) = 2 (ceil(5 / 2) = 3 is not its inverse)
+        for form in ("auto", "tcgen05"):
+            with pytest.raises(ValueError, match="needs sparse_tile_form='lean'"):
+                _declare(GEOM_SMALL, 4, 1, sparse_tile_form=form, sparse_sub_tiles_per_cta=2)
+        with pytest.raises(ValueError, match="sparse_tile_form must be one of"):
+            _declare(GEOM_SMALL, 4, 1, sparse_tile_form="fast")
+        with pytest.raises(ValueError, match="sparse_sub_tiles_per_cta must be None"):
+            _declare(GEOM_SMALL, 4, 1, sparse_tile_form="lean", sparse_sub_tiles_per_cta=0)
+        with pytest.raises(NotImplementedError, match="below 8"):
+            _declare(GEOM_SMALL, 4, 1, top_k=4, sparse_tile_form="lean")
+        # over the block's own K / V: the DECODE form only; the packed form: THD is the core's
+        mk = lambda *shape: torch.empty(*shape, dtype=BF16, device=_DEV)  # noqa: E731
+        geom, _ = _geom(GEOM_SMALL, causal_bottom_right=False)
+        ones = torch.ones(D, dtype=BF16, device=_DEV)
+        with pytest.raises(NotImplementedError, match="DECODE form only"):
+            GatedAttentionBlockFwd(
+                mk(1, 64, 512),
+                mk(geom.n_qkvg, 512),
+                ones,
+                ones,
+                mk(1, 64, ROPE),
+                mk(1, 64, ROPE),
+                mk(512, 8 * D),
+                mk(1, 64, 512),
+                geom,
+                sparse_tile_form="lean",
+            )
+        with pytest.raises(NotImplementedError, match="thd=True .* tcgen05 core's arm"):
+            GatedAttentionBlockFwd(
+                mk(64, 512),
+                mk(geom.n_qkvg, 512),
+                ones,
+                ones,
+                mk(64, ROPE),
+                mk(64, ROPE),
+                mk(512, 8 * D),
+                mk(64, 512),
+                geom,
+                thd=True,
+                num_sequences=2,
+                max_seq_len=64,
+                sparse_tile_form="lean",
+            )
+        # off a QsaSpec geometry the knobs have no stage: "auto" and no pin only
+        from cudnn.gated_attention_block import GatedAttentionBlockGeometry
+
+        dense = GatedAttentionBlockGeometry(**GEOM_SMALL)
+        for kw in (dict(sparse_tile_form="tcgen05"), dict(sparse_tile_form="lean"), dict(sparse_tile_form="lean", sparse_sub_tiles_per_cta=1)):
+            with pytest.raises(ValueError, match="block-sparse stage's knobs|needs sparse_tile_form='lean'"):
+                GatedAttentionBlockFwd(
+                    mk(1, 64, 512), mk(dense.n_qkvg, 512), ones, ones, mk(1, 64, ROPE), mk(1, 64, ROPE), mk(512, 8 * D), mk(1, 64, 512), dense, **kw
+                )
+        GatedAttentionBlockFwd(
+            mk(1, 64, 512), mk(dense.n_qkvg, 512), ones, ones, mk(1, 64, ROPE), mk(1, 64, ROPE), mk(512, 8 * D), mk(1, 64, 512), dense, sparse_tile_form="auto"
+        )
+
+
+def test_the_lean_split_rule_and_the_combine_form_table():
+    """``sparse_decode_split_choice(..., tile_form="lean")``: the lean split of the default k (65 at k 1 on every cell class; the k pin
+    selects 33 / 22 / 17), independent of the SM count (the lean tile's split is the list's cut, not a fill of the machine) -- and the
+    COMBINE FORM the lean splits take on cc 10.7, the table ``heuristics.SPARSE_LEAN_COMBINE_FORM_CELLS`` pinned row by row against the
+    adapter's plan-time rule (``_sparse_combine_decode_grid``): the decode-grid kernel on the 24- / 96-row grids at split 65 / 33, the
+    module's own forms at 384 rows below split 32 (B 4 x S_q 4 at split 22: the unmeasured one-warp-per-row form), the AUTO entry past the
+    decode-grid bound (B 8 / 16 x S_q 1: the module's own forms by construction), the measured cells named."""
+    from cudnn.gated_attention_block.api import sparse_decode_split_choice as pick
+    from cudnn.sdpa.fwd import heuristics as _H
+    from cudnn.sdpa.fwd.config_sm107 import lean_sparse_split
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import _sparse_combine_decode_grid
+
+    for b, s_q in ((1, 1), (4, 1), (1, 4), (4, 4), (8, 1), (16, 1), (32, 1)):
+        for sms in (212, 204, 0):
+            assert pick(batch=b, h_kv=2, s_q=s_q, top_k=512, sm_count=sms, tile_form="lean", group=12) == 65, (b, s_q, sms)
+    assert pick(batch=1, h_kv=2, s_q=1, top_k=512, sm_count=212, tile_form="lean", sub_tiles_per_cta=2) == 33
+    assert pick(batch=1, h_kv=2, s_q=1, top_k=512, sm_count=212, tile_form="lean", sub_tiles_per_cta=4) == 17
+    assert (
+        pick(batch=1, h_kv=2, s_q=1, top_k=8, sm_count=212, tile_form="lean") == 2
+        and pick(batch=1, h_kv=2, s_q=1, top_k=256, sm_count=212, tile_form="lean") == 33
+    )
+    assert (
+        pick(batch=1, h_kv=2, s_q=1, top_k=512, sm_count=212) == pick(batch=1, h_kv=2, s_q=1, top_k=512, sm_count=212, tile_form="tcgen05") == 16
+    )  # the core's rule as before
+    want = {
+        "decode_grid": comb.DECODE_GRID_AUTO,
+        "own": comb.DECODE_GRID_OFF,
+        "auto_past_bound": comb.DECODE_GRID_AUTO,
+        "lean_walk": comb.DECODE_GRID_LEAN_WALK,
+    }
+    rows = _H.SPARSE_LEAN_COMBINE_FORM_CELLS
+    assert {(b, s) for b, _h, s, *_ in rows} >= {(1, 1), (4, 1), (1, 4), (4, 4), (16, 1), (32, 1)}  # the 24 / 96 / 96 / 384 / 384 / 768-row grids
+    measured = 0
+    for b, h_q, s_q, split, k, form, note in rows:
+        assert split == lean_sparse_split(512, k) and split in _H.sparse_lean_splits(512), (b, s_q, split, k)
+        assert _sparse_combine_decode_grid(b, h_q, s_q, split, (10, 7)) == want[form], (b, h_q, s_q, split, form)
+        blocks = _H.decode_combine_lean_blocks(b, h_q, s_q)
+        if form == "decode_grid":
+            assert _H.decode_combine_grid_selected(b, h_q, s_q, split, (10, 7)) and blocks <= _H.DECODE_COMBINE_MAX_LEAN_BLOCKS
+        elif form == "own":
+            assert _H.decode_combine_force_lean(b, h_q, s_q, split, (10, 7)) and _H.decode_combine_rows(b, h_q, s_q) > _H.DECODE_COMBINE_SMALL_GRID_ROWS
+        elif form == "auto_past_bound":
+            assert blocks > _H.DECODE_COMBINE_MAX_LEAN_BLOCKS and not _H.decode_combine_lean_walk_selected(b, h_q, s_q, split, (10, 7))
+        measured += note.startswith("MEASURED")
+        assert _sparse_combine_decode_grid(b, h_q, s_q, split, (10, 0)) in (comb.DECODE_GRID_AUTO, comb.DECODE_GRID_OFF)  # off cc 10.7: never the walk
+    assert measured == 2  # the two kill-line cells (B 1 / B 4 x S_q 1 at split 65); every other row is owed to the gate
+
+
+def test_sparse_tile_form_over_e4m3_pools_names_no_body():
+    """Over e4m3 pools (``kv_cache_dtype=torch.float8_e4m3fn``) stage (4) of the block-sparse decode mode is the gathered cast + the DENSE
+    decode tile (``upcast_decode``): NO body of the sparse core runs, so the body knob has nothing to honour -- the explicit ``"lean"`` is the
+    lean body's own e4m3 decline (the heuristics' text, read off the POOLS' dtype, not the activations'), the explicit ``"tcgen05"`` a typed
+    decline naming the arm, and ``"auto"`` constructs the upcast stage with NO body read back (``sparse_tile_form`` / ``sparse_tile`` None:
+    never the name of a kernel that does not run); the envelope's per-cell ``sparse_tile(..., kv_cache_dtype=e4m3)`` reads None too, equal to
+    the declared block cell by cell, and the same declaration over bf16 pools keeps the core by name."""
+    from cudnn.gated_attention_block import GatedAttentionBlockFwd
+    from cudnn.gated_attention_block.api import _UpcastSparseSdpa
+    from cudnn.sdpa.fwd import heuristics as _H
+
+    e4m3 = torch.float8_e4m3fn
+    kc8, vc8 = (torch.empty(4, 2, 16, D, dtype=e4m3, device=_DEV) for _ in range(2))
+    pools = dict(n_pages=4, kv_cache_dtype=e4m3, sample_k_cache=kc8, sample_v_cache=vc8, fuse_norm_rope=False)
+    with _no_host_sync():
+        with pytest.raises(NotImplementedError) as e:
+            _declare(GEOM_SMALL, 4, 1, sparse_tile_form="lean", **pools)
+        reason = _H.sparse_lean_tile_decline(s_q=1, group=4, top_k=512, half_dtype=False)
+        assert str(e.value) == f"sparse_tile_form='lean' -- {reason}" and "e4m3 pools arm" in reason
+        with pytest.raises(NotImplementedError, match="no body of the sparse core"):
+            _declare(GEOM_SMALL, 4, 1, sparse_tile_form="tcgen05", **pools)
+        auto, env_kw = _declare(GEOM_SMALL, 4, 1, **pools)
+        assert auto.upcast_decode and auto.kv_cache_e4m3 and isinstance(auto._sdpa, _UpcastSparseSdpa)
+        assert (auto.sparse_tile_form_requested, auto.sparse_tile_form, auto.sparse_tile, auto.sparse_sub_tiles_per_cta) == ("auto", None, None, None)
+        bf16_pools, _ = _declare(GEOM_SMALL, 4, 1, fuse_norm_rope=False)  # the same declaration over bf16 pools: the core, by name
+        assert (bf16_pools.sparse_tile_form, bf16_pools.sparse_tile) == ("tcgen05", _TILE_TCGEN05) and not bf16_pools.upcast_decode
+    env = GatedAttentionBlockFwd.serving_envelope(env_kw["geom"], BF16, torch.device(_DEV), device_cc=_SM107).decode
+    assert e4m3 in env.kv_cache_dtypes
+    for form in ("auto", "lean", "tcgen05"):
+        assert env.sparse_tile(1, 4, sparse_tile_form=form, kv_cache_dtype=e4m3) is None, form
+    assert env.sparse_tile(1, 4, kv_cache_dtype=e4m3) == auto.sparse_tile  # cell by cell: no body on both readings
+    assert env.sparse_tile(1, 4, kv_cache_dtype=BF16) == env.sparse_tile(1, 4) == bf16_pools.sparse_tile == _TILE_TCGEN05
+    assert env.sparse_tile(1, 4, sparse_tile_form="lean", kv_cache_dtype=BF16) == _TILE_LEAN
+
+
+def test_the_envelope_reads_the_sparse_tile_route_back(monkeypatch):
+    """``serving_envelope().decode``: ``sparse_tiles`` names the bodies the part serves (the tcgen05 core everywhere; the lean tile on cc 10.7
+    only), ``sparse_tile_lean_default`` the AUTO pin's reading (True on the measured part, cc 10.7; False with the pin patched EMPTY and on every
+    other part), and ``sparse_tile(s_q, batch, ...)`` the body a step takes -- the same arithmetic the constructor runs (the placement bound
+    ``LEAN_SPARSE_MAX_UNITS`` = 4 under AUTO): pinned equal to a declared block's ``sparse_tile`` cell by cell, None where the explicit "lean"
+    would be a typed decline; empty / None on a dense geometry."""
+    from cudnn.gated_attention_block import GatedAttentionBlockFwd, GatedAttentionBlockGeometry
+    from cudnn.gated_attention_block import api as _api
+    from cudnn.sdpa.fwd import heuristics as _H
+
+    geom, _ = _geom(GEOM_SMALL)
+    dev = torch.device(_DEV)
+    env = GatedAttentionBlockFwd.serving_envelope(geom, BF16, dev, device_cc=_SM107).decode
+    assert env.sparse_core and env.sparse_tiles == (_TILE_TCGEN05, _TILE_LEAN) and env.sparse_tile_lean_default is True  # the measured part
+    assert (
+        env.sparse_tile(1, 1) == _TILE_LEAN and env.sparse_tile(1, 2) == _TILE_LEAN and env.sparse_tile(1, 3) == _TILE_TCGEN05
+    )  # the bound (4 units) under AUTO
+    assert env.sparse_tile(1, 4, sparse_tile_form="tcgen05") == _TILE_TCGEN05 and env.sparse_tile(1, 1, sparse_tile_form="tcgen05") == _TILE_TCGEN05
+    assert env.sparse_tile(1, 4, sparse_tile_form="lean") == _TILE_LEAN and env.sparse_tile(1, 16, sparse_tile_form="lean") == _TILE_LEAN
+    assert (
+        env.sparse_tile(4, 4, sparse_tile_form="lean") == _TILE_LEAN and env.sparse_tile(4, 5, sparse_tile_form="lean") == _TILE_LEAN
+    )  # the S_q rows share one CTA
+    assert env.sparse_tile(5, 4, sparse_tile_form="lean") is None and env.sparse_tile(1, 4, sparse_tile_form="lean", decode_split_kv=16) is None
+    assert env.sparse_tile(4, 4) == _TILE_TCGEN05  # 32 units under AUTO: past the bound, the core
+    assert env.sparse_tile(1, 4, sparse_tile_form="lean", decode_split_kv=33) == _TILE_LEAN
+    # a tcgen05 split pin outside the core's bound [1, ceil((top_k + 1) / 32)] = [1, 17] at top_k 512 is a declaration-time rejection,
+    # so the envelope reads None there (never "the core"); inside the bound the core; under AUTO the pin is the stronger knob and the same bound holds
+    assert env.sparse_tile(1, 4, sparse_tile_form="tcgen05", decode_split_kv=17) == _TILE_TCGEN05 and env.sparse_tile(1, 4, decode_split_kv=16) == _TILE_TCGEN05
+    assert (
+        env.sparse_tile(1, 4, sparse_tile_form="tcgen05", decode_split_kv=18) is None
+        and env.sparse_tile(1, 4, sparse_tile_form="tcgen05", decode_split_kv=0) is None
+    )
+    assert (
+        env.sparse_tile(1, 1, decode_split_kv=18) is None and env.sparse_tile(1, 1, decode_split_kv=1) == _TILE_TCGEN05
+    )  # AUTO: the pin keeps the core; split 1 = unsplit core
+    other = GatedAttentionBlockFwd.serving_envelope(geom, BF16, dev, device_cc=(10, 0)).decode  # the form is not served off cc 10.7: no body, no route
+    assert not other.served and other.sparse_tiles == () and other.sparse_tile(1, 1) is None and other.sparse_tile(1, 1, sparse_tile_form="lean") is None
+    dense = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**GEOM_SMALL), BF16, dev, device_cc=_SM107).decode
+    assert dense.sparse_tiles == () and dense.sparse_tile(1, 1) is None and not dense.sparse_tile_lean_default
+    per_row_geom, _ = _geom(GEOM_SMALL, index_list_form="per_row")
+    pr = GatedAttentionBlockFwd.serving_envelope(per_row_geom, BF16, dev, device_cc=_SM107).decode
+    assert pr.sparse_tile(1, 4, sparse_tile_form="lean") == _TILE_LEAN and pr.sparse_tile(2, 4, sparse_tile_form="lean") is None
+    assert pr.sparse_tile(4, 4, sparse_tile_form="lean") is None  # per-row lists past one row: the core
+    monkeypatch.setattr(_api, "_device_cc_of", lambda device: _SM107)  # the constructor reads the measured part on any host
+    flipped = GatedAttentionBlockFwd.serving_envelope(geom, BF16, dev, device_cc=_SM107).decode
+    assert flipped.sparse_tile_lean_default is True
+    with _no_host_sync():
+        for b, s_q, split in (
+            (1, 1, None),
+            (4, 1, None),
+            (16, 1, None),
+            (17, 1, None),
+            (4, 4, None),
+            (5, 4, None),
+            (1, 2, None),
+            (4, 1, 16),
+            (1, 1, 33),
+            (2, 1, 33),
+            (1, 2, 33),  # a lean split under AUTO inside the bound (2 / 4 / 4 units: k 2); past the bound a pinned 33 is the core's typed decline, not a cell
+        ):
+            blk, _ = _declare(GEOM_SMALL, b, s_q, decode_split_kv=split)
+            assert flipped.sparse_tile(s_q, b, decode_split_kv=split) == blk.sparse_tile, (b, s_q, split, blk.sparse_tile)
+    assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, dev, device_cc=(10, 0)).decode.sparse_tile_lean_default is False
+    monkeypatch.setattr(_H, "SPARSE_LEAN_TILE_DEFAULT_CCS", ())  # the pin EMPTY: the former function on the same part
+    former = GatedAttentionBlockFwd.serving_envelope(geom, BF16, dev, device_cc=_SM107).decode
+    assert (
+        former.sparse_tile_lean_default is False
+        and former.sparse_tile(1, 1) == _TILE_TCGEN05
+        and former.sparse_tile(1, 1, sparse_tile_form="lean") == _TILE_LEAN
+    )
+
+
+# (geometry, S_q, kv_lens, page, layout, dtype, split, k, fuse_gate, return_lse, block_lens, seed)
+_LEAN_BLOCK_CELLS = [
+    pytest.param(
+        GEOM_SMALL,
+        1,
+        (2052, 8192, 0, 4097),
+        16,
+        "hnd",
+        BF16,
+        None,
+        None,
+        True,
+        True,
+        True,
+        201,
+        id="Sq1-B4-p16-hnd-default-k1-split65-fused-gate-lse-dead-entry",
+    ),
+    pytest.param(GEOM_FLASH_NEXT, 1, (8192,), 16, "hnd", BF16, None, None, True, False, True, 202, id="Sq1-B1-flash-next-24-2-fused-gate"),
+    pytest.param(GEOM_SMALL, 1, (300, 77), 64, "nhd", F16, None, None, False, True, False, 203, id="Sq1-B2-p64-nhd-f16-gate-launch-no-block-lens"),
+    pytest.param(GEOM_SMALL, 1, (4096, 512), 32, "unified", BF16, 33, None, True, True, True, 204, id="Sq1-B2-p32-unified-split33-k2-fused-gate-lse"),
+    # (a 1-token sequence is the K1 ladder's cell: the test oracle's torch reference routes a 1-row product through a Triton kernel this node's torch cannot compile for sm_107a)
+    pytest.param(GEOM_SMALL, 1, (8192, 2052, 5, 7000), 16, "hnd", BF16, None, 4, True, False, True, 205, id="Sq1-B4-p16-k4-split17-short-sequence"),
+    # the step's rows 2..4 under the SHARED list (one list per sequence; every row of the step in one lean CTA over ONE gathered sub-tile, n_mt
+    # m16 tiles): the 24 / 2 geometry's three m-tiles at S_q 4, the small geometry's one m-tile (S_q 4 x G 4 = 16 rows), every MTP residue, rows
+    # shorter than the step dead on both bodies, a k pin and a lean split at S_q 2 / 3
+    pytest.param(GEOM_FLASH_NEXT, 4, (8192,), 16, "hnd", BF16, None, None, True, True, True, 206, id="Sq4-B1-flash-next-24-2-three-m-tiles-fused-gate-lse"),
+    pytest.param(
+        GEOM_SMALL, 4, (8191, 8190, 8189, 8188), 16, "hnd", BF16, None, None, True, True, True, 207, id="Sq4-B4-every-residue-one-m-tile-fused-gate-lse"
+    ),
+    pytest.param(
+        GEOM_SMALL, 4, (2, 4, 0, 20000), 16, "hnd", BF16, None, None, False, True, True, 208, id="Sq4-B4-shorter-than-the-step-dead-20000-gate-launch"
+    ),
+    pytest.param(GEOM_SMALL, 2, (300, 77), 64, "nhd", F16, 33, None, True, True, False, 209, id="Sq2-B2-p64-nhd-f16-split33-k2-no-block-lens"),
+    pytest.param(GEOM_FLASH_NEXT, 3, (4096, 2052), 32, "unified", BF16, None, 2, True, False, True, 210, id="Sq3-B2-flash-next-p32-unified-k2-split33"),
+]
+
+
+@requires_rubin
+@pytest.mark.parametrize("geom_kw, s_q, kv_lens, page, layout, dtype, split, k, fuse_gate, return_lse, block_lens, seed", _LEAN_BLOCK_CELLS)
+def test_the_lean_route_matches_the_oracle_and_the_tcgen05_route_within_tolerance(
+    geom_kw, s_q, kv_lens, page, layout, dtype, split, k, fuse_gate, return_lse, block_lens, seed
+):
+    """The block on ``sparse_tile_form="lean"`` against the fp32 oracle (the module's bars: ``cos(out) > 0.999``, the gated O and the LSE within
+    2e-2, dead rows exact, two launches bitwise; the stage's ``kernel_template`` the lean tile's) and against the SAME block on
+    ``sparse_tile_form="tcgen05"``: ``out`` within the module's tolerance (cos), the gated O and the LSE within 2e-2, the list bitwise (the
+    caller's list is the same tensor; the kernel-produced list is the indexer cell's) -- NOT bitwise across the bodies and never asserted so
+    (a 4 x 64-d split-K sum in fixed order vs one 256-d MMA chain; recorded in the print), bitwise WITHIN each body (two launches)."""
+    kw = dict(page=page, layout=layout, dtype=dtype, seed=seed, split=split, fuse_gate=fuse_gate, return_lse=return_lse, block_lens=block_lens)
+    lean = _Case(geom_kw, s_q, kv_lens, sparse_tile_form="lean", sparse_sub_tiles_per_cta=k, **kw)
+    tc = _Case(geom_kw, s_q, kv_lens, sparse_tile_form="tcgen05", **dict(kw, split=None))  # the core at the fill rule's split
+    assert lean.blk.sparse_tile == _TILE_LEAN and tc.blk.sparse_tile == _TILE_TCGEN05
+    lean.compile()
+    tc.compile()
+    assert lean.blk._sdpa.kernel_template == _TILE_LEAN == lean.blk._sdpa._impl.kernel_template and tc.blk._sdpa.kernel_template == _TILE_TCGEN05
+    assert lean.blk.decode_split_kv == lean.blk._sdpa._impl.split_kv and lean.blk.sparse_sub_tiles_per_cta == lean.blk._sdpa._impl.sub_tiles_per_cta
+    m_lean = _two_launches(lean, "lean route")
+    m_tc = _two_launches(tc, "tcgen05 route")
+    c = _cos(lean.out, tc.out)
+    d_o = float((lean.slab_views()[4].float() - tc.slab_views()[4].float()).abs().max())
+    d_lse = _lse_delta(lean.lse, tc.lse) if return_lse else 0.0
+    assert c > COS_OUT and d_o <= ATOL and d_lse <= ATOL, f"lean vs tcgen05: cos {c:.6f} max|dO_gated| {d_o:.3e} max|dLSE| {d_lse:.3e}"
+    assert torch.equal(lean.block_ids, tc.block_ids), "the caller's list is one tensor: bitwise by construction"
+    bitwise = bool(torch.equal(_bits(lean.out), _bits(tc.out)))
+    print(
+        f"\n{lean.label()} vs {tc.label()}: cos(out) {c:.6f} max|dO_gated| {d_o:.3e} max|dLSE| {d_lse:.2e} (bitwise across bodies {bitwise}: not required); "
+        f"lean vs oracle {m_lean}; tcgen05 vs oracle {m_tc}"
+    )
+
+
+@requires_rubin
+@pytest.mark.parametrize("s_q", [1, 4], ids=["Sq1-one-m-tile", "Sq4-three-m-tiles"])
+def test_the_lean_route_census_names_the_lean_kernel_and_matches_the_tcgen05_launch_count(s_q):
+    """The CUPTI census of one execute on each body (the 24 / 2 geometry at S_q 1 and at S_q 4 -- the shared list, three m-tiles in one lean
+    CTA --, the fill rule's split on the core, the default k on the lean tile): the lean route launches exactly ONE ``cudnn_sparse_lean_kernel``
+    and NO ``cudnn_kernel__kernel`` sparse core, the tcgen05 route the reverse; the launch COUNT is equal (the lean tile replaces the core one
+    for one; both routes run their pinned combine, the decode-grid kernel here: 24 / 96 rows, split 65 / 16); no memcpy / memset on either path."""
+    from cudnn.gated_attention_block.api import sparse_decode_split_choice
+
+    kw = dict(page=16, seed=211, fuse_gate=True, return_lse=True)
+    lean = _Case(GEOM_FLASH_NEXT, s_q, (8192,), sparse_tile_form="lean", **kw).compile()
+    tc = _Case(GEOM_FLASH_NEXT, s_q, (8192,), sparse_tile_form="tcgen05", **kw).compile()
+    assert lean.blk.qsa_shared_list and tc.blk.qsa_shared_list
+    lean.run()
+    tc.run()
+    k_lean, m_lean = _cupti_kernels(lambda: lean.execute())
+    k_tc, m_tc = _cupti_kernels(lambda: tc.execute())
+    if k_lean is None or k_tc is None:
+        pytest.skip("torch.profiler recorded no CUDA events (CUPTI unavailable on this node): the kernel names are unverified here")
+    print(f"\nlean: {len(k_lean)} kernels:\n  " + "\n  ".join(n[:140] for n in k_lean))
+    print(f"tcgen05: {len(k_tc)} kernels:\n  " + "\n  ".join(n[:140] for n in k_tc))
+    has = lambda names, tok: sum(tok in n for n in names)  # noqa: E731
+    assert not (m_lean or m_tc), "a memset / memcpy on the execute path"
+    assert has(k_lean, "cudnn_sparse_lean_kernel") == 1 and has(k_lean, "cudnn_kernel__kernel") == 0, k_lean
+    assert has(k_tc, "cudnn_kernel__kernel") == 1 and has(k_tc, "cudnn_sparse_lean_kernel") == 0, k_tc
+    assert len(k_lean) == len(k_tc), (len(k_lean), len(k_tc))
+    assert has(k_lean, "cudnn_kernel__combine_decode_grid_kernel") == 1 == has(k_tc, "cudnn_kernel__combine_decode_grid_kernel")
+    sm = torch.cuda.get_device_properties(torch.device(_DEV)).multi_processor_count
+    assert lean.blk.decode_split_kv == 65 and tc.blk.decode_split_kv == sparse_decode_split_choice(batch=1, h_kv=2, s_q=s_q, top_k=512, sm_count=sm) == 16
+
+
+@requires_rubin
+def test_the_indexer_decode_step_on_the_lean_route_lists_bitwise_and_attends_within_tolerance():
+    """The in-block indexer's decode step (per-row lists, one row per sequence: the lean body serves it as the shared list) on
+    ``sparse_tile_form="lean"`` against the SAME step on ``"tcgen05"``: the kernel-produced list, the counts, the side caches and the pools'
+    step rows BITWISE (the same prepare / scorer / top-k kernels run on both routes), ``out`` within the module's tolerance, the gated O and
+    the LSE within 2e-2; each route against its own two-stage oracle, two launches bitwise."""
+    kw = dict(page=16, seed=221, split=None, fuse_gate=True, return_lse=True, fuse_prepare=True)
+    lean = _IndexerCase(GEOM_SMALL, 1, (2052, 8192, 0, 4097), sparse_tile_form="lean", **kw)
+    tc = _IndexerCase(GEOM_SMALL, 1, (2052, 8192, 0, 4097), sparse_tile_form="tcgen05", **kw)
+    assert lean.blk.sparse_tile == _TILE_LEAN and tc.blk.sparse_tile == _TILE_TCGEN05 and not lean.blk.qsa_shared_list and lean.blk.decode_split_kv == 65
+    lean.compile()
+    tc.compile()
+    m_lean = _two_launches_indexer(lean, "lean route (indexer step)")
+    m_tc = _two_launches_indexer(tc, "tcgen05 route (indexer step)")
+    assert (
+        torch.equal(lean.kernel_ids(), tc.kernel_ids())
+        and torch.equal(lean.block_lens_out, tc.block_lens_out)
+        and torch.equal(lean.kernel_counts(), tc.kernel_counts())
+    )
+    assert torch.equal(_bits(lean.index_kv_cache), _bits(tc.index_kv_cache)) and torch.equal(_bits(lean.index_state_cache), _bits(tc.index_state_cache))
+    assert torch.equal(_bits(lean.k_cache.contiguous()), _bits(tc.k_cache.contiguous())) and torch.equal(
+        _bits(lean.v_cache.contiguous()), _bits(tc.v_cache.contiguous())
+    )
+    c = _cos(lean.out, tc.out)
+    d_o = float((lean.slab_views()[4].float() - tc.slab_views()[4].float()).abs().max())
+    d_lse = _lse_delta(lean.lse, tc.lse)
+    assert c > COS_OUT and d_o <= ATOL and d_lse <= ATOL, f"lean vs tcgen05 (indexer step): cos {c:.6f} max|dO_gated| {d_o:.3e} max|dLSE| {d_lse:.3e}"
+    print(f"\nindexer step lean vs tcgen05: list bitwise, cos(out) {c:.6f} max|dO_gated| {d_o:.3e} max|dLSE| {d_lse:.2e}; lean {m_lean}; tcgen05 {m_tc}")
+
+
+@requires_rubin
+def test_get_workspace_size_is_honest_under_the_lean_split():
+    """The lean split's partials (65 at k 1: the adapter's slab formula at the lean split) sit inside ``get_workspace_size()``; nothing past
+    the size is written (a sentinel tail survives an execute); the lean block's workspace exceeds the same block's on the core (16 partials)."""
+    lean = _Case(GEOM_SMALL, 1, (4096, 512, 0), page=16, seed=231, fuse_gate=True, sparse_tile_form="lean").compile()
+    tc = _Case(GEOM_SMALL, 1, (4096, 512, 0), page=16, seed=231, fuse_gate=True, sparse_tile_form="tcgen05").compile()
+    blk = lean.blk
+    scratch = blk._sdpa.scratch_workspace_bytes()
+    assert (
+        blk.decode_split_kv == 65
+        and scratch == blk._sdpa._impl._split_workspace_layout()[3]
+        and blk.get_workspace_size() >= blk._layout().total_bytes + scratch
+    )
+    assert blk.get_workspace_size() > tc.blk.get_workspace_size() and tc.blk.decode_split_kv == 16
+    need = blk.get_workspace_size()
+    ws = torch.empty(need + 65536, dtype=torch.uint8, device=_DEV)
+    ws[need:].fill_(0xA5)
+    ws[:need].fill_(0x7F)
+    out = torch.empty_like(lean.out)
+    lean.execute(out=out, ws=ws)
+    torch.cuda.synchronize()
+    assert (ws[need:] == 0xA5).all(), "bytes past get_workspace_size() were written on the lean route"
+    lean.check(out, ws, what="sentinel-tailed workspace (lean route)")
