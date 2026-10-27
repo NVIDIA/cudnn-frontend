@@ -16,7 +16,7 @@ import re
 
 import pytest
 
-from frost_test_utils import requires_dsl
+from frost_test_utils import requires_dsl, requires_rubin
 
 from cudnn.sdpa.fwd.api_dsl import _sm100_fp8_shapes
 from cudnn.sdpa.fwd.config_sm100 import TemplateParams
@@ -1883,18 +1883,19 @@ def test_sm107_fp8_direct_split_keeps_partial_stats_natural(d, monkeypatch):
     torch.testing.assert_close(lse.double(), scores.logsumexp(-1) * math.log2(math.e), atol=2e-4, rtol=2e-5)
 
 
-@pytest.mark.parametrize("d,pack,accepted", [(128, True, True), (192, False, True), (192, True, False)])
+@pytest.mark.parametrize("d,pack,accepted", [(128, True, True), (192, False, True), (192, True, True), (256, True, False)])
 def test_sm107_fp8_split_standalone_pack_domain(d, pack, accepted):
-    """A divisible GQA group does not make an unvalidated packed flavor eligible."""
+    """D192 packing is served; the independent D256 packed-split decline remains."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     if torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("SM107 required")
+    dv = 256 if d == 256 else 128
     q, k, v = [
-        torch.empty((1, s, h, width), device="cuda", dtype=torch.float8_e4m3fn).transpose(1, 2) for s, h, width in ((16, 4, d), (512, 1, d), (512, 1, 128))
+        torch.empty((1, s, h, width), device="cuda", dtype=torch.float8_e4m3fn).transpose(1, 2) for s, h, width in ((16, 4, d), (512, 1, d), (512, 1, dv))
     ]
-    out = torch.empty((1, 16, 4, 128), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
-    api = SdpaFwdDslSm100(q, k, v, out, pertensor_fp8=True, split_kv=4, pack_gqa=pack, cga=2)
+    out = torch.empty((1, 16, 4, dv), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    api = SdpaFwdDslSm100(q, k, v, out, pertensor_fp8=True, split_kv=4, pack_gqa=pack, cga=1 if d == 256 else 2)
     if accepted:
         assert api.check_support()
     else:
@@ -2006,3 +2007,31 @@ def test_sm107_d256_mxfp8_pair_is_bitwise_the_one_cta_build(causal):
         assert err <= 0.1 * scale, f"cga {cga}: max err {err} vs fp32 reference (scale {scale})"
     assert torch.equal(outs[1][0], outs[2][0]) and torch.equal(outs[1][1], outs[2][1]), "O / LSE must be bit-identical across the CTA widths"
     assert torch.equal(outs[None][0], outs[2][0]) and torch.equal(outs[None][1], outs[2][1]), "the unset knob must be the pair"
+
+
+@requires_rubin
+class TestNativeFp8SinkSplit:
+    """Keep the native regressions in the explicitly selected SM107 CI entry."""
+
+    from test_sdpa_fp8_sink_split_sm107 import (
+        test_native_fp8_sink_split_rebind_replay as _rebind,
+        test_native_fp8_sink_split_standalone as _standalone,
+        test_native_fp8_sink_keeps_independent_split_domain as _domain,
+    )
+
+    test_rebind_and_replay = staticmethod(_rebind)
+    test_standalone = staticmethod(_standalone)
+    test_domain_declines = staticmethod(_domain)
+
+
+@requires_rubin
+class TestNativeD192Fp8Pack:
+    """Expose packing and decline regressions through the selected CI file."""
+
+    from test_sdpa_fp8_d192_pack_sm107 import (
+        test_native_d192_fp8_pack_rebind_replay as _rebind,
+        test_native_d192_pack_retains_head_padding_decline as _decline,
+    )
+
+    test_rebind_and_replay = staticmethod(_rebind)
+    test_head_padding_decline = staticmethod(_decline)

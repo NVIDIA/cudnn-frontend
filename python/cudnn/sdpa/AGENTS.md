@@ -257,6 +257,12 @@ other-arch lowerings are smoke-compiled from whatever GPU you have.**
   to copy. Detector: `pytest --collect-only -q -k <feature>` per file must list
   the cases (the block-scaled O review found SM120 FP4 declining itself
   and the Rubin lane skipping the epilogue entirely).
+- When an architecture CI lane selects an explicit file list, check collection
+  through those entries. A directory-wide local sweep does not prove CI coverage.
+  A guarded class in the selected entry can expose parametrized helper tests via
+  `staticmethod`; retain the architecture guard because the helper module's
+  `pytestmark` does not transfer with its functions. The SM107 sink/split
+  detector is `test_sdpa_fp8_sm107.py::TestNativeFp8SinkSplit`.
 - The DSL traces the kernel in Python before any arch-specific codegen, so a
   lowering for an arch you do not have still fails or passes its trace here:
   `_load_sm120_kernel_module(None, TemplateParams(dtype_qkv=0, dtype_o=5),
