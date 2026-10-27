@@ -286,6 +286,7 @@ def test_thd_fp8_rejects_measured_empty_workspace_before_writes(ordered, native,
     assert plan._prepared.spec.native is not None and g.get_workspace_size() > 1
     if not native:
         binding_reference.use_reference(plan._prepared.spec)
+        plan._ordered_native = None  # The comparison must also bypass the retained native transport entry.
     if empty:
         vp[tensors["q"]] = bufs["q"][:0]
 

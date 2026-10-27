@@ -3295,7 +3295,7 @@ def test_sparse_tile_form_declaration_facts_and_the_auto_pin(monkeypatch):
     assert _H.SPARSE_LEAN_TILE_DEFAULT_CCS == (_SM107,), "the AUTO pin: the measured part"
     with _no_host_sync():
         with pytest.MonkeyPatch.context() as mp:  # the pin EMPTY: the former function, the core on every part
-            mp.setattr(_H, "SPARSE_LEAN_TILE_DEFAULT_CCS", ())
+            mp.setattr("cudnn.sdpa.fwd.sparse_tile_rules.SPARSE_LEAN_TILE_DEFAULT_CCS", ())
             auto, _ = _declare(GEOM_SMALL, 4, 1)
             assert (auto.sparse_tile_form_requested, auto.sparse_tile_form, auto.sparse_tile, auto.sparse_sub_tiles_per_cta) == (
                 "auto",
@@ -3355,12 +3355,12 @@ def test_sparse_tile_form_declaration_facts_and_the_auto_pin(monkeypatch):
         )  # inside the 4-unit bound (B 1 x H_kv 2 x S_q 2 = 4 units): ONLY the list-form rule keeps the core here (review of the first PR round)
         assert sq2_per_row.sparse_tile == _TILE_TCGEN05 and sq2_per_row.sparse_tile_form == "tcgen05" and not sq2_per_row.qsa_shared_list
         monkeypatch.setattr(
-            _H, "LEAN_SPARSE_SERVED_MAX_S_Q", 1
+            "cudnn.sdpa.fwd.sparse_tile_rules.LEAN_SPARSE_SERVED_MAX_S_Q", 1
         )  # the served rows are ONE constant the rule reads (never a literal): one row -> the explicit lean declines S_q 2, AUTO keeps the lean tile at one row
         with pytest.raises(NotImplementedError, match="S_q <= 1"):
             _declare(GEOM_SMALL, 1, 2, sparse_tile_form="lean")
         assert _declare(GEOM_SMALL, 1, 1)[0].sparse_tile == _TILE_LEAN
-        monkeypatch.setattr(_H, "LEAN_SPARSE_SERVED_MAX_S_Q", 4)
+        monkeypatch.setattr("cudnn.sdpa.fwd.sparse_tile_rules.LEAN_SPARSE_SERVED_MAX_S_Q", 4)
         monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 0))
         other, _ = _declare(GEOM_SMALL, 1, 1)  # an unmeasured part: the core
         assert other.sparse_tile == _TILE_TCGEN05
@@ -3621,7 +3621,7 @@ def test_the_envelope_reads_the_sparse_tile_route_back(monkeypatch):
             blk, _ = _declare(GEOM_SMALL, b, s_q, decode_split_kv=split)
             assert flipped.sparse_tile(s_q, b, decode_split_kv=split) == blk.sparse_tile, (b, s_q, split, blk.sparse_tile)
     assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, dev, device_cc=(10, 0)).decode.sparse_tile_lean_default is False
-    monkeypatch.setattr(_H, "SPARSE_LEAN_TILE_DEFAULT_CCS", ())  # the pin EMPTY: the former function on the same part
+    monkeypatch.setattr("cudnn.sdpa.fwd.sparse_tile_rules.SPARSE_LEAN_TILE_DEFAULT_CCS", ())  # the pin EMPTY: the former function on the same part
     former = GatedAttentionBlockFwd.serving_envelope(geom, BF16, dev, device_cc=_SM107).decode
     assert (
         former.sparse_tile_lean_default is False

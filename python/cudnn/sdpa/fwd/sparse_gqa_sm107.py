@@ -423,7 +423,7 @@ class SparseGqaFwdDslSm107:
         # vocabulary is the heuristics' (one spelling for the adapter and the gated attention block); resolved by check_support (the
         # placement rule on the measured parts, the explicit body honoured or declined by name) into `tile_form` / `kernel_template`.
         # `sub_tiles_per_cta` pins the lean body's k (1 .. min(8, n_sub - 1)); it is refused by name where the resolved body is tcgen05.
-        from cudnn.sdpa.fwd.heuristics import SPARSE_TILE_FORMS
+        from cudnn.sdpa.fwd.sparse_tile_rules import SPARSE_TILE_FORMS
 
         if not isinstance(tile_form, str) or tile_form not in SPARSE_TILE_FORMS:
             raise ValueError(
@@ -581,7 +581,7 @@ class SparseGqaFwdDslSm107:
                 "sparse d256 forward (sm107): list_per_sequence=True needs bottom_right=True -- the shared list is anchored at the step-0 position "
                 "kv_len - S_q (the decode / MTP form); a top-left per-sequence list has no serving meaning"
             )
-        from cudnn.sdpa.fwd.heuristics import sparse_tcgen05_max_split  # one copy of the core's split bound (the envelope reads the same)
+        from cudnn.sdpa.fwd.sparse_tile_rules import sparse_tcgen05_max_split  # one copy of the core's split bound (the envelope reads the same)
 
         max_tiles = sparse_tcgen05_max_split(self.top_k) if _TOPK_MIN <= self.top_k <= _TOPK_MAX else 0
 
@@ -793,8 +793,8 @@ class SparseGqaFwdDslSm107:
         (``ceil(n_sub / k)``; unset = the default k of :func:`heuristics.sparse_lean_sub_tiles_per_cta` or the pinned ``sub_tiles_per_cta``),
         k in ``1 .. min(8, n_sub - 1)``; ``self.split_kv`` becomes the lean split and ``self.sub_tiles_per_cta`` the k.  The TCGEN05 core:
         ``split_kv`` up to ``ceil((top_k + 1) / 32)`` as before; a ``sub_tiles_per_cta`` pin is refused by name (never silently ignored)."""
-        from cudnn.sdpa.fwd import heuristics as H
-        from cudnn.sdpa.fwd.config_sm107 import lean_sparse_n_sub, lean_sparse_split
+        from cudnn.sdpa.fwd import sparse_tile_rules as H
+        from cudnn.sdpa.fwd.sparse_tile_rules import lean_sparse_n_sub, lean_sparse_split
 
         split_req = self.split_kv_requested
         reason = H.sparse_lean_tile_decline(
@@ -870,7 +870,7 @@ class SparseGqaFwdDslSm107:
     def kernel_template(self) -> Optional[str]:
         """The body ``compile`` loads, by its module stem (``heuristics.SPARSE_TILE_LEAN`` / ``SPARSE_TILE_TCGEN05``): the readback a caller
         pins its route against; None before ``check_support`` resolved the form."""
-        from cudnn.sdpa.fwd.heuristics import SPARSE_TILE_FORM_LEAN, SPARSE_TILE_LEAN, SPARSE_TILE_TCGEN05
+        from cudnn.sdpa.fwd.sparse_tile_rules import SPARSE_TILE_FORM_LEAN, SPARSE_TILE_LEAN, SPARSE_TILE_TCGEN05
 
         if self.tile_form is None:
             return None
@@ -879,7 +879,7 @@ class SparseGqaFwdDslSm107:
     @property
     def lean(self) -> bool:
         """Whether the resolved body is the lean tile (after ``check_support``)."""
-        from cudnn.sdpa.fwd.heuristics import SPARSE_TILE_FORM_LEAN
+        from cudnn.sdpa.fwd.sparse_tile_rules import SPARSE_TILE_FORM_LEAN
 
         return self.tile_form == SPARSE_TILE_FORM_LEAN
 

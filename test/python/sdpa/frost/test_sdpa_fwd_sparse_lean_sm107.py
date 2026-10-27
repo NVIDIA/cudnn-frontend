@@ -1546,7 +1546,7 @@ def test_tile_form_vocabulary_is_one_spelling_and_names_the_two_bodies():
     """The knob's vocabulary and the two bodies' ``kernel_template`` names live in the heuristics (DSL-free) and the adapter re-exports
     nothing else: ``("auto", "lean", "tcgen05")``, the module stems of the two kernel files; a bad value is a ``ValueError`` naming the
     vocabulary at construction, a bad k pin likewise."""
-    from cudnn.sdpa.fwd import heuristics as H
+    from cudnn.sdpa.fwd import sparse_tile_rules as H
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import KERNEL_FILE, KERNEL_FILE_LEAN
 
     assert H.SPARSE_TILE_FORMS == (H.SPARSE_TILE_FORM_AUTO, H.SPARSE_TILE_FORM_LEAN, H.SPARSE_TILE_FORM_TCGEN05) == ("auto", "lean", "tcgen05")
@@ -1568,7 +1568,7 @@ def test_auto_pin_names_the_measured_part_and_the_placement_rule_sits_behind_it(
     split 65, k 1), the bound ``LEAN_SPARSE_MAX_UNITS`` = 4 inclusive (B 2 in, B 3 out), the tcgen05 core where a pinned split is not a
     lean split (16), the lean tile where it is (33 -> k 2), the tcgen05 core on an unmeasured part; with the tuple patched EMPTY the former
     function returns (the tcgen05 core on every part, unsplit by default)."""
-    from cudnn.sdpa.fwd import heuristics as H
+    from cudnn.sdpa.fwd import sparse_tile_rules as H
 
     assert H.SPARSE_LEAN_TILE_DEFAULT_CCS == ((10, 7),), "the AUTO pin: the measured part"
     b = _route_adapter()
@@ -1599,7 +1599,7 @@ def test_placement_rule_at_the_bound_both_sides_and_the_k_rule():
     cc 10.7 only, ``top_k >= 8``; the lean splits of ``top_k`` (every entry >= 2: the lean tile always splits) and the largest k; the fill rule
     of the fill model (1 / 1 / 2 / 3 / 2 / 4 / 7 at B 1 / B 4 x S_q 1, B 1 x S_q 4, B 4 x S_q 4, B 8 / 16 / 32 x S_q 1 on 212 SMs) capped at the
     DEFAULT k of 1 (the k >= 2 renderings a measured lever); the AUTO resolution matrix."""
-    from cudnn.sdpa.fwd import heuristics as H
+    from cudnn.sdpa.fwd import sparse_tile_rules as H
 
     assert H.LEAN_SPARSE_MAX_UNITS == 4 and H.LEAN_SPARSE_DEFAULT_MAX_SUB_TILES_PER_CTA == 1 and H._SPARSE_LEAN_TILE_RULE_CC == (10, 7)
     sel = lambda b, s, **kw: H.sparse_decode_lean_tile_selected(
@@ -1640,7 +1640,7 @@ def test_lean_tile_declines_by_name_on_the_adapter(monkeypatch):
     served rows (4 = the kernel's own bound, ONE constant read by the rule), per-row lists past one row (the lean CTA gathers one list per
     sequence), ``top_k`` below 8, the tcgen05 core's ``softmax_groups``; a split that is not a lean split; the k pin's range, its agreement
     with a pinned split, and the pin refused by name where the resolved body is tcgen05 (explicit or AUTO) -- never silently ignored."""
-    from cudnn.sdpa.fwd import heuristics as H
+    from cudnn.sdpa.fwd import sparse_tile_rules as H
 
     decl = lambda **kw: H.sparse_lean_tile_decline(**dict(dict(s_q=1, group=12, top_k=512), **kw))  # noqa: E731
     assert decl() is None and decl(list_per_sequence=False) is None and decl(group=16) is None and decl(top_k=8) is None

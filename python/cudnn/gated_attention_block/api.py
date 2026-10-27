@@ -963,8 +963,8 @@ def sparse_decode_split_choice(
     A PERFORMANCE choice only (the fp32 partials ride the workspace, the combine is one more launch): the same function under every
     value, so a caller may pin any split in ``[1, ceil((top_k + 1) / 32)]`` (the cap binds the DEFAULT only)."""
     if tile_form == "lean":
-        from cudnn.sdpa.fwd.config_sm107 import lean_sparse_split
-        from cudnn.sdpa.fwd.heuristics import sparse_lean_sub_tiles_per_cta
+        from cudnn.sdpa.fwd.sparse_tile_rules import lean_sparse_split
+        from cudnn.sdpa.fwd.sparse_tile_rules import sparse_lean_sub_tiles_per_cta
 
         k = (
             int(sub_tiles_per_cta)
@@ -1124,7 +1124,7 @@ class DecodeEnvelope:
             return None
         if kv_cache_dtype is not None and kv_cache_dtype not in (torch.bfloat16, torch.float16):
             return None  # e4m3 pools: the gathered cast + the dense decode tile run, no body of the sparse core
-        from cudnn.sdpa.fwd import heuristics as _H
+        from cudnn.sdpa.fwd import sparse_tile_rules as _H
 
         g = self._geometry
         q = g.qsa
@@ -5767,7 +5767,7 @@ class _SparseSdpa(_Stage):
         )
         self._impl.check_support()
         # the route PINNED by the kernel that will compile (a route is pinned, never transcribed): the adapter's resolved body must be the one the block declared
-        from cudnn.sdpa.fwd.heuristics import SPARSE_TILE_FORM_AUTO
+        from cudnn.sdpa.fwd.sparse_tile_rules import SPARSE_TILE_FORM_AUTO
 
         if self.tile_form != SPARSE_TILE_FORM_AUTO and self._impl.tile_form != self.tile_form:
             raise RuntimeError(
@@ -9726,7 +9726,7 @@ class GatedAttentionBlockFwd(APIBase):
         (``"auto"`` / ``"lean"`` / ``"tcgen05"``), ``sparse_sub_tiles_per_cta`` None or an int >= 1 and ONLY with the explicit ``"lean"`` (a
         lean-only pin is never silently ignored); off a QsaSpec geometry only ``"auto"`` and no pin (the knobs are the block-sparse stage's).
         Records the declaration; the resolution follows once the form is known."""
-        from cudnn.sdpa.fwd.heuristics import SPARSE_TILE_FORM_AUTO, SPARSE_TILE_FORM_LEAN, SPARSE_TILE_FORMS
+        from cudnn.sdpa.fwd.sparse_tile_rules import SPARSE_TILE_FORM_AUTO, SPARSE_TILE_FORM_LEAN, SPARSE_TILE_FORMS
 
         if not isinstance(sparse_tile_form, str) or sparse_tile_form not in SPARSE_TILE_FORMS:
             raise ValueError(
@@ -9763,7 +9763,7 @@ class GatedAttentionBlockFwd(APIBase):
         ``sparse_tile_form`` None, so the paged form never comes here); a dense geometry has no body."""
         if self.qsa is None or self.sparse_tile_form is not None or self.kv_source == KV_SOURCE_PAGED:
             return
-        from cudnn.sdpa.fwd import heuristics as _H
+        from cudnn.sdpa.fwd import sparse_tile_rules as _H
 
         if self.sparse_tile_form_requested == _H.SPARSE_TILE_FORM_LEAN:
             reason = _H.sparse_lean_tile_decline(
@@ -10448,7 +10448,7 @@ class GatedAttentionBlockFwd(APIBase):
             # THE BODY of the sparse core (the constructor's note on `sparse_tile_form`): resolved HERE, before the split, because the split
             # is the body's -- the lean tile's splits SELECT its k.  The admissibility and the placement rule are the heuristics' (one copy;
             # the adapter runs the same functions at check_support and `_SparseSdpa` pins its readback against this resolution).
-            from cudnn.sdpa.fwd import heuristics as _H
+            from cudnn.sdpa.fwd import sparse_tile_rules as _H
 
             top_k = self.qsa.top_k
             reason = _H.sparse_lean_tile_decline(
@@ -10491,7 +10491,7 @@ class GatedAttentionBlockFwd(APIBase):
             if form == _H.SPARSE_TILE_FORM_LEAN:
                 if reason is not None:
                     raise NotImplementedError(f"sparse_tile_form='lean' -- {reason}")
-                from cudnn.sdpa.fwd.config_sm107 import lean_sparse_n_sub, lean_sparse_split
+                from cudnn.sdpa.fwd.sparse_tile_rules import lean_sparse_n_sub, lean_sparse_split
 
                 n_sub, splits, k_max = lean_sparse_n_sub(top_k), _H.sparse_lean_splits(top_k), _H.sparse_lean_max_sub_tiles_per_cta(top_k)
                 if decode_split_kv is None:
@@ -10707,7 +10707,7 @@ class GatedAttentionBlockFwd(APIBase):
         ``kernel_template`` (the tcgen05 core everywhere; the lean tile on cc 10.7, its one part -- ``heuristics._SPARSE_LEAN_TILE_RULE_CC``),
         the AUTO pin's reading on this part (``SPARSE_LEAN_TILE_DEFAULT_CCS``: cc 10.7, the measured part) and the part itself for the per-cell
         :meth:`DecodeEnvelope.sparse_tile`; empty off the sparse form."""
-        from cudnn.sdpa.fwd import heuristics as _H
+        from cudnn.sdpa.fwd import sparse_tile_rules as _H
 
         if not sparse_served:
             return dict(sparse_tiles=(), sparse_tile_lean_default=False, device_cc=cc)

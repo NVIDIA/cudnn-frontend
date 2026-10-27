@@ -3930,15 +3930,20 @@ def make_cfg_d256_decode(params: TemplateParams) -> Tuple[CfgD256Decode, TmaIter
 # N_KEYS == 32 (one 32-bit mask word per ROW per sub-tile, 8 blocks per sub-tile), SMEM = 2 x STAGES x N_KEYS x 512 + N_MT x 8192 under the
 # standard carveout, 1 <= SUB_TILES_PER_CTA <= 8 (the body is range_constexpr-unrolled over it), 1 <= S_Q <= 4 (the shared list's bound).
 _LEAN_FLAVOR = "sm107 d256 sparse lean"
-LEAN_SPARSE_N_KEYS = 32  # keys per sub-tile = 8 four-token blocks = one 32-bit valid word
+from cudnn.sdpa.fwd.sparse_tile_rules import (  # noqa: E402 -- the lean host arithmetic's DSL-free home
+    _LEAN_N_TAIL_MAX,
+    LEAN_SPARSE_MAX_SEQLEN_Q,
+    LEAN_SPARSE_MAX_SUB_TILES_PER_CTA,
+    LEAN_SPARSE_N_KEYS,
+    LEAN_SPARSE_SERVED_MAX_S_Q,
+    LEAN_SPARSE_TOPK_MIN,
+    lean_sparse_n_sub,
+    lean_sparse_split,
+)
+
 LEAN_SPARSE_BLOCKS_PER_SUB = LEAN_SPARSE_N_KEYS // _SPARSE_BLOCK_SIZE
 LEAN_SPARSE_THREADS_PER_MT = 128  # four warps per m16 tile: the d-slices of the split-D plan
 LEAN_SPARSE_ROWS_PER_MT = 16  # the m16n8k16 M extent: one m-tile = 16 query rows (token-major: row R = s x G + g)
-LEAN_SPARSE_MAX_SEQLEN_Q = 4  # the serving step's rows per sequence under ONE shared list (the sparse function's own S_q <= 4 bound)
-LEAN_SPARSE_MAX_SUB_TILES_PER_CTA = 8  # the sub-tile loop is unrolled at trace time (cutlass.range_constexpr); the fill rule never exceeds 7 (B 32)
-LEAN_SPARSE_TOPK_MIN = 8  # top_k < 8 is ONE sub-tile = split 1: the tcgen05 tile's cell (the adapter routes it there)
-LEAN_SPARSE_SERVED_MAX_S_Q = LEAN_SPARSE_MAX_SEQLEN_Q  # the step rows per sequence the ROUTE serves on the lean body = the kernel's own S_q bound (4: N_MT = ceil(S_q x G / 16) m16 tiles over ONE gathered sub-tile); the adapter and the heuristics read THIS constant, never a literal
-_LEAN_N_TAIL_MAX = 2  # the S_q <= 4 bound on the appended tail blocks (the same host bound at every S_q, so the S_q axis changes no grid)
 assert 1 <= LEAN_SPARSE_SERVED_MAX_S_Q <= LEAN_SPARSE_MAX_SEQLEN_Q  # the route never serves more rows than the kernel renders (the tripwire)
 _LEAN_S_EXCHANGE_BYTES = 4 * 4 * 32 * 16  # sS[4 warps][4 n-blocks][32 lanes][16 B] = 8 KiB per m-tile
 
@@ -3964,18 +3969,6 @@ def lean_sparse_n_mt(seqlen_q: int, qh_per_kh: int, rows_per_mt: int = LEAN_SPAR
     """The m16 tiles that hold the sequence's ``S_q x G`` query rows (token-major): 1 at S_q 1 / G 12, 2 at S_q 2, 3 at S_q 3..4 (G 12), 4 at
     S_q 4 / G 16, 1 at G 1 (four rows, one per token)."""
     return -(-(int(seqlen_q) * int(qh_per_kh)) // int(rows_per_mt))
-
-
-def lean_sparse_n_sub(top_k: int, block_size: int = _SPARSE_BLOCK_SIZE, n_keys: int = LEAN_SPARSE_N_KEYS) -> int:
-    """The HOST bound on a (sequence, KV head)'s 32-key sub-tiles: ``ceil((top_k + n_tail_max) x block_size / n_keys)`` = 65 at
-    top_k 512 (the device's real ``count + n_tail`` is smaller: the chunks past it are DEAD items that write the combine's identity)."""
-    return -(-(int(top_k) + _LEAN_N_TAIL_MAX) * int(block_size) // int(n_keys))
-
-
-def lean_sparse_split(top_k: int, sub_tiles_per_cta: int) -> int:
-    """The lean tile's split = the chunk count ``ceil(n_sub / k)``: the grid's x extent and the combine's partial count (65 / 33 / 22 / 17 at
-    top_k 512 for k = 1 / 2 / 3 / 4)."""
-    return -(-lean_sparse_n_sub(top_k) // int(sub_tiles_per_cta))
 
 
 def lean_sparse_smem_bytes(stages: int, n_mt: int = 1, n_keys: int = LEAN_SPARSE_N_KEYS, bpe_val: int = 2, d: int = 256) -> int:
