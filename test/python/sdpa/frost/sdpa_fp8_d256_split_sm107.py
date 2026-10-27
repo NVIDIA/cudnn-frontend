@@ -4,7 +4,6 @@
 
 from dataclasses import replace
 
-import cudnn
 import test_sdpa_prepared_fp8 as dense
 from sdpa_fp8_d256_padding import _check, _clone_with_slack, _record_route
 
