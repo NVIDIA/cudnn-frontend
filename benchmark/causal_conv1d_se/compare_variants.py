@@ -16,6 +16,7 @@ from cutlass import cute
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
 import tune
+from backend import verify_loaded_library
 
 
 def main():
@@ -38,6 +39,7 @@ def main():
     from se_bitwise import bitwise_difference, parameter_difference, ATOMIC_OUTPUTS
 
     a = json.loads(args.case.read_text())["args"]
+    requested_backend = Path(a["backend_library"]).resolve(strict=True)
     B, D, L = map(int, a["shape"].split(","))
     b2b, nwh = "projection_width" in a, a.get("layout") == "nwc"
     backward = args.direction == "backward" if args.direction else "rows" in a
@@ -99,6 +101,7 @@ def main():
         backend_fn(torch.cuda.current_stream().cuda_stream, *(t.data_ptr() for t in inputs + list(expected.values())), *dimensions)
 
     backend()
+    backend_identity = verify_loaded_library(requested_backend, cudnn.backend_version())
     functions = {"backend": backend}
     records = {}
     for index, item in enumerate(args.variant):
@@ -245,6 +248,7 @@ def main():
                 "cc": torch.cuda.get_device_capability(),
                 "case": str(args.case),
                 "args": a,
+                "backend_identity": backend_identity,
                 "direction": "backward" if backward else "forward",
                 "variants": records,
                 "timing": measurements,

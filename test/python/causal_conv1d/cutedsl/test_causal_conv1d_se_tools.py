@@ -143,3 +143,99 @@ def test_replay_profiles_the_module_that_runs(script, config, tool_tree, tmp_pat
     assert events == ["start", "candidate", *(["launch"] * 5), "pop", "stop", "timed"]
     record = json.loads((output / "compilation.json").read_text())
     assert record["command"][0] == f"{script}.py"
+
+
+@pytest.mark.parametrize("selection", ["missing", "different", "ambiguous", "replaced", "matching_symlink"])
+def test_loaded_backend_library_identity(selection, tmp_path, monkeypatch):
+    """Reject false attribution, accepting an alias only when the loaded file identity matches."""
+    import hashlib
+    import os
+
+    tool = _load("backend")
+    loaded = tmp_path / "libcudnn_ext.so.9"
+    loaded.write_bytes(b"loaded backend")
+    other = tmp_path / "other/libcudnn_ext.so.9"
+    other.parent.mkdir()
+    other.write_bytes(b"other backend")
+    alias = tmp_path / "backend.so"
+    alias.symlink_to(loaded)
+    stat = loaded.stat()
+    device = f"{os.major(stat.st_dev):x}:{os.minor(stat.st_dev):x}"
+    inode = stat.st_ino + (selection == "replaced")
+    mappings = f"0000-1000 r-xp 00000000 {device} {inode} {loaded}\n"
+    if selection == "ambiguous":
+        mappings += f"1000-2000 r-xp 00000000 {device} {other.stat().st_ino} {other}\n"
+    read_text = Path.read_text
+    monkeypatch.setattr(Path, "read_text", lambda path, *args, **kwargs: mappings if str(path) == "/proc/self/maps" else read_text(path, *args, **kwargs))
+    requested = tmp_path / "missing.so" if selection == "missing" else (other if selection == "different" else alias)
+    if selection == "matching_symlink":
+        identity = tool.verify_loaded_library(requested, 92900)
+        assert identity == dict(
+            requested_path=str(loaded),
+            loaded_path=str(loaded),
+            sha256=hashlib.sha256(loaded.read_bytes()).hexdigest(),
+            size_bytes=14,
+            frontend_backend_version=92900,
+        )
+    else:
+        with pytest.raises(FileNotFoundError if selection == "missing" else RuntimeError):
+            tool.verify_loaded_library(requested, 92900)
+
+
+@pytest.mark.parametrize("timing_state", ["empty", "missing_backend", "missing_candidate", "nonfinite", "zero", "complete"])
+def test_fused_reuse_requires_measured_forward_and_backward(timing_state, tool_tree, tmp_path, monkeypatch):
+    """Rerun incomplete fused probes instead of counting correctness-only results as timings."""
+    import hashlib
+
+    tool = _load("manifest_matrix")
+    tool.__file__ = str(tool_tree / "manifest_matrix.py")
+    cases = [
+        dict(family="b2b", dtype="float32", shape=[1, 8, 17], width=3, mixer_width=4, silu=False, directions=["forward", "backward"]),
+        dict(family="nwc", dtype="bfloat16", shape=[2, 768, 4096], width=4, silu=True, directions=["forward"]),
+    ]
+    manifest = tmp_path / "cases.json"
+    manifest.write_text(json.dumps({"cases": cases}))
+    complete = {name: {"median_us": 1.0} for name in ("candidate_fwd", "backend_fwd", "candidate_bwd", "backend_bwd")}
+    timings = {name: dict(value) for name, value in complete.items()}
+    if timing_state == "empty":
+        timings.clear()
+    elif timing_state == "missing_backend":
+        timings.pop("backend_bwd")
+    elif timing_state == "missing_candidate":
+        timings.pop("candidate_bwd")
+    elif timing_state == "nonfinite":
+        timings["candidate_bwd"]["median_us"] = float("nan")
+    elif timing_state == "zero":
+        timings["backend_fwd"]["median_us"] = 0
+    retained = {
+        "gpu": "test GPU",
+        "cc": [9, 0],
+        "args": dict(backend_library="unused.so", dtype="float32", shape="1,8,17", projection_width=3, mixer_width=4),
+        "sha256": {"b2b_kernel.py": hashlib.sha256(b"# frozen test source\n").hexdigest()},
+        "timing": timings,
+    }
+    reuse = tmp_path / "reuse"
+    reuse.mkdir()
+    (reuse / "probe.json").write_text(json.dumps(retained))
+    output = tmp_path / "results"
+    monkeypatch.setattr(
+        sys, "argv", [tool.__file__, "--manifest", str(manifest), "--output", str(output), "--backend-library", "unused.so", "--reuse", str(reuse)]
+    )
+    calls = []
+
+    def run(command, **kwargs):
+        """Return measured fused results only when the manifest explicitly reruns the probe."""
+        calls.append(command)
+        fused = Path(command[1]).name == "probe_b2b.py"
+        if fused:
+            assert "--timing" in command
+        return subprocess.CompletedProcess(command, 0, stdout=json.dumps({"timing": complete}) if fused else "", stderr="")
+
+    monkeypatch.setattr(tool.subprocess, "run", run)
+    with pytest.raises(SystemExit) as error:
+        tool.main()
+    assert error.value.code == 0
+    records = json.loads((output / "summary.json").read_text())["results"]
+    assert records[0].get("reused", False) == (timing_state == "complete")
+    assert len(calls) == (1 if timing_state == "complete" else 2)
+    assert records[0]["median_us"] == {name: 1.0 for name in complete}

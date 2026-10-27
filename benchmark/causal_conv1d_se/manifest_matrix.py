@@ -5,6 +5,7 @@
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 import subprocess
 import sys
@@ -64,8 +65,15 @@ def main():
             if expected[name] not in [v for k, v in data.get("sha256", {}).items() if Path(k).name == name]:
                 continue
             values = data.get("results", data.get("timing", {}))
-            candidate_names = [k for k in values if k not in ("backend", "frontend", "backend_fwd", "backend_bwd")]
-            if mk[-1] != "both" and len(candidate_names) != 1:
+            if mk[-1] == "both":
+                required = ("candidate_fwd", "backend_fwd", "candidate_bwd", "backend_bwd")
+            else:
+                candidate_names = [k for k in values if k not in ("backend", "frontend")]
+                if len(candidate_names) != 1:
+                    continue
+                required = ("backend", candidate_names[0])
+            medians = [values.get(name, {}).get("median_us") for name in required]
+            if not all(isinstance(value, (int, float)) and math.isfinite(value) and value > 0 for value in medians):
                 continue
             cache[mk] = (p, data)
     cases = json.loads(args.manifest.read_text())["cases"]
