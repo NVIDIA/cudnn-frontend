@@ -398,9 +398,9 @@ def test_nonpaged_d128_thd_lead_serves_a_valid_packed_first_plan(group, causal, 
     ],
 )
 def test_nonpaged_d128_mha_thd_leads_from_512_declared_tokens(device_cc, batch, q, kv, expected):
-    """Unpacked MHA d128 causal THD leads with equal declared Q and KV extents over a cache of at least 4096 declared tokens when the
-    declared Q rows fill the SMs or each sequence carries 512 declared Q tokens; chunks, shorter caches, HALF, non-causal and windowed
-    graphs stay backend-first."""
+    """Unpacked MHA d128 causal THD leads when the declaration admits no chunk over a longer cache (equal extents, equal totals when
+    declared), the cache holds at least 4096 declared tokens and each sequence carries 512 declared Q tokens; chunks, a Q total declared
+    alone, shorter caches, HALF, non-causal and windowed graphs stay backend-first."""
     from cudnn.sdpa.fwd import placement
 
     base = dict(d_qk=128, b=batch, h_q=32, h_kv=32, s_q=q, s_kv=kv, causal=True, bottom_right=True, dtype=cudnn.data_type.BFLOAT16, device_cc=device_cc)
@@ -416,8 +416,19 @@ def test_nonpaged_d128_mha_thd_leads_from_512_declared_tokens(device_cc, batch, 
     cache = dict(base, b=4096, s_q=65536, s_kv=65536)
     assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**cache)) == placement.LEAD  # FlashInfer cache-shape declaration
     assert (
-        placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**cache, "max_total_seq_len_q": 16384})) == placement.LEAD
-    )  # bounded total under CUDA graphs
+        placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**cache, "max_total_seq_len_q": 16384})) == placement.TRAIL
+    )  # a Q total declared alone (FlashInfer under CUDA graphs) admits chunks over a longer cache
+    assert (
+        placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**cache, "max_total_seq_len_q": 16384, "max_total_seq_len_kv": 16384}))
+        == placement.TRAIL
+    )  # equal totals, but four tokens per declared sequence
+    few = dict(base, b=4, s_q=4096, s_kv=4096)
+    assert (
+        placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**few, "max_total_seq_len_q": 4096, "max_total_seq_len_kv": 4096})) == placement.LEAD
+    )  # equal totals: no sequence can see a longer cache than its query
+    assert (
+        placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**few, "max_total_seq_len_q": 1024})) == placement.TRAIL
+    )  # a Q total below the cache capacity: 256-token queries over 4096-token caches
 
 
 @pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
@@ -427,7 +438,8 @@ def test_nonpaged_d128_mha_thd_leads_from_512_declared_tokens(device_cc, batch, 
     [(1, 8192, 8192, "lead"), (16, 512, 512, "lead"), (16, 512, 4096, "trail"), (64, 256, 256, "trail"), (1, 256, 256, "trail")],  # (16, 512, 4096): a chunk
 )
 def test_nonpaged_d64_thd_leads_from_512_declared_tokens(device_cc, h_q, h_kv, batch, q, kv, expected):
-    """Unpacked d64 causal THD leads when the declared Q rows fill the SMs or each sequence carries 512 tokens; small, HALF, non-causal and windowed graphs stay backend-first."""
+    """Unpacked d64 causal THD leads when the declaration admits no chunk over a longer cache and each sequence carries 512 declared tokens;
+    chunks, a Q total declared alone, small, HALF, non-causal and windowed graphs stay backend-first."""
     from cudnn.sdpa.fwd import placement
 
     base = dict(
@@ -445,8 +457,19 @@ def test_nonpaged_d64_thd_leads_from_512_declared_tokens(device_cc, h_q, h_kv, b
     cache = dict(base, b=4096, s_q=65536, s_kv=65536)
     assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**cache)) == placement.LEAD  # FlashInfer cache-shape declaration
     assert (
-        placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**cache, "max_total_seq_len_q": 16384})) == placement.LEAD
-    )  # bounded total under CUDA graphs
+        placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**cache, "max_total_seq_len_q": 16384})) == placement.TRAIL
+    )  # a Q total declared alone (FlashInfer under CUDA graphs) admits chunks over a longer cache
+    assert (
+        placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**cache, "max_total_seq_len_q": 16384, "max_total_seq_len_kv": 16384}))
+        == placement.TRAIL
+    )  # equal totals, but four tokens per declared sequence
+    few = dict(base, b=4, s_q=4096, s_kv=4096)
+    assert (
+        placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**few, "max_total_seq_len_q": 4096, "max_total_seq_len_kv": 4096})) == placement.LEAD
+    )  # equal totals: no sequence can see a longer cache than its query
+    assert (
+        placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**few, "max_total_seq_len_q": 1024})) == placement.TRAIL
+    )  # a Q total below the cache capacity: 256-token queries over 4096-token caches
 
 
 @requires_dsl

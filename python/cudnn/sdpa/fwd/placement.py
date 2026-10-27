@@ -346,15 +346,17 @@ S = 2048 lost and group 2 was not covered.
 Rows with no measurement (SM80, SM100 mxfp8) keep the historical order (LEAD); they are still
 opt-in, so the order is only observable with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``.
 SM100 / SM103 nonpaged BF16 d128 MHA causal THD (2026-10-25, ``NONPAGED_D128_MHA_THD_*``): one Q head per KV head cannot
-pack, so the lead is the unpacked FROST plan; it leads the backend when the declared Q and KV extents are equal (a ragged
-batch without a prefix), the declared cache holds at least 4096 tokens, and the declared Q rows fill the SMs or each
-sequence carries at least 512 declared Q tokens, on cc 10.0 and cc 10.3; it trails below that, and a chunk over a longer
-cache (a declared Q extent below the KV extent) keeps the backend. FlashInfer's ragged declaration is one graph per shape
-class at its cache shape for both Q and KV (or a bounded total under CUDA graphs), so the rule decides once per class.
+pack, so the lead is the unpacked FROST plan; it leads the backend when the declaration admits no chunk over a longer
+cache (equal Q and KV extents and, with packed totals declared, equal totals), the declared cache holds at least 4096
+tokens and each sequence carries at least 512 declared Q tokens (the extent, or the declared total spread over the batch),
+on cc 10.0 and cc 10.3; it trails below that. A declared Q extent below the KV extent, or a Q total declared alone or
+below the KV total, keeps the backend. FlashInfer's ragged declaration without totals is one graph per shape class at its
+cache shape for both Q and KV, so the rule decides once per class; its bounded Q total under CUDA graphs keeps the
+backend.
 SM100 / SM103 nonpaged BF16 d64 causal THD (2026-10-26, ``NONPAGED_D64_THD_*``): d64 THD cannot pack, so the lead is the
-unpacked FROST plan for any whole-number head ratio; it leads the backend when the declared Q and KV extents are equal and
-the declared Q rows fill the SMs or each sequence carries at least 512 declared tokens, on cc 10.0 and cc 10.3, and trails
-below that; a chunk over a longer cache keeps the backend.
+unpacked FROST plan for any whole-number head ratio; it leads the backend when the declaration admits no chunk over a
+longer cache (equal Q and KV extents and, with packed totals declared, equal totals) and each sequence carries at least
+512 declared tokens, on cc 10.0 and cc 10.3, and trails below that.
 
 """
 
@@ -408,6 +410,18 @@ def _declared_q_total(facts) -> int:
     """The declared Q token total of a THD graph: ``max_total_seq_len_q`` when the graph declares one (an explicit
     zero included), else the dense envelope ``b * s_q``."""
     return facts.b * facts.s_q if facts.max_total_seq_len_q is None else facts.max_total_seq_len_q
+
+
+def _thd_declared_without_prefix(facts) -> bool:
+    """Whether the declaration admits no chunk over a longer cache: equal Q and KV extents and, when the graph declares
+    packed token totals, equal totals (a Q total alone, or unequal totals, leave room for sequences whose cache is longer
+    than their query)."""
+    return facts.s_q == facts.s_kv and facts.max_total_seq_len_q == facts.max_total_seq_len_kv
+
+
+def _thd_declared_tokens_per_sequence(facts) -> int:
+    """The declared Q tokens one sequence can carry: the extent, or the declared total spread over the batch."""
+    return min(facts.s_q, -(-_declared_q_total(facts) // max(facts.b, 1)))
 
 
 CHUNKED_SQUARE_MIN_KV_TOKENS = 32768  # s_q == s_kv at <= 128 tiles: kept from the 2026-09-18 bound, not re-measured
@@ -1014,16 +1028,12 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
         and (facts.d_qk, facts.d_v) == (128, 128)
         and facts.h_q == facts.h_kv
         and facts.causal
-        and facts.s_q == facts.s_kv  # equal declared extents: a ragged batch without a prefix, either diagonal alignment
+        and _thd_declared_without_prefix(facts)  # either diagonal alignment
         and facts.window_left is None
         and not (facts.has_sink or facts.right_band_widening or facts.has_epilogue_gate)
         and facts.device_cc in NONPAGED_D128_MHA_THD_CCS
         and facts.s_kv >= NONPAGED_D128_MHA_THD_MIN_KV_TOKENS
-        and (
-            # the declared Q rows fill the SMs (a bounded or cache-shape declaration), or each sequence is long
-            facts.h_q * min(facts.b * facts.s_q, _declared_q_total(facts)) >= THD_PACKED_MIN_Q_ROWS_PER_SM * (facts.device_sm_count or 148)
-            or min(facts.s_q, -(-_declared_q_total(facts) // max(facts.b, 1))) >= NONPAGED_D128_MHA_THD_MIN_TOKENS
-        )
+        and _thd_declared_tokens_per_sequence(facts) >= NONPAGED_D128_MHA_THD_MIN_TOKENS
     ):
         return LEAD  # unpacked causal MHA d128 THD
     if (
@@ -1036,15 +1046,12 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
         and facts.h_kv > 0
         and facts.h_q % facts.h_kv == 0
         and facts.causal
-        and facts.s_q == facts.s_kv  # equal declared extents: a ragged batch without a prefix, either diagonal alignment
+        and _thd_declared_without_prefix(facts)  # either diagonal alignment
         and facts.window_left is None
         and not (facts.has_sink or facts.right_band_widening or facts.has_epilogue_gate)
         and facts.device_cc in NONPAGED_D64_THD_CCS
         and facts.s_kv >= NONPAGED_D64_THD_MIN_TOKENS
-        and (
-            facts.h_q * min(facts.b * facts.s_q, _declared_q_total(facts)) >= THD_PACKED_MIN_Q_ROWS_PER_SM * (facts.device_sm_count or 148)
-            or min(facts.s_q, -(-_declared_q_total(facts) // max(facts.b, 1))) >= NONPAGED_D64_THD_MIN_TOKENS
-        )
+        and _thd_declared_tokens_per_sequence(facts) >= NONPAGED_D64_THD_MIN_TOKENS
     ):
         return LEAD  # unpacked causal d64 THD
     if facts.thd or facts.has_paged_kv or (facts.window_left is not None and not _d512_swa(facts)):
