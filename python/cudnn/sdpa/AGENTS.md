@@ -415,8 +415,13 @@ production kernels gain no debug knob or timing-dependent assertion.
   with `batch_idx == n_batch`. Allocating `B+1` map slots makes that address
   in bounds but does not initialize a descriptor there.
 - When setup writes maps only for the `B` real sequences, exit dead initial
-  clusters before acquiring maps or shared resources. Use the cluster-uniform
+  clusters before acquiring maps, allocating TMEM, or entering role-specific
+  barrier protocols. Use the cluster-uniform
   `exit_if_dead_thd_cluster` helper; a role-local exit can strand barrier peers.
+- Under programmatic dependent launch, wait for setup before the dead-unit
+  check reads its metadata. Uniform CTA/cluster-local initialization may
+  overlap setup if all roles finish it before the exit and it owns no TMEM
+  or tensor maps. The SM107 paged physical-origin replay tests cover this order.
 - Exercise overlaunch without total-length hints and replay after changing
   all query lengths to zero. Check O/Stats canaries and run memcheck; ordinary
   live-row numerical comparisons do not cover the dead-unit path.
@@ -1186,6 +1191,23 @@ credit. Source-level vector loads can be scalarized, so the single-CTA THD
 path reads through lane zero and broadcasts before the release. Validate
 repeated waves with Compute Sanitizer racecheck as well as O/Stats tests.
 
+This also applies to the custom D256 FP8 predecode scheduler: use local
+stores and a release arrive for its single-CTA THD payload, preserving the
+transaction-counted DSMEM arm for multi-CTA renderings. The paged physical
+origin and multiwave cases in `test_sdpa_fwd_paged_thd_fp8.py` exercise this
+composition; numerics alone can pass while memcheck rejects the DSMEM write.
+Broadcast predecoded fields (Q tile, head, batch, bounds and split) as well as
+the original response before returning a slot credit. A vector response read
+alone leaves scalar field loads racing with the next local publication; the
+D256 multiwave racecheck catches the output-store warp reading a reused slot.
+
+The D256 FP8 shared-alpha handoff uses per-lane release arrivals for both
+publication and reuse, with matching barrier counts. Keep elected warp
+credits confined to the TMEM-only handoff: a TMEM wait does not publish the
+other lanes' shared alpha stores. Run the top-left mask/sink case in
+`test_sdpa_fwd_paged_thd_fp8.py` under racecheck, including its dense and
+compact controls, as well as the persistent scheduler case.
+
 Packed split workspace is bounded by declared packed-Q capacity. Every
 partial store and combine read must use live token coordinates, including
 empty sequences and nonaligned tails. `test_paged_thd_split_capture_lengths_and_stats`
@@ -1257,3 +1279,18 @@ otherwise hide a missing attribute restriction. For example, the pre-folded
 scale case in `test_thd_pack_gqa_unsupported_flavors_decline` includes legal
 CGA2 as well as CGA1. Removing only the pre-folded-scale decline must make the
 CGA2 case fail while the unrelated-domain cases still pass.
+
+
+Paged FP8 D256 uses rank-5 TMA maps with more than one dimension subtile.
+When a page is shorter than the KV tile, keep the shared-memory pitch of each
+dimension slab at the full tile height; a short TMA box must not pack the
+next dimension slab directly after the page rows. Use each pool's own strides
+and table. `test_paged_graph_fp8_d256_page_boundaries` exercises both sides
+of the tile/page boundary and independently laid-out K/V pools.
+
+A sink-only row must publish O=0 and LSE=sink even for a very negative finite
+sink. An empty softmax's reset max is a sentinel, not a real score: folding
+`exp(sink - sentinel)` can underflow and turn LSE into -inf. Select the
+sink-only result explicitly and retain the later padded-Q trim override.
+Detectors: `test_paged_graph_fp8_sink_rebind_replay` and
+`test_prepared_fp8_d256_dense_keyless_sink` include sink logits -120/+120.

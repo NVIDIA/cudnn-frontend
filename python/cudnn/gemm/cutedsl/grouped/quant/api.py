@@ -1897,6 +1897,7 @@ def grouped_gemm_quant_wrapper_sm100(
         )
 
     cache_key += (
+        a_tensor.device,
         wrapper_operand_meta(scheduler_counter_tensor),
         generate_amax,
         is_flat_sf(sfa_tensor),

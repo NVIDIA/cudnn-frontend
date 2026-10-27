@@ -12,41 +12,53 @@ pytestmark = [requires_dsl]
 
 
 @pytest.mark.parametrize(
-    "dim,dtype_name,stats_layout,total_hints",
+    "dim,dtype_name,stats_layout,total_hints,pack_gqa,splits",
     [
         pytest.param(
             dim,
             dtype,
             stats,
             totals,
+            False,
+            1,
             marks=pytest.mark.L0 if dtype == "bfloat16" and stats == "token" and totals else pytest.mark.L1,
         )
         for dim in (128, 256)
         for dtype in ("float16", "bfloat16")
         for stats in ("token", "head")
         for totals in (False, True)
+    ]
+    + [
+        pytest.param((576, 512), "bfloat16", "token", True, False, 1, marks=pytest.mark.L0, id="d576_unpacked"),
+        pytest.param((576, 512), "bfloat16", "head", True, True, 1, marks=pytest.mark.L0, id="d576_partial_pack"),
+        pytest.param((576, 512), "float16", "token", False, True, 1, marks=pytest.mark.L1, id="d576_fp16_partial_pack"),
+        pytest.param((576, 512), "bfloat16", "token", True, False, 2, marks=pytest.mark.L0, id="d576_split2_unpacked"),
+        pytest.param((576, 512), "bfloat16", "head", True, True, 5, marks=pytest.mark.L0, id="d576_split5_partial_pack"),
+        pytest.param((576, 512), "float16", "token", False, True, 9, marks=pytest.mark.L1, id="d576_split9_fp16_partial_pack"),
     ],
 )
-def test_independent_thd_origins_rebind_and_capture(dim, dtype_name, stats_layout, total_hints):
+def test_independent_thd_origins_rebind_and_capture(dim, dtype_name, stats_layout, total_hints, pack_gqa, splits):
     import cudnn
     import torch
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("SM100/SM103 physical THD origin path")
     torch.manual_seed(117)
-    batch, heads, kv_heads, maximum = 4, 8, 2, 256
+    d_qk, d_v = dim if isinstance(dim, tuple) else (dim, dim)
+    batch, heads, kv_heads, maximum = 4, (24 if d_qk == 576 else 8), 2, 256
     capacity = batch * maximum
     dtype = getattr(torch, dtype_name)
     ports = ("q", "k", "v", "o", "stats")
     widths = (torch.int64, torch.int32, torch.int64, torch.int32, torch.int64)
-    multipliers = (heads * dim, dim, 1, dim, 1)
+    # D576's +16 head padding must still represent integral token origins.
+    multipliers = (heads * (16 if d_qk == 576 else d_qk), 16 if d_qk == 576 else d_qk, 1, d_v, 1)
     q_lengths, kv_lengths = [129, 0, 65, 33], [147, 0, 92, 50]
     log2_stats = stats_layout == "head"
 
     def tensors(head_padding=0):
         result = {
-            name: torch.empty(batch, maximum, h, dim + head_padding, device="cuda", dtype=dtype)[..., :dim].transpose(1, 2)
-            for name, h in (("q", heads), ("k", kv_heads), ("v", kv_heads), ("o", heads))
+            name: torch.empty(batch, maximum, h, width + head_padding, device="cuda", dtype=dtype)[..., :width].transpose(1, 2)
+            for name, h, width in (("q", heads, d_qk), ("k", kv_heads, d_qk), ("v", kv_heads, d_v), ("o", heads, d_v))
         }
         result["stats"] = (
             torch.empty(capacity, heads, device="cuda", dtype=torch.float32)
@@ -60,7 +72,7 @@ def test_independent_thd_origins_rebind_and_capture(dim, dtype_name, stats_layou
         return result
 
     def flat(t):
-        return t.as_strided((capacity, t.shape[1], dim), (t.stride(2), t.stride(1), t.stride(3)))
+        return t.as_strided((capacity, t.shape[1], t.shape[-1]), (t.stride(2), t.stride(1), t.stride(3)))
 
     def fill(values, shift, short=False, empty=False):
         ql = [97, 0, 49, 17] if short else q_lengths
@@ -74,6 +86,7 @@ def test_independent_thd_origins_rebind_and_capture(dim, dtype_name, stats_layou
         for name, multiplier in zip(ports, multipliers):
             stride = values[name].stride(2) if name != "stats" else (heads if stats_layout == "token" else 1)
             rows = origins[name] + [origins[name][-1] + maximum]
+            assert all(x * stride % multiplier == 0 for x in rows), "fixture offsets must represent whole token rows exactly"
             values["ro_" + name].copy_(
                 torch.tensor([x * stride // multiplier for x in rows], device="cuda", dtype=values["ro_" + name].dtype).view(batch + 1, 1, 1, 1)
             )
@@ -81,7 +94,7 @@ def test_independent_thd_origins_rebind_and_capture(dim, dtype_name, stats_layou
             view = flat(values[name])
             view.fill_(float("nan"))
             for start, length in zip(origins[name], ql if name == "q" else kl):
-                view[start : start + length].copy_(torch.randn(length, view.shape[1], dim, device="cuda", dtype=dtype))
+                view[start : start + length].copy_(torch.randn(length, view.shape[1], view.shape[-1], device="cuda", dtype=dtype))
         return ql, kl, origins
 
     first = tensors()
@@ -100,7 +113,7 @@ def test_independent_thd_origins_rebind_and_capture(dim, dtype_name, stats_layou
         k=nodes["k"],
         v=nodes["v"],
         is_inference=False,
-        attn_scale=dim**-0.5,
+        attn_scale=d_qk**-0.5,
         diagonal_band_right_bound=0,
         use_padding_mask=True,
         seq_len_q=nodes["ql"],
@@ -117,9 +130,18 @@ def test_independent_thd_origins_rebind_and_capture(dim, dtype_name, stats_layou
     )
     graph.validate()
     graph.build_operation_graph()
-    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-    index = next(i for i in range(len(graph.plans)) if graph.get_plan_name_at_index(i).startswith("sdpa_fwd_prefill_sm100"))
-    graph.select_plan(index)
+    if d_qk == 576:
+        from cudnn.engines.manifest import family_for
+
+        graph.create_execution_plan(
+            family_for(graph).offered_ids()["sdpa_fwd_prefill_sm100"],
+            {cudnn.knob_type.TILE_CGA_M: 2, cudnn.knob_type.PACK_GQA: int(pack_gqa), cudnn.knob_type.SPLIT_KV: splits},
+        )
+        graph.select_plan(0)
+    else:
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        index = next(i for i in range(len(graph.plans)) if graph.get_plan_name_at_index(i).startswith("sdpa_fwd_prefill_sm100"))
+        graph.select_plan(index)
     graph.check_support()
     graph.build_plans()
     assert graph.get_plan_name_at_index(graph._plan_index).startswith("sdpa_fwd_prefill_sm100")
@@ -149,7 +171,7 @@ def test_independent_thd_origins_rebind_and_capture(dim, dtype_name, stats_layou
             q = inputs["q"][origins["q"][b] : origins["q"][b] + nq].transpose(0, 1)
             k = inputs["k"][origins["k"][b] : origins["k"][b] + nk].repeat_interleave(heads // kv_heads, dim=1).transpose(0, 1)
             v = inputs["v"][origins["v"][b] : origins["v"][b] + nk].repeat_interleave(heads // kv_heads, dim=1).transpose(0, 1)
-            scores = (q @ k.transpose(-1, -2)) * dim**-0.5
+            scores = (q @ k.transpose(-1, -2)) * d_qk**-0.5
             scores.masked_fill_(torch.arange(nk)[None, :] > torch.arange(nq)[:, None], float("-inf"))
             expected = (scores.softmax(-1) @ v).transpose(0, 1)
             expected_stats = scores.logsumexp(-1).T * (math.log2(math.e) if log2_stats else 1)

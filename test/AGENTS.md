@@ -79,6 +79,12 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 
 ### conftest.py landmines — read before editing
 
+Before releasing Torch's cache, synchronize every device with reserved memory.
+Expandable-segment cleanup can synchronize a default-stream handle on the wrong
+current device, then unmap memory still used by another GPU. The later CuTe launch
+can report that fault. `test_empty_cache_waits_for_other_devices_default_stream`
+checks completion before the unsafe release, so its failing control stays safe.
+
 For a timed subprocess test, arm a child-side `faulthandler` dump before the
 parent deadline and surface `TimeoutExpired.stdout` / `.stderr` in the failure.
 The parent's watchdog shows only `subprocess.communicate()`, and pytest's
@@ -180,6 +186,15 @@ prefill; a short query alone does not imply the D128 decode template.
   the fixed role positions while rejecting a supplied SF_V before launch.
   `test_sdpa_native_pv_bf16_binding.py` compares actual host frames and checks
   BF16 V stride/product addresses beyond `2**32` against an independent oracle.
+
+- **Scope sync-debug to the tested launch inside the capture context.** Enter
+  `with torch.cuda.graph(...)` before enabling `set_sync_debug_mode("error")`,
+  and restore the previous mode in `finally` before leaving that context.
+  Torch capture setup can synchronize and some builds reject it under the guard
+  before the API under test runs. Keep the launch guarded and reset each graph
+  in cleanup; `test_native_d576_compact_thd_rebind_and_capture` exercises this
+  with rebinding, poisoned replay and empty inputs. A pass on a Torch build that
+  also accepts the old scope does not reproduce the CI-specific failure.
 
 - Mark with a level (`@pytest.mark.L0` ... `L4`): L0 must stay fast (default CI smoke); big parameter sweeps go to higher levels.
 - **Test tiers are lists, not markers in test files.** `conftest.py` marks cells `smoke` / `nightly_only` at collection from the committed node-id lists in `tiers/` (`smoke_<arch>.txt` per compute capability -- `CUDNN_TEST_TIER_ARCH=cc107` applies another arch's list on any host -- and `nightly_only.txt`); the rules a cell must satisfy, the kept twin of every demoted cell and the run lines are in `tiers/README.md`. CI keeps `-m L0`; the tiers are opt-in selections (`-m smoke`; `-m "L0 and not nightly_only"`). `test_tiers.py` asserts every listed id still collects and that the markers select exactly the listed cells -- when you rename or re-parametrize a listed test, edit the list in the same commit.
@@ -886,6 +901,13 @@ Keep `stream` last in private CuTe host signatures and preserve the
 `_positional_order` guard. Matching named binder slots and a Python wrapper
 signature does not qualify a reordered entry; exercise a real compiled launch
 after ABI changes before considering a change to that convention.
+
+Kernel host imports can also be dynamic module exports: prepared execution
+reads `_host_thd_split` through the loaded template module. Before removing an
+apparently unused import, inspect attribute consumers and compile a plan using
+that host. `test_native_d576_compact_thd_rebind_and_capture[split2_unpacked]`
+catches a missing D576 split-host export before launch; a source-only import
+check or binder fixture with a synthetic module does not exercise this boundary.
 
 AST-based host frame fixtures must retain unannotated runtime arguments;
 `ast.unparse(None)` fails before binding. Raw positional CuTe entries require

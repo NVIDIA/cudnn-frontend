@@ -94,6 +94,35 @@ def test_quant_memo_uses_current_data_and_routing():
     assert_outputs_equal(warm, cold, changed["valid_m"])
 
 
+def test_quant_cache_keeps_each_devices_workspace(monkeypatch):
+    from cudnn.gemm.cutedsl.grouped.quant import api
+
+    if torch.cuda.device_count() < 2 or torch.cuda.get_device_capability(0) != torch.cuda.get_device_capability(1):
+        pytest.skip("requires two CUDA devices with the same compute capability")
+    monkeypatch.setattr(api, "_quant_wrapper_memo", {})
+    monkeypatch.setattr(api, "_cache_of_GroupedGemmQuantSm100Objects", {})
+    execute = api.GroupedGemmQuantSm100.execute
+
+    def checked_execute(self, *args, **kwargs):
+        # Catch a foreign workspace before its launch can poison the context.
+        assert self._workspace.device == kwargs["a_tensor"].device
+        return execute(self, *args, **kwargs)
+
+    monkeypatch.setattr(api.GroupedGemmQuantSm100, "execute", checked_execute)
+    with torch.cuda.device(0):
+        inputs = natural_inputs(mxfp8_inputs([256] * 4))
+    reference = None
+    for device in (0, 1, 0):
+        with torch.cuda.device(device):
+            moved = {name: value.to(device) if isinstance(value, torch.Tensor) else value for name, value in inputs.items()}
+            result = {name: None if value is None else value.cpu() for name, value in quant_call(moved).items()}
+            if reference is None:
+                reference = result
+            else:
+                assert_outputs_equal(result, reference, inputs["valid_m"])
+    assert len(api._cache_of_GroupedGemmQuantSm100Objects) == 2
+
+
 @pytest.mark.parametrize("operand", ["a_tensor", "b_tensor", "sfa_tensor", "sfb_tensor", "prob_tensor", "d_tensor"])
 def test_quant_rejects_invalid_layout_after_warmup(operand):
     inputs = natural_inputs(mxfp8_inputs([512] * 4))

@@ -1022,6 +1022,10 @@ def _host(
     for _a_idx, _a_op in enumerate(_a_operands):
         a_stride_m, a_stride_k, a_stride_l = _a_stride_sets[_a_idx]
         if cutlass.const_expr(a_is_m_major):
+            # Data descriptors carry CUTLASS's default TMA L2 promotion (128 B): a
+            # 64-byte K row (a 64-byte K tile, or the packed e2m1 side of a mixed pair)
+            # is otherwise its own DRAM request and streams ~30% slower on SM120; 128-byte
+            # rows measure the same either way.
             tma_a_desc_list.append(
                 _tma.create_tensor_map_tiled(
                     global_address=_a_op.iterator.toint(),
@@ -1033,6 +1037,7 @@ def _host(
                     ],
                     box_dims=[a_tma_group_elems, cta_tile_mnk[2], 1],
                     swizzle=ab_tma_swizzle,
+                    l2_promotion=_tma.TensorMapL2Promotion.l2_128b,
                 )
             )
         else:
@@ -1047,6 +1052,7 @@ def _host(
                     ],
                     box_dims=[cta_tile_mnk[2], cta_tile_mnk[0], 1],
                     swizzle=ab_tma_swizzle,
+                    l2_promotion=_tma.TensorMapL2Promotion.l2_128b,
                 )
             )
     # B is the routed token matrix. GATHER uses the original source extent and
@@ -1070,6 +1076,7 @@ def _host(
                 global_strides=b_strides,
                 box_dims=b_box,
                 swizzle=ab_tma_swizzle,
+                l2_promotion=_tma.TensorMapL2Promotion.l2_128b,
             )
         )
 
@@ -1079,8 +1086,12 @@ def _host(
     grid_shape = (grid_num_clusters, 1, 1)
     # Zero the scheduler counter on the launch stream. The PDL main kernel
     # below reads it only after griddepcontrol.wait, i.e. once this has landed.
+    # A runtime that zeroed the counter qword on this stream already (its own
+    # routing kernel, say) renders external_counter_reset True and saves the
+    # one-thread launch; the kernel then relies on that write having landed.
     counter_qword = grid_num_clusters * moe_desc_slots * TENSOR_MAP_QWORDS
-    _dynamic_scheduler_counter_initialization(tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
+    if cutlass.const_expr(not external_counter_reset):
+        _dynamic_scheduler_counter_initialization(tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     _kernel(
         problem_size[0],
         problem_size[1],

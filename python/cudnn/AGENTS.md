@@ -241,6 +241,8 @@ not become a compile key.
   without clearing caches and replays captures from each after changing inputs.
   Use an explicit per-device capture stream in that detector: Torch's implicit
   `graph.default_capture_stream` can retain the first device's stream.
+  `test_quant_cache_keeps_each_devices_workspace` checks the grouped quant
+  cache before a foreign workspace can reach a CUDA launch.
 - **Issue #604 is closed**: SM80 THD compiles use symbolic packed extents.
   The prepared backward host takes Int64 capacities and launch bounds at
   runtime, including the compact Stats head pitch and deterministic-counter
@@ -726,6 +728,17 @@ Shared helpers (schedulers, metadata utils, e.g. `gemm/cutedsl/grouped/moe_*.py`
 
 ## CuTeDSL kernel bodies
 
+Named barriers inside warp-specific branches need unaligned sync and arrive
+instructions. CuTeDSL 4.8's `NamedBarrier.arrive_and_wait()` emits an aligned
+barrier, including through `TmemAllocator.wait_for_alloc()`. Check the launch
+with Compute Sanitizer `--tool synccheck`; ordinary parity tests can pass despite
+divergent-barrier errors. The SM100 GLU/Hadamard/quant JAX parity tests cover this.
+
+A nonblocking barrier arrival must complete before the same warp uses that
+barrier again. Use a separate barrier for tile completion when consumers can
+outrun producers after a subtile arrival. Synccheck alone can miss this hang;
+`test_canonical_jax_glu_hadamard_quant_delayed_act` delays ACT warps to expose it.
+
 **Do not factor code out of a `@cute.kernel` body into a plain Python helper.**
 The DSL AST-transforms only the decorated function's own source: `for` becomes
 an `ir_loop`, `if` becomes an `scf` region. A helper called from the kernel is
@@ -749,6 +762,17 @@ multiple work items per CTA and detect this regression.
 Related: inside a kernel body, `for x in (a, b)` over a Python tuple is
 rewritten into a dynamic `ir_loop` and cannot iterate heterogeneous objects
 (e.g. `GridConstant[TensorMap]`). Unroll it, or use `cutlass.range_constexpr`.
+
+**A named barrier reached from a warp-role branch is a subset barrier, even
+when its declared participant count is correct.** `pipeline.NamedBarrier`
+lowers its operations with the aligned-CTA promise by default; using it from
+only the producer, MMA, epilogue, or reduction warps is undefined. Lower both
+`barrier_cta_arrive` and `barrier_cta_sync` with `aligned=False`, including
+split-phase arrive/wait protocols and TMEM allocation/deallocation gates.
+Do not call `TmemAllocator.wait_for_alloc()` for such a gate: it rebuilds an
+aligned named barrier, so call the original subset barrier directly. Run the
+affected kernel under `compute-sanitizer --tool synccheck`; ordinary numerical
+tests do not diagnose this contract violation.
 
 **Detector.** These break at `compile()`, not at import — `python -c "import ..."`
 and `pytest --collect-only` both stay green. After any refactor of a kernel

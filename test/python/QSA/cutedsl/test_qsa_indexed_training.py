@@ -19,9 +19,8 @@ pytestmark = pytest.mark.L0
 
 @pytest.fixture(autouse=True)
 def indexed_supported_device():
-    # The shared bitmap-QSA fixture also admits SM107; this indexed API does not.
-    if torch.cuda.is_available() and torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("Indexed QSA requires SM100 or SM103")
+    if torch.cuda.is_available() and torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Indexed QSA requires SM100, SM103 or SM107")
 
 
 def indices_for(inputs):
@@ -153,6 +152,8 @@ def canonical_inputs(supported_gpu):
     from cudnn.QSA.two_pass.api import _dsl_cuda_version
     from QSA.cutedsl.two_pass_reference import make_inputs as canonical
 
+    if torch.cuda.get_device_capability() == (10, 7):
+        pytest.skip("The canonical two-pass backward is currently qualified on SM100/SM103")
     if _dsl_cuda_version()[0] < 13:
         pytest.skip("12Q/1KV sparse two-pass requires the CUDA 13 DSL compiler")
     return canonical

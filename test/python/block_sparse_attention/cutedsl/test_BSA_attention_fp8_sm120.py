@@ -329,8 +329,11 @@ def test_sm120_fp8_blk128_dsl_gate_precedes_quantizer_import(monkeypatch):
     _require_sm120()
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     monkeypatch.setattr(interface.cutlass, "__version__", "4.6.0")
+    # The entry dispatches on Q's device first (SM90 / SM100 / SM120 share it); the remaining
+    # operands stay opaque, so the SM120 DSL gate must still raise before any of them is read.
+    q = torch.empty((1,), device="cuda", dtype=torch.bfloat16)
     with pytest.raises(RuntimeError, match=r"requires nvidia-cutlass-dsl>=4\.6\.1"):
-        interface.bsa_fp8_blk128_fwd(object(), object(), object(), object(), 1)
+        interface.bsa_fp8_blk128_fwd(q, object(), object(), object(), 1)
 
 
 @pytest.mark.L0

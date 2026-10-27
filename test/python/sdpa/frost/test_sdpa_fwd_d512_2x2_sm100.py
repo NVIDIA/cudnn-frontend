@@ -78,7 +78,9 @@ def test_two_by_two_host_slots_match_role_split():
         return [a.arg for a in host.args.args if not (a.annotation is not None and "Constexpr" in ast.unparse(a.annotation))]
 
     parent = runtime_slots("sm100/prefill_d512_f16.py")
-    assert runtime_slots(_KERNEL_FILE) == parent
+    # The SM100 twin adds independent V-table strides and physical THD origins
+    # for native D576. The prepared positional entry always keeps stream last.
+    assert runtime_slots(_KERNEL_FILE) == parent[:-1] + ["table_v_strides", "thd_origin_ptrs", parent[-1]]
     assert runtime_slots("sm107/prefill_d512_f16_2x2.py") == parent
 
 
@@ -156,7 +158,7 @@ _ARRIVE_SITE_PINS = {
     "mb_tmem_dealloc.arrive": 1,  # local ...
     "mb_tmem_dealloc.arrive_on_peer": 1,  # ... + on-peer = PAIR_LANES per CTA
     "mb_q_empty.arrive": 1,  # MMA commit after the tile's last BMM1
-    "mb_bmm1_done[": 1,
+    "mb_bmm1_done[": 2,  # mutually exclusive two-/three-chunk arms, one commit after the final QK chunk
     "mb_bmm2_done[": 2,  # per-iteration (last N-block) + empty-tile commit
 }
 

@@ -778,7 +778,7 @@ sdpa_fwd_prefill_sm100_d256
 sdpa_fwd_prefill_sm100_d128_fp8
 sdpa_fwd_prefill_sm120
 sdpa_fwd_decode_sm100_d256          (future)
-sdpa_bwd_sm100_d128                 (future)
+sdpa_bwd_sm100_d128
 ```
 
 - The name is what `get_plan_name_at_index()` reports and what

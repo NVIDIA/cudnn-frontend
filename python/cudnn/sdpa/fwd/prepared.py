@@ -407,6 +407,8 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
         and not getattr(_pybind_module._SdpaThdBinder, "supports_paged_split_physical_origins", False)
     ):
         raise NotImplementedError("paged split physical THD origins require rebuilding the native extension")
+    if s.quant is not None and s.paged and not getattr(_pybind_module._SdpaThdBinder, "supports_paged_fp8_physical_origins", False):
+        raise NotImplementedError("paged FP8 THD requires rebuilding the native extension")
     s.native = _pybind_module._SdpaThdBinder(s)
     return s
 
@@ -460,6 +462,10 @@ def execute_native_thd_tensors(spec, buffers, workspace_ptr, stream, scale, *, l
     from cudnn import _pybind_module
 
     roles = _NATIVE_THD_ROLES + _native_quant_roles(getattr(spec, "quant", None))
+    if getattr(spec, "origin_specs", None) is not None:
+        from .thd_origins import ROLES
+
+        roles += ROLES
     buffers = tuple(buffers) + (None,) * (len(roles) - len(buffers))
     gate_index = -1
     if gate is not None:

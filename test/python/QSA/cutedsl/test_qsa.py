@@ -501,7 +501,7 @@ def test_paired_owner_encoding_rejects_oversized_metadata(supported_gpu, monkeyp
 
 
 @pytest.mark.L1
-@pytest.mark.parametrize("blocks", [1, 15, 16, 31, 32, 511, 512, 513, 1023, 1024, 1025, 32768])
+@pytest.mark.parametrize("blocks", [1, 15, 16, 31, 32, 511, 512, 513, 1023, 1024, 1025, 8192, 8193, 32768])
 @pytest.mark.parametrize("offset", [0, 1])
 def test_compaction_boundaries_and_replay(supported_gpu, blocks, offset):
     from cuda.bindings import driver as cuda
@@ -528,10 +528,12 @@ def test_compaction_boundaries_and_replay(supported_gpu, blocks, offset):
     try:
         with torch.cuda.graph(graph):
             launch()
-        for pattern in ("full", "alternate", "empty"):
+        for pattern in ("full", "alternate", "byte_values", "empty"):
             sel.fill_(0 if pattern == "empty" else 255)
             if pattern == "alternate":
                 sel[:, 1::2] = 0
+            elif pattern == "byte_values":
+                sel.copy_(torch.arange(sel.numel(), device=sel.device).remainder(256).to(torch.uint8).view_as(sel))
             valid = (sel != 0) & (last[None] >= lo[:, None]) & (first[None] <= hi[:, None]) & (lo[:, None] <= hi[:, None])
             expected_counts = valid.sum(1).int()
             expected_ids = torch.full_like(ids, -1)

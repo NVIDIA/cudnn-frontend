@@ -2086,6 +2086,7 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
 
     NLOHMANN_DEFINE_TYPE_INTRUSIVE(SDPA_attributes,
                                    name,
+                                   compute_data_type,
                                    inputs,
                                    outputs,
                                    generate_stats,
