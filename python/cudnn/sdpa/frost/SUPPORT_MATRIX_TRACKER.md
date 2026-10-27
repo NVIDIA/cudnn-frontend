@@ -716,9 +716,16 @@ ragged Q/O/Stats + page pools at `S_q(max) == 1` — FlashInfer's prefill-style 
 at one token per sequence, nvbug 6607857). Exact D128 FP16/BF16 paged THD
 prefill at declared `S_q > 1` also accepts an explicit `TILE_CGA_M=1` on cc 10.0:
 it uses the existing two-slab prefill body (256 packed rows), distinct from the
-128-row decode/split tile. Default CGA selection remains unchanged, and cc 10.3
-retains its existing domain. Other unsplit ragged prefill graphs keep `TILE_CGA_M=2`
-and a pinned 1 declines. The decode tile remains unavailable for fp8 / mxfp8 (their (128, 128) flavors keep
+128-row decode/split tile. Default CGA selection remains unchanged there, and cc 10.3
+retains its existing domain. Nonpaged FP16/BF16 D128 THD prefill with one query head
+per KV head, unsplit, under a plain mask (none, causal or padding — no sliding window,
+right band, sink, bias, kv_mask, epilogue gate or pre-folded scale) runs that same
+two-slab single-CTA body by DEFAULT on cc 10.0 and cc 10.3
+(`config_sm100.supports_sm100_nonpaged_d128_thd_single_cta`, shared by the engine
+capability domain, `mismatch` and the adapter gate; the pair tile stays a runner and an
+explicit `TILE_CGA_M=2` is honored). Other unsplit ragged prefill graphs (grouped
+heads, windows, bands, sinks, biases, kv_masks, gates, pre-folded scales, fp8 / mxfp8)
+keep `TILE_CGA_M=2` and a pinned 1 declines. The decode tile remains unavailable for fp8 / mxfp8 (their (128, 128) flavors keep
 `cgas={2}`, their other flavors their own width), and the d192x128 / d512 f16 flavors
 (no decode tile yet — their decode graphs run the prefill kernel as before; the d256
 f16/bf16 flavor has its own swap-AB decode tile, ᵈ). d64 has its own native decode tile (ᵈ⁶⁴). Measured on B200 (graph path,
