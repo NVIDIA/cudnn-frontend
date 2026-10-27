@@ -169,16 +169,16 @@ FIXED_CONV_CASES_L1 = tuple(
 )
 
 
-# Name, N, C, K, input spatial, filter spatial, padding, stride, dilation.
+# Name, N, C, K, input spatial, filter spatial, padding, stride, dilation, seed base.
 WGRAD_RESIDUAL_SHAPES = (
-    ("", 64, 256, 16, (7, 7), (1, 1), (0, 0), (1, 1), (1, 1)),
-    ("n76_c80_k240_34x34", 76, 80, 240, (34, 34), (1, 1), (0, 0), (1, 1), (1, 1)),
-    ("n17_c16_k80_28x28", 17, 16, 80, (28, 28), (3, 3), (1, 1), (1, 1), (1, 1)),
-    ("n31_c32_k96_500x1", 31, 32, 96, (500, 1), (5, 1), (2, 0), (1, 1), (1, 1)),
-    ("n65_c32_k112_1x700", 65, 32, 112, (1, 700), (1, 7), (0, 3), (1, 1), (1, 1)),
-    ("n15_c16_k1040_28x28", 15, 16, 1040, (28, 28), (1, 1), (0, 0), (1, 1), (1, 1)),
-    ("n30_c102_k16_7x7", 30, 102, 16, (7, 7), (1, 1), (0, 0), (1, 1), (1, 1)),
-    ("n35_c64_k22_100x50", 35, 64, 22, (100, 50), (1, 1), (0, 0), (1, 1), (1, 1)),
+    ("n64_c256_k16_7x7", 64, 256, 16, (7, 7), (1, 1), (0, 0), (1, 1), (1, 1), 212),
+    ("n76_c80_k240_34x34", 76, 80, 240, (34, 34), (1, 1), (0, 0), (1, 1), (1, 1), 218),
+    ("n17_c16_k80_28x28", 17, 16, 80, (28, 28), (3, 3), (1, 1), (1, 1), (1, 1), 224),
+    ("n31_c32_k96_500x1", 31, 32, 96, (500, 1), (5, 1), (2, 0), (1, 1), (1, 1), 230),
+    ("n65_c32_k112_1x700", 65, 32, 112, (1, 700), (1, 7), (0, 3), (1, 1), (1, 1), 236),
+    ("n15_c16_k1040_28x28", 15, 16, 1040, (28, 28), (1, 1), (0, 0), (1, 1), (1, 1), 242),
+    ("n30_c102_k16_7x7", 30, 102, 16, (7, 7), (1, 1), (0, 0), (1, 1), (1, 1), 248),
+    ("n35_c64_k22_100x50", 35, 64, 22, (100, 50), (1, 1), (0, 0), (1, 1), (1, 1), 254),
 )
 
 
@@ -203,20 +203,18 @@ FIXED_CONV_EXPANSION_CASES_L1 = tuple(
             min_device_capability=min_device_capability,
             rtol=5e-3,
             atol=5e-3,
-            rng_seed=200 + dtype_index * 6 + topology_index,
+            rng_seed=seed_base + dtype_seed_offset,
         ),
         id=f"conv2d_{conv_fuzzer.conv_type_name(conv_type)}_{topology}_{dtype_name}",
     )
-    for dtype_index, (dtype, dtype_name, min_device_capability) in enumerate(((torch.float16, "f16", (7, 0)), (torch.float32, "f32", (8, 0))))
-    for topology_index, (conv_type, epilogue, accumulate_output, materialize_intermediate, topology) in enumerate(
-        (
-            (conv_fuzzer.ConvType.FPROP, conv_fuzzer.EpilogueType.NONE, False, False, "plain"),
-            (conv_fuzzer.ConvType.FPROP, conv_fuzzer.EpilogueType.RELU, False, False, "relu"),
-            (conv_fuzzer.ConvType.WGRAD, conv_fuzzer.EpilogueType.RELU, False, True, "relu_exposed"),
-            (conv_fuzzer.ConvType.FPROP, conv_fuzzer.EpilogueType.NONE, True, True, "add_exposed"),
-            (conv_fuzzer.ConvType.DGRAD, conv_fuzzer.EpilogueType.NONE, True, True, "add_exposed"),
-            (conv_fuzzer.ConvType.WGRAD, conv_fuzzer.EpilogueType.NONE, True, True, "add_exposed"),
-        )
+    for dtype, dtype_name, min_device_capability, dtype_seed_offset in ((torch.float16, "f16", (7, 0), 0), (torch.float32, "f32", (8, 0), 6))
+    for conv_type, epilogue, accumulate_output, materialize_intermediate, topology, seed_base in (
+        (conv_fuzzer.ConvType.FPROP, conv_fuzzer.EpilogueType.NONE, False, False, "plain", 200),
+        (conv_fuzzer.ConvType.FPROP, conv_fuzzer.EpilogueType.RELU, False, False, "relu", 201),
+        (conv_fuzzer.ConvType.WGRAD, conv_fuzzer.EpilogueType.RELU, False, True, "relu_exposed", 202),
+        (conv_fuzzer.ConvType.FPROP, conv_fuzzer.EpilogueType.NONE, True, True, "add_exposed", 203),
+        (conv_fuzzer.ConvType.DGRAD, conv_fuzzer.EpilogueType.NONE, True, True, "add_exposed", 204),
+        (conv_fuzzer.ConvType.WGRAD, conv_fuzzer.EpilogueType.NONE, True, True, "add_exposed", 205),
     )
 ) + tuple(
     pytest.param(
@@ -238,19 +236,15 @@ FIXED_CONV_EXPANSION_CASES_L1 = tuple(
             min_device_capability=min_device_capability,
             rtol=rtol,
             atol=atol,
-            rng_seed=212 + shape_index * 6 + dtype_index * 2 + int(materialize_intermediate),
+            rng_seed=seed_base + dtype_seed_offset + int(materialize_intermediate),
         ),
-        id=f"conv2d_wgrad_residual_{'exposed' if materialize_intermediate else 'virtual'}_{dtype_name}" + (f"_{shape_name}" if shape_name else ""),
+        id=f"conv2d_wgrad_residual_{'exposed' if materialize_intermediate else 'virtual'}_{dtype_name}_{shape_name}",
     )
-    for shape_index, (shape_name, batch, in_channels, out_channels, input_spatial, filter_spatial, padding, stride, dilation) in enumerate(
-        WGRAD_RESIDUAL_SHAPES
-    )
-    for dtype_index, (dtype, dtype_name, min_device_capability, rtol, atol) in enumerate(
-        (
-            (torch.float16, "f16", (7, 0), 5e-3, 5e-3),
-            (torch.bfloat16, "bf16", (8, 0), 2.1e-2, 5e-2),
-            (torch.float32, "f32", (8, 0), 5e-3, 5e-3),
-        )
+    for shape_name, batch, in_channels, out_channels, input_spatial, filter_spatial, padding, stride, dilation, seed_base in WGRAD_RESIDUAL_SHAPES
+    for dtype, dtype_name, min_device_capability, rtol, atol, dtype_seed_offset in (
+        (torch.float16, "f16", (7, 0), 5e-3, 5e-3, 0),
+        (torch.bfloat16, "bf16", (8, 0), 2.1e-2, 5e-2, 2),
+        (torch.float32, "f32", (8, 0), 5e-3, 5e-3, 4),
     )
     for materialize_intermediate in (False, True)
 )
