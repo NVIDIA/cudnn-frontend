@@ -617,7 +617,7 @@ def test_2cta_stail_route_declines_dense_and_mha_typed():
     """The pair body serves grouped THD only: dense and MHA requests decline BY NAME before any compile."""
     _require_2cta()
     dense = make_case((256, 256), (256, 256), hq=4, hkv=2, thd=False)
-    with pytest.raises(NotImplementedError, match="2-CTA datapath requires THD"):
+    with pytest.raises(NotImplementedError, match="requires THD"):  # the typed decline of the direct entry (cta_pair 'on'): by name, before any compile
         make_adapter_2cta_stail(dense, compile_plan=False).check_support()
     from d128_thd_test_utils import declaration as mha_declaration
     from d128_thd_test_utils import make_case as make_mha_case
