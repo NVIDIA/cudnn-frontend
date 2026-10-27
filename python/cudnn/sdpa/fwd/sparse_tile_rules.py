@@ -1,5 +1,5 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """The SM107 index-list sparse decode's host rules: the ``tile_form`` vocabulary, the lean tile's host arithmetic and the placement /
 decline rules between its two bodies.  DSL-free and import-light on purpose: the gated attention block validates and resolves a
