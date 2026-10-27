@@ -38,7 +38,8 @@ On Windows ARM64, the CuTe DSL and TVM-FFI runtime dependencies are excluded fro
 The package-wide `nvidia-cutlass-dsl[cu13]>=4.8.0` dependency floor applies to
 BSA. Sage FP8 relies on functionality introduced in CuTe DSL 4.6.1, which the
 package floor already satisfies. A defensive runtime check remains for
-environments that force an older DSL.
+environments that force an older DSL; the KPage path has the same check at
+the package floor and was verified on CuTe DSL 4.6.2, 4.7.0, and 4.7.1.
 
 ## Forward
 
@@ -354,6 +355,100 @@ with forward. Valid tokens occupy the prefix of each physical block; callers
 zero `dout` for padded queries and discard their outputs. SM110 blk128 backward
 still requires `block_sizes=None`.
 
+## KPage (SM100/SM103 blk128, partially occupied blocks)
+
+`kpage=True` on `block_sparse_attention_forward` and
+`block_sparse_attention_backward` selects a second set of blk128 kernels for
+sparse patterns in which many selected blocks are only partially valid, as
+happens when a 3D video latent is flattened and `block_sizes` marks the rows
+past each block's content. The base kernels load and compute every selected
+block as a full 128-row tile and mask the padding; KPage splits each selected
+K/V block into 16-row pages and gathers only the valid pages, from any blocks,
+into the same 128-row MMA tile during the TMA load. A block with `v` valid
+rows then costs `16 * ceil(v / 16)` rows instead of 128. Query blocks with at
+most 64 valid rows (see `q_block_sizes` below) run on an M64 x N256 kernel,
+the others on M128 x N128. Backward packs K/V pages into owner tiles the same
+way and walks the union of their Q pages with a per-step page-pair mask, so
+`block_sizes` is supported in backward on this path.
+
+```python
+from cudnn.ops import block_sparse_attention_forward, block_sparse_attention_backward, kpage_prepare_layout
+
+# Metadata as for the base path: block_sizes[j] is the number of valid keys of KV block j.
+o, lse = block_sparse_attention_forward(q, k, v, q2k_block_index, block_sparse_num, block_sizes, kpage=True)
+dq, dk, dv = block_sparse_attention_backward(do, q, k, v, o, lse, q2k_block_index, block_sparse_num, block_sizes, kpage=True)
+
+# Reuse one layout across calls; q_block_sizes marks padding on the query side as well.
+layout = kpage_prepare_layout(q2k_block_index, block_sparse_num, block_sizes, q_block_sizes=block_sizes)
+o, lse = block_sparse_attention_forward(q, k, v, q2k_block_index, block_sparse_num, block_sizes, kpage=layout)
+dq, dk, dv = block_sparse_attention_backward(do, q, k, v, o, lse, q2k_block_index, block_sparse_num, block_sizes, kpage=layout)
+```
+
+`kpage=True` computes the same function as the base path with the same
+arguments (`block_sizes` masks keys, every query row is valid) and builds
+the page layout on the call. `kpage_prepare_layout` builds a `KPageLayout`
+once from the metadata so repeated calls with the same sparse pattern (every
+layer of a diffusion step, every training step with a fixed packing) skip the
+metadata kernels. The layout depends on the metadata only, never on `q`, `k`,
+or `v`. Backward tables are built on the first backward call with that layout.
+
+`q_block_sizes` (int32, one entry per query block) is specific to this path:
+query rows at or past `q_block_sizes[i]` in block `i` are padding. They are
+not computed, which is where the M64 x N256 route and part of the speedup on
+video layouts come from, and their rows of `o`, `lse`, and `dq` are written
+as zero. Inputs whose query side carries the same per-block padding as the
+key side pass `q_block_sizes=block_sizes`.
+
+Contract, in addition to the metadata ranges above:
+
+- SM100/SM103, `sparse_block_size=128`, BF16, `head_dim=128`; MHA, GQA, and
+  MQA with metadata per query head (`pack_gqa=None` behaves as `False`,
+  `pack_gqa=True` is not taken); `seqlen_q` and `seqlen_k` independent and
+  arbitrary (rows past a sequence end are padding of its final block, as on
+  the base path); `block_sizes` of shape `(N_kv,)`.
+  BHSD or BSHD tensors (q/k/v/o/do and the gradients) that are compact in
+  their layout. A batch is run as `batch * heads` independent heads, so
+  `block_sizes` is shared across the batch (as on the base SM100 path) and a
+  BSHD batch must be 1. `kv_splits`, `use_clc`, and `bucket_size_blocks`
+  are not taken; a fixed count may be odd.
+- `allow_empty_block_nums` has the base meaning: with `True`, a query block
+  with `q2k_block_nums == 0` gets `O = 0`, `LSE = -inf`, and `dQ = 0`; with
+  `False` (default) such a block is a metadata error. Backward accepts empty
+  blocks as on the base path.
+- Masked key rows (at or past `block_sizes[j]` in block `j`) of `k` and `v`,
+  and padding query rows of `q` and `do` when `q_block_sizes` is given, take
+  no part in the computation and may hold any finite value. Backward writes
+  zeros to the masked rows of `dk` and `dv`. Values on valid rows are exact.
+- `kpage_prepare_layout(validate=True)` (default) checks the metadata on the
+  device with one readback and raises `ValueError` naming the offending entry.
+  The layout build itself reads back three counts; `with_backward=True` also
+  builds the backward tables, which otherwise happens on the first backward
+  call. `seqlen_q` / `seqlen_k` are needed only when a sequence is not a
+  multiple of 128 or when `block_sizes` is omitted and `seqlen_k != seqlen_q`
+  (`kpage=True` takes them from the tensors).
+- A `KPageLayout` remembers the metadata tensors it was built from; passing it
+  together with other metadata, or with tensors of another shape, raises
+  `ValueError`.
+
+The forward output of the KPage path can be fed to the KPage backward or to a
+base backward with `block_sizes=None` when every block is full; the two paths
+compute the same function and differ only in the execution layout.
+
+When to use it: the gain comes from padding (`block_sizes < 128`, and
+`q_block_sizes` for the query side) and grows with the padding fraction
+(1.2-1.3x at 10%, 3.2-3.8x at 59% in `benchmark/bsa`). Without
+padding the page gather costs more than the base kernel's whole-block load,
+so with `block_sizes=None` the base path is faster (measured 0.6x at four
+blocks per row, 0.96x at 128). GQA/MQA run with per-query-head metadata; the
+base path's packed GQA is not available here. BSHD inputs are supported but
+the strided page gathers make the forward slower than on BHSD (measured 1.3x
+on a 16-head layout); prefer BHSD. A `seqlen_k` that is not a multiple of 16
+selects forward kernels whose K/V descriptors carry the row extent instead of
+whole 16-row pages (measured 3-5% slower forward; the backward is
+unaffected), so pad K/V to a multiple of 16 rows when that matters. A call
+carries about 0.1 ms of host work (metadata checks, tensor conversion), which
+only matters for sub-millisecond problems.
+
 ## Current support
 
 ### Forward
@@ -367,6 +462,7 @@ still requires `block_sizes=None`.
 | SM100/SM103 | 64 (explicit) | BF16 | QK=128, V=128 | MHA |
 | SM100/SM103 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
 | SM100/SM103 | 128 (explicit) | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
+| SM100/SM103 | 128, `kpage=True` | BF16 | QK=128, V=128 | MHA, GQA, MQA |
 | SM120 | 64 | FP16, BF16 | QK=128, V=128 | MHA, GQA, MQA |
 | SM120 | 128 (explicit) | FP16, BF16 | QK=128, V=128 | MHA, GQA, MQA |
 | SM120 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
@@ -375,8 +471,8 @@ still requires `block_sizes=None`.
 For FP16/BF16, SM90 blk64 requires `S_q` to be a multiple of 64; native blk128 supports
 positive arbitrary Q/KV lengths, including partial final blocks. Its fixed count may be
 any positive value. The SM100/SM103 blk128 fixed count must be even and at
-least two; SM120 and the explicit Blackwell blk64 path accept any positive
-fixed count. Variable counts use `q2k_block_nums`. `allow_empty_block_nums`
+least two (the KPage path accepts any positive count); SM120 and the explicit
+Blackwell blk64 path accept any positive fixed count. Variable counts use `q2k_block_nums`. `allow_empty_block_nums`
 defaults to `False`; when it is `True`, empty rows (`q2k_block_nums == 0`)
 produce `O = 0` and `LSE = -inf`. SM90 blk64 selects the empty-row handling as a
 compile-time specialization, so the default non-empty configuration keeps its
@@ -392,9 +488,10 @@ blk128 supports empty rows and explicit split-KV; its default remains unsplit.
 | SM90 | 64 or 128 (explicit) | BF16 | 128 | MHA |
 | SM100/SM103 | 64 | BF16 | 128 | MHA |
 | SM100/SM103 | 128 | BF16 | 64 or 128 | MHA |
+| SM100/SM103 | 128, `kpage=True` | BF16 | 128 | MHA, GQA, MQA; `block_sizes` supported |
 
-Backward is not implemented for SM120. It requires equal QK/V dimensions and
-does not currently support GQA/MQA.
+Backward is not implemented for SM120. It requires equal QK/V dimensions and,
+except on the KPage path, does not currently support GQA/MQA.
 
 SM90 native blk128 requires CuTe DSL >= 4.6.2. Q/K/V, O/dO and gradient
 buffers must have a contiguous head dimension, 16-byte aligned base pointers,
