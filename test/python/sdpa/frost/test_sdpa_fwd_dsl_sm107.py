@@ -229,7 +229,11 @@ _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle 
     # mb_bias_ring_empty drain, P15) since the ring's cluster-multicast form (bias_mode 3) landed: 82 / 22.
     ("f16", (128, 128)): (True, 82, 22),
     ("fp8", (128, 128)): (False, 44, 12),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o)
-    ("mxfp8", (128, 128)): (True, 36, 13),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o)
+    ("mxfp8", (128, 128)): (
+        True,
+        37,
+        13,
+    ),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o); +1: the FP32 split-partial epilogue's mb_o_empty wait
     ("f16", (192, 128)): (True, 32, 11),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
     ("fp8", (192, 128)): (True, 43, 12),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
     ("mxfp8", (192, 128)): (True, 35, 13),
@@ -1255,10 +1259,35 @@ def test_rubin_mxfp8_forward_row_exists():
     assert caps.thd_d_shapes is SM107_MXFP8_THD_SHAPES
     assert caps.thd_d_shapes == frozenset({(256, 256)}) and caps.thd_d_shapes < caps.d_shapes
     assert caps.thd_padded_stats is True and caps.cu_seq_len is True
-    # The machinery the ported kernels lack stays declined: split-KV and PackGQA.
-    assert caps.split_kv_supported is False
+    # PackGQA stays declined; split-KV is wired on the d128 body only.
+    from cudnn.sdpa.fwd.config_sm107 import SM107_MXFP8_SPLIT_SHAPES
+
+    assert caps.split_kv_supported is True
+    assert caps.split_d_shapes is SM107_MXFP8_SPLIT_SHAPES and caps.split_d_shapes == frozenset({(128, 128)})
     assert caps.pack_gqas == frozenset({False})
     assert _caps("sdpa_fwd_prefill_sm100_mxfp8").sm_hi == 106
+
+
+@pytest.mark.L0
+def test_sm107_mxfp8_split_coverage():
+    """split_kv > 1 on the cc 10.7 MXFP8 row: the d128 body with half outputs, dense or causal; the rest declines typed."""
+    from cudnn import data_type as _dt
+    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.config_sm107 import SM107_MXFP8_SPLIT_SHAPES
+
+    caps = _caps("sdpa_fwd_prefill_sm107_mxfp8")
+    knobs = engines.SdpaFwdKnobs(split_kv=2)
+    for d_qk, d_v in sorted(caps.d_shapes):
+        why = engines.mismatch(caps, _mxfp8_facts(d_qk=d_qk, d_v=d_v, s_kv=4096), knobs)
+        assert (why is None) == ((d_qk, d_v) in SM107_MXFP8_SPLIT_SHAPES), (d_qk, d_v, why)
+    assert engines.mismatch(caps, _mxfp8_facts(s_kv=4096, causal=True), knobs) is None
+    assert engines.mismatch(caps, _f16_facts(dtype=_dt.FP8_E4M3, dtype_o=_dt.HALF, is_mxfp8=True, s_kv=4096), knobs) is None
+    for bad in (
+        dict(dtype=_dt.FP8_E4M3, dtype_o=_dt.FP8_E4M3, is_mxfp8=True, s_kv=4096),
+        dict(dtype=_dt.FP8_E4M3, dtype_o=_dt.BFLOAT16, is_mxfp8=True, s_kv=4096, thd=True, padded=True, d_qk=256, d_v=256),
+    ):
+        assert engines.mismatch(caps, _f16_facts(**bad), knobs) is not None, bad
+    assert engines.mismatch(caps, _mxfp8_facts(s_kv=4096)) is None
 
 
 def test_rubin_mxfp8_row_serves_paged_pools_on_d128_d256():

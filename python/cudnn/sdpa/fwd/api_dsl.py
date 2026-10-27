@@ -59,6 +59,7 @@ from cudnn.sdpa.fwd.config_sm107 import SM107_SMALL_D_CGAS as _SM107_SMALL_D_CGA
 from cudnn.sdpa.fwd.config_sm107 import sm107_small_tile_leg as _sm107_small_tile_leg
 from cudnn.sdpa.fwd.config_sm107 import SM107_FP8_THD_SHAPES as _SM107_FP8_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import SM107_FP8_SPLIT_SHAPES as _SM107_FP8_SPLIT_SHAPES
+from cudnn.sdpa.fwd.config_sm107 import SM107_MXFP8_SPLIT_SHAPES as _SM107_MXFP8_SPLIT_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import supports_fp8_padded_split
 from cudnn.sdpa.fwd.config_sm107 import SM107_FP8_PACK_GQA_SHAPES as _SM107_FP8_PACK_GQA_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import SM107_MXFP8_THD_SHAPES as _SM107_MXFP8_THD_SHAPES
@@ -1718,6 +1719,7 @@ class SdpaFwdDsl(APIBase):
             return (
                 bool(not self._fp8 and self.flavor in ((64, 64), (128, 128), (192, 128)))
                 or bool(self._fp8 and self._pertensor and self.flavor in _SM107_FP8_SPLIT_SHAPES)
+                or bool(self._fp8 and not self._pertensor and self.flavor in _SM107_MXFP8_SPLIT_SHAPES)
                 or self._decode_q_tile() > 0
                 or self._rubin_native_d512_leg()
                 or self._rubin_native_d256_split_leg()
@@ -3460,6 +3462,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     self.packed_thd_split
                     or (not self._fp8 and self.flavor in ((128, 128), (192, 128)))
                     or (self._fp8 and self._pertensor and self.flavor in _SM107_FP8_SPLIT_SHAPES)
+                    or (self._fp8 and not self._pertensor and self.flavor in _SM107_MXFP8_SPLIT_SHAPES)
                 ),
                 "split_kv > 1 on cc10.7 requires half/per-tensor FP8 D64/D128 or D192/V128, per-tensor FP8 D256, half D256 THD or native dense unpacked prefill, native dense D512 half, or the d256 decode tile",
             )
@@ -4311,7 +4314,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and (not self.o_block_scale or self._can_prepare_block_output())
         ):
             return False
-        if self._device_cc == (10, 7) and (self.split_kv > 1 or self.pack_gqa):
+        if self._device_cc == (10, 7) and (
+            self.pack_gqa
+            or (
+                self.split_kv > 1
+                and (self.flavor not in _SM107_MXFP8_SPLIT_SHAPES or self._o_dtype() not in (torch.bfloat16, torch.float16) or self.paged or self.thd)
+            )
+        ):
             return False
         return self.thd or all(
             self._prepared_operand_layout(desc) is not None

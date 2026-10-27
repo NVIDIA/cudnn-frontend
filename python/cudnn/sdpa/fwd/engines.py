@@ -77,6 +77,7 @@ from cudnn.sdpa.fwd.config_sm107 import (
     SM107_F16_THD_SHAPES,
     SM107_FP8_THD_SHAPES,
     SM107_FP8_SPLIT_SHAPES,
+    SM107_MXFP8_SPLIT_SHAPES,
     supports_fp8_padded_split,
     SM107_FP8_PACK_GQA_SHAPES,
     SM107_MXFP8_THD_SHAPES,
@@ -947,13 +948,22 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
         return "prepared block-scaled outputs require fixed dense unsplit plans"
     if facts.is_mxfp8 and (
         capabilities.sm_lo not in (100, 107, 120)
-        or (capabilities.sm_lo == 107 and (split_kv or 1) > 1)
+        or (
+            capabilities.sm_lo == 107
+            and (split_kv or 1) > 1
+            and (
+                (facts.d_qk, facts.d_v) not in SM107_MXFP8_SPLIT_SHAPES
+                or facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+                or facts.has_paged_kv
+                or facts.thd
+            )
+        )
         or not capabilities.is_mxfp8
         or facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1)
         or (facts.has_epilogue_gate and capabilities.sm_lo != 107)
         or (facts.shape_overrides and not facts.thd)
     ):
-        return "prepared MXFP8 serves SM100 fixed dense or bounded THD, SM107 fixed dense or bounded THD scalar outputs, and SM120 fixed dense or THD plans"
+        return "prepared MXFP8 serves SM100 fixed dense or bounded THD, SM107 fixed dense (split-KV at D128 with half outputs) or bounded THD scalar outputs, and SM120 fixed dense or THD plans"
     if facts.is_fp8 and (
         capabilities.sm_lo not in (100, 107, 120)
         or facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1)
@@ -1966,6 +1976,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 )
             ):
                 return "SM107 D256 split requires native dense unpacked prefill, half THD or the d256 decode tile"
+            if (
+                capabilities.sm_lo == 107
+                and facts.is_mxfp8
+                and (facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16) or facts.has_paged_kv or facts.thd)
+            ):
+                return "SM107 MXFP8 split-KV serves dense graphs with half outputs only"
             # Select with the requested knobs: small half split plans use D64;
             # other restricted flavors retain their larger-envelope walk.
             if capabilities.split_d_shapes is not None and _selected_d_shape(capabilities, facts, knobs) not in capabilities.split_d_shapes:
@@ -3397,6 +3413,8 @@ def _sm107_mxfp8_spec() -> EngineSpec:
             thd=True,
             thd_d_shapes=SM107_MXFP8_THD_SHAPES,
             thd_padded_stats=True,
+            split_kv_supported=True,
+            split_d_shapes=SM107_MXFP8_SPLIT_SHAPES,
             cu_seq_len=True,
             # Paged KV (issue #920 on cc 10.7; the SM100 MXFP8 row's pool contract verbatim): K/V page pools and the
             # F8_128x4 descale POOLS that page with them through the block tables (page id = TMA batch coordinate of
