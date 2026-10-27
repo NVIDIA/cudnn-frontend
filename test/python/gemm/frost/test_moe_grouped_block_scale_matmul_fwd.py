@@ -1944,6 +1944,63 @@ def test_sm120_mixed_pair_smem_footprint_padded_rows_opt_in() -> None:
     assert t_padded.multi_gemm_ab_stages(padded, cfg)[:2] == t_same.multi_gemm_ab_stages(same, cfg)[:2]
 
 
+@requires_sm120
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["normal", "swap_ab"])
+def test_sm120_padded_e2m1_matches_packed_relu_large(swap_ab) -> None:
+    """The padded and packed forms feed the same e2m1 containers to the same MMAs
+    in the same order, so on one input their outputs are bitwise equal: checked
+    with a ReLU epilogue on a FlashInfer-sized mixed problem (an MXFP8 token
+    against MXFP4 weights, 3072 routed rows over 4 experts, N 1024, K 1024), in
+    both kernel orientations, and both against the dequantized reference.
+
+    Background (PR #1882's report): FlashInfer's unified-MoE benchmark flagged
+    its ReLU^2 12-expert 7168x3072 MXFP8 x MXFP4 case at 4096 tokens as failing
+    the all-elements ``torch.testing.assert_close(rtol=0.25, atol=1.0)`` with
+    the padded catalog. Re-measured on the packed kernels (2026-10-26, RTX PRO
+    6000): the same case fails identically, by 1 element of 29,360,128 (|diff|
+    1.168 against a bound of 1.147), with a relative L2 error of 0.1831 -- the
+    same 0.1831 as CUTLASS's MXFP8 x MXFP4 kernel, whose largest deviation
+    (1.141) stays just under the bound, the two outputs differing by at most
+    0.148. It is a tolerance artifact of 4-bit weight quantization at that
+    element count, not a defect of either form; this test pins what the padded
+    form must keep instead: bit-for-bit agreement with the packed one."""
+    dev = "cuda"
+    torch.manual_seed(0)
+    E, S, N, K = 4, 3072, 1024, 1024
+    offsets_list = [0, 768, 1536, 2304, S]
+    bs, sf_k = 32, K // 32
+    fp4, fp8 = cudnn.data_type.FP4_E2M1, cudnn.data_type.FP8_E4M3
+    lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
+    tok_fp8 = (torch.randn(1, S, K, device=dev) * 0.5).to(torch.float8_e4m3fn)
+    w_u8 = torch.randint(0, 256, (E, N, K // 2), dtype=torch.uint8, device=dev)
+    w_rt, w_ref = w_u8.view(torch.float4_e2m1fn_x2), _unpack_fp4(w_u8, lut).view(E, N, K)
+    sfa_log = _rand_e8m0((S, sf_k), dev)
+    sfb_log = _rand_e8m0((E, N, sf_k), dev)
+    sfa_blk = torch.cat([_to_blocked(sfa_log[b : offsets_list[i + 1]]) for i, b in enumerate(offsets_list[:-1])])
+    sfa_blk = _with_static_segmented_capacity(sfa_blk, S, len(offsets_list) - 1, sf_k)
+    sfb_blk = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, sf_k, N)
+    offsets = torch.tensor(offsets_list, dtype=torch.int32, device=dev)
+
+    outputs = {}
+    for padded in (False, True):
+        g = _build_graph(E, S, N, K, len(offsets_list) - 1, combo="mxfp8", a_dt_override=fp8, b_dt_override=fp4, epilogue_relu=True)
+        compiled = _plan(g, config=by_name(_SM120_BS_CFG), **({"swap_ab": True} if swap_ab else {}), **({"padded_e2m1": True} if padded else {}))
+        assert compiled.chain.block_scale.padded_e2m1 is padded
+        output = torch.zeros(1, S, N, dtype=torch.bfloat16, device=dev)
+        compiled(_vp_bs(compiled, tok_fp8, w_rt, output, sfa_blk, sfb_blk, fto=offsets))
+        torch.cuda.synchronize()
+        outputs[padded] = output.clone()
+    assert torch.equal(outputs[False], outputs[True]), "padded and packed e2m1 forms disagree bitwise"
+
+    tok_deq = tok_fp8.float().view(S, K) * sfa_log.float().repeat_interleave(bs, 1)
+    w_deq = w_ref * sfb_log.float().repeat_interleave(bs, 2)
+    ref = torch.zeros(S, N, dtype=torch.float32, device=dev)
+    for i, begin in enumerate(offsets_list[:-1]):
+        end = offsets_list[i + 1]
+        ref[begin:end] = torch.relu(tok_deq[begin:end] @ w_deq[i % E].T)
+    torch.testing.assert_close(outputs[False][0], ref.to(torch.bfloat16), atol=2e-1, rtol=2e-2)
+
+
 @requires_sm100
 @pytest.mark.parametrize("fake_a", [True, False], ids=["raw_fp8_token", "raw_fp8_weight"])
 @pytest.mark.parametrize("scaled_kind", ["mxfp8", "mxfp4"])
