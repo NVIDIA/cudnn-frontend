@@ -126,7 +126,7 @@ def snapshots(p):
     return {port: p["data"][port].clone() for port in ("q", "k", "v", "o", "do", "stats")}
 
 
-def make_adapter(p, token_major):
+def make_adapter(p, token_major, deterministic=False):
     c = p["c"]
     eq, ek, es = checks._envelope_samples(c)
     eo = torch.empty(c.b, eq.shape[2], c.h, c.d_v, device=eq.device, dtype=c.dtype).permute(0, 2, 1, 3)
@@ -150,13 +150,14 @@ def make_adapter(p, token_major):
         max_total_seq_len_kv=1500,
         thd_stats_token_major=token_major,
         thd_ragged_offsets=p["spec"],
+        deterministic=deterministic,
     )
     assert api.check_support()
     api.compile()
     return api
 
 
-def make_graph(p, token_major, cudnn_handle=None):
+def make_graph(p, token_major, cudnn_handle=None, deterministic=False):
     c = p["c"]
     io = cudnn.data_type.HALF if c.dtype == torch.float16 else cudnn.data_type.BFLOAT16
     g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, handle=cudnn_handle)
@@ -199,6 +200,7 @@ def make_graph(p, token_major, cudnn_handle=None):
         dO=tensors["do"],
         stats=tensors["stats"],
         attn_scale=c.scale,
+        use_deterministic_algorithm=deterministic,
         use_padding_mask=True,
         seq_len_q=ql,
         seq_len_kv=kl,
@@ -255,7 +257,7 @@ def test_origins_rebind_and_replay(monkeypatch, dt, token_major, surface):
     check_origins_rebind_and_replay(monkeypatch, dt, token_major, surface)
 
 
-def check_origins_rebind_and_replay(monkeypatch, dt, token_major, surface, *, d=256, d_v=256, physical_origins=True, cudnn_handle=None):
+def check_origins_rebind_and_replay(monkeypatch, dt, token_major, surface, *, d=256, d_v=256, physical_origins=True, cudnn_handle=None, deterministic=False):
     import cutlass.cute as cute
     from functools import partial
 
@@ -266,12 +268,12 @@ def check_origins_rebind_and_replay(monkeypatch, dt, token_major, surface, *, d=
     monkeypatch.setattr(SdpaBwdDslSm100D256, "_ws_budget_bytes", lambda self: 1 << 20)
     p = payload(dt, token_major, (257, 93, 128), (383, 129, 267), 0, False)
     if surface == "standalone":
-        plan = make_adapter(p, token_major)
+        plan = make_adapter(p, token_major, deterministic=deterministic)
         assert plan._qh_chunk == 4
         execute = lambda payload: run(plan, payload)
         ws_bytes = plan.scratch_workspace_bytes()
     else:
-        plan, execute = make_graph(p, token_major, cudnn_handle)
+        plan, execute = make_graph(p, token_major, cudnn_handle, deterministic=deterministic)
         ws_bytes = plan.get_workspace_size()
     p["ws"] = torch.empty(ws_bytes, dtype=torch.uint8, device="cuda")
     poison(p)
@@ -332,7 +334,10 @@ def check_origins_rebind_and_replay(monkeypatch, dt, token_major, surface, *, d=
                 stream.synchronize()
                 check(p)
                 for port, want in zip(("dq", "dk", "dv"), expected):
-                    torch.testing.assert_close(p["data"][port], want, atol=0, rtol=0)
+                    if deterministic:
+                        assert torch.equal(p["data"][port].view(torch.int16), want.view(torch.int16)), port
+                    else:
+                        torch.testing.assert_close(p["data"][port], want, atol=0, rtol=0)
     finally:
         stream.synchronize()
         for capture, _ in retained:

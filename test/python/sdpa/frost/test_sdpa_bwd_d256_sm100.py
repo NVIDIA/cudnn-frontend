@@ -128,7 +128,8 @@ def test_capabilities_match_what_is_implemented():
     assert not c.bias and not c.dbias and not c.decode
     assert c.layouts == frozenset({"bshd"})
     assert not c.tile_ms and not c.tile_ns, "fixed geometry: no tile axis, the heuristics list {} as the complete record"
-    for deferred in ("padded", "sink", "dsink", "deterministic"):
+    assert c.deterministic
+    for deferred in ("padded", "sink", "dsink"):
         assert not getattr(c, deferred), f"{deferred} is deferred: claim it together with its accept test here and the tracker line"
     for never in (
         "dropout",
@@ -936,8 +937,9 @@ def test_head_subgroups_rebind_stream_replay_and_launch_count(monkeypatch):
         dict(sq=500, skv=500, is_causal=True, window_size_left=256),
         dict(b=1, hq=2, sq=500, skv=1024, is_causal=True, causal_bottom_right=True),
         dict(sq=257, skv=129),
+        dict(deterministic=True),
     ],
-    ids=["dense", "fp16", "gqa", "swa-padded", "br-ragged-sq", "257x129"],
+    ids=["dense", "fp16", "gqa", "swa-padded", "br-ragged-sq", "257x129", "deterministic"],
 )
 def test_adapter_backstop_admits_the_served_matrix_and_sizes_its_workspace_at_build(kw):
     from cudnn.sdpa.bwd.api_dsl_sm100_d256 import SdpaBwdDslSm100D256
@@ -962,12 +964,11 @@ def test_adapter_backstop_admits_the_served_matrix_and_sizes_its_workspace_at_bu
         (dict(sq=1), "decode"),
         (dict(is_causal=True, window_size_right=16), "right-band"),
         (dict(window_size_left=0), "window_left > 0"),
-        (dict(deterministic=True), "deterministic"),
         (dict(seq_kv_lens_present=True), "padding masks"),
         (dict(thd=True), "THD"),
         (dict(d=512), "d_qk = d_v = 256"),
     ],
-    ids=["fp32", "gqa-ratio", "decode", "right-band", "swa-zero", "deterministic", "padded", "thd", "d512"],
+    ids=["fp32", "gqa-ratio", "decode", "right-band", "swa-zero", "padded", "thd", "d512"],
 )
 def test_adapter_backstop_refuses_what_the_row_declines(kw, needle):
     from cudnn.sdpa.bwd.api_dsl_sm100_d256 import SdpaBwdDslSm100D256

@@ -1618,7 +1618,7 @@ def _sm100_d256_spec() -> EngineSpec:
     Tensor maps retain each operand's actual width; delta and GQA fold use the value width. Any S_q / S_kv (padded to 128 / 256 and masked), dense, top-left and bottom-right causal,
     sliding window (left), MHA / GQA / MQA, BSHD-physical io, contiguous fp32 Stats, bf16 / fp16.  Declined, each asserted
     by a test (``test_sdpa_bwd_d256_sm100.py``): dense padding masks, sink / dSink, bias / dBias, right-band widening,
-    decode shapes, ``dense_flex``, ``deterministic``.  ``sm_hi = 106`` like the SM100 MXFP8 row: 107+ is the native Rubin
+    decode shapes and ``dense_flex``. Dense and THD deterministic requests use the same fixed-order chain.  ``sm_hi = 106`` like the SM100 MXFP8 row: 107+ is the native Rubin
     row's.  The native competitor on this box is cuDNN backend ENGINE 5 (``eng5_k14=3_k24=2_k27=0_k38=0_k40=3_k41=2``, the
     FORT flash_bprop 128x128x256 cga2x1x1 chain) -- opt_in, and every test / benchmark pins the FROST plan by name.
     """
@@ -1634,6 +1634,7 @@ def _sm100_d256_spec() -> EngineSpec:
             d_envelope=False,
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             gqa=True,
+            deterministic=True,  # independent output tiles and fixed-order dK/dQ GEMMs / GQA fold
             causal=True,
             bottom_right=True,
             swa=True,
