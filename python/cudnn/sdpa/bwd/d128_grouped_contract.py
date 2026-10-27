@@ -15,8 +15,8 @@ ACCUM_ITEMSIZE = 4  # the fp32 dK / dV accumulation workspace under dkv_accum = 
 # head + the fp32 ``dkv_reduce`` fold launch (a FIXED summation order; the shipping chain, byte-identical when the field is unset);
 # "fp32_reduce" = every Q-head owner reduce-adds its fp32 dK / dV tile (``cp.reduce.async.bulk.tensor`` add.f32) into ONE per-KV-head fp32
 # workspace (hardware order, non-deterministic: `use_deterministic_algorithm` is declined on this route anyway), the fold launch gone, ONE bf16
-# rounding at the output in ``cast_dq_thd``.  Served by the 1-CTA grouped THD body and the s_tail pair body; declined BY NAME on the dense grouped
-# chain, on the MHA routes and on the dp_tail pair body.
+# rounding at the output in ``cast_dq_thd``.  Served by the 1-CTA grouped THD body and the cta_group::2 pair body; declined BY NAME on the
+# dense grouped chain and on the MHA routes.
 DKV_ACCUM_FORMS = ("bf16_partials", "fp32_reduce")
 DKV_ACCUM_DEFAULT = DKV_ACCUM_FORMS[0]
 

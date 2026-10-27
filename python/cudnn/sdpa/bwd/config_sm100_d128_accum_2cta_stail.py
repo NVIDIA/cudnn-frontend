@@ -58,12 +58,8 @@ What moves against the first body (resource-manager 2026-10-27 00:53 UTC tables 
 
 from dataclasses import dataclass
 
-from .config_sm100_d128_accum_2cta import CFG as CFG_DP_TAIL
-from .config_sm100_d128_accum_2cta import Config, diag_2cta_code, reg_split_counts, resolve_diag_2cta  # noqa: F401  (re-exported for the body)
-
-# The typed vocabulary of the pair bodies' TMEM maps (adapter field ``SdpaBwdDslSm100D128.tmem_map``; ``None`` = the default).
-TMEM_MAPS = ("dp_tail", "s_tail")
-TMEM_MAP_DEFAULT = "dp_tail"  # the first body, byte-identical rendering (md5 c28e6013 @ 4/32/4, 28b0eba0 @ 2/8/2) when the field is unset
+from .config_sm100_d128_accum_2cta import CFG as CFG_BASE
+from .config_sm100_d128_accum_2cta import Config, diag_2cta_code, resolve_diag_2cta  # noqa: F401  (re-exported for the body)
 
 
 @dataclass(frozen=True)
@@ -76,20 +72,16 @@ class ConfigSTail(Config):
     # RESOURCE-NOTE: sDQ 16 KiB dedicated ring, 2 x [64 q x 32 d] fp32 SW128; dS STS waits no dq_empty
     DQ_SLOTS: int = 2
     DQ_ROUNDS: int = 2
-    # --- the leader's MMA issue order on this map: fa4 (default until MEASURED) | fa4b (kernel header section 5) ---
-    PAIR_MMA_ORDER_DEFAULT: str = "fa4"
-    # --- the dQ partial's route out of the CTA on this map: tma (default until MEASURED) | red_global | red_global_pair (header section 11) ---
-    DQ_ROUTE_PAIR_DEFAULT: str = "tma"
-    # --- the softmax's MASK FORM on this map (lever L5, code-writer D 2026-10-27): fsel (default until MEASURED) | predicated | diag_mask_off ---
+    # --- the softmax's MASK FORM: fsel (default; measured neutral against predicated) | predicated | diag_mask_off (diagnostic) ---
     MASK_FORM_DEFAULT: str = "fsel"
     MASK_WORD_COLS: int = 32  # columns per keep-word = tile_dsl.mask.MASK_WORD_COLS (the body asserts the two agree at import)
-    TMEM_MAP: str = "s_tail"
+    TMEM_MAP: str = "s_tail"  # the body's identity: the dQ image lives in S^T's dead tail (the resolution token `tmem_map=s_tail`, the record names)
     # --- the STAMPS lever (typed adapter field ``debug_clk``; header section 11): default OFF = the shipped rendering, byte-identical ---
     DEBUG_CLK_DEFAULT: bool = False
     DBG_CLK_WORDS: int = 96  # Int32 words per CTA record = the WHOLE bar-block spare [BAR_LAYOUT_END, TMEM_HANDLE) = 384 B since the C2b row
     # dvk_stage_empty took 16 B of it (was 100 words / 400 B at the 34-row layout); validate_config pins the exact fit, the layout uses 82 words
     DBG_CLK_BLOCKED_THRESH: int = 128  # a wait above this many clk really waited (a first-test pass costs ~30-60 clk of issue): the d512 bodies' value
-    DBG_CLK_HIST_EDGES: tuple = (100, 400, 1600)  # clk bins of the per-tile "ship issue - ds_tmem pass" segment; bin 0 = the optimizer's < 100 clk kill line
+    DBG_CLK_HIST_EDGES: tuple = (100, 400, 1600)  # clk bins of the per-tile "ship issue - ds_tmem pass" segment (bin 0 = under 100 clk)
     DBG_CLK_MAGIC: int = 0x5354414D  # "STAM": the record's first word (a decoder refuses a record without it)
     DBG_CLK_RECORD_ALIGN: int = 256  # the stamps region starts at the first 256-B boundary past the chain's workspace regions
     # --- the DIAGNOSTIC probes' constants (header section 11; OUTPUT WRONG BY DESIGN under a probe) ---
@@ -101,19 +93,11 @@ class ConfigSTail(Config):
     SOFTMAX_LEAD_WARP: int = 0  # 16w_fa4: the softmax warp whose elected lane arms ds_recv_full and ships XCHG (FAv4's tidx 0; inspector X4)
 
     @property
-    def PAIR_MMA_ORDERS(self):
-        # fa4: dP^T(t), dQ(t-1), dV(t), S^T(t+1), dK(t); tail dQ(hi-1) (FAv4's loop rotated onto the tile body; s_read / s_tail_empty
-        # sites of resources/arm2-barrier-table.md D1 / D2).  fa4b: dP^T(t), dV(t), dQ(t-1), S^T(t+1), dK(t) -- the in-tile dQ slot one GEMM
-        # later (the same sites, guards and counts; `dq_after_dv`).  s_first / dk_first need a DIFFERENT site set on this map: declined by name.
-        return ("fa4", "fa4b")
-
-    @property
     def DIAG_2CTA_NAMES_ON_MAP(self):
-        # The probes THIS body has code for (the shared code space is config_sm100_d128_accum_2cta.CFG.DIAG_2CTA_NAMES).
-        # D7 (dp_empty_wait_off) is MEANINGLESS on this map: dp_empty is arrived at the dS^T readout, four GEMMs before dP^T(t+1) needs
-        # it, so skipping its wait measures nothing -> declined by name.  D8 (ds_gates_off) is RETIRED on this map (barrier-inspector
-        # 2026-10-27 08:01): skipping the three dS gates removed the ONLY back-edge of the ds_recv_full expect_tx arm (arm(t+1) landed on a
-        # tx-pending phase = P3 over-arrival -> CUDA 719 on every launch) -> declined by name; its safe replacement is exchange_off (D8s).
+        # The probes this body has code for (== the code space config_sm100_d128_accum_2cta.CFG.DIAG_2CTA_NAMES; every other name declines).
+        # Two probes of an earlier pair body are NOT defined here: a skipped dp_empty wait measures nothing on this map (dp_empty is arrived at
+        # the dS^T readout, four GEMMs before dP^T(t+1) needs it) and skipping the three dS gates removes the ONLY back-edge of the ds_recv_full
+        # expect_tx arm (the arm of tile t+1 lands on a tx-pending phase = an over-arrival fault); the safe exchange ceiling is exchange_off.
         #   dq_reduce_add_off (D2-pair): the store warp's four reduce-add ISSUES skipped (ring protocol kept; dQ zero)
         #   exchange_off      (D8s):     the epilogue's XCHG ship skipped + ds_recv_full armed with DIAG_EXCHANGE_OFF_TX = 0 bytes; the three dS
         #                                gates, the relay, the XCHG STS / proxy fence / named barrier and every other wait KEPT (the recv half
@@ -142,14 +126,6 @@ class ConfigSTail(Config):
     @property
     def DBG_CLK_RECORD_BYTES(self):
         return self.DBG_CLK_WORDS * 4  # Int32 words
-
-    @property
-    def DQ_ROUTES_PAIR(self):
-        # tma: sDQ STS -> dq_full -> the store warp's tma_reduce_add (today's path).  red_global: red.global.add.v4.f32 from the dQ readout
-        # registers, the ring protocol kept (dq_full / dq_empty flips identical, no STS, no UTMAREDG).  red_global_pair: the same reds, lane
-        # pairs exchange one v4 per 32-B sector (shfl.sync.bfly 1) so each warp-level red carries full sectors.  Perf-only on dK / dV (bitwise:
-        # they never touch the route); dQ differs by the fp32 add ORDER only (non-deterministic under every route, the fp64 gate decides).
-        return ("tma", "red_global", "red_global_pair")
 
     @property
     def MASK_FORMS(self):
@@ -217,36 +193,6 @@ class ConfigSTail(Config):
     def DS_STS_PER_LANE_PER_TILE(self):
         # RESOURCE-NOTE: dS STS from the 32 packed words = today's LDTM image; 4 own + 4 XCHG STS.128/lane
         return self.QUARTERS_PER_GROUP * self.DS_STS_VECS_PER_QUARTER  # 8 per softmax lane per tile = 64 warp-STS per CTA per tile (today's 4 x 16)
-
-    def diag_2cta_names_for_roles(self, roles):
-        """The probes a role shape SERVES: ``ds_gates_off`` (D8) is RETIRED under ``16w_fa4`` -- the ds_recv_full arm's back-edge is the softmax's
-        dq_done WAR wait, which runs through the leader's gate waits D8 would skip (barrier-inspector section 5.3 / the 08:01 TX-PENDING reading)."""
-        if roles == self.WARP_ROLES_DEFAULT:
-            return self.DIAG_2CTA_NAMES_ON_MAP
-        return tuple(name for name in self.DIAG_2CTA_NAMES_ON_MAP if name != "ds_gates_off")
-
-    def dq_routes_for_roles(self, roles):
-        """The dQ routes a role shape SERVES: the register-direct reds are NOT BUILT under ``16w_fa4`` (the reduce group has no red path; PLAN § 11.4
-        drops the route) -- ``tma`` only there."""
-        return self.DQ_ROUTES_PAIR if roles == self.WARP_ROLES_DEFAULT else (self.DQ_ROUTE_PAIR_DEFAULT,)
-
-    # --- derived: the register-direct dQ route's counts (the 64-column half-row image: one lane = one d half of one q row) ---
-    @property
-    def DQ_RED_ROW_WORDS(self):
-        return self.DQ_COLS  # fp32 words per lane per tile = the lane's 64 contiguous d of its row (== D_HALF, asserted)
-
-    @property
-    def DQ_RED_V4_PER_LANE(self):
-        # RESOURCE-NOTE: red route: 16 x red.global.add.v4.f32 per lane per tile (128 lanes: 2048 per CTA); 0 sDQ STS, 0 UTMAREDG
-        return self.DQ_RED_ROW_WORDS // 4  # 16 x 16-B groups per lane per tile
-
-    @property
-    def DQ_RED_SECTORS_PER_LANE(self):
-        return self.DQ_RED_ROW_WORDS // 8  # 8 x 32-B sectors per lane per tile (the paired form's unit)
-
-    @property
-    def DQ_RED_V4_PER_TILE_PER_CTA(self):
-        return self.EPILOGUE_LANES * self.DQ_RED_V4_PER_LANE  # 2048 (the sass-checker's RED count per CTA per tile; 64 warp-level instructions)
 
     # --- derived: the slab chain gains the sDQ ring between XCHG and STATS (Q -16384, +DQ 16384: SLABS_END unchanged) ---
     @property
@@ -325,123 +271,32 @@ class ConfigSTail(Config):
 CFG = ConfigSTail()
 
 
-def resolve_tmem_map(name=None):
-    """The pair body selector, typed: ``None`` -> ``TMEM_MAP_DEFAULT`` (the first body); any value outside ``TMEM_MAPS`` is a ``ValueError``
-    BY NAME (a selector outside its domain declines, never a silent default)."""
-    tmem_map = TMEM_MAP_DEFAULT if name is None else name
-    if type(tmem_map) is not str or tmem_map not in TMEM_MAPS:
-        raise ValueError(f"tmem_map must be one of {TMEM_MAPS}; got {tmem_map!r}")
-    return tmem_map
-
-
-def tmem_map_s_tail(name=None):
-    """The chain's ``Constexpr[bool]`` for a resolved map name: the prepared host launches THIS body under ``s_tail``."""
-    return resolve_tmem_map(name) == "s_tail"
-
-
-def config_for_map(name=None):
-    """The ``Config`` instance a resolved map name renders with (the first body's CFG or this module's)."""
-    return {"dp_tail": CFG_DP_TAIL, "s_tail": CFG}[resolve_tmem_map(name)]
-
-
-def resolve_pair_mma_order_for_map(name=None, tmem_map=None):
-    """The leader MMA issue order ON A MAP, typed: ``None`` -> the map's ``PAIR_MMA_ORDER_DEFAULT``; a name outside the map's
-    ``PAIR_MMA_ORDERS`` is a ``ValueError`` BY NAME (on ``s_tail`` only ``fa4`` exists; on ``dp_tail`` ``fa4`` is unreachable: its dQ image
-    sits in dP^T's dead half and dp_empty is arrived after the dQ readout, kernel header section 5 of the first body)."""
-    resolved = resolve_tmem_map(tmem_map)
-    cfg = config_for_map(resolved)
-    order = cfg.PAIR_MMA_ORDER_DEFAULT if name is None else name
-    if type(order) is not str or order not in cfg.PAIR_MMA_ORDERS:
-        raise ValueError(f"pair_mma_order must be one of {cfg.PAIR_MMA_ORDERS} on tmem_map {resolved!r}; got {order!r}")
-    return order
-
-
-def dq_after_dv_for_map(name=None, tmem_map=None):
-    """The s_tail body's order ``Constexpr[bool]`` for a (resolved) order name ON A MAP: True iff the order is ``fa4b`` (dQ(t-1) issued after
-    dV(t)); False for ``fa4`` and for every first-body order (the first body never reads it).  Declines exactly as
-    :func:`resolve_pair_mma_order_for_map` (a name outside the map's domain is a ``ValueError`` BY NAME)."""
-    return resolve_pair_mma_order_for_map(name, tmem_map) == "fa4b"
-
-
-# The dQ route's kernel code space (``Constexpr[int]`` ``dq_route_code``; the body names DQ_ROUTE_TMA / _RED / _RED_PAIR from these).
-DQ_ROUTE_PAIR_CODES = {"tma": 0, "red_global": 1, "red_global_pair": 2}
-
-
-def resolve_dq_route_pair_for_map(name=None, tmem_map=None):
-    """The dQ partial's route out of the CTA ON A MAP, typed: ``None`` -> the map's default (``"tma"`` on both maps); a name outside the
-    map's domain is a ``ValueError`` BY NAME (on ``s_tail`` the domain is ``CFG.DQ_ROUTES_PAIR``; the first body (``dp_tail``) has NO
-    register-direct route: only ``"tma"`` resolves there)."""
-    resolved = resolve_tmem_map(tmem_map)
-    allowed = CFG.DQ_ROUTES_PAIR if resolved == "s_tail" else (CFG.DQ_ROUTE_PAIR_DEFAULT,)
-    route = CFG.DQ_ROUTE_PAIR_DEFAULT if name is None else name
-    if type(route) is not str or route not in allowed:
-        raise ValueError(f"dq_route_pair must be one of {allowed} on tmem_map {resolved!r}; got {route!r}")
-    return route
-
-
-def dq_route_pair_code(name=None, tmem_map=None):
-    """The s_tail body's ``dq_route_code`` Constexpr[int] for a (resolved) route name ON A MAP (``DQ_ROUTE_PAIR_CODES``; 0 = tma on every map);
-    declines exactly as :func:`resolve_dq_route_pair_for_map`."""
-    return DQ_ROUTE_PAIR_CODES[resolve_dq_route_pair_for_map(name, tmem_map)]
-
-
-# Why a probe of the shared code space is NOT defined on a map (the typed decline's text; every row reachable: validate_config trips each).
-DIAG_2CTA_DECLINE_WHY = {
-    ("dp_empty_wait_off", "s_tail"): "dp_empty is arrived at the dS^T readout on the s_tail map, so a skipped dp_empty wait probes nothing",
-    ("ds_gates_off", "s_tail"): (
-        "RETIRED on the s_tail map: skipping the three dS gates removes the only back-edge of the ds_recv_full expect_tx arm, so the arm of "
-        "tile t+1 lands on a tx-pending phase and FAULTS (CUDA 719; barrier-inspector 2026-10-27 08:01) -- the safe exchange ceiling is 'exchange_off'"
-    ),
-    ("exchange_off", "dp_tail"): "the first body (dp_tail) carries no exchange_off probe: s_tail only",
-    ("stats_one_chunk", "dp_tail"): "the first body (dp_tail) carries no stats_one_chunk probe: s_tail only",
-    ("sdq_sts_off", "dp_tail"): "the first body (dp_tail) has no dedicated sDQ ring to probe: s_tail only",
-}
-
-
 # The mask form's kernel code space (``Constexpr[int]`` ``mask_form_code``; the body names MASK_FORM_FSEL / _PREDICATED / _DIAG_OFF from these).
 MASK_FORM_CODES = {"fsel": 0, "predicated": 1, "diag_mask_off": 2}
 
 
-def resolve_mask_form_for_map(name=None, tmem_map=None):
-    """The softmax's MASK FORM on a map, typed: ``None`` -> the map's default (``"fsel"`` on both maps = today's rendering); a name outside
-    the map's domain is a ``ValueError`` BY NAME (on ``s_tail`` the domain is ``CFG.MASK_FORMS``; the first body (``dp_tail``) has ONE form:
-    only ``"fsel"`` resolves there).  ``CFG.MASK_FORM_DIAGNOSTIC`` (``"diag_mask_off"``) is the deletion probe: output WRONG BY DESIGN, resolved
-    here like the ``diag_2cta`` probes (set on the adapter INSTANCE by the probe driver, keyed apart, refused by the driver's --validate)."""
-    resolved = resolve_tmem_map(tmem_map)
-    allowed = CFG.MASK_FORMS if resolved == "s_tail" else (CFG.MASK_FORM_DEFAULT,)
+def resolve_mask_form(name=None):
+    """The softmax's MASK FORM, typed: ``None`` -> ``CFG.MASK_FORM_DEFAULT`` (``"fsel"``, the shipped rendering); a name outside ``CFG.MASK_FORMS``
+    is a ``ValueError`` BY NAME.  ``CFG.MASK_FORM_DIAGNOSTIC`` (``"diag_mask_off"``) is the deletion probe: output WRONG BY DESIGN, resolved here
+    like the ``diag_2cta`` probes (set on the adapter INSTANCE by a probe driver, keyed apart, refused by the driver's --validate)."""
     form = CFG.MASK_FORM_DEFAULT if name is None else name
-    if type(form) is not str or form not in allowed:
-        raise ValueError(f"mask_form must be one of {allowed} on tmem_map {resolved!r}; got {form!r}")
+    if type(form) is not str or form not in CFG.MASK_FORMS:
+        raise ValueError(f"mask_form must be one of {CFG.MASK_FORMS}; got {form!r}")
     return form
 
 
-def mask_form_code(name=None, tmem_map=None):
-    """The s_tail body's ``mask_form_code`` Constexpr[int] for a (resolved) form name ON A MAP (``MASK_FORM_CODES``; 0 = fsel on every map);
-    declines exactly as :func:`resolve_mask_form_for_map`."""
-    return MASK_FORM_CODES[resolve_mask_form_for_map(name, tmem_map)]
+def mask_form_code(name=None):
+    """The body's ``mask_form_code`` Constexpr[int] for a (resolved) form name (``MASK_FORM_CODES``; 0 = fsel); declines exactly as
+    :func:`resolve_mask_form`."""
+    return MASK_FORM_CODES[resolve_mask_form(name)]
 
 
-def resolve_diag_2cta_for_map(name=None, tmem_map=None):
-    """The DIAGNOSTIC probe ON A MAP, typed: the one code space of ``config_sm100_d128_accum_2cta.diag_2cta_code`` (so the kernel constants
-    DIAG_* agree across the bodies), with the probes a map does not define declined BY NAME (each map's ``DIAG_2CTA_NAMES_ON_MAP``; the reason
-    per (probe, map) in ``DIAG_2CTA_DECLINE_WHY``: a probe never renders as a silent no-op on a body without code for it)."""
-    resolved = resolve_tmem_map(tmem_map)
-    diag = resolve_diag_2cta(name)
-    allowed = CFG_DP_TAIL.DIAG_2CTA_NAMES_ON_MAP if resolved == "dp_tail" else CFG.DIAG_2CTA_NAMES_ON_MAP
-    if diag is not None and diag not in allowed:
-        raise ValueError(f"diag_2cta {diag!r} is not defined on tmem_map {resolved!r} ({DIAG_2CTA_DECLINE_WHY[(diag, resolved)]}); choose from {allowed}")
-    return diag
-
-
-def resolve_debug_clk_for_map(value=None, tmem_map=None):
-    """The STAMPS lever ON A MAP, typed: ``None`` -> ``CFG.DEBUG_CLK_DEFAULT`` (False: the shipped rendering); a bool; anything else (an int, a
-    string) is a ``ValueError`` BY NAME; ``True`` on ``dp_tail`` declines BY NAME (the first body carries no stamps lever)."""
-    resolved = resolve_tmem_map(tmem_map)
+def resolve_debug_clk(value=None):
+    """The STAMPS lever, typed: ``None`` -> ``CFG.DEBUG_CLK_DEFAULT`` (False: the shipped rendering); a bool; anything else (an int, a string)
+    is a ``ValueError`` BY NAME."""
     flag = CFG.DEBUG_CLK_DEFAULT if value is None else value
     if type(flag) is not bool:
         raise ValueError(f"debug_clk must be a bool (None = {CFG.DEBUG_CLK_DEFAULT}); got {flag!r} ({type(flag).__name__})")
-    if flag and resolved != "s_tail":
-        raise ValueError(f"debug_clk is defined on tmem_map 's_tail' only (the first body carries no stamps lever); got True on tmem_map {resolved!r}")
     return flag
 
 
@@ -458,61 +313,47 @@ DELETED_BARRIERS_XFA4 = ("ds_tmem", "dp_empty")
 # waiter set of the first build raced the leader's zero-trip EMPTY commit (a zero-trip item as a cluster's first item: a HANG; consecutive zero-trips:
 # a lap).  `dq_done` reverts to the reduce group alone (the 04:17 AUDIT row).
 ADDED_BARRIERS_XFA4 = ("dq_war_done",)
-# The barrier row that has NO USER under 16w_fa4 although it is in the 16w table (the stack fold 2026-10-27): writer C's C2b row `dvk_stage_empty`
-# serves `dkv_accum = "fp32_reduce"`, whose fp32 dK / dV staging lives in the 16w EPILOGUE loop; under 16w_fa4 the field DECLINES BY NAME
-# (`validate_fields_for_roles`), so the row is absent from BAR_LAYOUT_XFA4 / BarsXFA4 (no init, no arrive, no wait) and writer B's 33-row table,
-# its END and its PTX record stand unchanged.
+# The barrier row that has NO USER under 16w_fa4 although it is in the 16w table: `dvk_stage_empty` serves `dkv_accum = "fp32_reduce"`, whose
+# fp32 dK / dV staging lives in the 16w EPILOGUE loop; under 16w_fa4 the field DECLINES BY NAME (`validate_fields_for_roles`), so the row is
+# absent from BAR_LAYOUT_XFA4 / BarsXFA4 (no init, no arrive, no wait) and the 33-row table, its END and its PTX record stand unchanged.
 UNSERVED_BARRIERS_XFA4 = ("dvk_stage_empty",)
 
 
-def resolve_warp_roles_for_map(name=None, tmem_map=None):
-    """The ROLE SHAPE on a map, typed: ``None`` -> ``CFG.WARP_ROLES_DEFAULT`` ("16w", today's rendering); a name outside the map's domain is a
-    ``ValueError`` BY NAME (``16w_fa4`` exists on ``s_tail`` only: the first body (``dp_tail``) keeps its one role shape)."""
-    resolved = resolve_tmem_map(tmem_map)
-    allowed = CFG.WARP_ROLES if resolved == "s_tail" else (CFG.WARP_ROLES_DEFAULT,)
+def resolve_warp_roles(name=None):
+    """The ROLE SHAPE, typed: ``None`` -> ``CFG.WARP_ROLES_DEFAULT`` ("16w", the shipped rendering); a name outside ``CFG.WARP_ROLES`` is a
+    ``ValueError`` BY NAME."""
     roles = CFG.WARP_ROLES_DEFAULT if name is None else name
-    if type(roles) is not str or roles not in allowed:
-        raise ValueError(f"warp_roles must be one of {allowed} on tmem_map {resolved!r}; got {roles!r}")
+    if type(roles) is not str or roles not in CFG.WARP_ROLES:
+        raise ValueError(f"warp_roles must be one of {CFG.WARP_ROLES}; got {roles!r}")
     return roles
 
 
-def warp_roles_code(name=None, tmem_map=None):
-    """The s_tail body's ``warp_roles_code`` Constexpr[int] for a (resolved) role-shape name ON A MAP (``WARP_ROLES_CODES``; 0 = 16w on every map);
-    declines exactly as :func:`resolve_warp_roles_for_map`."""
-    return WARP_ROLES_CODES[resolve_warp_roles_for_map(name, tmem_map)]
+def warp_roles_code(name=None):
+    """The body's ``warp_roles_code`` Constexpr[int] for a (resolved) role-shape name (``WARP_ROLES_CODES``; 0 = 16w); declines exactly as
+    :func:`resolve_warp_roles`."""
+    return WARP_ROLES_CODES[resolve_warp_roles(name)]
 
 
-def validate_fields_for_roles(roles, dq_route_pair=None, diag_2cta=None, debug_clk=False, dkv_accum=None):
-    """The field bundle a (resolved) role shape SERVES, typed BY NAME: under ``16w_fa4`` a register-direct dQ route is NOT BUILT and ``ds_gates_off``
-    (D8) is RETIRED (:meth:`ConfigSTail.dq_routes_for_roles` / :meth:`ConfigSTail.diag_2cta_names_for_roles`).  Called by ``compile_host`` before
-    any trace and asserted here; returns ``roles``."""
+def validate_fields_for_roles(roles, diag_2cta=None, debug_clk=False, dkv_accum=None):
+    """The field bundle a (resolved) role shape SERVES, typed BY NAME: under ``16w_fa4`` the STAMPS lever ``debug_clk`` (its record layout names
+    the 16w roles' waits) and ``dkv_accum = "fp32_reduce"`` (its fp32 dK / dV staging rounds live in the 16w epilogue loop) are not built and
+    decline; every ``diag_2cta`` probe of ``CFG.DIAG_2CTA_NAMES`` serves both shapes.  Called by ``compile_host`` before any trace; returns ``roles``."""
     if roles not in CFG.WARP_ROLES:
         raise ValueError(f"warp_roles must be one of {CFG.WARP_ROLES}; got {roles!r}")
-    # the stack fold: under the DEFAULT shape the MAP resolvers own every domain (dp_tail included: the first body's probes resolve there);
-    # the role filter below removes names under a NON-default shape only
+    resolve_diag_2cta(diag_2cta)
     if roles == CFG.WARP_ROLES_DEFAULT:
         return roles
-    routes = CFG.dq_routes_for_roles(roles)
-    if dq_route_pair is not None and dq_route_pair not in routes:
-        raise ValueError(f"dq_route_pair {dq_route_pair!r} is not built under warp_roles {roles!r} (the reduce group has no red path); choose from {routes}")
-    diags = CFG.diag_2cta_names_for_roles(roles)
-    if diag_2cta is not None and diag_2cta not in diags:
-        raise ValueError(
-            f"diag_2cta {diag_2cta!r} is not defined under warp_roles {roles!r} (ds_gates_off is RETIRED there: the ds_recv_full arm's back-edge "
-            f"runs through the leader's gate waits it would skip); choose from {diags}"
-        )
-    if debug_clk and roles != CFG.WARP_ROLES_DEFAULT:  # the stack fold: the STAMPS record layout (DBG_CLK.ROLE_WAITS / WORD) is the 16w roles'
+    if debug_clk:  # the STAMPS record layout (DBG_CLK.ROLE_WAITS / WORD) is the 16w roles'
         raise ValueError(
             f"debug_clk is not defined under warp_roles {roles!r} (the STAMPS record layout names the 16w roles' waits: no words for the softmax's "
-            f"dq_war_done wait or the reduce group; a 16w_fa4 layout is a design step, not a merge); choose warp_roles {CFG.WARP_ROLES_DEFAULT!r}"
+            f"dq_war_done wait or the reduce group); choose warp_roles {CFG.WARP_ROLES_DEFAULT!r}"
         )
     from .d128_grouped_contract import DKV_ACCUM_DEFAULT, resolve_dkv_accum  # local: the contract module is the field's truth, the config stays light
 
-    if resolve_dkv_accum(dkv_accum) != DKV_ACCUM_DEFAULT and roles != CFG.WARP_ROLES_DEFAULT:
+    if resolve_dkv_accum(dkv_accum) != DKV_ACCUM_DEFAULT:
         raise ValueError(
             f"dkv_accum {dkv_accum!r} is not built under warp_roles {roles!r} (the fp32 dK / dV staging rounds live in the 16w epilogue loop; the "
-            f"reduce group of 16w_fa4 stages bf16 halves only -- the seam is the barrier-inspector's before a re-site); choose warp_roles "
-            f"{CFG.WARP_ROLES_DEFAULT!r} or dkv_accum {DKV_ACCUM_DEFAULT!r}"
+            f"reduce group of 16w_fa4 stages bf16 halves only); choose warp_roles {CFG.WARP_ROLES_DEFAULT!r} or dkv_accum {DKV_ACCUM_DEFAULT!r}"
         )
     return roles
 
@@ -756,7 +597,7 @@ BAR_LAYOUT_XFA4 = (
         CFG.ONE_LANE,
         "mma",
         "LOCAL",
-    ),  # TWO waiter sets: reduce `dq_state` st(0) (readout) + softmax `dq_war` st(1) (the sDS WAR before every dS STS)
+    ),  # ONE waiter set: the reduce group's `dq_state` st(0) (the readout); the softmax's sDS WAR wait is the `dq_war_done` row below
     ("p_ready", 230672, 1, CFG.PAIR_SOFTMAX_LANES, "leader", "LEADER"),
     ("ds_ready", 230688, 1, CFG.PAIR_SOFTMAX_LANES, "leader", "LEADER"),  # arrived BEFORE the softmax's dq_war wait: dK(t) never waits dQ(t-1)
     ("s_read", 230704, 1, CFG.PAIR_SOFTMAX_LANES, "leader", "LEADER"),  # KEPT (X1): every tile after the S^T ld + wait(LOAD); MMA(L) slot 2
@@ -823,20 +664,18 @@ def bar_kind_counts_for_roles(roles):
 def validate_config():
     """The arm-(ii) deltas on top of the first body's geometry; CPU only (raises at import).  Every number the kernel header quotes is here."""
     c = CFG
-    base = CFG_DP_TAIL
-    assert c.TMEM_MAP == "s_tail" and TMEM_MAPS == ("dp_tail", "s_tail") and TMEM_MAP_DEFAULT == "dp_tail"
+    base = CFG_BASE
+    assert c.TMEM_MAP == "s_tail"
     # unchanged geometry (inherited): MMA shapes, pair extents, boxes, warps, registers, the per-stage slab bytes, the lane constants
     assert (c.M, c.N, c.D, c.K_HW, c.BPE, c.BPE_ACC, c.CTA_MMA, c.CGA_M, c.CGA_N) == (base.M, base.N, base.D, base.K_HW, base.BPE, base.BPE_ACC, 2, 2, 1)
     assert (c.PAIR_KV_ROWS, c.Q_HALF, c.D_HALF, c.COLLECTIVE_M_KV, c.COLLECTIVE_M_Q) == (256, 64, 64, 256, 128)
     assert (c.Q1_BYTES, c.Q2_BYTES, c.DO1_BYTES, c.DO2_BYTES) == (16384,) * 4 and (c.K1_BYTES, c.K2_BYTES, c.V_BYTES, c.DS_BYTES) == (32768,) * 4
     assert (c.DS_HALF_BYTES, c.XCHG_BYTES, c.DQ_SLICES, c.DQ_SLICE_BYTES) == (16384, 16384, 4, 8192)
-    assert (c.SOFTMAX_REGS, c.EPILOGUE_REGS, c.SERVICE_REGS, c.ENTRY_REGS, c.REG_SPLITS) == (144, 144, 80, 128, base.REG_SPLITS)
+    assert (c.SOFTMAX_REGS, c.EPILOGUE_REGS, c.SERVICE_REGS, c.ENTRY_REGS) == (144, 144, 80, 128)
     assert (c.MAPS_PER_SEQUENCE, c.MAP_BOX_ROWS, c.THD_UNIT_ROWS, c.Q_TILES_PER_PAIR) == (9, base.MAP_BOX_ROWS, 256, 2)
     assert (c.PACK_QUARTER_COLS, c.PACK_GROUP_COLS, c.K_STEPS_PER_BOX, c.K2_HALF_BYTES, c.DS_A_LBO) == (16, 32, 4, 16384, 8192)
     assert [c.ts_k_perm(k) for k in range(c.N // c.K_HW)] == [base.ts_k_perm(k) for k in range(base.N // base.K_HW)]
-    assert (c.TMA_LOAD_FORMS, c.TMA_LOAD_FORM_DEFAULT) == (base.TMA_LOAD_FORMS, "multicast")
-    assert (c.STORE_WAIT_FORMS, c.STORE_WAIT_FORM_DEFAULT) == (base.STORE_WAIT_FORMS, "retry")
-    assert (c.REG_SPLIT_NAMES, c.REG_SPLIT_DEFAULT, c.DIAG_2CTA_NAMES) == (base.REG_SPLIT_NAMES, "144/144/80", base.DIAG_2CTA_NAMES)
+    assert c.DIAG_2CTA_NAMES == base.DIAG_2CTA_NAMES
     # ring depths: Q1 one stage; the dQ staging ring 2 slots x 2 rounds = the 4 reduce-add slices per tile
     assert (c.Q1_STAGES, c.Q2_STAGES, c.DO_STAGES, c.KV_STAGES, c.SCHED_STAGES) == (1, 1, 1, 1, 2)
     assert (c.DQ_SLOTS, c.DQ_ROUNDS) == (2, 2) and c.DQ_SLOTS * c.DQ_ROUNDS == c.DQ_SLICES
@@ -890,74 +729,27 @@ def validate_config():
     assert c.TMEM_DEAD_COL == c.DS_COL + c.PACK_COLS == 192 and c.TMEM_DEAD_COL <= c.DV_COL  # the first body's dQ columns are DEAD
     assert (c.DV_COL, c.DV_COLS, c.DK_COL, c.DK_COLS, c.TMEM_USED, c.TMEM_COLS) == (256, 128, 384, 128, 512, 512)
     assert c.TMEM_USED <= c.TMEM_COLS and c.DQ_LANE_SPLIT == 64 and c.TMEM_COLS == base.TMEM_COLS
-    # the order and the probes ON THIS MAP (typed; every reader declines by name)
-    assert c.PAIR_MMA_ORDERS == ("fa4", "fa4b") and c.PAIR_MMA_ORDER_DEFAULT == "fa4"  # fa4b = dQ(t-1) after dV(t); the default stays fa4 until MEASURED
-    assert resolve_pair_mma_order_for_map(None, "s_tail") == "fa4" and resolve_pair_mma_order_for_map("fa4", "s_tail") == "fa4"
-    assert resolve_pair_mma_order_for_map("fa4b", "s_tail") == "fa4b"
-    assert dq_after_dv_for_map(None, "s_tail") is False and dq_after_dv_for_map("fa4", "s_tail") is False and dq_after_dv_for_map("fa4b", "s_tail") is True
-    assert dq_after_dv_for_map(None, None) is False and dq_after_dv_for_map("s_first", "dp_tail") is False and dq_after_dv_for_map("dk_first", None) is False
-    assert resolve_pair_mma_order_for_map(None, None) == base.PAIR_MMA_ORDER_DEFAULT and resolve_pair_mma_order_for_map(None, "dp_tail") == "s_first"
-    for bad_order, bad_map in (("s_first", "s_tail"), ("dk_first", "s_tail"), ("fa4", "dp_tail"), ("fa4", None), ("fa4b", "dp_tail"), ("fa4b", None)):
+    # the probes (typed; the body has code for every name of the code space; the two probes of an earlier pair body are outside the domain)
+    assert c.DIAG_2CTA_NAMES_ON_MAP == ("dq_reduce_add_off", "exchange_off", "stats_one_chunk", "sdq_sts_off") == c.DIAG_2CTA_NAMES
+    assert resolve_diag_2cta(None) is None and [resolve_diag_2cta(n) for n in c.DIAG_2CTA_NAMES_ON_MAP] == list(c.DIAG_2CTA_NAMES_ON_MAP)
+    for bad_diag in ("dp_empty_wait_off", "ds_gates_off", "bogus", "", 1):
         try:
-            resolve_pair_mma_order_for_map(bad_order, bad_map)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError((bad_order, bad_map))
-    # the dQ route ON THIS MAP (typed; the default is the TMA path until MEASURED; the first body resolves "tma" only)
-    assert c.DQ_ROUTES_PAIR == ("tma", "red_global", "red_global_pair") and c.DQ_ROUTE_PAIR_DEFAULT == "tma" == c.DQ_ROUTES_PAIR[0]
-    assert DQ_ROUTE_PAIR_CODES == {"tma": 0, "red_global": 1, "red_global_pair": 2} and tuple(DQ_ROUTE_PAIR_CODES) == c.DQ_ROUTES_PAIR
-    assert resolve_dq_route_pair_for_map(None, "s_tail") == "tma" and resolve_dq_route_pair_for_map("tma", "s_tail") == "tma"
-    assert (
-        resolve_dq_route_pair_for_map("red_global", "s_tail") == "red_global"
-        and resolve_dq_route_pair_for_map("red_global_pair", "s_tail") == "red_global_pair"
-    )
-    assert resolve_dq_route_pair_for_map(None, None) == "tma" and resolve_dq_route_pair_for_map("tma", "dp_tail") == "tma"
-    assert (dq_route_pair_code(None, None), dq_route_pair_code(None, "s_tail"), dq_route_pair_code("red_global", "s_tail")) == (0, 0, 1)
-    assert dq_route_pair_code("red_global_pair", "s_tail") == 2
-    for bad_route, bad_map in (("red_global", "dp_tail"), ("red_global", None), ("red_global_pair", None), ("bogus", "s_tail"), ("", "s_tail"), (1, "s_tail")):
-        try:
-            resolve_dq_route_pair_for_map(bad_route, bad_map)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError((bad_route, bad_map))
-    # the red route's counts: one lane holds the 64 contiguous d of ONE q row (the M 128 half-row image: lane m % 64 + 64 * (d // 64))
-    assert c.DQ_RED_ROW_WORDS == c.DQ_COLS == c.D_HALF == 64 and c.DQ_RED_V4_PER_LANE == 16 and c.DQ_RED_SECTORS_PER_LANE == 8
-    assert c.DQ_RED_V4_PER_LANE * 4 == c.DQ_RED_ROW_WORDS == c.DQ_ROUNDS * c.DQ_BOX and c.DQ_RED_SECTORS_PER_LANE * 2 == c.DQ_RED_V4_PER_LANE
-    assert c.DQ_RED_V4_PER_TILE_PER_CTA == c.EPILOGUE_LANES * c.DQ_RED_V4_PER_LANE == 2048 and c.EPILOGUE_LANES == 2 * c.Q_HALF
-    # the probes ON THIS MAP (D7 and D8 decline BY NAME here; the three day-3 probes decline by name on dp_tail; every decline row reachable)
-    assert c.DIAG_2CTA_NAMES_ON_MAP == ("dq_reduce_add_off", "exchange_off", "stats_one_chunk", "sdq_sts_off") and set(c.DIAG_2CTA_NAMES_ON_MAP) < set(
-        c.DIAG_2CTA_NAMES
-    )
-    assert base.DIAG_2CTA_NAMES_ON_MAP == ("dq_reduce_add_off", "dp_empty_wait_off", "ds_gates_off") and "ds_gates_off" not in c.DIAG_2CTA_NAMES_ON_MAP
-    assert resolve_diag_2cta_for_map(None, "s_tail") is None and resolve_diag_2cta_for_map("dq_reduce_add_off", "s_tail") == "dq_reduce_add_off"
-    assert [resolve_diag_2cta_for_map(n, "s_tail") for n in c.DIAG_2CTA_NAMES_ON_MAP] == list(c.DIAG_2CTA_NAMES_ON_MAP)
-    assert (
-        resolve_diag_2cta_for_map("dp_empty_wait_off", "dp_tail") == "dp_empty_wait_off" and resolve_diag_2cta_for_map("ds_gates_off", None) == "ds_gates_off"
-    )
-    for bad_diag, bad_map in DIAG_2CTA_DECLINE_WHY:
-        try:
-            resolve_diag_2cta_for_map(bad_diag, bad_map)
+            resolve_diag_2cta(bad_diag)
         except ValueError as error:
-            assert DIAG_2CTA_DECLINE_WHY[(bad_diag, bad_map)] in str(error) and f"is not defined on tmem_map {bad_map!r}" in str(error), str(error)
+            assert "diag_2cta must be None or one of" in str(error), str(error)
         else:
-            raise AssertionError((bad_diag, bad_map, "must decline by name"))
-    assert set(DIAG_2CTA_DECLINE_WHY) == {(n, "s_tail") for n in base.DIAG_2CTA_NAMES if n not in c.DIAG_2CTA_NAMES_ON_MAP} | {
-        (n, "dp_tail") for n in c.DIAG_2CTA_NAMES_ON_MAP if n not in base.DIAG_2CTA_NAMES_ON_MAP
-    }
+            raise AssertionError((bad_diag, "must decline by name"))
     assert (c.DIAG_EXCHANGE_OFF_TX, c.DIAG_STATS_CHUNK) == (0, 0) and 0 <= c.DIAG_STATS_CHUNK < c.DIAG_STATS_CHUNKS_PER_QUARTER == 8
     assert (c.DIAG_STATS_LDS_PER_LANE, c.DIAG_STATS_LDS_REMOVED_PER_LANE) == (32, 28) and c.DIAG_STATS_LDS_REMOVED_PER_LANE * c.SOFTMAX_WARPS == 224
-    # the STAMPS lever: typed bool, s_tail only; the record fits the bar block's spare; the layout is unique, contiguous, and names real barriers
-    assert c.DEBUG_CLK_DEFAULT is False and resolve_debug_clk_for_map(None, "s_tail") is False and resolve_debug_clk_for_map(True, "s_tail") is True
-    assert resolve_debug_clk_for_map(False, None) is False and resolve_debug_clk_for_map(None, None) is False
-    for bad_flag, bad_map in ((True, "dp_tail"), (True, None), (1, "s_tail"), ("True", "s_tail"), (0, None), ("", "s_tail")):
+    # the STAMPS lever: typed bool; the record fits the bar block's spare; the layout is unique, contiguous, and names real barriers
+    assert c.DEBUG_CLK_DEFAULT is False and resolve_debug_clk(None) is False and resolve_debug_clk(True) is True and resolve_debug_clk(False) is False
+    for bad_flag in (1, "True", 0, ""):
         try:
-            resolve_debug_clk_for_map(bad_flag, bad_map)
+            resolve_debug_clk(bad_flag)
         except ValueError:
             pass
         else:
-            raise AssertionError((bad_flag, bad_map, "debug_clk must decline by name"))
+            raise AssertionError((bad_flag, "debug_clk must decline by name"))
     d = DBG_CLK
     assert d.SMEM == BAR_LAYOUT_END == 230960 and d.WORDS == 96 and d.BYTES == 384 and d.SMEM % 16 == 0
     assert d.SMEM + d.BYTES == c.TMEM_HANDLE and d.BYTES == c.TMEM_HANDLE - BAR_LAYOUT_END  # the record IS the spare: no byte past it, none left
@@ -985,48 +777,25 @@ def validate_config():
             pass
         else:
             raise AssertionError(bad)
-    # the softmax's MASK FORM on this map (typed; the default is today's FSEL rendering until MEASURED; the first body resolves "fsel" only)
+    # the softmax's MASK FORM (typed; the default is the FSEL rendering: measured neutral against the predicated form)
     assert c.MASK_FORMS == ("fsel", "predicated", "diag_mask_off") and c.MASK_FORM_DEFAULT == "fsel" == c.MASK_FORMS[0]
     assert c.MASK_FORM_DIAGNOSTIC == "diag_mask_off" and c.MASK_FORM_DIAGNOSTIC in c.MASK_FORMS and c.MASK_FORM_DIAGNOSTIC != c.MASK_FORM_DEFAULT
     assert MASK_FORM_CODES == {"fsel": 0, "predicated": 1, "diag_mask_off": 2} and tuple(MASK_FORM_CODES) == c.MASK_FORMS
-    assert resolve_mask_form_for_map(None, "s_tail") == "fsel" and resolve_mask_form_for_map("fsel", "s_tail") == "fsel"
-    assert resolve_mask_form_for_map("predicated", "s_tail") == "predicated" and resolve_mask_form_for_map("diag_mask_off", "s_tail") == "diag_mask_off"
-    assert resolve_mask_form_for_map(None, None) == "fsel" and resolve_mask_form_for_map("fsel", "dp_tail") == "fsel"
-    assert (mask_form_code(None, None), mask_form_code(None, "s_tail"), mask_form_code("predicated", "s_tail"), mask_form_code("diag_mask_off", "s_tail")) == (
-        0,
-        0,
-        1,
-        2,
-    )
-    for bad_form, bad_map in (
-        ("predicated", "dp_tail"),
-        ("predicated", None),
-        ("diag_mask_off", None),
-        ("bogus", "s_tail"),
-        ("", "s_tail"),
-        (1, "s_tail"),
-        ("FSEL", "s_tail"),
-    ):
+    assert resolve_mask_form(None) == "fsel" == resolve_mask_form("fsel") and resolve_mask_form("predicated") == "predicated"
+    assert resolve_mask_form("diag_mask_off") == "diag_mask_off"
+    assert (mask_form_code(None), mask_form_code("fsel"), mask_form_code("predicated"), mask_form_code("diag_mask_off")) == (0, 0, 1, 2)
+    for bad_form in ("bogus", "", 1, "FSEL"):
         try:
-            resolve_mask_form_for_map(bad_form, bad_map)
+            resolve_mask_form(bad_form)
         except ValueError:
             pass
         else:
-            raise AssertionError((bad_form, bad_map))
+            raise AssertionError(bad_form)
     # the softmax lane's mask cost per tile: one select per cell of its two 32-column q quarters over one keep-word per quarter; the two groups'
     # quarters tile the 128 q columns, so the CTA's 256 softmax lanes select 128 x 128 cells per tile (the sass census' 64 FSEL + 8 R2P per lane)
     assert c.MASK_WORD_COLS == 32 == c.GROUP_QUARTER and c.QUARTERS_PER_GROUP == 2 and c.SOFTMAX_GROUPS == 2
     assert c.MASK_SELECTS_PER_LANE_PER_TILE == 64 == c.QUARTERS_PER_GROUP * c.GROUP_QUARTER and c.MASK_WORDS_PER_LANE_PER_TILE == 2
     assert c.MASK_SELECTS_PER_LANE_PER_TILE * c.SOFTMAX_GROUPS == c.N and c.MASK_SELECTS_PER_LANE_PER_TILE * c.SOFTMAX_LANES == c.M * c.N
-    assert tmem_map_s_tail(None) is False and tmem_map_s_tail("dp_tail") is False and tmem_map_s_tail("s_tail") is True
-    assert config_for_map(None) is base and config_for_map("s_tail") is c
-    for bad in ("bogus", True, 1, "", "stail", "S_TAIL"):
-        try:
-            resolve_tmem_map(bad)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError(bad)
     # BAR_LAYOUT: 34 names / 39 slots, 16-B rows, contiguous from BARS, disjoint, inside [BARS, TMEM_HANDLE); counts by kind; scope by kind
     assert BAR_LAYOUT_STATUS.startswith("FILLED") and len(BAR_LAYOUT) == 35 and sum(row[2] for row in BAR_LAYOUT) == 40
     expected_counts = dict(
@@ -1078,72 +847,44 @@ def validate_config():
         "k2_full",
     }  # the seven cga2 tensor-load barriers: LEADER-armed, LEADER-waited (P9)
     first_body = [row[0] for row in __import__("cudnn.sdpa.bwd.config_sm100_d128_accum_2cta", fromlist=["BAR_LAYOUT"]).BAR_LAYOUT]
-    assert [n for n in names if n not in ("s_read", "s_tail_empty", "dvk_stage_empty")] == first_body  # every other row keeps its name and relative order
-    assert names[-1] == "dvk_stage_empty"  # the C2b row is appended after the first body's last row (tmem_dealloc)
+    assert [n for n in names if n not in ("s_read", "s_tail_empty", "dvk_stage_empty")] == first_body  # every other row keeps the base table's name and order
+    assert names[-1] == "dvk_stage_empty"  # the fp32_reduce row is appended after the base table's last row (tmem_dealloc)
     assert len(ALIASES) == 3 and [a[0] for a in ALIASES] == ["dk_store", "dv_store", "ds_recv(rank)"]  # the dq_staging alias is deleted
     assert (c.PAIR_EPILOGUE_LANES, c.PAIR_SOFTMAX_LANES, c.DQ_SLICE_LANES, c.STORE_LANES) == (256, 512, 64, 32)
-    # --- X-FA4 (warp_roles 16w_fa4; barrier-inspector resources/x-fa4-barrier-table.md section 8): the role shape is typed, resolved PER MAP, and its
-    # 32-row table equals the audited 34-row table minus the two deleted rows with ds_smem counted from the softmax, re-packed (config = truth) ---
+    # --- the alternate role shape (warp_roles 16w_fa4): typed, and its 33-row table equals the audited 35-row table minus the two deleted rows
+    # and the unserved fp32 row, with ds_smem counted from the softmax, re-packed, plus the dq_war_done row (config = truth) ---
     assert c.WARP_ROLES == ("16w", "16w_fa4") and c.WARP_ROLES_DEFAULT == "16w" == c.WARP_ROLES[0] and tuple(WARP_ROLES_CODES) == c.WARP_ROLES
     assert WARP_ROLES_CODES == {"16w": 0, "16w_fa4": 1} and DELETED_BARRIERS_XFA4 == ("ds_tmem", "dp_empty") and ADDED_BARRIERS_XFA4 == ("dq_war_done",)
-    assert resolve_warp_roles_for_map(None, "s_tail") == "16w" == resolve_warp_roles_for_map("16w", "s_tail") == resolve_warp_roles_for_map(None, None)
-    assert resolve_warp_roles_for_map("16w_fa4", "s_tail") == "16w_fa4" and resolve_warp_roles_for_map("16w", "dp_tail") == "16w"
-    assert (warp_roles_code(None, None), warp_roles_code(None, "s_tail"), warp_roles_code("16w_fa4", "s_tail"), warp_roles_code("16w", "dp_tail")) == (
-        0,
-        0,
-        1,
-        0,
-    )
-    for bad_roles, bad_map in (
-        ("16w_fa4", "dp_tail"),
-        ("16w_fa4", None),
-        ("bogus", "s_tail"),
-        ("", "s_tail"),
-        (1, "s_tail"),
-        ("16W", "s_tail"),
-        ("20w", "s_tail"),
-    ):
+    assert resolve_warp_roles(None) == "16w" == resolve_warp_roles("16w") and resolve_warp_roles("16w_fa4") == "16w_fa4"
+    assert (warp_roles_code(None), warp_roles_code("16w"), warp_roles_code("16w_fa4")) == (0, 0, 1)
+    for bad_roles in ("bogus", "", 1, "16W", "20w"):
         try:
-            resolve_warp_roles_for_map(bad_roles, bad_map)
+            resolve_warp_roles(bad_roles)
         except ValueError:
             pass
         else:
-            raise AssertionError((bad_roles, bad_map))
-    assert (
-        validate_fields_for_roles("16w", "red_global", "dq_reduce_add_off") == "16w"  # ds_gates_off is RETIRED on the MAP (writer A): no role serves it
-        and validate_fields_for_roles("16w_fa4", "tma", "dq_reduce_add_off") == "16w_fa4"
-    )
-    assert validate_fields_for_roles("16w_fa4", None, None) == "16w_fa4"
-    # the stack fold: debug_clk and dkv_accum = fp32_reduce decline BY NAME under 16w_fa4 and pass under 16w; the unserved row is named
-    assert validate_fields_for_roles("16w_fa4", None, None, debug_clk=False, dkv_accum="bf16_partials") == "16w_fa4"
-    assert validate_fields_for_roles("16w", None, None, debug_clk=True, dkv_accum="fp32_reduce") == "16w"
+            raise AssertionError(bad_roles)
+    assert validate_fields_for_roles("16w", "dq_reduce_add_off") == "16w" and validate_fields_for_roles("16w_fa4", "dq_reduce_add_off") == "16w_fa4"
+    assert validate_fields_for_roles("16w_fa4", None) == "16w_fa4" and validate_fields_for_roles("16w_fa4", "exchange_off") == "16w_fa4"
+    # debug_clk and dkv_accum = fp32_reduce decline BY NAME under 16w_fa4 and pass under 16w; the unserved row is named
+    assert validate_fields_for_roles("16w_fa4", None, debug_clk=False, dkv_accum="bf16_partials") == "16w_fa4"
+    assert validate_fields_for_roles("16w", None, debug_clk=True, dkv_accum="fp32_reduce") == "16w"
     for bad_kw in ({"debug_clk": True}, {"dkv_accum": "fp32_reduce"}):
         try:
-            validate_fields_for_roles("16w_fa4", None, None, **bad_kw)
+            validate_fields_for_roles("16w_fa4", None, **bad_kw)
         except ValueError as error:
             assert "is not defined under warp_roles '16w_fa4'" in str(error) or "is not built under warp_roles '16w_fa4'" in str(error), str(error)
         else:
             raise AssertionError(bad_kw)
     assert UNSERVED_BARRIERS_XFA4 == ("dvk_stage_empty",) and all(n in {row[0] for row in BAR_LAYOUT} for n in UNSERVED_BARRIERS_XFA4)
     assert not any(row[0] in UNSERVED_BARRIERS_XFA4 for row in BAR_LAYOUT_XFA4)
-    for bad_roles, bad_route, bad_diag in (
-        ("16w_fa4", "red_global", None),
-        ("16w_fa4", "red_global_pair", None),
-        ("16w_fa4", None, "ds_gates_off"),
-        ("20w", None, None),
-    ):
+    for bad_roles, bad_diag in (("20w", None), ("16w_fa4", "ds_gates_off"), ("16w", "dp_empty_wait_off")):
         try:
-            validate_fields_for_roles(bad_roles, bad_route, bad_diag)
+            validate_fields_for_roles(bad_roles, bad_diag)
         except ValueError:
             pass
         else:
-            raise AssertionError((bad_roles, bad_route, bad_diag))
-    # the stack: ds_gates_off left the MAP domain (writer A's retirement), so the role filter is the identity on both shapes; D8s / D10 / D9 serve both
-    assert (
-        c.diag_2cta_names_for_roles("16w") == c.DIAG_2CTA_NAMES_ON_MAP == c.diag_2cta_names_for_roles("16w_fa4")
-        and "ds_gates_off" not in c.DIAG_2CTA_NAMES_ON_MAP
-    )
-    assert c.dq_routes_for_roles("16w") == c.DQ_ROUTES_PAIR and c.dq_routes_for_roles("16w_fa4") == ("tma",)
+            raise AssertionError((bad_roles, bad_diag))
     # the role-derived lane counts (never a literal in the body): the XCHG named barrier and ds_smem follow the warps that write XCHG / sDS own
     assert c.xchg_barrier_lanes("16w") == c.ds_smem_lanes("16w") == c.EPILOGUE_LANES == 128
     assert c.xchg_barrier_lanes("16w_fa4") == c.ds_smem_lanes("16w_fa4") == c.SOFTMAX_LANES == 256

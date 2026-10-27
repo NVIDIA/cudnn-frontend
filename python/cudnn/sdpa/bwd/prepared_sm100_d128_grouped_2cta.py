@@ -13,18 +13,14 @@ from functools import partial
 from types import SimpleNamespace
 
 from cudnn.frost.compiled_cache import positional_entry
-from .config_sm100_d128_accum_2cta import resolve_reg_split, resolve_store_wait_form, resolve_tma_load_form
+from .config_sm100_d128_accum_2cta import resolve_diag_2cta
 from .config_sm100_d128_accum_2cta_stail import (
     DBG_CLK,
     dbg_clk_records,
     dbg_clk_region_offset,
-    resolve_debug_clk_for_map,
-    resolve_diag_2cta_for_map,
-    resolve_dq_route_pair_for_map,
-    resolve_mask_form_for_map,
-    resolve_pair_mma_order_for_map,
-    resolve_tmem_map,
-    resolve_warp_roles_for_map,
+    resolve_debug_clk,
+    resolve_mask_form,
+    resolve_warp_roles,
 )
 from .d128_grouped_2cta_contract import CTA_PAIR_BODY, CTA_PAIR_CLUSTER, ONE_CTA_BODY, PAIR_BODY, CtaPairDecline, resolve_cta_pair, select_cta_pair
 from .d128_grouped_2cta_contract import THD as IMPLEMENTATION
@@ -113,25 +109,18 @@ def resolve_cta_pair_body(api):
 
 
 def check_support_selected(api):
-    """The grouped dispatch behind ``cta_pair``: resolve, then run the chosen body's OWN support predicates.  Under ``auto`` the heuristic's
-    pair body (``CTA_PAIR_BODY``) is materialized as the typed ``tmem_map`` when that field is unset (an explicit map is honoured; ``on`` keeps
-    the field's own default -- the first body, the direct route's day-1 semantics) and a pair predicate that declines sends the request to the
-    one-CTA body with the decline recorded in the reason; under ``on`` that decline is the answer."""
+    """The grouped dispatch behind ``cta_pair``: resolve, then run the chosen body's OWN support predicates.  Under ``auto`` a pair predicate
+    that declines sends the request to the one-CTA body with the decline recorded in the reason; under ``on`` that decline is the answer."""
     resolution = resolve_cta_pair_body(api)
     if resolution.body == PAIR_BODY:
-        materialized = resolution.mode == "auto" and getattr(api, "tmem_map", None) is None
-        if materialized:
-            api.tmem_map = CTA_PAIR_BODY
         try:
             supported = check_support(api)
         except NotImplementedError as error:
             if resolution.mode != "auto":
                 raise
-            if materialized:
-                api.tmem_map = None
             api._cta_pair = replace(resolution, body=ONE_CTA_BODY, reason=f"cta_pair=auto: the one-CTA body (the pair body declined: {error})")
         else:
-            api._cta_pair = replace(resolution, pair_map=resolve_tmem_map(getattr(api, "tmem_map", None)))
+            api._cta_pair = replace(resolution, pair_map=CTA_PAIR_BODY)
             return supported
     return _check_support_grouped(api)
 
@@ -148,41 +137,12 @@ def compile_plan_selected(api):
     return compile_plan_one_cta(api)
 
 
-def tmem_map(api):
-    """The adapter record's pair BODY selector (``SdpaBwdDslSm100D128.tmem_map``: a ``TMEM_MAPS`` name or ``None`` = "dp_tail", the first
-    body, byte-identical rendering; "s_tail" = ARM (ii)'s body), typed: a ``ValueError`` names the field and the domain."""
-    try:
-        return resolve_tmem_map(getattr(api, "tmem_map", None))
-    except ValueError as error:
-        raise ValueError(f"{api._NAME}: {error}") from None
-
-
-def pair_mma_order(api):
-    """The adapter record's pair MMA issue order (``SdpaBwdDslSm100D128.pair_mma_order``: a name of the selected body's ``PAIR_MMA_ORDERS``
-    or ``None`` = that body's default; "fa4" / "fa4b" exist on the s_tail map only, "s_first" / "dk_first" on the dp_tail map only), typed: a
-    ``ValueError`` names the field, the domain and the map."""
-    try:
-        return resolve_pair_mma_order_for_map(getattr(api, "pair_mma_order", None), getattr(api, "tmem_map", None))
-    except ValueError as error:
-        raise ValueError(f"{api._NAME}: {error}") from None
-
-
-def dq_route_pair(api):
-    """The adapter record's dQ partial route out of the pair body (``SdpaBwdDslSm100D128.dq_route_pair``: a name of the s_tail body's
-    ``CFG.DQ_ROUTES_PAIR`` -- "tma" (default) | "red_global" | "red_global_pair" -- or ``None`` = "tma"; the red forms exist on the s_tail map
-    only), typed: a ``ValueError`` names the field, the domain and the map."""
-    try:
-        return resolve_dq_route_pair_for_map(getattr(api, "dq_route_pair", None), getattr(api, "tmem_map", None))
-    except ValueError as error:
-        raise ValueError(f"{api._NAME}: {error}") from None
-
-
 def mask_form(api):
     """The adapter record's softmax MASK FORM on the pair body (``SdpaBwdDslSm100D128.mask_form``: a name of the s_tail body's ``CFG.MASK_FORMS``
     -- "fsel" (default) | "predicated" | "diag_mask_off" (DIAGNOSTIC: output wrong by design) -- or ``None`` = "fsel"; the non-default forms exist
     on the s_tail map only), typed: a ``ValueError`` names the field, the domain and the map."""
     try:
-        return resolve_mask_form_for_map(getattr(api, "mask_form", None), getattr(api, "tmem_map", None))
+        return resolve_mask_form(getattr(api, "mask_form", None))
     except ValueError as error:
         raise ValueError(f"{api._NAME}: {error}") from None
 
@@ -192,16 +152,7 @@ def warp_roles(api):
     (default: today's rendering) | "16w_fa4" (X-FA4: the softmax ships the dS exchange from its registers; warps 8-11 = the reduce group) -- or
     ``None`` = "16w"; "16w_fa4" exists on the s_tail map only), typed: a ``ValueError`` names the field, the domain and the map."""
     try:
-        return resolve_warp_roles_for_map(getattr(api, "warp_roles", None), getattr(api, "tmem_map", None))
-    except ValueError as error:
-        raise ValueError(f"{api._NAME}: {error}") from None
-
-
-def tma_load_form(api):
-    """The adapter record's cga2 TMA load form (``SdpaBwdDslSm100D128.tma_load_form``: a ``CFG.TMA_LOAD_FORMS`` name or ``None`` = the
-    config default), typed: a ``ValueError`` names the field and the domain."""
-    try:
-        return resolve_tma_load_form(getattr(api, "tma_load_form", None))
+        return resolve_warp_roles(getattr(api, "warp_roles", None))
     except ValueError as error:
         raise ValueError(f"{api._NAME}: {error}") from None
 
@@ -210,7 +161,7 @@ def diag_2cta(api):
     """The adapter record's DIAGNOSTIC probe (``SdpaBwdDslSm100D128.diag_2cta``: a ``CFG.DIAG_2CTA_NAMES`` name or ``None`` = no probe,
     the shipped body), typed: a ``ValueError`` names the field and the domain.  A set value makes the OUTPUT WRONG BY DESIGN."""
     try:
-        return resolve_diag_2cta_for_map(getattr(api, "diag_2cta", None), getattr(api, "tmem_map", None))
+        return resolve_diag_2cta(getattr(api, "diag_2cta", None))
     except ValueError as error:
         raise ValueError(f"{api._NAME}: {error}") from None
 
@@ -220,7 +171,7 @@ def debug_clk(api):
     body brackets every mbarrier wait of one representative warp per role with %clock64 and dumps a per-CTA record into the workspace region
     this module carves; s_tail only), typed: a ``ValueError`` names the field, the type and the map.  Output CORRECT under both values."""
     try:
-        return resolve_debug_clk_for_map(getattr(api, "debug_clk", None), getattr(api, "tmem_map", None))
+        return resolve_debug_clk(getattr(api, "debug_clk", None))
     except ValueError as error:
         raise ValueError(f"{api._NAME}: {error}") from None
 
@@ -238,24 +189,6 @@ def debug_clk_records(api, workspace):
     offset, n_rec = region
     base = dbg_clk_region_offset(workspace.data_ptr()) - workspace.data_ptr() + offset
     return workspace[base : base + n_rec * DBG_CLK.BYTES].view(torch.int32).view(n_rec, DBG_CLK.WORDS)
-
-
-def store_wait_form(api):
-    """The adapter record's store-warp wait form KNOB (``SdpaBwdDslSm100D128.store_wait_form``: a ``CFG.STORE_WAIT_FORMS`` name or ``None`` =
-    the config default), typed: a ``ValueError`` names the field and the domain.  Perf-only: the same function under every value."""
-    try:
-        return resolve_store_wait_form(getattr(api, "store_wait_form", None))
-    except ValueError as error:
-        raise ValueError(f"{api._NAME}: {error}") from None
-
-
-def reg_split(api):
-    """The adapter record's register-split KNOB (``SdpaBwdDslSm100D128.reg_split``: a ``CFG.REG_SPLIT_NAMES`` name or ``None`` = the config
-    default), typed: a ``ValueError`` names the field and the domain.  Perf-only: the same function under every value."""
-    try:
-        return resolve_reg_split(getattr(api, "reg_split", None))
-    except ValueError as error:
-        raise ValueError(f"{api._NAME}: {error}") from None
 
 
 def check_support(api):
@@ -331,13 +264,7 @@ def compile_plan(api):
             dtype,
             api.is_causal,
             sm,
-            pair_mma_order=pair_mma_order(api),
-            tma_load_form=tma_load_form(api),
             diag_2cta=diag_2cta(api),
-            store_wait_form=store_wait_form(api),
-            reg_split=reg_split(api),
-            tmem_map=tmem_map(api),
-            dq_route_pair=dq_route_pair(api),
             debug_clk=debug_clk(api),
             mask_form=mask_form(api),
             dkv_accum=dkv_accum(api),

@@ -51,37 +51,6 @@ class Config:
     EPILOGUE_REGS: int = 144
     SERVICE_REGS: int = 80
     REGFILE: int = 65536
-    # --- the leader's MMA issue order per q tile (kernel header section 5, MMA ISSUE ORDER; code-writer 2026-10-26) ---
-    # s_first:  dP^T(t), dV(t), S^T(t+1), dK(t), dQ(t) -- THE default (validated at b2d05784; the faster order BY MEASUREMENT);
-    # dk_first: dP^T(t), dV(t), dK(t), S^T(t+1), dQ(t) -- S^T(t+1) after dK(t) (the dS exchange chain under 1024 clk of MMA); the A/B
-    # arm ``frost_thd_2cta_dk_first``.  Same numerics by construction (the test module pins dK / dV bitwise).  MEASURED (benchmarker
-    # ORDER A/B/A, 2026-10-27 00:05 UTC, gb200-perf-152, one process per cell, main-kernel CUPTI us, band 1 %): dk_first = -2.78 % at
-    # 16K and -1.55 % at 32K vs s_first, indistinguishable at the step; the 2026-10-26 flip to dk_first (2c951980) rode a validate
-    # ladder only and is undone here.  A perf-relevant default flips only with its A/B/A row.
-    PAIR_MMA_ORDER_DEFAULT: str = "s_first"
-    # --- the cga2 TMA load form (kernel header section 10; code-writer 2026-10-27, from the sass-checker's FROST / FAv4 diff item 8) ---
-    # multicast: tma_load_tile(cta_group=2, mcast_mask=1 << rank) -> `cp.async.bulk.tensor ... .multicast::cluster.cta_group::2` with a
-    #            one-CTA mask (THE default: validated at b2d05784 and every ladder since; the DSL wrapper emits the modifier whenever a
-    #            mask is PRESENT, so a self-mask still takes the multicast routing path);
-    # plain:     the same load with mcast_mask=None -> `cp.async.bulk.tensor ... .cta_group::2` (FAv4's form at cluster (2,1)); the
-    #            bytes still complete on the pair LEADER's mbarrier (the wrapper's bit-24 routing, independent of the mask), so the
-    #            leader's expect_tx (2x bytes) and every barrier row are unchanged.  Same bytes, same SMEM image: an A/B knob
-    #            (bitwise on dK / dV by construction); the arm ``frost_thd_2cta_plain_tma``.  UNMEASURED until its A/B/A row.
-    TMA_LOAD_FORM_DEFAULT: str = "multicast"
-    # --- KNOBS (perf-only, the same function bitwise under every value; code-writer 2026-10-27 step 4, optimizer day-2 § 6.2 rank 5) ---
-    # store_wait_form: the STORE warp's six mbarrier waits (dq_full x 4, dv_full, dk_full).  retry = the barriers' declared try_wait form
-    #   (THE default: every ladder since b2d05784; on sm_100a the store warp rendered 76 PHASECHK + 146 BRA + 4 NANOSLEEP retry loops,
-    #   sass-checker 23:20); two_instr = tile_dsl.barrier.wait(spin=True), the hint-less `mbarrier.try_wait.parity.acquire.cta` inline-PTX
-    #   loop the MMA warp's 19 waits render as (2 instructions each).  tma_store_wait has ONE spelling (cp.async.bulk.wait_group.read):
-    #   not part of the knob.  The arm ``frost_thd_2cta_two_instr_wait``; UNMEASURED until its A/B/A row (lever L3's wait-form half).
-    STORE_WAIT_FORM_DEFAULT: str = "retry"
-    # reg_split: the three setmaxnreg counts (softmax / epilogue / service), named "<s>/<e>/<v>"; every split satisfies the entry formula
-    #   (SOFTMAX_WARPS s + EPILOGUE_WARPS e + SERVICE_WARPS v) x 32 == REGFILE with s, e >= ENTRY_REGS (INCREASE) and v <= ENTRY_REGS
-    #   (DECREASE), every count % 8 == 0.  144/144/80 = THE default (validated); 136/136/104 = FA4's working point (M5': softmax and
-    #   epilogue give up M5_REG_SHIFT each, the four service warps take the freed registers).  KILLED on any STL / LDL in the census
-    #   (DE-15 / DE-47).  The arm ``frost_thd_2cta_regs_136``; UNMEASURED until its A/B/A row.
-    REG_SPLIT_DEFAULT: str = "144/144/80"
-    M5_REG_SHIFT: int = 8
     # --- TMEM ---
     TMEM_COLS: int = 512  # one tcgen05.alloc.cta_group::2 of TMEM_COLS on BOTH CTAs; the same constant deallocates
     # --- scaffold (declared budget: mbarriers + TMEM handle + CLC payload; the inspector's rows must fit it) ---
@@ -501,60 +470,19 @@ class Config:
         return self.HEAD_BOX // self.K_HW  # 4 MMA k-steps per 64-wide d box (dP^T is issued per dO1 half box)
 
     @property
-    def PAIR_MMA_ORDERS(self):
-        return ("dk_first", "s_first")  # the two leader issue orders a ``pair_mma_order`` field may name (header section 5)
-
-    @property
-    def TMA_LOAD_FORMS(self):
-        return ("multicast", "plain")  # the two cga2 TMA load forms a ``tma_load_form`` field may name (header section 10)
-
-    @property
-    def STORE_WAIT_FORMS(self):
-        return ("retry", "two_instr")  # the two store-warp mbarrier wait forms a ``store_wait_form`` knob may name (header section 4 / 11)
-
-    @property
-    def REG_SPLITS(self):
-        """name -> (softmax, epilogue, service) setmaxnreg counts; the M5' split is DERIVED from the default and M5_REG_SHIFT."""
-        default = (self.SOFTMAX_REGS, self.EPILOGUE_REGS, self.SERVICE_REGS)
-        freed = (self.SOFTMAX_WARPS + self.EPILOGUE_WARPS) * self.M5_REG_SHIFT  # registers per lane the compute warps give up
-        m5 = (self.SOFTMAX_REGS - self.M5_REG_SHIFT, self.EPILOGUE_REGS - self.M5_REG_SHIFT, self.SERVICE_REGS + freed // self.SERVICE_WARPS)
-        return {"/".join(str(r) for r in default): default, "/".join(str(r) for r in m5): m5}
-
-    @property
-    def REG_SPLIT_NAMES(self):
-        return tuple(self.REG_SPLITS)  # ("144/144/80", "136/136/104"): the names a ``reg_split`` knob may carry
-
-    @property
     def DIAG_2CTA_NAMES(self):
-        # The ONE code space of the pair bodies' DIAGNOSTIC probes (``diag_2cta_code`` = 1 + index; shared by BOTH bodies so the kernel
-        # constants DIAG_* agree).  Which names a BODY defines is its map's ``DIAG_2CTA_NAMES_ON_MAP`` (this body's below, the s_tail body's
-        # in config_sm100_d128_accum_2cta_stail), resolved PER MAP by ``resolve_diag_2cta_for_map``: a name outside the map's set declines
-        # BY NAME, so a probe can never render as a silent no-op on a body that has no code for it.  Each probe removes ONE issue, wait or
-        # transfer of the DEFAULT body and keeps every arrive and wait site it does not name, so the barrier table is identical; the OUTPUT
-        # IS WRONG BY DESIGN (a timing ceiling, never a result; `--validate` refuses the arm by name; never shipped armed).
-        #   dq_reduce_add_off  (D2-pair): the store warp skips the four fp32 dQ tma_reduce_add issues per tile (dQ stays zero)
-        #   dp_empty_wait_off  (D7):      the leader MMA warp does not wait dp_empty before dP^T(t+1) (the dQ(t) TMEM image may
-        #                                 be overwritten before the epilogue read it) = the ceiling of arm (ii); dp_tail only
-        #   ds_gates_off       (D8):      the leader MMA warp does not wait ds_smem / ds_recv_full / ds_pair_ready before dQ(t).
-        #                                 RETIRED on the s_tail map (declines by name there) and UNSOUND here: skipping the gates removes
-        #                                 the ONLY back-edge of the ds_recv_full expect_tx ARM, so arm(t+1) can land on a tx-pending phase
-        #                                 (P3 over-arrival -> CUDA 719 on the s_tail body; the dp_tail body ran clean by ~900 clk of timing
-        #                                 margin, not by rule -- barrier-inspector 2026-10-27 08:01).  Kept in the code space for the first
-        #                                 body's rendering pins only; its first-body numbers are a broken-protocol ceiling.
-        #   exchange_off       (D8s):     [s_tail only] the SAFE exchange-family ceiling (the inspector's "D8x, bytes faked"): the epilogue's
-        #                                 XCHG ship is skipped and ds_recv_full is armed with 0 tx bytes, so every phase completes at its own
-        #                                 arm; EVERY wait kept (the recv half is never written: dQ wrong)
-        #   stats_one_chunk    (D10):     [s_tail only] each stats / delta quarter loads ONE LDS.128 chunk and reuses it for all eight
-        #                                 (-448 of the 512 stats wavefronts per tile per CTA; registers / compute / waits unchanged)
-        #   sdq_sts_off        (D9):      [s_tail only] the sDQ slice STS + its proxy fence skipped per round; the reduce-add reads stale
-        #                                 staging (-256 wavefronts); the ring protocol kept
-        return ("dq_reduce_add_off", "dp_empty_wait_off", "ds_gates_off", "exchange_off", "stats_one_chunk", "sdq_sts_off")
-
-    @property
-    def DIAG_2CTA_NAMES_ON_MAP(self):
-        # The probes THIS body (tmem_map "dp_tail", the first body) has code for: the first three names of the code space; the s_tail-only
-        # probes decline BY NAME here (``resolve_diag_2cta_for_map``).
-        return self.DIAG_2CTA_NAMES[:3]
+        # The code space of the pair body's DIAGNOSTIC probes (``diag_2cta_code`` = 1 + index; the body names DIAG_* from it).  Each probe
+        # removes ONE issue, wait or transfer of the DEFAULT body and keeps every arrive and wait site it does not name, so the barrier table
+        # is identical; the OUTPUT IS WRONG BY DESIGN (a timing ceiling, never a result; `--validate` refuses the arm by name; never shipped
+        # armed; the default rendering is byte-identical, pinned by PTX md5).
+        #   dq_reduce_add_off: the store warp skips the four fp32 dQ tma_reduce_add issues per tile (dQ stays zero)
+        #   exchange_off:      the exchange-family ceiling: the XCHG ship is skipped and ds_recv_full is armed with 0 tx bytes, so every phase
+        #                      completes at its own arm; EVERY wait kept (the recv half is never written: dQ wrong)
+        #   stats_one_chunk:   each stats / delta quarter loads ONE LDS.128 chunk and reuses it for all eight (-448 of the 512 stats
+        #                      wavefronts per tile per CTA; registers / compute / waits unchanged)
+        #   sdq_sts_off:       the sDQ slice STS + its proxy fence skipped per round; the reduce-add reads stale staging (-256 wavefronts);
+        #                      the ring protocol kept
+        return ("dq_reduce_add_off", "exchange_off", "stats_one_chunk", "sdq_sts_off")
 
     @property
     def DV_FULL_LANES(self):
@@ -601,66 +529,6 @@ class Config:
 
 
 CFG = Config()
-
-
-def resolve_pair_mma_order(name=None):
-    """The pair body's MMA issue order, typed: ``None`` -> ``CFG.PAIR_MMA_ORDER_DEFAULT``; any value outside ``CFG.PAIR_MMA_ORDERS``
-    is a ``ValueError`` BY NAME (a selector outside its domain declines, never a silent default)."""
-    order = CFG.PAIR_MMA_ORDER_DEFAULT if name is None else name
-    if type(order) is not str or order not in CFG.PAIR_MMA_ORDERS:
-        raise ValueError(f"pair_mma_order must be one of {CFG.PAIR_MMA_ORDERS}; got {order!r}")
-    return order
-
-
-def s_lookahead_after_dk(name=None):
-    """The kernel's ``Constexpr[bool]`` for a resolved order name: S^T(t+1) is issued after dK(t) under ``dk_first``."""
-    return resolve_pair_mma_order(name) == "dk_first"
-
-
-def resolve_tma_load_form(name=None):
-    """The pair body's cga2 TMA load form, typed: ``None`` -> ``CFG.TMA_LOAD_FORM_DEFAULT``; any value outside ``CFG.TMA_LOAD_FORMS``
-    is a ``ValueError`` BY NAME (a selector outside its domain declines, never a silent default)."""
-    form = CFG.TMA_LOAD_FORM_DEFAULT if name is None else name
-    if type(form) is not str or form not in CFG.TMA_LOAD_FORMS:
-        raise ValueError(f"tma_load_form must be one of {CFG.TMA_LOAD_FORMS}; got {form!r}")
-    return form
-
-
-def tma_load_plain(name=None):
-    """The kernel's ``Constexpr[bool]`` for a resolved form name: the loads carry no multicast mask under ``plain``."""
-    return resolve_tma_load_form(name) == "plain"
-
-
-def resolve_store_wait_form(name=None):
-    """The store warp's mbarrier wait form, typed: ``None`` -> ``CFG.STORE_WAIT_FORM_DEFAULT``; any value outside ``CFG.STORE_WAIT_FORMS``
-    is a ``ValueError`` BY NAME (a knob outside its domain declines, never a silent default)."""
-    form = CFG.STORE_WAIT_FORM_DEFAULT if name is None else name
-    if type(form) is not str or form not in CFG.STORE_WAIT_FORMS:
-        raise ValueError(f"store_wait_form must be one of {CFG.STORE_WAIT_FORMS}; got {form!r}")
-    return form
-
-
-def store_wait_spin(name=None):
-    """The kernel's ``Constexpr[bool]`` for a resolved wait form: the store warp spins the hint-less 2-instruction loop under ``two_instr``."""
-    return resolve_store_wait_form(name) == "two_instr"
-
-
-def resolve_reg_split(name=None):
-    """The register split, typed: ``None`` -> ``CFG.REG_SPLIT_DEFAULT``; any value outside ``CFG.REG_SPLIT_NAMES`` is a ``ValueError`` BY NAME."""
-    split = CFG.REG_SPLIT_DEFAULT if name is None else name
-    if type(split) is not str or split not in CFG.REG_SPLIT_NAMES:
-        raise ValueError(f"reg_split must be one of {CFG.REG_SPLIT_NAMES}; got {split!r}")
-    return split
-
-
-def reg_split_code(name=None):
-    """The kernel's ``Constexpr[int]`` for a resolved split name: its index in ``CFG.REG_SPLIT_NAMES`` (0 = the default)."""
-    return CFG.REG_SPLIT_NAMES.index(resolve_reg_split(name))
-
-
-def reg_split_counts(code):
-    """(softmax, epilogue, service) setmaxnreg counts for a split code (the kernel entry reads them at trace time, never a literal)."""
-    return CFG.REG_SPLITS[CFG.REG_SPLIT_NAMES[code]]
 
 
 def resolve_diag_2cta(name=None):
@@ -838,22 +706,13 @@ def validate_config():
     assert (c.SCHED_CREDIT_WARPS, c.PAIR_SCHED_CREDIT_WARPS) == (15, 30)
     assert (c.PAIR_EPILOGUE_LANES, c.PAIR_STORE_LANES, c.DQ_SLICE_LANES, c.TMEM_DEALLOC_ARRIVERS) == (256, 64, 64, 2)
     assert c.DV_FULL_LANES == c.EPILOGUE_LANES + c.STORE_LANES == 160  # AUDIT fix A: the loader's k2_empty observation is in dv_full's sum
-    assert c.PAIR_MMA_ORDERS == ("dk_first", "s_first") and c.PAIR_MMA_ORDER_DEFAULT in c.PAIR_MMA_ORDERS
-    assert c.TMA_LOAD_FORMS == ("multicast", "plain") and c.TMA_LOAD_FORM_DEFAULT in c.TMA_LOAD_FORMS
-    # knobs: the store-warp wait form and the register split (every split obeys the entry formula and the setmaxnreg directions)
-    assert c.STORE_WAIT_FORMS == ("retry", "two_instr") and c.STORE_WAIT_FORM_DEFAULT in c.STORE_WAIT_FORMS
-    assert store_wait_spin(None) is False and store_wait_spin("two_instr") is True
-    assert c.REG_SPLIT_NAMES == ("144/144/80", "136/136/104") and c.REG_SPLIT_DEFAULT == c.REG_SPLIT_NAMES[0] and c.M5_REG_SHIFT % 8 == 0
-    assert c.REG_SPLITS[c.REG_SPLIT_DEFAULT] == (c.SOFTMAX_REGS, c.EPILOGUE_REGS, c.SERVICE_REGS) and reg_split_counts(0) == c.REG_SPLITS[c.REG_SPLIT_DEFAULT]
-    for name, (s_regs, e_regs, v_regs) in c.REG_SPLITS.items():
-        assert name == f"{s_regs}/{e_regs}/{v_regs}"
-        assert (c.SOFTMAX_WARPS * s_regs + c.EPILOGUE_WARPS * e_regs + c.SERVICE_WARPS * v_regs) * 32 == c.REGFILE, name
-        assert all(r % 8 == 0 and 24 <= r <= 256 for r in (s_regs, e_regs, v_regs)), name
-        assert s_regs >= c.ENTRY_REGS and e_regs >= c.ENTRY_REGS and v_regs <= c.ENTRY_REGS, name  # INCREASE / INCREASE / DECREASE
-    assert c.REG_SPLITS["136/136/104"] == (136, 136, 104) and [reg_split_code(n) for n in c.REG_SPLIT_NAMES] == [0, 1]
-    assert c.DIAG_2CTA_NAMES == ("dq_reduce_add_off", "dp_empty_wait_off", "ds_gates_off", "exchange_off", "stats_one_chunk", "sdq_sts_off")
-    assert len(set(c.DIAG_2CTA_NAMES)) == 6 and c.DIAG_2CTA_NAMES_ON_MAP == c.DIAG_2CTA_NAMES[:3] == ("dq_reduce_add_off", "dp_empty_wait_off", "ds_gates_off")
-    assert diag_2cta_code(None) == 0 and [diag_2cta_code(n) for n in c.DIAG_2CTA_NAMES] == [1, 2, 3, 4, 5, 6]  # distinct, non-zero codes
+    # the register split (the entry formula and the setmaxnreg directions): 144 / 144 / 80 on 16 warps
+    s_regs, e_regs, v_regs = c.SOFTMAX_REGS, c.EPILOGUE_REGS, c.SERVICE_REGS
+    assert (c.SOFTMAX_WARPS * s_regs + c.EPILOGUE_WARPS * e_regs + c.SERVICE_WARPS * v_regs) * 32 == c.REGFILE
+    assert all(r % 8 == 0 and 24 <= r <= 256 for r in (s_regs, e_regs, v_regs))
+    assert s_regs >= c.ENTRY_REGS and e_regs >= c.ENTRY_REGS and v_regs <= c.ENTRY_REGS  # INCREASE / INCREASE / DECREASE
+    assert c.DIAG_2CTA_NAMES == ("dq_reduce_add_off", "exchange_off", "stats_one_chunk", "sdq_sts_off") and len(set(c.DIAG_2CTA_NAMES)) == 4
+    assert diag_2cta_code(None) == 0 and [diag_2cta_code(n) for n in c.DIAG_2CTA_NAMES] == [1, 2, 3, 4]  # distinct, non-zero codes
     assert c.DQ_SLICE_LANES == c.Q_HALF  # one lane per q row of ONE d half: the M=128 D image's lane split
     assert (c.MCAST_PAIR_MASK, c.XCHG_BARRIER) == (0b11, 2) and c.XCHG_BARRIER not in (0, c.SOFTMAX_BARRIER)
     assert (c.Q1_TX, c.Q2_TX, c.DO1_HALF_TX, c.DO2_TX) == (32768, 32768, 16384, 32768)

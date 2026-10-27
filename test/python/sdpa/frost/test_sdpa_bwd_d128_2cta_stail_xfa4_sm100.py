@@ -34,15 +34,13 @@ import torch
 
 from d128_grouped_test_utils import adapter_arguments, check_case, make_case, make_workspace, poison
 from frost_test_utils import requires_dsl
-from test_sdpa_bwd_d128_2cta_sm100 import _adapter_class, _require_2cta, _setmaxnreg_of, make_adapter_2cta
-from test_sdpa_bwd_d128_2cta_skew_sm100 import _CELLS, _CHILD_TIMEOUT_S, _GLOBAL_PREFIX, _LEVER_LINE, _SKV, _WATCHDOG_S
-from test_sdpa_bwd_d128_2cta_stail_sm100 import _BODY_MODULE, _CHILD, _EXPECTED, _RECORD, _TMEM_MAP, SITES
+from d128_2cta_test_utils import _CELLS, _CHILD_TIMEOUT_S, _GLOBAL_PREFIX, _LEVER_LINE, _SKV, _WATCHDOG_S, _adapter_class, _require_2cta, _setmaxnreg_of
+from test_sdpa_bwd_d128_2cta_stail_sm100 import _BODY_MODULE, _CHILD, _EXPECTED, _RECORD, SITES
 from test_sdpa_bwd_d128_2cta_stail_sm100 import _bitwise_twin, _body_source, _function_code, _record_md5, _render, make_adapter_2cta_stail
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
 _ROLES = "16w_fa4"
-_ORDERS = [pytest.param(None, id="fa4"), pytest.param("fa4b", id="fa4b")]
 _RECORD_XFA4 = pathlib.Path(__file__).resolve().parent / "renderings" / "md5_d128_accum_grouped_2cta_stail_xfa4_sm_100a.txt"
 # The role shape's census beside the module census (resources/render_2cta_stail_x86.py keys): the dS^T readout LDTMs (4 x16 gone), the proxy fences
 # (the epilogue's two -> the softmax's one; one _dq_round site fewer), the sDQ slice STS (3 -> 2 round sites x 8), the XCHG named barrier's thread
@@ -154,22 +152,22 @@ def test_xfa4_role_shape_config_is_the_truth():
     assert (c.xchg_barrier_lanes("16w"), c.xchg_barrier_lanes("16w_fa4")) == (128, 256) and (c.ds_smem_lanes("16w"), c.ds_smem_lanes("16w_fa4")) == (128, 256)
     assert (c.SOFTMAX_LEAD_WARP, c.REDUCE_LEAD_WARP, c.REDUCE_WARPS, c.REDUCE_LANES, c.PAIR_REDUCE_LANES) == (0, 8, 4, 128, 256)
     assert (c.DS_STS_VECS_PER_QUARTER, c.DS_STS_PER_LANE_PER_TILE) == (4, 8) and c.M * c.SOFTMAX_GROUPS * c.DS_STS_PER_LANE_PER_TILE * 16 == 32768
-    # the stack: ds_gates_off is RETIRED on the MAP (writer A), so the role filter is the identity -- D2-pair / D8s / D10 / D9 serve both shapes
-    assert c.diag_2cta_names_for_roles("16w_fa4") == c.DIAG_2CTA_NAMES_ON_MAP and c.dq_routes_for_roles("16w_fa4") == ("tma",)
+    # every probe of the code space serves both role shapes
+    assert all(cfgmod.validate_fields_for_roles("16w_fa4", probe) == "16w_fa4" for probe in c.DIAG_2CTA_NAMES_ON_MAP)
     assert (cfgmod.bar_layout_for_roles("16w") is cfgmod.BAR_LAYOUT) and (cfgmod.bar_layout_for_roles("16w_fa4") is cfgmod.BAR_LAYOUT_XFA4)
     assert (c.SOFTMAX_REGS, c.EPILOGUE_REGS, c.SERVICE_REGS) == (144, 144, 80) and (c.SMEM_BYTES, c.TMEM_COLS) == (231424, 512)  # UNCHANGED
     cfgmod.validate_config()
     body = importlib.import_module(_BODY_MODULE)
-    assert tuple(body.Bars._fields) == tuple(r[0] for r in cfgmod.BAR_LAYOUT) and len(body.Bars._fields) == 35  # the audited 34 rows + the C2b row
-    assert tuple(body.BarsXFA4._fields) == tuple(names) and len(body.BarsXFA4._fields) == 33  # the 16w_fa4 bundle = the inspector's 32 rows + dq_war_done
+    assert tuple(body.Bars._fields) == tuple(r[0] for r in cfgmod.BAR_LAYOUT) and len(body.Bars._fields) == 35  # the audited 34 rows + the fp32 row
+    assert tuple(body.BarsXFA4._fields) == tuple(names) and len(body.BarsXFA4._fields) == 33  # the 16w_fa4 bundle = 32 kept rows + dq_war_done
     assert (body.WARP_ROLES_16W, body.WARP_ROLES_16W_FA4, body.SOFTMAX_LEAD_WARP) == (0, 1, 0)
     assert (body.XCHG_BARRIER_LANES_16W, body.XCHG_BARRIER_LANES_16W_FA4) == (128, 256)
 
 
 def test_xfa4_warp_roles_is_typed_and_declines_by_name():
-    """``warp_roles`` is a typed field: ``None`` -> "16w" (today's rendering); "16w_fa4" exists on the s_tail map only (dp_tail declines BY NAME); any other
-    name declines; under "16w_fa4" the register-direct dQ routes are NOT BUILT and ``ds_gates_off`` is RETIRED (both decline BY NAME at the config
-    bundle check and at ``compile_host`` before any trace); the adapter reader prefixes the engine name; the record default is None."""
+    """``warp_roles`` is a typed field: ``None`` -> "16w" (the shipped rendering); "16w_fa4" is the alternate shape; any other name declines BY NAME;
+    under "16w_fa4" the STAMPS lever and ``dkv_accum = "fp32_reduce"`` are not built (both decline BY NAME at the config bundle check and at
+    ``compile_host`` before any trace); the adapter reader prefixes the engine name; the record default is None."""
     from types import SimpleNamespace
 
     from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
@@ -177,50 +175,32 @@ def test_xfa4_warp_roles_is_typed_and_declines_by_name():
     from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_grouped_2cta_host import compile_host
     from cudnn.sdpa.bwd.prepared_sm100_d128_grouped_2cta import warp_roles
 
-    assert (
-        cfgmod.resolve_warp_roles_for_map(None, "s_tail")
-        == "16w"
-        == cfgmod.resolve_warp_roles_for_map(None, None)
-        == cfgmod.resolve_warp_roles_for_map("16w", "dp_tail")
-    )
-    assert cfgmod.resolve_warp_roles_for_map("16w_fa4", "s_tail") == "16w_fa4" and cfgmod.warp_roles_code("16w_fa4", "s_tail") == 1
-    assert cfgmod.warp_roles_code(None, None) == 0 == cfgmod.warp_roles_code("16w", "s_tail")
-    for bad_roles, bad_map in (
-        ("16w_fa4", "dp_tail"),
-        ("16w_fa4", None),
-        ("bogus", "s_tail"),
-        ("", "s_tail"),
-        (1, "s_tail"),
-        ("16W", "s_tail"),
-        ("20w", "s_tail"),
-    ):
+    assert cfgmod.resolve_warp_roles(None) == "16w" == cfgmod.resolve_warp_roles("16w")
+    assert cfgmod.resolve_warp_roles("16w_fa4") == "16w_fa4" and cfgmod.warp_roles_code("16w_fa4") == 1
+    assert cfgmod.warp_roles_code(None) == 0 == cfgmod.warp_roles_code("16w")
+    for bad_roles in ("bogus", "", 1, "16W", "20w"):
         with pytest.raises(ValueError, match="warp_roles must be one of"):
-            cfgmod.resolve_warp_roles_for_map(bad_roles, bad_map)
+            cfgmod.resolve_warp_roles(bad_roles)
         with pytest.raises(ValueError, match="warp_roles must be one of"):
-            cfgmod.warp_roles_code(bad_roles, bad_map)
-    assert (
-        cfgmod.validate_fields_for_roles("16w_fa4", "tma", "dq_reduce_add_off") == "16w_fa4"
-        and cfgmod.validate_fields_for_roles("16w", "red_global", "dq_reduce_add_off") == "16w"  # ds_gates_off is RETIRED on the MAP (stack: writer A)
-    )
+            cfgmod.warp_roles_code(bad_roles)
+    assert cfgmod.validate_fields_for_roles("16w_fa4", "dq_reduce_add_off") == "16w_fa4" and cfgmod.validate_fields_for_roles("16w", "exchange_off") == "16w"
+    with pytest.raises(ValueError, match="debug_clk is not defined under warp_roles '16w_fa4'"):
+        cfgmod.validate_fields_for_roles("16w_fa4", None, debug_clk=True)
     with pytest.raises(ValueError, match="is not built under warp_roles '16w_fa4'"):
-        cfgmod.validate_fields_for_roles("16w_fa4", "red_global", None)
-    with pytest.raises(ValueError, match="is not built under warp_roles '16w_fa4'"):
-        cfgmod.validate_fields_for_roles("16w_fa4", "red_global_pair", None)
-    with pytest.raises(ValueError, match="ds_gates_off.*is not defined under warp_roles '16w_fa4'"):
-        cfgmod.validate_fields_for_roles("16w_fa4", None, "ds_gates_off")
-    assert warp_roles(SimpleNamespace(_NAME="x")) == "16w" and warp_roles(SimpleNamespace(_NAME="x", tmem_map="s_tail", warp_roles="16w_fa4")) == "16w_fa4"
+        cfgmod.validate_fields_for_roles("16w_fa4", None, dkv_accum="fp32_reduce")
+    with pytest.raises(ValueError, match="diag_2cta must be None or one of"):
+        cfgmod.validate_fields_for_roles("16w_fa4", "ds_gates_off")
+    assert warp_roles(SimpleNamespace(_NAME="x")) == "16w" and warp_roles(SimpleNamespace(_NAME="x", warp_roles="16w_fa4")) == "16w_fa4"
     with pytest.raises(ValueError, match="sdpa_bwd_sm100_d128: warp_roles must be one of"):
-        warp_roles(SimpleNamespace(_NAME="sdpa_bwd_sm100_d128", warp_roles="16w_fa4"))  # the first body (dp_tail) keeps its one role shape
-    with pytest.raises(ValueError, match="sdpa_bwd_sm100_d128: warp_roles must be one of"):
-        warp_roles(SimpleNamespace(_NAME="sdpa_bwd_sm100_d128", tmem_map="s_tail", warp_roles="16w-fa4"))
-    assert SdpaBwdDslSm100D128.warp_roles is None  # the record default: today's rendering
+        warp_roles(SimpleNamespace(_NAME="sdpa_bwd_sm100_d128", warp_roles="16w-fa4"))
+    assert SdpaBwdDslSm100D128.warp_roles is None  # the record default: the shipped rendering
     specs, dtypes = tuple((i, 1, 1, "int32") for i in range(9)), tuple("int32" for _ in range(9))
-    with pytest.raises(ValueError, match="is not built under warp_roles '16w_fa4'"):
-        compile_host((2, 8, 2, True), specs, dtypes, None, True, 100, tmem_map="s_tail", warp_roles="16w_fa4", dq_route_pair="red_global")
-    with pytest.raises(ValueError, match="ds_gates_off.*is not defined (on tmem_map 's_tail'|under warp_roles '16w_fa4')"):  # the MAP declines first
-        compile_host((2, 8, 2, True), specs, dtypes, None, True, 100, tmem_map="s_tail", warp_roles="16w_fa4", diag_2cta="ds_gates_off")
+    with pytest.raises(ValueError, match="debug_clk is not defined under warp_roles '16w_fa4'"):
+        compile_host((2, 8, 2, True), specs, dtypes, None, True, 100, warp_roles="16w_fa4", debug_clk=True)
+    with pytest.raises(ValueError, match="dkv_accum 'fp32_reduce' is not built under warp_roles '16w_fa4'"):
+        compile_host((2, 8, 2, True), specs, dtypes, None, True, 100, warp_roles="16w_fa4", dkv_accum="fp32_reduce")
     with pytest.raises(ValueError, match="warp_roles must be one of"):
-        compile_host((2, 8, 2, True), specs, dtypes, None, True, 100, warp_roles="16w_fa4")  # dp_tail
+        compile_host((2, 8, 2, True), specs, dtypes, None, True, 100, warp_roles="20w")
 
 
 def test_xfa4_host_renders_for_sm_100a_and_matches_its_record(tmp_path):
@@ -228,10 +208,10 @@ def test_xfa4_host_renders_for_sm_100a_and_matches_its_record(tmp_path):
     table row (arrive 40 -> 37, try_wait 68 -> 65, `bar.sync 2, 256` and no `2, 128`, 4 LDTM fewer, 2 proxy fences fewer, 8 slice STS fewer, one
     relaxed.cluster arrive fewer, the ship and the expect_tx arm count unchanged), no local memory, no nanosleep, the default register split; the md5
     matches the committed record at this geometry (skips, never widens, on a DSL build difference)."""
-    md5, census, regs = _render(tmp_path, {"tmem_map": _TMEM_MAP, "warp_roles": _ROLES}, _XFA4_CENSUS)
+    md5, census, regs = _render(tmp_path, {"warp_roles": _ROLES}, _XFA4_CENSUS)
     print(f"\n2-CTA s_tail 16w_fa4 sm_100a: PTX md5 {md5} census {census} setmaxnreg {regs}")
     assert census == _EXPECTED_XFA4, {k: (census.get(k), v) for k, v in _EXPECTED_XFA4.items() if census.get(k) != v}
-    assert sorted(regs) == _setmaxnreg_of("144/144/80"), regs  # the split is UNCHANGED (the resource-manager's table 3)
+    assert sorted(regs) == _setmaxnreg_of(), regs  # the split is UNCHANGED
     dsl, want = _record_md5(_RECORD_XFA4, "d128_accum_grouped_2cta_stail_xfa4")
     assert want is not None, _RECORD_XFA4
     import importlib.metadata as md
@@ -245,11 +225,11 @@ def test_xfa4_host_renders_for_sm_100a_and_matches_its_record(tmp_path):
 def test_xfa4_default_rendering_is_unchanged_and_16w_named_is_the_default(tmp_path):
     """The field ABSENT and ``warp_roles = "16w"`` render the SAME PTX = the S-tail record (645f8a24 @ 2/8/2: the pin of the sibling module), with the
     16w census (arrive 40 / try_wait 68 / `bar.sync 2, 128` / 13 LDTM / 15 proxy fences / 24 slice STS); nothing of X-FA4 reaches the default."""
-    md5_d, census_d, regs_d = _render(tmp_path, {"tmem_map": _TMEM_MAP}, _XFA4_CENSUS)
-    md5_n, census_n, _ = _render(tmp_path, {"tmem_map": _TMEM_MAP, "warp_roles": "16w"}, _XFA4_CENSUS)
+    md5_d, census_d, regs_d = _render(tmp_path, {}, _XFA4_CENSUS)
+    md5_n, census_n, _ = _render(tmp_path, {"warp_roles": "16w"}, _XFA4_CENSUS)
     assert md5_d == md5_n, "warp_roles named '16w' must be the default rendering"
     assert census_d == dict(_EXPECTED, **_EXPECTED_16W_EXTRA) == census_n, census_d
-    assert sorted(regs_d) == _setmaxnreg_of("144/144/80")
+    assert sorted(regs_d) == _setmaxnreg_of()
     dsl, want = _record_md5(_RECORD, "d128_accum_grouped_2cta_stail")
     import importlib.metadata as md
 
@@ -383,11 +363,7 @@ def test_xfa4_dp_empty_and_ds_tmem_absent_from_the_16w_fa4_paths():
     assert any("bars = _bars(slab, fa4_roles)" in ln for ln in kernel) and any("fa4_roles = warp_roles_code == WARP_ROLES_16W_FA4" in ln for ln in kernel)
     i_red = next(i for i, ln in enumerate(kernel) if "_reduce_loop(" in ln)
     assert kernel[i_red - 1].strip() == "if cutlass.const_expr(fa4_roles):" and kernel[i_red + 1].strip() == "else:" and "_epilogue_loop(" in kernel[i_red + 2]
-    for guard in (
-        "warp_roles_code not in (WARP_ROLES_16W, WARP_ROLES_16W_FA4)",
-        "fa4_roles and dq_route_code != DQ_ROUTE_TMA",
-        "fa4_roles and diag_2cta_code == DIAG_DS_GATES_OFF",
-    ):
+    for guard in ("warp_roles_code not in (WARP_ROLES_16W, WARP_ROLES_16W_FA4)", "fa4_roles and debug_clk", "fa4_roles and dkv_fp32"):
         assert any(f"if cutlass.const_expr({guard}):" in ln for ln in kernel), guard
     # the bundles: one 34-field class + one 32-field NamedTuple built from BAR_LAYOUT_XFA4; the init loop runs over whichever bundle it was handed
     assert 'BarsXFA4 = NamedTuple("BarsXFA4", [(row[0], MBarrier) for row in BAR_LAYOUT_XFA4])' in src
@@ -453,26 +429,23 @@ def test_xfa4_thd_all_empty():
     _run_case(case)
 
 
-@pytest.mark.parametrize("order", _ORDERS)
-def test_xfa4_persistent_reuse_more_pairs_than_sms(order):
+def test_xfa4_persistent_reuse_more_pairs_than_sms():
     """P14 row: n_q == 1 with more pairs than SMs (a cluster claims a second CLC item: the softmax's `dq_war` consumes the previous item's tail flip at
-    tile lo'; the N == 1 tail path), a half-dead last pair, zero-trip blocks past seq_q; under both leader orders (fa4 | fa4b)."""
+    tile lo'; the N == 1 tail path), a half-dead last pair, zero-trip blocks past seq_q."""
     _require_2cta()
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     hq, b = 8, 2
     skv = 256 * ((sms // (hq * b)) + 2) + 128
     case = make_case((128, 64), (skv, skv - 256), hq=hq, hkv=1, dtype=torch.bfloat16, causal=True, stats_layout="TH1")
-    _run_case(case, pair_mma_order=order)
+    _run_case(case)
 
 
-@pytest.mark.parametrize("order", _ORDERS)
-def test_xfa4_zero_trip_mix(order):
-    """The inspector's N-walk as one case (N = 3, 1, 0 / 1, 0 / 8, 6, 4, 2 with dead blocks): every s_tail_empty guard, the two dq_done observer sets
-    (the softmax's `dq_war` consumes the previous live tail in an empty item and the empty commit at the next live item's tile lo), the carry of the
-    pending completions across zero-trip items; under both leader orders."""
+def test_xfa4_zero_trip_mix():
+    """The N-walk as one case (N = 3, 1, 0 / 1, 0 / 8, 6, 4, 2 with dead blocks): every s_tail_empty guard, the softmax's `dq_war_done` observation
+    across empty items, the carry of the pending completions across zero-trip items."""
     _require_2cta()
     case = make_case((300, 128, 1000), (2000, 700, 1000), hq=4, hkv=2, dtype=torch.bfloat16, causal=True, stats_layout="TH1")
-    _run_case(case, pair_mma_order=order)
+    _run_case(case)
 
 
 def test_xfa4_launch_count_and_cluster_facts():
@@ -506,23 +479,6 @@ def test_xfa4_role_shapes_agree_bitwise_on_dk_dv():
     _require_2cta()
     case = make_case((256, 512), (256, 512), hq=4, hkv=2, thd=True, dtype=torch.bfloat16, causal=True, stats_layout="TH1")
     _bitwise_twin(case, lambda c: make_adapter_2cta_stail(c), lambda c: make_adapter_2cta_stail(c, warp_roles=_ROLES), "the two role shapes (16w vs 16w_fa4)")
-
-
-def test_xfa4_mma_orders_agree_bitwise_on_dk_dv():
-    """fa4 vs fa4b under 16w_fa4: the leader's in-tile dQ slot moves, nothing of dK / dV's chains does -- BITWISE (G09 twin-diff); dQ by the gate."""
-    _require_2cta()
-    case = make_case((256, 512), (256, 512), hq=4, hkv=2, thd=True, dtype=torch.bfloat16, causal=True, stats_layout="TH1")
-    fa4 = lambda c: make_adapter_2cta_stail(c, warp_roles=_ROLES, pair_mma_order="fa4")  # noqa: E731
-    fa4b = lambda c: make_adapter_2cta_stail(c, warp_roles=_ROLES, pair_mma_order="fa4b")  # noqa: E731
-    _bitwise_twin(case, fa4, fa4b, "the two leader orders under 16w_fa4 (fa4 vs fa4b)")
-
-
-def test_xfa4_first_body_and_16w_untouched_by_the_field():
-    """``tmem_map`` unset keeps the FIRST body (its md5 pin is the sibling module's); here: the first body and the 16w S-tail body agree BITWISE on dK / dV
-    with each other as before (the arm's chain did not move the default path), on the 4-tile case."""
-    _require_2cta()
-    case = make_case((256, 512), (256, 512), hq=4, hkv=2, thd=True, dtype=torch.bfloat16, causal=True, stats_layout="TH1")
-    _bitwise_twin(case, lambda c: make_adapter_2cta(c), lambda c: make_adapter_2cta_stail(c), "the first body vs the 16w S-tail body (the default path)")
 
 
 @pytest.mark.parametrize("site", list(SITES))
@@ -571,15 +527,15 @@ def test_sdpa_bwd_d128_2cta_stail_xfa4_survives_pair_skew(site, tmp_path):
     assert proc.returncode == 0 and f"SKEW_OK {site} {row['delay_us']}" in proc.stdout, f"rc={proc.returncode}\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
 
 
-# ------------------------------------------------------------------------------------------------------------ GPU: the zero-trip HANG repro (RULE-GAPS 649), fresh-process rows
-# The pair body's 16w_fa4 form HUNG (2026-10-27 10:24, GPU 1 of gb200-nvl4-ts2-87, pytest-timeout 25:00 inside torch.cuda.synchronize) on the
-# first matrix cell with DEAD PAIRS: the softmax's `dq_war` WAR wait is PRE-ARMED (its first wait passes only while NO dq_done flip has
+# ------------------------------------------------------------------------------------------------------------ GPU: the zero-trip HANG repro, fresh-process rows
+# An earlier build of the 16w_fa4 form HUNG (a 25-minute pytest timeout inside torch.cuda.synchronize) on the first matrix cell with DEAD PAIRS:
+# the softmax's `dq_war` WAR wait is PRE-ARMED (its first wait passes only while NO dq_done flip has
 # completed) and the table asked it to observe the zero-trip EMPTY dq_done commit too -- but that commit has no softmax edge in its producer
 # chain (dvk_empty <- the store warps <- the reduce group), so on a zero-trip item it can land BEFORE the softmax's wait: the softmax spins on
 # a completed phase forever and the CTA never reaches the final barrier_cta_sync (a zero-trip item as a cluster's FIRST item); two consecutive
 # zero-trip items after a live one on one cluster = two flips before one observation = a LAP (a deadlock at the next live item's first STS).
-# RED-then-green: on a90d6521 these rows FAIL by the watchdog (exit 70 = HANG, the process killed to free the GPU); after the inspector's § 15 fix
-# they pass.  Each row is ONE fresh child process (the kernel wedges its context); the watchdog wraps the executes only (compile is outside it),
+# RED-then-green: on the pre-fix tree these rows FAIL by the watchdog (exit 70 = HANG, the process killed to free the GPU); with the dedicated
+# `dq_war_done` row they pass.  Each row is ONE fresh child process (the kernel wedges its context); the watchdog wraps the executes only (compile is outside it),
 # with the SHORT kernel-stage budget by name -- never the 25-minute pytest timeout that found the hang.
 _HANG_WATCHDOG_S = 120.0  # config/budgets.yaml stages.validate_multihead (a 1024-class validate cell: run + the CPU reference; compile outside)
 _HANG_CASES = {

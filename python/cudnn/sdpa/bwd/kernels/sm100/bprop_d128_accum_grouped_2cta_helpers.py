@@ -18,26 +18,14 @@ from cutlass.experimental.cuda import tensor_map as tmap
 
 from cudnn.frost.tile_dsl.thd import THD_SETUP_THREADS, emit_seq_descs, write_thd_meta, write_thd_port_origins, write_thd_prefix_warp
 from ..bprop_thd_reduce import dkv_reduce_thd_origins_host
-from .bprop_d128_accum_grouped_2cta_f16 import MAP_DK, MAP_DO1, MAP_DO2, MAP_DQ, MAP_DV, MAP_K, MAP_Q1, MAP_Q2, MAP_V, main_thd_2cta_host
-from .bprop_d128_accum_grouped_2cta_stail_f16 import main_thd_2cta_stail_host
+from .bprop_d128_accum_grouped_2cta_stail_f16 import MAP_DK, MAP_DO1, MAP_DO2, MAP_DQ, MAP_DV, MAP_K, MAP_Q1, MAP_Q2, MAP_V, main_thd_2cta_stail_host
 from . import bprop_d128_accum_grouped_2cta_stail_f16 as _stail
 from .bprop_d128_accum_thd_helpers import _origin_row, cast_dq_thd_d128_kernel, delta_zero_thd_d128_kernel
 from .bprop_d128_helpers import ROWS_PER_CTA, THREADS
 from ...config_sm100_d128_accum_2cta import CFG
 
-# The second pair body (ARM (ii), typed field ``tmem_map = "s_tail"``) shares the nine-map setup and the box rows: its map order is pinned to this
-# module's (the setup kernel below writes the slots in THIS order for both bodies).
-assert (_stail.MAP_Q1, _stail.MAP_K, _stail.MAP_V, _stail.MAP_DO1, _stail.MAP_DQ, _stail.MAP_DK, _stail.MAP_DV, _stail.MAP_Q2, _stail.MAP_DO2) == (
-    MAP_Q1,
-    MAP_K,
-    MAP_V,
-    MAP_DO1,
-    MAP_DQ,
-    MAP_DK,
-    MAP_DV,
-    MAP_Q2,
-    MAP_DO2,
-)
+# The pair body's map order is the setup kernel's (the slots below are written in the body's MAP_* order); its box rows are the base geometry's.
+assert (MAP_Q1, MAP_K, MAP_V, MAP_DO1, MAP_DQ, MAP_DK, MAP_DV, MAP_Q2, MAP_DO2) == tuple(range(CFG.MAPS_PER_SEQUENCE))
 assert _stail.CFG.MAP_BOX_ROWS == CFG.MAP_BOX_ROWS and _stail.CFG.MAPS_PER_SEQUENCE == CFG.MAPS_PER_SEQUENCE
 
 
@@ -277,15 +265,8 @@ def host_thd_2cta(
     max_skv,
     scale,
     causal: cutlass.Constexpr[bool],
-    s_lookahead_after_dk: cutlass.Constexpr[bool],
-    dq_after_dv: cutlass.Constexpr[bool],
-    dq_route_code: cutlass.Constexpr[int],
-    tma_load_plain: cutlass.Constexpr[bool],
     diag_2cta_code: cutlass.Constexpr[int],
-    store_wait_spin: cutlass.Constexpr[bool],
-    reg_split_code: cutlass.Constexpr[int],
     warp_roles_code: cutlass.Constexpr[int],
-    s_tail_map: cutlass.Constexpr[bool],
     mask_form_code: cutlass.Constexpr[int],
     dkv_fp32: cutlass.Constexpr[bool],
     dk_acc,
@@ -294,25 +275,13 @@ def host_thd_2cta(
     dbg_clk,
     stream,
 ):
-    """Five native launches: the nine-map setup, delta / dQ zero, the 2-CTA pair MAIN, the dQ cast, the fp32 group fold.
-    ``mask_form_code`` = the s_tail body's softmax mask form (its header section 11: 0 = fsel, the default; 1 = predicated = the interior-tile
-    mask skip of lever L5; 2 = diag_mask_off, OUTPUT WRONG BY DESIGN), from the typed ``mask_form`` field resolved per map by the prepared
-    host; passed to the s_tail MAIN launch only (the first body never reads it).
-    ``debug_clk`` / ``dbg_clk`` = the s_tail body's STAMPS lever (its header section 11) and the Int32 dump tensor the prepared host carved
-    (None when off; the first body never reads them).
-    ``warp_roles_code`` = the s_tail body's ROLE SHAPE (its header section 11: 0 = 16w, the default rendering; 1 = 16w_fa4 = X-FA4, the softmax
-    ships the dS exchange from its registers and warps 8-11 are the reduce group), from the typed ``warp_roles`` field; the first body never reads it.
-    ``s_lookahead_after_dk`` = the FIRST body's leader MMA issue order (s_first | dk_first), ``dq_after_dv`` = the s_tail body's (fa4 | fa4b;
-    each kernel header's section 5; each Constexpr is read by its own body only), ``dq_route_code`` = the s_tail body's dQ route (its header
-    section 11: 0 = tma, the default; 1 / 2 = register-direct red.global.add; the s_tail main host receives the ``dq_accum`` tensor for it and
-    drops it under the default; the first body never reads the route), ``tma_load_plain`` = its cga2
-    TMA load form (section 10), ``diag_2cta_code`` = its DIAGNOSTIC probe (section 11; 0 = none), ``store_wait_spin`` = the store
-    warp's wait form and ``reg_split_code`` = the setmaxnreg split (the two perf-only knobs, section 4), all resolved by the prepared
-    host from the adapter's typed fields.  ``s_tail_map`` (the typed ``tmem_map`` field: False = "dp_tail" = the first body, the default
-    rendering byte-identical; True = "s_tail" = ``bprop_d128_accum_grouped_2cta_stail_f16``, ARM (ii)) selects the MAIN launch; the
-    other four launches and every runtime argument are the same for both bodies (each body reads its own order Constexpr)."""
-    if cutlass.const_expr(dkv_fp32 and not s_tail_map):
-        raise ValueError("dkv_accum 'fp32_reduce' is served by the s_tail pair body only (the dp_tail body has no fp32 dK / dV store path)")
+    """Five native launches: the nine-map setup, delta / dQ zero, the cta_group::2 pair MAIN, the dQ cast, the fp32 group fold (four under
+    ``dkv_fp32``: the fold is gone and the cast launch converts dK / dV too).
+    ``mask_form_code`` = the pair body's softmax mask form (its header section 11: 0 = fsel, the default; 1 = predicated = the interior-tile
+    mask skip; 2 = diag_mask_off, OUTPUT WRONG BY DESIGN), ``diag_2cta_code`` = its DIAGNOSTIC probe (section 11; 0 = none), ``warp_roles_code``
+    = its ROLE SHAPE (section 11: 0 = 16w, the default rendering; 1 = 16w_fa4, the softmax ships the dS exchange from its registers and warps
+    8-11 are the reduce group), ``debug_clk`` / ``dbg_clk`` = its STAMPS lever (section 11) and the Int32 dump tensor the prepared host carved
+    (None when off) -- all resolved by the prepared host from the adapter's typed fields and read by the MAIN launch only."""
     rows = CFG.MAP_BOX_ROWS
     if cutlass.const_expr(dkv_fp32):
         dk_map, dv_map = _tensor_map_rows(dk_acc, rows[MAP_DK], CFG.DQ_BOX), _tensor_map_rows(dv_acc, rows[MAP_DV], CFG.DQ_BOX)
@@ -358,57 +327,28 @@ def host_thd_2cta(
         delta_zero_thd_d128_kernel(o, do, delta, dq_accum, meta, origins, cutlass.Int32(batch), origin_specs).launch(
             grid=(q_grid, batch, q.shape[2]), block=(THREADS, 1, 1), stream=stream
         )
-    if cutlass.const_expr(s_tail_map):
-        main_thd_2cta_stail_host(
-            maps,
-            lse,
-            delta,
-            meta,
-            origins,
-            dq_accum,
-            cutlass.Int32(batch),
-            q.shape[2],
-            max_skv,
-            _origin_row(origin_specs, 8),
-            scale,
-            causal,
-            q.element_type,
-            q.shape[2] // k.shape[2],
-            dq_after_dv,
-            dq_route_code,
-            tma_load_plain,
-            diag_2cta_code,
-            store_wait_spin,
-            reg_split_code,
-            warp_roles_code,
-            mask_form_code,
-            dkv_fp32,
-            debug_clk,
-            dbg_clk,
-            stream,
-        )
-    else:
-        main_thd_2cta_host(
-            maps,
-            lse,
-            delta,
-            meta,
-            origins,
-            cutlass.Int32(batch),
-            q.shape[2],
-            max_skv,
-            _origin_row(origin_specs, 8),
-            scale,
-            causal,
-            q.element_type,
-            q.shape[2] // k.shape[2],
-            s_lookahead_after_dk,
-            tma_load_plain,
-            diag_2cta_code,
-            store_wait_spin,
-            reg_split_code,
-            stream,
-        )
+    main_thd_2cta_stail_host(
+        maps,
+        lse,
+        delta,
+        meta,
+        origins,
+        cutlass.Int32(batch),
+        q.shape[2],
+        max_skv,
+        _origin_row(origin_specs, 8),
+        scale,
+        causal,
+        q.element_type,
+        q.shape[2] // k.shape[2],
+        diag_2cta_code,
+        warp_roles_code,
+        mask_form_code,
+        dkv_fp32,
+        debug_clk,
+        dbg_clk,
+        stream,
+    )
     if cutlass.const_expr(dkv_fp32):
         cast_dq_thd_d128_kernel(
             dq_accum,

@@ -12,35 +12,18 @@ from cudnn.frost.compiled_cache import compile_cached
 from ...d128_grouped_2cta_contract import ABI_VERSION, MAPS_PER_SEQUENCE, thd_workspace_offsets
 from ...d128_grouped_contract import dkv_accum_fp32, resolve_dkv_accum, validate_fp32_accum_fits
 from ...d128_thd_contract import ORIGIN_PORTS
-from ...config_sm100_d128_accum_2cta import (
-    diag_2cta_code,
-    reg_split_code,
-    resolve_reg_split,
-    resolve_store_wait_form,
-    resolve_tma_load_form,
-    s_lookahead_after_dk,
-    store_wait_spin,
-    tma_load_plain,
-)
+from ...config_sm100_d128_accum_2cta import diag_2cta_code, resolve_diag_2cta
 from ...config_sm100_d128_accum_2cta_stail import CFG as STAIL_CFG
 from ...config_sm100_d128_accum_2cta_stail import (
     DBG_CLK,
     dbg_clk_region_offset,
-    dq_after_dv_for_map,
-    dq_route_pair_code,
     mask_form_code,
-    resolve_debug_clk_for_map,
-    resolve_diag_2cta_for_map,
-    resolve_dq_route_pair_for_map,
-    resolve_mask_form_for_map,
-    resolve_pair_mma_order_for_map,
-    resolve_tmem_map,
-    resolve_warp_roles_for_map,
-    tmem_map_s_tail,
+    resolve_debug_clk,
+    resolve_mask_form,
+    resolve_warp_roles,
     validate_fields_for_roles,
     warp_roles_code,
 )
-from cudnn.frost.tile_dsl.requirements import red_global_v4_requirement_error
 from .bprop_d128_accum_grouped_2cta_helpers import host_thd_2cta
 
 
@@ -90,15 +73,8 @@ def host(
     config: cutlass.Constexpr,
     origin_specs: cutlass.Constexpr,
     causal: cutlass.Constexpr[bool],
-    lookahead_after_dk: cutlass.Constexpr[bool],
-    after_dv: cutlass.Constexpr[bool],
-    dq_route: cutlass.Constexpr[int],
-    plain_tma: cutlass.Constexpr[bool],
     diag_code: cutlass.Constexpr[int],
-    wait_spin: cutlass.Constexpr[bool],
-    regs_code: cutlass.Constexpr[int],
     roles_code: cutlass.Constexpr[int],
-    s_tail_map: cutlass.Constexpr[bool],
     mask_code: cutlass.Constexpr[int],
     dkv_fp32: cutlass.Constexpr[bool],
     debug_clk: cutlass.Constexpr[bool],
@@ -168,15 +144,8 @@ def host(
         cutlass.Int32(max_skv),
         scale,
         causal,
-        lookahead_after_dk,
-        after_dv,
-        dq_route,
-        plain_tma,
         diag_code,
-        wait_spin,
-        regs_code,
         roles_code,
-        s_tail_map,
         mask_code,
         dkv_fp32,
         dk_acc,
@@ -194,70 +163,29 @@ def compile_host(
     dtype,
     causal,
     sm,
-    pair_mma_order=None,
-    tma_load_form=None,
     diag_2cta=None,
-    store_wait_form=None,
-    reg_split=None,
-    tmem_map=None,
-    dq_route_pair=None,
     debug_clk=None,
     mask_form=None,
     dkv_accum=None,
     warp_roles=None,
 ):
-    """Capacities and bounds are runtime scalars, never artifact key values; the 2-CTA chain is keyed apart from the 1-CTA one, per
-    MMA issue order (``pair_mma_order``: a ``CFG.PAIR_MMA_ORDERS`` name, ``None`` = ``CFG.PAIR_MMA_ORDER_DEFAULT``; typed) and per
-    cga2 TMA load form (``tma_load_form``: a ``CFG.TMA_LOAD_FORMS`` name, ``None`` = ``CFG.TMA_LOAD_FORM_DEFAULT``; typed) and per
-    DIAGNOSTIC probe (``diag_2cta``: a ``CFG.DIAG_2CTA_NAMES`` name or ``None`` = no probe = the shipped body; output WRONG BY DESIGN
-    when set, keyed apart so the probe never serves a real plan), and per perf-only knob: the store warp's wait form (``store_wait_form``:
-    a ``CFG.STORE_WAIT_FORMS`` name, ``None`` = the default) and the register split (``reg_split``: a ``CFG.REG_SPLIT_NAMES`` name, ``None``
-    = the default), and per pair BODY (``tmem_map``: a ``TMEM_MAPS`` name, ``None`` = "dp_tail" = the first body, byte-identical rendering;
-    "s_tail" = ``bprop_d128_accum_grouped_2cta_stail_f16``, ARM (ii); the order and the probe domains are resolved PER MAP: ``fa4`` / ``fa4b`` only on
-    s_tail, D7 declined there), and per dQ ROUTE (``dq_route_pair``: a ``CFG.DQ_ROUTES_PAIR`` name of the s_tail body or ``None`` = "tma" = the
-    reduce-add path; "red_global" / "red_global_pair" = the register-direct red.global.add forms, s_tail only -- the s_tail kernel header's
-    section 11; the part floor of the vector red is declined by name here, and D2-pair under a red route too: there is no reduce-add to skip).
-    Every threaded Constexpr is in the key (RULE-GAPS 203): the order NAME keys ``fa4b`` apart, the route NAME keys the red forms apart, the
-    mask-form NAME keys ``predicated`` / ``diag_mask_off`` apart (``mask_form``: a ``CFG.MASK_FORMS`` name of the s_tail body or ``None`` = "fsel"
-    = today's rendering; "predicated" = the interior-tile mask skip of lever L5; "diag_mask_off" = its DIAGNOSTIC ceiling, output wrong by
-    design, s_tail only -- the s_tail kernel header's section 11), the ``dkv_accum`` form NAME keys the fp32 chain apart (``dkv_accum``: a
-    ``DKV_ACCUM_FORMS`` name or ``None`` = ``bf16_partials``; ``fp32_reduce`` is served by the s_tail body only -- declined BY NAME on dp_tail),
-    the ROLE SHAPE name keys ``16w_fa4`` apart (``warp_roles``: a ``CFG.WARP_ROLES`` name of the s_tail body or ``None`` = "16w" = today's
-    rendering; "16w_fa4" = X-FA4, the s_tail kernel header's sections 4 / 5 / 11, s_tail only -- under it a red dQ route, ``ds_gates_off``,
-    ``debug_clk`` and ``dkv_accum = "fp32_reduce"`` decline by name here, before any trace).
-    ``debug_clk`` (the s_tail body's STAMPS lever: a bool, ``None`` = False = the shipped rendering; True on s_tail only) is keyed too: the
-    armed build carries the dump tensor and renders different PTX, never served to a plan that did not ask for it."""
-    tmap = resolve_tmem_map(tmem_map)
-    form_mask = resolve_mask_form_for_map(mask_form, tmap)
-    order = resolve_pair_mma_order_for_map(pair_mma_order, tmap)
-    form = resolve_tma_load_form(tma_load_form)
-    diag = resolve_diag_2cta_for_map(diag_2cta, tmap)
-    route = resolve_dq_route_pair_for_map(dq_route_pair, tmap)
-    clk = resolve_debug_clk_for_map(debug_clk, tmap)
+    """Capacities and bounds are runtime scalars, never artifact key values; the 2-CTA chain is keyed apart from the 1-CTA one and per typed
+    field: ``diag_2cta`` (a ``CFG.DIAG_2CTA_NAMES`` name or ``None`` = no probe = the shipped body; output WRONG BY DESIGN when set, keyed apart
+    so the probe never serves a real plan), ``mask_form`` (a ``CFG.MASK_FORMS`` name or ``None`` = "fsel" = the default rendering; "predicated"
+    = the interior-tile mask skip; "diag_mask_off" = its DIAGNOSTIC ceiling, output wrong by design -- the kernel header's section 11),
+    ``dkv_accum`` (a ``DKV_ACCUM_FORMS`` name or ``None`` = ``bf16_partials``; ``fp32_reduce`` keys the four-launch fp32 chain apart),
+    ``warp_roles`` (a ``CFG.WARP_ROLES`` name or ``None`` = "16w" = the default rendering; "16w_fa4" = the alternate role shape of header
+    sections 4 / 5 / 11, under which ``debug_clk`` and ``dkv_accum = "fp32_reduce"`` decline by name here, before any trace) and
+    ``debug_clk`` (the STAMPS lever: a bool, ``None`` = False = the shipped rendering; the armed build carries the dump tensor and renders
+    different PTX, never served to a plan that did not ask for it).  Every threaded Constexpr is in the key by NAME."""
+    form_mask = resolve_mask_form(mask_form)
+    diag = resolve_diag_2cta(diag_2cta)
+    clk = resolve_debug_clk(debug_clk)
     accum_form = resolve_dkv_accum(dkv_accum)
-    roles = validate_fields_for_roles(  # X-FA4: the role shape and the bundle it serves (the stack fold adds debug_clk / dkv_accum)
-        resolve_warp_roles_for_map(warp_roles, tmap), route, diag, debug_clk=clk, dkv_accum=accum_form
-    )
-    if route != "tma":
-        if diag == "dq_reduce_add_off":
-            raise ValueError(
-                f"diag_2cta 'dq_reduce_add_off' (D2-pair) is not defined under dq_route_pair {route!r}: the red route issues no reduce-add to skip"
-            )
-        if diag == "sdq_sts_off":
-            raise ValueError(f"diag_2cta 'sdq_sts_off' (D9) is not defined under dq_route_pair {route!r}: the red route writes no sDQ slice to skip")
-        message = red_global_v4_requirement_error((sm // 10, sm % 10))
-        if message is not None:
-            raise NotImplementedError(f"dq_route_pair {route!r}: {message}")
-    wait_form = resolve_store_wait_form(store_wait_form)
-    split = resolve_reg_split(reg_split)
-    s_tail = tmem_map_s_tail(tmap)
+    roles = validate_fields_for_roles(resolve_warp_roles(warp_roles), diag, debug_clk=clk, dkv_accum=accum_form)
     fp32 = dkv_accum_fp32(accum_form)
-    if fp32 and not s_tail:
-        raise ValueError(f"dkv_accum 'fp32_reduce' is served by the s_tail pair body only (tmem_map {tmap!r} has no fp32 dK / dV store path)")
     if fp32:
         validate_fp32_accum_fits(config[1], config[2])
-    lookahead_after_dk = False if s_tail else s_lookahead_after_dk(order)  # the first body's order Constexpr; inert on the s_tail body
-    after_dv = dq_after_dv_for_map(order, tmap)  # the s_tail body's order Constexpr (fa4b = dQ(t-1) issued after dV(t)); False under every first-body order
     key = (
         "sdpa_bwd_sm100_d128_grouped_thd_2cta",
         ABI_VERSION,
@@ -267,13 +195,7 @@ def compile_host(
         str(dtype),
         bool(causal),
         sm,
-        order,
-        form,
         diag,
-        wait_form,
-        split,
-        tmap,
-        route,
         form_mask,
         accum_form,
         roles,
@@ -296,16 +218,9 @@ def compile_host(
         config,
         origin_specs,
         bool(causal),
-        lookahead_after_dk,
-        after_dv,
-        dq_route_pair_code(route, tmap),
-        tma_load_plain(form),
         diag_2cta_code(diag),
-        store_wait_spin(wait_form),
-        reg_split_code(split),
-        warp_roles_code(roles, tmap),
-        s_tail,
-        mask_form_code(form_mask, tmap),
+        warp_roles_code(roles),
+        mask_form_code(form_mask),
         fp32,
         clk,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),

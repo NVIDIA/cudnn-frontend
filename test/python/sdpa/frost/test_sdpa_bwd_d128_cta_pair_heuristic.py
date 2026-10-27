@@ -26,7 +26,7 @@ pytestmark = [pytest.mark.L0, requires_dsl]
 
 _ENGINE = "sdpa_bwd_sm100_d128"
 _ONE_CTA_KERNEL = "bprop_d128_accum_grouped_thd_kernel"
-_PAIR_KERNELS = {"dp_tail": "bprop_d128_accum_grouped_2cta_kernel", "s_tail": "bprop_d128_accum_grouped_2cta_stail_kernel"}
+_PAIR_KERNEL = "bprop_d128_accum_grouped_2cta_stail_kernel"
 _SELECTION_TABLE = [  # S_max of the batch -> the body ``auto`` selects at cc 10.0 with a cluster of two admitted (the measured rule)
     pytest.param(2048, "1cta", id="s2k"),
     pytest.param(4096, "1cta", id="s4k"),
@@ -198,13 +198,11 @@ def test_cta_pair_selector_is_typed_on_its_inputs():
             _select("auto", 8192, "uniform", **bad)
 
 
-def _fake_api(mode, s=16384, thd=True, device="cpu", tmem_map=None):
+def _fake_api(mode, s=16384, thd=True, device="cpu"):
     """A declaration-only stand-in for the adapter: the fields the resolution reads and nothing else."""
     desc = SimpleNamespace(shape=(1, 8, s, 128), device=torch.device(device))
     api = SimpleNamespace(_NAME=_ENGINE, cta_pair=mode, thd=thd, q_desc=desc, k_desc=SimpleNamespace(shape=(1, 2, s, 128), device=desc.device))
     api._cta_pair = None
-    if tmem_map is not None:
-        api.tmem_map = tmem_map
     api._uses_grouped_heads = lambda: True
     return api
 
@@ -232,8 +230,7 @@ def test_cta_pair_resolution_records_the_device_facts_on_the_instance(monkeypatc
 def test_cta_pair_dispatch_falls_back_under_auto_and_reraises_under_on(monkeypatch):
     """The grouped dispatch: ``auto`` that selected the pair runs the pair body's own support predicates and, when one declines, serves the
     one-CTA body with the decline recorded in the reason; ``on`` re-raises that decline unchanged (by name); ``off`` never touches the pair
-    path.  Under ``auto`` the heuristic's pair body (``CTA_PAIR_BODY``) is materialized as the typed ``tmem_map`` on the instance when the field
-    is unset -- and withdrawn again on the fallback; an explicit ``tmem_map`` is honoured; ``on`` leaves the field alone."""
+    path.  A pair accepted records the pair body's identity (``CTA_PAIR_BODY``) as ``pair_map`` on the resolution."""
     c = _contract()
     p = _prepared()
     monkeypatch.setattr(p, "_device_cc", lambda api: (10, 0))
@@ -249,7 +246,7 @@ def test_cta_pair_dispatch_falls_back_under_auto_and_reraises_under_on(monkeypat
     api = _fake_api("auto")
     assert p.check_support_selected(api) is True
     assert seen == ["pair", "1cta"] and api._cta_pair.body == c.ONE_CTA_BODY and "pair body declined" in api._cta_pair.reason
-    assert "the test withholds" in api._cta_pair.reason and getattr(api, "tmem_map", None) is None
+    assert "the test withholds" in api._cta_pair.reason and api._cta_pair.pair_map is None
     seen.clear()
     with pytest.raises(NotImplementedError, match="requires something the test withholds"):
         p.check_support_selected(_fake_api("on"))
@@ -258,24 +255,18 @@ def test_cta_pair_dispatch_falls_back_under_auto_and_reraises_under_on(monkeypat
     assert p.check_support_selected(_fake_api("off")) is True and seen == ["1cta"]
     seen.clear()
     assert p.check_support_selected(_fake_api("auto", s=2048)) is True and seen == ["1cta"]
-    # the pair accepted: the heuristic's body is materialized under auto when unset, an explicit map is honoured, `on` keeps its own default
+    # the pair accepted: the resolution records the pair body's identity under auto and under on
 
     def pair_accepts(api):
-        seen.append(("pair", getattr(api, "tmem_map", None)))
+        seen.append("pair")
         return True
 
     monkeypatch.setattr(p, "check_support", pair_accepts)
-    seen.clear()
-    api = _fake_api("auto")
-    assert p.check_support_selected(api) is True and seen == [("pair", c.CTA_PAIR_BODY)] and api.tmem_map == c.CTA_PAIR_BODY
-    assert api._cta_pair.body == c.PAIR_BODY and api._cta_pair.pair_map == c.CTA_PAIR_BODY
-    seen.clear()
-    api = _fake_api("auto", tmem_map="dp_tail")
-    assert p.check_support_selected(api) is True and seen == [("pair", "dp_tail")] and api._cta_pair.pair_map == "dp_tail"
-    seen.clear()
-    api = _fake_api("on")
-    assert p.check_support_selected(api) is True and seen == [("pair", None)] and getattr(api, "tmem_map", None) is None
-    assert api._cta_pair.pair_map == "dp_tail", "on + tmem_map unset = the first body, the direct route's day-1 semantics"
+    for mode in ("auto", "on"):
+        seen.clear()
+        api = _fake_api(mode)
+        assert p.check_support_selected(api) is True and seen == ["pair"]
+        assert api._cta_pair.body == c.PAIR_BODY and api._cta_pair.pair_map == c.CTA_PAIR_BODY == "s_tail"
 
 
 def _cpu_case(s=256, lens=None):
@@ -308,7 +299,7 @@ def test_cta_pair_on_requires_grouped_heads_typed():
     """``on`` on an MHA declaration declines by name (the MHA path has no pair body) -- through the direct 2-CTA entry, whose class pins ``on``."""
     from d128_thd_test_utils import declaration as mha_declaration
     from d128_thd_test_utils import make_case as make_mha_case
-    from test_sdpa_bwd_d128_2cta_sm100 import make_adapter_2cta
+    from d128_2cta_test_utils import make_adapter_2cta
 
     case = make_mha_case((129, 3), (129, 3), heads=2, device="cpu")
     api = make_adapter_2cta(case, compile_plan=False, declaration=mha_declaration)
@@ -329,7 +320,7 @@ def test_cta_pair_token_and_prose_name_the_predicates():
 
 # ------------------------------------------------------------------------------------------------------------ GPU rows (SM100 / SM103)
 def _require_pair_part():
-    from test_sdpa_bwd_d128_2cta_sm100 import _require_2cta
+    from d128_2cta_test_utils import _require_2cta
 
     _require_2cta()
 
@@ -393,8 +384,6 @@ def test_cta_pair_launch_census_per_selection(mode, s, body, pair_map):
     case = make_case((s,), (s,), hq=hq, hkv=hkv, thd=True, dtype=torch.bfloat16, causal=True)
     api = make_adapter(case, compile_plan=False)
     api.cta_pair = mode
-    if mode == "on":
-        api.tmem_map = pair_map
     assert api.check_support()
     api.compile()
     res = p.cta_pair_resolution(api)
@@ -406,11 +395,9 @@ def test_cta_pair_launch_census_per_selection(mode, s, body, pair_map):
         assert any(_ONE_CTA_KERNEL in n for n in kernels) and not any("2cta" in n for n in kernels), kernels
         assert api._prepared.artifact.implementation == "accumulation_grouped_thd"
     else:
-        assert any(_PAIR_KERNELS[pair_map] in n for n in kernels) and any("setup_thd_d128_2cta_kernel" in n for n in kernels), kernels
+        assert any(_PAIR_KERNEL in n for n in kernels) and any("setup_thd_d128_2cta_kernel" in n for n in kernels), kernels
         assert api._prepared.artifact.implementation == c.THD and res.pair_map == pair_map
         import importlib
 
-        cfg = importlib.import_module(
-            f"cudnn.sdpa.bwd.kernels.sm100.{'bprop_d128_accum_grouped_2cta_stail_f16' if pair_map == 's_tail' else 'bprop_d128_accum_grouped_2cta_f16'}"
-        ).CFG
+        cfg = importlib.import_module("cudnn.sdpa.bwd.kernels.sm100.bprop_d128_accum_grouped_2cta_stail_f16").CFG
         assert (cfg.CGA_M, cfg.CGA_N) == (c.CTA_PAIR_CLUSTER, 1)

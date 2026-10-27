@@ -1,9 +1,0 @@
-# sm_100a PTX md5 of the d128 grouped THD cta_group::2 chain's DEFAULT rendering (prepared_d128_grouped_2cta_host.compile_host with
-# every typed field unset: pair_mma_order / tma_load_form / diag_2cta at their config defaults; host trace-compile, no device; the probe
-# geometry B, H, HK = 2, 8, 2 is in test_sdpa_bwd_d128_2cta_sm100.py).  Rendered 2026-10-27 at the tree that added the pair probes
-# (code-writer step 4): the SAME md5 renders at 4f702556 (the tree before the probes, a detached temporary worktree) and after
-# them -- the record is the pre-change value.  The task driver's 4 / 32 / 4 geometry renders c28e6013 for the same body (header
-# section 11).  RULE-GAPS 241: the 2-CTA chain's own md5 pin.  Re-render deliberately on a
-# protocol change and say so here.
-dsl=nvidia-cutlass-dsl 4.8.1
-d128_accum_grouped_2cta sm_100a default rc=0 ptx_md5=28b0eba0beca8d693daeda8863bf879c

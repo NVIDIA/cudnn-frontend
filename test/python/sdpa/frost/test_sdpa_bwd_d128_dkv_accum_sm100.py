@@ -9,12 +9,12 @@ the ``dkv_reduce_thd_origins`` fold launch sums the group in fp32 (five launches
 fold launch gone, the bf16 convert folded into ``cast_dq_thd`` (four launches).  A ROUNDING CHANGE (the group accumulates in fp32 in a
 non-deterministic order instead of 8 bf16-rounded partials summed in a fixed order): an op ATTRIBUTE the caller sets, never a knob; dQ is
 untouched by the field.  Both bodies carry it: the 1-CTA body (``bprop_d128_accum_grouped_f16`` through ``bprop_d128_accum_thd_f16``) and
-the S-tail pair body (``bprop_d128_accum_grouped_2cta_stail_f16``); the first pair body (``dp_tail``) declines it by name.
+the cta_group::2 pair body (``bprop_d128_accum_grouped_2cta_stail_f16``).
 
 Host rows (no GPU): the typed domain, config = truth (the fp32 staging slots of both bodies), the default renderings of BOTH chains equal to
 their committed records with the field unset AND with ``bf16_partials`` named, the fp32 renderings' census (the reduce-adds up by the eight
 dK / dV slices, the bf16 tile stores gone, the fold entry gone, the P7 commit / wait groups and the two ring credits / waits of the dK
-staging's WAR edge), the ``dp_tail`` decline.  GPU rows: the fp64-oracle ladder on both bodies at the smallest shapes, the launch census
+staging's WAR edge), the typed declines.  GPU rows: the fp64-oracle ladder on both bodies at the smallest shapes, the launch census
 (5 -> 4) with the R9 gate, dQ bitwise vs the default where one kv block feeds it (one reduce-add contributor), dK / dV within the suite's
 own tolerance (never widened) with the max error of both arms recorded side by side, the declines by name (dense, MHA).
 """
@@ -83,7 +83,7 @@ _PROBE = textwrap.dedent(r"""
     dtypes = tuple("int32" for _ in ports)
     if chain == "pair":
         from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_grouped_2cta_host import compile_host
-        compile_host((B, H, HK, True), specs, dtypes, cutlass.BFloat16, True, 100, tmem_map="s_tail", **fields)
+        compile_host((B, H, HK, True), specs, dtypes, cutlass.BFloat16, True, 100, **fields)
     else:
         from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_grouped_thd_host import compile_host
         compile_host((B, H, HK, True), specs, dtypes, cutlass.BFloat16, True, 100, **fields)
@@ -207,14 +207,15 @@ def test_dkv_accum_fp32_renders_for_sm_100a_with_the_documented_census(tmp_path,
     assert fp32["LOCAL"] == 0 and fp32["NANOSLEEP"] == 0
 
 
-def test_dkv_accum_fp32_declines_by_name_on_the_first_pair_body():
-    """The dp_tail pair body carries no fp32 store path: the pair chain's compile_host declines the form BY NAME before any trace."""
+def test_dkv_accum_declines_by_name_at_the_pair_chain_entry():
+    """A value outside the domain and the one unbuilt combination (``fp32_reduce`` under ``warp_roles = "16w_fa4"``) decline BY NAME at the pair
+    chain's compile_host before any trace."""
     from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_grouped_2cta_host import compile_host
 
-    with pytest.raises(ValueError, match="fp32_reduce"):
-        compile_host((2, 8, 2, True), (None,) * 9, (None,) * 9, None, True, 100, tmem_map="dp_tail", **_FP32)
-    with pytest.raises(ValueError, match="dkv_accum"):
-        compile_host((2, 8, 2, True), (None,) * 9, (None,) * 9, None, True, 100, tmem_map="s_tail", dkv_accum="fp32")
+    with pytest.raises(ValueError, match="dkv_accum must be one of"):
+        compile_host((2, 8, 2, True), (None,) * 9, (None,) * 9, None, True, 100, dkv_accum="fp32")
+    with pytest.raises(ValueError, match="dkv_accum 'fp32_reduce' is not built under warp_roles '16w_fa4'"):
+        compile_host((2, 8, 2, True), (None,) * 9, (None,) * 9, None, True, 100, warp_roles="16w_fa4", **_FP32)
 
 
 def _code_lines(text):

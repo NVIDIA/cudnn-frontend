@@ -37,7 +37,7 @@ CTA_PAIR_MIN_SEQ = 8192
 # under ``auto`` and declines ``on`` by name until a row is measured there.
 CTA_PAIR_CCS = ((10, 0),)
 CTA_PAIR_CLUSTER = CFG.CGA_M  # the pair = one cluster of two CTAs; the device must admit at least one such cluster (the occupancy query)
-CTA_PAIR_BODY = "s_tail"  # the heuristic's pair body (the measured winner) when the typed ``tmem_map`` is unset under ``auto``
+CTA_PAIR_BODY = "s_tail"  # the pair body's identity (its TMEM map: the dQ image in S^T's dead tail) = config_sm100_d128_accum_2cta_stail.CFG.TMEM_MAP
 PAIR_BODY = "2cta"
 ONE_CTA_BODY = "1cta"
 CTA_PAIR_PREDICATES = ("thd", "cc", "cluster", "seq")  # the names a decline / a fallback reason carries; ``seq`` under ``auto`` only
@@ -67,7 +67,7 @@ class CtaPairResolution:
     s_kv_max: int
     cc: Optional[tuple]
     cluster_admitted: Optional[bool]  # None = the occupancy query was not consulted (off, or a cheaper predicate failed first)
-    pair_map: Optional[str] = None  # the pair body's TMEM map once the dispatch settled it (None on the one-CTA body)
+    pair_map: Optional[str] = None  # the pair body's identity (``CTA_PAIR_BODY``) once the dispatch chose it (None on the one-CTA body)
 
     @property
     def token(self):
