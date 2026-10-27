@@ -65,13 +65,17 @@ def _split_reference(q, k, v, *, split, pack, q_tile_rows=128, **kwargs):
     count = (last_key - first_key).clamp(min=0)
     count = torch.where(first_q < qlens.view(b, 1), count, 0)
     columns = torch.arange(skv, device=q.device).view(1, 1, 1, skv)
-    outputs, logs = [], []
+    outputs, logs, bounds = [], [], []
+    with_bound = kwargs.get("return_intermediates", False)
     for index in range(split):
         start = first_key + index * (count // split) + (count % split).clamp(max=index)
         end = start + count // split + (index < count % split)
         included = (columns >= start[:, None, :, None] * 128) & (columns < end[:, None, :, None] * 128)
         bias = torch.where(included, 0.0, -torch.inf)
-        partial, stats, _ = compute_ref(q, k, v, **dict(kwargs, bias=bias, sink_token=None))
+        result = compute_ref(q, k, v, **dict(kwargs, bias=bias, sink_token=None))
+        partial, stats, _ = result[:3]
+        if with_bound:
+            bounds.append(_half_p_output_bound(result[3], v.transpose(1, 2), q.dtype, kwargs["v_descale"]))
         outputs.append(partial.transpose(1, 2).double())
         logs.append(stats.double())
     terms = logs
@@ -83,9 +87,16 @@ def _split_reference(q, k, v, *, split, pack, q_tile_rows=128, **kwargs):
     dead = rows[:, None, :, None] >= qlens.view(b, 1, 1, 1)
     combined_stats = combined_stats.masked_fill(dead, -torch.inf)
     output = output.masked_fill(dead, 0)
-    _, full_stats, _ = compute_ref(q, k, v, **dict(kwargs, torch_itype=torch.float64))
+    _, full_stats, _ = compute_ref(q, k, v, **dict(kwargs, torch_itype=torch.float64, return_intermediates=False))
     torch.testing.assert_close(combined_stats.float(), full_stats, atol=1e-5, rtol=1e-6)
-    return output.transpose(1, 2).float(), full_stats, output.abs().max().item()
+    result = (output.transpose(1, 2).float(), full_stats, output.abs().max().item())
+    if with_bound:
+        # Each partition has its own P rounding and online-softmax gains.
+        # The combine is a nonnegative weighted sum, so propagate the bounds
+        # with independent FP64 partition weights, including the sink mass.
+        bound = sum(partial * torch.exp(log - combined_stats).nan_to_num() for partial, log in zip(bounds, logs))
+        return result + (bound.masked_fill(dead, 0),)
+    return result
 
 
 def _half_p_output_bound(parts, v, input_dtype, descale_v):
@@ -97,7 +108,8 @@ def _half_p_output_bound(parts, v, input_dtype, descale_v):
     Propagate the possible P-code changes through |V| and the online-softmax
     gains. This is an input-dependent bound, not a fitted tensor coordinate or
     tolerance; packed/unpacked bitwise checks independently protect row mapping.
-    This helper is for the unsplit D256/D512 register-sum, Stats-present path.
+    This helper covers one D256/D512 register-sum, Stats-present partition;
+    the split reference combines these bounds using independent FP64 weights.
     """
     from sdpa.fp16_ref import _pv
 
@@ -145,7 +157,6 @@ def _check(
         padding = (bufs["seq_q"].view(b), lens)
     # D256 casts P without D128's extra 2**4 factor, even for a narrow Q/K
     # head paired with wide V. The FP64 oracle follows that native pipeline.
-    assert not softmax_f16 or split == 1, "HALF P bound requires an unsplit plan"
     result = _split_reference(
         q.transpose(1, 2),
         k.transpose(1, 2),
@@ -177,7 +188,8 @@ def _check(
     in_key = "e4m3" if q.dtype == torch.float8_e4m3fn else "e5m2"
     if softmax_f16:
         assert output_check is None
-        bound = _half_p_output_bound(result[3], v, q.dtype, bufs["descale_v"].item()) * bufs["scale_o"].abs()
+        bound = _half_p_output_bound(result[3], v, q.dtype, bufs["descale_v"].item()) if split == 1 else result[3]
+        bound = bound * bufs["scale_o"].abs()
         output_result = _check_half_fp8_o(bufs["o"], ref * bufs["scale_o"], bufs["o"].dtype, in_key, bound)
     else:
         output_result = (output_check or paged._check_fp8_o)(bufs["o"], ref * bufs["scale_o"], bufs["o"].dtype, in_key)

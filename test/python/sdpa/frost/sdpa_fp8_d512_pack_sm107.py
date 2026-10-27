@@ -62,7 +62,7 @@ def _run(case, dtype, output, monkeypatch, *, half=False, pack=True, adapter=Fal
         value = bufs[name]
         value._base[..., value.shape[-1] :].fill_(float("nan"))
         value.copy_((value.float() * 2.5).to(dtype))
-    check = dict(causal=causal, bottom_right=bottom_right, window=window, softmax_f16=half and split == 1, split=split, pack=pack, q_tile_rows=256)
+    check = dict(causal=causal, bottom_right=bottom_right, window=window, softmax_f16=half, split=split, pack=pack, q_tile_rows=256)
     g.execute(vp, ws)
     _check(bufs, **check)
     if half and split == 1:
