@@ -243,7 +243,8 @@ FIXED_CONV_EXPANSION_CASES_L1 = tuple(
     for shape_name, batch, in_channels, out_channels, input_spatial, filter_spatial, padding, stride, dilation, seed_base in WGRAD_RESIDUAL_SHAPES
     for dtype, dtype_name, min_device_capability, rtol, atol, dtype_seed_offset in (
         (torch.float16, "f16", (7, 0), 5e-3, 5e-3, 0),
-        (torch.bfloat16, "bf16", (8, 0), 2.1e-2, 5e-2, 2),
+        # Integer inputs accumulate exactly in FP32; the reference includes BF16 output rounding.
+        (torch.bfloat16, "bf16", (8, 0), 0, 0, 2),
         (torch.float32, "f32", (0, 0), 5e-3, 5e-3, 4),
     )
     for materialize_intermediate in (False, True)
@@ -275,6 +276,7 @@ def _run_fixed_conv_test(conv_case: FixedConvCase, cudnn_handle, num_diffs: int)
         pytest.skip(f"Requires device capability {conv_case.min_device_capability}")
     X = W = Y = bias = prior_output = reference = actual_output = None
     intermediate_output = intermediate_reference = destination = None
+    intermediate_dtype = conv_case.intermediate_dtype if conv_case.intermediate_dtype is not None else torch.float32
     original_stream = cudnn.get_stream(handle=cudnn_handle)
     try:
         X, W, Y, bias = conv_fuzzer.create_tensors(config, random.Random(config.rng_seed))
@@ -286,7 +288,7 @@ def _run_fixed_conv_test(conv_case: FixedConvCase, cudnn_handle, num_diffs: int)
                 destination = X
             else:
                 destination = W
-            intermediate_output = torch.empty_like(destination, dtype=conv_case.intermediate_dtype)
+            intermediate_output = torch.empty_like(destination, dtype=intermediate_dtype)
             conv_fuzzer.fill_with_garbage(intermediate_output)
 
         try:
@@ -347,7 +349,7 @@ def _run_fixed_conv_test(conv_case: FixedConvCase, cudnn_handle, num_diffs: int)
             comparison_passed, comparison_message = conv_fuzzer.compare_results(
                 intermediate_output,
                 intermediate_reference,
-                conv_case.intermediate_dtype,
+                intermediate_dtype,
                 num_diffs,
                 rtol=conv_case.rtol,
                 atol=conv_case.atol,
@@ -539,3 +541,112 @@ def test_fixed_reference_bias_order(epilogue):
         expected = expected.relu()
     actual = conv_fuzzer.compute_reference(config, X, W, Y, bias, prior_output, intermediate_dtype=torch.float16)
     torch.testing.assert_close(actual, expected, rtol=0, atol=1e-7)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("path", ("reference", "graph"))
+@pytest.mark.parametrize("epilogue", (conv_fuzzer.EpilogueType.BIAS, conv_fuzzer.EpilogueType.BIAS_RELU))
+def test_fixed_missing_bias(path, epilogue, cudnn_handle):
+    config = replace(FIXED_CONV_CASES_L0[0].values[0].config, epilogue=epilogue)
+    tensor = torch.ones(1)
+    original_stream = cudnn.get_stream(handle=cudnn_handle)
+    try:
+        with pytest.raises(ValueError, match="requires a bias tensor"):
+            if path == "reference":
+                conv_fuzzer.compute_reference(config, tensor, tensor, tensor, None)
+            else:
+                conv_fuzzer.run_cudnn_conv(config, tensor, tensor, tensor, None, cudnn_handle)
+        assert cudnn.get_stream(handle=cudnn_handle) == original_stream
+    finally:
+        cudnn.set_stream(handle=cudnn_handle, stream=original_stream)
+
+
+@pytest.mark.L0
+def test_fixed_default_intermediate_buffer(cudnn_handle, num_diffs):
+    conv_case = next(p.values[0] for p in FIXED_CONV_EXPANSION_CASES_L1 if p.id == "conv2d_wgrad_residual_exposed_f16_n64_c256_k16_7x7")
+    _run_fixed_conv_test(replace(conv_case, intermediate_dtype=None), cudnn_handle, num_diffs)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16), ids=("fp16", "bf16"))
+@pytest.mark.parametrize("materialize", (False, True), ids=("virtual", "exposed"))
+@pytest.mark.parametrize("fp32_edge", (False, True), ids=("low_precision_edge", "fp32_edge"))
+def test_wgrad_intermediate_rounding(dtype, materialize, fp32_edge, cudnn_handle, num_diffs):
+    if torch.cuda.get_device_capability() < ((8, 0) if dtype == torch.bfloat16 else (7, 0)):
+        pytest.skip(f"Unsupported convolution input dtype: {dtype}")
+    config = _fixed_conv_case(
+        spatial_dims=2,
+        batch=2,
+        in_channels=32,
+        out_channels=32,
+        input_spatial=(4, 4),
+        filter_spatial=(1, 1),
+        padding=(0, 0),
+        stride=(1, 1),
+        dilation=(1, 1),
+        conv_type=conv_fuzzer.ConvType.WGRAD,
+        dtype=dtype,
+        rng_seed=300,
+    ).config
+    X = W = Y = prior_output = intermediate = reference = raw_reference = None
+    expected = opposite_precision = None
+    edge_dtype = torch.float32 if fp32_edge else dtype
+    original_stream = cudnn.get_stream(handle=cudnn_handle)
+    try:
+        X, W, Y, _ = conv_fuzzer.create_tensors(config, random.Random(config.rng_seed))
+        X.zero_()
+        Y.zero_()
+        X[0, 0, 0, 0] = 1 + 2**-7
+        Y[0, 0, 0, 0] = 1 + 2**-7
+        prior_output = torch.zeros_like(W)
+        prior_output[0, 0, 0, 0] = -(1 + 2**-6)
+        if materialize:
+            intermediate = torch.empty_like(W, dtype=edge_dtype)
+            conv_fuzzer.fill_with_garbage(intermediate)
+
+        # The exact product is 1 + 2^-6 + 2^-14. Rounding drops the last term;
+        # cancellation after the edge makes that rounding visible in the output.
+        expected = torch.zeros_like(W)
+        opposite_precision = torch.zeros_like(W)
+        expected[0, 0, 0, 0] = 2**-14 if fp32_edge else 0
+        opposite_precision[0, 0, 0, 0] = 0 if fp32_edge else 2**-14
+        assert not conv_fuzzer.compare_results(opposite_precision, expected, dtype, num_diffs, rtol=0, atol=1e-6)[0]
+        try:
+            success, message = conv_fuzzer.run_cudnn_conv(
+                config,
+                X,
+                W,
+                Y,
+                None,
+                cudnn_handle,
+                prior_output,
+                raise_on_unsupported=True,
+                intermediate_dtype=edge_dtype,
+                intermediate_output=intermediate,
+            )
+        except cudnn.cudnnGraphNotSupportedError as error:
+            pytest.skip(f"Unsupported convolution rounding control: {error}")
+        assert success, message
+        reference, raw_reference = conv_fuzzer.compute_reference(
+            config,
+            X,
+            W,
+            Y,
+            None,
+            prior_output,
+            intermediate_dtype=edge_dtype,
+            return_intermediate=True,
+        )
+        assert torch.isfinite(W).all() and torch.isfinite(reference).all()
+        passed, message = conv_fuzzer.compare_results(W, reference, dtype, num_diffs, rtol=0, atol=1e-6)
+        assert passed, message
+        torch.testing.assert_close(reference, expected, rtol=0, atol=0)
+        if intermediate is not None:
+            assert torch.isfinite(intermediate).all() and torch.isfinite(raw_reference).all()
+            torch.testing.assert_close(intermediate, raw_reference, rtol=0, atol=0)
+    finally:
+        try:
+            cudnn.set_stream(handle=cudnn_handle, stream=original_stream)
+        finally:
+            del X, W, Y, prior_output, intermediate, reference, raw_reference, expected, opposite_precision
+            torch.cuda.empty_cache()

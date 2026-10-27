@@ -625,6 +625,8 @@ def create_tensors(config: ConvConfig, rng: random.Random):
 def _validate_fusion_arguments(config, bias, prior_output, intermediate_dtype, expose_intermediate):
     if config.conv_type != ConvType.FPROP and config.epilogue in (EpilogueType.BIAS, EpilogueType.BIAS_RELU):
         raise ValueError("Backward convolution does not support bias epilogues")
+    if config.epilogue in (EpilogueType.BIAS, EpilogueType.BIAS_RELU) and bias is None:
+        raise ValueError("The selected epilogue requires a bias tensor")
     has_intermediate = (
         prior_output is not None
         or config.epilogue == EpilogueType.RELU
