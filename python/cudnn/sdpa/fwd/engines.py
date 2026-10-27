@@ -2631,8 +2631,9 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
       write_thd_meta THD leg; the SM107 row carries all four of its per-tensor
       FP8 siblings (config_sm107.SM107_FP8_THD_SHAPES: d128, d192xd128, d256
       and d512, on the FROST THD contract since 2026-09-09).
-    - split_kv_supported / split_d_shapes: both d128 and d192x128 kernels
-      wire SplitHelpers; SM100 d256 carries the same split contract.
+    - split_kv_supported / split_d_shapes: SM100 d64/d128, d192x128, d256
+      and d512 wire SplitHelpers. D512 graph plans share the standalone
+      FP32-partial/combine contract, including its dense head envelope.
     - sched_policies: both rows serve the full {NATURAL, LPT, LPT_L2} domain
       (issue #653) — the SM107 sibling threads qh_per_kh/seqlen_kv through
       every decode call site, which is what the shared LPT_L2 decode requires,
@@ -2845,7 +2846,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # every flavor already runs.
             softmax_precisions=(frozenset({cudnn.data_type.FLOAT, cudnn.data_type.HALF}) if rubin_row else frozenset({cudnn.data_type.FLOAT})),
             split_kv_supported=True,
-            split_d_shapes=(SM107_FP8_SPLIT_SHAPES if rubin_row else frozenset({(64, 64), (128, 128), (192, 128), (256, 256)})),
+            split_d_shapes=(SM107_FP8_SPLIT_SHAPES if rubin_row else frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})),
             pack_gqas=frozenset({False, True}),
             # SM107: PackGQA is wired in the d128 FP8 BODY at D64 and D128.
             # The d192xd128 sibling shares it, but stays declined until its PackGQA

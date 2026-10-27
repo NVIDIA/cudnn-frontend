@@ -126,11 +126,11 @@ def test_fp8_sink_split_requires_current_native_extension(monkeypatch):
         dense._case(sq=16, skv=256, split_kv=4, sink=sink)
 
 
-def test_fp8_sink_keeps_existing_split_domain():
-    """A sink does not widen the independent FP8 split head-dimension domain."""
+def test_fp8_sink_keeps_packed_split_decline():
+    """A dense FP8 sink split does not widen the independent packed-Q domain."""
     sink = torch.zeros((1, 4, 1, 1), device="cuda")
-    with pytest.raises(NotImplementedError, match="split_kv > 1 is wired only"):
-        dense._case(d=512, sq=16, skv=256, split_kv=4, sink=sink)
+    with pytest.raises(NotImplementedError, match="split_kv > 1 serves"):
+        dense._case(d=512, sq=16, skv=256, split_kv=4, sink=sink, thd=True)
 
 
 @pytest.mark.parametrize("d,dv", [(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)])
