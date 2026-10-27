@@ -46,11 +46,12 @@ def test_entries_are_well_formed_and_name_known_rows():
 
     rows = {s.name for s in FWD} | {s.name for s in BWD}
     for key, entry in pt.TABLE.items():
-        row, cc, dtype, heads, phase, layout, mask, sink, group = key
+        row, cc, dtype, heads, phase, layout, mask, sink, group, kv_aligned = key
         assert row in rows, key
         assert isinstance(cc, tuple) and len(cc) == 2 and dtype in ("bf16", "f16") and len(heads) == 2
         assert phase in ("q1", "mtp", "prefill") and layout in ("dense", "paged", "thd", "thd_ragged")
         assert mask in ("none", "window", "causal_br", "causal_tl") and isinstance(sink, bool) and group in ("mha", "gqa")
+        assert isinstance(kv_aligned, bool)
         assert entry.direction in ("always", "never", "ge", "le") and entry.study
         assert (entry.log2_work is None) == (entry.direction in ("always", "never"))
 
@@ -89,3 +90,12 @@ def test_cost_proxy_is_byte_bound_for_decode_and_flop_bound_for_prefill():
     assert pt.log2_work(_facts(h_q=4, **dec)) == pytest.approx(pt.log2_work(_facts(h_q=16, **dec)), abs=0.01)
     pre = dict(d_qk=256, d_v=256, s_kv=4096, h_kv=2, b=1, h_q=32)
     assert pt.log2_work(_facts(s_q=4096, **pre)) == pytest.approx(pt.log2_work(_facts(s_q=2048, **pre)) + 1)
+
+
+@pytest.mark.L0
+def test_kv_off_the_tile_is_its_own_class():
+    """S_kv off the 128-key tile disables split-KV, so a study measured on the tile never answers for it (an off-tile d256
+    decode was 11-13x slower on FROST, which the aligned grid could not see)."""
+    row = "sdpa_fwd_prefill_sm100"
+    assert pt.lookup(row, _facts(s_kv=8192)) is not None
+    assert pt.lookup(row, _facts(s_kv=8191)) is None

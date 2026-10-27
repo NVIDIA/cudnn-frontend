@@ -3,7 +3,8 @@
 
 """Measured placement table: FROST row vs the backend, per shape class, generated from frozen sweeps.
 
-A class is read off the graph facts (row, device, dtype, head pair, phase, layout, mask, sink, MHA vs GQA). Each entry
+A class is read off the graph facts (row, device, dtype, head pair, phase, layout, mask, sink, MHA vs GQA, S_kv on
+the 128-key tile). Each entry
 is a monotone rule on ONE work scalar, :func:`log2_work` (a roofline-shaped cost proxy): ``always``, ``never``, ``ge T`` (FROST leads
 from T up) or ``le T`` (FROST leads up to T). Entries are produced by ``benchmark/placement_gen`` from a training grid
 and qualified on a frozen holdout; every entry names its study. Do not edit entries by hand -- regenerate.
@@ -76,7 +77,9 @@ def class_key(row: str, facts) -> Optional[Tuple]:
     else:
         mask = "none"
     group = "mha" if facts.h_q == facts.h_kv else "gqa"
-    return (row, tuple(facts.device_cc or ()), dtype, (facts.d_qk, facts.d_v), phase, layout, mask, bool(facts.has_sink), group)
+    # S_kv off the 128-key tile changes what the kernels can do (no split-KV), not just how long they run: its own class.
+    kv_aligned = facts.s_kv % 128 == 0
+    return (row, tuple(facts.device_cc or ()), dtype, (facts.d_qk, facts.d_v), phase, layout, mask, bool(facts.has_sink), group, kv_aligned)
 
 
 COST_BALANCE = 16.0
@@ -108,10 +111,9 @@ def lookup(row: str, facts) -> Optional[bool]:
 # ---------------------------------------------------------------------------------------------------------------- generated
 # benchmark/placement_gen/gen.py --emit; one block per study, keys sorted. Do not edit by hand.
 TABLE: Dict[Tuple, Entry] = {
-    # study sm100_d256_decode_20261027 (full-power B200, cuDNN 9.28.0.38; frozen 200-case grid, 40-case holdout)
-    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "dense", "none", False, "gqa"): Entry("ge", 26.001, "sm100_d256_decode_20261027"),
-    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa"): Entry("ge", 26.002, "sm100_d256_decode_20261027"),
     # study sm100_d576_decode_20261027 (full-power B200, cuDNN 9.28.0.38; frozen 128-case grid, 40-case holdout)
-    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "mtp", "paged", "causal_br", False, "gqa"): Entry("always", None, "sm100_d576_decode_20261027"),
-    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "q1", "paged", "none", False, "gqa"): Entry("ge", 26.588, "sm100_d576_decode_20261027"),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "mtp", "paged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm100_d576_decode_20261027"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "q1", "paged", "none", False, "gqa", True): Entry("ge", 26.588, "sm100_d576_decode_20261027"),
 }
