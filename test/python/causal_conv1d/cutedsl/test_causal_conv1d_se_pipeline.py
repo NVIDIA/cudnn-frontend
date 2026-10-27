@@ -134,6 +134,27 @@ def test_backward_seqpar_rounding(dtype, width, silu):
     )
 
 
+@pytest.mark.parametrize("shape", [(2, 1024, 1031), (2, 1032, 1024), (2, 1032, 1087), (2, 1032, 1095), (1, 136, 135), (2, 8, 71)])
+@pytest.mark.parametrize("width,silu", [(2, False), (3, False), (3, True)])
+def test_backward_masked_stages(shape, width, silu):
+    """Check each masked axis and both double-buffer stages against the pinned backend."""
+    _dsl()
+    _check(
+        dict(
+            name=f"modern_tail_{shape[0]}_{shape[1]}_{shape[2]}_{width}_{silu}",
+            family="nwh",
+            direction="backward",
+            shape=list(shape),
+            width=width,
+            mixer_width=None,
+            dtype="float32",
+            silu=silu,
+            iterations=3,
+            min_device_version=800,
+        )
+    )
+
+
 @pytest.mark.parametrize(
     "dtype,width,channels,length,silu",
     [

@@ -158,7 +158,7 @@ causal_conv1d_bwd_nwc.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 def _nwh_pair_masks(width, element_bits, silu):
-    """Natural-order lanes in the cuDNN 9.29 SE 64x64 backward tile.
+    """Natural-order lanes in the cuDNN 9.29 / NVRTC 13.5–13.6 backward tile.
 
     Masks are (full stage 0, masked stage 0, full stage 1, masked stage 1).
     NVRTC contracts the first two products differently across template paths.
@@ -173,6 +173,14 @@ def _nwh_pair_masks(width, element_bits, silu):
     if _uses_packed_nwh():
         masked = 0 if silu else 0xF0000000
         return (0, masked, 0, masked)
+    # FP32 masked-tile contraction in NVRTC 13.5/13.6. In particular, the
+    # second double-buffer stage has a different K3 profile from the first.
+    if width == 2 and not silu:
+        return (0, 0xF00000F0, 0, 0xF00000F0)
+    if width == 3:
+        if silu:
+            return (0, 0xFFFFFF00, 0, 0x77777700)
+        return (0, 0xF0000700, 0, 0xF0000F00)
     if silu:
         masked = 0 if width == 2 else ((0xFFFFFFFF << (4 * (width - 1))) & 0xFFFFFFFF)
         return (0, masked, 0, masked)
@@ -200,6 +208,9 @@ def _nwh_first_pair(
         if cutlass.const_expr(shape[1] % 64 != 0 or shape[2] % 64 != 0):
             if (channel // 64 + 1) * 64 > shape[2] or (position // 64 + 1) * 64 > shape[1]:
                 mask = cutlass.Uint32(masks[1])
+                if cutlass.const_expr(masks[1] != masks[3]):
+                    if position // 64 % 2 != 0:
+                        mask = cutlass.Uint32(masks[3])
         bit = (position % (element_bits // 4)) * (128 // element_bits) + channel % (128 // element_bits)
         if (mask >> bit) & 1:
             value = cute.math.fma(g1, w1, g0 * w0)
