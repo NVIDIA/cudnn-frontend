@@ -247,7 +247,7 @@ def test_parity_fused_layer_path_with_packed_qkv_views():
 
 kda_ops = pytest.importorskip("fla.ops.kda")
 chunk_kda = kda_ops.chunk_kda
-from cudnn.fla.kda import make_chunk_kda, last_path as kda_last_path
+from cudnn.fla.kda import _BWD_CHECKED, make_chunk_kda, last_path as kda_last_path
 
 kda_shim = make_chunk_kda(chunk_kda)
 
@@ -518,9 +518,7 @@ def test_kda_sm90_fused_training_falls_back(gate):
     lv_fla, lv_cud = _kda_clone(master, torch.bfloat16), _kda_clone(master, torch.bfloat16)
     o_fla = _run_kda(chunk_kda, lv_fla, gate)
     o_cud = _run_kda(kda_shim, lv_cud, gate)
-    assert (
-        kda_last_path().startswith("fallback") and kda_last_path() != "fallback:underfilled"
-    ), f"expected the backward check to decline, got {kda_last_path()}"
+    assert kda_last_path() == "fallback:_Decline", f"expected the backward check to decline, got {kda_last_path()}"
     o_fla.backward(do)
     o_cud.backward(do)
     torch.testing.assert_close(o_cud, o_fla, rtol=0, atol=0)
@@ -536,13 +534,11 @@ def test_kda_sm90_cached_backward_decline_keeps_no_inputs():
     import gc
     import weakref
 
-    import cudnn.fla.kda as kda_mod
-
     B = _filled_batch(4)
     master = _kda_leaves(B=B, T=128, H=4, HV=4, K=128, V=128, dtype=torch.bfloat16, seed=5)
     do = torch.randn(B, 128, 4, 128, device="cuda", dtype=torch.bfloat16)
     refs = []
-    kda_mod._BWD_CHECKED.clear()
+    _BWD_CHECKED.clear()
     for _ in range(3):
         lv = _kda_clone(master, torch.bfloat16)
         o = _run_kda(kda_shim, lv, "softplus")
@@ -552,7 +548,7 @@ def test_kda_sm90_cached_backward_decline_keeps_no_inputs():
         del lv, o
     gc.collect()
     assert all(r() is None for r in refs), "a declined call's q is still referenced after it returned"
-    assert len(kda_mod._BWD_CHECKED) == 1 and all(isinstance(v, str) for v in kda_mod._BWD_CHECKED.values()), kda_mod._BWD_CHECKED
+    assert len(_BWD_CHECKED) == 1 and all(isinstance(v, str) for v in _BWD_CHECKED.values()), _BWD_CHECKED
 
 
 @sm90
