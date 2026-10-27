@@ -2427,44 +2427,49 @@ def _correction_warp_group(
                     row_base_bytes = tid_in_wg * cutlass.Int32(_SWZ_BYTES_C)
                     row_xor_field = ((tid_in_wg >> cutlass.Int32(_SWZ_SHIFT_C)) & cutlass.Int32(_SWZ_MASK_C)) << cutlass.Int32(4)
 
-                    for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
-                        o_addr = tmem_base_epi + cutlass.Int32(tmem_O_off + chunk_idx * O_CHUNK)
-                        o_chunk = nvvm.tcgen05_ld(
-                            "32x32b",
-                            nvvm.make_tmem_ptr(o_addr, cutlass.Float32),
-                            num=O_CHUNK,
-                        )
+                    for chunk_pair in cutlass.range_constexpr(N_CHUNKS_O // 2):
+                        o_pair = [
+                            nvvm.tcgen05_ld(
+                                "32x32b",
+                                nvvm.make_tmem_ptr(tmem_base_epi + cutlass.Int32(tmem_O_off + (2 * chunk_pair + j) * O_CHUNK), cutlass.Float32),
+                                num=O_CHUNK,
+                            )
+                            for j in range(2)
+                        ]
                         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                        o_scaled = o_chunk * inv_sum
-                        # Dead-row sanitize: an empty mainloop never writes O TMEM,
-                        # so o_chunk is garbage (possibly NaN) and `* inv_sum(=0)`
-                        # cannot zero it — select 0 explicitly (keeps amax_o clean).
-                        _zero_f = cutlass.Float32(0.0)
-                        o_elems = [cutlass.Float32(arith.select(row_dead.ir_value(), _zero_f.ir_value(), o_scaled[i].ir_value())) for i in range(O_CHUNK)]
+                        for chunk_j in cutlass.range_constexpr(2):
+                            chunk_idx = 2 * chunk_pair + chunk_j
+                            o_chunk = o_pair[chunk_j]
+                            o_scaled = o_chunk * inv_sum
+                            # Dead-row sanitize: an empty mainloop never writes O TMEM,
+                            # so o_chunk is garbage (possibly NaN) and `* inv_sum(=0)`
+                            # cannot zero it — select 0 explicitly (keeps amax_o clean).
+                            _zero_f = cutlass.Float32(0.0)
+                            o_elems = [cutlass.Float32(arith.select(row_dead.ir_value(), _zero_f.ir_value(), o_scaled[i].ir_value())) for i in range(O_CHUNK)]
 
-                        if cutlass.const_expr(amax_o_tensor is not None):
-                            _amax_o_local = fmax_f32(_amax_o_local, abs_max_tree(o_elems))
+                            if cutlass.const_expr(amax_o_tensor is not None):
+                                _amax_o_local = fmax_f32(_amax_o_local, abs_max_tree(o_elems))
 
-                        # Plain range (not range_constexpr) — extraction at Python trace time.
-                        o_packed_v = fp32_to_fp8_pack(
-                            [o_elems[i] for i in range(16)],
-                            dtype=OUT_STORAGE_DTYPE,
-                        )
+                            # Plain range (not range_constexpr) — extraction at Python trace time.
+                            o_packed_v = fp32_to_fp8_pack(
+                                [o_elems[i] for i in range(16)],
+                                dtype=OUT_STORAGE_DTYPE,
+                            )
 
-                        col_elems = chunk_idx * O_CHUNK
-                        block_idx = col_elems // D_BLOCK_SIZE
-                        col_in_block_bytes = (col_elems % D_BLOCK_SIZE) * CFG.BPE_O
-                        block_off_bytes = block_idx * _SUBTILE_BYTES_C
+                            col_elems = chunk_idx * O_CHUNK
+                            block_idx = col_elems // D_BLOCK_SIZE
+                            col_in_block_bytes = (col_elems % D_BLOCK_SIZE) * CFG.BPE_O
+                            block_off_bytes = block_idx * _SUBTILE_BYTES_C
 
-                        swizzled_in_row = row_xor_field ^ cutlass.Int32(col_in_block_bytes)
-                        addr_off_bytes = cutlass.Int32(block_off_bytes) + row_base_bytes + swizzled_in_row
+                            swizzled_in_row = row_xor_field ^ cutlass.Int32(col_in_block_bytes)
+                            addr_off_bytes = cutlass.Int32(block_off_bytes) + row_base_bytes + swizzled_in_row
 
-                        # Re-type pointer to Int32 so 4-i32 store maps to one st.shared.v4.b32.
-                        fp8_ptr = sO_sub_base.subview(addr_off_bytes).data_ptr()
-                        i32_ptr = Pointer(fp8_ptr, dtype=cutlass.Int32)
-                        if chunk_idx == 0:
-                            bars.mb_o_empty[qs].wait(o_empty_phase, spin=SPIN_RING_WAITS)
-                        i32_ptr.store(o_packed_v, alignment=16)
+                            # Re-type pointer to Int32 so 4-i32 store maps to one st.shared.v4.b32.
+                            fp8_ptr = sO_sub_base.subview(addr_off_bytes).data_ptr()
+                            i32_ptr = Pointer(fp8_ptr, dtype=cutlass.Int32)
+                            if chunk_idx == 0:
+                                bars.mb_o_empty[qs].wait(o_empty_phase, spin=SPIN_RING_WAITS)
+                            i32_ptr.store(o_packed_v, alignment=16)
                 elif cutlass.const_expr(CFG.O_BLOCK_SCALE > 0):
                     # Block-scaled O (DTYPE_O 4 = E2M1 + E4M3 SF per 16 d, 5 = E4M3 +
                     # UE8M0 SF per 32 d) -- verbatim port of the SM100 sibling's
