@@ -123,6 +123,7 @@ from cudnn.sdpa.fwd.engines import (
     mismatch,
     pack_gqa_partial,
     rubin_dense_d128_shared_leg,
+    sm100_nonpaged_d128_thd_single_cta_leg,
     sm120_decode_tile,
 )
 
@@ -2032,6 +2033,10 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
             and _ceil_div(units, sm_count) < _ceil_div(units, sm_count // 2)
         )
         return sched_policy, 1 if prefer else 2
+    if selected_shape == (128, 128) and (split_kv or 1) == 1 and sm100_nonpaged_d128_thd_single_cta_leg(caps, facts, cga=1, split_kv=1):
+        # The SM100 nonpaged D128 half THD graphs with one query head per KV head run the single-CTA two-slab prefill body
+        # (engines.sm100_nonpaged_d128_thd_single_cta_leg); the pair tile stays a runner.
+        return sched_policy, 1
     if selected_shape == (128, 128) and domain == frozenset({1, 2}) and not (facts.is_fp8 or facts.is_mxfp8):
         # The f16 SM100 and cc 10.7 rows: cga1 = the decode tile when one of its 128-row
         # tiles covers the head's Q rows, else the cga2 prefill pipeline.
@@ -3066,6 +3071,9 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         if knobs not in seen:
             seen.add(knobs)
             unique.append(knobs)
+    if unsplit_leg.cga == 1 and sm100_nonpaged_d128_thd_single_cta_leg(caps, facts, cga=2, split_kv=1) and 2 in effective_cgas(caps, facts, 1):
+        # The pair tile stays a runner on the SM100 nonpaged D128 half THD graphs the single-CTA body leads.
+        unique.append(replace(unsplit_leg, cga=2))
     splits, packed = paged_thd_split_choice(caps, facts)
     if splits > 1:
         unique.insert(

@@ -14,7 +14,7 @@ from frost_test_utils import requires_dsl
 import cudnn
 from cudnn.sdpa.fwd import heuristics as heur
 from cudnn.sdpa.fwd.config_sm100 import CfgD512, cga_ctas
-from cudnn.sdpa.fwd.engines import ENGINE_SPECS, mismatch
+from cudnn.sdpa.fwd.engines import ENGINE_SPECS, effective_cgas, mismatch
 from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
 
 pytestmark = pytest.mark.L0
@@ -410,6 +410,63 @@ def test_nonpaged_d128_rubin_split_obeys_physical_wave_budget(monkeypatch, batch
         assert tiles * (h_q // group) * splits <= 2 * 204
         assert len(range(0, kv, 128)) // splits >= 4
         assert mismatch(spec.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=splits, pack_gqa=packed)) is None
+
+
+@requires_dsl
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("dtype", [cudnn.data_type.BFLOAT16, cudnn.data_type.HALF])
+@pytest.mark.parametrize("mask", ["bottom_right", "top_left", "none"])
+def test_sm100_nonpaged_d128_mha_thd_leads_with_the_single_cta_body(device_cc, dtype, mask):
+    """A nonpaged D128 half THD graph with one query head per KV head puts the single-CTA prefill body first (cga 1, unsplit),
+    keeps the pair tile as a runner, and both widths pass mismatch; the plan-time THD split still leads where it applies."""
+    causal = mask != "none"
+    facts = _mla_split_facts(
+        d_qk=128,
+        b=4,
+        h_q=32,
+        h_kv=32,
+        s_q=4096,
+        s_kv=4096,
+        causal=causal,
+        bottom_right=mask == "bottom_right",
+        dtype=dtype,
+        device_cc=device_cc,
+        max_total_seq_len_q=16384,
+        max_total_seq_len_kv=16384,
+    )
+    assert effective_cgas(SPEC.capabilities, facts, 1) == frozenset({1, 2})
+    sets = heur._knob_sets(SPEC, facts)
+    assert (sets[0].cga, sets[0].split_kv, sets[0].pack_gqa) == (1, 1, False)
+    assert any(k.cga == 2 and k.split_kv == 1 for k in sets)
+    for k in sets:
+        assert mismatch(SPEC.capabilities, facts, k) is None, k
+    if mask != "top_left":
+        chunk = replace(facts, b=1, s_q=256, s_kv=8192, max_total_seq_len_q=None, max_total_seq_len_kv=None)
+        splits, _ = heur.nonpaged_thd_split_choice(SPEC.capabilities, chunk)
+        assert splits > 1 and heur._knob_sets(SPEC, chunk)[0].split_kv == splits
+
+
+@requires_dsl
+@pytest.mark.parametrize(
+    "other",
+    [
+        dict(h_kv=8),
+        dict(window_left=512),
+        dict(has_sink=True),
+        dict(has_bias=True),
+        dict(has_kv_mask=True),
+        dict(attn_scale_prefolded=True),
+        dict(right_band_widening=True, right_bound=16),
+    ],
+    ids=["gqa", "window", "sink", "bias", "kv_mask", "prefolded_scale", "band"],
+)
+def test_sm100_d128_thd_graphs_off_the_single_cta_leg_keep_the_pair_tile(other):
+    """Grouped heads, a window or band, a sink, a bias, a kv_mask or a pre-folded scale keep the pair tile first, and the
+    single-CTA width is not admitted for them."""
+    base = dict(d_qk=128, b=4, h_q=32, h_kv=32, s_q=4096, s_kv=4096, causal=True, bottom_right=True, max_total_seq_len_q=16384, max_total_seq_len_kv=16384)
+    facts = _mla_split_facts(**{**base, **other})
+    assert heur._knob_sets(SPEC, facts)[0].cga == 2
+    assert mismatch(SPEC.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=1, pack_gqa=False, sched_policy=0, tile_m=128, tile_n=128)) is not None
 
 
 @requires_dsl

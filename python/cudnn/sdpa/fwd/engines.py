@@ -46,6 +46,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     supports_paged_prefill_cga1,
     supports_paged_d256_pack_gqa,
     supports_nonpaged_d128_thd_prefill,
+    supports_sm100_nonpaged_d128_thd_single_cta,
     supports_paged_d128_partial_pack_gqa,
     supports_nonpaged_d128_thd_pack_gqa,
     supports_thd_split,
@@ -1110,6 +1111,34 @@ def launch_grid_mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts",
     )
 
 
+def sm100_nonpaged_d128_thd_single_cta_leg(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", *, cga, split_kv) -> bool:
+    """The SM100 single-CTA D128 half THD prefill leg of a graph (``config_sm100.supports_sm100_nonpaged_d128_thd_single_cta``):
+    half inputs, no pre-folded scale, one query head per KV head, a plain mask."""
+    return (
+        capabilities.sm_lo == 100
+        and not facts.attn_scale_prefolded
+        and facts.dtype in (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
+        and supports_sm100_nonpaged_d128_thd_single_cta(
+            (facts.d_qk, facts.d_v),
+            device_cc=facts.device_cc,
+            fp8=facts.is_fp8 or facts.is_mxfp8,
+            thd=facts.thd,
+            paged=facts.has_paged_kv,
+            cga=cga,
+            split_kv=split_kv or 1,
+            one_head_per_kv=facts.h_kv > 0 and facts.h_q == facts.h_kv,
+            plain_mask=(
+                facts.window_left is None
+                and not facts.right_band_widening
+                and not facts.has_sink
+                and not facts.has_bias
+                and not facts.has_kv_mask
+                and not facts.has_epilogue_gate
+            ),
+        )
+    )
+
+
 def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split_kv: Optional[int] = None, cga: Optional[int] = None) -> frozenset[int]:
     """CGA domain of the native flavor and split leg selected by the graph.
 
@@ -1121,6 +1150,8 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
 
     _knobs = SdpaFwdKnobs(split_kv=split_kv, cga=cga) if (split_kv is not None or cga is not None) else None
     selected = _selected_d_shape(capabilities, facts, _knobs)
+    if sm100_nonpaged_d128_thd_single_cta_leg(capabilities, facts, cga=cga, split_kv=split_kv):
+        return frozenset({1, 2})
     if (
         capabilities.sm_lo == 107
         and not facts.attn_scale_prefolded
@@ -1569,13 +1600,19 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if (
             knobs.cga == 1
             and facts.thd
-            and not (ragged_decode or packed_split or paged_prefill_cga1)
+            and not (
+                ragged_decode
+                or packed_split
+                or paged_prefill_cga1
+                or sm100_nonpaged_d128_thd_single_cta_leg(capabilities, facts, cga=1, split_kv=knobs.split_kv or 1)
+            )
             and capabilities.sm_lo == 100
             and _selected_d_shape(capabilities, facts, knobs) == (128, 128)
         ):
             return (
                 "cga=1 on the d128 flavor supports the decode tile for ragged Q over paged K/V with ragged Stats at S_q == 1, "
-                "exact D128 with split_kv > 1, or the SM100 paged prefill body at S_q > 1; other THD graphs run the cga2 prefill tile"
+                "exact D128 with split_kv > 1, the SM100 paged prefill body at S_q > 1, or the SM100 nonpaged half prefill body with one "
+                "query head per KV head under a plain mask; other THD graphs run the cga2 prefill tile"
             )
         if ragged_decode and (knobs.split_kv is None or knobs.split_kv < 2):
             # The ragged final rows exist only through the combine pass.
