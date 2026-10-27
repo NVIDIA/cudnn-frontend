@@ -675,3 +675,7 @@ def test_native_d576_has_launch_geometry_for_the_split_model():
     assert heur._selected_d_shape(SPEC.capabilities, facts) == (576, 512)
     launch = heur._split_launch(SPEC.capabilities, facts, 64, 128, 2, 1, split_kv=2)
     assert launch.ctas_per_tile == 2
+    # 128 Q rows per tile, not D512's 256: S_q=129 is two unpacked tiles, or ceil(129 / (128 // 32)) packed.
+    facts = _facts(b=1, h_q=96, h_kv=1, s_q=129, s_kv=8192, d_qk=576, d_v=512, causal=False)
+    assert heur._split_launch(SPEC.capabilities, facts, 64, 128, 2, 1).q_tiles == 2
+    assert heur._split_launch(SPEC.capabilities, facts, 64, 128, 2, 32).q_tiles == 33
