@@ -1894,7 +1894,7 @@ def test_sm107_fp8_split_standalone_pack_domain(d, pack, accepted):
     if accepted:
         assert api.check_support()
     else:
-        with pytest.raises(NotImplementedError, match="PackGQA"):
+        with pytest.raises(NotImplementedError, match="split_kv"):
             api.check_support()
 
 
@@ -2052,3 +2052,20 @@ class TestNativeD256Fp8HeadPadding:
     test_dense_rebind_replay = staticmethod(_dense)
     test_dense_masks = staticmethod(_masks)
     test_dense_half_softmax = staticmethod(_half)
+
+
+@requires_rubin
+class TestNativeD256Fp8Pack:
+    """Run native D256 packing through the selected architecture CI entry."""
+
+    from sdpa_fp8_d256_pack_sm107 import (
+        test_native_d256_pack_rebind_replay as _dense,
+        test_native_d256_pack_half_softmax as _half,
+        test_native_d256_pack_large_group_adapter as _adapter,
+        test_native_d256_pack_declines as _declines,
+    )
+
+    test_rebind_and_replay = staticmethod(_dense)
+    test_half_softmax = staticmethod(_half)
+    test_large_group_adapter = staticmethod(_adapter)
+    test_declines = staticmethod(_declines)

@@ -47,10 +47,12 @@ def _case(
     gate=None,
     sink=None,
     sdpa_kwargs=None,
+    heads=(4, 2),
+    seq_lens=None,
 ):
     dv = d if dv is None else dv
     torch.manual_seed(827)
-    hq, hk = 4, 2
+    hq, hk = heads
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.FP8_E4M3,
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -81,6 +83,13 @@ def _case(
                 tensors["off_v"], vp[off_v] = off_v, cu * hk * dv
             kwargs[("seq_len_" if arch == "sm120" else "cu_seq_len_") + name] = lens
         kwargs["use_padding_mask"] = True
+    if seq_lens is not None:
+        assert not thd
+        for name, values in zip(("seq_q", "seq_kv"), seq_lens):
+            value = torch.tensor(values, device="cuda", dtype=torch.int32).view(b, 1, 1, 1)
+            tensor = g.tensor_like(value)
+            buffers[name], tensors[name], vp[tensor] = value, tensor, value
+        kwargs.update(use_padding_mask=True, seq_len_q=tensors["seq_q"], seq_len_kv=tensors["seq_kv"])
     for name, val in (("descale_q", 0.8), ("descale_k", 0.9), ("descale_v", 0.7), ("descale_s", 1.0), ("scale_s", 1.0), ("scale_o", 1.3)):
         t = g.tensor(dim=[1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.FLOAT, name=name)
         buf = torch.full((1,), val, device="cuda", dtype=torch.float32)
