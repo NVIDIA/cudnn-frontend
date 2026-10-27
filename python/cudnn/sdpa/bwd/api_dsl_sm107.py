@@ -991,9 +991,9 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         """The family's regions of a THD plan, after the four shared ones (``[(name, shape, dtype)]`` over the PACKED token
         capacities ``tq`` / ``tkv``): the half row's per-Q-head dK / dV partials over the packed kv axis under GQA -- no staging,
         no folds.  The fp8 row overrides (its bf16 dV partials and amax scratch always, the twin's upcasts and dQ workspace)."""
-        h, d = self.h_q, _SM107_D
+        h = self.h_q
         if gqa:
-            return [("dv_part", (1, tkv, h, d), self.dtype), ("dk_part", (1, tkv, h, d), self.dtype)]
+            return [("dv_part", (1, tkv, h, self.head_dim_v), self.dtype), ("dk_part", (1, tkv, h, self.head_dim_qk), self.dtype)]
         return []
 
     def _scratch_plan(self):

@@ -109,7 +109,21 @@ def _grad_failure(name, got, ref, dt):
 
 
 def _thd_case(
-    lens_q, lens_kv, h, d, dtype, cap_q=None, cap_kv=None, poison=False, seed=7, causal=False, bottom_right=False, window_left=None, hkv=None, device="cuda"
+    lens_q,
+    lens_kv,
+    h,
+    d,
+    dtype,
+    cap_q=None,
+    cap_kv=None,
+    poison=False,
+    seed=7,
+    causal=False,
+    bottom_right=False,
+    window_left=None,
+    hkv=None,
+    device="cuda",
+    d_v=None,
 ):
     """Packed Q/K/V/dO plus the forward's O and packed LSE, per sequence in fp64 on the storage-rounded operands.
 
@@ -120,6 +134,7 @@ def _thd_case(
     buffers live: ``"cuda"`` for the kernels, ``"cpu"`` for a host-side graph probe that needs only the geometry.
     """
     dev, b = device, len(lens_q)
+    d_v = d if d_v is None else d_v
     t_q, t_kv = sum(lens_q), sum(lens_kv)
     cap_q, cap_kv = cap_q or t_q, cap_kv or t_kv
     cu_q, cu_k = [0], [0]
@@ -130,15 +145,15 @@ def _thd_case(
     hkv = h if hkv is None else hkv
     grp = h // hkv
 
-    def _pk(cap, live, nh):
-        x = torch.randn(1, cap, nh, d, generator=g).to(device=dev, dtype=dtype)
+    def _pk(cap, live, nh, dim):
+        x = torch.randn(1, cap, nh, dim, generator=g).to(device=dev, dtype=dtype)
         if poison and cap > live:
             x[0, live:] = float("nan")
         return x
 
-    q_p, do_p = _pk(cap_q, t_q, h), _pk(cap_q, t_q, h)
-    k_p, v_p = _pk(cap_kv, t_kv, hkv), _pk(cap_kv, t_kv, hkv)
-    o_p = torch.full_like(q_p, float("nan") if poison else 0.0)
+    q_p, do_p = _pk(cap_q, t_q, h, d), _pk(cap_q, t_q, h, d_v)
+    k_p, v_p = _pk(cap_kv, t_kv, hkv, d), _pk(cap_kv, t_kv, hkv, d_v)
+    o_p = torch.full_like(do_p, float("nan") if poison else 0.0)
     lse_p = torch.full((1, h, cap_q), float("nan") if poison else 0.0, device=dev, dtype=torch.float32)
     scale = 1.0 / math.sqrt(d)
     for i in range(b):
@@ -156,7 +171,7 @@ def _thd_case(
         lse_p[0, :, cu_q[i] : cu_q[i] + lens_q[i]] = torch.logsumexp(sc, dim=-1).float()
         o_p[0, cu_q[i] : cu_q[i] + lens_q[i]] = (torch.softmax(sc, dim=-1) @ vs).transpose(0, 1).to(dtype)
     return SimpleNamespace(
-        b=b, h=h, hkv=hkv, d=d, dtype=dtype, scale=scale, causal=causal, bottom_right=bottom_right, window_left=window_left,
+        b=b, h=h, hkv=hkv, d=d, d_v=d_v, dtype=dtype, scale=scale, causal=causal, bottom_right=bottom_right, window_left=window_left,
         lens_q=list(lens_q), lens_kv=list(lens_kv), cu_q=cu_q, cu_k=cu_k, t_q=t_q, t_kv=t_kv, cap_q=cap_q, cap_kv=cap_kv,
         q=q_p, k=k_p, v=v_p, do=do_p, o=o_p, lse=lse_p,
     )  # fmt: skip

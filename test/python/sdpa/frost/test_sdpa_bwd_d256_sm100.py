@@ -119,7 +119,7 @@ def test_capabilities_match_what_is_implemented():
     c = _spec().capabilities
     assert (c.sm_lo, c.sm_hi) == _SM_RANGE, "SM100 / SM103 (cc 10.0-10.6); the native Rubin row owns 107+"
     assert c.d == frozenset({128, 192, 256}) and not c.d_envelope and c.dqk_ge_dv
-    assert c.declaration_check is not None, "only D256 and dense D192x128 are qualified"
+    assert c.declaration_check is not None, "only the exact D256 and D192x128 head pairs are qualified"
     assert c.dtypes == frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})
     assert not c.is_fp8 and not c.is_mxfp8 and c.out_dtypes == frozenset()
     assert c.causal and c.bottom_right and c.swa and c.gqa

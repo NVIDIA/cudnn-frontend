@@ -563,7 +563,9 @@ def dkv_reduce_kernel(
                 wide=wide,
             )
         else:
-            v_in_range = gidx < K_VECS + V_VECS
+            # A dK vector rejected by row_limit still belongs to the dK
+            # interval. It must not become a negative-index dV vector.
+            v_in_range = (gidx >= K_VECS) & (gidx < K_VECS + V_VECS)
             if cutlass.const_expr(row_limit is not None):
                 v_in_range = v_in_range & (cutlass.Int32((((gvec - K_VECS * VEC) // D_V) // H_KV) % S_KV) < _row_limit_value(row_limit))
             if v_in_range:

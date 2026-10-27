@@ -531,11 +531,8 @@ def _validate_cfg_d256_2x2(cfg: CfgBwdD256x2) -> None:
             ),
             (
                 cfg.TILE_N == 128
-                and (
-                    (cfg.TILE_K, cfg.TILE_O) == (256, 256)
-                    or ((cfg.TILE_K, cfg.TILE_O) == (192, 128) and cfg.DATAPATH_2X2_PROFILE == PROFILE_SM100 and not cfg.THD_VARLEN)
-                ),
-                f"{f}: TILE_N = 128 q cols; native D256 or dense SM100 D192x128 required; got {cfg.TILE_N}/{cfg.TILE_K}/{cfg.TILE_O}",
+                and ((cfg.TILE_K, cfg.TILE_O) == (256, 256) or ((cfg.TILE_K, cfg.TILE_O) == (192, 128) and cfg.DATAPATH_2X2_PROFILE == PROFILE_SM100)),
+                f"{f}: TILE_N = 128 q cols; native D256 or SM100 D192x128 required; got {cfg.TILE_N}/{cfg.TILE_K}/{cfg.TILE_O}",
             ),
             (
                 cfg.CGA_M == 2 and cfg.CGA_N == 1 and cfg.CTA_MMA == 2,
@@ -725,8 +722,8 @@ def make_cfg_d256_2x2(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
     if getattr(params, "thd_varlen", False) and profile != PROFILE_SM100:
         raise ValueError(f"{_FLAVOR}: THD is implemented only on the SM100 profile")
     d_qk, d_v = getattr(params, "head_dim_qk", 256), getattr(params, "head_dim_v", 256)
-    if (d_qk, d_v) != (256, 256) and not ((d_qk, d_v) == (192, 128) and profile == PROFILE_SM100 and not getattr(params, "thd_varlen", False)):
-        raise ValueError(f"{_FLAVOR}: head geometry must be D256 or dense SM100 D192x128; got {d_qk}/{d_v}")
+    if (d_qk, d_v) != (256, 256) and not ((d_qk, d_v) == (192, 128) and profile == PROFILE_SM100):
+        raise ValueError(f"{_FLAVOR}: head geometry must be D256 or SM100 D192x128; got {d_qk}/{d_v}")
     _c._validate_params(_FLAVOR, FAMILY_F16, params, datapath_2x2=True)
     dtype_o = getattr(params, "dtype_o", -1)
     if dtype_o < 0:
