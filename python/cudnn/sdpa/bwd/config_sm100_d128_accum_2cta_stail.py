@@ -213,7 +213,7 @@ class ConfigSTail(Config):
         return tuple(self.dq_use(u)[1] for u in range(self.DQ_SLICES))  # (0, 2, 1, 3): the store warp's reduce-add issue order as SLICES
 
     def dq_slice(self, rank, index):
-        raise ValueError("the s_tail map has no dQ staging alias on ds_own + XCHG (the dedicated sDQ ring: dq_slot(slot)); dq_slice is the dp_tail map's")
+        raise ValueError("the s_tail map has no dQ staging alias on ds_own + XCHG (the dedicated sDQ ring: dq_slot(slot)); no other map has one")
 
     # --- dkv_accum = fp32_reduce (fp32_reduce; the resource plan): fp32 [M x DQ_BOX] staging slots over the dV / dK bf16 staging
     # bytes + the dS slab, two rounds per item: R1 = dV's four slices + dK's slice 0 (80 KiB) -> the store warp's drain -> dvk_stage_empty -> R2 = dK's

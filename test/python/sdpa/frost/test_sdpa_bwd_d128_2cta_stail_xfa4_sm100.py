@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """L0 tests of the pair body's alternate role shape, the typed field ``warp_roles = "16w_fa4"`` (the softmax writes the dS^T halves from its
 registers and ships the exchange; warps 8-11 are the reduce group; ds_tmem and dp_empty deleted, dq_war_done added: 33 barriers).
 
@@ -227,7 +229,7 @@ def test_xfa4_default_rendering_is_unchanged_and_16w_named_is_the_default(tmp_pa
 
 # ------------------------------------------------------------------------------------------------------------ host: the audit's section-12 punch list as SOURCE assertions
 def _stmt(ln):
-    """The statement of a code line without its trailing comment (the bodies carry `# RESOURCE-NOTE` / `# skew lever` comments inline)."""
+    """The statement of a code line without its trailing comment (the body carries `# skew lever` comments inline)."""
     return ln.strip().split("  #")[0].strip()
 
 

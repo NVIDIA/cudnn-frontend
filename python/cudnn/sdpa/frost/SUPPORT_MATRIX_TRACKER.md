@@ -406,7 +406,7 @@ the allocation contract. All scratch is initialized each execution.
 | Unmasked / top-left causal | ✅ |
 | IO layout | Compact BSHD rows; THD uses each port's ragged origins and ignores logical batch pitch |
 | Stats | Dense: contiguous FP32 natural-log LSE; THD: packed token-major or head-major with declared physical capacity |
-| Workspace / kernel launches | MHA: dense accumulation (any lengths) / 3, dense recompute (D64, left window, deterministic request, older CuTeDSL, negative scale) / 1, THD accumulation / 4. GQA/MQA: append native dK/dV partials and an FP32 group fold; dense / 4, THD / 5 |
+| Workspace / kernel launches | MHA: dense accumulation (any lengths) / 3, dense recompute (D64, left window, deterministic request, older CuTeDSL, negative scale) / 1, THD accumulation / 4. GQA/MQA: append native dK/dV partials and an FP32 group fold; dense / 4, THD / 5 (4 under `dkv_accum=fp32_reduce`: no fold launch) |
 | THD MHA | ✅ cc 10.0 or 10.3, public CuTeDSL >= 4.8, positive FP32 scale, positive declared capacities; actual empty sequences and tails supported |
 | GQA / MQA | ✅ BF16 only, cc 10.0 or 10.3, public CuTeDSL >= 4.8, positive FP32 scale, Hq > Hkv with integral ratio; dense Sq/Skv must be multiples of 128, THD accepts tails and empty actual sequences |
 | `cta_group::2` pair body (grouped THD BF16, top-left causal or unmasked, GQA / MQA), selected by the per-S heuristic | ✅ **native**, cc 10.0: served when both declared `S_q` and `S_kv` (the batch's longest sequence per side) are `>= 8192` (`d128_grouped_2cta_contract.CTA_PAIR_MIN_SEQ`) and the device admits a cluster of two (occupancy query); below the threshold, on cc 10.3 and on dense GQA the one-CTA grouped body serves. Op-level field `cta_pair`: `auto` (default, the rule) / `off` (one-CTA always) / `on` (the pair at any S; a failing predicate -- THD, cc, cluster, grouped heads -- declines by name). Same contract, workspace sizing and 5 launches as the one-CTA THD GQA chain; dQ accumulation unordered either way. Op-level field `dkv_accum` (both grouped THD bodies): `bf16_partials` (default: one bf16 partial per q head + the fp32 fold launch, a fixed summation order) / `fp32_reduce` (opt-in: fp32 accumulation across the q heads of a kv head in hardware order with one bf16 rounding at the output, four launches; a rounding change -- dK / dV are not bitwise reproducible across runs; declined by name on dense GQA, MHA and under `warp_roles="16w_fa4"`). Op-level fields `mask_form` (`fsel` default / `predicated`) and `warp_roles` (`16w` default / `16w_fa4`, an alternate role shape kept for follow-up work) select bitwise-identical dK / dV renderings of the pair body |
@@ -470,10 +470,14 @@ the device's occupancy query, and the one-CTA body otherwise; `off` pins the one
 pins the pair at any sequence length and declines by name (THD, cc, cluster, grouped heads) when
 a predicate fails. The threshold is the smallest sequence length at which the pair body won the
 in-session backward step against the one-CTA body on GB200 (cc 10.0): 8K / 16K / 32K / 64K
-uniform and the varlen ramps, every cell by more than the measurement band. **Perf table:**
-`<PR fills: the per-cell table (one-CTA step, pair step, FlashAttention-4 step, ratios, node
-class, clock, commit) and the 2K / 4K cells>`; cc 10.3 and the 2K / 4K cells are unmeasured and
-serve the one-CTA body until a row is added here. `test_sdpa_bwd_d128_cta_pair_heuristic.py`
+uniform and the varlen ramps, every cell by more than the measurement band. **Measured** (GB200
+class, cc 10.0, SM clock locked, every process under the power cap: in-process ratios
+are the figures, absolutes are lower bounds): the pair body vs the one-CTA body on the eager
+backward step +4.9 % (8K) / +7.9 % (16K) / +8.5 % (32K) / +8.8 % (64K), B 4, Hq 32, Hkv 4, causal
+THD; pair / FlashAttention-4 1.036-1.044 on the eager step and 1.019-1.032 on CUDA-graph replay of
+the whole chain; the kernel of record is the pair body's default rendering, PTX md5 4b3d0bbb (the
+test module's pin); the per-cell tables are in the PR. cc 10.3 and the 2K / 4K cells serve the
+one-CTA body (2K / 4K measured as a loss for the pair; cc 10.3 unmeasured) until a row is added here. `test_sdpa_bwd_d128_cta_pair_heuristic.py`
 pins the constants, the selection table, the declines and the launch census per selection;
 `test_sdpa_bwd_d128_2cta_stail_sm100.py` / `test_sdpa_bwd_d128_2cta_stail_xfa4_sm100.py` cover the
 pair body's numerics, degenerate rows and renderings; `test_sdpa_bwd_d128_dkv_accum_sm100.py` the

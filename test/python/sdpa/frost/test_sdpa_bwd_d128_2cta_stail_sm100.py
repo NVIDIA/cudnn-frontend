@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """L0 tests of the d128 grouped THD cta_group::2 pair body (``bprop_d128_accum_grouped_2cta_stail_f16``: the dQ half-row image in S^T's dead
 tail, FAv4's rotated leader order, the dedicated sDQ ring, 35 barriers).
 
