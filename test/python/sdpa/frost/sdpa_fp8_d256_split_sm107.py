@@ -60,6 +60,8 @@ def test_native_d256_split_nomask_optional(pack, dtype, stats, amax, monkeypatch
     selected = g.plans[g._plan_index]
     g.create_execution_plan(selected.engine_id, replace(selected.knobs, pack_gqa=pack, split_kv=9, sched_policy=int(pack), cga=1))
     g.select_plan(len(g.plans) - 1)
+    knobs = g.plans[g._plan_index].knobs
+    assert knobs.split_kv == 9 and knobs.pack_gqa == pack, knobs
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(1, g.get_workspace_size()), dtype=torch.uint8, device="cuda")
