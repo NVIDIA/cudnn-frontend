@@ -30,14 +30,17 @@ def l2_swizzle_tile(raw_m, raw_n, nt_m, nt_n, swizzle_w, identity=False):
     """
     if cutlass.const_expr(identity):
         return raw_m, raw_n
-    t = raw_n * nt_m + raw_m
-    blk = nt_m * swizzle_w
-    sb = t // blk
-    off = t - sb * blk
-    base_n = sb * swizzle_w
-    cur_S = cutlass.min(cutlass.Int32(swizzle_w), nt_n - base_n)
-    log_m = off // cur_S
-    log_n = base_n + off - log_m * cur_S
+    log_m = raw_m
+    log_n = raw_n
+    if swizzle_w != 1:
+        t = raw_n * nt_m + raw_m
+        blk = nt_m * swizzle_w
+        sb = t // blk
+        off = t - sb * blk
+        base_n = sb * swizzle_w
+        cur_S = cutlass.min(cutlass.Int32(swizzle_w), nt_n - base_n)
+        log_m = off // cur_S
+        log_n = base_n + off - log_m * cur_S
     return log_m, log_n
 
 
