@@ -188,6 +188,29 @@ def test_paged_d512_decode_trails_until_its_decode_tile():
 
 
 @pytest.mark.L0
+def test_paged_d576_mla_decode_leads_past_its_work_floor():
+    """Paged bf16 D576x512 MLA decode leads at s_q == 1 once h_q * b * S_kv reaches the measured floor; below it, over
+    dense K/V or in f16 (unmeasured) the backend keeps its decode engine; multi-token decode keeps the decode-shaped LEAD."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == _SM100)
+    mla = dict(d_qk=576, d_v=512, h_kv=1, has_paged_kv=True, padded=True, page_size=64, causal=False, bottom_right=False)
+    for h_q in (16, 32, 64, 128):
+        for b in (1, 8, 32, 128):
+            for s_kv in (2048, 8192, 32768, 131072):
+                want = placement.LEAD if h_q * b * s_kv >= placement.SQ1_D576_MIN_WORK else placement.TRAIL
+                assert placement.place(spec, _facts(s_q=1, h_q=h_q, b=b, s_kv=s_kv, **mla)) == want, (h_q, b, s_kv)
+    lead = dict(h_q=64, b=64, s_kv=8192)
+    assert placement.place(spec, _facts(s_q=1, **lead, **mla)) == placement.LEAD
+    assert placement.place(spec, _facts(s_q=1, **lead, **{**mla, "has_paged_kv": False, "page_size": 0})) == placement.TRAIL
+    assert placement.place(spec, _facts(s_q=1, dtype=cudnn.data_type.HALF, **lead, **mla)) == placement.TRAIL
+    assert placement.place(spec, _facts(s_q=1, window_left=128, **lead, **mla)) == placement.TRAIL
+    assert placement.place(spec, _facts(s_q=1, has_sink=True, **lead, **mla)) == placement.TRAIL
+    assert placement.place(spec, _facts(s_q=1, h_q=16, b=1, s_kv=32768, **mla)) == placement.TRAIL  # 2**19
+    assert placement.place(spec, _facts(s_q=4, h_q=16, b=1, s_kv=2048, **mla)) == placement.LEAD
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "outside",
     [
