@@ -3390,15 +3390,28 @@ def test_fp8_bwd_d256_admitted_by_the_cpp_node_on_rubin(monkeypatch, d, sm_versi
 
 @pytest.mark.parametrize(
     "shape,thd,admitted",
-    [((576, 512), False, True), ((576, 512), True, False), ((568, 512), False, False), ((576, 504), False, False), ((384, 256), True, True)],
+    [((576, 512), False, True), ((576, 512), True, True), ((568, 512), False, False), ((576, 504), False, False), ((384, 256), True, True)],
 )
-def test_native_d576_admission_preserves_old_thd_envelope(shape, thd, admitted):
+def test_native_d576_admission_preserves_other_head_envelopes(shape, thd, admitted):
     from dataclasses import replace
 
     facts = replace(_facts(_mk_eligible_graph()), d_qk=shape[0], d_v=shape[1], thd=thd)
     spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
     reason = engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=2, pack_gqa=False))
     assert (reason is None) == admitted, reason
+
+
+def test_native_d576_thd_requires_matching_native_extension(monkeypatch):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    facts = replace(_facts(_mk_eligible_graph()), d_qk=576, d_v=512, thd=True)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    knobs = engines.SdpaFwdKnobs(cga=2, pack_gqa=False)
+    assert engines.mismatch(caps, facts, knobs) is None
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", SimpleNamespace(supports_physical_origins=True))
+    reason = engines.mismatch(caps, facts, knobs)
+    assert "native D576x512 THD requires the matching" in reason
 
 
 @pytest.mark.parametrize("shape,admitted", [((576, 512), True), ((512, 512), False)])

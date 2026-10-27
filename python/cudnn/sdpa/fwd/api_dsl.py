@@ -2555,10 +2555,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 not self._can_prepare_dense_layout(),
                 "native D576x512 requires Q/K/V/O layouts that bind without a copy",
             )
-        self._not_implemented_error_if(
-            self.thd and self.flavor == SM100_NATIVE_D576_SHAPE,
-            "native D576x512 requires dense Q; THD origins are not wired",
-        )
+        if self.thd and self.flavor == SM100_NATIVE_D576_SHAPE:
+            self._not_implemented_error_if(
+                not getattr(_pybind_module._SdpaThdBinder, "supports_native_d576", False),
+                "native D576x512 THD requires the matching cuDNN Frontend native extension",
+            )
+            # Even compact standalone THD uses sequence-local maps. Graph lowering
+            # replaces these absent offsets with the caller's per-port declarations.
+            self._thd_origin_specs = (None,) * 5
         self._not_implemented_error_if(
             self.pack_gqa and self._fp8 and not self._pertensor and self.flavor != (128, 128),
             "PackGQA on MXFP8 is wired in the d128 flavor only (the per-CTA SF_Q gather of sm100/prefill_d128_mxfp8.py)",

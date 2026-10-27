@@ -20,8 +20,11 @@ three 192-column K chunks. FP16/BF16, partial PackGQA (largest divisor of the
 head ratio dividing 64), split-KV with FP32 partials, padding, supported bands,
 sinks and optional/base-2 Stats use the existing prepared API. Paged K/V retain
 independent tables, strides and HND/NHD pool layouts, including V as the leading
-512 channels of a 576-wide record. THD, other head dimensions, quantized inputs
-and SM107 do not inherit this flavor. This adds eligibility; no heuristic
+512 channels of a 576-wide record. Unsplit THD also uses the native body,
+with packed or unpacked GQA, sequence-local Q/K/V/O maps and independent
+physical Q/K/V/O/Stats offsets. Paged THD retains independent K/V tables and
+pool layouts. THD split, other head dimensions, quantized inputs and SM107
+do not inherit this flavor. This adds eligibility; no heuristic
 ordering or performance claim is implied.
 
 What the shipped FROST SDPA engines actually serve, one table per architecture.

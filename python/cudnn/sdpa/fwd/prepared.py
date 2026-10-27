@@ -462,6 +462,10 @@ def execute_native_thd_tensors(spec, buffers, workspace_ptr, stream, scale, *, l
     from cudnn import _pybind_module
 
     roles = _NATIVE_THD_ROLES + _native_quant_roles(getattr(spec, "quant", None))
+    if getattr(spec, "origin_specs", None) is not None:
+        from .thd_origins import ROLES
+
+        roles += ROLES
     buffers = tuple(buffers) + (None,) * (len(roles) - len(buffers))
     gate_index = -1
     if gate is not None:
