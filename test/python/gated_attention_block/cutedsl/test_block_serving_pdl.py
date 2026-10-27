@@ -148,12 +148,13 @@ def test_auto_and_the_explicit_switch_answer_for_one_domain_on_the_measured_part
     the knob answer for one domain.  Pools declared in the activation dtype (``kv_cache_dtype=torch.bfloat16``, the ``None`` spelling)
     take the default and the explicit True alike -- a serving stack that spells the dtype can form its own A/B --, a 16-bit pool of the
     other width hears the attribute's own ``ValueError``, not the switch's decline.  On every pipeline the default excludes -- the EXTEND
-    form, ``kv_source="self"``, a QuantSpec pipeline, a QsaSpec geometry (with and without the indexer band; the decode indexer over the
-    pools on both readings of ``fuse_prepare``), the e4m3 cache -- AUTO
+    form, ``kv_source="self"``, a QuantSpec pipeline, a QsaSpec geometry under the in-block indexer (the decode indexer over the pools on
+    both readings of ``fuse_prepare``), the e4m3 cache -- AUTO
     reads False with no stage switched; the explicit True is served per stage on the two bf16 forms without a decode route (their
-    prefill tiles carry no sites), SERVED on the block-sparse decode mode (the sparse core and its combine carry the sites; its own AUTO
-    tuple is empty until measured) and is the typed decline on the QuantSpec pipeline, the e4m3 cache, the sparse core's packed form and the
-    in-block indexer (its kernels would take the switch unmeasured)."""
+    prefill tiles carry no sites), SERVED on the block-sparse decode mode (the sparse core and its combine carry the sites) -- where AUTO
+    resolves True too on the caller-list block, with and without the indexer band, since the measured part entered
+    ``SPARSE_DECODE_PDL_DEFAULT_CCS`` (2026-10-27) -- and is the typed decline on the QuantSpec pipeline, the e4m3 cache, the sparse core's
+    packed form and the in-block indexer (its kernels would take the switch unmeasured)."""
     import test_block_qsa_decode as _qsa
     import test_block_qsa_fp8_kv as _qkv
     import test_block_serving_extend as _ext
@@ -206,19 +207,23 @@ def test_auto_and_the_explicit_switch_answer_for_one_domain_on_the_measured_part
     assert off(GatedAttentionBlockFwd(*qargs, quant=spec))
     with pytest.raises(NotImplementedError, match=decline):
         GatedAttentionBlockFwd(*qargs, quant=spec, use_pdl=True)
-    # the block-sparse decode mode: a QsaSpec geometry (with and without the indexer band) -- AUTO False (the sparse chain's own measured-parts
-    # tuple is EMPTY until the switched chain is measured), the explicit True SERVED: the sparse core and its split combine carry the sites,
-    # so the sparse stage takes the switch beside the chain's other switched stages (the inversion of the former decline pin)
-    assert _api.SPARSE_DECODE_PDL_DEFAULT_CCS == ()
+    # the block-sparse decode mode: a QsaSpec geometry under CALLER lists (with and without the indexer band) -- AUTO True on the measured
+    # part (the sparse chain's own measured-parts tuple holds cc 10.7 since 2026-10-27: the switched block measured bitwise the plain one and
+    # never slower over B 1 / 4 / 32), the explicit True SERVED the same way: the sparse core and its split combine carry the sites, so the
+    # sparse stage takes the switch beside the chain's other switched stages; the explicit False pins the plain chain on the measured part
+    assert _api.SPARSE_DECODE_PDL_DEFAULT_CCS == ((10, 7),)
     sparse = _qsa._declare(_qsa.GEOM_SMALL, 2, 1, n_pages=4)[0]
-    assert off(sparse) and sparse.decode_route is None and sparse.sparse_decode
+    assert sparse.use_pdl is True and sparse.use_pdl_requested is None and sparse._sdpa.use_pdl is True and sparse.decode_route is None and sparse.sparse_decode
+    assert "sdpa_sparse" in sparse.pdl_stages and sparse.use_pdl_effective is True
     sparse_on = _qsa._declare(_qsa.GEOM_SMALL, 2, 1, n_pages=4, use_pdl=True)[0]
     assert sparse_on.use_pdl is True and sparse_on.use_pdl_requested is True and sparse_on._sdpa.use_pdl is True and sparse_on.sparse_decode
-    assert "sdpa_sparse" in sparse_on.pdl_stages and sparse_on.use_pdl_effective is True
+    assert "sdpa_sparse" in sparse_on.pdl_stages and sparse_on.use_pdl_effective is True and sparse_on.pdl_stages == sparse.pdl_stages
     assert sparse_on.pdl_stages == tuple(st.name for st in sparse_on._stages if getattr(st, "use_pdl", False))
-    assert _qsa._declare(_qsa.GEOM_SMALL, 2, 1, n_pages=4, use_pdl=False)[0].pdl_stages == ()
+    sparse_off = _qsa._declare(_qsa.GEOM_SMALL, 2, 1, n_pages=4, use_pdl=False)[0]
+    assert sparse_off.use_pdl is False and sparse_off.use_pdl_requested is False and sparse_off.pdl_stages == () and sparse_off._sdpa.use_pdl is False
     band = _qsa._declare(_qsa.GEOM_SMALL, 4, 1, n_pages=6, index_band=True, fuse_norm_rope=False)[0]
-    assert off(band) and band.geom.index_band
+    assert band.use_pdl is True and band.use_pdl_requested is None and band.geom.index_band, "AUTO True with the indexer band under caller lists"
+    assert "sdpa_sparse" in band.pdl_stages and "cache_write" in band.pdl_stages and band.use_pdl_effective is True
     # the in-block indexer's DECODE step over the pools (2026-10-21): AUTO False on both readings of fuse_prepare (its stage threads the
     # switch it is handed -- `pdl_names` spells the kernels that would take it -- and is handed False), the explicit True the same decline
     for fused in (False, True):
