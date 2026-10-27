@@ -3,6 +3,7 @@
 
 
 from cutlass.experimental import primitives as nvvm
+from cutlass._mlir.dialects import arith
 import cutlass
 import cutlass.cute as cute
 
@@ -388,6 +389,25 @@ def cp_async_commit():
 @cute.jit
 def cp_async_wait(num_remaining: cutlass.Constexpr[int] = 0):
     nvvm.cp_async_wait_group(num_remaining)
+
+
+@cute.jit
+def cp_async_gather_row16(smem_dst, gmem_src, live):
+    """ONE 16-byte ``cp.async.cg.shared.global`` of a GATHERED row chunk with a per-copy ZERO-FILL predicate.
+
+    ``live`` (a ``cutlass.Boolean``) selects ``src-size = 16`` (the 16 bytes at ``gmem_src`` land in ``smem_dst``) or ``src-size = 0``
+    (nothing is read; the 16 destination bytes are ZERO-FILLED -- PTX fills the bytes past ``src-size`` with zeros).  ``gmem_src`` must
+    be a VALID address on either arm (a dead row passes the operand's base pointer), ``smem_dst`` the 16-B-aligned destination (an
+    ``Array`` subview or a ``Pointer``).  The copy joins the calling thread's CURRENT ``cp.async`` group: the caller commits
+    (:func:`cp_async_commit`) and waits (:func:`cp_async_wait`) -- every lane commits, a lane with nothing live included (an empty
+    group completes at once), so a group ledger stays uniform across the CTA.
+
+    Why a helper and not :func:`load_tile_2d`: that loader's ``valid_rows`` / ``valid_cols`` predicate is a DENSE tile's bounds (row
+    index below a count); an index-list gather decides per ROW whether the row exists (a -1 block id, a block past the sequence's
+    length, a dead item, a -1 page) -- a different predicate with the same zero-fill mechanics.  The SM107 lean block-sparse decode
+    tile (``sm107/sparse_lean_d256_f16.py``) is its first caller (K + V, dense and paged pools, one spelling)."""
+    size = cutlass.Int32(arith.select(live.ir_value(), cutlass.Int32(16).ir_value(), cutlass.Int32(0).ir_value()))
+    nvvm.cp_async_shared_global(smem_dst, gmem_src, 16, nvvm.LoadCacheModifier.CG, cp_size=size)
 
 
 @cute.jit
