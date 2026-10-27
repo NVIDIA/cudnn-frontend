@@ -34,6 +34,13 @@ def _require_exact_sm100():
         pytest.skip("this hardware-validation case requires an SM100 (10, 0) GPU")
 
 
+def _require_indexer_backward_v2_gpu():
+    """Skip unless the v2 backend supports the current GPU capability."""
+    supported_capabilities = ((10, 0), (10, 3))
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in supported_capabilities:
+        pytest.skip(f"IndexerBackward v2 requires capability in {supported_capabilities}")
+
+
 def _allocate(cfg, sm_scale: float):
     b = cfg["b"]
     s_q = cfg["s_q"]
@@ -1737,6 +1744,20 @@ def test_DSA_indexer_backward_v2_accepts_sm103_capability(monkeypatch):
     assert plan.check_support()
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("capability,supported", [((10, 0), True), ((10, 3), True), ((10, 7), False)])
+def test_indexer_backward_v2_test_guard_matches_backend_capabilities(monkeypatch, capability, supported):
+    """The H32 runtime tests skip major-10 GPUs outside the v2 support set."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+
+    if supported:
+        _require_indexer_backward_v2_gpu()
+    else:
+        with pytest.raises(pytest.skip.Exception):
+            _require_indexer_backward_v2_gpu()
+
+
 @torch_fork_set_rng(seed=1710)
 @pytest.mark.parametrize(
     "topk,b,topk_indices_global,dw_dtype,dk_dtype",
@@ -1754,11 +1775,13 @@ def test_DSA_indexer_backward_wrapper_v2_native_h32(topk, b, topk_indices_global
     receives an internal-tile-equivalent 2176-slot tensor whose tail is invalid
     and zero.  The native plan uses no ticket-counter workspace with FP32 dK.
     """
-    _require_sm100()
+    _require_indexer_backward_v2_gpu()
+    DSA = None
     try:
         from cudnn import DSA
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    assert DSA is not None
 
     padded_topk = ((topk + 127) // 128) * 128
     cfg = dict(b=b, s_q=16, s_kv=2176, head_dim=128, qhead_per_kv_head=32, topk=topk)
@@ -1847,11 +1870,13 @@ def test_DSA_indexer_backward_wrapper_v2_native_h32(topk, b, topk_indices_global
 @torch_fork_set_rng(seed=1712)
 def test_DSA_indexer_backward_wrapper_v2_native_h32_deterministic():
     """The public deterministic H32 policy is bitwise stable and accurate."""
-    _require_sm100()
+    _require_indexer_backward_v2_gpu()
+    DSA = None
     try:
         from cudnn import DSA
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    assert DSA is not None
 
     cfg = dict(b=1, s_q=3, s_kv=128, head_dim=128, qhead_per_kv_head=32, topk=128)
     index_q, weights, index_k, attn_source, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)

@@ -1027,6 +1027,9 @@ class IndexerBackwardV2Sm100:
             rdW = cute.make_rmem_tensor((self.num_heads,), Float32)
             # A row buffers, chunked (8, 8) for 16B vector STS
             rAhi = cute.make_rmem_tensor((8, self.num_heads // 8), BFloat16)
+            # Keep the compile-time-disabled one-term path initialized without
+            # allocating another fragment or increasing its register pressure.
+            rAlo = rAhi
             if const_expr(self.use_two_term):
                 rAlo = cute.make_rmem_tensor((8, self.num_heads // 8), BFloat16)
 
@@ -1471,7 +1474,7 @@ class IndexerBackwardV2Sm100:
                     bulk_mst = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.meta_stage)
                 bulk_tst = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.ring_depth)
                 bulk_vcnt = Int32(0)
-                for bulk_k in cutlass.range(n_slots, unroll=1):
+                for _ in cutlass.range(n_slots, unroll=1):
                     if const_expr(self.static_rows):
                         bulk_ticket_row = Int32(cute.arch.block_idx()[0])
                     else:
@@ -1575,7 +1578,7 @@ class IndexerBackwardV2Sm100:
             pk_tst = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.ring_depth)
             pk_vcnt = Int32(0)
             atomic_n_slots = 0 if self.use_bulk_dk else n_slots
-            for pk_k in cutlass.range(atomic_n_slots, unroll=1):
+            for _ in cutlass.range(atomic_n_slots, unroll=1):
                 # identical ticket sequence in every warpgroup; the row value
                 # feeds only the local-id batch offset (sIdx carries the
                 # scatter targets) plus skip/parity bookkeeping; warp-elected
