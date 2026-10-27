@@ -76,7 +76,7 @@ def _reference(q, k, v, sink, causal):
     ids=["packed-tail", "partial-pack-rescale-sink", "unpacked-rectangular", "mha-sink", "legacy-fp16", "legacy-unmasked", "envelope224"],
 )
 @torch_fork_set_rng(seed=987)
-def test_half_fused_correction_rebind_and_capture(b, sq, sk, hq, hkv, pack, sink_enabled, dtype, causal, sched, d, monkeypatch):
+def test_half_fused_correction_rebind_and_capture(b, sq, sk, hq, hkv, pack, sink_enabled, dtype, causal, sched, d, monkeypatch, cudnn_handle):
     import cudnn
     from cudnn.engines.manifest import MANIFEST
     from cudnn.sdpa.fwd import api_dsl
@@ -107,40 +107,43 @@ def test_half_fused_correction_rebind_and_capture(b, sq, sk, hq, hkv, pack, sink
         return q, k, v, o, stats, sink
 
     initial = tensors()
-    handle = cudnn.create_handle()
-    io = cudnn.data_type.BFLOAT16 if dtype == torch.bfloat16 else cudnn.data_type.HALF
-    graph = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, handle=handle)
-    qd, kd, vd = (graph.tensor_like(t) for t in initial[:3])
-    sinkd = graph.tensor_like(initial[5]) if sink_enabled else None
-    extra = dict(sink_token=sinkd) if sink_enabled else {}
-    od, sd = graph.sdpa(q=qd, k=kd, v=vd, generate_stats=True, attn_scale=1 / 16, use_causal_mask=causal, **extra)
-    od.set_output(True).set_dim(initial[3].shape).set_stride(initial[3].stride())
-    sd.set_output(True).set_dim(initial[4].shape).set_stride(initial[4].stride()).set_data_type(cudnn.data_type.FLOAT)
-    graph.validate()
-    graph.build_operation_graph()
-    engine = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()["sdpa_fwd_prefill_sm100"]
-    knobs = {getattr(cudnn.knob_type, k): v for k, v in dict(TILE_M=128, TILE_N=128, TILE_CGA_M=2, PACK_GQA=int(pack), SCHED_POLICY=sched, SPLIT_KV=1).items()}
-    graph.create_execution_plan(engine, knobs)
-    graph.select_plan(graph.get_execution_plan_count() - 1)
-    graph.check_support()
-    graph.build_plans()
-    assert loaded, "the explicit plan did not compile the native half D256 body"
-    assert bool(loaded[-1].CFG.HALF_FUSED_CORR_SPLIT_P) == (dtype == torch.bfloat16 and causal)
-    workspace = torch.empty(max(1, graph.get_workspace_size()), device="cuda", dtype=torch.uint8)
-
-    def execute(t):
-        vp = dict(zip((qd, kd, vd, od, sd), t[:5]))
-        if sink_enabled:
-            vp[sinkd] = t[5]
-        cudnn.set_stream(handle, torch.cuda.current_stream().cuda_stream)
-        graph.execute(vp, workspace, handle=handle)
-
-    def verify(t):
-        expected, stats = _reference(*t[:3], t[5], causal)
-        torch.testing.assert_close(t[3].double(), expected, atol=3e-3, rtol=2e-2)
-        torch.testing.assert_close(t[4].double(), stats, atol=6e-4, rtol=0)
-
+    handle = cudnn_handle
+    saved_stream = cudnn.get_stream(handle)
     try:
+        io = cudnn.data_type.BFLOAT16 if dtype == torch.bfloat16 else cudnn.data_type.HALF
+        graph = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, handle=handle)
+        qd, kd, vd = (graph.tensor_like(t) for t in initial[:3])
+        sinkd = graph.tensor_like(initial[5]) if sink_enabled else None
+        extra = dict(sink_token=sinkd) if sink_enabled else {}
+        od, sd = graph.sdpa(q=qd, k=kd, v=vd, generate_stats=True, attn_scale=1 / 16, use_causal_mask=causal, **extra)
+        od.set_output(True).set_dim(initial[3].shape).set_stride(initial[3].stride())
+        sd.set_output(True).set_dim(initial[4].shape).set_stride(initial[4].stride()).set_data_type(cudnn.data_type.FLOAT)
+        graph.validate()
+        graph.build_operation_graph()
+        engine = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()["sdpa_fwd_prefill_sm100"]
+        knobs = {
+            getattr(cudnn.knob_type, k): v for k, v in dict(TILE_M=128, TILE_N=128, TILE_CGA_M=2, PACK_GQA=int(pack), SCHED_POLICY=sched, SPLIT_KV=1).items()
+        }
+        graph.create_execution_plan(engine, knobs)
+        graph.select_plan(graph.get_execution_plan_count() - 1)
+        graph.check_support()
+        graph.build_plans()
+        assert loaded, "the explicit plan did not compile the native half D256 body"
+        assert bool(loaded[-1].CFG.HALF_FUSED_CORR_SPLIT_P) == (dtype == torch.bfloat16 and causal)
+        workspace = torch.empty(max(1, graph.get_workspace_size()), device="cuda", dtype=torch.uint8)
+
+        def execute(t):
+            vp = dict(zip((qd, kd, vd, od, sd), t[:5]))
+            if sink_enabled:
+                vp[sinkd] = t[5]
+            cudnn.set_stream(handle, torch.cuda.current_stream().cuda_stream)
+            graph.execute(vp, workspace, handle=handle)
+
+        def verify(t):
+            expected, stats = _reference(*t[:3], t[5], causal)
+            torch.testing.assert_close(t[3].double(), expected, atol=3e-3, rtol=2e-2)
+            torch.testing.assert_close(t[4].double(), stats, atol=6e-4, rtol=0)
+
         for t in (initial, tensors()):  # New allocations through the SAME plan.
             t[3].fill_(float("nan"))
             t[4].fill_(float("nan"))
@@ -161,8 +164,10 @@ def test_half_fused_correction_rebind_and_capture(b, sq, sk, hq, hkv, pack, sink
             finally:
                 capture.reset()
     finally:
-        torch.cuda.synchronize()
-        cudnn.destroy_handle(handle)
+        try:
+            torch.cuda.synchronize()
+        finally:
+            cudnn.set_stream(handle, saved_stream)
 
 
 @pytest.mark.L0
