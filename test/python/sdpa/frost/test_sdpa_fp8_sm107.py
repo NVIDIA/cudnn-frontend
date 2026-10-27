@@ -830,11 +830,12 @@ def test_sm107_split_is_wired_only_for_supported_flavors():
     cfg.make_cfg_d128(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
     cfg.make_cfg_d192(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
 
-    # D512 per-tensor and block-scaled Rubin cells still refuse split.
+    cfg.make_cfg_d512(tp(dtype_qkv=_E4M3, dtype_o=_BF16_OUT))
+
+    # Block-scaled Rubin cells still refuse split.
     unwired = [
         ("d128 mxfp8", cfg.make_cfg_d128_mxfp8, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
         ("d256 mxfp8", cfg.make_cfg_d256_mxfp8, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
-        ("d512", cfg.make_cfg_d512, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
     ]
     for name, make, params in unwired:
         with pytest.raises(ValueError, match="split_kv > 1 is not wired"):
@@ -1841,7 +1842,7 @@ class TestMixedStagedFp8:
     test_mixed_layout = staticmethod(_mixed_layout)
 
 
-@pytest.mark.parametrize("d", [128, 192])
+@pytest.mark.parametrize("d", [128, 192, 512])
 def test_sm107_fp8_direct_split_keeps_partial_stats_natural(d, monkeypatch):
     """Bypass adapter flag normalization and check the template/combiner log-base contract."""
     import math
@@ -1850,7 +1851,7 @@ def test_sm107_fp8_direct_split_keeps_partial_stats_natural(d, monkeypatch):
 
     if torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("SM107 required")
-    b, h, sq, sk, dv, splits = 1, 2, 16, 512, 128, 4
+    b, h, sq, sk, dv, splits = 1, 2, 16, 512, (512 if d == 512 else 128), 4
     q = torch.full((b, sq, h, d), 0.5, device="cuda", dtype=torch.float8_e4m3fn).transpose(1, 2)
     chunks = torch.arange(sk, device="cuda") // 128 + 1
     k = (chunks.view(1, sk, 1, 1) * 0.5).expand(b, sk, 1, d).to(q.dtype).contiguous().transpose(1, 2)
@@ -1877,14 +1878,16 @@ def test_sm107_fp8_direct_split_keeps_partial_stats_natural(d, monkeypatch):
     torch.testing.assert_close(lse.double(), scores.logsumexp(-1) * math.log2(math.e), atol=2e-4, rtol=2e-5)
 
 
-@pytest.mark.parametrize("d,pack,accepted", [(128, True, True), (192, False, True), (192, True, True), (256, True, True)])
+@pytest.mark.parametrize(
+    "d,pack,accepted", [(128, True, True), (192, False, True), (192, True, True), (256, True, True), (512, True, True), (512, False, True)]
+)
 def test_sm107_fp8_split_standalone_pack_domain(d, pack, accepted):
-    """D192 and D256 native per-tensor FP8 packed splits share adapter admission."""
+    """Native per-tensor FP8 packed splits share adapter admission."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     if torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("SM107 required")
-    dv = 256 if d == 256 else 128
+    dv = d if d >= 256 else 128
     q, k, v = [
         torch.empty((1, s, h, width), device="cuda", dtype=torch.float8_e4m3fn).transpose(1, 2) for s, h, width in ((16, 4, d), (512, 1, d), (512, 1, dv))
     ]
@@ -2106,3 +2109,24 @@ class TestNativeD512Fp8Pack:
     test_half_adapter = staticmethod(_half)
     test_unpacked_lpt = staticmethod(_lpt)
     test_declines = staticmethod(_declines)
+
+
+@requires_rubin
+class TestNativeD512Fp8Split:
+    """Native split partials and the shared final combine preserve one contract."""
+
+    from sdpa_fp8_d512_split_sm107 import (
+        test_native_d512_split_rebind_replay as _replay,
+        test_native_d512_split_half_adapter as _adapter,
+        test_native_d512_split_nomask_optional as _optional,
+        test_native_d512_split_omitted_scales as _scales,
+        test_native_d512_split_scalar_kv_tail as _tail,
+    )
+
+    test_rebind_and_replay = staticmethod(_replay)
+    test_half_adapter = staticmethod(_adapter)
+
+    test_nomask_optional = staticmethod(_optional)
+    test_omitted_scales = staticmethod(_scales)
+
+    test_scalar_kv_tail = staticmethod(_tail)

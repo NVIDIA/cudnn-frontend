@@ -296,14 +296,14 @@ _O_BLOCK_SCALE_BY_DTYPE = {_DTYPE_O_NVFP4: 16, _DTYPE_O_MXFP8: 32}
 # failed across the per-tensor FP8 THD suite.
 SM107_FP8_THD_SHAPES = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
 # Bodies with FP32 partial stores: shared by factory, admission and prepared workspace.
-SM107_FP8_SPLIT_SHAPES = frozenset({(64, 64), (128, 128), (192, 128), (256, 256)})
+SM107_FP8_SPLIT_SHAPES = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
 # Packing and splitting are separate domains; both graph and adapter read this one.
 SM107_FP8_PACK_GQA_SHAPES = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
 
 
-def supports_fp8_d256_padded_split(d_shape, *, device_cc, pertensor, thd, paged):
-    """Native dense D256 FP8 partials honor runtime Q/KV lengths and tails."""
-    return device_cc == (10, 7) and pertensor and d_shape == (256, 256) and not thd and not paged
+def supports_fp8_padded_split(d_shape, *, device_cc, pertensor, thd, paged):
+    """Native dense D256/D512 FP8 partials honor runtime Q/KV lengths and tails."""
+    return device_cc == (10, 7) and pertensor and d_shape in ((256, 256), (512, 512)) and not thd and not paged
 
 
 # f16/bf16 flavor names whose kernel body HAS been ported to the FROST
@@ -2679,7 +2679,10 @@ _D512_READ_TILE_ARRIVERS = (
 
 
 def _make_cfg_d512_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
-    _validate_params(flavor, params)
+    split_wired = not mxfp8 and params.dtype_qkv in (_DTYPE_E4M3, _DTYPE_E5M2)
+    _validate_params(flavor, params, split_wired=split_wired)
+    if (params.split_kv or 1) > 1 and params.thd_varlen:
+        raise ValueError(f"{flavor}: per-tensor FP8 split-KV is dense-only")
     if not mxfp8 and params.dtype_qkv in (_DTYPE_E4M3, _DTYPE_E5M2):
         if params.sched_policy not in (None, SCHED_NATURAL, SCHED_LPT):
             raise ValueError(f"{flavor}: per-tensor FP8 supports NATURAL/LPT schedulers only")

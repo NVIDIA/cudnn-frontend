@@ -38,7 +38,7 @@ def _clone_with_slack(value, fill):
     return clone
 
 
-def _split_reference(q, k, v, *, split, pack, **kwargs):
+def _split_reference(q, k, v, *, split, pack, q_tile_rows=128, **kwargs):
     """FP64 blocked reference with FP8 P rounded at each split's own maximum.
 
     Partition logical score columns with a PyTorch bias mask; do not call the
@@ -53,7 +53,7 @@ def _split_reference(q, k, v, *, split, pack, **kwargs):
     skv = k.shape[1]
     qlens, klens = kwargs["padding"] or (torch.full((b,), sq, device=q.device), torch.full((b,), skv, device=q.device))
     rows = torch.arange(sq, device=q.device).view(1, sq)
-    tile_q = 128 // (heads // k.shape[2] if pack else 1)
+    tile_q = q_tile_rows // (heads // k.shape[2] if pack else 1)
     first_q = rows // tile_q * tile_q
     diagonal = (klens - qlens).view(b, 1) if kwargs["diag_align"] == cudnn.diagonal_alignment.BOTTOM_RIGHT else 0
     first_key = torch.zeros((b, sq), device=q.device, dtype=torch.int64)
@@ -126,7 +126,9 @@ def _check_half_fp8_o(output, reference, output_dtype, input_key, bound):
     assert torch.all(error <= bound + atol), f"HALF P-bound exceeded: max excess={(error - bound).max().item():.6f} > {atol} ({input_key})"
 
 
-def _check(bufs, *, page=0, causal=False, bottom_right=False, window=None, split=1, pack=False, stats_log2=False, output_check=None, softmax_f16=False):
+def _check(
+    bufs, *, page=0, causal=False, bottom_right=False, window=None, split=1, pack=False, stats_log2=False, output_check=None, softmax_f16=False, q_tile_rows=128
+):
     import test_sdpa_fwd_paged_sm100 as paged
 
     q, k, v = (bufs[n] for n in ("q", "k", "v"))
@@ -158,6 +160,7 @@ def _check(bufs, *, page=0, causal=False, bottom_right=False, window=None, split
         torch_itype=q.dtype,
         split=split,
         pack=pack,
+        q_tile_rows=q_tile_rows,
         torch_otype=torch.float16,
         padding=padding,
         left_bound=window,
