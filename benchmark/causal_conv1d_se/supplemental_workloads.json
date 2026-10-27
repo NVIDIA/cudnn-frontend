@@ -1,0 +1,407 @@
+{
+  "cases": [
+    {
+      "family": "ncw",
+      "dtype": "bfloat16",
+      "shape": [
+        2,
+        768,
+        4096
+      ],
+      "width": 4,
+      "silu": true,
+      "directions": [
+        "forward"
+      ]
+    },
+    {
+      "family": "ncw",
+      "dtype": "bfloat16",
+      "shape": [
+        2,
+        768,
+        256
+      ],
+      "width": 16,
+      "silu": false,
+      "directions": [
+        "forward"
+      ]
+    },
+    {
+      "family": "ncw",
+      "dtype": "bfloat16",
+      "shape": [
+        2,
+        768,
+        256
+      ],
+      "width": 32,
+      "silu": false,
+      "directions": [
+        "forward"
+      ]
+    },
+    {
+      "family": "ncw",
+      "dtype": "bfloat16",
+      "shape": [
+        2,
+        768,
+        256
+      ],
+      "width": 64,
+      "silu": false,
+      "directions": [
+        "forward"
+      ]
+    },
+    {
+      "family": "ncw",
+      "dtype": "bfloat16",
+      "shape": [
+        2,
+        768,
+        256
+      ],
+      "width": 128,
+      "silu": false,
+      "directions": [
+        "forward"
+      ]
+    },
+    {
+      "family": "nwc",
+      "dtype": "bfloat16",
+      "shape": [
+        64,
+        768,
+        256
+      ],
+      "width": 7,
+      "silu": false,
+      "directions": [
+        "forward"
+      ]
+    },
+    {
+      "family": "nwc",
+      "dtype": "bfloat16",
+      "shape": [
+        64,
+        768,
+        4096
+      ],
+      "width": 4,
+      "silu": false,
+      "directions": [
+        "forward"
+      ]
+    },
+    {
+      "family": "nwc",
+      "dtype": "bfloat16",
+      "shape": [
+        2,
+        768,
+        4096
+      ],
+      "width": 8,
+      "silu": false,
+      "directions": [
+        "forward"
+      ]
+    },
+    {
+      "family": "nwc",
+      "dtype": "bfloat16",
+      "shape": [
+        2,
+        4096,
+        510
+      ],
+      "width": 4,
+      "silu": false,
+      "directions": [
+        "forward"
+      ]
+    },
+    {
+      "family": "nwc",
+      "dtype": "float16",
+      "shape": [
+        64,
+        768,
+        256
+      ],
+      "width": 7,
+      "silu": false,
+      "directions": [
+        "forward"
+      ]
+    },
+    {
+      "family": "nwc",
+      "dtype": "float32",
+      "shape": [
+        64,
+        768,
+        256
+      ],
+      "width": 7,
+      "silu": false,
+      "directions": [
+        "forward"
+      ]
+    },
+    {
+      "family": "nwc",
+      "dtype": "bfloat16",
+      "shape": [
+        2,
+        768,
+        256
+      ],
+      "width": 32,
+      "silu": false,
+      "directions": [
+        "forward"
+      ]
+    },
+    {
+      "family": "nwc",
+      "dtype": "bfloat16",
+      "shape": [
+        2,
+        768,
+        256
+      ],
+      "width": 64,
+      "silu": false,
+      "directions": [
+        "forward"
+      ]
+    },
+    {
+      "family": "nwc",
+      "dtype": "bfloat16",
+      "shape": [
+        2,
+        768,
+        256
+      ],
+      "width": 128,
+      "silu": false,
+      "directions": [
+        "forward"
+      ]
+    },
+    {
+      "family": "ncw",
+      "dtype": "bfloat16",
+      "shape": [
+        2,
+        768,
+        256
+      ],
+      "width": 256,
+      "silu": false,
+      "directions": [
+        "forward"
+      ]
+    },
+    {
+      "family": "nwc",
+      "dtype": "bfloat16",
+      "shape": [
+        1,
+        768,
+        128
+      ],
+      "width": 4,
+      "silu": true,
+      "directions": [
+        "forward"
+      ]
+    },
+    {
+      "family": "nwc",
+      "dtype": "bfloat16",
+      "shape": [
+        1,
+        4096,
+        8192
+      ],
+      "width": 4,
+      "silu": true,
+      "directions": [
+        "forward"
+      ]
+    },
+    {
+      "family": "ncw",
+      "dtype": "bfloat16",
+      "shape": [
+        2,
+        768,
+        4096
+      ],
+      "width": 4,
+      "silu": true,
+      "directions": [
+        "backward"
+      ]
+    },
+    {
+      "family": "ncw",
+      "dtype": "bfloat16",
+      "shape": [
+        2,
+        768,
+        256
+      ],
+      "width": 32,
+      "silu": false,
+      "directions": [
+        "backward"
+      ]
+    },
+    {
+      "family": "ncw",
+      "dtype": "bfloat16",
+      "shape": [
+        2,
+        768,
+        256
+      ],
+      "width": 128,
+      "silu": false,
+      "directions": [
+        "backward"
+      ]
+    },
+    {
+      "family": "nwc",
+      "dtype": "bfloat16",
+      "shape": [
+        64,
+        768,
+        256
+      ],
+      "width": 7,
+      "silu": false,
+      "directions": [
+        "backward"
+      ]
+    },
+    {
+      "family": "nwc",
+      "dtype": "bfloat16",
+      "shape": [
+        2,
+        4096,
+        510
+      ],
+      "width": 4,
+      "silu": false,
+      "directions": [
+        "backward"
+      ]
+    },
+    {
+      "family": "nwc",
+      "dtype": "bfloat16",
+      "shape": [
+        2,
+        768,
+        256
+      ],
+      "width": 32,
+      "silu": false,
+      "directions": [
+        "backward"
+      ]
+    },
+    {
+      "family": "nwc",
+      "dtype": "bfloat16",
+      "shape": [
+        2,
+        768,
+        256
+      ],
+      "width": 128,
+      "silu": false,
+      "directions": [
+        "backward"
+      ]
+    },
+    {
+      "family": "b2b",
+      "dtype": "bfloat16",
+      "shape": [
+        2,
+        64,
+        256
+      ],
+      "width": 32,
+      "mixer_width": 256,
+      "silu": false,
+      "directions": [
+        "forward",
+        "backward"
+      ]
+    },
+    {
+      "family": "b2b",
+      "dtype": "float16",
+      "shape": [
+        2,
+        64,
+        256
+      ],
+      "width": 32,
+      "mixer_width": 256,
+      "silu": false,
+      "directions": [
+        "forward",
+        "backward"
+      ],
+      "source": "wide-filter precision and partial-tile regression"
+    },
+    {
+      "family": "b2b",
+      "dtype": "bfloat16",
+      "shape": [
+        1,
+        7,
+        1031
+      ],
+      "width": 32,
+      "mixer_width": 256,
+      "silu": false,
+      "directions": [
+        "forward",
+        "backward"
+      ],
+      "source": "wide-filter precision and partial-tile regression"
+    },
+    {
+      "family": "b2b",
+      "dtype": "float16",
+      "shape": [
+        1,
+        7,
+        1031
+      ],
+      "width": 32,
+      "mixer_width": 256,
+      "silu": false,
+      "directions": [
+        "forward",
+        "backward"
+      ],
+      "source": "wide-filter precision and partial-tile regression"
+    }
+  ]
+}
