@@ -40,6 +40,7 @@ endif()
 
 # Find python
 option(CUDNN_FRONTEND_PYTHON_STABLE_ABI "Require the stable ABI for Python bindings." OFF)
+option(CUDNN_FRONTEND_PYTHON_FREE_THREADED "Enable experimental free-threaded Python bindings." OFF)
 if(CUDNN_FRONTEND_PYTHON_STABLE_ABI)
     find_package(Python 3.12 REQUIRED COMPONENTS Interpreter Development.Module Development.SABIModule)
 else()
@@ -48,6 +49,9 @@ endif()
 set(binding_options)
 if(CUDNN_FRONTEND_PYTHON_STABLE_ABI)
     set(binding_options STABLE_ABI)
+endif()
+if(CUDNN_FRONTEND_PYTHON_FREE_THREADED)
+    list(APPEND binding_options FREE_THREADED)
 endif()
 
 # Find cudnn
@@ -97,6 +101,9 @@ if("nanobind-static-abi3" IN_LIST binding_libraries)
 elseif(CUDNN_FRONTEND_PYTHON_STABLE_ABI)
     # nanobind may silently fall back, but ON requires an abi3 extension.
     message(FATAL_ERROR "Stable ABI was requested, but nanobind did not enable it for this Python interpreter.")
+endif()
+if("nanobind-static-ft" IN_LIST binding_libraries)
+    set(binding_runtime nanobind-static-ft)
 endif()
 
 target_compile_features(_compiled_module PRIVATE cxx_std_20)
