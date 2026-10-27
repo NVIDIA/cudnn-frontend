@@ -2,17 +2,38 @@
 # SPDX-License-Identifier: Apache-2.0
 """Grouped d128 declarations: native dK/dV partials followed by an FP32 fold."""
 
-import re
 from functools import partial
 from types import SimpleNamespace
 
 from cudnn.frost.compiled_cache import positional_entry
 from .prepared import ATTRIBUTES, ROLES, BwdLaunchSpec, Operand, _same_geometry
 from .d128_contract import ACCUMULATION_CCS, validate_accumulation_scale
-from .d128_grouped_contract import DENSE, THD, dense_workspace_layout, thd_workspace_layout, validate_dimensions, validate_dense_bounds, validate_thd_bounds
+from .d128_grouped_contract import (
+    DENSE,
+    DKV_ACCUM_DEFAULT,
+    THD,
+    dense_workspace_layout,
+    dsl_version_decline,
+    resolve_dkv_accum,
+    thd_workspace_layout,
+    validate_dimensions,
+    validate_dense_bounds,
+    validate_fp32_accum_fits,
+    validate_thd_bounds,
+)
 from .d128_thd_contract import KV_PORTS, ORIGIN_PORTS, Q_PORTS, validate_stats_span
 from .prepared_sm100_d128 import _GuardedAccumulationEntry
-from .prepared_sm100_d128_thd import THD_ATTRIBUTES, THD_ROLES, _GuardedEntry
+from .prepared_sm100_d128_thd import THD_ATTRIBUTES, THD_ROLES, _GuardedEntry, diag_delete_dq_reduce_add
+
+
+def dkv_accum(api):
+    """The adapter record's op-level dK / dV accumulation form (``SdpaBwdDslSm100D128.dkv_accum``: a ``DKV_ACCUM_FORMS`` name or ``None`` =
+    ``bf16_partials``, the shipping chain), typed: a ``ValueError`` names the field and the domain.  A set ``fp32_reduce`` is a ROUNDING CHANGE
+    (an op attribute), served by the THD grouped chain only."""
+    try:
+        return resolve_dkv_accum(getattr(api, "dkv_accum", None))
+    except ValueError as error:
+        raise ValueError(f"{api._NAME}: {error}") from None
 
 
 def check_support(api):
@@ -27,9 +48,8 @@ def check_support(api):
         if not condition:
             raise NotImplementedError(f"{api._NAME}: grouped d128 {reason}")
 
-    installed, version = cutedsl_state()
-    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version[1]) if installed and version and version[0] == "nvidia-cutlass-dsl" else None
-    require(match is not None and tuple(map(int, match.groups())) >= (4, 8, 0), f"requires nvidia-cutlass-dsl >= 4.8.0; found {version}")
+    decline = dsl_version_decline(*cutedsl_state())  # the chain's floor: ONE named constant, shared with the pair dispatch's gate
+    require(decline is None, decline)
     require(api.q_desc.device.type == "cuda", "Q must reside on CUDA")
     cc = compute_capability(resolve_device(api.q_desc.device))
     require(tuple(cc) in ACCUMULATION_CCS, f"requires SM100 or SM103; got {cc}")
@@ -68,6 +88,7 @@ def check_support(api):
     api.s_q_max, api.s_k_max = sq, sk
     api.head_dim_qk = api.head_dim_v = 128
     api.dtype, api.scale_softmax = api.q_desc.dtype, scale
+    dkv_accum(api)  # typed: a value outside the vocabulary is a ValueError here, before any route check
     if api.thd:
         _check_thd(api, require)
     else:
@@ -79,6 +100,10 @@ def check_support(api):
 def _check_dense(api, require):
     b, h, hk, sq, sk = api.batch_size, api.h_q, api.h_kv, api.s_q_max, api.s_k_max
     require(not api._thd_ro_spec, "ragged offsets require THD")
+    require(
+        dkv_accum(api) == DKV_ACCUM_DEFAULT,
+        "dkv_accum 'fp32_reduce' is served on the THD grouped chain only (the dense grouped chain keeps bf16 partials + the fp32 fold)",
+    )
     try:
         validate_dense_bounds(b, h, hk, sq, sk)
     except ValueError as error:
@@ -111,6 +136,8 @@ def _check_thd(api, require):
     tk_phys = declared_k if set(ro_spec) & KV_PORTS else tk
     try:
         validate_thd_bounds(b, h, hk, sq, sk, tq, tk, tq_phys, tk_phys)
+        if dkv_accum(api) != DKV_ACCUM_DEFAULT:
+            validate_fp32_accum_fits(h, hk)  # the fp32 per-KV-head accumulators live inside the bf16 partial regions: the workspace is unchanged
     except ValueError as error:
         require(False, str(error))
     for role in ROLES[:9]:
@@ -208,8 +235,12 @@ def compile_plan(api):
         from .kernels.sm100.prepared_d128_grouped_host import compile_host
 
         args = (tuple(geometry), regions, dtype, api.is_causal, sm)
+    form = dkv_accum(api)
     with torch.cuda.device(device):
-        entry = compile_host(*args)
+        if api.thd:
+            entry = compile_host(*args, diag_delete_dq_reduce_add=diag_delete_dq_reduce_add(api), dkv_accum=form)
+        else:
+            entry = compile_host(*args, diag_delete_dq_reduce_add=diag_delete_dq_reduce_add(api))  # dense: bf16_partials only (declined above)
     fn = positional_entry(entry)
     if fn is None:
         raise NotImplementedError("grouped d128 requires a positional tvm-ffi entry")
@@ -219,7 +250,12 @@ def compile_plan(api):
     else:
         fn = _GuardedAccumulationEntry(fn, operands, required)
     owner = SimpleNamespace(
-        entry=entry, workspace_bytes=required, workspace_regions=regions, implementation=api._implementation, partial_dtype=str(api.dtype).split(".")[-1]
+        entry=entry,
+        workspace_bytes=required,
+        workspace_regions=regions,
+        implementation=api._implementation,
+        partial_dtype=str(api.dtype).split(".")[-1],
+        dkv_accum=form,
     )
     return BwdLaunchSpec(
         owner,

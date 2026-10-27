@@ -1,0 +1,7 @@
+# sm_100a PTX md5 of the d128 grouped THD cta_group::2 chain's DEFAULT rendering (prepared_d128_grouped_2cta_host.compile_host with every
+# typed field unset: the pair body bprop_d128_accum_grouped_2cta_stail_f16.py under warp_roles 16w, mask_form fsel, dkv_accum bf16_partials,
+# no probe, no stamps; host trace-compile, no device; the probe geometry B, H, HK = 2, 8, 2 is in test_sdpa_bwd_d128_2cta_stail_sm100.py).
+# The B, H, HK = 4, 32, 4 geometry renders 4b3d0bbb91d93d1939d57a246030eeed for the same body (kernel header section 11).  Re-render
+# deliberately on a protocol change and say so here.
+dsl=nvidia-cutlass-dsl 4.8.1
+d128_accum_grouped_2cta_stail sm_100a default rc=0 ptx_md5=645f8a240225a22501df58215ffe6937

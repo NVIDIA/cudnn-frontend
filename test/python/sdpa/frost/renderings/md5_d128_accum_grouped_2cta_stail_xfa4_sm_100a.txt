@@ -1,0 +1,9 @@
+# sm_100a PTX md5 of the d128 grouped THD cta_group::2 chain's rendering under warp_roles="16w_fa4" (prepared_d128_grouped_2cta_host.compile_host
+# with every other typed field unset: the pair body bprop_d128_accum_grouped_2cta_stail_f16.py under the alternate role shape -- the softmax
+# writes sDS own + XCHG from its dS^T registers and ships, warps 8-11 are the reduce group, ds_tmem + dp_empty deleted and dq_war_done added
+# (BAR_LAYOUT_XFA4, 33 rows), the softmax's dq_war_done WAR wait; host trace-compile, no device; the probe geometry B, H, HK = 2, 8, 2 is in
+# test_sdpa_bwd_d128_2cta_stail_xfa4_sm100.py).  The B, H, HK = 4, 32, 4 geometry renders 83dacedc610eae473be0477295a0816e for the same body.
+# The default (warp_roles unset = "16w") record md5_d128_accum_grouped_2cta_stail_default_sm_100a.txt (645f8a24 @ 2/8/2; 4b3d0bbb @ 4/32/4)
+# is UNCHANGED by this role shape.  Re-render deliberately on a protocol change and say so here.
+dsl=nvidia-cutlass-dsl 4.8.1
+d128_accum_grouped_2cta_stail_xfa4 sm_100a default rc=0 ptx_md5=55b28f6b9ccf3a4dc984937aed741881

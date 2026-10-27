@@ -42,6 +42,17 @@ class Config:
     DESC_VERSION: int = 1
     SWIZZLE_BYTES: int = 128
     SWIZZLE_LAYOUT: int = 2
+    # --- dkv_accum = fp32_reduce (the grouped THD kernel only): the fp32 dV / dK staging over the ALIAS slab and the TMEM planes it reads ---
+    BPE_ACC: int = 4  # fp32 accumulator bytes (the dQ image and the fp32 dK / dV staging)
+    D_HALF: int = 64  # one TMEM readout half of a 128-column accumulator plane
+    DV_COL: int = 256  # TMEM column of the dV accumulator plane (the bodies' `tmem_base + 256`)
+    DK_COL: int = 384  # TMEM column of the dK accumulator plane (the bodies' `tmem_base + 384`)
+    DKV_ACC_SLICES: int = 4  # fp32 [M x DQ_BOX] reduce-add slices per [M x D] tile = D // DQ_BOX = the dQ ring's slot count
+    DKV_ACC_SLICE_BYTES: int = 16384  # M x DQ_BOX x BPE_ACC = SLICE_BYTES: the four slices fill the 64 KiB ALIAS slab exactly
+
+    def dkv_acc_slot(self, index):
+        """Byte base of fp32 staging slice ``index`` of a dV / dK round: the dQ fp32 image's slice ``index`` over the ALIAS slab."""
+        return self.ALIAS + index * self.DKV_ACC_SLICE_BYTES
 
 
 CFG = Config()
@@ -111,6 +122,13 @@ def validate_config():
     assert CFG.TMEM_HANDLE + 4 <= CFG.SCHED_PAYLOAD
     assert CFG.SCHED_PAYLOAD + 64 == 230880
     assert (230880 + 1023) // 1024 * 1024 == CFG.SMEM_BYTES
+    # dkv_accum = fp32_reduce (fp32_reduce): the fp32 dV / dK staging = the dQ fp32 image's four [M x DQ_BOX] SW128 slices over the ALIAS slab (one fp32
+    # [M x D] tile per round; dV then dK), one dq_empty ring slot per slice (the dK round's WAR waits), the TMEM planes the staging reads.
+    assert (CFG.BPE_ACC, CFG.D_HALF, CFG.DKV_ACC_SLICES, CFG.DKV_ACC_SLICE_BYTES) == (4, CFG.D // 2, CFG.D // CFG.DQ_BOX, CFG.M * CFG.DQ_BOX * CFG.BPE_ACC)
+    assert CFG.DKV_ACC_SLICE_BYTES == CFG.SLICE_BYTES and CFG.DKV_ACC_SLICES * CFG.DKV_ACC_SLICE_BYTES == 2 * CFG.OPERAND_BYTES == CFG.M * CFG.D * CFG.BPE_ACC
+    assert [CFG.dkv_acc_slot(i) for i in range(CFG.DKV_ACC_SLICES)] == [CFG.ALIAS + i * CFG.SLICE_BYTES for i in range(CFG.DKV_ACC_SLICES)]
+    assert CFG.DKV_ACC_SLICES == next(item[2] for item in BAR_LAYOUT if item[0] == "dq_empty")  # one ring slot per slice
+    assert (CFG.DV_COL, CFG.DK_COL) == (256, 384) and CFG.DV_COL + CFG.D == CFG.DK_COL and CFG.DK_COL + CFG.D == CFG.TMEM_COLS and CFG.D_HALF * 2 == CFG.D
 
 
 validate_config()
