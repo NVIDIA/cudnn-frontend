@@ -13,6 +13,7 @@ five launches either way, the pair's cluster dims, the one-CTA kernel below the 
 RED-first: every row below was written before the field existed.
 """
 
+import pathlib
 import re
 from types import SimpleNamespace
 
@@ -73,14 +74,22 @@ def test_cta_pair_config_is_the_truth():
     c = _contract()
     from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta import CFG
     from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import CFG as STAIL_CFG
+    from cudnn.sdpa.bwd.d128_contract import ACCUMULATION_CCS
 
     assert c.CTA_PAIR_MODES == ("auto", "off", "on") and c.CTA_PAIR_MODE_DEFAULT == "auto"
     assert c.CTA_PAIR_MIN_SEQ == 8192 and c.CTA_PAIR_MIN_SEQ % c.UNIT_ROWS == 0 and c.CTA_PAIR_MIN_SEQ % CFG.PAIR_KV_ROWS == 0
-    assert c.CTA_PAIR_CCS == ((10, 0),) and all(tuple(cc) in c.ACCUMULATION_CCS for cc in c.CTA_PAIR_CCS)
+    assert c.CTA_PAIR_CCS == ((10, 0),) and all(tuple(cc) in ACCUMULATION_CCS for cc in c.CTA_PAIR_CCS)  # the measured part is an accumulation part
     assert c.CTA_PAIR_CLUSTER == CFG.CGA_M == 2
     assert c.CTA_PAIR_BODY == "s_tail" == STAIL_CFG.TMEM_MAP
     assert (c.PAIR_BODY, c.ONE_CTA_BODY) == ("2cta", "1cta")
-    assert "smallest S where the pair body won" in c.__doc__ or "smallest S where the pair body won" in open(c.__file__).read()
+    from cudnn.sdpa.bwd.d128_grouped_contract import DSL_MIN_VERSION, dsl_version_decline
+
+    assert DSL_MIN_VERSION == (4, 8, 0) and dsl_version_decline(True, ("nvidia-cutlass-dsl", "4.8.0")) is None
+    assert dsl_version_decline(False, None) == dsl_version_decline(True, None) == "requires nvidia-cutlass-dsl >= 4.8.0; found None"
+    assert dsl_version_decline(True, ("nvidia-cutlass-dsl", "4.7.0")).startswith("requires nvidia-cutlass-dsl >= 4.8.0; found ")
+    assert dsl_version_decline(True, ("nvidia-cutlass-dsl-internal", "0.3.0+2026")) is not None  # an internal build: not the measured public floor
+    source = pathlib.Path(c.__file__).read_text()  # the threshold's provenance sentence sits beside the constant (the module docstring is in it)
+    assert "smallest S where the pair body won" in source
 
 
 def test_cta_pair_field_is_typed_and_the_record_defaults_are_pinned():
@@ -190,7 +199,6 @@ def test_cta_pair_off_is_the_one_cta_body_at_every_s_without_probing():
 
 
 def test_cta_pair_selector_is_typed_on_its_inputs():
-    c = _contract()
     with pytest.raises(ValueError, match="cta_pair must be one of"):
         _select("bogus", 8192, "uniform")
     for bad in (dict(s_q_max=0), dict(s_kv_max=-1), dict(s_q_max="8192"), dict(s_q_max=8192.0)):
@@ -267,6 +275,111 @@ def test_cta_pair_dispatch_falls_back_under_auto_and_reraises_under_on(monkeypat
         api = _fake_api(mode)
         assert p.check_support_selected(api) is True and seen == ["pair"]
         assert api._cta_pair.body == c.PAIR_BODY and api._cta_pair.pair_map == c.CTA_PAIR_BODY == "s_tail"
+
+
+def test_cta_pair_dispatch_gates_the_dsl_before_the_occupancy_probe(monkeypatch):
+    """A missing or too-old CuTe DSL is the grouped chain's typed decline (NotImplementedError naming the floor and the installed version) at
+    ``check_support``, BEFORE the dispatch runs the cluster occupancy probe: the probe imports the DSL (``cutlass.utils.HardwareInfo``), so an
+    absent wheel raised a raw ModuleNotFoundError and an older one an AttributeError out of ``check_support()`` (PR 1943 review).  Under
+    ``auto`` and ``on`` alike, with every cheaper predicate passing (S 16K, cc 10.0); ``off`` is gated the same way (its one-CTA body has the
+    same floor)."""
+    c = _contract()
+    p = _prepared()
+    import cudnn.frost.buffers as buffers
+
+    def probe(device):
+        raise probe.error  # what the occupancy query raises on the DSL state under test
+
+    monkeypatch.setattr(p, "_device_cc", lambda api: (10, 0))
+    monkeypatch.setattr(p, "max_active_pairs", probe)
+    floor = ".".join(map(str, getattr(c, "DSL_MIN_VERSION", (4, 8, 0))))
+    for state, error in (
+        ((False, None), ModuleNotFoundError("No module named 'cutlass'")),
+        ((True, ("nvidia-cutlass-dsl", "4.7.0")), AttributeError("'HardwareInfo' object has no attribute 'get_max_active_clusters'")),
+    ):
+        probe.error = error
+        monkeypatch.setattr(buffers, "cutedsl_state", lambda state=state: state)
+        for mode in ("auto", "on", "off"):
+            api = _fake_api(mode)
+            with pytest.raises(NotImplementedError, match=rf"{_ENGINE}: grouped d128 requires nvidia-cutlass-dsl >= {re.escape(floor)}; found "):
+                p.check_support_selected(api)
+            assert not getattr(api, "_is_supported", False)
+
+
+def test_cta_pair_probe_failures_are_named_in_the_cluster_decline(monkeypatch):
+    """The occupancy query's OWN failures (the DSL present and new enough; the query raising from inside the DSL or the driver) are never an
+    exception out of ``check_support``: the device admits no pair, the ``cluster`` predicate declines by name with the query's text -- under
+    ``on`` the decline, under ``auto`` the one-CTA body with the text in the reason; the answer is cached per device like a successful query."""
+    c = _contract()
+    p = _prepared()
+    import cudnn.frost.device as frost_device
+
+    monkeypatch.setattr(p, "_device_cc", lambda api: (10, 0))
+    monkeypatch.setattr(frost_device, "resolve_device", lambda device=None: 0)  # host-only: the index read of the stand-in's CUDA device
+    monkeypatch.setattr(p, "_check_support_grouped", lambda api: True)
+    for error in (RuntimeError("cuOccupancyMaxActiveClusters failed"), ImportError("No module named 'cutlass.utils'"), AttributeError("no query")):
+        p._MAX_ACTIVE_PAIRS.clear()
+        p._PROBE_FAILURES.clear()
+        seen = []
+
+        def query(index, error=error):
+            seen.append(index)
+            raise error
+
+        monkeypatch.setattr(p, "_occupancy_query", query)
+        api = _fake_api("auto", device="cuda")
+        assert p.check_support_selected(api) is True
+        assert api._cta_pair.body == c.ONE_CTA_BODY and api._cta_pair.cluster_admitted is False, api._cta_pair
+        assert "cluster" in api._cta_pair.reason and f"{type(error).__name__}: {error}" in api._cta_pair.reason, api._cta_pair.reason
+        with pytest.raises(NotImplementedError, match=rf"{_ENGINE}: cta_pair 'on' requires a cluster of .*{type(error).__name__}: {re.escape(str(error))}"):
+            p.check_support_selected(_fake_api("on", device="cuda"))
+        assert len(seen) == 1, "the failed query is cached per device like a successful one"
+    p._MAX_ACTIVE_PAIRS.clear()
+    p._PROBE_FAILURES.clear()
+
+
+def test_cta_pair_support_validates_the_pair_fields_by_name(monkeypatch):
+    """The pair body's ``check_support`` resolves EVERY typed field of the body (``mask_form``, ``warp_roles``, ``diag_2cta``, ``debug_clk``,
+    ``dkv_accum``) and the role shape's cross-field rule, so a value outside a domain is a ValueError BY NAME and an unbuilt combination a typed
+    decline at SUPPORT time -- never a ValueError out of ``compile()`` after ``auto`` committed to the pair (PR 1943 review).  Under ``auto`` the
+    unbuilt combination falls back to the one-CTA body with the decline in the reason; under ``on`` it is the answer; the served bundle passes."""
+    c = _contract()
+    p = _prepared()
+    monkeypatch.setattr(p, "_device_cc", lambda api: (10, 0))
+    monkeypatch.setattr(p, "max_active_pairs", lambda device: 76)
+
+    def grouped_ok(api):  # the one-CTA route's checks, stubbed: the pair check reads the declaration facts they record
+        s = int(api.q_desc.shape[2])
+        api.batch_size, api.h_q, api.h_kv, api.s_q_max, api.s_k_max = 1, 8, 2, s, s
+        api._thd_t_q = api._thd_t_kv = api._thd_t_q_phys = api._thd_t_kv_phys = s
+        return True
+
+    monkeypatch.setattr(p, "_check_support_grouped", grouped_ok)
+    for field, bad, text in (
+        ("warp_roles", "bogus", "warp_roles must be one of"),
+        ("mask_form", "bogus", "mask_form must be one of"),
+        ("diag_2cta", "ds_gates_off", "diag_2cta must be None or one of"),
+        ("debug_clk", "yes", "debug_clk must be a bool"),
+        ("dkv_accum", "fp16", "dkv_accum must be one of"),
+    ):
+        for mode in ("auto", "on"):
+            api = _fake_api(mode)
+            setattr(api, field, bad)
+            with pytest.raises(ValueError, match=f"{_ENGINE}: {text}"):
+                p.check_support_selected(api)
+            assert not getattr(api, "_is_supported", False), (field, mode)
+    unbuilt = "debug_clk is not defined under warp_roles '16w_fa4'"
+    api = _fake_api("on")
+    api.warp_roles, api.debug_clk = "16w_fa4", True
+    with pytest.raises(NotImplementedError, match=f"{_ENGINE}: 2-CTA datapath {unbuilt}"):
+        p.check_support_selected(api)
+    api = _fake_api("auto")
+    api.warp_roles, api.debug_clk = "16w_fa4", True
+    assert p.check_support_selected(api) is True
+    assert api._cta_pair.body == c.ONE_CTA_BODY and unbuilt in api._cta_pair.reason, api._cta_pair
+    api = _fake_api("auto")
+    api.warp_roles, api.dkv_accum, api.mask_form = "16w_fa4", "bf16_partials", "predicated"
+    assert p.check_support_selected(api) is True and api._cta_pair.body == c.PAIR_BODY and api._is_supported is True
 
 
 def _cpu_case(s=256, lens=None):

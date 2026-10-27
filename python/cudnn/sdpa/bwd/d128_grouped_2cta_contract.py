@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .config_sm100_d128_accum_2cta import CFG
-from .d128_contract import ACCUMULATION_CCS, WORKSPACE_ALIGNMENT, WORKSPACE_SLACK
+from .d128_contract import WORKSPACE_ALIGNMENT, WORKSPACE_SLACK
 from .d128_grouped_contract import PARTIAL_ITEMSIZE
 from .d128_grouped_contract import validate_thd_bounds as _validate_grouped_thd_bounds
 from .d128_thd_contract import ORIGIN_PORTS
@@ -28,8 +28,9 @@ UNIT_ROWS = CFG.THD_UNIT_ROWS  # 256 kv rows per CLC work item (one cga2 pair)
 # prepared module, so the rule is testable without a GPU and the probe runs only when the cheaper predicates passed.
 CTA_PAIR_MODES = ("auto", "off", "on")
 CTA_PAIR_MODE_DEFAULT = "auto"
-# The smallest S where the pair body won the in-session step on GB200 (cc 10.0) against the one-CTA body -- 8K +6.5 %, 16K +7.0 %,
-# 32K +8.8 %, 64K +10.4 %, varlen ramps +7..+8.5 % (2026-10-27); lowered when a shorter S wins (the 2K / 4K cells are measured separately).
+# The smallest S where the pair body won the in-session backward step on GB200 (cc 10.0) against the one-CTA body -- 8K +4.9 %, 16K +7.9 %,
+# 32K +8.5 %, 64K +8.8 % uniform, the varlen ramps +6.5 % (16K) / +8.3 % (32K) (2026-10-27; the rows of record in the PR); below it the pair
+# LOSES on the step (2K -3.9 %, 4K -3.5 %, measured) and the one-CTA body serves.  Lowered when a shorter S wins.
 # Both declared extents (S_q and S_kv: the batch's LONGEST sequence on each side) must reach it: the measured cells have them equal, so a
 # lopsided batch serves the measured-safe one-CTA body.
 CTA_PAIR_MIN_SEQ = 8192
@@ -44,7 +45,12 @@ CTA_PAIR_PREDICATES = ("thd", "cc", "cluster", "seq")  # the names a decline / a
 
 
 class CtaPairDecline(ValueError):
-    """``cta_pair = "on"`` with a failing pair predicate: the text names the predicate and the value seen (the adapter's typed decline)."""
+    """``cta_pair = "on"`` with a failing pair predicate: the text names the predicate and the value seen (the adapter's typed decline);
+    ``predicate`` = its ``CTA_PAIR_PREDICATES`` name (the dispatch appends the occupancy query's own failure text to a ``cluster`` decline)."""
+
+    def __init__(self, predicate, text):
+        super().__init__(text)
+        self.predicate = predicate
 
 
 def resolve_cta_pair(name=None):
@@ -115,7 +121,7 @@ def select_cta_pair(mode, *, thd, s_q_max, s_kv_max, cc, max_active_pairs):
     if failures:
         name, text, got = failures[0]
         if mode == "on":
-            raise CtaPairDecline(f"cta_pair 'on' {text}; got {got}")
+            raise CtaPairDecline(name, f"cta_pair 'on' {text}; got {got}")
         return CtaPairResolution(mode, ONE_CTA_BODY, f"cta_pair=auto: the one-CTA body ({name}: {text}; got {got})", s_q_max, s_kv_max, cc, admitted)
     if mode == "on":
         return CtaPairResolution(mode, PAIR_BODY, "cta_pair=on", s_q_max, s_kv_max, cc, admitted)

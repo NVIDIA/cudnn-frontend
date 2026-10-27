@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Grouped d128 declarations: native dK/dV partials followed by an FP32 fold."""
 
-import re
 from functools import partial
 from types import SimpleNamespace
 
@@ -14,6 +13,7 @@ from .d128_grouped_contract import (
     DKV_ACCUM_DEFAULT,
     THD,
     dense_workspace_layout,
+    dsl_version_decline,
     resolve_dkv_accum,
     thd_workspace_layout,
     validate_dimensions,
@@ -48,9 +48,8 @@ def check_support(api):
         if not condition:
             raise NotImplementedError(f"{api._NAME}: grouped d128 {reason}")
 
-    installed, version = cutedsl_state()
-    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version[1]) if installed and version and version[0] == "nvidia-cutlass-dsl" else None
-    require(match is not None and tuple(map(int, match.groups())) >= (4, 8, 0), f"requires nvidia-cutlass-dsl >= 4.8.0; found {version}")
+    decline = dsl_version_decline(*cutedsl_state())  # the chain's floor: ONE named constant, shared with the pair dispatch's gate
+    require(decline is None, decline)
     require(api.q_desc.device.type == "cuda", "Q must reside on CUDA")
     cc = compute_capability(resolve_device(api.q_desc.device))
     require(tuple(cc) in ACCUMULATION_CCS, f"requires SM100 or SM103; got {cc}")

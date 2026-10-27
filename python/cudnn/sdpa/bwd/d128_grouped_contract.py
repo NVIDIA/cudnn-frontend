@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Grouped d128 workspace: FP32 dQ/Delta and native per-Q-head dK/dV partials."""
 
+import re
+
 from .d128_contract import WORKSPACE_ALIGNMENT, WORKSPACE_SLACK, workspace_layout as dense_mha_workspace_layout
 from .d128_thd_contract import workspace_layout as thd_mha_workspace_layout, workspace_offsets as thd_mha_workspace_offsets
 
@@ -10,6 +12,23 @@ DENSE = "accumulation_grouped_dense"
 THD = "accumulation_grouped_thd"
 PARTIAL_ITEMSIZE = 2  # BF16 for BF16 IO, FP16 for FP16 IO; final group accumulation is FP32.
 ACCUM_ITEMSIZE = 4  # the fp32 dK / dV accumulation workspace under dkv_accum = "fp32_reduce" (one buffer per KV head)
+# The CuTe DSL floor of the grouped d128 chain (both bodies): the public wheel from which the chain's hosts trace and from which the pair
+# dispatch's cluster occupancy query (``cutlass.utils.HardwareInfo.get_max_active_clusters``) exists.  Above the FROST-wide floor
+# ``cudnn.frost.buffers.CUTEDSL_MIN_VERSION`` (4.7.0), so every grouped route gates it BY NAME at ``check_support`` before any DSL import:
+# an absent or older wheel is a typed decline carrying the installed and the required version, never a raw ImportError / AttributeError.
+DSL_MIN_VERSION = (4, 8, 0)
+
+
+def dsl_version_decline(installed, version):
+    """The decline text for a CuTe DSL state ``(installed, version)`` (``cudnn.frost.buffers.cutedsl_state()``) that is absent, not the public
+    wheel or below ``DSL_MIN_VERSION``; ``None`` when the chain can trace.  Internal builds number themselves differently and are declined like
+    the chain's hosts always did (the public floor is the measured one)."""
+    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version[1]) if installed and version and version[0] == "nvidia-cutlass-dsl" else None
+    if match is not None and tuple(map(int, match.groups())) >= DSL_MIN_VERSION:
+        return None
+    return f"requires nvidia-cutlass-dsl >= {'.'.join(map(str, DSL_MIN_VERSION))}; found {version}"
+
+
 # The typed op-level field ``SdpaBwdDslSm100D128.dkv_accum``: how the GQA group's dK / dV are accumulated on the THD chain.
 # A ROUNDING CHANGE between the two forms, hence an op ATTRIBUTE the caller sets (never a knob): "bf16_partials" = one bf16 partial per Q
 # head + the fp32 ``dkv_reduce`` fold launch (a FIXED summation order; the shipping chain, byte-identical when the field is unset);

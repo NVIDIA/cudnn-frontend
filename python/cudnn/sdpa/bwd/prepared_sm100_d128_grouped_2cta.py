@@ -21,10 +21,12 @@ from .config_sm100_d128_accum_2cta_stail import (
     resolve_debug_clk,
     resolve_mask_form,
     resolve_warp_roles,
+    validate_fields_for_roles,
 )
 from .d128_grouped_2cta_contract import CTA_PAIR_BODY, CTA_PAIR_CLUSTER, ONE_CTA_BODY, PAIR_BODY, CtaPairDecline, resolve_cta_pair, select_cta_pair
 from .d128_grouped_2cta_contract import THD as IMPLEMENTATION
 from .d128_grouped_2cta_contract import WORKSPACE_SLACK, thd_workspace_layout, thd_workspace_offsets, validate_thd_bounds
+from .d128_grouped_contract import dsl_version_decline
 from .d128_thd_contract import KV_PORTS
 from .prepared import ROLES, BwdLaunchSpec, Operand
 from .prepared_sm100_d128_grouped import check_support as _check_support_grouped
@@ -59,37 +61,66 @@ def _device_cc(api):
 
 _MAX_ACTIVE_PAIRS = {}  # device index -> the occupancy query's answer; plan-time only, one probe compile per device per process
 _PROBE_FAILURES = {}  # device index -> the text of a query that failed (then the answer is 0 and the pair is not admitted)
+# What a failing query raises: the DSL absent (ImportError) or without the query (AttributeError), the driver's error (RuntimeError), a bad
+# device (ValueError).  Every one is the cluster predicate's typed decline, never an exception out of check_support.
+_PROBE_ERRORS = (ImportError, AttributeError, RuntimeError, ValueError)
+
+
+def _occupancy_query(index):
+    """The DSL's cluster occupancy query on device ``index`` (``cuOccupancyMaxActiveClusters`` on a probe kernel, ``cutlass.utils.HardwareInfo``):
+    the primary context is bound first through ``ensure_current_context`` (the execute path's helper).  Imports the DSL, so it runs behind the
+    chain's version gate only (:func:`resolve_cta_pair_body`)."""
+    import cutlass.utils
+
+    from cudnn._device import ensure_current_context
+
+    ensure_current_context(None, index)
+    return int(cutlass.utils.HardwareInfo(index).get_max_active_clusters(CTA_PAIR_CLUSTER))
 
 
 def max_active_pairs(device):
-    """How many clusters of ``CTA_PAIR_CLUSTER`` CTAs the device admits at once: the DSL's occupancy query (``cuOccupancyMaxActiveClusters`` on a
-    probe kernel, ``cutlass.utils.HardwareInfo``), 0 when the query itself fails (an unsupported driver or part).  Cached per device index for
-    the process: the query compiles a probe kernel, so it runs once -- and the selector consults it only after the cheaper predicates passed.
-    No device memory is owned and nothing blocks: the primary context is bound through ``ensure_current_context`` (the execute path's helper)."""
+    """How many clusters of ``CTA_PAIR_CLUSTER`` CTAs the device admits at once (:func:`_occupancy_query`), 0 when the query itself fails (an
+    unsupported driver or part, a DSL without the query): the failure is recorded (:func:`probe_failure`) and named in the cluster decline,
+    never raised.  Cached per device index for the process: the query compiles a probe kernel, so it runs once -- and the selector consults it
+    only after the cheaper predicates passed.  No device memory is owned and nothing blocks."""
     from cudnn.frost.device import resolve_device
 
     index = resolve_device(device)
     if index not in _MAX_ACTIVE_PAIRS:
         try:
-            import cutlass.utils
-
-            from cudnn._device import ensure_current_context
-
-            ensure_current_context(None, index)
-            count = int(cutlass.utils.HardwareInfo(index).get_max_active_clusters(CTA_PAIR_CLUSTER))
-        except (RuntimeError, ValueError) as error:
+            count = _occupancy_query(index)
+        except _PROBE_ERRORS as error:
             _PROBE_FAILURES[index] = f"{type(error).__name__}: {error}"
             count = 0
         _MAX_ACTIVE_PAIRS[index] = count
     return _MAX_ACTIVE_PAIRS[index]
 
 
+def probe_failure(device):
+    """The text of a failed occupancy query on ``device`` (``None`` when it succeeded or never ran); the cluster decline / fallback names it."""
+    from cudnn.frost.device import resolve_device
+
+    return _PROBE_FAILURES.get(resolve_device(device))
+
+
+def _probe_note(api):
+    failure = probe_failure(api.q_desc.device)
+    return "" if failure is None else f" (the occupancy query failed: {failure})"
+
+
 def resolve_cta_pair_body(api):
     """Resolve the adapter's ``cta_pair`` for its declaration: the mode (typed), the declared S_q / S_kv (the batch's longest sequence on each
     side -- the ``(B, H, S, D)`` declaration a THD graph carries), Q's device cc (``None`` off CUDA) and, last and cached, the cluster
     admission.  The resolution is recorded on the instance (:func:`cta_pair_resolution`).  ``on`` with a failing predicate is the engine's
-    typed decline, by name; a value outside the field's domain is a ``ValueError`` by name."""
+    typed decline, by name; a value outside the field's domain is a ``ValueError`` by name.  The chain's DSL floor (``DSL_MIN_VERSION``, both
+    bodies) is gated FIRST, before any device read: the occupancy probe imports the DSL, so an absent or older wheel declines by name here
+    instead of raising from inside the probe."""
+    from cudnn.frost.buffers import cutedsl_state
+
     mode = cta_pair(api)
+    decline = dsl_version_decline(*cutedsl_state())
+    if decline is not None:
+        raise NotImplementedError(f"{api._NAME}: grouped d128 {decline}")
     s_q_max, s_kv_max = int(api.q_desc.shape[2]), int(api.k_desc.shape[2])
     try:
         resolution = select_cta_pair(
@@ -101,9 +132,12 @@ def resolve_cta_pair_body(api):
             max_active_pairs=lambda: max_active_pairs(api.q_desc.device),
         )
     except CtaPairDecline as error:
-        raise NotImplementedError(f"{api._NAME}: {error}") from None
+        note = _probe_note(api) if error.predicate == "cluster" else ""  # the query ran (cc passed on a CUDA device): its own failure, named
+        raise NotImplementedError(f"{api._NAME}: {error}{note}") from None
     except ValueError as error:
         raise ValueError(f"{api._NAME}: {error}") from None
+    if resolution.cluster_admitted is False:
+        resolution = replace(resolution, reason=resolution.reason + _probe_note(api))
     api._cta_pair = resolution
     return resolution
 
@@ -207,6 +241,16 @@ def check_support(api):
     except ValueError as error:
         require(False, str(error))
     api._grouped_workspace_regions, api._grouped_workspace_bytes = thd_workspace_layout(b, h, api._thd_t_q, api._thd_t_kv)
+    # The body's whole typed field bundle, resolved HERE: a value outside a domain is a ValueError BY NAME at support time (never first at
+    # compile, after auto committed to the pair); then the role shape's cross-field rule (config_sm100_d128_accum_2cta_stail.
+    # validate_fields_for_roles): a combination that is not built is a typed DECLINE -- under cta_pair=auto the dispatch then serves the
+    # one-CTA body with this text in its reason, under on it is the answer.
+    mask_form(api)
+    roles, probe, stamps, accum = warp_roles(api), diag_2cta(api), debug_clk(api), dkv_accum(api)
+    try:
+        validate_fields_for_roles(roles, probe, debug_clk=stamps, dkv_accum=accum)
+    except ValueError as error:
+        require(False, str(error))
     api._dbg_clk_region = None
     if debug_clk(api):
         # STAMPS (s_tail only; typed above): the Int32 record dump of every CTA of the MAIN grid, carved PAST the chain's regions at the first
