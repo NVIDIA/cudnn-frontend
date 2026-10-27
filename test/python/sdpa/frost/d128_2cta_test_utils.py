@@ -30,10 +30,11 @@ def _adapter_class():
     import cudnn
 
     try:
-        module = importlib.import_module(_ADAPTER_MODULE)
-    except ImportError as error:
-        pytest.skip(f"{_ADAPTER_MODULE} is not importable from {cudnn.__file__}: this venv's cudnn is not the tree under test ({error})")
-    return module.SdpaBwdDslSm100D128Cta2
+        return importlib.import_module(_ADAPTER_MODULE).SdpaBwdDslSm100D128Cta2
+    except ImportError as error:  # an explicit raise (pytest.skip() is one too, but static analysis cannot see it)
+        raise pytest.skip.Exception(
+            f"{_ADAPTER_MODULE} is not importable from {cudnn.__file__}: this venv's cudnn is not the tree under test ({error})"
+        ) from None
 
 
 def _require_2cta():

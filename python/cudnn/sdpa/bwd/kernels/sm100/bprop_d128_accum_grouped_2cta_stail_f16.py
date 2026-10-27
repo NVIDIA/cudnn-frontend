@@ -561,7 +561,6 @@ from cutlass.base_dsl.typing import Pointer
 from cutlass.experimental import primitives as nvvm
 
 from cudnn.frost.tile_dsl.barrier import MBarrier, PipelineState, Producer, Scope, advance, cga_arrive, cga_wait, named_barrier_fence
-from cudnn.frost.tile_dsl.barrier import wait as mbar_wait
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.mask import MASK_WORD_COLS, apply_mask_words, band_mask_words
 from cudnn.frost.tile_dsl.mma import desc_opaque, mma_ss, mma_ts_step
@@ -584,10 +583,8 @@ from ...config_sm100_d128_accum_2cta import diag_2cta_code
 from ...config_sm100_d128_accum_2cta_stail import (
     ALIASES,
     BAR_LAYOUT,
-    BAR_LAYOUT_STATUS,
     ADDED_BARRIERS_XFA4,
     BAR_LAYOUT_XFA4,
-    BAR_LAYOUT_XFA4_STATUS,
     CFG,
     DBG_CLK,
     DELETED_BARRIERS_XFA4,
@@ -609,7 +606,9 @@ EPILOGUE_LEAD_WARP = SOFTMAX_WARP_END  # the one warp whose elected lane arms ds
 MMA_WARP = EPILOGUE_WARP_END
 TMA_LOAD_WARP = MMA_WARP + 1
 TMA_STORE_WARP = MMA_WARP + 2
-SCHED_WARP = MMA_WARP + 3
+SCHED_WARP = MMA_WARP + 3  # the role dispatch's `else` branch: the CTA's LAST warp (pinned below; the dispatch never spells the id)
+if SCHED_WARP != CFG.THREADS // 32 - 1 or SCHED_WARP != EPILOGUE_WARP_END + CFG.SERVICE_WARPS - 1:
+    raise ValueError(f"the scheduler warp must be the CTA's last warp (the dispatch's else branch is exactly one warp); got {SCHED_WARP}")
 # Test-only skew levers (house form; default 0 = no traced code: the test module's census pins nanosleep == 0 on the default rendering; the
 # test sets the module global BEFORE the module executes -- spec loader + sys.modules; never an environment variable, never a knob).
 # Carried from the first body (the barrier audit AUDIT 2026-10-26): LOADER (lever 4, the k2_empty back-edge: both CTAs' loaders sleep at the
@@ -635,7 +634,6 @@ DEBUG_SOFTMAX_DQ_WAR_DELAY_US: int = int(globals().get("FROST_D128_2CTA_DEBUG_SO
 #   DIAG_EXCHANGE_OFF      (exchange_off):     _epilogue_loop skips the XCHG ship and arms ds_recv_full with CFG.DIAG_EXCHANGE_OFF_TX = 0 bytes; EVERY wait kept
 #   DIAG_STATS_ONE_CHUNK   (stats_one_chunk):     _p_values / _ds_values load ONE stats / delta chunk per quarter and reuse it (LDS.128 32 -> 4 per lane per tile)
 #   DIAG_SDQ_STS_OFF       (sdq_sts_off):      _dq_round skips the sDQ slice STS + its proxy fence (the reduce-add reads stale staging; waits / arrives stay)
-DIAG_NONE = diag_2cta_code(None)
 DIAG_DQ_REDUCE_ADD_OFF = diag_2cta_code("dq_reduce_add_off")
 DIAG_EXCHANGE_OFF = diag_2cta_code("exchange_off")
 DIAG_STATS_ONE_CHUNK = diag_2cta_code("stats_one_chunk")
@@ -651,6 +649,9 @@ _W = DBG_CLK.WORD
 MASK_FORM_FSEL = mask_form_code("fsel")
 MASK_FORM_PREDICATED = mask_form_code("predicated")
 MASK_FORM_DIAG_OFF = mask_form_code("diag_mask_off")
+if {mask_form_code(n) for n in CFG.MASK_FORMS} != {MASK_FORM_FSEL, MASK_FORM_PREDICATED, MASK_FORM_DIAG_OFF}:  # config = truth: the body's
+    # const_expr chain renders fsel, predicated and (anything else) diag_mask_off -- a fourth code would trace as the no-mask form, silently
+    raise ValueError(f"this body renders exactly the three mask forms {CFG.MASK_FORMS}; the code space grew")
 if CFG.MASK_WORD_COLS != MASK_WORD_COLS:  # config = truth: the config's keep-word width is the mask helper's (both 32; the config stays cutlass-free)
     raise ValueError(f"CFG.MASK_WORD_COLS {CFG.MASK_WORD_COLS} != tile_dsl.mask.MASK_WORD_COLS {MASK_WORD_COLS}")
 # ROLE SHAPE (header sections 4 / 5 / 11; the later rank 1 "the alternate role shape"): the typed adapter field ``warp_roles`` reaches the kernel as the ``warp_roles_code``
@@ -711,7 +712,6 @@ class Bars(NamedTuple):
     )
 
 
-_BARS_STATUS = BAR_LAYOUT_STATUS
 # BAR_LAYOUT kind -> (producer, scope).  "peer" rows are driven by arrive_on_peer / read_tile_id_arrive_on_leader (never .arrive()).
 _KINDS = {
     "tma_leader": (Producer.TMA_LOAD, Scope.LEADER),
@@ -727,7 +727,6 @@ DVK_STAGE_EMPTY_ROW = Bars._fields.index("dvk_stage_empty")  # fp32_reduce: the 
 # The 16w_fa4 bundle: the audit's 32 rows + dq_war_done (BAR_LAYOUT_XFA4) in order; the two deleted names have no field, no init, no arrive, no
 # wait, no state; the fp32_reduce row dvk_stage_empty is UNSERVED there (fp32_reduce declines by name under 16w_fa4) and has no field either.
 BarsXFA4 = NamedTuple("BarsXFA4", [(row[0], MBarrier) for row in BAR_LAYOUT_XFA4])
-_BARS_XFA4_STATUS = BAR_LAYOUT_XFA4_STATUS
 assert (
     tuple(BarsXFA4._fields)
     == tuple(row[0] for row in BAR_LAYOUT_XFA4)
@@ -2072,7 +2071,7 @@ def _mma_loop_follower(bars, sched, pair, head, batch, meta, n_batch, causal: cu
         _credit(bars.sched_empty[sched_state.idx])
         elect_p = nvvm.elect_sync()
         lo, hi, seq_q, seq_k, q_start = _item_bounds(pair, meta, batch, n_batch, causal)
-        for qtile in cutlass.range(lo, hi, 1, unroll=1):
+        for _ in cutlass.range(lo, hi, 1, unroll=1):
             if cutlass.const_expr(dbg is not None):
                 _clk_add(dbg, _W["tiles_follower"], cutlass.Int32(1))
             _wait(bars.ds_smem, relay_state.phase, dbg, _W["wait:follower:ds_smem"])
@@ -2136,7 +2135,7 @@ def _reduce_loop(
     while valid != 0:
         _credit(bars.sched_empty[sched_state.idx])
         lo, hi, seq_q, seq_k, q_start = _item_bounds(pair, meta, batch, n_batch, causal)
-        for qtile in cutlass.range(lo, hi, 1, unroll=1):
+        for _ in cutlass.range(lo, hi, 1, unroll=1):
             _wait_tcgen(bars.dq_done, dq_state.phase, None, 0)
             _skew_follower_dq_readout(rank)  # skew lever 6 (16w_fa4 site): the FOLLOWER holds its dQ readout (s_tail_empty alone holds S^T(t+1))
             dq = _tmem_load(tmem_base + CFG.DQ_COL, CFG.DQ_COLS)
@@ -2334,10 +2333,10 @@ def _load_loop(
         pair, head, batch, valid, sched_state = _next_tile(sched, bars, sched_state, dbg, _W["wait:loader:sched_full"])
     if cutlass.const_expr(CFG.CTA_MMA == 2):
         # P15: whole-ring drains from the CARRIED states (the leader's last multicast commits must land on a resident follower).
-        q1_state = _drain(bars.q1_empty, q1_state, CFG.Q1_STAGES, dbg, _W["wait:loader:q1_empty"])
-        q2_state = _drain(bars.q2_empty, q2_state, 1, dbg, _W["wait:loader:q2_empty"])
-        do1_state = _drain(bars.do1_empty, do1_state, 1, dbg, _W["wait:loader:do1_empty"])
-        do2_state = _drain(bars.do2_empty, do2_state, 1, dbg, _W["wait:loader:do2_empty"])
+        _drain(bars.q1_empty, q1_state, CFG.Q1_STAGES, dbg, _W["wait:loader:q1_empty"])
+        _drain(bars.q2_empty, q2_state, 1, dbg, _W["wait:loader:q2_empty"])
+        _drain(bars.do1_empty, do1_state, 1, dbg, _W["wait:loader:do1_empty"])
+        _drain(bars.do2_empty, do2_state, 1, dbg, _W["wait:loader:do2_empty"])
         _drain(bars.k1_empty, kv_state, 1, dbg, _W["wait:loader:k1_empty"])
         _drain(bars.v_empty, kv_state, 1, dbg, _W["wait:loader:v_empty"])
 
@@ -2364,7 +2363,7 @@ def _store_loop(
 ):
     """Warp 14, BOTH CTAs: dQ reduce-add out of the DEDICATED sDQ ring (4 fp32 slices [64 q x 32 d] per tile in TWO rounds of two slots; one
     reduce per PAIR tile), dV / dK native stores.
-    ``diag_2cta_code`` (DIAGNOSTIC, default DIAG_NONE = this body): DIAG_DQ_REDUCE_ADD_OFF skips the four tma_reduce_add ISSUES per tile
+    ``diag_2cta_code`` (DIAGNOSTIC, default diag_2cta_code(None) = 0 = this body): DIAG_DQ_REDUCE_ADD_OFF skips the four tma_reduce_add ISSUES per tile
     (dq_reduce_add_off); the dq_full waits, the commit / wait groups and the per-round dq_empty arrives stay, so the 2-slot ring balance holds (2N per
     slot per item) and dQ stays ZERO (output WRONG BY DESIGN; `--validate` refuses the arm).
     The six mbarrier waits of this warp (dq_full x 4 USES, dv_full, dk_full) go through :func:`_wait_store` (the declared parity-wait form).
@@ -2494,7 +2493,7 @@ def bprop_d128_accum_grouped_2cta_stail_kernel(
     ``warp_roles`` field.
     ``mask_form_code`` = the softmax's mask form (header section 11: MASK_FORM_FSEL = the default; MASK_FORM_PREDICATED = the interior-tile
     mask skip; MASK_FORM_DIAG_OFF = the DIAGNOSTIC ceiling, output wrong by design), from the typed ``mask_form`` field;
-    read by the softmax role only.  ``diag_2cta_code`` = the DIAGNOSTIC probe (header section 11; DIAG_NONE = this body), from the typed
+    read by the softmax role only.  ``diag_2cta_code`` = the DIAGNOSTIC probe (header section 11; diag_2cta_code(None) = 0 = this body), from the typed
     ``diag_2cta`` field; ``debug_clk`` / ``dbg_clk`` = the STAMPS lever (header section 11) and its Int32 dump tensor (None = dropped from the
     signature when off: byte-identical rendering).
     ``dkv_fp32`` = the op-level ``dkv_accum`` field (header section 11: False = bf16 partials + the fold, the default rendering; True = fp32
