@@ -1145,6 +1145,11 @@ class CfgD256:
     EPILOGUE_GATE: int = 0
     GATE_BPE: int = 2
 
+    # Half causal schedule: the dedicated correction WG also generates P1.
+    # Unlike MXFP8 FUSED_CORR_SPLIT_P, this retains one softmax WG and four
+    # correction warps. Append-only internal topology, not an autotune knob.
+    HALF_FUSED_CORR_SPLIT_P: int = 0
+
 
 def d256_gate_smem_bytes(cfg: CfgD256) -> int:
     """The SMEM the GATED d256 half rendering allocates, from the SAME constants its arrays are declared with:
@@ -1172,12 +1177,30 @@ def _validate_cfg_d256(cfg: CfgD256) -> None:
     checks = (
         (cfg.MMA_REGS == cfg.TMALDG_REGS == cfg.TMASTG_REGS == cfg.SCHEDULER_REGS, "d256: MMA/TMALDG/TMASTG/SCHEDULER regs must match"),
         (
-            cfg.MMA_REGS + (0 if fused_corr_split_p else cfg.CORRECTION_REGS) + cfg.SOFTMAX_REGS + cfg.SOFTMAX_WG1_REGS <= 512,
+            cfg.MMA_REGS + (0 if fused_corr_split_p else cfg.CORRECTION_REGS) + cfg.SOFTMAX_REGS + (cfg.SOFTMAX_WG1_REGS if split_p else 0) <= 512,
             "d256: register budget over 512",
         ),
         (
             cfg.MMA_REGS % 8 == 0 and cfg.CORRECTION_REGS % 8 == 0 and cfg.SOFTMAX_REGS % 8 == 0 and cfg.SOFTMAX_WG1_REGS % 8 == 0,
             "d256: per-role regs must be multiples of 8",
+        ),
+        (
+            not cfg.HALF_FUSED_CORR_SPLIT_P
+            or (
+                cfg.DTYPE_QKV == DTYPE_BF16
+                and cfg.MASK_FLAGS == MASK_CAUSAL
+                and not cfg.BOTTOM_RIGHT
+                and not cfg.WINDOW_LEFT
+                and not cfg.WINDOW_RIGHT
+                and not cfg.THD_VARLEN
+                and not cfg.PAGED_KV
+                and not cfg.EPILOGUE_GATE
+                and cfg.SPLIT_KV == 1
+                and not split_p
+                and not fused_corr_split_p
+                and cfg.CORRECTION_WARPS == 4
+            ),
+            "d256: half fused correction requires dense unsplit BF16 top-left causal",
         ),
         (cfg.CGA_M == cfg.CTA_MMA, "d256 flavor pairs CGA_M with CTA_MMA"),
         (cfg.CTA_MMA == (1 if fp8 else 2), "d256 SM100: FP8 requires CTA1; BF16/FP16 requires CTA2"),
@@ -1295,6 +1318,17 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
     split_p = fp8 and (mask_flags == MASK_NONE or pt_plain_top_left_causal)
     pt_thd_split_p = pt_plain_top_left_causal and bool(mask_flags & MASK_PADDED)
     fused_corr_split_p = mxfp8 and strict_top_left_causal
+    half_fused_corr_split_p = (
+        not mxfp8
+        and params.dtype_qkv == DTYPE_BF16
+        and mask_flags == MASK_CAUSAL
+        and strict_top_left_causal
+        and not params.window_left
+        and not params.thd_varlen
+        and not params.paged_kv
+        and not params.epilogue_gate
+        and params.split_kv == 1
+    )
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     b_o = bpe(dtype_o)
 
@@ -1303,7 +1337,11 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
     pt_e4_causal_regs = not mxfp8 and params.dtype_qkv == DTYPE_E4M3 and mask_flags == MASK_CAUSAL and not params.bottom_right
     pt_e5_causal_regs = not mxfp8 and params.dtype_qkv == DTYPE_E5M2 and mask_flags == MASK_CAUSAL and not params.bottom_right
     softmax_regs, softmax_wg1_regs, correction_regs = 240, 136 if split_p else 40, 96
-    if fused_corr_split_p:
+    if half_fused_corr_split_p:
+        # 4 warps each: 240 softmax + 216 correction/P1 + 48 other = 504.
+        # WG1's legal tracing placeholder does not represent a live warpgroup.
+        correction_regs = 216
+    elif fused_corr_split_p:
         softmax_regs, softmax_wg1_regs, correction_regs = 248, 216, 64
     elif mxfp8 and split_p:
         softmax_regs, softmax_wg1_regs, correction_regs = 256, 144, 72
@@ -1353,6 +1391,14 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
         SOFTMAX_WARPGROUPS=2 if split_p or fused_corr_split_p else 1,
         CORRECTION_WARPS=0 if fused_corr_split_p else 4,
         FUSED_CORR_SPLIT_P=1 if fused_corr_split_p else 0,
+        HALF_FUSED_CORR_SPLIT_P=int(half_fused_corr_split_p),
+        # Forty registers spill the producer/scheduler's live metadata under
+        # the fused role split; 48 stays within the 64K register file.
+        MMA_REGS=48 if half_fused_corr_split_p else 40,
+        TMALDG_REGS=48 if half_fused_corr_split_p else 40,
+        TMASTG_REGS=48 if half_fused_corr_split_p else 40,
+        SCHEDULER_REGS=48 if half_fused_corr_split_p else 40,
+        OTHER_REGS=48 if half_fused_corr_split_p else 40,
         SOFTMAX_REGS=softmax_regs,
         SOFTMAX_WG1_REGS=softmax_wg1_regs,
         CORRECTION_REGS=correction_regs,
