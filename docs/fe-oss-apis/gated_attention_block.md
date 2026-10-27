@@ -1286,8 +1286,8 @@ a split past the item's tile count, `causal_bottom_right` on the block's OWN K /
 pools (`index_source="indexer"`) and `fuse_prepare` on this mode are SERVED since 2026-10-21 (the next paragraph).  The envelope's
 `decode.sparse_core` names the stage, `decode.requires` spells both list forms, `decode.routes` is empty (the dense tile's facts
 do not apply).  **Two bodies, one function (`sparse_tile_form`, the knobs table above):** the sparse core is the tcgen05 tile
-(`sparse_d256_f16`) or, on `sparse_tile_form="lean"`, the LEAN decode tile (`sparse_lean_d256_f16`: one 128-thread `mma.sync` + `cp.async`
-CTA per (sequence, KV head, chunk of k 32-key sub-tiles), no TMEM / TMA / CLC, the SAME fp32 split-major partials into the workspace, the
+(`sparse_d256_f16`) or, on `sparse_tile_form="lean"`, the LEAN decode tile (`sparse_lean_d256_f16`: one `mma.sync` + `cp.async`
+CTA of 128 x N_MT threads per (sequence, KV head, chunk of k 32-key sub-tiles; N_MT = ceil(S_q x G / 16) m16 tiles of four warps each), no TMEM / TMA / CLC, the SAME fp32 split-major partials into the workspace, the
 same combine with the gate riding it) -- at `S_q <= 4` under the shared list (one list per sequence: every row of the step in one CTA,
 `n_mt = ceil(S_q x G / 16)` m16 tiles over one gathered sub-tile; the per-row list at one row per sequence is the same list),
 bf16 / f16, `G <= 16`, `top_k >= 8`, `decode_split_kv` None (the lean split 65 at the default k 1) or a lean split; `"auto"` takes the lean tile

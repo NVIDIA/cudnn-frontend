@@ -3724,7 +3724,8 @@ count, the kernel's own epilogue gate under a split (the combine carries it), a 
 of a dense batch, log2 stats, a pure caller list without the tail, head dims other than 256, FP8 / MXFP8.
 
 **The SECOND BODY of the function -- the LEAN decode tile** (`python/cudnn/sdpa/fwd/kernels/sm107/sparse_lean_d256_f16.py`: `mma.sync`
-m16n8k16 + `cp.async`, one 128-thread CTA per (sequence, KV head, chunk of `k` 32-key sub-tiles), four warps each owning a 64-wide
+m16n8k16 + `cp.async`, one CTA of 128 x N_MT threads per (sequence, KV head, chunk of `k` 32-key sub-tiles; N_MT = ceil(S_q x G / 16) m16 tiles
+of four warps), each warp owning a 64-wide
 d-slice -- BMM1 split-K over the warps with an 8-KiB SMEM exchange and a fixed-order sum, the softmax redundant per warp, BMM2 on the
 warp's own 16 x 64 O slice --, the one-shot zero-filled `cp.async` gather of the rows the list names, no TMEM / TMA / CLC / mbarrier /
 warp specialization; the visible set from the ONE helper it shares with the tcgen05 core, `sm107/_sparse_item_common.py`, whose cubins
@@ -3750,7 +3751,8 @@ row, `top_k` below 8, the tcgen05 core's `softmax_groups`; a split that is not a
 dense decode tile --, so an explicit body is a typed decline naming the arm and `sparse_tile` / the envelope's `.sparse_tile(..., kv_cache_dtype=e4m3)`
 read None (never the name of a kernel that does not run).  PLACEMENT (`sparse_tile_rules.sparse_decode_lean_tile_selected`): the lean tile below
 `B x H_kv <= LEAN_SPARSE_MAX_UNITS = 4` CTAs per chunk on cc 10.7 with `top_k >= 8`, the tcgen05 core above -- the unit is the lean grid's own
-(one 128-thread CTA per (sequence, KV head, chunk); the step's S_q rows ride inside the CTA as m16 tiles, so S_q changes no grid and is not in
+(one CTA of 128 x N_MT threads per (sequence, KV head, chunk); the step's S_q rows ride inside the CTA as N_MT = ceil(S_q x G / 16) m16 tiles
+of four warps each -- 128 threads at S_q 1 / G 12, 512 at S_q 4 / G 16 -- so S_q sizes the CTA, not the grid, and is not in
 the bound: B 1 and B 2 on two KV heads take the lean body at every served S_q 1..4, the shared-list block at B 1 x S_q 2..4 included) --
 consulted by `"auto"` ONLY on the parts of `SPARSE_LEAN_TILE_DEFAULT_CCS` = `((10, 7),)` since the end-to-end gate (2026-10-26; the
 measured-default rule: the tuple flipped with the gate's table, the bound refit from it to 4 over `B x H_kv x S_q`; 2026-10-27 the unit

@@ -55,10 +55,11 @@ SPARSE_TILE_LEAN = "sparse_lean_d256_f16"
 ``kernel_template`` and the block's ``sparse_tile`` read back, so a route is PINNED by the kernel that compiled, never transcribed."""
 LEAN_SPARSE_MAX_UNITS = 4
 """The PLACEMENT bound, in CTAs PER CHUNK: the lean tile below ``B x H_kv <= 4`` (B <= 2 on two KV heads, at EVERY served step width
-S_q 1..4), the tcgen05 core above.  The unit is the lean grid's own: one 128-thread CTA per (sequence, KV head, chunk of k sub-tiles),
-the step's S_q rows riding INSIDE the CTA as ``N_MT = ceil(S_q x G / 16)`` m16 tiles -- the grid is ``B x H_kv x split``, so S_q
-changes no grid and is NOT in the bound (the served rows are :func:`sparse_lean_tile_decline`'s business: ``S_q <= 4`` under one
-shared list).  The lean tile's advantage is the ABSENCE of the tcgen05 core's ~4.5-us per-CTA chain on a launch that is
+S_q 1..4), the tcgen05 core above.  The unit is the lean grid's own: one CTA per (sequence, KV head, chunk of k sub-tiles) of
+``128 x N_MT`` threads, the step's S_q rows riding INSIDE the CTA as ``N_MT = ceil(S_q x G / 16)`` m16 tiles of four warps each
+(128 threads at S_q 1 / G 12, 512 at S_q 4 / G 16; ``config_sm107.make_cfg_d256_sparse_lean`` pins ``THREADS``) -- the grid is
+``B x H_kv x split``, so S_q sizes the CTA, not the grid, and is NOT in the bound (the served rows are :func:`sparse_lean_tile_decline`'s business:
+``S_q <= 4`` under one shared list).  The lean tile's advantage is the ABSENCE of the tcgen05 core's ~4.5-us per-CTA chain on a launch that is
 latency-bound (one wave of small CTAs: the 212-SM class measured the kernel alone 3.34 vs 5.66 us at B 1 x 8K x S_q 1, +69 %, and the
 chain 8.32 -> 5.75 us); it shrinks as the launch becomes HBM-bound, where both tiles move the same bytes and the lean form's shared
 gather forces a split whose combine on a 768-block grid costs more than the tcgen05 core's lean walk at split 4 (B 32 x S_q 1: a
