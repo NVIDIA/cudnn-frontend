@@ -82,8 +82,8 @@ only (the graph attribute is forward-only).
 `sdpa_bwd_sm100` (f16/bf16, d in (256, 512]) is a default candidate too: the backend has no SM100
 engine for that band, so it is the only provider there. `sdpa_bwd_sm100_d128` is a default candidate that ranks
 ahead of the backend for d128 THD without a window and behind it elsewhere; `sdpa_bwd_sm100_d256` is a default candidate that
-ranks ahead of the backend for d256 on cc 10.0 (except mask-free ragged THD past S_q 4096) and behind it for D192x128 and
-everywhere else (`sdpa/bwd/heuristics.py`). Every other
+ranks ahead of the backend for d256 on cc 10.0 and behind it for mask-free ragged THD past S_q 4096, D192x128, other parts,
+and deterministic, bias, dropout, windowed or sink graphs (`sdpa/bwd/heuristics.py`). Every other
 FROST SDPA engine is `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before
 `import cudnn` or the graph runs a cuDNN backend plan. The flag also ranks FROST first everywhere.
 
