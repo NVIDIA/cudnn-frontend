@@ -192,6 +192,7 @@ __all__ = [
     "SMEM_USABLE_BYTES",
     "SM107_FP8_THD_SHAPES",
     "SM107_FP8_SPLIT_SHAPES",
+    "SM107_FP8_PACK_GQA_SHAPES",
     "SM107_F16_THD_SHAPES",
     "SM107_EPILOGUE_GATE_SHAPES",
     "SM107_SCORE_STATS_SHAPES",
@@ -296,6 +297,8 @@ _O_BLOCK_SCALE_BY_DTYPE = {_DTYPE_O_NVFP4: 16, _DTYPE_O_MXFP8: 32}
 SM107_FP8_THD_SHAPES = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
 # Bodies with FP32 partial stores: shared by factory, admission and prepared workspace.
 SM107_FP8_SPLIT_SHAPES = frozenset({(64, 64), (128, 128), (192, 128)})
+# Packing and splitting are separate domains; both graph and adapter read this one.
+SM107_FP8_PACK_GQA_SHAPES = frozenset({(64, 64), (128, 128), (192, 128)})
 
 # f16/bf16 flavor names whose kernel body HAS been ported to the FROST
 # setup-kernel contract (the 14-arg build_thd_meta_o_descs_kernel + the 4B+4

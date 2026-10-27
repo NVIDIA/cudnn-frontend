@@ -74,6 +74,7 @@ from cudnn.sdpa.fwd.config_sm107 import (
     SM107_F16_THD_SHAPES,
     SM107_FP8_THD_SHAPES,
     SM107_FP8_SPLIT_SHAPES,
+    SM107_FP8_PACK_GQA_SHAPES,
     SM107_MXFP8_THD_SHAPES,
     SM107_SCORE_STATS_SHAPES,
     SM107_SMALL_D_CGAS,
@@ -2848,13 +2849,9 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             split_kv_supported=True,
             split_d_shapes=(SM107_FP8_SPLIT_SHAPES if rubin_row else frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})),
             pack_gqas=frozenset({False, True}),
-            # SM107: PackGQA is wired in the d128 FP8 BODY at D64 and D128.
-            # The d192xd128 sibling shares it, but stays declined until its PackGQA
-            # path is actually validated on Rubin (a shared body is evidence
-            # the code exists, not that it is correct at a wider K).  The
-            # ported d256/d512 kernels do not wire it at all, as they do not
-            # wire split-KV.
-            pack_gqa_d_shapes=(frozenset({(64, 64), (128, 128)}) if rubin_row else None),
+            # Native SM107 per-tensor FP8 D64/D128/D192x128 pack whole GQA
+            # groups. D256/D512 retain their independent packing decline.
+            pack_gqa_d_shapes=(SM107_FP8_PACK_GQA_SHAPES if rubin_row else None),
             # Fused epilogue gate on the Rubin d256 FP8 kernel (E4M3 / E5M2 in,
             # any out dtype): G is staged in BF16 (kernel GATE_STORAGE_DTYPE), so
             # the row names that one dtype rather than inheriting Q's.  The FP8

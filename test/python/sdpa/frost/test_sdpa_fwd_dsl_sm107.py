@@ -1060,19 +1060,19 @@ def test_sm107_nonpaged_d128_thd_pack_gqa_contract(dtype_name, group, cga):
     assert engines.mismatch(caps, facts, dataclasses.replace(knobs, cga=4)) is not None
 
 
-def test_sm107_fp8_pack_gqa_serves_d64_and_d128():
-    """Native D64 and D128 pack GQA; wider siblings retain their typed decline."""
+def test_sm107_fp8_pack_gqa_serves_native_split_flavors():
+    """D64/D128/D192 pack GQA; D256/D512 retain their typed decline."""
     from cudnn.sdpa.fwd import engines
 
     caps = _caps("sdpa_fwd_prefill_sm107_fp8")
-    assert caps.pack_gqa_d_shapes == frozenset({(64, 64), (128, 128)})
-    for d_qk, d_v in ((192, 128), (256, 256), (512, 512)):
+    assert caps.pack_gqa_d_shapes == frozenset({(64, 64), (128, 128), (192, 128)})
+    for d_qk, d_v in ((256, 256), (512, 512)):
         facts = _f16_facts(**_fp8_ungated_kw(h_kv=2, d_qk=d_qk, d_v=d_v))
         assert engines.mismatch(caps, facts) is None, (d_qk, d_v, "the unpacked graph must be served")
         why = engines.mismatch(caps, facts, engines.SdpaFwdKnobs(pack_gqa=True))
         assert why is not None and "pack_gqa" in why, (d_qk, d_v, why)
-    for d in (64, 128):
-        packed = _f16_facts(**_fp8_ungated_kw(h_kv=2, d_qk=d, d_v=d))
+    for d_qk, d_v in ((64, 64), (128, 128), (192, 128)):
+        packed = _f16_facts(**_fp8_ungated_kw(h_kv=2, d_qk=d_qk, d_v=d_v))
         assert engines.mismatch(caps, packed, engines.SdpaFwdKnobs(pack_gqa=True)) is None
 
 
