@@ -383,93 +383,84 @@ def test_nonpaged_d128_thd_lead_serves_a_valid_packed_first_plan(group, causal, 
 
 
 @pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
-@pytest.mark.parametrize(
-    "batch,q,kv,expected",
-    [
-        (1, 8192, 8192, "lead"),
-        (16, 4096, 4096, "lead"),
-        (4, 4096, 4096, "lead"),
-        (16, 512, 4096, "trail"),  # a chunk: the declared Q extent below the KV extent
-        (4, 256, 4096, "trail"),  # the chunks that measured behind the backend
-        (4, 256, 1024, "trail"),
-        (16, 512, 512, "trail"),  # cache below 4096 tokens
-        (64, 256, 256, "trail"),
-        (1, 256, 256, "trail"),
-    ],
-)
-def test_nonpaged_d128_mha_thd_leads_from_512_declared_tokens(device_cc, batch, q, kv, expected):
-    """Unpacked MHA d128 causal THD leads when the declaration admits no chunk over a longer cache (equal extents, equal totals when
-    declared), the cache holds at least 4096 declared tokens and each sequence carries 512 declared Q tokens; chunks, a Q total declared
-    alone, shorter caches, HALF, non-causal and windowed graphs stay backend-first."""
+def test_nonpaged_d128_mha_thd_lead_follows_the_module_bounds(device_cc, monkeypatch):
+    """Unpacked MHA d128 causal THD leads where the rule's own constants say so: a declaration without a prefix chunk (equal
+    extents, equal totals when declared), a cache of at least NONPAGED_D128_MHA_THD_MIN_KV_TOKENS and
+    NONPAGED_D128_MHA_THD_MIN_TOKENS declared Q tokens per sequence, on a cc in NONPAGED_D128_MHA_THD_CCS.  The bounds are read
+    from the module and moved under a monkeypatch, so no measured boundary is pinned; the declaration contract and the structural
+    exclusions (a Q total alone, HALF, non-causal, windowed, another cc) are the test."""
     from cudnn.sdpa.fwd import placement
 
-    base = dict(d_qk=128, b=batch, h_q=32, h_kv=32, s_q=q, s_kv=kv, causal=True, bottom_right=True, dtype=cudnn.data_type.BFLOAT16, device_cc=device_cc)
-    assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**base)) == getattr(placement, expected.upper())
-    if expected == "lead":
-        assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, "dtype": cudnn.data_type.HALF})) == placement.TRAIL
-        assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, "causal": False, "bottom_right": False})) == placement.TRAIL
-        assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, "window_left": 128})) == placement.TRAIL
-        assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, "max_total_seq_len_q": 128})) == placement.TRAIL
-        assert (
-            placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, "max_total_seq_len_q": 0})) == placement.TRAIL
-        )  # an explicit zero total
-    cache = dict(base, b=4096, s_q=65536, s_kv=65536)
-    assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**cache)) == placement.LEAD  # FlashInfer cache-shape declaration
-    assert (
-        placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**cache, "max_total_seq_len_q": 16384})) == placement.TRAIL
-    )  # a Q total declared alone (FlashInfer under CUDA graphs) admits chunks over a longer cache
-    assert (
-        placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**cache, "max_total_seq_len_q": 16384, "max_total_seq_len_kv": 16384}))
-        == placement.TRAIL
-    )  # equal totals, but four tokens per declared sequence
-    few = dict(base, b=4, s_q=4096, s_kv=4096)
-    assert (
-        placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**few, "max_total_seq_len_q": 4096, "max_total_seq_len_kv": 4096})) == placement.LEAD
-    )  # equal totals: no sequence can see a longer cache than its query
-    assert (
-        placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**few, "max_total_seq_len_q": 1024})) == placement.TRAIL
-    )  # a Q total below the cache capacity: 256-token queries over 4096-token caches
+    min_tokens, min_kv = placement.NONPAGED_D128_MHA_THD_MIN_TOKENS, placement.NONPAGED_D128_MHA_THD_MIN_KV_TOKENS
+    s = max(min_tokens, min_kv)
+
+    def place(**kw):
+        base = dict(d_qk=128, b=4, h_q=32, h_kv=32, s_q=s, s_kv=s, causal=True, bottom_right=True, dtype=cudnn.data_type.BFLOAT16, device_cc=device_cc)
+        return placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, **kw}))
+
+    assert place() == placement.LEAD
+    assert place(s_q=min_kv - 1, s_kv=min_kv - 1) == placement.TRAIL  # the cache floor
+    assert place(max_total_seq_len_q=4 * (min_tokens - 1), max_total_seq_len_kv=4 * (min_tokens - 1)) == placement.TRAIL  # below the per-sequence tokens
+    assert place(max_total_seq_len_q=4 * min_tokens, max_total_seq_len_kv=4 * min_tokens) == placement.LEAD  # at them
+    with monkeypatch.context() as m:
+        m.setattr(placement, "NONPAGED_D128_MHA_THD_MIN_KV_TOKENS", 2 * s)
+        assert place() == placement.TRAIL
+        assert place(s_q=2 * s, s_kv=2 * s) == placement.LEAD
+    # Declarations that admit a chunk over a longer cache.
+    assert place(s_q=s // 2) == placement.TRAIL  # unequal extents
+    assert place(max_total_seq_len_q=2 * s) == placement.TRAIL  # a Q total declared alone
+    cache = dict(b=4096, s_q=16 * s, s_kv=16 * s)
+    assert place(**cache) == placement.LEAD  # a cache-shape declaration
+    assert place(**cache, max_total_seq_len_q=4 * s) == placement.TRAIL  # a Q total declared alone
+    assert place(**cache, max_total_seq_len_q=4 * s, max_total_seq_len_kv=4 * s) == placement.TRAIL  # equal totals, a few tokens per declared sequence
+    for other in (
+        dict(dtype=cudnn.data_type.HALF),
+        dict(causal=False, bottom_right=False),
+        dict(window_left=128),
+        dict(max_total_seq_len_q=0),  # an explicit zero total
+        dict(device_cc=(12, 0)),
+    ):
+        assert place(**other) == placement.TRAIL, other
 
 
 @pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
 @pytest.mark.parametrize("h_q,h_kv", [(32, 4), (32, 32), (64, 8)])
-@pytest.mark.parametrize(
-    "batch,q,kv,expected",
-    [(1, 8192, 8192, "lead"), (16, 512, 512, "lead"), (16, 512, 4096, "trail"), (64, 256, 256, "trail"), (1, 256, 256, "trail")],  # (16, 512, 4096): a chunk
-)
-def test_nonpaged_d64_thd_leads_from_512_declared_tokens(device_cc, h_q, h_kv, batch, q, kv, expected):
-    """Unpacked d64 causal THD leads when the declaration admits no chunk over a longer cache and each sequence carries 512 declared tokens;
-    chunks, a Q total declared alone, small, HALF, non-causal and windowed graphs stay backend-first."""
+def test_nonpaged_d64_thd_lead_follows_the_module_bounds(device_cc, h_q, h_kv, monkeypatch):
+    """Unpacked d64 causal THD leads where NONPAGED_D64_THD_MIN_TOKENS (the per-sequence Q tokens and the cache floor) and
+    NONPAGED_D64_THD_CCS say so, under a declaration without a prefix chunk; the bounds are read from the module and moved under a
+    monkeypatch, the declaration contract and the structural exclusions are the test."""
     from cudnn.sdpa.fwd import placement
 
-    base = dict(
-        d_qk=64, d_v=64, b=batch, h_q=h_q, h_kv=h_kv, s_q=q, s_kv=kv, causal=True, bottom_right=True, dtype=cudnn.data_type.BFLOAT16, device_cc=device_cc
-    )
-    assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**base)) == getattr(placement, expected.upper())
-    if expected == "lead":
-        assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, "device_cc": (12, 0)})) == placement.TRAIL
-        assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, "dtype": cudnn.data_type.HALF})) == placement.TRAIL
-        assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, "causal": False, "bottom_right": False})) == placement.TRAIL
-        assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, "window_left": 128})) == placement.TRAIL
-        assert (
-            placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, "max_total_seq_len_q": 0})) == placement.TRAIL
-        )  # an explicit zero total
-    cache = dict(base, b=4096, s_q=65536, s_kv=65536)
-    assert placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**cache)) == placement.LEAD  # FlashInfer cache-shape declaration
-    assert (
-        placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**cache, "max_total_seq_len_q": 16384})) == placement.TRAIL
-    )  # a Q total declared alone (FlashInfer under CUDA graphs) admits chunks over a longer cache
-    assert (
-        placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**cache, "max_total_seq_len_q": 16384, "max_total_seq_len_kv": 16384}))
-        == placement.TRAIL
-    )  # equal totals, but four tokens per declared sequence
-    few = dict(base, b=4, s_q=4096, s_kv=4096)
-    assert (
-        placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**few, "max_total_seq_len_q": 4096, "max_total_seq_len_kv": 4096})) == placement.LEAD
-    )  # equal totals: no sequence can see a longer cache than its query
-    assert (
-        placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**few, "max_total_seq_len_q": 1024})) == placement.TRAIL
-    )  # a Q total below the cache capacity: 256-token queries over 4096-token caches
+    s = placement.NONPAGED_D64_THD_MIN_TOKENS
+
+    def place(**kw):
+        base = dict(
+            d_qk=64, d_v=64, b=4, h_q=h_q, h_kv=h_kv, s_q=s, s_kv=s, causal=True, bottom_right=True, dtype=cudnn.data_type.BFLOAT16, device_cc=device_cc
+        )
+        return placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, **kw}))
+
+    assert place() == placement.LEAD
+    assert place(s_q=s - 1, s_kv=s - 1) == placement.TRAIL  # the cache floor
+    assert place(s_q=2 * s, s_kv=2 * s, max_total_seq_len_q=4 * (s - 1), max_total_seq_len_kv=4 * (s - 1)) == placement.TRAIL  # below the per-sequence tokens
+    assert place(s_q=2 * s, s_kv=2 * s, max_total_seq_len_q=4 * s, max_total_seq_len_kv=4 * s) == placement.LEAD  # at them
+    with monkeypatch.context() as m:
+        m.setattr(placement, "NONPAGED_D64_THD_MIN_TOKENS", 2 * s)
+        assert place() == placement.TRAIL
+        assert place(s_q=2 * s, s_kv=2 * s) == placement.LEAD
+    assert place(s_q=2 * s, s_kv=8 * s) == placement.TRAIL  # unequal extents: a chunk over a longer cache
+    assert place(s_q=8 * s, s_kv=8 * s, max_total_seq_len_q=16 * s) == placement.TRAIL  # a Q total declared alone
+    cache = dict(b=4096, s_q=128 * s, s_kv=128 * s)
+    assert place(**cache) == placement.LEAD  # a cache-shape declaration
+    assert place(**cache, max_total_seq_len_q=32 * s) == placement.TRAIL  # a Q total declared alone
+    assert place(**cache, max_total_seq_len_q=32 * s, max_total_seq_len_kv=32 * s) == placement.TRAIL  # equal totals, a few tokens per declared sequence
+    for other in (
+        dict(dtype=cudnn.data_type.HALF),
+        dict(causal=False, bottom_right=False),
+        dict(window_left=128),
+        dict(max_total_seq_len_q=0),  # an explicit zero total
+        dict(device_cc=(12, 0)),
+    ):
+        assert place(**other) == placement.TRAIL, other
 
 
 @requires_dsl
