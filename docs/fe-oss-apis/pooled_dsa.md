@@ -77,16 +77,26 @@ selects top-k pools, and expands them into token IDs. Optional cache updates
 run first. Inputs begin after Q/K projection; Q rotation and quantization
 remain upstream. Final sparse attention over token K/V is a separate operation.
 
-The score for query `i` and pool `j` is
+The real-valued score for query `i` and pool `j` is
 `sum_h weights[i,h] * max(dot(q[i,h], pooled_key[j]), 0)`.
 Only `j < floor((positions[i] + 1) / pool_size)` is eligible. Pool selection
 uses these index scores; it does not apply attention softmax.
 
+BF16 weights select the SM100 DeepGEMM arithmetic contract: tensor-core
+dot products accumulate in FP32, each ReLU result rounds to BF16, and four
+BF16 fused multiply-add chains reduce heads `0,4,...`, `1,5,...`,
+`2,6,...`, and `3,7,...`. BF16 adds combine chains 0+2, 1+3, then the
+two results. The materialized logits are BF16. This is not equivalent to
+rounding an FP32 weighted sum once at the end.
+
+FP32 weights retain the FP32 reduction and logits path. The API never
+casts weights; their dtype selects the arithmetic and scratch dtype.
+
 | Argument | Dtype and shape | Meaning |
 |---|---|---|
-| `q` | BF16/E4M3 `(N,32,128)` or UINT8 `(N,32,64)` | Rotated index queries; FP4 packs two E2M1 values per byte |
-| `weights` | FP32 `(N,32)` | Head weights; FP8 query scales must be folded into them |
-| `q_scale` | FP4 only: UINT8 `(N,32,4)` or INT32 `(N,32)` | Four UE8M0 scale bytes per head, packed in INT32 if desired |
+| `q` | BF16/E4M3 `(N,32,128)` or UINT8/INT8 `(N,32,64)` | Rotated index queries; FP4 packs two E2M1 values per byte |
+| `weights` | BF16 or FP32 `(N,32)` | BF16 matches the native SM100 DeepGEMM head reduction and logits |
+| `q_scale` | UINT8 `(N,32,4)` or INT32 `(N,32)` | Four UE8M0 scale bytes per head; required for FP4, optional for FP8 with `fp8_scale_format="ue8m0"` |
 | `cache` | UINT8 `(physical_pages,page_bytes)` | Pooled-key cache; formats below |
 | `block_table` | INT32 `(requests,pages_per_request)` | Logical-to-physical page mapping |
 | `cu_query` | INT32 `(requests+1,)` | Offsets of packed query rows |
@@ -103,12 +113,21 @@ the choice among tied scores are unspecified.
 ```python
 from cudnn.ops import dsa
 
+# Native SM100 FP8: BF16 weights, packed UE8M0 Q scales and cache scales.
 result = dsa.pooled_indexer_forward(
     q, weights, cache, block_table, cu_query, positions, q_scale,
-    cache_dtype="fp4", mode="decode", max_query_tokens=1,
+    cache_dtype="fp8", fp8_scale_format="ue8m0",
+    mode="decode", max_query_tokens=1,
     current_stream=stream)
 indices = result["indices"]
 ```
+
+FP8 `q_scale=None` uses unit Q scales; callers may fold positive query
+scales into weights upstream, as vLLM does. Explicit scales support four
+different 32-channel scales per head. With the default
+`fp8_scale_format="fp32"`, the cache uses FP32 scales and Q scales must
+be folded into weights. Set the same format on the cache writer and reader.
+FP4 uses packed UE8M0 scales and accepts signed or unsigned packed Q bytes.
 
 For cache writes, pass all six keyword tensors `keys`, `gates`, `ape`,
 `tail`, `pool_slots`, and `tail_slots` to the forward call.
@@ -117,8 +136,9 @@ query.
 
 `max_query_tokens` is a host upper bound on each request's query count,
 not its context length. `mode="decode"` supports packed multi-token
-requests and partial-pool continuation. `mode="prefill"` tiles four
-queries per score program; cache writes require pool-aligned chunk starts.
+requests and partial-pool continuation. `mode="prefill"` tiles two
+queries per BF16 score program and four for FP32; cache writes require
+pool-aligned chunk starts.
 Empty requests are allowed. `cu_query` must be monotonic, start at zero,
 and end at `N`. The bound must cover every offset difference. Each
 request's complete causal pools must fit its valid page-table entries.
@@ -129,12 +149,16 @@ with token expansion. The selector has separate prefill and decode kernels.
 Each keeps selected pool IDs in shared memory and writes token IDs, tail
 tokens, and padding directly. Cache writes add one fused launch. Scoring reads the
 page table directly, including in prefill. There is no gathered key buffer.
-Scores and reductions use FP32; low-precision operands use their native
-tensor-core dot product. The API needs Triton 3.7+ and CuTe DSL 4.8+.
+The scorer and selector remain separate kernels behind one public API.
+BF16 arithmetic matches DeepGEMM's reduction order; FP32 weights select
+the FP32 path. The API needs Triton 3.7+ and CuTe DSL 4.8+.
 Queries, keys, scales, and head weights must be finite.
 
-Scratch contains FP32 scores and radix scratch. For `N` queries and `C`
-pooled-key columns it uses `12*N*C` bytes. The function allocates scratch when omitted. Callers
+Scratch contains logits and radix scratch. For `N` queries and `C`
+pooled-key columns, FP32 uses `12*N*C` bytes. BF16 uses `10*N*C` bytes,
+or `2*N*C + 32` when the `max_pools` power-of-two bucket is 8192, 16384,
+or 32768 and selection keeps candidates in shared memory.
+The function allocates scratch when omitted. Callers
 may supply a 256-byte-aligned buffer with each region rounded up to
 256 bytes. Shapes and positive row-major strides can change without recompilation within `max_pools`; columns must
 be contiguous. `max_pools` defaults to the initial page-table capacity.
@@ -175,13 +199,18 @@ stores this rotated key in the selected format:
 | `cache_dtype` | Bytes per page of `P` pools | Page contents |
 |---|---:|---|
 | `bf16` | `P * 256` | `P` contiguous BF16 vectors |
-| `fp8` | `P * 132` | `P * 128` E4M3 bytes, then `P` FP32 scales |
+| `fp8`, `fp8_scale_format="fp32"` | `P * 132` | `P * 128` E4M3 bytes, then `P` FP32 scales |
+| `fp8`, `fp8_scale_format="ue8m0"` | `P * 132` | Same values, then four repeated UE8M0 bytes per pool, as in native vLLM |
 | `fp4` | `P * 68` | `P * 64` packed E2M1 bytes, then four UE8M0 scales per pool |
 
 FP8 uses one power-of-two scale per 128 channels. MXFP4 uses one per
 32 channels; the earlier channel occupies the low nibble. FP4 rounds
 to nearest even. All cache formats receive BF16 keys and gates.
 There is no global FP4 scale.
+
+`fp8_scale_format` defaults to `"fp32"` for existing callers. Select
+`"ue8m0"` on both APIs to share a cache with SM100 DeepGEMM. Encoding
+happens in the pooling kernel; no scale conversion kernel is launched.
 
 `mode="prefill"` requires each request's new tokens to start on a pool
 boundary. The kernel reads completed pools directly from packed inputs.
