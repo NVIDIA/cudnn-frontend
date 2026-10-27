@@ -369,6 +369,7 @@ SQ1_D512_MIN_KV_TOKENS_WIDE = 2**14  # h_q >= 32: 0.57-0.94 at the bound, 1.02-1
 SQ1_D512_MIN_KV_TOKENS_NARROW = 2**15  # h_q < 32: 0.56-0.92 at the bound, 1.09-1.13 below
 SQ1_D512_WIDE_Q_HEADS = 32
 SQ1_D512_UNSPLIT_MIN_UNITS = 16  # s_q == 1, d512, S_kv off the KV tile (no split): 24 units 0.10-0.66, 12 units 0.96, 2-3 units 1.01-2.17
+SQ1_D576_MIN_WORK = 2**20  # the #1933 hand floor; see the D576 arm in _place_sm100_f16
 D512_PREFILL_MIN_Q_ROWS = 4096  # d512 prefill below a 2k cache: b * h_q * s_q from which FROST wins (0.39-0.88); 2048 rows lose 1.14-1.24
 # chunked prefill (a chunk attending to a longer cache), by launch size in 128-row Q tiles (b * h_q * ceil(s_q / 128)):
 CHUNKED_MAX_Q_TILES = 128  # <= 128 tiles wins from a 4k cache (0.30-0.89, d64-d256); 256 tiles loses 1.02-1.07 for d64/d128
@@ -902,6 +903,12 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
     flavor = _selected_d_shape(caps, facts)
     if dense and facts.s_q == 1:
         units = facts.b * facts.h_kv
+        if flavor == (576, 512):
+            # Paged bf16 D576x512 MLA decode beyond the generated table (study sm100_d576_decode_20261027 measured cc 10.0
+            # with exact declarations): the #1933 floor keeps its extrapolation to other SM100-row parts and bounded
+            # declarations until a study measures them. Dense K/V, windows and sinks were not measured.
+            measured = facts.has_paged_kv and facts.dtype == cudnn.data_type.BFLOAT16 and facts.window_left is None and not facts.has_sink
+            return LEAD if measured and facts.h_q * facts.b * facts.s_kv >= SQ1_D576_MIN_WORK else TRAIL
         if facts.has_paged_kv and flavor == (512, 512):
             # Paged d512 decode runs the role-split PREFILL tile (no d512 decode tile yet) and measures
             # behind the backend's paged decode engine (module docstring: 77.8 vs 65.1 us

@@ -134,10 +134,13 @@ def main():
     table = {k: fit(v, args.margin) for k, v in by.items()}
 
     def pick(case):
+        """True / False for a class with an entry; None where the runtime falls back to the hand-written rules."""
         f = to_facts(case, s)
         key = pt.class_key(s["row"], f)
-        direction, t = table.get(key, ("never", None))
-        if direction in ("never", "always", "non-monotone"):
+        direction, t = table.get(key, (None, None))
+        if direction in (None, "non-monotone"):
+            return None
+        if direction in ("never", "always"):
             return direction == "always"
         w = pt.log2_work(f)
         return w >= t if direction == "ge" else w <= t
@@ -147,19 +150,24 @@ def main():
     for k, (direction, t) in sorted(table.items(), key=lambda kv: str(kv[0])):
         n = len(by[k])
         print(f"  {k[3:]}  n={n:3d}  {direction}" + ("" if t is None else f" {t:.2f}"))
+    # A case whose class has no entry is scored by what the runtime does there -- the hand-written fallback, i.e. the
+    # measured default leg (``cudnn_auto``); without that leg it is left unscored and counted.
     for label, rows in (("train", train), ("holdout", hold)):
         for rule, chooser in (("generated", lambda d: pick(d["cudnn"]["case"])), ("measured default", None), ("backend only", lambda d: False)):
-            regs = []
+            regs, unscored = [], 0
             for d in rows:
                 b, f = d["cudnn"]["ms"], d["cudnn_oss"]["ms"]
-                if chooser is None:
+                choice = None if chooser is None else chooser(d)
+                if choice is None:
                     if "cudnn_auto" not in d:
+                        unscored += 1
                         continue
                     regs.append(d["cudnn_auto"]["ms"] / min(b, f))
                 else:
-                    regs.append((f if chooser(d) else b) / min(b, f))
+                    regs.append((f if choice else b) / min(b, f))
             if regs:
-                print(f"  {label:8s} {rule:16s} regret geo {g(regs):.3f} max {max(regs):.3f} >1.05 {sum(r > 1.05 for r in regs)}/{len(regs)}")
+                extra = f"  ({unscored} unscored: no entry and no default leg)" if unscored else ""
+                print(f"  {label:8s} {rule:16s} regret geo {g(regs):.3f} max {max(regs):.3f} >1.05 {sum(r > 1.05 for r in regs)}/{len(regs)}{extra}")
     bad = [k for k, (direction, _) in table.items() if direction == "non-monotone"]
     if bad:
         print("NON-MONOTONE classes (split the key; no entry emitted):", *bad, sep="\n  ")
