@@ -99,3 +99,39 @@ def test_backward_graphs_carry_the_sliding_window_the_flop_model_counts():
     assert "left_bound" not in kw["sdpa_mxfp8_backward"], "the mxfp8 backward carries the band now: drop the mxfp8 arm of bwd_sliding_window"
     assert 'bwd_sliding_window = None if args.data_type == "mxfp8" else args.sliding_window_size' in src
     assert src.count("bwd_sliding_window,") == 1, "the backward tflops_per_sec call must take bwd_sliding_window, not args.sliding_window_size"
+
+
+@pytest.mark.parametrize("profile_pass", ["fwd", "bwd"])
+def test_benchmark_fits_one_workspace_across_iterations(profile_pass):
+    """A fixed graph must run several iterations within one workspace allocation."""
+    import subprocess
+    import textwrap
+
+    script = _REPO_ROOT / "benchmark" / "attention_training" / "benchmark_single_sdpa.py"
+    # For this BF16 case, uint8 CUDA allocations are the graph workspace. Reject
+    # another allocation before it can consume memory, reproducing a device
+    # that fits one workspace but cannot temporarily hold a second copy.
+    probe = textwrap.dedent("""\
+        import runpy, sys
+        import torch
+        script, profile_pass = sys.argv[1:]
+        original_empty = torch.empty
+        workspace_allocations = []
+        def bounded_empty(*args, **kwargs):
+            if kwargs.get('dtype') == torch.uint8 and str(kwargs.get('device', '')).startswith('cuda'):
+                assert not workspace_allocations, 'benchmark exceeded its single-workspace memory budget'
+                workspace_allocations.append(args)
+            return original_empty(*args, **kwargs)
+        torch.empty = bounded_empty
+        sys.path.insert(0, str(__import__('pathlib').Path(script).parent))
+        sys.argv = [script, '--sdpa_backend', 'cudnn', '--data_type', 'bfloat16',
+                    '--batch_size', '1', '--q_seqlen', '128', '--kv_seqlen', '128',
+                    '--num_q_heads', '4', '--num_kv_heads', '2', '--head_dim', '64',
+                    '--profile_pass', profile_pass, '--num_iterations', '2', '--skip_ref']
+        runpy.run_path(script, run_name='__main__')
+        assert len(workspace_allocations) == 1, workspace_allocations
+        print('SINGLE_WORKSPACE_BENCHMARK_PASSED')
+        """)
+    result = subprocess.run([sys.executable, "-c", probe, str(script), profile_pass], capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "SINGLE_WORKSPACE_BENCHMARK_PASSED" in result.stdout
