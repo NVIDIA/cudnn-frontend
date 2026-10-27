@@ -2493,7 +2493,7 @@ def _mk_paged_graph_fp8(*, d=128, page_size=16, max_pages=8, hnd=True, thd=False
 
 def test_paged_fp8_probe_accepts_and_declines():
     """Paged per-tensor FP8 admits native D128/D256 with dense or THD Q.
-    D64 serves dense Q only. Off-contract pages remain declined, and the
+    D64 and aligned D256 envelope heads serve dense Q only. Off-contract pages remain declined, and the
     f16/bf16 row never serves an sdpa_fp8 graph."""
     fp8_name = engines.engine_name(fp8=True)
     for hnd in (True, False):
@@ -2503,14 +2503,19 @@ def test_paged_fp8_probe_accepts_and_declines():
         assert fp8_name in elig and engines.engine_name() not in elig
     assert fp8_name in _eligible(_mk_paged_graph_fp8(d=64)), "d=64 FP8 rides the d128 FP8 envelope"
     assert fp8_name in _eligible(_mk_paged_graph_fp8(page_size=128))
-    for hnd in (True, False):
-        assert fp8_name in _eligible(_mk_paged_graph_fp8(d=256, hnd=hnd))
-    assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=192)), "(192, 192) has no supported kernel envelope"
+    row = next(spec.capabilities for spec in engines.ENGINE_SPECS if spec.name == fp8_name)
+    for d in (192, 224, 256):
+        for hnd in (True, False):
+            graph = _mk_paged_graph_fp8(d=d, hnd=hnd)
+            assert fp8_name in _eligible(graph)
+            assert engines._selected_d_shape(row, _facts(graph)) == (256, 256)
+    assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=225)), "FP8 head widths must be 16-aligned"
     assert fp8_name not in _eligible(_mk_paged_graph_fp8(page_size=48)), "page_size must divide 128 or be a multiple of it"
     for d in (128, 256):
         for hnd in (True, False):
             assert fp8_name in _eligible(_mk_paged_graph_fp8(d=d, hnd=hnd, thd=True))
-    assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=64, thd=True))
+    for d in (64, 192, 224):
+        assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=d, thd=True))
 
 
 def test_paged_quantized_rows_mismatch_reasons():
@@ -2552,16 +2557,16 @@ def test_paged_quantized_rows_mismatch_reasons():
             assert engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True, d_qk=d, d_v=d, device_cc=cc)) is None
     assert "dense-only" in engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True, d_qk=64, d_v=64))
     assert "native per-tensor D128/D256" in engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True, d_qk=512, d_v=512))
-    # Admission follows the selected flavor; D256 is exact, not a D192 envelope.
+    # D192/V192 selects the D256 envelope; D192/V128 selects the unpaged D192 flavor.
     assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=256, d_v=256)) is None
-    assert "no kernel-flavor envelope" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=192))
+    assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=192)) is None
     assert "wired on the d64, d128, d256 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=128))
     for d in (64, 128):
         sink_facts = paged_facts(is_fp8=True, has_sink=True, d_qk=d, d_v=d)
         assert engines.mismatch(fp8, sink_facts) is None
         split_knobs = engines.SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=2)
         assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=d, d_v=d), split_knobs) is None
-        assert "sink-free dense" in engines.mismatch(fp8, sink_facts, split_knobs)
+        assert engines.mismatch(fp8, sink_facts, split_knobs) is None
     # Block-scaled O (#1088) over pools: epilogue and loader are independent, but the pair is not validated.
     assert "block-scaled O" in engines.mismatch(fp8, paged_facts(is_fp8=True, dtype_o=cudnn.data_type.FP8_E4M3, o_block_scale=32))
     assert "block-scaled O" in engines.mismatch(mxfp8, paged_facts(is_mxfp8=True, page_size=128, dtype_o=cudnn.data_type.FP8_E4M3, o_block_scale=32))

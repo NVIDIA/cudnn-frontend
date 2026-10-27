@@ -48,11 +48,9 @@ pytestmark = [requires_blackwell, requires_dsl]
 # under test.  Both lines carry all four native flavors -- d128, d192xd128,
 # d256 and d512 (api_dsl._SM107_FP8_KERNEL_FILES mirrors _SM100_FP8_KERNEL_FILES)
 # -- so every flavor test below runs on both. Rubin D64/D128/D192x128 now
-# serve PackGQA; the D256 packing cases retain their declared decline, pinned
-# by test_sm107_fp8_pack_gqa_serves_native_split_flavors.
+# serve PackGQA, as does the native D256 pipeline. D512 remains unpacked.
 # Per-tensor FP8 Stats strides are runtime Int64 slots on all four flavors.
 _D128_ARCH = "sm107" if _SM == 107 else "sm100"
-_skip_pack_gqa_wide_on_rubin = pytest.mark.skipif(_SM == 107, reason="the Rubin per-tensor FP8 D256 row does not serve PackGQA")
 # Five e5m2 ids read `max|O-ref|` 0.0404-0.0423 against the shared 4e-2 e5m2 bound
 # (`_half_atol`, tightened by #971) on the 204-SM Rubin part -- a DATASET edge
 # (torch's Philox lays draws out by SM count, so the cc 10.7 tensors are not the
@@ -80,11 +78,11 @@ def _known_e5m2_edge_scope(request):
 
 
 _D128_D256 = [pytest.param(128, id="d128"), pytest.param(256, id="d256")]
-_D128_D256_PACK_GQA = [pytest.param(128, id="d128"), pytest.param(256, id="d256", marks=_skip_pack_gqa_wide_on_rubin)]
+_D128_D256_PACK_GQA = [pytest.param(128, id="d128"), pytest.param(256, id="d256")]
 # test_fp8_pack_gqa_e5m2 only: its d128 combo is one of the five e5m2 edges.
 _D128_D256_PACK_GQA_E5M2 = [
     pytest.param(128, id="d128", marks=_known_e5m2_edge_on_rubin),
-    pytest.param(256, id="d256", marks=_skip_pack_gqa_wide_on_rubin),
+    pytest.param(256, id="d256"),
 ]
 
 _FP8 = {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}
@@ -802,21 +800,18 @@ def test_fp8_head_dim_envelope(dims, mask):
 
 
 @pytest.mark.L0
-def test_fp8_d256_retains_exact_shape_floor():
-    """D192 serves aligned dense heads; the independent D256 floor remains.
-
-    Pin the shared adapter/graph domain on both native architecture lines.
-    """
+def test_fp8_d256_dense_envelope_matches_adapter():
+    """Pin the shared D256 dense-envelope domain on both native arch lines."""
     from cudnn.sdpa.fwd import engines as eng
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100, _SM100_FP8_ENVELOPE_FLOORS, _fp8_envelope_covers
 
-    assert (192, 128) not in _SM100_FP8_ENVELOPE_FLOORS and _SM100_FP8_ENVELOPE_FLOORS[(256, 256)] == 255
+    assert _SM100_FP8_ENVELOPE_FLOORS == {(512, 512): 256}
     for arch in ("sm100", "sm107"):
         spec = next(sp for sp in eng.ENGINE_SPECS if sp.name == f"sdpa_fwd_prefill_{arch}_fp8")
-        assert dict(spec.capabilities.d_envelope_floors) == {(256, 256): 255, (512, 512): 256}, arch
+        assert dict(spec.capabilities.d_envelope_floors) == {(512, 512): 256}, arch
     shapes = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
-    for d_qk, d_v in ((160, 160), (224, 208)):
-        assert not _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
+    for d_qk, d_v in ((16, 144), (224, 16), (160, 160), (224, 208)):
+        assert _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
     for d_qk, d_v in ((96, 96), (128, 64), (160, 96), (176, 128), (192, 96), (320, 320)):
         assert _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
 
@@ -834,14 +829,10 @@ def test_fp8_d256_retains_exact_shape_floor():
         api = _api(d_qk, d_v)
         assert api.check_support(), (d_qk, d_v)
         assert tuple(api.flavor) == want, (d_qk, d_v, api.flavor)
-    for d_qk, d_v in ((160, 160), (224, 208)):
+    for d_qk, d_v in ((16, 144), (224, 16), (160, 160), (224, 208)):
         api = _api(d_qk, d_v)
-        try:
-            supported = api.check_support()
-        except ValueError as exc:  # the adapter may surface the envelope gate as a raise
-            supported = False
-            assert "floors" in str(exc), str(exc)
-        assert not supported, (d_qk, d_v)
+        assert api.check_support(), (d_qk, d_v)
+        assert tuple(api.flavor) == (256, 256), (d_qk, d_v, api.flavor)
 
 
 @pytest.mark.L0
@@ -2121,19 +2112,16 @@ def test_fp8_d512_head_dim_envelope(d_qk, d_v, mask):
 @pytest.mark.L0
 def test_fp8_d512_envelope_floor_declines_straddling_shapes():
     """The D512 flavor serves the (256, 512] band on both head dims; shapes
-    straddling its floor decline.  Below it the D256 flavor is exact-shape only
-    (its padded envelope is non-deterministic, see
-    test_fp8_d256_retains_exact_shape_floor), so a shape such as
-    (160, 160) -- too wide for D192/128, not the D256 shape -- is declined too.
-    Both device lines carry the flavor, so both shape maps are pinned.
+    straddling its floor decline. Below it D256 serves aligned dense heads.
+    Both device lines carry the flavors, so both shape maps are pinned.
     """
     from cudnn.sdpa.fwd.api_dsl import _fp8_envelope_covers, _sm100_fp8_shapes
 
     for device_cc in ((10, 0), (10, 7)):
         shapes = _sm100_fp8_shapes(pertensor=True, device_cc=device_cc)
-        for d_qk, d_v in [(256, 256), (384, 448), (464, 368), (272, 272), (512, 512)]:
+        for d_qk, d_v in [(160, 160), (256, 256), (384, 448), (464, 368), (272, 272), (512, 512)]:
             assert _fp8_envelope_covers(d_qk, d_v, shapes), (device_cc, d_qk, d_v)
-        for d_qk, d_v in [(160, 160), (272, 256), (384, 128), (512, 256)]:
+        for d_qk, d_v in [(272, 256), (384, 128), (512, 256)]:
             assert not _fp8_envelope_covers(d_qk, d_v, shapes), (device_cc, d_qk, d_v)
 
 
@@ -2623,3 +2611,15 @@ class TestD192Fp8HeadPadding:
 
     test_rebind_and_replay = staticmethod(_rebind)
     test_masks = staticmethod(_masks)
+
+
+@pytest.mark.L0
+@requires_pre_rubin_blackwell
+class TestD256Fp8HeadPadding:
+    """Collect bounded dense and paged D256 cases in the selected CI entry."""
+
+    from sdpa_fp8_d256_padding import test_dense_rebind_replay as _dense, test_dense_masks as _masks, test_paged_rebind_replay as _paged
+
+    test_dense_rebind_replay = staticmethod(_dense)
+    test_dense_masks = staticmethod(_masks)
+    test_paged_rebind_replay = staticmethod(_paged)

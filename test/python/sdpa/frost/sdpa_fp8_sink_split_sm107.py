@@ -85,7 +85,7 @@ def test_native_fp8_sink_split_standalone(d, dv, output):
     test_prepared_fp8_split_standalone_default_scales("sm107", d, dv, output, sink=True)
 
 
-@pytest.mark.parametrize("d", [256, 512])
+@pytest.mark.parametrize("d", [512])
 def test_native_fp8_sink_keeps_independent_split_domain(d):
     sink = torch.zeros((1, 4, 1, 1), device="cuda")
     with pytest.raises(NotImplementedError, match="split"):
