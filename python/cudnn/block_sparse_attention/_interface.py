@@ -1991,9 +1991,11 @@ def bsa_attn_fwd_blk64_cutedsl(
     is_persistent = use_clc_scheduler
     pack_gqa = False
     input_layout = "bhsd_native"
-    # Short/medium KV lists are dominated by the per-tile ramp, which short_tile_opt shortens; near-dense lists (capacity of the
-    # sparse index >= 90% of the KV blocks, known on the host without a sync) hide the ramp and keep the original schedule.
-    short_tile_opt = int(q2k_block_index.shape[-1]) * 10 < ((seqlen_k + sparse_block_size - 1) // sparse_block_size) * 9
+    # Short/medium KV lists on the persistent (CLC) scheduler are dominated by the per-tile ramp, which short_tile_opt shortens.
+    # Near-dense lists (capacity of the sparse index >= 90% of the KV blocks, known on the host without a sync) hide the ramp, and
+    # the static one-tile-per-CTA scheduler has no ramp to overlap (the shared first softmax step is a net loss there): both keep
+    # the original schedule.
+    short_tile_opt = is_persistent and int(q2k_block_index.shape[-1]) * 10 < ((seqlen_k + sparse_block_size - 1) // sparse_block_size) * 9
 
     split_offsets = None
     if kv_splits_i > 1:
