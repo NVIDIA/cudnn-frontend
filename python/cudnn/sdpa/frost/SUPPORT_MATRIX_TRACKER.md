@@ -521,7 +521,7 @@ MMA as d=512.
 | MXFP8 (E4M3/E5M2 + per-32 E8M0 SF) | ❌ᵗ⁰ | ✅ (native d64, cga1, dense / unsplit / unpaged)⁷ | ✅ | ✅ | ✅ | ✅ | ✅ᵍ (E4M3 only, d=256) |  ✅ᵍ (E4M3 only)  |
 | O dtype ≠ QKV dtype — **quantized graphs only**¹ | — | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵍ (fp16/bf16 gradients) |  ✅ᵍ · —ᵇ²  |
 | Block-scaled O (`sdpa_fp8` / `sdpa_mxfp8` + `sf_o`): FP4_E2M1 O + E4M3 scale per 16 d, or E4M3 O + UE8M0 scale per 32 d — per-tensor FP8 and block-scale MXFP8 graphs, dense/unsplit/unpacked only; `scale_o` doubles as the FP4 global scale (a python-only input on `sdpa_mxfp8`) | ❌ | ❌ | ✅ (FP8: SM100 / SM107 / SM120; MXFP8: SM100 / SM107, and SM120 for the E4M3 + UE8M0/32 O) | ❌ | ❌ | ❌ | ❌ |  ❌  |
-| Head-dim envelope (zero-padded below native) | f16 ×8: every D ≤ 32 (8 / 16 / 24 / 32; **native 32**)ᵗ⁰ | f16 ×8 · fp8 ×16 up to 64 (**native 64**: the d128 kernel files at `d_flavor=64`)⁷ · mxfp8 exact | f16 ×8 · fp8 ×16 · mxfp8 exact | f16 ×8 · **fp8 exact (192, 128) only**¹⁰ · mxfp8 exact | f16 ×8 · **fp8 exact 256 only**¹⁰ · mxfp8 exact | f16 ×8 · fp8 ×16, floor 256² · mxfp8 exact | f16 (256, 512] ×8ᵇ · mxfp8 exact 256ᵍ |  none — exact (256, 256)ᵇ² ᵍ  |
+| Head-dim envelope (zero-padded below native) | f16 ×8: every D ≤ 32 (8 / 16 / 24 / 32; **native 32**)ᵗ⁰ | f16 ×8 · fp8 ×16 up to 64 (**native 64**: the d128 kernel files at `d_flavor=64`)⁷ · mxfp8 exact | f16 ×8 · fp8 ×16 · mxfp8 exact | f16 ×8 · **fp8 ×16 dense**¹⁰ · mxfp8 exact | f16 ×8 · **fp8 ×16 dense/paged**¹⁰ · mxfp8 exact | f16 ×8 · fp8 ×16, floor 256² · mxfp8 exact | f16 (256, 512] ×8ᵇ · mxfp8 exact 256ᵍ |  none — exact (256, 256)ᵇ² ᵍ  |
 | **Layout** | | | | | | | |  |
 | BSHD | ✅ᵗ⁰ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵍ |  ✅ᵇ² ᵍ  |
 | Arbitrary dense B/H/S stride order (`dense_flex`) | f16 onlyᵗ⁰ | f16 only | f16 only | f16 only | ✅ | f16 only | ✅ᵇ ᶜ · ❌ᵍ |  ❌ᵇ² · ❌ᵍ  |
@@ -1243,8 +1243,9 @@ K TMA loads, preserving zero-fill even when physical storage slack contains NaN;
 SM100 exact D192 retains its rank-5 chunk load. V loads and O stores retain the
 logical V width. Non-native THD heads remain declined. D256 serves its aligned
 dense envelope on both lines and the existing paged domain on SM100/SM103.
-Its partial K/V loads preserve logical head bounds with rank-4 TMA; exact-head
-rank-5 loads remain unchanged. D128's ×16 envelope and the D512 band² are unchanged.
+On SM100/SM103, partial K/V loads preserve logical head bounds with rank-4 TMA
+and exact-head rank-5 loads remain unchanged. Native SM107 uses rank-4 TMA for
+both exact and partial heads. D128's ×16 envelope and the D512 band² are unchanged.
 ᵍ **`sdpa_bwd_sm100_mxfp8` only — `sdpa_mxfp8_backward()` with E4M3 payloads,
 d_qk = d_v = 256 exactly, fp16/bf16 `o_f16`/`dO_f16`/dQ/dK/dV.** Serves MHA /
 GQA / MQA, any fixed S_q / S_kv (the kernels mask tile tails; S_q = 1 works),
@@ -1340,9 +1341,9 @@ reuse them too (issue #1472).
 All three lines now carry d192×d128 (`sm107/prefill_d192_d128_{f16,fp8,mxfp8}.py`
 — the d128 body with `make_cfg_d192` / `make_cfg_d192_mxfp8`), so a d=192 graph
 lands on its NATIVE kernel in every dtype family. The FP8 row carries that
-flavor's envelope **floor** (128) with it: the floors are arch-independent
-(`fwd/api_dsl._SM100_FP8_ENVELOPE_FLOORS`), so d_qk zero-padded into d192 stays
-declined here exactly as on SM100 — that is a kernel property, not an arch one.
+flavor's aligned dense envelope with it: 16-aligned Q/K widths up to 192 and
+V widths up to 128 are served on SM100/SM103 and native SM107. Non-native THD
+heads remain declined.
 
 The MXFP8 d192 flavor is **cga2 only** where SM100 serves it at both widths, and
 that is a descriptor constraint rather than a tuning choice. At cga1 the K/V
@@ -3798,7 +3799,7 @@ The graph and prepared launcher serve aligned dense heads with Q/K width up to 1
 
 ### D256 per-tensor FP8 head padding
 
-Aligned dense heads within the D256 tile are envelope-served on SM100/SM103 and native SM107, with the D256 MMA geometry and no materialized padding copy. The existing SM100/SM103 paged route accepts the same head envelope. Partial K and V independently use bounded rank-4 descriptors; exact heads retain their rank-5 descriptors. Page loads keep the full-height shared-memory dimension-slab pitch while explicitly stepping each dimension subtile. The shared graph/adapter D256 floor is removed. Native SM107 D256 dense packing is documented below; split-KV and paged support remain separate gaps, and non-native THD heads remain declined.
+Aligned dense heads within the D256 tile are envelope-served on SM100/SM103 and native SM107, with the D256 MMA geometry and no materialized padding copy. The existing SM100/SM103 paged route accepts the same head envelope. On SM100/SM103, partial K and V independently use bounded rank-4 descriptors and exact heads retain their rank-5 descriptors. Native SM107 constructs rank-4 descriptors for both exact and partial heads. Page loads keep the full-height shared-memory dimension-slab pitch while explicitly stepping each dimension subtile. The shared graph/adapter D256 floor is removed. Native SM107 D256 dense packing is documented below; split-KV and paged support remain separate gaps, and non-native THD heads remain declined.
 
 `test_sdpa_fwd_fp8_sm100.py::TestD256Fp8HeadPadding` and `test_sdpa_fp8_sm107.py::TestNativeD256Fp8HeadPadding` collect the applicable dense/paged cases without collecting their helper module twice. Coverage includes both FP8 inputs, half/FP8 outputs, independent Q/K and V padding, poisoned slack, output canaries, sinks, masks, rebinding and retained graph replay; paged coverage also exercises HND/NHD pools, independent K/V page orders and changed sequence lengths. Native dense coverage includes the advertised HALF softmax precision. No heuristics or placement change.
 

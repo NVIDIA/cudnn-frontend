@@ -37,7 +37,7 @@ def _clone_with_slack(value, fill):
     return clone
 
 
-def _check(bufs, *, page=0, causal=False, bottom_right=False, window=None):
+def _check(bufs, *, page=0, causal=False, bottom_right=False, window=None, output_check=None):
     from sdpa.fp8_ref import compute_ref
     import test_sdpa_fwd_paged_sm100 as paged
 
@@ -80,11 +80,12 @@ def _check(bufs, *, page=0, causal=False, bottom_right=False, window=None):
     )
     ref = ref.transpose(1, 2)
     in_key = "e4m3" if q.dtype == torch.float8_e4m3fn else "e5m2"
-    paged._check_fp8_o(bufs["o"], ref * bufs["scale_o"], bufs["o"].dtype, in_key)
+    output_result = (output_check or paged._check_fp8_o)(bufs["o"], ref * bufs["scale_o"], bufs["o"].dtype, in_key)
     # Match the existing prepared-dense Stats bound; paged cases retain their
     # existing absolute bound.
     torch.testing.assert_close(bufs["lse"].reshape(b, h, sq), stats.reshape(b, h, sq), atol=0.01, rtol=0 if page else 0.01)
     assert abs(bufs["amax_o"].item() - ref.abs().max().item()) <= 0.03
+    return output_result
 
 
 def _check_dense(d, dv, dtype, output, monkeypatch, *, causal=False, bottom_right=False, window=None, softmax_precision=None):

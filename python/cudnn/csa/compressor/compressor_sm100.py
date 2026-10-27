@@ -559,18 +559,31 @@ def _compressor_bwd_kernel(
                     mGKV[t * W + d + dim] = ZERO_BF16
                     mGS[t * W + d + dim] = ZERO_BF16
 
+        # ``mCuComp`` is monotonic, so locate this CTA's first compressed row with
+        # an upper-bound search and carry the owning segment forward across the
+        # remaining consecutive rows.  The former row-by-row linear scan made a
+        # packed backward O(nb_valid * n_seq), which dominates long, highly ragged
+        # packs.  This changes metadata lookup only; the floating-point expression
+        # and dAPE partial/reduction trees below remain unchanged.
+        seq_idx = cutlass.Int32(0)
+        first_bb = bidx * rows_per_cta
+        if first_bb < nb_valid:
+            lower = cutlass.Int32(0)
+            upper = n_seq
+            while lower + cutlass.Int32(1) < upper:
+                middle = (lower + upper) // cutlass.Int32(2)
+                if first_bb < cutlass.Int32(mCuComp[middle]):
+                    upper = middle
+                else:
+                    lower = middle
+            seq_idx = lower
+
         for rr in cutlass.range_constexpr(rows_per_cta):
             bb = bidx * rows_per_cta + rr
             if bb < nb_valid:
-                seq_idx = cutlass.Int32(0)
-                bis = cutlass.Int32(bb)
-                for s in cutlass.range(n_seq):
-                    cs = mCuComp[s]
-                    ce = mCuComp[s + 1]
-                    if bb >= cs:
-                        if bb < ce:
-                            seq_idx = s
-                            bis = bb - cs
+                while seq_idx + cutlass.Int32(1) < n_seq and bb >= cutlass.Int32(mCuComp[seq_idx + cutlass.Int32(1)]):
+                    seq_idx = seq_idx + cutlass.Int32(1)
+                bis = bb - cutlass.Int32(mCuComp[seq_idx])
                 tok0 = mCu[seq_idx] + bis * ratio
 
                 # Recompute window probs (same order as forward).

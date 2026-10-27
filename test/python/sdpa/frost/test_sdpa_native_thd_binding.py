@@ -108,6 +108,8 @@ def _reference(s, facts, workspace=0x30000, stream=17):
 
 
 def test_ordered_thd_rebinds_storage_and_validates_workspace_before_launch():
+    import torch
+
     from cudnn.engines.base import ExecutionContext
     from cudnn.sdpa._plan import _FrostSdpaPlan
 
@@ -170,6 +172,13 @@ def test_ordered_thd_rebinds_storage_and_validates_workspace_before_launch():
         ):
             with pytest.raises(ValueError, match=message):
                 call(current, bad, stream)
+            assert not frames
+        if hasattr(torch.Tensor, "__dlpack_c_exchange_api__"):
+            # CPU storage has a valid pointer and enough bytes, but its device
+            # must be rejected even after this schema has accepted CUDA storage.
+            cpu_workspace = torch.empty(spec.scratch_bytes, dtype=torch.uint8, device="cpu")
+            with pytest.raises(ValueError, match="workspace must be on CUDA device 0"):
+                call(current, cpu_workspace, stream)
             assert not frames
         # Unknown-capacity raw pointers use the normal Python completion path;
         # the native entry must not launch before that path validates the call.
