@@ -783,7 +783,8 @@ def _stage3(
     else:
         dk_c = _window(_window(dk_out, 0, bb, bc), 2, hb, hc)  # [bc, S_kv, hc, D]
     # dK = dS . Q: A = dS[kv, q] (M, K, H, B) K-major; B = Q (D, q, H, B); out (kv, D, H, B).
-    _matmul(mm_dk, _permuted(ds, (2, 3, 1, 0)), _permuted(q_c, (3, 1, 2, 0)), _permuted(dk_c, (1, 3, 2, 0)), hc, bc, meta, desc, stream, dk_epi)
+    if cutlass.const_expr(mm_dk is not None):
+        _matmul(mm_dk, _permuted(ds, (2, 3, 1, 0)), _permuted(q_c, (3, 1, 2, 0)), _permuted(dk_c, (1, 3, 2, 0)), hc, bc, meta, desc, stream, dk_epi)
     # dQ = dS^T . K: A = dS^T[q, kv] (M, K, H, B) M-major; B = K (D, kv, H_kv, B); out (q, D, H, B).  Under GQA the K head is
     # shared by `group` Q heads.  The shipped rendering (`dq_b_head_group == group`) indexes B by `h // group` itself, so ONE
     # launch covers the chunk's `hc` Q heads (A = the whole dS chunk, out = the whole dQ chunk, B = the chunk's kv_n K heads:
@@ -845,21 +846,22 @@ def _stage3_thd(
     q_c = _window(q, 2, hb, hc)  # [1, T_q, hc, D]
     dk_c = _window(dk_out, 2, hb, hc)  # [1, T_kv, hc, D]
     # dK = dS . Q: A = dS[kv rows, q cols] (M, K, H, 1) K-major; B = Q (D, T_q, H, 1) packed; out (T_kv, D, H, 1) packed.
-    _matmul(
-        mm_dk,
-        _permuted(ds, (2, 3, 1, 0)),
-        _permuted(q_c, (3, 1, 2, 0)),
-        _permuted(dk_c, (1, 3, 2, 0)),
-        hc,
-        n_seq,
-        meta,
-        desc,
-        stream,
-        dk_epi,
-        grid_m=grid_m_kv,
-        thd_origins=thd_origins,
-        thd_origin_rows=(thd_origin_rows[0], -1 if group > 1 else thd_origin_rows[6]),
-    )
+    if cutlass.const_expr(mm_dk is not None):
+        _matmul(
+            mm_dk,
+            _permuted(ds, (2, 3, 1, 0)),
+            _permuted(q_c, (3, 1, 2, 0)),
+            _permuted(dk_c, (1, 3, 2, 0)),
+            hc,
+            n_seq,
+            meta,
+            desc,
+            stream,
+            dk_epi,
+            grid_m=grid_m_kv,
+            thd_origins=thd_origins,
+            thd_origin_rows=(thd_origin_rows[0], -1 if group > 1 else thd_origin_rows[6]),
+        )
     kv_n = hc // group
     n_launch = _dq_launches(group, dq_b_head_group)
     heads = hc // n_launch  # Q heads per dQ launch: kv_n * dq_b_head_group
@@ -1165,24 +1167,45 @@ def host_f16(
                 _zero_ds(ds_full, config, stream)
             # STAGE 2: head_base / batch_base offset every full-tensor read; dS stays chunk-local.
             if cutlass.const_expr(chunk_partials):
-                main(
-                    q_k,
-                    do_k,
-                    k_k,
-                    v_k,
-                    dv_k,
-                    ds_full,
-                    lse_k,
-                    delta,
-                    seq_kv,
-                    (b, h, hk, sqp, skvp, hc, bc, sq, skv),
-                    scale,
-                    hb,
-                    bb,
-                    stream,
-                    cutlass.Int32(0),
-                    cutlass.Int32(0),
-                )
+                if cutlass.const_expr(mm_dk is None):
+                    main(
+                        q_k,
+                        do_k,
+                        k_k,
+                        v_k,
+                        dv_k,
+                        ds_full,
+                        lse_k,
+                        delta,
+                        seq_kv,
+                        (b, h, hk, sqp, skvp, hc, bc, sq, skv),
+                        scale,
+                        hb,
+                        bb,
+                        stream,
+                        cutlass.Int32(0),
+                        cutlass.Int32(0),
+                        dk_tensor=dk_real,
+                    )
+                else:
+                    main(
+                        q_k,
+                        do_k,
+                        k_k,
+                        v_k,
+                        dv_k,
+                        ds_full,
+                        lse_k,
+                        delta,
+                        seq_kv,
+                        (b, h, hk, sqp, skvp, hc, bc, sq, skv),
+                        scale,
+                        hb,
+                        bb,
+                        stream,
+                        cutlass.Int32(0),
+                        cutlass.Int32(0),
+                    )
                 _stage3(mm_dk, mm_dq, ds, q, k, dk_real, dq, bb, bc, hb, hc, group, seq_kv, desc, stream, dq_b_head_group=dq_bhg, dk_chunk_local=True)
                 # Same BF16 per-Q-head partials and ordered FP32 fold. Every
                 # whole GQA group is consumed before its workspace is reused.
@@ -1190,7 +1213,26 @@ def host_f16(
                 dv_out = _window(_window(dv, 0, bb, bc), 2, hb // group, hc // group)
                 dkv_reduce_host(dk_tgt, dv_k, dk_out, dv_out, d, d_v, group, dtype, False, stream)
             else:
-                main(q_k, do_k, k_k, v_k, dv_k, ds_full, lse_k, delta, seq_kv, (b, h, hk, sqp, skvp, hc, bc, sq, skv), scale, hb, bb, stream)
+                if cutlass.const_expr(mm_dk is None):
+                    main(
+                        q_k,
+                        do_k,
+                        k_k,
+                        v_k,
+                        dv_k,
+                        ds_full,
+                        lse_k,
+                        delta,
+                        seq_kv,
+                        (b, h, hk, sqp, skvp, hc, bc, sq, skv),
+                        scale,
+                        hb,
+                        bb,
+                        stream,
+                        dk_tensor=dk_real,
+                    )
+                else:
+                    main(q_k, do_k, k_k, v_k, dv_k, ds_full, lse_k, delta, seq_kv, (b, h, hk, sqp, skvp, hc, bc, sq, skv), scale, hb, bb, stream)
                 # STAGE 3: consume the chunk's workspace, write the outputs' (batch, head) slice.
                 _stage3(mm_dk, mm_dq, ds, q, k, dk_real, dq, bb, bc, hb, hc, group, seq_kv, desc, stream, dq_b_head_group=dq_bhg)
 
@@ -1323,27 +1365,69 @@ def _host_f16_thd_chain(
     for ci in range(h // hc):
         hb = ci * hc
         # STAGE 2: packed operands, the kv-blocked workspace, this launch's heads; batch_base 0 (one packed batch).
-        if cutlass.const_expr(origins is not None):
-            main(
-                q,
-                do,
-                k,
-                v,
-                dv_k,
-                ds_full,
-                stats,
-                delta,
-                meta,
-                (b, h, hk, sqp, rcap, hc, 1, sq_env, skv_env, units),
-                scale,
-                hb,
-                0,
-                stream,
-                thd_origins=origins,
-                thd_origin_rows=origin_rows[:7] + ((-1 if group > 1 else origin_rows[7]),) + origin_rows[8:],
-            )
+        if cutlass.const_expr(mm_dk is None):
+            if cutlass.const_expr(origins is not None):
+                main(
+                    q,
+                    do,
+                    k,
+                    v,
+                    dv_k,
+                    ds_full,
+                    stats,
+                    delta,
+                    meta,
+                    (b, h, hk, sqp, rcap, hc, 1, sq_env, skv_env, units),
+                    scale,
+                    hb,
+                    0,
+                    stream,
+                    thd_origins=origins,
+                    thd_origin_rows=origin_rows[:6] + ((-1 if group > 1 else origin_rows[6]), (-1 if group > 1 else origin_rows[7])) + origin_rows[8:],
+                    dk_tensor=dk_tgt,
+                    dk_maps=desc3,
+                )
+            else:
+                main(
+                    q,
+                    do,
+                    k,
+                    v,
+                    dv_k,
+                    ds_full,
+                    stats,
+                    delta,
+                    meta,
+                    (b, h, hk, sqp, rcap, hc, 1, sq_env, skv_env, units),
+                    scale,
+                    hb,
+                    0,
+                    stream,
+                    dk_tensor=dk_tgt,
+                    dk_maps=desc3,
+                )
         else:
-            main(q, do, k, v, dv_k, ds_full, stats, delta, meta, (b, h, hk, sqp, rcap, hc, 1, sq_env, skv_env, units), scale, hb, 0, stream)
+            if cutlass.const_expr(origins is not None):
+                main(
+                    q,
+                    do,
+                    k,
+                    v,
+                    dv_k,
+                    ds_full,
+                    stats,
+                    delta,
+                    meta,
+                    (b, h, hk, sqp, rcap, hc, 1, sq_env, skv_env, units),
+                    scale,
+                    hb,
+                    0,
+                    stream,
+                    thd_origins=origins,
+                    thd_origin_rows=origin_rows[:7] + ((-1 if group > 1 else origin_rows[7]),) + origin_rows[8:],
+                )
+            else:
+                main(q, do, k, v, dv_k, ds_full, stats, delta, meta, (b, h, hk, sqp, rcap, hc, 1, sq_env, skv_env, units), scale, hb, 0, stream)
         # STAGE 3: the THD arm over the chunk's workspace; the outputs' head slice, every sequence through its own descriptor.
         _stage3_thd(
             mm_dk,

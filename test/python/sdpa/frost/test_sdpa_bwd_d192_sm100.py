@@ -15,6 +15,67 @@ _ENGINE = "sdpa_bwd_sm100_d256"
 
 @requires_pre_rubin_blackwell
 @pytest.mark.parametrize("dt", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("fused", [False, True], ids=["raw-legacy", "raw-fused"])
+def test_rectangular_raw_stage2_frame(dt, fused):
+    """The default raw frame stays usable; fusion appends its explicit dK output."""
+    from cudnn.frost.template_loader import load_template
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
+    from cudnn.sdpa.bwd.api_dsl import _sm100_kernel_path
+    from cudnn.sdpa.bwd.config_d256_2x2 import TemplateParams2x2
+
+    b, h, sq, sk = 2, 2, 256, 512
+    params = TemplateParams2x2(
+        datapath_2x2_profile=1, head_dim_qk=192, head_dim_v=128, dtype_qkv=DTYPE_BF16 if dt == torch.bfloat16 else DTYPE_FP16, fuse_dk=fused
+    )
+    mod = load_template(_sm100_kernel_path("bprop_d256_2x2_f16.py"), params, tag="d192_raw_frame")
+    fn = mod.compile(b=b, qh=h, kh=h, sq=sq, skv=sk)
+    gen = torch.Generator(device="cpu").manual_seed(81)
+
+    def draw(rows, dim):
+        return torch.randn(b, rows, h, dim, generator=gen).to(device="cuda", dtype=dt)
+
+    q, k, v, do = draw(sq, 192), draw(sk, 192), draw(sk, 128), draw(sq, 128)
+    qh, kh, vh, doh = (x.permute(0, 2, 1, 3) for x in (q, k, v, do))
+    keep = _causal_keep(sq, sk, causal=False)
+    o64, lse64, _, _, dk_ref, dv_ref = _reference64(qh, kh, vh, doh, keep, 1)
+    delta = (o64 * doh.double()).sum(-1).float().contiguous()
+    ds = torch.full((b, h, sk, sq), float("nan"), device="cuda", dtype=dt)
+    dv = torch.full_like(v, float("nan"))
+    dk = torch.full_like(k, float("nan"))
+    lens = torch.full((b,), sk, dtype=torch.int32, device="cuda")
+    extra = {"dk_tensor": dk} if fused else {}
+
+    def execute():
+        fn(
+            q,
+            do,
+            k,
+            v,
+            dv,
+            ds,
+            lse64.float().contiguous(),
+            delta,
+            lens,
+            (b, h, h, sq, sk, h, b, sq, sk),
+            192**-0.5,
+            0,
+            0,
+            stream=torch.cuda.current_stream().cuda_stream,
+            **extra,
+        )
+
+    execute()
+    torch.cuda.synchronize()
+    _check("dV", dv.permute(0, 2, 1, 3), dv_ref, dt)
+    assert torch.isfinite(ds).all()
+    if fused:
+        _check("dK", dk.permute(0, 2, 1, 3), dk_ref, dt)
+    else:
+        assert torch.isnan(dk).all()
+
+
+@requires_pre_rubin_blackwell
+@pytest.mark.parametrize("dt", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 @pytest.mark.parametrize(
     "sq,sk,hk,causal,br,left,budget",
     [
@@ -39,6 +100,17 @@ def check_backward_replay_and_rebind(monkeypatch, dt, sq, sk, hk, causal, br, le
 
         monkeypatch.setattr(api_dsl_sm107, "_SM107_WS_BUDGET_BYTES", budget)
     from cudnn.sdpa.bwd.api_dsl_sm100_d256 import SdpaBwdDslSm100D256
+    from cudnn.sdpa.bwd.kernels.sm107 import prepared_host
+
+    compiled_hosts = []
+    original_host = prepared_host.compile_host_f16
+
+    def record_host(main, mm_dk, mm_dq, *args, **kwargs):
+        assert (mm_dk is None) == (d == 192), "D192 must omit the separate dK GEMM; D256 must retain it"
+        compiled_hosts.append(main)
+        return original_host(main, mm_dk, mm_dq, *args, **kwargs)
+
+    monkeypatch.setattr(prepared_host, "compile_host_f16", record_host)
 
     compiled_geometry = []
     original_compile = SdpaBwdDslSm100D256._compile_plan
@@ -46,6 +118,7 @@ def check_backward_replay_and_rebind(monkeypatch, dt, sq, sk, hk, causal, br, le
     def record_compile(api, main, mm_dk, mm_dq):
         compiled_geometry.append((main.CFG.TILE_K, main.CFG.TILE_O))
         assert compiled_geometry[-1] == (d, dv), "the actual compiled body must use native geometry"
+        assert bool(main.CFG.FUSE_DK) == (d == 192)
         for stage3 in (mm_dk, mm_dq):
             assert stage3.PARAMS.cgrp_tile_mn == ((128, 192) if d == 192 else (256, 256))
             assert stage3.cta_group == (1 if d == 192 else 2)
@@ -64,6 +137,7 @@ def check_backward_replay_and_rebind(monkeypatch, dt, sq, sk, hk, causal, br, le
     g.check_support()
     g.build_plans()
     assert compiled_geometry
+    assert compiled_hosts
     assert g._compiled_plans[g._plan_index]._prepared is not None
     ws = torch.empty(max(1, g.get_workspace_size()), dtype=torch.uint8, device="cuda")
     grads = (_bshd_empty(b, sq, hq, d, dt), _bshd_empty(b, sk, hk, d, dt), _bshd_empty(b, sk, hk, dv, dt))
