@@ -3172,7 +3172,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                         )
                     )
                 ),
-                "split_kv > 1 with an attention sink requires half or SM100/SM103 per-tensor FP8 sink-free partials without an epilogue gate; packed THD sinks require a supported packed combine",
+                "split_kv > 1 with an attention sink requires half or SM100/SM103/SM107 per-tensor FP8 sink-free partials without an epilogue gate; packed THD sinks require a supported packed combine",
             )
             if self.has_sink and self._fp8:
                 from cudnn import _pybind_module
