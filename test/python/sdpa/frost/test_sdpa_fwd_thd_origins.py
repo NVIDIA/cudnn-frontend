@@ -220,3 +220,179 @@ def test_independent_thd_origins_rebind_and_capture(dim, dtype_name, stats_layou
     finally:
         for captured, _, _ in captures:
             captured.reset()
+
+
+@pytest.mark.parametrize("dim", [pytest.param(128, marks=pytest.mark.L0), pytest.param(256, marks=pytest.mark.L1)])
+def test_compact_thd_origins_use_single_load_maps(dim):
+    """Offsets equal to the compact prefixes publish one map per load port.
+
+    A sequence votes with its Q/O/Stats origins when it has query rows and
+    with its K/V origins when it has keys; other offsets are ignored. A gap
+    in any bound port switches that launch back to sequence-local maps, also
+    on graph replay.
+    """
+    import inspect
+
+    import cudnn
+    import torch
+    from cudnn.sdpa.fwd.thd_origins import compact_word_offset
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("SM100/SM103 physical THD origin path")
+    torch.manual_seed(118)
+    batch, heads, kv_heads, maximum = 4, 8, 2, 256
+    capacity = batch * maximum
+    dtype = torch.bfloat16
+    ports = ("q", "k", "v", "o", "stats")
+    multipliers = (heads * dim, dim, 1, dim, 1)
+
+    values = {
+        name: torch.empty(batch, maximum, h, dim, device="cuda", dtype=dtype).transpose(1, 2)
+        for name, h in (("q", heads), ("k", kv_heads), ("v", kv_heads), ("o", heads))
+    }
+    values["stats"] = torch.empty(capacity, heads, device="cuda", dtype=torch.float32)
+    values["ql"] = torch.empty(batch, 1, 1, 1, device="cuda", dtype=torch.int32)
+    values["kl"] = torch.empty_like(values["ql"])
+    for name in ports:
+        values["ro_" + name] = torch.empty(batch + 1, 1, 1, 1, device="cuda", dtype=torch.int32)
+
+    def flat(t):
+        return t.as_strided((capacity, t.shape[1], dim), (t.stride(2), t.stride(1), t.stride(3)))
+
+    def prefix(lengths):
+        rows, total = [], 0
+        for length in lengths:
+            rows.append(total)
+            total += length
+        return rows
+
+    def fill(ql, kl, shifts=None, elsewhere=()):
+        """Bind compact prefixes; open a gap of ``shifts[port]`` rows after the first sequence in each listed port;
+        place the ``elsewhere`` (port, b) pairs at a row the compact rule rejects, data included."""
+        origins = {name: prefix(ql if name in ("q", "o", "stats") else kl) for name in ports}
+        for name, shift in (shifts or {}).items():
+            origins[name] = [row + (shift if b else 0) for b, row in enumerate(origins[name])]
+        for port, b in elsewhere:
+            origins[port][b] = 700 + 16 * b
+        values["ql"].copy_(torch.tensor(ql, dtype=torch.int32, device="cuda").view(batch, 1, 1, 1))
+        values["kl"].copy_(torch.tensor(kl, dtype=torch.int32, device="cuda").view(batch, 1, 1, 1))
+        for name, multiplier in zip(ports, multipliers):
+            stride = values[name].stride(2) if name != "stats" else heads
+            rows = origins[name] + [origins[name][-1] + (ql if name in ("q", "o", "stats") else kl)[-1]]
+            values["ro_" + name].copy_(torch.tensor([x * stride // multiplier for x in rows], device="cuda", dtype=torch.int32).view(batch + 1, 1, 1, 1))
+        for name in ("q", "k", "v"):
+            view = flat(values[name])
+            view.fill_(float("nan"))
+            for start, length in zip(origins[name], ql if name == "q" else kl):
+                view[start : start + length].copy_(torch.randn(length, view.shape[1], dim, device="cuda", dtype=dtype))
+        return ql, kl, origins
+
+    graph = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    nodes = {name: graph.tensor_like(values[name]) for name in ("q", "k", "v", "ql", "kl")}
+    for name, multiplier in zip(ports, multipliers):
+        nodes["ro_" + name] = graph.tensor_like(values["ro_" + name])
+        if name in ("q", "k", "v"):
+            nodes[name].set_ragged_offset(nodes["ro_" + name]).set_ragged_offset_multiplier(multiplier)
+    nodes["o"], nodes["stats"] = graph.sdpa(
+        q=nodes["q"],
+        k=nodes["k"],
+        v=nodes["v"],
+        is_inference=False,
+        attn_scale=dim**-0.5,
+        diagonal_band_right_bound=0,
+        use_padding_mask=True,
+        seq_len_q=nodes["ql"],
+        seq_len_kv=nodes["kl"],
+    )
+    nodes["o"].set_output(True).set_dim(values["o"].shape).set_stride(values["o"].stride()).set_ragged_offset(nodes["ro_o"]).set_ragged_offset_multiplier(
+        multipliers[3]
+    )
+    nodes["stats"].set_output(True).set_dim((batch, heads, maximum, 1)).set_stride((maximum * heads, 1, heads, 1)).set_data_type(
+        cudnn.data_type.FLOAT
+    ).set_ragged_offset(nodes["ro_stats"])
+    graph.validate()
+    graph.build_operation_graph()
+    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    index = next(i for i in range(len(graph.plans)) if graph.get_plan_name_at_index(i).startswith("sdpa_fwd_prefill_sm100"))
+    graph.select_plan(index)
+    graph.check_support()
+    graph.build_plans()
+    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
+    api = inspect.getclosurevars(graph._compiled_plans[graph._plan_index]._compiled.default_stream).nonlocals["api"]
+    word_offset = api._thd_plan().off_o_desc + compact_word_offset(batch)
+    pack = {nodes[name]: tensor for name, tensor in values.items()}
+
+    def single_maps():
+        return int(workspace[word_offset : word_offset + 8].view(torch.int64).item())
+
+    def poison():
+        values["o"].fill_(-17)
+        values["stats"].fill_(-29)
+        workspace.fill_(255)
+
+    def check(state):
+        ql, kl, origins = state
+        inputs = {name: flat(values[name]).double().cpu() for name in ("q", "k", "v")}
+        for name, tensor in inputs.items():
+            live = torch.zeros(capacity, dtype=torch.bool)
+            for start, length in zip(origins[name], ql if name == "q" else kl):
+                live[start : start + length] = True
+            assert torch.isnan(tensor[~live]).all(), f"{name} padding was modified"
+        output = flat(values["o"]).float().cpu()
+        stats = values["stats"].float().cpu()
+        written_o, written_stats = torch.zeros(capacity, dtype=torch.bool), torch.zeros(capacity, dtype=torch.bool)
+        for b, (nq, nk) in enumerate(zip(ql, kl)):
+            if not nq:
+                continue
+            q = inputs["q"][origins["q"][b] : origins["q"][b] + nq].transpose(0, 1)
+            k = inputs["k"][origins["k"][b] : origins["k"][b] + nk].repeat_interleave(heads // kv_heads, dim=1).transpose(0, 1)
+            v = inputs["v"][origins["v"][b] : origins["v"][b] + nk].repeat_interleave(heads // kv_heads, dim=1).transpose(0, 1)
+            scores = (q @ k.transpose(-1, -2)) * dim**-0.5
+            scores.masked_fill_(torch.arange(nk)[None, :] > torch.arange(nq)[:, None], float("-inf"))
+            expected = (scores.softmax(-1) @ v).transpose(0, 1)
+            expected_stats = scores.logsumexp(-1).T
+            o_start, st_start = origins["o"][b], origins["stats"][b]
+            torch.testing.assert_close(output[o_start : o_start + nq].double(), expected, atol=0.025, rtol=0.02)
+            torch.testing.assert_close(stats[st_start : st_start + nq].double(), expected_stats, atol=0.003, rtol=0.003)
+            written_o[o_start : o_start + nq] = True
+            written_stats[st_start : st_start + nq] = True
+        assert torch.all(output[~written_o] == -17)
+        assert torch.all(stats[~written_stats] == -29)
+
+    def run(state, expect_single, replay=None):
+        poison()
+        if replay is None:
+            graph.execute(pack, workspace)
+        else:
+            replay.replay()
+        torch.cuda.synchronize()
+        check(state)
+        assert single_maps() == expect_single
+
+    lengths, keyless, queryless = ([129, 0, 65, 33], [147, 0, 92, 50]), ([97, 0, 49, 17], [101, 0, 76, 0]), ([129, 0, 65, 33], [147, 83, 92, 50])
+    # Compact prefixes in every port: single load maps.
+    run(fill(*lengths), 1)
+    # A sequence without query rows or keys does not vote, whatever its offsets say.
+    run(fill(*lengths, elsewhere=[(name, 1) for name in ports]), 1)
+    # A keyless sequence does not vote with its K/V offsets.
+    run(fill(*keyless, elsewhere=[("k", 3), ("v", 3)]), 1)
+    # A sequence with keys but no query rows votes with its K/V offsets: its
+    # rows sit inside the packed KV prefix that its predecessor's tail reads.
+    run(fill(*queryless, elsewhere=[("k", 1), ("v", 1)]), 0)
+    # A gap after the first sequence in any one port, or in K and V together: sequence-local maps.
+    gaps = ({"k": 8, "v": 8}, {"q": 8}, {"k": 8}, {"v": 8}, {"o": 8}, {"stats": 8})
+    for shifts in gaps:
+        run(fill(*lengths, shifts=shifts), 0)
+    captured = torch.cuda.CUDAGraph()
+    try:
+        fill(*lengths)
+        with torch.cuda.graph(captured):
+            graph.execute(pack, workspace)
+        # Replay reads the offsets of each launch: compact, every gap, keys without queries elsewhere, compact.
+        run(fill(*lengths), 1, replay=captured)
+        for shifts in gaps:
+            run(fill(*lengths, shifts=shifts), 0, replay=captured)
+        run(fill(*queryless, elsewhere=[("k", 1), ("v", 1)]), 0, replay=captured)
+        run(fill(*keyless), 1, replay=captured)
+    finally:
+        captured.reset()
