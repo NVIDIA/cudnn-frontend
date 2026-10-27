@@ -90,7 +90,12 @@ def _leads(spec: EngineSpec, facts) -> bool:
         return facts.thd and facts.window_left is None and (facts.d_qk, facts.d_v) == (128, 128)
     if spec.name == "sdpa_bwd_sm100_d256":
         return _d256_leads(facts)
-    return True
+    return spec.name not in TRAIL_ONLY_ROWS
+
+
+TRAIL_ONLY_ROWS = frozenset({"sdpa_bwd_sm80", "sdpa_bwd_sm120", "sdpa_bwd_sm107", "sdpa_bwd_sm107_d512"})
+"""Default-offered rows with no measured lead shard: ranked after the backend's block, so they serve a graph only when the
+backend declines it (a correctness fallback, not a performance claim)."""
 
 
 SM100_D256_BWD_RAGGED_MASKFREE_MAX_S_Q = 4095  # mask-free ragged THD d256 past this length: 0.95-1.10 of the backend

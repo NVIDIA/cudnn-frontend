@@ -480,6 +480,11 @@ def _d512_swa(facts) -> bool:
     )
 
 
+TRAIL_ONLY_ROWS = frozenset({"sdpa_fwd_prefill_sm80"})
+"""Default-offered rows with no measured lead shard: offered after the backend's block, so they serve a graph only when the
+backend declines it (a correctness fallback, not a performance claim)."""
+
+
 def place(spec, facts) -> str:
     """``LEAD`` or ``TRAIL`` for the row ``spec`` serving ``facts`` (see the module docstring).
 
@@ -505,6 +510,8 @@ def place(spec, facts) -> str:
         return _place_sm100_fp8(spec.capabilities, facts)
     if spec.name == "sdpa_fwd_prefill_sm107_fp8":
         return _place_sm107_fp8(spec.capabilities, facts)
+    if spec.name in TRAIL_ONLY_ROWS:
+        return TRAIL
     return LEAD
 
 

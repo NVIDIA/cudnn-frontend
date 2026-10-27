@@ -69,13 +69,25 @@ def test_known_default_and_opt_in_rows_are_offered(monkeypatch):
         "sdpa_fwd_prefill_sm100_fp8",
         "sdpa_fwd_prefill_sm107_fp8",
         "sdpa_fwd_prefill_sm107_mxfp8",
+        "sdpa_fwd_prefill_sm80",
     }
-    opt_in_rows = {"sdpa_fwd_prefill_sm80", "sdpa_fwd_prefill_sm100_mxfp8", "sdpa_fwd_prefill_sm120_mxfp8"}
+    opt_in_rows = {"sdpa_fwd_prefill_sm100_mxfp8", "sdpa_fwd_prefill_sm120_mxfp8"}
     offered = _FAMILY.offered_ids()
     assert default_rows <= offered.keys()
     assert opt_in_rows.isdisjoint(offered)
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     assert default_rows | opt_in_rows <= _FAMILY.offered_ids().keys()
+
+
+@pytest.mark.L0
+def test_trail_only_rows_rank_behind_the_backend():
+    """A default row with no measured lead shard serves only graphs the backend declines (a correctness fallback)."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    assert placement.TRAIL_ONLY_ROWS <= _FAMILY.offered_ids().keys()
+    for spec in ENGINE_SPECS:
+        if spec.name in placement.TRAIL_ONLY_ROWS:
+            assert placement.place(spec, _facts(device_cc=(8, 0))) == placement.TRAIL, spec.name
 
 
 @pytest.mark.L0

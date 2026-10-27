@@ -259,3 +259,24 @@ def test_sm100_d256_leads_the_backend_only_inside_its_measured_box(monkeypatch):
         assert order(**unmeasured) == trail, unmeasured
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     assert order(d_qk=192, d_v=128, h_kv=16) == lead
+
+
+def test_trail_only_rows_rank_behind_the_backend(monkeypatch):
+    """The default 16-bit rows with no measured lead shard rank behind the backend's block (a correctness fallback for
+    graphs the backend declines); the FROST opt-in keeps them first."""
+    from cudnn.engines.base import PlanConfig
+    from cudnn.engines.heuristics import is_backend_block
+    from cudnn.engines.manifest import MANIFEST
+    from cudnn.sdpa.bwd import heuristics
+
+    family = next(f for f in MANIFEST if f.name == "frost_sdpa_bwd")
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    for name in heuristics.TRAIL_ONLY_ROWS:
+        assert not family.slots[name].opt_in, name
+        eid = _OFFERED[name]
+        monkeypatch.setattr(heuristics, "recommend", lambda kind, facts, offered, eid=eid: [PlanConfig(eid, None)])
+        order = ["backend" if is_backend_block(p) else "frost" for p in heuristics.propose("A", _facts(), _OFFERED)]
+        assert order == ["backend", "frost"], name
+    monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+    order = ["backend" if is_backend_block(p) else "frost" for p in heuristics.propose("A", _facts(), _OFFERED)]
+    assert order == ["frost"]
