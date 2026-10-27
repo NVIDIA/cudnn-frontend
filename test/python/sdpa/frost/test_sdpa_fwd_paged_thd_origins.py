@@ -114,7 +114,8 @@ def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stat
             values[name].normal_()
             values[name][-1].fill_(float("nan"))
         for name in ("kt", "vt"):
-            values[name].copy_(torch.randperm(page_count, device="cuda", dtype=torch.int32).view(batch, 1, pages_per_sequence, 1))
+            # Page order is host test data; avoid an unrelated GPU radix sort.
+            values[name].copy_(torch.randperm(page_count, dtype=torch.int32).view(batch, 1, pages_per_sequence, 1))
         return ql, kl, starts
 
     first = buffers()
