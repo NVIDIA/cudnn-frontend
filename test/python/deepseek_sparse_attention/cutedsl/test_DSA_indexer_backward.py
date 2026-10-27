@@ -1737,13 +1737,14 @@ def test_DSA_indexer_backward_v2_accepts_sm103_capability(monkeypatch):
     assert plan.check_support()
 
 
-@pytest.mark.L1
 @torch_fork_set_rng(seed=1710)
 @pytest.mark.parametrize(
     "topk,b,topk_indices_global,dw_dtype,dk_dtype",
     [
-        pytest.param(2048, 1, False, torch.bfloat16, torch.float32, id="aligned-2048-local-bf16dw-fp32dk"),
-        pytest.param(2051, 2, True, torch.float32, torch.bfloat16, id="csa-tail-2051-global-fp32dw-bf16dk"),
+        pytest.param(129, 2, False, torch.float32, torch.float32, marks=pytest.mark.L0, id="tail-129-local-b2-fp32dw-fp32dk"),
+        pytest.param(2048, 2, False, torch.bfloat16, torch.float32, marks=pytest.mark.L1, id="aligned-2048-local-b2-bf16dw-fp32dk"),
+        pytest.param(2051, 2, True, torch.float32, torch.bfloat16, marks=pytest.mark.L1, id="csa-tail-2051-global-b2-fp32dw-bf16dk"),
+        pytest.param(2051, 2, False, torch.float32, torch.float32, marks=pytest.mark.L1, id="csa-tail-2051-local-b2-fp32dw-fp32dk"),
     ],
 )
 def test_DSA_indexer_backward_wrapper_v2_native_h32(topk, b, topk_indices_global, dw_dtype, dk_dtype):
@@ -1833,13 +1834,16 @@ def test_DSA_indexer_backward_wrapper_v2_native_h32(topk, b, topk_indices_global
     )
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(native_attn, default_attn[..., :topk], rtol=0.0, atol=0.0)
+    # The native and padded paths reduce different physical extents. Their
+    # softmax updates need numerical agreement, not bitwise identity; the
+    # deterministic test below owns the bitwise-stability contract.
+    torch.testing.assert_close(native_attn, default_attn[..., :topk], rtol=3e-6, atol=2e-7)
     torch.testing.assert_close(d_index_q, default_dq, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(d_weights.float(), default_dw.float(), rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(d_index_k, default_dk, rtol=3e-2, atol=3e-2)
 
 
-@pytest.mark.L1
+@pytest.mark.L0
 @torch_fork_set_rng(seed=1712)
 def test_DSA_indexer_backward_wrapper_v2_native_h32_deterministic():
     """The public deterministic H32 policy is bitwise stable and accurate."""

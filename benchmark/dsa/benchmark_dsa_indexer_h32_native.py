@@ -26,6 +26,7 @@ from cudnn import DSA
 
 
 def _call(backend, q, w, k, attn, predict, indices, grad_loss, outputs):
+    """Launch one backend into caller-owned output buffers."""
     return DSA.indexer_backward_wrapper(
         q,
         w,
@@ -48,6 +49,7 @@ def _call(backend, q, w, k, attn, predict, indices, grad_loss, outputs):
 
 
 def _diff_stats(lhs, rhs):
+    """Return finite/error statistics for corresponding gradient outputs."""
     stats = []
     for actual, expected in zip(lhs, rhs):
         actual_f = actual.float()
@@ -65,6 +67,7 @@ def _diff_stats(lhs, rhs):
 
 
 def _summary(values):
+    """Summarize one positive finite latency sample population."""
     ordered = sorted(values)
     result = {
         "median_us": statistics.median(ordered),
@@ -78,6 +81,7 @@ def _summary(values):
 
 
 def main():
+    """Benchmark native H32 against conservative and eager-pad controls."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--topk", type=int, required=True)
     parser.add_argument("--warmup", type=int, default=30)

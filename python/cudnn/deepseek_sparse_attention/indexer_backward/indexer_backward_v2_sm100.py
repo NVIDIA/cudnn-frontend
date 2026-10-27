@@ -70,7 +70,7 @@ from cutlass import Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.typing import BFloat16, Float32
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import llvm
+from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cutlass_dsl import dsl_user_op
 from cudnn._cutlass_compat import OperandMajorMode, SmemAllocator, TmemAllocator
 
@@ -101,6 +101,32 @@ from .indexer_backward_sm100 import _score_grad_inplace
 
 mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd="rn")
 fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd="rn")
+
+
+class _SubsetNamedBarrier(pipeline.NamedBarrier):
+    """Named barrier for a subset of CTA warps, without an aligned promise."""
+
+    @dsl_user_op
+    def arrive(self, *, loc=None, ip=None):
+        """Arrive at the subset barrier from divergent warp-role control flow."""
+        nvvm.barrier_cta_arrive(
+            Int32(self.barrier_id).ir_value(loc=loc, ip=ip),
+            Int32(self.num_threads).ir_value(loc=loc, ip=ip),
+            aligned=False,
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def arrive_and_wait(self, *, loc=None, ip=None):
+        """Wait on the subset barrier from divergent warp-role control flow."""
+        nvvm.barrier_cta_sync(
+            Int32(self.barrier_id).ir_value(loc=loc, ip=ip),
+            thread_count=Int32(self.num_threads).ir_value(loc=loc, ip=ip),
+            aligned=False,
+            loc=loc,
+            ip=ip,
+        )
 
 
 @dsl_user_op
@@ -312,12 +338,12 @@ class IndexerBackwardV2Sm100:
         self.num_regs_dk = 160
 
         # participants: MMA warp + S-epi warps + dK warps (TMEM users)
-        self.tmem_alloc_barrier = pipeline.NamedBarrier(
+        self.tmem_alloc_barrier = _SubsetNamedBarrier(
             barrier_id=2,
             num_threads=32 * (1 + len(self.epi_warp_ids) + len(self.dk_warp_ids)),
         )
         # TMEM dealloc gate: S-epi + dK warps
-        self.tmem_dealloc_barrier = pipeline.NamedBarrier(
+        self.tmem_dealloc_barrier = _SubsetNamedBarrier(
             barrier_id=3,
             num_threads=32 * (len(self.epi_warp_ids) + len(self.dk_warp_ids)),
         )
@@ -325,7 +351,7 @@ class IndexerBackwardV2Sm100:
         # warp arrive()s right after staging its smem partial
         # (non-blocking), the combine arrive_and_wait()s after the dQ
         # store -> count = 2 x 128.
-        self.epi_dw_barrier = pipeline.NamedBarrier(
+        self.epi_dw_barrier = _SubsetNamedBarrier(
             barrier_id=4,
             num_threads=2 * 32 * len(self.epi_warp_ids),
         )
@@ -339,13 +365,13 @@ class IndexerBackwardV2Sm100:
         # weights row
         # straight from gmem (mW is read-only), so weights are never staged
         # in smem.
-        self.stage_barrier = pipeline.NamedBarrier(barrier_id=5, num_threads=128)
+        self.stage_barrier = _SubsetNamedBarrier(barrier_id=5, num_threads=128)
         # Deterministic dK row boundary. CTA-private planes remove cross-CTA
         # atomic races; this barrier keeps the four dK warps on one row and
         # prevents consecutive query rows from interleaving within a plane.
         # Ordinary dynamic-ticket execution retains the fully overlapped
         # schedule.
-        self.dk_row_barrier = pipeline.NamedBarrier(barrier_id=6, num_threads=128)
+        self.dk_row_barrier = _SubsetNamedBarrier(barrier_id=6, num_threads=128)
 
     # -----------------------------------------------------------------
     # host side
@@ -766,7 +792,11 @@ class IndexerBackwardV2Sm100:
                         q_state.advance()
 
             elif warp_idx == self.mma_warp_id:
-                tmem.wait_for_alloc()
+                # TmemAllocator.wait_for_alloc() rebuilds an aligned named
+                # barrier. These 32 MMA threads synchronize with only the
+                # participating epilogue and dK warps, so use the original
+                # unaligned subset barrier directly.
+                self.tmem_alloc_barrier.arrive_and_wait()
                 tmem_base = tmem.retrieve_ptr(Float32)
                 tAccdQ = cute.make_tensor(tmem_base + self.tmem_dQ_off, acc_dQ_ref.layout)
 
@@ -962,7 +992,7 @@ class IndexerBackwardV2Sm100:
             cute.arch.setmaxregister_increase(self.num_regs_epi)
             if warp_idx == self.epi_warp_ids[0]:
                 tmem.allocate(self.tmem_alloc_cols)
-            tmem.wait_for_alloc()
+            self.tmem_alloc_barrier.arrive_and_wait()
             tmem_base = tmem.retrieve_ptr(Float32)
             tAccS0 = cute.make_tensor(tmem_base + self.tmem_S_off[0], acc_S_ref.layout)
             tAccdQ = cute.make_tensor(tmem_base + self.tmem_dQ_off, acc_dQ_ref.layout)
@@ -1412,7 +1442,7 @@ class IndexerBackwardV2Sm100:
         # =============================================================
         else:
             cute.arch.setmaxregister_increase(self.num_regs_dk)
-            tmem.wait_for_alloc()
+            self.tmem_alloc_barrier.arrive_and_wait()
             tmem_base = tmem.retrieve_ptr(Float32)
             tAccdK = [cute.make_tensor(tmem_base + self.tmem_dK_off[s], acc_dK_ref.layout) for s in range(self.dk_stage)]
 
