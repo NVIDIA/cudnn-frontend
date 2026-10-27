@@ -718,8 +718,16 @@ class SdpaThdBinder {
                     py::handle override_strides,
                     const std::vector<int64_t> &indices,
                     py::object stream) const {
-        auto read = read_ordered_binding(
-            schema, buffers, tensor_uids, auto_bindings, workspace, override_uids, override_shapes, override_strides);
+        DLDevice workspace_device{};
+        auto read = read_ordered_binding(schema,
+                                         buffers,
+                                         tensor_uids,
+                                         auto_bindings,
+                                         workspace,
+                                         override_uids,
+                                         override_shapes,
+                                         override_strides,
+                                         &workspace_device);
         // Complete unsupported producer protocols in the existing shared Python
         // normalizer. Never re-read supported operands or discard observations.
         if (scratch_bytes_ < 0 || !py::cast<py::list>(read[1]).empty() || read[2].is_none()) return read;
@@ -733,24 +741,10 @@ class SdpaThdBinder {
             if (bytes < scratch_bytes_)
                 invalid("needs a " + std::to_string(scratch_bytes_) + "-byte workspace, got " + std::to_string(bytes) +
                         " bytes (size it with graph.get_workspace_size())");
-            // Preserve the graph plan's observable placement contract on every
-            // call, independently of the schema's immutable geometry cache.
-            auto device  = py::getattr(workspace, "__dlpack_device__", py::none());
-            bool matches = true;
-            if (!device.is_none()) {
-                matches = py::tuple(device()).equal(py::make_tuple(2, device_));
-            } else {
-                auto observed = py::steal<py::object>(PyObject_GetAttrString(workspace.ptr(), "device"));
-                if (observed.is_valid()) {
-                    matches = py::getattr(observed, "type", py::none()).equal(py::str("cuda")) &&
-                              py::getattr(observed, "index", py::none()).equal(py::int_(device_));
-                } else if (PyErr_ExceptionMatches(PyExc_AttributeError)) {
-                    PyErr_Clear();
-                } else {
-                    throw py::python_error();
-                }
-            }
-            if (!matches) invalid("workspace must be on CUDA device " + std::to_string(device_));
+            // The shared reader observed this call's device with its extent.
+            // Reuse that fact, not a cached placement or a second Python query.
+            if (workspace_device.device_type != kDLCUDA || workspace_device.device_id != device_)
+                invalid("workspace must be on CUDA device " + std::to_string(device_));
         }
         execute(read[0], indices, ptr, std::move(stream), py::none(), -1);
         return py::none();

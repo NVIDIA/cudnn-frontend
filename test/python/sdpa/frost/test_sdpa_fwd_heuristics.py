@@ -754,18 +754,17 @@ def test_per_tensor_fp8_d128_paged_decode_runs_cga1_on_both_legs(batch):
 
 @pytest.mark.L0
 def test_per_tensor_fp8_envelope_uses_d256_cga1():
-    """The D256 flavor's geometry (cga = 1) reaches the plan list for its exact
-    shape; a non-native shape in its padded envelope is declined (the flavor is
-    floored to exact shapes until its padded paths are validated), so no plan is
-    proposed for it at all."""
-
+    """Exact and aligned padded heads use the D256 flavor with CGA1."""
     name = engines.engine_name(fp8=True)
-    exact = _facts(d_qk=256, d_v=256, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True)
-    plans = recommend("A", exact, {name: 20510})
-    assert plans
-    assert {plan.knobs.cga for plan in plans} == {1}
-    padded = _facts(d_qk=224, d_v=224, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True)
-    assert not recommend("A", padded, {name: 20510})
+    row = next(spec.capabilities for spec in engines.ENGINE_SPECS if spec.name == name)
+    for d in (256, 224):
+        facts = _facts(d_qk=d, d_v=d, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True)
+        plans = recommend("A", facts, {name: 20510})
+        assert plans
+        assert {plan.knobs.cga for plan in plans} == {1}
+        assert all(engines._selected_d_shape(row, facts, plan.knobs) == (256, 256) for plan in plans)
+    misaligned = _facts(d_qk=225, d_v=224, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True)
+    assert not recommend("A", misaligned, {name: 20510})
 
 
 @pytest.mark.L0
