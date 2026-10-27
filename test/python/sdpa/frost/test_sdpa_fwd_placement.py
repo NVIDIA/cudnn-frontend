@@ -88,6 +88,16 @@ def test_trail_only_rows_rank_behind_the_backend():
     for spec in ENGINE_SPECS:
         if spec.name in placement.TRAIL_ONLY_ROWS:
             assert placement.place(spec, _facts(device_cc=(8, 0))) == placement.TRAIL, spec.name
+    from cudnn.engines.heuristics import LAST_RESORT, _assemble
+
+    # Across modes: a backend that offers only FALLBACK entries still precedes a last-resort row (review on #1962).
+    frost = PlanConfig(_OFFERED[_SM100], object())
+    proposals = lambda kind: [BACKEND, LAST_RESORT, frost]
+    backend_fb = [PlanConfig(7, "fb", mode=cudnn.heur_mode.FALLBACK)]
+    final = _assemble([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK], proposals, backend_fb)
+    assert [p.engine_id for p in final] == [7, frost.engine_id]
+    assert [p.engine_id for p in _assemble([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK], proposals, [])] == [frost.engine_id]
+    assert [p.engine_id for p in _assemble([cudnn.heur_mode.OPENSOURCE], proposals, backend_fb)] == [frost.engine_id]
 
 
 @pytest.mark.L0

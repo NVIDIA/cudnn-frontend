@@ -3169,15 +3169,21 @@ def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     ours = recommend(kind, facts, offered)
     if not ours:
         return ours
-    from cudnn.engines.heuristics import BACKEND
+    from cudnn.engines.heuristics import BACKEND, LAST_RESORT
     from cudnn.engines.manifest import opt_in_engines_enabled
 
-    from .placement import LEAD, place
+    from .placement import LEAD, TRAIL_ONLY_ROWS, place
 
     if opt_in_engines_enabled():
         return ours + [BACKEND]
-    spec = next(s for s in ENGINE_SPECS if offered.get(s.name) == ours[0].engine_id)
-    return ours + [BACKEND] if place(spec, facts) == LEAD else [BACKEND] + ours
+    name_of = {offered[s.name]: s.name for s in ENGINE_SPECS if s.name in offered}
+    last = [p for p in ours if name_of.get(p.engine_id) in TRAIL_ONLY_ROWS]
+    rest = [p for p in ours if p not in last]
+    if not rest:
+        return [BACKEND, LAST_RESORT] + last
+    spec = next(s for s in ENGINE_SPECS if offered.get(s.name) == rest[0].engine_id)
+    placed = rest + [BACKEND] if place(spec, facts) == LEAD else [BACKEND] + rest
+    return placed + [LAST_RESORT] + last if last else placed
 
 
 # Mode blocks, the delegating entry, dedup, the mode strip: placement bookkeeping

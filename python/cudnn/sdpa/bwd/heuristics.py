@@ -119,11 +119,14 @@ def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
 
     if not ours or opt_in_engines_enabled():
         return ours
-    from cudnn.engines.heuristics import BACKEND
+    from cudnn.engines.heuristics import BACKEND, LAST_RESORT
 
     spec_of = {offered[s.name]: s for s in ENGINE_SPECS if s.name in offered}
-    lead = [p for p in ours if _leads(spec_of[p.engine_id], facts)]
-    trail = [p for p in ours if p not in lead]
+    last = [p for p in ours if spec_of[p.engine_id].name in TRAIL_ONLY_ROWS]
+    lead = [p for p in ours if p not in last and _leads(spec_of[p.engine_id], facts)]
+    trail = [p for p in ours if p not in last and p not in lead]
+    if last:
+        return lead + [BACKEND] + trail + [LAST_RESORT] + last
     return lead + [BACKEND] + trail if trail else lead
 
 
