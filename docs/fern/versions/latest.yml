@@ -62,6 +62,9 @@ navigation:
       - section: GNN
         slug: operations/gnn
         contents:
+          - page: Heterogeneous basis aggregation (post)
+            path: ../../operations/gnn/agg_hg_basis_post.md
+            slug: agg_hg_basis_post
           - page: GNN simple aggregation
             path: ../../operations/gnn/agg_simple.md
             slug: agg_simple

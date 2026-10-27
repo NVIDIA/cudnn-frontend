@@ -12,6 +12,8 @@ import cudnn
 @pytest.mark.skipif(sys.platform.startswith("win"), reason="cuDNN GNN APIs are not supported on Windows")
 def test_gnn_mha_bindings_do_not_depend_on_build_headers():
     assert hasattr(cudnn, "gnn_activation_op")
+    assert hasattr(cudnn, "gnn_agg_hg_basis_post_forward")
+    assert hasattr(cudnn, "gnn_agg_hg_basis_post_backward")
     assert hasattr(cudnn, "gnn_mha_gat_forward")
     assert hasattr(cudnn, "gnn_mha_gat_backward")
     assert hasattr(cudnn, "gnn_mha_gat_v2_forward")

@@ -208,6 +208,114 @@ init_gnn_submodule([[maybe_unused]] py::module_ &m) {
 #endif
 
 #if !defined(_WIN32)
+    m.def(
+        "gnn_agg_hg_basis_post_forward",
+        [](std::intptr_t stream,
+           std::intptr_t csc_offsets,
+           std::intptr_t csc_indices,
+           std::int64_t n_src_nodes,
+           std::int64_t n_dst_nodes,
+           std::int64_t n_indices,
+           int idx_type,
+           std::intptr_t edge_types,
+           int num_edge_types,
+           std::intptr_t node_features,
+           std::intptr_t weights_comb,
+           std::intptr_t output,
+           int node_feat_dim,
+           int num_bases,
+           bool concat_own,
+           bool norm_by_edge_type) {
+            require_gnn_backend_version(92900, "cudnnGnnAggHgBasisPostForward");
+            ensure_cuda_runtime_context();
+            auto graph  = make_csc_graph(csc_offsets, csc_indices, 0, n_src_nodes, n_dst_nodes, n_indices, idx_type);
+            auto status = detail::gnn_agg_hg_basis_post_forward(reinterpret_cast<cudaStream_t>(stream),
+                                                                &graph,
+                                                                reinterpret_cast<const int32_t *>(edge_types),
+                                                                num_edge_types,
+                                                                reinterpret_cast<const float *>(node_features),
+                                                                reinterpret_cast<const float *>(weights_comb),
+                                                                reinterpret_cast<float *>(output),
+                                                                node_feat_dim,
+                                                                num_bases,
+                                                                concat_own,
+                                                                norm_by_edge_type);
+            throw_if_gnn_failed(status, "cudnnGnnAggHgBasisPostForward");
+        },
+        py::arg("stream"),
+        py::arg("csc_offsets"),
+        py::arg("csc_indices"),
+        py::arg("n_src_nodes"),
+        py::arg("n_dst_nodes"),
+        py::arg("n_indices"),
+        py::arg("idx_type"),
+        py::arg("edge_types"),
+        py::arg("num_edge_types"),
+        py::arg("node_features"),
+        py::arg("weights_comb"),
+        py::arg("output"),
+        py::arg("node_feat_dim"),
+        py::arg("num_bases"),
+        py::arg("concat_own"),
+        py::arg("norm_by_edge_type"));
+
+    m.def(
+        "gnn_agg_hg_basis_post_backward",
+        [](std::intptr_t stream,
+           std::intptr_t csc_offsets,
+           std::intptr_t csc_indices,
+           std::int64_t n_src_nodes,
+           std::int64_t n_dst_nodes,
+           std::int64_t n_indices,
+           int idx_type,
+           std::intptr_t edge_types,
+           int num_edge_types,
+           std::intptr_t grad_output,
+           std::intptr_t node_features,
+           std::intptr_t weights_comb,
+           std::intptr_t grad_node_features,
+           std::intptr_t grad_weights_comb,
+           int node_feat_dim,
+           int num_bases,
+           bool concat_own,
+           bool norm_by_edge_type) {
+            require_gnn_backend_version(92900, "cudnnGnnAggHgBasisPostBackward");
+            ensure_cuda_runtime_context();
+            auto graph  = make_csc_graph(csc_offsets, csc_indices, 0, n_src_nodes, n_dst_nodes, n_indices, idx_type);
+            auto status = detail::gnn_agg_hg_basis_post_backward(reinterpret_cast<cudaStream_t>(stream),
+                                                                 &graph,
+                                                                 reinterpret_cast<const int32_t *>(edge_types),
+                                                                 num_edge_types,
+                                                                 reinterpret_cast<const float *>(grad_output),
+                                                                 reinterpret_cast<const float *>(node_features),
+                                                                 reinterpret_cast<const float *>(weights_comb),
+                                                                 reinterpret_cast<float *>(grad_node_features),
+                                                                 reinterpret_cast<float *>(grad_weights_comb),
+                                                                 node_feat_dim,
+                                                                 num_bases,
+                                                                 concat_own,
+                                                                 norm_by_edge_type);
+            throw_if_gnn_failed(status, "cudnnGnnAggHgBasisPostBackward");
+        },
+        py::arg("stream"),
+        py::arg("csc_offsets"),
+        py::arg("csc_indices"),
+        py::arg("n_src_nodes"),
+        py::arg("n_dst_nodes"),
+        py::arg("n_indices"),
+        py::arg("idx_type"),
+        py::arg("edge_types"),
+        py::arg("num_edge_types"),
+        py::arg("grad_output"),
+        py::arg("node_features"),
+        py::arg("weights_comb"),
+        py::arg("grad_node_features"),
+        py::arg("grad_weights_comb"),
+        py::arg("node_feat_dim"),
+        py::arg("num_bases"),
+        py::arg("concat_own"),
+        py::arg("norm_by_edge_type"));
+
     py::enum_<detail::gnn_activation_op_t>(m, "gnn_activation_op")
         .value("LINEAR", detail::gnn_activation_op_t::LINEAR)
         .value("RELU", detail::gnn_activation_op_t::RELU)

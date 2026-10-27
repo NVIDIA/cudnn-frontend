@@ -1461,6 +1461,124 @@ gnn_mha_simple_backward(cudaStream_t stream,
     return CUDNN_STATUS_NOT_SUPPORTED;
 #endif
 }
+
+inline cudnnStatus_t
+gnn_agg_hg_basis_post_forward(cudaStream_t stream,
+                              const gnn_csc_graph_t *graph,
+                              const int32_t *edge_types,
+                              int num_edge_types,
+                              const float *node_features,
+                              const float *weights_comb,
+                              float *output,
+                              int node_feat_dim,
+                              int num_bases,
+                              int concat_own,
+                              int norm_by_edge_type) {
+#if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
+    if (get_backend_version() < 92900) return CUDNN_STATUS_NOT_SUPPORTED;
+    NV_FE_CALL_TO_BACKEND(gnn_agg_hg_basis_post_forward,
+                          cudnnGnnAggHgBasisPostForward,
+                          stream,
+                          graph,
+                          edge_types,
+                          num_edge_types,
+                          node_features,
+                          weights_comb,
+                          output,
+                          node_feat_dim,
+                          num_bases,
+                          concat_own,
+                          norm_by_edge_type);
+#elif CUDNN_VERSION >= 92900
+    return cudnnGnnAggHgBasisPostForward(stream,
+                                         reinterpret_cast<const cudnnGnnCscGraph_t *>(graph),
+                                         edge_types,
+                                         num_edge_types,
+                                         node_features,
+                                         weights_comb,
+                                         output,
+                                         node_feat_dim,
+                                         num_bases,
+                                         concat_own,
+                                         norm_by_edge_type);
+#else
+    (void)stream;
+    (void)graph;
+    (void)edge_types;
+    (void)num_edge_types;
+    (void)node_features;
+    (void)weights_comb;
+    (void)output;
+    (void)node_feat_dim;
+    (void)num_bases;
+    (void)concat_own;
+    (void)norm_by_edge_type;
+    return CUDNN_STATUS_NOT_SUPPORTED;
+#endif
+}
+
+inline cudnnStatus_t
+gnn_agg_hg_basis_post_backward(cudaStream_t stream,
+                               const gnn_csc_graph_t *graph,
+                               const int32_t *edge_types,
+                               int num_edge_types,
+                               const float *grad_output,
+                               const float *node_features,
+                               const float *weights_comb,
+                               float *grad_node_features,
+                               float *grad_weights_comb,
+                               int node_feat_dim,
+                               int num_bases,
+                               int concat_own,
+                               int norm_by_edge_type) {
+#if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
+    if (get_backend_version() < 92900) return CUDNN_STATUS_NOT_SUPPORTED;
+    NV_FE_CALL_TO_BACKEND(gnn_agg_hg_basis_post_backward,
+                          cudnnGnnAggHgBasisPostBackward,
+                          stream,
+                          graph,
+                          edge_types,
+                          num_edge_types,
+                          grad_output,
+                          node_features,
+                          weights_comb,
+                          grad_node_features,
+                          grad_weights_comb,
+                          node_feat_dim,
+                          num_bases,
+                          concat_own,
+                          norm_by_edge_type);
+#elif CUDNN_VERSION >= 92900
+    return cudnnGnnAggHgBasisPostBackward(stream,
+                                          reinterpret_cast<const cudnnGnnCscGraph_t *>(graph),
+                                          edge_types,
+                                          num_edge_types,
+                                          grad_output,
+                                          node_features,
+                                          weights_comb,
+                                          grad_node_features,
+                                          grad_weights_comb,
+                                          node_feat_dim,
+                                          num_bases,
+                                          concat_own,
+                                          norm_by_edge_type);
+#else
+    (void)stream;
+    (void)graph;
+    (void)edge_types;
+    (void)num_edge_types;
+    (void)grad_output;
+    (void)node_features;
+    (void)weights_comb;
+    (void)grad_node_features;
+    (void)grad_weights_comb;
+    (void)node_feat_dim;
+    (void)num_bases;
+    (void)concat_own;
+    (void)norm_by_edge_type;
+    return CUDNN_STATUS_NOT_SUPPORTED;
+#endif
+}
 #endif
 
 #if CUDNN_VERSION >= 92200
