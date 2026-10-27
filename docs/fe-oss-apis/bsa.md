@@ -372,7 +372,7 @@ way and walks the union of their Q pages with a per-step page-pair mask, so
 `block_sizes` is supported in backward on this path.
 
 ```python
-from cudnn.torch import block_sparse_attention_forward, block_sparse_attention_backward, kpage_prepare_layout
+from cudnn.ops import block_sparse_attention_forward, block_sparse_attention_backward, kpage_prepare_layout
 
 # Metadata as for the base path: block_sizes[j] is the number of valid keys of KV block j.
 o, lse = block_sparse_attention_forward(q, k, v, q2k_block_index, block_sparse_num, block_sizes, kpage=True)

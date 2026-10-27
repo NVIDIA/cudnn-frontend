@@ -2417,6 +2417,9 @@ class BlockSparseAttnBackwardSm100KPage:
         wg_idx = (cute.arch.thread_idx()[0] % num_compute_threads) // 128
         num_wg = num_compute_threads // 128
         leader_warp = (cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4) == 0
+        # Only the compute warps reach these barriers (the arrive from the leader warp alone), so they must be non-aligned.
+        epi_sync_128 = _SubsetNamedBarrier(barrier_id=barrier_id, num_threads=128)
+        epi_sync_160 = _SubsetNamedBarrier(barrier_id=barrier_id, num_threads=128 + cute.arch.WARP_SIZE)
 
         if const_expr(not self.dKV_postprocess):
             sdKV = sdKV[None, None, wg_idx]  # (tile_n, 64) for bf16
@@ -2493,7 +2496,7 @@ class BlockSparseAttnBackwardSm100KPage:
             tdKVrdKV_r2s = cute.make_tensor(tdKVrdKV.iterator, tdKVsdKV_r2s.shape)
             cute.copy(thr_copy_r2s_dKV, tdKVrdKV_r2s, tdKVsdKV_r2s)
             cute.arch.fence_view_async_shared()
-            cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128)
+            epi_sync_128.arrive_and_wait_w_index(wg_idx)
 
             # SMEM -> GMEM
             if leader_warp:
@@ -2537,11 +2540,11 @@ class BlockSparseAttnBackwardSm100KPage:
                 if const_expr(epi_stage < num_epi_stages - 1):
                     cute.arch.cp_async_bulk_commit_group()
                     cute.arch.cp_async_bulk_wait_group(0, read=True)
-                cute.arch.barrier_arrive(barrier_id=barrier_id + wg_idx, number_of_threads=128 + cute.arch.WARP_SIZE)
+                epi_sync_160.arrive_w_index(wg_idx)
 
             # Barrier since all warps need to wait for SMEM to be freed
             cute.arch.fence_view_async_shared()
-            cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128 + cute.arch.WARP_SIZE)
+            epi_sync_160.arrive_and_wait_w_index(wg_idx)
 
         cute.arch.sync_warp()
         with cute.arch.elect_one():
