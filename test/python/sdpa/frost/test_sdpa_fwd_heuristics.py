@@ -2307,7 +2307,7 @@ def test_sm107_paged_prefill_split_budget_spans_two_waves(sm107_metadata_target)
 @pytest.mark.L0
 def test_sm107_paged_split_ties_go_to_the_packed_grid(sm107_metadata_target):
     """A bounded one-tile Rubin paged chunk (Q bound 128) declares as many packed tiles as unpacked ones; the live tokens sit at or
-    below the bound, so the equal-work tie goes to the packed grid at the same split -- on the two-wave arm (G16) and on the
+    below the bound, so the equal-work tie goes to the packed grid at the same split -- on the main arm (G16 at one Q tile: a first-wave tie) and on the
     one-tile fallback (G8). The SM100 wave choice keeps its unpacked tie-break."""
     from types import SimpleNamespace
 
