@@ -1219,6 +1219,8 @@ including when a sink dominates the row. Mask its partial O by the computed
 weight before arithmetic; testing only `LSE == -inf` misses `0 * NaN` contamination.
 `test_packed_prefetch_excludes_zero_weight_partials` compares explicit reducer
 specializations with FP64, including sink-dominated rows and changed-total replay.
+`test_quantized_sink_combine_excludes_zero_weight_payload` covers the dense
+quantized small/serial reductions with NaN and both infinite payloads.
 
 Oversized Q/O backing allocations do not enlarge a split plan's live-Q bound.
 Without an explicit packed-total hint, the split workspace is still bounded by

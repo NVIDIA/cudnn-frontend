@@ -282,6 +282,9 @@ def _accumulate_splits(
         live = lse_s > neg_inf
         e = cute.math.exp(lse_s - m_safe, fastmath=True)
         w = cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
+        # Finite LSE can still underflow against a dominant split or sink.
+        # Its payload is dead too: never multiply zero by a NaN/Inf partial.
+        live = w > zero
         e0 = zero
         e1 = zero
         e2 = zero
