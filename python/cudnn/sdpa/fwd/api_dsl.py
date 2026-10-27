@@ -708,8 +708,8 @@ def _load_kernel_template(filename: str, params: Hashable, tag: str):
 
 def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplateParams, fp8: bool = False, pertensor: bool = False, rubin: bool = False):
     """Load one SM100-family module for the selected flavor and quantization
-    path. Rubin uses its SM107 siblings except for the shared half packed
-    split and paged pipelines, whose SMEM fits the version-0 descriptor window,
+    path. Rubin uses its SM107 siblings, including paged D128 half, except for
+    the shared half single-Q split and D256 paged pipelines, whose SMEM fits the version-0 descriptor window,
     and, on dense (128, 128) half graphs, the shared d128 decode tile at cga1
     and native D128 prefill under PackGQA."""
 
@@ -732,7 +732,7 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         return _load_kernel_template(_SM100_DECODE_KERNEL_FILE, params, f"sdpa_fwd_sm107_{tag}_single_q")
     if rubin and not fp8 and flavor == (256, 256) and params.thd_varlen and not params.paged_kv and params.split_kv > 1:
         return _load_kernel_template(_SM100_KERNEL_FILES[flavor], params, f"sdpa_fwd_sm107_{tag}_packed_split")
-    if rubin and not fp8 and params.paged_kv and flavor in ((128, 128), (256, 256)):
+    if rubin and not fp8 and params.paged_kv and flavor == (256, 256):
         return _load_kernel_template(_SM100_KERNEL_FILES[flavor], params, f"sdpa_fwd_sm107_{tag}_paged")
     if rubin and not fp8 and flavor == _SM100_DECODE_FLAVOR and params.cta_mma == 1 and not params.thd_varlen and not params.paged_kv and not params.ragged_q:
         # Dense d128 half at TILE_CGA_M=1 on cc 10.7: the shared 128-row DECODE tile (CfgD128Decode, 224 KiB, inside the
@@ -3083,12 +3083,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # on the flavors config_sm100._PAGED_KV_FLAVORS names (the same set
             # its _validate_params backstops, and engines' paged_d_shapes) and of
             # the d64/d128/d256 per-tensor FP8 and the MXFP8 kernels; every kernel file without it (
-            # the SM107 half and per-tensor FP8 siblings and the SM107 d192x128 / d512
+            # the unwired SM107 half and per-tensor FP8 siblings and the SM107 d192x128 / d512
             # MXFP8 siblings, the d192x128 / d512 FP8 flavors, the d512
             # 2x2-datapath twin) backstops
             # with a module-scope guard on paged_kv, and these declines keep that
             # guard unreachable from here.  On cc 10.7: half pools serve THD queries
-            # (the shared SM100 bodies), MXFP8 pools serve dense queries on d128 / d256
+            # (native D128 or the remaining shared SM100 bodies), MXFP8 pools serve dense queries on d128 / d256
             # (the sm107 siblings' own PAGED_KV loader); per-tensor FP8 pools and dense
             # half queries are not wired (engines.mismatch's Rubin clause is the twin).
             # The d256 DECODE tile (sm107/decode_d256_f16.py) walks the block table itself and

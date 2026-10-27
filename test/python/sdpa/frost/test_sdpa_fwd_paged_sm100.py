@@ -1960,7 +1960,6 @@ _PAGED_UNWIRED_KERNELS = [
     ("sm100/prefill_d192_d128_fp8.py", 0, 1),
     ("sm100/prefill_d512_fp8.py", 0, 2),
     ("sm100/prefill_d512_f16_2x2.py", 2, 2),
-    ("sm107/prefill_d128_f16.py", 2, 2),
     ("sm107/prefill_d128_fp8.py", 0, 2),
     ("sm107/prefill_d192_d128_mxfp8.py", 0, 2),
     ("sm107/prefill_d256_f16.py", 2, 2),
@@ -1976,7 +1975,7 @@ def test_paged_unwired_kernels_refuse_paged_params(rel, dtype_qkv, cta_mma):
     family (per-tensor FP8 d128 is wired now, MXFP8 shares its dtype codes) and names
     the d192 flavor for the f16/bf16 kernel, so each d128 / d192x128 / d256 / d512 kernel
     file WITHOUT the PAGED_KV specialization -- the d192x128 / d512 FP8 flavors, the
-    d512 2x2-datapath twin, the four SM107 d128 / d256 half and per-tensor FP8 siblings and
+    d512 2x2-datapath twin, the SM107 d256 half and d128 / d256 per-tensor FP8 siblings and
     the SM107 d192x128 / d512 MXFP8 siblings (the SM107 d128 / d256 MXFP8 siblings carry
     their own PAGED_KV loader) -- must refuse a paged TemplateParams itself, at module scope
     (or in its config backstop) -- never load its dense K/V descriptors over a page pool."""
