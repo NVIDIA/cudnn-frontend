@@ -81,7 +81,9 @@ only (the graph attribute is forward-only).
 (`sdpa/fwd/placement.py`).
 `sdpa_bwd_sm100` (f16/bf16, d in (256, 512]) is a default candidate too: the backend has no SM100
 engine for that band, so it is the only provider there. `sdpa_bwd_sm100_d128` is a default candidate that ranks
-ahead of the backend for d128 THD without a window and behind it elsewhere (`sdpa/bwd/heuristics.py`). Every other
+ahead of the backend for d128 THD without a window and behind it elsewhere; `sdpa_bwd_sm100_d256` is a default candidate that
+ranks ahead of the backend for d256 on cc 10.0 (except mask-free ragged THD past S_q 4096) and behind it for D192x128 and
+everywhere else (`sdpa/bwd/heuristics.py`). Every other
 FROST SDPA engine is `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before
 `import cudnn` or the graph runs a cuDNN backend plan. The flag also ranks FROST first everywhere.
 
@@ -362,7 +364,7 @@ Engines: `sdpa_fwd_prefill_sm100` (f16/bf16), `sdpa_fwd_prefill_sm100_fp8`,
 `sdpa_fwd_prefill_sm100_mxfp8`, `sdpa_bwd_sm100`, `sdpa_bwd_sm100_mxfp8`,
 `sdpa_bwd_sm100_d256`, `sdpa_bwd_sm100_d128`. The half-precision d512 backward engine serves **only
 the large-head-dim band, d ∈ (256, 512]**, the half-precision d256 backward
-engine (`sdpa_bwd_sm100_d256`, the 2x2-datapath body, 2026-10-01, opt_in) serves
+engine (`sdpa_bwd_sm100_d256`, the 2x2-datapath body, 2026-10-01; default since 2026-10-27) serves
 **exactly d = 256 plus native dense and THD D192x128**, the d128 engine serves **exactly d = 128** for
 half-precision MHA and, on SM100 or SM103, BF16 GQA/MQA within the restrictions
 below. The MXFP8 backward engine serves **exactly d = 256** —

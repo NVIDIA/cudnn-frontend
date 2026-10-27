@@ -29,8 +29,8 @@ plan:
   [MXFP8](#mxfp8-numerics-sdpa_bwd_sm107_mxfp8)). The sole provider of that
   graph on Rubin: cuDNN 9.27 has no MXFP8 d = 256 backward kernel there.
 
-A fourth engine, `sdpa_bwd_sm100_d256` (bf16 / fp16, SM100 / SM103, cc 10.0-10.6,
-`opt_in`), runs the SAME chain on the Blackwell line over the 2x2-datapath main
+A fourth engine, `sdpa_bwd_sm100_d256` (bf16 / fp16, SM100 / SM103, cc 10.0-10.6; a default
+candidate, ranked against the backend in `sdpa/bwd/heuristics.py`), runs the SAME chain on the Blackwell line over the 2x2-datapath main
 kernel (see "The 2x2-datapath body" below); pin it the same way
 (`startswith("sdpa_bwd_sm100_d256")`), because the bf16 d256 graph also has a
 native backend plan there (cuDNN engine 5 on B200 / 9.26).

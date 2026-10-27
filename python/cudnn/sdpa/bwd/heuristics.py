@@ -79,10 +79,31 @@ def _leads(spec: EngineSpec, facts) -> bool:
     ``sdpa_bwd_sm100_d128`` (measured 2026-10-26 against cuDNN 9.28.0.38, 216 cases at 32k tokens: d64/d128, GQA
     32/8 16/2 and MHA, S 1k-16k, causal / mask-free / SWA1024, BSHD and THD at equal and half-to-full lengths): THD at
     d128 wins 0.79-0.95 (one 1.07) -> ahead; dense BSHD d128 is parity (0.93-1.27), a window loses ~2x and dense D64
-    loses 1.7-2.3x -> behind the backend. Every other row keeps ours-first."""
+    loses 1.7-2.3x -> behind the backend.
+
+    ``sdpa_bwd_sm100_d256`` (measured 2026-10-27 on a full-power B200 against cuDNN 9.28.0.38, 108 cases at 32k tokens:
+    d256 GQA 16/2, 32/4 and MHA 16/16, D192x128 MHA 16-128 heads, S 1k-16k, causal / mask-free, BSHD and THD at equal and
+    half-to-full lengths): d256 wins 0.73-0.98 -> ahead, except a mask-free ragged THD declaration (declared total below
+    b * S_q) at S_q >= 4096 (0.95-1.10); D192x128 loses 1.08-1.91 everywhere -> behind. Only cc 10.0 was measured, and
+    deterministic / bias / dropout / window / sink graphs were not. Every other row keeps ours-first."""
     if spec.name == "sdpa_bwd_sm100_d128":
         return facts.thd and facts.window_left is None and (facts.d_qk, facts.d_v) == (128, 128)
+    if spec.name == "sdpa_bwd_sm100_d256":
+        return _d256_leads(facts)
     return True
+
+
+SM100_D256_BWD_RAGGED_MASKFREE_MAX_S_Q = 4095  # mask-free ragged THD d256 past this length: 0.95-1.10 of the backend
+
+
+def _d256_leads(facts) -> bool:
+    """The measured d256 lead box for ``sdpa_bwd_sm100_d256`` (see :func:`_leads`)."""
+    if (facts.d_qk, facts.d_v) != (256, 256) or facts.device_cc != (10, 0):
+        return False
+    if facts.deterministic or facts.has_bias or facts.has_dropout or facts.has_sink or facts.window_left is not None:
+        return False
+    ragged = facts.thd and facts.max_total_seq_len_q is not None and facts.max_total_seq_len_q < facts.b * facts.s_q
+    return not (ragged and not facts.causal and facts.s_q > SM100_D256_BWD_RAGGED_MASKFREE_MAX_S_Q)
 
 
 def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
