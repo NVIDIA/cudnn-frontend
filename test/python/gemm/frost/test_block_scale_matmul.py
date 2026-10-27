@@ -36,6 +36,7 @@ from gemm_test_utils import (
     block_quant_ref as _block_quant_ref,
     reduction_ref as _reduction_ref,
     assert_block_scale_reduction_close as _assert_block_scale_reduction_close,
+    plan_as_sm100,
 )
 
 from cudnn.gemm.frost import compiler as C
@@ -815,12 +816,12 @@ def test_block_scale_sf_ring_budget(moe, force_stg, budget, stages, monkeypatch)
     from cudnn.gemm.frost import tile_config
     from cudnn.gemm.frost.fusion_ir import MoeSpec
 
-    monkeypatch.setattr(C, "_current_arch", lambda: 100)
+    plan_as_sm100(monkeypatch)  # an SM100 config: its own compiler, whatever the active family
     monkeypatch.setattr(tile_config, "_sm_smem_budget_bytes", lambda device=None: budget)
     # The rendered grid size asks the active GPU how many 2-CTA clusters fit; a part
     # without clusters (pre-SM90) has none. The stage budget checked here does not
     # depend on it.
-    monkeypatch.setattr(C, "_grid_num_clusters", lambda cfg, device=None: 1)
+    monkeypatch.setattr(C100, "_grid_num_clusters", lambda cfg, device=None: 1)
     chain = analyze(_build_nvfp4_graph(256, 256, 512, block_size=32, sf_dt=_DT_E8M0, a_dt=_DT_E4M3))
     if moe:
         chain = dataclasses.replace(chain, moe=MoeSpec(num_experts=1, num_groups=3))
@@ -831,12 +832,12 @@ def test_block_scale_sf_ring_budget(moe, force_stg, budget, stages, monkeypatch)
     # another ring and pads to 1024 B: at an odd depth the two 512 B-per-stage SF
     # rings cost 2 x 512 B of padding, at an even depth none -- which is why the
     # odd-depth exact-fit budgets below sit 1024 B above the payload sum.
-    with C.force_stg_epi(force_stg):
+    with C100.force_stg_epi(force_stg):
         if stages == 0:
             with pytest.raises(NotImplementedError, match="no AB stage fits"):
-                C._render_block_scale_tile_constants(cfg, chain, select_template(chain, cfg))
+                C100._render_block_scale_tile_constants(cfg, chain, select_template(chain, cfg))
             return
-        src = C._render_block_scale_tile_constants(cfg, chain, select_template(chain, cfg))
+        src = C100._render_block_scale_tile_constants(cfg, chain, select_template(chain, cfg))
     assigned = dict(re.findall(r"^(\w+) = (.*)$", src, re.M))
     assert assigned["ab_stages"] == str(stages)
 

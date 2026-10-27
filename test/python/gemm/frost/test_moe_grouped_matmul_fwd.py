@@ -25,6 +25,7 @@ from gemm_test_utils import (
     reduction_ref as _reduction_ref,
     reduction_dims as _reduction_dims,
     FULL_EXPERT_REDUCE_OFFSETS as _FULL_EXPERT_REDUCE_OFFSETS,
+    plan_as_sm100,
 )
 
 from cudnn.gemm.frost.compiler import force_stg_epi, jit_from_cudnn_graph
@@ -2504,24 +2505,13 @@ def test_moe_swap_ab_quant(case):
     _run_moe_swap_ab_quant(case)
 
 
-def _plan_as_sm100(monkeypatch, C):
-    """These swap-AB checks are planning-only: pin the arch probe the template gate
-    reads (the active family's compiler, and the SM100 one these tests call) so the
-    active GPU's own gate does not answer first on a non-SM100 part."""
-    from cudnn.gemm.frost import compiler as active
-
-    for module in {id(C): C, id(active): active}.values():
-        monkeypatch.setattr(module, "_current_arch", lambda device=None: 100)
-
-
 @pytest.mark.parametrize("block_scale", [False, True])
 @pytest.mark.parametrize("grouped", [False, True])
 def test_moe_swap_ab_token_quant_requires_aligned_groups(block_scale, grouped, monkeypatch):
     from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
-    from cudnn.gemm.frost.sm100 import compiler as C
     from test_moe_grouped_block_scale_matmul_fwd import _build_graph as build_bs
 
-    _plan_as_sm100(monkeypatch, C)
+    C = plan_as_sm100(monkeypatch)
     graph = (build_bs if block_scale else _build_graph)(2, 256, 128, 256, num_groups=4)
     _, binding = analyze_with_binding(graph)
     base = binding.outputs[0].set_output(False)
@@ -2540,9 +2530,8 @@ def test_moe_swap_ab_token_quant_requires_aligned_groups(block_scale, grouped, m
 
 def test_moe_swap_ab_segmented_feature_quant_requires_scale_prefix(monkeypatch):
     from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
-    from cudnn.gemm.frost.sm100 import compiler as C
 
-    _plan_as_sm100(monkeypatch, C)
+    C = plan_as_sm100(monkeypatch)
     graph = _build_graph(2, 173, 128, 256, num_groups=4)
     _, binding = analyze_with_binding(graph)
     base = binding.outputs[0].set_output(False)
