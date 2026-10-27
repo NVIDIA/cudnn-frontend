@@ -1720,9 +1720,10 @@ def _kernel(
             if cutlass.const_expr(cluster_k_slices > 1):
                 nvvm.bar_warp_sync(0xFFFFFFFF)
                 if elect_one:
-                    # Relaxed: the mailbox loads were consumed by the reduction; a release arrive costs a MEMBAR.GPU per peer.
+                    # Release at CTA scope orders this warp's mailbox reads before the peer's next bulk write
+                    # (CUTLASS's remote consumer_release); cluster scope costs a MEMBAR.GPU per peer.
                     for k_peer in cutlass.range_constexpr(1, cluster_k_slices):
-                        nvvm.mbarrier_arrive(nvvm.mapa(k_free_mbar_ptr, k_peer), scope=nvvm.MemScope.CLUSTER, relaxed=True)
+                        nvvm.mbarrier_arrive(nvvm.mapa(k_free_mbar_ptr, k_peer), scope=nvvm.MemScope.CTA)
             consumer_stage = tile_iter % CLC_SCHED_STAGES
             if consumer_stage == 0 and tile_iter != 0:
                 clc_full_phase_epi = clc_full_phase_epi ^ 1
