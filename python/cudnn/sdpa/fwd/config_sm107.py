@@ -3948,6 +3948,10 @@ class TemplateParamsLean(TemplateParams):
     # N_MT = ceil(S_q x G / 16), the thread count 128 x N_MT and the S exchange's extent fold on it (the tcgen05 tile takes S_q at
     # runtime; this tile holds every row of the sequence in one CTA).  Plan-time only: the declared Q shape's S_q.
     decode_seqlen_q: int = 1
+    # k, the 32-key sub-tiles per CTA (1..LEAN_SPARSE_MAX_SUB_TILES_PER_CTA): the resolved pin the adapter carries into the record, so an
+    # explicit `sub_tiles_per_cta` survives template lowering (`ceil(n_sub / split)` is NOT invertible: top_k 32 gives split 2 for k 3 and
+    # k 4) and two pins are two cache identities.  0 = unset (the doc-default record): the builder derives k from `split_kv` as before.
+    sub_tiles_per_cta: int = 0
 
 
 def lean_sparse_n_mt(seqlen_q: int, qh_per_kh: int, rows_per_mt: int = LEAN_SPARSE_ROWS_PER_MT) -> int:
@@ -4175,7 +4179,17 @@ def make_cfg_d256_sparse_lean(params: TemplateParams, *, n_keys: int = LEAN_SPAR
         raise ValueError(f"{flavor}: page_size requires paged_kv=True")
     n_sub = lean_sparse_n_sub(params.qsa_block_topk, _SPARSE_BLOCK_SIZE, n_keys)
     split_req = int(params.split_kv or 1)
-    if split_req > 1:
+    k_rec = int(getattr(params, "sub_tiles_per_cta", 0) or 0)  # the record's k (the adapter's resolved pin); 0 = unset -> derived from the split
+    if k_rec > 0:
+        k = k_rec
+        if split_req > 1 and lean_sparse_split(params.qsa_block_topk, k) != split_req:
+            raise ValueError(
+                f"{flavor}: the record's sub_tiles_per_cta={k} and split_kv={split_req} disagree: the lean split of k {k} at top_k {params.qsa_block_topk} is "
+                f"ceil({n_sub} / {k}) = {lean_sparse_split(params.qsa_block_topk, k)}"
+            )
+        if sub_tiles_per_cta is not None and int(sub_tiles_per_cta) != k:
+            raise ValueError(f"{flavor}: the record carries sub_tiles_per_cta={k}, but sub_tiles_per_cta={sub_tiles_per_cta} was given")
+    elif split_req > 1:
         k = -(-n_sub // split_req)
         if sub_tiles_per_cta is not None and int(sub_tiles_per_cta) != k:
             raise ValueError(

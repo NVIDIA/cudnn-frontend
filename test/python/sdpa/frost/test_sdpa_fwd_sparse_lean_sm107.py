@@ -107,10 +107,44 @@ def test_lean_record_is_a_frozen_subclass_with_the_appended_seqlen_q_axis():
     from cudnn.sdpa.fwd.config_sm107 import TemplateParamsLean, make_cfg_d256_sparse_lean
 
     assert issubclass(TemplateParamsLean, TemplateParams) and "decode_seqlen_q" not in TemplateParams.__dataclass_fields__
-    assert [f.name for f in dataclasses.fields(TemplateParamsLean)][-1] == "decode_seqlen_q" and TemplateParamsLean().decode_seqlen_q == 1
+    names = [f.name for f in dataclasses.fields(TemplateParamsLean)]
+    assert names[-2:] == ["decode_seqlen_q", "sub_tiles_per_cta"] and TemplateParamsLean().decode_seqlen_q == 1 and TemplateParamsLean().sub_tiles_per_cta == 0
     assert TemplateParamsLean() != TemplateParams() and hash(TemplateParamsLean(decode_seqlen_q=4)) != hash(TemplateParamsLean())
+    assert hash(TemplateParamsLean(sub_tiles_per_cta=2)) != hash(TemplateParamsLean())  # the pinned k is part of the record's identity
     base = TemplateParams(**{f.name: getattr(_params(), f.name) for f in dataclasses.fields(TemplateParams)})
     assert make_cfg_d256_sparse_lean(base) == make_cfg_d256_sparse_lean(_params()) and make_cfg_d256_sparse_lean(base).S_Q == 1
+
+
+def test_the_explicit_sub_tile_pin_survives_template_lowering():
+    """An explicit ``sub_tiles_per_cta`` k is carried by the lean record (``TemplateParamsLean.sub_tiles_per_cta``) and read back by the
+    config builder as THE k -- ``ceil(n_sub / split)`` is not invertible (top_k 32: k 4 and k 3 both give split 2; top_k 64: k 8 -> split 2 ->
+    k 5), so a record that carried only the split would render a different kernel from the reported pin and give two pins one cache
+    identity (review of the first PR round).  A record whose k and split disagree is a typed rejection of the builder."""
+    import dataclasses
+
+    from cudnn.sdpa.fwd.config_sm107 import lean_sparse_split, make_cfg_d256_sparse_lean
+
+    for top_k, k in ((32, 4), (64, 8), (32, 3), (512, 4), (512, 2), (8, 1)):
+        a = _route_adapter(tile_form="lean", top_k=top_k, sub_tiles_per_cta=k)
+        assert a.check_support() and a.sub_tiles_per_cta == k and a.split_kv == lean_sparse_split(top_k, k)
+        p = a.template_params()
+        cfg = make_cfg_d256_sparse_lean(p)
+        assert p.sub_tiles_per_cta == k and (cfg.SUB_TILES_PER_CTA, cfg.SPLIT) == (k, a.split_kv), (top_k, k, cfg.SUB_TILES_PER_CTA, cfg.SPLIT)
+    # two pins with the SAME split are two records (two cache identities, two renderings)
+    p4 = _route_adapter(tile_form="lean", top_k=32, sub_tiles_per_cta=4)
+    p3 = _route_adapter(tile_form="lean", top_k=32, sub_tiles_per_cta=3)
+    assert p4.check_support() and p3.check_support() and p4.split_kv == p3.split_kv == 2
+    assert p4.template_params() != p3.template_params() and hash(p4.template_params()) != hash(p3.template_params())
+    # a split pin resolves its k and the record carries it; the default k (no pin) is carried too
+    sp = _route_adapter(tile_form="lean", split=33)
+    assert sp.check_support() and sp.template_params().sub_tiles_per_cta == 2 and make_cfg_d256_sparse_lean(sp.template_params()).SUB_TILES_PER_CTA == 2
+    d = _route_adapter(tile_form="lean")
+    assert d.check_support() and d.template_params().sub_tiles_per_cta == 1
+    # a record whose k and split disagree is rejected by name
+    with pytest.raises(ValueError, match="sub_tiles_per_cta"):
+        make_cfg_d256_sparse_lean(dataclasses.replace(d.template_params(), split_kv=33, sub_tiles_per_cta=4))
+    # a record without the k (0 = unset: the doc-default record / an older caller) derives it from the split as before
+    assert make_cfg_d256_sparse_lean(dataclasses.replace(sp.template_params(), sub_tiles_per_cta=0)).SUB_TILES_PER_CTA == 2
 
 
 def test_lean_config_pins_the_body_geometry():

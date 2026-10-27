@@ -79,7 +79,7 @@ m16n8k16 + ``cp.async``, one 128-thread CTA per (sequence, KV head, chunk of ``s
 one 256-d MMA chain, 32- vs 128-key tiles: never bitwise ACROSS the bodies, bitwise WITHIN each), so a caller may pin either.  The lean
 body serves the DECODE form only (``bottom_right`` + the shared list at ``S_q <= config_sm107.LEAN_SPARSE_SERVED_MAX_S_Q`` = 4 -- every
 row of the step in ONE CTA: ``n_mt = ceil(S_q x G / 16)`` m16 tiles of 128 threads over one gathered sub-tile, where the tcgen05 core runs
-every row as its own item; the adapter builds the lean tile's own record ``config_sm107.TemplateParamsLean(decode_seqlen_q=S_q)``, the
+every row as its own item; the adapter builds the lean tile's own record ``config_sm107.TemplateParamsLean(decode_seqlen_q=S_q, sub_tiles_per_cta=k)``, the
 compile-time S_q axis -- or the per-row list at ``S_q == 1``, which IS the shared list; per-row lists past one row are the core's --,
 ``seq_kv_lens`` present, dense BSHD or paged pools, bf16 / f16, G <= 16,
 ``top_k`` in [8, 512]) and ALWAYS splits: its ``split_kv`` is a LEAN split ``ceil(n_sub / k)`` (``heuristics.sparse_lean_splits``: 65 / 33 /
@@ -1008,7 +1008,9 @@ class SparseGqaFwdDslSm107:
             # compiled-plan keys are what they were)
             from cudnn.sdpa.fwd.config_sm107 import TemplateParamsLean
 
-            return TemplateParamsLean(**kw, decode_seqlen_q=self._SQ)
+            # the resolved k rides the record too: an explicit pin survives template lowering (ceil(n_sub / split) is not invertible) and
+            # two pins are two cache identities
+            return TemplateParamsLean(**kw, decode_seqlen_q=self._SQ, sub_tiles_per_cta=int(self.sub_tiles_per_cta or 0))
         return TemplateParams(**kw)
 
     def combine_form(self) -> int:
