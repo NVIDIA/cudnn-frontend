@@ -2347,6 +2347,8 @@ def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int], cga: Opti
         return cga_tile_m(192, cga)
     if facts.d_qk <= 256 and facts.d_v <= 256:
         return cga_tile_m(256, cga)
+    if _selected_d_shape(caps, facts) == (576, 512):
+        return cga_tile_m(576, cga)
     return cga_tile_m(512, cga)
 
 

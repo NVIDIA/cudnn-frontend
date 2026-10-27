@@ -662,3 +662,20 @@ def test_rubin_d64_decode_proposes_the_packed_leg(monkeypatch, s_q, window, sink
     else:
         assert any((p.knobs.split_kv or 1) > 1 for p in plans)  # the split leg is proposed again; its rank is the wave model's
     assert all(mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
+
+
+@pytest.mark.L0
+def test_native_d576_has_launch_geometry_for_the_split_model():
+    """The native D576x512 shape (one 2x2 CTA pair) is a key of the geometry the wave model reads; planning a D576 graph
+    raised KeyError: 576 in _split_launch before."""
+    from cudnn.sdpa.fwd.config_sm100 import cga_ctas, cga_tile_m
+
+    assert (cga_ctas(576), cga_ctas(576, 2), cga_tile_m(576)) == (2, 2, 128)
+    facts = _facts(b=64, h_q=96, h_kv=1, s_q=1, s_kv=8192, d_qk=576, d_v=512, causal=False)
+    assert heur._selected_d_shape(SPEC.capabilities, facts) == (576, 512)
+    launch = heur._split_launch(SPEC.capabilities, facts, 64, 128, 2, 1, split_kv=2)
+    assert launch.ctas_per_tile == 2
+    # 128 Q rows per tile, not D512's 256: S_q=129 is two unpacked tiles, or ceil(129 / (128 // 32)) packed.
+    facts = _facts(b=1, h_q=96, h_kv=1, s_q=129, s_kv=8192, d_qk=576, d_v=512, causal=False)
+    assert heur._split_launch(SPEC.capabilities, facts, 64, 128, 2, 1).q_tiles == 2
+    assert heur._split_launch(SPEC.capabilities, facts, 64, 128, 2, 32).q_tiles == 33

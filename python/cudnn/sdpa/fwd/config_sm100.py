@@ -978,7 +978,7 @@ def cga_tile_m(d_qk: int, cta_mma: Optional[int] = None) -> int:
     CGA-width knob (D192). D128 CGA1 here models the 128-row decode/split
     tile; the paged prefill leg has two slabs and its caller accounts for them.
     """
-    cls = {32: CfgD32, 64: CfgD64, 128: CfgD128, 192: CfgD192, 256: CfgD256, 512: CfgD512}[d_qk]
+    cls = _GEOMETRY_BY_D_QK[d_qk]
     if d_qk == 128 and cta_mma == 1:
         # Default D128 half CGA1 geometry is the decode/split tile
         # (sm100/decode_d128_f16.py, TILES_Q=1), not the two-slab paged prefill.
@@ -992,7 +992,7 @@ def cga_ctas(d_qk: int, cta_mma: Optional[int] = None) -> int:
     Public CGA selects the MMA width. It is not a physical launch count for
     the role-split D512 flavor, whose CGA_M/CTA_MMA ratio is two.
     """
-    cls = {32: CfgD32, 64: CfgD64, 128: CfgD128, 192: CfgD192, 256: CfgD256, 512: CfgD512}[d_qk]
+    cls = _GEOMETRY_BY_D_QK[d_qk]
     return cls.CGA_M // cls.CTA_MMA * (cls.CTA_MMA if cta_mma is None else cta_mma)
 
 
@@ -3977,6 +3977,18 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
     )
     _validate_cfg_d192(cfg)
     return cfg, _tma_iters(cfg)
+
+
+class _CfgD576Geometry:
+    """Native D576x512 launch geometry: the 2x2 datapath with one CTA pair (make_cfg_d512_2x2(cga_m=2))."""
+
+    TILES_Q = CfgD512X2.TILES_Q
+    TILE_M = CfgD512X2.TILE_M
+    CTA_MMA = CfgD512X2.CTA_MMA
+    CGA_M = 2
+
+
+_GEOMETRY_BY_D_QK = {32: CfgD32, 64: CfgD64, 128: CfgD128, 192: CfgD192, 256: CfgD256, 512: CfgD512, 576: _CfgD576Geometry}
 
 
 MAKE_CFG = {32: make_cfg_d32, 64: make_cfg_d64, 128: make_cfg_d128, 192: make_cfg_d192, 256: make_cfg_d256, 512: make_cfg_d512}
