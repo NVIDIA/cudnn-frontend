@@ -70,6 +70,14 @@ else()
     find_package(nanobind CONFIG REQUIRED)
 endif()
 
+# Match nanobind's ABI detection rather than the interpreter's runtime GIL state.
+if(CUDNN_FRONTEND_PYTHON_FREE_THREADED AND NOT (NB_ABI MATCHES "[0-9]t"))
+    message(FATAL_ERROR
+        "CUDNN_FRONTEND_PYTHON_FREE_THREADED=ON requires a free-threaded Python interpreter. "
+        "Selected ${Python_EXECUTABLE} (ABI: ${NB_ABI}). "
+        "Select a free-threaded interpreter or set CUDNN_FRONTEND_PYTHON_FREE_THREADED=OFF.")
+endif()
+
 # Header-only frontend logic is compiled here too; preserve the project's
 # optimization level instead of nanobind's default size optimization.
 nanobind_add_module(
