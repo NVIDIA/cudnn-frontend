@@ -171,6 +171,8 @@ LayerNorm and RMSNorm, and adaptive InstanceNorm: pass the virtual result of `ga
 one = graph.tensor_like(torch.ones((1, 1, 1), dtype=torch.float32))
 epsilon = graph.tensor_like(torch.full((1, 1, 1), 1e-5, dtype=torch.float32))
 effective_gamma = graph.add(gamma, one)
+# Declare the virtual scale layout before inferring adaptive statistics.
+effective_gamma.set_dim(gamma.get_dim()).set_stride(gamma.get_stride())
 effective_gamma.set_data_type(cudnn.data_type.FLOAT)
 y, rstd = graph.rmsnorm(
     input=X, scale=effective_gamma, epsilon=epsilon,
