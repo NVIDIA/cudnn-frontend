@@ -6,7 +6,7 @@ import pytest
 import torch
 from cuda.bindings import driver as cuda
 
-from cudnn.ops import qsa_backward, qsa_indexed_forward
+from cudnn.ops import qsa_backward, qsa_forward, qsa_indexed_forward
 from QSA.cutedsl.test_qsa import make_inputs, reference, assert_close, supported_gpu
 
 pytestmark = pytest.mark.L0
@@ -59,6 +59,64 @@ def test_native_forward_masks_nonfinite_kv(rubin):
     for got, ref in zip(actual[:2], expected[:2]):
         assert_close(got[:3], ref[:3])
     assert_close(actual[2][:, :3], expected[2][:, :3])
+
+
+@pytest.mark.parametrize("lengths", [(32768,), (16385, 16386)])
+def test_bitmap_long_public_dispatch(rubin, lengths):
+    """Exercise the public long-row launcher with aligned and packed bitmaps."""
+    total = sum(lengths)
+    torch.manual_seed(92)
+    q = torch.randn((total, 12, 256), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((total, 1, 256), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    first, last, origins, bases = [], [], [], []
+    origin, base = 0, 0
+    for length in lengths:
+        starts = list(range(origin, origin + length, 4))
+        first.extend(starts)
+        last.extend(min(start + 3, origin + length - 1) for start in starts)
+        origins.extend([origin] * length)
+        bases.extend([base] * length)
+        origin += length
+        base += len(starts)
+    first, last, origins, bases = [torch.tensor(x, device="cuda", dtype=torch.int32) for x in (first, last, origins, bases)]
+    rows = torch.arange(total, device="cuda", dtype=torch.int32)
+    sel = torch.zeros((total, base), device="cuda", dtype=torch.uint8)
+    current = bases + (rows - origins) // 4
+    for delta in range(4):
+        sel[rows.long(), (current - delta).clamp_min(0).long()] = 255
+    # Empty rows and a row above the canonical top-512 cap exercise general bitmap semantics.
+    sel[::7] = 0
+    sel[-1] = 1
+    outputs = qsa_forward(q, k, v, sel, origins, rows, bases, origins, first, last, 1 / 16)
+    for row in sorted(
+        {
+            0,
+            1,
+            7,
+            63,
+            64,
+            lengths[0] - 1,
+            total - 2,
+            total - 1,
+            min(lengths[0], total - 1),
+        }
+    ):
+        tokens = torch.arange(total, device="cuda")
+        blocks = bases[row] + (tokens - origins[row]) // 4
+        valid = (tokens >= origins[row]) & (tokens <= row)
+        valid &= sel[row, blocks.clamp(0, base - 1).long()] != 0
+        keys = tokens[valid]
+        if keys.numel() == 0:
+            assert torch.count_nonzero(outputs["out"][row]) == 0
+            assert torch.count_nonzero(outputs["out_fp32"][row]) == 0
+            assert torch.isneginf(outputs["lse"][:, row]).all()
+            continue
+        scores = (q[row].float() @ k[keys, 0].float().T) / 16
+        expected = scores.softmax(-1) @ v[keys, 0].float()
+        assert_close(outputs["out"][row], expected.to(q.dtype))
+        assert_close(outputs["out_fp32"][row], expected)
+        assert_close(outputs["lse"][:, row], scores.logsumexp(-1))
 
 
 def test_indexed_long_packed_workspace_and_replay(rubin, monkeypatch):
