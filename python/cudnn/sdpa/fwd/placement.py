@@ -313,7 +313,9 @@ FP8 agrees with the backend within rel-RMS 0.04 (E4M3 O), bf16 within 0.003.
 
 Rubin paged bf16 d128 GQA prefill chunks (2026-10-24, ``_sm107_paged_gqa_prefill``): LEAD for GQA 4 / 8 at b 1-4,
 128 < s_q <= 1024, S_kv 2k-32k, bottom-right causal, page 16, head-major in-page K. MHA and group 2 retain the
-backend-first order. Past one Q tile, ``paged_thd_split_choice`` allows a two-wave budget: the declared capacity
+backend-first order. Long-prefix chunks (2026-10-27): GQA 4 / 8 / 16 also lead at 1024 < s_q <= 4096 with
+6k <= S_kv <= 32k, the range of a frozen training grid (32/8, 32/4, 64/4; b 1 / 4) measured through FlashInfer's paged
+wrapper in both process orders; a separately frozen 40-case holdout qualified the rule. Performance outcomes remain internal. Past one Q tile, ``paged_thd_split_choice`` allows a two-wave budget: the declared capacity
 (b * max_q rows) can overstate the live work in a mixed-length batch. These remain graph-declaration policies;
 neither rule reads device lengths. Validation uses the FlashInfer paged prefill wrapper with actual per-request
 lengths, bounded and exact declarations, CUDA-graph replay of every offered candidate, both traversal orders,
@@ -448,6 +450,8 @@ SM100_FP8_SINK_DECODE_MIN_KV_UNITS = 32  # d64 sink below 32 KV units: full-cach
 FP8_SYNTH_KV_MIN_TILE_KV = 2**21  # S_kv off the KV tile, mask-free: Q tiles * s_kv from which FROST wins (0.41-0.89)
 SM100_PAGED_GQA16_MAX_B = 4  # SM100 paged bf16 GQA prefill: measured batch range (module docstring)
 SM107_PAGED_GQA_MAX_B = 4  # Rubin paged bf16 GQA prefill chunks: measured batch range (module docstring)
+SM107_PAGED_GQA_LONG_CHUNK_MAX_S_Q = 4096  # Rubin paged GQA long-prefix chunks: the measured query range ends here
+SM107_PAGED_GQA_LONG_CHUNK_MIN_KV = 6144  # ... and the cache range starts here (module docstring)
 SM107_FP8_TINY_MAX_KV = 128  # cc 10.7 FP8 d256 / d512: a single KV tile ...
 SM107_FP8_TINY_MAX_Q_TILES = 8  # ... and at most 8 Q tiles is launch-bound; the backend keeps it
 SM107_FP8_D128_CAUSAL_MAX_S_Q = 4096  # packed GQA bottom-right causal chunk up to this query length: 0.78-0.94
@@ -593,7 +597,13 @@ def _sm107_paged_gqa_prefill(facts) -> bool:
     )
     if not common or group not in (4, 8, 16):
         return False
-    chunk = facts.bottom_right and 128 < min(facts.s_q, facts.max_total_seq_len_q or facts.s_q) and facts.s_q <= 1024 and 2048 <= facts.s_kv <= 32768
+    long_chunk = 1024 < facts.s_q <= SM107_PAGED_GQA_LONG_CHUNK_MAX_S_Q and SM107_PAGED_GQA_LONG_CHUNK_MIN_KV <= facts.s_kv
+    chunk = (
+        facts.bottom_right
+        and 128 < min(facts.s_q, facts.max_total_seq_len_q or facts.s_q)
+        and (facts.s_q <= 1024 or long_chunk)
+        and 2048 <= facts.s_kv <= 32768
+    )
     square = facts.s_q == facts.s_kv and 768 <= facts.s_q <= 8192
     return chunk or square
 
