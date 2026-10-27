@@ -9,18 +9,22 @@ import cutlass.cute as cute
 from cuda.bindings import driver
 
 from cudnn.frost.compiled_cache import compile_cached
-from ...d128_grouped_2cta_contract import ABI_VERSION, MAPS_PER_SEQUENCE, thd_workspace_offsets
+from ...d128_grouped_2cta_contract import ABI_VERSION, MAPS_PER_SEQUENCE, stats2_pad_total, stats2_shape_strides, thd_workspace_offsets
 from ...d128_grouped_contract import dkv_accum_fp32, resolve_dkv_accum, validate_fp32_accum_fits
 from ...d128_thd_contract import ORIGIN_PORTS
 from ...config_sm100_d128_accum_2cta import diag_2cta_code, resolve_diag_2cta
 from ...config_sm100_d128_accum_2cta_stail import CFG as STAIL_CFG
 from ...config_sm100_d128_accum_2cta_stail import (
     DBG_CLK,
+    DBG_CLK_RING,
     dbg_clk_region_offset,
+    STATS_FORM_CODES,
     mask_form_code,
     resolve_debug_clk,
     resolve_mask_form,
+    resolve_stats_form,
     resolve_warp_roles,
+    stats_form_code,
     validate_fields_for_roles,
     warp_roles_code,
 )
@@ -76,6 +80,7 @@ def host(
     diag_code: cutlass.Constexpr[int],
     roles_code: cutlass.Constexpr[int],
     mask_code: cutlass.Constexpr[int],
+    stats_code: cutlass.Constexpr[int],
     dkv_fp32: cutlass.Constexpr[bool],
     debug_clk: cutlass.Constexpr[bool],
     stream: driver.CUstream,
@@ -89,9 +94,21 @@ def host(
     else:
         stats = cute.make_tensor(stats_ptr, cute.make_layout((1, heads, stats_head_stride), stride=(heads * stats_head_stride, stats_head_stride, 1)))
     payload = (workspace + cutlass.Int64(255)) & cutlass.Int64(-256)
-    rounded, rounded_k, delta_off, meta_off, origins_off, maps_off, dk_off, dv_off, regions_end = thd_workspace_offsets(batch, heads, t_q, t_kv)
+    tma_ring = stats_code == STATS_FORM_CODES["tma_ring"]  # the s_tail body's stats form (header section 11): the padded stats region replaces delta
+    rounded, rounded_k, delta_off, meta_off, origins_off, maps_off, dk_off, dv_off, regions_end, rowoff_off = thd_workspace_offsets(
+        batch, heads, t_q, t_kv, tma_ring
+    )
     dq_accum = _scratch(payload, cutlass.Int64(0), cutlass.Float32, (1, rounded, heads, 128), (rounded * heads * 128, heads * 128, 128, 1))
-    delta = _scratch(payload, delta_off, cutlass.Float32, (1, heads, rounded), (heads * rounded, rounded, 1))
+    if cutlass.const_expr(tma_ring):
+        # stats_form = tma_ring: the q-tile-padded pre-scaled stats region [heads][PAD_TOTAL / N][2][N] fp32 the delta launch writes and the main
+        # kernel's loader bulk-copies per q tile, plus the Int32 padded row offsets [batch + 1] the setup kernel writes (the contract's regions)
+        stats_shape, stats_strides = stats2_shape_strides(heads, stats2_pad_total(batch, rounded))
+        stats2 = _scratch(payload, delta_off, cutlass.Float32, stats_shape, stats_strides)
+        rowoff = _scratch(payload, rowoff_off, cutlass.Int32, (batch + 1,), (1,))
+        delta = None
+    else:
+        stats2, rowoff = None, None
+        delta = _scratch(payload, delta_off, cutlass.Float32, (1, heads, rounded), (heads * rounded, rounded, 1))
     dk_part = _scratch(payload, dk_off, q.element_type, (1, rounded_k, heads, 128), (rounded_k * heads * 128, heads * 128, 128, 1))
     dv_part = _scratch(payload, dv_off, q.element_type, (1, rounded_k, heads, 128), (rounded_k * heads * 128, heads * 128, 128, 1))
     meta = _scratch(payload, meta_off, cutlass.Int32, (4 * batch + 4,), (1,))
@@ -113,7 +130,8 @@ def host(
         # (config dbg_clk_records: ceil(max_skv / THD_UNIT_ROWS) pairs x CGA_M x heads x batch), at the same offset the adapter advertised
         # (config dbg_clk_region_offset of the regions' end); the kernel writes every record at exit, so the region needs no zeroing.
         n_pairs = cute.math.max((cutlass.Int32(max_skv) + STAIL_CFG.THD_UNIT_ROWS - 1) // STAIL_CFG.THD_UNIT_ROWS, cutlass.Int32(1))
-        n_words = n_pairs * (STAIL_CFG.CGA_M * heads * batch * DBG_CLK.WORDS)
+        dbg_words = (DBG_CLK_RING if cutlass.const_expr(tma_ring) else DBG_CLK).WORDS  # the record by form: 96 (ldg) / 88 (tma_ring), config = truth
+        n_words = n_pairs * (STAIL_CFG.CGA_M * heads * batch * dbg_words)
         dbg_clk = _scratch(payload, dbg_clk_region_offset(regions_end), cutlass.Int32, (n_words,), (1,))
     else:
         dbg_clk = None
@@ -147,11 +165,14 @@ def host(
         diag_code,
         roles_code,
         mask_code,
+        stats_code,
         dkv_fp32,
         dk_acc,
         dv_acc,
         debug_clk,
         dbg_clk,
+        stats2,
+        rowoff,
         stream,
     )
 
@@ -168,6 +189,7 @@ def compile_host(
     mask_form=None,
     dkv_accum=None,
     warp_roles=None,
+    stats_form=None,
 ):
     """Capacities and bounds are runtime scalars, never artifact key values; the 2-CTA chain is keyed apart from the 1-CTA one and per typed
     field: ``diag_2cta`` (a ``CFG.DIAG_2CTA_NAMES`` name or ``None`` = no probe = the shipped body; output WRONG BY DESIGN when set, keyed apart
@@ -177,12 +199,18 @@ def compile_host(
     ``warp_roles`` (a ``CFG.WARP_ROLES`` name or ``None`` = "16w" = the default rendering; "16w_fa4" = the alternate role shape of header
     sections 4 / 5 / 11, under which ``debug_clk`` and ``dkv_accum = "fp32_reduce"`` decline by name here, before any trace) and
     ``debug_clk`` (the STAMPS lever: a bool, ``None`` = False = the shipped rendering; the armed build carries the dump tensor and renders
-    different PTX, never served to a plan that did not ask for it).  Every threaded Constexpr is in the key by NAME."""
+    different PTX, never served to a plan that did not ask for it) and ``stats_form`` (a ``CFG.STATS_FORMS`` name or ``None`` = the role shape's
+    form: "tma_ring" = the default = the loader-fed SMEM stats ring of header section 11 fed from the chain's padded pre-scaled stats region,
+    bitwise the same stats; "ldg" = the previous default, the form "16w_fa4" resolves to; "tma_ring" NAMED declines by name under
+    ``warp_roles = "16w_fa4"``; the ring's STAMPS record is the re-based spare).  Every threaded
+    Constexpr is in the key by NAME."""
     form_mask = resolve_mask_form(mask_form)
     diag = resolve_diag_2cta(diag_2cta)
     clk = resolve_debug_clk(debug_clk)
     accum_form = resolve_dkv_accum(dkv_accum)
-    roles = validate_fields_for_roles(resolve_warp_roles(warp_roles), diag, debug_clk=clk, dkv_accum=accum_form)
+    shape = resolve_warp_roles(warp_roles)
+    form_stats = resolve_stats_form(stats_form, shape)  # unset: the form the role shape renders (tma_ring under 16w, ldg under 16w_fa4)
+    roles = validate_fields_for_roles(shape, diag, debug_clk=clk, dkv_accum=accum_form, stats_form=form_stats)
     fp32 = dkv_accum_fp32(accum_form)
     if fp32:
         validate_fp32_accum_fits(config[1], config[2])
@@ -200,6 +228,7 @@ def compile_host(
         accum_form,
         roles,
         clk,
+        form_stats,
     )
     types = [dtype] * 5 + [cutlass.Float32] + [dtype] * 3 + [cutlass.Int32] * 2
     args = [cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=4 if i == 5 or i >= 9 else 16) for i, t in enumerate(types)]
@@ -221,6 +250,7 @@ def compile_host(
         diag_2cta_code(diag),
         warp_roles_code(roles),
         mask_form_code(form_mask),
+        stats_form_code(form_stats),
         fp32,
         clk,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),

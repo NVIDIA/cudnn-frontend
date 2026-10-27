@@ -65,7 +65,8 @@ _CENSUS = {
 }
 _EXPECTED_FP32_DELTA = {
     "1cta": dict(REDUCE_ADD_TENSOR=(4, 12), BULK_TENSOR_STORE=(4, 0), MBARRIER_ARRIVE=(30, 34), MBARRIER_WAIT=(45, 47), BULK_COMMIT=(5, 13), BULK_WAIT=(5, 9)),
-    "pair": dict(REDUCE_ADD_TENSOR=(4, 12), BULK_TENSOR_STORE=(4, 0), MBARRIER_ARRIVE=(40, 41), MBARRIER_WAIT=(68, 69), BULK_COMMIT=(5, 6), BULK_WAIT=(5, 6)),
+    # the pair's default stats form is the tma_ring (the stats ring's arm + release, its two waits): arrive 42 / wait 70 under bf16_partials
+    "pair": dict(REDUCE_ADD_TENSOR=(4, 12), BULK_TENSOR_STORE=(4, 0), MBARRIER_ARRIVE=(42, 43), MBARRIER_WAIT=(70, 71), BULK_COMMIT=(5, 6), BULK_WAIT=(5, 6)),
 }
 
 _PROBE = textwrap.dedent(r"""
@@ -394,7 +395,9 @@ def test_dkv_accum_fp32_launch_census_is_four_with_no_host_work(body, monkeypatc
     kernels = [e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA and e.name.startswith("cudnn_kernel_")]
     assert len(kernels) == 4, kernels
     assert not any("dkv_reduce" in n for n in kernels), kernels
-    assert any("cast_dq_thd_d128_kernel" in n for n in kernels) and any("delta_zero_thd_d128_kernel" in n for n in kernels), kernels
+    # the delta launch by the chain's stats form: the compact `delta_zero_thd_d128_kernel` (1-CTA; the pair under ldg) or the padded-stats
+    # `delta_zero_stats_thd_d128_2cta_kernel` (the pair's default tma_ring form)
+    assert any("cast_dq_thd_d128_kernel" in n for n in kernels) and any("delta_zero" in n for n in kernels), kernels
     check_case(case, workspace)
 
 

@@ -73,6 +73,16 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
     # values: the same accumulation chain per GEMM); dQ by the fp64 gate.  Under "16w_fa4" ``debug_clk`` and ``dkv_accum = "fp32_reduce"``
     # decline by name.  Typed (``config_sm100_d128_accum_2cta_stail.CFG.WARP_ROLES``); read only on the 2-CTA route; the compile key carries it.
     warp_roles: "str | None" = None
+    # The pair body's STATS FORM -- how the softmax gets each q tile's LSE / delta rows: "tma_ring" (``None`` = the same under the default role
+    # shape; THE default since the day-4 measurement, +1.8 / +1.9 % at the step at 16K / 32K and +3.3 % on the graph replay against "ldg": the
+    # loader warp TMA-loads both rows one tile ahead into a two-stage SMEM ring behind a full / empty barrier pair; the chain's delta launch
+    # writes the two rows pre-scaled with the SAME two multiplies, so every stat word is bitwise the ldg form's and dQ / dK / dV are bitwise
+    # between the forms; the workspace carries the q-tile-padded pre-scaled stats for the LSE copy) | "ldg" (the previous default, selectable;
+    # the form "16w_fa4" resolves to when unset: the softmax fetches them per tile with one global load per lane, scales, stores them into one
+    # SMEM slab and fences the 8 warps with a named-barrier pair).  Perf-only; "tma_ring" NAMED declines by name under "16w_fa4"; served
+    # together with ``debug_clk``.  Typed (``config_sm100_d128_accum_2cta_stail.CFG.STATS_FORMS``); read only on the 2-CTA route; the compile
+    # key carries it.
+    stats_form: "str | None" = None
 
     def __init__(
         self,

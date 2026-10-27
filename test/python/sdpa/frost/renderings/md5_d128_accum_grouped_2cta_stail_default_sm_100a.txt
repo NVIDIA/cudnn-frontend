@@ -1,12 +1,20 @@
 # sm_100a PTX md5 PER KERNEL of the d128 grouped THD cta_group::2 chain's DEFAULT rendering (prepared_d128_grouped_2cta_host.compile_host with
 # every typed field unset: the pair body bprop_d128_accum_grouped_2cta_stail_f16.py under warp_roles 16w, mask_form fsel, dkv_accum bf16_partials,
-# no probe, no stamps; host trace-compile, no device; the probe geometry B, H, HK = 2, 8, 2 is in test_sdpa_bwd_d128_2cta_stail_sm100.py).
+# stats_form tma_ring = THE default since the day-4 decision (the loader-fed SMEM stats ring; the delta-and-stats launch replaces the compact
+# delta launch), no probe, no stamps; host trace-compile, no device; the probe geometry B, H, HK = 2, 8, 2 is in
+# test_sdpa_bwd_d128_2cta_stail_sm100.py; the main kernel renders 306ad223fb86f8b8efa86449f6d14ba6 at B, H, HK = 4, 32, 4).
 # One row per kernel the chain OWNS: the md5 of that kernel's `.entry` region of the dumped module (frost_test_utils.ptx_kernel_md5s), so a row
 # moves only when the kernel it names changes.  The dK / dV group fold dkv_reduce_thd_origins_kernel is launched by this chain AND the one-CTA
-# grouped THD chain and is EXCLUDED here (frost_test_utils.D128_THD_SHARED_KERNELS): its change in #1925 moved the previous chain-wide md5
-# while no kernel of this chain changed.  Re-render deliberately on a protocol change and say so here.
+# grouped THD chain and is EXCLUDED here (frost_test_utils.D128_THD_SHARED_KERNELS).  Re-render deliberately on a protocol change and say so here.
 dsl=nvidia-cutlass-dsl 4.8.1
-d128_accum_grouped_2cta_stail sm_100a default kernel=setup_thd_d128_2cta_kernel rc=0 ptx_md5=21bc43d2d7defa52651bef03fadcb27c
-d128_accum_grouped_2cta_stail sm_100a default kernel=delta_zero_thd_d128_kernel rc=0 ptx_md5=6abbda6bc300c53b48a7fe23ae01fab9
-d128_accum_grouped_2cta_stail sm_100a default kernel=bprop_d128_accum_grouped_2cta_stail_kernel rc=0 ptx_md5=ca665f06726364e1552c68db64cf368c
+d128_accum_grouped_2cta_stail sm_100a default kernel=setup_thd_d128_2cta_kernel rc=0 ptx_md5=824f5ab6c74347df9b7441ecac028820
+d128_accum_grouped_2cta_stail sm_100a default kernel=delta_zero_stats_thd_d128_2cta_kernel rc=0 ptx_md5=1826f78e59b07a34dc67f398503e466e
+d128_accum_grouped_2cta_stail sm_100a default kernel=bprop_d128_accum_grouped_2cta_stail_kernel rc=0 ptx_md5=d9b419aaaad5c66b298bbaeb3a036f1c
 d128_accum_grouped_2cta_stail sm_100a default kernel=cast_dq_thd_d128_kernel rc=0 ptx_md5=9621254b15c92badbdb00185d4efcb19
+# stats_form = "ldg" (named; every other field unset): the previous default -- the softmax's per-tile global fetch of LSE / delta under the
+# named-barrier pair, the compact delta launch, the setup kernel without the padded row-offset pass; the form the 16w_fa4 role shape resolves to
+# when the field is unset.  Its main kernel is the merged rendering's main body (7de23bd718c23a9ec81abd2c657adbbe at 4, 32, 4), byte-identical.
+d128_accum_grouped_2cta_stail_ldg sm_100a default kernel=setup_thd_d128_2cta_kernel rc=0 ptx_md5=21bc43d2d7defa52651bef03fadcb27c
+d128_accum_grouped_2cta_stail_ldg sm_100a default kernel=delta_zero_thd_d128_kernel rc=0 ptx_md5=6abbda6bc300c53b48a7fe23ae01fab9
+d128_accum_grouped_2cta_stail_ldg sm_100a default kernel=bprop_d128_accum_grouped_2cta_stail_kernel rc=0 ptx_md5=ca665f06726364e1552c68db64cf368c
+d128_accum_grouped_2cta_stail_ldg sm_100a default kernel=cast_dq_thd_d128_kernel rc=0 ptx_md5=9621254b15c92badbdb00185d4efcb19
