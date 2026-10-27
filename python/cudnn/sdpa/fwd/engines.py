@@ -2673,7 +2673,8 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # a partial Q/K head uses rank-4 K TMA so storage slack zero-fills;
             # exact D192 retains the rank-5 chunk load. SM107 already uses rank-4.
             # D256 also preserves actual K/V widths, including paged SM100 pools;
-            # partial heads use bounded rank-4 loads and exact heads keep rank-5.
+            # SM100/SM103 partial heads use bounded rank-4 loads and exact heads
+            # keep rank-5. Native SM107 uses rank-4 for both exact and partial heads.
             # Both architecture rows mirror api_dsl._SM100_FP8_ENVELOPE_FLOORS
             # so graph admission and prepared lowering agree.
             d_envelope_floors=(((512, 512), 256),),
