@@ -5497,7 +5497,7 @@ class _SparseSdpa(_Stage):
     on the host (the setup launch normalizes them on device).  ``block_ids`` keeps its ``[T, top_k]`` form with every id
     RELATIVE TO ITS SEQUENCE (block ``j`` of sequence ``b`` = its tokens ``[4j, 4j + 4)``); the LSE is the head-major packed
     ``[1, H_q, T]`` the block already carries at ``B = 1``.  The ONE scratch the arm needs -- the adapter's int32 THD
-    metadata (``THD_WORK_META_WORDS(B)``, 16-byte rounded) -- enters the block's engine arm through
+    metadata (``THD_META_WORDS(B)`` = 4 B + 4 words, 16-byte rounded: the layout the sm107 sparse adapter sizes it with) -- enters the block's engine arm through
     :meth:`scratch_workspace_bytes` and is handed back at ``execute(workspace=)``.  A one-sequence packing computes the
     dense ``B = 1`` function bitwise; an empty sequence owns no rows.
 
@@ -5787,7 +5787,7 @@ class _SparseSdpa(_Stage):
 
     def scratch_workspace_bytes(self) -> int:
         """The adapter's ``scratch_workspace_bytes``: 0 on a dense declaration (the kernel has no GMEM scratch), the int32
-        THD metadata (``THD_WORK_META_WORDS(B)`` words, 16-byte rounded) under ``thd=True``; folded into the block's workspace
+        THD metadata (``THD_META_WORDS(B)`` = 4 B + 4 words, 16-byte rounded: the sm107 sparse adapter's own sizing) under ``thd=True``; folded into the block's workspace
         like the dense stage's so the size stays honest either way."""
         if self._impl is None:
             raise RuntimeError(f"{self.name}: call check_support() before scratch_workspace_bytes()")
