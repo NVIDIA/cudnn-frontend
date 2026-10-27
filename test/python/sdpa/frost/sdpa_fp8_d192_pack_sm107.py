@@ -65,8 +65,8 @@ def test_native_d192_fp8_pack_rebind_replay(b, split, sched, sink, dtype, output
 
 
 @pytest.mark.parametrize("d,dv", [(160, 160), (224, 208)])
-def test_native_d192_pack_retains_d256_padding_decline(d, dv):
+def test_native_d192_pack_retains_thd_padding_decline(d, dv):
     import cudnn
 
-    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="no kernel-flavor envelope covers"):
-        shared._case(arch="sm107", d=d, dv=dv, sq=17, skv=256)
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="dense-only"):
+        shared._case(arch="sm107", d=d, dv=dv, sq=17, skv=256, thd=True)

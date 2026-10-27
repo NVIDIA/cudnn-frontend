@@ -46,6 +46,7 @@ def _case(
     split_kv=1,
     gate=None,
     sink=None,
+    sdpa_kwargs=None,
 ):
     dv = d if dv is None else dv
     torch.manual_seed(827)
@@ -64,7 +65,7 @@ def _case(
         strides = [seq * h * dim, dim, h * dim, 1] if thd else list(buf.stride())
         t = g.tensor(dim=[b, h, seq, dim], stride=strides, data_type=input_type, name=name)
         buffers[name], tensors[name], vp[t] = buf, t, buf
-    kwargs = {}
+    kwargs = dict(sdpa_kwargs or {})
     if thd:
         for name, seq, h in (("q", sq, hq), ("kv", skv, hk)):
             cu = torch.arange(b + 1, device="cuda", dtype=torch.int32) * seq
