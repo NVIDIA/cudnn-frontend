@@ -3,6 +3,7 @@
 """Shared D256 FP8 envelope cases, collected by the architecture CI entries."""
 
 from dataclasses import replace
+import math
 
 import pytest
 import torch
@@ -37,6 +38,67 @@ def _clone_with_slack(value, fill):
     return clone
 
 
+def _split_reference(q, k, v, *, split, pack, **kwargs):
+    """FP64 blocked reference with FP8 P rounded at each split's own maximum.
+
+    Partition logical score columns with a PyTorch bias mask; do not call the
+    kernel's scheduler, index helpers or combine. Full-attention Stats provide
+    an independent check that the partitions cover the same mathematical op.
+    """
+    from sdpa.fp8_ref import compute_ref
+
+    if split == 1:
+        return compute_ref(q, k, v, **kwargs)
+    b, sq, heads, _ = q.shape
+    skv = k.shape[1]
+    qlens, klens = kwargs["padding"] or (torch.full((b,), sq, device=q.device), torch.full((b,), skv, device=q.device))
+    rows = torch.arange(sq, device=q.device).view(1, sq)
+    tile_q = 128 // (heads // k.shape[2] if pack else 1)
+    first_q = rows // tile_q * tile_q
+    diagonal = (klens - qlens).view(b, 1) if kwargs["diag_align"] == cudnn.diagonal_alignment.BOTTOM_RIGHT else 0
+    first_key = torch.zeros((b, sq), device=q.device, dtype=torch.int64)
+    if kwargs["left_bound"] is not None:
+        first_key = (first_q + diagonal - kwargs["left_bound"]).clamp(min=0) // 128
+    last_key = ((klens.view(b, 1) + 127) // 128).expand(b, sq)
+    if kwargs["right_bound"] is not None:
+        last_key = torch.minimum(last_key, (first_q + tile_q + diagonal + kwargs["right_bound"] + 127) // 128)
+    count = (last_key - first_key).clamp(min=0)
+    count = torch.where(first_q < qlens.view(b, 1), count, 0)
+    columns = torch.arange(skv, device=q.device).view(1, 1, 1, skv)
+    outputs, logs, bounds = [], [], []
+    with_bound = kwargs.get("return_intermediates", False)
+    for index in range(split):
+        start = first_key + index * (count // split) + (count % split).clamp(max=index)
+        end = start + count // split + (index < count % split)
+        included = (columns >= start[:, None, :, None] * 128) & (columns < end[:, None, :, None] * 128)
+        bias = torch.where(included, 0.0, -torch.inf)
+        result = compute_ref(q, k, v, **dict(kwargs, bias=bias, sink_token=None))
+        partial, stats, _ = result[:3]
+        if with_bound:
+            bounds.append(_half_p_output_bound(result[3], v.transpose(1, 2), q.dtype, kwargs["v_descale"]))
+        outputs.append(partial.transpose(1, 2).double())
+        logs.append(stats.double())
+    terms = logs
+    sink = kwargs["sink_token"]
+    if sink is not None:
+        terms = logs + [sink.double().expand(b, heads, sq, 1)]
+    combined_stats = torch.logsumexp(torch.stack(terms), dim=0)
+    output = sum(partial * torch.exp(log - combined_stats).nan_to_num() for partial, log in zip(outputs, logs))
+    dead = rows[:, None, :, None] >= qlens.view(b, 1, 1, 1)
+    combined_stats = combined_stats.masked_fill(dead, -torch.inf)
+    output = output.masked_fill(dead, 0)
+    _, full_stats, _ = compute_ref(q, k, v, **dict(kwargs, torch_itype=torch.float64, return_intermediates=False))
+    torch.testing.assert_close(combined_stats.float(), full_stats, atol=1e-5, rtol=1e-6)
+    result = (output.transpose(1, 2).float(), full_stats, output.abs().max().item())
+    if with_bound:
+        # Each partition has its own P rounding and online-softmax gains.
+        # The combine is a nonnegative weighted sum, so propagate the bounds
+        # with independent FP64 partition weights, including the sink mass.
+        bound = sum(partial * torch.exp(log - combined_stats).nan_to_num() for partial, log in zip(bounds, logs))
+        return result + (bound.masked_fill(dead, 0),)
+    return result
+
+
 def _half_p_output_bound(parts, v, input_dtype, descale_v):
     """Bound HALF + Stats output error from the independent FP64 reference.
 
@@ -46,7 +108,8 @@ def _half_p_output_bound(parts, v, input_dtype, descale_v):
     Propagate the possible P-code changes through |V| and the online-softmax
     gains. This is an input-dependent bound, not a fitted tensor coordinate or
     tolerance; packed/unpacked bitwise checks independently protect row mapping.
-    This helper is for the unsplit D256/D512 register-sum, Stats-present path.
+    This helper covers one D256/D512 register-sum, Stats-present partition;
+    the split reference combines these bounds using independent FP64 weights.
     """
     from sdpa.fp16_ref import _pv
 
@@ -74,8 +137,7 @@ def _check_half_fp8_o(output, reference, output_dtype, input_key, bound):
     assert torch.all(error <= bound + atol), f"HALF P-bound exceeded: max excess={(error - bound).max().item():.6f} > {atol} ({input_key})"
 
 
-def _check(bufs, *, page=0, causal=False, bottom_right=False, window=None, output_check=None, softmax_f16=False):
-    from sdpa.fp8_ref import compute_ref
+def _check(bufs, *, page=0, causal=False, bottom_right=False, window=None, split=1, pack=False, stats_log2=False, output_check=None, softmax_f16=False):
     import test_sdpa_fwd_paged_sm100 as paged
 
     q, k, v = (bufs[n] for n in ("q", "k", "v"))
@@ -93,7 +155,7 @@ def _check(bufs, *, page=0, causal=False, bottom_right=False, window=None, outpu
         padding = (bufs["seq_q"].view(b), lens)
     # D256 casts P without D128's extra 2**4 factor, even for a narrow Q/K
     # head paired with wide V. The FP64 oracle follows that native pipeline.
-    result = compute_ref(
+    result = _split_reference(
         q.transpose(1, 2),
         k.transpose(1, 2),
         v.transpose(1, 2),
@@ -104,6 +166,8 @@ def _check(bufs, *, page=0, causal=False, bottom_right=False, window=None, outpu
         s_scale=16.0,
         s_descale=1.0 / 16.0,
         torch_itype=q.dtype,
+        split=split,
+        pack=pack,
         torch_otype=torch.float16,
         padding=padding,
         left_bound=window,
@@ -121,14 +185,19 @@ def _check(bufs, *, page=0, causal=False, bottom_right=False, window=None, outpu
     in_key = "e4m3" if q.dtype == torch.float8_e4m3fn else "e5m2"
     if softmax_f16:
         assert output_check is None
-        bound = _half_p_output_bound(result[3], v, q.dtype, bufs["descale_v"].item()) * bufs["scale_o"].abs()
+        bound = _half_p_output_bound(result[3], v, q.dtype, bufs["descale_v"].item()) if split == 1 else result[3]
+        bound = bound * bufs["scale_o"].abs()
         output_result = _check_half_fp8_o(bufs["o"], ref * bufs["scale_o"], bufs["o"].dtype, in_key, bound)
     else:
         output_result = (output_check or paged._check_fp8_o)(bufs["o"], ref * bufs["scale_o"], bufs["o"].dtype, in_key)
     # Match the existing prepared-dense Stats bound; paged cases retain their
     # existing absolute bound.
-    torch.testing.assert_close(bufs["lse"].reshape(b, h, sq), stats.reshape(b, h, sq), atol=0.01, rtol=0 if page else 0.01)
-    assert abs(bufs["amax_o"].item() - ref.abs().max().item()) <= 0.03
+    if "lse" in bufs:
+        if stats_log2:
+            stats = stats / math.log(2)
+        torch.testing.assert_close(bufs["lse"].reshape(b, h, sq), stats.reshape(b, h, sq), atol=0.01, rtol=0 if page else 0.01)
+    if "amax_o" in bufs:
+        assert abs(bufs["amax_o"].item() - ref.abs().max().item()) <= 0.03
     return output_result
 
 
@@ -173,7 +242,9 @@ def _check_dense(d, dv, dtype, output, monkeypatch, *, causal=False, bottom_righ
         value = bufs[name]
         value._base[..., value.shape[-1] :].fill_(float("nan"))
         value.copy_((value.float() * 2.5).to(dtype))
-    check = dict(causal=causal, bottom_right=bottom_right, window=window, softmax_f16=softmax_precision == cudnn.data_type.HALF and split == 1)
+    check = dict(
+        causal=causal, bottom_right=bottom_right, window=window, split=split, pack=pack, softmax_f16=softmax_precision == cudnn.data_type.HALF and split == 1
+    )
     g.execute(vp, ws)
     _check(bufs, **check)
     assert torch.all(bufs["o_storage"][..., dv:] == 12)

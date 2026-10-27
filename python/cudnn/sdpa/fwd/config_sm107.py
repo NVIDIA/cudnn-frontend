@@ -296,9 +296,15 @@ _O_BLOCK_SCALE_BY_DTYPE = {_DTYPE_O_NVFP4: 16, _DTYPE_O_MXFP8: 32}
 # failed across the per-tensor FP8 THD suite.
 SM107_FP8_THD_SHAPES = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
 # Bodies with FP32 partial stores: shared by factory, admission and prepared workspace.
-SM107_FP8_SPLIT_SHAPES = frozenset({(64, 64), (128, 128), (192, 128)})
+SM107_FP8_SPLIT_SHAPES = frozenset({(64, 64), (128, 128), (192, 128), (256, 256)})
 # Packing and splitting are separate domains; both graph and adapter read this one.
-SM107_FP8_PACK_GQA_SHAPES = frozenset({(64, 64), (128, 128), (192, 128), (256, 256)})
+SM107_FP8_PACK_GQA_SHAPES = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
+
+
+def supports_fp8_d256_padded_split(d_shape, *, device_cc, pertensor, thd, paged):
+    """Native dense D256 FP8 partials honor runtime Q/KV lengths and tails."""
+    return device_cc == (10, 7) and pertensor and d_shape == (256, 256) and not thd and not paged
+
 
 # f16/bf16 flavor names whose kernel body HAS been ported to the FROST
 # setup-kernel contract (the 14-arg build_thd_meta_o_descs_kernel + the 4B+4
@@ -1625,7 +1631,7 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     must also be a Capabilities decline — reaching this is an engine-row bug.
 
     ``split_wired`` identifies kernels with both SplitHelpers and FP32
-    partial-output stores: half and per-tensor FP8 D128 and D192/V128. The engine
+    partial-output stores: half and per-tensor FP8 D128/D192, plus per-tensor FP8 D256. The engine
     row and standalone adapter expose the same flavor domain.
 
     ``block_scaled_o_wired`` says whether THIS flavor's kernel carries the
@@ -2445,7 +2451,10 @@ def _d256_read_tile_arrivers(cta_mma: int) -> int:
 def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     """The cc 10.7 d256 config (per-tensor FP8 or MXFP8): tile geometry, ring depths, warp layout and the SMEM / descriptor-window
     checks for the one-CTA and the 2-CTA-pair builds (``params.cta_mma``); raises with the failing tally on an impossible layout."""
-    _validate_params(flavor, params)
+    split_wired = not mxfp8 and params.dtype_qkv in (_DTYPE_E4M3, _DTYPE_E5M2)
+    _validate_params(flavor, params, split_wired=split_wired)
+    if (params.split_kv or 1) > 1 and params.thd_varlen:
+        raise ValueError(f"{flavor}: per-tensor FP8 split-KV is dense-only")
     if params.pack_gqa and not mxfp8:
         if params.thd_varlen:
             raise ValueError(f"{flavor}: per-tensor FP8 PackGQA is dense-only")
@@ -2671,6 +2680,14 @@ _D512_READ_TILE_ARRIVERS = (
 
 def _make_cfg_d512_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     _validate_params(flavor, params)
+    if not mxfp8 and params.dtype_qkv in (_DTYPE_E4M3, _DTYPE_E5M2):
+        if params.sched_policy not in (None, SCHED_NATURAL, SCHED_LPT):
+            raise ValueError(f"{flavor}: per-tensor FP8 supports NATURAL/LPT schedulers only")
+        if params.pack_gqa:
+            if params.thd_varlen:
+                raise ValueError(f"{flavor}: per-tensor FP8 PackGQA is dense-only")
+            if 128 % params.qh_per_kh:
+                raise ValueError(f"{flavor}: PackGQA requires a whole head group dividing TILE_M=128; got {params.qh_per_kh}")
     if params.cta_mma != _D512_CTA_MMA:
         raise ValueError(f"{flavor}: the role-split pipeline is cga4x1 / CTA_MMA=2 only (got cta_mma={params.cta_mma})")
     dtype_o = resolve_dtype_o(params)

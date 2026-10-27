@@ -48,7 +48,7 @@ def _check_half_unpacked_control(g, bufs, tensors, check):
         g.select_plan(selected_index)
 
 
-def _run_packed(case, dtype, output, monkeypatch, half=False, adapter=False):
+def _run_packed(case, dtype, output, monkeypatch, half=False, adapter=False, split=1, pack=True):
     d, dv, group, sq, skv, causal, bottom_right, window, sink, sched = case
     heads = 2 * group
     seen = _record_route(monkeypatch)
@@ -76,21 +76,25 @@ def _run_packed(case, dtype, output, monkeypatch, half=False, adapter=False):
         sdpa_kwargs=kwargs,
     )
     selected = g.plans[g._plan_index]
-    g.create_execution_plan(selected.engine_id, replace(selected.knobs, pack_gqa=True, split_kv=1, sched_policy=sched, cga=1))
+    g.create_execution_plan(selected.engine_id, replace(selected.knobs, pack_gqa=pack, split_kv=split, sched_policy=sched, cga=1))
     g.select_plan(len(g.plans) - 1)
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(1, g.get_workspace_size()), dtype=torch.uint8, device="cuda")
     assert seen and set(seen) == {"sm107/prefill_d256_fp8.py"}, seen
-    assert g.plans[g._plan_index].knobs.pack_gqa
+    assert g.plans[g._plan_index].knobs.pack_gqa == pack
     for name in ("q", "k", "v"):
         value = bufs[name]
         value._base[..., value.shape[-1] :].fill_(float("nan"))
         value.copy_((value.float() * 2.5).to(dtype))
-    check = dict(causal=causal, bottom_right=bottom_right, window=window, softmax_f16=half)
+    # Split chunks use independent maxima before FP8 P quantization. Compare
+    # them to a partitioned FP64 reference, not one unsplit rounding trajectory.
+    # HALF uses its independent per-partition P-rounding allowance; FLOAT and
+    # Stats/Amax keep their existing bounds.
+    check = dict(causal=causal, bottom_right=bottom_right, window=window, split=split, pack=pack, softmax_f16=half)
     g.execute(vp, ws)
     _check(bufs, **check)
-    if half:
+    if half and split == 1:
         _check_half_unpacked_control(g, bufs, tensors, check)
     if adapter:
         plan = g._compiled_plans[g._plan_index]
@@ -131,7 +135,7 @@ def _run_packed(case, dtype, output, monkeypatch, half=False, adapter=False):
         g.execute({t: fresh[n] for n, t in tensors.items()}, torch.empty_like(ws))
 
         _check(fresh, **check)
-        if half:
+        if half and split == 1:
             _check_half_unpacked_control(g, fresh, tensors, check)
         bufs["seq_q"].copy_(torch.tensor([min(sq, 7), 0], device="cuda", dtype=torch.int32).view(2, 1, 1, 1))
         bufs["seq_kv"].copy_(torch.tensor([min(skv, 129), 0], device="cuda", dtype=torch.int32).view(2, 1, 1, 1))
@@ -142,7 +146,7 @@ def _run_packed(case, dtype, output, monkeypatch, half=False, adapter=False):
             bufs[name].fill_(float("nan"))
         capture.replay()
         _check(bufs, **check)
-        if half:
+        if half and split == 1:
             _check_half_unpacked_control(g, bufs, tensors, check)
         assert torch.all(bufs["o_storage"][..., dv:] == 12)
 
