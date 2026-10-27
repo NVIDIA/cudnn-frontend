@@ -48,6 +48,7 @@ from typing import Callable
 
 import cutlass.experimental.primitives as nvvm
 from cudnn.gemm.frost.tile_helpers import (
+    extract_block_scale_sfb,
     epi_subtile_spans as _epi_subtile_spans,
     l2_swizzle_tile as _l2_swizzle_tile,
     tcgen05_alloc as _tcgen05_alloc,
@@ -1111,6 +1112,8 @@ def _kernel(
                 )
                 for j in range(num_sfb_operands)
             ]
+            if cutlass.const_expr(sfb_sub_tile_n > 0):
+                sfb_tile_n = init_tile_n
             while is_valid != 0:
                 acc_stage = tile_iter % acc_stages
                 if acc_stage == 0 and tile_iter != 0:
@@ -1169,6 +1172,13 @@ def _kernel(
                         time_limit=10_000_000,
                     ):
                         pass
+
+                    if cutlass.const_expr(sfb_sub_tile_n > 0):
+                        sf_n_start = (sfb_tile_n * cgrp_tile_n_cur + n_rank * cta_tile_mnk[1]) % 128
+                        for _bj in cutlass.range_constexpr(num_sfb_operands):
+                            extract_block_scale_sfb(
+                                smem_sfb_list[_bj].subview(sfb_smem_bytes * stage), sf_n_start, sfb_sub_tile_n, sf_tma_box_k, sfb_smem_bytes
+                            )
 
                     for sf_word in cutlass.range_constexpr(num_sf_atoms):
                         for _bj in cutlass.range_constexpr(num_sfb_operands):
@@ -1255,11 +1265,23 @@ def _kernel(
                     time_limit=10_000_000,
                 ):
                     pass
-                _m_idx, _n_idx, _l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
+                m_idx, n_idx, l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
                 cute.arch.fence_proxy("async.shared", space="cta")
                 is_valid = vld
                 if cutlass.const_expr(split_k_slices > 1):
-                    tile_l = _l_idx
+                    tile_l = l_idx
+                if cutlass.const_expr(sfb_sub_tile_n > 0):
+                    mma_raw_m = m_idx >> _preferred_cluster_m_shift
+                    mma_raw_n = n_idx >> _preferred_cluster_n_shift
+                    mma_nt_m = gridx >> _preferred_cluster_m_shift
+                    mma_nt_n = gridy >> _preferred_cluster_n_shift
+                    if cutlass.const_expr(fallback_cluster_shape_mnk is not None):
+                        if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
+                            mma_raw_m = m_idx >> _fallback_cluster_m_shift
+                            mma_raw_n = n_idx >> _fallback_cluster_n_shift
+                            mma_nt_m = gridx >> _fallback_cluster_m_shift
+                            mma_nt_n = gridy >> _fallback_cluster_n_shift
+                    _unused_m, sfb_tile_n = _l2_swizzle_tile(mma_raw_m, mma_raw_n, mma_nt_m, mma_nt_n, swizzle_w, identity=tile_swizzle_n == 1)
                 nvvm.bar_warp_sync(0xFFFFFFFF)
                 if elect_one:
                     empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)

@@ -806,6 +806,13 @@ reference; `sdpa/frost/test_sdpa_thd_tensormap_acquire.py` and
 surrounding descriptor replacement, data visibility, and pipeline synchronization
 have different contracts and remain required.
 
+**Every TMA scatter4 source needs 128-byte SMEM address alignment.** An aligned
+ring base does not align each four-row issue: a 16-byte staging row advances
+only 64 bytes, so every second issue faults. Select STG for such staging pitches
+unless padding is included in both the layout and resource accounting. Detector:
+`gemm/frost/test_moe_grouped_block_scale_matmul_fwd.py::test_moe_block_scale_narrow_n_routing`
+(`scatter-False-24`, including capture/replay), verified RED before the store gate.
+
 For fractional-microsecond performance changes, repeat A/B with shared addresses,
 reversed construction order, and an independently compiled unchanged-source
 control. An A/A that shares one compiled kernel does not bound the variation

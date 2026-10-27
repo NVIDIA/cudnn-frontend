@@ -76,9 +76,206 @@ def test_moe_swap_ab_lowers_internal_operation():
 def test_moe_swap_ab_preserves_block_scale_tile_constraints(cta_n, monkeypatch):
     sm100 = plan_as_sm100(monkeypatch)
     chain = analyze(_build_graph(2, 173, 256, 256, num_groups=6))
-    cfg = by_name(f"CONFIG_sm100_128x{cta_n}x128_128x{cta_n}x32_cluster1x1_1ctamma")
+    cfg = by_name(f"CONFIG_sm100_256x{cta_n}x128_128x{cta_n}x32_cluster2x1_2ctamma")
     with pytest.raises(NotImplementedError, match="mma_tile_n % 128 == 0"):
         sm100.probe_chain(chain, replace(cfg, swap_ab=True))
+
+
+def _narrow_n_config(width, *, mma_k=32, cluster="1x1", m_blocks=1):
+    return f"CONFIG_sm100_{128 * m_blocks}x{width}x128_128x{width}x{mma_k}_cluster{cluster}_1ctamma"
+
+
+@pytest.mark.parametrize("width", range(8, 128, 8))
+@pytest.mark.parametrize("swap_ab", [False, True])
+def test_moe_block_scale_narrow_n_support(width, swap_ab):
+    chain = analyze(_build_graph(2, 811, 264, 512, num_groups=6))
+    C.probe_chain(chain, replace(by_name(_narrow_n_config(width)), swap_ab=swap_ab))
+
+
+@requires_sm100
+@pytest.mark.parametrize("width", range(8, 128, 8))
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
+def test_moe_block_scale_narrow_n_ragged_groups(width, swap_ab, combo):
+    _run_e2e(
+        E=2,
+        S=811,
+        N=264,
+        K=512,
+        offsets_list=[0, 1, 1, 304, 433, 807, 811],
+        combo=combo,
+        config_name=_narrow_n_config(width),
+        cta_group=1,
+        swap_ab=swap_ab,
+    )
+
+
+@requires_sm100
+@pytest.mark.parametrize("width", [8, 24, 64, 96, 120])
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("cluster,m_blocks", [("2x1", 1), ("1x2", 1), ("2x2", 1), ("1x1", 2)])
+def test_moe_block_scale_narrow_n_cluster(width, swap_ab, cluster, m_blocks):
+    _run_e2e(
+        E=2,
+        S=811,
+        N=264,
+        K=512,
+        offsets_list=[0, 1, 1, 304, 433, 807, 811],
+        config_name=_narrow_n_config(width, cluster=cluster, m_blocks=m_blocks),
+        cta_group=1,
+        swap_ab=swap_ab,
+    )
+
+
+@requires_sm100
+@pytest.mark.parametrize("width", [8, 24, 64, 96])
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("force_stg", [False, True])
+def test_moe_block_scale_narrow_n_aligned_m_major(width, swap_ab, force_stg):
+    _run_e2e(
+        E=2,
+        S=768,
+        N=256,
+        K=512,
+        offsets_list=[0, 0, 384, 384, 768, 768, 768],
+        offset_multiple=384,
+        config_name=_narrow_n_config(width),
+        cta_group=1,
+        swap_ab=swap_ab,
+        output_major="m",
+        force_stg=force_stg,
+    )
+
+
+@requires_sm107
+@pytest.mark.parametrize("width", [8, 48, 96])
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
+def test_moe_block_scale_narrow_n_k64(width, swap_ab, combo):
+    _run_e2e(
+        E=2,
+        S=811,
+        N=264,
+        K=512,
+        offsets_list=[0, 1, 1, 304, 433, 807, 811],
+        combo=combo,
+        config_name=_narrow_n_config(width, mma_k=64),
+        cta_group=1,
+        swap_ab=swap_ab,
+    )
+
+
+@requires_sm100
+@pytest.mark.parametrize("width", [8, 24, 48, 96, 120])
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
+def test_moe_block_scale_narrow_n_gather(width, swap_ab, combo):
+    _run_gather_block_scale(C, replace(by_name(_narrow_n_config(width)), swap_ab=swap_ab), combo=combo)
+
+
+@requires_sm100
+@pytest.mark.parametrize("width", [24, 96])
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("fp8_on_a", [False, True])
+@pytest.mark.parametrize("mma_k", [32, pytest.param(64, marks=requires_sm107)])
+def test_moe_block_scale_narrow_n_mixed(width, swap_ab, fp8_on_a, mma_k):
+    _run_e2e_mixed(fp8_on_a, _narrow_n_config(width, mma_k=mma_k), swap_ab=swap_ab)
+
+
+@requires_sm100
+@pytest.mark.parametrize("width", [24, 96])
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("fake_a", [False, True])
+@pytest.mark.parametrize("combo", ["mxfp4", "mxfp8"])
+def test_moe_block_scale_narrow_n_one_sided(width, swap_ab, fake_a, combo):
+    name = _narrow_n_config(width) + ("_swapAB" if swap_ab else "")
+    test_e2e_one_sided_dequant(fake_a, combo, True, name)
+
+
+@requires_sm100
+@pytest.mark.parametrize("width", [8, 24, 96])
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
+def test_moe_block_scale_narrow_n_swiglu(width, swap_ab, combo):
+    from test_moe_grouped_block_scale_matmul_fwd_swiglu import test_dual_moe_grouped_block_scale_matmul_fwd_swiglu as run
+
+    name = _narrow_n_config(width) + ("_swapAB" if swap_ab else "")
+    run(combo, name, 1)
+
+
+@requires_sm100
+@pytest.mark.parametrize("width", [8, 24, 96])
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("dims", [[1, 1, 1], [1, 1, 256], [1, 811, 1]])
+def test_moe_block_scale_narrow_n_reduction(width, swap_ab, dims):
+    _run_e2e(
+        E=2,
+        S=811,
+        N=256,
+        K=512,
+        offsets_list=[0, 1, 1, 304, 433, 807, 811],
+        config_name=_narrow_n_config(width),
+        cta_group=1,
+        swap_ab=swap_ab,
+        reduction_mode=cudnn.reduction_mode.ADD,
+        reduction_dims=dims,
+    )
+
+
+@requires_sm100
+@pytest.mark.parametrize("width", [32, 64, 96])
+@pytest.mark.parametrize("swap_ab", [False, True])
+def test_moe_block_scale_narrow_n_quant(width, swap_ab):
+    _run_e2e(
+        E=2,
+        S=811,
+        N=256,
+        K=512,
+        offsets_list=[0, 1, 1, 304, 433, 807, 811],
+        config_name=_narrow_n_config(width),
+        cta_group=1,
+        swap_ab=swap_ab,
+        quant=True,
+    )
+
+
+@requires_sm100
+@pytest.mark.parametrize("width", [24, 64])
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("mode", ["scatter", "combine"])
+def test_moe_block_scale_narrow_n_routing(width, swap_ab, mode):
+    plan = _run_e2e(
+        E=2,
+        S=258,
+        N=256,
+        K=512,
+        offsets_list=[0, 3, 3, 131, 257, 258, 258],
+        config_name=_narrow_n_config(width),
+        cta_group=1,
+        swap_ab=swap_ab,
+        **{f"{mode}_top_k": 2},
+    )
+    if mode == "scatter" and not swap_ab:
+        # Four 16-byte rows advance only 64 bytes: every second scatter4
+        # source would violate TMA's 128-byte SMEM address alignment.
+        assert plan._compiled.store_modes == (("stg",) if width == 24 else ("tma",))
+
+
+@requires_sm100
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp8"])
+def test_moe_block_scale_narrow_n_gather_public(swap_ab, combo, cudnn_handle):
+    previous_stream = cudnn.get_stream(cudnn_handle)
+    try:
+        _run_gather_block_scale(
+            C,
+            replace(by_name(_narrow_n_config(24)), swap_ab=swap_ab),
+            combo=combo,
+            public=True,
+            handle=cudnn_handle,
+        )
+    finally:
+        cudnn.set_stream(cudnn_handle, previous_stream)
 
 
 @requires_sm100
@@ -1404,7 +1601,7 @@ def _run_e2e(
     # CUDA path does not implement for that dtype.
     sfa_live = torch.cat([part.view(torch.uint8) for part in sfa_parts]).view(sfa_log.dtype)
     sfa_blk = _with_static_segmented_capacity(sfa_live, S, num_groups, sf_k)
-    sfb_blk = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, sf_k, N)
+    sfb_blk = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, _ceil_div(N, 128) * 128, _ceil_div(sf_k, 4) * 4)
     offsets = torch.tensor(offsets_list, dtype=offset_torch_dt, device=dev)
     if quant:
         q = torch.empty(1, S, N, dtype=quant_out_torch_dt, device=dev)

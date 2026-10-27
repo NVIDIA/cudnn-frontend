@@ -34,6 +34,7 @@ from cudnn.gemm.frost.kernel_templates.dynamic_scheduler_counter_initialization 
     dynamic_scheduler_counter_initialization as _dynamic_scheduler_counter_initialization,
 )
 from cudnn.gemm.frost.tile_helpers import (
+    extract_block_scale_sfb,
     moe_gather_row,
     tma_gather4,
     moe_gather_scales,
@@ -74,6 +75,7 @@ from cuda.bindings import driver as _cuda
 # output descriptors that are re-dimensioned per routed group.
 moe_desc_slots = num_a_operands + num_sfa_operands + n_tma_outputs
 _CTA_GROUP = nvvm.CTAGroup.CTA_2 if cta_group == 2 else nvvm.CTAGroup.CTA_1
+_sfb_needs_sub_tile = sfb_sub_tile_n > 0
 
 if use_acc_overlap and any(_w != epi_n for _, _w in _epi_subtile_spans(epi_cols_per_mma_m, epi_n)):
     raise NotImplementedError(f"{__name__}: acc overlap reverses subtiles by index, which needs a uniform drain width")
@@ -1221,6 +1223,8 @@ def _kernel(
                 ):
                     pass
                 is_valid = (sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)).load()
+                if cutlass.const_expr(_sfb_needs_sub_tile):
+                    sfb_tile_n = (sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(2)).load()
                 # Finish every lane's slot reads before the elected release.
                 nvvm.bar_warp_sync(0xFFFFFFFF)
                 if elect_one:
@@ -1279,6 +1283,13 @@ def _kernel(
                             time_limit=10_000_000,
                         ):
                             pass
+
+                        if cutlass.const_expr(_sfb_needs_sub_tile):
+                            sf_n_start = (sfb_tile_n * cgrp_tile_mnk[1] + n_rank * cta_tile_mnk[1]) % 128
+                            for _bj in cutlass.range_constexpr(num_sfb_operands):
+                                extract_block_scale_sfb(
+                                    smem_sfb_list[_bj].subview(sfb_smem_bytes * stage), sf_n_start, sfb_sub_tile_n, sf_tma_box_k, sfb_smem_bytes
+                                )
 
                         for sf_word in cutlass.range_constexpr(num_sf_atoms):
                             for _bj in cutlass.range_constexpr(num_sfb_operands):

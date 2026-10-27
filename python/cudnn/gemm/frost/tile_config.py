@@ -971,7 +971,7 @@ def select_config(
     # joins the scan up to M = 512 — 128 first, so a scoring tie keeps the taller
     # tile (fewer CTAs, same waves). The intermediate N widths are likewise measured
     # wins, and both extensions are restricted to the plain single-GEMM row-major-B
-    # path: block-scale needs cta_n % 128 == 0 (SF swizzle), multi-GEMM squeezes the
+    # path: automatic block-scale tiles stay >=128, multi-GEMM squeezes the
     # shared budget to powers of two, and N-major B re-rounds to swizzle groups.
     plain = x == 1 and not block_scale and not b_n_major
     cta_m_choices = (128, 64) if (plain and M <= 512) else (128,)
@@ -1019,7 +1019,9 @@ def select_config(
         early_pair = block_scale and not m_is_group_average and 2 * (-(-N // cta_n)) <= sm
         cta_group = 2 if (M > cta_m or early_pair) else 1
 
-    # The tcgen05 SF swizzle needs whole 128-wide blocks per MMA. The sm120 warp
+    # Automatic tcgen05 planning keeps whole 128-wide SF blocks. The 1-CTA
+    # sub-tiles are supported through explicit configs; their extraction work
+    # needs calibration before automatic selection. The sm120 warp
     # MMA reads its scales from registers, so a CTA tile there only has to be a
     # multiple or a divisor of the 128-row block (validate_block_scale_config_sm120)
     # -- every n_axis width is -- and 3+ parallel GEMMs keep their sub-128 N tile.
@@ -1028,7 +1030,7 @@ def select_config(
         cta_n = max(cta_n, 128)
         if cta_n > cta_n_max:
             raise NotImplementedError(
-                f"block-scaled matmul needs cta_tile_n % 128 == 0, but {x} parallel "
+                f"automatic block-scaled matmul planning needs cta_tile_n % 128 == 0, but {x} parallel "
                 f"GEMM(s) cap the N tile at {cta_n_max}; pick a geometry explicitly "
                 "via jit_from_cudnn_graph"
             )
@@ -1179,12 +1181,18 @@ def as_pipeline(cfg: TileConfig, pipeline: str) -> TileConfig:
 
 
 # ---------------------------------------------------------------------------
-# Block-scaled matmul config validation (geometry-only; cta_group lives on the
-# template), one function per template family plus a dispatcher. tcgen05: the
-# F8_128x4 SF swizzle + 32x128b.warpx4 utccp atom impose mma_tile_m/n % 128 == 0
+# Block-scaled matmul config validation (geometry-only), one function per
+# template family plus a dispatcher. tcgen05: the
+# F8_128x4 SF swizzle + 32x128b.warpx4 utccp atom impose mma_tile_m % 128 == 0
+# and whole SF blocks unless an sm100 template extracts an N sub-tile,
 # and cta_tile_k (elements) % (4*block_size) == 0. sm120: the warp MMA reads its
 # scales from registers, so the 128-row block is a TMA-box (CTA tile) fact.
 # ---------------------------------------------------------------------------
+
+
+def block_scale_narrow_n_ok(cfg: TileConfig) -> bool:
+    """SM100's SFB sub-tile path; independent of graph extents and swap-AB."""
+    return cfg.pipeline == "sm100" and 0 < cfg.mma_tile_n < 128 and cfg.mma_tile_n % 8 == 0 and cfg.cta_tile_n == cfg.mma_tile_n and cfg.ctas_per_mma == 1
 
 
 def validate_block_scale_config_sm100(cfg: TileConfig, block_size: int, cta_tile_k_elems: int) -> None:
@@ -1192,19 +1200,19 @@ def validate_block_scale_config_sm100(cfg: TileConfig, block_size: int, cta_tile
     sm100 family; sm103 differs only in its 384-byte K-tile). ``cta_tile_k_elems``
     is the K-tile in *elements* (FP4: 256 on sm100 / 768 on sm103; FP8: 128)."""
     # The SF 128x4 swizzle gives one scale-factor word per 128-row / 128-column
-    # block, and the rule is that EACH MMA INSTRUCTION must land on whole blocks —
-    # so it applies to the instruction tile, not the CTA tile. They coincide at
-    # num_mma == 1, which is why this used to read cta_tile_m/n.
+    # block. Each M instruction covers whole blocks; sm100 can extract
+    # an N sub-tile into the same scale layout before the SMEM->TMEM copy.
     if cfg.mma_tile_m % 128 != 0:
         raise NotImplementedError(
             f"block-scaled matmul requires mma_tile_m % 128 == 0 (SF 128x4 swizzle: "
             f"each MMA instruction must cover whole SF blocks); config {cfg.name!r} "
             f"has cta_tile_m={cfg.cta_tile_m} / mma_size_m={cfg.mma_size_m} = {cfg.mma_tile_m}"
         )
-    if cfg.mma_tile_n % 128 != 0:
+    if cfg.mma_tile_n % 128 != 0 and not block_scale_narrow_n_ok(cfg):
         raise NotImplementedError(
             f"block-scaled matmul requires mma_tile_n % 128 == 0 (SF 128x4 swizzle: "
-            f"each MMA instruction must cover whole SF blocks); config {cfg.name!r} "
+            f"each MMA instruction must cover whole SF blocks), or a narrow "
+            f"1-CTA sm100 N tile; config {cfg.name!r} "
             f"has mma_tile_n={cfg.mma_tile_n}"
         )
     # The 64-byte MMA-inst K is SM 10.7+ SILICON, not a pipeline property, so it

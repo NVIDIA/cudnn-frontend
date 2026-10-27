@@ -758,6 +758,9 @@ def _run_bs_numeric(combo, config_name, M, N, K, out_major="n", split_k=1, force
         sfb_log = _rand_e8m0((N, sf_k), dev)
 
     g = _build_nvfp4_graph(M, N, K, block_size=bs, sf_dt=sf_dt, a_dt=a_dt, b_dt=b_dt, out_major=out_major)
+    # Runtime buffers belong to the public graph's roles even when the compiled
+    # plan's binding has been swapped into kernel coordinates.
+    _, binding = analyze_with_binding(g)
     compiled = _plan(g, config=dataclasses.replace(by_name(config_name), split_k_slices=split_k), force_stg_epi=force_stg)
     assert compiled.block_scale
     if mixed:
@@ -770,18 +773,17 @@ def _run_bs_numeric(combo, config_name, M, N, K, out_major="n", split_k=1, force
     else:
         c = torch.zeros(1, M, N, dtype=torch.float16, device=dev)
     compiled(
-        _vp_bs(
-            compiled,
-            a_rt,
-            b_rt,
-            c,
+        {
+            binding.a_operands[0]: a_rt,
+            binding.b_operands[0]: b_rt,
+            binding.outputs[0]: c,
             # The F8_128x4 blob is padded to whole 128-row blocks (and 4-wide
             # K words), so its rank-3 view carries the PADDED extents when M / N
             # (or sf_k) are not multiples -- the kernel reads it as a base
             # pointer plus the layout it rebuilds from the problem size.
-            _to_blocked(sfa_log).view(1, -(-M // 128) * 128, -1),
-            _to_blocked(sfb_log).view(1, -(-N // 128) * 128, -1),
-        ),
+            binding.sfa_operands[0]: _to_blocked(sfa_log).view(1, -(-M // 128) * 128, -1),
+            binding.sfb_operands[0]: _to_blocked(sfb_log).view(1, -(-N // 128) * 128, -1),
+        },
         workspace=ws,
     )
     torch.cuda.synchronize()
@@ -791,6 +793,123 @@ def _run_bs_numeric(combo, config_name, M, N, K, out_major="n", split_k=1, force
     ref = (a_s @ b_s.t()).to(torch.float16)
     # nvfp4 is bit-exact; mx paths carry fp16 rounding.
     torch.testing.assert_close(c[0], ref, atol=2e-1, rtol=2e-2)
+
+
+# Dense sm100 N sub-tiles, independent of operand orientation and N extent.
+
+
+def _narrow_n_config(width, *, m_blocks=1, cluster="1x1", swap=False, mma_k=32):
+    return f"CONFIG_sm100_{128 * m_blocks}x{width}x128_128x{width}x{mma_k}_cluster{cluster}_1ctamma" + ("_swapAB" if swap else "")
+
+
+@pytest.mark.parametrize("width", range(8, 128, 8))
+def test_narrow_n_geometry(width):
+    validate_block_scale_config_sm100(by_name(_narrow_n_config(width)), 16, 256)
+
+
+@requires_sm100
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
+@pytest.mark.parametrize("width", range(8, 128, 8))
+def test_narrow_n_multiple_sf_blocks(combo, width):
+    # Walks every reachable SF sub-block, including 32/64/96 offsets and
+    # tiles spanning two 128-row blocks. N is intentionally much larger than 32.
+    _run_bs_numeric(combo, _narrow_n_config(width), 136, 264, 1024)
+
+
+@requires_sm100
+@pytest.mark.parametrize("width", [8, 24, 32, 48, 64, 96, 120])
+@pytest.mark.parametrize("swap", [False, True])
+def test_narrow_n_tail_and_swap(width, swap):
+    _run_bs_numeric("nvfp4", _narrow_n_config(width, swap=swap), 259, 267, 768, force_stg=True)
+
+
+@requires_sm100
+@pytest.mark.parametrize("cluster,m_blocks", [("2x1", 1), ("1x2", 1), ("2x2", 1), ("1x1", 2), ("1x1", 4)])
+@pytest.mark.parametrize("width", [16, 48, 96])
+def test_narrow_n_cluster_and_m_blocks(cluster, m_blocks, width):
+    _run_bs_numeric("nvfp4", _narrow_n_config(width, cluster=cluster, m_blocks=m_blocks), 384, 272, 1024)
+
+
+@requires_sm100
+@pytest.mark.parametrize("width", [8, 24, 64, 96])
+@pytest.mark.parametrize("out_major", ["n", "m"])
+def test_narrow_n_split_k(width, out_major):
+    _run_bs_numeric("mxfp8", _narrow_n_config(width), 136, 272, 2048, out_major=out_major, split_k=2)
+
+
+@requires_sm100
+@pytest.mark.parametrize("width", [8, 24, 48, 96])
+def test_narrow_n_persistent_raster(width):
+    # More than two waves: the MMA warp must follow CLC and the L2 raster,
+    # rather than keep extracting the first tile's SFB rows.
+    _run_bs_numeric("nvfp4", _narrow_n_config(width), 384, 4104, 512)
+
+
+@requires_sm100
+@pytest.mark.parametrize("width", [8, 48, 96])
+@pytest.mark.parametrize("swap", [False, True])
+def test_narrow_n_mixed_input_widths(width, swap):
+    _run_bs_numeric("mxfp8_x_mxfp4", _narrow_n_config(width, swap=swap), 136, 264, 1024)
+
+
+@requires_sm100
+@pytest.mark.parametrize("fake_a", [False, True])
+@pytest.mark.parametrize("combo", ["mxfp4", "mxfp8"])
+def test_narrow_n_one_sided_dequant(fake_a, combo):
+    test_one_sided_dequant_e2e(fake_a, combo, _narrow_n_config(24))
+
+
+@requires_sm107
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8", "mxfp8_x_mxfp4"])
+@pytest.mark.parametrize("width", [8, 48, 96])
+def test_narrow_n_k64(combo, width):
+    _run_bs_numeric(combo, _narrow_n_config(width, mma_k=64), 136, 264, 1024)
+
+
+@requires_sm100
+@pytest.mark.parametrize("width", [8, 48, 96])
+def test_narrow_n_multi_gemm_fusion(width):
+    from test_block_scale_matmul_swiglu import _run as _dual_bs_numeric
+
+    _dual_bs_numeric("nvfp4", _narrow_n_config(width), 256, 384, 512)
+
+
+@requires_sm100
+@pytest.mark.parametrize("shape_flag", ["is_override_shape_enabled", "is_dynamic_shape_enabled"])
+def test_narrow_n_replay_changed_extents_and_capture(shape_flag):
+    from cudnn.gemm.frost.graph_analyzer import build_gemm_plan
+    from cudnn.gemm.frost.knobs import GemmKnobs
+
+    g = _build_nvfp4_graph(136, 264, 1024)
+    g._cpp_graph_kwargs[shape_flag] = True
+    _, bd = analyze_with_binding(g)
+    compiled = build_gemm_plan(g, knobs=GemmKnobs.from_config(by_name(_narrow_n_config(24))))
+    for n in (40, 272, 520):
+        a, b, sfa, sfb, ref, _, _, _ = _make_block_scale_inputs("nvfp4", 136, n, 1024)
+        sa = _to_blocked(sfa).view(1, 256, -1)
+        sb = _to_blocked(sfb).view(1, -(-n // 128) * 128, -1)
+        out = torch.full((1, 136, n), float("nan"), device="cuda", dtype=torch.float16)
+        pack = {bd.a_operands[0]: a, bd.b_operands[0]: b, bd.sfa_operands[0]: sa, bd.sfb_operands[0]: sb, bd.outputs[0]: out}
+        compiled(pack)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out[0], ref.half(), atol=2e-1, rtol=2e-2)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    capture = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(capture, stream=stream):
+        compiled(pack, stream=stream.cuda_stream)
+    sb.copy_(_to_blocked((sfb.float() * 2).to(sfb.dtype)).view_as(sb))
+    out.fill_(float("nan"))
+    capture.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out[0], (ref * 2).half(), atol=2e-1, rtol=2e-2)
+
+
+@pytest.mark.parametrize("width", [16, 32, 64, 96])
+def test_narrow_n_pair_mma_stays_declined(width):
+    cfg = by_name(f"CONFIG_sm100_256x{width}x128_128x{width}x32_cluster2x1_2ctamma")
+    with pytest.raises(NotImplementedError, match="mma_tile_n"):
+        validate_block_scale_config_sm100(cfg, 16, 256)
 
 
 _SPLITK_BS_CFG = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"

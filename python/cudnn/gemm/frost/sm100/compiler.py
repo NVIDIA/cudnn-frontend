@@ -1609,9 +1609,13 @@ def _render_block_scale_tile_constants(
     sf_k = cta_k_elems // bs.block_size  # SF values along K per tile
     sf_k4 = sf_k // 4  # 4 SF-K per utccp atom
     nb_m = cta_m // 128
-    nb_n = cta_n // 128
+    nb_n = max(1, cta_n // 128)
+    sfb_sub_tile_n = cta_n if cta_n < 128 else 0
+    # N sub-tiles can straddle a 128-row scale block. Load both blocks when
+    # required by any tile origin, then extract the actual rows in the MMA warp.
+    sfb_load_blocks = -(-(cta_n + 128 - math.gcd(cta_n, 128)) // 128)
     mma_nb_m = cfg.mma_tile_m // 128
-    mma_nb_n = cfg.mma_tile_n // 128
+    mma_nb_n = max(1, cfg.mma_tile_n // 128)
     sfa_nb_m = mma_nb_m * cfg.mma_size_m
 
     _REGISTERS_PER_ATOM = 4  # cols per 128×4 utccp atom
@@ -1650,7 +1654,7 @@ def _render_block_scale_tile_constants(
 
     # SF SMEM bytes per stage (sf_dtype 1 byte; whole k-tile loaded by TMA).
     sfa_smem_bytes = cta_m * sf_k
-    sfb_smem_bytes = cta_n * sf_k
+    sfb_smem_bytes = sfb_load_blocks * 128 * sf_k
     # SF TMA box (fp16-recast trick): inner 256 fp16 (=512 B = one 128×4 SF atom
     # block, hardcoded in the template), box-K = sf_k4 atoms.
     sf_tma_box_k = sf_k4
@@ -2052,6 +2056,7 @@ def _render_block_scale_tile_constants(
         f"word_atoms = {word_atoms}",
         f"num_blocks_m = {nb_m}",
         f"num_blocks_n = {nb_n}",
+        f"sfb_sub_tile_n = {sfb_sub_tile_n}",
         f"registers_per_block = {_REGISTERS_PER_BLOCK}",
         f"epi_cols_per_mma_m = {epi_cols_per_mma_m}",
         f"mma_c_dtype = {DTYPE_TO_CUTLASS[chain.matmul.accum_dtype]}",
@@ -2069,7 +2074,7 @@ def _render_block_scale_tile_constants(
         f"sfb_smem_bytes = {sfb_smem_bytes}",
         f"sf_tma_box_k = {sf_tma_box_k}",
         f"sfa_tma_box_mn = {nb_m}",
-        f"sfb_tma_box_mn = {nb_n}",
+        f"sfb_tma_box_mn = {sfb_load_blocks}",
     ]
     if is_sm103:
         kstep = mma_inst_k_bytes
@@ -3870,6 +3875,10 @@ def _output_store_mode(
         if out.major == token_major:
             return "stg"
         if isinstance(chain.moe, MoeSwapAbSpec) and _epi_n_for_chain(cfg, chain) % 4:
+            return "stg"
+        # Each scatter4 source begins at a four-row boundary in the staging
+        # image. TMA requires 128-byte SMEM addresses, even for a 64-byte payload.
+        if out.major == "n" and 4 * _epi_row_bytes(out.dtype, _epi_n_for_chain(cfg, chain)) % 128:
             return "stg"
     # TMA addresses its contiguous dim in 16-byte units, and truncates. The next
     # two rejections are that granule at a different extent.

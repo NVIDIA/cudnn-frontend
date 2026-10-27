@@ -59,6 +59,29 @@ def epi_subtile_spans(cols, epi_n=32):
 TENSOR_MAP_QWORDS = 16
 
 
+@cute.jit
+def extract_block_scale_sfb(stage, n_start, tile_n: cutlass.Constexpr, k_atoms: cutlass.Constexpr, stage_bytes: cutlass.Constexpr):
+    """Extract a tcgen05 N sub-tile in place from one or two F8_128x4 blocks.
+
+    All lanes gather the source words before overwriting each atom. The result
+    starts at row zero, keeping scale_b at its aligned TMEM base for every N.
+    Call warp-wide after the stage's SF-ready wait and before its UTCCP copies.
+    """
+    words = cutlass.Array(base=stage.data_ptr(), shape=stage_bytes // 4, dtype=cutlass.Uint32)
+    lane = cute.arch.lane_idx()
+    for atom in cutlass.range_constexpr(k_atoms):
+        values = []
+        for col in cutlass.range_constexpr((tile_n + 31) // 32):
+            row = n_start + cutlass.min(lane + col * 32, tile_n - 1)
+            src = (row // 128) * (128 * k_atoms) + atom * 128 + (row % 32) * 4 + (row % 128) // 32
+            values.append(words.data_ptr(src).load())
+        nvvm.bar_warp_sync(0xFFFFFFFF)
+        for col in cutlass.range_constexpr((tile_n + 31) // 32):
+            words.data_ptr(atom * 128 + lane * 4 + col).store(values[col])
+    cute.arch.fence_proxy("async.shared", space="cta")
+    nvvm.bar_warp_sync(0xFFFFFFFF)
+
+
 def moe_swizzle_tile(t, nt_m, nt_n, swizzle_w):
     """Group-local linear tile index -> (m, n) under an N-super-block walk.
     ``swizzle_w == nt_n`` reproduces the plain n-fast split; ``1`` gives m-fast.
@@ -493,12 +516,13 @@ def moe_gather_scales(
         pass
     src_words = cutlass.inttoptr(scratch.data_ptr().toint(), 3, cutlass.Uint32)
     dst_words = cutlass.inttoptr(dst.data_ptr().toint(), 3, cutlass.Uint32)
-    for i in cutlass.range(rows * (scales // 4) // 32, unroll_full=True):
+    for i in cutlass.range((rows * (scales // 4) + 31) // 32, unroll_full=True):
         word = lane + i * 32
-        row = word // (scales // 4)
-        kw = word % (scales // 4)
-        packed = (row // 128) * (128 * (scales // 4)) + kw * 128 + (row % 32) * 4 + (row % 128) // 32
-        (dst_words + packed).store((src_words + (row // 4) * 32 + (row % 4) * 4 + (scale_k % 16) // 4 + kw).load())
+        if word < rows * (scales // 4):
+            row = word // (scales // 4)
+            kw = word % (scales // 4)
+            packed = (row // 128) * (128 * (scales // 4)) + kw * 128 + (row % 32) * 4 + (row % 128) // 32
+            (dst_words + packed).store((src_words + (row // 4) * 32 + (row % 4) * 4 + (scale_k % 16) // 4 + kw).load())
     cute.arch.fence_view_async_shared()
     nvvm.bar_warp_sync(0xFFFFFFFF)
     with cute.arch.elect_one():
