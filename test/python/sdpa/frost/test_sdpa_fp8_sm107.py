@@ -16,7 +16,7 @@ import re
 
 import pytest
 
-from frost_test_utils import requires_dsl
+from frost_test_utils import requires_dsl, requires_rubin
 
 from cudnn.sdpa.fwd.api_dsl import _sm100_fp8_shapes
 from cudnn.sdpa.fwd.config_sm100 import TemplateParams
@@ -2010,3 +2010,18 @@ def test_sm107_d256_mxfp8_pair_is_bitwise_the_one_cta_build(causal):
         assert err <= 0.1 * scale, f"cga {cga}: max err {err} vs fp32 reference (scale {scale})"
     assert torch.equal(outs[1][0], outs[2][0]) and torch.equal(outs[1][1], outs[2][1]), "O / LSE must be bit-identical across the CTA widths"
     assert torch.equal(outs[None][0], outs[2][0]) and torch.equal(outs[None][1], outs[2][1]), "the unset knob must be the pair"
+
+
+@requires_rubin
+class TestNativeFp8SinkSplit:
+    """Keep the native regressions in the explicitly selected SM107 CI entry."""
+
+    from test_sdpa_fp8_sink_split_sm107 import (
+        test_native_fp8_sink_split_rebind_replay as _rebind,
+        test_native_fp8_sink_split_standalone as _standalone,
+        test_native_fp8_sink_keeps_independent_split_domain as _domain,
+    )
+
+    test_rebind_and_replay = staticmethod(_rebind)
+    test_standalone = staticmethod(_standalone)
+    test_domain_declines = staticmethod(_domain)
