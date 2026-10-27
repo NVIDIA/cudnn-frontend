@@ -38,19 +38,12 @@ pytestmark = [requires_blackwell, requires_dsl]
 # 100-106, sm107 = the Rubin line): pin the engine that serves the device
 # under test.  Both lines carry all four native flavors -- d128, d192xd128,
 # d256 and d512 (api_dsl._SM107_FP8_KERNEL_FILES mirrors _SM100_FP8_KERNEL_FILES)
-# -- so every flavor test below runs on both; the `_skip_*_on_rubin` markers
-# from the d128-only era are retired.  TWO Rubin declines are still true, each
-# kept as a marker with its real reason and pinned host-side in
-# test_sdpa_fwd_dsl_sm107.py:
-#   * the sm107 row packs GQA on d128 only (`pack_gqa_d_shapes = {(128, 128)}`,
-#     no PackGQA path in the wider siblings) -- a DECLARED decline
-#     (test_sm107_fp8_pack_gqa_is_d128_only); the packed d192 / d256 execute
-#     tests skip with that reason;
-# Per-tensor FP8 Stats strides are now runtime Int64 slots on all four flavors.
+# -- so every flavor test below runs on both. Rubin D64/D128/D192x128 now
+# serve PackGQA; the D256 packing cases retain their declared decline, pinned
+# by test_sm107_fp8_pack_gqa_serves_native_split_flavors.
+# Per-tensor FP8 Stats strides are runtime Int64 slots on all four flavors.
 _D128_ARCH = "sm107" if _SM == 107 else "sm100"
-_skip_pack_gqa_wide_on_rubin = pytest.mark.skipif(
-    _SM == 107, reason="the Rubin per-tensor FP8 row packs GQA on d128 only (pack_gqa_d_shapes; pinned by test_sm107_fp8_pack_gqa_is_d128_only)"
-)
+_skip_pack_gqa_wide_on_rubin = pytest.mark.skipif(_SM == 107, reason="the Rubin per-tensor FP8 D256 row does not serve PackGQA")
 # Five e5m2 ids read `max|O-ref|` 0.0404-0.0423 against the shared 4e-2 e5m2 bound
 # (`_half_atol`, tightened by #971) on the 204-SM Rubin part -- a DATASET edge
 # (torch's Philox lays draws out by SM count, so the cc 10.7 tensors are not the
@@ -1304,7 +1297,6 @@ def test_fp8_pack_gqa_e5m2(d):
     _check(out, o_ref, torch.float16, "e5m2", a_o, a_ref)
 
 
-@_skip_pack_gqa_wide_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("h_q,h_kv", [(8, 4), (8, 2), (16, 2)], ids=["g2", "g4", "g8"])
 @torch_fork_set_rng(seed=0)
@@ -1330,7 +1322,6 @@ def test_fp8_pack_gqa_d192_d128_ratios(h_q, h_kv):
     torch.testing.assert_close(lse_v, lse_ref, atol=5e-2, rtol=3e-2)
 
 
-@_skip_pack_gqa_wide_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_fp8_pack_gqa_d192_d128_grouped_lpt():
@@ -1358,7 +1349,6 @@ def test_fp8_pack_gqa_d192_d128_grouped_lpt():
     torch.testing.assert_close(lse_v, lse_ref, atol=5e-2, rtol=3e-2)
 
 
-@_skip_pack_gqa_wide_on_rubin
 @pytest.mark.L1
 @torch_fork_set_rng(seed=0)
 def test_fp8_pack_gqa_d192_d128_e5m2_sink():

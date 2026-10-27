@@ -32,7 +32,7 @@ def test_native_fp8_sink_split_rebind_replay(d, dv, split, dtype, output, monkey
     sink = torch.linspace(-120, 120, 4, device="cuda").view(1, 4, 1, 1)
     g, vp, ws, bufs, tensors = shared._case(arch="sm107", d=d, dv=dv, sq=sq, skv=256, split_kv=split, dtype=dtype, output_dtype=output, sink=sink)
     selected = g.plans[g._plan_index]
-    g.create_execution_plan(selected.engine_id, replace(selected.knobs, pack_gqa=split == 9 and d != 192, sched_policy=split % 3))
+    g.create_execution_plan(selected.engine_id, replace(selected.knobs, pack_gqa=split == 9, sched_policy=split % 3))
     g.select_plan(len(g.plans) - 1)
     g.check_support()
     g.build_plans()
