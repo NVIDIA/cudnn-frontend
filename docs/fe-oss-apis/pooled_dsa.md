@@ -4,6 +4,36 @@ Pooled DSA selects groups of index keys, then expands each selected group to
 individual token IDs. `cudnn.ops.dsa` provides a pooled indexer and separate
 selection, cache-update, and index-expansion APIs for Blackwell SM100/SM103.
 
+## Performance status
+
+**The standalone frontend scorer is not yet performant.** Use the public
+selector with DeepGEMM logits for the measured vLLM serving route.
+`pooled_indexer_forward` matches the native BF16 contract on tested inputs,
+but its large-prefill scoring path is much slower than DeepGEMM.
+
+At 4,096 queries, 32,768 pools, 32 heads, and head dimension 128, CUDA-graph
+stage measurements on exclusive GB200/GB300 nodes give:
+
+| GPU | Cache | DeepGEMM score ms | Frontend score ms | Shared selector ms | Full-indexer slowdown |
+| --- | --- | ---: | ---: | ---: | ---: |
+| GB200 | FP8 | 0.376 | 7.126 | 0.305 | 10.74× |
+| GB200 | FP4 | 0.283 | 6.612 | 0.305 | 11.61× |
+| GB300 | FP8 | 0.343 | 7.089 | 0.303 | 11.59× |
+| GB300 | FP4 | 0.283 | 6.579 | 0.304 | 11.73× |
+
+Each value averages medians from both execution orders, with 15 samples
+per order and ten calls per graph after warmup. The full-indexer ratio
+includes scoring and the same fused selector in both paths. Native prefill
+K gathering is excluded; the frontend reads paged keys directly. These
+measurements use frontend `13892e8e625a4a8445e1a1be031046b4b84018cf`.
+
+The cuDNN contribution to the measured GLM-5.3-Flash serving gain comes
+from `pooled_select_forward`: fused selection/expansion and direct BF16
+logit input. The vLLM branch also removes temporary gathers from prefill
+cache writes, so its E2E gains cover both changes. There is no selector-only
+E2E ablation. The full frontend scorer and cache-update API are not used
+by that serving path.
+
 ## Selection from logits
 
 `cudnn.ops.dsa.pooled_select_forward` accepts precomputed BF16 or FP32
