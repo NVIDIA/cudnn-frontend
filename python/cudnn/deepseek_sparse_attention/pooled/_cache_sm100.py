@@ -10,11 +10,12 @@ from cutlass import BFloat16, Float32, Int32, Int64, Uint8
 
 
 class PoolCacheKernel:
-    def __init__(self, pool_size, page_size, cache_dtype, mode):
+    def __init__(self, pool_size, page_size, cache_dtype, mode, fp8_scale_format):
         self.pool_size = pool_size
         self.page_size = page_size
         self.cache_dtype = cache_dtype
         self.mode = mode
+        self.fp8_scale_format = fp8_scale_format
         self.warps = 4
 
     @cute.jit
@@ -89,13 +90,18 @@ class PoolCacheKernel:
             largest = cute.arch.warp_reduction_max(largest)
             scale, exponent = self._power_two_scale(largest * (1.0 / 448.0))
             output = cute.make_tensor(cute.recast_ptr(base, dtype=cutlass.Float8E4M3FN), cute.make_layout((self.page_size * 128,)))
-            scale_out = cute.make_tensor(cute.recast_ptr(base + self.page_size * 128, dtype=Float32), cute.make_layout((self.page_size,)))
             quantized = cute.make_rmem_tensor((4,), cutlass.Float8E4M3FN)
             quantized.store((values.load() / scale).to(cutlass.Float8E4M3FN))
             for j in cutlass.range_constexpr(4):
                 output[offset * 128 + lane + j * 32] = quantized[j]
             if lane == 0:
-                scale_out[offset] = scale
+                if cutlass.const_expr(self.fp8_scale_format == "ue8m0"):
+                    scale_out = cute.make_tensor(base + self.page_size * 128, cute.make_layout((self.page_size * 4,)))
+                    for j in cutlass.range_constexpr(4):
+                        scale_out[offset * 4 + j] = Uint8(exponent + 127)
+                else:
+                    scale_out = cute.make_tensor(cute.recast_ptr(base + self.page_size * 128, dtype=Float32), cute.make_layout((self.page_size,)))
+                    scale_out[offset] = scale
         else:
             output = cute.make_tensor(base, cute.make_layout((self.page_size * 68,)))
             value_bits = cute.recast_tensor(values, Int32)

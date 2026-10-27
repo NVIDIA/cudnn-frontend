@@ -15,7 +15,7 @@ _NAMES = ("keys", "gates", "ape", "cache", "tail", "pool_slots", "tail_slots", "
 
 
 @lru_cache(maxsize=128)
-def _compile_cache_update(device, capability, pool_size, page_size, cache_dtype, mode, integer_dtypes):
+def _compile_cache_update(device, capability, pool_size, page_size, cache_dtype, mode, integer_dtypes, fp8_scale_format):
     _require_dsl()
     import cutlass
     import cutlass.cute as cute
@@ -41,7 +41,7 @@ def _compile_cache_update(device, capability, pool_size, page_size, cache_dtype,
     )
     with torch.cuda.device(device):
         return cute.compile(
-            PoolCacheKernel(pool_size, page_size, cache_dtype, mode),
+            PoolCacheKernel(pool_size, page_size, cache_dtype, mode, fp8_scale_format),
             matrix(cutlass.BFloat16, 128),
             matrix(cutlass.BFloat16, 128),
             ape,
@@ -77,10 +77,12 @@ class PoolCacheUpdate(APIBase):
         page_size=64,
         cache_dtype="fp8",
         mode="prefill",
+        fp8_scale_format="fp32",
     ):
         super().__init__()
         self.pool_size, self.page_size = int(pool_size), int(page_size)
         self.cache_dtype, self.mode = cache_dtype, mode
+        self.fp8_scale_format = fp8_scale_format
         tensors = (keys, gates, ape, cache, tail, pool_slots, tail_slots, positions, cu_seqlens)
         self._descs = tuple(self._make_tensor_desc(t) for t in tensors)
         self._device = torch.device(keys.device)
@@ -154,6 +156,8 @@ class PoolCacheUpdate(APIBase):
             raise ValueError("expected pool_size 4 or 16, positive page_size, and prefill/decode mode")
         if self.cache_dtype not in ("bf16", "fp8", "fp4"):
             raise ValueError("cache_dtype must be bf16, fp8, or fp4 (MXFP4)")
+        if self.fp8_scale_format not in ("fp32", "ue8m0") or (self.cache_dtype != "fp8" and self.fp8_scale_format != "fp32"):
+            raise ValueError("fp8_scale_format must be fp32, or ue8m0 with an FP8 cache")
         self._validate(self._descs, descriptors=True)
         self._capability = torch.cuda.get_device_capability(self._device)
         if self._capability not in ((10, 0), (10, 3)):
@@ -164,7 +168,7 @@ class PoolCacheUpdate(APIBase):
     def compile(self):
         self._ensure_support_checked()
         self._compiled_kernel = _compile_cache_update(
-            self._device.index, self._capability, self.pool_size, self.page_size, self.cache_dtype, self.mode, self._integer_dtypes
+            self._device.index, self._capability, self.pool_size, self.page_size, self.cache_dtype, self.mode, self._integer_dtypes, self.fp8_scale_format
         )
 
     def scratch_workspace_bytes(self):
@@ -198,9 +202,10 @@ def pool_cache_update_wrapper(
     cache_dtype="fp8",
     mode="prefill",
     current_stream=None,
+    fp8_scale_format="fp32",
 ):
     """Update caller-owned caches; compile once before graph capture."""
     args = (keys, gates, ape, cache, tail, pool_slots, tail_slots, positions, cu_seqlens)
-    plan = PoolCacheUpdate(*args, pool_size=pool_size, page_size=page_size, cache_dtype=cache_dtype, mode=mode)
+    plan = PoolCacheUpdate(*args, pool_size=pool_size, page_size=page_size, cache_dtype=cache_dtype, mode=mode, fp8_scale_format=fp8_scale_format)
     plan.compile()
     return plan.execute(*args, current_stream=current_stream)
