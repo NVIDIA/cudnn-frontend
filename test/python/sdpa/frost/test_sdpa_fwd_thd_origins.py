@@ -266,11 +266,11 @@ def test_compact_thd_origins_use_single_load_maps(dim):
             total += length
         return rows
 
-    def fill(ql, kl, k_shift=0, q_shift=0, elsewhere=()):
-        """Bind compact prefixes; shift K/V by ``k_shift`` rows and Q alone by ``q_shift`` rows after the first
-        sequence; place the ``elsewhere`` (port, b) pairs at a row the compact rule rejects, data included."""
+    def fill(ql, kl, shifts=None, elsewhere=()):
+        """Bind compact prefixes; open a gap of ``shifts[port]`` rows after the first sequence in each listed port;
+        place the ``elsewhere`` (port, b) pairs at a row the compact rule rejects, data included."""
         origins = {name: prefix(ql if name in ("q", "o", "stats") else kl) for name in ports}
-        for name, shift in (("k", k_shift), ("v", k_shift), ("q", q_shift)):
+        for name, shift in (shifts or {}).items():
             origins[name] = [row + (shift if b else 0) for b, row in enumerate(origins[name])]
         for port, b in elsewhere:
             origins[port][b] = 700 + 16 * b
@@ -379,18 +379,19 @@ def test_compact_thd_origins_use_single_load_maps(dim):
     # A sequence with keys but no query rows votes with its K/V offsets: its
     # rows sit inside the packed KV prefix that its predecessor's tail reads.
     run(fill(*queryless, elsewhere=[("k", 1), ("v", 1)]), 0)
-    # A gap after the first K/V sequence, or after the first Q sequence alone: sequence-local maps.
-    run(fill(*lengths, k_shift=8), 0)
-    run(fill(*lengths, q_shift=8), 0)
+    # A gap after the first sequence in any one port, or in K and V together: sequence-local maps.
+    gaps = ({"k": 8, "v": 8}, {"q": 8}, {"k": 8}, {"v": 8}, {"o": 8}, {"stats": 8})
+    for shifts in gaps:
+        run(fill(*lengths, shifts=shifts), 0)
     captured = torch.cuda.CUDAGraph()
     try:
         fill(*lengths)
         with torch.cuda.graph(captured):
             graph.execute(pack, workspace)
-        # Replay reads the offsets of each launch: compact, padded K/V, padded Q, keys without queries elsewhere, compact.
+        # Replay reads the offsets of each launch: compact, every gap, keys without queries elsewhere, compact.
         run(fill(*lengths), 1, replay=captured)
-        run(fill(*lengths, k_shift=8), 0, replay=captured)
-        run(fill(*lengths, q_shift=8), 0, replay=captured)
+        for shifts in gaps:
+            run(fill(*lengths, shifts=shifts), 0, replay=captured)
         run(fill(*queryless, elsewhere=[("k", 1), ("v", 1)]), 0, replay=captured)
         run(fill(*keyless), 1, replay=captured)
     finally:
