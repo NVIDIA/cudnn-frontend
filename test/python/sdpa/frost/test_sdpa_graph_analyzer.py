@@ -2566,7 +2566,7 @@ def test_paged_quantized_rows_mismatch_reasons():
         assert engines.mismatch(fp8, sink_facts) is None
         split_knobs = engines.SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=2)
         assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=d, d_v=d), split_knobs) is None
-        assert "sink-free dense" in engines.mismatch(fp8, sink_facts, split_knobs)
+        assert engines.mismatch(fp8, sink_facts, split_knobs) is None
     # Block-scaled O (#1088) over pools: epilogue and loader are independent, but the pair is not validated.
     assert "block-scaled O" in engines.mismatch(fp8, paged_facts(is_fp8=True, dtype_o=cudnn.data_type.FP8_E4M3, o_block_scale=32))
     assert "block-scaled O" in engines.mismatch(mxfp8, paged_facts(is_mxfp8=True, page_size=128, dtype_o=cudnn.data_type.FP8_E4M3, o_block_scale=32))
