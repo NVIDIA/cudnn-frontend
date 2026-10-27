@@ -1896,6 +1896,19 @@ def test_sm120_padded_e2m1_declines_k_tail() -> None:
         _plan(g, config=by_name(_SM120_BS_CFG), padded_e2m1=True)
 
 
+@requires_sm120
+@pytest.mark.parametrize("fp8_on_a", [True, False], ids=["mxfp8_x_mxfp4", "mxfp4_x_mxfp8"])
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["normal", "swap_ab"])
+def test_sm120_padded_e2m1_rejects_misaligned_operands(fp8_on_a, swap_ab) -> None:
+    """PTX tensor-copy rule for ``.b4x16_p64``: the padded operand's global
+    address and strides must be 32-byte aligned. A 16-byte-offset view of the fp4
+    operand runs on the packed kernel (the 16-byte TMA rule) and is rejected at
+    the launch boundary by the padded one, before any descriptor is encoded."""
+    _run_e2e_mixed(fp8_on_a, _SM120_BS_CFG, swap_ab=swap_ab, fp4_offset_bytes=16)
+    with pytest.raises(ValueError, match="32-byte aligned"):
+        _run_e2e_mixed(fp8_on_a, _SM120_BS_CFG, swap_ab=swap_ab, padded_e2m1=True, fp4_offset_bytes=16)
+
+
 def test_sm120_mixed_pair_smem_footprint_budgets_packed_rows() -> None:
     """The sm120 SMEM footprint check (multi_gemm_smem_bytes) sizes the packed e2m1
     side of a mixed pair at its real 64-byte row, as multi_gemm_ab_stages does and

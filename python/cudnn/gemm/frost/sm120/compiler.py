@@ -3192,6 +3192,30 @@ def _alignment_reject(named_buffers) -> "str | None":
     return None
 
 
+def _padded_e2m1_operand_reject(named_buffers) -> "str | None":
+    """PTX tensor-copy rule for the padded ``.b4x16_p64`` form (and the other
+    sub-byte padded types): the tensor's global address and its stride in every
+    dimension must be 32-byte aligned, twice the 16 bytes the packed ``.b4x16``
+    descriptors need. Entries are ``(role, buffer)`` of the operands the kernel
+    loads padded, in kernel orientation; ``None`` buffers are skipped. Checked
+    before any descriptor is encoded: the encode otherwise fails with an opaque
+    ``cudaErrorInvalidValue``, or mis-strides. Returns a reason, or ``None``."""
+    bad = []
+    for role, buf in named_buffers:
+        if buf is None:
+            continue
+        ptr = int(buf.data_ptr())
+        elem = buf.element_size()
+        if ptr % 32:
+            bad.append(f"{role}: base address 0x{ptr:x} is {_pow2_floor(ptr)}-byte aligned")
+        strides = [s * elem for s, n in zip(buf.stride(), buf.shape) if n != 1 and s != 1]
+        if any(s % 32 for s in strides):
+            bad.append(f"{role}: strides {tuple(buf.stride())} x {elem} B are not all multiples of 32 bytes")
+    if bad:
+        return "padded e2m1 operands (TMA .b4x16_p64) need a 32-byte aligned base address and 32-byte aligned strides: " + "; ".join(bad)
+    return None
+
+
 def _mixed_width_operand_reject(chain: FusionChain, a_bufs, b_bufs) -> "str | None":
     """Runtime K rule of a mixed fp4 x fp8 block-scale pair (MoE; the buffers in
     kernel orientation, ``(batch, rows, packed K)``, K-major for the fp4 side).
@@ -5943,9 +5967,15 @@ class CompiledMoeBlockScaleGemm:
         _mixed = _mixed_width_operand_reject(self.chain, a_bufs, b_bufs)
         if _mixed is not None:
             raise ValueError(_mixed)
+        from ..kernel_registry import sm120_padded_e2m1_sides
+
+        _padded_a, _padded_b = sm120_padded_e2m1_sides(self.chain)
+        _padded = _padded_e2m1_operand_reject([("token", x) for x in (a_bufs if _padded_a else ())] + [("weight", x) for x in (b_bufs if _padded_b else ())])
+        if _padded is not None:
+            raise ValueError(_padded)
         _named = (
-            [("token", x, 16, "ptr") for x in a_bufs]
-            + [("weight", x, 16, "ptr") for x in b_bufs]
+            [("token", x, 32 if _padded_a else 16, "ptr") for x in a_bufs]
+            + [("weight", x, 32 if _padded_b else 16, "ptr") for x in b_bufs]
             + [(f"output[{i}]", x, _out_reqs[i], "full") for i, x in enumerate(out_bufs)]
             + [(f"aux {self.chain.aux_tensors[i].name!r}", x, _aux_reqs[self.chain.aux_tensors[i].name], "full") for i, x in enumerate(aux_bufs)]
             + [("SFA", x, 16, "ptr") for x in (sfa or [])]
