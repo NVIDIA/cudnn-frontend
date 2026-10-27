@@ -685,7 +685,10 @@ def test_mixed_cga_uses_host_constant_masks_and_shifts_at_every_use_site():
 
 @pytest.mark.parametrize("stem", ["sm100_moe_grouped_matmul_fwd", "sm100_moe_grouped_block_scale_matmul_fwd"])
 def test_moe_swap_ab_preserves_mma_and_producer_barriers(stem):
+    """Preserve pipeline synchronization while allowing the bulk register policy."""
+
     def pipeline(file):
+        """Extract barrier/MMA regions with only the documented role normalization."""
         tree = ast.parse(template_path(file).read_text())
         kernel = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_kernel")
         # The gathered token SF is A normally and B after swapAB. Normalize
@@ -696,6 +699,18 @@ def test_moe_swap_ab_preserves_mma_and_producer_barriers(stem):
                 for name in ast.walk(call.args[1]):
                     if isinstance(name, ast.Name) and name.id == token_sf_count:
                         name.id = "num_token_sf_operands"
+        for mma in (node for node in kernel.body if isinstance(node, ast.If) and ast.unparse(node.test) == "warp_idx == mma_warp_id"):
+            register_adjustment = mma.body[0]
+            if isinstance(register_adjustment, ast.If) and ast.unparse(register_adjustment.test) == "cutlass.const_expr(not moe_combine_swap_bulk_enabled)":
+                # The swapped bulk specialization disables register redistribution.
+                # Normalize ONLY this exact prologue adjustment; every MMA operation
+                # and barrier (including its predicates/order) still compares verbatim.
+                expected = ast.parse("nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)").body
+                assert not register_adjustment.orelse
+                assert [ast.dump(node, include_attributes=False) for node in register_adjustment.body] == [
+                    ast.dump(node, include_attributes=False) for node in expected
+                ]
+                mma.body[:1] = register_adjustment.body
         warp_regions = [
             ast.dump(node, include_attributes=False)
             for node in kernel.body

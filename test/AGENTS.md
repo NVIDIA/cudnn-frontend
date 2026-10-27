@@ -665,6 +665,26 @@ outputs and check every launch. `test_gemm_swiglu_retained_outputs_replay`
 covers multiple groups within a tile and persistent tile transitions, including
 one-group tiles that must advance the C ring at every tile boundary.
 
+For bulk MoE COMBINE, establish ownership from the per-CTA MMA slice, not the
+cluster-wide instruction shape: the normal 128-row slice gives each epilogue
+thread one complete feature row. Stage every register drain before submitting
+that row, and wait for async shared-memory reads before reusing it. Reserve
+staging ahead of the AB rings in both the SMEM budget and descriptor-root model.
+Bulk and atomic fallback predicates must agree for partial feature tiles and
+unaligned output rows. `gemm/frost/test_moe_combine_bulk.py` varies routed rows,
+features and scores independently, checks output padding, then changes scores
+under graph replay and rebinds the same artifact to a smaller token count.
+Its segmented-scale replay cases also change group boundaries and scale values
+in place. Normal 2-CTA configurations retain atomics pending qualification:
+the SM100 NVFP4-to-BF16 case at S/N/K=1026/512/1024 reported invalid shared
+writes under memcheck despite passing ordinary numerics. Keep the admission
+regression and run `test_two_cta_atomic_fallback` under compute-sanitizer on
+SM100 before widening that gate. SM107 swapped bulk uses a separate predicate
+and has its own native cases; passing those does not qualify normal 2-CTA bulk.
+The template barrier-parity detector permits the swapped bulk specialization's
+guard around the exact register-decrease prologue only. MMA operations and
+barrier calls, predicates and ordering still compare without that exception.
+
 Independent page tables need independent observed-span checks and Int64 stride
 slots in the prepared host. Test distinct K/V page values and layouts, then
 rebind allocations and mutate table values under capture replay. Preserve the
