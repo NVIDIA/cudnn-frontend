@@ -187,6 +187,15 @@ prefill; a short query alone does not imply the D128 decode template.
   `test_sdpa_native_pv_bf16_binding.py` compares actual host frames and checks
   BF16 V stride/product addresses beyond `2**32` against an independent oracle.
 
+- **Scope sync-debug to the tested launch inside the capture context.** Enter
+  `with torch.cuda.graph(...)` before enabling `set_sync_debug_mode("error")`,
+  and restore the previous mode in `finally` before leaving that context.
+  Torch capture setup can synchronize and some builds reject it under the guard
+  before the API under test runs. Keep the launch guarded and reset each graph
+  in cleanup; `test_native_d576_compact_thd_rebind_and_capture` exercises this
+  with rebinding, poisoned replay and empty inputs. A pass on a Torch build that
+  also accepts the old scope does not reproduce the CI-specific failure.
+
 - Mark with a level (`@pytest.mark.L0` ... `L4`): L0 must stay fast (default CI smoke); big parameter sweeps go to higher levels.
 - **Test tiers are lists, not markers in test files.** `conftest.py` marks cells `smoke` / `nightly_only` at collection from the committed node-id lists in `tiers/` (`smoke_<arch>.txt` per compute capability -- `CUDNN_TEST_TIER_ARCH=cc107` applies another arch's list on any host -- and `nightly_only.txt`); the rules a cell must satisfy, the kept twin of every demoted cell and the run lines are in `tiers/README.md`. CI keeps `-m L0`; the tiers are opt-in selections (`-m smoke`; `-m "L0 and not nightly_only"`). `test_tiers.py` asserts every listed id still collects and that the markers select exactly the listed cells -- when you rename or re-parametrize a listed test, edit the list in the same commit.
 - **Default L0 coverage is not sufficient if the CI target excludes the provider.** Check the actual CI path and `-k` filters. The general Python target excludes FROST cases, so representative shared-API FROST tests also need collection under `sdpa/frost/`; `test_sdpa_ordered_bindings.py` reuses the shared ordered-binding smoke logic. Verify both target collection and execution on a supported GPU.
