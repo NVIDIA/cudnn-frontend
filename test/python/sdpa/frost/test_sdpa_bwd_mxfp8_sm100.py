@@ -504,7 +504,11 @@ def test_causal_gqa_d192x128():
 
 @pytest.mark.L0
 def test_causal_empty_kv_tiles_d192x128():
-    _run(d=192, dv=128, b=4, hq=32, hkv=8, sq=256, skv=1024, causal=True)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _run(d=192, dv=128, b=4, hq=32, hkv=8, sq=256, skv=1024, causal=True, repeat_outputs=2)
+    stream.synchronize()
 
 
 @pytest.mark.L0
