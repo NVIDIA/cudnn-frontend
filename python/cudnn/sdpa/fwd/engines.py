@@ -81,6 +81,7 @@ from cudnn.sdpa.fwd.config_sm107 import (
     SM107_SMALL_D_CGAS,
     SM107_FP32_VECTOR_WITH_BIAS_TILE_N,
     SM107_TILE_NS_BY_D_SHAPE,
+    SM107_FP8_TILE_NS_BY_D_SHAPE,
     supports_native_d128_narrow_tile,
 )
 from cudnn.sdpa.fwd.config_sm120 import (
@@ -1035,6 +1036,10 @@ def effective_tile_ns(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
     ``tile_ns_by_d_shape`` entry for the selected flavor replaces it (the Rubin small tiles render 64 and 128, the
     native D128 rendering additionally admits explicit 64 on its double-score pipeline)."""
     selected = _selected_d_shape(capabilities, facts, knobs)
+    if capabilities.sm_lo == 107 and facts.is_fp8 and not facts.is_mxfp8:
+        # Explicit per-tensor widths do not inherit the half-precision resident-arm
+        # default picker. Keep the row's default128 while admitting the D64 option.
+        return dict(SM107_FP8_TILE_NS_BY_D_SHAPE).get(selected, capabilities.tile_ns)
     if capabilities.sm_lo == 107 and supports_native_d128_narrow_tile(
         selected,
         device_cc=facts.device_cc,

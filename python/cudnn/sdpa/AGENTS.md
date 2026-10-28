@@ -1362,3 +1362,10 @@ consistent; V's descriptor stride follows V, not Q/K. The host detector
 `MmaDesc`'s independently derived contraction/transpose geometry. Whole-backward
 native numerical and replay tests remain necessary; compilation alone misses
 these wrong-address walks.
+
+An explicit tile-domain extension must not silently enroll another dtype in
+a measured default picker. Rubin's `tile_ns_by_d_shape` also feeds the
+half-precision resident-arm selector; explicit-only per-tensor widths belong
+in `effective_tile_ns`, like the native D128 explicit narrow tile. The detector
+`test_fp8_d64_narrow_tile_keeps_graph_defaults` checks both A and FALLBACK at
+first-half tails as well as tile multiples, while admitting an explicit N64.
