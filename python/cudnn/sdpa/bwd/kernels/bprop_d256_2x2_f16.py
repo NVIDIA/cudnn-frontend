@@ -2109,12 +2109,35 @@ def _tmastg_warp(
             else:
                 tma_store_tile(sdS[ds_slot], tma_ds(q_col_base, ws_row + kv_block_base + KV_ROW_OFFSET_PEER, head_idx, batch_ws))
             tma_store_commit()
+            if cutlass.const_expr(CFG.FUSE_DK and _THD and CFG.XFER_STAGES >= 2):
+                # Keep the current store in flight while retiring the previous
+                # slot. Both TMA and dK must finish reading that slot before its
+                # compute producer receives a reuse credit.
+                if q_iter > q_lo:
+                    tma_store_wait(1)
+                    retired_slot = ds_mma_done_state.idx
+                    bars.mb_ds_mma_empty[retired_slot].wait(ds_mma_done_state.phase, spin=SPIN_RING_WAITS)
+                    ds_mma_done_state = advance(ds_mma_done_state, CFG.XFER_STAGES)
+                    if nvvm.elect_sync():
+                        bars.mb_ds_smem_empty[retired_slot].arrive()
+            else:
+                tma_store_wait(0)
+                if cutlass.const_expr(CFG.FUSE_DK):
+                    bars.mb_ds_mma_empty[ds_slot].wait(ds_mma_done_state.phase, spin=SPIN_RING_WAITS)
+                    ds_mma_done_state = advance(ds_mma_done_state, CFG.XFER_STAGES)
+                if nvvm.elect_sync():
+                    bars.mb_ds_smem_empty[ds_slot].arrive()
+
+        if cutlass.const_expr(CFG.FUSE_DK and _THD and CFG.XFER_STAGES >= 2):
+            # The pair-rounded q range always contains at least one tile,
+            # including dead THD units. Drain its last slot before moving to
+            # the next work item; ring indices continue across work items.
             tma_store_wait(0)
-            if cutlass.const_expr(CFG.FUSE_DK):
-                bars.mb_ds_mma_empty[ds_slot].wait(ds_mma_done_state.phase, spin=SPIN_RING_WAITS)
-                ds_mma_done_state = advance(ds_mma_done_state, CFG.XFER_STAGES)
+            retired_slot = ds_mma_done_state.idx
+            bars.mb_ds_mma_empty[retired_slot].wait(ds_mma_done_state.phase, spin=SPIN_RING_WAITS)
+            ds_mma_done_state = advance(ds_mma_done_state, CFG.XFER_STAGES)
             if nvvm.elect_sync():
-                bars.mb_ds_smem_empty[ds_slot].arrive()
+                bars.mb_ds_smem_empty[retired_slot].arrive()
 
         # dV uses independent output origins: full tensor or current chunk workspace.
         bars.mb_dv_stg_full.wait(dv_full_state.phase, spin=SPIN_RING_WAITS)
