@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, Optional
 
+from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan, ExecutionContext, PlanConfig
 
 if TYPE_CHECKING:
@@ -47,6 +48,8 @@ class _FrostNormPlan(CompiledPlan):
 
 class FrostNormFwdEngine(BaseEngine):
     """One shipped norm-forward engine spec, bound to its manifest id."""
+
+    behavior_notes = (behavior_note.RUNTIME_COMPILATION,)  # JIT-compiled at build_plans()
 
     def __init__(self, spec: "EngineSpec", engine_id: int):
         super().__init__()

@@ -18,6 +18,7 @@ contract around them.
 
 from typing import TYPE_CHECKING, List, Optional
 
+from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan, ExecutionContext, PlanConfig
 from cudnn.sdpa._plan import _FrostSdpaPlan, _check_workspace
 
@@ -53,6 +54,8 @@ class FrostSdpaBwdEngine(BaseEngine):
     spec's shipped name and ``engine_id`` is its fixed offset in the family's id
     block (see :func:`FrostSdpaBwdEngines`).
     """
+
+    behavior_notes = (behavior_note.RUNTIME_COMPILATION,)  # JIT-compiled at build_plans()
 
     def __init__(self, spec: "EngineSpec", engine_id: int):
         super().__init__()
