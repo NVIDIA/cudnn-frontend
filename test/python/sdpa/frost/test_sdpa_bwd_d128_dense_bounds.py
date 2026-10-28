@@ -133,7 +133,8 @@ def test_dense_window_accepts_safe_radius(d, window_left):
     facts, api = _declarations(d=d, window_left=window_left)
     assert _reason(facts) is None
     assert api.check_support()
-    assert api._implementation == "recompute"
+    accumulation = d == 64 and window_left + 1 + 128 + 256 <= 2**31 - 1
+    assert api._implementation == ("accumulation" if accumulation else "recompute")
 
 
 @pytest.mark.parametrize("window_left", [True, 1.5])

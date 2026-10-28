@@ -23,12 +23,12 @@ graph.execute(variant_pack, workspace)
 
 Plan construction selects the implementation from declarations and the build
 device. On SM100 or SM103 with public CuTeDSL 4.8 or newer and a positive attention
-scale and no deterministic request or sliding window, the D128 MHA three-kernel chain computes the row delta while initializing FP32 dQ
+scale and no deterministic request, the D64 and D128 MHA three-kernel chain (D128 without a sliding window, D64 with or without one) computes the row delta while initializing FP32 dQ
 scratch, accumulates dQ and writes dK/dV, then converts dQ to the output type.
 Sequence lengths need not be multiples of 128: the tail tiles' loads are zero-filled,
 their stores and dQ reductions are clipped, and the tail Stats rows contribute nothing.
 The output conversion applies no extra scale. Its scratch size is
-`4 * B * H * round_up(S_q, 128) * 129 + 240` bytes. The final 240 bytes cover internal
+`4 * B * H * round_up(S_q, 128) * (D + 1) + 240` bytes. The final 240 bytes cover internal
 alignment for any valid 16-byte-aligned caller workspace.
 
 Dense MHA with `use_deterministic_algorithm=True` selects the one-kernel recompute
@@ -36,8 +36,8 @@ implementation: a single CTA owns each gradient tile and reduces in a fixed orde
 without inter-CTA atomics. It requires zero workspace and supports both unmasked
 and top-left causal attention. The choice is made when the plan is built.
 
-D64 and sliding-window dense MHA use that same recompute implementation,
-whether or not determinism is requested. D64 uses native 64-wide operand/MMA tiles and gradient stores; score and dS
+A D128 left sliding window uses that same recompute implementation,
+whether or not determinism is requested. D64 uses native 64-wide operand/MMA tiles and gradient stores on either implementation; score and dS
 tiles retain their 128-column geometry. A left window bounds both Q and KV owners' reduction
 loops and masks boundary tiles; rows containing one legal key have zero score
 gradients and contribute no dQ/dK.
@@ -70,7 +70,7 @@ initializes its scratch each time, and performs no allocation, layout copy or
 device-to-host read. The plan supports CUDA-graph capture and replay. FP32 dQ
 atomic accumulation does not promise bitwise repeatability.
 
-The three-kernel implementation is selected for D128 without a window on SM100 and SM103 when determinism is not requested. Existing support
+The three-kernel implementation is selected for D64, and for D128 without a window, on SM100 and SM103 when determinism is not requested. Existing support
 on other pre-Rubin Blackwell devices retains the previous implementation.
 The engine remains opt-in while performance qualification proceeds.
 

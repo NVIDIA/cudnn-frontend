@@ -1,8 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Dense d128 accumulation geometry. Offsets are bytes from one aligned slab."""
+"""Dense d64 / d128 accumulation geometry."""
 
 from dataclasses import dataclass
+
+HEAD_DIMS = (64, 128)
+_SLICE_BYTES = 16384
+_BAR_BYTES = 400
+_SCHED_BYTES = 64
 
 
 @dataclass(frozen=True)
@@ -49,86 +54,144 @@ class Config:
     DK_COL: int = 384  # TMEM column of the dK accumulator plane (the bodies' `tmem_base + 384`)
     DKV_ACC_SLICES: int = 4  # fp32 [M x DQ_BOX] reduce-add slices per [M x D] tile = D // DQ_BOX = the dQ ring's slot count
     DKV_ACC_SLICE_BYTES: int = 16384  # M x DQ_BOX x BPE_ACC = SLICE_BYTES: the four slices fill the 64 KiB ALIAS slab exactly
+    ALIAS_SLICES: int = 4
+    DQ_SLICES: int = 4
+    DO_SUBTILES: int = 2
 
     def dkv_acc_slot(self, index):
         """Byte base of fp32 staging slice ``index`` of a dV / dK round: the dQ fp32 image's slice ``index`` over the ALIAS slab."""
         return self.ALIAS + index * self.DKV_ACC_SLICE_BYTES
 
 
-CFG = Config()
-
-# name, byte offset, active slots, init count, producer kind.
-# Unused declaration padding remains: dq_done[1:3], dp_empty[1], ds_smem[1].
-BAR_LAYOUT = (
-    ("k_empty", 230400, 1, 1, "mma"),
-    ("k_full", 230416, 1, 1, "tma"),
-    ("v_empty", 230432, 1, 1, "mma"),
-    ("v_full", 230448, 1, 1, "tma"),
-    ("do_empty", 230464, 1, 1, "mma"),
-    ("do_full", 230480, 2, 1, "tma"),
-    ("q_empty", 230496, 2, 1, "mma"),
-    ("q_full", 230512, 2, 1, "tma"),
-    ("s_done", 230528, 1, 1, "mma"),
-    ("dp_done", 230544, 1, 1, "mma"),
-    ("dq_done", 230560, 1, 1, "mma"),
-    ("dp_empty", 230592, 1, 128, "thread"),
-    ("p_ready", 230608, 1, 256, "thread"),
-    ("ds_ready", 230624, 1, 256, "thread"),
-    ("ds_smem", 230640, 1, 128, "thread"),
-    ("dq_empty", 230656, 4, 32, "thread"),
-    ("dq_full", 230688, 4, 128, "thread"),
-    ("dv_full", 230720, 1, 128, "thread"),
-    ("dk_full", 230736, 1, 128, "thread"),
-    ("dvk_empty", 230752, 1, 32, "thread"),
-    ("sched_full", 230768, 2, 1, "tma"),
-    ("sched_empty", 230784, 2, 15, "thread"),
-)
-
-
-def validate_config():
-    """Fixed source geometry, lane counts and disjoint slab regions; CPU only."""
-    assert (CFG.M, CFG.N, CFG.D, CFG.K_HW, CFG.BPE) == (128, 128, 128, 16, 2)
-    assert (CFG.THREADS, CFG.TMEM_COLS, CFG.Q_STAGES, CFG.SCHED_STAGES) == (512, 512, 2, 2)
-    assert (CFG.DESC_VERSION, CFG.SWIZZLE_BYTES, CFG.SWIZZLE_LAYOUT) == (1, 128, 2)
-    assert (CFG.HEAD_BOX, CFG.DQ_BOX, CFG.OPERAND_BYTES, CFG.SLICE_BYTES) == (64, 32, 32768, 16384)
-    assert (CFG.SOFTMAX_LANES, CFG.EPILOGUE_LANES, CFG.STORE_LANES, CFG.ONE_LANE, CFG.SCHED_CONSUMER_WARPS) == (256, 128, 32, 1, 15)
-    assert (CFG.SOFTMAX_REGS, CFG.EPILOGUE_REGS, CFG.SERVICE_REGS) == (144, 144, 80)
-    assert (CFG.SOFTMAX_LANES * CFG.SOFTMAX_REGS + CFG.EPILOGUE_LANES * CFG.EPILOGUE_REGS + 4 * 32 * CFG.SERVICE_REGS) == 65536
-    assert CFG.SOFTMAX_BARRIER == 1  # CTA synchronization reserves barrier0.
-    regions = (
-        (CFG.Q, 2 * CFG.OPERAND_BYTES),
-        (CFG.DO, CFG.OPERAND_BYTES),
-        (CFG.K, CFG.OPERAND_BYTES),
-        (CFG.V, CFG.OPERAND_BYTES),
-        (CFG.ALIAS, 2 * CFG.OPERAND_BYTES),
-        (CFG.STATS, 512),
-        (CFG.DELTA, 512),
+def make_config(d: int) -> Config:
+    """The slab geometry of the accumulation kernel at head dimension ``d``."""
+    if d not in HEAD_DIMS:
+        raise ValueError(f"accumulation head dimension must be one of {HEAD_DIMS}; got {d}")
+    operand = 128 * d * 2
+    dq_slices = d // 32
+    alias_slices = max(2, dq_slices, 2 * operand // _SLICE_BYTES)
+    q = 0
+    do = q + 2 * operand
+    k = do + operand
+    v = k + operand
+    alias = v + operand
+    stats = alias + alias_slices * _SLICE_BYTES
+    delta = stats + 512
+    bars = delta + 512
+    tmem_handle = bars + _BAR_BYTES
+    sched = tmem_handle + 16
+    smem = (sched + _SCHED_BYTES + 1023) // 1024 * 1024
+    return Config(
+        D=d,
+        HEAD_BOX=64,
+        SMEM_BYTES=smem,
+        Q=q,
+        DO=do,
+        K=k,
+        V=v,
+        ALIAS=alias,
+        STATS=stats,
+        DELTA=delta,
+        TMEM_HANDLE=tmem_handle,
+        SCHED_PAYLOAD=sched,
+        OPERAND_BYTES=operand,
+        ALIAS_SLICES=alias_slices,
+        DQ_SLICES=dq_slices,
+        DO_SUBTILES=d // 64,
+        D_HALF=d // 2,
+        DV_COL=512 - 2 * d,
+        DK_COL=512 - d,
+        DKV_ACC_SLICES=d // 32,
     )
-    assert tuple(start for start, _ in regions) == (0, 65536, 98304, 131072, 163840, 229376, 229888)
+
+
+def make_bar_layout(cfg: Config):
+    """name, byte offset, active slots, init count, producer kind."""
+    base = cfg.DELTA + 512
+    return (
+        ("k_empty", base + 0, 1, 1, "mma"),
+        ("k_full", base + 16, 1, 1, "tma"),
+        ("v_empty", base + 32, 1, 1, "mma"),
+        ("v_full", base + 48, 1, 1, "tma"),
+        ("do_empty", base + 64, 1, 1, "mma"),
+        ("do_full", base + 80, 2, 1, "tma"),
+        ("q_empty", base + 96, 2, 1, "mma"),
+        ("q_full", base + 112, 2, 1, "tma"),
+        ("s_done", base + 128, 1, 1, "mma"),
+        ("dp_done", base + 144, 1, 1, "mma"),
+        ("dq_done", base + 160, 1, 1, "mma"),
+        ("dp_empty", base + 192, 1, 128, "thread"),
+        ("p_ready", base + 208, 1, 256, "thread"),
+        ("ds_ready", base + 224, 1, 256, "thread"),
+        ("ds_smem", base + 240, 1, 128, "thread"),
+        ("dq_empty", base + 256, 4, 32, "thread"),
+        ("dq_full", base + 288, 4, 128, "thread"),
+        ("dv_full", base + 320, 1, 128, "thread"),
+        ("dk_full", base + 336, 1, 128, "thread"),
+        ("dvk_empty", base + 352, 1, 32, "thread"),
+        ("sched_full", base + 368, 2, 1, "tma"),
+        ("sched_empty", base + 384, 2, 15, "thread"),
+    )
+
+
+CFG = make_config(128)
+BAR_LAYOUT = make_bar_layout(CFG)
+
+
+def validate_config(cfg: Config = CFG, bar_layout=None):
+    """Fixed source geometry, lane counts and disjoint slab regions; CPU only."""
+    bar_layout = make_bar_layout(cfg) if bar_layout is None else bar_layout
+    assert (cfg.M, cfg.N, cfg.K_HW, cfg.BPE) == (128, 128, 16, 2) and cfg.D in HEAD_DIMS
+    assert (cfg.THREADS, cfg.TMEM_COLS, cfg.Q_STAGES, cfg.SCHED_STAGES) == (512, 512, 2, 2)
+    assert (cfg.DESC_VERSION, cfg.SWIZZLE_BYTES, cfg.SWIZZLE_LAYOUT) == (1, 128, 2)
+    assert (cfg.HEAD_BOX, cfg.DQ_BOX, cfg.SLICE_BYTES) == (64, 32, 16384)
+    assert cfg.OPERAND_BYTES == cfg.M * cfg.D * cfg.BPE and cfg.SLICE_BYTES == cfg.M * cfg.DQ_BOX * 4
+    assert cfg.DQ_SLICES == cfg.D // 32 and cfg.DO_SUBTILES == cfg.D // cfg.HEAD_BOX
+    assert cfg.ALIAS_SLICES >= max(2, cfg.DQ_SLICES) and cfg.ALIAS_SLICES * cfg.SLICE_BYTES >= 2 * cfg.OPERAND_BYTES
+    assert (cfg.SOFTMAX_LANES, cfg.EPILOGUE_LANES, cfg.STORE_LANES, cfg.ONE_LANE, cfg.SCHED_CONSUMER_WARPS) == (256, 128, 32, 1, 15)
+    assert (cfg.SOFTMAX_REGS, cfg.EPILOGUE_REGS, cfg.SERVICE_REGS) == (144, 144, 80)
+    assert (cfg.SOFTMAX_LANES * cfg.SOFTMAX_REGS + cfg.EPILOGUE_LANES * cfg.EPILOGUE_REGS + 4 * 32 * cfg.SERVICE_REGS) == 65536
+    assert cfg.SOFTMAX_BARRIER == 1
+    assert 256 + 2 * cfg.D <= cfg.TMEM_COLS
+    regions = (
+        (cfg.Q, 2 * cfg.OPERAND_BYTES),
+        (cfg.DO, cfg.OPERAND_BYTES),
+        (cfg.K, cfg.OPERAND_BYTES),
+        (cfg.V, cfg.OPERAND_BYTES),
+        (cfg.ALIAS, cfg.ALIAS_SLICES * cfg.SLICE_BYTES),
+        (cfg.STATS, 512),
+        (cfg.DELTA, 512),
+    )
+    if cfg.D == 128:
+        assert tuple(start for start, _ in regions) == (0, 65536, 98304, 131072, 163840, 229376, 229888)
+        assert (cfg.TMEM_HANDLE, cfg.SCHED_PAYLOAD, cfg.SMEM_BYTES) == (230800, 230816, 231424)
     assert all(start + size == regions[i + 1][0] for i, (start, size) in enumerate(regions[:-1]))
-    assert regions[-1][0] + regions[-1][1] == 230400
+    bars = regions[-1][0] + regions[-1][1]
     thread_counts = dict(dp_empty=128, p_ready=256, ds_ready=256, ds_smem=128, dq_empty=32, dq_full=128, dv_full=128, dk_full=128, dvk_empty=32, sched_empty=15)
-    assert len(BAR_LAYOUT) == 22 and sum(item[2] for item in BAR_LAYOUT) == 33
+    assert len(bar_layout) == 22 and sum(item[2] for item in bar_layout) == 33
     addresses = set()
-    for name, offset, stages, count, kind in BAR_LAYOUT:
+    for name, offset, stages, count, kind in bar_layout:
         assert stages in (1, 2, 4) and offset % 8 == 0
-        assert count == (thread_counts[name] if kind == "thread" else CFG.ONE_LANE)
+        assert count == (thread_counts[name] if kind == "thread" else cfg.ONE_LANE)
         assert kind in ("thread", "mma", "tma")
         for i in range(stages):
             address = offset + i * 8
-            assert 230400 <= address < CFG.TMEM_HANDLE and address not in addresses
+            assert bars <= address < cfg.TMEM_HANDLE and address not in addresses
             addresses.add(address)
-    assert (CFG.TMEM_HANDLE, CFG.SCHED_PAYLOAD, CFG.SMEM_BYTES) == (230800, 230816, 231424)
-    assert CFG.TMEM_HANDLE + 4 <= CFG.SCHED_PAYLOAD
-    assert CFG.SCHED_PAYLOAD + 64 == 230880
-    assert (230880 + 1023) // 1024 * 1024 == CFG.SMEM_BYTES
+    assert cfg.TMEM_HANDLE == bars + _BAR_BYTES and cfg.TMEM_HANDLE + 4 <= cfg.SCHED_PAYLOAD
+    assert cfg.SCHED_PAYLOAD + _SCHED_BYTES <= cfg.SMEM_BYTES <= 227 * 1024
+    assert (cfg.SCHED_PAYLOAD + _SCHED_BYTES + 1023) // 1024 * 1024 == cfg.SMEM_BYTES
     # dkv_accum = fp32_reduce (fp32_reduce): the fp32 dV / dK staging = the dQ fp32 image's four [M x DQ_BOX] SW128 slices over the ALIAS slab (one fp32
     # [M x D] tile per round; dV then dK), one dq_empty ring slot per slice (the dK round's WAR waits), the TMEM planes the staging reads.
-    assert (CFG.BPE_ACC, CFG.D_HALF, CFG.DKV_ACC_SLICES, CFG.DKV_ACC_SLICE_BYTES) == (4, CFG.D // 2, CFG.D // CFG.DQ_BOX, CFG.M * CFG.DQ_BOX * CFG.BPE_ACC)
-    assert CFG.DKV_ACC_SLICE_BYTES == CFG.SLICE_BYTES and CFG.DKV_ACC_SLICES * CFG.DKV_ACC_SLICE_BYTES == 2 * CFG.OPERAND_BYTES == CFG.M * CFG.D * CFG.BPE_ACC
-    assert [CFG.dkv_acc_slot(i) for i in range(CFG.DKV_ACC_SLICES)] == [CFG.ALIAS + i * CFG.SLICE_BYTES for i in range(CFG.DKV_ACC_SLICES)]
-    assert CFG.DKV_ACC_SLICES == next(item[2] for item in BAR_LAYOUT if item[0] == "dq_empty")  # one ring slot per slice
-    assert (CFG.DV_COL, CFG.DK_COL) == (256, 384) and CFG.DV_COL + CFG.D == CFG.DK_COL and CFG.DK_COL + CFG.D == CFG.TMEM_COLS and CFG.D_HALF * 2 == CFG.D
+    assert (cfg.BPE_ACC, cfg.D_HALF, cfg.DKV_ACC_SLICES, cfg.DKV_ACC_SLICE_BYTES) == (4, cfg.D // 2, cfg.D // cfg.DQ_BOX, cfg.M * cfg.DQ_BOX * cfg.BPE_ACC)
+    assert cfg.DKV_ACC_SLICE_BYTES == cfg.SLICE_BYTES and cfg.DKV_ACC_SLICES * cfg.DKV_ACC_SLICE_BYTES == 2 * cfg.OPERAND_BYTES == cfg.M * cfg.D * cfg.BPE_ACC
+    assert [cfg.dkv_acc_slot(i) for i in range(cfg.DKV_ACC_SLICES)] == [cfg.ALIAS + i * cfg.SLICE_BYTES for i in range(cfg.DKV_ACC_SLICES)]
+    assert cfg.DV_COL + cfg.D == cfg.DK_COL and cfg.DK_COL + cfg.D == cfg.TMEM_COLS and cfg.D_HALF * 2 == cfg.D
+    if cfg.D == 128:
+        assert cfg.SCHED_PAYLOAD + 64 == 230880 and (230880 + 1023) // 1024 * 1024 == cfg.SMEM_BYTES
+        assert cfg.DKV_ACC_SLICES == next(item[2] for item in bar_layout if item[0] == "dq_empty")  # one ring slot per slice
+        assert (cfg.DV_COL, cfg.DK_COL) == (256, 384)
 
 
-validate_config()
+for _d in HEAD_DIMS:
+    validate_config(make_config(_d))

@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""SM100 (Blackwell) d=256 block-scale MXFP8 backward adapter: SF repack -> dQ -> fused dK/dV.
+"""SM100 (Blackwell) d=128 / d=256 block-scale MXFP8 backward adapter: SF repack -> dQ -> fused dK/dV.
 
 Two CuTe DSL kernels ported from Xinbo Zhao's ``fmha_mxfp8_large_head_dim``
 each a 2-CTA warp-specialized
@@ -49,6 +49,8 @@ from cudnn.sdpa.bwd.api_dsl import SdpaBwdDsl
 from cudnn.sdpa.fwd.api_dsl import ws_align
 
 _HEAD_DIM = 256
+_HEAD_PAIRS = ((64, 64), (128, 128), (192, 128), (256, 256))
+_PAIR_ROUTE = _HEAD_PAIRS[:3]
 _SF_BLOCK = 32
 _ROLES = ("q", "k", "v", "o", "do", "stats", "dq", "dk", "dv", "q_T", "k_T", "do_T", "do_f16", "sf_q", "sf_q_T", "sf_k", "sf_k_T", "sf_v", "sf_do", "sf_do_T")
 _ATTRIBUTES = (
@@ -80,7 +82,7 @@ def _cdiv(a: int, b: int) -> int:
 
 
 class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
-    """d=256 block-scale MXFP8 backward on Blackwell (see the module docstring)."""
+    """d=128 / d=256 block-scale MXFP8 backward on Blackwell (see the module docstring)."""
 
     def __init__(
         self,
@@ -165,7 +167,8 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
     def _sf_expected_bytes(self, graph_sf: str) -> int:
         """Byte count of a graph SF tensor under cuDNN's F8_128x4 padding rules
         (rows to 128, block columns to 4)."""
-        b, hq, hk, sq, sk, d = self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, self.head_dim_qk
+        b, hq, hk, sq, sk = self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max
+        d = self.head_dim_v if graph_sf in ("sf_v", "sf_do", "sf_do_T") else self.head_dim_qk
         d_sc_pad = _cdiv(_cdiv(d, _SF_BLOCK), 4) * 4
         d_pad = _cdiv(d, 128) * 128
         if graph_sf in ("sf_q", "sf_do"):
@@ -205,8 +208,10 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         Reaching a raise here means the row lied -- these are backstops, not
         the gate. ValueError, never assert.
         """
-        d = self.head_dim_qk
-        self._value_error_if(d != _HEAD_DIM or self.head_dim_v != _HEAD_DIM, f"SM100 MXFP8 bwd: d_qk and d_v must both be 256; got {d} / {self.head_dim_v}")
+        self._value_error_if(
+            (self.head_dim_qk, self.head_dim_v) not in _HEAD_PAIRS,
+            f"SM100 MXFP8 bwd: (d_qk, d_v) must be one of {_HEAD_PAIRS}; got ({self.head_dim_qk}, {self.head_dim_v})",
+        )
         self._value_error_if(self.h_kv < 1 or self.h_q % self.h_kv != 0, f"SM100 MXFP8 bwd: h_q ({self.h_q}) must be a multiple of h_kv ({self.h_kv})")
         self._value_error_if(self.dtype != torch.float8_e4m3fn, f"SM100 MXFP8 bwd: the kernels consume E4M3 payloads only; got {self.dtype}")
         for desc in (self.k_desc, self.v_desc, self.do_desc, self.q_T_desc, self.k_T_desc, self.do_T_desc):
@@ -251,7 +256,10 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
             want = self._sf_expected_bytes(name)
             self._value_error_if(have != want, f"SM100 MXFP8 bwd: {name} has {have} bytes; the F8_128x4 layout for this shape needs {want}")
         self._value_error_if(self.seq_kv_lens_present or self.seq_q_lens_present, "SM100 MXFP8 bwd: padding masks (seq lens) are not implemented")
-        self._value_error_if(self.window_size_left is not None, "SM100 MXFP8 bwd: sliding window is not implemented")
+        self._value_error_if(
+            self.window_size_left is not None and not self._pair_route(), f"SM100 MXFP8 bwd: sliding window is served at (d_qk, d_v) in {_PAIR_ROUTE} only"
+        )
+        self._value_error_if(self.window_size_left is not None and not self.is_causal, "SM100 MXFP8 bwd: a sliding window requires the causal mask")
         self._value_error_if(self.causal_bottom_right, "SM100 MXFP8 bwd: bottom-right causal is not implemented")
         self._value_error_if(self.is_causal and (self.window_size_right or 0) != 0, "SM100 MXFP8 bwd: causal right-band widening is not implemented")
         self._value_error_if(self.tile_m not in (None, 128) or self.tile_n not in (None, 128), "SM100 MXFP8 bwd: tiles are fixed at 128x128")
@@ -265,13 +273,23 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
 
         return int(get_workspace_size(self.s_q_max, self.head_dim_qk, self.h_q, self.batch_size, cutlass.Float32))
 
+    def _pair_route(self) -> bool:
+        return (self.head_dim_qk, self.head_dim_v) in _PAIR_ROUTE
+
+    def _window(self) -> int:
+        return 0 if self.window_size_left is None else int(self.window_size_left) + 1
+
     def scratch_workspace_bytes(self) -> int:
         """Kernel scratch (rowsum(O*dO) + scaled LSE + the dQ fp32 slot the
         kernels size but do not use) plus the eleven repacked scale-factor
         buffers. A pure function of the plan geometry; all of it is carved
-        from the caller's buffer at execute."""
+        from the caller's buffer at execute. The kernel pair needs the delta rows only."""
         from cudnn.sdpa.bwd.kernels.sm100.bprop_sf_repack_mxfp8 import repack_geometry
 
+        if self._pair_route():
+            from cudnn.sdpa.bwd.kernels.sm100.prepared_d192_fp8_host import workspace_layout
+
+            return workspace_layout(self.batch_size, self.h_q, self.s_q_max)[1]
         total = ws_align(self._kernel_workspace_bytes())
         for _name, _src, rows, kg, l, layout, _pm in self._sf_plan():
             total += ws_align(repack_geometry(rows, kg, l, layout)[3])
@@ -305,11 +323,89 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
             return masks.MaskEnum.WINDOW_MASK, masks.MaskEnum.WINDOW_MASK_BWD
         return masks.MaskEnum.RESIDUAL_MASK, masks.MaskEnum.RESIDUAL_MASK_BWD
 
+    def _pair_geoms(self):
+        geometry = []
+        for role in _ROLES[:9]:
+            desc = getattr(self, role + "_desc")
+            if role == "stats":
+                b, h, s, _ = (int(x) for x in desc.shape)
+                shape, strides, compact = (b, h, s), tuple(int(x) for x in desc.stride[:3]), (h * s, s, 1)
+            else:
+                b, h, s, d = (int(x) for x in desc.shape)
+                sb, sh, ss, sd = (int(x) for x in desc.stride)
+                shape, strides, compact = (b, s, h, d), (sb, ss, sh, sd), (s * h * d, h * d, d, 1)
+            geometry.append((shape, tuple(want if n == 1 else st for n, st, want in zip(shape, strides, compact))))
+        return tuple(geometry)
+
+    def _operands(self):
+        from .prepared import Operand
+
+        operands = []
+        for role in _ROLES:
+            if role.startswith("sf_"):
+                count = self._sf_expected_bytes(role)
+                op = Operand("int8", (count,), (1,), count, 16, 1, opaque_bytes=True)
+            else:
+                desc = getattr(self, role + "_desc")
+                shape, strides = tuple(desc.shape), tuple(desc.stride)
+                span = 1 + sum((int(n) - 1) * int(st) for n, st in zip(shape, strides))
+                op = Operand(str(desc.dtype).split(".")[-1], shape, strides, span, 16, desc.dtype.itemsize)
+            operands.append(op)
+        return tuple(operands)
+
+    def _compile_pair(self):
+        import cutlass
+        from types import SimpleNamespace
+
+        from cudnn.frost.compiled_cache import positional_entry
+        from cudnn.frost.device import compute_capability, resolve_device
+
+        from .kernels.sm100.prepared_d192_fp8_host import compile_host_mx, sf_geometry, sf_geometry_t, workspace_layout
+        from .prepared import BwdLaunchSpec
+
+        out_dt = cutlass.BFloat16 if self.out_dtype == torch.bfloat16 else cutlass.Float16
+        b, hq, hk, sq, sk = self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max
+        d, dv = self.head_dim_qk, self.head_dim_v
+        sf_geoms = (
+            sf_geometry(b, hq, sq, d),
+            sf_geometry_t(b, hq, sq, d),
+            sf_geometry(b, hk, sk, d),
+            sf_geometry_t(b, hk, sk, d),
+            sf_geometry(b, hk, sk, dv),
+            sf_geometry(b, hq, sq, dv),
+            sf_geometry_t(b, hq, sq, dv),
+        )
+        regions, total = workspace_layout(b, hq, sq)
+        major, minor = compute_capability(resolve_device(self.q_desc.device))
+        with torch.cuda.device(resolve_device(self.q_desc.device)):
+            entry = compile_host_mx(self._pair_geoms(), sf_geoms, regions, out_dt, self.is_causal, major * 10 + minor, self._gqa_group, d, dv, self._window())
+        owner = SimpleNamespace(entry=entry, workspace_bytes=total)
+        fn = positional_entry(entry)
+        if fn is None:
+            raise NotImplementedError("SM100 MXFP8 backward requires a positional tvm-ffi entry")
+        self._prepared = BwdLaunchSpec(
+            owner,
+            fn,
+            self._operands(),
+            total,
+            int(self.q_desc.device.index or 0),
+            self.scale_softmax,
+            name="sdpa_bwd_sm100_mxfp8",
+            roles=_ROLES,
+            attributes=_ATTRIBUTES,
+            scale_log2=False,
+            native_binding=False,
+        )
+        self._compiled = owner
+        return owner
+
     def compile(self) -> None:
         """Prepare one pointer host for all SF repacks, dQ and fused dK/dV."""
         self._ensure_support_checked()
         if self._compiled is not None:
             return self._compiled
+        if self._pair_route():
+            return self._compile_pair()
         import cutlass
         from types import SimpleNamespace
 
