@@ -3,6 +3,7 @@
 """One pointer entry for dense per-tensor FP8 delta, dK / dV and dQ launches at D_QK in {128, 192}, D_V = 128."""
 
 import pathlib
+import threading
 
 from typing import Optional
 
@@ -14,13 +15,47 @@ from cudnn.frost.compiled_cache import compile_cached
 from cudnn.frost.template_loader import load_template
 
 from cudnn.sdpa.bwd.d128_contract import ABI_VERSION, WORKSPACE_SLACK
-from cudnn.sdpa.bwd.kernels.sm100.bprop_d192_dkdv_fp8 import host as dkdv_host
-from cudnn.sdpa.bwd.kernels.sm100.bprop_d192_dq_fp8 import host as dq_host
 from cudnn.sdpa.bwd.kernels.bprop_chain_common import dot_do_o_host
 from cudnn.sdpa.bwd.kernels.sm100.bprop_d192_fp8_helpers import delta_d192_fp8_host as delta_host
 
-HEAD_DIMS = globals().get("FROST_TEMPLATE_PARAMS", (192, 128))
 EXP2_FMA_SPLIT_SMS = frozenset((100,))
+SPEC = globals().get("FROST_TEMPLATE_PARAMS")
+HEAD_DIMS = (192, 128) if SPEC is None else (int(SPEC[0]), int(SPEC[1]))
+
+
+def _spec(dqk, dv, sm, mx, window):
+    """(D_QK, D_V, exp2 FMA split, block-scale mode, window): the kernel pair a prepared host is bound to."""
+    return (int(dqk), int(dv), int(sm) in EXP2_FMA_SPLIT_SMS, bool(mx), int(window))
+
+
+def _kernel_hosts(spec):
+    here = pathlib.Path(__file__).resolve()
+    tag = f"sdpa_bwd_d{spec[0]}x{spec[1]}_{'mxfp8' if spec[3] else 'fp8'}{'_fma' if spec[2] else ''}_w{spec[4]}"
+    dkdv = load_template(str(here.with_name("bprop_d192_dkdv_fp8.py")), spec, tag=f"{tag}_dkdv").host
+    dq = load_template(str(here.with_name("bprop_d192_dq_fp8.py")), spec, tag=f"{tag}_dq").host
+    return dkdv, dq
+
+
+def _specialized(spec):
+    """The prepared-host module bound to ``spec``; its kernel bindings never change after import."""
+    return load_template(__file__, spec, tag=f"sdpa_bwd_d{spec[0]}x{spec[1]}_{'mxfp8' if spec[3] else 'fp8'}_host")
+
+
+if SPEC is None:
+    from cudnn.sdpa.bwd.kernels.sm100.bprop_d192_dkdv_fp8 import host as dkdv_host
+    from cudnn.sdpa.bwd.kernels.sm100.bprop_d192_dq_fp8 import host as dq_host
+else:
+    dkdv_host = dq_host = None
+_BIND_LOCK = threading.Lock()
+
+
+def _bind():
+    """Bind this module's kernel pair on the first compile; the pair is fixed by ``SPEC`` and never changes."""
+    global dkdv_host, dq_host
+    with _BIND_LOCK:
+        if dkdv_host is None:
+            dkdv_host, dq_host = _kernel_hosts(tuple(SPEC))
+
 
 FP8_SCALARS = (
     "descale_q",
@@ -195,19 +230,11 @@ def host(
 
 def compile_host(geometry, regions, grad_dtype, causal, sm, amax_requested, dqk=192, dv=128, ratio=1):
     """Compile from declarations only; addresses and scale remain runtime slots."""
-    global dkdv_host, dq_host
-    head_dims = (int(dqk), int(dv))
-    if head_dims != tuple(HEAD_DIMS):
-        return load_template(__file__, head_dims, tag=f"sdpa_bwd_d{dqk}x{dv}_fp8_host").compile_host(
-            geometry, regions, grad_dtype, causal, sm, amax_requested, dqk, dv, ratio
-        )
-    exp2_fma_split = int(sm) in EXP2_FMA_SPLIT_SMS
-    if head_dims != (192, 128) or exp2_fma_split:
-        here = pathlib.Path(__file__).resolve()
-        params = (*head_dims, exp2_fma_split)
-        tag = f"sdpa_bwd_d{dqk}x{dv}_fp8{'_fma' if exp2_fma_split else ''}"
-        dkdv_host = load_template(str(here.with_name("bprop_d192_dkdv_fp8.py")), params, tag=f"{tag}_dkdv").host
-        dq_host = load_template(str(here.with_name("bprop_d192_dq_fp8.py")), params, tag=f"{tag}_dq").host
+    spec = _spec(dqk, dv, sm, False, 0)
+    if spec != SPEC:
+        return _specialized(spec).compile_host(geometry, regions, grad_dtype, causal, sm, amax_requested, dqk, dv, ratio)
+    _bind()
+    head_dims = spec[:2]
     types = [cutlass.Float8E4M3FN] * 5 + [cutlass.Float32] + [grad_dtype] * 3
     args = [cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=4 if i == 5 else 16) for i, t in enumerate(types)]
     args += [cute.runtime.make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4) for _ in FP8_SCALARS]
@@ -343,17 +370,11 @@ def host_mx(
 
 def compile_host_mx(geometry, sf_geoms, regions, out_dtype, causal, sm, ratio=1, dqk=128, dv=128, window=0):
     """Compile the block-scale chain from declarations only; the kernel templates run in block-scale mode with a left sliding window of ``window`` keys (0 = none)."""
-    global dkdv_host, dq_host
-    head_dims = (int(dqk), int(dv))
-    if head_dims != tuple(HEAD_DIMS):
-        return load_template(__file__, head_dims, tag=f"sdpa_bwd_d{dqk}x{dv}_mxfp8_host").compile_host_mx(
-            geometry, sf_geoms, regions, out_dtype, causal, sm, ratio, dqk, dv, window
-        )
-    here = pathlib.Path(__file__).resolve()
-    params = (*head_dims, int(sm) in EXP2_FMA_SPLIT_SMS, True, int(window))
-    tag = f"sdpa_bwd_d{dqk}x{dv}_mxfp8_w{int(window)}"
-    dkdv_host = load_template(str(here.with_name("bprop_d192_dkdv_fp8.py")), params, tag=f"{tag}_dkdv").host
-    dq_host = load_template(str(here.with_name("bprop_d192_dq_fp8.py")), params, tag=f"{tag}_dq").host
+    spec = _spec(dqk, dv, sm, True, window)
+    if spec != SPEC:
+        return _specialized(spec).compile_host_mx(geometry, sf_geoms, regions, out_dtype, causal, sm, ratio, dqk, dv, window)
+    _bind()
+    head_dims = spec[:2]
     fp8 = cutlass.Float8E4M3FN
     types = (fp8, fp8, fp8, out_dtype, fp8, cutlass.Float32, out_dtype, out_dtype, out_dtype, fp8, fp8, fp8, out_dtype) + (cutlass.Int8,) * 7
     args = [cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=4 if i == 5 else 16) for i, t in enumerate(types)]

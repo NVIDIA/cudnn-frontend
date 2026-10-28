@@ -129,6 +129,37 @@ def test_repeated_launches_are_bitwise(sm100_row):
             assert torch.equal(value, later[name]), name
 
 
+def test_pair_host_binds_one_kernel_pair_per_specialization(monkeypatch):
+    import cutlass
+
+    from cudnn.sdpa.bwd.kernels.sm100 import prepared_d192_fp8_host as pair
+
+    compiled = []
+
+    def record(host, *args, **kwargs):
+        compiled.append(host)
+        return object()
+
+    mx_w0, mx_w128 = (128, 128, False, True, 0), (128, 128, False, True, 128)
+    fp8_sm103, fp8_sm100, mx_192 = (192, 128, False, False, 0), (192, 128, True, False, 0), (192, 128, False, True, 0)
+    modules = {spec: pair._specialized(spec) for spec in (mx_w0, mx_w128, fp8_sm103, fp8_sm100, mx_192)}
+    for module in modules.values():
+        monkeypatch.setattr(module, "compile_cached", record)
+    out = cutlass.BFloat16
+    pair.compile_host_mx((), (), (), out, True, 103, 1, 128, 128, 0)
+    pair.compile_host_mx((), (), (), out, True, 103, 1, 128, 128, 128)
+    pair.compile_host_mx((), (), (), out, True, 103, 1, 128, 128, 0)
+    pair.compile_host_mx((), (), (), out, True, 103, 1, 192, 128, 0)
+    pair.compile_host((), (), out, True, 103, (False,) * 4, 192, 128, 1)
+    pair.compile_host((), (), out, True, 100, (False,) * 4, 192, 128, 1)
+    assert len(compiled) == 6
+    for spec, module in modules.items():
+        assert module.SPEC == spec and (module.dkdv_host, module.dq_host) == pair._kernel_hosts(spec)
+    assert modules[mx_w0].dq_host is not modules[mx_w128].dq_host
+    assert modules[fp8_sm103].dkdv_host is not modules[mx_192].dkdv_host
+    assert modules[fp8_sm103].dkdv_host is not modules[fp8_sm100].dkdv_host
+
+
 @requires_pre_rubin_blackwell
 def test_causal_empty_kv_tiles(sm100_row):
     sm100_row._run_fp8(b=4, hq=32, sq=256, skv=1024, causal=True, d_v=_DV).check()

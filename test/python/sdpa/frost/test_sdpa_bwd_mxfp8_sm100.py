@@ -492,6 +492,12 @@ def test_window_pair(d, window):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d,dv", [(64, 64), (128, 128), (192, 128)])
+def test_window_last_query_row_keeps_one_key(d, dv):
+    _run(d=d, dv=dv, hq=2, hkv=2, sq=255, skv=128, causal=True, left_bound=128)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("out", list(_OUT), ids=list(_OUT))
 def test_dense_d192x128(out):
     _run(d=192, dv=128, out_dt=_OUT[out])
@@ -629,6 +635,14 @@ def test_reject_right_band_widening():
 def test_reject_sliding_window():
     """The two-CTA d=256 chain has no window arm."""
     assert _decline_reason(use_causal_mask=True, left_bound=64) is not None
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d,dv", [(64, 64), (128, 128), (192, 128)])
+def test_reject_window_with_keyless_query_rows(d, dv):
+    reason = _decline_reason(d=d, dv=dv, sq=512, skv=128, use_causal_mask=True, left_bound=128)
+    assert reason is not None and "keeps a key" in reason, reason
+    assert _decline_reason(d=d, dv=dv, sq=255, skv=128, use_causal_mask=True, left_bound=128) is None
 
 
 @pytest.mark.L0
