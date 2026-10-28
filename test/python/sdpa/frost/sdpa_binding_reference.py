@@ -923,6 +923,7 @@ def bind_dense_split(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFact
         o_strides,
         lse_strides,
         *ragged_args,
+        *((frame[spec.index["sinks_ptr"]],) if spec.has_sink else ()),
         stream,
         *((frame[spec.index["seq_q_lens_addr"]],) if getattr(spec, "ragged_q_lens", 0) else ()),
     )
