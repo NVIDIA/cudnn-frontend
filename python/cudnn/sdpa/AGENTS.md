@@ -472,6 +472,13 @@ retain barrier arrivals for dead work while suppressing its output stores.
 `test_sdpa_bwd_thd_d256_sm100.py::test_origins_rebind_and_replay` checks this
 with poisoned scratch, one-sided empties and changed device metadata.
 
+The loader must follow a lookahead consumer's operand order. In the D192
+backward body, waiting for dO_dV(i)'s slot before loading Q(i+1) delays the
+MMA's next score even with extra Q buffers. Preload Q0, then issue dO(i),
+Q(i+1), dO_dV(i); guard the empty prologue and final prefetch and advance the
+Q ring once per actual tile. The D192 dense/THD replay suites and D256
+`test_mma_order_arms_match_the_fp64_reference` exercise both issue orders.
+
 Shared protocol (both passes):
 
 - **An end-of-kernel ring drain walks the WHOLE ring, never `min(total, stages)` steps.**  A consumer started at
