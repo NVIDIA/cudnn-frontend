@@ -46,12 +46,12 @@ def test_entries_are_well_formed_and_name_known_rows():
 
     rows = {s.name for s in FWD} | {s.name for s in BWD}
     for key, entry in pt.TABLE.items():
-        row, cc, dtype, heads, phase, layout, mask, sink, group, split_blocked = key
+        row, cc, dtype, heads, phase, layout, mask, sink, group, kv_off_tile = key
         assert row in rows, key
         assert isinstance(cc, tuple) and len(cc) == 2 and dtype in ("bf16", "f16") and len(heads) == 2
         assert phase in ("q1", "mtp", "prefill") and layout in ("dense", "paged", "thd", "thd_ragged")
         assert mask in ("none", "window", "causal_br", "causal_tl") and isinstance(sink, bool) and group in ("mha", "gqa")
-        assert isinstance(split_blocked, bool) and not (split_blocked and layout == "paged")
+        assert isinstance(kv_off_tile, bool)
         assert entry.direction in ("always", "never", "ge", "le") and entry.study
         assert (entry.log2_work is None) == (entry.direction in ("always", "never"))
         assert entry.feature in pt.FEATURES
@@ -96,16 +96,18 @@ def test_cost_proxy_is_byte_bound_for_decode_and_flop_bound_for_prefill():
 
 
 @pytest.mark.L0
-def test_dense_kv_off_the_tile_is_its_own_class_paged_is_not():
-    """A dense S_kv off the 128-key tile cannot split KV (an off-tile dense d256 decode was 11-13x slower on FROST, which
-    an on-tile grid cannot see), so it is a separate class; paged KV splits at any logical maximum and keeps its class
-    (review on #1957: an off-tile paged D576 decode lost its FROST split route to the backend)."""
+def test_kv_off_the_tile_is_its_own_class_with_its_own_entry():
+    """S_kv off the 128-key tile is a separate class for dense and paged KV (an off-tile dense d256 decode was 11-13x slower on
+    FROST; off-tile paged d256 decode wins at lower cost than on-tile), and every measured on-tile class has a measured
+    off-tile twin, so an off-tile graph is never answered by an on-tile study nor dropped to the backend (review on #1957: an
+    off-tile paged D576 decode, B1 H_q16 S_kv 49151, lost its FROST split route)."""
     row = "sdpa_fwd_prefill_sm100"
-    assert pt.class_key(row, _facts(s_kv=8191))[-1] is False  # paged
-    assert pt.lookup(row, _facts(s_kv=49151, h_q=16, b=1)) == pt.lookup(row, _facts(s_kv=49152, h_q=16, b=1))
-    dense = dict(has_paged_kv=False, d_qk=256, d_v=256, h_q=16)
-    assert pt.class_key(row, _facts(s_kv=8191, **dense))[-1] is True
-    assert pt.class_key(row, _facts(s_kv=8192, **dense))[-1] is False
+    for kw in (dict(), dict(has_paged_kv=False, d_qk=256, d_v=256, h_q=16)):
+        assert pt.class_key(row, _facts(s_kv=8191, **kw))[-1] is True
+        assert pt.class_key(row, _facts(s_kv=8192, **kw))[-1] is False
+    for key in pt.TABLE:
+        assert key[:-1] + (not key[-1],) in pt.TABLE, key
+    assert pt.lookup(row, _facts(s_kv=49151, h_q=16, b=1)) is True
 
 
 @pytest.mark.L0
@@ -119,3 +121,4 @@ def test_off_tile_dense_d256_decode_reads_parallel_tiles():
     for s_kv in (2049, 32769, 131071):
         assert pt.lookup(row, _facts(s_kv=s_kv, b=16, **d256)) is False
         assert pt.lookup(row, _facts(s_kv=s_kv, b=64, **d256)) is True
+        assert pt.lookup(row, _facts(s_kv=s_kv, b=40, **d256)) is True  # 33-63 tiles measured on 9.28 and 9.26 (review on #1957)

@@ -4,7 +4,7 @@
 """Measured placement table: FROST row vs the backend, per shape class, generated from frozen sweeps.
 
 A class is read off the graph facts (row, device, dtype, head pair, phase, layout, mask, sink, MHA vs GQA, and whether
-split-KV is blocked by a dense S_kv off the 128-key tile). Each entry
+S_kv is off the 128-key tile). Each entry
 is a monotone rule on ONE scalar from :data:`FEATURES` -- the roofline-shaped cost proxy :func:`log2_work` or the
 parallel-tile count :func:`log2_tiles`, whichever the class's data is monotone in: ``always``, ``never``, ``ge T`` (FROST leads
 from T up) or ``le T`` (FROST leads up to T). Entries are produced by ``benchmark/placement_gen`` from a training grid
@@ -79,10 +79,10 @@ def class_key(row: str, facts) -> Optional[Tuple]:
     else:
         mask = "none"
     group = "mha" if facts.h_q == facts.h_kv else "gqa"
-    # A dense S_kv off the 128-key tile cannot split KV, which changes what the kernels can do, not just how long they run:
-    # its own class. Paged KV splits at any logical maximum, so it never sets this.
-    split_blocked = not facts.has_paged_kv and facts.s_kv % 128 != 0
-    return (row, tuple(facts.device_cc or ()), dtype, (facts.d_qk, facts.d_v), phase, layout, mask, bool(facts.has_sink), group, split_blocked)
+    # Off the 128-key tile dense KV cannot split and paged KV measures differently near the boundary: its own class, which
+    # an on-tile study never answers.
+    kv_off_tile = facts.s_kv % 128 != 0
+    return (row, tuple(facts.device_cc or ()), dtype, (facts.d_qk, facts.d_v), phase, layout, mask, bool(facts.has_sink), group, kv_off_tile)
 
 
 COST_BALANCE = 16.0
@@ -124,15 +124,20 @@ def lookup(row: str, facts) -> Optional[bool]:
 # ---------------------------------------------------------------------------------------------------------------- generated
 # benchmark/placement_gen/gen.py --emit; one block per study, keys sorted. Do not edit by hand.
 TABLE: Dict[Tuple, Entry] = {
-    # study sm100_d256_decode_v2_20261028 (full-power B200, cuDNN 9.28.0.38; frozen 200 on-tile + 200 off-tile grid)
-    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "dense", "none", False, "gqa", False): Entry("ge", 26.001, "sm100_d256_decode_v2_20261028"),
+    # study sm100_d256_decode_v3_20261028 (full-power B200, cuDNN 9.28.0.38; frozen 200 on-tile + 200 off-tile grid + 48 off-tile dense at 34-60 tiles)
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "dense", "none", False, "gqa", False): Entry("ge", 26.001, "sm100_d256_decode_v3_20261028"),
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "dense", "none", False, "gqa", True): Entry(
-        "ge", 5.5, "sm100_d256_decode_v2_20261028", "tiles"
+        "ge", 5.044, "sm100_d256_decode_v3_20261028", "tiles"
     ),
-    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", False): Entry("ge", 26.002, "sm100_d256_decode_v2_20261028"),
-    # study sm100_d576_decode_20261027 (full-power B200, cuDNN 9.28.0.38; frozen 128-case grid)
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", False): Entry("ge", 26.002, "sm100_d256_decode_v3_20261028"),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", True): Entry("ge", 24.532, "sm100_d256_decode_v3_20261028"),
+    # study sm100_d576_decode_v2_20261028 (full-power B200, cuDNN 9.28.0.38; frozen 128-case grid on the tile + the same grid off it)
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "mtp", "paged", "causal_br", False, "gqa", False): Entry(
-        "always", None, "sm100_d576_decode_20261027"
+        "always", None, "sm100_d576_decode_v2_20261028"
     ),
-    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "q1", "paged", "none", False, "gqa", False): Entry("ge", 26.588, "sm100_d576_decode_20261027"),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "mtp", "paged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm100_d576_decode_v2_20261028"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "q1", "paged", "none", False, "gqa", False): Entry("ge", 26.588, "sm100_d576_decode_v2_20261028"),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "q1", "paged", "none", False, "gqa", True): Entry("ge", 26.131, "sm100_d576_decode_v2_20261028"),
 }
