@@ -427,6 +427,7 @@ class KernelTemplate:
     # stage 1: pipeline / graph-type / mainloop axes
 
     def _axis_reject(self, chain: FusionChain, config: TileConfig, graph_type: GraphType) -> str | None:
+        """Explain which requested config axis this template cannot execute."""
         cfg_cls = config_class_for_pipeline(self.pipeline)
         if not isinstance(config, cfg_cls):
             return f"config {config.name} is not a {cfg_cls.__name__} " f"(template {self.file} pairs with config_{self.pipeline})"
@@ -869,6 +870,7 @@ def _mm(
     template_cls: "type[KernelTemplate] | None" = None,
     supports_cluster_k_reduce: bool = False,
 ) -> KernelTemplate:
+    """Describe a tcgen05 template and its supported geometry and strategy axes."""
     pipeline = _pipeline_from_file(file)
     if pipeline not in PIPELINE_ARCH_RANGES:
         raise KeyError(

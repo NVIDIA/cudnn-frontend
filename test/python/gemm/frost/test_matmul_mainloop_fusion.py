@@ -892,6 +892,7 @@ def _splitk_plan(g, S):
 
 @requires_sm100
 def test_cluster_k_reduce_declines_unimplemented_mainloop():
+    """Reject cluster reduction while retaining the supported mainloop workspace path."""
     from dataclasses import replace
 
     graph = _mainloop_graph_ab("cos", "cos", 240, 272, 4200)

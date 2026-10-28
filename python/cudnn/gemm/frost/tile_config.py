@@ -147,6 +147,7 @@ class TileConfig:
     cluster_k_reduce: bool = field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
+        """Validate nested tile geometry and the requested execution strategy."""
         name = self.name
 
         if not isinstance(self.swap_ab, bool):

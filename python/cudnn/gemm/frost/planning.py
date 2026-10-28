@@ -427,6 +427,7 @@ def select_strategies(
     limit: int = MAX_PLAN_CONFIGS,
     shapes_fixed: bool = False,
 ) -> list[TileConfig]:
+    """Rank supported plans with a stable first choice and a bounded shortlist."""
     if not 1 <= limit <= MAX_PLAN_CONFIGS:
         raise ValueError(f"strategy limit must be between 1 and {MAX_PLAN_CONFIGS}")
     device = current_device_properties() if device is None else device
@@ -454,6 +455,7 @@ def select_strategies(
                 return selected
 
     def include_small_m(configs: list[TileConfig]) -> list[TileConfig]:
+        """Include the probed narrow-token candidate without replacing the incumbent."""
         if small_m is None or small_m in configs or limit == 1:
             return configs
         return [configs[0], small_m, *configs[1:]][:limit]
@@ -518,4 +520,5 @@ def select_strategy(
     device: DeviceProperties | None = None,
     shapes_fixed: bool = False,
 ) -> TileConfig:
+    """Return the first supported strategy using the same policy as the shortlist."""
     return select_strategies(chain, baseline, probe=probe, device=device, limit=1, shapes_fixed=shapes_fixed)[0]

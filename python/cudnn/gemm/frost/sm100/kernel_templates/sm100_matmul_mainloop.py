@@ -35,7 +35,6 @@ from typing import Callable
 
 import cutlass.experimental.primitives as nvvm
 from cudnn.gemm.frost.tile_helpers import (
-    cluster_split_k_reduce,
     epi_subtile_spans as _epi_subtile_spans,
     l2_swizzle_tile as _l2_swizzle_tile,
     tcgen05_alloc as _tcgen05_alloc,
@@ -156,16 +155,17 @@ def _kernel(
     m: cutlass.Int64,
     n: cutlass.Int64,
     k: cutlass.Int64,
+    swizzle_w: cutlass.Int32,
     # @@INJECT_KERNEL_AB_DESC_PARAMS@@
     # @@INJECT_KERNEL_TAP_PARAMS@@
-    # @@SPLITK_ONLY:BEGIN@@
-    mSplitK_partials: cute.Tensor,
-    # @@SPLITK_ONLY:END@@
     # @@INJECT_KERNEL_REDUCTION_STRIDE_PARAMS@@
     # @@INJECT_KERNEL_AUX_PARAMS@@
     # @@TMA_STORE_ONLY:BEGIN@@
     # @@INJECT_KERNEL_TMA_C_PARAMS@@
     # @@TMA_STORE_ONLY:END@@
+    # @@SPLITK_ONLY:BEGIN@@
+    mSplitK_partials: cute.Tensor,
+    # @@SPLITK_ONLY:END@@
 ) -> None:
     # @@INJECT_AB_DESC_LISTS@@
     tma_a_desc = tma_a_descs[0]
@@ -263,7 +263,6 @@ def _kernel(
             init_raw_n = bidy >> _fallback_cluster_n_shift
             init_nt_m = gridx >> _fallback_cluster_m_shift
             init_nt_n = gridy >> _fallback_cluster_n_shift
-    swizzle_w = _auto_swizzle_w(m, n, k, init_nt_n)
     init_tile_m, init_tile_n = _l2_swizzle_tile(
         init_raw_m,
         init_raw_n,
@@ -1373,11 +1372,6 @@ def _kernel(
         is_valid = cutlass.Int32(1)
         clc_full_phase_epi = cutlass.Int32(0)
 
-        write_epilogue = True
-        if cutlass.const_expr(cluster_k_reduce):
-            write_epilogue = k_rank == 0
-            cluster_reduce_iter = cutlass.Int32(0)
-
         # @@EPILOGUE_SETUP:BEGIN@@
         if cutlass.const_expr(epi_packed_lanes):
             row_id_with_warp_offset = base_row_id
@@ -1447,21 +1441,6 @@ def _kernel(
                         c_rmem_vecs.append(_cv)
                     c_rmem_vec = c_rmem_vecs[0]
 
-                    if cutlass.const_expr(cluster_k_reduce):
-                        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                        c_rmem_vec = cluster_split_k_reduce(
-                            c_rmem_vec,
-                            cluster_mailbox,
-                            cluster_ready_mbar_ptr,
-                            cluster_free_mbar_ptr,
-                            cluster_reduce_iter,
-                            k_rank,
-                            k_root_rank,
-                            cluster_shape_mnk[0] * cluster_shape_mnk[1],
-                            split_k_slices,
-                        )
-                        cluster_reduce_iter += 1
-
                     if mi == mma_size_m - 1 and subtile_idx == subtile_cnt - 1:
                         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
@@ -1478,18 +1457,16 @@ def _kernel(
                     col = coord_n_c + subtile_col_offset
 
                     # @@TMA_STORE_ONLY:BEGIN@@
-                    if write_epilogue:
-                        vec_f32 = c_rmem_vec
-                        col_j = col
-                        linear_idx = tile_l * out_stride_l_0 + row * out_stride_m_0 + col_j * out_stride_n_0
+                    vec_f32 = c_rmem_vec
+                    col_j = col
 
-                        # @@INJECT_EPILOGUE@@
+                    # @@INJECT_EPILOGUE@@
 
-                        # @@INJECT_TMA_STORE_SEQUENCE@@
+                    # @@INJECT_TMA_STORE_SEQUENCE@@
                     # @@TMA_STORE_ONLY:END@@
 
                     # @@STG_ONLY:BEGIN@@
-                    if write_epilogue and row_active and row < M:
+                    if row_active and row < M:
                         for j in cutlass.range_constexpr(subtile_w // vsize):
                             col_j = col + j * vsize
                             if col_j + vsize <= N:
@@ -1660,20 +1637,23 @@ def _host(
     grid_x = num_tile_m_host * cluster_m
     grid_y = num_tile_n_host * cluster_n
     grid_shape = (grid_x, grid_y, batch * split_k_slices)
+    # Resolve shape-only rasterization once per launch on the host.
+    swizzle_w_host = _auto_swizzle_w(m, n, k_sym, num_tile_n_host)
     launch = _kernel(
         problem_size[0],
         problem_size[1],
         problem_size[2],
+        swizzle_w_host,
         # @@INJECT_HOST_KERNEL_DESC_PASS@@
         # @@INJECT_HOST_TAP_PASS@@
-        # @@SPLITK_ONLY:BEGIN@@
-        splitk_partials,
-        # @@SPLITK_ONLY:END@@
         # @@INJECT_HOST_REDUCTION_STRIDE_PASS@@
         # @@INJECT_HOST_AUX_PASS@@
         # @@TMA_STORE_ONLY:BEGIN@@
         # @@INJECT_HOST_TMA_C_PASS@@
         # @@TMA_STORE_ONLY:END@@
+        # @@SPLITK_ONLY:BEGIN@@
+        splitk_partials,
+        # @@SPLITK_ONLY:END@@
     )
     # Mixed CGA: `cluster` is the preferred (wide) shape and `fallback_cluster`
     # the regular one the device groups blocks into when a preferred cluster does

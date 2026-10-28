@@ -81,6 +81,7 @@ def test_split_k_and_swap_ab_round_trip():
 
 
 def test_cluster_k_reduce_config_and_knobs():
+    """Round-trip the explicit reduction mode and preserve legacy workspace records."""
     from dataclasses import replace
 
     workspace = replace(DEFAULT_CONFIG, split_k_slices=4)
@@ -95,13 +96,15 @@ def test_cluster_k_reduce_config_and_knobs():
     assert public[cudnn.knob_type.CLUSTER_K_REDUCE] == 1
     assert GemmKnobs.from_public(public).to_config() == cluster
     legacy = GemmKnobs.from_config(workspace).to_public()
-    assert legacy.pop(cudnn.knob_type.CLUSTER_K_REDUCE) == 0
+    cluster_reduce = legacy.pop(cudnn.knob_type.CLUSTER_K_REDUCE)
+    assert cluster_reduce == 0
     assert GemmKnobs.from_public(legacy).to_config() == workspace
     with pytest.raises(ValueError, match="CLUSTER_K_REDUCE must be 0 or 1"):
         GemmKnobs.from_public({**public, cudnn.knob_type.CLUSTER_K_REDUCE: 2})
 
 
 def test_cluster_k_reduce_config_rejects_invalid_combinations():
+    """Reject non-boolean mode values and impossible full-cluster geometries."""
     from dataclasses import replace
 
     with pytest.raises(ValueError, match="cluster_k_reduce must be bool"):
@@ -114,6 +117,7 @@ def test_cluster_k_reduce_config_rejects_invalid_combinations():
 
 @requires_sm100
 def test_cluster_k_reduce_declines_sm120_before_compiling(monkeypatch):
+    """Reject an unsupported cluster mode before entering the SM120 compiler."""
     from dataclasses import replace
     from cudnn.gemm.frost.sm120 import compiler
     from cudnn.gemm.frost.tile_config import as_pipeline
@@ -122,6 +126,7 @@ def test_cluster_k_reduce_declines_sm120_before_compiling(monkeypatch):
     cfg = replace(as_pipeline(DEFAULT_CONFIG, "sm120"), split_k_slices=4, cluster_k_reduce=True)
 
     def unexpected_compile(*args, **kwargs):
+        """Fail if an unsupported config or runtime extent triggers compilation."""
         pytest.fail("an unsupported cluster reduction must be declined before compilation")
 
     monkeypatch.setattr(compiler, "_import_kernel", unexpected_compile)
@@ -132,6 +137,7 @@ def test_cluster_k_reduce_declines_sm120_before_compiling(monkeypatch):
 @requires_sm100
 @pytest.mark.parametrize("slices", [1, 4])
 def test_sm120_workspace_split_k_executes_on_sm100_family(slices):
+    """Keep the SM120 workspace path executable on an admitted SM100-family device."""
     from dataclasses import replace
     from cudnn.gemm.frost.sm120 import compiler
     from cudnn.gemm.frost.tile_config import as_pipeline
@@ -188,6 +194,7 @@ def test_replayed_split_k_record_declines_under_dynamic_shapes():
 
 @requires_sm100
 def test_calibrated_heuristic_lists_eight_unique_configs(monkeypatch):
+    """Propose distinct replayable plans while retaining workspace reduction by default."""
     from cudnn.gemm.frost import compiler, planning, tile_config
     from cudnn.gemm.frost.fusion_ir import FusionChain, MatmulSpec, OutputSpec
     from cudnn.gemm.frost.heuristics import ENGINE, GemmFacts, recommend
@@ -379,6 +386,7 @@ def test_frost_gemm_knobs_replay_and_run():
 @requires_sm100
 @pytest.mark.parametrize("cluster_reduce", [False, True])
 def test_cluster_splitk_public_replay_workspace(cluster_reduce):
+    """Honor the public reduction-mode knob and its reported workspace requirement."""
     from dataclasses import replace
 
     g, _ = _build_matmul_bias_relu()

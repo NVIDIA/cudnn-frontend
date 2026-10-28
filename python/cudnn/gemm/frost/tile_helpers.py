@@ -27,18 +27,21 @@ from cutlass._mlir.dialects import llvm
 def l2_swizzle_tile(raw_m, raw_n, nt_m, nt_n, swizzle_w, identity=False):
     """N-direction super-block rasterization of the (m, n) cgrp-tile coord, for
     L2 reuse. ``identity=True`` compiles out the general mapping when the caller
-    knows that ``swizzle_w == 1``.
+    knows that ``swizzle_w == 1``. A launch-time width of one also bypasses
+    the divisions, without specializing a separate kernel for each shape.
     """
     if cutlass.const_expr(identity):
         return raw_m, raw_n
-    t = raw_n * nt_m + raw_m
-    blk = nt_m * swizzle_w
-    sb = t // blk
-    off = t - sb * blk
-    base_n = sb * swizzle_w
-    cur_S = cutlass.min(cutlass.Int32(swizzle_w), nt_n - base_n)
-    log_m = off // cur_S
-    log_n = base_n + off - log_m * cur_S
+    log_m, log_n = raw_m, raw_n
+    if swizzle_w != 1:
+        t = raw_n * nt_m + raw_m
+        blk = nt_m * swizzle_w
+        sb = t // blk
+        off = t - sb * blk
+        base_n = sb * swizzle_w
+        cur_S = cutlass.min(cutlass.Int32(swizzle_w), nt_n - base_n)
+        log_m = off // cur_S
+        log_n = base_n + off - log_m * cur_S
     return log_m, log_n
 
 
@@ -58,22 +61,26 @@ def epi_subtile_spans(cols, epi_n=32):
 
 
 TENSOR_MAP_QWORDS = 16
+CLUSTER_K_REDUCE_BARRIER_ID = 4
 
 
 @cute.jit
-def cluster_split_k_reduce(partial, mailbox, ready, free, iteration, k_rank, root_rank, plane_ctas: cutlass.Constexpr, slices: cutlass.Constexpr):
+def cluster_split_k_reduce(
+    partial, mailbox, ready, free, iteration, k_rank, root_rank, plane_ctas: cutlass.Constexpr, slices: cutlass.Constexpr, epilogue_threads: cutlass.Constexpr
+):
     """Bulk-copy one fragment per peer to reusable slots on its K-rank-zero CTA.
 
     All epilogue lanes participate before output masking. A producer publishes
     its CTA-local staging before the elected bulk copy; transaction completion
     makes the root's local reads safe. Root lanes rendezvous before the release
     acknowledgement, so neither receive nor source slots can be reused early.
+    ``epilogue_threads`` covers exactly the caller's participating epilogue warps.
     """
     tid = cute.arch.thread_idx()[0]
     warp = cute.arch.warp_idx()
     elected = nvvm.elect_sync()
     values = partial.to_elements()
-    chunk_elems = 128 * len(values)
+    chunk_elems = epilogue_threads * len(values)
     phase = iteration & 1
     result = partial
     if k_rank != 0:
@@ -81,7 +88,7 @@ def cluster_split_k_reduce(partial, mailbox, ready, free, iteration, k_rank, roo
         for q in cutlass.range_constexpr(len(values) // 4):
             staging.data_ptr(tid * len(values) + q * 4).store(partial[q * 4 : q * 4 + 4], alignment=16)
         cute.arch.fence_proxy("async.shared", space="cta")
-        nvvm.barrier_cta_sync(barrier_id=4, thread_count=128)
+        nvvm.barrier_cta_sync(barrier_id=CLUSTER_K_REDUCE_BARRIER_ID, thread_count=epilogue_threads)
         if warp == 0:
             remote_ready = nvvm.mapa(ready, root_rank)
             if elected:
@@ -102,7 +109,7 @@ def cluster_split_k_reduce(partial, mailbox, ready, free, iteration, k_rank, roo
                 for e in cutlass.range_constexpr(4):
                     summed[q * 4 + e] = summed[q * 4 + e] + incoming[e]
         result = _cvec.Vector.from_elements(tuple(summed), cutlass.Float32)
-        nvvm.barrier_cta_sync(barrier_id=4, thread_count=128)
+        nvvm.barrier_cta_sync(barrier_id=CLUSTER_K_REDUCE_BARRIER_ID, thread_count=epilogue_threads)
         if warp == 0:
             for peer in cutlass.range_constexpr(1, slices):
                 if elected:

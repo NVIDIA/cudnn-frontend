@@ -484,6 +484,7 @@ def test_shared_width_profile_does_not_override_dtype_support(monkeypatch):
 @pytest.mark.L0
 @pytest.mark.parametrize("family", ["sm100", "sm120"])
 def test_both_compilers_delegate_joint_selection_but_replay_and_dynamic_bypass_it(monkeypatch, family):
+    """Preserve shape facts and exact replay across both compiler-family facades."""
     import importlib
 
     from cudnn.gemm.frost import planning
@@ -494,6 +495,7 @@ def test_both_compilers_delegate_joint_selection_but_replay_and_dynamic_bypass_i
     shape_facts = []
 
     def select(chain, baseline, *, probe, shapes_fixed):
+        """Record shape facts passed from the compiler to shared strategy selection."""
         assert probe == compiler.probe_chain
         calls.append(baseline)
         shape_facts.append(shapes_fixed)
@@ -524,6 +526,7 @@ def test_both_compilers_delegate_joint_selection_but_replay_and_dynamic_bypass_i
 @pytest.mark.parametrize("family", ["sm100", "sm120"])
 @pytest.mark.parametrize("dynamic,override", [(False, False), (False, True), (True, False), (True, True)])
 def test_planner_graph_shape_facts(family, dynamic, override):
+    """Distinguish fixed declarations from dynamic and override-enabled graphs."""
     import importlib
     from types import SimpleNamespace
 
@@ -721,6 +724,7 @@ def _block_scaled_chain(*, M, N=5120, K=2048, batch=1, quantized=True, moe_group
 @pytest.mark.parametrize("tokens,width", [(1, 8), (8, 8), (9, 16), (16, 16), (17, 32), (32, 32)])
 @pytest.mark.parametrize("shapes_fixed", [False, True])
 def test_small_m_block_scale_plan_uses_token_width_and_one_wave(tokens, width, shapes_fixed):
+    """Choose bounded token tiles and legal one-wave splits without enabling cluster reduction."""
     from cudnn.gemm.frost import planning
     from cudnn.gemm.frost.knobs import GemmKnobs
 
@@ -741,6 +745,7 @@ def test_small_m_block_scale_plan_uses_token_width_and_one_wave(tokens, width, s
 @pytest.mark.L0
 @pytest.mark.parametrize("shapes_fixed,weight_n,expected", [(False, 6144, 64), (False, 6145, None), (True, 14336, 8)])
 def test_small_m_override_rule_bounds_weight_tiles(shapes_fixed, weight_n, expected):
+    """Keep override proposals within the measured wide-token weight-grid envelope."""
     from cudnn.gemm.frost import planning
 
     chain = _block_scaled_chain(M=8, N=weight_n, quantized=False)
@@ -752,6 +757,7 @@ def test_small_m_override_rule_bounds_weight_tiles(shapes_fixed, weight_n, expec
 @pytest.mark.L0
 @pytest.mark.parametrize("shapes_fixed", [False, True])
 def test_small_m_other_gpus_retain_incumbent_and_offer_candidate(shapes_fixed):
+    """Offer narrow-token geometry without replacing an unqualified device incumbent."""
     from cudnn.gemm.frost import planning
 
     chain = _block_scaled_chain(M=8, N=4096, K=4096, quantized=False)
@@ -766,6 +772,7 @@ def test_small_m_other_gpus_retain_incumbent_and_offer_candidate(shapes_fixed):
 @pytest.mark.L0
 @pytest.mark.parametrize("K,slices", [(256, 1), (512, 2), (768, 2), (1024, 4), (8192, 16)])
 def test_small_m_split_k_respects_k_tiles(K, slices):
+    """Bound automatic split-K by available K work and the conservative slice limit."""
     from cudnn.gemm.frost import planning
 
     chain = _block_scaled_chain(M=8, N=128, K=K, quantized=False)
@@ -777,12 +784,14 @@ def test_small_m_split_k_respects_k_tiles(K, slices):
 @pytest.mark.L0
 @pytest.mark.parametrize("reject", ["candidate", "baseline", "both", "bug"])
 def test_small_m_plan_support_probe_and_fallback(reject):
+    """Honor candidate rejection and propagate unexpected support-probe failures."""
     from cudnn.gemm.frost import planning
 
     chain = _block_scaled_chain(M=8, quantized=False)
     baseline = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma")
 
     def probe(original, config):
+        """Exercise support-probe acceptance and typed candidate rejection."""
         assert original is chain
         if reject == "bug":
             raise RuntimeError("probe bug")
@@ -803,6 +812,7 @@ def test_small_m_plan_support_probe_and_fallback(reject):
 @pytest.mark.L0
 @pytest.mark.parametrize("case", ["plain", "large_m", "batch", "moe", "quant", "fake_sf", "compact_sf", "n_major_b", "sm103", "sm120"])
 def test_small_m_rule_preserves_other_paths(case):
+    """Leave ineligible graph structures, layouts and pipeline families unchanged."""
     from cudnn.gemm.frost import planning
 
     chain = _block_scaled_chain(M=8, quantized=False)

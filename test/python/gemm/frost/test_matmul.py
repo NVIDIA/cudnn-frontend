@@ -3562,6 +3562,7 @@ def _splitk_cfg(sm100_name=None):
 
 
 def test_benchmark_cluster_k_reduce_variants(monkeypatch):
+    """Preserve unswept strategy axes and skip invalid benchmark combinations."""
     from dataclasses import replace
     from cudnn.frost.occupancy import MAX_CLUSTER_SIZE
 
@@ -3584,6 +3585,7 @@ def test_benchmark_cluster_k_reduce_variants(monkeypatch):
 
 
 def _jit_splitk(g, S, base_cfg=None, *, cluster_k_reduce=False):
+    """Compile a forced split-K config for numerical and workspace contract checks."""
     from dataclasses import replace
 
     from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
@@ -3708,6 +3710,7 @@ def test_splitk_n_not_multiple_of_4(N):
 
 @requires_sm100
 def test_splitk_cta_group1():
+    """Execute workspace split-K without requiring a paired-CTA MMA."""
     g, A, Bt, C = _splitk_graph(1, 256, 256, 4096)
     compiled = _jit_splitk(g, 4, base_cfg=by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"))
     assert compiled.store_modes == ("stg",) and not compiled.config.cluster_k_reduce
@@ -3722,6 +3725,7 @@ def test_splitk_cta_group1():
 @pytest.mark.parametrize("cluster_reduce", [False, True])
 @pytest.mark.parametrize("swap", [False, True])
 def test_cluster_splitk_slices_and_replay(slices, swap, cluster_reduce):
+    """Honor each explicit slice count and reduction mode in both operand orientations."""
     from dataclasses import replace
     from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
     from cudnn.frost.occupancy import occupancy_map, MAX_CLUSTER_SIZE
@@ -3767,6 +3771,7 @@ def test_cluster_splitk_slices_and_replay(slices, swap, cluster_reduce):
     ],
 )
 def test_cluster_splitk_geometry(cta_m, mma_m, cta_n, group, cluster, slices):
+    """Reduce fragments correctly across supported CTA, MMA and CGA geometries."""
     from cudnn.frost.occupancy import occupancy_map
 
     cfg = by_name(f"CONFIG_sm100_{cta_m}x{cta_n}x128_{mma_m}x{cta_n}x32_cluster{cluster}_{group}ctamma")
@@ -3788,6 +3793,7 @@ def test_cluster_splitk_geometry(cta_m, mma_m, cta_n, group, cluster, slices):
 @requires_sm100
 @pytest.mark.parametrize("failure_stage", ["render", "compile"])
 def test_cluster_splitk_build_failure_does_not_change_mode(monkeypatch, failure_stage):
+    """Propagate build failures without retrying a different reduction mode."""
     from cudnn.gemm.frost import compiler
     from cutlass.base_dsl.common import DSLRuntimeError
 
@@ -3796,6 +3802,7 @@ def test_cluster_splitk_build_failure_does_not_change_mode(monkeypatch, failure_
     attempts = []
 
     def render(chain, snippets, cfg):
+        """Inject a rendering failure while recording the requested reduction mode."""
         attempts.append(cfg.cluster_k_reduce)
         if cfg.cluster_k_reduce and failure_stage == "render":
             raise NotImplementedError("test: no SMEM left for the cluster mailbox")
@@ -3806,10 +3813,12 @@ def test_cluster_splitk_build_failure_does_not_change_mode(monkeypatch, failure_
         original_import = compiler._import_kernel
 
         def import_kernel(src):
+            """Inject a DSL compilation failure without changing template selection."""
             mod = original_import(src)
             if "cluster_k_reduce = True" in src:
 
                 def cannot_compile():
+                    """Raise the sentinel compilation failure used to verify exact-mode behavior."""
                     raise DSLRuntimeError("test: cluster lowering unavailable in the installed compiler")
 
                 mod.compile = cannot_compile
@@ -3831,6 +3840,7 @@ def test_cluster_splitk_build_failure_does_not_change_mode(monkeypatch, failure_
 
 @requires_sm100
 def test_cluster_splitk_smem_budget_declines(monkeypatch):
+    """Reject mailbox allocations that leave no legal mainloop staging depth."""
     from cudnn.gemm.frost import compiler, tile_config
 
     # One 32-KiB AB stage fits; adding four 16-KiB fragment slots does not.
@@ -3848,6 +3858,7 @@ def test_cluster_splitk_smem_budget_declines(monkeypatch):
 
 @requires_sm100
 def test_cluster_splitk_override_capture_and_k_guard():
+    """Reuse cluster plans under capture and reject insufficient K before output writes."""
     from cudnn.gemm.frost.graph_analyzer import build_gemm_plan
     from cudnn.gemm.frost.knobs import GemmKnobs
     from dataclasses import replace
@@ -3887,6 +3898,7 @@ def test_cluster_splitk_override_capture_and_k_guard():
 @pytest.mark.parametrize("mma_k", [32, 64])
 @pytest.mark.parametrize("swap", [False, True])
 def test_cluster_splitk_fp8(dtype, mma_k, swap):
+    """Preserve FP8 results across instruction widths and swapped operands."""
     from dataclasses import replace
 
     if mma_k == 64 and not 107 <= _current_arch() < 110:
@@ -3902,6 +3914,7 @@ def test_cluster_splitk_fp8(dtype, mma_k, swap):
 
 @requires_sm100
 def test_cluster_splitk_persistent_mailbox_reuse():
+    """Keep receive slots and peer shared memory live across persistent work items."""
     cfg = by_name("CONFIG_sm100_128x32x128_128x32x32_cluster1x1_1ctamma")
     g, A, B, C = _splitk_graph(1, 129, 8192, 2048)
     plan = _jit_splitk(g, 2, base_cfg=cfg, cluster_k_reduce=True)
@@ -3934,6 +3947,7 @@ def test_splitk_deterministic():
 
 
 def test_splitk_workspace_size_and_missing_workspace():
+    """Report FP32 partial storage and require the caller to provide it."""
     # Workspace split-K remains valid even when all slices cannot fit a cluster.
     B, M, N, K, S = 2, 256, 384, 4096, 32
     g, A, Bt, C = _splitk_graph(B, M, N, K)

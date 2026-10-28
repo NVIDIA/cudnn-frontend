@@ -848,6 +848,19 @@ The B200-targeted rule leads on SM100; other GPUs retain the existing first
 choice and include the new geometry as an autotuning candidate. A four-shape
 SM107 comparison found both wins and regressions from unconditional preference.
 
+The dense SM100, mainloop-fusion, block-scale and SM103 hosts resolve the L2
+swizzle width once per call from the current logical M/N/K, then pass an Int32
+kernel argument. Do not compute this shape-only division chain in each warp.
+Keep the mixed-CGA pinned identity mapping and the shared helper's runtime
+width-one division bypass. MoE still resolves its per-group raster on device
+because the group extents are device data.
+
+Narrow block-scale tiles here extract arbitrary SF sub-rows, including across
+128-row atoms. They have no kernel-N <= 32 requirement: explicit narrow replay
+on override/dynamic graphs remains legal, with SF capacity and output checks on
+every call. Do not import the restricted narrow implementation's shape gates.
+Automatic small-M planning still uses the fixed/override/dynamic rules above.
+
 `TileConfig.cluster_k_reduce` explicitly selects the split-K reduction mode.
 False (including old knob records) uses workspace plus a separate reducer;
 True puts all slices in one cluster and reports zero partial workspace.
@@ -857,6 +870,13 @@ and insufficient SMEM; never change a requested mode during build or execute.
 Automatic planning retains False. Keep the flag in canonical names and public
 knob round-trips. Epilogue codegen takes `workspace_split_k` directly; do not
 rewrite the config's split count or wrap template regions through source regexes.
+Keep cluster device code only in templates that implement the full protocol;
+mainloop fusion and SM103 must contain no incomplete cluster branches. The
+epilogue parity test compares their shared base drain with the supported
+templates after removing only cluster reduction and its root-write predicate.
+Other bounds, loads and stores remain part of that comparison. Name the cluster
+CTA barrier and derive both its participant count and fragment span from the
+caller's epilogue warp count.
 For the SM100 dense and block-scale cluster implementations, every
 epilogue lane, including masked output lanes, stages its fragment before an
 async-proxy fence and CTA rendezvous. Elected bulk copies register their byte
@@ -870,6 +890,10 @@ racecheck. Gate TMA compute and stores together in one SSA region; separate
 guards leave the store's vectors undefined. For mixed-width block-scale inputs,
 CTA-K elements use the wider operand's bit width after either orientation;
 `test_cluster_splitk_mixed_width_k_tiles_after_swap` covers shallow legal K.
+Both compiler families use `recipe.check_split_k_shape` in the launch guard
+and `explain()`: every split must have a K tile, and workspace reduction must
+retain its compiled N chunk. Check before seeds, workspace writes or launch;
+reject without changing the selected reduction mode.
 
 ## The public function contract
 

@@ -67,6 +67,7 @@ def test_backend_mirror_values_are_frozen():
 
 
 def test_frontend_only_band():
+    """Keep frontend knob values stable and reject forwarding them to the backend."""
     kt = cudnn.knob_type
     assert cudnn.FRONTEND_KNOB_TYPE_BASE == 1000
     fe_only = {

@@ -168,16 +168,17 @@ def _kernel(
     m: cutlass.Int64,
     n: cutlass.Int64,
     k: cutlass.Int64,
+    swizzle_w: cutlass.Int32,
     # @@INJECT_KERNEL_AB_DESC_PARAMS@@
     # @@INJECT_KERNEL_TAP_PARAMS@@
-    # @@SPLITK_ONLY:BEGIN@@
-    mSplitK_partials: cute.Tensor,
-    # @@SPLITK_ONLY:END@@
     # @@INJECT_KERNEL_REDUCTION_STRIDE_PARAMS@@
     # @@INJECT_KERNEL_AUX_PARAMS@@
     # @@TMA_STORE_ONLY:BEGIN@@
     # @@INJECT_KERNEL_TMA_C_PARAMS@@
     # @@TMA_STORE_ONLY:END@@
+    # @@SPLITK_ONLY:BEGIN@@
+    mSplitK_partials: cute.Tensor,
+    # @@SPLITK_ONLY:END@@
 ) -> None:
     # @@INJECT_AB_DESC_LISTS@@
     # @@TMA_STORE_ONLY:BEGIN@@
@@ -281,7 +282,6 @@ def _kernel(
             init_raw_n = bidy >> _fallback_cluster_n_shift
             init_nt_m = gridx >> _fallback_cluster_m_shift
             init_nt_n = gridy >> _fallback_cluster_n_shift
-    swizzle_w = _auto_swizzle_w(m, n, k, init_nt_n)
     init_tile_m, init_tile_n = _l2_swizzle_tile(
         init_raw_m,
         init_raw_n,
@@ -1193,6 +1193,7 @@ def _kernel(
                             k_root_rank,
                             cluster_shape_mnk[0] * cluster_shape_mnk[1],
                             split_k_slices,
+                            num_epilogue_warps * 32,
                         )
                         cluster_reduce_iter += 1
 
@@ -1215,7 +1216,6 @@ def _kernel(
                     if write_epilogue:
                         vec_f32 = c_rmem_vec
                         col_j = col
-                        linear_idx = tile_l * out_stride_l_0 + row * out_stride_m_0 + col_j * out_stride_n_0
 
                         # @@INJECT_EPILOGUE@@
 
@@ -1418,20 +1418,23 @@ def _host(
     grid_x = num_tile_m_host * cluster_m
     grid_y = num_tile_n_host * cluster_n
     grid_shape = (grid_x, grid_y, batch * split_k_slices)
+    # Resolve shape-only rasterization once per launch on the host.
+    swizzle_w_host = _auto_swizzle_w(m, n, k_sym, num_tile_n_host)
     launch = _kernel(
         problem_size[0],
         problem_size[1],
         problem_size[2],
+        swizzle_w_host,
         # @@INJECT_HOST_KERNEL_DESC_PASS@@
         # @@INJECT_HOST_TAP_PASS@@
-        # @@SPLITK_ONLY:BEGIN@@
-        splitk_partials,
-        # @@SPLITK_ONLY:END@@
         # @@INJECT_HOST_REDUCTION_STRIDE_PASS@@
         # @@INJECT_HOST_AUX_PASS@@
         # @@TMA_STORE_ONLY:BEGIN@@
         # @@INJECT_HOST_TMA_C_PASS@@
         # @@TMA_STORE_ONLY:END@@
+        # @@SPLITK_ONLY:BEGIN@@
+        splitk_partials,
+        # @@SPLITK_ONLY:END@@
     )
     # Mixed CGA: `cluster` is the preferred (wide) shape and `fallback_cluster`
     # the regular one the device groups blocks into when a preferred cluster does

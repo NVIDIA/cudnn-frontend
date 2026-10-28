@@ -95,6 +95,7 @@ from ..recipe import (
     build as build_recipe,
     check_alignment,
     check_shapes,
+    check_split_k_shape,
     contiguous_modulus,
     expected_shape,
     moe_weight_sf_reject,
@@ -801,6 +802,7 @@ def _epi_vec_bytes(
 
 
 def _epi_store_dtype(chain: FusionChain, config: TileConfig) -> str:
+    """Use FP32 for workspace partials and the graph output dtype for final stores."""
     return "fp32" if config.workspace_split_k else chain.output_dtype
 
 
@@ -2211,6 +2213,7 @@ def _render_template(
     snippets: EpilogueSnippets,
     config: TileConfig,
 ) -> str:
+    """Render the selected dense or mainloop template with its exact config."""
     # Template selected by the kernel registry from the pure-geometry config +
     # execution strategy (cta_group); mainloop/graph_type from chain.
     from ..kernel_registry import select_template
@@ -3144,6 +3147,7 @@ class CompiledFusedGemm:
         gave_up = self.deferrals
 
         def lowered(operands, graph_order=None, stream=None, workspace=None):
+            """Validate resolved buffers and launch the already compiled GEMM plan."""
             _check_plan_device(device)
             # Which axis order each input arrived in, by the backend's own rule:
             # the descriptor defines the tensor and the pack supplies a pointer,
@@ -3234,21 +3238,7 @@ class CompiledFusedGemm:
                         gave_up["operands do not share a layout"] += 1
                         return refuse(operands, graph_order)
             if split_k_slices > 1:
-                # Every slice must own at least one whole CTA-K tile.
-                if (k + cta_k_elems - 1) // cta_k_elems < split_k_slices:
-                    raise ValueError(
-                        f"cudnn.frost gemm: split_k_slices={split_k_slices} exceeds the "
-                        f"{(k + cta_k_elems - 1) // cta_k_elems} K tile(s) of K={k}; "
-                        f"the plan was built for a deeper K — rebuild for this shape"
-                    )
-                if batch * split_k_slices > 65535:
-                    raise ValueError(f"cudnn.frost gemm: batch={batch} * split_k_slices={split_k_slices} " f"exceeds the CUDA grid.z limit of 65535")
-                # The reducer's row chunk was sized for the plan's N.
-                if needs_workspace and n % reduce_elems:
-                    raise ValueError(
-                        f"cudnn.frost gemm: N={n} is not a multiple of the reducer chunk ({reduce_elems} elements) "
-                        f"this plan was built with — rebuild for this shape"
-                    )
+                check_split_k_shape(k, n, batch, split_k_slices, cta_k_elems, reduce_elems if needs_workspace else 1)
             # Seeding is the one thing here that WRITES, so it is planned in full
             # before any of it is issued: a second reduction output that turns
             # out to be unseedable must not find the first already filled, and a
@@ -3320,6 +3310,15 @@ class CompiledFusedGemm:
         mnk, axes = recipe.problem(operands, graph_order)
         check_shapes(recipe, operands, mnk, axes)
         check_alignment(recipe, operands, axes)
+        if self.config.split_k_slices > 1:
+            check_split_k_shape(
+                int(mnk[2]),
+                int(mnk[1]),
+                recipe.batch,
+                self.config.split_k_slices,
+                _cta_k_elems(self.chain, self.config),
+                _splitk_reduce_elems(self.chain) if self.config.workspace_split_k else 1,
+            )
         raise RuntimeError(
             "cudnn.frost gemm: the launch path refused this call and no rule explains why -- its "
             "per-call guards and the diagnostics here have drifted apart. Guards that fired: "
@@ -4180,11 +4179,13 @@ def _cta_k_elems(chain: FusionChain, config: TileConfig) -> int:
 
 
 def _cluster_split_k_chunk_elems(chain: FusionChain, config: TileConfig) -> int:
+    """Size one mailbox fragment from the selected epilogue drain."""
     # One fragment per epilogue lane, reused over all N spans and MMA-M blocks.
     return 128 * _epi_n_for_chain(config, chain)
 
 
 def _cluster_split_k_smem_bytes(chain: FusionChain, config: TileConfig) -> int:
+    """Reserve reusable fragment slots and barriers for cluster reduction."""
     # S-1 receive slots on the root plus one CTA-local bulk-copy source slot.
     return 4 * config.split_k_slices * _cluster_split_k_chunk_elems(chain, config) + 16 if config.cluster_k_reduce else 0
 
@@ -4513,6 +4514,7 @@ def probe_chain(chain: FusionChain, config: TileConfig) -> None:
 
 
 def _check_splitk_supported(chain: FusionChain, config: TileConfig) -> None:
+    """Reject split-K modes that exceed template, geometry or device limits."""
     reason = _splitk_reject_reason(chain, config)
     if reason is not None:
         raise NotImplementedError(reason)

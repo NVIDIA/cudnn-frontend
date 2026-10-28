@@ -94,6 +94,7 @@ from ..recipe import (
     build as build_recipe,
     check_alignment,
     check_shapes,
+    check_split_k_shape,
     contiguous_modulus,
     expected_shape,
     moe_weight_sf_reject,
@@ -2828,6 +2829,8 @@ class CompiledFusedGemm:
                     if tuple(vs[j].stride()) != st:
                         gave_up["operands do not share a layout"] += 1
                         return refuse(operands, graph_order)
+            if needs_workspace:
+                check_split_k_shape(k, n, batch, split_k_slices, cta_k_elems, reduce_elems)
             # Seeding is the one thing here that WRITES, so it is planned in full
             # before any of it is issued: a second reduction output that turns
             # out to be unseedable must not find the first already filled, and a
@@ -2859,21 +2862,6 @@ class CompiledFusedGemm:
                 if workspace is None:
                     raise ValueError(
                         "cudnn.frost gemm: this plan needs a workspace; allocate " "graph.get_workspace_size() bytes and pass the buffer to execute()"
-                    )
-                # Every slice must own at least one whole CTA-K tile.
-                if (k + cta_k_elems - 1) // cta_k_elems < split_k_slices:
-                    raise ValueError(
-                        f"cudnn.frost gemm: split_k_slices={split_k_slices} exceeds the "
-                        f"{(k + cta_k_elems - 1) // cta_k_elems} K tile(s) of K={k}; "
-                        f"the plan was built for a deeper K — rebuild for this shape"
-                    )
-                if batch * split_k_slices > 65535:
-                    raise ValueError(f"cudnn.frost gemm: batch={batch} * split_k_slices={split_k_slices} " f"exceeds the CUDA grid.z limit of 65535")
-                # The reducer's row chunk was sized for the plan's N.
-                if n % reduce_elems:
-                    raise ValueError(
-                        f"cudnn.frost gemm: N={n} is not a multiple of the reducer chunk ({reduce_elems} elements) "
-                        f"this plan was built with — rebuild for this shape"
                     )
                 extra = (workspace.view(0, "float32", (split_k_slices * batch * m * n,)),)
             return launchable(
@@ -2914,6 +2902,15 @@ class CompiledFusedGemm:
         mnk, axes = recipe.problem(operands, graph_order)
         check_shapes(recipe, operands, mnk, axes)
         check_alignment(recipe, operands, axes)
+        if self.config.split_k_slices > 1:
+            check_split_k_shape(
+                int(mnk[2]),
+                int(mnk[1]),
+                recipe.batch,
+                self.config.split_k_slices,
+                _cta_k_elems(self.chain, self.config),
+                _splitk_reduce_elems(self.chain) if self.config.workspace_split_k else 1,
+            )
         m, n = int(mnk[0]), int(mnk[1])
         if self.config.swap_ab and self.chain.quants:
             # A swap-AB plan's chain is the graph transposed: name a scale layout
