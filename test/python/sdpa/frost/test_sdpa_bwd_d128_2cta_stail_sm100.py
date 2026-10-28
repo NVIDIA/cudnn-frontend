@@ -51,9 +51,12 @@ _BODY_REL = pathlib.Path("python/cudnn/sdpa/bwd/kernels/sm100/bprop_d128_accum_g
 _TREE = pathlib.Path(__file__).resolve().parents[4]  # test/python/sdpa/frost/<file> -> the checkout
 _RECORD = pathlib.Path(__file__).resolve().parent / "renderings" / "md5_d128_accum_grouped_2cta_stail_default_sm_100a.txt"
 _RECORD_TOKEN = "d128_accum_grouped_2cta_stail"
-# The kernels the pair chain OWNS (one record row each; the group fold dkv_reduce_thd_origins_kernel is shared with the one-CTA chain: rendered,
-# never pinned here -- frost_test_utils.D128_THD_SHARED_KERNELS).
-_OWN_KERNELS = ("setup_thd_d128_2cta_kernel", "delta_zero_thd_d128_kernel", "bprop_d128_accum_grouped_2cta_stail_kernel", "cast_dq_thd_d128_kernel")
+_RECORD_TOKEN_LDG = "d128_accum_grouped_2cta_stail_ldg"  # the stats_form = "ldg" rendering's rows (the previous default), beside the default's in the same file
+# The kernels the pair chain OWNS under the DEFAULT form (tma_ring: the delta-and-stats launch; one record row each; the group fold
+# dkv_reduce_thd_origins_kernel is shared with the one-CTA chain: rendered, never pinned here -- frost_test_utils.D128_THD_SHARED_KERNELS);
+# under "ldg" the delta launch is the compact one.
+_OWN_KERNELS = ("setup_thd_d128_2cta_kernel", "delta_zero_stats_thd_d128_2cta_kernel", "bprop_d128_accum_grouped_2cta_stail_kernel", "cast_dq_thd_d128_kernel")
+_OWN_KERNELS_LDG = ("setup_thd_d128_2cta_kernel", "delta_zero_thd_d128_kernel", "bprop_d128_accum_grouped_2cta_stail_kernel", "cast_dq_thd_d128_kernel")
 # The probes' purity census: the stats / delta LDS.128 (`ld.shared.v4.b32`: stats_one_chunk removes exactly CFG.DIAG_STATS_LDS_REMOVED_PER_LANE
 # static sites), the expect_tx arms (exchange_off keeps the count), the %clock64 reads (0 unless `debug_clk`), and the three counts every probe
 # must leave untouched: `bar.warp.sync`, `tcgen05.fence::after_thread_sync`, `mapa` (exchange_off loses the ship's own two).
@@ -70,23 +73,41 @@ _CENSUS = dict(CENSUS_BASE, entry_stail=r"\.entry\s+cudnn_kernel_bprop_d128_accu
 # 16 + 16 k-steps -> mma 56 + 16 = 72), the tail's dq_done commit (+1), the arrive sites 41 - 4 (a dq_empty bootstrap + two per-slot sites of a
 # 4-slice ring -> 2 slots x 2 rounds) + 1 (dq_full per round, 3 sites) + 1 (s_read) + 1 (s_tail_empty) = 40, the wait sites 63 - 2 (dq_empty:
 # 3 rounds x 2 slots vs 4 + 4 terminal) - 1 (the q1 drain, one stage) + 1 (s_read) + 4 (s_tail_empty: prologue, lookahead, tail, drain) + 3 (the
-# tail's dS gates) = 68.  The entry is this body's kernel.
+# tail's dS gates) = 68 -- the "ldg" form's counts (_EXPECTED_LDG, the merged rendering).  The DEFAULT form "tma_ring" (the day-4 decision) adds the
+# stats ring's rows: the ring's expect_tx arm + the softmax's plain stage release (arrive 42), the softmax's stats_full wait + the loader's
+# stats_empty wait (try_wait 70, their two `_wait` reconvergences: bar.warp.sync 69), the arm (expect_tx 12); every other row is the ldg form's
+# (no proxy fence, no tcgen05 fence, no LDS.128 moved).  The entry is this body's kernel.
 _EXPECTED = dict(
     EXPECTED_BASE,
     mma_cta_group_2=72,
     commit_multicast=13,
-    mbarrier_arrive=40,
-    try_wait=68,
+    mbarrier_arrive=42,
+    try_wait=70,
     entry=0,
     entry_stail=1,
     lds_v4_b32=38,  # 32 stats / delta chunks (CFG.DIAG_STATS_LDS_PER_LANE) + 6 other 16-B shared loads
-    expect_tx=11,  # the 8 tensor rows (do1 x 2) + ds_recv_full + the scheduler's local and remote arm
+    expect_tx=12,  # the 8 tensor rows (do1 x 2) + ds_recv_full + the scheduler's local and remote arm + the stats ring's arm
     clock64=0,
-    bar_warp_sync=67,
+    bar_warp_sync=69,
     tcgen05_fence_after=32,
     mapa=17,
 )
+_EXPECTED_LDG = dict(_EXPECTED, mbarrier_arrive=40, try_wait=68, expect_tx=11, bar_warp_sync=67)  # stats_form = "ldg": the merged rendering's census
 _PROBES = ("dq_reduce_add_off", "exchange_off", "stats_one_chunk", "sdq_sts_off")  # CFG.DIAG_2CTA_NAMES_ON_MAP (asserted in the config-truth row)
+# The STATS FORM (lever S1, header section 11): "tma_ring" = THE default since the day-4 decision (the loader-fed two-stage SMEM stats ring: ONE 1 KiB
+# bulk copy per q tile from the chain's padded pre-scaled stats region) | "ldg" = the previous default, selectable (the softmax's per-tile LDG fetch of
+# LSE / delta under the `bar.sync 1,256` pair; the form the 16w_fa4 role shape resolves to when the field is unset).  The census
+# rows the form moves (the S1 skeleton 14.6): the named-barrier pair, the two stats STS, the plain bulk copy (a NEW opcode class in this body: today's
+# only cp.async.bulk is the DSMEM ship), the two ring rows' inits, the one global load the loader adds (rowoff[b]) against the six the softmax drops.
+_STATS_FORMS = ("ldg", "tma_ring")
+_STATS_CENSUS = {
+    "bar_sync_1_256": r"bar\.sync\s+1,\s*256",
+    "st_shared_b32": r"st\.shared\.b32",
+    "bulk_g2s_plain": r"cp\.async\.bulk\.shared::cluster\.global\.mbarrier",
+    "mbarrier_init": r"mbarrier\.init",
+    "ld_global": r"ld\.global",
+    "fence_proxy_async": r"fence\.proxy\.async",
+}
 
 
 def _probe_census_delta(probe, c, default):
@@ -215,11 +236,54 @@ def test_2cta_stail_config_is_the_truth():
         96,
         384,
         17,
-        82,
+        84,
         128,
         (100, 400, 1600),
-    )  # the record = the 384-B spare left by the fp32_reduce row
+    )  # the record = the 384-B spare left by the fp32_reduce row (derived); 82 ldg words + the stats ring's 2 (appended after every ldg word)
     assert d.SMEM == cfgmod.BAR_LAYOUT_END and d.SMEM + d.BYTES <= c.TMEM_HANDLE and c.DEBUG_CLK_DEFAULT is False
+    # --- lever S1 (stats_form; header sections 5 / 8 / 11): the two geometries, the ring, the re-based ring barrier table, the record per form ---
+    from cudnn.sdpa.bwd import d128_grouped_2cta_contract as contract
+
+    r = cfgmod.CFG_RING
+    assert (c.STATS_FORMS, c.STATS_FORM_DEFAULT, cfgmod.STATS_FORM_CODES) == (("ldg", "tma_ring"), "tma_ring", {"ldg": 0, "tma_ring": 1})
+    assert c.STATS_FORM_FA4 == "ldg" and c.STATS_FORM_DEFAULT_BY_ROLES == {"16w": "tma_ring", "16w_fa4": "ldg"}  # the unset field per role shape
+    assert (c.STATS_STAGES, r.STATS_STAGES, c.STATS_STAGE_BYTES, c.STATS_TX, c.STATS_DELTA_OFF, c.STATS_RING) == (1, 2, 1024, 1024, 512, 229376)
+    assert (c.SLABS_END, c.SMEM_BYTES, c.BARS, c.TMEM_HANDLE, c.SCHED_PAYLOAD) == (230400, 231424, 230400, 231344, 231360)  # ldg = the shipped scaffold
+    assert (r.SLABS_END, r.SMEM_BYTES, r.BARS, r.TMEM_HANDLE, r.SCHED_PAYLOAD) == (231424, 232448, 231424, 232368, 232384)  # tma_ring: +1024, == the cap
+    assert r.SMEM_BYTES == c.SMEM_OPT_IN_CAP == 232448 and [r.stats_stage(st) for st in range(2)] == [229376, 230400] == [r.stats_lse(st) for st in range(2)]
+    assert [r.stats_delta(st) for st in range(2)] == [229888, 230912] and (c.stats_lse(0), c.stats_delta(0)) == (c.STATS, c.DELTA)
+    assert (c.STATS_KINDS, c.STATS_RECORD_BYTES, c.STATS_PAD_GRAN) == (2, 1024, 128) and c.STATS_RECORD_BYTES == c.STATS_STAGE_BYTES
+    assert cfgmod.cfg_for_stats_form(None) is r is cfgmod.cfg_for_stats_form("tma_ring") and cfgmod.cfg_for_stats_form("ldg") is c is cfgmod.cfg_for_stats_form(
+        None, "16w_fa4"
+    )
+    ring = cfgmod.BAR_LAYOUT_RING
+    assert len(ring) == 37 and sum(row[2] for row in ring) == 44 and cfgmod.BAR_LAYOUT_RING_END == 232016 and ring[0][1] == r.BARS == 231424
+    assert ring[:35] == tuple((n, off + 1024, sl, cnt, k, sc) for n, off, sl, cnt, k, sc in cfgmod.BAR_LAYOUT)  # the audited rows re-based, nothing else
+    assert ring[35] == ("stats_full", 231984, 2, c.ONE_LANE, "tma", "LOCAL") and ring[36] == ("stats_empty", 232000, 2, c.SOFTMAX_LANES, "thread", "LOCAL")
+    assert cfgmod.BAR_KIND_COUNTS_RING == {"tma_leader": 7, "mma": 9, "thread": 10, "leader": 6, "peer": 2, "tma_dsmem": 1, "tma": 2}
+    assert (
+        cfgmod.bar_layout_for_roles("16w", "tma_ring") is ring is cfgmod.bar_layout_for_roles("16w")
+        and cfgmod.bar_layout_for_roles("16w", "ldg") is cfgmod.BAR_LAYOUT
+    )
+    assert cfgmod.bar_layout_end_for_roles("16w", "tma_ring") == 232016 and cfgmod.bar_layout_end_for_roles("16w_fa4", "tma_ring") == 231984
+    dr = cfgmod.DBG_CLK_RING
+    assert (dr.SMEM, dr.WORDS, dr.BYTES) == (232016, 88, 352) and dr.SMEM + dr.BYTES == r.TMEM_HANDLE and dr.WORD == d.WORD  # derived: the re-based spare
+    assert [d.WORD[f"wait:{role}:{b}"] for role, b in cfgmod.DBG_CLK_RING_WAITS] == [82, 83] and cfgmod.dbg_clk_for_stats_form("tma_ring") is dr
+    assert cfgmod.dbg_clk_bytes(1, 1, 256, "ldg") == 2 * 384 and cfgmod.dbg_clk_bytes(1, 1, 256) == cfgmod.dbg_clk_bytes(1, 1, 256, "tma_ring") == 2 * 352
+    # the padded pre-scaled stats region (the contract): one (head, q tile) record = one ring stage image; PAD_TOTAL bounds every sequence's block
+    assert contract.ABI_VERSION == 2 and contract.STATS_KINDS == 2
+    assert contract.stats2_pad_total(4, 16384) == 16384 + 512 and contract.stats2_shape_strides(32, 16896) == ((32, 132, 2, 128), (132 * 256, 256, 128, 1))
+    for b, lens in ((3, (129, 0, 127)), (5, (300, 128, 1000, 0, 257)), (4, (1, 1, 1, 1))):
+        rounded_q = (sum(lens) + 127) // 128 * 128
+        assert sum((n + 127) // 128 * 128 for n in lens) <= contract.stats2_pad_total(b, rounded_q), (b, lens)
+    ldg_off, ring_off = contract.thd_workspace_offsets(2, 8, 1000, 1000), contract.thd_workspace_offsets(2, 8, 1000, 1000, True)
+    assert ldg_off[-1] is None and ring_off[-1] is not None and ldg_off[:3] == ring_off[:3] and ring_off[3] > ldg_off[3]  # the stats region replaces delta
+    assert contract.thd_workspace_layout(2, 8, 1000, 1000)[0][1][1] == (1, 8, 1024) and contract.thd_workspace_layout(2, 8, 1000, 1000, True)[0][1][1] == (
+        8,
+        10,
+        2,
+        128,
+    )
     assert (d.TAG_BACK_IN_TILE, d.TAG_BACK_TAIL, d.TAG_BACK_RELAY) == (2, 1, 1) and set(d.ROLE_WAITS) == {
         "leader",
         "softmax",
@@ -230,7 +294,8 @@ def test_2cta_stail_config_is_the_truth():
     }
     assert (
         cfgmod.dbg_clk_records(2, 8, 512) == 2 * 2 * 8 * 2
-        and cfgmod.dbg_clk_bytes(2, 8, 512) == 64 * cfgmod.DBG_CLK.BYTES
+        and cfgmod.dbg_clk_bytes(2, 8, 512) == 64 * cfgmod.DBG_CLK_RING.BYTES
+        and cfgmod.dbg_clk_bytes(2, 8, 512, "ldg") == 64 * cfgmod.DBG_CLK.BYTES
         and cfgmod.dbg_clk_region_offset(1000) == 1024
     )
     cfgmod.validate_config()
@@ -302,6 +367,57 @@ def test_2cta_stail_mask_form_is_typed():
     assert SdpaBwdDslSm100D128.mask_form is None  # the record default: today's rendering
     body = _body_module()
     assert (body.MASK_FORM_FSEL, body.MASK_FORM_PREDICATED, body.MASK_FORM_DIAG_OFF) == tuple(cfgmod.MASK_FORM_CODES[f] for f in _MASK_FORMS)
+
+
+def test_2cta_stail_stats_form_is_typed():
+    """``stats_form`` is a typed field (lever S1): ``None`` = the role shape's form -- "tma_ring" (THE default since the day-4 decision) under the
+    default roles, "ldg" under "16w_fa4" (the only form sited there); "ldg" is the other value (the previous default); anything else declines BY
+    NAME; the kernel's constants are the config's code space (config = truth); the adapter reader prefixes the engine name; the record default is
+    None; the combination rules: "tma_ring" NAMED x ``warp_roles = "16w_fa4"`` declines BY NAME at compile_host (the first build sites the ring in
+    the 16w bundle; the unset field is served there as ldg), "tma_ring" x ``debug_clk`` is SERVED (the re-based record carries the two ring wait
+    words), "tma_ring" x every probe / mask form passes."""
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
+    from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_grouped_2cta_host import compile_host
+    from cudnn.sdpa.bwd.prepared_sm100_d128_grouped_2cta import stats_form
+
+    c = cfgmod.CFG
+    assert c.STATS_FORMS == _STATS_FORMS and c.STATS_FORM_DEFAULT == "tma_ring" and tuple(cfgmod.STATS_FORM_CODES) == _STATS_FORMS
+    assert cfgmod.resolve_stats_form(None) == "tma_ring" == cfgmod.resolve_stats_form(None, "16w") and cfgmod.resolve_stats_form(None, "16w_fa4") == "ldg"
+    for form, code in (("ldg", 0), ("tma_ring", 1)):
+        assert cfgmod.resolve_stats_form(form) == form and cfgmod.stats_form_code(form) == code
+    assert cfgmod.stats_form_code(None) == 1 and cfgmod.stats_form_code(None, "16w_fa4") == 0
+    with pytest.raises(ValueError, match="warp_roles must be one of"):
+        cfgmod.resolve_stats_form(None, "bogus")
+    for bad_form in ("bogus", "", "TMA_RING", "tma", 1):
+        with pytest.raises(ValueError, match="stats_form must be one of"):
+            cfgmod.resolve_stats_form(bad_form)
+        with pytest.raises(ValueError, match="stats_form must be one of"):
+            cfgmod.stats_form_code(bad_form)
+    assert stats_form(SimpleNamespace(_NAME="sdpa_bwd_sm100_d128", stats_form="ldg")) == "ldg" and stats_form(SimpleNamespace(_NAME="x")) == "tma_ring"
+    assert stats_form(SimpleNamespace(_NAME="x", warp_roles="16w_fa4")) == "ldg" and stats_form(SimpleNamespace(_NAME="x", warp_roles="16w")) == "tma_ring"
+    with pytest.raises(ValueError, match="sdpa_bwd_sm100_d128: stats_form must be one of"):
+        stats_form(SimpleNamespace(_NAME="sdpa_bwd_sm100_d128", stats_form="ring"))
+    assert SdpaBwdDslSm100D128.stats_form is None  # the record default: unset = the role shape's form (tma_ring under 16w)
+    body = _body_module()
+    assert (
+        (body.STATS_FORM_LDG, body.STATS_FORM_TMA_RING) == (0, 1)
+        and body.STATS_RECORD_ELEMS == 256
+        and tuple(body.BarsRing._fields[-2:]) == ("stats_full", "stats_empty")
+    )
+    assert (
+        cfgmod.validate_fields_for_roles("16w", None, stats_form="tma_ring") == "16w"
+        and cfgmod.validate_fields_for_roles("16w", None, debug_clk=True, stats_form="tma_ring") == "16w"
+    )
+    for probe in _PROBES:
+        assert cfgmod.validate_fields_for_roles("16w", probe, stats_form="tma_ring") == "16w"
+    assert cfgmod.validate_fields_for_roles("16w_fa4") == "16w_fa4" and cfgmod.validate_fields_for_roles("16w_fa4", None, stats_form="ldg") == "16w_fa4"
+    with pytest.raises(ValueError, match="stats_form 'tma_ring' is not built under warp_roles '16w_fa4'"):
+        compile_host((2, 8, 2, True), (None,) * 9, (None,) * 9, None, True, 100, warp_roles="16w_fa4", stats_form="tma_ring")
+    with pytest.raises(ValueError, match="stats_form must be one of"):
+        compile_host((2, 8, 2, True), (None,) * 9, (None,) * 9, None, True, 100, stats_form="ring")
 
 
 def test_2cta_stail_tile_mask_predicate_is_exact_against_the_per_cell_mask():
@@ -439,6 +555,8 @@ def test_2cta_stail_fields_under_16w_fa4_decline_or_resite_by_name(tmp_path):
         compile_host((2, 8, 2, True), (None,) * 9, (None,) * 9, None, True, 100, warp_roles="16w_fa4", debug_clk=True)
     with pytest.raises(ValueError, match="dkv_accum 'fp32_reduce' is not built under warp_roles '16w_fa4'"):
         compile_host((2, 8, 2, True), (None,) * 9, (None,) * 9, None, True, 100, warp_roles="16w_fa4", dkv_accum="fp32_reduce")
+    with pytest.raises(ValueError, match="stats_form 'tma_ring' is not built under warp_roles '16w_fa4'"):  # lever S1: the ring is the 16w bundle's
+        compile_host((2, 8, 2, True), (None,) * 9, (None,) * 9, None, True, 100, warp_roles="16w_fa4", stats_form="tma_ring")
     assert cfgmod.validate_fields_for_roles("16w", None, debug_clk=True, dkv_accum="fp32_reduce") == "16w"
     assert cfgmod.UNSERVED_BARRIERS_XFA4 == ("dvk_stage_empty",) and "dvk_stage_empty" not in {row[0] for row in cfgmod.BAR_LAYOUT_XFA4}
     assert "dvk_stage_empty" in {row[0] for row in cfgmod.BAR_LAYOUT} and "dvk_stage_empty" not in _body_module().BarsXFA4._fields
@@ -451,7 +569,7 @@ def test_2cta_stail_fields_under_16w_fa4_decline_or_resite_by_name(tmp_path):
 
 def test_2cta_stail_host_renders_debug_clk_for_sm_100a(tmp_path):
     """``debug_clk = True`` (the STAMPS lever, header section 11) renders the %clock64 brackets (and the two %globaltimer body stamps) on top of the
-    SAME barrier census: 40 arrive / 68 try_wait / 11 expect_tx / 67 bar.warp.sync / 32 tcgen05.fence sites, the ship, the reduce-adds, the STS,
+    SAME barrier census: 42 arrive / 70 try_wait / 12 expect_tx / 69 bar.warp.sync / 32 tcgen05.fence sites, the ship, the reduce-adds, the STS,
     no local memory, no nanosleep, the default register split -- under a different md5; the default (False) rendering is the record's."""
     md5_on, census_on, regs_on = _render(tmp_path, {"debug_clk": True})
     print(f"\n2-CTA s_tail debug_clk sm_100a: PTX md5 {md5_on} census {census_on} setmaxnreg {regs_on}")
@@ -490,6 +608,119 @@ def test_2cta_stail_host_renders_mask_forms_for_sm_100a(tmp_path):
     assert census_d["selp_f32"] - census_o["selp_f32"] == CFG.MASK_SELECTS_PER_LANE_PER_TILE, (census_d, census_o)
     assert census_d["shr_u32"] - census_o["shr_u32"] == CFG.MASK_WORDS_PER_LANE_PER_TILE, (census_d, census_o)
     _assert_record(kernels_d, _RECORD, _RECORD_TOKEN, "the default (fsel) rendering: the mask-form chain must leave the default byte-identical")
+
+
+def test_2cta_stail_host_renders_stats_forms_for_sm_100a(tmp_path):
+    """Lever S1's two stats forms (header section 11): "tma_ring" named explicitly IS the default rendering (the record's per-kernel md5s, the default
+    census: the ring's 43 inits, one plain `cp.async.bulk` global -> shared, no `bar.sync 1,256`, no stats STS); "ldg" (the previous default) renders a
+    DIFFERENT PTX whose census differs EXACTLY by the rows the skeleton names (resources/s1-barrier-table.md 14.6): `bar.sync 1,256` 0 -> 4 and the two
+    stats STS 0 -> 4 (the `_stats` block back), the plain bulk copy 1 -> 0, the two ring rows' inits (-4), the ring's arm (expect_tx -1) and its release
+    (-1 plain arrive = arrive 42 -> 40), the two ring waits (try_wait 70 -> 68, bar.warp.sync 69 -> 67); the chain-level global-load count is equal
+    (the softmax's six loads against the loader's one and the setup / delta launches' five); every other row of the module census identical (no proxy
+    fence, no tcgen05 fence, no LDS.128 moved, the 144 / 144 / 80 split, no local memory, no nanosleep); each form matches its committed per-kernel
+    record rows (the ldg rows under their own token); the default x ``debug_clk`` renders with the ring's barrier census + the clock reads only."""
+    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import CFG_RING, STATS_RING_ROWS
+
+    md5_d, census_d, regs_d, kernels_d = _render_kernels(tmp_path, {}, _STATS_CENSUS)
+    md5_r, census_r, regs_r = _render(tmp_path, {"stats_form": "tma_ring"}, _STATS_CENSUS)
+    md5_l, census_l, regs_l, kernels_l = _render_kernels(tmp_path, {"stats_form": "ldg"}, _STATS_CENSUS)
+    print(f"\n2-CTA s_tail stats forms sm_100a: default {md5_d} tma_ring {md5_r} ldg {md5_l}; census {census_d} | {census_l}")
+    assert md5_r == md5_d and census_r == census_d and regs_r == regs_d, "tma_ring named explicitly is the default rendering"
+    assert {k: v for k, v in census_d.items() if k not in _STATS_CENSUS} == _EXPECTED, census_d
+    assert (census_d["bar_sync_1_256"], census_d["st_shared_b32"], census_d["bulk_g2s_plain"], census_d["mbarrier_init"]) == (0, 0, 1, 43), census_d
+    assert set(kernels_d) == set(_OWN_KERNELS) | set(D128_THD_SHARED_KERNELS), kernels_d  # the ring chain's five launches
+    _assert_record(kernels_d, _RECORD, _RECORD_TOKEN, "the default (tma_ring) rendering")
+    expected_ldg = dict(
+        _EXPECTED_LDG,
+        bar_sync_1_256=4,  # the named-barrier pair of `_stats` at its two sites (the item prologue, the per-tile lookahead)
+        st_shared_b32=4,  # the two stats STS per site
+        bulk_g2s_plain=0,  # the ring's copy is the ONLY plain global -> shared bulk copy of this body
+        mbarrier_init=census_d["mbarrier_init"] - len(STATS_RING_ROWS) * CFG_RING.STATS_STAGES,  # stats_full[2] + stats_empty[2] = 4 inits fewer
+        # the chain-level count (the module census spans the five launches): the MAIN kernel's two `_stats` sites load six words (origin word,
+        # LSE, delta x 2) where the ring's loader loads one (rowoff[b] per item) = +5; the setup kernel's row-offset loop (-2) and the pre-scaling
+        # delta launch's LSE / row-offset loads (-3) take the same five away: net 0 (per-kernel split: the host census of the writer's section)
+        ld_global=census_d["ld_global"],
+        fence_proxy_async=census_d["fence_proxy_async"],  # neither form needs a proxy fence for the stats (async write -> mbarrier -> generic read)
+    )
+    assert census_l == expected_ldg, {
+        k: (census_l.get(k), expected_ldg.get(k)) for k in set(census_l) | set(expected_ldg) if census_l.get(k) != expected_ldg.get(k)
+    }
+    assert regs_l == regs_d, "the 144 / 144 / 80 split is the same under both forms"
+    assert md5_l != md5_d, "ldg must render different PTX from tma_ring"
+    # the ldg chain's five launches: the compact delta launch; the main kernel and the setup kernel (no padded row-offset pass) render differently
+    # from the default's, the dQ cast is the same kernel; the shared fold is rendered and excluded from the pin
+    assert set(kernels_l) == set(_OWN_KERNELS_LDG) | set(D128_THD_SHARED_KERNELS), kernels_l
+    assert kernels_l[_OWN_KERNELS[2]] != kernels_d[_OWN_KERNELS[2]] and kernels_l[_OWN_KERNELS[3]] == kernels_d[_OWN_KERNELS[3]], (kernels_d, kernels_l)
+    _assert_record(kernels_l, _RECORD, _RECORD_TOKEN_LDG, "the ldg rendering")
+    md5_c, census_c, regs_c = _render(tmp_path, {"debug_clk": True}, _STATS_CENSUS)
+    assert census_c["clock64"] > 0 and md5_c != md5_d and regs_c == regs_d
+    # the STAMPS lever adds its clock reads, its record's word stores (st.shared.b32: the 88-word record, zeroed and accumulated) and its record
+    # LDS; every barrier / TMA / copy row is the ring's (the two ring wait words bracket the two ring waits: no barrier moves)
+    moved_by_clk = ("clock64", "lds_v4_b32", "st_shared_b32")
+    assert census_c["st_shared_b32"] > 0, "the STAMPS record's stores (the stats STS stay gone: the default render above pins 0)"
+    assert {k: v for k, v in census_c.items() if k not in moved_by_clk} == {k: v for k, v in census_d.items() if k not in moved_by_clk}
+
+
+def test_2cta_stail_stats_ring_sites_follow_the_skeleton():
+    """SOURCE assertions on lever S1's sites (resources/s1-barrier-table.md sections 1 / 7.1 / 14 -- the deterministic-hang topologies the skeleton
+    ruled out become rows): every stats-ring statement sits under `if cutlass.const_expr(tma_ring):` (the ldg rendering has no stats_full / stats_empty /
+    bulk copy), every `_stats` call under `not tma_ring` (the tma_ring rendering has no `bar.sync 1,256`); the softmax waits stats_full AFTER the
+    s_read arrive and BEFORE _p_values, releases stats_empty right after _ds_values (its last stats read) and before the STORE wait, with a plain
+    `_wait` (never `_wait_tcgen`, no proxy fence); the loader waits stats_empty, arms stats_full with `pred=own_pred` (`elect_sync()`, never
+    `is_leader`) and issues ONE `bulk_copy` onto its OWN mbar right after Q1(t) and before the dO1 wait; both ring states are declared BEFORE the
+    persistent loop and advanced once per tile inside it (never reset at the item top: the odd-K hang of the skeleton's 14.4)."""
+    src = _body_source()
+    softmax = _function_code(src, "_softmax_loop", "_epilogue_loop")
+    loader = _function_code(src, "_load_loop", "_store_loop")
+
+    def guarded(lines, needle, guard):
+        hits = [i for i, ln in enumerate(lines) if needle in ln]
+        assert hits, needle
+        for i in hits:
+            indent = len(lines[i]) - len(lines[i].lstrip())
+            j = i - 1
+            while j >= 0 and (len(lines[j]) - len(lines[j].lstrip()) >= indent or not lines[j].strip().startswith("if cutlass.const_expr(")):
+                j -= 1
+            assert j >= 0 and guard in lines[j], (needle, lines[i].strip(), lines[j].strip() if j >= 0 else None)
+        return hits
+
+    first = lambda lines, needle: next(i for i, ln in enumerate(lines) if needle in ln)  # noqa: E731
+    # the softmax: declared before the loop; the wait after s_read and before _p_values; the release after _ds_values and before the STORE wait
+    while_at = first(softmax, "while valid != 0:")
+    assert first(softmax, "stats_state = PipelineState.start()") < while_at and sum("stats_state = PipelineState.start(" in ln for ln in softmax) == 1
+    guarded(softmax, "stats_state = PipelineState.start()", "tma_ring")
+    wait_at = guarded(softmax, "_wait(bars.stats_full[stats_state.idx], stats_state.phase", "tma_ring")[0]
+    assert first(softmax, "_arrive_leader(bars.s_read)") < wait_at < first(softmax, "p = _p_values(slab, stats_base,")
+    assert not any("_wait_tcgen(bars.stats_full" in ln for ln in softmax) and not any("fence_proxy" in ln and "stats" in ln for ln in softmax)
+    rel_at = guarded(softmax, "bars.stats_empty[stats_state.idx].arrive()", "tma_ring")[0]
+    ds_at = first(softmax, "words = _ds_values(slab, stats_base + CFG.STATS_DELTA_OFF,")
+    store_waits = [i for i, ln in enumerate(softmax) if "tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)" in ln]
+    assert ds_at < rel_at < min(i for i in store_waits if i > ds_at)
+    adv_at = guarded(softmax, "stats_state = advance(stats_state, CFG_RING.STATS_STAGES)", "tma_ring")[0]
+    assert rel_at < adv_at and adv_at < first(softmax, "tile_state = advance(tile_state, 1)") and adv_at > while_at
+    for needle in ("_stats(slab, lse, delta, row, group, lo * CFG.N,", "_stats(slab, lse, delta, row, group, (qtile + 1) * CFG.N,"):
+        guarded(softmax, needle, "not tma_ring")
+    assert not any("named_barrier_fence(CFG.SOFTMAX_BARRIER" in ln for ln in softmax)  # the pair lives inside `_stats` only (retired with it)
+    # the loader: declared before the loop; the own-CTA arm; wait -> arm -> ONE bulk copy after Q1(t) and before the dO1 wait; one advance per tile
+    lwhile = first(loader, "while valid != 0:")
+    assert first(loader, "stats_ld = PipelineState.start(phase=1)") < lwhile and sum("stats_ld = PipelineState.start(" in ln for ln in loader) == 1
+    guarded(loader, "stats_ld = PipelineState.start(phase=1)", "tma_ring")
+    guarded(loader, "own_pred = nvvm.elect_sync()", "tma_ring")
+    lwait = guarded(loader, "_wait(bars.stats_empty[stats_ld.idx], stats_ld.phase", "tma_ring")[0]
+    arm = guarded(loader, "bars.stats_full[stats_ld.idx].arrive(n_bytes=CFG.STATS_TX, pred=own_pred)", "tma_ring")[0]
+    copy = guarded(loader, "bulk_copy(", "tma_ring")[0]
+    q1_load = [i for i, ln in enumerate(loader) if "tma_slice_runtime_desc(q1_desc, 0, q_row + q_half, head, 0)" in ln][0]
+    assert q1_load < lwait < arm < copy < first(loader, "_wait(bars.do1_empty, do1_state.phase")
+    depth, end = 0, copy  # the copy call's extent (black spreads its arguments over lines): the mbar operand is OUR stats_full copy
+    while True:
+        depth += loader[end].count("(") - loader[end].count(")")
+        if depth <= 0:
+            break
+        end += 1
+    assert sum("bulk_copy(" in ln for ln in loader) == 1 and any("bars.stats_full[stats_ld.idx].smem_ptr" in ln for ln in loader[copy : end + 1])
+    assert not any("is_leader" in ln and "stats_full" in ln for ln in loader) and not any("tma_tensormap_acquire" in ln and "stats" in ln for ln in loader)
+    ladv = guarded(loader, "stats_ld = advance(stats_ld, CFG_RING.STATS_STAGES)", "tma_ring")[0]
+    assert copy < ladv and ladv < first(loader, "pair, head, batch, valid, sched_state = _next_tile(")
 
 
 def test_2cta_stail_dp_empty_is_arrived_at_the_ds_readout_before_the_recv_arm():
@@ -737,6 +968,76 @@ _MASK_TWIN_CASES = [
 ]
 
 
+_STATS_TWIN_CASES = [
+    pytest.param(dict(lq=(256, 256), lk=(256, 256), hq=4, hkv=2, causal=True), id="uniform-256-causal"),
+    pytest.param(dict(lq=(1024,), lk=(1024,), hq=8, hkv=1, causal=True, stats_layout="HN"), id="uniform-1024-gqa8-causal-HN"),
+    pytest.param(dict(lq=(384, 384), lk=(384, 384), hq=4, hkv=2, causal=False), id="uniform-384-noncausal"),  # S % 128 = 0, S % 256 != 0
+    pytest.param(dict(lq=(256, 512, 768, 1024), lk=(256, 512, 768, 1024), hq=4, hkv=2, causal=True), id="ramp-1024-causal"),  # dead pairs = zero-trip items
+    pytest.param(dict(lq=(129, 0, 127, 1), lk=(65, 128, 0, 3), hq=4, hkv=2, causal=True), id="suite-degenerate-causal"),  # len % 128 == 1, empty, 1 row
+    pytest.param(dict(lq=(129, 0, 127, 1), lk=(65, 128, 0, 3), hq=6, hkv=2, causal=False, stats_layout="HN"), id="suite-degenerate-noncausal-HN"),
+    pytest.param(dict(lq=(65, 0, 3), lk=(17, 129, 0), hq=6, hkv=2, causal=True, stats_layout="HN"), id="short-pair-half-dead-HN"),
+    pytest.param(dict(lq=(300, 300), lk=(300, 300), hq=3, hkv=1, causal=True), id="pair-tail-300"),  # S % 128 = 44: a partial last q tile, pad rows
+    pytest.param(dict(lq=(0, 0), lk=(0, 0), hq=3, hkv=1, causal=True, stats_layout="HN", envelope=(128, 128)), id="all-empty"),
+    pytest.param(dict(lq=(300, 128, 1000), lk=(2000, 700, 1000), hq=4, hkv=2, causal=True), id="zero-trip-mix"),  # N = 3 / 1 / 0 items; 8 pairs
+    pytest.param(dict(lq=(128, 64), lk=("skv", "skv - 256"), hq=8, hkv=1, causal=True), id="n_q-1-pairs-gt-sms"),  # n_q == 1, two items per CTA
+]
+
+
+@pytest.mark.parametrize("spec", _STATS_TWIN_CASES)
+def test_2cta_stail_stats_forms_agree_bitwise(spec):
+    """Lever S1's twin (G09: a claim BY CONSTRUCTION -- the tma_ring stat words are the SAME two fp32 multiplies on the same operands, performed
+    once per q row in the delta launch instead of per (row, pair) in the softmax; a pad row's 0.0 is the ldg form's `stat = 0`): dK / dV BITWISE
+    between stats_form = ldg and tma_ring on every row, dQ BITWISE where the sequences have at most _DQ_ORDER_FREE_PAIRS kv pairs, by the fp64 gate
+    beyond; each form passes the suite's fp64 gate first.  The rows: the 8-cell THD matrix (incl. S % 256 != 0 at 384, S % 128 != 0 at 300 = pad rows
+    in the padded stats region, a sequence of 129 rows = len % 128 == 1, empty sequences, a 1-row sequence, dead pairs = zero-trip items) in BOTH Stats
+    layouts (token-major TH1 and head-major HN: the delta launch reads either), the all-empty THD case, the zero-trip mix, and n_q == 1 with more
+    pairs than SMs (two items per CTA: the k-indexed ring across items, never a per-item stage reset)."""
+    _require_2cta()
+    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import CFG
+
+    spec = dict(spec)
+    lq, lk, causal = spec.pop("lq"), spec.pop("lk"), spec.pop("causal")
+    if lk and lk[0] == "skv":
+        sms = torch.cuda.get_device_properties(0).multi_processor_count
+        skv = 256 * ((sms // (spec["hq"] * 2)) + 2) + 128  # pairs x hq x b > sms, the last pair half-dead (the P14 row's cell)
+        lk = (skv, skv - 256)
+    case = make_case(lq, lk, thd=True, dtype=torch.bfloat16, causal=causal, stats_layout=spec.pop("stats_layout", "TH1"), **spec)
+    dq_bitwise = max(lk) <= _DQ_ORDER_FREE_PAIRS * CFG.PAIR_KV_ROWS
+    grads = {}
+    for form in _STATS_FORMS:
+        api = make_adapter_2cta_stail(case, stats_form=form)
+        workspace = make_workspace(api.scratch_workspace_bytes())
+        poison(case, workspace)
+        api.execute(**adapter_arguments(case), workspace=workspace.tensor)
+        torch.cuda.synchronize()
+        check_case(case, workspace)
+        grads[form] = {role: case.tensors[role][0].detach().clone() for role in ("dq", "dk", "dv")}
+    for role in ("dk", "dv") + (("dq",) if dq_bitwise else ()):
+        assert torch.equal(grads["ldg"][role].view(torch.int16), grads["tma_ring"][role].view(torch.int16)), f"{role}: ldg vs tma_ring differ bitwise"
+
+
+def test_2cta_stail_tma_ring_launch_count_and_stats_launch():
+    """Under stats_form = tma_ring the chain is still five launches: the nine-map setup (now also writing the padded row offsets), the pre-scaling
+    padded delta launch ``delta_zero_stats_thd_d128_2cta_kernel`` (replacing ``delta_zero_thd_d128_kernel``), the pair MAIN kernel, the cast, the fold;
+    the workspace carries the padded stats region instead of the compact delta (the contract's layout) and is larger than the ldg form's."""
+    _require_2cta()
+    case = make_case((256, 300), (256, 300), hq=4, hkv=2, thd=True, dtype=torch.bfloat16, causal=True)
+    plain = make_adapter_2cta_stail(case, stats_form="ldg")
+    api, workspace = _run_case(case, repeats=1, stats_form="tma_ring")
+    assert api.scratch_workspace_bytes() > plain.scratch_workspace_bytes(), "the padded pre-scaled stats region is larger than the compact delta"
+    names = []
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        api.execute(**adapter_arguments(case), workspace=workspace.tensor)
+        torch.cuda.synchronize()
+    for event in prof.events():
+        if event.device_type == torch.autograd.DeviceType.CUDA:
+            names.append(event.name)
+    kernels = [n for n in names if n.startswith("cudnn_kernel_")]
+    assert len(kernels) == 5, kernels
+    assert any("delta_zero_stats_thd_d128_2cta_kernel" in n for n in kernels) and not any("delta_zero_thd_d128_kernel" in n for n in kernels), kernels
+    assert any("bprop_d128_accum_grouped_2cta_stail_kernel" in n for n in kernels) and any("setup_thd_d128_2cta_kernel" in n for n in kernels), kernels
+
+
 @pytest.mark.parametrize("spec", _MASK_TWIN_CASES)
 def test_2cta_stail_mask_forms_agree_bitwise(spec):
     """The mask-form twin (a claim BY CONSTRUCTION: a masked P / dS cell is exactly +0.0 under fsel and under predicated, and an interior
@@ -788,17 +1089,20 @@ def test_2cta_stail_debug_clk_dump_accounts_the_waits():
     iff its magic word matches, and a never-launched cluster leaves BOTH of its CTAs' records unwritten."""
     _require_2cta()
     from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
-    from cudnn.sdpa.bwd.prepared_sm100_d128_grouped_2cta import debug_clk_records
+    from cudnn.sdpa.bwd.prepared_sm100_d128_grouped_2cta import debug_clk_record, debug_clk_records
 
-    d = cfgmod.DBG_CLK
-    W = d.WORD
     hq, hkv = 4, 2
     case = make_case((256, 512), (256, 512), hq=hq, hkv=hkv, thd=True, dtype=torch.bfloat16, causal=True, stats_layout="TH1")
     _bitwise_twin(case, make_adapter_2cta_stail, lambda c: make_adapter_2cta_stail(c, debug_clk=True), "the stamps lever (off vs on)")
     plain = make_adapter_2cta_stail(case)
     api = make_adapter_2cta_stail(case, debug_clk=True)
+    d = debug_clk_record(api)  # the record the carve and the dump use: derived from the layout the body renders (never a literal here)
+    W = d.WORD
     n_rec = cfgmod.dbg_clk_records(case.batch, hq, api.s_k_max)
-    assert api.scratch_workspace_bytes() >= plain.scratch_workspace_bytes() + n_rec * d.BYTES, "the dump region is carved only under the lever"
+    assert (
+        d.BYTES == 4 * d.WORDS and api.scratch_workspace_bytes() >= plain.scratch_workspace_bytes() + n_rec * d.BYTES
+    ), "the dump region is carved only under the lever, sized exactly n_rec x record"
+    assert api.scratch_workspace_bytes() < plain.scratch_workspace_bytes() + n_rec * d.BYTES + 2 * d.RECORD_ALIGN, "no second record size hides in the carve"
     assert debug_clk_records(plain, make_workspace(plain.scratch_workspace_bytes()).tensor) is None
     workspace = make_workspace(api.scratch_workspace_bytes())
     poison(case, workspace)
@@ -1024,13 +1328,20 @@ _DKV_ACCUM_SEAM_ROWS = {
     "follower_epilogue_item_end": "store-drain seam (lever 3): the FOLLOWER's late item-end readout holds round 1 -> dvk_stage_empty (THREAD 32 / 32, "
     "LOCAL) -> round 2 -> the item-end drain -> dvk_empty (pair-wide 64) / k2_empty: the leader's next dS write / ship waits on BOTH CTAs' drains",
 }
-_SKEW_ROWS = [pytest.param(site, None, id=site) for site in SITES] + [
-    pytest.param(site, "fp32_reduce", id=f"{site}-fp32_reduce") for site in _DKV_ACCUM_SEAM_ROWS
-]
+# ``stats_form = "tma_ring"`` (lever S1; the S1 skeleton section 10): the levers that reach the ring's two new waits -- the LOADER lever (the loader's
+# item-top sleep delays stats(t) behind the softmax's wait: a bounded stats_full stall, never a hang), the FOLLOWER softmax's S^T-read lever (the softmax
+# behind the loader: the loader's stats_empty credit wait is the one that blocks -- bounded by the ring's depth) and the leader's ship lever (the
+# exchange chain late while the ring keeps running).  Each a fresh child; the pass criterion is the SAME fp64 gate + capture / replay.
+_STATS_RING_SKEW_ROWS = ("loader_zero_trip", "softmax_s_read", "leader_ship")
+_SKEW_ROWS = (
+    [pytest.param(site, None, None, id=site) for site in SITES]
+    + [pytest.param(site, "fp32_reduce", None, id=f"{site}-fp32_reduce") for site in _DKV_ACCUM_SEAM_ROWS]
+    + [pytest.param(site, None, "tma_ring", id=f"{site}-tma_ring") for site in _STATS_RING_SKEW_ROWS]
+)
 
 
-@pytest.mark.parametrize("site, dkv_accum", _SKEW_ROWS)
-def test_sdpa_bwd_d128_2cta_stail_survives_pair_skew(site, dkv_accum, tmp_path):
+@pytest.mark.parametrize("site, dkv_accum, stats_form", _SKEW_ROWS)
+def test_sdpa_bwd_d128_2cta_stail_survives_pair_skew(site, dkv_accum, stats_form, tmp_path):
     """One lever per id on the SECOND body (``SITES[site]``: role, site, delay, what it isolates, the RED form, the expected PASS): a fresh process
     arms ``FROST_D128_2CTA_DEBUG_<SITE>_DELAY_US`` before the body executes, runs the skew / p14 cell (more pairs than SMs) under ``process_watchdog``
     and asserts the fp64 gate eagerly and under capture / replay.  Exit 70 or a subprocess timeout = HANG -> the barrier AUDIT, never a bigger
@@ -1039,6 +1350,8 @@ def test_sdpa_bwd_d128_2cta_stail_survives_pair_skew(site, dkv_accum, tmp_path):
     pass criterion is the SAME gate (the fp32 form is tighter on every validated cell) -- never a widened tolerance."""
     row = SITES[site]
     fields = {} if dkv_accum is None else {"dkv_accum": dkv_accum}
+    if stats_form is not None:
+        fields["stats_form"] = stats_form  # lever S1: the typed stats form in the child, as the driver sets it
     form = "bf16_partials" if dkv_accum is None else dkv_accum
     seam = _DKV_ACCUM_SEAM_ROWS.get(site, "(the field does not move this lever's bytes)") if dkv_accum else ""
     assert row["lever"] in set(LEVER_LINE.findall(_body_source())), f"the second body must expose {row['lever']}"
@@ -1060,7 +1373,7 @@ def test_sdpa_bwd_d128_2cta_stail_survives_pair_skew(site, dkv_accum, tmp_path):
         fields=fields,
         dkv=form,
     )
-    tag = f"{site}_{form}"
+    tag = f"{site}_{form}" + ("" if stats_form is None else f"_{stats_form}")
     (tmp_path / f"skew_stail_{tag}.py").write_text(script)
     print(f"\n[{site}] {row['role']} sleeps {row['delay_us']} us at {row['site']}; isolates {row['isolates']}; RED = {row['red']}; GREEN = {row['green']}")
     if dkv_accum:

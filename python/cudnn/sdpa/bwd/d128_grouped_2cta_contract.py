@@ -17,10 +17,33 @@ from .d128_grouped_contract import PARTIAL_ITEMSIZE
 from .d128_grouped_contract import validate_thd_bounds as _validate_grouped_thd_bounds
 from .d128_thd_contract import ORIGIN_PORTS
 
-ABI_VERSION = 1
+ABI_VERSION = 2  # 2: the ``stats_form = "tma_ring"`` workspace form (the padded pre-scaled stats region + the padded row offsets; header section 14)
 THD = "accumulation_grouped_thd_2cta"
 MAPS_PER_SEQUENCE = CFG.MAPS_PER_SEQUENCE
 UNIT_ROWS = CFG.THD_UNIT_ROWS  # 256 kv rows per CLC work item (one cga2 pair)
+# --- stats_form = "tma_ring" (the s_tail body's header section 11; config_sm100_d128_accum_2cta_stail.CFG.STATS_FORMS): the delta launch
+# writes the softmax's stat words PRE-SCALED and q-tile-PADDED into ``stats2`` = fp32 [heads][PAD_TOTAL / N][STATS_KINDS][N] -- kind 0 =
+# -log2(e) * LSE (0 for an LSE of -inf), kind 1 = -scale * delta; the pad rows [S_b, ceil(S_b / N) * N) of every sequence hold 0.0 = the ldg
+# form's `stat = 0` for a row past the sequence, bit for bit -- and the main kernel's loader bulk-copies ONE (head, q tile) block = STATS_KINDS
+# x N x 4 B = 1 KiB per tile into its SMEM stats ring (no tensor map, no clip: a tile never crosses its sequence's padded block).  PAD_TOTAL =
+# rounded_q + N * batch is the host bound on sum_b ceil(S_b / N) * N; ``rowoff[b] = sum_{i < b} ceil(S_i / N) * N`` (+ the total at [batch])
+# is written by the setup kernel (tile_dsl.thd.write_thd_row_offsets) into its own Int32 [batch + 1] region -- the 4B+4 metadata tensor
+# keeps its shape (a tensor's extent is part of the kernel's mangled signature: the ldg rendering pin).  Under "ldg" the compact delta region
+# and the shipped layout are unchanged.
+STATS_KINDS = 2
+
+
+def stats2_pad_total(batch, rounded_q):
+    """The padded token total of the tma_ring stats region: every sequence rounded UP to a whole q tile (N), bounded on the host."""
+    return rounded_q + CFG.N * batch
+
+
+def stats2_shape_strides(heads, pad_total):
+    """The ``stats2`` tensor as the delta launch writes it and the loader addresses it: [heads][pad_total / N tiles][STATS_KINDS][N] fp32,
+    one (head, tile) block contiguous = STATS_KINDS * N elements = the SMEM ring stage image [LSE row | delta row]."""
+    tiles = pad_total // CFG.N
+    return (heads, tiles, STATS_KINDS, CFG.N), (tiles * STATS_KINDS * CFG.N, STATS_KINDS * CFG.N, CFG.N, 1)
+
 
 # --- the per-S HEURISTIC: which body serves a BF16 grouped THD request (the adapter's typed op-level field ``cta_pair``) --------------------
 # One place for every number the selector reads (G10 config-as-truth; test_sdpa_bwd_d128_cta_pair_heuristic.py pins each).  The selector
@@ -142,11 +165,19 @@ def validate_thd_bounds(batch, heads, kv_heads, sq, skv, tq, tkv, tq_phys, tkv_p
         raise ValueError("pair launch envelope exceeds the grid or Int32 work-id range")
 
 
-def thd_workspace_offsets(batch, heads, tq, tkv):
-    """Shared host/trace arithmetic; no value reads from device metadata.  Byte offsets from the 256-B aligned payload."""
+def thd_workspace_offsets(batch, heads, tq, tkv, stats_ring=False):
+    """Shared host/trace arithmetic; no value reads from device metadata.  Byte offsets from the 256-B aligned payload.  ``stats_ring``
+    (``stats_form = "tma_ring"``): the compact delta region is replaced by the padded pre-scaled ``stats2`` region followed by the Int32
+    ``rowoff`` [batch + 1] region (``None`` under the ldg form); every later offset follows.  Returns ``(rounded_q, rounded_k, delta_or_stats2,
+    meta, origins, maps, dk, dv, regions_end, rowoff)``."""
     rounded_q = (tq + 127) // 128 * 128
     delta = 4 * rounded_q * heads * 128
-    meta = delta + 4 * rounded_q * heads
+    if stats_ring:
+        rowoff = delta + _align(CFG.BPE_ACC * STATS_KINDS * stats2_pad_total(batch, rounded_q) * heads)
+        meta = rowoff + _align(4 * (batch + 1))
+    else:
+        rowoff = None
+        meta = delta + 4 * rounded_q * heads
     origins = meta + _align(4 * (4 * batch + 4))
     maps = origins + _align(8 * len(ORIGIN_PORTS) * batch)
     prefix_end = maps + MAPS_PER_SEQUENCE * batch * 128
@@ -154,20 +185,26 @@ def thd_workspace_offsets(batch, heads, tq, tkv):
     dk = _align(prefix_end)
     size = rounded_k * heads * 128 * PARTIAL_ITEMSIZE
     dv = dk + _align(size)
-    return rounded_q, rounded_k, delta, meta, origins, maps, dk, dv, dv + size
+    return rounded_q, rounded_k, delta, meta, origins, maps, dk, dv, dv + size, rowoff
 
 
-def thd_workspace_layout(batch, heads, tq, tkv):
-    """Compact FP32 dQ / Delta, metadata, INT64 origins, nine per-sequence maps, native compact-KV partials."""
+def thd_workspace_layout(batch, heads, tq, tkv, stats_ring=False):
+    """Compact FP32 dQ / Delta (or the padded pre-scaled stats region + the padded row offsets under ``stats_ring``), metadata, INT64 origins,
+    nine per-sequence maps, native compact-KV partials."""
     if any(type(n) is not int or n <= 0 for n in (batch, heads, tq, tkv)):
         raise ValueError("grouped 2-CTA d128 packed workspace dimensions must be positive integers")
-    rounded_q, rounded_k, delta, meta, origins, maps, dk, dv, total = thd_workspace_offsets(batch, heads, tq, tkv)
+    rounded_q, rounded_k, delta, meta, origins, maps, dk, dv, total, rowoff = thd_workspace_offsets(batch, heads, tq, tkv, stats_ring)
     if total + WORKSPACE_SLACK > 2**63 - 1:
         raise ValueError("grouped 2-CTA d128 packed workspace exceeds the signed pointer range")
     kv_shape, kv_strides = (1, rounded_k, heads, 128), (rounded_k * heads * 128, heads * 128, 128, 1)
+    if stats_ring:
+        stats_shape, stats_strides = stats2_shape_strides(heads, stats2_pad_total(batch, rounded_q))
+        stats_regions = ((delta, stats_shape, stats_strides), (rowoff, (batch + 1,), (1,)))
+    else:
+        stats_regions = ((delta, (1, heads, rounded_q), (heads * rounded_q, rounded_q, 1)),)
     regions = (
         (0, (1, rounded_q, heads, 128), (rounded_q * heads * 128, heads * 128, 128, 1)),
-        (delta, (1, heads, rounded_q), (heads * rounded_q, rounded_q, 1)),
+        *stats_regions,
         (meta, (4 * batch + 4,), (1,)),
         (origins, (len(ORIGIN_PORTS), batch), (batch, 1)),
         (maps, (MAPS_PER_SEQUENCE * batch * 16,), (1,)),
