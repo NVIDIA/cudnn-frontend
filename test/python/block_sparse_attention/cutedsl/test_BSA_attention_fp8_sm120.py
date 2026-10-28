@@ -314,6 +314,82 @@ def test_sm120_fp8_per_token_scale_views(sk, scale_layout):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("sk", (256, 320))
+@pytest.mark.parametrize("scale_layout", ("contiguous", "padded_aligned", "broadcast"))
+@pytest.mark.parametrize("variable_counts", (False, True))
+@torch_fork_set_rng(seed=28132)
+def test_sm120_fp8_per_token_tma_scales_match_fallback_and_replay(monkeypatch, sk, scale_layout, variable_counts):
+    """TMA scale loads share K's barrier and preserve tails and scalar views."""
+    _require_sm120(per_token=True)
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    from cudnn.block_sparse_attention._fp8_quant import _quantize_sage_bhsd
+
+    batch, heads, sq = 2, 2, 147
+    q = torch.randn((batch, heads, sq, 128), device="cuda", dtype=torch.bfloat16)
+    k, v = [torch.randn((batch, heads, sk, 128), device=q.device, dtype=q.dtype) for _ in range(2)]
+    packed = list(_quantize_sage_bhsd(q, k, v, v_block_size=128, k_quant_block_size=1))
+    scales = packed[4]
+    if scale_layout == "padded_aligned":
+        storage = torch.empty((*scales.shape[:-1], sk + 4), device=q.device, dtype=scales.dtype)
+        scales = storage[..., :sk].copy_(scales)
+    elif scale_layout == "broadcast":
+        scales = scales[:1, :1].expand(batch, heads, sk)
+    packed[4] = scales
+    reference_storage = torch.empty(scales.numel() + 1, device=q.device, dtype=scales.dtype)
+    reference_scales = reference_storage[1:].view_as(scales).copy_(scales)
+    reference_packed = list(packed)
+    reference_packed[4] = reference_scales
+    nk = (sk + 127) // 128
+    indices = torch.arange(nk - 1, -1, -1, device=q.device, dtype=torch.int32).expand(batch, heads, 2, nk).contiguous()
+    kwargs = dict(sparse_block_size=128, v_block_size=128, k_quant_block_size=1)
+    if variable_counts:
+        counts = torch.full((batch, heads, 2), nk, device=q.device, dtype=torch.int32)
+        counts[0, 0, 0] = 0
+        sizes = torch.full((nk,), 73, device=q.device, dtype=torch.int32)
+        sizes[0] = 0
+        sizes[-1] = min(41, sk - (nk - 1) * 128)
+        kwargs.update(q2k_block_nums=counts, block_sizes=sizes)
+    monkeypatch.setattr(interface._bsa_attn_fwd_sm120_fp8, "compile_cache", {})
+    original_compile = interface.cute.compile
+    compiled_flags = []
+
+    def record_compile(instance, *args, **kw):
+        compiled_flags.append(instance.k_scale_tma)
+        return original_compile(instance, *args, **kw)
+
+    monkeypatch.setattr(interface.cute, "compile", record_compile)
+
+    def run(inputs):
+        return interface._bsa_attn_fwd_sm120_fp8(*inputs, indices, nk, 128**-0.5, **kwargs)
+
+    expected = run(reference_packed)
+    actual = run(packed)
+    for result, reference in zip(actual, expected):
+        torch.testing.assert_close(result, reference, rtol=0, atol=0)
+    assert compiled_flags[0] is False
+    assert compiled_flags[-1] is (scale_layout != "broadcast")
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            captured = run(packed)
+        # A broadcast view must update its non-overlapping source only once.
+        if scale_layout == "broadcast":
+            scales[:1, :1].mul_(0.75)
+        else:
+            scales.mul_(0.75)
+        packed[5].mul_(1.5)
+        reference_scales.copy_(scales)
+        for result in captured:
+            result.fill_(float("nan"))
+        graph.replay()
+        expected = run(reference_packed)
+        for result, reference in zip(captured, expected):
+            torch.testing.assert_close(result, reference, rtol=0, atol=0)
+    finally:
+        graph.reset()
+
+
+@pytest.mark.L0
 def test_sm120_fp8_per_token_dsl_gate(monkeypatch):
     ops = _require_sm120(per_token=True)
     from cudnn.frost import buffers

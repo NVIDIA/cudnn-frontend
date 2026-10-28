@@ -8,6 +8,8 @@ FP8 fragment/softmax helpers use per-row Q, per-16-token or per-token K,
 and per-channel V scaling; no blk64 attention kernel is launched.
 """
 
+from typing import Optional
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
@@ -224,12 +226,15 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
         k_quant_block_size: int = 16,
         tile_m: int = 128,
         wave_split: int = 0,
+        k_scale_tma: bool = False,
         _query_start: int = 0,
         _query_count: int = 0,
     ):
         assert v_block_size in (0, 128)
         if k_quant_block_size not in (1, 16):
             raise ValueError("k_quant_block_size must be 1 or 16")
+        self.k_scale_tma = k_scale_tma
+        assert not k_scale_tma or (k_quant_block_size == 1 and v_block_size == 128)
         self.k_quant_block_size = k_quant_block_size
         self.v_block_size = v_block_size
         if v_block_size == 0:
@@ -294,6 +299,7 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
                 block_sizes_mode=block_sizes_mode,
                 v_block_size=v_block_size,
                 k_quant_block_size=k_quant_block_size,
+                k_scale_tma=k_scale_tma,
             )
             self.bulk = type(self)(**common, tile_m=128, _query_count=wave_split)
             self.tail = type(self)(**common, tile_m=64, _query_start=wave_split * 2)
@@ -527,12 +533,15 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
         )
         self.O_smem_layout = cute.select(O_smem_layout_staged, mode=[0, 1])
 
+        KScale_smem_layout = cute.make_layout((128, self.kv_stage))
+
         @cute.struct
         class SharedStorage:
             Q_barrier: cute.struct.MemRange[cutlass.Int64, self.q_stage * 2]
             K_barrier: cute.struct.MemRange[cutlass.Int64, self.kv_stage * 2]
             V_barrier: cute.struct.MemRange[cutlass.Int64, self.kv_stage * 2]
 
+            KScale_smem: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 128 * self.kv_stage if self.k_scale_tma else 0], 128]
             Q_smem: cute.struct.Align[cute.struct.MemRange[self.Q_dtype, cute.cosize(self.Q_smem_layout) if self.tile_m == 128 else 0], 128]
             K_smem: cute.struct.Align[cute.struct.MemRange[self.K_dtype, cute.cosize(self.K_smem_layout)], 128]
             V_smem: cute.struct.Align[cute.struct.MemRange[self.V_dtype, cute.cosize(self.V_smem_layout)], 128]
@@ -562,6 +571,19 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
             (self.tile_shape_pv[1], self.tile_shape_pv[2]),
             num_multicast=1,
         )
+
+        tma_atom_KScale, tma_tensor_KScale = None, None
+        if cutlass.const_expr(self.k_scale_tma):
+            # The interface checks base/stride alignment before selecting this
+            # specialization. K and its descales share one transaction barrier.
+            scale_tensor = cute.make_tensor(mKScale.iterator.align(16), mKScale.layout)
+            tma_atom_KScale, tma_tensor_KScale = cute.nvgpu.cpasync.make_tiled_tma_atom(
+                tma_copy_op,
+                scale_tensor,
+                KScale_smem_layout,
+                (128,),
+                num_multicast=1,
+            )
 
         tma_copy_op = cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp()
         tma_atom_O, tma_tensor_O = cute.nvgpu.cpasync.make_tiled_tma_atom(
@@ -609,6 +631,8 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
             self.Vt_smem_layout,
             self.O_smem_layout,
             softmax_scale * log2_e,
+            tma_tensor_KScale,
+            tma_atom_KScale,
         ).launch(
             grid=grid_config,
             block=block_config,
@@ -645,6 +669,8 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
         Vt_smem_layout: cute.ComposedLayout,
         O_smem_layout: cute.ComposedLayout,
         scale_softmax_log2e: cutlass.Float32,
+        mKScaleCoords: Optional[cute.Tensor],
+        tma_atom_KScale: Optional[cute.CopyAtom],
     ):
         tidx, _, _ = cute.arch.thread_idx()
         lane_idx = cute.arch.lane_idx()
@@ -671,6 +697,8 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_Q)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_K)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_V)
+            if cutlass.const_expr(self.k_scale_tma):
+                cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_KScale)
 
             if cutlass.const_expr(self.use_tma_o):
                 cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_O)
@@ -692,7 +720,7 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
             num_stages=self.kv_stage,
             producer_group=cg,
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_mma_warps),
-            tx_count=cute.size_in_bytes(self.K_dtype, cute.select(K_smem_layout, mode=[0, 1])),
+            tx_count=cute.size_in_bytes(self.K_dtype, cute.select(K_smem_layout, mode=[0, 1])) + (512 if self.k_scale_tma else 0),
             barrier_storage=shared_storage.K_barrier.data_ptr(),
             cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
         )
@@ -715,6 +743,8 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
         else:
             q_buffer = shared_storage.Q_smem.data_ptr()
         sQ = cute.make_tensor(cute.recast_ptr(q_buffer, Q_smem_layout.inner, dtype=self.Q_dtype), Q_smem_layout.outer)
+        if cutlass.const_expr(self.k_scale_tma):
+            sKScale = shared_storage.KScale_smem.get_tensor(cute.make_layout((128, self.kv_stage)))
         sK = shared_storage.K_smem.get_tensor(K_smem_layout.outer, swizzle=K_smem_layout.inner)
         sV = shared_storage.V_smem.get_tensor(V_smem_layout.outer, swizzle=V_smem_layout.inner)
         p_smem_atom = cute.nvgpu.tcgen05.make_smem_layout_atom(cute.nvgpu.tcgen05.SmemLayoutAtomKind.MN_SW64, self.Q_dtype)
@@ -791,6 +821,19 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
             cute.group_modes(gV, 0, 2),
         )
 
+        if cutlass.const_expr(self.k_scale_tma):
+            gScale = cute.local_tile(
+                mKScaleCoords[None, work_desc.kv_head_idx, work_desc.batch_idx],
+                (128,),
+                (None,),
+            )
+            tKSs, tKSg = cute.nvgpu.cpasync.tma_partition(
+                tma_atom_KScale,
+                *cta_coord_layout,
+                cute.group_modes(sKScale, 0, 1),
+                cute.group_modes(gScale, 0, 1),
+            )
+
         # Keep the dynamic budget within the CTA allocation: 256 * 240 +
         # 128 * 24 = 64512 registers. Raising the donor budget to 32 while
         # retaining 240 compute registers can deadlock setmaxnreg.inc.
@@ -814,6 +857,13 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
                     tKsK[None, K_producer_state.index],
                     tma_bar_ptr=K_pipeline.producer_get_barrier(K_producer_state),
                 )
+                if cutlass.const_expr(self.k_scale_tma):
+                    cute.copy(
+                        tma_atom_KScale,
+                        tKSg[None, physical_idx],
+                        tKSs[None, K_producer_state.index],
+                        tma_bar_ptr=K_pipeline.producer_get_barrier(K_producer_state),
+                    )
                 K_pipeline.producer_commit(K_producer_state)
                 K_producer_state.advance()
                 V_pipeline.producer_acquire(V_producer_state)
@@ -955,7 +1005,9 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
                     B_uses_fp8_ldsm=True,
                 )
 
-                if cutlass.const_expr(self.k_quant_block_size == 1):
+                if cutlass.const_expr(self.k_scale_tma):
+                    tKScale = _apply_per_token_k_scales_fp8(tSrS, tScS, sKScale[None, k_stage], cutlass.Int32(0))
+                elif cutlass.const_expr(self.k_quant_block_size == 1):
                     tKScale = _apply_per_token_k_scales_fp8(tSrS, tScS, gKScale, n_tile_idx)
                 else:
                     tKScale = _load_sage_k_scales_fp8(tScS, gKScale, n_tile_idx, self.tile_size)

@@ -1593,6 +1593,15 @@ def _bsa_attn_fwd_sm120_fp8(
     current_stream = cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
     tile_m = sparse_block_size
     wave_split = 0
+    k_scale_tma = (
+        sparse_block_size == 128
+        and k_quant_block_size == 1
+        and v_block_size == 128
+        and k_scale_t.dtype == torch.float32
+        and k_scale_t.data_ptr() % 16 == 0
+        and k_scale_t.stride(0) == 1
+        and all(stride > 0 and stride % 4 == 0 for stride in k_scale_t.stride()[1:])
+    )
     if sparse_block_size == 128 and k_quant_block_size == 1 and v_block_size == 128 and not has_block_nums and not has_block_sizes:
         num_sms = _get_device_sm_count_for_device(q_fp8.device.index)
         num_query_tiles = num_q_blocks * batch * num_heads
@@ -1616,7 +1625,11 @@ def _bsa_attn_fwd_sm120_fp8(
         has_block_nums=has_block_nums,
         block_sizes_mode=block_sizes_mode,
         **({"v_block_size": v_block_size} if v_block_size else {}),
-        **({"k_quant_block_size": k_quant_block_size, "tile_m": tile_m, "wave_split": wave_split} if sparse_block_size == 128 else {}),
+        **(
+            {"k_quant_block_size": k_quant_block_size, "tile_m": tile_m, "wave_split": wave_split, "k_scale_tma": k_scale_tma}
+            if sparse_block_size == 128
+            else {}
+        ),
     )
     compile_options = getattr(fwd_kernel, "_compile_options", "")
     if has_block_nums or fixed_block_sparse_num < getattr(fwd_kernel, "_compile_min_blocks", 0):
@@ -1629,6 +1642,7 @@ def _bsa_attn_fwd_sm120_fp8(
             k_quant_block_size,
             tile_m,
             wave_split,
+            k_scale_tma,
             head_dim,
             has_block_nums,
             has_block_sizes,
