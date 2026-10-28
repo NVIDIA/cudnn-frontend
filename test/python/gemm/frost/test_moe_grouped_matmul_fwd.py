@@ -2249,7 +2249,7 @@ def test_moe_swap_ab_plain_graph_coordinates_and_public_replay(aligned):
 def test_moe_templates_follow_internal_operation(block_scale, monkeypatch):
     from cudnn.gemm.frost import fusion_ir, kernel_registry as R
     from cudnn.gemm.frost.sm100 import compiler as C
-    from test_moe_grouped_block_scale_matmul_fwd import _build_graph as build_bs
+    from moe_block_scale_test_utils import _build_graph as build_bs
 
     graph = (build_bs if block_scale else _build_graph)(2, 176, 256, 256, num_groups=4)
     chain = analyze(graph)
@@ -2352,7 +2352,7 @@ def test_moe_swap_ab_sweep_includes_geometry_rejected_by_original_graph(monkeypa
 @pytest.mark.parametrize("swap", [False, True])
 def test_moe_norm2_is_refused_at_probe_and_jit(block_scale, swap):
     from cudnn.gemm.frost.sm100 import compiler
-    from test_moe_grouped_block_scale_matmul_fwd import _build_graph as build_bs
+    from moe_block_scale_test_utils import _build_graph as build_bs
 
     graph = (build_bs if block_scale else _build_graph)(
         2,
@@ -2376,7 +2376,7 @@ def _run_moe_swap_ab_quant(case, *, block_scale=False):
     from cudnn.gemm.frost.fusion_ir import segmented_row_scale_capacity_rows
     from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
     from cudnn.gemm.frost.sm100 import compiler as C
-    from test_moe_grouped_block_scale_matmul_fwd import _build_graph as build_bs
+    from moe_block_scale_test_utils import _build_graph as build_bs
 
     col = case in ("col", "col_grouped", "multi")
     grouped = case in ("row_grouped", "col_grouped")
@@ -2511,7 +2511,7 @@ def test_moe_swap_ab_quant(case):
 @pytest.mark.parametrize("grouped", [False, True])
 def test_moe_swap_ab_token_quant_requires_aligned_groups(block_scale, grouped, monkeypatch):
     from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
-    from test_moe_grouped_block_scale_matmul_fwd import _build_graph as build_bs
+    from moe_block_scale_test_utils import _build_graph as build_bs
 
     C = plan_as_sm100(monkeypatch)
     graph = (build_bs if block_scale else _build_graph)(2, 256, 128, 256, num_groups=4)
@@ -2550,7 +2550,7 @@ def _run_moe_swap_ab_reductions(axis, *, block_scale=False, reduction_kind="basi
     from contextlib import nullcontext
     from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
     from cudnn.gemm.frost.sm100 import compiler as C
-    from test_moe_grouped_block_scale_matmul_fwd import _build_graph as build_bs
+    from moe_block_scale_test_utils import _build_graph as build_bs
 
     avg = reduction_kind == "avg"
     products = reduction_kind == "products"
