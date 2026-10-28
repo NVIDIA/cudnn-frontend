@@ -880,7 +880,9 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.device_index = int(api.q_desc.device.index or 0)
     # The decode tile's ragged-Q leg (api.thd_decode_leg): a split launch by construction.
     s.ragged = bool(getattr(api, "thd_decode_leg", False))
-    s.ragged_q_lens = int(getattr(api, "_ragged_q_lens", 0)) if s.ragged else 0
+    # Standalone THD always requires Q lengths. Graph lowering may explicitly
+    # select the legacy offset-only form when the graph has no length operand.
+    s.ragged_q_lens = int(getattr(api, "_ragged_q_lens", 2 if getattr(api, "cu_seq_q_lens", False) else 1)) if s.ragged else 0
     if s.ragged_q_lens:
         from cudnn import _pybind_module
 

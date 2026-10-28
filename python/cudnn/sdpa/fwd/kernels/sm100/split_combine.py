@@ -368,12 +368,15 @@ def _ld_global_f32(addr):
     return cutlass.Float32(r[0] if isinstance(r, (tuple, list)) else r)
 
 
+@cute.jit
 def _query_length(q_lens, batch):
     """Lengths and adjacent prefix pairs are two plan-time views of device data."""
     a = cutlass.make_array_view(q_lens)
     if cutlass.const_expr(cute.rank(q_lens) == 2):
-        return cutlass.Int64(a[batch, 1]) - cutlass.Int64(a[batch, 0])
-    return cutlass.Int64(a[batch])
+        length = cutlass.Int64(a[batch, 1]) - cutlass.Int64(a[batch, 0])
+    else:
+        length = cutlass.Int64(a[batch])
+    return length
 
 
 def _row_sink_logit(sinks, q_lens, head, batch, q_row):
@@ -2602,6 +2605,48 @@ def _host_ptr_ragged(
     stats_log2: cutlass.Constexpr[bool],
     decode_grid: cutlass.Constexpr[int],
     stream: _cuda_driver.CUstream = None,
+) -> None:
+    """Preserve the offset-only entry's positional ABI; None is not a runtime slot."""
+    _host_ptr_ragged_q_lens(
+        o_partial_ptr,
+        lse_partial_ptr,
+        o_out_ptr,
+        lse_out_ptr,
+        problem_size,
+        n_splits,
+        o_strides,
+        lse_strides,
+        ragged_q_ptr,
+        ragged_o_ptr,
+        ragged_lse_ptr,
+        ragged_divs,
+        ragged_caps,
+        stats_log2,
+        decode_grid,
+        stream,
+        q_lens_ptr=None,
+        q_lens_prefix=False,
+    )
+
+
+@cute.jit
+def _host_ptr_ragged_q_lens(
+    o_partial_ptr: cute.Pointer,
+    lse_partial_ptr: cute.Pointer,
+    o_out_ptr: cute.Pointer,
+    lse_out_ptr: Optional[cute.Pointer],
+    problem_size: Tuple[int, int, int, int],
+    n_splits: cutlass.Int32,
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    ragged_q_ptr: cute.Pointer,
+    ragged_o_ptr: cute.Pointer,
+    ragged_lse_ptr: Optional[cute.Pointer],
+    ragged_divs: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    ragged_caps: Tuple[cutlass.Int32, cutlass.Int32],
+    stats_log2: cutlass.Constexpr[bool],
+    decode_grid: cutlass.Constexpr[int],
+    stream: _cuda_driver.CUstream = None,
     q_lens_ptr: Optional[cute.Pointer] = None,
     q_lens_prefix: cutlass.Constexpr[bool] = False,
 ) -> None:
@@ -2746,6 +2791,50 @@ def _host_ptr_sink_q_lens(
 
 @cute.jit
 def _host_ptr_ragged_sink(
+    o_partial_ptr: cute.Pointer,
+    lse_partial_ptr: cute.Pointer,
+    o_out_ptr: cute.Pointer,
+    lse_out_ptr: Optional[cute.Pointer],
+    problem_size: Tuple[int, int, int, int],
+    n_splits: cutlass.Int32,
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    ragged_q_ptr: cute.Pointer,
+    ragged_o_ptr: cute.Pointer,
+    ragged_lse_ptr: Optional[cute.Pointer],
+    ragged_divs: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    ragged_caps: Tuple[cutlass.Int32, cutlass.Int32],
+    sinks_ptr: cute.Pointer,
+    stats_log2: cutlass.Constexpr[bool],
+    decode_grid: cutlass.Constexpr[int],
+    stream: _cuda_driver.CUstream = None,
+) -> None:
+    """Preserve the offset-only entry's positional ABI; None is not a runtime slot."""
+    _host_ptr_ragged_sink_q_lens(
+        o_partial_ptr,
+        lse_partial_ptr,
+        o_out_ptr,
+        lse_out_ptr,
+        problem_size,
+        n_splits,
+        o_strides,
+        lse_strides,
+        ragged_q_ptr,
+        ragged_o_ptr,
+        ragged_lse_ptr,
+        ragged_divs,
+        ragged_caps,
+        sinks_ptr,
+        stats_log2,
+        decode_grid,
+        stream,
+        q_lens_ptr=None,
+        q_lens_prefix=False,
+    )
+
+
+@cute.jit
+def _host_ptr_ragged_sink_q_lens(
     o_partial_ptr: cute.Pointer,
     lse_partial_ptr: cute.Pointer,
     o_out_ptr: cute.Pointer,
@@ -2956,7 +3045,11 @@ def compile_ptr(
         # The ragged-Q leg's entry appends the offsets / divisors / capacities; the
         # dense entry's positional ABI stays exactly what its callers pass.
         off_t = cutlass.Int64 if ragged_i64 else cutlass.Int32
-        entry, extra = (_host_ptr_ragged_sink if has_sink else _host_ptr_ragged), (
+        if ragged_q_lens:
+            entry = _host_ptr_ragged_sink_q_lens if has_sink else _host_ptr_ragged_q_lens
+        else:
+            entry = _host_ptr_ragged_sink if has_sink else _host_ptr_ragged
+        extra = (
             P(off_t),
             P(off_t),
             P(off_t) if has_lse else None,

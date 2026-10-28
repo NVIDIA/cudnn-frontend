@@ -92,7 +92,11 @@ For single-Q ragged split decode, physical Q-offset differences can include
 storage gaps. The combine must use the declared device Q lengths (ordinary or
 cumulative), independently of output addresses. Exercise an empty sequence with
 nonzero offset distance and assert that both O and Stats canaries remain intact;
-`test_half_q_single_q_ragged_decode` covers eager, rebinding and retained replay.
+`test_half_q_single_q_ragged_decode` covers graph and standalone execution,
+rebinding and retained replay. Standalone THD requires Q lengths independently
+of the dense-only `seq_q_lens_present` flag: bind against the compiled spec,
+validate ordinary B or cumulative B+1 storage, and reject uncompiled operands.
+A graph-only test misses a direct-API operand silently dropped by that flag.
 
 **Rule S2 — A change to any FROST SDPA `Capabilities` row updates
 `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` in the same commit.**

@@ -349,7 +349,8 @@ def test_gate_in_combine_on_the_decode_grid(dtype, splits):
 @L0
 @pytest.mark.parametrize("splits", [4, 32], ids=lambda s: f"s{s}")
 @pytest.mark.parametrize("i64", [pytest.param(False, id="i32", marks=_gpu), pytest.param(True, id="i64", marks=_gpu)])
-def test_ragged_placement_on_the_decode_grid(i64, splits):
+@pytest.mark.parametrize("sink", [False, True], ids=["plain", "sink"])
+def test_ragged_placement_on_the_decode_grid(i64, splits, sink):
     """The ragged-Q decode leg's entry: three sequences of 2 / 0 / 1 query rows (``S_q`` max 2) land on the packed O / Stats
     at their offsets (tokens 0, 1 and 2; the zero-length sequence writes nothing), the rows past a sequence's length are not
     written, a canary past the capacity is untouched, the values match the reference, and ON == OFF bitwise at <= 16 splits."""
@@ -357,6 +358,12 @@ def test_ragged_placement_on_the_decode_grid(i64, splits):
 
     b, h, sq, d = 3, 4, 2, 256
     op, lp, ref_o, ref_lse = _partials(b, h, sq, d, splits)
+    sinks = torch.linspace(-0.5, 0.5, h, dtype=torch.float32, device="cuda") if sink else None
+    if sink:
+        logits = sinks.double().cpu().view(1, h, 1)
+        weight = torch.sigmoid(ref_lse - logits)
+        ref_o = ref_o * weight.permute(0, 2, 1).unsqueeze(-1)
+        ref_lse = torch.logaddexp(ref_lse, logits)
     off_t = torch.int64 if i64 else torch.int32
     q_lens = [2, 0, 1]
     tok_off = [0, 2, 2, 3]  # exclusive prefix sums
@@ -366,7 +373,7 @@ def test_ragged_placement_on_the_decode_grid(i64, splits):
     ro = rq.clone()
     rl = torch.tensor([t * h for t in tok_off], dtype=off_t, device="cuda")
     cap = tok_off[-1]
-    fns = _entries(comb, dtype_o="bf16", has_lse=True, dtype_partial="f32", ragged=True, ragged_i64=i64)
+    fns = _entries(comb, dtype_o="bf16", has_lse=True, dtype_partial="f32", ragged=True, ragged_i64=i64, has_sink=sink)
     outs = {}
     for name, fn in fns.items():
         o = torch.full((1, cap + 2, h, d), -31.0, device="cuda", dtype=torch.bfloat16)  # two canary tokens past the capacity
@@ -385,6 +392,7 @@ def test_ragged_placement_on_the_decode_grid(i64, splits):
             rl.data_ptr(),
             (h * d, h * d, h),
             (cap, cap),
+            *((sinks.data_ptr(),) if sink else ()),
             torch.cuda.current_stream().cuda_stream,
         )
         torch.cuda.synchronize()

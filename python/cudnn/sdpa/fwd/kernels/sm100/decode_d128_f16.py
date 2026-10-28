@@ -841,8 +841,8 @@ def _tmaldg_warp_group(
     else:
         tma_q = GmemTileTma(tma_q_desc)
     if cutlass.const_expr(thd_origins is not None and not PAGED_KV):
-        tma_k = lambda d, h, row, b: origin_tma_slice(o_desc_words, 2, n_batch, b, d, h, row)
-        tma_v = lambda d, h, row, b: origin_tma_slice(o_desc_words, 3, n_batch, b, d, h, row)
+        tma_k = lambda d, h, row, b: origin_tma_slice(o_desc_words, 2, n_batch, b, d, h, row)  # noqa: E731
+        tma_v = lambda d, h, row, b: origin_tma_slice(o_desc_words, 3, n_batch, b, d, h, row)  # noqa: E731
     elif cutlass.const_expr(CFG.THD_VARLEN and not PAGED_KV):
         # THD: K/V ride the setup kernel's packed-total-clamped runtime
         # descriptors (o_desc_words slots n_batch+1 / n_batch+2), so the last

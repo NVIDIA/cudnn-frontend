@@ -4297,11 +4297,21 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 raise ValueError(f"cudnn.sdpa: split workspace requires {required} bytes")
             workspace_ptr = ws.ptr
 
+        # Use the compiled operand contract: ragged THD requires Q lengths
+        # even though seq_q_lens_present is the dense padded-Q flag.
+        self._value_error_if(spec.seq_q_present and seq_q_lens is None, "seq_q_lens is required by this compiled specialization")
+        self._value_error_if(
+            not spec.seq_q_present and seq_q_lens is not None, "seq_q_lens was provided but this specialization was compiled without Q lengths"
+        )
+        q_lens = None
+        if spec.seq_q_present:
+            check_q_lens = self._checked_cu_seq_lens if spec.ragged_q_lens == 2 else self._checked_seq_lens
+            q_lens = check_q_lens(seq_q_lens, "seq_q_lens")
+
         if spec.native is not None:
             # Standalone lengths require exactly the declared batch, whereas
             # graph binding allows a larger carrier for an effective batch.
             kv_lens = self._checked_seq_lens(seq_kv_lens, "seq_kv_lens") if seq_kv_lens is not None else None
-            q_lens = self._checked_seq_lens(seq_q_lens, "seq_q_lens") if self.seq_q_lens_present else None
             if spec.combine is not None and spec.combine.gate is not None:
                 # The gate rides the combine (the decode tile's split): bound to the gated
                 # combine entry for this launch, never handed to the native binder (which
@@ -4344,7 +4354,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             lse=facts_of_tensor(lse_tensor),
             sinks=facts_of_tensor(self._checked_sinks_1d(sinks) if sinks is not None else None),
             seq_kv_lens=facts_of_tensor(self._checked_seq_lens(seq_kv_lens, "seq_kv_lens") if seq_kv_lens is not None else None),
-            seq_q_lens=facts_of_tensor(self._checked_seq_lens(seq_q_lens, "seq_q_lens") if self.seq_q_lens_present else None),
+            seq_q_lens=facts_of_tensor(q_lens),
             block_table=facts_of_tensor(block_table),
             block_table_v=facts_of_tensor(block_table_v),
             gate=facts_of_tensor(gate),

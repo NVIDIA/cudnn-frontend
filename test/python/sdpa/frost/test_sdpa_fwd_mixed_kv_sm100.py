@@ -301,8 +301,9 @@ def test_mixed_decode_resource_domain(q, kv):
     + [(torch.bfloat16, torch.bfloat16), (torch.float16, torch.float16)],
 )
 @pytest.mark.parametrize("prefix_q", [False, True])
+@pytest.mark.parametrize("entry", ["graph", "standalone"])
 @torch_fork_set_rng(seed=49383)
-def test_half_q_single_q_ragged_decode(qdtype, kvdtype, prefix_q, cudnn_handle):
+def test_half_q_single_q_ragged_decode(qdtype, kvdtype, prefix_q, entry, cudnn_handle):
     import cudnn
     from cudnn.engines.manifest import family_for
     from cudnn.sdpa.fwd.prepared import PreparedDenseLaunch
@@ -359,42 +360,72 @@ def test_half_q_single_q_ragged_decode(qdtype, kvdtype, prefix_q, cudnn_handle):
     handle, saved_stream = cudnn_handle, cudnn.get_stream(cudnn_handle)
     captures = []
     try:
-        graph = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, handle=handle)
-        nodes = {name: graph.tensor_like(t) for name, t in first.items() if name not in ("q", "o", "stats")}
-        nodes["q"] = graph.tensor(dim=(b, h, 1, d), stride=(h * d, d, h * d, 1), data_type=io).set_ragged_offset(nodes["ro_q"])
-        nodes["o"], nodes["stats"] = graph.sdpa(
-            q=nodes["q"],
-            k=nodes["k"],
-            v=nodes["v"],
-            generate_stats=True,
-            attn_scale=d**-0.5,
-            use_padding_mask=True,
-            **({"cu_seq_len_q": nodes["ql"]} if prefix_q else {"seq_len_q": nodes["ql"]}),
-            seq_len_kv=nodes["kl"],
-            paged_attention_k_table=nodes["kt"],
-            paged_attention_v_table=nodes["vt"],
-            paged_attention_max_seq_len_kv=page * blocks,
-        )
-        nodes["o"].set_output(True).set_dim((b, h, 1, d)).set_stride((h * d, d, h * d, 1)).set_data_type(io).set_ragged_offset(nodes["ro_o"])
-        nodes["stats"].set_output(True).set_dim((b, h, 1, 1)).set_stride((h, 1, h, 1)).set_data_type(cudnn.data_type.FLOAT).set_ragged_offset(nodes["ro_stats"])
-        graph.validate()
-        graph.build_operation_graph()
-        graph.create_execution_plan(
-            family_for(graph).offered_ids()["sdpa_fwd_prefill_sm100"],
-            {
-                cudnn.knob_type.TILE_CGA_M: 1,
-                cudnn.knob_type.PACK_GQA: 1,
-                cudnn.knob_type.SPLIT_KV: 5 if hnd else 2,
-            },
-        )
-        graph.select_plan(0)
-        graph.check_support()
-        graph.build_plans()
-        compiled = graph._compiled_plans[graph._plan_index]
-        assert compiled._compiled.kernel_template == "decode_d128_f16"
-        assert isinstance(compiled._prepared, PreparedDenseLaunch)
-        assert compiled._prepared.spec.ragged_q_lens == (2 if prefix_q else 1)
-        workspace = torch.empty(max(1, graph.get_workspace_size()), dtype=torch.uint8, device="cuda")
+        if entry == "graph":
+            graph = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, handle=handle)
+            nodes = {name: graph.tensor_like(t) for name, t in first.items() if name not in ("q", "o", "stats")}
+            nodes["q"] = graph.tensor(dim=(b, h, 1, d), stride=(h * d, d, h * d, 1), data_type=io).set_ragged_offset(nodes["ro_q"])
+            nodes["o"], nodes["stats"] = graph.sdpa(
+                q=nodes["q"],
+                k=nodes["k"],
+                v=nodes["v"],
+                generate_stats=True,
+                attn_scale=d**-0.5,
+                use_padding_mask=True,
+                **({"cu_seq_len_q": nodes["ql"]} if prefix_q else {"seq_len_q": nodes["ql"]}),
+                seq_len_kv=nodes["kl"],
+                paged_attention_k_table=nodes["kt"],
+                paged_attention_v_table=nodes["vt"],
+                paged_attention_max_seq_len_kv=page * blocks,
+            )
+            nodes["o"].set_output(True).set_dim((b, h, 1, d)).set_stride((h * d, d, h * d, 1)).set_data_type(io).set_ragged_offset(nodes["ro_o"])
+            nodes["stats"].set_output(True).set_dim((b, h, 1, 1)).set_stride((h, 1, h, 1)).set_data_type(cudnn.data_type.FLOAT).set_ragged_offset(
+                nodes["ro_stats"]
+            )
+            graph.validate()
+            graph.build_operation_graph()
+            graph.create_execution_plan(
+                family_for(graph).offered_ids()["sdpa_fwd_prefill_sm100"],
+                {
+                    cudnn.knob_type.TILE_CGA_M: 1,
+                    cudnn.knob_type.PACK_GQA: 1,
+                    cudnn.knob_type.SPLIT_KV: 5 if hnd else 2,
+                },
+            )
+            graph.select_plan(0)
+            graph.check_support()
+            graph.build_plans()
+            compiled = graph._compiled_plans[graph._plan_index]
+            assert compiled._compiled.kernel_template == "decode_d128_f16"
+            assert isinstance(compiled._prepared, PreparedDenseLaunch)
+            assert compiled._prepared.spec.ragged_q_lens == (2 if prefix_q else 1)
+            workspace = torch.empty(max(1, graph.get_workspace_size()), dtype=torch.uint8, device="cuda")
+        else:
+            from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+            api = SdpaFwdDslSm100(
+                sample_q=first["q"].as_strided((b, h, 1, d), (h * d, d, h * d, 1)),
+                sample_k=first["k"],
+                sample_v=first["v"],
+                sample_o=first["o"].as_strided((b, h, 1, d), (h * d, d, h * d, 1)),
+                sample_lse=first["stats"].as_strided((b, h, 1), (h, 1, h)),
+                thd=True,
+                max_total_seq_len_q=capacity,
+                seq_kv_lens_present=True,
+                cu_seq_q_lens=prefix_q,
+                paged_page_size=page,
+                paged_max_seq_len_kv=page * blocks,
+                paged_table_stride=tuple(first["kt"].view(b, blocks).stride()),
+                paged_table_v_stride=tuple(first["vt"].view(b, blocks).stride()),
+                ragged_divisors=(h * d, h * d, h),
+                ragged_offsets_int64=hnd,
+                cga=1,
+                pack_gqa=True,
+                split_kv=5 if hnd else 2,
+            )
+            api.check_support()
+            api.compile()
+            assert api.thd_decode_leg
+            workspace = torch.empty(max(1, api.scratch_workspace_bytes()), dtype=torch.uint8, device="cuda")
 
         def poison(values):
             values["o"].fill_(-17)
@@ -402,8 +433,25 @@ def test_half_q_single_q_ragged_decode(qdtype, kvdtype, prefix_q, cudnn_handle):
             workspace.fill_(255)
 
         def execute(values):
-            cudnn.set_stream(handle, torch.cuda.current_stream().cuda_stream)
-            graph.execute({nodes[name]: t for name, t in values.items()}, workspace, handle=handle)
+            if entry == "graph":
+                cudnn.set_stream(handle, torch.cuda.current_stream().cuda_stream)
+                graph.execute({nodes[name]: t for name, t in values.items()}, workspace, handle=handle)
+            else:
+                api.execute(
+                    values["q"],
+                    values["k"],
+                    values["v"],
+                    values["o"],
+                    values["stats"],
+                    seq_q_lens=values["ql"],
+                    seq_kv_lens=values["kl"],
+                    workspace=workspace,
+                    block_table=values["kt"].view(b, blocks),
+                    block_table_v=values["vt"].view(b, blocks),
+                    ragged_q=values["ro_q"],
+                    ragged_o=values["ro_o"],
+                    ragged_lse=values["ro_stats"],
+                )
 
         def verify(values, state):
             ql, kl, starts = state
@@ -427,11 +475,27 @@ def test_half_q_single_q_ragged_decode(qdtype, kvdtype, prefix_q, cudnn_handle):
             assert torch.all(data["o"][~o_written] == -17)
             assert torch.all(data["stats"][~st_written] == -29)
 
+        fill(first)
         poison(first)
         invalid = dict(first, ql=torch.zeros(b if prefix_q else b - 1, 1, 1, 1, device="cuda", dtype=torch.int32))
         with pytest.raises(ValueError, match="seq_q_lens"):
             execute(invalid)
         assert torch.all(first["o"] == -17) and torch.all(first["stats"] == -29)
+        if entry == "standalone":
+            # Standalone THD requires lengths even though dense-only
+            # seq_q_lens_present is false. Reject before any output write.
+            n = b + int(prefix_q)
+            for invalid_q in (
+                None,
+                torch.zeros(n + 1, device="cuda", dtype=torch.int32),
+                torch.zeros(n, device="cuda", dtype=torch.int64),
+                torch.zeros(n * 2, device="cuda", dtype=torch.int32)[::2],
+                torch.zeros(n, dtype=torch.int32),
+            ):
+                with pytest.raises(ValueError, match="seq_q_lens"):
+                    execute(dict(first, ql=invalid_q))
+                assert torch.all(first["o"] == -17) and torch.all(first["stats"] == -29)
+            assert api._dense_spec.ragged_q_lens == (2 if prefix_q else 1)
 
         for values in (first, buffers()):
             state = fill(values)
