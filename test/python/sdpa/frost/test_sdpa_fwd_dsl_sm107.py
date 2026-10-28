@@ -8797,3 +8797,35 @@ def test_d256_pack_gqa_divisibility_rule_is_exempted_on_the_rubin_decode_tile_on
     a = api()
     assert a.check_support()
     assert a._decode_q_tile() == 16 and a._decode_q_tile_for(1, 15, 5) == 16
+
+
+class TestMixedFp8Kv:
+    """Native mixed K/V coverage in the architecture CI's selected entry."""
+
+    from mixed_kv_sm107_cases import (
+        graph_admission,
+        native_resources,
+        dense_paged,
+        paged_origins,
+        thd_origins,
+        thd_uniform_control,
+        single_q,
+        single_q_unsplit,
+        single_q_sink,
+        compact_split,
+        dense_paged_decline,
+        uniform_control,
+    )
+
+    test_graph_admission = staticmethod(graph_admission)
+    test_native_resources = staticmethod(native_resources)
+    test_dense_paged = staticmethod(dense_paged)
+    test_paged_origins = staticmethod(paged_origins)
+    test_thd_origins = staticmethod(thd_origins)
+    test_thd_uniform_control = staticmethod(thd_uniform_control)
+    test_single_q = staticmethod(single_q)
+    test_single_q_unsplit = staticmethod(single_q_unsplit)
+    test_single_q_sink = staticmethod(single_q_sink)
+    test_compact_split = staticmethod(compact_split)
+    test_dense_paged_decline = staticmethod(dense_paged_decline)
+    test_uniform_control = staticmethod(uniform_control)

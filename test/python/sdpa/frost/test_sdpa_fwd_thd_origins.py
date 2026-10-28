@@ -39,11 +39,13 @@ pytestmark = [requires_dsl]
         pytest.param((576, 512), "float16", "token", False, True, 9, marks=pytest.mark.L1, id="d576_split9_fp16_partial_pack"),
     ],
 )
-def test_independent_thd_origins_rebind_and_capture(dim, dtype_name, stats_layout, total_hints, pack_gqa, splits, kv_dtype_name=None):
+def test_independent_thd_origins_rebind_and_capture(
+    dim, dtype_name, stats_layout, total_hints, pack_gqa, splits, kv_dtype_name=None, engine_name="sdpa_fwd_prefill_sm100"
+):
     import cudnn
     import torch
 
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (((10, 7),) if engine_name.endswith("sm107") else ((10, 0), (10, 3))):
         pytest.skip("SM100/SM103 physical THD origin path")
     torch.manual_seed(117)
     d_qk, d_v = dim if isinstance(dim, tuple) else (dim, dim)
@@ -138,7 +140,7 @@ def test_independent_thd_origins_rebind_and_capture(dim, dtype_name, stats_layou
         from cudnn.engines.manifest import family_for
 
         graph.create_execution_plan(
-            family_for(graph).offered_ids()["sdpa_fwd_prefill_sm100"],
+            family_for(graph).offered_ids()[engine_name],
             {
                 cudnn.knob_type.TILE_CGA_M: 1 if d_qk == 128 and splits > 1 else 2,
                 cudnn.knob_type.PACK_GQA: int(pack_gqa),
@@ -148,11 +150,12 @@ def test_independent_thd_origins_rebind_and_capture(dim, dtype_name, stats_layou
         graph.select_plan(0)
     else:
         graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-        index = next(i for i in range(len(graph.plans)) if graph.get_plan_name_at_index(i).startswith("sdpa_fwd_prefill_sm100"))
+        index = next(i for i in range(len(graph.plans)) if graph.get_plan_name_at_index(i).startswith(engine_name))
         graph.select_plan(index)
     graph.check_support()
     graph.build_plans()
-    assert graph.get_plan_name_at_index(graph._plan_index).startswith("sdpa_fwd_prefill_sm100")
+    assert graph.get_plan_name_at_index(graph._plan_index).startswith(engine_name)
+    assert graph._compiled_plans[graph._plan_index]._prepared.spec.origin_specs is not None
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
 
     def poison(values):

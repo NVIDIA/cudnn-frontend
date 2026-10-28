@@ -717,8 +717,12 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     and native D128 prefill under PackGQA."""
 
     tag = _flavor_tag(flavor)
-    if params.dtype_kv != -1 and (rubin or fp8 or flavor != (128, 128)):
-        raise ValueError("independent FP8 KV storage requires the SM100 D128 half pipeline")
+    if params.dtype_kv != -1 and (fp8 or flavor != (128, 128)):
+        raise ValueError("independent FP8 KV storage requires the SM100/SM107 D128 half pipeline")
+    if rubin and not fp8 and flavor == _SM100_DECODE_FLAVOR and params.ragged_q:
+        # The single-query paged split ABI uses the shared decode tile, as
+        # on SM100/SM103, compiled for the actual SM107 target.
+        return _load_kernel_template(_SM100_DECODE_KERNEL_FILE, params, f"sdpa_fwd_sm107_{tag}_ragged_decode")
     if rubin and not fp8 and getattr(params, "decode_q_tile", 0):
         # Decode-shaped d256 f16/bf16 graphs on cc 10.7: the Rubin twin of the swap-AB
         # tile (the record field routes, exactly as on the SM100 arm below).  It serves
@@ -2272,11 +2276,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # FlashInfer prefill-style graph at one token per sequence.  The
         # kernel reads the batch's Q ragged offset as its row coordinate and
         # the split combine places the final rows, so the leg needs ragged
-        # Stats (a per-batch padded Stats has no ragged base), int32 offsets
+        # Stats (a per-batch padded Stats has no ragged base), int32/int64 offsets
         # whose multiplier divides the row (checked with the ragged tensors
         # in engines.mismatch), per-batch KV lengths (the dense kernel's
-        # SEQ_KV read; the cu form is not plumbed) and no sink (sink + split is
-        # declined everywhere).  Twin of engines._thd_decode_leg; keep in lockstep.
+        # SEQ_KV read; the cu form is not plumbed). A sink is folded once by
+        # the split combine. Twin of engines._thd_decode_leg; keep in lockstep.
         self.thd_decode_leg = bool(
             self.thd
             and self.paged
@@ -2392,8 +2396,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "mixed half-Q/FP8-KV requires the matching native cuDNN Frontend extension",
             )
             self._not_implemented_error_if(
-                major != 10 or minor >= 7 or (int(d_qk), int(d_v)) != (128, 128),
-                "mixed half-Q/FP8-KV requires native SM100/SM103 D128 prefill",
+                major != 10 or (int(d_qk), int(d_v)) != (128, 128),
+                "mixed half-Q/FP8-KV requires native SM100/SM103/SM107 D128 prefill",
             )
             self._not_implemented_error_if(
                 not self._can_prepare_dense_layout(),
@@ -2425,7 +2429,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             max_q=int(s_qo),
         )
         # An unsplit Rubin paged request uses the prefill template even at
-        # one query token; the split decode leg belongs to the SM100 family.
+        # one query token; split requests use the shared ragged decode tile.
         self.thd_decode_leg = self.thd_decode_leg and not paged_prefill_cga1
         split_cga = self.cga if self.cga is not None else (1 if (int(d_qk), int(d_v)) == (64, 64) else 2)
         self.packed_thd_split = bool(
@@ -2471,12 +2475,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
         arch_error = cutedsl_arch_requirement_error(self._device_cc)
         self._not_implemented_error_if(arch_error is not None, arch_error)
-        # The ragged-Q decode leg is an sm100/decode_d128_f16.py mode not wired on cc 10.7 (its dense d128 graphs ride that
-        # tile through TILE_CGA_M=1 since issue #1472); the admitted unsplit paged cga1 THD leg uses the two-slab prefill template.
-        self._not_implemented_error_if(
-            self.thd_decode_leg and self._device_cc == (10, 7),
-            "the d128 decode tile's ragged-Q leg is not wired on cc10.7 (Rubin); THD graphs keep the prefill tile there",
-        )
         # cc10.7 (Rubin) now runs every dtype family through its own SM107
         # sibling kernels (f16/bf16, per-tensor FP8 and MXFP8 -- the SM107 port).
         # The per-arch-line split lives in the kernel FILES and the engine rows;
@@ -3238,7 +3236,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 and not _rubin_decode_tile
                 and not self._rubin_native_d512_leg()
                 and not (
-                    self.packed_thd_split or (self._fp8 and self._pertensor and self.flavor in _SM107_FP8_PACK_GQA_SHAPES) or self._rubin_shared_dense_leg()
+                    self.thd_decode_leg
+                    or self.packed_thd_split
+                    or (self._fp8 and self._pertensor and self.flavor in _SM107_FP8_PACK_GQA_SHAPES)
+                    or self._rubin_shared_dense_leg()
                 ),
                 "split_kv > 1 with PackGQA on cc10.7 requires per-tensor FP8 D64/D128/D192x128/D256, half D128 paged THD, a dense D128 half graph, native dense D512 half, or the d256 decode tile",
             )
