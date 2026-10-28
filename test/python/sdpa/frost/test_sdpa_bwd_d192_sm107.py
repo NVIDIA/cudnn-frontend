@@ -32,6 +32,16 @@ def test_other_architectures_decline(monkeypatch, cc):
     assert _decline_reason(monkeypatch, engine=_ENGINE, cc=cc, d=192, d_v=128) is not None
 
 
+@pytest.mark.parametrize("dt", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("thd", [False, True], ids=["dense", "thd"])
+def test_decode_declines_before_lowering(monkeypatch, dt, thd):
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    reason = _decline_reason(monkeypatch, engine=_ENGINE, d=192, d_v=128, sq=1, dt=dt, thd=thd)
+    assert reason is not None and "decode" in reason, reason
+
+
 def test_stable_opt_in_slot():
     from cudnn.engines.manifest import MANIFEST
 

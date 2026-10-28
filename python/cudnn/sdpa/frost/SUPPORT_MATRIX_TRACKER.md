@@ -1403,6 +1403,9 @@ rows retain their existing capabilities.
 geometry and fused dK, and covers FP64 gradients, poisoned gaps/workspace,
 changed-length/empty-sequence replay and standalone/graph bindings. Candidate
 ranking remains separate from this capability addition.
+An `S_q == 1` declaration is declined during eligibility, before adapter
+lowering. Runtime empty THD sequences within a prefill envelope remain supported;
+`test_decode_declines_before_lowering` distinguishes the two contracts.
 
 The f16/bf16 row is a separate engine from `sdpa_fwd_prefill_sm100` (which stops
 at cc 10.6) because the lowerings diverge: the Rubin kernels build **version-1

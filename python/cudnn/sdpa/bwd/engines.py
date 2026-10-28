@@ -1675,6 +1675,7 @@ def _sm107_d192_spec() -> EngineSpec:
             thd=True,
             thd_declared_totals=True,
             thd_ragged_offsets=True,
+            decode=False,  # prefill body: a 128-row q tile per iteration
             layouts=frozenset({"bshd"}),
         ),
         lower=partial(lower_dsl_bwd, api_type=_SM107),
