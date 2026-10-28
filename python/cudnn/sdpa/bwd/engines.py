@@ -1650,6 +1650,38 @@ def _sm100_d256_spec() -> EngineSpec:
     )
 
 
+def _sm107_d192_spec() -> EngineSpec:
+    """Native half D192x128 on SM107-119, sharing the D192 2x2 body and prepared API.
+
+    A separate row keeps the existing D256 eligibility unchanged: independent THD
+    origins and deterministic execution are qualified here for the fused dK body.
+    """
+    return EngineSpec(
+        name="sdpa_bwd_sm107_d192",
+        capabilities=Capabilities(
+            zero_scale=True,
+            sm_lo=_RUBIN[0],
+            sm_hi=_RUBIN[1],
+            d=frozenset({128, 192}),
+            dqk_ge_dv=True,
+            declaration_check=_native_d256_head_mismatch,
+            d_envelope=False,
+            dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            gqa=True,
+            deterministic=True,
+            causal=True,
+            bottom_right=True,
+            swa=True,
+            thd=True,
+            thd_declared_totals=True,
+            thd_ragged_offsets=True,
+            decode=False,  # prefill body: a 128-row q tile per iteration
+            layouts=frozenset({"bshd"}),
+        ),
+        lower=partial(lower_dsl_bwd, api_type=_SM107),
+    )
+
+
 def _sm107_d512_spec() -> EngineSpec:
     """cc 10.7 (the Rubin-line, 107 <= SM <= 119) d in (256, 512] bf16 / fp16 backward row (``api_dsl_sm107_d512.SdpaBwdDslSm107D512``).
 
@@ -1829,6 +1861,7 @@ ENGINE_SPECS = (
     _sm100_d256_spec(),
     _sm107_d512_spec(),
     _sm100_d128_spec(),
+    _sm107_d192_spec(),
 )
 
 __all__ = [

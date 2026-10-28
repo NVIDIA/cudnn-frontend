@@ -93,7 +93,9 @@ def test_rectangular_backward_replay_and_rebind(monkeypatch, dt, sq, sk, hk, cau
     check_backward_replay_and_rebind(monkeypatch, dt, sq, sk, hk, causal, br, left, budget)
 
 
-def check_backward_replay_and_rebind(monkeypatch, dt, sq, sk, hk, causal, br, left, budget, *, d=192, dv=128, deterministic=False):
+def check_backward_replay_and_rebind(
+    monkeypatch, dt, sq, sk, hk, causal, br, left, budget, *, d=192, dv=128, deterministic=False, api_type=None, engine=_ENGINE, scale=None, batch_pitch=False
+):
     """Check native geometry, FP64 gradients and replay after changing data/pointers."""
     if budget is not None:
         from cudnn.sdpa.bwd import api_dsl_sm107
@@ -102,6 +104,7 @@ def check_backward_replay_and_rebind(monkeypatch, dt, sq, sk, hk, causal, br, le
     from cudnn.sdpa.bwd.api_dsl_sm100_d256 import SdpaBwdDslSm100D256
     from cudnn.sdpa.bwd.kernels.sm107 import prepared_host
 
+    api_type = api_type or SdpaBwdDslSm100D256
     compiled_hosts = []
     original_host = prepared_host.compile_host_f16
 
@@ -113,7 +116,7 @@ def check_backward_replay_and_rebind(monkeypatch, dt, sq, sk, hk, causal, br, le
     monkeypatch.setattr(prepared_host, "compile_host_f16", record_host)
 
     compiled_geometry = []
-    original_compile = SdpaBwdDslSm100D256._compile_plan
+    original_compile = api_type._compile_plan
 
     def record_compile(api, main, mm_dk, mm_dq):
         compiled_geometry.append((main.CFG.TILE_K, main.CFG.TILE_O))
@@ -124,7 +127,7 @@ def check_backward_replay_and_rebind(monkeypatch, dt, sq, sk, hk, causal, br, le
             assert stage3.cta_group == (1 if d == 192 else 2)
         return original_compile(api, main, mm_dk, mm_dq)
 
-    monkeypatch.setattr(SdpaBwdDslSm100D256, "_compile_plan", record_compile)
+    monkeypatch.setattr(api_type, "_compile_plan", record_compile)
     b, hq = 2, 4
     keep = _causal_keep(sq, sk, causal=causal, bottom_right=br, left=left)
     kwargs = dict(use_deterministic_algorithm=deterministic)
@@ -132,25 +135,39 @@ def check_backward_replay_and_rebind(monkeypatch, dt, sq, sk, hk, causal, br, le
         kwargs["use_causal_mask_bottom_right" if br else "use_causal_mask"] = True
     if left is not None:
         kwargs["diagonal_band_left_bound"] = left
+    if scale is not None:
+        kwargs["scale"] = scale
+    if batch_pitch:
+        kwargs["stride_fn"] = lambda shape: [(shape[2] + 17) * shape[1] * shape[3], shape[3], shape[1] * shape[3], 1]
     g, ports, grad_ports = _build_graph(b=b, hq=hq, hkv=hk, sq=sq, skv=sk, d=d, d_v=dv, dt=dt, **kwargs)
-    select_engine(g, _ENGINE)
+    select_engine(g, engine)
     g.check_support()
     g.build_plans()
     assert compiled_geometry
     assert compiled_hosts
     assert g._compiled_plans[g._plan_index]._prepared is not None
     ws = torch.empty(max(1, g.get_workspace_size()), dtype=torch.uint8, device="cuda")
-    grads = (_bshd_empty(b, sq, hq, d, dt), _bshd_empty(b, sk, hk, d, dt), _bshd_empty(b, sk, hk, dv, dt))
+    padding = []
+
+    def empty(s, h, dim):
+        if not batch_pitch:
+            return _bshd_empty(b, s, h, dim, dt)
+        storage = torch.full((b, s + 17, h, dim), -31, device="cuda", dtype=dt)
+        padding.append((storage, s))
+        return storage[:, :s].permute(0, 2, 1, 3)
+
+    grads = (empty(sq, hq, d), empty(sk, hk, d), empty(sk, hk, dv))
 
     def inputs(seed):
         gen = torch.Generator(device="cpu").manual_seed(seed)
 
         def draw(s, h, dim):
-            return torch.randn(b, s, h, dim, generator=gen).to(device="cuda", dtype=dt).permute(0, 2, 1, 3)
+            value = torch.randn(b, s, h, dim, generator=gen).to(device="cuda", dtype=dt).permute(0, 2, 1, 3)
+            return empty(s, h, dim).copy_(value) if batch_pitch else value
 
         q, k, v, do = draw(sq, hq, d), draw(sk, hk, d), draw(sk, hk, dv), draw(sq, hq, dv)
-        o64, lse64, dead, *refs = _reference64(q, k, v, do, keep, hq // hk)
-        o = _bshd_empty(b, sq, hq, dv, dt)
+        o64, lse64, dead, *refs = _reference64(q, k, v, do, keep, hq // hk, scale=scale)
+        o = empty(sq, hq, dv)
         o.copy_(o64.to(dt))
         stats = lse64.float().masked_fill(dead, 0).unsqueeze(-1).contiguous()
         return dict(q=q, k=k, v=v, do=do, o=o, stats=stats), refs
@@ -166,6 +183,8 @@ def check_backward_replay_and_rebind(monkeypatch, dt, sq, sk, hk, causal, br, le
     def check(refs):
         for name, got, ref in zip(("dQ", "dK", "dV"), grads, refs):
             _check(name, got, ref, dt)
+        for storage, live in padding:
+            assert (storage[:, live:] == -31).all(), "physical batch padding changed"
 
     values, refs = inputs(31)
     bindings = pack(values)

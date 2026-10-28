@@ -127,6 +127,10 @@ A graph-only test misses a direct-API operand silently dropped by that flag.
 - Reviewing: if the diff touches `fwd/engines.py`, `bwd/engines.py` or
   `cudnn/engines/manifest.py` and `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` is
   untouched, ask why before approving.
+- Prefill-only backward rows explicitly set `decode=False`: the capability
+  default is `True`, which otherwise admits `S_q == 1` before the adapter
+  rejects it. `test_sdpa_bwd_d192_sm107.py::test_decode_declines_before_lowering`
+  checks real dense/THD graph declarations at that boundary.
 
 **Rule S3 — When P is aliased into a score slot's TMEM tail, the warpgroup
 that stores into columns another warpgroup still has to read must be
