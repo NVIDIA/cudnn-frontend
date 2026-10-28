@@ -650,6 +650,31 @@ treatment at the caller boundary.**
   cc 10.7 (Rule 7): a device-blind "available" is the blind spot that routes a
   cc 10.7 graph to the backend engine.
 
+**Rule 10 — a kwarg that makes a graph ineligible for the python engines is
+read by the family's analyzer under the spelling of EVERY op that takes it.**
+
+- The analyzer's record is the node's kwargs verbatim
+  (`sdpa/graph_analyzer._record_from_node`), and the rows gate on FACTS derived
+  from it; a capability no row claims still needs its fact, because the decline
+  by name is what keeps the graph on the backend -- a False fact is a silent
+  admission. `sdpa()` / `sdpa_backward()` spell the score modifier `score_mod` /
+  `score_mod_bprop`, `sdpa_fp8()` spells it `fn`; `has_score_mod` read only `fn`,
+  so to the rows no f16 graph ever had a modifier. The moment 1.31 gave the
+  SM100 prefill row a d64 flavor it served TransformerEngine's flex-attention
+  graphs (b2 h4 s16 d64) as plain attention and the modifier was dropped
+  (post-scale bias: 38 % of O outside 5e-2; softcap: 33 / 8192 elements). It
+  surfaced as an apparent cuDNN 9.27 -> 9.28 regression in TransformerEngine's
+  flex-attention tests; the change that mattered was the FE python package
+  1.30 -> 1.31 in the same test-container refresh.
+- When an op gains a kwarg a kernel cannot honor, add the spelling to the
+  analyzer and a cell to the detector in the same change; `graph.selected_engine`
+  on a graph with the kwarg is the one-line check.
+- Detectors: `test/python/sdpa/frost/test_sdpa_score_mod_decline.py` (host-only:
+  the fact on every spelling, every fwd / bwd row declines, the row admitting
+  the control graph declines by name) and
+  `test/python/sdpa/graph/test_flexible_sdpa_te_shape.py` (the TE shape is
+  served by the backend and O carries the modifier).
+
 ## Frontend-only kernel package layout
 
 ```

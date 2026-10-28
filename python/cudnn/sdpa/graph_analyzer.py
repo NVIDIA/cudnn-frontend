@@ -986,7 +986,12 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         has_dsink=rec.get("dSink_token") is not None,
         has_bias=rec.get("bias") is not None,
         has_dropout=rec.get("dropout") is not None,
-        has_score_mod=rec.get("fn") is not None,
+        # The callback's kwarg is ``score_mod`` on sdpa() / sdpa_backward() (plus
+        # ``score_mod_bprop`` on the backward) and ``fn`` on sdpa_fp8(); every
+        # spelling makes the graph FROST-ineligible (no row sets score_mod=True).
+        # Reading only ``fn`` let the SM100 prefill row serve TransformerEngine's
+        # flex-attention graphs and silently drop the user's score modifier.
+        has_score_mod=any(rec.get(key) is not None for key in ("score_mod", "score_mod_bprop", "fn")),
         has_paged_kv=paged,
         page_size=page_size,
         paged_k_table_t=table_k,
