@@ -271,7 +271,18 @@ class _Sm100FrostConvPlan(CompiledPlan):
             output_dtype=output_dtype,
         )
         input_channel_tile = _input_channel_tile(image_dtype)
-        if image.dim[1] % input_channel_tile:
+        c96_causal = (
+            image_dtype == output_dtype == "bfloat16"
+            and image.dim[1] == 96
+            and analysis.epilogue_node is None
+            and weight.dim[0] in (96, 192)
+            and tuple(weight.dim[2:]) == (3, 3, 3)
+            and _tuple_param(node, "stride", _ONE) == _ONE
+            and _tuple_param(node, "dilation", _ONE) == _ONE
+            and _tuple_param(node, "pre_padding", _ZERO) in ((0, 1, 1), (1, 1, 1), (2, 1, 1))
+            and _tuple_param(node, "post_padding", _ZERO) == (0, 1, 1)
+        )
+        if image.dim[1] % input_channel_tile and not c96_causal:
             raise NotImplementedError(
                 f"frost_conv requires input channels to be a multiple of the {input_channel_tile}-element mainloop tile for {image_dtype}; got {image.dim[1]}"
             )

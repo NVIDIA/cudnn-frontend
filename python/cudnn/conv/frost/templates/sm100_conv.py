@@ -191,8 +191,11 @@ def _kernel(
     # Constexpr knobs
     mma_tiler: cutlass.Constexpr[Tuple[int, int, int]],
     mma_inst_shape_mnk: cutlass.Constexpr[Tuple[int, int, int]],
-    # GEMM-K tile count (= ceil_div(T*R*S*C, mma_tiler_k)), host-computed.
+    # Channel/filter tile count (= T*R*S*ceil_div(C, mma_tiler_k)), host-computed.
     k_tile_cnt: cutlass.Constexpr[int],
+    channel_tiles: cutlass.Constexpr[int],
+    first_filter_t: cutlass.Constexpr[int],
+    channel_first: cutlass.Constexpr[bool],
     num_ab_stage: cutlass.Constexpr[int],
     num_acc_stage: cutlass.Constexpr[int],
     num_c_stage: cutlass.Constexpr[int],
@@ -399,9 +402,9 @@ def _kernel(
     # Per-CTA unicast (no multicast_mask) prims.cp_async_bulk_tensor loads.
     # Im2col coords are decomposed from the linear M index:
     # m_off_cta -> (n, z, p, q); spatial anchors are then q*str_w-pad_w (etc).
-    # The filter coord (s, r, t) and C-element offset are loop-carried and
-    # advanced by a colexicographic carry (add + compare + conditional reset),
-    # so the loop body never divides the linear k by T*R*S.
+    # Filter and channel coordinates use loop-carried additions and resets.
+    # C96/K96 visits its three 32-channel tiles at each filter position;
+    # other shapes retain the original filter-first reduction order.
     if warp_idx == tma_warp_id:
         ab_stage_idx = 0
         Z_out, P_out, Q_out = zpq
@@ -432,13 +435,11 @@ def _kernel(
             # B side: per-CTA N offset (KTRSC tiled descriptor consumes this).
             n_off_cta = mma_tile_coord_mnl[1] * mma_tiler[1] + (cta_rank_in_cluster % _atom_thr if use_2cta_instrs else 0) * n_per_cta
 
-            # Filter coord (s, r, t) + C-chunk, carried across K-tiles and
-            # advanced colexicographically (s fastest). Reset to origin per
-            # work-tile since each tile sweeps GEMM-K from 0. The carry below
-            # replaces k // (T*R*S) style division.
+            # Reset the filter/channel coordinates for each output tile.
+            # Carry arithmetic below avoids division in the reduction loop.
             s_idx = 0
             r_idx = 0
-            t_idx = 0
+            t_idx = first_filter_t
             c_chunk_idx = 0
             for k in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                 mbar_full = ab_full_mbar_ptr.subview(ab_stage_idx)
@@ -497,19 +498,30 @@ def _kernel(
                     ab_stage_idx = 0
                     ab_empty_phase_bit = ab_empty_phase_bit ^ 1
 
-                # Colex carry of (s, r, t, c_chunk): bump s, ripple right on
-                # wrap. Nested single-compare ifs (no boolean-and on traced
-                # predicates) advance the coord over (S, R, T, *).
-                s_idx += 1
-                if s_idx == S_filt:
-                    s_idx = 0
-                    r_idx += 1
-                    if r_idx == R_filt:
-                        r_idx = 0
-                        t_idx += 1
-                        if t_idx == T_filt:
-                            t_idx = 0
-                            c_chunk_idx += 1
+                # Advance channels first for the C96/K96 path; preserve
+                # the filter-first order for previously supported shapes.
+                if cutlass.const_expr(channel_first):
+                    c_chunk_idx += 1
+                    if c_chunk_idx == channel_tiles:
+                        c_chunk_idx = 0
+                        s_idx += 1
+                        if s_idx == S_filt:
+                            s_idx = 0
+                            r_idx += 1
+                            if r_idx == R_filt:
+                                r_idx = 0
+                                t_idx += 1
+                else:
+                    s_idx += 1
+                    if s_idx == S_filt:
+                        s_idx = 0
+                        r_idx += 1
+                        if r_idx == R_filt:
+                            r_idx = 0
+                            t_idx += 1
+                            if t_idx == T_filt:
+                                t_idx = first_filter_t
+                                c_chunk_idx += 1
 
             # Advance to next persistent work-tile (static schedule).
             tile_sched.advance_to_next_work()
@@ -531,21 +543,20 @@ def _kernel(
 
         # tcgen05 SMEM descriptors for stage 0. tcgen05_mma encodes SMEM
         # addresses in 16-byte units, so per-stage / per-K-block increments
-        # are bytes >> 4. (leading=16, stride=1024, layout=2) is the 128B-swizzle
-        # K-major layout, matching cuda.TensorMapSwizzle.s128b on the A/B
-        # descriptors. sA/sB are flat cutlass.Arrays, so the SMEM base address is
-        # the array itself.
+        # are bytes >> 4. K-major stride spans eight rows: 512 bytes with
+        # 64B swizzle (layout=4), or 1024 bytes with 128B swizzle (layout=2).
+        # These must match the host-side A/B tensor-map swizzles.
         desc_a_base = prims.Tcgen05SmemDesc.build(
             sA,
             leading_byte_offset=16,
-            stride_byte_offset=1024,
-            layout=2,
+            stride_byte_offset=8 * k_tile_size * (ab_dtype.width // 8),
+            layout=4 if k_tile_size * (ab_dtype.width // 8) == 64 else 2,
         )
         desc_b_base = prims.Tcgen05SmemDesc.build(
             sB,
             leading_byte_offset=16,
-            stride_byte_offset=1024,
-            layout=2,
+            stride_byte_offset=8 * k_tile_size * (ab_dtype.width // 8),
+            layout=4 if k_tile_size * (ab_dtype.width // 8) == 64 else 2,
         )
 
         # Per-stage descriptor delta (one full AB stage in SMEM, in 16B units).
@@ -1036,10 +1047,11 @@ def _check_tensor_alignment(
     if not aligned(ab_dtype, c) or not aligned(c_dtype, k):
         raise testing.CantImplementError(f"C={c} and K={k} must provide 16-byte channel rows")
 
-    # The producer advances filter coordinates once per complete mainloop K
-    # tile. A partial channel tile would need a distinct carry path; decline it
-    # until that path exists instead of skipping filter/channel contributions.
-    if c % channel_tile:
+    # The C96/K192 route keeps a 64-channel tile and compact storage.
+    # Both TMA maps zero-fill its final 32 lanes at each filter position.
+    # C96/K96 uses three full 32-channel tiles.
+    c96_remainder = ab_dtype is cutlass.BFloat16 and c_dtype is cutlass.BFloat16 and c == 96 and k in (96, 192) and channel_tile == 64
+    if c % channel_tile and not c96_remainder:
         raise testing.CantImplementError(f"C={c} must be a multiple of the {channel_tile}-element mainloop tile for {ab_dtype}")
 
 
@@ -1550,7 +1562,7 @@ class _FpropKernel:
             channels_per_pixel=k_tile,
             pixels_per_column=mma_tiler_per_cta_m,
             traversal_strides=(1, p.stride_dhw[2], p.stride_dhw[1], p.stride_dhw[0], 1),
-            swizzle=cuda.TensorMapSwizzle.s128b,
+            swizzle=cuda.TensorMapSwizzle.s64b if p.tile_config.cta_tile_k_bytes == 64 else cuda.TensorMapSwizzle.s128b,
         )
 
         # Filter B: KTRSC raw, tiled descriptor.
@@ -1561,7 +1573,7 @@ class _FpropKernel:
             b,
             box_dims=(n_per_cta, 1, 1, 1, k_tile),
             stride_order=(4, 3, 2, 1, 0),
-            swizzle=cuda.TensorMapSwizzle.s128b,
+            swizzle=cuda.TensorMapSwizzle.s64b if p.tile_config.cta_tile_k_bytes == 64 else cuda.TensorMapSwizzle.s128b,
         )
 
         # Output C: NZPQK raw, im2col store descriptor with zero corners.
@@ -1608,10 +1620,18 @@ class _FpropKernel:
             256 // p.a_dtype.width,
         )
 
-        # GEMM-K tile count: GEMM-K = T*R*S*C, tiled by mma_tiler_k.
+        # The producer visits every filter/channel-tile combination.
+        # Round C before multiplying by TRS: a partial channel tile is padded
+        # independently at every filter position by TMA's out-of-bounds fill.
         mma_tiler_k = cute.size(p.mma_tiler, mode=[2])
-        gemm_k = T_filter * R_filter * S_filter * a.shape[4]
-        k_tile_cnt = (gemm_k + mma_tiler_k - 1) // mma_tiler_k
+        channel_tiles = (a.shape[4] + mma_tiler_k - 1) // mma_tiler_k
+        # An initial single-frame C96 call has only the last temporal
+        # filter plane in bounds. Skip the two guaranteed-zero planes.
+        first_filter_t = 0
+        if cutlass.const_expr(a.shape[4] == 96 and p.a_dtype == cutlass.BFloat16 and a.shape[1] == 1 and c.shape[1] == 1):
+            if cutlass.const_expr(T_filter == 3 and p.lower_padding_dhw[0] == 2 and p.stride_dhw[0] == 1 and p.dilation_dhw[0] == 1):
+                first_filter_t = 2
+        k_tile_cnt = (T_filter - first_filter_t) * R_filter * S_filter * channel_tiles
 
         # Output spatial dims for the im2col producer/epilogue coord decode.
         # c.shape = (N, Z, P, Q, K); filter_trs / padding / stride / dilation
@@ -1625,6 +1645,9 @@ class _FpropKernel:
             p.mma_tiler,
             mma_inst_shape_mnk,
             k_tile_cnt,
+            channel_tiles,
+            first_filter_t,
+            a.shape[4] == 96 and c.shape[4] == 96 and p.a_dtype == cutlass.BFloat16,
             p.num_ab_stage,
             p.num_acc_stage,
             p.num_c_stage,
@@ -1665,24 +1688,26 @@ _DEFAULT_DILATION: Tuple[int, int, int] = (1, 1, 1)
 _DEFAULT_DTYPE: Type[Numeric] = cutlass.BFloat16
 
 
-def _dense_config_violation(tile_config: ConvTileConfig, channel_bytes: int) -> str | None:
+def _dense_config_violation(tile_config: ConvTileConfig, channel_bytes: int, *, allow_c96: bool = False) -> str | None:
     """Return why a tile cannot implement dense convolution, if anything."""
-    if tile_config.cta_tile_k_bytes != 128:
+    if tile_config.cta_tile_k_bytes != 128 and not (allow_c96 and tile_config.cta_tile_k_bytes == 64):
         return f"CTA K must be 128 bytes, got {tile_config.cta_tile_k_bytes}"
     if channel_bytes <= 0:
         return f"channel_bytes must be positive, got {channel_bytes}"
-    if channel_bytes % tile_config.cta_tile_k_bytes:
+    if channel_bytes % tile_config.cta_tile_k_bytes and not allow_c96:
         return f"channel_bytes={channel_bytes} must be divisible by CTA K={tile_config.cta_tile_k_bytes} bytes"
     if tile_config.cta_tile_m == 64 and tile_config.cta_group == 2 and tile_config.cta_tile_n % 64:
         return f"M=64 2-CTA requires CTA N divisible by 64, got {tile_config.cta_tile_n}"
     return None
 
 
-def _is_dense_selection_candidate(tile_config: ConvTileConfig, implicit_m: int, output_n: int, channel_bytes: int) -> bool:
+def _is_dense_selection_candidate(tile_config: ConvTileConfig, implicit_m: int, output_n: int, channel_bytes: int, *, allow_c96: bool = False) -> bool:
     """Apply dense compatibility plus the automatic-selection axes."""
-    n_choices = (128, 256) if output_n >= 512 else (32, 64, 128, 256)
+    # C96 uses an exact K96/K192 output tile to avoid unused MMA columns.
+    n_choices = (output_n,) if allow_c96 else ((128, 256) if output_n >= 512 else (32, 64, 128, 256))
     return (
-        _dense_config_violation(tile_config, channel_bytes) is None
+        _dense_config_violation(tile_config, channel_bytes, allow_c96=allow_c96) is None
+        and tile_config.cta_tile_k_bytes == (64 if allow_c96 and output_n == 96 else 128)
         and tile_config.cta_tile_m == 128
         and tile_config.cta_group == (2 if implicit_m > 128 else 1)
         and tile_config.cta_tile_n in n_choices
@@ -1721,15 +1746,16 @@ def compile(
     implicit_m = N * Z * P * Q
     implicit_k = T * R * S * C
     channel_bytes = C * ab_dtype.width // 8
+    allow_c96 = ab_dtype is cutlass.BFloat16 and c_dtype is cutlass.BFloat16 and C == 96 and K in (96, 192)
     if tile_config is None:
         tile_config = _get_config(
             implicit_m,
             K,
             implicit_k,
-            predicate=lambda config: _is_dense_selection_candidate(config, implicit_m, K, channel_bytes),
+            predicate=lambda config: _is_dense_selection_candidate(config, implicit_m, K, channel_bytes, allow_c96=allow_c96),
         )
     else:
-        violation = _dense_config_violation(tile_config, channel_bytes)
+        violation = _dense_config_violation(tile_config, channel_bytes, allow_c96=allow_c96)
         if violation is not None:
             raise ValueError(f"dense convolution config {tile_config.name} is incompatible: {violation}")
 
