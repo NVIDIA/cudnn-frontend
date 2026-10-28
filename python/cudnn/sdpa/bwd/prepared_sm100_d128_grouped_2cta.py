@@ -224,6 +224,17 @@ def debug_clk(api):
         raise ValueError(f"{api._NAME}: {error}") from None
 
 
+def debug_clk_record(api):
+    """The STAMPS record of this adapter's rendering: the ONE value the carve (``check_support``), the dump reader (``debug_clk_records``) and
+    the tests read -- its WORDS / BYTES are the bar block's spare, DERIVED from the layout the body renders ((TMEM_HANDLE - the layout's end) / 4;
+    config = truth, never a literal) and asserted here against the geometry, so a layout change can never leave a stale record size behind."""
+    from .config_sm100_d128_accum_2cta_stail import CFG as _cfg
+
+    record = DBG_CLK
+    assert record.BYTES == 4 * record.WORDS == _cfg.TMEM_HANDLE - record.SMEM, (record, _cfg.TMEM_HANDLE)
+    return record
+
+
 def debug_clk_records(api, workspace):
     """The STAMPS dump of the LAST ``execute`` as an Int32 view ``[records, DBG_CLK.WORDS]`` of the caller's workspace tensor (the bytes the s_tail
     kernel wrote; no copy, no sync: the caller synchronizes); ``None`` when the lever is off.  Record r = the MAIN kernel's linear CTA

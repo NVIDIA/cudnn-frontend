@@ -1089,17 +1089,20 @@ def test_2cta_stail_debug_clk_dump_accounts_the_waits():
     iff its magic word matches, and a never-launched cluster leaves BOTH of its CTAs' records unwritten."""
     _require_2cta()
     from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
-    from cudnn.sdpa.bwd.prepared_sm100_d128_grouped_2cta import debug_clk_records
+    from cudnn.sdpa.bwd.prepared_sm100_d128_grouped_2cta import debug_clk_record, debug_clk_records
 
-    d = cfgmod.DBG_CLK
-    W = d.WORD
     hq, hkv = 4, 2
     case = make_case((256, 512), (256, 512), hq=hq, hkv=hkv, thd=True, dtype=torch.bfloat16, causal=True, stats_layout="TH1")
     _bitwise_twin(case, make_adapter_2cta_stail, lambda c: make_adapter_2cta_stail(c, debug_clk=True), "the stamps lever (off vs on)")
     plain = make_adapter_2cta_stail(case)
     api = make_adapter_2cta_stail(case, debug_clk=True)
+    d = debug_clk_record(api)  # the record the carve and the dump use: derived from the layout the body renders (never a literal here)
+    W = d.WORD
     n_rec = cfgmod.dbg_clk_records(case.batch, hq, api.s_k_max)
-    assert api.scratch_workspace_bytes() >= plain.scratch_workspace_bytes() + n_rec * d.BYTES, "the dump region is carved only under the lever"
+    assert (
+        d.BYTES == 4 * d.WORDS and api.scratch_workspace_bytes() >= plain.scratch_workspace_bytes() + n_rec * d.BYTES
+    ), "the dump region is carved only under the lever, sized exactly n_rec x record"
+    assert api.scratch_workspace_bytes() < plain.scratch_workspace_bytes() + n_rec * d.BYTES + 2 * d.RECORD_ALIGN, "no second record size hides in the carve"
     assert debug_clk_records(plain, make_workspace(plain.scratch_workspace_bytes()).tensor) is None
     workspace = make_workspace(api.scratch_workspace_bytes())
     poison(case, workspace)
