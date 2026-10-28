@@ -97,15 +97,15 @@ def select_implementation(cc, dsl_version, batch, heads, sq, skv, scale):
     return ACCUMULATION
 
 
-def workspace_layout(batch, heads, sq):
+def workspace_layout(batch, heads, sq, d=128):
     """Return aligned-payload-relative regions and advertised allocation bytes."""
-    if any(type(n) is not int or n <= 0 for n in (batch, heads, sq)):
+    if any(type(n) is not int or n <= 0 for n in (batch, heads, sq)) or d not in (64, 128, 192):
         raise ValueError("dense d128 workspace dimensions must be positive integers")
     rounded = (sq + 127) // 128 * 128
-    dq_bytes = 4 * batch * rounded * heads * 128
+    dq_bytes = 4 * batch * rounded * heads * d
     delta_bytes = 4 * batch * heads * rounded
     regions = (
-        (0, (batch, rounded, heads, 128), (rounded * heads * 128, heads * 128, 128, 1)),
+        (0, (batch, rounded, heads, d), (rounded * heads * d, heads * d, d, 1)),
         (dq_bytes, (batch, heads, rounded), (heads * rounded, rounded, 1)),
     )
     total = dq_bytes + delta_bytes + WORKSPACE_SLACK

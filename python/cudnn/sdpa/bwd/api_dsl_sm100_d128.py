@@ -225,12 +225,10 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
         self.head_dim_qk = self.head_dim_v = d
         self.scale_softmax = d**-0.5 if self.scale_softmax is None else float(self.scale_softmax)
         require(math.isfinite(self.scale_softmax) and self.scale_softmax != 0, "attn_scale must be finite and nonzero")
-        # The recompute body owns each gradient tile in one CTA and visits
-        # reduction tiles in a fixed order. The accumulation body uses unordered
-        # FP32 dQ reductions, so it cannot serve a deterministic request.
+        window_in_envelope = self.window_size_left is None or (d == 64 and self.window_size_left + 1 + int(sk) + 2 * 128 <= 2**31 - 1)
         self._implementation = (
             RECOMPUTE
-            if self.deterministic or d != 128 or self.window_size_left is not None
+            if self.deterministic or not window_in_envelope
             else select_implementation(cc, version, int(b), int(h), int(sq), int(sk), self.scale_softmax)
         )
         self._is_supported = True
@@ -264,7 +262,7 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
         if self.thd:
             return self._thd_workspace_bytes
         if self._implementation == ACCUMULATION:
-            return workspace_layout(self.batch_size, self.h_q, self.s_q_max)[1]
+            return workspace_layout(self.batch_size, self.h_q, self.s_q_max, self.head_dim_qk)[1]
         return 0
 
     def execute(

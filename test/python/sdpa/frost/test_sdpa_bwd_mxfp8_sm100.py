@@ -100,30 +100,34 @@ def _build_graph(
     declare_amax=False,
     with_sink=False,
     seq_len_dims=None,
+    dv=None,
     **sdpa_kwargs,
 ):
-    """An ``sdpa_mxfp8_backward`` graph over BSHD-physical tensors. Returns the
+    """An ``sdpa_mxfp8_backward`` graph over BSHD-physical tensors (``dv`` = D_V, default D_QK). Returns the
     graph, its named tensors, and the (dQ, dK, dV, amax...) outputs."""
+    dv = d if dv is None else dv
     io_half = _OUT_CUDNN[out_dt]
     grad_half = _OUT_CUDNN[grad_dt] if grad_dt is not None else io_half
     g = cudnn.pygraph(io_data_type=fp8, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    shq, shk = (b, hq, sq, d), (b, hkv, skv, d)
+    shq, shk, shv, sho = (b, hq, sq, d), (b, hkv, skv, d), (b, hkv, skv, dv), (b, hq, sq, dv)
     t = {}
-    for name, sh in (("q", shq), ("q_T", shq), ("k", shk), ("k_T", shk), ("v", shk), ("dO", shq), ("dO_T", shq)):
+    for name, sh in (("q", shq), ("q_T", shq), ("k", shk), ("k_T", shk), ("v", shv), ("dO", sho), ("dO_T", sho)):
         t[name] = g.tensor(name=name, dim=list(sh), stride=stride_fn(sh), data_type=fp8)
     for name in ("o_f16", "dO_f16"):
-        t[name] = g.tensor(name=name, dim=list(shq), stride=stride_fn(shq), data_type=io_half)
+        t[name] = g.tensor(name=name, dim=list(sho), stride=stride_fn(sho), data_type=io_half)
     t["stats"] = g.tensor(name="stats", dim=[b, hq, sq, 1], stride=[hq * sq, sq, 1, 1], data_type=cudnn.data_type.FLOAT)
     q_row, q_col = _sf_dims(b, hq, sq, d)
     k_row, k_col = _sf_dims(b, hkv, skv, d)
+    v_row, _v_col = _sf_dims(b, hkv, skv, dv)
+    do_row, do_col = _sf_dims(b, hq, sq, dv)
     for name, dims in (
         ("sf_q", q_row),
         ("sf_q_T", q_col),
         ("sf_k", k_row),
         ("sf_k_T", k_col),
-        ("sf_v", k_row),
-        ("sf_dO", q_row),
-        ("sf_dO_T", q_col),
+        ("sf_v", v_row),
+        ("sf_dO", do_row),
+        ("sf_dO_T", do_col),
     ):
         t[name] = g.tensor(
             name=name,
@@ -166,7 +170,7 @@ def _build_graph(
         **sdpa_kwargs,
     )
     dq, dk, dv, amax_dq, amax_dk, amax_dv = outs
-    for out, sh in ((dq, shq), (dk, shk), (dv, shk)):
+    for out, sh in ((dq, shq), (dk, shk), (dv, shv)):
         out.set_output(True).set_data_type(grad_half).set_dim(list(sh)).set_stride(stride_fn(sh))
     # The op returns the amax ports unconditionally and validate() wants their
     # dims; they stay virtual (not requested) unless declare_amax.
@@ -190,26 +194,51 @@ def _plan_index(g, name=_ENGINE):
 
 
 def _run(
-    b=1, hq=2, hkv=None, sq=256, skv=256, out_dt=torch.bfloat16, causal=False, omit_scale=False, tol_cos=_TOL_COS, seed=0, repeat_outputs=0, **sdpa_kwargs
+    b=1,
+    hq=2,
+    hkv=None,
+    sq=256,
+    skv=256,
+    out_dt=torch.bfloat16,
+    causal=False,
+    omit_scale=False,
+    tol_cos=_TOL_COS,
+    seed=0,
+    repeat_outputs=0,
+    d=None,
+    dv=None,
+    **sdpa_kwargs,
 ):
     """Quantize random operands, build the graph, pin the engine, execute, and
-    compare dQ/dK/dV against the MXFP8 backward reference."""
+    compare dQ/dK/dV against the MXFP8 backward reference (``dv`` = D_V, default D_QK)."""
     from sdpa.mxfp8_ref import compute_ref, compute_ref_backward
 
     torch.manual_seed(seed)
     hkv = hq if hkv is None else hkv
-    d, dev = _D, "cuda"
+    d, dev = (_D if d is None else d), "cuda"
+    dv = d if dv is None else dv
     scale = 1.0 / math.sqrt(d)
-    q, dO = torch.randn(b, hq, sq, d, device=dev), torch.randn(b, hq, sq, d, device=dev)
+    q, dO = torch.randn(b, hq, sq, d, device=dev), torch.randn(b, hq, sq, dv, device=dev)
     if omit_scale:  # attn_scale off the graph = no scaling (1.0); pre-scaled Q keeps the logits in their usual range
         q, scale = q * scale, 1.0
-    k, v = torch.randn(b, hkv, skv, d, device=dev), torch.randn(b, hkv, skv, d, device=dev)
-    Q, K, V, DO = (_quantize(x, b, h, s, d) for x, h, s in ((q, hq, sq), (k, hkv, skv), (v, hkv, skv), (dO, hq, sq)))
+    k, v = torch.randn(b, hkv, skv, d, device=dev), torch.randn(b, hkv, skv, dv, device=dev)
+    Q, K, V, DO = (_quantize(x, b, h, s, dd) for x, h, s, dd in ((q, hq, sq, d), (k, hkv, skv, d), (v, hkv, skv, dv), (dO, hq, sq, dv)))
 
     right = 0 if causal else None
     align = cudnn.diagonal_alignment.TOP_LEFT if causal else None
+    left = sdpa_kwargs.get("left_bound")
     o_ref, stats = compute_ref(
-        Q["row"], K["row"], V["col"], Q["sf_row_ref"], K["sf_row_ref"], V["sf_col_ref"], scale, output_type=out_dt, right_bound=right, diag_align=align
+        Q["row"],
+        K["row"],
+        V["col"],
+        Q["sf_row_ref"],
+        K["sf_row_ref"],
+        V["sf_col_ref"],
+        scale,
+        output_type=out_dt,
+        left_bound=left,
+        right_bound=right,
+        diag_align=align,
     )
     o_f16 = _to_bshd(o_ref.to(out_dt))
     dO_f16 = _to_bshd(dO.to(out_dt))
@@ -232,6 +261,7 @@ def _run(
         DO["sf_row_ref"],
         DO["sf_col_ref"],
         torch_otype=out_dt,
+        left_bound=left,
         right_bound=right,
         diag_align=align,
         stats=stats,
@@ -239,7 +269,7 @@ def _run(
 
     if causal:
         sdpa_kwargs["use_causal_mask"] = True
-    g, t, (dq_t, dk_t, dv_t, *_amax) = _build_graph(b, hq, hkv, sq, skv, d, out_dt=out_dt, scale=None if omit_scale else scale, **sdpa_kwargs)
+    g, t, (dq_t, dk_t, dv_t, *_amax) = _build_graph(b, hq, hkv, sq, skv, d, dv=dv, out_dt=out_dt, scale=None if omit_scale else scale, **sdpa_kwargs)
     g.create_execution_plans([cudnn.heur_mode.A])
     idx = _plan_index(g)
     assert idx is not None, f"{_ENGINE} not offered; plans = {[g.get_plan_name_at_index(i) for i in range(g.get_execution_plan_count())]}"
@@ -249,7 +279,7 @@ def _run(
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
     dq = _to_bshd(torch.zeros(b, hq, sq, d, device=dev, dtype=out_dt))
     dk = _to_bshd(torch.zeros(b, hkv, skv, d, device=dev, dtype=out_dt))
-    dv = _to_bshd(torch.zeros(b, hkv, skv, d, device=dev, dtype=out_dt))
+    dv = _to_bshd(torch.zeros(b, hkv, skv, dv, device=dev, dtype=out_dt))
     pack = {
         t["q"]: Q["row"],
         t["q_T"]: Q["col"],
@@ -423,6 +453,75 @@ def test_fully_masked_kv_tiles_overwrite_outputs(monkeypatch, out, persistent, b
     stream.synchronize()
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("out", list(_OUT), ids=list(_OUT))
+def test_dense_d128(out):
+    _run(d=128, out_dt=_OUT[out])
+
+
+@pytest.mark.L0
+def test_causal_gqa_d128():
+    _run(d=128, hq=8, hkv=2, sq=257, skv=256, causal=True)
+
+
+@pytest.mark.L0
+def test_ragged_tails_d128():
+    _run(d=128, hq=2, hkv=1, sq=200, skv=160)
+
+
+@pytest.mark.L0
+def test_batch_and_heads_d128():
+    _run(d=128, b=2, hq=4, hkv=2, sq=384, skv=512, out_dt=torch.float16)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("out", list(_OUT), ids=list(_OUT))
+def test_dense_d64(out):
+    _run(d=64, out_dt=_OUT[out])
+
+
+@pytest.mark.L0
+def test_causal_gqa_d64():
+    _run(d=64, hq=8, hkv=2, sq=257, skv=256, causal=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d,window", [(64, 128), (64, 64), (128, 128)])
+def test_window_pair(d, window):
+    _run(d=d, hq=2, hkv=2, sq=512, skv=512, causal=True, left_bound=window)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("out", list(_OUT), ids=list(_OUT))
+def test_dense_d192x128(out):
+    _run(d=192, dv=128, out_dt=_OUT[out])
+
+
+@pytest.mark.L0
+def test_causal_gqa_d192x128():
+    _run(d=192, dv=128, hq=8, hkv=2, sq=257, skv=256, causal=True)
+
+
+@pytest.mark.L0
+def test_ragged_tails_d192x128():
+    _run(d=192, dv=128, hq=2, hkv=1, sq=200, skv=160)
+
+
+@pytest.mark.L0
+def test_batch_and_heads_d192x128():
+    _run(d=192, dv=128, b=2, hq=4, hkv=2, sq=384, skv=512, out_dt=torch.float16)
+
+
+@pytest.mark.L0
+def test_window_d192x128():
+    _run(d=192, dv=128, hq=2, hkv=2, sq=512, skv=512, causal=True, left_bound=128)
+
+
+@pytest.mark.L0
+def test_window_ragged_d64():
+    _run(d=64, hq=4, hkv=2, sq=300, skv=300, causal=True, left_bound=100)
+
+
 @pytest.mark.L1
 def test_long_causal():
     _run(b=1, hq=2, hkv=2, sq=2048, skv=2048, causal=True)
@@ -483,10 +582,17 @@ def test_accepts_the_claimed_dense_graph():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 192, 512])
-def test_reject_other_head_dims(d):
-    """Exact d=256 only: the SF plumbing has no envelope story."""
-    assert _decline_reason(d=d) is not None
+@pytest.mark.parametrize("d,dv", [(32, 32), (192, 192), (512, 512), (128, 64), (256, 128)])
+def test_reject_other_head_dims(d, dv):
+    """Exact (64, 64), (128, 128), (192, 128) and (256, 256) only: the SF plumbing has no envelope story."""
+    assert _decline_reason(d=d, dv=dv) is not None
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d,dv", [(64, 64), (128, 128), (192, 128)])
+def test_accepts_the_pair_graphs(d, dv):
+    assert _decline_reason(d=d, dv=dv) is None
+    assert _decline_reason(d=d, dv=dv, use_causal_mask=True, left_bound=64) is None
 
 
 @pytest.mark.L0
@@ -512,6 +618,7 @@ def test_reject_right_band_widening():
 
 @pytest.mark.L0
 def test_reject_sliding_window():
+    """The two-CTA d=256 chain has no window arm."""
     assert _decline_reason(use_causal_mask=True, left_bound=64) is not None
 
 
@@ -579,11 +686,11 @@ def test_capabilities_match_what_is_implemented():
     spec = next(s for s in ENGINE_SPECS if s.name == _ENGINE)
     c = spec.capabilities
     assert c.is_mxfp8 and not c.is_fp8
-    assert c.d == frozenset({256}) and not c.d_envelope
+    assert c.d == frozenset({64, 128, 192, 256}) and c.dqk_ge_dv and not c.d_envelope
     assert c.dtypes == frozenset({cudnn.data_type.FP8_E4M3})
     assert c.out_dtypes == frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})
     assert c.causal and c.gqa and c.deterministic
-    assert not (c.bottom_right or c.swa or c.right_band_widening or c.padded or c.thd or c.cu_seq_len)
+    assert c.swa and not (c.bottom_right or c.right_band_widening or c.padded or c.thd or c.cu_seq_len)
     assert not (c.bias or c.dbias or c.sink or c.dsink or c.amax_dgrad)
     assert c.layouts == frozenset({"bshd"})
     assert c.tile_ms == frozenset({128}) and c.tile_ns == frozenset({128})
