@@ -1208,6 +1208,8 @@ def _sm100_mxfp8_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Op
         return "the mxfp8 row serves a sliding window on the kernel pair route (D_QK 64, 128, 192) only"
     if facts.window_left is not None and not facts.causal:
         return "the mxfp8 row serves a sliding window under the causal mask only"
+    if facts.window_left is not None and facts.s_q > facts.s_kv + facts.window_left:
+        return "the mxfp8 row serves a sliding window while every query row keeps a key (S_q <= S_kv + left offset)"
     return None
 
 

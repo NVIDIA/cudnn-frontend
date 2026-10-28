@@ -636,9 +636,9 @@ The MXFP8 row also serves **(64, 64), (128, 128) and (192, 128)** on the block-s
 mode of the same dK/dV + dQ kernel pair (block-scaled tcgen05 MMA; the F8_128x4 scale
 factors are staged through tensor memory, and at D192x128 the transposed operands
 reuse the stage one tile behind): MHA / GQA / MQA, unmasked or top-left causal, a left
-sliding window under the causal mask, any S_q / S_kv, BF16/FP16 `o_f16`/`dO_f16` and
+sliding window under the causal mask while every query row keeps a key (S_q <= S_kv + left offset), any S_q / S_kv, BF16/FP16 `o_f16`/`dO_f16` and
 dQ/dK/dV. Each kernel owns its output tiles, so deterministic requests are honored as on
-the d = 256 chain. Declined on this route: a window without the causal mask, and
+the d = 256 chain. Declined on this route: a window without the causal mask or with keyless query rows, and
 everything the d = 256 chain declines (E5M2, bottom-right / right-widened masks,
 padding, THD, bias / dBias, sink / dSink, `amax_*` outputs, non-BSHD strides).
 `test_sdpa_bwd_mxfp8_sm100.py` covers the three pairs against an FP32 reference,
