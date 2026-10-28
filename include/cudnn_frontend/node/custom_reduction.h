@@ -19,7 +19,7 @@ class CustomReductionNode : public NodeCRTP<CustomReductionNode> {
 
     Custom_reduction_attributes attributes;
 
-    CustomReductionNode(Custom_reduction_attributes&& attributes_, detail::Context const& context)
+    CustomReductionNode(Custom_reduction_attributes &&attributes_, detail::Context const &context)
         : NodeCRTP(context), attributes(std::move(attributes_)) {}
 
     Type
@@ -54,11 +54,12 @@ class CustomReductionNode : public NodeCRTP<CustomReductionNode> {
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             !attributes.compute_data_types.empty() && attributes.compute_data_types.size() != stream_count,
             error_code_t::INVALID_VALUE,
-            "Custom reduction compute-type count must equal its input stream count.");
+            "Custom reduction compute-type count must "
+            "equal its input stream count.");
 
         std::vector<int64_t> common_shape;
         for (size_t i = 0; i < stream_count; ++i) {
-            auto const& input = attributes.inputs[i];
+            auto const &input = attributes.inputs[i];
             RETURN_CUDNN_FRONTEND_ERROR_IF(input == nullptr,
                                            error_code_t::ATTRIBUTE_NOT_SET,
                                            "Custom reduction input stream " + std::to_string(i) + " is not set.");
@@ -75,19 +76,21 @@ class CustomReductionNode : public NodeCRTP<CustomReductionNode> {
         }
 
         auto const rank = static_cast<int64_t>(common_shape.size());
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            rank > CUDNN_DIM_MAX, error_code_t::INVALID_VALUE, "Custom reduction input rank exceeds CUDNN_DIM_MAX.");
         for (size_t i = 0; i < attributes.reduction_dims.size(); ++i) {
             auto const dim = attributes.reduction_dims[i];
             RETURN_CUDNN_FRONTEND_ERROR_IF(
                 dim < 0 || dim >= rank,
                 error_code_t::INVALID_VALUE,
                 "Custom reduction dimension " + std::to_string(dim) + " is outside [0, " + std::to_string(rank) + ").");
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                i > 0 && dim <= attributes.reduction_dims[i - 1],
-                error_code_t::INVALID_VALUE,
-                "Custom reduction dimensions must be unique and in strictly ascending order.");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(i > 0 && dim <= attributes.reduction_dims[i - 1],
+                                           error_code_t::INVALID_VALUE,
+                                           "Custom reduction dimensions must be unique and in strictly "
+                                           "ascending order.");
         }
 
-        for (auto const& [index, output] : attributes.outputs) {
+        for (auto const &[index, output] : attributes.outputs) {
             CUDNN_FRONTEND_UNUSED(index);
             RETURN_CUDNN_FRONTEND_ERROR_IF(
                 output == nullptr, error_code_t::ATTRIBUTE_NOT_SET, "Custom reduction output is not set.");
@@ -103,8 +106,8 @@ class CustomReductionNode : public NodeCRTP<CustomReductionNode> {
         }
 
         for (size_t i = 0; i < attributes.inputs.size(); ++i) {
-            auto const& input  = attributes.inputs[i];
-            auto const& output = attributes.outputs.at(static_cast<int64_t>(i));
+            auto const &input  = attributes.inputs[i];
+            auto const &output = attributes.outputs.at(static_cast<int64_t>(i));
 
             input->fill_from_context(context);
             if (output->get_data_type() == DataType_t::NOT_SET) {
@@ -118,14 +121,16 @@ class CustomReductionNode : public NodeCRTP<CustomReductionNode> {
                 output->set_dim(std::move(output_dim));
             }
             if (output->get_stride().empty()) {
-                auto const& output_dim = output->get_dim();
+                auto const &output_dim = output->get_dim();
                 // generate_NHWC_stride_order indexes axis 1 and therefore
                 // requires rank >= 2. A rank-1 keep-dims reduction has the
                 // canonical contiguous vector stride instead.
                 auto const stride_order = output_dim.size() == 1
                                               ? detail::generate_row_major_stride_order(output_dim.size())
                                               : detail::generate_NHWC_stride_order(output_dim.size());
-                output->set_stride(detail::generate_stride(output_dim, stride_order));
+                std::vector<int64_t> output_stride;
+                CHECK_CUDNN_FRONTEND_ERROR(detail::generate_stride_checked(output_dim, stride_order, output_stride));
+                output->set_stride(std::move(output_stride));
             }
             output->fill_from_context(context);
         }
@@ -140,14 +145,14 @@ class CustomReductionNode : public NodeCRTP<CustomReductionNode> {
 
     error_t
     create_cudnn_operations(
-        std::unordered_set<Tensor_attributes::uid_t>& uids_involved_in_operations,
-        std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
-        managed_backend_descriptor_t& raw_operations,
-        std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final;
+        std::unordered_set<Tensor_attributes::uid_t> &uids_involved_in_operations,
+        std::vector<std::shared_ptr<cudnn_frontend::Operation>> &operations,
+        managed_backend_descriptor_t &raw_operations,
+        std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>> &tensors) const override final;
 
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     void
-    serialize(json& j) const override final {
+    serialize(json &j) const override final {
         auto compute_data_types = attributes.compute_data_types;
         if (compute_data_types.empty() && attributes.compute_data_type != DataType_t::NOT_SET) {
             compute_data_types.assign(attributes.inputs.size(), attributes.compute_data_type);
@@ -160,7 +165,7 @@ class CustomReductionNode : public NodeCRTP<CustomReductionNode> {
         j["compute_data_types"]   = std::move(compute_data_types);
         j["identity_types"]       = json::array();
         j["identity_raw"]         = json::array();
-        for (auto const& identity : attributes.identity_values) {
+        for (auto const &identity : attributes.identity_values) {
             j["identity_types"].push_back(identity.get_data_type());
             j["identity_raw"].push_back(identity.get_raw_hex());
         }
@@ -172,7 +177,7 @@ class CustomReductionNode : public NodeCRTP<CustomReductionNode> {
             j["inputs"].push_back({std::to_string(i), attributes.inputs[i]});
         }
         j["outputs"] = json::array();
-        for (auto const& [index, output] : attributes.outputs) {
+        for (auto const &[index, output] : attributes.outputs) {
             j["outputs"].push_back({std::to_string(index), output});
         }
     }
@@ -202,10 +207,10 @@ class CustomReductionNode : public NodeCRTP<CustomReductionNode> {
     }
 
     static error_t
-    validate_reducer_body(Graph const& body,
-                          std::vector<std::shared_ptr<Tensor_attributes>> const& lhs,
-                          std::vector<std::shared_ptr<Tensor_attributes>> const& rhs,
-                          std::vector<std::shared_ptr<Tensor_attributes>> const& outputs);
+    validate_reducer_body(Graph const &body,
+                          std::vector<std::shared_ptr<Tensor_attributes>> const &lhs,
+                          std::vector<std::shared_ptr<Tensor_attributes>> const &rhs,
+                          std::vector<std::shared_ptr<Tensor_attributes>> const &outputs);
 
     // A reducer that builds the graph of this node again must not run this reducer again.
     bool reducer_running = false;

@@ -52,6 +52,36 @@ uid_key(std::string const& text) {
     return value;
 }
 
+inline uint64_t
+unsigned_integer(json const& value) {
+    if (!value.is_number_integer() || (!value.is_number_unsigned() && value.get<int64_t>() < 0)) {
+        throw std::invalid_argument("Serialized integer must be an in-range unsigned 64-bit integer");
+    }
+    return value.get<uint64_t>();
+}
+
+inline int32_t
+integer32(json const& value) {
+    auto const number = signed_integer(value);
+    if (number < std::numeric_limits<int32_t>::min() || number > std::numeric_limits<int32_t>::max()) {
+        throw std::invalid_argument("Serialized integer is out of signed 32-bit range");
+    }
+    return static_cast<int32_t>(number);
+}
+
+inline std::vector<int64_t>
+integer_array(json const& value) {
+    if (!value.is_array()) {
+        throw std::invalid_argument("Serialized integer sequence must be an array");
+    }
+    std::vector<int64_t> result;
+    result.reserve(value.size());
+    for (auto const& element : value) {
+        result.push_back(signed_integer(element));
+    }
+    return result;
+}
+
 }  // namespace cudnn_frontend::serialization_detail
 
 template <>

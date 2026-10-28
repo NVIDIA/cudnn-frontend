@@ -15,6 +15,99 @@
 #include <thread>
 #include <type_traits>
 #include <vector>
+#include <sstream>
+
+TEST_CASE("Tensor integer JSON fields reject numeric coercion before conversion",
+          "[serialize][boundary][integer_schema]") {
+    namespace fe      = cudnn_frontend;
+    json const tensor = fe::graph::Tensor_attributes(1.0F).set_uid(-17);
+    std::vector<json> const invalid{1.5,
+                                    1.0e100,
+                                    -1.0e100,
+                                    std::numeric_limits<double>::infinity(),
+                                    std::numeric_limits<double>::quiet_NaN(),
+                                    uint64_t{1} << 63,
+                                    true,
+                                    "1",
+                                    nullptr};
+    for (auto field : {"uid", "dim", "stride", "ragged_offset_uid", "ragged_offset_multiplier", "alignment"}) {
+        for (auto const &value : invalid) {
+            auto info = tensor;
+            if (std::string(field) == "dim" || std::string(field) == "stride") {
+                info[field] = json::array({1, value});
+            } else {
+                info[field] = value;
+            }
+            INFO(field << ": " << value.dump());
+            REQUIRE_THROWS_AS(info.get<fe::graph::Tensor_attributes>(), std::exception);
+            json graph{{"json_version", "2.0"}, {"gid", 1}, {"nodes", json::array()}, {"tensors", json::array({info})}};
+            fe::graph::Graph structural;
+            fe::error_t status;
+            REQUIRE_NOTHROW(status = structural.deserialize(graph));
+            REQUIRE(status.get_code() == fe::error_code_t::INVALID_VALUE);
+            fe::graph::Graph plan;
+            REQUIRE_NOTHROW(status = plan.deserialize(static_cast<cudnnHandle_t>(nullptr), graph, false, false));
+            REQUIRE(status.get_code() == fe::error_code_t::INVALID_VALUE);
+        }
+    }
+    for (auto value : {std::numeric_limits<int64_t>::min(), std::numeric_limits<int64_t>::max()}) {
+        auto valid   = tensor;
+        valid["uid"] = value;
+        REQUIRE(valid.get<fe::graph::Tensor_attributes>().get_uid() == value);
+    }
+    auto reused = fe::graph::Tensor_attributes(2.0F).set_ragged_offset(
+        std::make_shared<fe::graph::Tensor_attributes>(fe::graph::Tensor_attributes().set_uid(99)));
+    reused.set_ragged_offset_multiplier(4);
+    from_json(tensor, reused);
+    REQUIRE(reused.get_ragged_offset() == nullptr);
+    REQUIRE_FALSE(reused.has_ragged_offset_multiplier());
+}
+
+TEST_CASE(
+    "Structural graph integer fields and inspection-only reducers have "
+    "safe boundaries",
+    "[serialize][boundary][integer_schema]") {
+    namespace fe = cudnn_frontend;
+    json const base{{"json_version", "2.0"}, {"gid", 1}, {"nodes", json::array()}, {"tensors", json::array()}};
+    for (auto const &value : std::vector<json>{1.0e100, -1.0e100, 1.5, true, "1", nullptr}) {
+        for (auto field : {"gid", "sm_count"}) {
+            auto j = base;
+            if (std::string(field) == "gid") {
+                j[field] = value;
+            } else {
+                j["context"][field] = value;
+            }
+            fe::graph::Graph graph;
+            fe::error_t status;
+            REQUIRE_NOTHROW(status = graph.deserialize(j));
+            // Null SM count is the historical optional-field spelling.
+            if (std::string(field) == "sm_count" && value.is_null()) {
+                REQUIRE(status.is_good());
+            } else {
+                REQUIRE(status.get_code() == fe::error_code_t::INVALID_VALUE);
+            }
+        }
+    }
+    auto valid                   = base;
+    valid["gid"]                 = std::numeric_limits<uint64_t>::max();
+    valid["context"]["sm_count"] = -1;
+    fe::graph::Graph graph;
+    REQUIRE(graph.deserialize(valid).is_good());
+    auto refused                   = base;
+    refused["context"]["sm_count"] = 1.0e100;
+    refused["nodes"] = json::array({json{{"tag", "MATMUL"}, {"inputs", 1.0e100}}, json{{"tag", "CUSTOM_REDUCTION"}}});
+    fe::error_t status;
+    REQUIRE_NOTHROW(status = graph.deserialize(refused));
+    REQUIRE(status.get_code() == fe::error_code_t::GRAPH_NOT_SUPPORTED);
+    REQUIRE(status.get_message().find("inspection-only") != std::string::npos);
+    for (auto const &tag :
+         std::vector<json>{"CUSTOM_REDUCTIONsuffix", std::string("CUSTOM_REDUCTION\0suffix", 23), nullptr, 1}) {
+        auto malformed     = base;
+        malformed["nodes"] = json::array({json{{"tag", tag}}});
+        REQUIRE_NOTHROW(status = graph.deserialize(malformed));
+        REQUIRE(status.get_code() == fe::error_code_t::UNSUPPORTED_GRAPH_FORMAT);
+    }
+}
 
 TEST_CASE("Runtime scalar JSON preserves its typed wire representation", "[serialize][plan_metadata][scalar]") {
     namespace fe = cudnn_frontend;
@@ -25,11 +118,11 @@ TEST_CASE("Runtime scalar JSON preserves its typed wire representation", "[seria
                                      -0.0F,
                                      std::numeric_limits<double>::infinity(),
                                      __float2bfloat16(1.5F)};
-    for (auto const& value : values) {
+    for (auto const &value : values) {
         auto restored = json::from_ubjson(json::to_ubjson(json(value))).get<Scalar>();
         REQUIRE(restored.index() == value.index());
         std::visit(
-            [&](auto const& expected) {
+            [&](auto const &expected) {
                 using T = std::decay_t<decltype(expected)>;
                 REQUIRE(std::memcmp(&expected, &std::get<T>(restored), sizeof(T)) == 0);
             },
@@ -57,12 +150,12 @@ TEST_CASE("Runtime scalar JSON rejects malformed tags and values", "[serialize][
                                       json{{"index", 1}, {"value", int64_t{std::numeric_limits<int32_t>::min()} - 1}},
                                       json{{"index", 4}, {"value", "2.0"}},
                                       json{{"index", 4}, {"value", nullptr}}};
-    for (auto const& value : malformed) {
+    for (auto const &value : malformed) {
         INFO(value.dump());
         REQUIRE_THROWS_AS(value.get<Scalar>(), std::exception);
     }
     for (auto index : {2, 3, 5}) {
-        for (auto const& word : std::vector<std::string>{"",
+        for (auto const &word : std::vector<std::string>{"",
                                                          "0",
                                                          "100000000",
                                                          "-0000000",
@@ -97,7 +190,7 @@ TEST_CASE("Plan metadata validates sibling UID and workspace representations", "
         } else {
             entry = json::array({16, 4});
         }
-        for (auto const& key : std::vector<std::string>{"",
+        for (auto const &key : std::vector<std::string>{"",
                                                         "01",
                                                         "-0",
                                                         "+1",
@@ -112,7 +205,7 @@ TEST_CASE("Plan metadata validates sibling UID and workspace representations", "
             INFO(std::string(field) << ": " << key);
             REQUIRE_THROWS_AS(md::parse(j), std::exception);
         }
-        for (auto const& key : {"-9223372036854775808", "9223372036854775807", "-2", "0"}) {
+        for (auto const &key : {"-9223372036854775808", "9223372036854775807", "-2", "0"}) {
             auto j   = base;
             j[field] = json::object({{key, entry}});
             REQUIRE_NOTHROW(md::parse(j));
@@ -132,7 +225,7 @@ TEST_CASE("Plan metadata validates sibling UID and workspace representations", "
                                      json::array({1, 0, json::array({"00000000", "00000000"})}),
                                      json::array({2, 0, json::array({"00000000"})}),
                                      json::array({0, 0.5, json::array()})};
-    for (auto const& entry : bad_work) {
+    for (auto const &entry : bad_work) {
         auto j                       = base;
         j["workspace_modifications"] = {{"3", entry}};
         INFO(entry.dump());
@@ -155,8 +248,10 @@ TEST_CASE("Plan metadata validates sibling UID and workspace representations", "
     REQUIRE_THROWS_AS(md::parse(duplicate), std::exception);
 }
 
-TEST_CASE("Plan metadata preserves virtual predicates and bounds owned aliases and dumps",
-          "[serialize][plan_metadata][host]") {
+TEST_CASE(
+    "Plan metadata preserves virtual predicates and bounds owned aliases "
+    "and dumps",
+    "[serialize][plan_metadata][host]") {
     namespace fe = cudnn_frontend;
     namespace md = fe::graph::plan_serialization_detail;
     json base{{"cudnn_backend_data", "opaque"},
@@ -221,6 +316,169 @@ TEST_CASE("Plan metadata preserves virtual predicates and bounds owned aliases a
     REQUIRE(md::parse(workspace).dumps.empty());
 }
 
+TEST_CASE("Plan metadata separates scalar reads empty shapes aliases and dumps",
+          "[serialize][plan_metadata][pbv_contract]") {
+    namespace fe = cudnn_frontend;
+    namespace md = fe::graph::plan_serialization_detail;
+    json base{{"cudnn_backend_data", "opaque"},
+              {"variant_pack_uids", json::array({1})},
+              {"fe_workspace_size", 16},
+              {"variant_pack_replacements", json::array()},
+              {"behavior_notes", json::array({json::array()})},
+              {"gid", 1},
+              {"nodes", json::array()},
+              {"tensors", json::array()}};
+    for (auto extent : {int64_t{0}, int64_t{2}}) {
+        DYNAMIC_SECTION("PBV extent " << extent) {
+            auto scalar  = fe::graph::Tensor_attributes(2.0F).set_uid(1).set_dim({extent}).set_stride({1});
+            auto payload = base;
+            payload["tensors"].push_back(json(scalar));
+            auto metadata = md::parse(payload);
+            REQUIRE(metadata.scalars.count(1) == 1);
+            REQUIRE(md::tensor_bytes(*metadata.tensors.at(1)) == extent * 4);
+            REQUIRE(md::dump_bytes(*metadata.tensors.at(1)) == extent * 4);
+            REQUIRE_NOTHROW(md::validate_owned_spans(metadata, {}));
+            auto roundtrip = md::parse(json::from_ubjson(json::to_ubjson(payload)));
+            REQUIRE(roundtrip.tensors.at(1)->get_dim() == std::vector<int64_t>{extent});
+            payload["tensors_to_dump"] = json::array({json::array({1, int('x')})});
+            if (extent == 0) {
+                REQUIRE_NOTHROW(md::validate_owned_spans(md::parse(payload), {}));
+            } else {
+                REQUIRE_THROWS_AS(md::validate_owned_spans(md::parse(payload), {}), std::exception);
+            }
+            payload["tensors_to_dump"]         = json::array();
+            payload["tensors"][0]["data_type"] = "DOUBLE";
+            REQUIRE_THROWS_AS(md::parse(payload), std::exception);
+        }
+    }
+    auto zero = fe::graph::Tensor_attributes()
+                    .set_uid(1)
+                    .set_dim({0, 2})
+                    .set_stride({2, 1})
+                    .set_data_type(fe::DataType_t::FLOAT)
+                    .set_is_virtual(true);
+    base["tensors"].push_back(json(zero));
+    REQUIRE_NOTHROW(md::parse(base));
+    REQUIRE(md::tensor_bytes(zero) == 0);
+    REQUIRE(md::dump_bytes(zero) == 0);
+    auto scalar      = fe::graph::Tensor_attributes(2.0F).set_uid(1);
+    base["tensors"]  = json::array({json(scalar)});
+    auto empty_alias = fe::graph::Tensor_attributes()
+                           .set_uid(2)
+                           .set_dim({0})
+                           .set_stride({1})
+                           .set_data_type(fe::DataType_t::FLOAT)
+                           .set_is_pass_by_value(true);
+    auto end_alias = empty_alias;
+    end_alias.set_uid(3).set_dim({1});
+    base["tensors"].push_back(json(empty_alias));
+    base["tensors"].push_back(json(end_alias));
+    std::vector<std::pair<int64_t, std::pair<int64_t, int64_t>>> chain{{1, {2, 0}}, {2, {3, 0}}};
+    REQUIRE_NOTHROW(md::validate_owned_spans(md::parse(base), chain));
+    base["tensors"][2]["data_type"] = "DOUBLE";
+    REQUIRE_THROWS_AS(md::validate_owned_spans(md::parse(base), chain), std::exception);
+    // A raw PBV vector still owns a scalar argument read even when its shape is
+    // empty.
+    base["tensors"] = json::array({json(empty_alias.set_uid(1)), json(end_alias.set_uid(2))});
+    chain           = {{1, {2, 0}}};
+    REQUIRE_NOTHROW(md::validate_owned_spans(md::parse(base), chain));
+    auto workspace                       = base;
+    workspace["workspace_modifications"] = {{"1", json::array({2, 0, json::array()})}};
+    REQUIRE_THROWS_AS(md::parse(workspace), std::exception);
+    workspace["tensors"][0]["is_pass_by_value"] = false;
+    REQUIRE_THROWS_AS(md::validate_owned_spans(md::parse(workspace), chain), std::exception);
+    workspace["tensors"][1]["is_pass_by_value"] = false;
+    workspace["tensors"][0]["dim"]              = {4};
+    REQUIRE_NOTHROW(md::validate_owned_spans(md::parse(workspace), chain));
+}
+
+TEST_CASE("Reduction plan warmup omits fake dumps and preserves execution dumps",
+          "[serialize][custom_reduction][warmup_dumps]") {
+    namespace fe = cudnn_frontend;
+    if (CUDNN_VERSION < 92900 || fe::detail::get_backend_version() < 92900) {
+        SKIP("Requires cuDNN9.29");
+    }
+    fe::graph::Graph graph;
+    graph.set_io_data_type(fe::DataType_t::FLOAT)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+    auto input   = graph.tensor(fe::graph::Tensor_attributes()
+                                  .set_uid(1)
+                                  .set_dim({1, 4, 1, 1})
+                                  .set_stride({4, 1, 4, 4})
+                                  .set_name("warmup_input"));
+    auto scalar  = graph.tensor(fe::graph::Tensor_attributes()
+                                   .set_uid(2)
+                                   .set_dim({1, 1, 1, 1})
+                                   .set_stride({1, 1, 1, 1})
+                                   .set_is_pass_by_value(true)
+                                   .set_name("warmup_raw_scalar"));
+    auto shifted = graph.pointwise(input, scalar, fe::graph::Pointwise_attributes().set_mode(fe::PointwiseMode_t::ADD));
+    auto output =
+        graph.custom_reduction({shifted},
+                               fe::graph::reduction_modifiers::sum(
+                                   fe::graph::Custom_reduction_attributes().set_reduction_dims({1}).set_identity_values(
+                                       {fe::graph::Custom_reduction_identity(0.0F)})))[0];
+    output->set_output(true).set_uid(3);
+    struct Resources {
+        cudnnHandle_t handle = nullptr;
+        void *input = nullptr, *output = nullptr, *workspace = nullptr;
+        ~Resources() {
+            cudaFree(workspace);
+            cudaFree(output);
+            cudaFree(input);
+            if (handle) cudnnDestroy(handle);
+        }
+    } resources;
+    REQUIRE(cudnnCreate(&resources.handle) == CUDNN_STATUS_SUCCESS);
+    auto built = graph.build(resources.handle, {fe::HeurMode_t::A});
+    INFO(built.get_message());
+    REQUIRE(built.is_good());
+    std::vector<uint8_t> blob;
+    REQUIRE(graph.serialize(blob).is_good());
+    auto payload               = json::from_ubjson(blob);
+    payload["tensors_to_dump"] = json::array({json::array({scalar->get_uid(), int('x')})});
+    blob                       = json::to_ubjson(payload);
+    std::ostringstream captured;
+    // Test-only logger capture. Product warmup must not toggle shared logger
+    // state.
+    (void)fe::getLogger();
+    struct LoggerCapture {
+        std::ostream &stream;
+        std::streambuf *previous;
+        bool enabled = fe::isLoggingEnabled();
+        bool dumps   = fe::isLoggingTensorDumpEnabled();
+        explicit LoggerCapture(std::ostringstream &output)
+            : stream(fe::getStream()), previous(stream.rdbuf(output.rdbuf())) {
+            fe::isLoggingEnabled()           = true;
+            fe::isLoggingTensorDumpEnabled() = true;
+        }
+        ~LoggerCapture() {
+            stream.rdbuf(previous);
+            fe::isLoggingEnabled()           = enabled;
+            fe::isLoggingTensorDumpEnabled() = dumps;
+        }
+    } logging(captured);
+    fe::graph::Graph restored;
+    REQUIRE(restored.deserialize(resources.handle, blob, false, true).is_good());
+    REQUIRE(captured.str().find("Tensor Dump uid:") == std::string::npos);
+    REQUIRE(fe::isLoggingTensorDumpEnabled());
+    float values[] = {1.0F, 2.0F, 3.0F, 4.0F};
+    float bias     = 2.0F;
+    REQUIRE(cudaMalloc(&resources.input, sizeof(values)) == cudaSuccess);
+    REQUIRE(cudaMalloc(&resources.output, sizeof(float)) == cudaSuccess);
+    REQUIRE(cudaMemcpy(resources.input, values, sizeof(values), cudaMemcpyHostToDevice) == cudaSuccess);
+    int64_t workspace_size = 0;
+    REQUIRE(restored.get_workspace_size(workspace_size).is_good());
+    if (workspace_size) REQUIRE(cudaMalloc(&resources.workspace, workspace_size) == cudaSuccess);
+    std::unordered_map<int64_t, void *> pointers{{1, resources.input}, {2, &bias}, {3, resources.output}};
+    REQUIRE(restored.execute(resources.handle, pointers, resources.workspace).is_good());
+    REQUIRE(captured.str().find("Tensor Dump uid: 2 Name: warmup_raw_scalar") != std::string::npos);
+    float actual = 0.0F;
+    REQUIRE(cudaMemcpy(&actual, resources.output, sizeof(actual), cudaMemcpyDeviceToHost) == cudaSuccess);
+    REQUIRE(actual == 18.0F);
+}
+
 TEST_CASE("Tensor attributes", "[tensor][serialize]") {
     namespace fe = cudnn_frontend;
 
@@ -243,7 +501,7 @@ TEST_CASE("Tensor attributes", "[tensor][serialize]") {
 TEST_CASE("Tensor compile-time constants preserve exact typed values", "[tensor][serialize][compile_time_constant]") {
     namespace fe = cudnn_frontend;
 
-    auto check_round_trip = [](auto const& value, char const* expected_type, char const* expected_raw) {
+    auto check_round_trip = [](auto const &value, char const *expected_type, char const *expected_raw) {
         using value_t = std::decay_t<decltype(value)>;
 
         auto tensor_attributes = fe::graph::Tensor_attributes(value, fe::graph::ScalarType::COMPILE_TIME_CONST)
@@ -262,7 +520,7 @@ TEST_CASE("Tensor compile-time constants preserve exact typed values", "[tensor]
         auto restored_constant = deserialized.get_compile_time_constant();
         REQUIRE(restored_constant.has_value());
 
-        auto const& restored = std::get<value_t>(restored_constant.value());
+        auto const &restored = std::get<value_t>(restored_constant.value());
         REQUIRE(std::memcmp(&restored, &value, sizeof(value_t)) == 0);
     };
 
@@ -377,8 +635,10 @@ TEST_CASE("Tensor compile-time constant JSON rejects malformed state", "[tensor]
     }
 }
 
-TEST_CASE("Tensor compile-time constant with a mismatched data type serializes and validates",
-          "[graph][serialize][compile_time_constant][key]") {
+TEST_CASE(
+    "Tensor compile-time constant with a mismatched data type serializes "
+    "and validates",
+    "[graph][serialize][compile_time_constant][key]") {
     namespace fe = cudnn_frontend;
 
     // The develop public setters can make this state: a FLOAT constant on an INT32 tensor.
@@ -418,8 +678,10 @@ TEST_CASE("Tensor compile-time constant with a mismatched data type serializes a
     REQUIRE(restored_graph.deserialize(graph_json).is_good());
 }
 
-TEST_CASE("Graph deserialization returns an error for a malformed compile-time constant",
-          "[graph][serialize][compile_time_constant]") {
+TEST_CASE(
+    "Graph deserialization returns an error for a malformed compile-time "
+    "constant",
+    "[graph][serialize][compile_time_constant]") {
     namespace fe = cudnn_frontend;
 
     fe::graph::Graph graph;
@@ -437,7 +699,7 @@ TEST_CASE("Graph deserialization returns an error for a malformed compile-time c
 
     json serialized = graph;
     bool corrupted{false};
-    for (auto& tensor : serialized.at("tensors")) {
+    for (auto &tensor : serialized.at("tensors")) {
         if (tensor.value("name", "") == "constant") {
             tensor["compile_time_constant_value"]["raw"] = "3F80000Z";
             corrupted                                    = true;
@@ -466,7 +728,7 @@ TEST_CASE("Graph serialization preserves signed-zero compile-time constants",
           "[graph][serialize][compile_time_constant][key]") {
     namespace fe = cudnn_frontend;
 
-    auto populate_graph = [](fe::graph::Graph& graph, float constant_value) {
+    auto populate_graph = [](fe::graph::Graph &graph, float constant_value) {
         auto x =
             graph.tensor(fe::graph::Tensor_attributes().set_name("x").set_dim({1, 4}).set_stride({4, 1}).set_data_type(
                 fe::DataType_t::FLOAT));
@@ -498,7 +760,7 @@ TEST_CASE("Graph serialization preserves signed-zero compile-time constants",
 
     json serialized = negative_graph;
     bool found_constant{false};
-    for (auto const& tensor : serialized.at("tensors")) {
+    for (auto const &tensor : serialized.at("tensors")) {
         if (tensor.value("name", "") == "constant") {
             found_constant = true;
             REQUIRE(tensor.at("has_compile_time_constant").get<bool>());
@@ -588,8 +850,8 @@ TEST_CASE("conv graph serialization preserves alignment", "[graph][serialize]") 
     auto y = graph.conv_fprop(x, w, conv_fprop_attributes);
     y->set_name("output").set_output(true).set_data_type(fe::DataType_t::HALF);
 
-    auto alignment_of = [](json const& serialized, std::string const& name) -> int64_t {
-        for (auto const& tensor : serialized["tensors"]) {
+    auto alignment_of = [](json const &serialized, std::string const &name) -> int64_t {
+        for (auto const &tensor : serialized["tensors"]) {
             if (tensor.contains("name") && tensor["name"].get<std::string>() == name) {
                 return tensor.value("alignment", fe::graph::Tensor_attributes::default_alignment);
             }
@@ -731,7 +993,8 @@ TEST_CASE("Graph key dynamic shape", "[graph][key][dynamic_shape]") {
     // clang-format on
 
     constexpr int shapes_count = sizeof(shapes) / sizeof(shapes[0]);
-    size_t key                 = 0;  // Save key between runs to verify that dim and stride information is deleted
+    size_t key                 = 0;  // Save key between runs to verify that dim and stride
+                                     // information is deleted
 
     for (int idx_shape = 0; idx_shape < shapes_count; idx_shape++) {
         auto b = shapes[idx_shape].b;
@@ -1206,9 +1469,12 @@ TEST_CASE("Plan deserialize with run_warmup=false still prepares template", "[gr
     // Check for success and variant pack uids are the same as the expected uids
     SECTION("blob overload, run_warmup=false") {
         fe::graph::Graph graph_deserialized;
-        REQUIRE(
-            graph_deserialized.deserialize(handle, serialized_data, /*enforce_precompiled=*/false, /*run_warmup=*/false)
-                .is_good());
+        REQUIRE(graph_deserialized
+                    .deserialize(handle,
+                                 serialized_data,
+                                 /*enforce_precompiled=*/false,
+                                 /*run_warmup=*/false)
+                    .is_good());
         // check the variant pack uids are the same as the expected uids
         REQUIRE(graph_deserialized.get_variant_pack_uids_sorted() == expected_uids);
         // tensor metadata must still resolve with warmup skipped (deserialized_tensor_properties)
@@ -1231,12 +1497,18 @@ TEST_CASE("Plan deserialize with run_warmup=false still prepares template", "[gr
     // Confirms warmup is purely a priming step with no effect on the executable plan.
     SECTION("run_warmup=false matches the default warmup=true template") {
         fe::graph::Graph warmed;
-        REQUIRE(
-            warmed.deserialize(handle, serialized_data, /*enforce_precompiled=*/false, /*run_warmup=*/true).is_good());
+        REQUIRE(warmed
+                    .deserialize(handle,
+                                 serialized_data,
+                                 /*enforce_precompiled=*/false,
+                                 /*run_warmup=*/true)
+                    .is_good());
 
         fe::graph::Graph skipped;
-        auto const skipped_status =
-            skipped.deserialize(handle, serialized_data, /*enforce_precompiled=*/false, /*run_warmup=*/false);
+        auto const skipped_status = skipped.deserialize(handle,
+                                                        serialized_data,
+                                                        /*enforce_precompiled=*/false,
+                                                        /*run_warmup=*/false);
         REQUIRE(skipped_status.is_good());
 
         // The plan-side state the fast execute path relies on is identical either way.
@@ -1284,9 +1556,14 @@ TEST_CASE("serialize_structure flag controls structural payload", "[graph][seria
 
     // Both remain reloadable through the plan path with identical variant packs.
     auto const expected_uids = graph.get_variant_pack_uids_sorted();
-    for (auto const& blob : {with_structure, without_structure}) {
+    for (auto const &blob : {with_structure, without_structure}) {
         fe::graph::Graph reloaded;
-        REQUIRE(reloaded.deserialize(handle, blob, /*enforce_precompiled=*/false, /*run_warmup=*/false).is_good());
+        REQUIRE(reloaded
+                    .deserialize(handle,
+                                 blob,
+                                 /*enforce_precompiled=*/false,
+                                 /*run_warmup=*/false)
+                    .is_good());
         REQUIRE(reloaded.get_variant_pack_uids_sorted() == expected_uids);
     }
 
@@ -1337,7 +1614,12 @@ TEST_CASE("Plan re-serialize preserves pass-by-value and workspace modifications
     auto const expected_uids = graph.get_variant_pack_uids_sorted();
 
     fe::graph::Graph reloaded;
-    REQUIRE(reloaded.deserialize(handle, blob, /*enforce_precompiled=*/false, /*run_warmup=*/false).is_good());
+    REQUIRE(reloaded
+                .deserialize(handle,
+                             blob,
+                             /*enforce_precompiled=*/false,
+                             /*run_warmup=*/false)
+                .is_good());
     REQUIRE(reloaded.get_variant_pack_uids_sorted() == expected_uids);
 
     // Re-serialize the plan-only graph; the cached maps must survive intact.
@@ -1407,7 +1689,7 @@ TEST_CASE("Plan round trip keeps a compile-time constant with a mismatched type"
             REQUIRE(cudaMalloc(&workspace, static_cast<size_t>(workspace_size)) == cudaSuccess);
         }
 
-        std::unordered_map<int64_t, void*> variant_pack = {{X->get_uid(), x_dev}, {Y->get_uid(), y_dev}};
+        std::unordered_map<int64_t, void *> variant_pack = {{X->get_uid(), x_dev}, {Y->get_uid(), y_dev}};
         REQUIRE(graph.execute(handle, variant_pack, workspace).is_good());
 
         std::vector<uint8_t> data;
@@ -1416,8 +1698,8 @@ TEST_CASE("Plan round trip keeps a compile-time constant with a mismatched type"
         auto status = restored.deserialize(handle, data, /*enforce_precompiled=*/true, /*run_warmup=*/false);
         INFO(status.get_message());
         REQUIRE(status.is_good());
-        std::unordered_map<int64_t, void*> restored_variant_pack = {{X->get_uid(), x_dev},
-                                                                    {Y->get_uid(), restored_y_dev}};
+        std::unordered_map<int64_t, void *> restored_variant_pack = {{X->get_uid(), x_dev},
+                                                                     {Y->get_uid(), restored_y_dev}};
         REQUIRE(restored.execute(handle, restored_variant_pack, workspace).is_good());
         REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
 
@@ -1495,8 +1777,8 @@ struct FusionGraph {
 // The wire format is a JSON string, e.g. {"deviceVer":890,...}.
 // Returns -1 if the key is not found.
 static int
-parse_device_ver(std::vector<uint8_t> const& buf) {
-    std::string s(reinterpret_cast<const char*>(buf.data()), buf.size());
+parse_device_ver(std::vector<uint8_t> const &buf) {
+    std::string s(reinterpret_cast<const char *>(buf.data()), buf.size());
     auto pos = s.find("\"deviceVer\":");
     if (pos == std::string::npos) return -1;
     pos += std::string("\"deviceVer\":").size();
@@ -1519,7 +1801,7 @@ make_wrong_arch_devprop() {
     // Pick a different SM: add 100 (one major step up) if possible, else subtract 100.
     int wrong_ver = (real_ver < 900) ? (real_ver + 100) : (real_ver - 100);
 
-    std::string s(reinterpret_cast<const char*>(buf.data()), buf.size());
+    std::string s(reinterpret_cast<const char *>(buf.data()), buf.size());
     std::string needle = "\"deviceVer\":" + std::to_string(real_ver);
     std::string repl   = "\"deviceVer\":" + std::to_string(wrong_ver);
     auto pos           = s.find(needle);
@@ -1621,7 +1903,9 @@ TEST_CASE("Handle-less plan deserialize", "[serialize][graph]") {
         REQUIRE(fg.graph->create_execution_plans({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
         fg.graph->select_behavior_notes({fe::BehaviorNote_t::RUNTIME_COMPILATION});
         if (fg.graph->check_support().is_bad()) {
-            SKIP("No RUNTIME_COMPILATION engine available for this graph on this GPU/cuDNN");
+            SKIP(
+                "No RUNTIME_COMPILATION engine available for this graph on this "
+                "GPU/cuDNN");
         }
         REQUIRE(fg.graph->build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
 
@@ -1703,7 +1987,9 @@ TEST_CASE("Handle-less plan deserialize", "[serialize][graph]") {
         cudnnDestroy(handle);
     }
 
-    SECTION("concurrency: N threads share one devprop, each deserializes its own blob") {
+    SECTION(
+        "concurrency: N threads share one devprop, each deserializes its own "
+        "blob") {
         // Concurrent rehydration is the primary motivation for this feature.
         // One shared read-only DeviceProperties descriptor is used by all threads;
         // each thread deserializes into its own Graph.
@@ -1726,7 +2012,7 @@ TEST_CASE("Handle-less plan deserialize", "[serialize][graph]") {
                 results[t] = g.deserialize(blob).is_good() ? 1 : 0;
             });
         }
-        for (auto& th : threads) th.join();
+        for (auto &th : threads) th.join();
 
         for (int t = 0; t < kThreads; ++t) {
             REQUIRE(results[t] == 1);

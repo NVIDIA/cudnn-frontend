@@ -18,8 +18,43 @@ class PointwiseNode : public NodeCRTP<PointwiseNode> {
    public:
     Pointwise_attributes attributes;
 
-    PointwiseNode(Pointwise_attributes&& attributes_, detail::Context const& context)
+    PointwiseNode(Pointwise_attributes &&attributes_, detail::Context const &context)
         : NodeCRTP(context), attributes(std::move(attributes_)) {}
+
+    error_t
+    validate_operand_roles() const {
+        auto const ports = get_pointwise_mode_port_count(attributes.mode);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            ports < 2 || ports > 4, error_code_t::ATTRIBUTE_NOT_SET, "Pointwise mode is not set or unsupported.");
+        auto const required = ports - 1;
+        for (int64_t index = 0; index < required; ++index) {
+            auto const input = attributes.inputs.find(static_cast<Pointwise_attributes::input_names>(index));
+            RETURN_CUDNN_FRONTEND_ERROR_IF(input == attributes.inputs.end() || input->second == nullptr,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "Pointwise required input " + std::to_string(index) + " is not set.");
+        }
+        for (auto const &[port, tensor] : attributes.inputs) {
+            auto const index = static_cast<int64_t>(port);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(index < 0 || index > 2 || (tensor != nullptr && index >= required),
+                                           error_code_t::INVALID_VALUE,
+                                           "Pointwise operand is not consumed by the selected mode.");
+        }
+        auto const output = attributes.outputs.find(Pointwise_attributes::output_names::OUT_0);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(output == attributes.outputs.end() || output->second == nullptr,
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "Pointwise output is not set.");
+        for (auto const &[port, tensor] : attributes.outputs) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(port != Pointwise_attributes::output_names::OUT_0,
+                                           error_code_t::INVALID_VALUE,
+                                           "Pointwise output role is unknown.");
+        }
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    pre_validate_node() const override final {
+        return validate_operand_roles();
+    }
 
     Type
     getType() override final {
@@ -28,6 +63,7 @@ class PointwiseNode : public NodeCRTP<PointwiseNode> {
 
     error_t
     infer_properties_node() override final {
+        CHECK_CUDNN_FRONTEND_ERROR(validate_operand_roles());
         CUDNN_FE_LOG_LABEL_ENDL("INFO:     Inferrencing properties for pointwise node " << attributes.name);
 
         attributes.fill_from_context(context);
@@ -38,7 +74,7 @@ class PointwiseNode : public NodeCRTP<PointwiseNode> {
         // Only infer dims and strides if user did not set them
         if (output_dim.empty()) {
             std::vector<std::vector<int64_t>> input_shapes;
-            for (const auto& [input_name, input_tensor] : attributes.inputs) {
+            for (const auto &[input_name, input_tensor] : attributes.inputs) {
                 if (!input_tensor) {
                     continue;
                 }
@@ -50,7 +86,7 @@ class PointwiseNode : public NodeCRTP<PointwiseNode> {
         }
 
         if (out_0_tensor->get_stride().empty()) {
-            for (const auto& [input_name, input_tensor] : attributes.inputs) {
+            for (const auto &[input_name, input_tensor] : attributes.inputs) {
                 if (input_tensor == nullptr) {
                     continue;
                 }
@@ -67,7 +103,9 @@ class PointwiseNode : public NodeCRTP<PointwiseNode> {
                 std::vector<int64_t> stride_order;
                 CHECK_CUDNN_FRONTEND_ERROR(
                     detail::generate_stride_order_preserving_format(input_stride, output_dim.size(), stride_order));
-                out_0_tensor->set_stride(detail::generate_stride(output_dim, stride_order));
+                std::vector<int64_t> output_stride;
+                CHECK_CUDNN_FRONTEND_ERROR(detail::generate_stride_checked(output_dim, stride_order, output_stride));
+                out_0_tensor->set_stride(std::move(output_stride));
             }
             RETURN_CUDNN_FRONTEND_ERROR_IF(out_0_tensor->get_stride().empty(),
                                            error_code_t::SHAPE_DEDUCTION_FAILED,
@@ -79,10 +117,11 @@ class PointwiseNode : public NodeCRTP<PointwiseNode> {
 
     error_t
     create_cudnn_operations(
-        std::unordered_set<Tensor_attributes::uid_t>& uids_involved_in_operations,
-        std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
-        managed_backend_descriptor_t& raw_operations,
-        std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
+        std::unordered_set<Tensor_attributes::uid_t> &uids_involved_in_operations,
+        std::vector<std::shared_ptr<cudnn_frontend::Operation>> &operations,
+        managed_backend_descriptor_t &raw_operations,
+        std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>> &tensors) const override final {
+        CHECK_CUDNN_FRONTEND_ERROR(validate_operand_roles());
         CUDNN_FRONTEND_UNUSED(raw_operations);
         CUDNN_FE_LOG_LABEL("INFO: " << "Building PointwiseNode operations " << attributes.name << " ");
 
@@ -277,8 +316,8 @@ class PointwiseNode : public NodeCRTP<PointwiseNode> {
         double const alpha1_d = 1.0, alpha2_d = 1.0;
         float const alpha1_f = 1.0f, alpha2_f = 1.0f;
 
-        void const* alpha1 = is_double ? static_cast<void const*>(&alpha1_d) : static_cast<void const*>(&alpha1_f);
-        void const* alpha2 = is_double ? static_cast<void const*>(&alpha2_d) : static_cast<void const*>(&alpha2_f);
+        void const *alpha1 = is_double ? static_cast<void const *>(&alpha1_d) : static_cast<void const *>(&alpha1_f);
+        void const *alpha2 = is_double ? static_cast<void const *>(&alpha2_d) : static_cast<void const *>(&alpha2_f);
 
         _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(
             pointwise_operation.get_raw_desc(), CUDNN_ATTR_OPERATION_POINTWISE_ALPHA1, attr_type, 1, alpha1));
@@ -290,14 +329,14 @@ class PointwiseNode : public NodeCRTP<PointwiseNode> {
 
         operations.push_back(std::make_shared<Operation_v8>(std::move(pointwise_operation)));
 
-        auto const& non_virtual_uids = attributes.get_non_virtual_uids();
+        auto const &non_virtual_uids = attributes.get_non_virtual_uids();
         uids_involved_in_operations.insert(non_virtual_uids.begin(), non_virtual_uids.end());
         return {error_code_t::OK, ""};
     }
 
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     virtual void
-    serialize(json& j) const override final {
+    serialize(json &j) const override final {
         j = attributes;
         j.update(R"({"tag": "POINTWISE"})"_json);
     }
@@ -343,7 +382,7 @@ INode::pointwise(std::shared_ptr<Tensor_attributes> a, Pointwise_attributes attr
         attributes.name += std::to_string(sub_nodes.size());
     }
     attributes.inputs[Pointwise_attributes::input_names::IN_0] = a;
-    if (a->get_name().empty()) {
+    if (a != nullptr && a->get_name().empty()) {
         a->set_name(attributes.name + "::IN_0");
     };
     auto OUT_0 = attributes.outputs[Pointwise_attributes::output_names::OUT_0] =
@@ -362,10 +401,10 @@ INode::pointwise(std::shared_ptr<Tensor_attributes> a,
     }
     attributes.inputs[Pointwise_attributes::input_names::IN_0] = a;
     attributes.inputs[Pointwise_attributes::input_names::IN_1] = b;
-    if (a->get_name().empty()) {
+    if (a != nullptr && a->get_name().empty()) {
         a->set_name(attributes.name + "::IN_0");
     };
-    if (b->get_name().empty()) {
+    if (b != nullptr && b->get_name().empty()) {
         b->set_name(attributes.name + "::IN_1");
     };
     auto OUT_0 = attributes.outputs[Pointwise_attributes::output_names::OUT_0] =
@@ -386,13 +425,13 @@ INode::pointwise(std::shared_ptr<Tensor_attributes> a,
     attributes.inputs[Pointwise_attributes::input_names::IN_0] = a;
     attributes.inputs[Pointwise_attributes::input_names::IN_1] = b;
     attributes.inputs[Pointwise_attributes::input_names::IN_2] = c;
-    if (a->get_name().empty()) {
+    if (a != nullptr && a->get_name().empty()) {
         a->set_name(attributes.name + "::IN_0");
     };
-    if (b->get_name().empty()) {
+    if (b != nullptr && b->get_name().empty()) {
         b->set_name(attributes.name + "::IN_1");
     };
-    if (c->get_name().empty()) {
+    if (c != nullptr && c->get_name().empty()) {
         c->set_name(attributes.name + "::IN_2");
     };
     auto OUT_0 = attributes.outputs[Pointwise_attributes::output_names::OUT_0] =

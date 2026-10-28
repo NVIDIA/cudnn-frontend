@@ -738,30 +738,34 @@ inline void
 from_json(const nlohmann::json& j, Tensor_attributes& ta) {
     ta.name             = j.contains("name") && !j["name"].is_null() ? j.at("name").get<std::string>() : "";
     ta.data_type        = j.at("data_type").get<DataType_t>();
-    ta.dim              = j.at("dim").get<std::vector<int64_t>>();
-    ta.stride           = j.at("stride").get<std::vector<int64_t>>();
+    ta.dim              = ::cudnn_frontend::serialization_detail::integer_array(j.at("dim"));
+    ta.stride           = ::cudnn_frontend::serialization_detail::integer_array(j.at("stride"));
     ta.is_virtual       = j.at("is_virtual").get<bool>();
     ta.is_pass_by_value = j.at("is_pass_by_value").get<bool>();
     ta.reordering_type  = j.at("reordering_type").get<TensorReordering_t>();
-    ta.set_uid(j.at("uid").get<Tensor_attributes::uid_t>());
+    ta.set_uid(::cudnn_frontend::serialization_detail::signed_integer(j.at("uid")));
 
     ta.pass_by_value.reset();
     if (ta.is_pass_by_value && !j.at("pass_by_value").is_null()) {
         ta.pass_by_value = j.at("pass_by_value");
     }
+    ta.ragged_offset.reset();
+    ta.ragged_offset_multiplier = 1;
     if (j.contains("ragged_offset_uid")) {
         auto ragged_offset = std::make_shared<Tensor_attributes>();
-        ragged_offset->set_uid(j.at("ragged_offset_uid").get<Tensor_attributes::uid_t>());
+        ragged_offset->set_uid(::cudnn_frontend::serialization_detail::signed_integer(j.at("ragged_offset_uid")));
         if (j.contains("ragged_offset_name")) {
             ragged_offset->name = j.at("ragged_offset_name").get<std::string>();
         }
         ta.ragged_offset = ragged_offset;
     }
     if (j.contains("ragged_offset_multiplier")) {
-        ta.ragged_offset_multiplier = j.at("ragged_offset_multiplier").get<int64_t>();
+        ta.ragged_offset_multiplier =
+            ::cudnn_frontend::serialization_detail::signed_integer(j.at("ragged_offset_multiplier"));
     }
     // Optional read, for backward compatibility with payloads that predate this key.
-    ta.alignment = j.value("alignment", Tensor_attributes::default_alignment);
+    ta.alignment = j.contains("alignment") ? ::cudnn_frontend::serialization_detail::signed_integer(j.at("alignment"))
+                                           : Tensor_attributes::default_alignment;
 
     // Optional reads preserve compatibility with tensor payloads written before compile-time
     // constants were serialized. A true flag makes the typed raw value mandatory so malformed

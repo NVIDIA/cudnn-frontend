@@ -138,20 +138,18 @@ class Graph : public ICudnn, public INode {
     collect_assigned_uid(std::shared_ptr<Tensor_attributes> const &tensor,
                          std::unordered_set<Tensor_attributes::uid_t> &used_uids,
                          std::unordered_set<Tensor_attributes const *> &visited_tensors) const {
-        if (tensor == nullptr || !visited_tensors.insert(tensor.get()).second) {
-            return {error_code_t::OK, ""};
+        for (auto current = tensor; current != nullptr && visited_tensors.insert(current.get()).second;
+             current      = current->get_ragged_offset()) {
+            if (current->has_uid()) {
+                auto uid = current->get_uid();
+                RETURN_CUDNN_FRONTEND_ERROR_IF(used_uids.find(uid) != used_uids.end(),
+                                               error_code_t::INVALID_VALUE,
+                                               "uid " + std::to_string(uid) + " for tensor named " +
+                                                   current->get_name() +
+                                                   " has been already assigned to another tensor.");
+                used_uids.insert(uid);
+            }
         }
-
-        if (tensor->has_uid()) {
-            auto uid = tensor->get_uid();
-            RETURN_CUDNN_FRONTEND_ERROR_IF(used_uids.find(uid) != used_uids.end(),
-                                           error_code_t::INVALID_VALUE,
-                                           "uid " + std::to_string(uid) + " for tensor named " + tensor->get_name() +
-                                               " has been already assigned to another tensor.");
-            used_uids.insert(uid);
-        }
-
-        CHECK_CUDNN_FRONTEND_ERROR(collect_assigned_uid(tensor->get_ragged_offset(), used_uids, visited_tensors));
         return {error_code_t::OK, ""};
     }
 
@@ -159,22 +157,19 @@ class Graph : public ICudnn, public INode {
     assign_tensor_uid(std::shared_ptr<Tensor_attributes> const &tensor,
                       std::unordered_set<Tensor_attributes::uid_t> &used_uids,
                       std::unordered_set<Tensor_attributes const *> &visited_tensors) const {
-        if (tensor == nullptr || !visited_tensors.insert(tensor.get()).second) {
-            return {error_code_t::OK, ""};
-        }
-
-        if (tensor->has_uid() == false) {
-            Tensor_attributes::uid_t uid = 1;
-            while (used_uids.find(uid) != used_uids.end()) {
-                ++uid;
+        for (auto current = tensor; current != nullptr && visited_tensors.insert(current.get()).second;
+             current      = current->get_ragged_offset()) {
+            if (current->has_uid() == false) {
+                Tensor_attributes::uid_t uid = 1;
+                while (used_uids.find(uid) != used_uids.end()) {
+                    ++uid;
+                }
+                current->set_uid(uid);
+                used_uids.insert(uid);
+                CUDNN_FE_LOG_LABEL_ENDL("INFO: Assigned UID " << current->get_uid() << " to tensor named '"
+                                                              << current->get_name() << "'.");
             }
-            tensor->set_uid(uid);
-            used_uids.insert(uid);
-            CUDNN_FE_LOG_LABEL_ENDL("INFO: Assigned UID " << tensor->get_uid() << " to tensor named '"
-                                                          << tensor->get_name() << "'.");
         }
-
-        CHECK_CUDNN_FRONTEND_ERROR(assign_tensor_uid(tensor->get_ragged_offset(), used_uids, visited_tensors));
         return {error_code_t::OK, ""};
     }
 
@@ -357,7 +352,8 @@ class Graph : public ICudnn, public INode {
             RETURN_CUDNN_FRONTEND_ERROR_IF(
                 source == edge.first || edge.second < 0 || !destinations.insert(edge.first).second,
                 error_code_t::INVALID_VALUE,
-                "Variant-pack replacements have a cycle, negative offset or duplicate destination");
+                "Variant-pack replacements have a cycle, negative offset or "
+                "duplicate destination");
         }
         for (auto const &[source, edge] : replacements) {
             (void)edge;
@@ -655,7 +651,8 @@ class Graph : public ICudnn, public INode {
             ctx.output_dtype = experimental::RmsNormSiluDtype::NVFP4;
         } else {
             return {error_code_t::GRAPH_NOT_SUPPORTED,
-                    "OSS RmsNorm+SiLU engine supports BFLOAT16, FP8_E4M3, or FP4_E2M1 output"};
+                    "OSS RmsNorm+SiLU engine supports BFLOAT16, FP8_E4M3, or "
+                    "FP4_E2M1 output"};
         }
 
         // Detect SM version and instantiate the appropriate OSS engine
@@ -767,12 +764,13 @@ class Graph : public ICudnn, public INode {
         // Initializes this cudnn graph
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             cudnn_cuda_graph == nullptr, error_code_t::INVALID_VALUE, "cudnn_cuda_graph should not be a nullptr");
-        // Only a cuDNN execution plan can be recorded into a CUDA graph by this API.
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            plans.is_frontend_engine_candidate(),
-            error_code_t::GRAPH_NOT_SUPPORTED,
-            "The selected engine is not backed by a cuDNN execution plan, so update_cuda_graph() cannot "
-            "record it; capture execute() on a stream instead.");
+        // Only a cuDNN execution plan can be recorded into a CUDA graph by this
+        // API.
+        RETURN_CUDNN_FRONTEND_ERROR_IF(plans.is_frontend_engine_candidate(),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "The selected engine is not backed by a cuDNN execution plan, so "
+                                       "update_cuda_graph() cannot "
+                                       "record it; capture execute() on a stream instead.");
         UidBindings const derived_bindings = derive_variant_pack_replacements_(uid_to_device_ptrs);
         CHECK_CUDNN_FRONTEND_ERROR(check_aligned_operand_pointers_(uid_to_device_ptrs, derived_bindings));
 
@@ -789,9 +787,10 @@ class Graph : public ICudnn, public INode {
         ///////////////////////////////////////
         // Add pass_by_value data pointers to uid_to_pointer map.
         // Using cached values to avoid repeated tree traversal overhead.
-        // cuda graph will keep a copy of the kernel parameters, meaning that at the time of
-        // launching the cuda_graph executable, cached values being deallocated does not affect these cpu values.
-        // No cuda graph nodes are required for handling fe owned pass by value tensors.
+        // cuda graph will keep a copy of the kernel parameters, meaning that at the
+        // time of launching the cuda_graph executable, cached values being
+        // deallocated does not affect these cpu values. No cuda graph nodes are
+        // required for handling fe owned pass by value tensors.
         CHECK_CUDNN_FRONTEND_ERROR(
             extend_tensor_map_with_pass_by_value_tensors_(uid_to_device_ptrs, cached_pass_by_value));
 
@@ -845,10 +844,10 @@ class Graph : public ICudnn, public INode {
             size_t num_dependent_nodes;
             _CUDNN_CHECK_CUDA_ERROR(
                 detail::cuda_graph_node_get_dependent_nodes(current_node, nullptr, &num_dependent_nodes));
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                num_dependent_nodes != 1,
-                error_code_t::INVALID_VALUE,
-                "Each node of cudnn_cuda_graph before the backend graph node should have exactly 1 dependent node.");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(num_dependent_nodes != 1,
+                                           error_code_t::INVALID_VALUE,
+                                           "Each node of cudnn_cuda_graph before the backend graph node should "
+                                           "have exactly 1 dependent node.");
             _CUDNN_CHECK_CUDA_ERROR(
                 detail::cuda_graph_node_get_dependent_nodes(current_node, &current_node, &num_dependent_nodes));
         }
@@ -880,7 +879,8 @@ class Graph : public ICudnn, public INode {
                                        "Failed to create variant pack's backend descriptor.");
 
         // offset workspace by the already used fe graph workspace
-        // this is where cudnn backend can start using workspace for its execution plans
+        // this is where cudnn backend can start using workspace for its execution
+        // plans
         void *cudnn_workspace = static_cast<char *>(workspace) + fe_workspace_size;
         CHECK_CUDNN_FRONTEND_ERROR(create_variant_pack(variant_pack_descriptor, device_ptrs, uids, cudnn_workspace));
 
@@ -899,7 +899,8 @@ class Graph : public ICudnn, public INode {
             detail::cuda_graph_node_get_dependent_nodes(current_node, nullptr, &num_dependent_nodes));
         RETURN_CUDNN_FRONTEND_ERROR_IF(num_dependent_nodes != 0,
                                        error_code_t::INVALID_VALUE,
-                                       "cudnn_cuda_graph should have no graph nodes after the backend graph node.");
+                                       "cudnn_cuda_graph should have no graph "
+                                       "nodes after the backend graph node.");
 
         return {error_code_t::OK, ""};
     }
@@ -924,12 +925,13 @@ class Graph : public ICudnn, public INode {
                         std::unordered_map<Tensor_attributes::uid_t, void *> &uid_to_device_ptrs,
                         void *workspace,
                         cudaGraph_t cudnn_cuda_graph) {
-        // Only a cuDNN execution plan can be recorded into a CUDA graph by this API.
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            plans.is_frontend_engine_candidate(),
-            error_code_t::GRAPH_NOT_SUPPORTED,
-            "The selected engine is not backed by a cuDNN execution plan, so populate_cuda_graph() cannot "
-            "record it; capture execute() on a stream instead.");
+        // Only a cuDNN execution plan can be recorded into a CUDA graph by this
+        // API.
+        RETURN_CUDNN_FRONTEND_ERROR_IF(plans.is_frontend_engine_candidate(),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "The selected engine is not backed by a cuDNN execution plan, so "
+                                       "populate_cuda_graph() cannot "
+                                       "record it; capture execute() on a stream instead.");
         UidBindings const derived_bindings = derive_variant_pack_replacements_(uid_to_device_ptrs);
         CHECK_CUDNN_FRONTEND_ERROR(check_aligned_operand_pointers_(uid_to_device_ptrs, derived_bindings));
 
@@ -938,7 +940,8 @@ class Graph : public ICudnn, public INode {
         _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_get_nodes(cudnn_cuda_graph, nullptr, &numNodes));
         RETURN_CUDNN_FRONTEND_ERROR_IF(numNodes != 0,
                                        error_code_t::INVALID_VALUE,
-                                       "cuda graph provided to populate is not empty. cuDNN requires it to be empty "
+                                       "cuda graph provided to populate is not empty. cuDNN requires it to be "
+                                       "empty "
                                        "for the corresponding update APIs to work correctly.");
 
         // This function makes linear cuda graphs. And that makes it easy to walk
@@ -951,9 +954,10 @@ class Graph : public ICudnn, public INode {
         ///////////////////////////////////////
         // Add pass_by_value data pointers to uid_to_pointer map.
         // Using cached values to avoid repeated tree traversal overhead.
-        // cuda graph will keep a copy of the kernel parameters, meaning that at the time of
-        // launching the cuda_graph executable, cached values being deallocated does not affect these cpu values.
-        // No cuda graph nodes are required for handling fe owned pass by value tensors.
+        // cuda graph will keep a copy of the kernel parameters, meaning that at the
+        // time of launching the cuda_graph executable, cached values being
+        // deallocated does not affect these cpu values. No cuda graph nodes are
+        // required for handling fe owned pass by value tensors.
         CHECK_CUDNN_FRONTEND_ERROR(
             extend_tensor_map_with_pass_by_value_tensors_(uid_to_device_ptrs, cached_pass_by_value));
 
@@ -1038,7 +1042,8 @@ class Graph : public ICudnn, public INode {
                                        "Failed to create variant pack's backend descriptor.");
 
         // offset workspace by the already used fe graph workspace
-        // this is where cudnn backend can start using workspace for its execution plans
+        // this is where cudnn backend can start using workspace for its execution
+        // plans
         void *cudnn_workspace = static_cast<char *>(workspace) + fe_workspace_size;
         CHECK_CUDNN_FRONTEND_ERROR(create_variant_pack(variant_pack_descriptor, device_ptrs, uids, cudnn_workspace));
 
@@ -1150,23 +1155,25 @@ class Graph : public ICudnn, public INode {
                                std::unordered_map<Tensor_attributes::uid_t, void *> &uid_to_device_ptrs,
                                void *workspace,
                                cudaGraph_t cudnn_cuda_graph) {
-        // Only a cuDNN execution plan can be recorded into a CUDA graph by this API.
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            plans.is_frontend_engine_candidate(),
-            error_code_t::GRAPH_NOT_SUPPORTED,
-            "The selected engine is not backed by a cuDNN execution plan, so populate_cuda_graph_direct() "
-            "cannot record it; capture execute() on a stream instead.");
+        // Only a cuDNN execution plan can be recorded into a CUDA graph by this
+        // API.
+        RETURN_CUDNN_FRONTEND_ERROR_IF(plans.is_frontend_engine_candidate(),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "The selected engine is not backed by a cuDNN execution plan, so "
+                                       "populate_cuda_graph_direct() "
+                                       "cannot record it; capture execute() on a stream instead.");
         size_t numNodes = 0;
         _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_get_nodes(cudnn_cuda_graph, nullptr, &numNodes));
         RETURN_CUDNN_FRONTEND_ERROR_IF(numNodes != 0,
                                        error_code_t::INVALID_VALUE,
-                                       "cuda graph provided to populate_cuda_graph_direct is not empty. cuDNN requires "
+                                       "cuda graph provided to populate_cuda_graph_direct is not empty. cuDNN "
+                                       "requires "
                                        "it to be empty for the corresponding update APIs to work correctly.");
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            !cuda_graph_direct_population_eligible(),
-            error_code_t::INVALID_VALUE,
-            "This graph needs cuDNN Frontend auxiliary CUDA graph nodes, so it cannot be populated directly. Use "
-            "populate_cuda_graph() instead.");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!cuda_graph_direct_population_eligible(),
+                                       error_code_t::INVALID_VALUE,
+                                       "This graph needs cuDNN Frontend auxiliary CUDA graph nodes, so it "
+                                       "cannot be populated directly. Use "
+                                       "populate_cuda_graph() instead.");
 
         ///////////////////////////////////////
         //// PASS BY VALUE TENSOR HANDLING ////
@@ -1246,18 +1253,18 @@ class Graph : public ICudnn, public INode {
                              void *workspace,
                              cudaGraph_t cudnn_cuda_graph) {
         // Only a cuDNN execution plan can be updated in place by this API.
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            plans.is_frontend_engine_candidate(),
-            error_code_t::GRAPH_NOT_SUPPORTED,
-            "The selected engine is not backed by a cuDNN execution plan, so update_cuda_graph_direct() "
-            "cannot update it; capture execute() on a stream instead.");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(plans.is_frontend_engine_candidate(),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "The selected engine is not backed by a cuDNN execution plan, so "
+                                       "update_cuda_graph_direct() "
+                                       "cannot update it; capture execute() on a stream instead.");
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             cudnn_cuda_graph == nullptr, error_code_t::INVALID_VALUE, "cudnn_cuda_graph should not be a nullptr");
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            !cuda_graph_direct_population_eligible(),
-            error_code_t::INVALID_VALUE,
-            "This graph needs cuDNN Frontend auxiliary CUDA graph nodes, so it cannot be updated directly. Use "
-            "update_cuda_graph() instead.");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!cuda_graph_direct_population_eligible(),
+                                       error_code_t::INVALID_VALUE,
+                                       "This graph needs cuDNN Frontend auxiliary CUDA graph nodes, so it "
+                                       "cannot be updated directly. Use "
+                                       "update_cuda_graph() instead.");
 
         CHECK_CUDNN_FRONTEND_ERROR(
             extend_tensor_map_with_pass_by_value_tensors_(uid_to_device_ptrs, cached_pass_by_value));
@@ -1766,6 +1773,26 @@ class Graph : public ICudnn, public INode {
                           std::vector<int64_t> const &override_uids                 = {},
                           std::vector<std::vector<int64_t>> const &override_shapes  = {},
                           std::vector<std::vector<int64_t>> const &override_strides = {}) const {
+        return execute_uid_map_impl(handle,
+                                    tensor_uid_to_pointer_map,
+                                    workspace,
+                                    plan_index,
+                                    override_uids,
+                                    override_shapes,
+                                    override_strides,
+                                    true);
+    }
+
+   private:
+    error_t
+    execute_uid_map_impl(cudnnHandle_t handle,
+                         std::unordered_map<int64_t, void *> &tensor_uid_to_pointer_map,
+                         void *workspace,
+                         int64_t plan_index,
+                         std::vector<int64_t> const &override_uids,
+                         std::vector<std::vector<int64_t>> const &override_shapes,
+                         std::vector<std::vector<int64_t>> const &override_strides,
+                         bool dump_tensors) const {
         if (!varpack_prep_state->prepared.load(std::memory_order_acquire)) {
             CHECK_CUDNN_FRONTEND_ERROR(const_cast<Graph *>(this)->prepare_variant_pack_template());
         }
@@ -1782,10 +1809,18 @@ class Graph : public ICudnn, public INode {
                                            "Uid " + std::to_string(uid) + " not found in variant pack.");
             user_ptrs[i] = it->second;
         }
-        return execute_plan_at_index(
-            handle, user_ptrs, n_user, workspace, plan_index, override_uids, override_shapes, override_strides);
+        return execute_ordered_impl(handle,
+                                    user_ptrs,
+                                    n_user,
+                                    workspace,
+                                    plan_index,
+                                    override_uids,
+                                    override_shapes,
+                                    override_strides,
+                                    dump_tensors);
     }
 
+   public:
     // --- THE implementation: sorted pointer array + plan index + optional overrides ---
     // Thread-safe: copies the pre-built template to stack, patches user pointers, dispatches.
     error_t
@@ -1797,6 +1832,28 @@ class Graph : public ICudnn, public INode {
                           std::vector<int64_t> const &override_uids                 = {},
                           std::vector<std::vector<int64_t>> const &override_shapes  = {},
                           std::vector<std::vector<int64_t>> const &override_strides = {}) const {
+        return execute_ordered_impl(handle,
+                                    sorted_user_ptrs,
+                                    n_user,
+                                    workspace,
+                                    plan_index,
+                                    override_uids,
+                                    override_shapes,
+                                    override_strides,
+                                    true);
+    }
+
+   private:
+    error_t
+    execute_ordered_impl(cudnnHandle_t handle,
+                         void **sorted_user_ptrs,
+                         int n_user,
+                         void *workspace,
+                         int64_t plan_index,
+                         std::vector<int64_t> const &override_uids,
+                         std::vector<std::vector<int64_t>> const &override_shapes,
+                         std::vector<std::vector<int64_t>> const &override_strides,
+                         bool dump_tensors) const {
         // The driver-API engines read the calling THREAD's context stack, and a
         // thread that has done no CUDA work yet (a PyTorch autograd worker) has
         // none. All roads reach here, so every execute is covered; the steady
@@ -1903,7 +1960,9 @@ class Graph : public ICudnn, public INode {
         CHECK_CUDNN_FRONTEND_ERROR(run_auxiliary_kernels(handle, workspace, cached_workspace_modifications));
 
         CUDNN_FE_LOG_LABEL_ENDL("INFO: Executing gid " << gid);
-        CHECK_CUDNN_FRONTEND_ERROR(log_tensors_to_dump_(handle, varpack_template.all_uids, ptrs));
+        if (dump_tensors) {
+            CHECK_CUDNN_FRONTEND_ERROR(log_tensors_to_dump_(handle, varpack_template.all_uids, ptrs));
+        }
 
         // 5. Dispatch
         void *engine_workspace = workspace == nullptr ? nullptr : static_cast<char *>(workspace) + fe_workspace_size;
@@ -1949,6 +2008,7 @@ class Graph : public ICudnn, public INode {
         return {error_code_t::OK, ""};
     }
 
+   public:
     error_t
     warmup(cudnnHandle_t handle) {
         cudaStream_t fake_stream;
@@ -1989,8 +2049,12 @@ class Graph : public ICudnn, public INode {
 
         _CUDNN_CHECK_CUDA_ERROR(detail::cuda_malloc((void **)&tmp_pointer, 1024 * 1024));
 
-        float tmp_double  = 1.0f;
-        void *cpu_pointer = reinterpret_cast<void *>(&tmp_double);
+        // Capturing still packs PBV arguments on the host. DOUBLE/INT64 read
+        // eight bytes even though no captured kernel is launched here.
+        alignas(uint64_t) unsigned char tmp_scalar[sizeof(uint64_t)] = {};
+        float const tmp_float                                        = 1.0F;
+        std::memcpy(tmp_scalar, &tmp_float, sizeof(tmp_float));
+        void *cpu_pointer = tmp_scalar;
 
         for (auto const &tensor : deserialized_tensor_properties) {
             if (tensor->get_is_virtual() == false) {
@@ -2021,7 +2085,10 @@ class Graph : public ICudnn, public INode {
         CHECK_CUDNN_FRONTEND_ERROR(
             extend_tensor_map_with_pass_by_value_tensors_(tensor_uid_to_pointer_map, deserialized_pass_by_value));
 
-        auto cudnn_status = execute(handle, tensor_uid_to_pointer_map, tmp_pointer);
+        // Fake storage has no shape-sized allocation contract. Preserve normal
+        // execution dumps while omitting them only for this fake capture call.
+        auto cudnn_status =
+            execute_uid_map_impl(handle, tensor_uid_to_pointer_map, tmp_pointer, plans.candidate, {}, {}, {}, false);
         (void)cudnn_status;  // No need to check bad executes
 
         _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_end_capture(fake_stream, &graph_obj));
@@ -2212,7 +2279,8 @@ class Graph : public ICudnn, public INode {
         CUDNN_FE_LOG_BANNER(" DESERIALIZE PLAN WITHOUT HANDLE ");
         if (device_properties == nullptr) {
             return {error_code_t::ATTRIBUTE_NOT_SET,
-                    "device_properties is not set; call set_device_properties() before deserialize(), "
+                    "device_properties is not set; call set_device_properties() "
+                    "before deserialize(), "
                     "or use deserialize(handle, data) to supply a cuDNN handle"};
         }
         return deserialize_plan_blob(nullptr, device_properties, data, enforce_precompiled, false);
@@ -2313,10 +2381,10 @@ class Graph : public ICudnn, public INode {
                 CHECK_CUDNN_FRONTEND_ERROR(tensor_from_json(info, tensor));
             }
         }
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            enforce_precompiled && !j.contains("cudnn_backend_data"),
-            error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED,
-            "enforce_precompiled requested, but serialized graph has no precompiled execution plan");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(enforce_precompiled && !j.contains("cudnn_backend_data"),
+                                       error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED,
+                                       "enforce_precompiled requested, but serialized graph has no "
+                                       "precompiled execution plan");
 
         // Parse every frontend field before constructing a plan or publishing any executable state.
         auto metadata = plan_serialization_detail::parse(j);
@@ -2410,11 +2478,14 @@ class Graph : public ICudnn, public INode {
     Graph &
     set_kernel_cache(std::shared_ptr<KernelCache> cache);
 
-    //! How CUDA graphs recorded from this graph keep its execution plans' resources alive (see
-    //! CudaGraphRetention_t). Takes effect for execution plans built afterwards, so call it before
-    //! create_execution_plans()/build_plans() or deserialize(). With cuDNN 9.28+, the setting also applies to
-    //! the backend's retention (CUDNN_ATTR_EXECUTION_PLAN_CUDA_GRAPH_RETENTION); with cuDNN 9.27, whose backend
-    //! always retains, CudaGraphRetention_t::NONE only removes the frontend's own references.
+    //! How CUDA graphs recorded from this graph keep its execution plans'
+    //! resources alive (see CudaGraphRetention_t). Takes effect for execution
+    //! plans built afterwards, so call it before
+    //! create_execution_plans()/build_plans() or deserialize(). With cuDNN 9.28+,
+    //! the setting also applies to the backend's retention
+    //! (CUDNN_ATTR_EXECUTION_PLAN_CUDA_GRAPH_RETENTION); with cuDNN 9.27, whose
+    //! backend always retains, CudaGraphRetention_t::NONE only removes the
+    //! frontend's own references.
     Graph &
     set_cuda_graph_retention(CudaGraphRetention_t retention) {
         cuda_graph_retention = retention;
@@ -2422,8 +2493,9 @@ class Graph : public ICudnn, public INode {
         return *this;
     }
 
-    //! The mode in effect: the one set with set_cuda_graph_retention(), else the CUDNN_CUDA_GRAPH_RETENTION
-    //! environment variable ("per_graph" or "none"), else CudaGraphRetention_t::PER_GRAPH.
+    //! The mode in effect: the one set with set_cuda_graph_retention(), else the
+    //! CUDNN_CUDA_GRAPH_RETENTION environment variable ("per_graph" or "none"),
+    //! else CudaGraphRetention_t::PER_GRAPH.
     CudaGraphRetention_t
     get_cuda_graph_retention() const {
         return detail::effective_cuda_graph_retention(cuda_graph_retention);
@@ -2740,13 +2812,15 @@ class Graph : public ICudnn, public INode {
 
     struct VariantPackTemplate {
         std::vector<int64_t> all_uids;      // all UIDs in sorted order (user + internal)
-        std::vector<void *> template_ptrs;  // pre-filled: pass_by_value entries, nullptr for user/workspace slots
-        std::vector<int> user_slots;        // indices into template_ptrs that the user fills (sorted UID order)
+        std::vector<void *> template_ptrs;  // pre-filled: pass_by_value entries,
+                                            // nullptr for user/workspace slots
+        std::vector<int> user_slots;        // indices into template_ptrs that the user
+                                            // fills (sorted UID order)
 
         // Pre-computed slot indices for per-call updates (avoid linear scans at execute time)
-        std::vector<std::pair<int, int64_t>> workspace_slots;  // (slot, byte_offset)
-        std::vector<std::pair<int, std::pair<int, int64_t>>>
-            replacement_slots;  // (dst_slot, (src_slot, offset)) — only used by Slice nodes
+        std::vector<std::pair<int, int64_t>> workspace_slots;                    // (slot, byte_offset)
+        std::vector<std::pair<int, std::pair<int, int64_t>>> replacement_slots;  // (dst_slot, (src_slot, offset)) —
+                                                                                 // only used by Slice nodes
         std::vector<std::pair<int, int64_t>> aligned_slots;  // (slot, byte alignment), user and replacement slots
         // Slots and uids handed to the backend, when a legacy Slice source the backend graph does not consume must be
         // left out (the backend rejects an unknown uid). Empty when every slot goes to the backend.
@@ -3072,16 +3146,15 @@ class Graph : public ICudnn, public INode {
             throw std::runtime_error(status.get_message());
         }
         std::unordered_set<Tensor_attributes const *> collected_ragged_offsets;
-        auto add_ragged_offsets = [&](auto const &self, std::shared_ptr<Tensor_attributes> const &tensor) -> void {
-            if (tensor == nullptr || !collected_ragged_offsets.insert(tensor.get()).second) {
-                return;
+        auto add_ragged_offsets = [&](std::shared_ptr<Tensor_attributes> const &tensor) -> void {
+            for (auto current = tensor; current != nullptr && collected_ragged_offsets.insert(current.get()).second;
+                 current      = current->get_ragged_offset()) {
+                tensors.emplace(current->get_uid(), json(*current));
             }
-            tensors.emplace(tensor->get_uid(), json(*tensor));
-            self(self, tensor->get_ragged_offset());
         };
         for (auto const &tensor : tensors_in_graph) {
             if (tensor != nullptr) {
-                add_ragged_offsets(add_ragged_offsets, tensor->get_ragged_offset());
+                add_ragged_offsets(tensor->get_ragged_offset());
             }
         }
         auto add_tensor = [&](json &refs, std::string const &port_name, json const &tensor_info) {
@@ -3138,12 +3211,44 @@ class Graph : public ICudnn, public INode {
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     error_t
     deserialize(const json &j, bool const enforce_precompiled = false) {
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            enforce_precompiled,
-            error_code_t::GRAPH_NOT_SUPPORTED,
-            "enforce_precompiled requires plan serialization; JSON deserialization reconstructs the graph");
+        try {
+            return deserialize_graph_impl(j, enforce_precompiled);
+        } catch (std::exception const &error) {
+            return {error_code_t::INVALID_VALUE, std::string("Serialized graph is malformed: ") + error.what()};
+        }
+    }
+
+   private:
+    error_t
+    deserialize_graph_impl(const json &j, bool const enforce_precompiled) {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(enforce_precompiled,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "enforce_precompiled requires plan serialization; JSON deserialization "
+                                       "reconstructs the graph");
 
         CHECK_CUDNN_FRONTEND_ERROR(check_graph_json_version(j));
+
+        // Refuse inspection-only reducers before reconstructing unrelated
+        // operations or converting their fields.
+        RETURN_CUDNN_FRONTEND_ERROR_IF(j.contains("nodes") && !j.at("nodes").is_array(),
+                                       error_code_t::UNSUPPORTED_GRAPH_FORMAT,
+                                       "Serialized graph nodes must be a list.");
+        if (j.contains("nodes") && j.at("nodes").is_array()) {
+            for (auto const &node : j.at("nodes")) {
+                RETURN_CUDNN_FRONTEND_ERROR_IF(
+                    !node.is_object() || !node.contains("tag") || !node.at("tag").is_string(),
+                    error_code_t::UNSUPPORTED_GRAPH_FORMAT,
+                    "Serialized graph node must have a string tag.");
+                if (node.is_object() && node.contains("tag") && node.at("tag").is_string() &&
+                    node.at("tag").get<std::string>() == "CUSTOM_REDUCTION") {
+                    return {error_code_t::GRAPH_NOT_SUPPORTED,
+                            "CUSTOM_REDUCTION graph structure is inspection-only because "
+                            "reducer callbacks cannot "
+                            "be serialized or reconstructed; deserialize the execution "
+                            "plan instead"};
+                }
+            }
+        }
 
         if (j.contains("context")) {
             const auto &j_context = j["context"];
@@ -3160,7 +3265,7 @@ class Graph : public ICudnn, public INode {
                 context.set_name(j_context["name"].get<std::string>());
             }
             if (j_context.contains("sm_count") && !j_context["sm_count"].is_null()) {
-                context.set_target_sm_count(j_context["sm_count"].get<int32_t>());
+                context.set_target_sm_count(::cudnn_frontend::serialization_detail::integer32(j_context["sm_count"]));
             }
             if (j_context.contains("is_dynamic_shape_enabled") && !j_context["is_dynamic_shape_enabled"].is_null()) {
                 context.set_dynamic_shape_enabled(j_context["is_dynamic_shape_enabled"].get<bool>());
@@ -3170,14 +3275,14 @@ class Graph : public ICudnn, public INode {
             }
         }
 
-        gid = j["gid"].get<uint64_t>();
+        gid = ::cudnn_frontend::serialization_detail::unsigned_integer(j.at("gid"));
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(!j.contains("tensors") || !j["tensors"].is_array(),
                                        error_code_t::UNSUPPORTED_GRAPH_FORMAT,
                                        "Serialized graph tensors must be a list.");
         std::map<Tensor_attributes::uid_t, json> tensor_table;
         for (auto const &tensor_info : j["tensors"]) {
-            auto tensor_uid = tensor_info.at("uid").get<Tensor_attributes::uid_t>();
+            auto tensor_uid = ::cudnn_frontend::serialization_detail::signed_integer(tensor_info.at("uid"));
             RETURN_CUDNN_FRONTEND_ERROR_IF(!tensor_table.emplace(tensor_uid, tensor_info).second,
                                            error_code_t::UNSUPPORTED_GRAPH_FORMAT,
                                            "Serialized graph has duplicate tensor uid " + std::to_string(tensor_uid));
@@ -3204,7 +3309,7 @@ class Graph : public ICudnn, public INode {
         }
 
         auto resolve_tensor_ref = [&tensor_table](json const &tensor_ref, json &tensor_info) -> error_t {
-            auto tensor_uid  = tensor_ref.get<Tensor_attributes::uid_t>();
+            auto tensor_uid  = ::cudnn_frontend::serialization_detail::signed_integer(tensor_ref);
             auto tensor_iter = tensor_table.find(tensor_uid);
             RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_iter == tensor_table.end(),
                                            error_code_t::UNSUPPORTED_GRAPH_FORMAT,
@@ -3230,8 +3335,10 @@ class Graph : public ICudnn, public INode {
                 if (j_sub_node.contains("tag") && j_sub_node["tag"].is_string() &&
                     j_sub_node["tag"].get<std::string>() == "CUSTOM_REDUCTION") {
                     return {error_code_t::GRAPH_NOT_SUPPORTED,
-                            "CUSTOM_REDUCTION graph structure is inspection-only because reducer callbacks cannot "
-                            "be serialized or reconstructed; deserialize the execution plan instead"};
+                            "CUSTOM_REDUCTION graph structure is inspection-only because "
+                            "reducer callbacks cannot "
+                            "be serialized or reconstructed; deserialize the execution "
+                            "plan instead"};
                 }
 
                 json inputs;
@@ -3353,6 +3460,9 @@ class Graph : public ICudnn, public INode {
                         FILL_GLOBAL_IO_TENSOR_MAP(moe_grouped_matmul_attributes);
                         sub_nodes.emplace_back(
                             std::make_unique<MoeGroupedMatmulNode>(std::move(moe_grouped_matmul_attributes), context));
+                    } else {
+                        return {error_code_t::UNSUPPORTED_GRAPH_FORMAT,
+                                "Unsupported serialized graph node tag: " + tag};
                     }
                 }
 #undef CHECK_TENSORS
@@ -3361,6 +3471,8 @@ class Graph : public ICudnn, public INode {
 
         return {error_code_t::OK, ""};
     }
+
+   public:
 #endif
 
     std::string
@@ -3371,7 +3483,8 @@ class Graph : public ICudnn, public INode {
         ss << j;
         return ss.str();
 #else
-        return "print is unavailable when compiled with CUDNN_FRONTEND_SKIP_JSON_LIB";
+        return "print is unavailable when compiled with "
+               "CUDNN_FRONTEND_SKIP_JSON_LIB";
 #endif
     }
 };
@@ -3440,7 +3553,6 @@ CustomReductionNode::expand_node() {
             bool &flag;
             ~Reset_on_exit() { flag = false; }
         } const reset_on_exit{reducer_running};
-#ifndef NV_CUDNN_DISABLE_EXCEPTION
         try {
             reducer_values = attributes.reducer(candidate_subgraph, reducer_lhs, reducer_rhs);
         } catch (std::exception const &e) {
@@ -3448,11 +3560,9 @@ CustomReductionNode::expand_node() {
                     std::string("Custom reduction reducer callback threw an exception: ") + e.what()};
         } catch (...) {
             return {error_code_t::INVALID_VALUE,
-                    "Custom reduction reducer callback threw an exception of unknown type."};
+                    "Custom reduction reducer callback threw an exception of unknown "
+                    "type."};
         }
-#else
-        reducer_values = attributes.reducer(candidate_subgraph, reducer_lhs, reducer_rhs);
-#endif
     }
     // Also when the reducer cleared the body mark by an assignment to the body.
     CHECK_CUDNN_FRONTEND_ERROR(candidate_subgraph->refuse_non_pointwise_sub_nodes());
@@ -3567,10 +3677,11 @@ CustomReductionNode::post_validate_node() const {
             output->get_data_type() != input->get_data_type(),
             error_code_t::INVALID_VALUE,
             "Custom reduction output and input data types must match for stream " + std::to_string(i) + ".");
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            attributes.identity_values[i].get_data_type() != output->get_data_type(),
-            error_code_t::INVALID_VALUE,
-            "Custom reduction identity type must exactly match output type for stream " + std::to_string(i) + ".");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.identity_values[i].get_data_type() != output->get_data_type(),
+                                       error_code_t::INVALID_VALUE,
+                                       "Custom reduction identity type must exactly match output type for "
+                                       "stream " +
+                                           std::to_string(i) + ".");
 
         auto expected_output_dim = input->get_dim();
         for (auto const dim : attributes.reduction_dims) {
@@ -3587,7 +3698,8 @@ CustomReductionNode::post_validate_node() const {
                 is_integer_class(attributes.compute_data_types[i]) != is_integer_class(output->get_data_type()),
                 error_code_t::INVALID_VALUE,
                 "Custom reduction compute type for stream " + std::to_string(i) +
-                    " must be in the same integer or floating-point class as the stream type.");
+                    " must be in the same integer or floating-point class as the "
+                    "stream type.");
         }
     }
 
@@ -3615,7 +3727,8 @@ CustomReductionNode::validate_reducer_body(Graph const &body,
             }
             RETURN_CUDNN_FRONTEND_ERROR_IF(true,
                                            error_code_t::INVALID_VALUE,
-                                           "Custom reduction reducer-body tensors must be singleton scalars; tensor '" +
+                                           "Custom reduction reducer-body tensors "
+                                           "must be singleton scalars; tensor '" +
                                                tensor->get_name() + "' has shape [" + shape + "].");
         }
         RETURN_CUDNN_FRONTEND_ERROR_IF(!tensor->get_is_virtual() && !tensor->get_has_compile_time_constant(),
@@ -3630,7 +3743,8 @@ CustomReductionNode::validate_reducer_body(Graph const &body,
                                            !distinct_boundaries.insert(rhs[i].get()).second ||
                                            !distinct_boundaries.insert(outputs[i].get()).second,
                                        error_code_t::INVALID_VALUE,
-                                       "Custom reduction lhs, rhs, and output boundaries must be pairwise distinct.");
+                                       "Custom reduction lhs, rhs, and output boundaries must be pairwise "
+                                       "distinct.");
     }
 
     return {error_code_t::OK, ""};
@@ -3760,11 +3874,11 @@ CustomReductionNode::create_cudnn_operations(
         auto const lhs_uid    = lhs_tensors[static_cast<size_t>(i)]->get_uid();
         auto const rhs_uid    = rhs_tensors[static_cast<size_t>(i)]->get_uid();
         auto const output_uid = reducer_output_tensors[static_cast<size_t>(i)]->get_uid();
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            !distinct_uids.insert(lhs_uid).second || !distinct_uids.insert(rhs_uid).second ||
-                !distinct_uids.insert(output_uid).second,
-            error_code_t::INVALID_VALUE,
-            "Custom reduction boundary UIDs must be pairwise distinct after graph UID assignment.");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!distinct_uids.insert(lhs_uid).second || !distinct_uids.insert(rhs_uid).second ||
+                                           !distinct_uids.insert(output_uid).second,
+                                       error_code_t::INVALID_VALUE,
+                                       "Custom reduction boundary UIDs must be pairwise distinct after graph "
+                                       "UID assignment.");
         lhs_uids.emplace_back(lhs_uid);
         rhs_uids.emplace_back(rhs_uid);
         output_uids.emplace_back(output_uid);
@@ -3803,7 +3917,8 @@ CustomReductionNode::create_cudnn_operations(
     auto const finalize_status = detail::finalize(custom_operation->get_backend_descriptor());
     if (finalize_status != CUDNN_STATUS_SUCCESS) {
         std::stringstream error_msg;
-        error_msg << "detail::finalize(custom_operation->get_backend_descriptor()) failed with message: "
+        error_msg << "detail::finalize(custom_operation->get_backend_descriptor()) "
+                     "failed with message: "
                   << detail::get_last_error_string_() << ", and code: " << detail::get_error_string(finalize_status);
         CUDNN_FE_LOG_LABEL_ENDL("ERROR: " << error_msg.str() << " at " << __FILE__ << ":" << __LINE__);
         auto const frontend_status =
@@ -3835,12 +3950,13 @@ Graph::get_behavior_notes_for_plan_at_index(int64_t const index, std::vector<Beh
 inline error_t
 Graph::get_behavior_notes(std::vector<BehaviorNote_t> &notes) const {
     int64_t const candidate = plans.candidate;
-    RETURN_CUDNN_FRONTEND_ERROR_IF(
-        candidate == -1,
-        error_code_t::INVALID_VALUE,
-        "No candiate plan set for the graph. You can set one by building a plan, which in turn sets the "
-        "candidate internally. Do note that you also query behaviour notes for a created-but-not-built plan by using "
-        "get_behavior_notes_for_plan_at_index API.");
+    RETURN_CUDNN_FRONTEND_ERROR_IF(candidate == -1,
+                                   error_code_t::INVALID_VALUE,
+                                   "No candiate plan set for the graph. You can set one by building a plan, "
+                                   "which in turn sets the "
+                                   "candidate internally. Do note that you also query behaviour notes for a "
+                                   "created-but-not-built plan by using "
+                                   "get_behavior_notes_for_plan_at_index API.");
 
     CHECK_CUDNN_FRONTEND_ERROR(get_behavior_notes_for_plan_at_index(candidate, notes));
     return {error_code_t::OK, ""};
@@ -3977,7 +4093,9 @@ Graph::build_plans(BuildPlanPolicy_t const policy, bool const do_multithreaded_b
         bool const oss_selected = plans.is_oss_rms_norm_silu_candidate();
         auto oss_status         = plans.build_oss_rms_norm_silu_engine();
         if (oss_status.is_good()) {
-            CUDNN_FE_LOG_LABEL_ENDL("INFO: OSS RmsNorm+SiLU engine built successfully (NVRTC compilation done)");
+            CUDNN_FE_LOG_LABEL_ENDL(
+                "INFO: OSS RmsNorm+SiLU engine built "
+                "successfully (NVRTC compilation done)");
             if (policy == BuildPlanPolicy_t::HEURISTICS_CHOICE) {
                 CUDNN_FE_LOG_BANNER("  BUILD PLANS ALL OK (OSS RmsNorm+SiLU engine)  ");
                 return {error_code_t::OK, ""};

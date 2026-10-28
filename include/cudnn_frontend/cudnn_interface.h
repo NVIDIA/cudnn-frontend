@@ -24,11 +24,16 @@
 namespace cudnn_frontend {
 
 namespace detail {
-// TODO: Always returns OK. Can the status and error message be accessed from tensor descriptor?
+// Create one descriptor after its ragged-offset prerequisite has been published.
 inline error_t
-create_cudnn_tensor(
+create_cudnn_tensor_descriptor(
     std::shared_ptr<graph::Tensor_attributes> const& props,
     std::unordered_map<graph::Tensor_attributes::uid_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) {
+    RETURN_CUDNN_FRONTEND_ERROR_IF(props == nullptr, error_code_t::INVALID_VALUE, "Tensor attributes are null.");
+    RETURN_CUDNN_FRONTEND_ERROR_IF(props->get_dim().empty() || props->get_dim().size() > CUDNN_DIM_MAX ||
+                                       props->get_stride().size() != props->get_dim().size(),
+                                   error_code_t::INVALID_VALUE,
+                                   "Tensor rank must be within CUDNN_DIM_MAX with matching strides.");
     RETURN_CUDNN_FRONTEND_ERROR_IF(
         props->has_uid() == false,
         error_code_t::ATTRIBUTE_NOT_SET,
@@ -72,8 +77,11 @@ create_cudnn_tensor(
     }
 
     if (auto ragged_offset_props = props->get_ragged_offset()) {
-        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensor(ragged_offset_props, tensors));
-        tensor_builder.setRaggedOffset(tensors.at(ragged_offset_props->get_uid()));
+        auto const offset = tensors.find(ragged_offset_props->get_uid());
+        RETURN_CUDNN_FRONTEND_ERROR_IF(offset == tensors.end(),
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "Ragged offset tensor must be created before its owner.");
+        tensor_builder.setRaggedOffset(offset->second);
     }
     if (props->has_ragged_offset_multiplier()) {
         tensor_builder.setRaggedOffsetMultiplier(props->get_ragged_offset_multiplier());
@@ -98,6 +106,42 @@ create_cudnn_tensor(
     }
 #endif
 
+    return {error_code_t::OK, ""};
+}
+
+inline error_t
+create_cudnn_tensor(
+    std::shared_ptr<graph::Tensor_attributes> const& props,
+    std::unordered_map<graph::Tensor_attributes::uid_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) {
+    RETURN_CUDNN_FRONTEND_ERROR_IF(props == nullptr, error_code_t::INVALID_VALUE, "Tensor attributes are null.");
+    CHECK_CUDNN_FRONTEND_ERROR(props->validate());
+    if (props->get_ragged_offset() == nullptr) {
+        return create_cudnn_tensor_descriptor(props, tensors);
+    }
+    std::vector<std::shared_ptr<graph::Tensor_attributes>> pending;
+    // Validation rejects cyclic identities. Walk iteratively so even a long acyclic offset chain is stack-safe.
+    for (auto current = props; current != nullptr; current = current->get_ragged_offset()) {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(current->get_dim().empty() || current->get_dim().size() > CUDNN_DIM_MAX ||
+                                           current->get_stride().size() != current->get_dim().size(),
+                                       error_code_t::INVALID_VALUE,
+                                       "Tensor rank must be within CUDNN_DIM_MAX with matching strides.");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!current->has_uid(),
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "Tensor UID not assigned before creating backend tensor.");
+        if (tensors.count(current->get_uid()) == 0) {
+            pending.push_back(current);
+        }
+    }
+    for (auto it = pending.rbegin(); it != pending.rend(); ++it) {
+        auto status = create_cudnn_tensor_descriptor(*it, tensors);
+        if (status.is_bad()) {
+            // A failed walk must not leave stale newly-built offsets behind for a corrected retry.
+            for (auto const& tensor : pending) {
+                tensors.erase(tensor->get_uid());
+            }
+            return status;
+        }
+    }
     return {error_code_t::OK, ""};
 }
 }  // namespace detail

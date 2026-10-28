@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "serialize.h"
+#include <algorithm>
 
 namespace cudnn_frontend::graph::plan_serialization_detail {
 
@@ -25,53 +26,56 @@ using Workspace    = std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std:
 using Replacements = std::unordered_map<uid_t, std::pair<uid_t, int64_t>>;
 
 inline void
-require(bool condition, char const* message) {
+require(bool condition, char const *message) {
     if (!condition) {
         throw std::invalid_argument(message);
     }
 }
 
 inline int64_t
-integer(json const& value) {
+integer(json const &value) {
     return ::cudnn_frontend::serialization_detail::signed_integer(value);
 }
 
 inline uid_t
-uid(std::string const& key) {
+uid(std::string const &key) {
     return ::cudnn_frontend::serialization_detail::uid_key(key);
 }
 
 inline bool
-same_scalar(Tensor_attributes::pass_by_values_t const& a, Tensor_attributes::pass_by_values_t const& b) {
+same_scalar(Tensor_attributes::pass_by_values_t const &a, Tensor_attributes::pass_by_values_t const &b) {
     if (a.index() != b.index()) {
         return false;
     }
     return std::visit(
-        [&](auto const& value) {
+        [&](auto const &value) {
             using T           = std::decay_t<decltype(value)>;
-            auto const& other = std::get<T>(b);
+            auto const &other = std::get<T>(b);
             return std::memcmp(&value, &other, sizeof(T)) == 0;
         },
         a);
 }
 
 inline void
-validate_shape(Tensor_attributes const& tensor) {
-    auto const& dim    = tensor.get_dim();
-    auto const& stride = tensor.get_stride();
+validate_shape(Tensor_attributes const &tensor) {
+    auto const &dim    = tensor.get_dim();
+    auto const &stride = tensor.get_stride();
     require(!dim.empty() && dim.size() <= CUDNN_DIM_MAX && stride.size() == dim.size(),
             "Serialized tensor dimensions and strides have invalid ranks");
     for (size_t i = 0; i < dim.size(); ++i) {
-        require(dim[i] > 0 && stride[i] >= 0, "Serialized tensor dimensions or strides are invalid");
+        require(dim[i] >= 0 && stride[i] >= 0, "Serialized tensor dimensions or strides are invalid");
     }
 }
 
 inline int64_t
-tensor_bytes(Tensor_attributes const& tensor) {
+tensor_bytes(Tensor_attributes const &tensor) {
     validate_shape(tensor);
-    auto const& dim    = tensor.get_dim();
-    auto const& stride = tensor.get_stride();
-    int64_t span       = 1;
+    auto const &dim    = tensor.get_dim();
+    auto const &stride = tensor.get_stride();
+    if (std::find(dim.begin(), dim.end(), 0) != dim.end()) {
+        return 0;
+    }
+    int64_t span = 1;
     for (size_t i = 0; i < dim.size(); ++i) {
         if (stride[i] == 0) {
             continue;
@@ -88,8 +92,11 @@ tensor_bytes(Tensor_attributes const& tensor) {
 
 // Tensor dumping copies the logical element count, independently of strides.
 inline int64_t
-dump_bytes(Tensor_attributes const& tensor) {
+dump_bytes(Tensor_attributes const &tensor) {
     validate_shape(tensor);
+    if (std::find(tensor.get_dim().begin(), tensor.get_dim().end(), 0) != tensor.get_dim().end()) {
+        return 0;
+    }
     int64_t count = 1;
     for (auto extent : tensor.get_dim()) {
         require(count <= std::numeric_limits<int64_t>::max() / extent,
@@ -100,6 +107,19 @@ dump_bytes(Tensor_attributes const& tensor) {
     require(width > 0 && count <= std::numeric_limits<int64_t>::max() / width,
             "Serialized tensor dump byte count is invalid");
     return count * width;
+}
+
+// PBV argument packing reads one dtype-sized scalar, independently of shape.
+// Unsupported sub-byte/Boolean scalar types fail backend packing before a read;
+// a zero here is not a known allocation capacity for those types.
+inline int64_t
+scalar_read_bytes(Tensor_attributes const &tensor) {
+    return static_cast<int64_t>(detail::get_data_type_size(tensor.get_data_type()));
+}
+
+inline int64_t
+binding_read_bytes(Tensor_attributes const &tensor) {
+    return tensor.get_is_pass_by_value() ? scalar_read_bytes(tensor) : tensor_bytes(tensor);
 }
 
 struct PlanMetadata {
@@ -116,22 +136,22 @@ struct PlanMetadata {
 };
 
 inline PlanMetadata
-parse(json const& j) {
+parse(json const &j) {
     PlanMetadata result;
     require(j.is_object(), "Serialized execution plan must be an object");
     require(j.at("cudnn_backend_data").is_string(), "Serialized backend plan must be a string");
     result.workspace_size = integer(j.at("fe_workspace_size"));
     require(result.workspace_size >= 0, "Serialized frontend workspace size must be nonnegative");
 
-    auto const& uids = j.at("variant_pack_uids");
+    auto const &uids = j.at("variant_pack_uids");
     require(uids.is_array() && uids.size() <= static_cast<size_t>(INT_MAX),
             "Serialized variant-pack UIDs must be an integer array");
-    for (auto const& value : uids) {
+    for (auto const &value : uids) {
         require(result.uids.insert(integer(value)).second, "Serialized variant-pack UID is repeated");
     }
 
     if (j.contains("pass_by_values")) {
-        auto const& values = j.at("pass_by_values");
+        auto const &values = j.at("pass_by_values");
         require(values.is_object(), "Serialized pass_by_values must be an object");
         for (auto it = values.begin(); it != values.end(); ++it) {
             result.scalars.emplace(uid(it.key()), it.value().get<Tensor_attributes::pass_by_values_t>());
@@ -139,13 +159,14 @@ parse(json const& j) {
     }
 
     if (j.contains("workspace_modifications")) {
-        auto const& values = j.at("workspace_modifications");
+        auto const &values = j.at("workspace_modifications");
         require(values.is_object(), "Serialized workspace_modifications must be an object");
         for (auto it = values.begin(); it != values.end(); ++it) {
             auto const key    = uid(it.key());
-            auto const& entry = it.value();
+            auto const &entry = it.value();
             require(entry.is_array() && entry.size() == 3 && entry[2].is_array(),
-                    "Serialized workspace modification must be [operation, offset, words]");
+                    "Serialized workspace modification must be [operation, offset, "
+                    "words]");
             auto const kind   = integer(entry[0]);
             auto const offset = integer(entry[1]);
             auto const words  = entry[2].get<std::vector<float>>();
@@ -158,7 +179,8 @@ parse(json const& j) {
             } else if (kind == 1) {
                 require(words.size() == 1 && std::isfinite(words[0]) && words[0] >= 0.0F &&
                             words[0] < std::ldexp(1.0F, 63) && std::trunc(words[0]) == words[0],
-                        "Serialized workspace memset requires one nonnegative integral byte count");
+                        "Serialized workspace memset requires one nonnegative integral "
+                        "byte count");
                 require(static_cast<int64_t>(words[0]) <= available,
                         "Serialized workspace memset exceeds frontend workspace");
             } else {
@@ -170,10 +192,10 @@ parse(json const& j) {
     }
 
     if (j.contains("aligned_operands")) {
-        auto const& values = j.at("aligned_operands");
+        auto const &values = j.at("aligned_operands");
         require(values.is_object(), "Serialized aligned_operands must be an object");
         for (auto it = values.begin(); it != values.end(); ++it) {
-            auto const& pair = it.value();
+            auto const &pair = it.value();
             require(pair.is_array() && pair.size() == 2, "Serialized aligned operand must have two integers");
             auto const alignment = integer(pair[0]);
             auto const width     = integer(pair[1]);
@@ -184,10 +206,10 @@ parse(json const& j) {
         }
     }
 
-    auto const& replacements = j.at("variant_pack_replacements");
+    auto const &replacements = j.at("variant_pack_replacements");
     require(replacements.is_array(), "Serialized variant-pack replacements must be an array");
     std::unordered_set<uid_t> destinations;
-    for (auto const& entry : replacements) {
+    for (auto const &entry : replacements) {
         require(entry.is_array() && entry.size() == 2 && entry[1].is_array() && entry[1].size() == 2,
                 "Serialized replacement must be [source, [destination, byte_offset]]");
         auto const source      = integer(entry[0]);
@@ -202,11 +224,11 @@ parse(json const& j) {
     }
 
     // Validate all legacy note rows, but reconstruct the selected plan's actual notes from the backend.
-    auto const& notes = j.at("behavior_notes");
+    auto const &notes = j.at("behavior_notes");
     require(notes.is_array() && !notes.empty(), "Serialized behavior notes must contain note arrays");
-    for (auto const& row : notes) {
+    for (auto const &row : notes) {
         require(row.is_array(), "Serialized behavior-note row must be an array");
-        for (auto const& note : row) {
+        for (auto const &note : row) {
             require(note.is_string() && json(note.get<BehaviorNote_t>()) == note,
                     "Serialized behavior note is unknown");
         }
@@ -214,24 +236,24 @@ parse(json const& j) {
 
     result.has_structure = j.contains("nodes") || j.contains("tensors");
     if (result.has_structure) {
-        auto const& gid = j.at("gid");
+        auto const &gid = j.at("gid");
         require(gid.is_number_integer() && (gid.is_number_unsigned() || gid.get<int64_t>() >= 0),
                 "Serialized graph ID must be an unsigned integer");
         result.gid          = gid.get<uint64_t>();
-        auto const& tensors = j.at("tensors");
+        auto const &tensors = j.at("tensors");
         require(tensors.is_array(), "Serialized graph tensors must be an array");
         if (j.contains("nodes")) {
             require(j.at("nodes").is_array(), "Serialized graph nodes must be an array");
         }
-        for (auto const& info : tensors) {
+        for (auto const &info : tensors) {
             require(info.is_object() && info.at("dim").is_array() && info.at("stride").is_array() &&
                         info.at("is_virtual").is_boolean() && info.at("is_pass_by_value").is_boolean(),
                     "Serialized tensor record has invalid field types");
             auto const key = integer(info.at("uid"));
-            for (auto const& value : info.at("dim")) {
+            for (auto const &value : info.at("dim")) {
                 (void)integer(value);
             }
-            for (auto const& value : info.at("stride")) {
+            for (auto const &value : info.at("stride")) {
                 (void)integer(value);
             }
             for (auto field : {"ragged_offset_uid", "ragged_offset_multiplier", "alignment"}) {
@@ -252,9 +274,11 @@ parse(json const& j) {
                     "Serialized tensor alignment must be a positive power of two");
             validate_shape(*tensor);
             if (tensor->get_is_pass_by_value()) {
-                for (auto extent : tensor->get_dim()) {
-                    require(extent == 1, "Serialized pass-by-value tensor must have one element");
-                }
+                require(std::count_if(tensor->get_dim().begin(),
+                                      tensor->get_dim().end(),
+                                      [](int64_t extent) { return extent > 1; }) <= 1,
+                        "Serialized pass-by-value tensor has multiple nonsingleton "
+                        "dimensions");
             }
             // Do not require byte-addressable storage for unconsumed virtual BOOLEAN or packed tensors.
             if (tensor->get_pass_by_value().has_value() && result.scalars.count(key) == 0) {
@@ -268,15 +292,13 @@ parse(json const& j) {
                 require(tensor->get_is_pass_by_value() && tensor->get_pass_by_value().has_value() &&
                             same_scalar(scalar->second, tensor->get_pass_by_value().value()),
                         "Serialized scalar representations disagree");
-                for (auto const extent : tensor->get_dim()) {
-                    require(extent == 1, "Serialized owned scalar tensor must have one element");
-                }
-                auto const capacity = std::visit([](auto const& value) { return sizeof(value); }, scalar->second);
-                require(static_cast<uint64_t>(tensor_bytes(*tensor)) <= capacity,
+                auto const capacity = std::visit([](auto const &value) { return sizeof(value); }, scalar->second);
+                require(static_cast<uint64_t>(scalar_read_bytes(*tensor)) <= capacity,
                         "Serialized scalar tensor exceeds owned storage");
             }
             auto const work = result.workspace.find(key);
             if (work != result.workspace.end()) {
+                require(!tensor->get_is_pass_by_value(), "Serialized workspace binding cannot own a host scalar");
                 require(tensor_bytes(*tensor) <= result.workspace_size - std::get<1>(work->second),
                         "Serialized workspace tensor exceeds frontend workspace");
             }
@@ -291,7 +313,7 @@ parse(json const& j) {
     }
 
     // Legacy tensor records may have reconstructed scalar owners after the top-level maps were read.
-    for (auto const& [key, value] : result.scalars) {
+    for (auto const &[key, value] : result.scalars) {
         (void)value;
         require(result.workspace.count(key) == 0 && destinations.count(key) == 0,
                 "Serialized scalar UID has another binding owner");
@@ -299,7 +321,7 @@ parse(json const& j) {
 
     if (j.contains("tensors_to_dump")) {
         require(j.at("tensors_to_dump").is_array(), "Serialized tensor dumps must be an array");
-        for (auto const& pair : j.at("tensors_to_dump")) {
+        for (auto const &pair : j.at("tensors_to_dump")) {
             require(pair.is_array() && pair.size() == 2, "Serialized tensor dump must be [uid, format]");
             auto const key    = integer(pair[0]);
             auto const format = integer(pair[1]);
@@ -328,36 +350,53 @@ parse(json const& j) {
 // Validate aliases in dependency order, carrying remaining allocation capacity through each chain.
 // Caller-provided pointers have no allocation-size contract; retain only their declared tensor bounds.
 inline void
-validate_owned_spans(PlanMetadata const& metadata,
-                     std::vector<std::pair<uid_t, std::pair<uid_t, int64_t>>> const& ordered) {
+validate_owned_spans(PlanMetadata const &metadata,
+                     std::vector<std::pair<uid_t, std::pair<uid_t, int64_t>>> const &ordered) {
     std::unordered_map<uid_t, int64_t> capacities;
     std::unordered_set<uid_t> scalar_aliases;
-    for (auto const& [key, scalar] : metadata.scalars) {
+    std::unordered_set<uid_t> workspace_aliases;
+    for (auto const &[key, scalar] : metadata.scalars) {
         capacities.emplace(key,
-                           std::visit([](auto const& value) { return static_cast<int64_t>(sizeof(value)); }, scalar));
+                           std::visit([](auto const &value) { return static_cast<int64_t>(sizeof(value)); }, scalar));
         scalar_aliases.insert(key);
     }
-    for (auto const& [key, work] : metadata.workspace) {
+    for (auto const &[key, work] : metadata.workspace) {
         capacities.emplace(key, metadata.workspace_size - std::get<1>(work));
+        workspace_aliases.insert(key);
     }
-    for (auto const& [source, edge] : ordered) {
+    for (auto const &[source, edge] : ordered) {
         auto available  = capacities.find(source);
         auto const from = metadata.tensors.find(source);
         auto const to   = metadata.tensors.find(edge.first);
+        if (workspace_aliases.count(source)) {
+            require(to == metadata.tensors.end() || !to->second->get_is_pass_by_value(),
+                    "Serialized workspace alias cannot bind a host scalar");
+            workspace_aliases.insert(edge.first);
+        }
         if (available == capacities.end() && from != metadata.tensors.end() &&
             detail::get_data_type_size(from->second->get_data_type()) > 0) {
-            available = capacities.emplace(source, tensor_bytes(*from->second)).first;
+            auto const span = tensor_bytes(*from->second);
+            auto const read = from->second->get_is_pass_by_value() ? scalar_read_bytes(*from->second) : 0;
+            available       = capacities.emplace(source, std::max(span, read)).first;
         }
         if (available != capacities.end()) {
             require(edge.second <= available->second, "Serialized replacement offset exceeds source capacity");
             auto remaining = available->second - edge.second;
             if (to != metadata.tensors.end()) {
-                auto const target_bytes = tensor_bytes(*to->second);
+                auto const target_bytes = binding_read_bytes(*to->second);
                 require(target_bytes <= remaining, "Serialized replacement exceeds its source tensor span");
-                remaining = target_bytes;
+                if (from != metadata.tensors.end() && detail::get_data_type_size(from->second->get_data_type()) > 0) {
+                    auto const span     = tensor_bytes(*from->second);
+                    auto const read     = from->second->get_is_pass_by_value() ? scalar_read_bytes(*from->second) : 0;
+                    auto const declared = std::max(span, read);
+                    require(edge.second <= declared && target_bytes <= declared - edge.second,
+                            "Serialized replacement exceeds its declared source tensor span");
+                }
             } else if (scalar_aliases.count(source)) {
                 // Legacy plan-only singleton PBV Slice writers legitimately emit zero-offset aliases.
-                require(edge.second == 0, "Serialized scalar replacement offset must be zero without tensor metadata");
+                require(edge.second == 0,
+                        "Serialized scalar replacement offset must "
+                        "be zero without tensor metadata");
             }
             capacities[edge.first] = remaining;
         }
@@ -365,7 +404,7 @@ validate_owned_spans(PlanMetadata const& metadata,
             scalar_aliases.insert(edge.first);
         }
     }
-    for (auto const& [tensor, format] : metadata.dumps) {
+    for (auto const &[tensor, format] : metadata.dumps) {
         (void)format;
         auto const bytes = dump_bytes(*tensor);
         require(bytes <= tensor_bytes(*tensor), "Serialized tensor dump exceeds its declared storage span");

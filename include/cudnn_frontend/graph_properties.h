@@ -24,6 +24,7 @@
 #include "context.h"
 
 #include "../cudnn_frontend_utils.h"
+#include <unordered_set>
 
 namespace cudnn_frontend {
 
@@ -79,6 +80,20 @@ class Tensor_attributes {
         RETURN_CUDNN_FRONTEND_ERROR_IF(dim.size() != stride.size(),
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "Tensor '" + name + "' does not equal dimensionality in dim and stride.");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(dim.size() > CUDNN_DIM_MAX || stride.size() > CUDNN_DIM_MAX,
+                                       error_code_t::INVALID_VALUE,
+                                       "Tensor '" + name + "' rank exceeds CUDNN_DIM_MAX.");
+        if (ragged_offset != nullptr) {
+            std::unordered_set<Tensor_attributes const*> offset_chain;
+            std::unordered_set<uid_t> offset_uids;
+            for (auto const* current = this; current != nullptr; current = current->ragged_offset.get()) {
+                RETURN_CUDNN_FRONTEND_ERROR_IF(
+                    !offset_chain.insert(current).second ||
+                        (current->has_uid() && !offset_uids.insert(current->get_uid()).second),
+                    error_code_t::INVALID_VALUE,
+                    "Tensor '" + name + "' has a cyclic ragged offset.");
+            }
+        }
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             is_virtual && is_pass_by_value,
             error_code_t::ATTRIBUTE_NOT_SET,
