@@ -801,7 +801,6 @@ def _mma_loop(
     swizzle: cutlass.Constexpr[int],
     causal: cutlass.Constexpr[bool],
 ):
-    nvvm.setmaxregister(CFG.SERVICE_REGS, nvvm.SetMaxRegisterAction.DECREASE)
     score = _mma_desc(CFG.M, CFG.N, CFG.D)
     grad = _mma_desc(CFG.M, CFG.D, CFG.N, btranspose=True)
     dqdesc = _mma_desc(CFG.N, CFG.D, CFG.M, atranspose=True, btranspose=True)
@@ -898,7 +897,6 @@ def _load_loop(
     causal: cutlass.Constexpr[bool],
     ratio: cutlass.Constexpr[int] = 1,
 ):
-    nvvm.setmaxregister(CFG.SERVICE_REGS, nvvm.SetMaxRegisterAction.DECREASE)
     q_state = PipelineState.start(phase=1)
     do_state = PipelineState.start(phase=1)
     kv_state = PipelineState.start(phase=1)
@@ -954,7 +952,6 @@ def _store_loop(
     causal: cutlass.Constexpr[bool],
     grad_dtype: cutlass.Constexpr,
 ):
-    nvvm.setmaxregister(CFG.SERVICE_REGS, nvvm.SetMaxRegisterAction.DECREASE)
     dq_state = PipelineState.start()
     out_state = PipelineState.start()
     sched_state = PipelineState.start()
@@ -989,7 +986,6 @@ def _store_loop(
 
 @cute.jit
 def _scheduler_loop(bars, sched):
-    nvvm.setmaxregister(CFG.SERVICE_REGS, nvvm.SetMaxRegisterAction.DECREASE)
     state = PipelineState.start()
     valid = cutlass.Int32(1)
     while valid != 0:
@@ -1061,6 +1057,8 @@ def bprop_d128_accum_fp8_kernel(
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
     tmem_base = tmem_slot.load()
+    if warp >= 12:
+        nvvm.setmaxregister(CFG.SERVICE_REGS, nvvm.SetMaxRegisterAction.DECREASE)
     if warp < 8:
         _softmax_loop(
             slab,
