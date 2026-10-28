@@ -22,8 +22,8 @@ The existing frontend filter remains active: execution plan configurations repor
 
 If `deselect_shared_mem_greater_than()` is not called, the frontend does not send a shared-memory-limit attribute to cuDNN. The backend continues to use its default device limit, preserving previous behavior.
 
-With cuDNN 9.27 or later headers and a cuDNN 9.27 or later runtime, the frontend also sends an explicitly set positive limit during heuristic, forced-engine, and knob queries. Backends that support the attribute can use the limit while configuring an engine, such as when choosing a pipeline-stage count.
+With cuDNN 9.28 or later headers and a cuDNN 9.28 or later runtime, the frontend also sends an explicitly set positive limit during heuristic, forced-engine, and knob queries. Backends that support the attribute can use the limit while configuring an engine, such as when choosing a pipeline-stage count.
 
-When built with headers older than cuDNN 9.27 or used with a runtime older than cuDNN 9.27, the new backend attribute is not sent. `deselect_shared_mem_greater_than()` retains its earlier behavior of filtering the configurations returned by the query.
+When built with headers older than cuDNN 9.28 or used with a runtime older than cuDNN 9.28, the new backend attribute is not sent. `deselect_shared_mem_greater_than()` retains its earlier behavior of filtering the configurations returned by the query.
 
 See the [restricted shared-memory matmul sample](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/cpp/matmul/matmuls.cpp) for a complete graph workflow.

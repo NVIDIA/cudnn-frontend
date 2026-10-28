@@ -32,10 +32,10 @@ struct ForwardingCase {
 TEST_CASE("Shared-memory limits are forwarded consistently", "[graph][shared_memory_limit]") {
     // Forced-engine creation and knob queries both use create_engine(), and therefore
     // share the engine-descriptor path below. Heuristic queries use the other path.
-    // Use the numeric values so this forwarding helper test also compiles with pre-9.27 headers.
+    // Use the numeric values so this forwarding helper test also compiles with pre-9.28 headers.
     constexpr auto heuristic_attribute = static_cast<cudnnBackendAttributeName_t>(205);
     constexpr auto engine_attribute    = static_cast<cudnnBackendAttributeName_t>(1309);
-#if CUDNN_VERSION >= 92700
+#if CUDNN_VERSION >= 92800
     static_assert(heuristic_attribute == CUDNN_ATTR_ENGINEHEUR_SHARED_MEMORY_LIMIT);
     static_assert(engine_attribute == CUDNN_ATTR_ENGINE_SHARED_MEMORY_LIMIT);
 #endif
@@ -45,17 +45,19 @@ TEST_CASE("Shared-memory limits are forwarded consistently", "[graph][shared_mem
     };
 
     constexpr int64_t positive_limit = 98 * 1024;
-    auto const cases                 = std::array<ForwardingCase, 8>{
-        ForwardingCase{"unset on old runtime", -1, 92600, false, 0},
-        ForwardingCase{"zero on old runtime", 0, 92600, false, 0},
-        ForwardingCase{"positive on old runtime", positive_limit, 92600, false, 0},
-        ForwardingCase{"oversized on old runtime", std::numeric_limits<int64_t>::max(), 92600, false, 0},
-        ForwardingCase{"unset on new runtime", -1, 92700, false, 0},
-        ForwardingCase{"zero on new runtime", 0, 92700, false, 0},
-        ForwardingCase{"positive on new runtime", positive_limit, 92700, true, static_cast<int32_t>(positive_limit)},
+    auto const cases                 = std::array<ForwardingCase, 10>{
+        ForwardingCase{"unset on old runtime", -1, 92700, false, 0},
+        ForwardingCase{"zero on old runtime", 0, 92700, false, 0},
+        ForwardingCase{"positive on old runtime", positive_limit, 92700, false, 0},
+        ForwardingCase{"oversized on old runtime", std::numeric_limits<int64_t>::max(), 92700, false, 0},
+        ForwardingCase{"positive just below supported runtime", positive_limit, 92799, false, 0},
+        ForwardingCase{"oversized just below supported runtime", std::numeric_limits<int64_t>::max(), 92799, false, 0},
+        ForwardingCase{"unset on new runtime", -1, 92800, false, 0},
+        ForwardingCase{"zero on new runtime", 0, 92800, false, 0},
+        ForwardingCase{"positive on new runtime", positive_limit, 92800, true, static_cast<int32_t>(positive_limit)},
         ForwardingCase{"oversized on new runtime",
                        std::numeric_limits<int64_t>::max(),
-                       92700,
+                       92800,
                        true,
                        std::numeric_limits<int32_t>::max()},
     };

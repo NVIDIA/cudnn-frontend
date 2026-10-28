@@ -93,7 +93,7 @@ create_engine(backend_descriptor& engine,
 #endif
     }
 
-#if (CUDNN_VERSION >= 92700)
+#if (CUDNN_VERSION >= 92800)
     _CUDNN_CHECK_CUDNN_ERROR(detail::set_shared_memory_limit_if_supported(
         engine.get_ptr(), CUDNN_ATTR_ENGINE_SHARED_MEMORY_LIMIT, shared_memory_limit));
 #else

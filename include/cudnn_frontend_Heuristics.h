@@ -261,7 +261,7 @@ class EngineHeuristicsBuilder_v8 {
         }
 #endif
 
-#if (CUDNN_VERSION >= 92700)
+#if (CUDNN_VERSION >= 92800)
         status = detail::set_shared_memory_limit_if_supported(m_heuristics.pointer->get_backend_descriptor(),
                                                               CUDNN_ATTR_ENGINEHEUR_SHARED_MEMORY_LIMIT,
                                                               m_heuristics.shared_memory_limit);

@@ -1979,7 +1979,7 @@ set_shared_memory_limit_if_supported(cudnnBackendDescriptor_t descriptor,
                                      SetAttribute &&set_attribute_fn) {
     // A backend value of zero means no limit was specified. Leave non-positive
     // frontend limits to the existing engine-config filter so its semantics do not change.
-    if (requested_limit <= 0 || backend_version < 92700) {
+    if (requested_limit <= 0 || backend_version < 92800) {
         return CUDNN_STATUS_SUCCESS;
     }
 
