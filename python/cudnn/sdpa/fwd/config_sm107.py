@@ -1641,8 +1641,8 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     kernels (per-tensor FP8 and MXFP8) do; the d192xd128 siblings share the d128
     config family but accept DTYPE_O 0..3 only, so a flavor-name test
     ("d128" in flavor) would let them through to a specialization error."""
-    if k.dtype_kv != -1:
-        raise ValueError(f"{flavor}: independent FP8 KV storage is not wired on the native SM107 pipeline")
+    if k.dtype_kv != -1 and not (flavor == "sm107 d128" and k.dtype_qkv in (_DTYPE_BF16, _DTYPE_FP16) and k.dtype_kv in (_DTYPE_E4M3, _DTYPE_E5M2)):
+        raise ValueError(f"{flavor}: independent FP8 KV storage requires the native SM107 half-input D128 pipeline")
     if k.decode_q_tile:
         # The loader routes a decode_q_tile record to sm107/decode_d256_f16.py
         # (make_cfg_d256_decode at the end of this module); a Rubin prefill template
@@ -1923,6 +1923,7 @@ class CfgD128(_CfgSm107):
     """d_qk = d_v = 128 (the classic 2-warpgroup pipeline)."""
 
     QO_ALIAS: int = 0
+    DTYPE_KV: int = -1
 
 
 @dataclass(frozen=True)
@@ -2014,7 +2015,8 @@ def _validate_dtype_k_step(cfg, flavor: str) -> None:
 def _validate_smem(cfg, flavor: str, *, qo_alias: bool, sf_bytes: int = 0, bias_bytes: int = 0) -> None:
     """The SMEM fit against the Rubin budget (``config_d128_family.validate_smem`` at ``SM107_ARCH``: 320 KiB usable minus the 2 KiB fixed
     overhead; ``sf_bytes`` / ``bias_bytes`` named in the message)."""
-    _validate_smem_shared(cfg, flavor, arch=SM107_ARCH, qo_alias=qo_alias, sf_bytes=sf_bytes, bias_bytes=bias_bytes)
+    kv_copy_bytes = (max(cfg.TILE_N * cfg.TILE_K, cfg.TILE_N * cfg.TILE_O) // cfg.CTA_MMA) if getattr(cfg, "DTYPE_KV", -1) in (_DTYPE_E4M3, _DTYPE_E5M2) else 0
+    _validate_smem_shared(cfg, flavor, arch=SM107_ARCH, qo_alias=qo_alias, sf_bytes=sf_bytes, bias_bytes=bias_bytes, kv_copy_bytes=kv_copy_bytes)
 
 
 def _validate_masks(cfg, flavor: str) -> None:
@@ -2295,6 +2297,7 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
         TILE_K=tile_k,
         TILE_O=tile_o,
         DTYPE_QKV=params.dtype_qkv,
+        DTYPE_KV=params.dtype_kv,
         DTYPE_O=dtype_o,
         BPE=b,
         BPE_O=b_o,
