@@ -17,7 +17,7 @@ from cudnn.gemm.frost.tile_helpers import (
     moe_combine_add,
     moe_combine_add_vector,
     tma_scatter4,
-    moe_gather_row,
+    moe_cache_token_indices,
     tma_gather4,
     copy_tensormap_to_workspace as _copy_tensormap_to_workspace,
     epi_subtile_spans as _epi_subtile_spans,
@@ -285,6 +285,11 @@ def _kernel(
         alignment=128,
     )
     # @@TMA_STORE_ONLY:END@@
+
+    gather_token_indices = [
+        cutlass.Array(cutlass.Int32, ((gather_token_rows + 31) // 32) * 32, space=cutlass.AddressSpace.smem, alignment=128)
+        for _ in range(1 if moe_gather else 0)
+    ]
 
     if cutlass.const_expr(cta_group == 2):
         ab_empty_count = cluster_size // cta_group if cutlass.const_expr(ab_empty_full_mask) else (cluster_m // cta_group) + cluster_n - 1
@@ -619,6 +624,19 @@ def _kernel(
                         nvvm.bar_warp_sync(0xFFFFFFFF)
                         _fence_tensormap_release()
 
+                if cutlass.const_expr(moe_gather):
+                    gather_row_offset = cutlass.Int32(0)
+                    if cutlass.const_expr(a_mcast_slices > 1):
+                        gather_row_offset = n_rank * gather_token_rows
+                    moe_cache_token_indices(
+                        gather_token_indices[0],
+                        token_index,
+                        group_begin + coord_m_group + gather_row_offset,
+                        group_end,
+                        mA_list[0].shape[0],
+                        gather_token_rows,
+                    )
+
                 for k_tile_idx in range(num_k_tiles):
                     stage = ab_iter % ab_stages
                     if stage == 0 and ab_iter != 0:
@@ -653,12 +671,11 @@ def _kernel(
                             if cutlass.const_expr(moe_gather):
                                 for _am in cutlass.range(cta_tile_mnk[0] // a_mcast_slices // 4, unroll_full=True):
                                     if elect_one:
-                                        row = group_begin + coord_m_group + _a_off + _am * 4
-                                        source_rows = mA_list[_ai].shape[0]
-                                        r0 = moe_gather_row(token_index, row, group_end, source_rows)
-                                        r1 = moe_gather_row(token_index, row + 1, group_end, source_rows)
-                                        r2 = moe_gather_row(token_index, row + 2, group_end, source_rows)
-                                        r3 = moe_gather_row(token_index, row + 3, group_end, source_rows)
+                                        row = _am * 4
+                                        r0 = gather_token_indices[0].subview(row).load()
+                                        r1 = gather_token_indices[0].subview(row + 1).load()
+                                        r2 = gather_token_indices[0].subview(row + 2).load()
+                                        r3 = gather_token_indices[0].subview(row + 3).load()
                                         tma_gather4(
                                             sA_stage.subview((_a_off + _am * 4) * cta_tile_mnk[2]),
                                             a_desc_load_list[_ai],

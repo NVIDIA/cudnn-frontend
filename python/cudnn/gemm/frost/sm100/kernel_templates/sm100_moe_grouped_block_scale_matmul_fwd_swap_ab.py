@@ -14,9 +14,9 @@ from cudnn.gemm.frost.kernel_templates.dynamic_scheduler_counter_initialization 
 )
 from cudnn.gemm.frost.tile_helpers import (
     extract_block_scale_sfb,
-    moe_gather_row,
+    moe_cache_token_indices,
     tma_gather4,
-    moe_gather_scales,
+    moe_gather_scales_cp_async,
     moe_scatter_row,
     moe_combine_add,
     moe_combine_swap_bulk,
@@ -360,15 +360,15 @@ def _kernel(
         else:
             ab_empty_count = (cluster_m // cta_group) + cluster_n - 1
     sched_empty_count = 1 + 1 + num_epilogue_warps
+    gather_token_indices = [
+        cutlass.Array(cutlass.Int32, ((cta_tile_mnk[1] * cta_group + 31) // 32) * 32, space=cutlass.AddressSpace.smem, alignment=128)
+        for _ in range(1 if moe_gather else 0)
+    ]
     sf_gather_scratch = [
-        cutlass.Array(cutlass.Uint8, (cta_tile_mnk[1] * cta_group) * 32, space=cutlass.AddressSpace.smem, alignment=128)
+        cutlass.Array(cutlass.Uint8, ((cta_tile_mnk[1] * cta_group * gather_sf_row_bytes + 127) // 128) * 128, space=cutlass.AddressSpace.smem, alignment=128)
         for _ in range(num_sfb_operands if moe_gather else 0)
     ]
-    sf_gather_mbar = [cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem) for _ in range(num_sfb_operands if moe_gather else 0)]
     if warp_idx == 0:
-        for _bar in sf_gather_mbar:
-            if elect_one:
-                nvvm.mbarrier_init(_bar, 1)
         if cutlass.const_expr(cta_group == 2):
             if cutlass.const_expr(use_acc_overlap):
                 if elect_one:
@@ -836,6 +836,11 @@ def _kernel(
                         nvvm.bar_warp_sync(0xFFFFFFFF)
                         _fence_tensormap_release()
 
+                if cutlass.const_expr(moe_gather):
+                    moe_cache_token_indices(
+                        gather_token_indices[0], token_index, group_begin + coord_n_group, group_end, mB_list[0].shape[0], cta_tile_mnk[1] * cta_group
+                    )
+
                 for k_tile_idx in range(num_k_tiles):
                     stage = ab_iter % ab_stages
                     if stage == 0 and ab_iter != 0:
@@ -933,12 +938,11 @@ def _kernel(
                             if cutlass.const_expr(moe_gather):
                                 for _gr in cutlass.range(cta_tile_mnk[1] // b_mcast_slices // 4, unroll_full=True):
                                     if elect_one:
-                                        row = group_begin + coord_n_group + pair_member * cta_tile_mnk[1] + _b_off + _gr * 4
-                                        source_rows = mB_list[_bj].shape[0]
-                                        r0 = moe_gather_row(token_index, row, group_end, source_rows)
-                                        r1 = moe_gather_row(token_index, row + 1, group_end, source_rows)
-                                        r2 = moe_gather_row(token_index, row + 2, group_end, source_rows)
-                                        r3 = moe_gather_row(token_index, row + 3, group_end, source_rows)
+                                        row = pair_member * cta_tile_mnk[1] + _b_off + _gr * 4
+                                        r0 = gather_token_indices[0].subview(row).load()
+                                        r1 = gather_token_indices[0].subview(row + 1).load()
+                                        r2 = gather_token_indices[0].subview(row + 2).load()
+                                        r3 = gather_token_indices[0].subview(row + 3).load()
                                         tma_gather4(
                                             smem_b_list[_bj].subview(sB_elems * stage + (_b_off + _gr * 4) * b_packed_per_row),
                                             b_desc_load_list[_bj],
@@ -964,20 +968,16 @@ def _kernel(
                                     )
                     if cutlass.const_expr(moe_gather):
                         for _sf in cutlass.range_constexpr(num_sfb_operands):
-                            moe_gather_scales(
+                            moe_gather_scales_cp_async(
                                 smem_sfb_list[_sf].subview(sfb_smem_bytes * stage),
                                 sf_gather_scratch[_sf],
-                                sf_gather_mbar[_sf],
                                 sf_full_mbar_ptr.subview(stage),
-                                tma_sfb_descs[_sf].get_ptr(),
-                                token_index,
-                                group_begin + coord_n_group,
-                                group_end,
-                                mB_list[_sf].shape[0],
+                                mSFB_list[_sf],
+                                gather_token_indices[0],
                                 coord_k // block_size,
-                                ab_iter % 2,
                                 cta_tile_mnk[1] * cta_group,
                                 cta_tile_mnk[2] // block_size,
+                                gather_sf_row_bytes,
                                 cta_group,
                             )
                     ab_iter += 1
