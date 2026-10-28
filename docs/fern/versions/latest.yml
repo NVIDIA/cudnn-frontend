@@ -65,12 +65,18 @@ navigation:
       - section: GNN
         slug: operations/gnn
         contents:
+          - page: Heterogeneous basis aggregation (post)
+            path: ../../operations/gnn/agg_hg_basis_post.md
+            slug: agg_hg_basis_post
           - page: GNN simple aggregation
             path: ../../operations/gnn/agg_simple.md
             slug: agg_simple
           - page: GAT and GATv2 attention
             path: ../../operations/gnn/mha_gat.md
             slug: mha_gat
+          - page: Simple multi-head attention
+            path: ../../operations/gnn/mha_simple.md
+            slug: mha_simple
       - section: For Agents
         slug: utilities
         contents:

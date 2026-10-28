@@ -847,9 +847,11 @@ cudnn.gnn.CscGraph.num_dst_nodes
 cudnn.gnn.CscGraph.num_edges
 cudnn.gnn.CscGraph.num_indices
 cudnn.gnn.CscGraph.with_reverse_csc
+cudnn.gnn.agg_hg_basis_post
 cudnn.gnn.agg_simple
 cudnn.gnn.mha_gat
 cudnn.gnn.mha_gat_v2
+cudnn.gnn.mha_simple
 cudnn.gnn_activation_op
 cudnn.gnn_activation_op.ELU
 cudnn.gnn_activation_op.LEAKY_RELU
@@ -860,6 +862,8 @@ cudnn.gnn_activation_op.SIGMOID
 cudnn.gnn_activation_op.TANH
 cudnn.gnn_activation_op.name
 cudnn.gnn_activation_op.value
+cudnn.gnn_agg_hg_basis_post_backward
+cudnn.gnn_agg_hg_basis_post_forward
 cudnn.gnn_agg_op
 cudnn.gnn_agg_op.MAX
 cudnn.gnn_agg_op.MEAN
@@ -873,6 +877,8 @@ cudnn.gnn_mha_gat_backward
 cudnn.gnn_mha_gat_forward
 cudnn.gnn_mha_gat_v2_backward
 cudnn.gnn_mha_gat_v2_forward
+cudnn.gnn_mha_simple_backward
+cudnn.gnn_mha_simple_forward
 cudnn.graph
 cudnn.graph_cache
 cudnn.grouped_gemm
