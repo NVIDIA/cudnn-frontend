@@ -1373,11 +1373,11 @@ Engines: `sdpa_fwd_prefill_sm107` (f16/bf16), `sdpa_fwd_prefill_sm107_fp8`
 (per-tensor FP8) and `sdpa_fwd_prefill_sm107_mxfp8` (block-scale) forward;
 `sdpa_bwd_sm107` (f16/bf16), `sdpa_bwd_sm107_fp8` (per-tensor FP8 E4M3,
 `sdpa_fp8_backward`) and `sdpa_bwd_sm107_mxfp8` (block-scale MXFP8 E4M3,
-`sdpa_mxfp8_backward`, see ᵐˣ) backward — **d = 256 exactly**, see ᵇ — and, since
+`sdpa_mxfp8_backward`, see ᵐˣ) backward — **d = 256 exactly for half/MXFP8; exact (256, 256) or (192, 128) for per-tensor FP8**, see ᵇ — and, since
 2026-10-01, `sdpa_bwd_sm107_d512` (f16/bf16, **d ∈ (256, 512]** envelope-served
 on 512-wide tiles, opt_in, the 2x2-datapath stage 2 at the 8-stage ring arm, see
-ᵇ³). Every other backward graph on the Rubin line (d < 256; d > 256 outside the
-f16/bf16 d ∈ (256, 512] band; a quantized graph off d = 256) gets a typed
+ᵇ³). Other head pairs outside these domains (including quantized pairs other than
+D256 and the per-tensor FP8 D192/V128 pair) get a typed
 `cudnnGraphNotSupportedError` at plan creation — the backend has no d = 256 MXFP8
 backward kernel on smVersion 1070 either, so the MXFP8 row is that graph's sole
 provider (MEASURED 2026-09-29).
@@ -1416,7 +1416,7 @@ from the layout **and** the version-1 SF path validated on Rubin — not free:
 putting the d128/d256 MXFP8 tiles on descriptor version 1 turned 21 green tests
 red (2026-09-08).
 
-| Feature | d32 (triangle attention)<br>FPROPᵗ | d64 (GPT-OSS)<br>FPROP | d128 (Llama)<br>FPROP | d192×d128 (DSv3 MLA)<br>FPROP | d256 (Qwen)<br>FPROP | d512 (DSv4)<br>FPROP | d256<br>BPROPᵇ | d512 (DSv4)<br>BPROPᵇ³<br>d ∈ (256, 512] |
+| Feature | d32 (triangle attention)<br>FPROPᵗ | d64 (GPT-OSS)<br>FPROP | d128 (Llama)<br>FPROP | d192×d128 (DSv3 MLA)<br>FPROP | d256 (Qwen)<br>FPROP | d512 (DSv4)<br>FPROP | d256; FP8 also d192×d128<br>BPROPᵇ | d512 (DSv4)<br>BPROPᵇ³<br>d ∈ (256, 512] |
 | --- | :--: | :--: | :--: | :--: | :--: | :--: | :--: | :--: |
 | **Data types** |  |  |  |  |  |  |  |  |
 | FP16 / BF16 | ✅ᵗ | ✅ᵗ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ | ✅ᵇ³ |
@@ -1424,7 +1424,7 @@ red (2026-09-08).
 | MXFP8 | ❌ | ❌ | ✅ | ✅ˣ | ✅ | ⚠️ⁱᵛ | ✅ᵐˣ (E4M3 payloads, bf16 gradients, **no amax**) | ❌ |
 | O dtype ≠ QKV — **quantized graphs only** (fp16/bf16/fp8 out) | — | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ (fp8 row: dQ/dK/dV e4m3, bf16 or fp16) · ✅ᵐˣ (mxfp8 row: bf16 only; fp16 declined, follow-up) | — |
 | Block-scaled O (`sdpa_fp8` / `sdpa_mxfp8` + `sf_o`): FP4_E2M1 O + E4M3 scale per 16 d, or E4M3 O + UE8M0 scale per 32 d — dense/unsplit/unpacked only | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | — | — |
-| Head-dim envelope | f16 ×8: every D ≤ 32 (8 / 16 / 24 / 32)ᵗ | f16 ×8: every 32 < D ≤ 64 (40 / 48 / 56 / 64)ᵗ · per-tensor fp8 ×16 up to64 on native64ⁱ | f16 ×8 · fp8 ×16 | f16 ×8 · fp8 ×16¹⁰ | f16 ×8 · fp8 ×16¹⁰ | f16 ×8 · fp8 ×16 (floor 256) | none — exact (256, 256) | f16 ×8 — envelope-served on 512-wide tiles (floor 256, exclusive)ᵇ³ |
+| Head-dim envelope | f16 ×8: every D ≤ 32 (8 / 16 / 24 / 32)ᵗ | f16 ×8: every 32 < D ≤ 64 (40 / 48 / 56 / 64)ᵗ · per-tensor fp8 ×16 up to64 on native64ⁱ | f16 ×8 · fp8 ×16 | f16 ×8 · fp8 ×16¹⁰ | f16 ×8 · fp8 ×16¹⁰ | f16 ×8 · fp8 ×16 (floor 256) | none — exact (256, 256); per-tensor FP8 also exact (192, 128) | f16 ×8 — envelope-served on 512-wide tiles (floor 256, exclusive)ᵇ³ |
 | **Layout** |  |  |  |  |  |  |  |  |
 | BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Arbitrary dense stride order (`dense_flex`) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ᵇ³ |
@@ -3883,3 +3883,20 @@ The native CGA4x1 / CTA_MMA2 role-split body packs whole query-head groups divid
 ### Native SM107 D512 per-tensor FP8 split-KV
 
 The CGA4x1 / CTA_MMA2 role-split D512 body now supports dense packed and unpacked split-KV, including its existing aligned head envelope, runtime Q/KV lengths and scalar KV tails. Every role decodes the same narrowed split interval, including empty chunks without a mask. The main kernel writes FP32 partial O and natural-log Stats in caller workspace; the shared combine applies the sink and final output scale once. The native [0,2,1,3] TMEM column permutation is preserved through bounded partial stores. Optional final Stats/Amax, base-2 final Stats, both FP8 inputs and all existing half/FP8 outputs retain the shared graph/adapter contract. THD, paged KV and MXFP8 splits remain declined on this flavor. Tests are collected through `TestNativeD512Fp8Split` in the SM107 architecture entry. No heuristics or placement change.
+
+
+### Native SM107 per-tensor FP8 D192x128 backward
+
+The existing opt-in `sdpa_bwd_sm107_fp8` row serves exact Q/K=192 and V/O=128
+alongside D256. Dense BSHD and packed THD use native operand widths, including
+their tensor maps, delta reduction, workspace and GQA fold; no data repack is
+added. The row retains its E4M3 input, E4M3/BF16/FP16 gradient, mask, amax,
+Stats-layout and declared-total contracts. Other head pairs, half and MXFP8
+rows keep their existing eligibility. Placement and heuristic policy are unchanged.
+
+Detectors: the `native_d192` tests in `test_sdpa_bwd_fp8_sm107.py` and
+`test_sdpa_bwd_thd_fp8_sm107.py` cover standalone and graph execution, both dS
+precisions, all gradient types, GQA, tails and empty sequences, requested amax,
+rebinding and retained replay. `test_fp8_tma_layout_matches_each_mma_consumer`
+checks the distinct dP/dV shared-memory layouts; the paired-fold tests retain
+legacy D256 controls and independent gradient widths.
