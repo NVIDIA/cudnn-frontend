@@ -74,7 +74,18 @@ from cudnn.sdpa.fwd.config_sm100 import (
     supports_paged_d256_pack_gqa,
     supports_paged_prefill_cga1,
 )
-from cudnn.sdpa.fwd.config_sm107 import SM107_FP32_VECTOR_WITH_BIAS_TILE_N, sm107_bias_auto_cga, sm107_pair_item_active, sm107_tile_n_pick
+from cudnn.sdpa.fwd.sparse_tile_rules import (
+    LEAN_SPARSE_MAX_SUB_TILES_PER_CTA,
+    LEAN_SPARSE_SERVED_MAX_S_Q,
+    LEAN_SPARSE_TOPK_MIN,
+    lean_sparse_n_sub,
+    lean_sparse_split,
+)
+from cudnn.sdpa.fwd.config_sm107 import (
+    sm107_bias_auto_cga,
+    sm107_pair_item_active,
+    sm107_tile_n_pick,
+)
 from cudnn.sdpa.fwd.config_sm100 import sm100_bias_auto_cga, sm100_tile_n_pick
 from cudnn.sdpa.fwd.config_sm120 import (
     D512_FLAVOR,
@@ -744,6 +755,50 @@ def decode_combine_force_lean(b: int, h_q: int, s_q: int, split: int, device_cc:
     Outside the bound the module's entry is its own forms by construction, so nothing is forced;
     where the rule says decode-grid the module's entry agrees."""
     return decode_combine_lean_blocks(b, h_q, s_q) <= DECODE_COMBINE_MAX_LEAN_BLOCKS and not decode_combine_grid_selected(b, h_q, s_q, split, device_cc)
+
+
+# The SM107 index-list sparse decode's tile_form vocabulary and lean-tile rules live in the DSL-free sparse_tile_rules (the gated
+# attention block reads them at declaration); re-exported here under their original names.
+from cudnn.sdpa.fwd.sparse_tile_rules import (  # noqa: E402,F401
+    SPARSE_TILE_FORM_AUTO,
+    SPARSE_TILE_FORM_LEAN,
+    SPARSE_TILE_FORM_TCGEN05,
+    SPARSE_TILE_FORMS,
+    SPARSE_TILE_TCGEN05,
+    SPARSE_TILE_LEAN,
+    LEAN_SPARSE_MAX_UNITS,
+    SPARSE_LEAN_TILE_DEFAULT_CCS,
+    _SPARSE_LEAN_TILE_RULE_CC,
+    LEAN_SPARSE_DEFAULT_MAX_SUB_TILES_PER_CTA,
+    _LEAN_FILL_OCCUPANCY_BY_S_Q,
+    sparse_lean_splits,
+    sparse_tcgen05_max_split,
+    sparse_lean_max_sub_tiles_per_cta,
+    sparse_lean_tile_decline,
+    sparse_decode_lean_tile_selected,
+    sparse_lean_fill_sub_tiles,
+    sparse_lean_sub_tiles_per_cta,
+    sparse_tile_form_auto,
+)
+
+# The COMBINE FORM the lean splits take on the cc 10.7 line (``sparse_gqa_sm107._sparse_combine_decode_grid`` = the split-aware rule
+# above applied to the lean split), per (B, H_q, S_q, lean split, k) on the 24 / 2 geometry at top_k 512 -- the table DESIGN 2.2 / 14.3
+# asks for, with the measured cells NAMED (212-SM class, the kill-line record: the combine term = lean_chain - lean) and the unmeasured
+# ones owed to the gate.  "decode_grid" = the decode-grid kernel inside its bound (the AUTO entry), "own" = the module's own forms
+# (DECODE_GRID_OFF), "auto_past_bound" = the AUTO entry past the decode-grid bound (= the module's own forms by construction), "lean_walk"
+# = the lean group walk.  The test suite pins every row against the rule.
+SPARSE_LEAN_COMBINE_FORM_CELLS: Tuple[Tuple[int, int, int, int, int, str, str], ...] = (
+    (1, 24, 1, 65, 1, "decode_grid", "MEASURED 212 SMs: 2.40 us (lean_chain 5.745 - lean 3.341 at B 1 x 8K; the model said 3.1)"),
+    (1, 24, 1, 33, 2, "decode_grid", "UNMEASURED (k 2 is off the default)"),
+    (4, 24, 1, 65, 1, "decode_grid", "MEASURED 212 SMs: 2.73 us (lean_chain 8.266 - lean 5.538 at B 4 x 8K)"),
+    (1, 24, 4, 65, 1, "decode_grid", "UNMEASURED: the default k at S_q 4 (96 rows, split 65 >= 8; the step's three m-tiles in one CTA)"),
+    (1, 24, 4, 33, 2, "decode_grid", "UNMEASURED: 96 rows, split 33 >= 8 (k 2 is off the default)"),
+    (4, 24, 4, 65, 1, "decode_grid", "UNMEASURED: the default k at B 4 x S_q 4 (384 rows; 96 lean blocks inside the decode-grid bound at split 65)"),
+    (4, 24, 4, 22, 3, "own", "UNMEASURED: 384 rows below split 32 -- the one-warp-per-row form past 8 splits (DESIGN 14.3: measure, or k 2 -> split 33)"),
+    (8, 24, 1, 33, 2, "auto_past_bound", "UNMEASURED: 192 lean blocks past the decode-grid bound at split 33 > 4 -- the module's own forms"),
+    (16, 24, 1, 17, 4, "auto_past_bound", "UNMEASURED: 384 lean blocks, split 17 -- the bound's edge (B 16: 0 .. +5 % modeled)"),
+    (32, 24, 1, 10, 7, "auto_past_bound", "outside the placement bound (the tcgen05 core's cell: its lean walk at split 3)"),
+)
 
 
 def _decode_tile_combine_cost(split: int, *, grid: Optional[Tuple[int, int, int]], per_partial: Optional[float] = None) -> float:
@@ -2111,6 +2166,8 @@ def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int], cga: Opti
         return cga_tile_m(192, cga)
     if facts.d_qk <= 256 and facts.d_v <= 256:
         return cga_tile_m(256, cga)
+    if _selected_d_shape(caps, facts) == (576, 512):
+        return cga_tile_m(576, cga)
     return cga_tile_m(512, cga)
 
 
@@ -2677,8 +2734,9 @@ def _d128_thd_split_units(facts, pack_g: int) -> int:
     return tiles * (facts.h_q // pack_g)
 
 
-def _d128_thd_split_wave_choice(facts, *, extra_waves: int = 1) -> Tuple[int, bool]:
-    """Score the physical packed/unpacked grids, preserving first-wave wins."""
+def _d128_thd_split_wave_choice(facts, *, extra_waves: int = 1, prefer_pack: bool = False) -> Tuple[int, bool]:
+    """Score the physical packed/unpacked grids, preserving first-wave wins. ``prefer_pack`` breaks equal-work ties toward the
+    packed grid (Rubin: see :func:`paged_thd_split_choice`)."""
     kv_tiles = _ceil_div(facts.s_kv, 128)
     sm_count = facts.device_sm_count or 128
     for waves in ((1, extra_waves) if extra_waves > 1 else (1,)):
@@ -2691,9 +2749,9 @@ def _d128_thd_split_wave_choice(facts, *, extra_waves: int = 1) -> Tuple[int, bo
             budget = min(16, waves * sm_count // units, kv_tiles // 4)
             for splits in range(2, budget + 1):
                 work = _ceil_div(units * splits, sm_count) * _ceil_div(kv_tiles, splits)
-                choices.append((work, splits, pack))
+                choices.append((work, splits, pack != prefer_pack, pack))
         if choices:
-            _, splits, pack = min(choices)
+            _, splits, _, pack = min(choices)
             return splits, pack
     return 1, False
 
@@ -2768,15 +2826,16 @@ def paged_thd_split_choice(caps: Capabilities, facts, *, first_wave: bool = Fals
         splits = _ceil_div(kv_tiles, loop_tiles)
         if splits > 1:
             work = _ceil_div(units * splits, sm_count) * loop_tiles
-            # Equal loop work prefers fewer partials, then fewer physical CTAs.
-            choices.append((work, splits, units, pack))
+            # Equal loop work prefers fewer partials, then fewer physical CTAs, then the packed grid: the declaration bounds
+            # the live tokens from above, and packed tiles shrink with them while unpacked ones keep a tile per head.
+            choices.append((work, splits, units, not pack, pack))
     if choices:
-        _, splits, _, pack = min(choices)
+        _, splits, _, _, pack = min(choices)
         return splits, pack
     if caps.sm_lo == 107 and facts.b <= 4 and facts.s_q <= 128 and facts.s_kv >= 8192:
         # Preserve first-wave choices. One-tile queries can use more waves;
         # longer queries can already use an efficient backend prefill tile.
-        return _d128_thd_split_wave_choice(facts, extra_waves=3)
+        return _d128_thd_split_wave_choice(facts, extra_waves=3, prefer_pack=True)
     return 1, False
 
 

@@ -1,7 +1,7 @@
 # cudnn.norm — sm_100 norm backend (CUTLASS primitives)
 
 JIT normalization kernels for **Blackwell (sm_100)**, written on **CUTLASS
-primitives** (`cutlass.primitives` / `nvvm` cp.async staging, `SmemAllocator`
+primitives** (`cutlass.experimental.primitives` / `nvvm` cp.async staging, `SmemAllocator`
 reductions) and the shared `cudnn.frost.tile_dsl` library — mirroring the
 structure of `cudnn.sdpa` and `cudnn.gemm.frost`. Supports **fprop** and
 **bprop** for five variants — **LayerNorm, RMSNorm, GroupNorm, InstanceNorm,
@@ -91,8 +91,9 @@ stores are already coalesced).
 Shared primitives: **`SmemAllocator`** (`cutlass.memory`) for staging + reduction
 scratch and the mbarrier; **`block_reduce_sum2`** (warp-shuffle + smem combine)
 for the two partials (`sum(x)`,`sum(x²)` fwd; `sum(dxhat)`,`sum(dxhat·xhat)` bwd);
-`import cutlass.primitives as nvvm` is the internal NVVM layer
-(`cutlass.primitives` aliases `cutlass.experimental.primitives`). BatchNorm reads
+`import cutlass.experimental.primitives as nvvm` is the internal NVVM layer, under the name the public
+`nvidia-cutlass-dsl` wheels ship (builds that also export `cutlass.primitives` alias it
+to the same module). BatchNorm reads
 global directly (strided cross-batch access — no contiguous row to stage).
 
 ## cuDNN graph engines
@@ -126,11 +127,11 @@ API (the kernel is still used for InstanceNorm graphs).
 ## Environment
 
 Requires Blackwell (SM100 or SM103; Hopper SM90 through the opt-in `norm_*_sm90` rows), a CUDA 13-capable driver, and a CUTLASS DSL build
->= 4.7.0 that exports `cutlass.primitives`. The norm entry points reject builds
-without this module. Check the active environment before running:
+>= 4.7.0 that exports `cutlass.experimental.primitives` (every public wheel does). The norm entry points
+reject builds without this module. Check the active environment before running:
 
 ```bash
-python -c "import cutlass.primitives"
+python -c "import cutlass.experimental.primitives"
 pip install torch --index-url https://download.pytorch.org/whl/cu128   # Blackwell
 ```
 

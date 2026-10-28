@@ -66,6 +66,7 @@ from cudnn.norm import NormVariant, norm_bprop, norm_fprop  # noqa: E402
 
 
 @pytest.mark.L0
+@pytest.mark.norm_rejects_before_launch
 def test_forward_refuses_mismatched_parameters():
     x = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)
     g = torch.ones(64, device="cuda", dtype=torch.float32)  # wrong dtype on purpose

@@ -587,6 +587,11 @@ def _load_loop(
         block, head, batch, valid, sched_state = _next_tile(sched, bars, sched_state, nheads, nk, causal, swizzle, batch_heads)
 
 
+# DIAGNOSTIC lever ``diag_delete_dq_reduce_add`` (``Constexpr[bool]``, default False = the shipped kernel, rendered PTX-identical):
+# the store warp skips the four fp32 dQ reduce-add issues per q tile and nothing else (every dq_full wait, commit, wait_group and
+# dq_empty arrive stays: the barrier table is unchanged).  Armed, the OUTPUT IS WRONG BY DESIGN (dQ stays zero) -- a timing-only
+# ceiling for the L2 reduce-add term; the dense MHA entry never arms it, the grouped dense kernel threads it from its adapter record.
+# The THD twin's header (bprop_d128_accum_thd_f16.py) carries the full statement.
 @cute.jit
 def _store_loop(
     slab,
@@ -605,6 +610,7 @@ def _store_loop(
     swizzle: cutlass.Constexpr[int],
     causal: cutlass.Constexpr[bool],
     dtype: cutlass.Constexpr,
+    diag_delete_dq_reduce_add: cutlass.Constexpr[bool] = False,
 ):
     nvvm.setmaxregister(CFG.SERVICE_REGS, nvvm.SetMaxRegisterAction.DECREASE)
     dq_state = PipelineState.start()
@@ -619,7 +625,9 @@ def _store_loop(
         for qtile in cutlass.range(lo, hi, 1, unroll=1):
             for i in cutlass.range_constexpr(4):
                 _wait(bars.dq_full[i], dq_state.phase)
-                tma_reduce_subtile(_operand(slab, CFG.ALIAS, cutlass.Float32, fp32=True), GmemTileTma(dq_desc)(0, qtile * CFG.N, head, batch), i)
+                # DIAGNOSTIC D2 (default off = the shipped code): only the reduce-add issue is deleted; commit / wait / arrives stay.
+                if cutlass.const_expr(not diag_delete_dq_reduce_add):
+                    tma_reduce_subtile(_operand(slab, CFG.ALIAS, cutlass.Float32, fp32=True), GmemTileTma(dq_desc)(0, qtile * CFG.N, head, batch), i)
                 tma_store_commit()
             for i in cutlass.range_constexpr(4):
                 tma_store_wait(3 - i)

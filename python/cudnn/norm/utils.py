@@ -6,7 +6,7 @@
 Mirrors the role of ``cudnn.sdpa.utils``: DLPack -> cute.Tensor conversion and a
 couple of small launch-side helpers. The heavy device-side primitives (cp.async
 staging, block reductions) live in each pass's ``kernels/_common_sm100.py`` and
-build on ``cudnn.frost.tile_dsl`` + ``cutlass.primitives``.
+build on ``cudnn.frost.tile_dsl`` + ``cutlass.experimental.primitives``.
 """
 
 from __future__ import annotations

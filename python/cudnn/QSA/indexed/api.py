@@ -65,7 +65,7 @@ class _QsaIndexedPlan(APIBase):
         self.workspace_bytes = sum(ws_align(math.prod(shape) * dtype.itemsize) for _, shape, dtype in self.layouts)
 
     def check_support(self):
-        from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_requirement_error, cutedsl_state, cutedsl_too_old
+        from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state, cutedsl_too_old
 
         installed, version = cutedsl_state()
         if not installed or cutedsl_too_old(version):
@@ -73,8 +73,11 @@ class _QsaIndexedPlan(APIBase):
                 cutedsl_requirement_error("Indexed QSA") or f"Indexed QSA requires nvidia-cutlass-dsl >= {'.'.join(str(x) for x in CUTEDSL_MIN_VERSION)}"
             )
         cc = torch.cuda.get_device_capability(self.device)
-        if cc not in ((10, 0), (10, 3)):
-            raise NotImplementedError(f"Indexed QSA requires SM100 or SM103, got SM{cc[0]}{cc[1]}")
+        if cc not in ((10, 0), (10, 3), (10, 7)):
+            raise NotImplementedError(f"Indexed QSA requires SM100, SM103 or SM107, got SM{cc[0]}{cc[1]}")
+        reason = cutedsl_arch_requirement_error(cc)
+        if reason:
+            raise NotImplementedError(reason)
         self.arch = cc[0] * 10 + cc[1]
         self.sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         self._is_supported = True
@@ -88,7 +91,10 @@ class _QsaIndexedPlan(APIBase):
         from . import _metadata
 
         with torch.cuda.device(self.device):
-            self.impl = importlib.import_module(f"cudnn.QSA.kernels.{self.direction}_sm100")
+            module = f"{self.direction}_sm100"
+            if self.direction == "fprop" and self.arch == 107 and self.total >= 32768:
+                module = "fprop_n64_sm107"
+            self.impl = importlib.import_module(f"cudnn.QSA.kernels.{module}")
             self._compiled_kernel = self.impl.compile_kernel(cutlass.BFloat16, 12, 1, self.arch)
             self._metadata = _metadata.compile_metadata(self.arch, self.nq, self.width // 4)
 

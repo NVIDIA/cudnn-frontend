@@ -54,6 +54,7 @@ cudnn.GroupedGemmSwigluSm100
 cudnn.GroupedGemmWgradSm100
 cudnn.Handle
 cudnn.Handle.device
+cudnn.KPageLayout
 cudnn.MhcProjectionBackward
 cudnn.MoeEp
 cudnn.MoeEpAutotuneCandidateResult
@@ -211,9 +212,12 @@ cudnn.behavior_note.name
 cudnn.behavior_note.value
 cudnn.block_sparse_attention
 cudnn.block_sparse_attention.BSA
+cudnn.block_sparse_attention.KPageLayout
+cudnn.block_sparse_attention.KPageLayout.build_backward
 cudnn.block_sparse_attention.block_sparse_attention_backward
 cudnn.block_sparse_attention.block_sparse_attention_forward
 cudnn.block_sparse_attention.block_sparse_attention_fp8_forward
+cudnn.block_sparse_attention.kpage_prepare_layout
 cudnn.block_sparse_attention_backward
 cudnn.block_sparse_attention_forward
 cudnn.block_sparse_attention_fp8_forward
@@ -501,6 +505,7 @@ cudnn.gated_attention_block.DECODE_ROUTE_SINGLE_UNIT
 cudnn.gated_attention_block.DECODE_ROUTE_TOKEN_UNITS
 cudnn.gated_attention_block.DecodeEnvelope
 cudnn.gated_attention_block.DecodeEnvelope.claimed_max_s_q
+cudnn.gated_attention_block.DecodeEnvelope.device_cc
 cudnn.gated_attention_block.DecodeEnvelope.fuse_prepare_default
 cudnn.gated_attention_block.DecodeEnvelope.index_block_sizes
 cudnn.gated_attention_block.DecodeEnvelope.index_cache_dtypes
@@ -521,6 +526,9 @@ cudnn.gated_attention_block.DecodeEnvelope.policy
 cudnn.gated_attention_block.DecodeEnvelope.q_tile_max
 cudnn.gated_attention_block.DecodeEnvelope.route
 cudnn.gated_attention_block.DecodeEnvelope.sparse_core
+cudnn.gated_attention_block.DecodeEnvelope.sparse_tile
+cudnn.gated_attention_block.DecodeEnvelope.sparse_tile_lean_default
+cudnn.gated_attention_block.DecodeEnvelope.sparse_tiles
 cudnn.gated_attention_block.DecodeEnvelope.writes_lse
 cudnn.gated_attention_block.DecodeRoute
 cudnn.gated_attention_block.DecodeRoute.batch
@@ -976,6 +984,7 @@ cudnn.knob_type.WARP_SPEC_CFG
 cudnn.knob_type.WORKSPACE
 cudnn.knob_type.name
 cudnn.knob_type.value
+cudnn.kpage_prepare_layout
 cudnn.linear_attention
 cudnn.linear_attention.gated_delta_net
 cudnn.linear_attention.gated_delta_net_summary
@@ -1355,6 +1364,8 @@ cudnn.numerical_note.name
 cudnn.numerical_note.value
 cudnn.nvfp4_attention_qat_backward
 cudnn.ops
+cudnn.ops.KPageLayout
+cudnn.ops.KPageLayout.build_backward
 cudnn.ops.Nvfp4BlockScaleDequantizer
 cudnn.ops.Nvfp4BlockScaleDequantizer.check_support
 cudnn.ops.Nvfp4BlockScaleDequantizer.compile
@@ -1375,6 +1386,7 @@ cudnn.ops.causal_conv1d_update
 cudnn.ops.fft_causal_conv1d
 cudnn.ops.kimi_delta_attention_backward_jax
 cudnn.ops.kimi_delta_attention_forward_jax
+cudnn.ops.kpage_prepare_layout
 cudnn.ops.nvfp4_block_scale_dequantize
 cudnn.ops.nvfp4_block_scale_quantize
 cudnn.ops.qsa_backward

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Plan-time physical-origin contracts for the half SM100 THD forward bodies."""
+"""Plan-time physical-origin contracts for SM100 THD forward bodies."""
 
 PORTS = ("q", "k", "v", "o", "stats")
 ROLES = tuple("ragged_" + name for name in PORTS)
@@ -36,5 +36,13 @@ def graph_origin_specs(facts):
 
 def descriptor_bytes(batch):
     # Four arrays of B maps and one valid-address dead-unit sentinel per array.
-    # Five INT64 origin rows follow the aligned tensor-map storage.
-    return 4 * (batch + 1) * 128 + ((5 * batch * 8 + 127) // 128) * 128
+    # Five INT64 origin rows and the compact-prefix word follow the aligned
+    # tensor-map storage.
+    return 4 * (batch + 1) * 128 + ((compact_word_offset(batch) - 4 * (batch + 1) * 128 + 8 + 127) // 128) * 128
+
+
+def compact_word_offset(batch):
+    """Byte offset, from the map storage base, of the INT64 word that setup
+    sets to one when every live origin equals its compact prefix and the load
+    ports therefore use single maps."""
+    return 4 * (batch + 1) * 128 + 5 * batch * 8

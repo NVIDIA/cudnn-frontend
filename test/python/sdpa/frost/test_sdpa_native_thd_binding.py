@@ -9,6 +9,7 @@ production fallback for native plans. No test pins a heuristic or timing.
 import sdpa_binding_reference as binding_reference
 
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 
@@ -29,8 +30,8 @@ def _fixture(dtype="bfloat16", layout="NH", rank=4):
     s.total_q, s.total_kv, s.off_o_desc = 16, 512, 4096
     s.expect = dict.fromkeys(("q", "k", "v", "o"), dtype)
     s.decl = {name: (h, 128, h * 128, 128, 1, h * 128) for name, h in (("q", 8), ("k", 2), ("v", 2), ("o", 8))}
-    # The native binder serves half hosts, whose K/V tables share one stride
-    # pair. The global prepared vocabulary also includes quantized-only slots.
+    # Model the existing half host ABI with one shared K/V table stride pair.
+    # Hosts declaring a separate V slot are exercised independently below.
     s.order = sorted((prep._FILLED_AT_BUILD | prep._FILLED_PER_CALL) - {"table_v_strides"})
     s.index = {name: i for i, name in enumerate(s.order)}
     s.template = [None] * len(s.order)
@@ -104,6 +105,93 @@ def test_physical_origins_revalidate_after_warm_binding(role, defect):
 
 def _reference(s, facts, workspace=0x30000, stream=17):
     return binding_reference._bind_thd_python(s, facts, workspace, stream, stream)
+
+
+def test_ordered_thd_rebinds_storage_and_validates_workspace_before_launch():
+    import torch
+
+    from cudnn.engines.base import ExecutionContext
+    from cudnn.sdpa._plan import _FrostSdpaPlan
+
+    spec, facts, frames = _fixture()
+    spec.scratch_bytes = 8192
+    spec.quant = spec.origin_specs = None
+    spec.native = cudnn._pybind_module._SdpaThdBinder(spec)
+    native = cudnn._pybind_module
+    roles = tuple(facts)
+    uids = tuple(range(1, len(roles) + 1))
+    layout = native.DeclaredLayout(len(roles))
+    for i, role in enumerate(roles):
+        fact = facts[role]
+        code, bits = prep._buffers.DTYPES[fact.dtype]
+        layout.set(i, fact.shape, fact.strides, fact.span * (bits // 8), code, bits)
+    schema = native._OrderedBindingSchema(uids, layout, False)
+    tensors = {role: SimpleNamespace(get_uid=lambda uid=uid: uid) for role, uid in zip(roles, uids)}
+    binding = SimpleNamespace(
+        **{role: tensors[role] for role in ("q", "k", "v", "o")},
+        cu_seq_len_q=tensors["q_lens"],
+        cu_seq_len_kv=tensors["kv_lens"],
+        stats=tensors["lse"],
+        bound_tensors=lambda: tensors.values(),
+    )
+    launch = prep.PreparedThdLaunch(spec, binding)
+    plan = _FrostSdpaPlan("thd-test", SimpleNamespace(binding=binding, prepared=launch, workspace_bytes=spec.scratch_bytes))
+    assert plan._ordered_native is spec.native
+    graph = cudnn.pygraph()
+    graph._ordered_binding_uids = uids
+    graph._slot_of_uid = dict(zip(uids, range(len(uids))))
+
+    def buffers(current):
+        result = []
+        for role, fact in current.items():
+            shape = fact.shape
+            if len(shape) == 4:
+                b, h, s, d = shape
+                shape = (b * s, h) if role == "lse" else (b * s, h, d)
+            result.append(native.make_operand_buffer(fact.ptr, shape, *prep._buffers.DTYPES[fact.dtype], fact.device[1]))
+        return tuple(result)
+
+    def call(current, workspace, stream=17):
+        return plan._execute_ordered(graph, schema, buffers(current), uids, workspace, None, None, None, stream)
+
+    for offset, stream in ((0, 17), (2**33, 23)):
+        current = {role: fact._replace(ptr=fact.ptr + offset) for role, fact in facts.items()}
+        address = 0x30000 + offset
+        expected = _reference(spec, current, address, plan._stream_handle(stream))
+        assert int(expected[spec.index["stream"]]) == stream
+        ws = native.make_operand_buffer(address, [spec.scratch_bytes], 1, 8, 0)
+        result = call(current, ws, stream)
+        frame = frames.pop()
+        assert result is None
+        assert list(frame) == expected
+        for bad, message in (
+            (None, "received none"),
+            (native.make_operand_buffer(address, [0], 1, 8, 0), "got 0 bytes"),
+            (native.make_operand_buffer(address, [spec.scratch_bytes - 1], 1, 8, 0), "got 8191 bytes"),
+            (native.make_operand_buffer(address, [spec.scratch_bytes], 1, 8, 1), "workspace must be on CUDA device 0"),
+        ):
+            with pytest.raises(ValueError, match=message):
+                call(current, bad, stream)
+            assert not frames
+        if hasattr(torch.Tensor, "__dlpack_c_exchange_api__"):
+            # CPU storage has a valid pointer and enough bytes, but its device
+            # must be rejected even after this schema has accepted CUDA storage.
+            cpu_workspace = torch.empty(spec.scratch_bytes, dtype=torch.uint8, device="cpu")
+            with pytest.raises(ValueError, match="workspace must be on CUDA device 0"):
+                call(current, cpu_workspace, stream)
+            assert not frames
+        # Unknown-capacity raw pointers use the normal Python completion path;
+        # the native entry must not launch before that path validates the call.
+        result = call(current, address, stream)
+        assert result[2] is None and not frames
+        pack = graph._finish_ordered(schema, result, address, None)
+        plan.execute(graph, pack, ExecutionContext(stream=stream, workspace=address))
+        frame = frames.pop()
+        assert list(frame) == expected
+        result = call(current, ws, stream)
+        frame = frames.pop()
+        assert result is None
+        assert list(frame) == expected
 
 
 def _equal(s, facts, **kwargs):
@@ -438,6 +526,31 @@ def test_native_paged_shared_table_stride_contract(hnd, table_rank):
             bind(s, changed)
 
 
+@pytest.mark.parametrize("hnd", [False, True])
+@pytest.mark.parametrize("table_rank", [2, 4])
+def test_native_half_host_binds_declared_independent_table_strides(hnd, table_rank):
+    """A half host with a V-stride slot receives each table's current geometry."""
+    spec, facts, _ = _paged_fixture(hnd=hnd, table_rank=table_rank)
+    spec.index["table_v_strides"] = len(spec.order)
+    spec.order.append("table_v_strides")
+    spec.template.append(None)
+    spec.native = cudnn._pybind_module._SdpaThdBinder(spec)
+    first = _native(spec, facts)
+    assert first[spec.index["table_v_strides"]] == (4, 1)
+    stride = 2**33
+    shape, strides = ((4, 1, 4, 1), (1, 1, stride, 1)) if table_rank == 4 else ((4, 4), (1, stride))
+    value_table = facts["block_table_v"]._replace(ptr=0x90000, shape=shape, strides=strides, span=3 * stride + 4)
+    changed = dict(facts, block_table_v=value_table)
+    second = _native(spec, changed)
+    assert second[spec.index["table_strides"]] == (4, 1)
+    assert second[spec.index["table_v_strides"]] == (1, stride)
+    assert first[spec.index["table_v_strides"]] == (4, 1)
+    assert spec.template[spec.index["table_v_strides"]] is None
+    changed["block_table_v"] = value_table._replace(span=value_table.span - 1)
+    with pytest.raises(ValueError):
+        _native(spec, changed)
+
+
 def test_native_nonpaged_host_does_not_require_paged_slots():
     """SM120's nonpaged host omits page tables entirely."""
     s, facts, _ = _fixture()
@@ -750,6 +863,57 @@ def test_physical_paged_split_origins_bind_independent_frames(layout, splits):
     assert tuple(s.template) == original
     # This still clears the old compact map bound, but overlaps the larger
     # physical-origin map/row reservation and must be rejected before launch.
+    s.split_workspace = s.split_workspace._replace(off_o=s.off_o_desc + (s.b + 3) * 128)
+    with pytest.raises(ValueError, match="overlap.*physical-origin"):
+        cudnn._pybind_module._SdpaThdBinder(s)
+
+
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("layout", [None, "NH", "HN"])
+@pytest.mark.parametrize("splits", [2, 5])
+def test_native_d576_thd_split_frames(paged, layout, splits):
+    """Asymmetric partial widths, origins and independent tables survive rebinding."""
+    from cudnn.sdpa.fwd.thd_origins import ROLES
+
+    s, facts, _ = _paged_fixture(hnd=True, layout=layout, v_hnd=False) if paged else _fixture(layout=layout)
+    s.d_qk, s.d_v, s.cga_tile_m = 576, 512, 128
+    for role, dim in (("q", 576), ("k", 576), ("v", 512), ("o", 512)):
+        h, _, ts, hs, _, span = s.decl[role]
+        s.decl[role] = (h, dim, ts * dim // 128, hs * dim // 128, 1, span * dim // 128)
+        f = facts[role]
+        facts[role] = f._replace(shape=(*f.shape[:-1], dim), strides=tuple(x * dim // 128 for x in f.strides[:-1]) + (1,), span=f.span * dim // 128)
+    s.order += ["lse_partial_ptr", "partial_o_strides"] + (["table_v_strides"] if "table_v_strides" not in s.order else [])
+    s.index = {name: i for i, name in enumerate(s.order)}
+    s.template += [None] * (len(s.order) - len(s.template))
+    capacity, off_o = 16, 8192
+    off_lse = off_o + splits * capacity * s.qh * s.d_v * 4
+    s.split_workspace = prep.ThdSplitWorkspace(splits, capacity, off_o, off_lse)
+    s.scratch_bytes = off_lse + splits * capacity * s.qh * 4
+    s.origin_specs = tuple(
+        (
+            None
+            if (paged and i in (1, 2)) or (i == 4 and layout is None)
+            else (i, 1, s.decl[role][2] if i < 4 else (1 if layout == "HN" else s.qh), 64 if i % 2 == 0 else 32)
+        )
+        for i, role in enumerate(("q", "k", "v", "o", "stats"))
+    )
+    for i, spec in enumerate(s.origin_specs):
+        if spec is not None:
+            facts[ROLES[i]] = prep.BufferFacts(0x500000 + i * 0x1000, f"int{spec[3]}", (2, 0), 5, (5,), (1,))
+    roles = prep._NATIVE_THD_ROLES + ROLES
+    indices = tuple(range(len(roles)))
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    for shift, step in ((0, 2), (0x1000000, 3)):
+        current = {name: fact._replace(ptr=fact.ptr + shift) for name, fact in facts.items()}
+        if paged:
+            table = current["block_table_v"]
+            current["block_table_v"] = table._replace(shape=(4, 1, 4, 1), strides=(4 * step + 5, 1, step, 1), span=3 * (4 * step + 5) + 3 * step + 1)
+        frame = s.native.bind(prep._native_pack_from_facts(current, roles), indices, 0x4000000, 17)
+        assert list(frame) == binding_reference._bind_thd_python(s, current, 0x4000000, 17, 17)
+        assert frame[s.index["partial_o_strides"]] == (capacity * s.qh * 512, s.qh * 512, 512)
+        assert frame[s.index["o_partial_ptr"]] == 0x4000000 + off_o
+        if paged:
+            assert frame[s.index["table_v_strides"]] == (4 * step + 5, step)
     s.split_workspace = s.split_workspace._replace(off_o=s.off_o_desc + (s.b + 3) * 128)
     with pytest.raises(ValueError, match="overlap.*physical-origin"):
         cudnn._pybind_module._SdpaThdBinder(s)

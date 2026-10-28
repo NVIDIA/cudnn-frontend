@@ -282,6 +282,9 @@ def _accumulate_splits(
         live = lse_s > neg_inf
         e = cute.math.exp(lse_s - m_safe, fastmath=True)
         w = cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
+        # Finite LSE can still underflow against a dominant split or sink.
+        # Its payload is dead too: never multiply zero by a NaN/Inf partial.
+        live = w > zero
         e0 = zero
         e1 = zero
         e2 = zero
@@ -365,13 +368,24 @@ def _ld_global_f32(addr):
     return cutlass.Float32(r[0] if isinstance(r, (tuple, list)) else r)
 
 
+@cute.jit
+def _query_length(q_lens, batch):
+    """Lengths and adjacent prefix pairs are two plan-time views of device data."""
+    a = cutlass.make_array_view(q_lens)
+    if cutlass.const_expr(cute.rank(q_lens) == 2):
+        length = cutlass.Int64(a[batch, 1]) - cutlass.Int64(a[batch, 0])
+    else:
+        length = cutlass.Int64(a[batch])
+    return length
+
+
 def _row_sink_logit(sinks, q_lens, head, batch, q_row):
     """The sink logit one row folds: its head's, or -inf (no sink at all) on a PADDED row -- a query row at or past its batch's Q length
     ``q_lens[batch]`` (the dense padded-Q trim), whose O / Stats stay 0 / -inf whatever the sink.  The partials of such a row and of a valid row whose
     every key is masked are the same (every split dead), so the reduction cannot tell them apart without the length."""
     sink_logit = cutlass.Float32(cutlass.make_array_view(sinks)[head])
     if cutlass.const_expr(q_lens is not None):
-        padded = cutlass.Int32(q_row) >= cutlass.Int32(cutlass.make_array_view(q_lens)[batch])
+        padded = cutlass.Int32(q_row) >= cutlass.Int32(_query_length(q_lens, batch))
         sink_logit = cutlass.Float32(arith.select(padded.ir_value(), cutlass.Float32(NEG_INF).ir_value(), sink_logit.ir_value()))
     return sink_logit
 
@@ -537,6 +551,8 @@ def _combine_kernel(
             rq = cutlass.make_array_view(ragged_q)
             q_base = cutlass.Int64(rq[batch]) // cutlass.Int64(ragged_q_div)
             q_len64 = cutlass.Int64(rq[batch + cutlass.Int32(1)]) // cutlass.Int64(ragged_q_div) - q_base
+            if cutlass.const_expr(q_lens is not None):
+                q_len64 = _query_length(q_lens, batch)
             in_seq = cutlass.Int64(q_row) < q_len64
             o_batch = cutlass.Int32(0)
             o_tok64 = cutlass.Int64(cutlass.make_array_view(ragged_o)[batch]) // cutlass.Int64(ragged_o_div) + cutlass.Int64(q_row)
@@ -1003,6 +1019,8 @@ def _combine_decode_kernel(
         rq = cutlass.make_array_view(ragged_q)
         q_base = cutlass.Int64(rq[batch]) // cutlass.Int64(ragged_q_div)
         q_len64 = cutlass.Int64(rq[batch + cutlass.Int32(1)]) // cutlass.Int64(ragged_q_div) - q_base
+        if cutlass.const_expr(q_lens is not None):
+            q_len64 = _query_length(q_lens, batch)
         in_seq = cutlass.Int64(q_row) < q_len64
         o_batch = cutlass.Int32(0)
         o_tok64 = cutlass.Int64(cutlass.make_array_view(ragged_o)[batch]) // cutlass.Int64(ragged_o_div) + cutlass.Int64(q_row)
@@ -2483,6 +2501,42 @@ def _host_ptr_quantized(
     stats_log2: cutlass.Constexpr[bool],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
+    """Preserve the sink-free quantized entry's original positional ABI."""
+    _host_ptr_quantized_sink(
+        o_partial_ptr,
+        lse_partial_ptr,
+        o_out_ptr,
+        lse_out_ptr,
+        problem_size,
+        n_splits,
+        o_strides,
+        lse_strides,
+        amax_o_ptr,
+        scale_o_ptr,
+        has_scale_o,
+        stats_log2,
+        stream,
+    )
+
+
+@cute.jit
+def _host_ptr_quantized_sink(
+    o_partial_ptr: cute.Pointer,
+    lse_partial_ptr: cute.Pointer,
+    o_out_ptr: cute.Pointer,
+    lse_out_ptr: Optional[cute.Pointer],
+    problem_size: Tuple[int, int, int, int],
+    n_splits: cutlass.Int32,
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    amax_o_ptr: Optional[cute.Pointer],
+    scale_o_ptr: Optional[cute.Pointer],
+    has_scale_o: cutlass.Constexpr[bool],
+    stats_log2: cutlass.Constexpr[bool],
+    stream: _cuda_driver.CUstream = None,
+    sinks_ptr: Optional[cute.Pointer] = None,
+    q_lens_ptr: Optional[cute.Pointer] = None,
+) -> None:
     """Reduce FP8-input partials, then scale/cast and report the recombined Amax.
 
     Quantized outputs keep unscaled partials and apply scale_o here. Half outputs
@@ -2490,6 +2544,8 @@ def _host_ptr_quantized(
     reduction. The preceding split-attention kernel initializes Amax, ordered
     before this reduction on the same stream. MXFP8 has no scalar output
     scale: its None-specialized pointer also removes Amax unscaling.
+    Optional sink/Q-length pointers trail the original stream slot. The sink
+    participates in the final normalizer once; padded Q rows remain dead.
     """
     o_partial, lse_partial, o_out, lse_out = _ptr_operands(
         o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides
@@ -2500,6 +2556,12 @@ def _host_ptr_quantized(
     scale_o = None
     if cutlass.const_expr(has_scale_o):
         scale_o = cute.make_tensor(scale_o_ptr, cute.make_layout((1,), stride=(1,)))
+    sinks = None
+    if cutlass.const_expr(sinks_ptr is not None):
+        sinks = _sink_operand(sinks_ptr, problem_size)
+    q_lens = None
+    if cutlass.const_expr(q_lens_ptr is not None):
+        q_lens = cute.make_tensor(q_lens_ptr, cute.make_layout((problem_size[0],), stride=(1,)))
     _launch_combine(
         o_partial,
         lse_partial,
@@ -2518,6 +2580,8 @@ def _host_ptr_quantized(
         None,
         DECODE_GRID_OFF,
         stream,
+        sinks,
+        q_lens,
     )
     if cutlass.const_expr(amax_o_ptr is not None and not has_scale_o and scale_o_ptr is not None):
         _unscale_amax_kernel(amax_o_ptr, scale_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
@@ -2542,6 +2606,50 @@ def _host_ptr_ragged(
     decode_grid: cutlass.Constexpr[int],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
+    """Preserve the offset-only entry's positional ABI; None is not a runtime slot."""
+    _host_ptr_ragged_q_lens(
+        o_partial_ptr,
+        lse_partial_ptr,
+        o_out_ptr,
+        lse_out_ptr,
+        problem_size,
+        n_splits,
+        o_strides,
+        lse_strides,
+        ragged_q_ptr,
+        ragged_o_ptr,
+        ragged_lse_ptr,
+        ragged_divs,
+        ragged_caps,
+        stats_log2,
+        decode_grid,
+        stream,
+        q_lens_ptr=None,
+        q_lens_prefix=False,
+    )
+
+
+@cute.jit
+def _host_ptr_ragged_q_lens(
+    o_partial_ptr: cute.Pointer,
+    lse_partial_ptr: cute.Pointer,
+    o_out_ptr: cute.Pointer,
+    lse_out_ptr: Optional[cute.Pointer],
+    problem_size: Tuple[int, int, int, int],
+    n_splits: cutlass.Int32,
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    ragged_q_ptr: cute.Pointer,
+    ragged_o_ptr: cute.Pointer,
+    ragged_lse_ptr: Optional[cute.Pointer],
+    ragged_divs: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    ragged_caps: Tuple[cutlass.Int32, cutlass.Int32],
+    stats_log2: cutlass.Constexpr[bool],
+    decode_grid: cutlass.Constexpr[int],
+    stream: _cuda_driver.CUstream = None,
+    q_lens_ptr: Optional[cute.Pointer] = None,
+    q_lens_prefix: cutlass.Constexpr[bool] = False,
+) -> None:
     """The ragged-Q decode leg's pointer ABI: :func:`_host_ptr` plus the (B+1,)
     ragged offsets of Q / O / Stats (int32 or int64 elements), their
     elements-per-token divisors and the (O, Stats) packed token capacities; the
@@ -2558,6 +2666,10 @@ def _host_ptr_ragged(
     ragged_lse = None
     if cutlass.const_expr(ragged_lse_ptr is not None):
         ragged_lse = cute.make_tensor(ragged_lse_ptr, cute.make_layout((n_off,), stride=(1,)))
+    q_lens = None
+    if cutlass.const_expr(q_lens_ptr is not None):
+        layout = cute.make_layout((B, 2), stride=(1, 1)) if cutlass.const_expr(q_lens_prefix) else cute.make_layout((B,), stride=(1,))
+        q_lens = cute.make_tensor(q_lens_ptr, layout)
     _launch_combine(
         o_partial,
         lse_partial,
@@ -2576,6 +2688,7 @@ def _host_ptr_ragged(
         None,
         decode_grid,
         stream,
+        q_lens=q_lens,
     )
 
 
@@ -2696,6 +2809,52 @@ def _host_ptr_ragged_sink(
     decode_grid: cutlass.Constexpr[int],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
+    """Preserve the offset-only entry's positional ABI; None is not a runtime slot."""
+    _host_ptr_ragged_sink_q_lens(
+        o_partial_ptr,
+        lse_partial_ptr,
+        o_out_ptr,
+        lse_out_ptr,
+        problem_size,
+        n_splits,
+        o_strides,
+        lse_strides,
+        ragged_q_ptr,
+        ragged_o_ptr,
+        ragged_lse_ptr,
+        ragged_divs,
+        ragged_caps,
+        sinks_ptr,
+        stats_log2,
+        decode_grid,
+        stream,
+        q_lens_ptr=None,
+        q_lens_prefix=False,
+    )
+
+
+@cute.jit
+def _host_ptr_ragged_sink_q_lens(
+    o_partial_ptr: cute.Pointer,
+    lse_partial_ptr: cute.Pointer,
+    o_out_ptr: cute.Pointer,
+    lse_out_ptr: Optional[cute.Pointer],
+    problem_size: Tuple[int, int, int, int],
+    n_splits: cutlass.Int32,
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    ragged_q_ptr: cute.Pointer,
+    ragged_o_ptr: cute.Pointer,
+    ragged_lse_ptr: Optional[cute.Pointer],
+    ragged_divs: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    ragged_caps: Tuple[cutlass.Int32, cutlass.Int32],
+    sinks_ptr: cute.Pointer,
+    stats_log2: cutlass.Constexpr[bool],
+    decode_grid: cutlass.Constexpr[int],
+    stream: _cuda_driver.CUstream = None,
+    q_lens_ptr: Optional[cute.Pointer] = None,
+    q_lens_prefix: cutlass.Constexpr[bool] = False,
+) -> None:
     """:func:`_host_ptr_ragged` plus the fp32 [H] attention-sink logits."""
     o_partial, lse_partial, o_out, lse_out = _ptr_operands(
         o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides
@@ -2708,6 +2867,10 @@ def _host_ptr_ragged_sink(
     if cutlass.const_expr(ragged_lse_ptr is not None):
         ragged_lse = cute.make_tensor(ragged_lse_ptr, cute.make_layout((n_off,), stride=(1,)))
     sinks = _sink_operand(sinks_ptr, problem_size)
+    q_lens = None
+    if cutlass.const_expr(q_lens_ptr is not None):
+        layout = cute.make_layout((B, 2), stride=(1, 1)) if cutlass.const_expr(q_lens_prefix) else cute.make_layout((B,), stride=(1,))
+        q_lens = cute.make_tensor(q_lens_ptr, layout)
     _launch_combine(
         o_partial,
         lse_partial,
@@ -2727,6 +2890,7 @@ def _host_ptr_ragged_sink(
         decode_grid,
         stream,
         sinks,
+        q_lens,
     )
 
 
@@ -2764,6 +2928,7 @@ def compile_ptr(
     has_q_lens: bool = False,
     decode_grid: int = DECODE_GRID_OFF,
     use_pdl: bool = False,
+    ragged_q_lens: int = 0,
 ) -> Callable:
     """Compile a shape-generic pointer entry for prepared split execution.
 
@@ -2776,16 +2941,21 @@ def compile_ptr(
     and append the device-total-Q pointer; other entries share the existing
     reduction and launch. The quantized dense entry appends Amax/scale
     pointers; half and ragged entries keep their existing positional ABI.
+    The quantized sink entry preserves that prefix and appends sink/Q-length
+    pointers after the stream, with an explicit None Q-length slot when absent.
     ``has_scale_o_input=False`` removes the scalar input and Amax unscale
     launch for MXFP8. Per-tensor FP8 retains both by default.
     ``gate=True`` (dense half launches only; ``dtype_gate`` "f16" / "bf16" names
     G's dtype) is the gate-in-combine entry: the dense ABI plus G's pointer and
     its four BSHD strides appended -- see the module docstring for the
     numerics it fixes.
-    ``has_sink`` selects the sink entries (half outputs only): the reduction
+    ``has_sink`` selects the sink entries (half or quantized outputs): the reduction
     folds the attention sink once (the partials are sink-free).  The dense and
     ragged entries append the fp32 [H] sink-logit pointer right before
     ``stats_log2``; the packed entry takes it as its trailing ``sinks_ptr``.
+    ``ragged_q_lens`` appends the device Q-length pointer after the stream on the
+    ragged entry: 1 reads B lengths, 2 reads B+1 cumulative lengths. These decide
+    live rows independently of the physical offsets used to address Q/O/Stats.
     ``has_q_lens`` (the dense sink entry only) appends the int32 (B,) per-batch Q-length pointer after the sink pointer: the rows of the padded-Q trim
     past their batch's length keep ``O := 0 / LSE := -inf`` instead of folding the sink.
     ``decode_grid`` (appended; ``DECODE_GRID_OFF`` by default: an entry that names no
@@ -2830,10 +3000,10 @@ def compile_ptr(
         raise ValueError("the gate-in-combine entry needs dtype_gate 'f16' or 'bf16' (the gate G is a half tensor of O's shape)")
     if dtype_gate is not None and not gate:
         raise ValueError("dtype_gate is a gate=True specialization")
-    if has_sink and quantized:
-        raise ValueError("the sink fold is wired for the half combine entries only (FP8 split + sink stays declined)")
     if has_sink and gate:
         raise ValueError("the gate-in-combine entry carries no sink fold (a gated split with a sink is declined)")
+    if ragged_q_lens not in (0, 1, 2) or (ragged_q_lens and not ragged):
+        raise ValueError("ragged_q_lens requires the ragged entry: 1 for lengths, 2 for prefixes")
     if has_q_lens and not has_sink:
         raise ValueError("has_q_lens is a sink specialization: the Q lengths only decide which rows fold the sink")
     if has_q_lens and (ragged or packed):
@@ -2867,7 +3037,7 @@ def compile_ptr(
         entry, extra, form = _host_ptr_packed, (P(cutlass.Int32),), ()
     elif quantized:
         entry, extra, form = (
-            _host_ptr_quantized,
+            _host_ptr_quantized_sink if has_sink else _host_ptr_quantized,
             (P(cutlass.Float32) if has_amax else None, P(cutlass.Float32) if has_scale_o_input else None, bool(has_scale_o)),
             (),
         )
@@ -2875,7 +3045,11 @@ def compile_ptr(
         # The ragged-Q leg's entry appends the offsets / divisors / capacities; the
         # dense entry's positional ABI stays exactly what its callers pass.
         off_t = cutlass.Int64 if ragged_i64 else cutlass.Int32
-        entry, extra = (_host_ptr_ragged_sink if has_sink else _host_ptr_ragged), (
+        if ragged_q_lens:
+            entry = _host_ptr_ragged_sink_q_lens if has_sink else _host_ptr_ragged_q_lens
+        else:
+            entry = _host_ptr_ragged_sink if has_sink else _host_ptr_ragged
+        extra = (
             P(off_t),
             P(off_t),
             P(off_t) if has_lse else None,
@@ -2888,7 +3062,7 @@ def compile_ptr(
         entry, extra = _host_ptr_gated, (P(_ELEM[dtype_gate]), (cutlass.Int64(0),) * 4)
     else:
         entry, extra = (_host_ptr_sink_q_lens if has_q_lens else _host_ptr_sink if has_sink else _host_ptr), ()
-    if has_sink and not packed:
+    if has_sink and not packed and not quantized:
         extra = (*extra, P(cutlass.Float32))  # the fp32 [H] sink logits, right before stats_log2 (the packed entry's ride as its trailing sinks_ptr)
         if has_q_lens:
             extra = (*extra, P(cutlass.Int32))  # the int32 (B,) per-batch Q lengths of the padded-Q trim, right after the sinks
@@ -2902,6 +3076,8 @@ def compile_ptr(
         options="--enable-tvm-ffi",
         cache_key=_cache_key,
         symbol="frost_sdpa_fwd_combine_ptr",
-        **({"sinks_ptr": P(cutlass.Float32)} if (has_sink and packed) else {}),
+        **({"sinks_ptr": P(cutlass.Float32)} if (has_sink and (packed or quantized)) else {}),
+        **({"q_lens_ptr": P(cutlass.Int32)} if (has_q_lens and quantized) else {}),
+        **({"q_lens_ptr": P(cutlass.Int32), "q_lens_prefix": ragged_q_lens == 2} if ragged_q_lens else {}),
         **({"use_pdl": True} if use_pdl else {}),
     )

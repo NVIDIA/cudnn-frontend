@@ -297,14 +297,15 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_bwd_sm107": EngineSlot(4, opt_in=True),
             "sdpa_bwd_sm107_fp8": EngineSlot(5, opt_in=True),
             "sdpa_bwd_sm107_mxfp8": EngineSlot(6, opt_in=True),
-            "sdpa_bwd_sm100_d256": EngineSlot(7, opt_in=True),
+            "sdpa_bwd_sm100_d256": EngineSlot(7),
             "sdpa_bwd_sm107_d512": EngineSlot(8, opt_in=True),
-            "sdpa_bwd_sm100_d128": EngineSlot(9, opt_in=True),
+            "sdpa_bwd_sm100_d128": EngineSlot(9),
+            "sdpa_bwd_sm107_d192": EngineSlot(10, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         # One entry per eligible row, WITH the tiles the lowering would pick
         # (cudnn.sdpa.bwd.heuristics), so the record pins the kernel.
-        heuristics=("cudnn.sdpa.bwd.heuristics", "recommend"),
+        heuristics=("cudnn.sdpa.bwd.heuristics", "propose"),
         validator=("cudnn._sdpa_validate", "validate_graph"),
     ),
     EngineFamily(

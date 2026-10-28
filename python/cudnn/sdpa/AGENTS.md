@@ -80,6 +80,29 @@ The initial-wave limit is a plan-time choice evaluated against current host-know
 capacity at binding. Where an exact packed workload is available, count packed
 token tiles rather than unpacked tiles times all query heads.
 
+Packed split partials use compact work prefixes, but Q/K/V and final O/Stats
+may each have independent physical origins. Do not reuse partial indexing for
+input addressing or drop the origin declarations while lowering a split plan.
+The D128 nonpaged split cases in `test_sdpa_fwd_thd_origins.py` poison the gaps
+and rebind all pitches; mixed FP8 KV repeats them in
+`test_sdpa_fwd_mixed_kv_sm100.py`. Sequence-local K/V maps clip each live segment,
+so interior NaN padding cannot enter a tile tail.
+The physical-origin binding must be enabled for every supported architecture
+and layout, not just its paged path. Assert the prepared THD spec contains
+`origin_specs` when the graph declares offsets. The SM107 `TestMixedFp8Kv`
+THD cases cover mixed KV and uniform half, packed and unpacked, with poisoned
+gaps, independent port origins, rebinding, and changed-length replay.
+
+For single-Q ragged split decode, physical Q-offset differences can include
+storage gaps. The combine must use the declared device Q lengths (ordinary or
+cumulative), independently of output addresses. Exercise an empty sequence with
+nonzero offset distance and assert that both O and Stats canaries remain intact;
+`test_half_q_single_q_ragged_decode` covers graph and standalone execution,
+rebinding and retained replay. Standalone THD requires Q lengths independently
+of the dense-only `seq_q_lens_present` flag: bind against the compiled spec,
+validate ordinary B or cumulative B+1 storage, and reject uncompiled operands.
+A graph-only test misses a direct-API operand silently dropped by that flag.
+
 **Rule S2 — A change to any FROST SDPA `Capabilities` row updates
 `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` in the same commit.**
 
@@ -104,6 +127,10 @@ token tiles rather than unpacked tiles times all query heads.
 - Reviewing: if the diff touches `fwd/engines.py`, `bwd/engines.py` or
   `cudnn/engines/manifest.py` and `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` is
   untouched, ask why before approving.
+- Prefill-only backward rows explicitly set `decode=False`: the capability
+  default is `True`, which otherwise admits `S_q == 1` before the adapter
+  rejects it. `test_sdpa_bwd_d192_sm107.py::test_decode_declines_before_lowering`
+  checks real dense/THD graph declarations at that boundary.
 
 **Rule S3 — When P is aliased into a score slot's TMEM tail, the warpgroup
 that stores into columns another warpgroup still has to read must be
@@ -238,6 +265,20 @@ read the wrong K/V at batch one. The detector is
 `test_sdpa_bwd_d256_sm100.py::test_batch_pitch_rebind_and_replay`, including
 both source padding and output copy-out with canaries in unused physical rows.
 
+A TMA view split into fixed head chunks must retain the logical head bound.
+A rank-5 `(chunk, row, inner)` view can treat storage slack as live columns even
+when Q is correctly zero-padded; `0 * NaN` still poisons BMM1. Keep the bounded
+rank-4 loads for partial head chunks, and preserve the exact-head lowering.
+`test_sdpa_fwd_fp8_sm100.py::TestD192Fp8HeadPadding` and the native SM107
+`TestNativeD192Fp8HeadPadding` bridge poison Q/K/V head slack and check full
+O/Stats/Amax, output canaries, rebinding and retained replay on both arch lines.
+For paged head chunks, the descriptor box may cover only one page slice while
+the MMA operand still uses the full tile-height pitch between dimension slabs.
+Preserve that pitch and step dimensions in exactly one layer: a paged helper
+that loops dimension subtiles must not also request multiple loads per subtile.
+`TestD256Fp8HeadPadding::test_paged_rebind_replay` covers partial K/V heads,
+short and wide pages, independent pools/tables, sinks and changed-length replay.
+
 **Rule S6 — A kernel feature lands on every arch line's test file, and its
 other-arch lowerings are smoke-compiled from whatever GPU you have.**
 
@@ -250,6 +291,14 @@ other-arch lowerings are smoke-compiled from whatever GPU you have.**
   to copy. Detector: `pytest --collect-only -q -k <feature>` per file must list
   the cases (the block-scaled O review found SM120 FP4 declining itself
   and the Rubin lane skipping the epilogue entirely).
+- When an architecture CI lane selects an explicit file list, check collection
+  through those entries. A directory-wide local sweep does not prove CI coverage.
+  A guarded class in the selected entry can expose parametrized helper tests via
+  `staticmethod`; retain the architecture guard because the helper module's
+  `pytestmark` does not transfer with its functions. The SM107 sink/split
+  detector is `test_sdpa_fp8_sm107.py::TestNativeFp8SinkSplit`.
+  Put shared implementations in modules without the `test_` prefix so directory
+  sweeps collect each architecture entry once, rather than also collecting helpers.
 - The DSL traces the kernel in Python before any arch-specific codegen, so a
   lowering for an arch you do not have still fails or passes its trace here:
   `_load_sm120_kernel_module(None, TemplateParams(dtype_qkv=0, dtype_o=5),
@@ -345,6 +394,14 @@ on the address path shows the wrap before any GPU run.
   with the existing `thd_over_launched_units_are_dead` and
   `thd_multi_unit_per_cta` regressions.
 
+A caller that explicitly acquires an immutable runtime map must also disable
+its tile helper's default acquire for that lifetime. Otherwise every q tile
+repeats the tensor-map invalidation and flush despite the outer acquire.
+In 2x2 backward, loaders acquire compact maps at entry and physical maps per
+work item; the fused Qdk map belongs to the store warp and needs its own acquire
+on both CTAs. Preserve the initialized dead-unit fallback. The D192/D256 THD
+origin/rebind suites and their empty replay cases exercise these boundaries.
+
 **Rule S9 — Every scheduler reader needs a reuse back-edge; match output-phase cadence.**
 
 Every scheduler payload reader must either return a reuse credit or have a
@@ -415,8 +472,13 @@ production kernels gain no debug knob or timing-dependent assertion.
   with `batch_idx == n_batch`. Allocating `B+1` map slots makes that address
   in bounds but does not initialize a descriptor there.
 - When setup writes maps only for the `B` real sequences, exit dead initial
-  clusters before acquiring maps or shared resources. Use the cluster-uniform
+  clusters before acquiring maps, allocating TMEM, or entering role-specific
+  barrier protocols. Use the cluster-uniform
   `exit_if_dead_thd_cluster` helper; a role-local exit can strand barrier peers.
+- Under programmatic dependent launch, wait for setup before the dead-unit
+  check reads its metadata. Uniform CTA/cluster-local initialization may
+  overlap setup if all roles finish it before the exit and it owns no TMEM
+  or tensor maps. The SM107 paged physical-origin replay tests cover this order.
 - Exercise overlaunch without total-length hints and replay after changing
   all query lengths to zero. Check O/Stats canaries and run memcheck; ordinary
   live-row numerical comparisons do not cover the dead-unit path.
@@ -436,6 +498,13 @@ Keep physical per-port origins separate from compact workspace prefixes and
 retain barrier arrivals for dead work while suppressing its output stores.
 `test_sdpa_bwd_thd_d256_sm100.py::test_origins_rebind_and_replay` checks this
 with poisoned scratch, one-sided empties and changed device metadata.
+
+The loader must follow a lookahead consumer's operand order. In the D192
+backward body, waiting for dO_dV(i)'s slot before loading Q(i+1) delays the
+MMA's next score even with extra Q buffers. Preload Q0, then issue dO(i),
+Q(i+1), dO_dV(i); guard the empty prologue and final prefetch and advance the
+Q ring once per actual tile. The D192 dense/THD replay suites and D256
+`test_mma_order_arms_match_the_fp64_reference` exercise both issue orders.
 
 Shared protocol (both passes):
 
@@ -1186,6 +1255,23 @@ credit. Source-level vector loads can be scalarized, so the single-CTA THD
 path reads through lane zero and broadcasts before the release. Validate
 repeated waves with Compute Sanitizer racecheck as well as O/Stats tests.
 
+This also applies to the custom D256 FP8 predecode scheduler: use local
+stores and a release arrive for its single-CTA THD payload, preserving the
+transaction-counted DSMEM arm for multi-CTA renderings. The paged physical
+origin and multiwave cases in `test_sdpa_fwd_paged_thd_fp8.py` exercise this
+composition; numerics alone can pass while memcheck rejects the DSMEM write.
+Broadcast predecoded fields (Q tile, head, batch, bounds and split) as well as
+the original response before returning a slot credit. A vector response read
+alone leaves scalar field loads racing with the next local publication; the
+D256 multiwave racecheck catches the output-store warp reading a reused slot.
+
+The D256 FP8 shared-alpha handoff uses per-lane release arrivals for both
+publication and reuse, with matching barrier counts. Keep elected warp
+credits confined to the TMEM-only handoff: a TMEM wait does not publish the
+other lanes' shared alpha stores. Run the top-left mask/sink case in
+`test_sdpa_fwd_paged_thd_fp8.py` under racecheck, including its dense and
+compact controls, as well as the persistent scheduler case.
+
 Packed split workspace is bounded by declared packed-Q capacity. Every
 partial store and combine read must use live token coordinates, including
 empty sequences and nonaligned tails. `test_paged_thd_split_capture_lengths_and_stats`
@@ -1197,6 +1283,8 @@ including when a sink dominates the row. Mask its partial O by the computed
 weight before arithmetic; testing only `LSE == -inf` misses `0 * NaN` contamination.
 `test_packed_prefetch_excludes_zero_weight_partials` compares explicit reducer
 specializations with FP64, including sink-dominated rows and changed-total replay.
+`test_quantized_sink_combine_excludes_zero_weight_payload` covers the dense
+quantized small/serial reductions with NaN and both infinite payloads.
 
 Oversized Q/O backing allocations do not enlarge a split plan's live-Q bound.
 Without an explicit packed-total hint, the split workspace is still bounded by
@@ -1257,3 +1345,43 @@ otherwise hide a missing attribute restriction. For example, the pre-folded
 scale case in `test_thd_pack_gqa_unsupported_flavors_decline` includes legal
 CGA2 as well as CGA1. Removing only the pre-folded-scale decline must make the
 CGA2 case fail while the unrelated-domain cases still pass.
+
+
+Paged FP8 D256 uses rank-5 TMA maps with more than one dimension subtile.
+When a page is shorter than the KV tile, keep the shared-memory pitch of each
+dimension slab at the full tile height; a short TMA box must not pack the
+next dimension slab directly after the page rows. Use each pool's own strides
+and table. `test_paged_graph_fp8_d256_page_boundaries` exercises both sides
+of the tile/page boundary and independently laid-out K/V pools.
+
+A sink-only row must publish O=0 and LSE=sink even for a very negative finite
+sink. An empty softmax's reset max is a sentinel, not a real score: folding
+`exp(sink - sentinel)` can underflow and turn LSE into -inf. Select the
+sink-only result explicitly and retain the later padded-Q trim override.
+Detectors: `test_paged_graph_fp8_sink_rebind_replay` and
+`test_prepared_fp8_d256_dense_keyless_sink` include sink logits -120/+120.
+
+
+A shared GMEM operand can need different SMEM swizzles for its MMA consumers.
+In native FP8 D192x128 backward, the nontransposed dP contraction reads dO/V
+with 128-byte atoms, while transposed dV reads 64 value columns per CTA with
+64-byte atoms. Keep each TMA map, SMEM descriptor and MMA instruction walker
+consistent; V's descriptor stride follows V, not Q/K. The host detector
+`test_fp8_tma_layout_matches_each_mma_consumer` compares config values against
+`MmaDesc`'s independently derived contraction/transpose geometry. Whole-backward
+native numerical and replay tests remain necessary; compilation alone misses
+these wrong-address walks.
+
+Physical THD origin forwarding must cover every admitted CGA, including unsplit
+nonpaged paths. A CGA2 replay does not validate CGA1 lowering: the kernel can
+accept the plan while missing origin specs silently select compact prefixes.
+`TestMixedFp8Kv.test_thd_cga1_origins` pins CGA1 for uniform and mixed KV, asserts
+prepared origin specs before launch, and checks gapped inputs/output canaries
+under changed bindings and retained replay.
+
+An explicit tile-domain extension must not silently enroll another dtype in
+a measured default picker. Rubin's `tile_ns_by_d_shape` also feeds the
+half-precision resident-arm selector; explicit-only per-tensor widths belong
+in `effective_tile_ns`, like the native D128 explicit narrow tile. The detector
+`test_fp8_d64_narrow_tile_keeps_graph_defaults` checks both A and FALLBACK at
+first-half tails as well as tile multiples, while admitting an explicit N64.
