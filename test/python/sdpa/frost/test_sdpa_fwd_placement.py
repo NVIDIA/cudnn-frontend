@@ -69,13 +69,35 @@ def test_known_default_and_opt_in_rows_are_offered(monkeypatch):
         "sdpa_fwd_prefill_sm100_fp8",
         "sdpa_fwd_prefill_sm107_fp8",
         "sdpa_fwd_prefill_sm107_mxfp8",
+        "sdpa_fwd_prefill_sm80",
     }
-    opt_in_rows = {"sdpa_fwd_prefill_sm80", "sdpa_fwd_prefill_sm100_mxfp8", "sdpa_fwd_prefill_sm120_mxfp8"}
+    opt_in_rows = {"sdpa_fwd_prefill_sm100_mxfp8", "sdpa_fwd_prefill_sm120_mxfp8"}
     offered = _FAMILY.offered_ids()
     assert default_rows <= offered.keys()
     assert opt_in_rows.isdisjoint(offered)
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     assert default_rows | opt_in_rows <= _FAMILY.offered_ids().keys()
+
+
+@pytest.mark.L0
+def test_trail_only_rows_rank_behind_the_backend():
+    """A default row with no measured lead shard serves only graphs the backend declines (a correctness fallback)."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    assert placement.TRAIL_ONLY_ROWS <= _FAMILY.offered_ids().keys()
+    for spec in ENGINE_SPECS:
+        if spec.name in placement.TRAIL_ONLY_ROWS:
+            assert placement.place(spec, _facts(device_cc=(8, 0))) == placement.TRAIL, spec.name
+    from cudnn.engines.heuristics import LAST_RESORT, _assemble
+
+    # Across modes: a backend that offers only FALLBACK entries still precedes a last-resort row (review on #1962).
+    frost = PlanConfig(_OFFERED[_SM100], object())
+    proposals = lambda kind: [BACKEND, LAST_RESORT, frost]
+    backend_fb = [PlanConfig(7, "fb", mode=cudnn.heur_mode.FALLBACK)]
+    final = _assemble([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK], proposals, backend_fb)
+    assert [p.engine_id for p in final] == [7, frost.engine_id]
+    assert [p.engine_id for p in _assemble([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK], proposals, [])] == [frost.engine_id]
+    assert [p.engine_id for p in _assemble([cudnn.heur_mode.OPENSOURCE], proposals, backend_fb)] == [frost.engine_id]
 
 
 @pytest.mark.L0

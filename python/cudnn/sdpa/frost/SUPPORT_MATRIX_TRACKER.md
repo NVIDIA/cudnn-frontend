@@ -105,7 +105,9 @@ only (the graph attribute is forward-only).
 engine for that band, so it is the only provider there. `sdpa_bwd_sm100_d128` is a default candidate that ranks
 ahead of the backend for d128 THD without a window and behind it elsewhere; `sdpa_bwd_sm100_d256` is a default candidate that
 ranks ahead of the backend for d256 on cc 10.0 and behind it for mask-free ragged THD past S_q 4096, D192x128, other parts,
-and deterministic, bias, dropout, windowed or sink graphs (`sdpa/bwd/heuristics.py`). Every other
+and deterministic, bias, dropout, windowed or sink graphs (`sdpa/bwd/heuristics.py`). `sdpa_fwd_prefill_sm80`,
+`sdpa_bwd_sm80`, `sdpa_bwd_sm120`, `sdpa_bwd_sm107` and `sdpa_bwd_sm107_d512` are default candidates that always rank
+behind the backend (`TRAIL_ONLY_ROWS`): they serve a graph only when the backend declines it. Every other
 FROST SDPA engine is `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before
 `import cudnn` or the graph runs a cuDNN backend plan. The flag also ranks FROST first everywhere.
 
@@ -1895,7 +1897,7 @@ as on the sibling rows: right-band widening, bias. Stats comes from the caller
 (the Rubin MXFP8 forward row serves THD at d256 since 2026-10-08 -- footnote ᶻ -- and
 writes the packed Stats this row consumes). Tests: `test_sdpa_bwd_thd_mxfp8_sm107.py`
 (direct adapter), the THD pins of `test_sdpa_bwd_mxfp8_sm107.py`.
-ᵇ³ **d ∈ (256, 512] backward (`sdpa_bwd_sm107_d512`, f16/bf16, opt_in, 2026-10-01;
+ᵇ³ **d ∈ (256, 512] backward (`sdpa_bwd_sm107_d512`, f16/bf16, 2026-10-01; default behind the backend since 2026-10-27;
 `python/cudnn/sdpa/bwd/api_dsl_sm107_d512.py`, stage-2 kernel
 `sm107/bprop_d512_f16_2x2.py`, config `bwd/config_sm100.py::TemplateParams2x2`).**
 The SM100 large-head-dim chain (ᵇ of the SM100 section: `delta = rowsum(dO·O)` →

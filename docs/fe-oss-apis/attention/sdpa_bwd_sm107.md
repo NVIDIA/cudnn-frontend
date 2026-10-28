@@ -13,8 +13,9 @@ forward activations (`Q/K/V/O`), the loss gradient `dO` and the forward `Stats`
 
 Three FROST engines serve the d = 256 pass on cc 10.7 (`cudnn.sdpa.bwd.engines`), and two
 more rows share the chain (the SM100 / SM103 d = 256 row and the cc 10.7 d in (256, 512]
-row, both described further down). Four are `opt_in`. The SM100 / SM103 d = 256 row is a default
-candidate that the backward heuristics rank against the backend. For the opt-in rows, set
+row, both described further down). The FP8 and MXFP8 rows are `opt_in`. The SM100 / SM103 d = 256 row is a default
+candidate that the backward heuristics rank against the backend; `sdpa_bwd_sm107` and `sdpa_bwd_sm107_d512` are default
+candidates that rank behind it (they serve a graph the backend declines). For the opt-in rows, set
 `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before `import cudnn`; for any of the five, pin the
 engine from the ranked plan list (`graph.plans` / `graph.select_plan(i)`) when
 validating or measuring, because the bf16 d256 graph also has a native backend
@@ -36,8 +37,8 @@ kernel (see "The 2x2-datapath body" below); pin it by name without the opt-in fl
 (`startswith("sdpa_bwd_sm100_d256")`), because the bf16 d256 graph also has a
 native backend plan there (cuDNN engine 5 on B200 / 9.26).
 
-A fifth engine, `sdpa_bwd_sm107_d512` (bf16 / fp16, cc 10.7 - 11.9, `opt_in`,
-2026-10-01), serves **d in (256, 512]** (multiples of 8, envelope-served on
+A fifth engine, `sdpa_bwd_sm107_d512` (bf16 / fp16, cc 10.7 - 11.9, default behind the
+backend, 2026-10-01), serves **d in (256, 512]** (multiples of 8, envelope-served on
 512-wide tiles) on the same line -- see "The d in (256, 512] row" below.  It is
 the only FROST d > 256 backward on cc 10.7, and the only backward at all for that
 band there: cuDNN 9.26 builds no d > 256 backward plan on cc 10.7, so a pin by
