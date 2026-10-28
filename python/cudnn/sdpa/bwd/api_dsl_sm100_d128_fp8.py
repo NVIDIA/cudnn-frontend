@@ -142,6 +142,7 @@ class SdpaBwdDslSm100D128Fp8(SdpaBwdDsl):
         self.grad_dtype = self.dq_desc.dtype
         require(self.grad_dtype in _GRAD_DTYPES, f"dQ/dK/dV dtype {self.grad_dtype} not in {_GRAD_DTYPES}")
         require(self.dk_desc.dtype == self.grad_dtype and self.dv_desc.dtype == self.grad_dtype, "dQ/dK/dV must share one dtype")
+        require(not (h > hk and d == 64 and self.grad_dtype == torch.float16), "FP16 gradients are not served on the grouped d64 route")
         for role in ROLES[:9]:
             desc = getattr(self, role + "_desc")
             if role == "stats":
@@ -158,8 +159,8 @@ class SdpaBwdDslSm100D128Fp8(SdpaBwdDsl):
         self.s_q_max, self.s_k_max = sq, sk
         self.head_dim_qk = self.head_dim_v = d
         self.scale_softmax = d**-0.5 if self.scale_softmax is None else float(self.scale_softmax)
-        require(math.isfinite(self.scale_softmax), "attn_scale must be finite")
-        implementation = select_implementation(cc, version, int(b), int(h), int(sq), int(sk), abs(self.scale_softmax) if self.scale_softmax != 0 else 1.0)
+        require(math.isfinite(self.scale_softmax) and self.scale_softmax > 0, "attn_scale must be finite and positive")
+        implementation = select_implementation(cc, version, int(b), int(h), int(sq), int(sk), self.scale_softmax)
         require(implementation == ACCUMULATION, "the declaration is outside the accumulation envelope")
         self._implementation = ACCUMULATION
         self._is_supported = True

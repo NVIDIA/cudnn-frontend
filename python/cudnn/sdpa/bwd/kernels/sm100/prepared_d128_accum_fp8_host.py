@@ -146,7 +146,7 @@ def compile_host(geometry, regions, grad_dtype, causal, sm, amax_requested, wind
     global accumulation_host, cast_dq_fp8_host, delta_zero_fp8_host
     head_dim = geometry[0][0][3]
     if head_dim == 64 and HEAD_DIM != 64:
-        module = load_template(__file__, 64, tag="sdpa_bwd_d64_fp8_host")
+        module = load_template(__file__, 64, tag=f"sdpa_bwd_d64_fp8_host_w{int(window)}", extra_key=int(window))
         return module.compile_host(geometry, regions, grad_dtype, causal, sm, amax_requested, window)
     if head_dim != HEAD_DIM:
         raise ValueError("prepared fp8 accumulation head dimension does not match the kernel specialization")

@@ -74,6 +74,8 @@ def test_row_admits_dense_d128_e4m3(monkeypatch, cc):
     assert _mismatch(monkeypatch, cc=cc, d=64, left_bound=127) is None
     assert _mismatch(monkeypatch, cc=cc, causal=False) is None
     assert _mismatch(monkeypatch, cc=cc, grad_dtypes=(cudnn.data_type.BFLOAT16,) * 3) is None
+    assert _mismatch(monkeypatch, cc=cc, d=64, hkv=1, grad_dtypes=(cudnn.data_type.BFLOAT16,) * 3) is None
+    assert _mismatch(monkeypatch, cc=cc, grad_dtypes=(cudnn.data_type.HALF,) * 3) is None
     assert _mismatch(monkeypatch, cc=cc, request_amax=()) is None
 
 
@@ -87,8 +89,9 @@ def test_row_admits_dense_d128_e4m3(monkeypatch, cc):
         (dict(left_bound=64), "sliding window at d64 only"),
         (dict(deterministic=True), "deterministic"),
         (dict(bottom_right=True), "bottom-right"),
+        (dict(d=64, hkv=1, grad_dtypes=(cudnn.data_type.HALF,) * 3), "FP16 gradients"),
     ],
-    ids=["d256", "rubin", "sm120", "gqa", "window", "deterministic", "bottom-right"],
+    ids=["d256", "rubin", "sm120", "gqa", "window", "deterministic", "bottom-right", "fp16-grouped-d64"],
 )
 def test_row_declines(monkeypatch, kw, needle):
     reason = _mismatch(monkeypatch, **kw)
@@ -145,6 +148,27 @@ def test_gqa_repeated_launches_are_bitwise(sm100_row):
         assert torch.equal(run.outs[0][name].view(torch.int8), run.outs[1][name].view(torch.int8)), name
     for name, value in run.amax[0].items():
         assert torch.equal(value, run.amax[1][name]), name
+
+
+@requires_pre_rubin_blackwell
+def test_negative_scale_declined_at_check():
+    from cudnn.sdpa.bwd.api_dsl_sm100_d128_fp8 import SdpaBwdDslSm100D128Fp8
+
+    b, h, s = 1, 2, 256
+
+    def bshd(width, dtype):
+        return torch.empty(b, s, h, width, dtype=dtype, device="cuda").permute(0, 2, 1, 3)
+
+    stats = torch.empty(b, h, s, 1, dtype=torch.float32, device="cuda")
+    samples = {n: bshd(_D, torch.float8_e4m3fn) for n in ("q", "k", "v", "o", "do")}
+    samples.update(stats=stats, **{n: bshd(_D, torch.bfloat16) for n in ("dq", "dk", "dv")})
+
+    def api(scale):
+        return SdpaBwdDslSm100D128Fp8(**{"sample_" + n: t for n, t in samples.items()}, is_causal=True, scale_softmax=scale)
+
+    assert api(0.1).check_support()
+    with pytest.raises(NotImplementedError, match="finite and positive"):
+        api(-0.1).check_support()
 
 
 @requires_pre_rubin_blackwell

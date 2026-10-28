@@ -130,5 +130,31 @@ def test_repeated_launches_are_bitwise(sm100_row):
 
 
 @requires_pre_rubin_blackwell
+def test_causal_empty_kv_tiles(sm100_row):
+    sm100_row._run_fp8(b=4, hq=32, sq=256, skv=1024, causal=True, d_v=_DV).check()
+
+
+@requires_pre_rubin_blackwell
+def test_negative_scale_declined_at_check():
+    from cudnn.sdpa.bwd.api_dsl_sm100_d192_fp8 import SdpaBwdDslSm100D192Fp8
+
+    b, h, s = 1, 2, 256
+
+    def bshd(width, dtype):
+        return torch.empty(b, s, h, width, dtype=dtype, device="cuda").permute(0, 2, 1, 3)
+
+    stats = torch.empty(b, h, s, 1, dtype=torch.float32, device="cuda")
+    samples = {n: bshd(_D if n in ("q", "k") else _DV, torch.float8_e4m3fn) for n in ("q", "k", "v", "o", "do")}
+    samples.update(stats=stats, **{n: bshd(_D if n in ("dq", "dk") else _DV, torch.bfloat16) for n in ("dq", "dk", "dv")})
+
+    def api(scale):
+        return SdpaBwdDslSm100D192Fp8(**{"sample_" + n: t for n, t in samples.items()}, is_causal=True, scale_softmax=scale)
+
+    assert api(0.1).check_support()
+    with pytest.raises(NotImplementedError, match="finite and positive"):
+        api(-0.1).check_support()
+
+
+@requires_pre_rubin_blackwell
 def test_explicit_attn_scale(sm100_row):
     sm100_row._run_fp8(b=1, hq=2, sq=384, skv=512, causal=True, attn_scale=0.5 / math.sqrt(_D), d_v=_DV).check()

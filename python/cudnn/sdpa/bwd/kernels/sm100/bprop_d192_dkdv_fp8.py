@@ -1037,7 +1037,7 @@ def _mma_loop(
         prev_qt = qt_state
         prev_do = do_state
         prev_ring = ring
-        for r in cutlass.range(0, ratio, 1, unroll=1):
+        for _ in cutlass.range(0, ratio, 1, unroll=1):
             for qtile in cutlass.range(lo, hi, 1, unroll=1):
                 q_next = advance(q_state, CFG.Q_STAGES)
                 _wait_tcgen(bars.do_full[do_state.idx], do_state.phase)
@@ -1122,8 +1122,9 @@ def _load_loop(
     while valid != 0:
         _credit(bars.sched_empty[sched_state.idx])
         lo, hi = _bounds(block, sq, causal)
+        _wait(bars.k_empty, kv_state.phase)
+        kv_state = advance(kv_state, 1)
         if lo < hi:
-            _wait(bars.k_empty, kv_state.phase)
             bars.k_full.arrive(n_bytes=CFG.K_TX, pred=nvvm.elect_sync())
             tma_load_tile(
                 _operand(slab, CFG.K, FP8, CFG.M, CFG.DQK, swz=CFG.QK_SWZ),
@@ -1136,7 +1137,6 @@ def _load_loop(
             tma_load_tile(_operand(slab, CFG.V, FP8, CFG.M, CFG.DV, swz=CFG.V_SWZ), GmemTileTma(v_desc)(0, block * CFG.M, head, batch), bars.v_full.smem_ptr)
             if cutlass.const_expr(MX):
                 tma_load_tile(_sf_tile(slab, CFG.SF_V, CFG.SF_V_BYTES), GmemTileTma(sf_v_desc)(0, 0, block, head, batch), bars.v_full.smem_ptr)
-            kv_state = advance(kv_state, 1)
         for r in cutlass.range(0, ratio, 1, unroll=1):
             hq = head * ratio + r
             for qtile in cutlass.range(lo, hi, 1, unroll=1):

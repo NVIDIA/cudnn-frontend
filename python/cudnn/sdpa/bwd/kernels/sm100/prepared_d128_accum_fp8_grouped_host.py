@@ -13,7 +13,7 @@ from cudnn.sdpa.bwd.d128_contract import ABI_VERSION
 from cudnn.sdpa.bwd.kernels.sm100.bprop_d128_accum_fp8 import host as accumulation_host
 from cudnn.sdpa.bwd.kernels.sm100.bprop_d128_fp8_grouped_helpers import fold_dkv_fp8_host
 from cudnn.sdpa.bwd.kernels.sm100.bprop_d128_fp8_helpers import cast_dq_fp8_host, delta_zero_fp8_host
-from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_accum_fp8_host import FP8_AMAX, FP8_SCALARS, _optional_view, _view
+from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_accum_fp8_host import FP8_SCALARS, _optional_view, _view
 from cudnn.frost.template_loader import load_template
 
 HEAD_DIM = globals().get("FROST_TEMPLATE_PARAMS", 128)
@@ -125,7 +125,7 @@ def compile_host(geometry, regions, grad_dtype, causal, sm, amax_requested, rati
     global accumulation_host, cast_dq_fp8_host, delta_zero_fp8_host
     head_dim = geometry[0][0][3]
     if head_dim == 64 and HEAD_DIM != 64:
-        module = load_template(__file__, 64, tag="sdpa_bwd_d64_fp8_grouped_host")
+        module = load_template(__file__, 64, tag=f"sdpa_bwd_d64_fp8_grouped_host_w{int(window)}", extra_key=int(window))
         return module.compile_host(geometry, regions, grad_dtype, causal, sm, amax_requested, ratio, window)
     if head_dim != HEAD_DIM:
         raise ValueError("prepared fp8 accumulation head dimension does not match the kernel specialization")

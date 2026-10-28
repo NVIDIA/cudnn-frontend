@@ -134,5 +134,10 @@ def test_d192_accumulation(dt, sq, sk, causal):
 
 
 @requires_pre_rubin_blackwell
+def test_d192_causal_empty_kv_tiles():
+    _run(torch.bfloat16, 256, 1024, True, b=4, h=32)
+
+
+@requires_pre_rubin_blackwell
 def test_d192_replay():
     _run(torch.bfloat16, 640, 640, True, replay=True)

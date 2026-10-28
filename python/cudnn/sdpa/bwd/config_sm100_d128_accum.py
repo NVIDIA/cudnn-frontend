@@ -99,8 +99,8 @@ def make_config(d: int) -> Config:
         DQ_SLICES=dq_slices,
         DO_SUBTILES=d // 64,
         D_HALF=d // 2,
-        DV_COL=512 - 2 * d,
-        DK_COL=512 - d,
+        DV_COL=256,
+        DK_COL=256 + d,
         DKV_ACC_SLICES=d // 32,
     )
 
@@ -186,7 +186,7 @@ def validate_config(cfg: Config = CFG, bar_layout=None):
     assert (cfg.BPE_ACC, cfg.D_HALF, cfg.DKV_ACC_SLICES, cfg.DKV_ACC_SLICE_BYTES) == (4, cfg.D // 2, cfg.D // cfg.DQ_BOX, cfg.M * cfg.DQ_BOX * cfg.BPE_ACC)
     assert cfg.DKV_ACC_SLICE_BYTES == cfg.SLICE_BYTES and cfg.DKV_ACC_SLICES * cfg.DKV_ACC_SLICE_BYTES == 2 * cfg.OPERAND_BYTES == cfg.M * cfg.D * cfg.BPE_ACC
     assert [cfg.dkv_acc_slot(i) for i in range(cfg.DKV_ACC_SLICES)] == [cfg.ALIAS + i * cfg.SLICE_BYTES for i in range(cfg.DKV_ACC_SLICES)]
-    assert cfg.DV_COL + cfg.D == cfg.DK_COL and cfg.DK_COL + cfg.D == cfg.TMEM_COLS and cfg.D_HALF * 2 == cfg.D
+    assert cfg.DV_COL + cfg.D == cfg.DK_COL and cfg.DK_COL + cfg.D <= cfg.TMEM_COLS and cfg.D_HALF * 2 == cfg.D
     if cfg.D == 128:
         assert cfg.SCHED_PAYLOAD + 64 == 230880 and (230880 + 1023) // 1024 * 1024 == cfg.SMEM_BYTES
         assert cfg.DKV_ACC_SLICES == next(item[2] for item in bar_layout if item[0] == "dq_empty")  # one ring slot per slice

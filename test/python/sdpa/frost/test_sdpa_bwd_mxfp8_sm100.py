@@ -503,6 +503,11 @@ def test_causal_gqa_d192x128():
 
 
 @pytest.mark.L0
+def test_causal_empty_kv_tiles_d192x128():
+    _run(d=192, dv=128, b=4, hq=32, hkv=8, sq=256, skv=1024, causal=True)
+
+
+@pytest.mark.L0
 def test_ragged_tails_d192x128():
     _run(d=192, dv=128, hq=2, hkv=1, sq=200, skv=160)
 
