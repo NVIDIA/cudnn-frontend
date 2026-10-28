@@ -1349,9 +1349,11 @@ def test_ragged_q_leg_predicate_and_heuristics():
         _ragged_paged_facts(cu_seq_kv_t=object()),  # the cu form is not plumbed on the dense kernel
     ):
         assert not _thd_decode_leg(caps, off), off
-    # Rubin has no decode tile: its row's capabilities (sm 107) never admit the leg.
-    rubin = [s for s in specs if s.capabilities.sm_lo == 107 and not (s.capabilities.is_fp8 or s.capabilities.is_mxfp8)]
-    assert rubin and all(not _thd_decode_leg(s.capabilities, leg) for s in rubin)
+    rubin = next(spec for spec in specs if spec.name == "sdpa_fwd_prefill_sm107")
+    rubin_leg = _ragged_paged_facts(device_cc=(10, 7))
+    assert _thd_decode_leg(rubin.capabilities, rubin_leg)
+    assert not _thd_decode_leg(rubin.capabilities, _ragged_paged_facts(device_cc=(10, 7), s_q=2))
+    assert engines.mismatch(rubin.capabilities, rubin_leg, engines.SdpaFwdKnobs(cga=1, split_kv=2, pack_gqa=True)) is None
     plans = _plans(leg)
     assert plans and all(p.knobs.cga == 1 for p in plans), [p.knobs for p in plans]
     assert all(p.knobs.split_kv >= 2 for p in plans), "the ragged final rows exist only through the combine"
