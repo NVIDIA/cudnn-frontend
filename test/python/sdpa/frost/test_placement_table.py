@@ -54,6 +54,7 @@ def test_entries_are_well_formed_and_name_known_rows():
         assert isinstance(kv_aligned, bool)
         assert entry.direction in ("always", "never", "ge", "le") and entry.study
         assert (entry.log2_work is None) == (entry.direction in ("always", "never"))
+        assert entry.feature in pt.FEATURES
 
 
 @pytest.mark.L0
@@ -101,3 +102,16 @@ def test_kv_off_the_tile_is_its_own_class():
     row = "sdpa_fwd_prefill_sm100"
     assert pt.lookup(row, _facts(s_kv=8192)) is not None
     assert pt.lookup(row, _facts(s_kv=8191)) is None
+
+
+@pytest.mark.L0
+def test_off_tile_dense_d256_decode_reads_parallel_tiles():
+    """Off the KV tile FROST cannot split, so dense d256 decode follows the parallel tiles (b * h_kv), not the cost: the
+    generated entry thresholds on "tiles" and is indifferent to S_kv."""
+    row = "sdpa_fwd_prefill_sm100"
+    d256 = dict(d_qk=256, d_v=256, has_paged_kv=False, h_q=16, h_kv=1)
+    entry = pt.TABLE[pt.class_key(row, _facts(s_kv=8191, b=1, **d256))]
+    assert entry.feature == "tiles"
+    for s_kv in (2049, 32769, 131071):
+        assert pt.lookup(row, _facts(s_kv=s_kv, b=16, **d256)) is False
+        assert pt.lookup(row, _facts(s_kv=s_kv, b=64, **d256)) is True

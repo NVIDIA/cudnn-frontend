@@ -130,8 +130,29 @@ def main():
         f = to_facts(d["cudnn"]["case"], s)
         key = pt.class_key(s["row"], f)
         if key is not None:
-            by[key].append((pt.log2_work(f), d["cudnn_oss"]["ms"] / d["cudnn"]["ms"]))
-    table = {k: fit(v, args.margin) for k, v in by.items()}
+            by[key].append((f, d["cudnn_oss"]["ms"] / d["cudnn"]["ms"], d["cudnn"]["ms"], d["cudnn_oss"]["ms"]))
+
+    def class_regret(pts, feat, rule):
+        direction, t = rule
+        out = []
+        for f, _, b, fr in pts:
+            lead = direction == "always" or (direction == "ge" and pt.FEATURES[feat](f) >= t) or (direction == "le" and pt.FEATURES[feat](f) <= t)
+            out.append((fr if lead else b) / min(b, fr))
+        return sum(map(math.log, out)) / len(out), max(out)
+
+    # Per class, fit every feature and keep the one with the lowest training regret (geo, then max); "cost" wins ties.
+    table, feature_of = {}, {}
+    for k, pts in by.items():
+        best = None
+        for feat in pt.FEATURES:
+            rule = fit([(pt.FEATURES[feat](f), r) for f, r, _, _ in pts], args.margin)
+            if rule[0] == "non-monotone":
+                continue
+            score = class_regret(pts, feat, rule)
+            if best is None or score < best[0]:
+                best = (score, feat, rule)
+        table[k] = best[2] if best else ("non-monotone", None)
+        feature_of[k] = best[1] if best else "cost"
 
     def pick(case):
         """True / False for a class with an entry; None where the runtime falls back to the hand-written rules."""
@@ -142,14 +163,14 @@ def main():
             return None
         if direction in ("never", "always"):
             return direction == "always"
-        w = pt.log2_work(f)
+        w = pt.FEATURES[feature_of[key]](f)
         return w >= t if direction == "ge" else w <= t
 
     g = lambda xs: math.exp(sum(map(math.log, xs)) / len(xs))
     print(f"study {s['id']}: {len(train)} train / {len(hold)} holdout cases, {len(table)} classes")
     for k, (direction, t) in sorted(table.items(), key=lambda kv: str(kv[0])):
         n = len(by[k])
-        print(f"  {k[3:]}  n={n:3d}  {direction}" + ("" if t is None else f" {t:.2f}"))
+        print(f"  {k[3:]}  n={n:3d}  {direction}" + ("" if t is None else f" {t:.2f} on {feature_of[k]}"))
     # A case whose class has no entry is scored by what the runtime does there -- the hand-written fallback, i.e. the
     # measured default leg (``cudnn_auto``); without that leg it is left unscored and counted.
     for label, rows in (("train", train), ("holdout", hold)):
@@ -178,7 +199,8 @@ def main():
         print(f"\n    # study {s['id']}")
         for k, (direction, t) in sorted(table.items(), key=lambda kv: str(kv[0])):
             if direction != "non-monotone":
-                print(f"    {k!r}: Entry({direction!r}, {t!r}, {s['id']!r}),")
+                feat = "" if t is None or feature_of[k] == "cost" else f", {feature_of[k]!r}"
+                print(f"    {k!r}: Entry({direction!r}, {t!r}, {s['id']!r}{feat}),")
     return 1 if bad else 0
 
 

@@ -5,7 +5,8 @@
 
 A class is read off the graph facts (row, device, dtype, head pair, phase, layout, mask, sink, MHA vs GQA, S_kv on
 the 128-key tile). Each entry
-is a monotone rule on ONE work scalar, :func:`log2_work` (a roofline-shaped cost proxy): ``always``, ``never``, ``ge T`` (FROST leads
+is a monotone rule on ONE scalar from :data:`FEATURES` -- the roofline-shaped cost proxy :func:`log2_work` or the
+parallel-tile count :func:`log2_tiles`, whichever the class's data is monotone in: ``always``, ``never``, ``ge T`` (FROST leads
 from T up) or ``le T`` (FROST leads up to T). Entries are produced by ``benchmark/placement_gen`` from a training grid
 and qualified on a frozen holdout; every entry names its study. Do not edit entries by hand -- regenerate.
 
@@ -23,8 +24,9 @@ import cudnn
 
 class Entry(NamedTuple):
     direction: str  # "always" | "never" | "ge" | "le"
-    log2_work: Optional[float]  # the threshold for "ge" / "le"
+    log2_work: Optional[float]  # the threshold for "ge" / "le", in the entry's feature
     study: str  # the frozen study that produced it (grid + holdout hashes live in its record)
+    feature: str = "cost"  # which scalar the threshold reads: a key of FEATURES
 
 
 def _dtype_name(dtype) -> Optional[str]:
@@ -97,6 +99,16 @@ def log2_work(facts) -> float:
     return math.log2(max(1.0, flops / COST_BALANCE, nbytes))
 
 
+def log2_tiles(facts) -> float:
+    """log2 of the grid's parallel tiles before any KV split: b * h_kv * ceil(s_q * G / 128) (packed Q rows per KV head)."""
+    group = max(1, facts.h_q // max(1, facts.h_kv))
+    return math.log2(max(1, facts.b * facts.h_kv * -(-facts.s_q * group // 128)))
+
+
+FEATURES = {"cost": log2_work, "tiles": log2_tiles}
+"""The scalars a class may be thresholded on; the generator picks, per class, the one its data is monotone in."""
+
+
 def lookup(row: str, facts) -> Optional[bool]:
     key = class_key(row, facts)
     entry = TABLE.get(key) if key is not None else None
@@ -104,13 +116,20 @@ def lookup(row: str, facts) -> Optional[bool]:
         return None
     if entry.direction in ("always", "never"):
         return entry.direction == "always"
-    w = log2_work(facts)
+    w = FEATURES[entry.feature](facts)
     return w >= entry.log2_work if entry.direction == "ge" else w <= entry.log2_work
 
 
 # ---------------------------------------------------------------------------------------------------------------- generated
 # benchmark/placement_gen/gen.py --emit; one block per study, keys sorted. Do not edit by hand.
 TABLE: Dict[Tuple, Entry] = {
+    # study sm100_d256_decode_v2_20261028 (full-power B200, cuDNN 9.28.0.38; frozen 200 on-tile + 200 off-tile grid, 40-case holdout)
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "dense", "none", False, "gqa", False): Entry(
+        "ge", 5.5, "sm100_d256_decode_v2_20261028", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "dense", "none", False, "gqa", True): Entry("ge", 26.001, "sm100_d256_decode_v2_20261028"),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", False): Entry("ge", 24.532, "sm100_d256_decode_v2_20261028"),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", True): Entry("ge", 26.002, "sm100_d256_decode_v2_20261028"),
     # study sm100_d576_decode_20261027 (full-power B200, cuDNN 9.28.0.38; frozen 128-case grid, 40-case holdout)
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "mtp", "paged", "causal_br", False, "gqa", True): Entry(
         "always", None, "sm100_d576_decode_20261027"
