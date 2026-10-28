@@ -979,17 +979,19 @@ with fp16 operands (`k * 2^-g` overflows). Both lie inside the documented gate r
   and operand packing through the `@cute.jit` stages in `common/gdn2_operands.py`. The rolled FP32
   backward scan retains its local load/store schedule. Read exchange scales before releasing a raw
   stage; register-only packing may follow that release. `encode_gate_exchange` accepts log2 prefixes
-  only, and returns exponentials or exact token logs according to the channel ballot. Size scratch
-  with `common/steep_scratch.py` for both separate forward arrays and backward bank-fill regions;
-  check bank-fill capacity before compilation.
+  only, and returns exponentials or exact token logs according to the channel ballot. The forward kernels
+  declare the steep scratch arrays from their cfg cosizes; the backward kernels carve it from the bank fill
+  at cfg byte offsets and assert the capacity in `build_cfg`.
 - Range tests must vary state-gradient magnitude independently of gate magnitude. A large finite
   FP32 seed, or a carry accumulated from finite FP16 output gradients, can overflow an undecayed
   FP16 state operand even when the decayed carry and all returned gradients fit. The large-seed
-  and large-carry regressions in `test_gdn2_frost_steep_decay.py` cover both backward implementations.
+  and large-carry regressions in the steep section of `linear_attention/test_la.py` cover both backward
+  implementations.
 - Keep steep state gradients and bounded key operands in FP32 through their projections
   (`common/gdn2_state_grad.py`). Narrowing a bounded key first can erase a term that becomes
   representable after multiplication by the state gradient. The caller-owned per-CTA workspace
-  uses `state_gradient_scratch_layout`; state publication uses `mb_dstate_input_ready`, and the
+  is sized by the kernel cfg's `dstate_scratch_cosize` (an fp32 state plus the bounded-key ring); state
+  publication uses `mb_dstate_input_ready`, and the
   key ring uses `mb_k_decay_inv_ready` / `mb_decay_done`. Scalar readers acquire these
   thread-produced barriers directly, including `mb_u_smem_ready` for restored dK; tensor-core
   completion only orders the async tensor-core operations. Full backward's
@@ -1008,20 +1010,18 @@ with fp16 operands (`k * 2^-g` overflows). Both lie inside the documented gate r
   alias them later. A forward graph without a final-state output cannot overwrite its seeds;
   indexed input pools in such graphs need no snapshot.
 
-Detectors, all in `linear_attention/test_gdn2_frost_steep_decay.py`: `test_fwd_bwd_steep_channel_decay`
-(and its fp16 twin), `test_fp16_inverse_range_without_normalization`,
-`test_multiple_steep_channels_are_repeatable`, `test_forward_state_alias_after_graph_warmup`,
+Detectors, all in the steep section of `linear_attention/test_la.py`: `test_steep_channel_decay_fwd_bwd`
+(and `test_steep_channel_decay_fp16`), `test_steep_fp16_inverse_range_without_normalization`,
+`test_steep_multiple_channels_repeatable`, `test_steep_forward_state_alias_after_graph_warmup`,
 `test_steep_channel_decay_overwrite_initial_state`, `test_steep_channel_decay_backward_overwrite_initial_state`,
-`test_read_only_state_pool_needs_no_snapshot`, `test_strided_state_overwrite` and
-`test_steep_summary_matches_reference`. Scratch bounds are checked by
-`linear_attention/test_gdn2_frost_steep_scratch.py`; `test_steep_schedule_geometry` checks schedule case
-selection across SM counts without changing the kernel launch limits.
+`test_steep_read_only_state_pool`, `test_steep_strided_state_overwrite` and
+`test_steep_summary_matches_reference`. Scratch bounds are asserted in each kernel's `build_cfg`.
 
 State snapshots preserve both the source dtype and its element width. The snapshot
 kernel copies raw bytes and does not convert FP16 to FP32. Exercise every accepted
 state dtype with forward and backward aliasing, padded storage, and changed-state
-CUDA-graph replay. The overwrite and replay cases in
-`linear_attention/test_gdn2_frost_steep_decay.py` cover these paths.
+CUDA-graph replay. The overwrite and replay cases in the steep section of
+`linear_attention/test_la.py` cover these paths.
 
 Pairing sparse queries requires per-query masking before dQ arithmetic when a
 key is nonfinite: a key valid for one query can be masked for its neighbor,
