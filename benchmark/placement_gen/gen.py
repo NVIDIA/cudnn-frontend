@@ -10,9 +10,10 @@ study drivers (one record per (case, leg) with ``ms``, ``plan``, ``case``). Each
 classified with ``cudnn.sdpa.placement_table.class_key`` -- the same code the runtime uses -- so a fitted class is
 exactly the class a graph looks up.
 
-Per class the fit is monotone in ``log2_work``: ``always`` (FROST never loses beyond the margin), ``never`` (it never
-wins), or a threshold halfway between the last training loss and the first win past it, in the direction that keeps more
-wins. A class whose
+Per class, every scalar in ``placement_table.FEATURES`` is fit monotonically: ``always`` (FROST never loses beyond the
+margin), ``never`` (it never wins), or a threshold halfway between the last training loss and the first win past it, in
+the direction that keeps more wins. The feature with the lowest training regret is kept and recorded in the entry; the
+frozen holdout, run once at the frozen head, remains the independent qualification. A class whose
 wins and losses interleave so that neither direction keeps a win is reported as NON-MONOTONE and gets no entry: split
 the class (add a key field) rather than fitting around it.
 """

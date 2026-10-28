@@ -46,12 +46,12 @@ def test_entries_are_well_formed_and_name_known_rows():
 
     rows = {s.name for s in FWD} | {s.name for s in BWD}
     for key, entry in pt.TABLE.items():
-        row, cc, dtype, heads, phase, layout, mask, sink, group, kv_aligned = key
+        row, cc, dtype, heads, phase, layout, mask, sink, group, split_blocked = key
         assert row in rows, key
         assert isinstance(cc, tuple) and len(cc) == 2 and dtype in ("bf16", "f16") and len(heads) == 2
         assert phase in ("q1", "mtp", "prefill") and layout in ("dense", "paged", "thd", "thd_ragged")
         assert mask in ("none", "window", "causal_br", "causal_tl") and isinstance(sink, bool) and group in ("mha", "gqa")
-        assert isinstance(kv_aligned, bool)
+        assert isinstance(split_blocked, bool) and not (split_blocked and layout == "paged")
         assert entry.direction in ("always", "never", "ge", "le") and entry.study
         assert (entry.log2_work is None) == (entry.direction in ("always", "never"))
         assert entry.feature in pt.FEATURES
@@ -96,12 +96,16 @@ def test_cost_proxy_is_byte_bound_for_decode_and_flop_bound_for_prefill():
 
 
 @pytest.mark.L0
-def test_kv_off_the_tile_is_its_own_class():
-    """S_kv off the 128-key tile disables split-KV, so a study measured on the tile never answers for it (an off-tile d256
-    decode was 11-13x slower on FROST, which the aligned grid could not see)."""
+def test_dense_kv_off_the_tile_is_its_own_class_paged_is_not():
+    """A dense S_kv off the 128-key tile cannot split KV (an off-tile dense d256 decode was 11-13x slower on FROST, which
+    an on-tile grid cannot see), so it is a separate class; paged KV splits at any logical maximum and keeps its class
+    (review on #1957: an off-tile paged D576 decode lost its FROST split route to the backend)."""
     row = "sdpa_fwd_prefill_sm100"
-    assert pt.lookup(row, _facts(s_kv=8192)) is not None
-    assert pt.lookup(row, _facts(s_kv=8191)) is None
+    assert pt.class_key(row, _facts(s_kv=8191))[-1] is False  # paged
+    assert pt.lookup(row, _facts(s_kv=49151, h_q=16, b=1)) == pt.lookup(row, _facts(s_kv=49152, h_q=16, b=1))
+    dense = dict(has_paged_kv=False, d_qk=256, d_v=256, h_q=16)
+    assert pt.class_key(row, _facts(s_kv=8191, **dense))[-1] is True
+    assert pt.class_key(row, _facts(s_kv=8192, **dense))[-1] is False
 
 
 @pytest.mark.L0

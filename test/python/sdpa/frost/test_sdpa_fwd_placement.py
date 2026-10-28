@@ -199,7 +199,7 @@ def test_paged_d576_mla_decode_leads_past_its_work_floor():
 
     spec = next(spec for spec in ENGINE_SPECS if spec.name == _SM100)
     mla = dict(d_qk=576, d_v=512, h_kv=1, has_paged_kv=True, padded=True, page_size=64, causal=False, bottom_right=False)
-    entry = placement_table.TABLE[(_SM100, (10, 0), "bf16", (576, 512), "q1", "paged", "none", False, "gqa", True)]
+    entry = placement_table.TABLE[(_SM100, (10, 0), "bf16", (576, 512), "q1", "paged", "none", False, "gqa", False)]
     assert entry.direction == "ge"
     for h_q in (16, 32, 64, 128):
         for b in (1, 8, 32, 128):

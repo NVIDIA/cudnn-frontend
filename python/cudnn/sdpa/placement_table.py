@@ -124,16 +124,15 @@ def lookup(row: str, facts) -> Optional[bool]:
 # ---------------------------------------------------------------------------------------------------------------- generated
 # benchmark/placement_gen/gen.py --emit; one block per study, keys sorted. Do not edit by hand.
 TABLE: Dict[Tuple, Entry] = {
-    # study sm100_d256_decode_v2_20261028 (full-power B200, cuDNN 9.28.0.38; frozen 200 on-tile + 200 off-tile grid, 40-case holdout)
-    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "dense", "none", False, "gqa", False): Entry(
+    # study sm100_d256_decode_v2_20261028 (full-power B200, cuDNN 9.28.0.38; frozen 200 on-tile + 200 off-tile grid)
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "dense", "none", False, "gqa", False): Entry("ge", 26.001, "sm100_d256_decode_v2_20261028"),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "dense", "none", False, "gqa", True): Entry(
         "ge", 5.5, "sm100_d256_decode_v2_20261028", "tiles"
     ),
-    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "dense", "none", False, "gqa", True): Entry("ge", 26.001, "sm100_d256_decode_v2_20261028"),
-    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", False): Entry("ge", 24.532, "sm100_d256_decode_v2_20261028"),
-    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", True): Entry("ge", 26.002, "sm100_d256_decode_v2_20261028"),
-    # study sm100_d576_decode_20261027 (full-power B200, cuDNN 9.28.0.38; frozen 128-case grid, 40-case holdout)
-    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "mtp", "paged", "causal_br", False, "gqa", True): Entry(
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", False): Entry("ge", 26.002, "sm100_d256_decode_v2_20261028"),
+    # study sm100_d576_decode_20261027 (full-power B200, cuDNN 9.28.0.38; frozen 128-case grid)
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "mtp", "paged", "causal_br", False, "gqa", False): Entry(
         "always", None, "sm100_d576_decode_20261027"
     ),
-    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "q1", "paged", "none", False, "gqa", True): Entry("ge", 26.588, "sm100_d576_decode_20261027"),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "q1", "paged", "none", False, "gqa", False): Entry("ge", 26.588, "sm100_d576_decode_20261027"),
 }

@@ -10,13 +10,14 @@
    - head pair defaults (`d_qk`, `d_v`), an optional `layout` default;
    - the `train` / `holdout` JSONL paths.
 2. **Sweep on the target part.** Run the `cudnn` (backend only), `cudnn_oss` (FROST first) and `cudnn_auto` (default dispatch) legs. Write one JSON line per (case, leg) with `ms`, `plan` and the `case` dict. Use a full-power board, and record co-tenant GPU processes at start and end.
-3. **Fit:** `python benchmark/placement_gen/gen.py study.json`. Every case becomes graph facts, classified with `placement_table.class_key`, the same code the runtime uses. Per class the fit is:
+3. **Fit:** `python benchmark/placement_gen/gen.py study.json`. Every case becomes graph facts, classified with `placement_table.class_key`, the same code the runtime uses. Per class, every scalar in `placement_table.FEATURES` is fit (today: `cost`, the roofline proxy, and `tiles`, the parallel tiles before a KV split). Each fit is:
    - `always`;
    - `never`;
-   - or one threshold on `log2_work` halfway between the last training loss and the first win past it, in the direction that keeps more wins.
+   - or one threshold halfway between the last training loss and the first win past it, in the direction that keeps more wins.
 
-   Cells within `--margin` of parity (default 3%) never move a threshold. A **NON-MONOTONE** class gets no entry; refine the class key instead.
-4. **Score.** The tool prints generated vs measured-default vs backend-only regret on train and holdout. The holdout must show no case where the generated choice is slower than the measured default beyond noise.
-5. **Emit:** `gen.py study.json --emit` prints the entries. Paste them as one block under a comment naming the study, part, cuDNN version and case counts.
+   The feature with the lowest training regret is kept and recorded in the entry. Cells within `--margin` of parity (default 3%) never move a threshold. A class that no feature can split monotonically is **NON-MONOTONE** and gets no entry; refine the class key instead.
+4. **Qualify on the frozen holdout, once, at the frozen head.** The holdout must exercise every class the entries cover (on- and off-tile S_kv, every layout), was never used to fit or to choose a feature or constant, and is consumed by the run.
+5. **Score.** The tool prints generated vs measured-default vs backend-only regret on train and holdout. The holdout must show no case where the generated choice is slower than the measured default beyond noise.
+6. **Emit:** `gen.py study.json --emit` prints the entries. Paste them as one block under a comment naming the study, part, cuDNN version and case counts.
 
 Entries carry the study id. Re-run the study when a kernel change touches the row's capabilities.
