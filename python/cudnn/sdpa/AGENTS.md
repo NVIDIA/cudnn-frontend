@@ -87,6 +87,11 @@ The D128 nonpaged split cases in `test_sdpa_fwd_thd_origins.py` poison the gaps
 and rebind all pitches; mixed FP8 KV repeats them in
 `test_sdpa_fwd_mixed_kv_sm100.py`. Sequence-local K/V maps clip each live segment,
 so interior NaN padding cannot enter a tile tail.
+The physical-origin binding must be enabled for every supported architecture
+and layout, not just its paged path. Assert the prepared THD spec contains
+`origin_specs` when the graph declares offsets. The SM107 `TestMixedFp8Kv`
+THD cases cover mixed KV and uniform half, packed and unpacked, with poisoned
+gaps, independent port origins, rebinding, and changed-length replay.
 
 For single-Q ragged split decode, physical Q-offset differences can include
 storage gaps. The combine must use the declared device Q lengths (ordinary or
@@ -1362,3 +1367,10 @@ consistent; V's descriptor stride follows V, not Q/K. The host detector
 `MmaDesc`'s independently derived contraction/transpose geometry. Whole-backward
 native numerical and replay tests remain necessary; compilation alone misses
 these wrong-address walks.
+
+Physical THD origin forwarding must cover every admitted CGA, including unsplit
+nonpaged paths. A CGA2 replay does not validate CGA1 lowering: the kernel can
+accept the plan while missing origin specs silently select compact prefixes.
+`TestMixedFp8Kv.test_thd_cga1_origins` pins CGA1 for uniform and mixed KV, asserts
+prepared origin specs before launch, and checks gapped inputs/output canaries
+under changed bindings and retained replay.
