@@ -159,6 +159,7 @@ def test_zero_attn_scale_claims():
         "sdpa_bwd_sm107_mxfp8",
         "sdpa_bwd_sm100_d256",
         "sdpa_bwd_sm107_d512",
+        "sdpa_bwd_sm107_d192",
     }
 
 
@@ -1113,9 +1114,68 @@ def test_capabilities_positional_prefix_is_append_only():
         "tile_ns_by_d_shape",
         "pack_gqa_requires_divisible",
         "thd_excluded_d_shapes",
-        "band",
     )
-    legacy_order = [n for n in names if n not in appended]
+    legacy_order = (
+        "sm_lo",
+        "sm_hi",
+        "phase",
+        "d_shapes",
+        "d_pad_multiple",
+        "thd_d_shapes",
+        "d_envelope_floors",
+        "dtypes",
+        "is_mxfp8",
+        "is_fp8",
+        "out_dtypes",
+        "o_block_scales",
+        "bias",
+        "dropout",
+        "score_mod",
+        "paged_kv",
+        "alibi",
+        "block_mask",
+        "rng_dump",
+        "score_max",
+        "score_sum_exp",
+        "dynamic_scale",
+        "unfuse_fma",
+        "stats_log2",
+        "seq_q_trim",
+        "right_band_widening",
+        "causal",
+        "bottom_right",
+        "swa",
+        "padded",
+        "sink",
+        "sink_dtypes",
+        "stats",
+        "lse_optional",
+        "thd",
+        "cu_seq_len",
+        "padded_stats",
+        "decode",
+        "single_wave_only",
+        "skv_tail_via_padding",
+        "layouts",
+        "skv_tile",
+        "sched_policies",
+        "tile_ms",
+        "tile_ns",
+        "cgas",
+        "sched_policies_by_d_shape",
+        "cgas_by_d_shape",
+        "split_cgas_by_d_shape",
+        "pack_gqas",
+        "split_kv_supported",
+        "split_d_shapes",
+        "softmax_precisions",
+        "pack_gqa_d_shapes",
+        "thd_padded_stats",
+        "epilogue_gate",
+        "epilogue_gate_d_shapes",
+        "epilogue_gate_dtypes",
+    )
+    assert names[: len(legacy_order)] == list(legacy_order), names
     caps = engines.Capabilities(*[legacy_value(n) for n in legacy_order])
     assert caps.thd_padded_stats is True
     assert caps.pack_gqa_partial_d_shapes is None
@@ -1136,8 +1196,10 @@ def test_capabilities_positional_prefix_is_append_only():
     assert names[start : start + len(legacy_tail)] == legacy_tail, names[start:]
     # ... and every later field is appended after it, in the order it landed (the zero-scale and pre-folded-scale fields,
     # then the resident-bias / kv_mask fields of the Rubin small tiles and their per-shape TILE_N domain, then the PackGQA
-    # divisibility rule; the canonical band set (#601) is the newest and sits at the very end).
-    assert names[start + len(legacy_tail) :] == list(appended), names[start:]
+    # divisibility rule, last). The canonical band set (#601) is appended after every other field and stays the last one.
+    first_appended = start + len(legacy_tail)
+    assert names[first_appended : first_appended + len(appended)] == list(appended), names[start:]
+    assert names[-1] == "band", names[-3:]
 
     # Positional construction in the PRE-BAND order (every row's spelling before the canonical model landed) still binds every
     # field, and the appended band set is DERIVED from those flags rather than shadowing them.  The row built here carries the
@@ -2514,7 +2576,7 @@ def _mk_paged_graph_fp8(*, d=128, page_size=16, max_pages=8, hnd=True, thd=False
 
 def test_paged_fp8_probe_accepts_and_declines():
     """Paged per-tensor FP8 admits native D128/D256 with dense or THD Q.
-    D64 serves dense Q only. Off-contract pages remain declined, and the
+    D64 and aligned D256 envelope heads serve dense Q only. Off-contract pages remain declined, and the
     f16/bf16 row never serves an sdpa_fp8 graph."""
     fp8_name = engines.engine_name(fp8=True)
     for hnd in (True, False):
@@ -2524,14 +2586,19 @@ def test_paged_fp8_probe_accepts_and_declines():
         assert fp8_name in elig and engines.engine_name() not in elig
     assert fp8_name in _eligible(_mk_paged_graph_fp8(d=64)), "d=64 FP8 rides the d128 FP8 envelope"
     assert fp8_name in _eligible(_mk_paged_graph_fp8(page_size=128))
-    for hnd in (True, False):
-        assert fp8_name in _eligible(_mk_paged_graph_fp8(d=256, hnd=hnd))
-    assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=192)), "(192, 192) has no supported kernel envelope"
+    row = next(spec.capabilities for spec in engines.ENGINE_SPECS if spec.name == fp8_name)
+    for d in (192, 224, 256):
+        for hnd in (True, False):
+            graph = _mk_paged_graph_fp8(d=d, hnd=hnd)
+            assert fp8_name in _eligible(graph)
+            assert engines._selected_d_shape(row, _facts(graph)) == (256, 256)
+    assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=225)), "FP8 head widths must be 16-aligned"
     assert fp8_name not in _eligible(_mk_paged_graph_fp8(page_size=48)), "page_size must divide 128 or be a multiple of it"
     for d in (128, 256):
         for hnd in (True, False):
             assert fp8_name in _eligible(_mk_paged_graph_fp8(d=d, hnd=hnd, thd=True))
-    assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=64, thd=True))
+    for d in (64, 192, 224):
+        assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=d, thd=True))
 
 
 def test_paged_quantized_rows_mismatch_reasons():
@@ -2573,16 +2640,16 @@ def test_paged_quantized_rows_mismatch_reasons():
             assert engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True, d_qk=d, d_v=d, device_cc=cc)) is None
     assert "dense-only" in engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True, d_qk=64, d_v=64))
     assert "native per-tensor D128/D256" in engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True, d_qk=512, d_v=512))
-    # Admission follows the selected flavor; D256 is exact, not a D192 envelope.
+    # D192/V192 selects the D256 envelope; D192/V128 selects the unpaged D192 flavor.
     assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=256, d_v=256)) is None
-    assert "no kernel-flavor envelope" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=192))
+    assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=192)) is None
     assert "wired on the d64, d128, d256 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=128))
     for d in (64, 128):
         sink_facts = paged_facts(is_fp8=True, has_sink=True, d_qk=d, d_v=d)
         assert engines.mismatch(fp8, sink_facts) is None
         split_knobs = engines.SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=2)
         assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=d, d_v=d), split_knobs) is None
-        assert "sink-free dense" in engines.mismatch(fp8, sink_facts, split_knobs)
+        assert engines.mismatch(fp8, sink_facts, split_knobs) is None
     # Block-scaled O (#1088) over pools: epilogue and loader are independent, but the pair is not validated.
     assert "block-scaled O" in engines.mismatch(fp8, paged_facts(is_fp8=True, dtype_o=cudnn.data_type.FP8_E4M3, o_block_scale=32))
     assert "block-scaled O" in engines.mismatch(mxfp8, paged_facts(is_mxfp8=True, page_size=128, dtype_o=cudnn.data_type.FP8_E4M3, o_block_scale=32))

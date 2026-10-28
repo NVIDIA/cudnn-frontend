@@ -40,6 +40,8 @@ from cudnn.gemm.frost.tile_helpers import (
     moe_scatter_row,
     moe_combine_add,
     moe_combine_add_vector,
+    moe_combine_stage,
+    moe_combine_bulk,
     tma_scatter4,
     copy_tensormap_to_workspace as _copy_tensormap_to_workspace,
     epi_subtile_spans as _epi_subtile_spans,
@@ -162,6 +164,7 @@ def _kernel(
     # @@INJECT_KERNEL_TMA_C_PARAMS@@
     # @@TMA_STORE_ONLY:END@@
 ) -> None:
+    """Run persistent block-scaled MoE GEMM with the selected output epilogue."""
     # @@INJECT_AB_DESC_LISTS@@
 
     # @@INJECT_MOE_MA_LIST@@
@@ -331,6 +334,14 @@ def _kernel(
         alignment=128,
     )
     # @@TMA_STORE_ONLY:END@@
+
+    if cutlass.const_expr(moe_combine_bulk_enabled):
+        combine_staging = cutlass.Array(
+            cd_dtype,
+            epi_stage_rows * epi_cols_per_mma_m,
+            space=cutlass.AddressSpace.smem,
+            alignment=1024,
+        )
 
     sA_elems = sA_packed_elems
     sB_elems = sB_packed_elems
@@ -811,13 +822,13 @@ def _kernel(
         ]
         sfa_block_bytes = 512 * (((k // block_size) + 3) // 4)
         previous_group_begin = cutlass.Int32(-1)
-        if cutlass.const_expr(moe_aligned_offsets or moe_gather):
+        if cutlass.const_expr(moe_aligned_offsets or moe_gather or moe_combine_fixed_descriptors):
             a_desc_load_list = [tma_a_descs[_ai].get_ptr() for _ai in range(num_a_operands)]
             sfa_desc_load_list = [tma_sfa_descs[_ai].get_ptr() for _ai in range(num_sfa_operands)]
         else:
             a_desc_load_list = a_desc_tma_ptr_list
             sfa_desc_load_list = sfa_desc_tma_ptr_list
-        if elect_one and cutlass.const_expr(not moe_aligned_offsets and not moe_gather):
+        if elect_one and cutlass.const_expr(not moe_aligned_offsets and not moe_gather and not moe_combine_fixed_descriptors):
             for _ai in cutlass.range_constexpr(num_a_operands):
                 _copy_tensormap_to_workspace(tma_a_descs[_ai].get_ptr(), tma_a_desc_smem_list[_ai])
             for _ai in cutlass.range_constexpr(num_sfa_operands):
@@ -855,17 +866,23 @@ def _kernel(
                 else:
                     coord_n_per_cta = tile_n * cgrp_tile_mnk[1] + n_rank * logical_cta_tile_n + pair_member * cta_tile_mnk[1]
                     coord_n_pair = tile_n * cgrp_tile_mnk[1] + n_rank * logical_cta_tile_n
-                if cutlass.const_expr(moe_aligned_offsets or moe_gather):
+                if cutlass.const_expr(moe_combine_fixed_descriptors):
+                    # Only invalid group-tail rows can cross an expert boundary;
+                    # COMBINE discards them before metadata reads and scatter-add.
                     coord_m_desc = group_begin + coord_m_group
+                    sfa_m_block = start_sf_block_m + coord_m_group // 128
+                elif cutlass.const_expr(moe_aligned_offsets or moe_gather):
+                    coord_m_desc = group_begin + coord_m_group
+                    sfa_m_block = coord_m_desc // 128
                 else:
                     coord_m_desc = coord_m_group
-                sfa_m_block = coord_m_desc // 128
+                    sfa_m_block = coord_m_desc // 128
                 if cutlass.const_expr(cta_group == 1):
                     sfb_n_block = coord_n_per_cta // 128
                 else:
                     sfb_n_block = coord_n_pair // 128
 
-                if group_begin != previous_group_begin and cutlass.const_expr(not moe_aligned_offsets and not moe_gather):
+                if group_begin != previous_group_begin and cutlass.const_expr(not moe_aligned_offsets and not moe_gather and not moe_combine_fixed_descriptors):
                     previous_group_begin = group_begin
                     for _ai in cutlass.range_constexpr(num_a_operands):
                         _fence_tensormap_acquire(a_desc_tma_ptr_list[_ai])
@@ -1906,6 +1923,43 @@ def _kernel(
                                     # @@INJECT_EPILOGUE@@
                         # @@STG_ONLY:END@@
 
+                        if cutlass.const_expr(moe_combine_bulk_enabled):
+                            moe_combine_stage(
+                                combine_staging.data_ptr(tidx * epi_cols_per_mma_m + subtile_col_offset),
+                                c_rmem_vec,
+                                gC_tap_0_ptr,
+                                token_index,
+                                token_ks,
+                                top_k_scores,
+                                row,
+                                group_end,
+                                coord_n_c,
+                                col,
+                                N,
+                                out_stride_m_0,
+                                moe_top_k,
+                                epi_cols_per_mma_m,
+                                subtile_w,
+                                cd_dtype,
+                            )
+
+                    if cutlass.const_expr(moe_combine_bulk_enabled):
+                        moe_combine_bulk(
+                            combine_staging.data_ptr(tidx * epi_cols_per_mma_m),
+                            gC_tap_0_ptr,
+                            token_index,
+                            token_ks,
+                            top_k_scores,
+                            row,
+                            group_end,
+                            coord_n_c,
+                            N,
+                            out_stride_m_0,
+                            moe_top_k,
+                            epi_cols_per_mma_m,
+                            cd_dtype,
+                        )
+
                 # The M-major TMA path loads its accumulator inside the store loop, so its release cannot move up.
                 # @@EPILOGUE_DRAIN:END@@
                 tile_iter += 1
@@ -1936,6 +1990,7 @@ def _host(
     # @@TMA_STORE_ONLY:END@@
     stream: _cuda.CUstream,
 ) -> None:
+    """Bind token and scale tensor maps, then launch grouped block-scale GEMM."""
     # @@INJECT_HOST_AB_LISTS@@
 
     m = problem_size[0]
@@ -2029,6 +2084,12 @@ def _host(
             )
     rest_k = ((k_sym // block_size) + 3) // 4
     rest_m = (m + 127) // 128 + num_groups
+    if cutlass.const_expr(moe_combine_fixed_descriptors):
+        # Match segmented_row_scale_capacity_rows, the runtime SF capacity
+        # contract. A wider descriptor can read past an exact-size SF buffer
+        # when the final group has fewer rows than the TMA box.
+        active_groups = cutlass.min(m, cutlass.Int64(num_groups))
+        rest_m = active_groups + (m - active_groups) // 128
     rest_n = (n + 127) // 128
     tma_sfa_desc_list = []
     for _sfa_op in _sfa_operands:

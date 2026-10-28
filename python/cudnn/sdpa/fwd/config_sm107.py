@@ -192,6 +192,7 @@ __all__ = [
     "SMEM_USABLE_BYTES",
     "SM107_FP8_THD_SHAPES",
     "SM107_FP8_SPLIT_SHAPES",
+    "SM107_FP8_PACK_GQA_SHAPES",
     "SM107_F16_THD_SHAPES",
     "SM107_EPILOGUE_GATE_SHAPES",
     "SM107_SCORE_STATS_SHAPES",
@@ -295,7 +296,15 @@ _O_BLOCK_SCALE_BY_DTYPE = {_DTYPE_O_NVFP4: 16, _DTYPE_O_MXFP8: 32}
 # failed across the per-tensor FP8 THD suite.
 SM107_FP8_THD_SHAPES = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
 # Bodies with FP32 partial stores: shared by factory, admission and prepared workspace.
-SM107_FP8_SPLIT_SHAPES = frozenset({(64, 64), (128, 128), (192, 128)})
+SM107_FP8_SPLIT_SHAPES = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
+# Packing and splitting are separate domains; both graph and adapter read this one.
+SM107_FP8_PACK_GQA_SHAPES = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
+
+
+def supports_fp8_padded_split(d_shape, *, device_cc, pertensor, thd, paged):
+    """Native dense D256/D512 FP8 partials honor runtime Q/KV lengths and tails."""
+    return device_cc == (10, 7) and pertensor and d_shape in ((256, 256), (512, 512)) and not thd and not paged
+
 
 # f16/bf16 flavor names whose kernel body HAS been ported to the FROST
 # setup-kernel contract (the 14-arg build_thd_meta_o_descs_kernel + the 4B+4
@@ -491,6 +500,8 @@ def sm107_f16_tile_width(d_qk: int, d_v: int, *, leg: Optional[str] = None, cga:
 # 128; 256 is refused by _validate_tile_n at two sub-tiles (2 x 256 S columns + the O slots + STATS exceed the 576-column TMEM).
 # The engine row's per-shape knob domain (Capabilities.tile_ns_by_d_shape) and the adapter's check_support read this ONE constant.
 SM107_TILE_NS_BY_D_SHAPE = (((32, 32), frozenset({64, 128})), ((64, 64), frozenset({64, 128})))
+# Per-tensor D64 uses the scalar FP8 P path; its MMA and row-sum tiles also render N64.
+SM107_FP8_TILE_NS_BY_D_SHAPE = (((64, 64), frozenset({64, 128})),)
 # The KV tile width an fp32 ADDITIVE kv_mask vector TOGETHER WITH a bias is served at on the small tiles: 64, and only 64.  The
 # 128-wide rendering of that pair spills on the softmax role (MEASURED, sm_107a, cutlass-dsl 4.8.0: STL / LDL 23 / 27 causal, 15 / 15
 # padded, 16 / 16 at d64 cga2 -- the sixteen 16-byte granules of a 64-column fp32 chunk are 64 registers beside the second chunk's
@@ -1622,7 +1633,7 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     must also be a Capabilities decline — reaching this is an engine-row bug.
 
     ``split_wired`` identifies kernels with both SplitHelpers and FP32
-    partial-output stores: half and per-tensor FP8 D128 and D192/V128. The engine
+    partial-output stores: half and per-tensor FP8 D128/D192, plus per-tensor FP8 D256. The engine
     row and standalone adapter expose the same flavor domain.
 
     ``block_scaled_o_wired`` says whether THIS flavor's kernel carries the
@@ -1630,6 +1641,8 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     kernels (per-tensor FP8 and MXFP8) do; the d192xd128 siblings share the d128
     config family but accept DTYPE_O 0..3 only, so a flavor-name test
     ("d128" in flavor) would let them through to a specialization error."""
+    if k.dtype_kv != -1 and not (flavor == "sm107 d128" and k.dtype_qkv in (_DTYPE_BF16, _DTYPE_FP16) and k.dtype_kv in (_DTYPE_E4M3, _DTYPE_E5M2)):
+        raise ValueError(f"{flavor}: independent FP8 KV storage requires the native SM107 half-input D128 pipeline")
     if k.decode_q_tile:
         # The loader routes a decode_q_tile record to sm107/decode_d256_f16.py
         # (make_cfg_d256_decode at the end of this module); a Rubin prefill template
@@ -1910,6 +1923,7 @@ class CfgD128(_CfgSm107):
     """d_qk = d_v = 128 (the classic 2-warpgroup pipeline)."""
 
     QO_ALIAS: int = 0
+    DTYPE_KV: int = -1
 
 
 @dataclass(frozen=True)
@@ -2001,7 +2015,8 @@ def _validate_dtype_k_step(cfg, flavor: str) -> None:
 def _validate_smem(cfg, flavor: str, *, qo_alias: bool, sf_bytes: int = 0, bias_bytes: int = 0) -> None:
     """The SMEM fit against the Rubin budget (``config_d128_family.validate_smem`` at ``SM107_ARCH``: 320 KiB usable minus the 2 KiB fixed
     overhead; ``sf_bytes`` / ``bias_bytes`` named in the message)."""
-    _validate_smem_shared(cfg, flavor, arch=SM107_ARCH, qo_alias=qo_alias, sf_bytes=sf_bytes, bias_bytes=bias_bytes)
+    kv_copy_bytes = (max(cfg.TILE_N * cfg.TILE_K, cfg.TILE_N * cfg.TILE_O) // cfg.CTA_MMA) if getattr(cfg, "DTYPE_KV", -1) in (_DTYPE_E4M3, _DTYPE_E5M2) else 0
+    _validate_smem_shared(cfg, flavor, arch=SM107_ARCH, qo_alias=qo_alias, sf_bytes=sf_bytes, bias_bytes=bias_bytes, kv_copy_bytes=kv_copy_bytes)
 
 
 def _validate_masks(cfg, flavor: str) -> None:
@@ -2135,12 +2150,15 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
     dtype_o = resolve_dtype_o(params)
     b, b_o = bpe(params.dtype_qkv), bpe(dtype_o)
     o_div = o_pack_div(dtype_o)
-    # TILE_N is a Cfg field (TemplateParams.tile_n): the quantized siblings keep 128 (their SF geometry is tied to the 128-column
+    # TILE_N is a Cfg field (TemplateParams.tile_n): the block-scaled siblings keep 128 (their SF geometry is tied to the 128-column
     # tile), the f16/bf16 small tiles take 64 / 128 (SM107_TILE_NS_BY_D_SHAPE; the 64-wide rendering is trace-compiled and served
     # through the TILE_N knob), and the half D128 rendering takes 64 / 128; 256 is refused by _validate_tile_n.
     tile_n = int(getattr(params, "tile_n", 128))
-    if tile_n != 128 and (params.dtype_qkv <= _DTYPE_E5M2 or tile_k > 128 or (tile_k == 128 and tile_n != 64)):
-        raise ValueError(f"{flavor}: TILE_N = {tile_n} requires a supported half-precision width: D128 permits 64/128; quantized renderings keep 128")
+    pertensor_tile_n = not mxfp8 and params.dtype_qkv <= _DTYPE_E5M2 and tile_n in dict(SM107_FP8_TILE_NS_BY_D_SHAPE).get((tile_k, tile_o), ())
+    if tile_n != 128 and (params.dtype_qkv <= _DTYPE_E5M2 or tile_k > 128 or (tile_k == 128 and tile_n != 64)) and not pertensor_tile_n:
+        raise ValueError(
+            f"{flavor}: TILE_N = {tile_n} requires a supported half-precision width: D128 half and per-tensor FP8 D64 permit 64/128; other quantized renderings keep 128"
+        )
     # The S / P slot count (TemplateParams.s_slots, appended; getattr so a record without the field renders one slot): 2 = the
     # double-buffered S of the f16/bf16 small tiles at TILE_N 64 -- _validate_tile_n pins the couplings (the TMEM fit, the width, the dtype).
     s_slots = int(getattr(params, "s_slots", 1))
@@ -2279,6 +2297,7 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
         TILE_K=tile_k,
         TILE_O=tile_o,
         DTYPE_QKV=params.dtype_qkv,
+        DTYPE_KV=params.dtype_kv,
         DTYPE_O=dtype_o,
         BPE=b,
         BPE_O=b_o,
@@ -2442,7 +2461,15 @@ def _d256_read_tile_arrivers(cta_mma: int) -> int:
 def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     """The cc 10.7 d256 config (per-tensor FP8 or MXFP8): tile geometry, ring depths, warp layout and the SMEM / descriptor-window
     checks for the one-CTA and the 2-CTA-pair builds (``params.cta_mma``); raises with the failing tally on an impossible layout."""
-    _validate_params(flavor, params)
+    split_wired = not mxfp8 and params.dtype_qkv in (_DTYPE_E4M3, _DTYPE_E5M2)
+    _validate_params(flavor, params, split_wired=split_wired)
+    if (params.split_kv or 1) > 1 and params.thd_varlen:
+        raise ValueError(f"{flavor}: per-tensor FP8 split-KV is dense-only")
+    if params.pack_gqa and not mxfp8:
+        if params.thd_varlen:
+            raise ValueError(f"{flavor}: per-tensor FP8 PackGQA is dense-only")
+        if 128 % params.qh_per_kh:
+            raise ValueError(f"{flavor}: PackGQA requires a whole head group dividing TILE_M=128; got {params.qh_per_kh}")
     cta_mma = params.cta_mma
     dtype_o = resolve_dtype_o(params)
     b, b_o = bpe(params.dtype_qkv), bpe(dtype_o)
@@ -2662,7 +2689,18 @@ _D512_READ_TILE_ARRIVERS = (
 
 
 def _make_cfg_d512_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
-    _validate_params(flavor, params)
+    split_wired = not mxfp8 and params.dtype_qkv in (_DTYPE_E4M3, _DTYPE_E5M2)
+    _validate_params(flavor, params, split_wired=split_wired)
+    if (params.split_kv or 1) > 1 and params.thd_varlen:
+        raise ValueError(f"{flavor}: per-tensor FP8 split-KV is dense-only")
+    if not mxfp8 and params.dtype_qkv in (_DTYPE_E4M3, _DTYPE_E5M2):
+        if params.sched_policy not in (None, SCHED_NATURAL, SCHED_LPT):
+            raise ValueError(f"{flavor}: per-tensor FP8 supports NATURAL/LPT schedulers only")
+        if params.pack_gqa:
+            if params.thd_varlen:
+                raise ValueError(f"{flavor}: per-tensor FP8 PackGQA is dense-only")
+            if 128 % params.qh_per_kh:
+                raise ValueError(f"{flavor}: PackGQA requires a whole head group dividing TILE_M=128; got {params.qh_per_kh}")
     if params.cta_mma != _D512_CTA_MMA:
         raise ValueError(f"{flavor}: the role-split pipeline is cga4x1 / CTA_MMA=2 only (got cta_mma={params.cta_mma})")
     dtype_o = resolve_dtype_o(params)
@@ -3930,15 +3968,20 @@ def make_cfg_d256_decode(params: TemplateParams) -> Tuple[CfgD256Decode, TmaIter
 # N_KEYS == 32 (one 32-bit mask word per ROW per sub-tile, 8 blocks per sub-tile), SMEM = 2 x STAGES x N_KEYS x 512 + N_MT x 8192 under the
 # standard carveout, 1 <= SUB_TILES_PER_CTA <= 8 (the body is range_constexpr-unrolled over it), 1 <= S_Q <= 4 (the shared list's bound).
 _LEAN_FLAVOR = "sm107 d256 sparse lean"
-LEAN_SPARSE_N_KEYS = 32  # keys per sub-tile = 8 four-token blocks = one 32-bit valid word
+from cudnn.sdpa.fwd.sparse_tile_rules import (  # noqa: E402 -- the lean host arithmetic's DSL-free home
+    _LEAN_N_TAIL_MAX,
+    LEAN_SPARSE_MAX_SEQLEN_Q,
+    LEAN_SPARSE_MAX_SUB_TILES_PER_CTA,
+    LEAN_SPARSE_N_KEYS,
+    LEAN_SPARSE_SERVED_MAX_S_Q,
+    LEAN_SPARSE_TOPK_MIN,
+    lean_sparse_n_sub,
+    lean_sparse_split,
+)
+
 LEAN_SPARSE_BLOCKS_PER_SUB = LEAN_SPARSE_N_KEYS // _SPARSE_BLOCK_SIZE
 LEAN_SPARSE_THREADS_PER_MT = 128  # four warps per m16 tile: the d-slices of the split-D plan
 LEAN_SPARSE_ROWS_PER_MT = 16  # the m16n8k16 M extent: one m-tile = 16 query rows (token-major: row R = s x G + g)
-LEAN_SPARSE_MAX_SEQLEN_Q = 4  # the serving step's rows per sequence under ONE shared list (the sparse function's own S_q <= 4 bound)
-LEAN_SPARSE_MAX_SUB_TILES_PER_CTA = 8  # the sub-tile loop is unrolled at trace time (cutlass.range_constexpr); the fill rule never exceeds 7 (B 32)
-LEAN_SPARSE_TOPK_MIN = 8  # top_k < 8 is ONE sub-tile = split 1: the tcgen05 tile's cell (the adapter routes it there)
-LEAN_SPARSE_SERVED_MAX_S_Q = LEAN_SPARSE_MAX_SEQLEN_Q  # the step rows per sequence the ROUTE serves on the lean body = the kernel's own S_q bound (4: N_MT = ceil(S_q x G / 16) m16 tiles over ONE gathered sub-tile); the adapter and the heuristics read THIS constant, never a literal
-_LEAN_N_TAIL_MAX = 2  # the S_q <= 4 bound on the appended tail blocks (the same host bound at every S_q, so the S_q axis changes no grid)
 assert 1 <= LEAN_SPARSE_SERVED_MAX_S_Q <= LEAN_SPARSE_MAX_SEQLEN_Q  # the route never serves more rows than the kernel renders (the tripwire)
 _LEAN_S_EXCHANGE_BYTES = 4 * 4 * 32 * 16  # sS[4 warps][4 n-blocks][32 lanes][16 B] = 8 KiB per m-tile
 
@@ -3964,18 +4007,6 @@ def lean_sparse_n_mt(seqlen_q: int, qh_per_kh: int, rows_per_mt: int = LEAN_SPAR
     """The m16 tiles that hold the sequence's ``S_q x G`` query rows (token-major): 1 at S_q 1 / G 12, 2 at S_q 2, 3 at S_q 3..4 (G 12), 4 at
     S_q 4 / G 16, 1 at G 1 (four rows, one per token)."""
     return -(-(int(seqlen_q) * int(qh_per_kh)) // int(rows_per_mt))
-
-
-def lean_sparse_n_sub(top_k: int, block_size: int = _SPARSE_BLOCK_SIZE, n_keys: int = LEAN_SPARSE_N_KEYS) -> int:
-    """The HOST bound on a (sequence, KV head)'s 32-key sub-tiles: ``ceil((top_k + n_tail_max) x block_size / n_keys)`` = 65 at
-    top_k 512 (the device's real ``count + n_tail`` is smaller: the chunks past it are DEAD items that write the combine's identity)."""
-    return -(-(int(top_k) + _LEAN_N_TAIL_MAX) * int(block_size) // int(n_keys))
-
-
-def lean_sparse_split(top_k: int, sub_tiles_per_cta: int) -> int:
-    """The lean tile's split = the chunk count ``ceil(n_sub / k)``: the grid's x extent and the combine's partial count (65 / 33 / 22 / 17 at
-    top_k 512 for k = 1 / 2 / 3 / 4)."""
-    return -(-lean_sparse_n_sub(top_k) // int(sub_tiles_per_cta))
 
 
 def lean_sparse_smem_bytes(stages: int, n_mt: int = 1, n_keys: int = LEAN_SPARSE_N_KEYS, bpe_val: int = 2, d: int = 256) -> int:

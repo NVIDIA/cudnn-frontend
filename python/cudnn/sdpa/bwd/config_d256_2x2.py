@@ -125,6 +125,8 @@ class TemplateParams2x2(TemplateParams):
 
     head_dim_qk: int = 256
     head_dim_v: int = 256
+    # Internal prepared-chain choice; raw stage-2 callers retain the dV/dS ABI.
+    fuse_dk: bool = False
 
 
 @dataclass(frozen=True)
@@ -160,13 +162,16 @@ class CfgBwdD256x2(CfgBwdD256):
     SMEM_CAP: int = SMEM_CAP_BYTES_SM100
     # 0 = the NATURAL MMA order (S(i), dP(i), BMM2(i) per q tile); 1 = the lookahead order (S(i+1) between dP(i) and
     # BMM2(i), the fp8 twin's form).  The body binds its module constant MMA_LOOKAHEAD from this field.  Profile 1
-    # ships NATURAL: measured on B200 (2026-10-01, B=1 H_q=32 H_kv=2 S=8192 bf16, whole backward, clean CUPTI
+    # ships NATURAL at D256: measured on B200 (2026-10-01, B=1 H_q=32 H_kv=2 S=8192 bf16, whole backward, clean CUPTI
     # medians) stage 2 is 3781 us NATURAL vs 4525 us lookahead dense (-16%) and 2020 vs 1974 us causal (+2%); the
     # lookahead's S(i+1) sits in the MMA queue ahead of BMM2(i) and the dV accumulate waits on it every tile.  Profile 2
     # keeps the design's lookahead (unmeasured here: no Rubin board on this box) -- the A/B is the Rubin lane's.
+    # Native D192x128 uses lookahead; its dense path pairs it with two-deep operand rings so S(i+1)'s Q can prefetch
+    # while the current dP/P work proceeds. The THD descriptor-patched pipeline retains compact one-deep operands.
     MMA_LOOKAHEAD: int = 0
     # TMEM columns between sub-block 0's and sub-block 1's regions (profile 2); 0 with one sub-block.
     SUBBLOCK_STRIDE_COLS: int = 0
+    FUSE_DK: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -309,13 +314,21 @@ class TmemLayout2x2:
     USED_COLS: int
     FREE_COLS: int
 
+    @property
+    def dK_BASE(self) -> int:
+        return self.dV_BASE + self.DV_COLS
+
+    @property
+    def DK_COLS(self) -> int:
+        return self.SUB_USED - self.dK_BASE
+
 
 def tmem_layout_2x2(cfg: CfgBwdD256x2) -> TmemLayout2x2:
     s_base = 0
     dp_base = cfg.STAGES_TMEM_S * _S_COLS
     dv_base = 2 * cfg.STAGES_TMEM_S * _S_COLS
     dv_cols = cfg.TILE_O // 2
-    sub_used = dv_base + dv_cols
+    sub_used = dv_base + dv_cols + (cfg.TILE_K // cfg.CTA_MMA if cfg.FUSE_DK else 0)
     sub_stride = sub_used if cfg.KV_SUBBLOCKS > 1 else 0
     used = cfg.KV_SUBBLOCKS * sub_used
     return TmemLayout2x2(
@@ -377,7 +390,14 @@ def smem_layout_2x2(cfg: CfgBwdD256x2) -> Tuple[SmemSlab, ...]:
         [(f"sP[{s}][{p}]", (s * cfg.STAGES_SMEM_P + p) * p_slab) for s in range(cfg.KV_SUBBLOCKS) for p in range(cfg.STAGES_SMEM_P)],
     )
     _push("sStats", cfg.STATS_STAGES * b.STATS_SLOT_ELEMS * 4)
-    _push("sdS", cfg.XFER_STAGES * b.dSBufferElems * cfg.BPE_DS)
+    _push(
+        "sdS",
+        cfg.XFER_STAGES * b.dSBufferElems * cfg.BPE_DS,
+        [(f"sdS_mma[{i}]", i * b.dSBufferElems * cfg.BPE_DS) for i in range(cfg.XFER_STAGES)] if cfg.FUSE_DK else (),
+    )
+    if cfg.FUSE_DK:
+        # Q in the transposed dK view: TILE_N rows by TILE_K / CTA_MMA columns.
+        _push("sQdk", b.qBufferElems * cfg.BPE, [("sQdk", 0)])
     return tuple(slabs)
 
 
@@ -385,8 +405,14 @@ def smem_bytes_2x2(cfg: CfgBwdD256x2) -> int:
     return sum(s.nbytes for s in smem_layout_2x2(cfg))
 
 
+def _scaffold_budget_2x2(cfg: CfgBwdD256x2) -> int:
+    # The fused body declares 576 B of barriers/scheduler/pointer storage;
+    # reserve a full aligned KiB. Other bodies retain their original allowance.
+    return 1024 if cfg.FUSE_DK else SMEM_SCAFFOLD_BYTES
+
+
 def kernel_smem_bytes_2x2(cfg: CfgBwdD256x2) -> int:
-    return smem_bytes_2x2(cfg) + SMEM_SCAFFOLD_BYTES
+    return smem_bytes_2x2(cfg) + _scaffold_budget_2x2(cfg)
 
 
 def desc_roots_2x2(cfg: CfgBwdD256x2) -> Tuple[Tuple[str, int], ...]:
@@ -410,7 +436,9 @@ def mbar_stage_counts_2x2(cfg: CfgBwdD256x2) -> Dict[str, int]:
     replaced by the SMEM ring's ``mb_p_full``).  ADDED: ``mb_s_acc_empty`` (the fp8 twin's), ``mb_p_empty``."""
     n_s = cfg.KV_SUBBLOCKS * cfg.STAGES_TMEM_S
     n_p = cfg.KV_SUBBLOCKS * cfg.STAGES_SMEM_P
+    fused = {"mb_qdk_full": 1, "mb_qdk_empty": 1, "mb_ds_mma_full": cfg.XFER_STAGES, "mb_ds_mma_empty": cfg.XFER_STAGES} if cfg.FUSE_DK else {}
     return {
+        **fused,
         "mb_q_full": cfg.STAGES_Q,
         "mb_q_empty": cfg.STAGES_Q,
         "mb_do_full": cfg.STAGES_dO,
@@ -450,7 +478,9 @@ def mbar_init_counts_2x2(cfg: CfgBwdD256x2) -> Dict[str, int]:
       (256), ``ds_smem_empty`` / ``dv_stg_empty`` the TMA-STG's elected lane (1).
     """
     one, commit, lanes = cfg.ONE_LANE, cfg.MMA_COMMIT_ARRIVES, cfg.SOFTMAX_LANES
+    fused = {"mb_qdk_full": one, "mb_qdk_empty": commit, "mb_ds_mma_full": cfg.SOFT_X_CTA_MMA, "mb_ds_mma_empty": commit} if cfg.FUSE_DK else {}
     return {
+        **fused,
         "mb_q_full": one,
         "mb_q_empty": commit,
         "mb_do_full": one,
@@ -531,11 +561,8 @@ def _validate_cfg_d256_2x2(cfg: CfgBwdD256x2) -> None:
             ),
             (
                 cfg.TILE_N == 128
-                and (
-                    (cfg.TILE_K, cfg.TILE_O) == (256, 256)
-                    or ((cfg.TILE_K, cfg.TILE_O) == (192, 128) and cfg.DATAPATH_2X2_PROFILE == PROFILE_SM100 and not cfg.THD_VARLEN)
-                ),
-                f"{f}: TILE_N = 128 q cols; native D256 or dense SM100 D192x128 required; got {cfg.TILE_N}/{cfg.TILE_K}/{cfg.TILE_O}",
+                and ((cfg.TILE_K, cfg.TILE_O) == (256, 256) or ((cfg.TILE_K, cfg.TILE_O) == (192, 128) and cfg.DATAPATH_2X2_PROFILE == PROFILE_SM100)),
+                f"{f}: TILE_N = 128 q cols; native D256 or SM100 D192x128 required; got {cfg.TILE_N}/{cfg.TILE_K}/{cfg.TILE_O}",
             ),
             (
                 cfg.CGA_M == 2 and cfg.CGA_N == 1 and cfg.CTA_MMA == 2,
@@ -560,6 +587,19 @@ def _validate_cfg_d256_2x2(cfg: CfgBwdD256x2) -> None:
                 f"{f}: L_CNT (the per-sub-block LEADER-scope fan-in) must be the sub-block's compute lanes x CTA_MMA = {(cfg.SOFTMAX_LANES // cfg.KV_SUBBLOCKS) * cfg.CTA_MMA}; got {cfg.L_CNT}",
             ),
             (cfg.MMA_LOOKAHEAD in (0, 1), f"{f}: MMA_LOOKAHEAD is 0 (NATURAL) or 1 (lookahead); got {cfg.MMA_LOOKAHEAD}"),
+        ]
+    )
+    _check(
+        [
+            (cfg.FUSE_DK in (0, 1), f"{f}: FUSE_DK must be 0 or 1"),
+            (
+                not cfg.FUSE_DK or ((cfg.TILE_K, cfg.TILE_O) == (192, 128) and cfg.DATAPATH_2X2_PROFILE == PROFILE_SM100),
+                f"{f}: fused dK requires the native SM100 D192x128 body",
+            ),
+            (
+                not cfg.FUSE_DK or b.kBufferElems * cfg.BPE_O <= cfg.KV_SUBBLOCKS * cfg.STAGES_SMEM_P * b.pSlabElems * cfg.BPE,
+                f"{f}: fused dK staging must fit the dead P ring",
+            ),
         ]
     )
     # --- dtype / k-step --------------------------------------------------------------------------------------------
@@ -678,14 +718,15 @@ def _validate_cfg_d256_2x2(cfg: CfgBwdD256x2) -> None:
     slabs = smem_layout_2x2(cfg)
     used = smem_bytes_2x2(cfg)
     cap = cfg.SMEM_CAP
-    if used + SMEM_SCAFFOLD_BYTES > cap:
+    scaffold_budget = _scaffold_budget_2x2(cfg)
+    if used + scaffold_budget > cap:
         tally = " | ".join(f"{s.name} {s.nbytes // 1024} KiB @{s.offset // 1024}" for s in slabs)
         raise ValueError(
-            f"{f}: SMEM slabs {used // 1024} KiB + {SMEM_SCAFFOLD_BYTES // 1024} KiB scaffolding exceed the {cap // 1024} KiB per-CTA cap of profile {cfg.DATAPATH_2X2_PROFILE} ({tally})"
+            f"{f}: SMEM slabs {used // 1024} KiB + {scaffold_budget // 1024} KiB scaffolding exceed the {cap // 1024} KiB per-CTA cap of profile {cfg.DATAPATH_2X2_PROFILE} ({tally})"
         )
     declared = scaffold_bytes_declared_2x2(cfg)
-    if declared > SMEM_SCAFFOLD_BYTES:
-        raise ValueError(f"{f}: declared scaffolding ({declared} B) exceeds the {SMEM_SCAFFOLD_BYTES} B budget")
+    if declared > scaffold_budget:
+        raise ValueError(f"{f}: declared scaffolding ({declared} B) exceeds the {scaffold_budget} B budget")
     for lbl, off in desc_roots_2x2(cfg):
         if not (0 <= off < used):
             raise ValueError(f"{f}: descriptor root {lbl} at {off} B lies outside the {used} B slab layout")
@@ -725,8 +766,8 @@ def make_cfg_d256_2x2(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
     if getattr(params, "thd_varlen", False) and profile != PROFILE_SM100:
         raise ValueError(f"{_FLAVOR}: THD is implemented only on the SM100 profile")
     d_qk, d_v = getattr(params, "head_dim_qk", 256), getattr(params, "head_dim_v", 256)
-    if (d_qk, d_v) != (256, 256) and not ((d_qk, d_v) == (192, 128) and profile == PROFILE_SM100 and not getattr(params, "thd_varlen", False)):
-        raise ValueError(f"{_FLAVOR}: head geometry must be D256 or dense SM100 D192x128; got {d_qk}/{d_v}")
+    if (d_qk, d_v) != (256, 256) and not ((d_qk, d_v) == (192, 128) and profile == PROFILE_SM100):
+        raise ValueError(f"{_FLAVOR}: head geometry must be D256 or SM100 D192x128; got {d_qk}/{d_v}")
     _c._validate_params(_FLAVOR, FAMILY_F16, params, datapath_2x2=True)
     dtype_o = getattr(params, "dtype_o", -1)
     if dtype_o < 0:
@@ -739,13 +780,19 @@ def make_cfg_d256_2x2(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
     rows_per_cta = SUB_ROWS * subblocks
     stages_tmem_s = 2 if profile == PROFILE_SM100 else 1
     stages_smem_p = 2 if profile == PROFILE_SM100 else 1
-    stages_q = 1 if profile == PROFILE_SM100 else 2
+    native_d192 = (d_qk, d_v) == (192, 128)
+    prefetch_d192 = native_d192 and not params.thd_varlen
+    fuse_dk = bool(getattr(params, "fuse_dk", False))
+    # Dense D192 leaves room for the next Q, dO and dO-for-dV operands (208896 B including scaffold, below 227 KiB).
+    # Together with lookahead this overlaps the next S MMA with the current P production; the D256 slabs do not fit it.
+    stages_q = 2 if prefetch_d192 or profile != PROFILE_SM100 else 1
+    stages_do = 2 if prefetch_d192 else 1
     subblock_wgs = 2 // subblocks
     cols_per_lane = 64 // subblock_wgs
     soft_lanes = 2 * 4 * 32
     # Register split per profile, 8 x softmax + 4 x service = 2016 = reg_entry_pool(12).
-    #   Profile 1 (32 q columns per compute lane): 176 / 152.  NOT the 4x1 body's 224 / 56: the Q / dO / dO_dv rings are
-    #   1-deep, so their slab addresses are STATIC and ptxas hoists every k-step descriptor of the three B operands
+    #   Profile 1 (32 q columns per compute lane): 176 / 152.  NOT the 4x1 body's 224 / 56: at D256 the Q / dO / dO_dv
+    #   rings are 1-deep, so their slab addresses are STATIC and ptxas hoists every k-step descriptor of the three B operands
     #   (16 + 16 + 8 64-bit values; desc_opaque's mov is transparent to ptxas) into the MMA warp's preamble as kernel
     #   invariants -- at 56 registers it parked them in local memory (70 STL / 79 LDL sm_100a 2026-10-01; 74 / 81 at
     #   sm_107a on the board's ptxas).  The 32-column compute lanes need ~135 registers (max R134 on the causal build).
@@ -783,13 +830,13 @@ def make_cfg_d256_2x2(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
         IDESC_K_DIM=0,
         K_SPLIT_UTCCP=0,
         STAGES_Q=stages_q,
-        STAGES_dO=1,
-        STAGES_dO_DV=1,
+        STAGES_dO=stages_do,
+        STAGES_dO_DV=stages_do,
         STAGES_KV=1,
         STAGES_TMEM_S=stages_tmem_s,
         STAGES_TMEM_P=0,
         STAGES_SMEM_P=stages_smem_p,
-        XFER_STAGES=1,
+        XFER_STAGES=2 if fuse_dk and params.thd_varlen else 1,
         STATS_STAGES=2,
         TILES_Q=1,
         SCHEDULER_STAGES=2,
@@ -832,6 +879,7 @@ def make_cfg_d256_2x2(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
         BMM2_CHUNK_SIZE=128,
         # --- the 2x2 axis ---
         DATAPATH_2X2_PROFILE=profile,
+        FUSE_DK=int(fuse_dk),
         KV_SUBBLOCKS=subblocks,
         ROWS_PER_CTA=rows_per_cta,
         KV_BLOCK_ROWS=rows_per_cta * 2,
@@ -842,8 +890,8 @@ def make_cfg_d256_2x2(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
         L_CNT=(soft_lanes // subblocks) * 2,
         TMEM_ALLOC_COLS=TMEM_ALLOC_COLS,
         SMEM_CAP=SMEM_CAP_BYTES_SM100 if profile == PROFILE_SM100 else SMEM_CAP_BYTES_SM107,
-        # Profile 1 ships the NATURAL order (measured, see the field); profile 2 keeps the design's lookahead until the Rubin A/B.
-        MMA_LOOKAHEAD=0 if profile == PROFILE_SM100 else 1,
+        # Keep D256's measured order; native D192 uses lookahead with layout-specific operand rings.
+        MMA_LOOKAHEAD=int(native_d192 or profile != PROFILE_SM100),
         SUBBLOCK_STRIDE_COLS=(2 * stages_tmem_s * _S_COLS + d_v // 2) if subblocks > 1 else 0,
     )
     _validate_cfg_d256_2x2(cfg)

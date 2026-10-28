@@ -469,6 +469,9 @@ class TemplateParams:
     # TMEM map gains the Q slots, the MMA form and the commit site move): the template-module cache keys on this record alone.  Picked by
     # config_sm107.sm107_q_in_tmem_pick (0 until measured; the sweep seam pins 1); validated by the factory (config_sm107._validate_q_in_tmem).
     q_in_tmem: int = 0
+    # Optional native FP8 K/V storage for the half-input d128 pipeline.
+    # Appended: -1 keeps the existing uniform Q/K/V behavior.
+    dtype_kv: int = -1
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any
@@ -523,6 +526,15 @@ def supports_scalar_kv_tail_split(d_shape, *, device_cc, fp8, pertensor):
     return (device_cc in ((10, 0), (10, 3), (10, 7)) and d_shape == (128, 128) and (not fp8 or pertensor)) or (
         device_cc == (10, 7) and d_shape == (512, 512) and not fp8
     )
+
+
+def supports_quantized_split_sink(*, device_cc, pertensor, thd):
+    """Per-tensor SM100/SM103/SM107 dense-Q partials fold the sink in combine.
+
+    Existing split, packing and paged head-dimension domains still apply.
+    MXFP8, packed queries and native SM120 need separate qualification.
+    """
+    return device_cc in ((10, 0), (10, 3), (10, 7)) and pertensor and not thd
 
 
 def supports_paged_split_sink(d_shape, *, device_cc, fp8, thd, paged, max_q):
@@ -585,6 +597,8 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
     if k.dtype_qkv not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: DTYPE_QKV must be E4M3/E5M2/BF16/FP16 (0..3); got {k.dtype_qkv}")
     fp8 = k.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
+    if k.dtype_kv != -1 and not (flavor == "d128" and k.dtype_qkv in (DTYPE_BF16, DTYPE_FP16) and k.dtype_kv in (DTYPE_E4M3, DTYPE_E5M2)):
+        raise ValueError(f"{flavor}: independent FP8 KV storage is wired only on the half-input d128 pipeline")
     if fp8 and flavor not in ("d64", "d128", "d192", "d256", "d512"):
         raise ValueError(f"{flavor}: FP8/MXFP8 inputs (DTYPE_QKV 0/1) are only supported on d64, d128, d192, d256, and d512")
     if k.softmax_f16 and not fp8:
@@ -1145,6 +1159,11 @@ class CfgD256:
     EPILOGUE_GATE: int = 0
     GATE_BPE: int = 2
 
+    # Half causal schedule: the dedicated correction WG also generates P1.
+    # Unlike MXFP8 FUSED_CORR_SPLIT_P, this retains one softmax WG and four
+    # correction warps. Append-only internal topology, not an autotune knob.
+    HALF_FUSED_CORR_SPLIT_P: int = 0
+
 
 def d256_gate_smem_bytes(cfg: CfgD256) -> int:
     """The SMEM the GATED d256 half rendering allocates, from the SAME constants its arrays are declared with:
@@ -1172,12 +1191,30 @@ def _validate_cfg_d256(cfg: CfgD256) -> None:
     checks = (
         (cfg.MMA_REGS == cfg.TMALDG_REGS == cfg.TMASTG_REGS == cfg.SCHEDULER_REGS, "d256: MMA/TMALDG/TMASTG/SCHEDULER regs must match"),
         (
-            cfg.MMA_REGS + (0 if fused_corr_split_p else cfg.CORRECTION_REGS) + cfg.SOFTMAX_REGS + cfg.SOFTMAX_WG1_REGS <= 512,
+            cfg.MMA_REGS + (0 if fused_corr_split_p else cfg.CORRECTION_REGS) + cfg.SOFTMAX_REGS + (cfg.SOFTMAX_WG1_REGS if split_p else 0) <= 512,
             "d256: register budget over 512",
         ),
         (
             cfg.MMA_REGS % 8 == 0 and cfg.CORRECTION_REGS % 8 == 0 and cfg.SOFTMAX_REGS % 8 == 0 and cfg.SOFTMAX_WG1_REGS % 8 == 0,
             "d256: per-role regs must be multiples of 8",
+        ),
+        (
+            not cfg.HALF_FUSED_CORR_SPLIT_P
+            or (
+                cfg.DTYPE_QKV == DTYPE_BF16
+                and cfg.MASK_FLAGS == MASK_CAUSAL
+                and not cfg.BOTTOM_RIGHT
+                and not cfg.WINDOW_LEFT
+                and not cfg.WINDOW_RIGHT
+                and not cfg.THD_VARLEN
+                and not cfg.PAGED_KV
+                and not cfg.EPILOGUE_GATE
+                and cfg.SPLIT_KV == 1
+                and not split_p
+                and not fused_corr_split_p
+                and cfg.CORRECTION_WARPS == 4
+            ),
+            "d256: half fused correction requires dense unsplit BF16 top-left causal",
         ),
         (cfg.CGA_M == cfg.CTA_MMA, "d256 flavor pairs CGA_M with CTA_MMA"),
         (cfg.CTA_MMA == (1 if fp8 else 2), "d256 SM100: FP8 requires CTA1; BF16/FP16 requires CTA2"),
@@ -1295,6 +1332,17 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
     split_p = fp8 and (mask_flags == MASK_NONE or pt_plain_top_left_causal)
     pt_thd_split_p = pt_plain_top_left_causal and bool(mask_flags & MASK_PADDED)
     fused_corr_split_p = mxfp8 and strict_top_left_causal
+    half_fused_corr_split_p = (
+        not mxfp8
+        and params.dtype_qkv == DTYPE_BF16
+        and mask_flags == MASK_CAUSAL
+        and strict_top_left_causal
+        and not params.window_left
+        and not params.thd_varlen
+        and not params.paged_kv
+        and not params.epilogue_gate
+        and params.split_kv == 1
+    )
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     b_o = bpe(dtype_o)
 
@@ -1303,7 +1351,11 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
     pt_e4_causal_regs = not mxfp8 and params.dtype_qkv == DTYPE_E4M3 and mask_flags == MASK_CAUSAL and not params.bottom_right
     pt_e5_causal_regs = not mxfp8 and params.dtype_qkv == DTYPE_E5M2 and mask_flags == MASK_CAUSAL and not params.bottom_right
     softmax_regs, softmax_wg1_regs, correction_regs = 240, 136 if split_p else 40, 96
-    if fused_corr_split_p:
+    if half_fused_corr_split_p:
+        # 4 warps each: 240 softmax + 216 correction/P1 + 48 other = 504.
+        # WG1's legal tracing placeholder does not represent a live warpgroup.
+        correction_regs = 216
+    elif fused_corr_split_p:
         softmax_regs, softmax_wg1_regs, correction_regs = 248, 216, 64
     elif mxfp8 and split_p:
         softmax_regs, softmax_wg1_regs, correction_regs = 256, 144, 72
@@ -1353,6 +1405,14 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
         SOFTMAX_WARPGROUPS=2 if split_p or fused_corr_split_p else 1,
         CORRECTION_WARPS=0 if fused_corr_split_p else 4,
         FUSED_CORR_SPLIT_P=1 if fused_corr_split_p else 0,
+        HALF_FUSED_CORR_SPLIT_P=int(half_fused_corr_split_p),
+        # Forty registers spill the producer/scheduler's live metadata under
+        # the fused role split; 48 stays within the 64K register file.
+        MMA_REGS=48 if half_fused_corr_split_p else 40,
+        TMALDG_REGS=48 if half_fused_corr_split_p else 40,
+        TMASTG_REGS=48 if half_fused_corr_split_p else 40,
+        SCHEDULER_REGS=48 if half_fused_corr_split_p else 40,
+        OTHER_REGS=48 if half_fused_corr_split_p else 40,
         SOFTMAX_REGS=softmax_regs,
         SOFTMAX_WG1_REGS=softmax_wg1_regs,
         CORRECTION_REGS=correction_regs,
@@ -2404,6 +2464,7 @@ class CfgD128(D128FamilySmallTileFields):
     # Paged KV cache; see TemplateParams.paged_kv.  PAGE_SIZE tokens per page.
     PAGED_KV: int = 0
     PAGE_SIZE: int = 0
+    DTYPE_KV: int = -1
 
 
 # Blackwell SM100 per-CTA dynamic SMEM cap (228 KiB physical, 227 KiB usable).
@@ -2434,7 +2495,8 @@ def _d128_smem_bytes(cfg) -> int:
     # The per-tensor FP8 kernel stages P (TILE_M x TILE_N fp8 per Q sub-tile) in SMEM so the next
     # step's QK^T can overlap the softmax; counted for every quantized row (pessimistic for MXFP8).
     p = cfg.TILES_Q * cfg.TILE_M * cfg.TILE_N * cfg.BPE if cfg.DTYPE_QKV <= 1 else 0
-    return qo + k + v + p
+    raw_kv = max(cfg.TILE_N * cfg.TILE_K, cfg.TILE_O * cfg.TILE_N) // cfg.CTA_MMA if cfg.DTYPE_KV in (DTYPE_E4M3, DTYPE_E5M2) and cfg.DTYPE_QKV > 1 else 0
+    return qo + k + v + p + raw_kv
 
 
 def _validate_cfg_d128(cfg: CfgD128) -> None:
@@ -2516,6 +2578,7 @@ def make_cfg_d128(params: TemplateParams, *, cga1_kv_stages: int = 2) -> Tuple[C
     tile_k_hw_fp8 = 32 if fp8 else tile_k_hw(params.dtype_qkv)
     cfg = CfgD128(
         DTYPE_QKV=params.dtype_qkv,
+        DTYPE_KV=params.dtype_kv,
         DTYPE_O=dtype_o,
         BPE=b,
         BPE_V=b_v,
@@ -2676,7 +2739,7 @@ def _validate_cfg_d128_decode(cfg: CfgD128Decode) -> None:
         (cfg.QO_ALIAS == 1, "d128 decode: Q and O share one SMEM slab (pays for the third KV stage)"),
         (cfg.TILES_Q == 1, "d128 decode: TILES_Q must be 1 (one 128-row Q tile per CTA)"),
         (cfg.TILE_M == 128 and cfg.TILE_N == 128 and cfg.TILE_K in (128, 192) and cfg.TILE_O == 128, "single-Q tile: QK width 128 or 192, V width 128"),
-        (cfg.STAGES_KV == (3 if cfg.TILE_K == 128 else 2), "single-Q tile: KV stages must fit the QK width"),
+        (cfg.STAGES_KV == (3 if cfg.TILE_K == 128 and cfg.DTYPE_KV == -1 else 2), "single-Q tile: KV stages must fit the QK width and storage conversion"),
         (
             _d128_smem_bytes(cfg) <= _SM100_MAX_DYN_SMEM,
             f"d128 decode: SMEM {_d128_smem_bytes(cfg) // 1024} KiB over the SM100 {_SM100_MAX_DYN_SMEM // 1024} KiB per-CTA cap",
@@ -2728,6 +2791,8 @@ def make_cfg_d128_decode(params: TemplateParams) -> Tuple[CfgD128Decode, TmaIter
     if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"d128 decode: f16/bf16 inputs only (DTYPE_QKV 2/3); got {params.dtype_qkv}")
     d_qk = params.single_q_head_dim
+    if params.dtype_kv != -1 and d_qk != 128:
+        raise ValueError("independent FP8 KV storage requires native D128")
     if d_qk not in (128, 192):
         raise ValueError("single-Q tile: QK width must be 128 or 192")
     if d_qk == 192 and not (params.thd_varlen and not params.paged_kv and not params.pack_gqa):
@@ -2740,7 +2805,10 @@ def make_cfg_d128_decode(params: TemplateParams) -> Tuple[CfgD128Decode, TmaIter
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     cfg = CfgD128Decode(
         TILE_K=d_qk,
-        STAGES_KV=3 if d_qk == 128 else 2,
+        # A raw FP8 tile shares the local load warp between K and V. Two
+        # converted stages leave room for that16KiB slab; uniform half keeps3.
+        STAGES_KV=3 if d_qk == 128 and params.dtype_kv == -1 else 2,
+        DTYPE_KV=params.dtype_kv,
         THD_VARLEN=int(params.thd_varlen),
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,

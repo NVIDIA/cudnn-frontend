@@ -1367,7 +1367,7 @@ def _fp8_cudnn_dtype(torch_dtype):
     }[torch_dtype]
 
 
-def _pools_fp8(B, KH, d, P, max_pages, hnd, in_key, lens, seed=0, v_hnd=None):
+def _pools_fp8(B, KH, d, P, max_pages, hnd, in_key, lens, seed=0, v_hnd=None, d_v=None, head_padding=False):
     """FP8 page pools + a scattered block table + per-tensor descales.  Returns
     (k_pool, v_pool, k_container, v_container, block_table[B, 1, max_pages, 1], dk, dv);
     the pools keep their storage layout, the containers are the graph's
@@ -1378,10 +1378,17 @@ def _pools_fp8(B, KH, d, P, max_pages, hnd, in_key, lens, seed=0, v_hnd=None):
     dev = "cuda"
     num_pages = B * max_pages + 5
     v_hnd = hnd if v_hnd is None else v_hnd
-    v_shape = (num_pages, KH, P, d) if v_hnd else (num_pages, P, KH, d)
-    shape = (num_pages, KH, P, d) if hnd else (num_pages, P, KH, d)
+    d_v = d if d_v is None else d_v
+    k_width = max(256, d + 16) if head_padding else d
+    v_width = max(256, d_v + 16) if head_padding else d_v
+    v_shape = (num_pages, KH, P, v_width) if v_hnd else (num_pages, P, KH, v_width)
+    shape = (num_pages, KH, P, k_width) if hnd else (num_pages, P, KH, k_width)
     k_pool, dk = _fp8_quant(torch.randn(*shape, device=dev) * 0.5, in_key)
     v_pool, dv = _fp8_quant(torch.randn(*v_shape, device=dev) * 0.5, in_key)
+    if head_padding:
+        k_pool[..., d:].fill_(float("nan"))
+        v_pool[..., d_v:].fill_(float("nan"))
+        k_pool, v_pool = k_pool[..., :d], v_pool[..., :d_v]
     bt = torch.randperm(num_pages, device=dev)[: B * max_pages].to(torch.int32).view(B, 1, max_pages, 1).contiguous()
     live = set()
     for b, L in enumerate(lens):
@@ -1448,7 +1455,7 @@ def _ref_fp8(
     kd = _gather_pages_fp8(k_pool, block_table, lens, hnd, P, s_max)
     vd = _gather_pages_fp8(v_pool, block_table, lens, hnd if v_hnd is None else v_hnd, P, s_max)
     # D64/D128 scale P before its FP8 cast; native D256 casts P directly.
-    p_cast_log2_scale = _FP8_P_CAST_LOG2_SCALE if q8.shape[-1] <= 128 else 0.0
+    p_cast_log2_scale = _FP8_P_CAST_LOG2_SCALE if max(q8.shape[-1], v_pool.shape[-1]) <= 128 else 0.0
     s_scale = 2.0 ** (p_cast_log2_scale + _FP8_RESCALE_THRESHOLD_LOG2)
     o, lse, _ = compute_ref(
         q8,
@@ -1522,6 +1529,8 @@ def _run_graph_fp8(
     q_lens=None,
     explicit_pack=None,
     explicit_cga=None,
+    d_v=None,
+    head_padding=False,
 ):
     """``causal``: None, "top_left" or "bottom_right" -- a causal upper bound (``right_bound=0``)
     with that diagonal alignment; ``window_left``: W adds the left sliding window (``left_bound=W``).
@@ -1535,7 +1544,8 @@ def _run_graph_fp8(
 
     dev = "cuda"
     scale = 1.0 / math.sqrt(d)
-    k_pool, v_pool, k_c, v_c, bt, dk, dv = _pools_fp8(B, KH, d, P, max_pages, hnd, in_key, lens, v_hnd=v_hnd)
+    d_v = d if d_v is None else d_v
+    k_pool, v_pool, k_c, v_c, bt, dk, dv = _pools_fp8(B, KH, d, P, max_pages, hnd, in_key, lens, v_hnd=v_hnd, d_v=d_v, head_padding=head_padding)
     mask_kw = {}
     right_bound = 0 if causal is not None else None
     diag_align = cudnn.diagonal_alignment.BOTTOM_RIGHT if causal == "bottom_right" else cudnn.diagonal_alignment.TOP_LEFT
@@ -1545,7 +1555,11 @@ def _run_graph_fp8(
         mask_kw.update(left_bound=window_left)
     q8, dq = _fp8_quant(torch.randn(B, s_q, H, d, device=dev) * 0.5, in_key)
     q_gpu = q8.transpose(1, 2)  # BSHD storage, BHSD logical
-    o_gpu = torch.empty(B, s_q, H, d, device=dev, dtype=out_dt).transpose(1, 2)
+    if head_padding:
+        o_storage = torch.full((B, s_q, H, d_v + 16), 12, device=dev, dtype=out_dt)
+        o_gpu = o_storage[..., :d_v].transpose(1, 2)
+    else:
+        o_gpu = torch.empty(B, s_q, H, d_v, device=dev, dtype=out_dt).transpose(1, 2)
     seq_lens = torch.tensor(lens, dtype=torch.int32, device=dev)
     slk = seq_lens.view(B, 1, 1, 1)
     slq = torch.tensor(q_lens if q_lens is not None else [s_q] * B, dtype=torch.int32, device=dev).view(B, 1, 1, 1)
@@ -1708,7 +1722,7 @@ def _run_graph_fp8(
     assert abs(amax_o.item() - ref_o.abs().max().item()) <= 0.03, f"amax_o {amax_o.item():.4f} vs ref {ref_o.abs().max().item():.4f}"
     if stats:
         got_lse = lse.view(B, H, s_q)
-        lse_atol = _fp8_lse_atol(d)
+        lse_atol = _fp8_lse_atol(256 if max(d, d_v) > 128 else d)
         torch.testing.assert_close(got_lse[live], ref_lse[live], atol=lse_atol, rtol=0)
         if (~live).any():
             torch.testing.assert_close(got_lse[~live], ref_lse[~live], atol=lse_atol, rtol=0)
@@ -2985,7 +2999,7 @@ def test_paged_mxfp8_independent_pool_layouts(hnd, dims):
         (3, 8, 8, False, True, 256, "e5m2", True, None),
     ],
 )
-def test_paged_graph_fp8_sink(d, in_key, s_q, H, KH, pack, hnd, P, out_key, stats, causal):
+def test_paged_graph_fp8_sink(d, in_key, s_q, H, KH, pack, hnd, P, out_key, stats, causal, split=1):
     """Sink epilogue composes with paged loading, including trimmed and keyless Q.
 
     Both FP8 flavors, independent K/V layouts, packed/unpacked GQA, MHA and
@@ -3007,7 +3021,7 @@ def test_paged_graph_fp8_sink(d, in_key, s_q, H, KH, pack, hnd, P, out_key, stat
         s_q=s_q,
         causal=causal,
         window_left=128,
-        explicit_split=1,
+        explicit_split=split,
         explicit_pack=pack,
         v_hnd=not hnd,
         sinks=sinks,
@@ -3017,7 +3031,7 @@ def test_paged_graph_fp8_sink(d, in_key, s_q, H, KH, pack, hnd, P, out_key, stat
 
 @pytest.mark.L0
 @pytest.mark.parametrize("d,cga", [(64, 1), (128, 1), (128, 2), (256, 1)])
-def test_paged_graph_fp8_sink_rebind_replay(d, cga):
+def test_paged_graph_fp8_sink_rebind_replay(d, cga, split=1):
     """A retained graph reads changed lengths, sinks and table contents on device.
 
     Rebinding the graph uses new allocations; poisoning O/Stats/Amax before
@@ -3039,7 +3053,7 @@ def test_paged_graph_fp8_sink_rebind_replay(d, cga):
         s_q=s_q,
         causal="bottom_right",
         window_left=128,
-        explicit_split=1,
+        explicit_split=split,
         explicit_cga=cga,
         sinks=sinks,
         return_case=True,

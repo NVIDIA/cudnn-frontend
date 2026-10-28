@@ -210,6 +210,9 @@ class SdpaThdBinder {
    public:
     explicit SdpaThdBinder(const py::object &spec)
         : fn_(spec.attr("fn")), owner_(spec.attr("owner")), template_(py::tuple(py::object(spec.attr("template")))) {
+        // Metadata-only callers predating ordered execution may omit scratch.
+        // Such a binder can still bind frames, but cannot bypass plan guards.
+        scratch_bytes_   = py::hasattr(spec, "scratch_bytes") ? integer(spec, "scratch_bytes") : -1;
         lse_padded_      = py::cast<bool>(spec.attr("lse_padded"));
         py::object quant = py::none();
         if (py::hasattr(spec, "quant")) quant = spec.attr("quant");
@@ -299,10 +302,14 @@ class SdpaThdBinder {
         }
         auto expect = py::cast<py::dict>(spec.attr("expect"));
         auto decl   = py::cast<py::dict>(spec.attr("decl"));
+        // Plain sdpa may retain half Q/O while the compiled kernel reads FP8 K/V.
+        // Cache each port's declared type; runtime binding still checks it exactly.
         for (size_t i = Q; i <= O; ++i) {
             const auto dtype = py::cast<std::string>(expect[names[i]]);
             const bool fp8   = dtype == "float8_e4m3fn" || dtype == "float8_e5m2";
-            if ((quantized_ && i != O) ? !fp8 : (dtype != "float16" && dtype != "bfloat16" && !(quantized_ && fp8)))
+            if ((quantized_ && i != O)
+                    ? !fp8
+                    : (dtype != "float16" && dtype != "bfloat16" && !(fp8 && (quantized_ || i == K || i == V))))
                 invalid("native THD binding has an unsupported operand dtype");
             dtype_code_[i]       = fp8 ? (dtype == "float8_e4m3fn" ? kDLFloat8_e4m3fn : kDLFloat8_e5m2)
                                        : (dtype == "float16" ? kDLFloat : kDLBfloat);
@@ -337,21 +344,20 @@ class SdpaThdBinder {
                 invalid("invalid native THD gate declaration");
         }
         if (py::hasattr(spec, "origin_specs") && !spec.attr("origin_specs").is_none()) {
-            const bool paged_d128_split = paged_ && cga_tile_m_ == 128 && integer(spec, "d_qk") == 128 &&
-                                          integer(spec, "d_v") == 128 && splits_ > 1;
+            const bool d128_split = !quantized_ && cga_tile_m_ == 128 && integer(spec, "d_qk") == 128 &&
+                                    integer(spec, "d_v") == 128 && splits_ > 1;
             const bool d576_split = !quantized_ && cga_tile_m_ == 128 && integer(spec, "d_qk") == 576 &&
                                     integer(spec, "d_v") == 512 && splits_ > 1;
-            if ((quantized_ && (!paged_ || mx_scales_)) || (splits_ != 1 && !paged_d128_split && !d576_split) ||
-                has_gate_)
+            if ((quantized_ && (!paged_ || mx_scales_)) || (splits_ != 1 && !d128_split && !d576_split) || has_gate_)
                 invalid(
-                    "physical THD origins require ungated half unsplit/paged D128 split/native D576 split or unsplit "
+                    "physical THD origins require ungated half unsplit/D128 split/native D576 split or unsplit "
                     "per-tensor FP8 "
                     "paged plans");
             auto specs = py::cast<py::tuple>(spec.attr("origin_specs"));
             if (specs.size() != 5) invalid("physical THD origins require five ports");
-            if (paged_d128_split || d576_split) {
-                if (paged_d128_split && specs[static_cast<size_t>(Q)].is_none())
-                    invalid("physical paged split plans require Q offsets");
+            if (d128_split || d576_split) {
+                if (d128_split && specs[static_cast<size_t>(Q)].is_none())
+                    invalid("physical D128 split plans require Q offsets");
                 // Origin maps/rows precede compact partials in the same caller workspace.
                 const int64_t origin_bytes =
                     add(multiply(add(b_, 1), 512), multiply(add(multiply(b_, 40), 127) / 128, 128));
@@ -699,6 +705,54 @@ class SdpaThdBinder {
         return true;
     }
 
+    int64_t
+    ordered_workspace_bytes() const {
+        return scratch_bytes_;
+    }
+
+    py::object
+    execute_ordered(py::handle schema,
+                    py::handle buffers,
+                    py::handle tensor_uids,
+                    const py::dict &auto_bindings,
+                    py::handle workspace,
+                    py::handle override_uids,
+                    py::handle override_shapes,
+                    py::handle override_strides,
+                    const std::vector<int64_t> &indices,
+                    py::object stream) const {
+        DLDevice workspace_device{};
+        auto read = read_ordered_binding(schema,
+                                         buffers,
+                                         tensor_uids,
+                                         auto_bindings,
+                                         workspace,
+                                         override_uids,
+                                         override_shapes,
+                                         override_strides,
+                                         &workspace_device);
+        // Complete unsupported producer protocols in the existing shared Python
+        // normalizer. Never re-read supported operands or discard observations.
+        if (scratch_bytes_ < 0 || !py::cast<py::list>(read[1]).empty() || read[2].is_none()) return read;
+        const auto extent = py::cast<py::tuple>(read[2]);
+        const int64_t ptr = py::cast<int64_t>(extent[0]);
+        if (scratch_bytes_) {
+            if (!ptr)
+                invalid("requires a " + std::to_string(scratch_bytes_) +
+                        "-byte workspace but execute() received none; allocate graph.get_workspace_size() bytes");
+            const int64_t bytes = py::cast<int64_t>(extent[1]);
+            if (bytes < scratch_bytes_)
+                invalid("needs a " + std::to_string(scratch_bytes_) + "-byte workspace, got " + std::to_string(bytes) +
+                        " bytes (size it with graph.get_workspace_size())");
+            // The shared reader observed this call's device with its extent.
+            // Reuse that fact, not a cached placement or a second Python query.
+            if (workspace_device.device_type != kDLCUDA || workspace_device.device_id != device_)
+                invalid("workspace must be on CUDA device " + std::to_string(device_));
+        }
+        execute(read[0], indices, ptr, std::move(stream), py::none(), -1);
+        return py::none();
+    }
+
    private:
     void
     bind_quantized_scalars(const std::vector<NativeOperandView> &facts, BoundLaunch &bound, int64_t workspace) const {
@@ -964,7 +1018,8 @@ class SdpaThdBinder {
     bool has_v_table_strides_     = false;
     size_t table_v_strides_index_ = 0;
     std::unique_ptr<SdpaMxScaleBinding> mx_scales_;
-    int64_t quant_offset_ = 0;
+    int64_t scratch_bytes_ = 0;
+    int64_t quant_offset_  = 0;
     bool quantized_ = false, has_amax_ = false;
     int64_t b_, qh_, kh_, device_, lens_form_, off_o_desc_, total_q_, total_kv_, lse_head_stride_;
     int64_t cga_tile_m_, units_, page_size_, workspace_alignment_;
@@ -983,12 +1038,27 @@ void
 init_sdpa_thd_binding(py::module_ &m) {
     py::class_<SdpaThdBinder>(m, "_SdpaThdBinder")
         .def(py::init<const py::object &>(), py::arg("spec"))
+        .def_prop_ro("ordered_workspace_bytes", &SdpaThdBinder::ordered_workspace_bytes)
+        .def("execute_ordered",
+             &SdpaThdBinder::execute_ordered,
+             py::arg("schema"),
+             py::arg("buffers"),
+             py::arg("tensor_uids"),
+             py::arg("auto_bindings"),
+             py::arg("workspace").none(),
+             py::arg("override_uids").none(),
+             py::arg("override_shapes").none(),
+             py::arg("override_strides").none(),
+             py::arg("indices"),
+             py::arg("stream").none())
         .def_prop_ro_static("supports_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_native_d576", [](py::object) { return true; })
+        .def_prop_ro_static("supports_mixed_fp8_kv", [](py::object) { return true; })
         .def_prop_ro_static("supports_native_d576_packed_split", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_fp8_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_split_physical_origins", [](py::object) { return true; })
+        .def_prop_ro_static("supports_nonpaged_d128_split_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_initial_waves", [](py::object) { return true; })
         .def_prop_ro_static("supports_initial_wave_geometry", [](py::object) { return true; })
         .def_prop_ro_static("supports_stats_stride_override", [](py::object) { return true; })

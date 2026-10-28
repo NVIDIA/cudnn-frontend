@@ -1145,7 +1145,7 @@ make_operand_buffer(int64_t ptr, std::vector<int64_t> shape, int dtype_code, int
 // workspace has no uid and no operand, but an engine still bounds-checks its
 // carves against it.
 py::object
-read_buffer_extent(py::handle buffer) {
+read_buffer_extent_with_device(py::handle buffer, DLDevice *device) {
     DLPackExchangeAPI *api = exchange_api_for(buffer.ptr());
     if (api == nullptr || api->dltensor_from_py_object_no_sync == nullptr) return py::none();
     DLTensor t{};
@@ -1156,7 +1156,13 @@ read_buffer_extent(py::handle buffer) {
     int64_t numel = 1;
     for (int d = 0; d < t.ndim; d++) numel *= t.shape[d];
     const int64_t itemsize = (static_cast<int64_t>(t.dtype.bits) * t.dtype.lanes + 7) / 8;
+    if (device) *device = t.device;
     return py::make_tuple(reinterpret_cast<int64_t>(static_cast<char *>(t.data) + t.byte_offset), numel * itemsize);
+}
+
+py::object
+read_buffer_extent(py::handle buffer) {
+    return read_buffer_extent_with_device(buffer, nullptr);
 }
 
 // The graph owns this provider-independent schema. It owns no Python objects,
@@ -1326,7 +1332,8 @@ class OrderedBindingSchema {
          py::handle workspace,
          py::handle override_uids,
          py::handle shapes,
-         py::handle strides) {
+         py::handle strides,
+         DLDevice *workspace_device = nullptr) {
         auto buffers = sequence(buffers_object, "ordered buffers");
         auto current = geometry(input_uids, override_uids, shapes, strides);
         if (py::len(buffers) != current->input_uids.size())
@@ -1347,7 +1354,8 @@ class OrderedBindingSchema {
         }
         std::vector<size_t> described;
         if (unread.empty()) described = finish(*pack, {});
-        auto extent = workspace.is_none() ? py::cast<py::object>(py::make_tuple(0, 0)) : read_buffer_extent(workspace);
+        auto extent = workspace.is_none() ? py::cast<py::object>(py::make_tuple(0, 0))
+                                          : read_buffer_extent_with_device(workspace, workspace_device);
         return py::make_tuple(py::cast(std::move(pack)), unread, std::move(extent), described);
     }
 };
@@ -1360,9 +1368,16 @@ read_ordered_binding(py::handle schema,
                      py::handle workspace,
                      py::handle override_uids,
                      py::handle override_shapes,
-                     py::handle override_strides) {
-    return py::cast<OrderedBindingSchema &>(schema).read(
-        buffers, tensor_uids, auto_bindings, workspace, override_uids, override_shapes, override_strides);
+                     py::handle override_strides,
+                     DLDevice *workspace_device) {
+    return py::cast<OrderedBindingSchema &>(schema).read(buffers,
+                                                         tensor_uids,
+                                                         auto_bindings,
+                                                         workspace,
+                                                         override_uids,
+                                                         override_shapes,
+                                                         override_strides,
+                                                         workspace_device);
 }
 
 // A workspace carve, planned once: the regions are fixed when the engine
@@ -1550,15 +1565,26 @@ per graph; ``VariantPackNative.describe_from`` compares a whole pack against it.
 
     py::class_<OrderedBindingSchema>(m, "_OrderedBindingSchema")
         .def(py::init<std::vector<int64_t>, const DeclaredLayout &, bool>())
-        .def("read",
-             &OrderedBindingSchema::read,
-             py::arg("buffers"),
-             py::arg("tensor_uids"),
-             py::arg("auto_bindings"),
-             py::arg("workspace").none(),
-             py::arg("override_uids").none(),
-             py::arg("override_shapes").none(),
-             py::arg("override_strides").none())
+        .def(
+            "read",
+            [](OrderedBindingSchema &schema,
+               py::handle buffers,
+               py::handle tensor_uids,
+               const py::dict &auto_bindings,
+               py::handle workspace,
+               py::handle override_uids,
+               py::handle override_shapes,
+               py::handle override_strides) {
+                return schema.read(
+                    buffers, tensor_uids, auto_bindings, workspace, override_uids, override_shapes, override_strides);
+            },
+            py::arg("buffers"),
+            py::arg("tensor_uids"),
+            py::arg("auto_bindings"),
+            py::arg("workspace").none(),
+            py::arg("override_uids").none(),
+            py::arg("override_shapes").none(),
+            py::arg("override_strides").none())
         .def("finish", &OrderedBindingSchema::finish);
 
     py::class_<VariantPackNative>(m, "VariantPackNative", R"(

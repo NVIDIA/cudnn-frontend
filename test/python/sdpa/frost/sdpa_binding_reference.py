@@ -838,17 +838,17 @@ def bind_dense(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], s
             raise ValueError("cudnn.sdpa: this specialization was compiled without a sink; construct the API with has_sink")
         frame[ix["sinks_ptr"]] = 0  # HAS_SINK=False: dead slot; a null faults loudly if it is ever read (Rule 8)
 
-    def lens(name: str) -> int:
+    def lens(name: str, count: int = b) -> int:
         f = facts.get(name)
         if f is None:
             raise ValueError(f"cudnn.sdpa: {name} is required by this compiled specialization")
         _on_plan_device(spec, name, f)
-        if f.dtype != "int32" or not f.contiguous or f.numel < b:
-            raise ValueError(f"cudnn.sdpa: {name} must be a contiguous int32 tensor of at least {b} elements; got {f.dtype} x {f.numel}")
+        if f.dtype != "int32" or not f.contiguous or f.numel < count:
+            raise ValueError(f"cudnn.sdpa: {name} must be a contiguous int32 tensor of at least {count} elements; got {f.dtype} x {f.numel}")
         if f.ptr % _ALIGN_F32:
             raise ValueError(f"cudnn.sdpa: {name} must be 4-byte aligned")
-        if f.span >= 0 and f.span < b:
-            raise ValueError(f"cudnn.sdpa: {name} spans {f.span} elements; this launch reads {b}")
+        if f.span >= 0 and f.span < count:
+            raise ValueError(f"cudnn.sdpa: {name} spans {f.span} elements; this launch reads {count}")
         return f.ptr
 
     # Dense hosts retain these pointer slots, but only SEQ_KV_PRESENT reads
@@ -856,7 +856,7 @@ def bind_dense(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], s
     frame[ix["o_desc_ptr"]] = 0
     frame[ix["meta_ptr"]] = lens("seq_kv_lens") if spec.seq_kv_present else 0
     if spec.seq_q_present:
-        frame[ix["seq_q_lens_addr"]] = lens("seq_q_lens")
+        frame[ix["seq_q_lens_addr"]] = lens("seq_q_lens", b + (1 if getattr(spec, "ragged_q_lens", 0) == 2 else 0))
 
     if spec.gate_expect is not None:
         g = _dense_role(spec, facts, "gate", spec.qh, spec.d_v, spec.s_q_max, spec.gate_expect)
@@ -923,7 +923,9 @@ def bind_dense_split(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFact
         o_strides,
         lse_strides,
         *ragged_args,
+        *((frame[spec.index["sinks_ptr"]],) if spec.has_sink else ()),
         stream,
+        *((frame[spec.index["seq_q_lens_addr"]],) if getattr(spec, "ragged_q_lens", 0) else ()),
     )
     return frame, combine_args
 

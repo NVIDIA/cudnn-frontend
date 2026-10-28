@@ -1,9 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""cuDNN-frontend adapters over the FROST SM107 (Rubin) d=256 SDPA backward chains.
+"""cuDNN-frontend adapters over the FROST SM107 (Rubin) SDPA backward chains.
 
-Three rows share this module -- ``sdpa_bwd_sm107`` (bf16 / fp16, :class:`SdpaBwdDslSm107`),
+Half D192x128 uses the shared native 2x2 body with fused dK and a 128x192
+dQ GEMM. Its dense/THD, independent-origin and deterministic contracts are
+served through the same adapter and prepared execution API as D256.
+
+Three adapter classes share this module -- ``sdpa_bwd_sm107`` (bf16 / fp16, :class:`SdpaBwdDslSm107`),
 ``sdpa_bwd_sm107_fp8`` (per-tensor FP8 E4M3, :class:`SdpaBwdDslSm107Fp8`) and
 ``sdpa_bwd_sm107_mxfp8`` (block-scale MXFP8, :class:`SdpaBwdDslSm107Mxfp8`; its own
 section at the end of this doc) -- because they share one chain shape.  Each is a
@@ -259,7 +263,7 @@ the caller (no Rubin MXFP8 THD forward row feeds it yet).  The graph tier needs 
 from __future__ import annotations
 
 import math
-from dataclasses import replace
+from dataclasses import asdict, replace
 from typing import Optional
 
 import torch
@@ -652,7 +656,7 @@ def _thd_packed_ok(desc: TensorDesc) -> bool:
 
 
 class SdpaBwdDslSm107(SdpaBwdDsl):
-    """``sdpa_bwd_sm107``: d_qk = d_v = 256, bf16 / fp16, on the Rubin line (cc 10.7-11.9)."""
+    """Native D256 or D192x128 bf16 / fp16 backward on the Rubin line (cc 10.7-11.9)."""
 
     _FAMILY = _cfg.FAMILY_F16
     _NAME = "sdpa_bwd_sm107"
@@ -667,6 +671,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
     # "THD / varlen"; the fp8 and MXFP8 bodies carry the same leg -- the MXFP8 one over packed per-sequence-tile-padded scale factors).
     _THD_SUPPORTED = True
     _THD_ORIGINS_SUPPORTED = False
+    _DETERMINISTIC_SUPPORTED = False
 
     def __init__(
         self,
@@ -777,7 +782,12 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         self._compiled = None
         self._prepared = None
 
+    def _native_half_d192(self) -> bool:
+        return self._FAMILY == _cfg.FAMILY_F16 and (self.head_dim_qk, self.head_dim_v) == (192, 128)
+
     def _check_head_dims(self) -> None:
+        if self._native_half_d192():
+            return
         self._value_error_if(
             self.head_dim_qk != _SM107_D or self.head_dim_v != _SM107_D,
             f"{self._NAME}: d_qk = d_v = {_SM107_D} exactly; got {self.head_dim_qk} / {self.head_dim_v}",
@@ -788,7 +798,8 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         """Re-check what the Capabilities row promised (backstops, never the gate)."""
         n = self._NAME
         self._value_error_if(
-            bool(self._thd_ro_spec) and (not self.thd or not self._THD_ORIGINS_SUPPORTED), f"{n}: independent THD origins are not implemented on this row"
+            bool(self._thd_ro_spec) and (not self.thd or not (self._THD_ORIGINS_SUPPORTED or self._native_half_d192())),
+            f"{n}: independent THD origins are not implemented on this row",
         )
         if self._thd_ro_spec:
             _prepared.check_thd_origins(self)
@@ -816,7 +827,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
                 )
             else:
                 self._value_error_if(
-                    not _bshd_physical_ok(desc, allow_batch_padding=self._BATCH_PADDED_BSHD),
+                    not _bshd_physical_ok(desc, allow_batch_padding=self._BATCH_PADDED_BSHD or self._native_half_d192()),
                     f"{n}: {name} must be BSHD-physical (stride order 3,1,2,0); got stride {tuple(desc.stride)}",
                 )
         st_shape, st_stride = tuple(int(x) for x in self.stats_desc.shape), tuple(int(x) for x in self.stats_desc.stride)
@@ -874,11 +885,16 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
             self.seq_q_lens_present, f"{n}: per-batch Q lengths (seq_q_lens) are not implemented -- the body threads only the per-batch kv length (seq_kv_lens)"
         )
         self._value_error_if(
+            self.seq_kv_lens_present and self._native_half_d192(),
+            f"{n}: per-batch kv lengths (seq_kv_lens) are not implemented on the native D192 2x2 body",
+        )
+        self._value_error_if(
             self.seq_kv_lens_present and not self._PER_BATCH_KV_LENS,
             f"{n}: per-batch kv lengths (seq_kv_lens) are not implemented -- this body takes ONE uniform real kv length (seqlen_kv_real)",
         )
         self._value_error_if(
-            self.deterministic, f"{n}: use_deterministic_algorithm is not claimed yet (the chain has no atomics; the two-run bitwise test decides)"
+            self.deterministic and not (self._DETERMINISTIC_SUPPORTED or self._native_half_d192()),
+            f"{n}: use_deterministic_algorithm is not claimed yet (the chain has no atomics; the two-run bitwise test decides)",
         )
         self._value_error_if(self.sink_desc is not None or self.dsink_desc is not None, f"{n}: sink / dSink are not implemented")
         self._value_error_if(self.bias_desc is not None or self.dbias_desc is not None, f"{n}: bias / dBias are not implemented")
@@ -941,7 +957,9 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
             plan += [
                 ("ds_ws", (1, self._qh_chunk, self._ws_rows_cap, sqp), self._ds_dtype),
                 ("seq_kv", (THD_BWD_MAPS_META_WORDS(b, self._thd_map_slots(b)),), torch.int32),
-                ("desc_words", ((2 * b if self._thd_ro_spec else b + 1) * 16,), torch.int64),
+                # Fused D192 main owns one dead Q map, B physical Q maps and B dK maps;
+                # stage-3 dQ reuses them after main completes.
+                ("desc_words", ((2 * b + 1 if self._native_half_d192() else 2 * b if self._thd_ro_spec else b + 1) * 16,), torch.int64),
             ]
             if self._thd_ro_spec:
                 plan.append(("thd_origins", (9, b), torch.int64))
@@ -991,9 +1009,9 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         """The family's regions of a THD plan, after the four shared ones (``[(name, shape, dtype)]`` over the PACKED token
         capacities ``tq`` / ``tkv``): the half row's per-Q-head dK / dV partials over the packed kv axis under GQA -- no staging,
         no folds.  The fp8 row overrides (its bf16 dV partials and amax scratch always, the twin's upcasts and dQ workspace)."""
-        h, d = self.h_q, _SM107_D
+        h = self.h_q
         if gqa:
-            return [("dv_part", (1, tkv, h, d), self.dtype), ("dk_part", (1, tkv, h, d), self.dtype)]
+            return [("dv_part", (1, tkv, h, self.head_dim_v), self.dtype), ("dk_part", (1, tkv, h, self.head_dim_qk), self.dtype)]
         return []
 
     def _scratch_plan(self):
@@ -1063,6 +1081,8 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         """The main kernel's ``datapath_2x2_profile``: 0 = the shipped 4x1 body; ``BWD_D256_2X2_PROFILE`` (2 = the Rubin
         interleaved twin, 1 = the SM100 body) when ``BWD_D256_2X2`` is on (both read at CALL time, f16 family only).  The
         SM100 d256 row overrides this with profile 1."""
+        if self._native_half_d192():
+            return _cfg2x2.PROFILE_SM100
         if not (BWD_D256_2X2 and self._FAMILY == _cfg.FAMILY_F16):
             return _cfg2x2.PROFILE_OFF
         if BWD_D256_2X2_PROFILE not in _cfg2x2.PROFILES:
@@ -1078,6 +1098,8 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
 
     def _stage3_tile_mn(self, sm: int) -> tuple:
         """The stage-3 cluster tile: ``_stage3_cgrp_tile_mn`` (the Rubin-line rule; the SM100 d256 row passes its tile explicitly)."""
+        if self._native_half_d192():
+            return (128, 192)
         return _stage3_cgrp_tile_mn(sm, _SM107_D)
 
     @staticmethod
@@ -1089,7 +1111,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         return _cfg.kv_pad_rows(mod.CFG)
 
     def _template_params(self):
-        return _cfg.TemplateParams(
+        params = _cfg.TemplateParams(
             dtype_qkv=_DTYPE_CODE[self.dtype],
             window_right=0 if self.is_causal else None,  # set => causal; right-band widening is declined
             window_left=self.window_size_left,
@@ -1105,6 +1127,9 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
             datapath_2x2_profile=self._datapath_2x2_profile(),
             **self._template_params_family(),
         )
+        if self._native_half_d192():
+            return _cfg2x2.TemplateParams2x2(**asdict(params), head_dim_qk=192, head_dim_v=128, fuse_dk=True)
+        return params
 
     def _template_params_family(self) -> dict:
         return {}  # the half row's record inherits its dS dtype (the io dtype)
@@ -1291,7 +1316,7 @@ _FP8_GRAD_DTYPES = (torch.float8_e4m3fn, torch.bfloat16, torch.float16)
 
 
 class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
-    """``sdpa_bwd_sm107_fp8``: cuDNN ``sdpa_fp8_backward`` at d = 256 on the Rubin line.
+    """``sdpa_bwd_sm107_fp8``: cuDNN ``sdpa_fp8_backward`` at D256 or D192/V128 on the Rubin line.
 
     FP8 E4M3 Q / K / V / O / dO with scalar descales in, fp32 Stats, gradients in the
     graph's dtype (E4M3 with ``scale_dQ / dK / dV``, or bf16 / fp16) plus the requested
@@ -1395,6 +1420,18 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
     def _ds_fp8(self) -> bool:
         return self._ds_dtype == torch.float8_e4m3fn
 
+    def _check_head_dims(self) -> None:
+        self._value_error_if(
+            (self.head_dim_qk, self.head_dim_v) not in ((256, 256), (192, 128)),
+            f"{self._NAME}: native head dimensions must be (256, 256) or (192, 128); got {self.head_dim_qk}/{self.head_dim_v}",
+        )
+
+    def _template_params(self):
+        params = super()._template_params()
+        if (self.head_dim_qk, self.head_dim_v) == (192, 128):
+            return _cfg.TemplateParamsFp8(**asdict(params), head_dim_qk=192, head_dim_v=128)
+        return params
+
     def _template_params_family(self) -> dict:
         return dict(dtype_ds=_DTYPE_CODE[self._ds_dtype])
 
@@ -1443,8 +1480,8 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
         partials under GQA, the bf16-dS twin's bf16 partials, dQ workspace and exact upcasts, and the amax scratch -- the dense
         ``_family_scratch_shapes`` with B = 1 and the token capacities for the row extents (every fold pass stops at the live total
         on device)."""
-        h, hkv, d = self.h_q, self.h_kv, _SM107_D
-        plan = [("dv_part", (1, tkv, h, d), self._partial_dtype)]
+        h, hkv, d = self.h_q, self.h_kv, self.head_dim_qk
+        plan = [("dv_part", (1, tkv, h, self.head_dim_v), self._partial_dtype)]
         if self._ds_fp8:
             if gqa:
                 plan.append(("dk_part", (1, tkv, h, d), self._partial_dtype))
@@ -1459,8 +1496,8 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
         return plan
 
     def _family_scratch_shapes(self, kv_rows: int, gqa: bool):
-        b, h, hkv, sq, skv, d = self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, _SM107_D
-        plan = [("dv_part", (b, kv_rows, h, d), self._partial_dtype)]  # stage 2's per-Q-head dV_true: fp32 under GQA, bf16 at MHA
+        b, h, hkv, sq, skv, d = self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, self.head_dim_qk
+        plan = [("dv_part", (b, kv_rows, h, self.head_dim_v), self._partial_dtype)]  # stage 2's per-Q-head dV_true: fp32 under GQA, bf16 at MHA
         if self._ds_fp8:
             # e4m3 dS: the GEMMs read the e4m3 payloads directly and quantize dQ (and MHA dK) in their epilogue; only the
             # GQA dK partials (fp32, TRUE units: EPI_DESCALE) go through stage 4, which rounds the group's sum once.

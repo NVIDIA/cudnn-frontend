@@ -106,6 +106,37 @@ def test_interleaved_2x2_thd_stays_declined():
         _cfg(profile=P2, thd_varlen=True)
 
 
+@pytest.mark.parametrize("thd", [False, True], ids=["dense", "thd"])
+@pytest.mark.parametrize("dtype", [DTYPE_BF16, DTYPE_FP16])
+def test_native_d192_fused_dk_resource_bounds(thd, dtype):
+    params = c2.TemplateParams2x2(datapath_2x2_profile=P1, head_dim_qk=192, head_dim_v=128, dtype_qkv=dtype, thd_varlen=thd, fuse_dk=True)
+    cfg = c2.make_cfg_d256_2x2(params, FAMILY_F16)
+    tm = c2.tmem_layout_2x2(cfg)
+    assert (tm.dK_BASE, tm.DK_COLS, tm.USED_COLS, tm.TOTAL_COLS) == (320, 96, 416, 512)
+    assert c2.smem_bytes_2x2(cfg) == (186 if thd else 226) * 1024
+    assert c2.scaffold_bytes_declared_2x2(cfg) == 576
+    assert c2.kernel_smem_bytes_2x2(cfg) <= cfg.SMEM_CAP
+    assert c2.desc_version_2x2(cfg) == 0
+    assert dict(c2.desc_roots_2x2(cfg))["sQdk"] == (162 if thd else 202) * 1024
+    assert (cfg.STAGES_Q, cfg.STAGES_dO, cfg.STAGES_dO_DV, cfg.XFER_STAGES) == ((1, 1, 1, 2) if thd else (2, 2, 2, 1))
+    assert c2.mbar_init_counts_2x2(cfg)["mb_ds_mma_full"] == 512
+    # No room for another dense operand stage or a third dS reader slot.
+    with pytest.raises(ValueError, match="SMEM slabs"):
+        c2._validate_cfg_d256_2x2(dataclasses.replace(cfg, STAGES_Q=cfg.STAGES_Q + 3))
+    with pytest.raises(ValueError, match="staging must fit the dead P ring"):
+        c2._validate_cfg_d256_2x2(dataclasses.replace(cfg, STAGES_SMEM_P=1))
+    raw = c2.make_cfg_d256_2x2(dataclasses.replace(params, fuse_dk=False), FAMILY_F16)
+    assert raw.FUSE_DK == 0 and raw.XFER_STAGES == 1
+    assert c2.tmem_layout_2x2(raw).DK_COLS == 0
+    assert "mb_qdk_full" not in c2.mbar_stage_counts_2x2(raw)
+
+
+@pytest.mark.parametrize("profile", [P1, P2])
+def test_fused_dk_declines_other_widths(profile):
+    with pytest.raises(ValueError, match="fused dK requires the native SM100 D192x128 body"):
+        c2.make_cfg_d256_2x2(c2.TemplateParams2x2(datapath_2x2_profile=profile, fuse_dk=True), FAMILY_F16)
+
+
 # --------------------------------------------------------------------------- the two profiles, pinned as values
 
 

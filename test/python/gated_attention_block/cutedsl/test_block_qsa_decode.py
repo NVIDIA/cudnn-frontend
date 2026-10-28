@@ -2952,34 +2952,40 @@ def test_pdl_on_is_bitwise_pdl_off_on_the_decode_ladder(row):
     assert torch.equal(_bits(b), _bits(c)), "a second switched step is not bitwise the first"
 
 
-def test_pdl_auto_stays_off_on_the_sparse_form_until_measured_and_the_envelope_says_so(monkeypatch):
-    """The AUTO reading of ``use_pdl`` on the block-sparse decode mode is False on every part today (``SPARSE_DECODE_PDL_DEFAULT_CCS``
-    is EMPTY: a part enters it with its measurement); the arm exists behind the tuple -- with the tuple patched to the measured dense part
-    AUTO resolves True on the sparse form and the switch reaches the sparse stage; an explicit value wins either way.  The envelope names
-    the switched stage kinds on the sparse form (``DECODE_PDL_STAGES``, the same four) and reads ``pdl_default`` off the sparse tuple."""
+def test_pdl_auto_resolves_true_on_the_sparse_form_on_the_measured_part_and_the_envelope_says_so(monkeypatch):
+    """The AUTO reading of ``use_pdl`` on the block-sparse decode mode is True on the measured part (``SPARSE_DECODE_PDL_DEFAULT_CCS ==
+    ((10, 7),)`` since 2026-10-27: the switched caller-list block measured against the plain one over B 1 / 4 / 32 -- bitwise, no cell slower)
+    and False on every other part; the switch reaches the sparse stage under AUTO exactly as under the explicit True; an explicit value wins
+    either way (``use_pdl=False`` pins the plain chain on cc 10.7); with the tuple patched EMPTY the former reading returns (False everywhere,
+    the explicit True still served).  The envelope names the switched stage kinds on the sparse form (``DECODE_PDL_STAGES``, the same four)
+    and reads ``pdl_default`` off the sparse tuple (True on cc 10.7, False on cc 10.0 and under the empty tuple); the dense form keeps its own."""
     from cudnn.frost import buffers
     from cudnn.gated_attention_block import api as _api
 
-    assert _api.SPARSE_DECODE_PDL_DEFAULT_CCS == ()
+    assert _api.SPARSE_DECODE_PDL_DEFAULT_CCS == ((10, 7),)
     monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 7))
     with _no_host_sync():
         auto = _declare(GEOM_SMALL, 2, 1, n_pages=4)[0]
         on = _declare(GEOM_SMALL, 2, 1, n_pages=4, use_pdl=True)[0]
         off = _declare(GEOM_SMALL, 2, 1, n_pages=4, use_pdl=False)[0]
-    assert auto.use_pdl_requested is None and auto.use_pdl is False and auto.pdl_stages == () and auto.use_pdl_effective is False
-    assert on.use_pdl is True and "sdpa_sparse" in on.pdl_stages and on.use_pdl_effective is True and off.use_pdl is False and off.pdl_stages == ()
-    monkeypatch.setattr(_api, "SPARSE_DECODE_PDL_DEFAULT_CCS", ((10, 7),))
-    with _no_host_sync():
-        measured = _declare(GEOM_SMALL, 2, 1, n_pages=4)[0]
-        other_part = None
-    assert measured.use_pdl_requested is None and measured.use_pdl is True and "sdpa_sparse" in measured.pdl_stages and measured.use_pdl_effective is True
-    assert _declare(GEOM_SMALL, 2, 1, n_pages=4, use_pdl=False)[0].use_pdl is False
+    assert auto.use_pdl_requested is None and auto.use_pdl is True and "sdpa_sparse" in auto.pdl_stages and auto.use_pdl_effective is True
+    assert auto.pdl_stages == on.pdl_stages and auto._sdpa.use_pdl is True, "AUTO on the measured part = the explicit True's chain"
+    assert on.use_pdl is True and on.use_pdl_requested is True and "sdpa_sparse" in on.pdl_stages and on.use_pdl_effective is True
+    assert off.use_pdl is False and off.use_pdl_requested is False and off.pdl_stages == () and off.use_pdl_effective is False
+    assert off._sdpa.use_pdl is False, "the explicit False pins the plain chain on the measured part"
     monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 0))
     with _no_host_sync():
         other_part = _declare(GEOM_SMALL, 2, 1, n_pages=4)[0]
-    assert other_part.use_pdl is False, "a part outside the tuple reads False"
+    assert other_part.use_pdl is False and other_part.pdl_stages == (), "a part outside the tuple reads False"
+    monkeypatch.setattr(_api, "SPARSE_DECODE_PDL_DEFAULT_CCS", ())
+    monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 7))
+    with _no_host_sync():
+        unmeasured = _declare(GEOM_SMALL, 2, 1, n_pages=4)[0]
+        still_on = _declare(GEOM_SMALL, 2, 1, n_pages=4, use_pdl=True)[0]
+    assert unmeasured.use_pdl is False and unmeasured.pdl_stages == () and still_on.use_pdl is True, "the tuple patched EMPTY = the former reading"
     monkeypatch.undo()
-    # the envelope: the sparse form names the four switched stage kinds; pdl_default reads the sparse tuple (empty -> False; patched -> True)
+    # the envelope: the sparse form names the four switched stage kinds; pdl_default reads the sparse tuple (cc 10.7 -> True; cc 10.0 -> False;
+    # patched empty -> False); the dense form reads its own tuple either way
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     geom, _ = _geom(GEOM_SMALL)
     env = GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=_SM107)
@@ -2988,24 +2994,28 @@ def test_pdl_auto_stays_off_on_the_sparse_form_until_measured_and_the_envelope_s
         and env.decode.sparse_core
         and env.decode.pdl_stages == _api.DECODE_PDL_STAGES == ("qk_norm_rope", "cache_write", "sigmoid_gate", "sdpa")
     )
-    assert env.decode.pdl_default is False
-    monkeypatch.setattr(_api, "SPARSE_DECODE_PDL_DEFAULT_CCS", ((10, 7),))
-    assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=_SM107).decode.pdl_default is True
+    assert env.decode.pdl_default is True, "the measured part: the sparse tuple holds cc 10.7"
     assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=(10, 0)).decode.pdl_default is False
-    dense = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**GEOM_SMALL, causal_bottom_right=True), BF16, _DEV, device_cc=_SM107)
+    dense_geom = GatedAttentionBlockGeometry(**GEOM_SMALL, causal_bottom_right=True)
+    dense = GatedAttentionBlockFwd.serving_envelope(dense_geom, BF16, _DEV, device_cc=_SM107)
     assert dense.decode.pdl_default is True and not dense.decode.sparse_core, "the dense form keeps its own measured tuple"
+    monkeypatch.setattr(_api, "SPARSE_DECODE_PDL_DEFAULT_CCS", ())
+    assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=_SM107).decode.pdl_default is False, "the empty tuple = the former reading"
+    assert GatedAttentionBlockFwd.serving_envelope(dense_geom, BF16, _DEV, device_cc=_SM107).decode.pdl_default is True, "the dense tuple is its own"
 
 
 def test_pdl_auto_never_resolves_true_under_the_in_block_indexer_whatever_the_tuple_holds(monkeypatch):
-    """The AUTO reading of ``use_pdl`` under ``QsaSpec(index_source="indexer")`` is False even with the sample's part IN
-    ``SPARSE_DECODE_PDL_DEFAULT_CCS``: the two readings answer for ONE domain -- the explicit True is declined by name there (the scorer /
-    top-k / step kernels would take the switch unmeasured), so a future measured entry in the tuple must not flip the indexer block through
-    the back door.  The caller-list block on the same patched tuple and part resolves True (the arm itself is live); the envelope agrees
-    (``pdl_default`` False on the indexer form)."""
+    """The AUTO reading of ``use_pdl`` under ``QsaSpec(index_source="indexer")`` is False with the sample's part IN
+    ``SPARSE_DECODE_PDL_DEFAULT_CCS`` (cc 10.7, the SHIPPED tuple since the 2026-10-27 measurement -- read as shipped, not patched): the two
+    readings answer for ONE domain -- the explicit True is declined by name there (the scorer / top-k / step kernels would take the switch
+    unmeasured), so the measured entry in the tuple must not flip the indexer block through the back door.  The caller-list block on the same
+    part resolves True (the default's own route); the envelope agrees (``pdl_default`` False and no switched stage on the indexer form, True
+    with the four stage kinds on the caller-list form)."""
+    from cudnn.frost import buffers
     from cudnn.gated_attention_block import api as _api
 
+    assert (10, 7) in _api.SPARSE_DECODE_PDL_DEFAULT_CCS, "the shipped tuple holds the measured part: nothing patched here"
     monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 7))
-    monkeypatch.setattr(_api, "SPARSE_DECODE_PDL_DEFAULT_CCS", ((10, 7),))
     with _no_host_sync():
         indexer = _declare_indexer()
         caller_list = _declare(GEOM_SMALL, 2, 1, n_pages=4)[0]
@@ -3014,8 +3024,11 @@ def test_pdl_auto_never_resolves_true_under_the_in_block_indexer_whatever_the_tu
     with pytest.raises(NotImplementedError, match="use_pdl=True is served for the bf16 / f16 block only"):
         with _no_host_sync():
             _declare_indexer(use_pdl=True)
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     env = GatedAttentionBlockFwd.serving_envelope(indexer.geom, BF16, _DEV, device_cc=_SM107)
-    assert env.decode.pdl_default is False and env.decode.pdl_stages == ()
+    assert env.decode.served and env.decode.pdl_default is False and env.decode.pdl_stages == ()
+    env_cl = GatedAttentionBlockFwd.serving_envelope(caller_list.geom, BF16, _DEV, device_cc=_SM107)
+    assert env_cl.decode.served and env_cl.decode.pdl_default is True and env_cl.decode.pdl_stages == _api.DECODE_PDL_STAGES
 
 
 def test_pdl_is_declined_on_e4m3_pools_and_on_the_packed_sparse_form_by_name():
@@ -3282,8 +3295,9 @@ def _lse_delta(a: torch.Tensor, b: torch.Tensor) -> float:
 
 def test_sparse_tile_form_declaration_facts_and_the_auto_pin(monkeypatch):
     """The knob's declaration facts (host, no device): ``sparse_tile_form="auto"`` (the default) follows the placement rule on the measured
-    part (``heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS`` = cc 10.7 since the gate's table; the lean tile at B 1 x S_q 1 = 2 units, the bound
-    ``LEAN_SPARSE_MAX_UNITS`` = 4 inclusive: B 2 in, B 3 out, the S_q 4 shared list out (8 units); a pinned tcgen05
+    part (``heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS`` = cc 10.7 since the gate's table; the lean tile at B 1 = 2 CTAs per chunk at every served
+    S_q 1..4 -- the S_q 4 shared list included (the gate's winning B 1 x S_q 4 rows) --, the bound ``LEAN_SPARSE_MAX_UNITS`` = 4 CTAs per
+    chunk (B x H_kv) inclusive: B 2 in, B 3 out, B 4 out at S_q 1 and at S_q 4 (the gate's losing rows); a pinned tcgen05
     split keeps the core, a pinned lean split is honoured by the lean body, per-row lists past one row keep the core, the served rows are ONE
     constant the rule reads -- ``LEAN_SPARSE_SERVED_MAX_S_Q`` --, an unmeasured part keeps the core) and the tcgen05 core everywhere with the
     tuple patched EMPTY (the former function); the explicit ``"lean"`` declares the lean body -- the lean split (65 at the default k 1; a pinned
@@ -3295,7 +3309,7 @@ def test_sparse_tile_form_declaration_facts_and_the_auto_pin(monkeypatch):
     assert _H.SPARSE_LEAN_TILE_DEFAULT_CCS == (_SM107,), "the AUTO pin: the measured part"
     with _no_host_sync():
         with pytest.MonkeyPatch.context() as mp:  # the pin EMPTY: the former function, the core on every part
-            mp.setattr(_H, "SPARSE_LEAN_TILE_DEFAULT_CCS", ())
+            mp.setattr("cudnn.sdpa.fwd.sparse_tile_rules.SPARSE_LEAN_TILE_DEFAULT_CCS", ())
             auto, _ = _declare(GEOM_SMALL, 4, 1)
             assert (auto.sparse_tile_form_requested, auto.sparse_tile_form, auto.sparse_tile, auto.sparse_sub_tiles_per_cta) == (
                 "auto",
@@ -3334,33 +3348,41 @@ def test_sparse_tile_form_declaration_facts_and_the_auto_pin(monkeypatch):
         flipped, _ = _declare(GEOM_SMALL, 1, 1)  # 2 units: the lean tile
         assert (flipped.sparse_tile_form, flipped.sparse_tile, flipped.decode_split_kv, flipped.sparse_sub_tiles_per_cta) == ("lean", _TILE_LEAN, 65, 1)
         assert flipped.sparse_tile_form_requested == "auto" and flipped._sdpa.tile_form == "lean"
-        at_bound, _ = _declare(GEOM_SMALL, 2, 1)  # 4 units: inside (the bound is inclusive)
+        at_bound, _ = _declare(GEOM_SMALL, 2, 1)  # 4 CTAs per chunk: inside (the bound is inclusive)
         assert at_bound.sparse_tile == _TILE_LEAN
-        past, _ = _declare(GEOM_SMALL, 3, 1)  # 6 units: the tcgen05 core
+        past, _ = _declare(GEOM_SMALL, 3, 1)  # 6 CTAs per chunk: the tcgen05 core
         assert past.sparse_tile == _TILE_TCGEN05 and past.sparse_tile_form == "tcgen05"
+        b4, _ = _declare(GEOM_SMALL, 4, 1)  # 8 CTAs per chunk: the core (the gate's B 4 x S_q 1 rows lose -2.0 .. -3.5 %)
+        assert b4.sparse_tile == _TILE_TCGEN05 and b4.sparse_tile_form == "tcgen05"
         pinned, _ = _declare(GEOM_SMALL, 1, 1, decode_split_kv=16)  # a tcgen05 split keeps the core under AUTO (the pin is the stronger knob)
         assert pinned.sparse_tile == _TILE_TCGEN05 and pinned.decode_split_kv == 16
         pinned_lean, _ = _declare(GEOM_SMALL, 1, 1, decode_split_kv=33)  # a lean split is honoured by the lean body
         assert pinned_lean.sparse_tile == _TILE_LEAN and (pinned_lean.decode_split_kv, pinned_lean.sparse_sub_tiles_per_cta) == (33, 2)
-        sq4, _ = _declare(GEOM_SMALL, 1, 4)  # the shared list at S_q 4 under AUTO: 8 units past the bound of 4: the core (the explicit lean serves it, above)
-        assert sq4.sparse_tile == _TILE_TCGEN05 and sq4.sparse_tile_form == "tcgen05" and sq4.qsa_shared_list
-        sq4_b5, _ = _declare(GEOM_SMALL, 5, 4)  # 40 units: past the bound
+        for s_q in (2, 3, 4):  # the shared list at S_q 2..4 under AUTO at B 1: 2 CTAs per chunk (the rows ride inside the CTA) -> the lean tile
+            sqn, _ = _declare(GEOM_SMALL, 1, s_q)
+            assert (sqn.sparse_tile, sqn.sparse_tile_form, sqn.decode_split_kv, sqn.sparse_sub_tiles_per_cta) == (_TILE_LEAN, "lean", 65, 1), s_q
+            assert sqn.qsa_shared_list and sqn._sdpa.tile_form == "lean" and sqn.sparse_tile_form_requested == "auto"
+        sq4_b2, _ = _declare(GEOM_SMALL, 2, 4)  # 4 CTAs per chunk at S_q 4: inside the bound
+        assert sq4_b2.sparse_tile == _TILE_LEAN and sq4_b2.decode_split_kv == 65
+        sq4_b4, _ = _declare(GEOM_SMALL, 4, 4)  # 8 CTAs per chunk: the core (the gate's B 4 x S_q 4 rows lose -8.8 .. -9.7 %)
+        assert sq4_b4.sparse_tile == _TILE_TCGEN05 and sq4_b4.sparse_tile_form == "tcgen05" and sq4_b4.qsa_shared_list
+        sq4_b5, _ = _declare(GEOM_SMALL, 5, 4)  # 10 CTAs per chunk: past the bound
         assert sq4_b5.sparse_tile == _TILE_TCGEN05
         sq4_per_row, _ = _declare(
             GEOM_SMALL, 1, 4, index_list_form="per_row"
-        )  # per-row lists past one row: the core (the lean CTA gathers one list per sequence)
+        )  # per-row lists past one row: the core (the lean CTA gathers one list per sequence) -- inside the bound (2 CTAs per chunk): the list-form rule alone
         assert sq4_per_row.sparse_tile == _TILE_TCGEN05 and not sq4_per_row.qsa_shared_list
         sq2_per_row, _ = _declare(
             GEOM_SMALL, 1, 2, index_list_form="per_row"
-        )  # inside the 4-unit bound (B 1 x H_kv 2 x S_q 2 = 4 units): ONLY the list-form rule keeps the core here (review of the first PR round)
+        )  # inside the bound (B 1 x H_kv 2 = 2 CTAs per chunk): ONLY the list-form rule keeps the core here (review of the first PR round)
         assert sq2_per_row.sparse_tile == _TILE_TCGEN05 and sq2_per_row.sparse_tile_form == "tcgen05" and not sq2_per_row.qsa_shared_list
         monkeypatch.setattr(
-            _H, "LEAN_SPARSE_SERVED_MAX_S_Q", 1
+            "cudnn.sdpa.fwd.sparse_tile_rules.LEAN_SPARSE_SERVED_MAX_S_Q", 1
         )  # the served rows are ONE constant the rule reads (never a literal): one row -> the explicit lean declines S_q 2, AUTO keeps the lean tile at one row
         with pytest.raises(NotImplementedError, match="S_q <= 1"):
             _declare(GEOM_SMALL, 1, 2, sparse_tile_form="lean")
         assert _declare(GEOM_SMALL, 1, 1)[0].sparse_tile == _TILE_LEAN
-        monkeypatch.setattr(_H, "LEAN_SPARSE_SERVED_MAX_S_Q", 4)
+        monkeypatch.setattr("cudnn.sdpa.fwd.sparse_tile_rules.LEAN_SPARSE_SERVED_MAX_S_Q", 4)
         monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 0))
         other, _ = _declare(GEOM_SMALL, 1, 1)  # an unmeasured part: the core
         assert other.sparse_tile == _TILE_TCGEN05
@@ -3562,7 +3584,8 @@ def test_the_envelope_reads_the_sparse_tile_route_back(monkeypatch):
     """``serving_envelope().decode``: ``sparse_tiles`` names the bodies the part serves (the tcgen05 core everywhere; the lean tile on cc 10.7
     only), ``sparse_tile_lean_default`` the AUTO pin's reading (True on the measured part, cc 10.7; False with the pin patched EMPTY and on every
     other part), and ``sparse_tile(s_q, batch, ...)`` the body a step takes -- the same arithmetic the constructor runs (the placement bound
-    ``LEAN_SPARSE_MAX_UNITS`` = 4 under AUTO): pinned equal to a declared block's ``sparse_tile`` cell by cell, None where the explicit "lean"
+    ``LEAN_SPARSE_MAX_UNITS`` = 4 CTAs per chunk, B x H_kv, under AUTO -- S_q is not in the bound): pinned equal to a declared block's
+    ``sparse_tile`` cell by cell, None where the explicit "lean"
     would be a typed decline; empty / None on a dense geometry."""
     from cudnn.gated_attention_block import GatedAttentionBlockFwd, GatedAttentionBlockGeometry
     from cudnn.gated_attention_block import api as _api
@@ -3574,14 +3597,20 @@ def test_the_envelope_reads_the_sparse_tile_route_back(monkeypatch):
     assert env.sparse_core and env.sparse_tiles == (_TILE_TCGEN05, _TILE_LEAN) and env.sparse_tile_lean_default is True  # the measured part
     assert (
         env.sparse_tile(1, 1) == _TILE_LEAN and env.sparse_tile(1, 2) == _TILE_LEAN and env.sparse_tile(1, 3) == _TILE_TCGEN05
-    )  # the bound (4 units) under AUTO
+    )  # the bound (4 CTAs per chunk = B x H_kv) under AUTO at S_q 1: B 1 / B 2 in, B 3 out
+    assert (
+        env.sparse_tile(3, 1) == _TILE_LEAN
+        and env.sparse_tile(4, 1) == _TILE_LEAN
+        and env.sparse_tile(4, 2) == _TILE_LEAN
+        and env.sparse_tile(1, 4) == _TILE_TCGEN05
+    )  # S_q is not in the bound: B 1 x S_q 3 / 4 and B 2 x S_q 4 take the lean tile under AUTO (the gate's S_q 4 rows); B 4 x S_q 1 (8 per chunk) keeps the core
     assert env.sparse_tile(1, 4, sparse_tile_form="tcgen05") == _TILE_TCGEN05 and env.sparse_tile(1, 1, sparse_tile_form="tcgen05") == _TILE_TCGEN05
     assert env.sparse_tile(1, 4, sparse_tile_form="lean") == _TILE_LEAN and env.sparse_tile(1, 16, sparse_tile_form="lean") == _TILE_LEAN
     assert (
         env.sparse_tile(4, 4, sparse_tile_form="lean") == _TILE_LEAN and env.sparse_tile(4, 5, sparse_tile_form="lean") == _TILE_LEAN
     )  # the S_q rows share one CTA
     assert env.sparse_tile(5, 4, sparse_tile_form="lean") is None and env.sparse_tile(1, 4, sparse_tile_form="lean", decode_split_kv=16) is None
-    assert env.sparse_tile(4, 4) == _TILE_TCGEN05  # 32 units under AUTO: past the bound, the core
+    assert env.sparse_tile(4, 4) == _TILE_TCGEN05  # B 4 = 8 CTAs per chunk under AUTO: past the bound, the core (S_q 4 changes no grid)
     assert env.sparse_tile(1, 4, sparse_tile_form="lean", decode_split_kv=33) == _TILE_LEAN
     # a tcgen05 split pin outside the core's bound [1, ceil((top_k + 1) / 32)] = [1, 17] at top_k 512 is a declaration-time rejection,
     # so the envelope reads None there (never "the core"); inside the bound the core; under AUTO the pin is the stronger knob and the same bound holds
@@ -3613,15 +3642,20 @@ def test_the_envelope_reads_the_sparse_tile_route_back(monkeypatch):
             (4, 4, None),
             (5, 4, None),
             (1, 2, None),
+            (1, 3, None),
+            (1, 4, None),
+            (2, 4, None),
+            (3, 4, None),  # 2 / 2 / 4 / 6 CTAs per chunk at S_q 3..4: the lean tile at B 1 / B 2, the core at B 3 (S_q is not in the bound)
             (4, 1, 16),
             (1, 1, 33),
             (2, 1, 33),
-            (1, 2, 33),  # a lean split under AUTO inside the bound (2 / 4 / 4 units: k 2); past the bound a pinned 33 is the core's typed decline, not a cell
+            (1, 2, 33),
+            (1, 4, 33),  # a lean split under AUTO inside the bound (2 / 4 / 2 / 2 CTAs per chunk: k 2); past the bound a pinned 33 = the core's decline
         ):
             blk, _ = _declare(GEOM_SMALL, b, s_q, decode_split_kv=split)
             assert flipped.sparse_tile(s_q, b, decode_split_kv=split) == blk.sparse_tile, (b, s_q, split, blk.sparse_tile)
     assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, dev, device_cc=(10, 0)).decode.sparse_tile_lean_default is False
-    monkeypatch.setattr(_H, "SPARSE_LEAN_TILE_DEFAULT_CCS", ())  # the pin EMPTY: the former function on the same part
+    monkeypatch.setattr("cudnn.sdpa.fwd.sparse_tile_rules.SPARSE_LEAN_TILE_DEFAULT_CCS", ())  # the pin EMPTY: the former function on the same part
     former = GatedAttentionBlockFwd.serving_envelope(geom, BF16, dev, device_cc=_SM107).decode
     assert (
         former.sparse_tile_lean_default is False

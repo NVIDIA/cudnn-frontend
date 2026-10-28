@@ -330,6 +330,7 @@ def test_template_params_cfg_and_bars_are_appended():
     from cudnn.sdpa.fwd.kernels._common_blackwell import Bars
 
     fields = [f.name for f in dataclasses.fields(TemplateParams)]
+    fields = fields[: fields.index("q_in_tmem") + 1]  # Later appended fields are legal.
     assert (
         fields[-8:] == ["n_chunk", "bias_stages", "padded_tail_form", "dead_subtile_quiet", "bias_max_form", "softmax_wgs", "s_slots", "q_in_tmem"]
         and TemplateParams().bias_stages == 0

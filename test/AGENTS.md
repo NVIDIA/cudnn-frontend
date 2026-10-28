@@ -273,6 +273,7 @@ prefill; a short query alone does not imply the D128 decode template.
 - **An fp8 midpoint flip is PROVED from the reference's intermediates, never inferred from the output's shape.** One flipped P/dS code moves one output d-row by `(c_alt - c_ref) x descale x operand_row` (Q for dK, K for dQ, dO for dV, V for O) -- but a power-of-two multiple of an operand row is not evidence of one: a masked key, another batch's or another head's row, two identical rows each one flip away, or a step no adjacent pair of codes has (8192 in e4m3) all fit that description (review on PR #1075). `assert_close_fp8_grad(..., operand=, flip_unit=, intermediates=, fp8_dtype=)` lifts the `4 * atol` row cap only when, at a VALID position of the row's own reduction (same batch, a q head of the same GQA group, unmasked), the reference's scaled fp32 intermediate -- `compute_ref(..., return_intermediates=)` / `compute_ref_backward(...)`, re-run on the bad rows only -- sits within 1/32 of a code spacing of the midpoint between its fp8 code and the adjacent one, and that single flip reproduces the row three ways: within the ordinary tolerance, per element within the output's own rounding (`atol` plus half an output code spacing from each side -- both sides are dequantized output codes; pass `out_dtype=torch_otype`), and as a whole (the least-squares number of flips fitted to the row is 1 within 1/2 -- two flips fit at 2, and on a row of large gradients `rtol * |expected|` is itself two flips wide, so the ordinary tolerance alone would take three flips for one). It prints the position, the two codes, the step and the three fits. Packed (ragged) outputs keep the plain cap, as does `h_k != h_v`. `sdpa/test_fp8_flip_budget.py` pins the accepted case and each of those rejections on a problem the reference itself built. The negative-score q rows have amplitude 8 at d192, so a legitimate flip moves a dK row by 0.5 -- the fixed cap (0.32) alone would call that a defect (sm107 212-SM lane, test310, 2026-09-15).
 - **Decode Stats must be tested independently of training.** The random SDPA harness uses `generate_stats=cfg.is_train`, so its `s_q == 1` inference sweep checks O without checking LSE. For ragged GQA decode, request Stats explicitly, initialize every head to NaN, and compare every head against the reference. Include padded-Stats, MHA, and `s_q > 1` controls; pin a backend plan when testing native codegen so FROST cannot mask it. `test_mhas_v2.py::test_sdpa_ragged_decode_stats` is the detector (NVBug 6783545); run with `--runxfail` when checking an affected older backend.
 - **Plan-specific xfails must check the selected plan.** A heuristic can start ranking a working engine first without fixing another engine's compiler bug. An architecture-only xfail then turns correct outputs into strict-XPASS failures. Inspect `get_engine_and_knobs_at_index()` for the selected plan and keep `strict=True` plus the expected exception type for the affected engine. `test_sdpa_ragged_decode_stats` distinguishes the affected native 10X/107 engines (10/18) from working engine 8.
+- **Match the softmax precision before budgeting FP8 rounding.** HALF rounds both the exponent input and its approximate result before the FP8 P cast; a FLOAT-only reference can report data-dependent midpoint flips. Use the documented exponent error propagated through P and V, plus an identical-input unpacked control for packing changes. For split-KV, derive P-rounding bounds at each partition's own maximum and combine them using independently computed softmax weights (including the sink). An unsplit allowance is not a split reference. Keep independent Stats/Amax and replay checks. Do not fit expected failures to one random tensor coordinate.
 - **Seed before you allocate.** `torch.manual_seed()` after constructing the inputs seeds nothing that matters. Two runs meant to be compared then differ by data, and the assertion fails (or worse, passes) for a reason unrelated to what is under test — if two runs must be comparable, build the inputs once and reuse them.
 - **Bound dense attention references independently of kernel memory.** A full
   `[B, H, S_q, S_kv]` FP32 score tensor and GQA `repeat_interleave` can exhaust a
@@ -664,6 +665,26 @@ outputs and check every launch. `test_gemm_swiglu_retained_outputs_replay`
 covers multiple groups within a tile and persistent tile transitions, including
 one-group tiles that must advance the C ring at every tile boundary.
 
+For bulk MoE COMBINE, establish ownership from the per-CTA MMA slice, not the
+cluster-wide instruction shape: the normal 128-row slice gives each epilogue
+thread one complete feature row. Stage every register drain before submitting
+that row, and wait for async shared-memory reads before reusing it. Reserve
+staging ahead of the AB rings in both the SMEM budget and descriptor-root model.
+Bulk and atomic fallback predicates must agree for partial feature tiles and
+unaligned output rows. `gemm/frost/test_moe_combine_bulk.py` varies routed rows,
+features and scores independently, checks output padding, then changes scores
+under graph replay and rebinds the same artifact to a smaller token count.
+Its segmented-scale replay cases also change group boundaries and scale values
+in place. Normal 2-CTA configurations retain atomics pending qualification:
+the SM100 NVFP4-to-BF16 case at S/N/K=1026/512/1024 reported invalid shared
+writes under memcheck despite passing ordinary numerics. Keep the admission
+regression and run `test_two_cta_atomic_fallback` under compute-sanitizer on
+SM100 before widening that gate. SM107 swapped bulk uses a separate predicate
+and has its own native cases; passing those does not qualify normal 2-CTA bulk.
+The template barrier-parity detector permits the swapped bulk specialization's
+guard around the exact register-decrease prologue only. MMA operations and
+barrier calls, predicates and ordering still compare without that exception.
+
 Independent page tables need independent observed-span checks and Int64 stride
 slots in the prepared host. Test distinct K/V page values and layouts, then
 rebind allocations and mutate table values under capture replay. Preserve the
@@ -884,6 +905,12 @@ binding. `test_sdpa_native_prefill_binding.py` covers D192/V128 alongside the
 equal-width flavors, fresh storage, invalid current spans and physical wide
 output strides through both split and unsplit execution.
 
+For unequal-width dK/dV reductions, a vector rejected by the device row limit
+still belongs to its original output interval. Do not let a masked dK vector
+fall through to dV with a negative index. The compact cases in
+`test_sdpa_bwd_thd_d192_sm100.py` check live gradients and untouched capacity
+tails after changing lengths under capture, including an all-empty replay.
+
 A launch recorder must reconstruct the plan's actual native binder type after
 intercepting its entry. Hard-coding THD fails once dense prefill becomes native.
 Keep the existing KV-tail and fixed-shape rejection diagnostics, as exercised
@@ -1019,6 +1046,12 @@ Q. An empty Q still clears the current Amax_O word. Frame recorders must rebuild
 entries. `test_sdpa_native_thd_fp8_binding.py` checks these contracts against the
 actual host signature. When patching a newly allocated pybind tuple, move its
 unique ownership; an additional owning cast makes PyTuple_SetItem reject it.
+When an ordered graph test substitutes the independent Python binding oracle,
+also clear the plan's retained native ordered entry. Replacing `spec.native`
+alone does not change that entry and would silently compare native execution
+against itself. The measured-empty-workspace test exercises both transports.
+Keep launches and recorder consumption such as `frames.pop()` outside assertions;
+assert on their saved results so optimized Python cannot remove test state changes.
 
 MXFP8 split partials follow their own host ABI: SM100 D512 and SM107 MXFP8
 write half partials, even though other FP8 flavors on those architectures use
@@ -1111,3 +1144,11 @@ pure scratch-layout tests without a backend parameter. Verify collection with
 that filter. Gate suites that import kernel helpers with the shared DSL
 availability and version checks before importing those helpers. Keep pure
 layout suites runnable below the kernel DSL floor.
+
+When pinning append-only records, assert the historical field segment or a
+frozen positional prefix, written explicitly rather than derived from the
+current dataclass under test. A last-N-fields check over the entire current record
+rejects legal future appends. Source-call pins must distinguish positional
+operands from appended keyword arguments (use the AST); a final keyword does
+not move the last positional operand. The SDPA field-order and FP8 THD fold
+pins exercise these cases.

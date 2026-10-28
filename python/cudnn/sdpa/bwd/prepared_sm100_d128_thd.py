@@ -124,6 +124,14 @@ def check_support(api):
     return True
 
 
+def diag_delete_dq_reduce_add(api):
+    """The adapter record's DIAGNOSTIC flag (``SdpaBwdDslSm100D128.diag_delete_dq_reduce_add``), typed: a bool or a ``ValueError``."""
+    value = getattr(api, "diag_delete_dq_reduce_add", False)
+    if type(value) is not bool:
+        raise ValueError(f"{api._NAME}: diag_delete_dq_reduce_add must be a bool; got {type(value).__name__}")
+    return value
+
+
 class _GuardedEntry:
     """Shared by graph and standalone; metadata cannot alias a gradient write."""
 
@@ -177,7 +185,9 @@ def compile_plan(api):
     dtype = cutlass.BFloat16 if api.dtype == torch.bfloat16 else cutlass.Float16
     config = (b, h, bool(api.thd_stats_token_major))
     with torch.cuda.device(device):
-        entry = compile_host(config, api._thd_origins, api._thd_origin_dtypes, dtype, api.is_causal, cc[0] * 10 + cc[1])
+        entry = compile_host(
+            config, api._thd_origins, api._thd_origin_dtypes, dtype, api.is_causal, cc[0] * 10 + cc[1], diag_delete_dq_reduce_add=diag_delete_dq_reduce_add(api)
+        )
     fn = positional_entry(entry)
     if fn is None:
         raise NotImplementedError("d128 THD requires a positional tvm-ffi entry")

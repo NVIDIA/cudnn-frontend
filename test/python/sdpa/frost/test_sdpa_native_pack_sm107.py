@@ -8,7 +8,7 @@ import math
 import pytest
 
 from frost_test_utils import requires_dsl
-from test_sdpa_fwd_dsl_sm107 import _dense_mask, _half_oracle, _half_prefold_api, _rubin_only
+from sm107_half_test_utils import _dense_mask, _half_oracle, _half_prefold_api, _rubin_only
 
 pytestmark = [pytest.mark.L1, requires_dsl]
 
