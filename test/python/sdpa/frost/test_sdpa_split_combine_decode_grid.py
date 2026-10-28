@@ -350,10 +350,11 @@ def test_gate_in_combine_on_the_decode_grid(dtype, splits):
 @pytest.mark.parametrize("splits", [4, 32], ids=lambda s: f"s{s}")
 @pytest.mark.parametrize("i64", [pytest.param(False, id="i32", marks=_gpu), pytest.param(True, id="i64", marks=_gpu)])
 @pytest.mark.parametrize("sink", [False, True], ids=["plain", "sink"])
-def test_ragged_placement_on_the_decode_grid(i64, splits, sink):
-    """The ragged-Q decode leg's entry: three sequences of 2 / 0 / 1 query rows (``S_q`` max 2) land on the packed O / Stats
-    at their offsets (tokens 0, 1 and 2; the zero-length sequence writes nothing), the rows past a sequence's length are not
-    written, a canary past the capacity is untouched, the values match the reference, and ON == OFF bitwise at <= 16 splits."""
+@pytest.mark.parametrize("q_lens_form", [0, 1, 2], ids=["offset_lengths", "declared_lengths", "prefix_lengths"])
+def test_ragged_placement_on_the_decode_grid(i64, splits, sink, q_lens_form):
+    """Ragged O / Stats use physical spans 2 / 0 / 1 and optional declared lengths 1 / 0 / 1 (ordinary or prefix form).
+    Declared-empty rows and capacity canaries stay untouched, including with sink; live values match the reference,
+    and ON == OFF bitwise at <= 16 splits."""
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
     b, h, sq, d = 3, 4, 2, 256
@@ -365,15 +366,18 @@ def test_ragged_placement_on_the_decode_grid(i64, splits, sink):
         ref_o = ref_o * weight.permute(0, 2, 1).unsqueeze(-1)
         ref_lse = torch.logaddexp(ref_lse, logits)
     off_t = torch.int64 if i64 else torch.int32
-    q_lens = [2, 0, 1]
-    tok_off = [0, 2, 2, 3]  # exclusive prefix sums
+    q_lens = [1, 0, 1] if q_lens_form else [2, 0, 1]
+    declared_q = torch.tensor(q_lens, device="cuda", dtype=torch.int32) if q_lens_form else None
+    if q_lens_form == 2:
+        declared_q = torch.cat((declared_q.new_zeros(1), declared_q.cumsum(0).to(torch.int32)))
+    tok_off = [0, 2, 2, 3]  # physical token offsets, independent of declared lengths
     # Q / O offsets in ELEMENTS of a [T, H, D] packed buffer (div = H * D), Stats offsets in elements of [H, T] per
     # sequence (div = H: the head-major packed Stats), all int32 / int64.
     rq = torch.tensor([t * h * d for t in tok_off], dtype=off_t, device="cuda")
     ro = rq.clone()
     rl = torch.tensor([t * h for t in tok_off], dtype=off_t, device="cuda")
     cap = tok_off[-1]
-    fns = _entries(comb, dtype_o="bf16", has_lse=True, dtype_partial="f32", ragged=True, ragged_i64=i64, has_sink=sink)
+    fns = _entries(comb, dtype_o="bf16", has_lse=True, dtype_partial="f32", ragged=True, ragged_i64=i64, has_sink=sink, ragged_q_lens=q_lens_form)
     outs = {}
     for name, fn in fns.items():
         o = torch.full((1, cap + 2, h, d), -31.0, device="cuda", dtype=torch.bfloat16)  # two canary tokens past the capacity
@@ -394,12 +398,21 @@ def test_ragged_placement_on_the_decode_grid(i64, splits, sink):
             (cap, cap),
             *((sinks.data_ptr(),) if sink else ()),
             torch.cuda.current_stream().cuda_stream,
+            *((declared_q.data_ptr(),) if q_lens_form else ()),
         )
         torch.cuda.synchronize()
         got_o = o[0, :cap].cpu().float()  # [T, H, D]
         got_l = lse[0, :, :cap].cpu().double()  # [H, T]
-        want_o = torch.cat([ref_o[bi, : q_lens[bi]] for bi in range(b)], dim=0).float()
-        want_l = torch.cat([ref_lse[bi, :, : q_lens[bi]] for bi in range(b)], dim=1)
+        # Declared lengths govern liveness; physical offsets still govern placement.
+        want_o = torch.full((cap, h, d), -31.0)
+        want_l = torch.full((h, cap), -31.0, dtype=torch.float64)
+        written = torch.zeros(cap, dtype=torch.bool)
+        for bi, nq in enumerate(q_lens):
+            start = tok_off[bi]
+            want_o[start : start + nq] = ref_o[bi, :nq].float()
+            want_l[:, start : start + nq] = ref_lse[bi, :, :nq]
+            written[start : start + nq] = True
+        assert torch.all(got_o[~written] == -31) and torch.all(got_l[:, ~written] == -31), "declared-empty rows preserve canaries"
         torch.testing.assert_close(got_o, want_o, atol=0.004, rtol=0.004)
         live = torch.isfinite(want_l)
         torch.testing.assert_close(got_l[live], want_l[live], atol=2e-5, rtol=2e-5)
