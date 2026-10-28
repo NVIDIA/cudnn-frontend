@@ -10,7 +10,7 @@ from cuda.bindings import driver
 
 from cudnn.frost.compiled_cache import compile_cached
 from ...d128_thd_contract import MAPS_PER_SEQUENCE, ORIGIN_PORTS
-from ...d128_grouped_contract import ABI_VERSION, thd_workspace_offsets
+from ...d128_grouped_contract import ABI_VERSION, dkv_accum_fp32, resolve_dkv_accum, thd_workspace_offsets, validate_fp32_accum_fits
 from .bprop_d128_accum_grouped_helpers import host_thd
 
 
@@ -61,6 +61,8 @@ def host(
     origin_specs: cutlass.Constexpr,
     causal: cutlass.Constexpr[bool],
     stream: driver.CUstream,
+    diag_delete_dq_reduce_add: cutlass.Constexpr[bool] = False,
+    dkv_fp32: cutlass.Constexpr[bool] = False,
 ):
     batch, heads, kv_heads, token_major = config
     q, k, v = _io(q_ptr, t_q_phys, heads), _io(k_ptr, t_kv_phys, kv_heads), _io(v_ptr, t_kv_phys, kv_heads)
@@ -79,6 +81,13 @@ def host(
     meta = _scratch(payload, meta_off, cutlass.Int32, (4 * batch + 4,), (1,))
     origins = _scratch(payload, origins_off, cutlass.Int64, (len(ORIGIN_PORTS), batch), (batch, 1))
     maps = _scratch(payload, maps_off, cutlass.Int64, (MAPS_PER_SEQUENCE * batch * 16,), (1,))
+    if cutlass.const_expr(dkv_fp32):
+        # dkv_accum = fp32_reduce: the per-KV-head fp32 accumulators [1, rounded_k, Hkv, 128] carved INSIDE the bf16 per-Q-head partial regions
+        # (4 x Hkv <= 2 x Hq bytes per kv row on every grouped ratio: validate_fp32_accum_fits); the advertised workspace is unchanged
+        dk_acc = _scratch(payload, dk_off, cutlass.Float32, (1, rounded_k, kv_heads, 128), (rounded_k * kv_heads * 128, kv_heads * 128, 128, 1))
+        dv_acc = _scratch(payload, dv_off, cutlass.Float32, (1, rounded_k, kv_heads, 128), (rounded_k * kv_heads * 128, kv_heads * 128, 128, 1))
+    else:
+        dk_acc, dv_acc = None, None
     q_lens = cute.make_tensor(q_lens_ptr, cute.make_layout((batch + 1,), stride=(1,)))
     kv_lens = cute.make_tensor(kv_lens_ptr, cute.make_layout((batch + 1,), stride=(1,)))
     ro_ptrs = (ro_q_ptr, ro_k_ptr, ro_v_ptr, ro_o_ptr, ro_do_ptr, ro_dq_ptr, ro_dk_ptr, ro_dv_ptr, ro_stats_ptr)
@@ -111,11 +120,29 @@ def host(
         scale,
         causal,
         stream,
+        diag_delete_dq_reduce_add,
+        dkv_fp32,
+        dk_acc,
+        dv_acc,
     )
 
 
-def compile_host(config, origin_specs, origin_dtypes, dtype, causal, sm):
-    """Capacities and bounds are runtime scalars, never artifact key values."""
+def compile_host(config, origin_specs, origin_dtypes, dtype, causal, sm, *, diag_delete_dq_reduce_add=False, dkv_accum=None):
+    """Capacities and bounds are runtime scalars, never artifact key values.
+
+    ``diag_delete_dq_reduce_add`` (DIAGNOSTIC, default False) renders the shipped kernels under the unchanged cache key; the
+    armed build (dQ stays zero by design) is keyed apart so it can never be served to a default plan.  ``dkv_accum`` (the op-level
+    field: a ``DKV_ACCUM_FORMS`` name or ``None`` = ``bf16_partials``, the shipped chain under the unchanged key; typed, a ``ValueError``
+    by name) keys the ``fp32_reduce`` chain apart (every threaded Constexpr is in the key)."""
+    form = resolve_dkv_accum(dkv_accum)
+    fp32 = dkv_accum_fp32(form)
+    if fp32:
+        validate_fp32_accum_fits(config[1], config[2])
+    key = ("sdpa_bwd_sm100_d128_grouped_thd", ABI_VERSION, config, origin_specs, origin_dtypes, str(dtype), bool(causal), sm)
+    if diag_delete_dq_reduce_add:
+        key += ("diag_delete_dq_reduce_add",)
+    if fp32:
+        key += ("dkv_accum", form)
     types = [dtype] * 5 + [cutlass.Float32] + [dtype] * 3 + [cutlass.Int32] * 2
     args = [cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=4 if i == 5 or i >= 9 else 16) for i, t in enumerate(types)]
     ro_types = {"int32": (cutlass.Int32, 4), "int64": (cutlass.Int64, 8)}
@@ -134,7 +161,9 @@ def compile_host(config, origin_specs, origin_dtypes, dtype, causal, sm):
         origin_specs,
         bool(causal),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+        bool(diag_delete_dq_reduce_add),
+        fp32,
         options=f"--enable-tvm-ffi --gpu-arch sm_{sm}a",
-        cache_key=repr(("sdpa_bwd_sm100_d128_grouped_thd", ABI_VERSION, config, origin_specs, origin_dtypes, str(dtype), bool(causal), sm)),
+        cache_key=repr(key),
         symbol="frost_sdpa_bwd_sm100_d128_grouped_thd_prepared",
     )

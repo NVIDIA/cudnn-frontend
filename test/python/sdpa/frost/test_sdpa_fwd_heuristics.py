@@ -2304,6 +2304,39 @@ def test_sm107_paged_prefill_split_budget_spans_two_waves(sm107_metadata_target)
 
 
 @pytest.mark.L0
+def test_sm107_paged_split_ties_go_to_the_packed_grid(sm107_metadata_target):
+    """A bounded one-tile Rubin paged chunk (Q bound 128) declares as many packed tiles as unpacked ones; the live tokens sit at or
+    below the bound, so the equal-work tie goes to the packed grid at the same split -- on the main arm (G16 at one Q tile: a first-wave tie) and on the
+    one-tile fallback (G8). The SM100 wave choice keeps its unpacked tie-break."""
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.fwd.heuristics import _d128_thd_split_wave_choice, paged_thd_split_choice
+
+    caps = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16).capabilities
+    base = dict(
+        s_q=128,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        thd=True,
+        padded=True,
+        has_paged_kv=True,
+        page_size=16,
+        shape_overrides=True,
+        k_t=SimpleNamespace(get_stride=lambda: (8192, 4096, 256, 1)),
+        device_cc=(10, 7),
+        device_sm_count=216,
+    )
+    g16 = _facts(**dict(base, b=2, h_q=32, h_kv=2, s_kv=16384, max_total_seq_len_q=256))
+    assert paged_thd_split_choice(caps, g16) == (3, True)
+    assert [(p.knobs.pack_gqa, p.knobs.split_kv) for p in _sm107_f16_plans(g16)[:1]] == [(True, 3)]
+    g8 = _facts(**dict(base, b=4, h_q=32, h_kv=4, s_kv=32768, max_total_seq_len_q=512))
+    splits, pack = paged_thd_split_choice(caps, g8)
+    assert pack and splits > 1
+    assert _d128_thd_split_wave_choice(g8, extra_waves=3) == (splits, False)  # the default tie-break, unchanged for SM100
+
+
+@pytest.mark.L0
 def test_paged_gqa16_admits_split_and_prefers_packing(sm107_metadata_target):
     """GQA16 paged d128: Rubin's split domain admits group 16 (SM100 already did), and paged SM100 lists the packed set first."""
     from types import SimpleNamespace

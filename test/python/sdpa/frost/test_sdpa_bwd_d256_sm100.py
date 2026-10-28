@@ -20,6 +20,7 @@ both profiles and the twin's GPU matrix (``test_sdpa_bwd_dsl_sm107.py -k twox2``
 
 from __future__ import annotations
 
+import ast
 import math
 import os
 import re
@@ -53,7 +54,7 @@ pytestmark = [pytest.mark.L0, requires_dsl]
 
 _ENGINE = "sdpa_bwd_sm100_d256"
 _FAMILY_NAME = "frost_sdpa_bwd"
-_SLOT = 7  # engines/manifest.py: EngineSlot(7, opt_in=True) -> FROST_SDPA_BWD_ID_BASE + 7 (slot 6 is sdpa_bwd_sm107_mxfp8)
+_SLOT = 7  # engines/manifest.py: EngineSlot(7) -> FROST_SDPA_BWD_ID_BASE + 7 (slot 6 is sdpa_bwd_sm107_mxfp8)
 _ENGINE_ID = 20_607
 _D = 256
 _SM100_CC = (10, 0)
@@ -95,7 +96,7 @@ def _spec(name=_ENGINE):
 # =========================================================================== registration / capabilities (host)
 
 
-def test_engine_is_registered_and_opt_in():
+def test_engine_is_registered_and_offered_by_default():
     from cudnn.engines.engine_ids import FROST_SDPA_BWD_ID_BASE
     from cudnn.engines.manifest import MANIFEST
 
@@ -103,7 +104,8 @@ def test_engine_is_registered_and_opt_in():
     fam = next(f for f in MANIFEST if f.name == _FAMILY_NAME)
     assert _ENGINE in fam.slots, f"{_ENGINE} has no manifest slot (append slot {_SLOT}; never reuse a retired slot)"
     slot = fam.slots[_ENGINE]
-    assert slot.slot == _SLOT and slot.opt_in, "new engines stay opt-in until they earn arch coverage + benchmarks"
+    # Default since the 2026-10-27 B200 qualification; cudnn.sdpa.bwd.heuristics._leads ranks it against the backend.
+    assert slot.slot == _SLOT and not slot.opt_in
     assert FROST_SDPA_BWD_ID_BASE + slot.slot == _ENGINE_ID
     from cudnn.sdpa.bwd.engines import ENGINE_SPECS
 
@@ -1012,7 +1014,7 @@ def test_descriptor_version_is_derived_per_profile(profile):
 def test_every_smem_tile_takes_the_module_desc_version():
     code = _code_lines(_kernel_source())
     n_tiles = len(re.findall(r"\bSmemTile\(", code))
-    assert n_tiles == 8, "sQ, sdO, sdO_dv, sK, sV, sP, sdS, sdV"
+    assert n_tiles == 11, "sQ, sdO, sdO_dv, sK, sV, sP, sdS, sdV; fused D192 adds sQdk, sdS_mma and sdK"
     assert code.count("desc_version=DESC_VERSION") == n_tiles
     assert not re.search(r"desc_version=[01]\b", code)
     assert len(re.findall(r"^DESC_VERSION\b.*=", code, re.M)) == 1
@@ -1048,7 +1050,7 @@ def test_idesc_k_dim_and_q_loop_bounds_come_from_the_shared_primitives():
         "mma_ts(" not in code and "tcgen05_cp" not in code and "tcgen05_st(" not in code
     ), "every operand is an SMEM SS operand: no TS MMA, no UTCCP, no TMEM P store"
     assert "m_dim=CFG.MMA_M" in code and "m_dim=CFG.TILE_M * CFG.CTA_MMA" not in code, "every idesc carries the 2x2 collective M = 128"
-    assert code.count("elect_once=True") == 5, "the five mma_ss sites (prologue S, NATURAL S, dP, lookahead S, BMM2) elect once per call"
+    assert code.count("elect_once=True") == 6, "prologue S, NATURAL S, dP, lookahead S, BMM2 and optional dK elect once per call"
     assert "Producer.LEADER_RELEASE" in code, "mb_p_full publishes the lane-written sP slab with the .release.cta leader arrive"
 
 
@@ -1057,13 +1059,19 @@ def test_mbarrier_ledger_matches_the_config():
     ledger derives, for both profiles; LEADER / LEADER_RELEASE producers carry the LEADER scope."""
     from cudnn.sdpa.bwd import config_d256_2x2 as c2
 
-    src = _kernel_source()
-    bars_src = src[src.index("def _make_bars") : src.index("# Tile decode")]
-    pat = re.compile(r"(mb_\w+)=MBarrier\(_alloc\(([^)]+)\),\s*stages=([^,]+),\s*init_count=([^,]+),\s*producer=Producer\.(\w+)(?:,\s*scope=Scope\.(\w+))?\)")
-    rows = pat.findall(bars_src)
-    assert len(rows) == 25
-    for profile in (1, 2):
-        mod = _load_kernel(profile)
+    from cudnn.frost.template_loader import load_template
+
+    tree = ast.parse(_kernel_source())
+    factory = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_make_bars")
+    rows = next(n.value.keywords for n in factory.body if isinstance(n, ast.Return))
+    assert len(rows) == 29
+    modules = [_load_kernel(1), _load_kernel(2)]
+    modules += [
+        load_template(modules[0].__file__, c2.TemplateParams2x2(datapath_2x2_profile=1, head_dim_qk=192, head_dim_v=128, fuse_dk=True, thd_varlen=thd))
+        for thd in (False, True)
+    ]
+    for mod in modules:
+        profile = mod.CFG.DATAPATH_2X2_PROFILE
         want_stages, want_counts = c2.mbar_stage_counts_2x2(mod.CFG), c2.mbar_init_counts_2x2(mod.CFG)
         env = {
             k: getattr(mod, k)
@@ -1071,13 +1079,23 @@ def test_mbarrier_ledger_matches_the_config():
         }
         env["cfg"] = mod.CFG
         seen = set()
-        for name, alloc, stages, count, prod, scope in rows:
+        for row in rows:
+            name, call = row.arg, row.value
+            if isinstance(call, ast.IfExp):
+                call = call.body if eval(ast.unparse(call.test), {}, env) else call.orelse
+            if isinstance(call, ast.Constant) and call.value is None:
+                continue
+            assert isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "MBarrier"
+            kw = {item.arg: item.value for item in call.keywords}
+            alloc, stages, count = (ast.unparse(n) for n in (call.args[0].args[0], kw["stages"], kw["init_count"]))
+            prod, scope = kw["producer"].attr, kw["scope"].attr if "scope" in kw else None
             seen.add(name)
             assert eval(stages, {}, env) == eval(alloc, {}, env) == want_stages[name], (profile, name)
             assert eval(count, {}, env) == want_counts[name], (profile, name)
             assert (prod in ("LEADER", "LEADER_RELEASE")) == (scope == "LEADER"), (profile, name)
         assert seen == set(want_stages)
-        assert (mod.qTmaTransactionBytes, mod.kTmaTransactionBytes) == (65536, 65536 * profile)
+        q_bytes = 128 * mod.CFG.TILE_K * 2
+        assert (mod.qTmaTransactionBytes, mod.kTmaTransactionBytes) == (q_bytes, q_bytes * profile)
         assert mod.READ_TILE_ARRIVERS_TOT == 21
 
 

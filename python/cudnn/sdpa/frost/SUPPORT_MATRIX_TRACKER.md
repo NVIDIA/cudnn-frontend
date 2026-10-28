@@ -81,7 +81,9 @@ only (the graph attribute is forward-only).
 (`sdpa/fwd/placement.py`).
 `sdpa_bwd_sm100` (f16/bf16, d in (256, 512]) is a default candidate too: the backend has no SM100
 engine for that band, so it is the only provider there. `sdpa_bwd_sm100_d128` is a default candidate that ranks
-ahead of the backend for d128 THD without a window and behind it elsewhere (`sdpa/bwd/heuristics.py`). Every other
+ahead of the backend for d128 THD without a window and behind it elsewhere; `sdpa_bwd_sm100_d256` is a default candidate that
+ranks ahead of the backend for d256 on cc 10.0 and behind it for mask-free ragged THD past S_q 4096, D192x128, other parts,
+and deterministic, bias, dropout, windowed or sink graphs (`sdpa/bwd/heuristics.py`). Every other
 FROST SDPA engine is `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before
 `import cudnn` or the graph runs a cuDNN backend plan. The flag also ranks FROST first everywhere.
 
@@ -362,7 +364,7 @@ Engines: `sdpa_fwd_prefill_sm100` (f16/bf16), `sdpa_fwd_prefill_sm100_fp8`,
 `sdpa_fwd_prefill_sm100_mxfp8`, `sdpa_bwd_sm100`, `sdpa_bwd_sm100_mxfp8`,
 `sdpa_bwd_sm100_d256`, `sdpa_bwd_sm100_d128`. The half-precision d512 backward engine serves **only
 the large-head-dim band, d ∈ (256, 512]**, the half-precision d256 backward
-engine (`sdpa_bwd_sm100_d256`, the 2x2-datapath body, 2026-10-01, opt_in) serves
+engine (`sdpa_bwd_sm100_d256`, the 2x2-datapath body, 2026-10-01; default since 2026-10-27) serves
 **exactly d = 256 plus native dense and THD D192x128**, the d128 engine serves **exactly d = 128** for
 half-precision MHA and, on SM100 or SM103, BF16 GQA/MQA within the restrictions
 below. The MXFP8 backward engine serves **exactly d = 256** —
@@ -383,7 +385,13 @@ not the physical span including holes. These device-value bounds are caller
 contracts; execution performs no device-to-host inspection.
 
 With nonpaged K/V, setup emits sequence-local Q/K/V/O tensor maps in the existing metadata launch.
-Their extents exclude interior padding from loads and stores. Stats uses its own
+Their extents exclude interior padding from loads and stores. When every
+sequence's bound origins equal its compact prefixes in each port where it
+occupies rows (Q/O/Stats when it has query rows, K/V when it has keys), setup
+publishes one map per load port instead, clamped to the packed total, and the
+consumer acquires it once; O keeps a map per sequence. The choice is recorded
+in the workspace per launch, so a captured graph follows the offsets it replays
+with. Stats uses its own
 origin and preserves the declared token-major or head-major layout; a head-major
 pitch must cover the physical rows, including gaps. Each invocation binds current
 offset pointers, and captured graphs read changed offset values on replay.
@@ -439,9 +447,10 @@ the allocation contract. All scratch is initialized each execution.
 | Unmasked / top-left causal | ✅ |
 | IO layout | Compact BSHD rows; THD uses each port's ragged origins and ignores logical batch pitch |
 | Stats | Dense: contiguous FP32 natural-log LSE; THD: packed token-major or head-major with declared physical capacity |
-| Workspace / kernel launches | MHA: dense accumulation (any lengths) / 3, dense recompute (D64, left window, deterministic request, older CuTeDSL, negative scale) / 1, THD accumulation / 4. GQA/MQA: append native dK/dV partials and an FP32 group fold; dense / 4, THD / 5 |
+| Workspace / kernel launches | MHA: dense accumulation (any lengths) / 3, dense recompute (D64, left window, deterministic request, older CuTeDSL, negative scale) / 1, THD accumulation / 4. GQA/MQA: append native dK/dV partials and an FP32 group fold; dense / 4, THD / 5 (4 under `dkv_accum=fp32_reduce`: no fold launch) |
 | THD MHA | ✅ cc 10.0 or 10.3, public CuTeDSL >= 4.8, positive FP32 scale, positive declared capacities; actual empty sequences and tails supported |
 | GQA / MQA | ✅ BF16 only, cc 10.0 or 10.3, public CuTeDSL >= 4.8, positive FP32 scale, Hq > Hkv with integral ratio; dense Sq/Skv must be multiples of 128, THD accepts tails and empty actual sequences |
+| `cta_group::2` pair body (grouped THD BF16, top-left causal or unmasked, GQA / MQA), selected by the per-S heuristic | ✅ **native**, cc 10.0: served when both declared `S_q` and `S_kv` (the batch's longest sequence per side) are `>= 8192` (`d128_grouped_2cta_contract.CTA_PAIR_MIN_SEQ`) and the device admits a cluster of two (occupancy query); below the threshold, on cc 10.3 and on dense GQA the one-CTA grouped body serves. Op-level field `cta_pair`: `auto` (default, the rule) / `off` (one-CTA always) / `on` (the pair at any S; a failing predicate -- THD, cc, cluster, grouped heads -- declines by name). Same contract, workspace sizing and 5 launches as the one-CTA THD GQA chain; dQ accumulation unordered either way. Op-level field `dkv_accum` (both grouped THD bodies): `bf16_partials` (default: one bf16 partial per q head + the fp32 fold launch, a fixed summation order) / `fp32_reduce` (opt-in: fp32 accumulation across the q heads of a kv head in hardware order with one bf16 rounding at the output, four launches; a rounding change -- dK / dV are not bitwise reproducible across runs; declined by name on dense GQA, MHA and under `warp_roles="16w_fa4"`). Op-level fields `mask_form` (`fsel` default / `predicated`) and `warp_roles` (`16w` default / `16w_fa4`, an alternate role shape kept for follow-up work) select bitwise-identical dK / dV renderings of the pair body |
 | Left sliding window | ✅ dense MHA D64/D128, with or without top-left causal |
 | Bottom-right causal, dense padding mask, right-band widening | ❌ |
 | Deterministic request | ✅ dense MHA, via fixed-order recompute; ❌ THD / GQA / MQA |
@@ -488,6 +497,32 @@ fallbacks; `test_sdpa_bwd_d128_thd_sm100.py` covers the packed MHA path.
 admission; `test_sdpa_bwd_d128_grouped_sm100.py` covers grouped numerics,
 origins, native binding, workspace poison, launch counts and capture/replay.
 Grouped and packed performance parity is not claimed by this capability release.
+
+**Grouped THD `cta_group::2` pair body and its per-S heuristic (2026-10-27).** The BF16 grouped
+THD backward has a second implementation, `accumulation_grouped_thd_2cta`: one cluster of two
+CTAs owns a 256-row KV work item (`bprop_d128_accum_grouped_2cta_stail_f16.py`, the `s_tail`
+TMEM map: the dQ image in the S^T tail, FAv4's rotated MMA issue order, a dedicated dQ staging
+ring), the dS^T half exchanged between the pair through DSMEM; the setup, delta / dQ-zero, dQ-cast
+and group-fold launches are shared with the one-CTA chain, so the launch count stays 5 and the
+workspace contract is the grouped THD one with nine per-sequence tensor maps. The typed adapter
+field `cta_pair` selects the body: `auto` (the default) serves the pair when both declared
+`S_q` and `S_kv` reach `CTA_PAIR_MIN_SEQ` = 8192 on cc 10.0 with a cluster of two admitted by
+the device's occupancy query, and the one-CTA body otherwise; `off` pins the one-CTA body; `on`
+pins the pair at any sequence length and declines by name (THD, cc, cluster, grouped heads) when
+a predicate fails. The threshold is the smallest sequence length at which the pair body won the
+in-session backward step against the one-CTA body on GB200 (cc 10.0): 8K / 16K / 32K / 64K
+uniform and the varlen ramps, every cell by more than the measurement band. **Measured** (GB200
+class, cc 10.0, SM clock locked, every process under the power cap: in-process ratios
+are the figures, absolutes are lower bounds): the pair body vs the one-CTA body on the eager
+backward step +4.9 % (8K) / +7.9 % (16K) / +8.5 % (32K) / +8.8 % (64K), B 4, Hq 32, Hkv 4, causal
+THD; pair / FlashAttention-4 1.036-1.044 on the eager step and 1.019-1.032 on CUDA-graph replay of
+the whole chain; the kernel of record is the pair body's default rendering, PTX md5 4b3d0bbb (the
+test module's pin); the per-cell tables are in the PR. cc 10.3 and the 2K / 4K cells serve the
+one-CTA body (2K / 4K measured as a loss for the pair; cc 10.3 unmeasured) until a row is added here. `test_sdpa_bwd_d128_cta_pair_heuristic.py`
+pins the constants, the selection table, the declines and the launch census per selection;
+`test_sdpa_bwd_d128_2cta_stail_sm100.py` / `test_sdpa_bwd_d128_2cta_stail_xfa4_sm100.py` cover the
+pair body's numerics, degenerate rows and renderings; `test_sdpa_bwd_d128_dkv_accum_sm100.py` the
+`dkv_accum` field on both bodies (fp64 ladder, launch census, the dQ twin).
 
 The MXFP8 backward is a **two-kernel chain with a scale-factor repack in
 front**: the seven F8_128x4 scale tensors are repacked into the kernels'
@@ -1314,11 +1349,11 @@ Engines: `sdpa_fwd_prefill_sm107` (f16/bf16), `sdpa_fwd_prefill_sm107_fp8`
 (per-tensor FP8) and `sdpa_fwd_prefill_sm107_mxfp8` (block-scale) forward;
 `sdpa_bwd_sm107` (f16/bf16), `sdpa_bwd_sm107_fp8` (per-tensor FP8 E4M3,
 `sdpa_fp8_backward`) and `sdpa_bwd_sm107_mxfp8` (block-scale MXFP8 E4M3,
-`sdpa_mxfp8_backward`, see ᵐˣ) backward — **d = 256 exactly**, see ᵇ — and, since
+`sdpa_mxfp8_backward`, see ᵐˣ) backward — **d = 256 exactly for half/MXFP8; exact (256, 256) or (192, 128) for per-tensor FP8**, see ᵇ — and, since
 2026-10-01, `sdpa_bwd_sm107_d512` (f16/bf16, **d ∈ (256, 512]** envelope-served
 on 512-wide tiles, opt_in, the 2x2-datapath stage 2 at the 8-stage ring arm, see
-ᵇ³). Every other backward graph on the Rubin line (d < 256; d > 256 outside the
-f16/bf16 d ∈ (256, 512] band; a quantized graph off d = 256) gets a typed
+ᵇ³). Other head pairs outside these domains (including quantized pairs other than
+D256 and the per-tensor FP8 D192/V128 pair) get a typed
 `cudnnGraphNotSupportedError` at plan creation — the backend has no d = 256 MXFP8
 backward kernel on smVersion 1070 either, so the MXFP8 row is that graph's sole
 provider (MEASURED 2026-09-29).
@@ -1357,7 +1392,7 @@ from the layout **and** the version-1 SF path validated on Rubin — not free:
 putting the d128/d256 MXFP8 tiles on descriptor version 1 turned 21 green tests
 red (2026-09-08).
 
-| Feature | d32 (triangle attention)<br>FPROPᵗ | d64 (GPT-OSS)<br>FPROP | d128 (Llama)<br>FPROP | d192×d128 (DSv3 MLA)<br>FPROP | d256 (Qwen)<br>FPROP | d512 (DSv4)<br>FPROP | d256<br>BPROPᵇ | d512 (DSv4)<br>BPROPᵇ³<br>d ∈ (256, 512] |
+| Feature | d32 (triangle attention)<br>FPROPᵗ | d64 (GPT-OSS)<br>FPROP | d128 (Llama)<br>FPROP | d192×d128 (DSv3 MLA)<br>FPROP | d256 (Qwen)<br>FPROP | d512 (DSv4)<br>FPROP | d256; FP8 also d192×d128<br>BPROPᵇ | d512 (DSv4)<br>BPROPᵇ³<br>d ∈ (256, 512] |
 | --- | :--: | :--: | :--: | :--: | :--: | :--: | :--: | :--: |
 | **Data types** |  |  |  |  |  |  |  |  |
 | FP16 / BF16 | ✅ᵗ | ✅ᵗ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ | ✅ᵇ³ |
@@ -1365,7 +1400,7 @@ red (2026-09-08).
 | MXFP8 | ❌ | ❌ | ✅ | ✅ˣ | ✅ | ⚠️ⁱᵛ | ✅ᵐˣ (E4M3 payloads, bf16 gradients, **no amax**) | ❌ |
 | O dtype ≠ QKV — **quantized graphs only** (fp16/bf16/fp8 out) | — | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ (fp8 row: dQ/dK/dV e4m3, bf16 or fp16) · ✅ᵐˣ (mxfp8 row: bf16 only; fp16 declined, follow-up) | — |
 | Block-scaled O (`sdpa_fp8` / `sdpa_mxfp8` + `sf_o`): FP4_E2M1 O + E4M3 scale per 16 d, or E4M3 O + UE8M0 scale per 32 d — dense/unsplit/unpacked only | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | — | — |
-| Head-dim envelope | f16 ×8: every D ≤ 32 (8 / 16 / 24 / 32)ᵗ | f16 ×8: every 32 < D ≤ 64 (40 / 48 / 56 / 64)ᵗ · per-tensor fp8 ×16 up to64 on native64ⁱ | f16 ×8 · fp8 ×16 | f16 ×8 · fp8 ×16¹⁰ | f16 ×8 · fp8 ×16¹⁰ | f16 ×8 · fp8 ×16 (floor 256) | none — exact (256, 256) | f16 ×8 — envelope-served on 512-wide tiles (floor 256, exclusive)ᵇ³ |
+| Head-dim envelope | f16 ×8: every D ≤ 32 (8 / 16 / 24 / 32)ᵗ | f16 ×8: every 32 < D ≤ 64 (40 / 48 / 56 / 64)ᵗ · per-tensor fp8 ×16 up to64 on native64ⁱ | f16 ×8 · fp8 ×16 | f16 ×8 · fp8 ×16¹⁰ | f16 ×8 · fp8 ×16¹⁰ | f16 ×8 · fp8 ×16 (floor 256) | none — exact (256, 256); per-tensor FP8 also exact (192, 128) | f16 ×8 — envelope-served on 512-wide tiles (floor 256, exclusive)ᵇ³ |
 | **Layout** |  |  |  |  |  |  |  |  |
 | BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Arbitrary dense stride order (`dense_flex`) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ᵇ³ |
@@ -2612,6 +2647,7 @@ envelope and fused bias/sinks remain unavailable to THD.
 | Backward sink / dSink, bias / dBias | SM100, SM103 |
 | f16/bf16 d = 256 backward: dense padding mask, right-band widening, THD, `dense_flex`, decode, deterministic; the 4-CTA multicast arm (perf) | SM100, SM103 — the ᵇ² row serves dense / causal (top-left, bottom-right) / sliding window / GQA on BSHD only |
 | Backward deterministic | SM100, SM103 — served by the MXFP8 d=256 row only |
+| d128 grouped THD `cta_group::2` pair body below `S` 8192, on cc 10.3, on dense GQA / MQA and on MHA | SM100, SM103 — the per-S heuristic (`cta_pair = auto`) serves the one-CTA grouped body there (below the threshold the pair has no measured win: the 2K / 4K cells are MEASURED as a loss for the pair on the step, -3.9 % / -3.5 %; cc 10.3 is unmeasured; the pair has no dense twin and no MHA body); `cta_pair = on` declines by name |
 | Backward decode-shaped S_q = 1 | SM100, SM103 — served by the MXFP8 d=256 row and the dense MHA f16/bf16 d128 row |
 | MXFP8 backward: E5M2, bottom-right / band-widened / sliding-window masks, non-BSHD strides, `amax_*` outputs | SM100, SM103 |
 | f16/bf16 forward split-KV | SM90, SM80; SM107 D512 and dense D256; THD outside D128/D256 and nonpaged D192 |
@@ -3422,8 +3458,7 @@ link serializes, read back by `pdl_stages` / `use_pdl_effective` on the block, `
 each form's envelope; the quantized and e4m3 pipelines decline the switch, typed; the block-sparse chain takes it since 2026-10-21 -- the sparse core's
 `griddepcontrol` sites (one wait per role before its first dependent read; no explicit release -- the CTA exit triggers the dependent at the core's
 completion, the placement measured on the cc 10.7 class) and its split combine's pair, bitwise
-the plain chain, `thd=True` x the switch declined by name, the AUTO reading `False` on the sparse form (`SPARSE_DECODE_PDL_DEFAULT_CCS`, kept empty: the 212-SM cc 10.7 class measured +2.1 % / +4.1 % at B 1 x 8K / 32K, a gain below the flip bar of >= 1.0 us and >= 5 %;
-empty) -- a knob, no `Capabilities` field) and `fuse_norm_rope_small_m` (at `B x S_q <= 128` a `fuse_norm_rope=True` declaration
+the plain chain, `thd=True` x the switch declined by name, the AUTO reading `True` on the sparse form's caller-list block on cc 10.7 since 2026-10-27 (`SPARSE_DECODE_PDL_DEFAULT_CCS = ((10, 7),)`: the 212-SM cc 10.7 class measured the switched block bitwise the plain one and faster on every cell -- +0.6 .. +2.5 % per decode step at B 1 (the lean tile), +2.4 .. +3.5 % at B 4 and +2.3 .. +3.8 % at B 32 (the tcgen05 core) over 8K / 32K / 128K at S_q 1 and 8K at S_q 4, no cell slower than its control band -- so the default followed the measurement; the earlier reading of +2.1 % / +4.1 % at B 1 x 8K / 32K alone, held below a per-step bar, is superseded by the full coverage; `False` on every other part until measured, never under the in-block indexer, which declines the switch; a knob-domain change, Rule S2 exempt) -- a knob, no `Capabilities` field) and `fuse_norm_rope_small_m` (at `B x S_q <= 128` a `fuse_norm_rope=True` declaration
 LOWERS stage (1) to the unfused chain -- `fuse_norm_rope_effective` reads it back; `True` keeps the fused fork for the A/B, and so does an
 explicit `fuse_cache_write=True`, the request for the arm that lives in the fork; `False` + `fuse_cache_write=True` is the typed decline).
 
@@ -3824,3 +3859,20 @@ The native CGA4x1 / CTA_MMA2 role-split body packs whole query-head groups divid
 ### Native SM107 D512 per-tensor FP8 split-KV
 
 The CGA4x1 / CTA_MMA2 role-split D512 body now supports dense packed and unpacked split-KV, including its existing aligned head envelope, runtime Q/KV lengths and scalar KV tails. Every role decodes the same narrowed split interval, including empty chunks without a mask. The main kernel writes FP32 partial O and natural-log Stats in caller workspace; the shared combine applies the sink and final output scale once. The native [0,2,1,3] TMEM column permutation is preserved through bounded partial stores. Optional final Stats/Amax, base-2 final Stats, both FP8 inputs and all existing half/FP8 outputs retain the shared graph/adapter contract. THD, paged KV and MXFP8 splits remain declined on this flavor. Tests are collected through `TestNativeD512Fp8Split` in the SM107 architecture entry. No heuristics or placement change.
+
+
+### Native SM107 per-tensor FP8 D192x128 backward
+
+The existing opt-in `sdpa_bwd_sm107_fp8` row serves exact Q/K=192 and V/O=128
+alongside D256. Dense BSHD and packed THD use native operand widths, including
+their tensor maps, delta reduction, workspace and GQA fold; no data repack is
+added. The row retains its E4M3 input, E4M3/BF16/FP16 gradient, mask, amax,
+Stats-layout and declared-total contracts. Other head pairs, half and MXFP8
+rows keep their existing eligibility. Placement and heuristic policy are unchanged.
+
+Detectors: the `native_d192` tests in `test_sdpa_bwd_fp8_sm107.py` and
+`test_sdpa_bwd_thd_fp8_sm107.py` cover standalone and graph execution, both dS
+precisions, all gradient types, GQA, tails and empty sequences, requested amax,
+rebinding and retained replay. `test_fp8_tma_layout_matches_each_mma_consumer`
+checks the distinct dP/dV shared-memory layouts; the paired-fold tests retain
+legacy D256 controls and independent gradient widths.

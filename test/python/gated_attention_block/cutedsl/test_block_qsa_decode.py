@@ -2952,34 +2952,40 @@ def test_pdl_on_is_bitwise_pdl_off_on_the_decode_ladder(row):
     assert torch.equal(_bits(b), _bits(c)), "a second switched step is not bitwise the first"
 
 
-def test_pdl_auto_stays_off_on_the_sparse_form_until_measured_and_the_envelope_says_so(monkeypatch):
-    """The AUTO reading of ``use_pdl`` on the block-sparse decode mode is False on every part today (``SPARSE_DECODE_PDL_DEFAULT_CCS``
-    is EMPTY: a part enters it with its measurement); the arm exists behind the tuple -- with the tuple patched to the measured dense part
-    AUTO resolves True on the sparse form and the switch reaches the sparse stage; an explicit value wins either way.  The envelope names
-    the switched stage kinds on the sparse form (``DECODE_PDL_STAGES``, the same four) and reads ``pdl_default`` off the sparse tuple."""
+def test_pdl_auto_resolves_true_on_the_sparse_form_on_the_measured_part_and_the_envelope_says_so(monkeypatch):
+    """The AUTO reading of ``use_pdl`` on the block-sparse decode mode is True on the measured part (``SPARSE_DECODE_PDL_DEFAULT_CCS ==
+    ((10, 7),)`` since 2026-10-27: the switched caller-list block measured against the plain one over B 1 / 4 / 32 -- bitwise, no cell slower)
+    and False on every other part; the switch reaches the sparse stage under AUTO exactly as under the explicit True; an explicit value wins
+    either way (``use_pdl=False`` pins the plain chain on cc 10.7); with the tuple patched EMPTY the former reading returns (False everywhere,
+    the explicit True still served).  The envelope names the switched stage kinds on the sparse form (``DECODE_PDL_STAGES``, the same four)
+    and reads ``pdl_default`` off the sparse tuple (True on cc 10.7, False on cc 10.0 and under the empty tuple); the dense form keeps its own."""
     from cudnn.frost import buffers
     from cudnn.gated_attention_block import api as _api
 
-    assert _api.SPARSE_DECODE_PDL_DEFAULT_CCS == ()
+    assert _api.SPARSE_DECODE_PDL_DEFAULT_CCS == ((10, 7),)
     monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 7))
     with _no_host_sync():
         auto = _declare(GEOM_SMALL, 2, 1, n_pages=4)[0]
         on = _declare(GEOM_SMALL, 2, 1, n_pages=4, use_pdl=True)[0]
         off = _declare(GEOM_SMALL, 2, 1, n_pages=4, use_pdl=False)[0]
-    assert auto.use_pdl_requested is None and auto.use_pdl is False and auto.pdl_stages == () and auto.use_pdl_effective is False
-    assert on.use_pdl is True and "sdpa_sparse" in on.pdl_stages and on.use_pdl_effective is True and off.use_pdl is False and off.pdl_stages == ()
-    monkeypatch.setattr(_api, "SPARSE_DECODE_PDL_DEFAULT_CCS", ((10, 7),))
-    with _no_host_sync():
-        measured = _declare(GEOM_SMALL, 2, 1, n_pages=4)[0]
-        other_part = None
-    assert measured.use_pdl_requested is None and measured.use_pdl is True and "sdpa_sparse" in measured.pdl_stages and measured.use_pdl_effective is True
-    assert _declare(GEOM_SMALL, 2, 1, n_pages=4, use_pdl=False)[0].use_pdl is False
+    assert auto.use_pdl_requested is None and auto.use_pdl is True and "sdpa_sparse" in auto.pdl_stages and auto.use_pdl_effective is True
+    assert auto.pdl_stages == on.pdl_stages and auto._sdpa.use_pdl is True, "AUTO on the measured part = the explicit True's chain"
+    assert on.use_pdl is True and on.use_pdl_requested is True and "sdpa_sparse" in on.pdl_stages and on.use_pdl_effective is True
+    assert off.use_pdl is False and off.use_pdl_requested is False and off.pdl_stages == () and off.use_pdl_effective is False
+    assert off._sdpa.use_pdl is False, "the explicit False pins the plain chain on the measured part"
     monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 0))
     with _no_host_sync():
         other_part = _declare(GEOM_SMALL, 2, 1, n_pages=4)[0]
-    assert other_part.use_pdl is False, "a part outside the tuple reads False"
+    assert other_part.use_pdl is False and other_part.pdl_stages == (), "a part outside the tuple reads False"
+    monkeypatch.setattr(_api, "SPARSE_DECODE_PDL_DEFAULT_CCS", ())
+    monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 7))
+    with _no_host_sync():
+        unmeasured = _declare(GEOM_SMALL, 2, 1, n_pages=4)[0]
+        still_on = _declare(GEOM_SMALL, 2, 1, n_pages=4, use_pdl=True)[0]
+    assert unmeasured.use_pdl is False and unmeasured.pdl_stages == () and still_on.use_pdl is True, "the tuple patched EMPTY = the former reading"
     monkeypatch.undo()
-    # the envelope: the sparse form names the four switched stage kinds; pdl_default reads the sparse tuple (empty -> False; patched -> True)
+    # the envelope: the sparse form names the four switched stage kinds; pdl_default reads the sparse tuple (cc 10.7 -> True; cc 10.0 -> False;
+    # patched empty -> False); the dense form reads its own tuple either way
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     geom, _ = _geom(GEOM_SMALL)
     env = GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=_SM107)
@@ -2988,24 +2994,28 @@ def test_pdl_auto_stays_off_on_the_sparse_form_until_measured_and_the_envelope_s
         and env.decode.sparse_core
         and env.decode.pdl_stages == _api.DECODE_PDL_STAGES == ("qk_norm_rope", "cache_write", "sigmoid_gate", "sdpa")
     )
-    assert env.decode.pdl_default is False
-    monkeypatch.setattr(_api, "SPARSE_DECODE_PDL_DEFAULT_CCS", ((10, 7),))
-    assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=_SM107).decode.pdl_default is True
+    assert env.decode.pdl_default is True, "the measured part: the sparse tuple holds cc 10.7"
     assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=(10, 0)).decode.pdl_default is False
-    dense = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**GEOM_SMALL, causal_bottom_right=True), BF16, _DEV, device_cc=_SM107)
+    dense_geom = GatedAttentionBlockGeometry(**GEOM_SMALL, causal_bottom_right=True)
+    dense = GatedAttentionBlockFwd.serving_envelope(dense_geom, BF16, _DEV, device_cc=_SM107)
     assert dense.decode.pdl_default is True and not dense.decode.sparse_core, "the dense form keeps its own measured tuple"
+    monkeypatch.setattr(_api, "SPARSE_DECODE_PDL_DEFAULT_CCS", ())
+    assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=_SM107).decode.pdl_default is False, "the empty tuple = the former reading"
+    assert GatedAttentionBlockFwd.serving_envelope(dense_geom, BF16, _DEV, device_cc=_SM107).decode.pdl_default is True, "the dense tuple is its own"
 
 
 def test_pdl_auto_never_resolves_true_under_the_in_block_indexer_whatever_the_tuple_holds(monkeypatch):
-    """The AUTO reading of ``use_pdl`` under ``QsaSpec(index_source="indexer")`` is False even with the sample's part IN
-    ``SPARSE_DECODE_PDL_DEFAULT_CCS``: the two readings answer for ONE domain -- the explicit True is declined by name there (the scorer /
-    top-k / step kernels would take the switch unmeasured), so a future measured entry in the tuple must not flip the indexer block through
-    the back door.  The caller-list block on the same patched tuple and part resolves True (the arm itself is live); the envelope agrees
-    (``pdl_default`` False on the indexer form)."""
+    """The AUTO reading of ``use_pdl`` under ``QsaSpec(index_source="indexer")`` is False with the sample's part IN
+    ``SPARSE_DECODE_PDL_DEFAULT_CCS`` (cc 10.7, the SHIPPED tuple since the 2026-10-27 measurement -- read as shipped, not patched): the two
+    readings answer for ONE domain -- the explicit True is declined by name there (the scorer / top-k / step kernels would take the switch
+    unmeasured), so the measured entry in the tuple must not flip the indexer block through the back door.  The caller-list block on the same
+    part resolves True (the default's own route); the envelope agrees (``pdl_default`` False and no switched stage on the indexer form, True
+    with the four stage kinds on the caller-list form)."""
+    from cudnn.frost import buffers
     from cudnn.gated_attention_block import api as _api
 
+    assert (10, 7) in _api.SPARSE_DECODE_PDL_DEFAULT_CCS, "the shipped tuple holds the measured part: nothing patched here"
     monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 7))
-    monkeypatch.setattr(_api, "SPARSE_DECODE_PDL_DEFAULT_CCS", ((10, 7),))
     with _no_host_sync():
         indexer = _declare_indexer()
         caller_list = _declare(GEOM_SMALL, 2, 1, n_pages=4)[0]
@@ -3014,8 +3024,11 @@ def test_pdl_auto_never_resolves_true_under_the_in_block_indexer_whatever_the_tu
     with pytest.raises(NotImplementedError, match="use_pdl=True is served for the bf16 / f16 block only"):
         with _no_host_sync():
             _declare_indexer(use_pdl=True)
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     env = GatedAttentionBlockFwd.serving_envelope(indexer.geom, BF16, _DEV, device_cc=_SM107)
-    assert env.decode.pdl_default is False and env.decode.pdl_stages == ()
+    assert env.decode.served and env.decode.pdl_default is False and env.decode.pdl_stages == ()
+    env_cl = GatedAttentionBlockFwd.serving_envelope(caller_list.geom, BF16, _DEV, device_cc=_SM107)
+    assert env_cl.decode.served and env_cl.decode.pdl_default is True and env_cl.decode.pdl_stages == _api.DECODE_PDL_STAGES
 
 
 def test_pdl_is_declined_on_e4m3_pools_and_on_the_packed_sparse_form_by_name():

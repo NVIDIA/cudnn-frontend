@@ -125,6 +125,8 @@ class TemplateParams2x2(TemplateParams):
 
     head_dim_qk: int = 256
     head_dim_v: int = 256
+    # Internal prepared-chain choice; raw stage-2 callers retain the dV/dS ABI.
+    fuse_dk: bool = False
 
 
 @dataclass(frozen=True)
@@ -169,6 +171,7 @@ class CfgBwdD256x2(CfgBwdD256):
     MMA_LOOKAHEAD: int = 0
     # TMEM columns between sub-block 0's and sub-block 1's regions (profile 2); 0 with one sub-block.
     SUBBLOCK_STRIDE_COLS: int = 0
+    FUSE_DK: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -311,13 +314,21 @@ class TmemLayout2x2:
     USED_COLS: int
     FREE_COLS: int
 
+    @property
+    def dK_BASE(self) -> int:
+        return self.dV_BASE + self.DV_COLS
+
+    @property
+    def DK_COLS(self) -> int:
+        return self.SUB_USED - self.dK_BASE
+
 
 def tmem_layout_2x2(cfg: CfgBwdD256x2) -> TmemLayout2x2:
     s_base = 0
     dp_base = cfg.STAGES_TMEM_S * _S_COLS
     dv_base = 2 * cfg.STAGES_TMEM_S * _S_COLS
     dv_cols = cfg.TILE_O // 2
-    sub_used = dv_base + dv_cols
+    sub_used = dv_base + dv_cols + (cfg.TILE_K // cfg.CTA_MMA if cfg.FUSE_DK else 0)
     sub_stride = sub_used if cfg.KV_SUBBLOCKS > 1 else 0
     used = cfg.KV_SUBBLOCKS * sub_used
     return TmemLayout2x2(
@@ -379,7 +390,14 @@ def smem_layout_2x2(cfg: CfgBwdD256x2) -> Tuple[SmemSlab, ...]:
         [(f"sP[{s}][{p}]", (s * cfg.STAGES_SMEM_P + p) * p_slab) for s in range(cfg.KV_SUBBLOCKS) for p in range(cfg.STAGES_SMEM_P)],
     )
     _push("sStats", cfg.STATS_STAGES * b.STATS_SLOT_ELEMS * 4)
-    _push("sdS", cfg.XFER_STAGES * b.dSBufferElems * cfg.BPE_DS)
+    _push(
+        "sdS",
+        cfg.XFER_STAGES * b.dSBufferElems * cfg.BPE_DS,
+        [(f"sdS_mma[{i}]", i * b.dSBufferElems * cfg.BPE_DS) for i in range(cfg.XFER_STAGES)] if cfg.FUSE_DK else (),
+    )
+    if cfg.FUSE_DK:
+        # Q in the transposed dK view: TILE_N rows by TILE_K / CTA_MMA columns.
+        _push("sQdk", b.qBufferElems * cfg.BPE, [("sQdk", 0)])
     return tuple(slabs)
 
 
@@ -387,8 +405,14 @@ def smem_bytes_2x2(cfg: CfgBwdD256x2) -> int:
     return sum(s.nbytes for s in smem_layout_2x2(cfg))
 
 
+def _scaffold_budget_2x2(cfg: CfgBwdD256x2) -> int:
+    # The fused body declares 576 B of barriers/scheduler/pointer storage;
+    # reserve a full aligned KiB. Other bodies retain their original allowance.
+    return 1024 if cfg.FUSE_DK else SMEM_SCAFFOLD_BYTES
+
+
 def kernel_smem_bytes_2x2(cfg: CfgBwdD256x2) -> int:
-    return smem_bytes_2x2(cfg) + SMEM_SCAFFOLD_BYTES
+    return smem_bytes_2x2(cfg) + _scaffold_budget_2x2(cfg)
 
 
 def desc_roots_2x2(cfg: CfgBwdD256x2) -> Tuple[Tuple[str, int], ...]:
@@ -412,7 +436,9 @@ def mbar_stage_counts_2x2(cfg: CfgBwdD256x2) -> Dict[str, int]:
     replaced by the SMEM ring's ``mb_p_full``).  ADDED: ``mb_s_acc_empty`` (the fp8 twin's), ``mb_p_empty``."""
     n_s = cfg.KV_SUBBLOCKS * cfg.STAGES_TMEM_S
     n_p = cfg.KV_SUBBLOCKS * cfg.STAGES_SMEM_P
+    fused = {"mb_qdk_full": 1, "mb_qdk_empty": 1, "mb_ds_mma_full": cfg.XFER_STAGES, "mb_ds_mma_empty": cfg.XFER_STAGES} if cfg.FUSE_DK else {}
     return {
+        **fused,
         "mb_q_full": cfg.STAGES_Q,
         "mb_q_empty": cfg.STAGES_Q,
         "mb_do_full": cfg.STAGES_dO,
@@ -452,7 +478,9 @@ def mbar_init_counts_2x2(cfg: CfgBwdD256x2) -> Dict[str, int]:
       (256), ``ds_smem_empty`` / ``dv_stg_empty`` the TMA-STG's elected lane (1).
     """
     one, commit, lanes = cfg.ONE_LANE, cfg.MMA_COMMIT_ARRIVES, cfg.SOFTMAX_LANES
+    fused = {"mb_qdk_full": one, "mb_qdk_empty": commit, "mb_ds_mma_full": cfg.SOFT_X_CTA_MMA, "mb_ds_mma_empty": commit} if cfg.FUSE_DK else {}
     return {
+        **fused,
         "mb_q_full": one,
         "mb_q_empty": commit,
         "mb_do_full": one,
@@ -559,6 +587,19 @@ def _validate_cfg_d256_2x2(cfg: CfgBwdD256x2) -> None:
                 f"{f}: L_CNT (the per-sub-block LEADER-scope fan-in) must be the sub-block's compute lanes x CTA_MMA = {(cfg.SOFTMAX_LANES // cfg.KV_SUBBLOCKS) * cfg.CTA_MMA}; got {cfg.L_CNT}",
             ),
             (cfg.MMA_LOOKAHEAD in (0, 1), f"{f}: MMA_LOOKAHEAD is 0 (NATURAL) or 1 (lookahead); got {cfg.MMA_LOOKAHEAD}"),
+        ]
+    )
+    _check(
+        [
+            (cfg.FUSE_DK in (0, 1), f"{f}: FUSE_DK must be 0 or 1"),
+            (
+                not cfg.FUSE_DK or ((cfg.TILE_K, cfg.TILE_O) == (192, 128) and cfg.DATAPATH_2X2_PROFILE == PROFILE_SM100),
+                f"{f}: fused dK requires the native SM100 D192x128 body",
+            ),
+            (
+                not cfg.FUSE_DK or b.kBufferElems * cfg.BPE_O <= cfg.KV_SUBBLOCKS * cfg.STAGES_SMEM_P * b.pSlabElems * cfg.BPE,
+                f"{f}: fused dK staging must fit the dead P ring",
+            ),
         ]
     )
     # --- dtype / k-step --------------------------------------------------------------------------------------------
@@ -677,14 +718,15 @@ def _validate_cfg_d256_2x2(cfg: CfgBwdD256x2) -> None:
     slabs = smem_layout_2x2(cfg)
     used = smem_bytes_2x2(cfg)
     cap = cfg.SMEM_CAP
-    if used + SMEM_SCAFFOLD_BYTES > cap:
+    scaffold_budget = _scaffold_budget_2x2(cfg)
+    if used + scaffold_budget > cap:
         tally = " | ".join(f"{s.name} {s.nbytes // 1024} KiB @{s.offset // 1024}" for s in slabs)
         raise ValueError(
-            f"{f}: SMEM slabs {used // 1024} KiB + {SMEM_SCAFFOLD_BYTES // 1024} KiB scaffolding exceed the {cap // 1024} KiB per-CTA cap of profile {cfg.DATAPATH_2X2_PROFILE} ({tally})"
+            f"{f}: SMEM slabs {used // 1024} KiB + {scaffold_budget // 1024} KiB scaffolding exceed the {cap // 1024} KiB per-CTA cap of profile {cfg.DATAPATH_2X2_PROFILE} ({tally})"
         )
     declared = scaffold_bytes_declared_2x2(cfg)
-    if declared > SMEM_SCAFFOLD_BYTES:
-        raise ValueError(f"{f}: declared scaffolding ({declared} B) exceeds the {SMEM_SCAFFOLD_BYTES} B budget")
+    if declared > scaffold_budget:
+        raise ValueError(f"{f}: declared scaffolding ({declared} B) exceeds the {scaffold_budget} B budget")
     for lbl, off in desc_roots_2x2(cfg):
         if not (0 <= off < used):
             raise ValueError(f"{f}: descriptor root {lbl} at {off} B lies outside the {used} B slab layout")
@@ -740,6 +782,7 @@ def make_cfg_d256_2x2(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
     stages_smem_p = 2 if profile == PROFILE_SM100 else 1
     native_d192 = (d_qk, d_v) == (192, 128)
     prefetch_d192 = native_d192 and not params.thd_varlen
+    fuse_dk = bool(getattr(params, "fuse_dk", False))
     # Dense D192 leaves room for the next Q, dO and dO-for-dV operands (208896 B including scaffold, below 227 KiB).
     # Together with lookahead this overlaps the next S MMA with the current P production; the D256 slabs do not fit it.
     stages_q = 2 if prefetch_d192 or profile != PROFILE_SM100 else 1
@@ -793,7 +836,7 @@ def make_cfg_d256_2x2(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
         STAGES_TMEM_S=stages_tmem_s,
         STAGES_TMEM_P=0,
         STAGES_SMEM_P=stages_smem_p,
-        XFER_STAGES=1,
+        XFER_STAGES=2 if fuse_dk and params.thd_varlen else 1,
         STATS_STAGES=2,
         TILES_Q=1,
         SCHEDULER_STAGES=2,
@@ -836,6 +879,7 @@ def make_cfg_d256_2x2(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
         BMM2_CHUNK_SIZE=128,
         # --- the 2x2 axis ---
         DATAPATH_2X2_PROFILE=profile,
+        FUSE_DK=int(fuse_dk),
         KV_SUBBLOCKS=subblocks,
         ROWS_PER_CTA=rows_per_cta,
         KV_BLOCK_ROWS=rows_per_cta * 2,

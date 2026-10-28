@@ -8,7 +8,7 @@ separate widths. No head-dimension staging or extra launch is added.
 
 It IS the Rubin half chain (:mod:`cudnn.sdpa.bwd.api_dsl_sm107`: ``delta = rowsum(dO . O)`` -> the main kernel with dV
 in TMEM and a kv-major ``[B, H_chunk, S_kv, S_q]`` dS workspace -> dK = dS . Q and dQ = dS^T . K as the
-``bprop_matmul_blackwell`` GEMMs at the (256, 256) cluster tile -> the GQA fold; one prepared pointer-host artifact
+``bprop_matmul_blackwell`` GEMMs at the native-width tile -> the GQA fold; one prepared pointer-host artifact
 per plan, ``prepared_sm107.compile_plan`` / ``kernels/sm107/prepared_host.host_f16``) with ONE substitution: the main
 kernel is the **2x2-datapath** body ``kernels/bprop_d256_2x2_f16.py`` at ``datapath_2x2_profile = 1``
 (``config_d256_2x2``): ``tcgen05.mma.cta_group::2`` with the collective M = 128 -- 64 kv rows per CTA, a 128-row kv
@@ -19,9 +19,16 @@ needs 576 exclusive columns and 327 KiB.
 What stays the Rubin row's, by construction: the kernel's launch ABI (``host_f16`` runs it unchanged), the kv WRITE
 PAIR of 256 rows (``STAGE3_GRAN_ROWS``: both 128-row blocks of a pair walk the identical q range, so the stage-3 GEMMs'
 K-trim stays tight and no mask needs the workspace zero-filled), the S_q / S_kv padding to 128 / 256, the head / batch
-chunking, the workspace carve, the standalone ``execute`` and every decline.  The stage-3 tile (256, 256) is passed
+chunking, the workspace carve, the standalone ``execute`` and every decline.  The stage-3 tile is passed
 EXPLICITLY here -- ``api_dsl_sm107._stage3_cgrp_tile_mn`` keys on the Rubin line by design and is not widened -- and the
-stage-3 granularity comes from the 2x2 config's ``kv_pad_rows_2x2`` (the pair, NOT the 128-row block).
+stage-3 granularity comes from the 2x2 config's ``kv_pad_rows_2x2`` (the pair, NOT the 128-row block). D192 uses a
+single-CTA (128, 192) tile; D256 retains the (256, 256) pair. Both M tiles fit within one workspace write pair.
+
+Native D192 folds dK into the main kernel, alongside dV; only dQ uses stage 3.
+The main kernel reuses dS in shared memory for dK and loads Q through its
+transposed tensor map on the existing store warp. THD uses the same fusion,
+with independent per-port origins and caller-owned descriptor scratch reused
+by dQ after main completes. The D256 chain retains both stage-3 GEMMs.
 
 Codegen: ``--gpu-arch sm_{sm}a`` of the device the plan is built for (100 / 103; ``prepared_host._check_target`` admits
 SM100-SM119 for the half chain), descriptor version 0.
@@ -40,6 +47,7 @@ from cudnn.sdpa.bwd import prepared_sm107 as _prepared
 from cudnn.sdpa.bwd.api_dsl_sm107 import _2X2_KERNEL_FILE, _STAGE3_TILE_D256, SdpaBwdDslSm107
 
 _SM100_D256_TEMPLATE_TAG = "sdpa_bwd_sm100_d256_main"
+_STAGE3_TILE_D192 = (128, 192)
 
 
 class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
@@ -99,6 +107,14 @@ class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
             ]
         return plan
 
+    def _scratch_shapes(self):
+        plan = super()._scratch_shapes()
+        if self.thd and (self.head_dim_qk, self.head_dim_v) == (192, 128):
+            # Main: one compact/dead Q map, B physical Q maps and B dK maps.
+            # Stage-3 dQ reuses these words only after main completes.
+            return [(name, ((2 * self.batch_size + 1) * 16,), dtype) if name == "desc_words" else (name, shape, dtype) for name, shape, dtype in plan]
+        return plan
+
     def check_support(self) -> bool:
         """This row's own declines first (what the 2x2 body has not run), then the half row's backstops."""
         self._value_error_if(
@@ -115,7 +131,7 @@ class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
     def _template_params(self):
         params = super()._template_params()
         if (self.head_dim_qk, self.head_dim_v) == (192, 128):
-            return _cfg2x2.TemplateParams2x2(**asdict(params), head_dim_qk=192, head_dim_v=128)
+            return _cfg2x2.TemplateParams2x2(**asdict(params), head_dim_qk=192, head_dim_v=128, fuse_dk=True)
         return params
 
     def _kernel_file(self) -> str:
@@ -125,8 +141,9 @@ class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
         return _SM100_D256_TEMPLATE_TAG
 
     def _stage3_tile_mn(self, sm: int) -> tuple:
-        """The d = 256 cluster tile, explicitly: cluster 2x1, 256 x 256 per pair, the 256-row M tile that equals the kv write pair
-        (``_stage3_cgrp_tile_mn`` keys on 107 <= sm <= 119 by design and stays that way)."""
+        """Use the native D192 tile on the SM100 half line; preserve the other rows' explicit D256 tile."""
+        if 100 <= sm <= 106 and (self.head_dim_qk, self.head_dim_v) == (192, 128):
+            return _STAGE3_TILE_D192
         return _STAGE3_TILE_D256
 
 

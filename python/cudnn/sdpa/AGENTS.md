@@ -367,6 +367,14 @@ on the address path shows the wrap before any GPU run.
   with the existing `thd_over_launched_units_are_dead` and
   `thd_multi_unit_per_cta` regressions.
 
+A caller that explicitly acquires an immutable runtime map must also disable
+its tile helper's default acquire for that lifetime. Otherwise every q tile
+repeats the tensor-map invalidation and flush despite the outer acquire.
+In 2x2 backward, loaders acquire compact maps at entry and physical maps per
+work item; the fused Qdk map belongs to the store warp and needs its own acquire
+on both CTAs. Preserve the initialized dead-unit fallback. The D192/D256 THD
+origin/rebind suites and their empty replay cases exercise these boundaries.
+
 **Rule S9 — Every scheduler reader needs a reuse back-edge; match output-phase cadence.**
 
 Every scheduler payload reader must either return a reuse credit or have a
@@ -473,6 +481,13 @@ Keep physical per-port origins separate from compact workspace prefixes and
 retain barrier arrivals for dead work while suppressing its output stores.
 `test_sdpa_bwd_thd_d256_sm100.py::test_origins_rebind_and_replay` checks this
 with poisoned scratch, one-sided empties and changed device metadata.
+
+The loader must follow a lookahead consumer's operand order. In the D192
+backward body, waiting for dO_dV(i)'s slot before loading Q(i+1) delays the
+MMA's next score even with extra Q buffers. Preload Q0, then issue dO(i),
+Q(i+1), dO_dV(i); guard the empty prologue and final prefetch and advance the
+Q ring once per actual tile. The D192 dense/THD replay suites and D256
+`test_mma_order_arms_match_the_fp64_reference` exercise both issue orders.
 
 Shared protocol (both passes):
 
@@ -1328,3 +1343,14 @@ sink. An empty softmax's reset max is a sentinel, not a real score: folding
 sink-only result explicitly and retain the later padded-Q trim override.
 Detectors: `test_paged_graph_fp8_sink_rebind_replay` and
 `test_prepared_fp8_d256_dense_keyless_sink` include sink logits -120/+120.
+
+
+A shared GMEM operand can need different SMEM swizzles for its MMA consumers.
+In native FP8 D192x128 backward, the nontransposed dP contraction reads dO/V
+with 128-byte atoms, while transposed dV reads 64 value columns per CTA with
+64-byte atoms. Keep each TMA map, SMEM descriptor and MMA instruction walker
+consistent; V's descriptor stride follows V, not Q/K. The host detector
+`test_fp8_tma_layout_matches_each_mma_consumer` compares config values against
+`MmaDesc`'s independently derived contraction/transpose geometry. Whole-backward
+native numerical and replay tests remain necessary; compilation alone misses
+these wrong-address walks.

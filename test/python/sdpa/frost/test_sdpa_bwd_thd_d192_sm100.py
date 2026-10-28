@@ -18,12 +18,27 @@ pytestmark = [pytest.mark.L0, requires_dsl, requires_pre_rubin_blackwell]
     "surface,physical_origins", [("standalone", False), ("standalone", True), ("graph", True)], ids=["compact", "origins-api", "origins-graph"]
 )
 def test_rectangular_thd_rebind_and_replay(monkeypatch, cudnn_handle, dt, token_major, surface, physical_origins):
+    from cudnn.sdpa.bwd.kernels.sm107 import prepared_host
+
+    compiled_hosts = []
+    original_host = prepared_host.compile_host_f16_thd
+
+    def record_host(main, mm_dk, mm_dq, *args, **kwargs):
+        assert mm_dk is None, "THD must omit the separate dK GEMM"
+        compiled_hosts.append(main)
+        return original_host(main, mm_dk, mm_dq, *args, **kwargs)
+
+    monkeypatch.setattr(prepared_host, "compile_host_f16_thd", record_host)
     geometry = []
     original = thd.SdpaBwdDslSm100D256._compile_plan
 
     def record(api, main, mm_dk, mm_dq):
         geometry.append((main.CFG.TILE_K, main.CFG.TILE_O))
         assert geometry[-1] == (192, 128)
+        assert main.CFG.FUSE_DK == 1 and main.CFG.XFER_STAGES == 2
+        assert next(shape for name, shape, _ in api._scratch_shapes() if name == "desc_words") == ((2 * api.batch_size + 1) * 16,)
+        for stage3 in (mm_dk, mm_dq):
+            assert stage3.PARAMS.cgrp_tile_mn == (128, 192) and stage3.cta_group == 1
         return original(api, main, mm_dk, mm_dq)
 
     monkeypatch.setattr(thd.SdpaBwdDslSm100D256, "_compile_plan", record)
@@ -31,6 +46,7 @@ def test_rectangular_thd_rebind_and_replay(monkeypatch, cudnn_handle, dt, token_
     try:
         thd.check_origins_rebind_and_replay(monkeypatch, dt, token_major, surface, d=192, d_v=128, physical_origins=physical_origins, cudnn_handle=cudnn_handle)
         assert geometry, "the test must compile the native rectangular body"
+        assert compiled_hosts
     finally:
         cudnn.set_stream(cudnn_handle, saved_stream)
 

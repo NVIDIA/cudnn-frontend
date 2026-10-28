@@ -297,7 +297,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_bwd_sm107": EngineSlot(4, opt_in=True),
             "sdpa_bwd_sm107_fp8": EngineSlot(5, opt_in=True),
             "sdpa_bwd_sm107_mxfp8": EngineSlot(6, opt_in=True),
-            "sdpa_bwd_sm100_d256": EngineSlot(7, opt_in=True),
+            "sdpa_bwd_sm100_d256": EngineSlot(7),
             "sdpa_bwd_sm107_d512": EngineSlot(8, opt_in=True),
             "sdpa_bwd_sm100_d128": EngineSlot(9),
         },

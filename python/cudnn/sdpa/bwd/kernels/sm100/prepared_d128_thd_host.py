@@ -60,6 +60,7 @@ def host(
     origin_specs: cutlass.Constexpr,
     causal: cutlass.Constexpr[bool],
     stream: driver.CUstream,
+    diag_delete_dq_reduce_add: cutlass.Constexpr[bool] = False,
 ):
     batch, heads, token_major = config
     q, k, v = _io(q_ptr, t_q_phys, heads), _io(k_ptr, t_kv_phys, heads), _io(v_ptr, t_kv_phys, heads)
@@ -106,11 +107,18 @@ def host(
         scale,
         causal,
         stream,
+        diag_delete_dq_reduce_add,
     )
 
 
-def compile_host(config, origin_specs, origin_dtypes, dtype, causal, sm):
-    """Capacities and bounds are runtime scalars, never artifact key values."""
+def compile_host(config, origin_specs, origin_dtypes, dtype, causal, sm, *, diag_delete_dq_reduce_add=False):
+    """Capacities and bounds are runtime scalars, never artifact key values.
+
+    ``diag_delete_dq_reduce_add`` (DIAGNOSTIC, default False) renders the shipped kernels under the unchanged cache key; the
+    armed build (dQ stays zero by design) is keyed apart so it can never be served to a default plan."""
+    key = ("sdpa_bwd_sm100_d128_thd", ABI_VERSION, config, origin_specs, origin_dtypes, str(dtype), bool(causal), sm)
+    if diag_delete_dq_reduce_add:
+        key += ("diag_delete_dq_reduce_add",)
     types = [dtype] * 5 + [cutlass.Float32] + [dtype] * 3 + [cutlass.Int32] * 2
     args = [cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=4 if i == 5 or i >= 9 else 16) for i, t in enumerate(types)]
     ro_types = {"int32": (cutlass.Int32, 4), "int64": (cutlass.Int64, 8)}
@@ -129,7 +137,8 @@ def compile_host(config, origin_specs, origin_dtypes, dtype, causal, sm):
         origin_specs,
         bool(causal),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+        bool(diag_delete_dq_reduce_add),
         options=f"--enable-tvm-ffi --gpu-arch sm_{sm}a",
-        cache_key=repr(("sdpa_bwd_sm100_d128_thd", ABI_VERSION, config, origin_specs, origin_dtypes, str(dtype), bool(causal), sm)),
+        cache_key=repr(key),
         symbol="frost_sdpa_bwd_sm100_d128_thd_prepared",
     )

@@ -225,3 +225,37 @@ def test_sm100_d128_leads_the_backend_only_on_unwindowed_d128_thd(monkeypatch):
     assert order(thd=True, d_qk=64, d_v=64) == ["backend", "frost"]
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     assert order() == ["frost"]
+
+
+def test_sm100_d256_leads_the_backend_only_inside_its_measured_box(monkeypatch):
+    """The default d256 backward row ranks ahead of the backend for d256 on cc 10.0 and behind it for D192x128, other parts,
+    unmeasured features and mask-free ragged THD past S_q 4096; the FROST opt-in keeps it first everywhere."""
+    from cudnn.engines.base import PlanConfig
+    from cudnn.engines.heuristics import is_backend_block
+    from cudnn.engines.manifest import MANIFEST
+    from cudnn.sdpa.bwd import heuristics
+
+    family = next(f for f in MANIFEST if f.name == "frost_sdpa_bwd")
+    assert not family.slots["sdpa_bwd_sm100_d256"].opt_in
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    eid = _OFFERED["sdpa_bwd_sm100_d256"]
+    monkeypatch.setattr(heuristics, "recommend", lambda kind, facts, offered: [PlanConfig(eid, None)])
+
+    def order(**over):
+        base = dict(device_cc=(10, 0), d_qk=256, d_v=256, dtype=cudnn.data_type.BFLOAT16, b=8, h_q=16, h_kv=2, s_q=4096, s_kv=4096)
+        plans = heuristics.propose("A", _facts(**{**base, **over}), _OFFERED)
+        return ["backend" if is_backend_block(p) else "frost" for p in plans]
+
+    lead, trail = ["frost"], ["backend", "frost"]
+    assert order() == lead
+    assert order(causal=False) == lead
+    assert order(thd=True, causal=False, max_total_seq_len_q=8 * 4096) == lead  # full-length THD
+    assert order(thd=True, causal=False, b=32, s_q=1024, s_kv=1024, max_total_seq_len_q=24 * 1024) == lead  # short ragged
+    assert order(thd=True, causal=False, max_total_seq_len_q=6 * 4096) == trail  # mask-free ragged past 4096
+    assert order(thd=True, max_total_seq_len_q=6 * 4096) == lead  # causal ragged
+    assert order(d_qk=192, d_v=128, h_kv=16) == trail
+    assert order(device_cc=(10, 3)) == trail
+    for unmeasured in (dict(deterministic=True), dict(has_bias=True), dict(has_dropout=True), dict(window_left=1024), dict(has_sink=True)):
+        assert order(**unmeasured) == trail, unmeasured
+    monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+    assert order(d_qk=192, d_v=128, h_kv=16) == lead

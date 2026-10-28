@@ -5,6 +5,11 @@
 All caller ports retain their independent ragged origins. Compact prefixes
 address only the internal Delta and FP32 dQ regions. Lengths remain on device;
 launch bounds and physical capacities are runtime declaration metadata.
+
+Grouped chain, op-level field ``dkv_accum = "fp32_reduce"``: ``delta_zero_thd_d128_kernel`` also zero-fills the per-KV-head fp32 dK / dV
+accumulators over each sequence's live kv rows and ``cast_dq_thd_d128_kernel`` also converts them once to the IO dtype at each output's own
+ragged origin -- both through the Optional trailing tensors (``None`` = dropped from the signature: the MHA chain and the default grouped
+chain render byte-identically); the grid's row extent then covers max(max_sq, max_skv) rows and z = Hq (the kv heads are the first Hkv).
 """
 
 from typing import Optional
@@ -41,6 +46,37 @@ from ...config_sm100_d128_accum import CFG
 
 def _origin_row(specs, port):
     return -1 if specs[port] is None else specs[port][0]
+
+
+@cute.jit
+def _zero_group_vector(acc, token, head, column):
+    """One lane's eight fp32 of a per-KV-head accumulator row (``acc`` = ``[1, rounded_k, Hkv, 128]`` fp32) set to exact zero (two 16-B stores)."""
+    zero4 = cutlass.Vector.from_elements(tuple(cutlass.Float32(0.0) for _ in range(4)), cutlass.Float32)
+    offset = token * cutlass.Int64(acc.stride[1]) + cutlass.Int64(head) * cutlass.Int64(acc.stride[2]) + column
+    (acc.iterator.raw_ptr() + offset).store(zero4, alignment=16)
+    (acc.iterator.raw_ptr() + offset + 4).store(zero4, alignment=16)
+
+
+@cute.jit
+def _cast_group_vector(acc, out, origins, origin: cutlass.Constexpr[int], batch, start, row, head, column, io_dtype: cutlass.Constexpr):
+    """One lane's eight fp32 of a per-KV-head accumulator row -> eight ``io_dtype`` values of the output's own ragged-origin row (the cast_dq
+    form: the group's ONE rounding at the output)."""
+    src_token = cutlass.Int64(start) + cutlass.Int64(row)
+    dst_token = thd_port_origin(origins, origin, batch, start) + cutlass.Int64(row)
+    src_offset = src_token * cutlass.Int64(acc.stride[1]) + cutlass.Int64(head) * cutlass.Int64(acc.stride[2]) + column
+    dst_offset = dst_token * cutlass.Int64(out.stride[1]) + cutlass.Int64(head) * cutlass.Int64(out.stride[2]) + column
+    lo = (acc.iterator.raw_ptr() + src_offset).load(count=4, alignment=16)
+    hi = (acc.iterator.raw_ptr() + src_offset + 4).load(count=4, alignment=16)
+    packed = cutlass.Vector.from_elements(
+        (
+            fp32_to_fp16(lo[0], lo[1], dtype=io_dtype),
+            fp32_to_fp16(lo[2], lo[3], dtype=io_dtype),
+            fp32_to_fp16(hi[0], hi[1], dtype=io_dtype),
+            fp32_to_fp16(hi[2], hi[3], dtype=io_dtype),
+        ),
+        cutlass.Int32,
+    )
+    Pointer(cutlass.make_array_view(out).data_ptr() + dst_offset, dtype=cutlass.Int32).store(packed, alignment=16)
 
 
 @cute.kernel
@@ -227,8 +263,13 @@ def delta_zero_thd_d128_kernel(
     origins: cute.Tensor,
     n_batch: cutlass.Int32,
     origin_specs: cutlass.Constexpr,
+    dk_acc: Optional[cute.Tensor] = None,
+    dv_acc: Optional[cute.Tensor] = None,
 ):
-    """Eight rows per CTA; all lanes participate in the unchanged FP32 dot tree."""
+    """Eight rows per CTA; all lanes participate in the unchanged FP32 dot tree.
+
+    ``dk_acc`` / ``dv_acc`` (dkv_accum = fp32_reduce; ``None`` = dropped, the shipping rendering): the per-KV-head fp32 accumulators are
+    zero-filled over the sequence's live kv rows by the blocks whose head index is a kv head (the grid covers max(max_sq, max_skv) rows)."""
     block, batch, head = cute.arch.block_idx()
     tid = cute.arch.thread_idx()[0]
     row = cutlass.Int32(block) * ROWS_PER_CTA + cutlass.Int32(tid // LANES_PER_ROW)
@@ -268,6 +309,15 @@ def delta_zero_thd_d128_kernel(
         token = cutlass.Int64(start) + cutlass.Int64(row)
         delta_offset = cutlass.Int64(head) * cutlass.Int64(delta.stride[1]) + token * cutlass.Int64(delta.stride[2])
         (delta.iterator.raw_ptr() + delta_offset).store(dot)
+    if cutlass.const_expr(dk_acc is not None):
+        # dkv_accum = fp32_reduce: an exact-zero fp32 image for the main kernel's reduce-adds; kv rows past the sequence are never written.
+        # fill dk/dv_acc (token_k, head) for head < Hkv (one CTA per kv head and row block); grid x = max(q, kv)
+        kv_length = cutlass.Int32(data[batch])
+        kv_start = cutlass.Int32(data[2 * n_batch + 1 + batch])
+        if head < dk_acc.shape[2] and row < kv_length:
+            kv_token = cutlass.Int64(kv_start) + cutlass.Int64(row)
+            _zero_group_vector(dk_acc, kv_token, head, column)
+            _zero_group_vector(dv_acc, kv_token, head, column)
 
 
 delta_zero_thd_d128_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -282,8 +332,18 @@ def cast_dq_thd_d128_kernel(
     n_batch: cutlass.Int32,
     dq_origin: cutlass.Constexpr[int],
     io_dtype: cutlass.Constexpr,
+    dk_acc: Optional[cute.Tensor] = None,
+    dv_acc: Optional[cute.Tensor] = None,
+    dk_out: Optional[cute.Tensor] = None,
+    dv_out: Optional[cute.Tensor] = None,
+    dk_origin: cutlass.Constexpr[int] = -1,
+    dv_origin: cutlass.Constexpr[int] = -1,
 ):
-    """Cast compact FP32 dQ once into each external sequence's own native rows."""
+    """Cast compact FP32 dQ once into each external sequence's own native rows.
+
+    ``dk_acc`` / ``dv_acc`` -> ``dk_out`` / ``dv_out`` (dkv_accum = fp32_reduce; ``None`` = dropped, the shipping rendering): the per-KV-head fp32
+    dK / dV accumulators are converted ONCE to the IO dtype into each output's own ragged-origin rows in the same streaming pass (the blocks
+    whose head index is a kv head; the grid covers max(max_sq, max_skv) rows) -- the fold launch's job without its read of 2 x Hq / Hkv partials."""
     block, batch, head = cute.arch.block_idx()
     tid = cute.arch.thread_idx()[0]
     row = cutlass.Int32(block) * ROWS_PER_CTA + cutlass.Int32(tid // LANES_PER_ROW)
@@ -308,6 +368,13 @@ def cast_dq_thd_d128_kernel(
             cutlass.Int32,
         )
         Pointer(cutlass.make_array_view(dq_out).data_ptr() + dst_offset, dtype=cutlass.Int32).store(packed, alignment=16)
+    if cutlass.const_expr(dk_acc is not None):
+        # convert 2x512 B fp32 -> 2x256 B bf16 per (token_k, kv head) at the fold's origins
+        kv_length = cutlass.Int32(data[batch])
+        kv_start = cutlass.Int32(data[2 * n_batch + 1 + batch])
+        if head < dk_acc.shape[2] and row < kv_length:
+            _cast_group_vector(dk_acc, dk_out, origins, dk_origin, batch, kv_start, row, head, column, io_dtype)
+            _cast_group_vector(dv_acc, dv_out, origins, dv_origin, batch, kv_start, row, head, column, io_dtype)
 
 
 cast_dq_thd_d128_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -340,6 +407,7 @@ def host_thd(
     scale,
     causal: cutlass.Constexpr[bool],
     stream,
+    diag_delete_dq_reduce_add: cutlass.Constexpr[bool] = False,
 ):
     """Four declared native launches; no host reads, tensor copies or allocation."""
     setup_thd_d128_kernel(
@@ -374,7 +442,20 @@ def host_thd(
         stream=stream,
     )
     accumulation_host(
-        maps, lse, delta, meta, origins, cutlass.Int32(batch), q.shape[2], max_skv, _origin_row(origin_specs, 8), scale, causal, q.element_type, stream
+        maps,
+        lse,
+        delta,
+        meta,
+        origins,
+        cutlass.Int32(batch),
+        q.shape[2],
+        max_skv,
+        _origin_row(origin_specs, 8),
+        scale,
+        causal,
+        q.element_type,
+        stream,
+        diag_delete_dq_reduce_add,
     )
     cast_dq_thd_d128_kernel(dq_accum, dq, meta, origins, cutlass.Int32(batch), _origin_row(origin_specs, 5), q.element_type).launch(
         grid=(q_grid, batch, q.shape[2]),
