@@ -228,14 +228,14 @@ _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle 
     # mb_bias_ring_full per leader fill a padded / shorter chunk receives) and +1 IDLE wait (the TMA-LDG warp's end-of-kernel
     # mb_bias_ring_empty drain, P15) since the ring's cluster-multicast form (bias_mode 3) landed: 82 / 22.
     ("f16", (128, 128)): (True, 82, 22),
-    ("fp8", (128, 128)): (False, 44, 12),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o)
+    ("fp8", (128, 128)): (False, 53, 12),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o); +9: the early-BMM1 mainloop arm
     ("mxfp8", (128, 128)): (
         True,
         37,
         13,
     ),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o); +1: the FP32 split-partial epilogue's mb_o_empty wait
     ("f16", (192, 128)): (True, 32, 11),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
-    ("fp8", (192, 128)): (True, 43, 12),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
+    ("fp8", (192, 128)): (True, 52, 12),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait; +9: the early-BMM1 mainloop arm
     ("mxfp8", (192, 128)): (True, 35, 13),
     ("f16", (256, 256)): (False, 30, 11),  # FP32 split-partial epilogue adds one output-ring wait
     ("fp8", (256, 256)): (False, 30, 11),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
@@ -4840,8 +4840,8 @@ _SM107_WAIT_FORM_PIN_ROWS = [
     # (quant, d_qk, d_v, dtype_o, SPIN_RING_WAITS, divergent SYNCS.PHASECHK, uniform USYNCS.PHASECHK, NANOSLEEP)
     # develop (sleeping form everywhere): 142 / 75 / 73; 42 ring-wait instantiations flipped -> 58 / 117 / 31
     pytest.param("mxfp8", 192, 128, _BF16_OUT, True, 58, 117, 31, id="mxfp8-d192x128-spin"),
-    # == develop's 160 / 84 / 82: the opt-out must leave every wait opcode where it was
-    pytest.param("fp8", 128, 128, _E4M3, False, 160, 84, 82, id="fp8-d128-sleep"),
+    # the opt-out must leave every wait opcode where it was
+    pytest.param("fp8", 128, 128, _E4M3, False, 164, 86, 84, id="fp8-d128-sleep"),
 ]
 
 
