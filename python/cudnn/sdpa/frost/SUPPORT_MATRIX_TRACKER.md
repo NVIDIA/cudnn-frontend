@@ -590,7 +590,7 @@ dK/dV stores and FP32 dQ accumulation, then the dQ conversion. Compact BSHD,
 unmasked or top-left causal, any S_q / S_kv, cc 10.0 or 10.3, public CuTeDSL >= 4.8
 and a positive FP32 scale; its scratch follows the formula above with D = 192.
 Declined: THD, GQA/MQA, sliding windows, bottom-right causal, padding, deterministic
-requests, bias / dBias, sink / dSink, decode shapes. `test_sdpa_bwd_d192_accum_sm100.py`
+requests, bias / dBias, sink / dSink. `test_sdpa_bwd_d192_accum_sm100.py`
 pins the engine, its declines and its gradients against an FP32 reference. The
 default d256 row keeps serving dense and THD D192x128 on the 2x2 body; this row is a
 second, opt-in route for the dense MHA shape.
