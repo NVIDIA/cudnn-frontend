@@ -42,7 +42,8 @@ def convert_fp8_smem_tile(src, dst, dst_swizzle: cutlass.Constexpr[int], out_dty
         raise ValueError("mixed FP8 KV: destination swizzle must match the half-width TMA subtile")
     rows = cutlass.const_expr(dst.tma_subtile_stride_elems // width)
     lane = cute.arch.thread_idx()[0] % cutlass.Int32(32)
-    for base in cutlass.range(0, dst.elems_per_stage, 256, unroll=1):
+    # Eight chunks amortize loop/index work while preserving the warp-owned stores.
+    for base in cutlass.range(0, dst.elems_per_stage, 256, unroll=8):
         logical = base + lane * cutlass.Int32(8)
         col = logical % cutlass.Int32(width)
         row = (logical // cutlass.Int32(width)) % cutlass.Int32(rows)
