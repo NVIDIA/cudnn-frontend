@@ -146,6 +146,7 @@ def test_capabilities_field_is_appended():
     from cudnn.sdpa.fwd.engines import Capabilities
 
     names = [f.name for f in fields(Capabilities)]
+    names = names[: names.index("thd_excluded_d_shapes") + 1]  # Preserve this historical segment.
     # ... the zero-scale and pre-folded-scale fields after it, then the resident-bias / kv_mask fields of the Rubin small tiles
     # and their per-shape TILE_N domain after THOSE, then the PackGQA divisibility rule and per-shape THD exclusions.
     assert names[-12:] == [

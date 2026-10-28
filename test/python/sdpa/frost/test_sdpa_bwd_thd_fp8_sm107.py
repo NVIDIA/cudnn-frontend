@@ -1532,7 +1532,7 @@ def test_fp8_thd_stage3_host_threads_the_epilogue_operands():
     """Source pin on the fp8 THD host: its stage-3 call hands the epilogue operands (``dk_epi`` / ``dq_epi``: the descale and
     quantize scalars, the amax pointers) to the THD stage-3 helper -- the dense fp8 host does; a THD host that reused the bf16
     helper's call shape would silently render EPI_NONE-shaped GEMMs (dQ wrong by ``descale_dP * descale_k``)."""
-    import re
+    import ast
     from pathlib import Path
 
     from cudnn.sdpa.bwd.kernels.sm107 import prepared_host
@@ -1543,10 +1543,13 @@ def test_fp8_thd_stage3_host_threads_the_epilogue_operands():
     body = body[: body.index("\ndef ", 1)]
     assert "_stage3_thd(" in body and "dk_epi" in body and "dq_epi" in body, "host_fp8_thd must pass dk_epi / dq_epi into the THD stage-3 call"
     assert "fold_quant_host(" in body and "THD_CU_K_TOTAL_OFF" in body, "the fold + quantize pass is bounded at the live kv total on device"
-    # Under GQA the dV + dK folds are ONE launch, bounded the same way: every pair call on this host ends in the live kv total.
-    pair_calls = re.findall(r"fold_quant_pair_host\(([^()]*)\)", body)
-    assert pair_calls, "under GQA the THD host folds dV + dK in ONE launch (fold_quant_pair_host), bounded at the live kv total"
-    assert all(c.split(",")[-1].strip() == "live_kv" for c in pair_calls), f"every fold_quant_pair_host call must end in live_kv: {pair_calls}"
+    # The live token limit remains the last positional operand; the appended
+    # D_b keyword gives dK its independent width without changing that slot.
+    host_node = next(n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == "host_fp8_thd")
+    pair_calls = [n for n in ast.walk(host_node) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "fold_quant_pair_host"]
+    assert pair_calls, "under GQA the THD host folds dV + dK in ONE launch, bounded at the live kv total"
+    assert all(isinstance(c.args[-1], ast.Name) and c.args[-1].id == "live_kv" for c in pair_calls)
+    assert all(any(k.arg == "D_b" and isinstance(k.value, ast.Name) and k.value.id == "d" for k in c.keywords) for c in pair_calls)
     assert "dot_do_o_scaled_host(" in body, "the packed delta is the scaled dot over the packed e4m3 O / dO"
 
 

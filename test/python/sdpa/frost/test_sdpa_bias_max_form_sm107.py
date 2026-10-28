@@ -71,6 +71,7 @@ def test_template_params_and_cfg_are_appended():
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
     names = [f.name for f in dataclasses.fields(TemplateParams)]
+    names = names[: names.index("q_in_tmem") + 1]  # Later appended fields are legal.
     # appended after the two tail / quiet forms; the third softmax warp group's count (softmax_wgs, test_sdpa_softmax_wgs_sm107.py) after it
     assert names[-6:] == ["padded_tail_form", "dead_subtile_quiet", "bias_max_form", "softmax_wgs", "s_slots", "q_in_tmem"], names[-8:]
     assert TemplateParams().bias_max_form == 0
