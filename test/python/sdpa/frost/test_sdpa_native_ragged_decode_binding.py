@@ -34,6 +34,27 @@ def _fixture(dtype="bfloat16", i64=False, stats="NH", rank=3, total=None):
     return s, facts, frames, combined
 
 
+@pytest.mark.parametrize("length_form", [1, 2], ids=["ordinary", "prefix"])
+def test_ragged_declared_lengths_match_reference_and_rebind(length_form):
+    s, facts, frames, combined = _fixture()
+    s.ragged_q_lens = length_form
+    count = s.b + (length_form == 2)
+    facts["seq_q_lens"] = facts["seq_q_lens"]._replace(shape=(count,), strides=(1,), span=count)
+    s.native = cudnn._pybind_module._SdpaDenseBinder(s)
+    first = _equal(s, facts)
+    assert first[1][-2:] == (17, facts["seq_q_lens"].ptr)
+    changed = dict(facts, seq_q_lens=facts["seq_q_lens"]._replace(ptr=0x900000))
+    second = _equal(s, changed, stream=29)
+    assert second[1][-2:] == (29, 0x900000)
+    assert second[0][s.index["seq_q_lens_addr"]] == 0x900000
+    short = dict(changed, seq_q_lens=changed["seq_q_lens"]._replace(shape=(count - 1,), span=count - 1))
+    with pytest.raises(ValueError):
+        binding_reference.bind_dense_split(s, short, 0x100000, 29, 29)
+    with pytest.raises(ValueError):
+        s.native.execute(_pack(short), prep._NATIVE_DENSE_INDICES, 29, workspace=0x100000)
+    assert frames == combined == []
+
+
 def _equal(s, facts, workspace=0x100000, stream=17):
     expected = binding_reference.bind_dense_split(s, facts, workspace, stream, stream)
     actual = s.native.bind_split(_pack(facts), prep._NATIVE_DENSE_INDICES, workspace, stream)

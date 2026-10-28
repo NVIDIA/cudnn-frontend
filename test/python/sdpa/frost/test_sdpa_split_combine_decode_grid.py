@@ -42,13 +42,13 @@ L0 = pytest.mark.L0
 L1 = pytest.mark.L1
 
 
-def _partials(b, h, sq, d, splits, seed=20261015):
+def _partials(b, h, sq, d, splits, seed=20261015, dead_first=True):
     """Split-major partials with the suite's dead patterns: every split dead on row 0 (multi-row shapes), a dead split
     beside live ones, the LAST split dead on head 0 (the clamped tail slots re-read it); dead payloads are NaN."""
     generator = torch.Generator().manual_seed(seed + splits)
     o = torch.randn(splits, b, sq, h, d, generator=generator) * 0.4
     lse = torch.randn(splits, b, h, sq, generator=generator) * 2.0 + 0.7
-    if sq > 1:
+    if sq > 1 and dead_first:
         lse[:, :, :, 0] = -torch.inf
     lse[1, :, :, min(1, sq - 1)] = -torch.inf
     lse[splits - 1, :, 0, :] = -torch.inf
@@ -358,7 +358,9 @@ def test_ragged_placement_on_the_decode_grid(i64, splits, sink, q_lens_form):
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
     b, h, sq, d = 3, 4, 2, 256
-    op, lp, ref_o, ref_lse = _partials(b, h, sq, d, splits)
+    op, lp, ref_o, ref_lse = _partials(b, h, sq, d, splits, dead_first=not bool(q_lens_form))
+    if q_lens_form:
+        assert torch.all(torch.isfinite(ref_lse[:, :, 0])) and torch.all(ref_o[:, 0].abs().amax(dim=(-1, -2)) > 0)
     sinks = torch.linspace(-0.5, 0.5, h, dtype=torch.float32, device="cuda") if sink else None
     if sink:
         logits = sinks.double().cpu().view(1, h, 1)
