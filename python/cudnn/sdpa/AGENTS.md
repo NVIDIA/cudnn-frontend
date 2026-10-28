@@ -494,6 +494,24 @@ production kernels gain no debug knob or timing-dependent assertion.
   non-monotone class the generator reports, or a feature the class key excludes), and say why in the rule.
 - A class the generator reports as NON-MONOTONE needs a finer key, not a hand-tuned region around its points.
 
+
+**Rule S13 — Register redistribution must converge at warpgroup scope.**
+
+All four warps in a warpgroup must execute the same `setmaxnreg` instruction.
+Put a shared service-role register release before branching into individual
+MMA, load, store and scheduler warps; calling the same helper separately from
+those branches emits distinct instructions and violates the PTX contract.
+An increase in one warpgroup may wait for registers released by another, so
+keep the original register budget and ensure every releasing warp can reach it.
+
+Detector: inspect generated PTX/SASS around the kernel's role dispatch. The
+service warpgroup must reach one common `setmaxnreg.dec` / `USETMAXREG.DEALLOC`
+site before splitting into roles. Separate sites reached by individual warps
+are invalid even when their immediate register counts match. Repeated CUDA
+Graph replay and sanitizer checks are also required; a single launch cannot
+establish liveness. See the [PTX setmaxnreg contract](https://docs.nvidia.com/cuda/parallel-thread-execution/#miscellaneous-instructions-setmaxnreg).
+
+
 ## 2x2 datapath (cta_group::2, M=128 collective = 64 rows per CTA) lessons
 
 Kernels on this atom: forward `fwd/kernels/sm100/prefill_d512_f16_2x2.py` + `fwd/kernels/sm107/prefill_d512_f16_2x2.py`

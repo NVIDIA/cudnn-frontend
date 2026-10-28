@@ -419,7 +419,6 @@ def _mma_loop(
     swizzle: cutlass.Constexpr[int],
     causal: cutlass.Constexpr[bool],
 ):
-    _service_regs()
     score = _mma_desc(CFG.M, CFG.N, CFG.DQK, mx=MX)
     dpdesc = _mma_desc(CFG.M, CFG.N, CFG.DV, mx=MX)
     dqdesc = _mma_desc(CFG.M, CFG.DQK, CFG.N, btranspose=True, mx=MX)
@@ -606,7 +605,6 @@ def _load_loop(
     causal: cutlass.Constexpr[bool],
     ratio: cutlass.Constexpr[int] = 1,
 ):
-    _service_regs()
     k_state = PipelineState.start(phase=1)
     kt_state = PipelineState.start(phase=1)
     v_state = PipelineState.start(phase=1)
@@ -701,7 +699,6 @@ def _store_loop(
     causal: cutlass.Constexpr[bool],
     grad_dtype: cutlass.Constexpr,
 ):
-    _service_regs()
     out_swz = CFG.QK_SWZ if cutlass.const_expr(grad_dtype == FP8) else CFG.SWIZZLE_BYTES
     split = cutlass.const_expr(OUT_SPLIT and grad_dtype != FP8)
     full_phase = cutlass.Int32(0)
@@ -729,7 +726,6 @@ def _store_loop(
 
 @cute.jit
 def _scheduler_loop(bars, sched):
-    _service_regs()
     state = PipelineState.start()
     valid = cutlass.Int32(1)
     while valid != 0:
@@ -804,6 +800,10 @@ def bprop_d192_dq_fp8_kernel(
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
     tmem_base = tmem_slot.load()
+    # All four service warps must execute the same warpgroup-aligned
+    # register release before diverging into their individual roles.
+    if warp >= 12:
+        _service_regs()
     if warp < 8:
         _softmax_loop(
             slab,
