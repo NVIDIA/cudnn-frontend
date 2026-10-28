@@ -641,7 +641,7 @@ def test_reject_sliding_window():
 @pytest.mark.L0
 @pytest.mark.parametrize("d,dv", [(64, 64), (128, 128), (192, 128)])
 def test_reject_non_positive_scale_on_the_pair(d, dv):
-    for scale in (-0.125, 0.0):
+    for scale in (-0.125, 0.0, float("inf")):
         reason = _decline_reason(d=d, dv=dv, sq=128, skv=128, use_causal_mask=True, scale=scale)
         assert reason is not None and ("positive attn_scale" in reason or "attn_scale = 0" in reason), reason
     assert _decline_reason(d=d, dv=dv, sq=128, skv=128, use_causal_mask=True, scale=0.125) is None
