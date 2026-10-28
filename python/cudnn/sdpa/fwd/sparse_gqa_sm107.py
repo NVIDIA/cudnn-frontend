@@ -92,7 +92,11 @@ split-major partial slab the tcgen05 core's split store writes, so the combine, 
 (``heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS`` = cc 10.7 since the gate's table) the placement rule
 ``heuristics.sparse_decode_lean_tile_selected`` (``B x H_kv <= LEAN_SPARSE_MAX_UNITS`` = 4 CTAs per chunk -- the lean grid's own unit: the
 step's S_q rows ride inside the CTA, so B 1 and B 2 on two KV heads take the lean body at every served S_q 1..4), the tcgen05 core on every
-other part; an explicit ``"lean"`` is honoured where the body serves the declaration and a typed decline naming the arm where it does not (``heuristics.sparse_lean_tile_decline``:
+other part; an explicit ``"lean"`` is honoured where the body serves the declaration -- on the core's parts and, FOR MEASUREMENT, on the
+Blackwell parts of ``heuristics.SPARSE_LEAN_TILE_EXPLICIT_CCS`` (cc 10.0 / 10.3, outside the record's ``sm_lo .. sm_hi`` and stated by its
+``lean_explicit_ccs`` field: the lean body is
+SM100-legal and its config pins no Rubin-only size; UNMEASURED there, the AUTO reading unchanged, ``"auto"`` / ``"tcgen05"`` declined by name
+through ``heuristics.sparse_tile_part_decline``) -- and a typed decline naming the arm where it does not (``heuristics.sparse_lean_tile_decline``:
 THD, a prefill / top-left form, no ``seq_kv_lens``, ``S_q`` past the served rows, per-row lists past one row, a group past 16, ``top_k`` below
 8, a non-default ``softmax_groups``), never a silent fallback; ``sub_tiles_per_cta`` is the lean body's pin and is refused by name where the
 resolved body is the tcgen05 core.  :attr:`SparseGqaFwdDslSm107.tile_form` / :attr:`kernel_template` read the resolved body back after
@@ -140,6 +144,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import cudnn
+from cudnn.sdpa.fwd.sparse_tile_rules import SPARSE_LEAN_TILE_EXPLICIT_CCS
 
 KERNEL_FILE = "sm107/sparse_d256_f16.py"
 KERNEL_FILE_LEAN = "sm107/sparse_lean_d256_f16.py"  # the second body (tile_form="lean"); the vocabulary and the kernel_template names are the heuristics'
@@ -155,7 +160,7 @@ class SparseCapabilities:
     """What the sparse core serves -- the adapter-owned claims record (no engine row: see the module docstring).  Field names
     follow ``engines.Capabilities`` where the meaning matches; the index-list fields are this record's own."""
 
-    sm_lo: int = 107
+    sm_lo: int = 107  # the CORE's parts (both bodies); the EXPLICIT lean tile is admitted on `lean_explicit_ccs` (below) too: cc 10.0 / 10.3, unmeasured
     sm_hi: int = 119
     phase: str = "forward"
     d_shapes: frozenset = frozenset({(_D, _D)})
@@ -195,6 +200,9 @@ class SparseCapabilities:
     )
     index_shared_list_max_tokens: int = 4  # S_q cap under list_per_sequence: the shared list's tail covers at most two blocks for S_q <= 4 (the MTP cap)
     cutedsl_min_version: Tuple[int, int, int] = (4, 8, 0)
+    lean_explicit_ccs: Tuple[Tuple[int, int], ...] = (
+        SPARSE_LEAN_TILE_EXPLICIT_CCS  # appended 2026-10-28: the parts OUTSIDE sm_lo .. sm_hi (cc 10.0 / 10.3: B200 / GB200, B300) on which the EXPLICIT tile_form="lean" is admitted for measurement (unmeasured there; "auto" / "tcgen05" resolve the core and are declined by name) -- the copy sparse_tile_part_decline reads, pinned equal to sparse_tile_rules.SPARSE_LEAN_TILE_EXPLICIT_CCS by the suite
+    )
 
 
 SPARSE_CAPABILITIES = SparseCapabilities()
@@ -527,9 +535,21 @@ class SparseGqaFwdDslSm107:
         msg = tma_gather4_requirement_error(cc)
         if msg is not None:
             raise NotImplementedError(f"sparse d256 forward (sm107): {msg}")
-        cc_code = cc[0] * 10 + cc[1]
-        if not (SPARSE_CAPABILITIES.sm_lo <= cc_code <= SPARSE_CAPABILITIES.sm_hi):
-            raise NotImplementedError(f"sparse d256 forward (sm107): needs a Rubin-line GPU (cc 10.7 .. 11.9); got cc {cc[0]}.{cc[1]}")
+        # the PART: the core's record (cc 10.7 .. 11.9: both bodies); the Blackwell parts of the record's lean_explicit_ccs
+        # (= sparse_tile_rules.SPARSE_LEAN_TILE_EXPLICIT_CCS: cc 10.0 / 10.3) serve the EXPLICIT lean tile only, for measurement -- "auto" /
+        # "tcgen05" there resolve the core and are declined by name (the ONE statement, sparse_tile_part_decline; its text ends with the former
+        # Rubin-line spelling)
+        from cudnn.sdpa.fwd.sparse_tile_rules import sparse_tile_part_decline
+
+        part = sparse_tile_part_decline(
+            device_cc=cc,
+            tile_form_requested=self.tile_form_requested,
+            sm_lo=SPARSE_CAPABILITIES.sm_lo,
+            sm_hi=SPARSE_CAPABILITIES.sm_hi,
+            explicit_lean_ccs=SPARSE_CAPABILITIES.lean_explicit_ccs,
+        )
+        if part is not None:
+            raise NotImplementedError(f"sparse d256 forward (sm107): {part}")
         device = self._device_index
         for name, t in (
             ("q", self.q),

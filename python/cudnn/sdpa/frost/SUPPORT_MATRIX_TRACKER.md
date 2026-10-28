@@ -3880,7 +3880,15 @@ consulted by `"auto"` ONLY on the parts of `SPARSE_LEAN_TILE_DEFAULT_CCS` = `((1
 measured-default rule: the tuple flipped with the gate's table, the bound refit from it to 4 over `B x H_kv x S_q`; 2026-10-27 the unit
 re-read as the CTAs per chunk from the same table's S_q 4 rows -- B 1 x S_q 4 wins +6.4 / +6.6 / +6.8 % at 2 per chunk, B 4 x S_q 4 loses
 -9.7 / -8.8 / -9.2 % at 8, each beside its S_q 1 twin), so `"auto"` takes the lean tile on cc 10.7 inside the bound and the tcgen05 core on
-every other part / past the bound; the explicit `"lean"` takes it anywhere the body serves the declaration.
+every other part / past the bound; the explicit `"lean"` takes it anywhere the body serves the declaration.  **Explicit admission on the
+Blackwell parts (2026-10-28, UNMEASURED):** `sparse_tile_rules.SPARSE_LEAN_TILE_EXPLICIT_CCS = ((10, 0), (10, 3))` -- on cc 10.0 / 10.3,
+outside the core's record (`sm_lo .. sm_hi` = 107 .. 119, unchanged), the adapter serves the EXPLICIT `tile_form="lean"` only (the lean body
+is SM100-legal instruction for instruction, its config pins no Rubin-only size, the DSL targets the ambient device, the sm100 split combine
+reduces the slab with the gate as for the dense d256 decode tile there -- its decode-grid rule is cc 10.7's, so the lean splits take the
+module's own forms); `"auto"` / `"tcgen05"` there resolve the core and are declined by name (`sparse_tile_part_decline`, the text ending
+with the former Rubin-line spelling; the part set is also the record's `SparseCapabilities.lean_explicit_ccs`, appended, pinned equal to the
+rules constant), so the route can be measured on a B200-class part; the AUTO pin and the placement rule stay cc 10.7's, and the
+gated attention block's other stages keep their Rubin pins (the standalone adapter is the entry on those parts).
 Kernel-alone evidence on the Rubin performance class (212 SMs at the 2376
 MHz lock, one process, A/B/A x 3 rounds x 10 replays of 100 launches, the control pair within 0.32 %, the oracle green before timing):
 B 1 x 8K x S_q 1 at `top_k` 512 on page-16 pools 3.341 us (3.352 with the build order rotated) against the tcgen05 core's 5.655 (+69.3 %),

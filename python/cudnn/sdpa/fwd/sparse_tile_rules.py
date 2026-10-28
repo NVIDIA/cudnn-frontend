@@ -94,10 +94,62 @@ x S_q 1 -16.3 %; B 16 x 8K x S_q 1 -44.1 %; B 16 x 32K x S_q 1 -43.6 % -> LEAN_S
 in the gate commit; the unit is the CTAs per chunk, B x H_kv, since the follow-up that read the same table's S_q 4 rows: the B 1 x S_q 4
 win stays on the default route, the B 4 x S_q 4 loss off it).
 Every other part keeps the tcgen05 core under ``"auto"`` until measured there; the explicit ``"tcgen05"`` keeps the former function on
-the measured part, the explicit ``"lean"`` takes the lean tile wherever the body serves the declaration (past the bound too)."""
+the measured part, the explicit ``"lean"`` takes the lean tile wherever the body serves the declaration (past the bound too, and -- for
+measurement -- on the Blackwell parts of :data:`SPARSE_LEAN_TILE_EXPLICIT_CCS` outside the core's record)."""
 _SPARSE_LEAN_TILE_RULE_CC = (10, 7)
-"""The ONE device line the lean tile exists for (its DSL target is ``sm_107a``; the kernel's own gate): the placement rule answers False
-on every other part whatever the tuple above holds."""
+"""The ONE device line the lean tile was MEASURED on (the kernel's home: its traces and SASS pins are ``sm_107a``'s): the placement rule
+answers False on every other part whatever the tuple above holds.  The explicit admission on the Blackwell parts is
+:data:`SPARSE_LEAN_TILE_EXPLICIT_CCS`'s (below), which this rule never reads."""
+SPARSE_LEAN_TILE_EXPLICIT_CCS: Tuple[Tuple[int, int], ...] = ((10, 0), (10, 3))
+"""The parts OUTSIDE the sparse core's record (``SparseCapabilities.sm_lo .. sm_hi`` = cc 10.7 .. 11.9) on which an EXPLICIT
+``tile_form="lean"`` is admitted FOR MEASUREMENT: the Blackwell line, cc 10.0 / 10.3 (B200 / GB200, B300).  The lean body is SM100-legal
+instruction for instruction (``cp.async``, ``ldmatrix``, ``mma.sync`` m16n8k16, ``bar.sync``, ``griddepcontrol``; no tcgen05 / TMA /
+mbarrier / cluster / setmaxnreg), its config pins no Rubin-only size (40 KiB SMEM at k 1 under the standard carveout, 128 x N_MT threads,
+REG <= 79 at k 1 on the sm_107a trace), the split arithmetic reads the device's SM count and the DSL targets the ambient device
+(``sm_100a`` / ``sm_103a``; the compiled-plan cache keys on the device's compute capability), so the admission is a HOST rule, not a kernel
+change; the sm100 split combine reduces the slab with the gate as it does for the dense d256 decode tile on those parts (its decode-grid
+rule is cc 10.7's, so the lean splits take the module's own forms there).  UNMEASURED on these parts (2026-10-28: admitted so the route can
+be measured on a B200-class part): the AUTO reading keeps :data:`SPARSE_LEAN_TILE_DEFAULT_CCS` (cc 10.7) and the placement rule keeps
+:data:`_SPARSE_LEAN_TILE_RULE_CC`, so ``tile_form="auto"`` / ``"tcgen05"`` on these parts resolve the tcgen05 core, which the adapter
+declines by name (:func:`sparse_tile_part_decline`: 'explicit lean tile only, unmeasured').  A measurement moves a part into the DEFAULT
+tuple with its table (the measured-default rule), never a transcription."""
+
+
+def sparse_tile_part_decline(
+    *,
+    device_cc: Optional[Tuple[int, int]],
+    tile_form_requested: str,
+    sm_lo: int,
+    sm_hi: int,
+    explicit_lean_ccs: Optional[Tuple[Tuple[int, int], ...]] = None,
+) -> Optional[str]:
+    """Why the PART cannot serve the declared body (the arm NAMED), or ``None`` when it can -- the adapter's arch gate (after the gather4
+    part floor, before the shapes), the ONE statement the gated attention block's sparse stage hears through the adapter.  ``sm_lo ..
+    sm_hi`` is the sparse core's record (cc 10.7 .. 11.9: both bodies); on a part of :data:`SPARSE_LEAN_TILE_EXPLICIT_CCS` only the
+    explicit ``"lean"`` is served (``"auto"`` resolves the tcgen05 core off the measured part, ``"tcgen05"`` names it: both declined with
+    the explicit-lean-only text); every other part is declined with the former statement's spelling (``needs a Rubin-line GPU (cc 10.7 ..
+    11.9); got cc X.Y``), which the explicit-lean-only text ends with too.  ``device_cc`` None (no reading) declines nothing here.
+    ``explicit_lean_ccs`` (appended) is the part set the caller's RECORD states (``SparseCapabilities.lean_explicit_ccs``: the adapter passes
+    its record's copy, which the test suite pins equal to :data:`SPARSE_LEAN_TILE_EXPLICIT_CCS`); ``None`` reads this module's constant."""
+    if device_cc is None:
+        return None
+    cc = (int(device_cc[0]), int(device_cc[1]))
+    cc_code = cc[0] * 10 + cc[1]
+    if int(sm_lo) <= cc_code <= int(sm_hi):
+        return None
+    lo, hi = divmod(int(sm_lo), 10), divmod(int(sm_hi), 10)
+    core = f"needs a Rubin-line GPU (cc {lo[0]}.{lo[1]} .. {hi[0]}.{hi[1]}); got cc {cc[0]}.{cc[1]}"
+    explicit = SPARSE_LEAN_TILE_EXPLICIT_CCS if explicit_lean_ccs is None else tuple((int(c[0]), int(c[1])) for c in explicit_lean_ccs)
+    if cc in explicit:
+        if tile_form_requested == SPARSE_TILE_FORM_LEAN:
+            return None
+        return (
+            f"cc {cc[0]}.{cc[1]} serves the EXPLICIT lean tile only (tile_form='lean': admitted for measurement, UNMEASURED there -- the AUTO "
+            f"reading stays the measured part's, cc 10.7); tile_form={tile_form_requested!r} resolves the tcgen05 core, which {core}"
+        )
+    return core
+
+
 LEAN_SPARSE_DEFAULT_MAX_SUB_TILES_PER_CTA = 1
 """The cap on the DEFAULT ``sub_tiles_per_cta`` (k): 1 -- one 32-key sub-tile per CTA, the kill-line rendering (REG 66-72, 4 CTAs per SM
 by registers).  The fill rule of :func:`sparse_lean_fill_sub_tiles` asks for k 2 / 3 / 4 / 7 at B 8 / B 4 x S_q 4 / B 16 / B 32 units,
