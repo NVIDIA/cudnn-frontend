@@ -204,14 +204,10 @@ def tma_reduce_subtile(smem_tile, gmem_slice, subtile: cutlass.Constexpr[int]):
 def _decode_flat(tile, nheads, nk, swizzle: cutlass.Constexpr[int], batch_heads: cutlass.Constexpr[int]):
     group = tile // (swizzle * nk)
     inner = tile % (swizzle * nk)
-    block = cutlass.Int32(0)
-    residual = cutlass.Int32(0)
-    if group < batch_heads // swizzle:
-        block = inner // swizzle
-        residual = inner % swizzle
-    else:
-        block = inner // max(batch_heads % swizzle, 1)
-        residual = inner % max(batch_heads % swizzle, 1)
+    full = group < batch_heads // swizzle
+    divisor = cutlass.Int32(arith.select(full.ir_value(), cutlass.Int32(swizzle).ir_value(), cutlass.Int32(max(batch_heads % swizzle, 1)).ir_value()))
+    block = inner // divisor
+    residual = inner % divisor
     hb = group * swizzle + residual
     return block, hb % nheads, hb // nheads
 

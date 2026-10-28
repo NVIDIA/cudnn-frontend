@@ -90,6 +90,30 @@ def _adapter(name: str):
     return getattr(api_dsl, name)
 
 
+def _fp8_adapter(name: str):
+    if name == _SM100_D128_FP8:
+        from cudnn.sdpa.bwd.api_dsl_sm100_d128_fp8 import SdpaBwdDslSm100D128Fp8
+
+        return SdpaBwdDslSm100D128Fp8
+    if name == _SM100_D192_FP8:
+        from cudnn.sdpa.bwd.api_dsl_sm100_d192_fp8 import SdpaBwdDslSm100D192Fp8
+
+        return SdpaBwdDslSm100D192Fp8
+    from cudnn.sdpa.bwd import api_dsl_sm107
+
+    return getattr(api_dsl_sm107, name)
+
+
+def _mxfp8_adapter(name: str):
+    if name == _SM100_MXFP8:
+        from cudnn.sdpa.bwd import api_dsl_mxfp8_sm100
+
+        return api_dsl_mxfp8_sm100.SdpaBwdDslSm100Mxfp8
+    from cudnn.sdpa.bwd import api_dsl_sm107
+
+    return getattr(api_dsl_sm107, name)
+
+
 def _cuda_driver():
     from cuda.bindings import driver
 
@@ -1118,7 +1142,7 @@ def lower_dsl_bwd_mxfp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested:
 
     fp8, half = facts.dtype, facts.dtype_o
     stats_geom = (tuple(facts.stats_t.get_dim()), tuple(facts.stats_t.get_stride()))
-    api = _adapter(api_type)(
+    api = _mxfp8_adapter(api_type)(
         sample_q=_port_desc("q", fp8, facts.q_t),
         sample_k=_port_desc("k", fp8, facts.k_t),
         sample_v=_port_desc("v", fp8, facts.v_t),
@@ -1374,7 +1398,7 @@ def lower_dsl_bwd_fp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: A
     fp8, grad = facts.dtype, facts.dtype_o
     stats_geom = (tuple(facts.stats_t.get_dim()), tuple(facts.stats_t.get_stride()))
     amaxes = dict(amax_dQ=facts.amax_dq_t, amax_dK=facts.amax_dk_t, amax_dV=facts.amax_dv_t, amax_dP=facts.amax_dp_t)
-    api = _adapter(api_type)(
+    api = _fp8_adapter(api_type)(
         sample_q=_desc(ports["q"], fp8, "q"),
         sample_k=_desc(ports["k"], fp8, "k"),
         sample_v=_desc(ports["v"], fp8, "v"),
