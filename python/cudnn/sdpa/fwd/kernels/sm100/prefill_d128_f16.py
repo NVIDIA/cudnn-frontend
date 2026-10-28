@@ -2651,7 +2651,10 @@ def _softmax_kv_body(
 
     new_p_sum_pair = hoisted_sum
     if cutlass.const_expr(N_CHUNKS == 2):
-        new_p_sum_pair = new_p_sum_pair + row_reduction_pair(deferred_P_1)
+        # At D64/CGA1 the balanced tail sum shortens the dependency chain.
+        # Keep chunk 0 sequential: its sum overlaps the P conversion/publication,
+        # and balancing it regresses complete attention. CGA2 retains its schedule.
+        new_p_sum_pair = new_p_sum_pair + row_reduction_pair(deferred_P_1, balanced=_D64_EARLY_SOFTMAX_HANDOFF and CFG.CTA_MMA == 1)
     alpha_pair = cutlass.Vector.from_elements((alpha, alpha), cutlass.Float32)
     total_sum = total_sum * alpha_pair + new_p_sum_pair
 
