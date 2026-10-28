@@ -129,3 +129,16 @@ def thd_uniform_control(dtype_name, pack_gqa):
     from test_sdpa_fwd_thd_origins import test_independent_thd_origins_rebind_and_capture as run
 
     run(128, dtype_name, "token", True, pack_gqa, 1, kv_dtype_name=dtype_name, engine_name=_ENGINE)
+
+
+@_native
+@pytest.mark.parametrize(
+    "qdtype,kvdtype",
+    [("bfloat16", "float8_e4m3fn"), ("float16", "float8_e5m2"), ("bfloat16", "bfloat16"), ("float16", "float16")],
+)
+@pytest.mark.parametrize("pack_gqa", [False, True])
+def thd_cga1_origins(qdtype, kvdtype, pack_gqa):
+    """Unsplit CGA1 must retain all five physical origins for uniform and mixed KV."""
+    from test_sdpa_fwd_thd_origins import test_independent_thd_origins_rebind_and_capture as run
+
+    run(128, qdtype, "head" if qdtype == "float16" else "token", True, pack_gqa, 1, kv_dtype_name=kvdtype, engine_name=_ENGINE, cga=1)

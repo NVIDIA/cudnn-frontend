@@ -2951,7 +2951,7 @@ band-around-diagonal masks, sinks -120 / -5 / +3 / +10 on keyless rows (O := 0 /
 dead pool pages NaN-poisoned on both routes (neither provider reads a dead table slot), f16 and bf16; the flag-free
 common-API walk runs the same graphs (backend-served at s_q >= 2 on 9.26 / 9.27, row-served at s_q == 1 where the
 backend has no sink engine). Still declined: dense (non-THD) paged queries, per-tensor FP8 pools (graph-level cells for
-the THD and dense query forms) and MXFP8 pools (a separate change), d192×128 / d512 pools, and sink + split-KV outside exact D128 half paged THD Q>1. Default
+the THD and dense query forms) and MXFP8 pools (a separate change), d192×128 / d512 pools, and sink + split-KV outside exact D128 half paged THD. Single-query THD split, including sinks, now uses the shared D128 decode tile compiled for SM107. Default
 placement keeps its sink exclusion on PAGED graphs (the paged packed-GQA prefill shard, Q 64-128, stays backend-first
 with a sink); the cga1 two-slab preference and the LPT-for-packed-THD rule take sink graphs on cc 10.7 paged half since
 the plan-ordering measurement (the next section: the B128 64/8 d128 Q 1 / 4 / 8 paged bf16 sink family proposes the
@@ -3008,11 +3008,10 @@ tile, the ragged-Q leg over paged pools, dense paged decode and the quantized fl
 #1472's B128 64/8 Q8 KV2056 becomes 1024 one-CTA 128-row units (64 live rows each) instead of 8192 two-CTA 512-row
 clusters (8 live rows each).
 
-**What stays out, and why.** A DENSE attention sink with split-KV stays declined (the dense combine folds no
-sink; measured here as a lever-D candidate -- see the issue's follow-up -- and pinned by
-`test_sdpa_fwd_cc107_sink_split_declines_L0`); dense D256 PackGQA and partial PackGQA need their own validation; the
-ragged-Q decode leg over paged pools (sink-free, split-mandatory THD-binder path) and dense paged decode on cc 10.7
-outside the d256 decode tile's route (ᵈʳ) are follow-ups; `_SM107_CGA_Q_ROWS = 256` in the Rubin no-GQA wave rule describes the d256 flavor (TILES_Q=1) rather
+**Current follow-ups.** Dense paged decode on cc 10.7 outside the d256 decode tile's route (ᵈʳ)
+remains a follow-up. The earlier dense sink/split and D128 partial-PackGQA declines have been removed;
+single-query ragged-Q decode over paged pools now supports split-KV, including a sink folded once by the combine.
+Its unsplit CGA1/2 plans retain the native SM107 prefill route. `_SM107_CGA_Q_ROWS = 256` in the Rubin no-GQA wave rule describes the d256 flavor (TILES_Q=1) rather
 than the 512-row d128 / d192 clusters (TILES_Q=2) -- noted for the rule's next re-measurement, not changed here.
 
 **Default placement (lever E, `placement._place_sm107_f16`).** Measured on a 216-SM cc 10.7 board (cuDNN 9.26.0.51 and
