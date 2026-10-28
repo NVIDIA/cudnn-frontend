@@ -38,13 +38,25 @@ def _apply_per_token_k_scales_fp8(tSrS: cute.Tensor, tScS: cute.Tensor, gKScale:
     """Descale in place so 32 per-column scales do not stay live in registers."""
     coordinates = layout_utils.reshape_acc_to_mn(tScS)
     scores = layout_utils.reshape_acc_to_mn(tSrS)
-    for n in cutlass.range_constexpr(cute.size(coordinates, mode=[1])):
-        key = k_tile_idx * 128 + coordinates[0, n][1]
-        # Masked columns need a positive descale so -inf stays -inf.
-        key = key if key < gKScale.shape[0] else gKScale.shape[0] - 1
-        scale = gKScale[key]
-        for m in cutlass.range_constexpr(cute.size(scores, mode=[0])):
-            scores[m, n] *= scale
+    # Adjacent C-fragment columns are a consecutive, even-aligned token pair.
+    # Keep scalar addressing for tail tiles and unaligned/strided scale views.
+    if gKScale.stride[0] == 1 and (gKScale.iterator.toint() & 7) == 0 and (k_tile_idx + 1) * 128 <= gKScale.shape[0]:
+        pair = cute.make_rmem_tensor(cute.make_layout(2), cutlass.Float32)
+        for n in cutlass.range_constexpr(0, cute.size(coordinates, mode=[1]), 2):
+            key = k_tile_idx * 128 + coordinates[0, n][1]
+            source = cute.make_tensor((gKScale.iterator + key).align(8), cute.make_layout(2))
+            cute.autovec_copy(source, pair)
+            for m in cutlass.range_constexpr(cute.size(scores, mode=[0])):
+                scores[m, n] *= pair[0]
+                scores[m, n + 1] *= pair[1]
+    else:
+        for n in cutlass.range_constexpr(cute.size(coordinates, mode=[1])):
+            key = k_tile_idx * 128 + coordinates[0, n][1]
+            # Masked columns need a positive descale so -inf stays -inf.
+            key = key if key < gKScale.shape[0] else gKScale.shape[0] - 1
+            scale = gKScale[key]
+            for m in cutlass.range_constexpr(cute.size(scores, mode=[0])):
+                scores[m, n] *= scale
     scales = cute.make_rmem_tensor(cute.make_layout(1), cutlass.Float32)
     scales[0] = 1.0
     return scales
@@ -232,6 +244,7 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
         self.num_threads = 384
         self.num_mma_warps = 8
         self.num_compute_threads = 256
+        self.phase_warps = 4 if k_quant_block_size == 1 else 2
         self.load_registers = 24
         self.compute_registers = 240
         self.kv_stage = 1
@@ -781,17 +794,14 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
             # Q is now resident in every compute warp. P uses a different
             # layout over the same bytes, so all Q reads must finish first.
             _compute_barrier(1, self.num_compute_threads)
-            # Four pairs of compute warps start after the preceding pair's
-            # first softmax. Each one-time named barrier has 128 participants:
-            # 64 arriving threads and 64 waiting threads. No per-tile barrier
-            # or clock-based delay is introduced.
+            # Stagger compute groups once, after the preceding group's first
+            # softmax. Per-token K uses two groups of four warps to shorten
+            # startup; coarse K retains four pairs. Each barrier counts both
+            # arriving and waiting threads. There is no per-tile barrier.
             if num_n_tiles > 1:
-                if warp_idx // 2 == 1:
-                    _compute_barrier(2, 128)
-                if warp_idx // 2 == 2:
-                    _compute_barrier(3, 128)
-                if warp_idx // 2 == 3:
-                    _compute_barrier(4, 128)
+                for group in cutlass.range_constexpr(1, self.num_mma_warps // self.phase_warps):
+                    if warp_idx // self.phase_warps == group:
+                        _compute_barrier(1 + group, self.phase_warps * 64)
 
             for load_count in cutlass.range(0, num_n_tiles, 1, unroll=1):
                 n_tile_ind = num_n_tiles - 1 - load_count
@@ -843,12 +853,9 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
                 )
 
                 if load_count == 0 and num_n_tiles > 1:
-                    if warp_idx // 2 == 0:
-                        _compute_barrier(2, 128, wait=False)
-                    if warp_idx // 2 == 1:
-                        _compute_barrier(3, 128, wait=False)
-                    if warp_idx // 2 == 2:
-                        _compute_barrier(4, 128, wait=False)
+                    for group in cutlass.range_constexpr(self.num_mma_warps // self.phase_warps - 1):
+                        if warp_idx // self.phase_warps == group:
+                            _compute_barrier(2 + group, self.phase_warps * 64, wait=False)
                 # Compute P @ V without changing the accumulation order.
                 _rescale_o_if_needed_fp8(tOrO, row_scale)
                 tOrP = _make_acc_into_fp8_smem(tSrS, sP[None, None, 0], tiled_mma_qk, tiled_mma_pv)

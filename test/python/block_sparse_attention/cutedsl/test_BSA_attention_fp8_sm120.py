@@ -283,6 +283,37 @@ def test_sm120_fp8_per_token_public_api_and_replay():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("sk", (256, 257, 258))
+@pytest.mark.parametrize("scale_layout", ("offset", "padded_heads"))
+@torch_fork_set_rng(seed=28129)
+def test_sm120_fp8_per_token_scale_views(sk, scale_layout):
+    """Vectorized loads must preserve supported views with four-byte alignment."""
+    _require_sm120(per_token=True)
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    from cudnn.block_sparse_attention._fp8_quant import _quantize_sage_bhsd
+
+    q = torch.randn((2, 2, 147, 128), device="cuda", dtype=torch.bfloat16) * 0.5
+    k, v = [torch.randn((2, 2, sk, 128), device="cuda", dtype=q.dtype) * 0.5 for _ in range(2)]
+    packed = list(_quantize_sage_bhsd(q, k, v, v_block_size=128, k_quant_block_size=1))
+    topk = (sk + 127) // 128
+    indices = torch.arange(topk, device="cuda", dtype=torch.int32).expand(2, 2, 2, topk).contiguous()
+    kwargs = dict(sparse_block_size=128, v_block_size=128, k_quant_block_size=1)
+    expected = interface._bsa_attn_fwd_sm120_fp8(*packed, indices, topk, 128**-0.5, **kwargs)
+    scales = packed[4]
+    if scale_layout == "offset":
+        storage = torch.empty(scales.numel() + 1, device=q.device, dtype=scales.dtype)
+        view = storage[1:].view_as(scales)
+    else:
+        storage = torch.empty((*scales.shape[:-1], sk + 1), device=q.device, dtype=scales.dtype)
+        view = storage[..., :sk]
+    view.copy_(scales)
+    packed[4] = view
+    actual = interface._bsa_attn_fwd_sm120_fp8(*packed, indices, topk, 128**-0.5, **kwargs)
+    for result, reference in zip(actual, expected):
+        torch.testing.assert_close(result, reference, rtol=0, atol=0)
+
+
+@pytest.mark.L0
 def test_sm120_fp8_per_token_dsl_gate(monkeypatch):
     ops = _require_sm120(per_token=True)
     from cudnn.frost import buffers
