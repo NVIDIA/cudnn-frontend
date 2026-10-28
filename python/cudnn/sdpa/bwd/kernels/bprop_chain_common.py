@@ -860,6 +860,7 @@ def fold_quant_pair_kernel(
     n_items_a: cutlass.Constexpr[int],
     n_ctas_b: cutlass.Constexpr[int],
     n_items_b: cutlass.Constexpr[int],
+    D_b: cutlass.Constexpr[int] = 0,
 ):
     """TWO operand sets in ONE launch -- the fp8 row's dV and dK folds, which used to be two back-to-back launches of
     :func:`fold_quant_kernel`: CTAs ``[0, n_ctas_a)`` walk set A (dV), the rest set B (dK) with their index rebased.  The dispatch
@@ -870,7 +871,20 @@ def fold_quant_pair_kernel(
     if bidx < n_ctas_a:
         _fold_quant_set(ws_a, out_a, descale_a, scale_a, amax_a, D, group, out_dtype, row_limit, bidx, n_ctas_a, n_items_a)
     else:
-        _fold_quant_set(ws_b, out_b, descale_b, scale_b, amax_b, D, group, out_dtype, row_limit, bidx - n_ctas_a, n_ctas_b, n_items_b)
+        _fold_quant_set(
+            ws_b,
+            out_b,
+            descale_b,
+            scale_b,
+            amax_b,
+            D if cutlass.const_expr(D_b == 0) else D_b,
+            group,
+            out_dtype,
+            row_limit,
+            bidx - n_ctas_a,
+            n_ctas_b,
+            n_items_b,
+        )
 
 
 fold_quant_pair_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -924,15 +938,35 @@ def fold_quant_pair_host(
     sm_count: cutlass.Constexpr[int],
     stream: cuda_driver.CUstream,
     row_limit: Optional[cute.Tensor] = None,
+    D_b: cutlass.Constexpr[int] = 0,
 ):
     """Launch :func:`fold_quant_pair_kernel`: set A's persistent CTAs then set B's, one grid (``fold_quant_pair_ctas``: the
     device's cap split in proportion to the sets' items -- the fp8 row's dV + dK folds; the same ``row_limit`` bounds both -- a
-    packed THD chain's live kv total)."""
+    packed THD chain's live kv total). ``D_b`` appends an independent second width; zero retains the first width."""
     items_a = fold_quant_items(out_a.shape, D, fold_quant_vec(ws_a.element_type))
-    items_b = fold_quant_items(out_b.shape, D, fold_quant_vec(ws_b.element_type))
+    second_dim = D if cutlass.const_expr(D_b == 0) else D_b
+    items_b = fold_quant_items(out_b.shape, second_dim, fold_quant_vec(ws_b.element_type))
     ctas_a, ctas_b = fold_quant_pair_ctas(items_a, items_b, sm_count)
     fold_quant_pair_kernel(
-        ws_a, out_a, descale_a, scale_a, amax_a, ws_b, out_b, descale_b, scale_b, amax_b, D, group, out_dtype, row_limit, ctas_a, items_a, ctas_b, items_b
+        ws_a,
+        out_a,
+        descale_a,
+        scale_a,
+        amax_a,
+        ws_b,
+        out_b,
+        descale_b,
+        scale_b,
+        amax_b,
+        D,
+        group,
+        out_dtype,
+        row_limit,
+        ctas_a,
+        items_a,
+        ctas_b,
+        items_b,
+        second_dim,
     ).launch(
         grid=(ctas_a + ctas_b, 1, 1),
         block=(FOLD_QUANT_THREADS, 1, 1),

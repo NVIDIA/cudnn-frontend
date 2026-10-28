@@ -259,7 +259,7 @@ the caller (no Rubin MXFP8 THD forward row feeds it yet).  The graph tier needs 
 from __future__ import annotations
 
 import math
-from dataclasses import replace
+from dataclasses import asdict, replace
 from typing import Optional
 
 import torch
@@ -1293,7 +1293,7 @@ _FP8_GRAD_DTYPES = (torch.float8_e4m3fn, torch.bfloat16, torch.float16)
 
 
 class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
-    """``sdpa_bwd_sm107_fp8``: cuDNN ``sdpa_fp8_backward`` at d = 256 on the Rubin line.
+    """``sdpa_bwd_sm107_fp8``: cuDNN ``sdpa_fp8_backward`` at D256 or D192/V128 on the Rubin line.
 
     FP8 E4M3 Q / K / V / O / dO with scalar descales in, fp32 Stats, gradients in the
     graph's dtype (E4M3 with ``scale_dQ / dK / dV``, or bf16 / fp16) plus the requested
@@ -1397,6 +1397,18 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
     def _ds_fp8(self) -> bool:
         return self._ds_dtype == torch.float8_e4m3fn
 
+    def _check_head_dims(self) -> None:
+        self._value_error_if(
+            (self.head_dim_qk, self.head_dim_v) not in ((256, 256), (192, 128)),
+            f"{self._NAME}: native head dimensions must be (256, 256) or (192, 128); got {self.head_dim_qk}/{self.head_dim_v}",
+        )
+
+    def _template_params(self):
+        params = super()._template_params()
+        if (self.head_dim_qk, self.head_dim_v) == (192, 128):
+            return _cfg.TemplateParamsFp8(**asdict(params), head_dim_qk=192, head_dim_v=128)
+        return params
+
     def _template_params_family(self) -> dict:
         return dict(dtype_ds=_DTYPE_CODE[self._ds_dtype])
 
@@ -1445,8 +1457,8 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
         partials under GQA, the bf16-dS twin's bf16 partials, dQ workspace and exact upcasts, and the amax scratch -- the dense
         ``_family_scratch_shapes`` with B = 1 and the token capacities for the row extents (every fold pass stops at the live total
         on device)."""
-        h, hkv, d = self.h_q, self.h_kv, _SM107_D
-        plan = [("dv_part", (1, tkv, h, d), self._partial_dtype)]
+        h, hkv, d = self.h_q, self.h_kv, self.head_dim_qk
+        plan = [("dv_part", (1, tkv, h, self.head_dim_v), self._partial_dtype)]
         if self._ds_fp8:
             if gqa:
                 plan.append(("dk_part", (1, tkv, h, d), self._partial_dtype))
@@ -1461,8 +1473,8 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
         return plan
 
     def _family_scratch_shapes(self, kv_rows: int, gqa: bool):
-        b, h, hkv, sq, skv, d = self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, _SM107_D
-        plan = [("dv_part", (b, kv_rows, h, d), self._partial_dtype)]  # stage 2's per-Q-head dV_true: fp32 under GQA, bf16 at MHA
+        b, h, hkv, sq, skv, d = self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, self.head_dim_qk
+        plan = [("dv_part", (b, kv_rows, h, self.head_dim_v), self._partial_dtype)]  # stage 2's per-Q-head dV_true: fp32 under GQA, bf16 at MHA
         if self._ds_fp8:
             # e4m3 dS: the GEMMs read the e4m3 payloads directly and quantize dQ (and MHA dK) in their epilogue; only the
             # GQA dK partials (fp32, TRUE units: EPI_DESCALE) go through stage 4, which rounds the group's sum once.
