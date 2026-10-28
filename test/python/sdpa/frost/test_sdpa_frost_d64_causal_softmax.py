@@ -32,8 +32,9 @@ def _reference(values, bottom_right, scale):
 @pytest.mark.parametrize("cga", [1, 2])
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("bottom_right,with_sink", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("k_tile_growth", [1.0, 2.0], ids=["ordinary", "rescale"])
 @torch_fork_set_rng(seed=1391)
-def test_d64_causal_softmax_rebind_and_replay(cga, packed, bottom_right, with_sink, cudnn_handle, monkeypatch):
+def test_d64_causal_softmax_rebind_and_replay(cga, packed, bottom_right, with_sink, k_tile_growth, cudnn_handle, monkeypatch):
     import cudnn
     from cudnn.engines.manifest import MANIFEST
     from cudnn.sdpa.fwd import api_dsl
@@ -62,6 +63,9 @@ def test_d64_causal_softmax_rebind_and_replay(cga, packed, bottom_right, with_si
             n: (torch.randn(b, s, h, d, device="cuda") * (2.0 if n != "v" else 0.5)).bfloat16().transpose(1, 2)
             for n, s, h in (("q", sq, hq), ("k", sk, hk), ("v", sk, hk))
         }
+        # Increasing key-tile magnitude forces online-max updates and O rescaling;
+        # ordinary random logits often leave that pipeline dependency dormant.
+        result["k"].mul_(k_tile_growth ** (torch.arange(sk, device="cuda") // 128)[None, None, :, None])
         if with_sink:
             result["sink"] = torch.tensor([-torch.inf, -100, 0, 9, -torch.inf, -100, 0, 9], device="cuda").view(1, hq, 1, 1)
         return result
@@ -99,6 +103,7 @@ def test_d64_causal_softmax_rebind_and_replay(cga, packed, bottom_right, with_si
         for module in loaded_modules:
             assert module.CFG.CTA_MMA == cga
             assert module._E2E_ENABLED is (torch.cuda.get_device_capability() == (10, 0)), "the graph lost its architecture-specific exp2 path"
+            assert module._D64_EARLY_SOFTMAX_HANDOFF is (torch.cuda.get_device_capability() == (10, 0))
         workspace = torch.empty(max(1, graph.get_workspace_size()), device="cuda", dtype=torch.uint8)
 
         def bindings():

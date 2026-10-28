@@ -351,6 +351,12 @@ _E2E_D64_INTERIOR = bool(
     and (CFG.MASK_FLAGS & (MASK_CAUSAL | MASK_SWA)) == MASK_CAUSAL
 )
 _E2E_ENABLED = bool(PARAMS.exp2_fma_split) and ((PARAMS.d_flavor != 64 and (_E2E_DENSE_BAND or _E2E_PAGED_INTERIOR or _E2E_THD_INTERIOR)) or _E2E_D64_INTERIOR)
+# The measured SM100 BF16 D64 schedule lets WG1 start its exp burst after
+# WG0 publishes alpha. Other widths, architectures and geometries keep their
+# existing handoff. The exp2 opt-in already carries the SM100 architecture gate.
+_D64_EARLY_SOFTMAX_HANDOFF = bool(
+    _E2E_ENABLED and _E2E_D64_INTERIOR and CFG.TILE_M == 128 and CFG.TILE_N == 128 and CFG.TILES_Q == 2 and CFG.S_SLOTS == 1 and CFG.Q_IN_TMEM == 0
+)
 _E2E_EMULATED_COLS = (_E2E_LIMIT // _E2E_FREQ) * _E2E_RES if _E2E_ENABLED else 0
 if _E2E_ENABLED:
     if not (0 <= _E2E_RES <= _E2E_FREQ and _E2E_FREQ % 2 == 0 and _E2E_RES % 2 == 0 and _E2E_LIMIT % _E2E_FREQ == 0):
@@ -2547,7 +2553,7 @@ def _softmax_kv_body(
     reg_S = RegTile(reg_S_vec, size=CFG.TILE_N)
     current_max = current_max_unscaled * scale_log2  # -inf when the whole iteration is masked
 
-    # Named-barrier wg0/wg1 sync: sub_tile_id==1 waits at TOP for sub_tile_id==0's bottom arrive.
+    # WG1 waits for WG0's handoff: after alpha for the D64 schedule, otherwise after P1.
     if sub_tile_id == 1:
         nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
 
@@ -2584,6 +2590,14 @@ def _softmax_kv_body(
     bars.mb_stat_full[sub_tile_id].arrive()
     # Publish fence: keeps the alpha publish ahead of the exp burst (see _NB_FENCE_ALPHA).
     named_barrier_fence(_NB_FENCE_ALPHA + sub_tile_id, 32 * CFG.SOFTMAX_WG_WARPS)
+
+    if cutlass.const_expr(_D64_EARLY_SOFTMAX_HANDOFF):
+        # Each WG has loaded its own complete S slot before either overwrites it
+        # with alpha/P. No cross-WG S/P alias exists at D64; the per-slot
+        # mbarriers still order MMA consumption and reuse. Preserve one handoff
+        # per iteration, including when the other WG takes a masked/skip body.
+        if sub_tile_id == 0:
+            nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
 
     # Rescale full reg_S in one vector op — emits same FFMA2 sequence as explicit half-tile rescales.
     reg_S = reg_S * scale_log2 - total_max_safe
@@ -2630,9 +2644,10 @@ def _softmax_kv_body(
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
         bars.mb_bmm2_ready[sub_tile_id * N_CHUNKS + 1].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
-    # wg0 fires bottom sync to release wg1 spinning at TOP barrier.
-    if sub_tile_id == 0:
-        nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
+    if cutlass.const_expr(not _D64_EARLY_SOFTMAX_HANDOFF):
+        # WG0's original bottom handoff releases WG1 at its top barrier.
+        if sub_tile_id == 0:
+            nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
 
     new_p_sum_pair = hoisted_sum
     if cutlass.const_expr(N_CHUNKS == 2):
