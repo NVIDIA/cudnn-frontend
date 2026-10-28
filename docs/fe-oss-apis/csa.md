@@ -142,6 +142,10 @@ policies:
   then warp 0 merges those eight sums. A second kernel folds the resulting group sums
   with an eight-way contiguous tree. This hierarchical grid supplies thousands of CTAs
   on long packed sequences instead of assigning the whole partial axis to 16 CTAs.
+  The ratio-4 producer accumulates 8 rows per CTA below 65,536 compressed rows and
+  24 rows per CTA at or above that boundary. The long-context schedule cuts producer
+  partial storage by about two thirds while retaining enough CTA parallelism; the
+  selected row count is part of the compiled/fast-launch cache key.
   Ratio 2 and ratio 128 use a serial ascending-CTA fold. Both forms contain no dAPE
   atomics, fully overwrite `grad_ape`, are bitwise replay-deterministic, and are
   accepted by strict torch deterministic mode.
@@ -173,11 +177,20 @@ output and therefore needs no fill. JIT and allocations are outside the measurem
 For the production `coff=1`, `head_dim=128`, ratio-4 long-context path with local
 pooling disabled, the compressor runs after the raw CP shards are gathered and therefore
 still sees the global packed token count. CP32 and CP64 therefore present the same 256K
-compressor shape. On the same GB200, unequal-document 256K and 1M/CP64 packs measured
-236.4 -> 134.3 us and 806.6 -> 402.1 us respectively versus
-the previous 32-way reducer. Nsight Systems attributes the 1M reduction change to
-456.5 us in the old reducer versus 20.2 + 30.9 us in the two new stages; the producer
-remains 306 us. Workspace grows by 3.125% (64 -> 66 MiB at 1M).
+compressor shape. On one L20D (capability `(10, 3)`, CUDA 13.0, PyTorch 2.12.1,
+CUTLASS DSL 4.8.1), the current unequal-document shapes measured as follows; each range
+covers both plan-construction orders:
+
+| configuration | workspace | atomic operation | deterministic operation | deterministic / atomic |
+|---|---:|---:|---:|---:|
+| r4, c1, d128, packed 256K, CP32/64 | 5.502 MiB | 116.6–118.0 us | 100.6–101.1 us | 0.85–0.86x |
+| r4, c1, d128, packed 1M, CP64 | 22.002 MiB | 372.0–373.9 us | 308.5–309.2 us | 0.83x |
+
+Compared with the 8-row deterministic producer on the same source and host, the
+24-row schedule reduces workspace from 16.5 to 5.502 MiB at 256K and from 66 to
+22.002 MiB at 1M. Deterministic operation time also falls from 105.0 to about 100.9 us
+and from 328.5 to about 309.0 us, respectively. dAPE remains within the benchmark's
+fp64 error gate (maximum absolute errors `1.80e-5` and `4.52e-5`).
 
 Reproduce the long-context rows with
 `benchmark/csa/bench_csa_dape_deterministic.py --long-context`. For the compact

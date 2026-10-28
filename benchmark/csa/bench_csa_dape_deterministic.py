@@ -21,7 +21,6 @@ import statistics
 
 import torch
 from cudnn.csa import CSACompressorBackward
-from cudnn.csa.compressor.compressor_sm100 import _BWD_ROWS
 
 # On the seeded 1M case, both deterministic trees stay within 2.1e-4 of the
 # FP64 sum while the atomic result varies by more than 1.9e-3.
@@ -132,7 +131,11 @@ def _dape_fp64_reference(workspace, total_comp, ratio, coff, d):
     """Sum the reducer's FP32 producer partials independently in FP64."""
     nelems = ratio * coff * d
     if ratio == 4:
-        npartials = (total_comp + _BWD_ROWS - 1) // _BWD_ROWS
+        # Keep --atomic-only usable with pre-selector source checkouts.
+        from cudnn.csa.compressor.compressor_sm100 import _bwd_rows
+
+        rows_per_cta = _bwd_rows(ratio, True, total_comp)
+        npartials = (total_comp + rows_per_cta - 1) // rows_per_cta
     else:
         # Ratio 128 chooses rows_per_cta from the runtime device shape; its
         # workspace (like generic ratio 2) contains only the producer planes.

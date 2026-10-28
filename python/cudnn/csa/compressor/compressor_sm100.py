@@ -55,8 +55,9 @@ Backward:
   over ``rows_per_cta`` blocks and then uses one fp32 atomic per ``(k, dim)`` per CTA.
   The opt-in deterministic path instead writes those CTA-local sums to caller-owned
   workspace and launches fixed-order reduction stages which fully overwrite ``dAPE``.
-  Ratio 4 uses a hierarchical two-kernel fold so long packed sequences expose enough
-  CTA parallelism; ratios 2 and 128 keep their serial fold. When ``total_comp == 0``
+  Ratio 4 uses a hierarchical two-kernel fold and a long-context 24-row CTA schedule
+  so packed sequences retain enough parallelism with fewer partial planes; ratios 2
+  and 128 keep their serial fold. When ``total_comp == 0``
   no kernel is launched and the buffers are left
   untouched (the wrapper falls back to allocating zeros).
 
@@ -955,6 +956,15 @@ _COMPILED = {}
 # kernel twice (the compiled-function cache itself is a plain dict guarded by the GIL).
 _COMPILE_LOCK = threading.Lock()
 _BWD_ROWS, _BWD_THREADS = 8, 128
+_BWD_ROWS_R4_DETERMINISTIC = 24
+_BWD_ROWS_R4_DETERMINISTIC_MIN_COMPRESSED_ROWS = 65536
+
+
+def _bwd_rows(ratio, deterministic, nb_total):
+    """Rows accumulated by one generic backward CTA for this plan capacity."""
+    if deterministic and ratio == 4 and nb_total >= _BWD_ROWS_R4_DETERMINISTIC_MIN_COMPRESSED_ROWS:
+        return _BWD_ROWS_R4_DETERMINISTIC
+    return _BWD_ROWS
 
 
 def _fwd_schedule(d):
@@ -1020,7 +1030,7 @@ def _compile_fwd(key, args, ratio, d, coff):
     return fn
 
 
-def _compile_bwd(key, args, ratio, d, coff, deterministic=False):
+def _compile_bwd(key, args, ratio, d, coff, rows_per_cta, deterministic=False):
     """JIT-compile the backward launch entry for ``key`` (capture-guarded)."""
     with _COMPILE_LOCK:
         fn = _COMPILED.get(key)
@@ -1031,7 +1041,7 @@ def _compile_bwd(key, args, ratio, d, coff, deterministic=False):
                     "graph capture (JIT compilation is not capture-safe); compile() or "
                     "run one eager step for this configuration before capturing."
                 )
-            fn = cute.compile(_compressor_bwd_launch, *args, ratio, d, coff, _BWD_ROWS, _BWD_THREADS, deterministic)
+            fn = cute.compile(_compressor_bwd_launch, *args, ratio, d, coff, rows_per_cta, _BWD_THREADS, deterministic)
             _COMPILED[key] = fn
     return fn
 
@@ -1097,9 +1107,10 @@ def precompile_fwd(ratio, d, coff, device):
         _compile_fwd(key, args, ratio, d, coff)
 
 
-def precompile_bwd(ratio, d, coff, device, deterministic=False):
-    """Ensure the backward kernel for ``(ratio, d, coff, device)`` is JIT-compiled."""
-    key = ("bwd", ratio, d, coff, bool(deterministic), device.index)
+def precompile_bwd(ratio, d, coff, device, deterministic=False, nb_total=0):
+    """Compile the backward schedule selected from the plan-time ``nb_total`` capacity."""
+    rows_per_cta = _bwd_rows(ratio, deterministic, nb_total)
+    key = ("bwd", ratio, d, coff, bool(deterministic), rows_per_cta, device.index)
     reduce_key = ("dape_reduce", ratio == 4, device.index)
     if key in _COMPILED and (not deterministic or reduce_key in _COMPILED):
         return
@@ -1123,7 +1134,7 @@ def precompile_bwd(ratio, d, coff, device, deterministic=False):
             cutlass.Int32(0),
             stream,
         )
-        _compile_bwd(key, args, ratio, d, coff, deterministic)
+        _compile_bwd(key, args, ratio, d, coff, rows_per_cta, deterministic)
         if deterministic:
             precompile_dape_reduce(device, split=ratio == 4)
 
@@ -1180,7 +1191,8 @@ def bwd_dape_workspace_bytes(nb_total, ratio, d, coff):
     """Caller-owned deterministic dAPE partial and reduction-stage bytes."""
     if nb_total <= 0:
         return 0
-    npartials = (nb_total + _BWD_ROWS - 1) // _BWD_ROWS
+    rows_per_cta = _bwd_rows(ratio, True, nb_total)
+    npartials = (nb_total + rows_per_cta - 1) // rows_per_cta
     nelems = ratio * coff * d
     stage_elems = 0
     if ratio == 4:
@@ -1244,7 +1256,8 @@ def run_bwd(
     (for the kernel's padding-token zero sweep) is derived from ``kv``'s element count.
     """
     dev = kv.device.index
-    key = ("bwd", ratio, d, coff, bool(deterministic), dev)
+    rows_per_cta = _bwd_rows(ratio, deterministic, nb_total)
+    key = ("bwd", ratio, d, coff, bool(deterministic), rows_per_cta, dev)
     total_tokens = kv.numel() // (coff * d)
     partial_buffer = workspace if deterministic else gape
     if stream_handle is None:
@@ -1286,9 +1299,9 @@ def run_bwd(
             )
             fn = _COMPILED.get(key)
             if fn is None:
-                fn = _compile_bwd(key, args, ratio, d, coff, deterministic)
+                fn = _compile_bwd(key, args, ratio, d, coff, rows_per_cta, deterministic)
             fn(*args)
             _FAST.put(key, fn, args)
         if deterministic:
-            partials = (nb_total + _BWD_ROWS - 1) // _BWD_ROWS
+            partials = (nb_total + rows_per_cta - 1) // rows_per_cta
             _run_dape_reduce(workspace, gape, partials, ratio * coff * d, stream_handle, split=ratio == 4)
