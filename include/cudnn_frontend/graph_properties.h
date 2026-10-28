@@ -6,12 +6,18 @@
 #pragma once
 
 #include <cerrno>
+#include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <iostream>
+#include <functional>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <type_traits>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 #include <limits.h>
 
@@ -22,6 +28,8 @@
 namespace cudnn_frontend {
 
 namespace graph {
+
+class CustomReductionNode;
 
 inline std::optional<float>
 get_rescale_threshold_from_env() {
@@ -112,6 +120,7 @@ class Tensor_attributes {
    private:
     template <typename>
     friend class Attributes;
+    friend class CustomReductionNode;
 
     std::string name;
     DataType_t data_type        = DataType_t::NOT_SET;
@@ -482,9 +491,14 @@ class Tensor_attributes {
 class Batchnorm_attributes;
 class Batchnorm_backward_attributes;
 class Concatenate_attributes;
+class Graph;
+class Custom_reduction_attributes;
 
 template <typename DerivedT>
 class Attributes {
+    static constexpr bool has_vector_inputs =
+        std::is_same_v<DerivedT, Concatenate_attributes> || std::is_same_v<DerivedT, Custom_reduction_attributes>;
+
     DerivedT&
     self() {
         return *static_cast<DerivedT*>(this);
@@ -505,7 +519,7 @@ class Attributes {
             return tensor && tensor->get_is_virtual() == false && !tensor->get_has_compile_time_constant();
         };
 
-        if constexpr (std::is_same_v<DerivedT, Concatenate_attributes>) {
+        if constexpr (has_vector_inputs) {
             for (auto tensor : derived->inputs) {
                 if (should_be_in_variant_pack(tensor)) {
                     non_virtual_uids.push_back(tensor->get_uid());
@@ -557,7 +571,7 @@ class Attributes {
     fill_tensors(std::vector<std::shared_ptr<Tensor_attributes>>& tensors) const {
         auto derived = static_cast<DerivedT const*>(this);
 
-        if constexpr (std::is_same_v<DerivedT, Concatenate_attributes>) {
+        if constexpr (has_vector_inputs) {
             for (auto& tensor : derived->inputs) {
                 tensors.push_back(tensor);
             }
@@ -583,7 +597,7 @@ class Attributes {
     fill_pass_by_value(std::unordered_map<Tensor_attributes::uid_t, Tensor_attributes::pass_by_values_t>&
                            tensor_to_pass_by_value) const {
         auto derived = static_cast<DerivedT const*>(this);
-        if constexpr (std::is_same_v<DerivedT, Concatenate_attributes>) {
+        if constexpr (has_vector_inputs) {
             for (auto& tensor : derived->inputs) {
                 if (tensor && tensor->get_pass_by_value().has_value()) {
                     tensor_to_pass_by_value.emplace(tensor->get_uid(), tensor->get_pass_by_value().value());
@@ -605,7 +619,7 @@ class Attributes {
     fill_from_context(detail::Context const& context) {
         auto derived = static_cast<DerivedT const*>(this);
 
-        if constexpr (std::is_same_v<DerivedT, Concatenate_attributes>) {
+        if constexpr (has_vector_inputs) {
             for (auto& tensor : derived->inputs) {
                 if (tensor) {
                     tensor->fill_from_context(context);
@@ -646,7 +660,7 @@ class Attributes {
         };
 
         int64_t number_of_dims = 1;
-        if constexpr (std::is_same_v<DerivedT, Concatenate_attributes>) {
+        if constexpr (has_vector_inputs) {
             for (auto tensor : derived->inputs) {
                 if (tensor && !is_fused_scalar(tensor)) {
                     number_of_dims = tensor->get_dim().size();
@@ -675,7 +689,7 @@ class Attributes {
         }
 
         // Expand fused scalar dimensions to match the number of dims of non-scalar tensors
-        if constexpr (std::is_same_v<DerivedT, Concatenate_attributes>) {
+        if constexpr (has_vector_inputs) {
             for (auto tensor : derived->inputs) {
                 if (is_fused_scalar(tensor)) {
                     tensor->set_dim(std::vector<int64_t>(number_of_dims, 1));
@@ -1434,6 +1448,256 @@ class Reduction_attributes : public Attributes<Reduction_attributes> {
         inputs[input_names::Group_offset] = std::move(value);
         return *this;
     }
+};
+
+// Exact-width, most-significant-byte-first scalar bits for the graph JSON constants and the custom-reduction
+// identities. Not in utils/serialize.h: the identity spelling is also needed without the JSON library.
+namespace serialization_detail {
+
+template <size_t ByteCount>
+struct unsigned_scalar_bits;
+
+template <>
+struct unsigned_scalar_bits<1> {
+    using type = uint8_t;
+};
+
+template <>
+struct unsigned_scalar_bits<2> {
+    using type = uint16_t;
+};
+
+template <>
+struct unsigned_scalar_bits<4> {
+    using type = uint32_t;
+};
+
+template <>
+struct unsigned_scalar_bits<8> {
+    using type = uint64_t;
+};
+
+template <typename T>
+std::string
+scalar_to_raw_hex(T const& value) {
+    static_assert(std::is_trivially_copyable_v<T>, "Raw scalars must be trivially copyable");
+    using raw_bits_t = typename unsigned_scalar_bits<sizeof(T)>::type;
+
+    static constexpr char hex_digits[] = "0123456789ABCDEF";
+    raw_bits_t raw_bits;
+    if constexpr (std::is_same_v<T, half>) {
+        raw_bits = static_cast<__half_raw>(value).x;
+    } else if constexpr (std::is_same_v<T, nv_bfloat16>) {
+        raw_bits = static_cast<__nv_bfloat16_raw>(value).x;
+    } else {
+        raw_bits = 0;
+        std::memcpy(&raw_bits, &value, sizeof(T));
+    }
+
+    std::string raw_hex(sizeof(T) * 2, '0');
+    for (size_t i = 0; i < sizeof(T); ++i) {
+        auto const shift   = static_cast<unsigned>((sizeof(T) - i - 1) * 8);
+        auto const byte    = static_cast<uint8_t>((raw_bits >> shift) & 0xFFu);
+        raw_hex[2 * i]     = hex_digits[byte >> 4];
+        raw_hex[2 * i + 1] = hex_digits[byte & 0x0F];
+    }
+    return raw_hex;
+}
+
+template <typename T>
+T
+scalar_from_raw_bits(typename unsigned_scalar_bits<sizeof(T)>::type raw_bits) {
+    static_assert(std::is_trivially_copyable_v<T>, "Raw scalars must be trivially copyable");
+    T value{};
+    if constexpr (std::is_same_v<T, half>) {
+        __half_raw half_raw{};
+        half_raw.x = raw_bits;
+        value      = half_raw;
+    } else if constexpr (std::is_same_v<T, nv_bfloat16>) {
+        __nv_bfloat16_raw bfloat16_raw{};
+        bfloat16_raw.x = raw_bits;
+        value          = bfloat16_raw;
+    } else {
+        std::memcpy(&value, &raw_bits, sizeof(T));
+    }
+    return value;
+}
+
+}  // namespace serialization_detail
+
+struct Custom_reduction_fp8_e4m3 {
+    uint8_t storage;
+};
+
+struct Custom_reduction_fp8_e5m2 {
+    uint8_t storage;
+};
+
+// One byte per element; zero is false and any other value is true.
+struct Custom_reduction_byte_boolean {
+    uint8_t storage;
+};
+
+// Owns the identity's exact scalar representation. In particular, equal-width
+// types such as HALF and BFLOAT16 remain distinct and are never converted.
+class Custom_reduction_identity {
+   public:
+    using value_t = std::variant<int8_t,
+                                 uint8_t,
+                                 int32_t,
+                                 uint32_t,
+                                 int64_t,
+                                 half,
+                                 float,
+                                 double,
+                                 nv_bfloat16,
+                                 Custom_reduction_fp8_e4m3,
+                                 Custom_reduction_fp8_e5m2,
+                                 Custom_reduction_byte_boolean>;
+
+    explicit Custom_reduction_identity(int8_t value) : value(value) {}
+    explicit Custom_reduction_identity(uint8_t value) : value(value) {}
+    explicit Custom_reduction_identity(int32_t value) : value(value) {}
+    explicit Custom_reduction_identity(uint32_t value) : value(value) {}
+    explicit Custom_reduction_identity(int64_t value) : value(value) {}
+    explicit Custom_reduction_identity(half value) : value(value) {}
+    explicit Custom_reduction_identity(float value) : value(value) {}
+    explicit Custom_reduction_identity(double value) : value(value) {}
+    explicit Custom_reduction_identity(nv_bfloat16 value) : value(value) {}
+    explicit Custom_reduction_identity(Custom_reduction_fp8_e4m3 value) : value(value) {}
+    explicit Custom_reduction_identity(Custom_reduction_fp8_e5m2 value) : value(value) {}
+    explicit Custom_reduction_identity(Custom_reduction_byte_boolean value) : value(value) {}
+
+    DataType_t
+    get_data_type() const {
+        return std::visit(
+            [](auto const& identity) {
+                using T = std::decay_t<decltype(identity)>;
+                if constexpr (std::is_same_v<T, int8_t>) {
+                    return DataType_t::INT8;
+                } else if constexpr (std::is_same_v<T, uint8_t>) {
+                    return DataType_t::UINT8;
+                } else if constexpr (std::is_same_v<T, int32_t>) {
+                    return DataType_t::INT32;
+                } else if constexpr (std::is_same_v<T, uint32_t>) {
+                    return DataType_t::UINT32;
+                } else if constexpr (std::is_same_v<T, int64_t>) {
+                    return DataType_t::INT64;
+                } else if constexpr (std::is_same_v<T, half>) {
+                    return DataType_t::HALF;
+                } else if constexpr (std::is_same_v<T, float>) {
+                    return DataType_t::FLOAT;
+                } else if constexpr (std::is_same_v<T, double>) {
+                    return DataType_t::DOUBLE;
+                } else if constexpr (std::is_same_v<T, nv_bfloat16>) {
+                    return DataType_t::BFLOAT16;
+                } else if constexpr (std::is_same_v<T, Custom_reduction_fp8_e4m3>) {
+                    return DataType_t::FP8_E4M3;
+                } else if constexpr (std::is_same_v<T, Custom_reduction_fp8_e5m2>) {
+                    return DataType_t::FP8_E5M2;
+                } else {
+                    static_assert(std::is_same_v<T, Custom_reduction_byte_boolean>,
+                                  "Unhandled custom-reduction identity type");
+                    return DataType_t::BYTE_BOOLEAN;
+                }
+            },
+            value);
+    }
+
+    void const*
+    data() const {
+        return std::visit([](auto const& identity) -> void const* { return &identity; }, value);
+    }
+
+    size_t
+    size() const {
+        return std::visit([](auto const& identity) { return sizeof(identity); }, value);
+    }
+
+    // Canonical, exact-width, most-significant-byte-first bits: independent of host byte order, and keeps signed
+    // zero, NaN payloads, integer bits and the explicit FP8 storage byte.
+    std::string
+    get_raw_hex() const {
+        return std::visit([](auto const& identity) { return serialization_detail::scalar_to_raw_hex(identity); },
+                          value);
+    }
+
+   private:
+    value_t value;
+};
+
+class Custom_reduction_attributes : public Attributes<Custom_reduction_attributes> {
+    friend class Attributes<Custom_reduction_attributes>;
+    friend class CustomReductionNode;
+
+   public:
+    using Tensor_t = std::shared_ptr<Tensor_attributes>;
+    using Graph_t  = std::shared_ptr<Graph>;
+    using Reducer_t =
+        std::function<std::vector<Tensor_t>(Graph_t, std::vector<Tensor_t> /* lhs */, std::vector<Tensor_t> /* rhs */)>;
+
+    std::vector<Tensor_t> inputs;
+    std::map<int64_t, Tensor_t> outputs;
+
+    // The semantic key is part of Graph::key(). Callers must change it whenever
+    // callback behavior or any captured value that affects the reducer changes.
+    // It must be deterministic and stable across processes and graph expansion.
+    Custom_reduction_attributes&
+    set_reducer(Reducer_t value, std::string semantic_key) {
+        reducer              = std::move(value);
+        reducer_semantic_key = std::move(semantic_key);
+        return *this;
+    }
+
+    Custom_reduction_attributes&
+    set_reduction_dims(std::vector<int64_t> value) {
+        reduction_dims = std::move(value);
+        return *this;
+    }
+
+    Custom_reduction_attributes&
+    set_identity_values(std::vector<Custom_reduction_identity> value) {
+        identity_values = std::move(value);
+        return *this;
+    }
+
+    Custom_reduction_attributes&
+    set_compute_data_types(std::vector<DataType_t> value) {
+        compute_data_types = std::move(value);
+        compute_data_type  = DataType_t::NOT_SET;
+        return *this;
+    }
+
+    // Homogeneous convenience spelling. The last singular/plural setter wins;
+    // leaving both unset preserves the backend's per-Y compute-type default.
+    Custom_reduction_attributes&
+    set_compute_data_type(DataType_t value) {
+        compute_data_type = value;
+        compute_data_types.clear();
+        return *this;
+    }
+
+    std::vector<int64_t> const&
+    get_reduction_dims() const {
+        return reduction_dims;
+    }
+
+    std::vector<Custom_reduction_identity> const&
+    get_identity_values() const {
+        return identity_values;
+    }
+
+    std::vector<DataType_t> const&
+    get_compute_data_types() const {
+        return compute_data_types;
+    }
+
+   private:
+    Reducer_t reducer = nullptr;
+    std::string reducer_semantic_key;
+    std::vector<int64_t> reduction_dims;
+    std::vector<Custom_reduction_identity> identity_values;
+    std::vector<DataType_t> compute_data_types;
 };
 
 class Rng_attributes : public Attributes<Rng_attributes> {

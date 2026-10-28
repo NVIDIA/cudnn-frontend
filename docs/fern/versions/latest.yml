@@ -29,6 +29,9 @@ navigation:
       - page: Convolutions
         path: ../../operations/Convolutions.md
         slug: operations/Convolutions
+      - page: Custom Reduction
+        path: ../../operations/CustomReduction.md
+        slug: operations/CustomReduction
       - page: FFT Causal Conv1d
         path: ../../operations/FFTCausalConv1d.md
         slug: operations/FFTCausalConv1d

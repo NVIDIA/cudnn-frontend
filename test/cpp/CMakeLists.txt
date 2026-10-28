@@ -23,6 +23,8 @@ include(${PROJECT_SOURCE_DIR}/cmake/cuDNN.cmake)
 add_executable(
     tests
 
+    custom_reduction.cpp
+    custom_reduction_backend.cpp
     pointwise_tests.cpp
     plans.cpp
     serialize.cpp

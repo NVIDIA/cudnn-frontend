@@ -15,6 +15,10 @@
 #include <sstream>
 #include <cmath>
 #include <cstdint>
+#include <charconv>
+#include <limits>
+#include <stdexcept>
+#include <cstring>
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -26,6 +30,29 @@
 #endif
 
 using json = nlohmann::json;
+
+namespace cudnn_frontend::serialization_detail {
+
+inline int64_t
+signed_integer(json const& j) {
+    if (!j.is_number_integer() ||
+        (j.is_number_unsigned() && j.get<uint64_t>() > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))) {
+        throw std::invalid_argument("Serialized integer must be an in-range signed 64-bit integer");
+    }
+    return j.get<int64_t>();
+}
+
+inline int64_t
+uid_key(std::string const& text) {
+    int64_t value     = 0;
+    auto const parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() || std::to_string(value) != text) {
+        throw std::invalid_argument("Serialized UID must be a canonical signed 64-bit decimal string");
+    }
+    return value;
+}
+
+}  // namespace cudnn_frontend::serialization_detail
 
 template <>
 struct nlohmann::adl_serializer<float> {
@@ -42,13 +69,16 @@ struct nlohmann::adl_serializer<float> {
 
     static void
     from_json(const nlohmann::json& j, float& f) {
-        // Read hexadecimal string and convert back to float
-        std::string hexValueStr = j.get<std::string>();
-        unsigned int hexValue;
-        std::stringstream stream(hexValueStr);
-        stream >> std::hex >> hexValue;
-
-        std::memcpy(&f, &hexValue, sizeof(float));
+        if (!j.is_string()) {
+            throw std::invalid_argument("Serialized FLOAT must contain exactly eight hexadecimal digits");
+        }
+        auto const& text  = j.get_ref<std::string const&>();
+        uint32_t bits     = 0;
+        auto const parsed = std::from_chars(text.data(), text.data() + text.size(), bits, 16);
+        if (text.size() != 8 || parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) {
+            throw std::invalid_argument("Serialized FLOAT must contain exactly eight hexadecimal digits");
+        }
+        std::memcpy(&f, &bits, sizeof(f));
     }
 };
 
@@ -90,24 +120,31 @@ struct nlohmann::adl_serializer<std::variant<int64_t, int32_t, half, float, doub
     static void
     from_json(const nlohmann::json& j, std::variant<int64_t, int32_t, half, float, double, nv_bfloat16>& data) {
         if (!j.is_object() || !j.contains("index") || !j.contains("value")) {
-            return;
+            throw std::invalid_argument("Serialized pass-by-value scalar requires index and value");
         }
 
-        size_t type_index = j.at("index").get<size_t>();
+        auto const type_index = cudnn_frontend::serialization_detail::signed_integer(j.at("index"));
         if (type_index == 0) {
-            data = j.at("value").get<int64_t>();
+            data = cudnn_frontend::serialization_detail::signed_integer(j.at("value"));
         } else if (type_index == 1) {
-            data = j.at("value").get<int32_t>();
+            auto const value = cudnn_frontend::serialization_detail::signed_integer(j.at("value"));
+            if (value < std::numeric_limits<int32_t>::min() || value > std::numeric_limits<int32_t>::max()) {
+                throw std::invalid_argument("Serialized INT32 scalar is out of range");
+            }
+            data = static_cast<int32_t>(value);
         } else if (type_index == 2) {
             data = j.at("value").get<half>();
         } else if (type_index == 3) {
             data = j.at("value").get<float>();
         } else if (type_index == 4) {
+            if (!j.at("value").is_number()) {
+                throw std::invalid_argument("Serialized DOUBLE scalar must be a number");
+            }
             data = j.at("value").get<double>();
         } else if (type_index == 5) {
             data = j.at("value").get<nv_bfloat16>();
         } else {
-            return;
+            throw std::invalid_argument("Serialized pass-by-value scalar has an unknown index");
         }
     }
 };
@@ -709,6 +746,7 @@ enum class DataType_t {
     INT4,
     COMPLEX_FP32,
     COMPLEX_FP64,
+    UINT32,
 };
 
 NLOHMANN_JSON_SERIALIZE_ENUM(DataType_t,
@@ -736,6 +774,7 @@ NLOHMANN_JSON_SERIALIZE_ENUM(DataType_t,
                                  {DataType_t::INT4, "INT4"},
                                  {DataType_t::COMPLEX_FP32, "COMPLEX_FP32"},
                                  {DataType_t::COMPLEX_FP64, "COMPLEX_FP64"},
+                                 {DataType_t::UINT32, "UINT32"},
 
                              })
 
@@ -1015,6 +1054,8 @@ get_data_type_size(DataType_t const data_type) {
             return 1;
         case DataType_t::INT32:
             return sizeof(int32_t);
+        case DataType_t::UINT32:
+            return sizeof(uint32_t);
         case DataType_t::INT8x4:
         case DataType_t::UINT8x4:
             return 4;
@@ -1082,6 +1123,14 @@ convert_to_cudnn_type(cudnn_frontend::DataType_t const mode, cudnnDataType_t& cu
         case DataType_t::INT32:
             cudnn_mode = CUDNN_DATA_INT32;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case DataType_t::UINT32:
+#if (CUDNN_VERSION >= 91100)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(91100, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
+            cudnn_mode = CUDNN_DATA_UINT32;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#else
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+#endif
         case DataType_t::INT8x4:
             cudnn_mode = CUDNN_DATA_INT8x4;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
@@ -2329,6 +2378,10 @@ convert_from_cudnn_type(cudnnDataType_t const cudnn_mode) {
             return DataType_t::INT8;
         case CUDNN_DATA_INT32:
             return DataType_t::INT32;
+#if (CUDNN_VERSION >= 91100)
+        case CUDNN_DATA_UINT32:
+            return DataType_t::UINT32;
+#endif
         case CUDNN_DATA_INT8x4:
             return DataType_t::INT8x4;
         case CUDNN_DATA_UINT8:
@@ -2407,6 +2460,7 @@ get_element_size_in_bits(cudnn_frontend::DataType_t datatype) {
             break;
         case DataType_t::FLOAT:
         case DataType_t::INT32:
+        case DataType_t::UINT32:
         case DataType_t::INT8x4:
         case DataType_t::UINT8x4:
             return 32;

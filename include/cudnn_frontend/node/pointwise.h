@@ -11,6 +11,10 @@
 namespace cudnn_frontend::graph {
 
 class PointwiseNode : public NodeCRTP<PointwiseNode> {
+    friend class CustomReductionNode;
+    // The backend accepts RELU_FWD in a reducer body only with the default upper clip.
+    bool in_reducer_body = false;
+
    public:
     Pointwise_attributes attributes;
 
@@ -129,7 +133,7 @@ class PointwiseNode : public NodeCRTP<PointwiseNode> {
                                                            &lower_clip));
 
             double upper_clip = attributes.relu_upper_clip.value_or(std::numeric_limits<double>::max());
-            if (attributes.compute_data_type == DataType_t::FLOAT) {
+            if (attributes.compute_data_type == DataType_t::FLOAT && !in_reducer_body) {
                 upper_clip = std::min<double>(upper_clip, std::numeric_limits<float>::max());
             }
 

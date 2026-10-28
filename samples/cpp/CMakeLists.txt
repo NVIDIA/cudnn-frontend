@@ -75,6 +75,10 @@ add_executable(
     membound/concat.cpp
     membound/membound_fusion.cpp
     membound/boolean_fusion.cpp
+    membound/custom_reduction.cpp
+    membound/custom_reduction_argmax.cpp
+    membound/custom_reduction_sampling.cpp
+    membound/custom_reduction_xla.cpp
 
     causal_conv1d/causal_conv1d.cpp
     causal_conv1d/causal_conv1d_nwh.cpp
