@@ -1639,6 +1639,8 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     kernels (per-tensor FP8 and MXFP8) do; the d192xd128 siblings share the d128
     config family but accept DTYPE_O 0..3 only, so a flavor-name test
     ("d128" in flavor) would let them through to a specialization error."""
+    if k.dtype_kv != -1:
+        raise ValueError(f"{flavor}: independent FP8 KV storage is not wired on the native SM107 pipeline")
     if k.decode_q_tile:
         # The loader routes a decode_q_tile record to sm107/decode_d256_f16.py
         # (make_cfg_d256_decode at the end of this module); a Rubin prefill template

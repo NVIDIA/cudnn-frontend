@@ -469,6 +469,9 @@ class TemplateParams:
     # TMEM map gains the Q slots, the MMA form and the commit site move): the template-module cache keys on this record alone.  Picked by
     # config_sm107.sm107_q_in_tmem_pick (0 until measured; the sweep seam pins 1); validated by the factory (config_sm107._validate_q_in_tmem).
     q_in_tmem: int = 0
+    # Optional native FP8 K/V storage for the half-input d128 pipeline.
+    # Appended: -1 keeps the existing uniform Q/K/V behavior.
+    dtype_kv: int = -1
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any
@@ -594,6 +597,8 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
     if k.dtype_qkv not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: DTYPE_QKV must be E4M3/E5M2/BF16/FP16 (0..3); got {k.dtype_qkv}")
     fp8 = k.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
+    if k.dtype_kv != -1 and not (flavor == "d128" and k.dtype_qkv in (DTYPE_BF16, DTYPE_FP16) and k.dtype_kv in (DTYPE_E4M3, DTYPE_E5M2)):
+        raise ValueError(f"{flavor}: independent FP8 KV storage is wired only on the half-input d128 pipeline")
     if fp8 and flavor not in ("d64", "d128", "d192", "d256", "d512"):
         raise ValueError(f"{flavor}: FP8/MXFP8 inputs (DTYPE_QKV 0/1) are only supported on d64, d128, d192, d256, and d512")
     if k.softmax_f16 and not fp8:
@@ -2459,6 +2464,7 @@ class CfgD128(D128FamilySmallTileFields):
     # Paged KV cache; see TemplateParams.paged_kv.  PAGE_SIZE tokens per page.
     PAGED_KV: int = 0
     PAGE_SIZE: int = 0
+    DTYPE_KV: int = -1
 
 
 # Blackwell SM100 per-CTA dynamic SMEM cap (228 KiB physical, 227 KiB usable).
@@ -2489,7 +2495,8 @@ def _d128_smem_bytes(cfg) -> int:
     # The per-tensor FP8 kernel stages P (TILE_M x TILE_N fp8 per Q sub-tile) in SMEM so the next
     # step's QK^T can overlap the softmax; counted for every quantized row (pessimistic for MXFP8).
     p = cfg.TILES_Q * cfg.TILE_M * cfg.TILE_N * cfg.BPE if cfg.DTYPE_QKV <= 1 else 0
-    return qo + k + v + p
+    raw_kv = max(cfg.TILE_N * cfg.TILE_K, cfg.TILE_O * cfg.TILE_N) // cfg.CTA_MMA if cfg.DTYPE_KV in (DTYPE_E4M3, DTYPE_E5M2) and cfg.DTYPE_QKV > 1 else 0
+    return qo + k + v + p + raw_kv
 
 
 def _validate_cfg_d128(cfg: CfgD128) -> None:
@@ -2571,6 +2578,7 @@ def make_cfg_d128(params: TemplateParams, *, cga1_kv_stages: int = 2) -> Tuple[C
     tile_k_hw_fp8 = 32 if fp8 else tile_k_hw(params.dtype_qkv)
     cfg = CfgD128(
         DTYPE_QKV=params.dtype_qkv,
+        DTYPE_KV=params.dtype_kv,
         DTYPE_O=dtype_o,
         BPE=b,
         BPE_V=b_v,
@@ -2731,7 +2739,7 @@ def _validate_cfg_d128_decode(cfg: CfgD128Decode) -> None:
         (cfg.QO_ALIAS == 1, "d128 decode: Q and O share one SMEM slab (pays for the third KV stage)"),
         (cfg.TILES_Q == 1, "d128 decode: TILES_Q must be 1 (one 128-row Q tile per CTA)"),
         (cfg.TILE_M == 128 and cfg.TILE_N == 128 and cfg.TILE_K in (128, 192) and cfg.TILE_O == 128, "single-Q tile: QK width 128 or 192, V width 128"),
-        (cfg.STAGES_KV == (3 if cfg.TILE_K == 128 else 2), "single-Q tile: KV stages must fit the QK width"),
+        (cfg.STAGES_KV == (3 if cfg.TILE_K == 128 and cfg.DTYPE_KV == -1 else 2), "single-Q tile: KV stages must fit the QK width and storage conversion"),
         (
             _d128_smem_bytes(cfg) <= _SM100_MAX_DYN_SMEM,
             f"d128 decode: SMEM {_d128_smem_bytes(cfg) // 1024} KiB over the SM100 {_SM100_MAX_DYN_SMEM // 1024} KiB per-CTA cap",
@@ -2783,6 +2791,8 @@ def make_cfg_d128_decode(params: TemplateParams) -> Tuple[CfgD128Decode, TmaIter
     if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"d128 decode: f16/bf16 inputs only (DTYPE_QKV 2/3); got {params.dtype_qkv}")
     d_qk = params.single_q_head_dim
+    if params.dtype_kv != -1 and d_qk != 128:
+        raise ValueError("independent FP8 KV storage requires native D128")
     if d_qk not in (128, 192):
         raise ValueError("single-Q tile: QK width must be 128 or 192")
     if d_qk == 192 and not (params.thd_varlen and not params.paged_kv and not params.pack_gqa):
@@ -2795,7 +2805,10 @@ def make_cfg_d128_decode(params: TemplateParams) -> Tuple[CfgD128Decode, TmaIter
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     cfg = CfgD128Decode(
         TILE_K=d_qk,
-        STAGES_KV=3 if d_qk == 128 else 2,
+        # A raw FP8 tile shares the local load warp between K and V. Two
+        # converted stages leave room for that16KiB slab; uniform half keeps3.
+        STAGES_KV=3 if d_qk == 128 and params.dtype_kv == -1 else 2,
+        DTYPE_KV=params.dtype_kv,
         THD_VARLEN=int(params.thd_varlen),
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,

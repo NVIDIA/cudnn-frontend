@@ -29,6 +29,8 @@ pytestmark = [requires_dsl]
         for totals in (False, True)
     ]
     + [
+        pytest.param(128, "bfloat16", "token", True, False, 2, marks=pytest.mark.L0, id="d128_split2_origins"),
+        pytest.param(128, "float16", "head", True, False, 5, marks=pytest.mark.L0, id="d128_split5_origins"),
         pytest.param((576, 512), "bfloat16", "token", True, False, 1, marks=pytest.mark.L0, id="d576_unpacked"),
         pytest.param((576, 512), "bfloat16", "head", True, True, 1, marks=pytest.mark.L0, id="d576_partial_pack"),
         pytest.param((576, 512), "float16", "token", False, True, 1, marks=pytest.mark.L1, id="d576_fp16_partial_pack"),
@@ -37,7 +39,7 @@ pytestmark = [requires_dsl]
         pytest.param((576, 512), "float16", "token", False, True, 9, marks=pytest.mark.L1, id="d576_split9_fp16_partial_pack"),
     ],
 )
-def test_independent_thd_origins_rebind_and_capture(dim, dtype_name, stats_layout, total_hints, pack_gqa, splits):
+def test_independent_thd_origins_rebind_and_capture(dim, dtype_name, stats_layout, total_hints, pack_gqa, splits, kv_dtype_name=None):
     import cudnn
     import torch
 
@@ -57,7 +59,9 @@ def test_independent_thd_origins_rebind_and_capture(dim, dtype_name, stats_layou
 
     def tensors(head_padding=0):
         result = {
-            name: torch.empty(batch, maximum, h, width + head_padding, device="cuda", dtype=dtype)[..., :width].transpose(1, 2)
+            name: torch.empty(
+                batch, maximum, h, width + head_padding, device="cuda", dtype=getattr(torch, kv_dtype_name) if kv_dtype_name and name in ("k", "v") else dtype
+            )[..., :width].transpose(1, 2)
             for name, h, width in (("q", heads, d_qk), ("k", kv_heads, d_qk), ("v", kv_heads, d_v), ("o", heads, d_v))
         }
         result["stats"] = (
@@ -130,12 +134,16 @@ def test_independent_thd_origins_rebind_and_capture(dim, dtype_name, stats_layou
     )
     graph.validate()
     graph.build_operation_graph()
-    if d_qk == 576:
+    if d_qk == 576 or kv_dtype_name is not None or (d_qk == 128 and splits > 1):
         from cudnn.engines.manifest import family_for
 
         graph.create_execution_plan(
             family_for(graph).offered_ids()["sdpa_fwd_prefill_sm100"],
-            {cudnn.knob_type.TILE_CGA_M: 2, cudnn.knob_type.PACK_GQA: int(pack_gqa), cudnn.knob_type.SPLIT_KV: splits},
+            {
+                cudnn.knob_type.TILE_CGA_M: 1 if d_qk == 128 and splits > 1 else 2,
+                cudnn.knob_type.PACK_GQA: int(pack_gqa),
+                cudnn.knob_type.SPLIT_KV: splits,
+            },
         )
         graph.select_plan(0)
     else:

@@ -368,13 +368,21 @@ def _ld_global_f32(addr):
     return cutlass.Float32(r[0] if isinstance(r, (tuple, list)) else r)
 
 
+def _query_length(q_lens, batch):
+    """Lengths and adjacent prefix pairs are two plan-time views of device data."""
+    a = cutlass.make_array_view(q_lens)
+    if cutlass.const_expr(cute.rank(q_lens) == 2):
+        return cutlass.Int64(a[batch, 1]) - cutlass.Int64(a[batch, 0])
+    return cutlass.Int64(a[batch])
+
+
 def _row_sink_logit(sinks, q_lens, head, batch, q_row):
     """The sink logit one row folds: its head's, or -inf (no sink at all) on a PADDED row -- a query row at or past its batch's Q length
     ``q_lens[batch]`` (the dense padded-Q trim), whose O / Stats stay 0 / -inf whatever the sink.  The partials of such a row and of a valid row whose
     every key is masked are the same (every split dead), so the reduction cannot tell them apart without the length."""
     sink_logit = cutlass.Float32(cutlass.make_array_view(sinks)[head])
     if cutlass.const_expr(q_lens is not None):
-        padded = cutlass.Int32(q_row) >= cutlass.Int32(cutlass.make_array_view(q_lens)[batch])
+        padded = cutlass.Int32(q_row) >= cutlass.Int32(_query_length(q_lens, batch))
         sink_logit = cutlass.Float32(arith.select(padded.ir_value(), cutlass.Float32(NEG_INF).ir_value(), sink_logit.ir_value()))
     return sink_logit
 
@@ -540,6 +548,8 @@ def _combine_kernel(
             rq = cutlass.make_array_view(ragged_q)
             q_base = cutlass.Int64(rq[batch]) // cutlass.Int64(ragged_q_div)
             q_len64 = cutlass.Int64(rq[batch + cutlass.Int32(1)]) // cutlass.Int64(ragged_q_div) - q_base
+            if cutlass.const_expr(q_lens is not None):
+                q_len64 = _query_length(q_lens, batch)
             in_seq = cutlass.Int64(q_row) < q_len64
             o_batch = cutlass.Int32(0)
             o_tok64 = cutlass.Int64(cutlass.make_array_view(ragged_o)[batch]) // cutlass.Int64(ragged_o_div) + cutlass.Int64(q_row)
@@ -1006,6 +1016,8 @@ def _combine_decode_kernel(
         rq = cutlass.make_array_view(ragged_q)
         q_base = cutlass.Int64(rq[batch]) // cutlass.Int64(ragged_q_div)
         q_len64 = cutlass.Int64(rq[batch + cutlass.Int32(1)]) // cutlass.Int64(ragged_q_div) - q_base
+        if cutlass.const_expr(q_lens is not None):
+            q_len64 = _query_length(q_lens, batch)
         in_seq = cutlass.Int64(q_row) < q_len64
         o_batch = cutlass.Int32(0)
         o_tok64 = cutlass.Int64(cutlass.make_array_view(ragged_o)[batch]) // cutlass.Int64(ragged_o_div) + cutlass.Int64(q_row)
@@ -2590,6 +2602,8 @@ def _host_ptr_ragged(
     stats_log2: cutlass.Constexpr[bool],
     decode_grid: cutlass.Constexpr[int],
     stream: _cuda_driver.CUstream = None,
+    q_lens_ptr: Optional[cute.Pointer] = None,
+    q_lens_prefix: cutlass.Constexpr[bool] = False,
 ) -> None:
     """The ragged-Q decode leg's pointer ABI: :func:`_host_ptr` plus the (B+1,)
     ragged offsets of Q / O / Stats (int32 or int64 elements), their
@@ -2607,6 +2621,10 @@ def _host_ptr_ragged(
     ragged_lse = None
     if cutlass.const_expr(ragged_lse_ptr is not None):
         ragged_lse = cute.make_tensor(ragged_lse_ptr, cute.make_layout((n_off,), stride=(1,)))
+    q_lens = None
+    if cutlass.const_expr(q_lens_ptr is not None):
+        layout = cute.make_layout((B, 2), stride=(1, 1)) if cutlass.const_expr(q_lens_prefix) else cute.make_layout((B,), stride=(1,))
+        q_lens = cute.make_tensor(q_lens_ptr, layout)
     _launch_combine(
         o_partial,
         lse_partial,
@@ -2625,6 +2643,7 @@ def _host_ptr_ragged(
         None,
         decode_grid,
         stream,
+        q_lens=q_lens,
     )
 
 
@@ -2744,6 +2763,8 @@ def _host_ptr_ragged_sink(
     stats_log2: cutlass.Constexpr[bool],
     decode_grid: cutlass.Constexpr[int],
     stream: _cuda_driver.CUstream = None,
+    q_lens_ptr: Optional[cute.Pointer] = None,
+    q_lens_prefix: cutlass.Constexpr[bool] = False,
 ) -> None:
     """:func:`_host_ptr_ragged` plus the fp32 [H] attention-sink logits."""
     o_partial, lse_partial, o_out, lse_out = _ptr_operands(
@@ -2757,6 +2778,10 @@ def _host_ptr_ragged_sink(
     if cutlass.const_expr(ragged_lse_ptr is not None):
         ragged_lse = cute.make_tensor(ragged_lse_ptr, cute.make_layout((n_off,), stride=(1,)))
     sinks = _sink_operand(sinks_ptr, problem_size)
+    q_lens = None
+    if cutlass.const_expr(q_lens_ptr is not None):
+        layout = cute.make_layout((B, 2), stride=(1, 1)) if cutlass.const_expr(q_lens_prefix) else cute.make_layout((B,), stride=(1,))
+        q_lens = cute.make_tensor(q_lens_ptr, layout)
     _launch_combine(
         o_partial,
         lse_partial,
@@ -2776,6 +2801,7 @@ def _host_ptr_ragged_sink(
         decode_grid,
         stream,
         sinks,
+        q_lens,
     )
 
 
@@ -2813,6 +2839,7 @@ def compile_ptr(
     has_q_lens: bool = False,
     decode_grid: int = DECODE_GRID_OFF,
     use_pdl: bool = False,
+    ragged_q_lens: int = 0,
 ) -> Callable:
     """Compile a shape-generic pointer entry for prepared split execution.
 
@@ -2837,6 +2864,9 @@ def compile_ptr(
     folds the attention sink once (the partials are sink-free).  The dense and
     ragged entries append the fp32 [H] sink-logit pointer right before
     ``stats_log2``; the packed entry takes it as its trailing ``sinks_ptr``.
+    ``ragged_q_lens`` appends the device Q-length pointer after the stream on the
+    ragged entry: 1 reads B lengths, 2 reads B+1 cumulative lengths. These decide
+    live rows independently of the physical offsets used to address Q/O/Stats.
     ``has_q_lens`` (the dense sink entry only) appends the int32 (B,) per-batch Q-length pointer after the sink pointer: the rows of the padded-Q trim
     past their batch's length keep ``O := 0 / LSE := -inf`` instead of folding the sink.
     ``decode_grid`` (appended; ``DECODE_GRID_OFF`` by default: an entry that names no
@@ -2883,6 +2913,8 @@ def compile_ptr(
         raise ValueError("dtype_gate is a gate=True specialization")
     if has_sink and gate:
         raise ValueError("the gate-in-combine entry carries no sink fold (a gated split with a sink is declined)")
+    if ragged_q_lens not in (0, 1, 2) or (ragged_q_lens and not ragged):
+        raise ValueError("ragged_q_lens requires the ragged entry: 1 for lengths, 2 for prefixes")
     if has_q_lens and not has_sink:
         raise ValueError("has_q_lens is a sink specialization: the Q lengths only decide which rows fold the sink")
     if has_q_lens and (ragged or packed):
@@ -2953,5 +2985,6 @@ def compile_ptr(
         symbol="frost_sdpa_fwd_combine_ptr",
         **({"sinks_ptr": P(cutlass.Float32)} if (has_sink and (packed or quantized)) else {}),
         **({"q_lens_ptr": P(cutlass.Int32)} if (has_q_lens and quantized) else {}),
+        **({"q_lens_ptr": P(cutlass.Int32), "q_lens_prefix": ragged_q_lens == 2} if ragged_q_lens else {}),
         **({"use_pdl": True} if use_pdl else {}),
     )

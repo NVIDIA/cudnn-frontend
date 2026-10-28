@@ -536,6 +536,19 @@ class Capabilities:
     # Native flavors with dense Q only. Unlike thd_d_shapes, this preserves
     # the THD envelope of every other flavor on the row. Append-only.
     thd_excluded_d_shapes: frozenset[tuple[int, int]] = frozenset()
+    # Exact native shapes with half Q/O and independent FP8 K/V storage.
+    # This is plain sdpa: no FP8-Q quantization or scalar-descale contract.
+    mixed_fp8_kv_d_shapes: frozenset[tuple[int, int]] = frozenset()
+
+
+def _mixed_fp8_kv(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
+    return (
+        not (facts.is_fp8 or facts.is_mxfp8 or facts.is_backward)
+        and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        and facts.kv_dtype in (cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2)
+        and facts.uniform_qo_dtype
+        and (facts.d_qk, facts.d_v) in capabilities.mixed_fp8_kv_d_shapes
+    )
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
@@ -1511,6 +1524,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # Unsplit D128 packing now lowers to native SM107; this route migration
             # does not expand the pre-folded-scale combinations.
             return "attn_scale_prefolded is not admitted on the half THD packed split / D128 packing / D192 single-Q legs"
+        if (
+            packed_split
+            and facts.device_cc in ((10, 0), (10, 3))
+            and not facts.has_paged_kv
+            and (facts.d_qk, facts.d_v) == (128, 128)
+            and not getattr(cudnn._pybind_module._SdpaThdBinder, "supports_nonpaged_d128_split_physical_origins", False)
+        ):
+            return "nonpaged D128 split physical origins require the matching native cuDNN Frontend extension"
         if packed_split and not getattr(
             cudnn._pybind_module._SdpaThdBinder,
             (
@@ -1886,8 +1907,15 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if facts.has_epilogue_gate:
             # Two different epilogues own the O store (quantize + SF_O vs. O *= sigmoid(G)).
             return "block-scaled O (sf_o) cannot be combined with the fused epilogue gate"
-    if not facts.uniform_dtype:
+    if not facts.uniform_dtype and not _mixed_fp8_kv(capabilities, facts):
         return "K/V dtypes must match Q" if (facts.is_mxfp8 or facts.is_fp8) else "K/V/O dtypes must match Q"
+    if _mixed_fp8_kv(capabilities, facts):
+        binder = cudnn._pybind_module._SdpaThdBinder if facts.thd else cudnn._pybind_module._SdpaDenseBinder
+        if not getattr(binder, "supports_mixed_fp8_kv", False):
+            return "mixed half-Q/FP8-KV requires the matching native cuDNN Frontend extension"
+        reason = _prepared_decline_reason(capabilities, facts, (knobs.split_kv or 1) if knobs is not None else 1)
+        if reason is not None:
+            return f"mixed half-Q/FP8-KV requires native prepared bindings: {reason}"
     if facts.thd:
         # The THD lowering rebuilds packed [1, T, H, D] views from the token,
         # head and element strides; the batch stride is never read (every
@@ -2185,6 +2213,7 @@ def _sm100_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_fwd_prefill_sm100",
         capabilities=Capabilities(
+            mixed_fp8_kv_d_shapes=frozenset({(128, 128)}),
             sm_lo=_BLACKWELL[0],
             sm_hi=106,
             phase="prefill",
@@ -3332,6 +3361,9 @@ def lower_dsl_prefill(
         **({"sample_kv_mask": ga.tensor_desc_from_ir(facts.kv_mask_t, name="kv_mask")} if ("sample_kv_mask" in _ctor_params and facts.has_kv_mask) else {}),
     )
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
+    if getattr(api, "thd_decode_leg", False):
+        # Physical offsets choose addresses; declared Q lengths choose live rows.
+        api._ragged_q_lens = 2 if facts.cu_seq_q_t is not None else 1 if facts.seq_q_t is not None else 0
     if (
         facts.thd
         and not getattr(api, "thd_decode_leg", False)
@@ -3346,7 +3378,7 @@ def lower_dsl_prefill(
                 not (facts.is_fp8 or facts.is_mxfp8)
                 and (
                     ((api.split_kv == 1 or (facts.d_qk, facts.d_v) == SM100_NATIVE_D576_SHAPE) and api.cga in (None, 2))
-                    or (facts.has_paged_kv and facts.d_qk == 128 and api.cga == 1)
+                    or (facts.d_qk == 128 and api.cga == 1 and (facts.has_paged_kv or api.packed_thd_split))
                 )
             )
             or (facts.is_fp8 and facts.has_paged_kv and api.split_kv == 1)
@@ -3644,7 +3676,11 @@ def lower_dsl_prefill(
             # Dense plans, and the decode tile's ragged-Q leg (a dense split
             # launch whose Q / O / Stats rows come from the bound ragged offsets).
             _execute.prepared = PreparedDenseLaunch(
-                api._dense_spec, binding, seq_kv_src=seq_kv_src, seq_q_src=seq_q_src if seq_q_lens_present else None, gate_src=gate_src
+                api._dense_spec,
+                binding,
+                seq_kv_src=seq_kv_src,
+                seq_q_src=seq_q_src if seq_q_lens_present or getattr(api, "_ragged_q_lens", 0) else None,
+                gate_src=gate_src,
             )
         if _execute.prepared is not None:
             _execute.default_stream = lambda: api._get_default_stream(None)

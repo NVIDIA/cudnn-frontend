@@ -38,7 +38,9 @@ pytestmark = [requires_dsl]
         pytest.param(128, "bfloat16", "hnd", "head", 1, 2, False, marks=pytest.mark.L1, id="split2_unpacked"),
     ],
 )
-def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stats_layout, cga, splits, pack_gqa, page_size=16, window_left=None, sink=None):
+def test_paged_thd_origins_rebind_and_capture(
+    dim, dtype_name, pool_layout, stats_layout, cga, splits, pack_gqa, page_size=16, window_left=None, sink=None, kv_dtype_name=None
+):
     import cudnn
     import torch
     from cudnn.engines.manifest import family_for
@@ -59,6 +61,7 @@ def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stat
     batch, heads, kv_heads, maximum, page, kv_max = 2, (24 if d_qk == 576 else 16), (2 if d_qk == 576 else 4), 320, page_size, (1024 if d_qk == 576 else 8192)
     pages_per_sequence, page_count = kv_max // page, batch * kv_max // page
     dtype = getattr(torch, dtype_name)
+    kv_dtype = getattr(torch, kv_dtype_name) if kv_dtype_name is not None else dtype
     io_type = cudnn.data_type.HALF if dtype_name == "float16" else cudnn.data_type.BFLOAT16
     widths = {"q": torch.int64, "o": torch.int32, "stats": torch.int64}
     multipliers = {"q": heads * (16 if d_qk == 576 else d_qk), "o": d_v, "stats": 1}
@@ -81,14 +84,14 @@ def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stat
             result["sink"] = torch.full((1, heads, 1, 1), sink, device="cuda", dtype=torch.float32)
         if pool_layout != "mixed":
             shape = (page_count + 1, kv_heads, page, 2 * d_qk) if pool_layout == "hnd" else (page_count + 1, page, kv_heads, 2 * d_qk)
-            interleaved = torch.empty(shape, device="cuda", dtype=dtype)
+            interleaved = torch.empty(shape, device="cuda", dtype=kv_dtype)
             if pool_layout == "nhd":
                 interleaved = interleaved.transpose(1, 2)
             result["k"], value_record = interleaved.split(d_qk, dim=-1)
             result["v"] = value_record[..., :d_v]
         else:
-            result["k"] = torch.empty(page_count + 1, kv_heads, page, d_qk, device="cuda", dtype=dtype)
-            result["v"] = torch.empty(page_count + 1, page, kv_heads, d_v, device="cuda", dtype=dtype).transpose(1, 2)
+            result["k"] = torch.empty(page_count + 1, kv_heads, page, d_qk, device="cuda", dtype=kv_dtype)
+            result["v"] = torch.empty(page_count + 1, page, kv_heads, d_v, device="cuda", dtype=kv_dtype).transpose(1, 2)
         for name in ("kt", "vt"):
             result[name] = torch.empty(batch, 1, pages_per_sequence, 1, device="cuda", dtype=torch.int32)
         if d_qk == 576:
@@ -126,7 +129,10 @@ def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stat
         for start, length in zip(starts["q"], ql):
             values["q"][start : start + length].copy_(torch.randn(length, heads, d_qk, device="cuda", dtype=dtype))
         for name in ("k", "v"):
-            values[name].normal_()
+            if kv_dtype_name is None:
+                values[name].normal_()
+            else:
+                values[name].copy_(torch.randn(values[name].shape, device="cuda", dtype=dtype))
             values[name][-1].fill_(float("nan"))
         for name in ("kt", "vt"):
             # Page order is host test data; avoid an unrelated GPU radix sort.
