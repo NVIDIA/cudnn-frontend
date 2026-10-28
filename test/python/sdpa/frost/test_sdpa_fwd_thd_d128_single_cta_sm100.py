@@ -36,7 +36,7 @@ def _ref_thd(q_pk, k_pk, v_pk, cu_q, cu_kv, *, scale, mask, group):
     return o
 
 
-def _run(q_lens, kv_lens, *, h_q, h_kv, s_max_q, s_max_kv, mask="bottom_right", dtype=torch.bfloat16, stats=False, d=128):
+def _run(q_lens, kv_lens, *, h_q, h_kv, s_max_q, s_max_kv, mask="bottom_right", dtype=torch.bfloat16, stats=False, d=128, gap=0):
     import cudnn
 
     dev = "cuda"
@@ -51,21 +51,29 @@ def _run(q_lens, kv_lens, *, h_q, h_kv, s_max_q, s_max_kv, mask="bottom_right", 
     k_pk = torch.randn(cu_kv[-1], h_kv, d, device=dev, dtype=dtype)
     v_pk = torch.randn(cu_kv[-1], h_kv, d, device=dev, dtype=dtype)
 
-    def _buf(packed, s_max, h):
-        stor = torch.zeros(B * s_max * h * d, device=dev, dtype=dtype)
-        stor[: packed.numel()] = packed.reshape(-1)
-        return stor, stor.as_strided((B, h, s_max, d), (s_max * h * d, d, h * d, 1))
+    # Storage rows: sequence b starts at cu[b] + b * gap; a gap > 0 leaves `gap` rows of NaN canary between sequences.
+    row_q = [c + b * gap for b, c in enumerate(cu_q)]
+    row_kv = [c + b * gap for b, c in enumerate(cu_kv)]
 
-    _, q_gpu = _buf(q_pk, s_max_q, h_q)
-    _, k_gpu = _buf(k_pk, s_max_kv, h_kv)
-    _, v_gpu = _buf(v_pk, s_max_kv, h_kv)
-    o_stor = torch.zeros(B * s_max_q * h_q * d, device=dev, dtype=dtype)
+    def _buf(packed, lens, rows, s_max, h):
+        stor = torch.full((B * s_max * h * d + gap * B * h * d,), float("nan"), device=dev, dtype=dtype).view(-1, h, d)
+        start = 0
+        for b, n in enumerate(lens):
+            stor[rows[b] : rows[b] + n] = packed[start : start + n]
+            start += n
+        flat = stor.view(-1)
+        return flat, flat.as_strided((B, h, s_max, d), (s_max * h * d, d, h * d, 1))
+
+    _, q_gpu = _buf(q_pk, q_lens, row_q, s_max_q, h_q)
+    _, k_gpu = _buf(k_pk, kv_lens, row_kv, s_max_kv, h_kv)
+    _, v_gpu = _buf(v_pk, kv_lens, row_kv, s_max_kv, h_kv)
+    o_stor = torch.full((B * s_max_q * h_q * d + gap * B * h_q * d,), float("nan"), device=dev, dtype=dtype)
     o_gpu = o_stor.as_strided((B, h_q, s_max_q, d), (s_max_q * h_q * d, d, h_q * d, 1))
     slq = torch.tensor(q_lens, dtype=torch.int32, device=dev).view(B, 1, 1, 1)
     slk = torch.tensor(kv_lens, dtype=torch.int32, device=dev).view(B, 1, 1, 1)
-    ro_q = (torch.tensor(cu_q, dtype=torch.int64, device=dev) * h_q * d).view(B + 1, 1, 1, 1)
-    ro_kv = (torch.tensor(cu_kv, dtype=torch.int64, device=dev) * h_kv * d).view(B + 1, 1, 1, 1)
-    ro_s = (torch.tensor(cu_q, dtype=torch.int64, device=dev) * h_q).view(B + 1, 1, 1, 1)
+    ro_q = (torch.tensor(row_q, dtype=torch.int64, device=dev) * h_q * d).view(B + 1, 1, 1, 1)
+    ro_kv = (torch.tensor(row_kv, dtype=torch.int64, device=dev) * h_kv * d).view(B + 1, 1, 1, 1)
+    ro_s = (torch.tensor(row_q, dtype=torch.int64, device=dev) * h_q).view(B + 1, 1, 1, 1)
 
     io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
@@ -96,7 +104,7 @@ def _run(q_lens, kv_lens, *, h_q, h_kv, s_max_q, s_max_kv, mask="bottom_right", 
     o.set_ragged_offset(r_o)
     vp = {t_q: q_gpu, t_k: k_gpu, t_v: v_gpu, o: o_gpu, t_sq: slq, t_sk: slk, r_q: ro_q, r_k: ro_kv, r_v: ro_kv, r_o: ro_q}
     if stats:
-        stats_gpu = torch.zeros(B * s_max_q * h_q, device=dev, dtype=torch.float32)
+        stats_gpu = torch.zeros(B * s_max_q * h_q + gap * B * h_q, device=dev, dtype=torch.float32)
         lse.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim([B, h_q, s_max_q, 1]).set_stride([s_max_q * h_q, 1, h_q, 1])
         lse.set_ragged_offset(r_s)
         vp[lse] = stats_gpu.as_strided((B, h_q, s_max_q, 1), (s_max_q * h_q, 1, h_q, 1))
@@ -112,7 +120,12 @@ def _run(q_lens, kv_lens, *, h_q, h_kv, s_max_q, s_max_kv, mask="bottom_right", 
     torch.cuda.synchronize()
     o_ref = _ref_thd(q_pk, k_pk, v_pk, cu_q, cu_kv, scale=scale, mask=mask, group=group)
     tol = dict(atol=5e-2, rtol=3e-2) if dtype == torch.bfloat16 else dict(atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(o_stor[: cu_q[-1] * h_q * d].view(cu_q[-1], h_q, d).float(), o_ref, **tol)
+    o_rows = o_stor.view(-1, h_q, d)
+    for b, n in enumerate(q_lens):
+        torch.testing.assert_close(o_rows[row_q[b] : row_q[b] + n].float(), o_ref[cu_q[b] : cu_q[b + 1]], **tol)
+        if gap:
+            # The canary rows between sequences stay NaN: no store lands outside the declared origins.
+            assert torch.isnan(o_rows[row_q[b] + n : row_q[b] + n + gap]).all(), f"sequence {b}: a store hit the gap after it"
     return plan.knobs
 
 
@@ -156,3 +169,16 @@ def test_grouped_heads_keep_the_pair_tile():
     q_lens, kv_lens, s_max = _CASES["chunks"]
     knobs = _run(q_lens, kv_lens, h_q=16, h_kv=4, s_max_q=s_max, s_max_kv=s_max)
     assert knobs.cga == 2 and knobs.pack_gqa, knobs
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mask", ["bottom_right", "none"])
+@torch_fork_set_rng(seed=0)
+def test_single_cta_body_reads_the_declared_origins_across_gaps(mask):
+    """Ragged offsets with storage gaps between sequences: the single-CTA body reads Q/K/V at the declared origins and
+    stores O there, leaving the gap rows untouched."""
+    if not _dsl_installed():
+        pytest.skip("cutlass/dsl not installed")
+    q_lens, kv_lens, s_max = _CASES["mixed"]
+    knobs = _run(q_lens, kv_lens, h_q=8, h_kv=8, s_max_q=s_max, s_max_kv=s_max, mask=mask, gap=24)
+    assert knobs.cga == 1 and knobs.split_kv in (None, 1), knobs

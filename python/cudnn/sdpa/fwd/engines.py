@@ -3420,7 +3420,12 @@ def lower_dsl_prefill(
                     or (
                         facts.d_qk == 128
                         and api.cga == 1
-                        and (facts.has_paged_kv or api.packed_thd_split or (facts.device_cc == (10, 7) and api.split_kv == 1))
+                        and (
+                            facts.has_paged_kv
+                            or api.packed_thd_split
+                            or (facts.device_cc == (10, 7) and api.split_kv == 1)
+                            or (api.split_kv == 1 and sm100_nonpaged_d128_thd_single_cta_leg(spec.capabilities, facts, cga=1, split_kv=1))
+                        )
                     )
                 )
             )
