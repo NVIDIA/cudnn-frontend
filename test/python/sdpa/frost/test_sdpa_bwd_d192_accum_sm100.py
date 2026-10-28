@@ -27,7 +27,17 @@ def test_row_ranks_ahead_of_the_d256_row():
     names = [s.name for s in ENGINE_SPECS]
     assert names.index(_ENGINE) < names.index("sdpa_bwd_sm100_d256")
     c = _spec().capabilities
-    assert c.d == frozenset({128, 192}) and c.dqk_ge_dv and c.causal and not c.gqa and not c.swa and not c.deterministic and not c.thd
+    assert (
+        c.d == frozenset({128, 192})
+        and c.dqk_ge_dv
+        and c.causal
+        and not c.gqa
+        and not c.swa
+        and not c.deterministic
+        and c.thd
+        and c.thd_declared_totals
+        and c.thd_ragged_offsets
+    )
 
 
 @pytest.mark.parametrize(
