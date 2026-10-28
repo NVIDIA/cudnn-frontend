@@ -15,7 +15,6 @@ from types import SimpleNamespace
 from cudnn.frost.compiled_cache import positional_entry
 from .config_sm100_d128_accum_2cta import resolve_diag_2cta
 from .config_sm100_d128_accum_2cta_stail import (
-    DBG_CLK,
     dbg_clk_records,
     dbg_clk_region_offset,
     dbg_clk_for_stats_form,
@@ -25,7 +24,6 @@ from .config_sm100_d128_accum_2cta_stail import (
     resolve_warp_roles,
     validate_fields_for_roles,
 )
-from .config_sm100_d128_accum_2cta_stail import CFG as STAIL_CFG
 from .d128_grouped_2cta_contract import CTA_PAIR_BODY, CTA_PAIR_CLUSTER, ONE_CTA_BODY, PAIR_BODY, CtaPairDecline, resolve_cta_pair, select_cta_pair
 from .d128_grouped_2cta_contract import THD as IMPLEMENTATION
 from .d128_grouped_2cta_contract import WORKSPACE_SLACK, thd_workspace_layout, thd_workspace_offsets, validate_thd_bounds
