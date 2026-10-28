@@ -1907,6 +1907,8 @@ def _sm100_d128_spec() -> EngineSpec:
 def _sm100_d128_fp8_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
     if facts.window_left is not None and facts.d_qk != 64:
         return "the fp8 d128 row serves a sliding window at d64 only"
+    if facts.d_qk == 64 and facts.h_q != facts.h_kv and facts.dtype_o == cudnn.data_type.HALF:
+        return "FP16 gradients are not served on the grouped d64 route"
     return None
 
 

@@ -416,8 +416,8 @@ def _epilogue_loop(
     while valid != 0:
         _credit(bars.sched_empty[sched_state.idx])
         lo, hi = _bounds(block, sq, causal)
-        for qtile in cutlass.range(lo, hi, 1, unroll=1):
-            for chunk in cutlass.range_constexpr(CFG.DQ_CHUNKS):
+        for _ in cutlass.range(lo, hi, 1, unroll=1):
+            for _chunk in cutlass.range_constexpr(CFG.DQ_CHUNKS):
                 _wait_tcgen(bars.dq_done, dq_state.phase)
                 vals = _tmem_load(tmem_base + CFG.TMEM_DQ, 64)
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
@@ -574,13 +574,13 @@ def _load_loop(
     while valid != 0:
         _credit(bars.sched_empty[sched_state.idx])
         lo, hi = _bounds(block, sq, causal)
+        _wait(bars.k_empty, kv_state.phase)
+        kv_state = advance(kv_state, 1)
         if lo < hi:
-            _wait(bars.k_empty, kv_state.phase)
             bars.k_full.arrive(n_bytes=CFG.K_BYTES, pred=nvvm.elect_sync())
             tma_load_tile(_operand(slab, CFG.K, dtype, CFG.M, CFG.DQK), GmemTileTma(k_desc)(0, block * CFG.M, head, batch), bars.k_full.smem_ptr)
             bars.v_full.arrive(n_bytes=CFG.V_BYTES, pred=nvvm.elect_sync())
             tma_load_tile(_operand(slab, CFG.V, dtype, CFG.M, CFG.DV), GmemTileTma(v_desc)(0, block * CFG.M, head, batch), bars.v_full.smem_ptr)
-            kv_state = advance(kv_state, 1)
         for qtile in cutlass.range(lo, hi, 1, unroll=1):
             _wait(bars.q_empty[q_state.idx], q_state.phase)
             bars.q_full[q_state.idx].arrive(n_bytes=CFG.Q_BYTES, pred=nvvm.elect_sync())

@@ -139,7 +139,6 @@ def make_bar_layout(cfg: Config):
 
 CFG = make_config(128)
 BAR_LAYOUT = make_bar_layout(CFG)
-_BAR_BASE = CFG.DELTA + 512
 
 
 def validate_config(cfg: Config = CFG, bar_layout=None):

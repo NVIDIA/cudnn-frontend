@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Storage-free plan construction for dense d128 per-tensor FP8 backward."""
 
+from functools import partial
 from types import SimpleNamespace
 
 from cudnn.frost.compiled_cache import positional_entry
@@ -16,7 +17,7 @@ _ALIGN = 256
 
 def grouped_workspace_layout(batch, heads_q, sq, skv, d=128):
     """Aligned-payload-relative regions for the grouped chain: the FP32 dQ accumulator and delta over the rounded S_q, then one bf16 dK and dV partial per Q head."""
-    (dq_region, delta_region), half_total = workspace_layout(batch, heads_q, sq, d)
+    (dq_region, delta_region), _ = workspace_layout(batch, heads_q, sq, d)
     rounded = (sq + 127) // 128 * 128
     base = (4 * batch * rounded * heads_q * d + 4 * batch * heads_q * rounded + _ALIGN - 1) // _ALIGN * _ALIGN
     part_bytes = 2 * batch * skv * heads_q * d
@@ -74,22 +75,22 @@ def compile_plan(api):
     ratio = api.h_q // api.h_kv
     window = 0 if api.window_size_left is None else int(api.window_size_left) + 1
     if window == 0 and api.head_dim_qk == 128:
-        from .kernels.sm100.prepared_d192_fp8_host import compile_host, workspace_layout as pair_workspace_layout
+        from .kernels.sm100.prepared_d192_fp8_host import compile_host as compile_pair_host, workspace_layout as pair_workspace_layout
 
         regions, required = pair_workspace_layout(api.batch_size, api.h_q, api.s_q_max)
-        compile_args = (tuple(geometry), regions, grad_dtype, api.is_causal, cc[0] * 10 + cc[1], requested, 128, 128, ratio)
+        compile = partial(compile_pair_host, tuple(geometry), regions, grad_dtype, api.is_causal, cc[0] * 10 + cc[1], requested, 128, 128, ratio)
     elif ratio > 1:
-        from .kernels.sm100.prepared_d128_accum_fp8_grouped_host import compile_host
+        from .kernels.sm100.prepared_d128_accum_fp8_grouped_host import compile_host as compile_grouped_host
 
         regions, required = grouped_workspace_layout(api.batch_size, api.h_q, api.s_q_max, api.s_k_max, api.head_dim_qk)
-        compile_args = (tuple(geometry), regions, grad_dtype, api.is_causal, cc[0] * 10 + cc[1], requested, ratio, window)
+        compile = partial(compile_grouped_host, tuple(geometry), regions, grad_dtype, api.is_causal, cc[0] * 10 + cc[1], requested, ratio, window)
     else:
-        from .kernels.sm100.prepared_d128_accum_fp8_host import compile_host
+        from .kernels.sm100.prepared_d128_accum_fp8_host import compile_host as compile_accumulation_host
 
         regions, required = workspace_layout(api.batch_size, api.h_q, api.s_q_max, api.head_dim_qk)
-        compile_args = (tuple(geometry), regions, grad_dtype, api.is_causal, cc[0] * 10 + cc[1], requested, window)
+        compile = partial(compile_accumulation_host, tuple(geometry), regions, grad_dtype, api.is_causal, cc[0] * 10 + cc[1], requested, window)
     with torch.cuda.device(device):
-        entry = compile_host(*compile_args)
+        entry = compile()
     fn = positional_entry(entry)
     if fn is None:
         raise NotImplementedError(f"{api._NAME} requires a positional tvm-ffi entry")

@@ -601,16 +601,17 @@ P and dS travel through SMEM rings and only the diagonal and tail tiles are mask
 D64, with or without a left sliding window, runs the FP8 accumulation chain (FP32 dQ
 scratch; GQA/MQA appends BF16 dK/dV partials per query head and a fixed-order fold).
 Compact BSHD, unmasked or top-left causal, any S_q / S_kv, cc 10.0 or 10.3, public
-CuTeDSL >= 4.8 and a finite scale. Declined: THD, padding, bottom-right causal,
+CuTeDSL >= 4.8 and a finite positive scale. Declined: THD, padding, bottom-right causal,
 right-band widening, deterministic requests, a caller-provided delta, bias / dBias,
-sink / dSink, a window at D128 or D192x128, GQA/MQA at D192x128.
+sink / dSink, a window at D128 or D192x128, GQA/MQA at D192x128, FP16 gradients at
+grouped D64 (its dK / dV partials are BF16).
 `test_sdpa_bwd_fp8_sm100.py` and `test_sdpa_bwd_d192_fp8_sm100.py` compare every
 served shape against an FP32 reference and pin the declines.
 
 | Opt-in SM100 / SM103 backward contract | `sdpa_bwd_sm100_d192` | `sdpa_bwd_sm100_d128_fp8` | `sdpa_bwd_sm100_d192_fp8` |
 |---|---|---|---|
 | Head dims | (192, 128) | (64, 64), (128, 128) | (192, 128) |
-| Payload / gradient dtypes | BF16, FP16 | E4M3 / E4M3 + amax, FP16, BF16 | E4M3 / E4M3 + amax, FP16, BF16 |
+| Payload / gradient dtypes | BF16, FP16 | E4M3 / E4M3 + amax, BF16, FP16 (not at grouped D64) | E4M3 / E4M3 + amax, BF16, FP16 |
 | Dense compact BSHD, rectangular lengths and tails | ✅ | ✅ | ✅ |
 | Unmasked / top-left causal | ✅ | ✅ | ✅ |
 | Left sliding window | ❌ | ✅ D64 only, with or without causal | ❌ |

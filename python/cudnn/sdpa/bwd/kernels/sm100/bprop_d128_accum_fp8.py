@@ -758,7 +758,7 @@ def _epilogue_loop(
     while valid != 0:
         _credit(bars.sched_empty[sched_state.idx])
         lo, hi = _bounds(block, sq, causal)
-        for qtile in cutlass.range(lo, hi, 1, unroll=1):
+        for _ in cutlass.range(lo, hi, 1, unroll=1):
             _wait_tcgen(bars.dq_done, dq_state.phase)
             halves = []
             for half in cutlass.range_constexpr(CFG.D // 64):
