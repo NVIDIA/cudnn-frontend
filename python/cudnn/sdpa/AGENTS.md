@@ -1333,3 +1333,14 @@ sink. An empty softmax's reset max is a sentinel, not a real score: folding
 sink-only result explicitly and retain the later padded-Q trim override.
 Detectors: `test_paged_graph_fp8_sink_rebind_replay` and
 `test_prepared_fp8_d256_dense_keyless_sink` include sink logits -120/+120.
+
+
+A shared GMEM operand can need different SMEM swizzles for its MMA consumers.
+In native FP8 D192x128 backward, the nontransposed dP contraction reads dO/V
+with 128-byte atoms, while transposed dV reads 64 value columns per CTA with
+64-byte atoms. Keep each TMA map, SMEM descriptor and MMA instruction walker
+consistent; V's descriptor stride follows V, not Q/K. The host detector
+`test_fp8_tma_layout_matches_each_mma_consumer` compares config values against
+`MmaDesc`'s independently derived contraction/transpose geometry. Whole-backward
+native numerical and replay tests remain necessary; compilation alone misses
+these wrong-address walks.

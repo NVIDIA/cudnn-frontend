@@ -1636,6 +1636,7 @@ def host_fp8(
     TRUE units, bound AS IS (the kernel reads delta unscaled; the row's own pre-pass is the scaled dot of the e4m3 payloads, so
     a caller's delta is not bitwise it) -- with it the scaled ``dot`` launch and the workspace's ``delta`` region do not exist."""
     b, h, hk, d, sq, skv, sqp, skvp, bc, hc, zero_ws, itemsize, bpe_ds, dq_bhg = config
+    d_v = geometry[2][0][3]
     q = _view(q_ptr, geometry[0])
     k = _view(k_ptr, geometry[1])
     v = _view(v_ptr, geometry[2])
@@ -1690,7 +1691,7 @@ def host_fp8(
     # STAGE 1: delta in TRUE units = rowsum(dO8 * O8) * descale_o * descale_dO -- unless the caller computed it (external_delta:
     # the producer of dO writes rowsum(dO * O) in true units, so the launch and the read of O go).
     if cutlass.const_expr(not external_delta):
-        dot_do_o_scaled_host(o, do, delta, descale_o, descale_do, DOT_Q_TILE, d, DOT_CHUNK_ELEMS, stream)
+        dot_do_o_scaled_host(o, do, delta, descale_o, descale_do, DOT_Q_TILE, d_v, DOT_CHUNK_ELEMS, stream)
     # Per-batch kv lengths under a bottom-right band: the dS zero-fill `_stage2_inputs` skipped runs ONCE here, ahead of the head
     # loop -- this row walks the whole batch in-grid (no batch chunking), so every head chunk sees every batch and the tiles a
     # shorter batch's band does not write hold this fill's zeros, never another batch's dS (the half row, batch-chunked, fills
@@ -1748,9 +1749,9 @@ def host_fp8(
         # true-unit partials are summed in fixed order BEFORE the amax fold, the scale and the cast (the backend's order) -- the dV
         # and dK folds in ONE launch.
         if cutlass.const_expr(group > 1):
-            fold_quant_pair_host(dv_part, dv, None, scale_dv, amax_dv, dk_tgt, dk, None, scale_dk, amax_dk, d, group, grad_dtype, sm_count, stream)
+            fold_quant_pair_host(dv_part, dv, None, scale_dv, amax_dv, dk_tgt, dk, None, scale_dk, amax_dk, d_v, group, grad_dtype, sm_count, stream, D_b=d)
         else:
-            fold_quant_host(dv_part, dv, None, scale_dv, amax_dv, d, group, grad_dtype, sm_count, stream)
+            fold_quant_host(dv_part, dv, None, scale_dv, amax_dv, d_v, group, grad_dtype, sm_count, stream)
     else:
         dk_part = _scratch(workspace, regions[R_FP8_DK_PART], cutlass.BFloat16)  # [B, kv_rows, H, D] stage 3's per-Q-head dS . Q8 (descale_q pending)
         dq_ws = _scratch(workspace, regions[R_DQ_WS], cutlass.BFloat16)  # [B, S_q, H, D] stage 3's dS^T . K8 (descale_k pending)
@@ -1795,7 +1796,7 @@ def host_fp8(
             _stage3(mm_dk, mm_dq, ds, q_bf16, k_bf16, dk_real, dq_ws, 0, b, hb, hc, group, seq_kv, desc, stream, dq_b_head_group=dq_bhg)
         # STAGE 4: fold (GQA) + the per-tensor FP8 epilogue (descale, amax, scale, cast) into the caller's gradients: dV + dK in one
         # launch (bf16 partials on this twin: its dS ring leaves no SMEM for the fp32 dV staging), then dQ.
-        fold_quant_pair_host(dv_part, dv, None, scale_dv, amax_dv, dk_part, dk, descale_q, scale_dk, amax_dk, d, group, grad_dtype, sm_count, stream)
+        fold_quant_pair_host(dv_part, dv, None, scale_dv, amax_dv, dk_part, dk, descale_q, scale_dk, amax_dk, d_v, group, grad_dtype, sm_count, stream, D_b=d)
         fold_quant_host(dq_ws, dq, descale_k, scale_dq, amax_dq, d, 1, grad_dtype, sm_count, stream)
 
 
@@ -1876,6 +1877,7 @@ def host_fp8_thd(
     it from numel); the setup kernel branches on it before reading the prefix tail, so both tensors are viewed ``(B+1,)``.
     """
     b, h, hk, d, t_q, t_kv, sqp, rcap, hc, zero_ws, bpe_ds, units, sq_env, skv_env, dq_bhg = config
+    d_v = geometry[2][0][3]
     q = _view(q_ptr, geometry[0])  # packed [1, T_q, H_q, D] e4m3
     k = _view(k_ptr, geometry[1])  # packed [1, T_kv, H_kv, D]
     v = _view(v_ptr, geometry[2])
@@ -1925,7 +1927,7 @@ def host_fp8_thd(
     # STAGE 1: delta in TRUE units over the packed O / dO (one streaming pass; rows past the packed capacity read as 0) -- unless the
     # caller computed it (external_delta: bound AS IS, in TRUE units; the kernel multiplies by attn_scale * descale_s only).
     if cutlass.const_expr(not external_delta):
-        dot_do_o_scaled_host(o, do, delta, descale_o, descale_do, DOT_Q_TILE, d, DOT_CHUNK_ELEMS, stream)
+        dot_do_o_scaled_host(o, do, delta, descale_o, descale_do, DOT_Q_TILE, d_v, DOT_CHUNK_ELEMS, stream)
 
     ds = _extent(ds_full, (1, hc, rcap, sqp))
     grid_m_kv = -(-skv_env // _THD_KV_BLOCK) * _THD_KV_BLOCK  # the kv envelope's M tiles (dK); dQ's is the padded q envelope (sqp)
@@ -1972,9 +1974,11 @@ def host_fp8_thd(
             _stage3_thd(mm_dk, mm_dq, ds, q, k, dk_tgt, dq, hb, hc, group, b, meta, desc3, stream, grid_m_kv, sqp, dq_bhg, dk_epi, dq_epi)
         # STAGE 4: dV always folds + quantizes here; dK under GQA (with dV in ONE launch) -- both bounded at the live kv total.
         if cutlass.const_expr(group > 1):
-            fold_quant_pair_host(dv_part, dv, None, scale_dv, amax_dv, dk_tgt, dk, None, scale_dk, amax_dk, d, group, grad_dtype, sm_count, stream, live_kv)
+            fold_quant_pair_host(
+                dv_part, dv, None, scale_dv, amax_dv, dk_tgt, dk, None, scale_dk, amax_dk, d_v, group, grad_dtype, sm_count, stream, live_kv, D_b=d
+            )
         else:
-            fold_quant_host(dv_part, dv, None, scale_dv, amax_dv, d, group, grad_dtype, sm_count, stream, live_kv)
+            fold_quant_host(dv_part, dv, None, scale_dv, amax_dv, d_v, group, grad_dtype, sm_count, stream, live_kv)
     else:
         dk_part = _scratch(workspace, regions[R_FP8_DK_PART], cutlass.BFloat16)  # [1, T_kv_cap, H, D] stage 3's per-Q-head dS . Q8
         dq_ws = _scratch(workspace, regions[R_DQ_WS], cutlass.BFloat16)  # [1, T_q_cap, H, D] stage 3's dS^T . K8 (descale_k pending)
@@ -2018,7 +2022,9 @@ def host_fp8_thd(
             _stage3_thd(mm_dk, mm_dq, ds, q_bf16, k_bf16, dk_part, dq_ws, hb, hc, group, b, meta, desc3, stream, grid_m_kv, sqp, dq_bhg)
         # STAGE 4: fold (GQA) + the per-tensor FP8 epilogue into the caller's packed gradients, each bounded at its live total: dV + dK
         # in one launch at the live kv total, dQ at the live q total.
-        fold_quant_pair_host(dv_part, dv, None, scale_dv, amax_dv, dk_part, dk, descale_q, scale_dk, amax_dk, d, group, grad_dtype, sm_count, stream, live_kv)
+        fold_quant_pair_host(
+            dv_part, dv, None, scale_dv, amax_dv, dk_part, dk, descale_q, scale_dk, amax_dk, d_v, group, grad_dtype, sm_count, stream, live_kv, D_b=d
+        )
         fold_quant_host(dq_ws, dq, descale_k, scale_dq, amax_dq, d, 1, grad_dtype, sm_count, stream, live_q)
 
 
