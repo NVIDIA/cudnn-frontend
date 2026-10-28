@@ -212,6 +212,34 @@ def waive_declined(what):
         pytest.skip(f"{what} declined: {exc}")
 
 
+def frost_la_unavailable():
+    """Why no FROST linear-attention engine can serve this process, or ``None``:
+    the device and CuTe DSL half of ``frost_la_gate``, read without a graph."""
+    from cudnn.frost import buffers
+
+    sm = buffers.current_sm()
+    if sm is None or not (100 <= sm <= 103 or sm == 107):
+        return f"the FROST engines need SM100 / SM103 / SM107 (found {sm})"
+    installed, version = buffers.cutedsl_state()
+    if not installed or buffers.cutedsl_too_old(version):
+        return f"the FROST engines need nvidia-cutlass-dsl >= {'.'.join(map(str, buffers.CUTEDSL_MIN_VERSION))} (found {version})"
+    return None
+
+
+@contextlib.contextmanager
+def waive_engine_less(what):
+    """:func:`waive_declined` for a call pinned to a FROST engine, limited to a
+    process that no FROST engine can serve (:func:`frost_la_unavailable`). Where
+    one can, a decline is a regression, and it fails the test."""
+    try:
+        yield
+    except cudnn.cudnnGraphNotSupportedError as exc:
+        reason = frost_la_unavailable()
+        if reason is None:
+            raise
+        pytest.skip(f"{what} declined: {reason}: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Case generation and dispatch
 # ---------------------------------------------------------------------------
@@ -4899,7 +4927,8 @@ def build_and_pin(graph, plan_name):
     """validate, lower, plan, pin ``plan_name`` and build; declines waive the test."""
     graph.validate()
     graph.build_operation_graph()
-    graph.create_execution_plans([cudnn.heur_mode.A])
+    with waive_engine_less(plan_name):  # no engine at all: a device outside every row
+        graph.create_execution_plans([cudnn.heur_mode.A])
     names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
     if plan_name not in names:
         pytest.skip(f"no {plan_name} plan for this graph (offered: {names})")
@@ -5113,7 +5142,8 @@ MAMBA2_SPAN_BOUNDS = [0, 1024, 1536, 2560, 3000]
 def mamba2_summary(case, *, initial_state=None):
     """``(final_state, transition)`` of a Mamba-2 case through the summary op, pinned to the FROST summary engine."""
     q, k, v, g, cu, A, dt_bias = op_args(case)
-    return la_ops.mamba2_summary(v, g, A, k, cu, initial_state=initial_state, dt_bias=dt_bias, plan_name="mamba2_summary_frost")
+    with waive_engine_less("mamba2 frost summary engine"):
+        return la_ops.mamba2_summary(v, g, A, k, cu, initial_state=initial_state, dt_bias=dt_bias, plan_name="mamba2_summary_frost")
 
 
 def mamba2_summary_bwd(case, dO, *, d_final_state=None):
@@ -5121,7 +5151,10 @@ def mamba2_summary_bwd(case, dO, *, d_final_state=None):
     q, k, v, g, cu, A, dt_bias = op_args(case)
     scale = 1.0 / math.sqrt(case.K)
     q = (q.float() * scale).to(q.dtype)  # the suite's forward adapter pre-scales C the same way
-    return la_ops.mamba2_summary_bwd(dO, g, A, q, cu, d_final_state=d_final_state, dt_bias=dt_bias, output_transition=True, plan_name="mamba2_summary_frost")
+    with waive_engine_less("mamba2 frost summary engine"):
+        return la_ops.mamba2_summary_bwd(
+            dO, g, A, q, cu, d_final_state=d_final_state, dt_bias=dt_bias, output_transition=True, plan_name="mamba2_summary_frost"
+        )
 
 
 def mamba2_log2_transition(case):
@@ -5186,8 +5219,9 @@ def test_mamba2_summary_graph_mixed_state_dtypes(backend, variant, shape):
     q, k, v, g, cu, A, dt_bias = op_args(case)
     q = (q.float() / math.sqrt(case.K)).to(q.dtype)
     d_o, _, _ = gradient_chain_inputs(case)
-    fs_op, transition_op = la_ops.mamba2_summary(v, g, A, k, cu, dt_bias=dt_bias, plan_name="mamba2_summary_frost")
-    dstate0_op, transition_bwd_op = la_ops.mamba2_summary_bwd(d_o, g, A, q, cu, dt_bias=dt_bias, output_transition=True, plan_name="mamba2_summary_frost")
+    with waive_engine_less("mamba2 frost summary engine"):
+        fs_op, transition_op = la_ops.mamba2_summary(v, g, A, k, cu, dt_bias=dt_bias, plan_name="mamba2_summary_frost")
+        dstate0_op, transition_bwd_op = la_ops.mamba2_summary_bwd(d_o, g, A, q, cu, dt_bias=dt_bias, output_transition=True, plan_name="mamba2_summary_frost")
     for state_dtype, transition_dtype in ((torch.float32, torch.bfloat16), (torch.bfloat16, torch.float32)):
         inputs = dict(k=k, v=v, g=g, a=A, dt_bias=dt_bias, cu_seqlens=cu)
         graph = cudnn.pygraph()

@@ -1144,3 +1144,11 @@ pure scratch-layout tests without a backend parameter. Verify collection with
 that filter. Gate suites that import kernel helpers with the shared DSL
 availability and version checks before importing those helpers. Keep pure
 layout suites runnable below the kernel DSL floor.
+
+When pinning append-only records, assert the historical field segment or a
+frozen positional prefix, written explicitly rather than derived from the
+current dataclass under test. A last-N-fields check over the entire current record
+rejects legal future appends. Source-call pins must distinguish positional
+operands from appended keyword arguments (use the AST); a final keyword does
+not move the last positional operand. The SDPA field-order and FP8 THD fold
+pins exercise these cases.

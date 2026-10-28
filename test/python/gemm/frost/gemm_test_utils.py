@@ -52,6 +52,21 @@ def with_static_segmented_capacity(live: torch.Tensor, total_rows: int, num_grou
     return result
 
 
+def plan_as_sm100(monkeypatch):
+    """The SM100 compiler, for planning-only checks of SM100 configs on any GPU.
+
+    Its arch probe and the active family's compiler's (the template gate reads that
+    one) are pinned to SM100, so the active GPU's own gate does not answer first. On
+    SM120 the active family is the sm120 tree, so the SM100 compiler is named
+    explicitly rather than reached through ``cudnn.gemm.frost.compiler``."""
+    from cudnn.gemm.frost import compiler as active
+    from cudnn.gemm.frost.sm100 import compiler as sm100
+
+    for module in {id(sm100): sm100, id(active): active}.values():
+        monkeypatch.setattr(module, "_current_arch", lambda device=None: 100)
+    return sm100
+
+
 def skip_unless_pipeline_active(cfg) -> None:
     """Skip when ``cfg``'s template family does not run on the active GPU.
 

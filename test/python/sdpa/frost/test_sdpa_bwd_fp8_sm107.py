@@ -2463,7 +2463,7 @@ def test_fp8_fold_pair_updates_both_outputs_and_amax():
             assert args[5 * i + 4].item() == values.abs().max().item(), f"amax operand {i}, shift {shift}"
 
 
-@requires_sm80
+@pytest.mark.skipif(_SM is None or _SM < 89, reason="native FP8 output conversion requires SM89+")
 @pytest.mark.parametrize("dims", [(256, 256), (128, 192)], ids=["legacy", "d192"])
 @pytest.mark.parametrize("partial_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("group", [1, 4], ids=["mha", "gqa"])

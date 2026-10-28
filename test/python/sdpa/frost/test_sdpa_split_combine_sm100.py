@@ -130,7 +130,9 @@ def test_pointer_combine_reuses_artifact_for_new_shapes():
     owner = comb.compile_ptr(dtype_o="bf16", has_lse=True)
     fn = positional_entry(owner)
     assert fn is not None
-    for b, h, sq, d, splits in [(2, 3, 5, 160, 3), (1, 2, 3, 256, 5)]:
+    # One prepared entry changes between one, two and four query-row warps
+    # as its runtime shape changes, and retains the many-split decode form.
+    for b, h, sq, d, splits in [(2, 3, 5, 160, 3), (1, 2, 1, 128, 4), (3, 5, 2, 128, 16), (1, 2, 3, 256, 5), (1, 3, 1, 160, 17)]:
         op, lp, ref_o, ref_lse = _partials(b, h, sq, d, splits)
         ostride, lstride = _strides(b, h, sq, d, "strided")
         o, ostorage, oused = _output((b, sq, h, d), ostride, torch.bfloat16)

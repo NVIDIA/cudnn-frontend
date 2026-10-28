@@ -443,7 +443,7 @@ def _spec_without_compiling(monkeypatch, api, builder, entry_name, frames=None):
 
     monkeypatch.setattr(prepared_host, entry_name, fake_compile)
     monkeypatch.setattr(prepared_sm107, "_sm", lambda api: 107)
-    mod = SimpleNamespace(FROST_SOURCE_DIGEST="probe", _host=None)
+    mod = SimpleNamespace(FROST_SOURCE_DIGEST="probe", _host=None, CFG=SimpleNamespace(FUSE_DK=False))
     assert api.check_support()
     return builder(api, mod, mod, mod), calls
 

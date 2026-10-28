@@ -32,6 +32,7 @@ from gemm_test_utils import (
     reduction_dims as _reduction_dims,
     assert_block_scale_reduction_close as _assert_block_scale_reduction_close,
     with_static_segmented_capacity as _with_static_segmented_capacity,
+    plan_as_sm100,
 )
 
 from cudnn.gemm.frost.dtypes import DTYPE_FROM_CUDNN as _DTYPE_FROM_CUDNN
@@ -72,11 +73,12 @@ def test_moe_swap_ab_lowers_internal_operation():
 
 
 @pytest.mark.parametrize("cta_n", (32, 64))
-def test_moe_swap_ab_preserves_block_scale_tile_constraints(cta_n):
+def test_moe_swap_ab_preserves_block_scale_tile_constraints(cta_n, monkeypatch):
+    sm100 = plan_as_sm100(monkeypatch)
     chain = analyze(_build_graph(2, 173, 256, 256, num_groups=6))
     cfg = by_name(f"CONFIG_sm100_128x{cta_n}x128_128x{cta_n}x32_cluster1x1_1ctamma")
     with pytest.raises(NotImplementedError, match="mma_tile_n % 128 == 0"):
-        C.probe_chain(chain, replace(cfg, swap_ab=True))
+        sm100.probe_chain(chain, replace(cfg, swap_ab=True))
 
 
 @requires_sm100

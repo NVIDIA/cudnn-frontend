@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.primitives as nvvm  # noqa: F401 — assert the primitive layer is present
+import cutlass.experimental.primitives as nvvm  # noqa: F401 — assert the primitive layer is present
 
 from cudnn.frost.tile_dsl.tma import load_tile, cp_async_commit, cp_async_wait
 

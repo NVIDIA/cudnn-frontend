@@ -25,6 +25,7 @@ from gemm_test_utils import (
     reduction_ref as _reduction_ref,
     reduction_dims as _reduction_dims,
     FULL_EXPERT_REDUCE_OFFSETS as _FULL_EXPERT_REDUCE_OFFSETS,
+    plan_as_sm100,
 )
 
 from cudnn.gemm.frost.compiler import force_stg_epi, jit_from_cudnn_graph
@@ -2508,11 +2509,11 @@ def test_moe_swap_ab_quant(case):
 
 @pytest.mark.parametrize("block_scale", [False, True])
 @pytest.mark.parametrize("grouped", [False, True])
-def test_moe_swap_ab_token_quant_requires_aligned_groups(block_scale, grouped):
+def test_moe_swap_ab_token_quant_requires_aligned_groups(block_scale, grouped, monkeypatch):
     from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
-    from cudnn.gemm.frost.sm100 import compiler as C
     from test_moe_grouped_block_scale_matmul_fwd import _build_graph as build_bs
 
+    C = plan_as_sm100(monkeypatch)
     graph = (build_bs if block_scale else _build_graph)(2, 256, 128, 256, num_groups=4)
     _, binding = analyze_with_binding(graph)
     base = binding.outputs[0].set_output(False)
@@ -2529,10 +2530,10 @@ def test_moe_swap_ab_token_quant_requires_aligned_groups(block_scale, grouped):
     C.probe_chain(analyze(graph), cfg)
 
 
-def test_moe_swap_ab_segmented_feature_quant_requires_scale_prefix():
+def test_moe_swap_ab_segmented_feature_quant_requires_scale_prefix(monkeypatch):
     from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
-    from cudnn.gemm.frost.sm100 import compiler as C
 
+    C = plan_as_sm100(monkeypatch)
     graph = _build_graph(2, 173, 128, 256, num_groups=4)
     _, binding = analyze_with_binding(graph)
     base = binding.outputs[0].set_output(False)

@@ -158,6 +158,7 @@ def test_zero_attn_scale_claims():
         "sdpa_bwd_sm107_mxfp8",
         "sdpa_bwd_sm100_d256",
         "sdpa_bwd_sm107_d512",
+        "sdpa_bwd_sm107_d192",
     }
 
 
@@ -1113,7 +1114,67 @@ def test_capabilities_positional_prefix_is_append_only():
         "pack_gqa_requires_divisible",
         "thd_excluded_d_shapes",
     )
-    legacy_order = [n for n in names if n not in appended]
+    legacy_order = (
+        "sm_lo",
+        "sm_hi",
+        "phase",
+        "d_shapes",
+        "d_pad_multiple",
+        "thd_d_shapes",
+        "d_envelope_floors",
+        "dtypes",
+        "is_mxfp8",
+        "is_fp8",
+        "out_dtypes",
+        "o_block_scales",
+        "bias",
+        "dropout",
+        "score_mod",
+        "paged_kv",
+        "alibi",
+        "block_mask",
+        "rng_dump",
+        "score_max",
+        "score_sum_exp",
+        "dynamic_scale",
+        "unfuse_fma",
+        "stats_log2",
+        "seq_q_trim",
+        "right_band_widening",
+        "causal",
+        "bottom_right",
+        "swa",
+        "padded",
+        "sink",
+        "sink_dtypes",
+        "stats",
+        "lse_optional",
+        "thd",
+        "cu_seq_len",
+        "padded_stats",
+        "decode",
+        "single_wave_only",
+        "skv_tail_via_padding",
+        "layouts",
+        "skv_tile",
+        "sched_policies",
+        "tile_ms",
+        "tile_ns",
+        "cgas",
+        "sched_policies_by_d_shape",
+        "cgas_by_d_shape",
+        "split_cgas_by_d_shape",
+        "pack_gqas",
+        "split_kv_supported",
+        "split_d_shapes",
+        "softmax_precisions",
+        "pack_gqa_d_shapes",
+        "thd_padded_stats",
+        "epilogue_gate",
+        "epilogue_gate_d_shapes",
+        "epilogue_gate_dtypes",
+    )
+    assert names[: len(legacy_order)] == list(legacy_order), names
     caps = engines.Capabilities(*[legacy_value(n) for n in legacy_order])
     assert caps.thd_padded_stats is True
     assert caps.pack_gqa_partial_d_shapes is None
@@ -1135,7 +1196,8 @@ def test_capabilities_positional_prefix_is_append_only():
     # ... and every later field is appended after it, in the order it landed (the zero-scale and pre-folded-scale fields,
     # then the resident-bias / kv_mask fields of the Rubin small tiles and their per-shape TILE_N domain, then the PackGQA
     # divisibility rule, last).
-    assert names[start + len(legacy_tail) :] == list(appended), names[start:]
+    first_appended = start + len(legacy_tail)
+    assert names[first_appended : first_appended + len(appended)] == list(appended), names[start:]
 
     bwd_names = [f.name for f in dataclasses.fields(bwd_engines.Capabilities)]
     assert bwd_names[-6:] == [
