@@ -194,7 +194,6 @@ def _kernel(
     # Channel/filter tile count (= T*R*S*ceil_div(C, mma_tiler_k)), host-computed.
     k_tile_cnt: cutlass.Constexpr[int],
     channel_tiles: cutlass.Constexpr[int],
-    first_filter_t: cutlass.Constexpr[int],
     channel_first: cutlass.Constexpr[bool],
     num_ab_stage: cutlass.Constexpr[int],
     num_acc_stage: cutlass.Constexpr[int],
@@ -439,7 +438,7 @@ def _kernel(
             # Carry arithmetic below avoids division in the reduction loop.
             s_idx = 0
             r_idx = 0
-            t_idx = first_filter_t
+            t_idx = 0
             c_chunk_idx = 0
             for k in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                 mbar_full = ab_full_mbar_ptr.subview(ab_stage_idx)
@@ -520,7 +519,7 @@ def _kernel(
                             r_idx = 0
                             t_idx += 1
                             if t_idx == T_filt:
-                                t_idx = first_filter_t
+                                t_idx = 0
                                 c_chunk_idx += 1
 
             # Advance to next persistent work-tile (static schedule).
@@ -1625,13 +1624,7 @@ class _FpropKernel:
         # independently at every filter position by TMA's out-of-bounds fill.
         mma_tiler_k = cute.size(p.mma_tiler, mode=[2])
         channel_tiles = (a.shape[4] + mma_tiler_k - 1) // mma_tiler_k
-        # An initial single-frame C96 call has only the last temporal
-        # filter plane in bounds. Skip the two guaranteed-zero planes.
-        first_filter_t = 0
-        if cutlass.const_expr(a.shape[4] == 96 and p.a_dtype == cutlass.BFloat16 and a.shape[1] == 1 and c.shape[1] == 1):
-            if cutlass.const_expr(T_filter == 3 and p.lower_padding_dhw[0] == 2 and p.stride_dhw[0] == 1 and p.dilation_dhw[0] == 1):
-                first_filter_t = 2
-        k_tile_cnt = (T_filter - first_filter_t) * R_filter * S_filter * channel_tiles
+        k_tile_cnt = T_filter * R_filter * S_filter * channel_tiles
 
         # Output spatial dims for the im2col producer/epilogue coord decode.
         # c.shape = (N, Z, P, Q, K); filter_trs / padding / stride / dilation
@@ -1646,7 +1639,6 @@ class _FpropKernel:
             mma_inst_shape_mnk,
             k_tile_cnt,
             channel_tiles,
-            first_filter_t,
             a.shape[4] == 96 and c.shape[4] == 96 and p.a_dtype == cutlass.BFloat16,
             p.num_ab_stage,
             p.num_acc_stage,

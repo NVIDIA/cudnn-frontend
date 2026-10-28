@@ -3,6 +3,7 @@
 
 """Keep newly covered C96 convolutions behind the backend's ranked plans."""
 
+from cudnn import data_type
 from cudnn.engines.base import PlanConfig
 from cudnn.engines.heuristics import BACKEND
 
@@ -25,4 +26,5 @@ def propose(kind: str, facts: ConvGraph, offered: dict[str, int]) -> list[PlanCo
     # C96 extends coverage; it has no demonstrated complete-operation speed
     # advantage. Explicit selection and OPENSOURCE still expose this plan.
     # Preserve the existing preference for all previously supported channels.
-    return [BACKEND] + ours if facts.image.dim[1] == 96 else ours
+    new_c96 = facts.image.dim[1] == 96 and facts.image.data_type == facts.output.data_type == data_type.BFLOAT16
+    return [BACKEND] + ours if new_c96 else ours

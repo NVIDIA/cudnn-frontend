@@ -216,22 +216,23 @@ def test_frost_conv_c96_stream_rebinding_and_capture(cudnn_handle):
         cudnn.set_stream(cudnn_handle, original_stream)
 
 
-@pytest.mark.parametrize("c", [64, 96])
+@pytest.mark.parametrize("c,dtype", [(64, torch.bfloat16), (96, torch.bfloat16), (96, torch.float32)])
 @pytest.mark.parametrize("mode", [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK, cudnn.heur_mode.OPENSOURCE])
-def test_frost_conv_c96_default_placement_and_explicit_selection(c, mode):
-    image = make_input((1, c, 1, 5, 7), torch.bfloat16, seed=610)
-    weight = make_input((96, c, 3, 3, 3), torch.bfloat16, seed=611)
-    output = torch.empty((1, 96, 1, 5, 7), dtype=torch.bfloat16, device="cuda", memory_format=torch.channels_last_3d)
-    graph = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+def test_frost_conv_c96_default_placement_and_explicit_selection(c, dtype, mode):
+    image = make_input((1, c, 1, 5, 7), dtype, seed=610)
+    weight = make_input((96, c, 3, 3, 3), dtype, seed=611)
+    output = torch.empty((1, 96, 1, 5, 7), dtype=dtype, device="cuda", memory_format=torch.channels_last_3d)
+    graph_dtype = cudnn.data_type.BFLOAT16 if dtype == torch.bfloat16 else cudnn.data_type.FLOAT
+    graph = cudnn.pygraph(io_data_type=graph_dtype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     x, w = graph.tensor_like(image), graph.tensor_like(weight)
     y = graph.conv_fprop(x, w, pre_padding=(2, 1, 1), post_padding=(0, 1, 1), stride=(1, 1, 1), dilation=(1, 1, 1))
-    y.set_output(True).set_dim(output.shape).set_stride(output.stride()).set_data_type(cudnn.data_type.BFLOAT16)
+    y.set_output(True).set_dim(output.shape).set_stride(output.stride()).set_data_type(graph_dtype)
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([mode])
     names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
     index = names.index("frost_conv")
-    if c == 64 or mode == cudnn.heur_mode.OPENSOURCE:
+    if c == 64 or dtype == torch.float32 or mode == cudnn.heur_mode.OPENSOURCE:
         assert index == 0
     else:
         assert index > 0, names
@@ -240,4 +241,19 @@ def test_frost_conv_c96_default_placement_and_explicit_selection(c, mode):
     graph.build_plans()
     workspace = torch.empty(max(1, graph.get_workspace_size()), dtype=torch.uint8, device="cuda")
     graph.execute({x: image, w: weight, y: output}, workspace)
-    _close(output, _reference(image, weight))
+    _close(output, torch.nn.functional.conv3d(torch.nn.functional.pad(image.float(), (1, 1, 1, 1, 2, 0)), weight.float()).to(dtype))
+
+
+@pytest.mark.parametrize("k", [96, 192])
+@pytest.mark.parametrize("value", [float("nan"), float("inf")], ids=["nan", "inf"])
+def test_frost_conv_c96_nonfinite_padded_filter_planes(k, value):
+    image = _compact(torch.ones((1, 96, 2, 3, 3), device="cuda", dtype=torch.bfloat16))
+    weight = _compact(torch.zeros((k, 96, 3, 3, 3), device="cuda", dtype=torch.bfloat16))
+    weight[0, 0, 0, 1, 1] = value
+    # Padding supplies zeros, but zero times NaN/Inf must still propagate NaN.
+    # A one-frame specialization must agree with the same frame in a chunk.
+    for depth in (1, 2):
+        chunk = _compact(image[:, :, :depth])
+        actual, expected = _conv(chunk, weight), _reference(chunk, weight)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0, equal_nan=True)
+        assert actual[0, 0, 0].isnan().all()

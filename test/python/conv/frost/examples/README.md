@@ -25,8 +25,7 @@ addition after the convolution's BF16 output conversion.
 
 K96 uses three full 32-channel reduction tiles. K192 uses two 64-channel tiles;
 TMA zero-fills the final 32 lanes at every filter position. Both routes read
-compact C96 storage. For the initial single-frame call, the kernel skips the
-two temporal filter planes that only read padding. Weight conversion can be reused across calls. History
+compact C96 storage. Weight conversion can be reused across calls. History
 assembly, input/output conversion, bias, and cache copies are per-call costs.
 
 The example explicitly selects `frost_conv` to demonstrate coverage. C96 plans
