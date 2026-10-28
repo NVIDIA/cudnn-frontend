@@ -242,6 +242,19 @@ void
 in_axis_order_of(std::vector<int64_t> &shape, std::vector<int64_t> &stride, const std::vector<int64_t> &reference) {
     const size_t n = shape.size();
     if (n != stride.size() || n != reference.size()) return;
+    // Stable descending sorts preserve index order at ties. If every pair has
+    // the same inversion in both stride vectors, the permutation is identity.
+    // Bound the quadratic check; larger ranks keep the original sorting path.
+    if (n <= 8) {
+        bool identity = true;
+        for (size_t i = 0; identity && i < n; ++i)
+            for (size_t j = i + 1; j < n; ++j)
+                if ((stride[i] < stride[j]) != (reference[i] < reference[j])) {
+                    identity = false;
+                    break;
+                }
+        if (identity) return;
+    }
     std::vector<size_t> by_stride(n), ref(n);
     for (size_t i = 0; i < n; i++) by_stride[i] = ref[i] = i;
     std::stable_sort(by_stride.begin(), by_stride.end(), [&](size_t a, size_t b) { return stride[a] > stride[b]; });
