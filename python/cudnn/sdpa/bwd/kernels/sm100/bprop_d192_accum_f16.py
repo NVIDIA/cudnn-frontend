@@ -417,7 +417,7 @@ def _epilogue_loop(
         _credit(bars.sched_empty[sched_state.idx])
         lo, hi = _bounds(block, sq, causal)
         for _ in cutlass.range(lo, hi, 1, unroll=1):
-            for _chunk in cutlass.range_constexpr(CFG.DQ_CHUNKS):
+            for _ in cutlass.range_constexpr(CFG.DQ_CHUNKS):
                 _wait_tcgen(bars.dq_done, dq_state.phase)
                 vals = _tmem_load(tmem_base + CFG.TMEM_DQ, 64)
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
