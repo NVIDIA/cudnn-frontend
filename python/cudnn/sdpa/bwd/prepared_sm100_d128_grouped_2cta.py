@@ -226,12 +226,15 @@ def debug_clk(api):
 
 def debug_clk_record(api):
     """The STAMPS record of this adapter's rendering: the ONE value the carve (``check_support``), the dump reader (``debug_clk_records``) and
-    the tests read -- its WORDS / BYTES are the bar block's spare, DERIVED from the layout the body renders ((TMEM_HANDLE - the layout's end) / 4;
-    config = truth, never a literal) and asserted here against the geometry, so a layout change can never leave a stale record size behind."""
-    from .config_sm100_d128_accum_2cta_stail import CFG as _cfg
+    the tests read -- the record of the stats form and the role shape the body renders (``dbg_clk_for_stats_form``: 88 words under the default
+    tma_ring layout, 96 under ldg; the same word map), its WORDS / BYTES the bar block's spare DERIVED from that layout ((TMEM_HANDLE - the
+    layout's end) / 4; config = truth, never a literal) and asserted here against the form's geometry, so a layout change can never leave a
+    stale record size behind."""
+    from .config_sm100_d128_accum_2cta_stail import cfg_for_stats_form
 
-    record = DBG_CLK
-    assert record.BYTES == 4 * record.WORDS == _cfg.TMEM_HANDLE - record.SMEM, (record, _cfg.TMEM_HANDLE)
+    form, roles = stats_form(api), warp_roles(api)
+    record = dbg_clk_for_stats_form(form, roles)
+    assert record.BYTES == 4 * record.WORDS == cfg_for_stats_form(form, roles).TMEM_HANDLE - record.SMEM, (form, roles, record)
     return record
 
 
@@ -246,7 +249,7 @@ def debug_clk_records(api, workspace):
     import torch
 
     offset, n_rec = region
-    d = dbg_clk_for_stats_form(stats_form(api))  # the record by stats form (96 words under ldg, 88 under tma_ring; the same word map)
+    d = debug_clk_record(api)  # the record by stats form (88 words under the default tma_ring, 96 under ldg; the same word map)
     base = dbg_clk_region_offset(workspace.data_ptr()) - workspace.data_ptr() + offset
     return workspace[base : base + n_rec * d.BYTES].view(torch.int32).view(n_rec, d.WORDS)
 
@@ -289,7 +292,7 @@ def check_support(api):
         offset = dbg_clk_region_offset(thd_workspace_offsets(b, h, api._thd_t_q, api._thd_t_kv, ring)[-2])
         n_rec = dbg_clk_records(b, h, sk)
         api._dbg_clk_region = (offset, n_rec)
-        api._grouped_workspace_bytes = max(api._grouped_workspace_bytes, offset + n_rec * dbg_clk_for_stats_form(stats_form(api)).BYTES + WORKSPACE_SLACK)
+        api._grouped_workspace_bytes = max(api._grouped_workspace_bytes, offset + n_rec * debug_clk_record(api).BYTES + WORKSPACE_SLACK)
     api._implementation = IMPLEMENTATION
     api._is_supported = True
     return True
