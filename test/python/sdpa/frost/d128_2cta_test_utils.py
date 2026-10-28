@@ -21,7 +21,6 @@ from test_sdpa_bwd_d128_accum_sm100 import _require_accumulation
 _ADAPTER_MODULE = "cudnn.sdpa.bwd.api_dsl_sm100_d128_2cta"
 _HOST_MODULE = "cudnn.sdpa.bwd.kernels.sm100.prepared_d128_grouped_2cta_host"
 _IMPLEMENTATION = "accumulation_grouped_thd_2cta"
-_PAIR_CCS = ((10, 0), (10, 3))
 
 
 def _adapter_class():
@@ -39,10 +38,12 @@ def _adapter_class():
 
 
 def _require_2cta():
+    from cudnn.sdpa.bwd.d128_grouped_2cta_contract import CTA_PAIR_CCS
+
     _require_accumulation()
     cc = torch.cuda.get_device_capability()
-    if cc not in _PAIR_CCS:
-        pytest.skip(f"the cta_group::2 d128 backward is served on SM100 / SM103 only; got {cc}")
+    if cc not in CTA_PAIR_CCS:
+        pytest.skip(f"forced cta_group::2 d128 backward requires cc in {CTA_PAIR_CCS}; got {cc}")
 
 
 def make_adapter_2cta(case, *, compile_plan=True, declaration=None, **fields):

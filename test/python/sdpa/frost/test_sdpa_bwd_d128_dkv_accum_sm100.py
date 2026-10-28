@@ -283,6 +283,9 @@ def _make_1cta(case, *, compile_plan=True, **fields):
 
 
 def _make_pair(case, *, compile_plan=True, **fields):
+    from d128_2cta_test_utils import _require_2cta
+
+    _require_2cta()
     return make_adapter_2cta_stail(case, compile_plan=compile_plan, **fields)
 
 
