@@ -386,6 +386,7 @@ class KernelTemplate:
     smem_fixed_reserve: int = 2048
     supports_mainloop_fusion: bool = False
     supports_multi_gemm: bool = True
+    supports_cluster_k_reduce: bool = False
 
     @property
     def block_scale(self) -> bool:
@@ -426,6 +427,7 @@ class KernelTemplate:
     # stage 1: pipeline / graph-type / mainloop axes
 
     def _axis_reject(self, chain: FusionChain, config: TileConfig, graph_type: GraphType) -> str | None:
+        """Explain which requested config axis this template cannot execute."""
         cfg_cls = config_class_for_pipeline(self.pipeline)
         if not isinstance(config, cfg_cls):
             return f"config {config.name} is not a {cfg_cls.__name__} " f"(template {self.file} pairs with config_{self.pipeline})"
@@ -433,6 +435,8 @@ class KernelTemplate:
             return f"graph_type {graph_type.value} != " f"template graph_type {self.graph_type.value}"
         if chain.has_mainloop_fusion != self.supports_mainloop_fusion:
             return f"graph mainloop_fusion={chain.has_mainloop_fusion} != " f"template supports_mainloop_fusion={self.supports_mainloop_fusion}"
+        if config.cluster_k_reduce and not self.supports_cluster_k_reduce:
+            return f"template {self.file} does not support cluster_k_reduce"
         if chain.is_multi_gemm and not self.supports_multi_gemm:
             return f"template {self.file} does not support multi-GEMM " f"({chain.num_gemms} parallel GEMMs); only the 1ctamma CLC " "template does this pass"
         return None
@@ -864,7 +868,9 @@ def _mm(
     supports_mainloop_fusion: bool = False,
     supports_multi_gemm: bool = True,
     template_cls: "type[KernelTemplate] | None" = None,
+    supports_cluster_k_reduce: bool = False,
 ) -> KernelTemplate:
+    """Describe a tcgen05 template and its supported geometry and strategy axes."""
     pipeline = _pipeline_from_file(file)
     if pipeline not in PIPELINE_ARCH_RANGES:
         raise KeyError(
@@ -883,15 +889,17 @@ def _mm(
         smem_fixed_reserve=smem_fixed_reserve,
         supports_mainloop_fusion=supports_mainloop_fusion,
         supports_multi_gemm=supports_multi_gemm,
+        supports_cluster_k_reduce=supports_cluster_k_reduce,
     )
 
 
 TEMPLATES: tuple[KernelTemplate, ...] = (
-    _mm("sm100_matmul.py"),
+    _mm("sm100_matmul.py", supports_cluster_k_reduce=True),
     _mm("sm100_matmul_mainloop.py", warps_per_cta=12, supports_mainloop_fusion=True, supports_multi_gemm=False),
     _mm(
         "sm100_block_scale_matmul.py",
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
+        supports_cluster_k_reduce=True,
     ),
     _mm(
         "sm100_moe_grouped_matmul_fwd.py",

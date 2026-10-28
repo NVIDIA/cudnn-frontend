@@ -890,6 +890,17 @@ def _splitk_plan(g, S):
     return jit_from_cudnn_graph(g, replace(_kw("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")["config"], split_k_slices=S))
 
 
+@requires_sm100
+def test_cluster_k_reduce_declines_unimplemented_mainloop():
+    """Reject cluster reduction while retaining the supported mainloop workspace path."""
+    from dataclasses import replace
+
+    graph = _mainloop_graph_ab("cos", "cos", 240, 272, 4200)
+    cfg = replace(_kw("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")["config"], split_k_slices=4, cluster_k_reduce=True)
+    with pytest.raises(NotImplementedError, match="sm100_matmul_mainloop.py.*cluster_k_reduce"):
+        jit_from_cudnn_graph(graph, cfg)
+
+
 def _run_splitk(compiled, variant_pack):
     from cudnn.frost.workspace import Workspace
 

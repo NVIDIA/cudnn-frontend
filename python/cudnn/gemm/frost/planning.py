@@ -297,6 +297,37 @@ def split_candidates(chain: FusionChain, config: TileConfig) -> range:
     return range(1, maximum + 1)
 
 
+_SMALL_M_BLOCK_SCALE_MAX_TOKENS = 32
+_SMALL_M_WIDE_TILE_MAX_WEIGHT_TILES = 48
+
+
+def _small_m_block_scale_config(chain: FusionChain, baseline: TileConfig, device: DeviceProperties, shapes_fixed: bool) -> TileConfig | None:
+    """Swap decode tokens onto kernel N and split K within one CTA wave.
+
+    This bounded heuristic supplements the fitted profiles, without changing
+    their coefficients. Override-enabled graphs keep a 64-wide token tile and
+    a bounded weight grid, since their declared token count is only a hint.
+    """
+    mm = chain.matmul
+    if baseline.pipeline != "sm100" or not chain.has_block_scale or not _block_scale_supported(chain):
+        return None
+    if chain.has_moe or chain.is_multi_gemm or chain.has_mainloop_fusion or chain.quants or chain.reductions or mm.batch != 1:
+        return None
+    if not 1 <= mm.M <= _SMALL_M_BLOCK_SCALE_MAX_TOKENS or mm.a_major != "k" or mm.b_major != "k" or mm.accum_dtype != "fp32":
+        return None
+    weight_tiles = _ceil_div(mm.N, 128)
+    if shapes_fixed:
+        width = next(w for w in (8, 16, 32) if w >= mm.M)
+    elif weight_tiles <= _SMALL_M_WIDE_TILE_MAX_WEIGHT_TILES:
+        width = 64
+    else:
+        return None
+    config = by_name(f"CONFIG_sm100_128x{width}x{baseline.cta_tile_k_bytes}_128x{width}x{baseline.mma_tile_k_bytes}_cluster1x1_1ctamma")
+    max_slices = min(16, max(split_candidates(chain, config)), device.sm_count // weight_tiles)
+    slices = 1 << (max(1, max_slices).bit_length() - 1)
+    return replace(config, split_k_slices=slices, swap_ab=True)
+
+
 def candidate_configs(chain: FusionChain, baseline: TileConfig, device: DeviceProperties, profile: CostProfile) -> list[TileConfig]:
     candidates = {baseline: None}
     for swapped, view in ((False, chain), (True, swap_ab(chain))):
@@ -394,15 +425,44 @@ def select_strategies(
     probe: Callable[[FusionChain, TileConfig], None],
     device: DeviceProperties | None = None,
     limit: int = MAX_PLAN_CONFIGS,
+    shapes_fixed: bool = False,
 ) -> list[TileConfig]:
+    """Rank supported plans with a stable first choice and a bounded shortlist."""
     if not 1 <= limit <= MAX_PLAN_CONFIGS:
         raise ValueError(f"strategy limit must be between 1 and {MAX_PLAN_CONFIGS}")
     device = current_device_properties() if device is None else device
     if device is None:
         return [baseline]
+    small_m = _small_m_block_scale_config(chain, baseline, device, shapes_fixed)
+    if small_m is not None:
+        try:
+            probe(chain, small_m)
+        except (NotImplementedError, ValueError):
+            small_m = None
+        else:
+            # This rule targets B200. On other GPUs retain
+            # the incumbent first: workspace-reducer overhead can reverse the
+            # winner, including on SM107's wider-K MMA path.
+            if device.arch == 100:
+                selected = [small_m]
+                if limit > 1 and baseline != small_m:
+                    try:
+                        probe(chain, baseline)
+                    except (NotImplementedError, ValueError):
+                        pass
+                    else:
+                        selected.append(baseline)
+                return selected
+
+    def include_small_m(configs: list[TileConfig]) -> list[TileConfig]:
+        """Include the probed narrow-token candidate without replacing the incumbent."""
+        if small_m is None or small_m in configs or limit == 1:
+            return configs
+        return [configs[0], small_m, *configs[1:]][:limit]
+
     profile = profile_for(chain, baseline, device)
     if profile is None:
-        return [baseline]
+        return include_small_m([baseline])
     ranked = rank_candidates(chain, candidate_configs(chain, baseline, device, profile), device, profile)
     checked: dict[TileConfig, bool] = {}
 
@@ -449,7 +509,7 @@ def select_strategies(
             break
         if config not in selected and accepted(config):
             selected.append(config)
-    return [first, *(config for _, config in ranked if config != first and config in selected)]
+    return include_small_m([first, *(config for _, config in ranked if config != first and config in selected)])
 
 
 def select_strategy(
@@ -458,5 +518,7 @@ def select_strategy(
     *,
     probe: Callable[[FusionChain, TileConfig], None],
     device: DeviceProperties | None = None,
+    shapes_fixed: bool = False,
 ) -> TileConfig:
-    return select_strategies(chain, baseline, probe=probe, device=device, limit=1)[0]
+    """Return the first supported strategy using the same policy as the shortlist."""
+    return select_strategies(chain, baseline, probe=probe, device=device, limit=1, shapes_fixed=shapes_fixed)[0]

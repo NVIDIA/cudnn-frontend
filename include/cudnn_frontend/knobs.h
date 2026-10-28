@@ -79,6 +79,8 @@ enum class KnobType_t : int64_t {
     // Warp grid over the CTA tile for warp-scoped MMA families (sm120).
     WARPS_M = 1008,
     WARPS_N = 1009,
+    // Reduce all SPLIT_K_SLC partials inside one CTA cluster (0/1).
+    CLUSTER_K_REDUCE = 1010,
     // Knobs are performance-only: a plan must compute the same function
     // whichever knob values it runs with, so an autotuner may pick any of
     // them. Anything that changes numerics (e.g. a reduced-precision softmax
