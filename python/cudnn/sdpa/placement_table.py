@@ -3,8 +3,8 @@
 
 """Measured placement table: FROST row vs the backend, per shape class, generated from frozen sweeps.
 
-A class is read off the graph facts (row, device, dtype, head pair, phase, layout, mask, sink, MHA vs GQA, S_kv on
-the 128-key tile). Each entry
+A class is read off the graph facts (row, device, dtype, head pair, phase, layout, mask, sink, MHA vs GQA, and whether
+split-KV is blocked by a dense S_kv off the 128-key tile). Each entry
 is a monotone rule on ONE scalar from :data:`FEATURES` -- the roofline-shaped cost proxy :func:`log2_work` or the
 parallel-tile count :func:`log2_tiles`, whichever the class's data is monotone in: ``always``, ``never``, ``ge T`` (FROST leads
 from T up) or ``le T`` (FROST leads up to T). Entries are produced by ``benchmark/placement_gen`` from a training grid
@@ -79,9 +79,10 @@ def class_key(row: str, facts) -> Optional[Tuple]:
     else:
         mask = "none"
     group = "mha" if facts.h_q == facts.h_kv else "gqa"
-    # S_kv off the 128-key tile changes what the kernels can do (no split-KV), not just how long they run: its own class.
-    kv_aligned = facts.s_kv % 128 == 0
-    return (row, tuple(facts.device_cc or ()), dtype, (facts.d_qk, facts.d_v), phase, layout, mask, bool(facts.has_sink), group, kv_aligned)
+    # A dense S_kv off the 128-key tile cannot split KV, which changes what the kernels can do, not just how long they run:
+    # its own class. Paged KV splits at any logical maximum, so it never sets this.
+    split_blocked = not facts.has_paged_kv and facts.s_kv % 128 != 0
+    return (row, tuple(facts.device_cc or ()), dtype, (facts.d_qk, facts.d_v), phase, layout, mask, bool(facts.has_sink), group, split_blocked)
 
 
 COST_BALANCE = 16.0
