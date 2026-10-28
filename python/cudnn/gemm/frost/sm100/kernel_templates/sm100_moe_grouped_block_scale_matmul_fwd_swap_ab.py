@@ -293,9 +293,6 @@ def _kernel(
     ]
 
     # @@TMA_STORE_ONLY:BEGIN@@
-    # One epilogue subtile = one MMA-M block x 32 cols; the M blocks reuse it.
-    # The ring slot is indexed by `tidx`, so its row count is the EPILOGUE THREAD
-    # count -- which is epi_tile_mn[0] only when the MMA M block is 128.
     epi_subtile_elems = epi_stage_rows * epi_row_elems * epi_slot_widen
     smem_d_ptr = cutlass.Array(
         cd_dtype,
@@ -438,8 +435,6 @@ def _kernel(
     ) * cta_group
     if cutlass.const_expr(cta_group == 2):
         pair_n_size = cgrp_tile_mnk[1] // cluster_n
-    # Per-CTA output rows one MMA-M block covers. The pair splits M, so this is
-    # the per-CTA mma_tile_m — half the instruction's hardware M.
     epi_rows_per_mma_m = cta_tile_mnk[0] // mma_size_m
     tmem_alloc_bar_count = (num_epilogue_warps + 1) * 32
     if cutlass.const_expr(cta_group == 2):
@@ -490,10 +485,6 @@ def _kernel(
             cached_next_begin = tile_lower_bound
 
         while is_tile_valid != 0:
-            # Dynamic tile assignment: the cluster leader claims the next GLOBAL
-            # tile index and broadcasts it, so the clusters that are live at any
-            # instant sit in one contiguous window of tile space and share L2.
-            # Static striding lets them drift apart and share nothing.
             if cta_rank_in_cluster == 0:
                 while not nvvm.mbarrier_try_wait_parity(
                     sched_bcast_empty_mbar_ptr.subview(bcast_stage),
@@ -527,9 +518,6 @@ def _kernel(
             if lane == 0:
                 nvvm.mbarrier_arrive(nvvm.mapa(sched_bcast_empty_mbar_ptr.subview(bcast_stage), 0))
             if cutlass.const_expr(cluster_size > 1):
-                # The final invalid broadcast has no next reuse of this stage to
-                # wait for its cluster-wide acknowledgements, so retain its exact
-                # stage and completion parity for the scheduler-warp drain below.
                 last_bcast_stage = bcast_stage
                 last_bcast_empty_done_phase = bcast_empty_phase ^ 1
             bcast_stage += 1
@@ -724,14 +712,8 @@ def _kernel(
                 sched_stage = cutlass.Int32(0)
                 sched_empty_phase = sched_empty_phase ^ 1
 
-        # Every multi-CTA cluster emits one invalid scheduler record before
-        # leaving the loop. Keep the leader CTA's DSM alive until every
-        # scheduler warp has consumed that final broadcast and acknowledged the
-        # leader slot. A singleton cluster has no remote DSM lifetime to drain.
         if cutlass.const_expr(cluster_size > 1):
             if cta_rank_in_cluster == 0:
-                # Each acknowledgement flips the saved pre-wrap empty phase, so
-                # pre-wrap ``bcast_empty_phase ^ 1`` is the completed parity.
                 while not nvvm.mbarrier_try_wait_parity(
                     sched_bcast_empty_mbar_ptr.subview(last_bcast_stage),
                     last_bcast_empty_done_phase,
@@ -1057,9 +1039,6 @@ def _kernel(
             sched_full_phase = cutlass.Int32(0)
             acc_stage = cutlass.Int32(0)
 
-            # fp4 packs its K-mode into the OMMA descriptor's 2-bit split field; fp8
-            # keeps the MX descriptor's 1-bit one. Both are built once, outside the
-            # loops — the fields depend only on j (the scale id within a word).
             if cutlass.const_expr(idesc_is_omma):
                 idesc_by_j = [
                     cutlass.experimental.primitives.Tcgen05MxOmmaInstrDesc.build(
@@ -1097,9 +1076,6 @@ def _kernel(
             sfb_tmem_bases = [(base_row_id << 16) | (base_col_id_root + sfb_col_bases[j]) for j in range(num_b_operands)]
             s2t_shape, s2t_multicast = nvvm.S2TCopyMode.S2T_32x128b_WARPX4
             sfb_scale_ptrs = [[nvvm.make_tmem_ptr(b + _sfb_word_stride * w, cutlass.Float32) for b in sfb_tmem_bases] for w in range(_sf_word_slots)]
-            # SFA is M-block-major; SFB is atom-major across the N blocks read by
-            # one instruction. The outer index selects a disjoint SF word, or the
-            # single reused slot. Fake sides keep their initialized slot zero.
             sfa_dst_ptrs = [
                 [
                     [
@@ -1126,8 +1102,6 @@ def _kernel(
                 ]
                 for w in range(_sf_word_slots)
             ]
-            # Per-group TMA replacement changes the GMEM source, not these invariant
-            # MMA-side SMEM descriptor roots.
             desc_a_roots = [
                 cutlass.experimental.primitives.Tcgen05SmemDesc.build(
                     start_address=smem_a_list[i],
@@ -1199,9 +1173,6 @@ def _kernel(
                         acc_base_col = base_col_id_root + (tile_iter % 2) * acc_stage_stride
                     else:
                         acc_base_col = base_col_id_root + acc_stage * acc_region_cols
-                    # One accumulator per (gemm, M block); M block mi sits
-                    # epi_cols_per_mma_m columns further into its GEMM's region and
-                    # reads SF word block mi (SF words are one per 128 rows).
                     acc_tmem_ptrs = [
                         [
                             nvvm.make_tmem_ptr(
@@ -1224,8 +1195,6 @@ def _kernel(
                         desc_sfa_bases = [desc_sfa_roots[i].advance_start_address(sfa_smem_bytes * stage) for i in range(num_sfa_operands)]
                         desc_sfb_bases = [desc_sfb_roots[j].advance_start_address(sfb_smem_bytes * stage) for j in range(num_sfb_operands)]
 
-                        # One SF word per group of MMAs, resident or refreshed before they
-                        # read it. A word spans word_atoms consecutive K-atoms in SMEM.
                         while not nvvm.mbarrier_try_wait_parity(
                             sf_full_mbar_ptr.subview(stage),
                             ab_full_phase_bit,
@@ -1234,9 +1203,6 @@ def _kernel(
                             pass
 
                         if cutlass.const_expr(_sfb_needs_sub_tile):
-                            # Token SF blocks start at each group's padded SF prefix.
-                            # Aligned global descriptors have the same modulo-128
-                            # origin; GATHER already packs tile-local SF rows.
                             sf_n_start = (sfb_tile_n * cgrp_tile_mnk[1] + n_rank * cta_tile_mnk[1]) % 128
                             for _bj in cutlass.range_constexpr(num_sfb_operands):
                                 extract_block_scale_sfb(
@@ -1310,9 +1276,6 @@ def _kernel(
                                                         group=_CTA_GROUP,
                                                         multicast=s2t_multicast,
                                                     )
-                                        # The M sub-block offset is a whole SMEM swizzle atom, so
-                                        # the descriptor's swizzle phase is preserved. B and its SF
-                                        # are shared; A's SF word block follows the M block.
                                         desc_a = desc_a_k.advance_start_address(a_smem_m_step_bytes * mma_m)
                                         if elect_one:
                                             _tcgen05_mma_block_scale(
@@ -1329,8 +1292,6 @@ def _kernel(
                                                 collector_op=_a_collector_op(gemm_i),
                                                 b_collector_op=_b_collector_op(mma_m),
                                             )
-                                # Every accumulator sees scale_d=False on exactly the first
-                                # k_block of the tile, so the flip stays outside mma_m.
                                 scale_d = cutlass.Boolean(True)
 
                         if elect_one:
@@ -1389,9 +1350,6 @@ def _kernel(
                 sched_stage = cutlass.Int32(0)
                 sched_full_phase = cutlass.Int32(0)
                 acc_stage = cutlass.Int32(0)
-                # fp4 packs its K-mode into the OMMA descriptor's 2-bit split field; fp8
-                # keeps the MX descriptor's 1-bit one. Both are built once, outside the
-                # loops — the fields depend only on j (the scale id within a word).
                 if cutlass.const_expr(idesc_is_omma):
                     idesc_by_j = [
                         cutlass.experimental.primitives.Tcgen05MxOmmaInstrDesc.build(
@@ -1428,9 +1386,6 @@ def _kernel(
                 sfb_tmem_bases = [(base_row_id << 16) | (base_col_id_root + sfb_col_bases[j]) for j in range(num_b_operands)]
                 s2t_shape, s2t_multicast = nvvm.S2TCopyMode.S2T_32x128b_WARPX4
                 sfb_scale_ptrs = [[nvvm.make_tmem_ptr(b + _sfb_word_stride * w, cutlass.Float32) for b in sfb_tmem_bases] for w in range(_sf_word_slots)]
-                # SFA is M-block-major; SFB is atom-major across the N blocks read by
-                # one instruction. The outer index selects a disjoint SF word, or the
-                # single reused slot. Fake sides keep their initialized slot zero.
                 sfa_dst_ptrs = [
                     [
                         [
@@ -1457,8 +1412,6 @@ def _kernel(
                     ]
                     for w in range(_sf_word_slots)
                 ]
-                # Per-group TMA replacement changes the GMEM source, not these
-                # invariant MMA-side SMEM descriptor roots.
                 desc_a_roots = [
                     cutlass.experimental.primitives.Tcgen05SmemDesc.build(
                         start_address=smem_a_list[i],
@@ -1528,9 +1481,6 @@ def _kernel(
                             acc_base_col = base_col_id_root + (tile_iter % 2) * acc_stage_stride
                         else:
                             acc_base_col = base_col_id_root + acc_stage * acc_region_cols
-                        # One accumulator per (gemm, M block); M block mi sits
-                        # epi_cols_per_mma_m columns further into its GEMM's region and
-                        # reads SF word block mi (SF words are one per 128 rows).
                         acc_tmem_ptrs = [
                             [
                                 nvvm.make_tmem_ptr(
@@ -1553,8 +1503,6 @@ def _kernel(
                             desc_sfa_bases = [desc_sfa_roots[i].advance_start_address(sfa_smem_bytes * stage) for i in range(num_sfa_operands)]
                             desc_sfb_bases = [desc_sfb_roots[j].advance_start_address(sfb_smem_bytes * stage) for j in range(num_sfb_operands)]
 
-                            # One SF word per group of MMAs, resident or refreshed before they
-                            # read it. A word spans word_atoms consecutive K-atoms in SMEM.
                             while not nvvm.mbarrier_try_wait_parity(
                                 sf_full_mbar_ptr.subview(stage),
                                 ab_full_phase_bit,
@@ -1631,9 +1579,6 @@ def _kernel(
                                                             group=_CTA_GROUP,
                                                             multicast=s2t_multicast,
                                                         )
-                                            # The M sub-block offset is a whole SMEM swizzle atom, so
-                                            # the descriptor's swizzle phase is preserved. B and its SF
-                                            # are shared; A's SF word block follows the M block.
                                             desc_a = desc_a_k.advance_start_address(a_smem_m_step_bytes * mma_m)
                                             if elect_one:
                                                 _tcgen05_mma_block_scale(
@@ -1650,8 +1595,6 @@ def _kernel(
                                                     collector_op=_a_collector_op(gemm_i),
                                                     b_collector_op=_b_collector_op(mma_m),
                                                 )
-                                    # Every accumulator sees scale_d=False on exactly the first
-                                    # k_block of the tile, so the flip stays outside mma_m.
                                     scale_d = cutlass.Boolean(True)
 
                             if elect_one:
@@ -1831,14 +1774,9 @@ def _kernel(
             if is_valid != 0:
                 coord_m_tile = tile_m * cgrp_tile_mnk[0] + m_rank * cta_tile_mnk[0]
                 # @@TMA_STORE_ONLY:BEGIN@@
-                # ragged tail; the base stays put, so the store coords are global.
-                # Under `moe_aligned_offsets` no tile crosses `group_end` in the
-                # has nothing to clip and the original descriptor serves.
                 if warp_idx == 0 and cutlass.const_expr(not moe_aligned_offsets and not moe_scatter):
                     if group_end != previous_group_end:
                         previous_group_end = group_end
-                        # One drain retires the in-flight stores of EVERY descriptor,
-                        # so it does not repeat per output.
                         nvvm.cp_async_bulk_wait_group(0, read=True)
                         for _di in cutlass.range_constexpr(n_tma_outputs):
                             _scratch = tma_c_desc_smem.subview(_di * TENSOR_MAP_QWORDS)
@@ -1872,8 +1810,6 @@ def _kernel(
                     acc_base_col = base_col_id_root + acc_stage * acc_region_cols
 
                 if cutlass.const_expr(moe_combine_swap_bulk_enabled):
-                    # Complete both 128-feature M fragments before reducing a
-                    # token row. Metadata is loaded once per warp/token batch.
                     for combine_subtile in cutlass.range_constexpr(subtile_cnt):
                         combine_col = coord_n_c + combine_subtile * epi_n
                         combine_weights = []
@@ -1887,8 +1823,6 @@ def _kernel(
                                     combine_weight = top_k_scores[combine_token, combine_slot]
                             combine_weights.append(combine_weight)
                         for combine_mi in cutlass.range_constexpr(mma_size_m):
-                            # Two 64-column loads avoid keeping 128 accumulators
-                            # live alongside routing metadata and spilling.
                             for combine_chunk in cutlass.range_constexpr(epi_n // 64):
                                 combine_tmem_col = acc_base_col + combine_mi * epi_cols_per_mma_m + combine_subtile * epi_n + combine_chunk * 64
                                 combine_tmem_addr = (row_id_with_warp_offset << 16) | combine_tmem_col
@@ -2229,9 +2163,6 @@ def compile() -> Callable:
     b_stride_elems = 16 // (b_dtype.width // 8)
     sym_m = cute.sym_int64()
     sym_n = cute.sym_int64(divisibility=min(out_vec_elems, moe_token_alignment))
-    # K tails are supported: the K loop is ceil_div and the TMA descriptor's global K
-    # extent makes a partial box HW zero-filled. The only real K rule is the 16-byte
-    # TMA contiguous-extent one, already gated by _tma_alignment_reject.
     sym_k = cute.sym_int64()
     # Packed K extent: same reasoning as sym_k -- no CTA-tile multiple is required.
     sym_akp = cute.sym_int64()
@@ -2256,10 +2187,6 @@ def compile() -> Callable:
             assumed_align=16,
         )
 
-    # The host rebuilds blocked row/K geometry from problem_size. Keep SF
-    # layouts dynamic to retain the validated weight SFA expert stride and
-    # GATHER token SFB row shape/stride. Mode 2 keeps the plane count
-    # (sym_e for SFA, 1 for SFB).
     def _make_fake_sfa():
         return cute.runtime.make_fake_tensor(
             sf_cutlass_dtype,

@@ -370,9 +370,14 @@ python/cudnn/
 
   gemm/frost/                   engine.py + graph_analyzer.py + the arch-neutral
                                 layer (recipe, tile_config, kernel_registry ...);
-                                compiler.py / epilogue_codegen.py are FACADES that
-                                become the active arch tree's module on first
-                                import (arch_family.py picks it from the GPU, or
+    graph_analyzer.py           SHARED dense/MoE builders and per-analysis metadata
+    compiler.py                 SHARED executors, launch arguments, source cache,
+                                buffer validation and workspace helpers
+    epilogue_codegen.py         SHARED pointwise DAG, auxiliary addressing,
+                                casts, stores and row-quantization emitters
+                                Both files become the active arch tree's module
+                                on first import, retaining the shared helpers
+                                (arch_family.py selects the tree from the GPU or
                                 CUDNN_FRONTEND_GEMM_ARCH_FAMILY)
     sm100/                      compiler.py + epilogue_codegen.py
                                 + kernel_templates/ (sm100_*, sm103_*)
@@ -385,6 +390,10 @@ python/cudnn/
                                 SM100-only tcgen05 compatibility wrappers;
                                 imported directly, never rendered as a kernel
 ```
+
+Dense and grouped GEMM analysis share one epilogue DAG builder in
+`gemm/frost/graph_analyzer.py`. Architecture-specific resource accounting,
+support checks and kernel scheduling remain in each source family.
 
 Two levels under the pass directory, always. **Arch is the one coverage axis
 that may be a directory** — `kernels/sm<arch>/` — because it partitions the

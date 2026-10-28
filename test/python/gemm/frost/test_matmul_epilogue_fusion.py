@@ -2846,7 +2846,9 @@ def test_row_quant_amax_uses_vector_reduce() -> None:
     """A scalar max tree lowers every pair to FSETP/FSEL.  Keep the row-block
     amax in TensorSSA form so MLIR lowers it to the compact vector reduction
     used by the specialized grouped-GLU epilogue."""
-    src = pathlib.Path(epilogue_codegen.__file__).read_text()
+    import inspect
+
+    src = inspect.getsource(epilogue_codegen._emit_block_quant_row)
     assert "cute.TensorSSA({p}_src.ir_value(), ({bs}, {n_sub}), cutlass.Float32)" in src
     assert "{p}_abs = cute.math.absf({p}_frg)" in src
     assert "cutlass._mlir.dialects.math.absf" not in src

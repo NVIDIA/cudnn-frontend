@@ -65,6 +65,37 @@ def test_single_gemm_unchanged() -> None:
     assert "vec_f32_1" not in epi
 
 
+def test_parallel_analysis_keeps_graph_metadata_isolated(monkeypatch) -> None:
+    """Analyze graphs concurrently with independent tensor declarations."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from cudnn.gemm.frost import graph_analyzer
+
+    graphs = []
+    for i, dtype in enumerate((cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)):
+        graph = _graph(io=dtype)
+        m, n, k = 64 * (i + 1), 128, 256
+        result = graph.matmul(A=_A(graph, m, k), B=_B(graph, k, n))
+        graph.relu(input=result).set_output(True)
+        if i:
+            result.set_output(True)
+        graphs.append(graph)
+    expected = [analyze(graph) for graph in graphs]
+    read_state = graph_analyzer._state_from_graph
+    ready = Barrier(len(graphs))
+
+    def interleaved_state(graph):
+        state = read_state(graph)
+        ready.wait(timeout=10)
+        return state
+
+    monkeypatch.setattr(graph_analyzer, "_state_from_graph", interleaved_state)
+    with ThreadPoolExecutor(max_workers=len(graphs)) as executor:
+        actual = list(executor.map(analyze, graphs))
+    assert actual == expected
+
+
 def test_dual_gemm_shared_a_detected() -> None:
     """silu(A@B0) * (A@B1) * scale: 2 GEMMs, A shared, B distinct."""
     M, N, K = 256, 256, 128
