@@ -240,7 +240,7 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
         self._implementation = (
             RECOMPUTE
             if self.deterministic or not window_in_envelope
-            else select_implementation(cc, version, int(b), int(h), int(sq), int(sk), self.scale_softmax)
+            else select_implementation(cc, version, int(b), int(h), int(sq), int(sk), self.scale_softmax, d_qk=int(d), d_v=int(d))
         )
         self._is_supported = True
         return True

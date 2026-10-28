@@ -155,7 +155,7 @@ class SdpaBwdDslSm100D192Fp8(SdpaBwdDsl):
         self.head_dim_qk, self.head_dim_v = D_QK, D_V
         self.scale_softmax = D_QK**-0.5 if self.scale_softmax is None else float(self.scale_softmax)
         require(math.isfinite(self.scale_softmax) and self.scale_softmax > 0, "attn_scale must be finite and positive")
-        implementation = select_implementation(cc, version, int(b), int(h), int(sq), int(sk), self.scale_softmax)
+        implementation = select_implementation(cc, version, int(b), int(h), int(sq), int(sk), self.scale_softmax, d_qk=D_QK, d_v=D_V, input_bytes=1)
         require(implementation == ACCUMULATION, "the declaration is outside the accumulation envelope")
         self._implementation = ACCUMULATION
         self._is_supported = True

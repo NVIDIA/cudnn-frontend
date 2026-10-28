@@ -144,3 +144,40 @@ def test_dense_window_graph_declines_noninteger_radius(window_left):
     facts, _ = _declarations(d=64, window_left=window_left)
     reason = _reason(facts)
     assert reason is not None and "window" in reason
+
+
+@pytest.mark.parametrize(
+    "d,sk,implementation", [(64, 4_194_176, "accumulation"), (64, 4_194_304, "recompute"), (64, 4_194_432, "recompute"), (128, 4_194_432, "accumulation")]
+)
+def test_accumulation_swizzle_uses_declared_head_dimension(d, sk, implementation):
+    # Metadata-only: D64's host swizzle is twice D128's for Sq=2.
+    # At Sk=2**22 its divisor reaches 2**31, despite a small launch grid.
+    _, api = _declarations(d=d, sq=2, sk=sk, causal=True)
+    assert api.check_support()
+    assert api._implementation == implementation
+
+
+@pytest.mark.parametrize("d,dv,last_safe", [(64, 64, 2_097_024), (128, 128, 4_194_176), (192, 128, 4_194_176)])
+@pytest.mark.parametrize("overflow", [False, True])
+def test_fp8_accumulation_swizzle_accounts_for_byte_payload(d, dv, last_safe, overflow):
+    from cudnn.api_base import TensorDesc
+    from cudnn.sdpa.bwd.api_dsl_sm100_d128_fp8 import SdpaBwdDslSm100D128Fp8
+    from cudnn.sdpa.bwd.api_dsl_sm100_d192_fp8 import SdpaBwdDslSm100D192Fp8
+
+    sk = last_safe + (128 if overflow else 0)
+    samples = {}
+    for role in ("q", "k", "v", "o", "do", "stats", "dq", "dk", "dv"):
+        length = sk if role in ("k", "v", "dk", "dv") else 2
+        width = 1 if role == "stats" else dv if role in ("v", "o", "do", "dv") else d
+        shape, stride = (1, 1, length, width), (length * width, width, width, 1)
+        dtype = torch.float32 if role == "stats" else torch.bfloat16 if role in ("dq", "dk", "dv") else torch.float8_e4m3fn
+        samples["sample_" + role] = TensorDesc(
+            dtype=dtype, shape=shape, stride=stride, stride_order=TensorDesc._compute_stride_order(shape, stride), device=torch.device("cuda", 0), name=role
+        )
+    api_type = SdpaBwdDslSm100D192Fp8 if d == 192 else SdpaBwdDslSm100D128Fp8
+    api = api_type(**samples, is_causal=True)
+    if overflow:
+        with pytest.raises(NotImplementedError, match="outside the accumulation envelope"):
+            api.check_support()
+    else:
+        assert api.check_support()
