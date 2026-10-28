@@ -221,6 +221,7 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
         block_sizes_mode: int = 0,
         v_block_size: int = 0,
         k_quant_block_size: int = 16,
+        tile_m: int = 128,
     ):
         assert v_block_size in (0, 128)
         if k_quant_block_size not in (1, 16):
@@ -236,17 +237,20 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
         self.softmax_p_scale_log2 = 8.0
 
         self.tile_size = SM120_FWD_BLOCK_SIZE
+        assert tile_m in (64, 128)
+        assert tile_m == 128 or (k_quant_block_size == 1 and v_block_size == 128)
+        self.tile_m = tile_m
 
         assert blocksparse_blocksize_q == 128, "Only block_size_m=128 is supported in this kernel."
         assert blocksparse_blocksize_k == 128, "Only block_size_n=128 is supported in this kernel."
-        # Eight compute warps retain the full Q128/KV128 tile. One extra
-        # warpgroup donates registers; its first warp drives the TMA producer.
-        self.num_threads = 384
-        self.num_mma_warps = 8
-        self.num_compute_threads = 256
+        # Each compute warp owns 16 query rows; the KV tile stays at 128.
+        # One extra warpgroup donates registers and drives the TMA producer.
+        self.num_mma_warps = self.tile_m // 16
+        self.num_compute_threads = self.num_mma_warps * 32
+        self.num_threads = self.num_compute_threads + 128
         self.phase_warps = 4 if k_quant_block_size == 1 else 2
         self.load_registers = 24
-        self.compute_registers = 240
+        self.compute_registers = 232 if self.tile_m == 64 else 240
         self.kv_stage = 1
         self.q_stage = 1
         self.q_in_regs = True
@@ -257,8 +261,8 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
         self.gqa_ratio = gqa_ratio
         self.qk_dim = head_dim
         self.value_dim = value_dim
-        self.tile_shape_qk = (self.tile_size, self.tile_size, self.qk_dim)
-        self.tile_shape_pv = (self.tile_size, self.value_dim, self.tile_size)
+        self.tile_shape_qk = (self.tile_m, self.tile_size, self.qk_dim)
+        self.tile_shape_pv = (self.tile_m, self.value_dim, self.tile_size)
 
         self.scheduler = None
 
@@ -431,7 +435,7 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
             K_barrier: cute.struct.MemRange[cutlass.Int64, self.kv_stage * 2]
             V_barrier: cute.struct.MemRange[cutlass.Int64, self.kv_stage * 2]
 
-            Q_smem: cute.struct.Align[cute.struct.MemRange[self.Q_dtype, cute.cosize(self.Q_smem_layout)], 128]
+            Q_smem: cute.struct.Align[cute.struct.MemRange[self.Q_dtype, cute.cosize(self.Q_smem_layout) if self.tile_m == 128 else 0], 128]
             K_smem: cute.struct.Align[cute.struct.MemRange[self.K_dtype, cute.cosize(self.K_smem_layout)], 128]
             V_smem: cute.struct.Align[cute.struct.MemRange[self.V_dtype, cute.cosize(self.V_smem_layout)], 128]
             O_smem: cute.struct.Align[cute.struct.MemRange[self.O_dtype, cute.cosize(self.O_smem_layout)], 128]
@@ -506,7 +510,7 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
             cluster=(1, 1, 1),
             smem=self.shared_storage_t.size_in_bytes(),
             stream=stream,
-            min_blocks_per_mp=1,
+            min_blocks_per_mp=2 if self.tile_m == 64 else 1,
         )
 
     @cute.kernel
@@ -589,15 +593,16 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
         V_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.kv_stage)
 
         # partition tensors
-        sQ = shared_storage.Q_smem.get_tensor(
-            Q_smem_layout.outer,
-            swizzle=Q_smem_layout.inner,
-        )
+        if cutlass.const_expr(self.tile_m == 64):
+            q_buffer = shared_storage.O_smem.data_ptr()
+        else:
+            q_buffer = shared_storage.Q_smem.data_ptr()
+        sQ = cute.make_tensor(cute.recast_ptr(q_buffer, Q_smem_layout.inner, dtype=self.Q_dtype), Q_smem_layout.outer)
         sK = shared_storage.K_smem.get_tensor(K_smem_layout.outer, swizzle=K_smem_layout.inner)
         sV = shared_storage.V_smem.get_tensor(V_smem_layout.outer, swizzle=V_smem_layout.inner)
         p_smem_atom = cute.nvgpu.tcgen05.make_smem_layout_atom(cute.nvgpu.tcgen05.SmemLayoutAtomKind.MN_SW64, self.Q_dtype)
-        p_smem_layout = cute.tile_to_shape(p_smem_atom, (128, 128, 1), order=(0, 1, 2))
-        sP = cute.make_tensor(cute.recast_ptr(shared_storage.Q_smem.data_ptr(), p_smem_layout.inner, dtype=self.Q_dtype), p_smem_layout.outer)
+        p_smem_layout = cute.tile_to_shape(p_smem_atom, (self.tile_m, 128, 1), order=(0, 1, 2))
+        sP = cute.make_tensor(cute.recast_ptr(q_buffer, p_smem_layout.inner, dtype=self.Q_dtype), p_smem_layout.outer)
         if cutlass.const_expr(self.v_block_size == 128):
             sVt = sV
         else:
@@ -635,9 +640,10 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
         else:
             gV = cute.local_tile(mV_slice, (self.tile_shape_pv[1], self.tile_shape_pv[2]), coord=(0, None))
 
-        gIndices = blocksparse_indices_q2k[None, work_desc.qo_tile_idx, work_desc.qo_head_idx, work_desc.batch_idx]
+        metadata_q_tile = work_desc.qo_tile_idx // (128 // self.tile_m)
+        gIndices = blocksparse_indices_q2k[None, metadata_q_tile, work_desc.qo_head_idx, work_desc.batch_idx]
         if cutlass.const_expr(self.has_block_nums):
-            num_n_tiles = blocksparse_num_blocks_q2k[work_desc.qo_tile_idx, work_desc.qo_head_idx, work_desc.batch_idx]
+            num_n_tiles = blocksparse_num_blocks_q2k[metadata_q_tile, work_desc.qo_head_idx, work_desc.batch_idx]
         else:
             num_n_tiles = block_sparse_num
         if cutlass.const_expr(self.has_block_sizes):
@@ -767,7 +773,7 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
             q_softmax_scale_log2e_m = cute.make_rmem_tensor_like(max_m, cutlass.Float32)
             tScS_mn = layout_utils.reshape_acc_to_mn(tScS)
             for m in cutlass.range_constexpr(cute.size(q_softmax_scale_log2e_m)):
-                row_idx = work_desc.qo_tile_idx * self.tile_size + tScS_mn[m, 0][0]
+                row_idx = work_desc.qo_tile_idx * self.tile_m + tScS_mn[m, 0][0]
                 q_softmax_scale_log2e_m[m] = gQScale[row_idx] * scale_softmax_log2e if row_idx < mQ.shape[0] else cutlass.Float32(0.0)
 
             tOrO.store(cute.full_like(tOrO, 0.0, self.acc_dtype))
@@ -920,7 +926,7 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
             )
             tScS_mn = layout_utils.reshape_acc_to_mn(tScS)
             for m in cutlass.range_constexpr(cute.size(lse)):
-                row_idx = work_desc.qo_tile_idx * self.tile_size + tScS_mn[m, 0][0]
+                row_idx = work_desc.qo_tile_idx * self.tile_m + tScS_mn[m, 0][0]
                 if tScS_mn[m, 0][1] == 0:
                     if row_idx < mQ.shape[0]:
                         mLSE_slice[row_idx] = lse[m]
@@ -928,7 +934,10 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
             tOrO_cvt = cute.make_rmem_tensor_like(tOrO, self.O_dtype)
             tOrO_cvt.store(tOrO.load().to(self.O_dtype))
 
-            # FP8 Q needs a separate, larger buffer for the BF16 output tile.
+            if cutlass.const_expr(self.tile_m == 64):
+                _compute_barrier(1, self.num_compute_threads)
+
+            # M64 aliases Q/P/O only after all compute warps finish reading P.
             sO = shared_storage.O_smem.get_tensor(O_smem_layout.outer, swizzle=O_smem_layout.inner)
             tiled_copy_o_r2s = cute.make_tiled_copy_C(
                 cute.make_copy_atom(

@@ -332,6 +332,65 @@ def test_sm120_fp8_per_token_dsl_gate(monkeypatch):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("tail", (0, 19))
+@pytest.mark.parametrize("offset_scales", (False, True))
+@torch_fork_set_rng(seed=28130)
+def test_sm120_fp8_per_token_m64_matches_m128_and_replays(monkeypatch, tail, offset_scales):
+    """M64 shares Q/P/O storage without changing KV128 softmax or metadata."""
+    _require_sm120(per_token=True)
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    from cudnn.block_sparse_attention._fp8_quant import _quantize_sage_bhsd
+
+    batch, heads, sq, sk = 2, 2, 128 + tail, 256 + tail
+    q = torch.randn((batch, heads, sq, 128), device="cuda", dtype=torch.bfloat16) * 0.5
+    k, v = [torch.randn((batch, heads, sk, 128), device="cuda", dtype=q.dtype) * 0.5 for _ in range(2)]
+    packed = list(_quantize_sage_bhsd(q, k, v, v_block_size=128, k_quant_block_size=1))
+    if offset_scales:
+        scales = packed[4]
+        storage = torch.empty(scales.numel() + 1, device=q.device, dtype=scales.dtype)
+        packed[4] = storage[1:].view_as(scales).copy_(scales)
+    nq, nk = (sq + 127) // 128, (sk + 127) // 128
+    indices = torch.arange(nk - 1, -1, -1, device="cuda", dtype=torch.int32).expand(batch, heads, nq, nk).contiguous()
+    kwargs = dict(sparse_block_size=128, v_block_size=128, k_quant_block_size=1)
+    monkeypatch.setattr(interface._bsa_attn_fwd_sm120_fp8, "compile_cache", {})
+    original_compile = interface.cute.compile
+    compiled_tiles = []
+
+    def record_compile(instance, *args, **kw):
+        compiled_tiles.append(instance.tile_m)
+        return original_compile(instance, *args, **kw)
+
+    monkeypatch.setattr(interface.cute, "compile", record_compile)
+
+    def run():
+        return interface._bsa_attn_fwd_sm120_fp8(*packed, indices, nk, 128**-0.5, **kwargs)
+
+    monkeypatch.setattr(interface, "_get_device_sm_count_for_device", lambda _: 10000)
+    expected = run()
+    monkeypatch.setattr(interface, "_get_device_sm_count_for_device", lambda _: batch * heads * nq)
+    actual = run()
+    for result, reference in zip(actual, expected):
+        torch.testing.assert_close(result, reference, rtol=0, atol=0)
+    assert compiled_tiles == [128, 64]
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            captured = run()
+        packed[4].mul_(0.75)
+        packed[5].mul_(1.5)
+        for result in captured:
+            result.fill_(float("nan"))
+        graph.replay()
+        monkeypatch.setattr(interface, "_get_device_sm_count_for_device", lambda _: 10000)
+        expected = run()
+        for result, reference in zip(captured, expected):
+            torch.testing.assert_close(result, reference, rtol=0, atol=0)
+        assert compiled_tiles == [128, 64]
+    finally:
+        graph.reset()
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize(("batch", "heads", "sq", "sk"), ((1, 1, 128, 128), (2, 3, 147, 659), (1, 8, 257, 2176)))
 @torch_fork_set_rng(seed=120128)
 def test_sm120_fp8_blk128_fused_v_quantization_exact(batch, heads, sq, sk):

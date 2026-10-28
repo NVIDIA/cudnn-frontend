@@ -1591,6 +1591,14 @@ def _bsa_attn_fwd_sm120_fp8(
         for index, tensor in enumerate(runtime_tensors)
     )
     current_stream = cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
+    tile_m = sparse_block_size
+    if sparse_block_size == 128 and k_quant_block_size == 1 and v_block_size == 128 and not has_block_nums and not has_block_sizes:
+        num_sms = _get_device_sm_count_for_device(q_fp8.device.index)
+        num_query_tiles = num_q_blocks * batch * num_heads
+        # Split a short, sparse wave into twice as many M64 CTAs. Longer
+        # loops retain M128 so K/V loads are amortized over more query rows.
+        if fixed_block_sparse_num <= 4 and num_sms <= num_query_tiles <= 2 * num_sms:
+            tile_m = 64
     fwd_kernel = Kernel(
         gqa_ratio=1,
         head_dim=head_dim,
@@ -1603,7 +1611,7 @@ def _bsa_attn_fwd_sm120_fp8(
         has_block_nums=has_block_nums,
         block_sizes_mode=block_sizes_mode,
         **({"v_block_size": v_block_size} if v_block_size else {}),
-        **({"k_quant_block_size": k_quant_block_size} if sparse_block_size == 128 else {}),
+        **({"k_quant_block_size": k_quant_block_size, "tile_m": tile_m} if sparse_block_size == 128 else {}),
     )
     compile_options = getattr(fwd_kernel, "_compile_options", "")
     if has_block_nums or fixed_block_sparse_num < getattr(fwd_kernel, "_compile_min_blocks", 0):
@@ -1614,6 +1622,7 @@ def _bsa_attn_fwd_sm120_fp8(
             _get_device_arch(),
             v_block_size,
             k_quant_block_size,
+            tile_m,
             head_dim,
             has_block_nums,
             has_block_sizes,
