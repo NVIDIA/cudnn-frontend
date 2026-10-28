@@ -603,6 +603,12 @@ def _render_tile_constants(
     b_lbo, b_sbo, b_k_step, b_tma_group_elems = _smem_desc_params(chain.matmul.b_major == "n", cta_smem_n, "N")
     a_smem_m_step_bytes = (cta_smem_m // cfg.mma_size_m) * cfg.cta_tile_k_bytes
     a_mcast_slices, b_mcast_slices, ab_empty_full_mask = _mcast_slice_plan(chain, cfg)
+    gather_token_rows = 0
+    if chain.has_moe and chain.moe.mode == "gather":
+        # Plain GATHER has no token SF consumer: cache only the data slice
+        # this CTA loads, including just its own N half under swapped 2-CTA MMA.
+        gather_token_rows = cta_smem_n // b_mcast_slices if isinstance(chain.moe, MoeSwapAbSpec) else cta_smem_m // a_mcast_slices
+    gather_index_bytes = align_up(gather_token_rows * 4, 128)
 
     lines = [
         f"# Tile config: {cfg.name}",
@@ -629,6 +635,7 @@ def _render_tile_constants(
         f"a_mcast_slices = {a_mcast_slices}",
         f"a_tma_box_m = {_a_tma_box_m(cfg, a_mcast_slices)}",
         f"b_mcast_slices = {b_mcast_slices}",
+        f"gather_token_rows = {gather_token_rows}",
         f"ab_empty_full_mask = {ab_empty_full_mask}",
         f"ab_smem_swizzle = cutlass.experimental.primitives.Tcgen05SmemSwizzle.{smem_swizzle_name}",
         f"a_smem_desc_leading_byte_offset = {a_lbo}",
@@ -737,11 +744,11 @@ def _render_tile_constants(
             cast_extra_per_stage += cfg.cta_tile_m * k_elems * DTYPE_BYTES[chain.mainloop_a_load_dtype]
         if chain.mainloop_b_cast:
             cast_extra_per_stage += smem_n * k_elems * DTYPE_BYTES[chain.mainloop_b_load_dtype]
-    if smem_d_bytes > 0 or cast_extra_per_stage > 0 or mg_extra_per_stage > 0:
+    if smem_d_bytes > 0 or gather_index_bytes > 0 or cast_extra_per_stage > 0 or mg_extra_per_stage > 0:
         try:
             new_ab = cfg.max_ab_stages(
                 smem_fixed_reserve=smem_fixed_reserve,
-                extra_smem_bytes=smem_d_bytes,
+                extra_smem_bytes=smem_d_bytes + gather_index_bytes,
                 extra_per_stage_bytes=cast_extra_per_stage + mg_extra_per_stage,
             )
         except ValueError as exc:
@@ -751,7 +758,10 @@ def _render_tile_constants(
                 ) from exc
             raise
         lines.append(
-            f"ab_stages = {new_ab}  # SMEM-D {smem_d_bytes}B fixed" f" + cast LOAD {cast_extra_per_stage}B/stage" f" + multi-GEMM {mg_extra_per_stage}B/stage"
+            f"ab_stages = {new_ab}  # SMEM-D {smem_d_bytes}B fixed"
+            f" + gather indices {gather_index_bytes}B fixed"
+            f" + cast LOAD {cast_extra_per_stage}B/stage"
+            f" + multi-GEMM {mg_extra_per_stage}B/stage"
         )
     lines.extend(_quant_device_imports(chain))
     lines.extend(_mixed_cga_constants(cfg, fallback_cluster))
@@ -1136,9 +1146,12 @@ def _render_block_scale_tile_constants(
 
     epi_reserved = _smem_d_bytes(cfg, chain) if use_tma_store_epi else _combine_smem_bytes(chain, cfg)
     ab_reserved = epi_reserved + _cluster_split_k_smem_bytes(chain, cfg)
+    # A K tile can start inside a 16-byte SF window. Reserve enough aligned
+    # windows for every possible start, including non-power-of-two SF widths.
+    gather_sf_row_bytes = align_up(sf_k + 16 - math.gcd(sf_k, 16), 16)
     if chain.has_moe and chain.moe.mode == "gather":
         token_rows, token_sfs = (cta_n, real_nb) if isinstance(chain.moe, MoeSwapAbSpec) else (cta_m, real_na)
-        ab_reserved += token_rows * 32 * token_sfs
+        ab_reserved += align_up(token_rows * 4, 128) + token_sfs * align_up(token_rows * gather_sf_row_bytes, 128)
     if is_sm103:
         sf_stages = 6
         a_chunk_bytes = cta_m * 128
@@ -1362,6 +1375,7 @@ def _render_block_scale_tile_constants(
         f"block_size = {bs.block_size}",
         f"sf_cutlass_dtype = {DTYPE_TO_CUTLASS[bs.sf_dtype]}",
         f"sf_scales_per_inst = {scales_per_inst}",
+        f"gather_sf_row_bytes = {gather_sf_row_bytes}",
         f"sf_insts_per_atom = {insts_per_word}",
         f"num_sf_atoms = {num_sf_words}",
         f"word_atoms = {word_atoms}",
