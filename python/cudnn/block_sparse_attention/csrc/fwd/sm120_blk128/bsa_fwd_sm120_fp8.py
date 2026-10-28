@@ -4,8 +4,8 @@
 """Native 128x128 SM120 Sage FP8 attention, derived from the blk64 kernel.
 
 Each CTA consumes original blk128 metadata and loads complete KV128 tiles.
-FP8 fragment/softmax helpers preserve the existing per-row Q, per-16-token K,
-and per-channel V scaling contract; no blk64 attention kernel is launched.
+FP8 fragment/softmax helpers use per-row Q, per-16-token or per-token K,
+and per-channel V scaling; no blk64 attention kernel is launched.
 """
 
 import cutlass
@@ -31,6 +31,23 @@ from cudnn.block_sparse_attention.csrc.utils.batched_static_scheduler import (
 )
 
 SM120_FWD_BLOCK_SIZE = 128
+
+
+@cute.jit
+def _apply_per_token_k_scales_fp8(tSrS: cute.Tensor, tScS: cute.Tensor, gKScale: cute.Tensor, k_tile_idx: cutlass.Int32) -> cute.Tensor:
+    """Descale in place so 32 per-column scales do not stay live in registers."""
+    coordinates = layout_utils.reshape_acc_to_mn(tScS)
+    scores = layout_utils.reshape_acc_to_mn(tSrS)
+    for n in cutlass.range_constexpr(cute.size(coordinates, mode=[1])):
+        key = k_tile_idx * 128 + coordinates[0, n][1]
+        # Masked columns need a positive descale so -inf stays -inf.
+        key = key if key < gKScale.shape[0] else gKScale.shape[0] - 1
+        scale = gKScale[key]
+        for m in cutlass.range_constexpr(cute.size(scores, mode=[0])):
+            scores[m, n] *= scale
+    scales = cute.make_rmem_tensor(cute.make_layout(1), cutlass.Float32)
+    scales[0] = 1.0
+    return scales
 
 
 @dsl_user_op
@@ -191,8 +208,12 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
         has_block_nums: bool = True,
         block_sizes_mode: int = 0,
         v_block_size: int = 0,
+        k_quant_block_size: int = 16,
     ):
         assert v_block_size in (0, 128)
+        if k_quant_block_size not in (1, 16):
+            raise ValueError("k_quant_block_size must be 1 or 16")
+        self.k_quant_block_size = k_quant_block_size
         self.v_block_size = v_block_size
         if v_block_size == 0:
             self._compile_options = ""
@@ -250,7 +271,7 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
         mO: cute.Tensor,  # (seqlen_q, value_dim, nheads, batch)
         mLSE: cute.Tensor,  # (seqlen, nheads, batch)
         mQScale: cute.Tensor,  # (seqlen_q, nheads_q, batch)
-        mKScale: cute.Tensor,  # (ceil_div(seqlen_k, 16), nheads_kv, batch)
+        mKScale: cute.Tensor,  # (ceil_div(seqlen_k, k_quant_block_size), nheads_kv, batch)
         mVScale: cute.Tensor,  # (value_dim, nheads_kv)
         blocksparse_indices_q2k: cute.Tensor,  # (k, q, nheads, batch)
         blocksparse_num_blocks_q2k: cute.Tensor,  # (q, nheads, batch)
@@ -801,12 +822,10 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
                     B_uses_fp8_ldsm=True,
                 )
 
-                tKScale = _load_sage_k_scales_fp8(
-                    tScS,
-                    gKScale,
-                    n_tile_idx,
-                    self.tile_size,
-                )
+                if cutlass.const_expr(self.k_quant_block_size == 1):
+                    tKScale = _apply_per_token_k_scales_fp8(tSrS, tScS, gKScale, n_tile_idx)
+                else:
+                    tKScale = _load_sage_k_scales_fp8(tScS, gKScale, n_tile_idx, self.tile_size)
 
                 K_pipeline.consumer_release(K_consumer_state)
                 K_consumer_state.advance()

@@ -1476,9 +1476,14 @@ def _bsa_attn_fwd_sm120_fp8(
     *,
     sparse_block_size: int = 64,
     v_block_size: int = 0,
+    k_quant_block_size: int = 16,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Launch native SM120 Sage FP8 with unchanged 64- or 128-block metadata."""
     _require_sage_fp8_cutedsl()
+    if type(k_quant_block_size) is not int or k_quant_block_size not in (1, 16):
+        raise ValueError("k_quant_block_size must be 1 or 16")
+    if k_quant_block_size == 1 and sparse_block_size != 128:
+        raise NotImplementedError("per-token K scaling requires SM120 blk128")
     assert sparse_block_size in (64, 128)
     assert v_block_size in (0, 128)
     assert v_block_size == 0 or sparse_block_size == 128
@@ -1502,7 +1507,7 @@ def _bsa_attn_fwd_sm120_fp8(
     else:
         assert v_fp8.shape == k_fp8.shape
     assert q_scale.shape == (batch, num_heads, seqlen_q)
-    assert k_scale.shape == (batch, num_heads, _ceil_div_int(seqlen_k, 16))
+    assert k_scale.shape == (batch, num_heads, _ceil_div_int(seqlen_k, k_quant_block_size))
     assert v_scale.shape == (num_heads, head_dim)
 
     num_q_blocks = _ceil_div_int(seqlen_q, sparse_block_size)
@@ -1598,6 +1603,7 @@ def _bsa_attn_fwd_sm120_fp8(
         has_block_nums=has_block_nums,
         block_sizes_mode=block_sizes_mode,
         **({"v_block_size": v_block_size} if v_block_size else {}),
+        **({"k_quant_block_size": k_quant_block_size} if sparse_block_size == 128 else {}),
     )
     compile_options = getattr(fwd_kernel, "_compile_options", "")
     if has_block_nums or fixed_block_sparse_num < getattr(fwd_kernel, "_compile_min_blocks", 0):
@@ -1607,6 +1613,7 @@ def _bsa_attn_fwd_sm120_fp8(
         (
             _get_device_arch(),
             v_block_size,
+            k_quant_block_size,
             head_dim,
             has_block_nums,
             has_block_sizes,
@@ -2319,10 +2326,15 @@ def bsa_fp8_blk128_fwd(
     block_sizes: Optional[torch.Tensor] = None,
     q2k_block_nums: Optional[torch.Tensor] = None,
     kv_splits: int = 1,
+    k_quant_block_size: int = 16,
 ) -> torch.Tensor:
     """Quantize BF16 inputs and launch native SM90, SM100/SM103, or SM120 FP8 blk128."""
     arch = _get_device_arch_for_device(q.device.index)
     arch_family = arch // 10
+    if type(k_quant_block_size) is not int or k_quant_block_size not in (1, 16):
+        raise ValueError("k_quant_block_size must be 1 or 16")
+    if k_quant_block_size == 1 and arch_family != 12:
+        raise NotImplementedError("per-token K scaling requires SM120 blk128")
     if arch in (100, 103):
         _require_sm100_fp8_blk128_cutedsl()
         from cudnn.block_sparse_attention._fp8_quant import _quantize_sage_bhsd
@@ -2353,7 +2365,7 @@ def bsa_fp8_blk128_fwd(
         raise NotImplementedError("Sage FP8 native blk128 requires SM90, SM100/SM103, or SM120")
     from cudnn.block_sparse_attention._fp8_quant import _quantize_sage_bhsd
 
-    quantized = _quantize_sage_bhsd(q, k, v, v_block_size=128)
+    quantized = _quantize_sage_bhsd(q, k, v, v_block_size=128, k_quant_block_size=k_quant_block_size)
     out, _ = _bsa_attn_fwd_sm120_fp8(
         *quantized,
         q2k_block_index,
@@ -2363,6 +2375,7 @@ def bsa_fp8_blk128_fwd(
         q2k_block_nums=q2k_block_nums,
         sparse_block_size=128,
         v_block_size=128,
+        k_quant_block_size=k_quant_block_size,
     )
     return out
 

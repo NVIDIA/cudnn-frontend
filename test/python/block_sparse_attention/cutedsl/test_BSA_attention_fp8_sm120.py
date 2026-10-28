@@ -14,12 +14,19 @@ from test_utils import torch_fork_set_rng
 pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
 
-def _require_sm120():
+def _require_sm120(*, per_token=False):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("native Sage FP8 tests require SM120")
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    from cudnn.frost.buffers import cutedsl_requirement_error
+
+    error = cutedsl_requirement_error("SM120 FP8 BSA tests")
+    if error is not None:
+        pytest.skip(error)
     if interface._cutlass_dsl_version() < (4, 6, 1):
         pytest.skip("Sage FP8 requires CuTe DSL >= 4.6.1")
+    if per_token and interface._cutlass_dsl_version() < (4, 8, 0):
+        pytest.skip("Per-token SM120 FP8 BSA requires CuTe DSL >= 4.8.0")
     from cudnn import ops
 
     return ops
@@ -125,11 +132,11 @@ def test_sm120_fp8_native_forward(block_size, tail):
     assert (difference.mean() / expected.abs().mean().clamp_min(1e-8)).item() < 0.05
 
 
-def _online_fp8_reference(quantized, indices, counts, sizes, softmax_scale):
+def _online_fp8_reference(quantized, indices, counts, sizes, softmax_scale, k_quant_block_size=16):
     """Model the native KV128 online softmax including the FP8 P cast."""
     q8, k8, v8, qs, ks, vs = quantized
     q = q8.float() * qs[..., None]
-    k = k8.float() * ks.repeat_interleave(16, dim=-1)[..., : k8.shape[2], None]
+    k = k8.float() * ks.repeat_interleave(k_quant_block_size, dim=-1)[..., : k8.shape[2], None]
     v = v8.float()
     out = torch.zeros_like(q)
     lse = torch.full(q.shape[:-1], -torch.inf, device=q.device)
@@ -161,16 +168,20 @@ def _online_fp8_reference(quantized, indices, counts, sizes, softmax_scale):
 @pytest.mark.L0
 @pytest.mark.parametrize("size_rank", (1, 2, 3))
 @pytest.mark.parametrize("v_block_size", (0, 128))
+@pytest.mark.parametrize("k_quant_block_size", (1, 16))
 @torch_fork_set_rng(seed=8128)
-def test_sm120_fp8_blk128_scales_counts_and_partial_blocks(size_rank, v_block_size):
-    _require_sm120()
+def test_sm120_fp8_blk128_scales_counts_and_partial_blocks(size_rank, v_block_size, k_quant_block_size):
+    _require_sm120(per_token=k_quant_block_size == 1)
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     batch, heads, sq, sk, dim = 2, 2, 147, 531, 128
     q8 = torch.randint(-4, 5, (batch, heads, sq, dim), device="cuda").to(torch.float8_e4m3fn)
     k8 = torch.randint(-4, 5, (batch, heads, sk, dim), device="cuda").to(torch.float8_e4m3fn)
     v8 = torch.randint(-4, 5, (batch, heads, sk, dim), device="cuda").to(torch.float8_e4m3fn)
     qs = torch.rand((batch, heads, sq), device="cuda") * 0.1 + 0.01
-    ks = torch.exp2(torch.linspace(-2, 2, (sk + 15) // 16, device="cuda")).expand(batch, heads, -1).contiguous()
+    ks = torch.exp2(torch.linspace(-2, 2, (sk + k_quant_block_size - 1) // k_quant_block_size, device="cuda")).expand(batch, heads, -1).contiguous()
+    if k_quant_block_size == 1:
+        # Adjacent tokens must differ: a per-16 reader cannot pass this oracle.
+        ks[..., 1::2] *= 0.25
     vs = torch.linspace(0.125, 2, heads * dim, device="cuda").view(heads, dim)
     quantized = (q8, k8, v8, qs, ks, vs)
     indices = torch.tensor([4, 0, 2], device="cuda", dtype=torch.int32).expand(batch, heads, 2, 3).contiguous()
@@ -183,14 +194,22 @@ def test_sm120_fp8_blk128_scales_counts_and_partial_blocks(size_rank, v_block_si
         sizes = sizes[:, None].repeat(1, heads, 1)
         sizes[:, 1, 2] = 0
     expanded_sizes = sizes.expand(batch, heads, -1) if size_rank == 1 else sizes[:, None].expand(-1, heads, -1) if size_rank == 2 else sizes
-    expected, expected_lse = _online_fp8_reference(quantized, indices, counts, expanded_sizes, 0.0625)
+    expected, expected_lse = _online_fp8_reference(quantized, indices, counts, expanded_sizes, 0.0625, k_quant_block_size)
     if v_block_size:
         padded = torch.zeros((batch, heads, (sk + 127) // 128 * 128, dim), device="cuda", dtype=v8.dtype)
         padded[:, :, :sk] = v8
         v8 = padded.view(batch, heads, -1, 128, dim).transpose(-1, -2).contiguous()
         quantized = (q8, k8, v8, qs, ks, vs)
     actual, lse = interface._bsa_attn_fwd_sm120_fp8(
-        *quantized, indices, 3, 0.0625, block_sizes=sizes, q2k_block_nums=counts, sparse_block_size=128, v_block_size=v_block_size
+        *quantized,
+        indices,
+        3,
+        0.0625,
+        block_sizes=sizes,
+        q2k_block_nums=counts,
+        sparse_block_size=128,
+        v_block_size=v_block_size,
+        k_quant_block_size=k_quant_block_size,
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(actual.float(), expected, rtol=5e-3, atol=2e-3)
@@ -198,6 +217,87 @@ def test_sm120_fp8_blk128_scales_counts_and_partial_blocks(size_rank, v_block_si
     empty_rows = counts.repeat_interleave(128, dim=-1)[..., :sq] == 0
     assert torch.count_nonzero(actual[empty_rows]) == 0
     assert torch.isneginf(lse[empty_rows]).all()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("sk", (1, 147, 1024))
+@torch_fork_set_rng(seed=27128)
+def test_sm120_fp8_per_token_quantization(sk):
+    _require_sm120(per_token=True)
+    from cudnn.block_sparse_attention._fp8_quant import _quantize_sage_bhsd
+
+    q = torch.randn((2, 3, 147, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((2, 3, sk, 128), device="cuda", dtype=torch.bfloat16)
+    k[..., 1::2, :] *= 0.01
+    v = torch.randn_like(k)
+    old = _quantize_sage_bhsd(q, k, v, v_block_size=128)
+    new = _quantize_sage_bhsd(q, k, v, v_block_size=128, k_quant_block_size=1)
+    # Only K's numerical recipe changes; Q, V, and their scales stay exact.
+    for index in (0, 2, 3, 5):
+        assert torch.equal(old[index].view(torch.uint8), new[index].view(torch.uint8))
+    centered = k.float() - k.float().mean(-2, keepdim=True)
+    scale = centered.abs().amax(-1).clamp_min(1e-3) / 448.0
+    torch.testing.assert_close(new[4], scale, rtol=2e-6, atol=1e-8)
+    expected = (centered / scale[..., None]).to(torch.float8_e4m3fn)
+    actual_codes, expected_codes = new[1].float(), expected.float()
+    different = actual_codes != expected_codes
+    if different.any():
+        # FP32 chunked mean reduction can move an exact E4M3 midpoint.
+        # Prove each disagreement is one adjacent code at that midpoint;
+        # a generic FP8 relative tolerance would miss a wrong scale or row.
+        a, e = actual_codes[different], expected_codes[different]
+        midpoint = (a + e) * 0.5
+        step = torch.exp2(torch.floor(torch.log2(midpoint.abs())) - 3).clamp_min(2**-9)
+        torch.testing.assert_close((a - e).abs(), step, rtol=0, atol=0)
+        normalized = (centered / scale[..., None])[different]
+        torch.testing.assert_close(normalized, midpoint, rtol=0, atol=1e-3)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=28128)
+def test_sm120_fp8_per_token_public_api_and_replay():
+    ops = _require_sm120(per_token=True)
+    q, k, v = [torch.randn((1, 2, 257, 128), device="cuda", dtype=torch.bfloat16) * 0.5 for _ in range(3)]
+    indices = torch.tensor([2, 0, 1], device="cuda", dtype=torch.int32).expand(1, 2, 3, 3).contiguous()
+    kwargs = dict(sparse_block_size=128, k_quant_block_size=1)
+    result = ops.block_sparse_attention_fp8_forward(q, k, v, indices, **kwargs)["o_tensor"]
+    reference = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    torch.testing.assert_close(result.float(), reference.float(), rtol=0.05, atol=0.015)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            captured = ops.block_sparse_attention_fp8_forward(q, k, v, indices, **kwargs)["o_tensor"]
+        k.mul_(0.5)
+        v.mul_(-2)
+        captured.fill_(float("nan"))
+        graph.replay()
+        expected = ops.block_sparse_attention_fp8_forward(q, k, v, indices, **kwargs)["o_tensor"]
+        torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+    finally:
+        graph.reset()
+    with pytest.raises(NotImplementedError, match="SM120 blk128"):
+        ops.block_sparse_attention_fp8_forward(q, k, v, indices, k_quant_block_size=1)
+    for invalid in (0, 2, True, 1.0):
+        with pytest.raises(ValueError, match="k_quant_block_size"):
+            ops.block_sparse_attention_fp8_forward(q, k, v, indices, sparse_block_size=128, k_quant_block_size=invalid)
+
+
+@pytest.mark.L0
+def test_sm120_fp8_per_token_dsl_gate(monkeypatch):
+    ops = _require_sm120(per_token=True)
+    from cudnn.frost import buffers
+    from cudnn.block_sparse_attention import _fp8_quant
+
+    monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.7.0")))
+
+    def forbid_quantization(*args, **kwargs):
+        raise AssertionError("quantization must not run below the DSL floor")
+
+    monkeypatch.setattr(_fp8_quant, "_quantize_sage_bhsd", forbid_quantization)
+    q = torch.zeros((1, 1, 128, 128), device="cuda", dtype=torch.bfloat16)
+    indices = torch.zeros((1, 1, 1, 1), device="cuda", dtype=torch.int32)
+    with pytest.raises(RuntimeError, match=r"4\.8\.0.*4\.7\.0"):
+        ops.block_sparse_attention_fp8_forward(q, q, q, indices, sparse_block_size=128, k_quant_block_size=1)
 
 
 @pytest.mark.L0
