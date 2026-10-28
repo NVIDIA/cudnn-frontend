@@ -33,6 +33,9 @@ from ..canonical import (
     normalize_b,
     normalize_mx,
     normalize_prob,
+    raw_desc,
+    raw_fake,
+    raw_uint8_dtype,
 )
 from cuda.bindings import driver as cuda
 import math
@@ -145,6 +148,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         situ_beta1: float = 4.0,
         situ_beta2: float = 25.0,
         _deterministic: bool = False,
+        a_dtype: Optional[torch.dtype] = None,
     ):
         """Initialize the GroupedGemmDgluSm100 API.
 
@@ -163,7 +167,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         :param sample_dbias: Optional dbias output tensor (expert_cnt, 2*n, 1)
         :param num_experts: (Discrete) Number of experts
         :param b_shape: (Discrete) Shape of a single expert B tensor, e.g. (n, k)
-        :param b_dtype: (Discrete) Data type of B tensors
+        :param b_dtype: (Discrete) Data type of B tensors. Dense mode: the dtype a raw uint8 B holds
         :param sample_sfd_row: Optional row scale factor for D
         :param sample_sfd_col: Optional column scale factor for D
         :param sample_amax: Optional amax tensor for quantization, shape (expert_cnt, 2, 1)
@@ -198,6 +202,9 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             ``act_func == "dswiglu"``.
         :param situ_beta1: Compile-time gate tanh scale for dSiTU-GLU.
         :param situ_beta2: Compile-time up-branch tanh scale for dSiTU-GLU.
+        :param a_dtype: The dtype a raw uint8 A holds (float8_e4m3fn or float8_e5m2). Raw uint8
+            scale factors follow sf_vec_size: 32 is E8M0, 16 is E4M3. The kernel reads raw
+            operands as these dtypes with no host-side view.
         """
         from cudnn.tensor_adapter import detect_framework
 
@@ -255,6 +262,9 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         self.prob_desc = operand_desc(sample_prob, "sample_prob", self.canonical_prob)
         self.dprob_desc = operand_desc(sample_dprob, "sample_dprob", self.canonical_dprob)
         self.dbias_desc = self._make_tensor_desc(sample_dbias, name="sample_dbias")
+        self.raw_dtypes = {}
+        self.a_desc = raw_desc(self, "a", self.a_desc, raw_uint8_dtype(sample_a, a_dtype))
+        self.sfa_desc = raw_desc(self, "sfa", self.sfa_desc, raw_uint8_dtype(sample_sfa, sf_vec_size=sf_vec_size))
 
         self.sfd_row_desc = self._make_tensor_desc(sample_sfd_row, name="sample_sfd_row")
         self.sfd_col_desc = self._make_tensor_desc(sample_sfd_col, name="sample_sfd_col")
@@ -267,8 +277,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
 
         # ---- Mode-specific state ----
         if self.weight_mode == MoEWeightMode.DENSE:
-            self.b_desc = operand_desc(sample_b, "sample_b", self.canonical_b)
-            self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb")
+            self.b_desc = raw_desc(self, "b", operand_desc(sample_b, "sample_b", self.canonical_b), raw_uint8_dtype(sample_b, b_dtype))
+            self.sfb_desc = raw_desc(self, "sfb", self._make_tensor_desc(sample_sfb, name="sample_sfb"), raw_uint8_dtype(sample_sfb, sf_vec_size=sf_vec_size))
             self.expert_cnt = self.padded_offsets_desc.shape[0]
         else:
             self._value_error_if(num_experts == 0, "num_experts must be > 0")
@@ -370,6 +380,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                 # that internal-only type is never named outside the Rubin module.
                 **({"sf_fp8_dtype_override": self.sf_fp8_dtype_override} if self.sf_fp8_dtype_override == "e5m3" else {}),
             )
+            self._kernel_obj.raw_dtypes = self.raw_dtypes
         return self._kernel_obj
 
     def scratch_workspace_bytes(self) -> int:
@@ -1042,9 +1053,9 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         dbias_fake = self._make_fake_cute_tensor_from_desc(self.dbias_desc, assumed_align=16)
 
         compile_kwargs = dict(
-            a=canonical_mx_fake(a_cute_fake, self.canonical_a),
-            b=canonical_b_fake(b_cute_fake, self.canonical_b, self.canonical_b_n_major),
-            sfb=sfb_cute_fake,
+            a=raw_fake(self, "a", canonical_mx_fake(a_cute_fake, self.canonical_a)),
+            b=raw_fake(self, "b", canonical_b_fake(b_cute_fake, self.canonical_b, self.canonical_b_n_major)),
+            sfb=raw_fake(self, "sfb", sfb_cute_fake),
             n=cutlass.Int32(0),
             k=cutlass.Int32(0),
             b_stride_size=cutlass.Int64(0),
@@ -1053,7 +1064,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             c=canonical_mx_fake(c_cute_fake, self.canonical_c),
             d=canonical_mx_fake(d_row_cute_fake, self.canonical_d_row),
             d_col=canonical_mx_fake(d_col_cute_fake, self.canonical_d_col),
-            sfa=sfa_cute_fake,
+            sfa=raw_fake(self, "sfa", sfa_cute_fake),
             sfd_row_tensor=sfd_row_fake,
             sfd_col_tensor=sfd_col_fake,
             amax_tensor=self._make_fake_cute_tensor_from_desc(self.amax_desc, assumed_align=16),
@@ -1244,7 +1255,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
 
         self._logger.debug("Compiling discrete grouped GEMM dGLU kernel")
         compile_kwargs = dict(
-            a=canonical_mx_fake(a_tensor, self.canonical_a),
+            a=raw_fake(self, "a", canonical_mx_fake(a_tensor, self.canonical_a)),
             b=b_ptrs_cute,
             sfb=sfb_ptrs_cute,
             n=cutlass.Int32(n),
@@ -1255,7 +1266,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             c=canonical_mx_fake(c_tensor, self.canonical_c),
             d=canonical_mx_fake(d_row_tensor, self.canonical_d_row),
             d_col=canonical_mx_fake(d_col_tensor, self.canonical_d_col),
-            sfa=sfa_tensor,
+            sfa=raw_fake(self, "sfa", sfa_tensor),
             sfd_row_tensor=sfd_row_tensor,
             sfd_col_tensor=sfd_col_tensor,
             amax_tensor=amax_tensor,
