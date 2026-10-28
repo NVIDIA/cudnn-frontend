@@ -642,7 +642,8 @@ def compute_reference(config: ConvConfig, X: torch.Tensor, W: torch.Tensor,
                       Y: torch.Tensor, bias: Optional[torch.Tensor],
                       prior_output: Optional[torch.Tensor] = None,
                       *, intermediate_dtype: Optional[torch.dtype] = None,
-                      return_intermediate: Literal[False] = False) -> torch.Tensor: ...
+                      return_intermediate: Literal[False] = False) -> torch.Tensor:
+    pass
 
 
 @overload
@@ -650,7 +651,8 @@ def compute_reference(config: ConvConfig, X: torch.Tensor, W: torch.Tensor,
                       Y: torch.Tensor, bias: Optional[torch.Tensor],
                       prior_output: Optional[torch.Tensor] = None,
                       *, intermediate_dtype: Optional[torch.dtype] = None,
-                      return_intermediate: Literal[True]) -> Tuple[torch.Tensor, torch.Tensor]: ...
+                      return_intermediate: Literal[True]) -> Tuple[torch.Tensor, torch.Tensor]:
+    pass
 
 
 @overload
@@ -658,7 +660,8 @@ def compute_reference(config: ConvConfig, X: torch.Tensor, W: torch.Tensor,
                       Y: torch.Tensor, bias: Optional[torch.Tensor],
                       prior_output: Optional[torch.Tensor] = None,
                       *, intermediate_dtype: Optional[torch.dtype] = None,
-                      return_intermediate: bool) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]: ...
+                      return_intermediate: bool) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    pass
 
 
 def compute_reference(config: ConvConfig, X: torch.Tensor, W: torch.Tensor,

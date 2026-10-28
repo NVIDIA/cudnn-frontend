@@ -624,9 +624,9 @@ def test_wgrad_intermediate_rounding(dtype, materialize, fp32_edge, cudnn_handle
                 intermediate_dtype=edge_dtype,
                 intermediate_output=intermediate,
             )
+            assert success, message
         except cudnn.cudnnGraphNotSupportedError as error:
             pytest.skip(f"Unsupported convolution rounding control: {error}")
-        assert success, message
         reference, raw_reference = conv_fuzzer.compute_reference(
             config,
             X,
