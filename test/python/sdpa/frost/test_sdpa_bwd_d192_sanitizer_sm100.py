@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Tile-aligned dense D192 backward cases under Compute Sanitizer memcheck (L1)."""
+"""Tile-aligned dense D192 backward cases under Compute Sanitizer memory/sync checks (L1)."""
 
 import os
 import shutil
@@ -26,10 +26,10 @@ def _sanitizer():
     return found
 
 
-def run_under_sanitizer(timeout, files=_FILES, select=_SELECT):
-    """memcheck over a pytest selection in a child process group; the child dumps its own stack before the parent deadline."""
+def run_under_sanitizer(timeout, files=_FILES, select=_SELECT, tool="memcheck"):
+    """Run a sanitizer over a pytest selection in a child process group; the child dumps its own stack before the parent deadline."""
     child = f"import faulthandler, sys\nfaulthandler.dump_traceback_later({timeout * 0.9!r})\nimport pytest\nsys.exit(pytest.main(sys.argv[1:]))\n"
-    cmd = [_sanitizer(), "--tool", "memcheck", "--report-api-errors", "no", "--error-exitcode", "9", sys.executable, "-u", "-c", child]
+    cmd = [_sanitizer(), "--tool", tool, "--report-api-errors", "no", "--error-exitcode", "9", sys.executable, "-u", "-c", child]
     cmd += [*files, "-k", select, "-p", "no:cacheprovider", "-q"]
     env = {**os.environ, "PYTORCH_NO_CUDA_MEMORY_CACHING": "1"}
     proc = subprocess.Popen(
@@ -51,10 +51,11 @@ def run_under_sanitizer(timeout, files=_FILES, select=_SELECT):
 
 
 @requires_pre_rubin_blackwell
-def test_tile_aligned_exact_allocations_under_compute_sanitizer():
+@pytest.mark.parametrize("tool", ["memcheck", "synccheck"])
+def test_tile_aligned_exact_allocations_under_compute_sanitizer(tool):
     if _sanitizer() is None:
         pytest.skip("compute-sanitizer is not installed")
     timeout = min(900.0, 0.6 * float(os.environ.get("CUDNN_TEST_TIMEOUT", "1500")))
-    code, out, err = run_under_sanitizer(timeout)
+    code, out, err = run_under_sanitizer(timeout, tool=tool)
     assert code == 0, out[-4000:] + err[-2000:]
     assert "ERROR SUMMARY: 0 errors" in out, out[-4000:]

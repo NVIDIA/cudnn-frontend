@@ -12,7 +12,7 @@ from cutlass.base_dsl.typing import Pointer
 from cutlass.experimental import primitives as nvvm
 from cutlass.experimental.cuda import tensor_map as tmap
 
-from cudnn.frost.tile_dsl.barrier import MBarrier, PipelineState, Producer, advance, named_barrier_fence
+from cudnn.frost.tile_dsl.barrier import MBarrier, PipelineState, Producer, advance
 from cudnn.frost.tile_dsl.handles import GmemTileTma, MmaDesc, SmemTile
 from cudnn.frost.tile_dsl.mma import mma_ss, mma_ts_step
 from cudnn.frost.tile_dsl.pointwise import ffma2, fmul2, fp32_to_fp16
@@ -204,7 +204,9 @@ def _stat_publish(slab, row, group, slot, qbase, sq, scale, val):
             _view(slab, CFG.STATS + slot * 256, cutlass.Float32, CFG.N).subview(row).store(stat)
         else:
             _view(slab, CFG.DELTA + slot * 256, cutlass.Float32, CFG.N).subview(row).store(-scale * val)
-    named_barrier_fence(CFG.SOFTMAX_BARRIER, CFG.SOFTMAX_LANES)
+    # Only softmax warps participate. The experimental primitive emits the
+    # non-aligned barrier.cta.sync required inside this warp-role branch.
+    nvvm.barrier_cta_sync(barrier_id=CFG.SOFTMAX_BARRIER, thread_count=CFG.SOFTMAX_LANES)
 
 
 @cute.jit
