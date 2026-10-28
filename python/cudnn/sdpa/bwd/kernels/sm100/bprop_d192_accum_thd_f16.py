@@ -202,7 +202,6 @@ def _mma_loop(
     causal: cutlass.Constexpr[bool],
     dtype: cutlass.Constexpr,
 ):
-    _service_regs()
     score = _mma_desc(dtype, CFG.M, CFG.N, CFG.DQK)
     dpdesc = _mma_desc(dtype, CFG.M, CFG.N, CFG.DV)
     dvdesc = _mma_desc(dtype, CFG.M, CFG.DV, CFG.N, btranspose=True)
@@ -292,7 +291,6 @@ def _load_loop(
     causal: cutlass.Constexpr[bool],
     dtype: cutlass.Constexpr,
 ):
-    _service_regs()
     q_state = PipelineState.start(phase=1)
     do_state = PipelineState.start(phase=1)
     kv_state = PipelineState.start(phase=1)
@@ -360,7 +358,6 @@ def _store_loop(
     causal: cutlass.Constexpr[bool],
     dtype: cutlass.Constexpr,
 ):
-    _service_regs()
     full_state = PipelineState.start()
     out_state = PipelineState.start()
     sched_state = PipelineState.start()
@@ -435,6 +432,10 @@ def bprop_d192_accum_thd_kernel(
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
     tmem_base = tmem_slot.load()
+    # setmaxnreg is warpgroup-aligned: the four service warps must release
+    # registers at the same instruction before their individual role branches.
+    if warp >= 12:
+        _service_regs()
     if warp < 8:
         _softmax_loop(slab, bars, sched, tmem_base, lse, delta, origins, stats_origin, block, head, batch, meta, n_batch, scale, causal, dtype)
     elif warp < 12:
