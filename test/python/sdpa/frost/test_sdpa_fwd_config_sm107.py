@@ -618,7 +618,7 @@ def test_index_list_fields_are_appended_with_inert_defaults():
     index_list = ["qsa_block_topk", "qsa_block_size", "qsa_include_open_block", "qsa_list_per_sequence", "qsa_softmax_groups"]
     start = names.index("qsa_block_topk")
     assert names[start : start + 5] == index_list, "append-only: the four index-list fields + the softmax-split knob stay contiguous, in landing order"
-    # ... and the only fields after them are the small-tile / resident-bias fields that landed next, in their order.
+    # Later tuning and storage fields remain appended in their landing order.
     assert names[start + 5 :] == [
         "bias_mode",
         "kv_mask_form",
@@ -631,11 +631,13 @@ def test_index_list_fields_are_appended_with_inert_defaults():
         "softmax_wgs",
         "s_slots",
         "q_in_tmem",
+        "dtype_kv",
     ], names[start:]
     assert TemplateParams() == TemplateParams(
         qsa_block_topk=0, qsa_block_size=0, qsa_include_open_block=True, qsa_list_per_sequence=False, qsa_softmax_groups=0
     )
     d = TemplateParams()
+    assert d.dtype_kv == -1  # Inherit the Q dtype unless mixed KV is requested.
     assert (d.qsa_block_topk, d.qsa_block_size, d.qsa_include_open_block, d.qsa_list_per_sequence, d.qsa_softmax_groups) == (0, 0, True, False, 0)
 
 
@@ -754,3 +756,55 @@ def test_sparse_factory_signature_is_append_only():
     assert params[0].name == "params" and params[0].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
     assert params[1].name == "gather_warps" and params[1].kind is inspect.Parameter.KEYWORD_ONLY and params[1].default == 8
     assert params[2].name == "softmax_groups" and params[2].kind is inspect.Parameter.KEYWORD_ONLY and params[2].default == 0, "appended after gather_warps"
+
+
+@pytest.mark.parametrize("s_kv", [129, 192, 257, 2048])
+@pytest.mark.parametrize("dtype_name", ["FP8_E4M3", "FP8_E5M2"])
+def test_fp8_d64_narrow_tile_keeps_graph_defaults(s_kv, dtype_name, monkeypatch):
+    """An explicit D64 width must not opt FP8 into the half-precision tail policy."""
+    import cudnn
+    from cudnn.frost import buffers
+    from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
+    from cudnn.sdpa.fwd import engines, heuristics
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    name = "sdpa_fwd_prefill_sm107_fp8"
+    facts = SdpaGraphFacts(
+        b=1,
+        h_q=4,
+        h_kv=4,
+        s_q=128,
+        s_kv=s_kv,
+        d_qk=64,
+        d_v=64,
+        dtype=getattr(cudnn.data_type, dtype_name),
+        dtype_o=cudnn.data_type.BFLOAT16,
+        is_fp8=True,
+        causal=True,
+        device_cc=(10, 7),
+        device_sm_count=216,
+    )
+    caps = next(spec.capabilities for spec in engines.ENGINE_SPECS if spec.name == name)
+    narrow = engines.SdpaFwdKnobs(tile_m=128, tile_n=64, cga=1, split_kv=1, sched_policy=0, pack_gqa=False)
+    assert engines.mismatch(caps, facts, narrow) is None
+    for kind in ("A", "FALLBACK"):
+        plans = heuristics.recommend(kind, facts, {name: 1})
+        assert plans, kind
+        assert all(plan.knobs.tile_n == 128 for plan in plans), (kind, plans)
+
+
+@pytest.mark.parametrize("dtype", [0, 1])
+@pytest.mark.parametrize("cga", [1, 2])
+def test_fp8_narrow_tile_stays_within_per_tensor_d64(dtype, cga):
+    """The block-scaled and wider kernels retain their 128-column requirement."""
+    params = TemplateParams(dtype_qkv=dtype, dtype_o=BF16, cta_mma=cga, tile_n=64)
+    cfg, _ = c107.make_cfg_d64(params)
+    assert cfg.TILE_N == 64
+    for factory in (
+        c107.make_cfg_d128,
+        c107.make_cfg_d192,
+        c107.make_cfg_d128_mxfp8,
+        c107.make_cfg_d192_mxfp8,
+    ):
+        with pytest.raises(ValueError, match="TILE_N"):
+            factory(params)

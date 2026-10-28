@@ -1418,7 +1418,7 @@ def lower_dsl_bwd_fp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: A
 
 
 def _sm107_fp8_spec() -> EngineSpec:
-    """SM107 (Rubin) d=256 per-tensor FP8 E4M3 backward row (``sdpa_fp8_backward``;
+    """SM107 (Rubin) D256 and D192/V128 per-tensor FP8 E4M3 backward row (``sdpa_fp8_backward``;
     ``api_dsl_sm107.SdpaBwdDslSm107Fp8``).
 
     The same two-kernel chain as :func:`_sm107_spec` with the cuDNN FP8 contract:
@@ -1467,7 +1467,9 @@ def _sm107_fp8_spec() -> EngineSpec:
             zero_scale=True,
             sm_lo=_RUBIN[0],
             sm_hi=_RUBIN[1],
-            d=frozenset({256}),
+            d=frozenset({128, 192, 256}),
+            dqk_ge_dv=True,
+            declaration_check=_native_d256_head_mismatch,
             d_envelope=False,
             dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
             is_fp8=True,
@@ -1593,7 +1595,7 @@ def _sm107_mxfp8_spec() -> EngineSpec:
     )
 
 
-def _sm100_d256_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
+def _native_d256_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
     pair = (facts.d_qk, facts.d_v)
     if pair == (256, 256):
         return None
@@ -1630,7 +1632,7 @@ def _sm100_d256_spec() -> EngineSpec:
             sm_hi=106,
             d=frozenset({128, 192, 256}),
             dqk_ge_dv=True,
-            declaration_check=_sm100_d256_head_mismatch,
+            declaration_check=_native_d256_head_mismatch,
             d_envelope=False,
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             gqa=True,
@@ -1645,6 +1647,38 @@ def _sm100_d256_spec() -> EngineSpec:
             layouts=frozenset({"bshd"}),
         ),
         lower=partial(lower_dsl_bwd, api_type=_SM100_D256),
+    )
+
+
+def _sm107_d192_spec() -> EngineSpec:
+    """Native half D192x128 on SM107-119, sharing the D192 2x2 body and prepared API.
+
+    A separate row keeps the existing D256 eligibility unchanged: independent THD
+    origins and deterministic execution are qualified here for the fused dK body.
+    """
+    return EngineSpec(
+        name="sdpa_bwd_sm107_d192",
+        capabilities=Capabilities(
+            zero_scale=True,
+            sm_lo=_RUBIN[0],
+            sm_hi=_RUBIN[1],
+            d=frozenset({128, 192}),
+            dqk_ge_dv=True,
+            declaration_check=_native_d256_head_mismatch,
+            d_envelope=False,
+            dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            gqa=True,
+            deterministic=True,
+            causal=True,
+            bottom_right=True,
+            swa=True,
+            thd=True,
+            thd_declared_totals=True,
+            thd_ragged_offsets=True,
+            decode=False,  # prefill body: a 128-row q tile per iteration
+            layouts=frozenset({"bshd"}),
+        ),
+        lower=partial(lower_dsl_bwd, api_type=_SM107),
     )
 
 
@@ -1827,6 +1861,7 @@ ENGINE_SPECS = (
     _sm100_d256_spec(),
     _sm107_d512_spec(),
     _sm100_d128_spec(),
+    _sm107_d192_spec(),
 )
 
 __all__ = [

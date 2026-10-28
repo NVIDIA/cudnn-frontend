@@ -2130,3 +2130,13 @@ class TestNativeD512Fp8Split:
     test_omitted_scales = staticmethod(_scales)
 
     test_scalar_kv_tail = staticmethod(_tail)
+
+
+@requires_rubin
+class TestNativeD64Fp8Narrow:
+    """The N64 option preserves the existing per-tensor D64 graph contract."""
+
+    from sdpa_fp8_d64_narrow_sm107 import narrow_rebind_replay, narrow_standalone
+
+    test_rebind_replay = staticmethod(narrow_rebind_replay)
+    test_standalone = staticmethod(narrow_standalone)

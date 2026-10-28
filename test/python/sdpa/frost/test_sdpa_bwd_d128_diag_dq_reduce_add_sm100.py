@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from frost_test_utils import arch_known_to_the_dsl, requires_dsl
+from frost_test_utils import D128_THD_SHARED_KERNELS, arch_known_to_the_dsl, assert_kernel_record, ptx_kernel_md5s, read_kernel_record, requires_dsl
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
@@ -68,25 +68,25 @@ _PROBE = textwrap.dedent(r"""
         print("FAIL no ptx dumped into", dump, os.listdir(dump)); sys.exit(3)
     txt = open(ptxs[-1], "rb").read().decode()
     print("PTX_MD5", hashlib.md5(txt.encode()).hexdigest())
+    print("PTX_FILE", ptxs[-1])
     for key, pat in json.loads(sys.argv[5]).items():
         print("CENSUS", key, len(re.findall(pat, txt)))
     """)
 
 
+_RECORD_TOKEN = "d128_accum"
+# The main kernel of each THD host (one record row per kernel the host's chain OWNS; the grouped chain's group fold is shared with the pair
+# chain: rendered, never pinned here -- frost_test_utils.D128_THD_SHARED_KERNELS).
+_MAIN_KERNEL = {"thd": "bprop_d128_accum_thd_kernel", "grouped_thd": "bprop_d128_accum_grouped_thd_kernel"}
+
+
 def _parse_record(f):
-    """-> (dsl line or None, {host: md5})."""
-    dsl, want = None, {}
-    for ln in f.read_text().splitlines():
-        if ln.startswith("dsl="):
-            dsl = ln[len("dsl=") :].strip()
-        m = re.match(r"d128_accum sm_100a (\S+) rc=0 ptx_md5=([0-9a-f]{32})", ln)
-        if m:
-            want[m.group(1)] = m.group(2)
-    return dsl, want
+    """-> (dsl line or None, {host: {kernel: md5}}) of the per-kernel record (frost_test_utils.read_kernel_record)."""
+    return read_kernel_record(f, _RECORD_TOKEN)
 
 
-def _render(tmp_path, host, armed):
-    """Host trace-compile ONE d128 accumulation THD host for sm_100a in a fresh process -> (md5, census)."""
+def _render_kernels(tmp_path, host, armed):
+    """Host trace-compile ONE d128 accumulation THD host for sm_100a in a fresh process -> (md5, census, {kernel: md5} in entry order)."""
     if not arch_known_to_the_dsl("sm_100a"):
         pytest.skip("this cutlass-dsl has no sm_100a")
     dump = tmp_path / f"sm100a_d128_accum_{host}_{'armed' if armed else 'default'}"
@@ -98,16 +98,25 @@ def _render(tmp_path, host, armed):
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
     what = f"sm_100a trace-compile of the {host} host ({'armed' if armed else 'default'})"
     assert proc.returncode == 0, f"{what} failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
-    md5 = None
+    md5, ptx_file = None, None
     census = {}
     for ln in proc.stdout.splitlines():
         if ln.startswith("PTX_MD5 "):
             md5 = ln.split()[1]
+        elif ln.startswith("PTX_FILE "):
+            ptx_file = ln.split(" ", 1)[1]
         elif ln.startswith("CENSUS "):
             _, key, n = ln.split()
             census[key] = int(n)
-    assert md5 and set(census) == set(_CENSUS), proc.stdout[-2000:]
-    return md5, census
+    assert md5 and ptx_file and set(census) == set(_CENSUS), proc.stdout[-2000:]
+    with open(ptx_file) as f:
+        kernels = ptx_kernel_md5s(f.read())
+    return md5, census, kernels
+
+
+def _render(tmp_path, host, armed):
+    """Host trace-compile ONE d128 accumulation THD host for sm_100a in a fresh process -> (md5, census)."""
+    return _render_kernels(tmp_path, host, armed)[:2]
 
 
 def _skip_unless_recorded_dsl(dsl):
@@ -120,11 +129,14 @@ def _skip_unless_recorded_dsl(dsl):
 
 
 def test_record_is_committed_and_complete():
-    """The pin's baseline is in the tree: a DSL line and one md5 per THD host."""
+    """The pin's baseline is in the tree: a DSL line and, per THD host, one md5 per kernel the host's chain owns (its main kernel among them);
+    the shared group fold has no row (it is pinned by its own module, not by every chain that launches it)."""
     assert _RECORD.is_file(), _RECORD
     dsl, want = _parse_record(_RECORD)
     assert dsl and dsl.startswith("nvidia-cutlass-dsl "), dsl
     assert set(want) == set(_HOSTS), (sorted(want), _HOSTS)
+    for host in _HOSTS:
+        assert _MAIN_KERNEL[host] in want[host] and not set(want[host]) & set(D128_THD_SHARED_KERNELS), (host, sorted(want[host]))
 
 
 @pytest.mark.parametrize("host", _HOSTS)
@@ -133,10 +145,13 @@ def test_default_rendering_ptx_md5_is_unchanged(tmp_path, host):
     the shipped code; a kernel argument it may be, a knob, env var or runtime branch it is not)."""
     dsl, want = _parse_record(_RECORD)
     _skip_unless_recorded_dsl(dsl)
-    got, census = _render(tmp_path, host, armed=False)
-    print(f"\nSM100 d128 accum {host} default: PTX md5 {got} (pre-lever {want[host]}) census {census}")
+    got, census, kernels = _render_kernels(tmp_path, host, armed=False)
+    print(f"\nSM100 d128 accum {host} default: PTX md5 {got} census {census} kernels {kernels} (record {want.get(host)})")
     assert census["REDUCE_ADD"] == _REDUCE_ADDS_PER_Q_TILE, census
-    assert got == want[host], f"{host}: PTX md5 {got} != the pre-lever record's {want[host]} -- the default rendering changed"
+    assert _MAIN_KERNEL[host] in kernels, kernels
+    assert_kernel_record(
+        kernels, want.get(host, {}), token=_RECORD_TOKEN, variant=host, excluded=D128_THD_SHARED_KERNELS, what=f"{host}: the default rendering"
+    )
 
 
 @pytest.mark.parametrize("host", _HOSTS)

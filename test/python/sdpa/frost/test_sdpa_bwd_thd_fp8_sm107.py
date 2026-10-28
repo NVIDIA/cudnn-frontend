@@ -132,6 +132,8 @@ def _thd_fp8_case(
     device="cuda",
     oracle=True,
     external_delta=False,
+    d=_D,
+    d_v=None,
 ):
     """Packed e4m3 Q / K / V / dO (one scalar per operand over the packed live tokens), the forward's packed e4m3 O and packed
     natural-log Stats (per sequence through ``sdpa.fp8_ref.compute_ref``, O quantized ONCE at the packed amax), the twelve
@@ -150,6 +152,7 @@ def _thd_fp8_case(
     from sdpa.fp8_ref import compute_ref, compute_ref_backward
     from sdpa.helpers import get_fp8_scale_factor
 
+    d_v = d if d_v is None else d_v
     dev, b = device, len(lens_q)
     lens_q, lens_kv = [int(x) for x in lens_q], [int(x) for x in lens_kv]
     assert len(lens_kv) == b
@@ -160,28 +163,28 @@ def _thd_fp8_case(
     cu_q, cu_k = _cu(lens_q), _cu(lens_kv)
     gen = torch.Generator(device="cpu").manual_seed(seed)
 
-    def draw(n, nh):
-        return torch.randn(max(n, 1), nh, _D, generator=gen)[:n].to(dev)
+    def draw(n, nh, width):
+        return torch.randn(max(n, 1), nh, width, generator=gen)[:n].to(dev)
 
-    q32, do32, k32, v32 = draw(t_q, h), draw(t_q, h), draw(t_kv, hkv), draw(t_kv, hkv)
+    q32, do32, k32, v32 = draw(t_q, h, d), draw(t_q, h, d_v), draw(t_kv, hkv, d), draw(t_kv, hkv, d_v)
     q8, q_ds = _quant_packed(q32)
     k8, k_ds = _quant_packed(k32)
     v8, v_ds = _quant_packed(v32)
     do8, do_ds = _quant_packed(do32)
 
     def pack(live8, cap, nh):  # [1, cap, nh, D] e4m3: the live rows leading, the capacity tail NaN (poison) or zero
-        stor = torch.full((1, cap, nh, _D), float("nan") if poison else 0.0, device=dev).to(_T_E4M3)
+        stor = torch.full((1, cap, nh, live8.shape[-1]), float("nan") if poison else 0.0, device=dev).to(_T_E4M3)
         stor[0, : live8.shape[0]] = live8
         return stor
 
-    scale = 1.0 / math.sqrt(_D)
+    scale = 1.0 / math.sqrt(d)
     s_scale = get_fp8_scale_factor(1.0, _T_E4M3)  # P <= 1
     s_descale = 1.0 / s_scale
     right = 0 if causal else None
     align = (cudnn.diagonal_alignment.BOTTOM_RIGHT if bottom_right else cudnn.diagonal_alignment.TOP_LEFT) if causal else None
     # The forward, per sequence: O in fp32 (quantized below ONCE at the packed amax -- the kernel reads one descale_o), Stats in
     # natural log.  A fully masked row comes out as O = 0, LSE = -inf (the forward's contract) from the oracle itself.
-    o32 = torch.zeros(1, cap_q, h, _D, device=dev, dtype=torch.float32)
+    o32 = torch.zeros(1, cap_q, h, d_v, device=dev, dtype=torch.float32)
     lse = torch.full((1, h, cap_q), float("nan") if poison else float("-inf"), device=dev, dtype=torch.float32)
     o_amax = 0.0
     for i in range(b):
@@ -251,7 +254,7 @@ def _thd_fp8_case(
     )
     deq = dict(q=q8.float() * q_ds, k=k8.float() * k_ds, dO=do8.float() * do_ds)
     return SimpleNamespace(
-        b=b, h=h, hkv=hkv, d=_D, grad_dtype=grad_dtype, dtype=grad_dtype, scale=scale, causal=causal, bottom_right=bottom_right, window_left=window_left,
+        b=b, h=h, hkv=hkv, d=d, d_v=d_v, grad_dtype=grad_dtype, dtype=grad_dtype, scale=scale, causal=causal, bottom_right=bottom_right, window_left=window_left,
         lens_q=lens_q, lens_kv=lens_kv, cu_q=cu_q, cu_k=cu_k, t_q=t_q, t_kv=t_kv, cap_q=cap_q, cap_kv=cap_kv, live=live,
         q=q_p, k=k_p, v=v_p, o=o8, do=do_p, lse=lse, scalars=scalars, dp_scale=dp_scale, s_descale=s_descale, grad_scale=grad_scale,
         descales={name: 1.0 / s for name, s in grad_scale.items()}, refs=refs, ref_amax=dict(dQ=amax32["dQ"], dK=amax32["dK"], dV=amax32["dV"], dP=ds_amax),
@@ -354,17 +357,18 @@ def _bitwise(name, a, b):
 # --------------------------------------------------------------------------- the direct adapter surface
 
 
-def _envelope_samples(case, envelope_q=None, envelope_kv=None):
+def _envelope_samples(case, envelope_q=None, envelope_kv=None, *, d=None):
     """The adapter's SAMPLES declare the ENVELOPE (B, H, S_max, D) the way a ragged graph does; the packed buffers only show up at
     execute.  e4m3 payloads, the gradient dtype on dQ / dK / dV, contiguous fp32 Stats.  ``envelope_q`` / ``envelope_kv`` name the
     envelopes when the longest sequence would not (a batch with no query anywhere would declare S_q = 1, a decode shape no prefill
     row serves; a capacity-padded packing needs ``B * S_max >= capacity``: the adapter tightens the declared total to ``B * S_max``,
     and the standalone surface holds the packed buffers to the plan's exact capacity)."""
+    d = case.d if d is None else d
     dev, b, h, hkv = "cuda", case.b, case.h, case.hkv
     s_max_q, s_max_kv = envelope_q or max(max(case.lens_q), 1), envelope_kv or max(max(case.lens_kv), 1)
 
     def env(n, s, nh, dt):
-        return torch.empty(1, n, s, nh, _D, device=dev, dtype=dt)[0].permute(0, 2, 1, 3)
+        return torch.empty(1, n, s, nh, d, device=dev, dtype=dt)[0].permute(0, 2, 1, 3)
 
     eq, ekv = env(b, s_max_q, h, _T_E4M3), env(b, s_max_kv, hkv, _T_E4M3)
     gq, gkv = env(b, s_max_q, h, case.grad_dtype), env(b, s_max_kv, hkv, case.grad_dtype)
@@ -385,16 +389,17 @@ def _build_direct_api(case, *, token_major_stats=False, request_amax=_AMAX, enve
     env_q = max(envelope_q or max(max(case.lens_q), 1), -(-case.cap_q // case.b))
     env_kv = max(max(max(case.lens_kv), 1), -(-case.cap_kv // case.b))
     eq, ekv, gq, gkv, e_stats = _envelope_samples(case, env_q, env_kv)
+    eo, ev, _, gv, _ = _envelope_samples(case, env_q, env_kv, d=case.d_v) if case.d != case.d_v else (eq, ekv, gq, gkv, e_stats)
     api = SdpaBwdDslSm107Fp8(
         sample_q=eq,
         sample_k=ekv,
-        sample_v=ekv,
-        sample_o=eq,
-        sample_do=eq,
+        sample_v=ev,
+        sample_o=eo,
+        sample_do=eo,
         sample_stats=e_stats,
         sample_dq=gq,
         sample_dk=gkv,
-        sample_dv=gkv,
+        sample_dv=gv,
         scale_softmax=case.scale,
         is_causal=case.causal,
         causal_bottom_right=case.bottom_right,
@@ -436,6 +441,8 @@ def _run_fp8_direct(
     envelope_q=None,
     external_delta=False,
     delta=None,
+    d=_D,
+    d_v=None,
 ):
     """Build the case, drive ``SdpaBwdDslSm107Fp8(thd=True)`` directly on PACKED views over a 0xFF-poisoned workspace (NaN in every
     dtype the chain stores: a stage reading a scratch region before writing it surfaces as NaN), the gradient tails past the packed
@@ -449,15 +456,15 @@ def _run_fp8_direct(
     case = _thd_fp8_case(
         lens_q, lens_kv, h, hkv, cap_q=sum(lens_q) + pad_cap, cap_kv=sum(lens_kv) + pad_cap, poison=poison, seed=seed, causal=causal,
         bottom_right=bottom_right, window_left=window_left, grad_dtype=grad_dtype, quantize_ds=(_ds_dtype_code() == DTYPE_E4M3),
-        external_delta=bool(external_delta) and delta is None,
+        external_delta=bool(external_delta) and delta is None, d=d, d_v=d_v,
     )  # fmt: skip
     api = _build_direct_api(case, token_major_stats=token_major_stats, request_amax=request_amax, envelope_q=envelope_q, external_delta=external_delta)
     delta_t = (delta if delta is not None else case.delta_t) if external_delta else None
     view = lambda t: t.permute(0, 2, 1, 3)  # noqa: E731  [1,T,H,D] -> logical [1,H,T,D], the dense path's orientation
     fill = float("nan") if poison_outputs else 0.0
-    dq = torch.empty(1, case.cap_q, case.h, _D, device=dev, dtype=grad_dtype)
-    dk = torch.empty(1, case.cap_kv, case.hkv, _D, device=dev, dtype=grad_dtype)
-    dv = torch.empty(1, case.cap_kv, case.hkv, _D, device=dev, dtype=grad_dtype)
+    dq = torch.empty(1, case.cap_q, case.h, case.d, device=dev, dtype=grad_dtype)
+    dk = torch.empty(1, case.cap_kv, case.hkv, case.d, device=dev, dtype=grad_dtype)
+    dv = torch.empty(1, case.cap_kv, case.hkv, case.d_v, device=dev, dtype=grad_dtype)
     # TRANSPOSED, not reshaped: lse is head-major [1, H, T]; a reshape to (T, H) would reinterpret the memory.  The compact
     # token-major form holds exactly the plan's packed capacity of rows (a leading-dim slice stays contiguous).
     stats = case.lse[0].transpose(0, 1).contiguous()[: api._t_q_cap] if token_major_stats else case.lse
@@ -1003,7 +1010,7 @@ def test_prepared_thd_fp8_standalone_switches_length_and_prefix_form(token_major
 
 @requires_rubin
 @pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
-def test_prepared_thd_fp8_rebind_lengths_and_replay(causal, monkeypatch):
+def test_prepared_thd_fp8_rebind_lengths_and_replay(causal, monkeypatch, d=_D, d_v=None):
     """The prepared THD plan rebinds new buffers AND new lengths (every length fact is a device value) without rebuilding tensor
     operands, allocating, synchronizing or compiling, and replays under CUDA-graph capture with changed lengths and data.  GQA
     with a padded capacity: the bounded fold must stop at every rebound live total."""
@@ -1011,7 +1018,7 @@ def test_prepared_thd_fp8_rebind_lengths_and_replay(causal, monkeypatch):
 
     from cudnn.sdpa.bwd.api_dsl import WorkspaceCarver
 
-    first = _run_fp8_direct((129, 97, 63), (143, 83, 79), h=4, hkv=2, poison=True, pad_cap=64, causal=causal)
+    first = _run_fp8_direct((129, 97, 63), (143, 83, 79), h=4, hkv=2, poison=True, pad_cap=64, causal=causal, d=d, d_v=d_v)
     api, cap_q, cap_kv = first.api, first.case.cap_q, first.case.cap_kv
     grads = dict(dq=first.dq, dk=first.dk, dv=first.dv)
     buffers = dict(q=first.case.q, k=first.case.k, v=first.case.v, o=first.case.o, do=first.case.do, lse=first.case.lse)
@@ -1022,7 +1029,7 @@ def test_prepared_thd_fp8_rebind_lengths_and_replay(causal, monkeypatch):
 
     def load(lens_q, lens_kv):
         """A NEW case into the SAME buffers (copies, no new operands) with the same packed capacities and the first case's scalars."""
-        case = _thd_fp8_case(lens_q, lens_kv, 4, 2, cap_q=cap_q, cap_kv=cap_kv, poison=True, causal=causal, quantize_ds=first.case.quantize_ds)
+        case = _thd_fp8_case(lens_q, lens_kv, 4, 2, cap_q=cap_q, cap_kv=cap_kv, poison=True, causal=causal, quantize_ds=first.case.quantize_ds, d=d, d_v=d_v)
         for name in ("q", "k", "v", "o", "do", "lse"):
             buffers[name].copy_(getattr(case, name))
         for name, value in case.scalars.items():
@@ -1133,22 +1140,28 @@ def _build_thd_fp8_graph(case, *, stats_layout="head_major", declare_totals=True
     s_max_q, s_max_kv = envelope_q or max(max(case.lens_q), 1), max(max(case.lens_kv), 1)
     st_q = [s_max_q * h * d, d, h * d, 1]
     st_kv = [s_max_kv * hkv * d, d, hkv * d, 1]
+    dv = case.d_v
+    st_o = [s_max_q * h * dv, dv, h * dv, 1]
+    st_v = [s_max_kv * hkv * dv, dv, hkv * dv, 1]
     g = cudnn.pygraph(io_data_type=_FP8, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     ro_q_t = (torch.tensor(case.cu_q, dtype=torch.int64, device=dev) * (h * d)).view(b + 1, 1, 1, 1)
     ro_k_t = (torch.tensor(case.cu_k, dtype=torch.int64, device=dev) * (hkv * d)).view(b + 1, 1, 1, 1)
+    ro_o_t = (torch.tensor(case.cu_q, dtype=torch.int64, device=dev) * (h * dv)).view(b + 1, 1, 1, 1)
+    ro_v_t = (torch.tensor(case.cu_k, dtype=torch.int64, device=dev) * (hkv * dv)).view(b + 1, 1, 1, 1)
     vp, t = {}, {}
 
-    def _ragged(name, s_max, stride, nh, ro_t):
-        x = g.tensor(name=name, dim=[b, nh, s_max, d], stride=stride, data_type=_FP8)
+    def _ragged(name, s_max, stride, nh, ro_t, width):
+        x = g.tensor(name=name, dim=[b, nh, s_max, width], stride=stride, data_type=_FP8)
         ro = g.tensor(name=f"{name}_ro", dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64)
         x.set_ragged_offset(ro)
         vp[ro] = ro_t
         return x
 
-    for n in ("q", "o", "dO"):
-        t[n] = _ragged(n, s_max_q, st_q, h, ro_q_t)
-    for n in ("k", "v"):
-        t[n] = _ragged(n, s_max_kv, st_kv, hkv, ro_k_t)
+    t["q"] = _ragged("q", s_max_q, st_q, h, ro_q_t, d)
+    for n in ("o", "dO"):
+        t[n] = _ragged(n, s_max_q, st_o, h, ro_o_t, dv)
+    t["k"] = _ragged("k", s_max_kv, st_kv, hkv, ro_k_t, d)
+    t["v"] = _ragged("v", s_max_kv, st_v, hkv, ro_v_t, dv)
     t_cap = max(64, -(-case.cap_q // 64) * 64)
     if stats_layout == "head_major":
         stats_stride = [h * t_cap, t_cap, 1, 1]
@@ -1177,8 +1190,12 @@ def _build_thd_fp8_graph(case, *, stats_layout="head_major", declare_totals=True
     kw.update(sdpa_kwargs)
     outs = g.sdpa_fp8_backward(**{k: t[k] for k in ("q", "k", "v", "o", "dO", *_SCALARS)}, stats=st, **kw)
     t.update(zip(("dQ", "dK", "dV") + _AMAX, outs))
-    for name, s_max, stride, nh, ro_t in (("dQ", s_max_q, st_q, h, ro_q_t), ("dK", s_max_kv, st_kv, hkv, ro_k_t), ("dV", s_max_kv, st_kv, hkv, ro_k_t)):
-        t[name].set_output(True).set_data_type(grad).set_dim([b, nh, s_max, d]).set_stride(stride)
+    for name, s_max, stride, nh, ro_t, width in (
+        ("dQ", s_max_q, st_q, h, ro_q_t, d),
+        ("dK", s_max_kv, st_kv, hkv, ro_k_t, d),
+        ("dV", s_max_kv, st_v, hkv, ro_v_t, dv),
+    ):
+        t[name].set_output(True).set_data_type(grad).set_dim([b, nh, s_max, width]).set_stride(stride)
         ro = g.tensor(name=f"{name}_ro", dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64)
         t[name].set_ragged_offset(ro)
         vp[ro] = ro_t
@@ -1191,7 +1208,21 @@ def _build_thd_fp8_graph(case, *, stats_layout="head_major", declare_totals=True
 
 
 def _run_fp8_graph(
-    lens_q, lens_kv, *, h=2, hkv=None, stats_layout="head_major", poison=False, pad_cap=0, poison_outputs=False, runs=1, grad_dtype=_T_E4M3, check=None, **kw
+    lens_q,
+    lens_kv,
+    *,
+    h=2,
+    hkv=None,
+    stats_layout="head_major",
+    poison=False,
+    pad_cap=0,
+    poison_outputs=False,
+    runs=1,
+    grad_dtype=_T_E4M3,
+    check=None,
+    d=_D,
+    d_v=None,
+    **kw,
 ):
     """Build the ragged fp8 graph, PIN the engine, execute, compare per sequence.  Skips, naming the attribute, while the fp8
     backward node cannot declare its packed totals (the row's ``thd_declared_totals`` makes a graph without them a typed decline)."""
@@ -1202,7 +1233,7 @@ def _run_fp8_graph(
     case = _thd_fp8_case(
         lens_q, lens_kv, h, hkv, cap_q=sum(lens_q) + pad_cap, cap_kv=sum(lens_kv) + pad_cap, poison=poison,
         causal=bool(kw.get("use_causal_mask") or kw.get("use_causal_mask_bottom_right")), bottom_right=bool(kw.get("use_causal_mask_bottom_right")),
-        window_left=kw.get("left_bound"), grad_dtype=grad_dtype, quantize_ds=(_ds_dtype_code() == DTYPE_E4M3),
+        window_left=kw.get("left_bound"), grad_dtype=grad_dtype, quantize_ds=(_ds_dtype_code() == DTYPE_E4M3), d=d, d_v=d_v,
     )  # fmt: skip
     g, vp, t = _build_thd_fp8_graph(case, stats_layout=stats_layout, **kw)
     g.validate()
@@ -1214,8 +1245,9 @@ def _run_fp8_graph(
     g.build_plans()
     fill = float("nan") if poison_outputs else 0.0
     dev = "cuda"
-    dq = torch.empty(1, case.cap_q, case.h, _D, device=dev, dtype=grad_dtype)
-    dk, dv = (torch.empty(1, case.cap_kv, case.hkv, _D, device=dev, dtype=grad_dtype) for _ in range(2))
+    dq = torch.empty(1, case.cap_q, case.h, case.d, device=dev, dtype=grad_dtype)
+    dk = torch.empty(1, case.cap_kv, case.hkv, case.d, device=dev, dtype=grad_dtype)
+    dv = torch.empty(1, case.cap_kv, case.hkv, case.d_v, device=dev, dtype=grad_dtype)
     amax_t = {name: torch.full((1, 1, 1, 1), float("nan"), device=dev, dtype=torch.float32) for name in _AMAX}
     vp.update({t["dQ"]: dq, t["dK"]: dk, t["dV"]: dv})
     vp.update({t[name]: amax_t[name] for name in _AMAX})
@@ -1236,7 +1268,7 @@ def _run_fp8_graph(
     _assert_tails_untouched(case, dq, dk, dv)
     amax = {name[len("amax_") :]: a.item() for name, a in amax_t.items()}
     (check or _check_fp8)(case, dq, dk, dv, amax)
-    return SimpleNamespace(case=case, dq=dq, dk=dk, dv=dv, amax=amax, outs=outs, graph=g)
+    return SimpleNamespace(case=case, dq=dq, dk=dk, dv=dv, amax=amax, outs=outs, graph=g, pack=vp, ports=t, workspace=ws)
 
 
 @requires_rubin
@@ -1610,3 +1642,59 @@ def test_reject_thd_fp8_conjunctions_the_row_declines(monkeypatch):
     facts = ga.analyze(g)
     reason = mismatch(_spec().capabilities, facts)
     assert reason is not None and "ragged" in reason
+
+
+@requires_rubin
+@pytest.mark.parametrize("grad_dtype", [_T_E4M3, torch.bfloat16, torch.float16], ids=["e4m3", "bf16", "fp16"])
+@pytest.mark.parametrize("token_major", [False, True], ids=["head_major", "token_major"])
+def test_native_d192_thd_fp8_backward(ds_knob, grad_dtype, token_major):
+    """Native unequal head widths preserve packed tails, empty sequences, both Stats layouts and all gradient dtypes."""
+    run = _run_fp8_direct(
+        (129, 0, 63),
+        (193, 65, 0),
+        h=4,
+        hkv=2,
+        d=192,
+        d_v=128,
+        token_major_stats=token_major,
+        causal=True,
+        bottom_right=True,
+        poison=True,
+        pad_cap=37,
+        poison_outputs=True,
+        grad_dtype=grad_dtype,
+        runs=2,
+    )
+    for first, second in zip(*run.outs):
+        _bitwise("repeated native D192 output", first, second)
+
+
+@requires_rubin
+@pytest.mark.parametrize("causal", [False, True])
+def test_native_d192_thd_fp8_rebind_lengths_and_replay(ds_knob, causal, monkeypatch):
+    """Reuse the existing strict THD lifecycle detector at the new native geometry."""
+    test_prepared_thd_fp8_rebind_lengths_and_replay(causal, monkeypatch, d=192, d_v=128)
+
+
+@requires_rubin
+@pytest.mark.parametrize("grad_dtype", [_T_E4M3, torch.bfloat16, torch.float16], ids=["e4m3", "bf16", "fp16"])
+@pytest.mark.parametrize("stats_layout", ["head_major", "token_major"])
+def test_native_d192_thd_fp8_graph_rebind_and_replay(ds_knob, grad_dtype, stats_layout, cudnn_handle):
+    from test_sdpa_bwd_fp8_sm107 import _check_fp8_graph_rebind_and_zero_do
+
+    run = _run_fp8_graph(
+        (129, 0, 63),
+        (193, 65, 0),
+        h=4,
+        hkv=2,
+        d=192,
+        d_v=128,
+        stats_layout=stats_layout,
+        grad_dtype=grad_dtype,
+        use_causal_mask_bottom_right=True,
+        poison=True,
+        poison_outputs=True,
+        pad_cap=37,
+    )
+    live = {"dQ": (slice(None), slice(0, run.case.t_q)), "dK": (slice(None), slice(0, run.case.t_kv)), "dV": (slice(None), slice(0, run.case.t_kv))}
+    _check_fp8_graph_rebind_and_zero_do(run.graph, run.pack, run.workspace, run.ports, cudnn_handle, live)

@@ -252,3 +252,61 @@ def build_paged_split_q_maps(
 
 
 build_paged_split_q_maps.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
+@cute.kernel
+def build_split_load_maps(
+    tensors,
+    q_desc: cutlass.GridConstant[tmap.TensorMap],
+    k_desc: cutlass.GridConstant[tmap.TensorMap],
+    v_desc: cutlass.GridConstant[tmap.TensorMap],
+    maps,
+    origins,
+    offsets,
+    specs: cutlass.Constexpr,
+    meta_t,
+    batch: cutlass.Int32,
+):
+    """Keep packed split partials compact while Q/K/V use independent origins.
+
+    The preceding split setup owns lengths, scheduling and partial-O maps.
+    Final O/Stats offsets are consumed by the packed combine, not these maps.
+    """
+    tid = cutlass.Int32(cute.arch.thread_idx()[0])
+    origin = cutlass.make_array_view(origins)
+    meta = cutlass.make_array_view(meta_t)
+    descs = (q_desc, k_desc, v_desc)
+    for b in cutlass.range(tid, batch, THD_SETUP_THREADS, unroll=1):
+        for port in cutlass.range_constexpr(3):
+            if cutlass.const_expr(specs[port] is not None):
+                offset = cutlass.Int64(cutlass.make_array_view(offsets[port])[b])
+                origin[port, b] = offset * cutlass.Int64(specs[port][1]) // cutlass.Int64(tensors[port].stride[1])
+            else:
+                prefix = batch if cutlass.const_expr(port == 0) else 2 * batch + 1
+                origin[port, b] = cutlass.Int64(meta[prefix + b])
+    cute.arch.barrier()
+    if nvvm.elect_sync():
+        warp = tid // 32
+        for port in cutlass.range_constexpr(3):
+            # Reuse the four-map layout; slot 0 remains the compact partial O.
+            if warp % 4 == port + 1:
+                prefix = batch if cutlass.const_expr(port == 0) else 2 * batch + 1
+                emit_seq_descs(
+                    descs[port],
+                    maps,
+                    meta,
+                    prefix,
+                    tensors[port],
+                    batch,
+                    cutlass.Int64(tensors[port].stride[1]),
+                    2,
+                    slot_base=(port + 1) * (batch + 1),
+                    first_batch=warp // 4,
+                    batch_step=cutlass.Int32(THD_SETUP_THREADS // 32 // 4),
+                    origins=origins,
+                    origin_row=port,
+                )
+        nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+
+
+build_split_load_maps.set_name_prefix("cudnn", remove_cutlass_symbol=True)

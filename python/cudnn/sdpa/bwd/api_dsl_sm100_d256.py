@@ -24,13 +24,17 @@ EXPLICITLY here -- ``api_dsl_sm107._stage3_cgrp_tile_mn`` keys on the Rubin line
 stage-3 granularity comes from the 2x2 config's ``kv_pad_rows_2x2`` (the pair, NOT the 128-row block). D192 uses a
 single-CTA (128, 192) tile; D256 retains the (256, 256) pair. Both M tiles fit within one workspace write pair.
 
+Native D192 folds dK into the main kernel, alongside dV; only dQ uses stage 3.
+The main kernel reuses dS in shared memory for dK and loads Q through its
+transposed tensor map on the existing store warp. THD uses the same fusion,
+with independent per-port origins and caller-owned descriptor scratch reused
+by dQ after main completes. The D256 chain retains both stage-3 GEMMs.
+
 Codegen: ``--gpu-arch sm_{sm}a`` of the device the plan is built for (100 / 103; ``prepared_host._check_target`` admits
 SM100-SM119 for the half chain), descriptor version 0.
 """
 
 from __future__ import annotations
-
-from dataclasses import asdict
 
 import torch
 
@@ -61,11 +65,6 @@ class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
     # The half row serves per-batch kv lengths on its standalone surface (its body reads ``seq_kv_lens[b]`` under the
     # padded-mask arm); the 2x2 body's padded arm has not run, so this row keeps the decline (a typed error below).
     _PER_BATCH_KV_LENS = False
-
-    def _check_head_dims(self) -> None:
-        if (self.head_dim_qk, self.head_dim_v) == (192, 128):
-            return
-        super()._check_head_dims()
 
     def _allow_head_subgroups(self) -> bool:
         """The dense BF16 chain folds global dK/dV partials after all head chunks.
@@ -113,12 +112,6 @@ class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
         """Profile 1 (one 64-row sub-block per CTA, 128-row kv block, 227 KiB, descriptor version 0) -- NOT the Rubin twin
         constant ``BWD_D256_2X2``: this row has no 4x1 body to fall back to."""
         return _cfg2x2.PROFILE_SM100
-
-    def _template_params(self):
-        params = super()._template_params()
-        if (self.head_dim_qk, self.head_dim_v) == (192, 128):
-            return _cfg2x2.TemplateParams2x2(**asdict(params), head_dim_qk=192, head_dim_v=128)
-        return params
 
     def _kernel_file(self) -> str:
         return _2X2_KERNEL_FILE

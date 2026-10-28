@@ -314,7 +314,7 @@ def compile_plan(api, main, mm_dk, mm_dq):
     )
     entry = compile_host_f16(
         main._host,
-        mm_dk._host,
+        None if getattr(main.CFG, "FUSE_DK", False) else mm_dk._host,
         mm_dq._host,
         config,
         geometry,
@@ -462,7 +462,7 @@ def compile_plan_thd(api, main, mm_dk, mm_dq):
     extra = dict(origin_specs=api._thd_origins, origin_dtypes=api._thd_origin_dtypes) if origins else {}
     entry = compile_host_f16_thd(
         main._host_origins if origins else main._host,
-        mm_dk._host_chain if origins else mm_dk._host,
+        None if getattr(main.CFG, "FUSE_DK", False) else (mm_dk._host_chain if origins else mm_dk._host),
         mm_dq._host_chain if origins else mm_dq._host,
         config,
         geometry,

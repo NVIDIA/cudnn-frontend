@@ -1,6 +1,15 @@
-# sm_100a PTX md5 of the d128 accumulation THD hosts (prepared_d128_thd_host / prepared_d128_grouped_thd_host.compile_host)
-# rendered from the tree BEFORE the diag_delete_dq_reduce_add lever landed (develop fc472d3d; host trace-compile, no device;
-# the probe geometry is in test_sdpa_bwd_d128_diag_dq_reduce_add_sm100.py).  Re-render deliberately on a protocol change.
+# sm_100a PTX md5 PER KERNEL of the d128 accumulation THD hosts' DEFAULT renderings (prepared_d128_thd_host / prepared_d128_grouped_thd_host
+# .compile_host with every typed field unset; host trace-compile, no device; the probe geometry is in test_sdpa_bwd_d128_diag_dq_reduce_add_sm100.py).
+# One row per kernel each chain OWNS: the md5 of that kernel's `.entry` region of the dumped module (frost_test_utils.ptx_kernel_md5s), so a row
+# moves only when the kernel it names changes.  The grouped chain's dK / dV group fold dkv_reduce_thd_origins_kernel is launched by the pair
+# chain too and is EXCLUDED here (frost_test_utils.D128_THD_SHARED_KERNELS): its change in #1925 moved the previous chain-wide md5 while no
+# kernel of this chain changed.  Re-render deliberately on a protocol change and say so here.
 dsl=nvidia-cutlass-dsl 4.8.1
-d128_accum sm_100a thd rc=0 ptx_md5=0b0bbfa815cfcc9c1cc7a759cc9b43bd
-d128_accum sm_100a grouped_thd rc=0 ptx_md5=a8149f92270ebd4fef3caf5b05668256
+d128_accum sm_100a thd kernel=setup_thd_d128_kernel rc=0 ptx_md5=f235b51a4a6f314b1979a56cfd68d4db
+d128_accum sm_100a thd kernel=delta_zero_thd_d128_kernel rc=0 ptx_md5=211ea85050a56f892cbbeb2570aba86a
+d128_accum sm_100a thd kernel=bprop_d128_accum_thd_kernel rc=0 ptx_md5=d8fd44925e7a459359a1a1e95cd4b51b
+d128_accum sm_100a thd kernel=cast_dq_thd_d128_kernel rc=0 ptx_md5=aebabbc7c9b76b7448e8dd4ec91ede6f
+d128_accum sm_100a grouped_thd kernel=setup_thd_d128_kernel rc=0 ptx_md5=280ebd0a971ea4462b76c295d43b83e6
+d128_accum sm_100a grouped_thd kernel=delta_zero_thd_d128_kernel rc=0 ptx_md5=48b5065063d2aba0eff1d94fb6007bfd
+d128_accum sm_100a grouped_thd kernel=bprop_d128_accum_grouped_thd_kernel rc=0 ptx_md5=0b91ee3ebb99242527ab5d0bf9204adc
+d128_accum sm_100a grouped_thd kernel=cast_dq_thd_d128_kernel rc=0 ptx_md5=b0627678c40990e74b74b4981df13f0a

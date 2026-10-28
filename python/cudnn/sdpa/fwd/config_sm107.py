@@ -500,6 +500,8 @@ def sm107_f16_tile_width(d_qk: int, d_v: int, *, leg: Optional[str] = None, cga:
 # 128; 256 is refused by _validate_tile_n at two sub-tiles (2 x 256 S columns + the O slots + STATS exceed the 576-column TMEM).
 # The engine row's per-shape knob domain (Capabilities.tile_ns_by_d_shape) and the adapter's check_support read this ONE constant.
 SM107_TILE_NS_BY_D_SHAPE = (((32, 32), frozenset({64, 128})), ((64, 64), frozenset({64, 128})))
+# Per-tensor D64 uses the scalar FP8 P path; its MMA and row-sum tiles also render N64.
+SM107_FP8_TILE_NS_BY_D_SHAPE = (((64, 64), frozenset({64, 128})),)
 # The KV tile width an fp32 ADDITIVE kv_mask vector TOGETHER WITH a bias is served at on the small tiles: 64, and only 64.  The
 # 128-wide rendering of that pair spills on the softmax role (MEASURED, sm_107a, cutlass-dsl 4.8.0: STL / LDL 23 / 27 causal, 15 / 15
 # padded, 16 / 16 at d64 cga2 -- the sixteen 16-byte granules of a 64-column fp32 chunk are 64 registers beside the second chunk's
@@ -1639,6 +1641,8 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     kernels (per-tensor FP8 and MXFP8) do; the d192xd128 siblings share the d128
     config family but accept DTYPE_O 0..3 only, so a flavor-name test
     ("d128" in flavor) would let them through to a specialization error."""
+    if k.dtype_kv != -1 and not (flavor == "sm107 d128" and k.dtype_qkv in (_DTYPE_BF16, _DTYPE_FP16) and k.dtype_kv in (_DTYPE_E4M3, _DTYPE_E5M2)):
+        raise ValueError(f"{flavor}: independent FP8 KV storage requires the native SM107 half-input D128 pipeline")
     if k.decode_q_tile:
         # The loader routes a decode_q_tile record to sm107/decode_d256_f16.py
         # (make_cfg_d256_decode at the end of this module); a Rubin prefill template
@@ -1919,6 +1923,7 @@ class CfgD128(_CfgSm107):
     """d_qk = d_v = 128 (the classic 2-warpgroup pipeline)."""
 
     QO_ALIAS: int = 0
+    DTYPE_KV: int = -1
 
 
 @dataclass(frozen=True)
@@ -2010,7 +2015,8 @@ def _validate_dtype_k_step(cfg, flavor: str) -> None:
 def _validate_smem(cfg, flavor: str, *, qo_alias: bool, sf_bytes: int = 0, bias_bytes: int = 0) -> None:
     """The SMEM fit against the Rubin budget (``config_d128_family.validate_smem`` at ``SM107_ARCH``: 320 KiB usable minus the 2 KiB fixed
     overhead; ``sf_bytes`` / ``bias_bytes`` named in the message)."""
-    _validate_smem_shared(cfg, flavor, arch=SM107_ARCH, qo_alias=qo_alias, sf_bytes=sf_bytes, bias_bytes=bias_bytes)
+    kv_copy_bytes = (max(cfg.TILE_N * cfg.TILE_K, cfg.TILE_N * cfg.TILE_O) // cfg.CTA_MMA) if getattr(cfg, "DTYPE_KV", -1) in (_DTYPE_E4M3, _DTYPE_E5M2) else 0
+    _validate_smem_shared(cfg, flavor, arch=SM107_ARCH, qo_alias=qo_alias, sf_bytes=sf_bytes, bias_bytes=bias_bytes, kv_copy_bytes=kv_copy_bytes)
 
 
 def _validate_masks(cfg, flavor: str) -> None:
@@ -2144,12 +2150,15 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
     dtype_o = resolve_dtype_o(params)
     b, b_o = bpe(params.dtype_qkv), bpe(dtype_o)
     o_div = o_pack_div(dtype_o)
-    # TILE_N is a Cfg field (TemplateParams.tile_n): the quantized siblings keep 128 (their SF geometry is tied to the 128-column
+    # TILE_N is a Cfg field (TemplateParams.tile_n): the block-scaled siblings keep 128 (their SF geometry is tied to the 128-column
     # tile), the f16/bf16 small tiles take 64 / 128 (SM107_TILE_NS_BY_D_SHAPE; the 64-wide rendering is trace-compiled and served
     # through the TILE_N knob), and the half D128 rendering takes 64 / 128; 256 is refused by _validate_tile_n.
     tile_n = int(getattr(params, "tile_n", 128))
-    if tile_n != 128 and (params.dtype_qkv <= _DTYPE_E5M2 or tile_k > 128 or (tile_k == 128 and tile_n != 64)):
-        raise ValueError(f"{flavor}: TILE_N = {tile_n} requires a supported half-precision width: D128 permits 64/128; quantized renderings keep 128")
+    pertensor_tile_n = not mxfp8 and params.dtype_qkv <= _DTYPE_E5M2 and tile_n in dict(SM107_FP8_TILE_NS_BY_D_SHAPE).get((tile_k, tile_o), ())
+    if tile_n != 128 and (params.dtype_qkv <= _DTYPE_E5M2 or tile_k > 128 or (tile_k == 128 and tile_n != 64)) and not pertensor_tile_n:
+        raise ValueError(
+            f"{flavor}: TILE_N = {tile_n} requires a supported half-precision width: D128 half and per-tensor FP8 D64 permit 64/128; other quantized renderings keep 128"
+        )
     # The S / P slot count (TemplateParams.s_slots, appended; getattr so a record without the field renders one slot): 2 = the
     # double-buffered S of the f16/bf16 small tiles at TILE_N 64 -- _validate_tile_n pins the couplings (the TMEM fit, the width, the dtype).
     s_slots = int(getattr(params, "s_slots", 1))
@@ -2288,6 +2297,7 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
         TILE_K=tile_k,
         TILE_O=tile_o,
         DTYPE_QKV=params.dtype_qkv,
+        DTYPE_KV=params.dtype_kv,
         DTYPE_O=dtype_o,
         BPE=b,
         BPE_O=b_o,

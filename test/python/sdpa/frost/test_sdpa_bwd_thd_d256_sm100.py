@@ -126,12 +126,12 @@ def snapshots(p):
     return {port: p["data"][port].clone() for port in ("q", "k", "v", "o", "do", "stats")}
 
 
-def make_adapter(p, token_major, deterministic=False):
+def make_adapter(p, token_major, deterministic=False, api_type=SdpaBwdDslSm100D256):
     c = p["c"]
     eq, ek, es = checks._envelope_samples(c)
     eo = torch.empty(c.b, eq.shape[2], c.h, c.d_v, device=eq.device, dtype=c.dtype).permute(0, 2, 1, 3)
     ev = torch.empty(c.b, ek.shape[2], c.hkv, c.d_v, device=ek.device, dtype=c.dtype).permute(0, 2, 1, 3)
-    api = SdpaBwdDslSm100D256(
+    api = api_type(
         sample_q=eq,
         sample_k=ek,
         sample_v=ev,
@@ -157,7 +157,7 @@ def make_adapter(p, token_major, deterministic=False):
     return api
 
 
-def make_graph(p, token_major, cudnn_handle=None, deterministic=False):
+def make_graph(p, token_major, cudnn_handle=None, deterministic=False, engine=_ENGINE):
     c = p["c"]
     io = cudnn.data_type.HALF if c.dtype == torch.float16 else cudnn.data_type.BFLOAT16
     g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, handle=cudnn_handle)
@@ -213,8 +213,8 @@ def make_graph(p, token_major, cudnn_handle=None, deterministic=False):
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    idx = checks._plan_index(g, _ENGINE)
-    assert idx is not None, f"{_ENGINE} missing: {[g.get_plan_name_at_index(i) for i in range(g.get_execution_plan_count())]}"
+    idx = checks._plan_index(g, engine)
+    assert idx is not None, f"{engine} missing: {[g.get_plan_name_at_index(i) for i in range(g.get_execution_plan_count())]}"
     g.select_plan(idx)
     g.check_support()
     g.build_plans()
@@ -257,7 +257,20 @@ def test_origins_rebind_and_replay(monkeypatch, dt, token_major, surface):
     check_origins_rebind_and_replay(monkeypatch, dt, token_major, surface)
 
 
-def check_origins_rebind_and_replay(monkeypatch, dt, token_major, surface, *, d=256, d_v=256, physical_origins=True, cudnn_handle=None, deterministic=False):
+def check_origins_rebind_and_replay(
+    monkeypatch,
+    dt,
+    token_major,
+    surface,
+    *,
+    d=256,
+    d_v=256,
+    physical_origins=True,
+    cudnn_handle=None,
+    deterministic=False,
+    api_type=SdpaBwdDslSm100D256,
+    engine=_ENGINE,
+):
     import cutlass.cute as cute
     from functools import partial
 
@@ -265,15 +278,15 @@ def check_origins_rebind_and_replay(monkeypatch, dt, token_major, surface, *, d=
 
     # Force two complete GQA groups through reused scratch to expose cross-chunk
     # addressing. The production workspace policy is not under test here.
-    monkeypatch.setattr(SdpaBwdDslSm100D256, "_ws_budget_bytes", lambda self: 1 << 20)
+    monkeypatch.setattr(api_type, "_ws_budget_bytes", lambda self: 1 << 20)
     p = payload(dt, token_major, (257, 93, 128), (383, 129, 267), 0, False)
     if surface == "standalone":
-        plan = make_adapter(p, token_major, deterministic=deterministic)
+        plan = make_adapter(p, token_major, deterministic=deterministic, api_type=api_type)
         assert plan._qh_chunk == 4
         execute = lambda payload: run(plan, payload)
         ws_bytes = plan.scratch_workspace_bytes()
     else:
-        plan, execute = make_graph(p, token_major, cudnn_handle, deterministic=deterministic)
+        plan, execute = make_graph(p, token_major, cudnn_handle, deterministic=deterministic, engine=engine)
         ws_bytes = plan.get_workspace_size()
     p["ws"] = torch.empty(ws_bytes, dtype=torch.uint8, device="cuda")
     poison(p)
