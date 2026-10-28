@@ -23,7 +23,8 @@ import torch
 
 from d128_grouped_test_utils import adapter_arguments, check_case, make_case, make_workspace, poison
 from frost_test_utils import requires_dsl
-from d128_2cta_test_utils import CELLS, CHILD_TIMEOUT_S, GLOBAL_PREFIX, LEVER_LINE, SKV, WATCHDOG_S, _adapter_class, _require_2cta, _setmaxnreg_of
+from d128_2cta_test_utils import CELLS, CHILD_EXIT_HANG, CHILD_TIMEOUT_S, GLOBAL_PREFIX, LEVER_LINE, SKV, WATCHDOG_S, _adapter_class, _require_2cta
+from d128_2cta_test_utils import _setmaxnreg_of, skip_if_child_declined
 from test_sdpa_bwd_d128_2cta_stail_sm100 import _BODY_MODULE, _CHILD, _EXPECTED, _EXPECTED_LDG, _RECORD, _RECORD_TOKEN, SITES
 from test_sdpa_bwd_d128_2cta_stail_sm100 import (
     _assert_record,
@@ -99,7 +100,8 @@ _EXPECTED_XFA4 = dict(
 )
 # the merge: the stail module's template carries the author's `**{fields!r}` / `dkv_accum={dkv}` keys (an earlier tree); the role shape is set beside them
 _CHILD_XFA4 = _CHILD.replace(
-    "api = make_adapter_2cta_stail(case, **{fields!r})", f"api = make_adapter_2cta_stail(case, warp_roles={_ROLES!r}, **{{fields!r}})"
+    "api = child_adapter(make_adapter_2cta_stail, case, **{fields!r})",
+    f"api = child_adapter(make_adapter_2cta_stail, case, warp_roles={_ROLES!r}, **{{fields!r}})",
 ).replace('"2-CTA s_tail pair-skew {site} dkv_accum={dkv}"', '"2-CTA s_tail the alternate role shape pair-skew {site} dkv_accum={dkv}"')
 assert "warp_roles=" in _CHILD_XFA4 and "the alternate role shape" in _CHILD_XFA4 and "{fields!r}" in _CHILD_XFA4 and "dkv_accum={dkv}" in _CHILD_XFA4
 from cudnn.sdpa.bwd.d128_grouped_contract import DKV_ACCUM_DEFAULT as _DKV_ACCUM_DEFAULT  # noqa: E402  (the artifact's recorded form under the default)
@@ -489,7 +491,8 @@ def test_sdpa_bwd_d128_2cta_stail_xfa4_survives_pair_skew(site, tmp_path):
     ``process_watchdog`` and asserts the fp64 gate eagerly and under capture / replay.  ``leader_ship`` at 300 us = the barrier audit deterministic
     repro of the the gate-skip probe TX-PENDING over-arrival (08:01): under the correct protocol the arm's back-edge (the softmax's `dq_war` wait) holds on both CTAs and
     the run stays clean (SKEW_OK); an over-arrival fault = STOP, the barrier audit reads it.  Exit 70 or a subprocess timeout = HANG -> the barrier AUDIT, never a bigger
-    budget; a gate miss = the RED form's wrong rows, named by ``check_case``.  Budget class: ``skew_module``."""
+    budget; exit 77 = the pair body declined on this device -> SKIP with the decline; a gate miss = the RED form's wrong rows, named by ``check_case``.
+    Budget class: ``skew_module``."""
     row = SITES[site]
     assert row["lever"] in set(LEVER_LINE.findall(_body_source())), f"the body must expose {row['lever']}"
     _require_2cta()
@@ -521,7 +524,8 @@ def test_sdpa_bwd_d128_2cta_stail_xfa4_survives_pair_skew(site, tmp_path):
         (tmp_path / f"skew_xfa4_{site}.log").write_text(out)
         pytest.fail(f"[{site}] HANG: the child did not return within {CHILD_TIMEOUT_S} s (RED form: {row['red']}) -> barrier AUDIT, never a bigger budget")
     (tmp_path / f"skew_xfa4_{site}.log").write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
-    if proc.returncode == 70:
+    skip_if_child_declined(proc, site)
+    if proc.returncode == CHILD_EXIT_HANG:
         pytest.fail(
             f"[{site}] HANG: process_watchdog killed the child after {WATCHDOG_S:.0f} s (RED form: {row['red']})\n{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}"
         )
@@ -570,10 +574,11 @@ assert Path(cudnn.__file__).resolve() == Path({expected_fe!r}).resolve(), cudnn.
 from d128_grouped_test_utils import adapter_arguments, check_case, make_case, make_workspace, poison
 from frost_test_utils import process_watchdog
 from test_sdpa_bwd_d128_2cta_stail_sm100 import make_adapter_2cta_stail
+from d128_2cta_test_utils import child_adapter
 sms = torch.cuda.get_device_properties(0).multi_processor_count
 print("DATASET sms=%d (inputs: the suite's CPU generator, seed 149)" % sms, flush=True)
 case = {case}
-api = make_adapter_2cta_stail(case, warp_roles={roles!r})  # compile (outside the watchdog: a slow compiler is not a hang)
+api = child_adapter(make_adapter_2cta_stail, case, warp_roles={roles!r})  # compile (outside the watchdog: a slow compiler is not a hang); exit 77 on a typed decline
 workspace = make_workspace(api.scratch_workspace_bytes())
 args = adapter_arguments(case)
 print("STAGE=kernel {name}", flush=True)
@@ -592,7 +597,8 @@ def test_xfa4_zero_trip_items_do_not_hang(name, tmp_path):
     """a recorded tooling note (RED-first): the zero-trip repro rows of the 16w_fa4 body in a FRESH child process with the short kernel-stage watchdog
     (`_HANG_WATCHDOG_S` = budgets `validate_multihead`): a zero-trip item as a cluster's ONLY / FIRST item, a full item after a zero-trip one, and
     two consecutive zero-trip items after a live one (the lap).  Exit 70 = the watchdog fired inside the executes = HANG (RED on the pre-fix tree: the
-    softmax's pre-armed dq_war wait vs the leader's empty dq_done commit); rc 0 + REPRO_OK = green; any other rc = the child's own error."""
+    softmax's pre-armed dq_war wait vs the leader's empty dq_done commit); rc 0 + REPRO_OK = green; exit 77 = the pair body declined on this device
+    (the sm80 / sm120 lanes) = SKIP with the decline; any other rc = the child's own error."""
     row = _HANG_CASES[name]
     _require_2cta()
     _adapter_class()
@@ -611,7 +617,8 @@ def test_xfa4_zero_trip_items_do_not_hang(name, tmp_path):
         (tmp_path / f"hang_xfa4_{name}.log").write_text(out)
         pytest.fail(f"[{name}] HANG: the child did not return within {timeout_s} s -> barrier AUDIT , never a bigger budget")
     (tmp_path / f"hang_xfa4_{name}.log").write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
-    if proc.returncode == 70:
+    skip_if_child_declined(proc, name)
+    if proc.returncode == CHILD_EXIT_HANG:
         pytest.fail(
             f"[{name}] HANG: process_watchdog killed the child after {_HANG_WATCHDOG_S:.0f} s inside the executes (RED: the softmax's pre-armed dq_war "
             f"wait vs the zero-trip empty dq_done commit)\n{proc.stdout[-1500:]}\n{proc.stderr[-1500:]}"

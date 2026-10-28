@@ -5,7 +5,8 @@
 The typed adapter field ``SdpaBwdDslSm100D128.cta_pair`` ("auto" = the default: the per-S rule | "off" = the one-CTA body always |
 "on" = the pair body, declining BY NAME when a predicate fails) is resolved by ``prepared_sm100_d128_grouped_2cta`` from ONE set of
 config constants in ``d128_grouped_2cta_contract`` (``CTA_PAIR_MIN_SEQ`` = the smallest S where the pair body won the in-session
-step on cc 10.0; ``CTA_PAIR_CCS`` = the measured part; the cluster-of-two admission through the DSL's occupancy query) plus every
+step on cc 10.0; ``CTA_PAIR_CCS`` = the SM100 line, cc 10.0 / 10.3 (the same tcgen05 / cta_group::2 / TMEM / CLC features; the threshold
+was measured on GB200); the cluster-of-two admission through the DSL's occupancy query) plus every
 support predicate of the pair body.  The host rows need no GPU: the pure selector, the typed domain, the declines by name, the
 dispatch with its fallback, the resolution token.  The GPU rows (skipped off SM100 / SM103) pin the launch census per selection:
 five launches either way, the pair's cluster dims, the one-CTA kernel below the threshold and under ``off``.
@@ -78,7 +79,7 @@ def test_cta_pair_config_is_the_truth():
 
     assert c.CTA_PAIR_MODES == ("auto", "off", "on") and c.CTA_PAIR_MODE_DEFAULT == "auto"
     assert c.CTA_PAIR_MIN_SEQ == 8192 and c.CTA_PAIR_MIN_SEQ % c.UNIT_ROWS == 0 and c.CTA_PAIR_MIN_SEQ % CFG.PAIR_KV_ROWS == 0
-    assert c.CTA_PAIR_CCS == ((10, 0),) and all(tuple(cc) in ACCUMULATION_CCS for cc in c.CTA_PAIR_CCS)  # the measured part is an accumulation part
+    assert c.CTA_PAIR_CCS == ((10, 0), (10, 3)) and all(tuple(cc) in ACCUMULATION_CCS for cc in c.CTA_PAIR_CCS)  # the SM100 line's accumulation parts
     assert c.CTA_PAIR_CLUSTER == CFG.CGA_M == 2
     assert c.CTA_PAIR_BODY == "s_tail" == STAIL_CFG.TMEM_MAP
     assert (c.PAIR_BODY, c.ONE_CTA_BODY) == ("2cta", "1cta")
@@ -141,12 +142,12 @@ def test_cta_pair_auto_reads_both_q_and_kv_extents():
 
 def test_cta_pair_auto_falls_back_by_named_predicate():
     """Each predicate the pair needs sends ``auto`` to the one-CTA body with the predicate NAMED in the reason: THD (no dense pair body), the
-    measured part (cc 10.0: SM103 is admitted by the body but unmeasured, so it serves the one-CTA body until measured), the cluster-of-two
-    admission (0 active pairs from the occupancy query), a device that is not CUDA at all."""
+    SM100 line (cc 10.0 / 10.3: Hopper, SM120 and a part of another line have no cta_group::2 pair), the cluster-of-two admission (0 active
+    pairs from the occupancy query), a device that is not CUDA at all."""
     c = _contract()
     for over, name in (
         (dict(thd=False), "thd"),
-        (dict(cc=(10, 3)), "cc"),
+        (dict(cc=(8, 0)), "cc"),
         (dict(cc=(9, 0)), "cc"),
         (dict(cc=(12, 0)), "cc"),
         (dict(cc=None), "cc"),
@@ -163,8 +164,11 @@ def test_cta_pair_auto_falls_back_by_named_predicate():
         return 76
 
     assert _select("auto", 2048, "uniform", max_active_pairs=probe).body == c.ONE_CTA_BODY and calls == []
-    assert _select("auto", 16384, "uniform", cc=(10, 3), max_active_pairs=probe).body == c.ONE_CTA_BODY and calls == []
+    assert _select("auto", 16384, "uniform", cc=(9, 0), max_active_pairs=probe).body == c.ONE_CTA_BODY and calls == []
     assert _select("auto", 16384, "uniform", max_active_pairs=probe).body == c.PAIR_BODY and calls == [1]
+    for cc in c.CTA_PAIR_CCS:  # every part of the SM100 line selects the pair under auto at the threshold (cc 10.3: the sm103 CI lane)
+        res = _select("auto", 16384, "uniform", cc=cc, max_active_pairs=76)
+        assert res.body == c.PAIR_BODY and res.cc == cc and f"cc {cc}" in res.reason, (cc, res)
 
 
 def test_cta_pair_on_declines_by_name_and_ignores_the_s_rule():
@@ -176,9 +180,11 @@ def test_cta_pair_on_declines_by_name_and_ignores_the_s_rule():
         assert res.body == c.PAIR_BODY and res.token == "pair=on:2cta", res
     with pytest.raises(ValueError, match=r"cta_pair 'on' requires THD"):
         _select("on", 16384, "uniform", thd=False)
-    for cc in ((10, 3), (9, 0), (12, 0)):
-        with pytest.raises(ValueError, match=rf"cta_pair 'on' requires cc .*\(10, 0\).*got {re.escape(str(cc))}"):
+    for cc in ((8, 0), (9, 0), (12, 0)):
+        with pytest.raises(ValueError, match=rf"cta_pair 'on' requires cc .*\(10, 0\), \(10, 3\).*got {re.escape(str(cc))}"):
             _select("on", 16384, "uniform", cc=cc)
+    for cc in c.CTA_PAIR_CCS:
+        assert _select("on", 256, "uniform", cc=cc).body == c.PAIR_BODY, cc
     with pytest.raises(ValueError, match=r"cta_pair 'on' requires cc .*got a device that is not CUDA"):
         _select("on", 16384, "uniform", cc=None)
     with pytest.raises(ValueError, match=r"cta_pair 'on' requires a cluster of 2 CTAs admitted .*got 0"):
@@ -382,6 +388,45 @@ def test_cta_pair_support_validates_the_pair_fields_by_name(monkeypatch):
     assert p.check_support_selected(api) is True and api._cta_pair.body == c.PAIR_BODY and api._is_supported is True
 
 
+def _grouped_ok(api):
+    """The one-CTA route's checks, stubbed: the pair check reads the declaration facts they record."""
+    s = int(api.q_desc.shape[2])
+    api.batch_size, api.h_q, api.h_kv, api.s_q_max, api.s_k_max = 1, 8, 2, s, s
+    api._thd_t_q = api._thd_t_kv = api._thd_t_q_phys = api._thd_t_kv_phys = s
+    return True
+
+
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)], ids=["cc10.0", "cc10.3"])
+def test_cta_pair_admits_every_part_of_the_sm100_line(monkeypatch, cc):
+    """RED-first (the sm103 CI lane, cc 10.3, failed every pair-body row with the typed decline): with the device cc read as ``cc`` the pair body
+    is SELECTED under ``auto`` at the threshold and ``on`` passes ``check_support`` at any S; the resolution records the cc.  The compile target
+    follows the device the same way as the one-CTA body (``--gpu-arch sm_{{cc}}a`` from the device cc in both prepared hosts), so nothing else
+    is per part."""
+    c = _contract()
+    p = _prepared()
+    monkeypatch.setattr(p, "_device_cc", lambda api: cc)
+    monkeypatch.setattr(p, "max_active_pairs", lambda device: 76)
+    monkeypatch.setattr(p, "_check_support_grouped", _grouped_ok)
+    api = _fake_api("auto")
+    assert p.check_support_selected(api) is True and api._is_supported is True
+    assert api._cta_pair.body == c.PAIR_BODY and api._cta_pair.cc == cc and api._cta_pair.token == "pair=auto:2cta", api._cta_pair
+    api = _fake_api("on", s=256)
+    assert p.check_support_selected(api) is True and api._cta_pair.body == c.PAIR_BODY and api._cta_pair.cc == cc, api._cta_pair
+
+
+@pytest.mark.parametrize("cc", [(8, 0), (12, 0)], ids=["cc8.0", "cc12.0"])
+def test_pair_body_helper_skips_on_a_typed_cc_decline(monkeypatch, cc):
+    """RED-first (the sm80 / sm120 CI lanes): the suite's pair-body construction (``d128_2cta_test_utils.make_adapter_2cta``) maps the library's
+    typed decline (``NotImplementedError`` out of ``check_support``, here the cc predicate) to a pytest SKIP whose reason is the decline text --
+    never a failure; the library's behaviour is unchanged (the decline itself is pinned by ``test_cta_pair_on_declines_by_name_...``)."""
+    from d128_2cta_test_utils import make_adapter_2cta
+
+    p = _prepared()
+    monkeypatch.setattr(p, "_device_cc", lambda api: cc)
+    with pytest.raises(pytest.skip.Exception, match=rf"pair body declined on this device: .*cta_pair 'on' requires cc .*got {re.escape(str(cc))}"):
+        make_adapter_2cta(_cpu_case())
+
+
 def _cpu_case(s=256, lens=None):
     lens = lens or (s, s)
     return make_case(lens, lens, hq=4, hkv=2, thd=True, dtype=torch.bfloat16, causal=True, device="cpu")
@@ -438,18 +483,21 @@ def _require_pair_part():
     _require_accumulation()
 
 
-@pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3), (12, 0)])
 def test_cta_pair_test_gates_match_forced_pair_support(monkeypatch, cc):
+    """The suite's forced two-CTA gates admit exactly the devices the library admits (``CTA_PAIR_CCS``: the SM100 line, cc 10.0 and 10.3
+    on this branch) and skip elsewhere with the forced-pair reason (#1985's alignment, read from the library's set rather than a copy)."""
     import d128_2cta_test_utils
     import test_sdpa_bwd_d128_dkv_accum_sm100 as dkv_tests
     from cudnn.frost import buffers
 
+    c = _contract()
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: cc)
     monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.8.0")))
     monkeypatch.setattr(dkv_tests, "make_adapter_2cta_stail", lambda case, **kwargs: case)
     _require_pair_part()
     for require_pair in (d128_2cta_test_utils._require_2cta, lambda: dkv_tests._make_pair(None)):
-        if cc == (10, 0):
+        if cc in c.CTA_PAIR_CCS:
             require_pair()
         else:
             with pytest.raises(pytest.skip.Exception, match="forced cta_group::2"):
@@ -478,13 +526,14 @@ def _kernels(api, case, workspace):
 
 
 def test_cta_pair_on_declines_by_name_off_the_measured_part():
-    """A REAL adapter on a CUDA device that is not the measured part: ``on`` declines naming the cc predicate (observable only off cc 10.0)."""
+    """A REAL adapter on a CUDA device outside the SM100 line: ``on`` declines naming the cc predicate (observable off cc 10.0 / 10.3 only: the
+    sm80 / sm120 CI lanes are this row's proof of the decline path)."""
     c = _contract()
     if not torch.cuda.is_available():
         pytest.skip("needs a CUDA device")
     cc = torch.cuda.get_device_capability()
     if cc in c.CTA_PAIR_CCS:
-        pytest.skip(f"cc {cc} is the measured part: the decline is observable off it only")
+        pytest.skip(f"cc {cc} admits the pair body: the decline is observable off the SM100 line only")
     case = make_case((256, 256), (256, 256), hq=4, hkv=2, thd=True, dtype=torch.bfloat16, causal=True)
     api = make_adapter(case, compile_plan=False)
     api.cta_pair = "on"
@@ -510,7 +559,7 @@ def test_cta_pair_launch_census_per_selection(mode, s, body, pair_map):
     p = _prepared()
     cc = torch.cuda.get_device_capability()
     if body == "2cta" and cc not in c.CTA_PAIR_CCS:
-        pytest.skip(f"cc {cc} is not the measured part: the heuristic serves the one-CTA body here")
+        pytest.skip(f"cc {cc} is outside {c.CTA_PAIR_CCS}: the heuristic serves the one-CTA body here")
     hq, hkv = (2, 1) if s >= 8192 else (4, 2)
     case = make_case((s,), (s,), hq=hq, hkv=hkv, thd=True, dtype=torch.bfloat16, causal=True)
     api = make_adapter(case, compile_plan=False)

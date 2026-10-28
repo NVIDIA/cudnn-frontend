@@ -26,7 +26,8 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
     # (``bprop_d128_accum_grouped_f16``, implementation ``accumulation_grouped_thd``) or the cta_group::2 PAIR body
     # (``bprop_d128_accum_grouped_2cta_stail_f16``, implementation ``accumulation_grouped_thd_2cta``; five launches either way).  A typed op-level
     # field (``d128_grouped_2cta_contract.CTA_PAIR_MODES``): "auto" = THE default = the per-S rule -- the pair iff both declared S_q and S_kv >=
-    # ``CTA_PAIR_MIN_SEQ`` (8192: the smallest S where the pair body won the measured backward step on cc 10.0), cc in ``CTA_PAIR_CCS``, a cluster
+    # ``CTA_PAIR_MIN_SEQ`` (8192: the smallest S where the pair body won the measured backward step on cc 10.0), cc in ``CTA_PAIR_CCS`` (the
+    # SM100 line, cc 10.0 / 10.3; the compile target follows the device as for the one-CTA body), a cluster
     # of two admitted by the device's occupancy query, and every support predicate of the pair body; else the one-CTA body.  "off" = the one-CTA
     # body always; "on" = the pair body at any S, declining BY NAME when a predicate fails.  Resolved once in ``check_support``
     # (``prepared_sm100_d128_grouped_2cta.resolve_cta_pair_body``) and recorded on the instance (``cta_pair_resolution``: the token
