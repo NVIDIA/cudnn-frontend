@@ -1011,7 +1011,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             situ_beta1: float = 4.0,
             situ_beta2: float = 25.0,
             scheduler_counter_tensor: Optional[torch.Tensor] = None,
-        ) -> None:
+            launch: bool = True,
+        ):
             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
             kernel_args = (
                 a_tensor,
@@ -1040,14 +1041,12 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 glu_clamp_min,
             )
             if self._is_rubin_kernel:
-                _compiled_kernel(*kernel_args, scheduler_counter_tensor)
+                args = (*kernel_args, scheduler_counter_tensor)
             else:
-                _compiled_kernel(
-                    *kernel_args,
-                    situ_beta1,
-                    situ_beta2,
-                    scheduler_counter_tensor,
-                )
+                args = (*kernel_args, situ_beta1, situ_beta2, scheduler_counter_tensor)
+            if not launch:
+                return _compiled_kernel, args
+            _compiled_kernel(*args)
 
         self._compiled_kernel = tensor_api
 
@@ -1309,7 +1308,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         current_stream: Optional[cuda.CUstream] = None,
         *,
         scheduler_counter_tensor: Optional[torch.Tensor] = None,
-    ) -> None:
+        launch: bool = True,
+    ):
         """Execute the compiled kernel.
 
         For dense mode, supply ``b_tensor`` and ``sfb_tensor``.
@@ -1359,6 +1359,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             initialized to zero on the execution stream before each invocation.
             Dense dynamic scheduling only; presence must match construction.
             Overlapping invocations require distinct counters.
+        :param launch: ``False`` returns the dense launch, ``(compiled kernel, positional arguments)``, instead of issuing it.
         """
         if (scheduler_counter_tensor is None) != (self.scheduler_counter_desc is None):
             raise ValueError("scheduler_counter_tensor presence must match sample_scheduler_counter at compilation")
@@ -1401,7 +1402,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             )
 
         if self.weight_mode == MoEWeightMode.DENSE:
-            self._compiled_kernel(
+            return self._compiled_kernel(
                 a_tensor=a_tensor,
                 b_tensor=b_tensor,
                 c_tensor=c_tensor,
@@ -1425,8 +1426,9 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 glu_clamp_min=glu_clamp_min,
                 situ_beta1=situ_beta1,
                 situ_beta2=situ_beta2,
+                launch=launch,
             )
-        else:
+        elif launch:
             self._compiled_kernel(
                 a_tensor=a_tensor,
                 b_ptrs_device=b_ptrs,

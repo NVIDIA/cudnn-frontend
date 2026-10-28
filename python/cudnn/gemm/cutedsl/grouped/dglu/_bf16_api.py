@@ -512,9 +512,10 @@ class GroupedGemmDgluBf16API(APIBase):
             stream,
             linear_offset,
             activation_tensor=None,
-        ) -> None:
+            launch=True,
+        ):
             b_arg = b_tensor if self.weight_mode == MoEWeightMode.DENSE else int(get_data_ptr(b_ptrs))
-            raw_compiled(
+            args = (
                 a_tensor,
                 b_arg,
                 cached_n,
@@ -533,6 +534,9 @@ class GroupedGemmDgluBf16API(APIBase):
                 stream,
                 activation_tensor,
             )
+            if not launch:
+                return raw_compiled, args
+            raw_compiled(*args)
 
         self._compiled_kernel = tensor_api
 
@@ -647,9 +651,11 @@ class GroupedGemmDgluBf16API(APIBase):
         activation_tensor: Optional[torch.Tensor] = None,
         *,
         workspace=None,
-    ) -> None:
+        launch: bool = True,
+    ):
         """``workspace``: caller-owned, 128-byte-aligned, contiguous device buffer of at least
-        ``scratch_workspace_bytes()`` bytes (torch tensor or any DLPack buffer); never allocated here."""
+        ``scratch_workspace_bytes()`` bytes (torch tensor or any DLPack buffer); never allocated here.
+        ``launch=False`` returns the dense launch, ``(compiled kernel, positional arguments)``, instead of issuing it."""
         if current_stream is None:
             # torch inputs stay ordered with the caller's current torch stream;
             # other frameworks (e.g. JAX) default to the CUDA legacy default stream.
@@ -730,7 +736,9 @@ class GroupedGemmDgluBf16API(APIBase):
             dbias_tensor=dbias_tensor,
             activation_tensor=activation_tensor,
         )
-        self._compiled_kernel(
+        if not launch and b_ptrs is not None:
+            return None
+        return self._compiled_kernel(
             a_tensor,
             c_tensor,
             d_row_tensor,
@@ -746,4 +754,5 @@ class GroupedGemmDgluBf16API(APIBase):
             current_stream,
             linear_offset,
             activation_tensor,
+            launch=launch,
         )

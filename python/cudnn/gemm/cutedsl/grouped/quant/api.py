@@ -34,6 +34,7 @@ from .grouped_gemm_quant import (
     BlockScaledMoEGroupedGemmQuantKernel,
 )
 from ..moe_utils import MoEWeightMode
+from ..plan import GroupedGemmPlan, offer, planned, planning
 from ..backend_utils import _torch_stream_context, rubin_single_group_offsets_kwarg, wrapper_operand_meta, block_scaled_sfd_tensors, row_major_layout
 from ..canonical import (
     b_nkl,
@@ -949,10 +950,11 @@ class GroupedGemmQuantSm100(APIBase):
             bias_tensor: Optional[torch.Tensor],
             stream: cuda.CUstream,
             scheduler_counter_tensor: Optional[torch.Tensor] = None,
-        ) -> None:
+            launch: bool = True,
+        ):
             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
             if self._is_rubin_kernel:
-                _compiled_kernel(
+                args = (
                     a_tensor,
                     b_tensor,
                     sfb_tensor,
@@ -976,7 +978,7 @@ class GroupedGemmQuantSm100(APIBase):
                     scheduler_counter_tensor,
                 )
             else:
-                _compiled_kernel(
+                args = (
                     a_tensor,
                     b_tensor,
                     sfb_tensor,
@@ -999,6 +1001,9 @@ class GroupedGemmQuantSm100(APIBase):
                     stream,
                     scheduler_counter_tensor,
                 )
+            if not launch:
+                return _compiled_kernel, args
+            _compiled_kernel(*args)
 
         self._compiled_kernel = tensor_api
 
@@ -1245,7 +1250,8 @@ class GroupedGemmQuantSm100(APIBase):
         current_stream: Optional[cuda.CUstream] = None,
         *,
         scheduler_counter_tensor: Optional[torch.Tensor] = None,
-    ) -> None:
+        launch: bool = True,
+    ):
         """Execute the compiled kernel.
 
         :param a_tensor: Input A tensor
@@ -1276,6 +1282,7 @@ class GroupedGemmQuantSm100(APIBase):
             initialized to zero on the execution stream before each invocation.
             Dense dynamic scheduling only; presence must match construction.
             Overlapping invocations require distinct counters.
+        :param launch: ``False`` returns the dense launch, ``(compiled kernel, positional arguments)``, instead of issuing it.
         """
         if (scheduler_counter_tensor is None) != (self.scheduler_counter_desc is None):
             raise ValueError("scheduler_counter_tensor presence must match sample_scheduler_counter at compilation")
@@ -1332,7 +1339,7 @@ class GroupedGemmQuantSm100(APIBase):
 
         self._logger.debug("Executing grouped_gemm_quant kernel")
         if self.weight_mode == MoEWeightMode.DENSE:
-            self._compiled_kernel(
+            return self._compiled_kernel(
                 a_tensor=a_tensor,
                 b_tensor=b_tensor,
                 d_tensor=d_tensor,
@@ -1350,8 +1357,9 @@ class GroupedGemmQuantSm100(APIBase):
                 bias_tensor=bias_tensor,
                 stream=current_stream,
                 scheduler_counter_tensor=scheduler_counter_tensor,
+                launch=launch,
             )
-        else:
+        elif launch:
             self._compiled_kernel(
                 a_tensor=a_tensor,
                 b_ptrs_device=b_ptrs,
@@ -1431,12 +1439,13 @@ def quant_run(
     current_stream,
     scheduler_counter_tensor,
     d_tensor=None,
+    plan=False,
 ):
     if outputs is None:
         outputs = quant_outputs(spec, a_tensor.device, d_tensor, current_stream)
     if not spec.low_precision:
         norm_const_tensor = None
-    api.execute(
+    arguments = dict(
         a_tensor=a_tensor,
         sfa_tensor=sfa_tensor,
         padded_offsets=padded_offsets,
@@ -1449,17 +1458,45 @@ def quant_run(
         norm_const_tensor=norm_const_tensor,
         prob_tensor=prob_tensor,
         row_scale_tensor=row_scale_tensor,
-        current_stream=current_stream,
         scheduler_counter_tensor=scheduler_counter_tensor,
-        d_tensor=outputs["d_tensor"],
-        d_col_tensor=outputs["d_col_tensor"],
-        amax_tensor=outputs["amax_tensor"],
-        sfd_row_tensor=outputs["sfd_row_tensor"],
-        sfd_col_tensor=outputs["sfd_col_tensor"],
     )
+    api.execute(**arguments, **outputs, current_stream=current_stream)
+    if plan and planning():
+        inputs = _QUANT_INPUTS + (("norm_const_tensor",) if spec.low_precision else ())
+        if d_tensor is not None:
+            arguments["d_tensor"], inputs = d_tensor, inputs + ("d_tensor",)
+        offer(
+            GroupedGemmPlan(
+                api.execute,
+                arguments,
+                inputs=inputs,
+                outputs={name: tensor for name, tensor in outputs.items() if name not in arguments},
+                init={"amax_tensor": float("-inf")},
+                result={name: name for name in outputs.keys()},
+                stream=current_stream,
+                stream_outputs=("amax_tensor",),
+            )
+        )
     return outputs
 
 
+_QUANT_INPUTS = (
+    "a_tensor",
+    "sfa_tensor",
+    "padded_offsets",
+    "alpha_tensor",
+    "b_tensor",
+    "sfb_tensor",
+    "bias_tensor",
+    "b_ptrs",
+    "sfb_ptrs",
+    "prob_tensor",
+    "row_scale_tensor",
+    "scheduler_counter_tensor",
+)
+
+
+@planned
 def grouped_gemm_quant_wrapper_sm100(
     a_tensor: torch.Tensor,
     sfa_tensor: torch.Tensor,
@@ -1674,6 +1711,7 @@ def grouped_gemm_quant_wrapper_sm100(
             row_scale_tensor=row_scale_tensor,
             current_stream=current_stream,
             scheduler_counter_tensor=scheduler_counter_tensor,
+            plan=True,
         )
 
     from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor

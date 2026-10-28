@@ -368,9 +368,9 @@ class GroupedGemmWgradBf16API(APIBase):
         else:
             cached_single_expert = None
 
-        def tensor_api(a_tensor, b_tensor, output, offsets, stream) -> None:
+        def tensor_api(a_tensor, b_tensor, output, offsets, stream, launch=True):
             out_arg = output if self.weight_mode == MoEWeightMode.DENSE else int(get_data_ptr(output))
-            raw_compiled(
+            args = (
                 a_tensor,
                 b_tensor,
                 out_arg,
@@ -379,6 +379,9 @@ class GroupedGemmWgradBf16API(APIBase):
                 stream,
                 cached_single_expert,
             )
+            if not launch:
+                return raw_compiled, args
+            raw_compiled(*args)
 
         self._compiled_kernel = tensor_api
 
@@ -479,7 +482,10 @@ class GroupedGemmWgradBf16API(APIBase):
         global_scale_a: Optional[torch.Tensor] = None,
         global_scale_b: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
-    ) -> None:
+        *,
+        launch: bool = True,
+    ):
+        """``launch=False`` returns the dense launch, ``(compiled kernel, positional arguments)``, instead of issuing it."""
         if current_stream is None:
             # torch inputs stay ordered with the caller's current torch stream;
             # other frameworks (e.g. JAX) default to the CUDA legacy default stream.
@@ -509,6 +515,8 @@ class GroupedGemmWgradBf16API(APIBase):
             self._validate_data_alignment(wgrad_tensor, "wgrad_tensor")
         if self.weight_mode == MoEWeightMode.DENSE:
             output = wgrad_tensor
+        elif not launch:
+            return None
         else:
             generated_wgrad_ptrs = wgrad_ptrs is None
             if wgrad_ptrs is None:
@@ -518,4 +526,4 @@ class GroupedGemmWgradBf16API(APIBase):
                 debug_validate_pointer_values(wgrad_ptrs, "wgrad_ptrs", stream=current_stream)
             self._record_pointer_stream(wgrad_ptrs, current_stream)
             output = wgrad_ptrs
-        self._compiled_kernel(a_tensor, b_tensor, output, offsets_tensor, current_stream)
+        return self._compiled_kernel(a_tensor, b_tensor, output, offsets_tensor, current_stream, launch=launch)

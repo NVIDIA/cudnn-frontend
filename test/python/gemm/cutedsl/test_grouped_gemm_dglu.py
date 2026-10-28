@@ -9,6 +9,7 @@ and discrete weight modes, with dSwiGLU and dGeGLU activations.
 """
 
 import functools
+import inspect
 
 import torch
 import pytest
@@ -2847,6 +2848,7 @@ def test_grouped_gemm_dglu_dbias_cache_keys_on_n(request, monkeypatch):
     monkeypatch.setenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1")
     monkeypatch.setattr(dglu_api, "_cache_of_GroupedGemmDgluSm100Objects", {})
     monkeypatch.setattr(dglu_api, "_dglu_wrapper_memo", {})
+    monkeypatch.setattr(cudnn, "grouped_gemm_dglu_wrapper_sm100", inspect.unwrap(cudnn.grouped_gemm_dglu_wrapper_sm100))  # counts the wrapper's own compiles
     _run_dglu_case(_build_dglu_case(request, *_DGLU_FP8_ARGS, overrides={"n": 512}), generate_dbias=True)
     inputs, cfg = case = _build_dglu_case(request, *_DGLU_FP8_ARGS, overrides={"n": 768})
     outputs = _run_dglu_case(case, generate_dbias=True)

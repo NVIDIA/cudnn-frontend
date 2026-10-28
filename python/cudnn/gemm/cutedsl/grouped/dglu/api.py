@@ -34,6 +34,7 @@ from ..backend_utils import (
     wrapper_workspace,
 )
 from ..canonical import b_nkl, check_canonical_contiguous, check_packed_sf, is_canonical_b, is_flat_sf, normalize_prob
+from ..plan import GroupedGemmPlan, offer, planned, planning
 from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
 import logging
@@ -409,7 +410,9 @@ class GroupedGemmDgluSm100(APIBase):
         activation_tensor: Optional[torch.Tensor] = None,
         *,
         workspace: Any = None,
-    ) -> None:
+        launch: bool = True,
+    ):
+        """``launch=False`` returns the launch, ``(compiled kernel, positional arguments)``, instead of issuing it."""
         if self._implementation is None:
             raise RuntimeError("Kernel not compiled; call compile() first")
         if self.backend is GroupedGemmBackend.BF16:
@@ -426,7 +429,7 @@ class GroupedGemmDgluSm100(APIBase):
             forbidden = [name for name, value in controls if value is not None]
             if forbidden:
                 raise ValueError(f"grouped_gemm_dglu_sm100: BF16 forbids scale control {forbidden[0]}")
-            self._implementation.execute(
+            stated = self._implementation.execute(
                 a_tensor=a_tensor,
                 c_tensor=c_tensor,
                 d_row_tensor=d_row_tensor,
@@ -442,11 +445,12 @@ class GroupedGemmDgluSm100(APIBase):
                 current_stream=current_stream,
                 workspace=workspace,
                 activation_tensor=activation_tensor,
+                launch=launch,
             )
         else:
             if activation_tensor is not None:
                 raise ValueError("activation output is supported only by the BF16 kernel")
-            self._implementation.execute(
+            stated = self._implementation.execute(
                 a_tensor=a_tensor,
                 c_tensor=c_tensor,
                 d_row_tensor=d_row_tensor,
@@ -468,9 +472,11 @@ class GroupedGemmDgluSm100(APIBase):
                 norm_const_tensor=norm_const_tensor,
                 current_stream=current_stream,
                 workspace=workspace,
+                launch=launch,
             )
         self._is_supported = self._implementation._is_supported
         self._compiled_kernel = self._implementation._compiled_kernel
+        return stated
 
 
 # --------------------------------------------------------------------------- #
@@ -923,8 +929,10 @@ def dglu_block_scaled_outputs(
         )
 
 
-def dglu_block_scaled_run(api, valid_m, n_out, l, d_dtype, sf_dtype, generate_dbias, call: DgluCall, outputs: Optional[TupleDict] = None) -> TupleDict:
-    """Allocate fresh outputs and execute with the current call operands."""
+def dglu_block_scaled_run(
+    api, valid_m, n_out, l, d_dtype, sf_dtype, generate_dbias, call: DgluCall, outputs: Optional[TupleDict] = None, plan=False
+) -> TupleDict:
+    """Allocate fresh outputs and execute with the current call operands; ``plan``: also plan the call."""
     if outputs is None:
         outputs = dglu_block_scaled_outputs(
             valid_m,
@@ -940,34 +948,52 @@ def dglu_block_scaled_run(api, valid_m, n_out, l, d_dtype, sf_dtype, generate_db
             call.a_tensor.ndim == 2,
         )
     dprob_slots = _dglu_dprob_slots(call, n_out // 2, valid_m) if call.deterministic else None
+    arguments = {name: getattr(call, name) for name in _DGLU_INPUTS}
+    if dprob_slots is not None:
+        arguments["dprob_tensor"] = dprob_slots
+    created = {name: tensor for name, tensor in outputs.items() if name != "dprob_tensor"}
     api.execute(
-        a_tensor=call.a_tensor,
-        c_tensor=call.c_tensor,
-        d_row_tensor=outputs["d_row_tensor"],
-        d_col_tensor=outputs["d_col_tensor"],
-        sfa_tensor=call.sfa_tensor,
-        padded_offsets=call.padded_offsets,
-        alpha_tensor=call.alpha_tensor,
-        beta_tensor=call.beta_tensor,
-        prob_tensor=call.prob_tensor,
-        dprob_tensor=call.dprob_tensor if dprob_slots is None else dprob_slots,
-        dbias_tensor=outputs["dbias_tensor"],
-        b_tensor=call.b_tensor,
-        sfb_tensor=call.sfb_tensor,
-        b_ptrs=call.b_ptrs,
-        sfb_ptrs=call.sfb_ptrs,
-        sfd_row_tensor=outputs["sfd_row_tensor"],
-        sfd_col_tensor=outputs["sfd_col_tensor"],
-        amax_tensor=outputs["amax_tensor"],
-        norm_const_tensor=call.norm_const_tensor,
+        **arguments,
+        **created,
         current_stream=call.current_stream,
         workspace=allocate_wrapper_workspace("torch", api.scratch_workspace_bytes(), call.a_tensor.device, call.current_stream),
     )
+    if plan and dprob_slots is None and planning():
+        offer(
+            GroupedGemmPlan(
+                api.execute,
+                arguments,
+                inputs=_DGLU_INPUTS,
+                outputs=created,
+                init={"amax_tensor": float("-inf"), "dbias_tensor": 0},
+                result={name: name for name in outputs.keys()},
+                stream=call.current_stream,
+                stream_outputs=tuple(created),
+                workspace_bytes=api.scratch_workspace_bytes(),
+            )
+        )
     if dprob_slots is not None:
         from ..dsrelu.api import _reduce_dprob_slots
 
         _reduce_dprob_slots(dprob_slots, normalize_prob(call.dprob_tensor)[1], call.current_stream)
     return outputs
+
+
+_DGLU_INPUTS = (
+    "a_tensor",
+    "c_tensor",
+    "sfa_tensor",
+    "padded_offsets",
+    "alpha_tensor",
+    "beta_tensor",
+    "prob_tensor",
+    "dprob_tensor",
+    "b_tensor",
+    "sfb_tensor",
+    "b_ptrs",
+    "sfb_ptrs",
+    "norm_const_tensor",
+)
 
 
 def _dglu_dprob_slots(call: DgluCall, n_weight: int, valid_m: int):
@@ -1318,6 +1344,7 @@ def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = Non
     )
 
 
+@planned
 def grouped_gemm_dglu_wrapper_sm100(
     a_tensor: torch.Tensor,
     c_tensor: torch.Tensor,
@@ -1481,23 +1508,54 @@ def grouped_gemm_dglu_wrapper_sm100(
             memo_framework, valid_m, two_n, memo_d_dtype, memo_generate_dbias, memo_experts, a_tensor, current_stream
         )
         launch_stream = current_stream if current_stream is not None or memo_framework == "torch" else default_stream(memo_framework)
+        arguments = dict(
+            a_tensor=a_tensor,
+            c_tensor=c_tensor,
+            padded_offsets=padded_offsets,
+            alpha_tensor=alpha_tensor,
+            beta_tensor=beta_tensor,
+            prob_tensor=prob_tensor,
+            dprob_tensor=dprob_tensor,
+            b_tensor=b_tensor,
+            b_ptrs=b_ptrs,
+            linear_offset=resolved_linear_offset,
+            activation_tensor=activation_tensor,
+        )
         with wrapper_workspace(memo_framework, api.scratch_workspace_bytes(), a_tensor.device, launch_stream) as workspace:
-            api._implementation.execute(
-                a_tensor=a_tensor,
-                c_tensor=c_tensor,
-                d_row_tensor=d_row_tensor,
-                padded_offsets=padded_offsets,
-                alpha_tensor=alpha_tensor,
-                beta_tensor=beta_tensor,
-                prob_tensor=prob_tensor,
-                dprob_tensor=dprob_tensor,
-                b_tensor=b_tensor,
-                b_ptrs=b_ptrs,
-                dbias_tensor=dbias_tensor,
-                linear_offset=resolved_linear_offset,
-                current_stream=launch_stream,
-                workspace=workspace,
-                activation_tensor=activation_tensor,
+            api._implementation.execute(**arguments, d_row_tensor=d_row_tensor, dbias_tensor=dbias_tensor, current_stream=launch_stream, workspace=workspace)
+        if planning() and memo_framework == "torch":
+            offer(
+                GroupedGemmPlan(
+                    api._implementation.execute,
+                    arguments,
+                    inputs=(
+                        "a_tensor",
+                        "c_tensor",
+                        "padded_offsets",
+                        "alpha_tensor",
+                        "beta_tensor",
+                        "prob_tensor",
+                        "dprob_tensor",
+                        "b_tensor",
+                        "b_ptrs",
+                        "activation_tensor",
+                    ),
+                    outputs={"d_row_tensor": d_row_tensor, "dbias_tensor": dbias_tensor},
+                    init={"dbias_tensor": 0},
+                    result={
+                        "d_row_tensor": "d_row_tensor",
+                        "d_col_tensor": None,
+                        "dprob_tensor": "dprob_tensor",
+                        "dbias_tensor": "dbias_tensor",
+                        "amax_tensor": None,
+                        "sfd_row_tensor": None,
+                        "sfd_col_tensor": None,
+                        **({"activation_tensor": "activation_tensor"} if activation_tensor is not None else {}),
+                    },
+                    stream=current_stream,
+                    stream_outputs=("d_row_tensor", "dbias_tensor"),
+                    workspace_bytes=api.scratch_workspace_bytes(),
+                )
             )
         return TupleDict(
             d_row_tensor=d_row_tensor,
@@ -1554,7 +1612,7 @@ def grouped_gemm_dglu_wrapper_sm100(
         deterministic=deterministic and dprob_tensor is not None,  # without dprob there is nothing to make deterministic
     )
     if memo is not None:
-        return dglu_block_scaled_run(*memo, call)
+        return dglu_block_scaled_run(*memo, call, plan=True)
 
     framework = detect_framework(a_tensor)
     if framework not in ("torch", "jax"):
