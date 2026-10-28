@@ -580,6 +580,11 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
             frame[ix["k_strides"]] = (kh * d_qk, kh * d_qk, d_qk)
             frame[ix["v_ptr"]] = o.ptr
             frame[ix["v_strides"]] = (kh * d_v, kh * d_v, d_v)
+    if getattr(spec, "origin_specs", None) is not None and "thd_origin_caps" in ix:
+        # Each port's own token capacity, for a host that clips its origins to the buffer. Paged K/V carry no origin.
+        stats = 0 if not spec.has_lse else (lse_cap if lse_cap is not None else (lse_head_stride if spec.lse_head_major and lse_head_stride else t_q))
+        kv = (0, 0) if spec.paged else (_capacity(k, geo.roles["k"], "k"), _capacity(v, geo.roles["v"], "v"))
+        frame[ix["thd_origin_caps"]] = (_capacity(q, geo.roles["q"], "q"), *kv, _capacity(o, geo.roles["o"], "o"), stats)
     if spec.has_lse and spec.lse_head_major:
         frame[ix["lse_ext"]] = lse_head_stride or t_q
     frame[ix["problem_size"]] = (geo.b, spec.qh, spec.kh, t_q, t_kv, 0)
