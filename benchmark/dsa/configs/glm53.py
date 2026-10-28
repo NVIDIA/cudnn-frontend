@@ -8,18 +8,28 @@ GLM-5.3 (GLM-5.2's architecture) runs V3.2-style DSA on the MLA latent: the
 absorbed query attends a shared 576-wide record (512 KV latent + 64 RoPE)
 and reads the 512 latent channels back as V; token top-2048 with no window
 fold and no sink, so the plain LSE is the indexer's training signal and
-``indexer_topk = 0``. GLM-5.3-Flash's sparse layers are NoPE MLA, so the
-record is 512 wide; its indexer selects 512 four-token pools = 2048 raw
-tokens (the incomplete tail pool, at most 3 tokens, is omitted). 64 heads
-for both.
+``indexer_topk = 0``. Its indexer has 32 heads x 128 over one key per token
+and selects 2048 entries; generation rows carry two query rows per request
+(``mtp_rows = 2``, one MTP draft).
 
-As in ``deepseek_v4``, ``s_kv == s_q`` and every query gathers its full top-k
-as independent unique random rows, the per-token upper bound; the 4-row pool
-locality of GLM-5.3-Flash is not modeled.
+GLM-5.3-Flash's sparse layers are NoPE MLA, so the record is 512 wide; its
+indexer scores one key per four-token pool (``indexer_pool_ratio = 4``) and
+selects 512 pools = 2048 raw tokens (``index_granularity = 4``; the
+incomplete tail pool, at most 3 tokens, is omitted). 64 heads for both.
+
+As in ``deepseek_v4``, ``s_kv == s_q`` and every context / bprop query
+gathers its full top-k, the per-token upper bound: ``glm53`` as independent
+unique random rows, ``glm53_flash`` as 512 random complete 4-token blocks
+(``index_granularity = 4``), so its pool locality is modeled.
+
+Axes: components core + indexer; phases context, generation, bprop;
+kv_dtypes bfloat16, mxfp8, nvfp4; flat and paged pools. Cells no kernel
+serves are written as skipped coverage rows with the reason.
 
 Usage:
     python -m benchmark.dsa.runner --config glm53
     python -m benchmark.dsa.runner --config glm53 --dry-run
+    python -m benchmark.dsa.runner --config glm53 --filter flash --component indexer
 """
 
 from ..config_types import DsaBenchmarkConfig, ModelPreset
@@ -32,6 +42,8 @@ GLM53 = ModelPreset(
     topk=2048,
     indexer_topk=0,
     has_sink=False,
+    indexer_heads=32,
+    mtp_rows=2,
 )
 
 GLM53_FLASH = ModelPreset(
@@ -42,6 +54,9 @@ GLM53_FLASH = ModelPreset(
     topk=2048,  # 512 pools x 4 raw tokens
     indexer_topk=0,
     has_sink=False,
+    index_granularity=4,
+    indexer_heads=32,
+    indexer_pool_ratio=4,
 )
 
 CONFIG = DsaBenchmarkConfig(
@@ -62,4 +77,8 @@ CONFIG = DsaBenchmarkConfig(
     num_iterations=20,
     num_warmup_iterations=5,
     output_dir="results",
+    components=["core", "indexer"],
+    phases=["context", "generation", "bprop"],
+    kv_dtypes=["bfloat16", "mxfp8", "nvfp4"],
+    paged=[False, True],
 )
