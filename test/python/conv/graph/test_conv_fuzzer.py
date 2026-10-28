@@ -623,6 +623,11 @@ def create_tensors(config: ConvConfig, rng: random.Random):
 
 
 def _validate_fusion_arguments(config, bias, prior_output, intermediate_dtype, expose_intermediate):
+    """Validate fusion arguments and return the intermediate dtype, defaulting to FP32.
+
+    Reject backward bias, missing bias tensors, and intermediate requests
+    without an epilogue or residual add.
+    """
     if config.conv_type != ConvType.FPROP and config.epilogue in (EpilogueType.BIAS, EpilogueType.BIAS_RELU):
         raise ValueError("Backward convolution does not support bias epilogues")
     if config.epilogue in (EpilogueType.BIAS, EpilogueType.BIAS_RELU) and bias is None:

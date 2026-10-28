@@ -51,6 +51,7 @@ def _fixed_conv_case(
     min_device_capability: tuple = (0, 0),
     rng_seed: int,
 ) -> FixedConvCase:
+    """Build an ungrouped case with matching input, weight, and output dtypes."""
     config = conv_fuzzer.ConvConfig(
         spatial_dims=spatial_dims,
         batch=batch,
@@ -271,6 +272,11 @@ def _create_prior_output(conv_case: FixedConvCase, X: torch.Tensor, W: torch.Ten
 
 
 def _run_fixed_conv_test(conv_case: FixedConvCase, cudnn_handle, num_diffs: int) -> None:
+    """Check final and exposed intermediate outputs against independent references.
+
+    Skip unsupported cases; fail on execution errors or numerical mismatches.
+    Always restore the caller's handle stream and release tensors.
+    """
     config = conv_case.config
     if torch.cuda.get_device_capability() < conv_case.min_device_capability:
         pytest.skip(f"Requires device capability {conv_case.min_device_capability}")
@@ -387,6 +393,7 @@ def test_conv_fixed_expansion_L1(conv_case: FixedConvCase, cudnn_handle, num_dif
 @pytest.mark.parametrize("intermediate_dtype", (torch.float16, torch.bfloat16, torch.float32))
 @pytest.mark.parametrize("relu", (False, True))
 def test_fixed_reference_intermediate(conv_type, intermediate_dtype, relu):
+    """Check that the reference rounds the intermediate before residual addition and optional ReLU."""
     config = _fixed_conv_case(
         spatial_dims=2,
         batch=1,
@@ -428,6 +435,7 @@ def test_fixed_reference_intermediate(conv_type, intermediate_dtype, relu):
 @pytest.mark.L0
 @pytest.mark.parametrize("conv_type", tuple(conv_fuzzer.ConvType))
 def test_fixed_reference_defaults(conv_type):
+    """Check that the default reference returns a single tensor with the plain convolution result."""
     config = _fixed_conv_case(
         spatial_dims=2,
         batch=1,
@@ -471,6 +479,7 @@ def test_fixed_reference_defaults(conv_type):
     ),
 )
 def test_fixed_invalid_fusion_arguments(path, conv_type, epilogue, intermediate_dtype, expose, cudnn_handle):
+    """Check that graph and reference paths reject invalid fusions and preserve the handle stream."""
     config = replace(FIXED_CONV_CASES_L0[0].values[0].config, conv_type=conv_type, epilogue=epilogue)
     tensor = torch.ones(1)
     message = "Backward convolution does not support bias" if conv_type != conv_fuzzer.ConvType.FPROP else "requires an epilogue or residual add"
@@ -497,6 +506,7 @@ def test_fixed_invalid_fusion_arguments(path, conv_type, epilogue, intermediate_
 
 @pytest.mark.L0
 def test_fixed_intermediate_buffer_dtype(cudnn_handle):
+    """Reject intermediate buffer dtype mismatches before graph setup."""
     config = FIXED_CONV_CASES_L0[0].values[0].config
     tensor = torch.ones(1)
     original_stream = cudnn.get_stream(handle=cudnn_handle)
@@ -521,6 +531,7 @@ def test_fixed_intermediate_buffer_dtype(cudnn_handle):
 @pytest.mark.L0
 @pytest.mark.parametrize("epilogue", (conv_fuzzer.EpilogueType.BIAS, conv_fuzzer.EpilogueType.BIAS_RELU))
 def test_fixed_reference_bias_order(epilogue):
+    """Check the reference order: round the convolution, add residual and bias, then apply optional ReLU."""
     config = replace(
         FIXED_CONV_CASES_L0[0].values[0].config,
         batch=1,
@@ -547,6 +558,7 @@ def test_fixed_reference_bias_order(epilogue):
 @pytest.mark.parametrize("path", ("reference", "graph"))
 @pytest.mark.parametrize("epilogue", (conv_fuzzer.EpilogueType.BIAS, conv_fuzzer.EpilogueType.BIAS_RELU))
 def test_fixed_missing_bias(path, epilogue, cudnn_handle):
+    """Require a bias tensor for bias epilogues in both graph and reference paths."""
     config = replace(FIXED_CONV_CASES_L0[0].values[0].config, epilogue=epilogue)
     tensor = torch.ones(1)
     original_stream = cudnn.get_stream(handle=cudnn_handle)
@@ -563,6 +575,7 @@ def test_fixed_missing_bias(path, epilogue, cudnn_handle):
 
 @pytest.mark.L0
 def test_fixed_default_intermediate_buffer(cudnn_handle, num_diffs):
+    """Verify that an exposed edge defaults to FP32 even with FP16 inputs and output."""
     conv_case = next(p.values[0] for p in FIXED_CONV_EXPANSION_CASES_L1 if p.id == "conv2d_wgrad_residual_exposed_f16_n64_c256_k16_7x7")
     _run_fixed_conv_test(replace(conv_case, intermediate_dtype=None), cudnn_handle, num_diffs)
 
@@ -572,6 +585,11 @@ def test_fixed_default_intermediate_buffer(cudnn_handle, num_diffs):
 @pytest.mark.parametrize("materialize", (False, True), ids=("virtual", "exposed"))
 @pytest.mark.parametrize("fp32_edge", (False, True), ids=("low_precision_edge", "fp32_edge"))
 def test_wgrad_intermediate_rounding(dtype, materialize, fp32_edge, cudnn_handle, num_diffs):
+    """Use residual cancellation to distinguish low-precision and FP32 WGRAD edges.
+
+    Cover virtual and materialized edges, and require the wrong precision to
+    fail the output comparison.
+    """
     if torch.cuda.get_device_capability() < ((8, 0) if dtype == torch.bfloat16 else (7, 0)):
         pytest.skip(f"Unsupported convolution input dtype: {dtype}")
     config = _fixed_conv_case(
