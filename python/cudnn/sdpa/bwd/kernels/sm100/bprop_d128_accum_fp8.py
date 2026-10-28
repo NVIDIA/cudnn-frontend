@@ -12,7 +12,7 @@ from cutlass.base_dsl.typing import Pointer
 from cutlass.experimental import primitives as nvvm
 from cutlass.experimental.cuda import tensor_map as tmap
 
-from cudnn.frost.tile_dsl.barrier import MBarrier, PipelineState, Producer, advance, named_barrier_fence
+from cudnn.frost.tile_dsl.barrier import MBarrier, PipelineState, Producer, advance
 from cudnn.frost.tile_dsl.handles import GmemTileTma, MmaDesc, SmemTile
 from cudnn.frost.tile_dsl.mma import mma_ss
 from cudnn.frost.tile_dsl.pointwise import abs_max_tree, ffma2, fmax_f32, fmul2, fp32_to_fp16, fp32_to_fp8_pack, opaque_f32_zero
@@ -243,7 +243,7 @@ def _bounds(block, sq, causal: cutlass.Constexpr[bool]):
 
 @cute.jit
 def _stats(slab, lse, delta, row, group, qbase, sq, batch, head, delta_scale, lse_shift):
-    named_barrier_fence(CFG.SOFTMAX_BARRIER, CFG.SOFTMAX_LANES)
+    nvvm.barrier_cta_sync(barrier_id=CFG.SOFTMAX_BARRIER, thread_count=CFG.SOFTMAX_LANES)
     idx = qbase + row
     valid = idx < sq
     if group == 0:
@@ -257,7 +257,7 @@ def _stats(slab, lse, delta, row, group, qbase, sq, batch, head, delta_scale, ls
     else:
         stat = -delta_scale * cutlass.Float32(delta[batch, head, idx])
         _view(slab, CFG.DELTA, cutlass.Float32, CFG.N).subview(row).store(stat)
-    named_barrier_fence(CFG.SOFTMAX_BARRIER, CFG.SOFTMAX_LANES)
+    nvvm.barrier_cta_sync(barrier_id=CFG.SOFTMAX_BARRIER, thread_count=CFG.SOFTMAX_LANES)
 
 
 @cute.jit
@@ -857,9 +857,12 @@ def _mma_loop(
             dsd = _operand(slab, CFG.DS + ring.idx * CFG.RING_BYTES, FP8, CFG.M, CFG.N).desc()
             dst = _operand(slab, CFG.DS + ring.idx * CFG.RING_BYTES, FP8, CFG.M, CFG.N, transpose=True).desc()
             mma_ss(dqdesc, dst, kt, dp)
-            _commit(bars.dq_done)
+            if qtile + 1 < hi:
+                _commit(bars.dq_done)
             qt = _operand(slab, CFG.Q + q_state.idx * CFG.OPERAND_BYTES, FP8, CFG.N, CFG.D, transpose=True, swz=CFG.IN_SWZ).desc()
             mma_ss(grad, dsd, qt, dk, accumulate=qtile > lo)
+            if qtile + 1 == hi:
+                _commit(bars.dq_done)
             _commit(bars.q_empty[q_state.idx])
             _commit(bars.ds_empty[ring.idx])
             q_state = q_next
