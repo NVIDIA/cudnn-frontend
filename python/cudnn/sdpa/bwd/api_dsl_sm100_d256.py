@@ -36,8 +36,6 @@ SM100-SM119 for the half chain), descriptor version 0.
 
 from __future__ import annotations
 
-from dataclasses import asdict
-
 import torch
 
 from cudnn.sdpa.bwd import api_dsl_sm107 as _sm107
@@ -67,11 +65,6 @@ class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
     # The half row serves per-batch kv lengths on its standalone surface (its body reads ``seq_kv_lens[b]`` under the
     # padded-mask arm); the 2x2 body's padded arm has not run, so this row keeps the decline (a typed error below).
     _PER_BATCH_KV_LENS = False
-
-    def _check_head_dims(self) -> None:
-        if (self.head_dim_qk, self.head_dim_v) == (192, 128):
-            return
-        super()._check_head_dims()
 
     def _allow_head_subgroups(self) -> bool:
         """The dense BF16 chain folds global dK/dV partials after all head chunks.
@@ -107,14 +100,6 @@ class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
             ]
         return plan
 
-    def _scratch_shapes(self):
-        plan = super()._scratch_shapes()
-        if self.thd and (self.head_dim_qk, self.head_dim_v) == (192, 128):
-            # Main: one compact/dead Q map, B physical Q maps and B dK maps.
-            # Stage-3 dQ reuses these words only after main completes.
-            return [(name, ((2 * self.batch_size + 1) * 16,), dtype) if name == "desc_words" else (name, shape, dtype) for name, shape, dtype in plan]
-        return plan
-
     def check_support(self) -> bool:
         """This row's own declines first (what the 2x2 body has not run), then the half row's backstops."""
         self._value_error_if(
@@ -127,12 +112,6 @@ class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
         """Profile 1 (one 64-row sub-block per CTA, 128-row kv block, 227 KiB, descriptor version 0) -- NOT the Rubin twin
         constant ``BWD_D256_2X2``: this row has no 4x1 body to fall back to."""
         return _cfg2x2.PROFILE_SM100
-
-    def _template_params(self):
-        params = super()._template_params()
-        if (self.head_dim_qk, self.head_dim_v) == (192, 128):
-            return _cfg2x2.TemplateParams2x2(**asdict(params), head_dim_qk=192, head_dim_v=128, fuse_dk=True)
-        return params
 
     def _kernel_file(self) -> str:
         return _2X2_KERNEL_FILE
