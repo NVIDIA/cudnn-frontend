@@ -72,7 +72,7 @@ def class_key(row: str, facts) -> Optional[Tuple]:
         layout = "dense"
     if facts.window_left is not None:
         mask = "window"
-    elif facts.causal and facts.s_q > 1:  # one query row: causal masks nothing
+    elif facts.causal and not (facts.s_q == 1 and facts.bottom_right):  # one bottom-right row sees every key: no mask
         mask = "causal_br" if facts.bottom_right else "causal_tl"
     else:
         mask = "none"

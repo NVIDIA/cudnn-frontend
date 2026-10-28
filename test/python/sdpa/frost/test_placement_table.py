@@ -57,8 +57,10 @@ def test_entries_are_well_formed_and_name_known_rows():
 
 
 @pytest.mark.L0
-def test_class_key_ignores_causal_for_one_query_row():
+def test_class_key_ignores_bottom_right_causal_for_one_query_row():
+    """A single bottom-right row sees every key (no mask); a single top-left row sees only key 0 -- a different graph."""
     assert pt.class_key("r", _facts(causal=True, bottom_right=True)) == pt.class_key("r", _facts(causal=False))
+    assert pt.class_key("r", _facts(causal=True, bottom_right=False))[6] == "causal_tl"
     assert pt.class_key("r", _facts(s_q=2, causal=True, bottom_right=True))[6] == "causal_br"
 
 

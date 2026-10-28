@@ -165,7 +165,8 @@ def main():
                     regs.append(d["cudnn_auto"]["ms"] / min(b, f))
                 else:
                     regs.append((f if choice else b) / min(b, f))
-            extra = f"  ({unscored} unscored: no entry and no default leg)" if unscored else ""
+            why = "no measured default leg" if chooser is None else "no entry and no measured default leg"
+            extra = f"  ({unscored} unscored: {why})" if unscored else ""
             if regs:
                 print(f"  {label:8s} {rule:16s} regret geo {g(regs):.3f} max {max(regs):.3f} >1.05 {sum(r > 1.05 for r in regs)}/{len(regs)}{extra}")
             elif rows:
