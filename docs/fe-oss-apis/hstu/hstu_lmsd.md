@@ -205,3 +205,25 @@ assert grads["dweight_tensor"] is None
 
 See the focused tests in [`test/python/hstu/cutedsl/hstu_lmsd/`](https://github.com/NVIDIA/cudnn-frontend/tree/main/test/python/hstu/cutedsl/hstu_lmsd/)
 for complete function calls.
+
+## JAX
+
+`cudnn.ops.hstu_lmsd_forward_jax` and `cudnn.ops.hstu_lmsd_backward_jax` run
+the same kernels on JAX arrays, eagerly or under `jax.jit`, without PyTorch.
+They return dicts with the PyTorch functions' keys; `mask_tensor` is `None`, and
+`dweight_tensor` is `None` when `compute_dweight=False`. There is no autodiff
+rule; call backward with the forward's inputs, `mean`/`rstd` and options.
+
+```python
+import jax
+from cudnn.ops import hstu_lmsd_backward_jax, hstu_lmsd_forward_jax
+
+out = jax.jit(hstu_lmsd_forward_jax)(x, u, weight, bias)
+grads = jax.jit(hstu_lmsd_backward_jax)(dy, x, u, weight, bias, out["mean_tensor"], out["rstd_tensor"])
+```
+
+The JAX ops do not support dropout yet (`dropout_ratio` must be 0): the
+kernel takes its seed as a launch-time scalar, and a JAX custom call would
+recompile for every new seed. Otherwise they share the PyTorch contract
+(BF16, SM10x, D divisible by 8 below 1024); options are static. All arrays
+must be on one GPU.
