@@ -433,9 +433,27 @@ def test_cta_pair_token_and_prose_name_the_predicates():
 
 # ------------------------------------------------------------------------------------------------------------ GPU rows (SM100 / SM103)
 def _require_pair_part():
-    from d128_2cta_test_utils import _require_2cta
+    from test_sdpa_bwd_d128_accum_sm100 import _require_accumulation
 
-    _require_2cta()
+    _require_accumulation()
+
+
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
+def test_cta_pair_test_gates_match_forced_pair_support(monkeypatch, cc):
+    import d128_2cta_test_utils
+    import test_sdpa_bwd_d128_dkv_accum_sm100 as dkv_tests
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: cc)
+    monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.8.0")))
+    monkeypatch.setattr(dkv_tests, "make_adapter_2cta_stail", lambda case, **kwargs: case)
+    _require_pair_part()
+    for require_pair in (d128_2cta_test_utils._require_2cta, lambda: dkv_tests._make_pair(None)):
+        if cc == (10, 0):
+            require_pair()
+        else:
+            with pytest.raises(pytest.skip.Exception, match="forced cta_group::2"):
+                require_pair()
 
 
 def _run(api, case, repeats=1):
