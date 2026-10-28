@@ -1592,6 +1592,7 @@ def _bsa_attn_fwd_sm120_fp8(
     )
     current_stream = cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
     tile_m = sparse_block_size
+    wave_split = 0
     if sparse_block_size == 128 and k_quant_block_size == 1 and v_block_size == 128 and not has_block_nums and not has_block_sizes:
         num_sms = _get_device_sm_count_for_device(q_fp8.device.index)
         num_query_tiles = num_q_blocks * batch * num_heads
@@ -1599,6 +1600,10 @@ def _bsa_attn_fwd_sm120_fp8(
         # loops retain M128 so K/V loads are amortized over more query rows.
         if fixed_block_sparse_num <= 4 and num_sms <= num_query_tiles <= 2 * num_sms:
             tile_m = 64
+        elif fixed_block_sparse_num >= 16 and num_sms < num_query_tiles <= num_sms + num_sms // 2:
+            # A small final wave wastes most SMs at M128. Split only that
+            # wave; full M64 dispatch repeats too many K/V loads in dense loops.
+            wave_split = num_sms
     fwd_kernel = Kernel(
         gqa_ratio=1,
         head_dim=head_dim,
@@ -1611,7 +1616,7 @@ def _bsa_attn_fwd_sm120_fp8(
         has_block_nums=has_block_nums,
         block_sizes_mode=block_sizes_mode,
         **({"v_block_size": v_block_size} if v_block_size else {}),
-        **({"k_quant_block_size": k_quant_block_size, "tile_m": tile_m} if sparse_block_size == 128 else {}),
+        **({"k_quant_block_size": k_quant_block_size, "tile_m": tile_m, "wave_split": wave_split} if sparse_block_size == 128 else {}),
     )
     compile_options = getattr(fwd_kernel, "_compile_options", "")
     if has_block_nums or fixed_block_sparse_num < getattr(fwd_kernel, "_compile_min_blocks", 0):
@@ -1623,6 +1628,7 @@ def _bsa_attn_fwd_sm120_fp8(
             v_block_size,
             k_quant_block_size,
             tile_m,
+            wave_split,
             head_dim,
             has_block_nums,
             has_block_sizes,

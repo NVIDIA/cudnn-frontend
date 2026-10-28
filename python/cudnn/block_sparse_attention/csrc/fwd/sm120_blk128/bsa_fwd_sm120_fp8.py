@@ -28,6 +28,7 @@ from cudnn.block_sparse_attention.csrc.fwd.sm120_blk64.bsa_fwd_sm120_fp8 import 
 from cudnn.block_sparse_attention.csrc.utils import layout_utils
 from cudnn.block_sparse_attention.csrc.utils.batched_static_scheduler import (
     BatchedStaticSchedulerMixin,
+    BatchedStaticWorkDesc,
 )
 
 SM120_FWD_BLOCK_SIZE = 128
@@ -222,6 +223,9 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
         v_block_size: int = 0,
         k_quant_block_size: int = 16,
         tile_m: int = 128,
+        wave_split: int = 0,
+        _query_start: int = 0,
+        _query_count: int = 0,
     ):
         assert v_block_size in (0, 128)
         if k_quant_block_size not in (1, 16):
@@ -270,6 +274,29 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
         self.has_block_sizes = has_block_sizes
         self.has_block_nums = has_block_nums
         self.block_sizes_mode = block_sizes_mode
+        self.wave_split = wave_split
+        self.query_start = _query_start
+        self.query_count = _query_count
+        assert wave_split >= 0 and _query_start >= 0 and _query_count >= 0
+        if wave_split:
+            assert tile_m == 128 and k_quant_block_size == 1 and v_block_size == 128
+            assert not has_block_nums and not has_block_sizes
+            common = dict(
+                gqa_ratio=gqa_ratio,
+                head_dim=head_dim,
+                value_dim=value_dim,
+                blocksparse_blocksize_q=blocksparse_blocksize_q,
+                blocksparse_blocksize_k=blocksparse_blocksize_k,
+                dtype=dtype,
+                acc_dtype=acc_dtype,
+                has_block_sizes=has_block_sizes,
+                has_block_nums=has_block_nums,
+                block_sizes_mode=block_sizes_mode,
+                v_block_size=v_block_size,
+                k_quant_block_size=k_quant_block_size,
+            )
+            self.bulk = type(self)(**common, tile_m=128, _query_count=wave_split)
+            self.tail = type(self)(**common, tile_m=64, _query_start=wave_split * 2)
 
     def _check_dim(self, tensor: cute.Tensor | list[cute.Tensor], mode: int):
         if isinstance(tensor, list):
@@ -281,6 +308,77 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
 
     @cute.jit
     def __call__(
+        self,
+        mQ: cute.Tensor,  # (seqlen_q, head_dim, nheads, batch)
+        mK: cute.Tensor,  # (seqlen_k, head_dim, nheads, batch)
+        mV: cute.Tensor,  # (D, S, H, B), or blocked (D, token128, KV-block, H, B)
+        mO: cute.Tensor,  # (seqlen_q, value_dim, nheads, batch)
+        mLSE: cute.Tensor,  # (seqlen, nheads, batch)
+        mQScale: cute.Tensor,  # (seqlen_q, nheads_q, batch)
+        mKScale: cute.Tensor,  # (ceil_div(seqlen_k, k_quant_block_size), nheads_kv, batch)
+        mVScale: cute.Tensor,  # (value_dim, nheads_kv)
+        blocksparse_indices_q2k: cute.Tensor,  # (k, q, nheads, batch)
+        blocksparse_num_blocks_q2k: cute.Tensor,  # (q, nheads, batch)
+        block_sparse_num: cutlass.Int32,
+        blocksparse_varblk: cute.Tensor,
+        softmax_scale: cutlass.Float32,
+        stream: cuda.CUstream,
+    ):
+        if cutlass.const_expr(self.wave_split > 0):
+            # Keep the full first wave at M128, then split only the short
+            # final wave. Both launches are part of one attention invocation.
+            self.bulk(
+                mQ,
+                mK,
+                mV,
+                mO,
+                mLSE,
+                mQScale,
+                mKScale,
+                mVScale,
+                blocksparse_indices_q2k,
+                blocksparse_num_blocks_q2k,
+                block_sparse_num,
+                blocksparse_varblk,
+                softmax_scale,
+                stream,
+            )
+            self.tail(
+                mQ,
+                mK,
+                mV,
+                mO,
+                mLSE,
+                mQScale,
+                mKScale,
+                mVScale,
+                blocksparse_indices_q2k,
+                blocksparse_num_blocks_q2k,
+                block_sparse_num,
+                blocksparse_varblk,
+                softmax_scale,
+                stream,
+            )
+        else:
+            self._launch(
+                mQ,
+                mK,
+                mV,
+                mO,
+                mLSE,
+                mQScale,
+                mKScale,
+                mVScale,
+                blocksparse_indices_q2k,
+                blocksparse_num_blocks_q2k,
+                block_sparse_num,
+                blocksparse_varblk,
+                softmax_scale,
+                stream,
+            )
+
+    @cute.jit
+    def _launch(
         self,
         mQ: cute.Tensor,  # (seqlen_q, head_dim, nheads, batch)
         mK: cute.Tensor,  # (seqlen_k, head_dim, nheads, batch)
@@ -476,7 +574,14 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
 
         log2_e = 1.44269504088896340736
 
-        grid_config = self.get_grid_config(mQ.shape[0], mQ.shape[2], mQ.shape[3])
+        if cutlass.const_expr(self.query_start > 0 or self.query_count > 0):
+            # Pad the logical M64 grid to pairs, including query tails. This
+            # keeps head/batch boundaries identical to the original M128 grid.
+            total = cute.ceil_div(mQ.shape[0], 128) * (128 // self.tile_m) * mQ.shape[2] * mQ.shape[3]
+            count = self.query_count if self.query_count > 0 else total - self.query_start
+            grid_config = (count, 1, 1)
+        else:
+            grid_config = self.get_grid_config(mQ.shape[0], mQ.shape[2], mQ.shape[3])
         block_config = (self.num_threads, 1, 1)
 
         self.kernel(
@@ -544,7 +649,19 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
         tidx, _, _ = cute.arch.thread_idx()
         lane_idx = cute.arch.lane_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        work_desc = self.get_work_desc()
+        if cutlass.const_expr(self.query_start > 0 or self.query_count > 0):
+            linear, _, _ = cute.arch.block_idx()
+            linear += self.query_start
+            q_tiles = cute.ceil_div(mQ.shape[0], 128) * (128 // self.tile_m)
+            head = (linear // q_tiles) % mQ.shape[2]
+            work_desc = BatchedStaticWorkDesc(
+                linear % q_tiles,
+                head,
+                head // self.gqa_ratio,
+                linear // (q_tiles * mQ.shape[2]),
+            )
+        else:
+            work_desc = self.get_work_desc()
         seqlen = mK.shape[0]
         num_compute_tiles = cute.ceil_div(seqlen, self.tile_size)
 
