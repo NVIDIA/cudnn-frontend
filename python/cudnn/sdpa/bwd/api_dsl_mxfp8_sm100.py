@@ -264,6 +264,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
             self.window_size_left is not None and self.s_q_max > self.s_k_max + self.window_size_left,
             "SM100 MXFP8 bwd: a sliding window requires every query row to keep a key (S_q <= S_kv + window_size_left)",
         )
+        self._value_error_if(self._pair_route() and not self.scale_softmax > 0, "SM100 MXFP8 bwd: the kernel pair requires a positive attn_scale")
         self._value_error_if(self.causal_bottom_right, "SM100 MXFP8 bwd: bottom-right causal is not implemented")
         self._value_error_if(self.is_causal and (self.window_size_right or 0) != 0, "SM100 MXFP8 bwd: causal right-band widening is not implemented")
         self._value_error_if(self.tile_m not in (None, 128) or self.tile_n not in (None, 128), "SM100 MXFP8 bwd: tiles are fixed at 128x128")

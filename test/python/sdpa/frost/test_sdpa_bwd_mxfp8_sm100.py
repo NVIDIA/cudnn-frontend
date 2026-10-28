@@ -579,9 +579,10 @@ def _decline_reason(**kw):
     knobs = kw.pop("knobs", None)
     b, hq, hkv = kw.pop("b", 1), kw.pop("hq", 2), kw.pop("hkv", 2)
     sq, skv, d = kw.pop("sq", 256), kw.pop("skv", 256), kw.pop("d", _D)
+    scale = kw.pop("scale", 1.0 / math.sqrt(d))
     spec = next(s for s in ENGINE_SPECS if s.name == _ENGINE)
     try:
-        g, _t, _outs = _build_graph(b, hq, hkv, sq, skv, d, scale=1.0 / math.sqrt(d), **kw)
+        g, _t, _outs = _build_graph(b, hq, hkv, sq, skv, d, scale=scale, **kw)
     except (cudnn.cudnnGraphNotSupportedError, RuntimeError) as e:
         return f"frontend refused the graph: {e}"
     facts = ga.analyze(g)
@@ -635,6 +636,15 @@ def test_reject_right_band_widening():
 def test_reject_sliding_window():
     """The two-CTA d=256 chain has no window arm."""
     assert _decline_reason(use_causal_mask=True, left_bound=64) is not None
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d,dv", [(64, 64), (128, 128), (192, 128)])
+def test_reject_non_positive_scale_on_the_pair(d, dv):
+    for scale in (-0.125, 0.0):
+        reason = _decline_reason(d=d, dv=dv, sq=128, skv=128, use_causal_mask=True, scale=scale)
+        assert reason is not None and ("positive attn_scale" in reason or "attn_scale = 0" in reason), reason
+    assert _decline_reason(d=d, dv=dv, sq=128, skv=128, use_causal_mask=True, scale=0.125) is None
 
 
 @pytest.mark.L0

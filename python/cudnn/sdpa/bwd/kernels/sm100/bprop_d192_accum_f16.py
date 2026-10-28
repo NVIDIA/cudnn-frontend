@@ -188,11 +188,11 @@ def _stat_load(lse, delta, row, group, qbase, sq, batch, head):
     val = cutlass.Float32(0.0)
     if row < CFG.N:
         idx = qbase + row
+        clamped = cutlass.Int32(arith.select((idx < sq).ir_value(), idx.ir_value(), (sq - 1).ir_value()))
         if group == 0:
-            clamped = cutlass.Int32(arith.select((idx < sq).ir_value(), idx.ir_value(), (sq - 1).ir_value()))
             val = cutlass.Float32(lse[batch, head, clamped])
         else:
-            val = cutlass.Float32(delta[batch, head, idx])
+            val = cutlass.Float32(delta[batch, head, clamped])
     return val
 
 
