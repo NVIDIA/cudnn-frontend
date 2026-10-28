@@ -270,7 +270,7 @@ def test_capabilities_match_what_is_implemented():
     The v1 deferrals (plan Q4 / PR-2c) are pinned False: each flips with its accept test here and a tracker line."""
     c = _spec().capabilities
     assert (c.sm_lo, c.sm_hi) == _SM_RANGE
-    assert c.d == frozenset({_D}) and not c.d_envelope and not c.dqk_ge_dv
+    assert c.d == frozenset({128, 192, _D}) and not c.d_envelope and c.dqk_ge_dv
     assert c.is_fp8 and not c.is_mxfp8, "per-tensor FP8 (sdpa_fp8_backward), not block-scale"
     assert c.dtypes == frozenset({_FP8}), "E4M3 only: the body has no E5M2 arm (config_sm107 rejects it)"
     assert _FP8 in c.out_dtypes, "the contract's FP8 gradients (dtype_o is the GRADIENT dtype on the fp8 backward)"
@@ -1733,6 +1733,8 @@ def _run_fp8_adapter(
     request_amax=_AMAX,
     external_delta=False,
     delta=None,
+    d=_D,
+    d_v=None,
 ):
     """The standalone surface of ``sdpa_bwd_sm107_fp8``: quantize unit-normal operands per tensor, run the fp8 oracle (forward
     for O / Stats, then backward with the oracle's Stats injected) COMPOSING the per-batch kv lengths and the band, build the
@@ -1750,6 +1752,7 @@ def _run_fp8_adapter(
 
     from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107Fp8
 
+    d_v = d if d_v is None else d_v
     hkv = hq if hkv is None else hkv
     dense = kv_lens is None
     kv_lens = [skv] * b if dense else [int(n) for n in kv_lens]
@@ -1757,19 +1760,19 @@ def _run_fp8_adapter(
     dev = "cuda"
     gen = torch.Generator(device="cpu").manual_seed(seed)
 
-    def draw(bb, s, h):
-        return torch.randn(bb, s, h, _D, generator=gen).to(dev)  # [B, S, H, D] storage
+    def draw(bb, s, h, width):
+        return torch.randn(bb, s, h, width, generator=gen).to(dev)  # [B, S, H, D] storage
 
     def quant(x):
         scale = get_fp8_scale_factor(x.abs().max().item(), _T_E4M3)
         return (x * scale).to(_T_E4M3), 1.0 / scale
 
-    q32, do32, k32, v32 = draw(b, sq, hq), draw(b, sq, hq), draw(b, skv, hkv), draw(b, skv, hkv)
+    q32, do32, k32, v32 = draw(b, sq, hq, d), draw(b, sq, hq, d_v), draw(b, skv, hkv, d), draw(b, skv, hkv, d_v)
     q8, q_ds = quant(q32)
     k8, k_ds = quant(k32)
     v8, v_ds = quant(v32)
     do8, do_ds = quant(do32)
-    scale = 1.0 / math.sqrt(_D)
+    scale = 1.0 / math.sqrt(d)
     s_scale = get_fp8_scale_factor(1.0, _T_E4M3)
     s_descale = 1.0 / s_scale
     right = 0 if causal else None
@@ -1827,7 +1830,7 @@ def _run_fp8_adapter(
         scale_dP=dp_scale,
     )
     samples = dict(q=_view_bhsd(q8), k=_view_bhsd(k8), v=_view_bhsd(v8), o=_view_bhsd(o8), do=_view_bhsd(do8), stats=stats)
-    outs_t = {n: torch.empty(sh, device=dev, dtype=grad_dtype) for n, sh in (("dQ", (b, sq, hq, _D)), ("dK", (b, skv, hkv, _D)), ("dV", (b, skv, hkv, _D)))}
+    outs_t = {n: torch.empty(sh, device=dev, dtype=grad_dtype) for n, sh in (("dQ", (b, sq, hq, d)), ("dK", (b, skv, hkv, d)), ("dV", (b, skv, hkv, d_v)))}
     samples.update(dq=_view_bhsd(outs_t["dQ"]), dk=_view_bhsd(outs_t["dK"]), dv=_view_bhsd(outs_t["dV"]))
     api = SdpaBwdDslSm107Fp8(
         **{"sample_" + n: t for n, t in samples.items()},
@@ -2458,3 +2461,224 @@ def test_fp8_fold_pair_updates_both_outputs_and_amax():
             expected = (values * scales[i]).to(torch.float8_e4m3fn)
             assert torch.equal(args[5 * i + 1].view(torch.uint8).cpu(), expected.view(torch.uint8)), f"operand {i}, shift {shift}"
             assert args[5 * i + 4].item() == values.abs().max().item(), f"amax operand {i}, shift {shift}"
+
+
+@requires_sm80
+@pytest.mark.parametrize("dims", [(256, 256), (128, 192)], ids=["legacy", "d192"])
+@pytest.mark.parametrize("partial_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("group", [1, 4], ids=["mha", "gqa"])
+@pytest.mark.parametrize("limited", [False, True], ids=["dense", "strided_live_rows"])
+def test_fp8_fold_pair_independent_widths(dims, partial_dtype, group, limited):
+    """Different-width dV/dK folds preserve both outputs, amax, dead rows and token padding through replay/rebinding."""
+    import cutlass
+    import cutlass.cute as cute
+    from cuda.bindings import driver as cuda
+    from cutlass.cute.runtime import from_dlpack
+
+    from cudnn.sdpa.bwd.kernels.bprop_chain_common import fold_quant_pair_host
+
+    b, rows, heads = 2, 129, 2
+    gen = torch.Generator().manual_seed(20261027)
+    compiled = None
+    stream = torch.cuda.Stream()
+    for binding in range(2):
+        partials, stores, outputs, descales, scales, maxima, sources = [], [], [], [], [], [], []
+        for operand, width in enumerate(dims):
+            source = torch.randn(b, rows + 3, heads * group, width, generator=gen).to(partial_dtype)
+            sources.append(source)
+            partials.append(source.cuda())
+            padding = 16 if limited else 0
+            storage = torch.full((b, rows, heads * width + padding), -16, dtype=_T_E4M3, device="cuda")
+            stores.append(storage)
+            outputs.append(storage.as_strided((b, rows, heads, width), (rows * storage.shape[-1], storage.shape[-1], width, 1)))
+            descales.append(torch.tensor([0.5 if operand == 0 else 2.0], device="cuda"))
+            scales.append(torch.tensor([0.75 if operand == 0 else 1.25], device="cuda"))
+            maxima.append(torch.zeros(1, device="cuda"))
+        live = torch.tensor([rows], dtype=torch.int32, device="cuda") if limited else None
+        view = lambda t: None if t is None else from_dlpack(t, assumed_align=16)
+        args = []
+        for index in range(2):
+            args.extend(view(t) for t in (partials[index], outputs[index], descales[index], scales[index], maxima[index]))
+        args.extend(
+            (dims[0], group, cutlass.Float8E4M3FN, torch.cuda.get_device_properties(0).multi_processor_count, cuda.CUstream(stream.cuda_stream), view(live))
+        )
+        # The legacy cell deliberately omits the appended argument, preserving existing call sites.
+        if dims[0] != dims[1]:
+            args.append(dims[1])
+        if compiled is None:
+            compiled = cute.compile(fold_quant_pair_host, *args)
+        runtime_args = args[:10] + args[14:16]  # constexpr geometry is omitted from the compiled invocation.
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            compiled(*runtime_args)
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            compiled(*runtime_args)
+        for turn, count in enumerate((93, 0, rows) if limited else (rows,)):
+            for index, width in enumerate(dims):
+                partials[index].copy_(sources[index] if turn % 2 == 0 else -sources[index])
+                partials[index][:, count:].fill_(float("nan"))
+                stores[index].fill_(-16)
+                maxima[index].zero_()
+            if limited:
+                live.fill_(count)
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                graph.replay()
+            stream.synchronize()
+            for index, width in enumerate(dims):
+                # Independent reference: fixed-order FP32 reduction of the original CPU partials, then descale/scale/quantize.
+                source = (sources[index] if turn % 2 == 0 else -sources[index])[:, :count].float().reshape(b, count, heads, group, width)
+                total = torch.zeros(b, count, heads, width)
+                for member in range(group):
+                    total += source[:, :, :, member]
+                total *= 0.5 if index == 0 else 2.0
+                expected = (total * (0.75 if index == 0 else 1.25)).to(_T_E4M3)
+                actual = outputs[index].float().cpu()
+                torch.testing.assert_close(actual[:, :count], expected.float(), rtol=0, atol=0)
+                assert torch.all(actual[:, count:] == -16), (binding, count, index, "dead row overwritten")
+                assert torch.all(stores[index][:, :, heads * width :].float() == -16), "token padding overwritten"
+                expected_max = total.abs().max().reshape(1) if count else torch.zeros(1)
+                torch.testing.assert_close(maxima[index].cpu(), expected_max, rtol=0, atol=0)
+
+
+@requires_rubin
+@pytest.mark.parametrize("grad_dtype", [_T_E4M3, torch.bfloat16, torch.float16], ids=["e4m3", "bf16", "fp16"])
+@pytest.mark.parametrize("shape", ["mha", "gqa_tail", "padded_band"])
+def test_native_d192_fp8_backward_rebind_and_replay(ds_knob, grad_dtype, shape, monkeypatch):
+    """Native 192/128 gradients and amax match the existing FP8 oracle, including refreshed data on a retained graph."""
+    import cutlass.cute as cute
+
+    kw = dict(d=192, d_v=128, hq=4, grad_dtype=grad_dtype, ws_poison=0xFF)
+    if shape == "mha":
+        kw.update(b=1, hkv=4, sq=256, skv=256, kv_lens=None)
+    elif shape == "gqa_tail":
+        kw.update(b=2, hkv=2, sq=257, skv=383, kv_lens=None, causal=True)
+    else:
+        kw.update(b=3, hkv=2, sq=256, skv=512, kv_lens=(512, 317, 0), causal=True, bottom_right=True, left=129)
+    first = _run_fp8_adapter(seed=17, **kw)
+    first.check()
+    rebound = _run_fp8_adapter(seed=23, **kw)
+    rebound.check()
+
+    def execute():
+        with monkeypatch.context() as patch:
+            patch.setattr(cute, "compile", lambda *a, **k: pytest.fail("execute recompiled"))
+            first.api.execute(
+                **rebound.args,
+                workspace=rebound.ws,
+                seq_kv_lens=rebound.lens,
+                delta_tensor=rebound.delta,
+                **rebound.scalars,
+                **rebound.amax_t,
+            )
+
+    def snapshot(run):
+        return ({name: x.clone() for name, x in run.outs_t.items()}, {name: x.clone() for name, x in run.amax_t.items()})
+
+    def poison():
+        for x in (*rebound.outs_t.values(), *rebound.amax_t.values()):
+            x.fill_(float("nan"))
+        rebound.ws.fill_(0xFF)
+
+    def verify(expected):
+        torch.cuda.synchronize()
+        for actual, refs in ((rebound.outs_t, expected[0]), (rebound.amax_t, expected[1])):
+            for name, ref in refs.items():
+                torch.testing.assert_close(actual[name].float(), ref.float(), atol=0, rtol=0)
+
+    expected = snapshot(rebound)
+    poison()
+    execute()
+    verify(expected)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        execute()
+    poison()
+    graph.replay()
+    verify(expected)
+    refreshed = _run_fp8_adapter(seed=31, **kw)
+    refreshed.check()
+    for name in ("q_tensor", "k_tensor", "v_tensor", "o_tensor", "do_tensor", "stats_tensor"):
+        rebound.args[name].copy_(refreshed.args[name])
+    for name in rebound.scalars:
+        rebound.scalars[name].copy_(refreshed.scalars[name])
+    poison()
+    graph.replay()
+    verify(snapshot(refreshed))
+
+
+@pytest.mark.parametrize(
+    "dims,accepted", [((192, 128), True), ((256, 256), True), ((128, 128), False), ((192, 192), False), ((256, 128), False), ((256, 192), False)]
+)
+def test_native_d192_fp8_graph_head_pair_domain(monkeypatch, dims, accepted):
+    assert (_decline_reason(monkeypatch, d=dims[0], d_v=dims[1]) is None) == accepted
+
+
+def _check_fp8_graph_rebind_and_zero_do(graph, pack, workspace, ports, handle, live_slices=None):
+    """Rebind every buffer, replay poisoned outputs, then zero dO under the retained capture."""
+    names = ("dQ", "dK", "dV") + _AMAX
+    live_slices = live_slices or {}
+    expected = {name: pack[ports[name]].clone() for name in names}
+    rebound = {port: value.clone() for port, value in pack.items()}
+    for port in pack:
+        assert rebound[port].data_ptr() != pack[port].data_ptr()
+    ws = torch.empty_like(workspace)
+
+    def poison():
+        for name in names:
+            rebound[ports[name]][live_slices.get(name, Ellipsis)].fill_(float("nan"))
+        ws.fill_(0xFF)
+
+    def verify(zero=False):
+        torch.cuda.synchronize()
+        for name in names:
+            ref = expected[name].clone()
+            if zero:
+                ref[live_slices.get(name, Ellipsis)] = 0
+            torch.testing.assert_close(rebound[ports[name]].float(), ref.float(), rtol=0, atol=0)
+
+    old_stream = cudnn.get_stream(handle)
+    try:
+        cudnn.set_stream(handle, torch.cuda.current_stream().cuda_stream)
+        poison()
+        graph.execute(rebound, ws, handle=handle)
+        verify()
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        cudnn.set_stream(handle, capture_stream.cuda_stream)
+        captured = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(captured, stream=capture_stream):
+            graph.execute(rebound, ws, handle=handle)
+        torch.cuda.current_stream().wait_stream(capture_stream)
+        poison()
+        captured.replay()
+        verify()
+        rebound[ports["dO"]].zero_()
+        poison()
+        captured.replay()
+        verify(zero=True)
+    finally:
+        cudnn.set_stream(handle, old_stream)
+
+
+@requires_rubin
+@pytest.mark.parametrize("grad_dtype", [_T_E4M3, torch.bfloat16, torch.float16], ids=["e4m3", "bf16", "fp16"])
+def test_native_d192_fp8_graph_rebind_and_replay(ds_knob, grad_dtype, cudnn_handle):
+    direct = _run_fp8_adapter(d=192, d_v=128, b=2, hq=4, hkv=2, sq=257, skv=383, kv_lens=None, causal=True, bottom_right=True, grad_dtype=grad_dtype, seed=17)
+    direct.check()
+    grad = {_T_E4M3: _FP8, torch.bfloat16: _BF16, torch.float16: cudnn.data_type.HALF}[grad_dtype]
+    graph, ports = _graph_and_ports(2, 4, 257, 192, d_v=128, hkv=2, skv=383, causal=True, bottom_right=True, grad_dtypes=(grad,) * 3)
+    graph.validate()
+    graph.build_operation_graph()
+    graph.create_execution_plans([cudnn.heur_mode.A])
+    select_engine(graph, _ENGINE)
+    graph.check_support()
+    graph.build_plans()
+    assert graph._compiled_plans[graph._plan_index]._prepared is not None
+    pack = {ports[name]: direct.args[name.lower() + "_tensor"] for name in ("q", "k", "v", "o", "dO", "stats", "dQ", "dK", "dV")}
+    pack.update({ports[name]: value.view(1, 1, 1, 1) for name, value in direct.scalars.items()})
+    pack.update({ports[name]: value.view(1, 1, 1, 1) for name, value in direct.amax_t.items()})
+    workspace = torch.empty(max(graph.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    _check_fp8_graph_rebind_and_zero_do(graph, pack, workspace, ports, cudnn_handle)

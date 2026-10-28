@@ -301,7 +301,8 @@ _NB_FENCE_P0 = 11
 # cc 10.0 only -- cc 10.3 retains its all-MUFU path) AND a tile/layout gate. Dense bands keep their
 # existing mix. BF16 D128 causal THD also mixes unmasked interior tiles (nonpaged, and paged without bias or an
 # explicit KV mask); diagonal, sliding-window and masked tiles retain MUFU. FP16 causal THD, d64 THD and
-# split-KV builds keep their previous behavior. Padding alone is not a causal/SWA band.
+# split-KV builds keep their previous behavior. Native BF16 D64 nonpaged causal interiors also use the mix.
+# Padding alone is not a causal/SWA band.
 _E2E_FREQ = 16
 _E2E_RES = 4
 _E2E_LIMIT = CFG.TILE_N
@@ -328,7 +329,19 @@ _E2E_THD_INTERIOR = bool(
     and CFG.SPLIT_KV == 1
     and (CFG.MASK_FLAGS & (MASK_CAUSAL | MASK_SWA)) == MASK_CAUSAL
 )
-_E2E_ENABLED = bool(PARAMS.exp2_fma_split) and (_E2E_DENSE_BAND or _E2E_PAGED_INTERIOR or _E2E_THD_INTERIOR)
+# Native BF16 D64 causal interiors share the existing mixed exp2 helper.
+# Keep diagonal tiles, alternate masks/layouts and unmeasured architectures on MUFU.
+_E2E_D64_INTERIOR = bool(
+    PARAMS.d_flavor == 64
+    and CFG.DTYPE_QKV == 2
+    and not CFG.THD_VARLEN
+    and not CFG.PAGED_KV
+    and CFG.SPLIT_KV == 1
+    and not CFG.BIAS_MODE
+    and not CFG.KV_MASK_FORM
+    and (CFG.MASK_FLAGS & (MASK_CAUSAL | MASK_SWA)) == MASK_CAUSAL
+)
+_E2E_ENABLED = bool(PARAMS.exp2_fma_split) and ((PARAMS.d_flavor != 64 and (_E2E_DENSE_BAND or _E2E_PAGED_INTERIOR or _E2E_THD_INTERIOR)) or _E2E_D64_INTERIOR)
 _E2E_EMULATED_COLS = (_E2E_LIMIT // _E2E_FREQ) * _E2E_RES if _E2E_ENABLED else 0
 if _E2E_ENABLED:
     if not (0 <= _E2E_RES <= _E2E_FREQ and _E2E_FREQ % 2 == 0 and _E2E_RES % 2 == 0 and _E2E_LIMIT % _E2E_FREQ == 0):
@@ -399,7 +412,14 @@ _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 # seq_kv_lens overloaded as the THD metadata buffer (int32 len 4B+4):
 #   [0..B-1]=seq_kv_lens  [B..2B]=cu_q(B+1)  [2B+1..3B+1]=cu_k(B+1)
 #   [3B+2..4B+1]=batch_remap(B)  [4B+2]=live units  [4B+3]=claim counter
-from cudnn.sdpa.fwd.kernels.thd_origins import build_thd_origins, origin_tensors, origin_tma_slice
+from cudnn.sdpa.fwd.kernels.thd_origins import (
+    COMPACT_MAP_SEQUENCE,
+    build_thd_origins,
+    origin_map_ptr,
+    origin_tensors,
+    origin_tma_slice,
+    thd_origins_compact_word,
+)
 from cudnn.frost.tile_dsl.thd import thd_port_origin
 from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_descs_kernel as _build_thd_meta_o_descs_kernel, TENSOR_MAP_QWORDS, THD_SETUP_THREADS
 
@@ -1260,6 +1280,17 @@ def _tmaldg_warp_group(
 
     if cutlass.const_expr(thd_origins is not None):
         tma_q = lambda d, h, r, b: origin_tma_slice(o_desc_words, 1, n_batch, b, d, h, r)
+        # Setup records whether the load ports hold one map each (every live
+        # origin equals its compact prefix) or a map per sequence.
+        origins_word = thd_origins_compact_word(thd_origins, n_batch)
+        origins_single_map = origins_word != cutlass.Int64(0)
+        origins_per_sequence = origins_word == cutlass.Int64(0)
+        if origins_single_map:
+            # One map per load port, acquired once like the compact-prefix path.
+            tma_tensormap_acquire(origin_map_ptr(o_desc_words, 1, n_batch, cutlass.Int32(COMPACT_MAP_SEQUENCE)))
+            if cutlass.const_expr(not PAGED_KV):
+                tma_tensormap_acquire(origin_map_ptr(o_desc_words, 2, n_batch, cutlass.Int32(COMPACT_MAP_SEQUENCE)))
+                tma_tensormap_acquire(origin_map_ptr(o_desc_words, 3, n_batch, cutlass.Int32(COMPACT_MAP_SEQUENCE)))
     else:
         tma_q = GmemTileTma(tma_q_desc)
     if cutlass.const_expr(thd_origins is not None and not PAGED_KV):
@@ -1342,18 +1373,24 @@ def _tmaldg_warp_group(
 
     while is_valid_tile > cutlass.Int32(0):
         if cutlass.const_expr(thd_origins is not None):
-            # Sequence-local maps have independent caller-port bases and clip
-            # every interior tail. Acquire again when a persistent unit changes.
-            stride = (n_batch + cutlass.Int32(1)) * cutlass.Int32(TENSOR_MAP_QWORDS)
-            base = o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(TENSOR_MAP_QWORDS)
-            q_map = (base + stride).tospace(cutlass.AddressSpace.generic)
-            tma_tensormap_acquire(q_map)
-            if cutlass.const_expr(not PAGED_KV):
-                k_map = (base + 2 * stride).tospace(cutlass.AddressSpace.generic)
-                v_map = (base + 3 * stride).tospace(cutlass.AddressSpace.generic)
-                tma_tensormap_acquire(k_map)
-                tma_tensormap_acquire(v_map)
-            q_seq_off, kv_seq_off, tma_batch = cutlass.Int32(0), cutlass.Int32(0), batch_idx
+            if origins_per_sequence:
+                # Sequence-local maps have independent caller-port bases and clip
+                # every interior tail. Acquire again when a persistent unit changes.
+                stride = (n_batch + cutlass.Int32(1)) * cutlass.Int32(TENSOR_MAP_QWORDS)
+                base = o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(TENSOR_MAP_QWORDS)
+                q_map = (base + stride).tospace(cutlass.AddressSpace.generic)
+                tma_tensormap_acquire(q_map)
+                if cutlass.const_expr(not PAGED_KV):
+                    k_map = (base + 2 * stride).tospace(cutlass.AddressSpace.generic)
+                    v_map = (base + 3 * stride).tospace(cutlass.AddressSpace.generic)
+                    tma_tensormap_acquire(k_map)
+                    tma_tensormap_acquire(v_map)
+            # Single maps keep the compact prefix offsets at batch coordinate 0;
+            # sequence-local maps carry the origin in their base and are
+            # selected by the batch coordinate.
+            q_seq_off = cutlass.Int32(arith.select(origins_single_map.ir_value(), q_seq_off.ir_value(), cutlass.Int32(0).ir_value()))
+            kv_seq_off = cutlass.Int32(arith.select(origins_single_map.ir_value(), kv_seq_off.ir_value(), cutlass.Int32(0).ir_value()))
+            tma_batch = cutlass.Int32(arith.select(origins_single_map.ir_value(), cutlass.Int32(0).ir_value(), batch_idx.ir_value()))
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
         if cutlass.const_expr(MAY_BE_EMPTY) and (kv_right <= kv_left):
@@ -1394,6 +1431,9 @@ def _tmaldg_warp_group(
                 bars.mb_q_full[0].smem_ptr,
                 cta_group=CFG.CTA_MMA,
                 mcast_mask=tma_mcast_mask,
+                # A runtime Q map is acquired by this warp itself (once for a
+                # single map, per unit for sequence-local maps).
+                acquire=thd_origins is None,
             )
 
             bars.mb_k_empty[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
@@ -1454,6 +1494,9 @@ def _tmaldg_warp_group(
                 bars.mb_q_full[1].smem_ptr,
                 cta_group=CFG.CTA_MMA,
                 mcast_mask=tma_mcast_mask,
+                # A runtime Q map is acquired by this warp itself (once for a
+                # single map, per unit for sequence-local maps).
+                acquire=thd_origins is None,
             )
             q_empty_phase = q_empty_phase ^ 1
 
@@ -3665,6 +3708,7 @@ def _host(
                 n_thd_units,
                 paged=PAGED_KV,
                 rank_by_kv=PAGED_KV and bool(CFG.BOTTOM_RIGHT) and (CFG.MASK_FLAGS & MASK_SWA) == 0,
+                single_maps=True,
             ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         else:
             _build_thd_meta_o_descs_kernel(

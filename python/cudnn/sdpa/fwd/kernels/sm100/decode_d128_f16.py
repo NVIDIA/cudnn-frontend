@@ -1369,7 +1369,7 @@ def _mma_warp_group(
 
 
 @cute.jit
-def _softmax_kv_body(
+def _softmax_kv_body_full(
     apply_mask: bool,
     kv_loop,
     tmem_ptr_i32,
@@ -1535,6 +1535,73 @@ def _softmax_kv_body(
 
 
 @cute.jit
+def _softmax_kv_body(
+    apply_mask: bool,
+    kv_loop,
+    tmem_ptr_i32,
+    bars,
+    q_abs,
+    eff_seqlen_kv,
+    eff_seqlen_q,
+    scale_log2,
+    total_max,
+    total_max_safe,
+    total_sum,
+    s_idx,
+    s_phase,
+    stat_empty_phase,
+    leader_cta_id,
+    warp_w=None,
+    sAlpha=None,
+):
+    # Experimental narrow scope: every lane of this warp is outside live Q.
+    # MMA and correction still consume its zero P rows and alpha=1, and all
+    # lanes participate in the exact same barriers as the ordinary path.
+    dead_warp = cutlass.Int32(0)
+    if cutlass.const_expr(CFG.PAGED_KV and CFG.PACK_GQA and CFG.TILE_K == 128 and CFG.TILE_O == 128 and not CFG.THD_VARLEN):
+        lane = cute.arch.thread_idx()[0] % cutlass.Int32(32)
+        first_q = cute.arch.make_warp_uniform(q_abs - lane // cutlass.Int32(HEADS_PER_TILE))
+        dead_warp = cutlass.Int32(first_q >= eff_seqlen_q)
+    if dead_warp != 0:
+        bars.mb_bmm1_done[s_idx].wait(s_phase)
+        tmem_base = tmem_ptr_i32.load()
+        p_addr_base = tmem_base + s_idx * cutlass.Int32(LAYOUT.S_SLOT_COLS) + cutlass.Int32(LAYOUT.P_IN_SLOT_OFF)
+        alpha_lane = cute.arch.thread_idx()[0] - cutlass.Int32(CFG.SOFTMAX_WG0_BASE * 32)
+        sAlpha.subview(alpha_lane).data_ptr().store(cutlass.Float32(1.0))
+        bars.mb_stat_full[0].arrive()
+        zero = cutlass.Vector.from_elements(tuple(cutlass.Float32(0.0) for _ in range(64)), cutlass.Float32).to(STORAGE_DTYPE)
+        for c in cutlass.range_constexpr(CFG.N_BMM2_CHUNKS):
+            nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base + cutlass.Int32(c * 32), cutlass.Float32), zero)
+            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+            bars.mb_bmm2_ready[s_idx * cutlass.Int32(CFG.N_BMM2_CHUNKS) + cutlass.Int32(c)].arrive(leader_cta_id=leader_cta_id, cta_group=1)
+        bars.mb_stat_empty[0].wait(stat_empty_phase)
+        stat_empty_phase = stat_empty_phase ^ 1
+        s_next = advance(PipelineState(idx=s_idx, phase=s_phase), LAYOUT.S_STAGES)
+        s_idx, s_phase = s_next.idx, s_next.phase
+    else:
+        total_max, total_max_safe, total_sum, s_idx, s_phase, stat_empty_phase = _softmax_kv_body_full(
+            apply_mask,
+            kv_loop,
+            tmem_ptr_i32,
+            bars,
+            q_abs,
+            eff_seqlen_kv,
+            eff_seqlen_q,
+            scale_log2,
+            total_max,
+            total_max_safe,
+            total_sum,
+            s_idx,
+            s_phase,
+            stat_empty_phase,
+            leader_cta_id,
+            warp_w,
+            sAlpha,
+        )
+    return total_max, total_max_safe, total_sum, s_idx, s_phase, stat_empty_phase
+
+
+@cute.jit
 def _softmax_kv_body_quad(
     apply_mask: bool,
     kv_loop,
@@ -1663,7 +1730,8 @@ def _softmax_kv_body_quad(
     return total_max, total_max_safe, total_sum, s_next.idx, s_next.phase, stat_empty_phase
 
 
-_softmax_step = _softmax_kv_body_quad if QUAD else _softmax_kv_body
+_SKIP_DEAD_Q_WARPS = CFG.PAGED_KV and CFG.PACK_GQA and CFG.TILE_K == 128 and CFG.TILE_O == 128 and not CFG.THD_VARLEN
+_softmax_step = _softmax_kv_body_quad if QUAD else (_softmax_kv_body if _SKIP_DEAD_Q_WARPS else _softmax_kv_body_full)
 
 
 @cute.jit

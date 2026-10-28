@@ -638,9 +638,17 @@ def opaque_i32_zero():
 
 
 @cutlass.cute.jit
-def opaque_i32(value: cutlass.Int32) -> cutlass.Int32:
-    """Identity mov.b32 that pins a per-lane loop invariant in its register."""
-    return inline_ptx("mov.b32 $0, $1;", write_only_types=[cutlass.Int32], read_only_args=[value])
+def opaque_i32(value: cutlass.Int32, anchor=None) -> cutlass.Int32:
+    """Identity mov.b32 that pins a per-lane loop invariant in its register.
+
+    ``anchor`` (optional, append-only): a loop-VARIANT ``Int32`` (the q-tile counter) passed as an extra, unreferenced asm operand -- the
+    :func:`~cudnn.frost.tile_dsl.mma.desc_opaque` form for a 32-bit address term.  Without it an item-invariant SMEM address and every
+    ``base + vec`` add derived from it are hoisted by LLVM's LICM to the item loop's preheader and stay live across the whole tile body
+    (the sm100 d128 2-CTA softmax's 8 dS STS addresses: 8 registers, 4 of them spilled at the 144-register split, 2026-10-27); anchored,
+    the mov and the adds that depend on it sit inside the tile next to the STS that consumes them, so their live range is one tile.  The
+    default path (no anchor) emits exactly the asm it always did."""
+    args = [value] if cutlass.const_expr(anchor is None) else [value, anchor]
+    return inline_ptx("mov.b32 $0, $1;", write_only_types=[cutlass.Int32], read_only_args=args)
 
 
 @cutlass.cute.jit
@@ -1308,3 +1316,24 @@ def atomic_max_f32_bits(slot: cute.Tensor, value: cutlass.Float32) -> None:
     them all.  Call it from ONE lane (lane 0 after :func:`warp_abs_max_f32_shfl` / :func:`warp_abs_max_f32`)."""
     ptr = Pointer(slot.iterator.raw_ptr(), dtype=cutlass.Int32)
     nvvm.atomicrmw(nvvm.AtomicOp.MAX, ptr, value.bitcast(cutlass.Int32))
+
+
+@cutlass.cute.jit
+def quad_reduce_max(val: cutlass.Float32) -> cutlass.Float32:
+    """The max over the FOUR lanes of a thread quad (lanes ``4 g .. 4 g + 3``: the lanes that share an ``m16n8`` C-fragment row), two
+    ``shfl.sync.bfly`` steps (offsets 2, 1) on the full warp mask -- every lane of the quad holds the result.  ``ftz`` max (FMNMX; the
+    operands are scores, a flushed sub-normal max changes no exp2).  The SM120 SDPA kernels carry the same two shuffles as
+    ``sm120/_common.nvvm_threadquad_reduction_max``; this is the arch-neutral home so an sm107 ``mma.sync`` kernel need not import an
+    sm120 module.  Call it from EVERY lane of the warp (``shfl.sync`` with the full mask)."""
+    val = cute.math.max(val, cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, val, 2, 0x1F, kind=nvvm.Shfl.BFLY)), ftz=True)
+    val = cute.math.max(val, cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, val, 1, 0x1F, kind=nvvm.Shfl.BFLY)), ftz=True)
+    return val
+
+
+@cutlass.cute.jit
+def quad_reduce_sum(val: cutlass.Float32) -> cutlass.Float32:
+    """The sum over the four lanes of a thread quad (see :func:`quad_reduce_max`): offsets 2 then 1, a FIXED order, so every lane of
+    the quad holds the bitwise-same sum and two launches agree bitwise.  Call it from every lane of the warp."""
+    val = val + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, val, 2, 0x1F, kind=nvvm.Shfl.BFLY))
+    val = val + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, val, 1, 0x1F, kind=nvvm.Shfl.BFLY))
+    return val

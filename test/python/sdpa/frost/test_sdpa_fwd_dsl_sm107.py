@@ -233,7 +233,7 @@ _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle 
     ("fp8", (192, 128)): (True, 43, 12),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
     ("mxfp8", (192, 128)): (True, 35, 13),
     ("f16", (256, 256)): (False, 29, 11),
-    ("fp8", (256, 256)): (False, 29, 11),
+    ("fp8", (256, 256)): (False, 30, 11),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
     ("mxfp8", (256, 256)): (False, 29, 11),
     ("f16", (512, 512)): (True, 23, 14),  # +1 ring wait: the in-loop mb_bmm2_done wait is spelled once per CORR_READY_BEFORE_DONE arm (ONE traced site)
     ("fp8", (512, 512)): (True, 22, 14),
@@ -363,8 +363,11 @@ def test_sm107_d512_o_store_levers_are_module_constants(kind, load_kw):
         code = _code_lines(fh.read())
     for name in _O_STORE_LEVERS:
         assert len(re.findall(rf"^{name}: bool = (?:True|False)$", code, re.M)) == 1, f"{mod.__name__}: exactly one {name} definition"
-        assert f"const_expr({name})" in code, f"{mod.__name__}: {name} is not folded at a site"
-    assert "const_expr(not O_STORE_STREAM)" in code, f"{mod.__name__}: the whole-tile store arm is gone -- the lever is no longer an A/B"
+        # FP8 split partials bypass final-O TMA stores; both unsplit store arms still fold the module lever.
+        predicate = f"{name} and not _FP32_PARTIALS" if kind == "fp8" and name == "O_STORE_STREAM" else name
+        assert f"const_expr({predicate})" in code, f"{mod.__name__}: {name} is not folded at a site"
+    whole_tile = "not O_STORE_STREAM and not _FP32_PARTIALS" if kind == "fp8" else "not O_STORE_STREAM"
+    assert f"const_expr({whole_tile})" in code, f"{mod.__name__}: the whole-tile store arm is gone -- the lever is no longer an A/B"
     assert re.search(r"\btma_store_tile\(", code) and re.search(r"\btma_store_subtile\(", code), f"{mod.__name__}: both store forms must trace"
     assert "    tma_store_subtile," in code, f"{mod.__name__}: tma_store_subtile must come from cudnn.frost.tile_dsl.tma"
     assert (
@@ -1060,25 +1063,20 @@ def test_sm107_nonpaged_d128_thd_pack_gqa_contract(dtype_name, group, cga):
     assert engines.mismatch(caps, facts, dataclasses.replace(knobs, cga=4)) is not None
 
 
-def test_sm107_fp8_pack_gqa_is_d128_only():
-    """The Rubin per-tensor FP8 row packs GQA on the d128 flavor only (`pack_gqa_d_shapes = {(128, 128)}`: the
-    d192x128 / d256 / d512 siblings carry no PackGQA path) while it serves those flavors UNPACKED.  This is the
-    typed decline behind `_skip_pack_gqa_wide_on_rubin` in test_sdpa_fwd_fp8_sm100.py -- the one Rubin marker that
-    survived retiring the d128-only-era skips -- so it is asserted on real facts here, where no GPU is needed: a
-    packed d192 / d256 / d512 graph is ineligible with a reason naming the knob, the same graph unpacked is eligible,
-    and packed d128 is eligible.  When a wider kernel gains PackGQA: widen the row, INVERT that shape's packed
-    assertion and drop the marker (test/AGENTS.md: invert the counter assertion, do not delete it)."""
+def test_sm107_fp8_pack_gqa_serves_native_split_flavors():
+    """All native FP8 flavors pack and split; THD packing remains declined."""
     from cudnn.sdpa.fwd import engines
 
     caps = _caps("sdpa_fwd_prefill_sm107_fp8")
-    assert caps.pack_gqa_d_shapes == frozenset({(128, 128)})
-    for d_qk, d_v in ((192, 128), (256, 256), (512, 512)):
-        facts = _f16_facts(**_fp8_ungated_kw(h_kv=2, d_qk=d_qk, d_v=d_v))
-        assert engines.mismatch(caps, facts) is None, (d_qk, d_v, "the unpacked graph must be served")
-        why = engines.mismatch(caps, facts, engines.SdpaFwdKnobs(pack_gqa=True))
-        assert why is not None and "pack_gqa" in why, (d_qk, d_v, why)
-    packed_d128 = _f16_facts(**_fp8_ungated_kw(h_kv=2, d_qk=128, d_v=128))
-    assert engines.mismatch(caps, packed_d128, engines.SdpaFwdKnobs(pack_gqa=True)) is None
+    shapes = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
+    assert caps.pack_gqa_d_shapes == shapes
+    for d_qk, d_v in shapes:
+        packed = _f16_facts(**_fp8_ungated_kw(h_kv=2, d_qk=d_qk, d_v=d_v))
+        assert engines.mismatch(caps, packed) is None
+        assert engines.mismatch(caps, packed, engines.SdpaFwdKnobs(pack_gqa=True)) is None
+    d512 = _f16_facts(**_fp8_ungated_kw(h_kv=2, d_qk=512, d_v=512))
+    assert engines.mismatch(caps, d512, engines.SdpaFwdKnobs(pack_gqa=True, split_kv=2, cga=2)) is None
+    assert engines.mismatch(caps, dataclasses.replace(d512, thd=True, padded=True), engines.SdpaFwdKnobs(pack_gqa=True)) is not None
 
 
 def test_sm107_fp8_paged_sink_declines():
@@ -1099,7 +1097,8 @@ def test_sm107_quantized_strided_stats_is_ported_for_all_flavors(family, monkeyp
     host_module = _fp8_host if family == "fp8" else _mxfp8_host
     load_kw = _DTYPE_FAMILIES[1 if family == "fp8" else 2][1]
     caps = _caps("sdpa_fwd_prefill_sm107_" + family)
-    assert caps.stats is True and caps.d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+    flavors = [(64, 64)] + _FLAVORS if family == "fp8" else _FLAVORS
+    assert caps.stats is True and caps.d_shapes == frozenset(flavors)
     captured = []
     sentinel = object()
 
@@ -1108,14 +1107,14 @@ def test_sm107_quantized_strided_stats_is_ported_for_all_flavors(family, monkeyp
         return sentinel
 
     monkeypatch.setattr(host_module, "compile_host", compile_host)
-    for flavor in _FLAVORS:
+    for flavor in flavors:
         mod = _load(flavor, rubin=True, **load_kw)
         assert not hasattr(mod, "compile"), "quantized attention must use the pointer compiler"
         with open(mod.__file__, encoding="utf-8") as fh:
             assert "strided Stats not ported" not in _code_lines(fh.read())
         # Bypass the memoized result so the real entry forwards its metadata.
         assert mod.compile_prepared.__wrapped__(d_qk=flavor[0], d_v=flavor[1], has_lse=True) is sentinel
-    assert len(captured) == len(_FLAVORS)
+    assert len(captured) == len(flavors)
 
 
 def test_sm107_rows_carry_the_padded_stats_trim():
@@ -1133,8 +1132,8 @@ def test_sm107_rows_serve_natural_scheduling_only():
     """The ROW-WIDE floor of every Rubin row stays NATURAL-only: every LPT
     variant is claimed per flavor (`sched_policies_by_d_shape`) where it is
     validated.  SCHED_LPT_L2 needs `qh_per_kh` / `seqlen_kv` at every decode
-    call site, which only the d128 / d192x128 FP8 and MXFP8 kernels pass, so it
-    may appear ONLY on those flavors -- INVERTED 2026-09-14 (it used to appear
+    call site. Native FP8 D64/D128/D192x128 and MXFP8 D128/D192x128
+    pass those inputs, so it may appear only on those flavors -- INVERTED 2026-09-14 (it used to appear
     on none, and the MXFP8 row claimed nothing beyond NATURAL).
 
     (This test used to assert LPT was "not honored" by the ported kernels; the
@@ -1144,7 +1143,7 @@ def test_sm107_rows_serve_natural_scheduling_only():
 
     lpt_l2_flavors = {
         "sdpa_fwd_prefill_sm107": set(),
-        "sdpa_fwd_prefill_sm107_fp8": {(128, 128), (192, 128)},
+        "sdpa_fwd_prefill_sm107_fp8": {(64, 64), (128, 128), (192, 128)},
         "sdpa_fwd_prefill_sm107_mxfp8": {(128, 128), (192, 128)},
     }
     for row, l2_shapes in lpt_l2_flavors.items():
@@ -1524,12 +1523,9 @@ def test_sm107_advertises_lpt_only_for_the_validated_d_shape():
 
 
 def test_sm107_fp8_advertises_lpt_only_for_the_validated_d_shape():
-    """The FP8 twin of the f16 test above: (256, 256), (192, 128) and -- since
-    2026-09-14 -- (128, 128) serve LPT (validated through the standalone
-    adapter, bit-identical to NATURAL -- see the row's comment); d512 does
-    not; the row-wide floor stays NATURAL.  LPT_L2 needs qh_per_kh / seqlen_kv
-    at every decode call site: the d128 and d192x128 kernels thread them and
-    both claim it; d256 / d512 pass neither argument."""
+    """D128/D192/D256/D512 serve LPT; the row-wide floor stays NATURAL.
+    LPT_L2 needs qh_per_kh / seqlen_kv at every decode call site: D128
+    and D192 thread them, while D256/D512 do not."""
     import cudnn
     from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
     from cudnn.sdpa.fwd import engines
@@ -1539,7 +1535,7 @@ def test_sm107_fp8_advertises_lpt_only_for_the_validated_d_shape():
     fp8 = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_fp8=True)
     for shape in ((256, 256), (192, 128), (128, 128)):
         assert SCHED_LPT in engines.effective_sched_policies(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8)), shape
-    assert SCHED_LPT not in engines.effective_sched_policies(caps, _f16_facts(d_qk=512, d_v=512, **fp8))
+    assert SCHED_LPT in engines.effective_sched_policies(caps, _f16_facts(d_qk=512, d_v=512, **fp8))
     for shape in ((192, 128), (128, 128)):
         assert SCHED_LPT_L2 in engines.effective_sched_policies(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8)), shape
     for shape in ((256, 256), (512, 512)):
@@ -1548,8 +1544,8 @@ def test_sm107_fp8_advertises_lpt_only_for_the_validated_d_shape():
 
 @pytest.mark.L0
 def test_sm107_fp8_lpt_knob_is_honored_or_ineligible_per_d_shape():
-    """Requesting LPT on the FP8 row: ACCEPTED at d256, d192xd128 and d128,
-    DECLINED (typed, naming the knob) at d512; LPT_L2: ACCEPTED at d192xd128
+    """Requesting LPT on the FP8 row: accepted at D128/D192/D256/D512.
+    LPT_L2: ACCEPTED at d192xd128
     and d128 only -- never silently downgraded (engine contract, Rule 4)."""
     import cudnn
     from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2
@@ -1558,10 +1554,8 @@ def test_sm107_fp8_lpt_knob_is_honored_or_ineligible_per_d_shape():
 
     caps = _caps("sdpa_fwd_prefill_sm107_fp8")
     fp8 = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_fp8=True)
-    for shape in ((256, 256), (192, 128), (128, 128)):
+    for shape in ((512, 512), (256, 256), (192, 128), (128, 128)):
         assert engines.mismatch(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8), SdpaFwdKnobs(sched_policy=SCHED_LPT)) is None, shape
-    why = engines.mismatch(caps, _f16_facts(d_qk=512, d_v=512, **fp8), SdpaFwdKnobs(sched_policy=SCHED_LPT))
-    assert why is not None and "sched_policy" in why
     for shape in ((192, 128), (128, 128)):
         assert engines.mismatch(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8), SdpaFwdKnobs(sched_policy=SCHED_LPT_L2)) is None, shape
     for shape in ((256, 256), (512, 512)):
@@ -2469,7 +2463,7 @@ def test_sm107_gate_kernel_signatures_are_append_only():
     ``gate_strides``) is always declared and compile() keys only what specializes the trace.
     Both quantized families use prepared pointer hosts with runtime gate strides.
     Their internal tensor host signatures remain append-only: ``gate_tensor``
-    immediately follows ``stream``; prepared flags may follow.  Ahead of ``stream``
+    immediately follows ``stream``; prepared flags and FP8 split partials follow.  Ahead of ``stream``
     the slot ORDER is the pointer host's ABI: ``_mxfp8_host._launch`` passes
     everything up to ``seq_q_lens_addr`` positionally and, under ``thd_slots``,
     the three THD length slots right after it (``stream=`` and the flags go by
@@ -2501,8 +2495,10 @@ def test_sm107_gate_kernel_signatures_are_append_only():
         host = list(inspect.signature(mod._host).parameters)
         stream_slot = host.index("stream")
         assert host[stream_slot : stream_slot + 2] == ["stream", "gate_tensor"], (mod.__name__, host[stream_slot:])
-        assert host[stream_slot + 2 :] in ([], ["prepared"]), (mod.__name__, host[stream_slot:])
+        tail = ["prepared", "o_partial_f32"] if mod is fp8 else ["prepared"]
+        assert host[stream_slot + 2 :] == tail, (mod.__name__, host[stream_slot:])
         assert inspect.signature(mod._host).parameters["gate_tensor"].default is None
+    assert inspect.signature(fp8._host).parameters["o_partial_f32"].default is None
     for mod in (f16, fp8, mxfp8):
         assert "gate_tensor" in inspect.signature(mod._kernel).parameters and "tma_gate_desc" in inspect.signature(mod._kernel).parameters
     # The THD length slots sit RIGHT AFTER seq_q_lens_addr and BEFORE stream: the positional tail the shared
@@ -3486,13 +3482,16 @@ def test_sm107_thd_gate_keyless_sequence_is_exactly_zero_and_a_zero_length_seque
 # the two dense arms moved on sm_100a and sm_107a alike; the eight THD / paged / gated arms re-rendered byte-identical.
 # Re-recorded under nvidia-cutlass-dsl 4.8.0 for the THD unit decode through the work prefix: the eight THD / paged / gated
 # arms moved on sm_100a and sm_107a alike; the two dense arms re-rendered byte-identical.
+# Re-recorded after #1922: the BF16 causal dense case now uses fused correction/P1. The shared body's dense cubins
+# change on both compile targets; all eight THD / paged / gated records stay byte-identical. This direct-template
+# probe does not select the separate native SM107 dense body.
 _PAGED_GATE_CUBIN_RECORD = {
     "nvidia-cutlass-dsl": "4.8.0",
-    "sm_100a_dense": "7db6daaf02f536bd9fbfd7e36e671fd8",
+    "sm_100a_dense": "8550fc4d4eb48f233f7bba50e53cc434",
     "sm_100a_thd": "d10d4f3814461e315a33778705e1920c",
     "sm_100a_paged_thd": "066bb542a059b0c1c1083f85f60fddcb",
     "sm_100a_paged_thd_pack": "a812d2551488e2b3b19177b470003278",
-    "sm_107a_dense": "63d9b3efb571b4ba00f3a4625fd280bc",
+    "sm_107a_dense": "22cfb3e0850bc20c2e23a4f86a02f9fd",
     "sm_107a_thd": "38403df53e25b064f21b0e0eb3471af3",
     "sm_107a_paged_thd": "3c106cb810219e1d3f1eab0433049b80",
     "sm_107a_paged_thd_pack": "cb43d702cddfa33ef699cfbe22441edb",
@@ -5243,6 +5242,7 @@ def test_sm107_half_split_direct_template_stats_base(d, stats_log2):
                 scale_softmax_log2=math.log2(math.e) / math.sqrt(d),
                 n_thd_units=0,
                 seq_q_lens_addr=0,
+                thd_origin_ptrs=None,
                 thd_q_lens_ptr=None,
                 thd_kv_lens_ptr=None,
                 thd_lens_form=None,
@@ -5602,6 +5602,7 @@ def test_softmax_lever_config_backstops_follow_the_flavor_tables():
 
     e4m3, bf16, fp16 = 0, 2, 3
     factories = [
+        ("sm107 d64", c.make_cfg_d64, {}),
         ("sm107 d128", c.make_cfg_d128, {}),
         ("sm107 d192xd128", c.make_cfg_d192, {}),
         ("sm107 d256", c.make_cfg_d256, dict(cta_mma=2)),
@@ -5721,7 +5722,7 @@ def test_prefolded_scale_declines_the_single_cta_half_legs_on_the_adapter(monkey
 
 @requires_dsl
 def test_rubin_d128_prefill_packing_loads_the_native_body():
-    """Packed and unpacked CGA2 share the native pipeline; decode and paged keep their own bodies."""
+    """Packed/unpacked prefill and paged THD use the native pipeline; dense decode keeps its shared body."""
     from cudnn.frost.tile_dsl.constants import DTYPE_BF16
 
     def where(**params):
@@ -5734,7 +5735,7 @@ def test_rubin_d128_prefill_packing_loads_the_native_body():
     assert where(cta_mma=2, pack_gqa=True, qh_per_kh=8, split_kv=2) == ("sm107", "prefill_d128_f16.py")
     assert where(cta_mma=2, pack_gqa=True, qh_per_kh=6, thd_varlen=True) == ("sm107", "prefill_d128_f16.py")
     assert where(cta_mma=2) == ("sm107", "prefill_d128_f16.py")
-    assert where(cta_mma=1, thd_varlen=True, paged_kv=True, page_size=16, seq_kv_lens_present=True, split_kv=1) == ("sm100", "prefill_d128_f16.py")
+    assert where(cta_mma=1, thd_varlen=True, paged_kv=True, page_size=16, seq_kv_lens_present=True, split_kv=1) == ("sm107", "prefill_d128_f16.py")
 
 
 def test_rubin_shared_dense_legs_decline_the_prefolded_scale_on_the_adapter(monkeypatch):

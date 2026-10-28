@@ -195,6 +195,51 @@ def test_paged_split_proposal_preserves_selected_packing(monkeypatch, packed, ba
     assert placement.place(spec, facts) == placement.LEAD
 
 
+@requires_dsl
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
+def test_nonpaged_d256_thd_leads_inside_its_domain(device_cc):
+    """Nonpaged d256 THD bottom-right causal prefill: FROST first from 256 query tokens and KV > 512, the backend elsewhere."""
+    from cudnn.sdpa.fwd import placement
+
+    base = dict(h_q=32, h_kv=4, s_q=8192, s_kv=8192, d_qk=256, d_v=256, thd=True, padded=True, causal=True, bottom_right=True, device_cc=device_cc)
+    assert placement._place_sm100_f16(SPEC.capabilities, _facts(**base)) == placement.LEAD
+    assert placement._place_sm100_f16(SPEC.capabilities, _facts(**{**base, "b": 32, "s_q": 256, "s_kv": 256 + 512})) == placement.LEAD
+    # any batch; every integral group and MHA
+    assert placement._place_sm100_f16(SPEC.capabilities, _facts(**{**base, "b": 64, "s_q": 768, "s_kv": 768})) == placement.LEAD
+    for h_kv in (2, 8, 16, 32):
+        assert placement._place_sm100_f16(SPEC.capabilities, _facts(**{**base, "h_kv": h_kv})) == placement.LEAD, h_kv
+    # a shape-override graph declares the cache batch and takes the same choice
+    assert (
+        placement._place_sm100_f16(
+            SPEC.capabilities, _facts(**{**base, "b": 4096, "s_q": 65536, "s_kv": 65536, "shape_overrides": True, "max_total_seq_len_q": 16384})
+        )
+        == placement.LEAD
+    )
+    for other in (
+        dict(s_q=512, s_kv=512),  # KV at the floor
+        dict(s_q=128, s_kv=1024),  # queries below the 256-token floor
+        dict(h_kv=3),  # a non-integral group
+        dict(dtype=cudnn.data_type.HALF),
+        dict(window_left=127),
+        dict(has_sink=True),
+        dict(bottom_right=False),
+    ):
+        assert placement._place_sm100_f16(SPEC.capabilities, _facts(**{**base, **other})) == placement.TRAIL, other
+
+
+@requires_dsl
+@pytest.mark.parametrize("device_cc,page_size", [((10, 0), 16), ((10, 0), 64), ((10, 3), 16), ((10, 3), 64)])
+def test_paged_d128_full_prefill_lead_covers_cc103_and_page64(device_cc, page_size, monkeypatch):
+    """#1809's packed full-prefill domain, extended to cc 10.3 and page 64; other page sizes and long prefixes keep the backend."""
+    from cudnn.sdpa.fwd import placement
+
+    monkeypatch.setattr(heur, "paged_thd_split_choice", lambda caps, facts: (1, False))  # the unsplit path, where the clause decides
+    facts = _paged_split_facts(h_q=32, h_kv=8, s_q=8192, s_kv=8192, device_cc=device_cc, page_size=page_size)
+    assert placement._place_sm100_f16(SPEC.capabilities, facts) == placement.LEAD
+    assert placement._place_sm100_f16(SPEC.capabilities, replace(facts, page_size=32)) == placement.TRAIL
+    assert placement._place_sm100_f16(SPEC.capabilities, replace(facts, s_kv=4 * 8192)) == placement.TRAIL
+
+
 def _mla_split_facts(**overrides):
     base = dict(h_q=4, h_kv=4, s_q=129, s_kv=4097, d_qk=192, d_v=128, thd=True, padded=True)
     base.update(overrides)
@@ -617,3 +662,20 @@ def test_rubin_d64_decode_proposes_the_packed_leg(monkeypatch, s_q, window, sink
     else:
         assert any((p.knobs.split_kv or 1) > 1 for p in plans)  # the split leg is proposed again; its rank is the wave model's
     assert all(mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
+
+
+@pytest.mark.L0
+def test_native_d576_has_launch_geometry_for_the_split_model():
+    """The native D576x512 shape (one 2x2 CTA pair) is a key of the geometry the wave model reads; planning a D576 graph
+    raised KeyError: 576 in _split_launch before."""
+    from cudnn.sdpa.fwd.config_sm100 import cga_ctas, cga_tile_m
+
+    assert (cga_ctas(576), cga_ctas(576, 2), cga_tile_m(576)) == (2, 2, 128)
+    facts = _facts(b=64, h_q=96, h_kv=1, s_q=1, s_kv=8192, d_qk=576, d_v=512, causal=False)
+    assert heur._selected_d_shape(SPEC.capabilities, facts) == (576, 512)
+    launch = heur._split_launch(SPEC.capabilities, facts, 64, 128, 2, 1, split_kv=2)
+    assert launch.ctas_per_tile == 2
+    # 128 Q rows per tile, not D512's 256: S_q=129 is two unpacked tiles, or ceil(129 / (128 // 32)) packed.
+    facts = _facts(b=1, h_q=96, h_kv=1, s_q=129, s_kv=8192, d_qk=576, d_v=512, causal=False)
+    assert heur._split_launch(SPEC.capabilities, facts, 64, 128, 2, 1).q_tiles == 2
+    assert heur._split_launch(SPEC.capabilities, facts, 64, 128, 2, 32).q_tiles == 33

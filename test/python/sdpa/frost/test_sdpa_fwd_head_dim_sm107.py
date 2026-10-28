@@ -312,8 +312,17 @@ def test_config_factories_derive_everything_from_the_tile(width):
     ):
         with pytest.raises(ValueError, match=re.escape(word)):
             c._validate_head_dim_tile(dataclasses.replace(cfg, **{field: value}), "probe")
-    with pytest.raises(ValueError, match="f16/bf16 prefill kernel only"):
-        make(c.TemplateParams(dtype_qkv=0, cta_mma=1))
+    if width == 32:
+        with pytest.raises(ValueError, match="per-tensor FP8 D64"):
+            make(c.TemplateParams(dtype_qkv=0, cta_mma=1))
+    else:
+        for dtype in (0, 1):
+            for cga in (1, 2):
+                quantized, _ = make(c.TemplateParams(dtype_qkv=dtype, dtype_o=2, cta_mma=cga, split_kv=4))
+                assert quantized.TILE_K == quantized.TILE_O == quantized.TILE_K_HW_BMM1 == 64
+                assert quantized.V_SWZ_BYTES == 64 // cga
+                with pytest.raises(ValueError, match="FP8 THD"):
+                    make(c.TemplateParams(dtype_qkv=dtype, cta_mma=cga, thd_varlen=True, seq_kv_lens_present=True))
     with pytest.raises(ValueError, match="THD/varlen"):
         make(c.TemplateParams(dtype_qkv=2, cta_mma=1, thd_varlen=True, seq_kv_lens_present=True))
     with pytest.raises(ValueError, match="epilogue_gate"):
@@ -355,7 +364,7 @@ def test_loader_binds_the_flavor_to_the_record():
 
 
 def test_expect_tx_is_the_full_box_and_every_box_is_the_tile():
-    """Static pin of the zero-fill contract (frost-tile-dsl.md s5: an overshooting TMA box delivers the FULL box's bytes): every
+    """Static pin of the zero-fill contract (frost-tile-dsl.md s5: an overshooting TMA box delivers the FULL box's bytes): the aggregate boxes cover each tile, every
     per-tile element count is a TILE product, every transaction byte count is that count x BPE x CTA_MMA, and no head-dim
     EXTENT (d_qk / d_v) reaches a byte count or a box -- the extents live in the descriptors only."""
     code = "\n".join(ln for ln in _KERNEL.read_text().splitlines() if not ln.lstrip().startswith("#"))
@@ -369,8 +378,8 @@ def test_expect_tx_is_the_full_box_and_every_box_is_the_tile():
         "HEADS_PER_TILE = CFG.PACK_G if CFG.PACK_GQA else 1",
         "TOKENS_PER_TILE = CFG.TILE_M // HEADS_PER_TILE",
         "qk_box_q = (1, TOKENS_PER_TILE, HEADS_PER_TILE, TMA_QK_GRANU_ELEMS)",
-        "qk_box_k = (1, CFG.TILE_N // CFG.CTA_MMA, 1, TMA_QK_GRANU_ELEMS)",
-        "vo_box_v = (1, CFG.TILE_N, 1, TMA_VO_GRANU_ELEMS)",
+        "qk_box_k = (1, K_BOX_ROWS, 1, TMA_QK_GRANU_ELEMS)",
+        "vo_box_v = (1, V_BOX_ROWS, 1, TMA_VO_GRANU_ELEMS)",
         "vo_box_o = (1, TOKENS_PER_TILE, HEADS_PER_TILE, _O_GRANU_ELEMS)",
     ):
         assert line in code, line
@@ -393,6 +402,47 @@ def test_expect_tx_is_the_full_box_and_every_box_is_the_tile():
                 assert math.prod(env[name]) == 128 * granularity, (packed, pack_g, name, env[name])
                 if not packed or pack_g == 1:
                     assert env[name] == (1, 128, 1, granularity)
+    # Evaluate the source's page subdivision and byte-count expressions together.
+    # Per-page boxes must still deliver the full expect_tx volume, including
+    # zero-filled head-dim tails; nonpaged boxes retain the original geometry.
+    names = (
+        "_K_TILE_ROWS",
+        "K_BOX_ROWS",
+        "V_BOX_ROWS",
+        "K_BOXES",
+        "V_BOXES",
+        "qk_box_k",
+        "vo_box_v",
+        "kBufferElems",
+        "vBufferElems",
+        "kTmaTransactionBytes",
+        "vTmaTransactionBytes",
+    )
+    expressions = {
+        target.id: node.value
+        for node in ast.walk(ast.parse(code))
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name) and target.id in names
+    }
+    for cga in (1, 2):
+        for tile_n in (64, 128):
+            for width in (32, 64, 128):
+                for page in (0, 8, 16, 32, 64, 128, 256):
+                    cfg = SimpleNamespace(TILE_N=tile_n, TILE_K=width, TILE_O=width, CTA_MMA=cga, BPE=2)
+                    env = dict(CFG=cfg, PAGED_KV=bool(page), PAGE_SIZE=page, TMA_QK_GRANU_ELEMS=32, TMA_VO_GRANU_ELEMS=16)
+                    for name in names:
+                        env[name] = eval(compile(ast.Expression(expressions[name]), str(_KERNEL), "eval"), {"__builtins__": {"min": min}}, env)
+                    assert math.prod(env["qk_box_k"]) * (width // 32) * env["K_BOXES"] * 2 * cga == env["kTmaTransactionBytes"]
+                    assert math.prod(env["vo_box_v"]) * (width // cga // 16) * env["V_BOXES"] * 2 * cga == env["vTmaTransactionBytes"]
+                    assert env["K_BOX_ROWS"] * env["K_BOXES"] == tile_n // cga
+                    assert env["V_BOX_ROWS"] * env["V_BOXES"] == tile_n
+                    if page:
+                        assert env["K_BOX_ROWS"] <= page and env["V_BOX_ROWS"] <= page
+                    else:
+                        assert env["qk_box_k"] == (1, tile_n // cga, 1, 32)
+                        assert env["vo_box_v"] == (1, tile_n, 1, 16)
+                        assert env["K_BOXES"] == env["V_BOXES"] == 1
     for bad in (r"TransactionBytes\s*=.*\bd_(qk|v)\b", r"box_[qkvo]\s*=.*\bd_(qk|v)\b", r"BufferElems\s*=.*\bd_(qk|v)\b"):
         assert not re.search(bad, code), bad
     assert "_MAKE_CFG = {32: make_cfg_d32, 64: make_cfg_d64, 128: make_cfg_d128}" in code

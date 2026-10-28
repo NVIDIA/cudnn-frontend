@@ -69,10 +69,11 @@ def test_prepared_fp8_paged_rebind(d, hnd, split, in_key, dtype, monkeypatch):
 @pytest.mark.parametrize("hnd", [False, True])
 @pytest.mark.parametrize("split", [1, 4])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
-def test_prepared_fp8_paged_strides_and_capture(hnd, split, dtype, monkeypatch):
+@pytest.mark.parametrize("d", [128, 256])
+def test_prepared_fp8_paged_strides_and_capture(hnd, split, dtype, d, monkeypatch):
     import cutlass.cute as cute
 
-    g, vp, ws, bufs, tensors = _case(hnd=hnd, split=split, dtype=dtype)
+    g, vp, ws, bufs, tensors = _case(d=d, hnd=hnd, split=split, dtype=dtype)
     prepared = g._compiled_plans[g._plan_index]._prepared
     assert prepared is not None
     owner = prepared.spec.owner
@@ -119,7 +120,7 @@ def test_prepared_fp8_paged_strides_and_capture(hnd, split, dtype, monkeypatch):
     assert prepared.spec.owner is owner
 
 
-@pytest.mark.parametrize("d,dv,split", [(64, 64, 1), (64, 64, 4), (112, 96, 1), (112, 96, 4), (384, 320, 1)])
+@pytest.mark.parametrize("d,dv,split", [(64, 64, 1), (64, 64, 4), (112, 96, 1), (112, 96, 4), (256, 256, 1), (256, 256, 4), (384, 320, 1)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_prepared_fp8_dense_head_envelopes(d, dv, split, dtype, monkeypatch):
     import cutlass.cute.runtime as runtime
@@ -332,3 +333,32 @@ def test_prepared_fp8_independent_table_physical_stride_int64(role, product, spl
         _check(bufs)
     for decoy in decoys:
         assert torch.count_nonzero(decoy) == 0
+
+
+@pytest.mark.parametrize("sink_logit", [-120.0, 120.0])
+def test_prepared_fp8_d256_dense_keyless_sink(sink_logit):
+    """The shared D256 epilogue preserves sink-only Stats in dense storage."""
+    import test_sdpa_fwd_fp8_sm100 as dense
+
+    sink = torch.full((1, 8, 1, 1), sink_logit, device="cuda", dtype=torch.float32)
+    result = dense._run(
+        3,
+        8,
+        8,
+        256,
+        256,
+        "e4m3",
+        torch.float16,
+        scale=1.0 / 16,
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True),
+        sink=sink,
+        seq_lens_q=[256, 129, 0],
+        seq_lens_kv=[200, 256, 128],
+        d_qk=256,
+        d_v=256,
+        return_lse=True,
+    )
+    dense._check(result.output, result.reference, torch.float16, "e4m3", result.amax, result.reference_amax)
+    assert torch.count_nonzero(result.output[0, :, :56]) == 0
+    torch.testing.assert_close(result.stats[0, :, :56], sink.view(8, 1).expand(8, 56), atol=1e-4, rtol=0)
+    torch.testing.assert_close(result.stats, result.reference_stats, atol=5e-2, rtol=3e-2)

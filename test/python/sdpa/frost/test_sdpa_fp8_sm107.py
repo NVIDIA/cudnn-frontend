@@ -16,7 +16,7 @@ import re
 
 import pytest
 
-from frost_test_utils import requires_dsl
+from frost_test_utils import requires_dsl, requires_rubin
 
 from cudnn.sdpa.fwd.api_dsl import _sm100_fp8_shapes
 from cudnn.sdpa.fwd.config_sm100 import TemplateParams
@@ -87,18 +87,22 @@ def test_sm100_module_unchanged():
 
 
 def test_sm107_per_tensor_fp8_native_shapes():
-    """INVERTED 2026-09-04: the SM107 port added d256 and d512 per-tensor FP8.
-    INVERTED again 2026-09-09: d192xd128 gained its Rubin sibling
-    (sm107/prefill_d192_d128_fp8.py), so both arch lines carry all four d >= 128
-    native flavors.  The SM100 line additionally carries the native d64 leg (the
-    d128 FP8 file at TemplateParams.d_flavor=64); Rubin has no d64 sibling and
-    keeps d64 on the d128 envelope, so the two shape sets differ by exactly that
-    flavor."""
-    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
-    assert (192, 128) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7))
-    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0)) == _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) | {(64, 64)}
-    assert (192, 128) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
-    assert (256, 256) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
+    """Both architecture lines provide native per-tensor D64 geometry."""
+    shapes = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
+    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) == shapes
+    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0)) == shapes
+
+
+@pytest.mark.parametrize("cga", [1, 2])
+@pytest.mark.parametrize("dtype", [0, 1])
+def test_sm107_fp8_d64_loader_binds_native_geometry(cga, dtype):
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
+
+    # A default record must not silently load the D128 envelope under a D64 key.
+    module = _load_sm100_kernel_module((64, 64), TemplateParams(dtype_qkv=dtype, dtype_o=_BF16_OUT, cta_mma=cga), fp8=True, pertensor=True, rubin=True)
+    assert module.PARAMS.d_flavor == 64
+    assert (module.CFG.TILE_K, module.CFG.TILE_O, module.CFG.TILE_K_HW_BMM1) == (64, 64, 64)
+    assert module.CFG.CTA_MMA == cga
 
 
 def test_per_tensor_fp8_rows_split_per_arch_line():
@@ -116,34 +120,17 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     # Arch ranges tile the SM100 family at the Rubin boundary, no overlap.
     assert (sm100.sm_lo, sm100.sm_hi) == (100, 106)
     assert (sm107.sm_lo, sm107.sm_hi) == (107, 119)
-    # Kernel flavors are row DATA.  FULLY INVERTED 2026-09-09: the Rubin line
-    # now carries all four d >= 128 per-tensor FP8 flavors, d192xd128 included.
-    # The native d64 leg (the d128 FP8 file at TemplateParams.d_flavor=64) is
-    # SM100-only -- api_dsl._SM107_FP8_KERNEL_FILES has no (64, 64), so a d64
-    # graph rides the d128 envelope on Rubin and the row must not name a flavor
-    # its split / PackGQA / scheduler domains never build.  The rows still
-    # differ on THD, split-KV, PackGQA and the scheduler domain -- which is the
-    # point of splitting the rows.
-    assert sm100.d_shapes == frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
-    assert sm107.d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
-    assert (192, 128) in sm107.d_shapes
-    assert (64, 64) not in sm107.d_shapes
+    assert sm100.d_shapes == sm107.d_shapes == frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
+    assert dict(sm107.cgas_by_d_shape)[(64, 64)] == frozenset({1, 2})
+    assert (64, 64) in sm107.split_d_shapes and (64, 64) in sm107.pack_gqa_d_shapes
+    assert (64, 64) not in sm107.thd_d_shapes
     # The envelope floors are arch-INDEPENDENT (api_dsl._SM100_FP8_ENVELOPE_FLOORS),
     # so a row that gains a flavor must gain its floor in the same commit --
     # otherwise mismatch() admits a graph check_support kills (contract 8b').
     assert dict(sm107.d_envelope_floors) == dict(sm100.d_envelope_floors)
-    # Envelope FLOORS keep an inexact graph off a flavor whose padded path is
-    # not validated.  BOTH rows carry them, and the Rubin one differs only by
-    # the (192, 128) entry it has no flavor for -- the floors' rationale is the
-    # kernel geometry (a cga4x1 d512 role-split; an unvalidated d256 padded
-    # path), which the Rubin ports inherit unchanged.  They must also match
-    # api_dsl._SM100_FP8_ENVELOPE_FLOORS, which the adapter enforces on BOTH
-    # arch lines -- a row that admits what the adapter rejects is a plan that
-    # enters the ranked list only to die in check_support.
-    assert sm100.d_envelope_floors == (((192, 128), 128), ((256, 256), 255), ((512, 512), 256))
-    # INVERTED 2026-09-09: Rubin gained the d192 flavor, so it gained that
-    # flavor's floor too -- the two rows' floor tables are now identical.
-    assert sm107.d_envelope_floors == (((192, 128), 128), ((256, 256), 255), ((512, 512), 256))
+    # Both rows keep the D512 role-split floor; smaller flavors serve their
+    # qualified aligned dense envelopes through bounded TMA descriptors.
+    assert sm100.d_envelope_floors == sm107.d_envelope_floors == (((512, 512), 256),)
 
     # The f16x2 exponent arm is Rubin-row data, not a notch.
     assert sm100.softmax_precisions == frozenset({_c.data_type.FLOAT})
@@ -160,13 +147,12 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     # (192, 128) since 2026-09-11, LPT + LPT_L2 at (192, 128) and (128, 128)
     # since 2026-09-14 (LPT_L2's decode needs qh_per_kh / seqlen_kv at every
     # call site, which the d128 and d192x128 kernels thread and the d256 /
-    # d512 kernels do not) -- each validated bit-identical to NATURAL; d512
-    # stays out (its role-split kernel
-    # still lacks the #1001 `lpt_q_tiles_in_cga_units` argument and writes
-    # nothing under LPT, which is what the old "causal d512 FP8 under LPT
-    # returns NaN" report was).
+    # d512 kernels do not). D512 now counts LPT Q tiles in CGA units;
+    # its two role pairs share rows, and both packed/unpacked plans use it.
     assert sm107.sched_policies == frozenset({SCHED_NATURAL})
     assert dict(sm107.sched_policies_by_d_shape) == {
+        (512, 512): frozenset({SCHED_NATURAL, SCHED_LPT}),
+        (64, 64): frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
         (256, 256): frozenset({SCHED_NATURAL, SCHED_LPT}),
         (192, 128): frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
         (128, 128): frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
@@ -607,12 +593,9 @@ def test_fp8_rows_serve_dense_envelope():
     for arch in ("sm100", "sm107"):
         row = caps[engines.engine_name(arch=arch, fp8=True)]
         assert row.d_pad_multiple == 16, arch
-    # FULLY INVERTED 2026-09-09: the Rubin per-tensor FP8 THD leg now covers every
-    # native flavor -- d192xd128 came free with the DSv3 port (same body as d128),
-    # and d256/d512 were moved onto the FROST THD contract.  Both lines now serve
-    # THD at every shape they serve dense.
+    # Native D64 is dense-only; THD retains the four D128-and-larger flavors.
     rubin_fp8 = caps[engines.engine_name(arch="sm107", fp8=True)]
-    assert rubin_fp8.thd_d_shapes == rubin_fp8.d_shapes
+    assert rubin_fp8.thd_d_shapes == rubin_fp8.d_shapes - {(64, 64)}
     assert caps[engines.engine_name(fp8=True)].thd_d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
 
     # The row and the STANDALONE wrapper enforce the same fact at two places
@@ -755,14 +738,17 @@ def test_fp8_envelope_mismatch_rules():
     sm100 = caps[engines.engine_name(fp8=True)]
     assert engines.mismatch(sm100, _fp8_facts()) is None
     assert engines.mismatch(sm100, _fp8_facts(d_qk=96, d_v=64)) is None
-    # The d192xd128 and D256 flavors serve ONLY their exact shapes (floors 128 / 255):
-    # d_qk zero-padded into d192 is numerically wrong and the D256 padded envelope is
-    # nondeterministic in test_mhas_v2, so the row declines the whole (128, 256) inexact
-    # region and the classic backend verdict applies there.
+    # D192 and D256 serve their aligned dense head envelopes.
     assert engines.mismatch(sm100, _fp8_facts(d_qk=192, d_v=128)) is None
     assert engines.mismatch(sm100, _fp8_facts(d_qk=256, d_v=256)) is None
-    for dq, dv in ((160, 96), (176, 128), (192, 96), (160, 160), (224, 208)):
-        assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=dq, d_v=dv)), (dq, dv)
+    for dq, dv in ((16, 144), (224, 16), (160, 160), (224, 208)):
+        for arch, cc in (("sm100", (10, 0)), ("sm107", (10, 7))):
+            row = caps[engines.engine_name(arch=arch, fp8=True)]
+            facts = _fp8_facts(device_cc=cc, d_qk=dq, d_v=dv)
+            assert engines.mismatch(row, facts) is None, (arch, dq, dv)
+            assert engines._selected_d_shape(row, facts) == (256, 256)
+    for dq, dv in ((160, 96), (176, 128), (192, 96)):
+        assert engines.mismatch(sm100, _fp8_facts(d_qk=dq, d_v=dv)) is None
     assert engines._selected_d_shape(sm100, _fp8_facts(d_qk=192, d_v=128)) == (192, 128)
     assert engines._selected_d_shape(sm100, _fp8_facts(d_qk=256, d_v=256)) == (256, 256)
     assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=272, d_v=256))
@@ -790,14 +776,11 @@ def test_fp8_envelope_mismatch_rules():
     # The Rubin row serves the same dense envelope (the ViT d=72-in-80 case).
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
     assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7))) is None
-    # INVERTED 2026-09-09: the Rubin d192 FP8 sibling landed, so the EXACT
-    # shape is now served on both rows.  Its floor (128) came with it, so the
-    # inexact region below stays declined -- d_qk zero-padded into d192 is
-    # numerically wrong, and that is a kernel property, not an arch one.
+    # Native SM107 serves the same aligned dense D192 envelope.
     assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128)) is None
     assert engines._selected_d_shape(sm107, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128)) == (192, 128)
     for dq, dv in ((160, 96), (176, 128), (192, 96)):
-        assert "no kernel-flavor envelope" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=dq, d_v=dv)), (dq, dv)
+        assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=dq, d_v=dv)) is None, (dq, dv)
     assert "dense-only" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), thd=True, padded=True))
     # INVERTED: the Rubin line gained a d512 per-tensor FP8 kernel, so the
     # native d512 shape is now SERVED rather than declined, and the (256, 512]
@@ -843,14 +826,16 @@ def test_sm107_split_is_wired_only_for_supported_flavors():
     # The wired cell builds.
     cfg.make_cfg_d128(tp(dtype_qkv=_E4M3, dtype_o=_BF16_OUT))
     cfg.make_cfg_d192(tp(dtype_qkv=_E4M3, dtype_o=_BF16_OUT))
+    cfg.make_cfg_d256(tp(dtype_qkv=_E4M3, dtype_o=_BF16_OUT))
     cfg.make_cfg_d128(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
     cfg.make_cfg_d192(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
 
-    # Wider per-tensor and block-scaled Rubin cells still refuse split.
+    cfg.make_cfg_d512(tp(dtype_qkv=_E4M3, dtype_o=_BF16_OUT))
+
+    # Block-scaled Rubin cells still refuse split.
     unwired = [
         ("d128 mxfp8", cfg.make_cfg_d128_mxfp8, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
-        ("d256", cfg.make_cfg_d256, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
-        ("d512", cfg.make_cfg_d512, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
+        ("d256 mxfp8", cfg.make_cfg_d256_mxfp8, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
     ]
     for name, make, params in unwired:
         with pytest.raises(ValueError, match="split_kv > 1 is not wired"):
@@ -1857,7 +1842,7 @@ class TestMixedStagedFp8:
     test_mixed_layout = staticmethod(_mixed_layout)
 
 
-@pytest.mark.parametrize("d", [128, 192])
+@pytest.mark.parametrize("d", [128, 192, 512])
 def test_sm107_fp8_direct_split_keeps_partial_stats_natural(d, monkeypatch):
     """Bypass adapter flag normalization and check the template/combiner log-base contract."""
     import math
@@ -1866,7 +1851,7 @@ def test_sm107_fp8_direct_split_keeps_partial_stats_natural(d, monkeypatch):
 
     if torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("SM107 required")
-    b, h, sq, sk, dv, splits = 1, 2, 16, 512, 128, 4
+    b, h, sq, sk, dv, splits = 1, 2, 16, 512, (512 if d == 512 else 128), 4
     q = torch.full((b, sq, h, d), 0.5, device="cuda", dtype=torch.float8_e4m3fn).transpose(1, 2)
     chunks = torch.arange(sk, device="cuda") // 128 + 1
     k = (chunks.view(1, sk, 1, 1) * 0.5).expand(b, sk, 1, d).to(q.dtype).contiguous().transpose(1, 2)
@@ -1893,22 +1878,25 @@ def test_sm107_fp8_direct_split_keeps_partial_stats_natural(d, monkeypatch):
     torch.testing.assert_close(lse.double(), scores.logsumexp(-1) * math.log2(math.e), atol=2e-4, rtol=2e-5)
 
 
-@pytest.mark.parametrize("d,pack,accepted", [(128, True, True), (192, False, True), (192, True, False)])
+@pytest.mark.parametrize(
+    "d,pack,accepted", [(128, True, True), (192, False, True), (192, True, True), (256, True, True), (512, True, True), (512, False, True)]
+)
 def test_sm107_fp8_split_standalone_pack_domain(d, pack, accepted):
-    """A divisible GQA group does not make an unvalidated packed flavor eligible."""
+    """Native per-tensor FP8 packed splits share adapter admission."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     if torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("SM107 required")
+    dv = d if d >= 256 else 128
     q, k, v = [
-        torch.empty((1, s, h, width), device="cuda", dtype=torch.float8_e4m3fn).transpose(1, 2) for s, h, width in ((16, 4, d), (512, 1, d), (512, 1, 128))
+        torch.empty((1, s, h, width), device="cuda", dtype=torch.float8_e4m3fn).transpose(1, 2) for s, h, width in ((16, 4, d), (512, 1, d), (512, 1, dv))
     ]
-    out = torch.empty((1, 16, 4, 128), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
-    api = SdpaFwdDslSm100(q, k, v, out, pertensor_fp8=True, split_kv=4, pack_gqa=pack, cga=2)
+    out = torch.empty((1, 16, 4, dv), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    api = SdpaFwdDslSm100(q, k, v, out, pertensor_fp8=True, split_kv=4, pack_gqa=pack, cga=1 if d == 256 else 2)
     if accepted:
         assert api.check_support()
     else:
-        with pytest.raises(NotImplementedError, match="PackGQA"):
+        with pytest.raises(NotImplementedError, match="split_kv"):
             api.check_support()
 
 
@@ -2016,3 +2004,129 @@ def test_sm107_d256_mxfp8_pair_is_bitwise_the_one_cta_build(causal):
         assert err <= 0.1 * scale, f"cga {cga}: max err {err} vs fp32 reference (scale {scale})"
     assert torch.equal(outs[1][0], outs[2][0]) and torch.equal(outs[1][1], outs[2][1]), "O / LSE must be bit-identical across the CTA widths"
     assert torch.equal(outs[None][0], outs[2][0]) and torch.equal(outs[None][1], outs[2][1]), "the unset knob must be the pair"
+
+
+@requires_rubin
+class TestNativeFp8SinkSplit:
+    """Keep the native regressions in the explicitly selected SM107 CI entry."""
+
+    from sdpa_fp8_sink_split_sm107 import (
+        test_native_fp8_sink_split_rebind_replay as _rebind,
+        test_native_fp8_sink_split_standalone as _standalone,
+        test_native_fp8_sink_keeps_independent_split_domain as _domain,
+    )
+
+    test_rebind_and_replay = staticmethod(_rebind)
+    test_standalone = staticmethod(_standalone)
+    test_split_domain = staticmethod(_domain)
+
+
+@requires_rubin
+class TestNativeD192Fp8Pack:
+    """Expose packing and decline regressions through the selected CI file."""
+
+    from sdpa_fp8_d192_pack_sm107 import (
+        test_native_d192_fp8_pack_rebind_replay as _rebind,
+        test_native_d192_pack_retains_thd_padding_decline as _decline,
+    )
+
+    test_rebind_and_replay = staticmethod(_rebind)
+    test_thd_padding_decline = staticmethod(_decline)
+
+
+@requires_rubin
+class TestNativeD192Fp8HeadPadding:
+    """Run both dense-envelope suites from the selected SM107 CI entry."""
+
+    from sdpa_fp8_d192_padding import test_fp8_d192_padded_heads_rebind_replay as _rebind
+    from test_sdpa_fwd_fp8_sm100 import _check_fp8_d192_head_envelope_masks as _masks
+
+    test_rebind_and_replay = staticmethod(_rebind)
+    test_masks = staticmethod(_masks)
+
+
+@requires_rubin
+class TestNativeD256Fp8HeadPadding:
+    """Collect the native D256 dense envelope through the selected CI entry."""
+
+    from sdpa_fp8_d256_padding import test_dense_rebind_replay as _dense, test_dense_masks as _masks, test_dense_half_softmax as _half
+
+    test_dense_rebind_replay = staticmethod(_dense)
+    test_dense_masks = staticmethod(_masks)
+    test_dense_half_softmax = staticmethod(_half)
+
+
+@requires_rubin
+class TestNativeD256Fp8Pack:
+    """Run native D256 packing through the selected architecture CI entry."""
+
+    from sdpa_fp8_d256_pack_sm107 import (
+        test_native_d256_pack_rebind_replay as _dense,
+        test_native_d256_pack_half_softmax as _half,
+        test_native_d256_pack_large_group_adapter as _adapter,
+        test_native_d256_pack_declines as _declines,
+    )
+
+    test_rebind_and_replay = staticmethod(_dense)
+    test_half_softmax = staticmethod(_half)
+    test_large_group_adapter = staticmethod(_adapter)
+    test_declines = staticmethod(_declines)
+
+
+@requires_rubin
+class TestNativeD256Fp8Split:
+    """Native split partials and the shared final combine preserve one contract."""
+
+    from sdpa_fp8_d256_split_sm107 import (
+        test_native_d256_split_rebind_replay as _replay,
+        test_native_d256_split_half_adapter as _adapter,
+        test_native_d256_split_nomask_optional as _optional,
+        test_native_d256_split_omitted_scales as _scales,
+        test_native_d256_split_scalar_kv_tail as _tail,
+    )
+
+    test_rebind_and_replay = staticmethod(_replay)
+    test_half_adapter = staticmethod(_adapter)
+
+    test_nomask_optional = staticmethod(_optional)
+    test_omitted_scales = staticmethod(_scales)
+
+    test_scalar_kv_tail = staticmethod(_tail)
+
+
+@requires_rubin
+class TestNativeD512Fp8Pack:
+    """Collect native role-split D512 packing and scheduling on the target architecture."""
+
+    from sdpa_fp8_d512_pack_sm107 import (
+        test_native_d512_pack_rebind_replay as _dense,
+        test_native_d512_pack_half_adapter as _half,
+        test_native_d512_unpacked_lpt as _lpt,
+        test_native_d512_pack_declines as _declines,
+    )
+
+    test_rebind_and_replay = staticmethod(_dense)
+    test_half_adapter = staticmethod(_half)
+    test_unpacked_lpt = staticmethod(_lpt)
+    test_declines = staticmethod(_declines)
+
+
+@requires_rubin
+class TestNativeD512Fp8Split:
+    """Native split partials and the shared final combine preserve one contract."""
+
+    from sdpa_fp8_d512_split_sm107 import (
+        test_native_d512_split_rebind_replay as _replay,
+        test_native_d512_split_half_adapter as _adapter,
+        test_native_d512_split_nomask_optional as _optional,
+        test_native_d512_split_omitted_scales as _scales,
+        test_native_d512_split_scalar_kv_tail as _tail,
+    )
+
+    test_rebind_and_replay = staticmethod(_replay)
+    test_half_adapter = staticmethod(_adapter)
+
+    test_nomask_optional = staticmethod(_optional)
+    test_omitted_scales = staticmethod(_scales)
+
+    test_scalar_kv_tail = staticmethod(_tail)
