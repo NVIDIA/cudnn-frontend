@@ -80,6 +80,24 @@ The initial-wave limit is a plan-time choice evaluated against current host-know
 capacity at binding. Where an exact packed workload is available, count packed
 token tiles rather than unpacked tiles times all query heads.
 
+Packed split partials use compact work prefixes, but Q/K/V and final O/Stats
+may each have independent physical origins. Do not reuse partial indexing for
+input addressing or drop the origin declarations while lowering a split plan.
+The D128 nonpaged split cases in `test_sdpa_fwd_thd_origins.py` poison the gaps
+and rebind all pitches; mixed FP8 KV repeats them in
+`test_sdpa_fwd_mixed_kv_sm100.py`. Sequence-local K/V maps clip each live segment,
+so interior NaN padding cannot enter a tile tail.
+
+For single-Q ragged split decode, physical Q-offset differences can include
+storage gaps. The combine must use the declared device Q lengths (ordinary or
+cumulative), independently of output addresses. Exercise an empty sequence with
+nonzero offset distance and assert that both O and Stats canaries remain intact;
+`test_half_q_single_q_ragged_decode` covers graph and standalone execution,
+rebinding and retained replay. Standalone THD requires Q lengths independently
+of the dense-only `seq_q_lens_present` flag: bind against the compiled spec,
+validate ordinary B or cumulative B+1 storage, and reject uncompiled operands.
+A graph-only test misses a direct-API operand silently dropped by that flag.
+
 **Rule S2 — A change to any FROST SDPA `Capabilities` row updates
 `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` in the same commit.**
 

@@ -302,10 +302,14 @@ class SdpaThdBinder {
         }
         auto expect = py::cast<py::dict>(spec.attr("expect"));
         auto decl   = py::cast<py::dict>(spec.attr("decl"));
+        // Plain sdpa may retain half Q/O while the compiled kernel reads FP8 K/V.
+        // Cache each port's declared type; runtime binding still checks it exactly.
         for (size_t i = Q; i <= O; ++i) {
             const auto dtype = py::cast<std::string>(expect[names[i]]);
             const bool fp8   = dtype == "float8_e4m3fn" || dtype == "float8_e5m2";
-            if ((quantized_ && i != O) ? !fp8 : (dtype != "float16" && dtype != "bfloat16" && !(quantized_ && fp8)))
+            if ((quantized_ && i != O)
+                    ? !fp8
+                    : (dtype != "float16" && dtype != "bfloat16" && !(fp8 && (quantized_ || i == K || i == V))))
                 invalid("native THD binding has an unsupported operand dtype");
             dtype_code_[i]       = fp8 ? (dtype == "float8_e4m3fn" ? kDLFloat8_e4m3fn : kDLFloat8_e5m2)
                                        : (dtype == "float16" ? kDLFloat : kDLBfloat);
@@ -340,21 +344,20 @@ class SdpaThdBinder {
                 invalid("invalid native THD gate declaration");
         }
         if (py::hasattr(spec, "origin_specs") && !spec.attr("origin_specs").is_none()) {
-            const bool paged_d128_split = paged_ && cga_tile_m_ == 128 && integer(spec, "d_qk") == 128 &&
-                                          integer(spec, "d_v") == 128 && splits_ > 1;
+            const bool d128_split = !quantized_ && cga_tile_m_ == 128 && integer(spec, "d_qk") == 128 &&
+                                    integer(spec, "d_v") == 128 && splits_ > 1;
             const bool d576_split = !quantized_ && cga_tile_m_ == 128 && integer(spec, "d_qk") == 576 &&
                                     integer(spec, "d_v") == 512 && splits_ > 1;
-            if ((quantized_ && (!paged_ || mx_scales_)) || (splits_ != 1 && !paged_d128_split && !d576_split) ||
-                has_gate_)
+            if ((quantized_ && (!paged_ || mx_scales_)) || (splits_ != 1 && !d128_split && !d576_split) || has_gate_)
                 invalid(
-                    "physical THD origins require ungated half unsplit/paged D128 split/native D576 split or unsplit "
+                    "physical THD origins require ungated half unsplit/D128 split/native D576 split or unsplit "
                     "per-tensor FP8 "
                     "paged plans");
             auto specs = py::cast<py::tuple>(spec.attr("origin_specs"));
             if (specs.size() != 5) invalid("physical THD origins require five ports");
-            if (paged_d128_split || d576_split) {
-                if (paged_d128_split && specs[static_cast<size_t>(Q)].is_none())
-                    invalid("physical paged split plans require Q offsets");
+            if (d128_split || d576_split) {
+                if (d128_split && specs[static_cast<size_t>(Q)].is_none())
+                    invalid("physical D128 split plans require Q offsets");
                 // Origin maps/rows precede compact partials in the same caller workspace.
                 const int64_t origin_bytes =
                     add(multiply(add(b_, 1), 512), multiply(add(multiply(b_, 40), 127) / 128, 128));
@@ -1050,10 +1053,12 @@ init_sdpa_thd_binding(py::module_ &m) {
              py::arg("stream").none())
         .def_prop_ro_static("supports_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_native_d576", [](py::object) { return true; })
+        .def_prop_ro_static("supports_mixed_fp8_kv", [](py::object) { return true; })
         .def_prop_ro_static("supports_native_d576_packed_split", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_fp8_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_split_physical_origins", [](py::object) { return true; })
+        .def_prop_ro_static("supports_nonpaged_d128_split_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_initial_waves", [](py::object) { return true; })
         .def_prop_ro_static("supports_initial_wave_geometry", [](py::object) { return true; })
         .def_prop_ro_static("supports_stats_stride_override", [](py::object) { return true; })

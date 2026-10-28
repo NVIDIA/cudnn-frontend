@@ -511,6 +511,10 @@ class SdpaGraphFacts:
     # caller replays execute under a CUDA graph (pygraph(is_cuda_graph_replay_expected=True)):
     # per-execute host costs are paid once at capture, so heuristics may lead with the GPU-time optimum
     cuda_graph_replay: bool = False
+    # Independent KV storage on a plain sdpa forward. Keep uniform_dtype's
+    # existing meaning for every other row and for backward.
+    kv_dtype: Optional[Any] = None  # shared K/V dtype; None when they differ
+    uniform_qo_dtype: bool = True  # actual O dtype equals Q
 
 
 _SDPA_NODE_TYPES = (
@@ -1002,6 +1006,8 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         d_v=d_v,
         dtype=q_dtype,
         uniform_dtype=uniform,
+        kv_dtype=k.get_data_type() if k.get_data_type() == v.get_data_type() else None,
+        uniform_qo_dtype=q_dtype == o_dtype,
         uniform_out_dtype=uniform_out,
         bshd_layout=bshd,
         packed_layout=packed,

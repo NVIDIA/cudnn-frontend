@@ -1,5 +1,21 @@
 # FROST SDPA — support matrix
 
+**Independent FP8 KV storage:** the SM100/SM103 half forward row serves exact
+D128 Q/K/V through plain `sdpa()` with BF16 or FP16 Q/O and matching E4M3 or
+E5M2 K/V. K/V are loaded and converted on chip; Q retains its original half
+precision, with no per-tensor descales or materialized half KV copy. Dense and
+paged Q retain the existing D128 prefill/decode selection and split-KV plans.
+THD retains its existing CGA/split domain and physical-origin contracts. The
+single-Q mixed tile uses two converted KV stages plus a raw FP8 slab; uniform
+half keeps its three stages. Other native flavors/architecture lines remain
+unsupported for mixed storage.
+D128 nonpaged THD split also honors independent physical Q/K/V/O/Stats origins
+for uniform half and mixed KV; partial storage keeps its compact indexing.
+Single-Q ragged split reads the declared device Q lengths (ordinary or cumulative)
+independently of physical offset gaps, preserving empty-row O/Stats canaries.
+Every operand uses its own TMA byte-alignment requirement and the native
+prepared binding contract. This changes eligibility only, not heuristics.
+
 SM100/SM103 per-tensor FP8 paged KV also serves native D128/D256 THD queries,
 with independent runtime Q/O/Stats offsets and padded or packed Stats. The
 unsplit, unpacked native bodies retain page-pool K/V descriptors; Q/O use
