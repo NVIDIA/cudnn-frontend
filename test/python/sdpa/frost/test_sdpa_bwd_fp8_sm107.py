@@ -2284,8 +2284,9 @@ def test_fp8_row_launches_one_setup_and_one_fold_whatever_the_group(hkv):
 # decision -- and one no numerics test can see: the previous form read every partial through 32-bit scalar loads (its vector load
 # had lost the tensor's alignment in the pointer arithmetic) and ran at 41-56 % of the HBM pin, bitwise correct.  Two tripwires:
 # the geometry helpers (one 16-byte load per partial per thread, a persistent grid capped at 8 CTAs of 256 threads per SM) and the
-# SASS of the pair kernel compiled for sm_107a (128-bit loads, no scalar partial reads, no spill, ONE atomicMax site per operand
-# set).  A third pin keeps the fp8 host-compile entries from growing a placeholder default for the device's multiprocessor count.
+# SASS of the pair kernel compiled for sm_107a (128-bit loads, no scalar partial reads, no spill, at most one atomicMax per CTA).
+# The two CTA-uniform arms may share their reduction tail; the runtime check below verifies both sets' outputs independently.
+# A third pin keeps the fp8 host-compile entries from growing a placeholder default for the device's multiprocessor count.
 _FOLD_SASS_PROBE = """
 import glob, os, re, subprocess, sys
 dump, group, cands = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
@@ -2372,8 +2373,9 @@ def test_fp8_prepared_host_compile_takes_the_device_sm_count_without_a_default()
 def test_fp8_fold_pass_sass_reads_128_bit_vectors_and_folds_one_atomic_per_cta(tmp_path):
     """sm_107a SASS of ``fold_quant_pair_kernel`` (fp32 partials, group 16, e4m3 out): every partial read is a 128-bit load (one
     per partial per set body -- the previous form read 258 32-bit scalars per thread and no LDG.128), the only 32-bit loads are
-    the two scale words, no stack spill, the amax tree on FMNMX, and exactly ONE ``REDG.E.MAX`` site per operand set behind the
-    CTA barrier (the per-warp atomic of the previous form was 32768 same-address arrivals per launch at S=8K)."""
+    the two scale words, no stack spill, and the amax tree on FMNMX. The CTA-uniform arms can retain separate atomic/barrier
+    sites or share a tail with the selected amax pointer. Either form performs at most one atomic per CTA (the previous
+    per-warp form was 32768 same-address arrivals per launch at S=8K); static site counts do not count runtime updates."""
     import subprocess
     import sys
 
@@ -2398,8 +2400,67 @@ def test_fp8_fold_pass_sass_reads_128_bit_vectors_and_folds_one_atomic_per_cta(t
     assert stats["LDG64"] == 0 and stats["LDG32"] <= 4, f"scalar / 64-bit global loads beyond the scale words: a partial read lost its alignment ({stats})"
     assert stats["STL"] == 0 and stats["LDL"] == 0, f"the fold pass spills ({stats})"
     assert stats["FMNMX"] > 0, f"the amax tree is compare + select, not FMNMX ({stats})"
-    assert stats["REDMAX"] == 2, f"expected ONE amax atomic site per operand set (2 for the pair), got {stats['REDMAX']}"
-    assert stats["BAR"] >= 2, f"no CTA barrier: the warp maxima are not combined before the atomic ({stats})"
+    assert 1 <= stats["REDMAX"] <= 2, f"expected a shared amax atomic site or one per operand set ({stats})"
+    assert stats["BAR"] >= 1, f"no CTA barrier: the warp maxima are not combined before the atomic ({stats})"
+
+
+@pytest.mark.skipif(_SM is None or _SM < 89, reason="FP8 conversion needs an SM89+ GPU")
+def test_fp8_fold_pair_updates_both_outputs_and_amax():
+    """Distinct operand sets must reach their own outputs and amax words, even when their compiled reduction tails merge."""
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
+    from cudnn.sdpa.bwd.kernels.bprop_chain_common import fold_quant_pair_host
+
+    # Unequal work sizes exercise both CTA ranges, including partially occupied final items.
+    dim, group = 256, 16
+    shapes = ((1, 17, 2, dim), (1, 21, 1, dim))
+    fake_args, args, bases = [], [], []
+    descales, scales = (0.5, 2.0), (2.0, 0.25)
+    for i, shape in enumerate(shapes):
+        ws_shape = (shape[0], shape[1], shape[2] * group, dim)
+        fake_args.extend(
+            [
+                make_fake_compact_tensor(cutlass.Float32, ws_shape, stride_order=(3, 2, 1, 0), assumed_align=16),
+                make_fake_compact_tensor(cutlass.Float8E4M3FN, shape, stride_order=(3, 2, 1, 0), assumed_align=16),
+                *[make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=16) for _ in range(3)],
+            ]
+        )
+        bases.append(((torch.arange(math.prod(ws_shape), dtype=torch.float32) % 31 - 15 + 4 * i) / 64).reshape(ws_shape))
+        args.extend(
+            [
+                torch.empty(ws_shape, device="cuda"),
+                torch.empty(shape, device="cuda", dtype=torch.float8_e4m3fn),
+                torch.tensor([descales[i]], device="cuda"),
+                torch.tensor([scales[i]], device="cuda"),
+                torch.zeros(1, device="cuda"),
+            ]
+        )
+    arch = f"sm_{_SM}" + ("a" if _SM >= 90 else "")
+    fn = cute.compile(
+        fold_quant_pair_host,
+        *fake_args,
+        dim,
+        group,
+        cutlass.Float8E4M3FN,
+        torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count,
+        make_fake_stream(use_tvm_ffi_env_stream=False),
+        None,
+        options=f"--enable-tvm-ffi --gpu-arch {arch}",
+    )
+    for shift in (0, 1):
+        for i, base in enumerate(bases):
+            args[5 * i].copy_(base + shift * (i + 1))
+            args[5 * i + 1].fill_(float("nan"))
+            args[5 * i + 4].zero_()
+        fn(*args, torch.cuda.current_stream().cuda_stream, None)
+        torch.cuda.synchronize()
+        for i, (base, shape) in enumerate(zip(bases, shapes)):
+            # Dyadic inputs keep the group sum exact in either fp32 or fp64, independent of reduction order.
+            values = (base.double() + shift * (i + 1)).reshape(*shape[:2], shape[2], group, dim).sum(3) * descales[i]
+            expected = (values * scales[i]).to(torch.float8_e4m3fn)
+            assert torch.equal(args[5 * i + 1].view(torch.uint8).cpu(), expected.view(torch.uint8)), f"operand {i}, shift {shift}"
+            assert args[5 * i + 4].item() == values.abs().max().item(), f"amax operand {i}, shift {shift}"
 
 
 @requires_sm80
