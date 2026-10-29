@@ -1808,10 +1808,10 @@ def test_sm120_reductions_skip_nan(split_k: int) -> None:
     as the native cuDNN engines do. Without split-K the drain folds them (per-CTA
     partials for the scalar, lane-run slots for rows and columns); the split-K
     reducer issues per-chunk atomics (scalar, rows) and per-element atomics
-    (columns). These paths used to keep a NaN, drop it, or decide by its sign bit
-    (which ``neg`` flips), and a lane-run slot whose first chunk was all NaN lost
-    the chunks after it, so one graph gave NaN, the NaN-free result or neither,
-    depending on the plan. A set with no finite element yields the output's seed."""
+    (columns). These paths used to keep a NaN, drop it, or decide by its sign bit,
+    and a lane-run slot whose first chunk was all NaN lost the chunks after it, so
+    one graph gave NaN, the NaN-free result or neither, depending on the plan. A
+    set whose elements are all NaN yields the output's seed."""
     from cudnn.gemm.frost.recipe import REDUCTION_INIT_VALUE
 
     M, N, K = 128, 128, 256
