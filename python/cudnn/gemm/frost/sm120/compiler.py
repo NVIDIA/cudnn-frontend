@@ -2175,8 +2175,9 @@ def _dense_sf_declaration_reject(chain: FusionChain, swap_ab: bool = False) -> "
 
     A graph declares each F8_128x4 SF as ``[planes, rows, SF-K]`` (A) or ``[planes, SF-K, rows]`` (B); a declaration
     ``_dense_sf_misread`` objects to at the declared problem size is declined here, since the declaration decides it
-    (accept means run). A bound buffer is not judged by its own extents: it supplies pointer, bytes and alignment, as
-    for the backend, so a larger buffer holding the packed blob at its start is read correctly by every engine.
+    (accept means run). At the declared problem size a bound buffer is not judged by its own extents: it supplies
+    pointer, bytes and alignment, as for the backend, so a larger buffer holding the packed blob at its start is read
+    correctly by every engine (at another size, see ``_dense_sf_runtime_reject``).
     ``chain`` is in kernel coordinates; ``swap_ab`` names the graph's tensors and extents in the message."""
     bs, mm = chain.block_scale, chain.matmul
     bad = []
@@ -2212,6 +2213,16 @@ def _dense_sf_declared_inputs(compiled) -> tuple:
     return tuple(declared)
 
 
+def _dense_sf_run_extents(batch: int, rows: int, k: int, block_size: int) -> frozenset:
+    """The extents of a scale factor laid out for the call itself: ``(batch, rows, SF-K)`` with rows and SF-K each
+    logical or padded to whole 128 x 4 atoms, and ``(1, batch x padded rows, padded SF-K)`` (the planes stacked as rows,
+    the template's own order); each in kernel and in graph orientation."""
+    sf_k = k // block_size
+    rows_pad, sf_k_pad = (rows + 127) // 128 * 128, (sf_k + 3) // 4 * 4
+    run = {(batch, r, s) for r in (rows, rows_pad) for s in (sf_k, sf_k_pad)} | {(1, batch * rows_pad, sf_k_pad)}
+    return frozenset(run | {(p, s, r) for p, r, s in run})
+
+
 def _dense_sf_runtime_reject(compiled, operands, graph_order=None) -> "str | None":
     """Refuse a call at whose problem size a declared scale factor would be read from the wrong rows.
 
@@ -2219,9 +2230,12 @@ def _dense_sf_runtime_reject(compiled, operands, graph_order=None) -> "str | Non
     overrides on the engine path, A / B buffers of other extents on the direct one), and what the template reads follows
     the call's M / N / K while the declared layout does not: an SFA declared [2, 256, 16] for M = 256 keeps batch 1 at
     4096 B, where the template reads it at 2048 B once M = 100. The cuDNN backend engines that honour the declaration
-    read it at 4096 B. Such a call is refused unless the SF operand itself lays the scales out for this call: an SF
-    override to the call's extents (what FlashInfer and cuDNN's dynamic-shape test pass), or a buffer of exactly those
-    extents. ``None`` also when the A / B layout is refused by the launch path itself."""
+    read it at 4096 B. Such a call is refused unless the SF slot has exactly the extents of an SF laid out for this call
+    (``_dense_sf_run_extents``): an SF override to them (what FlashInfer and cuDNN's dynamic-shape test pass), or a
+    buffer bound with exactly them, which the template reads as the call's packed blob. Any other binding -- the
+    declared extents, another view of the same bytes such as (1, 512, 16) or (4, 128, 16), a flat blob -- is refused:
+    under the declaration its bytes keep batch 1 at 4096 B. ``None`` also when the A / B layout is refused by the
+    launch path itself."""
     recipe, chain = compiled.recipe, compiled.chain
     try:
         (m, n, k), _axes = recipe.problem(operands, graph_order)
@@ -2240,8 +2254,7 @@ def _dense_sf_runtime_reject(compiled, operands, graph_order=None) -> "str | Non
         why = _dense_sf_misread(kernel, batch, rows, k, recipe.block_size)
         if why is None:
             continue
-        shape = tuple(operands[sf.index].shape)
-        if len(shape) == 3 and any(_dense_sf_misread(s, batch, rows, k, recipe.block_size) is None for s in (shape, (shape[0], shape[2], shape[1]))):
+        if tuple(operands[sf.index].shape) in _dense_sf_run_extents(batch, rows, k, recipe.block_size):
             continue
         rows_pad, sf_k_pad = (rows + 127) // 128 * 128, (k // recipe.block_size + 3) // 4 * 4
         bad.append(f"{name} (as declared) {why}")
@@ -2255,7 +2268,7 @@ def _dense_sf_runtime_reject(compiled, operands, graph_order=None) -> "str | Non
         + "; ".join(bad)
         + " -- override "
         + " and ".join(fix)
-        + " (padded to whole 128 x 4 atoms) along with A and B, or bind buffers of exactly those extents"
+        + " (padded to whole 128 x 4 atoms) along with the A / B / O overrides, or bind buffers of exactly those extents"
     )
 
 
