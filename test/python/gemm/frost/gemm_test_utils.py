@@ -170,6 +170,26 @@ def kw(name):
     return dict(config=by_name(name))
 
 
+# --- kernel PTX -------------------------------------------------------------
+
+
+def keep_kernel_ptx(monkeypatch, compiler, dump_dir) -> None:
+    """Compile the kernels ``compiler`` (a family compiler module) renders in this test
+    with ``--keep-ptx`` and without the persistent compiled cache, whose reloaded object
+    carries no PTX; the PTX files and the generated sources (unique to ``dump_dir``) stay
+    under ``dump_dir``. :func:`kernel_ptx` reads the PTX back."""
+    monkeypatch.setenv("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", "1")
+    monkeypatch.setenv("CUDNN_FRONTEND_GEMM_KERNEL_CACHE", str(dump_dir))
+    monkeypatch.setattr(compiler, "_FROST_COMPILE_OPTIONS", f"{compiler._FROST_COMPILE_OPTIONS} --keep-ptx --dump-dir={dump_dir}".strip())
+
+
+def kernel_ptx(compiled) -> str:
+    """The PTX of a plan (or :class:`Plan`) compiled under :func:`keep_kernel_ptx`."""
+    ptx = getattr(compiled, "_compiled", compiled)._launchable.__ptx__
+    assert ptx, "the kernel carries no PTX: compile it under keep_kernel_ptx"
+    return ptx
+
+
 # --- variant packs ----------------------------------------------------------
 
 
