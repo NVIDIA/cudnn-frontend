@@ -30,6 +30,8 @@ versions:
 
 redirects:
   # API pages grouped by operation.
+  - source: "/latest/operations/Normalizations/hstu_lmsd"
+    destination: "/cudnn/latest/operations/sparse_attention/hstu_lmsd"
   - source: "/latest/fe-oss-apis"
     destination: "/cudnn/latest/operations/overview"
   - source: "/latest/fe-oss-apis/attention"
@@ -119,7 +121,7 @@ redirects:
   - source: "/latest/fe-oss-apis/hstu/hstu_attention"
     destination: "/cudnn/latest/operations/sparse_attention/hstu_attention"
   - source: "/latest/fe-oss-apis/hstu/hstu_lmsd"
-    destination: "/cudnn/latest/operations/Normalizations/hstu_lmsd"
+    destination: "/cudnn/latest/operations/sparse_attention/hstu_lmsd"
   - source: "/latest/fe-oss-apis/kda_jax"
     destination: "/cudnn/latest/operations/LinearAttention/kda_jax"
   - source: "/latest/fe-oss-apis/nsa"

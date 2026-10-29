@@ -68,6 +68,9 @@ navigation:
           - page: HSTU Attention (Blackwell SM100/SM103)
             path: ../../operations/sparse_attention/hstu_attention.md
             slug: hstu_attention
+          - page: HSTU LayerNorm-Multiply-SiLU-Dropout (LMSD)
+            path: ../../operations/sparse_attention/hstu_lmsd.md
+            slug: hstu_lmsd
           - page: Block Sparse Attention (BSA)
             path: ../../operations/sparse_attention/bsa.md
             slug: bsa
@@ -208,9 +211,6 @@ navigation:
           - page: Fused RMSNorm + SiLU
             path: ../../operations/normalizations/rmsnorm_silu.md
             slug: rmsnorm_silu
-          - page: HSTU LayerNorm-Multiply-SiLU-Dropout (LMSD)
-            path: ../../operations/normalizations/hstu_lmsd.md
-            slug: hstu_lmsd
       - section: Pointwise and Reduction
         path: ../../operations/Pointwise.md
         slug: operations/Pointwise

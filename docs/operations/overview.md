@@ -60,7 +60,7 @@ The experimental API catalog includes:
 - [DeepSeek Sparse Attention (DSA)](/operations/sparse_attention/dsa)
 - [Flex Attention](/operations/sparse_attention/flex_attention) and [mask plan design](/operations/sparse_attention/flex_attention/flex_attention_design)
 - [HSTU Attention (Blackwell SM100/SM103)](/operations/sparse_attention/hstu_attention)
-- [HSTU LayerNorm-Multiply-SiLU-Dropout (LMSD)](/operations/Normalizations/hstu_lmsd)
+- [HSTU LayerNorm-Multiply-SiLU-Dropout (LMSD)](/operations/sparse_attention/hstu_lmsd)
 - [Native Sparse Attention (NSA)](/operations/sparse_attention/nsa)
 - [CSA Fused Compressor](/operations/sparse_attention/csa)
 - [Aligned HCA Backward](/operations/sparse_attention/csa/aligned_hca_backward)
