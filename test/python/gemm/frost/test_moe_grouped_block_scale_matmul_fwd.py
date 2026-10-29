@@ -2998,10 +2998,13 @@ def test_e2e_offset_dtypes_sm120(offset_cudnn_dt, offset_torch_dt) -> None:
 
 
 @requires_sm120
-def test_e2e_quant_scale_blob_admits_runtime_s_in_its_padding_sm120() -> None:
+@pytest.mark.parametrize("swap_ab,call_n", [(False, 256), (True, 224)], ids=["normal", "swap_ab"])
+def test_e2e_quant_scale_blob_admits_runtime_s_in_its_padding_sm120(swap_ab, call_n) -> None:
     """Block-scale twin of test_moe_grouped_matmul_fwd.py::test_moe_quant_scale_blob_admits_runtime_s_in_its_padding_sm120:
-    a plan whose F8_128x4 row-quant scale has rup(S, 128) == S rows runs a call with fewer
-    tokens in the same 128-row padding (the kernel's sym_m is the token count)."""
+    built at S == N == 256, the F8_128x4 row-quant scale has 256 rows, which equal the kernel's
+    M (the token count, or the weights' N under swap-AB). A call with fewer tokens in the same
+    128-row padding runs; under swap-AB it also has fewer weight columns, in the same 4-block
+    padding, which is what moves the kernel's M."""
     dev = "cuda"
     torch.manual_seed(0)
     E, N, K = 2, 256, 256
@@ -3013,25 +3016,27 @@ def test_e2e_quant_scale_blob_admits_runtime_s_in_its_padding_sm120() -> None:
     compiled = _plan(
         _build_graph(E, build_s, N, K, len(offsets_list) - 1, quant=True, quant_scale_reorder=True, quant_scale_dim=scale_shape),
         config=by_name(_SM120_BS_CFG),
+        swap_ab=swap_ab,
     )
+    assert compiled._compiled.config.swap_ab is swap_ab
     lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
     tok_u8 = torch.randint(0, 256, (1, call_s, K // 2), dtype=torch.uint8, device=dev)
-    w_u8 = torch.randint(0, 256, (E, N, K // 2), dtype=torch.uint8, device=dev)
+    w_u8 = torch.randint(0, 256, (E, call_n, K // 2), dtype=torch.uint8, device=dev)
     sfa_log = torch.randint(1, 4, (call_s, sf_k), device=dev).to(torch.float8_e4m3fn)
-    sfb_log = torch.randint(1, 4, (E, N, sf_k), device=dev).to(torch.float8_e4m3fn)
+    sfb_log = torch.randint(1, 4, (E, call_n, sf_k), device=dev).to(torch.float8_e4m3fn)
     sfa_parts = [_to_blocked(sfa_log[b:e]) for b, e in zip(offsets_list, offsets_list[1:])]
     sfa_blk = _with_static_segmented_capacity(torch.cat(sfa_parts), call_s, len(offsets_list) - 1, sf_k)
-    sfb_blk = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, _ceil_div(N, 128) * 128, _ceil_div(sf_k, 4) * 4)
+    sfb_blk = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, _ceil_div(call_n, 128) * 128, _ceil_div(sf_k, 4) * 4)
     offsets = torch.tensor(offsets_list, dtype=torch.int32, device=dev)
-    q = torch.empty(1, call_s, N, dtype=torch.float8_e4m3fn, device=dev)
+    q = torch.empty(1, call_s, call_n, dtype=torch.float8_e4m3fn, device=dev)
     q_scale = torch.zeros(*scale_shape, dtype=torch.float8_e8m0fnu, device=dev)
     tokens, weights = tok_u8.view(torch.float4_e2m1fn_x2), w_u8.view(torch.float4_e2m1fn_x2)
     compiled(_vp_bs(compiled, tokens, weights, [q, q_scale], sfa_blk, sfb_blk, fto=offsets))
     torch.cuda.synchronize()
 
     tok_s = _unpack_fp4(tok_u8, lut).view(call_s, K) * sfa_log.float().repeat_interleave(block_size, 1)
-    w_s = _unpack_fp4(w_u8, lut).view(E, N, K) * sfb_log.float().repeat_interleave(block_size, 2)
-    ref = torch.zeros((call_s, N), dtype=torch.float32, device=dev)
+    w_s = _unpack_fp4(w_u8, lut).view(E, call_n, K) * sfb_log.float().repeat_interleave(block_size, 2)
+    ref = torch.zeros((call_s, call_n), dtype=torch.float32, device=dev)
     for gi, (b, e) in enumerate(zip(offsets_list, offsets_list[1:])):
         ref[b:e] = tok_s[b:e] @ w_s[gi % E].T
     q_ref, scale_ref = _block_quant_ref(ref, 32, torch.float8_e4m3fn, torch.float8_e8m0fnu)

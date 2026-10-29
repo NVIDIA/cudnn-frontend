@@ -3454,33 +3454,44 @@ def test_sm120_all_major_combos(a_major: str, b_major: str, out_major: str) -> N
     )
 
 
-@pytest.mark.parametrize("axis,build_m,call_m", [(-1, 256, 200), (-1, 200, 256), (1, 256, 224)], ids=["row", "row_unaligned_build", "col_square"])
-def test_sm120_quant_scale_blob_admits_runtime_m_in_its_padding(axis: int, build_m: int, call_m: int) -> None:
+@pytest.mark.parametrize(
+    "axis,swap_ab,build_m,call_m,call_n",
+    [(-1, False, 256, 200, 256), (-1, False, 200, 256, 256), (1, False, 256, 224, 256), (-1, True, 256, 256, 224)],
+    ids=["row", "row_unaligned_build", "col_square", "row_swap_ab"],
+)
+def test_sm120_quant_scale_blob_admits_runtime_m_in_its_padding(axis: int, swap_ab: bool, build_m: int, call_m: int, call_n: int) -> None:
     """An F8_128x4 quant-scale output is a plan constant: rup(M, 128) rows for a
     row quant, rup(N, 128) for a col quant, the block axis padded to 4. The host
-    admits every runtime M that keeps those extents (_check_runtime_quant), and
-    the kernel must too. The scale's compile fake took the kernel's sym_m whenever
-    those rows equalled the build M -- a 128-aligned M for the row quant, N == M
-    for the col quant -- so the tvm-ffi front door refused such a call
-    (``Mismatched c_tap_1.shape[0]``), while a plan built at an unaligned M ran it.
-    A call that changes the padded extents is still refused by the host."""
+    admits every runtime M and N that keep those extents (_check_runtime_quant),
+    and the kernel must too. The scale's compile fake took the kernel's sym_m
+    whenever those rows equalled the kernel's build M -- a 128-aligned M for the
+    row quant, N == M for the col quant, and M == N for a swap-AB plan, whose
+    kernel M is the graph's N -- so the tvm-ffi front door refused a call that
+    moved the kernel's M inside the padding (``Mismatched c_tap_1.shape[0]``),
+    while a plan built at an unaligned M ran it. A call that changes the padded
+    extents is still refused by the host."""
     cfg = _resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
     N, K, bs = 256, 128, 32
+
+    def scale_dims(m: int, n: int) -> list[int]:
+        rows, blocks = (m, n // bs) if axis == -1 else (n, m // bs)
+        return [1, (rows + 127) // 128 * 128, (blocks + 3) // 4 * 4]
+
     g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     A = g.tensor(name="A", dim=[1, build_m, K], stride=_a_stride_batched(build_m, K, "k"))
     B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"))
     C = g.matmul(A=A, B=B, name="mm")
     Q, QS = g.block_scale_quantize(input=C, block_size=bs, axis=axis, name="q")
     Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
-    rows, blocks = (build_m, N // bs) if axis == -1 else (N, build_m // bs)
-    dims = [1, (rows + 127) // 128 * 128, (blocks + 3) // 4 * 4]
+    dims = scale_dims(build_m, N)
     QS.set_dim(dims).set_stride([dims[1] * dims[2], dims[2], 1])
     QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
     QS.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
-    compiled = _plan(g, config=cfg)
+    compiled = _plan(g, config=cfg, swap_ab=swap_ab)
+    assert compiled._compiled.config.swap_ab is swap_ab
 
-    a, b, _ = _mkdata(call_m, N, K, "bf16", "bf16")
-    q = torch.empty(1, call_m, N, dtype=torch.float8_e4m3fn, device="cuda")
+    a, b, _ = _mkdata(call_m, call_n, K, "bf16", "bf16")
+    q = torch.empty(1, call_m, call_n, dtype=torch.float8_e4m3fn, device="cuda")
     qs = torch.zeros(dims, dtype=torch.float8_e8m0fnu, device="cuda")
     compiled({A: a, B: b, Q: q, QS: qs})
     torch.cuda.synchronize()
@@ -3488,18 +3499,22 @@ def test_sm120_quant_scale_blob_admits_runtime_m_in_its_padding(axis: int, build
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
     if axis == -1:
         q_ref, s_ref = _block_quant_reference(mm, bs, torch.float8_e4m3fn, torch.float8_e8m0fnu)
-        got = qs.view(1, -1)[:, _f8_row_scale_addr(call_m, N, bs)]
+        got = qs.view(1, -1)[:, _f8_row_scale_addr(call_m, call_n, bs)]
     else:
         q_ref, s_ref = _col_quant_reference(mm, bs, torch.float8_e4m3fn, torch.float8_e8m0fnu)
         s_ref = s_ref.transpose(1, 2)
-        got = qs.view(1, -1)[:, _f8_col_scale_addr(call_m, N, bs)]
+        got = qs.view(1, -1)[:, _f8_col_scale_addr(call_m, call_n, bs)]
     torch.testing.assert_close(got.float(), s_ref.float(), atol=0, rtol=0)
     torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
 
-    # 128 more rows change the padded extents the scale blob was declared with.
-    a, b, _ = _mkdata(call_m + 128, N, K, "bf16", "bf16")
+    # 128 more rows change the padded extents the scale blob was declared with. The probe's blob keeps the
+    # declared shape and strides but sits in storage sized for the probe's own padded extents, so a host check
+    # that let this call through could not store past the allocation.
+    probe_m, probe_dims = call_m + 128, scale_dims(call_m + 128, call_n)
+    probe_qs = torch.zeros(probe_dims[1] * probe_dims[2], dtype=torch.float8_e8m0fnu, device="cuda")[: dims[1] * dims[2]].view(dims)
+    a, b, _ = _mkdata(probe_m, call_n, K, "bf16", "bf16")
     with pytest.raises(ValueError, match="scale_dim"):
-        compiled({A: a, B: b, Q: torch.empty(1, call_m + 128, N, dtype=torch.float8_e4m3fn, device="cuda"), QS: qs})
+        compiled({A: a, B: b, Q: torch.empty(1, probe_m, call_n, dtype=torch.float8_e4m3fn, device="cuda"), QS: probe_qs})
 
 
 @pytest.mark.parametrize(

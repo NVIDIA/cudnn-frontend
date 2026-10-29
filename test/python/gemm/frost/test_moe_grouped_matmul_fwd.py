@@ -2000,25 +2000,30 @@ def test_gather_numerics_sm120(cfg_name, m_major, activation, swiglu):
 
 
 @requires_matmul_gpu
-def test_moe_quant_scale_blob_admits_runtime_s_in_its_padding_sm120():
-    """MoE twin of test_matmul.py::test_sm120_quant_scale_blob_admits_runtime_m_in_its_padding,
-    where the kernel's sym_m is the token count: a plan whose F8_128x4 row-quant scale has
-    rup(S, 128) == S rows runs a call with fewer tokens in the same 128-row padding."""
+@pytest.mark.parametrize("swap_ab,call_n", [(False, 256), (True, 224)], ids=["normal", "swap_ab"])
+def test_moe_quant_scale_blob_admits_runtime_s_in_its_padding_sm120(swap_ab, call_n):
+    """MoE twin of test_matmul.py::test_sm120_quant_scale_blob_admits_runtime_m_in_its_padding.
+    Built at S == N == 256, the F8_128x4 row-quant scale has rup(S, 128) == 256 rows, which
+    equal the kernel's M: the token count, or the weights' N under swap-AB. A call with fewer
+    tokens in the same 128-row padding runs; under swap-AB it also has fewer weight columns,
+    in the same 4-block padding, which is what moves the kernel's M."""
     E, N, K, bs = 2, 256, 128, 32
     build_s, call_s = 256, 200
     scale_shape = _quant_scale_shape(build_s, N, True)
-    compiled = _plan(_build_graph(E, build_s, N, K, quant=True, quant_scale_reorder=True, quant_scale_dim=scale_shape), config=by_name(_SM120_CFG))
+    graph = _build_graph(E, build_s, N, K, quant=True, quant_scale_reorder=True, quant_scale_dim=scale_shape)
+    compiled = _plan(graph, config=by_name(_SM120_CFG), swap_ab=swap_ab)
+    assert compiled._compiled.config.swap_ab is swap_ab
 
     torch.manual_seed(0)
     token = torch.randint(-2, 3, (1, call_s, K), device="cuda").to(torch.bfloat16)
-    weight = torch.randint(-2, 3, (E, N, K), device="cuda").to(torch.bfloat16)
+    weight = torch.randint(-2, 3, (E, call_n, K), device="cuda").to(torch.bfloat16)
     offsets = _offsets([120, call_s - 120], call_s)
-    q = torch.empty(1, call_s, N, dtype=torch.float8_e4m3fn, device="cuda")
+    q = torch.empty(1, call_s, call_n, dtype=torch.float8_e4m3fn, device="cuda")
     q_scale = torch.zeros(*scale_shape, dtype=torch.float8_e8m0fnu, device="cuda")
     compiled(_vp_moe(compiled, token, weight, offsets, [q, q_scale]))
     torch.cuda.synchronize()
 
-    q_ref, scale_ref = _block_quant_ref(_ref_f32(token, weight, offsets, call_s, N, E), bs, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+    q_ref, scale_ref = _block_quant_ref(_ref_f32(token, weight, offsets, call_s, call_n, E), bs, torch.float8_e4m3fn, torch.float8_e8m0fnu)
     torch.testing.assert_close(q_scale.float(), _to_blocked(scale_ref[0]).view_as(q_scale).float(), atol=0, rtol=0)
     torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
 

@@ -764,7 +764,8 @@ def _tap_fake_shape(tap, chain: FusionChain | None = None) -> str:
         )
         # Fresh symbols, never the kernel's sym_m / sym_n / sym_l: the blob's extents are plan constants the host
         # checks (recipe._output_rule) and the kernel only takes its raw pointer, but one SymInt is one tvm-ffi Var,
-        # so sym_m held the padded F8_128x4 rows rup(M, 128) to a runtime M that _check_runtime_quant admits.
+        # so sym_m held the padded F8_128x4 rows to the kernel's runtime M (S for MoE, the graph's N under swap-AB)
+        # and refused calls that _check_runtime_quant admits.
         return "(" + ", ".join("1" if d == 1 else "cute.sym_int64()" for d in (m, n, b)) + ")"
     if tap.dim is None:
         l_expr = "1" if (chain is not None and chain.has_moe) else "sym_l"
