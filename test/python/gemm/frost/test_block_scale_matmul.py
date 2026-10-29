@@ -3547,7 +3547,8 @@ def test_sm120_fp4_rejects_non_k_major():
 # and then the planes back to back. A bound buffer supplies only pointer, bytes and alignment, so any buffer holding that
 # blob at its start is read correctly; a DECLARED layout that puts a plane or a row block elsewhere -- at the declared
 # problem size, or at the size a call runs -- is declined at check_support or refused before the launch. At another size
-# only an SF slot of exactly the run's own SF extents (an override to them, or a buffer of them) escapes the refusal.
+# only an SF slot of exactly the run's own SF extents (an override to them, or a buffer of them) escapes the refusal,
+# and a call that reads no scale factor (no row, no column or no whole scale block along K) is not judged at all.
 # MXFP8 (block 32) with K=512 reads 4 atoms (16 scales) per row; scales vary per block, so a misread shows up in the
 # numbers.
 _SF_K = 512
@@ -3848,6 +3849,52 @@ def test_sm120_block_scale_refuses_sf_declared_for_another_problem_size(route):
         run(sf, out, sf_rows)
         torch.cuda.synchronize()
         torch.testing.assert_close(out, ref, atol=2e-1, rtol=2e-2, msg=lambda m, s=tuple(sf.shape), r=sf_rows: f"SF {s}, SF override rows {r}: {m}")
+
+
+def test_sm120_block_scale_sf_check_leaves_an_empty_call_to_the_launch_path():
+    """The execute-time check above judges where the template would read the declared scale factors at the call's size.
+    A call with no row, no column or no whole scale block along K reads none, so the check leaves it to the launch path,
+    which owns zero extents, instead of calling it a misread (at 0 rows or 0 atoms per row, a declaration of several
+    batch planes always looked misplaced). Host-only: the batched plan declaring the packed SFA [2, 128, 16] is built the
+    way the JIT path builds it, without compiling, and only the extents of the CPU buffers are read. More rows than the
+    declared planes hold are still refused."""
+    from pathlib import Path
+
+    B, M, N = 2, 100, 128
+    g, _ = _build_sm120_sf_graph(B, M, N, *_packed_sf_dims(B, M, N))
+    config = by_name(_SM120_BS_128)
+    chain, binding = C120._analyze_graph(g)
+    use_tma = C120._use_tma_store_epi(chain, config)
+    compiled = C120.CompiledFusedGemm(
+        chain=chain,
+        config=config,
+        aux_names=[aux.name for aux in chain.aux_tensors],
+        generated_path=Path("unused"),
+        _launchable=lambda *args, **kwargs: pytest.fail("the scale-factor check launched the kernel"),
+        block_scale=True,
+        binding=binding,
+        store_modes=C120._store_modes(chain, config),
+        use_tma_store=use_tma,
+        vec_bytes_epi=C120._out_vec_bytes(chain, config, use_tma),
+        workspace_bytes=C120._splitk_workspace_bytes(chain, config),
+    )
+    recipe = compiled.recipe
+
+    def operands(m, n, k):  # A and B in kernel order; both SFs are the declared (2, 128, 16) bytes
+        bufs = [None] * len(compiled.bound)
+        for op in recipe.inputs:
+            bufs[op.index] = torch.empty(op.batch, n if op.is_b else m, k // op.kpack, dtype=torch.uint8)
+        for sf in recipe.sf:
+            bufs[sf.index] = torch.empty(B, 128, 16, dtype=torch.uint8)
+        for out in recipe.outputs:
+            bufs[out.index] = torch.empty(B, m, n, dtype=torch.float16)
+        return bufs
+
+    for mnk in ((0, N, _SF_K), (M, 0, _SF_K), (M, N, 0), (M, N, 16)):
+        reason = C120._dense_sf_runtime_reject(compiled, operands(*mnk))
+        assert reason is None, f"(M, N, K) = {mnk}"
+    refused = C120._dense_sf_runtime_reject(compiled, operands(200, N, _SF_K))
+    assert refused is not None and "SFA [2, 128, 16] (as declared) spaces its 2 planes 4 atoms apart" in refused
 
 
 @requires_sm120

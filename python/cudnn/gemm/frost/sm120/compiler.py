@@ -2234,8 +2234,12 @@ def _dense_sf_runtime_reject(compiled, operands, graph_order=None) -> "str | Non
     (``_dense_sf_run_extents``): an SF override to them (what FlashInfer and cuDNN's dynamic-shape test pass), or a
     buffer bound with exactly them, which the template reads as the call's packed blob. Any other binding -- the
     declared extents, another view of the same bytes such as (1, 512, 16) or (4, 128, 16), a flat blob -- is refused:
-    under the declaration its bytes keep batch 1 at 4096 B. ``None`` also when the A / B layout is refused by the
-    launch path itself."""
+    under the declaration its bytes keep batch 1 at 4096 B. Since only the slot's extents are compared, a flat or 2-D
+    buffer of exactly the run's packed bytes is refused too, although it cannot hold the declared layout (conservative).
+    A stacked declaration [1, B x rows, SF-K] has no plane pitch to check: at another M / N it is read at the call's own
+    pitch, as cuDNN engine 0 reads it (a known limit). ``None`` also when the A / B layout is refused by the launch
+    path itself, and for a call with no row, no column or no whole scale block along K: it reads no scale factor, so
+    the launch path decides it."""
     recipe, chain = compiled.recipe, compiled.chain
     try:
         (m, n, k), _axes = recipe.problem(operands, graph_order)
@@ -2243,6 +2247,8 @@ def _dense_sf_runtime_reject(compiled, operands, graph_order=None) -> "str | Non
         return None
     mm, bs, swap_ab = chain.matmul, chain.block_scale, compiled.config.swap_ab
     if (m, n, k) == (mm.M, mm.N, mm.K):
+        return None
+    if not (m and n) or k < recipe.block_size:  # reads no scale factor; the pitch rules would compare with a 0-atom plane
         return None
     bad, fix = [], []
     for sf in recipe.sf:
