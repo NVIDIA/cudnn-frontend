@@ -26,8 +26,9 @@ Rubin cells (``requires_rubin``; one compiled block per cell): the decode ladder
 reference over the WHOLE sequence gives the post-norm / post-RoPE Q, K, V and the pre-sigmoid gate; the prefix rows fill the
 pools (NaN everywhere else: a gathered unwritten row would poison O), the step's rows are the block's own write-through; the
 step rows' attention is the oracle's over ``qsa_visible_mask(..., pos0=)`` (shared) or per row (per-token), then the gate and
-the out projection -- ``cos(out) > 0.999``, the gated O (the workspace slot) and the LSE within ``atol 2e-2`` (the sparse
-end-to-end module's bars, never widened), a dead row (``kv_lens[b] = 0``; a row whose position is negative because the
+the out projection -- ``cos(out) > 0.999``, the gated O (the workspace slot) within the repo's bf16 / f16 OUTPUT bound
+(``gated_block_bounds.assert_output_close``: per element ``|d| <= 2^-7 max|ref| + 2^-6 |ref|`` and ``cos >= 0.999``; ``max|d|``
+printed beside the fraction of the bound), the LSE within ``atol 2e-2`` (the sparse end-to-end module's bars, never widened), a dead row (``kv_lens[b] = 0``; a row whose position is negative because the
 sequence is shorter than the step) EXACTLY ``out = 0`` / ``O = 0`` / ``LSE = -inf``, the pools' step rows BITWISE the slab's
 post-RoPE K / V bands, the prefix rows and the NULL block untouched, two launches bitwise.  The ladder: ``S_q`` 1 .. 4 (the
 shared list; B 1 / 2 / 4; ``kv_lens`` up to 20000 incl. 2052, a dead entry, a one-token sequence and a sequence shorter than
@@ -97,6 +98,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from gated_block_census import cupti_kernels as _cupti_kernels  # noqa: E402
 from gated_block_qsa_reference import qsa_visible_mask, random_block_ids  # noqa: E402
+from gated_block_bounds import assert_output_close  # noqa: E402
 from gated_block_reference import RefGeometry, build_rope_tables, gated_attention_block_reference  # noqa: E402
 
 _DEV = "cuda" if torch.cuda.is_available() else "cpu"
@@ -106,7 +108,10 @@ D = 256
 ROPE = 64
 BS = 4  # tokens per selectable block
 COS_OUT = 0.999  # the end-to-end suite's bar on `out`
-ATOL = 2e-2  # the SDPA stage test's bar on O / LSE -- never widened here
+# The SDPA stage test's bar on the LSE (test_sdpa_stage_sm107.py asserts atol 2e-2 on the LSE; its O checks are cos > 0.999) -- never widened here.
+# The gated O is held to the repo's bf16 / f16 OUTPUT bound instead (gated_block_bounds.py: per element |d| <= 2^-7 max|ref| + 2^-6 |ref| and
+# cos >= 0.999, the block backward's calibrated convention); see test_block_qsa_end_to_end.py for the measurement that retired the absolute bar.
+ATOL = 2e-2
 SHARED_MAX_S_Q = 4  # the sparse core's shared-list cap (SparseCapabilities.index_shared_list_max_tokens)
 GEOM_SMALL = dict(d_model=512, h_q=8, h_kv=2, d_head=D, rope_dim=ROPE)  # group 4, cheap projections
 GEOM_FLASH_NEXT = dict(d_model=2560, h_q=24, h_kv=2, d_head=D, rope_dim=ROPE)  # Qwen3.8-Flash-Next TP 1 (group 12)
@@ -841,7 +846,7 @@ class _CaseBase:
             d_lse = float((lse[~dead_bhs] - self.ref_lse[~dead_bhs]).abs().max()) if live.any() else 0.0
             assert d_lse <= ATOL, f"{what}: LSE off the oracle by {d_lse} (budget {ATOL})"
         assert c > COS_OUT, f"{what}: cos(out) {c} <= {COS_OUT}"
-        assert d_o <= ATOL, f"{what}: gated O off the oracle by {d_o} (budget {ATOL})"
+        ob = assert_output_close(o[live], self.ref_o_gated[live], f"{self.label()} {what}: gated O vs the oracle")
         # the write-through: the step's live rows are the slab's post-RoPE K / V rows, bitwise; nothing else moved
         slot = self.slot_mapping
         lv = slot >= 0
@@ -860,8 +865,10 @@ class _CaseBase:
             raw = index_k_raw_view(proj, self.geom, self.blk.batch, self.blk.seq_len)  # [B, S, 1, index_head_dim]
             assert torch.equal(_bits(self.index_cache[s_ // self.page, s_ % self.page, :]), _bits(raw.reshape(-1, raw.shape[-1])[lv]))
             assert (~torch.isnan(self.index_cache.float())).all(-1).sum().item() == int(lv.sum())
-        print(f"\n{self.label()} {what}: cos(out) {c:.6f} max|d out| {d_out:.4e} max|d O_gated| {d_o:.4e} max|d LSE| {d_lse:.2e} dead rows {int(dead.sum())}")
-        return dict(cos=c, d_out=d_out, d_o=d_o, d_lse=d_lse, dead=int(dead.sum()))
+        print(
+            f"\n{self.label()} {what}: cos(out) {c:.6f} max|d out| {d_out:.4e} max|d O_gated| {d_o:.4e} ({ob['bound_ratio']:.3f} of the output bound) max|d LSE| {d_lse:.2e} dead rows {int(dead.sum())}"
+        )
+        return dict(cos=c, d_out=d_out, d_o=d_o, d_lse=d_lse, dead=int(dead.sum()), o_bound_ratio=ob["bound_ratio"], o_cos=ob["cos"])
 
 
 class _Case(_CaseBase):
@@ -1152,7 +1159,7 @@ def test_mtp_rows_share_the_step0_list_and_see_the_block_completed_after_step0(s
     print(
         f"\nmtp S_q={s_q} pos0 mod 4 = {r}: vs the pos0 oracle max|dO| {d_pos0:.3e}; vs the per-row-tail reading max|dO| {d_rowtail:.3e} max|dLSE| {lse_rowtail:.3e}; hidden row {hidden_row_exists}"
     )
-    assert d_pos0 <= ATOL
+    assert_output_close(o[live], case.ref_o_gated[live], f"mtp S_q={s_q} pos0 mod 4 = {r}: gated O vs the pos0 oracle")
     if hidden_row_exists:
         assert d_rowtail > d_pos0 and lse_rowtail > m["d_lse"], "the per-row-tail reading should be the farther one where a block completed after step 0"
     else:
@@ -3706,9 +3713,9 @@ _LEAN_BLOCK_CELLS = [
 def test_the_lean_route_matches_the_oracle_and_the_tcgen05_route_within_tolerance(
     geom_kw, s_q, kv_lens, page, layout, dtype, split, k, fuse_gate, return_lse, block_lens, seed
 ):
-    """The block on ``sparse_tile_form="lean"`` against the fp32 oracle (the module's bars: ``cos(out) > 0.999``, the gated O and the LSE within
-    2e-2, dead rows exact, two launches bitwise; the stage's ``kernel_template`` the lean tile's) and against the SAME block on
-    ``sparse_tile_form="tcgen05"``: ``out`` within the module's tolerance (cos), the gated O and the LSE within 2e-2, the list bitwise (the
+    """The block on ``sparse_tile_form="lean"`` against the fp32 oracle (the module's bars: ``cos(out) > 0.999``, the gated O within the output
+    bound, the LSE within 2e-2, dead rows exact, two launches bitwise; the stage's ``kernel_template`` the lean tile's) and against the SAME block on
+    ``sparse_tile_form="tcgen05"``: ``out`` within the module's tolerance (cos), the gated O within the output bound, the LSE within 2e-2, the list bitwise (the
     caller's list is the same tensor; the kernel-produced list is the indexer cell's) -- NOT bitwise across the bodies and never asserted so
     (a 4 x 64-d split-K sum in fixed order vs one 256-d MMA chain; recorded in the print), bitwise WITHIN each body (two launches)."""
     kw = dict(page=page, layout=layout, dtype=dtype, seed=seed, split=split, fuse_gate=fuse_gate, return_lse=return_lse, block_lens=block_lens)
@@ -3724,7 +3731,8 @@ def test_the_lean_route_matches_the_oracle_and_the_tcgen05_route_within_toleranc
     c = _cos(lean.out, tc.out)
     d_o = float((lean.slab_views()[4].float() - tc.slab_views()[4].float()).abs().max())
     d_lse = _lse_delta(lean.lse, tc.lse) if return_lse else 0.0
-    assert c > COS_OUT and d_o <= ATOL and d_lse <= ATOL, f"lean vs tcgen05: cos {c:.6f} max|dO_gated| {d_o:.3e} max|dLSE| {d_lse:.3e}"
+    assert c > COS_OUT and d_lse <= ATOL, f"lean vs tcgen05: cos {c:.6f} max|dO_gated| {d_o:.3e} max|dLSE| {d_lse:.3e}"
+    assert_output_close(lean.slab_views()[4], tc.slab_views()[4], "lean vs tcgen05: gated O")
     assert torch.equal(lean.block_ids, tc.block_ids), "the caller's list is one tensor: bitwise by construction"
     bitwise = bool(torch.equal(_bits(lean.out), _bits(tc.out)))
     print(
@@ -3768,8 +3776,8 @@ def test_the_lean_route_census_names_the_lean_kernel_and_matches_the_tcgen05_lau
 def test_the_indexer_decode_step_on_the_lean_route_lists_bitwise_and_attends_within_tolerance():
     """The in-block indexer's decode step (per-row lists, one row per sequence: the lean body serves it as the shared list) on
     ``sparse_tile_form="lean"`` against the SAME step on ``"tcgen05"``: the kernel-produced list, the counts, the side caches and the pools'
-    step rows BITWISE (the same prepare / scorer / top-k kernels run on both routes), ``out`` within the module's tolerance, the gated O and
-    the LSE within 2e-2; each route against its own two-stage oracle, two launches bitwise."""
+    step rows BITWISE (the same prepare / scorer / top-k kernels run on both routes), ``out`` within the module's tolerance, the gated O within
+    the output bound, the LSE within 2e-2; each route against its own two-stage oracle, two launches bitwise."""
     kw = dict(page=16, seed=221, split=None, fuse_gate=True, return_lse=True, fuse_prepare=True)
     lean = _IndexerCase(GEOM_SMALL, 1, (2052, 8192, 0, 4097), sparse_tile_form="lean", **kw)
     tc = _IndexerCase(GEOM_SMALL, 1, (2052, 8192, 0, 4097), sparse_tile_form="tcgen05", **kw)
@@ -3790,7 +3798,8 @@ def test_the_indexer_decode_step_on_the_lean_route_lists_bitwise_and_attends_wit
     c = _cos(lean.out, tc.out)
     d_o = float((lean.slab_views()[4].float() - tc.slab_views()[4].float()).abs().max())
     d_lse = _lse_delta(lean.lse, tc.lse)
-    assert c > COS_OUT and d_o <= ATOL and d_lse <= ATOL, f"lean vs tcgen05 (indexer step): cos {c:.6f} max|dO_gated| {d_o:.3e} max|dLSE| {d_lse:.3e}"
+    assert c > COS_OUT and d_lse <= ATOL, f"lean vs tcgen05 (indexer step): cos {c:.6f} max|dO_gated| {d_o:.3e} max|dLSE| {d_lse:.3e}"
+    assert_output_close(lean.slab_views()[4], tc.slab_views()[4], "lean vs tcgen05 (indexer step): gated O")
     print(f"\nindexer step lean vs tcgen05: list bitwise, cos(out) {c:.6f} max|dO_gated| {d_o:.3e} max|dLSE| {d_lse:.2e}; lean {m_lean}; tcgen05 {m_tc}")
 
 

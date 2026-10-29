@@ -1766,6 +1766,16 @@ def qkvg_from_hf(
     block's accuracy budget but not HF-faithful -- the fp32 in-kernel offset
     form is the faithful one once a geometry declares it.
 
+    Measured consequence (the Qwen3.8-Flash-Next geometry: bf16, 24 / 2 heads,
+    ``d_head`` 256, T 2048; 2026-10-28): the once-rounded ``(1 + w)`` flips ~30 %
+    of the normed ``q`` and ~27 % of the ``k`` elements by one bf16 ulp against
+    the fp32-``(1 + w)`` reference (an HF-faithful chain shows ~7 % from its own
+    rope-dim rounding) and moves a SHORT row's gated O -- few visible keys, two
+    dominant ones with large opposite-sign V at one dim -- by up to ~2e-2 at that
+    dim (0.88 of the suites' bf16 output bound, cos 0.99999), while decode rows
+    attending >= 2048 keys stay within 2e-3.  Inside the block's accuracy budget,
+    as stated; the fp32 offset form (option C) remains the HF-faithful lever.
+
     Parameters
     ----------
     q_proj_weight
