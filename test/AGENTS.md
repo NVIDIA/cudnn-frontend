@@ -1160,3 +1160,6 @@ separate stride, not additional logical rows or required final-head storage.
 The wrapper capacity-reuse tests forbid compilation after capacities change;
 `test_sdpa_sm80_native_wrappers.py` retains fresh-process artifact checks while
 forbidding normalization and rejecting unsupported inner strides before launch.
+Its singleton-Stats case uses T=H=1 with zero, compact and padded head pitches:
+both packings classify the same element, but the token-major binder requires
+exact strides, so the wrapper must retain the head-major ABI for unused pitches.

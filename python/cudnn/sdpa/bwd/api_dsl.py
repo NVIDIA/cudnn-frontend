@@ -940,6 +940,10 @@ def _sm80_thd_backward(
         # A singleton head's pitch is never stepped, including a zero stride.
         stride_h = lse_t.stride(1) if h_q > 1 else t_q
         packing = thd_stats_packing(stride_h, lse_t.stride(2), h_q)
+        if h_q == 1 and packing == "token_major":
+            # At T=H=1 both packings address the same element. Keep the
+            # head-major ABI, which ignores the caller's unused head pitch.
+            packing = "head_major"
         if packing == "token_major":
             # Reuse the graph chain's existing compact token-major Stats ABI.
             # This is a view of the caller's storage, not a layout conversion.

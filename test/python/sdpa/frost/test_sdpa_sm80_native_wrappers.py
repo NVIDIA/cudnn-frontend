@@ -131,3 +131,28 @@ def test_packed_backward_declines_nonunit_dimension_stride(dtype, role, monkeypa
     monkeypatch.setattr(SdpaBwdDslSm80, "execute", forbidden)
     with pytest.raises(NotImplementedError, match=rf"SM80.*{role}.*(stride|packed rows)"):
         _wrapper(case, _prefix(case.cu_q), _prefix(case.cu_k), deterministic=True, max_s_q=40, max_s_kv=48)
+
+
+@requires_native_sm80
+@pytest.mark.parametrize("head_stride", [0, 1, 7])
+def test_packed_backward_singleton_stats_head_stride(head_stride):
+    """An unused Stats head pitch must not change the one-token binding."""
+    from sdpa.frost.test_sdpa_bwd_thd_sm80 import _thd_case
+    from test_sdpa_bwd_prepared_thd_sm80 import _check
+    from test_sdpa_sm80_thd_wrapper_prepared import _prefix, _wrapper
+
+    case = _thd_case((1,), (3,), 1, 96, torch.bfloat16, hkv=1, d_v=80, cap_q=1, cap_kv=3, poison=True)
+    case.lse = case.lse.as_strided((1, 1, 1), (0, head_stride, 1))
+    cu_q, cu_k = _prefix(case.cu_q), _prefix(case.cu_k)
+    outputs = _wrapper(case, cu_q, cu_k, deterministic=True)
+    _check(case, *(outputs[n] for n in ("dq_tensor", "dk_tensor", "dv_tensor")))
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            captured = _wrapper(case, cu_q, cu_k, deterministic=True)
+        for tensor in captured.values():
+            tensor.fill_(float("nan"))
+        graph.replay()
+        _check(case, *(captured[n] for n in ("dq_tensor", "dk_tensor", "dv_tensor")))
+    finally:
+        graph.reset()
