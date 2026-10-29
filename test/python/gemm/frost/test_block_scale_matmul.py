@@ -3542,29 +3542,41 @@ def test_sm120_fp4_rejects_non_k_major():
             jit_from_cudnn_graph(g, **_kw(_SM120_BS_128))
 
 
-# The dense template reads each F8_128x4 scale-factor operand at the pitches of the packed blob of the call's own
-# problem size (B29): 512 B per atom of 128 rows x 4 scales, ceil((K / 32) / 4) atoms per 128-row block, the blocks of a
-# batch plane back to back. MXFP8 (block 32) with K=512 reads 4 atoms (16 scales) per row; scales vary per block so a
-# misread shows up in the numbers.
+# The dense template reads each F8_128x4 scale-factor operand as the packed blob of the call's own problem size (B29):
+# 512 B per atom of 128 rows x 4 scales, ceil((K / block) / 4) atoms per 128-row block, the row blocks of a batch plane
+# and then the planes back to back. A bound buffer supplies only pointer, bytes and alignment, so any buffer holding that
+# blob at its start is read correctly; a DECLARED layout that puts a plane or a row block elsewhere -- at the declared
+# problem size, or at the size a call runs -- is declined at check_support or refused before the launch. MXFP8 (block 32)
+# with K=512 reads 4 atoms (16 scales) per row; scales vary per block, so a misread shows up in the numbers.
 _SF_K = 512
 
 
-def _build_sm120_mxfp8_sf_graph(B, M, N, sfa_dim, sfb_dim):
-    """Batched MXFP8 matmul declaring SFA ``sfa_dim`` = [B, rows, SF-K] and SFB ``sfb_dim`` = [B, SF-K, rows]."""
-    g = cudnn.pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    A = g.tensor(name="A", dim=[B, M, _SF_K], stride=[M * _SF_K, _SF_K, 1], data_type=cudnn.data_type.FP8_E4M3)
-    Bt = g.tensor(name="B", dim=[B, _SF_K, N], stride=[_SF_K * N, 1, _SF_K], data_type=cudnn.data_type.FP8_E4M3)
-    sf = dict(data_type=cudnn.data_type.FP8_E8M0, reordering_type=cudnn.tensor_reordering.F8_128x4)
-    SFA = g.tensor(name="SFA", dim=list(sfa_dim), stride=[sfa_dim[1] * sfa_dim[2], sfa_dim[2], 1], **sf)
-    SFB = g.tensor(name="SFB", dim=list(sfb_dim), stride=[sfb_dim[1] * sfb_dim[2], 1, sfb_dim[1]], **sf)
-    Ad = g.block_scale_dequantize(input=A, descale=SFA, block_size=[1, 32])
-    Bd = g.block_scale_dequantize(input=Bt, descale=SFB, block_size=[32, 1])
-    g.matmul(A=Ad, B=Bd, name="mm").set_output(True).set_data_type(cudnn.data_type.HALF)
-    return g
+def _build_sm120_sf_graph(B, M, N, sfa_dim, sfb_dim, nvfp4=False, override=False):
+    """Batched MXFP8 (or NVFP4) matmul declaring SFA ``sfa_dim`` = [planes, rows, SF-K] and SFB ``sfb_dim`` =
+    [planes, SF-K, rows]: ``(graph, {name: tensor})``."""
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.HALF,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+        **({"is_override_shape_enabled": True} if override else {}),
+    )
+    data_dt, block = (cudnn.data_type.FP4_E2M1, 16) if nvfp4 else (cudnn.data_type.FP8_E4M3, 32)
+    sf = dict(data_type=cudnn.data_type.FP8_E4M3 if nvfp4 else cudnn.data_type.FP8_E8M0, reordering_type=cudnn.tensor_reordering.F8_128x4)
+    t = dict(
+        A=g.tensor(name="A", dim=[B, M, _SF_K], stride=[M * _SF_K, _SF_K, 1], data_type=data_dt),
+        B=g.tensor(name="B", dim=[B, _SF_K, N], stride=[_SF_K * N, 1, _SF_K], data_type=data_dt),
+        SFA=g.tensor(name="SFA", dim=list(sfa_dim), stride=[sfa_dim[1] * sfa_dim[2], sfa_dim[2], 1], **sf),
+        SFB=g.tensor(name="SFB", dim=list(sfb_dim), stride=[sfb_dim[1] * sfb_dim[2], 1, sfb_dim[1]], **sf),
+    )
+    Ad = g.block_scale_dequantize(input=t["A"], descale=t["SFA"], block_size=[1, block])
+    Bd = g.block_scale_dequantize(input=t["B"], descale=t["SFB"], block_size=[block, 1])
+    t["O"] = g.matmul(A=Ad, B=Bd, name="mm")
+    t["O"].set_output(True).set_data_type(cudnn.data_type.HALF)
+    return g, t
 
 
 def _packed_sf_dims(B, M, N):
-    """The declarations of the packed blob: ``(sfa_dim, sfb_dim)`` padded to whole 128 x 4 atoms."""
+    """The MXFP8 declarations of the packed blob: ``(sfa_dim, sfb_dim)`` padded to whole 128 x 4 atoms."""
     return (B, _ceil_div(M, 128) * 128, _SF_K // 32), (B, _SF_K // 32, _ceil_div(N, 128) * 128)
 
 
@@ -3593,118 +3605,235 @@ def _sf_planes(scales, rows, sf_k):
     return torch.stack(planes).view(len(planes), rows, sf_k).view(torch.float8_e8m0fnu)
 
 
+def _sf_prefix(scales, shape):
+    """A zeroed E8M0 buffer of ``shape`` whose first bytes are the packed blob of ``scales`` (the run's own planes)."""
+    blob = _sf_planes(scales, _ceil_div(scales.shape[1], 128) * 128, _ceil_div(scales.shape[2], 4) * 4).view(torch.uint8).flatten()
+    buf = torch.zeros(shape, dtype=torch.uint8, device=scales.device)
+    buf.view(-1)[: blob.numel()] = blob
+    return buf.view(torch.float8_e8m0fnu)
+
+
+def _sm120_sf_plan(g, python):
+    """Index of the first FROST (``python``) or cuDNN backend plan of ``g`` that passes check_support, left selected
+    and built; ``None`` when that engine offers none."""
+    from cudnn.engines import is_python_engine
+
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    for i in range(g.get_execution_plan_count()):
+        if is_python_engine(g.get_engine_and_knobs_at_index(i)[0]) != python:
+            continue
+        g.select_plan(i)
+        try:
+            g.check_support()
+        except (NotImplementedError, cudnn.cudnnGraphNotSupportedError):
+            continue
+        g.build_plans()
+        return i
+    return None
+
+
 @requires_sm120
 @pytest.mark.parametrize(
-    "B, M, N, sfa_geometry, sfb_geometry",
+    "B, M, N, sfa_dim, sfb_dim, nvfp4, swap_ab, declined",
     [
-        (2, 100, 128, (256, 16), (128, 16)),  # SFA batch planes laid out for 256 rows: batch 1 read from batch 0's rows 128..255
-        (2, 128, 100, (128, 16), (256, 16)),  # the same on the SFB side
-        (1, 256, 128, (256, 32), (128, 16)),  # SFA SF-K axis padded to 32 scales: rows 128..255 read from rows 0..127's padding
+        (2, 100, 128, (2, 256, 16), (2, 16, 128), False, False, "SFA [2, 256, 16] spaces its 2 planes 8 atoms apart"),
+        (2, 128, 100, (2, 128, 16), (2, 16, 256), False, False, "SFB [2, 16, 256] spaces its 2 planes 8 atoms apart"),
+        (2, 128, 100, (2, 128, 16), (2, 16, 256), False, True, "SFB [2, 16, 256] spaces its 2 planes 8 atoms apart"),
+        (1, 256, 128, (1, 256, 32), (1, 16, 128), False, False, "SFA [1, 256, 32] has 32 scales along K (8 atoms)"),
+        (2, 100, 128, (1, 256, 32), (2, 16, 128), False, False, "SFA [1, 256, 32] has 32 scales along K (8 atoms)"),
+        (2, 100, 128, (2, 256, 32), (2, 32, 128), True, False, "SFA [2, 256, 32] spaces its 2 planes 16 atoms apart"),
     ],
-    ids=["sfa-batch-planes", "sfb-batch-planes", "sfa-k-padding"],
+    ids=["sfa-batch-planes", "sfb-batch-planes", "sfb-batch-planes-swap-ab", "sfa-k-padding", "stacked-rows-k-padding", "nvfp4-sfa-batch-planes"],
 )
-def test_sm120_block_scale_refuses_sf_laid_out_past_the_packed_blob(B, M, N, sfa_geometry, sfb_geometry):
-    """B29: a dense scale-factor buffer whose own shape spaces the batch planes or 128-row blocks further apart than
-    the packed blob is refused before any launch; it used to pass the density / capacity check and be read at the
-    packed pitches, which gave all-zero batch-1 rows (or rows 128..255) on SM120."""
-    a, b, sfa_log, sfb_log, _ref = _sm120_mxfp8_sf_case(B, M, N)
-    plan = _plan(_build_sm120_mxfp8_sf_graph(B, M, N, *_packed_sf_dims(B, M, N)), config=by_name(_SM120_BS_128))
+def test_sm120_block_scale_declines_sf_declared_past_the_packed_blob(B, M, N, sfa_dim, sfb_dim, nvfp4, swap_ab, declined):
+    """B29: the dense template reads F8_128x4 scales as the packed blob of the problem size, so a declared layout that
+    pads a batch plane past it, or makes SF-K wider than its row-block pitch, would be read from the wrong rows (batch 1,
+    or rows 128..255, came out all zero on SM120). It is declined by check_support and the direct JIT; a swap-AB plan
+    names the graph's tensors and extents."""
+    from cudnn.gemm.frost.compiler import probe_supported
+
+    g, _ = _build_sm120_sf_graph(B, M, N, sfa_dim, sfb_dim, nvfp4=nvfp4)
+    config = dataclasses.replace(by_name(_SM120_BS_128), swap_ab=swap_ab)
+    declined = rf"\(M={M}, N={N}, K={_SF_K}, block {16 if nvfp4 else 32};.*" + re.escape(declined + ", but the template reads")
+    with pytest.raises(NotImplementedError, match=declined):
+        probe_supported(g)
+    with pytest.raises(NotImplementedError, match=declined):
+        C120.probe_supported(g, config)
+    with pytest.raises(NotImplementedError, match=declined):
+        jit_from_cudnn_graph(g, config=config)
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "B, M, sfa_dim",
+    [
+        (2, 100, (2, 100, 16)),  # logical rows
+        (2, 100, (2, 128, 16)),  # padded to whole atoms
+        (1, 200, (1, 512, 16)),  # batch 1: more rows leave the row blocks the template reads where they are
+        (1, 100, (1, 128, 32)),  # one row block: the template reads its first 4 atoms
+        (2, 100, (1, 256, 16)),  # the batch planes stacked as rows, the template's own order
+    ],
+    ids=["logical", "padded", "batch1-max-m", "k-padding-one-row-block", "batches-stacked-as-rows"],
+)
+def test_sm120_block_scale_runs_sf_declared_where_the_template_reads_it(B, M, sfa_dim):
+    """The controls of the decline above (accept means run): a declared layout the template reads where it lies is
+    accepted, and a buffer laid out as declared gives the reference result."""
+    from cudnn.gemm.frost.compiler import probe_supported
+
+    N = 128
+    sfb_dim = _packed_sf_dims(B, M, N)[1]
+    g, _ = _build_sm120_sf_graph(B, M, N, sfa_dim, sfb_dim)
+    probe_supported(g)
+    a, b, sfa_log, sfb_log, ref = _sm120_mxfp8_sf_case(B, M, N)
+    rows, sf_k = _ceil_div(sfa_dim[1], 128) * 128, _ceil_div(sfa_dim[2], 4) * 4
+    sfa = _sf_planes(sfa_log, rows // B, sf_k).view(1, rows, sf_k) if sfa_dim[0] != B else _sf_planes(sfa_log, rows, sf_k)
+    plan = _plan(g, config=by_name(_SM120_BS_128))
     out = torch.full((B, M, N), float("nan"), dtype=torch.float16, device="cuda")
-    with pytest.raises(ValueError, match="laid out as the packed blob of this call"):
-        plan(_vp_bs(plan, a, b, out, _sf_planes(sfa_log, *sfa_geometry), _sf_planes(sfb_log, *sfb_geometry)))
+    plan(_vp_bs(plan, a, b, out, sfa, _sf_planes(sfb_log, sfb_dim[2], sfb_dim[1])))
     torch.cuda.synchronize()
-    assert torch.isnan(out).all().item(), "the refused call must not launch"
+    torch.testing.assert_close(out, ref, atol=2e-1, rtol=2e-2)
 
 
 @requires_sm120
 @pytest.mark.parametrize(
     "binding",
-    ["packed", "flat", "plane-per-batch-flat", "batches-stacked-as-rows", "max-m-rows", "k-padding-one-row-block"],
+    [
+        "packed",
+        "flat",
+        "plane-per-batch-flat",
+        "batches-stacked-as-rows",
+        "packed-prefix-in-larger-planes",
+        "packed-prefix-in-wider-rows",
+        "atom-rows-of-4",
+        "atom-planes",
+        "one-atom-row",
+    ],
 )
-def test_sm120_block_scale_sf_bindings_read_as_laid_out(binding):
-    """The controls of the refusal above: every binding whose layout the template reads where it lies still runs,
-    including the blob views that describe no plane and the paddings that leave the read pitches unchanged."""
-    B, M, N = (1, 200, 128) if binding == "max-m-rows" else (1, 100, 128) if binding == "k-padding-one-row-block" else (2, 100, 128)
+def test_sm120_block_scale_reads_any_sf_binding_as_the_packed_blob(binding):
+    """A bound SF buffer supplies pointer, bytes and alignment only (the declaration is the contract), which is how every
+    cuDNN backend engine reads it: under the packed declaration, every dense view of the packed blob and a larger buffer
+    holding it at its start give the reference result. A buffer's own shape is never read as a layout; only a declared
+    layout is declined or refused."""
+    wide = binding in ("packed-prefix-in-wider-rows", "atom-rows-of-4", "atom-planes", "one-atom-row")
+    B, M, N = (1, 256, 128) if wide else (2, 100, 128)
     a, b, sfa_log, sfb_log, ref = _sm120_mxfp8_sf_case(B, M, N)
-    plan = _plan(_build_sm120_mxfp8_sf_graph(B, M, N, *_packed_sf_dims(B, M, N)), config=by_name(_SM120_BS_128))
-    rows = _ceil_div(M, 128) * 128
+    g, _ = _build_sm120_sf_graph(B, M, N, *_packed_sf_dims(B, M, N))
+    plan = _plan(g, config=by_name(_SM120_BS_128))
+    packed = _sf_planes(sfa_log, _ceil_div(M, 128) * 128, 16)
     sfa = {
-        "packed": lambda: _sf_planes(sfa_log, rows, 16),
-        "flat": lambda: _sf_planes(sfa_log, rows, 16).view(1, 1, -1),
-        "plane-per-batch-flat": lambda: _sf_planes(sfa_log, rows, 16).view(B, -1, 1),
-        "batches-stacked-as-rows": lambda: _sf_planes(sfa_log, rows, 16).view(1, B * rows, 16),
-        "max-m-rows": lambda: _sf_planes(sfa_log, 512, 16),  # batch 1: the row-block pitch is unchanged
-        "k-padding-one-row-block": lambda: _sf_planes(sfa_log, 128, 32),  # one 128-row block: its first 4 atoms are read
+        "packed": lambda: packed,
+        "flat": lambda: packed.view(1, 1, -1),
+        "plane-per-batch-flat": lambda: packed.view(B, -1, 1),
+        "batches-stacked-as-rows": lambda: packed.view(1, -1, 16),
+        "packed-prefix-in-larger-planes": lambda: _sf_prefix(sfa_log, (B, 256, 16)),  # the run's blob in a max-M buffer
+        "packed-prefix-in-wider-rows": lambda: _sf_prefix(sfa_log, (B, 256, 32)),
+        "atom-rows-of-4": lambda: packed.view(1, -1, 4),
+        "atom-planes": lambda: packed.view(-1, 32, 16),
+        "one-atom-row": lambda: packed.view(1, -1, 512),
     }[binding]()
     out = torch.full((B, M, N), float("nan"), dtype=torch.float16, device="cuda")
-    plan(_vp_bs(plan, a, b, out, sfa, _sf_planes(sfb_log, _ceil_div(N, 128) * 128, 16)))
+    plan(_vp_bs(plan, a, b, out, sfa, _sf_planes(sfb_log, 128, 16)))
     torch.cuda.synchronize()
     torch.testing.assert_close(out, ref, atol=2e-1, rtol=2e-2)
+
+
+def _sm120_sf_override(t, B, M, N, sf_rows=None):
+    """Execute-time override kwargs running M rows: A and O, plus SFA at ``[B, sf_rows, 16]`` when given."""
+    geometry = {t["A"]: ([B, M, _SF_K], [M * _SF_K, _SF_K, 1]), t["O"]: ([B, M, N], [M * N, N, 1])}
+    if sf_rows is not None:
+        geometry[t["SFA"]] = ([B, sf_rows, 16], [sf_rows * 16, 16, 1])
+    return dict(
+        override_uids=[x.get_uid() for x in geometry],
+        override_shapes=[s for s, _ in geometry.values()],
+        override_strides=[st for _, st in geometry.values()],
+    )
 
 
 @requires_sm120
 @pytest.mark.parametrize(
-    "B, M, N, sfa_dim, sfb_dim, declined",
-    [
-        (2, 100, 128, (2, 256, 16), (2, 16, 128), "SFA [2, 256, 16] pads each of its 2 batch planes to 8 atoms"),
-        (2, 128, 100, (2, 128, 16), (2, 16, 256), "SFB [2, 16, 256] pads each of its 2 batch planes to 8 atoms"),
-        (1, 256, 128, (1, 256, 32), (1, 16, 128), "SFA [1, 256, 32] declares 32 scales along K"),
-        (2, 100, 128, (2, 100, 16), (2, 16, 128), None),  # logical rows
-        (2, 100, 128, (2, 128, 16), (2, 16, 128), None),  # padded rows
-        (1, 200, 128, (1, 512, 16), (1, 16, 128), None),  # batch 1: more rows leave the row-block pitch unchanged
-    ],
-    ids=["sfa-batch-planes", "sfb-batch-planes", "sfa-k-padding", "logical", "padded", "batch1-max-m"],
+    "case",
+    ["packed-prefix-in-larger-planes", "override-shape-sf-at-run-extents", "override-shape-batch1-sf-as-declared"],
 )
-def test_sm120_block_scale_declines_sf_declared_past_the_packed_blob(B, M, N, sfa_dim, sfb_dim, declined):
-    """B29 at the declaration: an SF bound as declared is laid out at the declared padded pitches, so a declaration
-    the template would misread is declined at check_support (and by the direct JIT) instead of failing at execute."""
-    from cudnn.gemm.frost.compiler import probe_supported
-
-    g = _build_sm120_mxfp8_sf_graph(B, M, N, sfa_dim, sfb_dim)
-    if declined is None:
-        probe_supported(g)
-        return
-    with pytest.raises(NotImplementedError, match=re.escape(declined)):
-        probe_supported(g)
-    with pytest.raises(NotImplementedError, match=re.escape(declined)):
-        jit_from_cudnn_graph(g, **_kw(_SM120_BS_128))
+def test_sm120_block_scale_sf_bindings_run_alike_on_frost_and_the_backend(case):
+    """Rule 9 for the bindings above: the same caller code gives the reference result on the FROST plan and on the cuDNN
+    backend plan. A larger buffer holding the packed blob under the packed declaration; a graph built at M=256 that runs
+    M=100 with SFA overridden to the run's extents [2, 128, 16] along with A and O (as cuDNN's dynamic-shape quantize test
+    and FlashInfer do), its buffer still the larger one; and a batch-1 graph built at M=256 that runs M=200 with SFA left
+    at its declaration, which lays out the 2 row blocks the template reads at M=200 where it reads them."""
+    B, built_m, M = {"packed-prefix-in-larger-planes": (2, 100, 100), "override-shape-sf-at-run-extents": (2, 256, 100)}.get(case, (1, 256, 200))
+    N = 128
+    a, b, sfa_log, sfb_log, ref = _sm120_mxfp8_sf_case(B, M, N)
+    sfa = _sf_planes(sfa_log, 256, 16) if B == 1 else _sf_prefix(sfa_log, (B, 256, 16))
+    outs = {}
+    for python in (True, False):
+        g, t = _build_sm120_sf_graph(B, built_m, N, *_packed_sf_dims(B, built_m, N), override=built_m != M)
+        index = _sm120_sf_plan(g, python)
+        if index is None:
+            assert not python, "the FROST engine declined this graph"
+            pytest.skip("no cuDNN backend plan for this graph on this build")
+        kw = _sm120_sf_override(t, B, M, N, 128 if case == "override-shape-sf-at-run-extents" else None) if built_m != M else {}
+        workspace = torch.empty(max(1, g.get_workspace_size()), dtype=torch.uint8, device="cuda")
+        out = torch.full((B, M, N), float("nan"), dtype=torch.float16, device="cuda")
+        pack = {t["A"]: a, t["B"]: b.transpose(1, 2), t["SFA"]: sfa, t["SFB"]: _sf_planes(sfb_log, 128, 16), t["O"]: out}
+        g.execute_plan_at_index(pack, workspace, index=index, **kw)
+        torch.cuda.synchronize()
+        outs["frost" if python else "backend"] = out
+    for engine, out in outs.items():
+        torch.testing.assert_close(out, ref, atol=2e-1, rtol=2e-2, msg=lambda m, engine=engine: f"{engine}: {m}")
 
 
 @requires_sm120
-def test_sm120_block_scale_engine_refuses_sf_planes_past_the_packed_blob():
-    """B29 through the FROST engine's public execute: the packed binding runs, and a rank-3 buffer that keeps its own
-    padded batch planes (an F8_128x4 slot keeps the caller's extents) is refused before the launch."""
-    from cudnn.engines import is_python_engine
-
-    B, M, N = 2, 100, 128
+@pytest.mark.parametrize("route", ["engine", "direct", "direct-swap-ab"])
+def test_sm120_block_scale_refuses_sf_declared_for_another_problem_size(route):
+    """B29 at a problem size the plan was not declared for: built at 256 rows with that side's SF declared for them
+    ([2, 256, 16]: batch planes 4096 B apart), a call running 100 rows -- A and O overridden on the engine route, smaller
+    buffers on the direct one -- would have the template read batch 1 at 2048 B, while the declaration (which the cuDNN
+    backend engines that honour it read) keeps it at 4096 B. With the SF left at its declared extents the call is refused
+    before the launch, naming the graph's tensors and extents; with the SF at the run's extents it runs."""
+    swap = route == "direct-swap-ab"
+    B, M, N = (2, 128, 100) if swap else (2, 100, 128)
     a, b, sfa_log, sfb_log, ref = _sm120_mxfp8_sf_case(B, M, N)
-    g = _build_sm120_mxfp8_sf_graph(B, M, N, *_packed_sf_dims(B, M, N))
-    _, binding = analyze_with_binding(g)
-    g.validate()
-    g.build_operation_graph()
-    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-    index = next(i for i in range(g.get_execution_plan_count()) if is_python_engine(g.get_engine_and_knobs_at_index(i)[0]))
-    g.select_plan(index)
-    g.check_support()
-    g.build_plans()
-    workspace = torch.empty(max(1, g.get_workspace_size()), dtype=torch.uint8, device="cuda")
+    packed = {"SFA": _sf_planes(sfa_log, 128, 16), "SFB": _sf_planes(sfb_log, 128, 16)}
+    side, other = ("SFB", "SFA") if swap else ("SFA", "SFB")
+    as_declared = _sf_prefix(sfb_log if swap else sfa_log, (B, 256, 16))  # holds the run's blob, but its extents are the declaration's
+    built = (M, 256) if swap else (256, N)
+    g, t = _build_sm120_sf_graph(B, *built, *_packed_sf_dims(B, *built), override=route == "engine")
+    if route == "engine":
+        index = _sm120_sf_plan(g, python=True)
+        assert index is not None, "the FROST engine declined this graph"
+        workspace = torch.empty(max(1, g.get_workspace_size()), dtype=torch.uint8, device="cuda")
 
-    def pack(sfa, out):
-        """Bind the graph's own roles; B is declared [B, K, N] with K contiguous."""
-        return {
-            binding.a_operands[0]: a,
-            binding.b_operands[0]: b.transpose(1, 2),
-            binding.sfa_operands[0]: sfa,
-            binding.sfb_operands[0]: _sf_planes(sfb_log, 128, 16),
-            binding.outputs[0]: out,
-        }
+        def run(sf, out, sf_rows=None):
+            pack = {t["A"]: a, t["B"]: b.transpose(1, 2), t[side]: sf, t[other]: packed[other], t["O"]: out}
+            g.execute_plan_at_index(pack, workspace, index=index, **_sm120_sf_override(t, B, M, N, sf_rows))
+
+    else:
+        plan = _plan(g, config=dataclasses.replace(by_name(_SM120_BS_128), swap_ab=swap))
+
+        def run(sf, out, sf_rows=None):  # B in kernel order: the call's N cannot be read off a graph-order view
+            plan({t["A"]: a, t["B"]: b, t[side]: sf, t[other]: packed[other], t["O"]: out})
 
     out = torch.full((B, M, N), float("nan"), dtype=torch.float16, device="cuda")
-    g.execute_plan_at_index(pack(_sf_planes(sfa_log, 128, 16), out), workspace, index=index)
-    torch.cuda.synchronize()
-    torch.testing.assert_close(out, ref, atol=2e-1, rtol=2e-2)
-    out.fill_(float("nan"))
-    with pytest.raises(ValueError, match="laid out as the packed blob of this call"):
-        g.execute_plan_at_index(pack(_sf_planes(sfa_log, 256, 16), out), workspace, index=index)
+    declared = "SFB [2, 16, 256]" if swap else "SFA [2, 256, 16]"
+    refused = rf"declared for \(M, N, K\) = \({built[0]}, {built[1]}, 512\) and runs \({M}, {N}, 512\), where " + re.escape(
+        f"{declared} (as declared) spaces its 2 planes 8 atoms apart, but the template reads batch l at l x 4 atoms"
+    )
+    with pytest.raises(ValueError, match=refused + ".*" + re.escape(f"override {side} to {[2, 16, 128] if swap else [2, 128, 16]}")):
+        run(as_declared, out)
     torch.cuda.synchronize()
     assert torch.isnan(out).all().item(), "the refused call must not launch"
+    run(as_declared if route == "engine" else packed[side], out, sf_rows=128)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, ref, atol=2e-1, rtol=2e-2)
+
+
+@requires_sm120
+def test_sm120_block_scale_engine_route_declines_sf_declared_past_the_packed_blob():
+    """B29 through the FROST engine: SFA declared [2, 256, 16] for M=100 (each batch plane laid out for 256 rows) leaves
+    the graph without a FROST plan that passes check_support, so it is routed to another engine; the packed declaration
+    keeps its FROST plan."""
+    for sfa_dim, served in (((2, 256, 16), False), ((2, 128, 16), True)):
+        g, _ = _build_sm120_sf_graph(2, 100, 128, sfa_dim, (2, 16, 128))
+        assert (_sm120_sf_plan(g, python=True) is not None) == served, f"SFA declared {list(sfa_dim)}"

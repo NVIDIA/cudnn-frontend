@@ -1193,68 +1193,6 @@ def _initialize_combine_output(chain: FusionChain, outputs, stream=None) -> None
     buffers.apply_zero_fill_plan(output.data_ptr(), plan, DTYPE_BYTES[chain.outputs[0].dtype], stream)
 
 
-# sm120_block_scale_matmul.py takes each scale-factor operand as a base pointer and rebuilds its F8_128x4 TMA view
-# from the call's problem size alone (``_host``: rest_k, rest_m / rest_n): k4 512-byte atoms (128 rows x 4 scales)
-# per 128-row block and every block of a batch plane back to back. Scale factors laid out at a larger pitch -- batch
-# planes padded to more rows, or an SF-K axis wider than 4 * k4 once a plane holds more than one row block -- pass
-# the launch path's density / capacity check and are then read silently from the wrong rows. So the declared layout
-# is declined at check_support (_dense_sf_declaration_reject) and a buffer laid out that way is refused before any
-# write or launch (_dense_sf_buffer_reject).
-
-
-def _dense_sf_read_geometry(rows: int, k: int, block_size: int) -> "tuple[int, int]":
-    """``(row_blocks, k4)`` of the packed F8_128x4 blob the dense block-scale template reads for one operand."""
-    return (rows + 127) // 128, (k // block_size + 3) // 4
-
-
-def _dense_sf_k_fits(sf_k: int, row_blocks: int, k4: int) -> bool:
-    """Does an SF-K extent of ``sf_k`` scales put each 128-row block where the template reads it? One row block
-    needs at least the ``k4`` atoms the template reads; more than one need exactly ``k4``, its row-block pitch."""
-    atoms = (sf_k + 3) // 4
-    return atoms == k4 if row_blocks > 1 else atoms >= k4
-
-
-def _dense_sf_buffer_reject(recipe, operands, graph_order=None) -> "str | None":
-    """Refuse scale-factor buffers whose own shape lays the scales out at another pitch than the template reads.
-
-    Only a buffer that describes its planes -- rank 3, byte elements, both inner extents above 1 -- can say so: a
-    dim 0 counting the batch planes the kernel reads must not spread them further apart than the packed plane, and
-    one inner extent must be the SF-K width of ``_dense_sf_k_fits``. A buffer that describes no plane (a flat blob,
-    ``view(1, 1, -1)``, the engine's ``(b, bytes // b, 1)`` view of a flat blob) stays a blob whose start holds the
-    packed layout. ``None`` when nothing is wrong, or when the A / B layout is itself refused by the launch path."""
-    described = []
-    for sf in recipe.sf:
-        v = operands[sf.index]
-        shape = tuple(v.shape)
-        if len(shape) == 3 and shape[1] > 1 and shape[2] > 1 and v.element_size() == 1:
-            described.append((sf, shape))
-    if not described:
-        return None
-    try:
-        (m, n, k), _axes = recipe.problem(operands, graph_order)
-    except ValueError:
-        return None
-    bad = []
-    for sf, shape in described:
-        rows = m if sf.is_a else n
-        planes = recipe.inputs[sf.operand_at].batch
-        row_blocks, k4 = _dense_sf_read_geometry(rows, k, recipe.block_size)
-        if planes > 1 and shape[0] == planes and shape[1] * shape[2] > 512 * k4 * row_blocks:
-            bad.append(
-                f"{sf.role} shape {shape} holds {planes} batch planes of {shape[1] * shape[2]}B, but the kernel reads batch l at l x {512 * k4 * row_blocks}B"
-            )
-        elif not (_dense_sf_k_fits(shape[1], row_blocks, k4) or _dense_sf_k_fits(shape[2], row_blocks, k4)):
-            pitch = f"its {row_blocks} 128-row blocks {512 * k4}B apart" if row_blocks > 1 else f"{4 * k4} scales per row"
-            bad.append(f"{sf.role} shape {shape} has no inner axis of {4 * k4} scales (rounded up to 4), but the kernel reads {pitch}")
-    if not bad:
-        return None
-    return (
-        f"block-scale F8_128x4 scale factors must be laid out as the packed blob of this call (M={m}, N={n}, K={k}): "
-        + "; ".join(bad)
-        + " -- bind that blob (to_blocked() of the logical scales) with its padded extents, or a flat view of it"
-    )
-
-
 class CompiledFusedGemm(_CompiledFusedGemm[TileConfig, GemmBinding]):
     """Execute a compiled fused GEMM."""
 
@@ -1262,15 +1200,17 @@ class CompiledFusedGemm(_CompiledFusedGemm[TileConfig, GemmBinding]):
     _validate_runtime_quant = True
 
     def _lower(self):
-        """The shared launch closure, behind ``_dense_sf_buffer_reject`` for a block-scale plan."""
+        """The shared launch closure; a dense block-scale plan first checks its declared scale factors against the
+        call's own problem size (``_dense_sf_runtime_reject``), before any output is seeded or the kernel launched."""
         lowered = super()._lower()
-        if lowered is None or not self.block_scale:
+        if lowered is None or not self.block_scale or self.config.pipeline != "sm120" or not self.recipe.sf:
             return lowered
-        recipe, refuse, gave_up = self.recipe, self.explain, self.deferrals
+        declared = _dense_sf_declared_inputs(self)
+        compiled, refuse, gave_up = self, self.explain, self.deferrals
 
         def lowered_sf_checked(operands, graph_order=None, stream=None, workspace=None):
-            """Refuse misread scale factors before the shared checks seed any output or launch."""
-            if _dense_sf_buffer_reject(recipe, operands, graph_order) is not None:
+            """The declared problem size skips the check: check_support judged the declaration at it."""
+            if not all(tuple(operands[i].shape) in shapes for i, shapes in declared) and _dense_sf_runtime_reject(compiled, operands, graph_order):
                 gave_up["scale-factor layout"] += 1
                 return refuse(operands, graph_order)
             return lowered(operands, graph_order, stream=stream, workspace=workspace)
@@ -1279,9 +1219,9 @@ class CompiledFusedGemm(_CompiledFusedGemm[TileConfig, GemmBinding]):
 
     def explain(self, operands, graph_order=None):
         """Say what is wrong with a call the launch path refused, the scale-factor layout included, and raise."""
-        if self.block_scale:
+        if self.block_scale and self.config.pipeline == "sm120":
             _check_plan_device(self.recipe.device)
-            reason = _dense_sf_buffer_reject(self.recipe, operands, graph_order)
+            reason = _dense_sf_runtime_reject(self, operands, graph_order)
             if reason is not None:
                 raise ValueError(reason)
         return super().explain(operands, graph_order)
@@ -2198,38 +2138,124 @@ _DENSE_BLOCK_SCALE_QUANT_DECLINE = (
 )
 
 
-def _dense_sf_declaration_reject(chain: FusionChain, swap_ab: bool = False) -> "str | None":
-    """Decline declared scale factors the dense block-scale template would read at another pitch.
+def _dense_sf_misread(dims, batch: int, rows: int, k: int, block_size: int) -> "str | None":
+    """Why the dense block-scale template would read an F8_128x4 scale factor laid out as ``dims`` from the wrong rows.
 
-    A graph declares each F8_128x4 SF as ``[batch, rows, SF-K]`` (A) or ``[batch, SF-K, rows]`` (B), logical or
-    padded to whole 128 x 4 atoms, and a buffer bound as declared holds that padded layout. Planes padded past the
-    problem's own blob, or an SF-K axis that does not fit ``_dense_sf_k_fits``, would be read from the wrong rows;
-    the declaration decides that, so it is declined here (accept means run) rather than refused at execute.
-    ``chain`` is in kernel coordinates; ``swap_ab`` names the graph's tensors in the message."""
+    sm120_block_scale_matmul.py takes each SF operand as a base pointer and rebuilds its TMA view from the problem size
+    alone (``_host``: rest_k, rest_m / rest_n): ``k4`` atoms of 512 B (128 rows x 4 scales) per 128-row block, the row
+    blocks of a batch plane and then the planes back to back -- the packed blob. ``dims`` = ``(planes, rows, SF-K)``,
+    each plane padded to whole atoms, is read where it lies (``None``) only if
+    - with dim 0 counting more than one batch plane, every plane spans exactly the template's plane, and
+    - SF-K is exactly ``k4`` atoms whenever the template reads more than one row block in all (at least ``k4`` when it
+      reads one: that row block's other atoms are never read).
+    ``[1, batch x rows, SF-K]`` stacks the planes as rows, which is the template's own order. ``batch`` and ``rows`` are
+    the operand's batch and M (or N) extents, ``k`` the reduction extent."""
+    planes, sf_rows, sf_k = (int(d) for d in dims)
+    row_blocks, k4 = (rows + 127) // 128, (k // block_size + 3) // 4  # the template's rest_m / rest_n and rest_k
+    k_atoms = (sf_k + 3) // 4
+    plane_atoms = ((sf_rows + 127) // 128) * k_atoms
+    if batch > 1 and planes > 1 and plane_atoms != row_blocks * k4:
+        return f"spaces its {planes} planes {plane_atoms} atoms apart, but the template reads batch l at l x {row_blocks * k4} atoms"
+    if batch * row_blocks > 1 and k_atoms != k4:
+        return f"has {sf_k} scales along K ({k_atoms} atoms), but the template reads its {batch * row_blocks} 128-row blocks {k4} atoms apart"
+    if k_atoms < k4:
+        return f"has {sf_k} scales along K ({k_atoms} atoms), but the template reads {k4} atoms per row"
+    return None
+
+
+def _dense_sf_name(dim, kernel_a: bool, swap_ab: bool) -> "tuple[str, tuple]":
+    """``(graph role, kernel-orientation (planes, rows, SF-K))`` of the SF a kernel-coordinate chain declares as ``dim``."""
+    kernel = (int(dim[0]), int(dim[1]), int(dim[2])) if kernel_a else (int(dim[0]), int(dim[2]), int(dim[1]))
+    graph = list(dim) if not swap_ab else [dim[0], dim[2], dim[1]]
+    return f"{'SFA' if kernel_a != swap_ab else 'SFB'} {graph}", kernel
+
+
+def _dense_sf_declaration_reject(chain: FusionChain, swap_ab: bool = False) -> "str | None":
+    """Decline a declared scale-factor layout the dense block-scale template would read from the wrong rows.
+
+    A graph declares each F8_128x4 SF as ``[planes, rows, SF-K]`` (A) or ``[planes, SF-K, rows]`` (B); a declaration
+    ``_dense_sf_misread`` objects to at the declared problem size is declined here, since the declaration decides it
+    (accept means run). A bound buffer is not judged by its own extents: it supplies pointer, bytes and alignment, as
+    for the backend, so a larger buffer holding the packed blob at its start is read correctly by every engine.
+    ``chain`` is in kernel coordinates; ``swap_ab`` names the graph's tensors and extents in the message."""
     bs, mm = chain.block_scale, chain.matmul
     bad = []
-    for kernel_a, dim, rows, planes in ((True, bs.sfa_dim, mm.M, mm.a_batch), (False, bs.sfb_dim, mm.N, mm.b_batch)):
+    for kernel_a, dim, rows, batch in ((True, bs.sfa_dim, mm.M, mm.a_batch), (False, bs.sfb_dim, mm.N, mm.b_batch)):
         if dim is None or len(dim) != 3:
             continue
-        sf_rows, sf_k = (int(dim[1]), int(dim[2])) if kernel_a else (int(dim[2]), int(dim[1]))
-        declared = list(dim) if not swap_ab else [dim[0], dim[2], dim[1]]
-        role = "SFA" if kernel_a != swap_ab else "SFB"
-        row_blocks, k4 = _dense_sf_read_geometry(rows, mm.K, bs.block_size)
-        atoms = ((sf_rows + 127) // 128) * ((sf_k + 3) // 4)
-        if planes > 1 and atoms > row_blocks * k4:
-            bad.append(
-                f"{role} {declared} pads each of its {planes} batch planes to {atoms} atoms, but the template reads batch l at l x {row_blocks * k4} atoms"
-            )
-        elif not _dense_sf_k_fits(sf_k, row_blocks, k4):
-            pitch = f"its {row_blocks} 128-row blocks {k4} atoms apart" if row_blocks > 1 else f"{k4} atoms per row block"
-            bad.append(f"{role} {declared} declares {sf_k} scales along K, but the template reads {pitch} ({4 * k4} scales per row)")
+        name, kernel = _dense_sf_name(dim, kernel_a, swap_ab)
+        why = _dense_sf_misread(kernel, batch, rows, mm.K, bs.block_size)
+        if why is not None:
+            bad.append(f"{name} {why}")
     if not bad:
         return None
+    m, n = (mm.N, mm.M) if swap_ab else (mm.M, mm.N)
     return (
         "the sm120 dense block-scale template reads F8_128x4 scale factors as the packed blob of the problem size "
-        f"(M={mm.M}, N={mm.N}, K={mm.K}; one atom = 128 rows x 4 scales), and a declaration laid out at another pitch would "
-        "be read from the wrong rows: " + "; ".join(bad) + " -- declare each SF over its own operand, [batch, M | N, K / block] "
-        "or those extents padded up to whole 128 x 4 atoms"
+        f"(M={m}, N={n}, K={mm.K}, block {bs.block_size}; one atom = 128 rows x 4 scales), and a declaration laid out at another "
+        "pitch would be read from the wrong rows: " + "; ".join(bad) + " -- declare SFA as [batch, M, K / block] and SFB as "
+        "[batch, K / block, N], or with those extents padded up to whole 128 x 4 atoms"
+    )
+
+
+def _dense_sf_declared_inputs(compiled) -> tuple:
+    """``((index, shapes), ...)`` for the A and B operands the problem size is read off: their storage extents, in
+    kernel and in graph order, at the problem size the plan was declared for."""
+    recipe, mm = compiled.recipe, compiled.chain.matmul
+    declared = []
+    for op, mn in ((recipe.a, mm.M), (recipe.b, mm.N)):
+        kernel = (op.batch, mn, mm.K // op.kpack)
+        graph = [0, 0, 0]
+        for axis, extent in zip(op.declared, kernel):
+            graph[axis] = extent
+        declared.append((op.index, frozenset((kernel, tuple(graph)))))
+    return tuple(declared)
+
+
+def _dense_sf_runtime_reject(compiled, operands, graph_order=None) -> "str | None":
+    """Refuse a call at whose problem size a declared scale factor would be read from the wrong rows.
+
+    check_support judged each declared SF at the declared problem size, but one plan also serves other sizes (A / B
+    overrides on the engine path, A / B buffers of other extents on the direct one), and what the template reads follows
+    the call's M / N / K while the declared layout does not: an SFA declared [2, 256, 16] for M = 256 keeps batch 1 at
+    4096 B, where the template reads it at 2048 B once M = 100. The cuDNN backend engines that honour the declaration
+    read it at 4096 B. Such a call is refused unless the SF operand itself lays the scales out for this call: an SF
+    override to the call's extents (what FlashInfer and cuDNN's dynamic-shape test pass), or a buffer of exactly those
+    extents. ``None`` also when the A / B layout is refused by the launch path itself."""
+    recipe, chain = compiled.recipe, compiled.chain
+    try:
+        (m, n, k), _axes = recipe.problem(operands, graph_order)
+    except ValueError:
+        return None
+    mm, bs, swap_ab = chain.matmul, chain.block_scale, compiled.config.swap_ab
+    if (m, n, k) == (mm.M, mm.N, mm.K):
+        return None
+    bad, fix = [], []
+    for sf in recipe.sf:
+        dim = bs.sfa_dim if sf.is_a else bs.sfb_dim
+        if dim is None or len(dim) != 3:
+            continue
+        batch, rows = recipe.inputs[sf.operand_at].batch, (m if sf.is_a else n)
+        name, kernel = _dense_sf_name(dim, sf.is_a, swap_ab)
+        why = _dense_sf_misread(kernel, batch, rows, k, recipe.block_size)
+        if why is None:
+            continue
+        shape = tuple(operands[sf.index].shape)
+        if len(shape) == 3 and any(_dense_sf_misread(s, batch, rows, k, recipe.block_size) is None for s in (shape, (shape[0], shape[2], shape[1]))):
+            continue
+        rows_pad, sf_k_pad = (rows + 127) // 128 * 128, (k // recipe.block_size + 3) // 4 * 4
+        bad.append(f"{name} (as declared) {why}")
+        fix.append(f"{name.split()[0]} to {[batch, rows_pad, sf_k_pad] if name.startswith('SFA') else [batch, sf_k_pad, rows_pad]}")
+    if not bad:
+        return None
+    built, runs = ((mm.N, mm.M, mm.K), (n, m, k)) if swap_ab else ((mm.M, mm.N, mm.K), (m, n, k))
+    return (
+        f"block-scale F8_128x4 scale factors must be laid out for the problem size of the call: this plan was declared for "
+        f"(M, N, K) = {built} and runs {runs}, where "
+        + "; ".join(bad)
+        + " -- override "
+        + " and ".join(fix)
+        + " (padded to whole 128 x 4 atoms) along with A and B, or bind buffers of exactly those extents"
     )
 
 
