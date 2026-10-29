@@ -41,7 +41,7 @@ import pytest
 import torch
 
 from cudnn.frost.buffers import cutedsl_requirement_error
-import cudnn.gated_attention_block.api as _api
+from cudnn.gated_attention_block import api as _api
 from cudnn.gated_attention_block import (
     DENSE_SERVING_CCS,
     KV_SOURCE_PAGED,

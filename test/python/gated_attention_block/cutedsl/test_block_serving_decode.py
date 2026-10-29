@@ -71,7 +71,7 @@ from cudnn.gated_attention_block import (
     ServingEnvelope,
     decode_route,
 )
-import cudnn.gated_attention_block.api as _api  # noqa: E402  (the device read the cc 10.0 host rows patch)
+from cudnn.gated_attention_block import api as _api  # noqa: E402  (the device read the cc 10.0 host rows patch)
 from cudnn.gated_attention_block.api import DECODE_TILE, PREFILL_TILE, _CacheWrite, _cols, _Projection, _Sdpa, _SigmoidGate, _view, decode_split_choice
 
 requirement_error = cutedsl_requirement_error("the gated attention block's serving tests")

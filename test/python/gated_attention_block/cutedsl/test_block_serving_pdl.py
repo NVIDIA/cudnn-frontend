@@ -38,7 +38,7 @@ import sys
 import pytest
 import torch
 
-import cudnn.gated_attention_block.api as _api
+from cudnn.gated_attention_block import api as _api
 from cudnn.frost import buffers as _buffers
 from cudnn.frost.buffers import cutedsl_requirement_error
 from cudnn.gated_attention_block import GatedAttentionBlockFwd, GatedAttentionBlockGeometry, QsaSpec, QuantSpec, decode_route

@@ -3298,7 +3298,7 @@ def test_on_a_cc_10_0_reading_the_explicit_lean_tile_through_the_block_is_a_type
     sparse forms stay Rubin-only (2026-10-29) -- the declaration still resolves the lean body (the adapter would serve it standalone),
     ``check_support`` declines by name before any stage, the sparse stage itself declines before the adapter, and the envelope says not
     served there (the AUTO / tcgen05 readings decline the same way: the part statement names the form, not the body)."""
-    import cudnn.gated_attention_block.api as _api
+    from cudnn.gated_attention_block import api as _api
 
     monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 0))
     with _no_host_sync():

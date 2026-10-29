@@ -92,7 +92,7 @@ def _quant_part_row_first():
     (2026-10-29) ``check_support`` on a served part other than Rubin declines ``quant`` by name ahead of every stage (the lift named),
     so the stage-level texts these rows pin are read from the stage itself there.  Read the way the block reads its device (the
     module's own device read), not torch's capability, so a simulated reading agrees with the block."""
-    import cudnn.gated_attention_block.api as _api
+    from cudnn.gated_attention_block import api as _api
 
     cc = _api._device_cc_of(torch.device("cuda")) if torch.cuda.is_available() else None
     return cc is not None and cc != _SM107 and _api._dense_part_decline(cc) is None

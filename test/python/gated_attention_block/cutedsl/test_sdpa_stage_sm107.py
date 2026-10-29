@@ -32,7 +32,7 @@ _SM107 = (10, 7)
 def _part():
     """The part the STAGE reads its device for (``api._device_cc_of``: the one function its gates read -- torch's capability on a real host,
     the simulated one under a host plugin that patches it)."""
-    import cudnn.gated_attention_block.api as _api
+    from cudnn.gated_attention_block import api as _api
 
     return _api._device_cc_of(torch.device("cuda")) if torch.cuda.is_available() else None
 
@@ -79,7 +79,7 @@ def test_the_quantized_stage_and_the_gate_are_declined_on_a_cc_10_0_reading(monk
     """A cc 10.0 reading of the stage's device (the ONE function the stage reads, patched -- a host row on any CUDA device): the bf16
     stage passes the part gate (the next check is the adapter's, on the real device), the FP8 stage is pinned to the Rubin FP8 row, and
     ``fuse_gate=True`` at d256 is the DEVICE row's decline -- the sm100 f16 row claims no gate epilogue -- after the Rubin-row pins."""
-    import cudnn.gated_attention_block.api as _api
+    from cudnn.gated_attention_block import api as _api
 
     monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 0))
     geom, _ = _geoms()
