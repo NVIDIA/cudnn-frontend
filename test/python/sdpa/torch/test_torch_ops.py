@@ -583,8 +583,9 @@ class TestSdpaVarlen:
         assert (o.float() - ref).abs().max().item() < TOL
 
     @pytest.mark.L0
-    def test_thd_grad_out_keeps_its_layout(self):
-        """A THD dO with its own token stride (a view of a wider buffer) gets its own ragged offset instead of a copy."""
+    def test_thd_grad_out_with_its_own_token_stride(self):
+        """A THD dO with its own token stride (a view of a wider buffer) is materialized in O's layout: SM80 backend eng7
+        returns wrong gradients when dO's token stride / ragged offset differ from O's (#2051)."""
         torch.manual_seed(0)
         lens, H, D = [200, 312, 96], 8, 128
         q, k, v, cu, T, mx = self._make(lens, H, H, D)
@@ -602,8 +603,6 @@ class TestSdpaVarlen:
         _, _, rdq, rdk, rdv = self._ref(q, k, v, cu, is_causal=True, grad=grad)
         for got, ref in ((dq, rdq), (dk, rdk), (dv, rdv)):
             assert (got.float() - ref).abs().max().item() < TOL
-        keys = [key for key in torch_op._graph_cache if key[0] == "sdpa_bwd"]
-        assert any(tuple(grad.stride()) in key for key in keys), "dO must be declared with its own strides"
 
     @pytest.mark.L0
     def test_thd_grad_out_with_an_undeclarable_pitch_is_materialized(self):

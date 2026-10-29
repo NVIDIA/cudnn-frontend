@@ -91,7 +91,7 @@ def test_torch_ops_do_not_rebuild_prefix_casts(backward, monkeypatch):
     uids = [uid.Q, uid.K, uid.V, uid.O]
     uids += [uid.DO, uid.STATS, uid.DQ, uid.DK, uid.DV] if backward else [uid.STATS]
     uids += [uid.SEQ_LEN_Q, uid.SEQ_LEN_KV, uid.RAGGED_Q, uid.RAGGED_O]
-    uids += [uid.RAGGED_DO, uid.RAGGED_DQ] if backward else [uid.RAGGED_STATS]
+    uids += [uid.RAGGED_DQ] if backward else [uid.RAGGED_STATS]
     uids += [uid.RAGGED_KV, uid.RAGGED_V]
     if backward:
         uids += [uid.RAGGED_DK, uid.RAGGED_DV]
@@ -114,14 +114,7 @@ def test_torch_ops_do_not_rebuild_prefix_casts(backward, monkeypatch):
         uid.RAGGED_V: [0, 5 * 64, 9 * 64],
     }
     if backward:
-        expected.update(
-            {
-                uid.RAGGED_DO: expected[uid.RAGGED_O],
-                uid.RAGGED_DQ: expected[uid.RAGGED_Q],
-                uid.RAGGED_DK: expected[uid.RAGGED_KV],
-                uid.RAGGED_DV: expected[uid.RAGGED_V],
-            }
-        )
+        expected.update({uid.RAGGED_DQ: expected[uid.RAGGED_Q], uid.RAGGED_DK: expected[uid.RAGGED_KV], uid.RAGGED_DV: expected[uid.RAGGED_V]})
     else:
         expected[uid.RAGGED_STATS] = [0, 3 * 4, 7 * 4]
     for role, values in expected.items():

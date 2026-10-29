@@ -83,7 +83,6 @@ class _UIDs(IntEnum):
     RAGGED_DQ = 12
     RAGGED_DK = 13
     RAGGED_DV = 14
-    RAGGED_DO = 15
     O = 100  # noqa: E741 — matches the SDPA output tensor name
     STATS = 101
     DO = 200
@@ -659,7 +658,6 @@ def _build_bwd_graph(
         rk = g.tensor(name="ragged_k", dim=[B + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64, uid=_UIDs.RAGGED_KV)
         rv = g.tensor(name="ragged_v", dim=[B + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64, uid=_UIDs.RAGGED_V)
         ro = g.tensor(name="ragged_o", dim=[B + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64, uid=_UIDs.RAGGED_O)
-        rdo = g.tensor(name="ragged_do", dim=[B + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64, uid=_UIDs.RAGGED_DO)
         rdq = g.tensor(name="ragged_dq", dim=[B + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64, uid=_UIDs.RAGGED_DQ)
         rdk = g.tensor(name="ragged_dk", dim=[B + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64, uid=_UIDs.RAGGED_DK)
         rdv = g.tensor(name="ragged_dv", dim=[B + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64, uid=_UIDs.RAGGED_DV)
@@ -667,7 +665,7 @@ def _build_bwd_graph(
         k_t.set_ragged_offset(rk)
         v_t.set_ragged_offset(rv)
         o_t.set_ragged_offset(ro)
-        do_t.set_ragged_offset(rdo)
+        do_t.set_ragged_offset(ro)
 
     rb = window_right if window_right >= 0 else (0 if is_causal else None)
     lb = window_left if window_left >= 0 else None
@@ -725,7 +723,6 @@ def _build_bwd_graph(
                 _UIDs.SEQ_LEN_KV,
                 _UIDs.RAGGED_Q,
                 _UIDs.RAGGED_O,
-                _UIDs.RAGGED_DO,
                 _UIDs.RAGGED_DQ,
                 _UIDs.RAGGED_KV,
                 _UIDs.RAGGED_V,
@@ -960,6 +957,10 @@ def _sdpa_bwd_impl(
         lse = lse.clone(memory_format=torch.contiguous_format)
     lse = lse.reshape(B, H_q, S_q, 1)
     grad_out = _grad_out_operand(grad_out, o)
+    if grad_out.stride() != o.stride():
+        # THD dO shares O's layout and ragged offset: SM80 backend eng7 returns wrong gradients for a THD dO with its
+        # own token stride (#2051).
+        grad_out = torch.empty_strided(o.shape, o.stride(), dtype=grad_out.dtype, device=grad_out.device).copy_(grad_out)
 
     q_stride = _thd_desc_stride(q, S_q)
     k_stride = _thd_desc_stride(k, S_kv)
@@ -989,7 +990,6 @@ def _sdpa_bwd_impl(
         tuple(k.stride()),
         tuple(v.stride()),
         tuple(o.stride()),
-        tuple(grad_out.stride()),
         attn_scale,
         is_causal,
         causal_bottom_right,
@@ -1024,7 +1024,6 @@ def _sdpa_bwd_impl(
             k_stride=k_stride,
             v_stride=v_stride,
             o_stride=o_stride,
-            do_stride=_thd_desc_stride(grad_out, S_q),
             stats_stride=stats_stride,
             is_deterministic=is_deterministic,
             is_thd=True,
@@ -1041,7 +1040,7 @@ def _sdpa_bwd_impl(
     metadata = prepare_varlen_metadata(
         cu_seqlens_q,
         cu_seqlens_kv,
-        (q.stride(0), o.stride(0), grad_out.stride(0), H_q * D_qk),
+        (q.stride(0), o.stride(0), H_q * D_qk),
         (k.stride(0), v.stride(0), H_k * D_qk, H_v * D_v),
     )
     buffers.extend(metadata)
