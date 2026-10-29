@@ -686,8 +686,9 @@ def _emit_block_quant_col(
         ]
     )
     # `_mcb` is Int64 on every path (the Int64 kernel `M`, or a widened group extent): `row`, `col_j` and the
-    # lane are Int32, so an Int32 `_mcb` keeps the F8_128x4 atom term in 32 bits, and once one batch's padded
-    # scale blob passes 2 GiB that term wraps and the scale byte is stored 2^32 bytes below its slot.
+    # lane are Int32, so an Int32 `_mcb` keeps the F8_128x4 atom term in 32 bits. That term wraps once one
+    # batch's padded scale table (one group's table on the grouped paths) passes 2 GiB, and the scale byte is
+    # then stored 2^32 bytes below its slot.
     if quant.grouped_by_moe and swapped:
         lines.extend(
             [

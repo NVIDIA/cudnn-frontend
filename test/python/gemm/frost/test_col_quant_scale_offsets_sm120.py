@@ -5,14 +5,18 @@
 
 The col-scale index is ``((n // 128) * mcb + mb // 4) * 512 + ...``. ``row``, ``col_j`` and the lane are
 Int32, so with an Int32 ``mcb`` (a build-time literal on the dense path, the group extent on the grouped
-MoE path) that atom term was evaluated in 32 bits: once one batch's padded scale blob passed 2 GiB it
-wrapped, and every scale byte past 2^31 was stored 2^32 bytes below its slot. The ``past2GiB`` cells take
-the smallest such shape: N = 16 (F8_128x4 pads N to one 128-column atom) and 2^28 + 64 rows at block 16,
-which puts the last four row blocks past 2^31. Their scale tensor starts 2 GiB into a sentinel-filled
-carrier, so a wrapped store lands on the carrier's head instead of on memory the test does not own.
+MoE path) that atom term was evaluated in 32 bits: once one batch's padded scale table (one group's table
+on the grouped path) passed 2 GiB it wrapped, and every scale byte past 2^31 was stored 2^32 bytes below
+its slot. The ``past2GiB`` cells take the smallest such shape: N = 16 (F8_128x4 pads N to one 128-column
+atom) and 2^28 + 64 rows at block 16, which puts the last four row blocks past 2^31. Their scale tensor
+starts 2 GiB into a sentinel-filled carrier, so a wrapped store lands on the carrier's head instead of on
+memory the test does not own. Those cells are L1 (about 12 GiB each); the host-only render check at the
+end is what the default L0 selection has against an Int32 ``mcb``.
 """
 
 from __future__ import annotations
+
+import re
 
 import pytest
 import torch
@@ -114,3 +118,37 @@ def test_col_quant_f8_128x4_scale_offsets_sm120(kind, bs, M, N, K):
     else:
         for group in range(len(offsets) - 1):
             check(group, offsets[group], offsets[group + 1])
+
+
+class _Rendered(Exception):
+    """Raised in place of the DSL compile, to carry the rendered kernel source out of jit_from_cudnn_graph."""
+
+
+def _scale_index_lines(monkeypatch, graph) -> list[str]:
+    """The ``_q0_mcb`` / ``_q0_sidx`` lines of the kernel the SM120 compiler renders for ``graph``, not compiled."""
+
+    def render_only(src):
+        raise _Rendered(src)
+
+    monkeypatch.setattr(C120, "_import_kernel", render_only)
+    with pytest.raises(_Rendered) as rendered:
+        C120.jit_from_cudnn_graph(graph, config=by_name(_CFG))
+    return sorted({ln.strip() for ln in rendered.value.args[0].splitlines() if ln.strip().startswith(("_q0_mcb =", "_q0_sidx"))})
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("kind,bs,M,N,K", [("dense", 32, 320, 256, 64), ("moe_grouped", 32, 384, 256, 64)], ids=["dense", "moe_grouped"])
+def test_col_quant_f8_128x4_scale_index_is_int64_sm120(monkeypatch, kind, bs, M, N, K):
+    """Host-only: the rendered scale index multiplies by an Int64 ``_q0_mcb`` taken from the runtime extents.
+
+    That is the Int64 kernel ``M`` or the group extent widened to Int64, so the index text is the same at any M.
+    A build-time literal or an Int32 group extent only goes wrong past 2 GiB, which the L0 GPU cells do not reach.
+    """
+    renders = []
+    for m in (M, M + 2**28):  # 2^23 more row blocks: a baked mcb literal would differ by 2^21
+        offsets = (0, m) if kind == "dense" else (0, 4 * bs, m)
+        renders.append(_scale_index_lines(monkeypatch, _graph(kind, offsets, m, N, K, bs)))
+    assert renders[0] == renders[1], f"the col-quant scale index depends on the plan's M: {renders}"
+    mcb = [ln for ln in renders[0] if ln.startswith("_q0_mcb =")]
+    assert len(mcb) == 1 and re.search(r"\bM\b|cutlass\.Int64\(", mcb[0]), f"`_q0_mcb` must be an Int64 runtime value: {renders[0]}"
+    assert all("* _q0_mcb +" in ln for ln in renders[0] if ln.startswith("_q0_sidx")), renders[0]
