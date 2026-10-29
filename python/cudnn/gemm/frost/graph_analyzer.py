@@ -165,6 +165,7 @@ class GemmBinding:
     top_k_scores: Any = None
 
     def bound_tensors(self) -> list[Any]:
+        """List tensors bound by this GEMM plan."""
         ts = [
             *self.a_operands,
             *self.b_operands,
@@ -242,6 +243,7 @@ def _make_multi_binding(
 
 
 def _safe_name(t: Any) -> str | None:
+    """Return a tensor name when available."""
     try:
         nm = t.get_name()
     except Exception:  # noqa: BLE001 — unbuilt tensors can throw
@@ -250,6 +252,7 @@ def _safe_name(t: Any) -> str | None:
 
 
 def _safe_uid(t: Any) -> int | None:
+    """Return a tensor UID when available."""
     try:
         uid = t.get_uid()
     except Exception:  # noqa: BLE001
@@ -590,6 +593,7 @@ def _infer_bcast_mode(matmul_out_dim: tuple[int, ...], aux_dim: tuple[int, ...])
 
 
 def _infer_a_major(dim: tuple[int, ...], stride: tuple[int, ...]) -> AMajor:
+    """Infer the A operand major axis from graph strides."""
     if stride[-1] == 1:
         return "k"
     if stride[-2] == 1:
@@ -598,6 +602,7 @@ def _infer_a_major(dim: tuple[int, ...], stride: tuple[int, ...]) -> AMajor:
 
 
 def _infer_b_major(dim: tuple[int, ...], stride: tuple[int, ...]) -> BMajor:
+    """Infer the B operand major axis from graph strides."""
     if stride[-2] == 1:
         return "k"
     if stride[-1] == 1:
@@ -611,6 +616,7 @@ def _is_output(meta: dict[int, _TensorMeta], tensor_id: int) -> bool:
 
 
 def _materialized_output_ids(meta: dict[int, _TensorMeta]) -> list[int]:
+    """Collect materialized tensor IDs in graph order."""
     return [tid for _, tid in sorted((item.output_index, tid) for tid, item in meta.items() if item.output_index is not None)]
 
 
@@ -1056,6 +1062,7 @@ def _block_scale_combo(cap):
 
 
 def _block_scale_spec(a0, b0, meta):
+    """Construct the shared block-scale operand specification."""
     from .fusion_ir import BlockScaleSpec
 
     return BlockScaleSpec(
@@ -1134,6 +1141,7 @@ def _collect_reductions(ops, meta, dag, io_dtype, intermediate_dtype, compute_dt
 
 
 def _output_layouts(dense_entries, quant_recs, meta):
+    """Attach each materialized output's declared dimensions and strides."""
     from dataclasses import replace as _spec_replace
 
     for _di in range(len(dense_entries)):
@@ -1364,7 +1372,6 @@ def _build_multi_moe_chain(
     )
     gemm_idx_by_output, op_position_by_id = dag.gemm_indices, dag.positions
     fusion_ops, reachable_quant_ops, recorded_by_out = dag.ops, dag.quant_ops, dag.recorded
-    _operand_ref = dag.source_ref
 
     if not fusion_ops and len(moe_ops) > 1:
         raise ValueError("multi-MoE graph has no fusion op; parallel grouped matmuls must " "share a pointwise epilogue (the no-epilogue case is out of scope)")
@@ -1707,7 +1714,6 @@ def _build_multi_gemm_chain(
     )
     gemm_idx_by_output, op_position_by_id = dag.gemm_indices, dag.positions
     fusion_ops, reachable_quant_ops, recorded_by_out = dag.ops, dag.quant_ops, dag.recorded
-    _operand_ref = dag.source_ref
 
     if not fusion_ops and len(matmuls) > 1:
         per_gemm_dtypes: list[Dtype] = []
@@ -1876,6 +1882,7 @@ def _build_chain(
     intermediate_dtype: Dtype = "fp32",
     compute_dtype: Dtype = "fp32",
 ) -> FusionChain:
+    """Dispatch a graph snapshot to the dense or grouped builder."""
     moe_ops = [op for op in ops if op.cudnn_name == "moe_grouped_matmul"]
     if moe_ops:
         return _build_multi_moe_chain(moe_ops, ops, meta, io_dtype, intermediate_dtype, compute_dtype)

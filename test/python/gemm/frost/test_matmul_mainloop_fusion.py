@@ -340,6 +340,34 @@ def test_e2e_mainloop_int8(op, cfg) -> None:
     assert diff == 0.0, f"{cfg} {op}: max|diff|={diff} (expected bit-exact)"
 
 
+@pytest.mark.parametrize("operand", ["a", "b"])
+@pytest.mark.parametrize("op", ["abs", "relu", "neg"])
+@pytest.mark.parametrize("compute", [cudnn.data_type.INT32, cudnn.data_type.FLOAT], ids=["int32", "fp32"])
+@pytest.mark.parametrize("b_order", ["graph", "kernel"])
+@requires_sm100
+@requires_int8_mma
+def test_mainloop_int8_identity_preserves_signed_arithmetic(operand, op, compute, b_order):
+    """Preserve signed INT8 values through each declared compute dtype."""
+    m = n = k = 128
+    graph = cudnn.pygraph(io_data_type=cudnn.data_type.INT8, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.INT32)
+    a = graph.tensor(name="a", dim=[1, m, k], stride=[m * k, k, 1])
+    b = graph.tensor(name="b", dim=[1, k, n], stride=[k * n, 1, k])
+    transformed = getattr(graph, op)(input=a if operand == "a" else b, compute_data_type=compute).set_data_type(cudnn.data_type.INT8)
+    out = graph.matmul(A=transformed if operand == "a" else a, B=transformed if operand == "b" else b).set_data_type(cudnn.data_type.FLOAT).set_output(True)
+    plan = _plan(graph, config=by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"))
+    values = (torch.arange(m * k, device="cuda", dtype=torch.int32) % 16 - 8).to(torch.int8).reshape(1, m, k)
+    identity = torch.eye(k, device="cuda", dtype=torch.int8)[None]
+    av, bv = (values, identity) if operand == "a" else (identity, values)
+    if b_order == "graph":
+        bv = bv.transpose(1, 2)
+    output = torch.empty((1, m, n), device="cuda")
+    plan({a: av, b: bv, out: output})
+    expected = _TORCH_OP[op](values).float()
+    if operand == "b":
+        expected = expected.transpose(1, 2)
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+
+
 @requires_sm100
 def test_e2e_mainloop_multicast_and_oob() -> None:
     # multicast_a + multicast_b cluster, plus M-OOB / K-OOB shape.

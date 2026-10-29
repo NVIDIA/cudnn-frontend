@@ -15,9 +15,9 @@ import re
 import sys
 import tempfile
 from collections import Counter
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, ClassVar
+from typing import Any, Callable, ClassVar, Generic, Protocol, TypeVar
 
 from cudnn.frost import buffers
 from cudnn.frost.workspace import Workspace
@@ -25,9 +25,37 @@ from cudnn.frost.workspace import Workspace
 from .arch_family import active_family
 from .dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS, _pow2_floor, tensor_alignment
 from .fusion_ir import FusionChain, MoeSwapAbSpec, TensorRef, segmented_row_scale_capacity_rows
-from .graph_analyzer import GemmBinding, resolve_variant_pack
-from .tile_config import TileConfig
 from .recipe import REDUCTION_INIT_VALUE, _output_rule, contiguous_modulus, expected_shape
+
+
+class _RuntimeConfig(Protocol):
+    @property
+    def swap_ab(self) -> bool: ...
+
+    @property
+    def split_k_slices(self) -> int: ...
+
+    @property
+    def workspace_split_k(self) -> bool: ...
+
+
+class _RuntimeBinding(Protocol):
+    a_operands: list[Any]
+    b_operands: list[Any]
+    outputs: list[Any]
+    aux: list[Any]
+    sfa_operands: list[Any]
+    sfb_operands: list[Any]
+    first_token_offset: Any
+    token_index: Any
+    token_ks: Any
+    top_k_scores: Any
+
+    def bound_tensors(self) -> list[Any]: ...
+
+
+_ConfigT = TypeVar("_ConfigT", bound=_RuntimeConfig)
+_BindingT = TypeVar("_BindingT", bound=_RuntimeBinding)
 
 _CTAMMA_SUFFIX = re.compile(r"_[12]ctamma$")
 
@@ -62,6 +90,7 @@ def _aux_fake_shape_code(aux: TensorRef) -> str:
 
 
 def _aux_can_use_explicit_fake_stride(aux: TensorRef) -> bool:
+    """Check whether auxiliary strides can be encoded directly."""
     if len(aux.dim) not in (2, 3):
         return False
     stride1_dims = [i for i, stride in enumerate(aux.stride) if stride == 1]
@@ -103,6 +132,7 @@ def _aux_call_block(aux_tensors: list[TensorRef], prefix: str = "") -> str:
 
 
 def _reduction_stride_kernel_params(chain: FusionChain) -> str:
+    """Declare reduction output stride parameters."""
     params: list[str] = []
     for i in range(len(chain.output_specs)):
         params.extend(
@@ -132,6 +162,7 @@ def _reduction_stride_kernel_params(chain: FusionChain) -> str:
 
 
 def _reduction_stride_host_unpack(chain: FusionChain) -> str:
+    """Unpack reduction output strides from the launch recipe."""
     if not chain.output_specs and not chain.reductions and not chain.quants:
         return ""
     lines = []
@@ -166,6 +197,7 @@ def _reduction_stride_host_unpack(chain: FusionChain) -> str:
 
 
 def _reduction_stride_host_unpack_from(chain: FusionChain, start_index: int) -> str:
+    """Unpack reduction strides from a selected argument offset."""
     if not chain.output_specs and not chain.reductions and not chain.quants:
         return ""
     lines: list[str] = []
@@ -213,6 +245,7 @@ def _reduction_stride_names(chain: FusionChain) -> list[str]:
 
 
 def _reduction_stride_host_pass(chain: FusionChain) -> str:
+    """Pass reduction output strides to the kernel."""
     args = _reduction_stride_names(chain)
     return ",\n".join(args) + "," if args else ""
 
@@ -231,6 +264,7 @@ def _splitk_epilogue_bindings(chain: FusionChain, n_taps: int) -> str:
 
 
 def _reduction_stride_compile_decls(chain: FusionChain) -> str:
+    """Declare symbolic reduction strides for compilation."""
     lines: list[str] = []
     for i in range(len(chain.output_specs)):
         lines.extend(
@@ -260,6 +294,7 @@ def _reduction_stride_compile_decls(chain: FusionChain) -> str:
 
 
 def _reduction_stride_compile_symbols(chain: FusionChain) -> str:
+    """Collect symbolic reduction stride arguments."""
     args: list[str] = []
     for i in range(len(chain.output_specs)):
         args.extend(
@@ -450,6 +485,7 @@ def _offset_vector(t):
 
 
 def _moe_num_groups(offsets, num_experts: int) -> int:
+    """Resolve the number of grouped GEMM intervals."""
     count = int(offsets.shape[0]) - 1
     if num_experts < 1 or count < 1 or count % num_experts:
         raise ValueError("FROST MoE requires G+1 explicit first_token_offset boundaries, where G is a positive multiple of num_experts")
@@ -457,6 +493,7 @@ def _moe_num_groups(offsets, num_experts: int) -> int:
 
 
 def _expected_output_shape(spec, chain: FusionChain, mnk, top_k_scores=None) -> tuple[int, int, int]:
+    """Resolve an output shape from runtime GEMM dimensions."""
     if chain.has_moe and chain.moe.mode == "combine":
         tokens = int(top_k_scores.shape[0])
         return (1, int(mnk[0]), tokens) if isinstance(chain.moe, MoeSwapAbSpec) else (1, tokens, int(mnk[1]))
@@ -647,7 +684,7 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
     b = compiled.binding
     if b is None:
         raise NotImplementedError("variant-pack call is not yet wired up for this graph type")
-    resolved = resolve_variant_pack(variant_pack, b)
+    resolved = compiled._compiler.resolve_variant_pack(variant_pack, b)
 
     memo = getattr(compiled, "_declared_storage_memo", None)
     if memo is None:
@@ -655,6 +692,7 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
         try:
             compiled._declared_storage_memo = memo
         except AttributeError:
+            # Keep the memo local for slot-only launchers.
             pass
 
     def pull(t, role):
@@ -810,6 +848,7 @@ def _usable_cache_dir(base: str) -> Path:
 
 
 def _cache_dir() -> Path:
+    """Select the generated-kernel source cache directory."""
     base = os.environ.get("CUDNN_FRONTEND_GEMM_KERNEL_CACHE")
     if not base:
         xdg = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
@@ -828,6 +867,7 @@ def _write_atomic(path: Path, src: str) -> None:
         try:
             os.unlink(tmp)
         except OSError:
+            # Preserve the original write failure.
             pass
         raise
 
@@ -863,15 +903,15 @@ class _CompiledRuntime:
 
 
 @dataclass
-class _CompiledMoeBase(_CompiledRuntime):
+class _CompiledMoeBase(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
     chain: FusionChain
-    config: TileConfig
+    config: _ConfigT
     generated_path: Path
     _launchable: Callable
     _grid_ctas: int = 0
     device: int = 0
     aux_names: list = field(default_factory=list)
-    binding: "GemmBinding | None" = None
+    binding: _BindingT | None = None
     vec_bytes_epi: "int | None" = None
     _desc_slots_per_cta: int = 0
     store_modes: tuple = ()
@@ -893,6 +933,7 @@ class _CompiledMoeBase(_CompiledRuntime):
         return backend._moe_carve_workspace(caller, n_slots, type(self).__name__)
 
     def __call__(self, variant_pack, workspace=None, stream=None):
+        """Validate the target device and dispatch a grouped GEMM call."""
         backend = self._compiler
         if not isinstance(variant_pack, dict):
             raise TypeError(f"compiled kernels are called with a variant-pack dict {{cuDNN tensor | uid | name: buffer}}; got {type(variant_pack).__name__}")
@@ -900,6 +941,7 @@ class _CompiledMoeBase(_CompiledRuntime):
         return self._call_variant_pack(variant_pack, workspace, stream)
 
     def _launch_moe(self, problem, offsets, workspace, operands, outputs, aux, stream, token_index, token_ks, top_k_scores):
+        """Assemble and launch the grouped GEMM arguments."""
         return self._launchable(
             problem,
             offsets,
@@ -914,17 +956,17 @@ class _CompiledMoeBase(_CompiledRuntime):
 
 
 @dataclass
-class _CompiledFusedGemm(_CompiledRuntime):
+class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
     """Execute a compiled fused GEMM."""
 
     chain: FusionChain
-    config: TileConfig
+    config: _ConfigT
     aux_names: list[str]
     generated_path: Path
     _launchable: Callable
     block_scale: bool = False
     device: int = 0
-    binding: "GemmBinding | None" = None
+    binding: _BindingT | None = None
     store_modes: tuple = ()
     use_tma_store: bool = False
     vec_bytes_epi: "int | None" = None
@@ -944,6 +986,7 @@ class _CompiledFusedGemm(_CompiledRuntime):
     deferrals: Any = field(default_factory=Counter, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        """Build the immutable launch recipe and lowering closure."""
         backend = self._compiler
         if self.binding is not None:
             self.bound = tuple(self.binding.bound_tensors())
@@ -951,6 +994,7 @@ class _CompiledFusedGemm(_CompiledRuntime):
             self.lowered = self._lower()
 
     def __call__(self, variant_pack, stream=None, workspace=None):
+        """Resolve the variant pack and execute the compiled GEMM."""
         backend = self._compiler
         if not isinstance(variant_pack, dict):
             raise TypeError(f"compiled kernels are called with a variant-pack dict {{cuDNN tensor | uid | name: buffer}}; got {type(variant_pack).__name__}")
@@ -1193,10 +1237,11 @@ class _CompiledFusedGemm(_CompiledRuntime):
 
 
 @dataclass
-class _CompiledMoeGemm(_CompiledMoeBase):
+class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
     """Execute a compiled grouped GEMM."""
 
     def _launch_single(self, token, weight, first_token_offset, output, snke, workspace=None, stream=None, token_index=None, token_ks=None, top_k_scores=None):
+        """Validate and launch one grouped GEMM."""
         backend = self._compiler
         first_token_offset = backend._offset_vector(first_token_offset)
         if len(snke) < 3:
@@ -1246,6 +1291,7 @@ class _CompiledMoeGemm(_CompiledMoeBase):
         return self._launch_moe(problem_size, first_token_offset, workspace, (a, b), cs, (), stream, token_index, token_ks, top_k_scores)
 
     def _call_variant_pack(self, variant_pack: dict, workspace=None, stream=None):
+        """Bind grouped GEMM inputs and select the launch path."""
         backend = self._compiler
         a_bufs, b_bufs, out_bufs, aux_bufs, fto, _sfa, _sfb, token_index, token_ks, top_k_scores, snk = backend._resolve_moe_variant_pack(self, variant_pack)
         _out_reqs = backend._output_align_reqs(self.chain, self.tma_slots, vec_bytes=self.vec_bytes_epi)
@@ -1372,7 +1418,7 @@ class _CompiledMoeGemm(_CompiledMoeBase):
 
 
 @dataclass
-class _CompiledMoeBlockScaleGemm(_CompiledMoeBase):
+class _CompiledMoeBlockScaleGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
     """Execute a compiled grouped block-scale GEMM."""
 
     _check_padded_operands: ClassVar[bool] = False
@@ -1381,6 +1427,7 @@ class _CompiledMoeBlockScaleGemm(_CompiledMoeBase):
     def _launch_single(
         self, token, weight, sfa, sfb, first_token_offset, output, snke, workspace=None, stream=None, token_index=None, token_ks=None, top_k_scores=None
     ):
+        """Validate and launch one block-scaled grouped GEMM."""
         backend = self._compiler
         first_token_offset = backend._offset_vector(first_token_offset)
         if len(snke) < 3:
@@ -1444,6 +1491,7 @@ class _CompiledMoeBlockScaleGemm(_CompiledMoeBase):
         return self._launch_moe(problem_size, first_token_offset, workspace, (a, b, *sf_args), cs, (), stream, token_index, token_ks, top_k_scores)
 
     def _call_variant_pack(self, variant_pack: dict, workspace=None, stream=None):
+        """Bind block-scaled grouped GEMM inputs and select the launch path."""
         backend = self._compiler
         a_bufs, b_bufs, out_bufs, aux_bufs, fto, sfa, sfb, token_index, token_ks, top_k_scores, snk = backend._resolve_moe_variant_pack(self, variant_pack)
         _out_reqs = backend._output_align_reqs(self.chain, self.tma_slots, vec_bytes=self.vec_bytes_epi)
@@ -1643,67 +1691,65 @@ class _CompiledMoeBlockScaleGemm(_CompiledMoeBase):
         )
 
 
-_SHARED_EXPORTS = (
-    "_CompiledRuntime",
-    "_CompiledMoeBase",
-    "_fallback_cache_dir",
-    "_usable_cache_dir",
-    "_cache_dir",
-    "_write_atomic",
-    "_import_kernel",
-    "_CompiledFusedGemm",
-    "_CompiledMoeGemm",
-    "_CompiledMoeBlockScaleGemm",
-    "_CTAMMA_SUFFIX",
-    "_INJECT_MARKER_LINE",
-    "_aux_fake_shape_code",
-    "_aux_can_use_explicit_fake_stride",
-    "_aux_fake_block",
-    "_aux_signature_block",
-    "_aux_call_block",
-    "_reduction_stride_kernel_params",
-    "_reduction_stride_host_unpack",
-    "_reduction_stride_host_unpack_from",
-    "_reduction_stride_names",
-    "_reduction_stride_host_pass",
-    "_splitk_epilogue_bindings",
-    "_reduction_stride_compile_decls",
-    "_reduction_stride_compile_symbols",
-    "_cvt_f32_to_fp8_scale_bits",
-    "_cvt_e5m3_bits_to_f32",
-    "_quant_device_imports",
-    "_template_stem",
-    "_resolve_path_blocks",
-    "_resolve_blocks",
-    "_replace_marker_lines",
-    "_MOE_SCHED_COUNTER_SLOTS",
-    "_MOE_DESC_SLOT_BYTES",
-    "_is_layout_ambiguous",
-    "_aux_fake_real_axes",
-    "_swap_mn_view",
-    "_offset_vector",
-    "_moe_num_groups",
-    "_expected_output_shape",
-    "_initialize_reduction_outputs",
-    "_tma_alignment_reject",
-    "_alignment_reject",
-    "_sf_blob_reject",
-    "_grouped_row_quant_scale_blob_reject",
-    "_moe_dense_layout_bad",
-    "_moe_operand_layout_bad",
-    "_declared_storage",
-    "_kernel_order",
-    "_check_moe_combine_n",
-    "_resolve_moe_variant_pack",
-    "_register_legacy_device_view_adapter",
-    "_moe_carve_workspace",
-    "_moe_launch_tail",
-)
-
-if TYPE_CHECKING:
-    from .sm100.compiler import *  # noqa: F401,F403
+_SHARED_EXPORTS = {
+    "_ConfigT": _ConfigT,
+    "_BindingT": _BindingT,
+    "_CompiledRuntime": _CompiledRuntime,
+    "_CompiledMoeBase": _CompiledMoeBase,
+    "_fallback_cache_dir": _fallback_cache_dir,
+    "_usable_cache_dir": _usable_cache_dir,
+    "_cache_dir": _cache_dir,
+    "_write_atomic": _write_atomic,
+    "_import_kernel": _import_kernel,
+    "_CompiledFusedGemm": _CompiledFusedGemm,
+    "_CompiledMoeGemm": _CompiledMoeGemm,
+    "_CompiledMoeBlockScaleGemm": _CompiledMoeBlockScaleGemm,
+    "_CTAMMA_SUFFIX": _CTAMMA_SUFFIX,
+    "_INJECT_MARKER_LINE": _INJECT_MARKER_LINE,
+    "_aux_fake_shape_code": _aux_fake_shape_code,
+    "_aux_can_use_explicit_fake_stride": _aux_can_use_explicit_fake_stride,
+    "_aux_fake_block": _aux_fake_block,
+    "_aux_signature_block": _aux_signature_block,
+    "_aux_call_block": _aux_call_block,
+    "_reduction_stride_kernel_params": _reduction_stride_kernel_params,
+    "_reduction_stride_host_unpack": _reduction_stride_host_unpack,
+    "_reduction_stride_host_unpack_from": _reduction_stride_host_unpack_from,
+    "_reduction_stride_names": _reduction_stride_names,
+    "_reduction_stride_host_pass": _reduction_stride_host_pass,
+    "_splitk_epilogue_bindings": _splitk_epilogue_bindings,
+    "_reduction_stride_compile_decls": _reduction_stride_compile_decls,
+    "_reduction_stride_compile_symbols": _reduction_stride_compile_symbols,
+    "_cvt_f32_to_fp8_scale_bits": _cvt_f32_to_fp8_scale_bits,
+    "_cvt_e5m3_bits_to_f32": _cvt_e5m3_bits_to_f32,
+    "_quant_device_imports": _quant_device_imports,
+    "_template_stem": _template_stem,
+    "_resolve_path_blocks": _resolve_path_blocks,
+    "_resolve_blocks": _resolve_blocks,
+    "_replace_marker_lines": _replace_marker_lines,
+    "_MOE_SCHED_COUNTER_SLOTS": _MOE_SCHED_COUNTER_SLOTS,
+    "_MOE_DESC_SLOT_BYTES": _MOE_DESC_SLOT_BYTES,
+    "_is_layout_ambiguous": _is_layout_ambiguous,
+    "_aux_fake_real_axes": _aux_fake_real_axes,
+    "_swap_mn_view": _swap_mn_view,
+    "_offset_vector": _offset_vector,
+    "_moe_num_groups": _moe_num_groups,
+    "_expected_output_shape": _expected_output_shape,
+    "_initialize_reduction_outputs": _initialize_reduction_outputs,
+    "_tma_alignment_reject": _tma_alignment_reject,
+    "_alignment_reject": _alignment_reject,
+    "_sf_blob_reject": _sf_blob_reject,
+    "_grouped_row_quant_scale_blob_reject": _grouped_row_quant_scale_blob_reject,
+    "_moe_dense_layout_bad": _moe_dense_layout_bad,
+    "_moe_operand_layout_bad": _moe_operand_layout_bad,
+    "_declared_storage": _declared_storage,
+    "_kernel_order": _kernel_order,
+    "_check_moe_combine_n": _check_moe_combine_n,
+    "_resolve_moe_variant_pack": _resolve_moe_variant_pack,
+    "_register_legacy_device_view_adapter": _register_legacy_device_view_adapter,
+    "_moe_carve_workspace": _moe_carve_workspace,
+    "_moe_launch_tail": _moe_launch_tail,
+}
 
 _impl = importlib.import_module(f"{__package__}.{active_family()}.compiler")
-for _name in _SHARED_EXPORTS:
-    setattr(_impl, _name, globals()[_name])
+_impl.__dict__.update(_SHARED_EXPORTS)
 sys.modules[__name__] = _impl

@@ -8,7 +8,6 @@ from __future__ import annotations
 import importlib
 import sys
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
 from .arch_family import active_family
 from .dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS, _allowed_vsize, dense_output_layout
@@ -41,15 +40,19 @@ def _aux_prefetch_var(name: str) -> str:
 
 
 def _compute_cast(var: str, dtype: Dtype, tag: str, *, source_dtype: Dtype | None = None) -> tuple[list[str], str]:
-    """Cast a running vector/scalar to the op's compute dtype."""
+    """Cast a running vector to the op's compute dtype."""
     new = f"_c_{tag}"
-    lines = [f"{new} = ({var}).to({DTYPE_TO_CUTLASS[dtype]})"]
+    value = f"({var})"
+    if dtype == "int32" and source_dtype in ("int8", "uint8", "int32"):
+        value = f"cutlass.Vector({value}.ir_value(), dtype={DTYPE_TO_CUTLASS[source_dtype]})"
+    lines = [f"{new} = {value}.to({DTYPE_TO_CUTLASS[dtype]})"]
     if dtype == "fp32" and source_dtype in ("int8", "uint8", "int32"):
         lines.append(f"{new} = {new} + cutlass.full_like({new}, 0.0)")
     return lines, new
 
 
 def _compute_literal(dtype: Dtype, value: float | int) -> str:
+    """Format a literal in the requested compute dtype."""
     if dtype == "int32":
         return f"cutlass.Int32({int(value)})"
     return f"cutlass.Float32({float(value)})"
@@ -322,8 +325,8 @@ def _emit_op(
             return [f"{new} = cutlass.full_like({prev}, cutlass.Float32(row))"], new
         gl = [f"_gi{idx} = cute.make_rmem_tensor({vsize}, cutlass.Float32)"]
         for k in range(vsize):
-            _row, _col = _elem_coord(k)
-            gl.append(f"_gi{idx}[{k}] = cutlass.Float32({_row if axis == 1 else _col})")
+            _, col = _elem_coord(k)
+            gl.append(f"_gi{idx}[{k}] = cutlass.Float32({col})")
         gl.append(f"{new} = _gi{idx}.load().to_vector()")
         return gl, new
 
@@ -353,6 +356,8 @@ def _emit_op(
         return [f"{new} = cute.math.abs({prev})"], new
 
     if op.op == "neg":
+        if op.compute_dtype == "int32":
+            return [f"{new} = cutlass.full_like({prev}, cutlass.Int32(0)) - {prev}"], new
         return [f"{new} = -{prev}"], new
 
     if op.op == "cos":
@@ -483,6 +488,7 @@ def _emit_round(var: str, out_dtype: Dtype, tag: str, *, source_dtype: Dtype = "
 
 
 def _store_cast_expr(var: str, dtype: Dtype) -> str:
+    """Format an output conversion expression."""
     if dtype == "uint8":
 
         return f"({var}).to(cutlass.Uint8).bitcast(cutlass.Int8)"
@@ -672,6 +678,7 @@ def _emit_reduction_local_combine(
 
 
 def _quant_output_max(dtype: Dtype) -> str:
+    """Return the maximum quantized output magnitude."""
     if dtype == "fp8_e4m3":
         return "cutlass.Float32(448.0)"
     if dtype == "fp8_e5m2":
@@ -777,7 +784,8 @@ def generate_mainloop(chain: FusionChain, operand: str = "a") -> str:
     for i, op in enumerate(ops):
         parent = op.resolved_parent_idx(i)
         tag = f"ml_{operand}_{i}"
-        cast_lines, parent_var = _compute_cast(result_var[parent], op.compute_dtype, tag)
+        parent_dtype = (load_dtype or src_dtype) if parent < 0 else ops[parent].out_dtype
+        cast_lines, parent_var = _compute_cast(result_var[parent], op.compute_dtype, tag, source_dtype=parent_dtype)
         lines.extend(cast_lines)
         aux_loads = {}
         if op.aux is not None:
@@ -785,7 +793,6 @@ def generate_mainloop(chain: FusionChain, operand: str = "a") -> str:
             aux_loads[op.aux] = f"cutlass.full_like({parent_var}, ({ptr} + 0).load().to({DTYPE_TO_CUTLASS[op.compute_dtype]}))"
         emit_lines, cur = _emit_op(op, parent_var, base + i, aux_loads)
         lines.extend(emit_lines)
-        parent_dtype = (load_dtype or src_dtype) if parent < 0 else ops[parent].out_dtype
         if op.out_dtype in ("fp8_e4m3", "fp8_e5m2") and (op.compute_dtype == "int32" or (op.op == "identity" and parent_dtype in ("int8", "uint8", "int32"))):
             cur = f"(({cur}).to(cutlass.Float32) + cutlass.full_like(({cur}).to(cutlass.Float32), 0.0))"
         round_lines, cur = _emit_round(cur, op.out_dtype, tag, source_dtype=op.compute_dtype)
@@ -908,6 +915,7 @@ class _AuxCodegen:
 
 
 def _emit_pointwise_dag(chain, *, vsize, bounded, aux_load_expr, gemm_out_dtype=None):
+    """Generate per-GEMM rounding and the shared pointwise DAG."""
     scatter = chain.has_moe and chain.moe.mode == "scatter"
     body_lines = []
     result_var: dict[int, str] = {}
@@ -1075,58 +1083,54 @@ def _emit_reduction_avg_inverse(red_idx: int, red: ReductionSpec, chain: FusionC
     return [f"_red_{red_idx}_inv = cutlass.Float32(1.0) / ({count})"]
 
 
-_SHARED_EXPORTS = (
-    "_emit_reduction_avg_inverse",
-    "_emit_block_quant_row",
-    "_AuxCodegen",
-    "_emit_pointwise_dag",
-    "EpilogueSnippets",
-    "_aux_ptr_var",
-    "_aux_prefetch_var",
-    "_compute_cast",
-    "_compute_literal",
-    "_elem_coord",
-    "tma_out_value",
-    "tma_out_ready_marker",
-    "_aux_reads_row",
-    "_LOG2E",
-    "_TWO_LOG2E",
-    "_tanh_expr",
-    "_fl",
-    "_step01",
-    "_nonzero01",
-    "_sigmoid_lines",
-    "_CMP_OPS",
-    "_LOGIC_OPS",
-    "_BACKWARD_OPS",
-    "_emit_binary_ext",
-    "_emit_op",
-    "_emit_round",
-    "_store_cast_expr",
-    "_dense_store_offset",
-    "_emit_mmajor_scatter",
-    "_tap_store_elems",
-    "_tap_vec_bytes",
-    "_emit_moe_scatter_store",
-    "_emit_tap_store",
-    "_reduction_output_offset_expr",
-    "_emit_reduction_local_combine",
-    "_quant_output_max",
-    "_scale_store_dtype",
-    "_f8_128x4_row_scale_index_expr",
-    "_e8m0_f32",
-    "_emit_scale_quantize",
-    "_emit_scale_quantize_pair",
-    "_MAINLOOP_IDX_BASE",
-    "_MAINLOOP_IDENTITY_CAST_INTRINSICS",
-    "generate_mainloop",
-    "_emit_splitk_partial_store",
-)
-
-if TYPE_CHECKING:
-    from .sm100.epilogue_codegen import *  # noqa: F401,F403
+_SHARED_EXPORTS = {
+    "_emit_reduction_avg_inverse": _emit_reduction_avg_inverse,
+    "_emit_block_quant_row": _emit_block_quant_row,
+    "_AuxCodegen": _AuxCodegen,
+    "_emit_pointwise_dag": _emit_pointwise_dag,
+    "EpilogueSnippets": EpilogueSnippets,
+    "_aux_ptr_var": _aux_ptr_var,
+    "_aux_prefetch_var": _aux_prefetch_var,
+    "_compute_cast": _compute_cast,
+    "_compute_literal": _compute_literal,
+    "_elem_coord": _elem_coord,
+    "tma_out_value": tma_out_value,
+    "tma_out_ready_marker": tma_out_ready_marker,
+    "_aux_reads_row": _aux_reads_row,
+    "_LOG2E": _LOG2E,
+    "_TWO_LOG2E": _TWO_LOG2E,
+    "_tanh_expr": _tanh_expr,
+    "_fl": _fl,
+    "_step01": _step01,
+    "_nonzero01": _nonzero01,
+    "_sigmoid_lines": _sigmoid_lines,
+    "_CMP_OPS": _CMP_OPS,
+    "_LOGIC_OPS": _LOGIC_OPS,
+    "_BACKWARD_OPS": _BACKWARD_OPS,
+    "_emit_binary_ext": _emit_binary_ext,
+    "_emit_op": _emit_op,
+    "_emit_round": _emit_round,
+    "_store_cast_expr": _store_cast_expr,
+    "_dense_store_offset": _dense_store_offset,
+    "_emit_mmajor_scatter": _emit_mmajor_scatter,
+    "_tap_store_elems": _tap_store_elems,
+    "_tap_vec_bytes": _tap_vec_bytes,
+    "_emit_moe_scatter_store": _emit_moe_scatter_store,
+    "_emit_tap_store": _emit_tap_store,
+    "_reduction_output_offset_expr": _reduction_output_offset_expr,
+    "_emit_reduction_local_combine": _emit_reduction_local_combine,
+    "_quant_output_max": _quant_output_max,
+    "_scale_store_dtype": _scale_store_dtype,
+    "_f8_128x4_row_scale_index_expr": _f8_128x4_row_scale_index_expr,
+    "_e8m0_f32": _e8m0_f32,
+    "_emit_scale_quantize": _emit_scale_quantize,
+    "_emit_scale_quantize_pair": _emit_scale_quantize_pair,
+    "_MAINLOOP_IDX_BASE": _MAINLOOP_IDX_BASE,
+    "_MAINLOOP_IDENTITY_CAST_INTRINSICS": _MAINLOOP_IDENTITY_CAST_INTRINSICS,
+    "generate_mainloop": generate_mainloop,
+    "_emit_splitk_partial_store": _emit_splitk_partial_store,
+}
 
 _impl = importlib.import_module(f"{__package__}.{active_family()}.epilogue_codegen")
-for _name in _SHARED_EXPORTS:
-    setattr(_impl, _name, globals()[_name])
+_impl.__dict__.update(_SHARED_EXPORTS)
 sys.modules[__name__] = _impl

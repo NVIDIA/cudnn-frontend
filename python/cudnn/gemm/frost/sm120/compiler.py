@@ -57,7 +57,7 @@ from ..dtypes import (
     dense_output_layout,
     tensor_alignment,
 )
-from .epilogue_codegen import EpilogueSnippets, generate, tma_out_ready_marker, tma_out_value
+from .epilogue_codegen import EpilogueSnippets, generate
 from ..fusion_ir import (
     ZERO_PRESERVING_OPS,
     FusionChain,
@@ -1193,7 +1193,7 @@ def _initialize_combine_output(chain: FusionChain, outputs, stream=None) -> None
     buffers.apply_zero_fill_plan(output.data_ptr(), plan, DTYPE_BYTES[chain.outputs[0].dtype], stream)
 
 
-class CompiledFusedGemm(_CompiledFusedGemm):
+class CompiledFusedGemm(_CompiledFusedGemm[TileConfig, GemmBinding]):
     """Execute a compiled fused GEMM."""
 
     _compiler = sys.modules[__name__]
@@ -2528,7 +2528,7 @@ def _check_moe_combine_operands(chain: FusionChain, a_bufs, b_bufs, fto, sfa, sf
 # One 128-byte TMA tensormap slot per CTA per distinct A operand.
 
 
-class CompiledMoeGemm(_CompiledMoeGemm):
+class CompiledMoeGemm(_CompiledMoeGemm[TileConfig, GemmBinding]):
     """Execute a compiled grouped GEMM."""
 
     _compiler = sys.modules[__name__]
@@ -2702,7 +2702,7 @@ def _jit_block_scale(
     )
 
 
-class CompiledMoeBlockScaleGemm(_CompiledMoeBlockScaleGemm):
+class CompiledMoeBlockScaleGemm(_CompiledMoeBlockScaleGemm[TileConfig, GemmBinding]):
     """Execute a compiled grouped block-scale GEMM."""
 
     _compiler = sys.modules[__name__]

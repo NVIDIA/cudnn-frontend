@@ -329,6 +329,8 @@ def _kernel(
 
     sA_elems = sA_packed_elems
     sB_elems = sB_packed_elems
+    # Stage scale-factor rings before data rings.
+    # See python/cudnn/frost/README.md#sm100-block-scale-descriptor-roots.
     smem_sfa_list = [
         cutlass.Array(
             cutlass.Uint8,

@@ -15,29 +15,11 @@ from ..epilogue_codegen import (
     EpilogueSnippets,
     _aux_ptr_var,
     _aux_prefetch_var,
-    _compute_cast,
-    _compute_literal,
-    _elem_coord,
     tma_out_value,
     tma_out_ready_marker,
-    _aux_reads_row,
-    _LOG2E,
-    _TWO_LOG2E,
-    _tanh_expr,
-    _fl,
-    _step01,
-    _nonzero01,
-    _sigmoid_lines,
-    _CMP_OPS,
-    _LOGIC_OPS,
-    _BACKWARD_OPS,
-    _emit_binary_ext,
-    _emit_op,
-    _emit_round,
     _store_cast_expr,
     _dense_store_offset,
     _emit_mmajor_scatter,
-    _tap_store_elems,
     _tap_vec_bytes,
     _emit_moe_scatter_store,
     _emit_tap_store,
@@ -45,12 +27,8 @@ from ..epilogue_codegen import (
     _emit_reduction_local_combine,
     _quant_output_max,
     _scale_store_dtype,
-    _f8_128x4_row_scale_index_expr,
     _e8m0_f32,
-    _emit_scale_quantize,
     _emit_scale_quantize_pair,
-    _MAINLOOP_IDX_BASE,
-    _MAINLOOP_IDENTITY_CAST_INTRINSICS,
     generate_mainloop,
     _emit_splitk_partial_store,
 )
@@ -68,7 +46,6 @@ from ..fusion_ir import (
 )
 
 _aux_codegen = _AuxCodegen(wide_offsets=False)
-_index_term = _aux_codegen.index_term
 _aux_index_expr = _aux_codegen.index_expr
 _bounded_aux_prelude = _aux_codegen.bounded_prelude
 _scatter_aux_prelude = _aux_codegen.scatter_prelude
@@ -76,6 +53,7 @@ _aux_load_expr = _aux_codegen.load_expr
 
 
 def _emit_moe_combine_store(tap_idx, i, src, spec, chain, vsize):
+    """Generate weighted MoE COMBINE stores."""
     swapped = isinstance(chain.moe, MoeSwapAbSpec)
     if not swapped and spec.major == "n":
         width = min(vsize, 16 // DTYPE_BYTES[spec.dtype])
@@ -154,6 +132,7 @@ def _emit_reduction_atomic_body(
     *,
     col_offset: int = 0,
 ) -> list[str]:
+    """Generate one SM100 reduction contribution."""
     src = f"_red_{red_idx}_src"
     lines = [f"{src} = ({source_var}).to({DTYPE_TO_CUTLASS[red.compute_dtype]})"]
     if red.mode == "avg":
@@ -442,6 +421,7 @@ def _emit_block_quant(
 
 
 def _tap_fake_shape(tap, chain: FusionChain | None = None) -> str:
+    """Declare a materialized output's symbolic shape."""
     if chain is not None and chain.has_moe and chain.moe.mode == "combine":
         return "(sym_m, cute.sym_int(), 1)" if isinstance(chain.moe, MoeSwapAbSpec) else "(cute.sym_int(), sym_n, 1)"
     if tap.is_quant_scale:

@@ -1,7 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""The LayerNorm-prologue gated dual GEMM substrate -- host side (params, geometry, build, launch)."""
+"""Configure and launch LayerNorm-prologue gated dual GEMMs.
+
+Protocol: python/cudnn/frost/README.md#layernorm-prologue-dual-gemm.
+"""
 
 from __future__ import annotations
 
@@ -251,7 +254,7 @@ _SM100_UNALLOCATABLE_MIN_K = 4 * K_STAGE
 
 
 def sm100_register_form_unallocatable(p: LnDualGemmParams, arch: str) -> bool:
-    """Whether ``p`` is in the sm100 body's C7600 class (module comment above); always False for the sm107 body."""
+    """Reject SM100 register forms that ptxas cannot allocate."""
     if arch != "sm100" or p.ln_pass_form != "registers" or p.epi_math == "scalar" or p.k < _SM100_UNALLOCATABLE_MIN_K:
         return False
     if p.dual:
@@ -439,7 +442,7 @@ def row_block_geometry(n_res: int, bn: int, k_block: Optional[int] = None) -> Ro
 
 
 def interleave_value_gate(w_value, w_gate):
-    """``[c_out, K]`` value and gate weights -> the ``[2 * c_out, K]`` row order the kernel's pairing expects:"""
+    """Interleave 128-channel value and gate weight blocks."""
     import torch
 
     if w_value.shape != w_gate.shape or w_value.ndim != 2:

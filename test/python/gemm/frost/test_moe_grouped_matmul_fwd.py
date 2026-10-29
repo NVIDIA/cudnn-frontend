@@ -1523,7 +1523,7 @@ def test_moe_m_major_alignment_is_per_output_dtype(offset_multiple: int, S: int,
     fto = next(t for t in g.tensors.values() if t.get_name() == "first_token_offset")
     fto.set_alignment_value(offset_multiple)
     # One promise can suffice for fp32/bf16 while fp8 still needs STG.
-    mm = g.tensors["moe::OUT_0"].set_data_type(cudnn.data_type.FLOAT)
+    mm = g.tensors["moe::OUT_0"].set_data_type(cudnn.data_type.FLOAT).set_output(False)
     c = g.identity(input=mm, name="float")
     h = g.relu(input=c, name="half")
     z = g.relu(input=h, name="byte")

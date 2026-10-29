@@ -10,6 +10,13 @@ The `cudnn` Python package: nanobind-backed graph API plus pure-Python **fronten
   sibling-symbol, and public-symbol import orders in fresh interpreters; the detector is
   `test_ops_callable_exports_survive_import_order` in `test/python/core/test_import_boundaries.py`.
 - Never add an eager `import torch` / `import cutlass` to `__init__.py` or anything it imports transitively. Kernel modules import them at top level, which is why they must only be reachable through the lazy table.
+- FROST GEMM's shared compiler/codegen helpers publish explicit export mappings
+  onto the selected family module. Shared executors use bounded generic runtime
+  interfaces; family subclasses bind `TileConfig` and `GemmBinding`. Keep those
+  concrete type imports in the family modules to avoid reverse dependencies.
+  Avoid wildcard family imports back into shared modules. Check facade-first
+  and direct-family-first imports in fresh processes
+  under both `CUDNN_FRONTEND_GEMM_ARCH_FAMILY=sm100|sm120` settings.
 - Reuse the existing required CuTeDSL dependencies (`pyproject.toml` `[project] dependencies`) unless a kernel truly needs a new package. The `[cutedsl]` extra now holds only `cuda-python`.
 
 ## Hard rules
@@ -758,6 +765,13 @@ python/cudnn/gemm/
 Shared helpers (schedulers, metadata utils, e.g. `gemm/cutedsl/grouped/moe_*.py`) stay internal to the family package — never exported through `cudnn`.
 
 ## CuTeDSL kernel bodies
+
+Loaded integer vectors can infer `Int8` while retaining no signedness metadata.
+Set the declared integer dtype on the vector wrapper before widening to INT32.
+CuTeDSL 4.8.0's unary integer vector negation can also crash when building its
+zero constant; subtract from a typed zero vector. Keep each graph node's compute dtype.
+`gemm/frost/test_matmul_mainloop_fusion.py::test_mainloop_int8_identity_preserves_signed_arithmetic`
+checks both operands, compute dtypes and B binding orders with exact comparisons.
 
 Named barriers inside warp-specific branches need unaligned sync and arrive
 instructions. CuTeDSL 4.8's `NamedBarrier.arrive_and_wait()` emits an aligned

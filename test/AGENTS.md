@@ -360,6 +360,11 @@ GREEN baseline. For RED/GREEN checks, copy only the new test changes into an
 isolated baseline worktree and collect there; verify the concrete operation
 module's `__file__` after conftest setup, not only `cudnn.__file__`.
 
+Read repository documentation relative to the test checkout, not `cudnn.__file__`.
+CI can load a wheel's package initializer while conftests overlay source modules;
+the wheel may omit Markdown files. The GEMM descriptor-order checks in
+`gemm/frost/test_block_scale_smem_layout_sm107.py` exercise this boundary.
+
 Import-regression subprocesses are separate interpreters: in-process
 `sys.path` or editable-finder changes do not automatically propagate. Carry
 the selected package/source setup into each child and verify its loaded path.

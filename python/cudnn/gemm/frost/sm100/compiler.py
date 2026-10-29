@@ -1920,7 +1920,7 @@ def _initialize_combine_output(chain: FusionChain, outputs, stream=None) -> None
     buffers.apply_zero_fill_plan(output.data_ptr(), plan, DTYPE_BYTES[chain.outputs[0].dtype], stream)
 
 
-class CompiledFusedGemm(_CompiledFusedGemm):
+class CompiledFusedGemm(_CompiledFusedGemm[TileConfig, GemmBinding]):
     """Execute a compiled fused GEMM."""
 
     _compiler = sys.modules[__name__]
@@ -2888,7 +2888,7 @@ def _check_block_scale_supported(chain: FusionChain, template_pipeline: str) -> 
 # One 128-byte TMA tensormap slot per CTA per distinct A operand.
 
 
-class CompiledMoeGemm(_CompiledMoeGemm):
+class CompiledMoeGemm(_CompiledMoeGemm[TileConfig, GemmBinding]):
     """Execute a compiled grouped GEMM."""
 
     _compiler = sys.modules[__name__]
@@ -3042,7 +3042,7 @@ def _jit_block_scale(
     return _compile_fused_gemm(chain, config, binding=binding)
 
 
-class CompiledMoeBlockScaleGemm(_CompiledMoeBlockScaleGemm):
+class CompiledMoeBlockScaleGemm(_CompiledMoeBlockScaleGemm[TileConfig, GemmBinding]):
     """Execute a compiled grouped block-scale GEMM."""
 
     _compiler = sys.modules[__name__]

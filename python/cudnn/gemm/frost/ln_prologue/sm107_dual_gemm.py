@@ -1,7 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""LayerNorm-prologue gated dual GEMM."""
+"""LayerNorm-prologue gated dual GEMM.
+
+Protocol: python/cudnn/frost/README.md#layernorm-prologue-dual-gemm.
+"""
 
 from __future__ import annotations
 
@@ -135,7 +138,7 @@ SKIP_MASKED_TILES: bool = PARAMS.skip_masked_tiles
 _EPS: float = PARAMS.eps
 _DIAG: str = PARAMS.diag  # diagnostic relief arms ("" in production)
 _INV_K: float = 1.0 / PARAMS.k
-_PASS_IN_M: bool = PARAMS.pass_order == "interleaved"  # the pass rides the scheduler's M axis (module docstring, TILE ORDER)
+_PASS_IN_M: bool = PARAMS.pass_order == "interleaved"
 _LOG2_PASSES: int = _PASSES.bit_length() - 1  # the validator pins passes to a power of two when the pass is folded into M
 matmul_b_batch = _PASSES
 _VALUE_BLOCK: int = 128  # value columns [0, 128) and gate columns [128, 256) of every 256-wide N tile
@@ -161,7 +164,7 @@ _LN_SMEM: bool = PARAMS.ln_pass_form != "registers"
 _LN_ROLLED: bool = PARAMS.ln_pass_form == "smem_rolled"
 _LN_PF: bool = PARAMS.ln_pass_form in ("smem_rolled_pf", "smem_rolled_tree")
 _LN_TREE: bool = PARAMS.ln_pass_form == "smem_rolled_tree"
-# EPILOGUE MATH (module docstring): the gated pairing on packed fp32x2 pairs (the same fp32 operations per element, half the ALU issue).
+# Packed epilogue arithmetic.
 _EPI_PACKED: bool = PARAMS.epi_math in ("packed", "packed_hoist", "packed_biasfold")
 _EPI_BIAS_HOIST: bool = PARAMS.epi_math in ("packed_hoist", "packed_biasfold")
 _EPI_BIASFOLD: bool = PARAMS.epi_math == "packed_biasfold"
@@ -303,7 +306,7 @@ def _a0_pair_f32(wa, wc, sel):
 
 @cute.jit
 def _row_coords(tile_m, n_kb, lkb, r_pair):
-    """Pair row ``r_pair`` (0-255) of scheduler tile ``tile_m`` -> ``(k, bi)`` (module docstring, ROW-BLOCK TILING)."""
+    """Map a pair row to its row-block coordinates."""
     ib = tile_m // n_kb
     kb_idx = tile_m - ib * n_kb
     kbw = cutlass.Int32(1) << lkb
@@ -320,7 +323,7 @@ def _cta_box_origin(tile_m, n_kb, lkb, pair_member):
 
 @cute.jit
 def _decode_pass(tile_m, tile_l):
-    """The scheduler's ``(tile_m, tile_l)`` -> ``(row-block tile, pass)`` (module docstring, TILE ORDER)."""
+    """Decode the scheduler row-block and pass indices."""
     row_tile = (tile_m >> _LOG2_PASSES) if cutlass.const_expr(_PASS_IN_M) else tile_m
     pass_idx = (tile_m & (_PASSES - 1)) if cutlass.const_expr(_PASS_IN_M) else tile_l
     return row_tile, pass_idx
@@ -328,8 +331,7 @@ def _decode_pass(tile_m, tile_l):
 
 @cute.jit
 def _item_tile(item_n, sub):
-    """LN ONCE (module docstring): the work item's sub-tile ``sub`` (0 .. _TPI - 1) -> ``(tile_n, pass)``: the item's N tiles are the low log2(_NTI)
-    bits of ``sub``, the pass the rest (both powers of two by the validator; ``_NTI = 1`` under "passes" -> ``tile_n = item_n``, ``pass = sub``)."""
+    """Decode a work-item subtile into its N tile and pass."""
     tile_n = item_n * _NTI + (sub & (_NTI - 1))
     pass_idx = sub >> _LOG2_NTI
     return tile_n, pass_idx
@@ -337,8 +339,7 @@ def _item_tile(item_n, sub):
 
 @cute.jit
 def _item_decode(m_idx, n_idx, gridx, gridy, swizzle_w):
-    """LN ONCE: a CLC response -> ``(row block, N-tile group)`` = the shipped per-tile decode (the cluster-rank shift, the L2 tile swizzle) without
-    the pass fold (the pass lives inside the item; the validator pins ``pass_order = "major"``)."""
+    """Decode a CLC work item."""
     raw_m = m_idx >> _preferred_cluster_m_shift
     raw_n = n_idx >> _preferred_cluster_n_shift
     nt_m = gridx >> _preferred_cluster_m_shift
@@ -483,7 +484,7 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
         identity=tile_swizzle_n == 1,
     )
     init_tile_l = bidz
-    init_tile_m, init_tile_l = _decode_pass(init_tile_m, init_tile_l)  # TILE ORDER (module docstring)
+    init_tile_m, init_tile_l = _decode_pass(init_tile_m, init_tile_l)
 
     if cutlass.const_expr(cta_group == 1):
         a_pattern = a_mcast_pattern
@@ -910,7 +911,7 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
             clc_full_phase_tma = cutlass.Int32(0)
             while is_valid != 0:
                 coord_m_per_cta = tile_m * cgrp_tile_m_cur + m_rank * cta_tile_mnk[0]
-                # LN-PROLOGUE DUAL GEMM: this CTA's 128 rows of the pair tile as a (k, bi) box origin (module docstring, ROW-BLOCK TILING)
+                # Locate this CTA's LayerNorm rows.
                 a_coord_k, a_coord_bi = _cta_box_origin(tile_m, n_kb, lkb, pair_member)
                 # K3 ARM: an MN-major operand lands as two 64-row boxes -- the (k, bi) of pair rows 128 pm + 0 and 128 pm + 64 (one bi each)
                 a_mn_k = []
@@ -1112,7 +1113,7 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                     identity=tile_swizzle_n == 1,
                 )
                 tile_l = l_idx
-                tile_m, tile_l = _decode_pass(tile_m, tile_l)  # TILE ORDER (module docstring)
+                tile_m, tile_l = _decode_pass(tile_m, tile_l)
                 nvvm.bar_warp_sync(0xFFFFFFFF)
                 if elect_one:
                     empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
@@ -1520,7 +1521,7 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
         is_valid = cutlass.Int32(1)
         clc_full_phase_epi = cutlass.Int32(0)
         if cutlass.const_expr(_LN_ONCE):
-            # LN ONCE (module docstring): the item's N-tile group and sub-tile counter; the acc ring stays per tile (tile_iter), the CLC per item
+            # Decode this work item's epilogue tile.
             item_n = init_tile_n
             sub = cutlass.Int32(0)
             item_iter = cutlass.Int32(0)
@@ -1731,7 +1732,7 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                     identity=tile_swizzle_n == 1,
                 )
                 tile_l = l_idx
-                tile_m, tile_l = _decode_pass(tile_m, tile_l)  # TILE ORDER (module docstring)
+                tile_m, tile_l = _decode_pass(tile_m, tile_l)
                 nvvm.bar_warp_sync(0xFFFFFFFF)
                 if elect_one:
                     empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
@@ -1839,7 +1840,7 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                     if cutlass.const_expr(_LN_TREE):
                         _sum = (_ta0 + _ta1) + (_ta2 + _ta3)
                 elif cutlass.const_expr(_LN_SMEM):
-                    # LN PASS FORMS "smem" / "smem_rolled" (module docstring): pass A only SUMS -- the row is not kept; passes B / C re-read the chunks
+                    # Re-read shared chunks for LayerNorm.
                     for _j in cutlass.range_constexpr(_NK if _ln_work else 0):
                         _row_base = sA_elems * _sts[_j] + ln_tid * cta_tile_mnk[2]
                         if cutlass.const_expr(_LN_ROLLED):
@@ -2327,7 +2328,7 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                 identity=tile_swizzle_n == 1,
             )
             tile_l = l_idx
-            tile_m, tile_l = _decode_pass(tile_m, tile_l)  # TILE ORDER (module docstring)
+            tile_m, tile_l = _decode_pass(tile_m, tile_l)
             nvvm.bar_warp_sync(0xFFFFFFFF)
             if elect_one:
                 empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
@@ -2360,7 +2361,7 @@ def _host(
     n = geom[1]  # the GEMM N: K1 = 2 * c_out (value | gate interleaved), K3 = c_out per GEMM
     k_sym = geom[2]  # K
     batch = geom[3]  # passes
-    # TILE ORDER (module docstring): "interleaved" folds the pass into the scheduler's M axis (passes tiles per row block, grid z = 1)
+    # Select scheduler grid axes.
     m = (m_rows * _PASSES) if cutlass.const_expr(_PASS_IN_M) else m_rows
     grid_z = 1 if cutlass.const_expr(_PASS_IN_M or _LN_ONCE) else batch  # LN ONCE: the pass lives inside the work item
     n_res = cutlass.Int32(geom[4])
@@ -2485,7 +2486,7 @@ def _host(
         block=(threads_per_cta, 1, 1),
         cluster=cluster_shape_mnk,
         use_pdl=USE_PDL,
-        min_blocks_per_mp=_MIN_BLOCKS_PER_MP,  # the `.minnctapersm` hint (REGISTER SPLIT, module docstring); 0 = no attribute = today's IR
+        min_blocks_per_mp=_MIN_BLOCKS_PER_MP,
         stream=stream,
     )
 
