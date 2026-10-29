@@ -26,6 +26,7 @@ from typing import Any, Optional
 
 import cudnn
 from cudnn._sdpa_tail import GateTail, match_gate_tail
+from cudnn.sdpa.layout import dense_layout_ok
 
 _LOG = logging.getLogger(__name__)
 
@@ -181,36 +182,6 @@ def packed_layout_ok(dim: tuple, stride: tuple) -> bool:
     return act == exp
 
 
-def dense_layout_ok(dim: tuple, stride: tuple) -> bool:
-    """Relaxed DENSE layout soundness for a rank-4 (B, H, S, D) tensor: the
-    real requirement of the SM100 DSL lowering, which normalizes any such
-    layout to the kernel's canonical BSHD-compact buffers (zero-copy when the
-    tensor already is BSHD-compact, one gather/scatter copy otherwise) — so
-    the B/H/S physical stride ORDER is free, and strides may be padded
-    (oversized) arbitrarily. What must hold:
-
-      * head dim (axis 3) innermost-contiguous: stride 1 (size-1 wildcarded);
-      * no zero stride on a size>1 dim — a broadcast view aliases distinct
-        logical elements onto one address, which is ill-defined for the O
-        write-back and rejected uniformly;
-      * non-overlapping: visiting dims by ascending stride, each stride must
-        cover the span of every dim below it (dense == equality; padded is
-        larger; SMALLER than dense would alias, so it is rejected).
-
-    Size-1 dims are wildcards: any stride, 0 and garbage included (cuDNN's
-    own harnesses corrupt them deliberately).
-    """
-    if dim[3] != 1 and stride[3] != 1:
-        return False
-    active = sorted((int(st), int(sz)) for st, sz in zip(stride, dim) if sz != 1)
-    span = 1
-    for st, sz in active:
-        if st < span:  # st == 0 (broadcast) or overlapping / sub-dense
-            return False
-        span = st * sz
-    return True
-
-
 # Element widths of the facts vocabulary, for the 16-byte TMA stride rule below.
 # An unmapped dtype gets the STRICTEST width (1 B -> strides must be multiples
 # of 16 elements); the row's dtype check declines such a G before layout anyway.
@@ -225,28 +196,12 @@ _ELEM_BYTES = {
 
 
 def gate_layout_ok(dim: tuple, stride: tuple, elem_bytes: int) -> bool:
-    """Whether a rank-4 logical (B, H, S, D) tensor is one the fused-gate kernels
-    can TMA-load ZERO-COPY: BSHD-compact, or a declared BSHD layout TMA can
-    express. Uses the shared ``config_sm100.bshd_zero_copy_stride`` predicate,
-    distinguishing compact from inexpressible geometry so the row declines
-    what the adapter would reject:
-
-      * head dim innermost-contiguous (stride 1);
-      * every stepped batch, seq and head stride is a 16-byte multiple;
-      * the declaration COVERS the tensor (head >= d, seq >= h*head,
-        batch >= s*seq) -- an overlapping declaration aliases distinct rows.
-
-    Stricter than ``bshd_layout_ok`` + ``dense_layout_ok`` on purpose: size-1
-    dims are NOT wildcarded, because the adapter's TensorDesc keeps the IR's
-    unit-dim strides verbatim and its cover check reads them.  Unlike Q/K/V/O,
-    G has no normalisation-copy fallback in the lowering.
-    """
+    """Whether a dense gate has native TMA geometry, including B/H/S permutations."""
     if len(dim) != 4 or len(stride) != 4:
         return False
-    from cudnn.sdpa.fwd.config_sm100 import bshd_compact, bshd_zero_copy_stride
+    from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
 
-    dim, stride = tuple(int(x) for x in dim), tuple(int(x) for x in stride)
-    return bshd_compact(dim, stride) or bshd_zero_copy_stride(dim, stride, max(1, int(elem_bytes))) is not None
+    return dense_bind_strides(tuple(int(x) for x in dim), tuple(int(x) for x in stride), max(1, int(elem_bytes))) is not None
 
 
 @dataclass(frozen=True)

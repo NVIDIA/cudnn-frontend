@@ -90,12 +90,12 @@ def test_native_split_strided_outputs_wide_tables_and_fixed_query_geometry():
     for role in ("block_table", "block_table_v"):
         f = facts[role]
         facts[role] = f._replace(strides=(2**33, 3), span=(s.b - 1) * 2**33 + 22)
-    _equal(s, facts)
+    _equal(s, facts, workspace=2**48)
     for role in ("q", "o"):
         f = facts[role]
         changed = dict(facts, **{role: f._replace(shape=(s.b - 1, *f.shape[1:]))})
         with pytest.raises(ValueError):
-            s.native.execute(_pack(changed), prep._NATIVE_DENSE_INDICES, 17, workspace=0x100000)
+            s.native.execute(_pack(changed), prep._NATIVE_DENSE_INDICES, 17, workspace=2**48)
     for workspace in (0, 0x100001, -16, 2**63 - 16):
         with pytest.raises(ValueError):
             s.native.execute(_pack(facts), prep._NATIVE_DENSE_INDICES, 17, workspace=workspace)
@@ -225,3 +225,51 @@ def test_standalone_split_requires_caller_workspace_without_allocating(native, m
         check(result["o_tensor"], result["lse_tensor"])
     finally:
         graph.reset()
+
+
+@pytest.mark.parametrize("role", ["q", "k", "v", "o", "lse", "seq_q_lens", "seq_kv_lens", "block_table", "block_table_v"])
+@pytest.mark.parametrize("observed", [False, True])
+@pytest.mark.parametrize("offset", [0, -16])
+def test_native_split_workspace_alias_rejects_before_either_launch(role, observed, offset):
+    spec, facts, frames, combined = _split_fixture(paged=True)
+    # Leave each operand and its overlapping scratch interval isolated, so a
+    # different role cannot mask a missing check for the selected operand.
+    facts = {name: fact._replace(ptr=0x1000000 * (index + 1)) for index, (name, fact) in enumerate(facts.items())}
+    _equal(spec, facts)
+    if not observed:
+        facts = {name: fact._replace(span=-1) for name, fact in facts.items()}
+    workspace = facts[role].ptr + offset
+    native_role = "lse_tensor" if role == "lse" else role
+    with pytest.raises(ValueError, match=rf"workspace overlaps {native_role}$"):
+        spec.native.execute(_pack(facts), prep._NATIVE_DENSE_INDICES, 17, workspace=workspace)
+    with pytest.raises(ValueError, match=rf"workspace overlaps {role}$"):
+        binding_reference.bind_dense_split(spec, facts, workspace, 17, 17)
+    assert frames == combined == []
+
+
+@pytest.mark.parametrize("paged", [False, True])
+def test_native_split_disjoint_slices_of_one_allocation(paged):
+    import ctypes
+    from cudnn.frost.buffers import DTYPE_ITEMSIZE
+
+    spec, facts, frames, combined = _split_fixture(paged=paged)
+    sizes = {role: fact.span * DTYPE_ITEMSIZE[fact.dtype] for role, fact in facts.items()}
+    scratch = spec.combine.lse_offset + spec.combine.lse.numel * 4
+    offsets, cursor = {}, 0
+    for role, size in sizes.items():
+        offsets[role] = cursor
+        cursor += (size + 31) // 16 * 16
+    workspace_offset = cursor
+    owner = bytearray(cursor + scratch + 16)
+    base = ctypes.addressof(ctypes.c_char.from_buffer(owner))
+    origin = (-base) % 16
+    # These are real slices of one host allocation; only metadata is bound,
+    # and the fixture's entries record frames instead of launching a GPU kernel.
+    views = {role: memoryview(owner)[origin + offset : origin + offset + sizes[role]] for role, offset in offsets.items()}
+    facts = {role: fact._replace(ptr=ctypes.addressof(ctypes.c_char.from_buffer(views[role]))) for role, fact in facts.items()}
+    workspace = base + origin + workspace_offset
+    assert workspace + scratch <= base + len(owner)
+    assert all(base <= fact.ptr < fact.ptr + sizes[role] <= workspace for role, fact in facts.items())
+    _equal(spec, facts, workspace=workspace)
+    spec.native.execute(_pack(facts), prep._NATIVE_DENSE_INDICES, 17, workspace=workspace)
+    assert len(frames) == len(combined) == 1

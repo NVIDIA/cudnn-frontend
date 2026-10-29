@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""SM100/SM107 half conversion plans use declared, caller-owned scratch."""
+"""SM100/SM107 half attention binds aligned declared layouts without copies."""
 
 import math
 
@@ -15,17 +15,17 @@ pytestmark = [pytest.mark.L0, requires_dsl, requires_blackwell]
 
 def _require_half_arch():
     if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("SM100/SM103/SM107 half conversion path")
+        pytest.skip("SM100/SM103/SM107 half native stride path")
 
 
-def _case(d=128, dv=128, dtype=torch.bfloat16, converted=("q", "k", "v", "o"), split=1, b=2):
+def _case(d=128, dv=128, dtype=torch.bfloat16, padded_roles=("q", "k", "v", "o"), split=1, b=2):
     _require_half_arch()
     if torch.cuda.get_device_capability() == (10, 7) and split > 1:
         pytest.skip("SM107 half split-KV remains unsupported")
     torch.manual_seed(751)
     tensors, storage = {}, {}
     for role, heads, seq, dim in (("q", 4, 17, d), ("k", 2, 128, d), ("v", 2, 128, dv), ("o", 4, 17, dv)):
-        raw = (torch.randn(b, seq, heads, dim + (role in converted), device="cuda") * 0.2).to(dtype)
+        raw = (torch.randn(b, seq, heads, dim + 8 * (role in padded_roles), device="cuda") * 0.2).to(dtype)
         if role == "o":
             raw.fill_(11)
         storage[role] = raw
@@ -51,15 +51,17 @@ def _check(tensors):
 @pytest.mark.parametrize("d,dv", [(96, 80), (128, 128), (192, 128), (256, 256), (384, 320), (512, 512)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("split", [1, 2])
-def test_half_staged_has_no_execute_allocations_and_replays_current_storage(d, dv, dtype, split, monkeypatch):
+def test_half_native_has_no_execute_allocations_and_replays_current_storage(d, dv, dtype, split, monkeypatch):
+    from test_sdpa_bwd_staged_sm80 import _assert_kernel_count
     from sdpa.frost.native_binding_utils import forbid_python_forward_binding
 
     api, tensors, storage = _case(d, dv, dtype, split=split)
     required = api.scratch_workspace_bytes()
     api.compile()
-    assert api._staged_spec.core.native is not None
+    assert api._dense_spec.native is not None
     forbid_python_forward_binding(monkeypatch)
-    assert required > 0 and api.scratch_workspace_bytes() == required
+    assert (required > 0) == (split > 1)
+    assert api.scratch_workspace_bytes() == required
     workspace = torch.empty(required, dtype=torch.uint8, device="cuda")
     for _ in range(2):
         _, tensors, storage = _case(d, dv, dtype, split=split)
@@ -73,10 +75,11 @@ def test_half_staged_has_no_execute_allocations_and_replays_current_storage(d, d
         run()
         _check(tensors)
         assert torch.all(storage["o"][..., -1] == 11)
-        graph = torch.cuda.CUDAGraph()
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
         try:
             with torch.cuda.graph(graph):
                 run()
+            _assert_kernel_count(graph, 2 if split > 1 else 1)
             tensors["v"].mul_(0.5)
             tensors["o"].fill_(float("nan"))
             graph.replay()
@@ -86,19 +89,19 @@ def test_half_staged_has_no_execute_allocations_and_replays_current_storage(d, d
             graph.reset()
 
 
-@pytest.mark.parametrize("converted", [("q",), ("o",), ("q", "k", "v", "o")])
+@pytest.mark.parametrize("padded_roles", [("q",), ("o",), ("q", "k", "v", "o")])
 @pytest.mark.parametrize("split", [1, 2])
-def test_half_staged_preserves_native_operands_and_split_output(converted, split):
-    api, tensors, storage = _case(converted=converted, split=split)
+def test_half_native_preserves_native_operands_and_split_output(padded_roles, split):
+    api, tensors, storage = _case(padded_roles=padded_roles, split=split)
     required = api.scratch_workspace_bytes()
     api.compile()
-    staged = api._staged_spec
-    expected = set(converted) - ({"o"} if split > 1 else set())
-    assert ({r[0] for r in staged.regions} if staged is not None else set()) == expected
+    assert api._dense_spec.native is not None
+    assert not hasattr(api, "_staged_spec")
+    assert (required > 0) == (split > 1)
     workspace = torch.empty(required, dtype=torch.uint8, device="cuda") if required else None
     _execute(api, tensors, workspace)
     _check(tensors)
-    if "o" in converted:
+    if "o" in padded_roles:
         assert torch.all(storage["o"][..., -1] == 11)
 
 
@@ -108,7 +111,7 @@ def test_half_staged_preserves_native_operands_and_split_output(converted, split
 def test_sm100_wrapper_supplies_current_workspace(layout, d, side_stream, monkeypatch):
     from cudnn.sdpa.fwd.api_dsl import sdpa_fwd_wrapper_dsl_sm100
 
-    _, tensors, _ = _case(d, d, converted=() if layout == "compact" else ("q", "k", "v", "o"))
+    _, tensors, _ = _case(d, d, padded_roles=() if layout == "compact" else ("q", "k", "v", "o"))
     if layout == "bhsd":
         tensors.update({n: tensors[n].contiguous() for n in ("q", "k", "v")})
     launch_stream = torch.cuda.Stream() if side_stream else torch.cuda.current_stream()
@@ -140,9 +143,9 @@ def test_sm100_wrapper_supplies_current_workspace(layout, d, side_stream, monkey
         assert seen[0][1].data_ptr() != seen[1][1].data_ptr()
 
 
-@pytest.mark.parametrize("staged", [False, True])
-def test_half_compiled_workspace_query_uses_prepared_budget(staged, monkeypatch):
-    api, _, _ = _case(converted=("q", "k", "v", "o") if staged else ())
+@pytest.mark.parametrize("strided", [False, True])
+def test_half_compiled_workspace_query_uses_prepared_budget(strided, monkeypatch):
+    api, _, _ = _case(padded_roles=("q", "k", "v", "o") if strided else ())
     required = api.scratch_workspace_bytes()
     api.compile()
     for name in ("_can_prepare_dense_layout", "_can_prepare_fp8", "_can_prepare_mxfp8"):
@@ -151,10 +154,10 @@ def test_half_compiled_workspace_query_uses_prepared_budget(staged, monkeypatch)
 
 
 @pytest.mark.parametrize("bad", ["q_dtype", "q_shape", "q_cpu", "o_overlap", "lse_dtype", "workspace_missing", "workspace_short", "workspace_alias"])
-def test_half_staged_rejects_invalid_bindings_before_copy(bad, monkeypatch):
-    from cudnn.sdpa.fwd import prepared_staged_forward
+def test_half_native_rejects_invalid_bindings_before_launch(bad, monkeypatch):
+    from sdpa.frost.native_binding_utils import assert_rejected_without_writes, forbid_native_forward_launch
 
-    api, tensors, _ = _case()
+    api, tensors, _ = _case(split=2 if bad.startswith("workspace_") else 1)
     api.compile()
     required = api.scratch_workspace_bytes()
     workspace = torch.empty(required, device="cuda", dtype=torch.uint8)
@@ -175,16 +178,14 @@ def test_half_staged_rejects_invalid_bindings_before_copy(bad, monkeypatch):
         workspace = workspace[:-1]
     elif bad == "workspace_alias":
         tensors["q"] = workspace[: tensors["q"].numel() * 2].view(torch.bfloat16).view(tensors["q"].shape)
-    monkeypatch.setattr(prepared_staged_forward, "_copy", lambda *a, **k: pytest.fail("invalid binding reached staging"))
-    monkeypatch.setattr(api._staged_spec.core, "fn", lambda *a, **k: pytest.fail("invalid binding reached attention"))
-    with pytest.raises(ValueError):
-        _execute(api, tensors, workspace)
+    forbid_native_forward_launch(monkeypatch, api._dense_spec)
+    assert_rejected_without_writes(lambda: _execute(api, tensors, workspace), [tensors["o"], tensors["lse"]], workspace)
 
 
 @pytest.mark.gpu_exclusive
 @pytest.mark.parametrize("d", [128, 256, 512])
 @pytest.mark.parametrize("role,product", [("q", False), ("o", True)])
-def test_half_staged_physical_wide_stride(d, role, product):
+def test_half_native_physical_wide_stride(d, role, product):
     api, tensors, _ = _case(d, d, b=4 if product else 2)
     api.compile()
     original = tensors[role]
@@ -213,7 +214,7 @@ def test_half_staged_physical_wide_stride(d, role, product):
 
 
 @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
-def test_half_staged_artifact_reloads_without_jit(d, dv, tmp_path):
+def test_half_native_artifact_reloads_without_jit(d, dv, tmp_path):
     _require_half_arch()  # Module pytestmarks do not follow re-exported test methods.
     import json
     import os
@@ -231,18 +232,18 @@ from cudnn.frost import compiled_cache
 folder, package, d, dv, reload = sys.argv[1:]
 assert Path(cudnn.__file__).resolve() == Path(package).resolve(), cudnn.__file__
 sys.path[:0] = [folder, str(Path(folder).parents[1])]
-from test_sdpa_staged_forward_half import _case, _execute, _check
+from native_forward_half_cases import _case, _execute, _check
 if reload == "1":
     def forbidden(*args, **kwargs):
-        raise AssertionError("reloaded staged artifact invoked JIT")
+        raise AssertionError("reloaded native artifact invoked JIT")
     cute.compile = forbidden
 api, tensors, storage = _case(int(d), int(dv))
 workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
 api.compile()
-owner = api._staged_spec.core.owner
+owner = api._dense_spec.owner
 if reload == "1":
     assert hasattr(owner, "_compiled_cache_raw")
-    assert all(entry is None or hasattr(entry[0], "_compiled_cache_raw") for entry in api._staged_spec.copies)
+    assert not hasattr(api, "_staged_spec")
 _execute(api, tensors, workspace)
 _check(tensors)
 graph = torch.cuda.CUDAGraph()
@@ -279,27 +280,25 @@ print(json.dumps(dict(digest=digest, stats=compiled_cache.stats())))
 
 @pytest.mark.parametrize("split", [1, 2])
 @pytest.mark.parametrize("explicit", [False, True])
-def test_half_staged_copies_follow_launch_stream(split, explicit, monkeypatch):
+def test_half_native_follows_launch_stream(split, explicit, monkeypatch):
     from cuda.bindings import driver
-    from cudnn.sdpa.fwd import prepared_staged_forward
+    from sdpa.frost.native_binding_utils import intercept_native_forward
 
     api, tensors, storage = _case(split=split)
     api.compile()
     workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
     target = torch.cuda.Stream(device=api.q_desc.device)
     target.wait_stream(torch.cuda.current_stream())
-    original = prepared_staged_forward._copy
     streams = []
 
-    def copy(entry, frame, stream):
-        assert stream == target.cuda_stream
-        streams.append(stream)
-        return original(entry, frame, stream)
+    def inspect(frame):
+        assert int(frame["stream"]) == target.cuda_stream
+        streams.append(frame["stream"])
 
-    monkeypatch.setattr(prepared_staged_forward, "_copy", copy)
+    intercept_native_forward(monkeypatch, api._dense_spec, inspect)
     raw = driver.CUstream(target.cuda_stream) if explicit else None
     # Explicit launch keeps a different torch current stream, so an accidental
-    # ambient-stream copy is observable even on a single GPU.
+    # ambient-stream launch is observable even on a single GPU.
     from contextlib import nullcontext
 
     context = nullcontext() if explicit else torch.cuda.stream(target)
@@ -311,6 +310,6 @@ def test_half_staged_copies_follow_launch_stream(split, explicit, monkeypatch):
     finally:
         torch.cuda.set_sync_debug_mode(old_mode)
     torch.cuda.current_stream().wait_stream(target)
-    assert len(streams) == (1 if split > 1 else 2)
+    assert len(streams) == 1
     _check(tensors)
     assert torch.all(storage["o"][..., -1] == 11)

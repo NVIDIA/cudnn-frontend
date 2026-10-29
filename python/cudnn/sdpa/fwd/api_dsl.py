@@ -1500,6 +1500,20 @@ class SdpaFwdDsl(APIBase):
             width = 1
         return dense_bind_strides(shape, stride, width)
 
+    def _check_native_dense_layouts(self):
+        """Every accepted dense data port binds its declared storage directly."""
+        if self.thd:
+            return
+        for role in ("q", "k", "v", "o"):
+            if self.paged and role in ("k", "v"):
+                continue  # Page pools have their own per-port layout contract.
+            desc = getattr(self, role + "_desc")
+            self._not_implemented_error_if(
+                self._prepared_operand_layout(desc) is None,
+                f"{role}: native dense forward requires contiguous D, non-overlapping B/H/S strides and 16-byte outer-stride alignment; "
+                f"got shape {tuple(desc.shape)}, strides {tuple(desc.stride)}",
+            )
+
     def _can_prepare_block_output(self):
         return bool(self.o_block_scale) and not (
             self.thd or self.paged or self.split_kv > 1 or self.pack_gqa or self.gate_desc is not None or getattr(self, "pv_bf16", False)
@@ -1518,6 +1532,7 @@ class SdpaFwdDsl(APIBase):
             execute_native_thd_tensors,
             facts_of_tensor,
         )
+        from cudnn._torch_stream import device_context
 
         spec = self._thd_spec if self.thd else self._dense_spec
         if self.thd:
@@ -1534,7 +1549,6 @@ class SdpaFwdDsl(APIBase):
             raise ValueError(f"cudnn.sdpa: prepared FP8 workspace must cover {required} bytes on the Q device")
         stream = self._get_default_stream(stream)
         stream_int = int(stream)
-        _ensure_current_context(stream_int, q.device.index)
         if spec.quant.block_output is None and scales.get("sf_o") is not None:
             raise ValueError("cudnn.sdpa: this specialization does not produce sf_o")
         if self.thd:
@@ -1542,12 +1556,16 @@ class SdpaFwdDsl(APIBase):
                 raise ValueError("cudnn.sdpa: this specialization was compiled without an epilogue gate")
             buffers = (q, k, v, o, q_lens, kv_lens, lse, sinks, block_table, block_table_v)
             buffers += tuple(scales.get(role) for role in _native_quant_roles(spec.quant))
-            launched = execute_native_thd_tensors(spec, buffers, ws.ptr, stream, scale * math.log2(math.e))
+            with device_context(q.device):
+                _ensure_current_context(stream_int, q.device.index)
+                launched = execute_native_thd_tensors(spec, buffers, ws.ptr, stream, scale * math.log2(math.e))
         else:
             buffers = (q, k, v, o, lse, sinks, kv_lens, q_lens, block_table, block_table_v, scales.get("gate"))
             buffers += (None,) * (len(_NATIVE_DENSE_ROLES) - len(buffers))
             buffers += tuple(scales.get(role) for role in _native_quant_roles(spec.quant))
-            execute_native_dense_tensors(spec, buffers, stream, scale * math.log2(math.e), ws.ptr)
+            with device_context(q.device):
+                _ensure_current_context(stream_int, q.device.index)
+                execute_native_dense_tensors(spec, buffers, stream, scale * math.log2(math.e), ws.ptr)
             launched = True
         # Preserve the retired tensor path's diagnostics at the live entry.
         if self.thd and getattr(self, "_prepared_mxfp8", False):
@@ -1561,6 +1579,8 @@ class SdpaFwdDsl(APIBase):
             else:
                 self._logger.debug("execute (FP8 THD): no addressable Q token, nothing to do")
         self._logger.debug("execute (prepared FP8) completed")
+        # Preserve the completion diagnostics from the retired staging executor.
+        self._logger.debug("execute (FP8 per-tensor) completed" if self._pertensor else "execute (MXFP8) completed")
 
     def _o_dtype(self):
         """The torch dtype O is STORED as.
@@ -2924,13 +2944,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             f"kv_mask={self.kv_mask_desc is not None}, pack_gqa={self.pack_gqa}, thd={self.thd}, gate={self.gate_desc is not None}",
         )
         if self.bias_desc is not None or self.kv_mask_desc is not None:
-            # The resident-block arms bind through the PREPARED launch only: the staging-copy executor (a layout TMA cannot bind
-            # zero-copy) forwards neither operand, so that path is a typed decline here, never an execute-time error (the engine
-            # row's _resident_arm_layout_decline is the twin, rule 8b).
+            # Bias and mask ports use the same native prepared launch contract.
             self._value_error_if(
                 not self._fp8 and not self._can_prepare_dense_layout(),
-                "the additive bias / kv_mask arms bind through the prepared launch only: Q/K/V/O need 16-byte-aligned BSHD-physical strides "
-                "that bind without a copy (the staging-copy path does not carry these operands)",
+                "the additive bias / kv_mask arms require native Q/K/V/O layouts: contiguous D and 16-byte-aligned covering B/H/S strides",
             )
             # Additive bias / per-key mask: the twin of the engine row's gates (engines._bias_arm_decline; rule 8b)
             # through the SAME constants (rule 8b').  The resident row-block lives in the Rubin f16/bf16 d128 file's
@@ -3479,9 +3496,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "the d256 decode tile's split combine; the dense d256 prefill kernel runs unpacked",
             )
             if _gate_in_combine:
-                # The gated combine is reached through the prepared dense launch only
-                # (the staged path binds the split through the same native binder, which
-                # knows no gate on a split): the operands must bind zero-copy.
+                # The gated combine uses the prepared dense launch; every
+                # operand must satisfy its native binding contract.
                 self._not_implemented_error_if(
                     not self._can_prepare_dense_layout(),
                     "the gate-in-combine split (the d256 decode tile) needs Q/K/V layouts the prepared dense launch binds zero-copy (BSHD-physical)",
@@ -3504,20 +3520,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     "the epilogue gate is bfloat16 on the quantized (FP8) path" if self._fp8 else "the epilogue gate must match Q dtype on the f16/bf16 path"
                 ),
             )
-            # The gate binds zero-copy or not at all: compact, or a TMA-expressible
-            # token-major declaration the artifact is compiled at (a G sliced out
-            # of a fused projection slab).  ONE rule decides -- the same
-            # `epilogue_gate_layout_declarable` the engine rows apply to G in
-            # mismatch() -- so a graph that entered the ranked list cannot die
-            # here (rule 8b lockstep).  It is STRICTER than dense_layout_ok:
-            # a head-major (torch-contiguous [B, H, S, D]) or 16-byte-unaligned
-            # G is a legal Q/K/V/O layout (those take the normalisation copy)
-            # but not a gate layout, because no hidden copy is made for the gate.
+            # Graph and standalone gate admission share the same per-port
+            # native stride predicate as Q/K/V/O.
             self._value_error_if(
                 not _epilogue_gate_layout_declarable(tuple(self.gate_desc.shape), tuple(self.gate_desc.stride), self.gate_desc.dtype.itemsize),
-                f"GATE layout is not TMA-expressible for a zero-copy binding: the gate must be BSHD-compact or a token-major "
-                f"declaration (D innermost-contiguous, then heads, then tokens; seq and head strides 16-byte multiples; covering) "
-                f"-- a head-major or unaligned G is neither, and no hidden copy is made for the gate; got BHSD strides {tuple(self.gate_desc.stride)}",
+                f"GATE layout is not TMA-expressible: contiguous D and 16-byte-aligned covering B/H/S strides are required; "
+                f"got BHSD strides {tuple(self.gate_desc.stride)}",
             )
         self._value_error_if(
             not self.has_amax_o and not self._fp8,
@@ -3578,6 +3586,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self.head_dim_qk = int(d_qk)
         self.head_dim_v = int(d_v)
 
+        self._check_native_dense_layouts()
         self._is_supported = True
         self._logger.debug("check_support completed successfully")
         return True
@@ -4050,16 +4059,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
     def compile(self) -> None:
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
-        self._staged_spec = None
-        if (self._fp8 and not (self._can_prepare_fp8() or self._can_prepare_mxfp8())) or (not self._fp8 and not self._can_prepare_dense_layout()):
-            from .prepared_staged_forward import compile_plan
-
-            self._dense_spec = self._thd_spec = None
-            self._prepared_fp8 = self._prepared_mxfp8 = False
-            self._staged_spec = compile_plan(self)
-            self._compiled_kernel = self._staged_spec.core.owner
-            self._logger.debug("compile completed")
-            return
         params = self.template_params()
         self._k_mod = _load_sm100_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)))
         # Which template serves this plan (its file stem, e.g. "prefill_d256_f16" /
@@ -4286,7 +4285,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         kv_mask=None,
     ) -> None:
         """Dense (padded) launch through the prepared native binder from this call's
-        torch tensors. Conversion plans use the shared staged entry instead; a split writes the
+        torch tensors. A split writes the
         partial slabs and recombines through the plan-time-compiled combine pass.
         ``ragged`` (the decode tile's ragged-Q
         leg): the (Q, O, Stats) ragged-offset tensors; Q / O / Stats then bind AS PASSED (packed, no
@@ -4474,17 +4473,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         holds unused amax and identity-scale words as well as THD metadata.
         """
         self._ensure_support_checked()
-        staged = getattr(self, "_staged_spec", None)
-        if staged is not None:
-            return staged.workspace_bytes
         b, qh = self.batch_size, self.h_q
         compiled = self._compiled_kernel is not None
-        if not compiled and (
-            (self._fp8 and not (self._can_prepare_fp8() or self._can_prepare_mxfp8())) or (not self._fp8 and not self._can_prepare_dense_layout())
-        ):
-            from .prepared_staged_forward import workspace_bytes
-
-            return workspace_bytes(self)
         if (self._prepared_fp8 or self._prepared_mxfp8) if compiled else (self._can_prepare_fp8() or self._can_prepare_mxfp8()):
             return self._prepared_quant_offset() + ws_align(8)
         if self.thd and not self.thd_decode_leg:
@@ -4622,9 +4612,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # Run on the caller's stream (ExecutionContext.stream, resolved from the
         # execute-time handle); None -> the default stream. Threaded to every
         # kernel launch below (dense / fp8 / mxfp8 / THD).
-        explicit_stream = current_stream is not None
-        if getattr(self, "_staged_spec", None) is None:
-            current_stream = self._get_default_stream(current_stream)
+        from cudnn._torch_stream import _raw_current_stream
+
+        if current_stream is None:
+            current_stream = cuda.CUstream(_raw_current_stream(torch, self.q_desc.device))
 
         self._value_error_if(
             self.softmax_scale_prefolded and scale_softmax is not None,
@@ -4723,30 +4714,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             )
             self._value_error_if(_desc is None and _t is not None, f"this specialization was compiled without a {_name}; construct the API with sample_{_name}")
 
-        if getattr(self, "_staged_spec", None) is not None:
-            from .prepared_staged_forward import execute as execute_staged
-
-            self._value_error_if(self._pertensor and any(t is not None for t in (sf_q, sf_k, sf_v)), "per-tensor FP8 does not accept MXFP8 input scales")
-            scales = dict(descale_q=descale_q, descale_k=descale_k, descale_v=descale_v) if self._pertensor else dict(sf_q=sf_q, sf_k=sf_k, sf_v=sf_v)
-            tensors = dict(
-                q=q_tensor,
-                k=k_tensor,
-                v=v_tensor,
-                o=o_tensor,
-                lse=lse_tensor,
-                sinks=sinks,
-                seq_q_lens=seq_q_lens,
-                seq_kv_lens=seq_kv_lens,
-                scale_o=scale_o,
-                amax_o=amax_o,
-                sf_o=sf_o,
-                gate=gate,
-                block_table=block_table,
-                block_table_v=block_table_v,
-                **scales,
-            )
-            execute_staged(self, tensors, workspace, current_stream if explicit_stream else None, scale_val)
-            return
         if getattr(self, "_prepared_fp8", False):
             self._execute_fp8_prepared(
                 q_tensor,
@@ -5705,8 +5672,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
     on the MXFP8 template ``sm120/prefill_mxfp8.py`` (both head dims up to
     256, multiples of 16) or its d512 flavor ``sm120/prefill_d512_mxfp8.py``
     (both head dims in (256, 512], multiples of 16).
-    Native layouts bind through the prepared MXFP8 entry and conversion layouts
-    through the staged forward (the scale tensors bind unchanged). A
+    Supported layouts bind their declared strides through the prepared MXFP8
+    entry; scale tensors bind unchanged and unsupported layouts decline. A
     block-scaled MXFP8 O (E4M3 + UE8M0 per 32, ``sample_sf_o``, with an
     optional global ``sample_scale_o``) is served as on the per-tensor path
     at d128; the FP4 (NVFP4) O is per-tensor only.
@@ -5758,13 +5725,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         # Layout gate (same envelope as SM100): THD keeps the strict BSHD
         # stride order (the varlen path binds (1, T, H, D) views with the
         # DECLARED token/head strides; _thd_check_strides_native declines
-        # what TMA cannot express); dense graphs get the dense_flex
-        # relaxation — execute() normalizes to the kernel's compact-BSHD
-        # storage via the prepared staging plan (zero-copy when already
-        # BSHD-compact, one gather / scatter copy otherwise), so only what
-        # normalization needs is required: head dim innermost-contiguous
-        # (stride 1), non-broadcast, non-overlapping strides, any B/H/S
-        # order, padded strides allowed.
+        # what TMA cannot express). Dense layouts bind their strides directly:
+        # D is innermost with stride 1, B/H/S may use any non-overlapping
+        # nesting, and stepped outer byte pitches must be 16-byte aligned.
         from cudnn.sdpa.graph_analyzer import dense_layout_ok, packed_layout_ok, thd_stats_packing
 
         for desc in (self.q_desc, self.k_desc, self.v_desc, self.o_desc):
@@ -6071,6 +6034,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         self.h_kv = int(h_kv)
         self.head_dim_qk = int(d_q)
         self.head_dim_v = int(d_v)
+        self._check_native_dense_layouts()
         self._is_supported = True
 
         self._logger.debug("check_support completed successfully")
@@ -6082,17 +6046,6 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
-            return
-
-        self._staged_spec = None
-        self._dense_spec = self._thd_spec = None
-        if not self._can_prepare_layout():
-            from .prepared_staged_forward import compile_plan
-
-            self._prepared_fp8 = self._prepared_mxfp8 = False
-            self._staged_spec = compile_plan(self)
-            self._compiled_kernel = self._staged_spec.core.owner
-            self._logger.debug("compile completed")
             return
 
         # None = the standalone-wrapper tier stated no preference: derive the
@@ -6212,13 +6165,17 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         ``sample_sf_o``); its bytes are laid out per the declared geometry.
         On MXFP8, ``scale_o`` is that O's optional global scale (bound exactly
         when constructed with ``sample_scale_o``).
-        Prepared FP8 / MXFP8, half THD, split-KV and dense layout conversions require caller-owned ``workspace``
+        Prepared FP8 / MXFP8, half THD and split-KV require caller-owned ``workspace``
         of at least ``scratch_workspace_bytes()`` bytes, contiguous, 16-byte
         aligned and on the Q device. Graph callers use ``get_workspace_size()``.
         """
 
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaFwdDslSm120 kernel is not compiled")
+        from cudnn._torch_stream import _raw_current_stream, device_context
+
+        if current_stream is None:
+            current_stream = cuda.CUstream(_raw_current_stream(torch, self.q_desc.device))
         self._value_error_if(
             self.o_block_scale > 0 and sf_o is None,
             "sf_o is required by this compiled specialization (block-scaled O)",
@@ -6263,16 +6220,6 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             quant = dict(descale_q=descale_q, descale_k=descale_k, descale_v=descale_v, scale_o=scale_o, amax_o=amax_o, sf_o=sf_o)
         else:
             quant = {}
-        if getattr(self, "_staged_spec", None) is not None:
-            from .prepared_staged_forward import execute as execute_staged
-
-            self._value_error_if(
-                not mxfp8 and any(t is not None for t in (sf_q, sf_k, sf_v)),
-                "SM120 staged forward takes MXFP8 input scales on MXFP8 plans only",
-            )
-            tensors = dict(q=q_tensor, k=k_tensor, v=v_tensor, o=o_tensor, lse=lse_tensor, sinks=sinks, seq_q_lens=seq_q_lens, seq_kv_lens=seq_kv_lens)
-            execute_staged(self, {**tensors, **quant}, workspace, current_stream, scale_val)
-            return
         if self._fp8:
             self._value_error_if(
                 not mxfp8 and any(t is not None for t in (sf_q, sf_k, sf_v)),
@@ -6300,7 +6247,6 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
             current_stream = self._get_default_stream(current_stream)
             stream_int = int(current_stream)
-            _ensure_current_context(stream_int, q_tensor.device.index)
             ws_ptr = 0
             if self.split_kv > 1:
                 if workspace is None:
@@ -6308,14 +6254,17 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 if workspace.device != q_tensor.device or not workspace.is_contiguous():
                     raise ValueError("cudnn.sdpa: split workspace must be contiguous and on the Q tensor's CUDA device")
                 ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm120 (split)")
-            execute_native_dense_tensors(
-                self._dense_spec,
-                (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, sinks, seq_kv_lens, seq_q_lens, None, None, None),
-                current_stream,
-                scale_softmax_log2,
-                ws_ptr,
-            )
+            with device_context(q_tensor.device):
+                _ensure_current_context(stream_int, q_tensor.device.index)
+                execute_native_dense_tensors(
+                    self._dense_spec,
+                    (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, sinks, seq_kv_lens, seq_q_lens, None, None, None),
+                    current_stream,
+                    scale_softmax_log2,
+                    ws_ptr,
+                )
             self._logger.debug("execute completed (prepared dense)")
+            self._logger.debug("execute completed")
             return
         if self.thd:
             self._execute_thd(
@@ -6418,13 +6367,6 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
     def scratch_workspace_bytes(self) -> int:
         self._ensure_support_checked()
         compiled = self._compiled_kernel is not None
-        staged = getattr(self, "_staged_spec", None)
-        if staged is not None:
-            return staged.workspace_bytes
-        if not compiled and not self._can_prepare_layout():
-            from .prepared_staged_forward import workspace_bytes
-
-            return workspace_bytes(self)
         if (self._prepared_fp8 or self._prepared_mxfp8) if compiled else (self._can_prepare_fp8() or self._can_prepare_mxfp8()):
             return self._prepared_quant_offset() + ws_align(8)
         if self.thd:

@@ -1093,9 +1093,7 @@ def test_decode_d128_prepared_rebind_and_capture(s_q, monkeypatch):
 @requires_pre_rubin_blackwell
 @requires_dsl
 def test_dense_f16_plan_is_prepared_and_matches_reference():
-    """A dense bf16 graph declared in BSHD storage executes through the prepared dense launch (no
-    tensor arm, no copies) and reproduces the reference O / LSE; a BHSD-declared graph (a layout the
-    tensor path repacks) keeps the tensor arm."""
+    """Dense BSHD and BHSD graphs both bind through prepared launches and reproduce O / LSE."""
     b, h, hk, s_q, s_kv, d = 2, 8, 2, 256, 512, 128
     g, t = _dense_graph(b, h, hk, s_q, s_kv, d)
     plan = _plan(g)
@@ -1116,7 +1114,7 @@ def test_dense_f16_plan_is_prepared_and_matches_reference():
     torch.testing.assert_close(bufs["o"].float(), o_ref, atol=5e-2, rtol=3e-2)
     torch.testing.assert_close(bufs["lse"].squeeze(-1), lse_ref, atol=5e-2, rtol=3e-2)
     g2, t2 = _dense_graph(b, h, hk, s_q, s_kv, d, bshd_storage=False)
-    assert _plan(g2)._prepared is None, "a BHSD-declared graph is repacked by the tensor path, not bound zero-copy"
+    assert _plan(g2)._prepared is not None and _plan(g2).takes_variant_pack
     bhsd = {n: bufs[n].contiguous() for n in ("q", "k", "v")}
     o2, lse2 = torch.empty(b, h, s_q, d, device=DEV, dtype=torch.bfloat16), torch.empty(b, h, s_q, 1, device=DEV, dtype=torch.float32)
     g2.execute(
@@ -1124,7 +1122,7 @@ def test_dense_f16_plan_is_prepared_and_matches_reference():
         torch.empty(max(g2.get_workspace_size(), 1), device=DEV, dtype=torch.uint8),
     )
     torch.cuda.synchronize()
-    assert torch.equal(o2, bufs["o"]) and torch.equal(lse2, bufs["lse"]), "the prepared dense launch and the tensor arm must agree bit for bit"
+    assert torch.equal(o2, bufs["o"]) and torch.equal(lse2, bufs["lse"]), "native BSHD and BHSD launches must agree bit for bit"
 
 
 @requires_pre_rubin_blackwell

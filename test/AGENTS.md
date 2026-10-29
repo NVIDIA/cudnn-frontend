@@ -391,6 +391,9 @@ uint8 FP4 storage, strided views, optional outputs, and device pointer tables.
 Intercept the compiled consumer for negative tests so intentional aliasing never
 reaches a kernel; prove RED before the fix. Also exercise disjoint slices of one
 allocation so rejecting shared ownership does not substitute for checking overlap.
+For per-operand negative cases, keep other operand ranges clear of the tested
+workspace interval and match the rejection to that operand. Otherwise one
+overlapping fixture can hide missing checks for every other role.
 Device pointer-table contents remain a caller contract, not a reason for a D2H read.
 
 ### fp32 operands and TF32 references
@@ -434,6 +437,15 @@ graph alive, it runs `gc.collect()` between tests and fails that test in
 teardown if the collector freed one. Whether a graph lands in a cycle can
 depend on test order, so a test that passes alone can still trip it in a
 suite.
+
+### Architecture test re-exports
+
+When an architecture test module re-exports shared checks, those checks must
+not import fixtures or reference math back from that architecture module,
+even inside a function. Move shared helpers into a non-`test_` module and
+import them from both sides. CodeQL's cyclic-import check catches the return
+edge; a successful import or collection alone may miss it because the edge
+is lazy. Preserve reference helper ASTs when moving them.
 
 ### Prepared quantized launch probes
 

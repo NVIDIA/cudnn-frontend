@@ -39,6 +39,9 @@ DTYPE = cudnn.data_type.HALF
 def _fake_sm100(monkeypatch):
     """Fake an SM100 device so the device-family gate passes without a real GPU."""
     monkeypatch.setattr(ga, "_device_cc", lambda: (10, 0))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: (10, 0))
     # Pure capability tests also construct Rubin facts on non-Rubin DSL builds.
     from cudnn.frost import buffers
 
@@ -244,13 +247,13 @@ def test_sm120_override_admits_prepared_and_declines_legacy_routes(monkeypatch, 
 
 @pytest.mark.parametrize("d", [128, 256])
 def test_override_filter_preserves_compatible_split_candidates(monkeypatch, d):
-    """A plain-store O may serve split plans even when TMA cannot bind it unsplit."""
+    """Both split and unsplit plans enforce the declared native layout contract."""
     from cudnn.sdpa.fwd import heuristics
 
     graph = _mk_graph(is_override_shape_enabled=True)
     q, k, v, dims, strides = _mk_qkv(graph, d=d)
     o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
-    # Odd token pitch is legal for the combine's ordinary global stores, not TMA.
+    # Native-only admission rejects an unaligned pitch before proposing plans.
     output_strides = (H * S * (d + 1), S * (d + 1), d + 1, 1)
     _finish_output(o, dims, output_strides)
     facts = _facts(graph)
@@ -259,12 +262,12 @@ def test_override_filter_preserves_compatible_split_candidates(monkeypatch, d):
     from dataclasses import replace
 
     split = replace(unsplit, split_kv=2)
-    assert engines.analyze_for(spec, graph)[1] is None  # provider has a compatible plan
+    assert "16-byte" in engines.analyze_for(spec, graph)[1]
     assert engines.analyze_for(spec, graph, unsplit)[1] is not None
-    assert engines.analyze_for(spec, graph, split)[1] is None
+    assert engines.analyze_for(spec, graph, split)[1] is not None
     monkeypatch.setattr(heuristics, "_knob_sets", lambda *_: [unsplit, split])
     plans = heuristics.recommend("A", facts, {spec.name: 20511})
-    assert [p.knobs for p in plans] == [split]
+    assert plans == []
     # Restore a TMA-bindable output: both contracts become eligible, regardless of ranking.
     o.set_stride(strides)
     fresh = ga.analyze(graph)
@@ -1401,7 +1404,7 @@ def test_sm107_small_tile_row_accepts_the_bias_and_kv_mask_in_their_served_forms
     po, _ = pad.sdpa(name="s", q=pq, k=pk, v=pv, attn_scale=0.1, is_inference=True, kv_mask=pm)
     _finish_output(po, (B, H, S, d), (S * H * d, d, H * d, 1), dtype=dt)
     why = engines.mismatch(caps, _facts(pad))
-    assert why is not None and "prepared launch" in why and "bind without a copy" in why, why
+    assert why is not None and "q:" in why and "16-byte" in why, why
 
 
 def test_additive_kv_mask_needs_a_whole_granule_extent(monkeypatch):
@@ -2891,29 +2894,23 @@ def test_gate_tail_declines_a_broadcast_g_and_an_undeclared_o_v(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "gate_strides",
-    [(H * S * _D256, S * _D256, _D256, 1), (S * H * 260, 260, H * 260, 1)],
+    "gate_strides,accepted",
+    [((H * S * _D256, S * _D256, _D256, 1), True), ((S * H * 260, 260, H * 260, 1), False)],
     ids=["head-major", "unaligned-head-stride"],
 )
-def test_gate_tail_declines_a_g_the_kernel_cannot_tma_load(monkeypatch, gate_strides):
-    """G is TMA-loaded ZERO-COPY by the fused kernel (Q/K/V/O have a normalisation
-    copy in the lowering; G has none), so a rank-4, O-SHAPED G whose strides TMA
-    cannot express -- head-major (the seq stride does not cover the heads), or a
-    head stride that is not a 16-byte multiple -- is a legal graph that the tail
-    matcher recognises, ``epilogue_gate_layout_ok`` records as False, and the
-    row declines naming the zero-copy rule.  This is the analyzer half of the
-    adapter's ``TMA-expressible`` ValueError (rule 8b): without it the row
-    would admit a G ``check_support`` then rejects."""
+def test_gate_tail_uses_native_dense_stride_contract(monkeypatch, gate_strides, accepted):
+    """Aligned head-major gates bind directly; unaligned pitches decline early."""
     _rubin(monkeypatch)
     spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
     g, ts = _mk_gated_graph(gate_strides=gate_strides)
     facts = _facts(g)
     assert facts.has_epilogue_gate is True and facts.epilogue_gate_t is ts["gate"]
-    assert facts.epilogue_gate_shape_ok is True, "the shape is O's -- only the LAYOUT is at fault"
-    assert facts.epilogue_gate_layout_ok is False
-    assert not _eligible(g)
-    assert "zero-copy" in engines.analyze_for(spec, g)[1]
-    # The same G declared BSHD-compact is served: the layout fact is the only difference.
+    assert facts.epilogue_gate_shape_ok is True
+    assert facts.epilogue_gate_layout_ok is accepted
+    reason = engines.analyze_for(spec, g)[1]
+    assert (reason is None) is accepted
+    if not accepted:
+        assert "zero-copy" in reason
     assert _eligible(_mk_gated_graph()[0]) == {"sdpa_fwd_prefill_sm107"}
 
 
@@ -3144,12 +3141,14 @@ def test_prepared_mxfp8_override_contract(thd, override, split, accepted, rubin_
 MXFP8_ENGINE = engines.engine_name(mxfp8=True)
 
 
-def _mk_paged_mxfp8(*, page=128, max_pages=8, d=256, kh=2, s_q=1, thd=False, v_nhd=False, q_bhsd=False, dtype=cudnn.data_type.FP8_E4M3):
+def _mk_paged_mxfp8(*, page=128, max_pages=8, d=256, kh=2, s_q=1, thd=False, v_nhd=False, q_bhsd=False, dtype=cudnn.data_type.FP8_E4M3, q_unaligned=False):
     """sdpa_mxfp8 over HND page pools + pool-shaped descales."""
     g = cudnn.pygraph(io_data_type=dtype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     num_pages = B * max_pages + 3
     q_dims = (B, H, s_q, d)
     q_strides = (H * s_q * d, s_q * d, d, 1) if q_bhsd else (s_q * H * d, d, H * d, 1)
+    if q_unaligned:
+        q_strides = (H * s_q * (d + 1), s_q * (d + 1), d + 1, 1)
     pool_dims = (num_pages, kh, page, d)
     hnd = (kh * page * d, page * d, d, 1)
     nhd = (page * kh * d, d, kh * d, 1)
@@ -3218,8 +3217,9 @@ def test_paged_mxfp8_probe_accepts_and_declines():
     assert reason is not None and "multiple of 128" in reason, reason
     reason = _mxfp8_reason(_mk_paged_mxfp8(thd=True))
     assert reason is not None and "THD" in reason, reason
-    reason = _mxfp8_reason(_mk_paged_mxfp8(q_bhsd=True, s_q=4))  # s_q > 1: at s_q == 1 the two layouts coincide
-    assert reason is not None and "BSHD" in reason, reason
+    assert _mxfp8_reason(_mk_paged_mxfp8(q_bhsd=True, s_q=4)) is None
+    reason = _mxfp8_reason(_mk_paged_mxfp8(q_unaligned=True, s_q=4))
+    assert reason is not None and "16-byte outer-stride alignment" in reason, reason
 
 
 def test_paged_mxfp8_accepts_mixed_pool_layouts():

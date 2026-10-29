@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""MXFP8 conversion plans preserve opaque scale buffers and current bindings."""
+"""MXFP8 native stride plans preserve opaque scale buffers and current bindings."""
 
 import pytest
 import torch
@@ -16,7 +16,7 @@ _FLAVORS = [(128, 128), (192, 128), (256, 256), (512, 512)]
 def _case(d, dv, *, b=2, output_dtype=torch.bfloat16, split=1, stats=True, amax=True):
     cc = torch.cuda.get_device_capability()
     if cc[0] not in (10, 12):
-        pytest.skip("SM100/SM103/SM107/SM120 MXFP8 conversion path")
+        pytest.skip("SM100/SM103/SM107/SM120 MXFP8 native stride path")
     if cc == (10, 7) and split > 1:
         pytest.skip("SM107 MXFP8 does not serve split KV")
     _, _, _, buffers, _ = _native_case(
@@ -34,7 +34,7 @@ def _case(d, dv, *, b=2, output_dtype=torch.bfloat16, split=1, stats=True, amax=
     for role in ("q", "k", "v", "o"):
         t = buffers[role]
         b, h, s, dim = t.shape
-        raw = torch.full((b, s, h, dim + 1), 11, device=t.device, dtype=t.dtype)
+        raw = torch.full((b, s, h, dim + 16), 11, device=t.device, dtype=t.dtype)
         view = raw[..., :dim].transpose(1, 2)
         if role != "o":
             view.copy_(t)
@@ -47,7 +47,7 @@ def _case(d, dv, *, b=2, output_dtype=torch.bfloat16, split=1, stats=True, amax=
         pertensor_fp8=False,
     )
     assert api.check_support()
-    assert not api._can_prepare_mxfp8()
+    assert api._can_prepare_mxfp8()
     return api, buffers, storage
 
 
@@ -61,17 +61,19 @@ def _execute(api, buffers, workspace, stream=None):
 
 
 @pytest.mark.parametrize("d,dv", _FLAVORS)
-def test_mxfp8_staged_uses_pointer_host_and_current_scales(d, dv, monkeypatch):
+def test_mxfp8_native_uses_pointer_host_and_current_scales(d, dv, monkeypatch):
     import cutlass.cute as cute
-    from sdpa.frost.native_binding_utils import forbid_python_forward_binding
+    from test_sdpa_bwd_staged_sm80 import _assert_kernel_count
+    from sdpa.frost.native_binding_utils import compact_forward_kernel_count, forbid_python_forward_binding
 
     api, buffers, storage = _case(d, dv)
-    monkeypatch.setattr(cute.runtime, "make_fake_tensor", lambda *a, **k: pytest.fail("MXFP8 conversion constructed a tensor fake"))
-    monkeypatch.setattr(cute.runtime, "make_fake_compact_tensor", lambda *a, **k: pytest.fail("MXFP8 conversion constructed a compact tensor fake"))
+    monkeypatch.setattr(cute.runtime, "make_fake_tensor", lambda *a, **k: pytest.fail("MXFP8 native entry constructed a tensor fake"))
+    monkeypatch.setattr(cute.runtime, "make_fake_compact_tensor", lambda *a, **k: pytest.fail("MXFP8 native entry constructed a compact tensor fake"))
     required = api.scratch_workspace_bytes()
     api.compile()
-    assert api._staged_spec is not None
-    assert api._staged_spec.core.native is not None
+    assert not hasattr(api, "_staged_spec")
+    assert api._dense_spec.native is not None
+    expected_kernels = compact_forward_kernel_count(api, buffers, _execute)
     forbid_python_forward_binding(monkeypatch)
     assert api.scratch_workspace_bytes() == required
     for offset in (128, 256):
@@ -80,10 +82,11 @@ def test_mxfp8_staged_uses_pointer_host_and_current_scales(d, dv, monkeypatch):
         workspace = backing[offset : offset + required + 1]
         _execute(api, buffers, workspace)
         _check(buffers, thd=False)
-        graph = torch.cuda.CUDAGraph()
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
         try:
             with torch.cuda.graph(graph):
                 _execute(api, buffers, workspace)
+            _assert_kernel_count(graph, expected_kernels)
             _change_scales(buffers)
             buffers["o"].fill_(float("nan"))
             graph.replay()
@@ -97,7 +100,7 @@ def test_mxfp8_staged_uses_pointer_host_and_current_scales(d, dv, monkeypatch):
 
 @pytest.mark.parametrize("d,dv", _FLAVORS)
 @pytest.mark.parametrize("split", [1, 4])
-def test_mxfp8_staged_fp8_output_without_optional_outputs(d, dv, split):
+def test_mxfp8_native_fp8_output_without_optional_outputs(d, dv, split):
     from cuda.bindings import driver
 
     api, buffers, _ = _case(d, dv, output_dtype=torch.float8_e4m3fn, split=split, stats=False, amax=False)
@@ -122,7 +125,7 @@ def test_mxfp8_staged_fp8_output_without_optional_outputs(d, dv, split):
 
 @pytest.mark.parametrize("role", ["sf_q", "sf_k", "sf_v"])
 @pytest.mark.parametrize("bad", ["missing", "short", "gapped", "device", "workspace_alias"])
-def test_mxfp8_staged_sf_rejects_before_copy(role, bad, monkeypatch):
+def test_mxfp8_native_sf_rejects_before_launch(role, bad, monkeypatch):
     api, buffers, _ = _case(128, 128)
     api.compile()
     workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
@@ -136,19 +139,19 @@ def test_mxfp8_staged_sf_rejects_before_copy(role, bad, monkeypatch):
     elif bad == "device":
         buffers[role] = torch.empty(original.shape, dtype=original.dtype)
     else:
+        workspace = torch.empty(max(workspace.numel(), original.numel()), device="cuda", dtype=torch.uint8)
         buffers[role] = workspace[: original.numel()].view(original.dtype).view(original.shape)
-    from cudnn.sdpa.fwd import prepared_staged_forward
+    from sdpa.frost.native_binding_utils import assert_rejected_without_writes, forbid_native_forward_launch, intercept_native_forward
 
-    monkeypatch.setattr(prepared_staged_forward, "_copy", lambda *a, **k: pytest.fail("invalid operand reached a prepared staging copy"))
-    monkeypatch.setattr(torch.Tensor, "copy_", lambda *a, **k: pytest.fail("invalid SF reached a staging copy"))
-    with pytest.raises(ValueError):
-        _execute(api, buffers, workspace)
+    monkeypatch.setattr(torch.Tensor, "copy_", lambda *a, **k: pytest.fail("invalid SF reached a copy"))
+    forbid_native_forward_launch(monkeypatch, api._dense_spec)
+    assert_rejected_without_writes(lambda: _execute(api, buffers, workspace), [buffers.get(n) for n in ("o", "lse", "amax_o")], workspace)
 
 
 @pytest.mark.gpu_exclusive
 @pytest.mark.parametrize("d,dv", _FLAVORS)
 @pytest.mark.parametrize("role,product", [("q", False), ("o", True)])
-def test_mxfp8_staged_physical_wide_batch_stride(d, dv, role, product):
+def test_mxfp8_native_physical_wide_batch_stride(d, dv, role, product):
     api, buffers, _ = _case(d, dv, b=4 if product else 2)
     api.compile()
     original = buffers[role]
@@ -179,7 +182,7 @@ def test_mxfp8_staged_physical_wide_batch_stride(d, dv, role, product):
 
 @pytest.mark.parametrize("d", [128, 192])
 @pytest.mark.parametrize("amax", [False, True])
-def test_staged_pv_bf16_keeps_v_width_and_omits_sf_v(d, amax, monkeypatch):
+def test_native_pv_bf16_keeps_v_width_and_omits_sf_v(d, amax, monkeypatch):
     from sdpa.frost.test_sdpa_prepared_pv_bf16 import _case as pv_case, _check as pv_check
     from sdpa.frost.native_binding_utils import forbid_python_forward_binding
 
@@ -187,7 +190,7 @@ def test_staged_pv_bf16_keeps_v_width_and_omits_sf_v(d, amax, monkeypatch):
     for role in ("q", "k", "v", "o"):
         tensor = buffers[role + "_tensor"]
         b, h, seq, dim = tensor.shape
-        storage = torch.empty((b, seq, h, dim + 1), device="cuda", dtype=tensor.dtype)
+        storage = torch.empty((b, seq, h, dim + 16), device="cuda", dtype=tensor.dtype)
         view = storage[..., :dim].transpose(1, 2)
         view.copy_(tensor)
         buffers[role + "_tensor"] = view
@@ -200,10 +203,10 @@ def test_staged_pv_bf16_keeps_v_width_and_omits_sf_v(d, amax, monkeypatch):
     )
     assert api.check_support()
     api.compile()
-    assert api._staged_spec.core.native is not None
+    assert api._dense_spec.native is not None
     forbid_python_forward_binding(monkeypatch)
-    assert len(api._staged_spec.core.quant.sf_sizes) == 2
-    assert api._staged_spec.core.quant.has_amax == amax
+    assert len(api._dense_spec.quant.sf_sizes) == 2
+    assert api._dense_spec.quant.has_amax == amax
     workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
     api.execute(**buffers, workspace=workspace)
     pv_check(buffers, scales)
@@ -220,9 +223,9 @@ def test_staged_pv_bf16_keeps_v_width_and_omits_sf_v(d, amax, monkeypatch):
 
 
 @pytest.mark.parametrize("d,dv", _FLAVORS)
-def test_mxfp8_staged_artifact_reloads_without_jit(d, dv, tmp_path):
+def test_mxfp8_native_artifact_reloads_without_jit(d, dv, tmp_path):
     if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("SM100/SM103/SM107 MXFP8 conversion path")
+        pytest.skip("SM100/SM103/SM107 MXFP8 native stride path")
     import json
     import os
     from pathlib import Path
@@ -239,15 +242,15 @@ from cudnn.frost import compiled_cache
 folder, package, d, dv, reload = sys.argv[1:]
 assert Path(cudnn.__file__).resolve() == Path(package).resolve(), cudnn.__file__
 sys.path[:0] = [folder, str(Path(folder).parents[1])]
-from test_sdpa_staged_forward_mxfp8 import _case, _execute, _check
+from native_forward_mxfp8_cases import _case, _execute, _check
 if reload == "1":
     def forbidden(*args, **kwargs):
-        raise AssertionError("reloaded staged artifact invoked JIT")
+        raise AssertionError("reloaded native artifact invoked JIT")
     cute.compile = forbidden
 api, tensors, storage = _case(int(d), int(dv))
 workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
 api.compile()
-owner = api._staged_spec.core.owner
+owner = api._dense_spec.owner
 if reload == "1":
     assert hasattr(owner, "_compiled_cache_raw")
 _execute(api, tensors, workspace)
@@ -286,14 +289,14 @@ print(json.dumps(dict(digest=digest, stats=compiled_cache.stats())))
 
 @pytest.mark.parametrize("block", [16, 32])
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
-def test_mxfp8_staged_block_output_matches_native_graph(block, dtype):
+def test_mxfp8_native_block_output_matches_native_graph(block, dtype):
     from test_sdpa_prepared_block_output import _fp8_case
 
     reference = _fp8_case(block, mxfp8=True, dtype=dtype, stats=True)
-    staged = _fp8_case(block, mxfp8=True, dtype=dtype, stats=True, staged=True)
+    strided = _fp8_case(block, mxfp8=True, dtype=dtype, stats=True, strided=True)
     ref_g, ref_vp, ref_ws, ref_o, ref_sf, ref_amax, ref_ts = reference
-    g, vp, ws, output, sf, amax, ts = staged
-    assert g.get_workspace_size() > ref_g.get_workspace_size()
+    g, vp, ws, output, sf, amax, ts = strided
+    assert g.get_workspace_size() == ref_g.get_workspace_size()
 
     def check():
         torch.testing.assert_close(output, ref_o, rtol=0, atol=0)
@@ -343,15 +346,15 @@ def test_mxfp8_compile_cli_uses_prepared_entry(rubin, d, monkeypatch):
     assert calls == [True]
 
 
-@pytest.mark.parametrize("converted", ["q", "k", "v", "o"])
-def test_sm107_d256_mxfp8_staging_preserves_each_native_operand(converted, monkeypatch):
+@pytest.mark.parametrize("padded_roles", ["q", "k", "v", "o"])
+def test_sm107_d256_mxfp8_strided_preserves_each_native_operand(padded_roles, monkeypatch):
     if torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("SM107 D256 mixed-layout contract")
-    from cudnn.sdpa.fwd import prepared_staged_forward
+    from sdpa.frost.native_binding_utils import assert_rejected_without_writes, forbid_native_forward_launch, intercept_native_forward
 
     _, tensors, storage = _case(256, 256)
     for role in ("q", "k", "v", "o"):
-        if role == converted:
+        if role == padded_roles:
             continue
         t = tensors[role]
         b, h, s, d = t.shape
@@ -363,22 +366,19 @@ def test_sm107_d256_mxfp8_staging_preserves_each_native_operand(converted, monke
         **{"sample_" + n: tensors[n] for n in ("q", "k", "v", "o", "lse")}, pertensor_fp8=False, sample_amax_o=tensors["amax_o"], has_amax_o=True
     )
     assert api.check_support()
-    compact, operands, regions, required = prepared_staged_forward._layout(api)
-    assert [r[0] for r in regions] == [converted], "native operands must not acquire conversion copies"
+    required = api.scratch_workspace_bytes()
     api.compile()
-    assert [r[0] for r in api._staged_spec.regions] == [converted]
+    assert api._dense_spec.native is not None and not hasattr(api, "_staged_spec")
     assert api.scratch_workspace_bytes() == required
     workspace = torch.empty(required, device="cuda", dtype=torch.uint8)
-    execute = prepared_staged_forward._bind_core
     seen = []
 
-    def launch(spec, facts, *args, **kwargs):
+    def inspect(frame):
         for role in ("q", "k", "v", "o"):
-            assert (facts[role].ptr == tensors[role].data_ptr()) == (role != converted)
+            assert frame[role + "_ptr"] == tensors[role].data_ptr()
         seen.append(True)
-        return execute(spec, facts, *args, **kwargs)
 
-    monkeypatch.setattr(prepared_staged_forward, "_bind_core", launch)
+    intercept_native_forward(monkeypatch, api._dense_spec, inspect)
     _execute(api, tensors, workspace)
     _check(tensors, thd=False)
     for role in ("q", "k", "v", "o"):
