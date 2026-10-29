@@ -3141,8 +3141,10 @@ def test_e2e_quant_scale_k_padding_is_zeroed_sm120(grouped, swap_ab) -> None:
     for the feature-axis quant: N=160 has 5 scale blocks, so every routed row's
     three padding slots must come out 0 from a 0xFF buffer, in the global blob and
     in the per-group segmented one (each group starts a fresh 128-row atom)."""
+    from gemm_test_utils import skip_unless_pipeline_active
     from test_moe_grouped_matmul_fwd import _f8_128x4_logical
 
+    skip_unless_pipeline_active(by_name(_SM120_BS_CFG))  # the sm100 tree's quant chunk check declines this config before its family check
     E, S, N, K, bs = 2, 300, 160, 256, 32
     offsets_list = [0, 100, 100, 220, S]
     num_groups, sf_k, blocks = len(offsets_list) - 1, K // bs, N // bs
