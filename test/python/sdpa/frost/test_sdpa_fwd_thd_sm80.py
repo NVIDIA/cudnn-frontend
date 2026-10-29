@@ -734,31 +734,34 @@ def test_graph_thd_independent_pitches_rebind_replay(d, dv, stats_layout):
     poison()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
-    handle = cudnn.create_handle()
-    previous_stream = cudnn.get_stream(handle)
+    captured = torch.cuda.CUDAGraph(keep_graph=True)
     try:
-        cudnn.set_stream(handle, stream.cuda_stream)
-        captured = torch.cuda.CUDAGraph(keep_graph=True)
-        with torch.cuda.graph(captured, stream=stream):
-            graph.execute(vp, workspace, handle=handle)
-        _assert_kernel_count(captured, 2)  # device lengths metadata + attention, no layout copies
+        handle = cudnn.create_handle()
+        previous_stream = cudnn.get_stream(handle)
+        try:
+            cudnn.set_stream(handle, stream.cuda_stream)
+            with torch.cuda.graph(captured, stream=stream):
+                graph.execute(vp, workspace, handle=handle)
+            _assert_kernel_count(captured, 2)  # device lengths metadata + attention, no layout copies
+        finally:
+            cudnn.set_stream(handle, previous_stream)
+            cudnn.destroy_handle(handle)
+        new_q, new_kv = (0, 25, 25), (26, 0, 41)
+        for node in vp:
+            name = node.get_name()
+            if name in ("seq_len_q", "seq_len_kv"):
+                vp[node].copy_(torch.tensor(new_q if name == "seq_len_q" else new_kv, dtype=torch.int32, device="cuda").view_as(vp[node]))
+            elif name.endswith("_ro"):
+                lengths = new_kv if name in ("k_ro", "v_ro") else new_q
+                prefix = [0, lengths[0], lengths[0] + lengths[1], sum(lengths)]
+                data_node = next((n for n in (q, k, v, o) if n.get_name() + "_ro" == name), None)
+                pitch = data_node.get_stride()[2] if data_node is not None else (4 if stats_layout == "token_major" else 1)
+                vp[node].copy_(torch.tensor(prefix, dtype=torch.int64, device="cuda").view_as(vp[node]) * pitch)
+        captured.replay()
+        torch.cuda.synchronize()
+        check(new_q, new_kv)
     finally:
-        cudnn.set_stream(handle, previous_stream)
-        cudnn.destroy_handle(handle)
-    new_q, new_kv = (0, 25, 25), (26, 0, 41)
-    for node in vp:
-        name = node.get_name()
-        if name in ("seq_len_q", "seq_len_kv"):
-            vp[node].copy_(torch.tensor(new_q if name == "seq_len_q" else new_kv, dtype=torch.int32, device="cuda").view_as(vp[node]))
-        elif name.endswith("_ro"):
-            lengths = new_kv if name in ("k_ro", "v_ro") else new_q
-            prefix = [0, lengths[0], lengths[0] + lengths[1], sum(lengths)]
-            data_node = next((n for n in (q, k, v, o) if n.get_name() + "_ro" == name), None)
-            pitch = data_node.get_stride()[2] if data_node is not None else (4 if stats_layout == "token_major" else 1)
-            vp[node].copy_(torch.tensor(prefix, dtype=torch.int64, device="cuda").view_as(vp[node]) * pitch)
-    captured.replay()
-    torch.cuda.synchronize()
-    check(new_q, new_kv)
+        captured.reset()
 
 
 def test_graph_thd_rejects_undersized_workspace():
