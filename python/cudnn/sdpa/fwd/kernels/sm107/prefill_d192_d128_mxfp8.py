@@ -128,16 +128,6 @@ DESC_VERSION: int = 0
 # Measured: +9.4 % @ S=32K dense H128 with the ring waits alone (the largest win of the family), +6.5 / +1.2 % @8K
 # dense / causal and +1.6 % @2K with the predicated credit arrive.
 SPIN_RING_WAITS: bool = True
-# CGA1 would put all four SF tiles past the 256 KiB version-0 descriptor window
-# (see the module docstring).  Structural invariant -> import-time raise, per the
-# engine contract; a graph cannot reach it because the Rubin MXFP8 row leaves
-# (192, 128) on the default cgas={2}.
-if CFG.CTA_MMA != 2:
-    raise ValueError(
-        f"prefill_d192_d128_mxfp8_sm107: CTA_MMA must be 2 (got {CFG.CTA_MMA}); at cga1 the "
-        f"scale-factor tiles start past the 256 KiB version-0 tcgen05 descriptor window and the "
-        f"UTCCP would read Q data as scale factors (LSE=+inf, O=NaN on every cell)"
-    )
 Cfg = type(CFG)
 TMA_QK_ITERS = _TMA.QK_ITERS
 TMA_VO_ITERS = _TMA.VO_ITERS
@@ -492,7 +482,6 @@ def _smem_offset_of_ones() -> int:
         CFG.TILES_Q * CFG.TILE_M * CFG.TILE_K * CFG.BPE,  # sQ
         CFG.STAGES_KV * (CFG.TILE_N * CFG.TILE_K // CFG.CTA_MMA) * CFG.BPE,  # sK
         CFG.STAGES_KV * (CFG.TILE_O * CFG.TILE_N // CFG.CTA_MMA) * CFG.BPE,  # sV
-        CFG.TILES_Q * CFG.TILE_M * CFG.TILE_O * CFG.BPE_O,  # sO
         CFG.TILES_Q * SF_SMEM_SIZE_Q,  # sQ_SF
         CFG.STAGES_KV * SF_SMEM_SIZE_K,  # sK_SF
         CFG.STAGES_KV * SF_SMEM_SIZE_P,  # sP_SF
@@ -586,7 +575,6 @@ def _kernel(
     sQ_raw = cutlass.Array(STORAGE_DTYPE, CFG.TILES_Q * qBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
     sK_raw = cutlass.Array(STORAGE_DTYPE, CFG.STAGES_KV * kBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
     sV_raw = cutlass.Array(STORAGE_DTYPE, CFG.STAGES_KV * vBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
-    sO_raw = cutlass.Array(OUT_STORAGE_DTYPE, CFG.TILES_Q * oBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
 
     # SF buffers sized in BYTES (uint8 storage).
     sQ_SF_raw = cutlass.Array(cutlass.Int8, CFG.TILES_Q * SF_SMEM_SIZE_Q, alignment=1024, space=cutlass.AddressSpace.smem)
@@ -595,9 +583,10 @@ def _kernel(
     sV_SF_raw = cutlass.Array(cutlass.Int8, CFG.STAGES_KV * SF_SMEM_SIZE_V, alignment=1024, space=cutlass.AddressSpace.smem)
     # Constant all-ones B tile for the row-sum MMA — the per-CTA N-half of
     # N=16 (_ONES_ROWS) x _ONES_ROW_BYTES, K-major like a K stage; written once
-    # at init, never touched by TMA.  LAST slab: _smem_offset_of_ones() above
-    # computes this same declaration order and guards the descriptor window.
+    # at init, never touched by TMA.  Last tcgen05 operand slab: _smem_offset_of_ones() above computes this same
+    # declaration order and guards the descriptor window; the O slab follows it.
     sOnes_raw = cutlass.Array(STORAGE_DTYPE, _ONES_ROWS * _ONES_ROW_BYTES, alignment=1024, space=cutlass.AddressSpace.smem)
+    sO_raw = cutlass.Array(OUT_STORAGE_DTYPE, CFG.TILES_Q * oBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
 
     sQ = SmemTile(
         base=sQ_raw,

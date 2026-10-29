@@ -1257,6 +1257,8 @@ def native_d192_paged_leg(capabilities: Capabilities, facts: "ga.SdpaGraphFacts"
         cga=knobs.cga if knobs is not None else None,
         split_kv=(knobs.split_kv or 1) if knobs is not None else 1,
     )
+
+
 # K/V bytes of a graph (B x KV heads x S_kv x (d_qk + d_v), one byte per element) up to which the single-CTA per-tensor fp8
 # d128 / d192x128 builds are listed on the 107 line.
 _SM107_D192_PT_CGA1_KV_BYTES_MAX = 96 * 1024 * 1024
@@ -1292,18 +1294,17 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
         return frozenset({1, 2})
     if (
         capabilities.sm_lo == 107
-        and capabilities.is_fp8
-        and not capabilities.is_mxfp8
+        and (capabilities.is_fp8 or capabilities.is_mxfp8)
         and selected == (192, 128)
         and not facts.thd
         and not facts.has_paged_kv
         and (split_kv or 1) == 1
         and facts.causal
         and int(facts.h_q) == int(facts.h_kv)
-        and facts.dtype_o in (cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2)
+        and (capabilities.is_mxfp8 or facts.dtype_o in (cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2))
         and int(facts.b) * int(facts.h_kv) * int(facts.s_kv) * (int(facts.d_qk) + int(facts.d_v)) <= _SM107_D192_PT_CGA1_KV_BYTES_MAX
     ):
-        # Per-tensor fp8 d192x128 on the 107 line, dense unsplit MHA under a causal band with an fp8 O: both widths.
+        # Quantized d192x128 on the 107 line, dense unsplit MHA under a causal band (fp8 O for the per-tensor kernel): both widths.
         return frozenset({1, 2})
     if (
         capabilities.sm_lo == 107
