@@ -1263,7 +1263,7 @@ def test_DSA_sparse_attention_backward_sm100_h96_d576_unaligned_topk_widths(topk
         from cuda.bindings import driver as cuda
         from cudnn import DSA
     except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+        return pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     s_q, s_kv = 4, topk + 17
     num_heads, head_dim = 96, 576
