@@ -224,6 +224,16 @@ def test_dense_staged_pointer_launch_and_rope_replay(d, dv, rope, dtype, monkeyp
         return original(*args, **kwargs)
 
     monkeypatch.setattr(module, entry, staged_call)
+    from cudnn.sdpa.fwd import prepared_sm80
+
+    native_calls = []
+    native_execute = prepared_sm80.execute_tensors
+
+    def native_call(*args, **kwargs):
+        native_calls.append(True)
+        return native_execute(*args, **kwargs)
+
+    monkeypatch.setattr(prepared_sm80, "execute_tensors", native_call)
 
     def run():
         return sdpa_fwd_wrapper_sm80(q, k, v, is_causal=True, rope_freqs=freqs)
@@ -246,7 +256,10 @@ def test_dense_staged_pointer_launch_and_rope_replay(d, dv, rope, dtype, monkeyp
         torch.testing.assert_close(out["lse_tensor"].double(), stats, rtol=0.002, atol=0.002)
 
     check(run())
-    assert calls, "the dense off-flavor/RoPE case must exercise the staged entry"
+    if rope:
+        assert calls, "RoPE must exercise its retained prepared entry"
+    else:
+        assert native_calls and not calls, "aligned padded widths must use the native entry without copies"
     import cutlass.cute.runtime as runtime
 
     def forbid_dlpack(*args, **kwargs):
@@ -346,14 +359,17 @@ assert Path(cudnn.__file__).resolve() == Path(package).resolve(), cudnn.__file__
 assert torch.cuda.get_device_capability() == (8, 0)
 sys.path.insert(0, tests)
 from test_sdpa_sm80_thd_forward_prepared import test_dense_staged_pointer_launch_and_rope_replay
-from cudnn.sdpa.fwd import prepared_staged_sm80
-module, entry = prepared_staged_sm80, "compile_plan"
+from cudnn.sdpa.fwd import prepared_staged_sm80, prepared_sm80
+module, entry = (prepared_staged_sm80, "compile_plan") if rope == "1" else (prepared_sm80, "build_spec")
 original = getattr(module, entry)
 artifacts = []
-def record(*args):
-    result = original(*args)
-    artifacts.append(result.core.artifact)
-    artifacts.extend(c[0] for c in result.copies if c is not None)
+def record(*args, **kwargs):
+    result = original(*args, **kwargs)
+    if rope == "1":
+        artifacts.append(result.core.artifact)
+        artifacts.extend(c[0] for c in result.copies if c is not None)
+    else:
+        artifacts.append(result.artifact)
     return result
 with pytest.MonkeyPatch.context() as patch:
     patch.setattr(module, entry, record)

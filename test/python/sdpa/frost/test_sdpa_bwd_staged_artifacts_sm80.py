@@ -29,7 +29,7 @@ from pathlib import Path
 import torch, cudnn
 import cutlass.cute as cute
 from cudnn.frost import compiled_cache
-from cudnn.sdpa.bwd import staged_sm80
+from cudnn.sdpa.bwd import staged_sm80, prepared_sm80
 tests, package, route, reload = sys.argv[1:]
 assert Path(cudnn.__file__).resolve() == Path(package).resolve(), cudnn.__file__
 sys.path[:0] = [tests, str(Path(tests).parents[1])]
@@ -46,6 +46,12 @@ def record(api, *args, **kwargs):
         artifacts.extend(entry[1] for _, _, entries in auxiliary for entry in entries)
     return spec
 staged_sm80.compile_staged = record
+original_native = prepared_sm80.build_spec
+def record_native(*args, **kwargs):
+    spec = original_native(*args, **kwargs)
+    artifacts.append(spec.artifact)
+    return spec
+prepared_sm80.build_spec = record_native
 if reload == "1":
     def forbidden(*args, **kwargs):
         raise AssertionError("fresh-process staged backward invoked JIT")

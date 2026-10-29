@@ -13,6 +13,16 @@ from .prepared import ATTRIBUTES, BwdLaunchSpec, Operand, ROLES, execute
 RO_ROLES = ("ragged_q", "ragged_k", "ragged_v", "ragged_o", "ragged_do", "ragged_dq", "ragged_dk", "ragged_dv", "ragged_stats")
 
 
+def stats_storage_facts(tensor, fact, operand):
+    """Keep the standalone declared-stride binding without rebuilding a view."""
+    if fact.span < operand.span:
+        available = tensor.untyped_storage().nbytes() // tensor.element_size() - tensor.storage_offset()
+        if available < operand.span:
+            raise ValueError("sdpa_bwd_sm80: stats backing storage is too small for the declared strides")
+        fact = fact._replace(span=operand.span)
+    return fact
+
+
 def native_layouts(api):
     """Select native vector-aligned operands with complete declarations."""
     from cudnn.sdpa.graph_analyzer import dense_layout_ok
@@ -202,6 +212,8 @@ def execute_tensors(api, tensors, workspace, stream, scale, ro_tensors=()):
                 raise ValueError("THD stats must match the declared packed layout")
         elif stats.numel != api.batch_size * api.h_q * api.s_q_max or (api._lse_stride is None and not stats.contiguous):
             raise ValueError("stats must match the declared element count and storage layout")
+        if not api.thd:
+            facts["stats"] = stats_storage_facts(tensors[5], stats, spec.operands[5])
     # Stats has always been a storage binding: compact plans accept flat buffers,
     # and strided plans reinterpret the declared strides after checking capacity.
     geometry = tuple((op.shape, op.strides) if op is not None and i < 9 and i != 5 else None for i, op in enumerate(spec.operands))

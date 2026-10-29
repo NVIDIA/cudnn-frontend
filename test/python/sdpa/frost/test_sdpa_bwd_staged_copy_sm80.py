@@ -214,19 +214,48 @@ def test_staged_copies_follow_handle_stream():
         cudnn.destroy_handle(handle)
 
 
-def test_staged_stats_preserves_declared_storage_view():
+def _use_unaligned_q(case):
+    q = case.bufs["q"]
+    case.bufs["q"] = torch.empty((*q.shape[:-1], q.shape[-1] + 1), dtype=q.dtype, device=q.device)[..., :-1].copy_(q)
+
+
+@pytest.mark.parametrize("valid_capacity", [True, False])
+@pytest.mark.parametrize("native", [True, False])
+def test_staged_stats_preserves_declared_storage_view(valid_capacity, native, monkeypatch):
     case = _case(96, 80)
+    if not native:
+        _use_unaligned_q(case)
     api, workspace = _adapter(case)
+    assert (api._prepared is not None) == native
     bufs = dict(case.bufs)
     # The old standalone contract interprets Stats through the declared strides,
     # even if the runtime container is a flat view into a larger allocation.
     bufs["stats"] = bufs["stats"].as_strided((bufs["stats"].numel(),), (1,))
+    if not valid_capacity:
+        from cudnn.sdpa.bwd import prepared_sm80, staged_sm80
+
+        bufs["stats"] = torch.empty_like(bufs["stats"])
+        monkeypatch.setattr(prepared_sm80, "execute", lambda *a, **k: pytest.fail("short Stats storage reached launch"))
+        monkeypatch.setattr(staged_sm80, "_copy", lambda *a, **k: pytest.fail("short Stats storage reached gather"))
+        with pytest.raises(ValueError, match="stats backing storage"):
+            _execute(api, bufs, workspace)
+        return
     _execute(api, bufs, workspace)
     _check(case)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            _execute(api, bufs, workspace)
+        for name in case.expected:
+            bufs[name].fill_(float("nan"))
+        graph.replay()
+        _check(case)
+    finally:
+        graph.reset()
 
 
-@pytest.mark.parametrize("overlap", [False, True])
-def test_ordered_gradient_copy_back(overlap, monkeypatch):
+@pytest.mark.parametrize("native,overlap", [(True, False), (False, False), (False, True)])
+def test_ordered_gradient_copy_back(native, overlap, monkeypatch):
     from cudnn.sdpa.bwd import staged_sm80
 
     case = _case(96, 96, hk=4)
@@ -238,7 +267,13 @@ def test_ordered_gradient_copy_back(overlap, monkeypatch):
         owner = torch.empty((b, seq, h, 3, d), device="cuda", dtype=case.dtype)
         for i, role in enumerate(("dq", "dk", "dv")):
             case.bufs[role] = owner[..., i, :].transpose(1, 2)
+    if not native:
+        # Keep the retained copy-back contract on an actually staged input.
+        # Aligned padded widths now use the native chain, including interleaved
+        # disjoint gradients sharing one allocation.
+        _use_unaligned_q(case)
     api, workspace = _adapter(case)
+    assert (api._prepared is not None) == native
     calls = []
     original = staged_sm80._copy
 
@@ -248,7 +283,10 @@ def test_ordered_gradient_copy_back(overlap, monkeypatch):
 
     monkeypatch.setattr(staged_sm80, "_copy", record)
     _execute(api, case.bufs, workspace)
-    assert calls[-3:] == [1, 1, 1], "potentially overlapping gradient scatters must preserve copy-back ordering"
+    if native:
+        assert not calls, "native interleaved gradients must not add layout copies"
+    else:
+        assert calls[-3:] == [1, 1, 1], "potentially overlapping gradient scatters must preserve copy-back ordering"
     if overlap:
         torch.testing.assert_close(case.bufs["dv"].float(), case.expected["dv"].float(), atol=0.03, rtol=0.03)
     else:
