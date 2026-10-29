@@ -2152,6 +2152,33 @@ def test_moe_quant_scale_k_padding_is_zeroed_sm120(axis, swap_ab):
     torch.testing.assert_close(q_buf.float(), (q_ref.transpose(1, 2) if axis == 1 else q_ref).float(), atol=0, rtol=0)
 
 
+@requires_matmul_gpu
+@pytest.mark.parametrize("swap", [False, True], ids=["token_by_weight", "weight_by_token"])
+def test_sm120_moe_empty_call_runs_as_a_no_op(swap):
+    """An expert-parallel rank that received no tokens calls its plan with S = 0.
+
+    The template host encoded a zero-extent TMA descriptor, and the DSL answered
+    with abort(). Both empty extents now return without a launch, and the plan
+    still serves the next call.
+    """
+    from cudnn.gemm.frost.sm120 import compiler as C120
+
+    E, S, N, K = 8, 768, 256, 128
+    compiled = C120.jit_from_cudnn_graph(_build_graph(E, S, N, K), config=replace(by_name(_SM120_CFG), swap_ab=swap))
+    workspace = torch.empty(compiled.workspace_bytes, dtype=torch.uint8, device="cuda")
+    torch.manual_seed(0)
+    token = torch.randn(1, S, K, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda")
+    no_rows = torch.zeros(E + 1, dtype=torch.int32, device="cuda")
+    compiled(_vp_moe(compiled, token[:, :0], weight, no_rows, torch.empty(1, 0, N, dtype=torch.bfloat16, device="cuda")), workspace=workspace)
+    offsets = _offsets([64, 0, 200, 128, 100, 12, 196, 68], S)
+    compiled(_vp_moe(compiled, token, weight[:, :0], offsets, torch.empty(1, S, 0, dtype=torch.bfloat16, device="cuda")), workspace=workspace)
+    out = torch.empty(1, S, N, dtype=torch.bfloat16, device="cuda")
+    compiled(_vp_moe(compiled, token, weight, offsets, out), workspace=workspace)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out[0], _ref_f32(token, weight, offsets, S, N, E).to(torch.bfloat16), atol=1e-1, rtol=1e-2)
+
+
 @pytest.mark.parametrize("weight_major", ["k", "n"])
 @pytest.mark.parametrize("gather", [False, True])
 def test_sm120_moe_render_smoke(weight_major: str, gather: bool) -> None:
@@ -3103,8 +3130,8 @@ def test_moe_reduction_initialization_validates_all_outputs_before_writing():
     assert (last_raw[1::2] == -12345).all()
 
 
-def _recorded_moe_plan(family, block_scale, multi, reduction, swap=False):
-    """Build a launch recorder for MoE runtime validation."""
+def _recorded_moe_plan(family, block_scale, multi, reduction, swap=False, *, rows=128, n=128, k=128, combo="nvfp4"):
+    """Build a launch recorder for MoE runtime validation; ``rows``, ``n`` and ``k`` size the call's buffers."""
     import importlib
     from pathlib import Path
     from dataclasses import replace
@@ -3114,7 +3141,7 @@ def _recorded_moe_plan(family, block_scale, multi, reduction, swap=False):
     if block_scale:
         from test_moe_grouped_block_scale_matmul_fwd import _build_graph as bs_graph
 
-        graph = bs_graph(2, 128, 128, 128, 2)
+        graph = bs_graph(2, 128, 128, 128, 2, combo)
     else:
         graph = _build_graph(2, 128, 128, 128, num_groups=2)
     _, original = analyze_with_binding(graph)
@@ -3142,14 +3169,14 @@ def _recorded_moe_plan(family, block_scale, multi, reduction, swap=False):
             output_specs=[replace(spec, source_ref=0) for spec in chain.output_specs],
             reductions=[replace(red, source_ref=0) for red in chain.reductions],
         )
-    storage_k = 64 if block_scale else 128
+    storage_k = k // 2 if block_scale and combo != "mxfp8" else k
     dtype = torch.uint8 if block_scale else torch.bfloat16
-    vp = {t: torch.ones((1, 128, storage_k), device="cuda", dtype=dtype) for t in binding.a_operands}
-    vp.update({t: torch.ones((2, 128, storage_k), device="cuda", dtype=dtype) for t in binding.b_operands})
+    vp = {t: torch.ones((1, rows, storage_k), device="cuda", dtype=dtype) for t in binding.a_operands}
+    vp.update({t: torch.ones((2, n, storage_k), device="cuda", dtype=dtype) for t in binding.b_operands})
     vp.update({t: torch.ones((1, 1, 8192), device="cuda", dtype=torch.uint8) for t in binding.sfa_operands})
     vp.update({t: torch.ones((2, 1, 8192), device="cuda", dtype=torch.uint8) for t in binding.sfb_operands})
-    vp[binding.first_token_offset] = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
-    output = torch.full((1, 1, 1) if reduction else (1, 128, 128), 17.0, device="cuda", dtype=torch.float32 if reduction else torch.bfloat16)
+    vp[binding.first_token_offset] = torch.tensor([0, min(64, rows), rows], device="cuda", dtype=torch.int32)
+    output = torch.full((1, 1, 1) if reduction else (1, rows, n), 17.0, device="cuda", dtype=torch.float32 if reduction else torch.bfloat16)
     vp[binding.outputs[0]] = output
     if swap:
         chain, binding = swap_ab(chain), swap_ab_binding(binding)
@@ -3199,6 +3226,84 @@ def test_moe_workspace_failure_preserves_reduction_outputs(family, block_scale, 
         compiled(vp, workspace=workspace)
     assert calls == []
     torch.testing.assert_close(output, torch.full_like(output, 17.0), atol=0, rtol=0)
+
+
+@pytest.mark.no_workspace_shim
+@pytest.mark.parametrize("block_scale", [False, True])
+@pytest.mark.parametrize("multi", [False, True])
+@pytest.mark.parametrize("swap", [False, True])
+@pytest.mark.parametrize("empty", ["rows", "n"])
+def test_sm120_moe_empty_call_seeds_and_skips_the_launch(block_scale, multi, swap, empty):
+    """No routed rows (an expert-parallel rank that received none) or no output
+    features leave nothing to compute. The template host would encode a TMA
+    descriptor with a zero extent, which the DSL answers with abort(), so the
+    launch is skipped; the seeded reduction identity is the whole result."""
+    compiled, vp, output, calls, _ = _recorded_moe_plan("sm120", block_scale, multi, True, swap, **{empty: 0})
+    workspace = torch.empty(compiled.workspace_bytes, device="cuda", dtype=torch.uint8)
+    compiled(vp, workspace=workspace)
+    torch.cuda.synchronize()
+    assert calls == []
+    torch.testing.assert_close(output, torch.zeros_like(output), atol=0, rtol=0)
+
+
+@pytest.mark.no_workspace_shim
+@pytest.mark.parametrize("combo,k", [("bf16", 0), ("nvfp4", 0), ("mxfp8", 16)])
+@pytest.mark.parametrize("multi", [False, True])
+@pytest.mark.parametrize("swap", [False, True])
+def test_sm120_moe_unencodable_k_is_refused_before_anything_is_written(combo, k, multi, swap):
+    """K = 0, or an MXFP8 K below one 32-element scale block (its scale-factor K
+    extent rounds down to 0), still has outputs to write but no K extent a TMA
+    descriptor can encode: refuse the call before the reduction seed.
+
+    K = 16 also ends inside a scale block, and checks of the scale factors may
+    refuse it first, each in its own words, so that case checks the refusal
+    (ValueError, no launch, nothing written) and not the message."""
+    compiled, vp, output, calls, _ = _recorded_moe_plan("sm120", combo != "bf16", multi, True, swap, k=k, combo=combo)
+    workspace = torch.empty(compiled.workspace_bytes, device="cuda", dtype=torch.uint8)
+    with pytest.raises(ValueError, match="K=0 is a zero K extent" if k == 0 else None):
+        compiled(vp, workspace=workspace)
+    torch.cuda.synchronize()
+    assert calls == []
+    torch.testing.assert_close(output, torch.full_like(output, 17.0), atol=0, rtol=0)
+
+
+@pytest.mark.no_workspace_shim
+@pytest.mark.parametrize("swap", [False, True])
+def test_sm120_moe_gather_from_an_empty_token_buffer_is_refused(swap):
+    """GATHER reads every routed row from the token buffer; an empty one leaves the
+    source descriptor a zero row extent, so the call is refused, not launched."""
+    from cudnn.gemm.frost.fusion_ir import swap_ab
+    from cudnn.gemm.frost.graph_analyzer import swap_ab_binding
+    from cudnn.gemm.frost.sm120 import compiler as C120
+
+    g, x, weights, offsets, indices, y = _build_gather_graph()
+    chain, binding = analyze_with_binding(g)
+    if swap:
+        chain, binding = swap_ab(chain), swap_ab_binding(binding)
+    calls = []
+    compiled = C120.CompiledMoeGemm(
+        chain=chain,
+        config=replace(by_name(_SM120_CFG), swap_ab=swap),
+        generated_path=pathlib.Path("unused"),
+        _launchable=lambda *args, **kwargs: calls.append(args),
+        binding=binding,
+        vec_bytes_epi=32,
+    )
+    out = torch.full((1, 257, 96), 17.0, device="cuda", dtype=torch.bfloat16)
+    vp = {
+        offsets: torch.tensor([0, 65, 65, 68, 197, 198, 257], device="cuda", dtype=torch.int32).view(7, 1, 1),
+        indices: torch.zeros((1, 257, 1), device="cuda", dtype=torch.int32),
+        y: out,
+        weights[0]: torch.ones((3, 96, 96), device="cuda", dtype=torch.bfloat16),
+    }
+    workspace = torch.empty(compiled.workspace_bytes, device="cuda", dtype=torch.uint8)
+    compiled({**vp, x: torch.ones((1, 137, 96), device="cuda", dtype=torch.bfloat16)}, workspace=workspace)
+    assert len(calls) == 1
+    calls.clear()
+    with pytest.raises(ValueError, match="token buffer that has none"):
+        compiled({**vp, x: torch.ones((1, 0, 96), device="cuda", dtype=torch.bfloat16)}, workspace=workspace)
+    assert calls == []
+    assert torch.all(out == 17.0)
 
 
 @pytest.mark.parametrize("family", ["sm100", "sm120"])

@@ -907,6 +907,8 @@ class _CompiledRuntime:
     _validate_combine: ClassVar[bool] = False
     # Per call: refuse a block-scale K that ends inside a scale block (_partial_scale_block_reject).
     _validate_whole_scale_blocks: ClassVar[bool] = False
+    # Consult the family's _zero_extent_problem: skip an empty call's launch; refuse a K it cannot encode or a GATHER from an empty token buffer.
+    _check_zero_extents: ClassVar[bool] = False
     accepts_stream: ClassVar[bool] = True
 
     @property
@@ -1079,6 +1081,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         quant_mn = (self.chain.matmul.M, self.chain.matmul.N) if self._validate_runtime_quant and self.chain.quants else None
         quant_reason = backend._runtime_quant_reason if quant_mn is not None else None
         quant_chain, quant_cfg = (self.chain, self.config)
+        zero_extent = backend._zero_extent_problem if self._check_zero_extents else None
         gave_up = self.deferrals
 
         def lowered(operands, graph_order=None, stream=None, workspace=None):
@@ -1162,10 +1165,12 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                     if tuple(vs[j].stride()) != st:
                         gave_up["operands do not share a layout"] += 1
                         return refuse(operands, graph_order)
-            if split_k_slices > 1:
+            # An empty problem (M or N == 0) launches nothing, so it needs no split-K shape or workspace.
+            empty = zero_extent is not None and zero_extent(m, n, k, block_size)
+            if split_k_slices > 1 and not empty:
                 backend.check_split_k_shape(k, n, batch, split_k_slices, cta_k_elems, reduce_elems if needs_workspace else 1)
             extra = ()
-            if needs_workspace:
+            if needs_workspace and not empty:
                 if workspace is None:
                     raise ValueError(
                         "cudnn.frost gemm: this plan needs a workspace; allocate graph.get_workspace_size() bytes and pass the buffer to execute()"
@@ -1192,6 +1197,8 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                         fill_word(ptr, count, word, stream)
                     else:
                         apply_fill(ptr, plan, word, stream)
+            if empty:
+                return None
             return launchable(
                 tuple(problem),
                 *(v.permute(1, 2, 0) for v in vs),
@@ -1307,8 +1314,11 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
             backend._check_moe_combine_operands(
                 self.chain, [token], [weight], first_token_offset, [], [], (token_index, token_ks, top_k_scores), outputs, K, workspace
             )
+        empty = self._check_zero_extents and backend._zero_extent_problem(S, N, K, None, token.shape[1])
         backend._initialize_reduction_outputs(self.chain, outputs, stream)
         backend._initialize_combine_output(self.chain, outputs, stream)
+        if empty:
+            return None
         return self._launch_moe(problem_size, first_token_offset, workspace, (a, b), cs, (), stream, token_index, token_ks, top_k_scores)
 
     def _call_variant_pack(self, variant_pack: dict, workspace=None, stream=None):
@@ -1433,8 +1443,11 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
         workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + backend._MOE_SCHED_COUNTER_SLOTS, workspace)
         if self._validate_combine:
             backend._check_moe_combine_operands(chain, a_slots, b_slots, first_token_offset, [], [], (token_index, token_ks, top_k_scores), outs, K, workspace)
+        empty = self._check_zero_extents and backend._zero_extent_problem(S, N, K, None, a_slots[0].shape[1])
         backend._initialize_reduction_outputs(chain, outs, stream)
         backend._initialize_combine_output(chain, outs, stream)
+        if empty:
+            return None
         return self._launch_moe(problem_size, first_token_offset, workspace, (*a_wrapped, *b_wrapped), cs, aux, stream, token_index, token_ks, top_k_scores)
 
 
@@ -1507,8 +1520,11 @@ class _CompiledMoeBlockScaleGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
             backend._check_moe_combine_operands(
                 self.chain, [token], [weight], first_token_offset, *sfs, (token_index, token_ks, top_k_scores), outputs, K, workspace
             )
+        empty = self._check_zero_extents and backend._zero_extent_problem(S, N, K, self.chain.block_scale.block_size, token.shape[1])
         backend._initialize_reduction_outputs(self.chain, outputs, stream)
         backend._initialize_combine_output(self.chain, outputs, stream)
+        if empty:
+            return None
         return self._launch_moe(problem_size, first_token_offset, workspace, (a, b, *sf_args), cs, (), stream, token_index, token_ks, top_k_scores)
 
     def _call_variant_pack(self, variant_pack: dict, workspace=None, stream=None):
@@ -1700,8 +1716,11 @@ class _CompiledMoeBlockScaleGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
             tokens, weights = ([t for t, _sf in a_slots], [w for w, _sf in b_slots])
             sfs = ([sf for _t, sf in a_slots if sf is not None], [sf for _w, sf in b_slots if sf is not None])
             backend._check_moe_combine_operands(chain, tokens, weights, first_token_offset, *sfs, (token_index, token_ks, top_k_scores), outs, K, workspace)
+        empty = self._check_zero_extents and backend._zero_extent_problem(S, N, K, chain.block_scale.block_size, a0.shape[1])
         backend._initialize_reduction_outputs(chain, outs, stream)
         backend._initialize_combine_output(chain, outs, stream)
+        if empty:
+            return None
         return self._launch_moe(
             problem_size,
             first_token_offset,
