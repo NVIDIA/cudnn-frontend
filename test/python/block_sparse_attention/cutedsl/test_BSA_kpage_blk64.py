@@ -118,6 +118,24 @@ def test_kpage_blk64_fixed_count_matches_base_kernel():
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=25)
+@pytest.mark.parametrize("softmax_scale", [0.0, -0.125])
+def test_kpage_blk64_nonpositive_softmax_scale(softmax_scale):
+    """Zero and negative scales with partially valid key blocks: the masked keys must not turn into NaN / +inf."""
+    BSA = _import_bsa()
+    heads, num_blocks = 2, 8
+    bs = torch.tensor([64, 40, 64, 7, 64, 64, 25, 64], dtype=torch.int32, device="cuda")
+    q, k, v = _inputs(heads, num_blocks, bs)
+    q2k, nums = _random_metadata(heads, num_blocks, num_blocks, kmax=6)
+    o_ref, lse_ref = _reference(q, k, v, q2k, nums, bs, softmax_scale=softmax_scale)
+    paged = _run(BSA, q, k, v, q2k, nums, bs, kpage=True, softmax_scale=softmax_scale)
+    base = _run(BSA, q, k, v, q2k, nums, bs, softmax_scale=softmax_scale)
+    torch.testing.assert_close(paged["o_tensor"].float(), o_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(paged["lse_tensor"], lse_ref, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(paged["o_tensor"].float(), base["o_tensor"].float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=26)
 def test_kpage_blk64_empty_query_blocks():
     """allow_empty_block_nums: a query block with no KV blocks gets O = 0 and LSE = -inf (as on the base path)."""
@@ -200,10 +218,6 @@ def test_kpage_blk64_rejects_unsupported_configurations():
         BSA.kpage_prepare_layout(q2k, 2, bs, q_block_sizes=bs, sparse_block_size=BLOCK)
     with pytest.raises(NotImplementedError, match="bwd_kv_groups"):
         BSA.kpage_prepare_layout(q2k, 2, bs, sparse_block_size=BLOCK, bwd_kv_groups=2)
-    # a zero or negative scale would turn the -inf of masked keys into NaN / +inf
-    for scale in (0.0, -0.125):
-        with pytest.raises(NotImplementedError, match="positive softmax_scale"):
-            _run(BSA, q, k, v, q2k, None, bs, kpage=True, softmax_scale=scale)
     # MHA only
     q_gqa = torch.randn((1, 2 * heads, seqlen, 128), device="cuda", dtype=torch.bfloat16)
     q2k_gqa = q2k.repeat_interleave(2, dim=1).contiguous()

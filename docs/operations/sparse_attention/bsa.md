@@ -468,7 +468,7 @@ o, lse = block_sparse_attention_forward(q, k, v, q2k_block_index, block_sparse_n
 The contract is that of the base blk64 forward with these differences:
 
 - BF16, `head_dim=128`, MHA; `seqlen_q` and `seqlen_k` multiples of 64; a
-  BSHD batch must be 1, as above; a positive `softmax_scale`.
+  BSHD batch must be 1, as above.
 - Every query row is computed, as on the base blk64 path: there is no
   `q_block_sizes`, and the output rows of query padding are not zeroed.
 - Forward only. `block_sparse_attention_backward(..., kpage=...)` with

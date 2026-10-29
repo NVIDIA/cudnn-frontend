@@ -230,10 +230,6 @@ def block_sparse_attention_forward(
     if kpage is not False:
         if pack_gqa is True or kv_splits != 1 or use_clc is not None:
             raise NotImplementedError("kpage does not take pack_gqa, kv_splits, or use_clc")
-        if sparse_block_size == 64 and softmax_scale is not None and not softmax_scale > 0.0:
-            # The page kernels mask partially valid keys with -inf before the scale, which a zero or negative scale
-            # turns into NaN / +inf.
-            raise NotImplementedError("the blk64 KPage path requires a positive softmax_scale")
     if arch_family == 9:
         if kv_splits != "auto" and (isinstance(kv_splits, str) or not 1 <= int(kv_splits) <= 256):
             raise ValueError("SM90 kv_splits must be 'auto' or an integer in [1, 256]")
