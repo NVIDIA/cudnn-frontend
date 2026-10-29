@@ -145,6 +145,12 @@ def _emit_binary_ext(op: FusionOp, a_expr: str, b_expr: str, idx: int, new: str)
     attrs = dict(op.attrs)
 
     if op.op in _CMP_OPS:
+        if op.compute_dtype == "fp32":
+            # Compare natively (arith.cmpf: ordered OEQ/OGT/OGE/OLT/OLE, unordered UNE) to keep IEEE
+            # semantics. The step form below gets NaN operands and equal infinities wrong: a - b is NaN
+            # there, and the NaN-ignoring max/min turn that NaN into 0.
+            py_op = {"cmp_eq": "==", "cmp_neq": "!=", "cmp_gt": ">", "cmp_ge": ">=", "cmp_lt": "<", "cmp_le": "<="}[op.op]
+            return lines + [f"{new} = cutlass._mlir_helpers.vector.where({a} {py_op} {b}, {_fl(a, 1.0)}, {_fl(a, 0.0)})"], new
         if op.op == "cmp_le":
             step, v = _step01(f"{b} - {a}", f"_{idx}")
             return lines + step + [f"{new} = {v}"], new
