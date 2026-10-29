@@ -310,9 +310,9 @@ class TensorRef:
 
     @property
     def symbolic_shape(self) -> tuple[int | Axis, ...]:
-        """Dynamic extent semantics; ``dim`` retains declared concrete sizes.
+        """Logical dynamic extents, with the same rank as declared ``dim``.
 
-        Rank-1 epilogue auxiliaries use the existing rank-2 kernel ABI.
+        Kernel ABI rank promotion belongs to lowering, not this record.
         Per-K orientation comes from the operand, even when K equals one.
         """
         if self.bcast_mode == "per_k":
@@ -328,7 +328,7 @@ class TensorRef:
         if len(self.dim) == 3:
             batch = Axis.GROUP if self.grouped_by_moe else (1 if self.dim[0] == 1 else Axis.BATCH)
             return (batch, *axes)
-        return axes
+        return axes[2 - len(self.dim) :]
 
 
 def gemm_source(g: int) -> int:

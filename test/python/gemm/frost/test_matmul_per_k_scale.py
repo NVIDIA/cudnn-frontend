@@ -193,8 +193,9 @@ def test_frost_per_k_ir_rejects_invalid_broadcast():
 def test_frost_aux_symbolic_shape_contract():
     # Equal and unit extents cannot identify a logical GEMM axis by value.
     cases = [
-        ("scalar", (1,), False, (1, 1), "(1, 1)"),
-        ("per_col", (128,), False, (1, Axis.N), "(1, sym_n)"),
+        ("scalar", (), False, (), "(1, 1)"),
+        ("scalar", (1,), False, (1,), "(1, 1)"),
+        ("per_col", (128,), False, (Axis.N,), "(1, sym_n)"),
         ("per_row", (128, 1), False, (Axis.M, 1), "(sym_m, 1)"),
         ("per_elem", (128, 128), False, (Axis.M, Axis.N), "(sym_m, sym_n)"),
         ("scalar", (2, 1, 1), False, (Axis.BATCH, 1, 1), "(sym_l, 1, 1)"),
@@ -208,7 +209,13 @@ def test_frost_aux_symbolic_shape_contract():
     for mode, dim, grouped, shape, code in cases:
         ref = TensorRef("aux", dim, (1,) * len(dim), "bf16", mode, grouped)
         assert ref.symbolic_shape == shape
+        assert len(ref.symbolic_shape) == len(ref.dim)
         assert compiler._aux_fake_shape_code(ref) == code
+        # Fake shape and fake stride must use the lowered ABI rank, not IR rank.
+        src = compiler._aux_fake_block([ref])
+        assert f", {code}, " in src
+        stride = "(" + ", ".join("cute.sym_int64()" for _ in range(max(2, len(dim)))) + ")"
+        assert f"stride={stride}" in src
     chain = analyze(_graph(side="ab")[0])
     chain = replace(chain, matmul=replace(chain.matmul, K=1), aux_tensors=[replace(ref, dim=(1, 1, 1)) for ref in chain.aux_tensors])
     assert [ref.symbolic_shape for ref in chain.aux_tensors] == [(1, 1, Axis.K), (1, Axis.K, 1)]

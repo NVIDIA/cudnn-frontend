@@ -62,10 +62,16 @@ _CTAMMA_SUFFIX = re.compile(r"_[12]ctamma$")
 _INJECT_MARKER_LINE = re.compile(r"^([ \t]*)# *@@([A-Z0-9_]+)@@[ \t]*\n", flags=re.MULTILINE)
 
 
+def _aux_kernel_shape(aux: TensorRef) -> tuple[int | Axis, ...]:
+    """Lower logical extents to the existing minimum-rank-2 aux ABI."""
+    shape = aux.symbolic_shape
+    return (1,) * max(0, 2 - len(shape)) + shape
+
+
 def _aux_fake_shape_code(aux: TensorRef) -> str:
-    """Render the IR's extent semantics without reconstructing broadcasts."""
+    """Render lowered extents without reconstructing broadcasts."""
     symbols = {Axis.M: "sym_m", Axis.N: "sym_n", Axis.K: "sym_k", Axis.BATCH: "sym_l", Axis.GROUP: "sym_g"}
-    return "(" + ", ".join(symbols[extent] if isinstance(extent, Axis) else str(extent) for extent in aux.symbolic_shape) + ")"
+    return "(" + ", ".join(symbols[extent] if isinstance(extent, Axis) else str(extent) for extent in _aux_kernel_shape(aux)) + ")"
 
 
 def _aux_can_use_explicit_fake_stride(aux: TensorRef) -> bool:
@@ -92,7 +98,7 @@ def _aux_fake_block(aux_tensors: list[TensorRef], *, dynamic_strides: bool = Fal
             stride = "(" + ", ".join(str(s) for s in aux.stride) + ")"
             lines.append(f"fake_{aux.name} = cute.runtime.make_fake_tensor({dtype}, {shape}, " f"stride={stride}, assumed_align={_align})")
         else:
-            _rank = len(aux.symbolic_shape)
+            _rank = len(_aux_kernel_shape(aux))
             stride = "(" + ", ".join("cute.sym_int64()" for _ in range(_rank)) + ")"
             lines.append(f"fake_{aux.name} = cute.runtime.make_fake_tensor({dtype}, {shape}, " f"stride={stride}, assumed_align={_align})")
     return "\n".join(lines) if lines else "pass"
