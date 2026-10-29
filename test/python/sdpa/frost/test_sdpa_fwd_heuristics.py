@@ -2453,3 +2453,38 @@ def test_sm107_pt_fp8_d192_mha_causal_fp8_o_lists_the_single_cta(sm107_metadata_
     assert _auto_sched_cga(spec, _facts(**base), split_kv=1, sched_policy=SCHED_NATURAL) == (SCHED_LPT, 1)
     for off in (dict(dtype_o=cudnn.data_type.BFLOAT16), dict(h_kv=8), dict(causal=False), dict(h_q=128, h_kv=128)):
         assert effective_cgas(spec.capabilities, _facts(**{**base, **off})) == frozenset({2}), off
+
+
+@pytest.mark.L0
+def test_sm107_pt_fp8_d128_dense_legs_take_the_single_cta(sm107_metadata_target):
+    """The 107-line per-tensor FP8 d128 row lists both widths on dense unsplit graphs inside the K/V budget and the auto pick takes
+    the single CTA with the scheduler it was handed; THD and the larger K/V sets keep the pair."""
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_NATURAL
+    from cudnn.sdpa.fwd.engines import effective_cgas
+    from cudnn.sdpa.fwd.heuristics import _auto_sched_cga
+
+    fp8_name = engines.engine_name(fp8=True, arch="sm107")
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == fp8_name)
+    base = dict(
+        is_fp8=True,
+        b=2,
+        h_q=64,
+        h_kv=8,
+        s_q=2048,
+        s_kv=2048,
+        d_qk=128,
+        d_v=128,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.FP8_E4M3,
+        device_cc=(10, 7),
+        device_sm_count=212,
+    )
+    for over, sched in (
+        (dict(), SCHED_LPT),
+        (dict(causal=False), SCHED_NATURAL),
+        (dict(b=1, h_q=40, h_kv=40, s_q=7800, s_kv=7800, causal=False), SCHED_NATURAL),
+    ):
+        facts = _facts(**{**base, **over})
+        assert effective_cgas(spec.capabilities, facts) == frozenset({1, 2}), over
+        assert _auto_sched_cga(spec, facts, split_kv=1, sched_policy=sched) == (sched, 1), over
+    assert effective_cgas(spec.capabilities, _facts(**{**base, "b": 8, "h_kv": 64})) == frozenset({2})
