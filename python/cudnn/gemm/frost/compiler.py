@@ -1066,8 +1066,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
             (o.index for o in r.outputs if o.role.startswith("quant_scale_") and self.chain.quants[int(o.role.rsplit("_", 1)[1])].scale_reorder == "F8_128x4")
         )
         mn_view_slots = (frozenset((o.index for o in r.outputs)) | frozenset((x.index for x in r.aux))) - packed_scale_slots
-        check_scale_blobs = self._validate_quant_scale_blobs and bool(packed_scale_slots)
-        out_slots = tuple((o.index for o in r.outputs))
+        checked_scale_slots = tuple(sorted(packed_scale_slots)) if self._validate_quant_scale_blobs else ()
         if split_k_slices > 1:
             cta_k_elems = backend._cta_k_elems(self.chain, self.config)
         if needs_workspace:
@@ -1131,9 +1130,10 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                     gave_up["output layout"] += 1
                     return refuse(operands, graph_order)
                 problem += (st[2], st[1], st[0]) if swap_ab and idx in mn_view_slots else (st[1], st[2], st[0])
-            if check_scale_blobs and backend._quant_scale_blob_reject(quant_chain, [operands[i] for i in out_slots]) is not None:
-                gave_up["quant scale blob"] += 1
-                return refuse(operands, graph_order)
+            for idx in checked_scale_slots:
+                if backend._quant_scale_plane_reject(operands[idx]) is not None:
+                    gave_up["quant scale blob"] += 1
+                    return refuse(operands, graph_order)
             for idx, align in auxs:
                 v = operands[idx]
                 if backend.tensor_alignment(tuple(v.shape), tuple(v.stride()), v.element_size(), ptr=v.data_ptr()) < align:

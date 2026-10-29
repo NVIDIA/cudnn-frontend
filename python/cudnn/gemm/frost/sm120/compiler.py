@@ -1193,14 +1193,28 @@ def _initialize_combine_output(chain: FusionChain, outputs, stream=None) -> None
     buffers.apply_zero_fill_plan(output.data_ptr(), plan, DTYPE_BYTES[chain.outputs[0].dtype], stream)
 
 
-def _quant_scale_blob_reject(chain: FusionChain, outputs) -> "str | None":
-    """Check each F8_128x4 quant-scale output against the addressing its epilogue uses.
+def _quant_scale_plane_reject(buf) -> "str | None":
+    """Why an F8_128x4 quant-scale output binding cannot take the blob its epilogue writes, or None.
 
     The epilogue writes the 128x4-atom stream at compact offsets from a batch plane's base
     (``tile_l * quant_scale_stride_l``) and never applies the M/N strides. Each batch plane
     must therefore be one dense byte run, and the batch stride must not let planes overlap.
-    A dense permuted view qualifies (the blob is read back as raw bytes); a pitched or
-    element-strided view would get the blob written into its gaps, outside the view."""
+    A dense permuted view qualifies (the blob is read back as raw bytes). A pitched or
+    element-strided view would get the blob written into its gaps, outside the view;
+    interleaved or overlapping planes would overwrite each other."""
+    shape, strides = tuple(buf.shape), tuple(buf.stride())
+    plane = 1
+    for stride, extent in sorted((st, s) for s, st in zip(shape[1:], strides[1:]) if s > 1):
+        if stride != plane:
+            return "a batch plane is not a dense byte run"
+        plane *= extent
+    if shape[0] > 1 and strides[0] < plane:
+        return f"its {plane}-byte batch planes overlap"
+    return None
+
+
+def _quant_scale_blob_reject(chain: FusionChain, outputs) -> "str | None":
+    """Check each F8_128x4 quant-scale output with ``_quant_scale_plane_reject``."""
     bad = []
     for spec, buf in zip(chain.outputs, outputs):
         if not spec.is_quant_scale:
@@ -1208,16 +1222,9 @@ def _quant_scale_blob_reject(chain: FusionChain, outputs) -> "str | None":
         qi = int(spec.source.rsplit("_", 1)[1])
         if chain.quants[qi].scale_reorder != "F8_128x4":
             continue
-        shape, strides = tuple(buf.shape), tuple(buf.stride())
-        plane = 1
-        for stride, extent in sorted((st, s) for s, st in zip(shape[1:], strides[1:]) if s > 1):
-            if stride != plane:
-                bad.append(f"quant scale output[{qi}] shape {shape} stride {strides}: a batch plane is not a dense byte run")
-                break
-            plane *= extent
-        else:
-            if shape[0] > 1 and strides[0] < plane:
-                bad.append(f"quant scale output[{qi}] shape {shape} stride {strides}: its {plane}-byte batch planes overlap")
+        reason = _quant_scale_plane_reject(buf)
+        if reason is not None:
+            bad.append(f"quant scale output[{qi}] shape {tuple(buf.shape)} stride {tuple(buf.stride())}: {reason}")
     if bad:
         return (
             "F8_128x4 quant scale outputs must be packed blobs (the epilogue writes each batch plane at compact offsets "
@@ -2622,6 +2629,9 @@ def _launch_moe_swap_ab(
     scale_blob_reason = _grouped_row_quant_scale_blob_reject(chain, outputs, m, n, g)
     if scale_blob_reason is not None:
         raise ValueError(scale_blob_reason)
+    # The whole-blob _sf_blob_reject in the loop above accepts an aliasing view whose span
+    # equals its element count (e.g. a stride-0 row axis); the per-plane rule does not.
+    compiled._check_quant_scale_blobs(outputs)
     for i, spec in enumerate(chain.output_specs):
         if i in compiled.tma_slots and spec.major == "n" and n * DTYPE_BYTES[spec.dtype] % 16:
             raise ValueError("MoE weight-by-token runtime S violates the TMA token boundary alignment")

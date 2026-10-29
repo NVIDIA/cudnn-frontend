@@ -2013,12 +2013,16 @@ def test_gather_layouts_and_frontend_sm120(case):
 
 
 @requires_sm120
-@pytest.mark.parametrize("relu", [False, True], ids=["one_gemm", "epilogue_op"])
-def test_moe_quant_scale_output_must_be_a_packed_blob_sm120(relu):
-    """Both plain MoE launchers (one GEMM, and the multi-GEMM path an epilogue op takes)
-    decline an F8_128x4 quant-scale binding the blob would spill out of, before any write."""
+@pytest.mark.parametrize("relu,swap", [(False, False), (True, False), (False, True)], ids=["one_gemm", "epilogue_op", "swap_ab"])
+def test_moe_quant_scale_output_must_be_a_packed_blob_sm120(relu, swap):
+    """All three plain MoE launchers (one GEMM, the multi-GEMM path an epilogue op takes, and
+    swap-AB) decline an F8_128x4 quant-scale binding the blob would spill out of, before any
+    write. S = 512 gives the [1, 512, 8] scale a row-aliasing view whose span equals its
+    element count, which the swap-AB launcher's whole-blob check alone accepts."""
+    from cudnn.gemm.frost.fusion_ir import MoeSwapAbSpec
+
     E, K, N, bs = 4, 128, 256, 32
-    group_sizes = [128, 0, 160, 96]
+    group_sizes = [128, 0, 288, 96]
     S = sum(group_sizes)
     g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
@@ -2031,8 +2035,9 @@ def test_moe_quant_scale_output_must_be_a_packed_blob_sm120(relu):
     q.set_data_type(cudnn.data_type.FP8_E4M3).set_output(True)
     sf.set_dim([1, S, N // bs]).set_stride([S * N // bs, N // bs, 1]).set_data_type(cudnn.data_type.FP8_E8M0).set_output(True)
     sf.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
-    compiled = _plan(g, config=by_name(_SM120_CFG))
+    compiled = _plan(g, config=by_name(_SM120_CFG), swap_ab=swap)
     assert bool(compiled.chain.ops) == relu
+    assert isinstance(compiled.chain.moe, MoeSwapAbSpec) == swap
     token = torch.randint(-2, 3, (1, S, K), device="cuda").to(torch.bfloat16)
     weight = torch.randint(-2, 3, (E, N, K), device="cuda").to(torch.bfloat16)
     offsets = _offsets(group_sizes, S)

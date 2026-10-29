@@ -383,6 +383,11 @@ def quant_scale_bindings(shape, dtype):
     bindings.append(("row_pitch", False, view.view(batch, rows, 2 * cols)[:, :, :cols], backing))
     view, backing = alloc(2 * batch * plane)
     bindings.append(("element_stride", False, view.as_strided(shape, (2 * plane, 2 * cols, 2)), backing))
+    if cols > 1 and (rows - 1) % (cols - 1) == 0:
+        # Every row aliases row 0 and the column stride spreads the row's bytes over the plane:
+        # the view spans exactly its element count, which a whole-blob density check accepts.
+        view, backing = alloc(batch * plane)
+        bindings.append(("aliased_rows", False, view.as_strided(shape, (plane, 0, (plane - 1) // (cols - 1))), backing))
     if batch > 1:
         view, backing = alloc(2 * batch * plane)
         bindings.append(("batch_pitch", True, view.view(batch, 2 * rows, cols)[:, :rows], backing))
@@ -396,19 +401,21 @@ def quant_scale_bindings(shape, dtype):
 def assert_quant_scale_blob_guard(run, shape, dtype, others=()):
     """``run(view)`` launches with ``view`` bound to an F8_128x4 quant-scale output of ``shape``.
 
-    A binding the blob would spill out of must raise before any write: its allocation and
-    ``others`` (byte views of the call's other outputs) stay untouched. An accepted binding
-    must hold, plane by plane, exactly the bytes the compact one holds, and nothing outside it.
+    A binding the epilogue cannot address must raise before any write: its allocation, and
+    ``others`` (byte views of the call's other outputs, refilled with SCALE_BLOB_FILL before
+    each such call), keep the fill byte. An accepted binding must hold, plane by plane,
+    exactly the bytes the compact one holds, and nothing outside it.
     ``shape`` must need no 128x4 padding, so the compact blob is written in full."""
     control = None
     for name, accepted, view, backing in quant_scale_bindings(shape, dtype):
-        before = [other.clone() for other in others]
         if not accepted:
+            for other in others:
+                other.fill_(SCALE_BLOB_FILL)
             with pytest.raises(ValueError, match="packed blob"):
                 run(view)
             torch.cuda.synchronize()
             assert torch.all(backing == SCALE_BLOB_FILL), f"{name}: a declined call wrote its scale allocation"
-            assert all(torch.equal(o, b) for o, b in zip(others, before)), f"{name}: a declined call wrote an output"
+            assert all(bool(torch.all(o == SCALE_BLOB_FILL)) for o in others), f"{name}: a declined call wrote an output"
             continue
         run(view)
         torch.cuda.synchronize()

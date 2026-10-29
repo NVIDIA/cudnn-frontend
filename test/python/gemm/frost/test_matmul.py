@@ -3498,9 +3498,10 @@ def test_sm120_warp_grid_axis(config_name: str, a_major: str) -> None:
 @requires_sm120
 def test_sm120_quant_scale_output_must_be_a_packed_blob() -> None:
     """The F8_128x4 quant epilogue writes the scale blob from each batch plane's base and
-    applies only the batch stride. A binding the blob would spill out of (a row pitch, an
-    element stride, interleaved or overlapping batch planes) is declined before the launch;
-    dense permuted planes and a padded batch pitch get exactly the compact blob's bytes."""
+    applies only the batch stride. A binding it cannot address is declined before the launch:
+    a row pitch or an element stride (the blob would spill out of the view), and interleaved
+    or overlapping batch planes (they would overwrite each other). Dense permuted planes and
+    a padded batch pitch get exactly the compact blob's bytes."""
     L, M, N, K, bs = 2, 256, 256, 128, 32
     g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     A = g.tensor(name="A", dim=[L, M, K], stride=[M * K, K, 1])
