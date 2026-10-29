@@ -799,6 +799,12 @@ aligned named barrier, so call the original subset barrier directly. Run the
 affected kernel under `compute-sanitizer --tool synccheck`; ordinary numerical
 tests do not diagnose this contract violation.
 
+The same rule applies to inline PTX: `bar.sync` is an alias for
+`barrier.sync.aligned`, even with an explicit participant count. Use
+`barrier.sync` for a warp-role subset and inspect the emitted PTX; successful
+replay and synccheck runs do not establish that the aligned-CTA promise is
+valid. D192 dense and THD backward share this Stats-publication barrier.
+
 **Detector.** These break at `compile()`, not at import — `python -c "import ..."`
 and `pytest --collect-only` both stay green. After any refactor of a kernel
 body, run that flavor's own tests.

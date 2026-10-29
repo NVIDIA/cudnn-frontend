@@ -59,7 +59,7 @@ def validate_accumulation_scale(scale):
 ACCUMULATION_CCS = ((10, 0), (10, 3))
 
 
-def select_implementation(cc, dsl_version, batch, heads, sq, skv, scale):
+def select_implementation(cc, dsl_version, batch, heads, sq, skv, scale, d_qk=128, d_v=128, input_bytes=2):
     """Choose from plan facts; recompute stays the fallback outside the accumulation envelope.
 
     The accumulation kernels round both sequence lengths up to whole 128-row
@@ -83,8 +83,9 @@ def select_implementation(cc, dsl_version, batch, heads, sq, skv, scale):
     if batch > 65535 or heads > 65535 or batch * heads * q_tiles * 128 > 2**31 - 1 or batch * heads * k_tiles > 2**31 - 1:
         return RECOMPUTE
     # The causal scheduler divides Int32 tile ids by swizzle * num_k_tiles.
-    # Use the compiled host's fixed d128, 16-bit L2 grouping for either mask.
-    heads_per_l2 = (50 * 1024 * 1024) // (sq * (128 + 128) * 2)
+    # Match the compiled family's Q/dO footprint, including narrower FP8
+    # payloads: a smaller row produces a larger scheduler divisor.
+    heads_per_l2 = (50 * 1024 * 1024) // (sq * (d_qk + d_v) * input_bytes)
     swizzle = 1 << (heads_per_l2.bit_length() - 1) if heads_per_l2 > 0 else 1
     if swizzle * k_tiles > 2**31 - 1:
         return RECOMPUTE
@@ -97,15 +98,15 @@ def select_implementation(cc, dsl_version, batch, heads, sq, skv, scale):
     return ACCUMULATION
 
 
-def workspace_layout(batch, heads, sq):
+def workspace_layout(batch, heads, sq, d=128):
     """Return aligned-payload-relative regions and advertised allocation bytes."""
-    if any(type(n) is not int or n <= 0 for n in (batch, heads, sq)):
+    if any(type(n) is not int or n <= 0 for n in (batch, heads, sq)) or d not in (64, 128, 192):
         raise ValueError("dense d128 workspace dimensions must be positive integers")
     rounded = (sq + 127) // 128 * 128
-    dq_bytes = 4 * batch * rounded * heads * 128
+    dq_bytes = 4 * batch * rounded * heads * d
     delta_bytes = 4 * batch * heads * rounded
     regions = (
-        (0, (batch, rounded, heads, 128), (rounded * heads * 128, heads * 128, 128, 1)),
+        (0, (batch, rounded, heads, d), (rounded * heads * d, heads * d, d, 1)),
         (dq_bytes, (batch, heads, rounded), (heads * rounded, rounded, 1)),
     )
     total = dq_bytes + delta_bytes + WORKSPACE_SLACK
