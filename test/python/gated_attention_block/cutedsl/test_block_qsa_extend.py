@@ -598,6 +598,7 @@ def test_extend_declaration_facts_route_carve_and_window_plan():
             ix = blk._indexer_extend
             assert ix.n_blocks_max == 32 * (16 // BS) and ix.max_kv_len == 32 * 16 and ix.pdl_names == () and blk.pdl_stages == ()
             assert ix.n_windows == 1 and ix.window_rows == batch * s_q and ix.pieces == [(b, 0, s_q) for b in range(batch)] and ix.launches_per_execute() == 6
+            assert ix.n_pieces == -(-batch // 4) * 4 and ix.piece_table[:batch] == ix.pieces  # the table padded to the 16-byte boundary
             # the carve: the caller-list band block's layout + the nine slots at the END, in launch order, ix_cand last
             caller = _qsa._declare(GEOM_SMALL, batch, s_q, n_pages=32, index_band=True, index_list_form="per_row")[0]
             lay, lay_c = blk._layout(), caller._layout()
@@ -634,7 +635,8 @@ def test_extend_declaration_facts_route_carve_and_window_plan():
         # "auto" inside the envelope: the decode step, untouched; the pins
         dec = _declare_extend(GEOM_SMALL, 2, 4, form=QSA_INDEX_SELECT_FORM_AUTO, cap=7)
         assert dec.indexer_decode and not dec.indexer_extend and dec.index_select_form_resolved == "decode" and isinstance(dec._indexer_decode, _IndexerDecode)
-        assert dec._indexer_extend is None and not dec._cache_write.index_ring and dec._layout().ix_qpos == -1
+        # the decode form's cache write may be fused into the prepare launch (the cc 10.7 fuse_prepare default): no ring arm either way
+        assert dec._indexer_extend is None and (dec._cache_write is None or not dec._cache_write.index_ring) and dec._layout().ix_qpos == -1
         for s_q in (1, 2, 4):
             pin = _declare_extend(GEOM_SMALL, 2, s_q, form=QSA_INDEX_SELECT_FORM_EXTEND, cap=3)
             assert (
@@ -646,18 +648,23 @@ def test_extend_declaration_facts_route_carve_and_window_plan():
         dpin = _declare_extend(GEOM_SMALL, 1, 4, form=QSA_INDEX_SELECT_FORM_DECODE, cap=7, slot_present=False)
         assert not dpin.indexer_extend and isinstance(dpin._indexer_decode, _IndexerDecode) and dpin.index_select_form == "decode"
     # the window plan's arithmetic (host ints)
-    r, windows, pieces = _extend_window_plan(2, 128, 32, QSA_EXTEND_SELECT_BUDGET_BYTES)
-    assert (r, windows, pieces) == (256, [(0, 256, 0, 1, 0, 1, 128)], [(0, 0, 128), (1, 0, 128)])
-    r, windows, pieces = _extend_window_plan(1, 1, 4, QSA_EXTEND_SELECT_BUDGET_BYTES)
-    assert (r, windows, pieces) == (1, [(0, 1, 0, 0, 0, 0, 1)], [(0, 0, 1)])  # R capped at T
-    r, windows, pieces = _extend_window_plan(1, 4096, 32768, 1 << 20)
-    assert r == 16 and len(windows) == 256 and len(pieces) == 256  # R floored at 16 rows
-    r, windows, pieces = _extend_window_plan(3, 100, 1024, 3 * 100 * 1024 * 4 // 2 + 1)  # the budget halves the rows: two windows, a sequence cut in two
-    assert r == 150 and windows == [(0, 150, 0, 1, 0, 1, 100), (150, 300, 2, 3, 1, 2, 100)] and pieces == [(0, 0, 100), (1, 0, 50), (1, 50, 50), (2, 0, 100)]
+    # (the piece TABLE lays the pieces out per window on a 4-int boundary -- the scorer binds a window's q_pos0 slice 16-byte aligned -- with
+    # harmless (sequence, 0, 1) padding pieces between the windows; ``pieces`` stays the real pieces in order)
+    r, windows, pieces, table = _extend_window_plan(2, 128, 32, QSA_EXTEND_SELECT_BUDGET_BYTES)
+    assert (r, windows, pieces) == (256, [(0, 256, 0, 1, 0, 1, 128)], [(0, 0, 128), (1, 0, 128)]) and table == pieces + [(1, 0, 1), (1, 0, 1)]
+    r, windows, pieces, table = _extend_window_plan(1, 1, 4, QSA_EXTEND_SELECT_BUDGET_BYTES)
+    assert (r, windows, pieces) == (1, [(0, 1, 0, 0, 0, 0, 1)], [(0, 0, 1)]) and table == [(0, 0, 1)] * 4  # R capped at T
+    r, windows, pieces, table = _extend_window_plan(1, 4096, 32768, 1 << 20)
+    assert r == 16 and len(windows) == 256 and len(pieces) == 256 and len(table) == 4 * 256  # R floored at 16 rows
+    r, windows, pieces, table = _extend_window_plan(3, 100, 1024, 3 * 100 * 1024 * 4 // 2 + 1)  # the budget halves the rows: two windows, a sequence cut in two
+    assert r == 150 and windows == [(0, 150, 0, 1, 0, 1, 100), (150, 300, 4, 5, 1, 2, 100)] and pieces == [(0, 0, 100), (1, 0, 50), (1, 50, 50), (2, 0, 100)]
+    assert table == [(0, 0, 100), (1, 0, 50), (1, 0, 1), (1, 0, 1), (1, 50, 50), (2, 0, 100), (2, 0, 1), (2, 0, 1)]
     for ws_ in windows:
+        assert ws_[2] % 4 == 0  # every window's first piece on a 16-byte boundary of ix_qpos
         for p in range(ws_[2], ws_[3] + 1):
-            assert ws_[4] <= pieces[p][0] <= ws_[5]
-    _check_extend_piece_table(pieces, 100, "qsa_indexer")
+            assert ws_[4] <= table[p][0] <= ws_[5]
+    assert [table[p] for ws_ in windows for p in range(ws_[2], ws_[3] + 1)] == pieces and len(table) % 4 == 0
+    _check_extend_piece_table(table, 100, "qsa_indexer")
     import re
 
     with pytest.raises(RuntimeError, match=re.escape("select piece 1 of sequence 1 covers rows [50, 101) outside [0, 100)")):
@@ -1067,6 +1074,7 @@ def test_extend_device_value_contract_reports_short_and_over_sequences_and_keeps
     assert bool((buf[n:] == 0x7F).all()), "a write past get_workspace_size()"
     # the sentinel past every piece's used slab: piece p of the window owns [offs[p], offs[p] + rows_p x NB) floats and uses G(q0 + rows) - G(q0) of them
     offs = [0] + [(k + 1) * t * nb_max for k in range(3)]
+    assert ix.n_windows == 1 and ix.piece_table[: len(ix.pieces)] == ix.pieces  # one window: the real pieces lead the table, the padding after
     for p, (b, r0, rows) in enumerate(ix.pieces):
         q0 = int(v["qpos"][p])
         used = sum(((q0 + i + 1) // BS) for i in range(rows))
@@ -1134,6 +1142,7 @@ def test_extend_launch_census_by_kernel_name_and_the_window_scaling():
         mp.setattr(_api, "QSA_EXTEND_SELECT_BUDGET_BYTES", 40 * ext.blk._indexer_extend.n_blocks_max * 4)  # 40 rows per window: 80 rows -> two windows
         two = _IndexerExtendCase(GEOM_FLASH_NEXT, t, kv_lens, page=16, cap=4, seed=251, split=4, fuse_gate=True, return_lse=True)
     assert two.blk._indexer_extend.n_windows == 2 and two.blk._indexer_extend.window_rows == 40 and len(two.blk._indexer_extend.pieces) == 4
+    assert two.blk._indexer_extend.n_pieces == 8 and two.blk._indexer_extend.windows[1][2] == 4  # the second window's q_pos0 slice starts 16-byte aligned
     two.compile()
     _two_launches_extend(two, "census (two windows)")
     assert torch.equal(two.kernel_ids(), ext.kernel_ids()) and torch.equal(_bits(two.out), _bits(ext.out)), "the window count changed the function"
@@ -1167,22 +1176,25 @@ def test_extend_launch_census_by_kernel_name_and_the_window_scaling():
 
 @requires_rubin
 def test_extend_capture_after_one_warm_up_replays_bitwise_and_takes_a_new_chunk():
-    """CUDA-graph capture of the extend block AFTER one eager warm-up (the first execute uploads the window plan's constants; the capture takes the
-    SECOND execute under ``set_sync_debug_mode("error")``): the capture launches nothing, the replay is BITWISE the eager run (``out``, the LSE, the
+    """CUDA-graph capture of the extend block AFTER one eager warm-up ON THE CAPTURE STREAM (the first execute uploads the window plan's constants
+    and creates the GEMM route's per-stream handle, which a capture refuses to create; the capture takes the SECOND execute under
+    ``set_sync_debug_mode("error")``): the capture launches nothing, the replay is BITWISE the eager run (``out``, the LSE, the
     list, the cache, the ring); a NEW chunk's tensors (another seed and prefix lengths over the same shapes) through the captured buffers replay
     bitwise the eager execute over them and pass the sibling's oracle."""
     t, kv_lens = 24, (321, 0, 2075)
     case = _IndexerExtendCase(GEOM_SMALL, t, kv_lens, page=16, cap=4, seed=261, fuse_gate=True, return_lse=True)
     case.compile()
     case.restore()
-    case.run()  # the eager warm-up: the plan constants land on this stream
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        case.run()  # the eager warm-up ON THE CAPTURE STREAM: the plan constants and the GEMM route's per-stream handle land there
     eager_out, eager_lse, eager_ids = case.out.clone(), case.lse.clone(), case.kernel_ids().clone()
     eager_cache, eager_ring = _bits(case.index_kv_cache).clone(), _bits(case.index_state_cache).clone()
     case.restore()
     case.out.fill_(float("nan"))
     case.lse.fill_(float("nan"))
     torch.cuda.synchronize()
-    stream = torch.cuda.Stream()
     graph = torch.cuda.CUDAGraph()
     try:
         with torch.cuda.graph(graph, stream=stream):

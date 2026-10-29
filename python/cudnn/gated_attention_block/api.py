@@ -2323,7 +2323,9 @@ class _Intermediates:
     # ``ix_kbar`` / ``ix_counts`` / ``ix_ids`` / ``ix_scores`` / ``ix_cand`` above are REUSED -- the dense kbar gathered from the paged cache
     # in ``ix_kbar``, the select windows' compact-logits scratch in ``ix_cand``): the gather's per-piece first query position and its
     # per-sequence report.  Every layout without the form is byte-identical.
-    ix_qpos: int = -1  # [n_pieces] int32: the first query position of every select piece (device data the scorer reads as q_pos0)
+    ix_qpos: int = (
+        -1
+    )  # [n_pieces] int32: the first query position of every select piece, the table laid out per window on a 16-byte boundary (the scorer's q_pos0)
     ix_seqrep: int = -1  # [B] int32: the gather's per-sequence report (n_keys, or -1 dead / -2 short / -3 past the table); nothing on the execute path reads it
 
 
@@ -7855,29 +7857,41 @@ class _IndexerDecode(_Stage):
         return ids
 
 
-def _extend_window_plan(batch: int, seq_len: int, n_blocks_max: int, budget_bytes: int) -> Tuple[int, list, list]:
+_QPOS_ALIGN = 4
+"""The EXTEND step's piece table is laid out per select window on a 4-int (16-byte) boundary: the scorer binds a window's ``q_pos0`` slice of the
+``ix_qpos`` slot as a 16-byte-aligned operand, so every window's first piece sits at a multiple of four; the gap is filled with harmless padding
+pieces ``(sequence, 0, 1)`` whose ``q_pos0`` the scorer never reads (the gather writes them, nothing else moves)."""
+
+
+def _extend_window_plan(batch: int, seq_len: int, n_blocks_max: int, budget_bytes: int) -> Tuple[int, list, list, list]:
     """The EXTEND step's select WINDOW PLAN as host ints (built at declaration, so ``get_workspace_size()`` before ``compile()`` already
     counts the slots): ``R = min(T, max(16, budget_bytes // (n_blocks_max x 4)))`` rows per window over the FLAT sequence-major rows of the
     ``[B, S_q]`` chunk (``T = B x S_q``), window ``w`` = rows ``[w R, min((w + 1) R, T))`` cut into PIECES at sequence boundaries -- at most
     one piece per sequence per window, the pieces in sequence order over consecutive sequences ``b_lo .. b_hi`` -- so a window's ``kbar``
     operand is the contiguous slice ``ix_kbar[b_lo : b_hi + 1]`` and its ``cu_seqlens_q`` / loose ``cand_batch_offsets`` are plan
-    constants.  Returns ``(R, windows, pieces)``: ``windows`` = ``(row_lo, row_hi, piece_lo, piece_hi, b_lo, b_hi, max_rows)`` per window,
-    ``pieces`` = ``(sequence, r0, rows)`` per piece (``n_pieces <= B + n_windows - 1``)."""
+    constants.  Returns ``(R, windows, pieces, table)``: ``windows`` = ``(row_lo, row_hi, piece_lo, piece_hi, b_lo, b_hi, max_rows)`` per window
+    (``piece_lo .. piece_hi`` index the TABLE), ``pieces`` = ``(sequence, r0, rows)`` per REAL piece in order (``<= B + n_windows - 1``), ``table``
+    = the pieces laid out per window on a :data:`_QPOS_ALIGN` boundary with padding pieces between the windows (the plan constants the gather
+    reads; its length is the ``ix_qpos`` slot's)."""
     t = int(batch) * int(seq_len)
     r = min(t, max(16, int(budget_bytes) // (int(n_blocks_max) * _itemsize(torch.float32))))
-    windows, pieces = [], []
+    windows, pieces, table = [], [], []
     for w in range(-(-t // r)):
         lo, hi = w * r, min((w + 1) * r, t)
-        p_lo = len(pieces)
+        p_lo = len(table)  # a multiple of _QPOS_ALIGN: the previous window's run was padded
         b_lo, b_hi = lo // int(seq_len), (hi - 1) // int(seq_len)
         max_rows = 0
         for bb in range(b_lo, b_hi + 1):
             r0 = max(lo, bb * int(seq_len)) - bb * int(seq_len)
             r1 = min(hi, (bb + 1) * int(seq_len)) - bb * int(seq_len)
             pieces.append((bb, r0, r1 - r0))
+            table.append((bb, r0, r1 - r0))
             max_rows = max(max_rows, r1 - r0)
-        windows.append((lo, hi, p_lo, len(pieces) - 1, b_lo, b_hi, max_rows))
-    return r, windows, pieces
+        p_hi = len(table) - 1
+        while len(table) % _QPOS_ALIGN:
+            table.append((b_hi, 0, 1))  # alignment padding: a harmless piece (its q_pos0 is written by the gather and read by nothing)
+        windows.append((lo, hi, p_lo, p_hi, b_lo, b_hi, max_rows))
+    return r, windows, pieces, table
 
 
 def _check_extend_piece_table(pieces: list, seq_len: int, name: str) -> None:
@@ -7940,7 +7954,9 @@ class _IndexerExtend(_PlanConstants, _Stage):
     compact slab under explicit query offsets (no microbatching), so the host windows the rows: ``R = min(T, max(16,
     QSA_EXTEND_SELECT_BUDGET_BYTES // (n_blocks_max x 4)))`` rows per window over the flat sequence-major rows, each window cut into pieces
     at sequence boundaries (at most one per sequence, consecutive sequences), ONE ``ix_cand`` slot of ``R x n_blocks_max`` fp32 reused
-    window by window in stream order.  Every piece satisfies :func:`_check_extend_piece_table` (the gather's precondition).  At the 24 / 2
+    window by window in stream order; the piece table is laid out per window on a 16-byte boundary (:data:`_QPOS_ALIGN`: the scorer binds the
+    window's ``q_pos0`` slice of ``ix_qpos`` as an aligned operand; harmless padding pieces fill the gaps).  Every piece satisfies
+    :func:`_check_extend_piece_table` (the gather's precondition).  At the 24 / 2
     geometry behind a 128K-token table (``n_blocks_max`` 32768): one window of 2048 rows at B 1 (a 256 MiB slot), two at B 4.
 
     **Plan constants, warm-up, capture.**  The piece table, every window's ``cu_seqlens_q`` (int32), loose ``cand_batch_offsets`` (int64) and
@@ -8015,10 +8031,12 @@ class _IndexerExtend(_PlanConstants, _Stage):
             )
         self.use_pdl = bool(use_pdl)
         # the select WINDOW PLAN (host ints): the window rows, the windows, the pieces; the gather's precondition on every piece (M1)
-        self.window_rows, self.windows, self.pieces = _extend_window_plan(self.batch, self.seq_len, self.n_blocks_max, QSA_EXTEND_SELECT_BUDGET_BYTES)
-        _check_extend_piece_table(self.pieces, self.seq_len, self.name)
+        self.window_rows, self.windows, self.pieces, self.piece_table = _extend_window_plan(
+            self.batch, self.seq_len, self.n_blocks_max, QSA_EXTEND_SELECT_BUDGET_BYTES
+        )
+        _check_extend_piece_table(self.piece_table, self.seq_len, self.name)  # the real pieces and the alignment padding alike
         self.n_windows = len(self.windows)
-        self.n_pieces = len(self.pieces)
+        self.n_pieces = len(self.piece_table)  # the ix_qpos slot's length: the pieces laid out per window on a 16-byte boundary
         self._q_recipe = None  # the pool-1 query compress
         self._step = None  # the chunk form of the step compress (paged, ring read-only)
         self._gather = None  # the dense kbar gather
@@ -8141,12 +8159,12 @@ class _IndexerExtend(_PlanConstants, _Stage):
         # window the query prefix, the LOOSE compact-logits bases (piece p at sum of the earlier pieces' rows x n_blocks_max floats) and -- e4m3 --
         # the scorer's padded Q scale prefix (_fp8_q_scale_prefix: nothing built per execute, Rule 1).
         host = dict(
-            piece_seq=torch.tensor([p[0] for p in self.pieces], dtype=torch.int32),
-            piece_r0=torch.tensor([p[1] for p in self.pieces], dtype=torch.int32),
-            piece_rows=torch.tensor([p[2] for p in self.pieces], dtype=torch.int32),
+            piece_seq=torch.tensor([p[0] for p in self.piece_table], dtype=torch.int32),
+            piece_r0=torch.tensor([p[1] for p in self.piece_table], dtype=torch.int32),
+            piece_rows=torch.tensor([p[2] for p in self.piece_table], dtype=torch.int32),
         )
         for w, (lo, hi, p_lo, p_hi, b_lo, b_hi, max_rows) in enumerate(self.windows):
-            rows = [self.pieces[p][2] for p in range(p_lo, p_hi + 1)]
+            rows = [self.piece_table[p][2] for p in range(p_lo, p_hi + 1)]
             cu = [0]
             for r in rows:
                 cu.append(cu[-1] + r)

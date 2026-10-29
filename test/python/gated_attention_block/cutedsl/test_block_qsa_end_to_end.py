@@ -788,7 +788,9 @@ def _indexer_two_stage(c: _Cell, label: str) -> dict:
     n_exec = len(c.runs)  # the stage's counter is cumulative over the cell's executes
     m = dict(identity=not ix["selects"], launches=ix["launches"], executes=n_exec)
     if not ix["selects"]:
-        j = torch.arange(top_k, device=dev, dtype=torch.int32).expand(b, s, top_k)
+        j = (
+            counts[..., None].to(torch.int32) - 1 - torch.arange(top_k, device=dev, dtype=torch.int32)
+        )  # the identity DESCENDING: the block's one canonical order
         assert torch.equal(torch.where(valid, k_ids, torch.full_like(k_ids, -1)), torch.where(valid, j, torch.full_like(j, -1))), f"{label}: not the identity"
         assert ix["launches"] == n_exec * c.blk._indexer.launches_per_execute(
             "kbar_out" in ix
@@ -1113,7 +1115,9 @@ def _indexer_e4m3_two_stage(cell8: _Cell, cell16: _Cell, label: str) -> dict:
     if cache:
         _e4m3_cache_rows(ix8["kbar_out"], ix16["kbar_out"], nb, None if seq_lens is None else seq_lens.tolist(), label)
     if not ix8["selects"]:
-        j = torch.arange(top_k, device=dev, dtype=torch.int32).expand(b, s, top_k)
+        j = (
+            counts[..., None].to(torch.int32) - 1 - torch.arange(top_k, device=dev, dtype=torch.int32)
+        )  # the identity DESCENDING: the block's one canonical order
         assert torch.equal(torch.where(valid, k_ids, torch.full_like(k_ids, -1)), torch.where(valid, j, torch.full_like(j, -1))), f"{label}: not the identity"
         assert torch.equal(k_ids, ix16["kernel_ids"])
         print(f"\n{label}: the identity list (S <= {q.identity_bound}), {ix8['launches']} indexer launch(es) over {n_exec} executes (cache={cache})")
@@ -1332,7 +1336,9 @@ def test_indexer_identity_block_first_use_on_an_explicit_stream_with_the_ambient
     pos = torch.arange(S, device="cuda").repeat(B)
     counts = torch.minimum((pos + 1) // BS, torch.full_like(pos, top_k)).to(torch.int32)
     j = torch.arange(top_k, device="cuda", dtype=torch.int32)
-    identity = torch.where(j[None, :] < counts[:, None], j[None, :].expand(t, top_k), torch.full((t, top_k), -1, dtype=torch.int32, device="cuda"))
+    identity = torch.where(
+        j[None, :] < counts[:, None], counts[:, None] - 1 - j[None, :], torch.full((t, top_k), -1, dtype=torch.int32, device="cuda")
+    )  # DESCENDING
     ambient, side = torch.cuda.default_stream(), torch.cuda.Stream()
     assert torch.cuda.current_stream() == ambient and side != ambient
     ws_bytes = sync.blk.get_workspace_size()  # the same declaration's size: every buffer is allocated and filled BEFORE the park
