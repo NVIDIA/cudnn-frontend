@@ -3493,6 +3493,56 @@ def test_sm120_warp_grid_axis(config_name: str, a_major: str) -> None:
     )
 
 
+# (graph builder, torch reference) for the activations whose emitters use max/min.
+_NAN_ACTIVATIONS = {
+    "relu": (lambda g, C: g.relu(input=C, name="act"), torch.relu),
+    "relu_clip": (lambda g, C: g.relu(input=C, lower_clip=-1.5, upper_clip=6.0, name="act"), lambda x: torch.clamp(x, -1.5, 6.0)),
+    "relu_slope_clip": (
+        lambda g, C: g.relu(input=C, negative_slope=1.0, lower_clip=-7.0, upper_clip=7.0, name="act"),
+        lambda x: torch.clamp(x, -7.0, 7.0),
+    ),
+    "leaky_relu": (lambda g, C: g.leaky_relu(input=C, negative_slope=0.01, name="act"), lambda x: torch.nn.functional.leaky_relu(x, 0.01)),
+    "elu": (lambda g, C: g.elu(input=C, name="act"), torch.nn.functional.elu),
+}
+
+
+@pytest.mark.parametrize("act", list(_NAN_ACTIVATIONS))
+def test_sm120_relu_family_propagates_nan(act: str) -> None:
+    """relu (plain, clipped, sloped and clipped), leaky_relu and elu keep a NaN
+    accumulator NaN, as torch does and as the frontend requests for RELU_FWD
+    (CUDNN_PROPAGATE_NAN). Their max/min used to return the non-NaN operand, so
+    NaN came out as 0 or lower_clip. +-inf accumulators pin the unchanged
+    non-finite results."""
+    cfg = _resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    M = N = K = 128
+    ok, reason = _compatible(cfg, M, N, K, "bf16", "bf16")
+    if not ok:
+        pytest.skip(reason)
+    build, ref_fn = _NAN_ACTIVATIONS[act]
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    build(g, g.matmul(A=A, B=B, name="mm")).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    compiled = _plan(g, config=cfg)
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    a[0, 0, 3] = float("nan")  # row 0: NaN in every column
+    a[0, 1, 4], a[0, 1, 5] = float("inf"), float("-inf")  # row 1: inf - inf
+    b[0, :, 4] = b[0, :, 5] = 1.0
+    a[0, 2, 6] = float("inf")  # row 2: 0 * inf, then +inf, then -inf
+    b[0, :64, 6], b[0, 64:96, 6], b[0, 96:, 6] = 0.0, 1.0, -1.0
+    acc = torch.einsum("bmk,bnk->bmn", a.double(), b.double()).float()
+    nan = torch.isnan(acc)
+    assert int(nan.sum()) == 320 and int(torch.isinf(acc).sum()) == 64
+
+    out = torch.full((1, M, N), 12345.0, device="cuda")  # finite, so an unwritten NaN cell cannot pass
+    compiled(_vp(compiled, a, b, out))
+    torch.cuda.synchronize()
+    lost = int((~torch.isnan(out[nan])).sum())
+    assert lost == 0, f"{act}: {lost} of {int(nan.sum())} NaN accumulators came out finite, values {torch.unique(out[nan]).tolist()[:4]}"
+    torch.testing.assert_close(out, ref_fn(acc), atol=1e-5, rtol=1e-5, equal_nan=True)
+
+
 def test_sm120_render_smoke() -> None:
     """Render the sm120 template end-to-end (real tile constants + epilogue
     snippets) on whatever GPU is active — no cute.compile, and through the
