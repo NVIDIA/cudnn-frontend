@@ -893,12 +893,9 @@ def _host(
             )
 
     grid_shape = (grid_num_clusters, 1, 1)
-    # A launch started at zero leaves the scheduler counter (the int32 at counter_qword) at its
-    # tile count + grid_num_clusters, since each CTA stops at its first claim past the last tile;
-    # this one-thread launch zeroes it before every main launch. A runtime that renders
-    # external_counter_reset True must zero it itself before every launch, visibly to the
-    # kernel's griddepcontrol.wait, which waits only for the previous grid on the stream: with
-    # one zero for FC1 and FC2 on one workspace, FC2 silently skips its tiles below FC1's final count.
+    # A launch started at zero leaves the scheduler counter (the int32 at counter_qword) at its tile count + grid_num_clusters (one failing claim per CTA).
+    # With external_counter_reset True the runtime must zero it before every launch, visible at griddepcontrol.wait (which waits only for the previous grid);
+    # one zero for FC1 and FC2 on one workspace makes FC2 silently skip its tiles below FC1's final count.
     counter_qword = grid_num_clusters * moe_desc_slots * TENSOR_MAP_QWORDS
     if cutlass.const_expr(not external_counter_reset):
         _dynamic_scheduler_counter_initialization(a_tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)

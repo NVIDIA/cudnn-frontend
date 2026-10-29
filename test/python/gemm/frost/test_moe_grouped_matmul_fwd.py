@@ -2069,7 +2069,7 @@ def test_sm120_moe_external_counter_reset_states_its_contract(template: str) -> 
     launch, and the kernel never writes the counter back. The comment at the guard
     is the only statement of what such a runtime owes (a zero before every launch,
     visible to the kernel's griddepcontrol.wait), so pin it together with the kernel
-    facts it rests on: one relaxed add per claim and no other use of the counter."""
+    facts it rests on: one atomic add per claim and no other use of the counter."""
     import ast
 
     from cudnn.gemm.frost.kernel_registry import template_path
@@ -2095,11 +2095,13 @@ def test_sm120_moe_external_counter_reset_states_its_contract(template: str) -> 
 @requires_matmul_gpu
 @pytest.mark.parametrize("external_reset", [False, True], ids=["host_reset", "external_reset"])
 def test_sm120_moe_scheduler_counter_needs_a_zero_before_every_launch(external_reset: bool, monkeypatch) -> None:
-    """FC1 then FC2 through one plan and one workspace, as FlashInfer's MoE adapters run
-    them. Each launch leaves the counter at its tile count + grid_num_clusters. The
-    default host zeroes it before every launch, so a stale count is harmless; with
-    ``external_counter_reset`` rendered True and one zero for both launches (a per-layer
-    reset), FC2 starts at FC1's final count and skips the tiles below it without an error."""
+    """FC1 then FC2 on one workspace, so both launches use one counter word, as in FlashInfer's
+    MoE adapters (two compiled kernels, FC1 and FC2, that share one ``desc`` scratch; one
+    compiled kernel stands in for both here). Each launch leaves the counter at its tile
+    count + grid_num_clusters. The default host zeroes it before every launch, so a stale
+    count is harmless; with ``external_counter_reset`` rendered True and one zero for both
+    launches (a per-layer reset), FC2 starts at FC1's final count and skips the tiles below
+    it without an error."""
     from cudnn.gemm.frost.sm120 import compiler as C120
 
     cfg = by_name(_SM120_CFG)  # 128 x 128 CTA tiles
