@@ -1507,11 +1507,29 @@ def _walk_mainloop_chain(
     intermediate_dtype: Dtype,
     compute_dtype: Dtype,
 ) -> tuple[int, list[FusionOp]]:
-    """Walk backwards from a matmul operand through pointwise ops (unary, or binary with one SCALAR graph-input aux) to the root graph input."""
+    """Walk operand pointwise ops to a graph input (scalar aux, or A-side per-K multiply)."""
 
     def _is_scalar_input(tid: int) -> bool:
         m = meta.get(tid)
         return m is not None and m.is_input and len(m.dim) > 0 and all(d == 1 for d in m.dim)
+
+    def _pointwise_dim(tid: int) -> tuple[int, ...]:
+        m = meta.get(tid)
+        if m is not None and m.dim:
+            return m.dim
+        producer = op_by_output.get(tid)
+        if producer is None or producer.cudnn_name not in (_UNARY_OP_MAP.keys() | _BINARY_OP_MAP.keys()):
+            return ()
+        dims = [_pointwise_dim(inp) for inp in producer.inputs]
+        if not dims or any(len(dim) != 3 for dim in dims):
+            return ()
+        if any(len({d for d in axis if d != 1}) > 1 for axis in zip(*dims)):
+            return ()
+        return tuple(max(axis) for axis in zip(*dims))
+
+    def _is_per_k_input(tid: int, other: int) -> bool:
+        m, source_dim = meta.get(tid), _pointwise_dim(other)
+        return label == "A" and m is not None and m.is_input and len(source_dim) == 3 and m.dim == (1, 1, source_dim[-1]) and source_dim[1] != 1
 
     # Each entry: (cudnn_name, is_binary, aux_name_or_None, aux_on_rhs).
     steps: list[tuple] = []
@@ -1534,13 +1552,17 @@ def _walk_mainloop_chain(
                 aux_id, chain_id, aux_on_rhs = i0, i1, False
             elif s1 and not s0:
                 aux_id, chain_id, aux_on_rhs = i1, i0, True
+            elif producer.cudnn_name == "mul" and _is_per_k_input(i0, i1):
+                aux_id, chain_id, aux_on_rhs = i0, i1, False
+            elif producer.cudnn_name == "mul" and _is_per_k_input(i1, i0):
+                aux_id, chain_id, aux_on_rhs = i1, i0, True
             else:
                 raise ValueError(
                     f"matmul {label} operand is produced by binary op "
                     f"{producer.op_name!r} ({producer.cudnn_name!r}) — mainloop "
                     "fusion only supports a binary op with exactly one SCALAR "
                     "graph-input aux (e.g. A * alpha); per-row/col/elem aux on an "
-                    "operand is out of POC scope (needs swizzle-aware indexing)"
+                    "operand is out of scope except A-side mul with a contiguous [1,1,K] scale"
                 )
             aux_meta = meta[aux_id]
             if aux_id not in aux_seen:
@@ -1551,7 +1573,7 @@ def _walk_mainloop_chain(
                         dim=aux_meta.dim,
                         stride=aux_meta.stride,
                         dtype=aux_meta.dtype,
-                        bcast_mode="scalar",
+                        bcast_mode="scalar" if _is_scalar_input(aux_id) else "per_k",
                     )
                 )
                 aux_objs.append(aux_meta.tensor)

@@ -41,7 +41,7 @@ AMajor = Literal["k", "m"]
 BMajor = Literal["k", "n"]
 OutMajor = Literal["n", "m"]
 
-BroadcastMode = Literal["scalar", "per_row", "per_col", "per_elem"]
+BroadcastMode = Literal["scalar", "per_row", "per_col", "per_elem", "per_k"]
 ReductionMode = Literal["add", "amax", "max", "min", "avg", "mul", "mul_no_zeros", "norm1", "norm2"]
 REDUCTION_DTYPES: tuple[Dtype, ...] = ("fp32", "int32")
 
@@ -562,6 +562,8 @@ class FusionChain:
         for op in self.ops:
             if op.aux is not None and op.aux not in names:
                 raise ValueError(f"op {op.op!r} references unknown aux {op.aux!r}")
+            if op.aux is not None and self.aux_by_name(op.aux).bcast_mode == "per_k":
+                raise ValueError("per-K scale is a mainloop-only aux, not an epilogue broadcast")
         for red in self.reductions:
             if is_gemm_source(red.source_ref):
                 g = gemm_index(red.source_ref)
@@ -613,7 +615,32 @@ class FusionChain:
                     if op.aux not in names:
                         raise ValueError(f"{label} op {op.op!r} references unknown aux {op.aux!r}")
                     ref = self.aux_by_name(op.aux)
-                    if ref.bcast_mode != "scalar":
+                    if ref.bcast_mode == "per_k":
+                        mm = self.matmul
+                        if (
+                            label != "mainloop_a_ops"
+                            or op.op != "mul"
+                            or self.has_moe
+                            or self.has_block_scale
+                            or self.is_multi_gemm
+                            or mm.batch != 1
+                            or mm.a_dtype != "bf16"
+                            or mm.b_dtype != "bf16"
+                            or self.mainloop_a_load_dtype is not None
+                            or mm.a_major != "k"
+                            or mm.K % 8 != 0
+                            or ref.dim != (1, 1, mm.K)
+                            or ref.stride[-1] != 1
+                            or ref.dtype != "bf16"
+                            or op.compute_dtype != "fp32"
+                            or op.out_dtype != "bf16"
+                        ):
+                            raise ValueError(
+                                "per-K mainloop scale requires a single batch=1 BF16 GEMM, K-major BF16 A, "
+                                "K divisible by 8, and A-side mul with contiguous BF16 [1,1,K] scale "
+                                "(FP32 compute, BF16 result)"
+                            )
+                    elif ref.bcast_mode != "scalar":
                         raise ValueError(
                             f"{label} op {op.op!r} aux {op.aux!r} must broadcast as a "
                             f"scalar (got {ref.bcast_mode!r}); per-row/col/elem mainloop "
@@ -777,6 +804,9 @@ class FusionChain:
 
 def swap_ab(chain: FusionChain) -> FusionChain:
     """Return the logical-transpose view ``C.T = B.T @ A.T`` of ``chain``."""
+
+    if any(aux.bcast_mode == "per_k" for aux in chain.aux_tensors):
+        raise ValueError("A-side per-K mainloop scale does not support swap_ab")
 
     def _mn(values):
         if values is None or len(values) < 2:

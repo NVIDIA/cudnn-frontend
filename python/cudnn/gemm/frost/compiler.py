@@ -64,6 +64,9 @@ _INJECT_MARKER_LINE = re.compile(r"^([ \t]*)# *@@([A-Z0-9_]+)@@[ \t]*\n", flags=
 
 def _aux_fake_shape_code(aux: TensorRef) -> str:
     """Generate the symbolic shape of an auxiliary tensor."""
+    if aux.bcast_mode == "per_k":
+        # This first implementation specializes K, unlike output-axis aux tensors.
+        return str(aux.dim)
     if len(aux.dim) == 3:
         if aux.grouped_by_moe:
             batch = "sym_g"
@@ -460,7 +463,7 @@ def _is_layout_ambiguous(t: object) -> bool:
 def _aux_fake_real_axes(ref: TensorRef) -> list[bool]:
     """Identify symbolic axes in an auxiliary tensor."""
     row = ref.bcast_mode in ("per_row", "per_elem")
-    col = ref.bcast_mode in ("per_col", "per_elem")
+    col = ref.bcast_mode in ("per_col", "per_elem", "per_k")
     if len(ref.dim) == 3:
         batch_real = ref.grouped_by_moe or ref.dim[0] != 1
         return [batch_real, row, col]
@@ -1043,6 +1046,8 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         ins = tuple(((op.kc, op.modulus, op.batch, op.kpack, op.is_b, i in stride_ins) for i, op in enumerate(r.inputs)))
         outs = tuple(((o.index, *(x for axis in o.rule for x in axis), o.align) for o in r.outputs))
         auxs = tuple(((x.index, x.align) for x in r.aux))
+        per_k_scales = tuple(x.index for x in r.aux if x.ref.bcast_mode == "per_k")
+        scale_mnk = (self.chain.matmul.M, self.chain.matmul.N, self.chain.matmul.K)
         sfs = tuple(((s.index, s.is_a, r.inputs[s.operand_at].batch) for s in r.sf))
         tail = r.arg_plan[len(r.inputs) :]
         shared, seeds = (r.shared_layout, r.seeds)
@@ -1089,6 +1094,10 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                 gave_up["A or B is not rank 3"] += 1
                 return refuse(operands, graph_order)
             m, n, k = (a_sh[1], b_sh[1], a_sh[2] * a_kpack)
+            for idx in per_k_scales:
+                scale = operands[idx]
+                if (m, n, k) != scale_mnk or tuple(scale.shape) != (1, 1, k) or scale.stride(-1) != 1 or backend.buffers.dtype_name(scale) != "bfloat16":
+                    raise ValueError("per-K mainloop scale requires the compiled M/N/K and a contiguous BF16 [1,1,K] runtime scale")
             problem = [m, n, k, batch]
             for (kc, mod, ebatch, kpack, is_b, takes_stride), v in zip(ins, vs):
                 sh, st = (v.shape, v.stride())
