@@ -26,6 +26,7 @@ from cudnn._pygraph import pygraph
 
 from ._cutedsl import BLOCK_SCALE_CUTEDSL_MIN_VERSION, DENSE_CUTEDSL_MIN_VERSION, requirement_error as cutedsl_requirement_error
 
+_MISSING_DEVICE = object()
 _ZERO = (0, 0, 0)
 _ONE = (1, 1, 1)
 _CUTLASS_STORAGE_DTYPES = {
@@ -353,6 +354,14 @@ class _Sm100FrostConvPlan(CompiledPlan):
             _cuda.CUstream(ctx.stream or 0),
         )
         if self._workspace_bytes:
+            device = getattr(ctx.workspace, "__dlpack_device__", None)
+            if device is None:
+                # Raw addresses have no observable placement; Python producers may.
+                observed = getattr(ctx.workspace, "device", _MISSING_DEVICE)
+                if observed is not _MISSING_DEVICE and (getattr(observed, "type", None) != "cuda" or getattr(observed, "index", None) != self._device):
+                    raise ValueError(f"frost_conv: workspace must be on CUDA device {self._device}")
+            elif tuple(device()) != (2, self._device):
+                raise ValueError(f"frost_conv: workspace must be on CUDA device {self._device}")
             workspace = Workspace.over(variant_pack, self._workspace_bytes, "frost_conv")
             start = variant_pack.workspace
             end = start + self._workspace_bytes

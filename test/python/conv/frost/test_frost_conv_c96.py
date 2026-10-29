@@ -7,9 +7,13 @@ import cudnn
 import pytest
 import torch
 
-from utils import make_input, requires_dense_cutedsl, requires_sm100, select_and_build_frost_plan
+from utils import make_input, requires_dense_cutedsl, _active_sm, select_and_build_frost_plan
 
-pytestmark = [pytest.mark.L1, requires_sm100, requires_dense_cutedsl]
+pytestmark = [
+    pytest.mark.L1,
+    pytest.mark.skipif(_active_sm() != 100, reason="FROST convolution requires SM100"),
+    requires_dense_cutedsl,
+]
 
 
 @pytest.fixture(autouse=True)
@@ -192,9 +196,11 @@ def test_frost_conv_c96_declines_outside_qualified_envelope(unsupported):
         FrostConvEngine().check_support(graph)
 
 
-def test_frost_conv_c96_stream_rebinding_and_capture(cudnn_handle):
+@pytest.mark.L0
+@pytest.mark.parametrize("k", [96, 192])
+def test_frost_conv_c96_stream_rebinding_and_capture(cudnn_handle, k):
     image = make_input((1, 96, 3, 5, 7), torch.bfloat16, seed=510)
-    weight = make_input((192, 96, 3, 3, 3), torch.bfloat16, seed=511)
+    weight = make_input((k, 96, 3, 3, 3), torch.bfloat16, seed=511)
     graph, (x, w, y), output, workspace = _plan(image, weight)
     stream = torch.cuda.Stream()
     original_stream = cudnn.get_stream(cudnn_handle)
@@ -221,6 +227,7 @@ def test_frost_conv_c96_stream_rebinding_and_capture(cudnn_handle):
                 torch.cuda.set_sync_debug_mode(previous_mode)
         for value in (0.25, -0.5):
             image.fill_(value)
+            weight.fill_(value / 2)
             output.fill_(float("nan"))
             captured.replay()
             torch.cuda.synchronize()
@@ -313,6 +320,79 @@ def test_frost_conv_c96_initial_workspace_bounds_and_aliases():
     graph.execute({x: image, w: weight, y: shared_output}, arena[:required])
     torch.cuda.synchronize()
     _close(shared_output, _reference(image, weight))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("ordered", [False, True])
+def test_frost_conv_c96_initial_workspace_device_before_launch(monkeypatch, ordered):
+    from types import SimpleNamespace
+
+    image = make_input((1, 96, 1, 5, 7), torch.bfloat16, seed=625)
+    weight = make_input((96, 96, 3, 3, 3), torch.bfloat16, seed=626)
+    graph, tensors, output, workspace = _plan(image, weight)
+    values = (image, weight, output)
+
+    def call(scratch):
+        if ordered:
+            graph.execute(values, scratch, tensor_uids=[t.uid for t in tensors])
+        else:
+            graph.execute(dict(zip(tensors, values)), scratch)
+
+    class PythonBuffer:
+        def __init__(self, tensor):
+            self.tensor = tensor
+            self.shape, self.dtype, self.device = tensor.shape, tensor.dtype, tensor.device
+
+        def data_ptr(self):
+            return self.tensor.data_ptr()
+
+        def stride(self):
+            return self.tensor.stride()
+
+        def element_size(self):
+            return self.tensor.element_size()
+
+    # CPU allocation alignment is not guaranteed; choose an aligned live slice.
+    required = graph.get_workspace_size()
+    arena = torch.empty(required + 127, dtype=torch.uint8, device="cpu")
+    offset = (-arena.data_ptr()) % 128
+    host_workspace = arena[offset : offset + required]
+    producer = PythonBuffer(workspace)
+    plan = graph._compiled_plans[graph._plan_index]
+    launches = []
+    with monkeypatch.context() as patch:
+        # Never launch on an invalid pointer, including when this test is RED.
+        patch.setattr(plan, "_compiled", lambda *args: launches.append(args))
+        with pytest.raises(ValueError, match="workspace must be on CUDA device"):
+            call(host_workspace)
+        assert not launches
+        for device in (
+            "cpu",
+            torch.device("cpu"),
+            torch.device("cuda", workspace.device.index + 1),
+            SimpleNamespace(type="cuda"),
+            SimpleNamespace(index=workspace.device.index),
+            None,
+        ):
+            producer.device = device
+            with pytest.raises(ValueError, match="workspace must be on CUDA device"):
+                call(producer)
+            assert not launches
+        # DLPack producers can declare a foreign device without a device property.
+        producer.__dlpack_device__ = lambda: (2, workspace.device.index + 1)
+        with pytest.raises(ValueError, match="workspace must be on CUDA device"):
+            call(producer)
+        assert not launches
+        del producer.__dlpack_device__
+        del producer.device
+        # No observable placement retains the existing caller-owned contract.
+        call(producer)
+        call(workspace.data_ptr())
+        assert len(launches) == 2
+    producer.device = workspace.device
+    call(producer)
+    torch.cuda.synchronize()
+    _close(output, _reference(image, weight))
 
 
 def test_frost_conv_c96_initial_capture_separate_workspaces(cudnn_handle):
