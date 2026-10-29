@@ -157,7 +157,7 @@ sdpa/frost/test_sdpa_bwd_mxfp8_sm107.py::test_reject_sink	rule: first L0 cell of
 sdpa/frost/test_sdpa_bwd_prepared_mxfp8.py::TestPreparedMxfp8Bwd::test_rebind_and_explicit_stream_replay[False]	rule: first L0 cell of test_rebind_and_explicit_stream_replay
 sdpa/frost/test_sdpa_bwd_prepared_mxfp8.py::TestPreparedMxfp8Bwd::test_warm_execute_has_no_tensor_plumbing[False]	rule: first L0 cell of test_warm_execute_has_no_tensor_plumbing
 sdpa/frost/test_sdpa_bwd_stage3_block_scale_sm107.py::test_block_scale_thd_leg_sf_prefix_contract_and_operand_refusals	rule: first L0 cell of test_block_scale_thd_leg_sf_prefix_contract_and_operand_refusals
-sdpa/frost/test_sdpa_bwd_native_execution_sm100.py::test_staged_execute_uses_prepared_copies[dtype0]	rule: first L0 cell of test_staged_execute_uses_prepared_copies
+sdpa/frost/test_sdpa_bwd_native_execution_sm100.py::test_native_execute_uses_current_pointers[dtype0]	rule: first L0 cell of test_native_execute_uses_current_pointers
 sdpa/frost/test_sdpa_bwd_native_layouts_sm100.py::test_native_rebind_stream_capture[roles0-264-4-False-dtype0]	rule: first L0 cell of test_native_rebind_stream_capture
 sdpa/frost/test_sdpa_bwd_thd_fp8_sm107.py::test_capabilities_claim_thd_and_a_ragged_bottom_right	rule: first L0 cell of test_capabilities_claim_thd_and_a_ragged_bottom_right
 sdpa/frost/test_sdpa_bwd_thd_fp8_sm107.py::test_fp8_thd_serves_the_external_delta	rule: first L0 cell of test_fp8_thd_declines_the_external_delta

@@ -1324,3 +1324,16 @@ def make_cfg_d512_2x2(params: TemplateParams) -> CfgBwdD512x2:
     )
     _validate_cfg_d512_2x2(cfg)
     return cfg
+
+
+def _sm100_device_clusters(device, cga_m: int) -> int:
+    """Clusters that fit the device once, for the THD persistent grid.
+
+    Occupancy-sized rather than work-sized: the work list is a device value, so
+    the grid cannot be it.  One CTA per SM is this kernel's design point, so the
+    cluster count is simply SM count / CGA width.
+    """
+    from cudnn.frost import device as _dev
+
+    idx = device.index if hasattr(device, "index") and device.index is not None else 0
+    return max(1, _dev.multiprocessor_count(idx) // cga_m)

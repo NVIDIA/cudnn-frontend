@@ -32,6 +32,7 @@ from cudnn.sdpa.bwd.config_sm120 import (
     padded_head_dim as _sm120_padded_head_dim,
     padded_head_dims as _sm120_padded_head_dims,
 )
+from .config_sm100 import _sm100_device_clusters  # noqa: F401 - retained private import seam
 from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, _torch_stream_context, ws_align
 from cudnn.sdpa.fwd import config_sm80 as _fwd_config_sm80
 
@@ -1941,19 +1942,6 @@ def _sm100_kernel_path(fname: str) -> str:
 # Kept next to the workspace math that uses it; CFG.WS_BLOCK_ROWS is the same
 # number and the stage-2 validator pins it to TILE_M.
 _SM100_WS_BLOCK_ROWS = 128
-
-
-def _sm100_device_clusters(device, cga_m: int) -> int:
-    """Clusters that fit the device once, for the THD persistent grid.
-
-    Occupancy-sized rather than work-sized: the work list is a device value, so
-    the grid cannot be it.  One CTA per SM is this kernel's design point, so the
-    cluster count is simply SM count / CGA width.
-    """
-    from cudnn.frost import device as _dev
-
-    idx = device.index if hasattr(device, "index") and device.index is not None else 0
-    return max(1, _dev.multiprocessor_count(idx) // cga_m)
 
 
 def _sm100_head_chunk_thd(

@@ -35,7 +35,7 @@ def compile_plan(api, stage2, mm_lo, mm_hi):
     import torch
 
     from cudnn.frost.device import compute_capability, resolve_device
-    from .api_dsl import _sm100_device_clusters
+    from .config_sm100 import _sm100_device_clusters
     from .kernels.sm100.prepared_host import Params, compile_host
     from .kernels.sm120.prepared_host import compact
 
