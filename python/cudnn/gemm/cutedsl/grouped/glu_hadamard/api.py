@@ -103,6 +103,7 @@ class GroupedGemmGluHadamardSm100(APIBase):
         use_dynamic_sched: bool = False,
         use_tmem_post_rht_amax: bool = False,
         tanh_clamp_scale: Optional[float] = None,
+        rht_sign_mask: int = 0,
     ):
         if sample_a is not None:
             _require_torch_inputs(sample_a, "GroupedGemmGluHadamardSm100")
@@ -173,9 +174,18 @@ class GroupedGemmGluHadamardSm100(APIBase):
         if sample_post_rht_amax is None:
             sample_post_rht_amax = torch.empty((self.expert_cnt, 1), dtype=torch.float32, device=sample_a.device)
         self.post_rht_amax_desc = self._make_tensor_desc(sample_post_rht_amax, name="sample_post_rht_amax")
+        # Random sign mask of the consumer's randomized Hadamard transform (bit i negates
+        # input element i of each 16-token block). The post-RHT amax is computed for that
+        # transform; the plain Hadamard amax can be off by the sign pattern and either clip
+        # or waste range when the consumer quantizes with it.
+        if not isinstance(rht_sign_mask, int) or not 0 <= rht_sign_mask < (1 << HADAMARD_SIZE):
+            raise ValueError(f"rht_sign_mask must be a {HADAMARD_SIZE}-bit integer, got {rht_sign_mask!r}")
+        self.rht_sign_mask = int(rht_sign_mask)
         if sample_hadamard is None:
-            self.hadamard_tensor = self._make_hadamard_tensor(sample_a.device)
+            self.hadamard_tensor = self._make_hadamard_tensor(sample_a.device, self.rht_sign_mask)
         else:
+            if self.rht_sign_mask != 0:
+                raise ValueError("rht_sign_mask cannot be combined with sample_hadamard; fold the signs into the tensor instead")
             self.hadamard_tensor = self._normalize_hadamard_tensor(
                 sample_hadamard,
                 device=sample_a.device,
@@ -220,10 +230,16 @@ class GroupedGemmGluHadamardSm100(APIBase):
         self._workspace = None
 
     @staticmethod
-    def _make_hadamard_tensor(device: torch.device) -> torch.Tensor:
+    def _make_hadamard_tensor(device: torch.device, rht_sign_mask: int = 0) -> torch.Tensor:
         import torch
 
-        return hadamard_matrix(HADAMARD_SIZE, dtype=torch.bfloat16, device=device).t().contiguous()
+        hadamard = hadamard_matrix(HADAMARD_SIZE, dtype=torch.bfloat16, device=device)
+        if rht_sign_mask:
+            # Input-side random signs: negate the rows the mask selects (row k is the weight
+            # of input element k), matching the smem FWHT path and the consumer's RHT.
+            signs = torch.tensor([-1.0 if (rht_sign_mask >> k) & 1 else 1.0 for k in range(HADAMARD_SIZE)], dtype=torch.bfloat16, device=device)
+            hadamard = hadamard * signs[:, None]
+        return hadamard.t().contiguous()
 
     @classmethod
     def _normalize_hadamard_tensor(
@@ -395,6 +411,7 @@ class GroupedGemmGluHadamardSm100(APIBase):
             enable_bias=self.bias_desc is not None,
             use_tmem_post_rht_amax=self.use_tmem_post_rht_amax,
             tanh_clamp_scale=self.tanh_clamp_scale,
+            rht_sign_mask=self.rht_sign_mask,
         )
 
         hardware_info = cutlass.utils.HardwareInfo()
@@ -745,6 +762,7 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
     use_tmem_post_rht_amax: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
     tanh_clamp_scale: Optional[float] = None,
+    rht_sign_mask: int = 0,
 ) -> TupleDict:
     """High-level wrapper for grouped GEMM GLU + Hadamard forward fusion."""
     from cudnn.gemm.cutedsl.discrete_grouped.discrete_kernel_utils import _require_pointer_tensor
@@ -773,6 +791,7 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
             ("b_dtype", b_dtype is not None),
             ("use_tmem_post_rht_amax", use_tmem_post_rht_amax),
             ("tanh_clamp_scale", tanh_clamp_scale is not None),
+            ("rht_sign_mask", rht_sign_mask != 0),
         ):
             if rejected:
                 raise ValueError(f"{name} is unsupported for the JAX block-scaled path")
@@ -870,6 +889,11 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
         stride_signature = tuple(None if idx in dynamic_stride_dims else value for idx, value in enumerate(tensor.stride()))
         return static_shape_suffix, stride_signature, tensor.dtype
 
+    # Validate the mask before it is normalized into the cache key: int() would map an invalid
+    # mask (1.5 -> 1) onto a valid entry's key, and the constructor's check only runs on a miss,
+    # so whether the call is rejected would depend on what was called before.
+    if not isinstance(rht_sign_mask, int) or not 0 <= rht_sign_mask < (1 << HADAMARD_SIZE):
+        raise ValueError(f"rht_sign_mask must be a {HADAMARD_SIZE}-bit integer, got {rht_sign_mask!r}")
     situ_beta1_cache_signature = float(situ_beta1) if act_func == "situglu" else None
     cache_key = (
         a_tensor.device,
@@ -877,6 +901,7 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
         act_func,
         situ_beta1_cache_signature,
         float(tanh_clamp_scale) if tanh_clamp_scale is not None else None,
+        int(rht_sign_mask),
         a_tensor.shape[1:],
         tuple(b_tensor.shape) if is_dense else b_shape,
         c_tensor.shape[1:],
@@ -938,6 +963,7 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
                 use_dynamic_sched=use_dynamic_sched,
                 use_tmem_post_rht_amax=use_tmem_post_rht_amax,
                 tanh_clamp_scale=tanh_clamp_scale,
+                rht_sign_mask=rht_sign_mask,
             )
             if is_dense:
                 api = GroupedGemmGluHadamardSm100(sample_b=b_tensor, sample_sfb=sfb_tensor, **common_kwargs)

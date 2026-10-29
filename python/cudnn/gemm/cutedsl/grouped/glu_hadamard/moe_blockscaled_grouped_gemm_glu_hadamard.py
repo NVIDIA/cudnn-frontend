@@ -153,6 +153,7 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
         enable_bias: bool = False,
         use_tmem_post_rht_amax: bool = False,
         tanh_clamp_scale: Optional[float] = None,
+        rht_sign_mask: int = 0,
     ):
         mma_tile_m = mma_tiler_mn[0]
         if self.FIX_PAD_SIZE % mma_tile_m != 0:
@@ -248,6 +249,13 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
         if tanh_clamp_scale is not None and act_func != "srelu":
             raise ValueError("tanh_clamp_scale is only supported with act_func='srelu'")
         self.tanh_clamp_scale = float(tanh_clamp_scale) if tanh_clamp_scale is not None else None
+        # Random sign mask of the consumer's randomized Hadamard transform: bit ``i`` negates
+        # input element ``i`` of each 16-token block before the transform. The post-RHT amax
+        # is computed for that transform (with the TMEM path, the signs are folded into the
+        # Hadamard tensor by the API). Trace-time constant.
+        if not isinstance(rht_sign_mask, int) or not 0 <= rht_sign_mask < (1 << HADAMARD_SIZE):
+            raise ValueError(f"rht_sign_mask must be a {HADAMARD_SIZE}-bit integer, got {rht_sign_mask!r}")
+        self.rht_sign_mask = int(rht_sign_mask)
 
     def _setup_attributes(self):
         """Set up configurations dependent on GEMM inputs (called inside __call__)."""
@@ -2305,7 +2313,16 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                         self.situglu_act(tCompute, acc_vec_up, acc_vec_gate, mProb, situ_beta1, situ_beta2)
 
                     if cutlass.const_expr(self.generate_amax):
-                        thread_tile_amax = self.amax_reduction_per_thread(tCompute, thread_tile_amax)
+                        # The amax describes D as it is stored in d_dtype, not the FP32 values
+                        # in registers: round-to-nearest can lift the largest element above
+                        # the FP32 maximum, and it would then saturate when D is quantized
+                        # with this amax.
+                        if cutlass.const_expr(self.d_dtype in (cutlass.BFloat16, cutlass.Float16)):
+                            tComputeD = cute.make_rmem_tensor(tCompute.shape, self.acc_dtype)
+                            tComputeD.store(tCompute.load().to(self.d_dtype).to(self.acc_dtype))
+                            thread_tile_amax = self.amax_reduction_per_thread(tComputeD, thread_tile_amax)
+                        else:
+                            thread_tile_amax = self.amax_reduction_per_thread(tCompute, thread_tile_amax)
 
                     #
                     # Store post-activation output to D.
@@ -2571,6 +2588,7 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                                 0,
                                 epi_tidx,
                                 thread_tile_post_rht_amax,
+                                self.rht_sign_mask,
                             )
                             thread_tile_post_rht_amax = hadamard_smem_transpose_fwht_amax(
                                 sD,
@@ -2578,6 +2596,7 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                                 HADAMARD_SIZE,
                                 epi_tidx,
                                 thread_tile_post_rht_amax,
+                                self.rht_sign_mask,
                             )
 
                     #
