@@ -665,7 +665,8 @@ def test_graph_thd_declines_overlapping_token_stride():
 
 @pytest.mark.parametrize("d,dv", [(64, 64), (128, 128), (192, 128), (256, 256)])
 @pytest.mark.parametrize("stats_layout", ["head_major_padded", "token_major"])
-def test_graph_thd_independent_pitches_rebind_replay(d, dv, stats_layout):
+@pytest.mark.parametrize("stats_carrier", ["canonical", "th1"])
+def test_graph_thd_independent_pitches_rebind_replay(d, dv, stats_layout, stats_carrier, cudnn_handle):
     """Declared pitches reach every address; padding and allocation tails stay untouched."""
     from test_sdpa_bwd_staged_sm80 import _assert_kernel_count
 
@@ -673,6 +674,16 @@ def test_graph_thd_independent_pitches_rebind_replay(d, dv, stats_layout):
     dtype = torch.bfloat16 if d == 192 else torch.float16
     graph, vp, nodes, _ = _make_graph(lens_q, lens_kv, h=4, hkv=2, d=d, dv=dv, dtype=dtype, stats_layout=stats_layout, cap_extra=5)
     q, k, v, o, stats = nodes
+    stats_view = vp[stats]
+
+    def bind_stats():
+        # Graph producers also expose packed Stats as (T, H, 1), including
+        # head-major storage with an independent, padded head pitch.
+        vp[stats] = stats_view
+        if stats_carrier == "th1":
+            vp[stats] = stats_view.unsqueeze(-1) if stats_layout == "token_major" else stats_view[0, :, : sum(lens_q)].T.unsqueeze(-1)
+
+    bind_stats()
     storage = {}
     for index, node in enumerate((q, k, v, o)):
         _, heads, _, width = node.get_dim()
@@ -714,29 +725,46 @@ def test_graph_thd_independent_pitches_rebind_replay(d, dv, stats_layout):
                     ref_o = torch.zeros((4, nq, dv), dtype=torch.float64, device="cuda")
                     ref_lse = torch.full((4, nq), -float("inf"), dtype=torch.float64, device="cuda")
                 torch.testing.assert_close(vp[o][0, oq : oq + nq].transpose(0, 1).float(), ref_o.float(), rtol=1e-2, atol=4e-3)
-                got_lse = vp[stats][oq : oq + nq].T if stats_layout == "token_major" else vp[stats][0, :, oq : oq + nq]
+                got_lse = stats_view[oq : oq + nq].T if stats_layout == "token_major" else stats_view[0, :, oq : oq + nq]
                 torch.testing.assert_close(got_lse, ref_lse.float(), rtol=1e-3, atol=2e-3)
             oq += nq
             ok += nk
         assert torch.all(storage[o][output_padding] == 77)
         if stats_layout != "token_major":
-            assert torch.isnan(vp[stats][0, :, oq:]).all()
+            assert torch.isnan(stats_view[0, :, oq:]).all()
 
     poison()
     graph.execute(vp, workspace)
     torch.cuda.synchronize()
     check(lens_q, lens_kv)
+    if stats_carrier == "th1":
+        good = vp[stats]
+        token_stride, head_stride, _ = good.stride()
+        for bad in (
+            good[:-1],
+            torch.empty_strided(good.shape, (token_stride + 1, head_stride, 1), dtype=good.dtype, device=good.device),
+            torch.empty_strided(good.shape, (token_stride, head_stride + 1, 1), dtype=good.dtype, device=good.device),
+        ):
+            poison()
+            vp[stats] = bad
+            with pytest.raises(ValueError, match="SM80 THD .*Stats"):
+                graph.execute(vp, workspace)
+            assert torch.isnan(vp[o][:, : sum(lens_q)]).all()
+            assert torch.all(workspace == 0xA5)
+            vp[stats] = good
     # Fresh allocations with the same pitches must not retain any previous pointer.
     for node in (q, k, v, o):
         storage[node] = storage[node].clone()
         vp[node] = storage[node].as_strided(vp[node].shape, vp[node].stride(), 8)
+    stats_view = stats_view.clone()
+    bind_stats()
     vp[v][:, : sum(lens_kv)].mul_(0.7)
     poison()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     captured = torch.cuda.CUDAGraph(keep_graph=True)
     try:
-        handle = cudnn.create_handle()
+        handle = cudnn_handle
         previous_stream = cudnn.get_stream(handle)
         try:
             cudnn.set_stream(handle, stream.cuda_stream)
@@ -745,7 +773,6 @@ def test_graph_thd_independent_pitches_rebind_replay(d, dv, stats_layout):
             _assert_kernel_count(captured, 2)  # device lengths metadata + attention, no layout copies
         finally:
             cudnn.set_stream(handle, previous_stream)
-            cudnn.destroy_handle(handle)
         new_q, new_kv = (0, 25, 25), (26, 0, 41)
         for node in vp:
             name = node.get_name()

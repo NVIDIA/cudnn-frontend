@@ -7088,21 +7088,38 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             )
             if self._thd_lse_token_major:
                 self._value_error_if(
-                    lse_tensor.ndim != 2 or lse_tensor.shape[0] < t_q or lse_tensor.shape[1] != self.h_q or tuple(lse_tensor.stride()) != (self.h_q, 1),
-                    f"SM80 THD token-major Stats must have shape (>= {t_q}, {self.h_q}) and compact strides",
+                    not (lse_tensor.ndim == 2 or (lse_tensor.ndim == 3 and lse_tensor.shape[2] == 1))
+                    or lse_tensor.shape[0] < t_q
+                    or lse_tensor.shape[1] != self.h_q
+                    or tuple(lse_tensor.stride()[:2]) != (self.h_q, 1),
+                    f"SM80 THD token-major Stats must have shape (>= {t_q}, {self.h_q}) or (>= {t_q}, {self.h_q}, 1) and compact token/head strides",
                 )
                 lse = lse_tensor.as_strided((1, self.h_q, t_q), (0, 1, self.h_q), lse_tensor.storage_offset())
             else:
                 if t_q == 0:
                     self._value_error_if(lse_tensor.numel() != 0, "SM80 THD zero-token Stats must be empty")
                 else:
+                    # A graph producer may expose packed Stats as (T,H,1).
+                    # Its head/token pitches still have to match the plan;
+                    # the carrier shape does not change the declared packing.
+                    canonical = (
+                        lse_tensor.ndim == 3
+                        and lse_tensor.shape[0] == 1
+                        and lse_tensor.shape[1] == self.h_q
+                        and lse_tensor.shape[2] >= t_q
+                        and tuple(lse_tensor.stride()[1:]) == (self._thd_lse_head_stride, 1)
+                    )
+                    th1 = (
+                        lse_tensor.ndim == 3
+                        and lse_tensor.shape[0] >= t_q
+                        and lse_tensor.shape[1] == self.h_q
+                        and lse_tensor.shape[2] == 1
+                        and tuple(lse_tensor.stride()[:2]) == (1, self._thd_lse_head_stride)
+                    )
                     self._value_error_if(
-                        lse_tensor.ndim != 3
-                        or lse_tensor.shape[0] != 1
-                        or lse_tensor.shape[1] != self.h_q
-                        or lse_tensor.shape[2] < t_q
-                        or tuple(lse_tensor.stride()[1:]) != (self._thd_lse_head_stride, 1),
-                        f"SM80 THD head-major Stats must have shape (1, {self.h_q}, >= {t_q}) and strides (head={self._thd_lse_head_stride}, token=1)",
+                        not (canonical or th1),
+                        f"SM80 THD head-major Stats must have shape (1, {self.h_q}, >= {t_q}) or (>= {t_q}, {self.h_q}, 1) "
+                        f"and strides (head={self._thd_lse_head_stride}, token=1)",
                     )
                 lse = lse_tensor.as_strided(
                     (1, self.h_q, t_q),
