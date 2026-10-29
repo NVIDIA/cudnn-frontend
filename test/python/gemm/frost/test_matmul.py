@@ -32,6 +32,7 @@ from gemm_test_utils import (
     e5m3_quant_ref as _e5m3_quant_ref,
     e5m3_to_float as _e5m3_to_float,
     requires_sm107,
+    requires_sm120,
 )
 
 # Module-wide GPU gate — every test here is end-to-end and needs Blackwell.
@@ -3982,6 +3983,96 @@ def test_splitk_rejects_grid_z_overflow():
     g, *_ = _splitk_graph(40000, 32, 32, 4096)
     with pytest.raises(NotImplementedError, match=r"grid\.z"):
         _jit_splitk(g, 2)
+
+
+def _frost_listed(g) -> bool:
+    """Whether the graph API offers a FROST plan, i.e. its check_support accepted the graph."""
+    from cudnn.engines import is_python_engine
+
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A])
+    return any(is_python_engine(p.engine_id) for p in g.plans)
+
+
+@requires_sm120
+def test_sm120_batch_past_grid_z_is_declined():
+    # The sm120 dense launch is (ceil(M / tile_m), ceil(N / tile_n), batch * S). With S = 1 a batch
+    # past 65535 used to plan, then fail every launch with cudaErrorInvalidValue and no fallback.
+    from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
+
+    assert _frost_listed(_splitk_graph(65535, 32, 32, 64)[0])
+    assert not _frost_listed(_splitk_graph(65536, 32, 32, 64)[0])
+    with pytest.raises(NotImplementedError, match=r"grid\.z = batch=65536 \* split_k_slices=1 = 65536"):
+        jit_from_cudnn_graph(_splitk_graph(65536, 32, 32, 64)[0], by_name(_SM120_SPLITK_CFG))
+
+
+@requires_sm120
+def test_sm120_n_past_grid_y_is_refused():
+    # grid.y = ceil(N / tile_n) has the same cap, and N is symbolic: a plan built at a legal N
+    # refuses a call that needs more N tiles before it writes anything, and explain() agrees.
+    from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
+    from cudnn.gemm.frost.graph_analyzer import resolve_variant_pack
+
+    cfg = by_name("CONFIG_sm120_128x16x128_16x16x32_cluster1x1_warps8x1")
+    M, K, n_max = 32, 64, 65535 * 16
+    g, A, Bt, C = _splitk_graph(1, M, n_max, K)
+    plan = jit_from_cudnn_graph(g, cfg)
+    a = torch.randint(-2, 2, (1, M, K), device="cuda").to(torch.bfloat16)
+    b = torch.randint(-2, 2, (1, n_max + 16, K), device="cuda").to(torch.bfloat16)
+    c = torch.full((1, M, n_max), float("nan"), dtype=torch.bfloat16, device="cuda")
+    plan({A: a, Bt: b[:, :n_max], C: c})  # grid.y = 65535 still launches
+    torch.cuda.synchronize()
+    assert torch.equal(c, (a.float() @ b[:, :n_max].float().transpose(1, 2)).to(torch.bfloat16))
+
+    c = torch.full((1, M, n_max + 16), -123.0, dtype=torch.bfloat16, device="cuda")
+    resolved = resolve_variant_pack({A: a, Bt: b, C: c}, plan.binding)
+    operands = [resolved[id(t)] for t in plan.binding.bound_tensors()]
+    messages = []
+    for call in (lambda: plan.lowered(operands), lambda: plan.explain(operands)):
+        with pytest.raises(ValueError, match=r"grid\.y = ceil\(N=1048576 / 16\) = 65536") as refused:
+            call()
+        messages.append(str(refused.value))
+    assert messages[0] == messages[1]
+    torch.cuda.synchronize()
+    assert torch.all(c == -123)
+    with pytest.raises(NotImplementedError, match=r"grid\.y = ceil\(N=1048576 / 16\) = 65536"):
+        jit_from_cudnn_graph(_splitk_graph(1, M, n_max + 16, K)[0], cfg)
+
+
+@requires_sm120
+def test_sm120_auto_pick_fits_grid_y():
+    # The automatic pick for a wide N is a 128-column tile; past 65535 such tiles it must move to a
+    # wider one rather than plan a launch CUDA rejects.
+    from cudnn.gemm.frost.compiler import plan_config
+
+    n = 65536 * 128
+    cfg = plan_config(analyze(_splitk_graph(1, 32, n, 64)[0]), shapes_fixed=True)
+    assert -(-n // cfg.cta_tile_n) <= 65535, cfg.name
+
+
+@requires_sm120
+def test_sm120_splitk_reducer_grid_y_is_declined():
+    # The split-K reducer's grid.y = ceil(N / reducer tile) can overflow while the main grid fits:
+    # a reducer CTA covers 16 columns at S >= 9 when N % 4 == 2.
+    from dataclasses import replace
+
+    from cudnn.gemm.frost.compiler import probe_chain
+
+    probe_chain(analyze(_splitk_graph(1, 32, 65535 * 16 - 2, 1024)[0]), replace(by_name(_SM120_SPLITK_CFG), split_k_slices=16))
+    g, *_ = _splitk_graph(1, 32, 65535 * 16 + 2, 1024)
+    with pytest.raises(NotImplementedError, match=r"split-K reducer grid\.y = ceil\(N=1048562 / 16\) = 65536"):
+        _jit_splitk(g, 16)
+
+
+def test_sm120_reducer_tile_restates_the_reducer_kernel():
+    # The sm120 grid gate restates the reducer's tile width without importing CuTe DSL.
+    from cudnn.gemm.frost.kernel_templates.split_k_reduction_epilogue_fusion import splitk_reduce_tile_n
+    from cudnn.gemm.frost.sm120 import compiler as sm120
+
+    for slices in range(2, 33):
+        for elems in (1, 2, 4):
+            assert sm120._splitk_reduce_tile_n(slices, elems) == splitk_reduce_tile_n(slices, elems)
 
 
 def _run_splitk_vs_dense(g, S, M, N, K, outs_fn, aux_fn=lambda p: []):

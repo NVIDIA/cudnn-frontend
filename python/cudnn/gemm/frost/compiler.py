@@ -894,6 +894,8 @@ class _CompiledRuntime:
     _compiler: ClassVar[Any]
     _validate_runtime_quant: ClassVar[bool] = False
     _validate_combine: ClassVar[bool] = False
+    # Each call's N is checked against the family's launch grid (``_launch_grid_reason``).
+    _validate_launch_grid: ClassVar[bool] = False
     accepts_stream: ClassVar[bool] = True
 
     @property
@@ -1065,6 +1067,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         quant_mn = (self.chain.matmul.M, self.chain.matmul.N) if self._validate_runtime_quant and self.chain.quants else None
         quant_reason = backend._runtime_quant_reason if quant_mn is not None else None
         quant_chain, quant_cfg = (self.chain, self.config)
+        grid_reason = functools.partial(backend._launch_grid_reason, self.chain, self.config) if self._validate_launch_grid else None
         gave_up = self.deferrals
 
         def lowered(operands, graph_order=None, stream=None, workspace=None):
@@ -1147,6 +1150,10 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                         return refuse(operands, graph_order)
             if split_k_slices > 1:
                 backend.check_split_k_shape(k, n, batch, split_k_slices, cta_k_elems, reduce_elems if needs_workspace else 1)
+            if grid_reason is not None:
+                reason = grid_reason(n)
+                if reason is not None:
+                    raise ValueError(reason)
             extra = ()
             if needs_workspace:
                 if workspace is None:
@@ -1209,6 +1216,10 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                 backend._cta_k_elems(self.chain, self.config),
                 backend._splitk_reduce_elems(self.chain) if self.config.workspace_split_k else 1,
             )
+        if self._validate_launch_grid:
+            reason = backend._launch_grid_reason(self.chain, self.config, int(mnk[1]))
+            if reason is not None:
+                raise ValueError(reason)
         if self._validate_runtime_quant:
             m, n = (int(mnk[0]), int(mnk[1]))
             if self.config.swap_ab and self.chain.quants:

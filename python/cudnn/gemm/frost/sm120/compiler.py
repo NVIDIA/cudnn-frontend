@@ -276,6 +276,16 @@ def _splitk_reduce_elems(chain: FusionChain) -> int:
     return elems
 
 
+def _splitk_reduce_tile_n(split_k_slices: int, reduce_elems: int) -> int:
+    """Output columns per split-K reducer CTA: the reducer kernel's ``splitk_reduce_tile_n``,
+    restated here because that module imports CuTe DSL, which the support probe does not load
+    (a test pins the two together)."""
+    groups = 1
+    while groups < 4 and split_k_slices > 4 * groups:
+        groups *= 2
+    return 32 // groups * reduce_elems
+
+
 def _out_vec_bytes(chain: FusionChain, config: TileConfig, use_tma_store: bool) -> int:
     """The vector width for the output stores."""
     if config.split_k_slices > 1:
@@ -1198,6 +1208,7 @@ class CompiledFusedGemm(_CompiledFusedGemm[TileConfig, GemmBinding]):
 
     _compiler = sys.modules[__name__]
     _validate_runtime_quant = True
+    _validate_launch_grid = True
 
 
 def _mma_a_dtype(chain: FusionChain) -> str:
@@ -2055,6 +2066,9 @@ def _precheck_plain(
     _compute_output_vec_bytes(chain)
     _check_block_quant_supported(chain, _epi_vec_bytes(chain, config), config)
     _check_own_family(select_template(chain, config))
+    _grid_reason = _launch_grid_reason(chain, config, chain.matmul.N)
+    if _grid_reason is not None:
+        raise NotImplementedError(_grid_reason)
 
 
 def _check_moe_output_dtypes(chain: FusionChain, tmpl) -> None:
@@ -2136,6 +2150,9 @@ def _precheck_block_scale(
     _check_own_family(select_template(chain, config))
     _check_block_scale_geometry(chain, config)
     _check_registry_funnel(_tmpl, chain, config)
+    _grid_reason = _launch_grid_reason(chain, config, chain.matmul.N)
+    if _grid_reason is not None:
+        raise NotImplementedError(_grid_reason)
 
 
 def _precheck_moe_block_scale(
@@ -2352,6 +2369,33 @@ def _splitk_reject_reason(chain: FusionChain, config: TileConfig) -> "str | None
     if reasons:
         return f"split_k_slices={config.split_k_slices} is not supported with: {', '.join(reasons)}"
     return None
+
+
+def _launch_grid_reason(chain: FusionChain, config: TileConfig, n: int) -> "str | None":
+    """Why the dense templates cannot launch this plan at kernel-frame N = ``n``, or None.
+
+    sm120_matmul.py and sm120_block_scale_matmul.py launch one CTA per output tile on a
+    (ceil(M / cta_tile_m), ceil(N / cta_tile_n), batch * split_k_slices) grid, and the split-K
+    reducer on a (ceil(M / 4), ceil(N / reducer tile), batch) grid. CUDA caps grid.y and grid.z
+    at 65535 (grid.x at 2**31 - 1, out of reach of any M an SM120 part can hold). Batch and the
+    slice count are fixed per plan; N is checked at plan time and again on every call, which
+    can grow it.
+    """
+    batch, slices = chain.matmul.batch, config.split_k_slices
+    over = []
+    if batch * slices > 65535:
+        over.append(f"grid.z = batch={batch} * split_k_slices={slices} = {batch * slices}")
+    tile_n = config.cga_tile_mn[1]
+    if -(-n // tile_n) > 65535:
+        over.append(f"grid.y = ceil(N={n} / {tile_n}) = {-(-n // tile_n)}")
+    if config.workspace_split_k:
+        reduce_n = _splitk_reduce_tile_n(slices, _splitk_reduce_elems(chain))
+        if -(-n // reduce_n) > 65535:
+            over.append(f"split-K reducer grid.y = ceil(N={n} / {reduce_n}) = {-(-n // reduce_n)}")
+    if not over:
+        return None
+    swapped = " (N is the graph's M: this swap-AB plan runs the GEMM transposed)" if config.swap_ab else ""
+    return f"the {config.name} launch grid exceeds CUDA's 65535 limit on grid.y and grid.z: {'; '.join(over)}{swapped}"
 
 
 def jit_from_cudnn_graph(
