@@ -29,16 +29,11 @@ class _FrostGemmPlan(CompiledPlan):
         return int(getattr(self._compiled, "workspace_bytes", 0) or 0)
 
     def get_workspace_size_for_shapes(self, override_uids, override_shapes) -> int:
-        """Workspace for an override-shape execute."""
-        sized = getattr(self._compiled, "workspace_bytes_for", None)
+        """Workspace for an override-shape execute (split-K partials follow the overridden A and B)."""
+        sized = getattr(self._compiled, "workspace_bytes_for_overrides", None)
         if sized is None or not self.get_workspace_size():
             return self.get_workspace_size()
-        out_uid = self._compiled.binding.outputs[0].get_uid()
-        for uid, shape in zip(override_uids or (), override_shapes or ()):
-            if uid == out_uid and len(shape) == 3:
-                b, m, n = (int(x) for x in shape)
-                return sized(b, m, n)
-        return self.get_workspace_size()
+        return sized(override_uids, override_shapes)
 
     def execute(self, graph, variant_pack, ctx: ExecutionContext) -> None:
         indices = self._operand_indices
@@ -48,21 +43,19 @@ class _FrostGemmPlan(CompiledPlan):
             except KeyError as exc:
                 raise ValueError(f"frost_gemm: tensor uid {exc} is bound by the kernel but is not an operand of this graph") from exc
         operands = variant_pack.operands(indices)
+        graph_order = None
+        borrowed = variant_pack.graph_described
+        if borrowed:
+            flags = tuple(i in borrowed for i in indices)
+            graph_order = flags if any(flags) else None
         required = self.get_workspace_size()
         if required:
-            sized = getattr(self._compiled, "workspace_bytes_for", None)
+            sized = getattr(self._compiled, "workspace_bytes_for_operands", None)
             if sized is not None:
-                out = operands[self._tensors.index(self._compiled.binding.outputs[0])].shape
-                if len(out) == 3:
-                    required = sized(int(out[0]), int(out[1]), int(out[2]))
+                required = sized(operands, graph_order)
         workspace = Workspace.over(variant_pack, required, "frost_gemm") if required else None
         launch = self._launch
         if launch is not None:
-            graph_order = None
-            borrowed = variant_pack.graph_described
-            if borrowed:
-                flags = tuple(i in borrowed for i in indices)
-                graph_order = flags if any(flags) else None
             launch(operands, graph_order, stream=ctx.stream, workspace=workspace)
         elif workspace is not None:
             self._compiled(dict(zip(self._tensors, operands)), workspace, stream=ctx.stream)

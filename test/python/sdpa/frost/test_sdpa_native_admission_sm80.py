@@ -123,7 +123,7 @@ def test_aligned_native_envelopes_remain_supported(direction, d, dv, singleton):
     assert api.check_support()
     assert _mismatch(direction, _facts(direction, descs)) is None
     if direction == "bwd":
-        assert api._native_pointer and api._staged_layout is None
+        assert api._native_pointer
 
 
 @pytest.mark.parametrize("d,dv", [(96, 80), (192, 128)])
@@ -131,7 +131,7 @@ def test_backward_thd_ignores_unused_batch_stride(d, dv):
     descs = _descs(d, dv, thd=True)
     api = _api("bwd", descs, thd=True, max_total_seq_len_q=64, max_total_seq_len_kv=64)
     assert api.check_support()
-    assert api._native_pointer and api._staged_layout is None
+    assert api._native_pointer
     assert _mismatch("bwd", _facts("bwd", descs, thd=True)) is None
 
 

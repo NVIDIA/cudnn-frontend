@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""SM80 padding uses native pointer chains; remaining staging stays covered."""
+"""SM80 native layouts preserve gradients, storage guards and replay."""
 
 import pytest
 import torch
@@ -40,7 +40,7 @@ def _pointer_only(monkeypatch):
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
 
     def forbidden(*args, **kwargs):
-        pytest.fail("staged backward reached tensor-fake construction")
+        pytest.fail("native backward reached tensor-fake construction")
 
     monkeypatch.setattr(cute.runtime, "make_fake_tensor", forbidden)
     monkeypatch.setattr(cute.runtime, "make_fake_compact_tensor", forbidden)
@@ -50,7 +50,7 @@ def _pointer_only(monkeypatch):
 @pytest.mark.parametrize(
     "d,dv,hk,features,deterministic", [(48, 32, 4, False, False), (96, 80, 2, True, False), (160, 112, 1, False, True), (224, 208, 2, False, False)]
 )
-def test_dense_staged_rebind_and_replay(dtype, d, dv, hk, features, deterministic):
+def test_dense_native_rebind_and_replay(dtype, d, dv, hk, features, deterministic):
     case = _case(d, dv, dtype=dtype, hk=hk, features=features, deterministic=deterministic)
     _check(case)
     bufs = {name: torch.empty_strided(buf.shape, buf.stride(), device=buf.device, dtype=buf.dtype).copy_(buf) for name, buf in case.bufs.items()}
@@ -88,7 +88,7 @@ def test_dense_staged_rebind_and_replay(dtype, d, dv, hk, features, deterministi
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("d,dv,hkv", [(96, 80, 4), (160, 112, 2), (224, 208, 1)])
 @pytest.mark.parametrize("stats_layout", ["head_major", "token_major"])
-def test_packed_staged_preserves_output_tail(dtype, d, dv, hkv, stats_layout):
+def test_packed_native_preserves_output_tail(dtype, d, dv, hkv, stats_layout):
     case, graph, pack, workspace, outputs = _run_graph(
         (64, 0, 96),
         (80, 0, 112),
@@ -152,7 +152,7 @@ def test_rope_declines_before_compile(dtype, d):
     api = SdpaBwdDslSm80(q, q, q, q, q, stats, q, q, q, has_rope=True, rope_max_s=128)
     with pytest.raises(NotImplementedError, match="RoPE"):
         api.compile()
-    assert api._prepared is None and api._staged_prepared is None
+    assert api._prepared is None
 
 
 def test_rope_eager_declines_cpu_angles():
@@ -172,7 +172,7 @@ def test_native_singleton_ignores_unused_strides():
     api = SdpaBwdDslSm80(q, q, q, q, q, stats, q, q, q)
     api.check_support()
     assert q.transpose(1, 2).is_contiguous()
-    assert api._native_pointer and api._staged_layout is None
+    assert api._native_pointer
 
 
 def test_sm80_direct_adapter_declines_old_dsl(monkeypatch):
@@ -188,7 +188,7 @@ def test_sm80_direct_adapter_declines_old_dsl(monkeypatch):
 
 
 @pytest.mark.parametrize("features", [False, True])
-def test_staged_workspace_slice_with_odd_extra_byte(features):
+def test_native_workspace_slice_with_odd_extra_byte(features):
     case = _case(96, 80, hk=2, features=features)
     size = case.workspace.numel()
     owner = torch.full((size + 513,), 0xD7, device="cuda", dtype=torch.uint8)
@@ -217,7 +217,7 @@ def test_staged_workspace_slice_with_odd_extra_byte(features):
 @pytest.mark.parametrize("role", ["dbias", "dsink"])
 @pytest.mark.parametrize("problem", ["size", "shape", "unexpected", "missing", "dtype"])
 @pytest.mark.parametrize("d", [96], ids=["native_padded"])
-def test_staged_auxiliary_outputs_validate_before_writes(role, problem, d, monkeypatch):
+def test_native_auxiliary_outputs_validate_before_writes(role, problem, d, monkeypatch):
     from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm80
 
     q = torch.zeros(2, 4, 128, d, device="cuda", dtype=torch.float16)
@@ -243,7 +243,7 @@ def test_staged_auxiliary_outputs_validate_before_writes(role, problem, d, monke
         **{"sample_" + role: aux if enabled else None},
     )
     api.compile()
-    spec_name = "_prepared" if d == 96 else "_staged_prepared"
+    spec_name = "_prepared"
     assert getattr(api, spec_name) is not None
     workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
     if problem == "size":
@@ -256,14 +256,11 @@ def test_staged_auxiliary_outputs_validate_before_writes(role, problem, d, monke
         aux = aux.to(torch.int32)
 
     def forbidden(*args, **kwargs):
-        pytest.fail("invalid auxiliary output reached a staging write or launch")
+        pytest.fail("invalid auxiliary output reached a native launch")
 
     with monkeypatch.context() as guards:
         guards.setattr(torch.Tensor, "copy_", forbidden)
         guards.setattr(torch.Tensor, "zero_", forbidden)
-        from cudnn.sdpa.bwd import staged_sm80
-
-        guards.setattr(staged_sm80, "_copy", forbidden)
         from dataclasses import replace
 
         guards.setattr(api, spec_name, replace(getattr(api, spec_name), fn=forbidden))
