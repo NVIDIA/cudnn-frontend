@@ -34,7 +34,7 @@ import pytest
 import torch
 
 from test_utils import torch_fork_set_rng
-from mxfp8_test_reference import _ReferenceWithStats, _cdiv, _quantize, _quantize_seq, _ref
+from mxfp8_test_reference import _cdiv, _quantize, _quantize_seq, _ref
 
 from cudnn.sdpa.fwd.config_sm107 import SM107_MXFP8_THD_SHAPES
 from cudnn.sdpa.fwd.engines import engine_name
