@@ -85,7 +85,7 @@ sdpa/frost/test_sdpa_fp8_sm107.py::TestPreparedSm107Fp8::test_sm107_fp8_dense_en
 sdpa/frost/test_sdpa_fp8_sm107.py::TestPreparedSm107Mxfp8::test_sm107_mxfp8_rebind[output_dtype0-128-128-dtype0-False-False]	prepared mxfp8 rebind
 sdpa/frost/test_sdpa_fp8_sm107.py::TestPreparedSm107Mxfp8::test_sm107_mxfp8_capture[dtype0-128-128]	prepared mxfp8 capture
 sdpa/frost/test_sdpa_fp8_sm107.py::TestPreparedBlockOutput::test_rebind_and_replay[False-False-dtype0-16-False-True]	prepared block-scaled output replay
-sdpa/frost/test_sdpa_fp8_sm107.py::TestStagedSm107Mxfp8::test_fp8_output[1-128-128]	staged mxfp8 fp8 output
+sdpa/frost/test_sdpa_fp8_sm107.py::TestNativeSm107Mxfp8Strides::test_fp8_output[1-128-128]	native strided mxfp8 fp8 output
 sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::test_mxfp8_masks[none-e4m3]	mxfp8 fwd d128 dense
 sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::test_mxfp8_masks[causal-e5m2]	mxfp8 fwd d128 causal e5m2
 sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::test_mxfp8_masks[swa-e4m3]	mxfp8 SWA
@@ -337,11 +337,11 @@ sdpa/frost/test_sdpa_prepared_thd.py::test_dense_layout_rule_covers_every_tma_gl
 sdpa/frost/test_sdpa_python_validate.py::test_alibi_requires_causal	rule: first L0 cell of test_alibi_requires_causal
 sdpa/frost/test_sdpa_python_validate.py::test_bottom_right_causal_with_bias	rule: first L0 cell of test_bottom_right_causal_with_bias
 sdpa/frost/test_sdpa_sm80_packed_init.py::test_initializer_rebinds_counts_and_preserves_guards[2]	rule: first L0 cell of test_initializer_rebinds_counts_and_preserves_guards
-sdpa/frost/test_sdpa_staged_forward_fp8.py::test_staged_block_output_matches_native_graph[dtype0-16]	rule: first L0 cell of test_staged_block_output_matches_native_graph
-sdpa/frost/test_sdpa_staged_forward_fp8.py::test_staged_paged_qo_preserves_kv_pool_views[1-False]	rule: first L0 cell of test_staged_paged_qo_preserves_kv_pool_views
-sdpa/frost/test_sdpa_staged_forward_half.py::test_half_staged_has_no_execute_allocations_and_replays_current_storage[1-dtype0-128-128]	rule: first L0 cell of test_half_staged_has_no_execute_allocations_and_replays_current_storage
-sdpa/frost/test_sdpa_staged_forward_half.py::test_half_staged_preserves_native_operands_and_split_output[1-converted0]	rule: first L0 cell of test_half_staged_preserves_native_operands_and_split_output
-sdpa/frost/test_sdpa_staged_forward_mxfp8.py::test_mxfp8_staged_block_output_matches_native_graph[dtype0-16]	rule: first L0 cell of test_mxfp8_staged_block_output_matches_native_graph
+sdpa/frost/test_sdpa_fp8_sm107.py::TestNativeFp8Strides::test_native_block_output_matches_native_graph[dtype0-16]	native stride regression
+sdpa/frost/test_sdpa_fp8_sm107.py::TestNativeFp8Strides::test_native_paged_qo_preserves_kv_pool_views[1-False]	native stride regression
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::TestNativeHalfStrides::test_current_storage[1-dtype0-128-128]	native stride regression
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::TestNativeHalfStrides::test_mixed_layout[1-padded_roles0]	native stride regression
+sdpa/frost/test_sdpa_fp8_sm107.py::TestNativeSm107Mxfp8Strides::test_block_output[dtype0-16]	native stride regression
 sdpa/frost/test_sdpa_thd_tensormap_acquire.py::test_quantized_thd_tensormaps_rebind_and_replay[e4m3-d128_fp8]	rule: first L0 cell of test_quantized_thd_tensormaps_rebind_and_replay
 sdpa/frost/test_sdpa_thd_tensormap_acquire.py::test_thd_tensormaps_rebind_and_replay[bf16-d128_cga2]	rule: first L0 cell of test_thd_tensormaps_rebind_and_replay
 sdpa/frost/test_sdpa_torch_varlen_metadata.py::test_frost_torch_auxiliary_metadata_rebind_and_replay[False-lengths]	rule: first L0 cell of test_frost_torch_auxiliary_metadata_rebind_and_replay

@@ -487,6 +487,16 @@ class SdpaDenseBinder {
         put(frame, Stream, stream);
         py::tuple combine_frame;
         if (split_ > 1) {
+            if (!quantized_) {
+                const auto end = add(workspace, workspace_bytes_);
+                for (size_t role = Q; role < facts.size(); ++role) {
+                    const auto &f = facts[role];
+                    if (!f.filled) continue;
+                    const auto bytes = storage_span(f);
+                    if (bytes && workspace < add(f.pointer, bytes) && f.pointer < end)
+                        invalid("split workspace overlaps " + std::string(names[role]));
+                }
+            }
             const auto partial_lse = add(workspace, lse_offset_);
             auto os                = py::cast<std::array<int64_t, 3>>(o.bound);
             // The combine entry's positional frame (split_combine.compile_ptr): the

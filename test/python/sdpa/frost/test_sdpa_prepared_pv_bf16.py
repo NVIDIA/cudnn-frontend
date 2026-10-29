@@ -182,12 +182,12 @@ def test_pv_bf16_staged_conversion_omits_dead_operands(d, amax, monkeypatch):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("PV-BF16 needs pre-Rubin SM100")
     gen = torch.Generator(device="cuda").manual_seed(587)
-    # Legal dense layout whose 258-byte head pitch cannot bind a TMA directly.
-    storage = torch.randn((2, 128, 2, 129), device="cuda", dtype=torch.bfloat16, generator=gen)
+    # Padded BF16 V uses a native 16-byte-aligned head pitch.
+    storage = torch.randn((2, 128, 2, 136), device="cuda", dtype=torch.bfloat16, generator=gen)
     v = storage[..., :128].transpose(1, 2)
     api, bufs, ws, scales = _case(d=d, amax=amax, v=v)
-    assert not api._prepared_mxfp8 and api._staged_spec is not None
-    core = api._staged_spec.core
+    assert api._prepared_mxfp8 and not hasattr(api, "_staged_spec")
+    core = api._dense_spec
     original = core.fn
     seen = []
 
@@ -201,6 +201,7 @@ def test_pv_bf16_staged_conversion_omits_dead_operands(d, amax, monkeypatch):
         return original(*args, **kwargs)
 
     monkeypatch.setattr(core, "fn", launch)
+    monkeypatch.setattr(core, "native", type(core.native)(core))
     api.execute(**bufs, workspace=ws)
     _check(bufs, scales)
     assert seen
@@ -214,7 +215,7 @@ def test_pv_bf16_no_amax_flag_with_sample_descriptor(d, native_layout):
         pytest.skip("PV-BF16 needs pre-Rubin SM100")
     v = None
     if not native_layout:
-        storage = torch.full((2, 128, 2, 129), 0.5, device="cuda", dtype=torch.bfloat16)
+        storage = torch.full((2, 128, 2, 136), 0.5, device="cuda", dtype=torch.bfloat16)
         v = storage[..., :128].transpose(1, 2)
     api, bufs, ws, scales = _case(d=d, amax=True, v=v, has_amax_o=False)
     assert api._prepared_mxfp8 == native_layout

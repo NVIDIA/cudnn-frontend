@@ -2623,3 +2623,23 @@ class TestD256Fp8HeadPadding:
     test_dense_rebind_replay = staticmethod(_dense)
     test_dense_masks = staticmethod(_masks)
     test_paged_rebind_replay = staticmethod(_paged)
+
+
+import native_forward_fp8_cases as _native_fp8_checks
+
+
+@pytest.mark.L0
+@requires_dsl
+class TestNativeFp8Strides:
+    test_fp8_native_uses_pointer_host_and_current_storage = staticmethod(_native_fp8_checks.test_fp8_native_uses_pointer_host_and_current_storage)
+    test_native_default_stream_is_resolved_for_q_device = staticmethod(_native_fp8_checks.test_native_default_stream_is_resolved_for_q_device)
+    test_native_default_stream_with_another_device_current = staticmethod(_native_fp8_checks.test_native_default_stream_with_another_device_current)
+    test_fp8_native_strided_stats = staticmethod(_native_fp8_checks.test_fp8_native_strided_stats)
+    test_native_physical_wide_batch_stride = staticmethod(_native_fp8_checks.test_native_physical_wide_batch_stride)
+    test_native_artifact_reloads_without_jit = staticmethod(_native_fp8_checks.test_native_artifact_reloads_without_jit)
+    test_native_block_output_matches_native_graph = staticmethod(_native_fp8_checks.test_native_block_output_matches_native_graph)
+    test_native_invalid_operand_is_rejected_before_any_launch = staticmethod(_native_fp8_checks.test_native_invalid_operand_is_rejected_before_any_launch)
+    test_native_amax_alias_checks_original_operand = staticmethod(_native_fp8_checks.test_native_amax_alias_checks_original_operand)
+    test_native_sf_alias_checks_original_operand = staticmethod(_native_fp8_checks.test_native_sf_alias_checks_original_operand)
+    test_native_paged_qo_preserves_kv_pool_views = staticmethod(_native_fp8_checks.test_native_paged_qo_preserves_kv_pool_views)
+    test_sm107_d256_strided_preserves_each_native_operand = staticmethod(_native_fp8_checks.test_sm107_d256_strided_preserves_each_native_operand)

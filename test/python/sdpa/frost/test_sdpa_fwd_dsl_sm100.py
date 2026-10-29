@@ -3350,17 +3350,27 @@ def test_sm103_d192_f16_exp2_split_is_folded_out_sass_pins(tmp_path, spec):
 
 
 # The CI arch targets select this module explicitly; imported tests need L0.
-import test_sdpa_staged_forward_half as _staged_half_checks
+import native_forward_half_cases as _native_half_checks
 
 
 @pytest.mark.L0
 @requires_dsl
-class TestStagedHalf:
-    test_current_storage = staticmethod(_staged_half_checks.test_half_staged_has_no_execute_allocations_and_replays_current_storage)
-    test_partial_staging = staticmethod(_staged_half_checks.test_half_staged_preserves_native_operands_and_split_output)
-    test_wrapper_workspace = staticmethod(_staged_half_checks.test_sm100_wrapper_supplies_current_workspace)
-    test_compiled_budget = staticmethod(_staged_half_checks.test_half_compiled_workspace_query_uses_prepared_budget)
-    test_invalid_bindings = staticmethod(_staged_half_checks.test_half_staged_rejects_invalid_bindings_before_copy)
-    test_physical_wide_stride = staticmethod(_staged_half_checks.test_half_staged_physical_wide_stride)
-    test_artifact_reload = staticmethod(_staged_half_checks.test_half_staged_artifact_reloads_without_jit)
-    test_launch_stream = staticmethod(_staged_half_checks.test_half_staged_copies_follow_launch_stream)
+class TestNativeHalfStrides:
+    test_current_storage = staticmethod(_native_half_checks.test_half_native_has_no_execute_allocations_and_replays_current_storage)
+    test_mixed_layout = staticmethod(_native_half_checks.test_half_native_preserves_native_operands_and_split_output)
+    test_wrapper_workspace = staticmethod(_native_half_checks.test_sm100_wrapper_supplies_current_workspace)
+    test_compiled_budget = staticmethod(_native_half_checks.test_half_compiled_workspace_query_uses_prepared_budget)
+    test_invalid_bindings = staticmethod(_native_half_checks.test_half_native_rejects_invalid_bindings_before_launch)
+    test_physical_wide_stride = staticmethod(_native_half_checks.test_half_native_physical_wide_stride)
+    test_artifact_reload = staticmethod(_native_half_checks.test_half_native_artifact_reloads_without_jit)
+    test_launch_stream = staticmethod(_native_half_checks.test_half_native_follows_launch_stream)
+
+
+# Keep native stride coverage in the architecture-specific CI entry.
+from native_forward_stride_cases import check_native_dense_permutations as _native_dense_permutations
+
+
+@pytest.mark.L0
+@requires_dsl
+class TestNativeDenseStrides:
+    test_permutations = staticmethod(_native_dense_permutations)

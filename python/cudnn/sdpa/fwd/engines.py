@@ -1238,12 +1238,11 @@ def _warn_amax_s_declared_once() -> None:
 
 
 def _resident_arm_layout_decline(facts: "ga.SdpaGraphFacts") -> Optional[str]:
-    """The resident-block arms (bias / kv_mask) bind their operands through the PREPARED launch only: the adapter's staging-copy
-    executor (``prepared_staged_forward``, the path a Q/K/V/O layout TMA cannot bind zero-copy takes) forwards neither the bias nor the
-    kv_mask, so such a graph used to BUILD and then fail at EXECUTE time (``kv_mask_tensor is required by this compiled specialization``
-    on a 72-byte head stride, 2026-10-08).  A layout the prepared launch cannot bind is therefore declined HERE, typed and early, with
-    the lowering's own admission arithmetic (``_prepared_decline_reason`` -> ``config_sm100.dense_bind_strides``); a fact set without
-    declared operands (a pure-fact probe) is not judged -- the adapter's ``check_support`` is the twin on real descriptors (rule 8b)."""
+    """Resident bias/mask operands share the native dense layout contract.
+
+    Pure-fact capability probes may omit descriptors; real declarations are
+    checked here and by the standalone adapter before compilation.
+    """
     from cudnn.graph_types import storage_geometry
     from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
 
@@ -1254,7 +1253,7 @@ def _resident_arm_layout_decline(facts: "ga.SdpaGraphFacts") -> Optional[str]:
         if geometry is None or dense_bind_strides(*geometry, 2) is None:
             return (
                 f"the resident-block arms (bias / kv_mask) bind through the prepared launch only, and {name}'s layout (dim {tuple(t.get_dim())}, "
-                f"strides {tuple(t.get_stride())}) does not bind without a copy: 16-byte-aligned BSHD-physical strides are required"
+                f"strides {tuple(t.get_stride())}) does not bind without a copy: 16-byte-aligned covering B/H/S strides are required"
             )
     return None
 
@@ -1976,6 +1975,27 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     elif "bshd" in capabilities.layouts and not facts.bshd_layout:
         return "Q/K/V/O must be BSHD-physical (stride order 3,1,2,0)"
 
+    if not facts.thd and capabilities.sm_lo in (100, 107, 120):
+        from cudnn.graph_types import storage_geometry, storage_slot_bytes
+        from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
+
+        for role in ("q", "k", "v", "o"):
+            if facts.has_paged_kv and role in ("k", "v"):
+                continue
+            tensor = getattr(facts, role + "_t")
+            if tensor is None:
+                # Pure-fact capability probes omit descriptors. Real graphs
+                # are validated by the analyzer; adapters check every port.
+                continue
+            dtype = tensor.get_data_type()
+            geometry = storage_geometry(tensor.get_dim(), tensor.get_stride(), dtype)
+            width = storage_slot_bytes(dtype)
+            if geometry is None or width is None or dense_bind_strides(*geometry, width) is None:
+                return (
+                    f"{role}: native dense forward requires contiguous D, non-overlapping B/H/S strides and 16-byte outer-stride alignment; "
+                    f"got shape {tuple(tensor.get_dim())}, strides {tuple(tensor.get_stride())}"
+                )
+
     for fact, cap, label in (
         (facts.has_bias, capabilities.bias, "bias"),
         (facts.has_dropout, capabilities.dropout, "dropout"),
@@ -2480,6 +2500,7 @@ def _sm107_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_fwd_prefill_sm107",
         capabilities=Capabilities(
+            layouts=frozenset({"bshd", "dense_flex"}),
             sm_lo=107,
             sm_hi=_BLACKWELL[1],
             phase="prefill",
@@ -2643,6 +2664,7 @@ def _sm100_mxfp8_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_fwd_prefill_sm100_mxfp8",
         capabilities=Capabilities(
+            layouts=frozenset({"bshd", "dense_flex"}),
             sm_lo=_BLACKWELL[0],
             sm_hi=106,  # no Rubin MXFP8 lowering
             phase="prefill",
@@ -2759,6 +2781,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
     return EngineSpec(
         name=f"sdpa_fwd_prefill_{arch}_fp8",
         capabilities=Capabilities(
+            layouts=frozenset({"bshd", "dense_flex"}),
             # Ranges, not the parts that exist today (see sm_lo above): the
             # split point is the Rubin line — 100-106 runs the SM100 modules,
             # 107-119 the SM107 sibling.
@@ -2997,6 +3020,7 @@ def _sm107_mxfp8_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_fwd_prefill_sm107_mxfp8",
         capabilities=Capabilities(
+            layouts=frozenset({"bshd", "dense_flex"}),
             sm_lo=107,
             sm_hi=_BLACKWELL[1],
             phase="prefill",

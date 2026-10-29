@@ -921,6 +921,8 @@ def dense_bind_strides(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int) -
     device, address alignment, observed span and compiled shape envelope. The bounded
     cache retains no buffers, pointers or per-call frames."""
     st = canonical_bhsd_strides(shape_bhsd, stride_bhsd)
+    if any(stride * elem_bytes % 16 for stride in st[:3]):
+        return None
     if not (bshd_compact(shape_bhsd, st) or bshd_zero_copy_stride(shape_bhsd, st, elem_bytes) is not None):
         return None
     bs, hs, ss, _es = st

@@ -16,8 +16,8 @@ pytestmark = [
 ]
 
 
-def _assert_kernel_count(capture, expected):
-    """Count actual launches: padded operands must not add gather/scatter nodes."""
+def _kernel_count(capture):
+    """Count actual kernel nodes, excluding graph memcpy/memset nodes."""
     from cuda.bindings import runtime as cudart
 
     graph = cudart.cudaGraph_t(capture.raw_cuda_graph())
@@ -30,6 +30,12 @@ def _assert_kernel_count(capture, expected):
         error, kind = cudart.cudaGraphNodeGetType(node)
         assert error == cudart.cudaError_t.cudaSuccess, error
         kernels += kind == cudart.cudaGraphNodeType.cudaGraphNodeTypeKernel
+    return kernels
+
+
+def _assert_kernel_count(capture, expected):
+    """Padded operands must not add gather/scatter nodes."""
+    kernels = _kernel_count(capture)
     assert kernels == expected, f"expected {expected} algorithm kernels, captured {kernels}; hidden layout adaptation"
 
 

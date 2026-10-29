@@ -81,7 +81,7 @@ def test_f16_routes_to_the_sm107_sibling(flavor):
 def test_f16_host_entries_carry_only_record_reproducible_defaults(flavor, rubin):
     """The compiled-plan cache persists a ``--enable-tvm-ffi`` host only when every default of its calling convention is a value the
     artifact record carries (None / bool / int / float / str): a tuple default silently leaves the host un-persistable, and the staged
-    artifact JITs again in every process (``TestStagedHalf::test_artifact_reload`` is the GPU detector).  Pinned on the host for every
+    artifact JITs again in every process (``TestNativeHalfStrides::test_artifact_reload`` is the GPU detector).  Pinned on the host for every
     f16 flavor of both arch trees."""
     import inspect
     from cudnn.frost.compiled_cache import _json_plain
@@ -4815,20 +4815,20 @@ def test_sm107_ring_wait_form_sass_pins(tmp_path, quant, d_qk, d_v, dtype_o, spi
 
 
 # The CI arch targets select this module explicitly; imported tests need L0.
-import test_sdpa_staged_forward_half as _staged_half_checks
+import native_forward_half_cases as _native_half_checks
 
 
 @pytest.mark.L0
 @requires_dsl
-class TestStagedHalf:
-    test_current_storage = staticmethod(_staged_half_checks.test_half_staged_has_no_execute_allocations_and_replays_current_storage)
-    test_partial_staging = staticmethod(_staged_half_checks.test_half_staged_preserves_native_operands_and_split_output)
-    test_wrapper_workspace = staticmethod(_staged_half_checks.test_sm100_wrapper_supplies_current_workspace)
-    test_compiled_budget = staticmethod(_staged_half_checks.test_half_compiled_workspace_query_uses_prepared_budget)
-    test_invalid_bindings = staticmethod(_staged_half_checks.test_half_staged_rejects_invalid_bindings_before_copy)
-    test_physical_wide_stride = staticmethod(_staged_half_checks.test_half_staged_physical_wide_stride)
-    test_artifact_reload = staticmethod(_staged_half_checks.test_half_staged_artifact_reloads_without_jit)
-    test_launch_stream = staticmethod(_staged_half_checks.test_half_staged_copies_follow_launch_stream)
+class TestNativeHalfStrides:
+    test_current_storage = staticmethod(_native_half_checks.test_half_native_has_no_execute_allocations_and_replays_current_storage)
+    test_mixed_layout = staticmethod(_native_half_checks.test_half_native_preserves_native_operands_and_split_output)
+    test_wrapper_workspace = staticmethod(_native_half_checks.test_sm100_wrapper_supplies_current_workspace)
+    test_compiled_budget = staticmethod(_native_half_checks.test_half_compiled_workspace_query_uses_prepared_budget)
+    test_invalid_bindings = staticmethod(_native_half_checks.test_half_native_rejects_invalid_bindings_before_launch)
+    test_physical_wide_stride = staticmethod(_native_half_checks.test_half_native_physical_wide_stride)
+    test_artifact_reload = staticmethod(_native_half_checks.test_half_native_artifact_reloads_without_jit)
+    test_launch_stream = staticmethod(_native_half_checks.test_half_native_follows_launch_stream)
 
 
 # ============================================================================
@@ -8724,3 +8724,15 @@ class TestMixedFp8Kv:
     test_compact_split = staticmethod(compact_split)
     test_dense_paged_decline = staticmethod(dense_paged_decline)
     test_uniform_control = staticmethod(uniform_control)
+
+
+# Keep native stride coverage in the architecture-specific CI entry.
+from native_forward_stride_cases import check_native_dense_permutations as _native_dense_permutations
+from native_forward_stride_cases import check_native_gate_permutations as _native_gate_permutations
+
+
+@pytest.mark.L0
+@requires_dsl
+class TestNativeDenseStrides:
+    test_permutations = staticmethod(_native_dense_permutations)
+    test_gate_permutations = staticmethod(_native_gate_permutations)

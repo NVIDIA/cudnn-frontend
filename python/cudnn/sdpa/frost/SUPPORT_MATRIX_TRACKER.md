@@ -4022,3 +4022,16 @@ precisions, all gradient types, GQA, tails and empty sequences, requested amax,
 rebinding and retained replay. `test_fp8_tma_layout_matches_each_mma_consumer`
 checks the distinct dP/dV shared-memory layouts; the paired-fold tests retain
 legacy D256 controls and independent gradient widths.
+
+
+## Native dense forward layout contract
+
+SM100/SM103, SM107 and SM120 half, per-tensor FP8 and MXFP8 forward rows bind
+Q/K/V/O through their declared strides. Dense B/H/S axes may have any covering,
+non-overlapping permutation and padding; D is innermost with stride one. Every
+outer storage stride must be a 16-byte multiple after canonicalizing unused
+axes. Alignment uses each port's actual storage dtype, including packed FP4 O.
+Graph and standalone declarations decline unsupported pitches before compilation.
+There is no dense layout gather/scatter or staging workspace. Split-KV retains
+its algorithmic partial/combine workspace, and quantized plans retain scalar
+scratch. THD packing and paged pool contracts remain independently checked.

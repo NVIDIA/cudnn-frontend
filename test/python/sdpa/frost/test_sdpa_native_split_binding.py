@@ -90,12 +90,12 @@ def test_native_split_strided_outputs_wide_tables_and_fixed_query_geometry():
     for role in ("block_table", "block_table_v"):
         f = facts[role]
         facts[role] = f._replace(strides=(2**33, 3), span=(s.b - 1) * 2**33 + 22)
-    _equal(s, facts)
+    _equal(s, facts, workspace=2**48)
     for role in ("q", "o"):
         f = facts[role]
         changed = dict(facts, **{role: f._replace(shape=(s.b - 1, *f.shape[1:]))})
         with pytest.raises(ValueError):
-            s.native.execute(_pack(changed), prep._NATIVE_DENSE_INDICES, 17, workspace=0x100000)
+            s.native.execute(_pack(changed), prep._NATIVE_DENSE_INDICES, 17, workspace=2**48)
     for workspace in (0, 0x100001, -16, 2**63 - 16):
         with pytest.raises(ValueError):
             s.native.execute(_pack(facts), prep._NATIVE_DENSE_INDICES, 17, workspace=workspace)
@@ -225,3 +225,18 @@ def test_standalone_split_requires_caller_workspace_without_allocating(native, m
         check(result["o_tensor"], result["lse_tensor"])
     finally:
         graph.reset()
+
+
+@pytest.mark.parametrize("role", ["q", "k", "v", "o", "lse", "seq_q_lens", "seq_kv_lens", "block_table", "block_table_v"])
+@pytest.mark.parametrize("observed", [False, True])
+def test_native_split_workspace_alias_rejects_before_either_launch(role, observed):
+    spec, facts, frames, combined = _split_fixture(paged=True)
+    _equal(spec, facts)
+    if not observed:
+        facts = {name: fact._replace(span=-1) for name, fact in facts.items()}
+    workspace = facts[role].ptr
+    with pytest.raises(ValueError, match="workspace overlaps"):
+        spec.native.execute(_pack(facts), prep._NATIVE_DENSE_INDICES, 17, workspace=workspace)
+    with pytest.raises(ValueError, match="workspace overlaps"):
+        binding_reference.bind_dense_split(spec, facts, workspace, 17, 17)
+    assert frames == combined == []

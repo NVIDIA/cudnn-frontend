@@ -1351,7 +1351,7 @@ def _dense_role_layout(shape, strides, heads, d, s_max, b_max, elem_bytes, tma, 
         rule = (
             "contiguous, every live B/H/S byte stride a 16-byte multiple, and the layout a covering permutation (config_sm90.dense_bind_strides)"
             if dense_flex
-            else "contiguous, seq and head strides 16-byte multiples, and the layout token-major and covering (config_sm100.dense_bind_strides)"
+            else "contiguous, every B/H/S byte stride a 16-byte multiple, and the layout a covering permutation (config_sm100.dense_bind_strides)"
         )
         raise ValueError(
             f"cudnn.sdpa: {name}: shape {tuple(shape)} strides {tuple(strides)} is not a layout the kernel binds zero-copy: the head dim must be {rule}"
@@ -1577,6 +1577,14 @@ def bind_dense_split(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFact
             raise ValueError("cudnn.sdpa: split output must match the declared (B, S_q)")
         o_ptr, o_strides = o.ptr, (*o.strides, 1)
         lse_ptr, lse_strides = _dense_lse(spec, facts.get("lse"), spec.b, spec.s_q_max, required=combine.has_stats)
+    if spec.quant is None:
+        workspace_end = workspace_ptr + combine.lse_offset + combine.lse.numel * 4
+        for name, fact in facts.items():
+            if fact is None or fact.numel == 0:
+                continue
+            span = fact.span if fact.span >= 0 else 1 + sum((n - 1) * st for n, st in zip(fact.shape, fact.strides, strict=True))
+            if workspace_ptr < fact.ptr + span * _buffers.DTYPE_ITEMSIZE[fact.dtype] and fact.ptr < workspace_end:
+                raise ValueError(f"cudnn.sdpa: split workspace overlaps {name}")
     lse_partial_ptr = workspace_ptr + combine.lse_offset
     partials = dict(facts, o=combine.o._replace(ptr=workspace_ptr), lse=combine.lse._replace(ptr=lse_partial_ptr))
     frame = bind_dense(spec, partials, stream, stream_int)

@@ -117,10 +117,12 @@ unsupported input runnable.
   Silent wrong results are the worst failure mode; a silent slow path is the
   second worst — both hide behind a green test. See
   `_thd_check_strides_native` in `sdpa/fwd/api_dsl.py`.
-- **Precedent is not a license.** The SM100 dense path's compact-BSHD
-  normalization (`dense_layout_ok`: "one gather/scatter copy otherwise")
-  predates this rule and is grandfathered — do not cite it to justify a new
-  copy path, and treat migrating it to serve-or-decline as open cleanup.
+- **Dense SDPA forward serves declared strides or declines.** SM100/SM107/SM120
+  bind aligned covering B/H/S permutations directly. Graph and standalone
+  admission share `config_sm100.dense_bind_strides`; each port uses its own
+  storage element width. Unaligned outer strides decline before compilation.
+  The prior compact-BSHD normalization exception has been removed; split
+  partials and quantization scalars remain legitimate algorithmic scratch.
 - The flip side of declining: whatever `check_support()` ACCEPTS, the kernel
   must address natively (layout-driven offset math, strides encoded in TMA
   descriptors) — acceptance is a promise about the execute path, not about
