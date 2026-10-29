@@ -720,6 +720,14 @@ def _kernel(
         sfa_lane_sel = (lane // 2) % 2
         sfb_lane_sel = lane_mod4
         sf_one = cutlass.Int32(sf_one_word)
+        # A row's ceil(K / block_size) K-scales end in its F8_128x4 word sf_tail_word. Unless that count is
+        # a multiple of 4, the word's last 1-3 bytes are blob padding: the SF box still loads them (TMA
+        # zero-fills only the words past rest_k), and the MMAs of the zero-filled K blocks behind them use
+        # them as scales, so a NaN pad (UE8M0 0xFF, UE4M3 0x7F) would make a whole output row or column
+        # NaN. sf_tail_keep is the AND mask that keeps only that word's live bytes.
+        sf_last = cutlass.Int32((k + (block_size - 1)) // block_size) - 1
+        sf_tail_word = sf_last >> 2
+        sf_tail_keep = ~(cutlass.Int32(-256) << ((sf_last & 3) * 8))
 
         acc_list = [cutlass.Array(mma_c_dtype, _ACC_REGS, alignment=16) for _g in range(num_gemms)]
 
@@ -793,6 +801,11 @@ def _kernel(
                 sSFA_ptrs = [smem_sfa_list[_ai].subview(_SFA_STAGE_WORDS * stage).data_ptr() for _ai in range(num_sfa_operands)]
                 sSFB_ptrs = [smem_sfb_list[_bj].subview(_SFB_STAGE_WORDS * stage).data_ptr() for _bj in range(num_sfb_operands)]
 
+                # sf_tail_keep on the word that holds a row's last K-scale, all ones on every other word.
+                _sf_keep = [
+                    cutlass.Int32(cutlass.select_(cutlass.Int32(k_tile_idx) * _SF_WORDS + w == sf_tail_word, sf_tail_keep, cutlass.Int32(-1)))
+                    for w in range(_SF_WORDS)
+                ]
                 if cutlass.const_expr(fake_dequant_a):
                     sfa_words_list = [[[sf_one] * _NUM_K_BLOCKS for _g in range(_SFA_GROUPS)] for _ai in range(num_a_operands)]
                 else:
@@ -802,7 +815,7 @@ def _kernel(
                         for g in cutlass.range_constexpr(_SFA_GROUPS):
                             _ws = []
                             for w in cutlass.range_constexpr(_SF_WORDS):
-                                _ws.append((sSFA_ptrs[_ai] + sfa_word_off[g] + w * _SF_ATOM_WORDS).load())
+                                _ws.append((sSFA_ptrs[_ai] + sfa_word_off[g] + w * _SF_ATOM_WORDS).load() & _sf_keep[w])
                             sfa_words.append(_sf_kblk_words(_ws))
                         sfa_words_list.append(sfa_words)
                 if cutlass.const_expr(fake_dequant_b):
@@ -814,7 +827,7 @@ def _kernel(
                         for g in cutlass.range_constexpr(_SFB_GROUPS):
                             _ws = []
                             for w in cutlass.range_constexpr(_SF_WORDS):
-                                _ws.append((sSFB_ptrs[_bj] + sfb_word_off[g] + w * _SF_ATOM_WORDS).load())
+                                _ws.append((sSFB_ptrs[_bj] + sfb_word_off[g] + w * _SF_ATOM_WORDS).load() & _sf_keep[w])
                             sfb_words.append(_sf_kblk_words(_ws))
                         sfb_words_list.append(sfb_words)
 

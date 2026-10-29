@@ -1557,8 +1557,11 @@ def _run_e2e(
     scatter_top_k=None,
     combine_top_k=None,
     epilogue_relu=False,
+    k_pad_byte=0,
 ):
-    """Compare routed block-scale execution and fused outputs with independent references."""
+    """Compare routed block-scale execution and fused outputs with independent references.
+
+    ``k_pad_byte`` fills the K-padding slots of the token and weight F8_128x4 blobs."""
     dev = "cuda"
     torch.manual_seed(0)
     block_size = _COMBOS[combo][0]
@@ -1633,12 +1636,12 @@ def _run_e2e(
     for gi in range(num_groups):
         b = offsets_list[gi]
         e = offsets_list[gi + 1]
-        sfa_parts.append(_to_blocked(sfa_log[b:e]))
+        sfa_parts.append(_to_blocked(sfa_log[b:e], k_pad_byte))
     # Byte views also support empty E8M0 segments, which torch.cat's generic
     # CUDA path does not implement for that dtype.
     sfa_live = torch.cat([part.view(torch.uint8) for part in sfa_parts]).view(sfa_log.dtype)
-    sfa_blk = _with_static_segmented_capacity(sfa_live, S, num_groups, sf_k)
-    sfb_blk = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, _ceil_div(N, 128) * 128, _ceil_div(sf_k, 4) * 4)
+    sfa_blk = _with_static_segmented_capacity(sfa_live, S, num_groups, _ceil_div(sf_k, 4) * 4)
+    sfb_blk = torch.cat([_to_blocked(sfb_log[e], k_pad_byte) for e in range(E)]).view(E, _ceil_div(N, 128) * 128, _ceil_div(sf_k, 4) * 4)
     offsets = torch.tensor(offsets_list, dtype=offset_torch_dt, device=dev)
     if quant:
         q = torch.empty(1, S, N, dtype=quant_out_torch_dt, device=dev)
@@ -2965,6 +2968,36 @@ def test_e2e_nvfp4_groups_sm120(offsets_list, cfg_name) -> None:
 @requires_sm120
 def test_e2e_mx_combos_sm120(combo) -> None:
     _run_e2e(E=2, S=1024, N=256, K=512, offsets_list=[0, 256, 384, 512, 1024], combo=combo, config_name=_SM120_BS_CFG, cta_group=None)
+
+
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["normal", "swap_ab"])
+@pytest.mark.parametrize(
+    "combo,K",
+    [
+        ("mxfp8", 2880),  # gpt-oss hidden: 90 K-scales, pad slots 90-91 scale whole zero-filled 1X K blocks
+        ("mxfp4", 160),  # 5: pad slot 5 shares a 2X K block with live slot 4
+        ("nvfp4", 288),  # 18: pad slots 18-19 share a 4X K block with live slots 16-17
+    ],
+)
+@requires_sm120
+def test_e2e_k_padding_scales_are_ignored_sm120(combo, K, swap_ab) -> None:
+    """When ceil(K / block_size) is not a multiple of 4, each token and weight row's last F8_128x4
+    word holds K-padding bytes, which the SF box loads and the MMAs of the zero-filled K blocks read.
+    A NaN encoding there (UE8M0 0xFF, UE4M3 0x7F) must not reach the output: it used to turn whole
+    token rows (and, for a weight row, that column of every group using the expert) into NaN."""
+    k_pad_byte = 0x7F if combo == "nvfp4" else 0xFF
+    _run_e2e(
+        E=2,
+        S=384,
+        N=256,
+        K=K,
+        offsets_list=[0, 130, 130, 300, 384],
+        combo=combo,
+        config_name=_SM120_BS_CFG,
+        cta_group=None,
+        swap_ab=swap_ab,
+        k_pad_byte=k_pad_byte,
+    )
 
 
 @requires_sm120

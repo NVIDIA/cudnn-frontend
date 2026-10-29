@@ -238,11 +238,15 @@ def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-def to_blocked(x: torch.Tensor) -> torch.Tensor:
-    """Reorder a (rows, cols) SF tensor into the F8_128x4 blocked layout."""
+def to_blocked(x: torch.Tensor, k_pad_byte: int = 0) -> torch.Tensor:
+    """Reorder a (rows, cols) SF tensor into the F8_128x4 blocked layout.
+
+    ``k_pad_byte`` fills the K-padding slots (columns ``cols`` up to the next multiple of 4) of every row."""
     rows, cols = x.shape
     nrb, ncb = ceil_div(rows, 128), ceil_div(cols, 4)
     pad = torch.zeros(nrb * 128, ncb * 4, dtype=x.dtype, device=x.device)
+    if k_pad_byte:
+        pad.view(torch.uint8)[:, cols:] = k_pad_byte
     pad[:rows, :cols] = x
     blocks = pad.view(nrb, 128, ncb, 4).permute(0, 2, 1, 3)
     return blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16).flatten()
