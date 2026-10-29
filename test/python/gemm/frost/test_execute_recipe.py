@@ -1029,13 +1029,15 @@ def _compact_in(storage_elems, *shape):
 
 
 _AUX_STRIDES = r"the kernel reads shape \(.*\) with strides \(.*\) on every axis of extent > 1"
+# The advice the refusal gives: a buffer with the strides it names, unless no buffer of the call's extents can be served.
+_PASS_A_BUFFER = r"pass a buffer with those strides, such as a view into an allocation of the declared shape, or rebuild the plan"
 
 
-def _aux_layout(aux_dim, aux_stride, legal, illegal, *, batch=1, plan=(M, N), refusal=_AUX_STRIDES):
+def _aux_layout(aux_dim, aux_stride, legal, illegal, *, batch=1, plan=(M, N), refusal=_AUX_STRIDES, remedy=_PASS_A_BUFFER):
     """R declared as ``aux_dim`` / ``aux_stride`` in a plan built at ``plan`` = (M, N):
-    the ``legal`` calls run exactly, ``illegal`` is refused as ``refusal`` says. A call
-    is (M, N, how to make R at that M and N)."""
-    return SimpleNamespace(aux_dim=aux_dim, aux_stride=aux_stride, legal=legal, illegal=illegal, batch=batch, plan=plan, refusal=refusal)
+    the ``legal`` calls run exactly, ``illegal`` is refused as ``refusal`` says, with
+    ``remedy`` as the advice. A call is (M, N, how to make R at that M and N)."""
+    return SimpleNamespace(aux_dim=aux_dim, aux_stride=aux_stride, legal=legal, illegal=illegal, batch=batch, plan=plan, refusal=refusal, remedy=remedy)
 
 
 _SM120_AUX_LAYOUTS = {
@@ -1070,7 +1072,9 @@ _SM120_AUX_LAYOUTS = {
         batch=2,
     ),
     # A rank-1 aux's fake carries no strides, so nothing but the guard stands
-    # between the kernel and a buffer of another stride.
+    # between the kernel and a buffer of another stride. (A swap-AB plan sees it as
+    # a per-row aux whose fake pins the stride: there the guard names a refusal the
+    # front door made raw.)
     "rank1_strided_per_col": _aux_layout(
         (N,),
         (2,),
@@ -1095,6 +1099,7 @@ _SM120_AUX_LAYOUTS = {
         (M, N, lambda m, n: _small_ints(1, m, n)),
         plan=(1, N),
         refusal=rf"the kernel reads only index 0 of axis 1, which had extent 1 when the plan was built, so it cannot serve extent {M} there",
+        remedy="rebuild the plan",
     ),
     "unit_m_per_row": _aux_layout(
         (1, 1, 1),
@@ -1135,7 +1140,8 @@ _SM120_AUX_LAYOUTS = {
 @requires_sm120
 @pytest.mark.parametrize(
     "layout,swap_ab",
-    [pytest.param(name, False, id=name) for name in _SM120_AUX_LAYOUTS] + [pytest.param("per_elem_n_major", True, id="per_elem_n_major-swap_ab")],
+    [pytest.param(name, False, id=name) for name in _SM120_AUX_LAYOUTS]
+    + [pytest.param(name, True, id=f"{name}-swap_ab") for name in ("per_elem_n_major", "rank1_strided_per_col")],
 )
 def test_sm120_aux_layout_is_refused_by_name_before_launch(layout, swap_ab):
     """The SM120 epilogue reads an aux at the strides the graph declared.
@@ -1145,9 +1151,11 @@ def test_sm120_aux_layout_is_refused_by_name_before_launch(layout, swap_ab):
     other strides on an axis it spans cannot be served. The launch path refuses
     it, counts it, and ``explain`` names the aux; nothing is written. Before, the
     call died in the tvm-ffi front door with a raw "Mismatched R.strides[i]" from
-    inside the body that is not allowed to raise -- or, where the fake does not
-    pin that stride (a rank-1 aux; an axis of a plan built at M = 1 or N = 1), ran
-    and read the wrong elements. Calls whose aux keeps the declared strides on
+    inside the body that is not allowed to raise -- or, where the fake carries no
+    stride on that axis (a rank-1 aux; per-row or per-column R of a plan built at
+    M = 1 or N = 1) or pins one on an axis the kernel never steps (per-element R of
+    a plan built at M = 1: the pinned stride N is a compact buffer's row stride),
+    ran and read the wrong elements. Calls whose aux keeps the declared strides on
     every axis of extent > 1 the kernel steps, and broadcasts along any other,
     stay legal at any M and N, in either kernel frame.
     """
@@ -1177,7 +1185,65 @@ def test_sm120_aux_layout_is_refused_by_name_before_launch(layout, swap_ab):
         assert dict(compiled.deferrals) == {}
 
     run, y, _ = call(*illegal)
-    with pytest.raises(ValueError, match=rf"aux 'R': {case.refusal}.*; got shape \("):
+    with pytest.raises(ValueError, match=rf"\({case.remedy}\): aux 'R': {case.refusal}.*; got shape \("):
+        run()
+    torch.cuda.synchronize()
+    assert dict(compiled.deferrals) == {"aux layout": 1}
+    assert torch.isnan(y).all()
+
+
+@requires_sm120
+@pytest.mark.parametrize("swap_ab", (False, True), ids=("plain", "swap_ab"))
+def test_sm120_block_scale_aux_layout_is_refused_by_name_before_launch(swap_ab):
+    """A dense nvfp4 block-scale plan takes the same per-call aux check.
+
+    A residual that keeps the declared strides runs exactly at another M; one
+    with padded rows, which the kernel would read N apart, is refused by name
+    before anything is written.
+    """
+    from cudnn.gemm.frost.sm120 import compiler
+    from cudnn.gemm.frost.tile_config import by_name
+
+    sf_k = BS_K // BS_BLOCK
+    fp4, fp8 = cudnn.data_type.FP4_E2M1, cudnn.data_type.FP8_E4M3
+    reorder = dict(reordering_type=cudnn.tensor_reordering.F8_128x4)
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=F32, compute_data_type=F32)
+    A = g.tensor(name="A", dim=[1, BS_M, BS_K], stride=[BS_M * BS_K, BS_K, 1], data_type=fp4)
+    SFA = g.tensor(name="SFA", dim=[1, BS_M, sf_k], stride=[BS_M * sf_k, sf_k, 1], data_type=fp8, **reorder)
+    B = g.tensor(name="B", dim=[1, BS_K, BS_N], stride=[BS_K * BS_N, 1, BS_K], data_type=fp4)
+    SFB = g.tensor(name="SFB", dim=[1, sf_k, BS_N], stride=[sf_k * BS_N, 1, sf_k], data_type=fp8, **reorder)
+    R = g.tensor(name="R", dim=[1, BS_M, BS_N], stride=[BS_M * BS_N, BS_N, 1], data_type=F32)
+    Ad = g.block_scale_dequantize(input=A, descale=SFA, block_size=[1, BS_BLOCK])
+    Bd = g.block_scale_dequantize(input=B, descale=SFB, block_size=[BS_BLOCK, 1])
+    Y = g.add(a=g.matmul(A=Ad, B=Bd, name="mm"), b=R, name="residual")
+    Y.set_output(True).set_data_type(F32)
+    config = replace(by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"), swap_ab=swap_ab)
+    compiled = compiler.jit_from_cudnn_graph(g, config)
+    assert compiled.block_scale
+
+    def call(m, r):
+        torch.manual_seed(0)
+        a = torch.randint(0, 256, (1, m, BS_K // 2), dtype=torch.uint8, device="cuda").view(torch.float4_e2m1fn_x2)
+        sfa = to_blocked(torch.randint(1, 4, (m, sf_k), device="cuda").to(torch.float8_e4m3fn)).view(1, m, sf_k)
+        b = torch.randint(0, 256, (1, BS_N, BS_K // 2), dtype=torch.uint8, device="cuda").view(torch.float4_e2m1fn_x2)
+        sfb = to_blocked(torch.randint(1, 4, (BS_N, sf_k), device="cuda").to(torch.float8_e4m3fn)).view(1, BS_N, sf_k)
+        y = torch.full((1, m, BS_N), float("nan"), device="cuda")
+        compiled.deferrals.clear()
+        return (lambda: compiled({A: a, SFA: sfa, B: b, SFB: sfb, R: r, Y: y})), y
+
+    # Every product is a multiple of 1/4 and every sum stays far below 2**22, so the fp32
+    # output is exact: a call adds exactly its residual to the same call with R = 0.
+    for m in (BS_M, 2 * BS_M):
+        r = _small_ints(1, m, BS_N)
+        (run, y), (run_zero, y_zero) = call(m, r), call(m, torch.zeros_like(r))
+        run()
+        run_zero()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(y - y_zero, r, atol=0, rtol=0)
+        assert dict(compiled.deferrals) == {}
+
+    run, y = call(BS_M, _small_ints(1, BS_M, 2 * BS_N)[:, :, :BS_N])  # rows 2N apart; the kernel reads them N apart
+    with pytest.raises(ValueError, match=rf"\({_PASS_A_BUFFER}\): aux 'R': {_AUX_STRIDES}.*; got shape \("):
         run()
     torch.cuda.synchronize()
     assert dict(compiled.deferrals) == {"aux layout": 1}

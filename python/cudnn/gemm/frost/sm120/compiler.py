@@ -1179,7 +1179,8 @@ def _reshape_aux_to_fake(t: object, ref: TensorRef) -> object:
 
 
 def _aux_layout_check(ref: TensorRef, swap_ab: bool) -> Callable:
-    """Build the per-call check of one aux buffer: ``(buf, m, n) -> reason | None``.
+    """Build the per-call check of one aux buffer: ``(buf, m, n) -> (reason, unservable) | None``,
+    where ``unservable`` says that no buffer of this call's extents can be served.
 
     The epilogue addresses an aux through its raw pointer at the strides the graph
     declared, written into the kernel as literals (``_AuxCodegen.index_expr``), and
@@ -1203,7 +1204,7 @@ def _aux_layout_check(ref: TensorRef, swap_ab: bool) -> Callable:
     unstepped = tuple(i for i, (r, st) in enumerate(zip(real, steps)) if r and not st)
     frame = " (in the kernel frame of this swap-AB plan, M and N exchanged)" if swap_ab else ""
 
-    def reason(buf, m: int, n: int) -> "str | None":
+    def reason(buf, m: int, n: int) -> "tuple[str, bool] | None":
         # The view the launch passes (_reshape_aux_to_fake is the identity at the fake's rank).
         view = buf if len(buf.shape) == rank and not swap_ab else _reshape_aux_to_fake(_swap_mn_view(buf) if swap_ab else buf, ref)
         shape, stride = tuple(view.shape), tuple(view.stride())
@@ -1213,7 +1214,10 @@ def _aux_layout_check(ref: TensorRef, swap_ab: bool) -> Callable:
         got = f"got shape {shape}, stride {stride}"
         stuck = [i for i in unstepped if want_stride[i] is None and want_shape[i] != 1]
         if stuck:
-            return f"aux {ref.name!r}: the kernel reads only index 0 of axis {stuck[0]}, which had extent 1 when the plan was built, so it cannot serve extent {want_shape[stuck[0]]} there{frame}; {got}"
+            return (
+                f"aux {ref.name!r}: the kernel reads only index 0 of axis {stuck[0]}, which had extent 1 when the plan was built, so it cannot serve extent {want_shape[stuck[0]]} there{frame}; {got}",
+                True,
+            )
         strides = "(" + ", ".join("*" if w == "*" or want_shape[i] == 1 else str(w) for i, w in enumerate(want_stride)) + ")"
         unit = [str(i) for i in unstepped if want_shape[i] != 1]
         note = (
@@ -1221,19 +1225,24 @@ def _aux_layout_check(ref: TensorRef, swap_ab: bool) -> Callable:
             if unit
             else ""
         )
-        return f"aux {ref.name!r}: the kernel reads shape {want_shape} with strides {strides} on every axis of extent > 1{note}{frame}; {got}"
+        return f"aux {ref.name!r}: the kernel reads shape {want_shape} with strides {strides} on every axis of extent > 1{note}{frame}; {got}", False
 
     return reason
 
 
 def _check_aux_layout(recipe, operands, m: int, n: int, swap_ab: bool) -> None:
     """Raise what ``_aux_layout_check`` finds wrong with any aux of this call."""
-    bad = [reason for x in recipe.aux if (reason := _aux_layout_check(x.ref, swap_ab)(operands[x.index], m, n)) is not None]
+    bad = [found for x in recipe.aux if (found := _aux_layout_check(x.ref, swap_ab)(operands[x.index], m, n)) is not None]
     if bad:
+        # An aux this plan cannot serve at these extents leaves no buffer to pass: only a new plan runs the call.
+        remedy = (
+            "rebuild the plan"
+            if any(unservable for _, unservable in bad)
+            else "pass a buffer with those strides, such as a view into an allocation of the declared shape, or rebuild the plan"
+        )
         raise ValueError(
             "runtime aux layout does not match the one compiled into the kernel, which reads each aux at the strides the graph declared and only index 0 "
-            "of an axis it declared at extent 1 (pass a buffer with those strides, such as a view into an allocation of the declared shape, or rebuild the plan): "
-            + "; ".join(bad)
+            f"of an axis it declared at extent 1 ({remedy}): " + "; ".join(text for text, _ in bad)
         )
 
 
