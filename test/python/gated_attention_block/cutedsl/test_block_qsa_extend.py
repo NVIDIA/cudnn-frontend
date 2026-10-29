@@ -1147,13 +1147,14 @@ def test_extend_launch_census_by_kernel_name_and_the_window_scaling():
     _two_launches_extend(two, "census (two windows)")
     assert torch.equal(two.kernel_ids(), ext.kernel_ids()) and torch.equal(_bits(two.out), _bits(ext.out)), "the window count changed the function"
 
-    def run_ext(c):
-        c.restore()
-        c.execute()
-
+    # the census of the block's OWN launches: the side caches restored OUTSIDE the profiled call (the restore is two DtoD copies of the test's,
+    # not the block's); the helper's warm + measured executes then run on the post-run ring -- the launch list is data-independent
+    ext.restore()
+    two.restore()
+    torch.cuda.synchronize()
     k_ctl, m_ctl = _cupti_kernels(lambda: ctl.execute())
-    k_ext, m_ext = _cupti_kernels(lambda: run_ext(ext))
-    k_two, m_two = _cupti_kernels(lambda: run_ext(two))
+    k_ext, m_ext = _cupti_kernels(lambda: ext.execute())
+    k_two, m_two = _cupti_kernels(lambda: two.execute())
     if k_ctl is None or k_ext is None or k_two is None:
         pytest.skip("torch.profiler recorded no CUDA events (CUPTI unavailable on this node); the bitwise cells stand")
     for nm, k, m in (("control (caller-list band)", k_ctl, m_ctl), ("extend (one window)", k_ext, m_ext), ("extend (two windows)", k_two, m_two)):
