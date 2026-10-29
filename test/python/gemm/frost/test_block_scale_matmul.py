@@ -3557,18 +3557,19 @@ def test_sm120_mxfp8_m_major_a_n_major_b(config_name):
 
 
 @requires_sm120
+@pytest.mark.parametrize("public", [False, True], ids=["jit", "knob_replay"])
 @pytest.mark.parametrize(
     "combo, config_name, M, N",
     [("mxfp8", _SM120_BS_512x16, 512, 128), ("nvfp4", _SM120_BS_512x16, 512, 128), ("mxfp8", _SM120_BS_32x384, 64, 384)],
     ids=["mxfp8-k_major_a_512", "nvfp4-k_major_a_512", "mxfp8-k_major_b_384"],
 )
-def test_sm120_block_scale_wide_k_major_tile_declines_before_compile(combo, config_name, M, N, monkeypatch):
+def test_sm120_block_scale_wide_k_major_tile_declines_before_compile(combo, config_name, M, N, public, monkeypatch):
     """Both routes that take an explicit tile -- jit_from_cudnn_graph and a
     replayed FROST knob record -- decline a K-major operand wider than one TMA
     box before a kernel is rendered and compiled. Without the gate the plan
     built and its first execute aborted the process ("CUDA Dialect Assertion
     failed on CUDA error: cudaErrorInvalidValue"), leaving nothing to decline
-    on."""
+    on. One case per route, so each route fails on its own without the gate."""
     from cudnn.engines import is_python_engine
     from cudnn.gemm.frost.knobs import GemmKnobs
 
@@ -3578,8 +3579,10 @@ def test_sm120_block_scale_wide_k_major_tile_declines_before_compile(combo, conf
     monkeypatch.setattr(C120, "_import_kernel", no_compile)
     kw = dict(block_size=32, sf_dt=cudnn.data_type.FP8_E8M0, a_dt=cudnn.data_type.FP8_E4M3) if combo == "mxfp8" else {}
     K = 256 if combo == "mxfp8" else 512
-    with pytest.raises(NotImplementedError, match="exceeds the TMA box_dim ceiling of 256"):
-        jit_from_cudnn_graph(_build_nvfp4_graph(M, N, K, **kw), config=by_name(config_name))
+    if not public:
+        with pytest.raises(NotImplementedError, match="exceeds the TMA box_dim ceiling of 256"):
+            jit_from_cudnn_graph(_build_nvfp4_graph(M, N, K, **kw), config=by_name(config_name))
+        return
 
     def graph():
         g = _build_nvfp4_graph(M, N, K, **kw)

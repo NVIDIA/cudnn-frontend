@@ -3011,12 +3011,15 @@ def test_e2e_fp4_rejects_n_major_weight_sm120() -> None:
 
 
 @requires_sm120
+@pytest.mark.parametrize("public", [False, True], ids=["jit", "knob_replay"])
 @pytest.mark.parametrize("swap_ab", [False, True], ids=["fwd", "swap_ab"])
 @pytest.mark.parametrize("config_name", [_SM120_BS_512x16, _SM120_BS_32x384], ids=["m512", "n384"])
-def test_sm120_moe_block_scale_wide_k_major_tile_declines_before_compile(config_name, swap_ab, monkeypatch) -> None:
-    """jit_from_cudnn_graph declines such a tile before a kernel is rendered and
-    compiled. Without the gate the plan built and its first launch aborted the
-    process."""
+def test_sm120_moe_block_scale_wide_k_major_tile_declines_before_compile(config_name, swap_ab, public, monkeypatch) -> None:
+    """jit_from_cudnn_graph and a replayed FROST knob record decline such a tile
+    before a kernel is rendered and compiled. Without the gate the plan built
+    and its first launch aborted the process."""
+    from cudnn.engines.manifest import MANIFEST
+    from cudnn.gemm.frost.knobs import GemmKnobs
     from cudnn.gemm.frost.sm120 import compiler as C120
 
     def no_compile(src):
@@ -3024,8 +3027,19 @@ def test_sm120_moe_block_scale_wide_k_major_tile_declines_before_compile(config_
 
     monkeypatch.setattr(C120, "_import_kernel", no_compile)
     g = _build_graph(2, 1024, 512, 256, num_groups=4, combo="mxfp8")
+    cfg = replace(by_name(config_name), swap_ab=swap_ab)
+    if not public:
+        with pytest.raises(NotImplementedError, match="exceeds the TMA box_dim ceiling of 256"):
+            jit_from_cudnn_graph(g, config=cfg)
+        return
+    g.validate()
+    g.build_operation_graph()
+    engine_id = next(row.engine_id for row in MANIFEST if row.name == "frost_gemm")
+    g.create_execution_plan(engine_id, GemmKnobs.from_config(cfg).to_public())
+    g.select_plan(g.get_execution_plan_count() - 1)
     with pytest.raises(NotImplementedError, match="exceeds the TMA box_dim ceiling of 256"):
-        jit_from_cudnn_graph(g, config=replace(by_name(config_name), swap_ab=swap_ab))
+        g.check_support()
+        g.build_plans()
 
 
 @requires_sm120
