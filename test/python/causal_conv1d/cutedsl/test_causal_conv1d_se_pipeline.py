@@ -399,3 +399,22 @@ def test_ncw_short_reduction_boundaries(dtype, silu, length):
             min_device_version=800,
         )
     )
+
+
+def test_ncw_forward_beyond_grid_z_limit():
+    """Require exact backend output when batch size exceeds CUDA's grid-z limit."""
+    _dsl()
+    _check(
+        dict(
+            name="ncw_forward_beyond_grid_z_limit",
+            family="ncw",
+            direction="forward",
+            shape=[65536, 4, 8],
+            width=3,
+            mixer_width=None,
+            dtype="bfloat16",
+            silu=False,
+            iterations=3,
+            min_device_version=800,
+        )
+    )
