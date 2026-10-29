@@ -33,7 +33,7 @@ def thd_origins(api):
 def workspace_regions(api, *, symbolic=False):
     """Return the one workspace layout used by sizing and compilation."""
     b, h, hk, sq, skv = api.batch_size, api.h_q, api.h_kv, api.s_q_max, api.s_k_max
-    dq, dv = api.head_dim_qk, api.head_dim_v
+    dq, dv = api.flavor_d_qk, api.flavor_d_v
     n_seq, max_sq = b, launch_bounds(api)[0]
     if api.thd:
         b, sq, skv = 1, (-1 if symbolic else api._t_q_cap), (-2 if symbolic else api._t_kv_cap)
@@ -41,8 +41,8 @@ def workspace_regions(api, *, symbolic=False):
     shapes = (
         (b, h, sq, dq) if api._use_d64 else (b, sq, h, dq),
         (b, h, sq),
-        (b, skv, h, dq) if h != hk or (api.thd and api.dk_desc.shape[-1] != dq) else None,
-        (b, skv, h, dv) if h != hk or (api.thd and api.dv_desc.shape[-1] != dv) else None,
+        (b, skv, h, dq) if h != hk or (api.thd and api.dk_desc.shape[-1] % 8) else None,
+        (b, skv, h, dv) if h != hk or (api.thd and api.dv_desc.shape[-1] % 8) else None,
         ((-3,) if api.thd and symbolic else (n_seq * h * ((max_sq + qtile - 1) // qtile),)) if api.deterministic else None,
         (api._bias_batch, h, sq, skv) if api._has_bias else None,
         (h,) if api.sink_desc is not None else None,
@@ -393,10 +393,10 @@ def _staged_host(
             # A port with origins runs the block-per-(sequence, row) variant; the
             # compact one walks tokens up to cu[n_seq].
             if cutlass.const_expr(rows[5] >= 0):
-                module._cast_thd_org_host(dq_acc, dq, cu_q, org, dtype, h, d, out_dq, rows[5], cutlass.Int32(n_seq), cutlass.Int32(max_sq), stream)
+                module._cast_thd_org_host(dq_acc, dq, cu_q, org, dtype, h, params.d_qk, out_dq, rows[5], cutlass.Int32(n_seq), cutlass.Int32(max_sq), stream)
             else:
-                module._cast_thd_host(dq_acc, dq, cu_q, dtype, h, d, out_dq, cutlass.Int32(n_seq), cutlass.Int32(sq * h * out_dq // 2), stream)
-            for part, out, row, dim_in, dim_out in ((dk_partial, dk, rows[6], d, out_dq), (dv_partial, dv, rows[7], dim_v, out_dv)):
+                module._cast_thd_host(dq_acc, dq, cu_q, dtype, h, params.d_qk, out_dq, cutlass.Int32(n_seq), cutlass.Int32(sq * h * out_dq // 2), stream)
+            for part, out, row, dim_in, dim_out in ((dk_partial, dk, rows[6], params.d_qk, out_dq), (dv_partial, dv, rows[7], params.d_v, out_dv)):
                 if cutlass.const_expr(part is not None):
                     if cutlass.const_expr(row >= 0):
                         module._dkv_reduce_thd_org_host(

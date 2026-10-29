@@ -42,7 +42,7 @@ def native_layouts(api):
     """Admit declarations the vector loads/stores can serve without staging."""
     return (
         not api._rope_max_s
-        and api.head_dim_v == api.flavor_d_v
+        and api.head_dim_v % 8 == 0
         and api.head_dim_qk % 8 == 0
         and all(all(n == 1 or st % 8 == 0 for n, st in zip(desc.shape[:-1], desc.stride[:-1])) for desc in (api.q_desc, api.k_desc, api.v_desc, api.o_desc))
     )

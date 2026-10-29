@@ -6639,9 +6639,9 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
     are deliberately NOT served: the capability row declines such graphs and
     the backend takes them.
 
-    Dense vector-aligned declarations with a native V width use one prepared
-    pointer host, including native GQA and strided Q/K/V/O/Stats. Other layouts,
-    and off-flavor widths use prepared bitwise copies and native GQA. RoPE
+    Dense vector-aligned declarations use one prepared pointer host, including
+    native GQA, padded head widths and strided Q/K/V/O/Stats. Other layouts
+    use prepared bitwise copies and native GQA. RoPE
     shares that plan, retaining only its standalone angle-table preprocessing.
     """
 

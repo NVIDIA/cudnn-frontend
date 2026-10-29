@@ -10,6 +10,7 @@ import torch
 from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm80
 from frost_test_utils import _SM, requires_dsl
 from test_sdpa_prepared_sm80 import _check
+from test_sdpa_bwd_staged_sm80 import _assert_kernel_count
 
 pytestmark = [pytest.mark.L0, requires_dsl, pytest.mark.skipif(_SM != 80, reason="requires native SM80")]
 
@@ -55,14 +56,31 @@ def _execute(api, case, workspace, stream=None):
     )
 
 
-@pytest.mark.parametrize("d,dv,pad", [(96, 96, 0), (192, 96, 1), (128, 128, 1), (63, 47, 1), (193, 193, 1)])
+@pytest.mark.parametrize(
+    "d,dv,pad,native",
+    [
+        (96, 96, 0, True),
+        (48, 32, 8, True),
+        (64, 96, 8, True),
+        (192, 112, 8, True),
+        (224, 208, 8, True),
+        (192, 96, 1, False),
+        (128, 128, 1, False),
+        (63, 47, 1, False),
+        (193, 193, 1, False),
+    ],
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("features", [False, True])
-def test_prepared_copy_avoids_torch_staging_and_replays(d, dv, pad, dtype, features, monkeypatch):
+def test_prepared_copy_avoids_torch_staging_and_replays(d, dv, pad, native, dtype, features, monkeypatch):
     api, case = _case(d, dv, dtype, pad, features)
     required = api.scratch_workspace_bytes()
     api.compile()
-    assert api._sm80_copy_spec.core.native is not None
+    if native:
+        assert api._sm80_spec.native is not None
+        assert api._sm80_copy_spec is None and required == 0
+    else:
+        assert api._sm80_copy_spec.core.native is not None
     workspace = torch.empty(required, device="cuda", dtype=torch.uint8)
     _execute(api, case, workspace)
     _check(case)
@@ -81,10 +99,12 @@ def test_prepared_copy_avoids_torch_staging_and_replays(d, dv, pad, dtype, featu
 
     run()
     _check(case)
-    graph = torch.cuda.CUDAGraph()
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
     try:
         with torch.cuda.graph(graph):
             run()
+        if native:
+            _assert_kernel_count(graph, 1)
         case.bufs["v"].mul_(0.5)
         case.bufs["o"].fill_(float("nan"))
         graph.replay()

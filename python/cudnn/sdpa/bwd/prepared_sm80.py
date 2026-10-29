@@ -17,7 +17,7 @@ def native_layouts(api):
     """Select native vector-aligned operands with complete declarations."""
     from cudnn.sdpa.graph_analyzer import dense_layout_ok
 
-    if api._has_rope or (api.head_dim_qk, api.head_dim_v) != (api.flavor_d_qk, api.flavor_d_v):
+    if api._has_rope or api.head_dim_qk % 8 or api.head_dim_v % 8:
         return False
     for role in ROLES[:5] + ROLES[6:9]:
         desc = getattr(api, role + "_desc")
@@ -183,6 +183,12 @@ def execute_tensors(api, tensors, workspace, stream, scale, ro_tensors=()):
         stream = torch.cuda.current_stream(tensors[0].device).cuda_stream
     facts = dict(zip(ROLES, map(facts_of_tensor, tensors)))
     facts.update(zip(RO_ROLES, map(facts_of_tensor, ro_tensors or (None,) * len(RO_ROLES))))
+    # Moving padded declarations off staging must preserve the standalone
+    # auxiliary-output shape checks, before any accumulator is initialized.
+    for role in ("dbias", "dsink"):
+        desc, fact = getattr(api, role + "_desc"), facts[role]
+        if desc is not None and fact is not None and fact.shape != tuple(desc.shape):
+            raise ValueError(f"sdpa_bwd_sm80: {role} must match the declared logical shape {tuple(desc.shape)}")
     if api.thd:
         for role in ("seq_q", "seq_kv"):
             f = facts[role]
