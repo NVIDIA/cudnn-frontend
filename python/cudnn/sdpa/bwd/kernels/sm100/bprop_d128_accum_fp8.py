@@ -12,6 +12,8 @@ from cutlass.base_dsl.typing import Pointer
 from cutlass.experimental import primitives as nvvm
 from cutlass.experimental.cuda import tensor_map as tmap
 
+from cutlass.cute.arch.nvvm_wrappers import inline_ptx
+
 from cudnn.frost.tile_dsl.barrier import MBarrier, PipelineState, Producer, advance
 from cudnn.frost.tile_dsl.handles import GmemTileTma, MmaDesc, SmemTile
 from cudnn.frost.tile_dsl.mma import mma_ss
@@ -243,7 +245,7 @@ def _bounds(block, sq, causal: cutlass.Constexpr[bool]):
 
 @cute.jit
 def _stats(slab, lse, delta, row, group, qbase, sq, batch, head, delta_scale, lse_shift):
-    nvvm.barrier_cta_sync(barrier_id=CFG.SOFTMAX_BARRIER, thread_count=CFG.SOFTMAX_LANES)
+    inline_ptx(f"barrier.sync {CFG.SOFTMAX_BARRIER}, {CFG.SOFTMAX_LANES};", write_only_types=[], read_only_args=[])
     idx = qbase + row
     valid = idx < sq
     if group == 0:
@@ -257,7 +259,7 @@ def _stats(slab, lse, delta, row, group, qbase, sq, batch, head, delta_scale, ls
     else:
         stat = -delta_scale * cutlass.Float32(delta[batch, head, idx])
         _view(slab, CFG.DELTA, cutlass.Float32, CFG.N).subview(row).store(stat)
-    nvvm.barrier_cta_sync(barrier_id=CFG.SOFTMAX_BARRIER, thread_count=CFG.SOFTMAX_LANES)
+    inline_ptx(f"barrier.sync {CFG.SOFTMAX_BARRIER}, {CFG.SOFTMAX_LANES};", write_only_types=[], read_only_args=[])
 
 
 @cute.jit
