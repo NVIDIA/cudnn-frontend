@@ -1295,7 +1295,8 @@ def native_d192_paged_leg(capabilities: Capabilities, facts: "ga.SdpaGraphFacts"
         cga=knobs.cga if knobs is not None else None,
         split_kv=(knobs.split_kv or 1) if knobs is not None else 1,
     )
-# K/V bytes of a graph (B x KV heads x S_kv x (d_qk + d_v), one byte per element) up to which the single-CTA d192x128 build is listed.
+# K/V bytes of a graph (B x KV heads x S_kv x (d_qk + d_v), one byte per element) up to which the single-CTA per-tensor fp8
+# d128 / d192x128 builds are listed on the 107 line.
 _SM107_D192_PT_CGA1_KV_BYTES_MAX = 96 * 1024 * 1024
 
 
@@ -1315,6 +1316,18 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
     if capabilities.sm_lo == 107 and not (facts.is_fp8 or facts.is_mxfp8) and facts.has_paged_kv and selected == (192, 128):
         return frozenset({2})
     if sm100_nonpaged_d128_thd_single_cta_leg(capabilities, facts, cga=cga, split_kv=split_kv):
+        return frozenset({1, 2})
+    if (
+        capabilities.sm_lo == 107
+        and capabilities.is_fp8
+        and not capabilities.is_mxfp8
+        and selected == (128, 128)
+        and not facts.thd
+        and not facts.has_paged_kv
+        and (split_kv or 1) == 1
+        and int(facts.b) * int(facts.h_kv) * int(facts.s_kv) * (int(facts.d_qk) + int(facts.d_v)) <= _SM107_D192_PT_CGA1_KV_BYTES_MAX
+    ):
+        # Per-tensor fp8 d128 on the 107 line, dense unsplit: both widths.
         return frozenset({1, 2})
     if (
         capabilities.sm_lo == 107
