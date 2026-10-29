@@ -279,6 +279,20 @@ that loops dimension subtiles must not also request multiple loads per subtile.
 `TestD256Fp8HeadPadding::test_paged_rebind_replay` covers partial K/V heads,
 short and wide pages, independent pools/tables, sinks and changed-length replay.
 
+Native backward gradient outputs must not overwrite each other.
+
+
+- A native route replacing ordered staged copy-back must reject overlapping
+  gradient address sets before any initialization or launch, on both graph and
+  standalone calls. Recheck current pointers on every binding.
+- Shared allocation or overlapping bounding spans do not imply overlapping
+  elements: disjoint interleaved Q/K/V gradients remain valid. Use declared
+  strides even when the graph binds flat storage or raw pointers.
+- Detectors: `test_sm80_gradient_overlap_rejected_before_entry`,
+  `test_sm80_shared_gradient_storage_matches_address_oracle`, and
+  `test_native_overlapping_gradients_rejected_before_writes`. Preserve the
+  existing legal interleaved-gradient and staged copy-order tests.
+
 **Rule S6 — A kernel feature lands on every arch line's test file, and its
 other-arch lowerings are smoke-compiled from whatever GPU you have.**
 
@@ -1396,17 +1410,3 @@ half-precision resident-arm selector; explicit-only per-tensor widths belong
 in `effective_tile_ns`, like the native D128 explicit narrow tile. The detector
 `test_fp8_d64_narrow_tile_keeps_graph_defaults` checks both A and FALLBACK at
 first-half tails as well as tile multiples, while admitting an explicit N64.
-
-
-**Rule S4 — Direct gradient outputs must not overwrite each other.**
-
-- A native route replacing ordered staged copy-back must reject overlapping
-  gradient address sets before any initialization or launch, on both graph and
-  standalone calls. Recheck current pointers on every binding.
-- Shared allocation or overlapping bounding spans do not imply overlapping
-  elements: disjoint interleaved Q/K/V gradients remain valid. Use declared
-  strides even when the graph binds flat storage or raw pointers.
-- Detectors: `test_sm80_gradient_overlap_rejected_before_entry`,
-  `test_sm80_shared_gradient_storage_matches_address_oracle`, and
-  `test_native_overlapping_gradients_rejected_before_writes`. Preserve the
-  existing legal interleaved-gradient and staged copy-order tests.
