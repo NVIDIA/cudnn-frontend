@@ -15,6 +15,7 @@ from cutlass.cute.runtime import make_fake_stream
 from cutlass.experimental import primitives as prims
 
 from cudnn.frost.compiled_cache import compile_cached, template_key
+from .._contract import paired_backward
 
 FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
 
@@ -30,7 +31,7 @@ LOG2E = 1.4426950408889634
 
 NTHREADS = 512
 CHB = 24
-NQ = 2  # Two queries fill 24 MMA columns.
+NQ = 2  # Two queries fill 24 MMA columns; other head geometries (24/2, 6/1) take the single-query kernels.
 BLK_BITS = 28  # Two owner bits follow the block index.
 BLK_MASK = (1 << BLK_BITS) - 1
 
@@ -794,7 +795,7 @@ def _bprop_host(
 
 def compile_kernel(dtype, query_heads, kv_heads, arch):
     """Compile native THD geometry; tensor extents remain dynamic."""
-    if kv_heads == 2:
+    if not paired_backward(query_heads, kv_heads):
         from .bprop_sm100_base import compile_kernel as compile_baseline
 
         return compile_baseline(dtype, query_heads, kv_heads, arch)
@@ -845,7 +846,7 @@ def compile_kernel(dtype, query_heads, kv_heads, arch):
 
 def launch(compiled, grad_out, q, k, v, out_fp32, lse, ids, counts, lo, hi, first, last, dq, dk, dv, scratch, scale, stream, num_sms):
     """Launch with caller-owned outputs and scratch."""
-    if k.shape[1] == 2:
+    if not paired_backward(q.shape[1], k.shape[1]):
         from .bprop_sm100_base import launch as launch_baseline
 
         return launch_baseline(compiled, grad_out, q, k, v, out_fp32, lse, ids, counts, lo, hi, first, last, dq, dk, dv, scratch, scale, stream, num_sms)

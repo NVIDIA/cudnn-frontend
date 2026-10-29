@@ -148,6 +148,7 @@ def compile_kernel(hq, hkv, arch, gated, n64=False):
 def launch(impl, arch, q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_first, block_last, out, out_fp32, lse, scale, stream):
     total, hq, _ = q.shape
     gated = 512 < total <= 16384
+    # The 64-key Rubin forward is specialised for 12 heads per KV head; 6:1 stays on the shared gathered body.
     n64 = arch == 107 and hq == 12 * k.shape[1] and total >= 32768
     compiled = compile_kernel(hq, k.shape[1], arch, gated, n64)
     align4 = lambda value: (value + 3) // 4 * 4

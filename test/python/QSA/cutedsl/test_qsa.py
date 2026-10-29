@@ -180,10 +180,39 @@ def check_case(inputs):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("heads", [(12, 1), (24, 2)])
+@pytest.mark.parametrize("heads", [(12, 1), (24, 2), (6, 1)])
 @pytest.mark.parametrize("lengths", [(1,), (3, 5, 9), (61, 68)])
 def test_packed_forward_backward(supported_gpu, heads, lengths):
     check_case(make_inputs(lengths, *heads, empty=True))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("lengths", [(513,), (2056,)], ids=["gated-dense", "gathered"])
+def test_six_query_heads_forward_routes(supported_gpu, lengths):
+    """6Q/1KV takes the dense-tile route and the gathered route like 12Q/1KV; neither is specialised for 12 heads."""
+    check_case(make_inputs(lengths, 6, 1, empty=True))
+
+
+@pytest.mark.L0
+def test_six_query_heads_take_the_single_query_backward(supported_gpu):
+    """6Q/1KV is not the paired 12:1 backward: no owner-bit compaction, and the unpaired kernel module is selected."""
+    from cudnn.QSA import api
+
+    inputs = make_inputs((9, 4), 6, 1, all_selected=True)
+    major, minor = torch.cuda.get_device_capability()
+    arch = major * 10 + minor
+    module, _ = api._implementation(inputs["q"], inputs["k"], "bprop")
+    assert module.__name__.rsplit(".", 1)[1] == ("bprop_sm107" if arch == 107 else "bprop_sm100_base")
+    module, _ = api._implementation(inputs["q"][:, :6].repeat(1, 2, 1).contiguous(), inputs["k"], "bprop")
+    assert module.__name__.rsplit(".", 1)[1] == "bprop_sm100"
+    from cuda.bindings import driver as cuda
+
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    metadata = tuple(inputs[name] for name in ("sel_blocks", "lo", "hi", "block_first", "block_last"))
+    ids, counts = api._compact_backward(*metadata, arch, stream, 6, 1)
+    assert ids.shape == inputs["sel_blocks"].shape and counts.shape == (13,)
+    ids, counts = api._compact_backward(*metadata, arch, stream, 12, 1)
+    assert ids.shape == (7, inputs["sel_blocks"].shape[1]) and counts.shape == (7,)
 
 
 @pytest.mark.L1
@@ -209,7 +238,7 @@ def test_runtime_scale(supported_gpu, scale):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("heads", [(12, 1), (24, 2)])
+@pytest.mark.parametrize("heads", [(12, 1), (24, 2), (6, 1)])
 @pytest.mark.parametrize("score,magnitude", [(8.0, 1e34), (-86.0, 1e38)], ids=["selected-large-v", "tiny-probability-large-v"])
 def test_forward_large_values(supported_gpu, heads, score, magnitude):
     inputs = make_inputs((513,), *heads)
@@ -231,7 +260,7 @@ def test_forward_large_values(supported_gpu, heads, score, magnitude):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("heads", [(12, 1), (24, 2)])
+@pytest.mark.parametrize("heads", [(12, 1), (24, 2), (6, 1)])
 @pytest.mark.parametrize("large_logits", [False, True], ids=["constant-key", "large-logits"])
 def test_backward_cancellation(supported_gpu, heads, large_logits):
     inputs = make_inputs((257,), *heads, all_selected=True)
@@ -251,7 +280,7 @@ def test_backward_cancellation(supported_gpu, heads, large_logits):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("heads", [(12, 1), (24, 2)])
+@pytest.mark.parametrize("heads", [(12, 1), (24, 2), (6, 1)])
 @pytest.mark.parametrize("poison", [(torch.nan, torch.inf), (torch.inf, torch.nan), (1e20, -1e20)], ids=["nan-inf", "inf-nan", "finite"])
 def test_masked_kv_poison(supported_gpu, heads, poison):
     inputs = make_inputs((3, 5), *heads, all_selected=True)
@@ -386,7 +415,7 @@ def test_paired_backward_mask_replay(supported_gpu, lengths):
 
 
 @pytest.mark.L1
-@pytest.mark.parametrize("heads", [(12, 1), (24, 2)])
+@pytest.mark.parametrize("heads", [(12, 1), (24, 2), (6, 1)])
 def test_dense_gather_replay(supported_gpu, heads):
     inputs = make_inputs((67, 446), *heads, empty=True)
     inputs["hi"].clamp_(max=511)
@@ -444,6 +473,9 @@ def test_reject_before_launch(supported_gpu, monkeypatch):
         qsa_forward(**inputs, block_size=8)
     with pytest.raises(ValueError, match="lse"):
         qsa_backward(inputs["q"], **inputs, out_fp32=inputs["q"].float(), lse=torch.empty((17, 12), device="cuda"))
+    for heads in ((3, 1), (24, 1), (6, 2), (12, 2)):
+        with pytest.raises(NotImplementedError, match="6/1, 12/1 or 24/2"):
+            qsa_forward(**make_inputs((17,), *heads))
 
 
 @pytest.mark.L0
@@ -497,7 +529,7 @@ def test_paired_owner_encoding_rejects_oversized_metadata(supported_gpu, monkeyp
     monkeypatch.setattr(torch, "empty", forbidden)
     oversized = SimpleNamespace(shape=(1, (1 << 28) + 1))
     with pytest.raises(NotImplementedError, match="block-owner encoding"):
-        api._compact_backward(oversized, None, None, None, None, arch, None, 1)
+        api._compact_backward(oversized, None, None, None, None, arch, None, 12, 1)
 
 
 @pytest.mark.L1
