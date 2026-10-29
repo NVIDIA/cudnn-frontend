@@ -411,6 +411,126 @@ def test_DSA_indexer_top_k_deterministic_compact_index_storage():
 
 
 @pytest.mark.L0
+def test_DSA_indexer_top_k_bf16_wide_rows_use_fp16_coarse_key():
+    """BF16 wider than 32768 columns refines over two rounds, and its scratch provides their second buffer."""
+    DSA = _import_dsa()
+    import cutlass
+
+    from cudnn.api_base import ws_align
+    from cudnn.deepseek_sparse_attention.indexer_top_k import indexer_top_k_decode_varlen as kernel_module
+    from cudnn.deepseek_sparse_attention.indexer_top_k.indexer_top_k_varlen_util import IndexerTopKKernelVarlen
+
+    cutlass_dtypes = {torch.float32: cutlass.Float32, torch.float16: cutlass.Float16, torch.bfloat16: cutlass.BFloat16}
+    for dtype, cutlass_dtype in cutlass_dtypes.items():
+        for num_cols in (1024, 32768, 32769, 65536, 131072, 1048576):
+            kernel = IndexerTopKKernelVarlen(cutlass_dtype, max_num_cols=kernel_module._bucket_num_cols(num_cols), top_k=2048)
+            wide_bf16 = dtype == torch.bfloat16 and num_cols > 32768
+            assert kernel.bf16_fp16_coarse_key == wide_bf16
+            if dtype != torch.float32:
+                assert (kernel.first_refine_shift, kernel.num_refine_rounds) == ((8, 2) if wide_bf16 else (0, 1))
+            # Each refine round after the first reads the other candidate buffer, in SMEM and in the scratch.
+            assert kernel.num_buffer_smem_input_idx == (2 if kernel.num_refine_rounds > 1 else 1)
+            assert kernel_module.buffer_numbers(dtype, num_cols) == kernel.num_buffer_smem_input_idx
+            assert kernel_module.buffer_numbers(dtype) >= kernel.num_buffer_smem_input_idx
+
+    for num_cols, buffers in ((32768, 1), (32769, 2)):
+        sample = torch.empty((3, num_cols), dtype=torch.bfloat16, device="cuda")
+        seq_lens = torch.full((3,), num_cols, dtype=torch.int32, device="cuda")
+        op = DSA.IndexerTopK(sample, seq_lens, top_k=2048)
+        assert op.check_support()
+        assert op.scratch_workspace_bytes() == ws_align(3 * buffers * num_cols * 4)
+
+
+def _bf16_from_fields(sign, exponent, mantissa):
+    """BF16 values from integer sign, biased-exponent and mantissa fields."""
+    bits = (sign << 15) | (exponent << 7) | mantissa
+    return torch.where(bits >= 0x8000, bits - 0x10000, bits).to(torch.int16).view(torch.bfloat16)
+
+
+def _bf16_wide_rows(num_cols, device):
+    """Rows whose top-K cutoff lands in FP16-derived coarse bins that span many BF16 exponents (the bins FP16
+    saturates to +-inf and its zero bin, where both refine rounds select) or in the single-exponent bins at the
+    edges of FP16's range. No NaN (its ordering is unspecified)."""
+
+    def fields(sign_lo, exponent_lo, exponent_hi, n=num_cols):
+        sign = torch.randint(sign_lo, 2, (n,), device=device)
+        exponent = torch.randint(exponent_lo, exponent_hi + 1, (n,), device=device)
+        # Exponent 255 carries only the infinities.
+        mantissa = torch.where(exponent == 255, 0, torch.randint(0, 128, (n,), device=device))
+        return _bf16_from_fields(sign, exponent, mantissa)
+
+    def ties(counts, filler):
+        """Exact multiplicities for the largest values, so the cutoff ties among the last of them."""
+        top = torch.cat([torch.full((n,), v, dtype=torch.bfloat16, device=device) for v, n in counts])
+        values = torch.cat([top, filler[: num_cols - top.numel()]])
+        return values[torch.randperm(num_cols, device=device)]
+
+    return [
+        fields(0, 0, 255),  # every exponent and +-inf: the cutoff is in the saturated +inf bin
+        fields(0, 143, 255),  # magnitudes >= 2**16 only
+        fields(0, 0, 112),  # magnitudes < 2**-14: BF16 subnormals, signed zeros; the cutoff is in the FP16 zero bin
+        fields(0, 111, 112),  # [2**-16, 2**-14): FP16 subnormal bins, one BF16 exponent each
+        fields(0, 140, 142),  # [2**13, 2**16): the top FP16 normal bin, right under the saturated one
+        fields(1, 143, 255),  # negative only: the least negative of the -inf bin
+        fields(1, 0, 112),  # negative and tiny only: the -0 bin
+        # Cutoff ties at 2**20 inside the +inf bin, below finite values that FP16 saturates as well.
+        ties([(float("inf"), 500), (2.0**120, 700), (2.0**64, 600), (2.0**20, 700)], fields(0, 0, 142)),
+        # Cutoff ties at 2**-100 inside the zero bin, under 2**-20 there and FP16 subnormals above it.
+        ties([(2.0**-15, 600), (2.0**-16, 700), (2.0**-20, 400), (2.0**-100, 700)], fields(1, 0, 254)),
+    ]
+
+
+@pytest.mark.L0
+def test_DSA_indexer_top_k_bf16_fp16_coarse_bins():
+    """The FP16-derived coarse key orders every BF16 value consistently with its exact 16-bit key. Its zero and
+    saturated bins hold many top bytes of that key, so the refine must cover both bytes."""
+    bits = torch.arange(1 << 16, dtype=torch.int32)
+    values = torch.where(bits >= 0x8000, bits - 0x10000, bits).to(torch.int16).view(torch.bfloat16)
+    values = values[~torch.isnan(values)]
+    raw = values.view(torch.int16).to(torch.int32) & 0xFFFF
+    key = torch.where(raw >= 0x8000, raw, ~raw & 0x7FFF)  # ascending key = descending value, +0 before -0
+    half = values.float().to(torch.float16).view(torch.int16).to(torch.int32) & 0xFFFF
+    coarse = torch.where(half >= 0x8000, half, ~half & 0x7FFF) >> 8
+    order = torch.argsort(key)
+    assert torch.all(coarse[order][1:] >= coarse[order][:-1]), "coarse bins must not reorder exact keys"
+    for c in (0x03, 0x7F, 0x80, 0xFC):  # +inf (saturated), +0, -0, -inf (saturated) bins
+        assert (key[coarse == c] >> 8).unique().numel() > 1, c
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=51)
+@pytest.mark.parametrize(
+    "tie_break,deterministic",
+    [(0, False), (1, False), (2, False), (0, True), (2, True)],
+    ids=["ties-none", "ties-small", "ties-large", "deterministic", "deterministic-large"],
+)
+def test_DSA_indexer_top_k_bf16_wide_rows_exact(tie_break, deterministic):
+    """Wide BF16 rows stay exact through the FP16-derived coarse key, including its many-exponent bins."""
+    DSA = _import_dsa()
+    # An odd width misaligns row starts; the bucket (131072) takes UINT32 indices and spills candidates.
+    num_cols, top_k = 100003, 2048
+    patterns = _bf16_wide_rows(num_cols, "cuda")
+    input_values = torch.stack(patterns + patterns).contiguous()
+    lengths = [num_cols] * len(patterns) + [top_k + 1, 32769, 65537, num_cols - 1, num_cols // 2, top_k, 40000, 3 * top_k, 50001]
+    seq_lens = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+
+    def run():
+        return DSA.indexer_top_k_wrapper(input_values, seq_lens, top_k, return_val=True, tie_break=tie_break, deterministic=deterministic)
+
+    result = run()
+    # Deterministic mode resolves cutoff ties like tie_break=1 unless asked otherwise.
+    check_tie_break = 1 if deterministic and tie_break == 0 else tie_break
+    check_ref_indexer_top_k(input_values, seq_lens, top_k, 1, result["indices"], result["values"], True, tie_break=check_tie_break)
+    if deterministic:
+        for row, length in enumerate(lengths):
+            valid = min(length, top_k)
+            assert torch.all(result["indices"][row, 1:valid] > result["indices"][row, : valid - 1])
+        repeat = run()
+        assert torch.equal(repeat["indices"], result["indices"])
+        assert torch.equal(repeat["values"].view(torch.int16), result["values"].view(torch.int16))
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=7)
 def test_DSA_indexer_top_k_rejects_overlapping_writable_ranges(monkeypatch):
     """Reject exact byte-range overlap before launch, but allow disjoint views of one allocation."""

@@ -86,7 +86,7 @@ def _make_call(scores, lengths, k, deterministic, ordering="auto"):
     )
     buffer = torch.empty(
         rows,
-        topk_kernel.buffer_numbers(scores.dtype),
+        topk_kernel.buffer_numbers(scores.dtype, cols),
         cols,
         dtype=torch.int32,
         device=scores.device,

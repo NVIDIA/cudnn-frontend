@@ -26,7 +26,7 @@ import cutlass
 import cutlass.cute as cute
 
 from .block_scan import block_prefix_sum_kernel
-from .indexer_top_k_varlen_util import IndexerTopKKernelVarlen, atomicAdd, resolve_deterministic_ordering
+from .indexer_top_k_varlen_util import IndexerTopKKernelVarlen, atomicAdd, bf16_uses_fp16_coarse_key, resolve_deterministic_ordering
 
 
 class ComputeDynamicCTAOffsets:
@@ -646,9 +646,18 @@ INPUT_ALIGN = 32
 BUFFER_ALIGN = 32
 
 
-def buffer_numbers(torch_dtype) -> int:
-    """int32 radix-scratch words per input element: two histogram passes for fp32."""
-    return 2 if torch_dtype == torch.float32 else 1
+def buffer_numbers(torch_dtype, num_cols=None) -> int:
+    """int32 radix-scratch words per input element: one per refine-round candidate buffer.
+
+    FP32, and BF16 wider than 32768 columns (FP16-derived coarse key), refine over several rounds that
+    alternate between two buffers; FP16 and narrower BF16 refine in one. ``num_cols=None`` returns the
+    dtype's maximum.
+    """
+    if torch_dtype == torch.float32:
+        return 2
+    if torch_dtype == torch.bfloat16 and (num_cols is None or bf16_uses_fp16_coarse_key(_bucket_num_cols(num_cols))):
+        return 2
+    return 1
 
 
 def compile_topk_kernel(

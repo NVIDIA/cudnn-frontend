@@ -246,7 +246,7 @@ class IndexerTopK(APIBase):
     def _buffer_shape(self) -> Tuple[int, int, int]:
         if self._buffer_dims is None:
             n_rows, num_cols = self.input_desc.shape
-            self._buffer_dims = (n_rows, _kernel_module().buffer_numbers(self.input_desc.dtype), num_cols)
+            self._buffer_dims = (n_rows, _kernel_module().buffer_numbers(self.input_desc.dtype, num_cols), num_cols)
         return self._buffer_dims
 
     def scratch_workspace_bytes(self) -> int:
