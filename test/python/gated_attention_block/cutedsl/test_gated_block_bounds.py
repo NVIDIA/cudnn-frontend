@@ -83,7 +83,7 @@ def test_empty_and_all_zero_tensors(dt):
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")], ids=["nan", "inf", "-inf"])
 def test_non_finite_values_are_refused(dt, bad):
     """A non-finite cell in the RESULT fails the finite check; one in the REFERENCE poisons the bound and the cosine (both NaN), so the
-    assertion fails there too -- never a silent pass, whichever operand is broken."""
+    assertion fails there too -- never a silent pass, whichever operand carries it."""
     ref = _randn(16, 8)
     got = ref.to(dt)
     bad_got = got.clone()
