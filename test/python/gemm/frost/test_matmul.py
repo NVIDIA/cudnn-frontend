@@ -3688,6 +3688,59 @@ def test_sm120_quant_scale_k_padding_is_zeroed(axes, M, N) -> None:
         torch.testing.assert_close(vp[Q].float(), q_ref.float(), atol=0, rtol=0)
 
 
+# (graph builder, torch reference) for the activations whose closed forms cancel near a limit.
+_SERIES_ACTIVATIONS = {
+    "tanh": (lambda g, x: g.tanh(input=x, name="act"), torch.tanh),
+    "elu": (lambda g, x: g.elu(input=x, name="act"), torch.nn.functional.elu),
+    "softplus": (lambda g, x: g.softplus(input=x, name="act"), torch.nn.functional.softplus),
+}
+
+# One dense config per arch tree: both render these ops with the shared emitters. A process renders only its own
+# tree, so the other tree's cases skip.
+_SERIES_CONFIGS = {
+    "sm100": "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
+    "sm120": "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
+}
+
+
+@pytest.mark.parametrize("act", list(_SERIES_ACTIVATIONS))
+@pytest.mark.parametrize("family", list(_SERIES_CONFIGS))
+def test_tanh_elu_softplus_relative_precision(family: str, act: str) -> None:
+    """tanh and elu near 0, and softplus of a very negative input, keep fp32
+    relative precision. The emitted forms cancelled there: tanh(1e-6) as
+    1 - 2/(e^2x + 1) came out 4.6% low, elu as (max(x, 0) + e^min(x, 0)) - 1
+    returned 0 for a positive input below 2^-24, and softplus(-20) as
+    log(1 + e^x) came out 0. A and B are 0, so the activation sees exactly the
+    fp32 aux X; inputs up to 10 in magnitude and +-inf pin the closed forms
+    that are kept."""
+    cfg = _resolve(_SERIES_CONFIGS[family])
+    M = N = K = 128
+    ok, reason = _compatible(cfg, M, N, K, "bf16", "bf16")
+    if not ok:
+        pytest.skip(reason)
+    build, ref_fn = _SERIES_ACTIVATIONS[act]
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    X = g.tensor(name="X", dim=[1, M, N], stride=[M * N, N, 1], data_type=cudnn.data_type.FLOAT)
+    build(g, g.add(a=g.matmul(A=A, B=B, name="mm"), b=X, name="x")).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    compiled = _plan(g, config=cfg)
+
+    gen = torch.Generator().manual_seed(0)
+    mag = 10.0 ** (-30.0 + 31.0 * torch.rand(6000, generator=gen, dtype=torch.float64))  # 1e-30 .. 10, both signs
+    # Not below -80: under about -87.3, e^x is subnormal and exp2 (ex2.approx.ftz) flushes it, so softplus returns 0
+    # there, which an rtol-only check would reject.
+    negative = -2.0 - 78.0 * torch.rand(M * N - 2 * mag.numel() - 2, generator=gen, dtype=torch.float64)  # softplus: e^x < 0.14
+    x = torch.cat([mag, -mag, negative, torch.tensor([float("inf"), float("-inf")], dtype=torch.float64)]).float()
+    x = x.view(1, M, N).cuda()
+    a = torch.zeros(1, M, K, dtype=torch.bfloat16, device="cuda")
+    b = torch.zeros(1, N, K, dtype=torch.bfloat16, device="cuda")
+    out = torch.full((1, M, N), float("nan"), device="cuda")
+    compiled(_vp(compiled, a, b, out, x))
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, ref_fn(x.double()).float(), atol=0, rtol=1e-5)
+
+
 # ---------------------------------------------------------------------------
 # Two-kernel split-K
 # ---------------------------------------------------------------------------

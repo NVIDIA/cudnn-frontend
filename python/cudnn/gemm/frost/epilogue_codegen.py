@@ -83,7 +83,8 @@ _TWO_LOG2E = "cutlass.Float32(2.8853900817779268)"
 
 
 def _tanh_expr(v: str) -> str:
-    """Generate vector tanh."""
+    """Generate vector tanh as 1 - 2/(e^2x + 1). Its absolute error, about 1e-7, is enough for gelu_tanh and the
+    backward ops but is the whole result as x goes to 0, so the tanh op switches to _TANH_SERIES there."""
     one = f"cutlass.full_like({v}, cutlass.Float32(1.0))"
     two = f"cutlass.full_like({v}, cutlass.Float32(2.0))"
     e2 = f"cute.math.exp2({v} * cutlass.full_like({v}, {_TWO_LOG2E}), fastmath=True)"
@@ -92,6 +93,28 @@ def _tanh_expr(v: str) -> str:
 
 def _fl(var: str, c: float) -> str:
     return f"cutlass.full_like({var}, cutlass.Float32({float(c)}))"
+
+
+# The closed forms of tanh (1 - 2/(e^2x + 1)) and elu (e^x - 1) near x = 0, and softplus's log(1 + y) for a small
+# y = e^-|x|, cancel: their absolute error (about 1e-7, one rounding of a value near 1) is the whole result as it goes
+# to 0. Below _SERIES_BOUND (in |x| for tanh and elu, in y for softplus) those emitters select the leading Taylor terms
+# instead, whose truncation error at the bound is under 1e-8 of the result; beyond it they keep the closed forms.
+# +-inf and NaN inputs give the same results as before.
+_SERIES_BOUND = 0.125
+
+_TANH_SERIES = (-1.0 / 3.0, 2.0 / 15.0, -17.0 / 315.0)  # x^3, x^5, x^7 coefficients
+
+_EXPM1_SERIES = (1.0 / 2.0, 1.0 / 6.0, 1.0 / 24.0, 1.0 / 120.0, 1.0 / 720.0)  # x^2 .. x^6
+
+_LOG1P_SERIES = (-1.0 / 2.0, 1.0 / 3.0, -1.0 / 4.0, 1.0 / 5.0, -1.0 / 6.0, 1.0 / 7.0, -1.0 / 8.0)  # y^2 .. y^8
+
+
+def _horner(v: str, coeffs: tuple[float, ...]) -> str:
+    """Generate sum(coeffs[i] * v**i) in Horner form."""
+    expr = _fl(v, coeffs[-1])
+    for c in reversed(coeffs[:-1]):
+        expr = f"{_fl(v, c)} + {v} * ({expr})"
+    return expr
 
 
 def _step01(d_expr: str, tag: str) -> tuple[list[str], str]:
@@ -311,15 +334,24 @@ def _emit_op(
         ], new
 
     if op.op == "elu":
+        # max(x, 0) + expm1(min(x, 0)): the expm1 term is exactly 0 for x >= 0, so a positive x passes through unrounded.
+        n = f"_eln{idx}"
         return [
             f"_el{idx} = {prev}",
-            f"{new} = cute.math.max(_el{idx}, {_fl(f'_el{idx}', 0.0)}) + cute.math.exp2(cute.math.min(_el{idx}, {_fl(f'_el{idx}', 0.0)}) * cutlass.full_like(_el{idx}, {_LOG2E}), fastmath=True) - {_fl(f'_el{idx}', 1.0)}",
+            f"{n} = cute.math.min(_el{idx}, {_fl(f'_el{idx}', 0.0)})",
+            f"_elm{idx} = cutlass._mlir_helpers.vector.where({n} > {_fl(n, -_SERIES_BOUND)}, {n} + {n} * {n} * ({_horner(n, _EXPM1_SERIES)}), "
+            f"cute.math.exp2({n} * cutlass.full_like({n}, {_LOG2E}), fastmath=True) - {_fl(n, 1.0)})",
+            f"{new} = cute.math.max(_el{idx}, {_fl(f'_el{idx}', 0.0)}) + _elm{idx}",
         ], new
 
     if op.op == "softplus":
+        # max(x, 0) + log1p(y), y = e^-|x|.
+        y = f"_spy{idx}"
         return [
             f"_sp{idx} = {prev}",
-            f"{new} = cute.math.max(_sp{idx}, {_fl(f'_sp{idx}', 0.0)}) + cute.math.log({_fl(f'_sp{idx}', 1.0)} + cute.math.exp2(-cute.math.abs(_sp{idx}) * cutlass.full_like(_sp{idx}, {_LOG2E}), fastmath=True))",
+            f"{y} = cute.math.exp2(-cute.math.abs(_sp{idx}) * cutlass.full_like(_sp{idx}, {_LOG2E}), fastmath=True)",
+            f"{new} = cute.math.max(_sp{idx}, {_fl(f'_sp{idx}', 0.0)}) + cutlass._mlir_helpers.vector.where({y} < {_fl(y, _SERIES_BOUND)}, "
+            f"{y} + {y} * {y} * ({_horner(y, _LOG1P_SERIES)}), cute.math.log({_fl(y, 1.0)} + {y}))",
         ], new
 
     if op.op == "tan":
@@ -358,7 +390,13 @@ def _emit_op(
         return _emit_binary_ext(op, lhs, rhs, idx, new)
 
     if op.op == "tanh":
-        return [f"{new} = {_tanh_expr(prev)}"], new
+        t, t2 = f"_th{idx}", f"_thq{idx}"
+        return [
+            f"{t} = {prev}",
+            f"{t2} = {t} * {t}",
+            f"{new} = cutlass._mlir_helpers.vector.where(cute.math.abs({t}) < {_fl(t, _SERIES_BOUND)}, {t} + {t} * {t2} * ({_horner(t2, _TANH_SERIES)}), "
+            f"{_tanh_expr(t)})",
+        ], new
 
     if op.op == "exp":
 
@@ -1122,6 +1160,11 @@ _SHARED_EXPORTS = {
     "_TWO_LOG2E": _TWO_LOG2E,
     "_tanh_expr": _tanh_expr,
     "_fl": _fl,
+    "_SERIES_BOUND": _SERIES_BOUND,
+    "_TANH_SERIES": _TANH_SERIES,
+    "_EXPM1_SERIES": _EXPM1_SERIES,
+    "_LOG1P_SERIES": _LOG1P_SERIES,
+    "_horner": _horner,
     "_step01": _step01,
     "_nonzero01": _nonzero01,
     "_sigmoid_lines": _sigmoid_lines,
