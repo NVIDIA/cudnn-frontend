@@ -209,16 +209,16 @@ def test_pv_bf16_staged_conversion_omits_dead_operands(d, amax, monkeypatch):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("native_layout", [False, True])
-def test_pv_bf16_no_amax_flag_with_sample_descriptor(d, native_layout):
+@pytest.mark.parametrize("compact_layout", [False, True])
+def test_pv_bf16_no_amax_flag_with_sample_descriptor(d, compact_layout):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("PV-BF16 needs pre-Rubin SM100")
     v = None
-    if not native_layout:
+    if not compact_layout:
         storage = torch.full((2, 128, 2, 136), 0.5, device="cuda", dtype=torch.bfloat16)
         v = storage[..., :128].transpose(1, 2)
     api, bufs, ws, scales = _case(d=d, amax=True, v=v, has_amax_o=False)
-    assert api._prepared_mxfp8 == native_layout
+    assert api._prepared_mxfp8 and not hasattr(api, "_staged_spec")
     assert not api.has_amax_o
     with pytest.raises(ValueError, match="has_amax_o=False"):
         api.execute(**bufs, workspace=ws)

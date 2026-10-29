@@ -3140,12 +3140,14 @@ def test_prepared_mxfp8_override_contract(thd, override, split, accepted, rubin_
 MXFP8_ENGINE = engines.engine_name(mxfp8=True)
 
 
-def _mk_paged_mxfp8(*, page=128, max_pages=8, d=256, kh=2, s_q=1, thd=False, v_nhd=False, q_bhsd=False, dtype=cudnn.data_type.FP8_E4M3):
+def _mk_paged_mxfp8(*, page=128, max_pages=8, d=256, kh=2, s_q=1, thd=False, v_nhd=False, q_bhsd=False, dtype=cudnn.data_type.FP8_E4M3, q_unaligned=False):
     """sdpa_mxfp8 over HND page pools + pool-shaped descales."""
     g = cudnn.pygraph(io_data_type=dtype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     num_pages = B * max_pages + 3
     q_dims = (B, H, s_q, d)
     q_strides = (H * s_q * d, s_q * d, d, 1) if q_bhsd else (s_q * H * d, d, H * d, 1)
+    if q_unaligned:
+        q_strides = (H * s_q * (d + 1), s_q * (d + 1), d + 1, 1)
     pool_dims = (num_pages, kh, page, d)
     hnd = (kh * page * d, page * d, d, 1)
     nhd = (page * kh * d, d, kh * d, 1)
@@ -3214,8 +3216,9 @@ def test_paged_mxfp8_probe_accepts_and_declines():
     assert reason is not None and "multiple of 128" in reason, reason
     reason = _mxfp8_reason(_mk_paged_mxfp8(thd=True))
     assert reason is not None and "THD" in reason, reason
-    reason = _mxfp8_reason(_mk_paged_mxfp8(q_bhsd=True, s_q=4))  # s_q > 1: at s_q == 1 the two layouts coincide
-    assert reason is not None and "BSHD" in reason, reason
+    assert _mxfp8_reason(_mk_paged_mxfp8(q_bhsd=True, s_q=4)) is None
+    reason = _mxfp8_reason(_mk_paged_mxfp8(q_unaligned=True, s_q=4))
+    assert reason is not None and "16-byte outer-stride alignment" in reason, reason
 
 
 def test_paged_mxfp8_accepts_mixed_pool_layouts():

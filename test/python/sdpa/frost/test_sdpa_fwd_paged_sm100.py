@@ -2919,7 +2919,7 @@ def test_paged_mxfp8_graph_declines_off_contract():
     assert _offers(_plans(128))
     assert not _offers(_plans(64)), "F8_128x4 pools hold whole 128-row SF atoms: page_size 64 is off-contract"
     assert not _offers(_plans(128, d_qk=64, d_v=64)), "MXFP8 is exact-native: no d64 envelope"
-    assert not _offers(_plans(128, q_bhsd=True, s_q=4)), "the MXFP8 row serves BSHD-physical Q/O only (at s_q == 1 the layouts coincide)"
+    assert _offers(_plans(128, q_bhsd=True, s_q=4)), "BHSD Q/O bind natively when s_q > 1 too"
     assert _offers(_plans(128, mixed_layout=True)), "K and V layout kinds are independent"
 
 

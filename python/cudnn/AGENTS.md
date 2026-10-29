@@ -311,6 +311,12 @@ the kernel that reads it).
   argument is a contract: validate device-residency and dtype (a CUDA int64
   tensor, not a host tensor) before handing its address to a kernel — both
   flagged in review on PR #517.
+- **Restore the caller's device after a launch on another device.** Binding
+  a stream's CUDA context can change the ambient device even when no torch
+  operation runs. Scope that binding and launch with `device_context`; test
+  with a side stream on Q's device while another device is current, then
+  assert the caller's device is unchanged. Detector:
+  `native_forward_fp8_cases.test_native_default_stream_with_another_device_current`.
 - **A raw stream handle never goes straight into `torch.cuda.ExternalStream`.**
   Every eager caller on torch's default stream hands us a default-stream
   legacy sentinel (`0`, `cudaStreamLegacy` = 1), and torch

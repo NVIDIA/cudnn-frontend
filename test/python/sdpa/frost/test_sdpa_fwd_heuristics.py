@@ -636,14 +636,14 @@ def test_sm120_mxfp8_d512_flavor_and_tile_contract():
 @pytest.mark.L0
 @pytest.mark.parametrize("dim", [256, 512])
 def test_sm120_fp8_dense_layouts_and_split_output(dim):
-    """FP8 layouts normalize to compact storage before main and split-combine kernels."""
+    """Aligned FP8 pitches bind natively in both main and split-combine kernels."""
     from types import SimpleNamespace
 
     shape = (1, 4, 16, dim)
     head_major = (64 * dim, 16 * dim, dim, 1)
-    padded = (64 * (dim + 1), 16 * (dim + 1), dim + 1, 1)
-    query = SimpleNamespace(get_dim=lambda: shape, get_stride=lambda: padded)
-    output = SimpleNamespace(get_dim=lambda: shape, get_stride=lambda: head_major)
+    padded = (64 * (dim + 16), 16 * (dim + 16), dim + 16, 1)
+    query = SimpleNamespace(get_dim=lambda: shape, get_stride=lambda: padded, get_data_type=lambda: cudnn.data_type.FP8_E4M3)
+    output = SimpleNamespace(get_dim=lambda: shape, get_stride=lambda: head_major, get_data_type=lambda: cudnn.data_type.BFLOAT16)
     facts = _facts(
         s_q=16,
         s_kv=32768,
