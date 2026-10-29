@@ -116,6 +116,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     supports_paged_prefill_cga1,
     supports_paged_d256_pack_gqa,
     supports_nonpaged_d128_thd_prefill,
+    supports_sm100_nonpaged_d128_thd_single_cta,
     supports_paged_d128_partial_pack_gqa,
     supports_nonpaged_d128_thd_pack_gqa,
     _PAGED_KV_FLAVORS as _SM100_PAGED_KV_FLAVORS,
@@ -2157,6 +2158,27 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and (self.cga == 1 or self.pack_gqa)
         )
 
+    def _sm100_nonpaged_thd_single_cta_leg(self) -> bool:
+        """The SM100 single-CTA D128 half THD prefill leg (``config_sm100.supports_sm100_nonpaged_d128_thd_single_cta``)."""
+        return not self.softmax_scale_prefolded and supports_sm100_nonpaged_d128_thd_single_cta(
+            (int(self.q_desc.shape[-1]), int(self.v_desc.shape[-1])),
+            device_cc=self._device_cc,
+            fp8=self._fp8,
+            thd=self.thd,
+            paged=self.paged,
+            cga=self.cga,
+            split_kv=self.split_kv,
+            one_head_per_kv=int(self.q_desc.shape[1]) == int(self.k_desc.shape[1]),
+            plain_mask=(
+                self.window_left is None
+                and not self.window_right
+                and not self.has_sink
+                and self.bias_desc is None
+                and self.kv_mask_desc is None
+                and self.gate_desc is None
+            ),
+        )
+
     def _rubin_native_thd_prefill_leg(self) -> bool:
         """The exact-D128 native THD prefill domain, shared with graph admission."""
         return not self.softmax_scale_prefolded and supports_nonpaged_d128_thd_prefill(
@@ -2792,10 +2814,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and self.cga == 1
             and not self._fp8
             and self.thd
-            and not (self.thd_decode_leg or self.packed_thd_split or paged_prefill_cga1 or self._rubin_native_thd_prefill_leg()),
+            and not (
+                self.thd_decode_leg
+                or self.packed_thd_split
+                or paged_prefill_cga1
+                or self._rubin_native_thd_prefill_leg()
+                or self._sm100_nonpaged_thd_single_cta_leg()
+            ),
             "cga=1 on the d128 half flavor requires an admitted one-query/split THD decode leg, paged prefill, "
-            "or native Rubin nonpaged exact D128 unsplit prefill; "
-            "other THD (ragged) graphs run the cga2 prefill tile",
+            "native Rubin nonpaged exact D128 unsplit prefill, or the SM100 nonpaged half prefill body with one query head per KV head "
+            "under a plain mask; other THD (ragged) graphs run the cga2 prefill tile",
         )
         # The per-tensor FP8 d128 flavor admits cga1 too, as its dense unsplit
         # prefill leg (heuristics._auto_sched_cga); its THD leg is validated on

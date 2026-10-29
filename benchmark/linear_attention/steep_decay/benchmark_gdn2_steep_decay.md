@@ -67,10 +67,10 @@ nvidia-smi -q > "$REPRO_DIR/results/nvidia-smi.txt"
 for arm in base-A1 patch-B1 patch-B2 base-A2; do
   case "$arm" in base-*) variant=base ;; *) variant=patch ;; esac
   PYTHONPATH="$REPRO_DIR/$variant" python \
-    test/python/linear_attention/benchmark_gdn2_steep_decay.py \
+    benchmark/linear_attention/steep_decay/benchmark_gdn2_steep_decay.py \
     --label "$arm" --output "$REPRO_DIR/results/$arm.json"
 done
-python test/python/linear_attention/summarize_gdn2_steep_decay.py "$REPRO_DIR/results"
+python benchmark/linear_attention/steep_decay/summarize_gdn2_steep_decay.py "$REPRO_DIR/results"
 ```
 
 Copy the result directory out before removing the container.
@@ -91,19 +91,6 @@ The [evidence archive](https://github.com/alfredclwong/cudnn-frontend/releases/t
 The release includes a SHA256 checksum. Generated results do not belong in this checkout.
 The archive retains the measured scripts. Later validation fixes change the benchmark script hash and require fresh ABBA records for new comparisons.
 
-## CPU validation tests
-
-The summary command needs only the Python standard library. Its regression tests need pytest and no GPU.
-The benchmark validation tests also need PyTorch. They use CPU tensors and replace GPU calls with test doubles.
-Both suites check normal and optimized Python execution.
-Run them without the GPU test harness:
-
-```bash
-python -m pytest --noconftest -c test/python/pytest.ini -o addopts= \
-  test/python/linear_attention/test_gdn2_steep_decay_summary.py \
-  test/python/linear_attention/test_gdn2_steep_decay_benchmark.py
-```
-
 ## Upstream correctness tests
 
 Use the public environment above and the patched runtime. Install the public test dependencies:
@@ -112,11 +99,8 @@ Use the public environment above and the patched runtime. Install the public tes
 python -m pip install pytest pytest-xdist looseversion
 export PYTHONPATH="$REPRO_DIR/patch"
 cd test/python
-python -m pytest -n 0 -m '' \
-  linear_attention/test_gdn2_frost_steep_decay.py \
-  linear_attention/test_gdn2_frost_steep_scratch.py -ra
 python -m pytest -n 0 -m '' linear_attention/test_la.py \
-  -k 'gdn2 and frost and (overwrite or state_indices)' -ra
+  -k 'test_steep or (gdn2 and frost and (overwrite or state_indices))' -ra
 ```
 
 The empty marker expression disables the default smoke-level filter.

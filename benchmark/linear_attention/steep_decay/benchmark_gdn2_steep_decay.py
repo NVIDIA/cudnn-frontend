@@ -14,6 +14,7 @@ import hashlib
 import importlib.metadata
 import json
 import statistics
+import sys
 from pathlib import Path
 
 import torch
@@ -22,6 +23,7 @@ import cudnn
 from cudnn.linear_attention.ops.gdn2 import gated_delta_net_v2
 from cudnn.linear_attention.frost import gdn2_engine
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "test" / "python" / "linear_attention"))
 import reference_gdn2
 
 NAMES = ("q", "k", "v", "g", "b", "w")

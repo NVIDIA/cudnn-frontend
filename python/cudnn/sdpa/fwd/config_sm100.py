@@ -565,6 +565,22 @@ def supports_nonpaged_d128_thd_prefill(d_shape, *, device_cc, fp8, thd, paged, c
     return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and not paged and cga in (None, 1, 2) and split_kv == 1
 
 
+def supports_sm100_nonpaged_d128_thd_single_cta(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv, one_head_per_kv, plain_mask):
+    """SM100 single-CTA D128 half THD prefill: the two-slab 256-row body for nonpaged ragged graphs with one query head
+    per KV head, unsplit, under a plain mask (none, causal or padding: no window, band, sink, bias or kv_mask)."""
+    return (
+        tuple(device_cc or ()) in ((10, 0), (10, 3))
+        and tuple(d_shape) == (128, 128)
+        and not fp8
+        and thd
+        and not paged
+        and one_head_per_kv
+        and plain_mask
+        and cga in (None, 1, 2)
+        and split_kv == 1
+    )
+
+
 def supports_paged_d128_partial_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
     """Rubin's two-CTA D128 paged half body packs a divisor of the GQA group."""
     return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and paged and cga in (None, 2) and split_kv == 1

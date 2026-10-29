@@ -28,8 +28,8 @@ A channel needs exact decay when its prefix falls below the dtype threshold (``-
 or its raw key magnitude makes the inverse operand unsafe. Normalized keys have magnitude at most one;
 ``channel_needs_exact_decay`` also bounds unnormalized keys before selecting the path.
 
-Dispatch.  The steep path costs registers and code even where it never runs, so each kernel's ``host`` launches it
-twice (``cfg.steep_mode``):
+Dispatch.  The steep path costs registers and code even where it never runs, so a ``STEEP_FAST`` kernel's ``host``
+launches it twice (``cfg.steep_mode``):
 
 - ``STEEP_FAST``: the original arithmetic plus a range check and one ballot per scan warp; a warp that finds a steep channel stores 1 into
   the second int32 of the kernel's scheduler slot, which the prologue zeroes every call.  A steep tile's outputs are
@@ -38,6 +38,9 @@ twice (``cfg.steep_mode``):
   entry while the flag is 0, so a call without a steep tile pays one empty launch; otherwise the kernel redoes the whole
   launch exactly (pulling tiles off the flag int, past its 1), overwriting every output before the next kernel reads it.
   No host synchronisation is involved, so the pair is safe under CUDA graphs and ``torch.compile``.
+- ``STEEP_OFF``: chosen by ``steep_mode_for`` when no tile can be steep.  Under the safe gate with normalized keys a tile's
+  log2 prefix stays above ``BT * gate_scale_log2``; when that floor is above the dtype's steep threshold the kernel runs
+  once, without the vote or the scratch, and no exact twin is compiled.
 A launch whose output aliases a state it reads (``overwrite_initial_state``, a ``state_indices`` pool, the backward's
 ``d_initial_state`` over ``d_final_state``) reads that state from a workspace snapshot (common/state_snapshot.py), so
 the exact launch never reads the fast launch's garbage.
@@ -78,8 +81,6 @@ Synchronisation invariants of the steep path:
   ``STEEP_FAST``.
 """
 
-import dataclasses
-
 import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
@@ -95,10 +96,8 @@ STEEP_LOG2_PREFIX_FP16: float = -14.0
 """fp16 operands: K inv = k * 2^-g reaches the fp16 maximum, ``65504 ~ 2^16``, two binades further down."""
 
 
-def steep_log2_prefix(io_dtype) -> float:
-    """The steep threshold for the operand dtype (a trace-time constant)."""
-    return STEEP_LOG2_PREFIX_FP16 if io_dtype == cutlass.Float16 else STEEP_LOG2_PREFIX
-
+STEEP_OFF: int = -1
+"""Kernel ``cfg.steep_mode``: no tile of this configuration can be steep; the original arithmetic alone, one launch."""
 
 STEEP_FAST: int = 0
 """Kernel ``cfg.steep_mode``: the original arithmetic plus the steep vote; a steep tile raises the call's steep flag.
@@ -114,14 +113,15 @@ prologue zeroes with the first: 0 means no steep tile, and the exact launch's ti
 stored."""
 
 
-def has_exact_path(cfg) -> bool:
-    """Whether ``cfg``'s kernel compiles the steep path in (``STEEP_EXACT``; a trace-time constant)."""
-    return cfg.steep_mode != STEEP_FAST
+def steep_mode_for(io_dtype, l2norm: bool, safe_gate: bool, gate_scale_log2: float, b_t: int) -> int:
+    """The steep mode of a configuration: ``STEEP_OFF`` when no BT-token tile can hold a steep key channel, else ``STEEP_FAST``.
 
-
-def steep_launch_cfg(cfg, launch_idx):
-    """Compile-time launch order: the requested specialization, then its exact twin."""
-    return cfg if launch_idx == 0 else dataclasses.replace(cfg, steep_mode=STEEP_EXACT)
+    Under the safe gate every token's log2 gate lies in ``(gate_scale_log2, 0)``, so a tile's prefix never falls below
+    ``b_t * gate_scale_log2``, and normalized keys leave the prefix as the only bound on the inverse operand."""
+    if not (safe_gate and l2norm):
+        return STEEP_FAST
+    threshold = STEEP_LOG2_PREFIX_FP16 if io_dtype == cutlass.Float16 else STEEP_LOG2_PREFIX
+    return STEEP_FAST if b_t * abs(float(gate_scale_log2)) >= -threshold else STEEP_OFF
 
 
 @cute.jit
@@ -178,7 +178,7 @@ def channel_needs_exact_decay(cfg: cutlass.Constexpr, prefix, raw_k_ptr, channel
     and reserve one binade below the operand maximum for reciprocal rounding.
     The last prefix is the minimum, so this bounds every row's inverse.
     """
-    threshold = cutlass.Float32(steep_log2_prefix(cfg.io_dtype))
+    threshold = cutlass.Float32(STEEP_LOG2_PREFIX_FP16 if cfg.io_dtype == cutlass.Float16 else STEEP_LOG2_PREFIX)
     if cutlass.const_expr(not cfg.l2norm):
         max_key = cutlass.Float32(1.0)
         for row in cutlass.range(cfg.b_t, unroll=1):
@@ -195,11 +195,14 @@ def classify_steep_channel(cfg: cutlass.Constexpr, prefix, raw_k_ptr, channel, c
 
     Callers retain ownership of stage offsets, scratch stores and barriers.
     """
-    channel_steep = channel_needs_exact_decay(cfg, prefix, raw_k_ptr, channel)
-    word = cutlass.Int32(nvvm.vote_sync(0xFFFFFFFF, channel_steep, nvvm.VoteSync.BALLOT))
-    if cutlass.const_expr(channel_rows < cfg.threads_per_warp):
-        word = word & cutlass.Int32((1 << channel_rows) - 1)
-    steep_raise_flag(cfg, flag_slot, word, lane_idx)
+    channel_steep = cutlass.Boolean(False)
+    word = cutlass.Int32(0)
+    if cutlass.const_expr(cfg.steep_mode != STEEP_OFF):
+        channel_steep = channel_needs_exact_decay(cfg, prefix, raw_k_ptr, channel)
+        word = cutlass.Int32(nvvm.vote_sync(0xFFFFFFFF, channel_steep, nvvm.VoteSync.BALLOT))
+        if cutlass.const_expr(channel_rows < cfg.threads_per_warp):
+            word = word & cutlass.Int32((1 << channel_rows) - 1)
+        steep_raise_flag(cfg, flag_slot, word, lane_idx)
     return channel_steep, word
 
 
@@ -227,7 +230,7 @@ def encode_gate_exchange(
     stage selection and publication barriers; this helper never synchronizes.
     """
     channel_steep, word = classify_steep_channel(cfg, prefix, raw_k_ptr, channel, channel_rows, flag_slot, lane_idx)
-    if cutlass.const_expr(has_exact_path(cfg)):
+    if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
         if lane_idx == 0:
             (words_ptr + scan_warp).store(word)
         if word != 0:
@@ -236,7 +239,7 @@ def encode_gate_exchange(
                     (log_last_ptr + channel).store(token_logs[cfg.b_t - 1])
     for row in cutlass.range_constexpr(cfg.b_t):
         values[row] = cute.math.exp2(values[row], fastmath=True)
-        if cutlass.const_expr(has_exact_path(cfg) and row < cfg.b_t - 1):
+        if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT and row < cfg.b_t - 1):
             if channel_steep:
                 values[row] = token_logs[row]
     return word
@@ -246,7 +249,7 @@ def encode_gate_exchange(
 def steep_tile_mask(cfg: cutlass.Constexpr, words_ptr):
     """Read the tile's four scan-warp ballots; FAST never reads exact-path scratch."""
     mask = cutlass.Int32(0)
-    if cutlass.const_expr(has_exact_path(cfg)):
+    if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
         mask = (words_ptr.load() | (words_ptr + 1).load()) | ((words_ptr + 2).load() | (words_ptr + 3).load())
     return mask
 
@@ -340,7 +343,7 @@ def row_operand_scales(cfg: cutlass.Constexpr, bits, reg_idx, row, channel, valu
     decay = value
     inverse = cute.math.rcp(value, approx=True, ftz=True)
     restore_multiplier = last_value
-    if cutlass.const_expr(has_exact_path(cfg)):
+    if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
         if ((bits >> reg_idx) & 1) != 0:
             decay = steep_decay_scale(cfg, exchange_ptr, log_last_ptr, row, channel)
             inverse = steep_restore_scale(cfg, exchange_ptr, log_last_ptr, row, channel)
