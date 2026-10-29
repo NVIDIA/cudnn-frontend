@@ -70,7 +70,7 @@ def test_workspace_layout_d192():
     assert regions[1][0] == 4 * 2 * 384 * 3 * 192 and total == 4 * 2 * 3 * 384 * 193 + 240
 
 
-def _run(dt, sq, sk, causal, b=2, h=3, seed=11, replay=False):
+def _run(dt, sq, sk, causal, b=2, h=3, seed=11, replay=False, replay_count=1):
     keep = _causal_keep(sq, sk, causal=causal)
     g, ports, grad_ports = _build_graph(b=b, hq=h, hkv=h, sq=sq, skv=sk, d=_D, d_v=_DV, dt=dt, **({"use_causal_mask": True} if causal else {}))
     select_engine(g, _ENGINE)
@@ -127,7 +127,10 @@ def _run(dt, sq, sk, causal, b=2, h=3, seed=11, replay=False):
         for name, value in values.items():
             value.copy_(fresh[name])
         poison()
-        capture.replay()
+        for i in range(replay_count):
+            capture.replay()
+            if i % 8 == 7:
+                torch.cuda.current_stream().synchronize()
         torch.cuda.synchronize()
         check(fresh_refs)
 
@@ -145,7 +148,9 @@ def test_d192_accumulation(dt, sq, sk, causal):
 
 @requires_pre_rubin_blackwell
 def test_d192_causal_empty_kv_tiles():
-    _run(torch.bfloat16, 256, 1024, True, b=4, h=32)
+    # Empty tiles must acknowledge the loader before releasing its K buffer.
+    # Repeated replay catches a store racing ahead of the initial empty wait.
+    _run(torch.bfloat16, 256, 1024, True, b=4, h=32, replay=True, replay_count=8192)
 
 
 @requires_pre_rubin_blackwell
