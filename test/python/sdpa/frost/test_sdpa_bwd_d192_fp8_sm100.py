@@ -9,14 +9,18 @@ import pytest
 import torch
 
 import test_sdpa_bwd_fp8_sm107 as _rubin
-from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell
+from frost_test_utils import _SM, requires_dsl
 
 pytestmark = [pytest.mark.L0, requires_dsl]
+requires_pair_cc = pytest.mark.skipif(
+    _SM is None or not (100 <= _SM <= 107), reason="needs an SM100 / SM103 / SM107 GPU, have " + ("none" if _SM is None else f"sm_{_SM}")
+)
 
 _ENGINE = "sdpa_bwd_sm100_d192_fp8"
 _D, _DV = 192, 128
 _SM100_CC = (10, 0)
 _SM103_CC = (10, 3)
+_SM107_CC = (10, 7)
 _GRAD_DTYPES = [torch.float8_e4m3fn, torch.bfloat16]
 
 
@@ -56,7 +60,7 @@ def test_engine_is_registered():
     assert c.dtypes == frozenset({cudnn.data_type.FP8_E4M3})
     assert c.out_dtypes == frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})
     assert c.amax_dgrad and c.causal and c.deterministic and not c.gqa and not c.swa and not c.bottom_right and not c.thd
-    assert (c.sm_lo, c.sm_hi) == (100, 106)
+    assert (c.sm_lo, c.sm_hi) == (100, 119)
 
 
 def test_row_ranks_right_behind_the_half_row():
@@ -66,7 +70,7 @@ def test_row_ranks_right_behind_the_half_row():
     assert names.index("sdpa_bwd_sm100_d192") + 1 == names.index(_ENGINE) < names.index("sdpa_bwd_sm100_d256")
 
 
-@pytest.mark.parametrize("cc", [_SM100_CC, _SM103_CC], ids=["sm100", "sm103"])
+@pytest.mark.parametrize("cc", [_SM100_CC, _SM103_CC, _SM107_CC], ids=["sm100", "sm103", "sm107"])
 def test_row_admits_dense_d192_e4m3(monkeypatch, cc):
     assert _mismatch(monkeypatch, cc=cc) is None
     assert _mismatch(monkeypatch, cc=cc, causal=False) is None
@@ -80,45 +84,45 @@ def test_row_admits_dense_d192_e4m3(monkeypatch, cc):
     [
         (dict(d=128, d_v=128), ""),
         (dict(d=256, d_v=256), ""),
-        (dict(cc=(10, 7)), "requires SM100-106"),
-        (dict(cc=(12, 0)), "requires SM100-106"),
+        (dict(cc=(12, 0)), "requires SM100-119"),
+        (dict(cc=(9, 0)), "requires SM100-119"),
         (dict(h=4, hkv=2), ""),
         (dict(left_bound=64), ""),
         (dict(bottom_right=True), ""),
     ],
-    ids=["d128", "d256", "rubin", "sm120", "gqa", "window", "bottom-right"],
+    ids=["d128", "d256", "sm120", "sm90", "gqa", "window", "bottom-right"],
 )
 def test_row_declines(monkeypatch, kw, needle):
     reason = _mismatch(monkeypatch, **kw)
     assert reason is not None and needle.lower() in reason.lower(), reason
 
 
-@requires_pre_rubin_blackwell
+@requires_pair_cc
 @pytest.mark.parametrize("grad_dtype", _GRAD_DTYPES, ids=["e4m3", "bf16"])
 def test_dense(sm100_row, grad_dtype):
     sm100_row._run_fp8(b=1, hq=2, sq=512, skv=512, causal=False, grad_dtype=grad_dtype, d_v=_DV).check()
 
 
-@requires_pre_rubin_blackwell
+@requires_pair_cc
 @pytest.mark.parametrize("grad_dtype", _GRAD_DTYPES, ids=["e4m3", "bf16"])
 def test_causal(sm100_row, grad_dtype):
     sm100_row._run_fp8(b=2, hq=3, sq=768, skv=768, causal=True, grad_dtype=grad_dtype, d_v=_DV).check()
 
 
-@requires_pre_rubin_blackwell
+@requires_pair_cc
 @pytest.mark.parametrize("sq,skv", [(768, 1280), (500, 500), (257, 129), (129, 1), (1, 300)], ids=["rect", "500", "257x129", "129x1", "1x300"])
 def test_non_tile_multiple_seqlens(sm100_row, sq, skv):
     sm100_row._run_fp8(b=1, hq=2, sq=sq, skv=skv, causal=False, d_v=_DV).check()
     sm100_row._run_fp8(b=1, hq=2, sq=sq, skv=skv, causal=True, d_v=_DV).check()
 
 
-@requires_pre_rubin_blackwell
+@requires_pair_cc
 @pytest.mark.parametrize("request_amax", [(), ("amax_dP",), ("amax_dQ", "amax_dV")], ids=["none", "dP", "dQ-dV"])
 def test_amax_subsets(sm100_row, request_amax):
     sm100_row._run_fp8(b=1, hq=2, sq=512, skv=640, causal=True, request_amax=request_amax, d_v=_DV).check()
 
 
-@requires_pre_rubin_blackwell
+@requires_pair_cc
 def test_repeated_launches_are_bitwise(sm100_row):
     run = sm100_row._run_fp8(b=1, hq=4, sq=1024, skv=1024, causal=True, runs=3, poison=float("nan"), d_v=_DV).check()
     for later in run.outs[1:]:
@@ -160,12 +164,12 @@ def test_pair_host_binds_one_kernel_pair_per_specialization(monkeypatch):
     assert modules[fp8_sm103].dkdv_host is not modules[fp8_sm100].dkdv_host
 
 
-@requires_pre_rubin_blackwell
+@requires_pair_cc
 def test_causal_empty_kv_tiles(sm100_row):
     sm100_row._run_fp8(b=4, hq=32, sq=256, skv=1024, causal=True, d_v=_DV, runs=32).check()
 
 
-@requires_pre_rubin_blackwell
+@requires_pair_cc
 def test_negative_scale_declined_at_check():
     from cudnn.sdpa.bwd.api_dsl_sm100_d192_fp8 import SdpaBwdDslSm100D192Fp8
 
@@ -186,6 +190,6 @@ def test_negative_scale_declined_at_check():
         api(-0.1).check_support()
 
 
-@requires_pre_rubin_blackwell
+@requires_pair_cc
 def test_explicit_attn_scale(sm100_row):
     sm100_row._run_fp8(b=1, hq=2, sq=384, skv=512, causal=True, attn_scale=0.5 / math.sqrt(_D), d_v=_DV).check()

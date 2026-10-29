@@ -1802,9 +1802,10 @@ def _sm107_mxfp8_spec() -> EngineSpec:
     )
 
 
-def _d192_accumulation_serves(facts: "ga.SdpaGraphFacts", deterministic_ok: bool = False) -> bool:
+def _d192_accumulation_serves(facts: "ga.SdpaGraphFacts", ccs=None, deterministic_ok: bool = False) -> bool:
     from .d128_contract import ACCUMULATION_CCS
 
+    ccs = ACCUMULATION_CCS if ccs is None else ccs
     return (
         (facts.d_qk, facts.d_v) == (192, 128)
         and not facts.thd
@@ -1813,7 +1814,7 @@ def _d192_accumulation_serves(facts: "ga.SdpaGraphFacts", deterministic_ok: bool
         and not facts.bottom_right
         and (deterministic_ok or not facts.deterministic)
         and facts.device_cc is not None
-        and tuple(facts.device_cc) in ACCUMULATION_CCS
+        and tuple(facts.device_cc) in ccs
     )
 
 
@@ -1833,9 +1834,11 @@ def _sm100_d192_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[s
 
 
 def _sm100_d192_fp8_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
-    if _d192_accumulation_serves(facts, deterministic_ok=True):
+    from .d128_contract import D192_FP8_CCS
+
+    if _d192_accumulation_serves(facts, D192_FP8_CCS, deterministic_ok=True):
         return None
-    return "the d192 fp8 kernel pair serves dense MHA (192, 128) without windows on cc 10.0 / 10.3"
+    return "the d192 fp8 kernel pair serves dense MHA (192, 128) without windows on cc 10.0 / 10.3 / 10.7"
 
 
 def _sm100_d256_spec() -> EngineSpec:
@@ -2205,7 +2208,7 @@ def _sm100_d192_fp8_spec() -> EngineSpec:
         name="sdpa_bwd_sm100_d192_fp8",
         capabilities=Capabilities(
             sm_lo=100,
-            sm_hi=106,
+            sm_hi=_RUBIN[1],
             d=frozenset({128, 192}),
             dqk_ge_dv=True,
             declaration_check=_sm100_d192_fp8_head_mismatch,
@@ -2360,11 +2363,11 @@ ENGINE_SPECS = (
     _sm80_spec(),
     _sm100_spec(),
     _sm100_mxfp8_spec(),
+    _sm100_d192_spec(),
+    _sm100_d192_fp8_spec(),
     _sm107_spec(),
     _sm107_fp8_spec(),
     _sm107_mxfp8_spec(),
-    _sm100_d192_spec(),
-    _sm100_d192_fp8_spec(),
     _sm100_d256_spec(),
     _sm107_d512_spec(),
     _sm100_d128_spec(),
