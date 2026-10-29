@@ -679,7 +679,7 @@ the query tiles, the dQ kernel owns one 128-query tile and streams the key tiles
 P and dS travel through SMEM rings and only the diagonal and tail tiles are masked.
 D64, with or without a left sliding window, runs the FP8 accumulation chain (FP32 dQ
 scratch; GQA/MQA appends BF16 dK/dV partials per query head and a fixed-order fold).
-Compact BSHD, unmasked or top-left causal, any S_q / S_kv, cc 10.0 or 10.3, public
+Compact BSHD, unmasked or top-left causal, any S_q / S_kv, cc 10.0 or 10.3 (the D192x128 pair row also cc 10.7), public
 CuTeDSL >= 4.8 and a finite positive scale. Declined: THD, padding, bottom-right causal,
 right-band widening, deterministic requests, a caller-provided delta, bias / dBias,
 sink / dSink, a window at D128 or D192x128, GQA/MQA at D192x128, FP16 gradients at
@@ -4500,7 +4500,9 @@ The CGA4x1 / CTA_MMA2 role-split D512 body now supports dense packed and unpacke
 The existing opt-in `sdpa_bwd_sm107_fp8` row serves exact Q/K=192 and V/O=128
 alongside D256. Dense BSHD and packed THD use native operand widths, including
 their tensor maps, delta reduction, workspace and GQA fold; no data repack is
-added. The row retains its E4M3 input, E4M3/BF16/FP16 gradient, mask, amax,
+added. Dense MHA (192, 128) without a window on cc 10.7 is served by the
+`sdpa_bwd_sm100_d192_fp8` kernel pair row, which lists ahead of this row; the chain
+keeps the other (192, 128) graphs. The row retains its E4M3 input, E4M3/BF16/FP16 gradient, mask, amax,
 Stats-layout and declared-total contracts. Other head pairs, half and MXFP8
 rows keep their existing eligibility. Placement and heuristic policy are unchanged.
 
