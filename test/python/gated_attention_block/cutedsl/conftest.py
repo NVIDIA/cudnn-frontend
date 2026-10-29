@@ -66,7 +66,10 @@ def pytest_collection_modifyitems(config, items):
     spells ``@pytest.mark.requires_rubin`` gets an unregistered-marker warning and NO skip (its Rubin accept tests would
     RUN, and fail to compile, on an A100 / GB200 host): give it its own ``skipif``, or land it here."""
     cc = _cc()
-    served = _dense_serving_ccs()
+    # the served-part set imports the block's package: read it only when a collected item carries a dense-part marker, so a
+    # CPU-only module of this directory (test_gated_block_bounds.py) still collects where the package or its CUDA bindings are absent
+    wants_dense = any("requires_blackwell" in item.keywords or "requires_dense_part" in item.keywords for item in items)
+    served = _dense_serving_ccs() if wants_dense else ()
     skip_rubin = pytest.mark.skip(reason=f"a Rubin (SM107) accept test; found {cc}")
     skip_blackwell = pytest.mark.skip(
         reason=f"an accept test of the dense forms on an admitted Blackwell-line part {tuple(c for c in served if c != _SM107)}; found {cc}"

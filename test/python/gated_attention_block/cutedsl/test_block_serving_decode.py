@@ -2704,10 +2704,10 @@ def test_on_a_cc_10_0_reading_the_rubin_only_pipelines_are_declined_by_name_befo
         sparse_tile_form="lean",
     )
     assert sblk.sparse_tile_form == "lean", "the declaration resolves the explicit lean body (the adapter admits it standalone on cc 10.0)"
-    with pytest.raises(NotImplementedError, match="sparse forms .* served on cc 10.7 \(Rubin\) only") as e:
+    with pytest.raises(NotImplementedError, match=r"sparse forms .* served on cc 10\.7 \(Rubin\) only") as e:
         sblk.check_support()
     assert "explicit lean tile on cc 10.0 / 10.3" in str(e.value) and "the lift" in str(e.value)
-    with pytest.raises(NotImplementedError, match="sparse forms .* served on cc 10.7 \(Rubin\) only"):
+    with pytest.raises(NotImplementedError, match=r"sparse forms .* served on cc 10\.7 \(Rubin\) only"):
         sblk._sdpa.check_support()  # the sparse stage's own gate, before the adapter
 
 
@@ -2831,7 +2831,7 @@ def test_sm100_declines_the_rubin_only_knobs_by_name():
     for kw in (dict(fuse_norm_rope=True, fuse_norm_rope_small_m=True), dict(fuse_norm_rope=True, fuse_cache_write=True)):
         fork, _ = _make_block(16, 4, 1, **kw)
         assert fork.fuse_norm_rope_effective and fork._norm_rope is None
-        with pytest.raises(NotImplementedError, match="rendered for sm_107a \(Rubin\); this device is SM100"):
+        with pytest.raises(NotImplementedError, match=r"rendered for sm_107a \(Rubin\); this device is SM100"):
             fork.check_support()
     with pytest.raises(NotImplementedError, match="decode_q_tile_max=32 caps the Rubin"):
         _make_block(16, 4, 1, decode_q_tile_max=32)
