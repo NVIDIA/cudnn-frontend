@@ -847,13 +847,14 @@ def _splitk_workspace(compiled):
     return Workspace(buf, compiled.workspace_bytes, "test_block_scale_splitk"), buf
 
 
-def _run_bs_numeric(combo, config_name, M, N, K, out_major="n", split_k=1, force_stg=False, cluster_k_reduce=False):
+def _run_bs_numeric(combo, config_name, M, N, K, out_major="n", split_k=1, force_stg=False, cluster_k_reduce=False, k_pad_byte=0):
     """Block-scale matmul vs a torch dequant-matmul reference.
 
     ``combo`` is ``nvfp4`` / ``mxfp4`` / ``mxfp8`` (both sides alike) or ``mxfp8_x_mxfp4`` -- the
     MIXED catalog row: e4m3 A against an e2m1 B under E8M0 / 32 scales (the gated attention
     block's stage (1) with an MXFP4 weight), so the shape/cluster sweep covers it beyond the
-    single 256x256x512 shape of ``test_mixed_mxfp8_mxfp4_numerics``."""
+    single 256x256x512 shape of ``test_mixed_mxfp8_mxfp4_numerics``. ``k_pad_byte`` fills the
+    K-padding slots of both F8_128x4 blobs."""
     dev = "cuda"
     torch.manual_seed(0)
     mixed = combo == "mxfp8_x_mxfp4"
@@ -912,8 +913,8 @@ def _run_bs_numeric(combo, config_name, M, N, K, out_major="n", split_k=1, force
             # K words), so its rank-3 view carries the PADDED extents when M / N
             # (or sf_k) are not multiples -- the kernel reads it as a base
             # pointer plus the layout it rebuilds from the problem size.
-            binding.sfa_operands[0]: _to_blocked(sfa_log).view(1, -(-M // 128) * 128, -1),
-            binding.sfb_operands[0]: _to_blocked(sfb_log).view(1, -(-N // 128) * 128, -1),
+            binding.sfa_operands[0]: _to_blocked(sfa_log, k_pad_byte).view(1, -(-M // 128) * 128, -1),
+            binding.sfb_operands[0]: _to_blocked(sfb_log, k_pad_byte).view(1, -(-N // 128) * 128, -1),
         },
         workspace=ws,
     )
@@ -3513,9 +3514,35 @@ def test_sm120_block_scale_matmul_numerics(combo, config_name, M, N, K):
 
 @requires_sm120
 @pytest.mark.parametrize(
+    "combo, config_name, K, split_k",
+    [
+        ("mxfp8", _SM120_BS_128, 320, 1),  # 10 K-scales: pad slots 10-11 scale whole zero-filled 1X K blocks
+        ("mxfp4", _SM120_BS_128, 416, 1),  # 13: pad slot 13 shares a 2X K block with live slot 12
+        ("nvfp4", _SM120_BS_128, 352, 1),  # 22: pad slots 22-23 share a 4X K block with live slots 20-21
+        ("mxfp8", _SM120_BS_128_W24, 1088, 3),  # 34: the padded word is in the last split's last K tile
+    ],
+)
+def test_sm120_block_scale_ignores_k_padding_scales(combo, config_name, K, split_k):
+    """When ceil(K / block_size) is not a multiple of 4, each row's last F8_128x4 word holds K-padding
+    bytes, which the SF box loads and the MMAs of the zero-filled K blocks read. A NaN encoding there
+    (UE8M0 0xFF, UE4M3 0x7F) must not reach the output: it used to make every output element NaN."""
+    _run_bs_numeric(combo, config_name, 256, 200, K, split_k=split_k, k_pad_byte=0x7F if combo == "nvfp4" else 0xFF)
+
+
+@requires_sm120
+@pytest.mark.parametrize(
     "combo,config_name,S,M,N,K",
-    [("nvfp4", _SM120_BS_128, 5, 256, 256, 4096), ("mxfp8", _SM120_BS_128_W24, 3, 512, 384, 1088)],  # the second: 8.5 K-tiles over 3 slices
-    ids=("nvfp4-S5", "mxfp8-w24-ktail-S3"),
+    [
+        ("nvfp4", _SM120_BS_128, 5, 256, 256, 4096),
+        ("mxfp8", _SM120_BS_128_W24, 3, 512, 384, 1088),  # 8.5 K-tiles over 3 slices
+        # The RTX PRO 6000 Blackwell Server Edition plan for these shapes: its first pick,
+        # and for mxfp8 also the swap-AB plan third in the same shortlist. S >= 9 folds the
+        # slices with the reducer's four lane groups; 11 also leaves a three-slice tail.
+        ("nvfp4", _SM120_BS_128, 16, 128, 1024, 16384),
+        ("mxfp8", "CONFIG_sm120_64x64x128_16x16x32_cluster1x1_warps4x2", 11, 64, 1024, 16384),
+        ("mxfp8", "CONFIG_sm120_64x64x128_16x16x32_cluster1x1_warps4x2_swapAB", 11, 64, 1024, 16384),
+    ],
+    ids=("nvfp4-S5", "mxfp8-w24-ktail-S3", "nvfp4-S16", "mxfp8-64x64-S11", "mxfp8-64x64-swapAB-S11"),
 )
 def test_sm120_block_scale_matmul_splitk_numerics(combo, config_name, S, M, N, K):
     _run_bs_numeric(combo, config_name, M, N, K, split_k=S)
@@ -3525,6 +3552,57 @@ def test_sm120_block_scale_matmul_splitk_numerics(combo, config_name, S, M, N, K
 @pytest.mark.parametrize("combo", ["nvfp4", "mxfp8"])
 def test_sm120_block_scale_matmul_m_major_out(combo):
     _run_bs_numeric(combo, _SM120_BS_128, 256, 256, 512, out_major="m")
+
+
+@requires_sm120
+def test_sm120_block_scale_splitk_batched_row_aux():
+    """Split-K over three batches with a per-batch row aux. Grid z carries batch * S, so each
+    slice loads A, B and both scale factors of batch z // S, and the reducer applies that
+    batch's aux. A per-row aux keeps the graph out of the cost model; the power-of-two baseline
+    (_auto_split_k) picks S=16 on the 128x128 tile for this shape on an RTX PRO 6000."""
+    B, M, N, K, bs = 3, 128, 256, 8192, 16
+    dev = "cuda"
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[B, M, K], stride=[M * K, K, 1], data_type=cudnn.data_type.FP4_E2M1)
+    Bt = g.tensor(name="B", dim=[B, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.FP4_E2M1)
+    sf_kw = dict(data_type=cudnn.data_type.FP8_E4M3, reordering_type=cudnn.tensor_reordering.F8_128x4)
+    SFA = g.tensor(name="SFA", dim=[B, M, K // bs], stride=[M * K // bs, K // bs, 1], **sf_kw)
+    SFB = g.tensor(name="SFB", dim=[B, K // bs, N], stride=[K // bs * N, 1, K // bs], **sf_kw)
+    row_scale = g.tensor(name="row_scale", dim=[B, M, 1], stride=[M, 1, 1], data_type=cudnn.data_type.FLOAT)
+    Ad = g.block_scale_dequantize(input=A, descale=SFA, block_size=[1, bs])
+    Bd = g.block_scale_dequantize(input=Bt, descale=SFB, block_size=[bs, 1])
+    Y = g.mul(a=g.matmul(A=Ad, B=Bd, name="mm"), b=row_scale, name="rw")
+    # nvfp4 values times e4m3 scales in {1, 2, 3} sum exactly in fp32, so an fp32 output compares bit for bit.
+    Y.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    compiled = jit_from_cudnn_graph(g, config=by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2_splitK16"))
+    ws, _ws_buf = _splitk_workspace(compiled)
+
+    torch.manual_seed(0)
+    lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
+    a_u8 = torch.randint(0, 256, (B, M, K // 2), dtype=torch.uint8, device=dev)
+    b_u8 = torch.randint(0, 256, (B, N, K // 2), dtype=torch.uint8, device=dev)
+    sfa = torch.randint(1, 4, (B, M, K // bs), device=dev).to(torch.float8_e4m3fn)
+    sfb = torch.randint(1, 4, (B, N, K // bs), device=dev).to(torch.float8_e4m3fn)
+    # Differs from batch to batch, so a dropped batch stride shows.
+    rows = torch.arange(B * M, dtype=torch.float32, device=dev).reshape(B, M, 1) % 3 + 1
+    y = torch.full((B, M, N), float("nan"), device=dev)
+    compiled(
+        {
+            A: a_u8.view(torch.float4_e2m1fn_x2),
+            Bt: b_u8.view(torch.float4_e2m1fn_x2),
+            # One compact F8_128x4 plane per batch, back to back.
+            SFA: torch.stack([_to_blocked(sfa[i]) for i in range(B)]).view(B, M, -1),
+            SFB: torch.stack([_to_blocked(sfb[i]) for i in range(B)]).view(B, N, -1),
+            row_scale: rows,
+            Y: y,
+        },
+        workspace=ws,
+    )
+    torch.cuda.synchronize()
+    a_s = _unpack_fp4(a_u8, lut).view(B, M, K) * sfa.float().repeat_interleave(bs, 2)
+    b_s = _unpack_fp4(b_u8, lut).view(B, N, K) * sfb.float().repeat_interleave(bs, 2)
+    ref = torch.einsum("bmk,bnk->bmn", a_s, b_s) * rows
+    assert torch.equal(y, ref), f"{(y != ref).sum().item()}/{y.numel()} elements differ"
 
 
 @requires_sm120
@@ -3540,3 +3618,59 @@ def test_sm120_fp4_rejects_non_k_major():
         g = _build_nvfp4_graph(256, 256, 256, a_major=a_major, b_major=b_major)
         with pytest.raises((ValueError, NotImplementedError), match="must be K-major"):
             jit_from_cudnn_graph(g, **_kw(_SM120_BS_128))
+
+
+_SM120_MXFP8 = dict(block_size=32, sf_dt=cudnn.data_type.FP8_E8M0, a_dt=cudnn.data_type.FP8_E4M3)
+
+
+@requires_sm120
+@pytest.mark.parametrize("K,a_major,b_major", [(144, "k", "k"), (130, "m", "n")], ids=["k_major", "mn_major"])
+def test_sm120_mxfp8_partial_scale_block_graph_is_declined(K, a_major, b_major):
+    """MXFP8 scales whole 32-element K blocks, yet only the 16-byte TMA rule gated K: K % 16 for
+    a K-major fp8 operand, nothing for M-major A with N-major B. A K ending inside a scale block
+    planned, and the kernel -- whose F8_128x4 scale-factor view holds floor(K / 32) scales per row
+    -- read zero-filled scales for the tail and another 128-row block's scales past the first
+    (audit finding B01: at M = N = 256, K = 144, 54025 of 65536 outputs wrong)."""
+    g = _build_nvfp4_graph(256, 256, K, a_major=a_major, b_major=b_major, **_SM120_MXFP8)
+    with pytest.raises(NotImplementedError, match="not a multiple of the scale block size 32"):
+        jit_from_cudnn_graph(g, **_kw(_SM120_BS_128))
+
+
+@requires_sm120
+def test_sm120_mxfp8_partial_scale_block_call_is_refused():
+    """The kernel binds K per call: a plan built at a whole-block K refuses a call whose K ends
+    inside a scale block before it writes anything, and still serves a K tail of whole blocks."""
+    M = N = 256
+    g = _build_nvfp4_graph(M, N, 160, **_SM120_MXFP8)
+    _, binding = analyze_with_binding(g)
+    compiled = jit_from_cudnn_graph(g, **_kw(_SM120_BS_128))
+    torch.manual_seed(0)
+
+    def call(K):
+        a = (torch.randn(1, M, K, device="cuda") * 0.5).to(torch.float8_e4m3fn)
+        b = (torch.randn(1, N, K, device="cuda") * 0.5).to(torch.float8_e4m3fn)
+        # ceil(K / 32) scales per row: a partial last block would carry a scale of its own.
+        sfa, sfb = _rand_e8m0((M, _ceil_div(K, 32)), "cuda"), _rand_e8m0((N, _ceil_div(K, 32)), "cuda")
+        c = torch.full((1, M, N), 7.0, dtype=torch.float16, device="cuda")
+        pack = {
+            binding.a_operands[0]: a,
+            binding.b_operands[0]: b,
+            binding.outputs[0]: c,
+            binding.sfa_operands[0]: _to_blocked(sfa).view(1, M, -1),
+            binding.sfb_operands[0]: _to_blocked(sfb).view(1, N, -1),
+        }
+        ref = (a[0].float() * sfa.float().repeat_interleave(32, 1)[:, :K]) @ (b[0].float() * sfb.float().repeat_interleave(32, 1)[:, :K]).t()
+        return pack, c, ref.to(torch.float16)
+
+    pack, c, ref = call(160)  # 1.25 K tiles, whole scale blocks
+    compiled(pack)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(c[0], ref, atol=2e-1, rtol=2e-2)
+    assert dict(compiled.deferrals) == {}
+
+    pack, c, _ = call(144)
+    with pytest.raises(ValueError, match="not a multiple of the scale block size 32"):
+        compiled(pack)
+    torch.cuda.synchronize()
+    assert torch.all(c == 7.0)
+    assert dict(compiled.deferrals) == {"partial scale block": 1}

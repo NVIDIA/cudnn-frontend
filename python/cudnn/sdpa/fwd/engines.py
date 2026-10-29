@@ -1913,12 +1913,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if facts.thd and capabilities.thd_d_shapes is not None and (facts.d_qk, facts.d_v) not in capabilities.thd_d_shapes:
         return f"THD (ragged) rides the packed native-tile leg on this engine (shapes {sorted(capabilities.thd_d_shapes)}); the head-dim envelope is dense-only"
     if facts.thd and capabilities.sm_lo == capabilities.sm_hi == 80 and capabilities.phase == "prefill":
+        from cudnn.sdpa.native_sm80 import forward_thd_layout_mismatch
+
         if knobs is not None and knobs.sched_policy not in (None, SCHED_NATURAL):
             return "SM80 THD forward requires the natural scheduler (the varlen grid is 3-D)"
         for name, tensor in (("Q", facts.q_t), ("K", facts.k_t), ("V", facts.v_t), ("O", facts.o_t)):
-            dim, stride = tuple(tensor.get_dim()), tuple(tensor.get_stride())
-            if (stride[2], stride[1], stride[3]) != (dim[1] * dim[3], dim[3], 1):
-                return f"SM80 THD {name} requires compact packed BSHD strides"
+            reason = forward_thd_layout_mismatch(name, tensor.get_dim(), tensor.get_stride())
+            if reason is not None:
+                return reason
         if (facts.seq_q_t is None and facts.cu_seq_q_t is None) or (facts.seq_kv_t is None and facts.cu_seq_kv_t is None):
             return "SM80 THD forward requires Q and KV lengths (seq_len_* or cu_seq_len_*)"
         if facts.has_bias or facts.has_sink:
