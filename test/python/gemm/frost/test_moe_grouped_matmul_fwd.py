@@ -17,6 +17,7 @@ import torch
 
 from gemm_test_utils import (
     requires_sm100,
+    requires_sm120,
     requires_matmul_gpu,
     Plan as _plan,
     ceil_div as _ceil_div,
@@ -2013,7 +2014,11 @@ def test_gather_layouts_and_frontend_sm120(case):
 
 
 @requires_matmul_gpu
-@pytest.mark.parametrize("swap_ab,out_dt", [(False, torch.int8), (True, torch.uint8)], ids=["int8", "swap_ab-uint8"])
+# The normal template also runs on SM10.x, like the GATHER / SCATTER SM120 tests above; the
+# swap-AB case is SM120-only, like every other SM120 swap-AB test.
+@pytest.mark.parametrize(
+    "swap_ab,out_dt", [pytest.param(False, torch.int8, id="int8"), pytest.param(True, torch.uint8, id="swap_ab-uint8", marks=requires_sm120)]
+)
 def test_moe_int8_output_rounds_to_nearest_even_and_saturates_sm120(swap_ab, out_dt):
     """A bf16 MoE GEMM stored straight to INT8 / UINT8 rounds half to even,
     saturates and stores NaN as 0, as cuDNN's native engines do. The epilogue's

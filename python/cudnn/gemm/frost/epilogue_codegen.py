@@ -490,9 +490,8 @@ def _emit_round(var: str, out_dtype: Dtype, tag: str, *, source_dtype: Dtype = "
         lo, hi = _INT8_RANGES[out_dtype]
         sat = f"_sat_{tag}"
         if source_dtype == "int32":
-            lines = [
-                f"{sat} = cute.math.min(cute.math.max({var}, cutlass.full_like({var}, cutlass.Int32({lo}))), cutlass.full_like({var}, cutlass.Int32({hi})))"
-            ]
+            lo_i, hi_i = _compute_literal("int32", lo), _compute_literal("int32", hi)
+            lines = [f"{sat} = cute.math.min(cute.math.max({var}, cutlass.full_like({var}, {lo_i})), cutlass.full_like({var}, {hi_i}))"]
         else:
             # max(x, 0) + min(x, 0) is x, or 0 for NaN: max / min return the non-NaN operand.
             lines = [
