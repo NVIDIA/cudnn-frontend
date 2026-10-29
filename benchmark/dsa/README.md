@@ -402,6 +402,13 @@ the Q=4K gain primarily to the 32 main-kernel waves: their total falls from
 22.941 to 9.696 ms. The optimized trace has no separate dKV prefold kernel;
 fixed-order conversion takes 1.452 ms and workspace clearing 0.658 ms.
 
+NCU reports 96 registers per thread and 231.42 KiB dynamic shared memory for
+the cluster-4 main kernel, limiting residency to one CTA per SM; achieved
+occupancy is 26.33%, with 57.37% DRAM and 35.07% compute throughput. A
+144-CTA-wave experiment was rejected: 36 four-CTA clusters spill beyond one
+resident cluster wave and regress Q=4K from 12.017 ms/4.533 GiB to
+14.932 ms/5.096 GiB. The 128-CTA, 32-cluster wave is therefore intentional.
+
 #### Profiling
 
 `profile` mode runs a single warmed-up backward call (using the first value
