@@ -15,22 +15,16 @@ from .packed_init import FROST_SOURCE_DIGEST as _INIT_DIGEST, zero_outputs
 
 
 @cute.jit
-def _view(ptr: Optional[cute.Pointer], geometry: cutlass.Constexpr, dynamic_outer: cutlass.Constexpr = True):
+def _view(ptr: Optional[cute.Pointer], geometry: cutlass.Constexpr):
     if cutlass.const_expr(ptr is None):
         return None
     shape, strides = geometry
-    # Native layouts use Int64 outer-stride arguments: making those static
-    # regresses their device code generation. Compact staging instead keeps
-    # the former tensor compiler's static strides. Both template kernels widen
-    # strides before address multiplication; static staging does not narrow
-    # their address arithmetic. No stride is assembled per execute in Python.
-    return cute.make_tensor(
-        ptr, cute.make_layout(shape, stride=tuple(cutlass.Int64(st) if dynamic_outer and i < len(strides) - 1 else st for i, st in enumerate(strides)))
-    )
+    # Keep native outer strides wide before device address multiplication.
+    return cute.make_tensor(ptr, cute.make_layout(shape, stride=tuple(cutlass.Int64(st) if i < len(strides) - 1 else st for i, st in enumerate(strides))))
 
 
 @cute.jit
-def _dense_host(
+def host(
     q: cute.Pointer,
     k: cute.Pointer,
     v: cute.Pointer,
@@ -40,7 +34,6 @@ def _dense_host(
     seq_q: Optional[cute.Pointer],
     sink: Optional[cute.Pointer],
     bias: Optional[cute.Pointer],
-    rope: Optional[cute.Pointer],
     scale_log2: cutlass.Float32,
     inv_scale: cutlass.Float32,
     module: cutlass.Constexpr,
@@ -53,23 +46,21 @@ def _dense_host(
     # Reuse the template configuration without a redundant dataclass argument;
     # compiled_cache can then export and reload the pointer-only call ABI.
     params = module.PARAMS
-    # Native geometry has nine operands; staged geometry adds the RoPE slot.
-    # Preserve the independently validated layout lowering of each entry.
     sq, skv, d = geometry[0][0][1], geometry[1][0][1], geometry[0][0][3]
     mask = (MASK_CAUSAL if params.is_causal else MASK_NONE) | (MASK_SWA if params.has_swa else 0)
     module._sdpa_host(
-        _view(q, geometry[0], len(geometry) == 9),
-        _view(k, geometry[1], len(geometry) == 9),
-        _view(v, geometry[2], len(geometry) == 9),
-        _view(o, geometry[3], len(geometry) == 9),
-        _view(stats, geometry[4], len(geometry) == 9),
-        _view(seq_kv, geometry[5], len(geometry) == 9),
-        _view(seq_q, geometry[6], len(geometry) == 9),
-        _view(sink, geometry[7], len(geometry) == 9),
-        _view(bias, geometry[8], len(geometry) == 9),
+        _view(q, geometry[0]),
+        _view(k, geometry[1]),
+        _view(v, geometry[2]),
+        _view(o, geometry[3]),
+        _view(stats, geometry[4]),
+        _view(seq_kv, geometry[5]),
+        _view(seq_q, geometry[6]),
+        _view(sink, geometry[7]),
+        _view(bias, geometry[8]),
         None,
         None,
-        _view(rope, geometry[9] if len(geometry) > 9 else None, len(geometry) == 9),
+        None,
         params.tile_m,
         params.num_warps,
         params.tile_n,
@@ -103,32 +94,9 @@ def _dense_host(
     )
 
 
-@cute.jit
-def host(
-    q: cute.Pointer,
-    k: cute.Pointer,
-    v: cute.Pointer,
-    o: cute.Pointer,
-    stats: Optional[cute.Pointer],
-    seq_kv: Optional[cute.Pointer],
-    seq_q: Optional[cute.Pointer],
-    sink: Optional[cute.Pointer],
-    bias: Optional[cute.Pointer],
-    scale_log2: cutlass.Float32,
-    inv_scale: cutlass.Float32,
-    module: cutlass.Constexpr,
-    geometry: cutlass.Constexpr,
-    dtype: cutlass.Constexpr,
-    swa_window: cutlass.Constexpr[int],
-    right_bound: cutlass.Constexpr[int],
-    stream: driver.CUstream,
-):
-    _dense_host(q, k, v, o, stats, seq_kv, seq_q, sink, bias, None, scale_log2, inv_scale, module, geometry, dtype, swa_window, right_bound, stream)
-
-
 def _compile_pointer_host(entry, module, params, geometry, swa_window, right_bound, cache_key):
     dtype = cutlass.BFloat16 if params.io_bf16 else cutlass.Float16
-    types = [dtype] * 4 + [cutlass.Float32, cutlass.Int32, cutlass.Int32, cutlass.Float32, cutlass.Float32 if params.bias_is_fp32 else dtype, cutlass.Float32]
+    types = [dtype] * 4 + [cutlass.Float32, cutlass.Int32, cutlass.Int32, cutlass.Float32, cutlass.Float32 if params.bias_is_fp32 else dtype]
     args = [
         (
             cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=16 if i < 4 else (2 if i == 8 and not params.bias_is_fp32 else 4))
@@ -155,7 +123,7 @@ def _compile_pointer_host(entry, module, params, geometry, swa_window, right_bou
 
 
 def compile_host(module, params, geometry, swa_window, right_bound, cache_key):
-    return _compile_pointer_host(_dense_host if len(geometry) == 10 else host, module, params, geometry, swa_window, right_bound, cache_key)
+    return _compile_pointer_host(host, module, params, geometry, swa_window, right_bound, cache_key)
 
 
 @cute.jit
@@ -188,23 +156,27 @@ def thd_host(
     swa_window: cutlass.Constexpr,
     lse_stride: cutlass.Constexpr,
     initialize_outputs: cutlass.Constexpr,
+    o_stride: cutlass.Constexpr,
+    dimensions: cutlass.Constexpr,
     stream: driver.CUstream,
 ):
     p = module.PARAMS
+    d_qk, d_v = dimensions
     dtype = cutlass.BFloat16 if p.io_bf16 else cutlass.Float16
     mask = (MASK_CAUSAL if p.is_causal else MASK_NONE) | (MASK_SWA if p.has_swa else 0)
+    output_stride = (0, h * d_v, d_v, 1) if o_stride is None else (0, o_stride[0], o_stride[1], 1)
     # Wrapper outputs retain zeroed holes/tails outside the live prefixes.
     # Empty capacities do not launch initialization or step either pointer.
     if cutlass.const_expr(initialize_outputs):
         if t_q > 0:
-            zero_outputs((_view(o, ((1, t_q, h, p.d_v), (0, h * p.d_v, p.d_v, 1))), _view(stats, ((1, h, t_q), (0, t_q, 1)))), stream)
+            zero_outputs((_view(o, ((1, t_q, h, d_v), output_stride)), _view(stats, ((1, h, t_q), (0, t_q, 1)))), stream)
     # Packed capacity and Stats head pitch remain dynamic Int64 values. The
     # never-stepped batch stride is zero, so it cannot specialize on capacity.
     module._sdpa_host(
-        _view(q, ((1, t_q, h, p.d_qk), (0, q_s, q_h, 1))),
-        _view(k, ((1, t_kv, h_kv, p.d_qk), (0, k_s, k_h, 1))),
-        _view(v, ((1, t_kv, h_kv, p.d_v), (0, v_s, v_h, 1))),
-        _view(o, ((1, t_q, h, p.d_v), (0, h * p.d_v, p.d_v, 1))),
+        _view(q, ((1, t_q, h, d_qk), (0, q_s, q_h, 1))),
+        _view(k, ((1, t_kv, h_kv, d_qk), (0, k_s, k_h, 1))),
+        _view(v, ((1, t_kv, h_kv, d_v), (0, v_s, v_h, 1))),
+        _view(o, ((1, t_q, h, d_v), output_stride)),
         _view(stats, ((1, h, t_q), (0, t_q, 1) if lse_stride is None else lse_stride)),
         None,
         None,
@@ -220,7 +192,7 @@ def thd_host(
         p.d_v,
         dtype,
         False,
-        True,
+        d_qk == p.d_qk,
         mask,
         swa_window,
         p.causal_bottom_right,
@@ -237,7 +209,7 @@ def thd_host(
         scale_log2,
         cutlass.Int32(t_q),
         cutlass.Int32(t_kv),
-        cutlass.Int32(p.d_qk),
+        cutlass.Int32(d_qk),
         right_bound,
         inv_scale,
         cutlass.Int32((max_sq + p.tile_m - 1) // p.tile_m),
@@ -248,10 +220,21 @@ def thd_host(
 
 @lru_cache(maxsize=128)
 def compile_thd_host(
-    module, h, h_kv, n_seq, swa_window, prefix_dtypes=("torch.int32", "torch.int32"), sink_dtype="torch.float32", lse_stride=None, initialize_outputs=True
+    module,
+    h,
+    h_kv,
+    n_seq,
+    swa_window,
+    prefix_dtypes=("torch.int32", "torch.int32"),
+    sink_dtype="torch.float32",
+    lse_stride=None,
+    initialize_outputs=True,
+    o_stride=None,
+    dimensions=None,
 ):
     """One pointer artifact per immutable flavor/head/mask contract."""
     p = module.PARAMS
+    dimensions = (p.d_qk, p.d_v) if dimensions is None else tuple(dimensions)
     dtype = cutlass.BFloat16 if p.io_bf16 else cutlass.Float16
     aux_types = {
         "torch.int32": cutlass.Int32,
@@ -281,6 +264,8 @@ def compile_thd_host(
             sink_dtype=sink_dtype,
             lse_stride=lse_stride,
             initialize_outputs=initialize_outputs,
+            o_stride=o_stride,
+            dimensions=dimensions,
         ),
         "prepared_thd",
     )
@@ -299,6 +284,8 @@ def compile_thd_host(
         swa_window,
         lse_stride,
         initialize_outputs,
+        o_stride,
+        dimensions,
         driver.CUstream(0),
         options="--enable-tvm-ffi --gpu-arch=sm_80",
         cache_key=key,

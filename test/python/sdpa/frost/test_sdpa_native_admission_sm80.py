@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """SM80 serves accepted declarations natively, or declines before compilation."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -114,7 +115,7 @@ def test_rope_declines_before_compile(direction):
 
 
 @pytest.mark.parametrize("direction", ["fwd", "bwd"])
-@pytest.mark.parametrize("d,dv", [(48, 32), (96, 80), (128, 128), (160, 112), (192, 128), (224, 208), (256, 256)])
+@pytest.mark.parametrize("d,dv", [(16, 256), (48, 32), (64, 96), (96, 80), (128, 128), (160, 112), (192, 128), (224, 208), (256, 256)])
 @pytest.mark.parametrize("singleton", [False, True])
 def test_aligned_native_envelopes_remain_supported(direction, d, dv, singleton):
     descs = _descs(d, dv, singleton=singleton)
@@ -122,16 +123,47 @@ def test_aligned_native_envelopes_remain_supported(direction, d, dv, singleton):
     assert api.check_support()
     assert _mismatch(direction, _facts(direction, descs)) is None
     if direction == "bwd":
-        assert api._native_pointer and api._staged_layout is None
+        assert api._native_pointer
 
 
-@pytest.mark.parametrize("d,dv", [(96, 80), (192, 128)])
+@pytest.mark.parametrize("d,dv", [(16, 256), (64, 96), (96, 80), (192, 128)])
 def test_backward_thd_ignores_unused_batch_stride(d, dv):
     descs = _descs(d, dv, thd=True)
     api = _api("bwd", descs, thd=True, max_total_seq_len_q=64, max_total_seq_len_kv=64)
     assert api.check_support()
-    assert api._native_pointer and api._staged_layout is None
+    assert api._native_pointer
     assert _mismatch("bwd", _facts("bwd", descs, thd=True)) is None
+
+
+def _forward_thd_case(d, dv, *, singleton=False):
+    descs = _descs(d, dv, thd=True, singleton=singleton)
+    b, h, s, _ = descs["q"].shape
+    descs["stats"] = TensorDesc(dtype=torch.float32, shape=(b, h, s), stride=(7, 64, 1), stride_order=(2, 1, 0), device=torch.device("cuda:0"), name="stats")
+    facts = replace(_facts("fwd", descs, thd=True), seq_q_t=SimpleNamespace(), seq_kv_t=SimpleNamespace())
+    return descs, facts
+
+
+@pytest.mark.parametrize("d,dv", [(48, 32), (64, 64), (64, 96), (96, 80), (128, 128), (192, 112), (192, 128), (224, 208), (256, 256)])
+@pytest.mark.parametrize("singleton", [False, True])
+def test_forward_thd_native_pitches(d, dv, singleton):
+    descs, facts = _forward_thd_case(d, dv, singleton=singleton)
+    api = _api("fwd", descs, thd=True, max_total_seq_len_q=64, max_total_seq_len_kv=64, seq_kv_lens_present=True)
+    assert api.check_support()
+    assert _mismatch("fwd", facts) is None
+
+
+@pytest.mark.parametrize("role", ["q", "k", "v", "o"])
+@pytest.mark.parametrize("bad_stride", [(7, 128, 128, 1), (7, 120, 544, 1), (7, 136, 561, 1), (7, 136, 560, 2)])
+def test_forward_thd_invalid_pitches_decline(role, bad_stride):
+    descs, _ = _forward_thd_case(128, 128)
+    descs[role] = TensorDesc(
+        dtype=torch.bfloat16, shape=descs[role].shape, stride=bad_stride, stride_order=(3, 1, 2, 0), device=torch.device("cuda:0"), name=role
+    )
+    facts = replace(_facts("fwd", descs, thd=True), seq_q_t=SimpleNamespace(), seq_kv_t=SimpleNamespace())
+    with pytest.raises(NotImplementedError, match=rf"(?i){role}.*stride"):
+        _api("fwd", descs, thd=True, max_total_seq_len_q=64, max_total_seq_len_kv=64, seq_kv_lens_present=True).check_support()
+    reason = _mismatch("fwd", facts)
+    assert reason is not None and role.lower() in reason.lower() and "stride" in reason.lower()
 
 
 @pytest.mark.parametrize("missing", ["bias", "dbias", "dsink"])

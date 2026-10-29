@@ -367,8 +367,15 @@ def block_sparse_attention_fp8_forward(
     softmax_scale: Optional[float] = None,
     sparse_block_size: int = 64,
     kv_splits: int = 1,
+    k_quant_block_size: int = 16,
 ) -> TupleDict:
-    """Run Sage FP8 BSA, including native sparse_block_size=128 on SM90, SM100/SM103 and SM120."""
+    """Run Sage FP8 BSA, including native sparse_block_size=128 on SM90, SM100/SM103 and SM120.
+
+    Q uses one scale per token/head. ``k_quant_block_size=1`` selects the
+    same granularity for K on SM120 blk128; the default keeps one scale per
+    16 tokens. V retains per-channel scales shared across batch and sequence.
+    This is a quantization-recipe choice, not an autotuning parameter.
+    """
     batch, heads, seqlen_q, seqlen_k = _validate_sage_inputs(q_tensor, k_tensor, v_tensor)
     # Sage FP8 folds the softmax scale into its per-group Q*K dequantization scales, so a zero or negative scale turns
     # a fully masked group's -inf maximum into NaN/+inf. NaN is rejected as well.
@@ -376,6 +383,19 @@ def block_sparse_attention_fp8_forward(
         raise ValueError(f"Sage FP8 softmax_scale must be positive, got {softmax_scale}")
     arch = _device_arch(q_tensor)
     arch_family = arch // 10
+    if type(k_quant_block_size) is not int or k_quant_block_size not in (1, 16):
+        raise ValueError("k_quant_block_size must be 1 or 16")
+    if k_quant_block_size == 1 and (arch_family != 12 or sparse_block_size != 128):
+        raise NotImplementedError("per-token K scaling requires SM120 blk128")
+    if k_quant_block_size == 1:
+        from packaging.version import Version
+        from cudnn.frost.buffers import cutedsl_state
+
+        installed, version = cutedsl_state()
+        if not installed:
+            raise RuntimeError("SM120 per-token FP8 BSA requires nvidia-cutlass-dsl >= 4.8.0")
+        if version is not None and version[0] == "nvidia-cutlass-dsl" and Version(version[1]).release < (4, 8, 0):
+            raise RuntimeError(f"SM120 per-token FP8 BSA requires nvidia-cutlass-dsl >= 4.8.0; found {version[1]}")
     if not isinstance(sparse_block_size, int) or sparse_block_size not in (64, 128):
         raise ValueError("Sage FP8 sparse_block_size must be 64 or 128")
     if arch_family not in {9, 10, 11, 12}:
@@ -433,6 +453,8 @@ def block_sparse_attention_fp8_forward(
 
         forward = _interface.bsa_fp8_blk128_fwd if sparse_block_size == 128 else _interface.bsa_fp8_blk64_fwd
         kwargs = {"kv_splits": kv_splits} if native_sm100_blk128 else {}
+        if sparse_block_size == 128:
+            kwargs["k_quant_block_size"] = k_quant_block_size
         out = forward(
             q_tensor,
             k_tensor,

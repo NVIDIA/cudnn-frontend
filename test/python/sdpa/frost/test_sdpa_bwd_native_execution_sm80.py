@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Prepared copies for the existing SM80 backward conversion domain."""
+"""Native SM80 backward binding, validation and stream contracts."""
 
 import pytest
 import torch
@@ -17,7 +17,7 @@ pytestmark = [
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("features", [False, True])
-def test_staged_execute_uses_prepared_copies(dtype, features, monkeypatch):
+def test_native_execute_uses_current_pointers(dtype, features, monkeypatch):
     import cutlass.cute as cute
 
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
@@ -25,7 +25,7 @@ def test_staged_execute_uses_prepared_copies(dtype, features, monkeypatch):
     _check(case)
 
     def forbidden(*args, **kwargs):
-        raise AssertionError("staged backward rebuilt a tensor or launched a torch data conversion")
+        raise AssertionError("native backward rebuilt a tensor or launched a torch data conversion")
 
     with monkeypatch.context() as guards:
         for name in ("as_strided", "copy_", "zero_", "contiguous", "to"):
@@ -92,8 +92,8 @@ def test_auxiliary_casts_strided_outputs_and_replay(dtype, declare_aux):
 
 
 @pytest.mark.parametrize("role", ["bias", "sink", "dbias", "dsink"])
-def test_invalid_auxiliary_binding_precedes_gather(role, monkeypatch):
-    from cudnn.sdpa.bwd import staged_sm80
+def test_invalid_auxiliary_binding_precedes_launch(role, monkeypatch):
+    from dataclasses import replace
 
     case = _case(96, 80, features=True)
     api, workspace = _adapter(case)
@@ -104,54 +104,34 @@ def test_invalid_auxiliary_binding_precedes_gather(role, monkeypatch):
         bufs[role] = bufs[role].to(torch.int32)
 
     def forbidden(*args, **kwargs):
-        pytest.fail("invalid auxiliary binding reached a prepared gather")
+        pytest.fail("invalid auxiliary binding reached a native launch")
 
-    monkeypatch.setattr(staged_sm80, "_copy", forbidden)
+    monkeypatch.setattr(api, "_prepared", replace(api._prepared, fn=forbidden))
     with pytest.raises(ValueError, match=role):
         _execute(api, bufs, workspace)
 
 
-def test_packed_copy_capacity_is_not_a_compile_key(tmp_path, monkeypatch):
+def test_packed_capacity_is_not_a_compile_key(tmp_path, monkeypatch):
     import cutlass.cute as cute
     from cudnn.sdpa.bwd.kernels.sm80 import prepared_host
-    from cudnn.sdpa.fwd.kernels.sm80.staged_copy import compile_gather
     from sdpa.frost.test_sdpa_bwd_thd_sm80 import _run_graph
 
     monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE", str(tmp_path))
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
-    compile_gather.cache_clear()
     prepared_host._compile_thd_artifact.cache_clear()
     _run_graph((33, 17), (41, 25), h=4, hkv=2, d=96, d_v=80, stats_layout="token_major")
 
     def forbidden(*args, **kwargs):
-        raise AssertionError("packed capacities leaked into the staging compile key")
+        raise AssertionError("packed capacities leaked into the native compile key")
 
     monkeypatch.setattr(cute, "compile", forbidden)
-    compile_gather.cache_clear()
     prepared_host._compile_thd_artifact.cache_clear()
     _run_graph((33, 9), (41, 11), h=4, hkv=2, d=96, d_v=80, stats_layout="token_major")
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_auxiliary_cast_matches_torch_rounding(dtype):
-    from cudnn.frost.compiled_cache import positional_entry
-    from cudnn.sdpa.bwd.kernels.sm80.staged_copy import compile_cast
-
-    # Halfway ties on either side of one, subnormals, signed zero and infinities.
-    values = [0.0, -0.0, 1.0, 1.0 + 2**-11, 1.0 + 3 * 2**-11, 1.0 + 2**-8, 1.0 + 3 * 2**-8, 2**-25, 3 * 2**-25, 2**-134, 3 * 2**-134, float("inf")]
-    src = torch.tensor(values + [-x for x in values], device="cuda", dtype=torch.float32)
-    owner = torch.full((src.numel(), 2), 13.0, device="cuda", dtype=dtype)
-    out = owner[:, 0]
-    fn = positional_entry(compile_cast((1, 1, 1, src.numel()), str(dtype).split(".")[-1]))
-    fn(src.data_ptr(), out.data_ptr(), (0, 0, 0, 2), torch.cuda.current_stream().cuda_stream)
-    bits = torch.int32 if dtype == torch.float32 else torch.int16
-    torch.testing.assert_close(out.contiguous().view(bits), src.to(dtype).view(bits), atol=0, rtol=0)
-    assert (owner[:, 1] == 13).all()
-
-
 @pytest.mark.parametrize("role", ["q", "dq", "dv"])
 @pytest.mark.parametrize("product", [False, True])
-def test_dense_copies_keep_physical_wide_strides(role, product):
+def test_dense_native_keeps_physical_wide_strides(role, product):
     case = _case(96, 80, wide=role, product=product, axis=0, sq=17, skv=33)
     assert (case.bufs[role].shape[0] - 1) * case.bufs[role].stride(0) > 2**32
     _check(case)
@@ -168,7 +148,7 @@ def test_dense_copies_keep_physical_wide_strides(role, product):
         graph.reset()
 
 
-def test_staged_copies_follow_handle_stream():
+def test_native_follows_handle_stream():
     import cudnn
 
     case = _case(96, 80, features=True)
@@ -204,7 +184,7 @@ def _use_unaligned_q(case):
 
 @pytest.mark.parametrize("valid_capacity", [True, False])
 @pytest.mark.parametrize("native", [True, False])
-def test_staged_stats_preserves_declared_storage_view(valid_capacity, native, monkeypatch):
+def test_native_stats_preserves_declared_storage_view(valid_capacity, native, monkeypatch):
     case = _case(96, 80)
     if not native:
         _use_unaligned_q(case)
@@ -218,11 +198,10 @@ def test_staged_stats_preserves_declared_storage_view(valid_capacity, native, mo
     # even if the runtime container is a flat view into a larger allocation.
     bufs["stats"] = bufs["stats"].as_strided((bufs["stats"].numel(),), (1,))
     if not valid_capacity:
-        from cudnn.sdpa.bwd import prepared_sm80, staged_sm80
+        from cudnn.sdpa.bwd import prepared_sm80
 
         bufs["stats"] = torch.empty_like(bufs["stats"])
         monkeypatch.setattr(prepared_sm80, "execute", lambda *a, **k: pytest.fail("short Stats storage reached launch"))
-        monkeypatch.setattr(staged_sm80, "_copy", lambda *a, **k: pytest.fail("short Stats storage reached gather"))
         with pytest.raises(ValueError, match="stats backing storage"):
             _execute(api, bufs, workspace)
         return
@@ -242,8 +221,6 @@ def test_staged_stats_preserves_declared_storage_view(valid_capacity, native, mo
 
 @pytest.mark.parametrize("native,overlap", [(True, False), (False, False), (False, True)])
 def test_native_interleaved_gradients_or_unaligned_decline(native, overlap, monkeypatch):
-    from cudnn.sdpa.bwd import staged_sm80
-
     case = _case(96, 96, hk=4)
     if overlap:
         case.bufs["dk"] = case.bufs["dq"]
@@ -262,21 +239,23 @@ def test_native_interleaved_gradients_or_unaligned_decline(native, overlap, monk
         return
     api, workspace = _adapter(case)
     assert (api._prepared is not None) == native
-    calls = []
-    original = staged_sm80._copy
+    from test_sdpa_bwd_staged_sm80 import _assert_kernel_count
 
-    def record(entry, frame, stream):
-        calls.append(len(frame[0]))
-        return original(entry, frame, stream)
-
-    monkeypatch.setattr(staged_sm80, "_copy", record)
     _execute(api, case.bufs, workspace)
-    assert not calls, "native interleaved gradients must not add layout copies"
     _check(case)
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    try:
+        with torch.cuda.graph(graph):
+            _execute(api, case.bufs, workspace)
+        _assert_kernel_count(graph, 4)
+        graph.replay()
+        _check(case)
+    finally:
+        graph.reset()
 
 
 @pytest.mark.parametrize("explicit_stream", [False, True])
-def test_staged_execution_preserves_other_current_device(explicit_stream):
+def test_native_execution_preserves_other_current_device(explicit_stream):
     if torch.cuda.device_count() < 2:
         pytest.skip("requires two CUDA devices")
     with torch.cuda.device(0):
@@ -286,7 +265,7 @@ def test_staged_execution_preserves_other_current_device(explicit_stream):
         launch.wait_stream(torch.cuda.current_stream())
         with torch.cuda.device(1):
             _execute(api, case.bufs, workspace, launch.cuda_stream if explicit_stream else None)
-            assert torch.cuda.current_device() == 1, "staged execution leaked Q's device into the caller"
+            assert torch.cuda.current_device() == 1, "native execution leaked Q's device into the caller"
         launch.synchronize()
         _check(case)
 

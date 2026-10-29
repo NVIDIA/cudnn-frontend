@@ -1,8 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The retained dense conversion layouts share the prepared large-head chain."""
+"""Native large-head backward layouts with no IO staging."""
 
 from types import SimpleNamespace
+from itertools import permutations
+from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
@@ -15,17 +17,22 @@ from sdpa.frost.test_sdpa_bwd_dsl_sm100 import _reference, _causal_keep, _check_
 pytestmark = [pytest.mark.L0, requires_dsl, requires_pre_rubin_blackwell]
 
 
-def _case(*, dtype=torch.bfloat16, d=512, hkv=2, causal=True, roles=("q", "do", "dq", "dv")):
+def _case(*, dtype=torch.bfloat16, d=512, hkv=2, causal=True, roles=("q", "do", "dq", "dv"), b=2, h=4, orders=None, singleton_stride=None):
     from cudnn.sdpa.bwd import api_dsl
 
     torch.manual_seed(5142)
-    b, h, sq, skv = 2, 4, 129, 143
+    sq, skv = 129, 143
     tensors, owners = {}, {}
     for name, heads, seq in (("q", h, sq), ("k", hkv, skv), ("v", hkv, skv), ("do", h, sq), ("o", h, sq), ("dq", h, sq), ("dk", hkv, skv), ("dv", hkv, skv)):
-        width = d + 3 if name in roles else d
-        owner = torch.full((b, seq, heads, width), 17, dtype=dtype, device="cuda")
-        tensor = owner[..., 1 : d + 1] if name in roles else owner
-        tensor = tensor.permute(0, 2, 1, 3)
+        width = d + 24 if name in roles else d
+        shape = (b, heads, seq, width)
+        order = (orders or {}).get(name, (0, 2, 1)) + (3,)
+        owner = torch.full(tuple(shape[i] for i in order), 17, dtype=dtype, device="cuda")
+        tensor = owner[..., 8 : d + 8] if name in roles else owner
+        tensor = tensor.permute(*(order.index(i) for i in range(4)))
+        if singleton_stride is not None:
+            strides = tuple(singleton_stride if n == 1 and i < 3 else st for i, (n, st) in enumerate(zip(tensor.shape, tensor.stride())))
+            tensor = tensor.as_strided(tensor.shape, strides)
         if name in ("q", "k", "v", "do"):
             tensor.copy_(torch.randn_like(tensor) * 0.1)
         tensors[name], owners[name] = tensor, owner
@@ -78,8 +85,8 @@ def _check(case):
     _check_prepared(case)
     for name in case.roles:
         owner = case.owners[name]
-        assert torch.all(owner[..., :1] == 17)
-        assert torch.all(owner[..., -2:] == 17)
+        assert torch.all(owner[..., :8] == 17)
+        assert torch.all(owner[..., -16:] == 17)
     assert torch.all(case.workspace_owner[:256] == 0xA7)
     assert torch.all(case.workspace_owner[-256:] == 0xA7)
 
@@ -87,14 +94,14 @@ def _check(case):
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
 @pytest.mark.parametrize("d,hkv,causal", [(264, 4, False), (384, 2, True), (512, 1, True)])
 @pytest.mark.parametrize("roles", [("q", "do", "dq", "dv"), ("k", "v", "o", "dk")])
-def test_staged_rebind_stream_capture(dtype, d, hkv, causal, roles, monkeypatch):
+def test_native_rebind_stream_capture(dtype, d, hkv, causal, roles, monkeypatch):
     import cutlass.cute as cute
     from cudnn.sdpa.bwd import prepared
 
-    monkeypatch.setattr(prepared, "_bind_python", lambda *a, **k: pytest.fail("half staged backward entered the Python binder"))
+    monkeypatch.setattr(prepared, "_bind_python", lambda *a, **k: pytest.fail("half native backward entered the Python binder"))
 
     def forbidden(*args, **kwargs):
-        raise AssertionError("staged backward used the legacy tensor compiler or DLPack")
+        raise AssertionError("native backward used the legacy tensor compiler or DLPack")
 
     with monkeypatch.context() as guards:
         guards.setattr(cute.runtime, "make_fake_compact_tensor", forbidden)
@@ -147,7 +154,7 @@ def test_staged_rebind_stream_capture(dtype, d, hkv, causal, roles, monkeypatch)
 
 
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
-def test_staged_standalone_and_runtime_layout(dtype, monkeypatch):
+def test_native_standalone_and_runtime_layout(dtype, monkeypatch):
     from cudnn.sdpa.bwd import api_dsl, prepared, prepared_sm100
 
     monkeypatch.setattr(prepared, "_bind_python", lambda *a, **k: pytest.fail("half standalone backward entered the Python binder"))
@@ -155,29 +162,29 @@ def test_staged_standalone_and_runtime_layout(dtype, monkeypatch):
     case = _case(dtype=dtype)
     api = api_dsl.SdpaBwdDslSm100(**{"sample_" + name: value for name, value in case.tensors.items()}, is_causal=True, scale_softmax=512**-0.5)
     api.compile()
-    assert api._prepared is None and api._staged_prepared is not None
+    assert api._prepared is not None
     workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
     args = {name + "_tensor": value for name, value in case.tensors.items()}
     api.execute(**args, workspace=workspace)
     _check_prepared(case)
     wrong = dict(args, q_tensor=case.tensors["q"].contiguous())
     with monkeypatch.context() as guards:
-        guards.setattr(prepared_sm100, "_copy", lambda *a, **k: pytest.fail("invalid metadata reached a prepared staging write"))
-        with pytest.raises(ValueError, match="declared shape and strides"):
+        api._prepared = replace(api._prepared, fn=lambda *a: pytest.fail("invalid metadata reached the kernel"), native_binding=True)
+        with pytest.raises(ValueError, match="geometry|strides"):
             api.execute(**wrong, workspace=workspace)
     launches = []
-    monkeypatch.setattr(prepared_sm100, "execute_staged", lambda *a: launches.append(a))
+    monkeypatch.setattr(prepared_sm100, "execute_standalone", lambda *a: launches.append(a))
     with pytest.raises(ValueError, match="padding masks"):
         api.execute(**args, workspace=workspace, seq_q_lens=torch.ones(2, dtype=torch.int32, device="cuda"))
     assert not launches
 
 
-@pytest.mark.parametrize("staged", [False, True])
-def test_sm100_direct_adapter_declines_old_dsl(staged, monkeypatch):
+@pytest.mark.parametrize("unaligned", [False, True])
+def test_sm100_direct_adapter_declines_old_dsl(unaligned, monkeypatch):
     from cudnn.frost import buffers
     from cudnn.sdpa.bwd import api_dsl
 
-    q = torch.empty(2, 4, 128, 515 if staged else 512, device="cuda", dtype=torch.bfloat16)[..., :512]
+    q = torch.empty(2, 4, 128, 515 if unaligned else 512, device="cuda", dtype=torch.bfloat16)[..., :512]
     stats = torch.empty(2, 4, 128, device="cuda", dtype=torch.float32)
     api = api_dsl.SdpaBwdDslSm100(q, q, q, q, q, stats, q, q, q)
     monkeypatch.setattr(buffers, "cutedsl_requirement_error", lambda name: f"{name} requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2")
@@ -201,7 +208,7 @@ def test_direct_standalone_with_another_device_current(dtype, explicit_stream, a
     case = _case(dtype=dtype, roles=())
     api = api_dsl.SdpaBwdDslSm100(**{"sample_" + name: value for name, value in case.tensors.items()}, is_causal=True, scale_softmax=512**-0.5)
     api.compile()
-    assert api._prepared is not None and api._staged_prepared is None
+    assert api._prepared is not None
     workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=target)
     args = {name + "_tensor": value for name, value in case.tensors.items()}
     # The SM107 adapter consumes the same prepared spec contract. Exercise its
@@ -258,3 +265,61 @@ def test_direct_standalone_with_another_device_current(dtype, explicit_stream, a
         with pytest.raises(ValueError, match="k must"):
             run()
         assert torch.cuda.current_device() == other
+
+
+def _kernel_count(case):
+    from cuda.bindings import runtime as cudart
+
+    capture = torch.cuda.CUDAGraph(keep_graph=True)
+    try:
+        with torch.cuda.graph(capture):
+            case.graph.execute(case.pack, case.workspace)
+        graph = cudart.cudaGraph_t(capture.raw_cuda_graph())
+        error, _, count = cudart.cudaGraphGetNodes(graph, 0)
+        assert error == cudart.cudaError_t.cudaSuccess
+        error, nodes, _ = cudart.cudaGraphGetNodes(graph, count)
+        assert error == cudart.cudaError_t.cudaSuccess
+        kinds = [cudart.cudaGraphNodeGetType(node) for node in nodes]
+        assert all(error == cudart.cudaError_t.cudaSuccess for error, _ in kinds)
+        capture.replay()
+        _check(case)
+        return sum(kind == cudart.cudaGraphNodeType.cudaGraphNodeTypeKernel for _, kind in kinds)
+    finally:
+        capture.reset()
+
+
+@pytest.mark.parametrize("order", list(permutations(range(3))))
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_independent_orders_bind_original_pointers(order, dtype, monkeypatch):
+    from cudnn.sdpa.bwd import prepared_sm100
+
+    roles = ("q", "k", "v", "o", "do", "dq", "dk", "dv")
+    all_orders = list(permutations(range(3)))
+    orders = {role: all_orders[(all_orders.index(order) + i) % 6] for i, role in enumerate(roles)}
+    control = _case(d=264, dtype=dtype, roles=())
+    expected_kernels = _kernel_count(control)
+    frames = []
+    original = prepared_sm100.compile_plan
+
+    def compile_plan(*args):
+        spec = original(*args)
+
+        def launch(*frame):
+            frames.append(frame)
+            return spec.fn(*frame)
+
+        return replace(spec, fn=launch, native_binding=True)
+
+    monkeypatch.setattr(prepared_sm100, "compile_plan", compile_plan)
+    case = _case(d=264, dtype=dtype, roles=roles, orders=orders)
+    assert case.graph.get_workspace_size() == control.graph.get_workspace_size()
+    assert _kernel_count(case) == expected_kernels
+    assert frames
+    assert tuple(frames[-1][:9]) == tuple(case.tensors[n].data_ptr() for n in ("q", "k", "v", "o", "do", "stats", "dq", "dk", "dv"))
+
+
+@pytest.mark.parametrize("b,h,hkv", [(1, 4, 2), (2, 1, 1), (1, 1, 1)])
+@pytest.mark.parametrize("unused", [0, 3, 2**33 + 1])
+def test_singleton_pitches_execute_and_replay(b, h, hkv, unused):
+    case = _case(d=264, b=b, h=h, hkv=hkv, singleton_stride=unused)
+    _kernel_count(case)

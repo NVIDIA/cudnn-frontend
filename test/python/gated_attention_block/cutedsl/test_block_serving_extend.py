@@ -41,7 +41,9 @@ import pytest
 import torch
 
 from cudnn.frost.buffers import cutedsl_requirement_error
+from cudnn.gated_attention_block import api as _api
 from cudnn.gated_attention_block import (
+    DENSE_SERVING_CCS,
     KV_SOURCE_PAGED,
     KV_SOURCE_SELF,
     SERVING_PAGE_SIZES,
@@ -75,6 +77,7 @@ if requirement_error:
     pytest.skip(requirement_error, allow_module_level=True)
 
 requires_rubin = pytest.mark.requires_rubin  # the suite's registered marker (conftest.py): skipped off SM107
+requires_blackwell = pytest.mark.requires_blackwell  # the registered marker: an admitted Blackwell-line part of DENSE_SERVING_CCS (cc 10.0; 2026-10-29)
 # The capture cell (g) needs the projection GEMM driver's capture-safe route (``build_proj_gemm(capture_safe=True)``: the forced-tile JIT
 # route, no cuDNN handle at the first execute).  Where the driver has no such route, a fresh declaration's first execute inside a capture
 # is the graph route's handle creation, so the cell is skipped there instead of asserting what that tree cannot deliver; the serving
@@ -1455,7 +1458,7 @@ def test_extend_typed_declines_match_the_envelope_row_by_row(monkeypatch):
     assert [st.name for st in gated._stages].count("sigmoid_gate") == 0 and "cache_write" in [st.name for st in gated._stages]
     assert "fuse_gate as declared" in env.extend.requires[-1]
     # the served verdict reads the device: Rubin serves the form, every other part names itself in the reason
-    cc = tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
+    cc = _api._device_cc_of(_DEV)  # the device read the envelope takes (torch's capability on a real host)
     assert env.device_cc == cc
     if cc == (10, 7):
         if not env.cutedsl_ok:
@@ -1469,8 +1472,14 @@ def test_extend_typed_declines_match_the_envelope_row_by_row(monkeypatch):
         for geom_kw, row in ((dict(_EXTEND_GEOM, window_left=64), "window"), (_SMALL_D256, "diagonal"), (d128, "head_dim")):
             bad = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**geom_kw), torch.bfloat16, _DEV)
             assert not bad.extend.served and bad.extend.reason == env.extend.declines[row] and bad.forms == (), row
+    elif cc in DENSE_SERVING_CCS:
+        # cc 10.0 (2026-10-29): both dense forms served through the shared SM100 d256 paged THD body; the geometry rows the same table's
+        assert env.extend.served and env.forms == ("extend", "decode") and env.extend.reason is None and env.cutedsl_ok
+        for geom_kw, row in ((dict(_EXTEND_GEOM, window_left=64), "window"), (_SMALL_D256, "diagonal"), (d128, "head_dim")):
+            bad = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**geom_kw), torch.bfloat16, _DEV)
+            assert not bad.extend.served and bad.extend.reason == env.extend.declines[row] and bad.forms == (), row
     else:
-        assert not env.extend.served and env.forms == () and "targets Rubin" in env.extend.reason
+        assert not env.extend.served and env.forms == () and "served on cc 10.7 (Rubin, SM107: every form) and cc 10.0" in env.extend.reason
     # a sparse geometry: the block serves the packed sparse stage (the sparse declaration's THD row is record-driven and the record claims
     # the arm), so the THD-only form reaches the table like the dense one and meets its `sparse` row -- the PACKED form's row since
     # 2026-10-14 (the sparse core serves THD and paged pools one at a time) -- the envelope says so wherever the device / dtype facts let
@@ -2709,3 +2718,95 @@ def test_extend_qwen35_shards_execute_within_the_budget(name):
         worst_cos = min(worst_cos, _cos(rec["out"][lo:hi], ref.out[0, p : p + q]))
         worst_err = max(worst_err, (og[lo:hi].float() - ref.o_gated[0, p : p + q].float()).abs().max().item())
     print(f"(shard) {name} p{page}: t_live {rec['t_live']} kv_lens {rec['kv_lens']} worst out cos {worst_cos:.6f} gated-O max|err| {worst_err:.3e}")
+
+
+# ---------------------------------------------------------------------------
+# cc 10.0 (the SM100 line of DENSE_SERVING_CCS; 2026-10-29): the EXTEND form through the shared SM100 d256 paged THD body
+# ---------------------------------------------------------------------------
+#
+# The same declaration, the same harness, the same check (nothing widened): the paged THD leg of the sm100 f16 row (CGA2, unsplit,
+# unpacked, NATURAL, no gate, no LSE), the write-through before it, the sigmoid gate its own launch.  Functional cells only; fuse_gate=True
+# and the fused projection fork are typed declines by name there.
+
+_Q38_27B_EXTEND_GEOM = dict(d_model=5120, h_q=24, h_kv=4, d_head=256, rope_dim=64, causal_bottom_right=True)
+
+
+def _sm100_pin_extend(hz):
+    """The compiled stage (4) on cc 10.0: the shared SM100 paged THD body, unsplit, unpacked, no gate epilogue, the gate its own stage."""
+    sd = hz.blk._sdpa
+    impl = sd._impl
+    assert sd.kv_source == KV_SOURCE_PAGED and sd.thd and not sd.fuse_gate and impl.kernel_template == "prefill_d256_f16", impl.kernel_template
+    assert impl._k_mod.__file__.endswith("/sm100/prefill_d256_f16.py") and impl.split_kv == 1 and not impl.pack_gqa
+    assert impl.template_params().epilogue_gate is False and not hz.blk.gate_fused and hz.blk._gate is not None
+    assert hz.blk.decode_route is None and hz.blk.use_pdl is False and hz.blk.pdl_stages == ()
+
+
+@requires_blackwell
+@pytest.mark.parametrize(
+    "dtype, layout, page",
+    [
+        pytest.param(torch.bfloat16, "hnd", 16, marks=pytest.mark.L0, id="bf16-hnd-16"),
+        pytest.param(torch.float16, "unified", 64, marks=pytest.mark.L1, id="f16-unified-64"),
+        pytest.param(torch.bfloat16, "nhd", 32, marks=pytest.mark.L1, id="bf16-nhd-32"),
+        pytest.param(torch.float16, "hnd", 128, marks=pytest.mark.L1, id="f16-hnd-128"),
+    ],
+)
+def test_sm100_extend_matrix_cell(dtype, layout, page):
+    """The degenerate matrix on serving buffers on cc 10.0 (the cells of the tracker's cc 10.0 EXTEND table): four sequences at T_max
+    512 -- an empty prefix, a step over a prefix ending mid-page, a PADDED entry, a tail tile -- within the dense suite's budget of the
+    per-sequence oracle, the pools bitwise the slab rows, stale rows untouched; the int64 slot dtype at pages 32 / 128."""
+    hz = _harness(4, 512, max_kv_len=512, page=page, layout=layout, dtype=dtype, slot_dtype=torch.int32 if page in (16, 64) else torch.int64)
+    _sm100_pin_extend(hz)
+    rec = hz.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    assert rec["t_live"] == 412
+    hz.check(rec, label=f"(cc 10.0) 8/2 {dtype} {layout} p{page}")
+
+
+@requires_blackwell
+def test_sm100_extend_the_27b_geometry_executes_within_the_budget():
+    """One EXTEND step at the 24 / 4 geometry at its real width (``d_model`` 5120) on cc 10.0: two sequences at ``T_max`` 256, a
+    100-token step over a 60-row prefix and a 156-token step over a 100-row prefix (the table row full), through the suite's harness and
+    ``check``; the stage pinned on the shared SM100 paged THD body."""
+    hz = _harness(2, 256, max_kv_len=256, page=16, geom_kw=_Q38_27B_EXTEND_GEOM, seed=37)
+    assert hz.geom.d_model == 5120 and hz.geom.h_kv == 4 and hz.geom.n_qkvg % 256 == 0
+    _sm100_pin_extend(hz)
+    rec = hz.step([100, 156], prefix_lens=[60, 100], prefill="reference")
+    hz.check(rec, label="(cc 10.0) 27B 24/4 d_model 5120 p16")
+    assert rec["kv_lens"] == [160, 256] and rec["t_live"] == 256 == hz.t_max
+
+
+@requires_blackwell
+def test_sm100_extend_two_launches_are_bitwise_and_lengths_form():
+    """Two launches bitwise on ``out`` and the pools; the ``[B]`` lengths form (``cu_seqlens=False``) within the budget on cc 10.0."""
+    hz = _harness(4, 512, max_kv_len=512, page=16, layout="hnd", seed=41)
+    rec1 = hz.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    out1 = rec1["out"].clone()
+    hz.refill_pools()
+    rec2 = hz.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    assert torch.equal(out1, rec2["out"])
+    hz.check(rec2, label="(cc 10.0) second launch")
+    lf = _harness(4, 512, max_kv_len=512, page=16, layout="hnd", cu=False, seed=21)
+    _sm100_pin_extend(lf)
+    rec = lf.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    lf.check(rec, label="(cc 10.0) the lengths form")
+
+
+@requires_blackwell
+def test_sm100_extend_declines_fuse_gate_and_the_fused_fork_by_name():
+    """On the part itself: ``fuse_gate=True`` on the EXTEND form is the SM100 row's typed decline at ``check_support`` (the paged body's
+    gate epilogue is the Rubin rendering's), ``fuse_norm_rope=True`` the sm_107a projection fork's; the plain declaration passes the part
+    rows and builds (the cells above)."""
+    gated, *_ = _declare_extend(2, 128, max_kv_len=128, fuse_gate=True)
+    assert gated.gate_fused, "the declaration records the fused gate; the part speaks at check_support"
+    with pytest.raises(NotImplementedError, match="fuse_gate=True is not served by the f16/bf16 SM100 SDPA engine row") as e:
+        gated.check_support()
+    assert "cc 10.0" in str(e.value) and "fuse_gate=False" in str(e.value)
+    fork, *_ = _declare_extend(2, 128, max_kv_len=128, fuse_norm_rope=True)
+    assert fork.fuse_norm_rope_effective
+    with pytest.raises(NotImplementedError, match="rendered for sm_107a \(Rubin\); this device is SM100"):
+        fork.check_support()
+    plain, *_ = _declare_extend(2, 128, max_kv_len=128)
+    plain._check_declaration()
+    plain._check_part_support()
+    env = GatedAttentionBlockFwd.serving_envelope(plain.geom, torch.bfloat16, _DEV)
+    assert env.device_cc == (10, 0) and env.forms == ("extend", "decode")

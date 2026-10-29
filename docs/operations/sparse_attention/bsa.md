@@ -243,6 +243,50 @@ Q retains the Sage BF16 intermediate-rounding recipe; K uses FP32 centering.
 FP32 rounding near an FP8 midpoint can select an adjacent E4M3 value across
 implementations.
 
+### SM120 per-token Q/K scaling
+
+On SM120 blk128, set `k_quant_block_size=1` to use one FP32 scale for every
+`(batch, head, token)` of **both Q and K**, covering all 128 head features.
+The default `k_quant_block_size=16` preserves the existing recipe. This
+argument controls numerics, not the sparse block size or an autotuning knob.
+
+```python
+out = block_sparse_attention_fp8_forward(
+    q, k, v, q2k_block_index,
+    sparse_block_size=128,
+    k_quant_block_size=1,
+)["o_tensor"]
+```
+
+K is still centered by its FP32 sequence mean before quantization. Its
+per-token descale is `max(amax(abs(K_centered[token, :])), 1e-3) / 448`,
+and the quotient is rounded to E4M3. Q retains its existing BF16 intermediate
+rounding, and V keeps one FP32 scale per `(head, channel)`, reduced over
+**batch and the entire key sequence**. This does not use MXFP8 block-scale
+instructions, Q centering, or a Q-mean/delta correction.
+
+The kernel applies each K descale to its own QK accumulator column before
+the maximum reduction and exponentiation. P uses the unchanged factor of
+256 before E4M3 conversion, with an unrounded FP32 denominator. V descales
+are applied to output channels after PV accumulation. A transposed V storage
+tile of 128 tokens is only a layout choice, **not** a V quantization block.
+
+For blocked V storage, the per-token kernel establishes the maximum over the
+complete 128-key score tile, then converts and consumes P in 32- or 64-key
+chunks. This interleaves probability conversion with PV while retaining the
+original ordered FP32 denominator and K32 MMA accumulation order. The chunk
+width is an internal scheduling choice with a separate compile-cache key;
+it does not change the quantization granularity or normalize each chunk
+independently. The coarse-K and unblocked-V paths retain their existing schedule.
+
+Per-token K requires CuTe DSL >= 4.8.0, SM120, `sparse_block_size=128`, MHA,
+and D=128. Tails, variable sparse counts, empty rows, and partial KV blocks
+follow the existing SM120 contract. Other architectures and blk64 reject
+this option rather than silently falling back to a coarser recipe. Finer
+scales can reduce quantization error, but are not a guarantee of better
+model quality on every input; kernel and quantization-inclusive latency
+should both be measured for the intended workload.
+
 The SM100/SM103 blk128 kernel retains the upstream rounded-probability
 normalization: P uses a factor of 128, and its denominator is accumulated from
 the same rounded FP8 probabilities by the widened PV Tensor Core operation.

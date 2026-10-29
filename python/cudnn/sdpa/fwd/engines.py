@@ -1912,12 +1912,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if facts.thd and capabilities.thd_d_shapes is not None and (facts.d_qk, facts.d_v) not in capabilities.thd_d_shapes:
         return f"THD (ragged) rides the packed native-tile leg on this engine (shapes {sorted(capabilities.thd_d_shapes)}); the head-dim envelope is dense-only"
     if facts.thd and capabilities.sm_lo == capabilities.sm_hi == 80 and capabilities.phase == "prefill":
+        from cudnn.sdpa.native_sm80 import forward_thd_layout_mismatch
+
         if knobs is not None and knobs.sched_policy not in (None, SCHED_NATURAL):
             return "SM80 THD forward requires the natural scheduler (the varlen grid is 3-D)"
         for name, tensor in (("Q", facts.q_t), ("K", facts.k_t), ("V", facts.v_t), ("O", facts.o_t)):
-            dim, stride = tuple(tensor.get_dim()), tuple(tensor.get_stride())
-            if (stride[2], stride[1], stride[3]) != (dim[1] * dim[3], dim[3], 1):
-                return f"SM80 THD {name} requires compact packed BSHD strides"
+            reason = forward_thd_layout_mismatch(name, tensor.get_dim(), tensor.get_stride())
+            if reason is not None:
+                return reason
         if (facts.seq_q_t is None and facts.cu_seq_q_t is None) or (facts.seq_kv_t is None and facts.cu_seq_kv_t is None):
             return "SM80 THD forward requires Q and KV lengths (seq_len_* or cu_seq_len_*)"
         if facts.has_bias or facts.has_sink:
@@ -3132,8 +3134,8 @@ def _sm80_spec() -> EngineSpec:
     """SM80 (A100) prefill row: lowers through ``lower_dsl_prefill`` onto the
     ``SdpaFwdDslSm80`` adapter (``fwd/api_dsl.py``), which owns kernel-flavor
     selection (gptoss/llama/dsv3/qwen), native eight-aligned head-dim envelopes,
-    declared data strides, and per-shape kernel caching. Native-flavor packed THD graphs bind the varlen template directly;
-    the dense head-dim envelope is not offered to THD. Dense graphs expose
+    declared data strides, and per-shape kernel caching. Dense and packed THD
+    graphs share the eight-aligned head-dim envelope. Dense graphs expose
     scheduler tuning; THD requires the natural 3-D grid."""
     from cudnn.sdpa.native_sm80 import graph_mismatch
 
@@ -3147,7 +3149,7 @@ def _sm80_spec() -> EngineSpec:
             d_shapes=frozenset({(256, 256)}),  # flavor envelopes; masked native loads
             d_pad_multiple=8,
             declaration_check=graph_mismatch,
-            thd_d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256)}),
+            thd_d_shapes=None,  # logical widths reach the masked native packed host
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             bias=True,
             right_band_widening=True,

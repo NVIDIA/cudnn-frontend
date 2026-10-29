@@ -79,8 +79,15 @@ kernel. Two OPTIONAL fusions, both off by default until the perf node ranks
 them: ``fuse_norm_rope`` (stages (2)+(3) into (1)'s epilogue) and ``fuse_gate``
 (stage (5) into (4)'s epilogue); with both on the block is THREE launches,
 ``proj(+norm+rope) -> sdpa(+gate) -> out_proj``. The block targets **Rubin
-(SM107) only** for now — every other arch is declined explicitly rather than
-served slowly.
+(SM107)** for every form and, since 2026-10-29, **cc 10.0 (the SM100 line:
+B200 / GB200)** for the DENSE bf16 / f16 INFERENCE forms alone -- the dense
+prefill form, the EXTEND form and the DECODE form through the shared SM100
+d256 kernels (:data:`DENSE_SERVING_CCS`; functional only, unmeasured there,
+``fuse_gate`` declined by name because the sm100 row claims no gate epilogue);
+the fused projection forks (``sm_107a`` renderings), the quantized pipelines,
+the sparse / QsaSpec / indexer machinery, the e4m3 cache and the backward stay
+Rubin-only, cc 10.3 is declined by name until proven through the block, and
+every other arch is declined explicitly rather than served slowly.
 
 **The default pipeline is deliberately UNFUSED**: five stages, five launches
 (four under ``inplace_qkv``), every intermediate materialised in the caller's
@@ -605,7 +612,9 @@ it (and wherever no two-unit route holds the step, whatever the batch).  ``decod
 batch the route was decided at; without a batch (the envelope's ``routes``) the route is the small-batch one."""
 
 DECODE_TILE = "decode_d256_f16"
-"""``kernel_template`` of the Rubin d256 decode tile (``sdpa/fwd/kernels/sm107/decode_d256_f16.py``: the swap-AB tile)."""
+"""``kernel_template`` of the d256 decode tile: the Rubin rendering ``sdpa/fwd/kernels/sm107/decode_d256_f16.py`` on cc 10.7 and its
+SM100 sibling ``sdpa/fwd/kernels/sm100/decode_d256_f16.py`` on cc 10.0 (the swap-AB tile; ONE template name, the adapter picks the file
+by the device -- the readback ``_Sdpa._impl._k_mod.__file__`` names which)."""
 
 PREFILL_TILE = "prefill_d256_f16"
 """``kernel_template`` of the paged d256 prefill tile the DECODE form's prefill route runs: the shared SM100 half d256 body
@@ -709,7 +718,10 @@ class DecodeRoute:
     PREFILL tile with the group packed (the EXTEND form's kernel at the dense step's envelope); ``_Sdpa.compile`` pins the compiled
     ``kernel_template`` against this record.  ``kv_streams`` is the figure the HBM-bound decode step is priced by: how many times the
     KV range of a (sequence, KV head) is streamed -- the token units on the packed decode tile, the group on the unpacked arm (one
-    head per CTA), one on the prefill tile and on the single-unit decode tile."""
+    head per CTA), one on the prefill tile and on the single-unit decode tile.  On the SM100 line (``device_cc`` cc 10.0, appended
+    2026-10-29) the same record names the SM100 decode tile (``sm100/decode_d256_f16.py`` at 16 columns; its 32-column arm is a typed
+    decline there until its cells run, :data:`DECODE_WIDE_TILE_CCS`) or the prefill tile under the line's own rule (:func:`decode_route`);
+    ``claimed`` is False on every SM100 cell."""
 
     s_q: int
     group: int  # h_q // h_kv: the heads a tile packs per token (1 = MHA, unpacked)
@@ -737,6 +749,12 @@ class DecodeRoute:
     # above it; ``None`` = no batch given, the small-batch reading.  A readback, not part of the route's identity (``compare=False``):
     # two records of one route read at different batches are equal when they name the same kernel.
     batch: Optional[int] = dataclasses.field(default=None, compare=False)
+    # APPENDED (2026-10-29): the PART whose table the route was read from (``decode_route(device_cc=)`` through :func:`_route_part`: None =
+    # the Rubin table -- no part given, cc 10.7, or an unserved part, the home reading --, a served Blackwell-line part = the SM100 line's
+    # rule) and the declared KV bound the line's wide-launch reading used (``decode_route(max_kv_len=)``; None = no bound given: never a
+    # wide launch).  Readbacks, not part of the route's identity.
+    device_cc: Optional[Tuple[int, int]] = dataclasses.field(default=None, compare=False)
+    max_kv_len: Optional[int] = dataclasses.field(default=None, compare=False)
 
     @property
     def decode_tile(self) -> bool:
@@ -765,7 +783,13 @@ def _resolve_decode_q_tile_max(max_q_tile: Optional[int]) -> Optional[int]:
 
 
 def decode_route(
-    geometry: "GatedAttentionBlockGeometry", s_q: int, policy: Optional[str] = None, max_q_tile: Optional[int] = None, batch: Optional[int] = None
+    geometry: "GatedAttentionBlockGeometry",
+    s_q: int,
+    policy: Optional[str] = None,
+    max_q_tile: Optional[int] = None,
+    batch: Optional[int] = None,
+    device_cc: Optional[Tuple[int, int]] = None,
+    max_kv_len: Optional[int] = None,
 ) -> DecodeRoute:
     """The DECODE route of ``s_q`` tokens at ``geometry`` under ``policy`` (``None`` = :data:`DEFAULT_DECODE_ROUTE_POLICY`), read
     here so the block, the envelope and the tests name the kernel BEFORE anything compiles; ``batch`` (appended) the step's sequences,
@@ -798,7 +822,29 @@ def decode_route(
     MHA (``h_q == h_kv``) stays the unpacked tile (the bit-exact unpacked fold, one stream: 16 columns to 16 tokens, 32 past).  A cap
     below the width an unpacked step needs (``decode_q_tile_max=16`` at 17 .. 32 tokens) is NOT served either -- the cap is honoured,
     never widened, and the reason names it.  ``claimed`` marks the measured cells: the PACKED decode tile at ``s_q <=
-    DECODE_CLAIMED_MAX_S_Q`` on a width up to :data:`DECODE_CLAIMED_MAX_N_Q`."""
+    DECODE_CLAIMED_MAX_S_Q`` on a width up to :data:`DECODE_CLAIMED_MAX_N_Q`.
+
+    ``device_cc`` / ``max_kv_len`` (appended 2026-10-29): the PART the route is read for and the declared KV bound.  The part is read
+    through :func:`_route_part` -- ONE rule for this function, the declaration and the envelope: ``None``, cc 10.7 and every part that
+    serves no dense form (an sm80 host, cc 10.3 until it is admitted) read the Rubin table above, value for value (every reading before
+    this change; the home reading -- ``DecodeRoute.device_cc`` None says so); a served Blackwell-line part of :data:`DENSE_SERVING_CCS`
+    (cc 10.0) reads the SM100 LINE's rule -- the SDPA adapter's own off cc 10.7 (``SdpaFwdDslSm100._decode_q_tile_for``:
+    ``config_sm100.decode_d256_q_tile`` with the launch's wide-tile reading ``config_sm100.d256_wide_decode_launch(batch, groups,
+    max_kv_len)``, ``groups`` = ``H_kv`` packed and ``H_q`` unpacked), input for input, so ``_Sdpa.compile``'s pin holds there: (a) a
+    ``max_q_tile`` cap is NOT served (the cap names the Rubin table; the adapter refuses it off cc 10.7 for the same reason); (b) packed
+    rows ``S_q x G <= 16`` ride the 16-column tile in ONE unit (1 stream); (c) ``16 < S_q x G <= 32`` is the adapter's 32-COLUMN arm where
+    the launch is WIDE -- ``batch x H_kv >= config_sm100.D256_WIDE_DECODE_MIN_UNITS`` units streaming at least
+    ``D256_WIDE_DECODE_MIN_KV_TILES`` 128-key tiles between them (``batch`` or ``max_kv_len`` None = not wide: the small-launch reading,
+    the envelope's ``routes``) -- and that arm is a typed decline on every part off :data:`DECODE_WIDE_TILE_CCS` (empty today: no cc 10.0
+    cell of the block has run it; the reason names the lift); (d) else the paged PREFILL tile with the whole group packed wherever that
+    body packs the group within its 128 rows (a group dividing 128), at EVERY batch -- the line has no two-unit arm to hold the step
+    below the fill -- under BOTH policies (they coincide on this line; ``policy`` is recorded); (e) else the decode tile UNPACKED: the
+    16-column tile to 16 tokens (``group`` streams); 17 .. 32 tokens unpacked need the 32-column width -- the same arm: the adapter
+    routes it for a wide UNPACKED launch (``batch x H_q`` units) only and the block declines it at every launch until the arm's cells run
+    -- NOT served with a reason naming the width and the lift (the envelope's ``routes`` predict it, the declaration raises it); MHA
+    takes (b) / (e) with one stream.  ``claimed`` is False on every SM100 cell (the claimed envelope is the Rubin measurement);
+    ``pdl_capable`` is the decode tile's on both lines (the SM100 tile carries the griddepcontrol pair too).  ``DecodeRoute.device_cc``
+    / ``.max_kv_len`` read the table's part and the bound back."""
     from cudnn.sdpa.fwd.config_sm100 import decode_d256_q_units, pack_gqa_group_size
     from cudnn.sdpa.fwd.config_sm107 import decode_d256_q_tile, decode_d256_single_unit_q_tile
 
@@ -808,6 +854,14 @@ def decode_route(
         if isinstance(batch, bool) or not isinstance(batch, int) or batch < 1:
             raise ValueError(f"decode_route: batch must be >= 1 (the step's sequences) or None (no batch: the small-batch reading), got {batch!r}")
         batch = int(batch)
+    if max_kv_len is not None:
+        if isinstance(max_kv_len, bool) or not isinstance(max_kv_len, int) or max_kv_len < 1:
+            raise ValueError(f"decode_route: max_kv_len must be >= 1 (the declared KV bound) or None (no bound: never a wide launch), got {max_kv_len!r}")
+        max_kv_len = int(max_kv_len)
+    # the table's part: ONE rule with the declaration and the envelope (_route_part) -- a served Blackwell-line part reads the SM100 line,
+    # None / cc 10.7 / an unserved part the Rubin table (the home reading; the readback says None = the Rubin table)
+    line_cc = _route_part(device_cc)
+    sm100_line = line_cc is not None and line_cc != _SM107_CC
     g = int(geometry.h_q) // int(geometry.h_kv)
     s_q = int(s_q)
     rows = s_q * g
@@ -823,21 +877,63 @@ def decode_route(
             n_q=int(n_q),
             token_units=int(units),
             pack_gqa=bool(packed),
-            claimed=(tile == DECODE_TILE) and bool(packed) and s_q <= DECODE_CLAIMED_MAX_S_Q and int(n_q) <= DECODE_CLAIMED_MAX_N_Q,
+            # the claimed envelope is the Rubin measurement: every SM100 cell is routed, declared, unmeasured
+            claimed=(not sm100_line) and (tile == DECODE_TILE) and bool(packed) and s_q <= DECODE_CLAIMED_MAX_S_Q and int(n_q) <= DECODE_CLAIMED_MAX_N_Q,
             reason=reason,
             kv_streams=int(streams),
             policy=policy,
             q_tile_max=cap,
             pdl_capable=(tile == DECODE_TILE),
             batch=batch,
+            device_cc=line_cc,
+            max_kv_len=max_kv_len,
         )
 
     if int(geometry.d_head) != 256:
-        return route(None, 0, 0, False, 0, f"the paged read rides the Rubin d256 SDPA flavor; got d_head={geometry.d_head}")
+        return route(None, 0, 0, False, 0, f"the paged read rides the d256 SDPA flavor (the Rubin and SM100 d256 decode tiles); got d_head={geometry.d_head}")
     if s_q < 1 or g < 1:
         return route(None, 0, 0, False, 0, f"a dense step needs S_q >= 1 and a whole GQA group, got S_q={s_q} at group {g}")
     if s_q > DECODE_MAX_S_Q:
         return route(None, 0, 0, False, 0, _decode_rows_decline(s_q))
+    if sm100_line:
+        # THE SM100 LINE (cc 10.0): the adapter's rule off cc 10.7, input for input -- config_sm100.decode_d256_q_tile with the launch's
+        # wide-tile reading; no single-unit table, no token-unit arm, no cap (section (a) .. (e) of the docstring).  The 32-column arm
+        # that rule takes on a WIDE launch is served on the parts of DECODE_WIDE_TILE_CCS only (empty until its cells run): the plumbing
+        # stays, the width is gated -- the lift is that tuple gaining the part, nothing else moves.
+        from cudnn.sdpa.fwd.config_sm100 import D256_DECODE_MAX_Q_ROWS, d256_wide_decode_launch
+        from cudnn.sdpa.fwd.config_sm100 import decode_d256_q_tile as decode_d256_q_tile_sm100
+
+        if cap is not None:
+            return route(None, 0, 0, False, 0, _decode_cap_decline_sm100(line_cc, cap))
+        wide_p = batch is not None and max_kv_len is not None and d256_wide_decode_launch(batch, int(geometry.h_kv), max_kv_len)
+        wide_u = batch is not None and max_kv_len is not None and d256_wide_decode_launch(batch, int(geometry.h_q), max_kv_len)
+        wide_arm = line_cc in DECODE_WIDE_TILE_CCS  # the 32-column arm admitted on this part
+
+        def wide_decline(packed: bool) -> DecodeRoute:
+            heads = int(geometry.h_kv) if packed else int(geometry.h_q)
+            return route(None, 0, 0, False, 0, _decode_wide_arm_decline_sm100(line_cc, s_q, g, packed, batch, heads, max_kv_len))
+
+        if g == 1:
+            n_q = decode_d256_q_tile_sm100(s_q, 1, wide_launch=wide_u)
+            if n_q == D256_DECODE_MAX_Q_ROWS and not wide_arm:
+                return wide_decline(False)
+            if n_q:
+                return route(DECODE_TILE, n_q, 1, False, 1)
+            return route(None, 0, 0, False, 0, _decode_unpacked_decline_sm100(line_cc, s_q, g, batch, int(geometry.h_q), max_kv_len))
+        n_q = decode_d256_q_tile_sm100(s_q, g, wide_launch=wide_p)
+        if n_q == D256_DECODE_MAX_Q_ROWS and not wide_arm:
+            return wide_decline(True)
+        if n_q:
+            return route(DECODE_TILE, n_q, 1, True, 1)
+        if rows <= DECODE_PREFILL_TILE_ROWS and pack_gqa_group_size(g, DECODE_PREFILL_TILE_ROWS) == g:
+            # the paged prefill tile with the whole group packed, at every batch: the line offers no two-unit arm below the fill
+            return route(PREFILL_TILE, 0, 0, True, 1)
+        n_q = decode_d256_q_tile_sm100(s_q, 1, wide_launch=wide_u)
+        if n_q == D256_DECODE_MAX_Q_ROWS and not wide_arm:
+            return wide_decline(False)
+        if n_q:
+            return route(DECODE_TILE, n_q, 1, False, g)
+        return route(None, 0, 0, False, 0, _decode_unpacked_decline_sm100(line_cc, s_q, g, batch, int(geometry.h_q), max_kv_len))
     if g == 1:
         # MHA: the unpacked fold on the decode tile (S_q <= 32 rows fit its 16- or 32-column width), one stream
         n_q = decode_d256_single_unit_q_tile(s_q, 1, **form)
@@ -869,7 +965,7 @@ def decode_route(
 
 
 _DECODE_ROWS_DECLINE = (
-    f"kv_source='paged' on a dense [B, S_q] declaration (the DECODE form) serves S_q <= {DECODE_MAX_ROWS} new tokens per sequence: the Rubin "
+    f"kv_source='paged' on a dense [B, S_q] declaration (the DECODE form) serves S_q <= {DECODE_MAX_ROWS} new tokens per sequence: the "
     "d256 decode tile in one token unit, the paged d256 prefill tile with the group packed or two token units of the decode tile (an MTP "
     f"verify step), then the decode tile UNPACKED (one head per CTA) up to {DECODE_MAX_ROWS} rows; a longer dense step over the pools is the "
     "EXTEND form's PACKED (thd=True) business (a QsaSpec geometry has no such cap: the sparse core runs one work item per query row)"
@@ -891,7 +987,72 @@ def _decode_cap_decline(s_q: int, group: int, cap: Optional[int]) -> str:
     )
 
 
-def decode_split_choice(route: DecodeRoute, *, batch: int, h_kv: int, max_kv_len: int, sm_count: int, gated: bool, h_q: Optional[int] = None) -> int:
+def _decode_cap_decline_sm100(cc: Tuple[int, int], cap: int) -> str:
+    """The SM100 line's reason for a width cap: the cap names the Rubin table (the adapter refuses it off cc 10.7 with the same reason)."""
+    return (
+        f"kv_source='paged' on a dense [B, S_q] declaration (the DECODE form): decode_q_tile_max={cap} caps the Rubin (cc 10.7) d256 decode route's "
+        f"width table; cc {cc[0]}.{cc[1]} routes the SM100 line's one width per launch (the 16-column decode tile; the 32-column arm the adapter "
+        "takes on a wide launch -- config_sm100.d256_wide_decode_launch -- is declined by name until its cells run, DECODE_WIDE_TILE_CCS) and the "
+        "SDPA adapter refuses the cap there -- declare decode_q_tile_max=None"
+    )
+
+
+_DECODE_WIDE_ARM_LIFT = "the 32-column SM100 decode arm: its cc 10.0 accept cells have not run; admitted when they do (DECODE_WIDE_TILE_CCS gains the part)"
+"""The ONE lift sentence of the SM100 line's 32-column arm, in every reason that declines it (:func:`_decode_wide_arm_decline_sm100`,
+:func:`_decode_unpacked_decline_sm100`), so the host rows and a serving stack pin one phrase."""
+
+
+def _decode_unpacked_decline_sm100(cc: Tuple[int, int], s_q: int, group: int, batch: Optional[int], h_q: int, max_kv_len: Optional[int]) -> str:
+    """The SM100 line's reason for an UNPACKED step of 17 .. 32 tokens off the wide-launch rule: the SDPA adapter routes the 32-column
+    width there for a WIDE launch only, and the block declines that arm at every launch until its cells run (a wide launch's own reason
+    is :func:`_decode_wide_arm_decline_sm100`); the envelope's ``routes`` predict it, the declaration raises it."""
+    from cudnn.sdpa.fwd.config_sm100 import D256_WIDE_DECODE_MIN_KV_TILES, D256_WIDE_DECODE_MIN_UNITS
+
+    launch = "no batch given (the small-launch reading)" if batch is None else f"batch {batch} x H_q {h_q} = {batch * h_q} unit(s) over max_kv_len={max_kv_len}"
+    return (
+        f"kv_source='paged' on a dense [B, S_q] declaration (the DECODE form): S_q={s_q} at group {group} rides the d256 decode tile UNPACKED on its "
+        f"32-column width (17 .. 32 live rows per head), which cc {cc[0]}.{cc[1]} routes for WIDE launches only -- batch x H_q >= "
+        f"{D256_WIDE_DECODE_MIN_UNITS} units streaming at least {D256_WIDE_DECODE_MIN_KV_TILES} 128-key tiles between them "
+        f"(config_sm100.d256_wide_decode_launch); this step reads {launch} -- and even there it is {_DECODE_WIDE_ARM_LIFT} -- declare a step of "
+        "at most 16 tokens or the EXTEND form (thd=True: the step packed)"
+    )
+
+
+def _decode_wide_arm_decline_sm100(cc: Tuple[int, int], s_q: int, group: int, packed: bool, batch: int, heads: int, max_kv_len: int) -> str:
+    """The SM100 line's reason for a step the SDPA adapter's rule puts on the 32-COLUMN decode tile at a WIDE launch
+    (``sm100/decode_d256_f16.py`` at ``N_Q`` 32: 17 .. 32 packed rows with the group packed, or an UNPACKED step of 17 .. 32 tokens) on a
+    part off :data:`DECODE_WIDE_TILE_CCS` -- the arm's plumbing is in place and its cc 10.0 accept cells have not run, so the block
+    declines it by name until they do (a served route has an accept test that ran); the envelope's ``route(s_q, batch, max_kv_len)``
+    predicts it, the declaration raises it."""
+    from cudnn.sdpa.fwd.config_sm100 import D256_WIDE_DECODE_MIN_KV_TILES, D256_WIDE_DECODE_MIN_UNITS
+
+    form = f"{s_q} x {group} = {s_q * group} packed rows" if packed else f"UNPACKED, {s_q} live rows per head, {group} KV stream(s)"
+    axis = "H_kv" if packed else "H_q"
+    advice = (
+        "declare a step of at most 16 packed rows (the 16-column tile), a launch below the wide rule (where the small-launch reading routes the "
+        "16-column tile unpacked or the paged prefill tile packed), or the EXTEND form (thd=True: the step packed)"
+        if packed
+        else "declare a step of at most 16 tokens or the EXTEND form (thd=True: the step packed)"
+    )
+    return (
+        f"kv_source='paged' on a dense [B, S_q] declaration (the DECODE form): S_q={s_q} at group {group} ({form}) at a WIDE launch -- batch {batch} x "
+        f"{axis} {heads} = {batch * heads} units over max_kv_len={max_kv_len}, past config_sm100.d256_wide_decode_launch's {D256_WIDE_DECODE_MIN_UNITS} units x "
+        f"{D256_WIDE_DECODE_MIN_KV_TILES} 128-key tiles -- is the SDPA adapter's 32-column width on cc {cc[0]}.{cc[1]}, and that is {_DECODE_WIDE_ARM_LIFT}; "
+        f"until then {advice}"
+    )
+
+
+def decode_split_choice(
+    route: DecodeRoute,
+    *,
+    batch: int,
+    h_kv: int,
+    max_kv_len: int,
+    sm_count: int,
+    gated: bool,
+    h_q: Optional[int] = None,
+    device_cc: Optional[Tuple[int, int]] = None,
+) -> int:
     """The split-KV the DECODE form lowers with when the declaration leaves ``decode_split_kv=None``: the SDPA heuristics' decode
     split model (``cudnn.sdpa.fwd.heuristics.choose_decode_tile_split_kv`` -- an under-full launch splits until its K / V streams
     saturate HBM, a launch past that never splits, the eager caller's second launch counted against the saving) over
@@ -899,7 +1060,9 @@ def decode_split_choice(route: DecodeRoute, *, batch: int, h_kv: int, max_kv_len
     and the declared ``max_kv_len`` in 128-key tiles at this part's SM count, the route's token units named so the model counts
     ONE KV stream per split for the units of a (sequence, KV head) (they stream the same range); floored at 2 under ``gated``
     (the gate rides the split COMBINE -- the tile has no gate seams); 1 for a route that is not served (declined at declaration)
-    and when ``sm_count`` is 0 (a non-CUDA declaration, declined at ``check_support`` anyway)."""
+    and when ``sm_count`` is 0 (a non-CUDA declaration, declined at ``check_support`` anyway).  ``device_cc`` (appended 2026-10-29)
+    names the ARCH LINE the model prices the launch on (``choose_decode_tile_split_kv(device_cc=)``: the Blackwell fit on cc 10.0 /
+    10.3, the Rubin fit for None and every other part) -- the block passes the part it read the route for."""
     if not route.decode_tile or int(sm_count) <= 0:
         return 1
     from cudnn.sdpa.fwd.heuristics import choose_decode_tile_split_kv
@@ -919,6 +1082,7 @@ def decode_split_choice(route: DecodeRoute, *, batch: int, h_kv: int, max_kv_len
             q_tile=route.n_q,
             combine_grid=(int(batch), real_heads, int(route.s_q)),
             token_units=int(route.token_units),
+            device_cc=None if device_cc is None else tuple(int(x) for x in device_cc)[:2],
         )
     )
     return max(split, 2) if gated else split
@@ -1050,12 +1214,17 @@ class DecodeEnvelope:
     inference_only: bool = True
     writes_lse: bool = False
 
-    def route(self, s_q: int, batch: Optional[int] = None) -> DecodeRoute:
+    def route(self, s_q: int, batch: Optional[int] = None, max_kv_len: Optional[int] = None) -> DecodeRoute:
         """The route of an ``s_q``-token step at this geometry under this record's ``policy`` (any ``s_q >= 1``; ``routes`` holds
         1 .. ``max_s_q`` + 1) -- the DENSE form's rule; under ``sparse_core`` the step runs the sparse core whatever this says.
         ``batch`` (appended) is the step's sequences: the default policy's prefill route needs the step to fill the part
-        (``DECODE_PREFILL_ROUTE_MIN_CTAS``), and ``routes`` is the reading without one (the small-batch route)."""
-        return decode_route(self._geometry, s_q, policy=self.policy or None, max_q_tile=self.q_tile_max, batch=batch)
+        (``DECODE_PREFILL_ROUTE_MIN_CTAS``), and ``routes`` is the reading without one (the small-batch route); ``max_kv_len``
+        (appended 2026-10-29) the declared KV bound the SM100 line's wide-launch rule reads with the batch.  The part is this record's
+        ``route_cc`` (:func:`_route_part` of the envelope's reading): cc 10.7 the Rubin table, cc 10.0 the SM100 twin, an unserved part /
+        no device the Rubin table (the home reading, listed as geometry facts)."""
+        return decode_route(
+            self._geometry, s_q, policy=self.policy or None, max_q_tile=self.q_tile_max, batch=batch, device_cc=self.route_cc, max_kv_len=max_kv_len
+        )
 
     _geometry: Optional["GatedAttentionBlockGeometry"] = None
     sparse_core: bool = False  # appended: stage (4) is the index-list sparse core over the pools (a QsaSpec geometry)
@@ -1116,6 +1285,9 @@ class DecodeEnvelope:
     sparse_tiles: Tuple[str, ...] = ()
     sparse_tile_lean_default: bool = False
     device_cc: Optional[Tuple[int, int]] = dataclasses.field(default=None, compare=False)  # the part :meth:`sparse_tile` reads the AUTO pin and the rule on
+    # appended (2026-10-29): the part ``routes`` / :meth:`route` were read for (:func:`_route_part` of ``device_cc``: a served part as itself,
+    # None = the Rubin table for an unserved part or no device -- the reading the declaration takes on that device too)
+    route_cc: Optional[Tuple[int, int]] = dataclasses.field(default=None, compare=False)
 
     def sparse_tile(
         self, s_q: int, batch: int, *, sparse_tile_form: str = "auto", decode_split_kv: Optional[int] = None, kv_cache_dtype: Optional[torch.dtype] = None
@@ -4594,10 +4766,73 @@ class _QkNormRope(_Stage):
         )
 
 
-# Rubin. The block is Rubin-only for now: the SDPA flavor it needs
-# ((256, 256) f16) exists on SM100 too, but nothing here has been validated
-# there, and serving an unvalidated arch silently is worse than declining it.
+# Rubin, the block's home part: every form.  The Rubin-only stages keep this literal -- the fused projection forks (sm_107a
+# renderings), the quantized SDPA rows, the sparse / QsaSpec / indexer machinery, the e4m3 cache, the backward.
 _SM107_CC = (10, 7)
+# The parts the block's DENSE bf16 / f16 INFERENCE forms are served on (2026-10-29) -- ONE tuple read by the SDPA stage's part gate, the
+# block's part rows, the envelope's part row, the test suite's markers and a serving stack's dispatch predicate (the #1999 pattern of one
+# constant for code and tests): cc 10.7 (every form, measured) and cc 10.0 (the SM100 line, B200 / GB200: the dense prefill form, the
+# EXTEND form and the DECODE form of the bf16 / f16 block through the shared SM100 d256 kernels -- the paged prefill tile with PackGQA,
+# the SM100 d256 decode tile and its split combine in the module's own forms --; functional only, UNMEASURED there, every Rubin-only
+# knob declined by name: fuse_gate (the sm100 row claims no gate epilogue), the fused projection forks, quant, save_for_backward,
+# thd=True over the block's own K / V, a QsaSpec geometry).  cc 10.3 (B300) runs the same SM100 kernels but is unproven through the
+# block: DECLINED BY NAME until its cells run (a served part has an accept row or a decline row, never neither).
+DENSE_SERVING_CCS: Tuple[Tuple[int, int], ...] = ((10, 7), (10, 0))
+# The Blackwell-line parts whose 32-COLUMN SM100 decode arm the block ROUTES (2026-10-29, the review follow-up of the cc 10.0 admission):
+# the SDPA adapter's own rule off cc 10.7 takes the 32-column decode tile (`sm100/decode_d256_f16.py` at N_Q 32) for 17 .. 32 packed rows
+# and for an UNPACKED step of 17 .. 32 tokens on a WIDE launch (config_sm100.d256_wide_decode_launch), but no cc 10.0 cell of the block
+# has run that arm (the 2026-10-29 cc 10.0 run read every DECODE cell at the small-launch reading: the 16-column tile packed / unpacked
+# and the paged prefill tile packed), so `decode_route` declines it by name on every part off this tuple -- EMPTY today.  The lift is this
+# tuple gaining (10, 0) together with the arm's accept cells (the one-tuple flip; the plumbing -- the wide readings, the adapter's
+# wide_launch -- stays in place behind the gate).  Read by `decode_route`, the suite's host rows and a serving stack's dispatch predicate.
+DECODE_WIDE_TILE_CCS: Tuple[Tuple[int, int], ...] = ()
+
+
+def _dense_part_decline(cc) -> Optional[str]:
+    """Why ``cc`` serves none of the block's DENSE bf16 / f16 forms -- the ONE part statement the SDPA stage raises, the envelope publishes
+    and the suite pins (None on a part of :data:`DENSE_SERVING_CCS`)."""
+    if cc is not None and tuple(int(x) for x in cc)[:2] in DENSE_SERVING_CCS:
+        return None
+    found = "no CUDA device" if cc is None else f"SM{int(cc[0])}{int(cc[1])}"
+    why = (
+        "gated_attention_block's dense bf16 / f16 forms are served on cc 10.7 (Rubin, SM107: every form) and cc 10.0 (SM100: the dense prefill, "
+        f"EXTEND and DECODE inference forms through the SM100 d256 decode / prefill tiles -- functional only, unmeasured); found {found}"
+    )
+    if cc is not None and tuple(int(x) for x in cc)[:2] == (10, 3):
+        why += " -- cc 10.3 runs the same SM100 kernels but is unproven through the block: declined by name until its cells run (2026-10-29)"
+    return why
+
+
+def _sparse_part_decline(cc) -> Optional[str]:
+    """Why ``cc`` serves none of the block's SPARSE forms -- a QsaSpec geometry on any ``kv_source`` (the sparse core, the lean tile THROUGH
+    THE BLOCK, the in-block indexer, the e4m3 cache): Rubin-only in this change, the lift named (None on cc 10.7)."""
+    if cc is not None and tuple(int(x) for x in cc)[:2] == _SM107_CC:
+        return None
+    found = "no CUDA device" if cc is None else f"SM{int(cc[0])}{int(cc[1])}"
+    return (
+        "gated_attention_block's sparse forms (a QsaSpec geometry: the index-list sparse core, the lean decode tile through the block, the "
+        "in-block indexer's sm_107a kernels, the e4m3 KV cache) are served on cc 10.7 (Rubin) only in this change; the standalone sparse "
+        "adapter's explicit lean tile on cc 10.0 / 10.3 (2026-10-29) needs its own cells THROUGH the block before the block admits it "
+        f"(the lift: those cells on a B200-class part); found {found}"
+    )
+
+
+def _route_part(cc) -> Optional[Tuple[int, int]]:
+    """The part the block's DECLARATION and its ENVELOPE read :func:`decode_route` (and the decode split model) for, from a device reading
+    ``cc``: a served part of :data:`DENSE_SERVING_CCS` as itself (cc 10.7 the Rubin table, cc 10.0 the SM100 twin); None -- the Rubin table,
+    the block's home reading -- for no CUDA device (a host-side declaration) and for a part that serves no form (``check_support`` / the
+    envelope decline it by name; its routes are listed as geometry facts, so the host rows of the suite read one table on every host).
+    ``decode_route(device_cc=)`` reads the same rule (one rule for the declaration, the envelope and the function; its ``device_cc``
+    readback is this value, None = the Rubin table), so the three readings agree on every part."""
+    if cc is None:
+        return None
+    cc = tuple(int(x) for x in cc)[:2]
+    return cc if cc in DENSE_SERVING_CCS else None
+
+
+def _route_device_cc(device) -> Optional[Tuple[int, int]]:
+    """:func:`_route_part` of the device's reading (:func:`_device_cc_of`)."""
+    return _route_part(_device_cc_of(device))
 
 
 def _bhsd_desc(b: int, h: int, s: int, d: int, dtype: torch.dtype, device, name: str, token_stride: int = 0) -> TensorDesc:
@@ -4671,7 +4906,11 @@ class _Sdpa(_Stage):
     ``(256, 256)`` flavor Qwen3.5 needs lands on
     ``sdpa/fwd/kernels/sm107/prefill_d256_f16.py`` (bf16 / f16) or, under
     ``pertensor_fp8=True``, ``prefill_d256_fp8.py`` (e4m3).  There is no flag to
-    pass; there IS an arch to check, which :meth:`check_support` does.
+    pass; there IS an arch to check, which :meth:`check_support` does: the
+    bf16 / f16 stage is served on the parts of :data:`DENSE_SERVING_CCS` (on
+    cc 10.0 the adapter's own SM100 kernels -- ``sm100/prefill_d256_f16.py``
+    dense / paged THD, ``sm100/decode_d256_f16.py`` over the pools --; 2026-10-29),
+    the quantized stage on cc 10.7 alone (the Rubin FP8 / MXFP8 d256 rows).
 
     **``fuse_gate=True`` is the SAME adapter with a gate descriptor.**  The
     sigmoid-gate epilogue -- a TMA-staged read of GATE and
@@ -4904,7 +5143,14 @@ class _Sdpa(_Stage):
                     raise ValueError(f"{self.name}: decode_split_kv must be >= 1, got {decode_split_kv}")
                 self.seq_lens_present = True  # the per-sequence KV lengths are mandatory over pools (the adapter's paged contract)
                 if self.decode_route is None:
-                    self.decode_route = decode_route(geometry, self.seq_len, batch=self.batch)
+                    # the stage's own reading: the part the block would read it for and the declared KV bound (the wide-launch rule)
+                    self.decode_route = decode_route(
+                        geometry,
+                        self.seq_len,
+                        batch=self.batch,
+                        device_cc=_route_device_cc(self.device),
+                        max_kv_len=self.max_kv_len or int(block_table_desc.shape[1]) * self.paged_page_size,
+                    )
                 if not self.decode_route.served:
                     raise NotImplementedError(f"{self.name}: {self.decode_route.reason}")
                 if self.decode_route.prefill_tile:
@@ -4934,11 +5180,13 @@ class _Sdpa(_Stage):
 
     @staticmethod
     def pdl_capable(route: Optional[DecodeRoute]) -> bool:
-        """Whether stage (4) takes the programmatic-dependent-launch switch on ``route``: the Rubin d256 decode tile and its split
-        combine carry the griddepcontrol pair (``DecodeRoute.decode_tile``); the paged d256 prefill tile (the DECODE form's prefill
-        route, the EXTEND form -- ``route`` None) and the dense prefill tiles (``kv_source="self"``: no route) do not, so the block
-        launches them plain and the link serializes -- correct by PDL's semantics (the successor's wait blocks on full completion).
-        ``DecodeRoute.pdl_capable`` is the same fact on the record."""
+        """Whether stage (4) takes the programmatic-dependent-launch switch on ``route``: the d256 decode tile and its split combine
+        carry the griddepcontrol pair on both served lines -- the Rubin tile (cc 10.7, the measured default) and the SM100 tile (cc 10.0,
+        where the block hands the EXPLICIT switch to it, asserted bitwise against the plain chain; the AUTO reading stays off there) --
+        (``DecodeRoute.decode_tile``); the paged d256 prefill tile (the DECODE form's prefill route, the EXTEND form -- ``route`` None)
+        and the dense prefill tiles (``kv_source="self"``: no route) do not, so the block launches them plain and the link serializes --
+        correct by PDL's semantics (the successor's wait blocks on full completion).  ``DecodeRoute.pdl_capable`` is the same fact on the
+        record."""
         return route is not None and route.decode_tile
 
     def _build_impl(self):
@@ -5146,7 +5394,14 @@ class _Sdpa(_Stage):
         or, before the twin existed, run a gate nobody wired at 2-4x the cost).
         Mirrors ``engines.mismatch()``: a row without the claim declines every
         head dim; a row claiming it with no shape set claims every flavor; a row
-        with no ``epilogue_gate_dtypes`` reads GATE in Q's dtype.
+        with no ``epilogue_gate_dtypes`` reads GATE in Q's dtype.  The three
+        pins read the Rubin row (the block's home row) on every device, as
+        before; AFTER them the DEVICE's row speaks where the device is a served
+        part other than Rubin (:meth:`_device_row_arch`, 2026-10-29): the sm100
+        f16 row claims no gate epilogue, so ``fuse_gate=True`` on cc 10.0 is
+        the typed decline here -- before the adapter's own refusal of a gate
+        descriptor off cc 10.7 -- and stage (5) runs as its own launch under
+        ``fuse_gate=False``.
         """
         g = self.geom
         caps = self._row_capabilities("sm107", self.fp8, self.mxfp8)
@@ -5181,6 +5436,29 @@ class _Sdpa(_Stage):
                 f"{self._family} SM107 SDPA engine row; got gate_dtype={gate_dtype}. "
                 "Pass gate_dtype= (the block's activation dtype) or use fuse_gate=False"
             )
+        arch = self._device_row_arch()
+        if arch != "sm107":
+            dev_caps = self._row_capabilities(arch, self.fp8, self.mxfp8)
+            dev_shapes = dev_caps.epilogue_gate_d_shapes
+            if not dev_caps.epilogue_gate or (dev_shapes is not None and (g.d_head, g.d_head) not in dev_shapes):
+                cc = _device_cc_of(self.device)
+                raise NotImplementedError(
+                    f"{self.name}: fuse_gate=True is not served by the {self._family} {arch.upper()} SDPA engine row (this device is cc "
+                    f"{cc[0]}.{cc[1]}: no gate epilogue on the SM100 d256 kernels, no gate in the SM100 line's split combine). Use fuse_gate=False "
+                    "(stage (5) runs as its own launch, after the decode tile's split combine or the paged / dense body)"
+                )
+
+    def _device_row_arch(self) -> str:
+        """The SDPA engine-row family this stage's DEVICE binds: ``"sm100"`` for a bf16 / f16 stage on a served part of
+        :data:`DENSE_SERVING_CCS` other than Rubin (cc 10.0: the sm100 f16 row), ``"sm107"`` on cc 10.7 and on every other reading (a
+        non-CUDA sample, an unserved part -- the block's home row, so a host-side declaration reads the Rubin claims as before and the
+        part gate speaks next) -- and for a QUANTIZED stage everywhere: the FP8 / MXFP8 pipelines bind the Rubin rows only and the part
+        rows decline them by name off cc 10.7 (``_check_part_support``, the stage's own gate), so their gate claims are read off the
+        Rubin row on every device, as before the cc 10.0 admission (the sm100 MXFP8 row's gate claim is not a fact of this block)."""
+        if self.fp8 or self.mxfp8:
+            return "sm107"
+        cc = _device_cc_of(self.device)
+        return "sm100" if cc is not None and cc != _SM107_CC and cc in DENSE_SERVING_CCS else "sm107"
 
     def check_support(self) -> None:
         # Geometry first, so the decline reads the same on every device (the
@@ -5201,9 +5479,17 @@ class _Sdpa(_Stage):
                     f"{self.name}: MXFP8 + fuse_gate needs the production adapter's `sample_gate` (the shared epilogue_gate hook); "
                     "this checkout's SdpaFwdDslSm100 has none. Use fuse_gate=False."
                 )
-        cc = torch.cuda.get_device_capability(self.device)
-        if tuple(cc) != _SM107_CC:
-            raise NotImplementedError(f"gated_attention_block targets Rubin (SM{_SM107_CC[0]}{_SM107_CC[1]}) only for now; found SM{cc[0]}{cc[1]}")
+        cc = _device_cc_of(self.device)
+        why = _dense_part_decline(cc)
+        if why is not None:
+            raise NotImplementedError(why)
+        if self.fp8 and cc != _SM107_CC:
+            # the quantized stage binds the Rubin FP8 / MXFP8 d256 rows (the block's quant pipelines are declined by name before this
+            # stage on cc 10.0; a standalone stage hears it here)
+            raise NotImplementedError(
+                f"{self.name}: the {'MXFP8' if self.mxfp8 else 'FP8'} SDPA stage binds the Rubin (cc 10.7) d256 {'MXFP8' if self.mxfp8 else 'per-tensor FP8'} "
+                f"row only; found SM{cc[0]}{cc[1]} -- the bf16 / f16 stage is the one served on this part (2026-10-29)"
+            )
         self._impl = self._build_impl()
         # The adapter's own contract check: the dense S % 128 split-KV decline and the
         # FP8 envelope, the gate descriptor's shape / dtype / TMA-expressible
@@ -5745,7 +6031,13 @@ class _SparseSdpa(_Stage):
 
         g = self.geom
         _check_qsa_geometry_against_record(g, self.dtype)
-        cc = tuple(torch.cuda.get_device_capability(self.device))
+        cc = _device_cc_of(self.device)
+        why = _sparse_part_decline(cc)
+        if why is not None:
+            # BEFORE the adapter (2026-10-29): the standalone adapter admits the EXPLICIT lean tile on cc 10.0 / 10.3 since #1999, but the
+            # block's sparse forms have no cells there -- the block declines by name rather than binding a route nobody validated through it
+            raise NotImplementedError(f"{self.name}: {why}")
+        cc = tuple(cc)
         ops = self._operands()
         self._ops = ops  # the declared forms: execute re-strides the unit dims of the bound views to them (below)
         self._impl = SparseGqaFwdDslSm107(
@@ -7878,9 +8170,13 @@ _DECODE_REQUIRES = (
     "decode_route_policy picks the single-unit route or the adapter's token units, decode_q_tile_max caps the tile's width table), the batch uniform",
     "paged_kv_page_size=P (a positive multiple of 16; validated at page_sizes)",
     "kv_source='paged'",
+    "a part of DENSE_SERVING_CCS: cc 10.7 (the Rubin d256 decode tile's width table, measured) or cc 10.0 (the SM100 d256 decode tile at 16 columns "
+    "and the paged prefill tile packed; its 32-column arm -- 17 .. 32 packed rows on a wide launch, an unpacked step of 17 .. 32 tokens -- declined by "
+    "name until its cells run, DECODE_WIDE_TILE_CCS; functional, unmeasured; decode_q_tile_max refused there)",
     "geometry.is_causal=True, geometry.causal_bottom_right=True, window_left=-1, window_right in (-1, 0), qsa=None, d_head=256",
     "sample_k_cache / sample_v_cache (the pools' [num_pages, H_kv, P, D] shape / dtype / strides) and sample_block_table ([B, max_pages] int32, any row stride)",
-    "bf16 / f16 activations (quant=None), save_for_backward=False, return_lse=False, token_capacity=None; fuse_gate rides the decode tile's split combine",
+    "bf16 / f16 activations (quant=None), save_for_backward=False, return_lse=False, token_capacity=None; fuse_gate rides the decode tile's split combine "
+    "on cc 10.7 and is a typed decline on cc 10.0 (the sm100 row claims no gate epilogue: fuse_gate=False, stage (5) its own launch)",
     "execute(block_table=, kv_lens=, k_cache=, v_cache=, slot_mapping=) with seq_lens=None (kv_lens binds the KV side only)",
 )
 _DECODE_DECLINE_NAMES = (
@@ -7988,9 +8284,11 @@ _EXTEND_REQUIRES = (
     "token_capacity=T_max (the samples' packed row count; a step hands lengths summing to T_live <= T_max)",
     "paged_kv_page_size=P (a positive multiple of 16; validated at page_sizes)",
     "kv_source='paged'",
+    "a part of DENSE_SERVING_CCS: cc 10.7 (measured) or cc 10.0 (the shared SM100 d256 paged THD body; functional, unmeasured)",
     "geometry.is_causal=True, geometry.causal_bottom_right=True, window_left=-1, window_right in (-1, 0), qsa=None, d_head=256",
     "sample_k_cache / sample_v_cache (the pools' [num_pages, H_kv, P, D] shape / dtype / strides) and sample_block_table ([B_max, max_pages] int32)",
-    "bf16 / f16 activations (quant=None), save_for_backward=False, return_lse=False; fuse_gate as declared (True folds stage (5) into the paged SDPA's epilogue)",
+    "bf16 / f16 activations (quant=None), save_for_backward=False, return_lse=False; fuse_gate as declared (True folds stage (5) into the paged SDPA's epilogue "
+    "on cc 10.7; a typed decline on cc 10.0, where the sm100 row claims no gate epilogue)",
 )
 
 
@@ -8090,7 +8388,14 @@ class GatedAttentionBlockFwd(APIBase):
     contribute nothing as long as they are FINITE, as a zero-initialized cache's are (a NaN there is ``0 x NaN``).  The
     typed declines are the same table's rows (:data:`_EXTEND_DECLINES`) a dense declaration can hit -- the diagonal, a
     window, another head dim, an LSE, a step wider than ``DECODE_MAX_ROWS`` -- and :meth:`serving_envelope`
-    publishes them with the route per ``S_q`` (``decode``).
+    publishes them with the route per ``S_q`` (``decode``).  **On cc 10.0 (2026-10-29; :data:`DENSE_SERVING_CCS`)** the same
+    form runs the SM100 d256 decode tile (``sm100/decode_d256_f16.py``) under the SM100 line's route (:func:`decode_route` with
+    ``device_cc``: the 16-column tile to 16 packed rows, the paged prefill tile packed for a group dividing 128, the 16-column tile
+    unpacked past them; the 32-column arm a wide launch would take is a typed decline until its cells run,
+    :data:`DECODE_WIDE_TILE_CCS`; no cap, no token units) with the split combine in the combine module's own forms (the decode-grid
+    pin is the cc 10.7 rule's; unmeasured on this line) and the gate as its own launch (``fuse_gate=True`` is a typed
+    decline there: the sm100 row claims no gate epilogue); PDL off by default (``DECODE_PDL_DEFAULT_CCS``), the explicit switch
+    served; functional only, unmeasured.
 
     **The block-sparse DECODE / extend-with-prefix mode (``kv_source="paged"`` on a dense ``[B, S_q]`` declaration of a
     ``QsaSpec`` geometry; bf16 / f16 inference, ``causal_bottom_right=True``; 2026-10-14)**: the same pipeline with stage (4)
@@ -9841,7 +10146,8 @@ class GatedAttentionBlockFwd(APIBase):
         ``fuse_cache_write``; ``TypeError`` otherwise).  Served on the dense DECODE form's UNFUSED chain with
         paged pools in the activation dtype (bf16 / f16, no quant, no indexer band, no e4m3 cache) when the TMA norm + RoPE kernel tiles the
         geometry; AUTO reads False everywhere else and an explicit True is a typed decline naming the reason.  Device-free (the arch half --
-        sm_90+ for the TMA kernel -- is the stage's ``check_support``; the dense DECODE form itself is served on cc 10.7 only)."""
+        sm_90+ for the TMA kernel -- is the stage's ``check_support``; the dense DECODE form itself is served on the parts of
+        :data:`DENSE_SERVING_CCS`)."""
         if requested is not None and not isinstance(requested, bool):
             raise TypeError(f"fuse_cache_write_small_m must be None (auto), True or False, got {type(requested).__name__}")
         if requested is None:
@@ -10565,7 +10871,19 @@ class GatedAttentionBlockFwd(APIBase):
             self.sparse_tile_form = form
             self.sparse_tile = None if form is None else (_H.SPARSE_TILE_LEAN if form == _H.SPARSE_TILE_FORM_LEAN else _H.SPARSE_TILE_TCGEN05)
             return kv_source, token_capacity, None, int(max_kv_len), split
-        route = decode_route(g, self.seq_len, policy=self.decode_route_policy, max_q_tile=self.decode_q_tile_max, batch=self.batch)
+        # the route on the PART the declaration will run on (a served part reads its own line's rule: the Rubin table on cc 10.7, the SM100
+        # twin on cc 10.0 with the declared KV bound for the wide-launch reading; a non-CUDA sample or an unserved part reads the Rubin
+        # table, the home reading -- check_support declines the part)
+        route_cc = _route_device_cc(device)
+        route = decode_route(
+            g,
+            self.seq_len,
+            policy=self.decode_route_policy,
+            max_q_tile=self.decode_q_tile_max,
+            batch=self.batch,
+            device_cc=route_cc,
+            max_kv_len=int(max_kv_len),
+        )
         if not route.served:
             raise NotImplementedError(f"kv_source='paged': {route.reason}")
         if route.prefill_tile and decode_split_kv is not None and int(decode_split_kv) > 1:
@@ -10577,7 +10895,9 @@ class GatedAttentionBlockFwd(APIBase):
         if decode_split_kv is None:
             dev = torch.device(device)
             sm = torch.cuda.get_device_properties(dev).multi_processor_count if (dev.type == "cuda" and torch.cuda.is_available()) else 0
-            split = decode_split_choice(route, batch=self.batch, h_kv=g.h_kv, max_kv_len=max_kv_len, sm_count=sm, gated=self.fuse_gate, h_q=g.h_q)
+            split = decode_split_choice(
+                route, batch=self.batch, h_kv=g.h_kv, max_kv_len=max_kv_len, sm_count=sm, gated=self.fuse_gate, h_q=g.h_q, device_cc=route_cc
+            )
         else:
             split = int(decode_split_kv)
         return kv_source, token_capacity, route, int(max_kv_len), split
@@ -10595,16 +10915,21 @@ class GatedAttentionBlockFwd(APIBase):
     ) -> ServingEnvelope:
         """The static serving envelope for ``(geometry, dtype, device)`` -- what a serving stack's INIT-time dispatch predicate
         reads instead of catching the block's exceptions.  Derived from the SAME code the constructor and ``check_support`` run:
-        the device fact (Rubin, cc 10.7, the one arch every stage binds), the CuTe DSL facts (the version floor and the Rubin
-        target, exactly as the stages' ``check_support`` gates them), the dtype (bf16 / f16 activations), and the geometry rows of
+        the device fact (the part: a dense geometry is served on the parts of :data:`DENSE_SERVING_CCS` -- cc 10.7, every form, and cc
+        10.0 since 2026-10-29 --, a QsaSpec geometry on cc 10.7 alone; the ONE statement the SDPA / sparse stages raise), the CuTe DSL
+        facts (the version floor and the Rubin target, exactly as the stages' ``check_support`` gates them), the dtype (bf16 / f16
+        activations), and the geometry rows of
         :data:`_EXTEND_DECLINES` (``diagonal``, ``window``, ``sparse``, ``head_dim``) evaluated on ``geometry`` for EACH paged form.
         The declaration rows (including ``return_lse`` and the EXTEND-only ``fuse_gate`` refusal) are listed in each form's
         ``declines``; a QsaSpec geometry meets the table's ``sparse`` row on both forms (:data:`_QSA_THD_DECLINE` only
         through a record without the packed arm).  Thus
         ``extend.served`` / ``decode.served`` are True iff a block declared as ``requires`` spells it passes its declaration and
         ``check_support`` here, and each form's ``declines`` lists every typed decline it raises at declaration with its message;
-        ``decode.routes`` names the kernel per ``S_q`` (:func:`decode_route`).  ``forms`` holds the served forms.  No allocation, no
-        launch; safe to call on any device (``served`` is simply False off Rubin; a non-CUDA ``device`` reads as no CUDA device).
+        ``decode.routes`` names the kernel per ``S_q`` (:func:`decode_route` read for the part, :func:`_route_part`: the Rubin table on
+        cc 10.7, the SM100 line's rule on cc 10.0, the Rubin table -- the home reading, geometry facts -- for an unserved part or no
+        device; the small-launch reading, ``decode.route(s_q, batch, max_kv_len)`` the one at a launch; ``decode.route_cc`` the part).
+        ``forms`` holds the served forms.  No allocation, no launch; safe to call on any device (``served`` is simply False off the
+        served parts; a non-CUDA ``device`` reads as no CUDA device).
         ``device_cc`` (appended) overrides the device's compute capability for a host-side reading of another part's envelope;
         ``decode_route_policy`` (appended) is the policy ``decode.routes`` / ``decode.route()`` are read under (``None`` = the default,
         :data:`DEFAULT_DECODE_ROUTE_POLICY`; ``decode.policy`` names it); ``decode_q_tile_max`` (appended) the width cap they are read
@@ -10623,11 +10948,10 @@ class GatedAttentionBlockFwd(APIBase):
         dsl_reason = cutedsl_requirement_error("the gated attention block's serving forms")
         if dsl_reason is None and cc == _SM107_CC:
             dsl_reason = cutedsl_arch_requirement_error(cc)
-        common = None
-        if cc != _SM107_CC:
-            common = (
-                f"gated_attention_block targets Rubin (SM{_SM107_CC[0]}{_SM107_CC[1]}) only; found {'no CUDA device' if cc is None else f'SM{cc[0]}{cc[1]}'}"
-            )
+        # the part row: the statement the stage raises -- the dense forms' part set for a dense geometry, Rubin alone for a QsaSpec one
+        common = _sparse_part_decline(cc) if geometry.qsa is not None else _dense_part_decline(cc)
+        if common is not None:
+            pass
         elif dsl_reason is not None:
             common = dsl_reason
         elif dtype not in (torch.bfloat16, torch.float16):
@@ -10686,10 +11010,11 @@ class GatedAttentionBlockFwd(APIBase):
             max_rows=DECODE_MAX_ROWS,
             # the declared envelope and its first decline, under the policy asked for
             routes=(
-                tuple(decode_route(geometry, s, policy=policy, max_q_tile=q_tile_max) for s in range(1, DECODE_MAX_S_Q + 2))
+                tuple(decode_route(geometry, s, policy=policy, max_q_tile=q_tile_max, device_cc=_route_part(cc)) for s in range(1, DECODE_MAX_S_Q + 2))
                 if (has_group and not sparse)
                 else ()
             ),
+            route_cc=_route_part(cc),
             _geometry=geometry,
             sparse_core=sparse,
             # the e4m3 cache (the gathered cast + the decode tile) is a form of the block-sparse decode mode with bf16 activations only --
@@ -10801,10 +11126,48 @@ class GatedAttentionBlockFwd(APIBase):
         this returned True is a bug HERE, not user error.
         """
         self._check_declaration()
+        self._check_part_support()
         for st in self._stages:
             st.check_support()
         self._is_supported = True
         return True
+
+    def _check_part_support(self) -> None:
+        """The PART rows of the declaration (``check_support``, after the device-free declaration checks and before any stage, so a
+        declaration on any host still builds and inspects; 2026-10-29): a QsaSpec geometry is declined by name off cc 10.7 (the sparse
+        core, the lean tile through the block, the indexer, the e4m3 cache: :func:`_sparse_part_decline`, raised here before the indexer
+        stages that precede the sparse SDPA); on a served DENSE part other than Rubin (:data:`DENSE_SERVING_CCS`) the Rubin-only pipelines
+        are declined by name, each message naming the check that lifts it -- ``quant`` (the FP8 / MXFP8 d256 SDPA rows and the sm_107a
+        projection forks), ``save_for_backward`` (the backward binds the Rubin d256 SDPA backward) and ``thd=True`` over the block's own
+        K / V (the nonpaged THD d256 arm has no cell through the block there; the EXTEND form IS served).  On cc 10.7 nothing; on an
+        unserved part nothing either -- the stages speak, the SDPA stage's part statement among them."""
+        cc = _device_cc_of(self.device)
+        if self.qsa is not None:
+            why = _sparse_part_decline(cc)
+            if why is not None:
+                raise NotImplementedError(why)
+            return
+        if cc is None or cc == _SM107_CC or cc not in DENSE_SERVING_CCS:
+            return
+        part = f"cc {cc[0]}.{cc[1]}"
+        if self.quant is not None:
+            raise NotImplementedError(
+                f"quant={type(self.quant).__name__} on {part}: the FP8 / MXFP8 pipelines bind the Rubin d256 FP8 / MXFP8 SDPA rows and the sm_107a "
+                "projection forks -- the bf16 / f16 block is the pipeline served on this part (the lift: the FP8-projection + bf16-attention mode, a "
+                "QuantSpec attribute that keeps stage (4) in bf16, with its cells on this part; 2026-10-29)"
+            )
+        if self.save_for_backward:
+            raise NotImplementedError(
+                f"save_for_backward=True on {part}: the block's backward binds SdpaBwdDslSm107 (the Rubin d256 SDPA backward), so the training "
+                "forward's record has no consumer on this part -- the inference forward (save_for_backward=False) is the form served here (the lift: a "
+                "backward binding for the SM100 d256 rows with its cells; 2026-10-29)"
+            )
+        if self.thd and self.kv_source != KV_SOURCE_PAGED:
+            raise NotImplementedError(
+                f"thd=True over the block's own K / V (kv_source='self') on {part}: the packed self-attention arm (the nonpaged THD d256 body) has no "
+                "cell THROUGH the block on this part yet -- the dense [B, S] form and the EXTEND form (thd=True with kv_source='paged') are the forms "
+                "served here (the lift: the packed oracle cells of the block's THD suite run on this part; 2026-10-29)"
+            )
 
     def _expected_weight_dtypes(self) -> dict:
         """``{"w_qkvg": dtype, "w_o": dtype}`` -- what each weight descriptor must carry.  ``h``'s dtype

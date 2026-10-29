@@ -318,7 +318,7 @@ sdpa/frost/test_sdpa_native_sink_binding.py::test_sink_contiguous_shapes_and_dea
 sdpa/frost/test_sdpa_native_sink_binding.py::test_sink_native_graph_rebind_and_replay[bfloat16-128-1-False]
 sdpa/frost/test_sdpa_native_sm120_binding.py::test_sm120_native_graph_envelopes_fresh_storage_and_replay[bfloat16-1-128-128]
 sdpa/frost/test_sdpa_native_sm120_binding.py::test_sm120_native_graph_sinks[248-256]
-sdpa/frost/test_sdpa_native_sm80_binding.py::test_sm80_actual_host_frame_matches_python[0.125-False--0.5-0-False-bfloat16]
+sdpa/frost/test_sdpa_native_sm80_binding.py::test_sm80_actual_host_frame_matches_python[0.125--0.5-0-False-bfloat16]
 sdpa/frost/test_sdpa_native_sm90_binding.py::test_dense_permutation_frames_match_python[False-permutation0-bfloat16]
 sdpa/frost/test_sdpa_native_sm90_binding.py::test_thd_fixed_batch_and_tensor_map_alignment
 sdpa/frost/test_sdpa_native_split_binding.py::test_native_split_frames_match_python_and_rebind[2-128-1-False-False-False-False-bfloat16]

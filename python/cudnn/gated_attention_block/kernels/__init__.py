@@ -1,12 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""FROST kernels of the gated attention block -- a FLAT package, Rubin (``sm_107a``) only.
+"""FROST kernels of the gated attention block -- a FLAT package, written for Rubin (``sm_107a``).
 
-The block targets one arch, so there is no arch sub-package here: arch is the
-ONLY axis that earns a directory (engine contract § 8) and a single arch earns
-none.  Every other axis -- stage, dtype family -- stays in the filename.  By
-stage of the pipeline in ``api.py``::
+The block was built for one arch, so there is no arch sub-package here: arch is
+the ONLY axis that earns a directory (engine contract § 8) and a single arch
+earns none.  Every other axis -- stage, dtype family -- stays in the filename.
+Since 2026-10-29 the block's dense bf16 / f16 inference forms also run on cc
+10.0 (``api.DENSE_SERVING_CCS``) through the kernels here that carry no arch pin
+(``proj_gemm`` over the sm100 GEMM family, the two norm + RoPE kernels,
+``cache_write``, ``elementwise``) and the shared SM100 SDPA kernels; the fused
+projection forks (``--gpu-arch sm_107a``), the quantize / indexer / sparse
+kernels stay Rubin-only and are declined by name there.  By stage of the
+pipeline in ``api.py``::
 
     proj_gemm.py                stages (1) and (6): plan records + runners over the
                                 RENDERED FROST GEMM template (writes no kernel)

@@ -195,6 +195,7 @@ prefill; a short query alone does not imply the D128 decode template.
 - **Default L0 coverage is not sufficient if the CI target excludes the provider.** Check the actual CI path and `-k` filters. The general Python target excludes FROST cases, so representative shared-API FROST tests also need collection under `sdpa/frost/`; `test_sdpa_ordered_bindings.py` reuses the shared ordered-binding smoke logic. Verify both target collection and execution on a supported GPU.
 - **Check for a module-level `pytestmark` before adding per-test markers.** Many files apply a level or capability marker file-wide (`pytestmark = ...` near the top); duplicating it on each test is noise, and suggesting it in review wastes a round-trip (recurred on PRs #814, #811, #797).
 - Gate on capability, don't assume it: skip via `check_support()` failures, `cudnn.backend_version()`, and `torch.cuda.get_device_capability()`.
+- If an optional import's `except ImportError` block ends before the test body, use `return pytest.skip(...)` to make the exit explicit. CodeQL can otherwise report the imported name as potentially uninitialized even though pytest raises a skip exception (PR #2042). Check the separate CodeQL alert result as well as the successful analysis workflow.
 - Test feature combinations through the support contract, not intersections of capability tables. The same head dimension can support gate and split on different paths while rejecting their combination. Assert acceptance/decline for concrete graph facts and requested knobs; avoid heuristic winner/order or timing goldens.
 - Shape-override windows and strict xfails measured on one native plan must also gate on the selected plan configuration. Negative geometry probes must allocate storage for every overridden row and use matching physical strides; an xfail does not contain an out-of-bounds GPU access.
 - Large physical-stride tests must handle allocation-time memory pressure: another xdist worker can consume free memory after `mem_get_info()`. The `gpu_exclusive` marker alone does not serialize ordinary xdist scheduling (the convention is the marker plus `@pytest.mark.xdist_group(name="gpu_exclusive")`, which `--dist loadgroup` runs on one worker; a test that deliberately wedges the GPU and the detector it is the control for must both carry it -- see the time-slicing lesson in python/cudnn/sdpa/AGENTS.md). Catch `torch.OutOfMemoryError` only around the large test-storage allocation and skip for unavailable resources; never catch the launch or numerical assertions. Retain a successful physical run with sufficient memory.
@@ -448,17 +449,16 @@ is lazy. Preserve reference helper ASTs when moving them.
 
 ### Prepared quantized launch probes
 
-When testing a retained staging path, choose a declaration that the graph
-validator accepts but the native pointer layout declines. A nonunit D stride
-is rejected before SDPA lowering; unit D with an unaligned outer pitch reaches
-the existing dense conversion path. `test_staged_rebind_stream_capture` in
-`test_sdpa_bwd_staged_sm100.py` guards its row padding and forbids legacy tensor
-compilation/DLPack while checking changed allocations and replay.
+Native dense SDPA data ports use aligned pitches and must not acquire hidden
+layout copies. `test_native_rebind_stream_capture` in
+`test_sdpa_bwd_native_layouts_sm100.py` guards padding and forbids legacy tensor
+compilation/DLPack while checking changed allocations and replay. Unaligned
+outer pitches are negative admission cases, not a request for staging.
 
 Optional gradients copied from accumulators after a prepared launch still need
 presence, dtype and extent checks before any staging write. They can be absent
 from the pointer ABI, so the common binder cannot validate them. The detector
-is `test_staged_auxiliary_outputs_validate_before_writes` (SM80 backward):
+is `test_native_auxiliary_outputs_validate_before_writes` (SM80 backward):
 forbid copy/zero/launch and pass malformed or uncompiled dBias/dSink outputs.
 
 Test both graph prepared-plan admission and the standalone adapter's compiler
@@ -562,23 +562,22 @@ After moving a wrapper to a prepared host, forbid the old tensor launcher
 after warmup and check fresh bindings plus changed-input graph replay. Keep
 physical stride and product-overflow probes on every native flavor, with
 wrapped addresses poisoned inside allocated guard storage.
-`test_sdpa_sm80_thd_forward_prepared.py` exercises both properties. Removing
-THD tensor fakes must also preserve the dense off-flavor/RoPE fallback.
+`test_sdpa_sm80_thd_forward_prepared.py` exercises both properties. Dense padded widths retain native strides; unsupported RoPE declarations
+must decline before compilation.
 
 
-### SM80 staged pointer launches
+### SM80 native pointer launches
 
-A pointer host can follow existing layout staging without changing that
-staging's numerical contract. Keep off-flavor and RoPE references, mutate
-angle tables after capture, and forbid `cutlass.cute.runtime.from_dlpack`
-after warmup so a return to tensor launch plumbing fails independently of
-numerical output. `test_dense_staged_pointer_launch_and_rope_replay` was
-RED on the old tensor launcher for both dtypes and both template families.
+Aligned dense and packed layouts execute through native pointer chains. Before
+removing a staging fallback, make its entry points raise and run the SM80 suites.
+Retain gradient/output references, current-pointer rebinding, launch-count checks
+and fresh-process artifacts. RoPE declarations decline during preparation.
+`test_dense_native_replay_or_rope_decline` checks this boundary.
 
 Trailing-dimension and contiguity checks do not prove that a broadcast input
 has a live batch slice: `(0, H, SQ, SKV)` passes both for an empty bias. Reject
 it before workspace writes or pointer binding; the `bias_tensor-empty_batch`
-case in `test_dense_staged_rejects_invalid_operands_before_staging` is the
+case in `test_dense_native_rejects_invalid_operands_before_launch` is the
 RED-then-green detector. A compiler-memo test must also rebuild the wrapper
 on its second call: clear the wrapper cache while retaining the compiler memo,
 then forbid JIT. Reusing the same adapter cannot test compiler reuse.
@@ -617,7 +616,7 @@ entry signature and delegate internally; do not assume the absent operand is
 removed from the exported call ABI. Exercise both native and staged routes,
 including a fresh-process artifact reload. For staged THD output padding,
 test the bounded cast/fold with physical wide output strides as well as the
-input staging; `test_staged_packed_physical_stride` covers both stride and
+input staging; `test_native_packed_physical_stride` covers both stride and
 index-product overflow with allocated guard storage.
 
 Prepared host migrations must preserve persistent compiled artifacts as well as
@@ -654,9 +653,10 @@ failure and an output that was simultaneously required and forbidden.
 For fixed-geometry staged pointer hosts, validate Q/K/V/O shape, dtype and device,
 and all auxiliary bindings before workspace carving or any copy/fill. A tensor
 compiler previously checked some of these at dispatch; raw addresses cannot.
-The SM80 detector `test_dense_staged_rejects_invalid_operands_before_staging`
-replaces the workspace carver with a tripwire so an invalid short buffer fails
-safely before it can reach a GPU launch.
+The SM80 detector `test_dense_native_rejects_invalid_operands_before_launch`
+replaces the launch function with a tripwire to check invalid operands before
+launch. `test_sm80_revalidates_every_current_operand[short]` separately checks
+that a short backing-storage span is rejected.
 
 For a GEMM+GLU failure, compare the final output with both the stored GEMM
 intermediate and an independent dot product before attributing it to GEMM.
@@ -989,6 +989,14 @@ only overrides must equal the fixed graph geometry. Run the existing prepared
 backward replay, auxiliary-output, artifact-cache and physical wide-address
 suites as well as the new native-route tests.
 
+For a fixed backward host, gradient overlap uses the declared address sets
+and current pointers, including when a graph carrier is a noncontiguous view.
+The host does not consume that carrier's strides. Reinterpreting its layout
+only in the overlap guard changes the graph contract and can reject legal
+interleaved outputs. `test_gradient_overlap_uses_declared_graph_addresses`
+checks both acceptance and rejection without overrides; explicit mismatched
+geometry overrides must still fail before launch.
+
 SM90 native binding retains the host's natural-unit scale slot, including zero
 and negative specializations. Its dense layout predicate covers permutations;
 THD preserves fixed batch and 128-byte tensor-map workspace alignment. Derive
@@ -1024,7 +1032,7 @@ SM80 graph operands are raw storage under graph declarations; standalone Stats
 may be flat, and bias uses the first contiguous [H,SQ,SKV] plane. Keep these
 contracts distinct from explicit geometry overrides. The actual-host frame and
 GPU detectors are `test_sdpa_native_sm80_binding.py`; the existing prepared SM80
-suite checks physical Int64 addressing and the staged/RoPE path stays separate.
+suite checks physical Int64 addressing and RoPE declarations decline before compilation.
 
 Per-tensor FP8 split binders must use the selected host's partial dtype, not the
 final output dtype: SM120 writes half partial slabs even when final O is FP8;
@@ -1157,3 +1165,21 @@ rejects legal future appends. Source-call pins must distinguish positional
 operands from appended keyword arguments (use the AST); a final keyword does
 not move the last positional operand. The SDPA field-order and FP8 THD fold
 pins exercise these cases.
+
+
+### Native SM80 packed wrapper widths
+
+The covering MMA flavor and the logical QK/V widths are distinct. Keep each
+logical load bound when removing wrapper padding; marking a partial Q/K width
+as even reads poisoned head slack. `test_sdpa_sm80_thd_native_widths.py` checks
+independent widths, gapped strides, original input pointers, native kernel counts
+and changed-input/prefix replay. Its graph cases include QK<V in dense and THD.
+Compact head-major Stats pitch is the dynamic packed capacity; preserve that
+symbolic pitch when keying a compiled artifact. Fixed inter-head padding is a
+separate stride, not additional logical rows or required final-head storage.
+The wrapper capacity-reuse tests forbid compilation after capacities change;
+`test_sdpa_sm80_native_wrappers.py` retains fresh-process artifact checks while
+forbidding normalization and rejecting unsupported inner strides before launch.
+Its singleton-Stats case uses T=H=1 with zero, compact and padded head pitches:
+both packings classify the same element, but the token-major binder requires
+exact strides, so the wrapper must retain the head-major ABI for unused pitches.

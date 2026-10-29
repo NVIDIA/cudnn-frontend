@@ -157,8 +157,8 @@ sdpa/frost/test_sdpa_bwd_mxfp8_sm107.py::test_reject_sink	rule: first L0 cell of
 sdpa/frost/test_sdpa_bwd_prepared_mxfp8.py::TestPreparedMxfp8Bwd::test_rebind_and_explicit_stream_replay[False]	rule: first L0 cell of test_rebind_and_explicit_stream_replay
 sdpa/frost/test_sdpa_bwd_prepared_mxfp8.py::TestPreparedMxfp8Bwd::test_warm_execute_has_no_tensor_plumbing[False]	rule: first L0 cell of test_warm_execute_has_no_tensor_plumbing
 sdpa/frost/test_sdpa_bwd_stage3_block_scale_sm107.py::test_block_scale_thd_leg_sf_prefix_contract_and_operand_refusals	rule: first L0 cell of test_block_scale_thd_leg_sf_prefix_contract_and_operand_refusals
-sdpa/frost/test_sdpa_bwd_staged_copy_sm100.py::test_staged_execute_uses_prepared_copies[dtype0]	rule: first L0 cell of test_staged_execute_uses_prepared_copies
-sdpa/frost/test_sdpa_bwd_staged_sm100.py::test_staged_rebind_stream_capture[roles0-264-4-False-dtype0]	rule: first L0 cell of test_staged_rebind_stream_capture
+sdpa/frost/test_sdpa_bwd_native_execution_sm100.py::test_native_execute_uses_current_pointers[dtype0]	rule: first L0 cell of test_native_execute_uses_current_pointers
+sdpa/frost/test_sdpa_bwd_native_layouts_sm100.py::test_native_rebind_stream_capture[roles0-264-4-False-dtype0]	rule: first L0 cell of test_native_rebind_stream_capture
 sdpa/frost/test_sdpa_bwd_thd_fp8_sm107.py::test_capabilities_claim_thd_and_a_ragged_bottom_right	rule: first L0 cell of test_capabilities_claim_thd_and_a_ragged_bottom_right
 sdpa/frost/test_sdpa_bwd_thd_fp8_sm107.py::test_fp8_thd_serves_the_external_delta	rule: first L0 cell of test_fp8_thd_declines_the_external_delta
 sdpa/frost/test_sdpa_bwd_thd_mxfp8_sm107.py::test_capabilities_claim_thd_with_declared_totals	rule: first L0 cell of test_capabilities_claim_thd_with_declared_totals
@@ -212,7 +212,7 @@ sdpa/frost/test_sdpa_native_sink_binding.py::test_sink_contiguous_shapes_and_dea
 sdpa/frost/test_sdpa_native_sink_binding.py::test_sink_native_graph_rebind_and_replay[bfloat16-128-1-False]	rule: first L0 cell of test_sink_native_graph_rebind_and_replay
 sdpa/frost/test_sdpa_native_sm120_binding.py::test_sm120_native_graph_envelopes_fresh_storage_and_replay[bfloat16-1-128-128]	rule: first L0 cell of test_sm120_native_graph_envelopes_fresh_storage_and_replay
 sdpa/frost/test_sdpa_native_sm120_binding.py::test_sm120_native_graph_sinks[248-256]	rule: first L0 cell of test_sm120_native_graph_sinks
-sdpa/frost/test_sdpa_native_sm80_binding.py::test_sm80_actual_host_frame_matches_python[0.125-False--0.5-0-False-bfloat16]	rule: first L0 cell of test_sm80_actual_host_frame_matches_python
+sdpa/frost/test_sdpa_native_sm80_binding.py::test_sm80_actual_host_frame_matches_python[0.125--0.5-0-False-bfloat16]	rule: first L0 cell of test_sm80_actual_host_frame_matches_python
 sdpa/frost/test_sdpa_native_sm90_binding.py::test_dense_permutation_frames_match_python[False-permutation0-bfloat16]	rule: first L0 cell of test_dense_permutation_frames_match_python
 sdpa/frost/test_sdpa_native_sm90_binding.py::test_thd_fixed_batch_and_tensor_map_alignment	rule: first L0 cell of test_thd_fixed_batch_and_tensor_map_alignment
 sdpa/frost/test_sdpa_native_split_binding.py::test_native_split_frames_match_python_and_rebind[2-128-1-False-False-False-False-bfloat16]	rule: first L0 cell of test_native_split_frames_match_python_and_rebind
@@ -266,3 +266,10 @@ sdpa/frost/test_tile_dsl_exp2_emul.py::test_exp2_emul_pair_matches_the_model_bit
 sdpa/frost/test_tile_dsl_q_loop_bounds.py::test_q_loop_bounds_match_reference[m0-W0-br0-R0-tq64-512x512]	rule: first L0 cell of test_q_loop_bounds_match_reference
 sdpa/frost/test_tile_dsl_sf_layout.py::test_atom_offset_matches_the_oracle_swizzle[128-4]	rule: first L0 cell of test_atom_offset_matches_the_oracle_swizzle
 sdpa/frost/test_tile_dsl_sf_layout.py::test_helper_traces_on_int32_and_matches_the_host[16]	rule: first L0 cell of test_helper_traces_on_int32_and_matches_the_host
+gated_attention_block/cutedsl/test_block_serving_decode.py::test_sm100_decode_matches_the_oracle_at_every_group_and_s_q[1-6]	gated block DECODE form, cc 10.0 | SM100 d256 decode tile, 16 columns, the group packed | split combine (module's own forms) | separate gate
+gated_attention_block/cutedsl/test_block_serving_decode.py::test_sm100_decode_matches_the_oracle_at_every_group_and_s_q[3-6]	gated block DECODE form, cc 10.0 | SM100 decode tile UNPACKED (6 KV streams) | separate gate
+gated_attention_block/cutedsl/test_block_serving_decode.py::test_sm100_decode_matches_the_oracle_at_every_group_and_s_q[2-16]	gated block DECODE form, cc 10.0 | the paged prefill tile with the group packed (the THD paged binding at the dense envelope)
+gated_attention_block/cutedsl/test_block_serving_decode.py::test_sm100_the_explicit_pdl_switch_is_served_and_bitwise_the_plain_chain	gated block DECODE form, cc 10.0 | the explicit use_pdl=True chain (the SM100 tile + combine with their griddepcontrol pair) bitwise the plain one
+gated_attention_block/cutedsl/test_block_serving_extend.py::test_sm100_extend_matrix_cell[bf16-hnd-16]	gated block EXTEND form, cc 10.0 | the shared SM100 d256 paged THD body, unsplit, unpacked | write-through before it
+gated_attention_block/cutedsl/test_block_end_to_end.py::test_matches_the_fp32_oracle[256-norm]	gated block dense prefill form, cc 10.0 | bf16 | S=256 | qk_norm (the sm100 d256 dense body)
+gated_attention_block/cutedsl/test_block_end_to_end.py::test_dead_rows_do_not_poison_the_gate	gated block dense prefill form, cc 10.0 | the padded dense arm (a dead entry) | the separate gate after the dead-row select

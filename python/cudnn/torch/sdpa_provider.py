@@ -228,13 +228,19 @@ def _varlen_fwd_out(out, query, key, value, cu_seq_q, cu_seq_k, max_q, max_k, is
             False, scale=scale, window_size_left=ws[0], window_size_right=ws[1],
             seqused_k=seqused_k, block_table=block_table, num_splits=num_splits,
         )  # fmt: skip
-    o, lse, _rng = _varlen_fwd(
-        query, key, value, cu_seq_q, cu_seq_k, max_q, max_k,
-        is_causal=is_causal, scale=scale, window_size=window_size, enable_gqa=enable_gqa,
-        seqused_k=seqused_k, block_table=block_table, num_splits=num_splits,
+    is_causal, window_right = _fa_window_right_to_cudnn(is_causal, ws[1])
+    calls["fwd"] += 1
+    attn_scale = scale if scale is not None else query.shape[-1] ** -0.5
+    # Below the dispatcher: write O straight into the caller's `out` (no extra O copy).
+    o, stats = _cudnn_ops._sdpa_fwd_impl(
+        query, key, value, attn_scale,
+        is_causal=is_causal, window_left=_fa_window_left_to_cudnn(ws[0]), window_right=window_right,
+        cu_seqlens_q=cu_seq_q, cu_seqlens_kv=cu_seq_k,
+        max_seqlen_q=max_q, max_seqlen_kv=max_k, return_lse=True, _out=out,
     )  # fmt: skip
-    out.copy_(o)
-    return lse
+    if o.data_ptr() != out.data_ptr():  # `out` not declarable as-is (_out_bindable)
+        out.copy_(o)
+    return stats.squeeze(-1).transpose(0, 1).contiguous()  # (T,H,1) -> (H,T) flash convention
 
 
 def _varlen_bwd(grad_out, query, key, value, out, lse, cu_seq_q, cu_seq_k, max_q, max_k, is_causal, rng_state, scale=None, window_size=None,):  # fmt: skip

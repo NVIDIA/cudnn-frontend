@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Persistent artifact ownership for the large-head dense conversion chain."""
+"""Persistent artifact ownership for the large-head native strided chain."""
 
 import json
 import os
@@ -16,7 +16,7 @@ pytestmark = [pytest.mark.L0, requires_dsl, requires_pre_rubin_blackwell]
 
 
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
-def test_staged_artifact_fresh_process(dtype, tmp_path):
+def test_native_artifact_fresh_process(dtype, tmp_path):
     child = r"""
 import json, sys
 from pathlib import Path
@@ -29,18 +29,16 @@ assert Path(cudnn.__file__).resolve() == Path(package).resolve(), cudnn.__file__
 sys.path[:0] = [tests, str(Path(tests).parents[1])]
 if reload == "1":
     def forbidden(*a, **kw):
-        raise AssertionError("staged backward invoked JIT while reloading its artifact")
+        raise AssertionError("native backward invoked JIT while reloading its artifact")
     cute.compile = forbidden
 owners = []
-original = prepared_sm100.compile_staged
+original = prepared_sm100.compile_plan
 def record(*args):
     result = original(*args)
-    owners.append(result.spec.artifact.entry)
-    owners.extend(entry[0] for entry in result.launches if entry is not None)
-    owners.extend(single[0] for entry in result.launches if entry is not None for single in entry[3])
+    owners.append(result.artifact.entry)
     return result
-prepared_sm100.compile_staged = record
-from test_sdpa_bwd_staged_sm100 import _case, _check
+prepared_sm100.compile_plan = record
+from test_sdpa_bwd_native_layouts_sm100 import _case, _check
 case = _case(dtype=getattr(torch, dtype))
 assert owners
 if reload == "1":

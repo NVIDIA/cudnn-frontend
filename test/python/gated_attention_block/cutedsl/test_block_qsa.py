@@ -398,7 +398,7 @@ def test_decode_indexer_declines_are_published_row_by_row_and_the_envelope_names
     assert dense.index_sources == () and dense.index_page_sizes == () and dense.index_query_rows_max == 0 and dense.fuse_prepare_default is False
     assert GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=(10, 0)).decode.fuse_prepare_default is False  # an unmeasured part
     assert not (set(tokens) & set(dense.declines))
-    assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-13:] == [
+    assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-14:] == [  # the append-only tail: route_cc after device_cc (2026-10-29)
         "index_sources",
         "index_cache_dtypes",
         "index_head_dims",
@@ -412,6 +412,7 @@ def test_decode_indexer_declines_are_published_row_by_row_and_the_envelope_names
         "sparse_tiles",
         "sparse_tile_lean_default",
         "device_cc",
+        "route_cc",
     ]
 
 
@@ -736,19 +737,27 @@ def test_an_indexer_declaration_builds_the_indexer_stage_and_the_execute_contrac
             and bool((dst[:, :299] > dst[:, 1:300]).all())
         )
     if torch.cuda.is_available():
-        # Off Rubin the block declines before any launch, and WHICH stage speaks depends on the part: below cc 10 the indexer
-        # stage (it precedes the sparse SDPA) names the scorer's device family; on a cc 10.x part other than Rubin (B200 / GB300)
-        # the indexer ACCEPTS -- the scorer is an SM100-family kernel -- and the sparse adapter's record declines, naming the
-        # found cc.  Both texts on every GPU host through a simulated capability (restored on exit), then the real device.
-        for sim_cc, pattern in (((9, 0), r"qsa_indexer: .*\(cc 10\.x\).*found cc 9\.0"), ((10, 0), r"Rubin-line GPU.*got cc 10\.0")):
+        # Off Rubin the block declines before any launch.  Since the cc 10.0 admission of the dense forms (2026-10-29) the FIRST word
+        # on any other part is the block's SPARSE PART STATEMENT (`_check_part_support`, before any stage: the sparse forms -- the
+        # core, the lean tile through the block, the indexer, the e4m3 cache -- are served on cc 10.7 only, the lift named), below
+        # and beside Rubin alike.  The stages' own gates still speak when asked directly: below cc 10 the indexer stage names the
+        # scorer's device family; on a cc 10.x part other than Rubin the sparse stage repeats the part statement AHEAD of the
+        # adapter (whose record would admit the explicit lean tile there since #1999).  Every text on every GPU host through a
+        # simulated capability (restored on exit), then the real device.
+        part = r"sparse forms .* served on cc 10\.7 \(Rubin\) only"
+        for sim_cc, stage, stage_pattern in (
+            ((9, 0), blk._indexer, r"qsa_indexer: .*\(cc 10\.x\).*found cc 9\.0"),
+            ((10, 0), blk._sdpa, part + r".*found SM100"),
+        ):
             with pytest.MonkeyPatch.context() as mp:
                 mp.setattr(torch.cuda, "get_device_capability", lambda *a, _cc=sim_cc, **k: _cc)
-                with pytest.raises(NotImplementedError, match=pattern):
+                with pytest.raises(NotImplementedError, match=part + rf".*found SM{sim_cc[0]}{sim_cc[1]}"):
                     blk.check_support()
+                with pytest.raises(NotImplementedError, match=stage_pattern):
+                    stage.check_support()
         cc = tuple(torch.cuda.get_device_capability())
         if cc != (10, 7):
-            pattern = rf"Rubin-line GPU.*got cc {cc[0]}\.{cc[1]}" if cc[0] == 10 else r"cc 10\.x"
-            with pytest.raises(NotImplementedError, match=pattern):
+            with pytest.raises(NotImplementedError, match=part + rf".*found SM{cc[0]}{cc[1]}"):
                 blk.check_support()
 
 
@@ -905,13 +914,17 @@ def test_a_legal_sparse_declaration_builds_the_sparse_stage_and_the_arch_gate_re
                 pytest.skip(str(_CUTEDSL_REQUIREMENT))  # the stages ahead import their CuTe DSL kernels to answer check_support()
             cc = tuple(torch.cuda.get_device_capability())
             if cc != (10, 7):
-                # a cc 10.x part other than Rubin hears the record's Rubin-line decline; below cc 10 the gather4 part floor
-                # (tile_dsl.requirements, cc 10.0+) answers one gate EARLIER, naming the instruction's floor, not the record
-                pattern = rf"Rubin-line GPU.*got cc {cc[0]}\.{cc[1]}" if cc[0] >= 10 else r"requires a cc 10\.0\+ part"
-                with pytest.raises(NotImplementedError, match=pattern):
+                # since the cc 10.0 admission of the dense forms (2026-10-29) a part other than Rubin hears the block's SPARSE PART
+                # STATEMENT first -- the block-level part row before any stage, then the sparse stage's own gate ahead of the adapter
+                # (whose record would admit the explicit lean tile on cc 10.0 / 10.3) -- naming the lift; the record's Rubin-line
+                # decline and the gather4 part floor are the standalone adapter's words there
+                part = rf"sparse forms .* served on cc 10\.7 \(Rubin\) only.*found SM{cc[0]}{cc[1]}"
+                with pytest.raises(NotImplementedError, match=part):
                     blk.check_support()
-                assert not blk._is_supported
-                assert blk._sdpa._impl is not None and blk._sdpa._impl._module is None  # declined before any kernel module was loaded
+                assert not blk._is_supported and blk._sdpa._impl is None  # declined before the stage was asked: no adapter, no kernel module
+                with pytest.raises(NotImplementedError, match=part):
+                    blk._sdpa.check_support()  # the stage on its own: the same statement, before the adapter is built
+                assert blk._sdpa._impl is None
             else:
                 assert blk.check_support() and blk._is_supported
     # The fused projection fork's own decline is geometry-first (reads the same on every device).
@@ -1146,6 +1159,10 @@ def test_the_dsl_floor_declines_through_the_block_before_any_kernel_import(monke
     if not torch.cuda.is_available():
         pytest.skip("the block's check_support reads the device capability")
     geom = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec())
+    # the block's part rows (its own, then the sparse stage's, both before the adapter) precede the floor check since the cc 10.0
+    # admission of the dense forms (2026-10-29): on a part other than Rubin they would answer first, so the probe reads a cc 10.7
+    # device throughout (the sm_107a half below needs the same substitution)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 7))
     blk = GatedAttentionBlockFwd(**_samples(geom), geometry=geom)
     monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.6.2")))
     with pytest.raises(NotImplementedError, match=re.escape("found 4.6.2")):
@@ -1153,7 +1170,6 @@ def test_the_dsl_floor_declines_through_the_block_before_any_kernel_import(monke
     assert blk._sdpa._impl is not None and blk._sdpa._impl._module is None, "the kernel module must not be loaded below the floor"
     monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.8.0")))
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 7))
     blk2 = GatedAttentionBlockFwd(**_samples(geom), geometry=geom)
     with pytest.raises(NotImplementedError, match="sm_107a"):
         blk2.check_support()

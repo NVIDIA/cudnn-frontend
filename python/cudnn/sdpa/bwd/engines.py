@@ -315,6 +315,9 @@ class Capabilities:
     # Appended for positional compatibility; no graph parsing, kernel imports,
     # allocation or compilation. The row supplies the verdict from pure facts.
     declaration_check: Optional[Callable[["ga.SdpaGraphFacts", Any], Optional[str]]] = None
+    # Logical Q/K and V widths are independently masked within a covering
+    # flavor; neither equality nor D_QK >= D_V is required. Append-only.
+    independent_head_dims: bool = False
 
 
 def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: Any = None) -> Optional[str]:
@@ -360,10 +363,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
             else "per-tensor FP8 (sdpa_fp8_backward)" if capabilities.is_fp8 else "half (fp16/bf16) sdpa_backward"
         )
         return f"this engine serves only {quant} graphs"
-    if capabilities.dqk_ge_dv:
+    if capabilities.dqk_ge_dv and not capabilities.independent_head_dims:
         if facts.d_qk < facts.d_v:
             return f"D_QK must be >= D_V; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
-    elif facts.d_qk != facts.d_v:
+    elif not capabilities.independent_head_dims and facts.d_qk != facts.d_v:
         return f"D_QK must equal D_V; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
     if capabilities.d_envelope:
         if max(facts.d_qk, facts.d_v) > max(capabilities.d):
@@ -983,7 +986,7 @@ def _sm80_spec() -> EngineSpec:
             d_envelope=True,  # flavor envelopes; masked native loads
             d_pad_multiple=8,
             declaration_check=graph_mismatch,
-            dqk_ge_dv=True,  # bprop kernel constraint relaxed to D_QK >= D_V
+            independent_head_dims=True,  # logical widths inside covering MMA flavors
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             gqa=True,
             causal=True,
@@ -1014,6 +1017,23 @@ def _sm80_spec() -> EngineSpec:
         ),
         lower=partial(lower_dsl_bwd, api_type=_SM80),
     )
+
+
+def _sm100_dense_layout_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
+    """Use the standalone native TMA admission for each dense data port."""
+    if facts.thd:
+        return None
+    from types import SimpleNamespace
+    from .prepared_sm100 import native_io_layout
+
+    ports = {name.lower(): (tuple(dim), tuple(stride)) for name, dim, stride in facts.port_layouts}
+    for name in ("q", "k", "v", "o", "do", "dq", "dk", "dv"):
+        geometry = ports.get(name)
+        # Synthetic capability probes may omit descriptors. Real graphs carry
+        # every data port, and the analyzer already checks their dense cover.
+        if geometry is not None and not native_io_layout(SimpleNamespace(shape=geometry[0], stride=geometry[1])):
+            return f"{name} requires non-overlapping dense strides with D stride 1 and 16-byte outer pitches"
+    return None
 
 
 def _sm100_spec() -> EngineSpec:
@@ -1077,11 +1097,8 @@ def _sm100_spec() -> EngineSpec:
             gqa=True,  # per-Q-head dK/dV partials + the shared dkv_reduce group fold
             thd=True,
             thd_declared_totals=True,  # the blocked workspace is sized at build time
-            # Any dense layout: the adapter uses a BSHD-physical tensor in place
-            # (a permuted view, zero copy) and stages a non-conforming one
-            # through the workspace. That is not hypothetical -- a caller that
-            # builds dO as torch.randn(o.shape) instead of empty_like(o) loses
-            # o's memory format and hands over a BHSD-contiguous dO.
+            # Independent native B/H/S nesting and aligned padding; no layout copies.
+            declaration_check=_sm100_dense_layout_mismatch,
             layouts=frozenset({"bshd", "dense_flex"}),
         ),
         lower=partial(lower_dsl_bwd, api_type=_SM100),
@@ -1785,7 +1802,7 @@ def _sm107_d512_spec() -> EngineSpec:
     to 256 / 128 and masked), dense, top-left and bottom-right causal, right-band widening, sliding window (left), MHA / GQA /
     MQA, BSHD-physical io, contiguous fp32 Stats, bf16 / fp16.  Declined on day one, each asserted by a test
     (``test_sdpa_bwd_d512_sm107.py``) and flipped only with a board-run accept + tracker line: THD / ragged (the SM100 row
-    serves it; the packed path has not run on cc 10.7), ``dense_flex`` staging layouts, dense padding masks, sink / dSink,
+    serves it; the packed path has not run on cc 10.7), graph ``dense_flex`` layouts, dense padding masks, sink / dSink,
     bias / dBias, deterministic, decode.
 
     Rule 7: the public DSL 4.7.0 lacks ``sm_107a``; the adapter's ``check_support`` declines through
@@ -1809,7 +1826,7 @@ def _sm107_d512_spec() -> EngineSpec:
             right_band_widening=True,
             gqa=True,  # per-Q-head dK/dV partials + the shared dkv_reduce group fold
             decode=False,  # prefill chain: a 256-row q cluster per stage-2 work item
-            layouts=frozenset({"bshd"}),  # dense_flex staging is the SM100 row's claim; unvalidated on cc 10.7
+            layouts=frozenset({"bshd"}),  # broader graph layouts remain unvalidated on cc 10.7
         ),
         lower=partial(lower_dsl_bwd, api_type=_SM107_D512),
     )

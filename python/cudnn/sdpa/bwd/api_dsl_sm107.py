@@ -276,7 +276,8 @@ from cudnn.sdpa.bwd import config_d256_2x2 as _cfg2x2
 from cudnn.sdpa.bwd import config_sm107 as _cfg
 from cudnn.sdpa.bwd import prepared_sm107 as _prepared
 from cudnn.frost.tile_dsl.thd import THD_BWD_MAPS_META_WORDS
-from cudnn.sdpa.bwd.api_dsl import SdpaBwdDsl, _SM100_MATMUL_FILE, _sm100_device_clusters, _sm100_kernel_path
+from cudnn.sdpa.bwd.api_dsl import SdpaBwdDsl, _SM100_MATMUL_FILE, _sm100_kernel_path
+from cudnn.sdpa.bwd.config_sm100 import _sm100_device_clusters
 from cudnn.sdpa.bwd.config_sm100 import (
     CAUSAL_K_HI,
     CAUSAL_K_LO,

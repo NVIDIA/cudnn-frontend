@@ -123,6 +123,8 @@ def _sigmoid_lines(x_var: str, tag: str) -> tuple[list[str], str]:
 
 _CMP_OPS = ("cmp_eq", "cmp_neq", "cmp_gt", "cmp_ge", "cmp_lt", "cmp_le")
 
+_CMP_PY_OPS = {"cmp_eq": "==", "cmp_neq": "!=", "cmp_gt": ">", "cmp_ge": ">=", "cmp_lt": "<", "cmp_le": "<="}
+
 _LOGIC_OPS = ("logical_and", "logical_or")
 
 _BACKWARD_OPS = (
@@ -145,6 +147,12 @@ def _emit_binary_ext(op: FusionOp, a_expr: str, b_expr: str, idx: int, new: str)
     attrs = dict(op.attrs)
 
     if op.op in _CMP_OPS:
+        if op.compute_dtype == "fp32":
+            # Compare natively (arith.cmpf: ordered OEQ/OGT/OGE/OLT/OLE, unordered UNE) to keep IEEE
+            # semantics. The step form below gets NaN operands and equal infinities wrong: a - b is NaN
+            # there, and the NaN-ignoring max/min turn that NaN into 0. Only int32 compute still reaches
+            # the step form, and it does not build there (the DSL's floor takes floating-point types only).
+            return lines + [f"{new} = cutlass._mlir_helpers.vector.where({a} {_CMP_PY_OPS[op.op]} {b}, {_fl(a, 1.0)}, {_fl(a, 0.0)})"], new
         if op.op == "cmp_le":
             step, v = _step01(f"{b} - {a}", f"_{idx}")
             return lines + step + [f"{new} = {v}"], new
@@ -198,7 +206,8 @@ def _emit_binary_ext(op: FusionOp, a_expr: str, b_expr: str, idx: int, new: str)
             lines += l2 + [f"_rmu{idx} = {m} * ({_fl(b, 1.0)} - {s2})"]
             m = f"_rmu{idx}"
         if slope is not None:
-            lines.append(f"_rf{idx} = {m} + {_fl(b, slope)} * ({_fl(b, 1.0)} - {m})")
+            # cuDNN RELU_BWD: the slope applies only where x <= lower (s1); x >= upper has zero gradient.
+            lines.append(f"_rf{idx} = {m} + {_fl(b, slope)} * {s1}")
             m = f"_rf{idx}"
         return lines + [f"{new} = {a} * {m}"], new
 
@@ -272,24 +281,31 @@ def _emit_op(
     if op.op == "identity":
         return [], prev
 
+    # relu (every slope / clip form), leaky_relu and elu keep a NaN input NaN, as torch does and as the frontend
+    # requests for RELU_FWD (CUDNN_PROPAGATE_NAN). The DSL's default max/min (maxnum/minnum) return the non-NaN
+    # operand, which turned NaN into 0 or lower_clip; propagate_nan=True lowers to arith.maximumf/minimumf. The
+    # binary max/min ops keep the default, which matches native cuDNN (eng10) MAX/MIN.
     if op.op == "relu":
         ra = dict(op.attrs)
         if not ra:
-            return [f"{new} = cute.math.max({prev}, cutlass.full_like({prev}, {_compute_literal(op.compute_dtype, 0)}))"], new
+            return [f"{new} = cute.math.max({prev}, cutlass.full_like({prev}, {_compute_literal(op.compute_dtype, 0)}), propagate_nan=True)"], new
         slope, lower, upper = ra.get("negative_slope"), ra.get("lower_clip"), ra.get("upper_clip")
         rl = [f"_r{idx} = {prev}"]
         rv = f"_r{idx}"
         if slope is not None:
-            rl.append(f"_rk{idx} = cute.math.max({rv}, {_fl(rv, 0.0)}) + {_fl(rv, slope)} * cute.math.min({rv}, {_fl(rv, 0.0)})")
+            # cuDNN RELU_FWD: x < lower ? lower + slope * (x - lower) : x, with lower defaulting to 0.
+            # lower_clip is where the slope starts, not a clamp applied after it.
+            lo = 0.0 if lower is None else lower
+            shifted = rv if lo == 0.0 else f"({rv} - {_fl(rv, lo)})"
+            rl.append(
+                f"_rk{idx} = cute.math.max({rv}, {_fl(rv, lo)}, propagate_nan=True) + {_fl(rv, slope)} * cute.math.min({shifted}, {_fl(rv, 0.0)}, propagate_nan=True)"
+            )
             cur = f"_rk{idx}"
-            if lower is not None:
-                rl.append(f"_rl{idx} = cute.math.max({cur}, {_fl(rv, lower)})")
-                cur = f"_rl{idx}"
         else:
-            rl.append(f"_rl{idx} = cute.math.max({rv}, {_fl(rv, lower if lower is not None else 0.0)})")
+            rl.append(f"_rl{idx} = cute.math.max({rv}, {_fl(rv, lower if lower is not None else 0.0)}, propagate_nan=True)")
             cur = f"_rl{idx}"
         if upper is not None:
-            rl.append(f"_ru{idx} = cute.math.min({cur}, {_fl(rv, upper)})")
+            rl.append(f"_ru{idx} = cute.math.min({cur}, {_fl(rv, upper)}, propagate_nan=True)")
             cur = f"_ru{idx}"
         return rl + [f"{new} = {cur}"], new
 
@@ -297,13 +313,13 @@ def _emit_op(
         slope = dict(op.attrs).get("negative_slope", 0.0)
         return [
             f"_lr{idx} = {prev}",
-            f"{new} = cute.math.max(_lr{idx}, {_fl(f'_lr{idx}', 0.0)}) + {_fl(f'_lr{idx}', slope)} * cute.math.min(_lr{idx}, {_fl(f'_lr{idx}', 0.0)})",
+            f"{new} = cute.math.max(_lr{idx}, {_fl(f'_lr{idx}', 0.0)}, propagate_nan=True) + {_fl(f'_lr{idx}', slope)} * cute.math.min(_lr{idx}, {_fl(f'_lr{idx}', 0.0)}, propagate_nan=True)",
         ], new
 
     if op.op == "elu":
         return [
             f"_el{idx} = {prev}",
-            f"{new} = cute.math.max(_el{idx}, {_fl(f'_el{idx}', 0.0)}) + cute.math.exp2(cute.math.min(_el{idx}, {_fl(f'_el{idx}', 0.0)}) * cutlass.full_like(_el{idx}, {_LOG2E}), fastmath=True) - {_fl(f'_el{idx}', 1.0)}",
+            f"{new} = cute.math.max(_el{idx}, {_fl(f'_el{idx}', 0.0)}, propagate_nan=True) + cute.math.exp2(cute.math.min(_el{idx}, {_fl(f'_el{idx}', 0.0)}, propagate_nan=True) * cutlass.full_like(_el{idx}, {_LOG2E}), fastmath=True) - {_fl(f'_el{idx}', 1.0)}",
         ], new
 
     if op.op == "softplus":
@@ -321,12 +337,14 @@ def _emit_op(
 
     if op.op == "gen_index":
         axis = dict(op.attrs).get("axis")
+        # An int32-compute index comes straight from the Int32 coordinate: Float32 rounds indices above 2**24.
+        idx_t = DTYPE_TO_CUTLASS[op.compute_dtype]
         if axis == 1:
-            return [f"{new} = cutlass.full_like({prev}, cutlass.Float32(row))"], new
-        gl = [f"_gi{idx} = cute.make_rmem_tensor({vsize}, cutlass.Float32)"]
+            return [f"{new} = cutlass.full_like({prev}, {idx_t}(row))"], new
+        gl = [f"_gi{idx} = cute.make_rmem_tensor({vsize}, {idx_t})"]
         for k in range(vsize):
             _, col = _elem_coord(k)
-            gl.append(f"_gi{idx}[{k}] = cutlass.Float32({col})")
+            gl.append(f"_gi{idx}[{k}] = {idx_t}({col})")
         gl.append(f"{new} = _gi{idx}.load().to_vector()")
         return gl, new
 
@@ -476,11 +494,29 @@ def _emit_op(
     raise AssertionError(f"unhandled op {op.op!r}")
 
 
+# int8 / uint8 values round to nearest even and saturate, NaN to 0 (cvt.rni.sat), as cuDNN's native engines store
+# them. A bare .to() lowers to fptosi / trunci, which round toward zero and keep the low byte (2.75 -> 2, 300 -> 44).
+_INT8_RANGES: dict[str, tuple[int, int]] = {"int8": (-128, 127), "uint8": (0, 255)}
+
+
 def _emit_round(var: str, out_dtype: Dtype, tag: str, *, source_dtype: Dtype = "fp32") -> tuple[list[str], str]:
     """Round a register value to its declared dtype."""
     if out_dtype == "fp32" and source_dtype == "fp32":
         return [], var
     new = f"_r_{tag}"
+    if out_dtype in _INT8_RANGES and source_dtype in ("fp32", "int32"):
+        lo, hi = _INT8_RANGES[out_dtype]
+        sat = f"_sat_{tag}"
+        if source_dtype == "int32":
+            lo_i, hi_i = _compute_literal("int32", lo), _compute_literal("int32", hi)
+            lines = [f"{sat} = cute.math.min(cute.math.max({var}, cutlass.full_like({var}, {lo_i})), cutlass.full_like({var}, {hi_i}))"]
+        else:
+            # max(x, 0) + min(x, 0) is x, or 0 for NaN: max / min return the non-NaN operand.
+            lines = [
+                f"{sat} = cute.math.max({var}, {_fl(var, 0.0)}) + cute.math.min({var}, {_fl(var, 0.0)})",
+                f"{sat} = cute.math.min(cute.math.max(cute.math.roundeven({sat}), {_fl(sat, lo)}), {_fl(sat, hi)})",
+            ]
+        return lines + [f"{new} = ({sat}).to({DTYPE_TO_CUTLASS[out_dtype]})"], new
     lines = [f"{new} = ({var}).to({DTYPE_TO_CUTLASS[out_dtype]})"]
     if out_dtype == "fp32" and source_dtype == "int32":
         lines.append(f"{new} = {new} + cutlass.full_like({new}, 0.0)")
@@ -967,13 +1003,14 @@ def _emit_pointwise_dag(chain, *, vsize, bounded, aux_load_expr, gemm_out_dtype=
         if scatter and op.op == "gen_index":
             token_axis = 2 if isinstance(chain.moe, MoeSwapAbSpec) else 1
             if dict(op.attrs).get("axis") == token_axis:
+                idx_t = DTYPE_TO_CUTLASS[op.compute_dtype]
                 if token_axis == 1:
-                    lines = [f"{cur} = cutlass.full_like({parent_var}, cutlass.Float32(moe_scatter_row(token_index, token_ks, row, group_end, M, moe_top_k)))"]
+                    lines = [f"{cur} = cutlass.full_like({parent_var}, {idx_t}(moe_scatter_row(token_index, token_ks, row, group_end, M, moe_top_k)))"]
                 else:
                     lines = [
-                        f"_gi{i} = cute.make_rmem_tensor(vsize, cutlass.Float32)",
+                        f"_gi{i} = cute.make_rmem_tensor(vsize, {idx_t})",
                         "for _sk in cutlass.range_constexpr(vsize):",
-                        f"    _gi{i}[_sk] = cutlass.Float32(moe_scatter_row(token_index, token_ks, col_j + _sk, group_end, N, moe_top_k))",
+                        f"    _gi{i}[_sk] = {idx_t}(moe_scatter_row(token_index, token_ks, col_j + _sk, group_end, N, moe_top_k))",
                         f"{cur} = _gi{i}.load().to_vector()",
                     ]
         body_lines.extend(lines)
@@ -1071,11 +1108,19 @@ def _emit_block_quant_row(
     return lines
 
 
-def _emit_reduction_avg_inverse(red_idx: int, red: ReductionSpec, chain: FusionChain) -> list[str]:
-    """Generate AVG normalization from runtime extents."""
+def _emit_reduction_avg_inverse(red_idx: int, red: ReductionSpec, chain: FusionChain, *, token_extent: str | None = None) -> list[str]:
+    """Generate AVG normalization from runtime extents.
+
+    A MoE kernel's token extent is the routed capacity, but its groups cover only the rows below the
+    final offset. ``token_extent`` names that used-row count for an ungrouped AVG over the token axis;
+    ``None`` divides by the capacity."""
     extents = ["M", "N"]
-    if chain.has_moe and red.grouped_by_moe:
-        extents[1 if isinstance(chain.moe, MoeSwapAbSpec) else 0] = "cutlass.Int32(group_end) - cutlass.Int32(group_begin)"
+    if chain.has_moe:
+        token_axis = 1 if isinstance(chain.moe, MoeSwapAbSpec) else 0
+        if red.grouped_by_moe:
+            extents[token_axis] = "cutlass.Int32(group_end) - cutlass.Int32(group_begin)"
+        elif token_extent is not None:
+            extents[token_axis] = token_extent
     factors = [f"cutlass.Float32({extent})" for dim, extent in zip(red.dim[1:], extents) if dim == 1]
     if not chain.has_moe and red.dim[0] == 1 and chain.matmul.batch != 1:
         factors.append(f"cutlass.Float32({float(chain.matmul.batch)})")
@@ -1105,6 +1150,7 @@ _SHARED_EXPORTS = {
     "_nonzero01": _nonzero01,
     "_sigmoid_lines": _sigmoid_lines,
     "_CMP_OPS": _CMP_OPS,
+    "_CMP_PY_OPS": _CMP_PY_OPS,
     "_LOGIC_OPS": _LOGIC_OPS,
     "_BACKWARD_OPS": _BACKWARD_OPS,
     "_emit_binary_ext": _emit_binary_ext,

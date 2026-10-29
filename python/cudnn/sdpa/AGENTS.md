@@ -34,6 +34,13 @@ padded Stats are different contracts.**
   `stats_layout`-parametrized THD tests (`test_dsl_sm100_thd_stats` and
   siblings) in `test/python/sdpa/frost/`.
 
+Packed graph Stats can also arrive as a `(T, H, 1)` carrier for either packing.
+Validate its token/head strides and capacity against the declaration, then bind
+the same storage without copying. The SM80 detector
+`test_graph_thd_independent_pitches_rebind_replay` covers both carrier forms,
+fresh pointers, changed-length replay, and pre-launch rejection of short or
+incorrectly pitched carriers.
+
 An explicitly padded Stats output is a separate existing forward contract:
 when Stats has no ragged offset, eligible rows with `thd_padded_stats=True` address
 its declared `(B, H, S_max)` strides even when Q/O are THD. FlashInfer prefill's
@@ -294,10 +301,12 @@ Native backward gradient outputs must not overwrite each other.
   the result against an address-set oracle with mixed layouts, different block
   widths and both pointer orders. Measure large declarations without walking
   every row per bind.
-- Detectors: `test_sm80_gradient_overlap_rejected_before_entry`,
-  `test_sm80_shared_gradient_storage_matches_address_oracle`, and
+- Detectors: `test_native_gradient_overlap_rejected_before_entry`,
+  `test_native_shared_gradient_storage_matches_address_oracle`, and
   `test_native_overlapping_gradients_rejected_before_writes`. Preserve the
-  existing legal interleaved-gradient and staged copy-order tests.
+  existing legal interleaved-gradient tests. When retiring a staged copy-order
+  path, replace its overlap case with a pre-launch rejection test that guards
+  the same output and workspace storage.
 
 **Rule S6 — A kernel feature lands on every arch line's test file, and its
 other-arch lowerings are smoke-compiled from whatever GPU you have.**
