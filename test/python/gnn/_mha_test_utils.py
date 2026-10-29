@@ -12,8 +12,9 @@ from cudnn.gnn import CscGraph
 def _require_gnn_mha(variant: str) -> None:
     if not hasattr(cudnn, f"gnn_mha_{variant}_forward") or not hasattr(cudnn, f"gnn_mha_{variant}_backward"):
         pytest.skip(f"cudnn-frontend was built without cudnnGnnMha{variant.title().replace('_', '')} support")
-    if cudnn.backend_version() < 92800:
-        pytest.skip("GAT and GATv2 require cuDNN 9.28.0 or newer")
+    minimum_version = 92900 if variant == "simple" else 92800
+    if cudnn.backend_version() < minimum_version:
+        pytest.skip(f"GNN MHA {variant} requires cuDNN {minimum_version // 10000}.{(minimum_version // 100) % 100}.0 or newer")
 
 
 def _tolerances(dtype: torch.dtype) -> tuple[float, float]:
@@ -135,3 +136,56 @@ def _reference_gat_v2(
     attention = torch.stack(attention_rows)
     output = torch.cat(head_outputs, dim=1) if concat_heads else torch.stack(head_outputs).mean(dim=0)
     return (output, attention)
+
+
+def _reference_mha_simple(
+    graph: CscGraph,
+    key_features: torch.Tensor,
+    query_features: torch.Tensor,
+    value_features: torch.Tensor,
+    edge_features: Optional[torch.Tensor],
+    score_bias: Optional[torch.Tensor],
+    score_weight: Optional[torch.Tensor],
+    dropout_mask: Optional[torch.Tensor],
+    num_heads: int,
+    concat_heads: bool,
+    norm_by_dim: bool,
+):
+    offsets = graph.offsets.cpu().tolist()
+    dim_node = key_features.shape[1]
+    dim_head = dim_node // num_heads
+    map_csc_to_coo = graph.map_csc_to_coo
+    attention_rows = []
+    head_outputs = []
+    for head in range(num_heads):
+        per_dst = []
+        per_edge = torch.zeros(graph.num_edges, device=key_features.device, dtype=torch.float32)
+        feature_slice = slice(head * dim_head, (head + 1) * dim_head)
+        for dst in range(graph.num_dst_nodes):
+            begin, end = offsets[dst], offsets[dst + 1]
+            source_rows = graph.indices[begin:end].long()
+            csc_rows = torch.arange(begin, end, device=key_features.device)
+            edge_rows = csc_rows if map_csc_to_coo is None else map_csc_to_coo[begin:end].long()
+            key = key_features[source_rows, feature_slice]
+            query = query_features[dst, feature_slice]
+            value = value_features[source_rows, feature_slice]
+            if edge_features is not None:
+                edge = edge_features[edge_rows, feature_slice]
+                key = key + edge
+                value = value + edge
+            logits = (key * query).sum(dim=-1).float()
+            if score_weight is not None:
+                logits = logits * score_weight[head, csc_rows]
+            if norm_by_dim:
+                logits = logits / dim_head**0.5
+            if score_bias is not None:
+                logits = logits + score_bias[head, csc_rows]
+            coefficients = torch.softmax(logits, dim=0)
+            per_edge = per_edge.index_copy(0, edge_rows, coefficients)
+            aggregation = coefficients if dropout_mask is None else coefficients * dropout_mask[head, edge_rows]
+            per_dst.append((aggregation.to(value.dtype).unsqueeze(1) * value).sum(dim=0))
+        attention_rows.append(per_edge)
+        head_outputs.append(torch.stack(per_dst))
+    attention = torch.stack(attention_rows)
+    output = torch.cat(head_outputs, dim=1) if concat_heads else torch.stack(head_outputs).mean(dim=0)
+    return output, attention
