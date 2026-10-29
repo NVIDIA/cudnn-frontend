@@ -3399,6 +3399,60 @@ def test_sm120_scope_gates() -> None:
         assert [t for t, _c in candidates(nmaj) if t.pipeline == "sm120"], in_dt
 
 
+# MaxSharedMemoryPerBlockOptin of the SM 12.x parts, the budget the sm120 catalog is swept against.
+_SM120_OPTIN_SMEM_BYTES = 99 * 1024
+
+
+@pytest.mark.parametrize("kind", ["dense", "moe", "moe_swap_ab"])
+def test_sm120_single_gemm_tile_without_an_ab_stage_declines_at_probe(kind, monkeypatch) -> None:
+    """A single-GEMM tile whose only AB stage the template gives up to its
+    transposed-STG epilogue staging is declined by the probe, the JIT and the
+    engine's knob replay with the same NotImplementedError -- not admitted by the
+    probe and then failed in the DSL trace ("num_elems must be at least 1"). The
+    SMEM budget is pinned to the SM 12.x opt-in, so the case is the same on every
+    part the sm120 pipeline runs on."""
+    from dataclasses import replace
+
+    from cudnn.engines import MANIFEST
+    from cudnn.gemm.frost import tile_config
+    from cudnn.gemm.frost.knobs import GemmKnobs
+    from cudnn.gemm.frost.sm120 import compiler as C120
+    from test_moe_grouped_matmul_fwd import _build_graph as _build_moe_graph
+
+    monkeypatch.setattr(tile_config, "_sm_smem_budget_bytes", lambda device=None: _SM120_OPTIN_SMEM_BYTES)
+
+    def graph():
+        return _build_graph(512, 512, 512, "bf16", "bf16") if kind == "dense" else _build_moe_graph(2, 512, 512, 256)
+
+    def config(name):
+        return replace(by_name(name), swap_ab=True) if kind == "moe_swap_ab" else by_name(name)
+
+    # The budget holds one 64-KiB AB stage of the first tile, and the template gives it
+    # up to the 16896-B staging; only an explicit config or a knob record names that
+    # tile. The staging leaves the catalog's second tile exactly one stage.
+    empty, one_stage = "CONFIG_sm120_256x256x128_16x16x32_cluster1x1_warps4x2", "CONFIG_sm120_256x128x128_16x16x32_cluster1x1_warps4x2"
+    assert by_name(empty) not in CATALOG and by_name(one_stage) in CATALOG
+    cfg = config(empty)
+    declined = "leaves no AB pipeline stage"
+    with pytest.raises(NotImplementedError, match=declined):
+        C120.probe_supported(graph(), cfg)
+    with pytest.raises(NotImplementedError, match=declined):
+        C120.jit_from_cudnn_graph(graph(), config=cfg)
+    C120.probe_supported(graph(), config(one_stage))
+
+    if active_family() != "sm120":
+        return  # the knob replay builds through the active tree's compiler
+    g = graph()
+    g.validate()
+    g.build_operation_graph()
+    (row,) = [r for r in MANIFEST if r.name == "frost_gemm"]
+    g.create_execution_plan(row.engine_id, GemmKnobs.from_config(cfg).to_public())
+    g.select_plan(g.get_execution_plan_count() - 1)
+    g.check_support()
+    with pytest.raises(NotImplementedError, match=declined):
+        g.build_plans()
+
+
 def test_sm120_epi_vec_clamp_and_stg_only() -> None:
     """sm120 always renders the transposed-STG epilogue, with the chunk capped
     at the 8-element fragment row run; the sm100 derivation is untouched."""
@@ -4224,6 +4278,45 @@ def test_splitk_epilogue_reduction():
     ref = torch.relu(torch.einsum("bmk,bnk->bmn", a.float(), b.float()).to(torch.bfloat16).float())
     assert torch.equal(out, ref.to(torch.bfloat16))
     assert out_am.flatten()[0] == ref.abs().amax()
+
+
+def _splitk_tile_reduction_graph(batch, mode):
+    """relu + one fp32 reduction over all of M and N (per batch when ``batch`` > 1)."""
+    M, N, K = 256, 256, 4096
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[batch, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[batch, K, N], stride=[K * N, 1, K])
+    R = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="r")
+    R.set_output(True)
+    red = g.reduction(input=R, mode=mode, name="red")
+    red.set_dim([batch, 1, 1]).set_stride([1, 1, 1])
+    red.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    return g
+
+
+@requires_sm120
+@pytest.mark.parametrize("batch", (1, 2), ids=("scalar", "per_batch"))
+@pytest.mark.parametrize("mode", ("ADD", "AVG", "NORM1"))
+def test_splitk_declines_tile_invariant_fp32_sum(monkeypatch, mode, batch):
+    """An explicit split-K config declines an fp32 sum over all of M and N, as the automatic pick does.
+
+    The reducer adds such a sum with one same-address atomic per output vector, so its rounding drifts
+    with the vector count: a constant-input AVG at 3000x3000x1024 came back 2.8% low at split 2 (1.5e-5
+    unsplit). AMAX is exact under atomics and keeps the explicit split."""
+    from dataclasses import replace
+
+    from cudnn.gemm.frost import compiler
+
+    def no_render(src):
+        pytest.fail("a declined split-K config must not render a kernel")
+
+    monkeypatch.setattr(compiler, "_import_kernel", no_render)
+    with pytest.raises(NotImplementedError, match=f"fp32 {mode.lower()} reduction over all of M and N"):
+        _jit_splitk(_splitk_tile_reduction_graph(batch, getattr(cudnn.reduction_mode, mode)), 2)
+    summed = analyze(_splitk_tile_reduction_graph(batch, getattr(cudnn.reduction_mode, mode)))
+    assert compiler._auto_split_k(summed, _splitk_cfg(), sm_count=188).split_k_slices == 1
+    amax = analyze(_splitk_tile_reduction_graph(batch, cudnn.reduction_mode.AMAX))
+    compiler.probe_chain(amax, replace(_splitk_cfg(), split_k_slices=2))
 
 
 def test_splitk_auto_select():
