@@ -357,6 +357,9 @@ _E2E_ENABLED = bool(PARAMS.exp2_fma_split) and ((PARAMS.d_flavor != 64 and (_E2E
 _D64_EARLY_SOFTMAX_HANDOFF = bool(
     _E2E_ENABLED and _E2E_D64_INTERIOR and CFG.TILE_M == 128 and CFG.TILE_N == 128 and CFG.TILES_Q == 2 and CFG.S_SLOTS == 1 and CFG.Q_IN_TMEM == 0
 )
+# The SM100 D64/CGA1 schedule benefits from one max tree across both score
+# chunks before alpha publication. Keep other geometries on their existing tree.
+_D64_JOINT_ROW_MAX = _D64_EARLY_SOFTMAX_HANDOFF and CFG.CTA_MMA == 1
 _E2E_EMULATED_COLS = (_E2E_LIMIT // _E2E_FREQ) * _E2E_RES if _E2E_ENABLED else 0
 if _E2E_ENABLED:
     if not (0 <= _E2E_RES <= _E2E_FREQ and _E2E_FREQ % 2 == 0 and _E2E_RES % 2 == 0 and _E2E_LIMIT % _E2E_FREQ == 0):
@@ -2498,7 +2501,12 @@ def _softmax_kv_body(
             )
             for c in range(N_CHUNKS)
         ]
-        chunks_max = [row_max_reduction(chunks_S[c]) for c in range(N_CHUNKS)]
+        if cutlass.const_expr(_D64_JOINT_ROW_MAX):
+            chunks_max = [
+                row_max_reduction(cutlass.Vector.from_elements(tuple(chunks_S[c][i] for c in range(N_CHUNKS) for i in range(CHUNK)), cutlass.Float32))
+            ]
+        else:
+            chunks_max = [row_max_reduction(chunks_S[c]) for c in range(N_CHUNKS)]
         from cudnn.frost.tile_dsl.regtile import vec_concat
 
         # vec_concat handles single-element lists too; keeps tracer Vector type uniform across N_CHUNKS.
@@ -2542,7 +2550,12 @@ def _softmax_kv_body(
             )
             for c in range(N_CHUNKS)
         ]
-        chunks_max = [row_max_reduction(raw_chunks[c]) for c in range(N_CHUNKS)]
+        if cutlass.const_expr(_D64_JOINT_ROW_MAX):
+            chunks_max = [
+                row_max_reduction(cutlass.Vector.from_elements(tuple(raw_chunks[c][i] for c in range(N_CHUNKS) for i in range(CHUNK)), cutlass.Float32))
+            ]
+        else:
+            chunks_max = [row_max_reduction(raw_chunks[c]) for c in range(N_CHUNKS)]
         reg_S_vec = vec_concat(raw_chunks)
         current_max_unscaled = chunks_max[0]
         for m in chunks_max[1:]:
