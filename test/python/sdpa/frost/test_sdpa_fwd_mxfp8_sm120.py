@@ -38,6 +38,7 @@ from typing import NamedTuple, Optional
 
 import pytest
 import torch
+import cudnn
 
 from test_utils import torch_fork_set_rng
 
@@ -641,7 +642,7 @@ def test_mxfp8_sm120_split_kv_graph_head_dims(d_qk, d_v):
 def test_mxfp8_sm120_graph_native_layout(layout, out_dt):
     """Aligned padded and BHSD layouts bind natively; byte-unaligned pitches decline."""
     if layout == "unaligned_pitch":
-        with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="q: native dense forward.*16-byte outer-stride alignment"):
+        with pytest.raises(cudnn.cudnnGraphNotSupportedError, match=r"q: native dense forward.*16-byte outer-stride alignment"):
             _run(2, 4, 2, 200, 330, out_dt=out_dt, layout=layout, sdpa_kwargs=_MASKS["causal"])
         return
     _check(_run(2, 4, 2, 200, 330, out_dt=out_dt, layout=layout, sdpa_kwargs=_MASKS["causal"]))
@@ -742,7 +743,7 @@ def test_mxfp8_sm120_d512_no_stats():
 def test_mxfp8_sm120_d512_native_layout(layout):
     """D512 writes quantized output through native aligned padded or BHSD strides."""
     if layout == "unaligned_pitch":
-        with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="q: native dense forward.*16-byte outer-stride alignment"):
+        with pytest.raises(cudnn.cudnnGraphNotSupportedError, match=r"q: native dense forward.*16-byte outer-stride alignment"):
             _run(1, 4, 2, 65, 193, d_qk=512, out_dt=torch.float8_e4m3fn, layout=layout, sdpa_kwargs=_MASKS["causal"])
         return
     _check(_run(1, 4, 2, 65, 193, d_qk=512, out_dt=torch.float8_e4m3fn, layout=layout, sdpa_kwargs=_MASKS["causal"]), d_qk=512)
