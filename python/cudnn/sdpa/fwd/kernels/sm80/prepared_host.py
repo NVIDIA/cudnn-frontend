@@ -188,23 +188,25 @@ def thd_host(
     swa_window: cutlass.Constexpr,
     lse_stride: cutlass.Constexpr,
     initialize_outputs: cutlass.Constexpr,
+    o_stride: cutlass.Constexpr,
     stream: driver.CUstream,
 ):
     p = module.PARAMS
     dtype = cutlass.BFloat16 if p.io_bf16 else cutlass.Float16
     mask = (MASK_CAUSAL if p.is_causal else MASK_NONE) | (MASK_SWA if p.has_swa else 0)
+    output_stride = (0, h * p.d_v, p.d_v, 1) if o_stride is None else (0, o_stride[0], o_stride[1], 1)
     # Wrapper outputs retain zeroed holes/tails outside the live prefixes.
     # Empty capacities do not launch initialization or step either pointer.
     if cutlass.const_expr(initialize_outputs):
         if t_q > 0:
-            zero_outputs((_view(o, ((1, t_q, h, p.d_v), (0, h * p.d_v, p.d_v, 1))), _view(stats, ((1, h, t_q), (0, t_q, 1)))), stream)
+            zero_outputs((_view(o, ((1, t_q, h, p.d_v), output_stride)), _view(stats, ((1, h, t_q), (0, t_q, 1)))), stream)
     # Packed capacity and Stats head pitch remain dynamic Int64 values. The
     # never-stepped batch stride is zero, so it cannot specialize on capacity.
     module._sdpa_host(
         _view(q, ((1, t_q, h, p.d_qk), (0, q_s, q_h, 1))),
         _view(k, ((1, t_kv, h_kv, p.d_qk), (0, k_s, k_h, 1))),
         _view(v, ((1, t_kv, h_kv, p.d_v), (0, v_s, v_h, 1))),
-        _view(o, ((1, t_q, h, p.d_v), (0, h * p.d_v, p.d_v, 1))),
+        _view(o, ((1, t_q, h, p.d_v), output_stride)),
         _view(stats, ((1, h, t_q), (0, t_q, 1) if lse_stride is None else lse_stride)),
         None,
         None,
@@ -248,7 +250,16 @@ def thd_host(
 
 @lru_cache(maxsize=128)
 def compile_thd_host(
-    module, h, h_kv, n_seq, swa_window, prefix_dtypes=("torch.int32", "torch.int32"), sink_dtype="torch.float32", lse_stride=None, initialize_outputs=True
+    module,
+    h,
+    h_kv,
+    n_seq,
+    swa_window,
+    prefix_dtypes=("torch.int32", "torch.int32"),
+    sink_dtype="torch.float32",
+    lse_stride=None,
+    initialize_outputs=True,
+    o_stride=None,
 ):
     """One pointer artifact per immutable flavor/head/mask contract."""
     p = module.PARAMS
@@ -281,6 +292,7 @@ def compile_thd_host(
             sink_dtype=sink_dtype,
             lse_stride=lse_stride,
             initialize_outputs=initialize_outputs,
+            o_stride=o_stride,
         ),
         "prepared_thd",
     )
@@ -299,6 +311,7 @@ def compile_thd_host(
         swa_window,
         lse_stride,
         initialize_outputs,
+        o_stride,
         driver.CUstream(0),
         options="--enable-tvm-ffi --gpu-arch=sm_80",
         cache_key=key,
