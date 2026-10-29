@@ -6,6 +6,7 @@
 import ast
 import importlib.util
 import textwrap
+import warnings
 from dataclasses import replace
 from pathlib import Path
 
@@ -278,6 +279,7 @@ def test_frost_per_k_gpu(options, cta_group, swapped):
     plan = compiler.jit_from_cudnn_graph(g, _config(cta_group, swapped))
     dtype, batch = _TORCH_DTYPES[options.get("dtype", cudnn.data_type.BFLOAT16)], options.get("batch", 1)
     torch.manual_seed(42)
+    stream = torch.cuda.Stream()
     for m, n, k in ((128, 128, options.get("K", 136)), (160, 192, 264)):
         buffers = _buffers(tensors, m, n, k, batch=batch, dtype=dtype, device="cuda")
         buffers["a"].normal_()
@@ -286,33 +288,42 @@ def test_frost_per_k_gpu(options, cta_group, swapped):
         for key in scales:
             buffers[key].copy_(torch.linspace(-1.5, 1.5, k, device="cuda").reshape(buffers[key].shape))
         pack = _pack(tensors, buffers)
-        plan(pack)
-        torch.cuda.synchronize()
+        # The compiled plan defaults to stream 0, not Torch's current stream.
+        # Order input production before side-stream warmup and capture explicitly.
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            plan(pack, stream=stream.cuda_stream)
+        stream.synchronize()
         captured = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(captured):
-            plan(pack)
-        for _ in range(2):
-            buffers[scales[-1]].neg_()
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("error", message="The CUDA Graph is empty.*")
+                with torch.cuda.graph(captured, stream=stream):
+                    plan(pack, stream=torch.cuda.current_stream().cuda_stream)
+            for _ in range(2):
+                buffers[scales[-1]].neg_()
+                buffers["y"].fill_(float("nan"))
+                captured.replay()
+                torch.testing.assert_close(buffers["y"], _reference(buffers, dtype, options), atol=0.25, rtol=0.02)
+            # One-hot opposite operand makes wrong K lanes detectable with zero tolerance.
+            av, bv = buffers["a"], buffers["b"]
+            av.fill_(1)
+            bv.fill_(1)
+            if options["side"] == "b":
+                av.zero_()
+                av[:, torch.arange(m, device="cuda"), torch.arange(m, device="cuda") * 5 % k] = 1
+            else:
+                bv.zero_()
+                bv[:, torch.arange(n, device="cuda"), torch.arange(n, device="cuda") * 5 % k] = 1
+            if batch > 1:
+                av[1].mul_(2)
+            for key in scales:
+                buffers[key].copy_((torch.arange(k, device="cuda") % 17 - 8).reshape(buffers[key].shape))
             buffers["y"].fill_(float("nan"))
             captured.replay()
-            torch.testing.assert_close(buffers["y"], _reference(buffers, dtype, options), atol=0.25, rtol=0.02)
-        # One-hot opposite operand makes wrong K lanes detectable with zero tolerance.
-        av, bv = buffers["a"], buffers["b"]
-        av.fill_(1)
-        bv.fill_(1)
-        if options["side"] == "b":
-            av.zero_()
-            av[:, torch.arange(m, device="cuda"), torch.arange(m, device="cuda") * 5 % k] = 1
-        else:
-            bv.zero_()
-            bv[:, torch.arange(n, device="cuda"), torch.arange(n, device="cuda") * 5 % k] = 1
-        if batch > 1:
-            av[1].mul_(2)
-        for key in scales:
-            buffers[key].copy_((torch.arange(k, device="cuda") % 17 - 8).reshape(buffers[key].shape))
-        buffers["y"].fill_(float("nan"))
-        captured.replay()
-        torch.testing.assert_close(buffers["y"], _reference(buffers, dtype, options), atol=0, rtol=0)
+            torch.testing.assert_close(buffers["y"], _reference(buffers, dtype, options), atol=0, rtol=0)
+        finally:
+            captured.reset()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU for the transform fragment")
