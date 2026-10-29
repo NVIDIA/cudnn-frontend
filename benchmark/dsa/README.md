@@ -19,9 +19,11 @@ run them:
   - `deepseek_v4.py` - DeepSeek-V4 Flash (H64, K=640) and Pro (H128, K=1152), 2k..32k
   - `deepseek_v41.py` - DeepSeek-V4.1 Flash (H64, K=640, same per-query gather as V4), 2k..32k
   - `glm53.py` - GLM-5.3 (H64, d=576/512, K=2048) and GLM-5.3-Flash (H64, NoPE d=512, K=2048), 2k..32k
+  - `qsa.py` - Query Sparse Attention (24Q/2KV, d=256, 512 four-token blocks per query) at TP 1/2/4/8, 2k..32k
 - `runner.py` - Configuration-based benchmark runner (one subprocess per case)
-- `benchmark_single_dsa.py` - Single-case worker the runner calls; prints a `RESULT,` line
-- `config_types.py` - `ModelPreset`, `DsaBenchmarkConfig`, `BenchmarkResult`
+- `benchmark_single_dsa.py` - Single-case worker the runner calls for `kind="dsa"` presets; prints a `RESULT,` line
+- `benchmark_single_qsa.py` - The same for `kind="qsa"` presets (`cudnn.ops.qsa_forward` / `qsa_backward`)
+- `config_types.py` - `ModelPreset`, `with_tp_shards`, `DsaBenchmarkConfig`, `BenchmarkResult`
 - `charts.py` - Chart generation
 - `run_all.sh` - Runs configs and lands results in `results/<config>/<gpu>/`
 - `results/` - Benchmark outputs (CSV and charts)
@@ -106,6 +108,24 @@ indexer selects 512 four-token pools = 2048 raw tokens (the incomplete tail
 pool, <= 3 tokens, is omitted). Like every preset here, the rows are
 gathered as independent random rows, not as 4-row pools.
 
+`qsa` (`configs/qsa.py`, `kind="qsa"`): Query Sparse Attention, the
+block-sparse attention of the packed Miles training interface
+([docs](../../docs/operations/sparse_attention/qsa.md)). Unlike the DSA
+presets it is GQA over per-head K/V (no shared record), `d = 256`, and the
+selection is a bitmap of four-token blocks: each query gets up to 512 random
+complete causal blocks plus its partial tail block, i.e. the indexer's block
+budget, so early queries gather fewer blocks than the budget. The case is one
+packed sequence (`s_kv == s_q`), timed as the public `qsa_forward` /
+`qsa_backward` call (allocation, selection compaction and kernels — QSA has no
+preallocated execute path); TFLOPS count the tokens actually gathered. The
+24Q/2KV model is swept across tensor-parallel shards with
+`with_tp_shards(..., [1, 2, 4, 8])`, the same rule as
+[`../attention_inference`](../attention_inference/README.md): q heads divide,
+the two KV heads divide at TP 2 and replicate from TP 4 on, so the per-rank
+shapes are 24/2, 12/1, 6/1 and 3/1 (`qsa`, `qsa-tp2`, `qsa-tp4`, `qsa-tp8`).
+The kernels serve the first three; `qsa-tp8` is declined by the QSA contract
+and lands as a `skipped=True` row.
+
 To add a model, copy `configs/deepseek_v4.py`, edit the `ModelPreset`s
 (`num_q_heads`, `head_dim_qk` in `{512, 576}`, `topk`, `indexer_topk`,
 `has_sink`) and the `DsaBenchmarkConfig` (`seqlens`, `profile_pass`,
@@ -113,7 +133,10 @@ To add a model, copy `configs/deepseek_v4.py`, edit the `ModelPreset`s
 forward variants are `(H, d_qk)` in `{(64, 512), (64, 576), (128, 512)}` with
 `indexer_topk` in `{0, 512, 1024}` (`2048` for H64 too); backward accepts any
 head count with `d_qk` in `{512, 576}` and a deterministic mode on SM100 for
-H16/H32/H64/H96/H128.
+H16/H32/H64/H96/H128. A QSA preset (`kind="qsa"`, `num_kv_heads`,
+`block_size=4`, `head_dim_qk = head_dim_vo = 256`) is served for 24/2, 12/1
+and 6/1 query/KV heads on SM100-family GPUs; wrap either kind in
+`with_tp_shards` to sweep tensor-parallel shards.
 
 ### Output
 
