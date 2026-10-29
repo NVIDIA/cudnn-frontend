@@ -513,7 +513,7 @@ def test_causal_empty_kv_tiles_d192x128():
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        _run(d=192, dv=128, b=4, hq=32, hkv=8, sq=256, skv=1024, causal=True, repeat_outputs=2)
+        _run(d=192, dv=128, b=4, hq=32, hkv=8, sq=256, skv=1024, causal=True, repeat_outputs=64)
     stream.synchronize()
 
 
