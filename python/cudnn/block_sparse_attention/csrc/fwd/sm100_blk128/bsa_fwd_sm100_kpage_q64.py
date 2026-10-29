@@ -1401,7 +1401,10 @@ class BlockSparseAttnForwardSm100KPageQ64:
                 mask_row = mTileOffsets[batch_idx, head_idx, m_block] + (block_iter_count - 1 - stage) * 2
                 mask_word_base = (warp_idx // 2) * 2
 
-                if masked_wg_count > 0:
+                # The first step is the generic step started from the reset state (row_max=-inf, row_sum=0 gives
+                # acc_scale == 0, i.e. the is_first result), so every step shares one code copy per mask variant: a
+                # separate once-per-tile copy of the large softmax step thrashes the instruction cache.
+                for n_tile in cutlass.range(masked_wg_count, unroll=1):
                     mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
                         mma_si_consumer_phase,
                         sm_stats_producer_phase,
@@ -1413,48 +1416,9 @@ class BlockSparseAttnForwardSm100KPageQ64:
                         mask_row=mask_row,
                         mask_word_base=mask_word_base,
                         masked=True,
-                        is_first=True,
                     )
                     mask_row -= 4
-                    for n_tile in cutlass.range(masked_wg_count - 1, unroll=1):
-                        mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
-                            mma_si_consumer_phase,
-                            sm_stats_producer_phase,
-                            tidx=tidx,
-                            tmem_s_addr=tmem_s_addr,
-                            tmem_p_addr=tmem_p_addr,
-                            sm_stats_bar_index=sm_stats_bar_index,
-                            mMaskTable=mMaskTable,
-                            mask_row=mask_row,
-                            mask_word_base=mask_word_base,
-                            masked=True,
-                        )
-                        mask_row -= 4
-                    if full_wg_count > 0:
-                        mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
-                            mma_si_consumer_phase,
-                            sm_stats_producer_phase,
-                            tidx=tidx,
-                            tmem_s_addr=tmem_s_addr,
-                            tmem_p_addr=tmem_p_addr,
-                            sm_stats_bar_index=sm_stats_bar_index,
-                            mMaskTable=mMaskTable,
-                            mask_row=mask_row,
-                            mask_word_base=mask_word_base,
-                        )
-                        for n_tile in cutlass.range(full_wg_count - 1, unroll=1):
-                            mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
-                                mma_si_consumer_phase,
-                                sm_stats_producer_phase,
-                                tidx=tidx,
-                                tmem_s_addr=tmem_s_addr,
-                                tmem_p_addr=tmem_p_addr,
-                                sm_stats_bar_index=sm_stats_bar_index,
-                                mMaskTable=mMaskTable,
-                                mask_row=mask_row,
-                                mask_word_base=mask_word_base,
-                            )
-                else:
+                for n_tile in cutlass.range(full_wg_count, unroll=1):
                     mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
                         mma_si_consumer_phase,
                         sm_stats_producer_phase,
@@ -1465,20 +1429,7 @@ class BlockSparseAttnForwardSm100KPageQ64:
                         mMaskTable=mMaskTable,
                         mask_row=mask_row,
                         mask_word_base=mask_word_base,
-                        is_first=True,
                     )
-                    for n_tile in cutlass.range(wg_count - 1, unroll=1):
-                        mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
-                            mma_si_consumer_phase,
-                            sm_stats_producer_phase,
-                            tidx=tidx,
-                            tmem_s_addr=tmem_s_addr,
-                            tmem_p_addr=tmem_p_addr,
-                            sm_stats_bar_index=sm_stats_bar_index,
-                            mMaskTable=mMaskTable,
-                            mask_row=mask_row,
-                            mask_word_base=mask_word_base,
-                        )
 
                 sScale[tidx + stage * self.stats_stride] = softmax.row_sum[0]
                 if const_expr(mLSE is not None or self.q_stage == 1):

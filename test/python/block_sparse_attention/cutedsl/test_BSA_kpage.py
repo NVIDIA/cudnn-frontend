@@ -217,8 +217,6 @@ def test_kpage_rejects_unsupported_configurations():
     q2k = torch.tensor([0, 2], dtype=torch.int32, device="cuda").view(1, 1, 1, 2).expand(1, heads, num_blocks, 2).contiguous()
     bs = torch.full((num_blocks,), BLOCK, dtype=torch.int32, device="cuda")
 
-    with pytest.raises(NotImplementedError, match="sparse_block_size=128"):
-        BSA.block_sparse_attention_forward(q, k, v, q2k, 2, bs, sparse_block_size=64, kpage=True)
     with pytest.raises(NotImplementedError, match="contiguous q2k_block_index"):
         BSA.block_sparse_attention_forward(q, k, v, q2k.transpose(2, 3).contiguous().transpose(2, 3), 2, bs, kpage=True)
     q2, k2, v2 = (torch.randn((2, seqlen, heads, 128), device="cuda", dtype=torch.bfloat16) for _ in range(3))

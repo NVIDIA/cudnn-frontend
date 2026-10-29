@@ -268,7 +268,7 @@ _bwd_paged_kv.compile_cache = {}
 
 
 def forward(q: Tensor, k: Tensor, v: Tensor, layout: KPageLayout, softmax_scale: Optional[float]) -> Tuple[Tensor, Tensor]:
-    """Forward over a prepared layout; returns (o, lse) with zeroed padding rows."""
+    """Forward over a prepared layout; returns (o, lse) with zeroed padding rows (blk128; the blk64 path has none)."""
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(HEAD_DIM)
     softmax_scale = float(softmax_scale)
@@ -277,8 +277,8 @@ def forward(q: Tensor, k: Tensor, v: Tensor, layout: KPageLayout, softmax_scale:
     t64 = layout._blk64_tables
     if t64.work_indices.numel() > 0:
         _fwd_m64(q, k, v, out, lse, t64.page_table, t64.mask_table, t64.tile_offsets, t64.iter_counts, t64.full_iter_counts, t64.work_indices, softmax_scale)
-    t128 = layout._tables
-    if t128.work_indices.numel() > 0:
+    t128 = layout._tables  # None on the blk64 path: every Q block is one M64 tile
+    if t128 is not None and t128.work_indices.numel() > 0:
         _fwd_m128(
             q, k, v, out, lse, t128.page_table, t128.mask_table, t128.tile_offsets, t128.tile_counts, t128.full_tile_counts, t128.work_indices, softmax_scale
         )
