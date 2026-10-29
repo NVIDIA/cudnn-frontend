@@ -746,8 +746,8 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
     assert use_cluster_dkv_relay(16384, 278528, 576)
     assert use_cluster_dkv_relay(16384, 131072, 576)
     assert not use_cluster_dkv_relay(128, 131072, 576)
-    assert deterministic_dkv_relay_cluster_size(8191, 65537, 512) == 8
-    assert deterministic_dkv_relay_cluster_size(8192, 65537, 512) == 4
+    assert deterministic_dkv_relay_cluster_size(2047, 65537, 512) == 8
+    assert deterministic_dkv_relay_cluster_size(2048, 65537, 512) == 4
     assert deterministic_dkv_relay_cluster_size(16384, 278528, 576) == 4
     assert deterministic_dkv_relay_cluster_size(16384, 524288, 576) == 16
     assert deterministic_dkv_relay_cluster_size(16384, 1048576, 576) == 16
@@ -763,8 +763,8 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
     ):
         dkv_shape = kernel_cls._get_workspace_size_dKV_for_q(16384, 524288, 576, 64, 1, cutlass.Float32)
         assert math.prod(dkv_shape) == _relay_workspace_bytes(16384, 524288, 576, 64, kernel_cls.dkv_relay_cluster_size)
-    assert deterministic_kernel_class(8191, 65537, 512) is FlashAttentionDSABackwardSm100DeterministicCluster8
-    assert deterministic_kernel_class(8192, 65537, 512) is FlashAttentionDSABackwardSm100DeterministicCluster4
+    assert deterministic_kernel_class(2047, 65537, 512) is FlashAttentionDSABackwardSm100DeterministicCluster8
+    assert deterministic_kernel_class(2048, 65537, 512) is FlashAttentionDSABackwardSm100DeterministicCluster4
     assert deterministic_kernel_class(16384, 524288, 576) is FlashAttentionDSABackwardSm100DeterministicCluster16
     assert deterministic_kernel_class(16384, 1048576, 576) is FlashAttentionDSABackwardSm100DeterministicCluster16
     assert _deterministic_kernel_class_for_config(16, 8) is FlashAttentionDSABackwardSm100DeterministicCluster8

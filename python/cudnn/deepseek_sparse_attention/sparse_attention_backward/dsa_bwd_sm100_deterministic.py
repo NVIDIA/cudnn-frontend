@@ -20,7 +20,7 @@ _SUPPORTED_DKV_SHARDS = (32, 64, 128)
 _LARGE_CONTEXT_WORKSPACE_BYTES = 16 << 30
 _RELAY_WORKSPACE_BUDGET_BYTES = 32 << 30
 _RELAY_WAVE_CTAS = 128
-_CLUSTER4_MIN_Q = 8192
+_CLUSTER4_MIN_Q = 2048
 
 
 @dsl_user_op
@@ -89,8 +89,9 @@ def _relay_workspace_bytes(total_seqlen_q: int, total_seqlen_kv: int, head_dim: 
 def deterministic_dkv_relay_cluster_size(total_seqlen_q: int, total_seqlen_kv: int, head_dim: int, num_heads: int = 64) -> int:
     """Select the preferred relay or its minimum-workspace fallback.
 
-    Long query batches prefer four-CTA relays for reducer parallelism; shorter
-    batches prefer eight. Cluster-16 is the minimum-workspace fallback when the
+    Query batches with at least 2K rows prefer four-CTA relays for reducer
+    parallelism; shorter batches prefer eight. Cluster-16 is the
+    minimum-workspace fallback when the
     preferred layout would exceed the memory-first budget. The long-query path
     deliberately skips cluster-8: measured GB200 sweeps found it slower than
     cluster-16 while retaining twice as many FP32 planes.
