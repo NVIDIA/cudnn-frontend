@@ -11,8 +11,10 @@ with lower defaulting to 0. lower_clip is where the slope starts, not a clamp
 applied after it, and the backward slope never reaches x >= upper_clip. The
 emitter used to compute max(leaky(x), lower) -- plain ReLU for the natural
 relu(negative_slope=s, lower_clip=0.0) -- and gave x >= upper the gradient
-slope * dy. One dense config per family; the one the active GPU does not run is
-skipped.
+slope * dy. An explicit negative_slope=0.0 is the descriptor the frontend sends
+when no slope is set, so it is max(x, lower): lower at x = -inf, as the native
+engines return, not lower + 0 * -inf = NaN. One dense config per family; the one
+the active GPU does not run is skipped.
 """
 
 from __future__ import annotations
@@ -45,6 +47,12 @@ _FWD_CASES = (
 _BWD_CASES = (
     dict(negative_slope=0.1, upper_clip=1.0),
     dict(negative_slope=0.1, lower_clip=-1.0, upper_clip=1.0),
+)
+_ZERO_SLOPE_CASES = (
+    dict(negative_slope=0.0),
+    dict(negative_slope=0.0, upper_clip=6.0),
+    dict(negative_slope=0.0, lower_clip=-1.0),
+    dict(negative_slope=0.0, lower_clip=0.5, upper_clip=6.0),
 )
 
 
@@ -93,6 +101,29 @@ def test_relu_slope_starts_at_lower_clip(family, attrs):
     ref = torch.where(acc < lower, lower + slope * (acc - lower), acc)
     if upper is not None:
         ref = torch.clamp(ref, max=upper)
+    torch.testing.assert_close(out.float(), ref.to(torch.bfloat16).float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("attrs", _ZERO_SLOPE_CASES, ids=_case_id)
+@pytest.mark.parametrize("family", sorted(_CONFIGS))
+def test_relu_zero_slope_at_neg_inf(family, attrs):
+    g, C = _matmul_graph()
+    y = g.relu(input=C, name="r", **attrs)
+    y.set_data_type(cudnn.data_type.BFLOAT16).set_output(True)
+    compiled = _compile(g, family)
+
+    a, b, _ = _operands()
+    b[0, :, 0] = 1.0
+    a[0, 0:4, 0] = float("-inf")  # rows 0-3 accumulate to -inf, rows 4-7 to +inf
+    a[0, 4:8, 0] = float("inf")
+    acc = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
+    out = torch.full((1, _M, _N), float("nan"), device="cuda", dtype=torch.bfloat16)
+    compiled(_vp(compiled, a, b, out))
+    torch.cuda.synchronize()
+
+    ref = torch.clamp(acc, min=attrs.get("lower_clip", 0.0))
+    if "upper_clip" in attrs:
+        ref = torch.clamp(ref, max=attrs["upper_clip"])
     torch.testing.assert_close(out.float(), ref.to(torch.bfloat16).float(), atol=1e-2, rtol=1e-2)
 
 
