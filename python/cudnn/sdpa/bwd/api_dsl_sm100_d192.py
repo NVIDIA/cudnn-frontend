@@ -214,3 +214,4 @@ class SdpaBwdDslSm100D192(SdpaBwdDsl):
         with context:
             ensure_current_context(stream, spec.device_index)
             execute(spec, facts, workspace_ptr, stream, scale=scale_softmax, geometry=geometry)
+        return None

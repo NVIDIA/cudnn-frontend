@@ -9,7 +9,8 @@ from cudnn.frost.tile_dsl.thd import THD_SETUP_THREADS, thd_port_origin
 from cudnn.sdpa.bwd.kernels.sm100.bprop_d128_accum_thd_helpers import setup_thd_d128_kernel, _origin_row, _cast_group_vector
 from cudnn.sdpa.bwd.kernels.sm100.bprop_d128_helpers import THREADS, ROWS_PER_CTA, LANES_PER_ROW, ELEMENTS_PER_LANE, RN
 from cudnn.sdpa.bwd.config_sm100_d192_accum import CFG
-from .bprop_d192_accum_thd_f16 import _tensor_map, host as accumulation_host
+from .bprop_d192_accum_f16 import _tensor_map
+from .bprop_d192_accum_thd_f16 import host as accumulation_host
 
 
 @cute.kernel

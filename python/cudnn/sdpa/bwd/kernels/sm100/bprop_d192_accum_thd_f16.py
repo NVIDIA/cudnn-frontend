@@ -25,7 +25,6 @@ from .bprop_d192_accum_f16 import (
     _commit,
     _credit,
     _tmem_load,
-    _tensor_map,
     _stat_publish,
     _p_values,
     _ds_values,
