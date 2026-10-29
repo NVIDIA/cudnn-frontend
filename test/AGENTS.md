@@ -446,7 +446,7 @@ compilation/DLPack while checking changed allocations and replay.
 Optional gradients copied from accumulators after a prepared launch still need
 presence, dtype and extent checks before any staging write. They can be absent
 from the pointer ABI, so the common binder cannot validate them. The detector
-is `test_staged_auxiliary_outputs_validate_before_writes` (SM80 backward):
+is `test_native_auxiliary_outputs_validate_before_writes` (SM80 backward):
 forbid copy/zero/launch and pass malformed or uncompiled dBias/dSink outputs.
 
 Test both graph prepared-plan admission and the standalone adapter's compiler
@@ -550,23 +550,22 @@ After moving a wrapper to a prepared host, forbid the old tensor launcher
 after warmup and check fresh bindings plus changed-input graph replay. Keep
 physical stride and product-overflow probes on every native flavor, with
 wrapped addresses poisoned inside allocated guard storage.
-`test_sdpa_sm80_thd_forward_prepared.py` exercises both properties. Removing
-THD tensor fakes must also preserve the dense off-flavor/RoPE fallback.
+`test_sdpa_sm80_thd_forward_prepared.py` exercises both properties. Dense padded widths retain native strides; unsupported RoPE declarations
+must decline before compilation.
 
 
-### SM80 staged pointer launches
+### SM80 native pointer launches
 
-A pointer host can follow existing layout staging without changing that
-staging's numerical contract. Keep off-flavor and RoPE references, mutate
-angle tables after capture, and forbid `cutlass.cute.runtime.from_dlpack`
-after warmup so a return to tensor launch plumbing fails independently of
-numerical output. `test_dense_staged_pointer_launch_and_rope_replay` was
-RED on the old tensor launcher for both dtypes and both template families.
+Aligned dense and packed layouts execute through native pointer chains. Before
+removing a staging fallback, make its entry points raise and run the SM80 suites.
+Retain gradient/output references, current-pointer rebinding, launch-count checks
+and fresh-process artifacts. RoPE declarations decline during preparation.
+`test_dense_native_replay_or_rope_decline` checks this boundary.
 
 Trailing-dimension and contiguity checks do not prove that a broadcast input
 has a live batch slice: `(0, H, SQ, SKV)` passes both for an empty bias. Reject
 it before workspace writes or pointer binding; the `bias_tensor-empty_batch`
-case in `test_dense_staged_rejects_invalid_operands_before_staging` is the
+case in `test_dense_native_rejects_invalid_operands_before_launch` is the
 RED-then-green detector. A compiler-memo test must also rebuild the wrapper
 on its second call: clear the wrapper cache while retaining the compiler memo,
 then forbid JIT. Reusing the same adapter cannot test compiler reuse.
@@ -605,7 +604,7 @@ entry signature and delegate internally; do not assume the absent operand is
 removed from the exported call ABI. Exercise both native and staged routes,
 including a fresh-process artifact reload. For staged THD output padding,
 test the bounded cast/fold with physical wide output strides as well as the
-input staging; `test_staged_packed_physical_stride` covers both stride and
+input staging; `test_native_packed_physical_stride` covers both stride and
 index-product overflow with allocated guard storage.
 
 Prepared host migrations must preserve persistent compiled artifacts as well as
@@ -642,7 +641,7 @@ failure and an output that was simultaneously required and forbidden.
 For fixed-geometry staged pointer hosts, validate Q/K/V/O shape, dtype and device,
 and all auxiliary bindings before workspace carving or any copy/fill. A tensor
 compiler previously checked some of these at dispatch; raw addresses cannot.
-The SM80 detector `test_dense_staged_rejects_invalid_operands_before_staging`
+The SM80 detector `test_dense_native_rejects_invalid_operands_before_launch`
 replaces the workspace carver with a tripwire so an invalid short buffer fails
 safely before it can reach a GPU launch.
 
@@ -1012,7 +1011,7 @@ SM80 graph operands are raw storage under graph declarations; standalone Stats
 may be flat, and bias uses the first contiguous [H,SQ,SKV] plane. Keep these
 contracts distinct from explicit geometry overrides. The actual-host frame and
 GPU detectors are `test_sdpa_native_sm80_binding.py`; the existing prepared SM80
-suite checks physical Int64 addressing and the staged/RoPE path stays separate.
+suite checks physical Int64 addressing and RoPE declarations decline before compilation.
 
 Per-tensor FP8 split binders must use the selected host's partial dtype, not the
 final output dtype: SM120 writes half partial slabs even when final O is FP8;

@@ -64,14 +64,12 @@ def workspace_regions(api, *, symbolic=False):
 
 
 @cute.jit
-def _view(ptr: Optional[cute.Pointer], geometry: cutlass.Constexpr, t_q: cutlass.Int64, t_kv: cutlass.Int64, static_layout: cutlass.Constexpr = False):
+def _view(ptr: Optional[cute.Pointer], geometry: cutlass.Constexpr, t_q: cutlass.Int64, t_kv: cutlass.Int64):
     if cutlass.const_expr(ptr is None):
         return None
     shape, strides = geometry
     shape = tuple(t_q if cutlass.const_expr(n == -1) else (t_kv if cutlass.const_expr(n == -2) else n) for n in shape)
     strides = tuple(t_q if cutlass.const_expr(st == -1) else (t_kv if cutlass.const_expr(st == -2) else st) for st in strides)
-    if cutlass.const_expr(static_layout):
-        return cute.make_tensor(ptr, cute.make_layout(shape, stride=strides))
     return cute.make_tensor(ptr, cute.make_layout(shape, stride=tuple(cutlass.Int64(st) if i < len(strides) - 1 else st for i, st in enumerate(strides))))
 
 
@@ -190,7 +188,7 @@ _copy_aux.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
-def _staged_host(
+def host(
     t_q: cutlass.Int64,
     t_kv: cutlass.Int64,
     max_sq: cutlass.Int64,
@@ -210,7 +208,6 @@ def _staged_host(
     dsink_ptr: Optional[cute.Pointer],
     bias_ptr: Optional[cute.Pointer],
     dbias_ptr: Optional[cute.Pointer],
-    rope_ptr: Optional[cute.Pointer],
     ro_q_ptr: Optional[cute.Pointer],
     ro_k_ptr: Optional[cute.Pointer],
     ro_v_ptr: Optional[cute.Pointer],
@@ -243,27 +240,22 @@ def _staged_host(
     # The template module already owns the immutable configuration. Passing its
     # dataclass again prevents compiled_cache from exporting this pointer ABI.
     params = module.PARAMS
-    # The former tensor compilers specialized constant staged strides.
-    # Preserve that code generation; native pointer entries retain wide
-    # dynamic strides, and packed token extents remain dynamic Int64.
-    # Device address products still widen their operands first.
-    static_layout = cutlass.const_expr(len(geometry) == 16)
-    q = _view(q_ptr, geometry[0], t_q, t_kv, static_layout)
-    k = _view(k_ptr, geometry[1], t_q, t_kv, static_layout)
-    v = _view(v_ptr, geometry[2], t_q, t_kv, static_layout)
-    o = _view(o_ptr, geometry[3], t_q, t_kv, static_layout)
-    do = _view(do_ptr, geometry[4], t_q, t_kv, static_layout)
-    stats = _view(stats_ptr, geometry[5], t_q, t_kv, static_layout)
-    dq = _view(dq_ptr, geometry[6], t_q, t_kv, static_layout)
-    dk = _view(dk_ptr, geometry[7], t_q, t_kv, static_layout)
-    dv = _view(dv_ptr, geometry[8], t_q, t_kv, static_layout)
-    seq_q = _view(seq_q_ptr, geometry[9], t_q, t_kv, static_layout)
-    seq_kv = _view(seq_kv_ptr, geometry[10], t_q, t_kv, static_layout)
-    sink = _view(sink_ptr, geometry[11], t_q, t_kv, static_layout)
-    dsink = _view(dsink_ptr, geometry[12], t_q, t_kv, static_layout)
-    bias = _view(bias_ptr, geometry[13], t_q, t_kv, static_layout)
-    dbias = _view(dbias_ptr, geometry[14], t_q, t_kv, static_layout)
-    rope = _view(rope_ptr, geometry[15] if len(geometry) > 15 else None, t_q, t_kv, static_layout)
+    # Native strides and packed token extents retain their Int64 addressing.
+    q = _view(q_ptr, geometry[0], t_q, t_kv)
+    k = _view(k_ptr, geometry[1], t_q, t_kv)
+    v = _view(v_ptr, geometry[2], t_q, t_kv)
+    o = _view(o_ptr, geometry[3], t_q, t_kv)
+    do = _view(do_ptr, geometry[4], t_q, t_kv)
+    stats = _view(stats_ptr, geometry[5], t_q, t_kv)
+    dq = _view(dq_ptr, geometry[6], t_q, t_kv)
+    dk = _view(dk_ptr, geometry[7], t_q, t_kv)
+    dv = _view(dv_ptr, geometry[8], t_q, t_kv)
+    seq_q = _view(seq_q_ptr, geometry[9], t_q, t_kv)
+    seq_kv = _view(seq_kv_ptr, geometry[10], t_q, t_kv)
+    sink = _view(sink_ptr, geometry[11], t_q, t_kv)
+    dsink = _view(dsink_ptr, geometry[12], t_q, t_kv)
+    bias = _view(bias_ptr, geometry[13], t_q, t_kv)
+    dbias = _view(dbias_ptr, geometry[14], t_q, t_kv)
     dk_work, dv_work = dk, dv
     cu_q, cu_k, org = None, None, None
     rows = tuple(-1 if o is None else o[0] for o in origins) if cutlass.const_expr(origins is not None) else (-1,) * 9
@@ -341,7 +333,7 @@ def _staged_host(
             seq_kv,
             bias,
             dbias_acc,
-            rope,
+            None,
             cu_q,
             cu_k,
             seq_q,
@@ -417,108 +409,6 @@ def _staged_host(
         _copy_aux(dbias_acc, dbias, dsink_acc, dsink, dbias_dtype).launch(grid=((max(n_bias, n_sink) + 255) // 256, 1, 1), block=(256, 1, 1), stream=stream)
 
 
-@cute.jit
-def host(
-    t_q: cutlass.Int64,
-    t_kv: cutlass.Int64,
-    max_sq: cutlass.Int64,
-    max_skv: cutlass.Int64,
-    q_ptr: cute.Pointer,
-    k_ptr: cute.Pointer,
-    v_ptr: cute.Pointer,
-    o_ptr: cute.Pointer,
-    do_ptr: cute.Pointer,
-    stats_ptr: cute.Pointer,
-    dq_ptr: cute.Pointer,
-    dk_ptr: cute.Pointer,
-    dv_ptr: cute.Pointer,
-    seq_q_ptr: Optional[cute.Pointer],
-    seq_kv_ptr: Optional[cute.Pointer],
-    sink_ptr: Optional[cute.Pointer],
-    dsink_ptr: Optional[cute.Pointer],
-    bias_ptr: Optional[cute.Pointer],
-    dbias_ptr: Optional[cute.Pointer],
-    ro_q_ptr: Optional[cute.Pointer],
-    ro_k_ptr: Optional[cute.Pointer],
-    ro_v_ptr: Optional[cute.Pointer],
-    ro_o_ptr: Optional[cute.Pointer],
-    ro_do_ptr: Optional[cute.Pointer],
-    ro_dq_ptr: Optional[cute.Pointer],
-    ro_dk_ptr: Optional[cute.Pointer],
-    ro_dv_ptr: Optional[cute.Pointer],
-    ro_stats_ptr: Optional[cute.Pointer],
-    workspace: cute.Pointer,
-    scale_log2: cutlass.Float32,
-    scale: cutlass.Float32,
-    length_form: cutlass.Int32,
-    module: cutlass.Constexpr,
-    d64_module: cutlass.Constexpr,
-    geometry: cutlass.Constexpr,
-    regions: cutlass.Constexpr,
-    zero_regions: cutlass.Constexpr,
-    zero_words: cutlass.Constexpr[int],
-    dtype: cutlass.Constexpr,
-    dbias_dtype: cutlass.Constexpr,
-    swa_window: cutlass.Constexpr[int],
-    right_bound: cutlass.Constexpr[int],
-    n_seq: cutlass.Constexpr[int],
-    lse_token_major: cutlass.Constexpr[bool],
-    initialize_outputs: cutlass.Constexpr[bool],
-    origins: cutlass.Constexpr,
-    stream: driver.CUstream,
-):
-    _staged_host(
-        t_q,
-        t_kv,
-        max_sq,
-        max_skv,
-        q_ptr,
-        k_ptr,
-        v_ptr,
-        o_ptr,
-        do_ptr,
-        stats_ptr,
-        dq_ptr,
-        dk_ptr,
-        dv_ptr,
-        seq_q_ptr,
-        seq_kv_ptr,
-        sink_ptr,
-        dsink_ptr,
-        bias_ptr,
-        dbias_ptr,
-        None,
-        ro_q_ptr,
-        ro_k_ptr,
-        ro_v_ptr,
-        ro_o_ptr,
-        ro_do_ptr,
-        ro_dq_ptr,
-        ro_dk_ptr,
-        ro_dv_ptr,
-        ro_stats_ptr,
-        workspace,
-        scale_log2,
-        scale,
-        length_form,
-        module,
-        d64_module,
-        geometry,
-        regions,
-        zero_regions,
-        zero_words,
-        dtype,
-        dbias_dtype,
-        swa_window,
-        right_bound,
-        n_seq,
-        lse_token_major,
-        initialize_outputs,
-        origins,
-        stream,
-    )
-
-
 def compile_host(api, geometry, d64_module, cache_key):
     dtype = cutlass.BFloat16 if api._params.io_bf16 else cutlass.Float16
     dbias_dtype = cutlass.Float32 if api.dbias_desc is None or str(api.dbias_desc.dtype).endswith("float32") else dtype
@@ -529,7 +419,7 @@ def compile_host(api, geometry, d64_module, cache_key):
         zeros = ((0, 0),) * 4
     # Only immutable specialization metadata enters the memo. Each plan still
     # sizes workspace and binds packed capacities, bounds and pointers itself.
-    compiler = _compile_thd_artifact if api.thd else (_compile_staged_artifact if len(geometry) == 16 else _compile_artifact)
+    compiler = _compile_thd_artifact if api.thd else _compile_artifact
     artifact = compiler(
         api._kmod,
         d64_module,
@@ -573,7 +463,7 @@ def _compile_artifact(
         + [dtype] * 3
         + [cutlass.Int32] * 2
         + [cutlass.Float32] * 2
-        + [cutlass.Float32 if module.PARAMS.bias_is_fp32 else dtype, dbias_dtype, cutlass.Float32]
+        + [cutlass.Float32 if module.PARAMS.bias_is_fp32 else dtype, dbias_dtype]
     )
     args = [
         (
@@ -590,7 +480,7 @@ def _compile_artifact(
         for o in (origins or (None,) * 9)
     ]
     artifact = compile_cached(
-        host if len(geometry) == 15 else _staged_host,
+        host,
         cutlass.Int64(0),
         cutlass.Int64(0),
         cutlass.Int64(0),
@@ -623,4 +513,3 @@ def _compile_artifact(
 
 
 _compile_thd_artifact = lru_cache(maxsize=128)(_compile_artifact)
-_compile_staged_artifact = lru_cache(maxsize=128)(_compile_artifact)

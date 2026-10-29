@@ -1028,12 +1028,11 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
     dBias, RoPE) arrive as extra optional keywords, as the ``SdpaBwdDsl``
     contract permits.
 
-    Layouts: any dense layout with the head dim innermost-contiguous is
-    served. Native flavor widths with vector-aligned outer strides compile
-    a pointer chain that reads/writes each declared layout directly. Other
-    dense layouts and widths retain carved staging; strided Stats are read
-    natively in both paths. Prepared execute requires caller workspace, which
-    the graph and convenience wrapper provide outside the launch path.
+    Dense operands require D-contiguous, vector-aligned, non-overlapping
+    layouts and head widths divisible by eight. The native pointer chain
+    reads/writes each declared layout directly, including strided Stats.
+    Prepared execute requires caller workspace, which the graph and convenience
+    wrapper provide outside the launch path.
     """
 
     def __init__(
@@ -1085,8 +1084,6 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         self._lse_stride: "Optional[tuple[int, int, int]]" = None
         self._prepared = None
         self._native_pointer = False
-        self._staged_layout = None
-        self._staged_prepared = None
         # THD (packed) plan-time state: the compact token capacities that size
         # the scratch and bound the launch, the physical capacities of the
         # caller's buffers, the Stats packing, and the compiled lengths ->
@@ -1470,23 +1467,15 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             )
         self._kmod = _load_sm80_bwd_module(self._params)
         d64 = _sm80_bwd_kernel_mod("d64") if self._use_d64 else None
-        if self._native_pointer:
-            from .prepared_sm80 import build_spec
+        from .prepared_sm80 import build_spec
 
-            self._prepared = build_spec(self, d64)
-            self._compiled_kernel = self._prepared.artifact
-        else:
-            from .staged_sm80 import compile_staged
-
-            self._staged_prepared = compile_staged(self, d64)
-            self._compiled_kernel = self._staged_prepared.artifact
+        self._prepared = build_spec(self, d64)
+        self._compiled_kernel = self._prepared.artifact
         self._logger.debug("compile completed")
 
     def scratch_workspace_bytes(self) -> int:
-        """Plan-time bytes for the prepared chain and retained operand staging."""
+        """Plan-time bytes for the native backward algorithm."""
         self._ensure_support_checked()
-        if self._staged_layout is not None:
-            return self._staged_layout.workspace_bytes
         from .kernels.sm80.prepared_host import workspace_regions
 
         return workspace_regions(self)[1]
@@ -1515,9 +1504,8 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         rope_freqs: Optional[torch.Tensor] = None,
         thd_ragged_offsets: Optional[dict] = None,
     ) -> None:
-        """Run the compiled SM80 backward on caller workspace. Native operands
-        bind directly; the existing staged layouts retain their copies and
-        feed the same pointer chain. THD outputs remain row-bounded on device.
+        """Run the compiled SM80 backward on caller workspace using native strides.
+        THD outputs remain row-bounded on device.
         """
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
@@ -1573,36 +1561,9 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
                 scale_softmax,
                 ro_tensors,
             )
+            self._logger.debug("execute completed (THD)" if self.thd else "execute completed (d64 fast path)" if self._use_d64 else "execute completed")
             return
-
-        from .staged_sm80 import run_staged
-
-        run_staged(
-            self,
-            (
-                q_tensor,
-                k_tensor,
-                v_tensor,
-                o_tensor,
-                do_tensor,
-                stats_tensor,
-                dq_tensor,
-                dk_tensor,
-                dv_tensor,
-                seq_q_lens,
-                seq_kv_lens,
-                sink_tensor,
-                dsink_tensor,
-                bias_tensor,
-                dbias_tensor,
-            ),
-            workspace,
-            current_stream,
-            scale_softmax,
-            rope_freqs,
-            ro_tensors,
-        )
-        self._logger.debug("execute completed (THD)" if self.thd else "execute completed (d64 fast path)" if self._use_d64 else "execute completed")
+        raise RuntimeError("SM80 backward compiled without a native prepared plan")
 
 
 _sm80_bwd_cache: dict = {}

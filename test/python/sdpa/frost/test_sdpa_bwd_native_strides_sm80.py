@@ -19,7 +19,7 @@ pytestmark = [
 
 @pytest.mark.parametrize("role", ["q", "k", "v", "o", "do", "dq", "dk", "dv"])
 @pytest.mark.parametrize("product", [False, True])
-def test_staged_packed_physical_stride(role, product, monkeypatch):
+def test_native_packed_physical_stride(role, product, monkeypatch):
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     lengths = (5,) if product else (2, 2)
     case = _thd_case(lengths, lengths, 2, 96, torch.bfloat16, hkv=1)
