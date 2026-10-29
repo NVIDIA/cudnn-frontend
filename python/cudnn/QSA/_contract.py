@@ -10,13 +10,25 @@ import torch
 # (query heads, KV heads) geometries the attention kernels serve: the full 24Q/2KV model and its 12Q/1KV (two-way) and
 # 6Q/1KV (four-way, KV head replicated) tensor-parallel shards.
 HEAD_GEOMETRIES = ((6, 1), (12, 1), (24, 2))
-# The paired backward (bprop_sm100 + bprop_dispatch) batches two queries into one 24-row MMA tile; it exists for 12Q/1KV
-# only. Every other geometry runs the single-query backward (bprop_sm100_base on SM100/SM103, bprop_sm107 on SM107).
-PAIRED_BACKWARD_HEADS = (12, 1)
+# The batched backward (bprop_sm100 + bprop_dispatch) fills one 24-column MMA tile with the heads of NQ consecutive
+# queries, which share one gathered K/V block union per CTA: two 12-head queries at 12Q/1KV, four 6-head queries at
+# 6Q/1KV (NQ * heads per KV head = 24). 24Q/2KV runs the single-query backward (bprop_sm100_base on SM100/SM103,
+# bprop_sm107 on SM107).
+PAIRED_BACKWARD_COLUMNS = 24
+PAIRED_BACKWARD_QUERIES = {(12, 1): 2, (6, 1): 4}
+# Compact IDs of the batched backward: the block index in the low BLK_BITS bits, one owner bit per batched query above
+# them. At NQ = 4 the owner bits are 28..31, so a code with bit 31 set is a negative int32: readers mask the block with
+# (1 << BLK_BITS) - 1 and test single owner bits with (code >> (BLK_BITS + i)) & 1, which the arithmetic shift keeps right.
+BLK_BITS = 28
 
 
 def paired_backward(hq, hkv):
-    return (hq, hkv) == PAIRED_BACKWARD_HEADS
+    return (hq, hkv) in PAIRED_BACKWARD_QUERIES
+
+
+def paired_queries(hq, hkv):
+    """Queries batched per CTA by the backward: 2 (12Q/1KV) or 4 (6Q/1KV); 1 for the single-query kernels."""
+    return PAIRED_BACKWARD_QUERIES.get((hq, hkv), 1)
 
 
 def check_tensor(name, tensor, shape, dtype, device, alignment=4):

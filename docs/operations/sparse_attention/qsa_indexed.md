@@ -52,9 +52,9 @@ padded explicitly by the caller; this API does not silently convert it. Empty
 rows produce zero output/gradients and negative-infinity LSE. Selection is not
 differentiated. Pass the same selection and scale to forward and backward.
 
-A GPU hash table compacts the selected starts. The 12Q/1KV backward unions
-adjacent queries' starts with owner bits, retaining each query's bounds and
-mask; the 6Q/1KV backward processes one query per CTA. Nonfinite K/V
+A GPU hash table compacts the selected starts. The backward unions consecutive
+queries' starts (two at 12Q/1KV, four at 6Q/1KV) with owner bits, retaining each
+query's bounds and mask. Nonfinite K/V
 uses the device-side per-query fallback described in QSA ([docs](/operations/sparse_attention/qsa), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/sparse_attention/qsa.md)). Every call
 rebuilds metadata, including during CUDA Graph replay. Warm up before capture.
 
@@ -63,7 +63,8 @@ plan validates current storage and uses only caller-owned buffers in execute;
 its cache retains immutable geometry and compiled kernels. Indexed metadata
 storage is proportional to `T * W`, independent of the full key-block count.
 At 128K with W=2052, compact IDs occupy 256.5 MiB in either direction, compared
-with 16 GiB for bitmap-forward IDs or 8 GiB for paired bitmap-backward IDs. The
+with 16 GiB for bitmap-forward IDs or 8 GiB (12Q/1KV) and 4 GiB (6Q/1KV) for
+batched bitmap-backward IDs. The
 4 GiB bitmap is also unnecessary. These are metadata sizes, not total process
 memory; saved state, outputs and FP32 gradient accumulators are additional.
 

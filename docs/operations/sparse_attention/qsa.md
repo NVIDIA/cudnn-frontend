@@ -151,10 +151,10 @@ Backward compacts the current selection, computes
 and LSE, and forms dQ/dK/dV. Accumulation uses FP32; output gradients use BF16.
 K/V gradient contributions from all query heads are summed. Floating-point
 atomic reductions can change low bits between runs.
-On Blackwell and Rubin, the 12:1 path pairs adjacent queries and gathers their selected
-block union. Owner bits retain each query's mask while sharing K/V loads.
-The 24:2 and 6:1 paths process one query per CTA; 6:1 fills six of the tile's
-sixteen head columns, so its per-token cost is close to 12:1's rather than half of it.
+On Blackwell and Rubin, the 12:1 and 6:1 paths batch consecutive queries (two
+12-head or four 6-head queries fill one 24-column tile) and gather their selected
+block union once. Owner bits retain each query's mask while sharing K/V loads.
+The 24:2 path processes one query per CTA.
 A device-side K/V scan selects a per-query fallback when nonfinite values are
 present. The fallback reuses the compact union but applies each query's owner
 bits and bounds before dQ arithmetic, preventing a masked NaN from crossing
@@ -202,8 +202,8 @@ The public functions select one of two architecture families internally:
 
 | Family | Forward kernel | Backward kernel |
 |---|---|---|
-| Blackwell SM100/SM103 | `cudnn_frost_qsa_fprop_sm100` | `cudnn_frost_qsa_bprop_sm100` (paired for 12:1, single-query for 24:2 and 6:1) |
-| Rubin SM107 | `cudnn_frost_qsa_fprop_sm107` | Paired `cudnn_frost_qsa_bprop_sm100` (12:1), `cudnn_frost_qsa_bprop_sm107` (24:2, 6:1) |
+| Blackwell SM100/SM103 | `cudnn_frost_qsa_fprop_sm100` | `cudnn_frost_qsa_bprop_sm100` (batched for 12:1 and 6:1, single-query for 24:2) |
+| Rubin SM107 | `cudnn_frost_qsa_fprop_sm107` | Batched `cudnn_frost_qsa_bprop_sm100` (12:1, 6:1), `cudnn_frost_qsa_bprop_sm107` (24:2) |
 
 Kernel symbols are implementation details; Rubin kernels compile for SM107.
 Rubin compaction scans 16 selection bytes per lane and preserves block order.
@@ -214,10 +214,10 @@ Calls allocate outputs and scratch on the input device and enqueue work on its
 current PyTorch CUDA stream. Warm up the chosen head geometry before CUDA graph
 capture. Compiled kernels reuse symbolic token and block extents; metadata is
 rebuilt from the current bitmap on each call. Forward scratch includes an int32
-`[T, NB]` compact-index buffer and int32 `[T]` counts. The 12:1 backward path on both families
-uses `[ceil(T/2), NB]` indices and `[ceil(T/2)]` counts; other backward paths use
-the forward shapes. Backward also uses FP32 gradient accumulators and `[T, Hq]`
-delta. The paired backward safety scan also uses four int32 flags per 1024
+`[T, NB]` compact-index buffer and int32 `[T]` counts. The batched backward path on both families
+uses `[ceil(T/NQ), NB]` indices and `[ceil(T/NQ)]` counts (`NQ` = 2 at 12:1, 4 at 6:1);
+the 24:2 backward uses the forward shapes. Backward also uses FP32 gradient accumulators and `[T, Hq]`
+delta. The batched backward safety scan also uses four int32 flags per 1024
 K/V elements plus one reduced flag. The dense route also uses packed token
 masks, tile ranges and K/V check flags. These buffers are rebuilt on each call.
 Full-call benchmarks must include forward preparation, compaction, backward
