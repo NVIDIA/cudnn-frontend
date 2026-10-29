@@ -16,7 +16,6 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import gated_block_bounds as gbb  # noqa: E402
 from gated_block_bounds import (  # noqa: E402
     OUTPUT_ATOL_FRAC,
     OUTPUT_COS_MIN,
@@ -122,15 +121,16 @@ def test_pure_dtype_rounding_of_the_reference_is_accepted(dt):
     assert 0.0 < s["bound_ratio"] < 0.25 and s["n_above_bound"] == 0 and s["cos"] > 0.9999 and s["finite"]
 
 
-def test_chunked_cosine_matches_an_independent_fp64_reduction():
-    """``cos64`` reduces in fp64 chunks (a 32k-token O never materializes as one fp64 copy); on a tensor THREE elements longer than one
-    chunk -- the partial last chunk and the cross-chunk accumulation both run -- it agrees with one plain fp64 reduction to 1e-9."""
-    n = gbb._CHUNK + 3
+def test_chunked_cosine_matches_an_independent_fp64_reduction(monkeypatch):
+    """``cos64`` reduces in fp64 chunks (a 32k-token O never materializes as one fp64 copy).  A TEST-LOCAL chunk of 1024 elements keeps
+    the check small (with the module's 2^26 the same check needed 2^26 + 3 elements and ~1.8 GiB of host memory); a tensor three elements
+    longer than a chunk runs the full-chunk and the partial-tail path, and agrees with one plain fp64 reduction to 1e-9."""
+    monkeypatch.setattr("gated_block_bounds._CHUNK", 1024)  # read at call time; the default raising=True pins the attribute's name
+    n = 1024 + 3
     a = torch.linspace(-1.0, 1.0, n).to(torch.bfloat16)
     b = (torch.linspace(-1.0, 1.0, n) * 0.5 + 0.25).to(torch.bfloat16)
     a64, b64 = a.double(), b.double()
     expect = float(a64 @ b64) / math.sqrt(float(a64 @ a64) * float(b64 @ b64))
-    del a64, b64
     assert 0.5 < expect < 0.999 and abs(cos64(a, b) - expect) <= 1e-9
     assert abs(cos64(a[:1000], b[:1000]) - float(a[:1000].double() @ b[:1000].double()) / (a[:1000].double().norm() * b[:1000].double().norm())) <= 1e-12
 
