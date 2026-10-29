@@ -24,6 +24,15 @@ compressed rows at pool 4; sm_89+ -- the cell skips below it and is UNCOVERED th
 ``.to(float8_e4m3fn)`` (the e4m3 cast of the bf16 row, ``|bf16 row| < 448`` asserted first); ``out_dtype`` is a compile key (a distinct
 artifact; the bf16 spelling is the io dtype's artifact); a wrong ``out`` dtype is refused both ways naming the recipe's; f16 io has no
 e4m3 arm; float32 stays a ``ValueError``; below sm_89 the arm is a typed decline naming the instruction.
+
+The rounding attribute (``compile_qsa_compress(rounding=)``, ``INDEX_COMPRESS_ROUNDINGS``; 2026-10-29): ``"single"`` is the chain above;
+``"hf"`` is the HF / vLLM-prepare dtype flow -- the pooled key cast to the io dtype before its norm, the normed row cast before its
+rotation, the rotation in the io dtype -- the oracle's ``hf_rounding=True`` points.  The ``"hf"`` arm reproduces the oracle's ROUNDING
+POINTS, not its bits (the fp32 reduction orders differ: the 16 per-lane partial sums of squares + the fast-math rsqrt vs torch's reduce), so its
+gate is a STATISTIC with a hard cap -- at least 99.9 % of the elements bitwise the HF-rounding oracle and every element within four io
+ulps of it -- while the ``"single"`` arm against the SAME oracle agrees on ~70 % of the elements (the FI README's "one bf16 ulp on a third
+of the elements"): the two conventions are told apart by the statistic, at pool 4 (the key) and pool 1 (the query form).  The attribute
+is a per-recipe compile key extended off the default only (the default artifacts keep their keys).
 """
 
 import os
@@ -40,6 +49,7 @@ if requirement_error:
 
 from cudnn.gated_attention_block.kernels.qsa_compress import (
     DEFAULT_POOL,
+    INDEX_COMPRESS_ROUNDINGS,
     QsaCompressRecipe,
     build_qsa_compress,
     compile_qsa_compress,
@@ -76,7 +86,33 @@ def _stream():
 # ---------------------------------------------------------------------------
 
 
-def compress_reference(k_raw, w, cos, sin, seq_lens, *, pool=_POOL, eps=_EPS, norm_weight_offset=0.0, rope_dim=_ROPE):
+def _normed_rows(k_raw, w, *, pool, eps, norm_weight_offset, hf_rounding):
+    """The pooled, RMSNormed rows ``[B, floor(S / pool), D]`` BEFORE the rotation: fp32 (``hf_rounding=False``) or the io dtype with HF's two
+    casts -- the pooled key before its norm, the normed row before its rotation (``hf_rounding=True``)."""
+    batch, s_tok, d = k_raw.shape
+    nb = s_tok // pool
+    io = k_raw.dtype
+    pooled = k_raw[:, : nb * pool].float().reshape(batch, nb, pool, d).mean(dim=2)
+    if hf_rounding:
+        pooled = pooled.to(io).float()
+    rstd = torch.rsqrt(pooled.pow(2).mean(-1, keepdim=True) + eps)
+    y = pooled * rstd * (w.float() + norm_weight_offset)
+    return y.to(io) if hf_rounding else y
+
+
+def hf_rotation_operand_magnitude(k_raw, w, *, pool=_POOL, eps=_EPS, norm_weight_offset=0.0, rope_dim=_ROPE):
+    """Per element of the HF-rounding oracle's output, the magnitude of the LARGER rotation operand -- ``max(|y_i|, |y_partner|)`` on the
+    rotated dims (the two terms of ``y * cos + rotate_half(y) * sin`` can cancel, so the result's own ulp is no yardstick for a one-ulp
+    flip of an operand), ``|y_i|`` on the passthrough dims -- the unit the ``"hf"`` gate's cap is stated in."""
+    y = _normed_rows(k_raw, w, pool=pool, eps=eps, norm_weight_offset=norm_weight_offset, hf_rounding=True).float().abs()
+    if rope_dim:
+        half = rope_dim // 2
+        partner = torch.cat((y[..., half:rope_dim], y[..., :half]), dim=-1)
+        y = torch.cat((torch.maximum(y[..., :rope_dim], partner), y[..., rope_dim:]), dim=-1)
+    return y
+
+
+def compress_reference(k_raw, w, cos, sin, seq_lens, *, pool=_POOL, eps=_EPS, norm_weight_offset=0.0, rope_dim=_ROPE, hf_rounding=False):
     """fp32 compressed keys ``[B, floor(S / pool), D]`` and the per-entry valid
     block counts ``[B]``.
 
@@ -86,20 +122,23 @@ def compress_reference(k_raw, w, cos, sin, seq_lens, *, pool=_POOL, eps=_EPS, no
     tables, read at the block START position ``pool * b``; ``seq_lens`` ``[B]``
     or None (= S).  Blocks at or past an entry's count are not the kernel's
     to write -- the caller masks them out of the comparison.
+
+    ``hf_rounding=True`` (appended): HF's dtype flow -- the pooled key cast to the key dtype BEFORE its norm, the normed row (every
+    dim) cast to it before the rotation, the rotation in that dtype (``rot * c + rotate_half(rot) * s``, each op rounded, as
+    ``gated_block_qsa_reference.qsa_indexer_reference(hf_rounding=True)`` spells it); the values returned are fp32 but io-representable.
     """
     batch, s_tok, d = k_raw.shape
     nb = s_tok // pool
-    pooled = k_raw[:, : nb * pool].float().reshape(batch, nb, pool, d).mean(dim=2)
-    rstd = torch.rsqrt(pooled.pow(2).mean(-1, keepdim=True) + eps)
-    y = pooled * rstd * (w.float() + norm_weight_offset)
+    y = _normed_rows(k_raw, w, pool=pool, eps=eps, norm_weight_offset=norm_weight_offset, hf_rounding=hf_rounding)
     if rope_dim:
         pos = torch.arange(nb, device=k_raw.device) * pool
-        c = cos[:, pos, :rope_dim].float()
-        s = sin[:, pos, :rope_dim].float()
+        c = cos[:, pos, :rope_dim].to(y.dtype)
+        s = sin[:, pos, :rope_dim].to(y.dtype)
         yr = y[..., :rope_dim]
         half = rope_dim // 2
         rotated = torch.cat((-yr[..., half:], yr[..., :half]), dim=-1)
         y = torch.cat((yr * c + rotated * s, y[..., rope_dim:]), dim=-1)
+    y = y.float()
     lens = torch.full((batch,), s_tok, device=k_raw.device, dtype=torch.int64) if seq_lens is None else seq_lens.to(torch.int64).clamp(0, s_tok)
     return y, lens // pool
 
@@ -134,6 +173,42 @@ def _assert_one_rounding(got: torch.Tensor, want32: torch.Tensor, mask: torch.Te
             f"max |diff| among them {diff[bad].max().item():.3e}, first indices {where}"
         )
     return (got[mask] == want[mask]).float().mean().item()
+
+
+_HF_BITWISE_FLOOR = 0.999
+"""The ``"hf"`` arm's gate against the HF-rounding oracle: the fraction of elements bitwise equal (measured 99.997 .. 100.000 % at S 5 ..
+4096, bf16 and f16, on an A100 host; the flips are the rare io roundings an fp32 reduction-order / fast-rsqrt difference moves), with
+every element within ``_HF_ULP_CAP`` io ulps OF THE LARGER ROTATION OPERAND (:func:`hf_rotation_operand_magnitude`): a one-ulp flip of an
+operand moves the io-dtype rotation's result by at most two of that operand's ulps plus the result's own rounding, both operands flipping
+by five -- never measured against the result's own ulp, which a cancelling sum makes arbitrarily small (one f16 element at S 512 / 4096 sat
+beyond four of ITS ulps while within one of its operand's)."""
+_HF_ULP_CAP = 6.0
+_SINGLE_VS_HF_CEILING = 0.95
+"""The discrimination: the ``"single"`` arm against the HF-rounding oracle agrees on ~70 % of the elements (measured 0.712); a kernel
+that ignored the attribute would pass the first gate and fail this one."""
+
+
+def _bitwise_fraction(got: torch.Tensor, want32: torch.Tensor, mask: torch.Tensor) -> float:
+    want = want32.to(got.dtype)
+    return (got[mask] == want[mask]).float().mean().item()
+
+
+def _assert_hf_rounding_points(got: torch.Tensor, want32: torch.Tensor, mask: torch.Tensor, what: str, operand_mag: torch.Tensor) -> float:
+    """The ``"hf"`` arm's gate: ``>= _HF_BITWISE_FLOOR`` of the masked elements bitwise the HF-rounding oracle's rounded value and every
+    one within ``_HF_ULP_CAP`` io ulps at the larger of the rotation operand's magnitude (``operand_mag``) and the two results';
+    returns the bitwise fraction."""
+    assert torch.isfinite(want32).all(), f"{what}: the oracle itself is non-finite"
+    assert torch.isfinite(got[mask]).all(), f"{what}: non-finite kernel output"
+    want = want32.to(got.dtype)
+    diff = (got.float() - want.float()).abs()
+    ulp = _ulp(torch.maximum(operand_mag.float(), torch.maximum(got.float().abs(), want.float().abs())), got.dtype)
+    over = (diff > _HF_ULP_CAP * ulp) & mask
+    if over.any():
+        where = over.nonzero()[:8].tolist()
+        raise AssertionError(f"{what}: {int(over.sum())} elements beyond {_HF_ULP_CAP} io ulps of the HF-rounding oracle; first indices {where}")
+    frac = _bitwise_fraction(got, want32, mask)
+    assert frac >= _HF_BITWISE_FLOOR, f"{what}: only {frac * 100:.3f} % of the elements bitwise the HF-rounding oracle (floor {_HF_BITWISE_FLOOR * 100:.1f} %)"
+    return frac
 
 
 def _valid_mask(n_blocks: torch.Tensor, nb: int) -> torch.Tensor:
@@ -228,13 +303,14 @@ def test_e4m3_out_arm_is_a_typed_decline_below_sm89_and_keyed_above_it():
 
 
 @requires_cuda
+@pytest.mark.parametrize("rounding", ["single", "hf"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
 @pytest.mark.parametrize("offset", [0.0, 1.0], ids=["folded_1_plus_w", "zero_centred_w"])
 @pytest.mark.parametrize("s_tok", [5, 512, 2051, 4096])
-def test_matches_the_oracle_within_one_rounding(s_tok, offset, dtype):
+def test_matches_the_oracle_within_one_rounding(s_tok, offset, dtype, rounding):
     """Three entries: a full one, one 7 tokens short (a ragged tail), an EMPTY
-    one.  Every block an entry owns is within one ulp of the oracle; every
-    other row of ``out`` keeps its sentinel."""
+    one.  ``"single"``: every block an entry owns is within one ulp of the fp32 oracle; ``"hf"``: the HF-rounding oracle's points
+    (the statistic + the cap of the module docstring); every other row of ``out`` keeps its sentinel."""
     batch = 3
     k_raw, w, cos, sin = _make(batch, s_tok, dtype)
     w_in = (1.0 + w.float()).to(dtype) if offset == 0.0 else w
@@ -243,16 +319,72 @@ def test_matches_the_oracle_within_one_rounding(s_tok, offset, dtype):
     out = _sentinel(batch, nb, dtype)
     sentinel = out.clone()
 
-    r = build_qsa_compress(k_raw, out, w_in, cos, sin, seq_lens, rope_dim=_ROPE, eps=_EPS, norm_weight_offset=offset, stream=_stream())
+    r = build_qsa_compress(k_raw, out, w_in, cos, sin, seq_lens, rope_dim=_ROPE, eps=_EPS, norm_weight_offset=offset, stream=_stream(), rounding=rounding)
     torch.cuda.synchronize()
-    assert r.has_seq_lens and r.pool == _POOL and r.d == _D
+    assert r.has_seq_lens and r.pool == _POOL and r.d == _D and r.rounding == rounding
 
-    want, n_blocks = compress_reference(k_raw, w_in, cos, sin, seq_lens, norm_weight_offset=offset)
+    want, n_blocks = compress_reference(k_raw, w_in, cos, sin, seq_lens, norm_weight_offset=offset, hf_rounding=rounding == "hf")
     assert n_blocks.tolist() == [s_tok // _POOL, max(s_tok - 7, 0) // _POOL, 0]
     mask = _valid_mask(n_blocks, nb)
-    exact = _assert_one_rounding(out, want, mask, f"S={s_tok} {dtype} offset={offset}")
+    if rounding == "hf":
+        mag = hf_rotation_operand_magnitude(k_raw, w_in, norm_weight_offset=offset)
+        exact = _assert_hf_rounding_points(out, want, mask, f"hf S={s_tok} {dtype} offset={offset}", mag)
+    else:
+        exact = _assert_one_rounding(out, want, mask, f"S={s_tok} {dtype} offset={offset}")
     assert torch.equal(out[~mask], sentinel[~mask]), "a block the kernel does not own was written"
-    print(f"S={s_tok} {dtype} offset={offset}: {int(mask.sum())} elements checked, {exact * 100:.3f}% bitwise equal to the rounded oracle")
+    print(f"S={s_tok} {dtype} offset={offset} rounding={rounding}: {int(mask.sum())} elements checked, {exact * 100:.3f}% bitwise equal to the rounded oracle")
+
+
+@requires_cuda
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+@pytest.mark.parametrize("pool, s_tok", [(4, 4096), (1, 2048)], ids=["pool4_keys", "pool1_queries"])
+def test_hf_rounding_is_the_hf_oracles_rounding_points_and_single_is_not(pool, s_tok, dtype):
+    """The DISCRIMINATION at the key form (pool 4) and the query form (pool 1): the ``"hf"`` arm against the HF-rounding oracle passes the
+    statistic (>= 99.9 % bitwise, every element within four io ulps) while the ``"single"`` arm against the SAME oracle agrees on well
+    under 95 % of the elements (measured ~71 %), and the converse -- the ``"single"`` arm is within one ulp of the fp32 oracle.  A kernel
+    that ignored the attribute would fail the first statement; one that applied it to the wrong site would fail the gate's cap."""
+    batch = 2
+    k_raw, w, cos, sin = _make(batch, s_tok, dtype, seed=50 + pool)
+    seq_lens = None if pool == 1 else torch.tensor([s_tok, s_tok - 3], device="cuda", dtype=torch.int32)
+    nb = s_tok // pool
+    outs = {}
+    for rounding in INDEX_COMPRESS_ROUNDINGS:
+        out = _sentinel(batch, nb, dtype)
+        build_qsa_compress(k_raw, out, w, cos, sin, seq_lens, rope_dim=_ROPE, eps=_EPS, norm_weight_offset=1.0, pool=pool, stream=_stream(), rounding=rounding)
+        outs[rounding] = out
+    torch.cuda.synchronize()
+    want_hf, n_blocks = compress_reference(k_raw, w, cos, sin, seq_lens, pool=pool, norm_weight_offset=1.0, hf_rounding=True)
+    want_32, _ = compress_reference(k_raw, w, cos, sin, seq_lens, pool=pool, norm_weight_offset=1.0)
+    mask = _valid_mask(n_blocks, nb)
+    mag = hf_rotation_operand_magnitude(k_raw, w, pool=pool, norm_weight_offset=1.0)
+    frac_hf = _assert_hf_rounding_points(outs["hf"], want_hf, mask, f"hf pool {pool} {dtype}", mag)
+    frac_single_vs_hf = _bitwise_fraction(outs["single"], want_hf, mask)
+    assert (
+        frac_single_vs_hf < _SINGLE_VS_HF_CEILING
+    ), f"the single arm agrees with the HF-rounding oracle on {frac_single_vs_hf * 100:.2f} %: the attribute changed nothing"
+    _assert_one_rounding(outs["single"], want_32, mask, f"single pool {pool} {dtype}")
+    assert not torch.equal(outs["single"], outs["hf"])
+    print(f"pool {pool} {dtype}: hf vs HF oracle {frac_hf * 100:.3f} % bitwise; single vs HF oracle {frac_single_vs_hf * 100:.2f} % bitwise")
+
+
+@requires_cuda
+def test_rounding_is_a_per_recipe_key_and_the_default_key_is_unchanged():
+    """``compile_qsa_compress(rounding="single")`` returns TODAY's artifact (the same cache key as no argument), ``"hf"`` a distinct one at
+    pool 4 AND at pool 1 (per recipe: the key recipe and the query recipe each take it), the e4m3 arm composes with it; an unknown value
+    is a ``ValueError`` naming ``INDEX_COMPRESS_ROUNDINGS``."""
+    assert INDEX_COMPRESS_ROUNDINGS == ("single", "hf")
+    for pool in (4, 1):
+        base = dict(dtype=torch.bfloat16, d=_D, rope_dim=_ROPE, pool=pool, has_seq_lens=pool == 4)
+        r0 = compile_qsa_compress(**base)
+        assert compile_qsa_compress(rounding="single", **base).compiled is r0.compiled and r0.rounding == "single"
+        rh = compile_qsa_compress(rounding="hf", **base)
+        assert rh.compiled is not r0.compiled and rh.rounding == "hf"
+        assert compile_qsa_compress(rounding="hf", **base).compiled is rh.compiled
+        if _CC is not None and _CC >= (8, 9):
+            e4 = compile_qsa_compress(rounding="hf", out_dtype=_E4M3, **base)
+            assert e4.compiled is not rh.compiled and e4.compiled is not compile_qsa_compress(out_dtype=_E4M3, **base).compiled
+    with pytest.raises(ValueError, match=r"rounding must be one of \('single', 'hf'\)"):
+        compile_qsa_compress(dtype=torch.bfloat16, d=_D, rope_dim=_ROPE, rounding="vllm")
 
 
 @requires_cuda
