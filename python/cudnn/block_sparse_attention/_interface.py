@@ -1593,6 +1593,12 @@ def _bsa_attn_fwd_sm120_fp8(
     current_stream = cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
     tile_m = sparse_block_size
     wave_split = 0
+    # Short loops benefit from consuming each K32 probability chunk promptly.
+    # Long fixed-count loops amortize conversion/synchronization over K64.
+    # This is a scheduling choice, not a change to the N128 softmax reduction.
+    p_tile_size = 32
+    if sparse_block_size == 128 and k_quant_block_size == 1 and v_block_size == 128 and not has_block_nums and fixed_block_sparse_num >= 128:
+        p_tile_size = 64
     k_scale_tma = (
         sparse_block_size == 128
         and k_quant_block_size == 1
@@ -1626,7 +1632,7 @@ def _bsa_attn_fwd_sm120_fp8(
         block_sizes_mode=block_sizes_mode,
         **({"v_block_size": v_block_size} if v_block_size else {}),
         **(
-            {"k_quant_block_size": k_quant_block_size, "tile_m": tile_m, "wave_split": wave_split, "k_scale_tma": k_scale_tma}
+            {"k_quant_block_size": k_quant_block_size, "tile_m": tile_m, "wave_split": wave_split, "k_scale_tma": k_scale_tma, "_p_tile_size": p_tile_size}
             if sparse_block_size == 128
             else {}
         ),
@@ -1643,6 +1649,7 @@ def _bsa_attn_fwd_sm120_fp8(
             tile_m,
             wave_split,
             k_scale_tma,
+            p_tile_size,
             head_dim,
             has_block_nums,
             has_block_sizes,

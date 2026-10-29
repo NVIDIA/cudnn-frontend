@@ -271,6 +271,14 @@ the maximum reduction and exponentiation. P uses the unchanged factor of
 are applied to output channels after PV accumulation. A transposed V storage
 tile of 128 tokens is only a layout choice, **not** a V quantization block.
 
+For blocked V storage, the per-token kernel establishes the maximum over the
+complete 128-key score tile, then converts and consumes P in 32- or 64-key
+chunks. This interleaves probability conversion with PV while retaining the
+original ordered FP32 denominator and K32 MMA accumulation order. The chunk
+width is an internal scheduling choice with a separate compile-cache key;
+it does not change the quantization granularity or normalize each chunk
+independently. The coarse-K and unblocked-V paths retain their existing schedule.
+
 Per-token K requires CuTe DSL >= 4.8.0, SM120, `sparse_block_size=128`, MHA,
 and D=128. Tails, variable sparse counts, empty rows, and partial KV blocks
 follow the existing SM120 contract. Other architectures and blk64 reject

@@ -834,7 +834,8 @@ def test_sm120_fp8_blk128_shared_p_fragment_bitwise(input_kind):
 
 
 @pytest.mark.L0
-def test_sm120_fp8_blk128_ordered_softmax_and_rescale_bitwise():
+@pytest.mark.parametrize("stream_chunk", (0, 32, 64))
+def test_sm120_fp8_blk128_ordered_softmax_and_rescale_bitwise(stream_chunk):
     """Preserve ordered FP32 sums and identity scaling, including subnormals."""
     _require_sm120()
     import cutlass
@@ -846,7 +847,9 @@ def test_sm120_fp8_blk128_ordered_softmax_and_rescale_bitwise():
         _rescale_o_for_next_acc_fp8,
     )
     from cudnn.block_sparse_attention.csrc.fwd.sm120_blk128.bsa_fwd_sm120_fp8 import (
+        _normalize_softmax_chunk_fp8,
         _online_softmax_ordered_fp8,
+        _prepare_softmax_streaming_fp8,
         _rescale_o_if_needed_fp8,
     )
     from cudnn.block_sparse_attention.csrc.utils import layout_utils
@@ -889,7 +892,17 @@ def test_sm120_fp8_blk128_ordered_softmax_and_rescale_bitwise():
                 tScale = _online_softmax_fp8(tiled_mma, tSrS, tMax, tSum, tQScale, 8.0, tKScale)
                 _rescale_o_for_next_acc_fp8(tiled_mma, tOrO, tScale)
             else:
-                tScale = _online_softmax_ordered_fp8(tiled_mma, tSrS, tMax, tSum, tQScale, 8.0, tKScale)
+                if cutlass.const_expr(stream_chunk == 0):
+                    tScale = _online_softmax_ordered_fp8(tiled_mma, tSrS, tMax, tSum, tQScale, 8.0, tKScale)
+                else:
+                    tScale, scaled_max = _prepare_softmax_streaming_fp8(tSrS, tMax, tSum, tQScale, 8.0)
+                    for chunk in cutlass.range_constexpr(128 // stream_chunk):
+                        groups = cute.size(tSrS, mode=[2]) // (128 // stream_chunk)
+                        scores_part = cute.make_tensor(
+                            tSrS.iterator + chunk * groups * tSrS.stride[2],
+                            cute.make_layout((tSrS.shape[0], tSrS.shape[1], groups), stride=tSrS.stride),
+                        )
+                        _normalize_softmax_chunk_fp8(scores_part, scaled_max, tSum, tQScale)
                 _rescale_o_if_needed_fp8(tOrO, tScale)
             thr_mma.partition_C(mPResult[case, implementation, None, None]).store(tSrS.load())
             thr_mma.partition_C(mOResult[case, implementation, None, None]).store(tOrO.load())
@@ -930,6 +943,9 @@ def test_sm120_fp8_blk128_ordered_softmax_and_rescale_bitwise():
     previous_sum[3] = 0
     q_scale = torch.rand((128,), device="cuda", generator=generator) * 0.01 + 0.001
     k_scale = torch.rand((4, 8), device="cuda", generator=generator) + 0.125
+    if stream_chunk:
+        # The streaming helper sees already-descaled per-token scores.
+        k_scale.fill_(1.0)
     bit_patterns = torch.tensor(
         [0, -2147483648, 1, -2147483647, 8388607, -2139095041, 8388608, -2139095040, 1065353216, -1082130432],
         device="cuda",
@@ -949,3 +965,66 @@ def test_sm120_fp8_blk128_ordered_softmax_and_rescale_bitwise():
     for result in (probabilities, outputs, statistics):
         # Integer views also check the sign of zero and exact subnormal bits.
         assert torch.equal(result[:, 0].view(torch.int32), result[:, 1].view(torch.int32))
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=120128)
+def test_sm120_fp8_per_token_probability_chunk_cache_and_parity(monkeypatch):
+    """K32/K64 schedules use distinct cache entries and identical arithmetic."""
+    _require_sm120(per_token=True)
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    native = importlib.import_module("cudnn.block_sparse_attention.csrc.fwd.sm120_blk128.bsa_fwd_sm120_fp8")
+    from cudnn.block_sparse_attention._fp8_quant import _quantize_sage_bhsd
+
+    kernel = native.BlockSparseAttnForwardFp8Sm120Blk128
+    # Hold compiler flags constant so they cannot hide a missing chunk key.
+    monkeypatch.setattr(kernel, "_compile_options", "")
+    monkeypatch.setattr(interface._bsa_attn_fwd_sm120_fp8, "compile_cache", {})
+    original_compile = interface.cute.compile
+    compiled_chunks = []
+    executed_chunks = []
+
+    def record_compile(instance, *args, **kwargs):
+        chunk = instance.p_tile_size
+        compiled_chunks.append(chunk)
+        compiled = original_compile(instance, *args, **kwargs)
+
+        def record_execute(*runtime_args):
+            executed_chunks.append(chunk)
+            return compiled(*runtime_args)
+
+        return record_execute
+
+    q = torch.randn((1, 1, 147, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 1, 16384, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    quantized = _quantize_sage_bhsd(q, k, v, v_block_size=128, k_quant_block_size=1)
+    indices = torch.arange(128, device="cuda", dtype=torch.int32).expand(1, 1, 2, 128).contiguous()
+    monkeypatch.setattr(interface.cute, "compile", record_compile)
+    results = []
+    for topk in (128, 127, 128, 127):
+        results.append(interface._bsa_attn_fwd_sm120_fp8(*quantized, indices, topk, 128**-0.5, sparse_block_size=128, v_block_size=128, k_quant_block_size=1))
+    torch.cuda.synchronize()
+    assert compiled_chunks == [64, 32]
+    assert executed_chunks == [64, 32, 64, 32]
+    for actual, expected in zip(results[2:], results[:2]):
+        for output, reference in zip(actual, expected):
+            torch.testing.assert_close(output, reference, rtol=0, atol=0)
+
+    # Runtime-count dispatch uses K32 even for 128 blocks. Compare both O and
+    # LSE against K64 with exactly the same quantized operands and block list.
+    counts = torch.full((1, 1, 2), 128, device="cuda", dtype=torch.int32)
+    variable = interface._bsa_attn_fwd_sm120_fp8(
+        *quantized,
+        indices,
+        128,
+        128**-0.5,
+        q2k_block_nums=counts,
+        sparse_block_size=128,
+        v_block_size=128,
+        k_quant_block_size=1,
+    )
+    torch.cuda.synchronize()
+    assert compiled_chunks == [64, 32, 32]
+    for output, reference in zip(variable, results[0]):
+        torch.testing.assert_close(output, reference, rtol=0, atol=0)
