@@ -2140,3 +2140,17 @@ class TestNativeD64Fp8Narrow:
 
     test_rebind_replay = staticmethod(narrow_rebind_replay)
     test_standalone = staticmethod(narrow_standalone)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeD64Half:
+    """Native D64 regressions collected by the SM107 CI entrypoint."""
+
+    import native_d64_sm107_test_utils as _checks
+
+    test_independent_origins = staticmethod(_checks.test_native_d64_independent_origins)
+    test_ragged_replay = staticmethod(_checks.test_native_d64_ragged_replay)
+    test_dense_pack_replay = staticmethod(_checks.test_native_d64_dense_pack_replay)
+    test_standalone_compact_thd = staticmethod(_checks.test_native_d64_standalone_compact_thd)

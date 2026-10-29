@@ -4166,3 +4166,23 @@ THD retains its compact packed contract. The SM107 D512 graph row remains
 BSHD-only; this change does not widen that row or deterministic support.
 Detector: `test_sdpa_bwd_native_layouts_sm100.py` checks native binding,
 padding canaries, fresh allocations, stream handling and changed-data replay.
+
+### Native SM107 half D64 ragged and packed execution
+
+The native D64 flavor supports nonpaged THD with FP16/BF16 Q/K/V/O,
+CGA1/CGA2, packed or unpacked GQA, natural/LPT scheduling, and TILE_N 64/128.
+Packed token/head-major and explicitly padded Stats retain their existing
+contracts. Independent physical origins and runtime length rebinding use the
+prepared THD chain without staging copies. Dense PackGQA uses the native
+64-wide tile, including smaller aligned head dimensions through its envelope.
+Paged KV, splitting, score side outputs and pre-folded scale keep their
+existing larger-flavor selection and admission boundaries. D32 THD remains
+outside this native flavor.
+
+Unsplit nonpaged native D64 PackGQA is currently available through explicit
+plans. Automatic packed proposals still use the historical shared-D128
+eligibility predicate; extending that policy is a separate heuristics change.
+The existing split candidates keep their D128 selection.
+`test_sdpa_fp8_sm107.py::TestNativeD64Half` exposes all 60 native regression
+cases through the SM107 CI entrypoint; its shared helper module is not
+collected separately.
