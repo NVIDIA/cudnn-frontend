@@ -26,6 +26,8 @@ from gemm_test_utils import (
     reduction_dims as _reduction_dims,
     FULL_EXPERT_REDUCE_OFFSETS as _FULL_EXPERT_REDUCE_OFFSETS,
     plan_as_sm100,
+    INT8_STORE_VALUES,
+    int8_store_ref,
 )
 
 from cudnn.gemm.frost.compiler import force_stg_epi, jit_from_cudnn_graph
@@ -2008,6 +2010,31 @@ def test_gather_layouts_and_frontend_sm120(case):
     if case == "frontend" and active_family() != "sm120":
         pytest.skip("set CUDNN_FRONTEND_GEMM_ARCH_FAMILY=sm120 before import to replay the public SM120 plan on SM10.x")
     _run_gather_layouts_and_frontend(C120, by_name(_SM120_CFG), case)
+
+
+@requires_matmul_gpu
+@pytest.mark.parametrize("swap_ab,out_dt", [(False, torch.int8), (True, torch.uint8)], ids=["int8", "swap_ab-uint8"])
+def test_moe_int8_output_rounds_to_nearest_even_and_saturates_sm120(swap_ab, out_dt):
+    """A bf16 MoE GEMM stored straight to INT8 / UINT8 rounds half to even,
+    saturates and stores NaN as 0, as cuDNN's native engines do. The epilogue's
+    bare .to() rounded toward zero and kept the low byte (2.75 -> 2, 300 -> 44).
+    Token row s is x_s exactly: one nonzero K term against unit weights."""
+    from cudnn.gemm.frost.sm120 import compiler as C120
+
+    E, S, N, K = 2, 256, 128, 128
+    output_dt = cudnn.data_type.UINT8 if out_dt is torch.uint8 else cudnn.data_type.INT8
+    compiled = C120.jit_from_cudnn_graph(_build_graph(E, S, N, K, output_dt=output_dt), config=replace(by_name(_SM120_CFG), swap_ab=swap_ab))
+    x = torch.tensor(INT8_STORE_VALUES, dtype=torch.bfloat16).repeat(-(-S // len(INT8_STORE_VALUES)))[:S].cuda()
+    token = torch.zeros(1, S, K, dtype=torch.bfloat16, device="cuda")
+    token[0, :, 0] = x
+    weight = torch.zeros(E, N, K, dtype=torch.bfloat16, device="cuda")
+    weight[:, :, 0] = 1.0
+    out = torch.full((1, S, N), 0x5A, dtype=out_dt, device="cuda")
+    compiled(_vp_moe(compiled, token, weight, _offsets([128, 128], S), out))
+    torch.cuda.synchronize()
+    ref = int8_store_ref(x, out_dt).view(1, S, 1).expand(1, S, N)
+    bad = (out != ref).any(dim=2)[0].nonzero().flatten().tolist()
+    assert not bad, "x -> got (expected): " + ", ".join(f"{float(x[s])} -> {int(out[0, s, 0])} ({int(ref[0, s, 0])})" for s in bad[:8])
 
 
 @pytest.mark.parametrize("weight_major", ["k", "n"])

@@ -476,11 +476,30 @@ def _emit_op(
     raise AssertionError(f"unhandled op {op.op!r}")
 
 
+# int8 / uint8 values round to nearest even and saturate, NaN to 0 (cvt.rni.sat), as cuDNN's native engines store
+# them. A bare .to() lowers to fptosi / trunci, which round toward zero and keep the low byte (2.75 -> 2, 300 -> 44).
+_INT8_RANGES: dict[str, tuple[int, int]] = {"int8": (-128, 127), "uint8": (0, 255)}
+
+
 def _emit_round(var: str, out_dtype: Dtype, tag: str, *, source_dtype: Dtype = "fp32") -> tuple[list[str], str]:
     """Round a register value to its declared dtype."""
     if out_dtype == "fp32" and source_dtype == "fp32":
         return [], var
     new = f"_r_{tag}"
+    if out_dtype in _INT8_RANGES and source_dtype in ("fp32", "int32"):
+        lo, hi = _INT8_RANGES[out_dtype]
+        sat = f"_sat_{tag}"
+        if source_dtype == "int32":
+            lines = [
+                f"{sat} = cute.math.min(cute.math.max({var}, cutlass.full_like({var}, cutlass.Int32({lo}))), cutlass.full_like({var}, cutlass.Int32({hi})))"
+            ]
+        else:
+            # max(x, 0) + min(x, 0) is x, or 0 for NaN: max / min return the non-NaN operand.
+            lines = [
+                f"{sat} = cute.math.max({var}, {_fl(var, 0.0)}) + cute.math.min({var}, {_fl(var, 0.0)})",
+                f"{sat} = cute.math.min(cute.math.max(cute.math.roundeven({sat}), {_fl(sat, lo)}), {_fl(sat, hi)})",
+            ]
+        return lines + [f"{new} = ({sat}).to({DTYPE_TO_CUTLASS[out_dtype]})"], new
     lines = [f"{new} = ({var}).to({DTYPE_TO_CUTLASS[out_dtype]})"]
     if out_dtype == "fp32" and source_dtype == "int32":
         lines.append(f"{new} = {new} + cutlass.full_like({new}, 0.0)")

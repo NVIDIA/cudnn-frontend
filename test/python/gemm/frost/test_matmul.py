@@ -32,6 +32,8 @@ from gemm_test_utils import (
     e5m3_quant_ref as _e5m3_quant_ref,
     e5m3_to_float as _e5m3_to_float,
     requires_sm107,
+    INT8_STORE_VALUES as _INT8_STORE_VALUES,
+    int8_store_ref as _int8_store_ref,
 )
 
 # Module-wide GPU gate — every test here is end-to-end and needs Blackwell.
@@ -2278,6 +2280,55 @@ def test_int8_matmul(config_name: str, out_dt: str) -> None:
     else:
         diff = (c.float().cpu() - ref.to(torch_dt).float()).abs().max().item()
     assert diff == 0.0, f"{config_name} -> {out_dt}: max|diff|={diff} (expected bit-exact)"
+
+
+@pytest.mark.parametrize("compute,out_dt,out_major", [("fp32", "int8", "n"), ("fp32", "uint8", "m"), ("int32", "int8", "m"), ("int32", "uint8", "n")])
+def test_sm120_int8_output_rounds_to_nearest_even_and_saturates(compute: str, out_dt: str, out_major: str) -> None:
+    """GEMM -> mul(scale) -> INT8 / UINT8 output, in FLOAT and in INT32 compute.
+    The epilogue narrowed with a bare .to(): fptosi rounded toward zero and kept
+    the low byte (2.75 -> 2, 128 -> -128, 300 -> 44), and trunci wrapped the
+    INT32 chain the same way. Row m of the GEMM is x_m exactly (one nonzero K term)."""
+    cfg = _resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    _skip_unless_active(cfg)
+    M = N = K = 64
+    int_chain = compute == "int32"
+    io = cudnn.data_type.INT8 if int_chain else _BF16
+    comp = cudnn.data_type.INT32 if int_chain else cudnn.data_type.FLOAT
+    g = cudnn.pygraph(io_data_type=io, intermediate_data_type=comp, compute_data_type=comp)
+    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"), data_type=io)
+    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"), data_type=io)
+    scale = g.tensor(name="scale", dim=[1, 1, 1], stride=[1, 1, 1], data_type=comp)
+    C = g.matmul(A=A, B=B, compute_data_type=comp, name="mm")
+    C.set_data_type(comp)
+    Y = g.mul(a=C, b=scale, compute_data_type=comp, name="requant")
+    Y.set_output(True).set_data_type(cudnn.data_type.UINT8 if out_dt == "uint8" else cudnn.data_type.INT8)
+    if out_major == "m":
+        Y.set_stride([M * N, 1, M])
+    compiled = _plan(g, config=cfg)
+    assert [(op.op, op.compute_dtype, op.out_dtype) for op in compiled.chain.ops] == [("mul", compute, out_dt)]
+
+    if int_chain:
+        # 3 * int8 spans [-381, 381]: in range, and past both edges of int8 and uint8.
+        col = torch.tensor([100, -100, 50, -43, 42, 43, 85, -86, 127, -127, 1, -1, 0, 90, -90, 60], dtype=torch.int8)
+        b_val, s_val = 3, torch.ones(1, 1, 1, dtype=torch.int32, device="cuda")
+    else:
+        col = torch.tensor(_INT8_STORE_VALUES, dtype=torch.bfloat16)
+        b_val, s_val = 1, torch.ones(1, 1, 1, dtype=torch.float32, device="cuda")
+    col = col.repeat(-(-M // len(col)))[:M]
+    a = torch.zeros(1, M, K, dtype=col.dtype, device="cuda")
+    a[0, :, 0] = col.cuda()
+    b = torch.zeros(1, N, K, dtype=col.dtype, device="cuda")
+    b[0, :, 0] = b_val
+    torch_dt = torch.uint8 if out_dt == "uint8" else torch.int8
+    c = torch.full((1, N, M) if out_major == "m" else (1, M, N), 0x5A, dtype=torch_dt, device="cuda")
+    c = c.transpose(1, 2) if out_major == "m" else c
+    compiled(_vp(compiled, a, b, c, s_val))
+    torch.cuda.synchronize()
+
+    x = col.float().cuda() * b_val
+    ref = _int8_store_ref(x, torch_dt).view(1, M, 1).expand(1, M, N)
+    bad = (c != ref).any(dim=2)[0].nonzero().flatten().tolist()
+    assert not bad, "x -> got (expected): " + ", ".join(f"{float(x[m])} -> {int(c[0, m, 0])} ({int(ref[0, m, 0])})" for m in bad[:8])
 
 
 # M-major batched output. The 32B store-alignment rule moves from N to M
