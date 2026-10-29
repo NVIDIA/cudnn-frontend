@@ -395,7 +395,7 @@ def _render_tile_constants(
         f"mma_a_dtype = {DTYPE_TO_CUTLASS[mma_a_dt]}",
         f"mma_b_dtype = {DTYPE_TO_CUTLASS[mma_b_dt]}",
         f"mma_c_dtype = {DTYPE_TO_CUTLASS[accum_dt]}",
-        f"acc_widen_to_fp32 = {accum_dt == 'int32' and out_dt != 'int32'}",
+        f"acc_widen_to_fp32 = {chain.widen_integer_accumulators}",
         f"ab_tma_dtype = {DTYPE_TO_CUTLASS[mma_a_dt]}",
         "",
         "tile_swizzle_n = 0",
@@ -2254,15 +2254,6 @@ def _check_graph_lowered(state: dict, chain: FusionChain, binding: "GemmBinding 
             "its operands straight from graph inputs -- a multi-GEMM graph has no mainloop fusion, and no GEMM "
             "consumes another GEMM's result"
         )
-    if chain.is_multi_gemm and chain.ops:
-        io_dtype, intermediate_dtype = state["io_dtype"], state["intermediate_dtype"]
-        declared = [_resolve_out_dtype(op.output, op.output_tensor, io_dtype, intermediate_dtype, meta) for op in ops if op.cudnn_name in _GEMM_NODE_KINDS]
-        if len(set(declared)) > 1:
-            raise NotImplementedError(
-                f"frost_gemm: the parallel GEMMs' outputs declare different dtypes {declared}; the fused multi-GEMM "
-                f"epilogue rounds every GEMM's accumulator to one ({chain.matmul.out_dtype}), so it would not "
-                "compute this graph"
-            )
 
 
 def _with_declared_output_layouts(chain: FusionChain, binding: "GemmBinding | None") -> FusionChain:
@@ -2623,8 +2614,8 @@ def _launch_moe_swap_ab(
     aux = [wrap(_reshape_aux_to_fake(buf, ref), _LEADING_DIM_AUX) for ref, buf in zip(chain.aux_tensors, aux)]
     slots = compiled._grid_ctas * compiled._desc_slots_per_cta
     workspace = compiled._make_workspace(slots + _MOE_SCHED_COUNTER_SLOTS, workspace)
-    _initialize_reduction_outputs(chain, outputs, stream)
     _check_moe_combine_operands(chain, weights, tokens, offsets, weight_sf, token_sf, (token_index, token_ks, top_k_scores), outputs, k, workspace)
+    _initialize_reduction_outputs(chain, outputs, stream)
     _initialize_combine_output(chain, outputs, stream)
     return compiled._launch_moe(problem, offsets, workspace, (*a, *b, *sf), c, aux, stream, token_index, token_ks, top_k_scores)
 

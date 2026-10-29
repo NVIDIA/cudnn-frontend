@@ -530,6 +530,7 @@ class FusionChain:
     moe: "MoeSpec | None" = None
     reductions: list[ReductionSpec] = field(default_factory=list)
     quants: list["BlockQuantizeSpec"] = field(default_factory=list)
+    gemm_out_dtypes: tuple[Dtype, ...] = ()
 
     def __post_init__(self) -> None:
         for i, spec in enumerate(self.output_specs):
@@ -544,6 +545,10 @@ class FusionChain:
             raise ValueError("num_a_operands / num_b_operands must be positive")
         if not self.gemm_operands:
             raise ValueError("gemm_operands must list at least one GEMM")
+        if self.gemm_out_dtypes and len(self.gemm_out_dtypes) != self.num_gemms:
+            raise ValueError("gemm_out_dtypes must describe every GEMM")
+        if any(dtype not in SUPPORTED_DTYPES for dtype in self.gemm_out_dtypes):
+            raise ValueError(f"unsupported GEMM output dtypes: {self.gemm_out_dtypes}")
         for g, (ai, bi) in enumerate(self.gemm_operands):
             if not (0 <= ai < self.num_a_operands) or not (0 <= bi < self.num_b_operands):
                 raise ValueError(f"gemm_operands[{g}]=({ai},{bi}) out of range for " f"{self.num_a_operands} A / {self.num_b_operands} B operands")
@@ -666,9 +671,24 @@ class FusionChain:
         return self.output_specs[0].dtype if self.output_specs else "bf16"
 
     @property
+    def widen_integer_accumulators(self) -> bool:
+        """Select the register format entering the epilogue."""
+        return self.matmul.accum_dtype == "int32" and self.gemm_out_dtype(0) != "int32" and not self.is_multi_gemm
+
+    @property
     def out_major(self) -> "OutMajor":
         """Layout of the primary-ABI-slot output."""
         return self.output_specs[0].major if self.output_specs else "n"
+
+    def gemm_out_dtype(self, index: int) -> Dtype:
+        """Return one GEMM's declared output dtype."""
+        if self.gemm_out_dtypes:
+            return self.gemm_out_dtypes[index]
+        if self.is_multi_gemm and not self.ops:
+            for spec in self.output_specs:
+                if spec.source_ref == gemm_source(index) and spec.quant_idx is None:
+                    return spec.dtype
+        return self.matmul.out_dtype
 
     def aux_by_name(self, name: str) -> TensorRef:
         for t in self.aux_tensors:

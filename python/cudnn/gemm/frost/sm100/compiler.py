@@ -653,7 +653,7 @@ def _render_tile_constants(
         f"mma_a_dtype = {DTYPE_TO_CUTLASS[mma_a_dt]}",
         f"mma_b_dtype = {DTYPE_TO_CUTLASS[mma_b_dt]}",
         f"mma_c_dtype = {DTYPE_TO_CUTLASS[accum_dt]}",
-        f"acc_widen_to_fp32 = {accum_dt == 'int32' and out_dt != 'int32'}",
+        f"acc_widen_to_fp32 = {chain.widen_integer_accumulators}",
         f"ab_tma_dtype = {DTYPE_TO_CUTLASS[mma_a_dt]}",
         f"mma_kind = {DTYPE_TO_MMA_KIND[mma_a_dt]}",
         *_epi_swizzle_lines(cfg, epi_store_dt, chain),
@@ -697,12 +697,7 @@ def _render_tile_constants(
         # Per-operand fusion flags (const_expr-gated in the template).
         lines.append(f"mainloop_fuse_a = {chain.has_mainloop_fusion_a}")
         lines.append(f"mainloop_fuse_b = {chain.has_mainloop_fusion_b}")
-        koob_fix = (
-            chain.has_mainloop_fusion_a
-            and chain.has_mainloop_fusion_b
-            and not _mainloop_chain_zero_preserving(chain.mainloop_a_ops)
-            and not _mainloop_chain_zero_preserving(chain.mainloop_b_ops)
-        )
+        koob_fix = not _mainloop_chain_zero_preserving(chain.mainloop_a_ops) or not _mainloop_chain_zero_preserving(chain.mainloop_b_ops)
         lines.append(f"mainloop_koob_fix = {koob_fix}")
         _bbits = (cfg.cta_tile_k_bytes // 16).bit_length() - 1
         lines.append(f"ab_swizzle = cutlass.Swizzle({_bbits}, 4, 3)")

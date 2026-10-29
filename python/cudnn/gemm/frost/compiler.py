@@ -615,6 +615,33 @@ def _check_moe_combine_n(compiled, n: int) -> None:
         raise ValueError(f"MoE COMBINE runtime kernel N must be divisible by {multiple} for the compiled epilogue; got N={n}")
 
 
+def _check_moe_operand_shapes(chain, a_bufs, b_bufs) -> None:
+    """Validate grouped operand shapes and logical K extents."""
+    swapped = isinstance(chain.moe, MoeSwapAbSpec)
+    tokens, weights = (b_bufs, a_bufs) if swapped else (a_bufs, b_bufs)
+    token_dtype = chain.matmul.b_dtype if swapped else chain.matmul.a_dtype
+    weight_dtype = chain.matmul.a_dtype if swapped else chain.matmul.b_dtype
+    for role, operands in (("token", tokens), ("weight", weights)):
+        for index, value in enumerate(operands):
+            if len(value.shape) != 3:
+                raise ValueError(f"MoE {role} operand[{index}] must be rank-3; got {tuple(value.shape)}")
+    rows = tokens[0].shape[1]
+    k = tokens[0].shape[2] * (2 if token_dtype == "fp4_e2m1" else 1)
+    experts, n = weights[0].shape[:2]
+    for index, value in enumerate(tokens):
+        if tuple(value.shape[:2]) != (1, rows):
+            raise ValueError("MoE token operands must share shape [1,S,K]")
+        actual = value.shape[2] * (2 if token_dtype == "fp4_e2m1" else 1)
+        if actual != k:
+            raise ValueError(f"MoE token operand[{index}] must have logical K={k}; got {actual}")
+    for index, value in enumerate(weights):
+        if tuple(value.shape[:2]) != (experts, n):
+            raise ValueError("MoE weight operands must share shape [E,N,K] in kernel order")
+        actual = value.shape[2] * (2 if weight_dtype == "fp4_e2m1" else 1)
+        if actual != k:
+            raise ValueError(f"MoE weight operand[{index}] must have logical K={k}; got {actual}")
+
+
 def _resolve_moe_variant_pack(compiled, variant_pack: dict):
     """Resolve MoE buffers and runtime dimensions."""
     b = compiled.binding
@@ -687,6 +714,7 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
         sfa = [_kernel_order(pull(t, "SFA"), t, memo) for t in b.sfa_operands]
         sfb = [pull(t, "SFB") for t in b.sfb_operands]
         mm = compiled.chain.matmul
+        _check_moe_operand_shapes(compiled.chain, a_bufs, b_bufs)
         token_index, token_ks = routing_indices(b_bufs)
         m = a_bufs[0].shape[1]
         n = token_index.shape[0] if token_index is not None else b_bufs[0].shape[1]
@@ -704,6 +732,7 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
     fto = pull(b.first_token_offset, "first_token_offset")
     sfa = [pull(t, "SFA") for t in b.sfa_operands]
     sfb = [_kernel_order(pull(t, "SFB"), t, memo) for t in b.sfb_operands]
+    _check_moe_operand_shapes(compiled.chain, a_bufs, b_bufs)
     k_factor = 2 if compiled.chain.matmul.a_dtype == "fp4_e2m1" else 1
     token_index, token_ks = routing_indices(a_bufs)
     S = token_index.shape[0] if token_index is not None else a_bufs[0].shape[1]
@@ -1074,6 +1103,13 @@ class _CompiledFusedGemm(_CompiledRuntime):
                         return refuse(operands, graph_order)
             if split_k_slices > 1:
                 backend.check_split_k_shape(k, n, batch, split_k_slices, cta_k_elems, reduce_elems if needs_workspace else 1)
+            extra = ()
+            if needs_workspace:
+                if workspace is None:
+                    raise ValueError(
+                        "cudnn.frost gemm: this plan needs a workspace; allocate graph.get_workspace_size() bytes and pass the buffer to execute()"
+                    )
+                extra = (workspace.view(0, "float32", (split_k_slices * batch * m * n,)),)
             if seeds:
                 fills = []
                 for idx, word, elem_bytes in seeds:
@@ -1095,13 +1131,6 @@ class _CompiledFusedGemm(_CompiledRuntime):
                         fill_word(ptr, count, word, stream)
                     else:
                         apply_fill(ptr, plan, word, stream)
-            extra = ()
-            if needs_workspace:
-                if workspace is None:
-                    raise ValueError(
-                        "cudnn.frost gemm: this plan needs a workspace; allocate graph.get_workspace_size() bytes and pass the buffer to execute()"
-                    )
-                extra = (workspace.view(0, "float32", (split_k_slices * batch * m * n,)),)
             return launchable(
                 tuple(problem),
                 *(v.permute(1, 2, 0) for v in vs),
@@ -1139,7 +1168,7 @@ class _CompiledFusedGemm(_CompiledRuntime):
         if self._validate_runtime_quant:
             m, n = (int(mnk[0]), int(mnk[1]))
             if self.config.swap_ab and self.chain.quants:
-                from fusion_ir import swap_ab
+                from .fusion_ir import swap_ab
 
                 try:
                     graph_chain = swap_ab(self.chain)
@@ -1191,7 +1220,6 @@ class _CompiledMoeGemm(_CompiledMoeBase):
                 )
         num_experts = int(weight.shape[0])
         num_groups = backend._moe_num_groups(first_token_offset, num_experts)
-        backend._initialize_reduction_outputs(self.chain, outputs, stream)
         a_perm = token.permute(1, 2, 0)
         b_perm = weight.permute(1, 2, 0)
         c_perms = [t.permute(1, 2, 0) for t in outputs]
@@ -1213,6 +1241,7 @@ class _CompiledMoeGemm(_CompiledMoeBase):
             backend._check_moe_combine_operands(
                 self.chain, [token], [weight], first_token_offset, [], [], (token_index, token_ks, top_k_scores), outputs, K, workspace
             )
+        backend._initialize_reduction_outputs(self.chain, outputs, stream)
         backend._initialize_combine_output(self.chain, outputs, stream)
         return self._launch_moe(problem_size, first_token_offset, workspace, (a, b), cs, (), stream, token_index, token_ks, top_k_scores)
 
@@ -1310,7 +1339,6 @@ class _CompiledMoeGemm(_CompiledMoeBase):
                 )
         num_experts = int(b_slots[0].shape[0])
         num_groups = backend._moe_num_groups(first_token_offset, num_experts)
-        backend._initialize_reduction_outputs(chain, outs, stream)
         a_stride_perms = [t.permute(1, 2, 0) for t in a_slots]
         b_stride_perms = [t.permute(1, 2, 0) for t in b_slots]
         c_perms = [ci.permute(1, 2, 0) for ci in outs]
@@ -1338,6 +1366,7 @@ class _CompiledMoeGemm(_CompiledMoeBase):
         workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + backend._MOE_SCHED_COUNTER_SLOTS, workspace)
         if self._validate_combine:
             backend._check_moe_combine_operands(chain, a_slots, b_slots, first_token_offset, [], [], (token_index, token_ks, top_k_scores), outs, K, workspace)
+        backend._initialize_reduction_outputs(chain, outs, stream)
         backend._initialize_combine_output(chain, outs, stream)
         return self._launch_moe(problem_size, first_token_offset, workspace, (*a_wrapped, *b_wrapped), cs, aux, stream, token_index, token_ks, top_k_scores)
 
@@ -1383,7 +1412,6 @@ class _CompiledMoeBlockScaleGemm(_CompiledMoeBase):
         scale_blob_reason = backend._grouped_row_quant_scale_blob_reject(self.chain, outputs, S, N, num_groups)
         if scale_blob_reason is not None:
             raise ValueError(scale_blob_reason)
-        backend._initialize_reduction_outputs(self.chain, outputs, stream)
         a_perm = token.permute(1, 2, 0)
         b_perm = weight.permute(1, 2, 0)
         c_perms = [t.permute(1, 2, 0) for t in outputs]
@@ -1411,6 +1439,7 @@ class _CompiledMoeBlockScaleGemm(_CompiledMoeBase):
             backend._check_moe_combine_operands(
                 self.chain, [token], [weight], first_token_offset, *sfs, (token_index, token_ks, top_k_scores), outputs, K, workspace
             )
+        backend._initialize_reduction_outputs(self.chain, outputs, stream)
         backend._initialize_combine_output(self.chain, outputs, stream)
         return self._launch_moe(problem_size, first_token_offset, workspace, (a, b, *sf_args), cs, (), stream, token_index, token_ks, top_k_scores)
 
@@ -1557,7 +1586,6 @@ class _CompiledMoeBlockScaleGemm(_CompiledMoeBase):
         scale_blob_reason = backend._grouped_row_quant_scale_blob_reject(chain, outs, S, N, num_groups)
         if scale_blob_reason is not None:
             raise ValueError(scale_blob_reason)
-        backend._initialize_reduction_outputs(chain, outs, stream)
         a0, b0 = (a_slots[0][0], b_slots[0][0])
         a_stride_perms = [t.permute(1, 2, 0) for t, _sf in a_slots]
         b_stride_perms = [t.permute(1, 2, 0) for t, _sf in b_slots]
@@ -1599,6 +1627,7 @@ class _CompiledMoeBlockScaleGemm(_CompiledMoeBase):
             tokens, weights = ([t for t, _sf in a_slots], [w for w, _sf in b_slots])
             sfs = ([sf for _t, sf in a_slots if sf is not None], [sf for _w, sf in b_slots if sf is not None])
             backend._check_moe_combine_operands(chain, tokens, weights, first_token_offset, *sfs, (token_index, token_ks, top_k_scores), outs, K, workspace)
+        backend._initialize_reduction_outputs(chain, outs, stream)
         backend._initialize_combine_output(chain, outs, stream)
         return self._launch_moe(
             problem_size,

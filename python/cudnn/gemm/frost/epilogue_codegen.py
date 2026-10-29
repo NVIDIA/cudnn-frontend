@@ -40,10 +40,13 @@ def _aux_prefetch_var(name: str) -> str:
     return f"_aux_{name}_pre"
 
 
-def _compute_cast(var: str, dtype: Dtype, tag: str) -> tuple[list[str], str]:
+def _compute_cast(var: str, dtype: Dtype, tag: str, *, source_dtype: Dtype | None = None) -> tuple[list[str], str]:
     """Cast a running vector/scalar to the op's compute dtype."""
     new = f"_c_{tag}"
-    return [f"{new} = ({var}).to({DTYPE_TO_CUTLASS[dtype]})"], new
+    lines = [f"{new} = ({var}).to({DTYPE_TO_CUTLASS[dtype]})"]
+    if dtype == "fp32" and source_dtype in ("int8", "uint8", "int32"):
+        lines.append(f"{new} = {new} + cutlass.full_like({new}, 0.0)")
+    return lines, new
 
 
 def _compute_literal(dtype: Dtype, value: float | int) -> str:
@@ -326,8 +329,8 @@ def _emit_op(
 
     if op.op == "binary_select":
         assert other_in_chain is not None and third_in_chain is not None
-        bl, nz = _nonzero01(third_in_chain, f"_{idx}")
-        return bl + [f"{new} = {other_in_chain} + ({prev} - {other_in_chain}) * {nz}"], new
+        zero = _compute_literal(op.compute_dtype, 0)
+        return [f"{new} = cutlass._mlir_helpers.vector.where({third_in_chain} != cutlass.full_like({third_in_chain}, {zero}), {prev}, {other_in_chain})"], new
 
     if op.op in _CMP_OPS or op.op in _LOGIC_OPS or op.op in _BACKWARD_OPS or op.op == "mod":
         if op.parent_idx_b is not None:
@@ -468,12 +471,15 @@ def _emit_op(
     raise AssertionError(f"unhandled op {op.op!r}")
 
 
-def _emit_round(var: str, out_dtype: Dtype, tag: str) -> tuple[list[str], str]:
-    """Round a register value to a tensor's declared dtype (no-op for fp32)."""
-    if out_dtype == "fp32":
+def _emit_round(var: str, out_dtype: Dtype, tag: str, *, source_dtype: Dtype = "fp32") -> tuple[list[str], str]:
+    """Round a register value to its declared dtype."""
+    if out_dtype == "fp32" and source_dtype == "fp32":
         return [], var
     new = f"_r_{tag}"
-    return [f"{new} = ({var}).to({DTYPE_TO_CUTLASS[out_dtype]})"], new
+    lines = [f"{new} = ({var}).to({DTYPE_TO_CUTLASS[out_dtype]})"]
+    if out_dtype == "fp32" and source_dtype == "int32":
+        lines.append(f"{new} = {new} + cutlass.full_like({new}, 0.0)")
+    return lines, new
 
 
 def _store_cast_expr(var: str, dtype: Dtype) -> str:
@@ -758,7 +764,6 @@ def generate_mainloop(chain: FusionChain, operand: str = "a") -> str:
     ab_dtype = DTYPE_TO_CUTLASS[src_dtype]
     vec_var = f"ml_vec_{operand}"
     out_var = f"ml_out_{operand}"
-    f32_var = f"ml_f32_{operand}"
     base = _MAINLOOP_IDX_BASE[operand]
     load_dtype = chain.mainloop_a_load_dtype if operand == "a" else chain.mainloop_b_load_dtype
     identity_cast_intrinsic = (
@@ -767,23 +772,40 @@ def generate_mainloop(chain: FusionChain, operand: str = "a") -> str:
     if identity_cast_intrinsic is not None:
         cvt = f"{identity_cast_intrinsic}({vec_var}.ir_value(), ml_vec_elems)"
         return f"{out_var} = cutlass.Vector({cvt}, dtype={ab_dtype})"
-    aux_loads: dict[str, str] = {}
-    for op in ops:
-        if op.aux is not None:
-            ptr = f"{op.aux}.iterator.raw_ptr()"
-            aux_loads[op.aux] = f"cutlass.full_like({f32_var}, ({ptr} + 0).load().to(cutlass.Float32))"
-    lines: list[str] = [f"{f32_var} = {vec_var}.to(cutlass.Float32)"]
-    result_var: dict[int, str] = {-1: f32_var}
+    lines: list[str] = []
+    result_var: dict[int, str] = {-1: vec_var}
     for i, op in enumerate(ops):
         parent = op.resolved_parent_idx(i)
-        parent_var = result_var[parent]
+        tag = f"ml_{operand}_{i}"
+        cast_lines, parent_var = _compute_cast(result_var[parent], op.compute_dtype, tag)
+        lines.extend(cast_lines)
+        aux_loads = {}
+        if op.aux is not None:
+            ptr = f"{op.aux}.iterator.raw_ptr()"
+            aux_loads[op.aux] = f"cutlass.full_like({parent_var}, ({ptr} + 0).load().to({DTYPE_TO_CUTLASS[op.compute_dtype]}))"
         emit_lines, cur = _emit_op(op, parent_var, base + i, aux_loads)
         lines.extend(emit_lines)
+        parent_dtype = (load_dtype or src_dtype) if parent < 0 else ops[parent].out_dtype
+        if op.out_dtype in ("fp8_e4m3", "fp8_e5m2") and (op.compute_dtype == "int32" or (op.op == "identity" and parent_dtype in ("int8", "uint8", "int32"))):
+            cur = f"(({cur}).to(cutlass.Float32) + cutlass.full_like(({cur}).to(cutlass.Float32), 0.0))"
+        round_lines, cur = _emit_round(cur, op.out_dtype, tag, source_dtype=op.compute_dtype)
+        lines.extend(round_lines)
         result_var[i] = cur
     terminal_var = result_var[len(ops) - 1]
-    if load_dtype in ("int8", "uint8") and src_dtype in ("fp8_e4m3", "fp8_e5m2"):
-        terminal_var = f"({terminal_var} + cutlass.full_like({terminal_var}, 0.0))"
     lines.append(f"{out_var} = ({terminal_var}).to({ab_dtype})")
+    major = "a_is_m_major" if operand == "a" else "b_is_n_major"
+    group = f"{operand}_tma_group_elems"
+    lines.extend(
+        [
+            "if cutlass.const_expr(mainloop_koob_fix):",
+            f"    if cutlass.const_expr({major}):",
+            f"        ml_k_of_L = (ml_L % ({group} * cta_tile_mnk[2])) // {group}",
+            "    else:",
+            "        ml_k_of_L = ml_L % cta_tile_mnk[2]",
+            f"    ml_valid = cutlass.full_like({out_var}.to(cutlass.Float32), cutlass.Float32(ml_k_of_L)) < cutlass.full_like({out_var}.to(cutlass.Float32), cutlass.Float32(k - k_tile_idx * cta_tile_mnk[2]))",
+            f"    {out_var} = cutlass._mlir_helpers.vector.where(ml_valid, {out_var}, cutlass.full_like({out_var}, 0.0))",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -893,7 +915,13 @@ def _emit_pointwise_dag(chain, *, vsize, bounded, aux_load_expr, gemm_out_dtype=
     for g in range(chain.num_gemms):
         src = "vec_f32" if g == 0 else f"vec_f32_{g}"
         tag = "mm" if g == 0 else f"mm{g}"
-        round_lines, var = _emit_round(src, gemm_out_dtype(g) if gemm_out_dtype is not None else chain.matmul.out_dtype, tag)
+        out_dtype = gemm_out_dtype(g) if gemm_out_dtype is not None else chain.gemm_out_dtype(g)
+        if chain.matmul.accum_dtype == "int32" and not chain.widen_integer_accumulators and out_dtype != "int32":
+            widened = f"_f_{tag}"
+            body_lines.append(f"{widened} = ({src}).to(cutlass.Float32)")
+            body_lines.append(f"{widened} = {widened} + cutlass.full_like({widened}, 0.0)")
+            src = widened
+        round_lines, var = _emit_round(src, out_dtype, tag)
         body_lines.extend(round_lines)
         gemm_var[g] = var
 
@@ -903,26 +931,29 @@ def _emit_pointwise_dag(chain, *, vsize, bounded, aux_load_expr, gemm_out_dtype=
             return gemm_var[gemm_index(ref)]
         return result_var[ref]
 
+    def _parent_dtype(ref: int) -> Dtype:
+        return chain.gemm_out_dtype(gemm_index(ref)) if is_gemm_source(ref) else chain.ops[ref].out_dtype
+
     for i, op in enumerate(chain.ops):
         if op.op == "aux_load":
             aux_ref = chain.aux_by_name(op.aux)
             body_lines.append(f"_op_{i} = {aux_load_expr(aux_ref, op.compute_dtype, 'vec_f32', bounded=bounded or aux_ref.stride[-1] != 1)}")
-            round_lines, cur = _emit_round(f"_op_{i}", op.out_dtype, str(i))
+            round_lines, cur = _emit_round(f"_op_{i}", op.out_dtype, str(i), source_dtype=op.compute_dtype)
             body_lines.extend(round_lines)
             result_var[i] = cur
             continue
         parent = op.resolved_parent_idx(i)
         parent_raw = _parent_value(parent)
-        cast_lines, parent_var = _compute_cast(parent_raw, op.compute_dtype, f"{i}_a")
+        cast_lines, parent_var = _compute_cast(parent_raw, op.compute_dtype, f"{i}_a", source_dtype=_parent_dtype(parent))
         body_lines.extend(cast_lines)
         aux_loads = {aux.name: aux_load_expr(aux, op.compute_dtype, parent_var, bounded=bounded or aux.stride[-1] != 1) for aux in chain.aux_tensors}
         other_in_chain = _parent_value(op.parent_idx_b) if op.parent_idx_b is not None else None
         if other_in_chain is not None:
-            cast_lines, other_in_chain = _compute_cast(other_in_chain, op.compute_dtype, f"{i}_b")
+            cast_lines, other_in_chain = _compute_cast(other_in_chain, op.compute_dtype, f"{i}_b", source_dtype=_parent_dtype(op.parent_idx_b))
             body_lines.extend(cast_lines)
         third_in_chain = _parent_value(op.parent_idx_c) if op.parent_idx_c is not None else None
         if third_in_chain is not None:
-            cast_lines, third_in_chain = _compute_cast(third_in_chain, op.compute_dtype, f"{i}_c")
+            cast_lines, third_in_chain = _compute_cast(third_in_chain, op.compute_dtype, f"{i}_c", source_dtype=_parent_dtype(op.parent_idx_c))
             body_lines.extend(cast_lines)
         lines, cur = _emit_op(op, parent_var, i, aux_loads, other_in_chain, third_in_chain, vsize=vsize)
         if scatter and op.op == "gen_index":
@@ -938,7 +969,7 @@ def _emit_pointwise_dag(chain, *, vsize, bounded, aux_load_expr, gemm_out_dtype=
                         f"{cur} = _gi{i}.load().to_vector()",
                     ]
         body_lines.extend(lines)
-        round_lines, cur = _emit_round(cur, op.out_dtype, str(i))
+        round_lines, cur = _emit_round(cur, op.out_dtype, str(i), source_dtype=op.compute_dtype)
         body_lines.extend(round_lines)
         result_var[i] = cur
     return (body_lines, _parent_value)
@@ -1032,7 +1063,20 @@ def _emit_block_quant_row(
     return lines
 
 
+def _emit_reduction_avg_inverse(red_idx: int, red: ReductionSpec, chain: FusionChain) -> list[str]:
+    """Generate AVG normalization from runtime extents."""
+    extents = ["M", "N"]
+    if chain.has_moe and red.grouped_by_moe:
+        extents[1 if isinstance(chain.moe, MoeSwapAbSpec) else 0] = "cutlass.Int32(group_end) - cutlass.Int32(group_begin)"
+    factors = [f"cutlass.Float32({extent})" for dim, extent in zip(red.dim[1:], extents) if dim == 1]
+    if not chain.has_moe and red.dim[0] == 1 and chain.matmul.batch != 1:
+        factors.append(f"cutlass.Float32({float(chain.matmul.batch)})")
+    count = " * ".join(factors) or "cutlass.Float32(1.0)"
+    return [f"_red_{red_idx}_inv = cutlass.Float32(1.0) / ({count})"]
+
+
 _SHARED_EXPORTS = (
+    "_emit_reduction_avg_inverse",
     "_emit_block_quant_row",
     "_AuxCodegen",
     "_emit_pointwise_dag",

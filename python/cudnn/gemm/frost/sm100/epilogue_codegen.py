@@ -8,6 +8,7 @@ from __future__ import annotations
 from math import gcd
 
 from ..epilogue_codegen import (
+    _emit_reduction_avg_inverse,
     _emit_block_quant_row,
     _AuxCodegen,
     _emit_pointwise_dag,
@@ -156,17 +157,7 @@ def _emit_reduction_atomic_body(
     src = f"_red_{red_idx}_src"
     lines = [f"{src} = ({source_var}).to({DTYPE_TO_CUTLASS[red.compute_dtype]})"]
     if red.mode == "avg":
-        if chain.has_moe:
-            extents = ["M", "N"]
-            if red.grouped_by_moe:
-                extents[1 if isinstance(chain.moe, MoeSwapAbSpec) else 0] = "cutlass.Int32(group_end) - cutlass.Int32(group_begin)"
-            count = " * ".join(f"cutlass.Float32({extent})" for dim, extent in zip(red.dim[1:], extents) if dim == 1)
-            count = count or "cutlass.Float32(1.0)"
-            lines.append(f"_red_{red_idx}_inv = cutlass.Float32(1.0) / ({count})")
-        else:
-            matmul = chain.matmul
-            count = (matmul.N if red.dim[2] == 1 else 1) * (matmul.M if red.dim[1] == 1 else 1) * (matmul.batch if red.dim[0] == 1 else 1)
-            lines.append(f"_red_{red_idx}_inv = cutlass.Float32({1.0 / count})")
+        lines.extend(_emit_reduction_avg_inverse(red_idx, red, chain))
     if red.dim[2] == 1:
         combine_lines, acc = _emit_reduction_local_combine(red_idx, red, src, vsize)
         lines.extend(combine_lines)

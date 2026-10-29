@@ -1342,6 +1342,9 @@ def _build_multi_moe_chain(
                 raise ValueError("all weight operands of a block-scale multi-MoE must share the same SF combo")
         block_scale_spec = _block_scale_spec(a0, b0, meta)
     mm_compute = moe_ops[0].compute_dtype if moe_ops[0].compute_dtype is not None else compute_dtype
+    gemm_out_dtypes = tuple(_resolve_out_dtype(mm.output, mm.output_tensor, io_dtype, intermediate_dtype, meta) for mm in moe_ops)
+    if combine:
+        gemm_out_dtypes = ("fp32",) * len(moe_ops)
 
     aux_tensors: list[TensorRef] = []
     aux_objs: list[Any] = []
@@ -1403,6 +1406,11 @@ def _build_multi_moe_chain(
                     recorded_by_out[tid].output_tensor,
                 )
             )
+        elif tid in gemm_idx_by_output:
+            index = gemm_idx_by_output[tid]
+            tensor = moe_ops[index].output_tensor
+            dtype = _resolve_out_dtype(tid, tensor, io_dtype, intermediate_dtype, meta)
+            dense_entries.append((OutputSpec(source_ref=gemm_source(index), dtype=dtype), tensor))
 
     reductions, reduction_objs = _collect_reductions(ops, meta, dag, io_dtype, intermediate_dtype, compute_dtype, 1, M, N, fto_id=fto_id, num_groups=num_groups)
 
@@ -1417,8 +1425,6 @@ def _build_multi_moe_chain(
                     moe_ops[0].output_tensor,
                 )
             )
-        elif any(_is_output(meta, mm.output) for mm in moe_ops):
-            raise ValueError("materializing the raw MoE grouped matmul output alongside pointwise " "ops is not supported; tap a fusion-op output instead")
         elif not reductions:
             raise ValueError("graph materializes no output; mark at least one tensor " "set_output(True)")
 
@@ -1450,6 +1456,7 @@ def _build_multi_moe_chain(
         num_a_operands=len(a_ids),
         num_b_operands=len(b_ids),
         gemm_operands=gemm_operands,
+        gemm_out_dtypes=gemm_out_dtypes if len(gemm_out_dtypes) > 1 else (),
         moe=MoeSpec(
             num_experts=int(E),
             mode=moe_ops[0].moe_mode,
@@ -1489,6 +1496,9 @@ def _walk_mainloop_chain(
     aux_tensors: list[TensorRef],
     aux_objs: list[Any],
     aux_seen: set[int],
+    io_dtype: Dtype,
+    intermediate_dtype: Dtype,
+    compute_dtype: Dtype,
 ) -> tuple[int, list[FusionOp]]:
     """Walk backwards from a matmul operand through pointwise ops (unary, or binary with one SCALAR graph-input aux) to the root graph input."""
 
@@ -1506,7 +1516,7 @@ def _walk_mainloop_chain(
                 raise ValueError(
                     f"matmul {label} operand producer {producer.op_name!r}: gen_index and " "pointwise scalar attrs are not supported in mainloop fusion"
                 )
-            steps.append((producer.cudnn_name, False, None, True))
+            steps.append((producer.cudnn_name, False, None, True, producer))
             (cur,) = producer.inputs
         elif producer.cudnn_name in _BINARY_OP_MAP:
             if producer.op_attrs:
@@ -1538,7 +1548,7 @@ def _walk_mainloop_chain(
                     )
                 )
                 aux_objs.append(aux_meta.tensor)
-            steps.append((producer.cudnn_name, True, aux_meta.name, aux_on_rhs))
+            steps.append((producer.cudnn_name, True, aux_meta.name, aux_on_rhs, producer))
             cur = chain_id
         else:
             raise ValueError(
@@ -1548,7 +1558,7 @@ def _walk_mainloop_chain(
             )
     steps.reverse()
     fops: list[FusionOp] = []
-    for idx, (cudnn_name, is_binary, aux_name, aux_on_rhs) in enumerate(steps):
+    for idx, (cudnn_name, is_binary, aux_name, aux_on_rhs, producer) in enumerate(steps):
         parent = idx - 1 if idx > 0 else -1
         if is_binary:
             fops.append(
@@ -1561,6 +1571,11 @@ def _walk_mainloop_chain(
             )
         else:
             fops.append(FusionOp(op=_UNARY_OP_MAP[cudnn_name], parent_idx=parent))
+        fops[-1] = replace(
+            fops[-1],
+            compute_dtype=producer.compute_dtype or compute_dtype,
+            out_dtype=_resolve_out_dtype(producer.output, producer.output_tensor, io_dtype, intermediate_dtype, meta),
+        )
     return cur, fops
 
 
@@ -1590,8 +1605,12 @@ def _build_multi_gemm_chain(
         mm0 = matmuls[0]
         op_by_output = {op.output: op for op in ops if op.cudnn_name != "matmul"}
         A_id, B_id = mm0.inputs
-        root_a, mainloop_a_ops = _walk_mainloop_chain(A_id, "A", op_by_output, meta, aux_tensors, aux_objs, aux_seen)
-        root_b, mainloop_b_ops = _walk_mainloop_chain(B_id, "B", op_by_output, meta, aux_tensors, aux_objs, aux_seen)
+        root_a, mainloop_a_ops = _walk_mainloop_chain(
+            A_id, "A", op_by_output, meta, aux_tensors, aux_objs, aux_seen, io_dtype, intermediate_dtype, compute_dtype
+        )
+        root_b, mainloop_b_ops = _walk_mainloop_chain(
+            B_id, "B", op_by_output, meta, aux_tensors, aux_objs, aux_seen, io_dtype, intermediate_dtype, compute_dtype
+        )
 
         def _mma_operand_dtype(operand_id: int) -> Dtype:
             om = meta.get(operand_id)
@@ -1671,6 +1690,7 @@ def _build_multi_gemm_chain(
                 raise ValueError("all B operands of a block-scale multi-GEMM must share the same SF combo")
         block_scale_spec = _block_scale_spec(a0, b0, meta)
     mm_compute = matmuls[0].compute_dtype if matmuls[0].compute_dtype is not None else compute_dtype
+    gemm_out_dtypes = tuple(_resolve_out_dtype(mm.output, mm.output_tensor, io_dtype, intermediate_dtype, meta) for mm in matmuls)
     matmul_out_dim = (batch, M, N)
 
     dag = _build_epilogue_dag(
@@ -1713,10 +1733,16 @@ def _build_multi_gemm_chain(
             matmul=matmul_spec,
             aux_tensors=aux_tensors,
             ops=[],
-            output_specs=[OutputSpec(source_ref=gemm_source(g), dtype=dt) for g, dt in enumerate(per_gemm_dtypes)],
+            output_specs=[
+                spec
+                for spec, _ in _output_layouts(
+                    [(OutputSpec(source_ref=gemm_source(g), dtype=dt), mm.output_tensor) for g, (dt, mm) in enumerate(zip(per_gemm_dtypes, matmuls))], [], meta
+                )
+            ],
             num_a_operands=len(a_ids),
             num_b_operands=len(b_ids),
             gemm_operands=gemm_operands,
+            gemm_out_dtypes=gemm_out_dtypes if len(gemm_out_dtypes) > 1 else (),
             block_scale=block_scale_spec,
         )
         # No-epilogue outputs = each GEMM's own buffer, in GEMM order.
@@ -1769,11 +1795,11 @@ def _build_multi_gemm_chain(
                     recorded_by_out[tid].output_tensor,
                 )
             )
-        elif len(matmuls) == 1 and tid == matmuls[0].output and _is_output(meta, tid):
+        elif tid in gemm_idx_by_output:
             dense_entries.append(
                 (
-                    OutputSpec(source_ref=gemm_source(0), dtype=matmul_out_dtype),
-                    matmuls[0].output_tensor,
+                    OutputSpec(source_ref=gemm_source(gemm_idx_by_output[tid]), dtype=gemm_out_dtypes[gemm_idx_by_output[tid]]),
+                    matmuls[gemm_idx_by_output[tid]].output_tensor,
                 )
             )
 
@@ -1819,6 +1845,7 @@ def _build_multi_gemm_chain(
         num_a_operands=len(a_ids),
         num_b_operands=len(b_ids),
         gemm_operands=gemm_operands,
+        gemm_out_dtypes=gemm_out_dtypes if len(gemm_out_dtypes) > 1 else (),
         mainloop_a_ops=mainloop_a_ops,
         mainloop_b_ops=mainloop_b_ops,
         mainloop_a_load_dtype=mainloop_a_load_dtype,

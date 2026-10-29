@@ -1129,6 +1129,7 @@ def _kernel(
 
                         ml_outs = []
                         for i in cutlass.range_constexpr(ml_chunks_a):
+                            ml_L = ml_offsets[i]
                             ml_vec_a = ml_vecs[i]
 
                             # @@INJECT_MAINLOOP_A@@
@@ -1138,7 +1139,6 @@ def _kernel(
                         for i in cutlass.range_constexpr(ml_chunks_a):
                             (sA_stage.subview(ml_offsets[i])).data_ptr().store_swizzled(ml_outs[i], ab_swizzle, alignment=ml_vec_bytes)
                     elif cutlass.const_expr(mainloop_koob_fix):
-                        a_kvalid = cutlass.Int32(k - k_tile_idx * cta_tile_mnk[2])
                         for chunk in cutlass.range_constexpr(ml_chunks_a):
                             ml_L = (ml_tid + chunk * ml_threads) * ml_vec_elems
                             ml_ptr_a = (sA_stage.subview(ml_L)).data_ptr()
@@ -1146,17 +1146,6 @@ def _kernel(
 
                             # @@INJECT_MAINLOOP_A@@
 
-                            if cutlass.const_expr(a_is_m_major):
-                                ml_k_of_L = (ml_L % (a_tma_group_elems * cta_tile_mnk[2])) // a_tma_group_elems
-                            else:
-                                ml_k_of_L = ml_L % cta_tile_mnk[2]
-                            ml_kloc = cutlass.full_like(ml_f32_a, cutlass.Float32(ml_k_of_L))
-                            ml_klim = cutlass.full_like(ml_f32_a, cutlass.Float32(a_kvalid))
-                            ml_out_a = _cvec.where(
-                                ml_kloc >= ml_klim,
-                                ml_f32_a - ml_f32_a,
-                                ml_out_a.to(cutlass.Float32),
-                            ).to(ab_dtype)
                             ml_ptr_a.store_swizzled(ml_out_a, ab_swizzle, alignment=ml_vec_bytes)
                     else:
                         for chunk in cutlass.range_constexpr(ml_chunks_a):
@@ -1193,6 +1182,7 @@ def _kernel(
 
                         ml_outs = []
                         for i in cutlass.range_constexpr(ml_chunks_b):
+                            ml_L = ml_offsets[i]
                             ml_vec_b = ml_vecs[i]
 
                             # @@INJECT_MAINLOOP_B@@
@@ -1216,6 +1206,27 @@ def _kernel(
 
                             if ml_tid < ml_tail_b:
                                 (sB_stage.subview(ml_L)).data_ptr().store_swizzled(ml_out_b, ab_swizzle, alignment=ml_vec_bytes)
+                    elif cutlass.const_expr(mainloop_koob_fix):
+                        for chunk in cutlass.range_constexpr(ml_chunks_b):
+                            ml_L = (ml_tid + chunk * ml_threads) * ml_vec_elems
+                            ml_ptr_b = (sB_stage.subview(ml_L)).data_ptr()
+                            ml_vec_b = ml_ptr_b.load_swizzled(ab_swizzle, alignment=ml_vec_bytes, count=ml_vec_elems)
+
+                            # @@INJECT_MAINLOOP_B@@
+
+                            ml_ptr_b.store_swizzled(ml_out_b, ab_swizzle, alignment=ml_vec_bytes)
+                        if cutlass.const_expr(ml_tail_b != 0):
+                            ml_L = cutlass.min(
+                                cutlass.Int32((ml_tid + ml_chunks_b * ml_threads) * ml_vec_elems),
+                                cutlass.Int32(sB_elems - ml_vec_elems),
+                            )
+                            ml_ptr_b = (sB_stage.subview(ml_L)).data_ptr()
+                            ml_vec_b = ml_ptr_b.load_swizzled(ab_swizzle, alignment=ml_vec_bytes, count=ml_vec_elems)
+
+                            # @@INJECT_MAINLOOP_B@@
+
+                            if ml_tid < ml_tail_b:
+                                ml_ptr_b.store_swizzled(ml_out_b, ab_swizzle, alignment=ml_vec_bytes)
                     else:
                         for chunk in cutlass.range_constexpr(ml_chunks_b):
                             ml_idx = (ml_tid + chunk * ml_threads) * ml_vec_elems

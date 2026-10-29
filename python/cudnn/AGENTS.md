@@ -84,6 +84,12 @@ Numbered so reviews can cite them; the list grows — append, never renumber.
   address has no such metadata. Use a launch recorder for invalid-device regression
   controls so an unfixed guard cannot poison the CUDA context. Detector:
   `test_python_workspace_device_is_checked_before_launch`.
+- **Grouped GEMMs validate every operand's logical K before launch.** Account
+  for each side's packed FP4 storage independently. Detector:
+  `gemm/frost/test_moe_grouped_matmul_fwd.py::test_moe_rejects_mismatched_k_before_launch`.
+- **Validate workspace before initializing reduction outputs.** A rejected call
+  must preserve caller buffers. Detectors: `test_moe_workspace_failure_preserves_reduction_outputs`
+  and `test_split_k_missing_workspace_preserves_reduction_outputs` in `gemm/frost/`.
 
 **Rule 2 — `execute()` launches exactly the kernels the plan promised:
 serve the declared layout natively, or decline — never adapt.**

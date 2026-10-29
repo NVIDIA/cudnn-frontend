@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from math import gcd
 
 from ..epilogue_codegen import (
+    _emit_reduction_avg_inverse,
     _emit_block_quant_row,
     _AuxCodegen,
     _emit_pointwise_dag,
@@ -78,11 +79,7 @@ _aux_load_expr = _aux_codegen.load_expr
 
 def _gemm_out_dtype(chain: FusionChain, g: int) -> Dtype:
     """Return the declared output dtype of one GEMM."""
-    if chain.is_multi_gemm and not chain.ops:
-        for spec in chain.output_specs:
-            if spec.source_ref == gemm_source(g) and spec.quant_idx is None:
-                return spec.dtype
-    return chain.matmul.out_dtype
+    return chain.gemm_out_dtype(g)
 
 
 def _emit_moe_combine_store(tap_idx, i, src, spec, chain, vsize):
@@ -174,18 +171,6 @@ def _reduction_partial_fold(red: ReductionSpec, dst: str, val: str) -> list[str]
     if red.compute_dtype == "int32":
         return [f"if {val} {'>' if op == 'max' else '<'} {dst}:", f"    {dst} = {val}"]
     return [f"{dst} = cute.math.{op}({dst}, {val})"]
-
-
-def _emit_reduction_avg_inverse(red_idx: int, red: ReductionSpec, chain: FusionChain) -> list[str]:
-    """``_red_<k>_inv`` = 1 / (number of elements an AVG output averages)."""
-    extents = ["M", "N"]
-    if chain.has_moe and red.grouped_by_moe:
-        extents[1 if isinstance(chain.moe, MoeSwapAbSpec) else 0] = "cutlass.Int32(group_end) - cutlass.Int32(group_begin)"
-    factors = [f"cutlass.Float32({extent})" for dim, extent in zip(red.dim[1:], extents) if dim == 1]
-    if not chain.has_moe and red.dim[0] == 1 and chain.matmul.batch != 1:
-        factors.append(f"cutlass.Float32({float(chain.matmul.batch)})")
-    count = " * ".join(factors) or "cutlass.Float32(1.0)"
-    return [f"_red_{red_idx}_inv = cutlass.Float32(1.0) / ({count})"]
 
 
 def _emit_reduction_vector_atomic(tap_idx: int, red_idx: int, red: ReductionSpec, acc: str) -> list[str]:
