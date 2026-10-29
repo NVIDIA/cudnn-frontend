@@ -34,6 +34,7 @@ from gemm_test_utils import (
     reduction_ref as _reduction_ref,
     reduction_dims as _reduction_dims,
     assert_block_scale_reduction_close as _assert_block_scale_reduction_close,
+    assert_quant_scale_blob_guard as _assert_quant_scale_blob_guard,
     with_static_segmented_capacity as _with_static_segmented_capacity,
     plan_as_sm100,
 )
@@ -3238,6 +3239,36 @@ def test_e2e_quant_scale_k_padding_is_zeroed_sm120(grouped, swap_ab) -> None:
     expected[:, :blocks] = s_ref[0].view(torch.uint8)
     torch.testing.assert_close(_f8_128x4_logical(scale, cols)[live], expected, atol=0, rtol=0)
     torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
+
+
+@requires_sm120
+@pytest.mark.parametrize("axis,relu", [(-1, False), (1, True)], ids=["row_one_gemm", "col_epilogue_op"])
+def test_moe_block_scale_quant_scale_output_must_be_a_packed_blob_sm120(axis, relu) -> None:
+    """F8_128x4 quant scales that are not grouped by the MoE offsets (row, and col) are
+    checked like the grouped row ones: both launchers (one GEMM, and the multi-GEMM path an
+    epilogue op takes) decline a binding the blob would spill out of, before any write."""
+    E, S, N, K, bs = 2, 512, 256, 512, 32
+    offsets_list = [0, 96, 96, 288, S]
+    groups = len(offsets_list) - 1
+    dims = (1, N, S // bs) if axis == 1 else (1, S, N // bs)
+    graph = _build_graph(
+        E, S, N, K, groups, quant=True, quant_scale_reorder=True, quant_scale_dim=dims, quant_axis=axis, epilogue_relu=relu, offset_multiple=32
+    )
+    compiled = _plan(graph, config=by_name(_SM120_BS_CFG))
+    assert bool(compiled.chain.ops) == relu
+    sf_k = K // _COMBOS["nvfp4"][0]
+    token = torch.randint(0, 256, (1, S, K // 2), dtype=torch.uint8, device="cuda").view(torch.float4_e2m1fn_x2)
+    weight = torch.randint(0, 256, (E, N, K // 2), dtype=torch.uint8, device="cuda").view(torch.float4_e2m1fn_x2)
+    sfa_log = torch.randint(1, 4, (S, sf_k), device="cuda").to(torch.float8_e4m3fn)
+    sfb_log = torch.randint(1, 4, (E, N, sf_k), device="cuda").to(torch.float8_e4m3fn)
+    sfa_live = torch.cat([_to_blocked(sfa_log[b:e]) for b, e in zip(offsets_list, offsets_list[1:]) if e > b])
+    sfa = _with_static_segmented_capacity(sfa_live, S, groups, sf_k)
+    sfb = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, N, sf_k)
+    offsets = torch.tensor(offsets_list, dtype=torch.int32, device="cuda")
+    out = torch.empty(1, S, N, dtype=torch.float8_e4m3fn, device="cuda")
+    _assert_quant_scale_blob_guard(
+        lambda view: compiled(_vp_bs(compiled, token, weight, [out, view], sfa, sfb, fto=offsets)), dims, torch.float8_e8m0fnu, others=[out.view(torch.uint8)]
+    )
 
 
 @requires_sm120

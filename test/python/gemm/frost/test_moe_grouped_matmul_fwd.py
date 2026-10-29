@@ -19,6 +19,7 @@ from gemm_test_utils import (
     requires_sm100,
     requires_sm120,
     requires_matmul_gpu,
+    assert_quant_scale_blob_guard as _assert_quant_scale_blob_guard,
     Plan as _plan,
     ceil_div as _ceil_div,
     to_blocked as _to_blocked,
@@ -2150,6 +2151,41 @@ def test_moe_quant_scale_k_padding_is_zeroed_sm120(axis, swap_ab):
     expected[:, :blocks] = s_ref[0].view(torch.uint8)
     torch.testing.assert_close(_f8_128x4_logical(scale_buf, dims[2])[:rows], expected, atol=0, rtol=0)
     torch.testing.assert_close(q_buf.float(), (q_ref.transpose(1, 2) if axis == 1 else q_ref).float(), atol=0, rtol=0)
+
+
+@requires_sm120
+@pytest.mark.parametrize("relu,swap", [(False, False), (True, False), (False, True)], ids=["one_gemm", "epilogue_op", "swap_ab"])
+def test_moe_quant_scale_output_must_be_a_packed_blob_sm120(relu, swap):
+    """All three plain MoE launchers (one GEMM, the multi-GEMM path an epilogue op takes, and
+    swap-AB) decline an F8_128x4 quant-scale binding the blob would spill out of, before any
+    write. S = 512 gives the [1, 512, 8] scale a row-aliasing view whose span equals its
+    element count, which the swap-AB launcher's whole-blob check alone accepts."""
+    from cudnn.gemm.frost.fusion_ir import MoeSwapAbSpec
+
+    E, K, N, bs = 4, 128, 256, 32
+    group_sizes = [128, 0, 288, 96]
+    S = sum(group_sizes)
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
+    w = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
+    fto = g.tensor(name="first_token_offset", dim=[E + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    y = g.moe_grouped_matmul(tok, w, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe")
+    if relu:
+        y = g.relu(input=y, name="relu")
+    q, sf = g.block_scale_quantize(input=y, block_size=bs, name="q")
+    q.set_data_type(cudnn.data_type.FP8_E4M3).set_output(True)
+    sf.set_dim([1, S, N // bs]).set_stride([S * N // bs, N // bs, 1]).set_data_type(cudnn.data_type.FP8_E8M0).set_output(True)
+    sf.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
+    compiled = _plan(g, config=by_name(_SM120_CFG), swap_ab=swap)
+    assert bool(compiled.chain.ops) == relu
+    assert isinstance(compiled.chain.moe, MoeSwapAbSpec) == swap
+    token = torch.randint(-2, 3, (1, S, K), device="cuda").to(torch.bfloat16)
+    weight = torch.randint(-2, 3, (E, N, K), device="cuda").to(torch.bfloat16)
+    offsets = _offsets(group_sizes, S)
+    out = torch.empty(1, S, N, dtype=torch.float8_e4m3fn, device="cuda")
+    _assert_quant_scale_blob_guard(
+        lambda view: compiled(_vp_moe(compiled, token, weight, offsets, [out, view])), (1, S, N // bs), torch.float8_e8m0fnu, others=[out.view(torch.uint8)]
+    )
 
 
 @pytest.mark.parametrize("weight_major", ["k", "n"])
