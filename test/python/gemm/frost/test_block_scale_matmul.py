@@ -3756,3 +3756,29 @@ def test_sm120_mxfp8_partial_scale_block_call_is_refused():
     torch.cuda.synchronize()
     assert torch.all(c == 7.0)
     assert dict(compiled.deferrals) == {"partial scale block": 1}
+
+
+@requires_sm120
+def test_sm120_block_scale_n_past_grid_y_is_refused():
+    """The block-scale template launches one CTA per output tile like the dense one, so N tiles
+    past CUDA's 65535 grid.y are declined at plan time and refused per call, before any write."""
+    narrow = "CONFIG_sm120_128x16x128_16x16x32_cluster1x1_warps8x1"
+    M, K, n = 32, 256, 65536 * 16
+    C120.probe_chain(analyze(_build_nvfp4_graph(M, 65535 * 16, K)), by_name(narrow))
+    with pytest.raises(NotImplementedError, match=r"grid\.y = ceil\(N=1048576 / 16\) = 65536"):
+        jit_from_cudnn_graph(_build_nvfp4_graph(M, n, K), **_kw(narrow))
+    g = _build_nvfp4_graph(M, 256, K)
+    _, binding = analyze_with_binding(g)
+    plan = jit_from_cudnn_graph(g, **_kw(narrow))
+    c = torch.full((1, M, n), -123.0, dtype=torch.float16, device="cuda")
+    pack = {
+        binding.a_operands[0]: torch.zeros(1, M, K // 2, dtype=torch.uint8, device="cuda").view(torch.float4_e2m1fn_x2),
+        binding.b_operands[0]: torch.zeros(1, n, K // 2, dtype=torch.uint8, device="cuda").view(torch.float4_e2m1fn_x2),
+        binding.outputs[0]: c,
+        binding.sfa_operands[0]: torch.ones(1, 128, K // 16, device="cuda").to(torch.float8_e4m3fn),
+        binding.sfb_operands[0]: torch.ones(1, n, K // 16, device="cuda").to(torch.float8_e4m3fn),
+    }
+    with pytest.raises(ValueError, match=r"grid\.y = ceil\(N=1048576 / 16\) = 65536"):
+        plan(pack)
+    torch.cuda.synchronize()
+    assert torch.all(c == -123)

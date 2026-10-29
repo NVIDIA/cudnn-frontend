@@ -907,6 +907,8 @@ class _CompiledRuntime:
     _validate_combine: ClassVar[bool] = False
     # Per call: refuse a block-scale K that ends inside a scale block (_partial_scale_block_reject).
     _validate_whole_scale_blocks: ClassVar[bool] = False
+    # Each call's N is checked against the family's launch grid (``_launch_grid_reason``).
+    _validate_launch_grid: ClassVar[bool] = False
     accepts_stream: ClassVar[bool] = True
 
     @property
@@ -1027,6 +1029,12 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
             raise NotImplementedError(f"cudnn.frost gemm: this kernel has no launch path -- {self.declined}")
         return self.lowered(operands, stream=stream, workspace=workspace)
 
+    def _check_launch_grid(self, n: int) -> None:
+        """Refuse a call whose kernel-frame N needs a launch grid CUDA rejects (the family's ``_launch_grid_reason``)."""
+        reason = self._compiler._launch_grid_reason(self.chain, self.config, n)
+        if reason is not None:
+            raise ValueError(f"cudnn.frost gemm: {reason} -- the plan was built for a smaller N; rebuild for this shape")
+
     def _lower(self):
         """Build the validated launch closure."""
         backend = self._compiler
@@ -1079,6 +1087,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         quant_mn = (self.chain.matmul.M, self.chain.matmul.N) if self._validate_runtime_quant and self.chain.quants else None
         quant_reason = backend._runtime_quant_reason if quant_mn is not None else None
         quant_chain, quant_cfg = (self.chain, self.config)
+        check_grid = self._check_launch_grid if self._validate_launch_grid else None
         gave_up = self.deferrals
 
         def lowered(operands, graph_order=None, stream=None, workspace=None):
@@ -1164,6 +1173,8 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                         return refuse(operands, graph_order)
             if split_k_slices > 1:
                 backend.check_split_k_shape(k, n, batch, split_k_slices, cta_k_elems, reduce_elems if needs_workspace else 1)
+            if check_grid is not None:
+                check_grid(n)
             extra = ()
             if needs_workspace:
                 if workspace is None:
@@ -1230,6 +1241,8 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                 backend._cta_k_elems(self.chain, self.config),
                 backend._splitk_reduce_elems(self.chain) if self.config.workspace_split_k else 1,
             )
+        if self._validate_launch_grid:
+            self._check_launch_grid(int(mnk[1]))
         if self._validate_runtime_quant:
             m, n = (int(mnk[0]), int(mnk[1]))
             if self.config.swap_ab and self.chain.quants:
