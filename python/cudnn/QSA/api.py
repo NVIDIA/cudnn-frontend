@@ -13,7 +13,7 @@ from torch import Tensor
 
 from cudnn._device import device_info
 
-from ._contract import check_inputs, check_tensor, paired_backward
+from ._contract import BLK_BITS, check_inputs, check_tensor, paired_backward, paired_queries
 
 
 def _implementation(q, k, direction):
@@ -31,8 +31,8 @@ def _implementation(q, k, direction):
     arch = cc[0] * 10 + cc[1]
     family = 107 if arch == 107 else 100
     if direction == "bprop":
-        # The paired 12:1 backward is one SM100 module compiled for every architecture; the other geometries run the
-        # single-query backward, which has a Rubin copy.
+        # The batched backward (12:1 pairs, 6:1 quads) is one SM100 module compiled for every architecture; 24:2 runs
+        # the single-query backward, which has a Rubin copy.
         if paired_backward(q.shape[1], k.shape[1]):
             family = 100
         elif family == 100:
@@ -52,15 +52,15 @@ def _compact(sel_blocks, lo, hi, block_first, block_last, arch, stream):
 def _compact_backward(sel_blocks, lo, hi, block_first, block_last, arch, stream, hq, hkv):
     if paired_backward(hq, hkv):
         from ._metadata import compile_group_kernel
-        from .kernels.bprop_sm100 import NQ, BLK_BITS
 
+        nq = paired_queries(hq, hkv)
         total, blocks = sel_blocks.shape
         if blocks > 1 << BLK_BITS:
-            raise NotImplementedError(f"Paired QSA requires NB <= {1 << BLK_BITS} for block-owner encoding")
-        groups = (total + NQ - 1) // NQ
+            raise NotImplementedError(f"Batched QSA backward requires NB <= {1 << BLK_BITS} for block-owner encoding")
+        groups = (total + nq - 1) // nq
         ids = torch.empty((groups, blocks), dtype=torch.int32, device=sel_blocks.device)
         counts = torch.empty(groups, dtype=torch.int32, device=sel_blocks.device)
-        compile_group_kernel(arch, NQ, BLK_BITS)(sel_blocks, lo, hi, block_first, block_last, ids, counts, total, stream)
+        compile_group_kernel(arch, nq, BLK_BITS)(sel_blocks, lo, hi, block_first, block_last, ids, counts, total, stream)
         return ids, counts
     return _compact(sel_blocks, lo, hi, block_first, block_last, arch, stream)
 

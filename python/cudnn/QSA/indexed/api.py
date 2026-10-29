@@ -12,7 +12,7 @@ from cuda.bindings import driver as cuda
 
 from cudnn.api_base import APIBase, TupleDict, WorkspaceCarver, ws_align
 from cudnn._torch_stream import stream_context
-from cudnn.QSA._contract import check_tensor, paired_backward
+from cudnn.QSA._contract import check_tensor, paired_backward, paired_queries
 
 QUERY_HEADS = (6, 12)  # per single KV head: the four-way and two-way tensor-parallel shards of the 24Q/2KV model
 
@@ -47,9 +47,9 @@ class _QsaIndexedPlan(APIBase):
         with torch.cuda.device(device):
             super().__init__()
         self.total, self.width, self.device, self.direction, self.hq = total, width, device, direction, hq
-        # The 12:1 backward pairs adjacent queries (owner bits in the compact IDs); 6:1 runs the single-query backward.
+        # The backward batches consecutive queries (two at 12:1, four at 6:1) with owner bits in the compact IDs.
         self.paired = direction == "bprop" and paired_backward(hq, 1)
-        self.nq = 2 if self.paired else 1
+        self.nq = paired_queries(hq, 1) if self.paired else 1
         groups = (total + self.nq - 1) // self.nq
         self.layouts = [
             ("ids", (groups, self.nq * (width // 4)), torch.int32),
