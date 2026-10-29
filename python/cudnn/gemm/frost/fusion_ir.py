@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from typing import Literal
 
 Dtype = Literal[
@@ -42,6 +43,18 @@ BMajor = Literal["k", "n"]
 OutMajor = Literal["n", "m"]
 
 BroadcastMode = Literal["scalar", "per_row", "per_col", "per_elem", "per_k"]
+
+
+class Axis(Enum):
+    """Logical GEMM extents, independent of codegen's symbol names."""
+
+    M = auto()
+    N = auto()
+    K = auto()
+    BATCH = auto()
+    GROUP = auto()
+
+
 ReductionMode = Literal["add", "amax", "max", "min", "avg", "mul", "mul_no_zeros", "norm1", "norm2"]
 REDUCTION_DTYPES: tuple[Dtype, ...] = ("fp32", "int32")
 
@@ -265,6 +278,7 @@ class TensorRef:
     dtype: Dtype
     bcast_mode: BroadcastMode
     grouped_by_moe: bool = False
+    reduction_axis: int | None = None
 
     def __post_init__(self) -> None:
         if self.dtype not in SUPPORTED_DTYPES:
@@ -273,6 +287,11 @@ class TensorRef:
             raise ValueError(f"dim {self.dim} and stride {self.stride} length mismatch")
         if self.bcast_mode == "per_k" and (len(self.dim) != 3 or self.dim[0] != 1 or (self.dim[1] != 1 and self.dim[2] != 1)):
             raise ValueError(f"per-K aux {self.name!r} must have shape [1,1,K] or [1,K,1]; got {self.dim}")
+        if self.bcast_mode == "per_k":
+            if self.reduction_axis not in (1, 2) or self.dim[3 - self.reduction_axis] != 1:
+                raise ValueError(f"per-K aux {self.name!r} needs an explicit reduction axis consistent with dim {self.dim}")
+        elif self.reduction_axis is not None:
+            raise ValueError(f"aux {self.name!r}: reduction_axis is only valid for per-K broadcasts")
         if self.grouped_by_moe:
             if len(self.dim) != 3:
                 raise ValueError(f"per-group aux {self.name!r} must be rank-3; got dim {self.dim}")
@@ -286,7 +305,30 @@ class TensorRef:
         """Logical reduction axis of a rank-3 per-K broadcast (A: 2, B: 1)."""
         if self.bcast_mode != "per_k":
             raise ValueError(f"aux {self.name!r} is not a per-K broadcast")
-        return 2 if self.dim[1] == 1 else 1
+        assert self.reduction_axis is not None  # Validated at construction.
+        return self.reduction_axis
+
+    @property
+    def symbolic_shape(self) -> tuple[int | Axis, ...]:
+        """Dynamic extent semantics; ``dim`` retains declared concrete sizes.
+
+        Rank-1 epilogue auxiliaries use the existing rank-2 kernel ABI.
+        Per-K orientation comes from the operand, even when K equals one.
+        """
+        if self.bcast_mode == "per_k":
+            shape = [1, 1, 1]
+            shape[self.k_axis] = Axis.K
+            return tuple(shape)
+        axes = {
+            "scalar": (1, 1),
+            "per_row": (Axis.M, 1),
+            "per_col": (1, Axis.N),
+            "per_elem": (Axis.M, Axis.N),
+        }[self.bcast_mode]
+        if len(self.dim) == 3:
+            batch = Axis.GROUP if self.grouped_by_moe else (1 if self.dim[0] == 1 else Axis.BATCH)
+            return (batch, *axes)
+        return axes
 
 
 def gemm_source(g: int) -> int:
@@ -626,8 +668,11 @@ class FusionChain:
                     ref = self.aux_by_name(op.aux)
                     if ref.bcast_mode == "per_k":
                         expected = (1, 1, self.matmul.K) if label == "mainloop_a_ops" else (1, self.matmul.K, 1)
-                        if ref.dim != expected:
-                            raise ValueError(f"{label} per-K aux {ref.name!r}: expected {expected}, got {ref.dim}")
+                        axis = 2 if label == "mainloop_a_ops" else 1
+                        if ref.dim != expected or ref.k_axis != axis:
+                            raise ValueError(
+                                f"{label} per-K aux {ref.name!r}: expected {expected} with K axis {axis}, " f"got {ref.dim} with K axis {ref.k_axis}"
+                            )
                     elif ref.bcast_mode != "scalar":
                         raise ValueError(
                             f"{label} op {op.op!r} aux {op.aux!r} must broadcast as a "
@@ -822,7 +867,15 @@ def swap_ab(chain: FusionChain) -> FusionChain:
         dim, stride = t.dim, t.stride
         if len(dim) == 1:
             dim, stride = (1, dim[0]), (stride[0], stride[0])
-        swapped_aux.append(dataclasses.replace(t, dim=_mn(dim), stride=_mn(stride), bcast_mode=_bcast(t.bcast_mode)))
+        swapped_aux.append(
+            dataclasses.replace(
+                t,
+                dim=_mn(dim),
+                stride=_mn(stride),
+                bcast_mode=_bcast(t.bcast_mode),
+                reduction_axis=None if t.reduction_axis is None else 3 - t.reduction_axis,
+            )
+        )
     swapped_outputs = [
         dataclasses.replace(
             o,

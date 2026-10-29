@@ -1575,13 +1575,15 @@ def _walk_mainloop_chain(
             aux_meta = meta[aux_id]
             if aux_id not in aux_seen:
                 aux_seen.add(aux_id)
+                scalar_aux = _is_scalar_input(aux_id)
                 aux_tensors.append(
                     TensorRef(
                         name=aux_meta.name,
                         dim=aux_meta.dim,
                         stride=aux_meta.stride,
                         dtype=aux_meta.dtype,
-                        bcast_mode="scalar" if _is_scalar_input(aux_id) else "per_k",
+                        bcast_mode="scalar" if scalar_aux else "per_k",
+                        reduction_axis=None if scalar_aux else (2 if label == "A" else 1),
                     )
                 )
                 aux_objs.append(aux_meta.tensor)

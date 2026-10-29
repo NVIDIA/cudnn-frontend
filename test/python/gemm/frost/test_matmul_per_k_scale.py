@@ -13,7 +13,7 @@ import cudnn
 import pytest
 import torch
 
-from cudnn.gemm.frost.fusion_ir import swap_ab
+from cudnn.gemm.frost.fusion_ir import Axis, TensorRef, swap_ab
 from cudnn.gemm.frost.graph_analyzer import analyze, analyze_with_binding, swap_ab_binding
 from cudnn.gemm.frost.kernel_registry import select_template
 from cudnn.gemm.frost.sm100 import compiler, epilogue_codegen
@@ -186,6 +186,37 @@ def test_frost_per_k_ir_rejects_invalid_broadcast():
         replace(chain, ops=[chain.mainloop_a_ops[0]])
     with pytest.raises(ValueError, match="expected"):
         replace(chain, aux_tensors=[replace(chain.aux_tensors[0], dim=(1, 1, 144))])
+    with pytest.raises(ValueError, match="explicit reduction axis"):
+        replace(chain.aux_tensors[0], reduction_axis=None)
+
+
+def test_frost_aux_symbolic_shape_contract():
+    # Equal and unit extents cannot identify a logical GEMM axis by value.
+    cases = [
+        ("scalar", (1,), False, (1, 1), "(1, 1)"),
+        ("per_col", (128,), False, (1, Axis.N), "(1, sym_n)"),
+        ("per_row", (128, 1), False, (Axis.M, 1), "(sym_m, 1)"),
+        ("per_elem", (128, 128), False, (Axis.M, Axis.N), "(sym_m, sym_n)"),
+        ("scalar", (2, 1, 1), False, (Axis.BATCH, 1, 1), "(sym_l, 1, 1)"),
+        ("per_row", (1, 1, 1), False, (1, Axis.M, 1), "(1, sym_m, 1)"),
+        ("per_col", (2, 1, 128), False, (Axis.BATCH, 1, Axis.N), "(sym_l, 1, sym_n)"),
+        ("per_elem", (2, 128, 128), False, (Axis.BATCH, Axis.M, Axis.N), "(sym_l, sym_m, sym_n)"),
+        ("scalar", (4, 1, 1), True, (Axis.GROUP, 1, 1), "(sym_g, 1, 1)"),
+        ("per_row", (4, 128, 1), True, (Axis.GROUP, Axis.M, 1), "(sym_g, sym_m, 1)"),
+        ("per_col", (4, 1, 128), True, (Axis.GROUP, 1, Axis.N), "(sym_g, 1, sym_n)"),
+    ]
+    for mode, dim, grouped, shape, code in cases:
+        ref = TensorRef("aux", dim, (1,) * len(dim), "bf16", mode, grouped)
+        assert ref.symbolic_shape == shape
+        assert compiler._aux_fake_shape_code(ref) == code
+    chain = analyze(_graph(side="ab")[0])
+    chain = replace(chain, matmul=replace(chain.matmul, K=1), aux_tensors=[replace(ref, dim=(1, 1, 1)) for ref in chain.aux_tensors])
+    assert [ref.symbolic_shape for ref in chain.aux_tensors] == [(1, 1, Axis.K), (1, Axis.K, 1)]
+    swapped = swap_ab(chain)
+    assert [ref.symbolic_shape for ref in swapped.aux_tensors] == [(1, Axis.K, 1), (1, 1, Axis.K)]
+    assert swap_ab(swapped).aux_tensors == chain.aux_tensors
+    with pytest.raises(ValueError, match="expected"):
+        replace(chain, aux_tensors=[replace(ref, reduction_axis=3 - ref.k_axis) for ref in chain.aux_tensors])
 
 
 @pytest.mark.parametrize("side", ["a", "b", "ab"])

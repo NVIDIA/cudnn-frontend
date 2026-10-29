@@ -24,7 +24,7 @@ from cudnn.frost.workspace import Workspace
 
 from .arch_family import active_family
 from .dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS, _pow2_floor, tensor_alignment
-from .fusion_ir import FusionChain, MoeSwapAbSpec, TensorRef, segmented_row_scale_capacity_rows
+from .fusion_ir import Axis, FusionChain, MoeSwapAbSpec, TensorRef, segmented_row_scale_capacity_rows
 from .recipe import REDUCTION_INIT_VALUE, _output_rule, contiguous_modulus, expected_shape
 
 
@@ -63,32 +63,9 @@ _INJECT_MARKER_LINE = re.compile(r"^([ \t]*)# *@@([A-Z0-9_]+)@@[ \t]*\n", flags=
 
 
 def _aux_fake_shape_code(aux: TensorRef) -> str:
-    """Generate the symbolic shape of an auxiliary tensor."""
-    if aux.bcast_mode == "per_k":
-        return "(1, 1, sym_k)" if aux.k_axis == 2 else "(1, sym_k, 1)"
-    if len(aux.dim) == 3:
-        if aux.grouped_by_moe:
-            batch = "sym_g"
-        else:
-            batch = "1" if aux.dim[0] == 1 else "sym_l"
-        if aux.bcast_mode == "scalar":
-            return f"({batch}, 1, 1)"
-        if aux.bcast_mode == "per_row":
-            return f"({batch}, sym_m, 1)"
-        if aux.bcast_mode == "per_col":
-            return f"({batch}, 1, sym_n)"
-        if aux.bcast_mode == "per_elem":
-            return f"({batch}, sym_m, sym_n)"
-    else:
-        if aux.bcast_mode == "scalar":
-            return "(1, 1)"
-        if aux.bcast_mode == "per_row":
-            return "(sym_m, 1)"
-        if aux.bcast_mode == "per_col":
-            return "(1, sym_n)"
-        if aux.bcast_mode == "per_elem":
-            return "(sym_m, sym_n)"
-    raise AssertionError(f"unknown bcast_mode {aux.bcast_mode!r}")
+    """Render the IR's extent semantics without reconstructing broadcasts."""
+    symbols = {Axis.M: "sym_m", Axis.N: "sym_n", Axis.K: "sym_k", Axis.BATCH: "sym_l", Axis.GROUP: "sym_g"}
+    return "(" + ", ".join(symbols[extent] if isinstance(extent, Axis) else str(extent) for extent in aux.symbolic_shape) + ")"
 
 
 def _aux_can_use_explicit_fake_stride(aux: TensorRef) -> bool:
@@ -115,7 +92,7 @@ def _aux_fake_block(aux_tensors: list[TensorRef], *, dynamic_strides: bool = Fal
             stride = "(" + ", ".join(str(s) for s in aux.stride) + ")"
             lines.append(f"fake_{aux.name} = cute.runtime.make_fake_tensor({dtype}, {shape}, " f"stride={stride}, assumed_align={_align})")
         else:
-            _rank = 3 if len(aux.dim) == 3 else 2
+            _rank = len(aux.symbolic_shape)
             stride = "(" + ", ".join("cute.sym_int64()" for _ in range(_rank)) + ")"
             lines.append(f"fake_{aux.name} = cute.runtime.make_fake_tensor({dtype}, {shape}, " f"stride={stride}, assumed_align={_align})")
     return "\n".join(lines) if lines else "pass"
