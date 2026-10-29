@@ -241,7 +241,7 @@ def test_staged_stats_preserves_declared_storage_view(valid_capacity, native, mo
 
 
 @pytest.mark.parametrize("native,overlap", [(True, False), (False, False), (False, True)])
-def test_ordered_gradient_copy_back(native, overlap, monkeypatch):
+def test_native_interleaved_gradients_or_unaligned_decline(native, overlap, monkeypatch):
     from cudnn.sdpa.bwd import staged_sm80
 
     case = _case(96, 96, hk=4)
@@ -254,9 +254,8 @@ def test_ordered_gradient_copy_back(native, overlap, monkeypatch):
         for i, role in enumerate(("dq", "dk", "dv")):
             case.bufs[role] = owner[..., i, :].transpose(1, 2)
     if not native:
-        # Keep the retained copy-back contract on an actually staged input.
-        # Aligned padded widths now use the native chain, including interleaved
-        # disjoint gradients sharing one allocation.
+        # Both overlapping and disjoint outputs decline when the input
+        # requires a staging copy; accepted interleaved outputs stay native.
         _use_unaligned_q(case)
         with pytest.raises(NotImplementedError, match="q.*stride"):
             _adapter(case)
@@ -272,14 +271,8 @@ def test_ordered_gradient_copy_back(native, overlap, monkeypatch):
 
     monkeypatch.setattr(staged_sm80, "_copy", record)
     _execute(api, case.bufs, workspace)
-    if native:
-        assert not calls, "native interleaved gradients must not add layout copies"
-    else:
-        assert calls[-3:] == [1, 1, 1], "potentially overlapping gradient scatters must preserve copy-back ordering"
-    if overlap:
-        torch.testing.assert_close(case.bufs["dv"].float(), case.expected["dv"].float(), atol=0.03, rtol=0.03)
-    else:
-        _check(case)
+    assert not calls, "native interleaved gradients must not add layout copies"
+    _check(case)
 
 
 @pytest.mark.parametrize("explicit_stream", [False, True])

@@ -896,6 +896,11 @@ addressing: THD never reads the declared batch stride. A shared dense-layout
 predicate can silently select staging for an otherwise valid packed graph.
 Keep per-port graph/standalone rejection checks and legal gapped THD controls
 in `test_sdpa_native_admission_sm80.py`, plus actual launch-count/replay checks.
+Keep declaration-only validators in `native_sm80.py`, outside prepared launch
+modules: the latter depend back on adapter helpers and can introduce import
+cycles when called by `check_support()`. After removing a supported route,
+remove its unreachable test branches and name the retained decline/replay
+cases for the contract they actually assert.
 
 
 `gated_attention_block` runs the SDPA forward adapter as its attention stage, and

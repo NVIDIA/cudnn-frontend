@@ -144,7 +144,7 @@ def test_packed_staged_preserves_output_tail(dtype, d, dv, hkv, stats_layout):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("d", [64, 128])
-def test_rope_staged_replay(dtype, d):
+def test_rope_declines_before_compile(dtype, d):
     from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm80
 
     q = torch.empty(2, 4, 128, d, device="cuda", dtype=dtype)
@@ -155,7 +155,7 @@ def test_rope_staged_replay(dtype, d):
     assert api._prepared is None and api._staged_prepared is None
 
 
-def test_rope_eager_accepts_cpu_angles(monkeypatch):
+def test_rope_eager_declines_cpu_angles():
     from cudnn.sdpa.bwd.api_dsl import sdpa_bwd_wrapper_sm80
 
     q = torch.empty(1, 2, 128, 128, device="cuda", dtype=torch.float16)
@@ -164,7 +164,7 @@ def test_rope_eager_accepts_cpu_angles(monkeypatch):
         sdpa_bwd_wrapper_sm80(q, q, q, q, q, stats, rope_freqs=torch.zeros(128, 64))
 
 
-def test_staged_singleton_strides_keep_existing_copy_set():
+def test_native_singleton_ignores_unused_strides():
     from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm80
 
     q = torch.empty(1, 1, 128, 128, device="cuda", dtype=torch.float16).as_strided((1, 1, 128, 128), (7, 3, 128, 1))

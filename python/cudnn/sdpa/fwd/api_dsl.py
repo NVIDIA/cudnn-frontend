@@ -6919,9 +6919,9 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self.head_dim_qk = int(d_qk)
         self.head_dim_v = int(d_v)
 
-        from cudnn.sdpa.fwd.prepared_sm80 import native_decline_reason
+        from cudnn.sdpa.native_sm80 import forward_adapter_mismatch
 
-        reason = native_decline_reason(self)
+        reason = forward_adapter_mismatch(self)
         self._not_implemented_error_if(reason is not None, reason)
 
         self._is_supported = True

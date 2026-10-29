@@ -124,14 +124,14 @@ print(json.dumps(compiled_cache.stats()))
 
 @pytest.mark.parametrize("backward", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_rope_execution_uses_prepared_table(backward, dtype, monkeypatch):
+def test_rope_declines_before_prepared_execution(backward, dtype, monkeypatch):
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm80
     from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm80
-    from test_sdpa_bwd_staged_sm80 import test_rope_staged_replay
-    from test_sdpa_sm80_thd_forward_prepared import test_dense_staged_pointer_launch_and_rope_replay
+    from test_sdpa_bwd_staged_sm80 import test_rope_declines_before_compile
+    from test_sdpa_sm80_thd_forward_prepared import test_dense_native_replay_or_rope_decline
 
-    # Intercept only the actual execution; the independent references retain
-    # their own Torch sin/cos. This was RED on both original adapters.
+    # Keep the execution tripwires while the public adapters reject RoPE
+    # during preparation. Low-level table execution is tested separately.
     for adapter in (SdpaFwdDslSm80, SdpaBwdDslSm80):
         original = adapter.execute
 
@@ -144,9 +144,9 @@ def test_rope_execution_uses_prepared_table(backward, dtype, monkeypatch):
 
         monkeypatch.setattr(adapter, "execute", execute)
     if backward:
-        test_rope_staged_replay(dtype, 128)
+        test_rope_declines_before_compile(dtype, 128)
     else:
-        test_dense_staged_pointer_launch_and_rope_replay(128, 128, True, dtype, monkeypatch)
+        test_dense_native_replay_or_rope_decline(128, 128, True, dtype, monkeypatch)
 
 
 @pytest.mark.parametrize("overflow", ["stride", "product"])

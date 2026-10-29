@@ -19,6 +19,17 @@ def data_layout_mismatch(name, shape, stride, *, thd=False):
     return None
 
 
+def forward_adapter_mismatch(api):
+    if api._rope_max_s:
+        return "SM80 RoPE forward requires staging and is not supported by the native adapter"
+    for role in ("q", "k", "v", "o"):
+        desc = getattr(api, role + "_desc")
+        reason = data_layout_mismatch(role, desc.shape, desc.stride, thd=api.thd)
+        if reason is not None:
+            return reason
+    return None
+
+
 def graph_mismatch(facts, _version=None):
     """No tensor-framework imports, allocation, compilation or graph mutation."""
     from cudnn.frost.buffers import is_contiguous

@@ -72,7 +72,7 @@ def _execute(api, case, workspace, stream=None):
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("features", [False, True])
-def test_prepared_copy_avoids_torch_staging_and_replays(d, dv, pad, native, dtype, features, monkeypatch):
+def test_native_replays_or_declines_copy_dependent_layout(d, dv, pad, native, dtype, features, monkeypatch):
     if not native:
         with pytest.raises(NotImplementedError, match="SM80.*(stride|multiple)"):
             _case(d, dv, dtype, pad, features)
@@ -80,11 +80,8 @@ def test_prepared_copy_avoids_torch_staging_and_replays(d, dv, pad, native, dtyp
     api, case = _case(d, dv, dtype, pad, features)
     required = api.scratch_workspace_bytes()
     api.compile()
-    if native:
-        assert api._sm80_spec.native is not None
-        assert api._sm80_copy_spec is None and required == 0
-    else:
-        assert api._sm80_copy_spec.core.native is not None
+    assert api._sm80_spec.native is not None
+    assert api._sm80_copy_spec is None and required == 0
     workspace = torch.empty(required, device="cuda", dtype=torch.uint8)
     _execute(api, case, workspace)
     _check(case)
