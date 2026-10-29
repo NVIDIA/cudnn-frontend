@@ -2642,8 +2642,10 @@ on the 80-wide tile.
 Engines: `sdpa_fwd_prefill_sm80`, `sdpa_bwd_sm80`. Both use `mma.sync` (no
 tcgen05) and assume the A100's 164 KiB opt-in SMEM — sm86/sm89 are declined.
 The backward serves packed THD graphs (ᵏ); the forward serves native-flavor packed THD graphs
-with per-batch or cumulative Q/KV lengths, compact BSHD Q/K/V/O, and packed
-head-major or token-major Stats.
+with per-batch or cumulative Q/KV lengths, token-major Q/K/V/O with independent
+8-element-aligned head/token strides (padding and gaps allowed), and packed
+head-major or token-major Stats. The head dimension is contiguous, head rows and
+token rows do not overlap, and the unused batch stride is ignored.
 The packed caller contract still applies: every sequence length is within its
 declared `S_max`, the Q/KV length sums fit the respective bound packed buffers
 and any `max_total_seq_len_*`, and ragged offsets describe the same adjacent
@@ -2719,7 +2721,8 @@ copy-dependent declarations decline before compilation.
 Native-flavor THD forward graphs reuse this pointer host, with optional head-major
 or token-major Stats and device-side length normalization in caller workspace.
 Plan construction and execution allocate no device memory. Graph admission requires
-compact packed Q/K/V/O, natural scheduling, and no bias, sink, or RoPE fusion.
+token-major Q/K/V/O with aligned, non-overlapping head/token strides, natural
+scheduling, and no bias, sink, or RoPE fusion.
 The graph path does not run the standalone wrapper's output-capacity initialization.
 
 Standalone packed forward/backward wrappers share prepared bitwise data copies
@@ -2776,7 +2779,7 @@ the caller's gradients (the ragged sweeps assert this with a NaN-filled tail). S
 deterministic dQ, head-dim envelope padding (carved staging at the packed
 capacities), zero-length and one-sided-empty sequences. Bias/dBias is dense-only (a packed graph has no `[B, H, S_q, S_kv]` bias); RoPE is a
 wrapper-only fusion no engine row admits. The SM80 forward row now serves
-native-flavor, compact packed THD with Q/KV lengths; its dense head-dim
+native-flavor, strided packed THD with Q/KV lengths; its dense head-dim
 envelope and fused bias/sinks remain unavailable to THD.
 
 ---
@@ -2804,7 +2807,7 @@ envelope and fused bias/sinks remain unavailable to THD.
 | Per-tensor FP8 backward | every arch except SM107 d = 256 E4M3 (`sdpa_bwd_sm107_fp8`, ᵇ) and, opt-in, SM100 / SM103 D64 / D128 (`sdpa_bwd_sm100_d128_fp8`) and dense (192, 128) (`sdpa_bwd_sm100_d192_fp8`) |
 | MXFP8 backward outside SM100/SM103 d ∈ {64, 128, (192, 128), 256} and SM107 d = 256 (`sdpa_bwd_sm107_mxfp8`, ᵐˣ) | every arch |
 | THD / ragged backward | SM120, the SM107 d512 row (ᵇ³) and the SM100/SM103 MXFP8 and f16/bf16 d256 (ᵇ²) rows (the SM100/SM103 f16/bf16 d512 row serves it — see ʰ; the SM107 f16/bf16 and per-tensor FP8 rows — see ᵇ; the SM107 MXFP8 row — see ᵐˣ; SM80 — see ᵏ). The d128 row serves THD only on cc 10.0 or 10.3 with public CuTeDSL ≥ 4.8 and positive FP32 scale: BF16/FP16 MHA and BF16 GQA/MQA. |
-| THD forward outside native-flavor dims or compact packed Q/K/V/O | SM80 — the graph path serves only the four native head-dim pairs and copy-free packed BSHD buffers |
+| THD forward outside native-flavor dims or aligned token-major Q/K/V/O | SM80 — the graph path serves the four native head-dim pairs with independent non-overlapping 8-element-aligned head/token strides, including padded/gapped rows |
 | **Decode tile on the Rubin line outside the d256 f16/bf16 flavor** | **SM107** — d128 / d192×d128 / d512 decode and every fp8 / mxfp8 decode run their flavor's prefill kernel; the d256 f16/bf16 decode tile (ᵈʳ: whole-group PackGQA, dense / paged split-KV, the MTP step in token units of the 32-column tile ᵐᵗᵖ) is the only Rubin decode tile today |
 | **Paged d256 decode-tile default placement outside its measured bands** | **SM107** — the MTP rows (`S_q` 2-4 on 24/2 and 32/2, the 32-column tile in up to two token units ᵐᵗᵖ) and group 32 (64/2, the 32-column tile in one unit) LEAD by default inside their measured bands since the follow-up to the first arm (the MTP box b 1-128 × KV 1k-128k at page 16 bf16: 0.01-0.31 of the backend's default plan, which costs 6.8-142 ms per launch at KV 128k; group 32 from 4 units and 2¹⁷ KV tokens in flight: 0.27-0.79) although the 32-column tile still trails FlashInfer's own fa2 decode kernel on part of them (6 % at q 2, 21-22 % at q 3-4; 7-9 % on group 32, at the medians) -- its per-CTA issue-rate gap at 24-64 packed rows (212-SM cc 10.7 perf class, cuDNN 9.27.0, 2026-10-13), a kernel lever, not a placement fact: FE's verdict is against the backend's plan. Still backend-first because unmeasured: the MTP rows at page 32 / 64 and in f16 and on the 12/1 / 16/1 geometries (the same groups, unmeasured at `S_q > 1`), group 32 on 32/1 (the same group, unmeasured), at page 32 / 64 (measured on 24/2 only), below 2¹⁷ tokens in flight (its 2¹⁶ step holds a parity cell) or with fewer than 4 units; Stats, sinks, a mask or window at `S_q = 1`, page 128, fewer than 4 units (1-2 units led only at the 128k endpoint), above 512 units or past 128k declared KV, a dense (unpaged) d256 cache at `S_q = 1` (measured against the prefill body only), THD queries, the fused gate, a paged decode without per-request KV lengths (no padding mask: every band cell carried one). The head-major in-page pool layout (each head's page contiguous, vLLM's `[blocks, 2, H_kv, block, D]`) is admitted beside the token-major one the band measured: measured 2026-10-14 on the 24/2 core geometry with the same protocol on an EXCLUSIVE GPU of the same 212-SM cc 10.7 class (lock 2376 sampled: busy median 2364; cuDNN 9.27.0 build 9.27.0.21; b 1-128 x declared KV 1k-128k at page 16 bf16, 48 cells x 2 regimes): the tile 0.36-0.92 of the backend on EVERY in-band cell in both regimes (32 cells per regime, all quotable; medians 0.45 replay / 0.45 eager), the out-of-band cells mixed 0.73-2.00 as in the token-major band. Follow-up: the kernel fix of the 32-column tile reopens both holds (a placement constant each); the Stats / page-128 twins are one measured chunk each (`placement._sm107_paged_d256_decode_tile_leads`) |
 | **Native d=64 (GPT-OSS) forward kernel** | **SM107 per-tensor FP8 / MXFP8** — served via the d128 envelope at ~2× MMA cost (the f16/bf16 row is native on its 64-wide tile, and every D ≤ 32 on its 32-wide one, since 2026-10-08 -- see the SM107 table's ᵗ). SM100/SM103 is native (⁷) for f16/bf16 (prefill, decode (ᵈ⁶⁴), paged and split-KV), per-tensor FP8 (prefill, paged, split-KV; cga1) and MXFP8 (dense / unsplit / unpaged; cga1) |
@@ -3898,7 +3901,9 @@ end to end against the fp32 block oracle (the serving-forms section above, `test
 
 Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): THD and paged pools in one declaration, THD with the in-block indexer (through the block), any of the decode form's three arms under THD, a shared list at `S_q > 4`, a split past the item's tile
 count, the kernel's own epilogue gate under a split (the combine carries it), a sink, a sliding window / band, Q-length trimming
-of a dense batch, log2 stats, a pure caller list without the tail, head dims other than 256, FP8 / MXFP8.
+of a dense batch, log2 stats, a pure caller list without the tail, head dims other than 256, FP8 / MXFP8 INPUTS (Q / K / V, and the
+e4m3 pools: no body of the sparse core runs over them -- the gathered cast + the dense decode tile, the lean paragraph below) and an FP8
+OUTPUT without the gate, on an unsplit plan or in e5m2 (the fused gated e4m3 store below is the one FP8 output served).
 
 **The SECOND BODY of the function -- the LEAN decode tile** (`python/cudnn/sdpa/fwd/kernels/sm107/sparse_lean_d256_f16.py`: `mma.sync`
 m16n8k16 + `cp.async`, one CTA of 128 x N_MT threads per (sequence, KV head, chunk of `k` 32-key sub-tiles; N_MT = ceil(S_q x G / 16) m16 tiles
@@ -3935,7 +3940,39 @@ consulted by `"auto"` ONLY on the parts of `SPARSE_LEAN_TILE_DEFAULT_CCS` = `((1
 measured-default rule: the tuple flipped with the gate's table, the bound refit from it to 4 over `B x H_kv x S_q`; 2026-10-27 the unit
 re-read as the CTAs per chunk from the same table's S_q 4 rows -- B 1 x S_q 4 wins +6.4 / +6.6 / +6.8 % at 2 per chunk, B 4 x S_q 4 loses
 -9.7 / -8.8 / -9.2 % at 8, each beside its S_q 1 twin), so `"auto"` takes the lean tile on cc 10.7 inside the bound and the tcgen05 core on
-every other part / past the bound; the explicit `"lean"` takes it anywhere the body serves the declaration.
+every other part / past the bound; the explicit `"lean"` takes it anywhere the body serves the declaration.  **Explicit admission on the
+Blackwell parts (2026-10-28, UNMEASURED):** `sparse_tile_rules.SPARSE_LEAN_TILE_EXPLICIT_CCS = ((10, 0), (10, 3))` -- on cc 10.0 / 10.3,
+outside the core's record (`sm_lo .. sm_hi` = 107 .. 119, unchanged), the adapter serves the EXPLICIT `tile_form="lean"` only (the lean body
+is SM100-legal instruction for instruction, its config pins no Rubin-only size, the DSL targets the ambient device, the sm100 split combine
+reduces the slab with the gate as for the dense d256 decode tile there -- a lean plan's combine form: on cc 10.0 the cc 10.7 split-aware
+rule's shape, measured, the next paragraph; on cc 10.3 the module's own forms, unmeasured); `"auto"` / `"tcgen05"` there resolve the core
+and are declined by name (`sparse_tile_part_decline`, the text ending with the former Rubin-line spelling; the part set is also the record's `SparseCapabilities.lean_explicit_ccs`, appended, pinned equal to the
+rules constant), so the route can be measured on a B200-class part; the AUTO pin and the placement rule stay cc 10.7's, and the
+gated attention block's other stages keep their Rubin pins (the standalone adapter is the entry on those parts).  **The lean route's
+combine FORM on cc 10.0 (2026-10-29, MEASURED):** `sparse_tile_rules.SPARSE_LEAN_COMBINE_RULE_CCS = ((10, 0),)` -- a LEAN plan there follows
+the cc 10.7 split-aware rule's shape (`sparse_lean_combine_rule_cc`; the decode-grid kernel on the 24-96-row grids at the lean splits, the
+module's own forms on the 384-row grid below split 32), from the 2026-10-28 measurement on the GB200 152-SM class (the decode-grid kernel
+3.0-3.8 us against the module's own forms 6.8-16.3 at 24-96 rows, 8.8-8.9 vs 7.4-16.3 at 384 rows; 15 of 16 cells named); cc 10.3 is
+UNMEASURED and keeps the module's own forms.  **The FUSED gated e4m3 store (2026-10-29; `SparseCapabilities.gated_e4m3_out`):** `o` declared
+`float8_e4m3fn` + `out_scale` (one fp32 element: the consumer's static per-tensor DEQUANT scale) + the epilogue gate on a SPLIT plan (the lean
+tile always splits; the tcgen05 core needs `split_kv >= 2`; never THD) takes the split combine's fused entry
+(`sm100/split_combine.compile_ptr(gate=True, gate_e4m3=True, dtype_o="e4m3")`): `e4m3(rn, satfinite)(O32 * sigmoid(G) * div.rn(1, scale))`,
+ONE rounding of the fp32 gated value with the inverse computed on device, dead rows 0, the LSE untouched -- within one e4m3 ulp of the
+unfused chain (the half O then `e4m3(half(O) * inv)`) and of the serving stacks' gate-and-quantize convention, never bitwise, wherever the
+half twin does not underflow before the scale (below the half dtype's smallest normal the twin loses digits and then flushes to zero, f16
+from 2^-25 down, while the fused path keeps the fp32 magnitude: the single rounding is the contract, the twin is not a general bound -- the
+suite's boundary cell records 48 on every form against the f16 twin's 0 and the bf16 twin's 52 at a merged value of 1e-8, a zero gate and
+the scale 1e-10).  `out_scale` is a
+POSITIVE NORMAL fp32 by contract (its value is never read on the host; a zero / subnormal scale makes the on-device inverse +inf: the e4m3 NaN
+byte on a dead row, +-448 on the live rows).  Declines by name: `NotImplementedError` (the typed decline) for an unwired form -- an e4m3 `o`
+without the gate / unsplit / under THD, any other output dtype --, `ValueError` for a malformed declaration -- an e4m3 `o` without the scale,
+a scale with a half `o`, a scale that is not one contiguous fp32 element.  `gated_e4m3_out` is the record's LAST field (appended after
+`lean_explicit_ccs`).  Validated on the Rubin development class (every form of the entry -- AUTO / ON / OFF and the lean group walk -- against
+the unfused twin, the walk at two walk-selected geometries, the f16 underflow boundary of the twin claim, the saturation at +-448, the strided
+element path, the PDL arm; the adapter's lean
+route end to end, and the tcgen05 route's split plan at split 4: the module's own forms inside the bound, the lean group walk on the
+192-lean-block grid); the lean-route adapter rows run on every SM100-line part (the explicit admission: the cc 10.0 / 10.3 CI parts) --
+`test_split_combine_gate_e4m3.py`.
 Kernel-alone evidence on the Rubin performance class (212 SMs at the 2376
 MHz lock, one process, A/B/A x 3 rounds x 10 replays of 100 launches, the control pair within 0.32 %, the oracle green before timing):
 B 1 x 8K x S_q 1 at `top_k` 512 on page-16 pools 3.341 us (3.352 with the build order rotated) against the tcgen05 core's 5.655 (+69.3 %),
