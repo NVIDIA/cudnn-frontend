@@ -702,7 +702,7 @@ def test_graph_thd_independent_pitches_rebind_replay(d, dv, stats_layout):
 
     def check(q_lengths, kv_lengths):
         oq = ok = 0
-        for nq, nk in zip(q_lengths, kv_lengths):
+        for nq, nk in zip(q_lengths, kv_lengths, strict=True):
             if nq:
                 qd = vp[q][0, oq : oq + nq].transpose(0, 1).double()
                 kd = vp[k][0, ok : ok + nk].transpose(0, 1).double().repeat_interleave(2, dim=0)

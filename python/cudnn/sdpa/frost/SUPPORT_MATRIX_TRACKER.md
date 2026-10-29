@@ -2721,7 +2721,8 @@ copy-dependent declarations decline before compilation.
 Native-flavor THD forward graphs reuse this pointer host, with optional head-major
 or token-major Stats and device-side length normalization in caller workspace.
 Plan construction and execution allocate no device memory. Graph admission requires
-compact packed Q/K/V/O, natural scheduling, and no bias, sink, or RoPE fusion.
+token-major Q/K/V/O with aligned, non-overlapping head/token strides, natural
+scheduling, and no bias, sink, or RoPE fusion.
 The graph path does not run the standalone wrapper's output-capacity initialization.
 
 Standalone packed forward/backward wrappers share prepared bitwise data copies
