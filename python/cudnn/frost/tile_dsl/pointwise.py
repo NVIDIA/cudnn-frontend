@@ -890,6 +890,62 @@ def rope_rotate_half(
 
 
 @cute.jit
+def round_pair_io(lo: cutlass.Float32, hi: cutlass.Float32, io_dtype):
+    """Two fp32 values rounded to ``io_dtype`` (bf16 / f16: ``cvt.rn.{bf16,f16}x2.f32``, round-to-nearest-even -- the SAME
+    instruction the store path rounds with) and widened back EXACTLY: the io-dtype ROUNDING POINT of a value that stays in fp32
+    registers (``x.to(io).to(fp32)`` in torch terms).  The pair form is the hardware's (one ``cvt`` rounds two values); a lone
+    value rounds as ``round_pair_io(x, x, dt)[0]``.  Used by the ``"hf"`` rounding arm of the QSA indexer's compress chains
+    (``gated_attention_block/kernels/qsa_compress.py``: the pooled key before its norm, the normed row before its rotation, the
+    rotation's three operations); :func:`round_values_io` is the row form."""
+    return f16x2_to_f32(fp32_to_fp16(lo, hi, dtype=io_dtype), dtype=io_dtype)
+
+
+def round_values_io(values, io_dtype):
+    """:func:`round_pair_io` over an EVEN-length Python list of fp32 values (a lane's chunk of a row), pairwise; returns the new
+    list.  Plain Python at trace time (no staged control flow), so it is callable from a kernel body like the unpack comprehensions."""
+    assert len(values) % 2 == 0, f"round_values_io: an even number of values is needed, got {len(values)}"
+    out = []
+    for i in range(0, len(values), 2):
+        lo, hi = round_pair_io(values[i], values[i + 1], io_dtype)
+        out.append(lo)
+        out.append(hi)
+    return out
+
+
+@cute.jit
+def rope_rotate_half_io(
+    y0: cutlass.Float32,
+    y1: cutlass.Float32,
+    cos0: cutlass.Float32,
+    cos1: cutlass.Float32,
+    sin0: cutlass.Float32,
+    sin1: cutlass.Float32,
+    lane: cutlass.Int32,
+    half_lanes: cutlass.Constexpr[int],
+    io_dtype,
+):
+    """:func:`rope_rotate_half` for a PAIR of adjacent elements with the io-dtype rotation of the HF / vLLM-prepare dtype flow:
+    ``a = io(y * cos)``, ``b = io(signed_partner * sin)``, ``out = io(a + b)`` -- each of the three operations rounded to ``io_dtype``
+    (torch's bf16 ops and Triton's bf16 ops both round per op; ``a - b == a + (-b)`` exactly, so the sign convention of
+    :func:`rope_rotate_half` is kept).  The TABLES are rounded to ``io_dtype`` first -- the HF reference rotates with ``cos`` / ``sin``
+    cast to the key dtype, so a 16-bit table of the OTHER width (f16 tables under bf16 io, or the converse) meets the oracle's rounding
+    point here, and a table already in the io dtype passes unchanged (an exact identity: every io value is a fixed point of its own
+    ``cvt.rn``).  With that, every input is io-representable (the caller rounded the normed row), so the fp32 products are exact and
+    the ONE rounding per op is the io one.  Same partner shuffle (every lane of the warp must reach this call), same lane rules;
+    returns ``(out0, out1)``.  Pairs so that one ``cvt`` rounds two values (:func:`round_pair_io`)."""
+    cos0, cos1 = round_pair_io(cos0, cos1, io_dtype)
+    sin0, sin1 = round_pair_io(sin0, sin1, io_dtype)
+    p0 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, y0, cutlass.Int32(half_lanes), 31, kind=nvvm.Shfl.BFLY))
+    p1 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, y1, cutlass.Int32(half_lanes), 31, kind=nvvm.Shfl.BFLY))
+    lower = lane < cutlass.Int32(half_lanes)
+    s0 = -p0 if lower else p0
+    s1 = -p1 if lower else p1
+    a0, a1 = round_pair_io(y0 * cos0, y1 * cos1, io_dtype)
+    b0, b1 = round_pair_io(s0 * sin0, s1 * sin1, io_dtype)
+    return round_pair_io(a0 + b0, a1 + b1, io_dtype)
+
+
+@cute.jit
 def l2norm_inv(sum_sq: cutlass.Float32) -> cutlass.Float32:
     """Inverse L2 norm, ``rsqrt(sum_sq + L2_NORM_EPS)``; a zero row normalizes to zero."""
     return cute.math.rsqrt(sum_sq + cutlass.Float32(L2_NORM_EPS), fastmath=True)
