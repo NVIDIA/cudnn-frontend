@@ -2664,7 +2664,7 @@ THD retains its packed-layout constraints; its unused batch stride is ignored.
 Backward bias/dBias and sink/dSink must be declared in pairs with contiguous
 auxiliary storage. Standalone RoPE and nonaligned data layouts are declined
 because they would require staging. The launch-count detectors in
-`test_sdpa_bwd_staged_sm80.py` and `test_sdpa_staged_copy_sm80.py` retain
+`test_sdpa_bwd_staged_sm80.py` and `test_sdpa_fwd_native_layouts_sm80.py` retain
 native padding/replay coverage; `test_sdpa_native_admission_sm80.py` checks
 early declines and legal dense/THD declarations without GPU allocation.
 

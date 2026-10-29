@@ -52,7 +52,7 @@ def native_decline_reason(api):
     return None
 
 
-def build_spec(api, d64_module, *, staged=False):
+def build_spec(api, d64_module):
     """Compile the chain with plan-time strides and dynamic packed capacities."""
     from .kernels.sm80.prepared_host import compile_host, launch_bounds, thd_origins
     from cudnn.sdpa.fwd.kernels.sm80.packed_init import FROST_SOURCE_DIGEST as init_digest
@@ -116,16 +116,7 @@ def build_spec(api, d64_module, *, staged=False):
         else:
             geometry.append(((math.prod(op.shape),), (1,)))
     roles = ROLES
-    if staged:
-        # The existing native entry retains its fifteen-operand ABI. Only the
-        # staged wrapper supplies a precomputed RoPE table.
-        roles += ("rope",)
-        shape = (api._rope_max_s, api.flavor_d_qk // 2, 2)
-        strides = (api.flavor_d_qk, 2, 1)
-        operands.append(Operand("float32", shape, strides, math.prod(shape), 4, 4) if api._has_rope else None)
-        geometry.append((shape, strides) if api._has_rope else None)
-    # The offset operands trail the geometry operands (and RoPE); the compiled
-    # geometry itself is unchanged.
+    # Offset operands follow the unchanged native geometry.
     origins = thd_origins(api)
     for o in origins or (None,) * len(RO_ROLES):
         width = 8 if o is not None and o[3] == "int64" else 4

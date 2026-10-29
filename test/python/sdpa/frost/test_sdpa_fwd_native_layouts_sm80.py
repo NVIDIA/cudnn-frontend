@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""SM80 conversion recipes and wrapper cache retain the caller's layout."""
+"""Native SM80 forward bindings and wrapper caches retain caller layouts."""
 
 from types import SimpleNamespace
 
@@ -81,7 +81,7 @@ def test_native_replays_or_declines_copy_dependent_layout(d, dv, pad, native, dt
     required = api.scratch_workspace_bytes()
     api.compile()
     assert api._sm80_spec.native is not None
-    assert api._sm80_copy_spec is None and required == 0
+    assert required == 0
     workspace = torch.empty(required, device="cuda", dtype=torch.uint8)
     _execute(api, case, workspace)
     _check(case)
@@ -235,7 +235,7 @@ def test_wrapper_stream_outputs_and_replay(explicit, d, dv, pad):
 
 
 @pytest.mark.parametrize("explicit", [False, True])
-def test_prepared_copies_follow_current_or_explicit_stream(explicit, monkeypatch):
+def test_native_follows_current_or_explicit_stream(explicit, monkeypatch):
     from contextlib import nullcontext
     from cuda.bindings import driver
     from cudnn.sdpa.fwd import prepared_sm80
@@ -266,16 +266,16 @@ def test_prepared_copies_follow_current_or_explicit_stream(explicit, monkeypatch
 
 
 def test_unsupported_layout_declines_before_workspace_or_copy(monkeypatch):
-    from cudnn.sdpa.fwd import prepared_staged_sm80
+    from cudnn.sdpa.fwd import prepared_sm80
 
-    monkeypatch.setattr(prepared_staged_sm80, "compile_plan", lambda *a, **k: pytest.fail("unsupported layout reached staging compilation"))
+    monkeypatch.setattr(prepared_sm80, "build_spec", lambda *a, **k: pytest.fail("unsupported layout reached native compilation"))
     with pytest.raises(NotImplementedError, match="q.*stride"):
         _case(pad=1)
 
 
 @pytest.mark.parametrize("role", ["q", "v", "o"])
 @pytest.mark.parametrize("product", [False, True])
-def test_prepared_copy_physical_wide_addresses(role, product):
+def test_native_physical_wide_addresses(role, product):
     api, case = _case(batch=3 if product else 2)
     old = case.bufs[role]
     batch_stride = 2**31 - 65536 if product else 2**32 + 65536
@@ -306,7 +306,7 @@ def test_prepared_copy_physical_wide_addresses(role, product):
 
 
 @pytest.mark.parametrize("d,dv", [(48, 32), (224, 208)])
-def test_prepared_copy_artifacts_reload_without_jit(d, dv, tmp_path):
+def test_native_artifacts_reload_without_jit(d, dv, tmp_path):
     import json
     import os
     from pathlib import Path
@@ -323,7 +323,7 @@ from cudnn.frost import compiled_cache
 folder, package, d, dv, reload = sys.argv[1:]
 assert Path(cudnn.__file__).resolve() == Path(package).resolve(), cudnn.__file__
 sys.path[:0] = [folder, str(Path(folder).parents[1])]
-from test_sdpa_staged_copy_sm80 import _case, _execute, _check
+from test_sdpa_fwd_native_layouts_sm80 import _case, _execute, _check
 if reload == "1":
     def forbidden(*args, **kwargs):
         raise AssertionError("reloaded SM80 copy chain invoked JIT")
@@ -331,7 +331,7 @@ if reload == "1":
 api, case = _case(int(d), int(dv), features=True)
 api.compile()
 spec = api._sm80_spec
-assert spec is not None and api._sm80_copy_spec is None
+assert spec is not None
 if reload == "1":
     assert hasattr(spec.artifact, "_compiled_cache_raw")
 workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
@@ -370,11 +370,11 @@ print(json.dumps(dict(digest=digest, stats=compiled_cache.stats())))
     assert first["digest"] == second["digest"]
 
 
-@pytest.mark.parametrize("staged", [False, True])
-def test_compiled_workspace_query_reuses_plan_budget(staged, monkeypatch):
-    from cudnn.sdpa.fwd import prepared_sm80, prepared_staged_sm80
+@pytest.mark.parametrize("padded", [False, True])
+def test_compiled_workspace_query_reuses_plan_budget(padded, monkeypatch):
+    from cudnn.sdpa.fwd import prepared_sm80
 
-    api, case = _case(96, 96) if staged else _case(128, 128, pad=0)
+    api, case = _case(96, 96) if padded else _case(128, 128, pad=0)
     expected = api.scratch_workspace_bytes()
     api.compile()
 
@@ -382,5 +382,4 @@ def test_compiled_workspace_query_reuses_plan_budget(staged, monkeypatch):
         pytest.fail("compiled workspace query rebuilt layout metadata")
 
     monkeypatch.setattr(prepared_sm80, "native_layouts", forbidden)
-    monkeypatch.setattr(prepared_staged_sm80, "_layout", forbidden)
     assert api.scratch_workspace_bytes() == expected
