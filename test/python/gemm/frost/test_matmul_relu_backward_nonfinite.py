@@ -8,9 +8,9 @@ The default RELU_BWD (lower clip 0, slope 0, no upper clip) is the threshold
 select dx = x <= 0 ? +0 : dy, as torch's threshold_backward is: the native cuDNN
 engines return +0 at x <= 0 whatever dy is. The shared epilogue emitter used to
 multiply dy by a 0/1 mask, so an inf or NaN dy on a dead unit -- an fp16 GEMM
-output above 65504, say -- came out NaN on the FROST plan only. A NaN x passes dy
-on both. The clipped and sloped forms multiply on the native engines as well and
-are not covered here.
+output whose fp32 accumulator reached 65520 in magnitude, say -- came out NaN on
+the FROST plan only. A NaN x passes dy on both. The clipped and sloped forms
+multiply on the native engines as well and are not covered here.
 """
 
 from __future__ import annotations
@@ -31,12 +31,14 @@ _DY = (_INF, -_INF, _NAN, -1.5, 1.5)  # row r of the GEMM output is exactly _DY[
 _X = (-1.0, 0.0, -0.0, 0.5, 2.0, _NAN, -_INF, _INF)  # column n of x is _X[n % 8]
 
 # Spellings of the same default RELU_BWD: for fp32 compute the frontend lowers an unset lower clip, slope and
-# upper clip as 0, 0 and FLT_MAX (include/cudnn_frontend/node/pointwise.h).
+# upper clip as 0, 0 and FLT_MAX, and clamps a larger upper clip, inf included, to FLT_MAX
+# (include/cudnn_frontend/node/pointwise.h).
 _DEFAULT_RELU_BWD = {
     "relu_backward": lambda g, dy, x: g.relu_backward(loss=dy, input=x, name="rb"),
     "lower_clip_0": lambda g, dy, x: g.relu_backward(loss=dy, input=x, lower_clip=0.0, name="rb"),
     "negative_slope_0": lambda g, dy, x: g.relu_backward(loss=dy, input=x, negative_slope=0.0, name="rb"),
     "upper_clip_flt_max": lambda g, dy, x: g.relu_backward(loss=dy, input=x, upper_clip=torch.finfo(torch.float32).max, name="rb"),
+    "upper_clip_inf": lambda g, dy, x: g.relu_backward(loss=dy, input=x, upper_clip=_INF, name="rb"),
     "leaky_relu_backward_0": lambda g, dy, x: g.leaky_relu_backward(loss=dy, input=x, negative_slope=0.0, name="rb"),
 }
 
