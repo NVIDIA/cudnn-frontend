@@ -1003,11 +1003,12 @@ def test_sm120_swap_quant_diagnostic_uses_package_import(monkeypatch):
 # --- an aux is read at the strides the graph declared -----------------------
 
 
-def _residual_graph(aux_dim, aux_stride, batch=1, **options):
+def _residual_graph(aux_dim, aux_stride, batch=1, plan=(M, N), **options):
     """``matmul(A, B) + R``: R's declared layout is the one compiled into the kernel."""
+    m0, n0 = plan
     g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32, **options)
-    A = g.tensor(name="A", uid=1, dim=[batch, M, K], stride=[M * K, K, 1])
-    B = g.tensor(name="B", uid=2, dim=[batch, K, N], stride=[K * N, 1, K])
+    A = g.tensor(name="A", uid=1, dim=[batch, m0, K], stride=[m0 * K, K, 1])
+    B = g.tensor(name="B", uid=2, dim=[batch, K, n0], stride=[K * n0, 1, K])
     R = g.tensor(name="R", uid=3, dim=list(aux_dim), stride=list(aux_stride), data_type=F32)
     Y = g.add(a=g.matmul(A=A, B=B, name="mm"), b=R, name="residual")
     Y.set_output(True).set_data_type(F32).set_uid(4)
@@ -1027,13 +1028,20 @@ def _compact_in(storage_elems, *shape):
     return _small_ints(storage_elems)[:count].view(*shape)
 
 
-# layout: (aux dim, aux stride, batch, legal calls, the call the kernel cannot read);
-# a call is (M, N, how to make R at that M and N).
+_AUX_STRIDES = r"the kernel reads shape \(.*\) with strides \(.*\) on every axis of extent > 1"
+
+
+def _aux_layout(aux_dim, aux_stride, legal, illegal, *, batch=1, plan=(M, N), refusal=_AUX_STRIDES):
+    """R declared as ``aux_dim`` / ``aux_stride`` in a plan built at ``plan`` = (M, N):
+    the ``legal`` calls run exactly, ``illegal`` is refused as ``refusal`` says. A call
+    is (M, N, how to make R at that M and N)."""
+    return SimpleNamespace(aux_dim=aux_dim, aux_stride=aux_stride, legal=legal, illegal=illegal, batch=batch, plan=plan, refusal=refusal)
+
+
 _SM120_AUX_LAYOUTS = {
-    "per_elem_n_major": (
+    "per_elem_n_major": _aux_layout(
         (1, M, N),
         (M * N, N, 1),
-        1,
         (
             (M, N, lambda m, n: _small_ints(1, m, n)),
             (2 * M, N, lambda m, n: _small_ints(1, m, n)),  # M is only on the unit-extent axis's stride
@@ -1042,37 +1050,84 @@ _SM120_AUX_LAYOUTS = {
         ),
         (M, N // 2, lambda m, n: _compact_in(M * N, 1, m, n)),
     ),
-    "per_elem_m_major": (
+    "per_elem_m_major": _aux_layout(
         (1, M, N),
         (M * N, 1, M),
-        1,
         (
             (M, N, lambda m, n: _small_ints(1, n, m).transpose(1, 2)),
             (M, 2 * N, lambda m, n: _small_ints(1, n, m).transpose(1, 2)),
         ),
         (2 * M, N, lambda m, n: _small_ints(1, n, m).transpose(1, 2)),
     ),
-    "batched_per_row": (
+    "batched_per_row": _aux_layout(
         (2, M, 1),
         (M, 1, 1),
-        2,
         (
             (M, N, lambda m, n: _small_ints(2, m, 1)),
             (M, 2 * N, lambda m, n: _small_ints(2, m, 1)),
         ),
         (2 * M, N, lambda m, n: _small_ints(2, m, 1)),
+        batch=2,
     ),
     # A rank-1 aux's fake carries no strides, so nothing but the guard stands
     # between the kernel and a buffer of another stride.
-    "rank1_strided_per_col": (
+    "rank1_strided_per_col": _aux_layout(
         (N,),
         (2,),
-        1,
         (
             (M, N, lambda m, n: _small_ints(2 * n)[::2]),
             (M, N // 2, lambda m, n: _small_ints(2 * n)[::2]),
         ),
         (M, N, lambda m, n: _compact_in(2 * n, n)),
+    ),
+    # A plan built at M = 1 (or N = 1) classifies R by the matmul output, whose extent
+    # there is 1 too, so its fake lets that axis grow with the call -- but the kernel
+    # never steps an axis R declared at extent 1: it reads index 0 for every row
+    # (column). Only a broadcast along that axis is read correctly, and only where the
+    # fake does not pin a stride there; here it pins N, so no buffer can be served.
+    "unit_m_per_elem": _aux_layout(
+        (1, 1, N),
+        (N, N, 1),
+        (
+            (1, N, lambda m, n: _small_ints(1, m, n)),
+            (1, N // 2, lambda m, n: _small_ints(1, m, n)),
+        ),
+        (M, N, lambda m, n: _small_ints(1, m, n)),
+        plan=(1, N),
+        refusal=rf"the kernel reads only index 0 of axis 1, which had extent 1 when the plan was built, so it cannot serve extent {M} there",
+    ),
+    "unit_m_per_row": _aux_layout(
+        (1, 1, 1),
+        (1, 1, 1),
+        (
+            (1, N, lambda m, n: _small_ints(1, 1, 1)),
+            (M, N, lambda m, n: _small_ints(1, 1, 1).expand(1, m, 1)),
+        ),
+        (M, N, lambda m, n: _small_ints(1, m, 1)),
+        plan=(1, N),
+        refusal=rf"the kernel reads shape \(1, {M}, 1\) with strides \(\*, 0, \*\) on every axis of extent > 1 \(0: the plan was built at extent 1 on axis 1,",
+    ),
+    "unit_n_per_col": _aux_layout(
+        (1, 1, 1),
+        (1, 1, 1),
+        (
+            (M, 1, lambda m, n: _small_ints(1, 1, 1)),
+            (M, N, lambda m, n: _small_ints(1, 1, 1).expand(1, 1, n)),
+        ),
+        (M, N, lambda m, n: _small_ints(1, 1, n)),
+        plan=(M, 1),
+        refusal=rf"the kernel reads shape \(1, 1, {N}\) with strides \(\*, \*, 0\) on every axis of extent > 1 \(0: the plan was built at extent 1 on axis 2,",
+    ),
+    "unit_m_rank1": _aux_layout(
+        (N,),
+        (1,),
+        (
+            (1, N, lambda m, n: _small_ints(1, n)),
+            (M, N, lambda m, n: _small_ints(1, n).expand(m, n)),
+        ),
+        (M, N, lambda m, n: _small_ints(m, n)),
+        plan=(1, N),
+        refusal=rf"the kernel reads shape \({M}, {N}\) with strides \(0, 1\) on every axis of extent > 1 \(0: the plan was built at extent 1 on axis 0,",
     ),
 }
 
@@ -1085,20 +1140,23 @@ _SM120_AUX_LAYOUTS = {
 def test_sm120_aux_layout_is_refused_by_name_before_launch(layout, swap_ab):
     """The SM120 epilogue reads an aux at the strides the graph declared.
 
-    They are literals in the generated kernel, not launch arguments, so a call
-    whose aux has other strides on an axis it spans cannot be served. The launch
-    path refuses it, counts it, and ``explain`` names the aux; nothing is written.
-    Before, the call died in the tvm-ffi front door with a raw "Mismatched
-    R.strides[i]" from inside the body that is not allowed to raise -- or, for a
-    rank-1 aux, whose fake declares no strides, ran and read the buffer at the
-    declared stride. Calls whose aux keeps the declared strides on every axis of
-    extent > 1 stay legal at any M and N, in either kernel frame.
+    They are literals in the generated kernel, not launch arguments, and an axis
+    the graph declared at extent 1 is not stepped at all, so a call whose aux has
+    other strides on an axis it spans cannot be served. The launch path refuses
+    it, counts it, and ``explain`` names the aux; nothing is written. Before, the
+    call died in the tvm-ffi front door with a raw "Mismatched R.strides[i]" from
+    inside the body that is not allowed to raise -- or, where the fake does not
+    pin that stride (a rank-1 aux; an axis of a plan built at M = 1 or N = 1), ran
+    and read the wrong elements. Calls whose aux keeps the declared strides on
+    every axis of extent > 1 the kernel steps, and broadcasts along any other,
+    stay legal at any M and N, in either kernel frame.
     """
     from cudnn.gemm.frost.sm120 import compiler
     from cudnn.gemm.frost.tile_config import by_name
 
-    aux_dim, aux_stride, batch, legal, illegal = _SM120_AUX_LAYOUTS[layout]
-    g, A, B, R, Y = _residual_graph(aux_dim, aux_stride, batch=batch)
+    case = _SM120_AUX_LAYOUTS[layout]
+    batch, legal, illegal = case.batch, case.legal, case.illegal
+    g, A, B, R, Y = _residual_graph(case.aux_dim, case.aux_stride, batch=batch, plan=case.plan)
     config = replace(by_name("CONFIG_sm120_64x64x64_16x16x32_cluster1x1_warps2x4"), swap_ab=swap_ab)
     compiled = compiler.jit_from_cudnn_graph(g, config)
 
@@ -1119,7 +1177,7 @@ def test_sm120_aux_layout_is_refused_by_name_before_launch(layout, swap_ab):
         assert dict(compiled.deferrals) == {}
 
     run, y, _ = call(*illegal)
-    with pytest.raises(ValueError, match=r"aux 'R': the kernel reads shape \(.*\) with strides \(.*\) on every axis of extent > 1.*; got"):
+    with pytest.raises(ValueError, match=rf"aux 'R': {case.refusal}.*; got shape \("):
         run()
     torch.cuda.synchronize()
     assert dict(compiled.deferrals) == {"aux layout": 1}
@@ -1163,7 +1221,7 @@ def test_sm120_aux_layout_refusal_reaches_graph_execute():
             torch.cuda.synchronize()
             torch.testing.assert_close(y, torch.einsum("bmk,bnk->bmn", a.float(), b.float()) + r, atol=0, rtol=0)
             continue
-        with pytest.raises(ValueError, match=r"aux 'R': the kernel reads shape \(1, 256, 128\) with strides \(65536, 256, 1\)"):
+        with pytest.raises(ValueError, match=r"aux 'R': the kernel reads shape \(1, 256, 128\) with strides \(\*, 256, 1\)"):
             g.execute({1: a, 2: b, 3: r, 4: y}, ws, **overrides)
         torch.cuda.synchronize()
         assert torch.isnan(y).all()

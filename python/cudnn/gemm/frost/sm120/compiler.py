@@ -1183,31 +1183,45 @@ def _aux_layout_check(ref: TensorRef, swap_ab: bool) -> Callable:
 
     The epilogue addresses an aux through its raw pointer at the strides the graph
     declared, written into the kernel as literals (``_AuxCodegen.index_expr``), and
-    its fake binds the extents to this call's M and N. So the view the launch hands
-    over must have the fake's extents and, on every axis of extent > 1, those
-    strides. The tvm-ffi front door enforces the strides only when the fake carries
-    them (``_aux_fake_block``); a rank-1 aux's fake does not, and the kernel would
-    read a buffer of another stride at the declared one all the same."""
+    never steps an axis the graph declared at extent 1: it reads index 0 there. The
+    fake binds the extents to this call's M and N, so such an axis grows with them
+    in a plan built at M = 1 or N = 1. On every axis of extent > 1 the view the
+    launch hands over must therefore have the declared stride where the kernel
+    steps, and stride 0 (a broadcast) where it does not. The tvm-ffi front door
+    enforces only the strides a fake carries (``_aux_fake_block``): a rank-1 aux's
+    fake carries none, and a fake that pins a nonzero stride on an axis the kernel
+    does not step leaves this plan no buffer of extent > 1 there that it can serve."""
     real = _aux_fake_real_axes(ref)
     rank, lead, (row, col) = len(real), ((int(ref.dim[0]),) if len(real) == 3 else ()), real[-2:]
     if len(ref.dim) == rank:
-        # An axis counts where the kernel steps along it or where the fake pins its stride.
-        pinned = _aux_can_use_explicit_fake_stride(ref)
-        want_stride = tuple(s if pinned or d != 1 else None for d, s in zip(ref.dim, ref.stride))
+        steps, declared, pinned = tuple(d != 1 for d in ref.dim), tuple(ref.stride), _aux_can_use_explicit_fake_stride(ref)
     else:  # rank 1: the fake adds a unit row axis, and the kernel steps the column at stride[0]
-        want_stride = (None, ref.stride[0] if ref.dim[0] != 1 else None)
-    checked = tuple((i, w) for i, w in enumerate(want_stride) if w is not None)
+        steps, declared, pinned = (False, ref.dim[0] != 1), (0, ref.stride[0]), False
+    # Per axis, the stride a view of extent > 1 needs: "*" where the fake fixes the extent at 1, and
+    # None where none serves (the kernel reads index 0 only and the fake pins a nonzero stride).
+    want_stride = tuple("*" if not r else s if st else 0 if not pinned or s == 0 else None for r, st, s in zip(real, steps, declared))
+    unstepped = tuple(i for i, (r, st) in enumerate(zip(real, steps)) if r and not st)
+    frame = " (in the kernel frame of this swap-AB plan, M and N exchanged)" if swap_ab else ""
 
     def reason(buf, m: int, n: int) -> "str | None":
         # The view the launch passes (_reshape_aux_to_fake is the identity at the fake's rank).
         view = buf if len(buf.shape) == rank and not swap_ab else _reshape_aux_to_fake(_swap_mn_view(buf) if swap_ab else buf, ref)
         shape, stride = tuple(view.shape), tuple(view.stride())
         want_shape = (*lead, m if row else 1, n if col else 1)
-        if shape == want_shape and all(shape[i] == 1 or stride[i] == w for i, w in checked):
+        if shape == want_shape and all(w == "*" or shape[i] == 1 or stride[i] == w for i, w in enumerate(want_stride)):
             return None
-        strides = "(" + ", ".join("*" if w is None else str(w) for w in want_stride) + ")"
-        frame = " (in the kernel frame of this swap-AB plan, M and N exchanged)" if swap_ab else ""
-        return f"aux {ref.name!r}: the kernel reads shape {want_shape} with strides {strides} on every axis of extent > 1{frame}; got shape {shape}, stride {stride}"
+        got = f"got shape {shape}, stride {stride}"
+        stuck = [i for i in unstepped if want_stride[i] is None and want_shape[i] != 1]
+        if stuck:
+            return f"aux {ref.name!r}: the kernel reads only index 0 of axis {stuck[0]}, which had extent 1 when the plan was built, so it cannot serve extent {want_shape[stuck[0]]} there{frame}; {got}"
+        strides = "(" + ", ".join("*" if w == "*" or want_shape[i] == 1 else str(w) for i, w in enumerate(want_stride)) + ")"
+        unit = [str(i) for i in unstepped if want_shape[i] != 1]
+        note = (
+            f" (0: the plan was built at extent 1 on {'axes' if len(unit) > 1 else 'axis'} {', '.join(unit)}, where the kernel reads only index 0)"
+            if unit
+            else ""
+        )
+        return f"aux {ref.name!r}: the kernel reads shape {want_shape} with strides {strides} on every axis of extent > 1{note}{frame}; {got}"
 
     return reason
 
@@ -1217,8 +1231,9 @@ def _check_aux_layout(recipe, operands, m: int, n: int, swap_ab: bool) -> None:
     bad = [reason for x in recipe.aux if (reason := _aux_layout_check(x.ref, swap_ab)(operands[x.index], m, n)) is not None]
     if bad:
         raise ValueError(
-            "runtime aux layout does not match the one compiled into the kernel, which reads each aux at the strides the graph declared "
-            "(pass a buffer with those strides, such as a view into an allocation of the declared shape, or rebuild the plan): " + "; ".join(bad)
+            "runtime aux layout does not match the one compiled into the kernel, which reads each aux at the strides the graph declared and only index 0 "
+            "of an axis it declared at extent 1 (pass a buffer with those strides, such as a view into an allocation of the declared shape, or rebuild the plan): "
+            + "; ".join(bad)
         )
 
 

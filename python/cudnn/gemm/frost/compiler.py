@@ -893,7 +893,7 @@ def _import_kernel(src: str) -> object:
 class _CompiledRuntime:
     _compiler: ClassVar[Any]
     _validate_runtime_quant: ClassVar[bool] = False
-    # The family checks each aux against the layout its epilogue compiled in (``_aux_layout_check``).
+    # _CompiledFusedGemm's lowered()/explain() check each aux against the layout the family's epilogue compiled in (``_aux_layout_check``).
     _validate_aux_layout: ClassVar[bool] = False
     _validate_combine: ClassVar[bool] = False
     accepts_stream: ClassVar[bool] = True
