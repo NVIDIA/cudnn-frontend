@@ -45,31 +45,42 @@ The dense SE comparisons do not establish parity for packed sequences, initial/f
 
 Use the active task worktree and a Python environment containing matching frontend bindings, PyTorch, CUDA Python, and the CuTe DSL version required by that frontend revision. Select the GPU with `CUDA_VISIBLE_DEVICES`. Set `CUDNN_SE_BACKEND_LIBRARY` to the exact `libcudnn_ext.so` under comparison and configure the runtime loader to use it. `CUDA_HOME` must supply the CUDA/CCCL headers for backend JIT compilation, and the NVRTC major version must match the cuDNN build. The harness verifies the loaded library's path and file identity and records its SHA-256, size, and frontend-reported backend version.
 
-Run all four suites on an idle GPU:
+Select the source directory, save its hashes, and run all four suites on an idle GPU. Set `SE_KERNEL_DIR` to a frozen source directory to benchmark another revision; the default is this checkout:
 
 ```bash
 cd "${CUDNN_FRONTEND_GITHUB_DIR:?}"
 export PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
 export SE_BENCH_RESULTS=/tmp/causal-se
+export SE_KERNEL_DIR="${SE_KERNEL_DIR:-$PWD/python/cudnn/causal_conv1d_se}"
+
+"${CUDNN_FRONTEND_PYTHON_VENV:?}/bin/python" - <<'PYCODE'
+import hashlib, json, os
+from pathlib import Path
+root = Path(os.environ["SE_KERNEL_DIR"])
+output = Path(os.environ["SE_BENCH_RESULTS"])
+output.mkdir(parents=True, exist_ok=True)
+names = ("kernel.py", "backward_kernel.py", "b2b_kernel.py")
+(output / "source-hashes.json").write_text(json.dumps({n: hashlib.sha256((root / n).read_bytes()).hexdigest() for n in names}))
+PYCODE
 
 "${CUDNN_FRONTEND_PYTHON_VENV:?}/bin/python" benchmark/causal_conv1d_se/controlled_matrix.py \
-  --backend-library "${CUDNN_SE_BACKEND_LIBRARY:?}" --output "$SE_BENCH_RESULTS/main"
+  --kernel-dir "$SE_KERNEL_DIR" --backend-library "${CUDNN_SE_BACKEND_LIBRARY:?}" --output "$SE_BENCH_RESULTS/main"
 "${CUDNN_FRONTEND_PYTHON_VENV:?}/bin/python" benchmark/causal_conv1d_se/controlled_matrix.py \
-  --backend-library "$CUDNN_SE_BACKEND_LIBRARY" --accumulate --output "$SE_BENCH_RESULTS/additive"
+  --kernel-dir "$SE_KERNEL_DIR" --backend-library "$CUDNN_SE_BACKEND_LIBRARY" --accumulate --output "$SE_BENCH_RESULTS/additive"
 "${CUDNN_FRONTEND_PYTHON_VENV:?}/bin/python" benchmark/causal_conv1d_se/controlled_matrix.py \
-  --backend-library "$CUDNN_SE_BACKEND_LIBRARY" --supplement --output "$SE_BENCH_RESULTS/supplement"
+  --kernel-dir "$SE_KERNEL_DIR" --backend-library "$CUDNN_SE_BACKEND_LIBRARY" --supplement --output "$SE_BENCH_RESULTS/supplement"
 "${CUDNN_FRONTEND_PYTHON_VENV:?}/bin/python" benchmark/causal_conv1d_se/controlled_matrix.py \
-  --backend-library "$CUDNN_SE_BACKEND_LIBRARY" --supplement --accumulate --output "$SE_BENCH_RESULTS/supplement-additive"
+  --kernel-dir "$SE_KERNEL_DIR" --backend-library "$CUDNN_SE_BACKEND_LIBRARY" --supplement --accumulate --output "$SE_BENCH_RESULTS/supplement-additive"
 ```
 
-`workloads.json` covers the named non-FFT backend cases and the frontend B=1,2,4,8 batch sweep. The main runner adds the common frontend workload, producing 77 direction-level comparisons; additive mode runs its 38 backward directions. `supplemental_workloads.json` adds 32 directions, including NCW K256, NWH K7/K64/K128, and fused Kp32/Km256, with eleven additive backward directions. Together these are 158 comparisons per GPU before backend exclusions. Backend-unsupported cases remain explicit in `summary.json`. Source hashes are checked after every subprocess; an edit during a sweep aborts it. Use `--kernel-dir` to select a frozen candidate source directory.
+`workloads.json` covers the named non-FFT backend cases and the frontend B=1,2,4,8 batch sweep. The main runner adds the common frontend workload, producing 77 direction-level comparisons; additive mode runs its 38 backward directions. `supplemental_workloads.json` adds 32 directions, including NCW K256, NWH K7/K64/K128, and fused Kp32/Km256, with eleven additive backward directions. Together these are 158 comparisons per GPU before backend exclusions. Backend-unsupported cases remain explicit in `summary.json`. Source hashes are checked after every subprocess; an edit during a sweep aborts it. The examples pass the same `SE_KERNEL_DIR` to `--kernel-dir` and to the hash calculation.
 
 For one workload, reuse a generated `*.case.json`:
 
 ```bash
 "${CUDNN_FRONTEND_PYTHON_VENV:?}/bin/python" benchmark/causal_conv1d_se/compare_variants.py \
   --case "$SE_BENCH_RESULTS/main/000-forward.case.json" --direction forward \
-  --variant candidate=python/cudnn/causal_conv1d_se/kernel.py \
+  --variant "candidate=$SE_KERNEL_DIR/kernel.py" \
   --shared-output-timing --output "$SE_BENCH_RESULTS/single.json"
 ```
 
@@ -85,19 +96,9 @@ Each result records candidate `cute.compile` wall time separately. This harness 
 
 ## Collect results
 
-Save the expected kernel hashes from the frozen source before starting a sweep:
+Collect results against the source hashes saved before the sweep:
 
 ```bash
-"${CUDNN_FRONTEND_PYTHON_VENV:?}/bin/python" - <<'PYCODE'
-import hashlib, json, os
-from pathlib import Path
-root = Path("python/cudnn/causal_conv1d_se")
-output = Path(os.environ["SE_BENCH_RESULTS"])
-output.mkdir(parents=True, exist_ok=True)
-names = ("kernel.py", "backward_kernel.py", "b2b_kernel.py")
-(output / "source-hashes.json").write_text(json.dumps({n: hashlib.sha256((root / n).read_bytes()).hexdigest() for n in names}))
-PYCODE
-
 "${CUDNN_FRONTEND_PYTHON_VENV:?}/bin/python" benchmark/causal_conv1d_se/summarize_controlled.py \
   --run "$SE_BENCH_RESULTS/main" --source-hashes "$SE_BENCH_RESULTS/source-hashes.json" \
   --output "$SE_BENCH_RESULTS/main-summary"
