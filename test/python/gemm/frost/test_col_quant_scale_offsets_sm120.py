@@ -7,11 +7,15 @@ The col-scale index is ``((n // 128) * mcb + mb // 4) * 512 + ...``. ``row``, ``
 Int32, so with an Int32 ``mcb`` (a build-time literal on the dense path, the group extent on the grouped
 MoE path) that atom term was evaluated in 32 bits: once one batch's padded scale table (one group's table
 on the grouped path) passed 2 GiB it wrapped, and every scale byte past 2^31 was stored 2^32 bytes below
-its slot. The ``past2GiB`` cells take the smallest such shape: N = 16 (F8_128x4 pads N to one 128-column
-atom) and 2^28 + 64 rows at block 16, which puts the last four row blocks past 2^31. Their scale tensor
-starts 2 GiB into a sentinel-filled carrier, so a wrapped store lands on the carrier's head instead of on
-memory the test does not own. Those cells are L1 (about 12 GiB each); the host-only render check at the
-end is what the default L0 selection has against an Int32 ``mcb``.
+its slot. The L0 GPU cells check every computed scale (not the padding slots) and all quantized data. The
+``past2GiB`` cells take N = 16 (F8_128x4 pads N to one 128-column atom) and 2^28 + 64 rows at block 16,
+which puts the last four row blocks past 2^31: the smallest group-aligned wrapping shape (groups start at
+multiples of 4 * block_size; the dense path already wraps at 2^28 + 16 rows). Their scale tensor starts
+2 GiB into a sentinel-filled carrier, and their one batch (one group) starts at the tensor's offset 0, so a
+wrapped store lands on the carrier's head instead of on memory the test does not own. They check the scales
+and data of the first atom, the last atom below 2^31 and the atom past it, and that the carrier's head is
+untouched. Those cells are L1 (about 12 GiB each); the host-only render check at the end is what the
+default L0 selection has against an Int32 ``mcb``.
 """
 
 from __future__ import annotations
