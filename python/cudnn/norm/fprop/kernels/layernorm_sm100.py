@@ -26,6 +26,7 @@ from cutlass.memory import SmemAllocator
 
 from cudnn.norm.utils import cur_stream, dyn, fake_stream
 from cudnn.norm._common_sm100 import (
+    affine_gamma,
     STAGE_BULK,
     STAGE_CPASYNC,
     STAGE_NONE,
@@ -54,9 +55,17 @@ def _ln_fwd_kernel(
     vec: cutlass.Constexpr,
     has_mean: cutlass.Constexpr,
     has_beta: cutlass.Constexpr,
+    affine: cutlass.Constexpr = None,
 ) -> None:
     tid, _, _ = cute.arch.thread_idx()
     r, _, _ = cute.arch.block_idx()
+    per_row: cutlass.Constexpr = affine is not None and affine[3]
+    gamma_step: cutlass.Constexpr = 0 if per_row else 1
+    gamma_base = cutlass.Int64(0)
+    if cutlass.const_expr(per_row):
+        gamma_base = cutlass.Int64(r)
+    elif cutlass.const_expr(affine is not None):
+        gamma_base = cutlass.Int64((r // affine[1]) % affine[0]) * M
     staged: cutlass.Constexpr = stage_mode != STAGE_NONE
     nv: cutlass.Constexpr = M // V
 
@@ -111,9 +120,10 @@ def _ln_fwd_kernel(
 
     mean, rstd = shifted_stats(s1, s2, kshift, Mf, eps, has_mean)
     if tid == 0:
-        if cutlass.const_expr(has_mean):
+        if cutlass.const_expr(has_mean and mMean is not None):
             mMean[r] = mean
-        mRstd[r] = rstd
+        if cutlass.const_expr(mRstd is not None):
+            mRstd[r] = rstd
 
     # --- pass 2: normalize + affine, store Y ---
     if cutlass.const_expr(vec):
@@ -128,9 +138,9 @@ def _ln_fwd_kernel(
                 cute.autovec_copy(xvg[None, vi], xf)
             for e in cutlass.range_constexpr(V):
                 x = (sX[j0 + e] if cutlass.const_expr(staged) else xf[e]).to(cutlass.Float32)
-                y = mGamma[j0 + e].to(cutlass.Float32) * ((x - mean) * rstd)
+                y = affine_gamma(mGamma[gamma_base + (j0 + e) * gamma_step], affine) * ((x - mean) * rstd)
                 if cutlass.const_expr(has_beta):
-                    y = y + mBeta[j0 + e].to(cutlass.Float32)
+                    y = y + mBeta[gamma_base + (j0 + e) * gamma_step].to(cutlass.Float32)
                 yf[e] = y.to(mY.element_type)
             cute.autovec_copy(yf, yv[None, vi])
             vi = vi + bt
@@ -138,9 +148,9 @@ def _ln_fwd_kernel(
         j = tid
         while j < M:
             x = (sX[j] if cutlass.const_expr(staged) else mX[r, j]).to(cutlass.Float32)
-            y = mGamma[j].to(cutlass.Float32) * ((x - mean) * rstd)
+            y = affine_gamma(mGamma[gamma_base + j * gamma_step], affine) * ((x - mean) * rstd)
             if cutlass.const_expr(has_beta):
-                y = y + mBeta[j].to(cutlass.Float32)
+                y = y + mBeta[gamma_base + j * gamma_step].to(cutlass.Float32)
             mY[r, j] = y.to(mY.element_type)
             j = j + bt
 

@@ -61,6 +61,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.NormGraphFacts", requested: 
     """First reason this engine cannot serve these facts, or None if it can."""
     if facts.invalid:
         return facts.invalid
+    if facts.extended_affine:
+        from cudnn.norm.affine import mismatch as affine_mismatch
+
+        reason = affine_mismatch(facts)
+        if reason is not None:
+            return reason
     if requested is not None and not isinstance(requested, NormFwdKnobs):
         return f"knob request is a {type(requested).__name__}, not NormFwdKnobs — wrong operation's vocabulary"
     if facts.phase != capabilities.phase:
@@ -124,6 +130,11 @@ def lower_norm_fprop(spec: EngineSpec, facts: "ga.NormGraphFacts", requested: Op
     :func:`cudnn.norm.fprop.api.norm_fprop`, which dispatches to the per-flavor
     sm_100 kernel (JIT-compiled + cached on first call) by ``facts.variant``.
     Outputs are copied into the graph's Y / mean / inv_variance buffers."""
+    if facts.extended_affine:
+        from cudnn.norm.affine import lower
+
+        return lower(facts)
+
     from cudnn.norm.fprop.api import fprop_workspace_bytes, norm_fprop
 
     binding = ga.NormBinding(

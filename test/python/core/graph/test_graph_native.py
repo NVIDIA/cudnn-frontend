@@ -306,7 +306,7 @@ class Testpygraph:
             for style in ("keyword", "positional"):
                 g = pygraph()
                 tensors = {port: g.tensor(dim=[4, 8], name=f"{port}_in") for port in spec["inputs"]}
-                attrs = {ak: "ATTR_SENTINEL" for ak in spec.get("attrs", ())}
+                attrs = {ak: False if ak == "adaptive" else "ATTR_SENTINEL" for ak in spec.get("attrs", ())}
                 lists = {lp: [g.tensor(dim=[4, 8], name=f"{lp}{i}_in") for i in range(2)] for lp in spec.get("list_inputs", ())}
                 if style == "keyword":
                     outs = getattr(g, op)(**tensors, **attrs, **lists)
@@ -319,7 +319,7 @@ class Testpygraph:
                 assert set(node.inputs) == expect_ports, op
                 assert tuple(node.outputs) == spec["outputs"], op
                 for ak in spec.get("attrs", ()):
-                    assert node.params[ak] == "ATTR_SENTINEL", op
+                    assert node.params[ak] == attrs[ak], op
                 assert len(outs) == len(spec["outputs"]), op
 
     def test_structured_out_dims(self):
@@ -696,3 +696,9 @@ class TestReviewSemantics:
         u.set_name("X")
         with pytest.raises(ValueError, match="ambiguous"):
             g.find_tensor("X")
+
+
+@pytest.mark.parametrize("op", ["layernorm", "rmsnorm", "instancenorm", "layernorm_backward", "rmsnorm_backward", "instancenorm_backward"])
+def test_adaptive_norm_flag_requires_bool(op):
+    with pytest.raises(TypeError, match="adaptive must be a bool"):
+        getattr(pygraph(), op)(adaptive="true")

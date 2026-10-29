@@ -124,6 +124,94 @@ than node params, read them from the variant pack in `lower_*`; (2) cuDNN has no
 native GroupNorm node, so the GroupNorm engine is reachable only via the direct
 API (the kernel is still used for InstanceNorm graphs).
 
+## Adaptive and zero-centered affine parameters in graphs
+
+The graph engines support adaptive LayerNorm, RMSNorm, and InstanceNorm,
+forward and backward. Pass `adaptive=True` to any of these operations:
+
+```python
+graph.layernorm(..., adaptive=True)
+graph.layernorm_backward(..., adaptive=True)
+graph.rmsnorm(..., adaptive=True)
+graph.rmsnorm_backward(..., adaptive=True)
+graph.instancenorm(..., adaptive=True)
+graph.instancenorm_backward(..., adaptive=True)
+```
+
+The default `adaptive=False` preserves ordinary normalization. The caller
+supplies per-sample scale and optional bias; generating those parameters from
+conditioning and applying a residual gate are separate graph operations.
+
+| Normalization | Dense input | Adaptive scale/bias | Reduction axes |
+|---|---|---|---|
+| LayerNorm / RMSNorm | `[B,S,D]` | `[B,1,D]` | `D` |
+| LayerNorm / RMSNorm | `[S,B,D]` | `[1,B,D]` | `D` |
+| InstanceNorm | `[N,C,L]`, `[N,C,H,W]`, `[N,C,D,H,W]` | `[N,C,1]`, `[N,C,1,1]`, `[N,C,1,1,1]` | Spatial axes |
+
+Parameter gradients match scale/bias shape and reduce only over their broadcast
+axes, retaining the sample dimension. LN/RMSNorm statistics have shape
+`X.shape[:-1] + [1]`; InstanceNorm statistics match its adaptive affine shape.
+InstanceNorm currently requires channels-first contiguous storage; channels-last
+and other strided layouts are declined without repacking.
+
+The existing `graph.adalayernorm(...)` and `graph.adalayernorm_backward(...)`
+spellings remain supported. `layernorm(adaptive=True)` and its backward
+counterpart create those same AdaLN nodes and retain backend lowering. The
+new spelling infers per-token statistics for the rank-3 layouts above; the legacy
+spelling keeps its existing inference defaults, so sequence-first callers should
+specify the statistics dimensions explicitly.
+Adaptive RMSNorm and InstanceNorm are handled by Python engines and have no
+backend lowering. Explicit `adaptive=False` keeps backend eligibility.
+
+Zero-centered gamma uses the same graph expression for ordinary/adaptive
+LayerNorm and RMSNorm, and adaptive InstanceNorm: pass the virtual result of `gamma + 1` as the scale. For example, with
+`X` and `gamma` already declared:
+
+```python
+# gamma is [B,1,D] for X[B,S,D]. Scalars are host pass-by-value inputs.
+one = graph.tensor_like(torch.ones((1, 1, 1), dtype=torch.float32))
+epsilon = graph.tensor_like(torch.full((1, 1, 1), 1e-5, dtype=torch.float32))
+effective_gamma = graph.add(gamma, one)
+# Declare the virtual scale layout before inferring adaptive statistics.
+effective_gamma.set_dim(gamma.get_dim()).set_stride(gamma.get_stride())
+effective_gamma.set_data_type(cudnn.data_type.FLOAT)
+y, rstd = graph.rmsnorm(
+    input=X, scale=effective_gamma, epsilon=epsilon,
+    norm_forward_phase=cudnn.norm_forward_phase.TRAINING, adaptive=True,
+)
+# Bind one to a host tensor containing 1 and epsilon to the desired epsilon.
+# Mark and bind y/rstd as outputs through the usual graph API.
+```
+
+The addition is fused into gamma loads, including the `DX` calculation in
+backward. It rounds to `effective_gamma`'s declared dtype before normalization;
+choosing FP32 preserves the FP32 sum, while FP16/BF16 reproduces a rounded
+intermediate. `DScale` is also the gradient of the original gamma because the
+addition has derivative one. The intermediate scale must stay virtual, and
+the host offset must equal one. Either operand order is accepted.
+
+These graph specializations support FP16, BF16, or FP32 inputs and affine
+parameters, including mixed input/parameter dtypes, with FP32 computation,
+statistics, and parameter gradients. Storage must be dense, row-major, and
+16-byte aligned. They use the shared row kernels, compile during plan build,
+write caller-provided buffers directly, and require no workspace. Training
+and inference forward plans, and backward plans with parameter gradients,
+support CUDA graph capture and execution on the handle's stream. LN/RMSNorm backward
+parameter reductions use FP32 atomics, so their summation order can vary. AdaIN
+reduces spatial gradients within one CTA per sample/channel and writes them
+directly, without atomics or a separate gradient-clearing launch.
+
+The ordinary norm schedules remain in use for graphs without these features.
+Pytest compares outputs, saved statistics, and gradients with PyTorch functional
+normalization and autograd references, including mixed dtypes, zero-centered
+gamma, legacy AdaLN equivalence, backend routing, and capture/replay. The
+new specializations have correctness and capture coverage; performance
+tuning remains separate work. Run their graph tests with:
+
+```bash
+pytest test/python/norm/graph/test_frost_norm_affine.py
+```
+
 ## Environment
 
 Requires Blackwell (SM100 or SM103; Hopper SM90 through the opt-in `norm_*_sm90` rows), a CUDA 13-capable driver, and a CUTLASS DSL build
