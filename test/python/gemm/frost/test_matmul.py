@@ -3529,9 +3529,17 @@ _SERIES_ACTIVATIONS = {
     "softplus": (lambda g, x: g.softplus(input=x, name="act"), torch.nn.functional.softplus),
 }
 
+# One dense config per arch tree: both render these ops with the shared emitters. A process renders only its own
+# tree, so the other tree's cases skip.
+_SERIES_CONFIGS = {
+    "sm100": "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
+    "sm120": "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
+}
+
 
 @pytest.mark.parametrize("act", list(_SERIES_ACTIVATIONS))
-def test_sm120_tanh_elu_softplus_relative_precision(act: str) -> None:
+@pytest.mark.parametrize("family", list(_SERIES_CONFIGS))
+def test_tanh_elu_softplus_relative_precision(family: str, act: str) -> None:
     """tanh and elu near 0, and softplus of a very negative input, keep fp32
     relative precision. The emitted forms cancelled there: tanh(1e-6) as
     1 - 2/(e^2x + 1) came out 4.6% low, elu as (max(x, 0) + e^min(x, 0)) - 1
@@ -3539,7 +3547,7 @@ def test_sm120_tanh_elu_softplus_relative_precision(act: str) -> None:
     log(1 + e^x) came out 0. A and B are 0, so the activation sees exactly the
     fp32 aux X; inputs up to 10 in magnitude and +-inf pin the closed forms
     that are kept."""
-    cfg = _resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    cfg = _resolve(_SERIES_CONFIGS[family])
     M = N = K = 128
     ok, reason = _compatible(cfg, M, N, K, "bf16", "bf16")
     if not ok:
@@ -3554,6 +3562,8 @@ def test_sm120_tanh_elu_softplus_relative_precision(act: str) -> None:
 
     gen = torch.Generator().manual_seed(0)
     mag = 10.0 ** (-30.0 + 31.0 * torch.rand(6000, generator=gen, dtype=torch.float64))  # 1e-30 .. 10, both signs
+    # Not below -80: under about -87.3, e^x is subnormal and exp2 (ex2.approx.ftz) flushes it, so softplus returns 0
+    # there, which an rtol-only check would reject.
     negative = -2.0 - 78.0 * torch.rand(M * N - 2 * mag.numel() - 2, generator=gen, dtype=torch.float64)  # softplus: e^x < 0.14
     x = torch.cat([mag, -mag, negative, torch.tensor([float("inf"), float("-inf")], dtype=torch.float64)]).float()
     x = x.view(1, M, N).cuda()
