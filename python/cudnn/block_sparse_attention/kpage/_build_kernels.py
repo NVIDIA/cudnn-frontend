@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# CuTe DSL kernels that build the KPage walk tables and clear padding rows.
+# CuTe DSL kernels that build the KPage walk tables and clear padding rows.  The forward walk kernels take the sparse
+# block size of the metadata (``block`` = 128 or 64); page ids are always ``block // PAGE`` consecutive Page16 ids per
+# block.
 
 from typing import Callable, Tuple
 
@@ -23,7 +25,8 @@ from cudnn.block_sparse_attention.kpage._compile import compile_key as make_comp
 class WalkStats:
     """Count the Page16 rows required by each forward walk."""
 
-    def __init__(self):
+    def __init__(self, block: int = BLOCK):
+        self.block = block
         self.num_threads = 256
         self.num_warps = self.num_threads // cute.arch.WARP_SIZE
 
@@ -77,7 +80,7 @@ class WalkStats:
         edge_idx = thread_idx
         while edge_idx < edge_count:
             block_idx = max(min(mBlockIndex[walk_idx, edge_idx], n_blocks - 1), 0)
-            block_rows = max(min(mBlockSizes[block_idx], BLOCK), 0)
+            block_rows = max(min(mBlockSizes[block_idx], self.block), 0)
             page_count += (block_rows + PAGE - 1) // PAGE
             edge_idx += self.num_threads
 
@@ -94,7 +97,7 @@ class WalkStats:
             page_count = warp_pages[lane_idx] if lane_idx < self.num_warps else Int32(0)
             page_count = warp_reduce(page_count, lambda x, y: x + y)
             if lane_idx == 0:
-                q_size = max(min(mQSizes[walk_idx % n_q_blocks], BLOCK), 0)
+                q_size = max(min(mQSizes[walk_idx % n_q_blocks], self.block), 0)
                 shared_count = Int32(0)
                 if q_size > 0:
                     if q_size <= 64:
@@ -218,9 +221,15 @@ class CompactQRoutes:
 
 
 class WalkFill:
-    """Fill Page16 walks, packed masks, and both M128/M64 metadata views."""
+    """Fill Page16 walks, packed masks, and both M128/M64 metadata views.
 
-    def __init__(self):
+    With ``block == 64`` every Q block is an M64 tile: the M64 views are indexed
+    by the Q block itself (no second half) and the M128 view is unused.
+    """
+
+    def __init__(self, block: int = BLOCK):
+        self.block = block
+        self.pages_per_block = block // PAGE
         self.num_threads = 256
         self.num_warps = self.num_threads // cute.arch.WARP_SIZE
 
@@ -290,7 +299,7 @@ class WalkFill:
         n_q_blocks = mQSizes.shape[0]
         n_blocks = mBlockSizes.shape[0]
         edge_count = max(min(mBlockCount[walk_idx], cap), 0)
-        q_size = max(min(mQSizes[walk_idx % n_q_blocks], BLOCK), 0)
+        q_size = max(min(mQSizes[walk_idx % n_q_blocks], self.block), 0)
         is_small = Int32(0)
         if q_size > 0:
             if q_size <= 64:
@@ -322,7 +331,7 @@ class WalkFill:
             block_idx = Int32(0)
             if edge_idx < edge_count:
                 block_idx = max(min(mBlockIndex[walk_idx, edge_idx], n_blocks - 1), 0)
-                block_rows = max(min(mBlockSizes[block_idx], BLOCK), 0)
+                block_rows = max(min(mBlockSizes[block_idx], self.block), 0)
                 page_count = block_rows // PAGE
 
             page_rank = page_count
@@ -339,8 +348,8 @@ class WalkFill:
             for idx in cutlass.range(warp_idx):
                 page_rank += warp_pages[idx]
             page_pos = page_rank - page_count
-            first_page = block_idx * 8
-            for page_idx in cutlass.range_constexpr(8):
+            first_page = block_idx * self.pages_per_block
+            for page_idx in cutlass.range_constexpr(self.pages_per_block):
                 if page_count > page_idx and page_pos + page_idx < allocated_pages:
                     flat_slot = output_page_base + page_pos + page_idx
                     if flat_slot < mPageTable.shape[0] * 8:
@@ -358,7 +367,7 @@ class WalkFill:
             tail_page_idx = Int32(0)
             if edge_idx < edge_count:
                 block_idx = max(min(mBlockIndex[walk_idx, edge_idx], n_blocks - 1), 0)
-                block_rows = max(min(mBlockSizes[block_idx], BLOCK), 0)
+                block_rows = max(min(mBlockSizes[block_idx], self.block), 0)
                 tail_page_idx = block_rows // PAGE
                 if block_rows - tail_page_idx * PAGE > 0:
                     page_count = Int32(1)
@@ -380,14 +389,14 @@ class WalkFill:
             if page_count > 0 and page_pos < allocated_pages:
                 flat_slot = output_page_base + page_pos
                 if flat_slot < mPageTable.shape[0] * 8:
-                    mPageTable[flat_slot // 8, flat_slot % 8] = block_idx * 8 + tail_page_idx
+                    mPageTable[flat_slot // 8, flat_slot % 8] = block_idx * self.pages_per_block + tail_page_idx
 
             for idx in cutlass.range(self.num_warps):
                 page_base += warp_pages[idx]
             cute.arch.sync_threads()
 
         dummy_page = page_base + thread_idx
-        zero_page = n_blocks * 8
+        zero_page = n_blocks * self.pages_per_block
         while dummy_page < allocated_pages:
             flat_slot = output_page_base + dummy_page
             mPageTable[flat_slot // 8, flat_slot % 8] = zero_page + flat_slot % 8
@@ -410,9 +419,9 @@ class WalkFill:
                     page_id = mPageTable[global_row, word_idx * 2 + half]
                     valid_rows = Int32(0)
                     if page_id < zero_page:
-                        block_idx = page_id // 8
-                        page_idx = page_id - block_idx * 8
-                        block_rows = max(min(mBlockSizes[block_idx], BLOCK), 0)
+                        block_idx = page_id // self.pages_per_block
+                        page_idx = page_id - block_idx * self.pages_per_block
+                        block_rows = max(min(mBlockSizes[block_idx], self.block), 0)
                         valid_rows = max(min(block_rows - page_idx * PAGE, PAGE), 0)
                     page_mask = (Int32(1) << valid_rows) - 1
                     word_mask = word_mask | (page_mask << (half * PAGE))
@@ -423,13 +432,14 @@ class WalkFill:
             mTileOffsets[walk_idx] = offset_tiles
             mTileCounts[walk_idx] = allocated_tiles
             mFullTiles[walk_idx] = valid_full_pages // FRAGS_PER_TILE
-            q64_idx = 2 * walk_idx
+            q64_idx = walk_idx if cutlass.const_expr(self.block == 64) else 2 * walk_idx
             mQ64Offsets[q64_idx] = offset_tiles
-            mQ64Offsets[q64_idx + 1] = 0
             mQ64IterCounts[q64_idx] = allocated_tiles // 2 if is_small != 0 else 0
-            mQ64IterCounts[q64_idx + 1] = 0
             mQ64FullIters[q64_idx] = valid_full_pages // (2 * FRAGS_PER_TILE) if is_small != 0 else 0
-            mQ64FullIters[q64_idx + 1] = 0
+            if cutlass.const_expr(self.block != 64):
+                mQ64Offsets[q64_idx + 1] = 0
+                mQ64IterCounts[q64_idx + 1] = 0
+                mQ64FullIters[q64_idx + 1] = 0
 
 
 class OrderQRouteWork:
@@ -1406,10 +1416,11 @@ def walk_stats(
     block_sizes: Tensor,
     shared_count: Tensor,
     stream: cuda.CUstream = None,
+    block: int = BLOCK,
 ) -> None:
     _run_metadata_kernel(
-        "kpage_walk_stats",
-        WalkStats(),
+        f"kpage_walk_stats_blk{block}",
+        WalkStats(block),
         (block_index, block_count, q_sizes, block_sizes, shared_count),
         walk_stats.compile_cache,
         stream,
@@ -1461,10 +1472,11 @@ def walk_fill(
     page_table: Tensor,
     mask_table: Tensor,
     stream: cuda.CUstream = None,
+    block: int = BLOCK,
 ) -> None:
     _run_metadata_kernel(
-        "kpage_walk_fill",
-        WalkFill(),
+        f"kpage_walk_fill_blk{block}",
+        WalkFill(block),
         (
             block_index,
             block_count,

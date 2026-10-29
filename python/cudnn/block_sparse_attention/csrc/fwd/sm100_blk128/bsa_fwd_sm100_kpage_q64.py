@@ -59,12 +59,18 @@ class BlockSparseAttnForwardSm100KPageQ64:
         head_dim_v: Optional[int] = None,
         qhead_per_kvhead: cutlass.Constexpr[int] = 1,
         tail_page: cutlass.Constexpr[bool] = False,
+        nonpositive_scale: cutlass.Constexpr[bool] = False,
     ):
         """``tail_page``: seqlen_k is not a multiple of 16, so the K/V page descriptors
         are built over the row extent (a page past seqlen_k loads as zeros) instead
-        of the 16-row page view, whose whole-page TMA boxes are a few percent faster."""
+        of the 16-row page view, whose whole-page TMA boxes are a few percent faster.
+        ``nonpositive_scale``: softmax_scale <= 0.  max(scale * S) is not scale * max(S) then,
+        and the -inf of masked keys times the scale is NaN / +inf, so the scores are scaled
+        before the masks and the softmax statistics run with a unit scale (as in the base
+        blk64 forward)."""
         self.qhead_per_kvhead = qhead_per_kvhead
         self.tail_page = tail_page
+        self.nonpositive_scale = nonpositive_scale
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
         self.head_dim_padded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
@@ -852,8 +858,9 @@ class BlockSparseAttnForwardSm100KPageQ64:
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             softmax_loop = partial(
                 self.softmax_loop,
-                softmax_scale_log2=softmax_scale_log2,
+                softmax_scale_log2=Float32(1.0) if const_expr(self.nonpositive_scale) else softmax_scale_log2,
                 softmax_scale=softmax_scale,
+                score_scale_log2=softmax_scale_log2,
                 sScale=sScale,
                 mLSE=mLSE,
                 pipeline_s_p_o=pipeline_s_p_o,
@@ -895,7 +902,7 @@ class BlockSparseAttnForwardSm100KPageQ64:
                 sm_stats_barrier,
                 reduce_mbar_ptr,
                 pipeline_o_epi,
-                softmax_scale_log2,
+                Float32(1.0) if const_expr(self.nonpositive_scale) else softmax_scale_log2,
                 oStats,
                 oExchange,
                 SeqlenInfoCls,
@@ -1328,6 +1335,7 @@ class BlockSparseAttnForwardSm100KPageQ64:
         stage: int | Int32,
         softmax_scale_log2: Float32,
         softmax_scale: Float32,
+        score_scale_log2: Float32,
         sScale: cute.Tensor,
         mLSE: Optional[cute.Tensor],
         pipeline_s_p_o: pipeline.PipelineAsync,
@@ -1383,6 +1391,7 @@ class BlockSparseAttnForwardSm100KPageQ64:
                 sm_stats_barrier=sm_stats_barrier,
                 sScale=sScale,
                 stage=stage,
+                score_scale_log2=score_scale_log2,
             )
 
             # Always acquire pipeline_sm_stats to stay in sync with correction
@@ -1401,7 +1410,10 @@ class BlockSparseAttnForwardSm100KPageQ64:
                 mask_row = mTileOffsets[batch_idx, head_idx, m_block] + (block_iter_count - 1 - stage) * 2
                 mask_word_base = (warp_idx // 2) * 2
 
-                if masked_wg_count > 0:
+                # The first step is the generic step started from the reset state (row_max=-inf, row_sum=0 gives
+                # acc_scale == 0, i.e. the is_first result), so every step shares one code copy per mask variant: a
+                # separate once-per-tile copy of the large softmax step thrashes the instruction cache.
+                for _ in cutlass.range(masked_wg_count, unroll=1):
                     mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
                         mma_si_consumer_phase,
                         sm_stats_producer_phase,
@@ -1413,48 +1425,9 @@ class BlockSparseAttnForwardSm100KPageQ64:
                         mask_row=mask_row,
                         mask_word_base=mask_word_base,
                         masked=True,
-                        is_first=True,
                     )
                     mask_row -= 4
-                    for n_tile in cutlass.range(masked_wg_count - 1, unroll=1):
-                        mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
-                            mma_si_consumer_phase,
-                            sm_stats_producer_phase,
-                            tidx=tidx,
-                            tmem_s_addr=tmem_s_addr,
-                            tmem_p_addr=tmem_p_addr,
-                            sm_stats_bar_index=sm_stats_bar_index,
-                            mMaskTable=mMaskTable,
-                            mask_row=mask_row,
-                            mask_word_base=mask_word_base,
-                            masked=True,
-                        )
-                        mask_row -= 4
-                    if full_wg_count > 0:
-                        mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
-                            mma_si_consumer_phase,
-                            sm_stats_producer_phase,
-                            tidx=tidx,
-                            tmem_s_addr=tmem_s_addr,
-                            tmem_p_addr=tmem_p_addr,
-                            sm_stats_bar_index=sm_stats_bar_index,
-                            mMaskTable=mMaskTable,
-                            mask_row=mask_row,
-                            mask_word_base=mask_word_base,
-                        )
-                        for n_tile in cutlass.range(full_wg_count - 1, unroll=1):
-                            mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
-                                mma_si_consumer_phase,
-                                sm_stats_producer_phase,
-                                tidx=tidx,
-                                tmem_s_addr=tmem_s_addr,
-                                tmem_p_addr=tmem_p_addr,
-                                sm_stats_bar_index=sm_stats_bar_index,
-                                mMaskTable=mMaskTable,
-                                mask_row=mask_row,
-                                mask_word_base=mask_word_base,
-                            )
-                else:
+                for _ in cutlass.range(full_wg_count, unroll=1):
                     mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
                         mma_si_consumer_phase,
                         sm_stats_producer_phase,
@@ -1465,20 +1438,7 @@ class BlockSparseAttnForwardSm100KPageQ64:
                         mMaskTable=mMaskTable,
                         mask_row=mask_row,
                         mask_word_base=mask_word_base,
-                        is_first=True,
                     )
-                    for n_tile in cutlass.range(wg_count - 1, unroll=1):
-                        mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
-                            mma_si_consumer_phase,
-                            sm_stats_producer_phase,
-                            tidx=tidx,
-                            tmem_s_addr=tmem_s_addr,
-                            tmem_p_addr=tmem_p_addr,
-                            sm_stats_bar_index=sm_stats_bar_index,
-                            mMaskTable=mMaskTable,
-                            mask_row=mask_row,
-                            mask_word_base=mask_word_base,
-                        )
 
                 sScale[tidx + stage * self.stats_stride] = softmax.row_sum[0]
                 if const_expr(mLSE is not None or self.q_stage == 1):
@@ -1507,6 +1467,7 @@ class BlockSparseAttnForwardSm100KPageQ64:
         sm_stats_barrier: pipeline.NamedBarrier,
         sScale: cute.Tensor,
         stage: int | Int32,
+        score_scale_log2: Float32,
         tidx: Int32,
         tmem_s_addr: Int32,
         tmem_p_addr: Int32,
@@ -1546,7 +1507,8 @@ class BlockSparseAttnForwardSm100KPageQ64:
             mma_si_consumer_phase,
         )
 
-        use_ldred_rowmax = self.arch >= Arch.sm_103 and self.arch <= Arch.sm_103f
+        # The hardware row max is of the unscaled scores, which is not the max of the scaled ones for a nonpositive scale.
+        use_ldred_rowmax = self.arch >= Arch.sm_103 and self.arch <= Arch.sm_103f and not self.nonpositive_scale
         tSrS_t2r = cute.make_rmem_tensor((128,), Float32)
         row_max_tile = -Float32.inf
         for c in cutlass.range_constexpr(4):
@@ -1557,6 +1519,12 @@ class BlockSparseAttnForwardSm100KPageQ64:
                 vals = bsa_fwd_helpers.tmem_load_32dp32b32x(tmem_s_addr + c * 32)
             for j in cutlass.range_constexpr(32):
                 tSrS_t2r[c * 32 + j] = vals[j]
+            if const_expr(self.nonpositive_scale):
+                # Scale the finite scores before the -inf mask sentinels; the softmax then runs with a unit scale.
+                for j in cutlass.range_constexpr(0, 32, 2):
+                    tSrS_t2r[c * 32 + j], tSrS_t2r[c * 32 + j + 1] = cute.arch.mul_packed_f32x2(
+                        (tSrS_t2r[c * 32 + j], tSrS_t2r[c * 32 + j + 1]), (score_scale_log2, score_scale_log2)
+                    )
             if const_expr(masked):
                 kpage_utils.apply_packed_mask_chunk(tSrS_t2r, c, mask_words[c])
 
