@@ -581,6 +581,32 @@ def _warp_amax_u32(value: str, mask: str) -> str:
     )
 
 
+def _f8_128x4_k_padding(quant: BlockQuantizeSpec, swapped: bool) -> bool:
+    """Whether an F8_128x4 scale row can end in K padding slots.
+
+    A blob row holds ``roundup(blocks, 4)`` scale slots. Grouped token-axis
+    segments hold none: their groups start at multiples of ``4 * block_size``."""
+    token_axis = (quant.axis == 1) != swapped
+    return quant.scale_reorder == "F8_128x4" and not (quant.grouped_by_moe and token_axis)
+
+
+def _emit_f8_128x4_k_pad_zero(quant: BlockQuantizeSpec, block: str, num_blocks: str, sidx: str, scale_tap_idx: int) -> list[str]:
+    """Zero the padding slots after a scale row's last real block.
+
+    A consumer whose K is the quantized axis multiplies them against its zero-filled
+    K tail, so a stale NaN encoding (E8M0 0xFF, E4M3 0x7F/0xFF) poisons its whole output
+    row. They share the last block's 4-byte quad, so the lane storing that block
+    writes them. Rows that pad the blob to a whole 128-row atom stay unwritten: only
+    consumer rows that are never stored read them."""
+    store_dtype = _scale_store_dtype(quant.scale_dtype)
+    zero = "cutlass.Int8(0)" if store_dtype == "cutlass.Int8" else f"cutlass.Int8(0).bitcast({store_dtype})"
+    lines = [f"if {block} + 1 == {num_blocks}:"]
+    for slot in range(1, 4):
+        lines.append(f"    if {block} % 4 < {4 - slot}:")
+        lines.append(f"        (gC_tap_{scale_tap_idx}_ptr + {sidx} + {slot}).store({zero}, alignment=1)")
+    return lines
+
+
 def _emit_block_quant_col(
     quant: BlockQuantizeSpec,
     quant_idx: int,
@@ -597,6 +623,7 @@ def _emit_block_quant_col(
     p = f"_q{quant_idx}"
     swapped = isinstance(chain.moe, MoeSwapAbSpec)
     col_bound = "group_end" if swapped else "N"
+    k_padding = _f8_128x4_k_padding(quant, swapped)
     scale_dtype = _scale_store_dtype(quant.scale_dtype)
     G = 16 if quant.block_size == 16 else 32
     if vsize % G != 0:
@@ -719,13 +746,15 @@ def _emit_block_quant_col(
                 f"{p}_sidx{k} = {batch_index_expr} * quant_scale_stride_l_{quant_idx} + "
                 f"{p}_mb * quant_scale_stride_m_{quant_idx} + {p}_n{k} * quant_scale_stride_n_{quant_idx}"
             )
-        _st = f"(gC_tap_{scale_tap_idx}_ptr + {p}_sidx{k}).store({p}_scale_mine[{k}], alignment=1)"
+        stores = [f"(gC_tap_{scale_tap_idx}_ptr + {p}_sidx{k}).store({p}_scale_mine[{k}], alignment=1)"]
+        if k_padding:
+            stores.extend(_emit_f8_128x4_k_pad_zero(quant, f"{p}_mb", f"(M // {quant.block_size})", f"{p}_sidx{k}", scale_tap_idx))
         if row_pred is None:
-            lines.append(_st)
+            lines.extend(stores)
         else:
             col_pred = f"{p}_n{k} < {col_bound}" if swapped else f"col_j + {vsize} <= N"
             lines.append(f"if ({row_pred}) & ({col_pred}):")
-            lines.append(f"    {_st}")
+            lines.extend(f"    {line}" for line in stores)
     return lines
 
 
@@ -744,7 +773,21 @@ def _emit_block_quant(
     """Generate block-quantized data and scale stores."""
     if quant.axis == 1:
         return _emit_block_quant_col(quant, quant_idx, source_var, output_dtype, out_var, scale_tap_idx, chain, batch_index_expr, vsize, row_pred)
-    return _emit_block_quant_row(quant, quant_idx, source_var, output_dtype, out_var, scale_tap_idx, chain, batch_index_expr, vsize, row_pred)
+    lines = _emit_block_quant_row(quant, quant_idx, source_var, output_dtype, out_var, scale_tap_idx, chain, batch_index_expr, vsize, row_pred)
+    swapped = isinstance(chain.moe, MoeSwapAbSpec)
+    if not _f8_128x4_k_padding(quant, swapped):
+        return lines
+    # The shared row emitter stores only real blocks; pad behind its scale stores, under their predicate.
+    p, bs = f"_q{quant_idx}", quant.block_size
+    for k in range(vsize // bs):
+        pad = _emit_f8_128x4_k_pad_zero(quant, f"{p}_scol{k}", f"(N // {bs})", f"{p}_sidx{k}", scale_tap_idx)
+        if row_pred is None:
+            lines.extend(pad)
+        else:
+            width, col_bound = ((k + 1) * bs, "group_end") if swapped else (vsize, "N")
+            lines.append(f"if ({row_pred}) & (col_j + {width} <= {col_bound}):")
+            lines.extend(f"    {line}" for line in pad)
+    return lines
 
 
 def _tap_fake_shape(tap, chain: FusionChain | None = None) -> str:

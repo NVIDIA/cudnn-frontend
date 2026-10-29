@@ -3054,6 +3054,50 @@ def test_e2e_reduction_amax_scalar_sm120() -> None:
 
 
 @requires_sm120
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["token_by_weight", "weight_by_token"])
+@pytest.mark.parametrize("grouped", [False, True], ids=["global", "segmented"])
+def test_e2e_quant_scale_k_padding_is_zeroed_sm120(grouped, swap_ab) -> None:
+    """Block-scale twin of test_matmul.py::test_sm120_quant_scale_k_padding_is_zeroed
+    for the feature-axis quant: N=160 has 5 scale blocks, so every routed row's
+    three padding slots must come out 0 from a 0xFF buffer, in the global blob and
+    in the per-group segmented one (each group starts a fresh 128-row atom)."""
+    from test_moe_grouped_matmul_fwd import _f8_128x4_logical
+
+    E, S, N, K, bs = 2, 300, 160, 256, 32
+    offsets_list = [0, 100, 100, 220, S]
+    num_groups, sf_k, blocks = len(offsets_list) - 1, K // bs, N // bs
+    cols = _ceil_div(blocks, 4) * 4
+    dims = (1, segmented_row_scale_capacity_rows(S, num_groups) if grouped else _ceil_div(S, 128) * 128, cols)
+    g = _build_graph(E, S, N, K, num_groups, combo="mxfp8", quant=True, quant_scale_reorder=True, quant_scale_dim=dims, quant_group_offset=grouped)
+    compiled = _plan(g, config=by_name(_SM120_BS_CFG), swap_ab=swap_ab)
+
+    # Small integers under unit E8M0 scales keep the GEMM, and so the quant reference, exact.
+    torch.manual_seed(0)
+    token = torch.randint(-2, 3, (1, S, K), device="cuda").float().to(torch.float8_e4m3fn)
+    weight = torch.randint(-2, 3, (E, N, K), device="cuda").float().to(torch.float8_e4m3fn)
+    sfa = torch.full((1, segmented_row_scale_capacity_rows(S, num_groups), sf_k), 0x7F, dtype=torch.uint8, device="cuda")
+    sfb = torch.full((E, _ceil_div(N, 128) * 128, _ceil_div(sf_k, 4) * 4), 0x7F, dtype=torch.uint8, device="cuda")
+    q = torch.empty(1, S, N, dtype=torch.float8_e4m3fn, device="cuda")
+    scale = torch.full(dims, 0xFF, dtype=torch.uint8, device="cuda")
+    offsets = torch.tensor(offsets_list, dtype=torch.int32, device="cuda")
+    e8m0 = torch.float8_e8m0fnu
+    compiled(_vp_bs(compiled, token, weight, [q, scale.view(e8m0)], sfa.view(e8m0), sfb.view(e8m0), fto=offsets))
+    torch.cuda.synchronize()
+
+    ref = torch.zeros((S, N), dtype=torch.float32, device="cuda")
+    live, base = [], 0
+    for gi, (begin, end) in enumerate(zip(offsets_list, offsets_list[1:])):
+        ref[begin:end] = token[0, begin:end].float() @ weight[gi % E].float().T
+        live.extend(range(base, base + end - begin) if grouped else range(begin, end))
+        base += _ceil_div(end - begin, 128) * 128
+    q_ref, s_ref = _block_quant_ref(ref, bs, torch.float8_e4m3fn, e8m0)
+    expected = torch.zeros(S, cols, dtype=torch.uint8, device="cuda")
+    expected[:, :blocks] = s_ref[0].view(torch.uint8)
+    torch.testing.assert_close(_f8_128x4_logical(scale, cols)[live], expected, atol=0, rtol=0)
+    torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
+
+
+@requires_sm120
 def test_e2e_auto_config_sm120() -> None:
     """The engine's auto path on an SM 12.x part: preferred_pipeline lands on the
     sm120 MoE block-scale template and select_config hands it a legal geometry."""

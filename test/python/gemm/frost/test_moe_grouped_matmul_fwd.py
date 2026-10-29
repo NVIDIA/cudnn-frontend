@@ -2010,6 +2010,59 @@ def test_gather_layouts_and_frontend_sm120(case):
     _run_gather_layouts_and_frontend(C120, by_name(_SM120_CFG), case)
 
 
+def _f8_128x4_logical(blob: torch.Tensor, cols: int) -> torch.Tensor:
+    """Undo an F8_128x4 blob's reordering: (rows rounded up to 128, cols) bytes."""
+    flat = blob.view(torch.uint8).flatten()
+    order = _to_blocked(torch.arange(flat.numel(), device=flat.device).view(-1, cols))
+    logical = torch.empty_like(flat)
+    logical[order] = flat
+    return logical.view(-1, cols)
+
+
+@requires_matmul_gpu
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["token_by_weight", "weight_by_token"])
+@pytest.mark.parametrize("axis", [-1, 1], ids=["feature_axis", "token_axis"])
+def test_moe_quant_scale_k_padding_is_zeroed_sm120(axis, swap_ab):
+    """MoE twin of test_matmul.py::test_sm120_quant_scale_k_padding_is_zeroed: the
+    slots after each real scale row's last block come out 0 from a 0xFF buffer. Each
+    axis is the row quant in one kernel orientation and the col quant in the other."""
+    E, K, bs = 4, 128, 32
+    # 11 token blocks pad to 12, 5 feature blocks to 8; the last group ends at S.
+    groups, N = ([96, 0, 128, 128], 128) if axis == 1 else ([100, 0, 120, 80], 160)
+    S = sum(groups)
+    rows, blocks = (N, S // bs) if axis == 1 else (S, N // bs)
+    dims = (1, _ceil_div(rows, 128) * 128, _ceil_div(blocks, 4) * 4)
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
+    w = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
+    fto = g.tensor(name="first_token_offset", dim=[E + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    if axis == 1:
+        fto.set_alignment_value(bs)  # token-axis blocks never straddle a group
+    out = g.moe_grouped_matmul(tok, w, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe")
+    q, q_scale = g.block_scale_quantize(input=out, block_size=bs, axis=axis, name="q")
+    q.set_data_type(cudnn.data_type.FP8_E4M3).set_output(True)
+    q_scale.set_dim(list(dims)).set_stride([dims[1] * dims[2], dims[2], 1])
+    q_scale.set_data_type(cudnn.data_type.FP8_E8M0).set_output(True)
+    q_scale.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
+    compiled = _plan(g, config=by_name(_SM120_CFG), swap_ab=swap_ab)
+
+    torch.manual_seed(0)
+    token = torch.randint(-2, 2, (1, S, K), device="cuda").to(torch.bfloat16)
+    weight = torch.randint(-2, 2, (E, N, K), device="cuda").to(torch.bfloat16)
+    offsets = _offsets(groups, S)
+    q_buf = torch.empty(1, S, N, dtype=torch.float8_e4m3fn, device="cuda")
+    scale_buf = torch.full(dims, 0xFF, dtype=torch.uint8, device="cuda")
+    compiled({tok: token, w: weight, fto: offsets, q: q_buf, q_scale: scale_buf.view(torch.float8_e8m0fnu)})
+    torch.cuda.synchronize()
+
+    ref = _ref_f32(token, weight, offsets, S, N, E)
+    q_ref, s_ref = _block_quant_ref(ref.T.contiguous() if axis == 1 else ref, bs, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+    expected = torch.zeros(rows, dims[2], dtype=torch.uint8, device="cuda")
+    expected[:, :blocks] = s_ref[0].view(torch.uint8)
+    torch.testing.assert_close(_f8_128x4_logical(scale_buf, dims[2])[:rows], expected, atol=0, rtol=0)
+    torch.testing.assert_close(q_buf.float(), (q_ref.transpose(1, 2) if axis == 1 else q_ref).float(), atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("weight_major", ["k", "n"])
 @pytest.mark.parametrize("gather", [False, True])
 def test_sm120_moe_render_smoke(weight_major: str, gather: bool) -> None:

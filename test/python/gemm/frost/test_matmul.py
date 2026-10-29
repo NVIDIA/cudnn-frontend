@@ -3522,6 +3522,54 @@ def test_sm120_render_smoke() -> None:
                 assert f"b_is_n_major = {b_major == 'n'}" in src, combo
 
 
+@pytest.mark.parametrize("axes,M,N", [((-1,), 200, 2880), ((-1, 1), 352, 320)], ids=["row", "row_col"])
+def test_sm120_quant_scale_k_padding_is_zeroed(axes, M, N) -> None:
+    """An F8_128x4 quant-scale row holds roundup(blocks, 4) slots. A block-scaled
+    GEMM whose K is the quantized axis reads the padding slots against its
+    zero-filled K tail, so a stale 0xFF (the E8M0 NaN) there turns the whole
+    output row into NaN. The epilogue must write them as 0, whatever the caller's
+    buffer held: here 0xFF. Rows past the last real row of a 128-row atom stay
+    unchecked. ``row_col`` also runs the row quant under the col quant's row
+    predicate."""
+    cfg = _resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    K, bs = 128, 32
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
+    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"))
+    C = g.matmul(A=A, B=B, name="mm")
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
+    vp, checks = {A: a, B: b}, []
+    for qi, axis in enumerate(axes):
+        Q, QS = g.block_scale_quantize(input=C, block_size=bs, axis=axis, name=f"q{qi}")
+        Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+        rows, blocks = (M, N // bs) if axis == -1 else (N, M // bs)
+        dims = [1, (rows + 127) // 128 * 128, (blocks + 3) // 4 * 4]
+        QS.set_dim(dims).set_stride([dims[1] * dims[2], dims[2], 1])
+        QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+        QS.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
+        vp[Q] = torch.empty(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
+        vp[QS] = torch.full(dims, 0xFF, dtype=torch.uint8, device="cuda").view(torch.float8_e8m0fnu)
+        if axis == -1:
+            q_ref, s_ref = _block_quant_reference(mm, bs, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+            addr = _f8_row_scale_addr(M, dims[2] * bs, bs)
+        else:
+            q_ref, s_ref = _col_quant_reference(mm, bs, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+            s_ref = s_ref.transpose(1, 2)
+            addr = _f8_col_scale_addr(dims[2] * bs, N, bs)
+        expected = torch.zeros(rows, dims[2], dtype=torch.uint8, device="cuda")
+        expected[:, :blocks] = s_ref[0].view(torch.uint8)
+        checks.append((Q, QS, q_ref, addr, expected))
+
+    compiled = _plan(g, config=cfg)
+    assert [q.axis == 1 for q in compiled.chain.quants] == [axis == 1 for axis in axes]
+    compiled(vp)
+    torch.cuda.synchronize()
+    for Q, QS, q_ref, addr, expected in checks:
+        torch.testing.assert_close(vp[QS].view(torch.uint8).flatten()[addr], expected, atol=0, rtol=0)
+        torch.testing.assert_close(vp[Q].float(), q_ref.float(), atol=0, rtol=0)
+
+
 # ---------------------------------------------------------------------------
 # Two-kernel split-K
 # ---------------------------------------------------------------------------
