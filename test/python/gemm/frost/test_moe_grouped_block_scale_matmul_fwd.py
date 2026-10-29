@@ -756,6 +756,7 @@ def _build_graph(
     combine_top_k=None,
     gather_rows=None,
     scale_k=None,
+    negative_scale=(False, False),
 ):
     block_size, default_dt, sf_dt = _COMBOS[combo]
     a_dt = default_dt if a_dt_override is None else a_dt_override
@@ -790,8 +791,9 @@ def _build_graph(
         data_type=offset_dt,
     )
     fto.set_alignment_value(offset_multiple)
-    tok_d = g.block_scale_dequantize(input=tok, descale=SFA, block_size=[1, block_size]) if dequant_a else tok
-    w_d = g.block_scale_dequantize(input=w, descale=SFB, block_size=[block_size, 1]) if dequant_b else w
+    # ``negative_scale`` = (token side, weight side); None leaves is_negative_scale unset.
+    tok_d = g.block_scale_dequantize(input=tok, descale=SFA, block_size=[1, block_size], is_negative_scale=negative_scale[0] or None) if dequant_a else tok
+    w_d = g.block_scale_dequantize(input=w, descale=SFB, block_size=[block_size, 1], is_negative_scale=negative_scale[1] or None) if dequant_b else w
     routing = {}
     mode = cudnn.moe_grouped_matmul_mode.NONE
     if gather_rows is not None:
@@ -3078,6 +3080,25 @@ def test_e2e_fp4_rejects_n_major_weight_sm120() -> None:
 
 
 @requires_sm120
+def test_sm120_moe_block_scale_declines_signed_negative_scale() -> None:
+    """The MoE block-scale templates (normal and swap-AB) read the E4M3 token and weight scales as
+    unsigned ``.ue4m3`` too, so a graph that declares signed scales is declined instead of run on
+    ``|s|``; without the attribute, or on E8M0 scales (no sign bit), the graph keeps its plan."""
+    from cudnn.gemm.frost.engine import FrostGemmEngine
+
+    engine = FrostGemmEngine()
+    for side in ("SFA", "SFB"):
+        flagged = _build_graph(2, 512, 256, 512, num_groups=2, combo="nvfp4", negative_scale=(side == "SFA", side == "SFB"))
+        match = f"is_negative_scale=True on its fp8_e4m3 scale factors '{side}'"
+        with pytest.raises(NotImplementedError, match=match):
+            engine.check_support(flagged)
+        for swap_ab in (False, True):
+            with pytest.raises(NotImplementedError, match=match):
+                jit_from_cudnn_graph(flagged, config=replace(by_name(_SM120_BS_CFG), swap_ab=swap_ab))
+    engine.check_support(_build_graph(2, 512, 256, 512, num_groups=2, combo="nvfp4"))
+    engine.check_support(_build_graph(2, 512, 256, 512, num_groups=2, combo="mxfp4", negative_scale=(True, True)))
+
+
 @pytest.mark.parametrize("public", [False, True], ids=["jit", "knob_replay"])
 @pytest.mark.parametrize("swap_ab", [False, True], ids=["fwd", "swap_ab"])
 @pytest.mark.parametrize("config_name", [_SM120_BS_512x16, _SM120_BS_32x384], ids=["m512", "n384"])
