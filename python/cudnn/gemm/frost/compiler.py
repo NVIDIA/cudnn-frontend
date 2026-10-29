@@ -757,7 +757,8 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
         m = a_bufs[0].shape[1]
         n = token_index.shape[0] if token_index is not None else b_bufs[0].shape[1]
         k = a_bufs[0].shape[2] * (2 if mm.a_dtype == "fp4_e2m1" else 1)
-        reason = _tma_alignment_reject(mm.a_dtype, mm.b_dtype, mm.a_major, mm.b_major, m, n, k)
+        # The same per-operand checks, named in the graph's frame (A = token, B = weight) as the token-by-weight plan names them.
+        reason = _tma_alignment_reject(mm.b_dtype, mm.a_dtype, "k" if mm.b_major == "k" else "m", "k" if mm.a_major == "k" else "n", n, m, k)
         if reason is not None:
             raise ValueError(reason)
         _check_moe_combine_n(compiled, n)
