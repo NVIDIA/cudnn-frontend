@@ -4226,6 +4226,45 @@ def test_splitk_epilogue_reduction():
     assert out_am.flatten()[0] == ref.abs().amax()
 
 
+def _splitk_tile_reduction_graph(batch, mode):
+    """relu + one fp32 reduction over all of M and N (per batch when ``batch`` > 1)."""
+    M, N, K = 256, 256, 4096
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[batch, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[batch, K, N], stride=[K * N, 1, K])
+    R = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="r")
+    R.set_output(True)
+    red = g.reduction(input=R, mode=mode, name="red")
+    red.set_dim([batch, 1, 1]).set_stride([1, 1, 1])
+    red.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    return g
+
+
+@requires_sm120
+@pytest.mark.parametrize("batch", (1, 2), ids=("scalar", "per_batch"))
+@pytest.mark.parametrize("mode", ("ADD", "AVG", "NORM1"))
+def test_splitk_declines_tile_invariant_fp32_sum(monkeypatch, mode, batch):
+    """An explicit split-K config declines an fp32 sum over all of M and N, as the automatic pick does.
+
+    The reducer adds such a sum with one same-address atomic per output vector, so its rounding drifts
+    with the vector count: a constant-input AVG at 3000x3000x1024 came back 2.8% low at split 2 (1.5e-5
+    unsplit). AMAX is exact under atomics and keeps the explicit split."""
+    from dataclasses import replace
+
+    from cudnn.gemm.frost import compiler
+
+    def no_render(src):
+        pytest.fail("a declined split-K config must not render a kernel")
+
+    monkeypatch.setattr(compiler, "_import_kernel", no_render)
+    with pytest.raises(NotImplementedError, match=f"fp32 {mode.lower()} reduction over all of M and N"):
+        _jit_splitk(_splitk_tile_reduction_graph(batch, getattr(cudnn.reduction_mode, mode)), 2)
+    summed = analyze(_splitk_tile_reduction_graph(batch, getattr(cudnn.reduction_mode, mode)))
+    assert compiler._auto_split_k(summed, _splitk_cfg(), sm_count=188).split_k_slices == 1
+    amax = analyze(_splitk_tile_reduction_graph(batch, cudnn.reduction_mode.AMAX))
+    compiler.probe_chain(amax, replace(_splitk_cfg(), split_k_slices=2))
+
+
 def test_splitk_auto_select():
     """Pure-function checks of the auto-split heuristic (fixed sm_count so no
     GPU work is issued)."""

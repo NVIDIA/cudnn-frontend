@@ -1661,13 +1661,18 @@ def _splitk_reduction_serializes(chain: FusionChain, red) -> bool:
     return chain.matmul.N // _splitk_reduce_elems(chain) > _SPLITK_ROW_SUM_MAX_ATOMICS
 
 
+def _splitk_reduction_drifts(red) -> bool:
+    """Whether ``red`` is an fp32 sum over all of M and N, which the split-K reducer folds with one same-address atomic
+    per output vector. It has no register partial, so the rounding drifts with the vector count (constant-input AVG 2.8%
+    low at 3000x3000x1024 split 2, 1.5e-5 unsplit); max / min / amax and int32 sums are exact under atomics."""
+    return red.dim[1] == 1 and red.dim[2] == 1 and red.mode in ("add", "avg", "norm1", "norm2") and red.compute_dtype == "fp32"
+
+
 def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None" = None) -> TileConfig:
     """Layer split-K onto the selected config when the output grid underfills the GPU and K is deep."""
     if config.split_k_slices != 1:
         return config
     if _splitk_reject_reason(chain, replace(config, split_k_slices=2)) is not None:
-        return config
-    if any(r.dim[1] == 1 and r.dim[2] == 1 and r.mode in ("add", "avg", "norm1", "norm2") and r.compute_dtype == "fp32" for r in chain.reductions):
         return config
     if any(_splitk_reduction_serializes(chain, r) for r in chain.reductions):
         return config
@@ -2360,6 +2365,10 @@ def _splitk_reject_reason(chain: FusionChain, config: TileConfig) -> "str | None
         reasons.append("packed fp4 output")
     if chain.matmul.accum_dtype != "fp32":
         reasons.append(f"{chain.matmul.accum_dtype} accumulation (fp32 partials only)")
+    # The automatic pick and every explicit path (a config, a replayed SPLIT_K_SLC knob) share this numerics gate.
+    drifting = sorted({red.mode for red in chain.reductions if _splitk_reduction_drifts(red)})
+    if drifting:
+        reasons.append(f"fp32 {'/'.join(drifting)} reduction over all of M and N (the reducer adds it with one same-address atomic per vector, which drifts)")
     if chain.matmul.batch * config.split_k_slices > 65535:
         reasons.append(f"grid.z={chain.matmul.batch * config.split_k_slices} exceeds CUDA's 65535 limit")
     if config.split_k_slices > 32:
