@@ -2511,3 +2511,8 @@ def test_sm107_pt_fp8_d128_dense_legs_take_the_single_cta(sm107_metadata_target)
         assert effective_cgas(spec.capabilities, facts) == frozenset({1, 2}), over
         assert _auto_sched_cga(spec, facts, split_kv=1, sched_policy=sched) == (sched, 1), over
     assert effective_cgas(spec.capabilities, _facts(**{**base, "b": 8, "h_kv": 64})) == frozenset({2})
+    mx_name = engines.engine_name(mxfp8=True, arch="sm107")
+    mx_spec = next(s for s in engines.ENGINE_SPECS if s.name == mx_name)
+    mx = _facts(**{**base, "is_fp8": False, "is_mxfp8": True, "dtype_o": cudnn.data_type.BFLOAT16})
+    assert effective_cgas(mx_spec.capabilities, mx) == frozenset({1, 2})
+    assert _auto_sched_cga(mx_spec, mx, split_kv=1, sched_policy=SCHED_LPT) == (SCHED_LPT, 1)

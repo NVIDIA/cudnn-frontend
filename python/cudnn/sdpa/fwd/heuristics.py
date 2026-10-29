@@ -2115,7 +2115,7 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         # The SM100 nonpaged D128 half THD graphs with one query head per KV head run the single-CTA two-slab prefill body
         # (engines.sm100_nonpaged_d128_thd_single_cta_leg); the pair tile stays a runner.
         return sched_policy, 1
-    if selected_shape == (128, 128) and caps.sm_lo == 107 and caps.is_fp8 and not caps.is_mxfp8 and domain == frozenset({1, 2}):
+    if selected_shape == (128, 128) and caps.sm_lo == 107 and (caps.is_fp8 or caps.is_mxfp8) and domain == frozenset({1, 2}):
         return sched_policy, 1
     if selected_shape == (128, 128) and domain == frozenset({1, 2}) and not (facts.is_fp8 or facts.is_mxfp8):
         # The f16 SM100 and cc 10.7 rows: cga1 = the decode tile when one of its 128-row

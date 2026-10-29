@@ -1934,6 +1934,7 @@ def test_sm107_d256_mxfp8_dense_legs_run_the_two_cta_pair():
     assert supported_cgas_for((192, 128), fp8=True, device_cc=(10, 7), pertensor=True) == (2,)
     assert supported_cgas_for((192, 128), fp8=True, device_cc=(10, 7), pertensor=False, fp8_o=True) == (2,)
     assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 7), pertensor=True) == (1, 2)
+    assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 7), pertensor=False) == (1, 2)
     # the row domain, narrowed per graph
     caps = _caps("sdpa_fwd_prefill_sm107_mxfp8")
     assert dict(caps.cgas_by_d_shape)[(256, 256)] == frozenset({1, 2})
