@@ -3439,15 +3439,23 @@ _NAN_ACTIVATIONS = {
     "elu": (lambda g, C: g.elu(input=C, name="act"), torch.nn.functional.elu),
 }
 
+# One dense config per arch tree: both render these ops with the shared emitters. A process renders only its own
+# tree, so the other tree's cases skip.
+_NAN_CONFIGS = {
+    "sm100": "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
+    "sm120": "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
+}
+
 
 @pytest.mark.parametrize("act", list(_NAN_ACTIVATIONS))
-def test_sm120_relu_family_propagates_nan(act: str) -> None:
+@pytest.mark.parametrize("family", list(_NAN_CONFIGS))
+def test_relu_family_propagates_nan(family: str, act: str) -> None:
     """relu (plain, clipped, sloped), leaky_relu and elu keep a NaN accumulator
     NaN, as torch does and as the frontend requests for RELU_FWD
     (CUDNN_PROPAGATE_NAN). Their max/min used to return the non-NaN operand, so
     NaN came out as 0 or lower_clip. +-inf accumulators pin the unchanged
     non-finite results."""
-    cfg = _resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    cfg = _resolve(_NAN_CONFIGS[family])
     M = N = K = 128
     ok, reason = _compatible(cfg, M, N, K, "bf16", "bf16")
     if not ok:
