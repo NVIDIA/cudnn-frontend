@@ -6,7 +6,8 @@
 Each CTA processes one query, or up to 32 in gated tiles, for one KV head.
 Sixteen gather warps fill a three-stage K/V ring. One MMA warp overlaps scores with the
 current softmax and value product. The two softmax groups split the head
-columns; a 12-head group uses eight columns and four columns.
+columns; a group of at most 12 heads uses eight columns and four columns
+(a 6-head group occupies the first six; the padded Q rows stay zero).
 The compact block list is streamed from global memory; its width has no
 compile-time limit. All token addresses use the supplied block spans.
 
@@ -433,7 +434,7 @@ def _fprop_body(
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
     if warp < SOFTMAX_WARPS:
-        if cutlass.const_expr(group_size == 12):
+        if cutlass.const_expr(group_size <= 12):
             if warp < 4:
                 _fprop_softmax(
                     tmem, bars, scratch, sp_raw, out, out_fp32, lse, ids, first, last, query, head, count, low, high, out.shape[0], tiles, scale, group_size, 8

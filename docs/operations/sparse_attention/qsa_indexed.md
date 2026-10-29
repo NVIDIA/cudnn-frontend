@@ -7,7 +7,8 @@ for block selection, bitmap training and the internal two-pass backend.
 `cudnn.ops.qsa_indexed_forward` and `qsa_indexed_backward` accept packed token
 indices directly. The implementation lives in `cudnn.QSA.indexed` and shares
 QSA's attention kernels. It supports BF16
-12Q/1KV and head dimension 256 on SM100/SM103 (CuTeDSL >= 4.7) and
+12Q/1KV and 6Q/1KV (one KV head shared by twelve or six query heads) with head
+dimension 256 on SM100/SM103 (CuTeDSL >= 4.7) and
 SM107 (CuTeDSL >= 4.8 with native SM107 compiler support). The architecture
 coverage here applies to forward and general-selection backward; the stricter
 `causal_topk` backward has the requirements listed below.
@@ -25,15 +26,15 @@ LSE; casting the BF16 output back to FP32 is insufficient.
 
 | Tensor | Shape | Dtype |
 |---|---|---|
-| Q, output, grad_out, dQ | `[T, 12, 256]` | BF16 |
+| Q, output, grad_out, dQ | `[T, Hq, 256]` | BF16 |
 | K, V, dK, dV | `[T, 1, 256]` | BF16 |
 | indices | `[T, W]` | int32 |
-| out_fp32 | `[T, 12, 256]` | FP32 |
-| lse | `[12, T]` | FP32 |
+| out_fp32 | `[T, Hq, 256]` | FP32 |
+| lse | `[Hq, T]` | FP32 |
 
-All tensors are contiguous on one CUDA device. Data tensors require 16-byte
-alignment; indices and LSE require four-byte alignment. `T > 0` and
-`T * 12 * 256 <= INT32_MAX`. Scale is a finite host scalar.
+`Hq` is 12 or 6. All tensors are contiguous on one CUDA device. Data tensors
+require 16-byte alignment; indices and LSE require four-byte alignment. `T > 0`
+and `T * Hq * 256 <= INT32_MAX`. Scale is a finite host scalar.
 
 `W` is a positive multiple of four, at most 2052. Each four-slot group describes
 one distinct complete block: `[start, start+1, start+2, start+3]`, or four `-1`
@@ -51,8 +52,9 @@ padded explicitly by the caller; this API does not silently convert it. Empty
 rows produce zero output/gradients and negative-infinity LSE. Selection is not
 differentiated. Pass the same selection and scale to forward and backward.
 
-A GPU hash table compacts the selected starts. Backward unions adjacent queries'
-starts with owner bits, retaining each query's bounds and mask. Nonfinite K/V
+A GPU hash table compacts the selected starts. The 12Q/1KV backward unions
+adjacent queries' starts with owner bits, retaining each query's bounds and
+mask; the 6Q/1KV backward processes one query per CTA. Nonfinite K/V
 uses the device-side per-query fallback described in QSA ([docs](/operations/sparse_attention/qsa), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/sparse_attention/qsa.md)). Every call
 rebuilds metadata, including during CUDA Graph replay. Warm up before capture.
 
@@ -80,8 +82,9 @@ dq, dk, dv = qsa_indexed_backward(
 )
 ```
 
-`selection_mode="general"` remains the default. The new mode declares the
-following stricter input contract; it is never inferred from tensor shapes:
+`selection_mode="general"` remains the default. The new mode is available for
+12Q/1KV only (6Q/1KV uses `general`) and declares the following stricter input
+contract; it is never inferred from tensor shapes:
 
 - Q/K/V, grad_out and saved FP32 output are finite. LSE is finite and comes
   from forward with the same indices and scale. The general path's nonfinite

@@ -7,6 +7,17 @@ import math
 
 import torch
 
+# (query heads, KV heads) geometries the attention kernels serve: the full 24Q/2KV model and its 12Q/1KV (two-way) and
+# 6Q/1KV (four-way, KV head replicated) tensor-parallel shards.
+HEAD_GEOMETRIES = ((6, 1), (12, 1), (24, 2))
+# The paired backward (bprop_sm100 + bprop_dispatch) batches two queries into one 24-row MMA tile; it exists for 12Q/1KV
+# only. Every other geometry runs the single-query backward (bprop_sm100_base on SM100/SM103, bprop_sm107 on SM107).
+PAIRED_BACKWARD_HEADS = (12, 1)
+
+
+def paired_backward(hq, hkv):
+    return (hq, hkv) == PAIRED_BACKWARD_HEADS
+
 
 def check_tensor(name, tensor, shape, dtype, device, alignment=4):
     if not isinstance(tensor, torch.Tensor):
@@ -26,8 +37,8 @@ def check_inputs(q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_first, b
         raise ValueError("k must have shape [T, Hkv, 256]")
     total, hq, dim = q.shape
     hkv = k.shape[1]
-    if total < 1 or dim != 256 or (hq, hkv) not in ((12, 1), (24, 2)):
-        raise NotImplementedError("QSA requires T > 0, D = 256, and 12/1 or 24/2 query/KV heads")
+    if total < 1 or dim != 256 or (hq, hkv) not in HEAD_GEOMETRIES:
+        raise NotImplementedError("QSA requires T > 0, D = 256, and 6/1, 12/1 or 24/2 query/KV heads")
     if q.numel() > 2**31 - 1:
         raise NotImplementedError("QSA requires T * Hq * D <= INT32_MAX")
     if q.dtype != torch.bfloat16:

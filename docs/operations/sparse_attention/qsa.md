@@ -58,8 +58,8 @@ Choose an entry by its input and saved-state contract:
 
 | Need | Entry point | Contract |
 |---|---|---|
-| Packed training with a block-selection bitmap | `cudnn.ops.qsa_forward`, `qsa_backward` | The bitmap API documented on this page; 12Q/1KV or 24Q/2KV |
-| Packed training with selected token IDs | `cudnn.ops.qsa_indexed_forward`, `qsa_indexed_backward` ([docs](/operations/sparse_attention/qsa/qsa_indexed), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/sparse_attention/qsa_indexed.md)) | 12Q/1KV on SM100/SM103; shares the QSA attention kernels |
+| Packed training with a block-selection bitmap | `cudnn.ops.qsa_forward`, `qsa_backward` | The bitmap API documented on this page; 24Q/2KV, 12Q/1KV or 6Q/1KV |
+| Packed training with selected token IDs | `cudnn.ops.qsa_indexed_forward`, `qsa_indexed_backward` ([docs](/operations/sparse_attention/qsa/qsa_indexed), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/sparse_attention/qsa_indexed.md)) | 12Q/1KV or 6Q/1KV on SM100/SM103/SM107; shares the QSA attention kernels |
 | Generate selected blocks from indexer Q and compressed K | `cudnn.ops.qsa_select_forward`, `qsa_select_decode_forward` | QSA selector over the shared DSA scorer and top-k; returns local block IDs, not token IDs |
 | Decode selection over a paged compressed-key cache | `cudnn.ops.qsa_select_decode_paged_forward` | BF16 indexer cache; see the paged selector's architecture and layout requirements in its docstring |
 | Integrated projection, compression, selection and attention | `GatedAttentionBlockFwd` with `QsaSpec(index_source="indexer")` ([docs](/operations/Attention/gated_attention_block), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/attention/gated_attention_block.md)) | Use the integrated block's own architecture, layout and inference support matrix |
@@ -153,6 +153,8 @@ K/V gradient contributions from all query heads are summed. Floating-point
 atomic reductions can change low bits between runs.
 On Blackwell and Rubin, the 12:1 path pairs adjacent queries and gathers their selected
 block union. Owner bits retain each query's mask while sharing K/V loads.
+The 24:2 and 6:1 paths process one query per CTA; 6:1 fills six of the tile's
+sixteen head columns, so its per-token cost is close to 12:1's rather than half of it.
 A device-side K/V scan selects a per-query fallback when nonfinite values are
 present. The fallback reuses the compact union but applies each query's owner
 bits and bounds before dQ arithmetic, preventing a masked NaN from crossing
@@ -191,16 +193,17 @@ back to FP32 does not reconstruct `out_fp32`.
 
 ## Support and execution
 
-Supported geometry is BF16, head dimension 256, head counts 12Q/1KV or 24Q/2KV,
-and `block_size=4`. `T > 0`, `NB > 0`, and `T * Hq * 256 <= INT32_MAX` are required.
+Supported geometry is BF16, head dimension 256, head counts 24Q/2KV, 12Q/1KV or
+6Q/1KV (the full model and its two- and four-way tensor-parallel shards, the KV
+head replicated at four-way), and `block_size=4`. `T > 0`, `NB > 0`, and `T * Hq * 256 <= INT32_MAX` are required.
 `scale` is a finite host scalar, normally `1 / sqrt(256)`.
 
 The public functions select one of two architecture families internally:
 
 | Family | Forward kernel | Backward kernel |
 |---|---|---|
-| Blackwell SM100/SM103 | `cudnn_frost_qsa_fprop_sm100` | `cudnn_frost_qsa_bprop_sm100` |
-| Rubin SM107 | `cudnn_frost_qsa_fprop_sm107` | Paired `cudnn_frost_qsa_bprop_sm100` (12:1), `cudnn_frost_qsa_bprop_sm107` (24:2) |
+| Blackwell SM100/SM103 | `cudnn_frost_qsa_fprop_sm100` | `cudnn_frost_qsa_bprop_sm100` (paired for 12:1, single-query for 24:2 and 6:1) |
+| Rubin SM107 | `cudnn_frost_qsa_fprop_sm107` | Paired `cudnn_frost_qsa_bprop_sm100` (12:1), `cudnn_frost_qsa_bprop_sm107` (24:2, 6:1) |
 
 Kernel symbols are implementation details; Rubin kernels compile for SM107.
 Rubin compaction scans 16 selection bytes per lane and preserves block order.
