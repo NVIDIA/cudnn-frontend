@@ -1073,11 +1073,19 @@ def _emit_block_quant_row(
     return lines
 
 
-def _emit_reduction_avg_inverse(red_idx: int, red: ReductionSpec, chain: FusionChain) -> list[str]:
-    """Generate AVG normalization from runtime extents."""
+def _emit_reduction_avg_inverse(red_idx: int, red: ReductionSpec, chain: FusionChain, *, token_extent: str | None = None) -> list[str]:
+    """Generate AVG normalization from runtime extents.
+
+    A MoE kernel's token extent is the routed capacity, but its groups cover only the rows below the
+    final offset. ``token_extent`` names that used-row count for an ungrouped AVG over the token axis;
+    ``None`` divides by the capacity."""
     extents = ["M", "N"]
-    if chain.has_moe and red.grouped_by_moe:
-        extents[1 if isinstance(chain.moe, MoeSwapAbSpec) else 0] = "cutlass.Int32(group_end) - cutlass.Int32(group_begin)"
+    if chain.has_moe:
+        token_axis = 1 if isinstance(chain.moe, MoeSwapAbSpec) else 0
+        if red.grouped_by_moe:
+            extents[token_axis] = "cutlass.Int32(group_end) - cutlass.Int32(group_begin)"
+        elif token_extent is not None:
+            extents[token_axis] = token_extent
     factors = [f"cutlass.Float32({extent})" for dim, extent in zip(red.dim[1:], extents) if dim == 1]
     if not chain.has_moe and red.dim[0] == 1 and chain.matmul.batch != 1:
         factors.append(f"cutlass.Float32({float(chain.matmul.batch)})")

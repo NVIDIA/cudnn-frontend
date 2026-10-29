@@ -17,6 +17,7 @@ import torch
 
 from gemm_test_utils import (
     requires_sm100,
+    requires_sm120,
     requires_matmul_gpu,
     Plan as _plan,
     ceil_div as _ceil_div,
@@ -2806,6 +2807,94 @@ def test_moe_avg_fp32(grouped, axis):
         group_reduction=grouped,
         integer_inputs=True,
     )
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "block_scale,swap,gather",
+    [(False, False, False), (False, True, False), (False, False, True), (True, False, False), (True, True, False)],
+    ids=["plain", "plain_swap_ab", "plain_gather", "block_scale", "block_scale_swap_ab"],
+)
+def test_moe_avg_divides_by_used_rows_sm120(block_scale, swap, gather):
+    """An ungrouped AVG over the token axis averages the rows the groups cover,
+    first_token_offset[G], not the routed capacity (Token.shape[1], or
+    len(token_index) under GATHER): trailing routed rows are unused, and ADD/MAX and
+    the grouped AVG already leave them out. The scalar AVG flushes per-CTA partials,
+    the per-feature AVG adds per chunk."""
+    from cudnn.gemm.frost.fusion_ir import segmented_row_scale_capacity_rows
+    from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
+    from cudnn.gemm.frost.sm120 import compiler as C120
+    from test_moe_grouped_block_scale_matmul_fwd import _build_graph as build_bs
+
+    E, S, N, K, G = 2, 192, 128, 128, 4
+    rows = 64 if gather else S  # token rows; under GATHER, S is the routed capacity len(token_index)
+    F = cudnn.data_type.FLOAT
+    if block_scale:
+        graph = build_bs(E, S, N, K, G, combo="nvfp4", output_dt=F, offset_multiple=8)
+        _, binding = analyze_with_binding(graph)
+        token_t, weight_t, fto_t, out_t = binding.a_operands[0], binding.b_operands[0], binding.first_token_offset, binding.outputs[0]
+    else:
+        graph = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=F, compute_data_type=F)
+        token_t = graph.tensor(name="token", dim=[1, rows, K], stride=[rows * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
+        weight_t = graph.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
+        fto_t = graph.tensor(name="first_token_offset", dim=[G + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+        fto_t.set_alignment_value(8)
+        routing = {"mode": cudnn.moe_grouped_matmul_mode.NONE}
+        if gather:
+            index_t = graph.tensor(name="token_index", dim=[1, S, 1], stride=[S, 1, 1], data_type=cudnn.data_type.INT32)
+            routing = {"mode": cudnn.moe_grouped_matmul_mode.GATHER, "token_index": index_t}
+        out_t = graph.moe_grouped_matmul(token_t, weight_t, fto_t, compute_data_type=F, name="moe", **routing)
+        out_t.set_output(True).set_data_type(F)
+    reductions = []
+    for name, dims in (("avg_scalar", (1, 1, 1)), ("avg_feature", (1, 1, N))):
+        red = graph.reduction(input=out_t, mode=cudnn.reduction_mode.AVG, name=name, compute_data_type=F)
+        red.set_dim(list(dims)).set_stride([dims[1] * dims[2], dims[2], 1]).set_data_type(F).set_output(True)
+        reductions.append(red)
+    compiled = C120.jit_from_cudnn_graph(graph, config=replace(by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"), swap_ab=swap))
+
+    # Exact integer products that do not cancel across features: out[s, n] = K * x[s] * w[g % E, n].
+    x = (torch.arange(rows, device="cuda") % 3 + 1).float()
+    signs = torch.where(torch.arange(N, device="cuda") % 3 == 0, -1.0, 1.0)
+    w = torch.arange(1, E + 1, device="cuda").float()[:, None] * signs
+    vp = {}
+    if block_scale:
+        codes = torch.tensor([0, 2, 4, 5], device="cuda", dtype=torch.uint8)  # E2M1 codes of 0, 1, 2, 3
+        vp[token_t] = (codes[x.long()] * 17).view(1, S, 1).expand(1, S, K // 2).contiguous().view(torch.float4_e2m1fn_x2)
+        w_codes = codes[w.abs().long()] + (w < 0).to(torch.uint8) * 8
+        vp[weight_t] = (w_codes * 17)[:, :, None].expand(E, N, K // 2).contiguous().view(torch.float4_e2m1fn_x2)
+        vp[binding.sfa_operands[0]] = torch.ones((1, segmented_row_scale_capacity_rows(S, G), K // 16), device="cuda").to(torch.float8_e4m3fn)
+        vp[binding.sfb_operands[0]] = torch.ones((E, N, K // 16), device="cuda").to(torch.float8_e4m3fn)
+    else:
+        vp[token_t] = x.view(1, rows, 1).expand(1, rows, K).to(torch.bfloat16).contiguous()
+        vp[weight_t] = w[:, :, None].expand(E, N, K).to(torch.bfloat16).contiguous()
+    routed = x
+    if gather:
+        index = (torch.arange(S, device="cuda") * 5 % rows).to(torch.int32)
+        vp[index_t] = index.view(1, S, 1)
+        routed = x[index.long()]
+    out = torch.empty((1, S, N), device="cuda")
+    vp[out_t] = out
+    avg_scalar = torch.empty((1, 1, 1), device="cuda")
+    avg_feature = torch.empty((1, 1, N), device="cuda")
+    vp.update(zip(reductions, (avg_scalar, avg_feature)))
+    workspace = torch.empty(compiled.workspace_bytes, device="cuda", dtype=torch.uint8)
+    # One plan, several routings: below capacity, far below it, at capacity, and empty
+    # (nothing to average: the AVG outputs keep their zero seed instead of 0 * inf).
+    for starts in ([0, 32, 32, 96, 160], [0, 8, 8, 16, 24], [0, 32, 32, 96, S], [0] * (G + 1)):
+        vp[fto_t] = torch.tensor(starts, device="cuda", dtype=torch.int32)
+        for buf in (out, avg_scalar, avg_feature):
+            buf.fill_(-12345.0)
+        compiled(vp, workspace=workspace)
+        torch.cuda.synchronize()
+        used = starts[-1]
+        ref = torch.zeros((S, N), device="cuda")
+        for g in range(G):
+            ref[starts[g] : starts[g + 1]] = K * routed[starts[g] : starts[g + 1], None] * w[g % E]
+        torch.testing.assert_close(out[0, :used], ref[:used], atol=0, rtol=0)
+        expected_scalar = ref[:used].mean() if used else torch.zeros((), device="cuda")
+        expected_feature = ref[:used].mean(0) if used else torch.zeros(N, device="cuda")
+        torch.testing.assert_close(avg_scalar, expected_scalar.view(1, 1, 1), atol=1e-3, rtol=1e-5, msg=lambda m: f"scalar AVG, offsets {starts}: {m}")
+        torch.testing.assert_close(avg_feature, expected_feature.view(1, 1, N), atol=1e-3, rtol=1e-5, msg=lambda m: f"per-feature AVG, offsets {starts}: {m}")
 
 
 def test_moe_reduction_initialization_validates_all_outputs_before_writing():
