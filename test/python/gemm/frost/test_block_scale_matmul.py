@@ -3532,8 +3532,17 @@ def test_sm120_block_scale_ignores_k_padding_scales(combo, config_name, K, split
 @requires_sm120
 @pytest.mark.parametrize(
     "combo,config_name,S,M,N,K",
-    [("nvfp4", _SM120_BS_128, 5, 256, 256, 4096), ("mxfp8", _SM120_BS_128_W24, 3, 512, 384, 1088)],  # the second: 8.5 K-tiles over 3 slices
-    ids=("nvfp4-S5", "mxfp8-w24-ktail-S3"),
+    [
+        ("nvfp4", _SM120_BS_128, 5, 256, 256, 4096),
+        ("mxfp8", _SM120_BS_128_W24, 3, 512, 384, 1088),  # 8.5 K-tiles over 3 slices
+        # The RTX PRO 6000 Blackwell Server Edition plan for these shapes: its first pick,
+        # and for mxfp8 also the swap-AB plan third in the same shortlist. S >= 9 folds the
+        # slices with the reducer's four lane groups; 11 also leaves a three-slice tail.
+        ("nvfp4", _SM120_BS_128, 16, 128, 1024, 16384),
+        ("mxfp8", "CONFIG_sm120_64x64x128_16x16x32_cluster1x1_warps4x2", 11, 64, 1024, 16384),
+        ("mxfp8", "CONFIG_sm120_64x64x128_16x16x32_cluster1x1_warps4x2_swapAB", 11, 64, 1024, 16384),
+    ],
+    ids=("nvfp4-S5", "mxfp8-w24-ktail-S3", "nvfp4-S16", "mxfp8-64x64-S11", "mxfp8-64x64-swapAB-S11"),
 )
 def test_sm120_block_scale_matmul_splitk_numerics(combo, config_name, S, M, N, K):
     _run_bs_numeric(combo, config_name, M, N, K, split_k=S)
@@ -3543,6 +3552,57 @@ def test_sm120_block_scale_matmul_splitk_numerics(combo, config_name, S, M, N, K
 @pytest.mark.parametrize("combo", ["nvfp4", "mxfp8"])
 def test_sm120_block_scale_matmul_m_major_out(combo):
     _run_bs_numeric(combo, _SM120_BS_128, 256, 256, 512, out_major="m")
+
+
+@requires_sm120
+def test_sm120_block_scale_splitk_batched_row_aux():
+    """Split-K over three batches with a per-batch row aux. Grid z carries batch * S, so each
+    slice loads A, B and both scale factors of batch z // S, and the reducer applies that
+    batch's aux. A per-row aux keeps the graph out of the cost model; the power-of-two baseline
+    (_auto_split_k) picks S=16 on the 128x128 tile for this shape on an RTX PRO 6000."""
+    B, M, N, K, bs = 3, 128, 256, 8192, 16
+    dev = "cuda"
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[B, M, K], stride=[M * K, K, 1], data_type=cudnn.data_type.FP4_E2M1)
+    Bt = g.tensor(name="B", dim=[B, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.FP4_E2M1)
+    sf_kw = dict(data_type=cudnn.data_type.FP8_E4M3, reordering_type=cudnn.tensor_reordering.F8_128x4)
+    SFA = g.tensor(name="SFA", dim=[B, M, K // bs], stride=[M * K // bs, K // bs, 1], **sf_kw)
+    SFB = g.tensor(name="SFB", dim=[B, K // bs, N], stride=[K // bs * N, 1, K // bs], **sf_kw)
+    row_scale = g.tensor(name="row_scale", dim=[B, M, 1], stride=[M, 1, 1], data_type=cudnn.data_type.FLOAT)
+    Ad = g.block_scale_dequantize(input=A, descale=SFA, block_size=[1, bs])
+    Bd = g.block_scale_dequantize(input=Bt, descale=SFB, block_size=[bs, 1])
+    Y = g.mul(a=g.matmul(A=Ad, B=Bd, name="mm"), b=row_scale, name="rw")
+    # nvfp4 values times e4m3 scales in {1, 2, 3} sum exactly in fp32, so an fp32 output compares bit for bit.
+    Y.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    compiled = jit_from_cudnn_graph(g, config=by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2_splitK16"))
+    ws, _ws_buf = _splitk_workspace(compiled)
+
+    torch.manual_seed(0)
+    lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
+    a_u8 = torch.randint(0, 256, (B, M, K // 2), dtype=torch.uint8, device=dev)
+    b_u8 = torch.randint(0, 256, (B, N, K // 2), dtype=torch.uint8, device=dev)
+    sfa = torch.randint(1, 4, (B, M, K // bs), device=dev).to(torch.float8_e4m3fn)
+    sfb = torch.randint(1, 4, (B, N, K // bs), device=dev).to(torch.float8_e4m3fn)
+    # Differs from batch to batch, so a dropped batch stride shows.
+    rows = torch.arange(B * M, dtype=torch.float32, device=dev).reshape(B, M, 1) % 3 + 1
+    y = torch.full((B, M, N), float("nan"), device=dev)
+    compiled(
+        {
+            A: a_u8.view(torch.float4_e2m1fn_x2),
+            Bt: b_u8.view(torch.float4_e2m1fn_x2),
+            # One compact F8_128x4 plane per batch, back to back.
+            SFA: torch.stack([_to_blocked(sfa[i]) for i in range(B)]).view(B, M, -1),
+            SFB: torch.stack([_to_blocked(sfb[i]) for i in range(B)]).view(B, N, -1),
+            row_scale: rows,
+            Y: y,
+        },
+        workspace=ws,
+    )
+    torch.cuda.synchronize()
+    a_s = _unpack_fp4(a_u8, lut).view(B, M, K) * sfa.float().repeat_interleave(bs, 2)
+    b_s = _unpack_fp4(b_u8, lut).view(B, N, K) * sfb.float().repeat_interleave(bs, 2)
+    ref = torch.einsum("bmk,bnk->bmn", a_s, b_s) * rows
+    assert torch.equal(y, ref), f"{(y != ref).sum().item()}/{y.numel()} elements differ"
 
 
 @requires_sm120

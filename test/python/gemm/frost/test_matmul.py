@@ -26,6 +26,7 @@ from gemm_test_utils import (
     requires_matmul_gpu,
     skip_unless_pipeline_active as _skip_unless_active,
     requires_sm100,
+    requires_sm120,
     Plan as _plan,
     vp as _vp,
     resolve as _resolve,
@@ -4032,6 +4033,75 @@ def test_splitk_rejects_grid_z_overflow():
         _jit_splitk(g, 2)
 
 
+# The sm120 split-K plans the tests above never launch. On an RTX PRO 6000 Blackwell
+# Server Edition (188 SMs; the only sm120 device name planning.profile_for gives the
+# cost model) the automatic plan picks each config below for the shape beside it (the
+# cost model from 32 rows up, the power-of-two baseline under 32), while the tests above
+# run S in {2, 3, 6, 8} on the 128x128 warps4x2 tile only. S >= 9 folds the slices with
+# the reducer's four lane groups (splitk_reduce_slice_groups); 11, 15 and 19 also
+# leave a three-slice tail. A swap-AB plan reduces in the transposed kernel frame.
+_SM120_PLANNED_SPLITK = (
+    ("bf16", 64, 2048, 7168, "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2_splitK11"),
+    ("bf16", 128, 1024, 16384, "CONFIG_sm120_128x64x128_16x16x32_cluster1x1_warps4x2_splitK10"),
+    ("bf16", 64, 1024, 16384, "CONFIG_sm120_128x64x128_16x16x32_cluster1x1_warps4x2_splitK19_swapAB"),
+    ("bf16", 64, 2560, 8192, "CONFIG_sm120_128x64x128_16x16x32_cluster1x1_warps4x2_splitK8_swapAB"),
+    ("fp8_e4m3", 64, 1024, 16384, "CONFIG_sm120_64x128x128_16x16x32_cluster1x1_warps4x2_splitK15"),
+    ("bf16", 16, 1024, 16384, "CONFIG_sm120_32x64x128_16x16x32_cluster1x1_warps2x4_splitK8"),
+)
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    ("dtype", "M", "N", "K", "config_name"),
+    _SM120_PLANNED_SPLITK,
+    ids=("bf16-128x128-S11", "bf16-128x64-S10", "bf16-128x64-swapAB-S19", "bf16-128x64-swapAB-S8", "fp8-64x128-S15", "bf16-32x64-S8"),
+)
+def test_sm120_splitk_planned_configs(dtype, M, N, K, config_name):
+    """Each split-K config the RTX PRO 6000 Blackwell Server Edition plan picks matches torch bit for bit."""
+    from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
+
+    g, A, Bt, C = _splitk_graph(1, M, N, K, io_dt=_CUDNN_DTYPE[dtype])
+    compiled = jit_from_cudnn_graph(g, by_name(config_name))
+    a, b, out, ref = _splitk_data(1, M, N, K, torch_in=_TORCH_DTYPE[dtype])
+    out.fill_(float("nan"))
+    _run_splitk(compiled, {A: a, Bt: b, C: out})
+    assert torch.equal(out, ref), f"{(out != ref).sum().item()}/{out.numel()} elements differ"
+
+
+@requires_sm120
+def test_sm120_splitk_batched_aux_and_row_sum():
+    """A per-batch row aux, a 3-D aux and a per-row fp32 sum, applied once to each batch's reduced sum.
+
+    Per-row and 3-D aux operands and reductions keep a graph out of the cost model, so its split
+    comes from the power-of-two baseline (_auto_split_k): on an RTX PRO 6000 that is this config
+    for this shape, S=16 over the 32x64 tile, which takes the reducer's four lane groups."""
+    from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
+
+    B, M, N, K = 3, 32, 128, 16384
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[B, M, K], stride=[M * K, K, 1])
+    Bt = g.tensor(name="B", dim=[B, K, N], stride=[K * N, 1, K])
+    r = g.tensor(name="r", dim=[B, M, 1], stride=[M, 1, 1], data_type=cudnn.data_type.FLOAT)
+    x = g.tensor(name="x", dim=[B, M, N], stride=[M * N, N, 1], data_type=cudnn.data_type.FLOAT)
+    Y = g.mul(a=g.mul(a=g.matmul(A=A, B=Bt, name="mm"), b=r, name="rw"), b=x, name="ew")
+    # An fp32 output keeps every value and every row sum an exact integer.
+    Y.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    row_sum = g.reduction(input=Y, mode=cudnn.reduction_mode.ADD, name="rs")
+    row_sum.set_dim([B, M, 1]).set_stride([M, 1, 1])
+    row_sum.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    compiled = jit_from_cudnn_graph(g, by_name("CONFIG_sm120_32x64x128_16x16x32_cluster1x1_warps2x4_splitK16"))
+    a, b, _, mm = _splitk_data(B, M, N, K, torch_out=torch.float32)
+    # Both aux patterns differ from batch to batch, so a dropped batch stride shows.
+    rows = torch.arange(B * M, dtype=torch.float32, device="cuda").reshape(B, M, 1) % 3 + 1
+    elems = torch.arange(B * M * N, dtype=torch.float32, device="cuda").reshape(B, M, N) % 7 - 3
+    y = torch.full((B, M, N), float("nan"), device="cuda")
+    s = torch.full((B, M, 1), float("nan"), device="cuda")
+    _run_splitk(compiled, {A: a, Bt: b, r: rows, x: elems, Y: y, row_sum: s})
+    ref = mm * rows * elems
+    assert torch.equal(y, ref), f"{(y != ref).sum().item()}/{y.numel()} elements differ"
+    assert torch.equal(s, ref.sum(dim=2, keepdim=True))
+
+
 def _run_splitk_vs_dense(g, S, M, N, K, outs_fn, aux_fn=lambda p: []):
     """Same graph built dense (S=1) and split (S): every output must match bit
     for bit, since small-integer data keeps the partial sums exact."""
@@ -4056,8 +4126,6 @@ def _run_splitk_vs_dense(g, S, M, N, K, outs_fn, aux_fn=lambda p: []):
 )
 def test_splitk_epilogue_fusion(kind, N, S):
     """The graph's epilogue runs once on the reduced sum for either backend."""
-    if kind == "row_aux" and _current_arch() == 120:
-        pytest.skip("the dense sm120 template hoists per-row aux loads before `row` is defined (no S=1 reference)")
     M, K = 256, 4096
     _run_splitk_vs_dense(_straddle_graph(kind, M, N, K), S, M, N, K, lambda p: _straddle_outs(p, M, N), lambda p: _straddle_aux(p, M, N))
 
