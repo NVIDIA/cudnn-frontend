@@ -63,12 +63,19 @@ def row_max_reduction(vec):
     return elems[0]
 
 
-def row_reduction_pair(vec):
+def row_reduction_pair(vec, balanced=False):
+    """Sum even/odd lanes; optionally shorten dependencies with a pairwise tree."""
     n = int(vec.shape[0])
     assert n % 2 == 0, f"row_reduction_pair: N={n} must be even"
     half = n // 2
     paired_ty = _ir.VectorType.get([half, 2], T_.f32())
     paired = vector.shape_cast(paired_ty, vec.ir_value())
+
+    if balanced:
+        nodes = [vector.extract(paired, dynamic_position=[], static_position=[i]) for i in range(half)]
+        while len(nodes) > 1:
+            nodes = [arith.addf(nodes[i], nodes[i + 1]) if i + 1 < len(nodes) else nodes[i] for i in range(0, len(nodes), 2)]
+        return cutlass.Vector(nodes[0], dtype=cutlass.Float32)
 
     acc = vector.extract(paired, dynamic_position=[], static_position=[0])
     for i in range(1, half):
