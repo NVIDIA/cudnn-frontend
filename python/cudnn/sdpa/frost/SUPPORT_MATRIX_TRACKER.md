@@ -3282,7 +3282,7 @@ of the warp reduction boundary. No timing or preferred split count is asserted.
 
 ### Rubin d256 gated attention block -- serving forms (frontend-only, no graph form)
 
-The gated attention block (`cudnn.gated_attention_block`; `docs/fe-oss-apis/gated_attention_block.md`) has no engine row and no
+The gated attention block (`cudnn.gated_attention_block`; `docs/operations/attention/gated_attention_block.md`) has no engine row and no
 `sdpa` graph form: its serving forms are claims of the BLOCK, recorded here one row per form x pool layout x page size x dtype,
 each written in the same change as its accept cell (Rule S2). Rubin (cc 10.7) only. The pool contract is the SDPA adapter's own
 paged contract -- a 4-D view `[num_pages, H_kv, page_size, D]`, `D` contiguous, the other three strides free: **L1** HND compact

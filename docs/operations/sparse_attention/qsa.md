@@ -59,10 +59,10 @@ Choose an entry by its input and saved-state contract:
 | Need | Entry point | Contract |
 |---|---|---|
 | Packed training with a block-selection bitmap | `cudnn.ops.qsa_forward`, `qsa_backward` | The bitmap API documented on this page; 12Q/1KV or 24Q/2KV |
-| Packed training with selected token IDs | [`cudnn.ops.qsa_indexed_forward`, `qsa_indexed_backward`](qsa_indexed.md) | 12Q/1KV on SM100/SM103; shares the QSA attention kernels |
+| Packed training with selected token IDs | [`cudnn.ops.qsa_indexed_forward`, `qsa_indexed_backward`](/operations/sparse_attention/qsa/qsa_indexed) | 12Q/1KV on SM100/SM103; shares the QSA attention kernels |
 | Generate selected blocks from indexer Q and compressed K | `cudnn.ops.qsa_select_forward`, `qsa_select_decode_forward` | QSA selector over the shared DSA scorer and top-k; returns local block IDs, not token IDs |
 | Decode selection over a paged compressed-key cache | `cudnn.ops.qsa_select_decode_paged_forward` | BF16 indexer cache; see the paged selector's architecture and layout requirements in its docstring |
-| Integrated projection, compression, selection and attention | [`GatedAttentionBlockFwd` with `QsaSpec(index_source="indexer")`](gated_attention_block.md) | Use the integrated block's own architecture, layout and inference support matrix |
+| Integrated projection, compression, selection and attention | [`GatedAttentionBlockFwd` with `QsaSpec(index_source="indexer")`](/operations/Attention/gated_attention_block) | Use the integrated block's own architecture, layout and inference support matrix |
 
 **Indexed attention consumes indices; the indexer generates them.** The indexed
 training calls do not run scoring or top-k. The selector's local block IDs need
@@ -83,12 +83,12 @@ visibility and tail handling remain part of the QSA contract; this reuse does
 not make QSA and DeepSeek attention interchangeable. Numerical rounding and
 top-k tie rules must also be checked before replacing an external selector.
 
-The [internal two-pass backend](qsa_two_pass.md) has a different
+The [internal two-pass backend](/operations/sparse_attention/qsa/qsa_two_pass) has a different
 saved-state and selection contract: 12Q/1KV or 24Q/2KV, canonical block lists,
 optional packed `cu_seqlens`, and native FP32 saved output / `[Hq, T]` LSE
 (or the earlier BF16 saved output / `[T, Hq]` LSE pair). For 12Q/1KV, the public
 `qsa_indexed_backward(..., selection_mode="causal_topk")` selects this backend
-when the caller declares the stricter [complete-block and causal-tail contract](qsa_indexed.md#complete-blocks-and-causal-tails).
+when the caller declares the stricter [complete-block and causal-tail contract](/operations/sparse_attention/qsa/qsa_indexed#complete-blocks-and-causal-tails).
 The default indexed and bitmap calls retain their general selection contracts.
 The implementation remains under `cudnn.QSA`; no public op class or
 algorithm-specific entry is added.

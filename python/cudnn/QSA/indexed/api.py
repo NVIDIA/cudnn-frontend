@@ -186,7 +186,7 @@ def qsa_indexed_backward(grad_out, q, k, v, out_fp32, lse, indices, scale=1 / 16
 
     ``general`` preserves arbitrary group ordering, padding holes and empty rows.
     ``causal_topk`` declares the finite-input, top-512 complete four-token blocks
-    plus causal-tail contract described in ``docs/fe-oss-apis/qsa_indexed.md``.
+    plus causal-tail contract described in ``docs/operations/sparse_attention/qsa_indexed.md``.
     Its packed form requires device int32 ``cu_seqlens``; ``max_seq_len`` is an
     optional host upper bound. Values stay on the device and are caller contracts.
     """

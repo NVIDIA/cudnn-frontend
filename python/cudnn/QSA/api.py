@@ -87,7 +87,7 @@ def qsa_forward(
     """Return ``(out, out_fp32, lse)`` for packed THD QSA.
 
     Selection and inclusive token bounds follow Miles. Block spans and bases must
-    describe the same packed sequences. See ``docs/fe-oss-apis/qsa.md``.
+    describe the same packed sequences. See ``docs/operations/sparse_attention/qsa.md``.
     """
     total, hq, hkv, _ = check_inputs(q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_first, block_last, scale, block_size)
     with torch.cuda.device(q.device):

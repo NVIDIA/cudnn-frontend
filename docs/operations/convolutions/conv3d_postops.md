@@ -268,6 +268,6 @@ python benchmark/e2e/Wan2.2-VAE/run_model.py \
     --model /path/to/Wan-AI/Wan2.2-TI2V-5B-Diffusers
 ```
 
-See the [e2e README](../../benchmark/e2e/Wan2.2-VAE/README.md) and
-[dependencies](../../benchmark/e2e/Wan2.2-VAE/requirements.txt).
+See the [e2e README](../../../benchmark/e2e/Wan2.2-VAE/README.md) and
+[dependencies](../../../benchmark/e2e/Wan2.2-VAE/requirements.txt).
 Use `--help` for defaults or `--check-only` for correctness without timing.

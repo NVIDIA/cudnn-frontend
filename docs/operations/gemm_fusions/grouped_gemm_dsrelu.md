@@ -60,7 +60,7 @@ $$
 #### Tanh soft clamp (`tanh_clamp_scale`)
 
 `tanh_clamp_scale=s` differentiates the soft-clamped forward epilogue
-(see [grouped_gemm_srelu](grouped_gemm_srelu.md)) instead of the plain one. Writing
+(see [grouped_gemm_srelu](/operations/Matmul/gemm_fusions/grouped_gemm_srelu)) instead of the plain one. Writing
 $t = \tanh(\mathrm{relu}(G)/s)$ and $b = s\,t$, both equations keep their shape with
 $\mathrm{relu}(G)$ replaced by $b$, and the row output picks up the chain-rule factor
 $1 - t^2$:

@@ -43,7 +43,7 @@ compilation. Each backend's argument contract is described below.
 SiTU-GLU is not available on the BF16 or Rubin backends.
 The block-scaled GeGLU forward path supports runtime activation alpha, clamp
 limits, and linear offset on both Blackwell and Rubin. The corresponding
-[dGeGLU backward path](grouped_gemm_dglu.md) supports the same activation
+[dGeGLU backward path](/operations/Matmul/gemm_fusions/grouped_gemm_dglu) supports the same activation
 configuration, with the parameter values included in the backward compiled-kernel
 cache key.
 

@@ -145,7 +145,7 @@ remain alive and unchanged until that stream completes.
 Class-API `execute()` requires `workspace=`, a caller-owned, contiguous,
 128-byte-aligned device buffer of at least `op.scratch_workspace_bytes()` bytes
 (never 0); the API allocates nothing and the wrapper allocates it per call on the
-launch stream. See the workspace contract in [grouped_gemm.md](grouped_gemm.md).
+launch stream. See the workspace contract in [grouped_gemm.md](/operations/Matmul/gemm_fusions/grouped_gemm).
 The carved scratch byte range must not overlap any live operand. Direct buffer
 spans (including packed uint8 FP4 storage and pointer tables) are checked using
 host metadata before launch. Disjoint views of one allocation are allowed.

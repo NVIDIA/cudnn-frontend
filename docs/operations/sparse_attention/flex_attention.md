@@ -286,7 +286,7 @@ linked above measures the current Flex Attention implementation only.
 
 ## Design documentation
 
-[Flex Attention Mask Plan Design](flex_attention_design.md) describes interval
+[Flex Attention Mask Plan Design](/operations/sparse_attention/flex_attention/flex_attention_design) describes interval
 coordinates, planner stages, partial/full CSR topology, consumer-specific
 packed predicates, forward/backward consumption, and plan compatibility and
 ownership.

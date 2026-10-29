@@ -20,7 +20,7 @@ scan them or read device values back to the host.
 
 The arithmetic follows the [DeepSeek-V4.1 inference reference](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/inference/model.py).
 The vectorized kernel is a cuDNN Frontend implementation. This operation performs
-no quantization, table gathering, or KV-cache packing. See [RoPE QDQ](rope_qdq.md)
+no quantization, table gathering, or KV-cache packing. See [RoPE QDQ](/operations/RoPE/rope-qdq)
 for the separate quantization operations.
 
 ## Convenience wrapper

@@ -8,7 +8,7 @@ the CUDA 12 flavor is rejected before its known compiler crash. The 24Q/2KV
 path also supports the CUDA 12 flavor.
 It supports one sequence or packed documents described by int32 `cu_seqlens`
 and a host upper bound `max_seq_len`. For the public packed training interface,
-use [indexed QSA](qsa_indexed.md). These are implementation notes,
+use [indexed QSA](/operations/sparse_attention/qsa/qsa_indexed). These are implementation notes,
 not a public API. The public `qsa_indexed_backward` selects this backend for
 12Q/1KV when the caller explicitly declares `selection_mode="causal_topk"`.
 
@@ -59,5 +59,5 @@ workspace. Execution checks current tensor layouts and storage; it does not
 allocate or read indices to the host. The backend's regressions exercise dense
 and sparse crossovers, changed-input replay and explicit stream handling.
 
-See [all QSA entry points](qsa.md#finding-qsa-attention-and-its-indexer) for
+See [all QSA entry points](/operations/sparse_attention/qsa#finding-qsa-attention-and-its-indexer) for
 selection and the other attention contracts.

@@ -8,7 +8,7 @@ The docs here describe installation and the graph-oriented frontend APIs (Python
 
 | Area | Path | Contents |
 |------|------|----------|
-| Pages | `*.mdx`, `**/*.md` | Landing page, quick start, samples, installation, developer guide, frontend API reference (`operations/`, `utilities/`, `fe-oss-apis/`), reference material |
+| Pages | `*.mdx`, `**/*.md` | Landing page, quick start, samples, installation, developer guide, frontend API reference (`operations/`, `utilities/`), reference material |
 | Images | `images/` | Figures referenced from pages (stored in Git LFS) |
 | Fern config | `fern/` | `fern.config.json`, `docs.yml` (site settings, redirects), `versions/latest.yml` (left navigation) |
 
@@ -21,9 +21,8 @@ docs/
   samples.mdx
   installation/*.mdx
   developer/*.mdx
-  operations/*.md
+  operations/**/*.md
   utilities/*.md
-  fe-oss-apis/**/*.md
   reference/*.mdx
   images/
   fern/

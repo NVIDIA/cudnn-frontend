@@ -14,48 +14,229 @@ navigation:
   - section: API Reference
     skip-slug: true
     contents:
-      - page: Attention
+      - page: Operations Overview
+        path: ../../operations/overview.md
+        slug: operations/overview
+      - page: Python API Naming Conventions
+        path: ../../operations/api_conventions.md
+        slug: operations/api_conventions
+      - section: Attention
         path: ../../operations/Attention.md
         slug: operations/Attention
-      - page: Block Scaling
+        contents:
+          - page: Gated Attention Block (SM107)
+            path: ../../operations/attention/gated_attention_block.md
+            slug: gated_attention_block
+          - page: Triangle Attention (SM107)
+            path: ../../operations/attention/triangle_attention.md
+            slug: triangle_attention
+          - page: Compact GQA backward (SM107)
+            path: ../../operations/attention/compact_gqa_backward.md
+            slug: compact_gqa_backward
+          - page: NVFP4 Attention QAT Backward
+            path: ../../operations/attention/nvfp4_attention_qat_backward.md
+            slug: nvfp4_attention_qat_backward
+          - page: SDPA Backward (SM100/SM103, d = 128)
+            path: ../../operations/attention/sdpa_bwd_sm100_d128.md
+            slug: sdpa_bwd_sm100_d128
+          - page: SDPA Backward (SM107, d = 256–512)
+            path: ../../operations/attention/sdpa_bwd_sm107.md
+            slug: sdpa_bwd_sm107
+          - page: SDPA Backward (SM120)
+            path: ../../operations/attention/sdpa_bwd_sm120.md
+            slug: sdpa_bwd_sm120
+      - section: Sparse Attention
+        path: ../../operations/sparse_attention/overview.md
+        slug: operations/sparse_attention
+        contents:
+          - page: Native Sparse Attention (NSA)
+            path: ../../operations/sparse_attention/nsa.md
+            slug: nsa
+          - page: DeepSeek Sparse Attention (DSA)
+            path: ../../operations/sparse_attention/dsa.md
+            slug: dsa
+          - section: Query Sparse Attention (QSA)
+            path: ../../operations/sparse_attention/qsa.md
+            slug: qsa
+            contents:
+              - page: Indexed QSA training
+                path: ../../operations/sparse_attention/qsa_indexed.md
+                slug: qsa_indexed
+              - page: QSA two-pass backend implementation notes
+                path: ../../operations/sparse_attention/qsa_two_pass.md
+                slug: qsa_two_pass
+          - page: HSTU Attention (Blackwell SM100/SM103)
+            path: ../../operations/sparse_attention/hstu_attention.md
+            slug: hstu_attention
+          - page: Block Sparse Attention (BSA)
+            path: ../../operations/sparse_attention/bsa.md
+            slug: bsa
+          - section: CSA Fused Compressor
+            path: ../../operations/sparse_attention/csa.md
+            slug: csa
+            contents:
+              - page: Aligned HCA Backward
+                path: ../../operations/sparse_attention/aligned_hca_backward.md
+                slug: aligned_hca_backward
+          - section: Flex Attention
+            path: ../../operations/sparse_attention/flex_attention.md
+            slug: flex_attention
+            contents:
+              - page: Flex Attention Mask Plan Design
+                path: ../../operations/sparse_attention/flex_attention_design.md
+                slug: flex_attention_design
+      - section: Block Scaling
         path: ../../operations/BlockScaling.md
         slug: operations/BlockScaling
-      - page: Causal Conv1d
+        contents:
+          - page: NVFP4 block-scale conversion
+            path: ../../operations/block_scaling/nvfp4_block_scale_conversion.md
+            slug: nvfp4_block_scale_conversion
+      - section: Causal Conv1d
         path: ../../operations/CausalConv1d.md
         slug: operations/CausalConv1d
+        contents:
+          - page: Causal Conv1d Python API
+            path: ../../operations/causal_conv1d/causal_conv1d.md
+            slug: causal_conv1d
+          - page: Causal Conv1d Decode Update
+            path: ../../operations/causal_conv1d/causal_conv1d_update.md
+            slug: causal_conv1d_update
       - page: Concatenate
         path: ../../operations/Concatenate.md
         slug: operations/Concatenate
-      - page: Convolutions
+      - section: Convolutions
         path: ../../operations/Convolutions.md
         slug: operations/Convolutions
+        contents:
+          - page: Fused Conv3D + Bias + Residual + RMSNorm + SiLU
+            path: ../../operations/convolutions/conv3d_postops.md
+            slug: conv3d_postops
       - page: FFT Causal Conv1d
         path: ../../operations/FFTCausalConv1d.md
         slug: operations/FFTCausalConv1d
-      - page: Linear Attention
+      - section: Linear Attention
         path: ../../operations/LinearAttention.md
         slug: operations/LinearAttention
-      - page: Matmul
+        contents:
+          - page: FLA Integration Shims
+            path: ../../operations/linear_attention/fla.md
+            slug: fla
+          - page: Kimi Delta Attention in JAX
+            path: ../../operations/linear_attention/kda_jax.md
+            slug: kda_jax
+      - section: Matmul
         path: ../../operations/Matmul.md
         slug: operations/Matmul
+        contents:
+          - section: GEMM Fusions
+            slug: gemm_fusions
+            contents:
+              - page: Discrete Grouped GEMM + dSwiGLU (SM100)
+                path: ../../operations/gemm_fusions/discrete_grouped_gemm_dswiglu.md
+                slug: discrete_grouped_gemm_dswiglu
+              - page: Discrete Grouped GEMM + SwiGLU (SM100)
+                path: ../../operations/gemm_fusions/discrete_grouped_gemm_swiglu.md
+                slug: discrete_grouped_gemm_swiglu
+              - page: GEMM + Amax (SM100)
+                path: ../../operations/gemm_fusions/gemm_amax.md
+                slug: gemm_amax
+              - page: GEMM + dsReLU (SM100)
+                path: ../../operations/gemm_fusions/gemm_dsrelu.md
+                slug: gemm_dsrelu
+              - page: GEMM + RoPE + MXFP8 Projection (SM100)
+                path: ../../operations/gemm_fusions/gemm_proj_rope_mxfp8.md
+                slug: gemm_proj_rope_mxfp8
+              - page: GEMM + sReLU (SM100)
+                path: ../../operations/gemm_fusions/gemm_srelu.md
+                slug: gemm_srelu
+              - page: GEMM + SwiGLU (SM100)
+                path: ../../operations/gemm_fusions/gemm_swiglu.md
+                slug: gemm_swiglu
+              - page: Grouped GEMM (SM100 BF16)
+                path: ../../operations/gemm_fusions/grouped_gemm.md
+                slug: grouped_gemm
+              - page: Grouped GEMM + dGLU (SM100)
+                path: ../../operations/gemm_fusions/grouped_gemm_dglu.md
+                slug: grouped_gemm_dglu
+              - page: Grouped GEMM + dsReLU (SM100)
+                path: ../../operations/gemm_fusions/grouped_gemm_dsrelu.md
+                slug: grouped_gemm_dsrelu
+              - page: Grouped GEMM + dSwiGLU (SM100)
+                path: ../../operations/gemm_fusions/grouped_gemm_dswiglu.md
+                slug: grouped_gemm_dswiglu
+              - page: Grouped GEMM + GLU (SM100)
+                path: ../../operations/gemm_fusions/grouped_gemm_glu.md
+                slug: grouped_gemm_glu
+              - page: Grouped GEMM + GLU + Hadamard (SM100)
+                path: ../../operations/gemm_fusions/grouped_gemm_glu_hadamard.md
+                slug: grouped_gemm_glu_hadamard
+              - page: Grouped GEMM + GLU + Hadamard + Quant (SM100)
+                path: ../../operations/gemm_fusions/grouped_gemm_glu_hadamard_quant.md
+                slug: grouped_gemm_glu_hadamard_quant
+              - page: Grouped GEMM + Quant (SM100)
+                path: ../../operations/gemm_fusions/grouped_gemm_quant.md
+                slug: grouped_gemm_quant
+              - page: Grouped GEMM + Quant -- Unified (SM100)
+                path: ../../operations/gemm_fusions/grouped_gemm_quant_unified.md
+                slug: grouped_gemm_quant_unified
+              - page: Grouped GEMM + sReLU (SM100)
+                path: ../../operations/gemm_fusions/grouped_gemm_srelu.md
+                slug: grouped_gemm_srelu
+              - page: Grouped GEMM + SwiGLU (SM100)
+                path: ../../operations/gemm_fusions/grouped_gemm_swiglu.md
+                slug: grouped_gemm_swiglu
+              - page: Grouped GEMM + WGrad (Unified)
+                path: ../../operations/gemm_fusions/grouped_gemm_wgrad.md
+                slug: grouped_gemm_wgrad
+              - page: DSv4.1 mHC Projection/RMS Backward (SM100)
+                path: ../../operations/gemm_fusions/mhc_projection_bwd.md
+                slug: mhc_projection_bwd
+          - page: Triangle Multiplicative Update
+            path: ../../operations/matmul/triangle_multiplicative_update.md
+            slug: triangle_multiplicative_update
       - page: MoE Grouped Matmul
         path: ../../operations/MoeGroupedMatmul.md
         slug: operations/MoeGroupedMatmul
-      - page: Normalizations
+      - section: Normalizations
         path: ../../operations/Normalizations.md
         slug: operations/Normalizations
-      - page: Pointwise and Reduction
+        contents:
+          - page: RMSNorm + RHT + Amax (SM100)
+            path: ../../operations/normalizations/rmsnorm_rht_amax.md
+            slug: rmsnorm_rht_amax
+          - page: Fused RMSNorm + SiLU
+            path: ../../operations/normalizations/rmsnorm_silu.md
+            slug: rmsnorm_silu
+          - page: HSTU LayerNorm-Multiply-SiLU-Dropout (LMSD)
+            path: ../../operations/normalizations/hstu_lmsd.md
+            slug: hstu_lmsd
+      - section: Pointwise and Reduction
         path: ../../operations/Pointwise.md
         slug: operations/Pointwise
+        contents:
+          - page: Engram Saved-State Gate
+            path: ../../operations/pointwise/engram_saved_gate.md
+            slug: engram_saved_gate
       - page: Resampling
         path: ../../operations/Resampling.md
         slug: operations/Resampling
       - page: Reshape
         path: ../../operations/Reshape.md
         slug: operations/Reshape
-      - page: RoPE (Rotary Position Embedding)
+      - section: RoPE (Rotary Position Embedding)
         path: ../../operations/RoPE.md
         slug: operations/RoPE
+        contents:
+          - page: Tail RoPE + Microscaled QDQ
+            path: ../../operations/rope/rope_qdq.md
+            slug: rope-qdq
+          - page: Prepared BF16 Tail RoPE
+            path: ../../operations/rope/rope_tail.md
+            slug: rope-tail
+          - page: DSv4.1 Vision RoPE Backward
+            path: ../../operations/rope/vision_rope_backward.md
+            slug: vision_rope_backward
       - page: Slice
         path: ../../operations/Slice.md
         slug: operations/Slice
@@ -104,145 +285,6 @@ navigation:
           - page: Composing multi-kernel blocks in Python
             path: ../../utilities/composing_kernel_blocks.md
             slug: composing_kernel_blocks
-      - section: Experimental APIs
-        collapsed: true
-        slug: fe-oss-apis
-        contents:
-          - page: FE-OSS APIs Overview
-            path: ../../fe-oss-apis/overview.md
-            slug: overview
-          - page: Python API Naming Conventions
-            path: ../../fe-oss-apis/api_conventions.md
-            slug: api_conventions
-          - page: Block Sparse Attention (BSA)
-            path: ../../fe-oss-apis/bsa.md
-            slug: bsa
-          - page: Causal Conv1d
-            path: ../../fe-oss-apis/causal_conv1d.md
-            slug: causal_conv1d
-          - page: Causal Conv1d Decode Update
-            path: ../../fe-oss-apis/causal_conv1d_update.md
-            slug: causal_conv1d_update
-          - page: CSA Fused Compressor
-            path: ../../fe-oss-apis/csa.md
-            slug: csa
-          - page: Tail RoPE + Microscaled QDQ
-            path: ../../fe-oss-apis/rope_qdq.md
-            slug: rope-qdq
-          - page: Prepared BF16 Tail RoPE
-            path: ../../fe-oss-apis/rope_tail.md
-            slug: rope-tail
-          - page: DeepSeek Sparse Attention (DSA)
-            path: ../../fe-oss-apis/dsa.md
-            slug: dsa
-          - page: Engram Saved-State Gate
-            path: ../../fe-oss-apis/engram_saved_gate.md
-            slug: engram_saved_gate
-          - page: FLA Integration Shims
-            path: ../../fe-oss-apis/fla.md
-            slug: fla
-          - page: Gated Attention Block (SM107)
-            path: ../../fe-oss-apis/gated_attention_block.md
-            slug: gated_attention_block
-          - page: Native Sparse Attention (NSA)
-            path: ../../fe-oss-apis/nsa.md
-            slug: nsa
-          - page: RMSNorm + RHT + Amax (SM100)
-            path: ../../fe-oss-apis/rmsnorm_rht_amax.md
-            slug: rmsnorm_rht_amax
-          - page: Fused RMSNorm + SiLU
-            path: ../../fe-oss-apis/rmsnorm_silu.md
-            slug: rmsnorm_silu
-          - page: Fused Conv3D + Bias + Residual + RMSNorm + SiLU
-            path: ../../fe-oss-apis/conv3d_postops.md
-            slug: conv3d_postops
-          - section: Attention (FE-OSS)
-            slug: attention
-            contents:
-              - page: Flex Attention
-                path: ../../fe-oss-apis/attention/flex_attention.md
-                slug: flex_attention
-              - page: Flex Attention Mask Plan Design
-                path: ../../fe-oss-apis/attention/flex_attention_design.md
-                slug: flex_attention_design
-              - page: NVFP4 Attention QAT Backward
-                path: ../../fe-oss-apis/attention/nvfp4_attention_qat_backward.md
-                slug: nvfp4_attention_qat_backward
-              - page: SDPA Backward (SM120)
-                path: ../../fe-oss-apis/attention/sdpa_bwd_sm120.md
-                slug: sdpa_bwd_sm120
-          - section: GEMM Fusions
-            slug: gemm_fusions
-            contents:
-              - page: Discrete Grouped GEMM + dSwiGLU (SM100)
-                path: ../../fe-oss-apis/gemm_fusions/discrete_grouped_gemm_dswiglu.md
-                slug: discrete_grouped_gemm_dswiglu
-              - page: Discrete Grouped GEMM + SwiGLU (SM100)
-                path: ../../fe-oss-apis/gemm_fusions/discrete_grouped_gemm_swiglu.md
-                slug: discrete_grouped_gemm_swiglu
-              - page: GEMM + Amax (SM100)
-                path: ../../fe-oss-apis/gemm_fusions/gemm_amax.md
-                slug: gemm_amax
-              - page: GEMM + dsReLU (SM100)
-                path: ../../fe-oss-apis/gemm_fusions/gemm_dsrelu.md
-                slug: gemm_dsrelu
-              - page: GEMM + RoPE + MXFP8 Projection (SM100)
-                path: ../../fe-oss-apis/gemm_fusions/gemm_proj_rope_mxfp8.md
-                slug: gemm_proj_rope_mxfp8
-              - page: GEMM + sReLU (SM100)
-                path: ../../fe-oss-apis/gemm_fusions/gemm_srelu.md
-                slug: gemm_srelu
-              - page: GEMM + SwiGLU (SM100)
-                path: ../../fe-oss-apis/gemm_fusions/gemm_swiglu.md
-                slug: gemm_swiglu
-              - page: Grouped GEMM (SM100 BF16)
-                path: ../../fe-oss-apis/gemm_fusions/grouped_gemm.md
-                slug: grouped_gemm
-              - page: Grouped GEMM + dGLU (SM100)
-                path: ../../fe-oss-apis/gemm_fusions/grouped_gemm_dglu.md
-                slug: grouped_gemm_dglu
-              - page: Grouped GEMM + dsReLU (SM100)
-                path: ../../fe-oss-apis/gemm_fusions/grouped_gemm_dsrelu.md
-                slug: grouped_gemm_dsrelu
-              - page: Grouped GEMM + dSwiGLU (SM100)
-                path: ../../fe-oss-apis/gemm_fusions/grouped_gemm_dswiglu.md
-                slug: grouped_gemm_dswiglu
-              - page: Grouped GEMM + GLU (SM100)
-                path: ../../fe-oss-apis/gemm_fusions/grouped_gemm_glu.md
-                slug: grouped_gemm_glu
-              - page: Grouped GEMM + GLU + Hadamard (SM100)
-                path: ../../fe-oss-apis/gemm_fusions/grouped_gemm_glu_hadamard.md
-                slug: grouped_gemm_glu_hadamard
-              - page: Grouped GEMM + GLU + Hadamard + Quant (SM100)
-                path: ../../fe-oss-apis/gemm_fusions/grouped_gemm_glu_hadamard_quant.md
-                slug: grouped_gemm_glu_hadamard_quant
-              - page: Grouped GEMM + Quant (SM100)
-                path: ../../fe-oss-apis/gemm_fusions/grouped_gemm_quant.md
-                slug: grouped_gemm_quant
-              - page: Grouped GEMM + Quant -- Unified (SM100)
-                path: ../../fe-oss-apis/gemm_fusions/grouped_gemm_quant_unified.md
-                slug: grouped_gemm_quant_unified
-              - page: Grouped GEMM + sReLU (SM100)
-                path: ../../fe-oss-apis/gemm_fusions/grouped_gemm_srelu.md
-                slug: grouped_gemm_srelu
-              - page: Grouped GEMM + SwiGLU (SM100)
-                path: ../../fe-oss-apis/gemm_fusions/grouped_gemm_swiglu.md
-                slug: grouped_gemm_swiglu
-              - page: Grouped GEMM + WGrad (Unified)
-                path: ../../fe-oss-apis/gemm_fusions/grouped_gemm_wgrad.md
-                slug: grouped_gemm_wgrad
-              - page: DSv4.1 mHC Projection/RMS Backward (SM100)
-                path: ../../fe-oss-apis/gemm_fusions/mhc_projection_bwd.md
-                slug: mhc_projection_bwd
-          - section: HSTU
-            slug: hstu
-            contents:
-              - page: HSTU Attention (Blackwell SM100/SM103)
-                path: ../../fe-oss-apis/hstu/hstu_attention.md
-                slug: hstu_attention
-              - page: HSTU LayerNorm-Multiply-SiLU-Dropout (LMSD)
-                path: ../../fe-oss-apis/hstu/hstu_lmsd.md
-                slug: hstu_lmsd
   - section: Developer Guide
     slug: developer
     contents:
