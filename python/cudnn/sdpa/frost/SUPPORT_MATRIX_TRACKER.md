@@ -171,8 +171,8 @@ The row's wider cc range does not admit prepared FP8 plans on cc 10.8–11.9;
 the standalone adapter does not support those devices.
 The existing D256 quantized epilogue gate also uses prepared launches, with
 runtime BF16 gate pointers and Int64 strides. Amax remains the ungated SDPA
-output's maximum. Existing conversion routes use prepared gather/scatter copies
-around a compact prepared attention plan.
+output's maximum. Supported dense layouts bind their declared strides directly;
+unsupported layouts decline before compilation.
 Fixed dense D128 block-scaled outputs use the prepared hosts described below.
 
 SM120/SM121 per-tensor FP8 also supports prepared dense, dense split-KV and THD
@@ -184,7 +184,7 @@ a mask-free dense `S_kv` off the 128-key tile is served through the KV-tail mask
 FP8 rows (#1425), the kernels replacing the tail tile's fully padded V scale blocks before BMM2.
 SM120/SM121 MXFP8 uses prepared launches for scalar outputs with fixed dense (unsplit and split) or THD geometry,
 and for the block-scaled MXFP8 O on fixed dense unsplit plans;
-dense conversion layouts use staged copies around a prepared compact plan, with the scale tensors bound unchanged.
+supported dense layouts bind their declared strides directly, with the scale tensors bound unchanged.
 SM107 MXFP8 at exact device cc 10.7 uses prepared launches for its four existing dense, unsplit native
 head shapes and for bounded THD at d256 (`config_sm107.SM107_MXFP8_THD_SHAPES`); THD at the other
 three shapes, split-KV and PackGQA remain unsupported. Dense MXFP8 runtime
@@ -193,8 +193,7 @@ SM107 D256 MXFP8 gates also use the prepared host. The existing direct-only SM10
 D128/D192 PV-BF16 specialization prepares native layouts with BF16 V and no SF_V
 operand; graph eligibility is unchanged. Conversion layouts and bias continue to
 decline runtime shape/stride overrides; a mask-free `S_kv` off the KV tile takes them
-through the KV-tail mask (#1425). Existing
-conversion layouts use staged copies around a prepared compact plan;
+through the KV-tail mask (#1425). Supported dense layouts use the native prepared plan;
 explicit opt-in does not bypass the contract. The same pure capability predicate
 filters candidate knobs and selects the prepared executor. Static-geometry graph
 eligibility is unchanged.
@@ -2716,9 +2715,9 @@ capacities without specializing the artifact on them. A fresh plan with the
 same specialization and stepped strides reuses the process-local artifact for
 different totals and bounds, even without persistent caching. The standalone
 THD wrapper binds caller data strides and logical widths directly to this prepared packed chain.
-Graph and direct-adapter padded widths use that same native chain. Internal
-legacy staging helpers remain isolated; supported public declarations cannot
-reach them. Standalone adapters require caller workspace, and convenience
+Graph and direct-adapter padded widths use that same native chain. The unused
+staging executors and data-copy helpers have been removed.
+Standalone adapters require caller workspace, and convenience
 wrappers provide it.
 
 The standalone SM80 packed forward wrapper also uses a cached pointer host.

@@ -3468,9 +3468,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "the d256 decode tile's split combine; the dense d256 prefill kernel runs unpacked",
             )
             if _gate_in_combine:
-                # The gated combine is reached through the prepared dense launch only
-                # (the staged path binds the split through the same native binder, which
-                # knows no gate on a split): the operands must bind zero-copy.
+                # The gated combine uses the prepared dense launch; every
+                # operand must satisfy its native binding contract.
                 self._not_implemented_error_if(
                     not self._can_prepare_dense_layout(),
                     "the gate-in-combine split (the d256 decode tile) needs Q/K/V layouts the prepared dense launch binds zero-copy (BSHD-physical)",
@@ -5645,8 +5644,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
     on the MXFP8 template ``sm120/prefill_mxfp8.py`` (both head dims up to
     256, multiples of 16) or its d512 flavor ``sm120/prefill_d512_mxfp8.py``
     (both head dims in (256, 512], multiples of 16).
-    Native layouts bind through the prepared MXFP8 entry and conversion layouts
-    through the staged forward (the scale tensors bind unchanged). A
+    Supported layouts bind their declared strides through the prepared MXFP8
+    entry; scale tensors bind unchanged and unsupported layouts decline. A
     block-scaled MXFP8 O (E4M3 + UE8M0 per 32, ``sample_sf_o``, with an
     optional global ``sample_scale_o``) is served as on the per-tensor path
     at d128; the FP4 (NVFP4) O is per-tensor only.
@@ -5698,13 +5697,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         # Layout gate (same envelope as SM100): THD keeps the strict BSHD
         # stride order (the varlen path binds (1, T, H, D) views with the
         # DECLARED token/head strides; _thd_check_strides_native declines
-        # what TMA cannot express); dense graphs get the dense_flex
-        # relaxation — execute() normalizes to the kernel's compact-BSHD
-        # storage via the prepared staging plan (zero-copy when already
-        # BSHD-compact, one gather / scatter copy otherwise), so only what
-        # normalization needs is required: head dim innermost-contiguous
-        # (stride 1), non-broadcast, non-overlapping strides, any B/H/S
-        # order, padded strides allowed.
+        # what TMA cannot express). Dense layouts bind their strides directly:
+        # D is innermost with stride 1, B/H/S may use any non-overlapping
+        # nesting, and stepped outer byte pitches must be 16-byte aligned.
         from cudnn.sdpa.graph_analyzer import dense_layout_ok, packed_layout_ok, thd_stats_packing
 
         for desc in (self.q_desc, self.k_desc, self.v_desc, self.o_desc):
