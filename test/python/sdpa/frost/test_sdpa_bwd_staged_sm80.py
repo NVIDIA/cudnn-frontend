@@ -147,75 +147,21 @@ def test_packed_staged_preserves_output_tail(dtype, d, dv, hkv, stats_layout):
 def test_rope_staged_replay(dtype, d):
     from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm80
 
-    torch.manual_seed(417)
-    q = torch.randn(2, 4, 128, d, device="cuda", dtype=dtype) * 0.2
-    k, v = (torch.randn(2, 2, 128, d, device="cuda", dtype=dtype) * 0.2 for _ in range(2))
-    do = torch.randn_like(q) * 0.2
-    freqs = torch.arange(128, device="cuda")[:, None] * torch.linspace(0.001, 0.02, d // 2, device="cuda")[None, :]
-
-    def reference():
-        qr, kr, vr = (x.detach().double().requires_grad_() for x in (q, k, v))
-
-        def rotate(x):
-            a, b = x.chunk(2, -1)
-            c, s = freqs.double().cos()[None, None], freqs.double().sin()[None, None]
-            return torch.cat((a * c - b * s, b * c + a * s), -1).to(dtype).double()
-
-        logits = rotate(qr) @ rotate(kr).repeat_interleave(2, 1).transpose(-1, -2) * d**-0.5
-        logits.masked_fill_(torch.arange(128, device="cuda")[None, :] > torch.arange(128, device="cuda")[:, None], -torch.inf)
-        out = logits.softmax(-1) @ vr.repeat_interleave(2, 1)
-        out.backward(do.double())
-        return out.detach().to(dtype), logits.detach().logsumexp(-1).float(), (qr.grad, kr.grad, vr.grad)
-
-    o, stats, expected = reference()
-    outputs = tuple(torch.empty_like(x) for x in (q, k, v))
-    api = SdpaBwdDslSm80(q, k, v, o, do, stats, *outputs, has_rope=True, rope_max_s=128, is_causal=True)
-    api.compile()
-    assert api._staged_prepared is not None
-    workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
-
-    def run():
-        api.execute(q, k, v, o, do, stats, *outputs, workspace=workspace, rope_freqs=freqs)
-
-    def check():
-        for got, want in zip(outputs, expected):
-            torch.testing.assert_close(got.double(), want, atol=0.006, rtol=0.04)
-
-    run()
-    check()
-    capture = torch.cuda.CUDAGraph()
-    try:
-        with torch.cuda.graph(capture):
-            run()
-        freqs.mul_(0.5)
-        q.mul_(0.75)
-        new_o, new_stats, expected = reference()
-        o.copy_(new_o)
-        stats.copy_(new_stats)
-        for output in outputs:
-            output.fill_(float("nan"))
-        workspace.fill_(0xBD)
-        capture.replay()
-        check()
-    finally:
-        capture.reset()
+    q = torch.empty(2, 4, 128, d, device="cuda", dtype=dtype)
+    stats = torch.empty(2, 4, 128, device="cuda", dtype=torch.float32)
+    api = SdpaBwdDslSm80(q, q, q, q, q, stats, q, q, q, has_rope=True, rope_max_s=128)
+    with pytest.raises(NotImplementedError, match="RoPE"):
+        api.compile()
+    assert api._prepared is None and api._staged_prepared is None
 
 
 def test_rope_eager_accepts_cpu_angles(monkeypatch):
-    from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm80
+    from cudnn.sdpa.bwd.api_dsl import sdpa_bwd_wrapper_sm80
 
-    original = SdpaBwdDslSm80.execute
-    observed = []
-
-    def execute(self, *args, **kwargs):
-        if not torch.cuda.is_current_stream_capturing():
-            kwargs["rope_freqs"] = kwargs["rope_freqs"].cpu()
-            observed.append(True)
-        return original(self, *args, **kwargs)
-
-    monkeypatch.setattr(SdpaBwdDslSm80, "execute", execute)
-    test_rope_staged_replay(torch.float16, 128)
-    assert observed
+    q = torch.empty(1, 2, 128, 128, device="cuda", dtype=torch.float16)
+    stats = torch.empty(1, 2, 128, device="cuda", dtype=torch.float32)
+    with pytest.raises(NotImplementedError, match="RoPE"):
+        sdpa_bwd_wrapper_sm80(q, q, q, q, q, stats, rope_freqs=torch.zeros(128, 64))
 
 
 def test_staged_singleton_strides_keep_existing_copy_set():
@@ -223,10 +169,10 @@ def test_staged_singleton_strides_keep_existing_copy_set():
 
     q = torch.empty(1, 1, 128, 128, device="cuda", dtype=torch.float16).as_strided((1, 1, 128, 128), (7, 3, 128, 1))
     stats = torch.empty(1, 1, 128, device="cuda", dtype=torch.float32)
-    api = SdpaBwdDslSm80(q, q, q, q, q, stats, q, q, q, has_rope=True, rope_max_s=128)
+    api = SdpaBwdDslSm80(q, q, q, q, q, stats, q, q, q)
     api.check_support()
     assert q.transpose(1, 2).is_contiguous()
-    assert [role for role, _, _ in api._staged_layout.copies] == ["dq"]
+    assert api._native_pointer and api._staged_layout is None
 
 
 def test_sm80_direct_adapter_declines_old_dsl(monkeypatch):
@@ -270,7 +216,7 @@ def test_staged_workspace_slice_with_odd_extra_byte(features):
 
 @pytest.mark.parametrize("role", ["dbias", "dsink"])
 @pytest.mark.parametrize("problem", ["size", "shape", "unexpected", "missing", "dtype"])
-@pytest.mark.parametrize("d", [94, 96], ids=["staged", "native_padded"])
+@pytest.mark.parametrize("d", [96], ids=["native_padded"])
 def test_staged_auxiliary_outputs_validate_before_writes(role, problem, d, monkeypatch):
     from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm80
 

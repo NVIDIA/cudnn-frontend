@@ -6640,9 +6640,8 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
     the backend takes them.
 
     Dense vector-aligned declarations use one prepared pointer host, including
-    native GQA, padded head widths and strided Q/K/V/O/Stats. Other layouts
-    use prepared bitwise copies and native GQA. RoPE
-    shares that plan, retaining only its standalone angle-table preprocessing.
+    native GQA, padded head widths and strided Q/K/V/O/Stats. Copy-dependent
+    declarations and RoPE decline before compilation.
     """
 
     def __init__(self, *args, scheduler: Optional[str] = None, bias_present: bool = False, bias_fp32: bool = False, rope_max_s: int = 0, **kwargs) -> None:
@@ -6919,6 +6918,11 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self.h_kv = int(h_kv)
         self.head_dim_qk = int(d_qk)
         self.head_dim_v = int(d_v)
+
+        from cudnn.sdpa.fwd.prepared_sm80 import native_decline_reason
+
+        reason = native_decline_reason(self)
+        self._not_implemented_error_if(reason is not None, reason)
 
         self._is_supported = True
         self._logger.debug("check_support completed successfully")

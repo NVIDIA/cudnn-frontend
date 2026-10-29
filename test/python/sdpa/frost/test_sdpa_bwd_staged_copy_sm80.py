@@ -86,26 +86,9 @@ def test_auxiliary_casts_strided_outputs_and_replay(dtype, declare_aux):
     sink_owner = torch.full((8,), 17.0, device="cuda")
     case.bufs["dbias"] = bias_owner[..., 0]
     case.bufs["dsink"] = sink_owner[::2].view(1, 4, 1, 1)
-    api, workspace = _adapter(case, declare_aux=declare_aux)
-    _execute(api, case.bufs, workspace)
-    _check(case)
-    graph = torch.cuda.CUDAGraph()
-    try:
-        with torch.cuda.graph(graph):
-            _execute(api, case.bufs, workspace)
-        for role in case.expected:
-            case.bufs[role].fill_(float("nan"))
-        workspace.fill_(0xBD)
-        graph.replay()
-        _check(case)
-        assert (bias_owner[..., 1] == 11).all()
-        assert (sink_owner[1::2] == 17).all()
-    finally:
-        graph.reset()
-    if not declare_aux:
-        case.bufs["dbias"] = torch.empty_like(case.bufs["dbias"], dtype=torch.float32)
-        _execute(api, case.bufs, workspace)
-        _check(case)
+    with pytest.raises(NotImplementedError, match="dbias|dsink"):
+        _adapter(case, declare_aux=declare_aux)
+    assert (bias_owner == 11).all() and (sink_owner == 17).all()
 
 
 @pytest.mark.parametrize("role", ["bias", "sink", "dbias", "dsink"])
@@ -225,6 +208,9 @@ def test_staged_stats_preserves_declared_storage_view(valid_capacity, native, mo
     case = _case(96, 80)
     if not native:
         _use_unaligned_q(case)
+        with pytest.raises(NotImplementedError, match="q.*stride"):
+            _adapter(case)
+        return
     api, workspace = _adapter(case)
     assert (api._prepared is not None) == native
     bufs = dict(case.bufs)
@@ -272,6 +258,9 @@ def test_ordered_gradient_copy_back(native, overlap, monkeypatch):
         # Aligned padded widths now use the native chain, including interleaved
         # disjoint gradients sharing one allocation.
         _use_unaligned_q(case)
+        with pytest.raises(NotImplementedError, match="q.*stride"):
+            _adapter(case)
+        return
     api, workspace = _adapter(case)
     assert (api._prepared is not None) == native
     calls = []

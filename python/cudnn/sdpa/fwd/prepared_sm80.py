@@ -40,12 +40,20 @@ class LaunchSpec:
 
 def native_layouts(api):
     """Admit declarations the vector loads/stores can serve without staging."""
-    return (
-        not api._rope_max_s
-        and api.head_dim_v % 8 == 0
-        and api.head_dim_qk % 8 == 0
-        and all(all(n == 1 or st % 8 == 0 for n, st in zip(desc.shape[:-1], desc.stride[:-1])) for desc in (api.q_desc, api.k_desc, api.v_desc, api.o_desc))
-    )
+    return native_decline_reason(api) is None
+
+
+def native_decline_reason(api):
+    from cudnn.sdpa.native_sm80 import data_layout_mismatch
+
+    if api._rope_max_s:
+        return "SM80 RoPE forward requires staging and is not supported by the native adapter"
+    for role in ("q", "k", "v", "o"):
+        desc = getattr(api, role + "_desc")
+        reason = data_layout_mismatch(role, desc.shape, desc.stride, thd=api.thd)
+        if reason is not None:
+            return reason
+    return None
 
 
 def build_spec(api, *, compiler=None):

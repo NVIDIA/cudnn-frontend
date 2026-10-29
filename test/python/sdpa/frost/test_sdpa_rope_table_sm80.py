@@ -63,38 +63,21 @@ def test_rope_table_rejects_invalid_shape_before_allocation(shape, detail, monke
         prepare(plan, values, values.device, torch.cuda.current_stream().cuda_stream)
 
 
-@pytest.mark.parametrize("backward", [False, True])
-@pytest.mark.parametrize("explicit", [False, True])
-def test_rope_table_restores_caller_device(backward, explicit, monkeypatch):
-    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm80
-    from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm80
-    from test_sdpa_bwd_staged_sm80 import test_rope_staged_replay
-    from test_sdpa_rope_staged_copy_sm80 import _forward_case, _forward_run, _forward_check
+def test_rope_table_restores_caller_device():
+    from cudnn.sdpa.rope_table_sm80 import compile_plan, prepare
 
     if torch.cuda.device_count() < 2:
         pytest.skip("requires two GPUs")
     operand_device = torch.cuda.current_device()
     caller_device = (operand_device + 1) % torch.cuda.device_count()
-    adapter = SdpaBwdDslSm80 if backward else SdpaFwdDslSm80
-    original = adapter.execute
+    device = torch.device("cuda", operand_device)
+    values = torch.randn(17, 64, device=device)
+    plan = compile_plan(17, 64, device)
     target = torch.cuda.current_stream(operand_device)
-
-    def execute(self, *args, **kwargs):
-        if torch.cuda.is_current_stream_capturing():
-            return original(self, *args, **kwargs)
-        kwargs["current_stream"] = target.cuda_stream if explicit else None
-        with torch.cuda.device(caller_device):
-            result = original(self, *args, **kwargs)
-            assert torch.cuda.current_device() == caller_device
-        return result
-
-    monkeypatch.setattr(adapter, "execute", execute)
-    if backward:
-        test_rope_staged_replay(torch.bfloat16, 128)
-    else:
-        api, values, workspace, owners = _forward_case()
-        _forward_run(api, values, workspace)
-        _forward_check(values)
+    with torch.cuda.device(caller_device):
+        result = prepare(plan, values, device, target.cuda_stream)
+        assert torch.cuda.current_device() == caller_device
+    torch.testing.assert_close(result, _reference(values, 64, device), atol=0, rtol=0)
 
 
 def test_rope_table_artifact_reloads_in_fresh_process(tmp_path):

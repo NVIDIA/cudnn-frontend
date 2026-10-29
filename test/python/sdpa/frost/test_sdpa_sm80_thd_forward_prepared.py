@@ -213,6 +213,10 @@ def test_dense_staged_pointer_launch_and_rope_replay(d, dv, rope, dtype, monkeyp
 
     q, k, v = (t.transpose(1, 2) for t in _inputs(d, dv, dtype, capq=128, capkv=256))
     freqs = torch.arange(256, device="cuda", dtype=torch.float32)[:, None] * torch.linspace(0.001, 0.01, d // 2, device="cuda")[None, :] if rope else None
+    if rope:
+        with pytest.raises(NotImplementedError, match="RoPE"):
+            sdpa_fwd_wrapper_sm80(q, k, v, is_causal=True, rope_freqs=freqs)
+        return
     calls = []
     from cudnn.sdpa.fwd import prepared_staged_sm80
 
@@ -336,7 +340,7 @@ def test_thd_nonpositive_and_large_scale(d, dv, scale, features):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d,dv,rope", [(96, 96, False), (192, 96, False), (128, 128, True), (256, 256, True)])
+@pytest.mark.parametrize("d,dv,rope", [(96, 96, False), (192, 96, False)])
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_dense_staged_artifact_reload_in_new_process(d, dv, rope, dtype, tmp_path):
     import json
@@ -402,7 +406,7 @@ print(json.dumps(compiled_cache.stats()))
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d,dv,rope", [(96, 96, False), (192, 96, False), (128, 128, True), (256, 256, True)])
+@pytest.mark.parametrize("d,dv,rope", [(96, 96, False), (192, 96, False)])
 @pytest.mark.parametrize("cache_mode", ["disabled", "unknown_manifest"])
 def test_dense_staged_process_reuse_without_persistence(d, dv, rope, cache_mode, tmp_path, monkeypatch):
     import cutlass.cute as cute

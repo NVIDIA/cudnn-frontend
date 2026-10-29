@@ -21,7 +21,7 @@ pytestmark = [
 ]
 
 
-@pytest.mark.parametrize("route", ["dense", "packed", "aux", "rope"])
+@pytest.mark.parametrize("route", ["dense", "packed", "aux"])
 def test_staged_backward_artifact_fresh_process(route, tmp_path):
     child = r"""
 import json, sys
@@ -63,7 +63,7 @@ elif route == "aux":
 elif route == "packed":
     helper.test_packed_staged_preserves_output_tail(torch.bfloat16, 160, 112, 2, "token_major")
 else:
-    helper.test_rope_staged_replay(torch.bfloat16, 128)
+    raise AssertionError("unknown native route")
 assert artifacts
 if reload == "1":
     assert all(hasattr(a, "_compiled_cache_raw") for a in artifacts)
@@ -88,7 +88,7 @@ print(json.dumps(compiled_cache.stats()))
     assert second["misses"] == 0 and second["hits"] > 0, second
 
 
-@pytest.mark.parametrize("route", ["dense", "packed", "aux", "rope"])
+@pytest.mark.parametrize("route", ["dense", "packed", "aux"])
 @pytest.mark.parametrize("cache_mode", ["disabled", "unknown_manifest"])
 def test_staged_backward_replan_without_disk_cache(route, cache_mode, tmp_path, monkeypatch):
     import cutlass.cute as cute
@@ -123,7 +123,7 @@ def test_staged_backward_replan_without_disk_cache(route, cache_mode, tmp_path, 
         elif route == "packed":
             helper.test_packed_staged_preserves_output_tail(torch.bfloat16, 160, 112, 2, "token_major")
         else:
-            helper.test_rope_staged_replay(torch.bfloat16, 128)
+            raise AssertionError("unknown native route")
 
     run()
 

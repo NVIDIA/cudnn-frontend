@@ -25,28 +25,31 @@ def stats_storage_facts(tensor, fact, operand):
 
 def native_layouts(api):
     """Select native vector-aligned operands with complete declarations."""
-    from cudnn.sdpa.graph_analyzer import dense_layout_ok
+    return native_decline_reason(api) is None
 
-    if api._has_rope or api.head_dim_qk % 8 or api.head_dim_v % 8:
-        return False
+
+def native_decline_reason(api):
+    from cudnn.sdpa.native_sm80 import data_layout_mismatch
+
+    if api._has_rope:
+        return "SM80 RoPE backward requires staging and is not supported by the native adapter"
     for role in ROLES[:5] + ROLES[6:9]:
         desc = getattr(api, role + "_desc")
-        if not dense_layout_ok(desc.shape, desc.stride) or any(n > 1 and st % 8 for n, st in zip(desc.shape[:-1], desc.stride[:-1])):
-            return False
-    # Older direct adapters declared only has_bias or omitted auxiliary gradient
-    # descriptors. Their optional runtime-output contract uses the staged
-    # prepared recipe, which validates and binds auxiliary outputs per call.
+        reason = data_layout_mismatch(role, desc.shape, desc.stride, thd=api.thd)
+        if reason is not None:
+            return reason
     if api._has_bias:
         if api.bias_desc is None or api.dbias_desc is None:
-            return False
+            return "SM80 bias and dbias must both be declared for native backward"
     elif api.bias_desc is not None or api.dbias_desc is not None:
-        return False
+        return "SM80 bias and dbias declarations require has_bias=True"
     if (api.sink_desc is not None) != (api.dsink_desc is not None):
-        return False
-    for desc in (api.sink_desc, api.dsink_desc, api.bias_desc, api.dbias_desc):
+        return "SM80 sink and dsink must both be declared for native backward"
+    for role in ("sink", "dsink", "bias", "dbias"):
+        desc = getattr(api, role + "_desc")
         if desc is not None and not desc.is_contiguous():
-            return False
-    return True
+            return f"SM80 {role}: native backward requires contiguous storage; got stride {tuple(desc.stride)}"
+    return None
 
 
 def build_spec(api, d64_module, *, staged=False):

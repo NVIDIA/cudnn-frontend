@@ -891,6 +891,13 @@ replay after previously active rows become fully masked. The detector is
 
 ## Adapter declines that other suites pin
 
+For SM80 native admission, distinguish stepped dense axes from packed THD
+addressing: THD never reads the declared batch stride. A shared dense-layout
+predicate can silently select staging for an otherwise valid packed graph.
+Keep per-port graph/standalone rejection checks and legal gapped THD controls
+in `test_sdpa_native_admission_sm80.py`, plus actual launch-count/replay checks.
+
+
 `gated_attention_block` runs the SDPA forward adapter as its attention stage, and
 its tests pin the adapter's declines by message (`match="multiple of 128"`).
 Those tests run only on the `oss` CI lanes (`python/*/cutedsl`, SM107). A change

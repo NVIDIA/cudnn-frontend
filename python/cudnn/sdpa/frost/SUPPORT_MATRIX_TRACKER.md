@@ -2583,23 +2583,21 @@ and any `max_total_seq_len_*`, and ragged offsets describe the same adjacent
 sequences. Runtime lengths stay on device; the adapter cannot host-validate
 these values without breaking graph capture.
 
-Dense forward uses a prepared pointer host when V matches its flavor width,
-Q/K head dimensions are multiples of eight, and every stepped Q/K/V/O outer
-stride is a multiple of eight elements. These plans require 16-byte-aligned
-Q/K/V/O base addresses and reject misaligned runtime bindings. They address
-declared B/H/S permutations, padded strides, GQA/MQA and strided Stats directly,
-with no layout staging or GQA expansion. Sink logits are converted to log2
-units inside the attention kernel. Address strides and products retain Int64
-width. Other admitted head dimensions and layouts use prepared bitwise
-gather/pad and scatter kernels in caller workspace around the same native GQA
-host. Q/K padding preserves the original attention scale; sink conversion remains
-inside attention. Native operands bind directly without redundant copies. The
-standalone dense wrapper keys plans by input strides and supplies current scratch.
-The capability envelope is unchanged; standalone RoPE uses prepared angle-table
-preprocessing and data copies. Its shared forward/backward table host fuses
-full-precision FP32 sin/cos and interleaving, retaining the existing CPU/dtype/layout
-normalization and launch-stream allocation. All forward entries share prepared host lowering;
-the former tensor compilers and their fake-operand construction are removed.
+Dense forward and backward admit head dimensions divisible by eight, within
+their existing flavor envelopes, and require every stepped data-port outer
+stride to be divisible by eight elements. Runtime data addresses must be
+16-byte aligned. Accepted declarations bind B/H/S permutations, padded widths,
+gapped layouts and strided Stats directly; no gather/pad/scatter fallback is
+selected. Graph eligibility and standalone `check_support()` share the
+addressing contract and decline unsupported declarations before compilation.
+THD retains its packed-layout constraints; its unused batch stride is ignored.
+
+Backward bias/dBias and sink/dSink must be declared in pairs with contiguous
+auxiliary storage. Standalone RoPE and nonaligned data layouts are declined
+because they would require staging. The launch-count detectors in
+`test_sdpa_bwd_staged_sm80.py` and `test_sdpa_staged_copy_sm80.py` retain
+native padding/replay coverage; `test_sdpa_native_admission_sm80.py` checks
+early declines and legal dense/THD declarations without GPU allocation.
 
 | Feature | d64 (GPT-OSS) | d128 (Llama) | d192×d128 (DSv3) | d256 (Qwen) |
 |---|:--:|:--:|:--:|:--:|
@@ -2626,7 +2624,7 @@ the former tensor compilers and their fake-operand construction are removed.
 | Ragged `S_kv` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | Decode-shaped (`S_q == 1`) | ❌ / ❌ | ❌ / ❌ | ❌ / ❌ | ❌ / ❌ |
 
-Native SM80 backward flavor widths with 16-byte-aligned Q/K/V/O/dO and
+Native SM80 backward eight-aligned widths with 16-byte-aligned Q/K/V/O/dO and
 D-gradient bases and stepped outer strides divisible by eight elements use
 one prepared pointer host. The host includes workspace initialization,
 do-dot, optional dSink, the selected backward kernel, dQ conversion, GQA
@@ -2640,27 +2638,17 @@ capacities without specializing the artifact on them. A fresh plan with the
 same specialization and stepped strides reuses the process-local artifact for
 different totals and bounds, even without persistent caching. The standalone
 THD wrapper pads to the native flavor width and uses this prepared packed chain.
-Off-flavor graph/direct-adapter widths, unaligned strides and older direct adapters
-without complete optional-output declarations use prepared gather/pad, gradient
-scatter and auxiliary cast recipes around the same pointer chain. These replace
-the existing tensor copies within the same caller-workspace budget. Packed copy
-capacities and stepped strides stay Int64 runtime arguments; disjoint dense gradients
-share one scatter launch, while overlapping storage ranges retain ordered copy-back.
-Standalone RoPE uses the same prepared data-copy recipes and the shared prepared
-angle-table host on the launch stream, preserving the existing FP32 trigonometry.
-Packed output casts and folds truncate flavor padding on device and leave capacity
-tails untouched. The obsolete generic and d64 tensor compilers and fake builders
-are removed. Standalone adapters require caller workspace, as native prepared
-adapters do; convenience wrappers continue to provide it. No eligibility changes.
+Graph and direct-adapter padded widths use that same native chain. Internal
+legacy staging helpers remain isolated; supported public declarations cannot
+reach them. Standalone adapters require caller workspace, and convenience
+wrappers provide it.
 
 The standalone SM80 packed forward wrapper also uses a cached pointer host.
 Packed capacities, Q/K/V token and head strides, and launch bounds bind as
 runtime Int64 arguments; Sink logits remain in natural units. The wrapper
 preserves its output allocation, capacity-tail zeroing and off-flavor padding.
-All SM80 forward tensor-fake construction is removed. Dense conversion copies,
-including standalone RoPE, share prepared gather/scatter plans with native GQA
-and natural-unit sinks. RoPE preserves its angle-table values through the shared prepared host;
-its obsolete tensor-staging executor and dedicated host compiler are removed.
+Dense forward uses the native pointer host and natural-unit sinks; unsupported
+copy-dependent declarations decline before compilation.
 Native-flavor THD forward graphs reuse this pointer host, with optional head-major
 or token-major Stats and device-side length normalization in caller workspace.
 Plan construction and execution allocate no device memory. Graph admission requires
