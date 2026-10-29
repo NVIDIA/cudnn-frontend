@@ -939,9 +939,7 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
 
 
 def _beyond_dense_leg(facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs], allowed_legs: frozenset[str] = frozenset()) -> bool:
-    """Whether the graph asks for a leg beyond the dense one a ``dense_only_d_shapes`` tile carries: THD, paged KV, the
-    score side outputs, the pre-folded attention scale (graph facts), split_kv > 1 or PackGQA (knobs).  The twin of
-    ``config_sm107.sm107_small_tile_leg``."""
+    """Whether any requested feature exceeds a tile's dense and allowed native legs."""
     return (
         _config_sm107.sm107_small_tile_leg(
             thd=facts.thd,
@@ -961,8 +959,8 @@ def _selected_d_shape(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
     per-shape envelope floors, so the knob domains (cga, split) describe the
     flavor the lowering will actually pick (api_dsl._pick_flavor walks the same
     floors). An exact native shape is always its own selection -- except a
-    ``dense_only_d_shapes`` tile, which is taken only for a graph on the dense
-    leg (``_beyond_dense_leg`` False) at a cga inside its domain (``knobs.cga``
+    restricted tile, which is taken only when every requested feature fits its
+    native legs (``_beyond_dense_leg`` False) at a cga inside its domain (``knobs.cga``
     unset or in ``cgas_by_d_shape``); otherwise the walk continues to the next
     covering shape, the route the graph took before the tile existed.  Callers
     that know the knobs pass them (``mismatch``, ``effective_cgas``); a
@@ -1024,10 +1022,14 @@ def _sm120_tile_mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts",
     return None
 
 
-def pack_gqa_partial(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
+def pack_gqa_partial(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> bool:
     """Whether the flavor this graph lowers onto packs a proper divisor of a
-    GQA group that does not divide tile_m (``pack_gqa_partial_d_shapes``)."""
-    return capabilities.pack_gqa_partial_d_shapes is not None and _selected_d_shape(capabilities, facts) in capabilities.pack_gqa_partial_d_shapes
+    GQA group that does not divide tile_m (``pack_gqa_partial_d_shapes``).
+
+    A pinned plan supplies its knobs: packing can select a wider native tile
+    than the graph's unpacked flavor. Fact-only callers retain their domain.
+    """
+    return capabilities.pack_gqa_partial_d_shapes is not None and _selected_d_shape(capabilities, facts, knobs) in capabilities.pack_gqa_partial_d_shapes
 
 
 def effective_sched_policies(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> frozenset[int]:
@@ -1838,7 +1840,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             else:
                 _pg_tile_m = max(capabilities.tile_ms)
             _partial = (
-                pack_gqa_partial(capabilities, facts)
+                pack_gqa_partial(capabilities, facts, knobs)
                 or ragged_pack
                 or supports_paged_d128_partial_pack_gqa(
                     (facts.d_qk, facts.d_v),
@@ -2548,8 +2550,8 @@ def _sm107_spec() -> EngineSpec:
             # paged THD d256 prefill's PackGQA (CGA2, unsplit); mismatch declines a packed dense d256 graph the
             # tile does not serve (the dense d256 prefill kernel runs unpacked).
             pack_gqa_d_shapes=frozenset({(64, 64), (128, 128), (256, 256), (512, 512)}),
-            # Native D512 2x2 tiles pack gcd(G,64), including two subgroups
-            # per KV head at G128. THD and paged D512 retain their declines.
+            # Native D64 packs gcd(G,128); D512 2x2 tiles pack gcd(G,64).
+            # THD and paged D512 retain their declines.
             pack_gqa_partial_d_shapes=frozenset({(64, 64), (512, 512)}),
             thd_pack_gqa_d_shapes=frozenset({(64, 64), (128, 128), (256, 256)}),
             split_kv_supported=True,

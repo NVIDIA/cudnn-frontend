@@ -2399,11 +2399,13 @@ def make_cfg_d32(params: TemplateParams) -> Tuple[CfgD32, TmaIters]:
 
 
 def make_cfg_d64(params: TemplateParams) -> Tuple[CfgD64, TmaIters]:
-    """The 64-wide head-dim tile of ``sm107/prefill_d128_f16.py`` (``TemplateParams.d_flavor=64``): every f16/bf16 head dim in
-    (32, 64] with D % 8 == 0 (40 / 48 / 56 / 64) by TMA zero fill; the same feature set and routing as ``make_cfg_d32`` (cga1
-    and cga2). Per-tensor FP8 uses the same native width in ``prefill_d128_fp8.py``,
+    """The 64-wide head-dim tile of ``sm107/prefill_d128_f16.py`` (``TemplateParams.d_flavor=64``).
+
+    Half-precision dense plans use aligned logical widths up to 64 by TMA zero fill;
+    native THD uses exact D64. Both CTA widths carry THD and PackGQA.
+    Per-tensor FP8 uses the same native width in ``prefill_d128_fp8.py``,
     including dense PackGQA and split-KV; its THD and paged forms remain unsupported.
-    Half precision additionally serves THD and PackGQA at both CTA widths."""
+    """
     if params.dtype_qkv <= _DTYPE_E5M2 and params.thd_varlen:
         raise ValueError("sm107 d64: per-tensor FP8 THD is not wired at the native D64 width")
     return _make_cfg_d128_family(params, flavor="sm107 d64", tile_k=64, tile_o=64, mxfp8=False)

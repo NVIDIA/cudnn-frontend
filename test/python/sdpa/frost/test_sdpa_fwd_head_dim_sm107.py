@@ -257,6 +257,20 @@ def test_row_routes_every_leg_beyond_dense_past_the_small_tiles():
     assert why is not None and "cga=3" in why and "[1, 2]" in why, why
 
 
+@requires_sm107_dsl
+@pytest.mark.parametrize("d_qk,d_v", [(8, 8), (24, 16), (32, 32), (48, 32), (64, 64)])
+@pytest.mark.parametrize("cga", [None, 1, 2])
+def test_partial_pack_checks_the_selected_native_tile(d_qk, d_v, cga):
+    """A packed plan may use D64 even when the unpacked graph selects D32."""
+    from cudnn.sdpa.fwd import engines
+
+    caps = _caps()
+    facts = _facts(d_qk=d_qk, d_v=d_v, h_q=24, h_kv=2)
+    knobs = engines.SdpaFwdKnobs(pack_gqa=True, cga=cga)
+    assert engines._selected_d_shape(caps, facts, knobs) == (64, 64)
+    assert engines.mismatch(caps, facts, knobs) is None
+
+
 def test_one_constant_feeds_the_row_the_adapter_and_the_factory():
     """``SM107_SMALL_D_CGAS`` is read by the row (cgas_by_d_shape), the adapter's cga twin (``supported_cgas_for``) and the config
     factory (which refuses any other width) -- the three cannot drift (rule 8b').  Same for the shapes and the kernel-file map."""
