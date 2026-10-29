@@ -209,8 +209,9 @@ def block_sparse_attention_forward(
     Callers must satisfy the "Sparse metadata" value ranges in
     ``docs/operations/sparse_attention/bsa.md``.
 
-    ``kpage`` selects the SM100/SM103 blk128 KPage kernels, which gather the
-    valid 16-row pages of partially occupied K/V blocks into full MMA tiles.
+    ``kpage`` selects the SM100/SM103 KPage kernels, which gather the
+    valid 16-row pages of partially occupied K/V blocks into full MMA tiles
+    (blk128, or blk64 for the forward).
     Pass ``True`` to build the page layout from the metadata on this call, or
     a :class:`KPageLayout` from :func:`kpage_prepare_layout` to reuse one.
     See "KPage" in ``docs/operations/sparse_attention/bsa.md`` for the contract.
@@ -229,8 +230,6 @@ def block_sparse_attention_forward(
     if kpage is not False:
         if pack_gqa is True or kv_splits != 1 or use_clc is not None:
             raise NotImplementedError("kpage does not take pack_gqa, kv_splits, or use_clc")
-        if sparse_block_size != 128:
-            raise NotImplementedError("kpage requires sparse_block_size=128")
     if arch_family == 9:
         if kv_splits != "auto" and (isinstance(kv_splits, str) or not 1 <= int(kv_splits) <= 256):
             raise ValueError("SM90 kv_splits must be 'auto' or an integer in [1, 256]")
@@ -499,7 +498,7 @@ def block_sparse_attention_backward(
         if bucket_size_blocks is not None:
             raise NotImplementedError("kpage does not take bucket_size_blocks; use kpage_prepare_layout(bwd_kv_groups=...)")
         if sparse_block_size != 128:
-            raise NotImplementedError("kpage requires sparse_block_size=128")
+            raise NotImplementedError("the KPage backward requires sparse_block_size=128 (the blk64 KPage path is forward only)")
     if arch_family == 9 and head_dim != 128:
         raise NotImplementedError("SM90 backward requires head_dim=128")
     if sparse_block_size == 64 and head_dim != 128:
@@ -609,8 +608,9 @@ def kpage_prepare_layout(
     allow_empty_block_nums: bool = False,
     bwd_kv_groups: Optional[int] = None,
     with_backward: bool = False,
+    sparse_block_size: int = 128,
 ) -> "KPageLayout":
-    """Build a reusable :class:`KPageLayout` from BSA blk128 sparse metadata.
+    """Build a reusable :class:`KPageLayout` from BSA sparse metadata (``sparse_block_size`` 128, or 64 for the forward).
 
     The positional arguments have the same meaning as in
     ``block_sparse_attention_forward``: ``block_sizes[j]`` is the number of
@@ -632,7 +632,9 @@ def kpage_prepare_layout(
     ``q2k_block_nums == 0`` get ``O = 0``, ``LSE = -inf`` and ``dQ = 0``).
     ``with_backward=True`` builds the backward tables here instead of on the
     first backward call.  ``bwd_kv_groups`` overrides the number of Q groups
-    the backward walk of each K/V tile is split into.
+    the backward walk of each K/V tile is split into.  With
+    ``sparse_block_size=64`` the layout serves the forward only and takes no
+    ``q_block_sizes``, ``with_backward`` or ``bwd_kv_groups``.
     """
     from . import _kpage_api
 
@@ -648,6 +650,7 @@ def kpage_prepare_layout(
         allow_empty_block_nums=allow_empty_block_nums,
         bwd_kv_groups=bwd_kv_groups,
         with_backward=with_backward,
+        sparse_block_size=sparse_block_size,
     )
 
 
