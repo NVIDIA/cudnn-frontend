@@ -726,7 +726,9 @@ def decode_combine_grid_selected(b: int, h_q: int, s_q: int, split: int, device_
     line's (measured on the Rubin performance class), so it answers False on EVERY other device -- the
     Blackwell line (cc 10.0 / 10.3), whose launches keep the module's own forms, and any line the rule was
     never measured on (``_DECODE_COMBINE_RULE_CC`` is the one line it holds for); ``None`` reads the cc 10.7
-    rule (the model's direct callers; a plan always names its device)."""
+    rule (the model's direct callers; a plan always names its device).  The sparse adapter's LEAN plans on the Blackwell parts of
+    ``sparse_tile_rules.SPARSE_LEAN_COMBINE_RULE_CCS`` (cc 10.0) evaluate this rule at the measured line's cc on purpose
+    (``sparse_lean_combine_rule_cc``: the rule's shape was measured for the lean grids on the GB200 class; the table sits there)."""
     if device_cc is not None and tuple(device_cc)[:2] != _DECODE_COMBINE_RULE_CC:
         return False
     if decode_combine_lean_blocks(b, h_q, s_q) > DECODE_COMBINE_MAX_LEAN_BLOCKS or int(split) < DECODE_COMBINE_MIN_SPLIT:
@@ -769,6 +771,7 @@ from cudnn.sdpa.fwd.sparse_tile_rules import (  # noqa: E402,F401
     SPARSE_TILE_LEAN,
     LEAN_SPARSE_MAX_UNITS,
     SPARSE_LEAN_TILE_DEFAULT_CCS,
+    SPARSE_LEAN_TILE_EXPLICIT_CCS,
     _SPARSE_LEAN_TILE_RULE_CC,
     LEAN_SPARSE_DEFAULT_MAX_SUB_TILES_PER_CTA,
     _LEAN_FILL_OCCUPANCY_BY_S_Q,
@@ -776,6 +779,10 @@ from cudnn.sdpa.fwd.sparse_tile_rules import (  # noqa: E402,F401
     sparse_tcgen05_max_split,
     sparse_lean_max_sub_tiles_per_cta,
     sparse_lean_tile_decline,
+    sparse_tile_part_decline,
+    SPARSE_LEAN_COMBINE_RULE_CCS,
+    _SPARSE_LEAN_COMBINE_RULE_SOURCE_CC,
+    sparse_lean_combine_rule_cc,
     sparse_decode_lean_tile_selected,
     sparse_lean_fill_sub_tiles,
     sparse_lean_sub_tiles_per_cta,
