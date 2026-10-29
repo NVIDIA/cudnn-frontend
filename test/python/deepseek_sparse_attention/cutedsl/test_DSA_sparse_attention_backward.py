@@ -1382,6 +1382,26 @@ def test_DSA_sparse_attention_backward_sm100_cluster8_repeat100():
 
 
 @pytest.mark.L2
+@torch_fork_set_rng(seed=20261030)
+def test_DSA_sparse_attention_backward_sm100_cluster8_topk2048():
+    """The optimized production-width relay remains exact and repeatable."""
+    try:
+        _exercise_deterministic_sm100_case(
+            64,
+            576,
+            257,
+            65537,
+            repeats=3,
+            topk=2048,
+            has_topk_length=True,
+            check_graph=True,
+            expected_relay_cluster_size=8,
+        )
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+
+@pytest.mark.L2
 @torch_fork_set_rng(seed=423)
 @pytest.mark.parametrize(
     "shared_topk,has_topk_length",
