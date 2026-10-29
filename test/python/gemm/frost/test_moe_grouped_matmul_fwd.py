@@ -2197,6 +2197,97 @@ def test_sm120_moe_render_smoke(weight_major: str, gather: bool) -> None:
     assert params == ["problem_size", "first_token_offset", "a_tma_workspace", *(["token_index"] if gather else []), "a_0", "b_0", "c_tap_0", "stream"], params
 
 
+_SM120_MOE_TEMPLATES = (
+    "sm120_moe_grouped_matmul_fwd.py",
+    "sm120_moe_grouped_matmul_fwd_swap_ab.py",
+    "sm120_moe_grouped_block_scale_matmul_fwd.py",
+    "sm120_moe_grouped_block_scale_matmul_fwd_swap_ab.py",
+)
+
+
+@pytest.mark.parametrize("template", _SM120_MOE_TEMPLATES)
+def test_sm120_moe_external_counter_reset_states_its_contract(template: str) -> None:
+    """Rendering ``external_counter_reset = True`` drops the host's counter-zeroing
+    launch, and the kernel never writes the counter back. The comment at the guard
+    is the only statement of what such a runtime owes (a zero before every launch,
+    visible to the kernel's griddepcontrol.wait), so pin it together with the kernel
+    facts it rests on: one atomic add per claim and no other use of the counter."""
+    import ast
+
+    from cudnn.gemm.frost.kernel_registry import template_path
+
+    src = template_path(template).read_text()
+    lines = src.splitlines()
+    (guard,) = [i for i, line in enumerate(lines) if line.strip() == "if cutlass.const_expr(not external_counter_reset):"]
+    assert "_dynamic_scheduler_counter_initialization(" in lines[guard + 1]
+    assert lines[guard - 1].strip().startswith("counter_qword = ")
+    top = guard - 1
+    while lines[top - 1].lstrip().startswith("#"):
+        top -= 1
+    contract = " ".join(line.strip().lstrip("#").strip() for line in lines[top : guard - 1])
+    for fact in ("+ grid_num_clusters", "before every launch", "griddepcontrol.wait"):
+        assert fact in contract, f"{template}: the external_counter_reset comment must state {fact!r}; got {contract!r}"
+    tree = ast.parse(src)
+    names = [node for node in ast.walk(tree) if isinstance(node, ast.Name) and node.id == "sched_counter_ptr"]
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and any(isinstance(a, ast.Name) and a.id == "sched_counter_ptr" for a in node.args)]
+    assert len(names) == 2 and len(calls) == 1, f"{template}: the scheduler counter has a new use; revisit the external_counter_reset comment"
+    assert ast.unparse(calls[0].func) == "nvvm.atomicrmw" and ast.literal_eval(calls[0].args[0]) == "add"
+
+
+@requires_matmul_gpu
+@pytest.mark.parametrize("external_reset", [False, True], ids=["host_reset", "external_reset"])
+def test_sm120_moe_scheduler_counter_needs_a_zero_before_every_launch(external_reset: bool, monkeypatch) -> None:
+    """FC1 then FC2 on one workspace, so both launches use one counter word, as in FlashInfer's
+    MoE adapters (two compiled kernels, FC1 and FC2, that share one ``desc`` scratch; one
+    compiled kernel stands in for both here). Each launch leaves the counter at its tile
+    count + grid_num_clusters. The default host zeroes it before every launch, so a stale
+    count is harmless; with ``external_counter_reset`` rendered True and one zero for both
+    launches (a per-layer reset), FC2 starts at FC1's final count and skips the tiles below
+    it without an error."""
+    from cudnn.gemm.frost.sm120 import compiler as C120
+
+    cfg = by_name(_SM120_CFG)  # 128 x 128 CTA tiles
+    grid = C120._grid_num_clusters(cfg)
+    m_tiles = grid // 2 + 10  # FC2's 2 * m_tiles tiles outnumber FC1's 2 + grid
+    E, S, N, K = 4, 128 * m_tiles, 256, 128
+    if external_reset:
+        render = C120._render_template
+
+        def render_external_reset(*args, **kwargs):
+            src = render(*args, **kwargs)
+            assert src.count("\nexternal_counter_reset = False\n") == 1
+            return src.replace("\nexternal_counter_reset = False\n", "\nexternal_counter_reset = True\n")
+
+        monkeypatch.setattr(C120, "_render_template", render_external_reset)
+    compiled = C120.jit_from_cudnn_graph(_build_graph(E, S, N, K), config=cfg)
+    torch.manual_seed(0)
+    token = torch.randn(1, S, K, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda")
+    workspace = torch.empty(compiled.workspace_bytes, dtype=torch.uint8, device="cuda")
+    counter = workspace.view(torch.int32)[:1]  # moe_desc_slots = 0: the workspace is the counter
+    counter.fill_(0 if external_reset else 1 << 30)  # the runtime's one zero / a stale count
+
+    def launch(starts):
+        offsets = torch.tensor(starts, dtype=torch.int32, device="cuda")
+        out = torch.full((1, S, N), float("nan"), dtype=torch.bfloat16, device="cuda")
+        compiled(_vp_moe(compiled, token, weight, offsets, out), workspace=workspace)
+        tiles = sum(_ceil_div(end - begin, 128) * (N // 128) for begin, end in zip(starts, starts[1:]))
+        assert counter.item() == tiles + grid  # every CTA stops at its first claim past the last tile
+        return out, _ref_f32(token, weight, offsets, S, N, E).to(torch.bfloat16), tiles
+
+    out, ref, fc1_tiles = launch([0, 128, 128, 128, 128])  # trailing rows unused
+    torch.testing.assert_close(out[0, :128], ref[:128], atol=1e-1, rtol=1e-2)
+    half = 128 * (m_tiles // 2)
+    out, ref, _ = launch([0, half, half, S - 128, S])
+    unwritten = out[0].isnan()
+    assert int(unwritten.sum()) == ((fc1_tiles + grid) * 128 * 128 if external_reset else 0)
+    torch.testing.assert_close(out[0][~unwritten], ref[~unwritten], atol=1e-1, rtol=1e-2)
+    if external_reset:  # zeroed before FC2 too, as the template comment asks
+        counter.zero_()
+        out, ref, _ = launch([0, half, half, S - 128, S])
+        torch.testing.assert_close(out[0], ref, atol=1e-1, rtol=1e-2)
+
+
 @requires_sm100
 @pytest.mark.parametrize(
     "cta_group,cta_n,mma_m,cta_m,cluster",
