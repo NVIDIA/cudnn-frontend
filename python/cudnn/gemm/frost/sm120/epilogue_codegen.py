@@ -716,6 +716,10 @@ def _emit_block_quant_col(
             ),
         ]
     )
+    # `_mcb` is Int64 on every path (the Int64 kernel `M`, or a widened group extent): `row`, `col_j` and the
+    # lane are Int32, so an Int32 `_mcb` keeps the F8_128x4 atom term in 32 bits. That term wraps once one
+    # batch's padded scale table (one group's table on the grouped paths) passes 2 GiB, and the scale byte is
+    # then stored 2^32 bytes below its slot.
     if quant.grouped_by_moe and swapped:
         lines.extend(
             [
@@ -728,21 +732,22 @@ def _emit_block_quant_col(
         lines.extend(
             [
                 f"{p}_mb = (row - group_begin) // {quant.block_size}",
-                f"{p}_mcb = (((group_end - group_begin) // {quant.block_size}) + 3) // 4",
+                f"{p}_mcb = ((cutlass.Int64(group_end - group_begin) // {quant.block_size}) + 3) // 4",
                 f"{p}_base = (group_begin // {4 * quant.block_size}) * ((N + 127) // 128) * 512",
             ]
         )
     else:
         lines.append(f"{p}_mb = row // {quant.block_size}")
+        if quant.scale_reorder == "F8_128x4":
+            lines.append(f"{p}_mcb = ((M // {quant.block_size}) + 3) // 4")
     for k in range(n_groups):
         lines.append(f"{p}_n{k} = col_j + {k * G} + ({p}_lane % {G})")
         if quant.scale_reorder == "F8_128x4":
-            mcb = f"{p}_mcb" if quant.grouped_by_moe else str((chain.matmul.M // quant.block_size + 3) // 4)
             base = f"{p}_base + " if quant.grouped_by_moe else ""
             token = f"({p}_n{k} - group_begin)" if quant.grouped_by_moe and swapped else f"{p}_n{k}"
             lines.append(
                 f"{p}_sidx{k} = {batch_index_expr} * quant_scale_stride_l_{quant_idx} + {base}"
-                f"(({token} // 128) * {mcb} + ({p}_mb // 4)) * 512 + "
+                f"(({token} // 128) * {p}_mcb + ({p}_mb // 4)) * 512 + "
                 f"({token} % 32) * 16 + (({token} % 128) // 32) * 4 + ({p}_mb % 4)"
             )
         else:
