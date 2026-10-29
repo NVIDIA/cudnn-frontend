@@ -1523,7 +1523,7 @@ def test_moe_m_major_alignment_is_per_output_dtype(offset_multiple: int, S: int,
     fto = next(t for t in g.tensors.values() if t.get_name() == "first_token_offset")
     fto.set_alignment_value(offset_multiple)
     # One promise can suffice for fp32/bf16 while fp8 still needs STG.
-    mm = g.tensors["moe::OUT_0"].set_data_type(cudnn.data_type.FLOAT)
+    mm = g.tensors["moe::OUT_0"].set_data_type(cudnn.data_type.FLOAT).set_output(False)
     c = g.identity(input=mm, name="float")
     h = g.relu(input=c, name="half")
     z = g.relu(input=h, name="byte")
@@ -2780,3 +2780,133 @@ def test_moe_reduction_initialization_validates_all_outputs_before_writing():
     assert (first == 0).all()
     assert torch.isneginf(last_raw[::2]).all()
     assert (last_raw[1::2] == -12345).all()
+
+
+def _recorded_moe_plan(family, block_scale, multi, reduction, swap=False):
+    """Build a launch recorder for MoE runtime validation."""
+    import importlib
+    from pathlib import Path
+    from dataclasses import replace
+    from cudnn.gemm.frost.fusion_ir import FusionOp, swap_ab
+    from cudnn.gemm.frost.graph_analyzer import analyze_with_binding, swap_ab_binding
+
+    if block_scale:
+        from test_moe_grouped_block_scale_matmul_fwd import _build_graph as bs_graph
+
+        graph = bs_graph(2, 128, 128, 128, 2)
+    else:
+        graph = _build_graph(2, 128, 128, 128, num_groups=2)
+    _, original = analyze_with_binding(graph)
+    if reduction:
+        source = original.outputs[0].set_output(False)
+        graph.reduction(input=source, mode=cudnn.reduction_mode.ADD).set_dim([1, 1, 1]).set_stride([1, 1, 1]).set_data_type(cudnn.data_type.FLOAT).set_output(
+            True
+        )
+    chain, binding = analyze_with_binding(graph)
+    if multi:
+        old = binding.b_operands[0]
+        second = graph.tensor(name="weight2", dim=list(old.get_dim()), stride=list(old.get_stride()), data_type=old.get_data_type())
+        binding = replace(binding, b_operands=[old, second])
+        if block_scale:
+            sf = binding.sfb_operands[0]
+            second_sf = graph.tensor(
+                name="sf2", dim=list(sf.get_dim()), stride=list(sf.get_stride()), data_type=sf.get_data_type(), reordering_type=cudnn.tensor_reordering.F8_128x4
+            )
+            binding = replace(binding, sfb_operands=[sf, second_sf])
+        chain = replace(
+            chain,
+            num_b_operands=2,
+            gemm_operands=[(0, 0), (0, 1)],
+            ops=[FusionOp("add", parent_idx=-1, parent_idx_b=-2)],
+            output_specs=[replace(spec, source_ref=0) for spec in chain.output_specs],
+            reductions=[replace(red, source_ref=0) for red in chain.reductions],
+        )
+    storage_k = 64 if block_scale else 128
+    dtype = torch.uint8 if block_scale else torch.bfloat16
+    vp = {t: torch.ones((1, 128, storage_k), device="cuda", dtype=dtype) for t in binding.a_operands}
+    vp.update({t: torch.ones((2, 128, storage_k), device="cuda", dtype=dtype) for t in binding.b_operands})
+    vp.update({t: torch.ones((1, 1, 8192), device="cuda", dtype=torch.uint8) for t in binding.sfa_operands})
+    vp.update({t: torch.ones((2, 1, 8192), device="cuda", dtype=torch.uint8) for t in binding.sfb_operands})
+    vp[binding.first_token_offset] = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
+    output = torch.full((1, 1, 1) if reduction else (1, 128, 128), 17.0, device="cuda", dtype=torch.float32 if reduction else torch.bfloat16)
+    vp[binding.outputs[0]] = output
+    if swap:
+        chain, binding = swap_ab(chain), swap_ab_binding(binding)
+    compiler = importlib.import_module(f"cudnn.gemm.frost.{family}.compiler")
+    cfg = replace(
+        by_name("CONFIG_sm100_128x128x64_128x128x32_cluster1x1_1ctamma" if family == "sm100" else "CONFIG_sm120_64x64x64_16x16x32_cluster1x1_warps2x4"),
+        swap_ab=swap,
+    )
+    calls = []
+    cls = compiler.CompiledMoeBlockScaleGemm if block_scale else compiler.CompiledMoeGemm
+    compiled = cls(
+        chain=chain, config=cfg, generated_path=Path("unused"), _launchable=lambda *args, **kwargs: calls.append(args), binding=binding, vec_bytes_epi=32
+    )
+    return compiled, vp, output, calls, original.b_operands[0] if not multi else second
+
+
+@pytest.mark.no_workspace_shim
+@pytest.mark.parametrize("family", ["sm100", "sm120"])
+@pytest.mark.parametrize("block_scale", [False, True])
+@pytest.mark.parametrize("multi", [False, True])
+@pytest.mark.parametrize("swap", [False, True])
+def test_moe_rejects_mismatched_k_before_launch(family, block_scale, multi, swap):
+    """Validate every operand's logical K before launch."""
+    compiled, vp, _, calls, weight = _recorded_moe_plan(family, block_scale, multi, False, swap)
+    workspace = torch.empty(compiled.workspace_bytes, device="cuda", dtype=torch.uint8)
+    compiled(vp, workspace=workspace)
+    assert len(calls) == 1
+    calls.clear()
+    good = vp[weight]
+    bad = torch.empty((*good.shape[:2], good.shape[2] // 2), device="cuda", dtype=good.dtype)
+    with pytest.raises(ValueError, match=r"K|\[E,N,K\]|\[1,S,K\]"):
+        compiled({**vp, weight: bad}, workspace=workspace)
+    assert calls == []
+
+
+@pytest.mark.no_workspace_shim
+@pytest.mark.parametrize("family", ["sm100", "sm120"])
+@pytest.mark.parametrize("block_scale", [False, True])
+@pytest.mark.parametrize("multi", [False, True])
+@pytest.mark.parametrize("swap", [False, True])
+@pytest.mark.parametrize("scratch", ["missing", "short"])
+def test_moe_workspace_failure_preserves_reduction_outputs(family, block_scale, multi, swap, scratch):
+    """Reject invalid scratch before initializing reduction outputs."""
+    compiled, vp, output, calls, _ = _recorded_moe_plan(family, block_scale, multi, True, swap)
+    workspace = None if scratch == "missing" else torch.empty(compiled.workspace_bytes - 1, device="cuda", dtype=torch.uint8)
+    with pytest.raises(ValueError, match="workspace|requires"):
+        compiled(vp, workspace=workspace)
+    assert calls == []
+    torch.testing.assert_close(output, torch.full_like(output, 17.0), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("family", ["sm100", "sm120"])
+@requires_sm100
+def test_moe_materializes_raw_and_pointwise_outputs(family):
+    """Write both raw and pointwise MoE materializations."""
+    import importlib
+    from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
+
+    graph = _build_graph(2, 128, 128, 128, num_groups=4)
+    _, binding = analyze_with_binding(graph)
+    raw = binding.outputs[0].set_data_type(cudnn.data_type.FLOAT)
+    relu = graph.relu(input=raw).set_data_type(cudnn.data_type.BFLOAT16).set_output(True)
+    chain, binding = analyze_with_binding(graph)
+    assert binding.outputs == [raw, relu]
+    assert len(chain.output_specs) == 2
+    compiler = importlib.import_module(f"cudnn.gemm.frost.{family}.compiler")
+    cfg = by_name("CONFIG_sm100_128x128x64_128x128x32_cluster1x1_1ctamma" if family == "sm100" else "CONFIG_sm120_64x64x64_16x16x32_cluster1x1_warps2x4")
+    compiled = compiler.jit_from_cudnn_graph(graph, cfg)
+    a = torch.zeros((1, 128, 128), device="cuda", dtype=torch.bfloat16)
+    a[:, :, 0] = torch.arange(128, device="cuda") - 64
+    b = torch.zeros((2, 128, 128), device="cuda", dtype=torch.bfloat16)
+    b[0, :, 0], b[1, :, 0] = 1, 2
+    offsets = torch.tensor([0, 0, 64, 128, 128], device="cuda", dtype=torch.int32)
+    first = torch.full((1, 128, 128), float("nan"), device="cuda")
+    second = torch.full_like(first, float("nan"), dtype=torch.bfloat16)
+    workspace = torch.empty(compiled.workspace_bytes, device="cuda", dtype=torch.uint8)
+    compiled({binding.a_operands[0]: a, binding.b_operands[0]: b, binding.first_token_offset: offsets, raw: first, relu: second}, workspace=workspace)
+    expected = a[:, :, :1].float().expand_as(first).clone()
+    expected[:, :64] *= 2
+    torch.testing.assert_close(first, expected, atol=0, rtol=0)
+    torch.testing.assert_close(second, expected.relu().to(torch.bfloat16), atol=0, rtol=0)

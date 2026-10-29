@@ -2846,7 +2846,9 @@ def test_row_quant_amax_uses_vector_reduce() -> None:
     """A scalar max tree lowers every pair to FSETP/FSEL.  Keep the row-block
     amax in TensorSSA form so MLIR lowers it to the compact vector reduction
     used by the specialized grouped-GLU epilogue."""
-    src = pathlib.Path(epilogue_codegen.__file__).read_text()
+    import inspect
+
+    src = inspect.getsource(epilogue_codegen._emit_block_quant_row)
     assert "cute.TensorSSA({p}_src.ir_value(), ({bs}, {n_sub}), cutlass.Float32)" in src
     assert "{p}_abs = cute.math.absf({p}_frg)" in src
     assert "cutlass._mlir.dialects.math.absf" not in src
@@ -3197,3 +3199,61 @@ def test_norm2_is_the_one_reduction_mode_this_engine_declines():
     red.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     with pytest.raises(NotImplementedError, match="square root"):
         probe_supported(g)
+
+
+@pytest.mark.parametrize("family", ["sm100", "sm120"])
+def test_binary_select_preserves_selected_values(family):
+    """Select without evaluating arithmetic on either branch."""
+    import importlib
+
+    graph = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    m = n = k = 128
+    a = graph.tensor(name="a", dim=[1, m, k], stride=[m * k, k, 1])
+    b = graph.tensor(name="b", dim=[1, k, n], stride=[k * n, 1, k])
+    other = graph.tensor(name="other", dim=[1, 1, n], stride=[n, n, 1], data_type=cudnn.data_type.FLOAT)
+    mask = graph.tensor(name="mask", dim=[1, 1, n], stride=[n, n, 1], data_type=cudnn.data_type.FLOAT)
+    c = graph.matmul(A=a, B=b).set_data_type(cudnn.data_type.FLOAT)
+    y = graph.binary_select(input0=c, input1=other, mask=mask).set_data_type(cudnn.data_type.FLOAT).set_output(True)
+    compiler = importlib.import_module(f"cudnn.gemm.frost.{family}.compiler")
+    cfg = by_name("CONFIG_sm100_128x128x64_128x128x32_cluster1x1_1ctamma" if family == "sm100" else "CONFIG_sm120_64x64x64_16x16x32_cluster1x1_warps2x4")
+    compiled = compiler.jit_from_cudnn_graph(graph, cfg)
+    av = torch.ones((1, m, k), device="cuda", dtype=torch.bfloat16)
+    bv = torch.eye(k, device="cuda", dtype=torch.bfloat16)[None]
+    choices = torch.tensor([1e20, float("inf"), float("-inf"), float("nan"), -0.0, 0.0, 3.0, -7.0], device="cuda").repeat(n // 8)[None, None]
+    masks = torch.tensor([1.0] * 8 + [0.0] * 8 + [-1.0] * 8 + [0.0] * 8, device="cuda").repeat(n // 32)[None, None]
+    out = torch.empty((1, m, n), device="cuda")
+    expected = torch.where(masks != 0, torch.ones_like(out), choices)
+    compiled({a: av, b: bv, other: choices, mask: masks, y: out})
+    torch.testing.assert_close(out, expected, atol=0, rtol=0, equal_nan=True)
+    assert torch.equal(torch.signbit(out), torch.signbit(expected))
+
+
+@pytest.mark.parametrize("family", ["sm100", "sm120"])
+@pytest.mark.parametrize("axis", ["m", "n", "mn"])
+@pytest.mark.parametrize("batch", [1, 2])
+def test_avg_reduction_uses_runtime_extents(family, axis, batch):
+    """Normalize AVG by the runtime reduction dimensions."""
+    import importlib
+
+    graph = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    m = n = k = 128
+    a = graph.tensor(name="a", dim=[batch, m, k], stride=[m * k, k, 1])
+    b = graph.tensor(name="b", dim=[batch, k, n], stride=[k * n, 1, k])
+    c = graph.matmul(A=a, B=b).set_data_type(cudnn.data_type.FLOAT)
+    dim = [1, 1 if "m" in axis else m, 1 if "n" in axis else n]
+    red = (
+        graph.reduction(input=c, mode=cudnn.reduction_mode.AVG)
+        .set_dim(dim)
+        .set_stride([dim[1] * dim[2], dim[2], 1])
+        .set_data_type(cudnn.data_type.FLOAT)
+        .set_output(True)
+    )
+    compiler = importlib.import_module(f"cudnn.gemm.frost.{family}.compiler")
+    cfg = by_name("CONFIG_sm100_128x128x64_128x128x32_cluster1x1_1ctamma" if family == "sm100" else "CONFIG_sm120_64x64x64_16x16x32_cluster1x1_warps2x4")
+    compiled = compiler.jit_from_cudnn_graph(graph, cfg)
+    for runtime_m, runtime_n in ((m, n), (2 * m if "m" in axis else m, 2 * n if "n" in axis else n)):
+        av = torch.ones((batch, runtime_m, k), device="cuda", dtype=torch.bfloat16)
+        bv = torch.ones((batch, runtime_n, k), device="cuda", dtype=torch.bfloat16)
+        out = torch.empty((1, 1 if "m" in axis else runtime_m, 1 if "n" in axis else runtime_n), device="cuda")
+        compiled({a: av, b: bv, red: out})
+        torch.testing.assert_close(out, torch.full_like(out, k), atol=0, rtol=0)

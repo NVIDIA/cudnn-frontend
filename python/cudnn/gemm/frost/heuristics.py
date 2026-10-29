@@ -1,17 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Family heuristics for ``frost_gemm``: the facts callable and the proposal
-callable the engine manifest names (``engines/manifest.py``).
-
-Same shape as the SDPA family (``cudnn.sdpa.fwd.heuristics``): the analyzer
-turns the graph into facts once, ``recommend`` proposes complete
-``PlanConfig(engine_id, GemmKnobs)`` entries from those facts alone, and every
-listed plan carries the exact tile config the engine will build -- so a recorded
-``(engine_id, knobs)`` replays the same kernel after the automatic pick changes.
-
-The shared planner proposes up to eight entries in calibrated paths, including
-geometry, split-K and swapAB choices, with the single-plan recommendation first.
-"""
+"""Family heuristics for ``frost_gemm``: the facts callable and the proposal callable the engine manifest names (``engines/manifest.py``)."""
 
 from __future__ import annotations
 

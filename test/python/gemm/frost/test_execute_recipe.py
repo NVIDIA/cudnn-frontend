@@ -957,3 +957,44 @@ def test_operand_batch_is_checked():
     one_batch_b = b[:1].contiguous()
     with pytest.raises(ValueError):
         compiled.lowered(_bound_buffers(compiled, a, one_batch_b, c), stream=None)
+
+
+@requires_sm100
+def test_split_k_missing_workspace_preserves_reduction_outputs():
+    """Check scratch before filling split-K reduction outputs."""
+    from cudnn.gemm.frost.tile_config import by_name
+
+    cfg = replace(by_name("CONFIG_sm100_128x128x64_128x128x32_cluster1x1_1ctamma"), split_k_slices=2)
+    compiled = jit_from_cudnn_graph(_row_reduction_graph(), cfg)
+    operands = _buffers_for(compiled)
+    seeds = [operands[o.index] for o in compiled.recipe.outputs if o.init is not None]
+    assert seeds
+    for output in seeds:
+        output.fill_(17.0)
+    with pytest.raises(ValueError, match="workspace"):
+        compiled.lowered(operands)
+    for output in seeds:
+        torch.testing.assert_close(output, torch.full_like(output, 17.0), atol=0, rtol=0)
+
+
+def test_sm120_swap_quant_diagnostic_uses_package_import(monkeypatch):
+    """Report the quantization error in the graph coordinate frame."""
+    from cudnn.gemm.frost.sm120 import compiler
+    from cudnn.gemm.frost.fusion_ir import BlockQuantizeSpec, FusionChain, MatmulSpec, OutputSpec, swap_ab
+    from cudnn.gemm.frost.tile_config import by_name
+
+    q = BlockQuantizeSpec(block_size=32, axis=2, source_ref=-1, scale_dtype="fp8_e8m0")
+    chain = FusionChain(matmul=MatmulSpec(128, 128, 128), quants=[q], output_specs=[OutputSpec(source_ref=-1, dtype="fp8_e4m3", quant_idx=0)])
+    compiled = object.__new__(compiler.CompiledFusedGemm)
+    compiled.chain = swap_ab(chain)
+    compiled.config = replace(by_name("CONFIG_sm120_64x64x64_16x16x32_cluster1x1_warps2x4"), swap_ab=True)
+    compiled.recipe = SimpleNamespace(device=0, problem=lambda *args: ((128, 128, 128), ()), batch=1)
+    for name in ("_check_plan_device", "check_shapes", "check_alignment"):
+        monkeypatch.setattr(compiler, name, lambda *args: None)
+
+    def reject(chain):
+        raise NotImplementedError("invalid quant extent")
+
+    monkeypatch.setattr(compiler, "_check_block_quant_semantics", reject)
+    with pytest.raises(ValueError, match="invalid quant extent"):
+        compiled.explain([])

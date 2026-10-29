@@ -1,18 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Tile-level helpers shared by the SM100 and SM120 kernel templates.
-
-A template is RENDERED (its `@@INJECT_*@@` blocks become module-level
-constants) and then exec'd from the kernel cache under a synthetic module
-name, so it cannot use relative imports and this module is never rendered.
-Everything here therefore takes what it needs as ARGUMENTS -- a helper that
-reads an injected constant (`mma_size_m`, `tile_swizzle_n`, `ab_dtype`, ...)
-has to stay in the template, or receive it explicitly.
-
-Scheduling and gather helpers serve both families. The tcgen05 wrappers are
-used only by the SM100 family and retain its instruction-specific contracts.
-"""
+"""Tile-level helpers shared by the SM100 and SM120 kernel templates."""
 
 from __future__ import annotations
 
@@ -25,11 +14,7 @@ from cutlass._mlir.dialects import llvm
 
 @cute.jit
 def l2_swizzle_tile(raw_m, raw_n, nt_m, nt_n, swizzle_w, identity=False):
-    """N-direction super-block rasterization of the (m, n) cgrp-tile coord, for
-    L2 reuse. ``identity=True`` compiles out the general mapping when the caller
-    knows that ``swizzle_w == 1``. A launch-time width of one also bypasses
-    the divisions, without specializing a separate kernel for each shape.
-    """
+    """N-direction super-block rasterization of the (m, n) cgrp-tile coord, for L2 reuse."""
     if cutlass.const_expr(identity):
         return raw_m, raw_n
     log_m, log_n = raw_m, raw_n
@@ -46,9 +31,7 @@ def l2_swizzle_tile(raw_m, raw_n, nt_m, nt_n, swizzle_w, identity=False):
 
 
 def epi_subtile_spans(cols, epi_n=32):
-    """Power-of-two column spans the epilogue drains a tile in (host-side).
-    Starts at ``epi_n`` and halves to fit the remainder, so any 8-multiple N is
-    covered whatever the widest span is."""
+    """Power-of-two column spans the epilogue drains a tile in (host-side)."""
     spans = []
     off = 0
     while off < cols:
@@ -68,14 +51,7 @@ CLUSTER_K_REDUCE_BARRIER_ID = 4
 def cluster_split_k_reduce(
     partial, mailbox, ready, free, iteration, k_rank, root_rank, plane_ctas: cutlass.Constexpr, slices: cutlass.Constexpr, epilogue_threads: cutlass.Constexpr
 ):
-    """Bulk-copy one fragment per peer to reusable slots on its K-rank-zero CTA.
-
-    All epilogue lanes participate before output masking. A producer publishes
-    its CTA-local staging before the elected bulk copy; transaction completion
-    makes the root's local reads safe. Root lanes rendezvous before the release
-    acknowledgement, so neither receive nor source slots can be reused early.
-    ``epilogue_threads`` covers exactly the caller's participating epilogue warps.
-    """
+    """Bulk-copy one fragment per peer to reusable slots on its K-rank-zero CTA."""
     tid = cute.arch.thread_idx()[0]
     warp = cute.arch.warp_idx()
     elected = nvvm.elect_sync()
@@ -119,12 +95,7 @@ def cluster_split_k_reduce(
 
 @cute.jit
 def extract_block_scale_sfb(stage, n_start, tile_n: cutlass.Constexpr, k_atoms: cutlass.Constexpr, stage_bytes: cutlass.Constexpr):
-    """Extract a tcgen05 N sub-tile in place from one or two F8_128x4 blocks.
-
-    All lanes gather the source words before overwriting each atom. The result
-    starts at row zero, keeping scale_b at its aligned TMEM base for every N.
-    Call warp-wide after the stage's SF-ready wait and before its UTCCP copies.
-    """
+    """Extract a tcgen05 N sub-tile in place from one or two F8_128x4 blocks."""
     words = cutlass.Array(base=stage.data_ptr(), shape=stage_bytes // 4, dtype=cutlass.Uint32)
     lane = cute.arch.lane_idx()
     for atom in cutlass.range_constexpr(k_atoms):
@@ -141,9 +112,7 @@ def extract_block_scale_sfb(stage, n_start, tile_n: cutlass.Constexpr, k_atoms: 
 
 
 def moe_swizzle_tile(t, nt_m, nt_n, swizzle_w):
-    """Group-local linear tile index -> (m, n) under an N-super-block walk.
-    ``swizzle_w == nt_n`` reproduces the plain n-fast split; ``1`` gives m-fast.
-    """
+    """Group-local linear tile index -> (m, n) under an N-super-block walk."""
     blk = cutlass.max(nt_m * swizzle_w, cutlass.Int32(1))
     sb = t // blk
     off = t - sb * blk
@@ -156,9 +125,6 @@ def moe_swizzle_tile(t, nt_m, nt_n, swizzle_w):
 
 @cute.jit
 def replace_tensormap_global_dim_0(desc_ptr, new_dim) -> None:
-    # Public DSL/NVVM builds reject ordinal 0 despite PTX using zero-based
-    # dimensions. Patch the shared-memory descriptor directly with legal PTX.
-    # The write must stay ordered before the caller copies/fences the descriptor.
     llvm.inline_asm(
         None,
         [desc_ptr.data_ptr().toint(dtype=cutlass.Int32).ir_value(), cutlass.Int32(new_dim).ir_value()],
@@ -221,12 +187,7 @@ def fence_tensormap_acquire(desc_ptr) -> None:
 
 @cute.jit
 def moe_group_at(visit_idx, num_groups, num_experts):
-    """Visitation index -> routed group index.
-
-    ``num_groups == num_experts`` (or a non-multiple) walks groups in order. Batched MoE
-    (``num_groups == B * num_experts``) walks expert-major -- the B groups sharing expert
-    ``g % E`` become consecutive, so the expert weight is fetched once instead of B times.
-    """
+    """Visitation index -> routed group index."""
     per_expert = num_groups // cutlass.max(num_experts, cutlass.Int32(1))
     group = visit_idx
     if per_expert > 1 and per_expert * num_experts == num_groups:
@@ -236,12 +197,7 @@ def moe_group_at(visit_idx, num_groups, num_experts):
 
 @cute.jit
 def copy_tensormap_to_workspace(src_desc_ptr, dst_i64_ptr) -> None:
-    """Copy the 128-byte A tensormap into ``dst_i64_ptr`` (seeds the SMEM copy).
-
-    The trip count is a compile-time constant, so this is a constexpr loop --
-    the templates had drifted into two spellings of the same fully-unrolled
-    copy (`range_constexpr` vs `range(..., unroll_full=True)`).
-    """
+    """Copy the 128-byte A tensormap into ``dst_i64_ptr`` (seeds the SMEM copy)."""
     src_words = cute.make_ptr(cutlass.Int64, src_desc_ptr.toint(), mem_space=cute.AddressSpace.generic)
     for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
         dst_i64_ptr.subview(i).store((src_words + i).load())
@@ -249,8 +205,6 @@ def copy_tensormap_to_workspace(src_desc_ptr, dst_i64_ptr) -> None:
 
 @cute.jit
 def moe_gather_row(token_index, row, group_end, source_rows):
-    # Never read beyond the routed group. An out-of-range source row asks TMA
-    # to zero-fill the padding while still completing the expected byte count.
     src = cutlass.Int32(source_rows)
     if row < group_end:
         src = cutlass.Int32(token_index[row])
@@ -281,13 +235,7 @@ def moe_combine_add(ptr, value, dtype: cutlass.Constexpr):
 
 @cute.jit
 def moe_combine_add_vector(ptr, values, dtype: cutlass.Constexpr, count: cutlass.Constexpr):
-    """At most 16 bytes of adjacent output elements, with scalar alignment ABI.
-
-    The full destination address includes the routed token's runtime row
-    stride. Halve the access when it is not naturally aligned; this preserves
-    support for shifted pointers and odd/padded row strides on plan reuse.
-    Atomicity remains per element, exactly as in the scalar path.
-    """
+    """At most 16 bytes of adjacent output elements, with scalar alignment ABI."""
     if cutlass.const_expr(count == 1):
         moe_combine_add(ptr, values[0], dtype)
     else:
@@ -374,12 +322,7 @@ def moe_combine_bulk(
     width: cutlass.Constexpr,
     dtype: cutlass.Constexpr,
 ):
-    """Reduce a complete staged feature tile, then release this thread's row.
-
-    Only its owning thread writes and reads a shared row. The async proxy fence
-    publishes those writes; read completion permits reuse without a CTA barrier.
-    Alignment and tail checks match moe_combine_stage's fallback predicate.
-    """
+    """Reduce a complete staged feature tile, then release this thread's row."""
     if row < group_end:
         token = token_index[row]
         slot = token_ks[row]
@@ -422,12 +365,7 @@ def moe_combine_swap_bulk(
     width: cutlass.Constexpr,
     features: cutlass.Constexpr,
 ):
-    """Publish a transposed BF16 tile and reduce one feature segment per token.
-
-    All 128 epilogue threads contribute features to each staged token row.
-    Publish before the first barrier, and wait for every async reader before
-    the second barrier permits any thread to overwrite the shared tile.
-    """
+    """Publish a transposed BF16 tile and reduce one feature segment per token."""
     cute.arch.fence_view_async_shared()
     nvvm.barrier_cta_sync(barrier_id=1, thread_count=128)
     if tid < width:
@@ -492,12 +430,7 @@ def tma_scatter4(desc, src, col, r0, r1, r2, r3):
 
 @cute.jit
 def tma_gather4(dst, desc, k, r0, r1, r2, r3, mbar, mask=None, cta_group: cutlass.Constexpr = 1):
-    """Gather four rows from a rank-2 tensor map with box_dims[1] == 1.
-
-    No mask selects shared::cta (SM120); a mask selects SM100 cluster multicast.
-    The experimental DSL TMA wrapper currently validates two coordinates for
-    this five-coordinate instruction, so issue the PTX directly.
-    """
+    """Gather four rows from a rank-2 tensor map with box_dims[1] == 1."""
     bar_addr = mbar.data_ptr().toint(dtype=cutlass.Int32)
     if cutlass.const_expr(cta_group == 2):
         bar_addr = bar_addr & cutlass.Int32(0xFEFFFFFF)
@@ -552,13 +485,7 @@ def moe_gather_scales(
     scales: cutlass.Constexpr,
     cta_group: cutlass.Constexpr = 1,
 ):
-    """TMA-load linear source SF, then publish an MMA 128x4 atom per stage.
-
-    A 16-byte SF window serves narrow K tiles too. Each four-row transfer uses
-    a 128-byte-aligned scratch slot (64 payload bytes). Scratch is producer-private
-    and reused only after all lanes have read it. The MMA stage barrier accounts
-    for a release arrival after packing, separately from the TMA scratch bytes.
-    """
+    """TMA-load linear source SF, then publish an MMA 128x4 atom per stage."""
     lane = cute.arch.lane_idx()
     with cute.arch.elect_one():
         nvvm.mbarrier_arrive_expect_tx(load_bar, rows * 16)

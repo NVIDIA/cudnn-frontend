@@ -26,6 +26,7 @@ from gemm_test_utils import (
 from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
 from cudnn.gemm.frost.epilogue_codegen import generate_mainloop
 from cudnn.gemm.frost.graph_analyzer import analyze
+from cudnn.gemm.frost.tile_config import by_name
 
 pytestmark = pytest.mark.L0
 
@@ -175,7 +176,7 @@ def test_zero_preserving_registry() -> None:
 def test_codegen_mainloop_b_snippet() -> None:
     chain = analyze(_mainloop_graph_ab("none", "relu", 256, 256, 128))
     snip = generate_mainloop(chain, "b")
-    assert "ml_f32_b = ml_vec_b.to(cutlass.Float32)" in snip
+    assert "ml_vec_b).to(cutlass.Float32)" in snip
     assert "ml_out_b = " in snip
     # A snippet is empty when only B is fused.
     assert generate_mainloop(chain, "a") == "pass"
@@ -205,8 +206,8 @@ def test_analyzer_chain_of_two_unary_a_ops() -> None:
 def test_codegen_mainloop_snippet_abs() -> None:
     chain = analyze(_mainloop_graph("abs", 256, 256, 128))
     snip = generate_mainloop(chain, "a")
-    assert "ml_f32_a = ml_vec_a.to(cutlass.Float32)" in snip
-    assert "cute.math.abs(ml_f32_a)" in snip
+    assert "ml_vec_a).to(cutlass.Float32)" in snip
+    assert "cute.math.abs(_c_ml_a_0)" in snip
     assert "ml_out_a = " in snip and ".to(cutlass.BFloat16)" in snip
 
 
@@ -337,6 +338,34 @@ def test_e2e_mainloop_int8(op, cfg) -> None:
     ref = torch.einsum("bmk,bnk->bmn", _TORCH_OP[op](a.cpu().to(torch.int64)), b.cpu().to(torch.int64)).float()
     diff = (c.cpu() - ref).abs().max().item()
     assert diff == 0.0, f"{cfg} {op}: max|diff|={diff} (expected bit-exact)"
+
+
+@pytest.mark.parametrize("operand", ["a", "b"])
+@pytest.mark.parametrize("op", ["abs", "relu", "neg"])
+@pytest.mark.parametrize("compute", [cudnn.data_type.INT32, cudnn.data_type.FLOAT], ids=["int32", "fp32"])
+@pytest.mark.parametrize("b_order", ["graph", "kernel"])
+@requires_sm100
+@requires_int8_mma
+def test_mainloop_int8_identity_preserves_signed_arithmetic(operand, op, compute, b_order):
+    """Preserve signed INT8 values through each declared compute dtype."""
+    m = n = k = 128
+    graph = cudnn.pygraph(io_data_type=cudnn.data_type.INT8, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.INT32)
+    a = graph.tensor(name="a", dim=[1, m, k], stride=[m * k, k, 1])
+    b = graph.tensor(name="b", dim=[1, k, n], stride=[k * n, 1, k])
+    transformed = getattr(graph, op)(input=a if operand == "a" else b, compute_data_type=compute).set_data_type(cudnn.data_type.INT8)
+    out = graph.matmul(A=transformed if operand == "a" else a, B=transformed if operand == "b" else b).set_data_type(cudnn.data_type.FLOAT).set_output(True)
+    plan = _plan(graph, config=by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"))
+    values = (torch.arange(m * k, device="cuda", dtype=torch.int32) % 16 - 8).to(torch.int8).reshape(1, m, k)
+    identity = torch.eye(k, device="cuda", dtype=torch.int8)[None]
+    av, bv = (values, identity) if operand == "a" else (identity, values)
+    if b_order == "graph":
+        bv = bv.transpose(1, 2)
+    output = torch.empty((1, m, n), device="cuda")
+    plan({a: av, b: bv, out: output})
+    expected = _TORCH_OP[op](values).float()
+    if operand == "b":
+        expected = expected.transpose(1, 2)
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
 
 
 @requires_sm100
@@ -959,3 +988,84 @@ def test_splitk_scalar_aux_mainloop() -> None:
     _run_splitk(compiled, _vp(compiled, a, b, c, *[auxmap[t.name] for t in compiled.chain.aux_tensors]))
     ref = torch.einsum("bmk,bnk->bmn", a.float() * av, b.float() * bv).to(torch.bfloat16)
     assert torch.equal(c, ref)
+
+
+@pytest.mark.parametrize("side", ["a", "b", "ab"])
+@pytest.mark.parametrize("cta_group", [1, 2])
+@requires_sm100
+def test_mainloop_reciprocal_masks_padded_k(side, cta_group):
+    """Exclude transformed padding from either MMA operand."""
+    m = n = 128
+    k = 136
+    graph = _mainloop_graph_ab("reciprocal" if "a" in side else "none", "reciprocal" if "b" in side else "none", m, n, k)
+    cfg = by_name(f"CONFIG_sm100_128x128x64_128x128x32_cluster{cta_group}x1_{cta_group}ctamma")
+    compiled = jit_from_cudnn_graph(graph, cfg)
+    from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
+
+    _, binding = analyze_with_binding(graph)
+    a = torch.ones((1, m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.ones((1, n, k), device="cuda", dtype=torch.bfloat16)
+    out = torch.full((1, m, n), float("nan"), device="cuda", dtype=torch.bfloat16)
+    compiled({binding.a_operands[0]: a, binding.b_operands[0]: b, binding.outputs[0]: out})
+    torch.testing.assert_close(out, torch.full_like(out, k), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("side", ["a", "b"])
+@pytest.mark.parametrize("integer_compute", [False, True])
+@requires_sm100
+def test_mainloop_preserves_intermediate_dtypes(side, integer_compute):
+    """Apply each mainloop node's compute and output dtypes."""
+    m = n = k = 128
+    graph = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    a = graph.tensor(name="a", dim=[1, m, k], stride=[m * k, k, 1])
+    b = graph.tensor(name="b", dim=[1, k, n], stride=[k * n, 1, k])
+    scalar = graph.tensor(name="scalar", dim=[1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.FLOAT)
+    value = a if side == "a" else b
+    value = graph.add(a=value, b=scalar, compute_data_type=cudnn.data_type.INT32 if integer_compute else cudnn.data_type.FLOAT)
+    value.set_data_type(cudnn.data_type.BFLOAT16)
+    value = graph.sub(a=value, b=scalar, compute_data_type=cudnn.data_type.FLOAT).set_data_type(cudnn.data_type.BFLOAT16)
+    y = graph.matmul(A=value if side == "a" else a, B=value if side == "b" else b).set_data_type(cudnn.data_type.FLOAT).set_output(True)
+    compiled = jit_from_cudnn_graph(graph, by_name("CONFIG_sm100_128x128x64_128x128x32_cluster1x1_1ctamma"))
+    raw = torch.full((1, m, k), 1.75 if integer_compute else 1.0, device="cuda", dtype=torch.bfloat16)
+    identity = torch.eye(k, device="cuda", dtype=torch.bfloat16)[None]
+    scale = torch.full((1, 1, 1), 0.0 if integer_compute else 256.0, device="cuda")
+    out = torch.empty((1, m, n), device="cuda")
+    compiled({a: raw if side == "a" else identity, b: raw if side == "b" else identity, scalar: scale, y: out})
+    torch.testing.assert_close(out, torch.full_like(out, 1.0 if integer_compute else 0.0), atol=0, rtol=0)
+
+
+@requires_sm100
+@pytest.mark.parametrize("side", ["a", "b"])
+@pytest.mark.parametrize("major", ["k", "mn"])
+@pytest.mark.parametrize("cta_group", [1, 2])
+def test_mixed_input_mainloop_masks_transformed_k_tail(side, major, cta_group):
+    """Mask transformed padding after a mainloop dtype conversion."""
+    m = n = 128
+    k = 144
+    graph = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    a = graph.tensor(
+        name="a",
+        dim=[1, m, k],
+        stride=[m * k, 1, m] if side == "a" and major == "mn" else [m * k, k, 1],
+        data_type=cudnn.data_type.INT8 if side == "a" else cudnn.data_type.BFLOAT16,
+    )
+    b = graph.tensor(
+        name="b",
+        dim=[1, k, n],
+        stride=[k * n, n, 1] if side == "b" and major == "mn" else [k * n, 1, k],
+        data_type=cudnn.data_type.INT8 if side == "b" else cudnn.data_type.BFLOAT16,
+    )
+    fused = graph.reciprocal(input=a if side == "a" else b).set_data_type(cudnn.data_type.BFLOAT16)
+    y = graph.matmul(A=fused if side == "a" else a, B=fused if side == "b" else b).set_data_type(cudnn.data_type.FLOAT).set_output(True)
+    cfg = by_name(f"CONFIG_sm100_128x128x128_128x128x32_cluster{cta_group}x1_{cta_group}ctamma")
+    compiled = jit_from_cudnn_graph(graph, cfg)
+    av = torch.ones((1, m, k), device="cuda", dtype=torch.int8 if side == "a" else torch.bfloat16)
+    bv = torch.ones((1, n, k), device="cuda", dtype=torch.int8 if side == "b" else torch.bfloat16)
+    if major == "mn":
+        if side == "a":
+            av = av.transpose(1, 2).contiguous().transpose(1, 2)
+        else:
+            bv = bv.transpose(1, 2).contiguous().transpose(1, 2)
+    result = torch.empty((1, m, n), device="cuda")
+    compiled({a: av, b: bv, y: result})
+    torch.testing.assert_close(result, torch.full_like(result, k), atol=0, rtol=0)

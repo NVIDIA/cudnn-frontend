@@ -61,11 +61,6 @@ class CostProfile:
     mn_bounds: tuple[int, int] = (32, 4096)
     k_bounds: tuple[int, int] = (1024, 16384)
     max_batch: int = 8
-    # Opt-in eligibility relaxations. The strict gate rejects nearly every real
-    # priority workload (measured on real chains: block-scale and per-tensor
-    # scale GEMMs carry trailing scalar-scale MULs; fp16 GEMMs commonly carry an
-    # n-major B), so a profile fitted on such workloads must opt in to govern
-    # them. Profiles that do not opt in keep the strict gate bit-for-bit.
     b_n_major_ok: bool = False
     scalar_scale_epilogue_ok: bool = False
 
@@ -223,15 +218,7 @@ def _simple_graph(chain: FusionChain) -> bool:
 
 
 def _eligible_graph(chain: FusionChain, profile: "CostProfile") -> bool:
-    """The strict gate, plus the relaxations this profile opted into.
-
-    Both relaxations preserve the cost model's validity by construction:
-    scalar-scale MUL epilogues add a near-constant per-element cost that is
-    identical for every candidate of the same layer (so the RANKING the model
-    produces is unchanged by ignoring it), and operand majorness does not
-    enter any cost feature. Candidate generation passes the view's B-layout
-    to select_config, so relaxed-eligibility candidates stay geometry-legal.
-    """
+    """The strict gate, plus the relaxations this profile opted into."""
     if _simple_graph(chain):
         return True
     mm = chain.matmul
@@ -249,10 +236,6 @@ def _eligible_graph(chain: FusionChain, profile: "CostProfile") -> bool:
     if chain.ops or chain.aux_tensors:
         if not profile.scalar_scale_epilogue_ok:
             return False
-        # Each op must be a scalar-scale MUL consuming an aux constant: a fan-in
-        # mul (both operands in-chain, no aux) multiplies two chain values and
-        # is not a constant epilogue, so it would break the equal-cost-per-
-        # candidate assumption this relaxation rests on.
         if not all(op.op == "mul" and op.aux is not None and op.parent_idx_b is None and op.parent_idx_c is None for op in chain.ops):
             return False
         if not all(getattr(t, "bcast_mode", None) == "scalar" for t in chain.aux_tensors):
@@ -302,12 +285,7 @@ _SMALL_M_WIDE_TILE_MAX_WEIGHT_TILES = 48
 
 
 def _small_m_block_scale_config(chain: FusionChain, baseline: TileConfig, device: DeviceProperties, shapes_fixed: bool) -> TileConfig | None:
-    """Swap decode tokens onto kernel N and split K within one CTA wave.
-
-    This bounded heuristic supplements the fitted profiles, without changing
-    their coefficients. Override-enabled graphs keep a 64-wide token tile and
-    a bounded weight grid, since their declared token count is only a hint.
-    """
+    """Swap decode tokens onto kernel N and split K within one CTA wave."""
     mm = chain.matmul
     if baseline.pipeline != "sm100" or not chain.has_block_scale or not _block_scale_supported(chain):
         return None
@@ -333,11 +311,6 @@ def candidate_configs(chain: FusionChain, baseline: TileConfig, device: DevicePr
     for swapped, view in ((False, chain), (True, swap_ab(chain))):
         mm = view.matmul
         if swapped and mm.a_major != "k":
-            # Swapping an n-major-B graph yields an m-major A, which the warp-
-            # scoped kernels do not serve: every such candidate would fail the
-            # probe. Skip the orientation instead of generating doomed picks.
-            # Strict-gate graphs (B k-major) always swap to a k-major A, so
-            # existing architectures never take this branch.
             continue
         family = {"_pipeline": "sm120", "_batch": mm.batch} if baseline.pipeline == "sm120" else {}
         auto = (
@@ -440,9 +413,6 @@ def select_strategies(
         except (NotImplementedError, ValueError):
             small_m = None
         else:
-            # This rule targets B200. On other GPUs retain
-            # the incumbent first: workspace-reducer overhead can reverse the
-            # winner, including on SM107's wider-K MMA path.
             if device.arch == 100:
                 selected = [small_m]
                 if limit > 1 and baseline != small_m:

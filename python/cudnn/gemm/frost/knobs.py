@@ -1,22 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The FROST GEMM engine's knobs: one :class:`~cudnn.gemm.frost.tile_config.TileConfig`
-spelled in the shared ``cudnn.knob_type`` vocabulary.
-
-A TileConfig carries geometry and strategy, reconstructed exactly from its canonical
-name (``tile_config.by_name``), so the knob record is that name's components
-as integers: the backend's own ``TILE_M`` / ``TILE_N`` / ``TILEK`` /
-``TILE_CGA_M`` / ``TILE_CGA_N`` / ``SPLIT_K_SLC`` / ``SWAP_AB`` where the meaning
-matches, and the frontend-only ``PIPELINE_ARCH`` / ``MMA_TILE_M`` / ``MMA_TILE_N``
-/ ``MMA_TILE_K`` / ``CTA_GROUP`` / ``WARPS_M`` / ``WARPS_N`` / ``CLUSTER_K_REDUCE`` for the axes the
-backend has no word for. K extents are BYTES, as in TileConfig, so one record
-serves every dtype.
-
-``GemmKnobs`` travels natively inside ``PlanConfig.knobs``; the engine converts
-at the public boundary (``FrostGemmEngine.knobs_to_public`` /
-``knobs_from_public``). A replayed record is honored exactly or declined
-(``plan_config``): never snapped to a neighbouring config.
-"""
+"""The FROST GEMM engine's knobs: one :class:`~cudnn.gemm.frost.tile_config.TileConfig` spelled in the shared ``cudnn.knob_type`` vocabulary."""
 
 from __future__ import annotations
 
@@ -64,8 +48,6 @@ class GemmKnobs:
         ("swap_ab", "SWAP_AB", False),
         ("cluster_k_reduce", "CLUSTER_K_REDUCE", False),
     )
-
-    # ---- TileConfig <-> knobs ---------------------------------------------
 
     @classmethod
     def from_config(cls, cfg: TileConfig) -> "GemmKnobs":
@@ -119,13 +101,8 @@ class GemmKnobs:
         return name
 
     def to_config(self) -> TileConfig:
-        """The TileConfig these knobs name. Raises (``KeyError`` for an unknown
-        spelling, ``NotImplementedError`` / ``ValueError`` from the family's
-        geometry checks) when the record names no config the catalog or the
-        family constructors admit -- the caller declines, never snaps."""
+        """The TileConfig these knobs name."""
         return by_name(self.config_name)
-
-    # ---- public vocabulary ---------------------------------------------
 
     def to_public(self) -> dict:
         """``{cudnn.knob_type: int}``: every axis this record carries (bools as 0/1)."""
