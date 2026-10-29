@@ -235,24 +235,25 @@ def test_DSA_sparse_attention_backward_sm100_h96_dispatch():
     assert _select_sm100_backend(96, 576, max_topk=512) == ("h96_h64_h32", 64)
     assert _select_sm100_backend(96, 576, max_topk=1024) == ("h96_h64_h32", 64)
     assert _select_sm100_backend(96, 576, max_topk=2048, deterministic=True) == ("h96_h64_h32", 64)
-    assert _select_sm100_backend(
-        96,
-        576,
-        head_dim_v=512,
-        dtype=torch.bfloat16,
-        max_topk=2048,
-        device_capability=(10, 0),
-        deterministic=False,
-    ) == ("h96_d576_2cta_m64", 64)
-    assert _select_sm100_backend(
-        96,
-        576,
-        head_dim_v=512,
-        dtype=torch.bfloat16,
-        max_topk=2048,
-        device_capability=(10, 0),
-        deterministic=True,
-    ) == ("h96_d576_2cta_m64", 64)
+    for max_topk in range(2048, 2052):
+        assert _select_sm100_backend(
+            96,
+            576,
+            head_dim_v=512,
+            dtype=torch.bfloat16,
+            max_topk=max_topk,
+            device_capability=(10, 0),
+            deterministic=False,
+        ) == ("h96_d576_2cta_m64", 64)
+        assert _select_sm100_backend(
+            96,
+            576,
+            head_dim_v=512,
+            dtype=torch.bfloat16,
+            max_topk=max_topk,
+            device_capability=(10, 0),
+            deterministic=True,
+        ) == ("h96_d576_2cta_m64", 64)
     assert _select_sm100_backend(
         96,
         576,
@@ -1245,6 +1246,104 @@ def test_DSA_sparse_attention_backward_sm100_h96_d576_topk2048_repeat():
         )
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("topk", [2048, 2049, 2050, 2051])
+@pytest.mark.parametrize("deterministic", [False, True], ids=["ordinary", "deterministic"])
+@torch_fork_set_rng(seed=20261029)
+def test_DSA_sparse_attention_backward_sm100_h96_d576_unaligned_topk_widths(topk, deterministic):
+    """Top-K 2048--2051 remains on the native H96 route with correct gradients."""
+    _require_sm100()
+    if torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
+        pytest.skip("H96/D576 two-CTA requires compute capability 10.0 or 10.3")
+    try:
+        from cuda.bindings import driver as cuda
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    s_q, s_kv = 4, topk + 17
+    num_heads, head_dim = 96, 576
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+    device = torch.device("cuda")
+    q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device) / 10
+    kv = torch.randn(s_kv, head_dim, dtype=torch.bfloat16, device=device) / 10
+    attn_sink = torch.randn(num_heads, dtype=torch.float32, device=device)
+    topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
+    out, lse = ref_sparse_attention_forward_chunked(q, kv, attn_sink, topk_idxs, softmax_scale=softmax_scale)
+    dout = torch.randn_like(out)
+
+    plan = DSA.SparseAttentionBackward(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        softmax_scale=softmax_scale,
+        deterministic=deterministic,
+    )
+    assert plan.check_support()
+    assert plan._backend == "h96_d576_2cta_m64"
+    plan.compile()
+    workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device=device)
+    dq, dkv, d_sink = torch.empty_like(q), torch.empty_like(kv), torch.empty_like(attn_sink)
+    result = plan.execute(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        dq,
+        dkv,
+        softmax_scale=softmax_scale,
+        workspace=workspace,
+        current_stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        d_sink=d_sink,
+    )
+    assert all(actual is expected for actual, expected in zip(result, (dq, dkv, d_sink)))
+    if deterministic:
+        first = tuple(tensor.clone() for tensor in result)
+        for buffer in (workspace, dq, dkv, d_sink):
+            buffer.view(torch.uint8).fill_(0xA5)
+        plan.execute(
+            q,
+            kv,
+            out,
+            dout,
+            lse,
+            attn_sink,
+            topk_idxs,
+            dq,
+            dkv,
+            softmax_scale=softmax_scale,
+            workspace=workspace,
+            current_stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            d_sink=d_sink,
+        )
+        for actual, expected in zip((dq, dkv, d_sink), first):
+            assert torch.equal(bitwise_bits(actual), bitwise_bits(expected))
+    check_ref_dsa_sparse_attention_backward(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        out,
+        dout,
+        lse,
+        dq,
+        dkv,
+        d_sink,
+        softmax_scale=softmax_scale,
+        atol=5e-2,
+        rtol=5e-2,
+    )
 
 
 @pytest.mark.L1
