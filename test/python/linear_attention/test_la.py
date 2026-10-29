@@ -1828,7 +1828,7 @@ def test_safe_gate_head_switch_same_process(backend, variant):
     backward, with explicit parameters and then with a_log absent, each forward against the fp64 reference."""
     configs = ((2, 2, 2), (4, 1, 1), (3, 3, 3), (1, 2, 2), (2, 2, 4))
     for i, (H, HK, HV) in enumerate(configs):
-        for T in ((256, SPLIT_T) if i < 2 else (256,)):
+        for T in (256, SPLIT_T) if i < 2 else (256,):
             case, kw, oracle = gate_mode_case(make_case(variant, torch.bfloat16, T=T, H=H, HK=HK, HV=HV), "safe", params="random", seed=SEED + 31 + i)
             o, fs = run_fwd(backend, case, output_final_state=True, **kw)
             o_ref, fs_ref = reference(case, **oracle)
@@ -1927,6 +1927,99 @@ def test_safe_gate_backward(backend, variant, K, gate_dtype):
         assert (got - ident).abs().max().item() / scale < ident_tol, name
     for name, leaf in (("dq", args[0]), ("dbeta", beta_leaf)):
         assert leaf.grad is not None and bool(torch.isfinite(leaf.grad).all()), name
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_kda_safe_gate_accepts_flat_dt_bias(backend):
+    """Megatron's flat ``[HO * K]`` parameter is a zero-copy public-API
+    alias of KDA's native ``[HO, K]`` safe-gate bias in the port and both
+    context-parallel summaries.  Autograd must return the original flat shape.
+    """
+    case, kw, _ = gate_mode_case(make_case("kda", torch.bfloat16, T=128, H=2, K=64, V=64), "safe", params="random", seed=SEED + 10)
+    matrix_bias = kw["dt_bias"].detach().clone().requires_grad_(True)
+    flat_bias = matrix_bias.detach().clone().reshape(-1).requires_grad_(True)
+
+    def port(bias):
+        out, _ = pinned_op(backend, "kda")(*op_args(case), **dict(kw, dt_bias=bias))
+        (grad,) = torch.autograd.grad(out.float().sum(), bias)
+        return out, grad
+
+    matrix_out, matrix_grad = port(matrix_bias)
+    flat_out, flat_grad = port(flat_bias)
+    assert_bitwise("flat dt_bias output", flat_out, matrix_out)
+    assert flat_grad.shape == flat_bias.shape
+    assert_bitwise("flat dt_bias gradient", flat_grad, matrix_grad.reshape(-1))
+
+    matrix_summary = run_summary(case, **dict(kw, dt_bias=matrix_bias.detach()))
+    flat_summary = run_summary(case, **dict(kw, dt_bias=flat_bias.detach()))
+    for name, got, want in zip(("H", "M"), flat_summary, matrix_summary):
+        assert_bitwise(f"flat dt_bias {name}", got, want)
+
+    set_seed(SEED + 11)
+    d_o = to_thd(torch.randn(case.B, case.T, case.HO, case.V, device="cuda", dtype=torch.float32) * 0.1).to(case.v.dtype)
+    matrix_g = run_summary_bwd(case, d_o, **dict(kw, dt_bias=matrix_bias.detach()))
+    flat_g = run_summary_bwd(case, d_o, **dict(kw, dt_bias=flat_bias.detach()))
+    assert_bitwise("flat dt_bias G", flat_g, matrix_g)
+
+
+def test_kda_public_safe_gate_normalizes_flat_dt_bias_before_dispatch(monkeypatch):
+    """Every public KDA entry gives its backend the native matrix view, while
+    the view keeps the flat parameter's storage and autograd shape.
+    """
+    captured = {}
+
+    def record(name, outputs):
+        def fake(*args, **kwargs):
+            captured[name] = kwargs["dt_bias"]
+            return outputs(kwargs["dt_bias"])
+
+        return fake
+
+    q = torch.randn(4, 2, 3, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    g = torch.randn(4, 2, 3, device="cuda")
+    beta = torch.randn(4, 2, device="cuda")
+    cu = torch.tensor([0, 4], device="cuda", dtype=torch.int32)
+    a_log = torch.randn(2, device="cuda")
+    dt_bias = torch.randn(6, device="cuda", requires_grad=True)
+
+    monkeypatch.setattr(
+        torch.ops.cudnn,
+        "kimi_delta_attention_fwd",
+        record("port", lambda bias: (v + bias.sum() * 0, v.new_empty(0), v.new_empty(0))),
+    )
+    monkeypatch.setattr(
+        torch.ops.cudnn,
+        "kimi_delta_attention_summary",
+        record("summary", lambda bias: (bias.sum().reshape(1, 1, 1, 1) * 0, bias.new_empty(0))),
+    )
+    monkeypatch.setattr(
+        torch.ops.cudnn,
+        "kimi_delta_attention_summary_bwd",
+        record("summary_bwd", lambda bias: (bias.sum().reshape(1, 1, 1, 1) * 0, bias.new_empty(0))),
+    )
+
+    out, _ = la_ops.kimi_delta_attention(q, k, v, g, beta, cu, safe_gate=True, a_log=a_log, dt_bias=dt_bias)
+    la_ops.kimi_delta_attention_summary(k, v, g, beta, cu, safe_gate=True, a_log=a_log, dt_bias=dt_bias)
+    la_ops.kimi_delta_attention_summary_bwd(q, k, g, beta, v, cu, safe_gate=True, a_log=a_log, dt_bias=dt_bias)
+    out.sum().backward()
+
+    for name, bias in captured.items():
+        assert bias.shape == (2, 3), name
+        assert bias.data_ptr() == dt_bias.data_ptr(), name
+    assert dt_bias.grad is not None and dt_bias.grad.shape == dt_bias.shape
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_kda_safe_gate_rejects_wrong_flat_dt_bias_length(backend):
+    """A malformed flat bias is rejected at the public boundary, before a
+    graph can allocate workspace or launch a kernel.
+    """
+    case, kw, _ = gate_mode_case(make_case("kda", torch.bfloat16, T=64, H=2, K=64, V=64), "safe")
+    bad_bias = kw["dt_bias"].new_empty(case.HO * case.K - 1)
+    with pytest.raises(ValueError, match=r"dt_bias must be \[HO, K\].*\[HO \* K\]"):
+        pinned_op(backend, "kda")(*op_args(case), **dict(kw, dt_bias=bad_bias))
 
 
 @pytest.mark.parametrize("param_dtype", [torch.bfloat16, torch.float16], ids=DTYPE_IDS.get)
