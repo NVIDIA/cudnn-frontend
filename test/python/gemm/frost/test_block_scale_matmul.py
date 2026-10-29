@@ -3540,3 +3540,59 @@ def test_sm120_fp4_rejects_non_k_major():
         g = _build_nvfp4_graph(256, 256, 256, a_major=a_major, b_major=b_major)
         with pytest.raises((ValueError, NotImplementedError), match="must be K-major"):
             jit_from_cudnn_graph(g, **_kw(_SM120_BS_128))
+
+
+_SM120_MXFP8 = dict(block_size=32, sf_dt=cudnn.data_type.FP8_E8M0, a_dt=cudnn.data_type.FP8_E4M3)
+
+
+@requires_sm120
+@pytest.mark.parametrize("K,a_major,b_major", [(144, "k", "k"), (130, "m", "n")], ids=["k_major", "mn_major"])
+def test_sm120_mxfp8_partial_scale_block_graph_is_declined(K, a_major, b_major):
+    """MXFP8 scales whole 32-element K blocks, yet only the 16-byte TMA rule gated K: K % 16 for
+    a K-major fp8 operand, nothing for M-major A with N-major B. A K ending inside a scale block
+    planned, and the kernel -- whose F8_128x4 scale-factor view holds floor(K / 32) scales per row
+    -- read zero-filled scales for the tail and another 128-row block's scales past the first
+    (audit finding B01: at M = N = 256, K = 144, 54025 of 65536 outputs wrong)."""
+    g = _build_nvfp4_graph(256, 256, K, a_major=a_major, b_major=b_major, **_SM120_MXFP8)
+    with pytest.raises(NotImplementedError, match="not a multiple of the scale block size 32"):
+        jit_from_cudnn_graph(g, **_kw(_SM120_BS_128))
+
+
+@requires_sm120
+def test_sm120_mxfp8_partial_scale_block_call_is_refused():
+    """The kernel binds K per call: a plan built at a whole-block K refuses a call whose K ends
+    inside a scale block before it writes anything, and still serves a K tail of whole blocks."""
+    M = N = 256
+    g = _build_nvfp4_graph(M, N, 160, **_SM120_MXFP8)
+    _, binding = analyze_with_binding(g)
+    compiled = jit_from_cudnn_graph(g, **_kw(_SM120_BS_128))
+    torch.manual_seed(0)
+
+    def call(K):
+        a = (torch.randn(1, M, K, device="cuda") * 0.5).to(torch.float8_e4m3fn)
+        b = (torch.randn(1, N, K, device="cuda") * 0.5).to(torch.float8_e4m3fn)
+        # ceil(K / 32) scales per row: a partial last block would carry a scale of its own.
+        sfa, sfb = _rand_e8m0((M, _ceil_div(K, 32)), "cuda"), _rand_e8m0((N, _ceil_div(K, 32)), "cuda")
+        c = torch.full((1, M, N), 7.0, dtype=torch.float16, device="cuda")
+        pack = {
+            binding.a_operands[0]: a,
+            binding.b_operands[0]: b,
+            binding.outputs[0]: c,
+            binding.sfa_operands[0]: _to_blocked(sfa).view(1, M, -1),
+            binding.sfb_operands[0]: _to_blocked(sfb).view(1, N, -1),
+        }
+        ref = (a[0].float() * sfa.float().repeat_interleave(32, 1)[:, :K]) @ (b[0].float() * sfb.float().repeat_interleave(32, 1)[:, :K]).t()
+        return pack, c, ref.to(torch.float16)
+
+    pack, c, ref = call(160)  # 1.25 K tiles, whole scale blocks
+    compiled(pack)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(c[0], ref, atol=2e-1, rtol=2e-2)
+    assert dict(compiled.deferrals) == {}
+
+    pack, c, _ = call(144)
+    with pytest.raises(ValueError, match="not a multiple of the scale block size 32"):
+        compiled(pack)
+    torch.cuda.synchronize()
+    assert torch.all(c == 7.0)
+    assert dict(compiled.deferrals) == {"partial scale block": 1}
