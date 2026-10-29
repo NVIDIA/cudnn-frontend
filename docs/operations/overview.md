@@ -28,7 +28,7 @@ The experimental API catalog includes:
 - [Causal Conv1d](/operations/CausalConv1d/causal_conv1d) and [Decode Update](/operations/CausalConv1d/causal_conv1d_update)
 - [FLA Integration Shims](/operations/LinearAttention/fla)
 - [Kimi Delta Attention in JAX](/operations/LinearAttention/kda_jax)
-- [Kimi CP State Merge](/operations/LinearAttention/kimi_cp_merge) — explicit merge of FP32 rank or piece summaries
+- [Kimi CP State Merge](/operations/LinearAttention/kimi_cp_merge) — explicit IEEE FP32 merge of rank or piece summaries
 - [GEMM + Amax](/operations/Matmul/gemm_fusions/gemm_amax)
 - [GEMM + RoPE + MXFP8 Projection](/operations/Matmul/gemm_fusions/gemm_proj_rope_mxfp8)
 - [Gated Attention Block (SM107)](/operations/Attention/gated_attention_block) — projection, QK-norm + RoPE, SDPA, sigmoid gate, out projection as one FROST block (bf16 / FP8 / MXFP8, optional MXFP4 weights and NVFP4 / MXFP4 output); index-list sparse attention (`QsaSpec`) and write-through into a paged KV cache

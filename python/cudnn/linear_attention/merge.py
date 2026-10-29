@@ -15,8 +15,6 @@ from cudnn.tensor_adapter import get_compute_capability
 
 __all__ = ["KimiCPMerge", "kimi_cp_merge"]
 
-MERGE_PRECISIONS = ("ieee", "bf16", "tf32", "tf32x3")
-
 
 def _compact(shape, stride):
     expected = 1
@@ -59,21 +57,23 @@ class KimiCPMerge(APIBase):
     receives the composed transition in the same walk order. No autograd is
     registered: CP integrations explicitly merge backward G/M with reverse=True.
 
-    Supported targets are SM100/SM103/SM107 with CuTeDSL >= 4.8.0 (SM107 also
-    needs compiler target sm_107a). All input/output buffers must be disjoint.
+    The merge uses the existing IEEE FP32 FMA state chain; it does not consult
+    ambient Torch matmul precision settings. Supported targets are SM100/SM103
+    with CuTeDSL >= 4.7.0 and SM107 with a DSL build that contains the sm_107a
+    target (first available in the public 4.8.0 wheel). The cudnn-frontend
+    package requires CuTeDSL >= 4.8.0. All input/output buffers must be disjoint.
     initial_states has H's shape; final_state/initial_state are [1, heads, V, K];
     transition is [1, heads, K, K]. Optional initial_state defaults to zeros;
     absent transition disables product output. No device storage is plan-owned.
-    Numerical precision and direction are fixed at compile time. Pass already
-    gathered FP32 summaries: no implicit conversion, communication or fallback.
+    Direction is fixed at compile time. Pass already gathered FP32 summaries:
+    no implicit conversion, communication or fallback.
     The caller orders summary/seed production before the launch stream and
     prevents concurrent writes or overlapping executions on the same buffers.
     """
 
-    def __init__(self, h, m, initial_states, final_state, initial_state=None, *, reverse=False, precision="tf32x3", transition=None):
+    def __init__(self, h, m, initial_states, final_state, initial_state=None, *, reverse=False, transition=None):
         super().__init__()
         self._warn_experimental_api()
-        self.precision = precision
         self.reverse = reverse
         declarations = dict(h=h, m=m, initial_states=initial_states, final_state=final_state, initial_state=initial_state, transition=transition)
         self._descriptors = {}
@@ -92,8 +92,6 @@ class KimiCPMerge(APIBase):
 
     def check_support(self):
         self._is_supported = False
-        if self.precision not in MERGE_PRECISIONS:
-            raise ValueError(f"precision must be one of {MERGE_PRECISIONS}")
         if not isinstance(self.reverse, bool):
             raise ValueError("reverse must be a bool")
         h = self._descriptors["h"]
@@ -152,7 +150,6 @@ class KimiCPMerge(APIBase):
                     emit_summary=self._descriptors["transition"] is not None,
                     device=self._device,
                     opt_level=3,
-                    merge_precision=self.precision,
                 )
         return self
 
@@ -177,8 +174,8 @@ class KimiCPMerge(APIBase):
         """
         if self._compiled_kernel is None:
             raise RuntimeError("Call compile() before execute()")
-        if self.precision != self._compiled_kernel.merge_precision or self.reverse != self._compiled_kernel.transpose:
-            raise ValueError("precision/reverse are fixed at compilation; construct a new KimiCPMerge plan")
+        if self.reverse != self._compiled_kernel.transpose:
+            raise ValueError("reverse is fixed at compilation; construct a new KimiCPMerge plan")
         tensors = dict(h=h, m=m, initial_states=initial_states, final_state=final_state, initial_state=initial_state, transition=transition)
         spans = []
         for name, tensor in tensors.items():
@@ -202,7 +199,7 @@ class KimiCPMerge(APIBase):
 
 
 @lru_cache(maxsize=128)
-def _plan(shape, device, has_seed, reverse, precision, output_transition):
+def _plan(shape, device, has_seed, reverse, output_transition):
     p, heads, v, k = shape
 
     def desc(s):
@@ -220,25 +217,22 @@ def _plan(shape, device, has_seed, reverse, precision, output_transition):
         desc((1, heads, v, k)),
         desc((1, heads, v, k)) if has_seed else None,
         reverse=reverse,
-        precision=precision,
         transition=desc((1, heads, k, k)) if output_transition else None,
     )
     return plan.compile()
 
 
-def kimi_cp_merge(h, m, initial_state=None, *, reverse=False, precision="tf32x3", output_transition=False, current_stream=None):
+def kimi_cp_merge(h, m, initial_state=None, *, reverse=False, output_transition=False, current_stream=None):
     """Allocate merge outputs; return TupleDict(initial_states, final_state, transition).
 
     Caller performs all-gather and supplies FP32 H/M in rank/piece order. The
-    additive H is never rounded; precision applies to running state/product and
-    M multiplication operands only. The public API defaults to TF32x3 to avoid
-    low-precision error accumulation across long CP chains; pass precision="ieee"
-    for the existing IEEE FP32 FMA path.
+    merge uses the existing IEEE FP32 FMA state chain for its multiplication,
+    running state/product, additive H and outputs.
     Inputs use the compact CUDA FP32 row-state layout described by KimiCPMerge;
     return shapes are [pieces, heads, V, K], [1, heads, V, K] and optional
     [1, heads, K, K]. This convenience wrapper allocates on current_stream;
     the prepared class is the allocation-free entry. Autograd-enabled inputs,
-    overlapping inputs, dtype/layout mismatches and invalid modes raise before
+    overlapping inputs and dtype/layout/direction mismatches raise before
     compilation or output allocation. No summary generation is performed.
     No producer-stream wait is inserted; the caller orders H/M/seed production
     before current_stream and serializes access to all merge buffers until the
@@ -247,8 +241,8 @@ def kimi_cp_merge(h, m, initial_state=None, *, reverse=False, precision="tf32x3"
     """
     if not isinstance(h, torch.Tensor) or not h.is_cuda or h.ndim != 4:
         raise ValueError("h must be a CUDA tensor of shape [pieces, heads, V, K]")
-    if precision not in MERGE_PRECISIONS or not isinstance(reverse, bool) or not isinstance(output_transition, bool):
-        raise ValueError(f"precision must be one of {MERGE_PRECISIONS}; reverse and output_transition must be bools")
+    if not isinstance(reverse, bool) or not isinstance(output_transition, bool):
+        raise ValueError("reverse and output_transition must be bools")
     p, heads, v, k = h.shape
     spans = [_tensor_span("h", h, tuple(h.shape), h.device), _tensor_span("m", m, (p, heads, k, k), h.device)]
     if initial_state is not None:
@@ -259,7 +253,7 @@ def kimi_cp_merge(h, m, initial_state=None, *, reverse=False, precision="tf32x3"
         if stream.device != h.device:
             raise ValueError("merge stream and operands must use the same device")
         with torch.cuda.stream(stream):
-            plan = _plan(tuple(h.shape), h.device, initial_state is not None, reverse, precision, output_transition)
+            plan = _plan(tuple(h.shape), h.device, initial_state is not None, reverse, output_transition)
             p, heads, v, k = h.shape
             states = torch.empty((p, heads, v, k), device=h.device, dtype=torch.float32)
             tail = torch.empty((1, heads, v, k), device=h.device, dtype=torch.float32)
