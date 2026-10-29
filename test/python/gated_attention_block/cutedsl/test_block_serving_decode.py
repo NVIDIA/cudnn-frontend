@@ -37,6 +37,11 @@ same values BITWISE on every page size (16 / 32 / 64 / 128) and f16; a block tab
 arbitrary row stride (bitwise the compact table); CUDA-graph capture of the FIRST execute on a NEW stream with no warm-up and
 the replay with new lengths / tables / slots / inputs bitwise the eager run; ``get_workspace_size()`` honest (the split
 partials inside, a sentinel past the carve untouched); two launches bitwise.
+
+Both-parts cells (``requires_dense_part``, 2026-10-29; the end of the module): a serving stack's PACKED K|V cache -- ONE ``[pages, 4, P, 512]``
+tensor, K in columns ``[0, D)`` and V in ``[D, 2D)`` of every row -- bound as the two half views at the 24 / 4 geometry, page 16 with one
+token per sequence and page 32 with a four-token step, kv to 2048 with a padded and a short entry, int64 slots, bf16 and f16: the oracle,
+the write-through in the right halves with every other byte untouched, two launches bitwise, bitwise the HND-compact twin.
 """
 
 import contextlib
@@ -82,6 +87,7 @@ pytestmark = pytest.mark.L0
 
 requires_rubin = pytest.mark.requires_rubin  # the suite's registered marker (conftest.py): skipped off SM107
 requires_blackwell = pytest.mark.requires_blackwell  # the registered marker: an admitted Blackwell-line part of DENSE_SERVING_CCS (cc 10.0)
+requires_dense_part = pytest.mark.requires_dense_part  # the registered marker: EVERY served part of DENSE_SERVING_CCS (cc 10.7 and cc 10.0)
 _SM100 = (10, 0)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -2840,3 +2846,104 @@ def test_sm100_declines_the_rubin_only_knobs_by_name():
     with pytest.raises(NotImplementedError, match="the 32-column SM100 decode arm: its cc 10.0 accept cells have not run"):
         _make_block(6, 32, 3, max_kv_len=4096, n_pages=256)  # the adapter's 32-column arm at a wide launch: declined by name on the part
     assert _cc() == _SM100 and GatedAttentionBlockFwd.serving_envelope(_geom(16)[0], torch.bfloat16, _DEV).forms == ("extend", "decode")
+
+
+# ---------------------------------------------------------------------------
+# Both served parts (requires_dense_part; 2026-10-29): a serving stack's PACKED K|V cache rows bound as two half views
+# ---------------------------------------------------------------------------
+#
+# A serving stack keeps ONE cache tensor per layer, [num_pages, H_kv, P, 2D] -- K in columns [0, D) and V in [D, 2D) of every row (the HND cache
+# of the 24 / 4 model family: [pages, 4, 16 or 32, 512] bf16) -- and hands the block its two halves as the pools, kv[..., :D] / kv[..., D:]: the
+# "unified" layout of the matrix above at the stack's OWN shape.  The cells here mirror that binding literally -- 24 / 4 at d 256, page 16 with
+# one token per sequence and page 32 with a four-token speculative step, a 2048-key context next to a padded entry and a short one, the stack's
+# int64 slot mapping -- and prove the ONE tensor behind the views: the step's rows land in the K half and the V half alone (bitwise the slab
+# bands attention consumed), the prefix rows are untouched, and every byte of every row nobody addressed -- block 0 among them -- still holds
+# the sentinel in BOTH halves (a K store running past D would land in the V half of the same row, and vice versa); the oracle, two launches
+# bitwise, bitwise the HND-compact twin.  Both parts: the gate in the combine on cc 10.7, its own launch on cc 10.0.
+
+_PACKED_KV_LENS = (2048, 0, 5, 1000, 33)  # the stack's longest context, a PADDED entry, a short one (kv_lens >= S_q at S_q 4), two tails
+_PACKED_KV_CELLS = [pytest.param(16, 1, id="p16-plain"), pytest.param(32, 4, id="p32-mtp4")]  # (page, S_q): one token per sequence / a 4-token step
+
+
+def _packed_kv_case(page, s_q, dtype, *, layout="unified", seed=11):
+    """ONE compiled 24 / 4 DECODE cell per (page, S_q, dtype, layout) on the served part's default chain: the gate in the split combine on cc
+    10.7, its own launch on cc 10.0 (``fuse_gate=False``, the placement the SM100 row serves)."""
+    blk_kw = {} if _cc() == _SM107 else dict(fuse_gate=False)
+    return _case(("packed_kv", page, s_q, dtype, layout), 6, s_q, _PACKED_KV_LENS, page=page, layout=layout, dtype=dtype, seed=seed, blk_kw=blk_kw)
+
+
+def _run_with_slots(case, slot_dtype):
+    """One execute with the slot mapping in ``slot_dtype`` (the stack's int64), synchronized; ``out`` cloned."""
+    case.execute(slot_mapping=case.slot_mapping.to(slot_dtype))
+    torch.cuda.synchronize()
+    return case.out.clone()
+
+
+def _assert_packed_kv_halves(case, what):
+    """The ONE tensor behind ``case.k_cache`` / ``case.v_cache`` and the row contract on it after an execute: the two views are the halves of a
+    contiguous ``[num_pages, H_kv, P, 2D]`` tensor (the V view's base ``D`` elements past the K view's, both with strides ``(H_kv*P*2D, P*2D,
+    2D, 1)``); the step's slots hold the slab's K band in the K half and the slab's V band in the V half, bitwise; the prefix rows (written by
+    torch before the run) are unchanged in both halves; every row nobody addressed -- the NULL block 0, the stale rows past ``kv_lens`` on a
+    sequence's last page, the spare pages -- still holds the sentinel in BOTH halves.  Returns the number of addressed rows (slots)."""
+    kv, page, D = case.k_cache._base, case.page, _D
+    h_kv = int(case.k_cache.shape[1])
+    assert kv is case.v_cache._base and tuple(kv.shape) == (case.n_pages, h_kv, page, 2 * D) and kv.is_contiguous(), f"{what}: not ONE [P, H, page, 2D] tensor"
+    assert (
+        case.k_cache.data_ptr() == kv.data_ptr() and case.v_cache.data_ptr() == kv.data_ptr() + D * kv.element_size()
+    ), f"{what}: the views are not the two halves"
+    assert tuple(case.k_cache.stride()) == tuple(case.v_cache.stride()) == (h_kv * page * 2 * D, page * 2 * D, 2 * D, 1), f"{what}: the half views' strides"
+    _, _, k_band, v_band = _slab_bands(case)
+    slot = case.slot_mapping
+    live = slot >= 0
+    s = slot[live].long()
+    assert torch.equal(_bits(case.k_cache[s // page, :, s % page, :]), _bits(k_band[live])), f"{what}: the K half at the step's slots is not the slab's K band"
+    assert torch.equal(_bits(case.v_cache[s // page, :, s % page, :]), _bits(v_band[live])), f"{what}: the V half at the step's slots is not the slab's V band"
+    addressed = torch.zeros(case.n_pages * page, dtype=torch.bool, device=_DEV)
+    for b, L in enumerate(case.kv_lens):
+        if L == 0:
+            continue
+        pos = torch.arange(L, device=_DEV)
+        slots_b = case.block_table[b, : -(-L // page)].long()[pos // page] * page + pos % page
+        addressed[slots_b] = True
+        n_pre = L - case.s_q
+        if n_pre:
+            sp = slots_b[:n_pre]
+            k_ref, v_ref = (x[:n_pre].to(case.dtype) for x in case.ref_rows[b])
+            assert torch.equal(_bits(case.k_cache[sp // page, :, sp % page, :]), _bits(k_ref)), f"{what}: a prefix K row of sequence {b} changed"
+            assert torch.equal(_bits(case.v_cache[sp // page, :, sp % page, :]), _bits(v_ref)), f"{what}: a prefix V row of sequence {b} changed"
+    assert not bool(addressed[:page].any()), f"{what}: block 0 is the NULL block, never addressed"
+    rows = kv.permute(0, 2, 1, 3).reshape(case.n_pages * page, h_kv, 2 * D)  # one [H_kv, 2D] content row per slot
+    assert bool((rows[~addressed] == _SENTINEL).all()), f"{what}: a row nobody addressed was written, in one of the two halves"
+    return int(addressed.sum().item())
+
+
+@requires_dense_part
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+@pytest.mark.parametrize("page, s_q", _PACKED_KV_CELLS)
+def test_packed_kv_rows_of_a_serving_stack_bind_as_two_half_views_on_the_decode_form(page, s_q, dtype):
+    """The stack's ONE ``[pages, 4, P, 512]`` cache tensor bound as the two half views on the DECODE form at 24 / 4: page 16 with one token per
+    sequence, page 32 with a four-token speculative step, kv 2048 / 0 (padded) / 5 / 1000 / 33, int64 slots, bf16 and f16 -- ``out`` within the
+    oracle's budget (the padded entry exactly 0), the write-through in the right halves and nothing else touched (``_assert_packed_kv_halves``),
+    two launches bitwise, bitwise the HND-compact twin on the same inputs, the route pinned against the part's table."""
+    case = _packed_kv_case(page, s_q, dtype)
+    what = f"packed K|V rows 24/4 p{page} S_q {s_q} {dtype}"
+    out = _run_with_slots(case, torch.int64)
+    case.check_against_oracle(out, what=what)
+    n_rows = _assert_packed_kv_halves(case, what)
+    assert (
+        n_rows == sum(_PACKED_KV_LENS) and _written(case.k_cache) == _written(case.v_cache) == n_rows * 4
+    ), f"{what}: the written rows are not the addressed ones"
+    again = _run_with_slots(case, torch.int64)
+    assert torch.equal(out, again), f"{what}: two launches differ"
+    _assert_packed_kv_halves(case, what + " (second launch)")
+    twin = _packed_kv_case(page, s_q, dtype, layout="hnd")
+    assert twin.k_cache._base is None and twin.k_cache.is_contiguous(), "the twin: two compact tensors"
+    out_h = _run_with_slots(twin, torch.int64)
+    twin.check_against_oracle(out_h, what=what + " (HND twin)")
+    assert torch.equal(out, out_h), f"{what}: out differs from the HND-compact twin's: max|diff| {(out.float() - out_h.float()).abs().max().item():.3e}"
+    r = case.blk.decode_route
+    if _cc() == _SM107:
+        assert (r.tile, r.n_q, r.token_units, r.pack_gqa) == _ROUTE_TABLES[DECODE_ROUTE_SINGLE_UNIT][6][s_q] and case.blk.gate_fused, r
+        assert case.route_readback()["file"].endswith("/sm107/decode_d256_f16.py")
+    else:
+        _sm100_pin(case, _SM100_ROUTE_TABLE[6][s_q])

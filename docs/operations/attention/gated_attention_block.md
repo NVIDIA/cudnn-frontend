@@ -670,6 +670,18 @@ same `[T, H_kv, D]` views.
 | `index_k_raw` | `[num_pages, P, index_head_dim]` activation dtype, `D` contiguous: the raw indexer key's pool, written at the same slots | REQUIRED iff the geometry declares the indexer band (`QsaSpec.index_band`), refused otherwise |
 | `block_table`, `kv_lens` | the paged-READ modes' page table and logical KV lengths ("Serving: the extend form" / "Serving: the decode form" below) | REQUIRED under `kv_source="paged"`; refused (`ValueError`) on a block declared `kv_source="self"`, which attends over its own K / V |
 
+**A serving stack's packed K|V cache** -- ONE tensor per layer, `[num_pages, H_kv, P, 2D]`, holding K in columns `[0, D)` and V in `[D, 2D)`
+of every row (the HND cache of the 24 / 4 model family at `d_head` 256: `[pages, 4, 16 or 32, 512]` bf16) -- IS the unified layout above and
+is bound without a copy as its two half VIEWS, `k_cache = kv[..., :D]` and `v_cache = kv[..., D:]`: both views carry the strides
+`(H_kv*P*2D, P*2D, 2D, 1)` -- `D` contiguous, every other stride a whole number of 16-byte vectors (`2D` elements = 1024 B at d256), the V
+view's base `D` elements past the K view's -- so the pool contract admits them and the two samples share one layout kind. The write-through
+lands K in the `[0, D)` half and V in the `[D, 2D)` half of a token's row and touches no other byte of the tensor (the other half of a written
+row is a row of the OTHER pool), and the paged forms read the halves back. Pinned by one cell per form at the stack's own shape -- 24 / 4,
+pages 16 (one token per sequence) and 32 (a four-token speculative step), kv to 2048 with a padded and a short entry, int64 slots, bf16 and
+f16; `out` bitwise the HND-compact pools', every other byte of the tensor untouched (the `packed_kv_rows` cells of
+`test_block_serving_decode.py` / `test_block_serving_extend.py`, L0 on every served part). Validated per form: the DECODE cells passed on
+cc 10.0 and on cc 10.7; the EXTEND cells passed on cc 10.0, and on cc 10.7 (a Rubin development node).
+
 `P` is a positive multiple of 16 (the serving stacks' page granularity; a 4-token sparse block then never straddles a page);
 a block declared without the attribute REFUSES every one of these inputs (`ValueError`) rather than ignoring a pool it would
 never write. **`fuse_cache_write`** (appended; `None` = auto): on the bf16 / f16 fused norm + RoPE pipeline without an indexer band the write-through
