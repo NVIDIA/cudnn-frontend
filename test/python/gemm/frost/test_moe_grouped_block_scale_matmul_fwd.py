@@ -20,6 +20,9 @@ from gemm_test_utils import (
     requires_sm100,
     requires_sm107,
     requires_sm120,
+    keep_kernel_ptx,
+    kernel_ptx,
+    brev_bfind_types,
     Plan as _plan,
     vp_bs as _vp_bs,
     E2M1 as _E2M1,
@@ -2962,6 +2965,36 @@ def test_sm120_moe_block_scale_render_smoke(combo: str, mode: str) -> None:
 @requires_sm120
 def test_e2e_nvfp4_groups_sm120(offsets_list, cfg_name) -> None:
     _run_e2e(E=2, S=1024, N=256, K=512, offsets_list=offsets_list, config_name=cfg_name, cta_group=None)
+
+
+@requires_sm120
+@pytest.mark.parametrize("swap_ab", [False, True])
+def test_sm120_moe_block_scale_scheduler_lane_search_is_unsigned(swap_ab, monkeypatch, tmp_path) -> None:
+    """The block-scale scheduler's twin of test_moe_grouped_matmul_fwd.py::
+    test_sm120_moe_scheduler_lane_search_is_unsigned: lane 0 wins for a first claim
+    in group 0 and, after 31 empty groups, at group 32 in the second 32-group
+    window. The routed result matches the reference and the bfind of the
+    bit-reversed ballot is bfind.u32 (bfind.s32 made the lane 32 whenever lane 0
+    won)."""
+    from cudnn.gemm.frost.sm120 import compiler as C120
+
+    keep_kernel_ptx(monkeypatch, C120, tmp_path)
+    offsets_list = [0, 128] + [128] * 31 + [384, 421]
+    compiled = _run_e2e(
+        E=len(offsets_list) - 1,
+        S=421,
+        N=128,
+        K=256,
+        offsets_list=offsets_list,
+        config_name=_SM120_BS_CFG,
+        cta_group=None,
+        swap_ab=swap_ab,
+    )
+    ptx = kernel_ptx(compiled)
+    assert "vote.sync.ballot.b32" in ptx
+    lane_search = brev_bfind_types(ptx)  # the scheduler's 31 - bfind(brev(ballot))
+    assert lane_search, "no bfind reads a brev.b32 result in the kernel PTX"
+    assert set(lane_search) == {"u32"}, f"the grouped scheduler's lane search uses {['bfind.' + t for t in lane_search]}, not bfind.u32"
 
 
 @pytest.mark.parametrize("combo", ["mxfp4", "mxfp8"])

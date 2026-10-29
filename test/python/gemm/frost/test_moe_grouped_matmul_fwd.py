@@ -25,6 +25,9 @@ from gemm_test_utils import (
     block_quant_ref as _block_quant_ref,
     reduction_ref as _reduction_ref,
     reduction_dims as _reduction_dims,
+    keep_kernel_ptx,
+    kernel_ptx,
+    brev_bfind_types,
     FULL_EXPERT_REDUCE_OFFSETS as _FULL_EXPERT_REDUCE_OFFSETS,
     plan_as_sm100,
 )
@@ -1260,6 +1263,44 @@ def test_moe_grouped_matmul_fwd_direct_call_requires_workspace() -> None:
     compiled(vp)
     torch.cuda.synchronize()
     torch.testing.assert_close(output[0], _ref_f32(token, weight, _offsets(group_sizes, S), S, N, E).to(torch.bfloat16), atol=1e-1, rtol=1e-2)
+
+
+# Group 0, then 31 empty groups: a CTA whose first claim lies past group 0 finds
+# no tile in the first 32-group window and takes group 32 at lane 0 of the next.
+_LANE0_GROUP_SIZES = [128] + [0] * 31 + [256, 37]
+
+
+@requires_sm120
+@pytest.mark.parametrize("swap_ab", [False, True])
+def test_sm120_moe_scheduler_lane_search_is_unsigned(swap_ab, monkeypatch, tmp_path) -> None:
+    """The grouped scheduler takes the lowest lane of a suffix ballot. On the Int32
+    ballot, ``cute.arch.bfind`` emitted bfind.s32, which returns 0xFFFFFFFF for
+    brev(0xFFFFFFFF) == -1: whenever lane 0 won (a first claim in group 0, or the
+    first group of a later 32-group window) the lane came out as 32, and shfl.sync
+    read lane 0 only through its 5-bit lane field. Both cases run against the
+    reference here; the bfind that reads the bit-reversed ballot must then be
+    bfind.u32."""
+    from cudnn.gemm.frost.sm120 import compiler as C120
+
+    keep_kernel_ptx(monkeypatch, C120, tmp_path)
+    E, N, K = len(_LANE0_GROUP_SIZES), 128, 128  # one expert per group: groups are visited in index order
+    S = sum(_LANE0_GROUP_SIZES)
+    compiled = C120.jit_from_cudnn_graph(_build_graph(E, S, N, K), config=replace(by_name(_SM120_CFG), swap_ab=swap_ab))
+
+    torch.manual_seed(0)
+    token = torch.randn(1, S, K, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda")
+    output = torch.full((1, S, N), -123, dtype=torch.bfloat16, device="cuda")
+    offsets = _offsets(_LANE0_GROUP_SIZES, S)
+    compiled(_vp_moe(compiled, token, weight, offsets, output))
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output[0], _ref_f32(token, weight, offsets, S, N, E).to(torch.bfloat16), atol=1e-1, rtol=1e-2)
+
+    ptx = kernel_ptx(compiled)
+    assert "vote.sync.ballot.b32" in ptx
+    lane_search = brev_bfind_types(ptx)  # the scheduler's 31 - bfind(brev(ballot))
+    assert lane_search, "no bfind reads a brev.b32 result in the kernel PTX"
+    assert set(lane_search) == {"u32"}, f"the grouped scheduler's lane search uses {['bfind.' + t for t in lane_search]}, not bfind.u32"
 
 
 def test_analyzer_detects_n_major_weight() -> None:

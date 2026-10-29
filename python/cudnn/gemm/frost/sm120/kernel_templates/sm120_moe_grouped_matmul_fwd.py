@@ -319,7 +319,9 @@ def _kernel(
                         nvvm.VoteSync.BALLOT,
                     )
                     if thread_succeed != 0:
-                        winning_lane = cutlass.Int32(31) - cute.arch.bfind(cute.arch.brev(thread_succeed)).to(cutlass.Int32)
+                        # The lowest succeeding lane, found on the Uint32 ballot: on the Int32 one bfind is bfind.s32,
+                        # which returns 0xFFFFFFFF for an all-lanes ballot (brev == -1), i.e. lane 32.
+                        winning_lane = cutlass.Int32(31) - cute.arch.bfind(cute.arch.brev(cutlass.Uint32(thread_succeed))).to(cutlass.Int32)
                         scan_base = nvvm.shfl_sync(full_warp_mask, visit_idx, winning_lane, shfl_idx_clamp, nvvm.Shfl.IDX)
                         group_idx = nvvm.shfl_sync(full_warp_mask, my_group, winning_lane, shfl_idx_clamp, nvvm.Shfl.IDX)
                         group_begin = nvvm.shfl_sync(full_warp_mask, my_begin, winning_lane, shfl_idx_clamp, nvvm.Shfl.IDX)

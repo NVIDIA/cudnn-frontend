@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import cudnn
+import re
 from dataclasses import replace
 
 import pytest
@@ -168,6 +169,36 @@ def resolve(name):
 def kw(name):
     """resolve() packaged as jit/Plan kwargs."""
     return dict(config=by_name(name))
+
+
+# --- kernel PTX -------------------------------------------------------------
+
+
+def keep_kernel_ptx(monkeypatch, compiler, dump_dir) -> None:
+    """Compile the kernels ``compiler`` (a family compiler module) renders in this test
+    with ``--keep-ptx`` and without the persistent compiled cache, whose reloaded object
+    carries no PTX; the PTX files and the generated sources (unique to ``dump_dir``) stay
+    under ``dump_dir``. :func:`kernel_ptx` reads the PTX back."""
+    monkeypatch.setenv("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", "1")
+    monkeypatch.setenv("CUDNN_FRONTEND_GEMM_KERNEL_CACHE", str(dump_dir))
+    monkeypatch.setattr(compiler, "_FROST_COMPILE_OPTIONS", f"{compiler._FROST_COMPILE_OPTIONS} --keep-ptx --dump-dir={dump_dir}".strip())
+
+
+def kernel_ptx(compiled) -> str:
+    """The PTX of a plan (or :class:`Plan`) compiled under :func:`keep_kernel_ptx`."""
+    ptx = getattr(compiled, "_compiled", compiled)._launchable.__ptx__
+    assert ptx, "the kernel carries no PTX: compile it under keep_kernel_ptx"
+    return ptx
+
+
+def brev_bfind_types(ptx: str) -> list[str]:
+    """The type (``s32``, ``u32``, ...) of every ``bfind`` in ``ptx`` that reads a ``brev.b32``
+    result of the same function: each lowest-set-bit search ``31 - bfind(brev(x))``."""
+    types = []
+    for body in re.split(r"\.(?:entry|func)\s", ptx)[1:]:  # PTX registers are scoped to their function
+        reversed_regs = set(re.findall(r"\bbrev\.b32\s+(%r\d+),", body))
+        types += [t for t, src in re.findall(r"\bbfind\.([\w.]+)\s+%r\d+,\s*(%r\d+);", body) if src in reversed_regs]
+    return types
 
 
 # --- variant packs ----------------------------------------------------------
