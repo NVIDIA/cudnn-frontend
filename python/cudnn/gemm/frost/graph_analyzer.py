@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 from collections import deque
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from math import isfinite
 from typing import Any
 
@@ -1511,11 +1512,37 @@ def _walk_mainloop_chain(
     intermediate_dtype: Dtype,
     compute_dtype: Dtype,
 ) -> tuple[int, list[FusionOp]]:
-    """Walk backwards from a matmul operand through pointwise ops (unary, or binary with one SCALAR graph-input aux) to the root graph input."""
+    """Walk operand pointwise ops to a graph input (scalar aux, or per-K multiply on either operand)."""
 
     def _is_scalar_input(tid: int) -> bool:
         m = meta.get(tid)
         return m is not None and m.is_input and len(m.dim) > 0 and all(d == 1 for d in m.dim)
+
+    @lru_cache(maxsize=None)
+    def _pointwise_dim(tid: int) -> tuple[int, ...]:
+        m = meta.get(tid)
+        if m is not None and m.dim:
+            return m.dim
+        producer = op_by_output.get(tid)
+        if producer is None or (producer.cudnn_name not in _UNARY_OP_MAP and producer.cudnn_name not in _BINARY_OP_MAP):
+            return ()
+        dims = [_pointwise_dim(inp) for inp in producer.inputs]
+        if not dims or any(len(dim) != 3 for dim in dims):
+            return ()
+        if any(len({d for d in axis if d != 1}) > 1 for axis in zip(*dims)):
+            return ()
+        return tuple(max(axis) for axis in zip(*dims))
+
+    def _is_per_k_input(tid: int, other: int) -> bool:
+        m = meta.get(tid)
+        k_axis = 2 if label == "A" else 1
+        if m is None or not m.is_input or len(m.dim) != 3 or m.dim[0] != 1 or m.dim[3 - k_axis] != 1:
+            return False
+        source_dim = _pointwise_dim(other)
+        if len(source_dim) != 3:
+            return False
+        expected = (1, 1, source_dim[2]) if label == "A" else (1, source_dim[1], 1)
+        return m.dim == expected and source_dim[3 - k_axis] != 1
 
     # Each entry: (cudnn_name, is_binary, aux_name_or_None, aux_on_rhs).
     steps: list[tuple] = []
@@ -1543,24 +1570,29 @@ def _walk_mainloop_chain(
                 aux_id, chain_id, aux_on_rhs = i0, i1, False
             elif s1 and not s0:
                 aux_id, chain_id, aux_on_rhs = i1, i0, True
+            elif producer.cudnn_name == "mul" and _is_per_k_input(i0, i1):
+                aux_id, chain_id, aux_on_rhs = i0, i1, False
+            elif producer.cudnn_name == "mul" and _is_per_k_input(i1, i0):
+                aux_id, chain_id, aux_on_rhs = i1, i0, True
             else:
                 raise ValueError(
                     f"matmul {label} operand is produced by binary op "
                     f"{producer.op_name!r} ({producer.cudnn_name!r}) — mainloop "
-                    "fusion only supports a binary op with exactly one SCALAR "
-                    "graph-input aux (e.g. A * alpha); per-row/col/elem aux on an "
-                    "operand is out of POC scope (needs swizzle-aware indexing)"
+                    "fusion supports a binary op with exactly one SCALAR graph-input aux "
+                    "(e.g. A * alpha), or mul with an A-side [1,1,K] or B-side [1,K,1] scale"
                 )
             aux_meta = meta[aux_id]
             if aux_id not in aux_seen:
                 aux_seen.add(aux_id)
+                scalar_aux = _is_scalar_input(aux_id)
                 aux_tensors.append(
                     TensorRef(
                         name=aux_meta.name,
                         dim=aux_meta.dim,
                         stride=aux_meta.stride,
                         dtype=aux_meta.dtype,
-                        bcast_mode="scalar",
+                        bcast_mode="scalar" if scalar_aux else "per_k",
+                        reduction_axis=None if scalar_aux else (2 if label == "A" else 1),
                     )
                 )
                 aux_objs.append(aux_meta.tensor)
@@ -1570,7 +1602,7 @@ def _walk_mainloop_chain(
             raise ValueError(
                 f"matmul {label} operand is produced by op {producer.op_name!r} "
                 f"({producer.cudnn_name!r}) which is not a pointwise op — mainloop "
-                "fusion supports unary ops and scalar-aux binary ops in the POC"
+                "fusion supports unary ops, scalar-aux binary ops and per-K mul"
             )
     steps.reverse()
     fops: list[FusionOp] = []
