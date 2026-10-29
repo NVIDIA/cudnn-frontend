@@ -314,6 +314,15 @@ def _sm100_blk64_requires_int64_kv_strides(
     return False
 
 
+def _sm100_blk64_require_int32_sage_q_strides(q: torch.Tensor) -> None:
+    """Decline a Sage FP8 Q whose batch stride does not fit the Int32 stride leaf.
+
+    The Sage Q view takes Int32 strides (there is no Int64 variant like K/V's exact layout) and
+    `_validate_sm100_blk64_int32_bounds` skips stride(0), so a batch stride >= 2**31 elements would silently truncate.
+    """
+    _sm100_blk64_require_int32("sage_fp8 q.stride(0)", q.stride(0))
+
+
 def _sm100_blk64_has_partial_kv_tail(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -1983,6 +1992,7 @@ def bsa_attn_fwd_blk64_cutedsl(
     )
     if is_sage_fp8:
         assert q_bhsd.is_contiguous() and k_bhsd.is_contiguous() and v_bhsd.is_contiguous(), "Sage FP8 requires fully contiguous BHSD Q/K/V tensors"
+        _sm100_blk64_require_int32_sage_q_strides(q_bhsd)
     use_int64_kv_strides = _sm100_blk64_requires_int64_kv_strides(k_bhsd, v_bhsd)
     use_exact_kv_layout = use_int64_kv_strides or _sm100_blk64_has_partial_kv_tail(k_bhsd, v_bhsd)
 
