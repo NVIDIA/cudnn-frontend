@@ -627,12 +627,16 @@ def test_graph_thd_respects_handle_stream_and_captures():
     torch.testing.assert_close(out, reference, rtol=0, atol=0)
 
 
-def test_graph_thd_declines_off_flavor_head_dim():
-    graph, _, _, _ = _make_graph((144, 96), (160, 128), d=96)
+@pytest.mark.parametrize("d,accepted", [(96, True), (94, False)])
+def test_graph_thd_head_dim_envelope(d, accepted):
+    graph, _, _, _ = _make_graph((144, 96), (160, 128), d=d)
     facts = ga.analyze(graph)
     caps = next(spec.capabilities for spec in fwd_engines.ENGINE_SPECS if spec.name == _ENGINE)
     reason = fwd_engines.mismatch(caps, facts)
-    assert reason is not None and "native-tile" in reason
+    if accepted:
+        assert reason is None
+    else:
+        assert reason is not None and "8" in reason
 
 
 @pytest.mark.parametrize("sched_policy", (fwd_engines.SCHED_LPT, fwd_engines.SCHED_LPT_L2))
@@ -663,7 +667,7 @@ def test_graph_thd_declines_overlapping_token_stride():
     assert reason is not None and "Q" in reason and "non-overlapping" in reason
 
 
-@pytest.mark.parametrize("d,dv", [(64, 64), (128, 128), (192, 128), (256, 256)])
+@pytest.mark.parametrize("d,dv", [(48, 32), (64, 64), (64, 96), (96, 80), (128, 128), (192, 112), (192, 128), (224, 208), (256, 256)])
 @pytest.mark.parametrize("stats_layout", ["head_major_padded", "token_major"])
 @pytest.mark.parametrize("stats_carrier", ["canonical", "th1"])
 def test_graph_thd_independent_pitches_rebind_replay(d, dv, stats_layout, stats_carrier, cudnn_handle):

@@ -101,7 +101,9 @@ def build_spec(api, d64_module, *, staged=False):
                             shape, strides = (api._t_q_phys, api.h_q), (api.h_q, 1)
                         else:
                             hs = api._thd_lse_head_stride or api._t_q_phys
-                            shape, strides = (1, api.h_q, hs), (api.h_q * hs, hs, 1)
+                            # Head padding is storage pitch, not additional
+                            # logical rows (including after the last head).
+                            shape, strides = (1, api.h_q, api._t_q_phys), (api.h_q * hs, hs, 1)
                 span = 1 + sum((int(n) - 1) * int(st) for n, st in zip(shape, strides))
                 alignment = 16 if role in ROLES[:5] + ROLES[6:9] else desc.dtype.itemsize
                 op = Operand(str(desc.dtype).split(".")[-1], shape, strides, span, alignment, desc.dtype.itemsize)
@@ -145,8 +147,8 @@ def build_spec(api, d64_module, *, staged=False):
             elif role == "stats":
                 if api._thd_lse_token_major:
                     shape = (-1, api.h_q)
-                elif not api._thd_lse_head_stride:
-                    shape, strides = (1, api.h_q, -1), (0, -1, 1)
+                else:
+                    shape, strides = (1, api.h_q, -1), (0, api._thd_lse_head_stride or -1, 1)
             normalized[i] = (shape, strides)
         compile_geometry = tuple(normalized)
     key = template_key(
@@ -211,7 +213,15 @@ def execute_tensors(api, tensors, workspace, stream, scale, ro_tensors=()):
     if stats is not None:
         if api.thd:
             op = spec.operands[5]
-            if stats.shape != op.shape or stats.strides != op.strides:
+            if api._thd_lse_token_major:
+                matches = stats.shape == op.shape and stats.strides == op.strides
+            else:
+                # Accept either a logical-row slice or the legacy full-pitch
+                # carrier. Only stepped strides determine addressed storage.
+                matches = (
+                    stats.shape in (op.shape, (1, api.h_q, op.strides[1])) and stats.strides[2] == 1 and (api.h_q == 1 or stats.strides[1] == op.strides[1])
+                )
+            if not matches:
                 raise ValueError("THD stats must match the declared packed layout")
         elif stats.numel != api.batch_size * api.h_q * api.s_q_max or (api._lse_stride is None and not stats.contiguous):
             raise ValueError("stats must match the declared element count and storage layout")

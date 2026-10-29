@@ -6790,10 +6790,6 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 "SM80 THD Q lengths cannot be both per-batch and cumulative",
             )
             self._not_implemented_error_if(
-                (d_qk, d_v) not in _SM80_FLAVOR_DIMS.values(),
-                f"SM80 THD graph path supports native head dims {sorted(_SM80_FLAVOR_DIMS.values())} only",
-            )
-            self._not_implemented_error_if(
                 self._bias_present or self.has_sink or self._rope_max_s,
                 "SM80 THD graph path does not support bias, sinks, or RoPE fusion",
             )
@@ -6979,6 +6975,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 lse_stride=self._lse_stride,
                 initialize_outputs=False,
                 o_stride=(int(self.o_desc.stride[2]), int(self.o_desc.stride[1])),
+                dimensions=(self.head_dim_qk, self.head_dim_v),
             )
             self._compile_thd_meta()
             self._logger.debug("compile completed")
@@ -7256,11 +7253,14 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
     tile_m, num_warps, tile_n = _SM80_FLAVOR_KNOBS[flavor]
     if scale_softmax is None:
         scale_softmax = 1.0 / math.sqrt(d_qk)
-    pad_v = d_v < fdv
-    if d_qk < fdqk or pad_v:
-        from cudnn.sdpa.packed_copy_sm80 import copy_packed_half
+    from cudnn.sdpa.native_sm80 import forward_thd_layout_mismatch
 
-        q, k, v = copy_packed_half((q, k, v), (fdqk, fdqk, fdv), (True, False, False))
+    for name, tensor in (("q", q), ("k", k), ("v", v)):
+        shape = tuple(tensor.shape[i] for i in (0, 2, 1, 3))
+        stride = tuple(tensor.stride(i) for i in (0, 2, 1, 3))
+        reason = forward_thd_layout_mismatch(name, shape, stride)
+        if reason is not None:
+            raise NotImplementedError(reason)
     wl, wr = window_size
     right_bound = wr if (is_causal and wr is not None and wr > 0) else 0
 
@@ -7311,11 +7311,12 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
         int(max(0, wl)) if wl is not None else 0,
         (str(cu_q_t.dtype), str(cu_k_t.dtype)),
         str(sinks_b.dtype) if sinks_b is not None else "torch.float32",
+        (d_qk, d_v),
     )
 
     t_q = q.shape[1]
     # The prepared host initializes both complete capacities before attention.
-    o_buf = torch.empty(1, t_q, h_q, fdv, dtype=q.dtype, device=device)
+    o_buf = torch.empty(1, t_q, h_q, d_v, dtype=q.dtype, device=device)
     lse_buf = torch.empty(1, h_q, t_q, dtype=torch.float32, device=device)
     stream = current_stream if current_stream is not None else torch.cuda.current_stream(device).cuda_stream
     execute(
@@ -7326,8 +7327,6 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
         int(right_bound),
         int(stream),
     )
-    if pad_v:
-        (o_buf,) = copy_packed_half((o_buf,), (d_v,), (True,))
     return TupleDict(o_tensor=o_buf, lse_tensor=lse_buf)
 
 

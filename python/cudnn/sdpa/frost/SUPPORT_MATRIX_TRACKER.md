@@ -2659,7 +2659,16 @@ stride to be divisible by eight elements. Runtime data addresses must be
 gapped layouts and strided Stats directly; no gather/pad/scatter fallback is
 selected. Graph eligibility and standalone `check_support()` share the
 addressing contract and decline unsupported declarations before compilation.
-THD retains its packed-layout constraints; its unused batch stride is ignored.
+Dense and THD share the eight-aligned head-width envelope, with independent
+logical Q/K and V widths up to 256 in both directions. The covering backward
+MMA flavor retains its own ordered tile dimensions; logical widths need not
+satisfy D_QK >= D_V. THD retains its packed-layout constraints; its unused
+batch stride is ignored. Packed forward
+hosts bind logical QK/VO widths independently of the selected MMA tile, and
+the convenience wrappers no longer pad, compact or trim data operands.
+Packed backward Stats may be a logical `(1, H, T)` slice with a wider head
+pitch; padding after the final head is not required. Legacy full-pitch and
+compact token-major carriers remain supported.
 
 Backward bias/dBias and sink/dSink must be declared in pairs with contiguous
 auxiliary storage. Standalone RoPE and nonaligned data layouts are declined
@@ -2706,7 +2715,7 @@ runtime host arguments; workspace views and offsets are formed from those
 capacities without specializing the artifact on them. A fresh plan with the
 same specialization and stepped strides reuses the process-local artifact for
 different totals and bounds, even without persistent caching. The standalone
-THD wrapper pads to the native flavor width and uses this prepared packed chain.
+THD wrapper binds caller data strides and logical widths directly to this prepared packed chain.
 Graph and direct-adapter padded widths use that same native chain. Internal
 legacy staging helpers remain isolated; supported public declarations cannot
 reach them. Standalone adapters require caller workspace, and convenience
@@ -2715,10 +2724,11 @@ wrappers provide it.
 The standalone SM80 packed forward wrapper also uses a cached pointer host.
 Packed capacities, Q/K/V token and head strides, and launch bounds bind as
 runtime Int64 arguments; Sink logits remain in natural units. The wrapper
-preserves its output allocation, capacity-tail zeroing and off-flavor padding.
+preserves its output allocation and capacity-tail zeroing, with masked native
+loads for logical widths smaller than the covering flavor.
 Dense forward uses the native pointer host and natural-unit sinks; unsupported
 copy-dependent declarations decline before compilation.
-Native-flavor THD forward graphs reuse this pointer host, with optional head-major
+THD forward graphs throughout the aligned width envelope reuse this pointer host, with optional head-major
 or token-major Stats and device-side length normalization in caller workspace.
 Plan construction and execution allocate no device memory. Graph admission requires
 token-major Q/K/V/O with aligned, non-overlapping head/token strides, natural

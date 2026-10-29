@@ -315,6 +315,9 @@ class Capabilities:
     # Appended for positional compatibility; no graph parsing, kernel imports,
     # allocation or compilation. The row supplies the verdict from pure facts.
     declaration_check: Optional[Callable[["ga.SdpaGraphFacts", Any], Optional[str]]] = None
+    # Logical Q/K and V widths are independently masked within a covering
+    # flavor; neither equality nor D_QK >= D_V is required. Append-only.
+    independent_head_dims: bool = False
 
 
 def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: Any = None) -> Optional[str]:
@@ -360,10 +363,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
             else "per-tensor FP8 (sdpa_fp8_backward)" if capabilities.is_fp8 else "half (fp16/bf16) sdpa_backward"
         )
         return f"this engine serves only {quant} graphs"
-    if capabilities.dqk_ge_dv:
+    if capabilities.dqk_ge_dv and not capabilities.independent_head_dims:
         if facts.d_qk < facts.d_v:
             return f"D_QK must be >= D_V; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
-    elif facts.d_qk != facts.d_v:
+    elif not capabilities.independent_head_dims and facts.d_qk != facts.d_v:
         return f"D_QK must equal D_V; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
     if capabilities.d_envelope:
         if max(facts.d_qk, facts.d_v) > max(capabilities.d):
@@ -983,7 +986,7 @@ def _sm80_spec() -> EngineSpec:
             d_envelope=True,  # flavor envelopes; masked native loads
             d_pad_multiple=8,
             declaration_check=graph_mismatch,
-            dqk_ge_dv=True,  # bprop kernel constraint relaxed to D_QK >= D_V
+            independent_head_dims=True,  # logical widths inside covering MMA flavors
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             gqa=True,
             causal=True,
