@@ -55,6 +55,7 @@ cudnn.GroupedGemmWgradSm100
 cudnn.Handle
 cudnn.Handle.device
 cudnn.KPageLayout
+cudnn.KimiCPMerge
 cudnn.MhcProjectionBackward
 cudnn.MoeEp
 cudnn.MoeEpAutotuneCandidateResult
@@ -933,6 +934,7 @@ cudnn.jax.row_major_desc
 cudnn.jax.sf_atom_spec
 cudnn.jax.zeros_init
 cudnn.jit
+cudnn.kimi_cp_merge
 cudnn.knob
 cudnn.knob.max_value
 cudnn.knob.min_value
@@ -987,6 +989,11 @@ cudnn.knob_type.name
 cudnn.knob_type.value
 cudnn.kpage_prepare_layout
 cudnn.linear_attention
+cudnn.linear_attention.KimiCPMerge
+cudnn.linear_attention.KimiCPMerge.check_support
+cudnn.linear_attention.KimiCPMerge.compile
+cudnn.linear_attention.KimiCPMerge.execute
+cudnn.linear_attention.KimiCPMerge.scratch_workspace_bytes
 cudnn.linear_attention.gated_delta_net
 cudnn.linear_attention.gated_delta_net_summary
 cudnn.linear_attention.gated_delta_net_summary_bwd
@@ -996,6 +1003,7 @@ cudnn.linear_attention.gated_delta_net_v2_summary_bwd
 cudnn.linear_attention.gated_delta_product
 cudnn.linear_attention.gated_delta_product_summary
 cudnn.linear_attention.gated_delta_product_summary_bwd
+cudnn.linear_attention.kimi_cp_merge
 cudnn.linear_attention.kimi_delta_attention
 cudnn.linear_attention.kimi_delta_attention_summary
 cudnn.linear_attention.kimi_delta_attention_summary_bwd
