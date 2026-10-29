@@ -165,9 +165,11 @@ class KimiCPMerge(APIBase):
         remain compact, 16-byte aligned and mutually disjoint. Unsupported or
         changed bindings raise before launch. current_stream accepts a Torch
         stream or raw CUDA handle, defaulting to the operand device's current
-        stream. No producer-stream wait is inserted: callers must order every
-        input write before current_stream and keep inputs/outputs free of
-        concurrent writes or overlapping executions until that stream completes.
+        stream. Buffers and current_stream must stay on the device declared at
+        compilation; construct a separate plan for each device. No
+        producer-stream wait is inserted: callers must order every input write
+        before current_stream and keep inputs/outputs free of concurrent writes
+        or overlapping executions until that stream completes.
         Recording storage on the consumer stream protects allocator lifetime
         only; it does not establish data dependencies. The caller's current
         device is restored. Warm calls support CUDA Graph capture.

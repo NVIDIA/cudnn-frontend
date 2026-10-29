@@ -69,7 +69,8 @@ and outputs must match in both directions. Reverse direction is fixed at
 compilation; use another plan to select the other direction. The plan owns no
 CUDA storage and requires no caller workspace; only fixed shared memory is used
 within each CTA. Warm execution supports CUDA Graph capture, new input
-allocations and caller-selected streams/devices. The same caller-side ordering
+allocations and caller-selected streams on the device where the plan was
+compiled. Compile a separate plan for each device. The same caller-side ordering
 rule applies to `execute`: inputs must be ready on its launch stream, and the
 bound buffers must not participate in another overlapping write or merge
 execution until completion.
