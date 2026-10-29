@@ -390,6 +390,9 @@ uint8 FP4 storage, strided views, optional outputs, and device pointer tables.
 Intercept the compiled consumer for negative tests so intentional aliasing never
 reaches a kernel; prove RED before the fix. Also exercise disjoint slices of one
 allocation so rejecting shared ownership does not substitute for checking overlap.
+For per-operand negative cases, keep other operand ranges clear of the tested
+workspace interval and match the rejection to that operand. Otherwise one
+overlapping fixture can hide missing checks for every other role.
 Device pointer-table contents remain a caller contract, not a reason for a D2H read.
 
 ### fp32 operands and TF32 references

@@ -232,13 +232,17 @@ def test_standalone_split_requires_caller_workspace_without_allocating(native, m
 @pytest.mark.parametrize("offset", [0, -16])
 def test_native_split_workspace_alias_rejects_before_either_launch(role, observed, offset):
     spec, facts, frames, combined = _split_fixture(paged=True)
+    # Leave each operand and its overlapping scratch interval isolated, so a
+    # different role cannot mask a missing check for the selected operand.
+    facts = {name: fact._replace(ptr=0x1000000 * (index + 1)) for index, (name, fact) in enumerate(facts.items())}
     _equal(spec, facts)
     if not observed:
         facts = {name: fact._replace(span=-1) for name, fact in facts.items()}
     workspace = facts[role].ptr + offset
-    with pytest.raises(ValueError, match="workspace overlaps"):
+    native_role = "lse_tensor" if role == "lse" else role
+    with pytest.raises(ValueError, match=rf"workspace overlaps {native_role}$"):
         spec.native.execute(_pack(facts), prep._NATIVE_DENSE_INDICES, 17, workspace=workspace)
-    with pytest.raises(ValueError, match="workspace overlaps"):
+    with pytest.raises(ValueError, match=rf"workspace overlaps {role}$"):
         binding_reference.bind_dense_split(spec, facts, workspace, 17, 17)
     assert frames == combined == []
 
