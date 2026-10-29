@@ -2265,9 +2265,10 @@ def _check_block_scale_sign(state: dict) -> None:
     """Decline ``block_scale_dequantize(is_negative_scale=True)`` on scale factors that can be negative.
 
     The shared analyzer records the attribute, but no chain field carries it. The sm120 warp MMA takes
-    every scale factor as an unsigned ``.ue4m3`` / ``.ue8m0`` operand and ignores the sign bit of an
-    E4M3 byte, so a block with ``s < 0`` would contribute ``x * |s|`` where the attribute asks for
-    ``x * s``. A sign-free scale cannot be negative, so the attribute changes nothing there."""
+    every scale factor as an unsigned ``.ue4m3`` / ``.ue8m0`` operand. PTX requires a zero MSB in a
+    ``.ue4m3`` byte; on SM120 the MMA was measured to ignore that bit, so a block with ``s < 0`` would
+    contribute ``x * |s|`` where the attribute asks for ``x * s``. A sign-free scale cannot be
+    negative, so the attribute changes nothing there."""
     meta = state["tensor_meta"]
     for op in state["ops"]:
         if op.cudnn_name != "block_scale_dequantize" or not op.is_negative_scale:

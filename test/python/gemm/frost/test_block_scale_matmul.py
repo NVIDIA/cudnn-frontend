@@ -3544,12 +3544,25 @@ def test_sm120_fp4_rejects_non_k_major():
             jit_from_cudnn_graph(g, **_kw(_SM120_BS_128))
 
 
+def test_sm120_analyze_graph_declines_signed_negative_scale():
+    """Host-only, so every lane runs it: the sm120 tree's ``_analyze_graph`` declines
+    ``is_negative_scale=True`` on either operand's E4M3 scales before any architecture-dependent
+    step. The same graph without it, and a flagged E8M0 graph (no sign bit), pass the analysis."""
+    for side in ("SFA", "SFB"):
+        flagged = _build_nvfp4_graph(256, 256, 512, negative_scale=(side == "SFA", side == "SFB"))
+        with pytest.raises(NotImplementedError, match=f"is_negative_scale=True on its fp8_e4m3 scale factors '{side}'"):
+            C120._analyze_graph(flagged)
+    C120._analyze_graph(_build_nvfp4_graph(256, 256, 512))
+    C120._analyze_graph(_build_nvfp4_graph(256, 256, 512, block_size=32, sf_dt=cudnn.data_type.FP8_E8M0, negative_scale=(True, True)))
+
+
 @requires_sm120
 def test_sm120_block_scale_declines_signed_negative_scale():
     """``is_negative_scale=True`` asks for ``x * s`` with signed E4M3 scales, but the sm120 block-scale
     MMA reads every scale as unsigned ``.ue4m3`` and ignores the sign bit: the plan ran and returned
     ``x * |s|``. The FROST engine and the direct JIT decline the attribute on either operand's E4M3
-    scales; the same graph without it, and a flagged E8M0 graph (no sign bit), keep their plans."""
+    scales, and the front door offers the graph no frost_gemm plan; the same graph without it, and a
+    flagged E8M0 graph (no sign bit), keep their plans."""
     from cudnn.gemm.frost.engine import FrostGemmEngine
 
     engine = FrostGemmEngine()
@@ -3562,3 +3575,12 @@ def test_sm120_block_scale_declines_signed_negative_scale():
             jit_from_cudnn_graph(flagged, **_kw(_SM120_BS_128))
     engine.check_support(_build_nvfp4_graph(256, 256, 512))
     engine.check_support(_build_nvfp4_graph(256, 256, 512, block_size=32, sf_dt=cudnn.data_type.FP8_E8M0, negative_scale=(True, True)))
+    g = _build_nvfp4_graph(256, 256, 512, negative_scale=(True, True))
+    g.validate()
+    g.build_operation_graph()
+    try:
+        g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    except cudnn.cudnnGraphNotSupportedError as exc:  # no backend plan either: the error names the decline
+        assert "is_negative_scale=True" in str(exc)
+    else:
+        assert not any(g.get_plan_name_at_index(i).startswith("frost_gemm") for i in range(g.get_execution_plan_count()))
