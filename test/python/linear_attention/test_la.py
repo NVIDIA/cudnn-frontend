@@ -2012,12 +2012,17 @@ def test_kda_public_safe_gate_normalizes_flat_dt_bias_before_dispatch(monkeypatc
 
 
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-def test_kda_safe_gate_rejects_wrong_flat_dt_bias_length(backend):
+def test_kda_safe_gate_rejects_wrong_flat_dt_bias_length(backend, monkeypatch):
     """A malformed flat bias is rejected at the public boundary, before a
     graph can allocate workspace or launch a kernel.
     """
     case, kw, _ = gate_mode_case(make_case("kda", torch.bfloat16, T=64, H=2, K=64, V=64), "safe")
     bad_bias = kw["dt_bias"].new_empty(case.HO * case.K - 1)
+    monkeypatch.setattr(
+        torch.ops.cudnn,
+        "kimi_delta_attention_fwd",
+        lambda *args, **kwargs: pytest.fail("invalid dt_bias reached the backend"),
+    )
     with pytest.raises(ValueError, match=r"dt_bias must be \[HO, K\].*\[HO \* K\]"):
         pinned_op(backend, "kda")(*op_args(case), **dict(kw, dt_bias=bad_bias))
 

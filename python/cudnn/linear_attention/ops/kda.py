@@ -64,6 +64,17 @@ def check_dtype(name, t, want) -> None:
         raise TypeError(f"kimi_delta_attention: {name} must be {names} (kernel-native; callers convert), got {t.dtype}")
 
 
+def _normalize_dt_bias(dt_bias: Optional[torch.Tensor], HO, K, op: str) -> Optional[torch.Tensor]:
+    """Return KDA's native ``[HO, K]`` safe-gate view without copying."""
+    if dt_bias is None or tuple(dt_bias.shape) == (HO, K):
+        return dt_bias
+    if dt_bias.dim() == 1 and dt_bias.numel() == HO * K:
+        if not dt_bias.is_contiguous():
+            raise ValueError(f"{op}: flat dt_bias [HO * K] must be contiguous")
+        return dt_bias.view(HO, K)
+    raise ValueError(f"{op}: dt_bias must be [HO, K] = [{HO}, {K}] or contiguous [HO * K] = [{HO * K}]; got {tuple(dt_bias.shape)}")
+
+
 def make_fprop_cache_key(
     total,
     N,
@@ -1330,9 +1341,9 @@ def kimi_delta_attention(
         a_log: ``[HO]`` safe-gate per-head log-amplitude (float32, bfloat16 or
             float16; ``d_a_log`` comes back in the same dtype), or ``None``
             for unit amplitude.
-        dt_bias: ``[HO, K]`` safe-gate channel bias (float32, bfloat16 or
-            float16; ``d_dt_bias`` comes back in the same dtype), or ``None``
-            for zero bias.
+        dt_bias: ``[HO, K]`` or contiguous flattened ``[HO * K]`` safe-gate
+            channel bias (float32, bfloat16 or float16; ``d_dt_bias`` comes
+            back in the same dtype and shape), or ``None`` for zero bias.
         checkpoint_every_n_tokens: if ``> 0``, also return the per-chunk
             recurrent state series ``state_checkpoints`` (``[total_checkpoints, HO, V, K]``, dtype per ``checkpoint_dtype``,
             one entry per N tokens strictly before each sequence end; the
@@ -1360,6 +1371,8 @@ def kimi_delta_attention(
     """
     if q.dim() != 3:
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
+    if safe_gate:
+        dt_bias = _normalize_dt_bias(dt_bias, g.shape[-2], g.shape[-1], "kimi_delta_attention")
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
     if state_indices is not None and initial_state is None:
@@ -2044,7 +2057,8 @@ def kimi_delta_attention_summary(
     Args:
         use_beta_sigmoid_in_kernel: apply ``sigmoid(beta)`` in the kernel; ``beta`` then holds raw logits.
         safe_gate: ``g`` is read as ``gate_lower_bound * sigmoid(exp(a_log) * (g + dt_bias))``; ``a_log`` ``[HO]`` and
-            ``dt_bias`` ``[HO, K]`` (fp32/bf16/fp16) default to unit amplitude / zero bias and require ``safe_gate=True``.
+            ``dt_bias`` ``[HO, K]`` or contiguous ``[HO * K]`` (fp32/bf16/fp16) default to unit amplitude / zero bias and
+            require ``safe_gate=True``.
         gate_lower_bound: safe-gate lower bound in log space (default -5.0).
         gate_domain: ``"log"`` (``g = ln(alpha)``) or ``"linear"`` (``g = alpha in (0, 1]^K``, 1e-10 floor, ``dG`` with respect
             to ``alpha``); not with ``safe_gate``.
@@ -2052,6 +2066,8 @@ def kimi_delta_attention_summary(
     """
     if k.dim() != 3:
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
+    if safe_gate:
+        dt_bias = _normalize_dt_bias(dt_bias, g.shape[-2], g.shape[-1], "kimi_delta_attention_summary")
     final_state, transition = torch.ops.cudnn.kimi_delta_attention_summary(
         k,
         v,
@@ -2109,7 +2125,8 @@ def kimi_delta_attention_summary_bwd(
         scale: attention scale applied to ``q``; defaults to ``1 / sqrt(K)``.
         use_beta_sigmoid_in_kernel: apply ``sigmoid(beta)`` in the kernel; ``beta`` then holds raw logits.
         safe_gate: ``g`` is read as ``gate_lower_bound * sigmoid(exp(a_log) * (g + dt_bias))``; ``a_log`` ``[HO]`` and
-            ``dt_bias`` ``[HO, K]`` (fp32/bf16/fp16) default to unit amplitude / zero bias and require ``safe_gate=True``.
+            ``dt_bias`` ``[HO, K]`` or contiguous ``[HO * K]`` (fp32/bf16/fp16) default to unit amplitude / zero bias and
+            require ``safe_gate=True``.
         gate_lower_bound: safe-gate lower bound in log space (default -5.0).
         gate_domain: ``"log"`` (``g = ln(alpha)``) or ``"linear"`` (``g = alpha in (0, 1]^K``, 1e-10 floor, ``dG`` with respect
             to ``alpha``); not with ``safe_gate``.
@@ -2117,6 +2134,8 @@ def kimi_delta_attention_summary_bwd(
     """
     if q.dim() != 3:
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
+    if safe_gate:
+        dt_bias = _normalize_dt_bias(dt_bias, g.shape[-2], g.shape[-1], "kimi_delta_attention_summary_bwd")
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
     d_initial_state, transition = torch.ops.cudnn.kimi_delta_attention_summary_bwd(
