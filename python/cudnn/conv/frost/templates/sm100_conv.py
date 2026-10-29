@@ -440,7 +440,10 @@ def _kernel(
             r_idx = 0
             t_idx = 0
             c_chunk_idx = 0
-            for k in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+            # Initial C96/K96 frames benefit from issuing their three channel
+            # loads together. Every padded filter plane is still evaluated.
+            producer_unroll = 3 if channel_first and zpq[0] == 1 and lower_pad_dhw[0] == 2 else 1
+            for k in cutlass.range(0, k_tile_cnt, 1, unroll=producer_unroll):
                 mbar_full = ab_full_mbar_ptr.subview(ab_stage_idx)
                 mbar_empty = ab_empty_mbar_ptr.subview(ab_stage_idx)
 
