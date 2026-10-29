@@ -128,6 +128,9 @@ navigation:
           - page: Kimi Delta Attention in JAX
             path: ../../operations/linear_attention/kda_jax.md
             slug: kda_jax
+          - page: Kimi Context Parallel State Merge
+            path: ../../operations/linear_attention/kimi_cp_merge.md
+            slug: kimi_cp_merge
       - section: Matmul
         path: ../../operations/Matmul.md
         slug: operations/Matmul

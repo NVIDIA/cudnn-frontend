@@ -3,6 +3,7 @@
 
 """Tests for the public IEEE FP32 Kimi context-parallel merge."""
 
+import importlib
 import inspect
 
 import pytest
@@ -55,7 +56,7 @@ def oracle(h, m, seed, reverse=False):
 
 
 @pytest.mark.parametrize("reverse", [False, True])
-@pytest.mark.parametrize("v,k", [(64, 64), (128, 64), (64, 128), (128, 128), (256, 128)])
+@pytest.mark.parametrize("v,k", [(64, 64), (128, 64), (256, 64), (64, 128), (128, 128), (256, 128)])
 def test_merge_matches_fp64_reference(reverse, v, k):
     h, m, seed = inputs(v=v, k=k)
     expected = oracle(h, m, seed, reverse)
@@ -135,7 +136,7 @@ def test_merge_rejects_invalid_bindings_before_launch(monkeypatch):
     h, m, seed = inputs()
     x, tail = torch.empty_like(h), torch.empty_like(seed)
     plan = KimiCPMerge(h, m, x, tail, seed).compile()
-    import cudnn.linear_attention.frost.common.piece_chain as module
+    module = importlib.import_module("cudnn.linear_attention.frost.common.piece_chain")
 
     monkeypatch.setattr(module, "run_state_chain", lambda *a, **kw: pytest.fail("invalid binding reached launch"))
     for kwargs in (dict(h=h.half()), dict(m=m[:1]), dict(initial_states=h), dict(initial_state=None), dict(transition=tail)):
@@ -149,7 +150,7 @@ def test_prepared_merge_rejects_autograd_declaration_before_compile(monkeypatch)
     h, m, seed = inputs()
     h.requires_grad_(True)
     plan = KimiCPMerge(h, m, torch.empty_like(h), torch.empty_like(seed), seed)
-    import cudnn.linear_attention.frost.common.piece_chain as module
+    module = importlib.import_module("cudnn.linear_attention.frost.common.piece_chain")
 
     monkeypatch.setattr(module, "build_state_chain", lambda **kwargs: pytest.fail("autograd declaration reached compiler"))
     with pytest.raises(ValueError, match="no autograd"):
@@ -168,7 +169,7 @@ def test_requires_grad_input_is_allowed_with_grad_disabled():
 
 @pytest.mark.parametrize("bad", ["dtype", "stride", "shape", "autograd", "reverse", "alias"])
 def test_wrapper_rejects_before_compilation(monkeypatch, bad):
-    import cudnn.linear_attention.merge as module
+    module = importlib.import_module(kimi_cp_merge.__module__)
 
     h, m, seed = inputs()
     kwargs = dict(initial_state=seed)
@@ -190,9 +191,20 @@ def test_wrapper_rejects_before_compilation(monkeypatch, bad):
 
 
 def test_old_dsl_declines_through_real_version_checker(monkeypatch):
-    import cudnn.frost.buffers as buffers
+    buffers = importlib.import_module("cudnn.frost.buffers")
 
     h, m, seed = inputs()
     monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.6.2")))
     with pytest.raises(NotImplementedError, match=r"requires nvidia-cutlass-dsl >= 4\.7\.0; found 4\.6\.2"):
+        KimiCPMerge(h, m, torch.empty_like(h), torch.empty_like(seed), seed).check_support()
+
+
+def test_sm107_without_sm107a_target_declines(monkeypatch):
+    buffers = importlib.import_module("cudnn.frost.buffers")
+    merge_module = importlib.import_module(KimiCPMerge.__module__)
+
+    h, m, seed = inputs()
+    monkeypatch.setattr(merge_module, "get_compute_capability", lambda *_: (10, 7))
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)
+    with pytest.raises(NotImplementedError, match="sm_107a"):
         KimiCPMerge(h, m, torch.empty_like(h), torch.empty_like(seed), seed).check_support()
