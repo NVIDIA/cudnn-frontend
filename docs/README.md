@@ -31,7 +31,9 @@ docs/
     versions/latest.yml     # navigation (paths are ../../<page>)
 ```
 
-Every page must be listed in `fern/versions/latest.yml` to be built. Page `slug`s are the source file names, so links between pages use `/section/page` (for example `/developer/graph-api`), never file paths.
+Every page must be listed in `fern/versions/latest.yml` to be built. Links between pages use the slugs from that navigation tree, such as `/developer/graph-api`. File-relative links do not work for Fern pages. Shared API pages can provide separate `docs` and `GitHub` links so readers can follow either the site route or the repository file.
+
+Redirect sources and destinations must include the `/cudnn` base path. The default version uses unversioned paths; preserve explicit `/cudnn/latest/` aliases when moving pages that used them.
 
 ## Building locally
 

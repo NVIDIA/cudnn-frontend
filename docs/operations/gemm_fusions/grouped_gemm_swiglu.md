@@ -2,7 +2,7 @@
 
 **This is an experimental API and subject to change.**
 
-**Legacy contiguous-only API note:** This page documents the older contiguous-only SwiGLU API. For new integrations, prefer the unified [Grouped GEMM + GLU](/operations/Matmul/gemm_fusions/grouped_gemm_glu) API, which covers dense and discrete weight layouts. This API keeps its signatures and runs the unified GLU kernel with `act_func="swiglu"`, for Torch and JAX.
+**Legacy contiguous-only API note:** This page documents the older contiguous-only SwiGLU API. For new integrations, prefer the unified Grouped GEMM + GLU ([docs](/operations/Matmul/gemm_fusions/grouped_gemm_glu), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/gemm_fusions/grouped_gemm_glu.md)) API, which covers dense and discrete weight layouts. This API keeps its signatures and runs the unified GLU kernel with `act_func="swiglu"`, for Torch and JAX.
 
 ## JAX support
 

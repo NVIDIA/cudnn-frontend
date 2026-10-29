@@ -85,6 +85,7 @@ First invocation builds the hook environments and can take >5 minutes; later run
 ## Conventions
 
 - `include/` is header-only: no `.cpp` files, no new required dependencies. Vendored third-party code lives in `include/cudnn_frontend/thirdparty/`.
+- Docs moves: check `/cudnn/<route>` and `/cudnn/latest/<route>` redirects against the navigation slugs. Shared Markdown pages need explicit GitHub links alongside Fern site links; see [docs/README.md](docs/README.md).
 - Every new frontend-only Python API needs: public functions, lazy export in `python/cudnn/ops/__init__.py`, docs under `docs/operations/`, and pytest coverage under `test/python/fe_api/`. Full recipe: [python/cudnn/AGENTS.md](python/cudnn/AGENTS.md) and the `cutedsl-kernel-integration` skill.
 - Frontend-only OSS APIs are experimental; keep the lazy-import boundary intact (no eager `torch`/`cutlass` imports at `cudnn` import time). CuTeDSL is a required dependency now, but a tensor framework is not, and `import cudnn` still has to stay cheap.
 - The `pyproject.toml` floor on `nvidia-cutlass-dsl` is `>=4.8.0`, matching the version pinned by vLLM v0.32.0 and SGLang v0.5.22. Every backend/kernel gates the DSL version at runtime and declines with an error that names the version — never assume the installed DSL satisfies your kernel. [python/cudnn/AGENTS.md](python/cudnn/AGENTS.md) **Rule 7** is canonical; cite it in review.
