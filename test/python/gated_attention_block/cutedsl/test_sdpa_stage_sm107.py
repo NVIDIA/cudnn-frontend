@@ -211,13 +211,18 @@ def test_gate_declines_a_gate_dtype_the_rows_do_not_claim(dtype, gate_dtype):
     assert "Rubin" not in str(ei.value)  # the geometry / dtype pin fired, not the cc gate
     assert "bfloat16" in str(ei.value)  # both rows serve the block's activation dtype for these cases
     # The block's own configuration is served on the Rubin rows: activation-dtype gate on both; on an admitted Blackwell-line part the
-    # DEVICE's row speaks after the Rubin pins (the sm100 f16 row claims no gate epilogue: a typed decline, 2026-10-29)
+    # DEVICE's row speaks after the Rubin pins for the bf16 / f16 stage (the sm100 f16 row claims no gate epilogue: a typed decline,
+    # 2026-10-29), while a QUANTIZED stage keeps the Rubin row on every device (its gate geometry reads the same everywhere, as the
+    # MXFP8 suite pins) and is declined by name by its own part gate at check_support -- "binds the Rubin (cc 10.7) ... row only"
     ok = _Sdpa(geom, batch=1, seq_len=256, dtype=dtype, device=torch.device("cuda"), want_lse=False, fuse_gate=True, gate_dtype=torch.bfloat16)
-    if _part() in DENSE_SERVING_CCS and _part() != _SM107:
+    if _part() in DENSE_SERVING_CCS and _part() != _SM107 and dtype != torch.float8_e4m3fn:
         with pytest.raises(NotImplementedError, match="SM100 SDPA engine row"):
             ok._check_gate_geometry()
     else:
         ok._check_gate_geometry()
+        if _part() in DENSE_SERVING_CCS and _part() != _SM107:
+            with pytest.raises(NotImplementedError, match=r"binds the Rubin \(cc 10\.7\) d256 per-tensor FP8 row only"):
+                ok.check_support()
 
 
 def _run_gated_stage(geom, ref, *, batch, seq_len, gate, gate_token_stride, seq_lens=None, want_lse=True):

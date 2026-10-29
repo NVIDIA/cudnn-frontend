@@ -5449,9 +5449,14 @@ class _Sdpa(_Stage):
                 )
 
     def _device_row_arch(self) -> str:
-        """The SDPA engine-row family this stage's DEVICE binds: ``"sm100"`` on a served part of :data:`DENSE_SERVING_CCS` other than
-        Rubin (cc 10.0: the sm100 f16 row), ``"sm107"`` on cc 10.7 and on every other reading (a non-CUDA sample, an unserved part --
-        the block's home row, so a host-side declaration reads the Rubin claims as before and the part gate speaks next)."""
+        """The SDPA engine-row family this stage's DEVICE binds: ``"sm100"`` for a bf16 / f16 stage on a served part of
+        :data:`DENSE_SERVING_CCS` other than Rubin (cc 10.0: the sm100 f16 row), ``"sm107"`` on cc 10.7 and on every other reading (a
+        non-CUDA sample, an unserved part -- the block's home row, so a host-side declaration reads the Rubin claims as before and the
+        part gate speaks next) -- and for a QUANTIZED stage everywhere: the FP8 / MXFP8 pipelines bind the Rubin rows only and the part
+        rows decline them by name off cc 10.7 (``_check_part_support``, the stage's own gate), so their gate claims are read off the
+        Rubin row on every device, as before the cc 10.0 admission (the sm100 MXFP8 row's gate claim is not a fact of this block)."""
+        if self.fp8 or self.mxfp8:
+            return "sm107"
         cc = _device_cc_of(self.device)
         return "sm100" if cc is not None and cc != _SM107_CC and cc in DENSE_SERVING_CCS else "sm107"
 
