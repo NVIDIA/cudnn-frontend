@@ -281,6 +281,7 @@ kBufferElems = CFG.TILE_N * CFG.TILE_K // CFG.CTA_MMA
 vBufferElems = CFG.TILE_O * CFG.TILE_N // CFG.CTA_MMA
 oBufferElems = CFG.TILE_M * CFG.TILE_O
 _E11 = os.environ.get("FROST_EXP_E11", "1") == "1"
+_E14B = _E11 and os.environ.get("FROST_EXP_E14B", "1") == "1"
 
 qTmaTransactionBytes = qBufferElems * CFG.BPE * CFG.CTA_MMA
 kTmaTransactionBytes = kBufferElems * CFG.BPE * CFG.CTA_MMA
@@ -577,6 +578,17 @@ def _kernel(
     )
 
     bars = make_classic_bars(CFG)
+    if cutlass.const_expr(_E14B):
+        sTileDec_raw = cutlass.Array(cutlass.Int32, CFG.SCHEDULER_STAGES * 16, alignment=16, space=cutlass.AddressSpace.smem)
+        mb_tile_dec = MBarrier(
+            cutlass.Array(cutlass.Int64, CFG.SCHEDULER_STAGES, alignment=16, space=cutlass.AddressSpace.smem),
+            stages=CFG.SCHEDULER_STAGES,
+            init_count=CFG.ONE_LANE,
+            producer=Producer.THREAD,
+        )
+    else:
+        sTileDec_raw = None
+        mb_tile_dec = None
     if cutlass.const_expr(_E11):
         mb_s_read = MBarrier(
             cutlass.Array(cutlass.Int64, CFG.TILES_Q, alignment=16, space=cutlass.AddressSpace.smem),
@@ -635,6 +647,9 @@ def _kernel(
                 nvvm.mbarrier_init(sched.mb_scheduler.subview(s), CFG.ONE_LANE)
                 nvvm.mbarrier_init(sched.mb_read_tile_id.subview(s), READ_TILE_ARRIVERS_TOTAL)
             bars.mb_tmem_dealloc.init()
+            if cutlass.const_expr(_E14B):
+                for _ds in range(CFG.SCHEDULER_STAGES):
+                    mb_tile_dec[_ds].init()
             bars.mb_empty_mainloop.init()
 
     # All 32 lanes of warp 0 fill the ones tile (v4 stores, _ONES_ROWS // 4
@@ -704,6 +719,8 @@ def _kernel(
             qh_per_kh=qh_per_kh,
             mb_s_read=mb_s_read,
             sStats_raw=sStats_raw,
+            sTileDec_raw=sTileDec_raw,
+            mb_tile_dec=mb_tile_dec,
         )
 
     elif warp_idx >= CFG.SOFTMAX_WG1_BASE and warp_idx < CFG.SOFTMAX_WG1_BASE + CFG.SOFTMAX_WG_WARPS:
@@ -728,6 +745,8 @@ def _kernel(
             qh_per_kh=qh_per_kh,
             mb_s_read=mb_s_read,
             sStats_raw=sStats_raw,
+            sTileDec_raw=sTileDec_raw,
+            mb_tile_dec=mb_tile_dec,
         )
 
     elif warp_idx >= CFG.CORR_WARP_BASE and warp_idx < CFG.CORR_WARP_BASE + CFG.CORRECTION_WARPS:
@@ -837,6 +856,8 @@ def _kernel(
             is_leader=is_leader,
             cta_in_pair=cta_in_pair,
             tma_mcast_mask=tma_mcast_mask,
+            sTileDec_raw=sTileDec_raw,
+            mb_tile_dec=mb_tile_dec,
         )
 
     elif warp_idx == CFG.TMASTG_WARP_ID:
@@ -915,6 +936,8 @@ def _tmaldg_warp_group(
     is_leader,
     cta_in_pair,
     tma_mcast_mask,
+    sTileDec_raw=None,
+    mb_tile_dec=None,
 ):
     """Unified TMA-LDG warp — cga1/cga2 × MASK_NONE/PADDED/CAUSAL/SWA.
 
@@ -1120,6 +1143,40 @@ def _tmaldg_warp_group(
         q_row_base = cute.arch.make_warp_uniform(q_super_idx * cutlass.Int32(CFG.TILES_Q * TOKENS_PER_TILE))
         q_seq_off, kv_seq_off, tma_batch = _thd_tma_offsets(seq_kv_lens_tensor, batch_idx, n_batch)
         is_valid_tile = nxt_v & cutlass.Int32(1)
+        if cutlass.const_expr(_E14B):
+            _dkv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
+            _dq = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_addr)
+            _db = _bounds_for_tile_split(q_super_idx, _dq, _dkv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx, CFG.QH_PER_KH)
+            if nvvm.elect_sync():
+                _dw = Pointer(sTileDec_raw.subview(sched_state.idx * cutlass.Int32(16)).data_ptr(), dtype=cutlass.Int32)
+                _dw.store(q_super_idx, alignment=4)
+                Pointer(sTileDec_raw.subview(sched_state.idx * cutlass.Int32(16) + cutlass.Int32(1)).data_ptr(), dtype=cutlass.Int32).store(
+                    head_idx, alignment=4
+                )
+                Pointer(sTileDec_raw.subview(sched_state.idx * cutlass.Int32(16) + cutlass.Int32(2)).data_ptr(), dtype=cutlass.Int32).store(
+                    batch_idx, alignment=4
+                )
+                Pointer(sTileDec_raw.subview(sched_state.idx * cutlass.Int32(16) + cutlass.Int32(3)).data_ptr(), dtype=cutlass.Int32).store(
+                    split_idx, alignment=4
+                )
+                Pointer(sTileDec_raw.subview(sched_state.idx * cutlass.Int32(16) + cutlass.Int32(4)).data_ptr(), dtype=cutlass.Int32).store(
+                    is_valid_tile, alignment=4
+                )
+                Pointer(sTileDec_raw.subview(sched_state.idx * cutlass.Int32(16) + cutlass.Int32(5)).data_ptr(), dtype=cutlass.Int32).store(_dkv, alignment=4)
+                Pointer(sTileDec_raw.subview(sched_state.idx * cutlass.Int32(16) + cutlass.Int32(6)).data_ptr(), dtype=cutlass.Int32).store(_dq, alignment=4)
+                Pointer(sTileDec_raw.subview(sched_state.idx * cutlass.Int32(16) + cutlass.Int32(7)).data_ptr(), dtype=cutlass.Int32).store(
+                    _db.left, alignment=4
+                )
+                Pointer(sTileDec_raw.subview(sched_state.idx * cutlass.Int32(16) + cutlass.Int32(8)).data_ptr(), dtype=cutlass.Int32).store(
+                    _db.unmasked_lo, alignment=4
+                )
+                Pointer(sTileDec_raw.subview(sched_state.idx * cutlass.Int32(16) + cutlass.Int32(9)).data_ptr(), dtype=cutlass.Int32).store(
+                    _db.unmasked_hi, alignment=4
+                )
+                Pointer(sTileDec_raw.subview(sched_state.idx * cutlass.Int32(16) + cutlass.Int32(10)).data_ptr(), dtype=cutlass.Int32).store(
+                    _db.right, alignment=4
+                )
+                mb_tile_dec[sched_state.idx].arrive()
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
         if cutlass.const_expr(CFG.MASK_FLAGS == 0 and SPLIT_KV > 1):
             kv_left, kv_right = _nomask_range_split(seqlen_kv, split_idx)
@@ -2001,6 +2058,8 @@ def _softmax_warp_group(
     qh_per_kh,
     mb_s_read=None,
     sStats_raw=None,
+    sTileDec_raw=None,
+    mb_tile_dec=None,
 ):
     """Softmax warp group: online softmax per kv iter, one lane per S_acc row.
 
@@ -2201,27 +2260,88 @@ def _softmax_warp_group(
         bars.mb_stat_full[sub_tile_id].arrive()
 
         # make_warp_uniform keeps scheduler payload in URs across the back-edge.
-        wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
-        nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
-        nxt_q = cute.arch.make_warp_uniform(nxt_q)
-        nxt_hb = cute.arch.make_warp_uniform(nxt_hb)
-        nxt_v = cute.arch.make_warp_uniform(nxt_v)
-        q_super_idx, head_idx, batch_idx, split_idx = _decode_payload_split(
-            nxt_q,
-            nxt_hb,
-            cta_in_pair,
-            n_q_supers,
-            n_qh,
-            n_batch,
-            seq_kv_lens_tensor,
-            qh_per_kh,
-            seqlen_kv,
-        )
-        is_valid_tile = nxt_v & cutlass.Int32(1)
-        sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
-        eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-        eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_addr)
-        bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx, CFG.QH_PER_KH)
+        if cutlass.const_expr(_E14B):
+            mb_tile_dec[sched_state.idx].wait(sched_state.phase, spin=SPIN_RING_WAITS)
+            q_super_idx = cute.arch.make_warp_uniform(
+                cutlass.Int32(
+                    Pointer(sTileDec_raw.subview(sched_state.idx * cutlass.Int32(16) + cutlass.Int32(0)).data_ptr(), dtype=cutlass.Int32).load(alignment=4)
+                )
+            )
+            head_idx = cute.arch.make_warp_uniform(
+                cutlass.Int32(
+                    Pointer(sTileDec_raw.subview(sched_state.idx * cutlass.Int32(16) + cutlass.Int32(1)).data_ptr(), dtype=cutlass.Int32).load(alignment=4)
+                )
+            )
+            batch_idx = cute.arch.make_warp_uniform(
+                cutlass.Int32(
+                    Pointer(sTileDec_raw.subview(sched_state.idx * cutlass.Int32(16) + cutlass.Int32(2)).data_ptr(), dtype=cutlass.Int32).load(alignment=4)
+                )
+            )
+            split_idx = cute.arch.make_warp_uniform(
+                cutlass.Int32(
+                    Pointer(sTileDec_raw.subview(sched_state.idx * cutlass.Int32(16) + cutlass.Int32(3)).data_ptr(), dtype=cutlass.Int32).load(alignment=4)
+                )
+            )
+            is_valid_tile = cute.arch.make_warp_uniform(
+                cutlass.Int32(
+                    Pointer(sTileDec_raw.subview(sched_state.idx * cutlass.Int32(16) + cutlass.Int32(4)).data_ptr(), dtype=cutlass.Int32).load(alignment=4)
+                )
+            )
+            eff_seqlen_kv = cute.arch.make_warp_uniform(
+                cutlass.Int32(
+                    Pointer(sTileDec_raw.subview(sched_state.idx * cutlass.Int32(16) + cutlass.Int32(5)).data_ptr(), dtype=cutlass.Int32).load(alignment=4)
+                )
+            )
+            eff_seqlen_q = cute.arch.make_warp_uniform(
+                cutlass.Int32(
+                    Pointer(sTileDec_raw.subview(sched_state.idx * cutlass.Int32(16) + cutlass.Int32(6)).data_ptr(), dtype=cutlass.Int32).load(alignment=4)
+                )
+            )
+            bounds = KvLoopBounds(
+                left=cute.arch.make_warp_uniform(
+                    cutlass.Int32(
+                        Pointer(sTileDec_raw.subview(sched_state.idx * cutlass.Int32(16) + cutlass.Int32(7)).data_ptr(), dtype=cutlass.Int32).load(alignment=4)
+                    )
+                ),
+                unmasked_lo=cute.arch.make_warp_uniform(
+                    cutlass.Int32(
+                        Pointer(sTileDec_raw.subview(sched_state.idx * cutlass.Int32(16) + cutlass.Int32(8)).data_ptr(), dtype=cutlass.Int32).load(alignment=4)
+                    )
+                ),
+                unmasked_hi=cute.arch.make_warp_uniform(
+                    cutlass.Int32(
+                        Pointer(sTileDec_raw.subview(sched_state.idx * cutlass.Int32(16) + cutlass.Int32(9)).data_ptr(), dtype=cutlass.Int32).load(alignment=4)
+                    )
+                ),
+                right=cute.arch.make_warp_uniform(
+                    cutlass.Int32(
+                        Pointer(sTileDec_raw.subview(sched_state.idx * cutlass.Int32(16) + cutlass.Int32(10)).data_ptr(), dtype=cutlass.Int32).load(alignment=4)
+                    )
+                ),
+            )
+            sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
+        else:
+            wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
+            nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
+            nxt_q = cute.arch.make_warp_uniform(nxt_q)
+            nxt_hb = cute.arch.make_warp_uniform(nxt_hb)
+            nxt_v = cute.arch.make_warp_uniform(nxt_v)
+            q_super_idx, head_idx, batch_idx, split_idx = _decode_payload_split(
+                nxt_q,
+                nxt_hb,
+                cta_in_pair,
+                n_q_supers,
+                n_qh,
+                n_batch,
+                seq_kv_lens_tensor,
+                qh_per_kh,
+                seqlen_kv,
+            )
+            is_valid_tile = nxt_v & cutlass.Int32(1)
+            sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
+            eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
+            eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_addr)
+            bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx, CFG.QH_PER_KH)
 
 
 @cute.jit
