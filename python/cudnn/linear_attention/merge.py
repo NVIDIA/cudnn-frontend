@@ -66,6 +66,8 @@ class KimiCPMerge(APIBase):
     absent transition disables product output. No device storage is plan-owned.
     Numerical precision and direction are fixed at compile time. Pass already
     gathered FP32 summaries: no implicit conversion, communication or fallback.
+    The caller orders summary/seed production before the launch stream and
+    prevents concurrent writes or overlapping executions on the same buffers.
     """
 
     def __init__(self, h, m, initial_states, final_state, initial_state=None, *, reverse=False, precision="tf32x3", transition=None):
@@ -166,8 +168,12 @@ class KimiCPMerge(APIBase):
         remain compact, 16-byte aligned and mutually disjoint. Unsupported or
         changed bindings raise before launch. current_stream accepts a Torch
         stream or raw CUDA handle, defaulting to the operand device's current
-        stream. The caller's current device is restored and all tensor storage
-        is recorded on the consumer stream. Warm calls support CUDA Graph capture.
+        stream. No producer-stream wait is inserted: callers must order every
+        input write before current_stream and keep inputs/outputs free of
+        concurrent writes or overlapping executions until that stream completes.
+        Recording storage on the consumer stream protects allocator lifetime
+        only; it does not establish data dependencies. The caller's current
+        device is restored. Warm calls support CUDA Graph capture.
         """
         if self._compiled_kernel is None:
             raise RuntimeError("Call compile() before execute()")
@@ -234,6 +240,10 @@ def kimi_cp_merge(h, m, initial_state=None, *, reverse=False, precision="tf32x3"
     the prepared class is the allocation-free entry. Autograd-enabled inputs,
     overlapping inputs, dtype/layout mismatches and invalid modes raise before
     compilation or output allocation. No summary generation is performed.
+    No producer-stream wait is inserted; the caller orders H/M/seed production
+    before current_stream and serializes access to all merge buffers until the
+    launch completes. Internal record_stream calls protect allocator lifetime,
+    not cross-stream data visibility.
     """
     if not isinstance(h, torch.Tensor) or not h.is_cuda or h.ndim != 4:
         raise ValueError("h must be a CUDA tensor of shape [pieces, heads, V, K]")

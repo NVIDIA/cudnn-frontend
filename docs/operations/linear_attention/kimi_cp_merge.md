@@ -67,6 +67,10 @@ No autograd is registered. Use inside an explicit CP autograd integration and
 merge the reverse state-gradient summaries separately during backward. Calling
 with `requires_grad` operands while grad mode is enabled raises instead of
 silently dropping gradients. The wrapper allocates outputs on the launch stream.
+It does not insert waits for H/M/seed produced on another stream. Order those
+writes before `current_stream`, and do not concurrently write or reuse any merge
+input/output until that stream completes. Internal `record_stream` calls protect
+allocator lifetime; they do not establish producer-to-consumer dependencies.
 
 ## Prepared, allocation-free API
 
@@ -85,7 +89,10 @@ Precision and reverse direction are fixed at compilation; use another plan to
 select another mode, or pass the new mode to the allocating wrapper.
 The plan owns no CUDA storage and requires no caller workspace; only fixed shared
 memory is used within each CTA. Warm execution supports CUDA Graph capture,
-new input allocations and caller-selected streams/devices.
+new input allocations and caller-selected streams/devices. The same caller-side
+ordering rule applies to `execute`: inputs must be ready on its launch stream,
+and the bound buffers must not participate in another overlapping write or merge
+execution until completion.
 
 Currently supports FROST SM100/SM103/SM107 targets; SM107 needs a DSL build with
 the sm_107a target. Requires CUDA-enabled PyTorch and CuTeDSL >= 4.8.0. With
