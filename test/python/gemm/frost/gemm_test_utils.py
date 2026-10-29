@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import cudnn
+import re
 from dataclasses import replace
 
 import pytest
@@ -188,6 +189,16 @@ def kernel_ptx(compiled) -> str:
     ptx = getattr(compiled, "_compiled", compiled)._launchable.__ptx__
     assert ptx, "the kernel carries no PTX: compile it under keep_kernel_ptx"
     return ptx
+
+
+def brev_bfind_types(ptx: str) -> list[str]:
+    """The type (``s32``, ``u32``, ...) of every ``bfind`` in ``ptx`` that reads a ``brev.b32``
+    result of the same function: each lowest-set-bit search ``31 - bfind(brev(x))``."""
+    types = []
+    for body in re.split(r"\.(?:entry|func)\s", ptx)[1:]:  # PTX registers are scoped to their function
+        reversed_regs = set(re.findall(r"\bbrev\.b32\s+(%r\d+),", body))
+        types += [t for t, src in re.findall(r"\bbfind\.([\w.]+)\s+%r\d+,\s*(%r\d+);", body) if src in reversed_regs]
+    return types
 
 
 # --- variant packs ----------------------------------------------------------

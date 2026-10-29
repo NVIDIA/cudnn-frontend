@@ -27,6 +27,7 @@ from gemm_test_utils import (
     reduction_dims as _reduction_dims,
     keep_kernel_ptx,
     kernel_ptx,
+    brev_bfind_types,
     FULL_EXPERT_REDUCE_OFFSETS as _FULL_EXPERT_REDUCE_OFFSETS,
     plan_as_sm100,
 )
@@ -1277,7 +1278,8 @@ def test_sm120_moe_scheduler_lane_search_is_unsigned(swap_ab, monkeypatch, tmp_p
     brev(0xFFFFFFFF) == -1: whenever lane 0 won (a first claim in group 0, or the
     first group of a later 32-group window) the lane came out as 32, and shfl.sync
     read lane 0 only through its 5-bit lane field. Both cases run against the
-    reference here; the kernel must then hold no signed bit-find."""
+    reference here; the bfind that reads the bit-reversed ballot must then be
+    bfind.u32."""
     from cudnn.gemm.frost.sm120 import compiler as C120
 
     keep_kernel_ptx(monkeypatch, C120, tmp_path)
@@ -1296,7 +1298,9 @@ def test_sm120_moe_scheduler_lane_search_is_unsigned(swap_ab, monkeypatch, tmp_p
 
     ptx = kernel_ptx(compiled)
     assert "vote.sync.ballot.b32" in ptx
-    assert "bfind.s32" not in ptx, "the grouped scheduler's lane search uses the signed bfind.s32"
+    lane_search = brev_bfind_types(ptx)  # the scheduler's 31 - bfind(brev(ballot))
+    assert lane_search, "no bfind reads a brev.b32 result in the kernel PTX"
+    assert set(lane_search) == {"u32"}, f"the grouped scheduler's lane search uses {['bfind.' + t for t in lane_search]}, not bfind.u32"
 
 
 def test_analyzer_detects_n_major_weight() -> None:
