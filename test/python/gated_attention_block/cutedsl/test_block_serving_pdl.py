@@ -38,7 +38,7 @@ import sys
 import pytest
 import torch
 
-import cudnn.gated_attention_block.api as _api
+from cudnn.gated_attention_block import api as _api
 from cudnn.frost import buffers as _buffers
 from cudnn.frost.buffers import cutedsl_requirement_error
 from cudnn.gated_attention_block import GatedAttentionBlockFwd, GatedAttentionBlockGeometry, QsaSpec, QuantSpec, decode_route
@@ -62,6 +62,7 @@ if requirement_error:
 pytestmark = pytest.mark.L0
 
 requires_rubin = pytest.mark.requires_rubin  # the suite's registered marker (conftest.py): skipped off SM107
+requires_blackwell = pytest.mark.requires_blackwell  # the registered marker: an admitted Blackwell-line part of DENSE_SERVING_CCS (cc 10.0; 2026-10-29)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -316,14 +317,18 @@ def test_the_prefill_route_keeps_the_switch_off_stage_four_and_reads_back_which_
     fp32 = GatedAttentionBlockFwd.serving_envelope(geom, torch.float32, _DEV, device_cc=(10, 7)).decode
     assert not fp32.served and fp32.pdl_default is False, "the default is a reading of a served form"
     monkeypatch.undo()
+    # the Rubin table's route facts on a Rubin reading (a cc 10.0 host's own reading records the SM100 line: group 16 at S_q 4 is the
+    # prefill tile there, pinned in test_block_serving_decode.py)
+    rubin_routes = GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=(10, 7)).decode
     assert (
         all(r.pdl_capable is r.decode_tile for r in env.decode.routes)
-        and env.decode.route(5, batch=32).pdl_capable is False
-        and env.decode.route(4).pdl_capable
+        and rubin_routes.route(5, batch=32).pdl_capable is False
+        and rubin_routes.route(4).pdl_capable
     )
-    assert env.decode.route(5).pdl_capable is True
+    assert rubin_routes.route(5).pdl_capable is True
     # the token-unit policy takes the same step on the decode tile at any batch, where the switch reaches stage (4); so does the default
-    # policy below the fill
+    # policy below the fill (the Rubin reading on any host)
+    monkeypatch.setattr(_api, "_route_device_cc", lambda device: None)
     for extra in (dict(decode_route_policy="token_units"), dict()):
         tu = _Case(16, 5, (100,), seed=1, blk_kw=dict(use_pdl=True, **extra))
         assert tu.blk.decode_route.decode_tile and tu.blk.decode_route.pdl_capable and tu.blk._sdpa.use_pdl is True and tu.blk.use_pdl_effective is True
@@ -369,6 +374,31 @@ def test_the_decode_step_is_bitwise_with_and_without_pdl(decl, s_q):
     # a second PDL step is bitwise the first: nothing in the chain raced
     c = on.run().clone()
     assert torch.equal(b, c)
+
+
+@requires_blackwell
+@pytest.mark.parametrize(
+    "decl, group, s_q", [("auto", 16, 1), ("unfused-auto", 6, 1), ("unfused-unsplit", 6, 4)], ids=["auto-16-sq1", "unfused-auto-6-sq1", "unfused-unsplit-6-sq4"]
+)
+def test_the_decode_step_is_bitwise_with_and_without_pdl_on_cc_10_0(decl, group, s_q):
+    """The explicit switch on cc 10.0 (2026-10-29; AUTO reads False there -- the default is the measured part's): the SM100 decode tile
+    and its combine carry the griddepcontrol pair, so the switched chain is BITWISE the plain one on ``out`` and on the pools, the same
+    kernels (``fuse_gate=False``: the gate its own launch on this part; the fused-fork declarations are the sm_107a decline there)."""
+    kw = dict(_DECLARATIONS[decl], fuse_gate=False)
+    off = _case(group, s_q, pdl=False, **kw)
+    on = _case(group, s_q, pdl=True, **kw)
+    assert on.route_readback() == off.route_readback() and _stage_names(on) == _stage_names(off)
+    assert on.route_readback()["template"] == DECODE_TILE and on.route_readback()["file"].endswith("/sm100/decode_d256_f16.py")
+    assert on.blk.use_pdl is True and on.blk._sdpa.use_pdl is True and "sdpa" in on.blk.pdl_stages and off.blk.use_pdl is False
+    a = off.run().clone()
+    b = on.run().clone()
+    on.check_against_oracle(b, what=f"cc 10.0 {decl} group {group} s_q={s_q} use_pdl=True")
+    assert torch.equal(a, b), f"{decl}: out differs with use_pdl on cc 10.0 (max|diff| {(a.float() - b.float()).abs().max().item():.3e})"
+    assert torch.equal(_bits(on.k_cache), _bits(off.k_cache)) and torch.equal(_bits(on.v_cache), _bits(off.v_cache)), "the write-through differs"
+    c = on.run().clone()
+    assert torch.equal(b, c)
+    auto = _Case(group, s_q, _LENS, seed=0, blk_kw=dict(fuse_gate=False, **_DECLARATIONS[decl]))
+    assert auto.blk.use_pdl is False and auto.blk.use_pdl_requested is None and auto.blk.pdl_stages == ()
 
 
 @requires_rubin
