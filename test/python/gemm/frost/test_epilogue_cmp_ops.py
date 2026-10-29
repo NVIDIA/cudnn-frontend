@@ -5,9 +5,9 @@
 
 The stored 0/1 masks must equal torch's comparisons cell for cell: a NaN operand
 compares false (true for cmp_neq), equal infinities compare equal, and finite
-operands, subnormals included, stay exact. Covers an aux operand, two chain
-operands (the isnan idiom cmp_neq(C, C)) and a scalar operand (the isfinite
-idiom cmp_lt(abs(C), inf))."""
+operands, subnormals included, stay exact. Covers an aux operand on either side
+of the compare, two chain operands (the isnan idiom cmp_neq(C, C)) and a scalar
+operand (the isfinite idiom cmp_lt(abs(C), inf))."""
 
 from __future__ import annotations
 
@@ -63,8 +63,8 @@ def _operands():
 
 
 def test_cmp_ops_follow_ieee_for_nonfinite_operands_sm120():
-    """The six cmp ops, the isnan idiom and the isfinite idiom on +-inf, NaN and
-    subnormal operands, dense sm120 matmul with an fp32 epilogue."""
+    """The six cmp ops with the aux on either side, the isnan idiom and the isfinite
+    idiom on +-inf, NaN and subnormal operands, dense sm120 matmul with an fp32 epilogue."""
     g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     A = g.tensor(name="A", dim=[1, _M, _K], stride=[_M * _K, _K, 1])
     B = g.tensor(name="B", dim=[1, _K, _N], stride=[_K * _N, 1, _K])
@@ -72,6 +72,7 @@ def test_cmp_ops_follow_ieee_for_nonfinite_operands_sm120():
     X = g.tensor(name="x", dim=[1, _M, _N], stride=[_M * _N, _N, 1], data_type=cudnn.data_type.FLOAT)
     inf = g.tensor(name="inf", dim=[1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.FLOAT)
     ys = {op: getattr(g, op)(input=C, comparison=X, name=f"y_{op}") for op in _CMP_OPS}
+    ys.update({f"{op}(X, C)": getattr(g, op)(input=X, comparison=C, name=f"y_{op}_xc") for op in _CMP_OPS})  # aux on the left
     ys["isnan"] = g.cmp_neq(input=C, comparison=C, name="y_isnan")
     ys["isfinite"] = g.cmp_lt(input=g.abs(input=C, name="abs"), comparison=inf, name="y_isfinite")
     for y in ys.values():
@@ -91,6 +92,7 @@ def test_cmp_ops_follow_ieee_for_nonfinite_operands_sm120():
     torch.cuda.synchronize()
 
     refs = {op: fn(acc, x) for op, fn in _CMP_OPS.items()}
+    refs.update({f"{op}(X, C)": fn(x, acc) for op, fn in _CMP_OPS.items()})
     refs["isnan"] = torch.isnan(acc)
     refs["isfinite"] = torch.isfinite(acc)
     bad = {}
