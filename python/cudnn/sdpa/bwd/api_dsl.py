@@ -1904,19 +1904,6 @@ def _sm100_kernel_path(fname: str) -> str:
 _SM100_WS_BLOCK_ROWS = 128
 
 
-def _sm100_device_clusters(device, cga_m: int) -> int:
-    """Clusters that fit the device once, for the THD persistent grid.
-
-    Occupancy-sized rather than work-sized: the work list is a device value, so
-    the grid cannot be it.  One CTA per SM is this kernel's design point, so the
-    cluster count is simply SM count / CGA width.
-    """
-    from cudnn.frost import device as _dev
-
-    idx = device.index if hasattr(device, "index") and device.index is not None else 0
-    return max(1, _dev.multiprocessor_count(idx) // cga_m)
-
-
 def _sm100_head_chunk_thd(
     h_q: int, ws_rows: int, s_kv: int, bpe: int, budget: int = _SM100_WS_BUDGET_BYTES, group: int = 1, t_rows: Optional[int] = None
 ) -> int:
@@ -2004,8 +1991,7 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         """True when a logical-BHSD desc sits on compact BSHD storage.
 
         Same predicate the SM120 adapter uses; defined here rather than shared
-        because that one is private to its class and this row's staging decision
-        is the only other caller.
+        because this row retains the compact packed-token contract.
         """
         b, h, s, d = (int(x) for x in desc.shape)
         return tuple(int(x) for x in desc.stride) == (s * h * d, d, h * d, 1)
@@ -2038,7 +2024,6 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         self._skv_pad = -(-self.s_k_max // 128) * 128
         self._is_padded = self._sq_pad != self.s_q_max or self._skv_pad != self.s_k_max
         self._compiled = None
-        self._staged_prepared = None
         self._zero_ws = False
         self._thd_lse_token_major = bool(getattr(self, "thd_stats_token_major", False)) and self.thd
         # Head-major Stats only: the caller's head stride, which the compiled
@@ -2071,28 +2056,15 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             # The budget is charged on the token rows (`t_rows`), so equal
             # lengths get the dense plan's chunk (see _SM100_WS_THD_PAD_SLACK).
             self._qh_chunk = _sm100_head_chunk_thd(self.h_q, self._ws_rows_cap, self._skv_pad, self._bpe, group=self._gqa_group, t_rows=self._t_q_cap)
-        # Retain the grandfathered dense conversion fallback for layouts that
-        # cannot use the native TMA pointer host. It stages compact BSHD buffers
-        # from caller workspace, decided here from the declarations. Native
-        # legal TMA layouts clear these staging lists below; BHSD dO now goes
-        # directly to the kernel too. THD retains its compact BSHD boundary.
-        self._stage_in = tuple(
-            name
-            for name, desc in (("q", self.q_desc), ("k", self.k_desc), ("v", self.v_desc), ("o", self.o_desc), ("dO", self.do_desc))
-            if not self._bshd_physical_ok(desc)
-        )
-        self._stage_out = tuple(name for name, desc in (("dQ", self.dq_desc), ("dK", self.dk_desc), ("dV", self.dv_desc)) if not self._bshd_physical_ok(desc))
+        # Dense operands bind their declared TMA pitches. Packed operands keep
+        # their existing compact token/head contract; neither path stages IO.
+        self._prepared = None
+
+    def _native_layout_errors(self):
         from .prepared_sm100 import native_io_layout
 
-        self._prepared = None
-        self._prepared_native = all(
-            native_io_layout(desc) for desc in (self.q_desc, self.k_desc, self.v_desc, self.o_desc, self.do_desc, self.dq_desc, self.dk_desc, self.dv_desc)
-        )
-        if self.thd:
-            self._prepared_native = self._prepared_native and not (self._stage_in or self._stage_out)
-        elif self._prepared_native:
-            # TMA descriptors and strided stores address these layouts directly.
-            self._stage_in = self._stage_out = ()
+        accepted = self._bshd_physical_ok if self.thd else native_io_layout
+        return tuple(name for name in ("q", "k", "v", "o", "do", "dq", "dk", "dv") if not accepted(getattr(self, name + "_desc")))
 
     # --- capability backstop -------------------------------------------------
     def check_support(self) -> bool:
@@ -2140,10 +2112,6 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             # Keep the existing layout boundary: incompatible declarations
             # decline here before compiling or binding a pointer host.
             self._value_error_if(
-                bool(self._stage_in or self._stage_out),
-                f"SM100 bwd THD: {', '.join(self._stage_in + self._stage_out)} must be BSHD-physical " "(the packed path has no staging copy)",
-            )
-            self._value_error_if(
                 self._thd_lse_token_major and bool(self.thd_stats_head_stride),
                 "SM100 bwd THD: thd_stats_head_stride is head-major-only (token-major (T, H) Stats is compact)",
             )
@@ -2156,6 +2124,12 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             )
         else:
             self._value_error_if(self.seq_kv_lens_present or self.seq_q_lens_present, "SM100 bwd: padding masks (seq lens) are not implemented")
+        invalid = self._native_layout_errors()
+        self._value_error_if(
+            bool(invalid),
+            f"{self._NAME}: {', '.join(invalid)} requires "
+            + ("compact BSHD-physical packed strides" if self.thd else "non-overlapping dense strides with D stride 1 and 16-byte outer pitches"),
+        )
         self._value_error_if(self.deterministic, "SM100 bwd: deterministic mode is not implemented")
         return True
 
@@ -2182,9 +2156,6 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             # descriptor word), dead on the dense path (every read is under
             # const_expr(_THD)) but part of the compiled ABI: borrowed here (Rule 8).
             total = delta + 2 * ws + ws_align(self.batch_size * 4) + ws_align(8)
-        for name in self._stage_in + self._stage_out:
-            s_len = self.s_k_max if name in ("k", "v", "dK", "dV") else self.s_q_max
-            total += ws_align(self.batch_size * s_len * self.h_q * self.head_dim_qk * self._bpe)
         if self._gqa_group > 1:
             # One dK and one dV partial per Q head, reduced to the KV heads at
             # the end. Sized on h_q, not h_kv -- that is the whole point.
@@ -2242,9 +2213,8 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
     def compile(self) -> None:
         """Plan-time JIT for the whole chain: stage 2's specialized module plus
         the two stage-3 GEMM specializations (dV/dK share one; dQ needs the other
-        operand-major and the other causal K-trim direction). Native layouts
-        and the existing dense conversion path both compile the complete
-        pointer chain here."""
+        operand-major and the other causal K-trim direction). The complete
+        pointer chain reads and writes the declared native layouts."""
         self._ensure_support_checked()
         if self._compiled is not None:
             return self._compiled
@@ -2377,16 +2347,10 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         # refuses a value that is neither 1 nor the group).
         self._dq_b_head_group = int(p_hi.b_head_group)
         mm_hi = load_template(_sm100_kernel_path(_SM100_MATMUL_FILE), p_hi, tag="sdpa_bwd_sm100_mm_hi")
-        if self._prepared_native:
-            from .prepared_sm100 import compile_plan
+        from .prepared_sm100 import compile_plan
 
-            self._prepared = compile_plan(self, stage2_mod, mm_lo, mm_hi)
-            self._compiled = self._prepared
-            return self._compiled
-        from .prepared_sm100 import compile_staged
-
-        self._staged_prepared = compile_staged(self, stage2_mod, mm_lo, mm_hi)
-        self._compiled = self._staged_prepared
+        self._prepared = compile_plan(self, stage2_mod, mm_lo, mm_hi)
+        self._compiled = self._prepared
         return self._compiled
 
     # --- execution -----------------------------------------------------------
@@ -2421,19 +2385,9 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
 
         if self._compiled is None:
             self.compile()
-        if self._prepared is not None:
-            from .prepared_sm100 import execute_standalone
+        from .prepared_sm100 import execute_standalone
 
-            return execute_standalone(
-                self,
-                (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor, seq_q_lens, seq_kv_lens),
-                workspace,
-                current_stream,
-                scale_softmax,
-            )
-        from .prepared_sm100 import execute_staged
-
-        return execute_staged(
+        return execute_standalone(
             self,
             (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor, seq_q_lens, seq_kv_lens),
             workspace,

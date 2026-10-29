@@ -436,12 +436,11 @@ suite.
 
 ### Prepared quantized launch probes
 
-When testing a retained staging path, choose a declaration that the graph
-validator accepts but the native pointer layout declines. A nonunit D stride
-is rejected before SDPA lowering; unit D with an unaligned outer pitch reaches
-the existing dense conversion path. `test_staged_rebind_stream_capture` in
-`test_sdpa_bwd_staged_sm100.py` guards its row padding and forbids legacy tensor
-compilation/DLPack while checking changed allocations and replay.
+Native dense SDPA data ports use aligned pitches and must not acquire hidden
+layout copies. `test_native_rebind_stream_capture` in
+`test_sdpa_bwd_native_layouts_sm100.py` guards padding and forbids legacy tensor
+compilation/DLPack while checking changed allocations and replay. Unaligned
+outer pitches are negative admission cases, not a request for staging.
 
 Optional gradients copied from accumulators after a prepared launch still need
 presence, dtype and extent checks before any staging write. They can be absent
@@ -976,6 +975,14 @@ storage after warmup. Keep producer shape separate from explicit overrides;
 only overrides must equal the fixed graph geometry. Run the existing prepared
 backward replay, auxiliary-output, artifact-cache and physical wide-address
 suites as well as the new native-route tests.
+
+For a fixed backward host, gradient overlap uses the declared address sets
+and current pointers, including when a graph carrier is a noncontiguous view.
+The host does not consume that carrier's strides. Reinterpreting its layout
+only in the overlap guard changes the graph contract and can reject legal
+interleaved outputs. `test_gradient_overlap_uses_declared_graph_addresses`
+checks both acceptance and rejection without overrides; explicit mismatched
+geometry overrides must still fail before launch.
 
 SM90 native binding retains the host's natural-unit scale slot, including zero
 and negative specializations. Its dense layout predicate covers permutations;

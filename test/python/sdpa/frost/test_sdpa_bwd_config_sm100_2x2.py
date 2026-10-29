@@ -63,6 +63,79 @@ def _sm107():
     return make_cfg_d512_2x2(TemplateParams2x2(**_SM107))
 
 
+@pytest.mark.parametrize("descriptor", [None, "cuda", "cuda:2", 2, "unindexed", "indexed"])
+@pytest.mark.parametrize("scope", [None, 2])
+@pytest.mark.parametrize("cga_m", [4, 8])
+def test_persistent_clusters_use_the_descriptor_or_build_device(descriptor, scope, cga_m, monkeypatch):
+    import torch
+    from cudnn.frost import device
+
+    if descriptor in ("unindexed", "indexed"):
+        descriptor = torch.device("cuda" if descriptor == "unindexed" else "cuda:2")
+    monkeypatch.setattr(device, "ambient_device", lambda: 1)
+    queried = []
+
+    def sm_count(index):
+        queried.append(index)
+        return {0: 80, 1: 132, 2: 7}[index]
+
+    monkeypatch.setattr(device, "multiprocessor_count", sm_count)
+    explicit = descriptor == 2 or str(descriptor) == "cuda:2"
+    expected_device = 2 if explicit or scope == 2 else 1
+    with device.build_device(scope):
+        result = cfgmod._sm100_device_clusters(descriptor, cga_m)
+    assert queried == [expected_device]
+    assert result == max(1, {1: 132, 2: 7}[expected_device] // cga_m)
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_prepared_plan_device_matches_its_compile_target(explicit, monkeypatch):
+    from types import SimpleNamespace
+    import torch
+    from cudnn.frost import device
+    from cudnn.sdpa.bwd import prepared_sm100
+    from cudnn.sdpa.bwd.kernels.sm100 import prepared_host
+
+    descriptor = torch.device("cuda:1" if explicit else "cuda")
+    desc = SimpleNamespace(shape=(1, 2, 128, 512), stride=(131072, 512, 1024, 1), dtype=torch.bfloat16, device=descriptor)
+    stats = SimpleNamespace(shape=(1, 2, 128), stride=(256, 128, 1), dtype=torch.float32, device=descriptor)
+    api = SimpleNamespace(
+        **{role + "_desc": stats if role == "stats" else desc for role in prepared_sm100.ROLES[:9]},
+        batch_size=1,
+        h_q=2,
+        h_kv=2,
+        head_dim_qk=512,
+        s_q_max=128,
+        s_k_max=128,
+        thd=False,
+        _sq_pad=128,
+        _skv_pad=128,
+        _qh_chunk=2,
+        _zero_ws=False,
+        _dq_b_head_group=1,
+        dtype=torch.bfloat16,
+        scale_softmax=512**-0.5,
+        _NAME="sdpa_bwd_sm100",
+        scratch_workspace_bytes=lambda: 132352,
+    )
+    target = 1 if explicit else 2
+    queried = []
+
+    def cc(index):
+        queried.append(index)
+        return (10, 0)
+
+    monkeypatch.setattr(device, "compute_capability", cc)
+    monkeypatch.setattr(device, "ambient_device", lambda: 0)
+    monkeypatch.setattr(prepared_host, "compile_host", lambda *a, **kw: lambda *frame: None)
+    monkeypatch.setattr(prepared_sm100, "positional_entry", lambda entry: entry)
+    stage = SimpleNamespace(CFG=SimpleNamespace(TILE_M=128, CTA_MMA=2), _host=None, FROST_SOURCE_DIGEST="host-test")
+    with device.build_device(2):
+        spec = prepared_sm100.compile_plan(api, stage, stage, stage)
+    assert queried == [target]
+    assert spec.device_index == target
+
+
 # --------------------------------------------------------------------------- the two arms' layouts, as values
 
 

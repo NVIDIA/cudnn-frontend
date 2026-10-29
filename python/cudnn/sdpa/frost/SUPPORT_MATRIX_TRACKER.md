@@ -4059,3 +4059,16 @@ precisions, all gradient types, GQA, tails and empty sequences, requested amax,
 rebinding and retained replay. `test_fp8_tma_layout_matches_each_mma_consumer`
 checks the distinct dP/dV shared-memory layouts; the paired-fold tests retain
 legacy D256 controls and independent gradient widths.
+
+### SM100/SM103 large-head backward native dense strides
+
+The `sdpa_bwd_sm100` dense D264–D512 half/BF16 chain binds independent
+non-overlapping B/H/S nesting and aligned padding directly for Q/K/V/O/dO
+and dQ/dK/dV. D has stride 1 and each stepped outer byte pitch is a multiple
+of 16. Unused B/H/S strides are canonicalized without changing addresses.
+Both graph admission and the standalone adapter decline unaligned pitches
+before compilation; the old workspace staging leg has been removed.
+THD retains its compact packed contract. The SM107 D512 graph row remains
+BSHD-only; this change does not widen that row or deterministic support.
+Detector: `test_sdpa_bwd_native_layouts_sm100.py` checks native binding,
+padding canaries, fresh allocations, stream handling and changed-data replay.
