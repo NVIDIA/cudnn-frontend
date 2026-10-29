@@ -3,10 +3,10 @@
 
 """The epilogue MOD op is C fmod (cuDNN's floating-point remainder; torch.fmod).
 
-fmod is exact, so the SM120 template is checked bitwise, signed zeros included, on
-the operands an emission of a - b * trunc(a / b) gets wrong: quotients that round up
-to an integer (k / 0.1f), |a / b| >= 2**23, an infinite divisor and a quotient that
-overflows. The sm100-family sweep in test_matmul_epilogue_fusion.py draws quotients
+fmod is exact, so the dense SM120 and SM100 templates are checked bitwise, signed zeros
+included, on the operands an emission of a - b * trunc(a / b) gets wrong: quotients that
+round up to an integer (k / 0.1f), |a / b| >= 2**23, an infinite divisor and a quotient
+that overflows. The sm100-family sweep in test_matmul_epilogue_fusion.py draws quotients
 below ~10 and compares within a tolerance, so it cannot tell the two forms apart.
 """
 
@@ -15,15 +15,19 @@ from __future__ import annotations
 import pytest
 import torch
 
-from gemm_test_utils import Plan, requires_sm120, vp
+from gemm_test_utils import Plan, requires_sm100, requires_sm120, vp
 
-pytestmark = [pytest.mark.L0, requires_sm120]
+pytestmark = pytest.mark.L0
 
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  — installs the cudnn.pygraph recorder hook
 from cudnn.gemm.frost.tile_config import by_name
 
-_CFG = "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"
+# The emitter is shared, so each family's dense template runs the same cases.
+_CONFIGS = [
+    pytest.param("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2", marks=requires_sm120, id="sm120"),
+    pytest.param("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma", marks=requires_sm100, id="sm100"),
+]
 _M = _N = _K = 128
 _INF, _NAN = float("inf"), float("nan")
 
@@ -50,7 +54,7 @@ def _cases(aux_is_dividend: bool) -> list[tuple[str, torch.Tensor, torch.Tensor]
     if aux_is_dividend:  # mod(x, C)
         return [
             ("x mod bf16(2 pi), |x / C| up to 2**24", torch.full((256,), 6.28125), torch.linspace(1e6, 1e8, 256)),
-            ("|x / C| >= 2**24, x / C overflows", torch.tensor([-3.0, 0.5, 2.0**-100]), torch.tensor([2.0**25, 3e38, 1e38])),
+            ("|x / C| >= 2**23, x / C overflows", torch.tensor([-3.0, 0.5, 2.0**-100]), torch.tensor([2.0**25, 3e38, 1e38])),
             ("x = +-inf, NaN, -0", torch.full((4,), 3.0), torch.tensor([_INF, -_INF, _NAN, -0.0])),
             ("small quotients", _bf16(torch.linspace(0.5, 1.5, 128)), torch.linspace(-8, 8, 128)),
         ]
@@ -69,8 +73,9 @@ def _cases(aux_is_dividend: bool) -> list[tuple[str, torch.Tensor, torch.Tensor]
 
 
 @pytest.mark.parametrize("aux_is_dividend", [False, True], ids=["mod_C_x", "mod_x_C"])
-def test_epilogue_mod_is_exact_fmod_sm120(aux_is_dividend):
-    plan = Plan(_mod_graph(aux_is_dividend), config=by_name(_CFG))
+@pytest.mark.parametrize("config", _CONFIGS)
+def test_epilogue_mod_is_exact_fmod(config, aux_is_dividend):
+    plan = Plan(_mod_graph(aux_is_dividend), config=by_name(config))
     cases = _cases(aux_is_dividend)
     assert all(len(gemm_vals) == len(aux_vals) for _, gemm_vals, aux_vals in cases)
     # The remaining positions hold (1, 1), whose fmod is 0.
