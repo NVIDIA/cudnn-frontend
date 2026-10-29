@@ -1026,6 +1026,10 @@ def _mma_loop(
             if cutlass.const_expr(MX):
                 _sf_copy(tmem_base, CFG.TMEM_SF_V, _sf_tile(slab, CFG.SF_V, CFG.SF_V_BYTES).desc(), 1)
             kv_state = advance(kv_state, 1)
+        else:
+            _wait_tcgen(bars.k_full, kv_state.phase)
+            _wait_tcgen(bars.v_full, kv_state.phase)
+            kv_state = advance(kv_state, 1)
         total = ratio * (hi - lo)
         t = cutlass.Int32(0)
         prev_q = q_state
@@ -1131,6 +1135,9 @@ def _load_loop(
             tma_load_tile(_operand(slab, CFG.V, FP8, CFG.M, CFG.DV, swz=CFG.V_SWZ), GmemTileTma(v_desc)(0, block * CFG.M, head, batch), bars.v_full.smem_ptr)
             if cutlass.const_expr(MX):
                 tma_load_tile(_sf_tile(slab, CFG.SF_V, CFG.SF_V_BYTES), GmemTileTma(sf_v_desc)(0, 0, block, head, batch), bars.v_full.smem_ptr)
+        else:
+            bars.k_full.arrive(n_bytes=0, pred=nvvm.elect_sync())
+            bars.v_full.arrive(n_bytes=0, pred=nvvm.elect_sync())
         for r in cutlass.range(0, ratio, 1, unroll=1):
             hq = head * ratio + r
             for qtile in cutlass.range(lo, hi, 1, unroll=1):

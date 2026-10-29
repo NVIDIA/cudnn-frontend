@@ -162,7 +162,7 @@ def test_pair_host_binds_one_kernel_pair_per_specialization(monkeypatch):
 
 @requires_pre_rubin_blackwell
 def test_causal_empty_kv_tiles(sm100_row):
-    sm100_row._run_fp8(b=4, hq=32, sq=256, skv=1024, causal=True, d_v=_DV).check()
+    sm100_row._run_fp8(b=4, hq=32, sq=256, skv=1024, causal=True, d_v=_DV, runs=32).check()
 
 
 @requires_pre_rubin_blackwell
