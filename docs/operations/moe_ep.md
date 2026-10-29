@@ -159,7 +159,8 @@ dgrad configurations:
 
 - `"baseline"` preserves the grouped schedule and all existing defaults;
 - `"rolling"` selects the upstream rolling/phase-interleaved schedule;
-- `"ds3_ep4_v1"` selects the complete, strictly qualified DS3 preset.
+- `"ds3_ep4_pattern"` selects the upstream preset named for its original DS3
+  EP4 workload.
 
 For example:
 
@@ -176,12 +177,10 @@ config = replace(
 )
 ```
 
-The DS3 preset currently requires EP4, 32 total experts, T4096 per-rank
-capacity, H7168, I2048, K8, MXFP8 combine, unclamped SwiGLU, and the training
-backward auxiliary outputs. Both contiguous and discrete native backward
-weights are supported. The upstream resolver rejects an unqualified workload
-during backend/kernel construction; MoeEP does not duplicate that complete
-qualification table in its public config validator.
+The name identifies the preset's origin, not an EP4-only runtime restriction.
+Additional topologies and problem shapes are supported, subject to the generic
+kernel resource, layout, output, full-route-capacity, and MXFP8 constraints.
+Both contiguous and discrete native backward weights are supported.
 
 DS3 owns its scheduling and transport preset fields. It requires
 `token_back_mode="epi_warps"`, `token_in_flag_batch=1`, `group_hint=None`, and
@@ -279,11 +278,11 @@ the earlier candidate. `MoeEpAutotuneResult` reports `winner`, per-candidate
 `evaluated_candidates`.
 
 Backward candidates may select different dgrad profiles. Candidate failure
-remains fail-fast: including `ds3_ep4_v1` in an unqualified workload aborts
-the sweep instead of silently skipping that candidate. Only include DS3 when
-the workload satisfies the qualification above. The reported winner contains
-the canonical public tuning; `group_hint=None` still resolves to the resident
-cluster count of the runtime device.
+remains fail-fast: if a selected profile violates a generic kernel resource,
+layout, or capacity constraint, the sweep aborts instead of silently skipping
+that candidate. The reported winner contains the canonical public tuning;
+`group_hint=None` still resolves to the resident cluster count of the runtime
+device.
 
 The sweep is fail-fast. Any validation, allocation, compile, launch, timing,
 synchronization, or teardown error ends the whole sweep. An existing active

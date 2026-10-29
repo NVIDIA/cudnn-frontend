@@ -37,12 +37,12 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--pattern",
-        choices=("smoke", "ds3_ep4_v1"),
+        choices=("smoke", "ds3_ep4_pattern"),
         default="smoke",
     )
     parser.add_argument(
         "--dgrad-optimization",
-        choices=("baseline", "rolling", "ds3_ep4_v1"),
+        choices=("baseline", "rolling", "ds3_ep4_pattern"),
         default="baseline",
     )
     parser.add_argument("--diagnostic-replays", type=int, default=2)
@@ -65,14 +65,14 @@ def _resolve_pattern_and_capacity(
     world_size: int,
 ):
     pattern = _training_graph_pattern(args.pattern, world_size)
-    if args.dgrad_optimization == "ds3_ep4_v1" and pattern.name != "ds3_ep4_v1":
-        raise ValueError("dgrad_optimization='ds3_ep4_v1' requires " "--pattern ds3_ep4_v1")
-    if pattern.name == "ds3_ep4_v1" and args.expect_overflow_assert:
-        raise ValueError("ds3_ep4_v1 uses the exact full route capacity and does not " "support the overflow-assert probe")
+    if args.dgrad_optimization == "ds3_ep4_pattern" and pattern.name != "ds3_ep4_pattern":
+        raise ValueError("dgrad_optimization='ds3_ep4_pattern' requires " "--pattern ds3_ep4_pattern")
+    if pattern.name == "ds3_ep4_pattern" and args.expect_overflow_assert:
+        raise ValueError("ds3_ep4_pattern uses the exact full route capacity and does not " "support the overflow-assert probe")
     physical_capacity = pattern.physical_recv_pool_size if args.physical_recv_pool_rows is None else args.physical_recv_pool_rows
     _positive("physical_recv_pool_rows", physical_capacity)
-    if pattern.name == "ds3_ep4_v1" and physical_capacity < pattern.physical_recv_pool_size:
-        raise ValueError("ds3_ep4_v1 requires physical_recv_pool_rows >= " f"{pattern.physical_recv_pool_size}, got {physical_capacity}")
+    if pattern.name == "ds3_ep4_pattern" and physical_capacity < pattern.physical_recv_pool_size:
+        raise ValueError("ds3_ep4_pattern requires physical_recv_pool_rows >= " f"{pattern.physical_recv_pool_size}, got {physical_capacity}")
     return pattern, physical_capacity
 
 
@@ -251,7 +251,7 @@ def _prepare_case(
     expected_upstream_profile = {
         "baseline": "explicit",
         "rolling": "optimized",
-        "ds3_ep4_v1": "ds3_ep4_v1",
+        "ds3_ep4_pattern": "ds3_ep4_v1",
     }[dgrad_optimization]
     if upstream_profile != expected_upstream_profile:
         raise RuntimeError("training graph probe did not select the requested upstream " f"profile: {upstream_profile!r} != " f"{expected_upstream_profile!r}")
