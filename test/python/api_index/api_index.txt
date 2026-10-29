@@ -214,6 +214,7 @@ cudnn.block_sparse_attention
 cudnn.block_sparse_attention.BSA
 cudnn.block_sparse_attention.KPageLayout
 cudnn.block_sparse_attention.KPageLayout.build_backward
+cudnn.block_sparse_attention.KPageLayout.sparse_block_size
 cudnn.block_sparse_attention.block_sparse_attention_backward
 cudnn.block_sparse_attention.block_sparse_attention_forward
 cudnn.block_sparse_attention.block_sparse_attention_fp8_forward
@@ -1367,6 +1368,7 @@ cudnn.nvfp4_attention_qat_backward
 cudnn.ops
 cudnn.ops.KPageLayout
 cudnn.ops.KPageLayout.build_backward
+cudnn.ops.KPageLayout.sparse_block_size
 cudnn.ops.Nvfp4BlockScaleDequantizer
 cudnn.ops.Nvfp4BlockScaleDequantizer.check_support
 cudnn.ops.Nvfp4BlockScaleDequantizer.compile

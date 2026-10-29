@@ -545,6 +545,17 @@ def _tma_alignment_reject(
     return None
 
 
+def _partial_scale_block_reject(K: int, block_size: int) -> str | None:
+    """Reject a block-scale K that ends inside a scale block."""
+    if K % block_size == 0:
+        return None
+    return (
+        f"block-scale K={K} is not a multiple of the scale block size {block_size}: the kernel sizes its F8_128x4 "
+        f"scale-factor view from the {K // block_size} whole blocks, so the scales of the partial last block can be "
+        f"read as zero or from another 128-row block; zero-pad K to {-(-K // block_size) * block_size}"
+    )
+
+
 def _alignment_reject(named_buffers) -> "str | None":
     """Every runtime buffer's alignment must be >= the kernel's compiled requirement for its role."""
     bad = []
@@ -895,6 +906,8 @@ class _CompiledRuntime:
     _validate_runtime_quant: ClassVar[bool] = False
     _validate_combine: ClassVar[bool] = False
     _validate_quant_scale_blobs: ClassVar[bool] = False
+    # Per call: refuse a block-scale K that ends inside a scale block (_partial_scale_block_reject).
+    _validate_whole_scale_blocks: ClassVar[bool] = False
     accepts_stream: ClassVar[bool] = True
 
     @property
@@ -1056,6 +1069,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         shared, seeds = (r.shared_layout, r.seeds)
         a_pos, b_pos, a_kpack = (r.a_at, r.b_at, r.a.kpack)
         block_size, batch = (r.block_size, r.batch)
+        whole_scale_blocks = self._validate_whole_scale_blocks
         device, launchable, refuse = (r.device, self._launchable, self.explain)
         fill_word, fill_plan, apply_fill = (backend.buffers.fill_word_async, backend.buffers.strided_fill_plan, backend.buffers.apply_fill_plan)
         is_contiguous = backend.buffers.is_contiguous
@@ -1140,6 +1154,9 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                     gave_up["aux alignment"] += 1
                     return refuse(operands, graph_order)
             if sfs:
+                if whole_scale_blocks and k % block_size:
+                    gave_up["partial scale block"] += 1
+                    return refuse(operands, graph_order)
                 k4 = (k // block_size + 3) // 4
                 for idx, is_a, sf_batch in sfs:
                     v = operands[idx]
@@ -1213,6 +1230,10 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         mnk, axes = recipe.problem(operands, graph_order)
         backend.check_shapes(recipe, operands, mnk, axes)
         backend.check_alignment(recipe, operands, axes)
+        if self._validate_whole_scale_blocks and self.chain.block_scale is not None:
+            reason = _partial_scale_block_reject(int(mnk[2]), self.chain.block_scale.block_size)
+            if reason is not None:
+                raise ValueError(reason)
         if self.config.split_k_slices > 1:
             backend.check_split_k_shape(
                 int(mnk[2]),
@@ -1539,6 +1560,10 @@ class _CompiledMoeBlockScaleGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
             raise ValueError(_r)
         if sfa or sfb:
             _S, _N, _K = (snk[0], snk[1], snk[2])
+            if self._validate_whole_scale_blocks:
+                _r_k = _partial_scale_block_reject(int(_K), self.chain.block_scale.block_size)
+                if _r_k is not None:
+                    raise ValueError(_r_k)
             token_sf, weight_sf, weights = (sfa, sfb, b_bufs)
             if isinstance(self.chain.moe, backend.MoeSwapAbSpec):
                 _S, _N = (_N, _S)
@@ -1754,6 +1779,7 @@ _SHARED_EXPORTS = {
     "_expected_output_shape": _expected_output_shape,
     "_initialize_reduction_outputs": _initialize_reduction_outputs,
     "_tma_alignment_reject": _tma_alignment_reject,
+    "_partial_scale_block_reject": _partial_scale_block_reject,
     "_alignment_reject": _alignment_reject,
     "_sf_blob_reject": _sf_blob_reject,
     "_grouped_row_quant_scale_blob_reject": _grouped_row_quant_scale_blob_reject,

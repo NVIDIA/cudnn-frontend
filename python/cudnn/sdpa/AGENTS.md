@@ -34,6 +34,13 @@ padded Stats are different contracts.**
   `stats_layout`-parametrized THD tests (`test_dsl_sm100_thd_stats` and
   siblings) in `test/python/sdpa/frost/`.
 
+Packed graph Stats can also arrive as a `(T, H, 1)` carrier for either packing.
+Validate its token/head strides and capacity against the declaration, then bind
+the same storage without copying. The SM80 detector
+`test_graph_thd_independent_pitches_rebind_replay` covers both carrier forms,
+fresh pointers, changed-length replay, and pre-launch rejection of short or
+incorrectly pitched carriers.
+
 An explicitly padded Stats output is a separate existing forward contract:
 when Stats has no ragged offset, eligible rows with `thd_padded_stats=True` address
 its declared `(B, H, S_max)` strides even when Q/O are THD. FlashInfer prefill's

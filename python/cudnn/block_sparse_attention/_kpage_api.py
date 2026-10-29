@@ -35,6 +35,7 @@ def _normalize_metadata(
     q2k_block_nums: Optional[torch.Tensor],
     q_block_sizes: Optional[torch.Tensor],
     num_kv_blocks: Optional[int],
+    sparse_block_size: int = 128,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Expand the BSA metadata to the four tensors the layout builder consumes.
 
@@ -58,13 +59,13 @@ def _normalize_metadata(
     if block_sizes is None:
         if num_kv_blocks is None:
             num_kv_blocks = num_q_blocks
-        block_sizes = torch.full((num_kv_blocks,), 128, dtype=torch.int32, device=q2k_block_index.device)
+        block_sizes = torch.full((num_kv_blocks,), sparse_block_size, dtype=torch.int32, device=q2k_block_index.device)
     elif block_sizes.ndim != 1:
         raise NotImplementedError("kpage takes block_sizes of shape (num_kv_blocks,)")
     elif num_kv_blocks is not None and block_sizes.numel() != num_kv_blocks:
         raise ValueError(f"block_sizes has {block_sizes.numel()} entries, seqlen_k spans {num_kv_blocks} KV blocks")
     if q_block_sizes is None:
-        q_block_sizes = torch.full((num_q_blocks,), 128, dtype=torch.int32, device=q2k_block_index.device)
+        q_block_sizes = torch.full((num_q_blocks,), sparse_block_size, dtype=torch.int32, device=q2k_block_index.device)
     return q2k_block_index, q2k_block_nums, block_sizes, q_block_sizes
 
 
@@ -105,17 +106,28 @@ def prepare_layout(
     allow_empty_block_nums: bool = False,
     bwd_kv_groups: Optional[int],
     with_backward: bool = False,
+    sparse_block_size: int = 128,
 ) -> KPageLayout:
     _require_cutedsl()
     major, minor = torch.cuda.get_device_capability(q2k_block_index.device)
     if major != 10:
         raise NotImplementedError(f"kpage requires an SM100/SM103 GPU, found SM{major}{minor}")
+    if sparse_block_size not in (64, 128):
+        raise ValueError(f"sparse_block_size must be 64 or 128, got {sparse_block_size}")
+    if sparse_block_size == 64 and (q_block_sizes is not None or with_backward or bwd_kv_groups is not None):
+        raise NotImplementedError("the blk64 KPage path is forward only and takes no q_block_sizes, with_backward or bwd_kv_groups")
     for name, seqlen in (("seqlen_q", seqlen_q), ("seqlen_k", seqlen_k)):
         if seqlen is not None and seqlen < 1:
             raise ValueError(f"{name} must be positive, got {seqlen}")
     source = _metadata_source(q2k_block_index, block_sparse_num, block_sizes, q2k_block_nums)
     idx, nums, kv_sizes, q_sizes = _normalize_metadata(
-        q2k_block_index, block_sparse_num, block_sizes, q2k_block_nums, q_block_sizes, None if seqlen_k is None else (seqlen_k + 127) // 128
+        q2k_block_index,
+        block_sparse_num,
+        block_sizes,
+        q2k_block_nums,
+        q_block_sizes,
+        None if seqlen_k is None else (seqlen_k + sparse_block_size - 1) // sparse_block_size,
+        sparse_block_size,
     )
     from .kpage._layout import prepare_layout as _prepare
 
@@ -131,6 +143,7 @@ def prepare_layout(
             allow_empty_block_nums=allow_empty_block_nums,
             bwd_kv_groups=bwd_kv_groups,
             source=source,
+            sparse_block_size=sparse_block_size,
         )
         if with_backward:
             layout.build_backward()
@@ -156,8 +169,8 @@ def resolve_layout(
     _require_cutedsl()
     if arch // 10 != 10:  # the kernels are validated on SM100/SM103 only
         raise NotImplementedError(f"kpage requires an SM100/SM103 GPU, found SM{arch}")
-    if sparse_block_size != 128:
-        raise NotImplementedError("kpage requires sparse_block_size=128")
+    if sparse_block_size not in (64, 128):
+        raise NotImplementedError("kpage requires sparse_block_size=128 (or 64 for the forward)")
     if q.dtype != torch.bfloat16:
         raise NotImplementedError("kpage requires BF16 q, k, and v")
     if k.shape != v.shape or q.shape[0] != k.shape[0] or q.shape[-1] != k.shape[-1]:
@@ -168,6 +181,11 @@ def resolve_layout(
         raise ValueError("the number of query heads must be divisible by the number of KV heads")
     if head_dim != 128:
         raise NotImplementedError("kpage requires head_dim=128")
+    if sparse_block_size == 64:
+        if heads != k.shape[1]:
+            raise NotImplementedError("the blk64 KPage path supports MHA only")
+        if seqlen_q % 64 or seqlen_k % 64:
+            raise NotImplementedError("the blk64 KPage path requires seqlen_q and seqlen_k to be multiples of 64")
     for name, t in (("q", q), ("k", k), ("v", v), *zip(("do_tensor", "o_tensor", "lse_tensor", "dq_tensor", "dk_tensor", "dv_tensor"), extra)):
         if t is not None:
             folded = _fold(t, name)
@@ -175,6 +193,8 @@ def resolve_layout(
                 raise NotImplementedError(f"kpage requires a compact BHSD or BSHD {name}, got strides {tuple(t.stride())}")
 
     if isinstance(kpage, KPageLayout):
+        if kpage.sparse_block_size != sparse_block_size:
+            raise ValueError(f"the KPageLayout was built for sparse_block_size={kpage.sparse_block_size}, the call uses {sparse_block_size}")
         if kpage.device != q.device:
             raise ValueError(f"the KPageLayout was built on {kpage.device}, q is on {q.device}")
         if (kpage.num_heads, kpage.seqlen_q, kpage.seqlen_k) != (batch * heads, seqlen_q, seqlen_k):
@@ -197,6 +217,7 @@ def resolve_layout(
         validate=True,
         allow_empty_block_nums=allow_empty_block_nums,
         bwd_kv_groups=None,
+        sparse_block_size=sparse_block_size,
     )
 
 
@@ -235,6 +256,8 @@ def backward(
 ):
     from .kpage import _interface
 
+    if layout_obj.sparse_block_size != 128:
+        raise NotImplementedError("the KPage backward is available for sparse_block_size=128 only")
     batch = q.shape[0]
     grads = _interface.backward(_fold(do), _fold(q), _fold(k), _fold(v), _fold(o), _fold(lse), layout_obj, softmax_scale, _fold(dq), _fold(dk), _fold(dv))
     return tuple(g.view(batch, g.shape[1] // batch, *g.shape[2:]) for g in grads)
