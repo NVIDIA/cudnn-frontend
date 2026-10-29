@@ -3985,10 +3985,11 @@ def test_splitk_rejects_grid_z_overflow():
         _jit_splitk(g, 2)
 
 
-# The sm120 split-K plans the tests above never launch. On an RTX PRO 6000 (188 SMs)
-# the automatic plan picks each config below for the shape beside it (the cost model
-# from 32 rows up, the power-of-two baseline under 32), while the tests above run
-# S in {2, 3, 6, 8} on the 128x128 warps4x2 tile only. S >= 9 folds the slices with
+# The sm120 split-K plans the tests above never launch. On an RTX PRO 6000 Blackwell
+# Server Edition (188 SMs; the only sm120 device name planning.profile_for gives the
+# cost model) the automatic plan picks each config below for the shape beside it (the
+# cost model from 32 rows up, the power-of-two baseline under 32), while the tests above
+# run S in {2, 3, 6, 8} on the 128x128 warps4x2 tile only. S >= 9 folds the slices with
 # the reducer's four lane groups (splitk_reduce_slice_groups); 11, 15 and 19 also
 # leave a three-slice tail. A swap-AB plan reduces in the transposed kernel frame.
 _SM120_PLANNED_SPLITK = (
@@ -4008,7 +4009,7 @@ _SM120_PLANNED_SPLITK = (
     ids=("bf16-128x128-S11", "bf16-128x64-S10", "bf16-128x64-swapAB-S19", "bf16-128x64-swapAB-S8", "fp8-64x128-S15", "bf16-32x64-S8"),
 )
 def test_sm120_splitk_planned_configs(dtype, M, N, K, config_name):
-    """Each split-K config the RTX PRO 6000 plan picks matches torch bit for bit."""
+    """Each split-K config the RTX PRO 6000 Blackwell Server Edition plan picks matches torch bit for bit."""
     from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
 
     g, A, Bt, C = _splitk_graph(1, M, N, K, io_dt=_CUDNN_DTYPE[dtype])

@@ -3517,9 +3517,9 @@ def test_sm120_block_scale_matmul_numerics(combo, config_name, M, N, K):
     [
         ("nvfp4", _SM120_BS_128, 5, 256, 256, 4096),
         ("mxfp8", _SM120_BS_128_W24, 3, 512, 384, 1088),  # 8.5 K-tiles over 3 slices
-        # The RTX PRO 6000 plan for these shapes: its first pick, and for mxfp8 the swap-AB
-        # candidate of the same shortlist. S >= 9 folds the slices with the reducer's four
-        # lane groups; 11 also leaves a three-slice tail.
+        # The RTX PRO 6000 Blackwell Server Edition plan for these shapes: its first pick,
+        # and for mxfp8 also the swap-AB plan third in the same shortlist. S >= 9 folds the
+        # slices with the reducer's four lane groups; 11 also leaves a three-slice tail.
         ("nvfp4", _SM120_BS_128, 16, 128, 1024, 16384),
         ("mxfp8", "CONFIG_sm120_64x64x128_16x16x32_cluster1x1_warps4x2", 11, 64, 1024, 16384),
         ("mxfp8", "CONFIG_sm120_64x64x128_16x16x32_cluster1x1_warps4x2_swapAB", 11, 64, 1024, 16384),
