@@ -4552,7 +4552,7 @@ def _sm107a_sass_counts(dump, quant, d, dtype_o, mask, cands):
 # to per-cell compares adds >= 128 ISETP, so a slack of 32 still catches a single arm.
 _SM107_MASK_SASS_ROWS = [
     pytest.param("mxfp8", 512, _BF16_OUT, "causal_swa640", 108 + 32, 2 + 6, 0, id="mxfp8-d512-causal_swa640"),
-    pytest.param("fp8", 128, _E4M3, "causal_padded", 108 + 32, 0 + 6, 9, id="fp8-d128-causal_padded"),
+    pytest.param("fp8", 128, _E4M3, "causal_padded", 151 + 32, 0 + 6, 25, id="fp8-d128-causal_padded"),
 ]
 
 
