@@ -1518,6 +1518,12 @@ _INDEXER_DECLINE_TOKENS = {  # the `indexer_e4m3_cache` row RETIRED 2026-10-21: 
     "indexer_shared_list": "selects per row",
     "shared_list_rows": "tail covers at most two blocks",
     "fuse_prepare_rope_tables_unfused": "the unfused query norm reads the per-token",
+    # the EXTEND step's rows (2026-10-29; their accept / reject cells live in test_block_qsa_extend.py)
+    "indexer_extend_fuse_prepare": "the T-row chunk's ring read and its tail write live in two launches",
+    "indexer_extend_ring_slots": "the extend step takes the stack's ring slots",
+    "indexer_extend_rope_tables_only": "the extend step is always unfused and its query norm reads the per-token",
+    "indexer_extend_ring_rows": "at least block_size - 1 = 3 ring rows",
+    "indexer_extend_chunk_rows": "a chunk longer than the table's reach",
 }
 
 
@@ -1660,10 +1666,10 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
         assert d.index_list_forms == ("per_row",) and d.index_list_form_default == "per_row" and d.pdl_stages == () and d.pdl_default is False
         assert set(_INDEXER_DECLINE_TOKENS) <= set(d.declines) and all(tok in d.declines[nm] for nm, tok in _INDEXER_DECLINE_TOKENS.items())
         assert "indexer_e4m3_cache" not in d.declines, "a served form has no decline row"
-        # the record's tail is append-only (a serving stack reads these by name; a new field goes after `route_cc` -- the part the dense
-        # routes were read for, appended 2026-10-29 after the lean tile's rows: `sparse_tiles` / `sparse_tile_lean_default` and the part
-        # the per-cell `sparse_tile(...)` reads)
-        assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-16:] == [
+        # the record's tail is append-only (a serving stack reads these by name; a new field goes after the EXTEND step's four fields --
+        # appended 2026-10-29 after `route_cc`, the part the dense routes were read for, itself after the lean tile's rows: `sparse_tiles` /
+        # `sparse_tile_lean_default` and the part the per-cell `sparse_tile(...)` reads)
+        assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-20:] == [
             "index_list_forms",
             "index_list_form_default",
             "index_sources",
@@ -1680,7 +1686,12 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
             "sparse_tile_lean_default",
             "device_cc",
             "route_cc",
+            "index_select_forms",
+            "index_extend_ring_rows_min",
+            "index_extend_select_budget_bytes",
+            "index_compress_roundings",
         ]
+        assert d.index_select_forms == ("auto", "decode", "extend") and d.index_extend_ring_rows_min == 3 and d.index_compress_roundings == ("single", "hf")
         assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=(10, 0)).decode.fuse_prepare_default is False  # an unmeasured part
         f16 = GatedAttentionBlockFwd.serving_envelope(geom, F16, _DEV, device_cc=_SM107).decode
         assert f16.index_sources == ("caller",) and f16.index_cache_dtypes == () and f16.fuse_prepare_default is False
@@ -1712,7 +1723,9 @@ def test_decode_indexer_typed_declines_equal_the_envelope_row_by_row():
     import re
 
     rows = {
-        "indexer_query_rows": lambda: _declare_indexer(GEOM_SMALL, 1, 17, cap=20),
+        "indexer_query_rows": lambda: _declare_indexer(
+            GEOM_SMALL, 1, 17, cap=20, index_select_form="decode"
+        ),  # the explicit pin: "auto" takes the EXTEND step past the envelope (2026-10-29)
         "indexer_page_size": lambda: _declare_indexer(GEOM_SMALL, 1, 1, page=48),
         "indexer_shared_list": lambda: _declare_indexer(GEOM_SMALL, 1, 1, qsa_over=dict(index_list_form="shared")),
         "fuse_prepare_rope_tables_unfused": lambda: _declare_indexer(GEOM_SMALL, 1, 1, rope_position_tables_only=True, fuse_prepare=False),
@@ -1774,7 +1787,10 @@ def test_decode_indexer_typed_declines_equal_the_envelope_row_by_row():
         # the query-row envelope at 8 heads: S_q 8 x 8 = 64 rows serves, 9 x 8 does not
         assert _declare_indexer(GEOM_SMALL, 1, 8, cap=11, qsa_over=dict(index_heads=8))._indexer_decode is not None
         with pytest.raises(NotImplementedError, match="at most 8 rows per sequence"):
-            _declare_indexer(GEOM_SMALL, 1, 9, cap=12, qsa_over=dict(index_heads=8))
+            _declare_indexer(GEOM_SMALL, 1, 9, cap=12, qsa_over=dict(index_heads=8), index_select_form="decode")
+        assert (
+            _declare_indexer(GEOM_SMALL, 1, 9, cap=12, qsa_over=dict(index_heads=8), index_state_slot_mapping_present=True)._indexer_extend is not None
+        )  # "auto": the EXTEND step
         # the ring rule, the commit flag, a missing sample, the side caches off their form, the flags' type
         with pytest.raises(ValueError, match=r"needs at least S_q \+ 4 - 1 = 7 rows"):
             _declare_indexer(GEOM_SMALL, 1, 4, cap=6)
