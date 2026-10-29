@@ -63,6 +63,8 @@ from ..fusion_ir import (
     FusionChain,
     MoeSwapAbSpec,
     TensorRef,
+    gemm_index,
+    is_gemm_source,
     segmented_row_scale_capacity_rows,
 )
 from ..recipe import (
@@ -1625,14 +1627,33 @@ def _check_executable(chain: FusionChain) -> None:
 _INT32_COMPUTE_OPS = frozenset(
     ("identity", "relu", "leaky_relu", "abs", "neg", "add", "sub", "mul", "max", "min", "add_square", "binary_select", "gen_index", "aux_load")
 )
+# The epilogue converts an int32-compute op's inputs and result with a direct
+# .to() between Int32 and their declared dtype, with no Float32 detour; between
+# Int32 and a Float8 type that cast does not compile (NVVM rejects e.g.
+# `sitofp <8 x i32> to <8 x i8>`). fp8_e5m3 does not reach this check on sm120:
+# dtype_arch_reject declines it.
+_INT32_COMPUTE_NO_CAST_DTYPES = ("fp8_e4m3", "fp8_e5m2", "fp8_e8m0")
 
 
 def _check_int32_compute(chain: FusionChain) -> None:
-    """Decline an epilogue op that computes in int32 but has no int32 emitter."""
+    """Decline an epilogue op that computes in int32 but has no int32 emitter, or
+    whose inputs or output would need an int32 <-> fp8 conversion."""
     for i, op in enumerate(chain.ops):
-        if op.compute_dtype == "int32" and op.op not in _INT32_COMPUTE_OPS:
+        if op.compute_dtype != "int32":
+            continue
+        if op.op not in _INT32_COMPUTE_OPS:
             raise NotImplementedError(
                 f"pointwise op {i} ({op.op!r}) computes in int32, which the sm120 epilogue emits only for {', '.join(sorted(_INT32_COMPUTE_OPS))}"
+            )
+        # The values the op reads: gen_index reads only its input's shape, and aux_load has no producing input.
+        refs = [op.parent_idx_b, op.parent_idx_c] + ([] if op.op in ("gen_index", "aux_load") else [op.resolved_parent_idx(i)])
+        dtypes = [chain.gemm_out_dtype(gemm_index(ref)) if is_gemm_source(ref) else chain.ops[ref].out_dtype for ref in refs if ref is not None]
+        if op.aux is not None:
+            dtypes.append(chain.aux_by_name(op.aux).dtype)
+        fp8 = sorted({dtype for dtype in (*dtypes, op.out_dtype) if dtype in _INT32_COMPUTE_NO_CAST_DTYPES})
+        if fp8:
+            raise NotImplementedError(
+                f"pointwise op {i} ({op.op!r}) computes in int32 but reads or writes {' and '.join(fp8)}; the sm120 epilogue has no int32 <-> fp8 conversion"
             )
 
 
