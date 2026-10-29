@@ -794,7 +794,7 @@ def generate_mainloop(chain: FusionChain, operand: str = "a") -> str:
             if ref.bcast_mode == "per_k":
                 dt = DTYPE_TO_CUTLASS[op.compute_dtype]
                 # The renderer selects logical (unswizzled) vector accesses for
-                # this path. A is K-major, so adjacent vector lanes advance K.
+                # this path. The operand is K-major, so vector lanes advance K.
                 lines.extend(
                     [
                         f"{tag}_scale = cute.make_rmem_tensor(ml_vec_elems, {dt})",

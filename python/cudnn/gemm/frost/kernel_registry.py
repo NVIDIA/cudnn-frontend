@@ -456,7 +456,6 @@ class MainloopKernelTemplate(KernelTemplate):
             (dtype not in ("bf16", "fp16"), "operand must be BF16 or FP16"),
             (load_dtype is not None, "operand load casts are not implemented"),
             (major != "k", "operand must be K-major"),
-            (chain.matmul.K % 8 != 0, "TMA requires K divisible by 8 for a 16-bit operand"),
             (ref.stride[ref.k_axis] != 1, "scale K axis must have unit stride"),
             (ref.dtype not in ("bf16", "fp16", "fp32"), "scale must be BF16, FP16 or FP32"),
             (op.compute_dtype != "fp32", "multiply must compute in FP32"),

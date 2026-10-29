@@ -121,15 +121,16 @@ class PerKScaleRule:
 
     axis: int
     dtype: str
+    name: str = ""
 
     def check(self, buffer, k: int) -> None:
         expected = (1, 1, k) if self.axis == 2 else (1, k, 1)
         if tuple(buffer.shape) != expected:
-            raise ValueError(f"per-K mainloop scale: expected shape {expected}, got {tuple(buffer.shape)}")
+            raise ValueError(f"per-K mainloop scale {self.name!r}: expected shape {expected}, got {tuple(buffer.shape)}")
         if buffer.stride(self.axis) != 1:
-            raise ValueError(f"per-K mainloop scale: K axis {self.axis} must have unit stride")
+            raise ValueError(f"per-K mainloop scale {self.name!r}: K axis {self.axis} must have unit stride")
         if dtype_name(buffer) != self.dtype:
-            raise ValueError(f"per-K mainloop scale: expected dtype {self.dtype}, got {dtype_name(buffer)}")
+            raise ValueError(f"per-K mainloop scale {self.name!r}: expected dtype {self.dtype}, got {dtype_name(buffer)}")
 
 
 def _per_k_rule(ref, swapped: bool) -> PerKScaleRule | None:
@@ -137,7 +138,7 @@ def _per_k_rule(ref, swapped: bool) -> PerKScaleRule | None:
         return None
     axis = 3 - ref.k_axis if swapped else ref.k_axis
     dtype = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32"}[ref.dtype]
-    return PerKScaleRule(axis, dtype)
+    return PerKScaleRule(axis, dtype, ref.name)
 
 
 @dataclass(frozen=True)

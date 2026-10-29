@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 from collections import deque
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from typing import Any
 
 import cudnn
@@ -1513,6 +1514,7 @@ def _walk_mainloop_chain(
         m = meta.get(tid)
         return m is not None and m.is_input and len(m.dim) > 0 and all(d == 1 for d in m.dim)
 
+    @lru_cache(maxsize=None)
     def _pointwise_dim(tid: int) -> tuple[int, ...]:
         m = meta.get(tid)
         if m is not None and m.dim:
@@ -1528,10 +1530,13 @@ def _walk_mainloop_chain(
         return tuple(max(axis) for axis in zip(*dims))
 
     def _is_per_k_input(tid: int, other: int) -> bool:
-        m, source_dim = meta.get(tid), _pointwise_dim(other)
-        if m is None or not m.is_input or len(source_dim) != 3:
-            return False
+        m = meta.get(tid)
         k_axis = 2 if label == "A" else 1
+        if m is None or not m.is_input or len(m.dim) != 3 or m.dim[0] != 1 or m.dim[3 - k_axis] != 1:
+            return False
+        source_dim = _pointwise_dim(other)
+        if len(source_dim) != 3:
+            return False
         expected = (1, 1, source_dim[2]) if label == "A" else (1, source_dim[1], 1)
         return m.dim == expected and source_dim[3 - k_axis] != 1
 
@@ -1564,9 +1569,8 @@ def _walk_mainloop_chain(
                 raise ValueError(
                     f"matmul {label} operand is produced by binary op "
                     f"{producer.op_name!r} ({producer.cudnn_name!r}) — mainloop "
-                    "fusion only supports a binary op with exactly one SCALAR "
-                    "graph-input aux (e.g. A * alpha); per-row/col/elem aux on an "
-                    "operand is out of scope except mul with an A-side [1,1,K] or B-side [1,K,1] scale"
+                    "fusion supports a binary op with exactly one SCALAR graph-input aux "
+                    "(e.g. A * alpha), or mul with an A-side [1,1,K] or B-side [1,K,1] scale"
                 )
             aux_meta = meta[aux_id]
             if aux_id not in aux_seen:
@@ -1587,7 +1591,7 @@ def _walk_mainloop_chain(
             raise ValueError(
                 f"matmul {label} operand is produced by op {producer.op_name!r} "
                 f"({producer.cudnn_name!r}) which is not a pointwise op — mainloop "
-                "fusion supports unary ops and scalar-aux binary ops in the POC"
+                "fusion supports unary ops, scalar-aux binary ops and per-K mul"
             )
     steps.reverse()
     fops: list[FusionOp] = []
