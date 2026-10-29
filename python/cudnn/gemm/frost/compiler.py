@@ -893,6 +893,8 @@ def _import_kernel(src: str) -> object:
 class _CompiledRuntime:
     _compiler: ClassVar[Any]
     _validate_runtime_quant: ClassVar[bool] = False
+    # The family checks each aux against the layout its epilogue compiled in (``_aux_layout_check``).
+    _validate_aux_layout: ClassVar[bool] = False
     _validate_combine: ClassVar[bool] = False
     accepts_stream: ClassVar[bool] = True
 
@@ -1065,6 +1067,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         quant_mn = (self.chain.matmul.M, self.chain.matmul.N) if self._validate_runtime_quant and self.chain.quants else None
         quant_reason = backend._runtime_quant_reason if quant_mn is not None else None
         quant_chain, quant_cfg = (self.chain, self.config)
+        aux_layouts = tuple(((x.index, backend._aux_layout_check(x.ref, swap_ab)) for x in r.aux)) if self._validate_aux_layout else ()
         gave_up = self.deferrals
 
         def lowered(operands, graph_order=None, stream=None, workspace=None):
@@ -1125,6 +1128,10 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                 v = operands[idx]
                 if backend.tensor_alignment(tuple(v.shape), tuple(v.stride()), v.element_size(), ptr=v.data_ptr()) < align:
                     gave_up["aux alignment"] += 1
+                    return refuse(operands, graph_order)
+            for idx, aux_layout_reason in aux_layouts:
+                if aux_layout_reason(operands[idx], m, n) is not None:
+                    gave_up["aux layout"] += 1
                     return refuse(operands, graph_order)
             if sfs:
                 k4 = (k // block_size + 3) // 4
@@ -1231,6 +1238,8 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                 raise ValueError(
                     f"{exc} [in the kernel frame of this swap-AB plan, which runs the graph transposed: its M = {m} and N = {n} are the graph's N and M, and its row / col quant axes the graph's col / row]"
                 ) from exc
+        if self._validate_aux_layout:
+            backend._check_aux_layout(recipe, operands, int(mnk[0]), int(mnk[1]), self.config.swap_ab)
         raise RuntimeError(
             f"cudnn.frost gemm: the launch path refused this call and no rule explains why -- its per-call guards and the diagnostics here have drifted apart. Guards that fired: {dict(self.deferrals)}."
         )

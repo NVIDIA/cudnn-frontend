@@ -27,7 +27,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from gemm_test_utils import kw, requires_sm100, to_blocked
+from gemm_test_utils import kw, requires_sm100, requires_sm120, to_blocked
 
 import cudnn
 import cudnn.gemm.frost  # noqa: F401 — installs the cudnn.pygraph recorder hook
@@ -998,3 +998,172 @@ def test_sm120_swap_quant_diagnostic_uses_package_import(monkeypatch):
     monkeypatch.setattr(compiler, "_check_block_quant_semantics", reject)
     with pytest.raises(ValueError, match="invalid quant extent"):
         compiled.explain([])
+
+
+# --- an aux is read at the strides the graph declared -----------------------
+
+
+def _residual_graph(aux_dim, aux_stride, batch=1, **options):
+    """``matmul(A, B) + R``: R's declared layout is the one compiled into the kernel."""
+    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32, **options)
+    A = g.tensor(name="A", uid=1, dim=[batch, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", uid=2, dim=[batch, K, N], stride=[K * N, 1, K])
+    R = g.tensor(name="R", uid=3, dim=list(aux_dim), stride=list(aux_stride), data_type=F32)
+    Y = g.add(a=g.matmul(A=A, B=B, name="mm"), b=R, name="residual")
+    Y.set_output(True).set_data_type(F32).set_uid(4)
+    return g, A, B, R, Y
+
+
+def _small_ints(*shape):
+    return torch.randint(-3, 4, shape, device="cuda").float()
+
+
+def _compact_in(storage_elems, *shape):
+    """A compact ``shape`` view carved from larger storage: should the guard let a
+    call through, the kernel's reads at the declared strides stay inside it."""
+    count = 1
+    for extent in shape:
+        count *= extent
+    return _small_ints(storage_elems)[:count].view(*shape)
+
+
+# layout: (aux dim, aux stride, batch, legal calls, the call the kernel cannot read);
+# a call is (M, N, how to make R at that M and N).
+_SM120_AUX_LAYOUTS = {
+    "per_elem_n_major": (
+        (1, M, N),
+        (M * N, N, 1),
+        1,
+        (
+            (M, N, lambda m, n: _small_ints(1, m, n)),
+            (2 * M, N, lambda m, n: _small_ints(1, m, n)),  # M is only on the unit-extent axis's stride
+            (2 * M, N, lambda m, n: _small_ints(m, n)),  # a rank-2 buffer, viewed onto the declared axes
+            (M, N // 2, lambda m, n: _small_ints(1, m, N)[:, :, :n]),  # rows still N apart
+        ),
+        (M, N // 2, lambda m, n: _compact_in(M * N, 1, m, n)),
+    ),
+    "per_elem_m_major": (
+        (1, M, N),
+        (M * N, 1, M),
+        1,
+        (
+            (M, N, lambda m, n: _small_ints(1, n, m).transpose(1, 2)),
+            (M, 2 * N, lambda m, n: _small_ints(1, n, m).transpose(1, 2)),
+        ),
+        (2 * M, N, lambda m, n: _small_ints(1, n, m).transpose(1, 2)),
+    ),
+    "batched_per_row": (
+        (2, M, 1),
+        (M, 1, 1),
+        2,
+        (
+            (M, N, lambda m, n: _small_ints(2, m, 1)),
+            (M, 2 * N, lambda m, n: _small_ints(2, m, 1)),
+        ),
+        (2 * M, N, lambda m, n: _small_ints(2, m, 1)),
+    ),
+    # A rank-1 aux's fake carries no strides, so nothing but the guard stands
+    # between the kernel and a buffer of another stride.
+    "rank1_strided_per_col": (
+        (N,),
+        (2,),
+        1,
+        (
+            (M, N, lambda m, n: _small_ints(2 * n)[::2]),
+            (M, N // 2, lambda m, n: _small_ints(2 * n)[::2]),
+        ),
+        (M, N, lambda m, n: _compact_in(2 * n, n)),
+    ),
+}
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "layout,swap_ab",
+    [pytest.param(name, False, id=name) for name in _SM120_AUX_LAYOUTS] + [pytest.param("per_elem_n_major", True, id="per_elem_n_major-swap_ab")],
+)
+def test_sm120_aux_layout_is_refused_by_name_before_launch(layout, swap_ab):
+    """The SM120 epilogue reads an aux at the strides the graph declared.
+
+    They are literals in the generated kernel, not launch arguments, so a call
+    whose aux has other strides on an axis it spans cannot be served. The launch
+    path refuses it, counts it, and ``explain`` names the aux; nothing is written.
+    Before, the call died in the tvm-ffi front door with a raw "Mismatched
+    R.strides[i]" from inside the body that is not allowed to raise -- or, for a
+    rank-1 aux, whose fake declares no strides, ran and read the buffer at the
+    declared stride. Calls whose aux keeps the declared strides on every axis of
+    extent > 1 stay legal at any M and N, in either kernel frame.
+    """
+    from cudnn.gemm.frost.sm120 import compiler
+    from cudnn.gemm.frost.tile_config import by_name
+
+    aux_dim, aux_stride, batch, legal, illegal = _SM120_AUX_LAYOUTS[layout]
+    g, A, B, R, Y = _residual_graph(aux_dim, aux_stride, batch=batch)
+    config = replace(by_name("CONFIG_sm120_64x64x64_16x16x32_cluster1x1_warps2x4"), swap_ab=swap_ab)
+    compiled = compiler.jit_from_cudnn_graph(g, config)
+
+    def call(m, n, make_aux):
+        torch.manual_seed(0)
+        a = torch.randint(-2, 3, (batch, m, K), device="cuda").to(torch.bfloat16)
+        b = torch.randint(-2, 3, (batch, n, K), device="cuda").to(torch.bfloat16)
+        r = make_aux(m, n)
+        y = torch.full((batch, m, n), float("nan"), device="cuda")
+        compiled.deferrals.clear()
+        return (lambda: compiled({A: a, B: b, R: r, Y: y})), y, torch.einsum("bmk,bnk->bmn", a.float(), b.float()) + r
+
+    for m, n, make_aux in legal:
+        run, y, ref = call(m, n, make_aux)
+        run()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(y, ref, atol=0, rtol=0)
+        assert dict(compiled.deferrals) == {}
+
+    run, y, _ = call(*illegal)
+    with pytest.raises(ValueError, match=r"aux 'R': the kernel reads shape \(.*\) with strides \(.*\) on every axis of extent > 1.*; got"):
+        run()
+    torch.cuda.synchronize()
+    assert dict(compiled.deferrals) == {"aux layout": 1}
+    assert torch.isnan(y).all()
+
+
+@requires_sm120
+@pytest.mark.skipif(cudnn.backend_version() < 92100, reason="override shape requires cuDNN backend 9.21.0+")
+def test_sm120_aux_layout_refusal_reaches_graph_execute():
+    """A dynamic-shape graph is how such a call arrives through ``execute``.
+
+    Its FROST plan runs a new M with a compact residual (the declared strides
+    still hold on every axis R spans) and refuses a new N, whose compact
+    residual rows are no longer N apart, by name and before writing anything.
+    """
+    g, A, B, R, Y = _residual_graph((1, M, N), (M * N, N, 1), is_dynamic_shape_enabled=True, is_override_shape_enabled=True)
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    frost = [i for i, p in enumerate(g.plans) if is_python_engine(p.engine_id)]
+    if not frost:
+        pytest.skip("no FROST plan for this graph")
+    g.select_plan(frost[0])
+    g.check_support()
+    g.build_plans()
+
+    for m, n in ((2 * M, N), (M, N // 2)):
+        torch.manual_seed(0)
+        a = torch.randint(-2, 3, (1, m, K), device="cuda").to(torch.bfloat16)
+        b = torch.randint(-2, 3, (1, n, K), device="cuda").to(torch.bfloat16)
+        r = _compact_in(2 * M * N, 1, m, n)
+        y = torch.full((1, m, n), float("nan"), device="cuda")
+        ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+        overrides = dict(
+            override_uids=[1, 2, 3, 4],
+            override_shapes=[[1, m, K], [1, K, n], [1, m, n], [1, m, n]],
+            override_strides=[[m * K, K, 1], [K * n, 1, K], [m * n, n, 1], [m * n, n, 1]],
+        )
+        if n == N:
+            g.execute({1: a, 2: b, 3: r, 4: y}, ws, **overrides)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(y, torch.einsum("bmk,bnk->bmn", a.float(), b.float()) + r, atol=0, rtol=0)
+            continue
+        with pytest.raises(ValueError, match=r"aux 'R': the kernel reads shape \(1, 256, 128\) with strides \(65536, 256, 1\)"):
+            g.execute({1: a, 2: b, 3: r, 4: y}, ws, **overrides)
+        torch.cuda.synchronize()
+        assert torch.isnan(y).all()

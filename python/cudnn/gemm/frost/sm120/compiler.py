@@ -1178,6 +1178,50 @@ def _reshape_aux_to_fake(t: object, ref: TensorRef) -> object:
     return t.reshape(shape)
 
 
+def _aux_layout_check(ref: TensorRef, swap_ab: bool) -> Callable:
+    """Build the per-call check of one aux buffer: ``(buf, m, n) -> reason | None``.
+
+    The epilogue addresses an aux through its raw pointer at the strides the graph
+    declared, written into the kernel as literals (``_AuxCodegen.index_expr``), and
+    its fake binds the extents to this call's M and N. So the view the launch hands
+    over must have the fake's extents and, on every axis of extent > 1, those
+    strides. The tvm-ffi front door enforces the strides only when the fake carries
+    them (``_aux_fake_block``); a rank-1 aux's fake does not, and the kernel would
+    read a buffer of another stride at the declared one all the same."""
+    real = _aux_fake_real_axes(ref)
+    rank, lead, (row, col) = len(real), ((int(ref.dim[0]),) if len(real) == 3 else ()), real[-2:]
+    if len(ref.dim) == rank:
+        # An axis counts where the kernel steps along it or where the fake pins its stride.
+        pinned = _aux_can_use_explicit_fake_stride(ref)
+        want_stride = tuple(s if pinned or d != 1 else None for d, s in zip(ref.dim, ref.stride))
+    else:  # rank 1: the fake adds a unit row axis, and the kernel steps the column at stride[0]
+        want_stride = (None, ref.stride[0] if ref.dim[0] != 1 else None)
+    checked = tuple((i, w) for i, w in enumerate(want_stride) if w is not None)
+
+    def reason(buf, m: int, n: int) -> "str | None":
+        # The view the launch passes (_reshape_aux_to_fake is the identity at the fake's rank).
+        view = buf if len(buf.shape) == rank and not swap_ab else _reshape_aux_to_fake(_swap_mn_view(buf) if swap_ab else buf, ref)
+        shape, stride = tuple(view.shape), tuple(view.stride())
+        want_shape = (*lead, m if row else 1, n if col else 1)
+        if shape == want_shape and all(shape[i] == 1 or stride[i] == w for i, w in checked):
+            return None
+        strides = "(" + ", ".join("*" if w is None else str(w) for w in want_stride) + ")"
+        frame = " (in the kernel frame of this swap-AB plan, M and N exchanged)" if swap_ab else ""
+        return f"aux {ref.name!r}: the kernel reads shape {want_shape} with strides {strides} on every axis of extent > 1{frame}; got shape {shape}, stride {stride}"
+
+    return reason
+
+
+def _check_aux_layout(recipe, operands, m: int, n: int, swap_ab: bool) -> None:
+    """Raise what ``_aux_layout_check`` finds wrong with any aux of this call."""
+    bad = [reason for x in recipe.aux if (reason := _aux_layout_check(x.ref, swap_ab)(operands[x.index], m, n)) is not None]
+    if bad:
+        raise ValueError(
+            "runtime aux layout does not match the one compiled into the kernel, which reads each aux at the strides the graph declared "
+            "(pass a buffer with those strides, such as a view into an allocation of the declared shape, or rebuild the plan): " + "; ".join(bad)
+        )
+
+
 def _initialize_combine_output(chain: FusionChain, outputs, stream=None) -> None:
     """Zero COMBINE's final output on the launch stream after runtime checks: the kernel only ever adds into it."""
     if chain.moe.mode != "combine":
@@ -1198,6 +1242,7 @@ class CompiledFusedGemm(_CompiledFusedGemm[TileConfig, GemmBinding]):
 
     _compiler = sys.modules[__name__]
     _validate_runtime_quant = True
+    _validate_aux_layout = True
 
 
 def _mma_a_dtype(chain: FusionChain) -> str:
