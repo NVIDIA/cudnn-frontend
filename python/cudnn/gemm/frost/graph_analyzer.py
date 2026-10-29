@@ -1507,7 +1507,7 @@ def _walk_mainloop_chain(
     intermediate_dtype: Dtype,
     compute_dtype: Dtype,
 ) -> tuple[int, list[FusionOp]]:
-    """Walk operand pointwise ops to a graph input (scalar aux, or A-side per-K multiply)."""
+    """Walk operand pointwise ops to a graph input (scalar aux, or per-K multiply on either operand)."""
 
     def _is_scalar_input(tid: int) -> bool:
         m = meta.get(tid)
@@ -1518,7 +1518,7 @@ def _walk_mainloop_chain(
         if m is not None and m.dim:
             return m.dim
         producer = op_by_output.get(tid)
-        if producer is None or producer.cudnn_name not in (_UNARY_OP_MAP.keys() | _BINARY_OP_MAP.keys()):
+        if producer is None or (producer.cudnn_name not in _UNARY_OP_MAP and producer.cudnn_name not in _BINARY_OP_MAP):
             return ()
         dims = [_pointwise_dim(inp) for inp in producer.inputs]
         if not dims or any(len(dim) != 3 for dim in dims):
@@ -1529,7 +1529,11 @@ def _walk_mainloop_chain(
 
     def _is_per_k_input(tid: int, other: int) -> bool:
         m, source_dim = meta.get(tid), _pointwise_dim(other)
-        return label == "A" and m is not None and m.is_input and len(source_dim) == 3 and m.dim == (1, 1, source_dim[-1]) and source_dim[1] != 1
+        if m is None or not m.is_input or len(source_dim) != 3:
+            return False
+        k_axis = 2 if label == "A" else 1
+        expected = (1, 1, source_dim[2]) if label == "A" else (1, source_dim[1], 1)
+        return m.dim == expected and source_dim[3 - k_axis] != 1
 
     # Each entry: (cudnn_name, is_binary, aux_name_or_None, aux_on_rhs).
     steps: list[tuple] = []
@@ -1562,7 +1566,7 @@ def _walk_mainloop_chain(
                     f"{producer.op_name!r} ({producer.cudnn_name!r}) — mainloop "
                     "fusion only supports a binary op with exactly one SCALAR "
                     "graph-input aux (e.g. A * alpha); per-row/col/elem aux on an "
-                    "operand is out of scope except A-side mul with a contiguous [1,1,K] scale"
+                    "operand is out of scope except mul with an A-side [1,1,K] or B-side [1,K,1] scale"
                 )
             aux_meta = meta[aux_id]
             if aux_id not in aux_seen:

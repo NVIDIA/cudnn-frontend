@@ -257,7 +257,7 @@ class BlockQuantizeSpec:
 
 @dataclass(frozen=True)
 class TensorRef:
-    """An auxiliary tensor input to the epilogue (e.g., bias, alpha, scale)."""
+    """An auxiliary fusion input (epilogue broadcasts or mainloop per-K scale)."""
 
     name: str
     dim: tuple[int, ...]
@@ -271,6 +271,8 @@ class TensorRef:
             raise ValueError(f"unsupported aux dtype {self.dtype!r}; expected one of {SUPPORTED_DTYPES}")
         if len(self.dim) != len(self.stride):
             raise ValueError(f"dim {self.dim} and stride {self.stride} length mismatch")
+        if self.bcast_mode == "per_k" and (len(self.dim) != 3 or self.dim[0] != 1 or (self.dim[1] != 1 and self.dim[2] != 1)):
+            raise ValueError(f"per-K aux {self.name!r} must have shape [1,1,K] or [1,K,1]; got {self.dim}")
         if self.grouped_by_moe:
             if len(self.dim) != 3:
                 raise ValueError(f"per-group aux {self.name!r} must be rank-3; got dim {self.dim}")
@@ -278,6 +280,13 @@ class TensorRef:
                 raise ValueError(f"per-group aux {self.name!r} must broadcast an M/N axis; got dim {self.dim}")
             if self.bcast_mode not in ("scalar", "per_col", "per_row"):
                 raise ValueError(f"per-group aux {self.name!r} supports scalar, per_col or per_row broadcast; " f"got {self.bcast_mode!r}")
+
+    @property
+    def k_axis(self) -> int:
+        """Logical reduction axis of a rank-3 per-K broadcast (A: 2, B: 1)."""
+        if self.bcast_mode != "per_k":
+            raise ValueError(f"aux {self.name!r} is not a per-K broadcast")
+        return 2 if self.dim[1] == 1 else 1
 
 
 def gemm_source(g: int) -> int:
@@ -610,36 +619,15 @@ class FusionChain:
                 if op.parent_idx_b is not None:
                     raise ValueError(f"{label} op {op.op!r} cannot have parent_idx_b (no fan-in)")
                 if op.op in BINARY_OPS and op.aux is None:
-                    raise ValueError(f"{label} binary op {op.op!r} needs a scalar aux tensor")
+                    raise ValueError(f"{label} binary op {op.op!r} needs an aux tensor")
                 if op.aux is not None:
                     if op.aux not in names:
                         raise ValueError(f"{label} op {op.op!r} references unknown aux {op.aux!r}")
                     ref = self.aux_by_name(op.aux)
                     if ref.bcast_mode == "per_k":
-                        mm = self.matmul
-                        if (
-                            label != "mainloop_a_ops"
-                            or op.op != "mul"
-                            or self.has_moe
-                            or self.has_block_scale
-                            or self.is_multi_gemm
-                            or mm.batch != 1
-                            or mm.a_dtype != "bf16"
-                            or mm.b_dtype != "bf16"
-                            or self.mainloop_a_load_dtype is not None
-                            or mm.a_major != "k"
-                            or mm.K % 8 != 0
-                            or ref.dim != (1, 1, mm.K)
-                            or ref.stride[-1] != 1
-                            or ref.dtype != "bf16"
-                            or op.compute_dtype != "fp32"
-                            or op.out_dtype != "bf16"
-                        ):
-                            raise ValueError(
-                                "per-K mainloop scale requires a single batch=1 BF16 GEMM, K-major BF16 A, "
-                                "K divisible by 8, and A-side mul with contiguous BF16 [1,1,K] scale "
-                                "(FP32 compute, BF16 result)"
-                            )
+                        expected = (1, 1, self.matmul.K) if label == "mainloop_a_ops" else (1, self.matmul.K, 1)
+                        if ref.dim != expected:
+                            raise ValueError(f"{label} per-K aux {ref.name!r}: expected {expected}, got {ref.dim}")
                     elif ref.bcast_mode != "scalar":
                         raise ValueError(
                             f"{label} op {op.op!r} aux {op.aux!r} must broadcast as a "
@@ -804,9 +792,6 @@ class FusionChain:
 
 def swap_ab(chain: FusionChain) -> FusionChain:
     """Return the logical-transpose view ``C.T = B.T @ A.T`` of ``chain``."""
-
-    if any(aux.bcast_mode == "per_k" for aux in chain.aux_tensors):
-        raise ValueError("A-side per-K mainloop scale does not support swap_ab")
 
     def _mn(values):
         if values is None or len(values) < 2:
