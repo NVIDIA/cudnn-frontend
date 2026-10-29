@@ -402,7 +402,7 @@ DSL satisfies your kernel.**
   number.
 - Tests that import a kernel module directly `pytest.skip` on a too-old DSL —
   they do not fail. CI runs the `oss:` lanes across the supported DSL versions
-  (`ci/stages/oss_tests/jobs.yml` in internal CI); a lane below your floor
+  (`ci/stages/python_tests/cutedsl.yml` in internal CI); a lane below your floor
   must show skips, not errors.
 - Keep declaration and execute-preflight metadata validators outside modules
   that import newer DSL kernel APIs. A correctly gated stage cannot protect
