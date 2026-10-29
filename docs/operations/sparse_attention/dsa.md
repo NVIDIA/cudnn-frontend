@@ -269,7 +269,7 @@ combine those groups in fixed order.
 
 If the selected bounded-wave layout would exceed 16 GiB, the generic M64 plan
 keeps each query wave at 128 CTAs and assigns one FP32 dKV plane to each
-cluster. Queries below 8192 rows prefer sixteen eight-CTA clusters; longer
+cluster. Queries below 2048 rows prefer sixteen eight-CTA clusters; larger
 queries prefer thirty-two four-CTA clusters for additional reducer parallelism.
 If that preferred layout's complete FP32-plane and packed-mask allocation would
 exceed 32 GiB, the plan selects an eight-plane, sixteen-CTA memory-first relay.
@@ -278,11 +278,16 @@ and 768K KV found it slower than cluster-16 while retaining twice as many FP32
 planes. A setup kernel builds packed 16-bit, 8-bit, or 4-bit rank masks for every
 `(query wave, head block, KV row)`. Reducer threads wait only for lower cluster
 ranks that actually update the same KV row, then publish that row with
-GPU-scope release/acquire ordering. Disjoint sparse rows continue in parallel;
-the fixed rank order handles both low- and high-overlap top-k rows without a
-global semaphore dependency on non-resident CTAs. The selected planes are
-folded in a fixed order. Duplicate top-k indices within one query row remain
-outside the deterministic contract, as in the bounded-wave path.
+GPU-scope release/acquire ordering. The participating reducer-thread CTA
+barrier carries the release/acquire causality, so no additional GPU-wide fence
+is needed. Rank zero skips the predecessor handoff, the last rank skips the
+successor publication, and the final release needs no second rendezvous.
+Disjoint sparse rows continue in parallel; the fixed rank order handles both
+low- and high-overlap top-k rows without a global semaphore dependency on
+non-resident CTAs. The selected 8, 16, or 32 planes are combined directly in
+the fixed-order conversion kernel, without an intermediate FP32 prefold.
+Duplicate top-k indices within one query row remain outside the deterministic
+contract, as in the bounded-wave path.
 
 For the ordinary policy, additional dKV workspace is
 `selected_shards * K8 * D8 * sizeof(float)`, where
@@ -335,6 +340,26 @@ ordinary and two-CTA routes stay within 0.3%. Cluster-8 and cluster-4 trade
 39.2% and 15.8% latency, respectively, for substantial workspace reduction;
 at 512K KV, cluster-16 is 1.0% faster than upstream while using 93.1% less
 scratch.
+
+The follow-up relay scheduling pass was measured against merged commit
+`1dea4471a6e6c05e29d3bf281281fd156d345a84` on the same SM100 environment with
+PyTorch 2.14.1+cu130, CuTe DSL 4.8.1, cuDNN 9.24.0, BF16 H64, top-k 2048,
+five warm-ups, and 40 allocation-free calls. It preserves the memory-bounded
+relay layouts except at the measured 2K/4K crossover, where four-CTA relays
+trade 2.25 GiB of additional scratch for substantially lower latency while
+remaining far below the 18 GiB 128-plane layout.
+
+| Dqk | Q | KV | Merged latency | Optimized latency | Speedup | Merged scratch | Optimized scratch |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 576 | 1024 | 65536 | 6.957 ms | 4.466 ms | 1.56x | 2.258 GiB | 2.258 GiB |
+| 576 | 2048 | 65536 | 12.744 ms | 7.114 ms | 1.79x | 2.267 GiB | 4.517 GiB |
+| 576 | 4096 | 65536 | 24.332 ms | 11.980 ms | 2.03x | 2.283 GiB | 4.533 GiB |
+| 576 | 8192 | 131072 | 31.677 ms | 24.142 ms | 1.31x | 9.129 GiB | 9.129 GiB |
+| 576 | 16384 | 262144 | 64.390 ms | 48.320 ms | 1.33x | 18.508 GiB | 18.508 GiB |
+| 576 | 16384 | 524288 | 101.409 ms | 64.426 ms | 1.57x | 10.008 GiB | 10.008 GiB |
+| 512 | 8192 | 131072 | 29.207 ms | 21.055 ms | 1.39x | 8.129 GiB | 8.129 GiB |
+| 512 | 16384 | 262144 | 60.060 ms | 42.305 ms | 1.42x | 16.508 GiB | 16.508 GiB |
+| 512 | 16384 | 524288 | 96.221 ms | 60.170 ms | 1.60x | 9.008 GiB | 9.008 GiB |
 
 For H64, a three-round, 20-call, reversed-order A/B measured prepared-plan
 eager execution at 104.579 ms and CUDA Graph replay at 104.225 ms (0.997x).

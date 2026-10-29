@@ -385,6 +385,23 @@ supported DSL.
 |     8192 |      8192 | 1024 |  4.538 |     605.76 |
 |     8192 |      8192 | 2048 |  8.562 |     642.06 |
 
+##### SM100 deterministic relay scheduling (2026-10-30)
+
+Against merged commit `1dea4471a6e6c05e29d3bf281281fd156d345a84`, the
+deterministic H64/D576 relay path improved from 6.957/12.744/24.332 ms to
+4.466/7.114/11.980 ms at Q=1K/2K/4K and KV=64K. At Q=16K, KV=512K it
+improved from 101.409 to 64.426 ms with the same 10.008 GiB workspace.
+Inputs were BF16 with top-k 2048, full runtime lengths, synthetic forward
+statistics, five warm-ups, and 40 allocation-free calls on the SM100 test
+environment (PyTorch 2.14.1+cu130, CuTe DSL 4.8.1, cuDNN 9.24.0).
+
+The 2K/4K policy now uses four-CTA relays (4.517/4.533 GiB) instead of the
+2.267/2.283 GiB eight-CTA layout; the full 128-plane layout would require
+about 18 GiB. Other measured relay workspaces are unchanged. Nsys attributes
+the Q=4K gain primarily to the 32 main-kernel waves: their total falls from
+22.941 to 9.696 ms. The optimized trace has no separate dKV prefold kernel;
+fixed-order conversion takes 1.452 ms and workspace clearing 0.658 ms.
+
 #### Profiling
 
 `profile` mode runs a single warmed-up backward call (using the first value
