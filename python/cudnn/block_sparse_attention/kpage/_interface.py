@@ -111,8 +111,9 @@ def _fwd_m64(
     head_dim = q.shape[-1]
     qhead_per_kvhead = q.shape[1] // k.shape[1]
     tail_page = k.shape[2] % PAGE != 0
+    nonpositive_scale = not softmax_scale > 0.0  # keeps the is_first first softmax step (NaN/inf otherwise)
     tensors = (q, k, v, out, lse, page_table, mask_table, tile_offsets, iter_counts, full_iter_counts, work_indices)
-    key = compile_key("kpage_fwd_m64", (torch2cute_dtype_map[q.dtype], head_dim, qhead_per_kvhead, tail_page, _get_device_arch()), tensors)
+    key = compile_key("kpage_fwd_m64", (torch2cute_dtype_map[q.dtype], head_dim, qhead_per_kvhead, tail_page, nonpositive_scale, _get_device_arch()), tensors)
     cache = _fwd_m64.compile_cache
     if key not in cache:
         q_t, k_t, v_t, o_t = [to_cute_tensor(t, (0, 1, 2)) for t in (q, k, v, out)]
@@ -122,7 +123,9 @@ def _fwd_m64(
         to_t, ic_t, fi_t = [to_cute_tensor(t, (0, 1, 2), assumed_align=4) for t in (tile_offsets, iter_counts, full_iter_counts)]
         wi_t = to_cute_tensor(work_indices, 0, assumed_align=4)
         cache[key] = cute.compile(
-            BlockSparseAttnForwardSm100KPageQ64(head_dim, head_dim, qhead_per_kvhead=qhead_per_kvhead, tail_page=tail_page),
+            BlockSparseAttnForwardSm100KPageQ64(
+                head_dim, head_dim, qhead_per_kvhead=qhead_per_kvhead, tail_page=tail_page, nonpositive_scale=nonpositive_scale
+            ),
             q_t,
             k_t,
             v_t,

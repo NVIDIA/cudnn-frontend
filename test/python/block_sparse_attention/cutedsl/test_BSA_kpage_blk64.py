@@ -31,12 +31,13 @@ def _import_bsa():
         importlib.import_module("cudnn.block_sparse_attention._interface")
     except (ImportError, OSError) as error:
         pytest.skip(f"block sparse attention optional dependencies are unavailable: {error}")
-    from cudnn.block_sparse_attention._kpage_api import KPAGE_MIN_CUTEDSL
-    from cudnn.block_sparse_attention._interface import _cutlass_dsl_version
+    else:
+        from cudnn.block_sparse_attention._kpage_api import KPAGE_MIN_CUTEDSL
+        from cudnn.block_sparse_attention._interface import _cutlass_dsl_version
 
-    if _cutlass_dsl_version() < KPAGE_MIN_CUTEDSL:
-        pytest.skip(f"kpage requires nvidia-cutlass-dsl>={'.'.join(map(str, KPAGE_MIN_CUTEDSL))}")
-    return BSA
+        if _cutlass_dsl_version() < KPAGE_MIN_CUTEDSL:
+            pytest.skip(f"kpage requires nvidia-cutlass-dsl>={'.'.join(map(str, KPAGE_MIN_CUTEDSL))}")
+        return BSA
 
 
 def _valid_rows(block_sizes: torch.Tensor) -> torch.Tensor:
@@ -66,9 +67,9 @@ def _random_metadata(heads: int, num_q_blocks: int, num_kv_blocks: int, kmax: in
     return q2k, nums
 
 
-def _reference(q, k, v, q2k, nums, bs):
+def _reference(q, k, v, q2k, nums, bs, softmax_scale=None):
     mask = block_sparse_mask(q2k, 0, bs, q.shape[2], k.shape[2], BLOCK, q2k_block_nums=nums)
-    return attention_reference(q, k, v, mask)
+    return attention_reference(q, k, v, mask, softmax_scale=softmax_scale)
 
 
 def _run(BSA, q, k, v, q2k, nums, bs, **kwargs):
@@ -114,6 +115,34 @@ def test_kpage_blk64_fixed_count_matches_base_kernel():
     base = BSA.block_sparse_attention_forward(q, k, v, q2k, 3, bs, sparse_block_size=BLOCK, softmax_scale=0.2)
     torch.testing.assert_close(paged["o_tensor"].float(), base["o_tensor"].float(), atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(paged["lse_tensor"], base["lse_tensor"], atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=26)
+def test_kpage_blk64_empty_query_blocks():
+    """allow_empty_block_nums: a query block with no KV blocks gets O = 0 and LSE = -inf (as on the base path)."""
+    BSA = _import_bsa()
+    heads, num_blocks = 2, 6
+    bs = torch.tensor([64, 40, 64, 7, 64, 50], dtype=torch.int32, device="cuda")
+    q, k, v = _inputs(heads, num_blocks, bs)
+    q2k, nums = _random_metadata(heads, num_blocks, num_blocks, kmax=3)
+    nums[0, 0, 0] = 0
+    nums[0, 1, 3] = 0
+    nums[0, 1, 4] = 0
+    empty = torch.zeros(heads, num_blocks * BLOCK, dtype=torch.bool, device="cuda")
+    empty[0, :BLOCK] = empty[1, 3 * BLOCK : 5 * BLOCK] = True
+
+    with pytest.raises(ValueError, match="at least one KV block"):
+        BSA.kpage_prepare_layout(q2k, None, bs, nums, sparse_block_size=BLOCK)
+    layout = BSA.kpage_prepare_layout(q2k, None, bs, nums, sparse_block_size=BLOCK, allow_empty_block_nums=True)
+    for kpage in (layout, True):
+        out = _run(BSA, q, k, v, q2k, nums, bs, kpage=kpage, allow_empty_block_nums=True)
+        o, lse = out["o_tensor"][0], out["lse_tensor"][0]
+        assert torch.equal(o[empty], torch.zeros_like(o[empty]))
+        assert torch.isneginf(lse[empty]).all()
+        o_ref, lse_ref = _reference(q, k, v, q2k, nums, bs)
+        torch.testing.assert_close(o[~empty].float(), o_ref[0][~empty], atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(lse[~empty], lse_ref[0][~empty], atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.L0
@@ -169,6 +198,12 @@ def test_kpage_blk64_rejects_unsupported_configurations():
         BSA.kpage_prepare_layout(q2k, 2, bs, sparse_block_size=BLOCK, with_backward=True)
     with pytest.raises(NotImplementedError, match="forward only"):
         BSA.kpage_prepare_layout(q2k, 2, bs, q_block_sizes=bs, sparse_block_size=BLOCK)
+    with pytest.raises(NotImplementedError, match="bwd_kv_groups"):
+        BSA.kpage_prepare_layout(q2k, 2, bs, sparse_block_size=BLOCK, bwd_kv_groups=2)
+    # a zero or negative scale would turn the -inf of masked keys into NaN / +inf
+    for scale in (0.0, -0.125):
+        with pytest.raises(NotImplementedError, match="positive softmax_scale"):
+            _run(BSA, q, k, v, q2k, None, bs, kpage=True, softmax_scale=scale)
     # MHA only
     q_gqa = torch.randn((1, 2 * heads, seqlen, 128), device="cuda", dtype=torch.bfloat16)
     q2k_gqa = q2k.repeat_interleave(2, dim=1).contiguous()

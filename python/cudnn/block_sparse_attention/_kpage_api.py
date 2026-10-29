@@ -114,8 +114,8 @@ def prepare_layout(
         raise NotImplementedError(f"kpage requires an SM100/SM103 GPU, found SM{major}{minor}")
     if sparse_block_size not in (64, 128):
         raise ValueError(f"sparse_block_size must be 64 or 128, got {sparse_block_size}")
-    if sparse_block_size == 64 and (q_block_sizes is not None or with_backward):
-        raise NotImplementedError("the blk64 KPage path is forward only and takes no q_block_sizes")
+    if sparse_block_size == 64 and (q_block_sizes is not None or with_backward or bwd_kv_groups is not None):
+        raise NotImplementedError("the blk64 KPage path is forward only and takes no q_block_sizes, with_backward or bwd_kv_groups")
     for name, seqlen in (("seqlen_q", seqlen_q), ("seqlen_k", seqlen_k)):
         if seqlen is not None and seqlen < 1:
             raise ValueError(f"{name} must be positive, got {seqlen}")

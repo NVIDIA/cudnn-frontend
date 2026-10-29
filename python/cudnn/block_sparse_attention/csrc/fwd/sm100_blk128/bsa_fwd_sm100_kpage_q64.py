@@ -59,12 +59,16 @@ class BlockSparseAttnForwardSm100KPageQ64:
         head_dim_v: Optional[int] = None,
         qhead_per_kvhead: cutlass.Constexpr[int] = 1,
         tail_page: cutlass.Constexpr[bool] = False,
+        nonpositive_scale: cutlass.Constexpr[bool] = False,
     ):
         """``tail_page``: seqlen_k is not a multiple of 16, so the K/V page descriptors
         are built over the row extent (a page past seqlen_k loads as zeros) instead
-        of the 16-row page view, whose whole-page TMA boxes are a few percent faster."""
+        of the 16-row page view, whose whole-page TMA boxes are a few percent faster.
+        ``nonpositive_scale``: softmax_scale <= 0, which keeps the is_first first softmax
+        step (the shared generic first step is only exact for a positive scale)."""
         self.qhead_per_kvhead = qhead_per_kvhead
         self.tail_page = tail_page
+        self.nonpositive_scale = nonpositive_scale
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
         self.head_dim_padded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
@@ -1401,35 +1405,117 @@ class BlockSparseAttnForwardSm100KPageQ64:
                 mask_row = mTileOffsets[batch_idx, head_idx, m_block] + (block_iter_count - 1 - stage) * 2
                 mask_word_base = (warp_idx // 2) * 2
 
-                # The first step is the generic step started from the reset state (row_max=-inf, row_sum=0 gives
-                # acc_scale == 0, i.e. the is_first result), so every step shares one code copy per mask variant: a
-                # separate once-per-tile copy of the large softmax step thrashes the instruction cache.
-                for n_tile in cutlass.range(masked_wg_count, unroll=1):
-                    mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
-                        mma_si_consumer_phase,
-                        sm_stats_producer_phase,
-                        tidx=tidx,
-                        tmem_s_addr=tmem_s_addr,
-                        tmem_p_addr=tmem_p_addr,
-                        sm_stats_bar_index=sm_stats_bar_index,
-                        mMaskTable=mMaskTable,
-                        mask_row=mask_row,
-                        mask_word_base=mask_word_base,
-                        masked=True,
-                    )
-                    mask_row -= 4
-                for n_tile in cutlass.range(full_wg_count, unroll=1):
-                    mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
-                        mma_si_consumer_phase,
-                        sm_stats_producer_phase,
-                        tidx=tidx,
-                        tmem_s_addr=tmem_s_addr,
-                        tmem_p_addr=tmem_p_addr,
-                        sm_stats_bar_index=sm_stats_bar_index,
-                        mMaskTable=mMaskTable,
-                        mask_row=mask_row,
-                        mask_word_base=mask_word_base,
-                    )
+                if const_expr(not self.nonpositive_scale):
+                    # The first step is the generic step started from the reset state (row_max=-inf, row_sum=0 gives
+                    # acc_scale == 0, i.e. the is_first result), so every step shares one code copy per mask variant: a
+                    # separate once-per-tile copy of the large softmax step thrashes the instruction cache.
+                    for _ in cutlass.range(masked_wg_count, unroll=1):
+                        mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
+                            mma_si_consumer_phase,
+                            sm_stats_producer_phase,
+                            tidx=tidx,
+                            tmem_s_addr=tmem_s_addr,
+                            tmem_p_addr=tmem_p_addr,
+                            sm_stats_bar_index=sm_stats_bar_index,
+                            mMaskTable=mMaskTable,
+                            mask_row=mask_row,
+                            mask_word_base=mask_word_base,
+                            masked=True,
+                        )
+                        mask_row -= 4
+                    for _ in cutlass.range(full_wg_count, unroll=1):
+                        mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
+                            mma_si_consumer_phase,
+                            sm_stats_producer_phase,
+                            tidx=tidx,
+                            tmem_s_addr=tmem_s_addr,
+                            tmem_p_addr=tmem_p_addr,
+                            sm_stats_bar_index=sm_stats_bar_index,
+                            mMaskTable=mMaskTable,
+                            mask_row=mask_row,
+                            mask_word_base=mask_word_base,
+                        )
+                else:
+                    # A zero or negative scale turns the reset-state rescale (-inf - max) * scale_log2 into NaN or +inf,
+                    # so the first step keeps its is_first specialisation there.
+                    if masked_wg_count > 0:
+                        mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
+                            mma_si_consumer_phase,
+                            sm_stats_producer_phase,
+                            tidx=tidx,
+                            tmem_s_addr=tmem_s_addr,
+                            tmem_p_addr=tmem_p_addr,
+                            sm_stats_bar_index=sm_stats_bar_index,
+                            mMaskTable=mMaskTable,
+                            mask_row=mask_row,
+                            mask_word_base=mask_word_base,
+                            masked=True,
+                            is_first=True,
+                        )
+                        mask_row -= 4
+                        for n_tile in cutlass.range(masked_wg_count - 1, unroll=1):
+                            mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
+                                mma_si_consumer_phase,
+                                sm_stats_producer_phase,
+                                tidx=tidx,
+                                tmem_s_addr=tmem_s_addr,
+                                tmem_p_addr=tmem_p_addr,
+                                sm_stats_bar_index=sm_stats_bar_index,
+                                mMaskTable=mMaskTable,
+                                mask_row=mask_row,
+                                mask_word_base=mask_word_base,
+                                masked=True,
+                            )
+                            mask_row -= 4
+                        if full_wg_count > 0:
+                            mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
+                                mma_si_consumer_phase,
+                                sm_stats_producer_phase,
+                                tidx=tidx,
+                                tmem_s_addr=tmem_s_addr,
+                                tmem_p_addr=tmem_p_addr,
+                                sm_stats_bar_index=sm_stats_bar_index,
+                                mMaskTable=mMaskTable,
+                                mask_row=mask_row,
+                                mask_word_base=mask_word_base,
+                            )
+                            for n_tile in cutlass.range(full_wg_count - 1, unroll=1):
+                                mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
+                                    mma_si_consumer_phase,
+                                    sm_stats_producer_phase,
+                                    tidx=tidx,
+                                    tmem_s_addr=tmem_s_addr,
+                                    tmem_p_addr=tmem_p_addr,
+                                    sm_stats_bar_index=sm_stats_bar_index,
+                                    mMaskTable=mMaskTable,
+                                    mask_row=mask_row,
+                                    mask_word_base=mask_word_base,
+                                )
+                    else:
+                        mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
+                            mma_si_consumer_phase,
+                            sm_stats_producer_phase,
+                            tidx=tidx,
+                            tmem_s_addr=tmem_s_addr,
+                            tmem_p_addr=tmem_p_addr,
+                            sm_stats_bar_index=sm_stats_bar_index,
+                            mMaskTable=mMaskTable,
+                            mask_row=mask_row,
+                            mask_word_base=mask_word_base,
+                            is_first=True,
+                        )
+                        for n_tile in cutlass.range(wg_count - 1, unroll=1):
+                            mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
+                                mma_si_consumer_phase,
+                                sm_stats_producer_phase,
+                                tidx=tidx,
+                                tmem_s_addr=tmem_s_addr,
+                                tmem_p_addr=tmem_p_addr,
+                                sm_stats_bar_index=sm_stats_bar_index,
+                                mMaskTable=mMaskTable,
+                                mask_row=mask_row,
+                                mask_word_base=mask_word_base,
+                            )
 
                 sScale[tidx + stage * self.stats_stride] = softmax.row_sum[0]
                 if const_expr(mLSE is not None or self.q_stage == 1):

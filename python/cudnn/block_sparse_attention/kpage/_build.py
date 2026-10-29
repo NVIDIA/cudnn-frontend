@@ -608,10 +608,10 @@ def build_walk_tables_blk64(
         block=_BLOCK64,
     )
 
-    # Compact queue of non-empty walks, long walks first (stable within each class).
-    active = torch.nonzero(iter_counts > 0).flatten().to(torch.int32)
-    heavy = iter_counts[active.long()] > _Q64_HEAVY_ITER_THRESHOLD
-    work_indices = active[torch.argsort(~heavy, stable=True)].contiguous()
+    # Every walk is queued, as on the blk128 route: an empty one (allow_empty_block_nums) takes the kernel's
+    # empty-tile path and writes O = 0, LSE = -inf.  Long walks first, stable within each class.
+    heavy = iter_counts > _Q64_HEAVY_ITER_THRESHOLD
+    work_indices = torch.argsort(~heavy, stable=True).to(torch.int32).contiguous()
     return Blk64ForwardTables(
         page_table=page_table,
         tile_offsets=tile_offsets.view(1, num_heads, n_q_blocks),

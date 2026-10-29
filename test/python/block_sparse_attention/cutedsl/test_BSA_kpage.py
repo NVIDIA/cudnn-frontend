@@ -153,6 +153,28 @@ def test_kpage_bsa_semantics_matches_base_kernel(seqlen_q_blocks, kv_block_sizes
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=13)
+@pytest.mark.parametrize("softmax_scale", [0.125, 0.0, -0.125])
+def test_kpage_m64_route_softmax_scale_sign(softmax_scale):
+    """Query blocks with <= 64 valid rows run on the M64 x N256 kernel; its first softmax step must stay exact for
+    zero and negative scales too (the reset-state rescale is NaN / +inf there)."""
+    BSA = _import_bsa()
+    heads, num_blocks = 2, 4
+    seqlen = num_blocks * BLOCK
+    bs = torch.full((num_blocks,), BLOCK, dtype=torch.int32, device="cuda")
+    q_sizes = torch.full((num_blocks,), 64, dtype=torch.int32, device="cuda")
+    q, k, v, _ = _inputs(heads, bs)
+    q2k = torch.arange(num_blocks, dtype=torch.int32, device="cuda").view(1, 1, 1, num_blocks).expand(1, heads, num_blocks, num_blocks).contiguous()
+    layout = BSA.kpage_prepare_layout(q2k, num_blocks, bs, q_block_sizes=q_sizes)
+    forward = BSA.block_sparse_attention_forward(q, k, v, q2k, num_blocks, bs, kpage=layout, softmax_scale=softmax_scale)
+    mask = block_sparse_mask(q2k, num_blocks, bs, seqlen, seqlen, BLOCK)
+    o_ref, lse_ref = attention_reference(q, k, v, mask, softmax_scale=softmax_scale)
+    valid = _valid_rows(q_sizes)
+    _check(forward["o_tensor"], o_ref, valid, tol=2e-2)
+    torch.testing.assert_close(forward["lse_tensor"][0, :, valid], lse_ref[0, :, valid], atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=12)
 def test_kpage_layout_reuse_and_preallocated_outputs():
     BSA = _import_bsa()
