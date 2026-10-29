@@ -196,7 +196,8 @@ class SdpaBwdDslSm100D192(SdpaBwdDsl):
             from .prepared_sm100_d192_thd import execute_standalone
 
             tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor)
-            return execute_standalone(self, tensors, workspace, current_stream, scale_softmax, optional)
+            execute_standalone(self, tensors, workspace, current_stream, scale_softmax, optional)
+            return None
         if any(value is not None for value in optional.values()):
             raise ValueError(f"{self._NAME}: optional operands were not compiled into this plan")
         tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor)
