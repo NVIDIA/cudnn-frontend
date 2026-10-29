@@ -1522,19 +1522,21 @@ def _walk_mainloop_chain(
     cur = operand_id
     while cur in op_by_output:
         producer = op_by_output[cur]
-        if producer.cudnn_name in _UNARY_OP_MAP:
+        if producer.cudnn_name == "gen_index":
+            raise ValueError(
+                f"matmul {label} operand producer {producer.op_name!r}: gen_index is unsupported in mainloop fusion (requires logical operand coordinates)"
+            )
+        if producer.cudnn_name in _UNARY_OP_MAP or producer.cudnn_name in _BINARY_OP_MAP:
             allowed_attrs = _MAINLOOP_POINTWISE_ATTR_KEYS.get(producer.cudnn_name, frozenset())
-            if producer.cudnn_name == "gen_index" or any(key not in allowed_attrs for key, _ in producer.op_attrs):
-                raise ValueError(
-                    f"matmul {label} operand producer {producer.op_name!r}: gen_index and " "pointwise scalar attrs are not supported in mainloop fusion"
-                )
-            if any(not isfinite(value) for _, value in producer.op_attrs):
-                raise ValueError(f"matmul {label} operand producer {producer.op_name!r}: negative_slope must be finite")
+            for key, value in producer.op_attrs:
+                if key not in allowed_attrs:
+                    raise ValueError(f"matmul {label} operand producer {producer.op_name!r}: {producer.cudnn_name}.{key} is unsupported in mainloop fusion")
+                if not isfinite(value):
+                    raise ValueError(f"matmul {label} operand producer {producer.op_name!r}: {producer.cudnn_name}.{key} must be finite")
+        if producer.cudnn_name in _UNARY_OP_MAP:
             steps.append((producer.cudnn_name, False, None, True, producer))
             (cur,) = producer.inputs
         elif producer.cudnn_name in _BINARY_OP_MAP:
-            if producer.op_attrs:
-                raise ValueError(f"matmul {label} operand producer {producer.op_name!r}: pointwise scalar " "attrs are not supported in mainloop fusion")
             i0, i1 = producer.inputs
             s0, s1 = _is_scalar_input(i0), _is_scalar_input(i1)
             if s0 and not s1:

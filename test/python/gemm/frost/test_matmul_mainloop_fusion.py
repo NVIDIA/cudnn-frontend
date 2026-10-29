@@ -75,6 +75,33 @@ def _mainloop_graph_ab(
     return g
 
 
+def _leaky_mainloop_graph(
+    side: str,
+    M: int = 128,
+    N: int = 128,
+    K: int = 136,
+    io_dtype=cudnn.data_type.BFLOAT16,
+    slopes: tuple[float, ...] = (0.1,),
+    pre_cos: bool = False,
+) -> cudnn.pygraph:
+    """Keep every pre-MMA activation's explicit output rounding boundary."""
+    graph = cudnn.pygraph(io_data_type=io_dtype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = graph.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = graph.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+
+    def transform(value, label):
+        if pre_cos:
+            value = graph.cos(input=value, name=f"{label}_cos").set_data_type(io_dtype)
+        for i, slope in enumerate(slopes):
+            value = graph.leaky_relu(input=value, negative_slope=slope, name=f"{label}_leaky_{i}").set_data_type(io_dtype)
+        return value
+
+    Ai = transform(A, "a") if side in ("a", "ab") else A
+    Bi = transform(B, "b") if side in ("b", "ab") else B
+    graph.matmul(A=Ai, B=Bi).set_data_type(cudnn.data_type.FLOAT).set_output(True)
+    return graph
+
+
 # ---------------------------------------------------------------------------
 # Analyzer
 # ---------------------------------------------------------------------------
@@ -198,29 +225,10 @@ def test_analyzer_chain_of_two_unary_a_ops() -> None:
     assert [op.op for op in chain.mainloop_a_ops] == ["abs", "relu"]
 
 
-def _leaky_mainloop_graph(side, m=128, n=128, k=136, io_dtype=cudnn.data_type.BFLOAT16, slopes=(0.1,), pre_cos=False):
-    """Keep every pre-MMA activation's explicit output rounding boundary."""
-    graph = cudnn.pygraph(io_data_type=io_dtype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    a = graph.tensor(name="a", dim=[1, m, k], stride=[m * k, k, 1])
-    b = graph.tensor(name="b", dim=[1, k, n], stride=[k * n, 1, k])
-
-    def transform(value, label):
-        if pre_cos:
-            value = graph.cos(input=value, name=f"{label}_cos").set_data_type(io_dtype)
-        for i, slope in enumerate(slopes):
-            value = graph.leaky_relu(input=value, negative_slope=slope, name=f"{label}_leaky_{i}").set_data_type(io_dtype)
-        return value
-
-    ai = transform(a, "a") if side in ("a", "ab") else a
-    bi = transform(b, "b") if side in ("b", "ab") else b
-    y = graph.matmul(A=ai, B=bi).set_data_type(cudnn.data_type.FLOAT).set_output(True)
-    return graph, a, b, y
-
-
 @pytest.mark.parametrize("side", ["a", "b", "ab"])
 @pytest.mark.parametrize("slope", [0.0, 0.1, 1.0, -0.25])
-def test_analyzer_leaky_relu_mainloop_attrs(side, slope):
-    chain = analyze(_leaky_mainloop_graph(side, slopes=(slope,))[0])
+def test_analyzer_leaky_relu_mainloop_attrs(side, slope) -> None:
+    chain = analyze(_leaky_mainloop_graph(side, slopes=(slope,)))
     assert chain.ops == []
     for operand in ("a", "b"):
         ops = getattr(chain, f"mainloop_{operand}_ops")
@@ -239,8 +247,8 @@ def test_analyzer_leaky_relu_mainloop_attrs(side, slope):
 
 @pytest.mark.parametrize("side", ["a", "b"])
 @pytest.mark.parametrize("io_dtype, expected", [(cudnn.data_type.BFLOAT16, "bf16"), (cudnn.data_type.HALF, "fp16")])
-def test_analyzer_leaky_relu_mainloop_chain(side, io_dtype, expected):
-    chain = analyze(_leaky_mainloop_graph(side, io_dtype=io_dtype, slopes=(0.1, 0.3))[0])
+def test_analyzer_leaky_relu_mainloop_chain(side, io_dtype, expected) -> None:
+    chain = analyze(_leaky_mainloop_graph(side, io_dtype=io_dtype, slopes=(0.1, 0.3)))
     ops = getattr(chain, f"mainloop_{side}_ops")
     assert [op.attrs for op in ops] == [(("negative_slope", 0.1),), (("negative_slope", 0.3),)]
     assert [op.parent_idx for op in ops] == [-1, 0]
@@ -251,8 +259,8 @@ def test_analyzer_leaky_relu_mainloop_chain(side, io_dtype, expected):
     assert f"_r_ml_{side}_0 = (" in snippet and f".to(cutlass.{dtype})" in snippet
 
 
-def test_analyzer_leaky_relu_mainloop_mixed_unary_chain():
-    chain = analyze(_leaky_mainloop_graph("ab", pre_cos=True)[0])
+def test_analyzer_leaky_relu_mainloop_mixed_unary_chain() -> None:
+    chain = analyze(_leaky_mainloop_graph("ab", pre_cos=True))
     for ops in (chain.mainloop_a_ops, chain.mainloop_b_ops):
         assert [op.op for op in ops] == ["cos", "leaky_relu"]
         assert [op.attrs for op in ops] == [(), (("negative_slope", 0.1),)]
@@ -261,82 +269,71 @@ def test_analyzer_leaky_relu_mainloop_mixed_unary_chain():
 
 @pytest.mark.parametrize("side", ["a", "b"])
 @pytest.mark.parametrize(
-    "op, attrs",
-    [("relu", {"lower_clip": 0.25}), ("swish", {"swish_beta": 2.0}), ("gen_index", {"axis": 2}), ("leaky_relu", {"negative_slope": 0.1, "upper_clip": 1.0})],
+    "op, attrs, unsupported_key",
+    [
+        ("relu", {"lower_clip": 0.25}, "lower_clip"),
+        ("swish", {"swish_beta": 2.0}, "swish_beta"),
+        ("leaky_relu", {"negative_slope": 0.1}, "upper_clip"),
+        ("leaky_relu_backward", {"negative_slope": 0.1}, "negative_slope"),
+    ],
 )
-def test_analyzer_leaky_relu_mainloop_keeps_attribute_gate(side, op, attrs):
+def test_analyzer_leaky_relu_mainloop_keeps_attribute_gate(side, op, attrs, unsupported_key) -> None:
     graph = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    a = graph.tensor(name="a", dim=[1, 128, 128], stride=[16384, 128, 1])
-    b = graph.tensor(name="b", dim=[1, 128, 128], stride=[16384, 1, 128])
-    value = graph._pointwise(op, [a if side == "a" else b], "unsupported", None, attrs)
-    graph.matmul(A=value if side == "a" else a, B=value if side == "b" else b).set_output(True)
-    with pytest.raises(ValueError, match="pointwise scalar attrs are not supported in mainloop fusion"):
+    M = N = K = 128
+    A = graph.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = graph.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    operand = A if side == "a" else B
+    if op == "leaky_relu_backward":
+        scalar = graph.tensor(name="scalar", dim=[1, 1, 1], stride=[1, 1, 1])
+        value = graph.leaky_relu_backward(loss=operand, input=scalar, name="unsupported", **attrs)
+    else:
+        value = getattr(graph, op)(input=operand, name="unsupported", **attrs)
+    if op == "leaky_relu":
+        # Inject an unsupported attribute into the recorded node, not the public builder.
+        graph.nodes[-1].params[unsupported_key] = 1.0
+    graph.matmul(A=value if side == "a" else A, B=value if side == "b" else B).set_output(True)
+    with pytest.raises(ValueError) as exc:
         analyze(graph)
+    assert str(exc.value) == f"matmul {side.upper()} operand producer 'unsupported': {op}.{unsupported_key} is unsupported in mainloop fusion"
+
+
+@pytest.mark.parametrize("side", ["a", "b"])
+def test_analyzer_mainloop_gen_index_diagnostic(side) -> None:
+    graph = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    M = N = K = 128
+    A = graph.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = graph.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    value = graph.gen_index(input=A if side == "a" else B, axis=2, name="index")
+    graph.matmul(A=value if side == "a" else A, B=value if side == "b" else B).set_output(True)
+    with pytest.raises(ValueError) as exc:
+        analyze(graph)
+    assert str(exc.value) == (
+        f"matmul {side.upper()} operand producer 'index': gen_index is unsupported " "in mainloop fusion (requires logical operand coordinates)"
+    )
 
 
 @pytest.mark.parametrize("slope", [float("nan"), float("inf"), -float("inf")])
-def test_analyzer_leaky_relu_mainloop_rejects_nonfinite_slope(slope):
-    with pytest.raises(ValueError, match="negative_slope must be finite"):
-        analyze(_leaky_mainloop_graph("a", slopes=(slope,))[0])
-
-
-@requires_sm100
-@pytest.mark.parametrize("side", ["a", "b", "ab"])
-@pytest.mark.parametrize("k", [128, 136, 144])
-@pytest.mark.parametrize("cta_group", [1, 2])
-def test_leaky_relu_mainloop_e2e(side, k, cta_group):
-    """Exercise complete and partial K tiles on one- and two-CTA MMA."""
-    m = n = 256
-    graph, a, b, y = _leaky_mainloop_graph(side, m, n, k)
-    cfg = by_name(f"CONFIG_sm100_128x128x128_128x128x32_cluster{cta_group}x1_{cta_group}ctamma")
-    compiled = jit_from_cudnn_graph(graph, cfg)
-    torch.manual_seed(0)
-    av = torch.randn((1, m, k), device="cuda", dtype=torch.bfloat16)
-    bv = torch.randn((1, n, k), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
-    out = torch.full((1, m, n), float("nan"), device="cuda", dtype=torch.float32)
-    compiled({a: av, b: bv, y: out})
-    torch.cuda.synchronize()
-    ar = torch.nn.functional.leaky_relu(av.float(), 0.1).to(av.dtype) if "a" in side else av
-    br = torch.nn.functional.leaky_relu(bv.float(), 0.1).to(bv.dtype) if "b" in side else bv
-    ref = ar.float() @ br.float()
-    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
-
-
-@requires_sm100
-@pytest.mark.parametrize("k", [136, 144])
-@pytest.mark.parametrize("cta_group", [1, 2])
-def test_leaky_relu_mainloop_e2e_masks_transformed_padding(k, cta_group):
-    """cos(0)=1 on BOTH padded operands makes a missing K mask observable."""
-    graph, a, b, y = _leaky_mainloop_graph("ab", m=256, n=256, k=k, pre_cos=True)
-    cfg = by_name(f"CONFIG_sm100_128x128x128_128x128x32_cluster{cta_group}x1_{cta_group}ctamma")
-    compiled = jit_from_cudnn_graph(graph, cfg)
-    av = torch.zeros((1, 256, k), device="cuda", dtype=torch.bfloat16)
-    bv = torch.zeros((1, 256, k), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
-    out = torch.full((1, 256, 256), float("nan"), device="cuda", dtype=torch.float32)
-    compiled({a: av, b: bv, y: out})
-    torch.cuda.synchronize()
-    torch.testing.assert_close(out, torch.full_like(out, k), atol=0, rtol=0)
-
-
-@requires_sm100
 @pytest.mark.parametrize("side", ["a", "b"])
-@pytest.mark.parametrize("io_dtype, torch_dtype", [(cudnn.data_type.BFLOAT16, torch.bfloat16), (cudnn.data_type.HALF, torch.float16)])
-def test_leaky_relu_mainloop_e2e_preserves_rounding(side, io_dtype, torch_dtype):
-    """An identity GEMM exposes each activation's intermediate rounding."""
-    graph, a, b, y = _leaky_mainloop_graph(side, k=128, io_dtype=io_dtype, slopes=(0.1, 0.3))
-    compiled = jit_from_cudnn_graph(graph, by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"))
-    raw = -torch.linspace(0.5, 2.0, 128, device="cuda").to(torch_dtype).expand(1, 128, 128).contiguous()
-    identity = torch.eye(128, device="cuda", dtype=torch_dtype)[None]
-    out = torch.empty((1, 128, 128), device="cuda", dtype=torch.float32)
-    compiled({a: raw if side == "a" else identity, b: raw.transpose(1, 2) if side == "b" else identity, y: out})
-    torch.cuda.synchronize()
-    ref = raw
-    for slope in (0.1, 0.3):
-        ref = torch.nn.functional.leaky_relu(ref.float(), slope).to(torch_dtype)
-    # Without the first rounding boundary this differs for both FP16 and BF16.
-    unrounded = torch.nn.functional.leaky_relu(torch.nn.functional.leaky_relu(raw.float(), 0.1), 0.3).to(torch_dtype)
-    assert not torch.equal(ref, unrounded)
-    torch.testing.assert_close(out, ref.float() if side == "a" else ref.float().transpose(1, 2), atol=0, rtol=0)
+def test_analyzer_leaky_relu_mainloop_rejects_nonfinite_slope(side, slope) -> None:
+    with pytest.raises(ValueError) as exc:
+        analyze(_leaky_mainloop_graph(side, slopes=(slope,)))
+    assert str(exc.value) == f"matmul {side.upper()} operand producer '{side}_leaky_0': leaky_relu.negative_slope must be finite"
+
+
+def test_analyzer_mainloop_finite_diagnostic_names_the_attribute(monkeypatch) -> None:
+    """A future whitelist extension must not report a hard-coded slope name."""
+    from cudnn.gemm.frost.graph_analyzer import _MAINLOOP_POINTWISE_ATTR_KEYS
+
+    monkeypatch.setitem(_MAINLOOP_POINTWISE_ATTR_KEYS, "relu", frozenset({"lower_clip"}))
+    graph = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    M = N = K = 128
+    A = graph.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = graph.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    value = graph.relu(input=A, lower_clip=float("inf"), name="clip")
+    graph.matmul(A=value, B=B).set_output(True)
+    with pytest.raises(ValueError) as exc:
+        analyze(graph)
+    assert str(exc.value) == "matmul A operand producer 'clip': relu.lower_clip must be finite"
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +368,65 @@ def test_codegen_mainloop_empty_when_no_fusion() -> None:
 # ---------------------------------------------------------------------------
 
 _TORCH_OP = {"abs": torch.abs, "relu": torch.relu, "neg": torch.neg, "cos": torch.cos}
+
+
+@requires_sm100
+@pytest.mark.parametrize("side", ["a", "b", "ab"])
+@pytest.mark.parametrize("k", [128, 136, 144])
+@pytest.mark.parametrize("cta_group", [1, 2])
+def test_leaky_relu_mainloop_e2e(side, k, cta_group) -> None:
+    """Exercise complete and partial K tiles on one- and two-CTA MMA."""
+    m = n = 256
+    graph = _leaky_mainloop_graph(side, m, n, k)
+    cfg = f"CONFIG_sm100_128x128x128_128x128x32_cluster{cta_group}x1_{cta_group}ctamma"
+    plan = _plan(graph, **_kw(cfg))
+    torch.manual_seed(0)
+    av = torch.randn((1, m, k), device="cuda", dtype=torch.bfloat16)
+    bv = torch.randn((1, n, k), device="cuda", dtype=torch.bfloat16)
+    out = torch.full((1, m, n), float("nan"), device="cuda", dtype=torch.float32)
+    plan(_vp(plan, av, bv, out))
+    torch.cuda.synchronize()
+    ar = torch.nn.functional.leaky_relu(av.float(), 0.1).to(av.dtype) if "a" in side else av
+    br = torch.nn.functional.leaky_relu(bv.float(), 0.1).to(bv.dtype) if "b" in side else bv
+    ref = torch.einsum("bmk,bnk->bmn", ar.float(), br.float())
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@requires_sm100
+@pytest.mark.parametrize("k", [136, 144])
+@pytest.mark.parametrize("cta_group", [1, 2])
+def test_leaky_relu_mainloop_e2e_masks_transformed_padding(k, cta_group) -> None:
+    """cos(0)=1 on BOTH padded operands makes a missing K mask observable."""
+    graph = _leaky_mainloop_graph("ab", M=256, N=256, K=k, pre_cos=True)
+    cfg = f"CONFIG_sm100_128x128x128_128x128x32_cluster{cta_group}x1_{cta_group}ctamma"
+    plan = _plan(graph, **_kw(cfg))
+    av = torch.zeros((1, 256, k), device="cuda", dtype=torch.bfloat16)
+    bv = torch.zeros((1, 256, k), device="cuda", dtype=torch.bfloat16)
+    out = torch.full((1, 256, 256), float("nan"), device="cuda", dtype=torch.float32)
+    plan(_vp(plan, av, bv, out))
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, torch.full_like(out, k), atol=0, rtol=0)
+
+
+@requires_sm100
+@pytest.mark.parametrize("side", ["a", "b"])
+@pytest.mark.parametrize("io_dtype, torch_dtype", [(cudnn.data_type.BFLOAT16, torch.bfloat16), (cudnn.data_type.HALF, torch.float16)])
+def test_leaky_relu_mainloop_e2e_preserves_rounding(side, io_dtype, torch_dtype) -> None:
+    """An identity GEMM exposes each activation's intermediate rounding."""
+    graph = _leaky_mainloop_graph(side, K=128, io_dtype=io_dtype, slopes=(0.1, 0.3))
+    plan = _plan(graph, **_kw("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"))
+    raw = -torch.linspace(0.5, 2.0, 128, device="cuda").to(torch_dtype).expand(1, 128, 128).contiguous()
+    identity = torch.eye(128, device="cuda", dtype=torch_dtype)[None]
+    out = torch.empty((1, 128, 128), device="cuda", dtype=torch.float32)
+    plan(_vp(plan, raw if side == "a" else identity, raw if side == "b" else identity, out))
+    torch.cuda.synchronize()
+    ref = raw
+    for slope in (0.1, 0.3):
+        ref = torch.nn.functional.leaky_relu(ref.float(), slope).to(torch_dtype)
+    # Without the first rounding boundary this differs for both FP16 and BF16.
+    unrounded = torch.nn.functional.leaky_relu(torch.nn.functional.leaky_relu(raw.float(), 0.1), 0.3).to(torch_dtype)
+    assert not torch.equal(ref, unrounded)
+    torch.testing.assert_close(out, ref.float() if side == "a" else ref.float().transpose(1, 2), atol=0, rtol=0)
 
 
 def _run_e2e(op, cfg_name, M, N, K, io_dtype, torch_dtype, out_major="n"):
