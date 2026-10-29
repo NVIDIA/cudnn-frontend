@@ -342,7 +342,7 @@ any bind — dtype, shape, strides, device, alignment, each a typed `ValueError`
 plan built without the flag refuses a delta. The producer this exists for is the gated
 attention block's sigmoid-gate backward kernel, which forms the delta over the `dO` it
 stores in `dot`'s own reduction order, so the fused and the unfused block backward are
-bitwise equal (`fuse_gate_bwd` in [gated_attention_block.md](../gated_attention_block.md)).
+bitwise equal (`fuse_gate_bwd` in [gated_attention_block.md](/operations/Attention/gated_attention_block)).
 The flag is independent of `seq_kv_lens_present`: each decides its own appended operand
 (the lengths, then the delta) and a plan built with both takes both at `execute`. It is a
 plan fact, not an eligibility fact — `Capabilities` and the graph path are unchanged (no

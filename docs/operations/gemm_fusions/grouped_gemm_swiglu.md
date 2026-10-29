@@ -1,12 +1,12 @@
-# Grouped GEMM + dSwiGLU (SM100)
+# Grouped GEMM + SwiGLU (SM100)
 
 **This is an experimental API and subject to change.**
 
-**Legacy contiguous-only API note:** This page documents the older contiguous-only dSwiGLU API. For new integrations, prefer the unified [Grouped GEMM + dGLU](grouped_gemm_dglu.md) API, which covers dense and discrete weight layouts.
+**Legacy contiguous-only API note:** This page documents the older contiguous-only SwiGLU API. For new integrations, prefer the unified Grouped GEMM + GLU ([docs](/operations/Matmul/gemm_fusions/grouped_gemm_glu), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/gemm_fusions/grouped_gemm_glu.md)) API, which covers dense and discrete weight layouts. This API keeps its signatures and runs the unified GLU kernel with `act_func="swiglu"`, for Torch and JAX.
 
 ## JAX support
 
-`cudnn.grouped_gemm_dswiglu_wrapper_sm100` accepts Torch tensors and canonical
+`cudnn.grouped_gemm_swiglu_wrapper_sm100` accepts Torch tensors and canonical
 MXFP8 JAX arrays or tracers. Torch execution is unchanged; JAX runs
 eagerly or under `jax.jit`, with XLA-owned buffers and stream ordering. Direct API-class construction
 with JAX samples remains unsupported.
@@ -16,12 +16,12 @@ Wrapper signatures and defaults are unchanged. JAX wrapper calls must set
 
 ## Overview
 
-**Grouped GEMM + dSwiGLU fusion**: A contiguous grouped block-scaled GEMM fused with a dSwiGLU backward epilogue on NVIDIA Blackwell GPUs (SM100+), designed for MoE (Mixture of Experts) workloads. Implemented with CUTLASS/CUTE.
+**Grouped GEMM + SwiGLU fusion**: A contiguous grouped block-scaled GEMM fused with a SwiGLU epilogue on NVIDIA Blackwell GPUs (SM100+), designed for MoE (Mixture of Experts) workloads. Implemented with CUTLASS/CUTE.
 Groups are contiguous in the M dimension and described by `padded_offsets` (cumulative aligned end offsets).
 
 This kernel performs:
 1. **Block-scaled grouped GEMM**: Low-precision GEMM (FP4, FP8) with per-block scale factors across multiple expert groups
-2. **dSwiGLU backward epilogue**: Fused backward computation using the forward `C` tensor (input/gate interleaved)
+2. **SwiGLU activation**: Fused activation applied to the GEMM output
 3. **Optional quantized output**: Produces row and column scale factors for downstream quantization
 
 ### Shapes
@@ -31,36 +31,35 @@ This kernel performs:
 - **Inputs**
   - `A`: contiguous activation tensor across all groups, shape `(valid_m, K, 1)`
   - `B`: weight tensor across all groups, shape `(N, K, L)`
-  - `C`: forward intermediate tensor with interleaved input/gate blocks, shape `(valid_m, 2N, 1)`
   - `SFA`: scale factor tensor for A, shape `(32, 4, ceil(valid_m/128), 4, ceil(ceil(K/sf_vec_size)/4), 1)`
   - `SFB`: scale factor tensor for B, shape `(32, 4, ceil(N/128), 4, ceil(ceil(K/sf_vec_size)/4), L)`
   - `padded_offsets`: cumulative sum of aligned group M sizes, shape `(L,)`. `valid_m = padded_offsets[-1]`
-  - `alpha`: per-group scaling factors for GEMM, shape `(L,)`
-  - `beta`: per-group scaling factors for `C`, shape `(L,)`
+  - `alpha`: per-group scaling factors, shape `(L,)`
   - `prob`: per-row gating probabilities, shape `(valid_m, 1, 1)`
   - `norm_const`: normalization constant for FP8 quantization, shape `(1,)`
 - **Outputs**
-  - `D_row`: row-quantized dSwiGLU output, shape `(valid_m, 2N, 1)`
-  - `D_col`: column-quantized dSwiGLU output, shape `(valid_m, 2N, 1)`
-  - `dprob`: gradient of `prob`, shape `(valid_m, 1, 1)`. Must be zero-initialized.
-  - `SFD_row`: row scale factors (when `d_dtype` is FP8), shape `(32, 4, ceil(valid_m/128), 4, ceil(ceil((2N)/sf_vec_size)/4), 1)`
-  - `SFD_col`: column scale factors (when `d_dtype` is FP8), shape `(32, 4, ceil((2N)/128), 4, ceil(ceil(valid_m/sf_vec_size)/4), 1)`
-  - `amax`: per-group amax (when `d_dtype` is bf16/float16), shape `(L, 2, 1)`
+  - `C`: intermediate GEMM result, shape `(valid_m, N, 1)`
+  - `D`: row-quantized SwiGLU output, shape `(valid_m, N/2, 1)`
+  - `D_col`: column-quantized SwiGLU output, shape `(valid_m, N/2, 1)`
+  - `SFD_row`: row scale factors (when `d_dtype` is FP8), shape `(32, 4, ceil(valid_m/128), 4, ceil(ceil((N/2)/sf_vec_size)/4), 1)`
+  - `SFD_col`: column scale factors (when `d_dtype` is FP8), shape `(32, 4, ceil((N/2)/128), 4, ceil(ceil(valid_m/sf_vec_size)/4), 1)`
+  - `amax`: per-group amax (when `d_dtype` is bf16/fp16), shape `(L, 1)`
 
 **Step 1: Block-scaled grouped GEMM** (per group `g` with rows `m` in `[padded_offsets[g-1], padded_offsets[g])`):
 
 $$
-\text{ref}[m, n] = \alpha_g^2 \sum_{k} \text{dequantize}(A[m, k], \text{SFA}) \cdot \text{dequantize}(B[n, k, g], \text{SFB})
+C[m, n] = \alpha_g \sum_{k} \text{dequantize}(A[m, k], \text{SFA}) \cdot \text{dequantize}(B[n, k, g], \text{SFB})
 $$
 
-**Step 2: dSwiGLU backward epilogue** (performed with 32-column interleaving along `2N`):
+**Step 2: SwiGLU epilogue** (performed by pairing 32-column blocks along `N`):
 
-- Scale `C` by `beta_g` per group and deinterleave into input/gate halves by 32-wide blocks.
-- `swish = gate * sigmoid(gate)`
-- `dprob` is the sum over 32-column chunks of `swish * input * ref`
-- `ab = ref * prob * swish`
-- `dswiglu = ref * prob * input * sigmoid(gate) * (1 + gate * (1 - sigmoid(gate)))`
-- Interleave `[ab, dswiglu]` back into `D_row`/`D_col` with 32-column blocks.
+Let block size `G = 32`. For each pair of consecutive 32-wide column blocks:
+- Input block: `X_b = C[:, 2·b·G : 2·b·G + G]`
+- Gate block: `G_b = C[:, 2·b·G + G : 2·b·G + 2·G]`
+
+$$
+D[:, bG:(b+1)G] = \text{prob} \cdot X_b \cdot \text{swish}(G_b), \quad \text{swish}(x) = x \cdot \sigma(x)
+$$
 
 **Step 3: Optional output quantization** (when SFD outputs are generated):
 
@@ -81,27 +80,26 @@ $$
    |    +------------+                       |
    |    |                                    |
    v    v                                    v
-  Dequantize → Grouped GEMM (per group ranges) → ref
+  Dequantize → Grouped GEMM (per group ranges) → Select B[:,:,group_idx]
                     |
                     | × alpha[group_idx]
                     v
-               ref (valid_m×N×1)
+               C (valid_m×N×1)
                     |
- C (valid_m×2N×1) --× beta[group_idx]--> deinterleave 32-col blocks
-                    |                    |
-                    |                swish, sigmoid
-                    |                    |
-                    +--> dprob (sum over blocks)
+                    | Pair 32-col blocks: [X0|G0|X1|G1|...]
+                    |     X_b × swish(G_b)
+                    v
+                    | × prob
+                    v
+               D (valid_m×N/2×1)
                     |
-                    +--> ab, dswiglu → interleave → D (valid_m×2N×1)
-                                      |
-                         +-----------+-----------+
-                         |                       |
-                         v                       v
-                    Row Quantize            Col Quantize
-                         |                       |
-                         v                       v
-                    D_row, SFD_row         D_col, SFD_col
+         +----------+-----------+
+         |                      |
+         v                      v
+    Row Quantize           Col Quantize
+         |                      |
+         v                      v
+    D_row, SFD_row        D_col, SFD_col
 ```
 
 ---
@@ -111,23 +109,22 @@ $$
 ### High-level Wrapper
 
 ```python
-from cudnn import grouped_gemm_dswiglu_wrapper_sm100
+from cudnn import grouped_gemm_swiglu_wrapper_sm100
 from cuda.bindings import driver as cuda
 
 stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-outputs = grouped_gemm_dswiglu_wrapper_sm100(
+outputs = grouped_gemm_swiglu_wrapper_sm100(
     a_tensor=a,
     b_tensor=b,
-    c_tensor=c,
     sfa_tensor=sfa,
     sfb_tensor=sfb,
     padded_offsets=padded_offsets,
     alpha_tensor=alpha,
-    beta_tensor=beta,
-    prob_tensor=prob,
     norm_const_tensor=norm_const,  # Required when SFD outputs are enabled (FP8 inputs)
+    prob_tensor=prob,
     acc_dtype=torch.float32,
+    c_dtype=torch.bfloat16,
     d_dtype=torch.bfloat16,
     cd_major="n",
     mma_tiler_mn=(256, 256),
@@ -136,48 +133,45 @@ outputs = grouped_gemm_dswiglu_wrapper_sm100(
     vector_f32=False,
     m_aligned=256,
     discrete_col_sfd=False,
-    epilogue_op=None,
     current_stream=stream,
 )
 
 # dictionary access:
-d_row = outputs["d_row_tensor"]   # row-quantized dSwiGLU output
-d_col = outputs["d_col_tensor"]   # column-quantized dSwiGLU output
-dprob = outputs["dprob_tensor"]   # dprob output
-amax = outputs["amax_tensor"]     # per-group amax (when d_dtype is bf16)
+c = outputs["c_tensor"] # intermediate GEMM result
+d = outputs["d_tensor"] # row-quantized SwiGLU output
+d_col = outputs["d_col_tensor"] # column-quantized SwiGLU output
+amax = outputs["amax_tensor"] # per-group amax (when d_dtype is bf16)
 sfd_row = outputs["sfd_row_tensor"] # row scale factors (when d_dtype is FP8)
 sfd_col = outputs["sfd_col_tensor"] # column scale factors (when d_dtype is FP8)
 
 # or tuple unpacking:
-d_row, d_col, dprob, amax, sfd_row, sfd_col = outputs
+c, d, d_col, amax, sfd_row, sfd_col = outputs
 ```
 
 ### Class API
 
 ```python
-from cudnn import GroupedGemmDswigluSm100
+from cudnn import GroupedGemmSwigluSm100
 from cuda.bindings import driver as cuda
 
 stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-api = GroupedGemmDswigluSm100(
+api = GroupedGemmSwigluSm100(
     sample_a=a,
     sample_b=b,
     sample_c=c,
-    sample_d_row=d_row,
-    sample_d_col=d_col,
+    sample_d=d,
     sample_sfa=sfa,
     sample_sfb=sfb,
     sample_padded_offsets=padded_offsets,
     sample_alpha=alpha,
-    sample_beta=beta,
-    sample_prob=prob,
-    sample_dprob=dprob,
+    sample_d_col=d_col,
     # Optional quantization outputs
     sample_sfd_row=sfd_row,        # Required when SFD outputs are enabled
     sample_sfd_col=sfd_col,        # Required when SFD outputs are enabled
     sample_amax=amax,              # Required for bf16 output with FP4 input
     sample_norm_const=norm_const,  # Required when SFD outputs are enabled
+    sample_prob=prob,              # Optional gating probabilities
     # Configuration
     acc_dtype=torch.float32,
     mma_tiler_mn=(256, 256),
@@ -186,7 +180,6 @@ api = GroupedGemmDswigluSm100(
     vector_f32=False,
     m_aligned=256,
     discrete_col_sfd=False,
-    epilogue_op=None,
 )
 assert api.check_support()
 api.compile()
@@ -194,19 +187,17 @@ api.execute(
     a_tensor=a,
     b_tensor=b,
     c_tensor=c,
-    d_row_tensor=d_row,
-    d_col_tensor=d_col,
+    d_tensor=d,
     sfa_tensor=sfa,
     sfb_tensor=sfb,
     padded_offsets=padded_offsets,
     alpha_tensor=alpha,
-    beta_tensor=beta,
-    prob_tensor=prob,
-    dprob_tensor=dprob,
+    d_col_tensor=d_col,
     sfd_row_tensor=sfd_row,
     sfd_col_tensor=sfd_col,
     amax_tensor=amax,
     norm_const_tensor=norm_const,
+    prob_tensor=prob,
     current_stream=stream,
 )
 ```
@@ -219,38 +210,29 @@ api.execute(
 
 - **Input tensor A**: `a_tensor` (wrapper) or `sample_a`, `a_tensor` (class)
   - Shape: `(valid_m, K, 1)`
-  - Stride: `(K, 1, valid_m·K)` - **must be K-major**
+  - Stride: `(K, 1, valid_m·K)` – must be K-major
   - Dtype (`ab_dtype`): `{float4_e2m1fn_x2, uint8, float8_e4m3fn, float8_e5m2}`
     - `uint8` is interpreted as packed FP4 (two FP4 values per byte)
 
 - **Input tensor B**: `b_tensor` (wrapper) or `sample_b`, `b_tensor` (class)
   - Shape: `(N, K, L)` where `L = num_groups`
-  - Stride: `(K, 1, N·K)` (K-major) or `(1, N, N·K)` (N-major). **Must be K-major for fp4 inputs**.
+  - Stride: `(K, 1, N·K)` – must be K-major
   - Dtype (`ab_dtype`): Must match A
 
-- **Input tensor C**: `c_tensor` (wrapper) or `sample_c`, `c_tensor` (class)
-  - Shape: `(valid_m, 2N, 1)`
-  - Stride: `(2N, 1, valid_m·2N)` - **must be N-major**
-  - Dtype (`c_dtype`): `{float32, float16, bfloat16, float8_e4m3fn, float8_e5m2}`
+- **Output tensor C**: `c_tensor` (class) or returned in wrapper dict
+  - Shape: `(valid_m, N, 1)`
+  - Stride: `(N, 1, valid_m·N)` – **must be N-major**
+  - Dtype (`c_dtype`): `{float16, bfloat16}` for FP4 inputs; `{float32, float16, bfloat16, float8_e4m3fn, float8_e5m2, float4_e2m1fn_x2}` otherwise
 
-- **Output tensor D_row**: `d_row_tensor` (class) or returned in wrapper dict
-  - Shape: `(valid_m, 2N, 1)`
-  - Stride: `(2N, 1, valid_m·2N)` - **must be N-major**
-  - Dtype (`d_dtype`): `{bfloat16, float32}` for FP4 inputs; `{float8_e4m3fn, float8_e5m2}` for FP8 inputs
+- **Output tensor D**: `d_tensor` (class) or returned in wrapper dict
+  - Shape: `(valid_m, N/2, 1)`
+  - Stride: `(N/2, 1, valid_m·N/2)` – **must be N-major**
+  - Dtype (`d_dtype`): `{bfloat16, float32}` for FP4 inputs; `{float16, bfloat16, float8_e4m3fn, float8_e5m2, float4_e2m1fn_x2}` otherwise
 
 - **Output tensor D_col**: `d_col_tensor` (class) or returned in wrapper dict
-  - Shape: `(valid_m, 2N, 1)`
-  - Stride: `(2N, 1, valid_m·2N)` - must match D_row (N-major)
-  - Dtype: Must match D_row
-
-- **Input tensor prob**: `prob_tensor` (wrapper) or `sample_prob` (class)
-  - Shape: `(valid_m, 1, 1)`
-  - Dtype: `float32`
-
-- **Output tensor dprob**: `dprob_tensor` (wrapper) or `sample_dprob` (class)
-  - Shape: `(valid_m, 1, 1)`
-  - Dtype: `float32`
-  - Must be zero-initialized.
+  - Shape: `(valid_m, N/2, 1)`
+  - Stride: `(N/2, 1, valid_m·N/2)` – must match D (N-major)
+  - Dtype: Must match D
 
 - **Scale factor tensors**
   - **SFA** (A scale factor): `sfa_tensor` (wrapper) or `sample_sfa`, `sfa_tensor` (class)
@@ -260,11 +242,11 @@ api.execute(
     - Shape: `(32, 4, ceil(N/128), 4, ceil(ceil(K/sf_vec_size)/4), L)`
     - Dtype: Must match SFA
   - **SFD_row** (D row scale factor, optional): `sfd_row_tensor` (wrapper) or `sample_sfd_row`, `sfd_row_tensor` (class)
-    - Shape: `(32, 4, ceil(valid_m/128), 4, ceil(ceil((2N)/sf_vec_size)/4), 1)`
+    - Shape: `(32, 4, ceil(valid_m/128), 4, ceil(ceil((N/2)/sf_vec_size)/4), 1)`
     - Dtype: Must match SFA
     - **Required when**: SFD outputs are enabled (FP8 inputs)
   - **SFD_col** (D column scale factor, optional): `sfd_col_tensor` (wrapper) or `sample_sfd_col`, `sfd_col_tensor` (class)
-    - Shape: `(32, 4, ceil((2N)/128), 4, ceil(ceil(valid_m/sf_vec_size)/4), 1)`
+    - Shape: `(32, 4, ceil((N/2)/128), 4, ceil(ceil(valid_m/sf_vec_size)/4), 1)`
     - Dtype: Must match SFA
     - **Required when**: SFD outputs are enabled (FP8 inputs)
 
@@ -278,11 +260,11 @@ api.execute(
   - **alpha**: Per-group scaling factors
     - Shape: `(L,)` where `L = num_groups`
     - Dtype: `float32`
-  - **beta**: Per-group scaling factors for `C`
-    - Shape: `(L,)` where `L = num_groups`
+  - **prob** (optional): Per-row gating probabilities
+    - Shape: `(valid_m, 1, 1)`
     - Dtype: `float32`
   - **amax** (optional): Per-group max absolute values
-    - Shape: `(L, 2, 1)`
+    - Shape: `(L, 1)`
     - Dtype: `float32`
     - **Required when**: `d_dtype ∈ {bfloat16, float16}`
   - **norm_const** (optional): Normalization constant for FP8 quantization
@@ -297,12 +279,12 @@ api.execute(
 
 - `mma_tiler_mn: Tuple[int, int]`
   - Kernel tile size `(TILE_M, TILE_N)`. Default: `(256, 256)`
-  - `TILE_M ∈ {64, 128, 256}`
+  - `TILE_M ∈ {128, 256}`
   - `TILE_N ∈ {128, 256}`
 
 - `cluster_shape_mn: Tuple[int, int] | None`
   - Thread Block cluster shape `(CLUSTER_M, CLUSTER_N)`
-  - Constraints: positive powers of 2, both &lt;= 4, `CLUSTER_M × CLUSTER_N <= 16`
+  - Constraints: positive powers of 2, both ≤ 4, `CLUSTER_M × CLUSTER_N ≤ 16`
   - Default: `(2, 1)` when `TILE_M=256`, `(1, 1)` otherwise
 
 - `sf_vec_size: int`
@@ -321,17 +303,13 @@ api.execute(
 - `discrete_col_sfd: bool`
   - If True, generate discrete column scale factors grouped by expert tiles
   - Only applies when `sfd_row_tensor`, `sfd_col_tensor`, and `norm_const_tensor` are provided
-  - No extra inputs are required; this only changes the layout of `sfd_col_tensor`
   - Default: `False`
-
-- `epilogue_op: Optional[str]`
-  - Optional epilogue operation. Valid values: `None`, `"none"`, `"identity"`, `"relu"`, `"srelu"`
-  - Default: `None`
 
 - CUDA stream (`current_stream` in class API, `current_stream` in wrapper)
 
-### Wrapper-specific Parameters: `grouped_gemm_dswiglu_wrapper_sm100`
+### Wrapper-specific Parameters: `grouped_gemm_swiglu_wrapper_sm100`
 
+- `c_dtype: torch.dtype`: Intermediate C tensor data type. Default: `torch.bfloat16`
 - `d_dtype: torch.dtype`: Output D tensor data type. Default: `torch.bfloat16`
 - `cd_major: str`: Major dimension for C and D tensors. Must be `"n"` (only N-major layout is supported). Default: `"n"`
 
@@ -340,23 +318,23 @@ api.execute(
 Returns a `TupleDict` - a dictionary-like object that also supports tuple unpacking and integer indexing.
 
 **Dictionary keys** (also the tuple unpacking order):
-- `d_row_tensor`: Row-quantized dSwiGLU output
-- `d_col_tensor`: Column-quantized dSwiGLU output
-- `dprob_tensor`: Gradient of `prob`
+- `c_tensor`: Intermediate GEMM result
+- `d_tensor`: Row-quantized SwiGLU output
+- `d_col_tensor`: Column-quantized SwiGLU output
 - `amax_tensor`: Per-group amax (when `d_dtype ∈ {bfloat16, float16}`)
 - `sfd_row_tensor`: Row scale factors (when SFD outputs are enabled)
 - `sfd_col_tensor`: Column scale factors (when SFD outputs are enabled)
 
 ### Class-specific Parameters
 
-#### `GroupedGemmDswigluSm100` (constructor)
+#### `GroupedGemmSwigluSm100` (constructor)
 
-- `sample_a`, `sample_b`, `sample_c`, `sample_d_row`, `sample_d_col`, `sample_sfa`, `sample_sfb`, `sample_padded_offsets`, `sample_alpha`, `sample_beta`, `sample_prob`, `sample_dprob`, `sample_sfd_row`, `sample_sfd_col`, `sample_amax`, `sample_norm_const` - see Input/Output tensors
+- `sample_a`, `sample_b`, `sample_c`, `sample_d`, `sample_sfa`, `sample_sfb`, `sample_padded_offsets`, `sample_alpha`, `sample_d_col`, `sample_sfd_row`, `sample_sfd_col`, `sample_amax`, `sample_norm_const`, `sample_prob` – see Input/Output tensors
   - Note: `sample_sfd_row`, `sample_sfd_col`, `sample_norm_const` must be all `None` or all not `None`
 
-#### `GroupedGemmDswigluSm100.execute`
+#### `GroupedGemmSwigluSm100.execute`
 
-- `a_tensor`, `b_tensor`, `c_tensor`, `d_row_tensor`, `d_col_tensor`, `sfa_tensor`, `sfb_tensor`, `padded_offsets`, `alpha_tensor`, `beta_tensor`, `prob_tensor`, `dprob_tensor`, `sfd_row_tensor`, `sfd_col_tensor`, `amax_tensor`, `norm_const_tensor` - see Input/Output tensors. Must have same layout as sample tensors provided in constructor.
+- `a_tensor`, `b_tensor`, `c_tensor`, `d_tensor`, `sfa_tensor`, `sfb_tensor`, `padded_offsets`, `alpha_tensor`, `d_col_tensor`, `sfd_row_tensor`, `sfd_col_tensor`, `amax_tensor`, `norm_const_tensor`, `prob_tensor` – see Input/Output tensors. Must have same layout as sample tensors provided in constructor.
 
 ---
 
@@ -364,9 +342,8 @@ Returns a `TupleDict` - a dictionary-like object that also supports tuple unpack
 
 ### Layouts and Strides
 
-- `A` must be **K-major** (contiguous along K dimension)
-- `B` must be **K-major** (contiguous along K dimension) or **N-major** (contiguous along N dimension). Must be **K-major** for fp4 inputs.
-- `C`, `D_row`, and `D_col` must be **N-major** (contiguous along N dimension)
+- `A` and `B` must be **K-major** (contiguous along K dimension)
+- `C`, `D`, and `D_col` must be **N-major** (contiguous along N dimension)
 - All tensors must be **16-byte aligned** along the contiguous dimension
 
 ### Canonical layouts (additive)
@@ -377,11 +354,10 @@ kernel-facing forms above keep working unchanged:
 
 - `A`: `(valid_m, K)` row-major
 - `B`: `(L, N, K)` C-contiguous
-- `C`: `(valid_m, 2N)` row-major
 - `SFA`/`SFB`: any dense C-contiguous buffer with the MMA-tiled element count,
   e.g. flat 1-D or the physical `(L, ceil(mn/128), ceil(ceil(K/sf_vec_size)/4), 32, 4, 4)`
-  allocation. The kernel rebuilds the MMA-tiled SF layouts from the GEMM shapes and
-  reads only the base pointer.
+  allocation — no `.view().permute()` gymnastics required. The kernel rebuilds the
+  MMA-tiled SF layouts from the GEMM shapes and reads only the base pointer.
 - `prob`: `(valid_m,)`, `float32` or `bfloat16`
 - `alpha_tensor` remains required; pass explicit per-group scaling factors.
 
@@ -392,8 +368,8 @@ These layouts are also used by the JAX execution path below. Unified GLU/dGLU
 APIs are separate.
 
 When `A` is canonical (2-D), the wrapper returns natural-shaped outputs:
-`d_row`/`d_col (valid_m, 2N)` row-major, `dprob (valid_m,)`, and
-`sfd_row`/`sfd_col` as C-contiguous physical `(1, ceil(mn/128), rest, 32, 4, 4)` buffers.
+`c (valid_m, N)`, `d`/`d_col (valid_m, N/2)` row-major, and `sfd_row`/`sfd_col` as
+C-contiguous physical `(1, ceil(mn/128), rest, 32, 4, 4)` buffers.
 
 ### JAX execution
 
@@ -403,9 +379,9 @@ JAX arrays managed by XLA. Torch and JAX calls return `TupleDict` with the same
 key order and tuple-unpacking behavior. The JAX path registers this output type
 as a JAX pytree.
 
-The `cudnn.jax.grouped_gemm_dswiglu` and `cudnn.torch.grouped_gemm_dswiglu` aliases
-have been removed. Call this wrapper, or `grouped_gemm_dglu_jax_sm100` with
-`act_func="dswiglu"`, and an FP8 `d_dtype`.
+The `cudnn.jax.grouped_gemm_swiglu` and `cudnn.torch.grouped_gemm_swiglu` aliases
+have been removed. Call this wrapper, or `grouped_gemm_glu_jax_sm100` with
+`act_func="swiglu"`, `generate_c=True`, and an FP8 `d_dtype`.
 
 Use canonical `A (m,k)`, `B (experts,n,k)`, and `prob (m,)` (fp32 or bf16).
 Scale factors are E8M0 arrays, or uint8 bit patterns, containing the packed
@@ -414,13 +390,12 @@ fp32 `alpha (experts,)`, `norm_const (1,)`, and int32 `padded_offsets (experts,)
 Offsets must be nondecreasing multiples of 256 in `[0,m]`; `m` must be a positive
 multiple of 256. These device values are the caller's responsibility.
 
-Backward also requires saved `C (m,2n)` and explicit fp32 `beta (experts,)`.
-It returns `d_row_tensor`, `d_col_tensor`, `dprob_tensor`, physical
+Forward returns `c_tensor (m,n)`, `d_tensor`/`d_col_tensor (m,n/2)`, physical
 `sfd_row_tensor`/`sfd_col_tensor`, and `amax_tensor=None`.
 
-The JAX path requires `sf_vec_size=32`, an FP8 `d_dtype`, and explicit probability and normalization arrays; backward also requires beta.
+The JAX path requires `sf_vec_size=32`, an FP8 `d_dtype`, and explicit probability and normalization arrays.
 Mixed Torch/JAX operands are rejected. The optional JAX configuration is
-`d_dtype`, `mma_tiler_mn`, and `cluster_shape_mn`.
+`c_dtype`, `d_dtype`, `mma_tiler_mn`, and `cluster_shape_mn`.
 Configuration arguments must be static under `jax.jit`:
 
 ```python
@@ -430,7 +405,7 @@ import jax
 import ml_dtypes
 
 compiled = jax.jit(partial(
-    cudnn.grouped_gemm_dswiglu_wrapper_sm100,
+    cudnn.grouped_gemm_swiglu_wrapper_sm100,
     sf_vec_size=32,
     d_dtype=ml_dtypes.float8_e4m3fn,
 ))
@@ -439,15 +414,15 @@ result = compiled(**jax_inputs)
 
 On the wrapper's JAX path, unsupported options raise `ValueError`: non-FP32
 accumulation, non-`n` output layout, scale-vector size other than 32,
-`vector_f32=True`, non-default `m_aligned`, and caller streams, plus caller
-output buffers and non-identity backward epilogues.
+`vector_f32=True`, non-default `m_aligned`, and caller streams.
 
-This initial bridge supports FP8 e4m3/e5m2 A/B and e4m3 D, with E8M0 block
-scales of vector size 32. The packed backward quantizer does not support e5m2 D.
-`discrete_col_sfd=True` packs column scales by expert. Packed FP4, BF16 D, and
-bias are outside its contract. Only dprob is zero-initialized, for atomic
-accumulation; other rows at or past `padded_offsets[-1]` are unspecified, as in
-the Torch path. CUDA graph compatibility uses the standard CuTeDSL JAX bridge.
+This initial bridge supports FP8 e4m3/e5m2 A/B and FP8 D, with E8M0 block
+scales of vector size 32. It runs `grouped_gemm_glu_jax_sm100` with
+`act_func="swiglu"` and `generate_c=True`, so on Rubin (SM107) it runs the Rubin
+GLU kernel, as the Torch path does. `discrete_col_sfd=True` packs column scales
+by expert. Packed FP4, BF16 D, and bias are outside its contract. Outputs are not initialized:
+rows at or past `padded_offsets[-1]` are unspecified, as in the Torch path.
+CUDA graph compatibility uses the standard CuTeDSL JAX bridge.
 This API supplies the fused backward operation explicitly; it does not register
 an automatic `jax.grad` rule. Full TE training integration is separate validation.
 
@@ -457,19 +432,18 @@ an automatic `jax.grad` rule. Full TE training integration is separate validatio
 
 | Format | ab_dtype | sf_dtype | sf_vec_size | d_dtype |
 |--------|----------|----------|-------------|-------------|
-| **MXFP8** | `float8_e4m3fn` or `float8_e5m2` | `{float8_e8m0fnu, float8_e4m3fn}` | 32 | `{float8_e4m3fn, float8_e5m2}` |
+| **MXFP8** | `float8_e4m3fn` or `float8_e5m2` | `float8_e8m0fnu` | 32 | `{float16, bfloat16, float8_e4m3fn, float8_e5m2}` | 
 | **NVF4** | `float4_e2m1fn_x2` or `uint8` | \{`float8_e4m3fn`, `float8_e8m0fnu`\} | \{16, 32\} | `{bfloat16, float32}` |
 
 #### Additional Type Constraints
 
 - `A` and `B` must have the same dtype
 - `SFA`, `SFB`, `SFD_row`, and `SFD_col` must have the same dtype
-- `D_row` and `D_col` must have the same dtype
+- `D` and `D_col` must have the same dtype
 - `acc_dtype` must be `float32`
-- `sf_dtype=float8_e4m3fn` is incompatible with `sf_vec_size=32`
-- FP8 `c_dtype` with `vector_f32=True` is not supported
-- FP4 `ab_dtype` only supports `d_dtype ∈ {bfloat16, float32}`
-- FP8 `ab_dtype` only supports `d_dtype ∈ {float8_e4m3fn, float8_e5m2}`
+- FP4 `ab_dtype` with `sf_vec_size=16` and `d_dtype=float32` is not supported
+- FP8 `ab_dtype` with `mma_tiler_mn[1]=128` and FP8 `d_dtype` is not supported
+- FP4 `ab_dtype` is not compatible with FP8 `c_dtype`
 
 ### Scale Factor Output Requirements
 
@@ -488,7 +462,7 @@ an automatic `jax.grad` rule. Full TE training integration is separate validatio
 
 ### Shapes and Divisibility
 
-- `N` must be divisible by 32 (32-column blocks for input/gate interleaving)
+- `N` must be divisible by 64 (two consecutive 32-column blocks for SwiGLU pairing)
 - `padded_offsets` length `L` is the expert count and must be `<= 1024`
 - Each group's M dimension is aligned to `m_aligned`
 - `valid_m = padded_offsets[-1]` determines the actual tensor M dimension
@@ -502,4 +476,4 @@ an automatic `jax.grad` rule. Full TE training integration is separate validatio
 
 ## Usage Examples
 
-For usage examples, see test cases in `test/python/gemm/cutedsl/test_grouped_gemm_dswiglu.py` + `test/python/gemm/cutedsl/test_grouped_gemm_dswiglu_utils.py`
+For usage examples, see test cases in `test/python/gemm/cutedsl/test_grouped_gemm_swiglu.py` + `test/python/gemm/cutedsl/test_grouped_gemm_swiglu_utils.py`

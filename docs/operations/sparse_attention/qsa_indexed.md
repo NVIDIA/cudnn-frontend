@@ -1,7 +1,7 @@
 # Indexed QSA training
 
 These attention calls **consume existing indices**; they do not compute the
-indexer score or top-k. See [QSA entry points and the indexer](qsa.md#finding-qsa-attention-and-its-indexer)
+indexer score or top-k. See QSA entry points and the indexer ([docs](/operations/sparse_attention/qsa#finding-qsa-attention-and-its-indexer), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/sparse_attention/qsa.md#finding-qsa-attention-and-its-indexer))
 for block selection, bitmap training and the internal two-pass backend.
 
 `cudnn.ops.qsa_indexed_forward` and `qsa_indexed_backward` accept packed token
@@ -53,7 +53,7 @@ differentiated. Pass the same selection and scale to forward and backward.
 
 A GPU hash table compacts the selected starts. Backward unions adjacent queries'
 starts with owner bits, retaining each query's bounds and mask. Nonfinite K/V
-uses the device-side per-query fallback described in [QSA](qsa.md). Every call
+uses the device-side per-query fallback described in QSA ([docs](/operations/sparse_attention/qsa), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/sparse_attention/qsa.md)). Every call
 rebuilds metadata, including during CUDA Graph replay. Warm up before capture.
 
 The public wrappers allocate outputs and one workspace. The internal APIBase
@@ -112,7 +112,7 @@ The new keyword-only arguments preserve existing positional calls.
 Sparse 12Q/1KV two-pass execution requires the **CUDA 13 CuTeDSL compiler** in
 addition to CuTeDSL >= 4.7 and SM100/SM103. A CUDA 13 PyTorch build alone does
 not establish the DSL compiler version; unsupported compiler builds are
-rejected before kernel compilation. See [two-pass details](qsa_two_pass.md)
+rejected before kernel compilation. See two-pass details ([docs](/operations/sparse_attention/qsa/qsa_two_pass), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/sparse_attention/qsa_two_pass.md))
 for the bounded records and workspace sizing. At 128K, 12Q/1KV uses about
 2.487 GiB of workspace, including 0.376 GiB of reusable sparse records.
 

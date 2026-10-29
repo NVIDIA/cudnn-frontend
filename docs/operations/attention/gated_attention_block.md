@@ -68,7 +68,7 @@ the launch stream through events, overlapping the SDPA backward chain) -- see [B
   In-place bf16 / f16 only, on the dense declaration with the write-through alone or on the block-sparse DECODE mode over the pools
   (`kv_source="paged"` on a `QsaSpec` geometry, 2026-10-21: the prepare kernel's paged arms -- the raw-key pool under caller lists, the
   indexer's query + compress arms under `index_source="indexer"`; `fuse_prepare=None` is the MEASURED default there: True on cc 10.7
-  (2026-10-21: the fused step +9.6 .. +14.5 % at B <= 4 and +4.4 .. +10.0 % at B 32 over 19 decode cells, bitwise), `False` on every other
+  (2026-10-21: the fused step +9.6 .. +14.5 % at B &lt;= 4 and +4.4 .. +10.0 % at B 32 over 19 decode cells, bitwise), `False` on every other
   part until measured, and `False` out of place (`inplace_qkv=False`) on every part -- the AUTO reading is never True where an explicit
   True is declined); `fuse_norm_rope` together with it is a typed decline (pick one), as are `thd=True` and
   `kv_source="paged"` on a DENSE geometry (the prepare kernel's packed arm and the dense DECODE form's are follow-ups) and
@@ -276,7 +276,7 @@ Served today:
   takes the small-M route's 128-row swap-AB tile, 109 CTAs, so the band declaration over the pools compiles with the opt-in flag
   unset and is capture-safe like the four-band one; past 128 rows the band slab keeps the graph route.  The route reads the
   part's SM count: the 128-row tile is its overflow branch, taken where the slab's 218 64-row tiles exceed one wave -- every
-  served part (<= 212 SMs); a part with 218 or more SMs would keep the band slab on the graph route at every row count); a
+  served part (&lt;= 212 SMs); a part with 218 or more SMs would keep the band slab on the graph route at every row count); a
   geometry without the band keeps exactly its four-band tuples. Enumerate `geometry.qkvg_blocks`, never `ProjBlock` itself.
 - the loader: `qkvg_from_hf(..., index_qk_proj_weight=attn.index_qk_proj.weight)` and `build_fused_qkvg_weight(...,
   index_qk_proj_weight=)` append the band (required iff declared, refused otherwise); `qkvg_from_vllm` takes it the same way, or
@@ -501,7 +501,7 @@ publishes `decode.index_cache_dtypes == (bf16, e4m3)`; the e4m3 MAIN pool togeth
 Performance (measured 2026-10-22/23: one exclusive Rubin cc 10.7 GPU, 212 SMs at the locked clock, every arm in one process per cell, A/B/A
 CUDA-graph replay; speed-ups positive = faster): the lever of the e4m3 cache over the bf16 cache is the scorer's bytes -- +10.8 % (7.4 us)
 of the decode step at B 32 x 128K x S_q 1 (the paged scorer 23.8 -> 16.8 us), +1.6 % geomean over 13 page-16 cells, +4.6 % over the B 32
-cells, within +-1 % at B <= 4 except the two B 1 x 8K cells (-1.1 / -1.0 %: the e4m3 path's fixed cost in the small prepare / score /
+cells, within +-1 % at B &lt;= 4 except the two B 1 x 8K cells (-1.1 / -1.0 %: the e4m3 path's fixed cost in the small prepare / score /
 top-k kernels at a 0.26 MB cache, where halving the bytes buys nothing); the block over the e4m3 cache against the serving baseline's own
 fp8 indexer path +7.5 % geomean over those 13 cells; the selection exact up to ties and the cache rows bitwise the bf16 twin's cast on
 every measured cell. The e4m3 column is a different function in every table; bf16 stays the default and the reference.
@@ -811,7 +811,7 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_le
 
 A runnable version of this recipe, self-checked against torch on the record alone (the slab is `h @ W_qkvg^T`, `rstd_*` are the
 RMSNorm statistics of the pre-norm bands, `out` is `(o * sigmoid(gate)) @ W_o^T`):
-[`samples/frost/gated_attention_block/00_training_forward.py`](../../samples/frost/gated_attention_block/00_training_forward.py).
+[`samples/frost/gated_attention_block/00_training_forward.py`](../../../samples/frost/gated_attention_block/00_training_forward.py).
 
 Two **save modes**, chosen at declaration because the workspace carve differs (`execute` checks that the record agrees):
 
@@ -1141,8 +1141,8 @@ and under capture (the first execute of a fresh switched declaration, captured w
 `blk.pdl_stages` then names `sdpa_sparse` (the `sdpa` kind) beside the norm + RoPE pass, the write-through and the separate gate.  Its
 AUTO reading is `True` on cc 10.7 (`SPARSE_DECODE_PDL_DEFAULT_CCS = ((10, 7),)` since 2026-10-27: the switched caller-list block measured
 against the plain one in one process on a 212-SM cc 10.7 part -- CUDA-graph replay, the served body on each route, the lean tile at B 1 and
-the tcgen05 core at B 4 and B 32 -- read +0.6 .. +2.5 % per step at B 1 x {8K, 32K, 128K} x S_q 1 / 4, +2.4 .. +3.5 % at B 4 and
-+2.3 .. +2.7 % at B 32 x {8K, 32K, 128K} x S_q 1, +0.6 % / +3.8 % at B 4 / B 32 x 8K x S_q 4, bitwise on every cell and no cell slower than
+the tcgen05 core at B 4 and B 32 -- read +0.6 .. +2.5 % per step at B 1 x &#123;8K, 32K, 128K&#125; x S_q 1 / 4, +2.4 .. +3.5 % at B 4 and
++2.3 .. +2.7 % at B 32 x &#123;8K, 32K, 128K&#125; x S_q 1, +0.6 % / +3.8 % at B 4 / B 32 x 8K x S_q 4, bitwise on every cell and no cell slower than
 its control band; `False` on every other part until measured there, never under the in-block indexer, and `use_pdl=False` is the plain chain
 on cc 10.7), and `use_pdl=True` with `thd=True` on a `QsaSpec` geometry is a typed decline (the packed form reads the setup
 launch's metadata above every role wait). Measured on a 212-SM cc 10.7
@@ -1339,7 +1339,7 @@ and the stage adds the scorer and the top-k -- eight kernels on the whole step w
 top-k, the sparse tile, the combine, the out projection and its split-K reducer); under `False` the norm + RoPE pass, the pool-1
 query compress, the step compress (`frost_qsa_compress_step`) and the K / V write-through run as their own launches -- eleven;
 `None` is the MEASURED default (`serving_envelope(...).decode.fuse_prepare_default`: True on cc 10.7 -- the 2026-10-21 end-to-end
-gate on an exclusive 212-SM part measured the fused step +9.6 .. +14.5 % faster at B <= 4 and +4.4 .. +10.0 % at B 32 over 19 decode cells,
+gate on an exclusive 212-SM part measured the fused step +9.6 .. +14.5 % faster at B &lt;= 4 and +4.4 .. +10.0 % at B 32 over 19 decode cells,
 bitwise --, `False` on every other part until measured, and `False` out of place -- `inplace_qkv=False` -- on every part: the AUTO reading is
 never True where an explicit True is declined); every output, the ring and the cache are BITWISE between the two readings.  `index_state_slot_mapping_present=True`
 takes the ring's write rows from `execute(index_state_slot_mapping=)` (`block x cap + pos % cap`, `-1` on a dead row; int32 or
@@ -2063,10 +2063,10 @@ decode ignores the policy: 32/2 -0.0 %, 64/8 -0.3 %), so NATURAL stays.
 
 - The SDPA epilogue gate is also reachable through the **graph API**: an `sdpa` node followed by `sigmoid` and
   `mul` pointwise nodes on `O` is served fused by the Rubin d256 FROST SDPA engines — see
-  [Attention](../operations/Attention.md), "Fused epilogue gate".
+  [Attention](/operations/Attention), "Fused epilogue gate".
 - How the block is composed (workspace, streams, fusion knobs, typed declines) and how to build the next one:
-  [Composing multi-kernel blocks in Python](../utilities/composing_kernel_blocks.md).
-- The MLA sibling of the fused projection epilogue: [GEMM + RoPE + MXFP8 Projection](gemm_fusions/gemm_proj_rope_mxfp8.md).
+  [Composing multi-kernel blocks in Python](/utilities/composing_kernel_blocks).
+- The MLA sibling of the fused projection epilogue: [GEMM + RoPE + MXFP8 Projection](/operations/Matmul/gemm_fusions/gemm_proj_rope_mxfp8).
 - Tests: `test/python/gated_attention_block/cutedsl/` (layout contract, reference oracle, end to end, FP8, MXFP8,
   fp4 weights / fp4 O (`test_block_fp4.py`, `test_proj_gemm_fp4.py`, `test_quantize_fp4.py`) and their backward
   (`test_block_backward_fp4.py`), packed sequences

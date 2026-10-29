@@ -1719,7 +1719,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             for any framework other than torch. Every returned tensor keeps its usual shape and
             dtype -- the slot workspaces and the fixed-order reductions into them are internal to
             this wrapper. ``None`` (default) follows ``torch.use_deterministic_algorithms``.
-            See docs/fe-oss-apis/gemm_fusions/grouped_gemm_dsrelu.md#deterministic-dprob.
+            See docs/operations/gemm_fusions/grouped_gemm_dsrelu.md#deterministic-dprob.
         current_stream: CUDA stream
 
     Returns:

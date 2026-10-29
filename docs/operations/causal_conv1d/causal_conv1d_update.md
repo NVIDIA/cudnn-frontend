@@ -10,7 +10,7 @@ short convolution used by GDN/KDA-style linear-attention blocks. Compilation,
 architecture dispatch, output ownership, streams, and kernel schedules remain
 private implementation details.
 
-Use [`cudnn.ops.causal_conv1d`](causal_conv1d.md) for full-sequence prefill or
+Use [`cudnn.ops.causal_conv1d`](/operations/CausalConv1d/causal_conv1d) for full-sequence prefill or
 training. Its width-four final state can be passed directly to this operation.
 
 Without circular-buffer metadata, row `n`, channel `d`, and selected cache

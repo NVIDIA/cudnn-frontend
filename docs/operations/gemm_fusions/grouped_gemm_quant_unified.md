@@ -304,7 +304,7 @@ operands on each call. D is fresh unless supplied through `d_tensor` or
 prepared configuration. A D supplied during preparation must be passed again
 at execution. `reuse_row_outputs` applies only to GLU.
 
-The shared [prepared execution contract](grouped_gemm_glu.md#prepared-execution)
+The shared [prepared execution contract](/operations/Matmul/gemm_fusions/grouped_gemm_glu#prepared-execution)
 requires fixed metadata/configuration apart from M, a separate plan per stream, and the
 preparation stream current during every call. `check=False` is only for callers
 that enforce those invariants themselves.
@@ -321,6 +321,6 @@ must preserve its optional presence.
 Omitting the counter retains internal initialization. Supplying it bypasses
 the counter-initialization launch, so callers may combine the reset with
 existing preparation work. The same contract applies to prepared calls;
-see [counter ownership](grouped_gemm_glu.md#caller-owned-scheduler-counter).
+see [counter ownership](/operations/Matmul/gemm_fusions/grouped_gemm_glu#caller-owned-scheduler-counter).
 Detect support with
 `grouped_gemm_quant_wrapper_sm100.supports_external_scheduler_counter`.

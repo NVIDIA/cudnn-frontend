@@ -2,7 +2,7 @@
 
 **This is an experimental API and subject to change.**
 
-**Legacy dense-only API note:** This page documents the older dense-only grouped quant API. For new integrations, prefer the unified [Grouped GEMM + Quant (Unified)](grouped_gemm_quant_unified.md) page.
+**Legacy dense-only API note:** This page documents the older dense-only grouped quant API. For new integrations, prefer the unified [Grouped GEMM + Quant (Unified)](/operations/Matmul/gemm_fusions/grouped_gemm_quant_unified) page.
 
 ## JAX support
 

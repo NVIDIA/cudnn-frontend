@@ -206,14 +206,14 @@ def block_sparse_attention_forward(
     block.  This wrapper only dispatches to Python CuTe DSL kernels; the former
     SM100 C++/AOT extension is intentionally not part of this package.
 
-    Sparse metadata values are a caller contract; see the "Sparse metadata"
-    section of ``docs/fe-oss-apis/bsa.md`` for the required value ranges.
+    Callers must satisfy the "Sparse metadata" value ranges in
+    ``docs/operations/sparse_attention/bsa.md``.
 
     ``kpage`` selects the SM100/SM103 blk128 KPage kernels, which gather the
     valid 16-row pages of partially occupied K/V blocks into full MMA tiles.
     Pass ``True`` to build the page layout from the metadata on this call, or
     a :class:`KPageLayout` from :func:`kpage_prepare_layout` to reuse one.
-    See "KPage" in ``docs/fe-oss-apis/bsa.md`` for the contract.
+    See "KPage" in ``docs/operations/sparse_attention/bsa.md`` for the contract.
     """
 
     batch, num_q_heads, num_kv_heads, seqlen_q, seqlen_k, head_dim, value_dim = _canonical_shapes(q_tensor, k_tensor, v_tensor, layout)
@@ -471,8 +471,8 @@ def block_sparse_attention_backward(
 ) -> TupleDict:
     """Compute explicit dQ, dK, and dV for block-sparse attention.
 
-    Sparse metadata values are a caller contract; see the "Sparse metadata"
-    section of ``docs/fe-oss-apis/bsa.md`` for the required value ranges.
+    Callers must satisfy the "Sparse metadata" value ranges in
+    ``docs/operations/sparse_attention/bsa.md``.
 
     ``kpage`` selects the KPage backward (see ``block_sparse_attention_forward``);
     it takes ``block_sizes`` and requires ``do_tensor`` to be zero on padding

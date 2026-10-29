@@ -18,7 +18,7 @@ The softmax is normalized once over all valid tokens in the selected blocks.
 `block_sizes` can shorten individual key/value blocks so that padded tokens do
 not participate in the softmax.
 
-Unlike [NSA Selection Attention](nsa.md#1-selection-attention), BSA supplies one
+Unlike [NSA Selection Attention](/operations/sparse_attention/nsa#1-selection-attention), BSA supplies one
 list of key/value blocks per **query block**. NSA Selection supplies routing
 metadata at query-token granularity and is one component of the larger NSA
 pipeline.

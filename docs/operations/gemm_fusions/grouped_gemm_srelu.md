@@ -76,7 +76,7 @@ a few elements in $5\times10^{5}$. This does not affect the unclamped path, wher
 a reference both evaluate $\mathrm{relu}(x)^2$ and therefore quantize identically.
 
 The matching backward kernel takes the same `tanh_clamp_scale` -- see
-[grouped_gemm_dsrelu](grouped_gemm_dsrelu.md). Both must be built with the same `s`, or the saved
+[grouped_gemm_dsrelu](/operations/Matmul/gemm_fusions/grouped_gemm_dsrelu). Both must be built with the same `s`, or the saved
 pre-activation is differentiated against the wrong nonlinearity.
 
 `D_col` stores the same logical output in the column-quantized path used by the grouped kernel family. When `D` is FP8, the kernel also emits `SFD_row` and `SFD_col`. When `D` is fp16/bf16, the kernel can emit per-expert `Amax`.

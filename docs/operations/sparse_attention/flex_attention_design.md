@@ -2,7 +2,7 @@
 
 This document describes the interval-mask planner and kernel protocols used by
 `cudnn.flex_attention`.
-For public APIs and examples, see [Flex Attention](flex_attention.md).
+For public APIs and examples, see [Flex Attention](/operations/sparse_attention/flex_attention).
 
 Implementation entry points in this repository:
 

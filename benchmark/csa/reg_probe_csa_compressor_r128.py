@@ -7,7 +7,7 @@ JIT-compiles the full shipped dispatch envelope — every (config, schedule) pai
 ``nb_total`` bucket tables can select, forward and backward, over coff {1, 2} x
 head_dim {128, 512} (16 kernels) — then runs ``ptxas -v`` on each kernel's PTX and
 prints a table of registers / spill bytes / stack bytes / ex2.approx count. This
-reproduces the register table published in docs/fe-oss-apis/csa.md.
+reproduces the register table published in docs/operations/sparse_attention/csa.md.
 
 Exits nonzero if any kernel spills, uses stack, fails ptxas, or exposes no PTX
 (PTX retention off).

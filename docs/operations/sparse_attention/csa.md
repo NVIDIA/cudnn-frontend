@@ -5,7 +5,7 @@
 ## Overview
 
 The CSA module hosts CuTe-DSL kernels for the CSA/HCA experimental attention variants
-(the components that are not shared with the [DSA module](dsa.md)). Its first operation
+(the components that are not shared with the [DSA module](/operations/sparse_attention/dsa)). Its first operation
 is the **fused Compressor**: one forward and one backward kernel for the `Compressor`
 gated-softmax pooling region (THD packed layout) used by CSA/HCA in Megatron-LM.
 

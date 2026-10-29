@@ -536,7 +536,7 @@ o_gated.set_output(True).set_dim(o_dims).set_stride(o_strides).set_data_type(cud
 ```
 
 The same fusion is reachable without the graph API through the
-[gated attention block](../fe-oss-apis/gated_attention_block.md) (`fuse_gate=True`).
+[gated attention block](/operations/Attention/gated_attention_block) (`fuse_gate=True`).
 
 #### Tensors
 ##### Input Tensors
@@ -841,14 +841,14 @@ dV.set_output(True).set_dim(v_gpu.shape).set_stride(v_gpu.stride())
 
 ### Block Sparse Attention FE OSS API
 
-The experimental [Block Sparse Attention API](../fe-oss-apis/bsa.md) provides
+The experimental [Block Sparse Attention API](/operations/sparse_attention/bsa) provides
 CuTe DSL forward and explicit backward kernels driven by per-query-block lists
 of selected key/value blocks. It is a standalone Python FE OSS API and is
 separate from the cuDNN Graph API described above.
 
 ### HSTU Attention FE OSS API (SM100/SM103)
 
-The experimental [HSTU Attention API](../fe-oss-apis/hstu/hstu_attention.md)
+The experimental [HSTU Attention API](/operations/sparse_attention/hstu_attention)
 provides packed-variable-length forward and backward CuTe DSL kernels for
 Blackwell SM100/SM103 GPUs. HSTU applies SiLU to scaled QK scores without
 softmax, supports its specialized mask modes, and exposes the sequence
@@ -859,7 +859,7 @@ Q-to-K and K-to-Q views from one coarse classification.
 
 ### Gated Attention Block FE OSS API (SM107)
 
-The experimental [Gated Attention Block API](../fe-oss-apis/gated_attention_block.md) is a model-level FE OSS
+The experimental [Gated Attention Block API](/operations/Attention/gated_attention_block) is a model-level FE OSS
 API for NVIDIA Rubin (SM107): the QKV+gate projection, QK-RMSNorm (optional) with partial RoPE, GQA SDPA,
 sigmoid gate and out projection of a Qwen3.5-style gated attention sub-layer behind one class, one workspace
 and one `execute()`, every stage a FROST kernel. It runs bf16 / fp16, per-tensor FP8 and MXFP8 -- the MXFP8

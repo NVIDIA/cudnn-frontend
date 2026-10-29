@@ -336,7 +336,7 @@ def sparse_indexer_score_recompute_wrapper(
     omitted. All of it runs on ``stream``.
 
     ``topk_length`` does not replace the ``-1`` padding: slots at and past
-    ``topk_length[row]`` must still hold ``-1`` (docs/fe-oss-apis/dsa.md,
+    ``topk_length[row]`` must still hold ``-1`` (docs/operations/sparse_attention/dsa.md,
     "Compact vs. non-compact sparse indices").
     """
     with _torch_stream_context(stream):
@@ -520,7 +520,7 @@ def sparse_attn_score_recompute_wrapper(
     ``topk_length`` does not replace the ``-1`` padding: slots at and past
     ``topk_length[row]`` must still hold ``-1``, because the SM100 kernel may
     ignore ``topk_length`` and skip slots by index value (issue #1549; see
-    docs/fe-oss-apis/dsa.md, "Compact vs. non-compact sparse indices").
+    docs/operations/sparse_attention/dsa.md, "Compact vs. non-compact sparse indices").
     """
     with _torch_stream_context(stream):
         q_attn, k_attn, lse = (maybe_contiguous(t, stream) for t in (q_attn, k_attn, lse))
