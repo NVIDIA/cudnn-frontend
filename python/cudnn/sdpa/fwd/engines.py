@@ -803,9 +803,9 @@ def rubin_dense_d128_shared_leg(capabilities: Capabilities, facts: "ga.SdpaGraph
     at CGA1 and native SM107 prefill for packed CGA2. The historical predicate name and admission limits
     are retained for policy consumers. Twin of SdpaFwdDslSm100._rubin_shared_dense_leg; keep the gates in lockstep.
 
-    ``knobs``: the request being validated, when there is one -- on the d64 envelope the flavor depends on it (the row's
-    native 64-wide tile carries the dense leg only, so a PackGQA or split request walks past it onto (128, 128) and the
-    shared bodies; a knob-less d64 graph selects the native tile and is not a shared leg)."""
+    ``knobs`` identifies the selected flavor. Native D64 dense and PackGQA plans
+    use their own tile; a split request can still select D128 and this shared
+    leg. A knob-less D64 graph selects the native tile and is not a shared leg."""
     return (
         capabilities.sm_lo == 107
         and not (facts.is_fp8 or facts.is_mxfp8)

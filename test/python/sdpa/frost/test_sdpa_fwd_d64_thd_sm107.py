@@ -64,6 +64,7 @@ def test_native_d64_ragged_replay(dtype, cga, packed, stats_layout, tile_n, sche
         ((48, 32), "partial_window", 64, 1, True),
         ((24, 16), "keyless_no_sink", 128, 1, False),
         ((64, 64), "mha", 64, 0, True),
+        pytest.param((64, 64), "mha", 64, 1, True, id="mha_lpt"),
     ],
 )
 def test_native_d64_dense_pack_replay(dtype_name, cga, head_dims, geometry, tile_n, scheduler, with_stats):
