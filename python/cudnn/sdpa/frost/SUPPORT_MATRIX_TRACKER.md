@@ -2641,7 +2641,7 @@ on the 80-wide tile.
 
 Engines: `sdpa_fwd_prefill_sm80`, `sdpa_bwd_sm80`. Both use `mma.sync` (no
 tcgen05) and assume the A100's 164 KiB opt-in SMEM — sm86/sm89 are declined.
-The backward serves packed THD graphs (ᵏ); the forward serves native-flavor packed THD graphs
+The backward serves packed THD graphs (ᵏ); the forward serves packed THD graphs
 with per-batch or cumulative Q/KV lengths, token-major Q/K/V/O with independent
 8-element-aligned head/token strides (padding and gaps allowed), and packed
 head-major or token-major Stats. The head dimension is contiguous, head rows and
@@ -2709,7 +2709,7 @@ do-dot, optional dSink, the selected backward kernel, dQ conversion, GQA
 reductions and auxiliary output copies. All stages use the current caller
 stream; graph and standalone execution share the binding validator. Native
 plans require caller workspace and do not build tensor views at execute.
-Native-flavor THD graph/direct-adapter plans use the same binder and a packed
+THD graph/direct-adapter plans throughout the aligned width envelope use the same binder and a packed
 host chain, including device length-to-prefix setup. Packed capacities are
 runtime host arguments; workspace views and offsets are formed from those
 capacities without specializing the artifact on them. A fresh plan with the
@@ -2735,13 +2735,9 @@ token-major Q/K/V/O with aligned, non-overlapping head/token strides, natural
 scheduling, and no bias, sink, or RoPE fusion.
 The graph path does not run the standalone wrapper's output-capacity initialization.
 
-Standalone packed forward/backward wrappers share prepared bitwise data copies
-for their existing head-width padding, backward compaction and output trimming.
-One fused copy handles the selected operands; native operands bind directly.
-The bounded wrapper allocation-recipe memo contains only host metadata, while
-compiled copy artifacts specialize on head/width geometry and bind Int64 token
-capacities, strides and addresses per call. The former Torch padding helpers
-are removed. Packed forward initializes O and Stats together inside its prepared
+Standalone packed forward/backward wrappers bind logical widths and independent
+data strides directly, with no padding, compaction or trimming copies.
+Packed forward initializes O and Stats together inside its prepared
 host; packed backward combines its existing dQ/GQA-gradient capacity zeroing with
 workspace initialization. MHA dK/dV and direct graph-output tails retain their
 previous write contract. Initialization capacities and offset products stay Int64.
@@ -2786,11 +2782,12 @@ counter are bounded by the envelope `S_max` (short tiles early-out; no length is
 read on the host); the dQ cast and the dK/dV fold stop at `cu_*[B]` on device and
 write the caller's head dim, so nothing past the packed total is ever written into
 the caller's gradients (the ragged sweeps assert this with a NaN-filled tail). Served under THD: the causal family, GQA/MQA, sinks/dSink,
-deterministic dQ, head-dim envelope padding (carved staging at the packed
-capacities), zero-length and one-sided-empty sequences. Bias/dBias is dense-only (a packed graph has no `[B, H, S_q, S_kv]` bias); RoPE is a
-wrapper-only fusion no engine row admits. The SM80 forward row now serves
-native-flavor, strided packed THD with Q/KV lengths; its dense head-dim
-envelope and fused bias/sinks remain unavailable to THD.
+deterministic dQ, native eight-aligned head widths within the flavor envelope,
+zero-length and one-sided-empty sequences. Bias/dBias is dense-only (a packed
+graph has no `[B, H, S_q, S_kv]` bias); RoPE is declined. The SM80 forward row
+serves strided packed THD with Q/KV lengths throughout the same aligned
+head-width envelope as dense forward; fused bias/sinks remain unavailable to
+THD graphs.
 
 ---
 

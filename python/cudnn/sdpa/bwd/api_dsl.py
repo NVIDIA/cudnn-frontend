@@ -906,6 +906,7 @@ def _sm80_thd_backward(
             assert int(hint) > 0, f"{label} must be > 0; got {hint}"
 
     from cudnn.sdpa.native_sm80 import data_layout_mismatch
+    from cudnn.sdpa.graph_analyzer import thd_stats_packing
 
     for name, tensor, tokens, heads, width in (
         ("q", q, t_q, h_q, d_qk),
@@ -936,12 +937,15 @@ def _sm80_thd_backward(
         if lse.dtype != torch.float32 or lse.device != dev or tuple(lse.shape) != (1, h_q, t_q):
             raise ValueError("SM80 THD Stats must be float32 [1,Hq,Tq] on Q's device")
         lse_t = lse
-        if tuple(lse_t.shape) == (1, h_q, t_q) and lse_t.stride(1) == 1 and lse_t.stride(2) == h_q:
+        # A singleton head's pitch is never stepped, including a zero stride.
+        stride_h = lse_t.stride(1) if h_q > 1 else t_q
+        packing = thd_stats_packing(stride_h, lse_t.stride(2), h_q)
+        if packing == "token_major":
             # Reuse the graph chain's existing compact token-major Stats ABI.
             # This is a view of the caller's storage, not a layout conversion.
             lse_t = lse_t[0].transpose(0, 1)
             stats_token_major = True
-        elif lse_t.stride(2) == 1 and (h_q == 1 or lse_t.stride(1) >= t_q):
+        elif packing == "head_major" and stride_h >= t_q:
             stats_head_stride = int(lse_t.stride(1)) if h_q > 1 and lse_t.stride(1) != t_q else 0
         else:
             raise NotImplementedError("SM80 THD Stats requires native head-major or compact token-major storage")

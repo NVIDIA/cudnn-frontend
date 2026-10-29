@@ -636,7 +636,7 @@ def test_graph_thd_head_dim_envelope(d, accepted):
     if accepted:
         assert reason is None
     else:
-        assert reason is not None and "8" in reason
+        assert reason is not None and "multiples of 8" in reason
 
 
 @pytest.mark.parametrize("sched_policy", (fwd_engines.SCHED_LPT, fwd_engines.SCHED_LPT_L2))
