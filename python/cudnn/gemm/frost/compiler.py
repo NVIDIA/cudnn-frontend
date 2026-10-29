@@ -25,7 +25,7 @@ from cudnn.frost.workspace import Workspace
 from .arch_family import active_family
 from .dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS, _pow2_floor, tensor_alignment
 from .fusion_ir import FusionChain, MoeSwapAbSpec, TensorRef, segmented_row_scale_capacity_rows
-from .recipe import REDUCTION_INIT_VALUE, _output_rule, contiguous_modulus, expected_shape
+from .recipe import AX_MN, REDUCTION_INIT_VALUE, _output_rule, contiguous_modulus, expected_shape
 
 
 class _RuntimeConfig(Protocol):
@@ -978,6 +978,35 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         if not self.config.workspace_split_k:
             return 0
         return backend.align_up(self.config.split_k_slices * batch * m * n * 4)
+
+    # The partials span the call's M and N, which the launch path reads off A and B.
+    # Output 0 is no stand-in: a graph whose only outputs are reductions has a reduction there.
+    def workspace_bytes_for_operands(self, operands, graph_order=None) -> int:
+        """workspace for one call's A and B buffers, in the axis order the launch path reads."""
+        r = self.recipe
+        if r is None:
+            return self.workspace_bytes
+        mn = []
+        for op in (r.a, r.b):
+            v = operands[op.index]
+            sh = v.shape
+            axes = op.axes(sh, v.stride(), bool(graph_order) and graph_order[op.index]) if len(sh) == 3 else None
+            if axes is None:
+                return 0  # the launch path refuses this layout before it reads the workspace
+            mn.append(int(sh[axes[AX_MN]]))
+        return self.workspace_bytes_for(r.batch, *mn)
+
+    def workspace_bytes_for_overrides(self, override_uids, override_shapes) -> int:
+        """workspace for an override-shape call: A and B dims it names (graph order), else the plan's."""
+        r = self.recipe
+        if r is None:
+            return self.workspace_bytes
+        dims = dict(zip(override_uids or (), override_shapes or ()))
+        mn = []
+        for op, planned in ((r.a, self.chain.matmul.M), (r.b, self.chain.matmul.N)):
+            shape = dims.get(self.bound[op.index].get_uid())
+            mn.append(planned if shape is None or len(shape) != 3 else int(shape[op.declared[AX_MN]]))
+        return self.workspace_bytes_for(r.batch, *mn)
 
     recipe: Any = field(default=None, init=False, repr=False, compare=False)
     lowered: Any = field(default=None, init=False, repr=False, compare=False)

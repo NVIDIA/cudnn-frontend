@@ -13,7 +13,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from gemm_test_utils import requires_sm100
+from gemm_test_utils import requires_sm100, requires_sm120
 
 import cudnn
 from cudnn.engines import MANIFEST, is_backend_engine, is_python_engine
@@ -226,6 +226,93 @@ def test_override_shape_frost(case):
         )
         torch.cuda.synchronize()
         torch.testing.assert_close(c2, ref, atol=0, rtol=0)
+
+
+def _reduced_dim(reduced, m, n):
+    return [1, m, 1] if reduced == "row" else [1, 1, n]
+
+
+def _build_amax_only_uids(m, n, k, reduced):
+    """bf16 matmul -> AMAX as the graph's ONLY output (uids 1, 2, 3): output 0 is
+    the reduction ([1, m, 1] or [1, 1, n]), not the [1, m, n] the split-K partials span."""
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", uid=1, dim=[1, m, k], stride=[m * k, k, 1], data_type=cudnn.data_type.BFLOAT16)
+    B = g.tensor(name="B", uid=2, dim=[1, k, n], stride=[k * n, 1, k], data_type=cudnn.data_type.BFLOAT16)
+    R = g.reduction(input=g.matmul(A=A, B=B, name="mm"), mode=cudnn.reduction_mode.AMAX, name="amax")
+    dim = _reduced_dim(reduced, m, n)
+    R.set_dim(dim).set_stride([dim[1] * dim[2], dim[2], 1])
+    R.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_uid(3)
+    return g
+
+
+@requires_sm120
+@pytest.mark.parametrize(("reduced", "swap_ab"), [("row", False), ("col", True)], ids=("row", "col_swap_ab"))
+def test_sm120_splitk_reduction_only_workspace_follows_a_and_b(reduced, swap_ab):
+    """A split-K plan writes S*B*M*N fp32 partials whatever its outputs are, so
+    the override-shape workspace query and execute's pre-check size them from
+    the A and B extents. Output 0 cannot stand in: a graph whose only output is
+    a reduction has the reduction there (it under-reported by N or M), and an
+    override that leaves it unchanged (only A at a new M) fell back to the
+    plan's own size."""
+    from dataclasses import replace
+
+    from cudnn.gemm.frost.knobs import GemmKnobs
+    from cudnn.gemm.frost.tile_config import by_name
+
+    h = cudnn.create_handle()
+    m0, n0, k, slices = 128, 256, 1024, 2
+    g = _build_amax_only_uids(m0, n0, k, reduced)
+    _plan(g)
+    engine_id, _ = g.get_engine_and_knobs_at_index(_index_of(g, _FROST))
+    config = replace(by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"), split_k_slices=slices, swap_ab=swap_ab)
+    g.create_execution_plan(engine_id, GemmKnobs.from_config(config).to_public())  # pinned, not the heuristic's pick
+    index = g.get_execution_plan_count() - 1
+    g.select_plan(index)
+    g.check_support()
+    _build_plans_or_skip(g)
+    assert g.get_workspace_size() == slices * m0 * n0 * 4
+
+    for m, n in ((m0, n0), (2 * m0, n0), (m0, 2 * n0)):
+        need = slices * m * n * 4
+        dim = _reduced_dim(reduced, m, n)
+        uids = [1, 2, 3]
+        shapes = [[1, m, k], [1, k, n], dim]
+        strides = [[m * k, k, 1], [k * n, 1, k], [dim[1] * dim[2], dim[2], 1]]
+        assert g.get_workspace_size(h, uids, shapes, strides) == need
+        assert g.get_workspace_size_plan_at_index(index, h, uids, shapes, strides) == need
+        if reduced == "col" and n == n0:  # the reduction keeps its shape: A alone carries the new M
+            assert g.get_workspace_size(h, uids[:1], shapes[:1], strides[:1]) == need
+
+        a = torch.empty(1, m, k, dtype=torch.int32).random_(-2, 3).to(torch.bfloat16).cuda()
+        b = torch.empty(1, n, k, dtype=torch.int32).random_(-2, 3).to(torch.bfloat16).cuda()
+        ref = torch.einsum("bmk,bnk->bmn", a.float(), b.float()).abs().amax(dim=2 if reduced == "row" else 1, keepdim=True)
+        overrides = dict(handle=h, override_uids=uids, override_shapes=shapes, override_strides=strides)
+
+        # A buffer of exactly the reported size runs, with A and B as tensors or as bare
+        # addresses (which borrow the graph's axis order); one 128 bytes short is refused
+        # before the reduction output is seeded.
+        out = torch.full(dim, float("nan"), dtype=torch.float32, device="cuda")
+        ws = torch.empty(need, dtype=torch.uint8, device="cuda")
+        for x, y in ((a, b), (a.data_ptr(), b.data_ptr())):
+            out.fill_(float("nan"))
+            g.execute({1: x, 2: y, 3: out}, ws, **overrides)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(out, ref, atol=0, rtol=0)
+        out.fill_(float("nan"))
+        with pytest.raises(ValueError, match=f"needs a {need}-byte workspace"):
+            g.execute({1: a, 2: b, 3: out}, ws[: need - 128], **overrides)
+        assert out.isnan().all()
+
+        # A raw address carries no capacity to check: kernel 1 must stay inside the reported size.
+        arena = torch.full((need + 4096,), 0xAB, dtype=torch.uint8, device="cuda")
+        g.execute({1: a, 2: b, 3: out}, arena.data_ptr(), **overrides)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, ref, atol=0, rtol=0)
+        assert (arena[need:] == 0xAB).all()
 
 
 @_GPU
