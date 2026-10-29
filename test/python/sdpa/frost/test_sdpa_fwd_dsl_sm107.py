@@ -909,12 +909,10 @@ def test_sm107_f16_thd_is_served_on_every_flavor():
     caps = _caps("sdpa_fwd_prefill_sm107")
     assert caps.thd is True
     assert caps.thd_d_shapes is SM107_F16_THD_SHAPES
-    assert (
-        SM107_F16_THD_SHAPES < caps.d_shapes and caps.d_shapes - SM107_F16_THD_SHAPES == SM107_F16_SMALL_D_SHAPES
-    ), "THD = every f16 shape but the small tiles"
+    assert SM107_F16_THD_SHAPES < caps.d_shapes and caps.d_shapes - SM107_F16_THD_SHAPES == {(32, 32)}, "THD = every f16 shape except D32"
     for d_qk, d_v in sorted(SM107_F16_THD_SHAPES):
         assert engines.mismatch(caps, _f16_facts(thd=True, padded=True, d_qk=d_qk, d_v=d_v)) is None, (d_qk, d_v)
-    for d_qk, d_v in sorted(SM107_F16_SMALL_D_SHAPES):
+    for d_qk, d_v in sorted(SM107_F16_SMALL_D_SHAPES - SM107_F16_THD_SHAPES):
         why = engines.mismatch(caps, _f16_facts(thd=True, padded=True, d_qk=d_qk, d_v=d_v))
         assert why is not None and "THD" in why, (d_qk, d_v, why)
 
