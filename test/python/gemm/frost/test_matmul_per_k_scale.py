@@ -14,6 +14,7 @@ import cudnn
 import pytest
 import torch
 
+from cudnn.frost.buffers import DeviceView, dtype_name
 from cudnn.gemm.frost.fusion_ir import Axis, TensorRef, swap_ab
 from cudnn.gemm.frost.graph_analyzer import analyze, analyze_with_binding, swap_ab_binding
 from cudnn.gemm.frost.kernel_registry import select_template
@@ -252,6 +253,27 @@ def test_frost_per_k_binding_lifecycle(monkeypatch, side, swapped):
         assert launches[-1][0][:3] == ((n, m, k) if swapped else (m, n, k))
         for arg, ref in zip(launches[-1][4:], plan.chain.aux_tensors):
             assert arg.shape[ref.k_axis] == k
+    assert len(launches) == 2
+
+
+@pytest.mark.parametrize("side", ["a", "b", "ab"])
+@pytest.mark.parametrize("swapped", [False, True])
+def test_frost_per_k_device_view_binding(monkeypatch, side, swapped):
+    """Per-K binding accepts zero-copy views with a tuple-only stride API."""
+    g, tensors = _graph(side=side)
+    plan, launches = _mock_plan(monkeypatch, g, swapped)
+    for m, n, k in ((128, 128, 136), (160, 192, 264)):
+        buffers = _buffers(tensors, m, n, k)
+        views = dict(buffers)
+        for key in (key for key in tensors if key.startswith("scale_")):
+            scale = buffers[key]
+            # Keep the backing tensor alive: DeviceView owns no allocation.
+            views[key] = DeviceView(scale.data_ptr(), scale.shape, dtype_name(scale), 0)
+        plan(_pack(tensors, views))
+        assert launches[-1][0][:3] == ((n, m, k) if swapped else (m, n, k))
+        for arg, ref in zip(launches[-1][4:], plan.chain.aux_tensors):
+            assert arg.shape[ref.k_axis] == k
+            assert any(arg.data_ptr() == views[key].data_ptr() for key in tensors if key.startswith("scale_"))
     assert len(launches) == 2
 
 

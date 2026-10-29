@@ -456,6 +456,10 @@ def _aux_fake_real_axes(ref: TensorRef) -> list[bool]:
 
 def _swap_mn_view(t: object) -> object:
     """Transpose the logical M/N axes without moving the runtime storage."""
+    # A contiguous DeviceView needs no strided transpose when one axis is unit,
+    # as for per-K scales. Its reshape preserves the pointer and owns no memory.
+    if isinstance(t, buffers.DeviceView) and len(t.shape) == 3 and 1 in t.shape[1:]:
+        return t.reshape(t.shape[0], t.shape[2], t.shape[1])
     if len(t.shape) == 3:
         return t.permute(0, 2, 1)
     if len(t.shape) == 2:

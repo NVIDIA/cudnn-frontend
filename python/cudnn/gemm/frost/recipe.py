@@ -127,7 +127,7 @@ class PerKScaleRule:
         expected = (1, 1, k) if self.axis == 2 else (1, k, 1)
         if tuple(buffer.shape) != expected:
             raise ValueError(f"per-K mainloop scale {self.name!r}: expected shape {expected}, got {tuple(buffer.shape)}")
-        if buffer.stride(self.axis) != 1:
+        if buffer.stride()[self.axis] != 1:
             raise ValueError(f"per-K mainloop scale {self.name!r}: K axis {self.axis} must have unit stride")
         if dtype_name(buffer) != self.dtype:
             raise ValueError(f"per-K mainloop scale {self.name!r}: expected dtype {self.dtype}, got {dtype_name(buffer)}")
