@@ -2945,6 +2945,37 @@ def test_sm120_moe_block_scale_render_smoke(combo: str, mode: str) -> None:
         assert "moe_scatter_row(token_index, token_ks" in src
 
 
+# Explicit (non-catalog) tiles with a CTA extent above the 256-element TMA box dimension.
+_SM120_BS_512x16 = "CONFIG_sm120_512x16x128_16x16x32_cluster1x1_warps8x1"
+_SM120_BS_32x384 = "CONFIG_sm120_32x384x128_16x16x32_cluster1x1_warps1x8"
+
+
+def test_sm120_moe_block_scale_k_major_tile_fits_one_tma_box() -> None:
+    """The sm120 MoE block-scale templates load a K-major token or weight as one
+    [cta_k, CTA extent] TMA box per stage, as the dense one does: above 256 rows
+    the host stub's descriptor encode aborts the process at launch, so the
+    geometry gate declines the tile in both kernel orientations. A GATHER token
+    is loaded one [cta_k, 1] box per routed row and keeps its wide tile; the
+    weight beside it is still one box."""
+    from cudnn.gemm.frost.fusion_ir import swap_ab
+    from cudnn.gemm.frost.sm120 import compiler as C120
+
+    wide_m, wide_n = by_name(_SM120_BS_512x16), by_name(_SM120_BS_32x384)
+    chain = analyze(_build_graph(2, 1024, 384, 256, num_groups=4, combo="mxfp8"))
+    for kernel_chain in (chain, swap_ab(chain)):  # A, B = token, weight; then weight, token
+        with pytest.raises(NotImplementedError, match="cta_tile_m=512 exceeds the TMA box_dim ceiling of 256"):
+            C120._check_block_scale_geometry(kernel_chain, wide_m)
+        with pytest.raises(NotImplementedError, match="cta_tile_n=384 exceeds the TMA box_dim ceiling of 256"):
+            C120._check_block_scale_geometry(kernel_chain, wide_n)
+    gather = analyze(_build_graph(2, 137, 128, 544, 6, combo="mxfp8", gather_rows=259))
+    C120._check_block_scale_geometry(gather, by_name("CONFIG_sm120_384x16x128_16x16x32_cluster1x1_warps8x1"))
+    C120._check_block_scale_geometry(swap_ab(gather), wide_n)
+    with pytest.raises(NotImplementedError, match="cta_tile_n=384 exceeds the TMA box_dim ceiling of 256"):
+        C120._check_block_scale_geometry(gather, wide_n)
+    with pytest.raises(NotImplementedError, match="cta_tile_m=512 exceeds the TMA box_dim ceiling of 256"):
+        C120._check_block_scale_geometry(swap_ab(gather), wide_m)
+
+
 @pytest.mark.parametrize("cfg_name", _SM120_BS_CFGS, ids=lambda n: n.removeprefix("CONFIG_sm120_"))
 @pytest.mark.parametrize(
     "offsets_list",
@@ -2977,6 +3008,24 @@ def test_e2e_fp4_rejects_n_major_weight_sm120() -> None:
     g = _build_graph(2, 512, 256, 512, num_groups=2, combo="nvfp4", weight_major="n")
     with pytest.raises(ValueError, match="must be K-major"):
         _plan(g, config=by_name(_SM120_BS_CFG))
+
+
+@requires_sm120
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["fwd", "swap_ab"])
+@pytest.mark.parametrize("config_name", [_SM120_BS_512x16, _SM120_BS_32x384], ids=["m512", "n384"])
+def test_sm120_moe_block_scale_wide_k_major_tile_declines_before_compile(config_name, swap_ab, monkeypatch) -> None:
+    """jit_from_cudnn_graph declines such a tile before a kernel is rendered and
+    compiled. Without the gate the plan built and its first launch aborted the
+    process."""
+    from cudnn.gemm.frost.sm120 import compiler as C120
+
+    def no_compile(src):
+        raise AssertionError(f"rendered a kernel for {config_name}")
+
+    monkeypatch.setattr(C120, "_import_kernel", no_compile)
+    g = _build_graph(2, 1024, 512, 256, num_groups=4, combo="mxfp8")
+    with pytest.raises(NotImplementedError, match="exceeds the TMA box_dim ceiling of 256"):
+        jit_from_cudnn_graph(g, config=replace(by_name(config_name), swap_ab=swap_ab))
 
 
 @requires_sm120

@@ -541,6 +541,19 @@ def _check_block_scale_geometry(chain: FusionChain, cfg: TileConfig) -> None:
                 f"block-scale config {cfg.name!r} cannot use {operand_name}-major input: "
                 f"SMEM extent {mn_extent} is not a multiple of the {group_elems}-element swizzle group"
             )
+    # A K-major operand is ONE [cta_k, CTA extent] TMA box per stage (an MN-major one is loaded in the
+    # swizzle-group boxes checked above, a GATHER token one row per box). The host stub encodes it at every
+    # launch, and CuTe DSL aborts the process when cuTensorMapEncodeTiled refuses a box dimension above
+    # _TMA_BOX_DIM_MAX -- no exception, so no decline -- hence the gate here.
+    gather_side = None
+    if chain.has_moe and chain.moe.mode == "gather":
+        gather_side = "N" if isinstance(chain.moe, MoeSwapAbSpec) else "M"
+    for is_k_major, extent, side in ((a_major == "k", cfg.cta_tile_m, "M"), (b_major == "k", cfg.cta_tile_n, "N")):
+        if is_k_major and side != gather_side and extent > _TMA_BOX_DIM_MAX:
+            raise NotImplementedError(
+                f"block-scale config {cfg.name!r}: cta_tile_{side.lower()}={extent} exceeds the TMA box_dim ceiling of "
+                f"{_TMA_BOX_DIM_MAX}; the K-major operand along {side} is loaded as one [cta_k, {extent}] box per stage"
+            )
 
 
 def _render_block_scale_tile_constants(
