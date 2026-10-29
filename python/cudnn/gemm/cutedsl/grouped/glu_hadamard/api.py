@@ -102,6 +102,7 @@ class GroupedGemmGluHadamardSm100(APIBase):
         situ_beta2: float = 25.0,
         use_dynamic_sched: bool = False,
         use_tmem_post_rht_amax: bool = False,
+        tanh_clamp_scale: Optional[float] = None,
     ):
         if sample_a is not None:
             _require_torch_inputs(sample_a, "GroupedGemmGluHadamardSm100")
@@ -191,6 +192,18 @@ class GroupedGemmGluHadamardSm100(APIBase):
         self.act_func = act_func
         self.situ_beta1 = float(situ_beta1)
         self.situ_beta2 = float(situ_beta2)
+        # Soft-clamp scale for act_func='srelu': (s * tanh(relu(x) / s))^2 instead of
+        # relu(x)^2. Must match the dsrelu kernel's tanh_clamp_scale in the backward.
+        if tanh_clamp_scale is not None:
+            self._value_error_if(
+                act_func != "srelu",
+                f"tanh_clamp_scale is only supported with act_func='srelu', got {act_func}",
+            )
+            self._value_error_if(
+                not math.isfinite(tanh_clamp_scale) or tanh_clamp_scale <= 0.0,
+                f"tanh_clamp_scale must be finite and positive, got {tanh_clamp_scale}",
+            )
+        self.tanh_clamp_scale = float(tanh_clamp_scale) if tanh_clamp_scale is not None else None
         if self.act_func == "situglu":
             self._value_error_if(
                 not math.isfinite(self.situ_beta1) or self.situ_beta1 <= 0.0,
@@ -381,6 +394,7 @@ class GroupedGemmGluHadamardSm100(APIBase):
             situ_beta1=self.situ_beta1,
             enable_bias=self.bias_desc is not None,
             use_tmem_post_rht_amax=self.use_tmem_post_rht_amax,
+            tanh_clamp_scale=self.tanh_clamp_scale,
         )
 
         hardware_info = cutlass.utils.HardwareInfo()
@@ -730,6 +744,7 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
     use_dynamic_sched: bool = False,
     use_tmem_post_rht_amax: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
+    tanh_clamp_scale: Optional[float] = None,
 ) -> TupleDict:
     """High-level wrapper for grouped GEMM GLU + Hadamard forward fusion."""
     from cudnn.gemm.cutedsl.discrete_grouped.discrete_kernel_utils import _require_pointer_tensor
@@ -753,7 +768,12 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
             use_dynamic_sched=use_dynamic_sched,
             sf_vec_sizes=(16, 32),
         )
-        for name, rejected in (("n", n is not None), ("b_dtype", b_dtype is not None), ("use_tmem_post_rht_amax", use_tmem_post_rht_amax)):
+        for name, rejected in (
+            ("n", n is not None),
+            ("b_dtype", b_dtype is not None),
+            ("use_tmem_post_rht_amax", use_tmem_post_rht_amax),
+            ("tanh_clamp_scale", tanh_clamp_scale is not None),
+        ):
             if rejected:
                 raise ValueError(f"{name} is unsupported for the JAX block-scaled path")
         return grouped_gemm_glu_hadamard_jax_forward(
@@ -856,6 +876,7 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
         weight_mode,
         act_func,
         situ_beta1_cache_signature,
+        float(tanh_clamp_scale) if tanh_clamp_scale is not None else None,
         a_tensor.shape[1:],
         tuple(b_tensor.shape) if is_dense else b_shape,
         c_tensor.shape[1:],
@@ -916,6 +937,7 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
                 situ_beta2=situ_beta2,
                 use_dynamic_sched=use_dynamic_sched,
                 use_tmem_post_rht_amax=use_tmem_post_rht_amax,
+                tanh_clamp_scale=tanh_clamp_scale,
             )
             if is_dense:
                 api = GroupedGemmGluHadamardSm100(sample_b=b_tensor, sample_sfb=sfb_tensor, **common_kwargs)
