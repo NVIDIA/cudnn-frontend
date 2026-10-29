@@ -1307,7 +1307,7 @@ def test_DSA_sparse_attention_backward_sm100_h96_d576_unaligned_topk_widths(topk
         current_stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         d_sink=d_sink,
     )
-    assert all(actual is expected for actual, expected in zip(result, (dq, dkv, d_sink)))
+    assert all(actual is expected for actual, expected in zip(result, (dq, dkv, d_sink), strict=True))
     if deterministic:
         first = tuple(tensor.clone() for tensor in result)
         for buffer in (workspace, dq, dkv, d_sink):
