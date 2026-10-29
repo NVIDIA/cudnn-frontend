@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from gemm_test_utils import requires_sm100, skip_unless_pipeline_active
+from gemm_test_utils import requires_sm100, requires_sm120, skip_unless_pipeline_active
 
 import cudnn
 from cudnn.engines import is_backend_engine, is_python_engine
@@ -433,6 +433,46 @@ def test_frost_gemm_declines_a_record_naming_no_canonical_config():
     with pytest.raises((NotImplementedError, cudnn.cudnnGraphNotSupportedError, RuntimeError), match="frost_gemm"):
         g2.check_support()
         g2.build_plans()
+
+
+@requires_sm120
+def test_frost_gemm_declines_a_split_k_record_for_a_tile_invariant_fp32_sum(monkeypatch):
+    """SPLIT_K_SLC is a performance knob, so a record may not change what the plan computes. The split-K
+    reducer adds an fp32 sum over all of M and N with one same-address atomic per output vector, which
+    drifts (a constant-input AVG at 3000x3000x1024 came back 2.8% low at split 2): the engine never lists
+    such a split, and a replayed record that adds one declines before any kernel is rendered."""
+    from dataclasses import replace
+
+    from cudnn.gemm.frost import compiler
+
+    def graph():
+        g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
+        B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
+        Y = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="r")
+        Y.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+        R = g.reduction(input=Y, mode=cudnn.reduction_mode.AVG, name="red")
+        R.set_dim([1, 1, 1]).set_stride([1, 1, 1]).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+        g.validate()
+        g.build_operation_graph()
+        return g
+
+    listed = graph()
+    listed.create_execution_plans([cudnn.heur_mode.A])
+    engine_id, knobs = listed.get_engine_and_knobs_at_index(_frost_indices(listed)[0])
+    assert knobs[cudnn.knob_type.SPLIT_K_SLC] == 1
+    record = GemmKnobs.from_config(replace(GemmKnobs.from_public(knobs).to_config(), split_k_slices=2)).to_public()
+
+    def no_render(src):
+        pytest.fail("a declined record must not render a kernel")
+
+    monkeypatch.setattr(compiler, "_import_kernel", no_render)
+    replay = graph()
+    replay.create_execution_plan(engine_id, record)
+    replay.select_plan(replay.get_execution_plan_count() - 1)
+    replay.check_support()
+    with pytest.raises(NotImplementedError, match="frost_gemm: .*fp32 avg reduction over all of M and N"):
+        replay.build_plans()
 
 
 def test_analyzer_declines_a_graph_without_a_gemm():

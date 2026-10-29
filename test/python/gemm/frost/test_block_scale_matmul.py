@@ -3522,6 +3522,20 @@ def test_sm120_block_scale_matmul_splitk_numerics(combo, config_name, S, M, N, K
 
 
 @requires_sm120
+def test_sm120_block_scale_splitk_declines_tile_invariant_fp32_sum(monkeypatch):
+    """The block-scale template shares the split-K reducer, so an explicit split declines an fp32 sum over
+    all of M and N (one same-address atomic per output vector drifts) before any kernel is rendered."""
+    g = _build_block_scale_reduction_graph(256, 256, 4096, cudnn.reduction_mode.AVG, [1, 1, 1])
+
+    def no_render(src):
+        pytest.fail("a declined split-K config must not render a kernel")
+
+    monkeypatch.setattr(C, "_import_kernel", no_render)
+    with pytest.raises(NotImplementedError, match="fp32 avg reduction over all of M and N"):
+        jit_from_cudnn_graph(g, config=dataclasses.replace(by_name(_SM120_BS_128), split_k_slices=2))
+
+
+@requires_sm120
 @pytest.mark.parametrize("combo", ["nvfp4", "mxfp8"])
 def test_sm120_block_scale_matmul_m_major_out(combo):
     _run_bs_numeric(combo, _SM120_BS_128, 256, 256, 512, out_major="m")
