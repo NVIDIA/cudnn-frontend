@@ -226,8 +226,8 @@ def make_config(dqk, dv, mx=False, k_hw=32):
         ONE_LANE=1,
         SCHED_CONSUMER_WARPS=15,
         SOFTMAX_REGS=160,
-        EPILOGUE_REGS=96,
-        SERVICE_REGS=96,
+        EPILOGUE_REGS=112 if k_hw == 64 else 96,
+        SERVICE_REGS=80 if k_hw == 64 else 96,
         DESC_VERSION=1,
         SWIZZLE_BYTES=128,
         SWIZZLE_LAYOUT=2,
@@ -294,7 +294,7 @@ def validate_config(cfg, bar_layout):
     assert cfg.TMEM_DK + cfg.DQK <= cfg.TMEM_P and cfg.P_COLS * 4 == cfg.N and cfg.TMEM_P + cfg.P_STAGES * cfg.P_COLS == cfg.TMEM_COLS
     assert all(c % 4 == 0 for c in (cfg.TMEM_DV, cfg.TMEM_DK))
     assert (cfg.SOFTMAX_LANES, cfg.EPILOGUE_LANES, cfg.STORE_LANES, cfg.ONE_LANE, cfg.SCHED_CONSUMER_WARPS) == (256, 128, 32, 1, 15)
-    assert (cfg.SOFTMAX_REGS, cfg.EPILOGUE_REGS, cfg.SERVICE_REGS) == (160, 96, 96)
+    assert (cfg.SOFTMAX_REGS, cfg.EPILOGUE_REGS, cfg.SERVICE_REGS) in ((160, 96, 96), (160, 112, 80))
     assert (cfg.SOFTMAX_LANES * cfg.SOFTMAX_REGS + cfg.EPILOGUE_LANES * cfg.EPILOGUE_REGS + 4 * 32 * cfg.SERVICE_REGS) == 65536
     groups = (cfg.DQK + 127) // 128
     ring_mx = cfg.MX and not cfg.T_SHARED
