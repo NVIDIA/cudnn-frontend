@@ -15,7 +15,7 @@ import cudnn
 from cutlass import cute
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
-import tune
+import timing
 from backend import verify_loaded_library
 
 
@@ -179,7 +179,7 @@ def main():
                         value.zero_()
             backend_fn(torch.cuda.current_stream().cuda_stream, *(t.data_ptr() for t in inputs + list(actual.values())), *dimensions)
 
-        output_address_control = tune.measure({"backend_reference_outputs": backend, "backend_candidate_outputs": shared_backend})
+        output_address_control = timing.measure({"backend_reference_outputs": backend, "backend_candidate_outputs": shared_backend})
         backend = shared_backend
         functions["backend"] = shared_backend
     frontend_checks = None
@@ -234,9 +234,9 @@ def main():
             torch.cuda.synchronize()
             torch.cuda.nvtx.range_pop()
         torch.cuda.cudart().cudaProfilerStop()
-    measurements = tune.measure(functions)
-    paired = {label: tune.measure({"backend": backend, label: fn}) for label, fn in functions.items() if label != "backend"}
-    frontend_paired = {label: tune.measure({"frontend": functions["frontend"], label: functions[label]}) for label in records} if args.frontend else None
+    measurements = timing.measure(functions)
+    paired = {label: timing.measure({"backend": backend, label: fn}) for label, fn in functions.items() if label != "backend"}
+    frontend_paired = {label: timing.measure({"frontend": functions["frontend"], label: functions[label]}) for label in records} if args.frontend else None
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         json.dumps(

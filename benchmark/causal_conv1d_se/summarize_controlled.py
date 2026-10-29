@@ -8,8 +8,20 @@ import json
 import math
 from pathlib import Path
 import statistics
+import random
 
-from summarize_regressions import interval
+
+def interval(candidate, backend):
+    """Estimate a paired-round 95% bootstrap interval for candidate/backend median latency."""
+    rng = random.Random(20261026)
+    n = len(candidate)
+    assert n == len(backend)
+    samples = []
+    for _ in range(5000):
+        indices = [rng.randrange(n) for _ in range(n)]
+        samples.append(statistics.median(candidate[i] for i in indices) / statistics.median(backend[i] for i in indices))
+    samples.sort()
+    return samples[125], samples[4874]
 
 
 def key(row):
