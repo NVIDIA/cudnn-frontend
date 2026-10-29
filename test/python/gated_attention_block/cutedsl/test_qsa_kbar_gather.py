@@ -406,4 +406,11 @@ def test_gather_clamp_keeps_the_dsa_compact_slab_inside_the_loose_regions():
     )
     torch.cuda.synchronize()
     assert torch.equal(torch.sort(ids[:t]).values, torch.sort(tight["block_ids"]).values)
-    assert torch.equal((ids[t:] >= 0).sum(-1), counts.view(2, t)[1].clamp(max=QSA_TOP_K)), "the OVER sequence's list lengths are not the clamped counts"
+    # the OVER sequence is position-MISALIGNED, as the -3 report says: the scorer's list lengths follow the CLAMPED first position
+    # (floor((q_pos0 + i + 1) / 4), every one <= NB by the clamp), while ix_counts carry the TRUE position's rule -- the two differ here
+    rows = torch.arange(t, device=dev, dtype=torch.int32)
+    lens_over = (ids[t:] >= 0).sum(-1).to(torch.int32)
+    assert torch.equal(lens_over, ((qpos[1] + rows + 1) // QSA_BLOCK_SIZE).clamp(max=QSA_TOP_K)), "the OVER sequence's lists do not follow the clamped position"
+    assert int(lens_over.max()) <= nb and not torch.equal(
+        lens_over, counts.view(2, t)[1]
+    ), "the clamped sequence should read misaligned against the true-position counts"
