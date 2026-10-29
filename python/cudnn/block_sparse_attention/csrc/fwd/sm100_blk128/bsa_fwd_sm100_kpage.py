@@ -78,12 +78,18 @@ class BlockSparseAttnForwardSm100KPage:
         head_dim_v: Optional[int] = None,
         qhead_per_kvhead: cutlass.Constexpr[int] = 1,
         tail_page: cutlass.Constexpr[bool] = False,
+        nonpositive_scale: cutlass.Constexpr[bool] = False,
     ):
         """``tail_page``: seqlen_k is not a multiple of 16, so the K/V page descriptors
         are built over the row extent (a page past seqlen_k loads as zeros) instead
-        of the 16-row page view, whose whole-page TMA boxes are a few percent faster."""
+        of the 16-row page view, whose whole-page TMA boxes are a few percent faster.
+        ``nonpositive_scale``: softmax_scale <= 0.  max(scale * S) is not scale * max(S) then,
+        and the -inf of masked keys times the scale is NaN / +inf, so the scores are scaled
+        before the masks and the softmax statistics run with a unit scale (as in the base
+        blk64 forward)."""
         self.qhead_per_kvhead = qhead_per_kvhead
         self.tail_page = tail_page
+        self.nonpositive_scale = nonpositive_scale
         assert head_dim == 128 and (head_dim_v is None or head_dim_v == 128), "page smem slices assume head_dim 128 (BF16, SW128)"
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -121,7 +127,8 @@ class BlockSparseAttnForwardSm100KPage:
         self.scheduling_mode = SchedulingMode.CLC
         is_sm103 = self.arch >= Arch.sm_103 and self.arch <= Arch.sm_103f
         assert isinstance(is_sm103, bool)
-        self.use_ldred_rowmax = is_sm103
+        # The hardware row max is of the unscaled scores, which is not the max of the scaled ones for a nonpositive scale.
+        self.use_ldred_rowmax = is_sm103 and not nonpositive_scale
         self.enable_ex2_emu = self.head_dim_padded <= 128 and not is_sm103
 
         self.softmax0_warp_ids = (0, 1, 2, 3)
@@ -759,8 +766,9 @@ class BlockSparseAttnForwardSm100KPage:
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             softmax_loop = partial(
                 self.softmax_loop,
-                softmax_scale_log2=softmax_scale_log2,
+                softmax_scale_log2=Float32(1.0) if const_expr(self.nonpositive_scale) else softmax_scale_log2,
                 softmax_scale=softmax_scale,
+                score_scale_log2=softmax_scale_log2,
                 thr_mma_qk=thr_mma_qk,
                 sScale=sScale,
                 mLSE=mLSE,
@@ -801,7 +809,7 @@ class BlockSparseAttnForwardSm100KPage:
                 pipeline_sm_stats,
                 sm_stats_barrier,
                 pipeline_o_epi,
-                softmax_scale_log2,
+                Float32(1.0) if const_expr(self.nonpositive_scale) else softmax_scale_log2,
                 SeqlenInfoCls,
                 tile_scheduler,
                 mBlockNums,
@@ -1155,6 +1163,7 @@ class BlockSparseAttnForwardSm100KPage:
         stage: int | Int32,
         softmax_scale_log2: Float32,
         softmax_scale: Float32,
+        score_scale_log2: Float32,
         thr_mma_qk: cute.ThrMma,
         tStS: cute.Tensor,  # ((TILE_M, TILE_N), 1, 1, q_stage)
         sScale: cute.Tensor,
@@ -1237,6 +1246,7 @@ class BlockSparseAttnForwardSm100KPage:
                 tStP_r2t=tStP_r2t,
                 sScale=sScale,
                 stage=stage,
+                score_scale_log2=score_scale_log2,
             )
 
             # Always acquire pipeline_sm_stats to stay in sync with correction
@@ -1336,6 +1346,7 @@ class BlockSparseAttnForwardSm100KPage:
         tStP_r2t: cute.Tensor,
         sScale: cute.Tensor,
         stage: int | Int32,
+        score_scale_log2: Float32,
         mMaskTable: cute.Tensor,
         mask_row: Int32,
         masked: bool = False,
@@ -1385,6 +1396,12 @@ class BlockSparseAttnForwardSm100KPage:
         else:
             cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
             hw_row_max = Float32(-Float32.inf)
+
+        if const_expr(self.nonpositive_scale):
+            # Scale the finite scores before the -inf mask sentinels; the softmax then runs with a unit scale.
+            tSrS_scaled = cute.make_tensor(tSrS_t2r.iterator, cute.make_layout((128,)))
+            for i in cutlass.range_constexpr(0, 128, 2):
+                tSrS_scaled[i], tSrS_scaled[i + 1] = cute.arch.mul_packed_f32x2((tSrS_scaled[i], tSrS_scaled[i + 1]), (score_scale_log2, score_scale_log2))
 
         if const_expr(masked):
             tSrS_flat = cute.make_tensor(tSrS_t2r.iterator, cute.make_layout((128,)))
