@@ -1085,7 +1085,10 @@ def test_sm120_an_empty_call_seeds_its_reductions_and_launches_nothing(split_k, 
 def test_sm120_an_unencodable_k_is_refused_before_anything_is_written(case):
     """K = 0, or an MXFP8 K below one 32-element scale block (its scale-factor K
     extent rounds down to 0), still has outputs to write but no K extent a TMA
-    descriptor can encode: the call is refused before the seed or the launch."""
+    descriptor can encode: the call is refused before the seed or the launch.
+
+    K = 16 also ends inside a scale block, and a check of the scale factors may
+    refuse it first with its own message, so that case matches only the K."""
     from cudnn.gemm.frost.tile_config import by_name
 
     if case == "bf16_k0":
@@ -1094,7 +1097,7 @@ def test_sm120_an_unencodable_k_is_refused_before_anything_is_written(case):
         from test_block_scale_matmul import _build_nvfp4_graph
 
         fp8, e8m0 = cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E8M0
-        graph, k, match = _build_nvfp4_graph(M, N, 256, block_size=32, sf_dt=e8m0, a_dt=fp8, b_dt=fp8), 16, "K=16 is below one 32-element scale block"
+        graph, k, match = _build_nvfp4_graph(M, N, 256, block_size=32, sf_dt=e8m0, a_dt=fp8, b_dt=fp8), 16, "K=16"
     compiled, calls = _recorded_sm120_plan(graph, by_name(_SM120_CFG))
     operands = _sentinel_operands(compiled, M, N, k)
     with pytest.raises(ValueError, match=match):

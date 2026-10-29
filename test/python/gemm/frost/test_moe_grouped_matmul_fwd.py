@@ -2932,10 +2932,13 @@ def test_sm120_moe_empty_call_seeds_and_skips_the_launch(block_scale, multi, swa
 def test_sm120_moe_unencodable_k_is_refused_before_anything_is_written(combo, k, multi, swap):
     """K = 0, or an MXFP8 K below one 32-element scale block (its scale-factor K
     extent rounds down to 0), still has outputs to write but no K extent a TMA
-    descriptor can encode: refuse the call before the reduction seed."""
+    descriptor can encode: refuse the call before the reduction seed.
+
+    K = 16 also ends inside a scale block, and a check of the scale factors may
+    refuse it first with its own message, so that case matches only the K."""
     compiled, vp, output, calls, _ = _recorded_moe_plan("sm120", combo != "bf16", multi, True, swap, k=k, combo=combo)
     workspace = torch.empty(compiled.workspace_bytes, device="cuda", dtype=torch.uint8)
-    with pytest.raises(ValueError, match="K=0 is a zero K extent" if k == 0 else "K=16 is below one 32-element scale block"):
+    with pytest.raises(ValueError, match="K=0 is a zero K extent" if k == 0 else "K=16"):
         compiled(vp, workspace=workspace)
     torch.cuda.synchronize()
     assert calls == []

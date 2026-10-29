@@ -894,7 +894,7 @@ class _CompiledRuntime:
     _compiler: ClassVar[Any]
     _validate_runtime_quant: ClassVar[bool] = False
     _validate_combine: ClassVar[bool] = False
-    # Consult the family's _zero_extent_problem: skip an empty call's launch, refuse a K it cannot encode.
+    # Consult the family's _zero_extent_problem: skip an empty call's launch; refuse a K it cannot encode or a GATHER from an empty token buffer.
     _check_zero_extents: ClassVar[bool] = False
     accepts_stream: ClassVar[bool] = True
 
