@@ -249,6 +249,25 @@ def _build_amax_only_uids(m, n, k, reduced):
     return g
 
 
+def _pin_sm120_split_k(g, slices, swap_ab=False):
+    """Plan ``g`` and select a FROST plan pinned to an SM120 workspace split-K
+    config, not the heuristic's pick. Returns the plan's index."""
+    from dataclasses import replace
+
+    from cudnn.gemm.frost.knobs import GemmKnobs
+    from cudnn.gemm.frost.tile_config import by_name
+
+    _plan(g)
+    engine_id, _ = g.get_engine_and_knobs_at_index(_index_of(g, _FROST))
+    config = replace(by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"), split_k_slices=slices, swap_ab=swap_ab)
+    g.create_execution_plan(engine_id, GemmKnobs.from_config(config).to_public())
+    index = g.get_execution_plan_count() - 1
+    g.select_plan(index)
+    g.check_support()
+    _build_plans_or_skip(g)
+    return index
+
+
 @requires_sm120
 @pytest.mark.parametrize(("reduced", "swap_ab"), [("row", False), ("col", True)], ids=("row", "col_swap_ab"))
 def test_sm120_splitk_reduction_only_workspace_follows_a_and_b(reduced, swap_ab):
@@ -257,23 +276,12 @@ def test_sm120_splitk_reduction_only_workspace_follows_a_and_b(reduced, swap_ab)
     the A and B extents. Output 0 cannot stand in: a graph whose only output is
     a reduction has the reduction there (it under-reported by N or M), and an
     override that leaves it unchanged (only A at a new M) fell back to the
-    plan's own size."""
-    from dataclasses import replace
-
-    from cudnn.gemm.frost.knobs import GemmKnobs
-    from cudnn.gemm.frost.tile_config import by_name
-
+    plan's own size. A list naming only the reduction gives the extent it
+    carries (M for a per-row one, N for a per-column one)."""
     h = cudnn.create_handle()
     m0, n0, k, slices = 128, 256, 1024, 2
     g = _build_amax_only_uids(m0, n0, k, reduced)
-    _plan(g)
-    engine_id, _ = g.get_engine_and_knobs_at_index(_index_of(g, _FROST))
-    config = replace(by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"), split_k_slices=slices, swap_ab=swap_ab)
-    g.create_execution_plan(engine_id, GemmKnobs.from_config(config).to_public())  # pinned, not the heuristic's pick
-    index = g.get_execution_plan_count() - 1
-    g.select_plan(index)
-    g.check_support()
-    _build_plans_or_skip(g)
+    index = _pin_sm120_split_k(g, slices, swap_ab)
     assert g.get_workspace_size() == slices * m0 * n0 * 4
 
     for m, n in ((m0, n0), (2 * m0, n0), (m0, 2 * n0)):
@@ -286,6 +294,8 @@ def test_sm120_splitk_reduction_only_workspace_follows_a_and_b(reduced, swap_ab)
         assert g.get_workspace_size_plan_at_index(index, h, uids, shapes, strides) == need
         if reduced == "col" and n == n0:  # the reduction keeps its shape: A alone carries the new M
             assert g.get_workspace_size(h, uids[:1], shapes[:1], strides[:1]) == need
+        if dim != _reduced_dim(reduced, m0, n0):  # the reduction alone carries the new extent
+            assert g.get_workspace_size(h, uids[2:], shapes[2:], strides[2:]) == need
 
         a = torch.empty(1, m, k, dtype=torch.int32).random_(-2, 3).to(torch.bfloat16).cuda()
         b = torch.empty(1, n, k, dtype=torch.int32).random_(-2, 3).to(torch.bfloat16).cuda()
@@ -313,6 +323,31 @@ def test_sm120_splitk_reduction_only_workspace_follows_a_and_b(reduced, swap_ab)
         torch.cuda.synchronize()
         torch.testing.assert_close(out, ref, atol=0, rtol=0)
         assert (arena[need:] == 0xAB).all()
+
+
+@requires_sm120
+def test_sm120_splitk_workspace_follows_a_named_output():
+    """An override list may name the output and leave A out. A strided view of A
+    keeps its own description, so the launch runs at the view's M and holds the
+    output to it: the query reads M off the named output, not the plan's own M,
+    and kernel 1 stays inside that size in a raw-address workspace."""
+    h = cudnn.create_handle()
+    m0, n0, k, slices = 128, 256, 1024, 2
+    g, _A, _B, _C = _build_matmul_uids(m0, n0, k)
+    _pin_sm120_split_k(g, slices)
+    m = 2 * m0
+    need = slices * m * n0 * 4
+    shape, stride = [1, m, n0], [m * n0, n0, 1]
+    assert g.get_workspace_size(h, [3], [shape], [stride]) == need
+
+    a, b, ref = _mm_operands(m, n0, k)
+    a = torch.zeros(1, m, k + 64, dtype=a.dtype, device=a.device)[:, :, :k].copy_(a)
+    c = torch.full(shape, float("nan"), dtype=torch.bfloat16, device="cuda")
+    arena = torch.full((need + 4096,), 0xAB, dtype=torch.uint8, device="cuda")
+    g.execute({1: a, 2: b, 3: c}, arena.data_ptr(), handle=h, override_uids=[3], override_shapes=[shape], override_strides=[stride])
+    torch.cuda.synchronize()
+    torch.testing.assert_close(c, ref, atol=0, rtol=0)
+    assert (arena[need:] == 0xAB).all()
 
 
 @_GPU

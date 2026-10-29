@@ -25,7 +25,7 @@ from cudnn.frost.workspace import Workspace
 from .arch_family import active_family
 from .dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS, _pow2_floor, tensor_alignment
 from .fusion_ir import FusionChain, MoeSwapAbSpec, TensorRef, segmented_row_scale_capacity_rows
-from .recipe import AX_MN, REDUCTION_INIT_VALUE, _output_rule, contiguous_modulus, expected_shape
+from .recipe import AX_MN, FROM_M, FROM_N, REDUCTION_INIT_VALUE, _output_rule, contiguous_modulus, expected_shape
 
 
 class _RuntimeConfig(Protocol):
@@ -997,16 +997,28 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         return self.workspace_bytes_for(r.batch, *mn)
 
     def workspace_bytes_for_overrides(self, override_uids, override_shapes) -> int:
-        """workspace for an override-shape call: A and B dims it names (graph order), else the plan's."""
+        """workspace for an override-shape call: A and B dims it names (graph order), else an output's, else the plan's."""
         r = self.recipe
         if r is None:
             return self.workspace_bytes
-        dims = dict(zip(override_uids or (), override_shapes or ()))
-        mn = []
-        for op, planned in ((r.a, self.chain.matmul.M), (r.b, self.chain.matmul.N)):
+        dims = {uid: shape for uid, shape in zip(override_uids or (), override_shapes or ()) if len(shape) == 3}
+        mn = [None, None]
+        for i, op in enumerate((r.a, r.b)):
             shape = dims.get(self.bound[op.index].get_uid())
-            mn.append(planned if shape is None or len(shape) != 3 else int(shape[op.declared[AX_MN]]))
-        return self.workspace_bytes_for(r.batch, *mn)
+            if shape is not None:
+                mn[i] = int(shape[op.declared[AX_MN]])
+        # A list may leave A or B out while a strided view of it (which keeps its own description) runs at
+        # new extents. The launch path holds every output to A's M and B's N, so a named output carries them.
+        for out in r.outputs:
+            shape = dims.get(self.bound[out.index].get_uid())
+            if shape is None:
+                continue
+            for axis, (source, _) in enumerate(out.rule):
+                at = {FROM_M: 0, FROM_N: 1}.get(source)
+                if at is not None and mn[at] is None:
+                    mn[at] = int(shape[axis])  # override dims count elements: no fp4 n // 2 to undo
+        planned = (self.chain.matmul.M, self.chain.matmul.N)
+        return self.workspace_bytes_for(r.batch, *(p if v is None else v for v, p in zip(mn, planned)))
 
     recipe: Any = field(default=None, init=False, repr=False, compare=False)
     lowered: Any = field(default=None, init=False, repr=False, compare=False)
