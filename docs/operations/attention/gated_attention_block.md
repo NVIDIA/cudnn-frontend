@@ -1300,8 +1300,8 @@ on cc 10.7 inside the placement bound (`heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS`
 sparse core: an explicit body is a typed decline and `blk.sparse_tile` reads `None`.  On the standalone adapter an explicit `split_kv=1`
 reads as unset (1 is its constructor default): under `tile_form="auto"` on a listed part it takes the lean split, so an unsplit launch there
 is pinned with `tile_form="tcgen05"` (the block's `decode_split_kv` defaults to None and keeps the core for an explicit 1).  The two bodies
-agree within the fixed-order-sum budget (the block suite: `cos(out) > 0.999`, the gated O within the suites' bf16 output bound -- per element
-`|d| <= 2^-7 max|ref| + 2^-6 |ref|` and `cos >= 0.999` -- and the LSE within 2e-2, the list bitwise), never bitwise across them.  Validated on Rubin against the fp32 oracle over the whole sequence (`test_block_qsa_decode.py`: `S_q` 1 .. 4
+agree within the fixed-order-sum budget (the block suite: `cos(out) > 0.999`, the gated O within the suites' dtype-specific output bound -- per element
+`|d| <= 2^-7 max|ref| + 2^-6 |ref|` in bf16, `|d| <= 2^-10 max|ref| + 2^-9 |ref|` in f16, and `cos >= 0.999` -- and the LSE within 2e-2, the list bitwise), never bitwise across them.  Validated on Rubin against the fp32 oracle over the whole sequence (`test_block_qsa_decode.py`: `S_q` 1 .. 4
 shared and 8 / 64 per row, `B` 1 / 2 / 4, `kv_lens` up to 20000 with dead and shorter-than-the-step entries, pages 16 / 32 / 64
 on all three layouts, bf16 / f16, splits 1 / 2 / 4 / 17 and the rule, the gate fused and separate, the LSE, the indexer band's
 raw-key write-through, the 24 / 2 Flash-Next geometry; the MTP residues on a short sequence; the block's form BITWISE the
