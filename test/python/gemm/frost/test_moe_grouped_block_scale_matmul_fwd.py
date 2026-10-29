@@ -2142,10 +2142,78 @@ def test_sm120_padded_e2m1_rejects_misaligned_operands(fp8_on_a, swap_ab) -> Non
     """PTX tensor-copy rule for ``.b4x16_p64``: the padded operand's global
     address and strides must be 32-byte aligned. A 16-byte-offset view of the fp4
     operand runs on the packed kernel (the 16-byte TMA rule) and is rejected at
-    the launch boundary by the padded one, before any descriptor is encoded."""
+    the launch boundary by the padded one, before any descriptor is encoded. The
+    rejection names the fp4 operand by its graph role in both orientations
+    (swap-AB puts the weight in kernel A)."""
     _run_e2e_mixed(fp8_on_a, _SM120_BS_CFG, swap_ab=swap_ab, fp4_offset_bytes=16)
-    with pytest.raises(ValueError, match="32-byte aligned"):
+    fp4_role = "weight" if fp8_on_a else "token"
+    with pytest.raises(ValueError, match=f"32-byte aligned strides: {fp4_role}: base address"):
         _run_e2e_mixed(fp8_on_a, _SM120_BS_CFG, swap_ab=swap_ab, padded_e2m1=True, fp4_offset_bytes=16)
+
+
+@pytest.mark.no_workspace_shim
+@pytest.mark.parametrize("family", ["sm100", "sm120"])
+@pytest.mark.parametrize(
+    "case,expected",
+    [
+        ("fp4_weight", "B (k-major, fp4_e2m1) requires K % 32 == 0, got K=48"),
+        ("fp4_token", "A (k-major, fp4_e2m1) requires K % 32 == 0, got K=48"),
+        ("n_major_weight", "B (n-major, fp8_e4m3) requires N % 16 == 0, got N=136"),
+    ],
+    ids=["fp4_weight", "fp4_token", "n_major_weight"],
+)
+def test_moe_tma_extent_rejection_names_graph_operands(family, case, expected) -> None:
+    """The runtime 16-byte TMA extent check names the operands in the graph's
+    frame in both orientations: A is the token and B the weight, with the graph's
+    majors and M / N, although swap-AB puts the weight in kernel A. Launch-recorder
+    plans (no kernel build) reject one bad extent with the same text, before any launch."""
+    import importlib
+    from cudnn.gemm.frost.fusion_ir import swap_ab
+    from cudnn.gemm.frost.graph_analyzer import swap_ab_binding
+
+    fp4, fp8 = cudnn.data_type.FP4_E2M1, cudnn.data_type.FP8_E4M3
+    E, S, N, K = 2, 256, 128, 256
+    if case == "n_major_weight":
+        graph = _build_graph(E, S, N, K, 2, combo="mxfp8", weight_major="n")
+        n, k, token_dt, weight_dt = 136, K, fp8, fp8
+    else:
+        token_dt, weight_dt = (fp8, fp4) if case == "fp4_weight" else (fp4, fp8)
+        graph = _build_graph(E, S, N, K, 2, combo="mxfp8", a_dt_override=token_dt, b_dt_override=weight_dt)
+        n, k = N, 48
+
+    def data(shape, dt):
+        """fp8 elements, or fp4 packed two per byte along the last (K) dim."""
+        if dt == fp4:
+            return torch.zeros((*shape[:-1], shape[-1] // 2), device="cuda", dtype=torch.uint8)
+        return torch.zeros(shape, device="cuda", dtype=torch.float8_e4m3fn)
+
+    chain, binding = analyze_with_binding(graph)
+    # Kernel order [E, N, K]; the N-major weight is a transposed view, as in _run_e2e.
+    weight = data((E, k, n), weight_dt).transpose(1, 2) if case == "n_major_weight" else data((E, n, k), weight_dt)
+    vp = {
+        binding.a_operands[0]: data((1, S, k), token_dt),
+        binding.b_operands[0]: weight,
+        binding.sfa_operands[0]: torch.zeros((1, 1, 8192), device="cuda", dtype=torch.uint8),
+        binding.sfb_operands[0]: torch.zeros((E, 1, 8192), device="cuda", dtype=torch.uint8),
+        binding.first_token_offset: torch.tensor([0, 128, S], device="cuda", dtype=torch.int32),
+        binding.outputs[0]: torch.zeros((1, S, n), device="cuda", dtype=torch.bfloat16),
+    }
+    compiler = importlib.import_module(f"cudnn.gemm.frost.{family}.compiler")
+    config = by_name(_CFG_1CTA if family == "sm100" else _SM120_BS_CFG)
+    calls = []
+    for swap in (False, True):
+        compiled = compiler.CompiledMoeBlockScaleGemm(
+            chain=swap_ab(chain) if swap else chain,
+            config=replace(config, swap_ab=swap),
+            generated_path=pathlib.Path("unused"),
+            _launchable=lambda *args, **kwargs: calls.append(args),
+            binding=swap_ab_binding(binding) if swap else binding,
+            vec_bytes_epi=32,
+        )
+        with pytest.raises(ValueError) as rejected:
+            compiled(vp, workspace=torch.empty(compiled.workspace_bytes, device="cuda", dtype=torch.uint8))
+        assert str(rejected.value) == f"TMA input contiguous dimensions must be 16-byte aligned: {expected}", f"swap_ab={swap}"
+    assert calls == []
 
 
 def test_sm120_mixed_pair_smem_footprint_budgets_packed_rows() -> None:
