@@ -68,7 +68,7 @@ class KimiCPMerge(APIBase):
     gathered FP32 summaries: no implicit conversion, communication or fallback.
     """
 
-    def __init__(self, h, m, initial_states, final_state, initial_state=None, *, reverse=False, precision="ieee", transition=None):
+    def __init__(self, h, m, initial_states, final_state, initial_state=None, *, reverse=False, precision="tf32x3", transition=None):
         super().__init__()
         self._warn_experimental_api()
         self.precision = precision
@@ -220,12 +220,14 @@ def _plan(shape, device, has_seed, reverse, precision, output_transition):
     return plan.compile()
 
 
-def kimi_cp_merge(h, m, initial_state=None, *, reverse=False, precision="ieee", output_transition=False, current_stream=None):
+def kimi_cp_merge(h, m, initial_state=None, *, reverse=False, precision="tf32x3", output_transition=False, current_stream=None):
     """Allocate merge outputs; return TupleDict(initial_states, final_state, transition).
 
     Caller performs all-gather and supplies FP32 H/M in rank/piece order. The
     additive H is never rounded; precision applies to running state/product and
-    M multiplication operands only. Default IEEE preserves the existing chain.
+    M multiplication operands only. The public API defaults to TF32x3 to avoid
+    low-precision error accumulation across long CP chains; pass precision="ieee"
+    for the existing IEEE FP32 FMA path.
     Inputs use the compact CUDA FP32 row-state layout described by KimiCPMerge;
     return shapes are [pieces, heads, V, K], [1, heads, V, K] and optional
     [1, heads, K, K]. This convenience wrapper allocates on current_stream;

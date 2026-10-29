@@ -4,6 +4,7 @@
 """Merge-only tests: the same FP32 H/M are shared across every precision."""
 
 import json
+import inspect
 
 import pytest
 import torch
@@ -80,6 +81,16 @@ def test_tf32x3_recovers_fp32_master_residual(reverse):
     assert errors["tf32x3"] < errors["tf32"] * 0.02
     assert errors["tf32x3"] < errors["bf16"] * 0.02
     print("MERGE_RELATIVE_L2 " + json.dumps(dict(reverse=reverse, pieces=16, heads=2, v=128, k=128, errors=errors)), flush=True)
+
+
+def test_public_default_is_tf32x3():
+    assert inspect.signature(KimiCPMerge).parameters["precision"].default == "tf32x3"
+    assert inspect.signature(kimi_cp_merge).parameters["precision"].default == "tf32x3"
+    h, m, seed = inputs(p=4)
+    actual = kimi_cp_merge(h, m, seed)
+    expected = kimi_cp_merge(h, m, seed, precision="tf32x3")
+    torch.testing.assert_close(actual["initial_states"], expected["initial_states"], rtol=0, atol=0)
+    torch.testing.assert_close(actual["final_state"], expected["final_state"], rtol=0, atol=0)
 
 
 def test_additive_h_is_not_quantized():

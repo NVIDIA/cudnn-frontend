@@ -3,7 +3,8 @@
 Experimental explicit merge over **caller-gathered FP32** Kimi CP summaries.
 No NCCL calls, local summary computation, or dtype-conversion kernels are hidden
 inside this operation. The same operation merges rank summaries or local pieces.
-Existing KDA graph calls retain their default IEEE internal chain.
+The explicit public merge defaults to TF32x3. Existing KDA graph calls retain
+their default IEEE internal chain for compatibility.
 
 For each piece `j`, in forward order:
 
@@ -21,10 +22,10 @@ this mode. The optional composed transition follows the same order/transposes.
 
 | `precision` | Multiplication | Accumulator / running master / H addition |
 | --- | --- | --- |
-| `"ieee"` (default) | Existing IEEE FP32 FMA chain | FP32 |
+| `"ieee"` | Existing IEEE FP32 FMA chain | FP32 |
 | `"bf16"` | BF16 Tensor Core operands, round-to-nearest-even | FP32 |
 | `"tf32"` | TF32 Tensor Core operands, round-to-nearest-even | FP32 |
-| `"tf32x3"` | Three TF32 Tensor Core products | FP32 |
+| `"tf32x3"` (default) | Three TF32 Tensor Core products | FP32 |
 
 For TF32x3, `A_hi = round_tf32(A)`, `A_lo = round_tf32(A - A_hi)` (and likewise B).
 The product is `A_hi B_hi + A_hi B_lo + A_lo B_hi`; the low-low term is omitted.
@@ -33,6 +34,12 @@ Each step retains the resulting FP32 state before rounding its next MMA operands
 The additive H is not quantized. TF32x3 is approximate, not IEEE FP32 equivalence.
 Assume finite inputs in the normal TF32 range; this is not a special-value or
 subnormal-preserving IEEE emulation.
+
+TF32x3 is the public default because merge error compounds with CP depth. It
+retains FP32 master state while recovering the leading residual terms omitted by
+a single TF32 product, providing substantially better long-chain accuracy than
+BF16 or TF32 operands without paying for the scalar IEEE path. Callers can still
+select IEEE when maximum accuracy is more important than Tensor Core throughput.
 
 These are explicit numerical choices, **not autotuning knobs**. Precision is part
 of the compiled-plan cache identity. This option does not alter summary-generation
@@ -45,7 +52,7 @@ from cudnn import kimi_cp_merge
 
 # H: [CP, heads, V, K], M: [CP, heads, K, K], both compact CUDA FP32.
 # Gather these tensors in sequence/rank order before calling the merge.
-result = kimi_cp_merge(H, M, precision="tf32x3")
+result = kimi_cp_merge(H, M)  # TF32x3 by default
 incoming = result["initial_states"][rank:rank + 1]  # [1, heads, V, K]
 tail = result["final_state"]                     # [1, heads, V, K]
 ```
