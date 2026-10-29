@@ -243,6 +243,28 @@ def test_gather_metadata_for_every_kv_lens_class():
 
 
 @requires_cuda
+def test_gather_dead_sequence_positions_never_wrap_at_the_int32_extremes():
+    """``kv_lens`` in {INT_MIN, INT_MIN + 1, -1, 0, 4} with T 4, NB 4 and one piece ``(b, 0, 4)`` per sequence: every ``L <= 0`` is DEAD with
+    zero counts, ``q_pos0 = r0 = 0`` and the report ``-1`` whatever its magnitude -- the positions are derived from ``max(L, 0)``, so the int32
+    ``L - T`` that wrapped positive at ``INT_MIN`` (counts [4, 4, 4, 0], ``q_pos0`` 15 under a correct ``-1`` report) never enters; the ``L = 4``
+    control is served (counts [0, 0, 0, 1], ``q_pos0`` 0, report 1).  The kbar rows follow the contract (one zero row for the dead ones)."""
+    t, int_min = 4, -(2**31)
+    cx = _Cache(5, 16, 1, torch.bfloat16, dead=(0, 1, 2, 3), seed=11)
+    nb = cx.reach
+    assert nb == 4
+    kv_lens = [int_min, int_min + 1, -1, 0, 4]
+    pieces = [(b, 0, t) for b in range(5)]
+    kbar, qpos, counts, rep, _ = _run(cx, kv_lens, pieces, t)
+    seq, want_q = _expected(kv_lens, t, nb, pieces)  # host ints: no wrap in the oracle
+    assert rep.tolist() == [SEQREP_DEAD] * 4 + [1]
+    assert qpos.tolist() == want_q == [0] * 5
+    got = counts.view(5, t).tolist()
+    assert got[:4] == [[0] * t] * 4, f"a dead sequence's counts are not zero: {got[:4]}"
+    assert got[4] == [0, 0, 0, 1] == seq[4][2]
+    _assert_gather(cx, kv_lens, t, kbar, "int32 extremes")
+
+
+@requires_cuda
 def test_gather_is_one_launch_and_allocates_nothing():
     """MEASURED: ONE kernel launch (``torch.profiler``'s census), no allocation and no host sync on the execute path."""
     from torch.profiler import ProfilerActivity, profile
@@ -343,6 +365,8 @@ def test_gather_host_refuses_a_chunk_past_the_table_reach_and_malformed_operands
         run(table=cx.table.t().contiguous().t())
     with pytest.raises(ValueError, match="kv_lens must be a contiguous int32 CUDA tensor of shape"):
         run(kv=kv.to(torch.int64))
+    with pytest.raises(ValueError, match="compiled for CUDA device"):  # the artifact's device is part of its key; operands elsewhere are refused
+        run(rr=r._replace(device=r.device + 1))
     with pytest.raises(ValueError, match="piece_r0 must be a contiguous int32 CUDA tensor of shape"):
         run(pr0=_i32([0, 0, 0]))
     with pytest.raises(ValueError, match="piece_seq must be a"):

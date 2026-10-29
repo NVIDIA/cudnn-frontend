@@ -927,9 +927,14 @@ def rope_rotate_half_io(
     """:func:`rope_rotate_half` for a PAIR of adjacent elements with the io-dtype rotation of the HF / vLLM-prepare dtype flow:
     ``a = io(y * cos)``, ``b = io(signed_partner * sin)``, ``out = io(a + b)`` -- each of the three operations rounded to ``io_dtype``
     (torch's bf16 ops and Triton's bf16 ops both round per op; ``a - b == a + (-b)`` exactly, so the sign convention of
-    :func:`rope_rotate_half` is kept).  The inputs are already io-representable (the caller rounded the normed row), so the fp32
-    products are exact and the ONE rounding per op is the io one.  Same partner shuffle (every lane of the warp must reach this
-    call), same lane rules; returns ``(out0, out1)``.  Pairs so that one ``cvt`` rounds two values (:func:`round_pair_io`)."""
+    :func:`rope_rotate_half` is kept).  The TABLES are rounded to ``io_dtype`` first -- the HF reference rotates with ``cos`` / ``sin``
+    cast to the key dtype, so a 16-bit table of the OTHER width (f16 tables under bf16 io, or the converse) meets the oracle's rounding
+    point here, and a table already in the io dtype passes unchanged (an exact identity: every io value is a fixed point of its own
+    ``cvt.rn``).  With that, every input is io-representable (the caller rounded the normed row), so the fp32 products are exact and
+    the ONE rounding per op is the io one.  Same partner shuffle (every lane of the warp must reach this call), same lane rules;
+    returns ``(out0, out1)``.  Pairs so that one ``cvt`` rounds two values (:func:`round_pair_io`)."""
+    cos0, cos1 = round_pair_io(cos0, cos1, io_dtype)
+    sin0, sin1 = round_pair_io(sin0, sin1, io_dtype)
     p0 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, y0, cutlass.Int32(half_lanes), 31, kind=nvvm.Shfl.BFLY))
     p1 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, y1, cutlass.Int32(half_lanes), 31, kind=nvvm.Shfl.BFLY))
     lower = lane < cutlass.Int32(half_lanes)

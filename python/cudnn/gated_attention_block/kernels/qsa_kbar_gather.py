@@ -21,9 +21,11 @@ ix_kbar.shape[1]`` (= the table's reach in compressed rows, ``max_pages x P / PO
                                                                         sequence's row n_keys when its last group is partial, L // POOL == T // POOL
                                                                         with T % POOL != 0, e.g. L = T = 37 -- never read there, n_vis <= n_keys)
     row j past both                             : untouched
-    ix_counts[b T + i]  = clamp(floor((L - T + i + 1) / POOL), 0, NB)                  the TRUE position's visible count (0 on a negative one)
+    ix_counts[b T + i]  = clamp(floor((L - T + i + 1) / POOL), 0, NB)                  the TRUE position's visible count (0 on a negative one);
+                                                                                        computed from max(L, 0) -- the same value for every L,
+                                                                                        and no int32 wrap of L - T at L near INT_MIN
     ix_qpos[p]          = clamp(max(L - T, 0) + r0_p, 0, POOL NB + POOL - 1 - rows_p)  p a piece of b: the scorer's non-negative first position,
-                                                                                        AND the memory guard below
+                                                                                        AND the memory guard below (from max(L, 0) - T likewise)
     ix_seqrep[b]        = n_keys  (served: T <= L <= POOL NB) | -1 (dead: L <= 0) | -2 (0 < L < T) | -3 (L > POOL NB)
 
 **The clamp of ``ix_qpos`` is the memory guard of the compact-logits scratch.**  The scorer stores row ``i`` of a piece at
@@ -37,7 +39,9 @@ existing device contract) is position-misaligned in its selection and REPORTED `
 violation (``-2``: a chunk extends a sequence of at least its own length); ``ix_seqrep`` is a device REPORT the tests read and the
 block never reads; its precedence is dead > short > over > served (``-1`` over ``-2`` over ``-3`` over ``n_keys``), and short / over are
 DISJOINT under the host rule ``T <= POOL x NB`` (``0 < L < T`` and ``L > POOL NB`` cannot both hold), so the order between those two
-never decides a report.  A dead sequence (``L <= 0``) is fully defined: zero rows up to ``ceil(T / POOL)``, counts 0, ``q_pos0 = r0_p``.
+never decides a report.  A dead sequence (``L <= 0``) is fully defined WHATEVER ITS MAGNITUDE: zero rows up to ``ceil(T / POOL)``, counts 0,
+``q_pos0 = r0_p`` -- the positions are derived from ``max(L, 0)``, never from ``L - T`` (int32 arithmetic on ``L = INT_MIN`` would wrap
+positive and hand a dead sequence live counts and a clamped ``q_pos0``).
 
 The piece table ``piece_seq / piece_r0 / piece_rows [n_pieces]`` (int32, device; the step's plan constants, uploaded once) names the
 select windows' pieces: piece ``p`` is rows ``[r0_p, r0_p + rows_p)`` of sequence ``piece_seq[p]``.  Its VALUES are device data used in
@@ -194,7 +198,9 @@ def frost_qsa_kbar_gather(
 
     # --- the metadata, by CTA (b, 0) ---
     if x == cutlass.Int32(0):
-        pos_base = length - t_rows  # the position of the chunk's row 0 (negative on a dead / short sequence)
+        # the position of the chunk's row 0 from the NON-NEGATIVE length: L - T for every L >= 0 (negative on a short sequence), -T for every
+        # dead one -- L - T itself wraps int32 at L near INT_MIN (counts [NB, NB, NB, 0] and a clamped q_pos0 for a DEAD sequence)
+        pos_base = length0 - t_rows
         for i in cutlass.range(tidx, t_rows, threads_per_cta):
             pos1 = pos_base + i + cutlass.Int32(1)  # the TRUE position + 1
             cnt = (pos1 // cutlass.Int32(pool)) if pos1 > cutlass.Int32(0) else cutlass.Int32(0)  # never a negative dividend
@@ -265,6 +271,7 @@ class QsaKbarGatherRecipe(NamedTuple):
     groups_per_cta: int
     threads_per_cta: int
     use_pdl: bool
+    device: int = -1  # appended: the CUDA device the artifact was compiled for (part of its key); the launch selects it, operands elsewhere are refused
 
 
 def _fake_i32_vec(n):
@@ -332,6 +339,7 @@ def compile_qsa_kbar_gather(
         groups_per_cta=threads_per_cta // ((d * elem_bytes) // ACCESS_BYTES),
         threads_per_cta=int(threads_per_cta),
         use_pdl=bool(use_pdl),
+        device=key[-1],
     )
 
 
@@ -430,24 +438,27 @@ def run_qsa_kbar_gather(
         got = None if not isinstance(ix_counts, torch.Tensor) else f"{ix_counts.dtype} {tuple(ix_counts.shape)} contiguous={ix_counts.is_contiguous()}"
         raise ValueError(f"ix_counts must be a contiguous int32 tensor of B x T = {batch} x {t} entries on {dev}, got {got}")
     _check_i32("ix_seqrep", ix_seqrep, batch, dev)
+    if dev.index is not None and dev.index != r.device:
+        raise ValueError(f"this artifact was compiled for CUDA device {r.device}; the operands live on {dev} (compile one per device)")
     grid_x = (n_blocks_max + r.groups_per_cta - 1) // r.groups_per_cta
-    r.compiled(
-        index_kv_cache,
-        block_table,
-        kv_lens,
-        piece_seq,
-        piece_r0,
-        piece_rows,
-        ix_kbar,
-        ix_qpos,
-        ix_counts,
-        ix_seqrep,
-        cutlass.Int32(n_pieces),
-        cutlass.Int32(t),
-        cutlass.Int32(grid_x),
-        cutlass.Int32(batch),
-        cuda.CUstream(int(stream)),
-    )
+    with torch.cuda.device(r.device):  # the launch runs in the artifact's context whichever device is current at the call
+        r.compiled(
+            index_kv_cache,
+            block_table,
+            kv_lens,
+            piece_seq,
+            piece_r0,
+            piece_rows,
+            ix_kbar,
+            ix_qpos,
+            ix_counts,
+            ix_seqrep,
+            cutlass.Int32(n_pieces),
+            cutlass.Int32(t),
+            cutlass.Int32(grid_x),
+            cutlass.Int32(batch),
+            cuda.CUstream(int(stream)),
+        )
 
 
 def build_qsa_kbar_gather(

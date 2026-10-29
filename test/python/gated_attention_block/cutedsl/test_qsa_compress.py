@@ -231,10 +231,10 @@ def _valid_mask(n_blocks: torch.Tensor, nb: int) -> torch.Tensor:
     return (torch.arange(nb, device=n_blocks.device)[None, :] < n_blocks[:, None])[:, :, None].expand(batch, nb, _D)
 
 
-def _make(batch, s_tok, dtype, *, seed=0, slab=False, table_batch=None):
+def _make(batch, s_tok, dtype, *, seed=0, slab=False, table_batch=None, table_dtype=None):
     """Raw keys (optionally as the INDEX band of a ``[B, S, 640]`` slab, token
     stride 640), a small zero-centred weight, and real RoPE tables at the
-    model's theta (identical rows across the batch)."""
+    model's theta (identical rows across the batch); ``table_dtype`` (appended) builds the tables in another 16-bit width than the io."""
     g = torch.Generator(device="cuda").manual_seed(seed)
 
     def rnd(*shape):
@@ -245,7 +245,9 @@ def _make(batch, s_tok, dtype, *, seed=0, slab=False, table_batch=None):
     else:
         k_raw = rnd(batch, s_tok, _D).to(dtype)
     w = (0.05 * rnd(_D)).to(dtype)
-    cos, sin = build_rope_tables(s_tok, _ROPE, base=_THETA, batch=batch if table_batch is None else table_batch, device="cuda", dtype=dtype)
+    cos, sin = build_rope_tables(
+        s_tok, _ROPE, base=_THETA, batch=batch if table_batch is None else table_batch, device="cuda", dtype=dtype if table_dtype is None else table_dtype
+    )
     return k_raw, w, cos, sin
 
 
@@ -358,8 +360,10 @@ def test_hf_rounding_is_the_hf_oracles_rounding_points_and_single_is_not(pool, s
     """The DISCRIMINATION at the key form (pool 4) and the query form (pool 1): the ``"hf"`` arm against the HF-rounding oracle passes the
     statistic (>= ``_HF_BITWISE_FLOOR`` bitwise, every element within ``_HF_ULP_CAP`` (6) io ulps at the larger rotation operand's
     magnitude -- the unit and its derivation in ``_HF_BITWISE_FLOOR``'s docstring) while the ``"single"`` arm against the SAME oracle
-    agrees on well under 95 % of the elements (measured ~71 %), and the converse -- the ``"single"`` arm is within one ulp of the fp32 oracle.  A kernel
-    that ignored the attribute would fail the first statement; one that applied it to the wrong site would fail the gate's cap."""
+    agrees on well under 95 % of the elements (measured ~71 %), and the converse -- the ``"single"`` arm is within one ulp of the fp32 oracle at the
+    larger rotation operand's magnitude (``_assert_one_rounding``'s yardstick) AND bitwise the default compile's output (the same
+    artifact: the honest statement that the single path did not change).  A kernel that ignored the attribute would fail the first
+    statement; one that applied it to the wrong site would fail the gate's cap."""
     batch = 2
     k_raw, w, cos, sin = _make(batch, s_tok, dtype, seed=50 + pool)
     seq_lens = None if pool == 1 else torch.tensor([s_tok, s_tok - 3], device="cuda", dtype=torch.int32)
@@ -381,8 +385,59 @@ def test_hf_rounding_is_the_hf_oracles_rounding_points_and_single_is_not(pool, s
     ), f"the single arm agrees with the HF-rounding oracle on {frac_single_vs_hf * 100:.2f} %: the attribute changed nothing"
     mag32 = hf_rotation_operand_magnitude(k_raw, w, pool=pool, norm_weight_offset=1.0, hf_rounding=False)
     _assert_one_rounding(outs["single"], want_32, mask, f"single pool {pool} {dtype}", mag32)
+    # the deterministic twin: the "single" arm IS the default compile's output (the same artifact under the same key), bitwise
+    default = _sentinel(batch, nb, dtype)
+    build_qsa_compress(k_raw, default, w, cos, sin, seq_lens, rope_dim=_ROPE, eps=_EPS, norm_weight_offset=1.0, pool=pool, stream=_stream())
+    torch.cuda.synchronize()
+    assert torch.equal(outs["single"], default), "the single arm differs from the default compile's output"
     assert not torch.equal(outs["single"], outs["hf"])
     print(f"pool {pool} {dtype}: hf vs HF oracle {frac_hf * 100:.3f} % bitwise; single vs HF oracle {frac_single_vs_hf * 100:.2f} % bitwise")
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "io_dtype, table_dtype", [(torch.bfloat16, torch.float16), (torch.float16, torch.bfloat16)], ids=["bf16_io_f16_tables", "f16_io_bf16_tables"]
+)
+@pytest.mark.parametrize("pool, batch, s_tok, seed", [(4, 1, 512, 54), (4, 2, 2048, 55), (1, 1, 1024, 56)], ids=["pool4_S512", "pool4_S2048", "pool1_S1024"])
+def test_hf_rounding_rounds_a_mixed_dtype_table_to_the_io_dtype(io_dtype, table_dtype, pool, batch, s_tok, seed):
+    """The compile APIs accept a 16-bit cos / sin table of the OTHER width than the io (``table_dtype`` is a compile key): under ``"hf"`` the
+    kernel rounds the table values to the io dtype BEFORE the rotation -- the HF reference rotates with the tables cast to the key dtype
+    and the oracle (``hf_rounding=True``) does the same -- so the statistic gate holds (f16 tables under bf16 io sat at 93.98 % bitwise before
+    the rounding was added: a systematic rounding-point difference, 986 of 16384 elements at pool 4 / S 512 / seed 54); under ``"single"``
+    the fp32 chain takes the table's exact value and stays within one io ulp of the fp32 oracle."""
+    k_raw, w, cos, sin = _make(batch, s_tok, io_dtype, seed=seed, table_dtype=table_dtype)
+    assert cos.dtype == table_dtype and k_raw.dtype == io_dtype
+    seq_lens = torch.tensor([s_tok] * batch, device="cuda", dtype=torch.int32) if pool == 4 else None
+    nb = s_tok // pool
+    outs = {}
+    for rounding in INDEX_COMPRESS_ROUNDINGS:
+        out = _sentinel(batch, nb, io_dtype)
+        r = build_qsa_compress(
+            k_raw, out, w, cos, sin, seq_lens, rope_dim=_ROPE, eps=_EPS, norm_weight_offset=1.0, pool=pool, stream=_stream(), rounding=rounding
+        )
+        assert r.table_dtype == table_dtype and r.dtype == io_dtype and r.rounding == rounding
+        outs[rounding] = out
+    torch.cuda.synchronize()
+    want_hf, n_blocks = compress_reference(k_raw, w, cos, sin, seq_lens, pool=pool, norm_weight_offset=1.0, hf_rounding=True)
+    want_32, _ = compress_reference(k_raw, w, cos, sin, seq_lens, pool=pool, norm_weight_offset=1.0)
+    mask = _valid_mask(n_blocks, nb)
+    frac_hf = _assert_hf_rounding_points(
+        outs["hf"],
+        want_hf,
+        mask,
+        f"hf {io_dtype} io / {table_dtype} tables pool {pool}",
+        hf_rotation_operand_magnitude(k_raw, w, pool=pool, norm_weight_offset=1.0),
+    )
+    frac_single = _assert_one_rounding(
+        outs["single"],
+        want_32,
+        mask,
+        f"single {io_dtype} io / {table_dtype} tables pool {pool}",
+        hf_rotation_operand_magnitude(k_raw, w, pool=pool, norm_weight_offset=1.0, hf_rounding=False),
+    )
+    print(
+        f"{io_dtype} io / {table_dtype} tables pool {pool} S {s_tok}: hf {frac_hf * 100:.3f} % bitwise the HF-rounding oracle; single {frac_single * 100:.3f} % bitwise the fp32 oracle"
+    )
 
 
 @requires_cuda

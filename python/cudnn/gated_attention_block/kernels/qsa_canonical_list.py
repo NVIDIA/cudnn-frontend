@@ -291,6 +291,7 @@ class QsaCanonicalListRecipe(NamedTuple):
     rows_per_cta: int
     use_pdl: bool
     with_lens: bool
+    device: int = -1  # appended: the CUDA device the artifact was compiled for (part of its key); the launch selects it, operands elsewhere are refused
 
 
 def _fake_ids():
@@ -338,6 +339,7 @@ def compile_qsa_canonical_list(*, threads_per_cta: int = DEFAULT_THREADS_PER_CTA
         rows_per_cta=int(threads_per_cta) // _WARP,
         use_pdl=bool(use_pdl),
         with_lens=bool(with_lens),
+        device=key[-1],
     )
 
 
@@ -401,8 +403,11 @@ def run_qsa_canonical_list(
             raise ValueError(f"block_lens_out must be a contiguous int32 [T={t}] tensor on {dev}")
     elif block_lens_out is not None:
         raise ValueError("this artifact was compiled WITHOUT the per-row list length (with_lens=False); block_lens_out would be silently ignored -- pass None")
+    if dev.index is not None and dev.index != r.device:
+        raise ValueError(f"this artifact was compiled for CUDA device {r.device}; the operands live on {dev} (compile one per device)")
     n_blocks = (t + r.rows_per_cta - 1) // r.rows_per_cta
-    r.compiled(ids_in, counts, ids_out, block_lens_out, cutlass.Int32(t), cutlass.Int32(n_blocks), cuda.CUstream(int(stream)))
+    with torch.cuda.device(r.device):  # the launch runs in the artifact's context whichever device is current at the call
+        r.compiled(ids_in, counts, ids_out, block_lens_out, cutlass.Int32(t), cutlass.Int32(n_blocks), cuda.CUstream(int(stream)))
 
 
 def build_qsa_canonical_list(

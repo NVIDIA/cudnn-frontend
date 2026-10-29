@@ -266,6 +266,8 @@ def test_host_refusals():
         run(rr=r0)
     with pytest.raises(ValueError, match="block_lens_out must be a contiguous int32"):
         run(l=lens.to(torch.int64))
+    with pytest.raises(ValueError, match="compiled for CUDA device"):  # the artifact's device is part of its key; operands elsewhere are refused
+        run(rr=r._replace(device=r.device + 1))
     with pytest.raises(ValueError, match="unit column stride"):
         run(i=ids.t().contiguous().t(), o=out.t().contiguous().t())
     with pytest.raises(ValueError, match="16-byte aligned"):
