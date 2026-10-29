@@ -199,7 +199,8 @@ def test_frost_conv_c96_declines_outside_qualified_envelope(unsupported):
 @pytest.mark.L0
 @pytest.mark.parametrize("k", [96, 192])
 def test_frost_conv_c96_stream_rebinding_and_capture(cudnn_handle, k):
-    image = make_input((1, 96, 3, 5, 7), torch.bfloat16, seed=510)
+    # M=3*7*9 exceeds 128, selecting two CTAs and four-output K96 reuse.
+    image = make_input((1, 96, 3, 7, 9), torch.bfloat16, seed=510)
     weight = make_input((k, 96, 3, 3, 3), torch.bfloat16, seed=511)
     graph, (x, w, y), output, workspace = _plan(image, weight)
     stream = torch.cuda.Stream()
