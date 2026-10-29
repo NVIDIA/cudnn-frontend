@@ -301,10 +301,12 @@ Native backward gradient outputs must not overwrite each other.
   the result against an address-set oracle with mixed layouts, different block
   widths and both pointer orders. Measure large declarations without walking
   every row per bind.
-- Detectors: `test_sm80_gradient_overlap_rejected_before_entry`,
-  `test_sm80_shared_gradient_storage_matches_address_oracle`, and
+- Detectors: `test_native_gradient_overlap_rejected_before_entry`,
+  `test_native_shared_gradient_storage_matches_address_oracle`, and
   `test_native_overlapping_gradients_rejected_before_writes`. Preserve the
-  existing legal interleaved-gradient and staged copy-order tests.
+  existing legal interleaved-gradient tests. When retiring a staged copy-order
+  path, replace its overlap case with a pre-launch rejection test that guards
+  the same output and workspace storage.
 
 **Rule S6 — A kernel feature lands on every arch line's test file, and its
 other-arch lowerings are smoke-compiled from whatever GPU you have.**

@@ -564,10 +564,12 @@ def test_d128_thd_guard_includes_the_last_prefix_element(arch, role):
     assert len(frames) == 1
 
 
+@pytest.mark.parametrize("engine", ["sm80", "sm100", "sm107_d512"])
 @pytest.mark.parametrize("pair", [("dq", "dk"), ("dq", "dv"), ("dk", "dv")])
 @pytest.mark.parametrize("raw_storage", [False, True])
-def test_sm80_gradient_overlap_rejected_before_entry(pair, raw_storage):
-    spec, _, facts, geometry, frames = _fixture("sm80", features=False)
+def test_native_gradient_overlap_rejected_before_entry(engine, pair, raw_storage):
+    spec, _, facts, geometry, frames = _fixture("sm80" if engine == "sm80" else "sm100", features=False)
+    spec = replace(spec, name="sdpa_bwd_" + engine)
     spec = replace(spec, native_binding=True)
     prep.execute(spec, facts, _WORKSPACE, 17, raw_storage=raw_storage, geometry=geometry)
     first, second = pair
@@ -581,13 +583,15 @@ def test_sm80_gradient_overlap_rejected_before_entry(pair, raw_storage):
     assert len(frames) == 2
 
 
+@pytest.mark.parametrize("engine", ["sm80", "sm100", "sm107_d512"])
 @pytest.mark.parametrize("strides", [(96, 48, 16, 1), (192, 16, 64, 1), (256, 64, 16, 1), (176, 80, 24, 1), (128, 56, 24, 1), (160, 80, 24, 1)])
 @pytest.mark.parametrize("second_layout", [None, ((2, 2, 3, 8), (176, 80, 24, 1)), ((2, 2, 3, 16), (176, 80, 24, 1))])
 @pytest.mark.parametrize("pair", [("dq", "dk"), ("dq", "dv"), ("dk", "dv")])
-def test_sm80_shared_gradient_storage_matches_address_oracle(strides, second_layout, pair):
+def test_native_shared_gradient_storage_matches_address_oracle(engine, strides, second_layout, pair):
     from itertools import product
 
-    spec, _, facts, _, frames = _fixture("sm80", features=False)
+    spec, _, facts, _, frames = _fixture("sm80" if engine == "sm80" else "sm100", features=False)
+    spec = replace(spec, name="sdpa_bwd_" + engine)
     shape = (2, 2, 3, 8)
     addresses = []
     ops = list(spec.operands)
