@@ -4178,3 +4178,11 @@ prepared THD chain without staging copies. Dense PackGQA uses the native
 Paged KV, splitting, score side outputs and pre-folded scale keep their
 existing larger-flavor selection and admission boundaries. D32 THD remains
 outside this native flavor.
+
+Unsplit nonpaged native D64 PackGQA is currently available through explicit
+plans. Automatic packed proposals still use the historical shared-D128
+eligibility predicate; extending that policy is a separate heuristics change.
+The existing split candidates keep their D128 selection.
+`test_sdpa_fp8_sm107.py::TestNativeD64Half` exposes all 60 native regression
+cases through the SM107 CI entrypoint; its shared helper module is not
+collected separately.
