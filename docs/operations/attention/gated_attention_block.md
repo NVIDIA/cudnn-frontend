@@ -274,6 +274,7 @@ top_k=512`). It is a DECLARATION ATTRIBUTE -- it changes the function -- never a
 | `index_band` (`False`) | `W_qkvg` carries a fifth band `ProjBlock.INDEX` of `(index_heads + index_kv_heads) * index_head_dim` columns below V |
 | `index_cache_dtype` (`None`) | appended: the indexer cache's dtype under `index_source="indexer"` -- `None` / `torch.bfloat16` (the compressed keys and the queries as the compress kernel writes them) or `torch.float8_e4m3fn` (the fp8 indexer cache: both as plain e4m3 of the same values, no scales; on the prefill form scored through the scorer's MXFP8 arm with unit scale factors, `index_k_compressed` then an e4m3 buffer; AT DECODE over the pools (2026-10-21) the paged `index_kv_cache` is e4m3 -- the prepare / compress kernels store the e4m3 cast of the bf16 row directly and the paged scorer reads it on its fp8 `mma.sync` arm, no cast kernel). Numerics-changing (3 mantissa bits move the weakest selected blocks at the k-th boundary: 99.0 / 97.4 / 96.5 % set agreement with the bf16 selection at S = 4096 / 32768 / 131072 on synthetic activations, every flip a rank-boundary flip), so an attribute, never a knob; bf16 stays the default and the reference. Refused under `index_source="caller"` (nothing of the block reads or writes an indexer cache there); e5m2 named |
 | `index_list_form` (`None`) | appended: the block-sparse DECODE mode's list form (`kv_source="paged"` on a dense `[B, S_q]` block) -- `"shared"`: ONE list per sequence, `[B, top_k]`, selected at the step-0 position `kv_lens[b] - S_q` and shared by the step's rows (the MTP form; `S_q <= 4`, the sparse core's shared-list cap); `"per_row"`: one list per row, `[B, S_q, top_k]` / `[T, top_k]`, at the row's own position (the serving stacks' per-row selection) at ANY `S_q`; `None`: `"shared"` at `S_q <= 4` and `"per_row"` past it under caller lists (the former derivation), `"per_row"` under the in-block indexer over the pools. A declaration attribute (numerics-changing: which keys the speculative rows see), never a knob. Typed declines: `"shared"` past four rows (`shared_list_rows`), `"shared"` under the indexer over the pools; `"shared"` on the block's own K / V (`kv_source="self"`) is refused by name. The envelope publishes `decode.index_list_forms` / `decode.index_list_form_default` |
+| `index_compress_rounding` (`"single"`) | appended (2026-10-29): the rounding points of the indexer's two compress chains -- the pool-4 compressed KEY and the pool-1 indexer QUERY -- at every writer (the prefill form, the chunk / decode step form, the fused prepare's arms). `"single"` (the default, the reference): fp32 through the mean, the RMSNorm and the RoPE, one rounding at the store (under the e4m3 cache the e4m3 cast of that bf16 row). `"hf"`: the HF / vLLM-prepare dtype flow -- the pooled key rounded to the io dtype before its norm, the normed row (query and key, all dims) rounded before its rotation, the rotation's three operations each rounded, the store exact -- the same ROUNDING POINTS as a vLLM-written cache row, not its bits (the fp32 reduction orders differ). The attention's own Q / K norm + RoPE is not governed by it. Numerics-changing, so an attribute, never a knob; refused under `index_source="caller"`. The envelope publishes `decode.index_compress_roundings` |
 | `index_heads`, `index_kv_heads`, `index_head_dim`, `index_norm_eps` (`4`, `1`, `128`, `1e-6`) | the indexer's geometry; they size the band (and `index_kv_heads x index_head_dim` the raw indexer key's write-through pool); under `index_source="indexer"` the scorer reads them (`index_heads` one of its packed head groups, `index_head_dim` its head dim) |
 
 `QsaSpec.identity_bound` (`top_k * block_size + block_size - 1` = 2051 at the defaults) is the visible-token count up to which
@@ -442,9 +443,12 @@ rotated at the block START position `4j`, one rounding -- the same kernel over t
 SELECTION -- the indexer scorer `sum_h relu(q_h . kbar_j) / sqrt(index_head_dim)` over the blocks below
 `floor((pos + 1) / 4)` and the fused radix top-k (ties to the smaller id) -- `cudnn.ops.qsa_select_forward`, the
 DSA compressed-logits path, so the dense `[T, n_blocks]` score tensor is never materialized; (4) the CANONICAL ORDER -- the
-top-k's set is reproducible but its slot order is not, and the core accumulates in list order, so each row is sorted (the
-selected ids descending, the `-1` padding last) before the core: two executes of the block are bitwise, and the list a caller
-gets back is canonical. The list is `[T, top_k]` int32 with exactly the derived count `min(top_k, floor((pos + 1) / 4))` of
+top-k's set is reproducible but its slot order is not, and the core accumulates in list order, so each row is put in the block's
+ONE canonical order (the selected ids DESCENDING, the `-1` padding last -- since 2026-10-29 by the FROST row canonicalizer
+`cudnn_block_qsa_canonical_list` in place on the list, no `torch.sort` and no allocation; the identity list below the bound is
+descending too) before the core: two executes of the block are bitwise, and the list a caller gets back is canonical on EVERY form
+of the block (the prefill form, the decode step, the extend step) -- the standalone paged selector's ASCENDING order is that function's
+own contract.  The list is `[T, top_k]` int32 with exactly the derived count `min(top_k, floor((pos + 1) / 4))` of
 valid ids then `-1`, so the sparse core takes it without `block_lens`.
 
 | the stack hands in / gets back | form | meaning |
@@ -555,7 +559,8 @@ deterministic radix top-k. Row `s` of sequence `b` sits at position `kv_lens[b] 
 `counts = clamp(floor((pos + 1) / 4), 0, n_blocks_max)` complete blocks; the scorer kernel writes `logits[t, 0:counts[t]]`
 (`scale x sum_h relu(qi[t, h] . kbar[b, j])` in fp32: the ReLU-summed, head-reduced indexer score) and the counts on device -- no torch
 prologue -- and the top-k returns `block_ids [T, top_k]` int32 in ASCENDING order with `-1` past `block_lens = min(top_k, counts)`
-(ties to the smaller id), so two calls are bitwise. A `-1` table entry under a visible block reads as a zero key (logit 0);
+(ties to the smaller id), so two calls are bitwise -- the standalone selector's own contract (the gated attention BLOCK's lists are
+DESCENDING on every form: its one canonical order). A `-1` table entry under a visible block reads as a zero key (logit 0);
 a padding sequence (`kv_lens == 0`) writes nothing but its counts (0) and never reads the cache. The scorer kernel alone
 (`kernels.qsa_score_paged.compile_qsa_score_paged` / `run_qsa_score_paged`: one warp-level `mma.sync.m16n8k16` per 8 keys x 16 D
 over the `seq_q x index_heads` query rows padded to 16 -- the query tile staged once per CTA in shared memory behind one CTA
@@ -745,10 +750,11 @@ blk = GatedAttentionBlockFwd(
     use_pdl=None,                # programmatic dependent launch over the chain: None = True on the DECODE form's decode-tile routes on cc 10.7 (the measured default), False everywhere else; True / False explicit -- "Serving: the decode form"
     fuse_norm_rope_small_m=None, # the DECODE form: None = fuse_norm_rope=True LOWERS stage (1) to the unfused chain at B x S_q <= 128 (the measured faster step); True = the fused fork as declared
     fuse_cache_write_small_m=None, # the DECODE form's unfused chain: None = the paged write-through folded into the norm + RoPE launch at B x S_q < 128 rows or S_q = 1 (the measured rule), its own launch past that and under an explicit fuse_cache_write=False; True / False explicit
-    sample_index_kv_cache=None, sample_index_state_cache=None, sample_index_state_block_table=None,   # the in-block indexer's DECODE step over the pools (QsaSpec(index_source="indexer") with kv_source="paged"), REQUIRED there, refused elsewhere: the paged compressed-key cache [n_pages, P / 4, 1, 128], the ring of raw indexer keys [blocks, cap >= S_q + 3, 1, 128], its [B, 1] int32 table -- "The in-block indexer's DECODE step over the pools"
+    sample_index_kv_cache=None, sample_index_state_cache=None, sample_index_state_block_table=None,   # the in-block indexer's DECODE / EXTEND steps over the pools (QsaSpec(index_source="indexer") with kv_source="paged"), REQUIRED there, refused elsewhere: the paged compressed-key cache [n_pages, P / 4, 1, 128], the ring of raw indexer keys [blocks, cap, 1, 128] (cap >= S_q + 3 on the DECODE step, cap >= 3 on the EXTEND step), its [B, 1] int32 table -- "The in-block indexer's DECODE and EXTEND steps over the pools"
     index_state_slot_mapping_present=False,   # that step: execute(index_state_slot_mapping=) names the ring's write rows (block x cap + pos % cap, -1 dead; slot_mapping's dtype) instead of the rows the kernels derive from the ring table
     index_commit_present=False,  # that step: a per-sequence commit count at execute (a follow-up: True is a typed NotImplementedError)
     rope_position_tables_only=False,   # that step under fuse_prepare=True: cos / sin REFUSED at execute; the fused launch rotates Q / K and the indexer queries from cos_pos / sin_pos at the device-derived position (the unfused twin with it is a typed decline)
+    index_select_form="auto",    # the indexer over the pools (2026-10-29): "auto" = the DECODE step inside the decode scorer's envelope (S_q x next_pow2(index_heads) <= 64) and the EXTEND step past it; "decode" / "extend" pin a form (performance-only) -- "The in-block indexer's DECODE and EXTEND steps over the pools"
 )
 workspace = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device=h.device)
 blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace,
@@ -761,8 +767,8 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace,
             k_scale=None, v_scale=None,                      # REQUIRED iff kv_cache_dtype=torch.float8_e4m3fn (1-element fp32 CUDA tensors), refused otherwise
             w_iq_norm=None, w_ik_norm=None,                  # REQUIRED iff QsaSpec(index_source="indexer"), refused otherwise -- "The in-block indexer"
             index_k_compressed=None, block_ids_out=None, block_lens_out=None,   # the indexer's optional outputs: the PREFILL form's compressed-key rows (refused at the decode step: the cache is paged), the list and its counts
-            index_kv_cache=None, index_state_cache=None, index_state_block_table=None,   # REQUIRED iff the indexer's DECODE step over the pools, refused otherwise (16-byte bases; the declared forms) -- "The in-block indexer's DECODE step over the pools"
-            index_state_slot_mapping=None,                   # REQUIRED iff index_state_slot_mapping_present (slot_mapping's dtype), refused otherwise
+            index_kv_cache=None, index_state_cache=None, index_state_block_table=None,   # REQUIRED iff the indexer's DECODE / EXTEND step over the pools, refused otherwise (16-byte bases; the declared forms) -- "The in-block indexer's DECODE and EXTEND steps over the pools"
+            index_state_slot_mapping=None,                   # REQUIRED iff index_state_slot_mapping_present (slot_mapping's dtype; REQUIRED on the EXTEND step: its ring tail write takes the stack's slots), refused otherwise
             cos_pos=None, sin_pos=None,                      # REQUIRED on that step: [1 or B, >= max_pages x P, rope_dim] position tables -- the table is the CEILING on positions; refused elsewhere
             n_commit=None)                                   # refused (index_commit_present=True is a follow-up)
 ```
@@ -1308,6 +1314,7 @@ under every value, measured or not -- so a replaying stack whose optimum differs
 | `fuse_cache_write_small_m` (declaration) | `None` (default = auto: the paged write-through folded into the norm + RoPE launch at `B x S_q < CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS = 128` rows or at `S_q = 1`, the separate launch at 128+ rows with `S_q > 1` -- the measured rule -- and under an explicit `fuse_cache_write=False`, the separate launch asked for by name), `True` (folded in; a typed decline where the arm is not served; the strongest request, followed beside `fuse_cache_write=False` too) or `False` (the separate launch) | where the paged write-through runs on the DECODE form's UNFUSED chain (the lowered `fuse_norm_rope=True` declaration or `fuse_norm_rope=False`): bf16 / f16, no `quant`, no indexer band, 16-bit pools, the TMA norm + RoPE kernel; a performance-only knob (the pools and the slab bitwise either way, one launch fewer); `blk.cache_write_in_norm_rope` reads back what runs, the stage list loses `"cache_write"` under the arm |
 | `sparse_tile_form` (declaration; a `QsaSpec` geometry only) | `"auto"` (default), `"lean"` or `"tcgen05"` | WHICH BODY of the index-list sparse core serves stage (4) on the block-sparse DECODE mode -- the tcgen05 core (`sparse_d256_f16`) or the LEAN decode tile (`sparse_lean_d256_f16`: `mma.sync` + `cp.async`, 128 threads per m16 tile, no TMEM / TMA / CLC): a performance-only knob (the same O / LSE under either body within the fixed-order-sum budget; never bitwise across the bodies, bitwise within each). `"auto"` consults the placement rule (cc 10.7, `B x H_kv <= 4` CTAs per chunk -- the lean grid's own unit: the step's `S_q` rows ride inside the CTA as m16 tiles, so `S_q` changes no grid and is not in the bound --, `top_k >= 8`, the lean body admissible) only on the parts of `heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS` -- cc 10.7 since the end-to-end gate measured the lean route against the tcgen05 route there (2026-10-26, a 212-SM part at the clock lock, one process per cell, the control pair within 1 %: B 1 x 8K x S_q 1 34.8 -> 32.5 us per decode step (+6.8 %, 2.22 us; +5.9 % / 1.93 us symmetric with the arms built in the other order) and B 1 x 32K 36.6 -> 34.6 us (+5.7 %, 1.98 us; +5.6 % symmetric); `LEAN_SPARSE_MAX_UNITS` = 4 refit to the last class that wins inside its band; the unit is the CTAs per chunk since the same table's `S_q` 4 rows: B 1 x `S_q` 4 wins +6.4 / +6.6 / +6.8 % at 2 per chunk, B 4 x `S_q` 4 loses -8.8 .. -9.7 % at 8), so `"auto"` is the lean tile on cc 10.7 inside the bound and the tcgen05 core on every other part and past the bound --; `"lean"` is honoured where the body serves the declaration (the DECODE mode at `S_q <= 4` under the shared list -- one list per sequence, every row of the step in one CTA -- or the per-row list at one row per sequence, bf16 / f16, `G <= 16`, `top_k >= 8`; it ALWAYS splits: `decode_split_kv` None = the lean split of the default k, 65 at `top_k` 512, or one of `heuristics.sparse_lean_splits(top_k)` = 65 / 33 / 22 / 17 / 13 / 11 / 10 / 9, which SELECTS k) and a typed decline naming the arm elsewhere (per-row lists past one row -- the lean CTA gathers one list per sequence --, `S_q` past 4, THD, the prefill form, a split that is not a lean split, `top_k` below 8); a pinned `decode_split_kv` that is not a lean split keeps `"auto"` on the core (the pin is the stronger knob). `blk.sparse_tile_form_requested` keeps the declaration, `blk.sparse_tile_form` the resolved body, `blk.sparse_tile` its `kernel_template` (pinned against the compiled kernel); `serving_envelope().decode.sparse_tiles` / `.sparse_tile(s_q, batch, ...)` / `.sparse_tile_lean_default` say so before anything is declared. Over e4m3 pools (`kv_cache_dtype=torch.float8_e4m3fn`: the gathered cast + the dense decode tile, no body of the sparse core) an explicit body is a typed decline naming the arm and `blk.sparse_tile` reads `None` (`decode.sparse_tile(..., kv_cache_dtype=torch.float8_e4m3fn)` too). Refused (`ValueError`) off a `QsaSpec` geometry unless `"auto"` |
 | `sparse_sub_tiles_per_cta` (declaration; with `sparse_tile_form="lean"` only) | `None` (default) or an int in `1 .. min(8, n_sub - 1)` | the lean tile's k -- its 32-key sub-tiles per CTA (the split is `ceil(n_sub / k)`, `n_sub = ceil((top_k + 2) x 4 / 32)` = 65 at `top_k` 512): `None` = the default (`heuristics.sparse_lean_sub_tiles_per_cta`: 1 today -- the k 2 / 3 / 4 renderings trace at 104-164 registers, a measured lever of the gate, not a default), an int pins it (with a pinned `decode_split_kv` the two must agree); a lean-only pin, refused by name (`ValueError`) under `"auto"` / `"tcgen05"` so it is never silently ignored. Performance-only: the same function under every k |
+| `index_select_form` (declaration; the in-block indexer over the pools only) | `"auto"` (default), `"decode"` or `"extend"` | WHICH STEP FORM derives a `QsaSpec(index_source="indexer")` block's selection over the paged side caches (2026-10-29): the DECODE step (the paged scorer stages the step's query rows once per CTA, `S_q x next_pow2(index_heads) <= 64`) or the EXTEND step (a T-row chunk behind a cached prefix at any `S_q <= max_kv_len`: the chunk compress with the ring read-only, the dense kbar gather, the compact-logits scorer per row window, the canonical-order kernel; "The in-block indexer's DECODE and EXTEND steps over the pools" below). `"auto"` takes the decode step inside its envelope and the extend step past it -- never on the ring's cap: a ring too short for the decode step at a small `S_q` is that step's typed refusal, a stack pins `"extend"` there (`cap >= 3`); `"decode"` past the envelope keeps the typed `indexer_query_rows` decline. A performance-only knob (the `sparse_tile_form` precedent): the same selection function under either form up to the fp32 accumulation order of two scorers -- bitwise WITHIN a form, never ACROSS. `blk.index_select_form` keeps the declaration, `blk.index_select_form_resolved` the form; `serving_envelope().decode.index_select_forms` lists the vocabulary. Refused (`ValueError`) off the indexer over the pools unless `"auto"` |
 | `block_table` (execute) | `[B, max_pages]` int32 at the declared strides; `0` = the NULL block of a padded entry | REQUIRED; page ids are device data |
 | `kv_lens` (execute) | `[B]` int32 contiguous: the LOGICAL KV length of every sequence INCLUDING the step's tokens; `0` = a padded entry | REQUIRED; bound to the SDPA's KV side ONLY (`seq_kv_lens = kv_lens`, `seq_q_lens = None`: every Q row of the step is live) |
 | `seq_lens` (execute) | -- | REFUSED under `kv_source="paged"` (the dense block's self-attention length is a Q-side length; the KV length is `kv_lens`) |
@@ -1375,13 +1382,13 @@ standalone adapter on the same views; the workspace sentinel; CUDA-graph capture
 lengths / tables / lists / slots / inputs bitwise eager -- on the four-band geometry and on the indexer-band one at N 13952, whose
 slab rides the small-M route's 128-row tile; the band chain's launch census one above the band-off chain's, the raw-key write).
 
-**The in-block indexer's DECODE step over the pools (`QsaSpec(index_source="indexer", index_band=True)` with
-`kv_source="paged"`; bf16; 2026-10-21).** The block-sparse DECODE mode derives the step's selection itself: declare the mode
+**The in-block indexer's DECODE and EXTEND steps over the pools (`QsaSpec(index_source="indexer", index_band=True)` with
+`kv_source="paged"`; bf16; the DECODE step 2026-10-21, the EXTEND step 2026-10-29).** The block-sparse DECODE mode derives the step's selection itself: declare the mode
 with the indexer geometry and THREE more samples -- `sample_index_kv_cache [n_pages, P / 4, 1, 128]` (the PAGED compressed-key
 cache in the activation dtype: compressed row `j` of sequence `b` lives on page `block_table[b, j // (P / 4)]`, row `j % (P / 4)`;
 page 0 is the null page; a page holds its rows contiguously), `sample_index_state_cache [blocks, cap, 1, 128]` (the RING of raw
 indexer keys, position-indexed -- the raw key of token position `p` of a sequence lives at row `p % cap` of its block; `cap >=
-S_q + 3`, the compress kernel's rule `min_ring_rows`; block 0 is the null block) and `sample_index_state_block_table [B, 1]`
+S_q + 3` on the DECODE step and `cap >= 3` on the EXTEND step, the compress kernel's rule `min_ring_rows` per form; block 0 is the null block) and `sample_index_state_block_table [B, 1]`
 int32 (the ring block per sequence; `0` for a dead entry) -- and `execute(..., w_iq_norm=, w_ik_norm=, index_kv_cache=,
 index_state_cache=, index_state_block_table=, cos_pos=, sin_pos=)`, the position tables `[1 or B, >= max_pages x P, rope_dim]`
 over the table's whole reach (the table is the CEILING on positions: one row short is a `ValueError` naming the bound before any
@@ -1419,19 +1426,63 @@ the counts, the ids, the compressed-slot report).  The envelope publishes the fa
 `decode.index_sources` (`("caller", "indexer")` at bf16 x `index_head_dim` 128), `index_cache_dtypes` (`(bf16, e4m3)`: the e4m3
 compressed-key cache served at decode since 2026-10-21, "At decode over the pools" above),
 `index_head_dims` (`(128,)`), `index_kv_heads` (`(1,)`), `index_block_sizes` (`(4,)`), `index_top_k_range` (`(4, 512, 4)`),
-`index_query_rows_max` (64: `S_q x next_pow2(index_heads)` rows per sequence), `index_state_rows_extra` (3: `cap >= S_q + 3`),
+`index_query_rows_max` (64: `S_q x next_pow2(index_heads)` rows per sequence, the DECODE step's envelope), `index_state_rows_extra` (3:
+`cap >= S_q + 3` on the DECODE step), `index_select_forms` / `index_extend_ring_rows_min` (3: `cap >= 3` on the EXTEND step) /
+`index_extend_select_budget_bytes` / `index_compress_roundings` (the EXTEND step's facts, 2026-10-29),
 `index_page_sizes` (`(16, 32, 64, 128)`: `P / 4` a power of two), `fuse_prepare_default`; `decode.kv_cache_dtypes` is `(bf16,)`
 under the indexer (the e4m3 pools wait for the sparse core's in-kernel dequant arm: `indexer_e4m3_pool`).  Typed declines by
-row name (`decode.declines`, each the text the declaration raises): `indexer_query_rows`, `indexer_page_size`,
+row name (`decode.declines`, each the text the declaration raises): `indexer_query_rows` (since 2026-10-29 under the explicit
+`index_select_form="decode"` pin only: `"auto"` takes the EXTEND step past the envelope), `indexer_page_size`,
 `indexer_e4m3_pool`, `indexer_shared_list`, `fuse_prepare_rope_tables_unfused`, `indexer_f16`, `indexer_head_dim`, `indexer_thd`
-(the `indexer_e4m3_cache` row retired 2026-10-21: the e4m3 cache is served); `use_pdl=True` under the indexer keeps
+(the `indexer_e4m3_cache` row retired 2026-10-21: the e4m3 cache is served), and the EXTEND step's rows `indexer_extend_fuse_prepare`,
+`indexer_extend_ring_slots`, `indexer_extend_rope_tables_only`, `indexer_extend_ring_rows`, `indexer_extend_chunk_rows` (the last raised
+with the two numbers appended after the shared text); `use_pdl=True` under the indexer keeps
 a typed decline by name (the caller-list sparse chain serves the switch; the indexer's step threads the switch it is handed and is
-handed `False` until its own switched chain is measured).  **Limitation:** there is no FROST writer
-of the paged compressed-key cache at PREFILL yet -- the prefill form writes `index_k_compressed` densely (`[B, >= floor(S / 4),
-128]`); a serving stack scatters those rows into the pages through its table and primes the ring with the prompt's last `cap`
-raw keys (the band's `index_k_raw` rows or the slab's band), exactly as the multi-step cell of the end-to-end module does -- under the
-e4m3 indexer cache the prefill form's e4m3 rows prime the paged e4m3 cache (one rounding convention, so the scatter is bitwise the step's
-own rows).
+handed `False` until its own switched chain is measured).
+
+**The EXTEND step (`index_select_form="extend"`, or `"auto"` past the decode scorer's envelope `S_q x next_pow2(index_heads) <= 64`;
+2026-10-29).** The same declaration at `S_q = T` is a T-row CHUNK of every sequence behind a cached prefix of `P = kv_lens[b] - T` tokens
+(`P = 0`: the first chunk, a prefill through the serving caches): the block selects for the chunk's rows itself over the PREFIX's
+compressed keys plus the chunk's own complete blocks, and WRITES the serving caches -- (1) the band's indexer queries normed + rotated
+per token (the pool-1 compress; `QsaSpec.index_compress_rounding` names the chain's rounding points); (2) the CHUNK COMPRESS, the step
+compress's chunk form with the ring READ-ONLY (`frost_qsa_compress_step(ring_write=False)`): every chunk row that completes a 4-token
+block pools it from the ring (the straddling block's rows below `P`) and the chunk's rows, RMSNorm + partial RoPE at the block START from
+`cos_pos` / `sin_pos`, into the paged compressed-key cache through the main table -- BITWISE the from-scratch prefill compress of the same
+keys; (3) the GATHER (`cudnn_block_qsa_kbar_gather`): every sequence's `min(floor(kv_lens[b] / 4), max_pages x P / 4)` compressed rows
+through the table into a dense workspace kbar (zero rows up to `ceil(T / 4)` on a dead / short sequence), the per-row visible counts, the
+select pieces' first query positions (clamped so no scorer write leaves its slab) and a per-sequence report; (4) the SELECT per row WINDOW
+-- the DSA compact-logits scorer + the fused radix top-k (`cudnn.ops.qsa_select_forward` with the device `q_pos0`, deterministic) over at most
+`R = min(T, max(16, QSA_EXTEND_SELECT_BUDGET_BYTES // (n_blocks_max x 4)))` rows per launch pair (the 512 MiB module constant bounds ONE fp32
+scratch slot reused window by window; `ceil(B x T / R)` windows: one at B 1 x T 2048 behind 128K, two at B 4); (5) the CANONICAL ORDER
+(`cudnn_block_qsa_canonical_list`, in place: the ids descending, `-1` past `min(top_k, counts)`, a dead row all `-1`) into `block_ids_out` or
+the workspace; then the K / V write-through + the RING arm -- the chunk's raw keys at positions `>= kv_lens[b] - cap` into the ring at
+`execute(index_state_slot_mapping=)` (the stack's `block x cap + pos % cap` for its last `cap` tokens, `-1` elsewhere; REQUIRED on this
+form), AFTER the chunk compress's ring reads in stream order -- and the sparse core per row.  12 launches at one select window (the slab,
+norm + RoPE, the four indexer launches + the scorer pair, two cache writes, the core, the out projection; + 1 split combine, + 2 per further
+window).  Always unfused (`fuse_prepare=None` reads False; an explicit True is the typed `indexer_extend_fuse_prepare`: the chunk's ring read
+and its tail write live in two launches); `rope_position_tables_only=False` (`indexer_extend_rope_tables_only`);
+`index_state_slot_mapping_present=True` (`indexer_extend_ring_slots`); the ring sample needs `cap >= 3` (`indexer_extend_ring_rows`: the
+straddling block reads at most three positions below the chunk, distinct modulo any ring of that many rows -- the kernel's TRUE bound, not an
+asserted one; the DECODE step's `cap >= S_q + 3` does not apply; vLLM's 4 satisfies it); `S_q <= max_kv_len` (`indexer_extend_chunk_rows`).
+THE RING INPUT CONTRACT: positions `4 floor(P / 4) .. P - 1` of every sequence already sit in the ring (at most three: the stack's own rule
+`token + cap >= end`, or this block's tail arm on the previous chunk / decode step) -- a stack that primed fewer rows reads stale slots,
+which no device report can see.  THE DEVICE-VALUE CONTRACT: `kv_lens[b] in {0} u [S_q, max_pages x P]` -- `0` a dead / padding sequence
+(exact: every list slot `-1`, `block_lens_out` 0, `out = 0` / `LSE = -inf`, no cache / ring / pool row touched); `0 < kv_lens[b] < S_q` a
+violation REPORTED as `-2` in the workspace's per-sequence report (the live rows' selection position-misaligned); `kv_lens[b] > max_pages x P`
+the other violation, `-3` (the clamped query positions keep every scorer write inside its slab -- memory-safe by construction -- and the
+compress's blocks past the table report `-2`); never raised, never read by the block.  CACHE PARITY: a chunk-written row is BITWISE the
+from-scratch compress and bitwise a decode-written row of the same four keys -- one chain under either rounding convention (`"single"` the
+reference; `"hf"` the HF / vLLM rounding points, not their bits, for a stack that mixes vLLM-written rows).  MIXED STEPS (the interim
+contract until the packed sparse arm): a serving step with decodes AND prefills is TWO plans per layer -- the decode step at `S_q <= 16`
+and the extend step at `S_q = T` -- executed back to back on one stream (disjoint sequences, the order free); ragged chunks are several
+extend executes grouped by `T` (front-padding a shorter chunk into a uniform `T` would pool garbage raw keys into prefix groups, which the
+block cannot detect).  The workspace carve is the caller-list band block's plus nine slots at the end (the queries, the slot report, the
+dense kbar `[B, max_pages x P / 4, 128]`, the piece positions, the counts, the report, the ids, the scores, the window scratch `R x
+max_pages x P / 4` fp32 -- 256 MiB at B 1 x T 2048 behind 128K; `get_workspace_size()` holds all of it).  The first execute of a fresh plan
+uploads the window plan's constants, so a CUDA-graph capture takes the block after ONE eager warm-up (the prefill form's rule; the decode
+step's no-warm-up claim does not extend to this form).  The envelope publishes `decode.index_select_forms` (`("auto", "decode",
+"extend")`), `index_extend_ring_rows_min` (3), `index_extend_select_budget_bytes` and `index_compress_roundings` (`("single", "hf")`).
+
 Validated on Rubin against the two-stage oracle (the step's set equals the fp64 top-k of the block's own operands up to ties; the
 attention of every row within the budget of the fp32 oracle fed the kernel's list; the ring rows and the completed cache rows
 bitwise the compress kernel; dead rows exact): `S_q` 1 .. 4 x `B` 1 / 2 / 4 x `kv_lens` 2 .. 32768 with dead and
@@ -1440,6 +1491,15 @@ kernel name, the identity region bitwise the caller-list block on the full list,
 position-table forms, the MTP residues, the workspace sentinel, and eight carried decode steps after a prefill (a rejected draft
 re-stepped; the cache rows bitwise a from-scratch compress of the accepted stream after every step).  Functional cells on a
 development node; the fusion's default flipped to True on cc 10.7 after the exclusive-node end-to-end gate measured it (2026-10-21).
+The EXTEND step validated on a Rubin development node (cc 10.7; functional cells, no perf claim -- the perf row is a later change's;
+`test_block_qsa_extend.py`, `test_block_qsa_end_to_end.py`) against the same two-stage oracle for the chunk form: chunk starts at every
+residue of the block grid (incl. residue 2), a true shorter-than-the-remainder chunk (`T < 4 - P % 4`: no block completes, the tail alone
+enters the ring), `T < cap` chunks carrying the ring's tail through the ring arm, the chunk-start pin (a row lists the straddling block iff
+it completes at or before that row), the identity rows + the first sparse row, two select windows at a lowered budget, the 128K-token
+reach, the e4m3 cache twins, the 24 / 2 geometry, the extend pin at decode widths against the decode form (the same function within the
+budget, never bitwise), cache parity under both roundings, the two device-value reports, the workspace honesty with no allocation and no
+host sync, the launch census by kernel name, the capture after one warm-up, and the 301-token prompt as chunks [125, 2, 1, 173] followed by
+eight carried decode steps.
 
 ### Backward
 
@@ -1843,8 +1903,10 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   declaration is the block-sparse DECODE / extend-with-prefix mode: stage (4) the sparse core reading the pools, one list per sequence
   at `S_q <= 4` (`block_ids [B, top_k]`) and one per row past it (any `S_q`), `decode_split_kv` in `[1, ceil((top_k + 1) / 32)]` or the
   fill rule, `fuse_gate` and `return_lse` served, `sample_block_table` contiguous, `fuse_prepare` served (`None` = the measured
-  default), the in-block indexer's DECODE step over the pools served (`index_source="indexer"`: bf16, the per-row list, the paged
-  compressed-key cache + the ring + its table as samples; "The in-block indexer's DECODE step over the pools" above); the packed form is
+  default), the in-block indexer's DECODE and EXTEND steps over the pools served (`index_source="indexer"`: bf16, the per-row list, the paged
+  compressed-key cache + the ring + its table as samples; `index_select_form` the step form -- the decode step inside the decode scorer's
+  envelope, the extend step past it: a T-row chunk behind a cached prefix that writes the caches itself; "The in-block indexer's DECODE and
+  EXTEND steps over the pools" above); the packed form is
   a typed decline.
 - The e4m3 KV cache (`kv_cache_dtype=torch.float8_e4m3fn`): bf16 activations with `paged_kv_page_size > 0`; the quantizing write-through
   on the dense prefill forms (QsaSpec or dense) and the block-sparse DECODE mode over e4m3 pools at `S_q <= 4` (the gathered cast + the

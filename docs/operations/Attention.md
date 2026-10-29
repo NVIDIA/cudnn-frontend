@@ -862,7 +862,8 @@ Q-to-K and K-to-Q views from one coarse classification.
 The experimental [Gated Attention Block API](/operations/Attention/gated_attention_block) is a model-level FE OSS
 API for NVIDIA Rubin (SM107): the QKV+gate projection, QK-RMSNorm (optional) with partial RoPE, GQA SDPA,
 sigmoid gate and out projection of a Qwen3.5-style gated attention sub-layer behind one class, one workspace
-and one `execute()`, every stage a FROST kernel. It runs bf16 / fp16, per-tensor FP8 and MXFP8 -- the MXFP8
+and one `execute()`, every stage a FROST kernel; on a `QsaSpec` geometry the in-block indexer serves its decode and extend steps
+over the paged side caches. It runs bf16 / fp16, per-tensor FP8 and MXFP8 -- the MXFP8
 pipeline optionally with MXFP4 (e2m1 x E8M0) projection weights and with an NVFP4 or MXFP4 block-quantized output
 feeding an fp4 x fp4 out projection -- with two fusion knobs (`fuse_norm_rope`, `fuse_gate`) that take the block to
 three launches (four with the fp4 output), plus a bf16 backward with a recompute policy. It is separate from the
