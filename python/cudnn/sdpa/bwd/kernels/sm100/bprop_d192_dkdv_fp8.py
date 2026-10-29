@@ -35,7 +35,8 @@ from cudnn.sdpa.bwd.config_sm100_d192_dkdv_fp8 import make_config
 _PARAMS = globals().get("FROST_TEMPLATE_PARAMS", (192, 128))
 MX = bool(_PARAMS[3]) if len(_PARAMS) > 3 else False
 WINDOW = int(_PARAMS[4]) if len(_PARAMS) > 4 else 0
-CFG, BAR_LAYOUT = make_config(int(_PARAMS[0]), int(_PARAMS[1]), MX)
+K_HW = int(_PARAMS[5]) if len(_PARAMS) > 5 else 32
+CFG, BAR_LAYOUT = make_config(int(_PARAMS[0]), int(_PARAMS[1]), MX, k_hw=K_HW)
 TS = bool(CFG.T_SHARED)
 P_SMEM = bool(CFG.P_SMEM)
 EXP2_FMA_SPLIT = bool(_PARAMS[2]) if len(_PARAMS) > 2 else False
@@ -122,7 +123,8 @@ def _operand(slab, offset, dtype, rows, cols, *, transpose=False, swz=CFG.SWIZZL
     )
 
 
-def _mma_desc(m, n, k, *, atranspose=False, btranspose=False, mx=MX):
+def _mma_desc(m, n, k, *, atranspose=False, btranspose=False, mx=MX, k_hw=None):
+    k_hw = CFG.K_HW if k_hw is None else k_hw
     if mx:
         return MmaDesc(
             M=m,
@@ -130,14 +132,16 @@ def _mma_desc(m, n, k, *, atranspose=False, btranspose=False, mx=MX):
             K=k,
             bpe_a=CFG.BPE,
             bpe_b=CFG.BPE,
-            tile_k_hw=CFG.K_HW,
+            tile_k_hw=k_hw,
             atranspose=atranspose,
             btranspose=btranspose,
             cta_group=1,
-            idesc=nvvm.Tcgen05MxInstrDesc.build(a_dtype=FP8, b_dtype=FP8, m_dim=m, n_dim=n, k_dim=0, a_major=int(atranspose), b_major=int(btranspose)),
+            idesc=nvvm.Tcgen05MxInstrDesc.build(
+                a_dtype=FP8, b_dtype=FP8, m_dim=m, n_dim=n, k_dim=int(k_hw == 64), a_major=int(atranspose), b_major=int(btranspose)
+            ),
             kind=nvvm.MMABlockScaleKind.MXF8F6F4,
             is_block_scale=True,
-            sf_blocks_per_step=CFG.K_HW // 32,
+            sf_blocks_per_step=k_hw // 32,
             scale_vec_size=nvvm.Tcgen05MMAScaleVecSize.BLOCK32,
         )
     return MmaDesc(
@@ -146,12 +150,12 @@ def _mma_desc(m, n, k, *, atranspose=False, btranspose=False, mx=MX):
         K=k,
         bpe_a=CFG.BPE,
         bpe_b=CFG.BPE,
-        tile_k_hw=CFG.K_HW,
+        tile_k_hw=k_hw,
         atranspose=atranspose,
         btranspose=btranspose,
         cta_group=1,
         idesc=nvvm.Tcgen05InstrDesc.build(
-            c_dtype=cutlass.Float32, a_dtype=FP8, b_dtype=FP8, m_dim=m, n_dim=n, a_major=int(atranspose), b_major=int(btranspose)
+            c_dtype=cutlass.Float32, a_dtype=FP8, b_dtype=FP8, m_dim=m, n_dim=n, k_dim=int(k_hw == 64), a_major=int(atranspose), b_major=int(btranspose)
         ),
         kind=nvvm.Tcgen05MMAKind.F8F6F4,
     )
