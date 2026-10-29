@@ -847,13 +847,14 @@ def _splitk_workspace(compiled):
     return Workspace(buf, compiled.workspace_bytes, "test_block_scale_splitk"), buf
 
 
-def _run_bs_numeric(combo, config_name, M, N, K, out_major="n", split_k=1, force_stg=False, cluster_k_reduce=False):
+def _run_bs_numeric(combo, config_name, M, N, K, out_major="n", split_k=1, force_stg=False, cluster_k_reduce=False, k_pad_byte=0):
     """Block-scale matmul vs a torch dequant-matmul reference.
 
     ``combo`` is ``nvfp4`` / ``mxfp4`` / ``mxfp8`` (both sides alike) or ``mxfp8_x_mxfp4`` -- the
     MIXED catalog row: e4m3 A against an e2m1 B under E8M0 / 32 scales (the gated attention
     block's stage (1) with an MXFP4 weight), so the shape/cluster sweep covers it beyond the
-    single 256x256x512 shape of ``test_mixed_mxfp8_mxfp4_numerics``."""
+    single 256x256x512 shape of ``test_mixed_mxfp8_mxfp4_numerics``. ``k_pad_byte`` fills the
+    K-padding slots of both F8_128x4 blobs."""
     dev = "cuda"
     torch.manual_seed(0)
     mixed = combo == "mxfp8_x_mxfp4"
@@ -912,8 +913,8 @@ def _run_bs_numeric(combo, config_name, M, N, K, out_major="n", split_k=1, force
             # K words), so its rank-3 view carries the PADDED extents when M / N
             # (or sf_k) are not multiples -- the kernel reads it as a base
             # pointer plus the layout it rebuilds from the problem size.
-            binding.sfa_operands[0]: _to_blocked(sfa_log).view(1, -(-M // 128) * 128, -1),
-            binding.sfb_operands[0]: _to_blocked(sfb_log).view(1, -(-N // 128) * 128, -1),
+            binding.sfa_operands[0]: _to_blocked(sfa_log, k_pad_byte).view(1, -(-M // 128) * 128, -1),
+            binding.sfb_operands[0]: _to_blocked(sfb_log, k_pad_byte).view(1, -(-N // 128) * 128, -1),
         },
         workspace=ws,
     )
@@ -3509,6 +3510,23 @@ def test_sm120_block_scale_tile_constants_render(combo, kind, vec, fmt, ptx):
 )
 def test_sm120_block_scale_matmul_numerics(combo, config_name, M, N, K):
     _run_bs_numeric(combo, config_name, M, N, K)
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "combo, config_name, K, split_k",
+    [
+        ("mxfp8", _SM120_BS_128, 320, 1),  # 10 K-scales: pad slots 10-11 scale whole zero-filled 1X K blocks
+        ("mxfp4", _SM120_BS_128, 416, 1),  # 13: pad slot 13 shares a 2X K block with live slot 12
+        ("nvfp4", _SM120_BS_128, 352, 1),  # 22: pad slots 22-23 share a 4X K block with live slots 20-21
+        ("mxfp8", _SM120_BS_128_W24, 1088, 3),  # 34: the padded word is in the last split's last K tile
+    ],
+)
+def test_sm120_block_scale_ignores_k_padding_scales(combo, config_name, K, split_k):
+    """When ceil(K / block_size) is not a multiple of 4, each row's last F8_128x4 word holds K-padding
+    bytes, which the SF box loads and the MMAs of the zero-filled K blocks read. A NaN encoding there
+    (UE8M0 0xFF, UE4M3 0x7F) must not reach the output: it used to make every output element NaN."""
+    _run_bs_numeric(combo, config_name, 256, 200, K, split_k=split_k, k_pad_byte=0x7F if combo == "nvfp4" else 0xFF)
 
 
 @requires_sm120
