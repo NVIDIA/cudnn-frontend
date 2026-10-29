@@ -642,8 +642,9 @@ For fixed-geometry staged pointer hosts, validate Q/K/V/O shape, dtype and devic
 and all auxiliary bindings before workspace carving or any copy/fill. A tensor
 compiler previously checked some of these at dispatch; raw addresses cannot.
 The SM80 detector `test_dense_native_rejects_invalid_operands_before_launch`
-replaces the workspace carver with a tripwire so an invalid short buffer fails
-safely before it can reach a GPU launch.
+replaces the launch function with a tripwire to check invalid operands before
+launch. `test_sm80_revalidates_every_current_operand[short]` separately checks
+that a short backing-storage span is rejected.
 
 For a GEMM+GLU failure, compare the final output with both the stored GEMM
 intermediate and an independent dot product before attributing it to GEMM.
