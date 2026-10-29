@@ -153,6 +153,24 @@ results/<config>/<gpu>/
 ![DeepSeek-V4 DSA on B200](results/deepseek_v4/b200/deepseek_v4.webp)
 - `dsv4_flash: H=64, d=512, K=640 (indexer_topk=512)`; `dsv4_pro: H=128, d=512, K=1152 (indexer_topk=1024)`; bf16, sink + `topk_length`, non-deterministic backward.
 
+#### SM100 (development part) - QSA at TP 1/2/4/8
+
+![QSA at TP 1/2/4/8 on an SM100 development part](results/qsa/sm100/qsa.webp)
+- `qsa: H24/2`, `qsa-tp2: H12/1`, `qsa-tp4: H6/1`; `d=256`, bf16, up to 512
+  complete causal four-token blocks + the tail block per query, one packed
+  sequence per case; `qsa-tp8` (H3/1) is in the CSV as `skipped`.
+- Measured on a 68-SM, 33 MB-L2 compute-capability 10.0 development part
+  (`gpu_name` in the CSV), not a B200: read the rows as a functional reference
+  and for the shard-to-shard ratios, not as the architecture's throughput.
+  Entries for production GPUs land in `results/qsa/<arch>/` from
+  `run_all.sh <arch> "" qsa`.
+- Ratios that carry over: at 16k+ the TP 4 forward costs about the TP 2
+  forward (six valid columns of the same 16-column tile), and the TP 4
+  backward is ~0.85x the TP 2 backward per token at 32k (four 6-head queries
+  batched per CTA against two 12-head queries). On this part the TFLOPS fall
+  beyond 8k although the gathered tokens per query are flat (~1.8k at 8k,
+  ~2.0k at 32k); a production run decides how much of that is the part.
+
 ## Single Scripts
 
 ### Standalone Indexer Top-K
