@@ -319,7 +319,9 @@ def _kernel(
                         nvvm.VoteSync.BALLOT,
                     )
                     if thread_succeed != 0:
-                        winning_lane = cutlass.Int32(31) - cute.arch.bfind(cute.arch.brev(thread_succeed)).to(cutlass.Int32)
+                        # The lowest succeeding lane, found on the Uint32 ballot: on the Int32 one bfind is bfind.s32,
+                        # which returns 0xFFFFFFFF for an all-lanes ballot (brev == -1), i.e. lane 32.
+                        winning_lane = cutlass.Int32(31) - cute.arch.bfind(cute.arch.brev(cutlass.Uint32(thread_succeed))).to(cutlass.Int32)
                         scan_base = nvvm.shfl_sync(full_warp_mask, visit_idx, winning_lane, shfl_idx_clamp, nvvm.Shfl.IDX)
                         group_idx = nvvm.shfl_sync(full_warp_mask, my_group, winning_lane, shfl_idx_clamp, nvvm.Shfl.IDX)
                         group_begin = nvvm.shfl_sync(full_warp_mask, my_begin, winning_lane, shfl_idx_clamp, nvvm.Shfl.IDX)
@@ -523,6 +525,9 @@ def _kernel(
             sched_stage = cutlass.Int32(0)
             sched_full_phase = sched_full_phase ^ 1
 
+        # Routed rows the groups cover (the final offset, at most the capacity M): the count an
+        # ungrouped AVG over tokens divides by. At least 1, so an empty routing flushes 0, not NaN.
+        moe_used_rows = cutlass.max(cutlass.min(cutlass.Int64(first_token_arr[num_groups]), M), cutlass.Int64(1))
         _red_part = cute.make_rmem_tensor(red_part_slots, cutlass.Float32)
         red_part_seed(_red_part)
         while is_valid != 0:
@@ -764,7 +769,7 @@ def _kernel(
                                         # @@INJECT_STG_VEC_BINDINGS@@
 
                                         # @@INJECT_EPILOGUE@@
-            red_part_flush_tile(_red_part, lane, M, N, (group_idx, group_begin, group_end), _red_part_args)
+            red_part_flush_tile(_red_part, lane, M, N, (group_idx, group_begin, group_end, moe_used_rows), _red_part_args)
 
             # Next record.
             while not nvvm.mbarrier_try_wait_parity(sched_full_mbar_ptr.subview(sched_stage), sched_full_phase, time_limit=10_000_000):
@@ -784,7 +789,7 @@ def _kernel(
                 sched_stage = cutlass.Int32(0)
                 sched_full_phase = sched_full_phase ^ 1
 
-        red_part_flush_cta(_red_part, lane, M, N, (group_idx, group_begin, group_end), _red_part_args)
+        red_part_flush_cta(_red_part, lane, M, N, (group_idx, group_begin, group_end, moe_used_rows), _red_part_args)
         # No more tiles for this CTA: all its global A/B reads have been issued.
         if cutlass.const_expr(USE_PDL):
             if warp_idx == 0:
