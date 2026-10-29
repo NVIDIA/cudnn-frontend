@@ -1517,7 +1517,7 @@ def test_sm107_mxfp8_tmem_map_fills_the_rubin_allocation_exactly():
     # not narrowed (it has no quantized SF or ones tile to push over the line).
     assert supported_cgas_for((192, 128), fp8=True, device_cc=(10, 0)) == (1, 2)
     assert supported_cgas_for((192, 128), fp8=False, device_cc=(10, 7)) == (1, 2)
-    assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 7)) == (2,)
+    assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 7)) == (1, 2)
     assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 7)) == (1,)
     # ...while d256 MXFP8 admits the pair too (test_sm107_d256_mxfp8_dense_legs_run_the_two_cta_pair pins where it is used)
     assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 7), pertensor=False) == (1, 2)
@@ -1776,8 +1776,8 @@ def _mxfp8_facts(**kw):
 def test_sm107_mxfp8_advertises_lpt_and_lpt_l2_per_d_shape():
     """INVERTED 2026-09-14 (the row was NATURAL-only): d128 and d192x128 claim
     LPT and LPT_L2, d256 and d512 do not, the row-wide floor stays NATURAL --
-    and the claim REACHES the ranking: a causal GQA graph leads with LPT_L2, a
-    causal graph without GQA on a few-wave grid leads with LPT, dense stays
+    and the claim REACHES the ranking: a causal GQA graph leads with LPT_L2 (plain LPT on the d128 row's
+    short-K/V arm), a causal graph without GQA on a few-wave grid leads with LPT, dense stays
     NATURAL.  An accept AND a reject per shape (engine contract, Rule 9)."""
     from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
     from cudnn.sdpa.fwd import engines, heuristics
@@ -1787,7 +1787,9 @@ def test_sm107_mxfp8_advertises_lpt_and_lpt_l2_per_d_shape():
     for shape in ((128, 128), (192, 128)):
         dom = engines.effective_sched_policies(caps, _mxfp8_facts(d_qk=shape[0], d_v=shape[1]))
         assert dom == frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}), (shape, dom)
-        assert heuristics._sched_points(caps, _mxfp8_facts(d_qk=shape[0], d_v=shape[1], causal=True, h_kv=2)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL], shape
+        gqa_first = SCHED_LPT if shape == (128, 128) else SCHED_LPT_L2
+        gqa_runner = SCHED_LPT_L2 if shape == (128, 128) else SCHED_LPT
+        assert heuristics._sched_points(caps, _mxfp8_facts(d_qk=shape[0], d_v=shape[1], causal=True, h_kv=2)) == [gqa_first, gqa_runner, SCHED_NATURAL], shape
         assert heuristics._sched_points(caps, _mxfp8_facts(d_qk=shape[0], d_v=shape[1], causal=True)) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL], shape
         assert heuristics._sched_points(caps, _mxfp8_facts(d_qk=shape[0], d_v=shape[1])) == [SCHED_NATURAL], shape
     for shape in ((256, 256), (512, 512)):

@@ -1281,15 +1281,14 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
         return frozenset({1, 2})
     if (
         capabilities.sm_lo == 107
-        and capabilities.is_fp8
-        and not capabilities.is_mxfp8
+        and (capabilities.is_fp8 or capabilities.is_mxfp8)
         and selected == (128, 128)
         and not facts.thd
         and not facts.has_paged_kv
         and (split_kv or 1) == 1
         and int(facts.b) * int(facts.h_kv) * int(facts.s_kv) * (int(facts.d_qk) + int(facts.d_v)) <= _SM107_D192_PT_CGA1_KV_BYTES_MAX
     ):
-        # Per-tensor fp8 d128 on the 107 line, dense unsplit: both widths.
+        # Quantized d128 on the 107 line, dense unsplit: both widths.
         return frozenset({1, 2})
     if (
         capabilities.sm_lo == 107
