@@ -385,7 +385,7 @@ class TestSdpaBwdDense:
         assert dq.isfinite().all() and dk.isfinite().all() and dv.isfinite().all()
 
     @pytest.mark.L0
-    @pytest.mark.parametrize("grad_layout", ["bhsd_contiguous", "broadcast"])
+    @pytest.mark.parametrize("grad_layout", ["bhsd_contiguous", "broadcast", "unaligned_pitch"])
     def test_dense_grad_out_keeps_its_layout(self, grad_layout):
         """dO is declared with its own strides rather than copied into O's layout; only a broadcast dO (no descriptor
         can carry it) is materialized."""
@@ -396,8 +396,10 @@ class TestSdpaBwdDense:
         o, lse = torch.ops.cudnn.sdpa_fwd(q, k, v, scale, is_causal=True, return_lse=True)
         if grad_layout == "bhsd_contiguous":
             grad = torch.randn(B, H, S, D, dtype=o.dtype, device="cuda")
-        else:
+        elif grad_layout == "broadcast":
             grad = torch.randn(1, 1, 1, D, dtype=o.dtype, device="cuda").expand(B, H, S, D)
+        else:  # aligned base, outer pitch 65 elements (130 B): not declarable, so materialized (review on #2003)
+            grad = torch.randn(B * H * S * (D + 1), dtype=o.dtype, device="cuda").as_strided((B, H, S, D), (H * S * (D + 1), S * (D + 1), D + 1, 1))
         assert grad.stride() != o.stride()
         dq, dk, dv = torch.ops.cudnn.sdpa_bwd(grad, q, k, v, o, lse, scale, is_causal=True)
         _, rdq, rdk, rdv = self._ref(q, k, v, scale, True, grad)
@@ -602,3 +604,23 @@ class TestSdpaVarlen:
             assert (got.float() - ref).abs().max().item() < TOL
         keys = [key for key in torch_op._graph_cache if key[0] == "sdpa_bwd"]
         assert any(tuple(grad.stride()) in key for key in keys), "dO must be declared with its own strides"
+
+    @pytest.mark.L0
+    def test_thd_grad_out_with_an_undeclarable_pitch_is_materialized(self):
+        """An aligned-base THD dO with a 65-element head pitch cannot be declared; it is copied, not rejected."""
+        torch.manual_seed(0)
+        lens, H, D = [200, 312, 96], 4, 64
+        q, k, v, cu, T, mx = self._make(lens, H, H, D)
+        scale = D**-0.5
+        o, lse = torch.ops.cudnn.sdpa_fwd(
+            q, k, v, scale, is_causal=True,
+            cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=mx, max_seqlen_kv=mx, return_lse=True,
+        )  # fmt: skip
+        grad = torch.randn(T * 260 + 64, dtype=o.dtype, device="cuda").as_strided((T, H, D), (260, 65, 1))
+        dq, dk, dv = torch.ops.cudnn.sdpa_bwd(
+            grad, q, k, v, o, torch_op.thd_lse_to_padded(lse.squeeze(-1), cu, mx), scale, is_causal=True,
+            cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=mx, max_seqlen_kv=mx,
+        )  # fmt: skip
+        _, _, rdq, rdk, rdv = self._ref(q, k, v, cu, is_causal=True, grad=grad)
+        for got, ref in ((dq, rdq), (dk, rdk), (dv, rdv)):
+            assert (got.float() - ref).abs().max().item() < TOL

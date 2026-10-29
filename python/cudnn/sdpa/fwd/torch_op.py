@@ -182,29 +182,48 @@ def _normalize_operand(t: torch.Tensor, name: str, op: str = "sdpa_fwd") -> torc
     return t
 
 
-def _out_bindable(out: torch.Tensor, shape: Tuple[int, ...], q: torch.Tensor) -> bool:
-    """Whether a caller-owned O can be declared as-is: right shape/dtype/device, head dim innermost, 16B-aligned base,
-    no aliasing. Otherwise the op computes into its own O and the caller copies."""
+def _declarable(t: torch.Tensor) -> bool:
+    """Whether ``t`` can be declared as-is: head dim innermost (stride 1), 16B-aligned base, no aliasing, and every
+    outer stride (of a size>1 dim) a 16-byte multiple -- the descriptor contract. THD (T, H, D) is checked as one
+    (1, H, T, D) sequence."""
     from cudnn.sdpa.graph_analyzer import dense_layout_ok
 
-    if tuple(out.shape) != shape or out.dtype != q.dtype or out.device != q.device or out.stride(-1) != 1 or out.data_ptr() % 16:
+    if t.stride(-1) != 1 or t.data_ptr() % 16:
         return False
-    st = tuple(out.stride())
-    dims, strides = (shape, st) if len(shape) == 4 else ((1, shape[1], shape[0], shape[2]), (0, st[1], st[0], st[2]))
-    return dense_layout_ok(dims, strides)
+    if any(n > 1 and (st * t.element_size()) % 16 for n, st in zip(t.shape[:-1], t.stride()[:-1])):
+        return False
+    shape, stride = tuple(t.shape), tuple(t.stride())
+    if t.ndim == 3:
+        shape, stride = (1, shape[1], shape[0], shape[2]), (0, stride[1], stride[0], stride[2])
+    return dense_layout_ok(shape, stride)
+
+
+def _overlaps(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Conservative: the two tensors' byte extents intersect in the same storage."""
+    if a.untyped_storage().data_ptr() != b.untyped_storage().data_ptr():
+        return False
+
+    def extent(t):
+        lo = t.data_ptr()
+        return lo, lo + (1 + sum((n - 1) * st for n, st in zip(t.shape, t.stride()) if n > 0)) * t.element_size()
+
+    (a0, a1), (b0, b1) = extent(a), extent(b)
+    return a0 < b1 and b0 < a1
+
+
+def _out_bindable(out: torch.Tensor, shape: Tuple[int, ...], q: torch.Tensor, inputs=()) -> bool:
+    """Whether a caller-owned O can be written in place: right shape/dtype/device, declarable, and not overlapping an
+    input the kernels read while writing O. Otherwise the op computes into its own O and the caller copies."""
+    if tuple(out.shape) != shape or out.dtype != q.dtype or out.device != q.device:
+        return False
+    return _declarable(out) and not any(t is not None and _overlaps(out, t) for t in inputs)
 
 
 def _grad_out_operand(grad_out: torch.Tensor, o: torch.Tensor) -> torch.Tensor:
-    """dO is declared with its own strides. Only a broadcast or overlapping dO (no descriptor can carry it; autograd
-    produces one for e.g. ``o.sum().backward()``) is materialized, in O's layout."""
-    from cudnn.sdpa.graph_analyzer import dense_layout_ok
-
-    grad_out = _normalize_operand(grad_out, "grad_out", "sdpa_bwd")
-    shape, stride = tuple(grad_out.shape), tuple(grad_out.stride())
-    if grad_out.ndim == 3:  # THD (T, H, D): check it as one (1, H, T, D) sequence
-        shape, stride = (1, shape[1], shape[0], shape[2]), (0, stride[1], stride[0], stride[2])
-    if not dense_layout_ok(shape, stride):
-        _logger.warning("sdpa_bwd: copying a broadcast/overlapping grad_out into O's layout (slow path)")
+    """dO is declared with its own strides. Only a dO no descriptor can carry (broadcast, overlapping, misaligned
+    pitch or base, strided head dim) is materialized, in O's layout."""
+    if not _declarable(grad_out):
+        _logger.warning("sdpa_bwd: copying grad_out into O's layout (slow path)")
         grad_out = torch.empty_strided(o.shape, o.stride(), dtype=grad_out.dtype, device=grad_out.device).copy_(grad_out)
     return grad_out
 
@@ -408,7 +427,7 @@ def _sdpa_fwd_impl(
         q_stride = _thd_desc_stride(q, S_q)
         k_stride = _thd_desc_stride(k, S_kv)
         v_stride = _thd_desc_stride(v, S_kv)
-        if _out is not None and not _out_bindable(_out, (T_q, H_q, D_v), q):
+        if _out is not None and not _out_bindable(_out, (T_q, H_q, D_v), q, (q, k, v, sinks)):
             _out = None
         o_stride = _thd_desc_stride(_out, S_q) if _out is not None else _packed_bhsd_stride(B, H_q, S_q, D_v)
         stats_stride = (S_q * H_q, 1, H_q, 1)  # TH1 token-major
@@ -430,7 +449,7 @@ def _sdpa_fwd_impl(
         k = _normalize_operand(k, "k")
         v = _normalize_operand(v, "v")
         q_stride, k_stride, v_stride = q.stride(), k.stride(), v.stride()
-        if _out is not None and not _out_bindable(_out, (B, H_q, S_q, D_v), q):
+        if _out is not None and not _out_bindable(_out, (B, H_q, S_q, D_v), q, (q, k, v, sinks)):
             _out = None
         o_stride = tuple(_out.stride()) if _out is not None else _like_layout_stride((B, H_q, S_q, D_v), q)  # O adopts Q's layout
         stats_stride = (H_q * S_q, S_q, 1, 1)
