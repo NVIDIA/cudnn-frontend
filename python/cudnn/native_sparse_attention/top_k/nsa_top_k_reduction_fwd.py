@@ -684,14 +684,15 @@ class FineGrainedReductionQK:
                                     k_block_idx = cute.get(tTR_cS_sub_tile[i], mode=[1]) + compute_iter_index * self.mma_tiler[1]
 
                                     if is_masked_tile:
+                                        # cur_s_q / cur_s_k are lengths (exclusive bounds): query cur_s_q and key cur_s_k are outside the sequence.
                                         if cutlass.const_expr(self.is_causal):
                                             k_idx = (k_block_idx + 1) * self.compress_block_sliding_stride - 1
                                             if k_idx > q_idx:
                                                 tTR_rS[i] = -cutlass.Float32.inf
-                                            if q_idx > cur_s_q or k_block_idx > cur_s_k:
+                                            if q_idx >= cur_s_q or k_block_idx >= cur_s_k:
                                                 tTR_rS[i] = -cutlass.Float32.inf
                                         else:
-                                            if q_idx > cur_s_q or k_block_idx > cur_s_k:
+                                            if q_idx >= cur_s_q or k_block_idx >= cur_s_k:
                                                 tTR_rS[i] = -cutlass.Float32.inf
 
                             # P = exp2(S * softmax_scale_log2_e - LSE),
