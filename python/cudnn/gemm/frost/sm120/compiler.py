@@ -1193,11 +1193,39 @@ def _initialize_combine_output(chain: FusionChain, outputs, stream=None) -> None
     buffers.apply_zero_fill_plan(output.data_ptr(), plan, DTYPE_BYTES[chain.outputs[0].dtype], stream)
 
 
+def _zero_extent_problem(m: int, n: int, k: int, block_size: "int | None" = None, source_rows: "int | None" = None) -> bool:
+    """True when a call has nothing to compute; raise when it has work the kernel cannot encode.
+
+    Each template's host encodes its TMA descriptors from the runtime extents, and
+    ``cuTensorMapEncodeTiled`` rejects a zero dimension. The DSL checks that result
+    with ``cuda_dialect_assert_success``, which aborts the process rather than
+    raising, so no zero extent may reach a launch. With M or N zero (an empty batch,
+    an expert-parallel rank that received no rows) the reduction seeds and the
+    COMBINE zero-fill are the whole result: the caller writes them and skips the
+    launch. K = 0, a block-scale K below one scale block (whose scale-factor K extent
+    rounds down to 0) and a GATHER from a token buffer with no rows would still have
+    outputs to write, so they are refused before anything is written.
+    """
+    if not (m and n):
+        return True
+    if k < (block_size or 1):
+        extent = (
+            f"block-scale K={k} is below one {block_size}-element scale block, so the scale factors have a zero K extent" if k else "K=0 is a zero K extent"
+        )
+        raise ValueError(
+            f"cudnn.frost gemm: {extent}, which the kernel's TMA descriptors cannot encode; a call with nonzero M and N needs K >= {block_size or 1}"
+        )
+    if source_rows == 0:
+        raise ValueError("cudnn.frost gemm: MoE token_index routes rows into a token buffer that has none; GATHER reads every routed row from that buffer")
+    return False
+
+
 class CompiledFusedGemm(_CompiledFusedGemm[TileConfig, GemmBinding]):
     """Execute a compiled fused GEMM."""
 
     _compiler = sys.modules[__name__]
     _validate_runtime_quant = True
+    _check_zero_extents = True
 
 
 def _mma_a_dtype(chain: FusionChain) -> str:
@@ -2534,6 +2562,7 @@ class CompiledMoeGemm(_CompiledMoeGemm[TileConfig, GemmBinding]):
     _compiler = sys.modules[__name__]
     _validate_runtime_quant = True
     _validate_combine = True
+    _check_zero_extents = True
 
 
 def _check_runtime_quant(chain: FusionChain, cfg: TileConfig, m: int, n: int) -> None:
@@ -2615,8 +2644,11 @@ def _launch_moe_swap_ab(
     slots = compiled._grid_ctas * compiled._desc_slots_per_cta
     workspace = compiled._make_workspace(slots + _MOE_SCHED_COUNTER_SLOTS, workspace)
     _check_moe_combine_operands(chain, weights, tokens, offsets, weight_sf, token_sf, (token_index, token_ks, top_k_scores), outputs, k, workspace)
+    empty = _zero_extent_problem(m, n, k, chain.block_scale.block_size if chain.block_scale is not None else None, tokens[0].shape[1])
     _initialize_reduction_outputs(chain, outputs, stream)
     _initialize_combine_output(chain, outputs, stream)
+    if empty:
+        return None
     return compiled._launch_moe(problem, offsets, workspace, (*a, *b, *sf), c, aux, stream, token_index, token_ks, top_k_scores)
 
 
@@ -2710,6 +2742,7 @@ class CompiledMoeBlockScaleGemm(_CompiledMoeBlockScaleGemm[TileConfig, GemmBindi
     _validate_combine = True
     _check_padded_operands = True
     _check_all_operands = True
+    _check_zero_extents = True
 
 
 def _jit_moe_block_scale(

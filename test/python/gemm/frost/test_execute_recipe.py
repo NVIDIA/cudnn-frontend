@@ -27,7 +27,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from gemm_test_utils import kw, requires_sm100, to_blocked
+from gemm_test_utils import kw, requires_sm100, requires_sm120, to_blocked
 
 import cudnn
 import cudnn.gemm.frost  # noqa: F401 — installs the cudnn.pygraph recorder hook
@@ -998,3 +998,159 @@ def test_sm120_swap_quant_diagnostic_uses_package_import(monkeypatch):
     monkeypatch.setattr(compiler, "_check_block_quant_semantics", reject)
     with pytest.raises(ValueError, match="invalid quant extent"):
         compiled.explain([])
+
+
+# --- a zero extent never reaches an sm120 template host ---------------------
+#
+# Each template's host encodes its TMA descriptors from the call's extents, and
+# cuTensorMapEncodeTiled rejects a zero dimension; the DSL checks that result
+# with an assertion that abort()s the process. The plans below record their
+# launch instead of compiling one, so code that still launches fails the test
+# rather than taking the test process down with it.
+
+_SM120_CFG = "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"
+
+
+def _max_reduction_graph():
+    """A dense output and a whole-problem MAX, whose identity (-inf) no output holds by accident."""
+    g = _plain_graph()
+    Y = [t for t in g._nodes[-1].outputs.values()][0]
+    R = g.reduction(input=Y, mode=cudnn.reduction_mode.MAX, name="red")
+    R.set_dim([1, 1, 1]).set_stride([1, 1, 1]).set_output(True).set_data_type(F32)
+    return g
+
+
+def _recorded_sm120_plan(graph, cfg):
+    """An sm120 plan built the way the JIT path builds it, with its launch recorded rather than compiled."""
+    from pathlib import Path
+    from cudnn.gemm.frost.sm120 import compiler as C120
+
+    chain, binding = C120._analyze_graph(graph)
+    use_tma = C120._use_tma_store_epi(chain, cfg)
+    calls = []
+    compiled = C120.CompiledFusedGemm(
+        chain=chain,
+        config=cfg,
+        aux_names=[aux.name for aux in chain.aux_tensors],
+        generated_path=Path("unused"),
+        _launchable=lambda *args, **kwargs: calls.append(args),
+        block_scale=chain.has_block_scale,
+        binding=binding,
+        store_modes=C120._store_modes(chain, cfg),
+        use_tma_store=use_tma,
+        vec_bytes_epi=C120._out_vec_bytes(chain, cfg, use_tma),
+        workspace_bytes=C120._splitk_workspace_bytes(chain, cfg),
+    )
+    assert compiled.lowered is not None, compiled.declined
+    return compiled, calls
+
+
+def _sentinel_operands(compiled, m, n, k):
+    """One buffer per bound tensor at a runtime (M, N, K), every output holding 17."""
+    r = compiled.recipe
+    bufs = [None] * len(compiled.binding.bound_tensors())
+    for op in r.inputs:
+        dtype = torch.uint8 if compiled.block_scale else torch.bfloat16
+        bufs[op.index] = torch.ones(op.batch, n if op.is_b else m, k // op.kpack, dtype=dtype, device="cuda")
+    for sf in r.sf:
+        bufs[sf.index] = torch.ones(1, 128, 4, dtype=torch.uint8, device="cuda")  # one F8_128x4 atom
+    for spec, out in zip(compiled.chain.outputs, r.outputs):
+        dtype = torch.float32 if out.raw else {"bf16": torch.bfloat16, "fp16": torch.float16}[spec.dtype]
+        bufs[out.index] = torch.full(expected_shape(out.rule, m, n), 17.0, dtype=dtype, device="cuda")
+    assert all(b is not None for b in bufs)
+    return bufs
+
+
+@pytest.mark.parametrize("split_k", (1, 2), ids=("whole_k", "split_k2"))
+@pytest.mark.parametrize("empty", ("m", "n"))
+def test_sm120_an_empty_call_seeds_its_reductions_and_launches_nothing(split_k, empty):
+    """M or N == 0 leaves nothing to compute: the reduction identity is the whole result.
+
+    No workspace is passed: the engine sizes a split-K plan's workspace from the
+    call's output, and an empty output asks for none.
+    """
+    from cudnn.gemm.frost.tile_config import by_name
+
+    compiled, calls = _recorded_sm120_plan(_max_reduction_graph(), replace(by_name(_SM120_CFG), split_k_slices=split_k))
+    operands = _sentinel_operands(compiled, 0 if empty == "m" else M, 0 if empty == "n" else N, K)
+    compiled.lowered(operands)
+    torch.cuda.synchronize()
+    assert calls == []
+    assert not compiled.deferrals
+    [seed] = [operands[o.index] for o in compiled.recipe.outputs if o.init is not None]
+    assert torch.isneginf(seed).all()
+
+
+@pytest.mark.parametrize("case", ("bf16_k0", "mxfp8_k16"))
+def test_sm120_an_unencodable_k_is_refused_before_anything_is_written(case):
+    """K = 0, or an MXFP8 K below one 32-element scale block (its scale-factor K
+    extent rounds down to 0), still has outputs to write but no K extent a TMA
+    descriptor can encode: the call is refused before the seed or the launch."""
+    from cudnn.gemm.frost.tile_config import by_name
+
+    if case == "bf16_k0":
+        graph, k, match = _max_reduction_graph(), 0, "K=0 is a zero K extent"
+    else:
+        from test_block_scale_matmul import _build_nvfp4_graph
+
+        fp8, e8m0 = cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E8M0
+        graph, k, match = _build_nvfp4_graph(M, N, 256, block_size=32, sf_dt=e8m0, a_dt=fp8, b_dt=fp8), 16, "K=16 is below one 32-element scale block"
+    compiled, calls = _recorded_sm120_plan(graph, by_name(_SM120_CFG))
+    operands = _sentinel_operands(compiled, M, N, k)
+    with pytest.raises(ValueError, match=match):
+        compiled.lowered(operands)
+    torch.cuda.synchronize()
+    assert calls == []
+    for out in compiled.recipe.outputs:
+        assert torch.all(operands[out.index] == 17.0)
+
+
+@requires_sm120
+def test_sm120_frost_engine_runs_an_empty_override_and_refuses_k0():
+    """The public route to a zero extent: a FROST plan executed with override_shapes.
+
+    Each of these abort()ed the process inside the template host. An empty call
+    now leaves the output alone, K = 0 raises, and the plan still serves a real
+    call afterwards.
+    """
+    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
+    A = g.tensor(name="A", uid=1, dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", uid=2, dim=[1, K, N], stride=[K * N, 1, K])
+    C = g.matmul(A=A, B=B, name="mm")
+    C.set_output(True).set_data_type(BF16).set_uid(3)
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    frost = [i for i, p in enumerate(g.plans) if is_python_engine(p.engine_id)]
+    if not frost:
+        pytest.skip("no FROST plan for this graph")
+    g.select_plan(frost[0])
+    g.check_support()
+    g.build_plans()
+
+    torch.manual_seed(0)
+    a = torch.randn(1, M, K, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(1, N, K, dtype=torch.bfloat16, device="cuda")
+    c = torch.full((1, M, N), 7.0, dtype=torch.bfloat16, device="cuda")
+    ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+
+    def run(m, n, k):
+        g.execute(
+            {1: a.data_ptr(), 2: b.data_ptr(), 3: c.data_ptr()},
+            ws,
+            override_uids=[1, 2, 3],
+            override_shapes=[[1, m, k], [1, k, n], [1, m, n]],
+            override_strides=[[M * K, K, 1], [K * N, 1, K], [M * N, N, 1]],
+        )
+        torch.cuda.synchronize()
+
+    run(0, N, K)
+    run(M, 0, K)
+    assert torch.all(c == 7.0)
+    with pytest.raises(ValueError, match="K=0 is a zero K extent"):
+        run(M, N, 0)
+    assert torch.all(c == 7.0)
+    run(128, N, K)
+    ref = torch.einsum("bmk,bnk->bmn", a[:, :128].float(), b.float())
+    torch.testing.assert_close(c[:, :128].float(), ref, atol=2e-1, rtol=2e-2)
+    assert torch.all(c[:, 128:] == 7.0)
