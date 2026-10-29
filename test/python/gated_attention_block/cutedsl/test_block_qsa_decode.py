@@ -1660,9 +1660,10 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
         assert d.index_list_forms == ("per_row",) and d.index_list_form_default == "per_row" and d.pdl_stages == () and d.pdl_default is False
         assert set(_INDEXER_DECLINE_TOKENS) <= set(d.declines) and all(tok in d.declines[nm] for nm, tok in _INDEXER_DECLINE_TOKENS.items())
         assert "indexer_e4m3_cache" not in d.declines, "a served form has no decline row"
-        # the record's tail is append-only (a serving stack reads these by name; a new field goes after `device_cc`, the lean tile's rows
-        # being the last appended: `sparse_tiles` / `sparse_tile_lean_default` and the part the per-cell `sparse_tile(...)` reads)
-        assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-15:] == [
+        # the record's tail is append-only (a serving stack reads these by name; a new field goes after `route_cc` -- the part the dense
+        # routes were read for, appended 2026-10-29 after the lean tile's rows: `sparse_tiles` / `sparse_tile_lean_default` and the part
+        # the per-cell `sparse_tile(...)` reads)
+        assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-16:] == [
             "index_list_forms",
             "index_list_form_default",
             "index_sources",
@@ -1678,6 +1679,7 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
             "sparse_tiles",
             "sparse_tile_lean_default",
             "device_cc",
+            "route_cc",
         ]
         assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=(10, 0)).decode.fuse_prepare_default is False  # an unmeasured part
         f16 = GatedAttentionBlockFwd.serving_envelope(geom, F16, _DEV, device_cc=_SM107).decode
@@ -3289,6 +3291,33 @@ def test_detector_turns_red_when_the_sparse_core_launches_with_the_attribute_but
 # ---------------------------------------------------------------------------
 
 _TILE_LEAN, _TILE_TCGEN05 = "sparse_lean_d256_f16", "sparse_d256_f16"
+
+
+def test_on_a_cc_10_0_reading_the_explicit_lean_tile_through_the_block_is_a_typed_decline(monkeypatch):
+    """Closes the drift since the standalone sparse adapter admitted the EXPLICIT lean tile on cc 10.0 / 10.3: THROUGH THE BLOCK the
+    sparse forms stay Rubin-only (2026-10-29) -- the declaration still resolves the lean body (the adapter would serve it standalone),
+    ``check_support`` declines by name before any stage, the sparse stage itself declines before the adapter, and the envelope says not
+    served there (the AUTO / tcgen05 readings decline the same way: the part statement names the form, not the body)."""
+    import cudnn.gated_attention_block.api as _api
+
+    monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 0))
+    with _no_host_sync():
+        blk, _ = _declare(GEOM_SMALL, 1, 1, sparse_tile_form="lean")
+        auto, _ = _declare(GEOM_SMALL, 1, 1)
+    assert blk.sparse_tile == _TILE_LEAN and blk.sparse_tile_form == "lean" and auto.sparse_tile == _TILE_TCGEN05
+    for b in (blk, auto):
+        with pytest.raises(NotImplementedError, match=r"sparse forms .* served on cc 10\.7 \(Rubin\) only") as e:
+            b.check_support()
+        assert "explicit lean tile on cc 10.0 / 10.3" in str(e.value) and "found SM100" in str(e.value)
+        with pytest.raises(NotImplementedError, match=r"sparse forms .* served on cc 10\.7 \(Rubin\) only"):
+            b._sdpa.check_support()
+    env = GatedAttentionBlockFwd.serving_envelope(blk.geom, BF16, _DEV, device_cc=(10, 0)).decode
+    assert not env.served and "sparse forms" in env.reason and env.sparse_tile(1, 1, sparse_tile_form="lean") is None and env.sparse_tiles == ()
+    monkeypatch.setattr(_api, "_device_cc_of", lambda device: _SM107)
+    with _no_host_sync():
+        rubin, _ = _declare(GEOM_SMALL, 1, 1, sparse_tile_form="lean")
+    rubin._check_declaration()
+    rubin._check_part_support()  # the Rubin reading passes the part rows: the stages speak next
 
 
 def _lse_delta(a: torch.Tensor, b: torch.Tensor) -> float:

@@ -1,4 +1,4 @@
-# Gated Attention Block (SM107)
+# Gated Attention Block (SM107 / SM100)
 
 **This is an experimental API and subject to change.**
 
@@ -19,7 +19,7 @@ h [B, S, d_model]                                       (post input-layernorm)
  |
  |  (2)+(3) QK-RMSNorm per head (optional) + partial RoPE on the first rope_dim   ONE kernel (Q and K only)
  |
- |  (4) SDPA        O = softmax(Q K^T * scale + mask) V,  GQA H_q / H_kv        FROST SDPA (Rubin d256 rows)
+ |  (4) SDPA        O = softmax(Q K^T * scale + mask) V,  GQA H_q / H_kv        FROST SDPA (the Rubin d256 rows; the SM100 d256 kernels on cc 10.0)
  |
  |  (5) gate        O_gated = O * sigmoid(GATE)                                 elementwise, after the SDPA epilogue
  |
@@ -32,8 +32,15 @@ Every stage is a FROST kernel: the two projections drive the shipped FROST GEMM 
 graph's ranked plan list), stage (4) drives the shipped FROST SDPA through its standalone adapter, and stages
 (2)+(3) and (5) are this block's own kernels. There are no cuBLAS or cuDNN-backend call-outs.
 
-**Target: NVIDIA Rubin (SM107, compute capability 10.7) only.** Every other architecture is declined with a
-typed error (`NotImplementedError`), never served slowly.
+**Target parts.** Every other architecture is declined with a typed error (`NotImplementedError`), never served slowly; the
+served parts are ONE tuple, `cudnn.gated_attention_block.DENSE_SERVING_CCS = ((10, 7), (10, 0))`, which the SDPA stage's part
+gate, `serving_envelope()` and the test suite's markers read:
+
+| part | forms served | status |
+|---|---|---|
+| NVIDIA Rubin (SM107, cc 10.7) | every form: the three precisions, the fusion knobs, the serving forms (write-through, EXTEND, DECODE), the block-sparse / indexer modes, the e4m3 cache, the backward | measured (the tables below) |
+| cc 10.0 (SM100: B200 / GB200; 2026-10-29) | the DENSE bf16 / f16 INFERENCE forms only -- the dense prefill form (`kv_source="self"`), the EXTEND form and the DECODE form over the pools -- through the shared SM100 d256 kernels (the paged prefill tile with PackGQA, the SM100 d256 decode tile and its split combine in the combine module's own forms), the sigmoid gate as its own launch | FUNCTIONAL ONLY, unmeasured; declined by name there: `fuse_gate=True` (the sm100 row claims no gate epilogue), the fused projection forks (`fuse_norm_rope=True` outside the DECODE form's lowering, `fuse_norm_rope_small_m=True`, an explicit `fuse_cache_write=True`: `sm_107a` renderings), `quant` (FP8 / MXFP8), `save_for_backward=True` (the backward binds the Rubin SDPA backward), `thd=True` over the block's own K / V, every `QsaSpec` form (the sparse core, the lean tile through the block, the indexer, the e4m3 cache), `decode_q_tile_max`, an unpacked decode step of 17 .. 32 tokens off the SM100 wide-launch rule; `use_pdl` auto reads False |
+| cc 10.3 (B300) | none -- the same SM100 kernels, unproven through the block | declined BY NAME until its cells run |
 
 Three precisions share the signature, and two fp4 modes ride the MXFP8 one (both are fields on `MxQuantSpec`,
 so they are unspellable on the bf16 and per-tensor FP8 pipelines rather than declined):
@@ -52,7 +59,12 @@ Two optional forward fusions are constructor flags; each is a different compiled
 `execute()` signature, and both default to off. The backward has two knobs of its own, both default off and both
 bitwise the unfused block: `fuse_gate_bwd` (the gate backward emits the SDPA backward's `delta`, one launch fewer) and
 `fuse_wgrad_overlap` (the two weight-gradient GEMMs run on a block-owned side stream, forked from and joined back to
-the launch stream through events, overlapping the SDPA backward chain) -- see [Backward](#backward).
+the launch stream through events, overlapping the SDPA backward chain) -- see [Backward](#backward).  On cc 10.0 (2026-10-29)
+both forward fusions are typed declines by name: the fused projection fork is an `sm_107a` rendering ("rendered for sm_107a (Rubin);
+this device is SM100" -- except on the DECODE form at decode row counts, where `fuse_norm_rope=True` is LOWERED to the unfused chain
+and therefore served), and `fuse_gate=True` is refused by the device's engine row ("fuse_gate=True is not served by the f16/bf16 SM100
+SDPA engine row": no gate epilogue on the SM100 d256 kernels, no gate in the SM100 line's split combine) -- stage (5) runs as its own
+launch under `fuse_gate=False`.
 
 - `fuse_norm_rope=True` folds stages (2)+(3) into stage (1)'s epilogue: Q/K tiles are normed and rotated on the
   fp32 accumulator and written once (needs `inplace_qkv`; inference only, no pre-norm Q/K is kept). Under FP8 /
@@ -1021,6 +1033,11 @@ inside the write kernel and the in-kernel dequant are the levers a later change 
 
 ### Serving: the extend form (`kv_source="paged"`, `token_capacity`)
 
+Served on cc 10.7 (the cells below) and, since 2026-10-29, on cc 10.0 through the same binding -- the shared SM100 d256 paged THD body
+(`sm100/prefill_d256_f16.py`: CGA2, unsplit, unpacked, NATURAL, no gate, no LSE), the write-through before it, the sigmoid gate as its
+own launch; functional only, unmeasured there, `fuse_gate=True` and `fuse_norm_rope=True` typed declines by name (the part table at the
+top; `test_block_serving_extend.py`'s `requires_blackwell` cells, pending their first run on a cc 10.0 part of the 152-SM class).
+
 Every serving prefill of a sequence with a cached prefix -- a chunked prefill, a prefix-cache hit, a speculative verify -- is an
 EXTEND step: the step's new tokens are written into the pools, and attention runs over each sequence's WHOLE logical KV range
 (its prefix and the new tokens) from the pools, on the bottom-right diagonal. `kv_source="paged"` (appended; `"self"` = the block
@@ -1149,6 +1166,36 @@ launch's metadata above every role wait). Measured on a 212-SM cc 10.7
 part: 1.1-1.5 us per decode step at B 1 (B 1 x KV 4K +5.0 %, 32K +4.0 %, 128K +2.5 %; +2.8 % geomean over the B 1 .. 4 cells), flat within
 the control pair where the tile dominates; with the write-through folded in, B 1 x KV 4K 32.3 -> 29.3 us (+10.2 %) against the plain
 seven-launch chain. The fused kernel the stage runs is a declaration fact:
+
+**On cc 10.0 (2026-10-29; `DENSE_SERVING_CCS`)** the same form runs the SM100 d256 decode tile (`sm100/decode_d256_f16.py`) under the
+SM100 LINE's route -- `decode_route(geometry, S_q, device_cc=(10, 0), batch=, max_kv_len=)`, the SDPA adapter's own rule off cc 10.7,
+input for input (`config_sm100.decode_d256_q_tile` with the wide-launch reading `config_sm100.d256_wide_decode_launch(batch, groups,
+max_kv_len)`: at least 8 units streaming at least 4096 128-key tiles between them; `groups` = `H_kv` packed, `H_q` unpacked): packed rows
+`S_q x group <= 16` ride the 16-column tile in ONE unit; `16 < S_q x group <= 32` the 32-column tile in one unit for a WIDE launch only;
+else the paged PREFILL tile with the whole group packed wherever the group divides 128 (16 / 8 / 4 / 32), at ANY batch (the line has no
+two-unit arm, so there is no fill rule) under BOTH policies (they coincide; `decode_route_policy` is recorded); else the 16-column tile
+UNPACKED (`group` KV streams) to 16 tokens; an unpacked step of 17 .. 32 tokens needs the 32-column width, routed for a wide launch
+only -- a typed decline otherwise, predicted by `serving_envelope(...).decode.routes` / `.route(S_q, batch, max_kv_len)` and raised at
+declaration; `decode_q_tile_max` (the Rubin table's cap) is refused by name; `DecodeRoute.claimed` is False on every SM100 cell (the
+claimed envelope is the Rubin measurement), `DecodeRoute.device_cc` / `.max_kv_len` read the inputs back.  The split count comes from the
+decode split model's Blackwell fit, the split combine runs the combine module's own forms (the decode-grid pin is the cc 10.7 rule's),
+`fuse_gate=True` is a typed decline (the gate is its own launch after the combine), `use_pdl=None` reads False (the explicit `True` is
+served: the SM100 tile and the combine carry the `griddepcontrol` pair).  The small-launch table at the served groups (`tile 16` = the
+SM100 decode tile packed, `U16` / `U32` unpacked with `group` streams, `P` = the paged prefill tile packed, `[W]` = the 32-column tile
+under the wide rule, `--` = the typed decline off it):
+
+| group (`H_q / H_kv`) | `S_q = 1` | `S_q = 2` | `S_q = 3 .. 5` | `S_q = 6 .. 8` | `S_q = 9 .. 16` | `S_q = 17 .. 32` |
+|---|---|---|---|---|---|---|
+| 6 (24 / 4) | tile 16 | tile 16 | U16 (6 streams) [W] | U16 | U16 | -- (W: U32) |
+| 12 (24 / 2) | tile 16 | U16 (12 streams) [W] | U16 | U16 | U16 | -- (W: U32) |
+| 16 (32 / 2, 16 / 1) | tile 16 | P [W] | P | P | U16 (16 streams) | -- (W: U32) |
+| 8 (8 / 1) | tile 16 | tile 16 | P [W at 3 / 4] | P | P | -- (W: U32) |
+| 4 (4 / 1) | tile 16 | tile 16 | tile 16 at 3 / 4, P at 5 [W at 5 .. 8] | P | P | P |
+| MHA | U16 | U16 | U16 | U16 | U16 | -- (W: U32) |
+
+(Wide-rule examples at group 6: `W` at B 2 x kv >= 64K or B 32 x kv >= 4K; `U32` at B 1 x kv >= 22K or B 4 x kv >= 5.5K.)  Functional
+only: nothing is measured on that part; the 32-column single unit for 17 .. 32 packed rows (the MTP T 3 .. 5 step at group 6) is the
+first lever to measure there.  The Rubin route of record follows.
 
 The route is TABLE-DRIVEN (the default policy, `decode_route_policy="single_unit"`): ONE ordered table of the Rubin decode tile's
 single-unit widths, `config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES = (16, 32, 64)` (the 64-column tile landed 2026-10-15: four
@@ -1725,7 +1772,8 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   through the small-M route (the band capture / replay cell of `test_block_qsa_decode.py`) and eager past 128 rows, where a
   capture is the driver's typed refusal. The quantized block's first-execute scale write is NOT refused under capture (the
   warm-up / re-capture contract above is the rule): `test_block_serving_capture.py`.
-- Rubin (SM107) only; cuDNN 9.x, `nvidia-cutlass-dsl >= 4.8.0.dev0` (the Rubin arch names), torch.
+- Rubin (SM107) for every form, or cc 10.0 (SM100) for the dense bf16 / f16 inference forms alone (the part table at the top;
+  functional only); cuDNN 9.x, `nvidia-cutlass-dsl >= 4.8.0.dev0` (the Rubin arch names; the 4.7.0 floor on cc 10.0), torch.
 - Backward: bf16 / fp16 (both against fp64 autograd on Rubin: `test_block_backward.py`) -- and per-tensor fp8 over the fp8
   training record (`quant=QuantSpec`: bf16 `dy` and gradients, dense or packed (`thd=True`), any `B*S`, head counts the TMA Q / K rebuild tiles),
   and MXFP8 over the MXFP8 training record (`quant=MxQuantSpec`: bf16 `dy` and gradients, dense only, `B*S % 32 == 0` when

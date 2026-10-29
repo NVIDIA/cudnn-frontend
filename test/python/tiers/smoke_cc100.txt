@@ -269,3 +269,11 @@ sdpa/frost/test_tile_dsl_exp2_emul.py::test_exp2_emul_pair_matches_the_model_bit
 sdpa/frost/test_tile_dsl_q_loop_bounds.py::test_q_loop_bounds_match_reference[m0-W0-br0-R0-tq64-512x512]
 sdpa/frost/test_tile_dsl_sf_layout.py::test_atom_offset_matches_the_oracle_swizzle[128-4]
 sdpa/frost/test_tile_dsl_sf_layout.py::test_helper_traces_on_int32_and_matches_the_host[16]
+# gated attention block, cc 10.0 (2026-10-29: the dense bf16 / f16 serving forms admitted on the SM100 line; one cell per code path)
+gated_attention_block/cutedsl/test_block_serving_decode.py::test_sm100_decode_matches_the_oracle_at_every_group_and_s_q[1-6]
+gated_attention_block/cutedsl/test_block_serving_decode.py::test_sm100_decode_matches_the_oracle_at_every_group_and_s_q[3-6]
+gated_attention_block/cutedsl/test_block_serving_decode.py::test_sm100_decode_matches_the_oracle_at_every_group_and_s_q[2-16]
+gated_attention_block/cutedsl/test_block_serving_decode.py::test_sm100_the_explicit_pdl_switch_is_served_and_bitwise_the_plain_chain
+gated_attention_block/cutedsl/test_block_serving_extend.py::test_sm100_extend_matrix_cell[bf16-hnd-16]
+gated_attention_block/cutedsl/test_block_end_to_end.py::test_matches_the_fp32_oracle[256-norm]
+gated_attention_block/cutedsl/test_block_end_to_end.py::test_dead_rows_do_not_poison_the_gate
