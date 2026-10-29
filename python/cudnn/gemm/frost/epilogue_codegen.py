@@ -171,6 +171,11 @@ def _emit_binary_ext(op: FusionOp, a_expr: str, b_expr: str, idx: int, new: str)
         return lines + la + lb + [f"{new} = {na} + {nb} - {na} * {nb}"], new
 
     if op.op == "mod":
+        if op.compute_dtype == "fp32":
+            # MOD is C fmod. `%` on Float32 vectors lowers to arith.remf, an exact fmodf. The form below,
+            # a - b * trunc(a / b), rounds the quotient first: it is off by |b| when a / b rounds up to an
+            # integer, can leave (-|b|, |b|) once |a / b| >= 2**24, and gives NaN for b = +-inf.
+            return lines + [f"{new} = {a} % {b}"], new
         q = f"_mq{idx}"
         lines.append(f"{q} = {a} / {b}")
         lp, sp = _step01(q, f"_{idx}mp")
