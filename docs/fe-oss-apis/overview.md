@@ -42,6 +42,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. New A
 - [QSA training from existing token indices](qsa_indexed.md)
 - [QSA two-pass backend implementation notes](qsa_two_pass.md)
 - [DeepSeek Sparse Attention (DSA)](dsa.md)
+- [Pooled DSA](pooled_dsa.md): full indexer, selection from logits, cache update, and index expansion
 - [Flex Attention](attention/flex_attention.md) and [mask plan design](attention/flex_attention_design.md)
 - [HSTU Attention (Blackwell SM100/SM103)](hstu/hstu_attention.md)
 - [HSTU LayerNorm-Multiply-SiLU-Dropout (LMSD)](hstu/hstu_lmsd.md)

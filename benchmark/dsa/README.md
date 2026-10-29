@@ -206,6 +206,34 @@ python -m benchmark.dsa.benchmark_dsa_indexer_h32 \
   --topk-indices-global --deterministic
 ```
 
+### Pooled indexer components
+
+`benchmark_pooled_components.py` measures the internal `ExpandIndices` plan and
+`PoolCacheUpdate` on Blackwell. It reports eager wall time, CUDA
+event span, and full CUDA graph replay time. Compilation and input setup
+are outside timing; repeated calls reuse fixed metadata and warm caches.
+
+```bash
+python benchmark/dsa/benchmark_pooled_components.py --with-vllm --output pooled-components.json
+python benchmark/dsa/benchmark_pooled_components.py --with-vllm --check-only --rows 1 64
+```
+
+The optional vLLM comparison uses its existing output-expansion stage and
+FP8 cache-write stage, including casts, gathers, and tail updates. BF16 and
+MXFP4 cache writers have no native vLLM baseline. The suite checks shared
+FP8 outputs exactly before timing. Run `deepseek_sparse_attention/cutedsl/test_pooled_dsa.py` first
+for the new cache formats and ragged decode coverage.
+
+These are component measurements, not `SparseAttnIndexerKpool.forward_native`
+or end-to-end attention measurements. Prefill uses one pool-aligned chunk;
+decode uses one token per request and sweeps every pool phase. The JSON
+records source paths, GPU state, options, and individual timing samples.
+
+The full prepared indexer is documented in
+[`pooled_dsa.md`](../../docs/fe-oss-apis/pooled_dsa.md). It includes paged
+scoring and top-k, with optional cache updates. Component timings alone
+do not establish full-indexer performance.
+
 ### Sparse Attention Forward
 
 `benchmark_dsa_sparse_attention_forward.py` benchmarks the public SM100
