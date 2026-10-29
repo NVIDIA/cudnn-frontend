@@ -137,6 +137,10 @@ _BACKWARD_OPS = (
     "softplus_backward",
 )
 
+# The largest finite fp32: the RELU upper clip the frontend lowers for fp32 compute when none is set
+# (include/cudnn_frontend/node/pointwise.h).
+_FLT_MAX = 3.4028234663852886e38
+
 
 def _emit_binary_ext(op: FusionOp, a_expr: str, b_expr: str, idx: int, new: str) -> tuple[list[str], str]:
     """Generate comparison, logical, modulo, and activation-gradient operations."""
@@ -190,6 +194,13 @@ def _emit_binary_ext(op: FusionOp, a_expr: str, b_expr: str, idx: int, new: str)
         slope = attrs.get("negative_slope")
         lower = attrs.get("lower_clip", 0.0)
         upper = attrs.get("upper_clip")
+        if not slope and lower == 0.0 and (upper is None or upper >= _FLT_MAX):
+            # cuDNN's default RELU_BWD (lower clip 0, slope 0, no upper clip, which the frontend lowers as FLT_MAX) is
+            # the threshold select dx = x <= 0 ? +0 : dy, like torch's threshold_backward: the native engines return +0
+            # on a dead unit even for an inf or NaN dy, which dy * mask turns into NaN. A NaN x passes dy (OLE is false).
+            # With a clip or a slope the native engines multiply dy by the derivative (inf * 0 = NaN there too), as the
+            # mask product below does.
+            return lines + [f"{new} = cutlass._mlir_helpers.vector.where({b} <= {_fl(b, 0.0)}, {_fl(a, 0.0)}, {a})"], new
         l1, s1 = _step01(f"{_fl(b, lower)} - {b}", f"_{idx}r1")
         lines += l1 + [f"_rm{idx} = {_fl(b, 1.0)} - {s1}"]
         m = f"_rm{idx}"
