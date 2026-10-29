@@ -61,8 +61,8 @@ def test_dense_geometry_preserves_wide_strides_and_span():
 
 
 def test_dense_geometry_distinguishes_tma_from_plain_output():
-    f = _facts(strides=(64, 32, 8, 1))
-    assert _role(f, tma=False).strides == (64, 8, 32)
+    f = _facts(strides=(80, 36, 8, 1), span=148)
+    assert _role(f, tma=False).strides == (80, 8, 36)
     with pytest.raises(ValueError, match="zero-copy"):
         _role(f, tma=True)
 
