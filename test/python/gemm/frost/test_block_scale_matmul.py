@@ -3853,48 +3853,75 @@ def test_sm120_block_scale_refuses_sf_declared_for_another_problem_size(route):
 
 def test_sm120_block_scale_sf_check_leaves_an_empty_call_to_the_launch_path():
     """The execute-time check above judges where the template would read the declared scale factors at the call's size.
-    A call with no row, no column or no whole scale block along K reads none, so the check leaves it to the launch path,
-    which owns zero extents, instead of calling it a misread (at 0 rows or 0 atoms per row, a declaration of several
-    batch planes always looked misplaced). Host-only: the batched plan declaring the packed SFA [2, 128, 16] is built the
-    way the JIT path builds it, without compiling, and only the extents of the CPU buffers are read. More rows than the
-    declared planes hold are still refused."""
+    A call with no row, no column or no whole scale block along K (K below the block size) reads none, so the check
+    leaves it to the launch path, which owns zero extents. Judging it would compare the declaration with an empty plane:
+    at 0 rows any declaration of several batch planes, the packed one included, would look misplaced, and at 0 atoms per
+    row so would any declaration read over more than one 128-row block, batch 1 included. The exemption ends at one
+    scale block: from K = block size the call reads one atom per row block and is judged like any other call. The
+    declared packed SF (4 atoms per row block) is refused at K = 32 (one scale) and K = 128 (one full atom of 4 scales),
+    on the batched plan and on the batch-1 plan read over two row blocks, while SF slots of the run's own extents pass;
+    NVFP4 draws the same line at its block of 16. More rows than the declared planes hold are still refused.
+    Host-only: each plan declares the packed SFs at (M, N, K) = (100, 128, 512) and is built the way the JIT path builds
+    it, without compiling; both SF slots are bound with the declared extents unless noted, and only the extents of the
+    CPU buffers are read."""
     from pathlib import Path
 
-    B, M, N = 2, 100, 128
-    g, _ = _build_sm120_sf_graph(B, M, N, *_packed_sf_dims(B, M, N))
-    config = by_name(_SM120_BS_128)
-    chain, binding = C120._analyze_graph(g)
-    use_tma = C120._use_tma_store_epi(chain, config)
-    compiled = C120.CompiledFusedGemm(
-        chain=chain,
-        config=config,
-        aux_names=[aux.name for aux in chain.aux_tensors],
-        generated_path=Path("unused"),
-        _launchable=lambda *args, **kwargs: pytest.fail("the scale-factor check launched the kernel"),
-        block_scale=True,
-        binding=binding,
-        store_modes=C120._store_modes(chain, config),
-        use_tma_store=use_tma,
-        vec_bytes_epi=C120._out_vec_bytes(chain, config, use_tma),
-        workspace_bytes=C120._splitk_workspace_bytes(chain, config),
-    )
-    recipe = compiled.recipe
+    def plan(B, nvfp4=False):
+        """``reject(m, n, k, sf)``: the check's verdict on a call at (m, n, k), A and B in kernel order and both SF slots
+        bound with extents ``sf`` (kernel orientation; by default the declared ones)."""
+        block = 16 if nvfp4 else 32
+        declared = (B, 128, _SF_K // block)
+        g, _ = _build_sm120_sf_graph(B, 100, 128, declared, (B, _SF_K // block, 128), nvfp4=nvfp4)
+        config = by_name(_SM120_BS_128)
+        chain, binding = C120._analyze_graph(g)
+        use_tma = C120._use_tma_store_epi(chain, config)
+        compiled = C120.CompiledFusedGemm(
+            chain=chain,
+            config=config,
+            aux_names=[aux.name for aux in chain.aux_tensors],
+            generated_path=Path("unused"),
+            _launchable=lambda *args, **kwargs: pytest.fail("the scale-factor check launched the kernel"),
+            block_scale=True,
+            binding=binding,
+            store_modes=C120._store_modes(chain, config),
+            use_tma_store=use_tma,
+            vec_bytes_epi=C120._out_vec_bytes(chain, config, use_tma),
+            workspace_bytes=C120._splitk_workspace_bytes(chain, config),
+        )
+        recipe = compiled.recipe
+        assert recipe.block_size == block
 
-    def operands(m, n, k):  # A and B in kernel order; both SFs are the declared (2, 128, 16) bytes
-        bufs = [None] * len(compiled.bound)
-        for op in recipe.inputs:
-            bufs[op.index] = torch.empty(op.batch, n if op.is_b else m, k // op.kpack, dtype=torch.uint8)
-        for sf in recipe.sf:
-            bufs[sf.index] = torch.empty(B, 128, 16, dtype=torch.uint8)
-        for out in recipe.outputs:
-            bufs[out.index] = torch.empty(B, m, n, dtype=torch.float16)
-        return bufs
+        def reject(m, n, k, sf=declared):
+            bufs = [None] * len(compiled.bound)
+            for op in recipe.inputs:
+                bufs[op.index] = torch.empty(op.batch, n if op.is_b else m, k // op.kpack, dtype=torch.uint8)
+            for slot in recipe.sf:
+                bufs[slot.index] = torch.empty(sf, dtype=torch.uint8)
+            for out in recipe.outputs:
+                bufs[out.index] = torch.empty(B, m, n, dtype=torch.float16)
+            return C120._dense_sf_runtime_reject(compiled, bufs)
 
-    for mnk in ((0, N, _SF_K), (M, 0, _SF_K), (M, N, 0), (M, N, 16)):
-        reason = C120._dense_sf_runtime_reject(compiled, operands(*mnk))
-        assert reason is None, f"(M, N, K) = {mnk}"
-    refused = C120._dense_sf_runtime_reject(compiled, operands(200, N, _SF_K))
-    assert refused is not None and "SFA [2, 128, 16] (as declared) spaces its 2 planes 4 atoms apart" in refused
+        return reject
+
+    batched, batch1, nvfp4 = plan(2), plan(1), plan(2, nvfp4=True)
+    for mnk in ((0, 128, _SF_K), (100, 0, _SF_K), (100, 128, 0), (100, 128, 16), (100, 128, 31)):
+        assert batched(*mnk) is None, f"B = 2, (M, N, K) = {mnk}"
+    assert batch1(200, 128, 16) is None, "B = 1, (M, N, K) = (200, 128, 16)"
+    assert nvfp4(100, 128, 8) is None, "NVFP4, (M, N, K) = (100, 128, 8)"
+    planes = "SFA [2, 128, 16] (as declared) spaces its 2 planes 4 atoms apart, but the template reads batch l at l x 1 atoms"
+    sf_k = "SFA [1, 128, 16] (as declared) has 16 scales along K (4 atoms), but the template reads its 2 128-row blocks 1 atoms apart"
+    for k in (32, 128):
+        reason = batched(100, 128, k)
+        assert reason is not None and planes in reason, f"B = 2, K = {k}: {reason}"
+        assert batched(100, 128, k, sf=(2, 128, 4)) is None, f"B = 2, K = {k}, SF slots of the run's extents"
+        reason = batch1(200, 128, k)
+        assert reason is not None and sf_k in reason, f"B = 1, M = 200, K = {k}: {reason}"
+    reason = nvfp4(100, 128, 16)
+    assert (
+        reason is not None and "SFA [2, 128, 32] (as declared) spaces its 2 planes 8 atoms apart, but the template reads batch l at l x 1 atoms" in reason
+    ), f"NVFP4, K = 16: {reason}"
+    reason = batched(200, 128, _SF_K)
+    assert reason is not None and "SFA [2, 128, 16] (as declared) spaces its 2 planes 4 atoms apart" in reason, f"B = 2, M = 200: {reason}"
 
 
 @requires_sm120
