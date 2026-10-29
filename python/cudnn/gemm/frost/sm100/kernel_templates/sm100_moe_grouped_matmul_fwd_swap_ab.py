@@ -43,8 +43,6 @@ from cuda.bindings import driver as _cuda
 # A TMA tensormap is 128 bytes = 16 int64 qwords.
 # @@INJECT_TILE_CONSTANTS@@
 
-# Tensormap workspace slots per CTA: the B operands, plus the output descriptor
-# when the TMA-store epilogue re-dimensions it per routed group.
 moe_desc_slots = num_b_operands + n_tma_outputs
 _CTA_GROUP = nvvm.CTAGroup.CTA_2 if cta_group == 2 else nvvm.CTAGroup.CTA_1
 
@@ -272,9 +270,6 @@ def _kernel(
     ]
 
     # @@TMA_STORE_ONLY:BEGIN@@
-    # One epilogue subtile = one MMA-M block x 32 cols; the M blocks reuse it.
-    # The ring slot is indexed by `tidx`, so its row count is the EPILOGUE THREAD
-    # count -- which is epi_tile_mn[0] only when the MMA M block is 128.
     epi_subtile_elems = epi_stage_rows * epi_row_elems * epi_slot_widen
     smem_d_ptr = cutlass.Array(
         cd_dtype,
@@ -290,9 +285,6 @@ def _kernel(
     )
     # @@TMA_STORE_ONLY:END@@
 
-    # One block per MMA mode, every count defined in both: the 2-CTA pair
-    # releases per PAIR (so ab_empty counts pairs and acc_empty counts both
-    # CTAs' epilogue warps), the 1-CTA one per CTA.
     if cutlass.const_expr(cta_group == 2):
         ab_empty_count = cluster_size // cta_group if cutlass.const_expr(ab_empty_full_mask) else (cluster_m // cta_group) + cluster_n - 1
         acc_empty_count = num_epilogue_warps * 2
@@ -353,9 +345,6 @@ def _kernel(
     )
 
     if cutlass.const_expr(cta_group == 1):
-        # TMEM accumulator layout, per acc stage: gemm g, M block mi, N block ni
-        # -> columns [g*cols_per_acc_stage + mi*epi_cols_per_mma_m + ni*mma_inst_n, +N),
-        # all at TMEM lane base 0.
         epi_cols_per_mma_m = cta_tile_mnk[1]
     else:
         pair_n_size = cgrp_tile_mnk[1] // cluster_n
@@ -411,10 +400,6 @@ def _kernel(
         is_tile_valid = cutlass.Int32(1)
 
         while is_tile_valid != 0:
-            # Dynamic tile assignment: the cluster leader claims the next GLOBAL
-            # tile index and broadcasts it, so the clusters live at any instant
-            # sit in one contiguous window of tile space and share L2. Static
-            # striding lets them drift apart and share nothing.
             if cta_rank_in_cluster == 0:
                 while not nvvm.mbarrier_try_wait_parity(
                     sched_bcast_empty_mbar_ptr.subview(bcast_stage),
@@ -447,9 +432,6 @@ def _kernel(
             if lane == 0:
                 nvvm.mbarrier_arrive(nvvm.mapa(sched_bcast_empty_mbar_ptr.subview(bcast_stage), 0))
             if cutlass.const_expr(cluster_size > 1):
-                # The final invalid broadcast has no next reuse of this stage to
-                # wait for its cluster-wide acknowledgements, so retain its exact
-                # stage and completion parity for the scheduler-warp drain below.
                 last_bcast_stage = bcast_stage
                 last_bcast_empty_done_phase = bcast_empty_phase ^ 1
             bcast_stage += 1
@@ -545,14 +527,8 @@ def _kernel(
                 sched_stage = cutlass.Int32(0)
                 sched_empty_phase = sched_empty_phase ^ 1
 
-        # Every multi-CTA cluster emits one invalid scheduler record before
-        # leaving the loop. Keep the leader CTA's DSM alive until every
-        # scheduler warp has consumed that final broadcast and acknowledged the
-        # leader slot. A singleton cluster has no remote DSM lifetime to drain.
         if cutlass.const_expr(cluster_size > 1):
             if cta_rank_in_cluster == 0:
-                # Each acknowledgement flips the saved pre-wrap empty phase, so
-                # pre-wrap ``bcast_empty_phase ^ 1`` is the completed parity.
                 while not nvvm.mbarrier_try_wait_parity(
                     sched_bcast_empty_mbar_ptr.subview(last_bcast_stage),
                     last_bcast_empty_done_phase,
@@ -791,8 +767,6 @@ def _kernel(
             sched_stage = cutlass.Int32(0)
             sched_full_phase = cutlass.Int32(0)
             acc_stage = cutlass.Int32(0)
-            # Per-group TMA replacement changes the GMEM source, not these invariant
-            # MMA-side SMEM descriptor roots.
             desc_a_roots = [
                 cutlass.experimental.primitives.Tcgen05SmemDesc.build(
                     start_address=smem_a_list[i],
@@ -841,8 +815,6 @@ def _kernel(
                         pass
 
                     acc_base_col = base_col_id_root + acc_stage * acc_region_cols
-                    # One accumulator per (gemm, M block). Column arithmetic stays on
-                    # the encoded (row << 16) | col integer.
                     tmem_addr_mmas = [
                         [
                             cutlass.inttoptr(
@@ -873,8 +845,6 @@ def _kernel(
                                 desc_a_k = desc_a_roots[gemm_a_idx[g]].advance_start_address(sA_bytes * stage + a_smem_k_step_bytes * k_block_idx)
                                 desc_b_k = desc_b_roots[gemm_b_idx[g]].advance_start_address(sB_bytes * stage + b_smem_k_step_bytes * k_block_idx)
                                 for mi in cutlass.range_constexpr(mma_size_m):
-                                    # The M sub-block offset is a whole SMEM swizzle atom,
-                                    # so the descriptor's swizzle phase is preserved.
                                     desc_a = desc_a_k.advance_start_address(a_smem_m_step_bytes * mi)
                                     if elect_one:
                                         _tcgen05_mma(
@@ -888,8 +858,6 @@ def _kernel(
                                             collector_op=_a_collector_op(g),
                                             b_collector_op=_b_collector_op(mi),
                                         )
-                            # Every accumulator sees scale_d=False on exactly the first
-                            # k_block of the tile, so the flip stays outside mi.
                             scale_d = cutlass.Boolean(True)
 
                         if elect_one:
@@ -944,8 +912,6 @@ def _kernel(
                 sched_stage = cutlass.Int32(0)
                 sched_full_phase = cutlass.Int32(0)
                 acc_stage = cutlass.Int32(0)
-                # Per-group TMA replacement changes the GMEM source, not these
-                # invariant MMA-side SMEM descriptor roots.
                 desc_a_roots = [
                     cutlass.experimental.primitives.Tcgen05SmemDesc.build(
                         start_address=smem_a_list[i],
@@ -994,8 +960,6 @@ def _kernel(
                             pass
 
                         acc_base_col = base_col_id_root + acc_stage * acc_region_cols
-                        # One accumulator per (gemm, M block). Column arithmetic stays on the
-                        # encoded (row << 16) | col integer.
                         tmem_addr_mmas = [
                             [
                                 cutlass.inttoptr(
@@ -1026,8 +990,6 @@ def _kernel(
                                     desc_a_k = desc_a_roots[gemm_a_idx[g]].advance_start_address(sA_bytes * stage + a_smem_k_step_bytes * k_block_idx)
                                     desc_b = desc_b_roots[gemm_b_idx[g]].advance_start_address(sB_bytes * stage + b_smem_k_step_bytes * k_block_idx)
                                     for mi in cutlass.range_constexpr(mma_size_m):
-                                        # The M sub-block offset is a whole SMEM swizzle atom, so the
-                                        # descriptor's swizzle phase is preserved. B is shared.
                                         desc_a = desc_a_k.advance_start_address(a_smem_m_step_bytes * mi)
                                         if elect_one:
                                             _tcgen05_mma(
@@ -1041,8 +1003,6 @@ def _kernel(
                                                 collector_op=_a_collector_op(g),
                                                 b_collector_op=_b_collector_op(mi),
                                             )
-                                # Every accumulator sees scale_d=False on exactly the first
-                                # k_block of the tile, so the flip stays outside mi/ni.
                                 scale_d = cutlass.Boolean(True)
 
                             if elect_one:
@@ -1141,9 +1101,6 @@ def _kernel(
         sched_stage = cutlass.Int32(0)
         sched_full_phase = cutlass.Int32(0)
 
-        # The drain layout follows the MMA INSTRUCTION's M: at hardware M=64 the
-        # accumulator occupies data paths 0-15 of each sub-partition, so the
-        # 32-data-path LDTM layout cannot be used to read it.
         # @@EPILOGUE_SETUP:BEGIN@@
         if cutlass.const_expr(epi_packed_lanes):
             row_id_with_warp_offset = base_row_id
@@ -1199,16 +1156,9 @@ def _kernel(
         while is_valid != 0:
             coord_m_tile = tile_m * cgrp_tile_mnk[0] + m_rank * cta_tile_mnk[0]
             # @@TMA_STORE_ONLY:BEGIN@@
-            # Re-dimension D to this group's last column so the hardware clips the
-            # ragged tail; the base stays put, so the store coords are global.
-            # Under `moe_aligned_offsets` no tile crosses `group_end` in the
-            # first place -- `cgrp_tile_n` divides every group -- so the clip
-            # has nothing to clip and the original descriptor serves.
             if warp_idx == 0 and cutlass.const_expr(not moe_aligned_offsets and not moe_scatter):
                 if group_end != previous_group_end:
                     previous_group_end = group_end
-                    # One drain retires the in-flight stores of EVERY descriptor,
-                    # so it does not repeat per output.
                     nvvm.cp_async_bulk_wait_group(0, read=True)
                     for _di in cutlass.range_constexpr(n_tma_outputs):
                         _scratch = tma_c_desc_smem.subview(_di * TENSOR_MAP_QWORDS)
@@ -1472,9 +1422,6 @@ def compile() -> Callable:
     ab_stride_elems = 16 // (ab_dtype.width // 8)
     sym_m = cute.sym_int64()
     sym_n = cute.sym_int64(divisibility=min(out_vec_elems, moe_token_alignment))
-    # K tails are supported: the K loop is ceil_div and the TMA descriptor's global K
-    # extent makes a partial box HW zero-filled. The only real K rule is the 16-byte
-    # TMA contiguous-extent one, already gated by _tma_alignment_reject.
     sym_k = cute.sym_int64()
     sym_e = cute.sym_int64()
     sym_g = cute.sym_int64()

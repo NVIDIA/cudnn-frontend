@@ -46,8 +46,12 @@ prefill's CG0 operand materialization (the four warps own the whole chunk), phas
   warp 2 : A then A
   warp 3 : the other key half of T
 No register redistribution: the launch's occupancy floor (min_blocks_per_mp = CTAS_PER_SM) sets the register budget.
+
+Steep scratch (STEEP_FAST / STEEP_EXACT; one element per array under STEEP_OFF): ballot words 16 B, last-token log2 gates
+512 B, k inverse norms 64 B, KK / A corrections 2048 B.
 """
 
+import dataclasses
 from dataclasses import dataclass
 from typing import NamedTuple, Optional, Type
 
@@ -68,13 +72,14 @@ from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_
 from ..common.beta_guard import beta_guard
 from ..common.gdn2_operands import scan_gate_prefixes, load_qk_beta_row, load_operand_scales, key_operand_half, query_operand_half
 from ..common.blockwise_inverse import invert_unit_lower_16x16_fragments
-from ..common.steep_scratch import SteepScratchLayout, steep_scratch_layout
 from ..common.steep_decay import (
+    STEEP_EXACT,
     STEEP_FAST,
+    STEEP_OFF,
     add_steep_corrections,
     encode_gate_exchange,
     lane_steep_bits,
-    steep_launch_cfg,
+    steep_mode_for,
     steep_tile_mask,
     steep_exit_unless_flagged,
     steep_row_corrections,
@@ -374,11 +379,13 @@ def compute_warp_group(
             )
 
         # ---- decay/restore operands ---------------------------------------------
-        exp_g_regs, inverse_g_regs, restore_g_regs = load_operand_scales(
-            cfg, decay_row, lane_in_row_group, steep_bits, sGate_exchange_ptr, steep_last_ptr, True
-        )
+        exp_g_halves = [None] * dk_halves
         for dim_half in cutlass.range_constexpr(dk_halves):
             dim_base = dim_half * 64 + lane_in_row_group * 8
+            exp_g_regs, inverse_g_regs, restore_g_regs = load_operand_scales(
+                cfg, decay_row, lane_in_row_group, steep_bits, sGate_exchange_ptr, steep_last_ptr, True, only_half=dim_half
+            )
+            exp_g_halves[dim_half] = exp_g_regs
             k_inv_vec, k_decay_vec, k_restore_half = key_operand_half(
                 cfg, dim_half, raw_k_regs, raw_beta_regs, k_inv_norm, exp_g_regs, inverse_g_regs, restore_g_regs
             )
@@ -397,7 +404,7 @@ def compute_warp_group(
         for dim_half in cutlass.range_constexpr(dk_halves):
             dim_base = dim_half * 64 + lane_in_row_group * 8
             reg_base = dim_half * 8
-            q_decay_vec = query_operand_half(cfg, dim_half, raw_q_regs, q_inv_norm, exp_g_regs)
+            q_decay_vec = query_operand_half(cfg, dim_half, raw_q_regs, q_inv_norm, exp_g_halves[dim_half])
             decay_col = dim_base
             decay_segment = decay_col // 64
             decay_swizzled_idx = decay_segment * (cfg.b_t * 64) + swizzle_xor_128b(decay_row, decay_row * 64 + decay_col - decay_segment * 64, elem_bytes=2)
@@ -793,7 +800,7 @@ def host(
     # ---- launch ----------------------------------------------------------------------
     for launch_idx in cutlass.range_constexpr(2 if cfg.steep_mode == STEEP_FAST else 1):
         frost_gdn2_prep(
-            steep_launch_cfg(cfg, launch_idx),
+            cfg if launch_idx == 0 else dataclasses.replace(cfg, steep_mode=STEEP_EXACT),
             cute.FastDivmodDivisorV2(heads_out),
             q_ratio,
             k_ratio,
@@ -883,10 +890,10 @@ def frost_gdn2_prep(
     sW_raw = cutlass.Array(cfg.io_dtype, RECS * cfg.d_k * cfg.b_t, space=SMEM, alignment=cfg.buffer_align_bytes)
     # steep key channels (common/steep_decay.py): the scan's ballot words, last-token log2 gates, k inverse norms and the
     # KK / A corrections of the CTA's current item
-    sSteepScan = cutlass.Array(cutlass.Int32, cfg.steep_scratch.scan.elements, space=SMEM, alignment=16)
-    sSteepLast = cutlass.Array(cutlass.Float32, cfg.steep_scratch.last.elements, space=SMEM, alignment=16)
-    sSteepNorm = cutlass.Array(cutlass.Float32, cfg.steep_scratch.norm.elements, space=SMEM, alignment=16)
-    sSteepCorr = cutlass.Array(cutlass.Float32, cfg.steep_scratch.corr.elements, space=SMEM, alignment=16)
+    sSteepScan = cutlass.Array(cutlass.Int32, cfg.steep_scan_cosize, space=SMEM, alignment=16)
+    sSteepLast = cutlass.Array(cutlass.Float32, cfg.steep_last_cosize, space=SMEM, alignment=16)
+    sSteepNorm = cutlass.Array(cutlass.Float32, cfg.steep_norm_cosize, space=SMEM, alignment=16)
+    sSteepCorr = cutlass.Array(cutlass.Float32, cfg.steep_corr_cosize, space=SMEM, alignment=16)
     sQ_tma = SmemTile(
         base=sQ_raw,
         elems_per_stage=(cfg.d_k * cfg.b_t),
@@ -1056,8 +1063,11 @@ class Gdn2PrepCfg:
     tma_k_bytes: int = 0
     tma_gate_bytes: int = 0
     tma_beta_bytes: int = 0
-    steep_scratch: SteepScratchLayout | None = None
-    steep_mode: int = STEEP_FAST  # common/steep_decay.py: STEEP_FAST / STEEP_EXACT
+    steep_mode: int = STEEP_FAST  # common/steep_decay.py: STEEP_OFF / STEEP_FAST / STEEP_EXACT
+    steep_scan_cosize: int = 0
+    steep_last_cosize: int = 0
+    steep_norm_cosize: int = 0
+    steep_corr_cosize: int = 0
 
 
 def build_cfg(
@@ -1073,7 +1083,6 @@ def build_cfg(
     allow_neg_eigval: bool,
     d_k: int,
     beta_guard: bool = False,
-    steep_mode: int = STEEP_FAST,
 ) -> Gdn2PrepCfg:
     """Build the per-compile ``Gdn2PrepCfg`` (io_dtype in {Float16, BFloat16}; gate fp32 or the io dtype); the raw ring depth
     is the config's constant for the key dim."""
@@ -1097,19 +1106,15 @@ def build_cfg(
     stage_bytes = 3 * tile * bytes_per_element + tile * (gate_dtype.width // 8)
     fixed_bytes = 2 * tile * bytes_per_element + cfg.b_t * cfg.b_t * bytes_per_element + 4 * cfg.b_t + (0 if gate_dtype == cutlass.Float32 else 4 * tile)
     record_bytes = 3 * cfg.smem_record_stages * tile * bytes_per_element
-    cfg.steep_scratch = steep_scratch_layout(
-        b_t=cfg.b_t,
-        d_k=cfg.d_k,
-        scan_warps=cfg.compute_warps,
-        scan_stages=1,
-        last_stages=1,
-        decay_stages=1,
-        norm_stages=1,
-    )
-    steep_bytes = cfg.steep_scratch.nbytes + 64  # separate-array alignment
+    cfg.steep_mode = steep_mode_for(cfg.io_dtype, cfg.l2norm, cfg.safe_gate, cfg.gate_scale_log2, cfg.b_t)
+    steep = cfg.steep_mode != STEEP_OFF
+    cfg.steep_scan_cosize = cfg.compute_warps if steep else 1
+    cfg.steep_last_cosize = cfg.d_k if steep else 1
+    cfg.steep_norm_cosize = cfg.b_t if steep else 1
+    cfg.steep_corr_cosize = 2 * cfg.b_t * cfg.b_t if steep else 1
+    steep_bytes = sum((cosize * 4 + 15) // 16 * 16 for cosize in (cfg.steep_scan_cosize, cfg.steep_last_cosize, cfg.steep_norm_cosize, cfg.steep_corr_cosize))
     smem_bytes = cfg.smem_raw_stages * stage_bytes + fixed_bytes + record_bytes + steep_bytes + CFG.SMEM_CTA_RESERVED_BYTES
     assert cfg.ctas_per_sm * smem_bytes <= CFG.SMEM_PER_SM_BYTES, f"{cfg.ctas_per_sm} CTAs of {smem_bytes} B do not fit the SM ({CFG.SMEM_PER_SM_BYTES} B)"
-    cfg.steep_mode = steep_mode
     return cfg
 
 

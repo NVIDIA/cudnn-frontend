@@ -517,7 +517,9 @@ class Config:
         per_piece = self.DS_HALF_BYTES // self.DQ_SLICE_BYTES
         return tuple(range(per_piece, self.DQ_SLICES)) + tuple(range(0, per_piece))
 
-    # --- derived: the 2-CTA per-sequence tensor-map set (box rows per slot; the d box is HEAD_BOX, the dQ box DQ_BOX fp32) ---
+    # --- derived: the 2-CTA per-sequence tensor-map set (box rows per slot; the d box is HEAD_BOX, the dQ box DQ_BOX fp32).  The s_tail
+    # body's stats ring (``stats_form = "tma_ring"``) rides a plain 1 KiB bulk copy from a padded pre-scaled region, never a map: the set stays
+    # nine under every form (a map array's extent is part of the kernel's mangled signature: the ldg rendering pin). ---
     @property
     def MAP_BOX_ROWS(self):
         # Q1 (own 64 q rows), K, V, dO1 (own 64 q rows), dQ (own 64 q rows, fp32), dK, dV, Q2 (128 q), dO2 (128 q)

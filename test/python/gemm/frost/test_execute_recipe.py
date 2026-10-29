@@ -630,6 +630,81 @@ def test_the_checker_is_loud_when_it_cannot_find_the_fault():
         compiled.explain(_bound_buffers(compiled, a, b, c))
 
 
+@requires_sm100
+@pytest.mark.parametrize("mainloop", [False, True])
+def test_host_swizzle_tracks_shape_overrides(mainloop, monkeypatch):
+    """Rebind unit and nonunit rasters, including a partial final super-block."""
+    import cutlass.cute as cute
+    from cudnn.gemm.frost.sm100 import compiler
+    from cudnn.gemm.frost.tile_config import by_name
+
+    m, n, k = 128, 512, 64
+    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32, is_override_shape_enabled=True)
+    A = g.tensor(name="A", dim=[1, m, k], stride=[m * k, k, 1])
+    B = g.tensor(name="B", dim=[1, k, n], stride=[k * n, 1, k])
+    operand = g.relu(input=A, name="relu_a").set_data_type(BF16) if mainloop else A
+    Y = g.matmul(A=operand, B=B, name="mm")
+    Y.set_output(True).set_data_type(BF16)
+    monkeypatch.setattr(compiler, "_l2_swizzle_budget_bytes", lambda: 3 * 2 * k * 64)
+    cfg = by_name("CONFIG_sm100_128x64x128_128x64x32_cluster1x1_1ctamma")
+    plan = compiler.jit_from_cudnn_graph(g, cfg)
+
+    def unexpected_compile(*args, **kwargs):
+        """A changed raster width must not specialize or compile another plan."""
+        pytest.fail("runtime swizzle width triggered compilation")
+
+    monkeypatch.setattr(cute, "compile", unexpected_compile)
+    for m, n, k in ((128, 512, 64), (512, 256, 64), (512, 448, 64), (512, 448, 128)):
+        a = torch.randint(-2, 3, (1, m, k), device="cuda").to(torch.bfloat16)
+        b = torch.randint(-2, 3, (1, n, k), device="cuda").to(torch.bfloat16)
+        out = torch.full((1, m, n), float("nan"), device="cuda", dtype=torch.bfloat16)
+        plan({A: a, B: b, Y: out})
+        torch.cuda.synchronize()
+        ref = (a.float().relu() if mainloop else a.float()) @ b.float().transpose(1, 2)
+        torch.testing.assert_close(out, ref.bfloat16(), atol=0, rtol=0)
+    capture = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.graph(capture, stream=stream):
+        plan({A: a, B: b, Y: out}, stream=stream.cuda_stream)
+    a.mul_(2)
+    out.fill_(float("nan"))
+    capture.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, (ref * 2).bfloat16(), atol=0, rtol=0)
+    assert not plan.deferrals
+
+
+@requires_sm100
+@pytest.mark.parametrize("pipeline,cluster_reduce", [("sm100", False), ("sm100", True), ("sm120", False)])
+@pytest.mark.parametrize("swapped", [False, True])
+def test_split_k_shape_guard_matches_explain(pipeline, cluster_reduce, swapped):
+    """Refuse empty slices before writes and give the same diagnostic on demand."""
+    from importlib import import_module
+    from cudnn.frost.workspace import Workspace
+    from cudnn.gemm.frost.tile_config import as_pipeline, by_name
+
+    compiler = import_module(f"cudnn.gemm.frost.{pipeline}.compiler")
+    cfg = by_name("CONFIG_sm100_128x64x128_128x64x32_cluster1x1_1ctamma")
+    cfg = replace(as_pipeline(cfg, pipeline), split_k_slices=4, cluster_k_reduce=cluster_reduce, swap_ab=swapped)
+    compiled = compiler.jit_from_cudnn_graph(_plain_graph(m=128, n=128, k=1024), cfg)
+    a = torch.ones((1, 128, 16), device="cuda", dtype=torch.bfloat16)
+    b = torch.ones_like(a)
+    out = torch.full((1, 128, 128), -123, device="cuda", dtype=torch.bfloat16)
+    operands = _bound_buffers(compiled, a, b, out)
+    scratch = torch.full((max(compiled.workspace_bytes, 1),), 0xA5, device="cuda", dtype=torch.uint8)
+    workspace = Workspace(scratch, compiled.workspace_bytes, "split-K guard test") if compiled.workspace_bytes else None
+    messages = []
+    for call in (lambda: compiled.lowered(operands, workspace=workspace), lambda: compiled.explain(operands)):
+        with pytest.raises(ValueError, match="exceeds the .* K tile") as error:
+            call()
+        messages.append(str(error.value))
+    assert messages[0] == messages[1]
+    torch.cuda.synchronize()
+    assert torch.all(out == -123)
+    assert torch.all(scratch == 0xA5)
+
+
 def _matmul_on(batch, m, n, k, want_frost, a, b, c):
     """Build the plain graph, pin a backend or a FROST plan, run it."""
     g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
@@ -882,3 +957,44 @@ def test_operand_batch_is_checked():
     one_batch_b = b[:1].contiguous()
     with pytest.raises(ValueError):
         compiled.lowered(_bound_buffers(compiled, a, one_batch_b, c), stream=None)
+
+
+@requires_sm100
+def test_split_k_missing_workspace_preserves_reduction_outputs():
+    """Check scratch before filling split-K reduction outputs."""
+    from cudnn.gemm.frost.tile_config import by_name
+
+    cfg = replace(by_name("CONFIG_sm100_128x128x64_128x128x32_cluster1x1_1ctamma"), split_k_slices=2)
+    compiled = jit_from_cudnn_graph(_row_reduction_graph(), cfg)
+    operands = _buffers_for(compiled)
+    seeds = [operands[o.index] for o in compiled.recipe.outputs if o.init is not None]
+    assert seeds
+    for output in seeds:
+        output.fill_(17.0)
+    with pytest.raises(ValueError, match="workspace"):
+        compiled.lowered(operands)
+    for output in seeds:
+        torch.testing.assert_close(output, torch.full_like(output, 17.0), atol=0, rtol=0)
+
+
+def test_sm120_swap_quant_diagnostic_uses_package_import(monkeypatch):
+    """Report the quantization error in the graph coordinate frame."""
+    from cudnn.gemm.frost.sm120 import compiler
+    from cudnn.gemm.frost.fusion_ir import BlockQuantizeSpec, FusionChain, MatmulSpec, OutputSpec, swap_ab
+    from cudnn.gemm.frost.tile_config import by_name
+
+    q = BlockQuantizeSpec(block_size=32, axis=2, source_ref=-1, scale_dtype="fp8_e8m0")
+    chain = FusionChain(matmul=MatmulSpec(128, 128, 128), quants=[q], output_specs=[OutputSpec(source_ref=-1, dtype="fp8_e4m3", quant_idx=0)])
+    compiled = object.__new__(compiler.CompiledFusedGemm)
+    compiled.chain = swap_ab(chain)
+    compiled.config = replace(by_name("CONFIG_sm120_64x64x64_16x16x32_cluster1x1_warps2x4"), swap_ab=True)
+    compiled.recipe = SimpleNamespace(device=0, problem=lambda *args: ((128, 128, 128), ()), batch=1)
+    for name in ("_check_plan_device", "check_shapes", "check_alignment"):
+        monkeypatch.setattr(compiler, name, lambda *args: None)
+
+    def reject(chain):
+        raise NotImplementedError("invalid quant extent")
+
+    monkeypatch.setattr(compiler, "_check_block_quant_semantics", reject)
+    with pytest.raises(ValueError, match="invalid quant extent"):
+        compiled.explain([])

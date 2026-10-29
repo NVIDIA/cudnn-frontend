@@ -122,7 +122,7 @@ def _partials(b, h, sq, d, splits):
 
 
 @pytest.mark.parametrize("splits", [4, 5, 16, 17, 20, 33, 64, 65], ids=lambda s: f"s{s}")
-@pytest.mark.parametrize("shape", [(1, 24, 1, 256), (2, 3, 5, 160)], ids=["decode_b1_h24_d256", "b2_h3_sq5_d160"])
+@pytest.mark.parametrize("shape", [(1, 24, 1, 256), (2, 3, 5, 160), (3, 5, 2, 128)], ids=["decode_b1_h24_d256", "b2_h3_sq5_d160", "b3_h5_sq2_head_tail"])
 def test_pointer_combine_many_splits_matches_the_reference(shape, splits):
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 

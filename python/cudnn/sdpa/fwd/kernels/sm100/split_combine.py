@@ -20,9 +20,12 @@ the dense padded-Q trim (a row at or past its batch's Q length) keeps the unspli
 partials are the same as a valid keyless row's, so the dense sink entry takes the per-batch Q lengths (``compile_ptr(has_q_lens=True)``) and drops the
 sink for those rows.
 
-One block of four warps per four (q_row, head, batch) rows, a lane owning four
-columns of d_v and walking the split axis; rows shorter than a block (decode,
-S_q < 4) take the decode form, whose four warps share one row's split axis.
+One warp per (q_row, head, batch) row, up to four rows per block; a lane
+owns four columns of d_v and walks the split axis. At S_q <= 2 the lean
+form groups the independent rows across heads, with at most four head
+warps per block. There is no CTA barrier or cross-warp exchange. Past G_S
+splits, those short rows take the decode form, whose four warps share one
+row's split axis.
 
 The DECODE-GRID kernel (``_combine_decode_grid_kernel``), a fourth form of the
 lean fp32-partial path: one block per (q_row, head, batch,
@@ -231,7 +234,10 @@ LEAN_WALK_G_T = 16
 
 
 def lean_grid_blocks(b: int, h: int, s_q: int) -> int:
-    """The lean forms' grid in blocks: ``ceil(S_q / ROWS_PER_BLOCK) x H_q x B`` (the quantity the decode-grid and lean-walk selection rules read)."""
+    """Logical row-grid size used by the decode-grid and lean-walk selection rules.
+
+    Short-query head packing changes the physical block grid, not this selector domain.
+    """
     return -(-int(s_q) // ROWS_PER_BLOCK) * int(h) * int(b)
 
 
@@ -517,20 +523,30 @@ def _combine_kernel(
     # the split tile's output, so nothing is read above the wait; the pass has no prologue to overlap, so the dependent grid (the
     # out projection in the gated block) is released right after it and stages its own while this pass runs.
     use_pdl: cutlass.Constexpr[bool] = False,
+    pack_heads: cutlass.Constexpr[bool] = False,
 ) -> None:
     if cutlass.const_expr(use_pdl):
         wait_on_dependent_grids()
         launch_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     lane = tidx % cutlass.Int32(32)
-    q_row = cute.arch.block_idx()[0] * cutlass.Int32(ROWS_PER_BLOCK) + tidx // cutlass.Int32(32)
-    head = cute.arch.block_idx()[1]
-    batch = cute.arch.block_idx()[2]
+    if cutlass.const_expr(pack_heads):
+        # Group the independent query rows across heads to keep each block busy.
+        head64 = cutlass.Int64(cute.arch.block_idx()[0]) * ROWS_PER_BLOCK + cutlass.Int64(tidx // 32)
+        head = cutlass.Int32(head64)
+        q_row = cute.arch.block_idx()[1]
+        batch = cute.arch.block_idx()[2]
+        in_bounds = head64 < cutlass.Int64(o_partial.shape[2])
+    else:
+        q_row = cute.arch.block_idx()[0] * cutlass.Int32(ROWS_PER_BLOCK) + tidx // cutlass.Int32(32)
+        head = cute.arch.block_idx()[1]
+        batch = cute.arch.block_idx()[2]
+        in_bounds = q_row < s_q
 
-    # A warp past S_q (last block only) has no row; there is no block-level
+    # A warp past the query/head bound has no row; there is no block-level
     # barrier below, so it simply falls through. Everything inside is
     # warp-uniform except the per-lane column guard.
-    if q_row < s_q:
+    if in_bounds:
         op = cutlass.make_array_view(o_partial)
         lp = cutlass.make_array_view(lse_partial)
         oo = cutlass.make_array_view(o_out)
@@ -2146,9 +2162,13 @@ def _launch_own_forms(
                 use_pdl=use_pdl,
             )
         else:
-            _combine_kernel(*args, lean_wide=True, use_pdl=use_pdl).launch(
-                grid=((SQ + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK, H, B),
-                block=[THREADS, 1, 1],
+            # Each warp owns one row without a CTA barrier or cross-warp
+            # exchange. Group heads so short-query batches use fewer blocks;
+            # a head tail is guarded independently in the kernel.
+            _combine_kernel(*args, lean_wide=True, use_pdl=use_pdl, pack_heads=True).launch(
+                grid=((H + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK, SQ, B),
+                block=[cute.math.min(cutlass.Int32(H), cutlass.Int32(ROWS_PER_BLOCK)) * 32, 1, 1],
+                max_number_threads=[THREADS, 1, 1],
                 stream=stream,
                 use_pdl=use_pdl,
             )

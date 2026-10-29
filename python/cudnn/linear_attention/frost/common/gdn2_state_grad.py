@@ -19,7 +19,7 @@ import cutlass.cute as cute
 
 from cudnn.frost.tile_dsl.pointwise import fp32_to_fp16
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b
-from .steep_decay import has_exact_path, steep_channel_bit
+from .steep_decay import STEEP_EXACT, steep_channel_bit
 
 
 @cute.jit
@@ -30,7 +30,7 @@ def pack_dstate_operand(
     operand = cutlass.Array(cutlass.Float32, width, alignment=16)
     for channel in cutlass.range_constexpr(width):
         operand[channel] = decayed[channel]
-    if cutlass.const_expr(has_exact_path(cfg)):
+    if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
         if steep_any != 0:
             steep_rows = cutlass.const_expr(cfg.d_k // len(cfg.compute_group_0_warp_ids))
             for channel in cutlass.range_constexpr(width):
@@ -47,7 +47,7 @@ def pack_dstate_operand(
 @cute.jit
 def store_steep_keys(cfg: cutlass.Constexpr, raw_k, norm, decay, bits, row, lane, keys):
     """Preserve bounded key operands before narrowing can erase a finite dU term."""
-    if cutlass.const_expr(has_exact_path(cfg)):
+    if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
         for i in cutlass.range_constexpr(cfg.d_k // 64 * 8):
             if ((bits >> i) & 1) != 0:
                 channel = (i // 8) * 64 + lane * 8 + i % 8
@@ -65,7 +65,7 @@ def add_steep_du(cfg: cutlass.Constexpr, values, scratch, keys, words, value_bas
     result = cutlass.Array(cutlass.Float32, 8, alignment=16)
     for i in cutlass.range_constexpr(8):
         result[i] = values[i]
-    if cutlass.const_expr(has_exact_path(cfg)):
+    if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
         steep_rows = cutlass.const_expr(cfg.d_k // len(cfg.compute_group_0_warp_ids))
         # Visit only set ballot bits, in increasing channel order. A full K scan
         # spends most of its time testing mild channels in a sparse steep tile.

@@ -26,7 +26,8 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
     # (``bprop_d128_accum_grouped_f16``, implementation ``accumulation_grouped_thd``) or the cta_group::2 PAIR body
     # (``bprop_d128_accum_grouped_2cta_stail_f16``, implementation ``accumulation_grouped_thd_2cta``; five launches either way).  A typed op-level
     # field (``d128_grouped_2cta_contract.CTA_PAIR_MODES``): "auto" = THE default = the per-S rule -- the pair iff both declared S_q and S_kv >=
-    # ``CTA_PAIR_MIN_SEQ`` (8192: the smallest S where the pair body won the measured backward step on cc 10.0), cc in ``CTA_PAIR_CCS``, a cluster
+    # ``CTA_PAIR_MIN_SEQ`` (8192: the smallest S where the pair body won the measured backward step on cc 10.0), cc in ``CTA_PAIR_CCS`` (the
+    # SM100 line, cc 10.0 / 10.3; the compile target follows the device as for the one-CTA body), a cluster
     # of two admitted by the device's occupancy query, and every support predicate of the pair body; else the one-CTA body.  "off" = the one-CTA
     # body always; "on" = the pair body at any S, declining BY NAME when a predicate fails.  Resolved once in ``check_support``
     # (``prepared_sm100_d128_grouped_2cta.resolve_cta_pair_body``) and recorded on the instance (``cta_pair_resolution``: the token
@@ -73,6 +74,16 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
     # values: the same accumulation chain per GEMM); dQ by the fp64 gate.  Under "16w_fa4" ``debug_clk`` and ``dkv_accum = "fp32_reduce"``
     # decline by name.  Typed (``config_sm100_d128_accum_2cta_stail.CFG.WARP_ROLES``); read only on the 2-CTA route; the compile key carries it.
     warp_roles: "str | None" = None
+    # The pair body's STATS FORM -- how the softmax gets each q tile's LSE / delta rows: "tma_ring" (``None`` = the same under the default role
+    # shape; THE default since the day-4 measurement, +1.8 / +1.9 % at the step at 16K / 32K and +3.3 % on the graph replay against "ldg": the
+    # loader warp TMA-loads both rows one tile ahead into a two-stage SMEM ring behind a full / empty barrier pair; the chain's delta launch
+    # writes the two rows pre-scaled with the SAME two multiplies, so every stat word is bitwise the ldg form's and dQ / dK / dV are bitwise
+    # between the forms; the workspace carries the q-tile-padded pre-scaled stats for the LSE copy) | "ldg" (the previous default, selectable;
+    # the form "16w_fa4" resolves to when unset: the softmax fetches them per tile with one global load per lane, scales, stores them into one
+    # SMEM slab and fences the 8 warps with a named-barrier pair).  Perf-only; "tma_ring" NAMED declines by name under "16w_fa4"; served
+    # together with ``debug_clk``.  Typed (``config_sm100_d128_accum_2cta_stail.CFG.STATS_FORMS``); read only on the 2-CTA route; the compile
+    # key carries it.
+    stats_form: "str | None" = None
 
     def __init__(
         self,
@@ -225,13 +236,11 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
         self.head_dim_qk = self.head_dim_v = d
         self.scale_softmax = d**-0.5 if self.scale_softmax is None else float(self.scale_softmax)
         require(math.isfinite(self.scale_softmax) and self.scale_softmax != 0, "attn_scale must be finite and nonzero")
-        # The recompute body owns each gradient tile in one CTA and visits
-        # reduction tiles in a fixed order. The accumulation body uses unordered
-        # FP32 dQ reductions, so it cannot serve a deterministic request.
+        window_in_envelope = self.window_size_left is None or (d == 64 and self.window_size_left + 1 + int(sk) + 2 * 128 <= 2**31 - 1)
         self._implementation = (
             RECOMPUTE
-            if self.deterministic or d != 128 or self.window_size_left is not None
-            else select_implementation(cc, version, int(b), int(h), int(sq), int(sk), self.scale_softmax)
+            if self.deterministic or not window_in_envelope
+            else select_implementation(cc, version, int(b), int(h), int(sq), int(sk), self.scale_softmax, d_qk=int(d), d_v=int(d))
         )
         self._is_supported = True
         return True
@@ -264,7 +273,7 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
         if self.thd:
             return self._thd_workspace_bytes
         if self._implementation == ACCUMULATION:
-            return workspace_layout(self.batch_size, self.h_q, self.s_q_max)[1]
+            return workspace_layout(self.batch_size, self.h_q, self.s_q_max, self.head_dim_qk)[1]
         return 0
 
     def execute(

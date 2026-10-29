@@ -162,8 +162,7 @@ def _case(
 ):
     """``accumulation`` True = the default accumulation route; False = pin the recompute kernel (``_recompute_route``);
     None = leave the selection alone and expect recompute as the natural fallback (e.g. a negative scale).
-    ``allow_zero`` = compare an identically-zero oracle gradient by absolute tolerance instead of demanding exact zeros
-    (the three-launch route rounds delta and dP separately, so a single-key dQ / dK is tiny but not bitwise zero)."""
+    ``allow_zero`` = compare an identically-zero oracle gradient by absolute tolerance."""
     gen = torch.Generator(device="cpu").manual_seed(seed)
 
     def draw(s):
@@ -205,7 +204,7 @@ def _case(
     if check_build:
         assert torch.cuda.memory_allocated() == before
     rounded = (sq + 127) // 128 * 128  # the accumulation workspace covers whole dQ tiles
-    required = 4 * b * h * rounded * 129 + 240 if accumulation else 0
+    required = 4 * b * h * rounded * (d + 1) + 240 if accumulation else 0
     assert graph.get_workspace_size() == required
     refs.update(zip(("dq", "dk", "dv"), outputs))
     pack = {refs[n]: value for n, value in tensors.items()}

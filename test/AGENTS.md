@@ -174,12 +174,6 @@ prefill; a short query alone does not imply the D128 decode template.
   `gemm/cutedsl/test_sm110_amax_reduction.py::test_direct_redux_scan_handles_multiline_call`
   covers matching and non-matching reduction calls with long argument lists.
 
-- Coverage-shape selectors raise when they cannot select the requested schedule.
-  Only the device-dependent fixture may convert that error into a skip.
-  Fixed supported-device geometry tests must fail if a schedule becomes unavailable.
-  `linear_attention/test_gdn2_frost_steep_decay.py::test_steep_schedule_geometry_rejects_missing_schedule`
-  disables DV splitting to check this boundary.
-
 - MXFP8 input does not imply three scale-factor buffers or one-byte V.
   The existing PV-BF16 specialization consumes only SF_Q/SF_K, keeps BF16
   V/O, and binds `sf_v_ptr=None` with a zero third SF tile count. Preserve
@@ -243,12 +237,9 @@ prefill; a short query alone does not imply the D128 decode template.
   medians and non-finite derived measurements before replacing existing output.
   Use explicit validation rather than `assert`, which Python `-O` removes.
   Serialize with `allow_nan=False`. Check all expected numerical errors against
-  their tolerance instead of trusting a saved pass flag. The CPU subprocess
-  tests in `linear_attention/test_gdn2_steep_decay_summary.py` cover these cases.
-  Benchmark producers must also use explicit checks for scheduler activation,
-  finite tensors, profiler activity, and numerical acceptance. The CPU tests in
-  `linear_attention/test_gdn2_steep_decay_benchmark.py` exercise the real producer
-  functions with mocked GPU calls under normal and optimized Python.
+  their tolerance instead of trusting a saved pass flag. Benchmark producers must
+  also use explicit checks for scheduler activation, finite tensors, profiler
+  activity, and numerical acceptance (`benchmark/linear_attention/steep_decay/`).
 - Memo-key regression tests should observe the actual lookup and the selected plan, rather than relying on positional offsets in private key tuples. Appending an independent cache axis must not break an unrelated test; keep the miss count, selected configuration, and A-B-A identity checks. `test_block_scaled_memo_respects_overlap_margin` records the lookup key through its test memo.
 - Workspace device checks compare storage with the declared launch device, not a fixed CUDA ordinal or the ambient current device. Match the diagnostic's actual expected/observed ordinals; the wrong-device message need not contain the word "device". `core/cutedsl/test_workspace_device.py` covers the diagnostic with one GPU and both storage-device directions when two are visible, including DLPack-only and CUDA-array-interface-only buffers.
 - **A dispatch fact that reads the device's SM count is asserted against the live resolver, never as a constant.** The small-M
@@ -368,6 +359,11 @@ package can therefore load candidate implementations and produce a false
 GREEN baseline. For RED/GREEN checks, copy only the new test changes into an
 isolated baseline worktree and collect there; verify the concrete operation
 module's `__file__` after conftest setup, not only `cudnn.__file__`.
+
+Read repository documentation relative to the test checkout, not `cudnn.__file__`.
+CI can load a wheel's package initializer while conftests overlay source modules;
+the wheel may omit Markdown files. The GEMM descriptor-order checks in
+`gemm/frost/test_block_scale_smem_layout_sm107.py` exercise this boundary.
 
 Import-regression subprocesses are separate interpreters: in-process
 `sys.path` or editable-finder changes do not automatically propagate. Carry
@@ -1139,11 +1135,8 @@ a different GPU current; include changed-input capture replay. The detector is
 staging suite; it exercises both standalone adapters with a real host. A test
 that intercepts entry before launch provides a safe RED control for this bug.
 
-FROST regression filenames must match the CI `-k frost` selection, including
-pure scratch-layout tests without a backend parameter. Verify collection with
-that filter. Gate suites that import kernel helpers with the shared DSL
-availability and version checks before importing those helpers. Keep pure
-layout suites runnable below the kernel DSL floor.
+FROST regression filenames must match the CI `-k frost` selection. Verify
+collection with that filter.
 
 When pinning append-only records, assert the historical field segment or a
 frozen positional prefix, written explicitly rather than derived from the

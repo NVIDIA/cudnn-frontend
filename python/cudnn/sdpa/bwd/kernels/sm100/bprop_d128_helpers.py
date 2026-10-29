@@ -23,12 +23,20 @@ RN = cute.math.RoundingMode.NEAREST_EVEN
 
 
 @cute.kernel
-def dot_do_o_kernel(o: cute.Tensor, do: cute.Tensor, delta: cute.Tensor, dq_accum: cute.Tensor, dot_factor: cutlass.Float32):
-    """Eight rows per CTA, FP32 FTZ pair reduction, and dQ initialization."""
+def dot_do_o_kernel(
+    o: cute.Tensor,
+    do: cute.Tensor,
+    delta: cute.Tensor,
+    dq_accum: cute.Tensor,
+    dot_factor: cutlass.Float32,
+    lanes_per_row: cutlass.Constexpr[int] = LANES_PER_ROW,
+    rows_per_cta: cutlass.Constexpr[int] = ROWS_PER_CTA,
+):
+    """``rows_per_cta`` rows per CTA, FP32 FTZ pair reduction, and dQ initialization."""
     block, batch, head = cute.arch.block_idx()
     tid, _, _ = cute.arch.thread_idx()
-    row = cutlass.Int64(block) * ROWS_PER_CTA + cutlass.Int64(tid // LANES_PER_ROW)
-    column = cutlass.Int64(tid % LANES_PER_ROW) * ELEMENTS_PER_LANE
+    row = cutlass.Int64(block) * rows_per_cta + cutlass.Int64(tid // lanes_per_row)
+    column = cutlass.Int64(tid % lanes_per_row) * ELEMENTS_PER_LANE
     # Tail rows past S_q read the last O / dO row (in bounds, uniform across
     # the shuffle group) and store delta = 0; their dQ rows are still zeroed.
     valid = row < cutlass.Int64(o.shape[1])
@@ -60,12 +68,12 @@ def dot_do_o_kernel(o: cute.Tensor, do: cute.Tensor, delta: cute.Tensor, dq_accu
     dot = cute.math.add(pairs[0], pairs[1], rounding=RN, ftz=True)
     dot = cute.math.add(dot, pairs[2], rounding=RN, ftz=True)
     dot = cute.math.add(dot, pairs[3], rounding=RN, ftz=True)
-    for step in cutlass.range_constexpr(4):
-        peer = nvvm.shfl_sync(thread_mask=0xFFFFFFFF, val=dot, offset=1 << (3 - step), mask_and_clamp=0x1F, kind=nvvm.Shfl.BFLY)
+    for step in cutlass.range_constexpr(lanes_per_row.bit_length() - 1):
+        peer = nvvm.shfl_sync(thread_mask=0xFFFFFFFF, val=dot, offset=lanes_per_row >> (step + 1), mask_and_clamp=0x1F, kind=nvvm.Shfl.BFLY)
         dot = cute.math.add(dot, peer, rounding=RN, ftz=True)
     dot = cute.math.mul(dot, dot_factor, rounding=RN, ftz=True)
     dot = cutlass.Float32(arith.select(valid.ir_value(), dot.ir_value(), cutlass.Float32(0.0).ir_value()))
-    if tid % LANES_PER_ROW == 0:
+    if tid % lanes_per_row == 0:
         (delta.iterator.raw_ptr() + delta_offset).store(dot)
 
 
@@ -75,18 +83,26 @@ dot_do_o_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 @cute.jit
 def delta_zero_host(o: cute.Tensor, do: cute.Tensor, delta: cute.Tensor, dq_accum: cute.Tensor, stream: cuda_driver.CUstream):
     """One dense no-dropout launch over dQ's rounded rows (a multiple of 128)."""
-    dot_do_o_kernel(o, do, delta, dq_accum, cutlass.Float32(1.0)).launch(
-        grid=(dq_accum.shape[1] // ROWS_PER_CTA, o.shape[0], o.shape[2]), block=(THREADS, 1, 1), stream=stream
+    lanes = o.shape[3] // ELEMENTS_PER_LANE
+    rows = THREADS // lanes
+    dot_do_o_kernel(o, do, delta, dq_accum, cutlass.Float32(1.0), lanes, rows).launch(
+        grid=(dq_accum.shape[1] // rows, o.shape[0], o.shape[2]), block=(THREADS, 1, 1), stream=stream
     )
 
 
 @cute.kernel
-def cast_dq_d128_kernel(dq_accum: cute.Tensor, dq_out: cute.Tensor, io_dtype: cutlass.Constexpr):
+def cast_dq_d128_kernel(
+    dq_accum: cute.Tensor,
+    dq_out: cute.Tensor,
+    io_dtype: cutlass.Constexpr,
+    lanes_per_row: cutlass.Constexpr[int] = LANES_PER_ROW,
+    rows_per_cta: cutlass.Constexpr[int] = ROWS_PER_CTA,
+):
     """Convert eight FP32 elements per lane without rescaling."""
     block, batch, head = cute.arch.block_idx()
     tid, _, _ = cute.arch.thread_idx()
-    row = cutlass.Int64(block) * ROWS_PER_CTA + cutlass.Int64(tid // LANES_PER_ROW)
-    column = cutlass.Int64(tid % LANES_PER_ROW) * ELEMENTS_PER_LANE
+    row = cutlass.Int64(block) * rows_per_cta + cutlass.Int64(tid // lanes_per_row)
+    column = cutlass.Int64(tid % lanes_per_row) * ELEMENTS_PER_LANE
     src_offset = (
         cutlass.Int64(batch) * cutlass.Int64(dq_accum.stride[0])
         + row * cutlass.Int64(dq_accum.stride[1])
@@ -99,8 +115,6 @@ def cast_dq_d128_kernel(dq_accum: cute.Tensor, dq_out: cute.Tensor, io_dtype: cu
         + cutlass.Int64(head) * cutlass.Int64(dq_out.stride[2])
         + column
     )
-    # The accumulator holds the rounded rows, so the load stays in bounds; only
-    # the output store skips the tail past S_q.
     lo = (dq_accum.iterator.raw_ptr() + src_offset).load(count=4, alignment=16)
     hi = (dq_accum.iterator.raw_ptr() + src_offset + 4).load(count=4, alignment=16)
     packed = cutlass.Vector.from_elements(
@@ -122,6 +136,8 @@ cast_dq_d128_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 @cute.jit
 def cast_dq_host(dq_accum: cute.Tensor, dq_out: cute.Tensor, io_dtype: cutlass.Constexpr, stream: cuda_driver.CUstream):
     """One native vector cast launch; output rows must be 16-byte aligned."""
-    cast_dq_d128_kernel(dq_accum, dq_out, io_dtype).launch(
-        grid=((dq_out.shape[1] + ROWS_PER_CTA - 1) // ROWS_PER_CTA, dq_out.shape[0], dq_out.shape[2]), block=(THREADS, 1, 1), stream=stream
+    lanes = dq_out.shape[3] // ELEMENTS_PER_LANE
+    rows = THREADS // lanes
+    cast_dq_d128_kernel(dq_accum, dq_out, io_dtype, lanes, rows).launch(
+        grid=((dq_out.shape[1] + rows - 1) // rows, dq_out.shape[0], dq_out.shape[2]), block=(THREADS, 1, 1), stream=stream
     )

@@ -32,6 +32,7 @@ from gemm_test_utils import (
     reduction_dims as _reduction_dims,
     assert_block_scale_reduction_close as _assert_block_scale_reduction_close,
     with_static_segmented_capacity as _with_static_segmented_capacity,
+    plan_as_sm100,
 )
 
 from cudnn.gemm.frost.dtypes import DTYPE_FROM_CUDNN as _DTYPE_FROM_CUDNN
@@ -72,11 +73,244 @@ def test_moe_swap_ab_lowers_internal_operation():
 
 
 @pytest.mark.parametrize("cta_n", (32, 64))
-def test_moe_swap_ab_preserves_block_scale_tile_constraints(cta_n):
+def test_moe_swap_ab_preserves_block_scale_tile_constraints(cta_n, monkeypatch):
+    """Keep the transformed MoE scale layout within supported tile geometry."""
+    sm100 = plan_as_sm100(monkeypatch)
     chain = analyze(_build_graph(2, 173, 256, 256, num_groups=6))
-    cfg = by_name(f"CONFIG_sm100_128x{cta_n}x128_128x{cta_n}x32_cluster1x1_1ctamma")
+    cfg = by_name(f"CONFIG_sm100_256x{cta_n}x128_128x{cta_n}x32_cluster2x1_2ctamma")
     with pytest.raises(NotImplementedError, match="mma_tile_n % 128 == 0"):
-        C.probe_chain(chain, replace(cfg, swap_ab=True))
+        sm100.probe_chain(chain, replace(cfg, swap_ab=True))
+
+
+def _narrow_n_config(width, *, mma_k=32, cluster="1x1", m_blocks=1):
+    """Build an exact narrow-N config while preserving the requested strategy axes."""
+    return f"CONFIG_sm100_{128 * m_blocks}x{width}x128_128x{width}x{mma_k}_cluster{cluster}_1ctamma"
+
+
+@requires_sm100
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("cta_m,cta_n,cta_group", [(256, 128, 1), (256, 128, 2), (512, 32, 1)])
+def test_moe_block_scale_resident_sf_multi_mma_m(combo, swap_ab, cta_m, cta_n, cta_group):
+    """Preserve segmented MoE scale addressing with resident words and MMA-M blocks."""
+    cluster, mode = ("1x1", "1ctamma") if cta_group == 1 else ("2x1", "2ctamma")
+    _run_e2e(
+        E=2,
+        S=811,
+        N=264,
+        K=1024,
+        offsets_list=[0, 1, 1, 304, 433, 807, 811],
+        combo=combo,
+        config_name=f"CONFIG_sm100_{cta_m}x{cta_n}x128_128x{cta_n}x32_cluster{cluster}_{mode}",
+        cta_group=cta_group,
+        swap_ab=swap_ab,
+    )
+
+
+@pytest.mark.parametrize("width", range(8, 128, 8))
+@pytest.mark.parametrize("swap_ab", [False, True])
+def test_moe_block_scale_narrow_n_support(width, swap_ab):
+    """Admit supported narrow MoE geometry through the registry funnel."""
+    chain = analyze(_build_graph(2, 811, 264, 512, num_groups=6))
+    C.probe_chain(chain, replace(by_name(_narrow_n_config(width)), swap_ab=swap_ab))
+
+
+@requires_sm100
+@pytest.mark.parametrize("width", range(8, 128, 8))
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
+def test_moe_block_scale_narrow_n_ragged_groups(width, swap_ab, combo):
+    """Handle ragged and empty token groups with narrow feature tiles."""
+    _run_e2e(
+        E=2,
+        S=811,
+        N=264,
+        K=512,
+        offsets_list=[0, 1, 1, 304, 433, 807, 811],
+        combo=combo,
+        config_name=_narrow_n_config(width),
+        cta_group=1,
+        swap_ab=swap_ab,
+    )
+
+
+@requires_sm100
+@pytest.mark.parametrize("width", [8, 24, 64, 96, 120])
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("cluster,m_blocks", [("2x1", 1), ("1x2", 1), ("2x2", 1), ("1x1", 2)])
+def test_moe_block_scale_narrow_n_cluster(width, swap_ab, cluster, m_blocks):
+    """Preserve grouped scale addressing under cluster multicast."""
+    _run_e2e(
+        E=2,
+        S=811,
+        N=264,
+        K=512,
+        offsets_list=[0, 1, 1, 304, 433, 807, 811],
+        config_name=_narrow_n_config(width, cluster=cluster, m_blocks=m_blocks),
+        cta_group=1,
+        swap_ab=swap_ab,
+    )
+
+
+@requires_sm100
+@pytest.mark.parametrize("width", [8, 24, 64, 96])
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("force_stg", [False, True])
+def test_moe_block_scale_narrow_n_aligned_m_major(width, swap_ab, force_stg):
+    """Store aligned M-major MoE outputs without changing narrow scale addressing."""
+    _run_e2e(
+        E=2,
+        S=768,
+        N=256,
+        K=512,
+        offsets_list=[0, 0, 384, 384, 768, 768, 768],
+        offset_multiple=384,
+        config_name=_narrow_n_config(width),
+        cta_group=1,
+        swap_ab=swap_ab,
+        output_major="m",
+        force_stg=force_stg,
+    )
+
+
+@requires_sm107
+@pytest.mark.parametrize("width", [8, 48, 96])
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
+def test_moe_block_scale_narrow_n_k64(width, swap_ab, combo):
+    """Execute narrow MoE tiles with the gated K64 block-scale instruction."""
+    _run_e2e(
+        E=2,
+        S=811,
+        N=264,
+        K=512,
+        offsets_list=[0, 1, 1, 304, 433, 807, 811],
+        combo=combo,
+        config_name=_narrow_n_config(width, mma_k=64),
+        cta_group=1,
+        swap_ab=swap_ab,
+    )
+
+
+@requires_sm100
+@pytest.mark.parametrize("width", [8, 24, 48, 96, 120])
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
+def test_moe_block_scale_narrow_n_gather(width, swap_ab, combo):
+    """Gather routed tokens while extracting the correct narrow weight scales."""
+    _run_gather_block_scale(C, replace(by_name(_narrow_n_config(width)), swap_ab=swap_ab), combo=combo)
+
+
+@requires_sm100
+@pytest.mark.parametrize("width", [24, 96])
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("fp8_on_a", [False, True])
+@pytest.mark.parametrize("mma_k", [32, pytest.param(64, marks=requires_sm107)])
+def test_moe_block_scale_narrow_n_mixed(width, swap_ab, fp8_on_a, mma_k):
+    """Keep mixed-width MoE data and scale extents independent."""
+    _run_e2e_mixed(fp8_on_a, _narrow_n_config(width, mma_k=mma_k), swap_ab=swap_ab)
+
+
+@requires_sm100
+@pytest.mark.parametrize("width", [24, 96])
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("fake_a", [False, True])
+@pytest.mark.parametrize("combo", ["mxfp4", "mxfp8"])
+def test_moe_block_scale_narrow_n_one_sided(width, swap_ab, fake_a, combo):
+    """Preserve the synthesized identity scale for one-sided MoE dequantization."""
+    name = _narrow_n_config(width) + ("_swapAB" if swap_ab else "")
+    test_e2e_one_sided_dequant(fake_a, combo, True, name)
+
+
+@requires_sm100
+@pytest.mark.parametrize("width", [8, 24, 96])
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
+def test_moe_block_scale_narrow_n_swiglu(width, swap_ab, combo):
+    """Apply the fused SwiGLU epilogue to narrow grouped block-scale tiles."""
+    from test_moe_grouped_block_scale_matmul_fwd_swiglu import test_dual_moe_grouped_block_scale_matmul_fwd_swiglu as run
+
+    name = _narrow_n_config(width) + ("_swapAB" if swap_ab else "")
+    run(combo, name, 1)
+
+
+@requires_sm100
+@pytest.mark.parametrize("width", [8, 24, 96])
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("dims", [[1, 1, 1], [1, 1, 256], [1, 811, 1]])
+def test_moe_block_scale_narrow_n_reduction(width, swap_ab, dims):
+    """Reduce narrow grouped outputs using the declared graph reduction semantics."""
+    _run_e2e(
+        E=2,
+        S=811,
+        N=256,
+        K=512,
+        offsets_list=[0, 1, 1, 304, 433, 807, 811],
+        config_name=_narrow_n_config(width),
+        cta_group=1,
+        swap_ab=swap_ab,
+        reduction_mode=cudnn.reduction_mode.ADD,
+        reduction_dims=dims,
+    )
+
+
+@requires_sm100
+@pytest.mark.parametrize("width", [32, 64, 96])
+@pytest.mark.parametrize("swap_ab", [False, True])
+def test_moe_block_scale_narrow_n_quant(width, swap_ab):
+    """Quantize narrow grouped outputs while respecting token and scale boundaries."""
+    _run_e2e(
+        E=2,
+        S=811,
+        N=256,
+        K=512,
+        offsets_list=[0, 1, 1, 304, 433, 807, 811],
+        config_name=_narrow_n_config(width),
+        cta_group=1,
+        swap_ab=swap_ab,
+        quant=True,
+    )
+
+
+@requires_sm100
+@pytest.mark.parametrize("width", [24, 64])
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("mode", ["scatter", "combine"])
+def test_moe_block_scale_narrow_n_routing(width, swap_ab, mode):
+    """Preserve gather and scatter routing, output guards and capture replay."""
+    plan = _run_e2e(
+        E=2,
+        S=258,
+        N=256,
+        K=512,
+        offsets_list=[0, 3, 3, 131, 257, 258, 258],
+        config_name=_narrow_n_config(width),
+        cta_group=1,
+        swap_ab=swap_ab,
+        **{f"{mode}_top_k": 2},
+    )
+    if mode == "scatter" and not swap_ab:
+        # Four 16-byte rows advance only 64 bytes: every second scatter4
+        # source would violate TMA's 128-byte SMEM address alignment.
+        assert plan._compiled.store_modes == (("stg",) if width == 24 else ("tma",))
+
+
+@requires_sm100
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp8"])
+def test_moe_block_scale_narrow_n_gather_public(swap_ab, combo, cudnn_handle):
+    """Execute a narrow gather plan through the public graph lifecycle."""
+    previous_stream = cudnn.get_stream(cudnn_handle)
+    try:
+        _run_gather_block_scale(
+            C,
+            replace(by_name(_narrow_n_config(24)), swap_ab=swap_ab),
+            combo=combo,
+            public=True,
+            handle=cudnn_handle,
+        )
+    finally:
+        cudnn.set_stream(cudnn_handle, previous_stream)
 
 
 @requires_sm100
@@ -1323,6 +1557,7 @@ def _run_e2e(
     combine_top_k=None,
     epilogue_relu=False,
 ):
+    """Compare routed block-scale execution and fused outputs with independent references."""
     dev = "cuda"
     torch.manual_seed(0)
     block_size = _COMBOS[combo][0]
@@ -1402,7 +1637,7 @@ def _run_e2e(
     # CUDA path does not implement for that dtype.
     sfa_live = torch.cat([part.view(torch.uint8) for part in sfa_parts]).view(sfa_log.dtype)
     sfa_blk = _with_static_segmented_capacity(sfa_live, S, num_groups, sf_k)
-    sfb_blk = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, sf_k, N)
+    sfb_blk = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, _ceil_div(N, 128) * 128, _ceil_div(sf_k, 4) * 4)
     offsets = torch.tensor(offsets_list, dtype=offset_torch_dt, device=dev)
     if quant:
         q = torch.empty(1, S, N, dtype=quant_out_torch_dt, device=dev)

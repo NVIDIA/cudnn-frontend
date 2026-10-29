@@ -165,6 +165,10 @@ CONTIG = [
 CL = [
     _case("BN 64x56x56", BN, (8, 64, 56, 56), cl=True, want="batchnorm_nhwc_sm100"),
     _case("BN 256x7x7", BN, (8, 256, 7, 7), cl=True, want="batchnorm_nhwc_sm100", smoke=True),
+    # The NHWC training forward's cache tiers (batchnorm_nhwc_sm100._knobs_for): mid M and
+    # wide C take the TMEM tier on SM100 and the smem tier where there is no TMEM (SM90).
+    _case("BN mid-M 256x56x56", BN, (16, 256, 56, 56), cl=True, want="batchnorm_nhwc_sm100", smoke=True),
+    _case("BN wide-C 1024x7x7", BN, (8, 1024, 7, 7), cl=True, want="batchnorm_nhwc_sm100", smoke=True),
     _case("IN 64x56x56", IN, (8, 64, 56, 56), cl=True, want="instancenorm_nhwc_sm100"),
     _case("IN 256x7x7", IN, (8, 256, 7, 7), cl=True, want="instancenorm_nhwc_sm100", smoke=True),
     _case("GN cpg=2 64x56x56", GN, (8, 64, 56, 56), cl=True, groups=32, want="groupnorm_nhwc_sm100"),
