@@ -145,6 +145,8 @@ _SM100_L2_BUDGET_BYTES = 50 * 1024 * 1024
 # causal walks take plain LPT (see _sched_points): 8 MiB sits between the measured
 # S=8K bf16 (4 MiB, LPT ahead) and S=32K bf16 (16 MiB, LPT_L2 ahead) points.
 _SM100_D128_LPT_L2_MIN_BYTES = 8 * 1024 * 1024
+# Per-KV-head K+V footprint below which the quantized d128 GQA causal arm of the 107 line proposes plain LPT first.
+_SM107_QUANT_D128_GQA_LPT_MAX_HEAD_BYTES = 2 * 1024 * 1024
 # Rubin, causal, NO GQA (h_q == h_kv): the LPT-vs-NATURAL crossover in grid WAVES
 # (work items per persistent 2-CTA cluster).  Perf node, kernel-level, d192x128
 # FP8 H128 causal, NATURAL = 1.00: LPT 1.00 / 1.16 / 0.93 / 0.87 / 0.92 and
@@ -1520,6 +1522,16 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # Row-keyed (``caps.sm_lo == 100`` names a cc RANGE, not a device): this also
         # proposes LPT on cc 10.3, where LPT vs LPT_L2 is unmeasured; it follows the
         # existing B200-measured precedent of the decode-tile arm above, keyed the same way.
+        primary = SCHED_LPT
+    elif (
+        causal_ish
+        and 107 <= caps.sm_lo < 120
+        and (facts.is_fp8 or facts.is_mxfp8)
+        and _selected_d_shape(caps, facts) == (128, 128)
+        and int(facts.h_q) != int(facts.h_kv)
+        and int(facts.s_kv) * (int(facts.d_qk) + int(facts.d_v)) < _SM107_QUANT_D128_GQA_LPT_MAX_HEAD_BYTES
+    ):
+        # Quantized d128 with GQA under a causal band on the 107 line: plain LPT first, LPT_L2 the runner.
         primary = SCHED_LPT
     elif causal_ish:
         # SM100/SM120: balance the triangular load; pick the LPT variant by

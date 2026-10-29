@@ -906,8 +906,9 @@ def test_d128_mxfp8_causal_primary_uses_measured_scheduler():
     GQA 1 and 3, S=4K..32K, controls <= 0.35 %; O / Stats / Amax_O bitwise identical across policies).  The notch is
     an explicit oracle arm, not a domain effect (unlike d256: the d128 kernel serves LPT_L2), so the row's domain must
     still list all three.  Everything around it keeps the old proposal: the per-tensor FP8 d128 row measured
-    shape-dependent and leads with LPT_L2; the sm100 d192x128 MXFP8 flavor and the Rubin d128 MXFP8 row are unmeasured
-    and lead with LPT_L2 on a GQA graph; a mask-free d128 MXFP8 graph proposes NATURAL alone."""
+    shape-dependent and leads with LPT_L2; the sm100 d192x128 MXFP8 flavor leads with LPT_L2 on a
+    GQA graph; the sm107 quantized d128 rows lead with plain LPT below _SM107_QUANT_D128_GQA_LPT_MAX_HEAD_BYTES per KV
+    head on a GQA graph and keep the L2-budget arm above it; a mask-free d128 MXFP8 graph proposes NATURAL alone."""
     from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
     from cudnn.sdpa.fwd.heuristics import _sched_points
 
@@ -933,7 +934,13 @@ def test_d128_mxfp8_causal_primary_uses_measured_scheduler():
     # Scope: d128 only, SM100 row only, causal only.
     assert _sched_points(caps[mx_name], _facts(is_mxfp8=True, h_kv=8, d_qk=192, d_v=128, **quant)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
     rubin_mx = caps[engines.engine_name(mxfp8=True, arch="sm107")]
+    rubin_fp8 = caps[engines.engine_name(fp8=True, arch="sm107")]
     assert _sched_points(rubin_mx, _facts(is_mxfp8=True, h_kv=8, device_cc=(10, 7), **quant)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
+    for s in (2048, 4096):
+        short = {**quant, "s_q": s, "s_kv": s}
+        assert _sched_points(rubin_mx, _facts(is_mxfp8=True, h_kv=8, device_cc=(10, 7), **short)) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL], s
+        assert _sched_points(rubin_fp8, _facts(is_fp8=True, h_kv=8, device_cc=(10, 7), **short)) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL], s
+        assert _sched_points(rubin_fp8, _facts(is_fp8=True, h_kv=24, device_cc=(10, 7), **short))[0] != SCHED_LPT_L2, s
     assert _sched_points(caps[mx_name], _facts(is_mxfp8=True, h_kv=8, causal=False, **quant)) == [SCHED_NATURAL]
 
 
