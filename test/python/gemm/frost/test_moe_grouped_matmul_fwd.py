@@ -2197,6 +2197,69 @@ def test_sm120_moe_render_smoke(weight_major: str, gather: bool) -> None:
     assert params == ["problem_size", "first_token_offset", "a_tma_workspace", *(["token_index"] if gather else []), "a_0", "b_0", "c_tap_0", "stream"], params
 
 
+@requires_matmul_gpu
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["token_by_weight", "weight_by_token"])
+def test_moe_offsets_outside_the_contract_stay_in_bounds_sm120(swap_ab):
+    """first_token_offset is device data the host never checks. A table that breaks the
+    contract (a boundary past S, or below zero) is clamped into the S routed rows: rows
+    it no longer covers keep their contents, and nothing is stored outside the output."""
+    from cudnn.gemm.frost.sm120 import compiler as C120
+
+    E, S, N, K, guard, sentinel = 2, 256, 256, 128, 128, 123.0
+    compiled = C120.jit_from_cudnn_graph(_build_graph(E, S, N, K), config=replace(by_name(_SM120_CFG), swap_ab=swap_ab))
+    torch.manual_seed(0)
+    token = torch.randn(1, S, K, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda")
+    per_expert = [(token[0].float() @ weight[e].float().T).to(torch.bfloat16) for e in range(E)]
+    # The exactly shaped [1, S, N] output between two guard regions.
+    backing = torch.empty(guard + S + guard, N, dtype=torch.bfloat16, device="cuda")
+    out = backing[guard : guard + S].unsqueeze(0)
+    # Each table with the rows every group computes once it is clamped into [0, S].
+    for table, rows in (
+        ([0, 128, 256], [(0, 128), (128, 256)]),
+        ([0, 128, 384], [(0, 128), (128, 256)]),
+        ([0, -64, 128], [(0, 0), (0, 128)]),
+    ):
+        backing.fill_(sentinel)
+        compiled(_vp_moe(compiled, token, weight, torch.tensor(table, dtype=torch.int32, device="cuda"), out))
+        torch.cuda.synchronize()
+        assert torch.all(backing[:guard] == sentinel) and torch.all(backing[guard + S :] == sentinel), f"offsets {table} stored outside the output"
+        expected = torch.full((S, N), sentinel, dtype=torch.bfloat16, device="cuda")
+        for group, (begin, end) in enumerate(rows):
+            expected[begin:end] = per_expert[group % E][begin:end]
+        torch.testing.assert_close(out[0], expected, atol=0.125, rtol=0.01)
+
+
+@requires_matmul_gpu
+def test_gather_offsets_outside_the_contract_stay_in_bounds_sm120():
+    """A GATHER table whose last boundary passes the R routed rows reads token_index and
+    stores output rows below R only: its last group is clamped to R."""
+    from cudnn.gemm.frost.sm120 import compiler as C120
+
+    g, x, weights, offsets, indices, y = _build_gather_graph()
+    compiled = C120.jit_from_cudnn_graph(g, config=by_name(_SM120_CFG))
+    source_rows, R, n, guard, sentinel = 137, 257, 96, 64, 123.0
+    torch.manual_seed(123)
+    token = torch.randn(1, source_rows, 96, device="cuda", dtype=torch.bfloat16)
+    wbuf = torch.randn(3, n, 96, device="cuda", dtype=torch.bfloat16) * 0.1
+    # The index entries past R name a real source row, so a read past R would also feed a store.
+    index_backing = torch.full((R + guard,), 5, dtype=torch.int32, device="cuda")
+    index_backing[:R] = torch.randint(source_rows, (R,), device="cuda", dtype=torch.int32)
+    index = index_backing[:R].view(1, R, 1)
+    backing = torch.full((R + guard, n), sentinel, dtype=torch.bfloat16, device="cuda")
+    out = backing[:R].unsqueeze(0)
+    starts = [0, 65, 65, 68, 197, 198, R + 40]
+    fto = torch.tensor(starts, device="cuda", dtype=torch.int32).view(7, 1, 1)
+    compiled({x: token, offsets: fto, indices: index, y: out, weights[0]: wbuf})
+    torch.cuda.synchronize()
+    assert torch.all(backing[R:] == sentinel), "a row past R was stored"
+    ref = torch.empty(R, n, device="cuda", dtype=torch.float32)
+    for group in range(6):
+        begin, end = starts[group], min(starts[group + 1], R)
+        ref[begin:end] = token[0, index.flatten()[begin:end].long()].float() @ wbuf[group % 3].float().T
+    torch.testing.assert_close(out[0].float(), ref.to(torch.bfloat16).float(), atol=0.03, rtol=0.02)
+
+
 _SM120_MOE_TEMPLATES = (
     "sm120_moe_grouped_matmul_fwd.py",
     "sm120_moe_grouped_matmul_fwd_swap_ab.py",

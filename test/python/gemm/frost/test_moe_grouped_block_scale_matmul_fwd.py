@@ -3334,3 +3334,83 @@ def test_sm120_moe_mxfp8_partial_scale_block_call_is_refused(swap_ab) -> None:
         compiled(vp)
     torch.cuda.synchronize()
     assert torch.all(out == 7.0)
+
+
+@requires_sm120
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["token_by_weight", "weight_by_token"])
+def test_moe_block_scale_offsets_outside_the_contract_stay_in_bounds_sm120(swap_ab) -> None:
+    """first_token_offset is device data the host never checks. A table that breaks the
+    contract (a boundary past S, or below zero) is clamped into the S routed rows: rows
+    it no longer covers keep their contents, and nothing is stored outside the output."""
+    dev = "cuda"
+    E, S, N, K, guard, sentinel = 2, 256, 256, 256, 128, 123.0
+    sf_k = K // 32
+    plan = _plan(_build_graph(E, S, N, K, 2, "mxfp8"), config=by_name(_SM120_BS_CFG), swap_ab=swap_ab)
+    torch.manual_seed(0)
+    tok = (torch.randn(1, S, K, device=dev) * 0.5).to(torch.float8_e4m3fn)
+    w = (torch.randn(E, N, K, device=dev) * 0.5).to(torch.float8_e4m3fn)
+    sfa_log = _rand_e8m0((S, sf_k), dev)
+    sfb_log = _rand_e8m0((E, N, sf_k), dev)
+    # Every clamped group below starts on a 128-row block, so one blocked SFA serves all the tables.
+    sfa = _with_static_segmented_capacity(_to_blocked(sfa_log), S, 2, sf_k)
+    sfb = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, sf_k, N)
+    tok_s = tok.float().view(S, K) * sfa_log.float().repeat_interleave(32, 1)
+    w_s = w.float() * sfb_log.float().repeat_interleave(32, 2)
+    # The exactly shaped [1, S, N] output between two guard regions.
+    backing = torch.empty(guard + S + guard, N, dtype=torch.bfloat16, device=dev)
+    out = backing[guard : guard + S].unsqueeze(0)
+    # Each table with the rows every group computes once it is clamped into [0, S].
+    for table, rows in (
+        ([0, 128, 256], [(0, 128), (128, 256)]),
+        ([0, 128, 384], [(0, 128), (128, 256)]),
+        ([0, -64, 128], [(0, 0), (0, 128)]),
+    ):
+        backing.fill_(sentinel)
+        plan(_vp_bs(plan, tok, w, out, sfa, sfb, fto=torch.tensor(table, dtype=torch.int32, device=dev)))
+        torch.cuda.synchronize()
+        assert torch.all(backing[:guard] == sentinel) and torch.all(backing[guard + S :] == sentinel), f"offsets {table} stored outside the output"
+        expected = torch.full((S, N), sentinel, dtype=torch.float32, device=dev)
+        for group, (begin, end) in enumerate(rows):
+            expected[begin:end] = tok_s[begin:end] @ w_s[group % E].T
+        torch.testing.assert_close(out[0], expected.to(torch.bfloat16), atol=2e-1, rtol=2e-2)
+
+
+@requires_sm120
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["token_by_weight", "weight_by_token"])
+def test_moe_block_scale_bad_offsets_keep_segmented_scales_in_bounds_sm120(swap_ab) -> None:
+    """A grouped row-quantized scale output addresses each group's 128-row segment through
+    the scheduler's SF block prefix, so a bad first_token_offset table must not push that
+    prefix past the segmented capacity: neither a boundary past S nor a decreasing table,
+    whose clamped groups overlap, stores past the quantized or the scale output."""
+    dev = "cuda"
+    E = G = 5
+    S, N, K, bs = 512, 256, 256, 32
+    scale_dim = (1, segmented_row_scale_capacity_rows(S, G), _ceil_div(N // bs, 4) * 4)
+    graph = _build_graph(
+        E, S, N, K, G, "mxfp8", quant=True, quant_scale_reorder=True, quant_scale_dim=scale_dim, quant_block_size=bs, quant_axis=-1, quant_group_offset=True
+    )
+    plan = _plan(graph, config=by_name(_SM120_BS_CFG), swap_ab=swap_ab)
+    torch.manual_seed(0)
+    tok = (torch.randn(1, S, K, device=dev) * 0.5).to(torch.float8_e4m3fn)
+    w = (torch.randn(E, N, K, device=dev) * 0.5).to(torch.float8_e4m3fn)
+    sfa = _with_static_segmented_capacity(_to_blocked(_rand_e8m0((S, K // 32), dev)), S, G, K // 32)
+    sfb_log = _rand_e8m0((E, N, K // 32), dev)
+    sfb = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, K // 32, N)
+    # Exactly sized outputs, each followed by a guard as large as the stores past it that the
+    # unclamped tables below would make.
+    scale_bytes = math.prod(scale_dim)
+    q_store = torch.empty((2 * S, N), dtype=torch.uint8, device=dev)
+    scale_store = torch.empty(scale_bytes + 8192, dtype=torch.uint8, device=dev)
+    q = q_store[:S].view(torch.float8_e4m3fn).unsqueeze(0)
+    scale = scale_store[:scale_bytes].view(scale_dim).view(torch.float8_e8m0fnu)
+    for table in (
+        [0, 100, 200, 300, 400, S],  # in contract
+        [0, 1, 2, 3, 4, 2 * S],  # the last group runs S rows past the output
+        [0, S, 0, S, 0, S],  # clamped, groups 0, 2 and 4 all cover [0, S)
+    ):
+        q_store.fill_(0x5A)
+        scale_store.fill_(0x7B)
+        plan(_vp_bs(plan, tok, w, [q, scale], sfa, sfb, fto=torch.tensor(table, dtype=torch.int32, device=dev)))
+        torch.cuda.synchronize()
+        assert torch.all(q_store[S:] == 0x5A), f"offsets {table} stored past the quantized output"
+        assert torch.all(scale_store[scale_bytes:] == 0x7B), f"offsets {table} stored past the {scale_bytes}-byte segmented scale output"
