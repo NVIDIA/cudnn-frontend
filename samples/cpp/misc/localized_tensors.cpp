@@ -9,10 +9,12 @@
 #include <cudnn_frontend.h>
 
 #include <cuda.h>
+#include <cudaTypedefs.h>
 
 #include <algorithm>
 #include <iostream>
 #include <sstream>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -43,21 +45,77 @@ reference implementation.
 #define C_UID 2
 
 // The CUDA driver API counterpart of CUDA_CHECK in helpers.h.
-#define CU_CHECK(status)                                                                                        \
-    {                                                                                                           \
-        CUresult err = status;                                                                                  \
-        if (err != CUDA_SUCCESS) {                                                                              \
-            char const *err_str = nullptr;                                                                      \
-            cuGetErrorString(err, &err_str);                                                                    \
-            std::stringstream err_msg;                                                                          \
-            err_msg << "CUDA Driver Error: " << (err_str ? err_str : "unknown error") << " (" << err << ") at " \
-                    << __FILE__ << ":" << __LINE__;                                                             \
-            FAIL(err_msg.str());                                                                                \
-        }                                                                                                       \
+#define CU_CHECK(status)                                                                                              \
+    {                                                                                                                 \
+        CUresult err = status;                                                                                        \
+        if (err != CUDA_SUCCESS) {                                                                                    \
+            std::stringstream err_msg;                                                                                \
+            err_msg << "CUDA Driver Error: " << driver_error_string(err) << " (" << err << ") at " << __FILE__ << ":" \
+                    << __LINE__;                                                                                      \
+            FAIL(err_msg.str());                                                                                      \
+        }                                                                                                             \
     }
 
 #if CUDA_VERSION >= 13040
 namespace {
+
+// The CUDA driver functions this sample calls. They are looked up at run time through the CUDA runtime, so
+// the samples executable does not link libcuda.so and still starts on a machine without the driver. Each
+// type is the function's signature as of the CUDA version in its suffix, the version that is requested.
+struct DriverApi {
+    PFN_cuGetErrorString_v6000 cuGetErrorString;
+    PFN_cuInit_v2000 cuInit;
+    PFN_cuDeviceGet_v2000 cuDeviceGet;
+    PFN_cuDeviceGetAttribute_v2000 cuDeviceGetAttribute;
+    PFN_cuMemGetAllocationGranularity_v10020 cuMemGetAllocationGranularity;
+    PFN_cuMemCreate_v10020 cuMemCreate;
+    PFN_cuMemAddressReserve_v10020 cuMemAddressReserve;
+    PFN_cuMemMap_v10020 cuMemMap;
+    PFN_cuMemSetAccess_v10020 cuMemSetAccess;
+    PFN_cuCtxSynchronize_v2000 cuCtxSynchronize;
+    PFN_cuMemUnmap_v10020 cuMemUnmap;
+    PFN_cuMemAddressFree_v10020 cuMemAddressFree;
+    PFN_cuMemRelease_v10020 cuMemRelease;
+    PFN_cuPointerGetAttribute_v4000 cuPointerGetAttribute;
+};
+DriverApi driver = {};
+
+// Fills `driver`. Returns the name of the first function the driver does not provide, or nullptr.
+char const *
+load_driver_api() {
+    char const *missing = nullptr;
+    auto load           = [&missing](char const *name, unsigned int version, auto &function) {
+        void *address                          = nullptr;
+        cudaDriverEntryPointQueryResult status = cudaDriverEntryPointSymbolNotFound;
+        cudaError_t err = cudaGetDriverEntryPointByVersion(name, &address, version, cudaEnableDefault, &status);
+        if ((err != cudaSuccess || status != cudaDriverEntryPointSuccess) && missing == nullptr) {
+            missing = name;
+        }
+        function = reinterpret_cast<std::remove_reference_t<decltype(function)>>(address);
+    };
+    load("cuGetErrorString", 6000, driver.cuGetErrorString);
+    load("cuInit", 2000, driver.cuInit);
+    load("cuDeviceGet", 2000, driver.cuDeviceGet);
+    load("cuDeviceGetAttribute", 2000, driver.cuDeviceGetAttribute);
+    load("cuMemGetAllocationGranularity", 10020, driver.cuMemGetAllocationGranularity);
+    load("cuMemCreate", 10020, driver.cuMemCreate);
+    load("cuMemAddressReserve", 10020, driver.cuMemAddressReserve);
+    load("cuMemMap", 10020, driver.cuMemMap);
+    load("cuMemSetAccess", 10020, driver.cuMemSetAccess);
+    load("cuCtxSynchronize", 2000, driver.cuCtxSynchronize);
+    load("cuMemUnmap", 10020, driver.cuMemUnmap);
+    load("cuMemAddressFree", 10020, driver.cuMemAddressFree);
+    load("cuMemRelease", 10020, driver.cuMemRelease);
+    load("cuPointerGetAttribute", 4000, driver.cuPointerGetAttribute);
+    return missing;
+}
+
+char const *
+driver_error_string(CUresult status) {
+    char const *text = nullptr;
+    driver.cuGetErrorString(status, &text);
+    return text ? text : "unknown error";
+}
 
 // Device memory placed in one locality domain. Freed when it goes out of scope.
 class LocalizedBuffer {
@@ -72,16 +130,16 @@ class LocalizedBuffer {
         prop.location.localized.localityDomainId = static_cast<unsigned char>(domain);
 
         size_t granularity = 0;
-        CU_CHECK(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+        CU_CHECK(driver.cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
         size = (std::max<size_t>(bytes, 1) + granularity - 1) / granularity * granularity;
 
         // The destructor does not run when a constructor throws, so undo the steps that succeeded here.
         try {
-            CU_CHECK(cuMemCreate(&handle, size, &prop, 0));
+            CU_CHECK(driver.cuMemCreate(&handle, size, &prop, 0));
             created = true;
-            CU_CHECK(cuMemAddressReserve(&ptr, size, granularity, 0, 0));
+            CU_CHECK(driver.cuMemAddressReserve(&ptr, size, granularity, 0, 0));
             reserved = true;
-            CU_CHECK(cuMemMap(ptr, size, 0, handle, 0));
+            CU_CHECK(driver.cuMemMap(ptr, size, 0, handle, 0));
             mapped = true;
 
             // Access is granted to the device, whichever domain holds the memory.
@@ -89,7 +147,7 @@ class LocalizedBuffer {
             access.location.type   = CU_MEM_LOCATION_TYPE_DEVICE;
             access.location.id     = device;
             access.flags           = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-            CU_CHECK(cuMemSetAccess(ptr, size, &access, 1));
+            CU_CHECK(driver.cuMemSetAccess(ptr, size, &access, 1));
         } catch (...) {
             release();
             throw;
@@ -109,19 +167,28 @@ class LocalizedBuffer {
     }
 
    private:
-    // Undo each allocation step that succeeded, in reverse order.
+    // Undo each allocation step that succeeded, in reverse order. This never throws, so a failure here cannot
+    // replace the error that may have led to it. A failed call is reported on stderr instead.
     void
     release() {
         if (mapped) {
             // After an error, copies or kernels using this memory may still be queued: wait before unmapping.
-            cuCtxSynchronize();
-            cuMemUnmap(ptr, size);
+            report(driver.cuCtxSynchronize(), "cuCtxSynchronize");
+            report(driver.cuMemUnmap(ptr, size), "cuMemUnmap");
         }
         if (reserved) {
-            cuMemAddressFree(ptr, size);
+            report(driver.cuMemAddressFree(ptr, size), "cuMemAddressFree");
         }
         if (created) {
-            cuMemRelease(handle);
+            report(driver.cuMemRelease(handle), "cuMemRelease");
+        }
+    }
+
+    static void
+    report(CUresult status, char const *call) {
+        if (status != CUDA_SUCCESS) {
+            std::cerr << "LocalizedBuffer cleanup: " << call << " failed: " << driver_error_string(status) << " ("
+                      << status << ")" << std::endl;
         }
     }
 
@@ -155,7 +222,7 @@ struct StreamOwner {
 int
 locality_domain_of(void const *ptr) {
     int domain = 0;
-    CU_CHECK(cuPointerGetAttribute(
+    CU_CHECK(driver.cuPointerGetAttribute(
         &domain, CU_POINTER_ATTRIBUTE_LOCALITY_DOMAIN_ORDINAL, reinterpret_cast<CUdeviceptr>(ptr)));
     return domain;
 }
@@ -169,22 +236,28 @@ TEST_CASE("Matmul on localized tensors", "[localized][matmul][graph]") {
 #else
     namespace fe = cudnn_frontend;
 
-    CU_CHECK(cuInit(0));
-    int driver_version = 0;
-    CU_CHECK(cuDriverGetVersion(&driver_version));
+    // The driver functions themselves are older than CUDA 13.4; the locality-domain values passed to them are not.
+    char const *missing = load_driver_api();
+    int driver_version  = 0;
+    CUDA_CHECK(cudaDriverGetVersion(&driver_version));
     if (driver_version < 13040) {
         SKIP("Locality domains need a CUDA 13.4 or newer driver; this driver is " << driver_version);
     }
+    if (missing != nullptr) {
+        SKIP("The CUDA driver does not provide " << missing);
+    }
+    CU_CHECK(driver.cuInit(0));
 
     int ordinal = 0;
     CUDA_CHECK(cudaGetDevice(&ordinal));
     CUdevice device = 0;
-    CU_CHECK(cuDeviceGet(&device, ordinal));
+    CU_CHECK(driver.cuDeviceGet(&device, ordinal));
 
     int num_domains = 0, sms_per_domain = 0, sms_total = 0;
-    CU_CHECK(cuDeviceGetAttribute(&num_domains, CU_DEVICE_ATTRIBUTE_LOCALITY_DOMAIN_COUNT, device));
-    CU_CHECK(cuDeviceGetAttribute(&sms_per_domain, CU_DEVICE_ATTRIBUTE_LOCALITY_DOMAIN_MULTIPROCESSOR_COUNT, device));
-    CU_CHECK(cuDeviceGetAttribute(&sms_total, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device));
+    CU_CHECK(driver.cuDeviceGetAttribute(&num_domains, CU_DEVICE_ATTRIBUTE_LOCALITY_DOMAIN_COUNT, device));
+    CU_CHECK(
+        driver.cuDeviceGetAttribute(&sms_per_domain, CU_DEVICE_ATTRIBUTE_LOCALITY_DOMAIN_MULTIPROCESSOR_COUNT, device));
+    CU_CHECK(driver.cuDeviceGetAttribute(&sms_total, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device));
     std::cout << "device " << ordinal << ": " << num_domains << " locality domain(s), " << sms_per_domain
               << " SMs per domain, " << sms_total << " SMs on the device" << std::endl;
     if (num_domains < 2) {
