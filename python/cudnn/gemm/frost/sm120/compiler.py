@@ -1616,6 +1616,26 @@ def _check_executable(chain: FusionChain) -> None:
         raise NotImplementedError("the tvm-ffi front door is not installed, and the launch path this engine has needs it (pip install apache-tvm-ffi)")
 
 
+# Epilogue ops the shared emitter computes in Int32 (relu and leaky_relu convert
+# their float attributes to int32). The others use Float32-only CuTe DSL math
+# (floor in the comparison, logical, mod and backward step forms; exp2, rcp,
+# log, erf, sin, cos, sqrt, pow), which raises TypeError or fails to lower; div
+# emits `/`, which the DSL lowers to an fp32 divide while the vector keeps its
+# Int32 type, so the int32 output would hold the fp32 quotient's bit pattern.
+_INT32_COMPUTE_OPS = frozenset(
+    ("identity", "relu", "leaky_relu", "abs", "neg", "add", "sub", "mul", "max", "min", "add_square", "binary_select", "gen_index", "aux_load")
+)
+
+
+def _check_int32_compute(chain: FusionChain) -> None:
+    """Decline an epilogue op that computes in int32 but has no int32 emitter."""
+    for i, op in enumerate(chain.ops):
+        if op.compute_dtype == "int32" and op.op not in _INT32_COMPUTE_OPS:
+            raise NotImplementedError(
+                f"pointwise op {i} ({op.op!r}) computes in int32, which the sm120 epilogue emits only for {', '.join(sorted(_INT32_COMPUTE_OPS))}"
+            )
+
+
 def _cta_k_elems(chain: FusionChain, config: TileConfig) -> int:
     """Elements of K per CTA tile; fp4 packs two per byte."""
     return config.cta_tile_k_bytes * 8 // DTYPE_BITS[_mma_a_dtype(chain)]
@@ -2303,6 +2323,7 @@ def probe_chain(chain: FusionChain, config: TileConfig) -> None:
     _dtype_reason = dtype_arch_reject(chain, _current_arch())
     if _dtype_reason is not None:
         raise NotImplementedError(_dtype_reason)
+    _check_int32_compute(chain)
     _check_executable(chain)
     _check_splitk_supported(chain, config)
     if chain.is_multi_gemm and not (chain.has_moe or chain.has_block_scale):
@@ -2379,6 +2400,7 @@ def jit_from_cudnn_graph(
     _dtype_reason = dtype_arch_reject(chain, _current_arch())
     if _dtype_reason is not None:
         raise NotImplementedError(_dtype_reason)
+    _check_int32_compute(chain)
     _check_cta_group_geometry(config)
     _check_mma_n_dim(chain, config)
     _check_splitk_supported(chain, config)

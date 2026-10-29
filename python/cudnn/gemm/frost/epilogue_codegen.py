@@ -321,12 +321,14 @@ def _emit_op(
 
     if op.op == "gen_index":
         axis = dict(op.attrs).get("axis")
+        # An int32-compute index comes straight from the Int32 coordinate: Float32 rounds indices above 2**24.
+        idx_t = DTYPE_TO_CUTLASS[op.compute_dtype]
         if axis == 1:
-            return [f"{new} = cutlass.full_like({prev}, cutlass.Float32(row))"], new
-        gl = [f"_gi{idx} = cute.make_rmem_tensor({vsize}, cutlass.Float32)"]
+            return [f"{new} = cutlass.full_like({prev}, {idx_t}(row))"], new
+        gl = [f"_gi{idx} = cute.make_rmem_tensor({vsize}, {idx_t})"]
         for k in range(vsize):
             _, col = _elem_coord(k)
-            gl.append(f"_gi{idx}[{k}] = cutlass.Float32({col})")
+            gl.append(f"_gi{idx}[{k}] = {idx_t}({col})")
         gl.append(f"{new} = _gi{idx}.load().to_vector()")
         return gl, new
 
@@ -967,13 +969,14 @@ def _emit_pointwise_dag(chain, *, vsize, bounded, aux_load_expr, gemm_out_dtype=
         if scatter and op.op == "gen_index":
             token_axis = 2 if isinstance(chain.moe, MoeSwapAbSpec) else 1
             if dict(op.attrs).get("axis") == token_axis:
+                idx_t = DTYPE_TO_CUTLASS[op.compute_dtype]
                 if token_axis == 1:
-                    lines = [f"{cur} = cutlass.full_like({parent_var}, cutlass.Float32(moe_scatter_row(token_index, token_ks, row, group_end, M, moe_top_k)))"]
+                    lines = [f"{cur} = cutlass.full_like({parent_var}, {idx_t}(moe_scatter_row(token_index, token_ks, row, group_end, M, moe_top_k)))"]
                 else:
                     lines = [
-                        f"_gi{i} = cute.make_rmem_tensor(vsize, cutlass.Float32)",
+                        f"_gi{i} = cute.make_rmem_tensor(vsize, {idx_t})",
                         "for _sk in cutlass.range_constexpr(vsize):",
-                        f"    _gi{i}[_sk] = cutlass.Float32(moe_scatter_row(token_index, token_ks, col_j + _sk, group_end, N, moe_top_k))",
+                        f"    _gi{i}[_sk] = {idx_t}(moe_scatter_row(token_index, token_ks, col_j + _sk, group_end, N, moe_top_k))",
                         f"{cur} = _gi{i}.load().to_vector()",
                     ]
         body_lines.extend(lines)
