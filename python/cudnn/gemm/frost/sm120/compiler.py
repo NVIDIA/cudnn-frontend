@@ -2204,6 +2204,7 @@ def _analyze_graph(graph: cudnn.pygraph) -> "tuple[FusionChain, GemmBinding | No
     state = _state_from_graph(graph)
     chain, binding = _analyze_state(state)
     _check_graph_lowered(state, chain, binding)
+    _check_block_scale_sign(state)
     return _with_declared_output_layouts(chain, binding), binding
 
 
@@ -2254,6 +2255,30 @@ def _check_graph_lowered(state: dict, chain: FusionChain, binding: "GemmBinding 
             "its operands straight from graph inputs -- a multi-GEMM graph has no mainloop fusion, and no GEMM "
             "consumes another GEMM's result"
         )
+
+
+# Scale-factor types without a sign bit: ``is_negative_scale`` cannot change their values.
+_SIGN_FREE_SF_DTYPES = frozenset({"fp8_e8m0", "fp8_e5m3"})
+
+
+def _check_block_scale_sign(state: dict) -> None:
+    """Decline ``block_scale_dequantize(is_negative_scale=True)`` on scale factors that can be negative.
+
+    The shared analyzer records the attribute, but no chain field carries it. The sm120 warp MMA takes
+    every scale factor as an unsigned ``.ue4m3`` / ``.ue8m0`` operand and ignores the sign bit of an
+    E4M3 byte, so a block with ``s < 0`` would contribute ``x * |s|`` where the attribute asks for
+    ``x * s``. A sign-free scale cannot be negative, so the attribute changes nothing there."""
+    meta = state["tensor_meta"]
+    for op in state["ops"]:
+        if op.cudnn_name != "block_scale_dequantize" or not op.is_negative_scale:
+            continue
+        sf = meta[op.inputs[1]]
+        if sf.dtype not in _SIGN_FREE_SF_DTYPES:
+            raise NotImplementedError(
+                f"block_scale_dequantize {op.op_name!r} sets is_negative_scale=True on its {sf.dtype} scale factors "
+                f"{sf.name!r}, which the sm120 block-scale MMA cannot honor: it reads every scale as an unsigned "
+                ".ue4m3 / .ue8m0 value, so a negative scale would be applied as its magnitude"
+            )
 
 
 def _with_declared_output_layouts(chain: FusionChain, binding: "GemmBinding | None") -> FusionChain:

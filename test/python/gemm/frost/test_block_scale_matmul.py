@@ -77,6 +77,7 @@ def _build_nvfp4_graph(
     b_major="k",
     reorder=True,
     out_major="n",
+    negative_scale=(False, False),
 ):
     sf_k = K // block_size
     sf_m, sf_n = M, N
@@ -111,8 +112,9 @@ def _build_nvfp4_graph(
         data_type=sf_dt,
         **sf_kw,
     )
-    Ad = g.block_scale_dequantize(input=A, descale=SFA, block_size=[1, block_size])
-    Bd = g.block_scale_dequantize(input=B, descale=SFB, block_size=[block_size, 1])
+    # ``negative_scale`` = (A side, B side); None leaves is_negative_scale unset.
+    Ad = g.block_scale_dequantize(input=A, descale=SFA, block_size=[1, block_size], is_negative_scale=negative_scale[0] or None)
+    Bd = g.block_scale_dequantize(input=B, descale=SFB, block_size=[block_size, 1], is_negative_scale=negative_scale[1] or None)
     C = g.matmul(A=Ad, B=Bd, name="mm")
     if out_major == "m":
         C.set_stride([M * N, 1, M])
@@ -3540,3 +3542,23 @@ def test_sm120_fp4_rejects_non_k_major():
         g = _build_nvfp4_graph(256, 256, 256, a_major=a_major, b_major=b_major)
         with pytest.raises((ValueError, NotImplementedError), match="must be K-major"):
             jit_from_cudnn_graph(g, **_kw(_SM120_BS_128))
+
+
+@requires_sm120
+def test_sm120_block_scale_declines_signed_negative_scale():
+    """``is_negative_scale=True`` asks for ``x * s`` with signed E4M3 scales, but the sm120 block-scale
+    MMA reads every scale as unsigned ``.ue4m3`` and ignores the sign bit: the plan ran and returned
+    ``x * |s|``. The FROST engine and the direct JIT decline the attribute on either operand's E4M3
+    scales; the same graph without it, and a flagged E8M0 graph (no sign bit), keep their plans."""
+    from cudnn.gemm.frost.engine import FrostGemmEngine
+
+    engine = FrostGemmEngine()
+    for side in ("SFA", "SFB"):
+        flagged = _build_nvfp4_graph(256, 256, 512, negative_scale=(side == "SFA", side == "SFB"))
+        match = f"is_negative_scale=True on its fp8_e4m3 scale factors '{side}'"
+        with pytest.raises(NotImplementedError, match=match):
+            engine.check_support(flagged)
+        with pytest.raises(NotImplementedError, match=match):
+            jit_from_cudnn_graph(flagged, **_kw(_SM120_BS_128))
+    engine.check_support(_build_nvfp4_graph(256, 256, 512))
+    engine.check_support(_build_nvfp4_graph(256, 256, 512, block_size=32, sf_dt=cudnn.data_type.FP8_E8M0, negative_scale=(True, True)))
