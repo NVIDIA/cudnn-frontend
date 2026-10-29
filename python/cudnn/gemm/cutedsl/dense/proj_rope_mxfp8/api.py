@@ -644,6 +644,11 @@ def gemm_proj_rope_mxfp8_wrapper_sm100(
             wc, ws = w, w_scale
         else:
             wc, ws = w.T.contiguous(), w_scale.T.contiguous()
+
+        # Debug intermediates (NVTE_FUSED_Q_UPROJ_DEBUG). Off by default, in which case the
+        # kernel body never references these and 1-element placeholders suffice.
+        import torch as _torch
+
         key = (get_shape(x), get_shape(wc), get_device(x))
         obj = _mxfp8in_obj_cache.get(key)
         if obj is None:
@@ -679,9 +684,10 @@ def gemm_proj_rope_mxfp8_wrapper_sm100(
     else:
         raise AssertionError(f"unsupported input dtype {x.dtype}; expected bfloat16 (BF16 GEMM) or float8_e4m3fn (MXFP8 GEMM)")
 
-    return TupleDict(
+    outputs = dict(
         out_fp8_row=out_fp8_row,
         out_scales_row=out_scales_row,
         out_fp8_col=out_fp8_col,
         out_scales_col=out_scales_col,
     )
+    return TupleDict(**outputs)
