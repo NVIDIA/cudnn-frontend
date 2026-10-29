@@ -318,21 +318,22 @@ def compile_qsa_canonical_list(*, threads_per_cta: int = DEFAULT_THREADS_PER_CTA
     key = (int(threads_per_cta), bool(use_pdl), bool(with_lens), current_device())
     if key not in compiled_cache:
         cache_key = template_key(globals(), {"key": key}, "compile_qsa_canonical_list")
-        compiled_cache[key] = compile_cached(
-            qsa_canonical_list_launch,
-            _fake_ids(),
-            _fake_i32_vec(),
-            _fake_ids(),
-            _fake_i32_vec() if with_lens else None,
-            cutlass.Int32(1),  # n_rows   ) runtime; the literals pin the TYPE only
-            cutlass.Int32(1),  # n_blocks )
-            int(threads_per_cta),
-            bool(use_pdl),
-            _FAKE_STREAM,
-            options="--enable-tvm-ffi",
-            cache_key=cache_key,
-            symbol="cudnn_block_qsa_canonical_list",
-        )
+        with torch.cuda.device(key[-1]):  # the compile and the DSL's load of the launchable run ON the artifact's device (the recipe's), whichever
+            compiled_cache[key] = compile_cached(  # device is live -- a build_device() scope names a device the live context need not be
+                qsa_canonical_list_launch,
+                _fake_ids(),
+                _fake_i32_vec(),
+                _fake_ids(),
+                _fake_i32_vec() if with_lens else None,
+                cutlass.Int32(1),  # n_rows   ) runtime; the literals pin the TYPE only
+                cutlass.Int32(1),  # n_blocks )
+                int(threads_per_cta),
+                bool(use_pdl),
+                _FAKE_STREAM,
+                options="--enable-tvm-ffi",
+                cache_key=cache_key,
+                symbol="cudnn_block_qsa_canonical_list",
+            )
     return QsaCanonicalListRecipe(
         compiled=compiled_cache[key],
         threads_per_cta=int(threads_per_cta),

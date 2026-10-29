@@ -304,32 +304,33 @@ def compile_qsa_kbar_gather(
         cache_key = template_key(globals(), {"key": key}, "compile_qsa_kbar_gather")
         batch = cute.sym_int()
         npc = cute.sym_int()
-        compiled_cache[key] = compile_cached(
-            qsa_kbar_gather_launch,
-            _fake_paged_state(dtype, d),
-            _fake_i32_table((batch, cute.sym_int()), (cute.sym_int(), 1)),
-            _fake_i32_vec(batch),
-            _fake_i32_vec(npc),
-            _fake_i32_vec(npc),
-            _fake_i32_vec(npc),
-            _fake_compact(dtype, (batch, cute.sym_int(), d), (2, 1, 0)),
-            _fake_i32_vec(npc),
-            _fake_i32_vec(cute.sym_int()),
-            _fake_i32_vec(batch),
-            cutlass.Int32(0),  # n_pieces ) runtime; the zeros pin the TYPE only
-            cutlass.Int32(1),  # t_rows   )
-            cutlass.Int32(1),  # grid_x   )
-            cutlass.Int32(1),  # grid_y   )
-            int(d),
-            int(elem_bytes),
-            int(pool),
-            int(threads_per_cta),
-            bool(use_pdl),
-            _FAKE_STREAM,
-            options="--enable-tvm-ffi",
-            cache_key=cache_key,
-            symbol="cudnn_block_qsa_kbar_gather",
-        )
+        with torch.cuda.device(key[-1]):  # the compile and the DSL's load of the launchable run ON the artifact's device (the recipe's), whichever
+            compiled_cache[key] = compile_cached(  # device is live -- a build_device() scope names a device the live context need not be
+                qsa_kbar_gather_launch,
+                _fake_paged_state(dtype, d),
+                _fake_i32_table((batch, cute.sym_int()), (cute.sym_int(), 1)),
+                _fake_i32_vec(batch),
+                _fake_i32_vec(npc),
+                _fake_i32_vec(npc),
+                _fake_i32_vec(npc),
+                _fake_compact(dtype, (batch, cute.sym_int(), d), (2, 1, 0)),
+                _fake_i32_vec(npc),
+                _fake_i32_vec(cute.sym_int()),
+                _fake_i32_vec(batch),
+                cutlass.Int32(0),  # n_pieces ) runtime; the zeros pin the TYPE only
+                cutlass.Int32(1),  # t_rows   )
+                cutlass.Int32(1),  # grid_x   )
+                cutlass.Int32(1),  # grid_y   )
+                int(d),
+                int(elem_bytes),
+                int(pool),
+                int(threads_per_cta),
+                bool(use_pdl),
+                _FAKE_STREAM,
+                options="--enable-tvm-ffi",
+                cache_key=cache_key,
+                symbol="cudnn_block_qsa_kbar_gather",
+            )
     return QsaKbarGatherRecipe(
         compiled=compiled_cache[key],
         dtype=dtype,
