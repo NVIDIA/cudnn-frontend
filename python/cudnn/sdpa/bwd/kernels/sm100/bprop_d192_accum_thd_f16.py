@@ -226,14 +226,16 @@ def _mma_loop(
     while valid != 0:
         _credit(bars.sched_empty[sched_state.idx])
         lo, hi, sq, skv, q_start = _bounds(block, meta, batch, n_batch, causal)
+        # Empty work still acknowledges the loader's K-buffer acquisition.
+        # Otherwise its zero-output store can lap the loader's k_empty wait.
+        _wait_tcgen(bars.k_full, kv_state.phase)
         if lo < hi:
-            _wait_tcgen(bars.k_full, kv_state.phase)
             _wait_tcgen(bars.q_full[q_state.idx], q_state.phase)
             qd = _operand(slab, CFG.Q + q_state.idx * CFG.Q_BYTES, dtype, CFG.N, CFG.DQK).desc()
             mma_ss(score, kd, qd, s)
             _commit(bars.s_done)
-            _wait_tcgen(bars.v_full, kv_state.phase)
-            kv_state = advance(kv_state, 1)
+        _wait_tcgen(bars.v_full, kv_state.phase)
+        kv_state = advance(kv_state, 1)
         _wait_tcgen(bars.dvk_empty, out_empty.phase)
         out_empty = advance(out_empty, 1)
         for qtile in cutlass.range(lo, hi, 1, unroll=1):
@@ -318,6 +320,9 @@ def _load_loop(
             tma_load_tile(
                 _operand(slab, CFG.V, dtype, CFG.M, CFG.DV), tma_slice_runtime_desc(v_desc, 0, block * CFG.M, head, 0), bars.v_full.smem_ptr, acquire=False
             )
+        else:
+            bars.k_full.arrive(n_bytes=0, pred=nvvm.elect_sync())
+            bars.v_full.arrive(n_bytes=0, pred=nvvm.elect_sync())
         for qtile in cutlass.range(lo, hi, 1, unroll=1):
             _wait(bars.q_empty[q_state.idx], q_state.phase)
             bars.q_full[q_state.idx].arrive(n_bytes=CFG.Q_BYTES, pred=nvvm.elect_sync())
