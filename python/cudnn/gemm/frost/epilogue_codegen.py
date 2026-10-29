@@ -288,9 +288,11 @@ def _emit_op(
         slope, lower, upper = ra.get("negative_slope"), ra.get("lower_clip"), ra.get("upper_clip")
         rl = [f"_r{idx} = {prev}"]
         rv = f"_r{idx}"
-        if slope is not None:
+        if slope:
             # cuDNN RELU_FWD: x < lower ? lower + slope * (x - lower) : x, with lower defaulting to 0.
-            # lower_clip is where the slope starts, not a clamp applied after it.
+            # lower_clip is where the slope starts, not a clamp applied after it. A zero slope takes the
+            # max(x, lower) branch below: the frontend sends slope 0.0 when none is set, so it is the same
+            # descriptor, and the native engines return lower at x = -inf, where this line gives 0 * -inf = NaN.
             lo = 0.0 if lower is None else lower
             shifted = rv if lo == 0.0 else f"({rv} - {_fl(rv, lo)})"
             rl.append(f"_rk{idx} = cute.math.max({rv}, {_fl(rv, lo)}) + {_fl(rv, slope)} * cute.math.min({shifted}, {_fl(rv, 0.0)})")
