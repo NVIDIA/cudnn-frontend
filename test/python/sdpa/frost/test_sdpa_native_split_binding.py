@@ -229,14 +229,43 @@ def test_standalone_split_requires_caller_workspace_without_allocating(native, m
 
 @pytest.mark.parametrize("role", ["q", "k", "v", "o", "lse", "seq_q_lens", "seq_kv_lens", "block_table", "block_table_v"])
 @pytest.mark.parametrize("observed", [False, True])
-def test_native_split_workspace_alias_rejects_before_either_launch(role, observed):
+@pytest.mark.parametrize("offset", [0, -16])
+def test_native_split_workspace_alias_rejects_before_either_launch(role, observed, offset):
     spec, facts, frames, combined = _split_fixture(paged=True)
     _equal(spec, facts)
     if not observed:
         facts = {name: fact._replace(span=-1) for name, fact in facts.items()}
-    workspace = facts[role].ptr
+    workspace = facts[role].ptr + offset
     with pytest.raises(ValueError, match="workspace overlaps"):
         spec.native.execute(_pack(facts), prep._NATIVE_DENSE_INDICES, 17, workspace=workspace)
     with pytest.raises(ValueError, match="workspace overlaps"):
         binding_reference.bind_dense_split(spec, facts, workspace, 17, 17)
     assert frames == combined == []
+
+
+@pytest.mark.parametrize("paged", [False, True])
+def test_native_split_disjoint_slices_of_one_allocation(paged):
+    import ctypes
+    from cudnn.frost.buffers import DTYPE_ITEMSIZE
+
+    spec, facts, frames, combined = _split_fixture(paged=paged)
+    sizes = {role: fact.span * DTYPE_ITEMSIZE[fact.dtype] for role, fact in facts.items()}
+    scratch = spec.combine.lse_offset + spec.combine.lse.numel * 4
+    offsets, cursor = {}, 0
+    for role, size in sizes.items():
+        offsets[role] = cursor
+        cursor += (size + 31) // 16 * 16
+    workspace_offset = cursor
+    owner = bytearray(cursor + scratch + 16)
+    base = ctypes.addressof(ctypes.c_char.from_buffer(owner))
+    origin = (-base) % 16
+    # These are real slices of one host allocation; only metadata is bound,
+    # and the fixture's entries record frames instead of launching a GPU kernel.
+    views = {role: memoryview(owner)[origin + offset : origin + offset + sizes[role]] for role, offset in offsets.items()}
+    facts = {role: fact._replace(ptr=ctypes.addressof(ctypes.c_char.from_buffer(views[role]))) for role, fact in facts.items()}
+    workspace = base + origin + workspace_offset
+    assert workspace + scratch <= base + len(owner)
+    assert all(base <= fact.ptr < fact.ptr + sizes[role] <= workspace for role, fact in facts.items())
+    _equal(spec, facts, workspace=workspace)
+    spec.native.execute(_pack(facts), prep._NATIVE_DENSE_INDICES, 17, workspace=workspace)
+    assert len(frames) == len(combined) == 1

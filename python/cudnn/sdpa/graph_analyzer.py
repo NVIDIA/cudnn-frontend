@@ -26,6 +26,7 @@ from typing import Any, Optional
 
 import cudnn
 from cudnn._sdpa_tail import GateTail, match_gate_tail
+from cudnn.sdpa.layout import dense_layout_ok
 
 _LOG = logging.getLogger(__name__)
 
@@ -179,36 +180,6 @@ def packed_layout_ok(dim: tuple, stride: tuple) -> bool:
     act = tuple(ax for ax in order if dim[ax] != 1)
     exp = tuple(ax for ax in _REQ_STRIDE_ORDER if ax != 0 and dim[ax] != 1)
     return act == exp
-
-
-def dense_layout_ok(dim: tuple, stride: tuple) -> bool:
-    """Relaxed DENSE layout soundness for a rank-4 (B, H, S, D) tensor: the
-    real requirement of the SM100 DSL lowering, which normalizes any such
-    layout to the kernel's canonical BSHD-compact buffers (zero-copy when the
-    tensor already is BSHD-compact, one gather/scatter copy otherwise) — so
-    the B/H/S physical stride ORDER is free, and strides may be padded
-    (oversized) arbitrarily. What must hold:
-
-      * head dim (axis 3) innermost-contiguous: stride 1 (size-1 wildcarded);
-      * no zero stride on a size>1 dim — a broadcast view aliases distinct
-        logical elements onto one address, which is ill-defined for the O
-        write-back and rejected uniformly;
-      * non-overlapping: visiting dims by ascending stride, each stride must
-        cover the span of every dim below it (dense == equality; padded is
-        larger; SMALLER than dense would alias, so it is rejected).
-
-    Size-1 dims are wildcards: any stride, 0 and garbage included (cuDNN's
-    own harnesses corrupt them deliberately).
-    """
-    if dim[3] != 1 and stride[3] != 1:
-        return False
-    active = sorted((int(st), int(sz)) for st, sz in zip(stride, dim) if sz != 1)
-    span = 1
-    for st, sz in active:
-        if st < span:  # st == 0 (broadcast) or overlapping / sub-dense
-            return False
-        span = st * sz
-    return True
 
 
 # Element widths of the facts vocabulary, for the 16-byte TMA stride rule below.

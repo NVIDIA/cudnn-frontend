@@ -115,7 +115,7 @@ def check_native_dense_permutations(family, d, dv, order, monkeypatch):
 def check_native_gate_permutations(kind, order, monkeypatch, cudnn_handle):
     import cudnn
     from sdpa.frost.native_binding_utils import forbid_python_forward_binding
-    from test_sdpa_native_gate_binding import _case
+    from native_gate_cases import _case
 
     if torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("fused output gates require SM107")

@@ -14,7 +14,7 @@ def _case(d=128, dtype=torch.float8_e4m3fn, stats=True, amax=True, v=None, has_a
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("PV-BF16 needs pre-Rubin SM100")
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
-    from test_sdpa_fwd_mxfp8_sm100 import _quantize
+    from mxfp8_test_reference import _quantize
 
     gen = torch.Generator(device="cuda").manual_seed(577)
     hq, hk, s = 4, 2, 128
@@ -56,7 +56,7 @@ def _case(d=128, dtype=torch.float8_e4m3fn, stats=True, amax=True, v=None, has_a
 
 
 def _check(bufs, scales):
-    from test_sdpa_fwd_mxfp8_sm100 import _ref
+    from mxfp8_test_reference import _ref
 
     ref = _ref(
         bufs["q_tensor"].float() * scales[0],

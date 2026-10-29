@@ -434,6 +434,15 @@ teardown if the collector freed one. Whether a graph lands in a cycle can
 depend on test order, so a test that passes alone can still trip it in a
 suite.
 
+### Architecture test re-exports
+
+When an architecture test module re-exports shared checks, those checks must
+not import fixtures or reference math back from that architecture module,
+even inside a function. Move shared helpers into a non-`test_` module and
+import them from both sides. CodeQL's cyclic-import check catches the return
+edge; a successful import or collection alone may miss it because the edge
+is lazy. Preserve reference helper ASTs when moving them.
+
 ### Prepared quantized launch probes
 
 When testing a retained staging path, choose a declaration that the graph

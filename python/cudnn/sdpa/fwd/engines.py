@@ -2078,13 +2078,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if facts.epilogue_gate_dtype not in dom:
             return f"gate dtype {facts.epilogue_gate_dtype} not in {sorted(str(d) for d in dom)}"
         if not facts.epilogue_gate_layout_ok:
-            # G is TMA-loaded zero-copy -- there is no normalisation copy for it
-            # (Q/K/V/O have one).  The standalone adapter's check_support raises
+            # G is TMA-loaded zero-copy. The standalone adapter's check_support raises
             # on the same G; declining here keeps the row honest (rule 8b).
-            return (
-                "the gate G must be BSHD-physical (D innermost-contiguous, then H, then S, then B) with 16-byte-aligned, "
-                "non-overlapping seq/head strides -- the fused kernel TMA-loads G zero-copy"
-            )
+            return "the gate G must have contiguous D and 16-byte-aligned covering B/H/S strides -- the fused kernel TMA-loads G zero-copy"
         # The kernel never materialises O_v: it gates the fp32 pre-cast
         # accumulator and casts ONCE to O's dtype, so an O_v of AT LEAST O's
         # precision describes that math (the intermediate rounding it implies

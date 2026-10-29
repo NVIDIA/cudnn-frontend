@@ -48,7 +48,7 @@ def _case(
     )
     buffers, tensors, vp = {}, {}, {}
     input_type = cudnn.data_type.FP8_E4M3 if dtype == torch.float8_e4m3fn else cudnn.data_type.FP8_E5M2
-    from sdpa.frost.test_sdpa_fwd_mxfp8_sm100 import _quantize, _quantize_seq
+    from mxfp8_test_reference import _quantize, _quantize_seq
 
     sf_args = {}
     for name, h, seq, dim in (("q", hq, sq, d), ("k", hk, skv, d), ("v", hk, skv, dv)):

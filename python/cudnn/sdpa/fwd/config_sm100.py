@@ -878,11 +878,11 @@ def bshd_zero_copy_stride(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int
     Compact BSHD returns None because it needs no explicit stride declaration;
     callers distinguish that case with ``bshd_compact``.
     """
-    from cudnn.sdpa.graph_analyzer import dense_layout_ok
+    from cudnn.sdpa.layout import dense_layout_ok
 
     if not dense_layout_ok(shape_bhsd, stride_bhsd):
         return None
-    b, h, s, d = (int(x) for x in shape_bhsd)
+    _b, h, s, d = (int(x) for x in shape_bhsd)
     bs, hs, ss, es = canonical_bhsd_strides(shape_bhsd, stride_bhsd)
     if es != 1 or any(st * elem_bytes % 16 for st in (bs, hs, ss)):
         return None
