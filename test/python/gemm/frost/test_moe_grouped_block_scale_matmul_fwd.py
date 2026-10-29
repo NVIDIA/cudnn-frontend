@@ -2138,9 +2138,12 @@ def test_sm120_padded_e2m1_rejects_misaligned_operands(fp8_on_a, swap_ab) -> Non
     """PTX tensor-copy rule for ``.b4x16_p64``: the padded operand's global
     address and strides must be 32-byte aligned. A 16-byte-offset view of the fp4
     operand runs on the packed kernel (the 16-byte TMA rule) and is rejected at
-    the launch boundary by the padded one, before any descriptor is encoded."""
+    the launch boundary by the padded one, before any descriptor is encoded. The
+    rejection names the fp4 operand by its graph role in both orientations
+    (swap-AB puts the weight in kernel A)."""
     _run_e2e_mixed(fp8_on_a, _SM120_BS_CFG, swap_ab=swap_ab, fp4_offset_bytes=16)
-    with pytest.raises(ValueError, match="32-byte aligned"):
+    fp4_role = "weight" if fp8_on_a else "token"
+    with pytest.raises(ValueError, match=f"32-byte aligned strides: {fp4_role}: base address"):
         _run_e2e_mixed(fp8_on_a, _SM120_BS_CFG, swap_ab=swap_ab, padded_e2m1=True, fp4_offset_bytes=16)
 
 

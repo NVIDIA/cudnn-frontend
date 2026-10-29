@@ -2880,6 +2880,32 @@ def test_moe_workspace_failure_preserves_reduction_outputs(family, block_scale, 
     torch.testing.assert_close(output, torch.full_like(output, 17.0), atol=0, rtol=0)
 
 
+@pytest.mark.no_workspace_shim
+@pytest.mark.parametrize("family", ["sm100", "sm120"])
+@pytest.mark.parametrize("block_scale", [False, True])
+@pytest.mark.parametrize("swap", [False, True])
+def test_moe_operand_rejections_name_graph_roles(family, block_scale, swap):
+    """Name a misaligned or missing operand by its graph role; swap-AB puts the weight in kernel A."""
+    from gemm_test_utils import graph_binding
+
+    compiled, vp, _, calls, _ = _recorded_moe_plan(family, block_scale, False, False, swap)
+    workspace = torch.empty(compiled.workspace_bytes, device="cuda", dtype=torch.uint8)
+    bd = graph_binding(compiled)
+    roles = [("token", bd.a_operands[0]), ("weight", bd.b_operands[0])]
+    if block_scale:
+        roles += [("token SF", bd.sfa_operands[0]), ("weight SF", bd.sfb_operands[0])]
+    for role, tensor in roles:
+        good = vp[tensor]
+        storage = torch.empty(good.numel() * good.element_size() + 8, device="cuda", dtype=torch.uint8)
+        misaligned = storage[8:].view(good.dtype).view(good.shape)
+        with pytest.raises(ValueError, match=f"requirement: {role}: alignment 8B < required 16B"):
+            compiled({**vp, tensor: misaligned}, workspace=workspace)
+        # str(KeyError) quotes its message; the closing quote pins the exact role.
+        with pytest.raises(KeyError, match=f"missing a buffer for {role}'"):
+            compiled({key: buf for key, buf in vp.items() if key is not tensor}, workspace=workspace)
+    assert calls == []
+
+
 @pytest.mark.parametrize("family", ["sm100", "sm120"])
 @requires_sm100
 def test_moe_materializes_raw_and_pointwise_outputs(family):

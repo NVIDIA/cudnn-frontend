@@ -749,8 +749,8 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
         ]
         aux_bufs = [_swap_mn_view(pull(t, "aux")) for t in b.aux]
         fto = pull(b.first_token_offset, "first_token_offset")
-        sfa = [_kernel_order(pull(t, "SFA"), t, memo) for t in b.sfa_operands]
-        sfb = [pull(t, "SFB") for t in b.sfb_operands]
+        sfa = [_kernel_order(pull(t, "weight SF"), t, memo) for t in b.sfa_operands]
+        sfb = [pull(t, "token SF") for t in b.sfb_operands]
         mm = compiled.chain.matmul
         _check_moe_operand_shapes(compiled.chain, a_bufs, b_bufs)
         token_index, token_ks = routing_indices(b_bufs)
@@ -768,8 +768,8 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
     out_bufs = [pull(t, "output") for t in b.outputs]
     aux_bufs = [pull(t, "aux") for t in b.aux]
     fto = pull(b.first_token_offset, "first_token_offset")
-    sfa = [pull(t, "SFA") for t in b.sfa_operands]
-    sfb = [_kernel_order(pull(t, "SFB"), t, memo) for t in b.sfb_operands]
+    sfa = [pull(t, "token SF") for t in b.sfa_operands]
+    sfb = [_kernel_order(pull(t, "weight SF"), t, memo) for t in b.sfb_operands]
     _check_moe_operand_shapes(compiled.chain, a_bufs, b_bufs)
     k_factor = 2 if compiled.chain.matmul.a_dtype == "fp4_e2m1" else 1
     token_index, token_ks = routing_indices(a_bufs)
@@ -1296,9 +1296,10 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
         a_bufs, b_bufs, out_bufs, aux_bufs, fto, _sfa, _sfb, token_index, token_ks, top_k_scores, snk = backend._resolve_moe_variant_pack(self, variant_pack)
         _out_reqs = backend._output_align_reqs(self.chain, self.tma_slots, vec_bytes=self.vec_bytes_epi)
         _aux_reqs = backend._aux_align_reqs(self.chain, vec_bytes=self.vec_bytes_epi)
+        a_role, b_role = ("weight", "token") if isinstance(self.chain.moe, backend.MoeSwapAbSpec) else ("token", "weight")
         _named = (
-            [("token", x, 16, "ptr") for x in a_bufs]
-            + [("weight", x, 16, "ptr") for x in b_bufs]
+            [(a_role, x, 16, "ptr") for x in a_bufs]
+            + [(b_role, x, 16, "ptr") for x in b_bufs]
             + [(f"output[{i}]", x, _out_reqs[i], "full") for i, x in enumerate(out_bufs)]
             + [(f"aux {self.chain.aux_tensors[i].name!r}", x, _aux_reqs[self.chain.aux_tensors[i].name], "full") for i, x in enumerate(aux_bufs)]
         )
@@ -1496,6 +1497,7 @@ class _CompiledMoeBlockScaleGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
         a_bufs, b_bufs, out_bufs, aux_bufs, fto, sfa, sfb, token_index, token_ks, top_k_scores, snk = backend._resolve_moe_variant_pack(self, variant_pack)
         _out_reqs = backend._output_align_reqs(self.chain, self.tma_slots, vec_bytes=self.vec_bytes_epi)
         _aux_reqs = backend._aux_align_reqs(self.chain, vec_bytes=self.vec_bytes_epi)
+        a_role, b_role = ("weight", "token") if isinstance(self.chain.moe, backend.MoeSwapAbSpec) else ("token", "weight")
         _padded_a, _padded_b = (False, False)
         if self._check_padded_operands:
             _mixed = backend._mixed_width_operand_reject(self.chain, a_bufs, b_bufs)
@@ -1505,17 +1507,17 @@ class _CompiledMoeBlockScaleGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
 
             _padded_a, _padded_b = sm120_padded_e2m1_sides(self.chain)
             _padded = backend._padded_e2m1_operand_reject(
-                [("token", x) for x in (a_bufs if _padded_a else ())] + [("weight", x) for x in (b_bufs if _padded_b else ())]
+                [(a_role, x) for x in (a_bufs if _padded_a else ())] + [(b_role, x) for x in (b_bufs if _padded_b else ())]
             )
             if _padded is not None:
                 raise ValueError(_padded)
         _named = (
-            [("token", x, 32 if _padded_a else 16, "ptr") for x in a_bufs]
-            + [("weight", x, 32 if _padded_b else 16, "ptr") for x in b_bufs]
+            [(a_role, x, 32 if _padded_a else 16, "ptr") for x in a_bufs]
+            + [(b_role, x, 32 if _padded_b else 16, "ptr") for x in b_bufs]
             + [(f"output[{i}]", x, _out_reqs[i], "full") for i, x in enumerate(out_bufs)]
             + [(f"aux {self.chain.aux_tensors[i].name!r}", x, _aux_reqs[self.chain.aux_tensors[i].name], "full") for i, x in enumerate(aux_bufs)]
-            + [("SFA", x, 16, "ptr") for x in sfa or []]
-            + [("SFB", x, 16, "ptr") for x in sfb or []]
+            + [(f"{a_role} SF", x, 16, "ptr") for x in sfa or []]
+            + [(f"{b_role} SF", x, 16, "ptr") for x in sfb or []]
         )
         _r = backend._alignment_reject(_named)
         if _r is not None:
