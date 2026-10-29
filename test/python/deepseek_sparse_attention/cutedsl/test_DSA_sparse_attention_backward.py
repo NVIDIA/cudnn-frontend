@@ -763,6 +763,9 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
     ):
         dkv_shape = kernel_cls._get_workspace_size_dKV_for_q(16384, 524288, 576, 64, 1, cutlass.Float32)
         assert math.prod(dkv_shape) == _relay_workspace_bytes(16384, 524288, 576, 64, kernel_cls.dkv_relay_cluster_size)
+        assert not kernel_cls.run_dkv_prefold
+        assert kernel_cls.num_dkv_final_terms == kernel_cls.num_dkv_shards
+        assert kernel_cls.dkv_final_stride == 1
     assert deterministic_kernel_class(2047, 65537, 512) is FlashAttentionDSABackwardSm100DeterministicCluster8
     assert deterministic_kernel_class(2048, 65537, 512) is FlashAttentionDSABackwardSm100DeterministicCluster4
     assert deterministic_kernel_class(16384, 524288, 576) is FlashAttentionDSABackwardSm100DeterministicCluster16

@@ -606,7 +606,7 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
         mdKV: cute.Tensor,
         seqlen: Int32,
     ):
-        """Fold the prefolded plane groups and convert to output dtype."""
+        """Fold the relay planes in fixed order and convert to output dtype."""
         tidx, tidy, _ = cute.arch.thread_idx()
         seq_block_idx, _, batch_idx = cute.arch.block_idx()
         seq_id = self.block_seq * seq_block_idx + tidy
@@ -646,7 +646,9 @@ class FlashAttentionDSABackwardSm100DeterministicCluster8(_FlashAttentionDSABack
     dkv_row_rank_mask = (1 << dkv_relay_cluster_size) - 1
     dkv_cluster_shape = (dkv_relay_cluster_size, 1, 1)
     num_dkv_fold_groups = num_dkv_shards // _FlashAttentionDSABackwardSm100DeterministicRelay.dkv_fold_group_size
-    num_dkv_final_terms = num_dkv_fold_groups
+    run_dkv_prefold = False
+    num_dkv_final_terms = num_dkv_shards
+    dkv_final_stride = 1
 
 
 class FlashAttentionDSABackwardSm100DeterministicCluster16(_FlashAttentionDSABackwardSm100DeterministicRelay):
@@ -658,7 +660,11 @@ class FlashAttentionDSABackwardSm100DeterministicCluster16(_FlashAttentionDSABac
     dkv_row_rank_mask = (1 << dkv_relay_cluster_size) - 1
     dkv_cluster_shape = (dkv_relay_cluster_size, 1, 1)
     num_dkv_fold_groups = num_dkv_shards // _FlashAttentionDSABackwardSm100DeterministicRelay.dkv_fold_group_size
-    num_dkv_final_terms = num_dkv_fold_groups
+    # Eight planes fit comfortably in the conversion kernel's ordered loop.
+    # Sum them there instead of writing and rereading an FP32 prefold plane.
+    run_dkv_prefold = False
+    num_dkv_final_terms = num_dkv_shards
+    dkv_final_stride = 1
 
 
 class FlashAttentionDSABackwardSm100DeterministicCluster4(_FlashAttentionDSABackwardSm100DeterministicRelay):
@@ -670,7 +676,9 @@ class FlashAttentionDSABackwardSm100DeterministicCluster4(_FlashAttentionDSABack
     dkv_row_rank_mask = (1 << dkv_relay_cluster_size) - 1
     dkv_cluster_shape = (dkv_relay_cluster_size, 1, 1)
     num_dkv_fold_groups = num_dkv_shards // _FlashAttentionDSABackwardSm100DeterministicRelay.dkv_fold_group_size
-    num_dkv_final_terms = num_dkv_fold_groups
+    run_dkv_prefold = False
+    num_dkv_final_terms = num_dkv_shards
+    dkv_final_stride = 1
 
 
 _DETERMINISTIC_KERNELS = {
