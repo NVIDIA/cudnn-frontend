@@ -826,7 +826,25 @@ def generate_mainloop(chain: FusionChain, operand: str = "a") -> str:
         aux_loads = {}
         if op.aux is not None:
             ptr = f"{op.aux}.iterator.raw_ptr()"
-            aux_loads[op.aux] = f"cutlass.full_like({parent_var}, ({ptr} + 0).load().to({DTYPE_TO_CUTLASS[op.compute_dtype]}))"
+            ref = chain.aux_by_name(op.aux)
+            if ref.bcast_mode == "per_k":
+                dt = DTYPE_TO_CUTLASS[op.compute_dtype]
+                # The renderer selects logical (unswizzled) vector accesses for
+                # this path. The operand is K-major, so vector lanes advance K.
+                lines.extend(
+                    [
+                        f"{tag}_scale = cute.make_rmem_tensor(ml_vec_elems, {dt})",
+                        f"{tag}_k = k_tile_idx * cta_tile_mnk[2] + ml_L % cta_tile_mnk[2]",
+                        f"for {tag}_lane in cutlass.range_constexpr(ml_vec_elems):",
+                        f"    {tag}_gk = {tag}_k + {tag}_lane",
+                        f"    {tag}_scale[{tag}_lane] = {dt}(0.0)",
+                        f"    if {tag}_gk < k:",
+                        f"        {tag}_scale[{tag}_lane] = ({ptr} + {tag}_gk).load().to({dt})",
+                    ]
+                )
+                aux_loads[op.aux] = f"{tag}_scale.load().to_vector()"
+            else:
+                aux_loads[op.aux] = f"cutlass.full_like({parent_var}, ({ptr} + 0).load().to({DTYPE_TO_CUTLASS[op.compute_dtype]}))"
         emit_lines, cur = _emit_op(op, parent_var, base + i, aux_loads)
         lines.extend(emit_lines)
         if op.out_dtype in ("fp8_e4m3", "fp8_e5m2") and (op.compute_dtype == "int32" or (op.op == "identity" and parent_dtype in ("int8", "uint8", "int32"))):

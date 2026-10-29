@@ -697,7 +697,13 @@ def _render_tile_constants(
         # Per-operand fusion flags (const_expr-gated in the template).
         lines.append(f"mainloop_fuse_a = {chain.has_mainloop_fusion_a}")
         lines.append(f"mainloop_fuse_b = {chain.has_mainloop_fusion_b}")
-        koob_fix = not _mainloop_chain_zero_preserving(chain.mainloop_a_ops) or not _mainloop_chain_zero_preserving(chain.mainloop_b_ops)
+        # Per-K aux indexing needs ml_L in logical order, not the physical
+        # swizzled SMEM address. The K-OOB path already provides that access.
+        koob_fix = (
+            any(aux.bcast_mode == "per_k" for aux in chain.aux_tensors)
+            or not _mainloop_chain_zero_preserving(chain.mainloop_a_ops)
+            or not _mainloop_chain_zero_preserving(chain.mainloop_b_ops)
+        )
         lines.append(f"mainloop_koob_fix = {koob_fix}")
         _bbits = (cfg.cta_tile_k_bytes // 16).bit_length() - 1
         lines.append(f"ab_swizzle = cutlass.Swizzle({_bbits}, 4, 3)")

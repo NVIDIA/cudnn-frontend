@@ -52,6 +52,8 @@ from cudnn.sdpa.fwd.config_sm90 import (
 from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES as _SM107_F16_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import supports_native_d128_dense_partial_pack, supports_native_d128_narrow_tile, supports_native_d512_dense_pack_split
 from cudnn.sdpa.fwd.config_sm107 import SM107_F16_SMALL_D_SHAPES as _SM107_F16_SMALL_D_SHAPES
+from cudnn.sdpa.fwd.config_sm107 import SM107_SMALL_D_NATIVE_LEGS as _SM107_SMALL_D_NATIVE_LEGS
+from cudnn.sdpa.fwd.config_sm107 import supports_native_d64_pack
 from cudnn.sdpa.fwd.config_sm107 import SM107_SMALL_D_CGAS as _SM107_SMALL_D_CGAS
 from cudnn.sdpa.fwd.config_sm107 import sm107_small_tile_leg as _sm107_small_tile_leg
 from cudnn.sdpa.fwd.config_sm107 import SM107_FP8_THD_SHAPES as _SM107_FP8_THD_SHAPES
@@ -2162,6 +2164,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
     def _rubin_native_d512_leg(self) -> bool:
         return supports_native_d512_dense_pack_split(self.flavor, device_cc=self._device_cc, fp8=self._fp8, thd=self.thd, paged=self.paged, cga=self.cga)
 
+    def _rubin_native_d64_pack_leg(self) -> bool:
+        return not self.softmax_scale_prefolded and supports_native_d64_pack(
+            self.flavor,
+            device_cc=self._device_cc,
+            fp8=self._fp8,
+            paged=self.paged,
+            split_kv=self.split_kv,
+            cga=self.cga,
+        )
+
     def _rubin_shared_dense_leg(self) -> bool:
         """Historical dense D128 decode/packing admission predicate (issue #1472).
 
@@ -2201,6 +2213,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
     def _rubin_native_thd_prefill_leg(self) -> bool:
         """The exact-D128 native THD prefill domain, shared with graph admission."""
+        if self.thd and self._rubin_native_d64_pack_leg():
+            return True
         return not self.softmax_scale_prefolded and supports_nonpaged_d128_thd_prefill(
             (int(self.q_desc.shape[-1]), int(self.v_desc.shape[-1])),
             device_cc=self._device_cc,
@@ -2213,6 +2227,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
     def _rubin_shared_thd_pack_leg(self) -> bool:
         """Unsplit nonpaged D128 THD packing on the native prefill body."""
+        if self.thd and self.pack_gqa and self._rubin_native_d64_pack_leg():
+            return True
         return self.pack_gqa and supports_nonpaged_d128_thd_pack_gqa(
             self.flavor,
             device_cc=self._device_cc,
@@ -2570,8 +2586,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # A graph must only land on a flavor that HAS a kernel for its
         # quantization AND its arch line: the per-tensor and block-scale
         # families have different native maps, and the Rubin f16 pool is
-        # exactly _SM107_KERNEL_FILES (today the four SM100 shapes d128,
-        # d192xd128, d256, d512; no native d64).  Without the Rubin narrowing a
+        # exactly _SM107_KERNEL_FILES, including the native small tiles.
+        # Without the Rubin narrowing a
         # shape the map lacks would be picked and then KeyError in
         # _load_sm100_kernel_module; with it, the graph falls to the next
         # covering envelope exactly as it does for a missing FP8 flavor.
@@ -2586,12 +2602,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 f for f in _SM100_FLAVORS if f in fp8_shapes and (f == (int(d_qk), int(d_v)) or min(int(d_qk), int(d_v)) > _SM100_FP8_ENVELOPE_FLOORS.get(f, 0))
             )
         elif self._device_cc == (10, 7):
-            # The Rubin f16 pool: a small head-dim tile (config_sm107.SM107_F16_SMALL_D_SHAPES) only for a graph on its
-            # DENSE leg (no THD / paged KV / split-KV / PackGQA / score side outputs -- sm107_small_tile_leg) at a cga it
-            # is validated at (SM107_SMALL_D_CGAS, or unset); any other graph walks past the small tiles onto the d128
-            # flavor it rode before they existed (zero-filled to 128), where that leg is wired.  The twin of the engine
-            # row's dense_only_d_shapes walk in engines._selected_d_shape (rule 8b'); the tests assert they agree per leg.
-            _leg = _sm107_small_tile_leg(
+            # Each small tile admits its own feature set and CTA widths. D32
+            # remains dense-only; D64 also carries THD and PackGQA. Check every
+            # requested feature before selecting a tile, matching the graph's
+            # native_legs_by_d_shape walk (rule 8b').
+            _legs = dict(
                 prefolded=bool(self.softmax_scale_prefolded),
                 thd=self.thd,
                 paged=self.paged,
@@ -2603,7 +2618,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 f
                 for f in _SM107_FLAVORS
                 if f in _SM107_KERNEL_FILES
-                and (f not in _SM107_F16_SMALL_D_SHAPES or (_leg is None and (self.cga is None or self.cga in _SM107_SMALL_D_CGAS[f])))
+                and (
+                    f not in _SM107_F16_SMALL_D_SHAPES
+                    or (
+                        _sm107_small_tile_leg(**_legs, allowed_legs=_SM107_SMALL_D_NATIVE_LEGS[f]) is None
+                        and (self.cga is None or self.cga in _SM107_SMALL_D_CGAS[f])
+                    )
+                )
             )
         else:
             # The SM100 f16/bf16 pool: the 32-wide small tile (the sm100 d128 file at d_flavor 32, config_sm100.SM100_DENSE_ONLY_D_SHAPES) only for a
@@ -2663,6 +2684,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 and not self.paged
                 and not self.packed_thd_split
                 and not self._rubin_shared_thd_pack_leg()
+                and not self._rubin_native_d64_pack_leg()
                 and not self._rubin_native_d512_leg()
                 and not (self.flavor == _SM100_DECODE_FLAVOR and not self.thd)
                 and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv)),
@@ -2671,6 +2693,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._not_implemented_error_if(
                 self.thd
                 and not self.thd_decode_leg
+                and not self._rubin_native_d64_pack_leg()
                 and not (self.packed_thd_split and int(d_qk) in (64, 128, 576))
                 and not supports_paged_d256_pack_gqa(
                     (int(d_qk), int(d_v)),
@@ -2697,6 +2720,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             _partial = (
                 (not self._fp8 and self._device_cc != (10, 7) and self.flavor in _SM100_PARTIAL_PACK_GQA_FLAVORS)
                 or self._rubin_native_d512_leg()
+                or self._rubin_native_d64_pack_leg()
                 or self._rubin_shared_thd_pack_leg()
                 or supports_paged_d128_partial_pack_gqa(
                     (int(d_qk), int(d_v)),
@@ -3373,6 +3397,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             f"MXFP8 {sorted(_SM107_MXFP8_THD_SHAPES)} or f16/bf16 {sorted(_SM107_F16_THD_SHAPES)} only; "
             f"got (D_QK={d_qk}, D_V={d_v}) on the "
             f"{'MXFP8' if (self._fp8 and not self._pertensor) else 'FP8' if self._fp8 else 'f16/bf16'} path",
+        )
+        self._not_implemented_error_if(
+            self.thd and self._device_cc == (10, 7) and not self._fp8 and (int(d_qk), int(d_v)) == (64, 64) and not self._rubin_native_d64_pack_leg(),
+            "native D64 THD requires nonpaged, unsplit half-precision plans on the D64 tile",
         )
         if self.gate_desc is not None:
             # STANDALONE twin of the rows' `epilogue_gate` / `epilogue_gate_d_shapes`

@@ -446,11 +446,35 @@ class KernelTemplate:
 class MainloopKernelTemplate(KernelTemplate):
     """A mainloop-fusion template."""
 
+    def _per_k_reject(self, chain: FusionChain, side: str, op) -> str | None:
+        ref = chain.aux_by_name(op.aux)
+        dtype = getattr(chain.matmul, f"{side}_dtype")
+        major = getattr(chain.matmul, f"{side}_major")
+        load_dtype = getattr(chain, f"mainloop_{side}_load_dtype")
+        checks = (
+            (op.op != "mul", "only mul is implemented"),
+            (dtype not in ("bf16", "fp16"), "operand must be BF16 or FP16"),
+            (load_dtype is not None, "operand load casts are not implemented"),
+            (major != "k", "operand must be K-major"),
+            (ref.stride[ref.k_axis] != 1, "scale K axis must have unit stride"),
+            (ref.dtype not in ("bf16", "fp16", "fp32"), "scale must be BF16, FP16 or FP32"),
+            (op.compute_dtype != "fp32", "multiply must compute in FP32"),
+            (op.out_dtype != dtype, "multiply result must match the MMA operand dtype"),
+        )
+        for rejected, reason in checks:
+            if rejected:
+                return f"{self.file}: per-K {side.upper()} scale {ref.name!r}: {reason}"
+        return None
+
     def _extra_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
         for side, ops in (("A", chain.mainloop_a_ops), ("B", chain.mainloop_b_ops)):
             for op in ops:
                 if op.op not in _SUPPORTED_MAINLOOP_OPS:
-                    return f"{self.file} cannot fuse mainloop op {op.op!r} on " f"operand {side} (supported: unary + scalar-aux binary)"
+                    return f"{self.file} cannot fuse mainloop op {op.op!r} on " f"operand {side} (supported: unary + scalar-aux binary, per-K mul)"
+                if op.aux is not None and chain.aux_by_name(op.aux).bcast_mode == "per_k":
+                    reason = self._per_k_reject(chain, side.lower(), op)
+                    if reason is not None:
+                        return reason
         return None
 
 

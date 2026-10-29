@@ -768,12 +768,17 @@ def test_split_chooser_receives_the_row_cost_profile(monkeypatch, row, device_cc
 
 
 @requires_dsl
+@pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize("s_q,window", [(1, None), (1, 128), (4, None), (4, 128)])
 @pytest.mark.parametrize("sink", [True, False])
-def test_rubin_d64_decode_proposes_the_packed_leg(monkeypatch, s_q, window, sink):
-    """A packed or split D64 leg lands on the d128 flavor (the native 64-wide tile is dense-only), so the proposal
-    reads that flavor as mismatch() does; reading the knob-less native d64 dropped every packed plan."""
+def test_rubin_decode_packing_uses_selected_flavor(monkeypatch, d, s_q, window, sink):
+    """D128 retains the shared decode tile; unsplit D64 packing is native.
+
+    Retain the shared decode proposal regression on D128. D64's native packed
+    capability is independent of its recommendation rank; split still uses D128.
+    """
     from cudnn.frost import buffers
+    from cudnn.sdpa.fwd.engines import _selected_d_shape
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
@@ -784,8 +789,8 @@ def test_rubin_d64_decode_proposes_the_packed_leg(monkeypatch, s_q, window, sink
         h_kv=8,
         s_q=s_q,
         s_kv=131072,
-        d_qk=64,
-        d_v=64,
+        d_qk=d,
+        d_v=d,
         causal=causal,
         bottom_right=causal,
         window_left=window,
@@ -794,11 +799,17 @@ def test_rubin_d64_decode_proposes_the_packed_leg(monkeypatch, s_q, window, sink
         device_sm_count=204,
     )
     plans = heur.recommend("A", facts, {spec.name: 20505})
-    assert plans[0].knobs.pack_gqa
+    assert plans
+    packed = heur.SdpaFwdKnobs(tile_m=128, tile_n=128, cga=1, pack_gqa=True, split_kv=1, sched_policy=0)
+    assert mismatch(spec.capabilities, facts, packed) is None
+    assert _selected_d_shape(spec.capabilities, facts, packed) == ((64, 64) if d == 64 else (128, 128))
+    if d == 128:
+        assert any(p.knobs.pack_gqa for p in plans)
     if sink:
-        assert plans[0].knobs.split_kv == 1  # no sink split on this row
+        assert all(p.knobs.split_kv == 1 for p in plans)  # no sink split on this row
     else:
         assert any((p.knobs.split_kv or 1) > 1 for p in plans)  # the split leg is proposed again; its rank is the wave model's
+        assert _selected_d_shape(spec.capabilities, facts, replace(packed, split_kv=2)) == (128, 128)
     assert all(mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
 
 

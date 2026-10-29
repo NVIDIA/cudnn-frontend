@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from cudnn.frost.buffers import init_word, is_contiguous, strided_fill_plan
+from cudnn.frost.buffers import dtype_name, init_word, is_contiguous, strided_fill_plan
 
 from .dtypes import DTYPE_BYTES, _aux_align_reqs, _output_align_reqs, _pow2_floor, tensor_alignment
 from .fusion_ir import FusionChain
@@ -116,11 +116,38 @@ class Output:
 
 
 @dataclass(frozen=True)
+class PerKScaleRule:
+    """Prepared binding contract in caller coordinates, independent of SMEM layout."""
+
+    axis: int
+    dtype: str
+    name: str = ""
+
+    def check(self, buffer, k: int) -> None:
+        expected = (1, 1, k) if self.axis == 2 else (1, k, 1)
+        if tuple(buffer.shape) != expected:
+            raise ValueError(f"per-K mainloop scale {self.name!r}: expected shape {expected}, got {tuple(buffer.shape)}")
+        if buffer.stride()[self.axis] != 1:
+            raise ValueError(f"per-K mainloop scale {self.name!r}: K axis {self.axis} must have unit stride")
+        if dtype_name(buffer) != self.dtype:
+            raise ValueError(f"per-K mainloop scale {self.name!r}: expected dtype {self.dtype}, got {dtype_name(buffer)}")
+
+
+def _per_k_rule(ref, swapped: bool) -> PerKScaleRule | None:
+    if ref.bcast_mode != "per_k":
+        return None
+    axis = 3 - ref.k_axis if swapped else ref.k_axis
+    dtype = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32"}[ref.dtype]
+    return PerKScaleRule(axis, dtype, ref.name)
+
+
+@dataclass(frozen=True)
 class Aux:
     index: int
     role: str
     align: int
     ref: Any  # TensorRef, for the fake-shape reshape
+    mainloop_scale: PerKScaleRule | None = None
 
 
 @dataclass(frozen=True)
@@ -462,7 +489,7 @@ def build(compiled) -> GemmRecipe:
         )
 
     aux = tuple(
-        Aux(index=order[id(t)], role=f"aux {compiled.aux_names[i]!r}", align=aux_reqs[compiled.aux_names[i]], ref=ref)
+        Aux(index=order[id(t)], role=f"aux {compiled.aux_names[i]!r}", align=aux_reqs[compiled.aux_names[i]], ref=ref, mainloop_scale=_per_k_rule(ref, swap_ab))
         for i, (t, ref) in enumerate(zip(binding.aux, chain.aux_tensors))
     )
     na = len(binding.a_operands)

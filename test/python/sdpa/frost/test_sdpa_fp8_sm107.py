@@ -2152,3 +2152,17 @@ class TestNativeFp8Strides:
     test_native_sf_alias_checks_original_operand = staticmethod(_native_fp8_checks.test_native_sf_alias_checks_original_operand)
     test_native_paged_qo_preserves_kv_pool_views = staticmethod(_native_fp8_checks.test_native_paged_qo_preserves_kv_pool_views)
     test_sm107_d256_strided_preserves_each_native_operand = staticmethod(_native_fp8_checks.test_sm107_d256_strided_preserves_each_native_operand)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeD64Half:
+    """Native D64 regressions collected by the SM107 CI entrypoint."""
+
+    import native_d64_sm107_test_utils as _checks
+
+    test_independent_origins = staticmethod(_checks.test_native_d64_independent_origins)
+    test_ragged_replay = staticmethod(_checks.test_native_d64_ragged_replay)
+    test_dense_pack_replay = staticmethod(_checks.test_native_d64_dense_pack_replay)
+    test_standalone_compact_thd = staticmethod(_checks.test_native_d64_standalone_compact_thd)

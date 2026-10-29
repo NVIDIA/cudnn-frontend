@@ -12,10 +12,10 @@ swizzle atoms, the TMA iteration counts, the TMEM O slot width, the BMM1 k-step 
 ``_validate_head_dim_tile``; the d128 rendering is byte-identical to the one-geometry file (``test_sdpa_fwd_score_stats.py``
 holds the cubin md5 records).
 
-The small tiles carry the row's DENSE leg only (``Capabilities.dense_only_d_shapes``): a graph that asks for split-KV, the score
-side outputs, THD, paged KV, PackGQA or a cga outside the tile's domain is selected PAST them onto the flavor that carries the leg
--- the d128 flavor it rode before the tiles existed (a cga2 request at D <= 32: the 64-wide tile) -- so nothing the row served
-before the tiles is withdrawn, and THD / paged KV / PackGQA at D <= 64 keep exactly their pre-tile typed declines.
+D32 carries dense plans. D64 also carries nonpaged, unsplit THD and PackGQA.
+Split-KV and score side outputs use a larger flavor; a cga2 request at D <= 32
+uses the 64-wide tile. THD requires exact native dimensions, and paged D64 THD
+remains declined.
 
 Three tiers: (1) CPU contract -- the row's accept / decline table per D, the ROUTE table per (D, leg) with the three pick
 implementations agreeing on every cell (the row's envelope walk, the adapter's flavor pool, ``sm107_f16_tile_width(leg=, cga=)``),
@@ -180,30 +180,29 @@ _LEGS = (
     (None, dict(), dict(cga=2), dict(cga=2), {8: 64, 24: 64, 32: 64, 48: 64, 64: 64, 128: 128}),
     # a cga1 request at D = 128 is SERVED on the d128 flavor since the shared SM100 decode tile was compiled for cc 10.7 (issue #1472)
     (None, dict(), dict(cga=1), dict(cga=1), {8: 32, 24: 32, 32: 32, 48: 64, 64: 64, 128: 128}),
-    ("THD", dict(thd=True, padded=True), None, dict(thd=True), {8: None, 24: None, 32: None, 48: None, 64: None, 128: 128}),
+    ("THD", dict(thd=True, padded=True), None, dict(thd=True), {8: None, 24: None, 32: None, 48: None, 64: 64, 128: 128}),
     ("THD", dict(has_paged_kv=True, padded=True, page_size=128, thd=True), None, None, {8: None, 24: None, 32: None, 48: None, 64: None, 128: 128}),
-    # PackGQA walks past the small tiles onto the d128 flavor and is SERVED there since the dense d128 half row packs GQA on the
-    # shared SM100 prefill body compiled for cc 10.7 (issue #1472; a group that divides the 128-row tile)
-    ("PackGQA", dict(h_kv=2), dict(pack_gqa=True), dict(h_kv=2, pack_gqa=True), {8: 128, 24: 128, 32: 128, 48: 128, 64: 128, 128: 128}),
+    # Dense PackGQA uses the native D64 tile for logical widths up to 64.
+    ("PackGQA", dict(h_kv=2), dict(pack_gqa=True), dict(h_kv=2, pack_gqa=True), {8: 64, 24: 64, 32: 64, 48: 64, 64: 64, 128: 128}),
 )
 _DECLINE_WORDS = {"THD": "THD", "PackGQA": "PackGQA", None: "cga"}
 
 
 @requires_sm107_dsl
 def test_row_routes_every_leg_beyond_dense_past_the_small_tiles():
-    """The small tiles carry the dense leg ONLY (``Capabilities.dense_only_d_shapes``): split-KV and the score side outputs at
-    D <= 64 select the d128 flavor (the pre-tile route, where ``split_d_shapes`` / ``score_stats_d_shapes`` name it) and are
-    SERVED, a cga2 request at D <= 32 selects the 64-wide tile, cga1 the small tile; THD / paged KV keep their pre-tile typed
-    declines and PackGQA rides the d128 flavor's shared body (issue #1472).  The three pick implementations agree on every cell (rule 8b'): the row's walk (``_selected_d_shape`` with
-    the knobs), ``sm107_f16_tile_width(leg=, cga=)`` and the adapter's flavor; ``effective_cgas`` with the requested cga is the
-    domain of the flavor the request lands on (the knob record `{TILE_CGA_M: 2}` at D <= 32 keeps working)."""
+    """Graph, adapter and config agree on each tile's native feature domain.
+
+    D64 carries THD and PackGQA; split and score outputs use D128. Combined THD
+    and paged requests remain declined, and D32 retains its dense-only domain.
+    """
     from cudnn.sdpa.fwd import engines, heuristics
     from cudnn.sdpa.fwd.config_sm107 import sm107_f16_tile_width, sm107_small_tile_leg
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
 
     caps = _caps()
     spec = {s.name: s for s in engines.ENGINE_SPECS}[_ROW]
-    assert caps.dense_only_d_shapes == frozenset({(32, 32), (64, 64)})
+    assert caps.dense_only_d_shapes == frozenset({(32, 32)})
+    assert dict(caps.native_legs_by_d_shape)[(64, 64)] == frozenset({"THD", "PackGQA"})
     assert sm107_small_tile_leg() is None and sm107_small_tile_leg(split_kv=1, pack_gqa=False) is None
     for kw, name in (
         (dict(thd=True), "THD"),
@@ -256,6 +255,20 @@ def test_row_routes_every_leg_beyond_dense_past_the_small_tiles():
     # a cga nobody serves is still a typed decline naming the domain of the flavor it would land on
     why = engines.mismatch(caps, f24, SdpaFwdKnobs(cga=3))
     assert why is not None and "cga=3" in why and "[1, 2]" in why, why
+
+
+@requires_sm107_dsl
+@pytest.mark.parametrize("d_qk,d_v", [(8, 8), (24, 16), (32, 32), (48, 32), (64, 64)])
+@pytest.mark.parametrize("cga", [None, 1, 2])
+def test_partial_pack_checks_the_selected_native_tile(d_qk, d_v, cga):
+    """A packed plan may use D64 even when the unpacked graph selects D32."""
+    from cudnn.sdpa.fwd import engines
+
+    caps = _caps()
+    facts = _facts(d_qk=d_qk, d_v=d_v, h_q=24, h_kv=2)
+    knobs = engines.SdpaFwdKnobs(pack_gqa=True, cga=cga)
+    assert engines._selected_d_shape(caps, facts, knobs) == (64, 64)
+    assert engines.mismatch(caps, facts, knobs) is None
 
 
 def test_one_constant_feeds_the_row_the_adapter_and_the_factory():
@@ -323,8 +336,12 @@ def test_config_factories_derive_everything_from_the_tile(width):
                 assert quantized.V_SWZ_BYTES == 64 // cga
                 with pytest.raises(ValueError, match="FP8 THD"):
                     make(c.TemplateParams(dtype_qkv=dtype, cta_mma=cga, thd_varlen=True, seq_kv_lens_present=True))
-    with pytest.raises(ValueError, match="THD/varlen"):
-        make(c.TemplateParams(dtype_qkv=2, cta_mma=1, thd_varlen=True, seq_kv_lens_present=True))
+    if width == 32:
+        with pytest.raises(ValueError, match="THD/varlen"):
+            make(c.TemplateParams(dtype_qkv=2, cta_mma=1, thd_varlen=True, seq_kv_lens_present=True))
+    else:
+        cfg, _ = make(c.TemplateParams(dtype_qkv=2, cta_mma=1, thd_varlen=True, seq_kv_lens_present=True))
+        assert cfg.THD_VARLEN and cfg.TILE_K == cfg.TILE_O == 64
     with pytest.raises(ValueError, match="epilogue_gate"):
         make(c.TemplateParams(dtype_qkv=2, cta_mma=1, epilogue_gate=True))
 

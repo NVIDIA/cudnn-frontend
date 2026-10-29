@@ -24,7 +24,7 @@ from cudnn.frost.workspace import Workspace
 
 from .arch_family import active_family
 from .dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS, _pow2_floor, tensor_alignment
-from .fusion_ir import FusionChain, MoeSwapAbSpec, TensorRef, segmented_row_scale_capacity_rows
+from .fusion_ir import Axis, FusionChain, MoeSwapAbSpec, TensorRef, segmented_row_scale_capacity_rows
 from .recipe import AX_MN, FROM_M, FROM_N, REDUCTION_INIT_VALUE, _output_rule, contiguous_modulus, expected_shape
 
 
@@ -62,36 +62,23 @@ _CTAMMA_SUFFIX = re.compile(r"_[12]ctamma$")
 _INJECT_MARKER_LINE = re.compile(r"^([ \t]*)# *@@([A-Z0-9_]+)@@[ \t]*\n", flags=re.MULTILINE)
 
 
+def _aux_kernel_shape(aux: TensorRef) -> tuple[int | Axis, ...]:
+    """Lower logical extents to the existing minimum-rank-2 aux ABI."""
+    shape = aux.symbolic_shape
+    return (1,) * max(0, 2 - len(shape)) + shape
+
+
 def _aux_fake_shape_code(aux: TensorRef) -> str:
-    """Generate the symbolic shape of an auxiliary tensor."""
-    if len(aux.dim) == 3:
-        if aux.grouped_by_moe:
-            batch = "sym_g"
-        else:
-            batch = "1" if aux.dim[0] == 1 else "sym_l"
-        if aux.bcast_mode == "scalar":
-            return f"({batch}, 1, 1)"
-        if aux.bcast_mode == "per_row":
-            return f"({batch}, sym_m, 1)"
-        if aux.bcast_mode == "per_col":
-            return f"({batch}, 1, sym_n)"
-        if aux.bcast_mode == "per_elem":
-            return f"({batch}, sym_m, sym_n)"
-    else:
-        if aux.bcast_mode == "scalar":
-            return "(1, 1)"
-        if aux.bcast_mode == "per_row":
-            return "(sym_m, 1)"
-        if aux.bcast_mode == "per_col":
-            return "(1, sym_n)"
-        if aux.bcast_mode == "per_elem":
-            return "(sym_m, sym_n)"
-    raise AssertionError(f"unknown bcast_mode {aux.bcast_mode!r}")
+    """Render lowered extents without reconstructing broadcasts."""
+    symbols = {Axis.M: "sym_m", Axis.N: "sym_n", Axis.K: "sym_k", Axis.BATCH: "sym_l", Axis.GROUP: "sym_g"}
+    return "(" + ", ".join(symbols[extent] if isinstance(extent, Axis) else str(extent) for extent in _aux_kernel_shape(aux)) + ")"
 
 
 def _aux_can_use_explicit_fake_stride(aux: TensorRef) -> bool:
     """Check whether auxiliary strides can be encoded directly."""
-    if len(aux.dim) not in (2, 3):
+    # Unit-axis strides also change when dynamic K is rebound; do not bake
+    # the originally declared K-sized strides into a per-K fake tensor.
+    if aux.bcast_mode == "per_k" or len(aux.dim) not in (2, 3):
         return False
     stride1_dims = [i for i, stride in enumerate(aux.stride) if stride == 1]
     if len(stride1_dims) <= 1:
@@ -111,7 +98,7 @@ def _aux_fake_block(aux_tensors: list[TensorRef], *, dynamic_strides: bool = Fal
             stride = "(" + ", ".join(str(s) for s in aux.stride) + ")"
             lines.append(f"fake_{aux.name} = cute.runtime.make_fake_tensor({dtype}, {shape}, " f"stride={stride}, assumed_align={_align})")
         else:
-            _rank = 3 if len(aux.dim) == 3 else 2
+            _rank = len(_aux_kernel_shape(aux))
             stride = "(" + ", ".join("cute.sym_int64()" for _ in range(_rank)) + ")"
             lines.append(f"fake_{aux.name} = cute.runtime.make_fake_tensor({dtype}, {shape}, " f"stride={stride}, assumed_align={_align})")
     return "\n".join(lines) if lines else "pass"
@@ -459,8 +446,8 @@ def _is_layout_ambiguous(t: object) -> bool:
 
 def _aux_fake_real_axes(ref: TensorRef) -> list[bool]:
     """Identify symbolic axes in an auxiliary tensor."""
-    row = ref.bcast_mode in ("per_row", "per_elem")
-    col = ref.bcast_mode in ("per_col", "per_elem")
+    row = ref.bcast_mode in ("per_row", "per_elem") or (ref.bcast_mode == "per_k" and ref.k_axis == 1)
+    col = ref.bcast_mode in ("per_col", "per_elem") or (ref.bcast_mode == "per_k" and ref.k_axis == 2)
     if len(ref.dim) == 3:
         batch_real = ref.grouped_by_moe or ref.dim[0] != 1
         return [batch_real, row, col]
@@ -469,6 +456,10 @@ def _aux_fake_real_axes(ref: TensorRef) -> list[bool]:
 
 def _swap_mn_view(t: object) -> object:
     """Transpose the logical M/N axes without moving the runtime storage."""
+    # A contiguous DeviceView needs no strided transpose when one axis is unit,
+    # as for per-K scales. Its reshape preserves the pointer and owns no memory.
+    if isinstance(t, buffers.DeviceView) and len(t.shape) == 3 and 1 in t.shape[1:]:
+        return t.reshape(t.shape[0], t.shape[2], t.shape[1])
     if len(t.shape) == 3:
         return t.permute(0, 2, 1)
     if len(t.shape) == 2:
@@ -1096,7 +1087,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         in_slots = tuple((op.index for op in r.inputs))
         ins = tuple(((op.kc, op.modulus, op.batch, op.kpack, op.is_b, i in stride_ins) for i, op in enumerate(r.inputs)))
         outs = tuple(((o.index, *(x for axis in o.rule for x in axis), o.align) for o in r.outputs))
-        auxs = tuple(((x.index, x.align) for x in r.aux))
+        auxs = tuple((x.index, x.align, x.mainloop_scale) for x in r.aux)
         sfs = tuple(((s.index, s.is_a, r.inputs[s.operand_at].batch) for s in r.sf))
         tail = r.arg_plan[len(r.inputs) :]
         shared, seeds = (r.shared_layout, r.seeds)
@@ -1176,8 +1167,10 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                     gave_up["output layout"] += 1
                     return refuse(operands, graph_order)
                 problem += (st[2], st[1], st[0]) if swap_ab and idx in mn_view_slots else (st[1], st[2], st[0])
-            for idx, align in auxs:
+            for idx, align, scale_rule in auxs:
                 v = operands[idx]
+                if scale_rule is not None:
+                    scale_rule.check(v, k)
                 if backend.tensor_alignment(tuple(v.shape), tuple(v.stride()), v.element_size(), ptr=v.data_ptr()) < align:
                     gave_up["aux alignment"] += 1
                     return refuse(operands, graph_order)

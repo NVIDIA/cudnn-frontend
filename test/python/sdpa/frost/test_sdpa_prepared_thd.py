@@ -236,7 +236,7 @@ def _plan(g):
     return g._compiled_plans[g._plan_index]
 
 
-def _compact_thd_api(bufs, b, ql, kl, hq, hk, d):
+def _compact_thd_api(bufs, b, ql, kl, hq, hk, d, *, cga=2, pack_gqa=False):
     """Prepare the actual standalone compact-prefix contract independently of a graph plan."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
@@ -252,9 +252,9 @@ def _compact_thd_api(bufs, b, ql, kl, hq, hk, d):
         cu_seq_q_lens=True,
         cu_seq_kv_lens=True,
         thd=True,
-        cga=2,
+        cga=cga,
         split_kv=1,
-        pack_gqa=False,
+        pack_gqa=pack_gqa,
     )
     assert api.check_support()
     api.compile()
@@ -329,7 +329,7 @@ def test_rubin_ragged_pack_rebind_and_changed_lengths_replay(dtype, stats_layout
 
 
 def _check_rubin_ragged_pack_rebind(
-    dtype, stats_layout, stats_log2, geometry, *, cga, causal=True, bottom_right=False, window_left=None, packed=None, sched_policy=1, tile_n=None
+    dtype, stats_layout, stats_log2, geometry, *, cga, causal=True, bottom_right=False, window_left=None, packed=None, sched_policy=1, tile_n=None, head_dim=128
 ):
     import inspect
 
@@ -342,6 +342,7 @@ def _check_rubin_ragged_pack_rebind(
         "single_unpacked": (1, 4096, 4609, 32, 8, 128),
         "two_wave_pair": (2, 2048, 2305, 16, 4, 128),
     }[geometry]
+    d = head_dim
     padded = stats_layout == "padded"
     head_major = stats_layout == "head"
     cap = b * ql
@@ -380,6 +381,7 @@ def _check_rubin_ragged_pack_rebind(
     g.build_plans()
     api = inspect.getclosurevars(_plan(g)._compiled.default_stream).nonlocals["api"]
     assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
+    assert api._k_mod.CFG.TILE_K == api._k_mod.CFG.TILE_O == head_dim
     if tile_n is not None:
         assert api._k_mod.PARAMS.tile_n == api._k_mod.CFG.TILE_N == tile_n
         assert api._k_mod.PARAMS.s_slots == api._k_mod.CFG.S_SLOTS == (2 if tile_n == 64 else 1)

@@ -545,6 +545,10 @@ class Capabilities:
     # Pure declaration constraints, shared with the standalone adapter.
     # Appended to retain the historical positional constructor.
     declaration_check: Optional[Callable[["ga.SdpaGraphFacts"], Optional[str]]] = None
+    # Native flavors with a bounded set of extra legs beyond dense execution.
+    # All requested legs must be in the set; unsupported combinations retain
+    # the next covering flavor. Appended to preserve positional construction.
+    native_legs_by_d_shape: tuple[tuple[tuple[int, int], frozenset[str]], ...] = ()
 
 
 def _mixed_fp8_kv(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
@@ -799,9 +803,9 @@ def rubin_dense_d128_shared_leg(capabilities: Capabilities, facts: "ga.SdpaGraph
     at CGA1 and native SM107 prefill for packed CGA2. The historical predicate name and admission limits
     are retained for policy consumers. Twin of SdpaFwdDslSm100._rubin_shared_dense_leg; keep the gates in lockstep.
 
-    ``knobs``: the request being validated, when there is one -- on the d64 envelope the flavor depends on it (the row's
-    native 64-wide tile carries the dense leg only, so a PackGQA or split request walks past it onto (128, 128) and the
-    shared bodies; a knob-less d64 graph selects the native tile and is not a shared leg)."""
+    ``knobs`` identifies the selected flavor. Native D64 dense and PackGQA plans
+    use their own tile; a split request can still select D128 and this shared
+    leg. A knob-less D64 graph selects the native tile and is not a shared leg."""
     return (
         capabilities.sm_lo == 107
         and not (facts.is_fp8 or facts.is_mxfp8)
@@ -934,13 +938,20 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     return None
 
 
-def _beyond_dense_leg(facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs]) -> bool:
-    """Whether the graph asks for a leg beyond the dense one a ``dense_only_d_shapes`` tile carries: THD, paged KV, the
-    score side outputs, the pre-folded attention scale (graph facts), split_kv > 1 or PackGQA (knobs).  The twin of
-    ``config_sm107.sm107_small_tile_leg``."""
-    if facts.thd or facts.has_paged_kv or facts.has_score_max or facts.has_score_sum_exp or facts.attn_scale_prefolded:
-        return True
-    return knobs is not None and ((knobs.split_kv or 1) > 1 or bool(knobs.pack_gqa))
+def _beyond_dense_leg(facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs], allowed_legs: frozenset[str] = frozenset()) -> bool:
+    """Whether any requested feature exceeds a tile's dense and allowed native legs."""
+    return (
+        _config_sm107.sm107_small_tile_leg(
+            thd=facts.thd,
+            paged=facts.has_paged_kv,
+            score_stats=facts.has_score_max or facts.has_score_sum_exp,
+            prefolded=facts.attn_scale_prefolded,
+            split_kv=knobs.split_kv if knobs is not None else 1,
+            pack_gqa=knobs.pack_gqa if knobs is not None else False,
+            allowed_legs=allowed_legs,
+        )
+        is not None
+    )
 
 
 def _selected_d_shape(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> Optional[tuple[int, int]]:
@@ -948,8 +959,8 @@ def _selected_d_shape(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
     per-shape envelope floors, so the knob domains (cga, split) describe the
     flavor the lowering will actually pick (api_dsl._pick_flavor walks the same
     floors). An exact native shape is always its own selection -- except a
-    ``dense_only_d_shapes`` tile, which is taken only for a graph on the dense
-    leg (``_beyond_dense_leg`` False) at a cga inside its domain (``knobs.cga``
+    restricted tile, which is taken only when every requested feature fits its
+    native legs (``_beyond_dense_leg`` False) at a cga inside its domain (``knobs.cga``
     unset or in ``cgas_by_d_shape``); otherwise the walk continues to the next
     covering shape, the route the graph took before the tile existed.  Callers
     that know the knobs pass them (``mismatch``, ``effective_cgas``); a
@@ -961,14 +972,16 @@ def _selected_d_shape(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
         for shape in capabilities.d_shapes
         if facts.d_qk <= shape[0] and facts.d_v <= shape[1] and ((facts.d_qk, facts.d_v) == shape or min(facts.d_qk, facts.d_v) > floors.get(shape, 0))
     ]
-    if capabilities.dense_only_d_shapes:
-        beyond = _beyond_dense_leg(facts, knobs)
+    if capabilities.dense_only_d_shapes or capabilities.native_legs_by_d_shape:
+        native_legs = dict(capabilities.native_legs_by_d_shape)
+        restricted = capabilities.dense_only_d_shapes | native_legs.keys()
         cga = knobs.cga if knobs is not None else None
         domains = dict(capabilities.cgas_by_d_shape)
         covering = [
             shape
             for shape in covering
-            if shape not in capabilities.dense_only_d_shapes or (not beyond and (cga is None or cga in domains.get(shape, capabilities.cgas)))
+            if shape not in restricted
+            or (not _beyond_dense_leg(facts, knobs, native_legs.get(shape, frozenset())) and (cga is None or cga in domains.get(shape, capabilities.cgas)))
         ]
     return min(covering, key=lambda shape: (shape[0], shape[1])) if covering else None
 
@@ -1009,10 +1022,14 @@ def _sm120_tile_mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts",
     return None
 
 
-def pack_gqa_partial(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
+def pack_gqa_partial(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> bool:
     """Whether the flavor this graph lowers onto packs a proper divisor of a
-    GQA group that does not divide tile_m (``pack_gqa_partial_d_shapes``)."""
-    return capabilities.pack_gqa_partial_d_shapes is not None and _selected_d_shape(capabilities, facts) in capabilities.pack_gqa_partial_d_shapes
+    GQA group that does not divide tile_m (``pack_gqa_partial_d_shapes``).
+
+    A pinned plan supplies its knobs: packing can select a wider native tile
+    than the graph's unpacked flavor. Fact-only callers retain their domain.
+    """
+    return capabilities.pack_gqa_partial_d_shapes is not None and _selected_d_shape(capabilities, facts, knobs) in capabilities.pack_gqa_partial_d_shapes
 
 
 def effective_sched_policies(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> frozenset[int]:
@@ -1552,6 +1569,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             and not decode_tile
             and not rubin_dense_d128_shared_leg(capabilities, facts, knobs)
             and not ragged_pack
+            and not _config_sm107.supports_native_d64_pack(
+                _selected_d_shape(capabilities, facts, knobs),
+                device_cc=facts.device_cc,
+                fp8=facts.is_fp8 or facts.is_mxfp8,
+                paged=facts.has_paged_kv,
+                split_kv=knobs.split_kv or 1,
+                cga=knobs.cga,
+            )
             and not _config_sm107.supports_native_d512_dense_pack_split(
                 _selected_d_shape(capabilities, facts, knobs),
                 device_cc=facts.device_cc,
@@ -1814,7 +1839,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             else:
                 _pg_tile_m = max(capabilities.tile_ms)
             _partial = (
-                pack_gqa_partial(capabilities, facts)
+                pack_gqa_partial(capabilities, facts, knobs)
                 or ragged_pack
                 or supports_paged_d128_partial_pack_gqa(
                     (facts.d_qk, facts.d_v),
@@ -1911,6 +1936,16 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         return "this native head-dimension flavor requires dense Q; THD origins are not wired"
     if facts.thd and capabilities.thd_d_shapes is not None and (facts.d_qk, facts.d_v) not in capabilities.thd_d_shapes:
         return f"THD (ragged) rides the packed native-tile leg on this engine (shapes {sorted(capabilities.thd_d_shapes)}); the head-dim envelope is dense-only"
+    if facts.thd and capabilities.sm_lo == 107 and not (facts.is_fp8 or facts.is_mxfp8) and (facts.d_qk, facts.d_v) == (64, 64):
+        if _selected_d_shape(capabilities, facts, knobs) != (64, 64) or not _config_sm107.supports_native_d64_pack(
+            (facts.d_qk, facts.d_v),
+            device_cc=facts.device_cc,
+            fp8=False,
+            paged=facts.has_paged_kv,
+            split_kv=(knobs.split_kv or 1) if knobs is not None else 1,
+            cga=knobs.cga if knobs is not None else None,
+        ):
+            return "native D64 THD requires nonpaged, unsplit half-precision plans on the D64 tile"
     if facts.thd and capabilities.sm_lo == capabilities.sm_hi == 80 and capabilities.phase == "prefill":
         from cudnn.sdpa.native_sm80 import forward_thd_layout_mismatch
 
@@ -2474,26 +2509,11 @@ def _sm107_spec() -> EngineSpec:
       bodies, the single-CTA THD legs and the shared dense D128 legs (decode
       tile, dense PackGQA) apply the scale in-kernel and decline.
 
-    Small head dims (``config_sm107.SM107_F16_SMALL_D_SHAPES``): the d128 file
-    at ``TILE_K = TILE_O = 32`` and ``64`` (``make_cfg_d32`` / ``make_cfg_d64``)
-    are native flavors of this row, so a head dim D <= 64 no longer rides the
-    zero-filled 128-wide tile.  The width a graph lands on is the smallest one
-    covering max(d_qk, d_v) -- 8 / 16 / 24 -> 32, 40 / 48 / 56 -> 64, 72..120 ->
-    128, the natives on themselves (``sm107_f16_tile_width``; the same walk as
-    ``_selected_d_shape`` below and ``api_dsl._pick_flavor``) -- and D % 8 != 0
-    (the TMA 16-byte global-stride rule at 2 B/elem) is a typed decline, never
-    a padded copy.  The small tiles serve the dense feature set (causal /
-    bottom-right / right band / SWA / padded / sink / GQA / Stats) at the
-    validated widths of ``SM107_SMALL_D_CGAS`` -- and ONLY that
-    (``dense_only_d_shapes``): a graph that asks for THD, split-KV, paged KV,
-    PackGQA, the score side outputs or a cga outside the tile's domain is
-    selected PAST the small tiles onto the d128 flavor it rode before they
-    existed (zero-filled to 128, where ``thd_d_shapes`` / ``split_d_shapes`` /
-    ``paged_d_shapes`` / ``pack_gqa_d_shapes`` / ``score_stats_d_shapes`` and
-    the cga2 domain apply exactly as before), so the tiles withdraw nothing the
-    row served: split-KV and the score outputs at D <= 64 stay served on d128,
-    a cga2 request at D <= 32 lands on the 64-wide tile, and THD / paged /
-    PackGQA at D <= 64 keep their pre-tile typed declines (exact-shape legs).
+    D32/D64 use native small tiles for the dense feature set. D64 also serves
+    exact-D64 nonpaged THD and dense/THD PackGQA at CGA1/CGA2. Smaller aligned
+    dense packed heads use the D64 envelope. Every requested extra leg must
+    fit native_legs_by_d_shape; split, paged, score-output and pre-folded-scale
+    graphs retain the next covering flavor and its admission checks.
     """
     return EngineSpec(
         name="sdpa_fwd_prefill_sm107",
@@ -2528,8 +2548,8 @@ def _sm107_spec() -> EngineSpec:
             skv_tail_via_padding=True,
             # SM107_F16_THD_SHAPES is the single definition, shared with the
             # standalone adapter's gate so the two cannot drift (rule 8b').  It
-            # now covers every f16 flavor; keeping it a named constant rather
-            # than `True` is what makes a future partial arch line expressible.
+            # covers the native D64 and larger f16 flavors. D32 remains dense;
+            # D64 THD additionally requires nonpaged, unsplit plans.
             thd=True,
             thd_padded_stats=True,
             padded_stats=True,
@@ -2546,11 +2566,11 @@ def _sm107_spec() -> EngineSpec:
             # (256, 256) = the d256 DECODE tile's whole-group packing (dense or paged, whatever tile_m) and the
             # paged THD d256 prefill's PackGQA (CGA2, unsplit); mismatch declines a packed dense d256 graph the
             # tile does not serve (the dense d256 prefill kernel runs unpacked).
-            pack_gqa_d_shapes=frozenset({(128, 128), (256, 256), (512, 512)}),
-            # Native D512 2x2 tiles pack gcd(G,64), including two subgroups
-            # per KV head at G128. THD and paged D512 retain their declines.
-            pack_gqa_partial_d_shapes=frozenset({(512, 512)}),
-            thd_pack_gqa_d_shapes=frozenset({(128, 128), (256, 256)}),
+            pack_gqa_d_shapes=frozenset({(64, 64), (128, 128), (256, 256), (512, 512)}),
+            # Native D64 packs gcd(G,128); D512 2x2 tiles pack gcd(G,64).
+            # THD and paged D512 retain their declines.
+            pack_gqa_partial_d_shapes=frozenset({(64, 64), (512, 512)}),
+            thd_pack_gqa_d_shapes=frozenset({(64, 64), (128, 128), (256, 256)}),
             split_kv_supported=True,
             # (256, 256) = the paged THD packed split and the decode tile's dense / paged split.
             split_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
@@ -2587,7 +2607,11 @@ def _sm107_spec() -> EngineSpec:
             # kernels do; see those rows), so it raises rather than
             # miscomputes. Both are follow-ups.
             sched_policies=frozenset({SCHED_NATURAL}),
-            sched_policies_by_d_shape=(((128, 128), frozenset({SCHED_NATURAL, SCHED_LPT})), ((256, 256), frozenset({SCHED_NATURAL, SCHED_LPT}))),
+            sched_policies_by_d_shape=(
+                ((64, 64), frozenset({SCHED_NATURAL, SCHED_LPT})),
+                ((128, 128), frozenset({SCHED_NATURAL, SCHED_LPT})),
+                ((256, 256), frozenset({SCHED_NATURAL, SCHED_LPT})),
+            ),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
@@ -2616,10 +2640,11 @@ def _sm107_spec() -> EngineSpec:
             score_max=True,
             score_sum_exp=True,
             score_stats_d_shapes=SM107_SCORE_STATS_SHAPES,
-            # The small tiles carry the dense leg only: every other leg (and a cga outside the tile's
-            # domain) is routed past them to the d128 flavor -- see the field's doc and the row
-            # docstring.  ONE constant with the adapter's pool (config_sm107, rule 8b').
-            dense_only_d_shapes=SM107_F16_SMALL_D_SHAPES,
+            # D32 remains dense-only; D64 carries the extra legs shared with
+            # standalone flavor selection. Unsupported combinations retain
+            # their covering flavor rather than silently changing semantics.
+            dense_only_d_shapes=frozenset({(32, 32)}),
+            native_legs_by_d_shape=(((64, 64), _config_sm107.SM107_SMALL_D_NATIVE_LEGS[(64, 64)]),),
             # Additive bias + per-key mask on the small tiles as a RESIDENT SMEM row-block
             # (the d128 file at BIAS_MODE = 1 / KV_MASK_FORM = 1 / 2 / 3): bias [1|B, 1|H_q, S_q, S_kv] in
             # the io dtype, kv_mask [1|B, 1, 1, S_kv] BOOLEAN (the bit word) or an ADDITIVE vector in
@@ -3438,35 +3463,45 @@ def lower_dsl_prefill(
         # Physical offsets choose addresses; declared Q lengths choose live rows.
         api._ragged_q_lens = 2 if facts.cu_seq_q_t is not None else 1 if facts.seq_q_t is not None else 0
     if (
-        facts.thd
-        and not getattr(api, "thd_decode_leg", False)
-        and facts.epilogue_gate_t is None
-        and (facts.device_cc in ((10, 0), (10, 3)) or (facts.device_cc == (10, 7) and facts.d_qk == 128 and not (facts.is_fp8 or facts.is_mxfp8)))
-        and (facts.d_qk, facts.d_v) in ((128, 128), (256, 256), SM100_NATIVE_D576_SHAPE)
-        and (
-            (
-                not (facts.is_fp8 or facts.is_mxfp8)
-                and (
-                    ((api.split_kv == 1 or (facts.d_qk, facts.d_v) == SM100_NATIVE_D576_SHAPE) and api.cga in (None, 2))
-                    or (
-                        facts.d_qk == 128
-                        and api.cga == 1
-                        and (
-                            facts.has_paged_kv
-                            or api.packed_thd_split
-                            or (facts.device_cc == (10, 7) and api.split_kv == 1)
-                            or (api.split_kv == 1 and sm100_nonpaged_d128_thd_single_cta_leg(spec.capabilities, facts, cga=1, split_kv=1))
+        (
+            facts.thd
+            and not getattr(api, "thd_decode_leg", False)
+            and facts.epilogue_gate_t is None
+            and (facts.device_cc in ((10, 0), (10, 3)) or (facts.device_cc == (10, 7) and facts.d_qk == 128 and not (facts.is_fp8 or facts.is_mxfp8)))
+            and (facts.d_qk, facts.d_v) in ((128, 128), (256, 256), SM100_NATIVE_D576_SHAPE)
+            and (
+                (
+                    not (facts.is_fp8 or facts.is_mxfp8)
+                    and (
+                        ((api.split_kv == 1 or (facts.d_qk, facts.d_v) == SM100_NATIVE_D576_SHAPE) and api.cga in (None, 2))
+                        or (
+                            facts.d_qk == 128
+                            and api.cga == 1
+                            and (
+                                facts.has_paged_kv
+                                or api.packed_thd_split
+                                or (facts.device_cc == (10, 7) and api.split_kv == 1)
+                                or (api.split_kv == 1 and sm100_nonpaged_d128_thd_single_cta_leg(spec.capabilities, facts, cga=1, split_kv=1))
+                            )
                         )
                     )
                 )
+                or (facts.is_fp8 and facts.has_paged_kv and api.split_kv == 1)
             )
-            or (facts.is_fp8 and facts.has_paged_kv and api.split_kv == 1)
         )
-    ) or (
-        # The SM90 row (f16/bf16, nonpaged, unsplit, ungated by its capabilities) reads every
-        # port's offsets: its setup launch builds per-sequence K/V/O maps at the origins.
-        facts.thd
-        and spec.name == "sdpa_fwd_prefill_sm90"
+        or (
+            # Native D64 uses the same per-port physical origins as native D128.
+            facts.thd
+            and facts.epilogue_gate_t is None
+            and spec.name == "sdpa_fwd_prefill_sm107"
+            and api._rubin_native_d64_pack_leg()
+        )
+        or (
+            # The SM90 row (f16/bf16, nonpaged, unsplit, ungated by its capabilities) reads every
+            # port's offsets: its setup launch builds per-sequence K/V/O maps at the origins.
+            facts.thd
+            and spec.name == "sdpa_fwd_prefill_sm90"
+        )
     ):
         from .thd_origins import graph_origin_specs
 
