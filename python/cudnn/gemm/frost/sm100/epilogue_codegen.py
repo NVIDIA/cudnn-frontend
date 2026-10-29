@@ -1544,7 +1544,7 @@ def generate(
     output_elem_bytes: int = 2,
     tma_slots: "frozenset[int]" = frozenset(),
     packed_lanes: bool = False,
-    split_k_slices: int = 1,
+    workspace_split_k: bool = False,
 ) -> EpilogueSnippets:
     """Produce the two hook-site snippets, the extra kernel param list, and
     all per-tap plumbing. ``vec_bytes_epi`` / ``output_elem_bytes`` (from the
@@ -1757,7 +1757,7 @@ def generate(
         body_lines.append("nvvm.bar_warp_sync(0xFFFFFFFF)")
 
     # Split-K partial store handling
-    if split_k_slices > 1:
+    if workspace_split_k:
         if tma_slots:
             body_lines = ["vec_out = vec_f32", tma_out_ready_marker(0)]
         else:

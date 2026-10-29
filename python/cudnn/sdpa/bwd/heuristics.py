@@ -97,7 +97,12 @@ def _leads(spec: EngineSpec, facts) -> bool:
         return facts.thd and facts.window_left is None and (facts.d_qk, facts.d_v) == (128, 128)
     if spec.name == "sdpa_bwd_sm100_d256":
         return _d256_leads(facts)
-    return True
+    return spec.name not in TRAIL_ONLY_ROWS
+
+
+TRAIL_ONLY_ROWS = frozenset({"sdpa_bwd_sm80", "sdpa_bwd_sm120", "sdpa_bwd_sm107", "sdpa_bwd_sm107_d512"})
+"""Default-offered rows with no measured lead shard: ranked after the backend's block, so they serve a graph only when the
+backend declines it (a correctness fallback, not a performance claim)."""
 
 
 SM100_D256_BWD_RAGGED_MASKFREE_MAX_S_Q = 4095  # mask-free ragged THD d256 past this length: 0.95-1.10 of the backend
@@ -121,11 +126,14 @@ def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
 
     if not ours or opt_in_engines_enabled():
         return ours
-    from cudnn.engines.heuristics import BACKEND
+    from cudnn.engines.heuristics import BACKEND, LAST_RESORT
 
     spec_of = {offered[s.name]: s for s in ENGINE_SPECS if s.name in offered}
-    lead = [p for p in ours if _leads(spec_of[p.engine_id], facts)]
-    trail = [p for p in ours if p not in lead]
+    last = [p for p in ours if spec_of[p.engine_id].name in TRAIL_ONLY_ROWS]
+    lead = [p for p in ours if p not in last and _leads(spec_of[p.engine_id], facts)]
+    trail = [p for p in ours if p not in last and p not in lead]
+    if last:
+        return lead + [BACKEND] + trail + [LAST_RESORT] + last
     return lead + [BACKEND] + trail if trail else lead
 
 

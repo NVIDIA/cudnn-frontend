@@ -207,8 +207,10 @@ class CompiledGdn2:
         self.length_rule = self.chain and self.batch_invariant
 
         layout = WorkspaceLayout()
-        from .common.host import tensormap_workspace_bytes
+        from .common.host import get_dtype, tensormap_workspace_bytes
+        from .common.steep_decay import STEEP_OFF, steep_mode_for
 
+        self.steep_mode = steep_mode_for(get_dtype(self.io_name), self.use_qk_l2norm, self.safe_gate, self.gate_lower_bound * kernel_module.LOG2_E, self.b_t)
         regions = []
         if self.chain:
             self.num_pieces = B * self.pieces
@@ -268,7 +270,13 @@ class CompiledGdn2:
             self.tensormap_bytes = tensormap_workspace_bytes(prefill_module, B)
             regions.append(("tensormaps", layout.add(self.tensormap_bytes, align=128), "int64", (self.tensormap_bytes // 8,)))
             seed = node.inputs.get("initial_state")
-            if self.has_final_state and not self.prep and seed is not None and (self.overwrite_initial_state or "state_indices" in node.inputs):
+            if (
+                self.steep_mode != STEEP_OFF
+                and self.has_final_state
+                and not self.prep
+                and seed is not None
+                and (self.overwrite_initial_state or "state_indices" in node.inputs)
+            ):
                 # The final state may overwrite the seeds (the graph contract, not this call's pointers: buffers can alias
                 # after warmup), so the prefill seeds from a copy its exact twin can reread (common/state_snapshot.py).
                 seed_name, seed_bytes = {"BFLOAT16": ("bfloat16", 2), "HALF": ("float16", 2)}.get(seed.get_data_type().name, ("float32", 4))
@@ -500,8 +508,8 @@ class CompiledGdn2Bwd:
         self.device = current_device()
         from .common.gate_bwd import GATE_BWD_BLOCKS, channel_gate_bwd
         from .common.head_reduce import head_group_reduce
-        from .common.host import tensormap_workspace_bytes
-        from .common.steep_scratch import state_gradient_scratch_layout
+        from .common.host import get_dtype, tensormap_workspace_bytes
+        from .common.steep_decay import STEEP_OFF, steep_mode_for
 
         self.head_group_reduce = head_group_reduce
         self.channel_gate_bwd = channel_gate_bwd
@@ -558,8 +566,10 @@ class CompiledGdn2Bwd:
         layout = WorkspaceLayout()
         regions = []
         # One FP32 state and bounded-key ring per persistent CTA; sequential backward kernels share the arena.
-        state_grad_layout = state_gradient_scratch_layout(d_k=K, d_v=V, b_t=self.b_t, decay_stages=bwd_module.CFG.SMEM_DECAY_STAGES)
-        dstate_scratch_elements = max(1, min(self.num_sm, self.num_pieces * HO)) * (state_grad_layout.nbytes // 4)
+        self.steep_mode = steep_mode_for(get_dtype(self.io_name), self.use_qk_l2norm, self.safe_gate, self.gate_lower_bound * bwd_module.LOG2_E, self.b_t)
+        dstate_scratch_elements = (
+            max(1, min(self.num_sm, self.num_pieces * HO)) * (V * K + bwd_module.CFG.SMEM_DECAY_STAGES * self.b_t * K) if self.steep_mode != STEEP_OFF else 1
+        )
         regions.append(("dstate_scratch", layout.add(dstate_scratch_elements * 4), "float32", (dstate_scratch_elements,)))
         off_scheduler = layout.add(40 if self.chain else 16)
         regions += [
@@ -651,7 +661,7 @@ class CompiledGdn2Bwd:
                 regions.append(("state_h", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
                 regions.append(("state_x", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
         d_final = node.inputs.get("d_final_state")
-        if not self.chain and self.overwrite_initial_state and d_final is not None:
+        if self.steep_mode != STEEP_OFF and not self.chain and self.overwrite_initial_state and d_final is not None:
             # d_initial_state overwrites d_final_state: the bprop reads a copy so its exact twin can redo it.
             d_name, d_bytes = {"BFLOAT16": ("bfloat16", 2), "HALF": ("float16", 2)}.get(d_final.get_data_type().name, ("float32", 4))
             regions.append(("dstate_snapshot", layout.add(B * HO * V * K * d_bytes, align=128), d_name, (B, HO, V, K)))
@@ -1350,8 +1360,8 @@ class CompiledGdn2SummaryBwd:
     state chain whose tail is ``d_initial_state`` and whose running product is ``transition``."""
 
     def __init__(self, node, summary_module):
-        from .common.host import tensormap_workspace_bytes
-        from .common.steep_scratch import state_gradient_scratch_layout
+        from .common.host import get_dtype, tensormap_workspace_bytes
+        from .common.steep_decay import STEEP_OFF, steep_mode_for
         from .common.piece_chain import build_state_chain, chain_rows_per_cta, choose_pieces, piece_table_layout, run_state_chain
         from .kernel.gdn2_chain_prologue_f16 import run_chain_prologue
         from .common.split_k import WORK_ITEM_FIELDS
@@ -1415,8 +1425,13 @@ class CompiledGdn2SummaryBwd:
         layout = WorkspaceLayout()
         regions = []
         # One FP32 state and bounded-key ring per persistent CTA; sequential backward kernels share the arena.
-        state_grad_layout = state_gradient_scratch_layout(d_k=K, d_v=V, b_t=self.b_t, decay_stages=summary_module.CFG.SMEM_DECAY_STAGES)
-        dstate_scratch_elements = max(1, min(self.num_sm, self.num_pieces * HO)) * (state_grad_layout.nbytes // 4)
+        io_name = "float16" if node.inputs["q"].get_data_type().name == "HALF" else "bfloat16"
+        self.steep_mode = steep_mode_for(get_dtype(io_name), self.use_qk_l2norm, self.safe_gate, self.gate_lower_bound * summary_module.LOG2_E, self.b_t)
+        dstate_scratch_elements = (
+            max(1, min(self.num_sm, self.num_pieces * HO)) * (V * K + summary_module.CFG.SMEM_DECAY_STAGES * self.b_t * K)
+            if self.steep_mode != STEEP_OFF
+            else 1
+        )
         regions.append(("dstate_scratch", layout.add(dstate_scratch_elements * 4), "float32", (dstate_scratch_elements,)))
         if self.chain:
             from .kernel import gdn2_recompute_f16 as recompute_module

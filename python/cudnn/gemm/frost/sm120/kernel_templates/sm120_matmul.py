@@ -238,11 +238,11 @@ def _kernel(
     k: cutlass.Int64,
     # @@INJECT_KERNEL_AB_DESC_PARAMS@@
     # @@INJECT_KERNEL_TAP_PARAMS@@
+    # @@INJECT_KERNEL_REDUCTION_STRIDE_PARAMS@@
+    # @@INJECT_KERNEL_AUX_PARAMS@@
     # @@SPLITK_ONLY:BEGIN@@
     mSplitK_partials: cute.Tensor,
     # @@SPLITK_ONLY:END@@
-    # @@INJECT_KERNEL_REDUCTION_STRIDE_PARAMS@@
-    # @@INJECT_KERNEL_AUX_PARAMS@@
 ) -> None:
     # @@INJECT_AB_DESC_LISTS@@
 
@@ -1113,11 +1113,11 @@ def _host(
         problem_size[2],
         # @@INJECT_HOST_KERNEL_DESC_PASS@@
         # @@INJECT_HOST_TAP_PASS@@
+        # @@INJECT_HOST_REDUCTION_STRIDE_PASS@@
+        # @@INJECT_HOST_AUX_PASS@@
         # @@SPLITK_ONLY:BEGIN@@
         splitk_partials,
         # @@SPLITK_ONLY:END@@
-        # @@INJECT_HOST_REDUCTION_STRIDE_PASS@@
-        # @@INJECT_HOST_AUX_PASS@@
     ).launch(
         grid=grid_shape,
         block=(threads_per_cta, 1, 1),

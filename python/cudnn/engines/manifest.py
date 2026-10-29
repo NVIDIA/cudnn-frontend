@@ -269,7 +269,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         slots={
             "sdpa_fwd_prefill_sm120": EngineSlot(5),
             "sdpa_fwd_prefill_sm120_fp8": EngineSlot(7, opt_in=True),
-            "sdpa_fwd_prefill_sm80": EngineSlot(8, opt_in=True),
+            "sdpa_fwd_prefill_sm80": EngineSlot(8),
             "sdpa_fwd_prefill_sm100": EngineSlot(11),
             "sdpa_fwd_prefill_sm100_mxfp8": EngineSlot(12, opt_in=True),
             "sdpa_fwd_prefill_sm100_fp8": EngineSlot(13),
@@ -290,17 +290,20 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "cudnn.sdpa.bwd.engine",
         "FrostSdpaBwdEngines",
         slots={
-            "sdpa_bwd_sm120": EngineSlot(0, opt_in=True),
-            "sdpa_bwd_sm80": EngineSlot(1, opt_in=True),
+            "sdpa_bwd_sm120": EngineSlot(0),
+            "sdpa_bwd_sm80": EngineSlot(1),
             "sdpa_bwd_sm100": EngineSlot(2),
             "sdpa_bwd_sm100_mxfp8": EngineSlot(3, opt_in=True),
-            "sdpa_bwd_sm107": EngineSlot(4, opt_in=True),
+            "sdpa_bwd_sm107": EngineSlot(4),
             "sdpa_bwd_sm107_fp8": EngineSlot(5, opt_in=True),
             "sdpa_bwd_sm107_mxfp8": EngineSlot(6, opt_in=True),
             "sdpa_bwd_sm100_d256": EngineSlot(7),
-            "sdpa_bwd_sm107_d512": EngineSlot(8, opt_in=True),
+            "sdpa_bwd_sm107_d512": EngineSlot(8),
             "sdpa_bwd_sm100_d128": EngineSlot(9),
             "sdpa_bwd_sm107_d192": EngineSlot(10, opt_in=True),
+            "sdpa_bwd_sm100_d128_fp8": EngineSlot(11, opt_in=True),
+            "sdpa_bwd_sm100_d192": EngineSlot(12, opt_in=True),
+            "sdpa_bwd_sm100_d192_fp8": EngineSlot(13, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         # One entry per eligible row, WITH the tiles the lowering would pick
@@ -321,7 +324,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "cudnn.norm.fprop.engine",
         "FrostNormFwdEngines",
         # Slots are FIXED FOREVER; append the next free one, never reorder.
-        slots={"norm_fprop_sm100": EngineSlot(0)},
+        slots={"norm_fprop_sm100": EngineSlot(0), "norm_fprop_sm90": EngineSlot(1, opt_in=True)},
         analyzer=("cudnn.norm.graph_analyzer", "analyze"),
     ),
     EngineFamily(
@@ -329,7 +332,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "frost_norm_bwd",
         "cudnn.norm.bprop.engine",
         "FrostNormBwdEngines",
-        slots={"norm_bprop_sm100": EngineSlot(0)},
+        slots={"norm_bprop_sm100": EngineSlot(0), "norm_bprop_sm90": EngineSlot(1, opt_in=True)},
         analyzer=("cudnn.norm.graph_analyzer", "analyze"),
     ),
 )

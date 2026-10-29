@@ -3561,12 +3561,36 @@ def _splitk_cfg(sm100_name=None):
     return by_name(sm100_name) if sm100_name else DEFAULT_CONFIG
 
 
-def _jit_splitk(g, S, base_cfg=None):
+def test_benchmark_cluster_k_reduce_variants(monkeypatch):
+    """Preserve unswept strategy axes and skip invalid benchmark combinations."""
+    from dataclasses import replace
+    from cudnn.frost.occupancy import MAX_CLUSTER_SIZE
+
+    benchmark_dir = pathlib.Path(__file__).resolve().parents[4] / "benchmark" / "gemm" / "frost"
+    monkeypatch.syspath_prepend(str(benchmark_dir))
+    from benchmark_utils import expand_config_variants, select_config_variants
+
+    cfg = replace(by_name(_SPLITK_EPI_CFG), split_k_slices=4)
+    cluster = replace(cfg, cluster_k_reduce=True)
+    specs = {c.name: (c, c.cta_group) for c in (cfg, cluster)}
+    variants = expand_config_variants(specs, sweep_split_k=20, sweep_swap_ab=True)
+    workspace = [c for c, _ in variants.values() if not c.cluster_k_reduce]
+    clustered = [c for c, _ in variants.values() if c.cluster_k_reduce]
+    assert {c.split_k_slices for c in workspace} == set(range(1, 21))
+    assert {c.split_k_slices for c in clustered} == set(range(2, MAX_CLUSTER_SIZE + 1))
+    assert len(workspace) == 40 and len(clustered) == 2 * (MAX_CLUSTER_SIZE - 1)
+    selected = select_config_variants(",".join(specs), specs, sweep_split_k=20, sweep_swap_ab=True)
+    assert set(selected) == set(variants)
+    assert list(expand_config_variants({cluster.name: specs[cluster.name]})) == [cluster.name]
+
+
+def _jit_splitk(g, S, base_cfg=None, *, cluster_k_reduce=False):
+    """Compile a forced split-K config for numerical and workspace contract checks."""
     from dataclasses import replace
 
     from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
 
-    return jit_from_cudnn_graph(g, replace(base_cfg or _splitk_cfg(), split_k_slices=S))
+    return jit_from_cudnn_graph(g, replace(base_cfg or _splitk_cfg(), split_k_slices=S, cluster_k_reduce=cluster_k_reduce))
 
 
 def _run_splitk(compiled, vp):
@@ -3686,13 +3710,221 @@ def test_splitk_n_not_multiple_of_4(N):
 
 @requires_sm100
 def test_splitk_cta_group1():
+    """Execute workspace split-K without requiring a paired-CTA MMA."""
     g, A, Bt, C = _splitk_graph(1, 256, 256, 4096)
     compiled = _jit_splitk(g, 4, base_cfg=by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"))
-    assert compiled.store_modes == ("stg",)
+    assert compiled.store_modes == ("stg",) and not compiled.config.cluster_k_reduce
     assert compiled.use_tma_store
     a, b, c, ref = _splitk_data(1, 256, 256, 4096)
     _run_splitk(compiled, {A: a, Bt: b, C: c})
     assert torch.equal(c, ref)
+
+
+@requires_sm100
+@pytest.mark.parametrize("slices", [2, 3, 4, 5, 8, 16, 32])
+@pytest.mark.parametrize("cluster_reduce", [False, True])
+@pytest.mark.parametrize("swap", [False, True])
+def test_cluster_splitk_slices_and_replay(slices, swap, cluster_reduce):
+    """Honor each explicit slice count and reduction mode in both operand orientations."""
+    from dataclasses import replace
+    from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
+    from cudnn.frost.occupancy import occupancy_map, MAX_CLUSTER_SIZE
+
+    base = by_name("CONFIG_sm100_128x24x128_128x24x32_cluster1x1_1ctamma")
+    if cluster_reduce and slices > MAX_CLUSTER_SIZE:
+        with pytest.raises(NotImplementedError, match="CGA limit"):
+            replace(base, split_k_slices=slices, cluster_k_reduce=True, swap_ab=swap)
+        return
+    cfg = replace(base, split_k_slices=slices, cluster_k_reduce=cluster_reduce, swap_ab=swap)
+    g, A, B, C = _splitk_graph(3, 136, 264, 2112)
+    if cluster_reduce and occupancy_map()[slices - 1] == 0:
+        with pytest.raises(NotImplementedError, match="cluster"):
+            jit_from_cudnn_graph(g, cfg)
+        return
+    plan = jit_from_cudnn_graph(g, cfg)
+    assert plan.config == cfg
+    assert plan.config.cluster_shape[2] == (slices if cluster_reduce else 1)
+    source = plan.generated_path.read_text()
+    if cluster_reduce:
+        assert plan.workspace_bytes == plan.workspace_bytes_for(3, 136, 264) == 0
+        assert "_splitk_reduce_kernel(" not in source
+    else:
+        assert plan.workspace_bytes == plan.workspace_bytes_for(3, 136, 264) > 0
+        assert "_splitk_reduce_kernel(" in source
+    a, b, out, ref = _splitk_data(3, 136, 264, 2112)
+    _run_splitk(plan, {A: a, B: b, C: out})
+    torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+
+@requires_sm100
+@pytest.mark.parametrize(
+    "cta_m,mma_m,cta_n,group,cluster,slices",
+    [
+        (64, 64, 24, 1, "1x1", 2),
+        (64, 64, 32, 2, "2x1", 2),
+        (256, 128, 256, 1, "1x1", 4),
+        (512, 128, 32, 1, "1x1", 4),
+        (128, 128, 128, 1, "2x2", 2),
+        (128, 128, 128, 1, "1x4", 4),
+        (128, 128, 128, 2, "2x1", 4),
+        (128, 128, 128, 2, "4x2", 2),
+    ],
+)
+def test_cluster_splitk_geometry(cta_m, mma_m, cta_n, group, cluster, slices):
+    """Reduce fragments correctly across supported CTA, MMA and CGA geometries."""
+    from cudnn.frost.occupancy import occupancy_map
+
+    cfg = by_name(f"CONFIG_sm100_{cta_m}x{cta_n}x128_{mma_m}x{cta_n}x32_cluster{cluster}_{group}ctamma")
+    supported = occupancy_map()[cfg.cga_size_m * cfg.cga_size_n * slices - 1] > 0
+    g, A, B, C = _splitk_graph(1, 520, 520, 4160)
+    if not supported:
+        with pytest.raises(NotImplementedError, match="cluster"):
+            _jit_splitk(g, slices, base_cfg=cfg, cluster_k_reduce=True)
+        return
+    plan = _jit_splitk(g, slices, base_cfg=cfg, cluster_k_reduce=True)
+    assert plan.config.cluster_k_reduce
+    if supported:
+        assert plan.workspace_bytes == 0
+    a, b, out, ref = _splitk_data(1, 520, 520, 4160)
+    _run_splitk(plan, {A: a, B: b, C: out})
+    torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+
+@requires_sm100
+@pytest.mark.parametrize("failure_stage", ["render", "compile"])
+def test_cluster_splitk_build_failure_does_not_change_mode(monkeypatch, failure_stage):
+    """Propagate build failures without retrying a different reduction mode."""
+    from cudnn.gemm.frost import compiler
+    from cutlass.base_dsl.common import DSLRuntimeError
+
+    g, A, B, C = _splitk_graph(1, 136, 264, 2048)
+    original = compiler._render_template
+    attempts = []
+
+    def render(chain, snippets, cfg):
+        """Inject a rendering failure while recording the requested reduction mode."""
+        attempts.append(cfg.cluster_k_reduce)
+        if cfg.cluster_k_reduce and failure_stage == "render":
+            raise NotImplementedError("test: no SMEM left for the cluster mailbox")
+        return original(chain, snippets, cfg)
+
+    monkeypatch.setattr(compiler, "_render_template", render)
+    if failure_stage == "compile":
+        original_import = compiler._import_kernel
+
+        def import_kernel(src):
+            """Inject a DSL compilation failure without changing template selection."""
+            mod = original_import(src)
+            if "cluster_k_reduce = True" in src:
+
+                def cannot_compile():
+                    """Raise the sentinel compilation failure used to verify exact-mode behavior."""
+                    raise DSLRuntimeError("test: cluster lowering unavailable in the installed compiler")
+
+                mod.compile = cannot_compile
+            return mod
+
+        monkeypatch.setattr(compiler, "_import_kernel", import_kernel)
+    cfg = by_name(_SPLITK_EPI_CFG)
+    with pytest.raises((NotImplementedError, DSLRuntimeError)):
+        _jit_splitk(g, 4, base_cfg=cfg, cluster_k_reduce=True)
+    assert attempts == [True]
+    plan = _jit_splitk(g, 4, base_cfg=cfg)
+    assert attempts == [True, False]
+    assert not plan.config.cluster_k_reduce
+    assert plan.workspace_bytes == plan.workspace_bytes_for(1, 136, 264) == 4 * 136 * 264 * 4
+    a, b, out, ref = _splitk_data(1, 136, 264, 2048)
+    _run_splitk(plan, {A: a, B: b, C: out})
+    torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+
+@requires_sm100
+def test_cluster_splitk_smem_budget_declines(monkeypatch):
+    """Reject mailbox allocations that leave no legal mainloop staging depth."""
+    from cudnn.gemm.frost import compiler, tile_config
+
+    # One 32-KiB AB stage fits; adding four 16-KiB fragment slots does not.
+    monkeypatch.setattr(tile_config, "_sm_smem_budget_bytes", lambda device=None: 40000)
+    g, A, B, C = _splitk_graph(1, 136, 264, 2048)
+    with compiler.force_stg_epi():
+        with pytest.raises((NotImplementedError, ValueError), match="SMEM|stage|budget"):
+            _jit_splitk(g, 4, base_cfg=by_name(_SPLITK_EPI_CFG), cluster_k_reduce=True)
+        plan = _jit_splitk(g, 4, base_cfg=by_name(_SPLITK_EPI_CFG))
+    assert not plan.config.cluster_k_reduce and plan.workspace_bytes > 0
+    a, b, out, ref = _splitk_data(1, 136, 264, 2048)
+    _run_splitk(plan, {A: a, B: b, C: out})
+    torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+
+@requires_sm100
+def test_cluster_splitk_override_capture_and_k_guard():
+    """Reuse cluster plans under capture and reject insufficient K before output writes."""
+    from cudnn.gemm.frost.graph_analyzer import build_gemm_plan
+    from cudnn.gemm.frost.knobs import GemmKnobs
+    from dataclasses import replace
+
+    g, A, B, C = _splitk_graph(1, 136, 264, 2112)
+    g._cpp_graph_kwargs["is_override_shape_enabled"] = True
+    cfg = replace(by_name(_SPLITK_EPI_CFG), split_k_slices=4, cluster_k_reduce=True)
+    plan = build_gemm_plan(g, knobs=GemmKnobs.from_config(cfg))
+    assert plan.config.cluster_k_reduce and plan.workspace_bytes_for(1, 272, 520) == 0
+    for m, n, k in ((136, 264, 2112), (272, 520, 2048)):
+        a, b, out, ref = _splitk_data(1, m, n, k)
+        pack = {A: a, B: b, C: out}
+        _run_splitk(plan, pack)
+        torch.testing.assert_close(out, ref, atol=0, rtol=0)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    capture = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(capture, stream=stream):
+            plan(pack, stream=stream.cuda_stream)
+        a.mul_(2)
+        out.fill_(float("nan"))
+        capture.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, ref * 2, atol=0, rtol=0)
+    finally:
+        capture.reset()
+    a_short, b_short, out, _ = _splitk_data(1, 136, 264, 64)
+    out.fill_(-123)
+    with pytest.raises(ValueError, match="exceeds the .* K tile"):
+        plan({A: a_short, B: b_short, C: out})
+    assert torch.all(out == -123)
+
+
+@requires_sm100
+@pytest.mark.parametrize("dtype", ["fp8_e4m3", "fp8_e5m2"])
+@pytest.mark.parametrize("mma_k", [32, 64])
+@pytest.mark.parametrize("swap", [False, True])
+def test_cluster_splitk_fp8(dtype, mma_k, swap):
+    """Preserve FP8 results across instruction widths and swapped operands."""
+    from dataclasses import replace
+
+    if mma_k == 64 and not 107 <= _current_arch() < 110:
+        pytest.skip("ordinary FP8 K64 requires SM10.7--10.9")
+    cfg = replace(by_name(f"CONFIG_sm100_128x24x128_128x24x{mma_k}_cluster1x1_1ctamma"), swap_ab=swap)
+    g, A, B, C = _splitk_graph(1, 136, 264, 2112, io_dt=_CUDNN_DTYPE[dtype])
+    plan = _jit_splitk(g, 4, base_cfg=cfg, cluster_k_reduce=True)
+    assert plan.config.cluster_k_reduce and plan.workspace_bytes == 0
+    a, b, out, ref = _splitk_data(1, 136, 264, 2112, torch_in=_TORCH_DTYPE[dtype])
+    _run_splitk(plan, {A: a, B: b, C: out})
+    torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+
+@requires_sm100
+def test_cluster_splitk_persistent_mailbox_reuse():
+    """Keep receive slots and peer shared memory live across persistent work items."""
+    cfg = by_name("CONFIG_sm100_128x32x128_128x32x32_cluster1x1_1ctamma")
+    g, A, B, C = _splitk_graph(1, 129, 8192, 2048)
+    plan = _jit_splitk(g, 2, base_cfg=cfg, cluster_k_reduce=True)
+    assert plan.config.cluster_k_reduce
+    a, b, out, ref = _splitk_data(1, 129, 8192, 2048)
+    for scale in (1, 2, 4):
+        out.fill_(float("nan"))
+        _run_splitk(plan, {A: a, B: b, C: out})
+        torch.testing.assert_close(out, ref * scale, atol=0, rtol=0)
+        a.mul_(2)
 
 
 @requires_sm100
@@ -3715,7 +3947,9 @@ def test_splitk_deterministic():
 
 
 def test_splitk_workspace_size_and_missing_workspace():
-    B, M, N, K, S = 2, 256, 384, 4096, 4
+    """Report FP32 partial storage and require the caller to provide it."""
+    # Workspace split-K remains valid even when all slices cannot fit a cluster.
+    B, M, N, K, S = 2, 256, 384, 4096, 32
     g, A, Bt, C = _splitk_graph(B, M, N, K)
     compiled = _jit_splitk(g, S)
     assert compiled.workspace_bytes == -(-S * B * M * N * 4 // 128) * 128
@@ -3773,7 +4007,7 @@ def _run_splitk_vs_dense(g, S, M, N, K, outs_fn, aux_fn=lambda p: []):
     ids=("row_aux", "per_col_aux", "two_taps_stg"),
 )
 def test_splitk_epilogue_fusion(kind, N, S):
-    """The graph's epilogue runs in kernel 2 on the reduced sum."""
+    """The graph's epilogue runs once on the reduced sum for either backend."""
     if kind == "row_aux" and _current_arch() == 120:
         pytest.skip("the dense sm120 template hoists per-row aux loads before `row` is defined (no S=1 reference)")
     M, K = 256, 4096
@@ -3792,7 +4026,7 @@ def test_splitk_epilogue_m_major_output():
 
 
 def test_splitk_epilogue_reduction():
-    """relu + AMAX beside the dense output: the atomic runs in kernel 2."""
+    """relu + AMAX beside the dense output, after the split reduction."""
     M, N, K = 256, 256, 4096
     g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])

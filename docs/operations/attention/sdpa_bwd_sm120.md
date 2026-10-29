@@ -14,9 +14,11 @@ Two integration surfaces are provided:
 
 * a standalone wrapper (documented below), `cudnn.sdpa_bwd_wrapper_dsl_sm120`, and
 * a FROST engine (`sdpa_bwd_sm120`, see `cudnn.sdpa.bwd.engines`) that serves
-  single-node `sdpa_backward()` graphs built with `cudnn.pygraph` when
-  selected from the ranked plan list (`graph.plans` /
-  `graph.select_plan(i)`) with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`.
+  single-node `sdpa_backward()` graphs built with `cudnn.pygraph`. It is a
+  default candidate ranked behind the backend, so the default dispatch uses it
+  when the backend declines a graph; select it explicitly from the ranked plan
+  list (`graph.plans` / `graph.select_plan(i)`), or set
+  `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` to rank it first.
 
 The kernels live in `python/cudnn/sdpa/bwd/kernels/sm120/`: the fused five-GEMM
 main kernel and its per-shape `compile()` in `bprop_f16.py`, the SM120-only
