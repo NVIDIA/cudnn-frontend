@@ -625,7 +625,7 @@ def _exp2_fma_split_for(device_cc: tuple[int, int], *, kind: str, flavor: tuple[
     return bool((kind, tuple(flavor)) in kernels and tuple(device_cc) in _EXP2_FMA_SPLIT_CC)
 
 
-def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[int, int], pertensor: bool = True) -> tuple[int, ...]:
+def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[int, int], pertensor: bool = True, fp8_o: bool = False) -> tuple[int, ...]:
     """CGA widths the STANDALONE adapter serves for a kernel flavor.
 
     A module-level function, not an inline expression in ``check_support``, so a
@@ -649,7 +649,8 @@ def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[i
     ``cgas={2}``.  Keep the three in lockstep.
     """
     if device_cc == (10, 7) and fp8 and flavor == (192, 128):
-        return (2,)
+        # The per-tensor kernel with an fp8 O keeps its last slab inside the version-0 descriptor window at cga1.
+        return (1, 2) if (pertensor and fp8_o) else (2,)
     if flavor == (192, 128):
         return (1, 2)
     if device_cc == (10, 7) and not fp8 and flavor in _SM107_F16_SMALL_D_SHAPES:
@@ -2929,7 +2930,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             else (
                 ((2,) if self.flavor in ((256, 256), SM100_NATIVE_D576_SHAPE) else (1,))
                 if self.packed_thd_split
-                else supported_cgas_for(self.flavor, fp8=self._fp8, device_cc=self._device_cc, pertensor=self._pertensor)
+                else supported_cgas_for(
+                    self.flavor, fp8=self._fp8, device_cc=self._device_cc, pertensor=self._pertensor, fp8_o=getattr(self, "dtype_o", None) in _SM100_FP8_DTYPES
+                )
             )
         )
         # Only a non-None request is checked: None means "let the lowering pick",

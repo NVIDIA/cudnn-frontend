@@ -2445,3 +2445,34 @@ def test_sm121_causal_scheduler_walks_naturally_past_one_stream_per_sm():
     assert plans(b=3)[0].knobs.sched_policy == SCHED_LPT_L2  # 48 streams: one per SM
     assert plans(device_cc=(12, 0), device_sm_count=188)[0].knobs.sched_policy == SCHED_LPT_L2
     assert plans(device_cc=(12, 0), device_sm_count=36)[0].knobs.sched_policy == SCHED_LPT_L2
+
+
+def test_sm107_pt_fp8_d192_mha_causal_fp8_o_lists_the_single_cta(sm107_metadata_target):
+    """The 107-line per-tensor FP8 d192x128 row lists both widths for a dense unsplit MHA causal graph with an fp8 O inside the
+    K/V budget, and the auto pick takes the single CTA; a half-precision O, GQA, a mask-free graph or a larger K/V set keep cga2."""
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT
+    from cudnn.sdpa.fwd.engines import effective_cgas
+    from cudnn.sdpa.fwd.heuristics import _auto_sched_cga
+
+    fp8_name = engines.engine_name(fp8=True, arch="sm107")
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == fp8_name)
+    base = dict(
+        is_fp8=True,
+        b=2,
+        h_q=64,
+        h_kv=64,
+        s_q=2048,
+        s_kv=2048,
+        d_qk=192,
+        d_v=128,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.FP8_E4M3,
+        device_cc=(10, 7),
+        device_sm_count=212,
+    )
+    assert effective_cgas(spec.capabilities, _facts(**base)) == frozenset({1, 2})
+    from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
+
+    assert _auto_sched_cga(spec, _facts(**base), split_kv=1, sched_policy=SCHED_NATURAL) == (SCHED_LPT, 1)
+    for off in (dict(dtype_o=cudnn.data_type.BFLOAT16), dict(h_kv=8), dict(causal=False), dict(h_q=128, h_kv=128)):
+        assert effective_cgas(spec.capabilities, _facts(**{**base, **off})) == frozenset({2}), off
