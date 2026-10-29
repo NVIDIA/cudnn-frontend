@@ -445,10 +445,14 @@ def test_frost_gemm_declines_a_split_k_record_for_a_tile_invariant_fp32_sum(monk
 
     from cudnn.gemm.frost import compiler
 
+    # Past the automatic pick's 2048-byte K floor (the module's K=256 is not), so only the drift rule keeps the
+    # listed record unsplit: without it, this graph lists SPLIT_K_SLC=2 on a 188-SM RTX PRO 6000.
+    k = 4096
+
     def graph():
         g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-        A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
-        B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
+        A = g.tensor(name="A", dim=[1, M, k], stride=[M * k, k, 1], data_type=cudnn.data_type.BFLOAT16)
+        B = g.tensor(name="B", dim=[1, k, N], stride=[k * N, 1, k], data_type=cudnn.data_type.BFLOAT16)
         Y = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="r")
         Y.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
         R = g.reduction(input=Y, mode=cudnn.reduction_mode.AVG, name="red")
@@ -473,6 +477,42 @@ def test_frost_gemm_declines_a_split_k_record_for_a_tile_invariant_fp32_sum(monk
     replay.check_support()
     with pytest.raises(NotImplementedError, match="frost_gemm: .*fp32 avg reduction over all of M and N"):
         replay.build_plans()
+
+
+@pytest.mark.parametrize("swapped", (False, True), ids=("plain", "swap_ab"))
+def test_sm120_split_k_gate_declines_tile_invariant_fp32_sums(swapped):
+    """Host-only (no kernel, no GPU work): the SM120 split-K gate that explicit configs, replayed records and the
+    automatic pick share declines an fp32 sum over all of M and N, per batch or over the batch too, also under
+    swap-AB (``swap_ab`` swaps a reduction's M and N extents). Modes exact under atomics (AMAX, an int32 ADD)
+    and per-row / per-column sums keep the split."""
+    from dataclasses import replace
+
+    from cudnn.gemm.frost.fusion_ir import swap_ab
+    from cudnn.gemm.frost.graph_analyzer import analyze
+    from cudnn.gemm.frost.sm120 import compiler
+
+    cfg = replace(by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"), split_k_slices=2, swap_ab=swapped)
+
+    def reason(mode, dim, batch=1, dtype=cudnn.data_type.FLOAT):
+        g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        A = g.tensor(name="A", dim=[batch, M, K], stride=[M * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
+        B = g.tensor(name="B", dim=[batch, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
+        Y = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="r")
+        Y.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+        R = g.reduction(input=Y, mode=getattr(cudnn.reduction_mode, mode), compute_data_type=dtype, name="red")
+        R.set_dim(dim).set_stride([dim[1] * dim[2], dim[2], 1]).set_output(True).set_data_type(dtype)
+        chain = analyze(g)
+        # probe_chain and jit_from_cudnn_graph gate the swapped view of a swap-AB config
+        return compiler._splitk_reject_reason(swap_ab(chain) if swapped else chain, cfg)
+
+    for mode in ("ADD", "AVG", "NORM1", "NORM2"):
+        for batch, dim in ((1, [1, 1, 1]), (2, [2, 1, 1]), (2, [1, 1, 1])):
+            assert f"fp32 {mode.lower()} reduction over all of M and N" in (reason(mode, dim, batch) or ""), (mode, dim)
+    assert reason("AMAX", [1, 1, 1]) is None
+    assert reason("ADD", [1, 1, 1], dtype=cudnn.data_type.INT32) is None
+    for mode in ("ADD", "AVG"):
+        assert reason(mode, [1, M, 1]) is None  # per row
+        assert reason(mode, [1, 1, N]) is None  # per column
 
 
 def test_analyzer_declines_a_graph_without_a_gemm():
