@@ -307,3 +307,31 @@ def test_staged_execution_preserves_other_current_device(explicit_stream):
             assert torch.cuda.current_device() == 1, "staged execution leaked Q's device into the caller"
         launch.synchronize()
         _check(case)
+
+
+@pytest.mark.parametrize("graph_api", [False, True])
+@pytest.mark.parametrize("pair", [("dq", "dk"), ("dq", "dv"), ("dk", "dv")])
+def test_native_overlapping_gradients_rejected_before_writes(graph_api, pair):
+    case = _case(96, 96, hk=4)
+    api, workspace = _adapter(case)
+    assert api._prepared is not None
+    first, second = pair
+    bad = dict(case.bufs)
+    bad[second] = bad[first]
+    ws = case.workspace if graph_api else workspace
+    ws.fill_(0xBD)
+    for role in ("dq", "dk", "dv"):
+        case.bufs[role].fill_(17)
+    with pytest.raises(ValueError, match=first + " overlaps " + second):
+        if graph_api:
+            case.graph.execute({case.refs[role]: tensor for role, tensor in bad.items()}, ws)
+        else:
+            _execute(api, bad, ws)
+    assert (ws == 0xBD).all(), "overlap rejection must precede accumulator initialization"
+    for role in ("dq", "dk", "dv"):
+        assert (case.bufs[role] == 17).all(), "overlap rejection must precede output writes"
+    if graph_api:
+        case.graph.execute(case.pack, ws)
+    else:
+        _execute(api, case.bufs, ws)
+    _check(case)

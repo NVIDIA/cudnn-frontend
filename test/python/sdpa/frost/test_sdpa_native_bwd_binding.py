@@ -562,3 +562,48 @@ def test_d128_thd_guard_includes_the_last_prefix_element(arch, role):
     with pytest.raises(ValueError, match="overlaps"):
         prep.execute(spec, current, _WORKSPACE, 29)
     assert len(frames) == 1
+
+
+@pytest.mark.parametrize("pair", [("dq", "dk"), ("dq", "dv"), ("dk", "dv")])
+@pytest.mark.parametrize("raw_storage", [False, True])
+def test_sm80_gradient_overlap_rejected_before_entry(pair, raw_storage):
+    spec, _, facts, geometry, frames = _fixture("sm80", features=False)
+    spec = replace(spec, native_binding=True)
+    prep.execute(spec, facts, _WORKSPACE, 17, raw_storage=raw_storage, geometry=geometry)
+    first, second = pair
+    for shift in (0, 16, 64):
+        bad = dict(facts)
+        bad[second] = bad[second]._replace(ptr=bad[first].ptr + shift)
+        with pytest.raises(ValueError, match=first + " overlaps " + second):
+            prep.execute(spec, bad, _WORKSPACE, 17, raw_storage=raw_storage, geometry=geometry)
+    assert len(frames) == 1, "invalid gradients must be rejected before any launch"
+    prep.execute(spec, facts, _WORKSPACE, 29, raw_storage=raw_storage, geometry=geometry)
+    assert len(frames) == 2
+
+
+@pytest.mark.parametrize("strides", [(96, 48, 16, 1), (192, 16, 64, 1), (256, 64, 16, 1)])
+def test_sm80_shared_gradient_storage_matches_address_oracle(strides):
+    from itertools import product
+
+    spec, _, facts, _, frames = _fixture("sm80", features=False)
+    shape = (2, 2, 3, 8)
+    offsets = {sum(i * s for i, s in zip(index, strides)) for index in product(*(range(n) for n in shape))}
+    span = max(offsets) + 1
+    ops = list(spec.operands)
+    for role in ("dk", "dv"):
+        i = spec.roles.index(role)
+        ops[i] = replace(ops[i], shape=shape, strides=strides, span=span)
+        facts[role] = facts[role]._replace(shape=shape, strides=strides, span=span)
+    spec = replace(spec, operands=tuple(ops), native_binding=True)
+    # Includes exact and shifted overlap, legal interleaved runs, and finite
+    # disjoint layouts that cannot be separated by a stride-GCD check alone.
+    for delta in range(0, span + 16, 8):
+        current = dict(facts, dv=facts["dv"]._replace(ptr=facts["dk"].ptr + 2 * delta))
+        overlap = not offsets.isdisjoint({x + delta for x in offsets})
+        if overlap:
+            with pytest.raises(ValueError, match="dk overlaps dv"):
+                prep.bind(spec, current, _WORKSPACE, 17)
+        else:
+            frame = prep.bind(spec, current, _WORKSPACE, 17)
+            assert frame[spec.roles.index("dv")] == current["dv"].ptr
+    assert not frames
