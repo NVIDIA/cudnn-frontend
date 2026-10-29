@@ -472,6 +472,26 @@ def check_shapes(recipe: GemmRecipe, operands, mnk, axes) -> None:
     _raise_first(reasons)
 
 
+def check_split_k_shape(k: int, n: int, batch: int, slices: int, cta_k_elems: int, reducer_elems: int = 1) -> None:
+    """Validate split-K extents before any writes, for either reduction mode.
+
+    An empty K slice has no initialized accumulator to publish. Workspace
+    reduction additionally requires the N chunk chosen when the plan was built.
+    Both compiler families and their diagnostics use this same check.
+    """
+    tiles = (k + cta_k_elems - 1) // cta_k_elems
+    if tiles < slices:
+        raise ValueError(
+            f"cudnn.frost gemm: split_k_slices={slices} exceeds the {tiles} K tile(s) of K={k}; " "the plan was built for a deeper K — rebuild for this shape"
+        )
+    if batch * slices > 65535:
+        raise ValueError(f"cudnn.frost gemm: batch={batch} * split_k_slices={slices} exceeds the CUDA grid.z limit of 65535")
+    if n % reducer_elems:
+        raise ValueError(
+            f"cudnn.frost gemm: N={n} is not a multiple of the reducer chunk ({reducer_elems} elements) " "this plan was built with — rebuild for this shape"
+        )
+
+
 def check_alignment(recipe: GemmRecipe, operands, axes) -> None:
     """Does every buffer meet the width its role's accesses were compiled for?
 

@@ -941,6 +941,7 @@ cudnn.knob.type
 cudnn.knob_type
 cudnn.knob_type.ARRAY_SIZE_PER_THREAD
 cudnn.knob_type.BLOCK_SIZE
+cudnn.knob_type.CLUSTER_K_REDUCE
 cudnn.knob_type.CTA_COUNT
 cudnn.knob_type.CTA_GROUP
 cudnn.knob_type.EDGE

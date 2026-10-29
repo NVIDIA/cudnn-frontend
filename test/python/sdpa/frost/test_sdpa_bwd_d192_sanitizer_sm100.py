@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Tile-aligned dense D192 backward cases under Compute Sanitizer memory/sync checks (L1)."""
+"""Tile-aligned dense D192 and D64 FP8 backward cases under Compute Sanitizer memcheck and synccheck (L1)."""
 
 import os
 import shutil
@@ -15,8 +15,8 @@ from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell
 
 pytestmark = [pytest.mark.L1, requires_dsl]
 
-_FILES = ["test_sdpa_bwd_d192_accum_sm100.py", "test_sdpa_bwd_d192_fp8_sm100.py"]
-_SELECT = "(test_d192_accumulation and dense-bf16) or (test_dense and bf16)"
+_FILES = ["test_sdpa_bwd_d192_accum_sm100.py", "test_sdpa_bwd_d192_fp8_sm100.py", "test_sdpa_bwd_fp8_sm100.py"]
+_SELECT = "(test_d192_accumulation and dense-bf16) or (test_dense and bf16) or (test_d64 and causal and e4m3)"
 
 
 def _sanitizer():
@@ -27,7 +27,7 @@ def _sanitizer():
 
 
 def run_under_sanitizer(timeout, files=_FILES, select=_SELECT, tool="memcheck"):
-    """Run a sanitizer over a pytest selection in a child process group; the child dumps its own stack before the parent deadline."""
+    """A sanitizer tool over a pytest selection in a child process group; the child dumps its own stack before the parent deadline."""
     child = f"import faulthandler, sys\nfaulthandler.dump_traceback_later({timeout * 0.9!r})\nimport pytest\nsys.exit(pytest.main(sys.argv[1:]))\n"
     cmd = [_sanitizer(), "--tool", tool, "--report-api-errors", "no", "--error-exitcode", "9", sys.executable, "-u", "-c", child]
     cmd += [*files, "-k", select, "-p", "no:cacheprovider", "-q"]

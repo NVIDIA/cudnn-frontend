@@ -618,10 +618,12 @@ def build_gemm_plan(graph: cudnn.pygraph, knobs=None):
     ``ValueError`` (type + message preserved) on rejection."""
     if not _graph_has_gemm(graph):
         raise ValueError("cudnn.gemm.frost: graph has no matmul / moe_grouped_matmul node; nothing to compile")
-    from .compiler import _graph_dynamic_shapes, jit_from_cudnn_graph, plan_config, probe_chain
+    # The compiler consumes analyzer bindings; load it only when building a plan,
+    # after this module's definitions are available, rather than at import time.
+    from .compiler import _graph_dynamic_shapes, _graph_shapes_fixed, jit_from_cudnn_graph, plan_config, probe_chain
 
     chain = analyze(graph)
-    config = plan_config(chain, dynamic_shapes=_graph_dynamic_shapes(graph), knobs=knobs)
+    config = plan_config(chain, dynamic_shapes=_graph_dynamic_shapes(graph), knobs=knobs, shapes_fixed=_graph_shapes_fixed(graph))
     if knobs is not None:
         probe_chain(chain, config)
     return jit_from_cudnn_graph(graph, config=config)

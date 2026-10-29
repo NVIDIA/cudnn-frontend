@@ -696,6 +696,31 @@ treatment at the caller boundary.**
   cc 10.7 (Rule 7): a device-blind "available" is the blind spot that routes a
   cc 10.7 graph to the backend engine.
 
+**Rule 10 — a kwarg that makes a graph ineligible for the python engines is
+read by the family's analyzer under the spelling of EVERY op that takes it.**
+
+- The analyzer's record is the node's kwargs verbatim
+  (`sdpa/graph_analyzer._record_from_node`), and the rows gate on FACTS derived
+  from it; a capability no row claims still needs its fact, because the decline
+  by name is what keeps the graph on the backend -- a False fact is a silent
+  admission. `sdpa()` / `sdpa_backward()` spell the score modifier `score_mod` /
+  `score_mod_bprop`, `sdpa_fp8()` spells it `fn`; `has_score_mod` read only `fn`,
+  so to the rows no f16 graph ever had a modifier. The moment 1.31 gave the
+  SM100 prefill row a d64 flavor it served TransformerEngine's flex-attention
+  graphs (b2 h4 s16 d64) as plain attention and the modifier was dropped
+  (post-scale bias: 38 % of O outside 5e-2; softcap: 33 / 8192 elements). It
+  surfaced as an apparent cuDNN 9.27 -> 9.28 regression in TransformerEngine's
+  flex-attention tests; the change that mattered was the FE python package
+  1.30 -> 1.31 in the same test-container refresh.
+- When an op gains a kwarg a kernel cannot honor, add the spelling to the
+  analyzer and a cell to the detector in the same change; `graph.selected_engine`
+  on a graph with the kwarg is the one-line check.
+- Detectors: `test/python/sdpa/frost/test_sdpa_score_mod_decline.py` (host-only:
+  the fact on every spelling, every fwd / bwd row declines, the row admitting
+  the control graph declines by name) and
+  `test/python/sdpa/graph/test_flexible_sdpa_te_shape.py` (the TE shape is
+  served by the backend and O carries the modifier).
+
 ## Frontend-only kernel package layout
 
 ```
@@ -806,6 +831,13 @@ reference; `sdpa/frost/test_sdpa_thd_tensormap_acquire.py` and
 surrounding descriptor replacement, data visibility, and pipeline synchronization
 have different contracts and remain required.
 
+**Every TMA scatter4 source needs 128-byte SMEM address alignment.** An aligned
+ring base does not align each four-row issue: a 16-byte staging row advances
+only 64 bytes, so every second issue faults. Select STG for such staging pitches
+unless padding is included in both the layout and resource accounting. Detector:
+`gemm/frost/test_moe_grouped_block_scale_matmul_fwd.py::test_moe_block_scale_narrow_n_routing`
+(`scatter-False-24`, including capture/replay), verified RED before the store gate.
+
 For fractional-microsecond performance changes, repeat A/B with shared addresses,
 reversed construction order, and an independently compiled unchanged-source
 control. An A/A that shares one compiled kernel does not bound the variation
@@ -814,6 +846,79 @@ Also check that an optimization's admission condition is exercised by the
 repository benchmark shapes or a documented target workload. A favorable
 synthetic shape establishes a local effect, not representative benefit; it does
 not by itself justify another compile-cache specialization.
+
+Resident block-scale SF words use only TMEM left after the accumulator staging
+decision. Account for every distinct operand, M block and word; fake-dequant
+sides continue to read their initialized slot zero. Keep the SF-ready/AB-ready
+waits and producer-stage release intact when moving the copies. Detectors:
+`test_block_scale_resident_sf_tmem_budget`, `test_block_scale_resident_sf_exact_fit`
+and the existing one-sided-dequant numerics in `gemm/frost/test_block_scale_matmul.py`.
+
+An `empty` mailbox acknowledgement must order prior reads before a producer
+overwrites the slot. Read-only consumers still need this write-after-read
+ordering; `bar.warp.sync` alone does not establish it with a producer outside
+that warp. Keep the MoE scheduler's release arrives unless a separate ordering
+proof covers every slot load. Numeric/racecheck success alone is not that proof.
+`test_moe_block_scale_mailbox_acknowledgements_order_prior_reads` in the existing
+`gemm/frost/test_template_epilogue_parity.py` pins this until such a proof exists.
+
+Small-M block-scale planning uses `GemmFacts.shapes_fixed` to distinguish fixed
+graphs from override-enabled graphs. Only fixed shapes select token widths
+8/16/32 after swapAB; overrides keep width 64 and at most 48 weight tiles.
+Dynamic shapes bypass strategy selection, and explicit knob replay bypasses
+automatic choices. Keep this bounded rule in shared `gemm/frost/planning.py`,
+probe both its proposed plan and any retained baseline, and leave fitted cost
+coefficients unchanged. Automatic candidates still use workspace reduction.
+The B200-targeted rule leads on SM100; other GPUs retain the existing first
+choice and include the new geometry as an autotuning candidate. A four-shape
+SM107 comparison found both wins and regressions from unconditional preference.
+
+The dense SM100, mainloop-fusion, block-scale and SM103 hosts resolve the L2
+swizzle width once per call from the current logical M/N/K, then pass an Int32
+kernel argument. Do not compute this shape-only division chain in each warp.
+Keep the mixed-CGA pinned identity mapping and the shared helper's runtime
+width-one division bypass. MoE still resolves its per-group raster on device
+because the group extents are device data.
+
+Narrow block-scale tiles here extract arbitrary SF sub-rows, including across
+128-row atoms. They have no kernel-N <= 32 requirement: explicit narrow replay
+on override/dynamic graphs remains legal, with SF capacity and output checks on
+every call. Do not import the restricted narrow implementation's shape gates.
+Automatic small-M planning still uses the fixed/override/dynamic rules above.
+
+`TileConfig.cluster_k_reduce` explicitly selects the split-K reduction mode.
+False (including old knob records) uses workspace plus a separate reducer;
+True puts all slices in one cluster and reports zero partial workspace.
+The K cluster dimension is derived from this flag and `split_k_slices`, never
+an independent tuning axis. Reject unsupported templates, unlaunchable clusters
+and insufficient SMEM; never change a requested mode during build or execute.
+Automatic planning retains False. Keep the flag in canonical names and public
+knob round-trips. Epilogue codegen takes `workspace_split_k` directly; do not
+rewrite the config's split count or wrap template regions through source regexes.
+Keep cluster device code only in templates that implement the full protocol;
+mainloop fusion and SM103 must contain no incomplete cluster branches. The
+epilogue parity test compares their shared base drain with the supported
+templates after removing only cluster reduction and its root-write predicate.
+Other bounds, loads and stores remain part of that comparison. Name the cluster
+CTA barrier and derive both its participant count and fragment span from the
+caller's epilogue warp count.
+For the SM100 dense and block-scale cluster implementations, every
+epilogue lane, including masked output lanes, stages its fragment before an
+async-proxy fence and CTA rendezvous. Elected bulk copies register their byte
+counts at the root before issue. The root waits for transaction completion,
+reads local receive slots and gathers all readers before a release/acquire
+acknowledgement at cluster scope. Budget S fragment slots (S-1 receive plus one
+local source), not S full accumulator tiles. Keep the cluster exit
+rendezvous: `test_cluster_splitk_persistent_mailbox_reuse` exposed both slot
+reuse hazards with an elected-only handoff and premature DSMEM lifetime under
+racecheck. Gate TMA compute and stores together in one SSA region; separate
+guards leave the store's vectors undefined. For mixed-width block-scale inputs,
+CTA-K elements use the wider operand's bit width after either orientation;
+`test_cluster_splitk_mixed_width_k_tiles_after_swap` covers shallow legal K.
+Both compiler families use `recipe.check_split_k_shape` in the launch guard
+and `explain()`: every split must have a K tile, and workspace reduction must
+retain its compiled N chunk. Check before seeds, workspace writes or launch;
+reject without changing the selected reduction mode.
 
 ## The public function contract
 

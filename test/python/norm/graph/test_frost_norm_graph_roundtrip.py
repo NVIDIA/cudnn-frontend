@@ -177,6 +177,10 @@ if __name__ == "__main__":
 @pytest.mark.L0
 def test_frost_norm_graph_roundtrip():
     """pytest entry point; this module also runs standalone via ``__main__``."""
+    from norm_test_utils import frost_norm_rows_offered_here
+
+    if not torch.cuda.is_available() or not frost_norm_rows_offered_here():
+        pytest.skip("no norm engine row on offer serves this device")
     try:
         main()
     except SystemExit as exc:

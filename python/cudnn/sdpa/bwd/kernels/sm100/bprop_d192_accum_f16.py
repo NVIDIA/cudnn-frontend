@@ -12,7 +12,7 @@ from cutlass.base_dsl.typing import Pointer
 from cutlass.experimental import primitives as nvvm
 from cutlass.experimental.cuda import tensor_map as tmap
 
-from cudnn.frost.tile_dsl.barrier import MBarrier, PipelineState, Producer, advance
+from cudnn.frost.tile_dsl.barrier import MBarrier, PipelineState, Producer, advance, named_barrier_fence
 from cudnn.frost.tile_dsl.handles import GmemTileTma, MmaDesc, SmemTile
 from cudnn.frost.tile_dsl.mma import mma_ss, mma_ts_step
 from cudnn.frost.tile_dsl.pointwise import ffma2, fmul2, fp32_to_fp16
@@ -204,9 +204,7 @@ def _stat_publish(slab, row, group, slot, qbase, sq, scale, val):
             _view(slab, CFG.STATS + slot * 256, cutlass.Float32, CFG.N).subview(row).store(stat)
         else:
             _view(slab, CFG.DELTA + slot * 256, cutlass.Float32, CFG.N).subview(row).store(-scale * val)
-    # Only softmax warps participate. The experimental primitive emits the
-    # non-aligned barrier.cta.sync required inside this warp-role branch.
-    nvvm.barrier_cta_sync(barrier_id=CFG.SOFTMAX_BARRIER, thread_count=CFG.SOFTMAX_LANES)
+    named_barrier_fence(CFG.SOFTMAX_BARRIER, CFG.SOFTMAX_LANES)
 
 
 @cute.jit
@@ -467,7 +465,6 @@ def _mma_loop(
     causal: cutlass.Constexpr[bool],
     dtype: cutlass.Constexpr,
 ):
-    _service_regs()
     score = _mma_desc(dtype, CFG.M, CFG.N, CFG.DQK)
     dpdesc = _mma_desc(dtype, CFG.M, CFG.N, CFG.DV)
     dvdesc = _mma_desc(dtype, CFG.M, CFG.DV, CFG.N, btranspose=True)
@@ -563,7 +560,6 @@ def _load_loop(
     causal: cutlass.Constexpr[bool],
     dtype: cutlass.Constexpr,
 ):
-    _service_regs()
     q_state = PipelineState.start(phase=1)
     do_state = PipelineState.start(phase=1)
     kv_state = PipelineState.start(phase=1)
@@ -622,7 +618,6 @@ def _store_loop(
     causal: cutlass.Constexpr[bool],
     dtype: cutlass.Constexpr,
 ):
-    _service_regs()
     full_state = PipelineState.start()
     out_state = PipelineState.start()
     sched_state = PipelineState.start()
@@ -654,7 +649,6 @@ def _store_loop(
 
 @cute.jit
 def _scheduler_loop(bars, sched):
-    _service_regs()
     state = PipelineState.start()
     valid = cutlass.Int32(1)
     while valid != 0:
@@ -712,6 +706,10 @@ def bprop_d192_accum_kernel(
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
     tmem_base = tmem_slot.load()
+    # setmaxnreg is warpgroup-aligned: the four service warps must release
+    # registers at the same instruction before their individual role branches.
+    if warp >= 12:
+        _service_regs()
     if warp < 8:
         _softmax_loop(slab, bars, sched, tmem_base, lse, delta, block, head, batch, sq, skv, nk, nheads, batch_heads, swizzle, scale, causal, dtype)
     elif warp < 12:

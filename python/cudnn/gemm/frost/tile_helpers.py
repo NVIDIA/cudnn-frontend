@@ -19,6 +19,7 @@ from __future__ import annotations
 import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
+import cutlass._mlir_helpers.vector as _cvec
 from cutlass._mlir.dialects import llvm
 
 
@@ -26,18 +27,21 @@ from cutlass._mlir.dialects import llvm
 def l2_swizzle_tile(raw_m, raw_n, nt_m, nt_n, swizzle_w, identity=False):
     """N-direction super-block rasterization of the (m, n) cgrp-tile coord, for
     L2 reuse. ``identity=True`` compiles out the general mapping when the caller
-    knows that ``swizzle_w == 1``.
+    knows that ``swizzle_w == 1``. A launch-time width of one also bypasses
+    the divisions, without specializing a separate kernel for each shape.
     """
     if cutlass.const_expr(identity):
         return raw_m, raw_n
-    t = raw_n * nt_m + raw_m
-    blk = nt_m * swizzle_w
-    sb = t // blk
-    off = t - sb * blk
-    base_n = sb * swizzle_w
-    cur_S = cutlass.min(cutlass.Int32(swizzle_w), nt_n - base_n)
-    log_m = off // cur_S
-    log_n = base_n + off - log_m * cur_S
+    log_m, log_n = raw_m, raw_n
+    if swizzle_w != 1:
+        t = raw_n * nt_m + raw_m
+        blk = nt_m * swizzle_w
+        sb = t // blk
+        off = t - sb * blk
+        base_n = sb * swizzle_w
+        cur_S = cutlass.min(cutlass.Int32(swizzle_w), nt_n - base_n)
+        log_m = off // cur_S
+        log_n = base_n + off - log_m * cur_S
     return log_m, log_n
 
 
@@ -57,6 +61,83 @@ def epi_subtile_spans(cols, epi_n=32):
 
 
 TENSOR_MAP_QWORDS = 16
+CLUSTER_K_REDUCE_BARRIER_ID = 4
+
+
+@cute.jit
+def cluster_split_k_reduce(
+    partial, mailbox, ready, free, iteration, k_rank, root_rank, plane_ctas: cutlass.Constexpr, slices: cutlass.Constexpr, epilogue_threads: cutlass.Constexpr
+):
+    """Bulk-copy one fragment per peer to reusable slots on its K-rank-zero CTA.
+
+    All epilogue lanes participate before output masking. A producer publishes
+    its CTA-local staging before the elected bulk copy; transaction completion
+    makes the root's local reads safe. Root lanes rendezvous before the release
+    acknowledgement, so neither receive nor source slots can be reused early.
+    ``epilogue_threads`` covers exactly the caller's participating epilogue warps.
+    """
+    tid = cute.arch.thread_idx()[0]
+    warp = cute.arch.warp_idx()
+    elected = nvvm.elect_sync()
+    values = partial.to_elements()
+    chunk_elems = epilogue_threads * len(values)
+    phase = iteration & 1
+    result = partial
+    if k_rank != 0:
+        staging = mailbox.subview((slices - 1) * chunk_elems)
+        for q in cutlass.range_constexpr(len(values) // 4):
+            staging.data_ptr(tid * len(values) + q * 4).store(partial[q * 4 : q * 4 + 4], alignment=16)
+        cute.arch.fence_proxy("async.shared", space="cta")
+        nvvm.barrier_cta_sync(barrier_id=CLUSTER_K_REDUCE_BARRIER_ID, thread_count=epilogue_threads)
+        if warp == 0:
+            remote_ready = nvvm.mapa(ready, root_rank)
+            if elected:
+                nvvm.mbarrier_arrive_expect_tx(remote_ready, chunk_elems * 4, scope=nvvm.MemScope.CLUSTER)
+            if elected:
+                nvvm.cp_async_bulk_shared_cluster_shared_cta(
+                    nvvm.mapa(mailbox.subview((k_rank - 1) * chunk_elems), root_rank), staging, remote_ready, chunk_elems * 4
+                )
+        while not nvvm.mbarrier_try_wait_parity(free, phase, time_limit=10_000_000, scope=nvvm.MBarrierScope.CLUSTER):
+            pass
+    else:
+        while not nvvm.mbarrier_try_wait_parity(ready, phase, time_limit=10_000_000, scope=nvvm.MBarrierScope.CLUSTER):
+            pass
+        summed = list(values)
+        for peer in cutlass.range_constexpr(1, slices):
+            for q in cutlass.range_constexpr(len(values) // 4):
+                incoming = mailbox.load((peer - 1) * chunk_elems + tid * len(values) + q * 4, vector_size=4, alignment=16)
+                for e in cutlass.range_constexpr(4):
+                    summed[q * 4 + e] = summed[q * 4 + e] + incoming[e]
+        result = _cvec.Vector.from_elements(tuple(summed), cutlass.Float32)
+        nvvm.barrier_cta_sync(barrier_id=CLUSTER_K_REDUCE_BARRIER_ID, thread_count=epilogue_threads)
+        if warp == 0:
+            for peer in cutlass.range_constexpr(1, slices):
+                if elected:
+                    nvvm.mbarrier_arrive(nvvm.mapa(free, root_rank + peer * plane_ctas), scope=nvvm.MemScope.CLUSTER)
+    return result
+
+
+@cute.jit
+def extract_block_scale_sfb(stage, n_start, tile_n: cutlass.Constexpr, k_atoms: cutlass.Constexpr, stage_bytes: cutlass.Constexpr):
+    """Extract a tcgen05 N sub-tile in place from one or two F8_128x4 blocks.
+
+    All lanes gather the source words before overwriting each atom. The result
+    starts at row zero, keeping scale_b at its aligned TMEM base for every N.
+    Call warp-wide after the stage's SF-ready wait and before its UTCCP copies.
+    """
+    words = cutlass.Array(base=stage.data_ptr(), shape=stage_bytes // 4, dtype=cutlass.Uint32)
+    lane = cute.arch.lane_idx()
+    for atom in cutlass.range_constexpr(k_atoms):
+        values = []
+        for col in cutlass.range_constexpr((tile_n + 31) // 32):
+            row = n_start + cutlass.min(lane + col * 32, tile_n - 1)
+            src = (row // 128) * (128 * k_atoms) + atom * 128 + (row % 32) * 4 + (row % 128) // 32
+            values.append(words.data_ptr(src).load())
+        nvvm.bar_warp_sync(0xFFFFFFFF)
+        for col in cutlass.range_constexpr((tile_n + 31) // 32):
+            words.data_ptr(atom * 128 + lane * 4 + col).store(values[col])
+    cute.arch.fence_proxy("async.shared", space="cta")
+    nvvm.bar_warp_sync(0xFFFFFFFF)
 
 
 def moe_swizzle_tile(t, nt_m, nt_n, swizzle_w):
@@ -493,12 +574,13 @@ def moe_gather_scales(
         pass
     src_words = cutlass.inttoptr(scratch.data_ptr().toint(), 3, cutlass.Uint32)
     dst_words = cutlass.inttoptr(dst.data_ptr().toint(), 3, cutlass.Uint32)
-    for i in cutlass.range(rows * (scales // 4) // 32, unroll_full=True):
+    for i in cutlass.range((rows * (scales // 4) + 31) // 32, unroll_full=True):
         word = lane + i * 32
-        row = word // (scales // 4)
-        kw = word % (scales // 4)
-        packed = (row // 128) * (128 * (scales // 4)) + kw * 128 + (row % 32) * 4 + (row % 128) // 32
-        (dst_words + packed).store((src_words + (row // 4) * 32 + (row % 4) * 4 + (scale_k % 16) // 4 + kw).load())
+        if word < rows * (scales // 4):
+            row = word // (scales // 4)
+            kw = word % (scales // 4)
+            packed = (row // 128) * (128 * (scales // 4)) + kw * 128 + (row % 32) * 4 + (row % 128) // 32
+            (dst_words + packed).store((src_words + (row // 4) * 32 + (row % 4) * 4 + (scale_k % 16) // 4 + kw).load())
     cute.arch.fence_view_async_shared()
     nvvm.bar_warp_sync(0xFFFFFFFF)
     with cute.arch.elect_one():

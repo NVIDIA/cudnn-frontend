@@ -21,7 +21,11 @@ from test_sdpa_bwd_d128_accum_sm100 import _require_accumulation
 _ADAPTER_MODULE = "cudnn.sdpa.bwd.api_dsl_sm100_d128_2cta"
 _HOST_MODULE = "cudnn.sdpa.bwd.kernels.sm100.prepared_d128_grouped_2cta_host"
 _IMPLEMENTATION = "accumulation_grouped_thd_2cta"
-_PAIR_CCS = ((10, 0), (10, 3))
+RECORD_ARCH = "sm_100a"  # the arch every committed rendering record is pinned on (frost_test_utils.read_kernel_record's default)
+# Exit codes of the fresh-process rows (the parents read them by name): the watchdog's HANG kill and the typed decline of the pair body.
+CHILD_EXIT_HANG = 70  # frost_test_utils.process_watchdog: os._exit(70) inside the kernel stage = HANG -> the barrier AUDIT, never a bigger budget
+CHILD_EXIT_SKIP = 77  # the child's pair body DECLINED by name on this device (make_adapter_2cta -> pytest.skip): the parent SKIPS with the reason
+_CHILD_SKIP_LINE = "CHILD_SKIP "
 
 
 def _adapter_class():
@@ -39,10 +43,27 @@ def _adapter_class():
 
 
 def _require_2cta():
+    """The pair-body GPU rows' part gate reads the library's own cc set (``CTA_PAIR_CCS``: the SM100 line, cc 10.0 / 10.3 -- never a copy of
+    it), so the forced two-CTA rows admit exactly the devices the library admits (#1985) and skip elsewhere.  Host rows never call it."""
+    from cudnn.sdpa.bwd.d128_grouped_2cta_contract import CTA_PAIR_CCS
+
     _require_accumulation()
     cc = torch.cuda.get_device_capability()
-    if cc not in _PAIR_CCS:
-        pytest.skip(f"the cta_group::2 d128 backward is served on SM100 / SM103 only; got {cc}")
+    if cc not in CTA_PAIR_CCS:
+        pytest.skip(f"forced cta_group::2 d128 backward requires cc in {CTA_PAIR_CCS}; got {cc}")
+
+
+def _check_support_or_skip(api):
+    """``api.check_support()`` with the library's TYPED decline (``NotImplementedError``: the cc / cluster / DSL / field predicates, by name)
+    mapped to a pytest skip that carries the decline text -- a device the pair body does not serve SKIPS every pair-body row, never fails it
+    (the sm80 / sm103 / sm120 CI lanes).  A ``ValueError`` (a field outside its domain) and any other exception propagate: those are bugs.
+    The library returns ``True`` or raises; a silent ``False`` is a library bug and fails here by name."""
+    try:
+        supported = api.check_support()
+    except NotImplementedError as error:
+        raise pytest.skip.Exception(f"pair body declined on this device: {error}") from None  # an explicit raise: static analysis sees it
+    assert supported is True, f"{type(api).__name__}.check_support() returned {supported!r} without a typed decline: a silent False is a library bug"
+    return api
 
 
 def make_adapter_2cta(case, *, compile_plan=True, declaration=None, **fields):
@@ -82,11 +103,30 @@ def make_adapter_2cta(case, *, compile_plan=True, declaration=None, **fields):
         setattr(api, name, value)
     if not compile_plan:
         return api
-    assert api.check_support()
+    _check_support_or_skip(api)
     api.compile()
     assert api._prepared.native is not None
     assert api._prepared.artifact.implementation == _IMPLEMENTATION
     return api
+
+
+def child_adapter(make, *args, **fields):
+    """In a FRESH child process (the skew / hang-repro rows): build the pair body through ``make`` (``make_adapter_2cta_stail`` or a sibling) or
+    exit ``CHILD_EXIT_SKIP`` with the decline on stdout -- the parent maps it to ``pytest.skip`` (``skip_if_child_declined``)."""
+    try:
+        return make(*args, **fields)
+    except pytest.skip.Exception as skipped:
+        print(f"{_CHILD_SKIP_LINE}{skipped}", flush=True)
+        sys.exit(CHILD_EXIT_SKIP)
+
+
+def skip_if_child_declined(proc, what):
+    """The parent side of ``child_adapter``: a child that exited ``CHILD_EXIT_SKIP`` skips this row with the child's reason (the decline text);
+    every other exit code is the caller's to read (``CHILD_EXIT_HANG``, 0, the child's own error)."""
+    if proc.returncode != CHILD_EXIT_SKIP:
+        return
+    line = next((ln[len(_CHILD_SKIP_LINE) :] for ln in proc.stdout.splitlines() if ln.startswith(_CHILD_SKIP_LINE)), None)
+    pytest.skip(f"[{what}] the child's {line or 'pair body declined by name (no reason line printed)'}")
 
 
 def run_case_2cta(case, repeats=2, **fields):
@@ -106,7 +146,7 @@ _RENDER = """
 import os, sys, re, glob
 os.environ["CUTE_DSL_DUMP_DIR"] = sys.argv[1]
 os.environ["CUTE_DSL_KEEP"] = "ptx"
-os.environ["CUTE_DSL_ARCH"] = "sm_100a"
+os.environ["CUTE_DSL_ARCH"] = {arch!r}
 os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
 import cutlass
 from {host} import compile_host
@@ -114,12 +154,13 @@ ports = ("q", "k", "v", "o", "do", "dq", "dk", "dv", "stats")
 B, H, HK = 2, 8, 2
 ts = lambda p: H if p == "stats" else (HK if p in ("k", "v", "dk", "dv") else H) * 128
 specs = tuple((i, 1, ts(p), "int32") for i, p in enumerate(ports))
-compile_host((B, H, HK, True), specs, tuple("int32" for _ in ports), cutlass.BFloat16, True, 100, **{form_kw})
+compile_host((B, H, HK, True), specs, tuple("int32" for _ in ports), cutlass.BFloat16, True, {sm}, **{form_kw})  # sm = the device cc as the prepared module passes it
 ptx_file = sorted(glob.glob(os.path.join(sys.argv[1], "*.ptx")), key=os.path.getmtime)[-1]
 ptx = open(ptx_file, "rb").read()
 import hashlib
 print("PTX_MD5", hashlib.md5(ptx).hexdigest())
 print("PTX_FILE", ptx_file)
+print("PTX_TARGET", re.search(rb"^\\.target\\s+(\\S+)", ptx, re.M).group(1).decode())
 for name, pat in {census}.items():
     print("CENSUS", name, len(re.findall(pat.encode(), ptx)))
 for action, imm in re.findall(rb"setmaxnreg\\.(inc|dec)\\.sync\\.aligned\\.u32\\s+(\\d+)", ptx):
@@ -171,13 +212,17 @@ def _setmaxnreg_of():
     return sorted([("inc", CFG.SOFTMAX_REGS), ("inc", CFG.EPILOGUE_REGS)] + [("dec", CFG.SERVICE_REGS)] * (CFG.SERVICE_WARPS + 1))
 
 
-def render_2cta_kernels(tmp_path, form_kw, census):
-    """Host trace-compile of the pair chain for sm_100a in a fresh process -> (PTX md5 of the module, census, [(setmaxnreg action, immediate), ...],
-    {kernel: md5 of its `.entry` region} in entry order -- the per-kernel record form, frost_test_utils.ptx_kernel_md5s)."""
+def render_2cta_kernels(tmp_path, form_kw, census, arch=RECORD_ARCH):
+    """Host trace-compile of the pair chain for ``arch`` (the record arch sm_100a by default; sm_103a = the GB300 target the prepared host
+    selects on cc 10.3) in a fresh process -> (PTX md5 of the module, census, [(setmaxnreg action, immediate), ...], {kernel: md5 of its `.entry`
+    region} in entry order -- the per-kernel record form, frost_test_utils.ptx_kernel_md5s).  No device needed: the host's ``--gpu-arch sm_{sm}a``
+    option (the production mechanism, ``sm`` from the device cc) selects the target -- it wins over ``CUTE_DSL_ARCH``, which is set to agree."""
     _adapter_class()  # the tree under test must be the one this venv imports
-    script = _RENDER.format(host=_HOST_MODULE, census=repr(census), form_kw=repr(form_kw))
+    sm = int(re.fullmatch(r"sm_(\d+)a", arch).group(1))  # the prepared module's `sm` (cc major * 10 + minor) -> the host's `--gpu-arch sm_{sm}a`
+    script = _RENDER.format(host=_HOST_MODULE, census=repr(census), form_kw=repr(form_kw), arch=arch, sm=sm)
     proc = subprocess.run([sys.executable, "-c", script, str(tmp_path)], capture_output=True, text=True, timeout=600, env=dict(os.environ))
     assert proc.returncode == 0 and "RENDER_OK" in proc.stdout, proc.stdout[-3000:] + proc.stderr[-3000:]
+    assert re.search(r"PTX_TARGET (\S+)", proc.stdout).group(1) == arch, proc.stdout[-500:]
     md5 = re.search(r"PTX_MD5 ([0-9a-f]{32})", proc.stdout).group(1)
     counts = {m.group(1): int(m.group(2)) for m in re.finditer(r"CENSUS (\S+) (\d+)", proc.stdout)}
     regs = [(m.group(1), int(m.group(2))) for m in re.finditer(r"SETMAXNREG (inc|dec) (\d+)", proc.stdout)]
