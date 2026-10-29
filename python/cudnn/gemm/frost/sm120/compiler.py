@@ -2075,11 +2075,12 @@ def _precheck_plain(
     from ..kernel_registry import select_template
 
     _check_supported(chain, config)
-    _arch_reason = select_template(chain, config).active_reject(config, chain)
+    _tmpl = select_template(chain, config)
+    _arch_reason = _tmpl.active_reject(config, chain)
     if _arch_reason is not None:
         raise NotImplementedError(_arch_reason)
     _check_dtype_config_compat(chain, config)
-    _ring = _single_gemm_ring_reject(chain, config, select_template(chain, config))
+    _ring = _single_gemm_ring_reject(chain, config, _tmpl)
     if _ring is not None:
         raise NotImplementedError(_ring)
     _check_input_alignment(chain)
