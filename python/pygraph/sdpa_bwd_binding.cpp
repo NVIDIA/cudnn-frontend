@@ -33,6 +33,7 @@ class SdpaBwdBinder : private FixedSdpaOperands {
         size_t index;
         int64_t block, period = 0;
         Geometry axes;
+        int64_t minimum_gap = std::numeric_limits<int64_t>::max();
     };
     std::vector<Output> outputs_;
     std::vector<Carrier> carriers_;
@@ -68,6 +69,17 @@ class SdpaBwdBinder : private FixedSdpaOperands {
             auto delta = bp % period - ap % period;
             if (delta < 0) delta += period;
             if (delta >= a.block && period - delta >= b.block) return false;
+        }
+        if (a.axes == b.axes) {
+            // Matching run starts may have different block widths. A shift
+            // beyond the earlier block must leave the later block within
+            // the next gap. Include the carry across every outer axis:
+            // head/batch padding can defeat the GCD shortcut.
+            if (ap <= bp) {
+                if (bp - ap >= a.block && bp - ap <= b.minimum_gap) return false;
+            } else if (ap - bp >= b.block && ap - bp <= a.minimum_gap) {
+                return false;
+            }
         }
         // Rare shared-storage layouts that the modular check cannot separate:
         // walk the sorted contiguous runs exactly, without allocating or
@@ -142,12 +154,14 @@ class SdpaBwdBinder : private FixedSdpaOperands {
                     if (count < 1 || stride < extent) invalid("gradient strides must not overlap");
                     const auto tail = multiply(count - 1, stride);
                     if (tail > std::numeric_limits<int64_t>::max() - extent) invalid("gradient span exceeds int64");
+                    const auto gap = stride - extent;
                     extent += tail;
                     if (out.axes.empty() && stride == out.block) {
                         out.block = multiply(out.block, count);
                     } else {
                         out.axes.emplace_back(count, stride);
-                        out.period = std::gcd(out.period, stride);
+                        out.period      = std::gcd(out.period, stride);
+                        out.minimum_gap = std::min(out.minimum_gap, gap);
                     }
                 }
                 if (extent > operands_.back().bytes) invalid("gradient span is smaller than its declared geometry");

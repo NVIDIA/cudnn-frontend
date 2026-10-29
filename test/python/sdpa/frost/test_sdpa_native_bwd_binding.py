@@ -581,29 +581,39 @@ def test_sm80_gradient_overlap_rejected_before_entry(pair, raw_storage):
     assert len(frames) == 2
 
 
-@pytest.mark.parametrize("strides", [(96, 48, 16, 1), (192, 16, 64, 1), (256, 64, 16, 1)])
-def test_sm80_shared_gradient_storage_matches_address_oracle(strides):
+@pytest.mark.parametrize("strides", [(96, 48, 16, 1), (192, 16, 64, 1), (256, 64, 16, 1), (176, 80, 24, 1), (128, 56, 24, 1), (160, 80, 24, 1)])
+@pytest.mark.parametrize("second_layout", [None, ((2, 2, 3, 8), (176, 80, 24, 1)), ((2, 2, 3, 16), (176, 80, 24, 1))])
+@pytest.mark.parametrize("pair", [("dq", "dk"), ("dq", "dv"), ("dk", "dv")])
+def test_sm80_shared_gradient_storage_matches_address_oracle(strides, second_layout, pair):
     from itertools import product
 
     spec, _, facts, _, frames = _fixture("sm80", features=False)
     shape = (2, 2, 3, 8)
-    offsets = {sum(i * s for i, s in zip(index, strides)) for index in product(*(range(n) for n in shape))}
-    span = max(offsets) + 1
+    addresses = []
     ops = list(spec.operands)
-    for role in ("dk", "dv"):
+    for role, (dims, layout) in zip(pair, ((shape, strides), (shape, strides) if second_layout is None else second_layout)):
+        offsets = {sum(i * s for i, s in zip(index, layout)) for index in product(*(range(n) for n in dims))}
+        addresses.append(offsets)
+        span = max(offsets) + 1
         i = spec.roles.index(role)
-        ops[i] = replace(ops[i], shape=shape, strides=strides, span=span)
-        facts[role] = facts[role]._replace(shape=shape, strides=strides, span=span)
+        ops[i] = replace(ops[i], shape=dims, strides=layout, span=span)
+        facts[role] = facts[role]._replace(shape=dims, strides=layout, span=span)
     spec = replace(spec, operands=tuple(ops), native_binding=True)
     # Includes exact and shifted overlap, legal interleaved runs, and finite
     # disjoint layouts that cannot be separated by a stride-GCD check alone.
-    for delta in range(0, span + 16, 8):
-        current = dict(facts, dv=facts["dv"]._replace(ptr=facts["dk"].ptr + 2 * delta))
-        overlap = not offsets.isdisjoint({x + delta for x in offsets})
+    # Head/batch gaps may be smaller than a row gap; mixed layouts and both
+    # pointer orders must not inherit a shortcut for matching run starts.
+    first, second = pair
+    span = max(map(max, addresses)) + 1
+    limit = (span + 15) // 8 * 8
+    for delta in range(-limit, limit + 1, 8):
+        current = dict(facts)
+        current[second] = facts[second]._replace(ptr=facts[first].ptr + 2 * delta)
+        overlap = not addresses[0].isdisjoint({x + delta for x in addresses[1]})
         if overlap:
-            with pytest.raises(ValueError, match="dk overlaps dv"):
+            with pytest.raises(ValueError, match=first + " overlaps " + second):
                 prep.bind(spec, current, _WORKSPACE, 17)
         else:
             frame = prep.bind(spec, current, _WORKSPACE, 17)
-            assert frame[spec.roles.index("dv")] == current["dv"].ptr
+            assert frame[spec.roles.index(second)] == current[second].ptr
     assert not frames

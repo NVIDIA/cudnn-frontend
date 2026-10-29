@@ -288,6 +288,12 @@ Native backward gradient outputs must not overwrite each other.
 - Shared allocation or overlapping bounding spans do not imply overlapping
   elements: disjoint interleaved Q/K/V gradients remain valid. Use declared
   strides even when the graph binds flat storage or raw pointers.
+- Cache disjointness geometry at plan time. Regular padded interleaves need
+  a bounded check even when outer padding defeats the stride-GCD shortcut;
+  include head/batch carry gaps and recheck current pointer offsets. Compare
+  the result against an address-set oracle with mixed layouts, different block
+  widths and both pointer orders. Measure large declarations without walking
+  every row per bind.
 - Detectors: `test_sm80_gradient_overlap_rejected_before_entry`,
   `test_sm80_shared_gradient_storage_matches_address_oracle`, and
   `test_native_overlapping_gradients_rejected_before_writes`. Preserve the
