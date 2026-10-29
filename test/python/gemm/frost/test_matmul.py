@@ -32,6 +32,8 @@ from gemm_test_utils import (
     e5m3_quant_ref as _e5m3_quant_ref,
     e5m3_to_float as _e5m3_to_float,
     requires_sm107,
+    requires_sm120,
+    assert_quant_scale_blob_guard as _assert_quant_scale_blob_guard,
 )
 
 # Module-wide GPU gate — every test here is end-to-end and needs Blackwell.
@@ -3491,6 +3493,27 @@ def test_sm120_warp_grid_axis(config_name: str, a_major: str) -> None:
         f"\n  bad:       {bad}/{diff.numel()}"
         f"\n  max|diff|: {float(diff.max().item()):.4g}  (tol={tol})"
     )
+
+
+@requires_sm120
+def test_sm120_quant_scale_output_must_be_a_packed_blob() -> None:
+    """The F8_128x4 quant epilogue writes the scale blob from each batch plane's base and
+    applies only the batch stride. A binding the blob would spill out of (a row pitch, an
+    element stride, interleaved or overlapping batch planes) is declined before the launch;
+    dense permuted planes and a padded batch pitch get exactly the compact blob's bytes."""
+    L, M, N, K, bs = 2, 256, 256, 128, 32
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[L, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[L, K, N], stride=[K * N, 1, K])
+    Q, SF = g.block_scale_quantize(input=g.matmul(A=A, B=B, name="mm"), block_size=bs, axis=-1, name="q")
+    Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    SF.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+    SF.set_dim([L, M, N // bs]).set_stride([M * N // bs, N // bs, 1]).set_reordering_type(cudnn.tensor_reordering.F8_128x4)
+    compiled = _plan(g, config=_resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"))
+    a, b, _ = _mkbatched_data(L, M, N, K, "bf16", "bf16")
+    q = torch.empty(L, M, N, dtype=torch.float8_e4m3fn, device="cuda")
+    _assert_quant_scale_blob_guard(lambda sf: compiled({A: a, B: b, Q: q, SF: sf}), (L, M, N // bs), torch.float8_e8m0fnu, others=[q.view(torch.uint8)])
+    assert dict(compiled._compiled.deferrals) == {"quant scale blob": 4}
 
 
 def test_sm120_render_smoke() -> None:

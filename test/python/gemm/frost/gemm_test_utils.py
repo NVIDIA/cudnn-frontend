@@ -356,6 +356,73 @@ def assert_block_scale_reduction_close(actual, expected, mode):
         torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-5)
 
 
+# Fill byte of every quant-scale binding below; never a valid scale for the small inputs the callers use.
+SCALE_BLOB_FILL = 0xA5
+
+
+def quant_scale_bindings(shape, dtype):
+    """``(name, accepted, view, backing)`` bindings of an F8_128x4 quant-scale output of ``shape``.
+
+    The epilogue writes the packed blob from each batch plane's base and applies only the
+    batch stride, so a view is accepted when every plane is one dense byte run and the
+    planes do not overlap. ``backing`` is the whole allocation, filled with SCALE_BLOB_FILL;
+    the compact binding comes first."""
+    batch, rows, cols = shape
+    plane = rows * cols
+
+    def alloc(nbytes):
+        backing = torch.full((nbytes,), SCALE_BLOB_FILL, dtype=torch.uint8, device="cuda")
+        return backing.view(dtype), backing
+
+    bindings = []
+    view, backing = alloc(batch * plane)
+    bindings.append(("compact", True, view.view(batch, rows, cols), backing))
+    view, backing = alloc(batch * plane)
+    bindings.append(("transposed", True, view.view(batch, cols, rows).transpose(1, 2), backing))
+    view, backing = alloc(2 * batch * plane)
+    bindings.append(("row_pitch", False, view.view(batch, rows, 2 * cols)[:, :, :cols], backing))
+    view, backing = alloc(2 * batch * plane)
+    bindings.append(("element_stride", False, view.as_strided(shape, (2 * plane, 2 * cols, 2)), backing))
+    if batch > 1:
+        view, backing = alloc(2 * batch * plane)
+        bindings.append(("batch_pitch", True, view.view(batch, 2 * rows, cols)[:, :rows], backing))
+        view, backing = alloc(batch * plane)
+        bindings.append(("batch_interleaved", False, view.view(rows, batch, cols).transpose(0, 1), backing))
+        view, backing = alloc(batch * plane)
+        bindings.append(("batch_overlap", False, view.as_strided(shape, (plane // 2, cols, 1)), backing))
+    return bindings
+
+
+def assert_quant_scale_blob_guard(run, shape, dtype, others=()):
+    """``run(view)`` launches with ``view`` bound to an F8_128x4 quant-scale output of ``shape``.
+
+    A binding the blob would spill out of must raise before any write: its allocation and
+    ``others`` (byte views of the call's other outputs) stay untouched. An accepted binding
+    must hold, plane by plane, exactly the bytes the compact one holds, and nothing outside it.
+    ``shape`` must need no 128x4 padding, so the compact blob is written in full."""
+    control = None
+    for name, accepted, view, backing in quant_scale_bindings(shape, dtype):
+        before = [other.clone() for other in others]
+        if not accepted:
+            with pytest.raises(ValueError, match="packed blob"):
+                run(view)
+            torch.cuda.synchronize()
+            assert torch.all(backing == SCALE_BLOB_FILL), f"{name}: a declined call wrote its scale allocation"
+            assert all(torch.equal(o, b) for o, b in zip(others, before)), f"{name}: a declined call wrote an output"
+            continue
+        run(view)
+        torch.cuda.synchronize()
+        inside = torch.zeros_like(backing, dtype=torch.bool)
+        inside.as_strided(view.shape, view.stride()).fill_(True)
+        assert torch.all(backing[~inside] == SCALE_BLOB_FILL), f"{name}: bytes outside the view were written"
+        planes = [backing[b * view.stride(0) : b * view.stride(0) + shape[1] * shape[2]] for b in range(shape[0])]
+        if control is None:
+            control = planes
+            assert not any(bool((p == SCALE_BLOB_FILL).any()) for p in planes), "the compact blob was not fully written"
+        else:
+            assert all(torch.equal(p, c) for p, c in zip(planes, control)), f"{name}: plane bytes differ from the compact blob"
+
+
 # --- shared MoE fixtures -----------------------------------------------------
 
 # Explicit boundaries for 36 groups (BxE > E) shared by the MoE grouped tests.

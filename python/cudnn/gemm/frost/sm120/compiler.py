@@ -1193,11 +1193,45 @@ def _initialize_combine_output(chain: FusionChain, outputs, stream=None) -> None
     buffers.apply_zero_fill_plan(output.data_ptr(), plan, DTYPE_BYTES[chain.outputs[0].dtype], stream)
 
 
+def _quant_scale_blob_reject(chain: FusionChain, outputs) -> "str | None":
+    """Check each F8_128x4 quant-scale output against the addressing its epilogue uses.
+
+    The epilogue writes the 128x4-atom stream at compact offsets from a batch plane's base
+    (``tile_l * quant_scale_stride_l``) and never applies the M/N strides. Each batch plane
+    must therefore be one dense byte run, and the batch stride must not let planes overlap.
+    A dense permuted view qualifies (the blob is read back as raw bytes); a pitched or
+    element-strided view would get the blob written into its gaps, outside the view."""
+    bad = []
+    for spec, buf in zip(chain.outputs, outputs):
+        if not spec.is_quant_scale:
+            continue
+        qi = int(spec.source.rsplit("_", 1)[1])
+        if chain.quants[qi].scale_reorder != "F8_128x4":
+            continue
+        shape, strides = tuple(buf.shape), tuple(buf.stride())
+        plane = 1
+        for stride, extent in sorted((st, s) for s, st in zip(shape[1:], strides[1:]) if s > 1):
+            if stride != plane:
+                bad.append(f"quant scale output[{qi}] shape {shape} stride {strides}: a batch plane is not a dense byte run")
+                break
+            plane *= extent
+        else:
+            if shape[0] > 1 and strides[0] < plane:
+                bad.append(f"quant scale output[{qi}] shape {shape} stride {strides}: its {plane}-byte batch planes overlap")
+    if bad:
+        return (
+            "F8_128x4 quant scale outputs must be packed blobs (the epilogue writes each batch plane at compact offsets "
+            "from its base and does not apply the M/N strides): " + "; ".join(bad)
+        )
+    return None
+
+
 class CompiledFusedGemm(_CompiledFusedGemm[TileConfig, GemmBinding]):
     """Execute a compiled fused GEMM."""
 
     _compiler = sys.modules[__name__]
     _validate_runtime_quant = True
+    _validate_quant_scale_blobs = True
 
 
 def _mma_a_dtype(chain: FusionChain) -> str:
@@ -2534,6 +2568,7 @@ class CompiledMoeGemm(_CompiledMoeGemm[TileConfig, GemmBinding]):
     _compiler = sys.modules[__name__]
     _validate_runtime_quant = True
     _validate_combine = True
+    _validate_quant_scale_blobs = True
 
 
 def _check_runtime_quant(chain: FusionChain, cfg: TileConfig, m: int, n: int) -> None:
@@ -2708,6 +2743,7 @@ class CompiledMoeBlockScaleGemm(_CompiledMoeBlockScaleGemm[TileConfig, GemmBindi
     _compiler = sys.modules[__name__]
     _validate_runtime_quant = True
     _validate_combine = True
+    _validate_quant_scale_blobs = True
     _check_padded_operands = True
     _check_all_operands = True
 
