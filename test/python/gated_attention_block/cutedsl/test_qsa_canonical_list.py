@@ -95,6 +95,14 @@ def test_check_top_k_accepts_every_multiple_of_four_and_the_shape_rule_holds_who
     assert moved_bytes(2048, 512) == 2 * 2048 * 512 * 4 + 2 * 2048 * 4
 
 
+def test_the_row_width_is_the_blocks_top_k():
+    """``TOP_K_MAX`` (the network's 512-slot width) IS the block's ``QSA_TOP_K`` -- a coupling the kernel states by comment only; pinned
+    here so a change of either constant fails by name (``check_top_k`` would otherwise refuse the block's ``top_k`` loudly, never silently)."""
+    from cudnn.QSA.selection import QSA_TOP_K
+
+    assert TOP_K_MAX == QSA_TOP_K == 512
+
+
 # ---------------------------------------------------------------------------
 # Numerics: bitwise the canonical form at every top_k
 # ---------------------------------------------------------------------------

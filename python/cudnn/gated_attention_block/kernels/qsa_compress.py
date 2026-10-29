@@ -919,7 +919,7 @@ def frost_qsa_compress_step(
     threads_per_cta: cutlass.Constexpr[int],
     use_pdl: cutlass.Constexpr[bool],
     ring_slot_i64: cutlass.Constexpr[bool],
-    write_ring: cutlass.Constexpr[bool],  # appended: False = the CHUNK form, the ring read-only (module docstring)
+    ring_write: cutlass.Constexpr[bool],  # appended: False = the CHUNK form, the ring read-only (module docstring); the public key's name
     round_io: cutlass.Constexpr[bool],  # appended: the "hf" rounding arm (module docstring)
 ) -> None:
     """One lane group (``lanes_per_row(d)`` lanes) per NEW ROW of the step.
@@ -933,7 +933,7 @@ def frost_qsa_compress_step(
     ``RING >= S_q + pool - 1``), so there is no intra-launch ordering requirement.  The dense and the paged form
     (``mBlockTable`` present) differ ONLY in where a position's ring row and a block's cache row live
     (:func:`ring_row_address`, :func:`paged_block_row`) and in the position source (:func:`step_position`).  Under
-    ``write_ring=False`` (the CHUNK form) step (1) is folded out: the ring is read-only, the launch has no ring write to order
+    ``ring_write=False`` (the CHUNK form) step (1) is folded out: the ring is read-only, the launch has no ring write to order
     against its ring reads at any ``S_q``, and the host rule is ``cap >= pool - 1``.
     """
     if cutlass.const_expr(use_pdl):
@@ -1006,15 +1006,15 @@ def frost_qsa_compress_step(
     knew_b = mKnew.iterator.toint() + b64 * cutlass.Int64(mKnew.stride[0]) * bpe
 
     # --- (1) the committed row's raw key enters the ring: a bit copy, 16 B per lane (never for a row at or past the table); folded
-    # OUT under the chunk form (write_ring=False: the ring is read-only in this launch, the tail enters it by a later launch) ----
-    if cutlass.const_expr(write_ring):
-        ring_write = committed & owns_ring & in_table
+    # OUT under the chunk form (ring_write=False: the ring is read-only in this launch, the tail enters it by a later launch) ----
+    if cutlass.const_expr(ring_write):
+        ring_store = committed & owns_ring & in_table  # THIS row's store; the launch-wide switch is the constexpr ring_write
         if cutlass.const_expr(has_ring_slots):
             dst, slot_live = ring_slot_address(mRing, mRingSlots, b * s_q + jr, ring_slot_i64, bpe)
-            ring_write = ring_write & slot_live
+            ring_store = ring_store & slot_live
         else:
             dst = ring_row_address(mRing, entry, p, bpe)
-        if ring_write:
+        if ring_store:
             src = knew_b + jr.to(cutlass.Int64) * knew_tok
             for c in cutlass.range_constexpr(chunks):
                 off = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane_off
@@ -1141,7 +1141,7 @@ def qsa_compress_step_launch(
     threads_per_cta: cutlass.Constexpr[int],
     use_pdl: cutlass.Constexpr[bool],
     ring_slot_i64: cutlass.Constexpr[bool],
-    write_ring: cutlass.Constexpr[bool],
+    ring_write: cutlass.Constexpr[bool],
     round_io: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
@@ -1167,7 +1167,7 @@ def qsa_compress_step_launch(
         threads_per_cta,
         use_pdl,
         ring_slot_i64,
-        write_ring,
+        ring_write,
         round_io,
     ).launch(grid=(grid_x, grid_y, 1), block=(threads_per_cta, 1, 1), stream=stream, use_pdl=use_pdl)
 
@@ -1349,7 +1349,7 @@ def compile_qsa_compress_step(
             int(threads_per_cta),
             bool(use_pdl),
             bool(ring_slots and ring_slot_dtype == torch.int64),
-            bool(ring_write),  # write_ring
+            bool(ring_write),  # ring_write
             rounding == "hf",  # round_io
             _FAKE_STREAM,
             options="--enable-tvm-ffi",

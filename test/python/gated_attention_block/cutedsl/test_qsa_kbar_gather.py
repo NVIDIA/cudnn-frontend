@@ -28,7 +28,6 @@ from cudnn.gated_attention_block.kernels.qsa_kbar_gather import (  # noqa: E402
     SEQREP_DEAD,
     SEQREP_OVER,
     SEQREP_SHORT,
-    QsaKbarGatherRecipe,
     build_qsa_kbar_gather,
     compile_qsa_kbar_gather,
     moved_bytes,
@@ -254,7 +253,8 @@ def test_gather_is_one_launch_and_allocates_nothing():
     r = compile_qsa_kbar_gather(dtype=torch.bfloat16)
     kbar = torch.empty(2, cx.reach, _D, device="cuda", dtype=torch.bfloat16)
     qpos, counts, rep = (torch.empty(n, dtype=torch.int32, device="cuda") for n in (2, 2 * t, 2))
-    kv, ps, pr0, prw = _i32([40, 0]), _i32([0, 1]), _i32([0, 0]), _i32([t, t])
+    kv = _i32([40, 0])
+    ps, pr0, prw = (_i32([p[i] for p in pieces]) for i in range(3))  # the piece table from `pieces`: seq, r0, rows
 
     def launch():
         run_qsa_kbar_gather(r, cx.cache, cx.table, kv, ps, pr0, prw, kbar, qpos, counts, rep, t_rows=t, stream=_stream())

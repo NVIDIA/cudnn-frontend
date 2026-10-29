@@ -16,8 +16,10 @@ ix_kbar.shape[1]`` (= the table's reach in compressed rows, ``max_pages x P / PO
     n_keys        = clamp(floor(L / POOL), 0, NB)
     row j < n_keys                              : ix_kbar[b, j] = cache[table[b, j // rpp], j % rpp]   (a -1 / out-of-range page -> a ZERO row:
                                                                                                         the paged scorer's own convention)
-    row n_keys <= j < min(NB, ceil(T / POOL))   : ix_kbar[b, j] = 0     (a dead / short sequence: the scorer selects over DEFINED zeros, the
-                                                                        prefill form's memset rule -- every row a chunk row can read is written)
+    row n_keys <= j < min(NB, ceil(T / POOL))   : ix_kbar[b, j] = 0     (every row a chunk row can read past n_keys is a DEFINED zero -- the
+                                                                        prefill form's memset rule: a dead / short sequence's rows, and a SERVED
+                                                                        sequence's row n_keys when its last group is partial, L // POOL == T // POOL
+                                                                        with T % POOL != 0, e.g. L = T = 37 -- never read there, n_vis <= n_keys)
     row j past both                             : untouched
     ix_counts[b T + i]  = clamp(floor((L - T + i + 1) / POOL), 0, NB)                  the TRUE position's visible count (0 on a negative one)
     ix_qpos[p]          = clamp(max(L - T, 0) + r0_p, 0, POOL NB + POOL - 1 - rows_p)  p a piece of b: the scorer's non-negative first position,
@@ -33,7 +35,9 @@ The clamp needs ``rows_p <= T <= POOL x NB``, which the HOST guarantees before a
 longer than the table's reach, naming both numbers).  A clamped sequence (``L > POOL NB``: ``kv_lens[b] > max_pages x P``, the block's
 existing device contract) is position-misaligned in its selection and REPORTED ``-3``; a sequence with ``0 < L < T`` is the other
 violation (``-2``: a chunk extends a sequence of at least its own length); ``ix_seqrep`` is a device REPORT the tests read and the
-block never reads.  A dead sequence (``L <= 0``) is fully defined: zero rows up to ``ceil(T / POOL)``, counts 0, ``q_pos0 = r0_p``.
+block never reads; its precedence is dead > short > over > served (``-1`` over ``-2`` over ``-3`` over ``n_keys``), and short / over are
+DISJOINT under the host rule ``T <= POOL x NB`` (``0 < L < T`` and ``L > POOL NB`` cannot both hold), so the order between those two
+never decides a report.  A dead sequence (``L <= 0``) is fully defined: zero rows up to ``ceil(T / POOL)``, counts 0, ``q_pos0 = r0_p``.
 
 The piece table ``piece_seq / piece_r0 / piece_rows [n_pieces]`` (int32, device; the step's plan constants, uploaded once) names the
 select windows' pieces: piece ``p`` is rows ``[r0_p, r0_p + rows_p)`` of sequence ``piece_seq[p]``.  Its VALUES are device data used in
