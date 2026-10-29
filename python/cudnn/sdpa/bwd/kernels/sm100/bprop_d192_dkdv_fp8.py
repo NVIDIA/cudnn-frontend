@@ -36,6 +36,8 @@ _PARAMS = globals().get("FROST_TEMPLATE_PARAMS", (192, 128))
 MX = bool(_PARAMS[3]) if len(_PARAMS) > 3 else False
 WINDOW = int(_PARAMS[4]) if len(_PARAMS) > 4 else 0
 K_HW = int(_PARAMS[5]) if len(_PARAMS) > 5 else 32
+L2_MIB = int(_PARAMS[6]) if len(_PARAMS) > 6 else 50
+PDL = bool(int(_PARAMS[7])) if len(_PARAMS) > 7 else False
 CFG, BAR_LAYOUT = make_config(int(_PARAMS[0]), int(_PARAMS[1]), MX, k_hw=K_HW)
 TS = bool(CFG.T_SHARED)
 P_SMEM = bool(CFG.P_SMEM)
@@ -1329,6 +1331,8 @@ def bprop_d192_dkdv_fp8_kernel(
                     bars[i][stage].init()
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
+    if cutlass.const_expr(PDL):
+        cute.arch.griddepcontrol_launch_dependents()
     tmem_base = tmem_slot.load()
     # All four service warps must execute the same warpgroup-aligned
     # register release before diverging into their individual roles.
@@ -1488,7 +1492,7 @@ def host(
     if cutlass.const_expr(q.shape[1] <= 0 or k.shape[1] <= 0):
         raise ValueError("dense d192 fp8 dK / dV requires positive Sq/Skv")
     nk = (k.shape[1] + CFG.M - 1) // CFG.M
-    heads_per_l2 = (50 * 1024 * 1024) // (q.shape[1] * (CFG.DQK + CFG.DV) * CFG.BPE)
+    heads_per_l2 = (L2_MIB * 1024 * 1024) // (q.shape[1] * (CFG.DQK + CFG.DV) * CFG.BPE)
     swizzle = 1 << (heads_per_l2.bit_length() - 1) if heads_per_l2 > 0 else 1
     grid = (nk * k.shape[2] * q.shape[0], 1, 1) if causal else (nk, k.shape[2], q.shape[0])
     q_map = _tensor_map(q, CFG.N, CFG.QK_BOX, CFG.QK_SWZ)

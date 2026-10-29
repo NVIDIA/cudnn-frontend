@@ -50,6 +50,8 @@ _PARAMS = globals().get("FROST_TEMPLATE_PARAMS", (192, 128))
 MX = bool(_PARAMS[3]) if len(_PARAMS) > 3 else False
 WINDOW = int(_PARAMS[4]) if len(_PARAMS) > 4 else 0
 K_HW = int(_PARAMS[5]) if len(_PARAMS) > 5 else 32
+L2_MIB = int(_PARAMS[6]) if len(_PARAMS) > 6 else 50
+PDL = bool(int(_PARAMS[7])) if len(_PARAMS) > 7 else False
 CFG, BAR_LAYOUT = make_config(int(_PARAMS[0]), int(_PARAMS[1]), MX, k_hw=K_HW)
 TS = bool(CFG.T_SHARED)
 OUT_SPLIT = bool(CFG.OUT_SPLIT)
@@ -945,7 +947,7 @@ def host(
     if cutlass.const_expr(q.shape[1] <= 0 or k.shape[1] <= 0):
         raise ValueError("dense d192 fp8 dQ requires positive Sq/Skv")
     nq = (q.shape[1] + CFG.M - 1) // CFG.M
-    heads_per_l2 = (50 * 1024 * 1024) // (k.shape[1] * (CFG.DQK + CFG.DV) * CFG.BPE)
+    heads_per_l2 = (L2_MIB * 1024 * 1024) // (k.shape[1] * (CFG.DQK + CFG.DV) * CFG.BPE)
     swizzle = 1 << (heads_per_l2.bit_length() - 1) if heads_per_l2 > 0 else 1
     grid = (nq * q.shape[2] * q.shape[0], 1, 1) if causal else (nq, q.shape[2], q.shape[0])
     k_map = _tensor_map(k, CFG.N, CFG.QK_BOX, CFG.QK_SWZ)
@@ -993,4 +995,4 @@ def host(
         swizzle,
         grad_dtype,
         ratio,
-    ).launch(grid=grid, block=(CFG.THREADS, 1, 1), stream=stream, min_blocks_per_mp=1)
+    ).launch(grid=grid, block=(CFG.THREADS, 1, 1), stream=stream, min_blocks_per_mp=1, use_pdl=PDL)
