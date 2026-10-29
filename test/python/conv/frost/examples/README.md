@@ -28,6 +28,11 @@ TMA zero-fills the final 32 lanes at every filter position. Both routes read
 compact C96 storage. Weight conversion can be reused across calls. History
 assembly, input/output conversion, bias, and cache copies are per-call costs.
 
+For multi-frame K96 outputs, the two-CTA 128-row tile shares each weight tile
+across four adjacent output tiles. Separate accumulators preserve the reduction
+order while reducing repeated weight loads. This uses no additional caller
+workspace.
+
 Initial single-frame K96 calls use a weight scan followed by the convolution.
 The scan preserves the NaN/Inf effect of the two fully padded temporal planes,
 so the convolution can omit their zero products. These plans declare 384 bytes

@@ -137,6 +137,20 @@ def test_frost_conv_c96_history_transitions_and_reset(k):
     _close(_conv(fresh, weight), _reference(fresh, weight))
 
 
+@pytest.mark.parametrize("shape,history_frames", [((1, 96, 5, 9, 11), 1), ((2, 96, 6, 129, 131), 2)])
+def test_frost_conv_c96_history_partial_tiles_and_persistent_reuse(shape, history_frames):
+    # The small case ends inside the second of four output tiles. The large
+    # case crosses batch/depth boundaries and gives CTAs multiple work items.
+    image = make_input(shape, torch.bfloat16, seed=402)
+    weight = make_input((96, 96, 3, 3, 3), torch.bfloat16, seed=403)
+    _close(_conv(image, weight, history_frames), _reference(image, weight, history_frames))
+    # Re-execute the same specialization with changed operands to expose stale
+    # shared/TMEM state, including the final partial work item.
+    image[:, 95].neg_()
+    weight[95].neg_()
+    _close(_conv(image, weight, history_frames), _reference(image, weight, history_frames))
+
+
 def test_frost_conv_c96_oracle_detects_wrong_padding_and_missing_tail():
     image = make_input((1, 96, 5, 5, 7), torch.bfloat16, seed=310)
     weight = make_input((96, 96, 3, 3, 3), torch.bfloat16, seed=311)
