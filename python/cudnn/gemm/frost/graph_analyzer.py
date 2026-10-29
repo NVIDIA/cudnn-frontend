@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 from collections import deque
 from dataclasses import dataclass, field, replace
+from math import isfinite
 from typing import Any
 
 import cudnn
@@ -99,6 +100,9 @@ _BINARY_OP_MAP: dict[str, str] = {
 }
 
 _POINTWISE_ATTR_KEYS = ("negative_slope", "lower_clip", "upper_clip", "swish_beta", "axis")
+
+# Mainloop attribute support is deliberately narrower than the epilogue's.
+_MAINLOOP_POINTWISE_ATTR_KEYS = {"leaky_relu": frozenset({"negative_slope"})}
 
 
 # Internal recording state, attached to each cudnn.pygraph instance
@@ -1519,10 +1523,13 @@ def _walk_mainloop_chain(
     while cur in op_by_output:
         producer = op_by_output[cur]
         if producer.cudnn_name in _UNARY_OP_MAP:
-            if producer.cudnn_name == "gen_index" or producer.op_attrs:
+            allowed_attrs = _MAINLOOP_POINTWISE_ATTR_KEYS.get(producer.cudnn_name, frozenset())
+            if producer.cudnn_name == "gen_index" or any(key not in allowed_attrs for key, _ in producer.op_attrs):
                 raise ValueError(
                     f"matmul {label} operand producer {producer.op_name!r}: gen_index and " "pointwise scalar attrs are not supported in mainloop fusion"
                 )
+            if any(not isfinite(value) for _, value in producer.op_attrs):
+                raise ValueError(f"matmul {label} operand producer {producer.op_name!r}: negative_slope must be finite")
             steps.append((producer.cudnn_name, False, None, True, producer))
             (cur,) = producer.inputs
         elif producer.cudnn_name in _BINARY_OP_MAP:
@@ -1580,6 +1587,7 @@ def _walk_mainloop_chain(
             fops.append(FusionOp(op=_UNARY_OP_MAP[cudnn_name], parent_idx=parent))
         fops[-1] = replace(
             fops[-1],
+            attrs=producer.op_attrs,
             compute_dtype=producer.compute_dtype or compute_dtype,
             out_dtype=_resolve_out_dtype(producer.output, producer.output_tensor, io_dtype, intermediate_dtype, meta),
         )

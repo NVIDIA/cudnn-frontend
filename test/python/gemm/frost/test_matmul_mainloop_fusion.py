@@ -198,6 +198,147 @@ def test_analyzer_chain_of_two_unary_a_ops() -> None:
     assert [op.op for op in chain.mainloop_a_ops] == ["abs", "relu"]
 
 
+def _leaky_mainloop_graph(side, m=128, n=128, k=136, io_dtype=cudnn.data_type.BFLOAT16, slopes=(0.1,), pre_cos=False):
+    """Keep every pre-MMA activation's explicit output rounding boundary."""
+    graph = cudnn.pygraph(io_data_type=io_dtype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    a = graph.tensor(name="a", dim=[1, m, k], stride=[m * k, k, 1])
+    b = graph.tensor(name="b", dim=[1, k, n], stride=[k * n, 1, k])
+
+    def transform(value, label):
+        if pre_cos:
+            value = graph.cos(input=value, name=f"{label}_cos").set_data_type(io_dtype)
+        for i, slope in enumerate(slopes):
+            value = graph.leaky_relu(input=value, negative_slope=slope, name=f"{label}_leaky_{i}").set_data_type(io_dtype)
+        return value
+
+    ai = transform(a, "a") if side in ("a", "ab") else a
+    bi = transform(b, "b") if side in ("b", "ab") else b
+    y = graph.matmul(A=ai, B=bi).set_data_type(cudnn.data_type.FLOAT).set_output(True)
+    return graph, a, b, y
+
+
+@pytest.mark.parametrize("side", ["a", "b", "ab"])
+@pytest.mark.parametrize("slope", [0.0, 0.1, 1.0, -0.25])
+def test_analyzer_leaky_relu_mainloop_attrs(side, slope):
+    chain = analyze(_leaky_mainloop_graph(side, slopes=(slope,))[0])
+    assert chain.ops == []
+    for operand in ("a", "b"):
+        ops = getattr(chain, f"mainloop_{operand}_ops")
+        if operand in side:
+            assert len(ops) == 1
+            assert ops[0].op == "leaky_relu"
+            assert ops[0].attrs == (("negative_slope", slope),)
+            assert (ops[0].compute_dtype, ops[0].out_dtype) == ("fp32", "bf16")
+            snippet = generate_mainloop(chain, operand)
+            assert f"cutlass.Float32({slope})" in snippet
+            assert "mainloop_koob_fix" in snippet
+        else:
+            assert ops == []
+            assert generate_mainloop(chain, operand) == "pass"
+
+
+@pytest.mark.parametrize("side", ["a", "b"])
+@pytest.mark.parametrize("io_dtype, expected", [(cudnn.data_type.BFLOAT16, "bf16"), (cudnn.data_type.HALF, "fp16")])
+def test_analyzer_leaky_relu_mainloop_chain(side, io_dtype, expected):
+    chain = analyze(_leaky_mainloop_graph(side, io_dtype=io_dtype, slopes=(0.1, 0.3))[0])
+    ops = getattr(chain, f"mainloop_{side}_ops")
+    assert [op.attrs for op in ops] == [(("negative_slope", 0.1),), (("negative_slope", 0.3),)]
+    assert [op.parent_idx for op in ops] == [-1, 0]
+    assert [op.out_dtype for op in ops] == [expected, expected]
+    snippet = generate_mainloop(chain, side)
+    assert "cutlass.Float32(0.1)" in snippet and "cutlass.Float32(0.3)" in snippet
+    dtype = "BFloat16" if expected == "bf16" else "Float16"
+    assert f"_r_ml_{side}_0 = (" in snippet and f".to(cutlass.{dtype})" in snippet
+
+
+def test_analyzer_leaky_relu_mainloop_mixed_unary_chain():
+    chain = analyze(_leaky_mainloop_graph("ab", pre_cos=True)[0])
+    for ops in (chain.mainloop_a_ops, chain.mainloop_b_ops):
+        assert [op.op for op in ops] == ["cos", "leaky_relu"]
+        assert [op.attrs for op in ops] == [(), (("negative_slope", 0.1),)]
+        assert [op.parent_idx for op in ops] == [-1, 0]
+
+
+@pytest.mark.parametrize("side", ["a", "b"])
+@pytest.mark.parametrize(
+    "op, attrs",
+    [("relu", {"lower_clip": 0.25}), ("swish", {"swish_beta": 2.0}), ("gen_index", {"axis": 2}), ("leaky_relu", {"negative_slope": 0.1, "upper_clip": 1.0})],
+)
+def test_analyzer_leaky_relu_mainloop_keeps_attribute_gate(side, op, attrs):
+    graph = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    a = graph.tensor(name="a", dim=[1, 128, 128], stride=[16384, 128, 1])
+    b = graph.tensor(name="b", dim=[1, 128, 128], stride=[16384, 1, 128])
+    value = graph._pointwise(op, [a if side == "a" else b], "unsupported", None, attrs)
+    graph.matmul(A=value if side == "a" else a, B=value if side == "b" else b).set_output(True)
+    with pytest.raises(ValueError, match="pointwise scalar attrs are not supported in mainloop fusion"):
+        analyze(graph)
+
+
+@pytest.mark.parametrize("slope", [float("nan"), float("inf"), -float("inf")])
+def test_analyzer_leaky_relu_mainloop_rejects_nonfinite_slope(slope):
+    with pytest.raises(ValueError, match="negative_slope must be finite"):
+        analyze(_leaky_mainloop_graph("a", slopes=(slope,))[0])
+
+
+@requires_sm100
+@pytest.mark.parametrize("side", ["a", "b", "ab"])
+@pytest.mark.parametrize("k", [128, 136, 144])
+@pytest.mark.parametrize("cta_group", [1, 2])
+def test_leaky_relu_mainloop_e2e(side, k, cta_group):
+    """Exercise complete and partial K tiles on one- and two-CTA MMA."""
+    m = n = 256
+    graph, a, b, y = _leaky_mainloop_graph(side, m, n, k)
+    cfg = by_name(f"CONFIG_sm100_128x128x128_128x128x32_cluster{cta_group}x1_{cta_group}ctamma")
+    compiled = jit_from_cudnn_graph(graph, cfg)
+    torch.manual_seed(0)
+    av = torch.randn((1, m, k), device="cuda", dtype=torch.bfloat16)
+    bv = torch.randn((1, n, k), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    out = torch.full((1, m, n), float("nan"), device="cuda", dtype=torch.float32)
+    compiled({a: av, b: bv, y: out})
+    torch.cuda.synchronize()
+    ar = torch.nn.functional.leaky_relu(av.float(), 0.1).to(av.dtype) if "a" in side else av
+    br = torch.nn.functional.leaky_relu(bv.float(), 0.1).to(bv.dtype) if "b" in side else bv
+    ref = ar.float() @ br.float()
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@requires_sm100
+@pytest.mark.parametrize("k", [136, 144])
+@pytest.mark.parametrize("cta_group", [1, 2])
+def test_leaky_relu_mainloop_e2e_masks_transformed_padding(k, cta_group):
+    """cos(0)=1 on BOTH padded operands makes a missing K mask observable."""
+    graph, a, b, y = _leaky_mainloop_graph("ab", m=256, n=256, k=k, pre_cos=True)
+    cfg = by_name(f"CONFIG_sm100_128x128x128_128x128x32_cluster{cta_group}x1_{cta_group}ctamma")
+    compiled = jit_from_cudnn_graph(graph, cfg)
+    av = torch.zeros((1, 256, k), device="cuda", dtype=torch.bfloat16)
+    bv = torch.zeros((1, 256, k), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    out = torch.full((1, 256, 256), float("nan"), device="cuda", dtype=torch.float32)
+    compiled({a: av, b: bv, y: out})
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, torch.full_like(out, k), atol=0, rtol=0)
+
+
+@requires_sm100
+@pytest.mark.parametrize("side", ["a", "b"])
+@pytest.mark.parametrize("io_dtype, torch_dtype", [(cudnn.data_type.BFLOAT16, torch.bfloat16), (cudnn.data_type.HALF, torch.float16)])
+def test_leaky_relu_mainloop_e2e_preserves_rounding(side, io_dtype, torch_dtype):
+    """An identity GEMM exposes each activation's intermediate rounding."""
+    graph, a, b, y = _leaky_mainloop_graph(side, k=128, io_dtype=io_dtype, slopes=(0.1, 0.3))
+    compiled = jit_from_cudnn_graph(graph, by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"))
+    raw = -torch.linspace(0.5, 2.0, 128, device="cuda").to(torch_dtype).expand(1, 128, 128).contiguous()
+    identity = torch.eye(128, device="cuda", dtype=torch_dtype)[None]
+    out = torch.empty((1, 128, 128), device="cuda", dtype=torch.float32)
+    compiled({a: raw if side == "a" else identity, b: raw.transpose(1, 2) if side == "b" else identity, y: out})
+    torch.cuda.synchronize()
+    ref = raw
+    for slope in (0.1, 0.3):
+        ref = torch.nn.functional.leaky_relu(ref.float(), slope).to(torch_dtype)
+    # Without the first rounding boundary this differs for both FP16 and BF16.
+    unrounded = torch.nn.functional.leaky_relu(torch.nn.functional.leaky_relu(raw.float(), 0.1), 0.3).to(torch_dtype)
+    assert not torch.equal(ref, unrounded)
+    torch.testing.assert_close(out, ref.float() if side == "a" else ref.float().transpose(1, 2), atol=0, rtol=0)
+
+
 # ---------------------------------------------------------------------------
 # Codegen
 # ---------------------------------------------------------------------------

@@ -28,3 +28,30 @@ set_compute_data_type(DataType_t value)
     - B
     - name
     - compute_data_type
+
+### FROST operand fusion
+
+On supported FROST GEMM mainloop templates, a `leaky_relu` feeding either
+matmul operand can be fused into the operand transform before MMA:
+
+```python
+activated = graph.leaky_relu(input=A, negative_slope=0.1)
+activated.set_data_type(cudnn.data_type.BFLOAT16)
+C = graph.matmul(A=activated, B=B)
+C.set_output(True)
+```
+
+The finite `negative_slope` is preserved in the fusion IR, as are each
+pointwise node's compute and output dtypes. Consecutive activations retain
+their intermediate rounding boundaries; they are not algebraically combined.
+This does not enable other parameterized mainloop operations, `gen_index`, or
+per-row/per-column/per-element operand auxiliaries. Existing template and
+architecture restrictions still apply.
+
+Set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` to offer the FROST GEMM engine as a
+plan candidate. This is an engine capability, not a guarantee that every graph
+or chosen plan will use it. The
+[self-checking sample](https://github.com/NVIDIA/cudnn-frontend/blob/develop/samples/frost/gemm/07_matmul_leaky_relu_mainloop.py)
+explicitly selects FROST and optionally compares CUDA-graph replay against
+separate PyTorch activations followed by FROST GEMM. Timings exclude graph
+construction and JIT compilation; performance depends on the shape and plan.
