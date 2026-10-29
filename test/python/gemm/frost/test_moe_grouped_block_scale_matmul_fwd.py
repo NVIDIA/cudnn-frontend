@@ -752,11 +752,12 @@ def _build_graph(
     scatter_top_k=None,
     combine_top_k=None,
     gather_rows=None,
+    scale_k=None,
 ):
     block_size, default_dt, sf_dt = _COMBOS[combo]
     a_dt = default_dt if a_dt_override is None else a_dt_override
     b_dt = default_dt if b_dt_override is None else b_dt_override
-    sf_k = K // block_size
+    sf_k = K // block_size if scale_k is None else scale_k
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -3057,3 +3058,59 @@ def test_e2e_auto_config_sm120() -> None:
         if b != e:
             ref[b:e] = tok_s[b:e] @ w_s[gi % E].T
     torch.testing.assert_close(output[0], ref.to(torch.bfloat16), atol=1e-1, rtol=1e-2)
+
+
+@requires_sm120
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["normal", "swap_ab"])
+@pytest.mark.parametrize("mode", ["none", "gather"])
+def test_sm120_moe_mxfp8_partial_scale_block_graph_is_declined(mode, swap_ab) -> None:
+    """MXFP8 scales whole 32-element K blocks, but the token's 16-byte TMA rule only needs
+    K % 16. Both orientations size the F8_128x4 scale-factor views from floor(K / 32) scales per
+    row, so at K = 144 the last K tile read zero-filled scales and every 128-row SF block past the
+    first read another block's (audit finding B01: 53917 of 65536 outputs wrong). GATHER, whose
+    linear token SF holds ceil(K / 32) scales, was declined for naming a floor(K / 32) SF shape."""
+    if mode == "gather":
+        g = _build_graph(2, 137, 128, 144, 4, combo="mxfp8", gather_rows=259, scale_k=_ceil_div(144, 32))
+    else:
+        g = _build_graph(2, 256, 256, 144, 2, combo="mxfp8")
+    with pytest.raises(NotImplementedError, match="not a multiple of the scale block size 32"):
+        _plan(g, config=by_name(_SM120_BS_CFG), swap_ab=swap_ab)
+
+
+@requires_sm120
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["normal", "swap_ab"])
+def test_sm120_moe_mxfp8_partial_scale_block_call_is_refused(swap_ab) -> None:
+    """The kernel binds K per call: a plan built at a whole-block K refuses a call whose K ends
+    inside a scale block before it writes anything, and still serves a K tail of whole blocks."""
+    E, S, N = 2, 256, 256
+    offsets_list = [0, 128, S]
+    compiled = _plan(_build_graph(E, S, N, 160, 2, combo="mxfp8"), config=by_name(_SM120_BS_CFG), swap_ab=swap_ab)
+    torch.manual_seed(0)
+
+    def call(K):
+        n_sc = _ceil_div(K, 32)  # a partial last block would carry a scale of its own
+        sf_cols = _ceil_div(n_sc, 4) * 4
+        tok = (torch.randn(1, S, K, device="cuda") * 0.5).to(torch.float8_e4m3fn)
+        w = (torch.randn(E, N, K, device="cuda") * 0.5).to(torch.float8_e4m3fn)
+        sfa, sfb = _rand_e8m0((S, n_sc), "cuda"), _rand_e8m0((E, N, n_sc), "cuda")
+        groups = list(zip(offsets_list, offsets_list[1:]))
+        sfa_live = torch.cat([_to_blocked(sfa[b:e]).view(torch.uint8) for b, e in groups]).view(sfa.dtype)
+        sfa_blk = _with_static_segmented_capacity(sfa_live, S, len(groups), sf_cols)
+        sfb_blk = torch.cat([_to_blocked(sfb[e]) for e in range(E)]).view(E, _ceil_div(N, 128) * 128, sf_cols)
+        out = torch.full((1, S, N), 7.0, dtype=torch.bfloat16, device="cuda")
+        fto = torch.tensor(offsets_list, dtype=torch.int32, device="cuda")
+        tok_s = tok[0].float() * sfa.float().repeat_interleave(32, 1)[:, :K]
+        w_s = w.float() * sfb.float().repeat_interleave(32, 2)[:, :, :K]
+        ref = torch.cat([tok_s[b:e] @ w_s[gi % E].T for gi, (b, e) in enumerate(groups)])
+        return _vp_bs(compiled, tok, w, out, sfa_blk, sfb_blk, fto=fto), out, ref.to(torch.bfloat16)
+
+    vp, out, ref = call(160)  # 1.25 K tiles, whole scale blocks
+    compiled(vp)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out[0], ref, atol=2e-1, rtol=2e-2)
+
+    vp, out, _ = call(144)
+    with pytest.raises(ValueError, match="not a multiple of the scale block size 32"):
+        compiled(vp)
+    torch.cuda.synchronize()
+    assert torch.all(out == 7.0)
