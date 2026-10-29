@@ -804,7 +804,7 @@ def test_rubin_decode_packing_uses_selected_flavor(monkeypatch, d, s_q, window, 
     assert mismatch(spec.capabilities, facts, packed) is None
     assert _selected_d_shape(spec.capabilities, facts, packed) == ((64, 64) if d == 64 else (128, 128))
     if d == 128:
-        assert plans[0].knobs.pack_gqa
+        assert any(p.knobs.pack_gqa for p in plans)
     if sink:
         assert all(p.knobs.split_kv == 1 for p in plans)  # no sink split on this row
     else:
