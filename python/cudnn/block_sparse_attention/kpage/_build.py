@@ -12,6 +12,9 @@
 # kernel, the rest to M128 x N128.  The Q and KV partitions are independent
 # (q_sizes over nQ blocks, kv_sizes over nKV blocks); dense Q is q_sizes == 128.
 #
+# Sparse block size 64 (``build_walk_tables_blk64``, forward only) uses the same table layout with 4 pages per block and
+# every Q block routed to the M64 kernel as a single tile.
+#
 # Backward: each CTA owns an 8-page K/V tile packed from consecutive KV
 # blocks (full blocks tile-aligned, partial blocks next-fit, no block straddles
 # a tile) and walks the union of the Q pages adjacent to any of those blocks.
@@ -31,6 +34,7 @@ from torch import Tensor
 
 from cudnn.block_sparse_attention.csrc.utils.kpage_utils import BLOCK, FRAGS_PER_TILE, PAGE
 
+_BLOCK64 = 64
 _Q64_HEAVY_ITER_THRESHOLD = 64
 _Q128_HEAVY_ITER_THRESHOLD = 96
 
@@ -39,6 +43,7 @@ __all__ = [
     "PagedKVWalkTables",
     "WalkTables",
     "build_walk_tables",
+    "build_walk_tables_blk64",
     "set_pad_q_stats",
     "zero_pad_forward_state",
     "zero_pad_rows",
@@ -548,6 +553,73 @@ def build_walk_tables(
         work_indices=work_indices_q64.contiguous(),
     )
     return tables, blk64_tables
+
+
+def build_walk_tables_blk64(
+    q2k_block_index: Tensor,  # [1, H, nQ, cap] int32, sparse_block_size 64
+    q2k_block_nums: Tensor,  # [1, H, nQ] int32
+    kv_sizes: Tensor,  # [nKV] int32 valid rows per 64-row KV block; device kernels clamp on load
+) -> Blk64ForwardTables:
+    """Forward page walks for sparse_block_size=64 metadata, for the M64 x N256 kernel.
+
+    A 64-row Q block is one M64 tile, so the tables are indexed by the Q block itself (``[1, H, nQ]``, not the two
+    halves of a 128-row block) and the M128 route is never used.  Q padding is not skipped, as in the base blk64
+    kernel.  One readback sizes the tables.
+    """
+    from ._build_kernels import current_stream, walk_fill, walk_stats
+
+    dev = kv_sizes.device
+    batch, num_heads, n_q_blocks, cap = q2k_block_index.shape
+    assert batch == 1, "kpage blk64 runs a batch as independent heads; batch must be 1"
+    idx = q2k_block_index.view(-1, cap)  # [H*nQ, cap]
+    cnt = q2k_block_nums.view(-1)  # [H*nQ]
+    assert idx.dtype == torch.int32 and cnt.dtype == torch.int32 and kv_sizes.dtype == torch.int32
+    n_walks = idx.shape[0]
+    q_sizes = torch.full((n_q_blocks,), _BLOCK64, dtype=torch.int32, device=dev)
+
+    stream = current_stream()
+    iter_tiles = torch.empty(n_walks, dtype=torch.int32, device=dev)
+    walk_stats(idx, cnt, q_sizes, kv_sizes, iter_tiles, stream, block=_BLOCK64)
+    tile_off = torch.cumsum(iter_tiles, dim=0, dtype=torch.int32) - iter_tiles
+    total_tiles = int((tile_off[-1] + iter_tiles[-1]).cpu())
+
+    # Dummy page ids are out of bounds for the TMA descriptor and load as zeros.
+    nt = max(total_tiles, 1)
+    page_table = torch.empty((nt, FRAGS_PER_TILE), dtype=torch.int32, device=dev)
+    mask_table = torch.empty((nt, 4), dtype=torch.int32, device=dev)
+    full_tile_counts = torch.empty(n_walks, dtype=torch.int32, device=dev)
+    tile_offsets = torch.empty(n_walks, dtype=torch.int32, device=dev)
+    iter_counts = torch.empty_like(tile_offsets)
+    full_iter_counts = torch.empty_like(tile_offsets)
+    walk_fill(
+        idx,
+        cnt,
+        q_sizes,
+        kv_sizes,
+        tile_off,
+        iter_tiles,
+        full_tile_counts,
+        tile_offsets,
+        iter_counts,
+        full_iter_counts,
+        page_table,
+        mask_table,
+        stream,
+        block=_BLOCK64,
+    )
+
+    # Every walk is queued, as on the blk128 route: an empty one (allow_empty_block_nums) takes the kernel's
+    # empty-tile path and writes O = 0, LSE = -inf.  Long walks first, stable within each class.
+    heavy = iter_counts > _Q64_HEAVY_ITER_THRESHOLD
+    work_indices = torch.argsort(~heavy, stable=True).to(torch.int32).contiguous()
+    return Blk64ForwardTables(
+        page_table=page_table,
+        tile_offsets=tile_offsets.view(1, num_heads, n_q_blocks),
+        iter_counts=iter_counts.view(1, num_heads, n_q_blocks),
+        full_iter_counts=full_iter_counts.view(1, num_heads, n_q_blocks),
+        mask_table=mask_table,
+        work_indices=work_indices,
+    )
 
 
 # ---------------------------------------------------------------------------

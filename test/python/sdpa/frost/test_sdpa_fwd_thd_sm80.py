@@ -653,14 +653,142 @@ def test_graph_thd_declines_dense_padded_stats():
     assert reason is not None and "ragged stats offsets" in reason
 
 
-def test_graph_thd_declines_gapped_token_stride():
+def test_graph_thd_declines_overlapping_token_stride():
     graph, _, nodes, _ = _make_graph((144, 96), (160, 128))
     q = nodes[0]
-    q.set_stride((144 * (2 * 128 + 8), 128, 2 * 128 + 8, 1))
+    q.set_stride((7, 128, 248, 1))
     facts = ga.analyze(graph)
     caps = next(spec.capabilities for spec in fwd_engines.ENGINE_SPECS if spec.name == _ENGINE)
     reason = fwd_engines.mismatch(caps, facts)
-    assert reason is not None and "compact packed BSHD strides" in reason
+    assert reason is not None and "Q" in reason and "non-overlapping" in reason
+
+
+@pytest.mark.parametrize("d,dv", [(64, 64), (128, 128), (192, 128), (256, 256)])
+@pytest.mark.parametrize("stats_layout", ["head_major_padded", "token_major"])
+@pytest.mark.parametrize("stats_carrier", ["canonical", "th1"])
+def test_graph_thd_independent_pitches_rebind_replay(d, dv, stats_layout, stats_carrier, cudnn_handle):
+    """Declared pitches reach every address; padding and allocation tails stay untouched."""
+    from test_sdpa_bwd_staged_sm80 import _assert_kernel_count
+
+    lens_q, lens_kv = (33, 0, 17), (41, 3, 23)
+    dtype = torch.bfloat16 if d == 192 else torch.float16
+    graph, vp, nodes, _ = _make_graph(lens_q, lens_kv, h=4, hkv=2, d=d, dv=dv, dtype=dtype, stats_layout=stats_layout, cap_extra=5)
+    q, k, v, o, stats = nodes
+    stats_view = vp[stats]
+
+    def bind_stats():
+        # Graph producers also expose packed Stats as (T, H, 1), including
+        # head-major storage with an independent, padded head pitch.
+        vp[stats] = stats_view
+        if stats_carrier == "th1":
+            vp[stats] = stats_view.unsqueeze(-1) if stats_layout == "token_major" else stats_view[0, :, : sum(lens_q)].T.unsqueeze(-1)
+
+    bind_stats()
+    storage = {}
+    for index, node in enumerate((q, k, v, o)):
+        _, heads, _, width = node.get_dim()
+        total = sum(lens_q if node in (q, o) else lens_kv)
+        head_stride = width + 8 * (index + 1)
+        token_stride = heads * head_stride + 8 * (index + 2)
+        span = (total + 4) * token_stride + (heads - 1) * head_stride + width
+        backing = torch.full((span + 24,), 77.0 if node is o else float("nan"), dtype=dtype, device="cuda")
+        view = backing.as_strided((1, total + 5, heads, width), (0, token_stride, head_stride, 1), 8)
+        if node is not o:
+            view[:, :total].normal_()
+        node.set_stride((7, head_stride, token_stride, 1))
+        for offset in vp:
+            if offset.get_name() == node.get_name() + "_ro":
+                # The graph still describes adjacent sequences; physical token pitches differ by port.
+                vp[offset].div_(node.get_dim()[1] * width, rounding_mode="floor").mul_(token_stride)
+        vp[node] = view
+        storage[node] = backing
+    output_padding = torch.ones_like(storage[o], dtype=torch.bool)
+    output_padding.as_strided(vp[o][:, : sum(lens_q)].shape, vp[o].stride(), 8).fill_(False)
+    workspace = _plan(graph)
+
+    def poison():
+        vp[o][:, : sum(lens_q)].fill_(float("nan"))
+        vp[stats].fill_(float("nan"))
+        workspace.fill_(0xA5)
+
+    def check(q_lengths, kv_lengths):
+        oq = ok = 0
+        for nq, nk in zip(q_lengths, kv_lengths, strict=True):
+            if nq:
+                qd = vp[q][0, oq : oq + nq].transpose(0, 1).double()
+                kd = vp[k][0, ok : ok + nk].transpose(0, 1).double().repeat_interleave(2, dim=0)
+                vd = vp[v][0, ok : ok + nk].transpose(0, 1).double().repeat_interleave(2, dim=0)
+                if nk:
+                    scores = qd @ kd.transpose(-1, -2) / math.sqrt(d)
+                    ref_o, ref_lse = scores.softmax(-1) @ vd, scores.logsumexp(-1)
+                else:
+                    ref_o = torch.zeros((4, nq, dv), dtype=torch.float64, device="cuda")
+                    ref_lse = torch.full((4, nq), -float("inf"), dtype=torch.float64, device="cuda")
+                torch.testing.assert_close(vp[o][0, oq : oq + nq].transpose(0, 1).float(), ref_o.float(), rtol=1e-2, atol=4e-3)
+                got_lse = stats_view[oq : oq + nq].T if stats_layout == "token_major" else stats_view[0, :, oq : oq + nq]
+                torch.testing.assert_close(got_lse, ref_lse.float(), rtol=1e-3, atol=2e-3)
+            oq += nq
+            ok += nk
+        assert torch.all(storage[o][output_padding] == 77)
+        if stats_layout != "token_major":
+            assert torch.isnan(stats_view[0, :, oq:]).all()
+
+    poison()
+    graph.execute(vp, workspace)
+    torch.cuda.synchronize()
+    check(lens_q, lens_kv)
+    if stats_carrier == "th1":
+        good = vp[stats]
+        token_stride, head_stride, _ = good.stride()
+        for bad in (
+            good[:-1],
+            torch.empty_strided(good.shape, (token_stride + 1, head_stride, 1), dtype=good.dtype, device=good.device),
+            torch.empty_strided(good.shape, (token_stride, head_stride + 1, 1), dtype=good.dtype, device=good.device),
+        ):
+            poison()
+            vp[stats] = bad
+            with pytest.raises(ValueError, match="SM80 THD .*Stats"):
+                graph.execute(vp, workspace)
+            assert torch.isnan(vp[o][:, : sum(lens_q)]).all()
+            assert torch.all(workspace == 0xA5)
+            vp[stats] = good
+    # Fresh allocations with the same pitches must not retain any previous pointer.
+    for node in (q, k, v, o):
+        storage[node] = storage[node].clone()
+        vp[node] = storage[node].as_strided(vp[node].shape, vp[node].stride(), 8)
+    stats_view = stats_view.clone()
+    bind_stats()
+    vp[v][:, : sum(lens_kv)].mul_(0.7)
+    poison()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    captured = torch.cuda.CUDAGraph(keep_graph=True)
+    try:
+        handle = cudnn_handle
+        previous_stream = cudnn.get_stream(handle)
+        try:
+            cudnn.set_stream(handle, stream.cuda_stream)
+            with torch.cuda.graph(captured, stream=stream):
+                graph.execute(vp, workspace, handle=handle)
+            _assert_kernel_count(captured, 2)  # device lengths metadata + attention, no layout copies
+        finally:
+            cudnn.set_stream(handle, previous_stream)
+        new_q, new_kv = (0, 25, 25), (26, 0, 41)
+        for node in vp:
+            name = node.get_name()
+            if name in ("seq_len_q", "seq_len_kv"):
+                vp[node].copy_(torch.tensor(new_q if name == "seq_len_q" else new_kv, dtype=torch.int32, device="cuda").view_as(vp[node]))
+            elif name.endswith("_ro"):
+                lengths = new_kv if name in ("k_ro", "v_ro") else new_q
+                prefix = [0, lengths[0], lengths[0] + lengths[1], sum(lengths)]
+                data_node = next((n for n in (q, k, v, o) if n.get_name() + "_ro" == name), None)
+                pitch = data_node.get_stride()[2] if data_node is not None else (4 if stats_layout == "token_major" else 1)
+                vp[node].copy_(torch.tensor(prefix, dtype=torch.int64, device="cuda").view_as(vp[node]) * pitch)
+        captured.replay()
+        torch.cuda.synchronize()
+        check(new_q, new_kv)
+    finally:
+        captured.reset()
 
 
 def test_graph_thd_rejects_undersized_workspace():
