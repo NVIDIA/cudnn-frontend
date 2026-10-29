@@ -169,13 +169,16 @@ def test_mha_wrapper_preserves_unwritten_kv_capacity(dtype, monkeypatch):
     from sdpa.frost.test_sdpa_bwd_prepared_thd_sm80 import _check
 
     case = _thd_case((96, 160), (128, 96), 4, 128, dtype, hkv=4, cap_q=512, cap_kv=512, poison=True, causal=True)
-    original = torch.empty_like
 
-    def allocate(*args, **kwargs):
-        return original(*args, **kwargs).fill_(7)
+    def poison(allocate):
+        def poisoned(*args, **kwargs):
+            return allocate(*args, **kwargs).fill_(7)
+
+        return poisoned
 
     with monkeypatch.context() as guard:
-        guard.setattr(torch, "empty_like", allocate)
+        for name in ("empty", "empty_like"):
+            guard.setattr(torch, name, poison(getattr(torch, name)))
         result = _wrapper(case, _prefix(case.cu_q), _prefix(case.cu_k), max_s_q=160, max_s_kv=128)
     _check(case, *(result[key] for key in ("dq_tensor", "dk_tensor", "dv_tensor")))
     assert torch.count_nonzero(result["dq_tensor"][:, case.t_q :]) == 0
