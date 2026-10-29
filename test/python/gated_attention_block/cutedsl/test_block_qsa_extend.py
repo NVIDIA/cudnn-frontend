@@ -341,6 +341,21 @@ class _IndexerExtendCase(_qsa._IndexerCase):
         self.index_kv_cache.copy_(self._snap[0])
         self.index_state_cache.copy_(self._snap[1])
 
+    def prime_prefix(self):
+        """The PREFIX blocks of every live sequence (``j < floor(P / 4)``) into the paged compressed-key cache through the compress kernel under
+        this case's rounding attribute (what a FROST prefill would have written), once per case; vectorised over the blocks (30720 at the 128K reach)."""
+        if getattr(self, "_primed", False):
+            return
+        for b, L in enumerate(self.kv_lens):
+            nb = max(L - self.s_q, 0) // BS
+            if L == 0 or nb == 0:
+                continue
+            kb = self.compress(self.k_raw_full[b][None, : nb * BS], self.cos_pos, self.sin_pos)  # [1, nb, d_i]
+            j = torch.arange(nb, device=_DEV)
+            self.index_kv_cache[self.block_table[b, j // self.rpp].long(), j % self.rpp, 0] = kb[0]
+        torch.cuda.synchronize()
+        self._primed = True
+
     def compress(self, k_raw, cos, sin, pool=BS, out_dtype=None):
         """The compress kernel's prefill form under THIS case's rounding attribute (the from-scratch oracle of every cache row)."""
         from cudnn.gated_attention_block.kernels.qsa_compress import compile_qsa_compress, run_qsa_compress
@@ -447,7 +462,6 @@ class _IndexerExtendCase(_qsa._IndexerCase):
             assert seqrep[b] == n_keys, f"{what}: sequence {b}: the report is {seqrep[b]}, expected n_keys {n_keys}"
             stream = self.stream_raw(b)  # [L, d_i]
             nb = L // BS
-            pages_all = self.block_table[b, : -(-nb // self.rpp)].long() if nb else None
             if nb:
                 kb = self.compress(stream[None, : nb * BS], self.cos_pos, self.sin_pos)[0]  # the from-scratch compress of the WHOLE stream
                 j_all = torch.arange(nb, device=_DEV)
@@ -1012,9 +1026,7 @@ def test_extend_device_value_contract_reports_short_and_over_sequences_and_keeps
     assert rep == [300 // BS, SEQREP_DEAD, SEQREP_SHORT], rep
     counts = case.kernel_counts()
     assert bool((counts[1] == 0).all()) and bool((counts[2, : t - 20] == 0).all()) and int(counts[2, -1]) == 20 // BS, counts[2].tolist()
-    assert (
-        torch.isfinite(case.out.float()).all() and torch.isfinite(case.lse[:, :, :]).all() or True
-    )  # the misaligned rows are finite inputs through finite kernels
+    assert torch.isfinite(case.out.float()).all(), "the short sequence's misaligned rows must stay finite (finite inputs through finite kernels)"
     assert bool((case.out[1] == 0).all()), "the dead sequence is not exact beside a short one"
     # (b) the OVER sequence: kv_lens past max_pages x P on sequence 0, through the INDEXER STAGE alone on a sentinel-tailed workspace
     case.restore()
@@ -1061,7 +1073,7 @@ def test_extend_device_value_contract_reports_short_and_over_sequences_and_keeps
         assert used <= rows * nb_max
         assert bool((v["cand"][offs[p] + used : offs[p + 1]] == -7.0).all()), f"piece {p}: a scorer write past its used compact slab ({used} floats)"
     cs = v["cslot"][0].tolist()
-    assert all(x in (-1, -2) for x in cs), cs  # blocks past the table report -2, never a write
+    assert any(x == -2 for x in cs) and all(x in (-1, -2) or 0 <= x < nb_max for x in cs), cs  # a block past the table reports -2 and writes nothing
     case.restore()
 
 
@@ -1148,7 +1160,9 @@ def test_extend_launch_census_by_kernel_name_and_the_window_scaling():
     assert len(k_ext) - len(k_ctl) == 6, (len(k_ext), len(k_ctl))
     assert len(k_two) - len(k_ext) == 2, (len(k_two), len(k_ext))
     extra = Counter(k_two) - Counter(k_ext)
-    assert sum(extra.values()) == 2 and all(n not in (Counter(k_ext) - Counter(k_ctl)) or True for n in extra)  # the second window's scorer + top-k pair
+    assert sum(extra.values()) == 2 and set(extra) <= set(
+        Counter(k_ext) - Counter(k_ctl)
+    ), extra  # the second window's scorer + top-k pair: kernels the one-window block runs once
 
 
 @requires_rubin
