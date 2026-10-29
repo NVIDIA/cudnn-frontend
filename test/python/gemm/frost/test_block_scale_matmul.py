@@ -3285,6 +3285,10 @@ _SM120_BS_128_W24 = "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps2x4"
 _SM120_BS_128x64 = "CONFIG_sm120_128x64x128_16x16x32_cluster1x1_warps4x2"
 _SM120_BS_64x128 = "CONFIG_sm120_64x128x128_16x16x32_cluster1x1_warps2x4"
 _SM120_BS_256x128 = "CONFIG_sm120_256x128x128_16x16x32_cluster1x1_warps8x1"
+# Explicit (non-catalog) tiles with a CTA extent above the 256-element TMA box dimension.
+_SM120_BS_512x16 = "CONFIG_sm120_512x16x128_16x16x32_cluster1x1_warps8x1"
+_SM120_BS_384x16 = "CONFIG_sm120_384x16x128_16x16x32_cluster1x1_warps8x1"
+_SM120_BS_32x384 = "CONFIG_sm120_32x384x128_16x16x32_cluster1x1_warps1x8"
 
 
 def _build_dense_bf16_graph(M, N, K):
@@ -3420,6 +3424,25 @@ def test_sm120_block_scale_config_rules():
     assert "divisor of 128" in _sm120_bs_template()._config_reject(chain, by_name("CONFIG_sm120_128x192x128_16x16x32_cluster1x1_warps4x2"))
 
 
+def test_sm120_block_scale_k_major_tile_fits_one_tma_box():
+    """A K-major operand is one [cta_k, CTA extent] TMA box per stage, and
+    cuTensorMapEncodeTiled refuses a box dimension above 256 when the host stub
+    encodes it at launch, where CuTe DSL aborts the process. The tile rules admit
+    a 384- or 512-row tile (a multiple of 128), so the geometry gate declines it
+    on the operand layout. An MN-major operand is loaded in 128-element group
+    boxes and keeps its wide tile."""
+    mxfp8 = dict(block_size=32, sf_dt=cudnn.data_type.FP8_E8M0, a_dt=cudnn.data_type.FP8_E4M3)
+    k_major = analyze(_build_nvfp4_graph(512, 384, 256, **mxfp8))
+    for name, extent in ((_SM120_BS_512x16, "cta_tile_m=512"), (_SM120_BS_384x16, "cta_tile_m=384"), (_SM120_BS_32x384, "cta_tile_n=384")):
+        with pytest.raises(NotImplementedError, match=f"{extent} exceeds the TMA box_dim ceiling of 256"):
+            C120._check_block_scale_geometry(k_major, by_name(name))
+    with pytest.raises(NotImplementedError, match="cta_tile_m=512 exceeds the TMA box_dim ceiling of 256"):
+        C120._check_block_scale_geometry(analyze(_build_nvfp4_graph(512, 384, 512)), by_name(_SM120_BS_512x16))
+    C120._check_block_scale_geometry(k_major, by_name(_SM120_BS_256x128))  # a 256-row box is the ceiling itself
+    C120._check_block_scale_geometry(analyze(_build_nvfp4_graph(384, 256, 256, a_major="m", **mxfp8)), by_name(_SM120_BS_384x16))
+    C120._check_block_scale_geometry(analyze(_build_nvfp4_graph(64, 384, 256, b_major="n", **mxfp8)), by_name(_SM120_BS_32x384))
+
+
 @pytest.mark.parametrize(
     "combo, kind, vec, fmt, ptx",
     [
@@ -3551,6 +3574,20 @@ def test_sm120_block_scale_matmul_splitk_numerics(combo, config_name, S, M, N, K
 
 
 @requires_sm120
+def test_sm120_block_scale_splitk_declines_tile_invariant_fp32_sum(monkeypatch):
+    """The block-scale template shares the split-K reducer, so an explicit split declines an fp32 sum over
+    all of M and N (one same-address atomic per output vector drifts) before any kernel is rendered."""
+    g = _build_block_scale_reduction_graph(256, 256, 4096, cudnn.reduction_mode.AVG, [1, 1, 1])
+
+    def no_render(src):
+        pytest.fail("a declined split-K config must not render a kernel")
+
+    monkeypatch.setattr(C, "_import_kernel", no_render)
+    with pytest.raises(NotImplementedError, match="fp32 avg reduction over all of M and N"):
+        jit_from_cudnn_graph(g, config=dataclasses.replace(by_name(_SM120_BS_128), split_k_slices=2))
+
+
+@requires_sm120
 @pytest.mark.parametrize("combo", ["nvfp4", "mxfp8"])
 def test_sm120_block_scale_matmul_m_major_out(combo):
     _run_bs_numeric(combo, _SM120_BS_128, 256, 256, 512, out_major="m")
@@ -3611,6 +3648,51 @@ def test_sm120_block_scale_splitk_batched_row_aux():
 @pytest.mark.parametrize("config_name", [_SM120_BS_128, _SM120_BS_128_W24])
 def test_sm120_mxfp8_m_major_a_n_major_b(config_name):
     _run_mxfp8_mn_major_numeric(config_name, 256, 256, 512)
+
+
+@requires_sm120
+@pytest.mark.parametrize("public", [False, True], ids=["jit", "knob_replay"])
+@pytest.mark.parametrize(
+    "combo, config_name, M, N",
+    [("mxfp8", _SM120_BS_512x16, 512, 128), ("nvfp4", _SM120_BS_512x16, 512, 128), ("mxfp8", _SM120_BS_32x384, 64, 384)],
+    ids=["mxfp8-k_major_a_512", "nvfp4-k_major_a_512", "mxfp8-k_major_b_384"],
+)
+def test_sm120_block_scale_wide_k_major_tile_declines_before_compile(combo, config_name, M, N, public, monkeypatch):
+    """Both routes that take an explicit tile -- jit_from_cudnn_graph and a
+    replayed FROST knob record -- decline a K-major operand wider than one TMA
+    box before a kernel is rendered and compiled. Without the gate the plan
+    built and its first execute aborted the process ("CUDA Dialect Assertion
+    failed on CUDA error: cudaErrorInvalidValue"), leaving nothing to decline
+    on. One case per route, so each route fails on its own without the gate."""
+    from cudnn.engines import is_python_engine
+    from cudnn.gemm.frost.knobs import GemmKnobs
+
+    def no_compile(src):
+        raise AssertionError(f"rendered a kernel for {config_name}")
+
+    monkeypatch.setattr(C120, "_import_kernel", no_compile)
+    kw = dict(block_size=32, sf_dt=cudnn.data_type.FP8_E8M0, a_dt=cudnn.data_type.FP8_E4M3) if combo == "mxfp8" else {}
+    K = 256 if combo == "mxfp8" else 512
+    if not public:
+        with pytest.raises(NotImplementedError, match="exceeds the TMA box_dim ceiling of 256"):
+            jit_from_cudnn_graph(_build_nvfp4_graph(M, N, K, **kw), config=by_name(config_name))
+        return
+
+    def graph():
+        g = _build_nvfp4_graph(M, N, K, **kw)
+        g.validate()
+        g.build_operation_graph()
+        return g
+
+    g = graph()
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    engine = next(e for e, _ in (g.get_engine_and_knobs_at_index(i) for i in range(g.get_execution_plan_count())) if is_python_engine(e))
+    replay = graph()
+    replay.create_execution_plan(engine, GemmKnobs.from_config(by_name(config_name)).to_public())
+    replay.select_plan(replay.get_execution_plan_count() - 1)
+    with pytest.raises(NotImplementedError, match="exceeds the TMA box_dim ceiling of 256"):
+        replay.check_support()
+        replay.build_plans()
 
 
 @requires_sm120

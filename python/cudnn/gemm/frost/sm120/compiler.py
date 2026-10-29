@@ -63,6 +63,8 @@ from ..fusion_ir import (
     FusionChain,
     MoeSwapAbSpec,
     TensorRef,
+    gemm_index,
+    is_gemm_source,
     segmented_row_scale_capacity_rows,
 )
 from ..recipe import (
@@ -313,6 +315,31 @@ def _l2_swizzle_budget_bytes() -> int:
     return l2_swizzle_budget_bytes()
 
 
+def _single_gemm_ring_reject(chain: FusionChain, cfg: TileConfig, tmpl) -> "str | None":
+    """Decline a single-GEMM tile the plain templates would trace with an empty AB ring.
+
+    For one GEMM the renderer emits ``ab_stages = cfg.max_ab_stages(...)`` (operand bytes
+    only) with ``stg_epi_prefunded = False``; the template then gives up whole stages of its
+    ``_AB_STAGE_BYTES`` for the transposed-STG epilogue staging. The catalog sweep
+    (``_sm120_smem_feasible``) applies the same rule, but an explicit or knob-replayed
+    geometry reaches the renderer without it."""
+    if chain.is_multi_gemm or chain.has_block_scale or tmpl.family != _FAMILY:
+        return None
+    from ..tile_config import _SM120_STG_STAGE_ELEMS
+
+    stages = cfg.max_ab_stages(smem_fixed_reserve=tmpl.smem_fixed_reserve)
+    per_stage = (chain.num_a_operands * cfg.cta_tile_m + chain.num_b_operands * cfg.cta_smem_tile_n) * cfg.cta_tile_k_bytes + 16
+    staging = 4 * _SM120_STG_STAGE_ELEMS * (cfg.cta_tile_m // cfg.warp_tile_m) * (cfg.cta_tile_n // cfg.warp_tile_n)
+    given = -(-staging // per_stage)
+    if stages - given >= 1:
+        return None
+    return (
+        f"{tmpl.file}: config {cfg.name!r} leaves no AB pipeline stage -- the SMEM budget holds {stages} "
+        f"stage(s), and the template gives up {given} whole {per_stage}-B stage(s) for its {staging}-B "
+        "epilogue staging; pick a smaller CTA tile or K tile"
+    )
+
+
 def _render_tile_constants(
     cfg: TileConfig,
     chain: FusionChain,
@@ -333,6 +360,9 @@ def _render_tile_constants(
             raise NotImplementedError(f"{tmpl.file}: {_mg}")
         _ab_stages, _, _ = tmpl.multi_gemm_ab_stages(chain, cfg)
     else:
+        _ring = _single_gemm_ring_reject(chain, cfg, tmpl)
+        if _ring is not None:
+            raise NotImplementedError(_ring)
         _ab_stages = cfg.max_ab_stages(smem_fixed_reserve=tmpl.smem_fixed_reserve)
     if chain.has_moe:
         token_major = chain.matmul.b_major if isinstance(chain.moe, MoeSwapAbSpec) else chain.matmul.a_major
@@ -541,6 +571,19 @@ def _check_block_scale_geometry(chain: FusionChain, cfg: TileConfig) -> None:
             raise ValueError(
                 f"block-scale config {cfg.name!r} cannot use {operand_name}-major input: "
                 f"SMEM extent {mn_extent} is not a multiple of the {group_elems}-element swizzle group"
+            )
+    # A K-major operand is ONE [cta_k, CTA extent] TMA box per stage (an MN-major one is loaded in the
+    # swizzle-group boxes checked above, a GATHER token one row per box). The host stub encodes it at every
+    # launch, and CuTe DSL aborts the process when cuTensorMapEncodeTiled refuses a box dimension above
+    # _TMA_BOX_DIM_MAX -- no exception, so no decline -- hence the gate here.
+    gather_side = None
+    if chain.has_moe and chain.moe.mode == "gather":
+        gather_side = "N" if isinstance(chain.moe, MoeSwapAbSpec) else "M"
+    for is_k_major, extent, side in ((a_major == "k", cfg.cta_tile_m, "M"), (b_major == "k", cfg.cta_tile_n, "N")):
+        if is_k_major and side != gather_side and extent > _TMA_BOX_DIM_MAX:
+            raise NotImplementedError(
+                f"block-scale config {cfg.name!r}: cta_tile_{side.lower()}={extent} exceeds the TMA box_dim ceiling of "
+                f"{_TMA_BOX_DIM_MAX}; the K-major operand along {side} is loaded as one [cta_k, {extent}] box per stage"
             )
 
 
@@ -1628,6 +1671,45 @@ def _check_executable(chain: FusionChain) -> None:
         raise NotImplementedError("the tvm-ffi front door is not installed, and the launch path this engine has needs it (pip install apache-tvm-ffi)")
 
 
+# Epilogue ops the shared emitter computes in Int32 (relu and leaky_relu convert
+# their float attributes to int32). The others use Float32-only CuTe DSL math
+# (floor in the comparison, logical, mod and backward step forms; exp2, rcp,
+# log, erf, sin, cos, sqrt, pow), which raises TypeError or fails to lower; div
+# emits `/`, which the DSL lowers to an fp32 divide while the vector keeps its
+# Int32 type, so the int32 output would hold the fp32 quotient's bit pattern.
+_INT32_COMPUTE_OPS = frozenset(
+    ("identity", "relu", "leaky_relu", "abs", "neg", "add", "sub", "mul", "max", "min", "add_square", "binary_select", "gen_index", "aux_load")
+)
+# The epilogue converts an int32-compute op's inputs and result with a direct
+# .to() between Int32 and their declared dtype, with no Float32 detour; between
+# Int32 and a Float8 type that cast does not compile (NVVM rejects e.g.
+# `sitofp <8 x i32> to <8 x i8>`). fp8_e5m3 does not reach this check on sm120:
+# dtype_arch_reject declines it.
+_INT32_COMPUTE_NO_CAST_DTYPES = ("fp8_e4m3", "fp8_e5m2", "fp8_e8m0")
+
+
+def _check_int32_compute(chain: FusionChain) -> None:
+    """Decline an epilogue op that computes in int32 but has no int32 emitter, or
+    whose inputs or output would need an int32 <-> fp8 conversion."""
+    for i, op in enumerate(chain.ops):
+        if op.compute_dtype != "int32":
+            continue
+        if op.op not in _INT32_COMPUTE_OPS:
+            raise NotImplementedError(
+                f"pointwise op {i} ({op.op!r}) computes in int32, which the sm120 epilogue emits only for {', '.join(sorted(_INT32_COMPUTE_OPS))}"
+            )
+        # The values the op reads: gen_index reads only its input's shape, and aux_load has no producing input.
+        refs = [op.parent_idx_b, op.parent_idx_c] + ([] if op.op in ("gen_index", "aux_load") else [op.resolved_parent_idx(i)])
+        dtypes = [chain.gemm_out_dtype(gemm_index(ref)) if is_gemm_source(ref) else chain.ops[ref].out_dtype for ref in refs if ref is not None]
+        if op.aux is not None:
+            dtypes.append(chain.aux_by_name(op.aux).dtype)
+        fp8 = sorted({dtype for dtype in (*dtypes, op.out_dtype) if dtype in _INT32_COMPUTE_NO_CAST_DTYPES})
+        if fp8:
+            raise NotImplementedError(
+                f"pointwise op {i} ({op.op!r}) computes in int32 but reads or writes {' and '.join(fp8)}; the sm120 epilogue has no int32 <-> fp8 conversion"
+            )
+
+
 def _cta_k_elems(chain: FusionChain, config: TileConfig) -> int:
     """Elements of K per CTA tile; fp4 packs two per byte."""
     return config.cta_tile_k_bytes * 8 // DTYPE_BITS[_mma_a_dtype(chain)]
@@ -1661,13 +1743,18 @@ def _splitk_reduction_serializes(chain: FusionChain, red) -> bool:
     return chain.matmul.N // _splitk_reduce_elems(chain) > _SPLITK_ROW_SUM_MAX_ATOMICS
 
 
+def _splitk_reduction_drifts(red) -> bool:
+    """Whether ``red`` is an fp32 sum over all of M and N, which the split-K reducer folds with one same-address atomic
+    per output vector. It has no register partial, so the rounding drifts with the vector count (constant-input AVG 2.8%
+    low at 3000x3000x1024 split 2, 1.5e-5 unsplit); max / min / amax and int32 sums are exact under atomics."""
+    return red.dim[1] == 1 and red.dim[2] == 1 and red.mode in ("add", "avg", "norm1", "norm2") and red.compute_dtype == "fp32"
+
+
 def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None" = None) -> TileConfig:
     """Layer split-K onto the selected config when the output grid underfills the GPU and K is deep."""
     if config.split_k_slices != 1:
         return config
     if _splitk_reject_reason(chain, replace(config, split_k_slices=2)) is not None:
-        return config
-    if any(r.dim[1] == 1 and r.dim[2] == 1 and r.mode in ("add", "avg", "norm1", "norm2") and r.compute_dtype == "fp32" for r in chain.reductions):
         return config
     if any(_splitk_reduction_serializes(chain, r) for r in chain.reductions):
         return config
@@ -2059,10 +2146,14 @@ def _precheck_plain(
     from ..kernel_registry import select_template
 
     _check_supported(chain, config)
-    _arch_reason = select_template(chain, config).active_reject(config, chain)
+    _tmpl = select_template(chain, config)
+    _arch_reason = _tmpl.active_reject(config, chain)
     if _arch_reason is not None:
         raise NotImplementedError(_arch_reason)
     _check_dtype_config_compat(chain, config)
+    _ring = _single_gemm_ring_reject(chain, config, _tmpl)
+    if _ring is not None:
+        raise NotImplementedError(_ring)
     _check_input_alignment(chain)
     _compute_output_vec_bytes(chain)
     _check_block_quant_supported(chain, _epi_vec_bytes(chain, config), config)
@@ -2102,6 +2193,9 @@ def _precheck_moe(
         _mg = _tmpl.multi_gemm_reject(chain, config)
         if _mg is not None:
             raise NotImplementedError(f"{_tmpl.file}: {_mg}")
+    _ring = _single_gemm_ring_reject(chain, config, _tmpl)
+    if _ring is not None:
+        raise NotImplementedError(_ring)
     _check_input_alignment(chain)
     _compute_output_vec_bytes(chain)
     _check_block_quant_supported(chain, _epi_vec_bytes(chain, config), config)
@@ -2344,6 +2438,7 @@ def probe_chain(chain: FusionChain, config: TileConfig) -> None:
     _dtype_reason = dtype_arch_reject(chain, _current_arch())
     if _dtype_reason is not None:
         raise NotImplementedError(_dtype_reason)
+    _check_int32_compute(chain)
     _check_executable(chain)
     _check_splitk_supported(chain, config)
     if chain.is_multi_gemm and not (chain.has_moe or chain.has_block_scale):
@@ -2386,6 +2481,10 @@ def _splitk_reject_reason(chain: FusionChain, config: TileConfig) -> "str | None
         reasons.append("packed fp4 output")
     if chain.matmul.accum_dtype != "fp32":
         reasons.append(f"{chain.matmul.accum_dtype} accumulation (fp32 partials only)")
+    # The automatic pick and every explicit path (a config, a replayed SPLIT_K_SLC knob) share this numerics gate.
+    drifting = sorted({red.mode for red in chain.reductions if _splitk_reduction_drifts(red)})
+    if drifting:
+        reasons.append(f"fp32 {'/'.join(drifting)} reduction over all of M and N (the reducer adds it with one same-address atomic per vector, which drifts)")
     if chain.matmul.batch * config.split_k_slices > 65535:
         reasons.append(f"grid.z={chain.matmul.batch * config.split_k_slices} exceeds CUDA's 65535 limit")
     if config.split_k_slices > 32:
@@ -2420,6 +2519,7 @@ def jit_from_cudnn_graph(
     _dtype_reason = dtype_arch_reject(chain, _current_arch())
     if _dtype_reason is not None:
         raise NotImplementedError(_dtype_reason)
+    _check_int32_compute(chain)
     _check_cta_group_geometry(config)
     _check_mma_n_dim(chain, config)
     _check_splitk_supported(chain, config)
