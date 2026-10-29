@@ -19,6 +19,7 @@ from cudnn import behavior_note, GraphContext, data_type
 from cudnn.datatypes import _cudnn_to_frost_dtype_name
 from cudnn.engines.base import BaseEngine, CompiledPlan, ExecutionContext, PlanConfig
 from cudnn.frost import buffers
+from cudnn.frost.workspace import Workspace
 from cudnn.frost.device import build_device, current_device
 from cudnn.conv.frost.graph_analyzer import analyze, ConvGraph
 from cudnn._pygraph import pygraph
@@ -309,6 +310,10 @@ class _Sm100FrostConvPlan(CompiledPlan):
         self._dtypes = tuple(_storage_dtype_name(t.data_type) for t in tensors)
         self._indices = None
         self._device = int(device)
+        self._workspace_bytes = int(getattr(compiled, "workspace_bytes", 0))
+
+    def get_workspace_size(self) -> int:
+        return self._workspace_bytes
 
     def execute(self, graph, variant_pack, ctx: ExecutionContext) -> None:
         # The compiled artifact bakes in device properties (max active clusters), so it
@@ -341,12 +346,24 @@ class _Sm100FrostConvPlan(CompiledPlan):
         image, weight, output = operands
         # The graph follows PyTorch/cuDNN's NCDHW/KCTRS convention, while the
         # im2col template consumes zero-copy NDHWC/KTRSC/NZPQK views.
-        self._compiled(
+        args = (
             image.permute(0, 2, 3, 4, 1),
             weight.permute(0, 2, 3, 4, 1),
             output.permute(0, 2, 3, 4, 1),
             _cuda.CUstream(ctx.stream or 0),
         )
+        if self._workspace_bytes:
+            workspace = Workspace.over(variant_pack, self._workspace_bytes, "frost_conv")
+            start = variant_pack.workspace
+            end = start + self._workspace_bytes
+            for role, operand, shape, dtype in zip(("image", "weight", "Y"), operands, self._shapes, self._dtypes):
+                operand_start = operand.data_ptr()
+                operand_end = operand_start + prod(shape) * buffers.DTYPE_ITEMSIZE[dtype]
+                if start < operand_end and operand_start < end:
+                    raise ValueError(f"frost_conv: workspace must not overlap {role}")
+            self._compiled(*args, workspace.view(0, "int32", (96,)))
+        else:
+            self._compiled(*args)
 
 
 class _Sm100FrostBlockScaleConvPlan(CompiledPlan):

@@ -185,15 +185,34 @@ def _select_epi_datapath(
 
 
 @cute.kernel
+def _scan_padded_filter_planes(weight: cute.Tensor, flags: cute.Tensor):
+    """Record 0*NaN/Inf contributions from the two fully padded C96 planes."""
+    lane, _, _ = cute.arch.thread_idx()
+    channel, _, _ = cute.arch.block_idx()
+    flat = cute.make_tensor(weight.iterator, cute.make_layout(96 * 3 * 3 * 3 * 96))
+    nonfinite = cutlass.Boolean(False)
+    for chunk in cutlass.range(54, unroll=1):
+        value = flat[channel * 2592 + chunk * 32 + lane].to(cutlass.Float32)
+        nonfinite = nonfinite | (value != value) | (value == cutlass.Float32(float("inf"))) | (value == cutlass.Float32(float("-inf")))
+    nonfinite = cute.arch.vote_any_sync(nonfinite)
+    if lane == 0:
+        flags[channel] = cutlass.Int32(nonfinite)
+
+
+_scan_padded_filter_planes.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
+@cute.kernel
 def _kernel(
     # Persistent tile scheduler parameters
     tile_sched_params: utils.PersistentTileSchedulerParams,
     # Constexpr knobs
     mma_tiler: cutlass.Constexpr[Tuple[int, int, int]],
     mma_inst_shape_mnk: cutlass.Constexpr[Tuple[int, int, int]],
-    # Channel/filter tile count (= T*R*S*ceil_div(C, mma_tiler_k)), host-computed.
+    # Channel/filter tile count for the temporal planes handled by the MMA loop.
     k_tile_cnt: cutlass.Constexpr[int],
     channel_tiles: cutlass.Constexpr[int],
+    first_filter_t: cutlass.Constexpr[int],
     channel_first: cutlass.Constexpr[bool],
     num_ab_stage: cutlass.Constexpr[int],
     num_acc_stage: cutlass.Constexpr[int],
@@ -217,6 +236,7 @@ def _kernel(
     tma_b_desc: cutlass.GridConstant[cuda.TensorMap],
     tma_c_desc: cutlass.GridConstant[cuda.TensorMap],
     epilogue_op: cutlass.Constexpr,
+    padded_plane_flags,
 ) -> None:
     """Implicit-GEMM fprop kernel: TMA load + tcgen05 MMA + TMA store."""
 
@@ -225,6 +245,12 @@ def _kernel(
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
     tidx, _, _ = cute.arch.thread_idx()
     cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+
+    if cutlass.const_expr(first_filter_t == 2):
+        # Cache all 96 exception bits once per warp, before the persistent loop.
+        flag_word0 = cute.arch.vote_ballot_sync(padded_plane_flags[tidx % 32] != 0)
+        flag_word1 = cute.arch.vote_ballot_sync(padded_plane_flags[tidx % 32 + 32] != 0)
+        flag_word2 = cute.arch.vote_ballot_sync(padded_plane_flags[tidx % 32 + 64] != 0)
 
     # CTA-group geometry, threaded through every tcgen05 call site below.
     # _atom_thr = MMA-atom CTA count (2 for the 2-CTA tcgen05 group, else 1).
@@ -438,10 +464,10 @@ def _kernel(
             # Carry arithmetic below avoids division in the reduction loop.
             s_idx = 0
             r_idx = 0
-            t_idx = 0
+            t_idx = first_filter_t
             c_chunk_idx = 0
             # Initial C96/K96 frames benefit from issuing their three channel
-            # loads together. Every padded filter plane is still evaluated.
+            # loads together.
             producer_unroll = 3 if channel_first and zpq[0] == 1 and lower_pad_dhw[0] == 2 else 1
             for k in cutlass.range(0, k_tile_cnt, 1, unroll=producer_unroll):
                 mbar_full = ab_full_mbar_ptr.subview(ab_stage_idx)
@@ -522,7 +548,7 @@ def _kernel(
                             r_idx = 0
                             t_idx += 1
                             if t_idx == T_filt:
-                                t_idx = 0
+                                t_idx = first_filter_t
                                 c_chunk_idx += 1
 
             # Advance to next persistent work-tile (static schedule).
@@ -859,6 +885,18 @@ def _kernel(
                 # Apply the user-supplied epilogue_op (constexpr fn) on the FP32
                 # accumulator before casting to the output dtype (defaults to
                 # identity).
+                if cutlass.const_expr(first_filter_t == 2):
+                    flag_word = flag_word2
+                    if subtile_idx == 0:
+                        flag_word = flag_word0
+                    elif subtile_idx == 1:
+                        flag_word = flag_word1
+                    corrected = cutlass.Array(cutlass.Float32, 32)
+                    corrected[0:32] = t2r_rmem
+                    for element in cutlass.range_constexpr(32):
+                        if (flag_word & cutlass.Uint32(1 << element)) != 0:
+                            corrected[element] = cutlass.Float32(float("nan"))
+                    t2r_rmem = corrected[0:32]
                 t2r_rmem = epilogue_op(t2r_rmem)
 
                 # RMEM -> SMEM. sC is a flat cutlass.Array (c_dtype elements);
@@ -1514,6 +1552,7 @@ class _FpropKernel:
         max_active_clusters: cutlass.Constexpr,
         stream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        padded_plane_flags=None,
     ):
         """Materialise kernel arguments from setup attrs and launch the device kernel."""
         p = self._setup
@@ -1622,12 +1661,15 @@ class _FpropKernel:
             256 // p.a_dtype.width,
         )
 
-        # The producer visits every filter/channel-tile combination.
+        # The producer visits each selected filter/channel-tile combination.
         # Round C before multiplying by TRS: a partial channel tile is padded
         # independently at every filter position by TMA's out-of-bounds fill.
         mma_tiler_k = cute.size(p.mma_tiler, mode=[2])
         channel_tiles = (a.shape[4] + mma_tiler_k - 1) // mma_tiler_k
-        k_tile_cnt = T_filter * R_filter * S_filter * channel_tiles
+        # The scan evaluates the nonfinite effect of every skipped zero product.
+        # It runs on every execute, including changed-weight graph replays.
+        first_filter_t = 2 if cutlass.const_expr(padded_plane_flags is not None) else 0
+        k_tile_cnt = (T_filter - first_filter_t) * R_filter * S_filter * channel_tiles
 
         # Output spatial dims for the im2col producer/epilogue coord decode.
         # c.shape = (N, Z, P, Q, K); filter_trs / padding / stride / dilation
@@ -1636,12 +1678,15 @@ class _FpropKernel:
 
         # Launch the kernel (argument order matches the device kernel
         # signature).
+        if cutlass.const_expr(padded_plane_flags is not None):
+            _scan_padded_filter_planes(b, padded_plane_flags).launch(grid=(96, 1, 1), block=(32, 1, 1), stream=stream)
         _kernel(
             tile_sched_params,
             p.mma_tiler,
             mma_inst_shape_mnk,
             k_tile_cnt,
             channel_tiles,
+            first_filter_t,
             a.shape[4] == 96 and c.shape[4] == 96 and p.a_dtype == cutlass.BFloat16,
             p.num_ab_stage,
             p.num_acc_stage,
@@ -1659,6 +1704,7 @@ class _FpropKernel:
             tma_b_desc,
             tma_c_desc,
             epilogue_op,
+            padded_plane_flags,
         ).launch(
             grid=grid,
             block=[p.threads_per_cta, 1, 1],
@@ -1707,6 +1753,17 @@ def _is_dense_selection_candidate(tile_config: ConvTileConfig, implicit_m: int, 
         and tile_config.cta_group == (2 if implicit_m > 128 else 1)
         and tile_config.cta_tile_n in n_choices
     )
+
+
+@dataclass(frozen=True)
+class _PaddedFrameConv:
+    """Scan and convolution artifact; all mutable flags belong to the caller."""
+
+    launch: object
+    workspace_bytes: int = 96 * 4
+
+    def __call__(self, image, weight, output, stream, flags):
+        self.launch(image, weight, output, stream, flags)
 
 
 @lru_cache(maxsize=None)
@@ -1776,6 +1833,23 @@ def compile(
 
     cluster_size = tile_config.cluster_shape_mn[0] * tile_config.cluster_shape_mn[1]
     max_active_clusters = utils.HardwareInfo().get_max_active_clusters(cluster_size)
+    use_padded_plane_scan = (
+        allow_c96
+        and K == 96
+        and D == Z == 1
+        and (T, R, S) == (3, 3, 3)
+        and lower_padding_dhw == (2, 1, 1)
+        and upper_padding_dhw == (0, 1, 1)
+        and stride_dhw == dilation_dhw == (1, 1, 1)
+        and epilogue == "identity"
+        and tile_config.cta_tile_m == 128
+        and tile_config.cta_tile_n == 96
+    )
+    if use_padded_plane_scan:
+        flags = make_fake_compact_tensor(cutlass.Int32, (96,), assumed_align=16)
+        return _PaddedFrameConv(
+            cute.compile(fprop_op, fake_a, fake_b, fake_c, max_active_clusters, make_fake_stream(), epilogue_op, flags, options="--enable-tvm-ffi")
+        )
     return cute.compile(
         fprop_op,
         fake_a,

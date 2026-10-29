@@ -257,3 +257,94 @@ def test_frost_conv_c96_nonfinite_padded_filter_planes(k, value):
         actual, expected = _conv(chunk, weight), _reference(chunk, weight)
         torch.testing.assert_close(actual, expected, atol=0, rtol=0, equal_nan=True)
         assert actual[0, 0, 0].isnan().all()
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")], ids=["nan", "inf", "negative-inf"])
+@pytest.mark.parametrize("channels", [tuple(range(96)), (0, 31, 32, 63, 64, 95), (95,)], ids=["all", "word-edges", "last"])
+def test_frost_conv_c96_initial_padded_plane_flags(value, channels):
+    image = make_input((2, 96, 1, 7, 9), torch.bfloat16, seed=610)
+    weight = _compact(torch.full((96, 96, 3, 3, 3), 0.25, device="cuda", dtype=torch.bfloat16))
+    for k in channels:
+        weight[k, 95, k % 2, 2, 2] = value
+    actual = _conv(image, weight)
+    torch.testing.assert_close(actual, _reference(image, weight), atol=0, rtol=0, equal_nan=True)
+    assert actual[:, channels].isnan().all()
+    # Clearing the exception at the same weight address must clear every flag.
+    weight.fill_(0.25)
+    torch.testing.assert_close(_conv(image, weight), _reference(image, weight), atol=0, rtol=0)
+
+
+def test_frost_conv_c96_initial_workspace_bounds_and_aliases():
+    image = make_input((1, 96, 1, 5, 7), torch.bfloat16, seed=620)
+    weight = make_input((96, 96, 3, 3, 3), torch.bfloat16, seed=621)
+    graph, (x, w, y), output, workspace = _plan(image, weight)
+    required = graph.get_workspace_size()
+    assert required == 96 * 4
+    bindings = {x: image, w: weight, y: output}
+    for invalid in (None, workspace[:0], workspace[: required - 1]):
+        output.fill_(float("nan"))
+        with pytest.raises(ValueError, match="workspace"):
+            graph.execute(bindings, invalid)
+        assert output.isnan().all()
+    for tensor in (image, weight, output):
+        alias = tensor.permute(0, 2, 3, 4, 1).view(-1).view(torch.uint8)[:required]
+        output.fill_(float("nan"))
+        with pytest.raises(ValueError, match="workspace must not overlap"):
+            graph.execute(bindings, alias)
+        assert output.isnan().all()
+    # Disjoint views of one allocation are valid; ownership alone is no alias.
+    output_bytes = output.numel() * output.element_size()
+    arena = torch.empty(required + 128 + output_bytes, device="cuda", dtype=torch.uint8)
+    shared_output = arena[required + 128 :].view(torch.bfloat16).view(1, 1, 5, 7, 96).permute(0, 4, 1, 2, 3)
+    graph.execute({x: image, w: weight, y: shared_output}, arena[:required])
+    torch.cuda.synchronize()
+    _close(shared_output, _reference(image, weight))
+
+
+def test_frost_conv_c96_initial_capture_separate_workspaces(cudnn_handle):
+    image = make_input((1, 96, 1, 64, 64), torch.bfloat16, seed=630)
+    weight = make_input((96, 96, 3, 3, 3), torch.bfloat16, seed=631)
+    graph, ports, _, _ = _plan(image, weight)
+    x, w, y = ports
+    original_stream = cudnn.get_stream(cudnn_handle)
+    captures, entries = [], []
+    try:
+        for _ in range(2):
+            current_image, current_weight = _compact(image), _compact(weight)
+            output = torch.empty_like(image)
+            workspace = torch.empty(graph.get_workspace_size(), dtype=torch.uint8, device="cuda")
+            stream, captured = torch.cuda.Stream(), torch.cuda.CUDAGraph()
+            captures.append(captured)
+            stream.wait_stream(torch.cuda.current_stream())
+            cudnn.set_stream(cudnn_handle, stream.cuda_stream)
+            with torch.cuda.stream(stream):
+                graph.execute({x: current_image, w: current_weight, y: output}, workspace, handle=cudnn_handle)
+            stream.synchronize()
+            before = torch.cuda.memory_allocated()
+            with torch.cuda.graph(captured, stream=stream):
+                previous_mode = torch.cuda.get_sync_debug_mode()
+                torch.cuda.set_sync_debug_mode("error")
+                try:
+                    graph.execute({x: current_image, w: current_weight, y: output}, workspace, handle=cudnn_handle)
+                finally:
+                    torch.cuda.set_sync_debug_mode(previous_mode)
+            assert torch.cuda.memory_allocated() == before
+            entries.append((current_image, current_weight, output, workspace, stream, captured))
+        for iteration in range(4):
+            for lane, (current_image, current_weight, output, workspace, stream, captured) in enumerate(entries):
+                current_image.fill_(0.25 * (iteration + 1))
+                current_weight.copy_(weight)
+                if (iteration + lane) % 2:
+                    current_weight[31 + 32 * lane, 95, 1, 2, 2] = float("inf")
+                output.fill_(float("nan"))
+                stream.wait_stream(torch.cuda.current_stream())
+            for _, _, _, _, stream, captured in entries:
+                with torch.cuda.stream(stream):
+                    captured.replay()
+            torch.cuda.synchronize()
+            for current_image, current_weight, output, _, _, _ in entries:
+                torch.testing.assert_close(output, _reference(current_image, current_weight), atol=0.015625, rtol=0.015625, equal_nan=True)
+    finally:
+        for captured in captures:
+            captured.reset()
+        cudnn.set_stream(cudnn_handle, original_stream)
