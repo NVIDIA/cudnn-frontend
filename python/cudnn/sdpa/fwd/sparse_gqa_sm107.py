@@ -78,7 +78,11 @@ the o_proj input scale) + ``epilogue_gate``, on a SPLIT plan (the lean tile alwa
 the split combine's fused entry (``sm100/split_combine.compile_ptr(gate=True, gate_e4m3=True, dtype_o="e4m3")``) stores
 ``e4m3(rn, satfinite)(O32 * sigmoid(G) * div.rn(1, scale))`` -- ONE rounding of the fp32 gated value, the inverse computed on device
 -- in place of the half O and the consumer's gate + quant launch; a dead row stores 0, the LSE is untouched.  Against the unfused
-chain (the half O, then ``e4m3(half(O) * inv)``) it differs by at most one e4m3 ulp at the larger magnitude, never bitwise.  ``out_scale``
+chain (the half O, then ``e4m3(half(O) * inv)``) it differs by at most one e4m3 ulp at the larger magnitude, never bitwise, WHEREVER the
+half twin does not underflow before the scale: below the half dtype's smallest normal the twin loses digits and then flushes to zero (f16
+from 2^-25 down) while the fused path keeps the fp32 magnitude -- the single rounding is the contract, the twin is not a general bound
+(the gate suite's boundary cell records 48 on every form against the f16 twin's 0 and the bf16 twin's 52: a merged value of 1e-8, a zero
+gate, the scale 1e-10).  ``out_scale``
 is a POSITIVE NORMAL fp32 by contract: its VALUE is never read on the host (a device word; the shape / dtype / contiguity are), and a zero /
 subnormal scale makes the on-device inverse +inf -- a dead row's ``0 * inf`` is then the e4m3 NaN byte and every live element +-448 (or NaN
 where it is exactly 0), so no kernel-side select makes a zero scale meaningful.  Declines by name: ``NotImplementedError`` (the typed decline

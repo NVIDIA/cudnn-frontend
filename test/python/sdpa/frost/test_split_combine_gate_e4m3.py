@@ -10,10 +10,13 @@ The entry reduces the fp32 split partials, gates the fp32 merged value with the 
 ``cvt.rn.satfinite.e4m3x2.f32`` (round-to-nearest-even, saturating at +-448).  The unfused production path -- the gated half entry of the
 same form, then ``(O.float() * inv).to(float8_e4m3fn)`` -- rounds to bf16 / f16 first, so the two differ by at most ONE e4m3 ulp at the larger
 magnitude (the unit named: the e4m3 spacing at ``max(|a|, |b|)``; the twin named: the gated half entry of the SAME kernel form plus torch's
-cast), never bitwise, and the fused store is deterministic (two launches bitwise), writes exactly 0 on a dead row whatever the gate holds, and
-leaves the LSE bitwise the half entry's (the LSE never sees the gate or the scale).  Against the serving stacks' gate-and-quantize convention
-(``e4m3(bf16(bf16(O) * sigmoid(G)) * inv)``: two half roundings, an exact sigmoid) the same one-ulp class holds; the histogram is printed, not
-claimed bitwise.
+cast), never bitwise, WHEREVER THE HALF TWIN DOES NOT UNDERFLOW BEFORE THE SCALE: below the half dtype's smallest normal the twin loses digits
+and then flushes to zero (f16 from 2^-25 down) while the fused path keeps the fp32 magnitude -- the single rounding is the contract, the twin
+is not a general bound, and the boundary cell below records the intended difference (48 on every form against the f16 twin's 0; the bf16
+twin's 52 is within the ulp).  The fused store is deterministic (two launches bitwise), writes exactly 0 on a dead row whatever the gate holds,
+and leaves the LSE bitwise the half entry's (the LSE never sees the gate or the scale).  Against the serving stacks' gate-and-quantize
+convention (``e4m3(bf16(bf16(O) * sigmoid(G)) * inv)``: two half roundings, an exact sigmoid) the same one-ulp class holds under the same
+proviso; the histogram is printed, not claimed bitwise.
 
 What this module pins: (1) the ENTRY's host contract -- the keyword's typed declines, the positional frame (the scale slot right after the gate
 strides, no defaulted slot ahead of ``stream``), the ``quant_divisor`` constexpr appended to every form and to the two launchers, and a host
@@ -21,7 +24,8 @@ trace-compile of the AUTO / OFF / LEAN_WALK forms for sm_100a and sm_107a whose 
 ``cvt.rn.satfinite.e4m3x2.f32`` pack and the packed ``st.global.b32`` store; (2) the NUMERICS on the GPU (any SM100-line part) on every form the
 entry can take -- AUTO / ON / OFF and the lean group walk --: within one ulp of the unfused twin and of the gate-and-quantize model, bitwise x2,
 dead rows 0, the LSE bitwise, AUTO == ON on a decode grid, ON == OFF at <= 16 splits (the forms' bitwise window), the walk at two geometries the
-cc 10.7 rule selects it for, the saturation contract (+-448, never NaN, where the scaled value exceeds the e4m3 range), the strided e4m3 output
+cc 10.7 rule selects it for, the f16 underflow boundary of the twin claim (48 against 0 on every form, recorded as intended; the bf16 twin
+within the ulp), the saturation contract (+-448, never NaN, where the scaled value exceeds the e4m3 range), the strided e4m3 output
 (the element path: canaries kept, bytes bitwise the packed path's), the PDL arm bitwise the plain arm; (3) the ADAPTER's op attribute (``o``
 float8_e4m3fn + ``out_scale`` + the epilogue gate on a split plan) with its declines by name, its combine-form rule on the Blackwell explicit-lean
 parts (the cc 10.7 split-aware rule's shape on cc 10.0, measured on the GB200 class 2026-10-28; cc 10.3 keeps the module's own forms), the lean
@@ -34,7 +38,6 @@ import inspect
 import json
 import math
 import os
-import re
 import subprocess
 import sys
 
@@ -217,7 +220,8 @@ def test_quant_divisor_constexpr_is_appended_to_every_form_and_both_launchers():
     ``_launch_combine``) carries NO fused arm.  Source pins, so a refactor that drops one -- or 'completes the five' -- is caught without a GPU."""
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
-    src = open(comb.__file__).read()
+    with open(comb.__file__) as fh:
+        src = fh.read()
     assert src.count("quant_divisor: cutlass.Constexpr[bool] = False") == 6, "the four kernels behind _launch_combine + _launch_combine + _launch_own_forms"
 
     def body(kernel):
@@ -473,6 +477,47 @@ def test_fused_walk_form_at_a_walk_selected_geometry(shape, splits):
         hist_gq = _check_fused(o1, _gate_quant_model(ref_o, gate, scale, dtype), l1, None, ref_lse, what=f"walk {tag} vs the gate-and-quantize model")
         print(f"\n{shape} s{splits} {tag} walk: vs unfused {hist}; vs gate-and-quantize {hist_gq}")
         assert hist["exact"] > 0
+
+
+@pytest.mark.parametrize("_m", [pytest.param(None, marks=_gpu)])
+def test_fused_keeps_the_fp32_magnitude_where_the_f16_twin_underflows_before_the_scale(_m):
+    """The BOUNDARY of the one-ulp twin claim, recorded as intended: B = H = S_q = 1, D 128, four identical fp32 partials of 1e-8 under a
+    zero partial LSE (the merged value 1e-8, the final LSE log 4), a zero gate (sigmoid 1/2: the fp32 gated value 5e-9) and the positive
+    normal scale 1e-10 (``inv`` 1e10: the scaled value is fp32 50, an e4m3 tie that rounds to even).  Every form of the fused entry stores
+    48 -- the fp32 magnitude, rounded once -- with the LSE bitwise the half entry's.  The f16 twin underflows BEFORE the scale: 5e-9 is
+    below 2^-25, half of f16's smallest subnormal, so the gated f16 entry stores 0 and its cast reads 0 -- 12 e4m3 ulp at the larger
+    magnitude; the twin is not a general bound.  bf16 does not underflow there (its smallest normal is 2^-126): the gated bf16 entry stores
+    bf16(5e-9) = 5.0059e-9 and its cast reads 52, within the one ulp the claim names.  The single rounding is the contract; the twin bounds
+    it only where the half dtype keeps the magnitude."""
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+
+    b, h, sq, d, splits = 1, 1, 1, 128, 4
+    op = torch.full((splits * b, sq, h, d), 1e-8, device="cuda", dtype=torch.float32)
+    lp = torch.zeros((splits * b, h, sq), device="cuda", dtype=torch.float32)
+    ref_lse = torch.full((b, h, sq), math.log(splits), dtype=torch.float64)  # every row live
+    scale = torch.tensor([1e-10], dtype=torch.float32, device="cuda")
+    for dtype, tag, twin_want, ulp_want in ((torch.float16, "f16", 0.0, 12.0), (torch.bfloat16, "bf16", 52.0, 1.0)):
+        gate = torch.zeros((b, sq, h, d), device="cuda", dtype=dtype)
+        fused_fns = _entries(comb, fused=True, tag=tag)
+        twin_fns = _entries(comb, fused=False, tag=tag)
+        for name in _FORMS:
+            o1, l1 = _launch(fused_fns[name], op, lp, b, h, sq, d, splits, gate, scale=scale)
+            ot, lt = _launch(twin_fns[name], op, lp, b, h, sq, d, splits, gate, out_dtype=dtype)
+            f, half_o, twin = o1.cpu().float(), ot.cpu().float(), _unfused_twin(ot, scale).cpu().float()
+            dist = _ulp_distance(f, twin)
+            print(
+                f"\nboundary {tag} {name}: fused {f.unique().tolist()} half entry {half_o.unique().tolist()} twin {twin.unique().tolist()} "
+                f"ulp {dist.unique().tolist()} lse {l1.flatten().tolist()}"
+            )
+            assert torch.all(f == 48.0), f"{tag} {name}: the fused store reads 48 everywhere (fp32 50 -> e4m3 ties to even); got {f.unique().tolist()}"
+            assert torch.equal(l1, lt), f"{tag} {name}: the LSE is bitwise the half entry's"
+            assert torch.allclose(l1.cpu(), torch.full((b, h, sq), math.log(splits)), atol=1e-5), l1  # the final LSE is log 4 (m 0, den 4)
+            assert torch.all(twin == twin_want) and torch.all(dist == ulp_want), (tag, name, twin.unique().tolist(), dist.unique().tolist())
+            if dtype == torch.float16:
+                assert torch.all(half_o == 0.0), f"{name}: the gated f16 entry underflows before the scale"
+            else:
+                assert torch.all(half_o != 0.0), f"{name}: the gated bf16 entry keeps the magnitude"
+                _check_fused(o1, _unfused_twin(ot, scale), l1, lt, ref_lse, what=f"boundary bf16 {name}")  # the claim holds where the twin keeps it
 
 
 @pytest.mark.parametrize("_m", [pytest.param(None, marks=_gpu)])

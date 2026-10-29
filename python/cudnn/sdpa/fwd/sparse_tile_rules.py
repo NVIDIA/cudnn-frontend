@@ -107,9 +107,11 @@ instruction for instruction (``cp.async``, ``ldmatrix``, ``mma.sync`` m16n8k16, 
 mbarrier / cluster / setmaxnreg), its config pins no Rubin-only size (40 KiB SMEM at k 1 under the standard carveout, 128 x N_MT threads,
 REG <= 79 at k 1 on the sm_107a trace), the split arithmetic reads the device's SM count and the DSL targets the ambient device
 (``sm_100a`` / ``sm_103a``; the compiled-plan cache keys on the device's compute capability), so the admission is a HOST rule, not a kernel
-change; the sm100 split combine reduces the slab with the gate as it does for the dense d256 decode tile on those parts (its decode-grid
-rule is cc 10.7's, so the lean splits take the module's own forms there).  UNMEASURED on these parts (2026-10-28: admitted so the route can
-be measured on a B200-class part): the AUTO reading keeps :data:`SPARSE_LEAN_TILE_DEFAULT_CCS` (cc 10.7) and the placement rule keeps
+change; the sm100 split combine reduces the slab with the gate as it does for the dense d256 decode tile on those parts -- a lean plan's
+combine FORM there is :func:`sparse_lean_combine_rule_cc`'s: on cc 10.0 the cc 10.7 split-aware rule's shape (the decode-grid kernel on the
+24-96-row grids at the lean splits; :data:`SPARSE_LEAN_COMBINE_RULE_CCS`, measured 2026-10-28), on cc 10.3 the module's own forms
+(unmeasured).  The AUTO default is UNMEASURED on these parts (2026-10-28: the explicit form admitted so the route can be measured on a
+B200-class part): the AUTO reading keeps :data:`SPARSE_LEAN_TILE_DEFAULT_CCS` (cc 10.7) and the placement rule keeps
 :data:`_SPARSE_LEAN_TILE_RULE_CC`, so ``tile_form="auto"`` / ``"tcgen05"`` on these parts resolve the tcgen05 core, which the adapter
 declines by name (:func:`sparse_tile_part_decline`: 'explicit lean tile only, unmeasured').  A measurement moves a part into the DEFAULT
 tuple with its table (the measured-default rule), never a transcription."""

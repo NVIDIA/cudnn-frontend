@@ -139,7 +139,11 @@ then ``cvt.rn.satfinite.e4m3x2.f32`` per pair (round-to-nearest-even, saturating
 ONE 32-bit word per lane where the output row is 4-byte addressable (``_store_e4m3_quad``: base, D stride 1 and the (B, S, H) strides
 multiples of 4 elements -- one byte per element), the module's element path otherwise.  So the fp32 gated value is rounded ONCE, to e4m3
 (no half rounding in between): the unfused twin -- the gated half entry then ``e4m3(bf16(O) * inv)`` -- and the serving stacks' gate-and-quantize launch
-(``e4m3(bf16(bf16(O) * sigmoid(G)) * inv)``) differ from it by at most one e4m3 ulp at the larger magnitude, never bitwise.  A dead row
+(``e4m3(bf16(bf16(O) * sigmoid(G)) * inv)``) differ from it by at most one e4m3 ulp at the larger magnitude, never bitwise, wherever the
+half twin does not underflow before the scale; below the half dtype's smallest normal the twin loses digits and then flushes to zero (f16
+from 2^-25 down) while the fused path keeps the fp32 magnitude -- the single rounding is the contract, the twin is not a general bound
+(the boundary cell of ``test_split_combine_gate_e4m3.py``: four partials of 1e-8 under a zero partial LSE, a zero gate, the scale 1e-10 ->
+48 on every form, the f16 twin 0, the bf16 twin 52).  A dead row
 stores exactly 0 (the SELECT precedes the scale; ``0 * inv`` with a finite ``inv``) -- so ``s`` is a POSITIVE NORMAL fp32 by contract: its
 value is never validated (a device word), and a zero / subnormal ``s`` makes ``inv`` +inf, a dead row's ``0 * inf`` the e4m3 NaN byte and
 every live element +-448 (or NaN where it is exactly 0) --, the LSE never sees the gate or the scale, and ``_launch_combine`` admits the
