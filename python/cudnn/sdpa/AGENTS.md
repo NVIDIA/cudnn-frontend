@@ -370,6 +370,13 @@ batch, where the linear offsets are largest. Rendering a kernel host-only for
 a `>= 2^31` geometry and grepping its PTX for `mul.wide.s32` / `cvt.s64.s32`
 on the address path shows the wrap before any GPU run.
 
+For paired dQ and dK/dV schedulers, bound each decoder's Int32 divisor using
+its own tile count and operand footprint. FP8 dQ derives its swizzle from
+K/V while dK/dV derives it from Q/dO; checking just one misses asymmetric
+sequence lengths. The host-only detector
+`test_fp8_accumulation_swizzle_accounts_for_byte_payload` exercises both
+orientations, the last safe tile and the first overflowing row.
+
 **Rule S8 — Hoist tensor-map acquire only over an immutable descriptor lifetime.**
 
 - A setup kernel may publish K/V maps once before attention. Acquire each map

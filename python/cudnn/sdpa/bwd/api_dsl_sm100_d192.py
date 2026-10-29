@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Graph adapter for dense D_QK = 192 / D_V = 128 half backward with prepared launches."""
+"""Graph adapter for dense and packed D_QK = 192 / D_V = 128 half backward with prepared launches."""
 
 import math
 from contextlib import nullcontext
@@ -15,7 +15,7 @@ D_V = 128
 
 
 class SdpaBwdDslSm100D192(SdpaBwdDsl):
-    """Dense MHA with 192-wide queries / keys and 128-wide values, top-left causal or unmasked."""
+    """Dense and packed MHA with 192-wide queries / keys and 128-wide values, top-left causal or unmasked."""
 
     _NAME = "sdpa_bwd_sm100_d192"
 
@@ -88,6 +88,11 @@ class SdpaBwdDslSm100D192(SdpaBwdDsl):
         self._implementation = None
 
     def check_support(self):
+        if self.thd:
+            from .prepared_sm100_d192_thd import check_support
+
+            return check_support(self)
+
         from cudnn import _pybind_module
         from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
         from cudnn.frost.device import compute_capability, resolve_device
@@ -150,14 +155,19 @@ class SdpaBwdDslSm100D192(SdpaBwdDsl):
         return True
 
     def compile(self):
-        from .prepared_sm100_d192 import compile_plan
-
         self._ensure_support_checked()
+        if self.thd:
+            from .prepared_sm100_d192_thd import compile_plan
+        else:
+            from .prepared_sm100_d192 import compile_plan
+
         self._prepared = compile_plan(self)
         self._compiled_kernel = self._prepared.artifact
 
     def scratch_workspace_bytes(self):
         self._ensure_support_checked()
+        if self.thd:
+            return self._thd_workspace_bytes
         return workspace_layout(self.batch_size, self.h_q, self.s_q_max, D_QK)[1]
 
     def execute(
@@ -182,6 +192,12 @@ class SdpaBwdDslSm100D192(SdpaBwdDsl):
 
         if self._prepared is None:
             raise RuntimeError(f"{self._NAME}: compile the plan before execute")
+        if self.thd:
+            from .prepared_sm100_d192_thd import execute_standalone
+
+            tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor)
+            execute_standalone(self, tensors, workspace, current_stream, scale_softmax, optional)
+            return None
         if any(value is not None for value in optional.values()):
             raise ValueError(f"{self._NAME}: optional operands were not compiled into this plan")
         tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor)
@@ -199,3 +215,4 @@ class SdpaBwdDslSm100D192(SdpaBwdDsl):
         with context:
             ensure_current_context(stream, spec.device_index)
             execute(spec, facts, workspace_ptr, stream, scale=scale_softmax, geometry=geometry)
+        return None

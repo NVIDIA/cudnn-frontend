@@ -419,7 +419,7 @@ the large-head-dim band, d ∈ (256, 512]**, the half-precision d256 backward
 engine (`sdpa_bwd_sm100_d256`, the 2x2-datapath body, 2026-10-01; default since 2026-10-27) serves
 **exactly d = 256 plus native dense and THD D192x128**, the d128 engine serves **exactly d = 64 or 128** for
 half-precision MHA and, on SM100 or SM103, BF16 GQA/MQA within the restrictions
-below, and the opt-in d192 engine serves **dense MHA D192x128** on the accumulation
+below, and the opt-in d192 engine serves **dense and packed MHA D192x128** on the accumulation
 chain. The MXFP8 backward engine serves **d = 256 on its two-kernel chain and D64, D128
 and D192x128 on the block-scale kernel pair**; the opt-in per-tensor FP8 engines serve
 **D64 and D128 (dense and grouped) and dense D192x128** —
@@ -586,16 +586,22 @@ pair body's numerics, degenerate rows and renderings; `test_sdpa_bwd_d128_dkv_ac
 `dkv_accum` field on both bodies (fp64 ladder, launch census, the dQ twin).
 
 The opt-in **d192 half backward** (`sdpa_bwd_sm100_d192`, slot 12) serves dense
-MHA (192, 128) BF16/FP16 on the d128 accumulation chain with 192-wide Q/K and
-128-wide V/O tiles: row delta plus dQ initialization, the main kernel with direct
-dK/dV stores and FP32 dQ accumulation, then the dQ conversion. Compact BSHD,
-unmasked or top-left causal, any S_q / S_kv, cc 10.0 or 10.3, public CuTeDSL >= 4.8
-and a positive FP32 scale; its scratch follows the formula above with D = 192.
-Declined: THD, GQA/MQA, sliding windows, bottom-right causal, padding, deterministic
-requests, bias / dBias, sink / dSink. `test_sdpa_bwd_d192_accum_sm100.py`
-pins the engine, its declines and its gradients against an FP32 reference. The
-default d256 row keeps serving dense and THD D192x128 on the 2x2 body; this row is a
-second, opt-in route for the dense MHA shape.
+and native THD MHA (192, 128) BF16/FP16 on an accumulation chain with 192-wide Q/K
+and 128-wide V/O tiles. Dense uses three launches: delta plus dQ initialization,
+main with direct dK/dV stores and FP32 dQ accumulation, then dQ conversion. THD
+adds device-side prefix/origin and per-sequence tensor-map setup. Its workspace
+is linear in declared compact Q capacity, with independent physical origins on
+all nine ports, token-major or head-major packed Stats, and ordinary/cumulative
+Q/KV lengths. Empty sequences, unequal lengths, changed offsets and fresh buffers
+are native; there is no tensor repack or host length read.
+
+Compact BSHD rows, unmasked or top-left causal, cc 10.0 or 10.3, public CuTeDSL
+>= 4.8 and finite positive scale. Declined: GQA/MQA, sliding windows, bottom-right
+causal, dense padding, deterministic requests, bias / dBias, sink / dSink.
+`test_sdpa_bwd_d192_accum_sm100.py` and `test_sdpa_bwd_d192_accum_thd_sm100.py`
+exercise the real graph/standalone routes and FP64 gradients. The default d256
+row retains its broader dense and THD D192x128 contract; this opt-in half row
+adds a low-workspace MHA choice. Per-tensor FP8 THD remains declined.
 
 The opt-in **per-tensor FP8 backward rows** (`sdpa_bwd_sm100_d128_fp8`, slot 11;
 `sdpa_bwd_sm100_d192_fp8`, slot 13) take E4M3 Q/K/V/O/dO with the per-tensor
@@ -622,7 +628,8 @@ served shape against an FP32 reference and pin the declines.
 | Unmasked / top-left causal | ✅ | ✅ | ✅ |
 | Left sliding window | ❌ | ✅ D64 only, with or without causal | ❌ |
 | GQA / MQA (integral Hq / Hkv) | ❌ | ✅ | ❌ |
-| THD, padding mask, bottom-right causal, right-band widening, bias / dBias, sink / dSink, deterministic request | ❌ | ❌ | ❌ |
+| Native THD, independent origins and packed Stats | ✅ | ❌ | ❌ |
+| Dense padding mask, bottom-right causal, right-band widening, bias / dBias, sink / dSink, deterministic request | ❌ | ❌ | ❌ |
 | Kernels | accumulation chain | kernel pair at D128; accumulation chain at D64 | kernel pair |
 
 The MXFP8 backward is a **two-kernel chain with a scale-factor repack in

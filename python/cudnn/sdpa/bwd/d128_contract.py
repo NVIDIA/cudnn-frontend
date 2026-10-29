@@ -89,6 +89,13 @@ def select_implementation(cc, dsl_version, batch, heads, sq, skv, scale, d_qk=12
     swizzle = 1 << (heads_per_l2.bit_length() - 1) if heads_per_l2 > 0 else 1
     if swizzle * k_tiles > 2**31 - 1:
         return RECOMPUTE
+    if input_bytes == 1:
+        # The separate FP8 dQ scheduler sizes its swizzle from K/V, then
+        # divides work ids by that swizzle times the number of Q tiles.
+        kv_heads_per_l2 = (50 * 1024 * 1024) // (skv * (d_qk + d_v) * input_bytes)
+        kv_swizzle = 1 << (kv_heads_per_l2.bit_length() - 1) if kv_heads_per_l2 > 0 else 1
+        if kv_swizzle * q_tiles > 2**31 - 1:
+            return RECOMPUTE
     if max(sq, skv) * heads * 128 * 2 >= 2**40:
         return RECOMPUTE
     try:

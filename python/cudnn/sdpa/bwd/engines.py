@@ -1963,6 +1963,46 @@ def _sm100_d128_fp8_spec() -> EngineSpec:
     )
 
 
+def _sm100_d192_half_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
+    """The half THD extension does not widen the separate FP8 row."""
+    if not facts.thd:
+        return _sm100_d192_head_mismatch(facts, version)
+    import re
+
+    from .d128_contract import ACCUMULATION_CCS, validate_accumulation_scale
+    from .d192_thd_contract import validate_bounds, validate_stats_span
+
+    if (facts.d_qk, facts.d_v) != (192, 128) or facts.h_q != facts.h_kv:
+        return "d192 THD requires MHA with exact (192, 128) head dimensions"
+    if facts.device_cc not in ACCUMULATION_CCS:
+        return "d192 THD requires SM100 or SM103 (cc 10.0 / 10.3)"
+    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version[1]) if version and version[0] == "nvidia-cutlass-dsl" else None
+    if match is None or tuple(map(int, match.groups())) < (4, 8, 0):
+        return f"d192 THD requires nvidia-cutlass-dsl >= 4.8.0; found {version}"
+    b, h, sq, sk = facts.b, facts.h_q, facts.s_q, facts.s_kv
+    tq, tk = facts.max_total_seq_len_q, facts.max_total_seq_len_kv
+    try:
+        validate_accumulation_scale(192**-0.5 if facts.scale is None else facts.scale)
+        if tq is None or tk is None:
+            return "d192 THD requires positive declared packed capacities"
+        validate_bounds(b, h, sq, sk, min(b * sq, tq), min(b * sk, tk), tq, tk)
+    except ValueError as error:
+        return str(error)
+    if facts.stats_t is not None and tuple(facts.stats_t.get_dim()) == (b, h, sq, 1):
+        stride = tuple(facts.stats_t.get_stride())
+        if len(stride) != 4:
+            return "d192 THD Stats strides must have rank 4"
+        packing = ga.thd_stats_packing(stride[1], stride[2], h)
+        if packing == "head_major" and stride[1] < tq:
+            return "d192 THD Stats head stride must cover the physical Q-token capacity"
+        if packing is not None:
+            try:
+                validate_stats_span(h, tq if packing == "token_major" else stride[1])
+            except ValueError as error:
+                return str(error)
+    return None
+
+
 def _sm100_d192_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm100_d192",
@@ -1971,9 +2011,12 @@ def _sm100_d192_spec() -> EngineSpec:
             sm_hi=106,
             d=frozenset({128, 192}),
             dqk_ge_dv=True,
-            declaration_check=_sm100_d192_head_mismatch,
+            declaration_check=_sm100_d192_half_mismatch,
             causal=True,
             compact_bshd=True,
+            thd=True,
+            thd_declared_totals=True,
+            thd_ragged_offsets=True,
             layouts=frozenset({"bshd"}),
         ),
         lower=partial(lower_dsl_bwd, api_type=_SM100_D192),
