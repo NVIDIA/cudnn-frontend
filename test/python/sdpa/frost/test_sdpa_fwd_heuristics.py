@@ -1714,7 +1714,7 @@ def test_sm107_d128_sink_free_decode_sets_are_admissible(sm107_metadata_target):
         (dict(b=1, s_q=1, s_kv=32768), SCHED_LPT),
         (dict(b=32, s_q=16, s_kv=8192), SCHED_LPT),
         (dict(b=8, s_q=1, s_kv=1024), 0),
-        (dict(b=8, s_q=4, s_kv=4096, d_qk=64, d_v=64, window_left=128), 0),
+        (dict(b=8, s_q=4, s_kv=4096, d_qk=128, d_v=128, window_left=128), 0),
         (dict(h_kv=4, s_q=16, s_kv=2048), 0),
         (dict(b=2, s_q=4096, s_kv=4096, window_left=1024), 0),
         (dict(b=2, s_q=4096, s_kv=4096, window_left=1024, has_sink=False), 0),
@@ -1739,9 +1739,9 @@ def test_sm107_shared_d128_scheduler_follows_the_measured_tables(sm107_metadata_
     facts = _sm107_d128_facts(**over)
     plans = _sm107_f16_plans(facts)
     first = plans[0].knobs
-    if over.get("d_qk") == 64:
-        # A packed d64 decode lands on the shared d128 decode tile (the native 64-wide tile is dense-only) and leads at
-        # NATURAL; the unpacked native tile stays proposed behind it.
+    if over.get("d_qk") == 128:
+        # D128 still reaches the shared decode tile when packed. D64 has
+        # its own native packed tile and is covered by the flavor contract test.
         caps = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16).capabilities
         assert first.pack_gqa is True and first.cga == 1 and first.sched_policy == first_sched, first
         assert any(not p.knobs.pack_gqa for p in plans), [p.knobs for p in plans]
