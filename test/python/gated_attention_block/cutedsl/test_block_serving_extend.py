@@ -2809,7 +2809,7 @@ def test_sm100_extend_declines_fuse_gate_and_the_fused_fork_by_name():
     assert "cc 10.0" in str(e.value) and "fuse_gate=False" in str(e.value)
     fork, *_ = _declare_extend(2, 128, max_kv_len=128, fuse_norm_rope=True)
     assert fork.fuse_norm_rope_effective
-    with pytest.raises(NotImplementedError, match="rendered for sm_107a \(Rubin\); this device is SM100"):
+    with pytest.raises(NotImplementedError, match=r"rendered for sm_107a \(Rubin\); this device is SM100"):
         fork.check_support()
     plain, *_ = _declare_extend(2, 128, max_kv_len=128)
     plain._check_declaration()
@@ -2846,6 +2846,7 @@ def _assert_one_packed_tensor(hz, what):
     return kv
 
 
+@pytest.mark.L0
 @requires_dense_part
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
 @pytest.mark.parametrize("page", [16, 32], ids=["p16", "p32"])

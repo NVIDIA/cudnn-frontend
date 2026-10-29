@@ -678,8 +678,9 @@ view's base `D` elements past the K view's -- so the pool contract admits them a
 lands K in the `[0, D)` half and V in the `[D, 2D)` half of a token's row and touches no other byte of the tensor (the other half of a written
 row is a row of the OTHER pool), and the paged forms read the halves back. Pinned by one cell per form at the stack's own shape -- 24 / 4,
 pages 16 (one token per sequence) and 32 (a four-token speculative step), kv to 2048 with a padded and a short entry, int64 slots, bf16 and
-f16; `out` bitwise the HND-compact pools', every other byte of the tensor untouched -- on every served part (cc 10.7 and cc 10.0; the
-`packed_kv_rows` cells of `test_block_serving_decode.py` / `test_block_serving_extend.py`).
+f16; `out` bitwise the HND-compact pools', every other byte of the tensor untouched (the `packed_kv_rows` cells of
+`test_block_serving_decode.py` / `test_block_serving_extend.py`, L0 on every served part). Validated per form: the DECODE cells passed on
+cc 10.0 and on cc 10.7; the EXTEND cells passed on cc 10.0, and on cc 10.7 (a Rubin development node).
 
 `P` is a positive multiple of 16 (the serving stacks' page granularity; a 4-token sparse block then never straddles a page);
 a block declared without the attribute REFUSES every one of these inputs (`ValueError`) rather than ignoring a pool it would
