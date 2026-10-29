@@ -3299,12 +3299,20 @@ def test_sm120_moe_mxfp8_partial_scale_block_graph_is_declined(mode, swap_ab) ->
 
 @requires_sm120
 @pytest.mark.parametrize("swap_ab", [False, True], ids=["normal", "swap_ab"])
-def test_sm120_moe_mxfp8_partial_scale_block_call_is_refused(swap_ab) -> None:
+def test_sm120_moe_mxfp8_partial_scale_block_call_is_refused(swap_ab, monkeypatch) -> None:
     """The kernel binds K per call: a plan built at a whole-block K refuses a call whose K ends
-    inside a scale block before it writes anything, and still serves a K tail of whole blocks."""
+    inside a scale block before it launches or writes anything, and still serves a K tail of whole
+    blocks."""
     E, S, N = 2, 256, 256
     offsets_list = [0, 128, S]
     compiled = _plan(_build_graph(E, S, N, 160, 2, combo="mxfp8"), config=by_name(_SM120_BS_CFG), swap_ab=swap_ab)
+    launches, launch = [], compiled._compiled._launchable
+
+    def recorded_launch(*args, **kwargs):
+        launches.append(args)
+        return launch(*args, **kwargs)
+
+    monkeypatch.setattr(compiled._compiled, "_launchable", recorded_launch)
     torch.manual_seed(0)
 
     def call(K):
@@ -3328,9 +3336,11 @@ def test_sm120_moe_mxfp8_partial_scale_block_call_is_refused(swap_ab) -> None:
     compiled(vp)
     torch.cuda.synchronize()
     torch.testing.assert_close(out[0], ref, atol=2e-1, rtol=2e-2)
+    assert len(launches) == 1
 
     vp, out, _ = call(144)
     with pytest.raises(ValueError, match="not a multiple of the scale block size 32"):
         compiled(vp)
     torch.cuda.synchronize()
+    assert len(launches) == 1
     assert torch.all(out == 7.0)
