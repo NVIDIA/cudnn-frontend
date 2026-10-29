@@ -976,6 +976,14 @@ only overrides must equal the fixed graph geometry. Run the existing prepared
 backward replay, auxiliary-output, artifact-cache and physical wide-address
 suites as well as the new native-route tests.
 
+For a fixed backward host, gradient overlap uses the declared address sets
+and current pointers, including when a graph carrier is a noncontiguous view.
+The host does not consume that carrier's strides. Reinterpreting its layout
+only in the overlap guard changes the graph contract and can reject legal
+interleaved outputs. `test_gradient_overlap_uses_declared_graph_addresses`
+checks both acceptance and rejection without overrides; explicit mismatched
+geometry overrides must still fail before launch.
+
 SM90 native binding retains the host's natural-unit scale slot, including zero
 and negative specializations. Its dense layout predicate covers permutations;
 THD preserves fixed batch and 128-byte tensor-map workspace alignment. Derive

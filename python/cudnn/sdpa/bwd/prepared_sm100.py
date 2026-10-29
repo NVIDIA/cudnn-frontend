@@ -97,7 +97,8 @@ def compile_plan(api, stage2, mm_lo, mm_hi):
     # the record `compile()` rendered: the group = one dQ launch per chunk, 1 = per member (`prepared_host._dq_launches`).
     params = Params(b, h, hk, d, api.s_q_max, api.s_k_max, rows, api._skv_pad, api._qh_chunk, api.thd, api._zero_ws, units, gran, int(api._dq_b_head_group))
     dtype = cutlass.BFloat16 if api.dtype == torch.bfloat16 else cutlass.Float16
-    major, minor = compute_capability(resolve_device(api.q_desc.device))
+    device_index = resolve_device(api.q_desc.device)
+    major, minor = compute_capability(device_index)
     sm = major * 10 + minor
     regions = delta, scores, dscores, meta, desc2, desc3, dkw, dvw
     geometry = tuple(geometry)
@@ -110,7 +111,7 @@ def compile_plan(api, stage2, mm_lo, mm_hi):
     fn = positional_entry(entry)
     if fn is None:
         raise NotImplementedError("SM100 backward requires a positional tvm-ffi entry")
-    return BwdLaunchSpec(owner, fn, tuple(operands), offset, int(api.q_desc.device.index or 0), api.scale_softmax, name, True, native_binding=True)
+    return BwdLaunchSpec(owner, fn, tuple(operands), offset, device_index, api.scale_softmax, name, True, native_binding=True)
 
 
 def execute_standalone(api, tensors, workspace, current_stream, scale):

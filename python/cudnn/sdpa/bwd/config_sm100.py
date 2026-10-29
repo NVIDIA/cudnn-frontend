@@ -1335,5 +1335,5 @@ def _sm100_device_clusters(device, cga_m: int) -> int:
     """
     from cudnn.frost import device as _dev
 
-    idx = device.index if hasattr(device, "index") and device.index is not None else 0
+    idx = _dev.resolve_device(device)
     return max(1, _dev.multiprocessor_count(idx) // cga_m)

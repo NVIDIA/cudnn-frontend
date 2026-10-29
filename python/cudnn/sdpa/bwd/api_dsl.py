@@ -32,7 +32,6 @@ from cudnn.sdpa.bwd.config_sm120 import (
     padded_head_dim as _sm120_padded_head_dim,
     padded_head_dims as _sm120_padded_head_dims,
 )
-from .config_sm100 import _sm100_device_clusters  # noqa: F401 - retained private import seam
 from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, _torch_stream_context, ws_align
 from cudnn.sdpa.fwd import config_sm80 as _fwd_config_sm80
 
