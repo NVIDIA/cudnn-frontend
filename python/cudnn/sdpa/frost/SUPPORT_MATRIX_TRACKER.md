@@ -3373,6 +3373,20 @@ content row (K at `+0`, V at `+D`, token stride `2D`) bound as its two halves --
 whole number of 16-byte vectors (a typed `ValueError` otherwise), `page_size` a positive multiple of 16, `slot_mapping [T]` int32 or
 int64 (a negative slot writes nothing; a slot past the pool writes nothing either).
 
+**The serving stacks' packed K|V cache = L3 at the stack's own shape** (2026-10-29): one `[num_pages, H_kv, P, 2D]` tensor per layer, K in
+columns `[0, D)` and V in `[D, 2D)` of every row (the 24 / 4 model family's HND cache `[pages, 4, 16 | 32, 512]`), bound as the two half views
+`kv[..., :D]` / `kv[..., D:]` -- strides `(H_kv*P*2D, P*2D, 2D, 1)` on both, the V base `D` elements past the K base; nothing repacked. One explicit
+cell per form (`requires_dense_part`: cc 10.7 AND cc 10.0; L0) at 24 / 4, `d_head` 256, `d_model` 512, int64 slots, bf16 and f16 -- DECODE
+`test_packed_kv_rows_of_a_serving_stack_bind_as_two_half_views_on_the_decode_form`: page 16 x `S_q` 1 and page 32 x `S_q` 4 over kv 2048 / 0
+(padded) / 5 / 1000 / 33 -- the oracle, the step's rows in the K half bitwise the slab's K band and in the V half the V band, the prefix rows
+unchanged, every row nobody addressed (block 0, the stale tail slots, the spare pages) still the sentinel in BOTH halves, two launches bitwise,
+`out` bitwise the HND-compact twin, the route pinned per part; EXTEND `test_extend_packed_kv_rows_of_a_serving_stack_bind_as_two_half_views`:
+pages 16 and 32, four sequences at `T_max` 512 (a 148-token chunk completing a 2048-key context, an empty-prefix sequence, a padded entry, a
+100-token step over a 5-row prefix; `T_live` 376) -- the suite's `check` through both halves (the stale rows untouched in both, the NULL page
+zero), two launches bitwise, bitwise the HND-compact twin on the same histories and pages. Run: cc 10.7 pending (2026-10-29); cc 10.0: the cells carry
+the marker and run on that part's CI job with the change that adds them (no exclusive cc 10.0 part held at the time; the matrix L3 rows
+above ran there 2026-10-29).
+
 **Served since 2026-10-12 -- the paged KV-cache WRITE-THROUGH** (`paged_kv_page_size > 0`, the block's `(4w)` stage: the post-RoPE
 K / V of every token into the caller's pools at `execute(k_cache=, v_cache=, slot_mapping=)`, after norm + RoPE and before the SDPA,
 which still attends over the block's own K / V; `out` bitwise the block's without it; `get_workspace_size()` unchanged; `quant`
@@ -3421,6 +3435,7 @@ tokens' pool rows bitwise the slab rows attention consumed, every unaddressed po
 | EXTEND `kv_source="paged"` (the paged THD read; bottom-right; bounded tokens) | L1 HND compact | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
 | EXTEND | L2 NHD by strides | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
 | EXTEND | L3 unified content row (K `+0`, V `+D`) | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+| EXTEND | L3 at the stacks' own shape `[pages, 4, P, 512]` (24 / 4), the two half views, int64 slots, kv to 2048 (2026-10-29) | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | -- (the L3 row above) | -- (the L3 row above) |
 
 Also validated (bf16): a one-sequence EXTEND with an EMPTY prefix at a tight declaration (`T_live = T_max = 384`) against the dense `B = 1`
 block on the same tokens -- the two bodies differ (the shared SM100 paged THD body vs the Rubin sibling): BITWISE on `out` and on the gated O (0 of 196 608 / 786 432 elements differ; both legs within the oracle budget, out cos 0.999995), pinned; a 512-token sequence
@@ -3501,6 +3516,7 @@ same values BITWISE on `out`, each within the oracle's budget; `kv_lens` 200 / 0
 | DECODE `[B, S_q]` over the pools | L1 HND compact | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
 | DECODE | L2 NHD by strides | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
 | DECODE | L3 unified content row (K `+0`, V `+D`) | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+| DECODE | L3 at the stacks' own shape `[pages, 4, P, 512]` (24 / 4), the two half views, int64 slots, kv to 2048 (2026-10-29) | bf16 ✅ f16 ✅ (`S_q` 1) | bf16 ✅ f16 ✅ (`S_q` 4) | -- (the L3 row above) | -- (the L3 row above) |
 
 Also validated: the block's form BITWISE the standalone `SdpaFwdDslSm100` on the same slab Q views / pools / table / gate at the
 same split and packing; paged == dense BITWISE (O and LSE) at the unsplit plan on the block's own operands (the padded dense
@@ -3703,6 +3719,7 @@ no performance number exists for any cc 10.0 cell.  The 32-column decode arm is 
 |---|---|---|
 | DECODE `[B, S_q]` over the pools | every served group (16 / 12 / 8 / 6 / 4) x `S_q` 1 .. 5 at d_model 512 on the SM100 route above (`test_sm100_decode_matches_the_oracle_at_every_group_and_s_q`); the 27B geometry 24 / 4 at d_model 5120 (`S_q` 1 at page 16: tile 16; `S_q` 4 at page 32: U16); the pool matrix L1 HND / L2 NHD / L3 unified x pages 16 / 32 / 64 / 128 x bf16 / f16 at 24 / 2 `S_q` 2 (bitwise across the layouts); two launches bitwise + the workspace sentinel; capture / replay of the FIRST execute with new lengths / tables / slots / inputs; the explicit `use_pdl=True` chain bitwise the plain one (dec + pdl: the default, the unfused-auto and the unfused-unsplit declarations); the prefill route at 32 / 2 `S_q` 2 / 5, 8 / 1 `S_q` 3, 4 / 1 `S_q` 5 at the standard batch (mtp) | ✅ 2026-10-29, the GB200 class (cc 10.0, 152 SMs); functional, UNMEASURED |
 | EXTEND `kv_source="paged"` + `token_capacity` | the degenerate matrix cell bf16 / HND / 16 (L0) + f16 / unified / 64 + bf16 / NHD / 32 (int64 slots) + f16 / HND / 128 (`test_sm100_extend_matrix_cell`); the 27B 24 / 4 EXTEND at d_model 5120 (two sequences at T_max 256, page 16); two launches bitwise + the `[B]` lengths form | ✅ 2026-10-29, the GB200 class (cc 10.0, 152 SMs); functional, UNMEASURED |
+| the packed K|V rows cells, both forms (`requires_dense_part`: the stacks' `[pages, 4, P, 512]` tensor as two half views at 24 / 4, pages 16 / 32, int64 slots, kv to 2048, bf16 / f16; the paragraph under the pool contract above) | `test_packed_kv_rows_of_a_serving_stack_bind_as_two_half_views_on_the_decode_form` (4 cells) + `test_extend_packed_kv_rows_of_a_serving_stack_bind_as_two_half_views` (4 cells) | runs on this part's CI job with the change that adds them (2026-10-29; no exclusive cc 10.0 part held); cc 10.7 pending (2026-10-29) |
 | dense prefill `[B, S]` (`kv_source="self"`) | `test_block_end_to_end.py`'s `requires_dense_part` cells: the fp32 oracle at S 256 / 512 (qk_norm on / off), the RoPE-only passthrough, the non-causal arm, the dead-row (padded) arm, the second execute, the caller stream, in-place == out-of-place, the Qwen3.8 family at S 512 / 2051; the flag-free projection route and the zero-warm-up capture of `test_block_serving_capture.py` | ✅ 2026-10-29, the GB200 class (cc 10.0, 152 SMs); functional, UNMEASURED |
 | the declines | `fuse_gate` / the fused forks / `quant` / `save_for_backward` / `thd` + `self` / a `QsaSpec` geometry (the explicit lean tile through the block) / the cap / the 32-column arm (U32 at any launch, W at a wide one): the cc 10.0 reading on any host + the on-part twins | ✅ host rows green on an sm_80 host (the sm80 reading and the simulated cc 10.0 reading); the on-part twins green in the 2026-10-29 cc 10.0 run (the W twin, added by the review follow-up, awaits that part's next run) |
 | the 32-column decode arm (`W`: 17 .. 32 packed rows on a wide launch; `U32`: an unpacked step of 17 .. 32 tokens) | NOT RUN -- declined by name (`DECODE_WIDE_TILE_CCS = ()`); the host rows pin the decline at the geometries that would have hit it, the small-launch reading unchanged and the one-tuple lift restoring the adapter's rule; its accept cells ARE the lift | ⛔ declined until its cells run |

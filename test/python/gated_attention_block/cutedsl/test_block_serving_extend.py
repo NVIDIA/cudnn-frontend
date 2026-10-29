@@ -30,6 +30,11 @@ padded tokens unwritten on a NaN-poisoned pool, ``out`` bitwise the block's with
 unchanged -- plus the other bf16 pipelines (fused norm + RoPE, dense and packed; out-of-place Q / K / V; the fused gate) and
 the indexer band's raw-key pool on the sparse block (the stage walk, then the whole block with the full caller list against the
 fp32 QSA oracle).
+
+Both-parts cells (``requires_dense_part``, 2026-10-29; the end of the module): a serving stack's PACKED K|V cache -- ONE ``[pages, 4, P, 512]``
+tensor, K in columns ``[0, D)`` and V in ``[D, 2D)`` of every row -- bound as the two half views on the EXTEND form at the 24 / 4 geometry,
+pages 16 and 32, a 2048-key context next to an empty-prefix sequence, a padded entry and a short prefix, int64 slots, bf16 and f16: the
+oracle through both halves with every unaddressed row stale in both, two launches bitwise, bitwise the HND-compact twin.
 """
 
 import contextlib
@@ -78,6 +83,7 @@ if requirement_error:
 
 requires_rubin = pytest.mark.requires_rubin  # the suite's registered marker (conftest.py): skipped off SM107
 requires_blackwell = pytest.mark.requires_blackwell  # the registered marker: an admitted Blackwell-line part of DENSE_SERVING_CCS (cc 10.0; 2026-10-29)
+requires_dense_part = pytest.mark.requires_dense_part  # the registered marker: EVERY served part of DENSE_SERVING_CCS (cc 10.7 and cc 10.0)
 # The capture cell (g) needs the projection GEMM driver's capture-safe route (``build_proj_gemm(capture_safe=True)``: the forced-tile JIT
 # route, no cuDNN handle at the first execute).  Where the driver has no such route, a fresh declaration's first execute inside a capture
 # is the graph route's handle creation, so the cell is skipped there instead of asserting what that tree cannot deliver; the serving
@@ -2810,3 +2816,65 @@ def test_sm100_extend_declines_fuse_gate_and_the_fused_fork_by_name():
     plain._check_part_support()
     env = GatedAttentionBlockFwd.serving_envelope(plain.geom, torch.bfloat16, _DEV)
     assert env.device_cc == (10, 0) and env.forms == ("extend", "decode")
+
+
+# ---------------------------------------------------------------------------
+# Both served parts (requires_dense_part; 2026-10-29): a serving stack's PACKED K|V cache rows bound as two half views -- the EXTEND form
+# ---------------------------------------------------------------------------
+#
+# The stack's ONE cache tensor per layer, [num_pages, H_kv, P, 2D] (K in columns [0, D), V in [D, 2D) of every row; the 24 / 4 model family's
+# HND cache [pages, 4, 16 or 32, 512]), handed to the block as its two halves kv[..., :D] / kv[..., D:] -- the "unified" layout of the matrix
+# above at the stack's own shape.  The cell mirrors the binding literally (24 / 4 at d 256, pages 16 and 32, a 148-token chunk completing a
+# 2048-key context next to an empty-prefix sequence, a padded entry and a 5-row prefix, the stack's int64 slot mapping, bf16 and f16) and
+# proves the one tensor behind the views: `check` reads the step's rows back through both halves (bitwise the slab rows attention consumed)
+# and finds every row nobody addressed still stale in BOTH halves (a K store running past D would land in the V half of the same row, and
+# vice versa), the NULL page zero; two launches bitwise; bitwise the HND-compact twin on the same histories and pages.
+
+_PACKED_KV_GEOM = dict(d_model=512, h_q=24, h_kv=4, d_head=256, rope_dim=64, causal_bottom_right=True)  # the 24 / 4 model family at a shrunk d_model
+_PACKED_KV_STEP = dict(q_lens=[148, 128, 0, 100], prefix_lens=[1900, 0, 0, 5])  # kv_lens 2048 / 128 / 0 / 105, T_live 376 of 512
+
+
+def _assert_one_packed_tensor(hz, what):
+    """``hz.k_cache`` / ``hz.v_cache`` are the two halves of ONE contiguous ``[num_pages, H_kv, P, 2D]`` tensor: the same base, the V view's
+    data pointer ``D`` elements past the K view's, both with strides ``(H_kv*P*2D, P*2D, 2D, 1)`` (``D`` contiguous, every other stride a whole
+    number of 16-byte vectors: the contract ``check_pool`` admits).  Returns the tensor."""
+    k, v = hz.k_cache, hz.v_cache
+    kv, page, D, h_kv = k._base, hz.page, hz.geom.d_head, hz.geom.h_kv
+    assert kv is v._base and tuple(kv.shape) == (hz.n_pages, h_kv, page, 2 * D) and kv.is_contiguous(), f"{what}: not ONE [P, H, page, 2D] tensor"
+    assert k.data_ptr() == kv.data_ptr() and v.data_ptr() == kv.data_ptr() + D * kv.element_size(), f"{what}: the views are not the two halves"
+    assert tuple(k.stride()) == tuple(v.stride()) == (h_kv * page * 2 * D, page * 2 * D, 2 * D, 1), f"{what}: the half views' strides"
+    return kv
+
+
+@requires_dense_part
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+@pytest.mark.parametrize("page", [16, 32], ids=["p16", "p32"])
+def test_extend_packed_kv_rows_of_a_serving_stack_bind_as_two_half_views(dtype, page):
+    """The stack's ONE ``[pages, 4, P, 512]`` cache tensor bound as the two half views on the EXTEND form at 24 / 4 (``d_model`` 512), pages 16
+    and 32, int64 slots, bf16 and f16: four sequences at ``T_max`` 512 -- a 148-token chunk over a 1900-row prefix (kv_len 2048: 128 pages at 16,
+    64 at 32), a 128-token sequence with an empty prefix, a PADDED entry (the NULL block), a 100-token step over a 5-row prefix (kv_len 105, a
+    tail tile) -- ``T_live`` 376; the suite's ``check`` (the oracle over every live sequence, the rows read back through both halves, the stale
+    rows untouched in both halves, the NULL page zero), two launches bitwise, bitwise the HND-compact twin on the same histories and pages; on
+    cc 10.0 the stage pinned on the shared SM100 paged THD body."""
+    hz = _harness(4, 512, max_kv_len=2048, page=page, layout="unified", dtype=dtype, slot_dtype=torch.int64, geom_kw=_PACKED_KV_GEOM, seed=29)
+    what = f"packed K|V rows 24/4 {dtype} p{page}"
+    kv = _assert_one_packed_tensor(hz, what)
+    assert hz.geom.h_kv == 4 and hz.geom.d_head == 256 and tuple(kv.shape[1:]) == (4, page, 512) and hz.slot.dtype == torch.int64
+    if tuple(torch.cuda.get_device_capability()) == (10, 0):
+        _sm100_pin_extend(hz)
+    rec = hz.step(_PACKED_KV_STEP["q_lens"], prefix_lens=_PACKED_KV_STEP["prefix_lens"], prefill="reference")
+    assert rec["kv_lens"] == [2048, 128, 0, 105] and rec["t_live"] == 376
+    hz.check(rec, label=what)
+    out = rec["out"].clone()
+    hz.refill_pools()
+    rec2 = hz.step(_PACKED_KV_STEP["q_lens"], prefix_lens=_PACKED_KV_STEP["prefix_lens"], prefill="reference")
+    assert torch.equal(out, rec2["out"]), f"{what}: two launches differ"
+    hz.check(rec2, label=what + " (second launch)")
+    twin = _harness(4, 512, max_kv_len=2048, page=page, layout="hnd", dtype=dtype, slot_dtype=torch.int64, geom_kw=_PACKED_KV_GEOM, seed=29)
+    assert twin.k_cache._base is None and twin.v_cache._base is None and twin.k_cache.is_contiguous(), "the twin: two compact tensors"
+    twin.adopt(hz)
+    rec_h = twin.step(_PACKED_KV_STEP["q_lens"], prefix_lens=_PACKED_KV_STEP["prefix_lens"], prefill="reference")
+    twin.check(rec_h, label=what + " (HND twin)")
+    assert torch.equal(
+        out, rec_h["out"]
+    ), f"{what}: out differs from the HND-compact twin's: max|diff| {(out.float() - rec_h['out'].float()).abs().max().item():.3e}"
