@@ -115,7 +115,7 @@ def test_rope_declines_before_compile(direction):
 
 
 @pytest.mark.parametrize("direction", ["fwd", "bwd"])
-@pytest.mark.parametrize("d,dv", [(48, 32), (96, 80), (128, 128), (160, 112), (192, 128), (224, 208), (256, 256)])
+@pytest.mark.parametrize("d,dv", [(16, 256), (48, 32), (64, 96), (96, 80), (128, 128), (160, 112), (192, 128), (224, 208), (256, 256)])
 @pytest.mark.parametrize("singleton", [False, True])
 def test_aligned_native_envelopes_remain_supported(direction, d, dv, singleton):
     descs = _descs(d, dv, singleton=singleton)
@@ -126,7 +126,7 @@ def test_aligned_native_envelopes_remain_supported(direction, d, dv, singleton):
         assert api._native_pointer
 
 
-@pytest.mark.parametrize("d,dv", [(96, 80), (192, 128)])
+@pytest.mark.parametrize("d,dv", [(16, 256), (64, 96), (96, 80), (192, 128)])
 def test_backward_thd_ignores_unused_batch_stride(d, dv):
     descs = _descs(d, dv, thd=True)
     api = _api("bwd", descs, thd=True, max_total_seq_len_q=64, max_total_seq_len_kv=64)
@@ -143,7 +143,7 @@ def _forward_thd_case(d, dv, *, singleton=False):
     return descs, facts
 
 
-@pytest.mark.parametrize("d,dv", [(64, 64), (128, 128), (192, 128), (256, 256)])
+@pytest.mark.parametrize("d,dv", [(48, 32), (64, 64), (64, 96), (96, 80), (128, 128), (192, 112), (192, 128), (224, 208), (256, 256)])
 @pytest.mark.parametrize("singleton", [False, True])
 def test_forward_thd_native_pitches(d, dv, singleton):
     descs, facts = _forward_thd_case(d, dv, singleton=singleton)

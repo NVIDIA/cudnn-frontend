@@ -2641,7 +2641,7 @@ on the 80-wide tile.
 
 Engines: `sdpa_fwd_prefill_sm80`, `sdpa_bwd_sm80`. Both use `mma.sync` (no
 tcgen05) and assume the A100's 164 KiB opt-in SMEM — sm86/sm89 are declined.
-The backward serves packed THD graphs (ᵏ); the forward serves native-flavor packed THD graphs
+The backward serves packed THD graphs (ᵏ); the forward serves packed THD graphs
 with per-batch or cumulative Q/KV lengths, token-major Q/K/V/O with independent
 8-element-aligned head/token strides (padding and gaps allowed), and packed
 head-major or token-major Stats. The head dimension is contiguous, head rows and
@@ -2659,7 +2659,16 @@ stride to be divisible by eight elements. Runtime data addresses must be
 gapped layouts and strided Stats directly; no gather/pad/scatter fallback is
 selected. Graph eligibility and standalone `check_support()` share the
 addressing contract and decline unsupported declarations before compilation.
-THD retains its packed-layout constraints; its unused batch stride is ignored.
+Dense and THD share the eight-aligned head-width envelope, with independent
+logical Q/K and V widths up to 256 in both directions. The covering backward
+MMA flavor retains its own ordered tile dimensions; logical widths need not
+satisfy D_QK >= D_V. THD retains its packed-layout constraints; its unused
+batch stride is ignored. Packed forward
+hosts bind logical QK/VO widths independently of the selected MMA tile, and
+the convenience wrappers no longer pad, compact or trim data operands.
+Packed backward Stats may be a logical `(1, H, T)` slice with a wider head
+pitch; padding after the final head is not required. Legacy full-pitch and
+compact token-major carriers remain supported.
 
 Backward bias/dBias and sink/dSink must be declared in pairs with contiguous
 auxiliary storage. Standalone RoPE and nonaligned data layouts are declined
@@ -2700,13 +2709,13 @@ do-dot, optional dSink, the selected backward kernel, dQ conversion, GQA
 reductions and auxiliary output copies. All stages use the current caller
 stream; graph and standalone execution share the binding validator. Native
 plans require caller workspace and do not build tensor views at execute.
-Native-flavor THD graph/direct-adapter plans use the same binder and a packed
+THD graph/direct-adapter plans throughout the aligned width envelope use the same binder and a packed
 host chain, including device length-to-prefix setup. Packed capacities are
 runtime host arguments; workspace views and offsets are formed from those
 capacities without specializing the artifact on them. A fresh plan with the
 same specialization and stepped strides reuses the process-local artifact for
 different totals and bounds, even without persistent caching. The standalone
-THD wrapper pads to the native flavor width and uses this prepared packed chain.
+THD wrapper binds caller data strides and logical widths directly to this prepared packed chain.
 Graph and direct-adapter padded widths use that same native chain. Internal
 legacy staging helpers remain isolated; supported public declarations cannot
 reach them. Standalone adapters require caller workspace, and convenience
@@ -2715,23 +2724,20 @@ wrappers provide it.
 The standalone SM80 packed forward wrapper also uses a cached pointer host.
 Packed capacities, Q/K/V token and head strides, and launch bounds bind as
 runtime Int64 arguments; Sink logits remain in natural units. The wrapper
-preserves its output allocation, capacity-tail zeroing and off-flavor padding.
+preserves its output allocation and capacity-tail zeroing, with masked native
+loads for logical widths smaller than the covering flavor.
 Dense forward uses the native pointer host and natural-unit sinks; unsupported
 copy-dependent declarations decline before compilation.
-Native-flavor THD forward graphs reuse this pointer host, with optional head-major
+THD forward graphs throughout the aligned width envelope reuse this pointer host, with optional head-major
 or token-major Stats and device-side length normalization in caller workspace.
 Plan construction and execution allocate no device memory. Graph admission requires
 token-major Q/K/V/O with aligned, non-overlapping head/token strides, natural
 scheduling, and no bias, sink, or RoPE fusion.
 The graph path does not run the standalone wrapper's output-capacity initialization.
 
-Standalone packed forward/backward wrappers share prepared bitwise data copies
-for their existing head-width padding, backward compaction and output trimming.
-One fused copy handles the selected operands; native operands bind directly.
-The bounded wrapper allocation-recipe memo contains only host metadata, while
-compiled copy artifacts specialize on head/width geometry and bind Int64 token
-capacities, strides and addresses per call. The former Torch padding helpers
-are removed. Packed forward initializes O and Stats together inside its prepared
+Standalone packed forward/backward wrappers bind logical widths and independent
+data strides directly, with no padding, compaction or trimming copies.
+Packed forward initializes O and Stats together inside its prepared
 host; packed backward combines its existing dQ/GQA-gradient capacity zeroing with
 workspace initialization. MHA dK/dV and direct graph-output tails retain their
 previous write contract. Initialization capacities and offset products stay Int64.
@@ -2776,11 +2782,12 @@ counter are bounded by the envelope `S_max` (short tiles early-out; no length is
 read on the host); the dQ cast and the dK/dV fold stop at `cu_*[B]` on device and
 write the caller's head dim, so nothing past the packed total is ever written into
 the caller's gradients (the ragged sweeps assert this with a NaN-filled tail). Served under THD: the causal family, GQA/MQA, sinks/dSink,
-deterministic dQ, head-dim envelope padding (carved staging at the packed
-capacities), zero-length and one-sided-empty sequences. Bias/dBias is dense-only (a packed graph has no `[B, H, S_q, S_kv]` bias); RoPE is a
-wrapper-only fusion no engine row admits. The SM80 forward row now serves
-native-flavor, strided packed THD with Q/KV lengths; its dense head-dim
-envelope and fused bias/sinks remain unavailable to THD.
+deterministic dQ, native eight-aligned head widths within the flavor envelope,
+zero-length and one-sided-empty sequences. Bias/dBias is dense-only (a packed
+graph has no `[B, H, S_q, S_kv]` bias); RoPE is declined. The SM80 forward row
+serves strided packed THD with Q/KV lengths throughout the same aligned
+head-width envelope as dense forward; fused bias/sinks remain unavailable to
+THD graphs.
 
 ---
 
@@ -2807,7 +2814,7 @@ envelope and fused bias/sinks remain unavailable to THD.
 | Per-tensor FP8 backward | every arch except SM107 d = 256 E4M3 (`sdpa_bwd_sm107_fp8`, ᵇ) and, opt-in, SM100 / SM103 D64 / D128 (`sdpa_bwd_sm100_d128_fp8`) and dense (192, 128) (`sdpa_bwd_sm100_d192_fp8`) |
 | MXFP8 backward outside SM100/SM103 d ∈ {64, 128, (192, 128), 256} and SM107 d = 256 (`sdpa_bwd_sm107_mxfp8`, ᵐˣ) | every arch |
 | THD / ragged backward | SM120, the SM107 d512 row (ᵇ³) and the SM100/SM103 MXFP8 and f16/bf16 d256 (ᵇ²) rows (the SM100/SM103 f16/bf16 d512 row serves it — see ʰ; the SM107 f16/bf16 and per-tensor FP8 rows — see ᵇ; the SM107 MXFP8 row — see ᵐˣ; SM80 — see ᵏ). The d128 row serves THD only on cc 10.0 or 10.3 with public CuTeDSL ≥ 4.8 and positive FP32 scale: BF16/FP16 MHA and BF16 GQA/MQA. |
-| THD forward outside native-flavor dims or aligned token-major Q/K/V/O | SM80 — the graph path serves the four native head-dim pairs with independent non-overlapping 8-element-aligned head/token strides, including padded/gapped rows |
+| THD forward outside the aligned head-width envelope or aligned token-major Q/K/V/O | SM80 — the graph path serves independent QK/V widths divisible by eight up to 256, with non-overlapping 8-element-aligned head/token strides, including padded/gapped rows |
 | **Decode tile on the Rubin line outside the d256 f16/bf16 flavor** | **SM107** — d128 / d192×d128 / d512 decode and every fp8 / mxfp8 decode run their flavor's prefill kernel; the d256 f16/bf16 decode tile (ᵈʳ: whole-group PackGQA, dense / paged split-KV, the MTP step in token units of the 32-column tile ᵐᵗᵖ) is the only Rubin decode tile today |
 | **Paged d256 decode-tile default placement outside its measured bands** | **SM107** — the MTP rows (`S_q` 2-4 on 24/2 and 32/2, the 32-column tile in up to two token units ᵐᵗᵖ) and group 32 (64/2, the 32-column tile in one unit) LEAD by default inside their measured bands since the follow-up to the first arm (the MTP box b 1-128 × KV 1k-128k at page 16 bf16: 0.01-0.31 of the backend's default plan, which costs 6.8-142 ms per launch at KV 128k; group 32 from 4 units and 2¹⁷ KV tokens in flight: 0.27-0.79) although the 32-column tile still trails FlashInfer's own fa2 decode kernel on part of them (6 % at q 2, 21-22 % at q 3-4; 7-9 % on group 32, at the medians) -- its per-CTA issue-rate gap at 24-64 packed rows (212-SM cc 10.7 perf class, cuDNN 9.27.0, 2026-10-13), a kernel lever, not a placement fact: FE's verdict is against the backend's plan. Still backend-first because unmeasured: the MTP rows at page 32 / 64 and in f16 and on the 12/1 / 16/1 geometries (the same groups, unmeasured at `S_q > 1`), group 32 on 32/1 (the same group, unmeasured), at page 32 / 64 (measured on 24/2 only), below 2¹⁷ tokens in flight (its 2¹⁶ step holds a parity cell) or with fewer than 4 units; Stats, sinks, a mask or window at `S_q = 1`, page 128, fewer than 4 units (1-2 units led only at the 128k endpoint), above 512 units or past 128k declared KV, a dense (unpaged) d256 cache at `S_q = 1` (measured against the prefill body only), THD queries, the fused gate, a paged decode without per-request KV lengths (no padding mask: every band cell carried one). The head-major in-page pool layout (each head's page contiguous, vLLM's `[blocks, 2, H_kv, block, D]`) is admitted beside the token-major one the band measured: measured 2026-10-14 on the 24/2 core geometry with the same protocol on an EXCLUSIVE GPU of the same 212-SM cc 10.7 class (lock 2376 sampled: busy median 2364; cuDNN 9.27.0 build 9.27.0.21; b 1-128 x declared KV 1k-128k at page 16 bf16, 48 cells x 2 regimes): the tile 0.36-0.92 of the backend on EVERY in-band cell in both regimes (32 cells per regime, all quotable; medians 0.45 replay / 0.45 eager), the out-of-band cells mixed 0.73-2.00 as in the token-major band. Follow-up: the kernel fix of the 32-column tile reopens both holds (a placement constant each); the Stats / page-128 twins are one measured chunk each (`placement._sm107_paged_d256_decode_tile_leads`) |
 | **Native d=64 (GPT-OSS) forward kernel** | **SM107 per-tensor FP8 / MXFP8** — served via the d128 envelope at ~2× MMA cost (the f16/bf16 row is native on its 64-wide tile, and every D ≤ 32 on its 32-wide one, since 2026-10-08 -- see the SM107 table's ᵗ). SM100/SM103 is native (⁷) for f16/bf16 (prefill, decode (ᵈ⁶⁴), paged and split-KV), per-tensor FP8 (prefill, paged, split-KV; cga1) and MXFP8 (dense / unsplit / unpaged; cga1) |

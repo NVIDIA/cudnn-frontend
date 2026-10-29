@@ -1153,3 +1153,21 @@ rejects legal future appends. Source-call pins must distinguish positional
 operands from appended keyword arguments (use the AST); a final keyword does
 not move the last positional operand. The SDPA field-order and FP8 THD fold
 pins exercise these cases.
+
+
+### Native SM80 packed wrapper widths
+
+The covering MMA flavor and the logical QK/V widths are distinct. Keep each
+logical load bound when removing wrapper padding; marking a partial Q/K width
+as even reads poisoned head slack. `test_sdpa_sm80_thd_native_widths.py` checks
+independent widths, gapped strides, original input pointers, native kernel counts
+and changed-input/prefix replay. Its graph cases include QK<V in dense and THD.
+Compact head-major Stats pitch is the dynamic packed capacity; preserve that
+symbolic pitch when keying a compiled artifact. Fixed inter-head padding is a
+separate stride, not additional logical rows or required final-head storage.
+The wrapper capacity-reuse tests forbid compilation after capacities change;
+`test_sdpa_sm80_native_wrappers.py` retains fresh-process artifact checks while
+forbidding normalization and rejecting unsupported inner strides before launch.
+Its singleton-Stats case uses T=H=1 with zero, compact and padded head pitches:
+both packings classify the same element, but the token-major binder requires
+exact strides, so the wrapper must retain the head-major ABI for unused pitches.

@@ -3114,8 +3114,8 @@ def _sm80_spec() -> EngineSpec:
     """SM80 (A100) prefill row: lowers through ``lower_dsl_prefill`` onto the
     ``SdpaFwdDslSm80`` adapter (``fwd/api_dsl.py``), which owns kernel-flavor
     selection (gptoss/llama/dsv3/qwen), native eight-aligned head-dim envelopes,
-    declared data strides, and per-shape kernel caching. Native-flavor packed THD graphs bind the varlen template directly;
-    the dense head-dim envelope is not offered to THD. Dense graphs expose
+    declared data strides, and per-shape kernel caching. Dense and packed THD
+    graphs share the eight-aligned head-dim envelope. Dense graphs expose
     scheduler tuning; THD requires the natural 3-D grid."""
     from cudnn.sdpa.native_sm80 import graph_mismatch
 
@@ -3129,7 +3129,7 @@ def _sm80_spec() -> EngineSpec:
             d_shapes=frozenset({(256, 256)}),  # flavor envelopes; masked native loads
             d_pad_multiple=8,
             declaration_check=graph_mismatch,
-            thd_d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256)}),
+            thd_d_shapes=None,  # logical widths reach the masked native packed host
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             bias=True,
             right_band_widening=True,

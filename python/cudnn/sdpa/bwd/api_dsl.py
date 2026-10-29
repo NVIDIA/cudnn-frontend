@@ -830,6 +830,8 @@ def _sm80_thd_plan(
     has_sink,
     deterministic,
     stats_token_major=False,
+    io_strides=(),
+    stats_head_stride=0,
 ):
     """Cache immutable wrapper plans without retaining tensors or runtime pointers.
 
@@ -837,11 +839,15 @@ def _sm80_thd_plan(
     receives them as runtime scalars and reuses its artifact across plans.
     """
 
-    def desc(h, d, s):
-        return TensorDesc(dtype, (n_seq, h, s, d), (s * h * d, d, h * d, 1), (3, 1, 2, 0), device)
+    def desc(index, h, d, s):
+        hs, ts, ds = io_strides[index] if io_strides else (d, h * d, 1)
+        return TensorDesc(dtype, (n_seq, h, s, d), (s * ts, hs, ts, ds), (3, 1, 2, 0), device)
 
-    q, k, v, o = desc(h_q, d_qk, t_q), desc(h_kv, d_qk, t_kv), desc(h_kv, d_v, t_kv), desc(h_q, d_v, t_q)
-    stats = TensorDesc(torch.float32, (n_seq, h_q, t_q), (h_q * t_q, t_q, 1), (2, 1, 0), device)
+    q, k, v = desc(0, h_q, d_qk, t_q), desc(1, h_kv, d_qk, t_kv), desc(2, h_kv, d_v, t_kv)
+    o, do = desc(3, h_q, d_v, t_q), desc(4, h_q, d_v, t_q)
+    dq, dk, dv = desc(5, h_q, d_qk, t_q), desc(6, h_kv, d_qk, t_kv), desc(7, h_kv, d_v, t_kv)
+    hs = stats_head_stride or t_q
+    stats = TensorDesc(torch.float32, (n_seq, h_q, t_q), (h_q * hs, hs, 1), (2, 1, 0), device)
     sink = TensorDesc(torch.float32, (h_q,), (1,), (0,), device) if has_sink else None
     wl, wr = window_size
     api = SdpaBwdDslSm80(
@@ -849,11 +855,11 @@ def _sm80_thd_plan(
         k,
         v,
         o,
-        o,
+        do,
         stats,
-        q,
-        k,
-        v,
+        dq,
+        dk,
+        dv,
         sample_sink=sink,
         sample_dsink=sink,
         is_causal=is_causal,
@@ -865,6 +871,7 @@ def _sm80_thd_plan(
         max_total_seq_len_q=t_q,
         max_total_seq_len_kv=t_kv,
         thd_stats_token_major=stats_token_major,
+        thd_stats_head_stride=stats_head_stride,
     )
     assert api.check_support(), "Unsupported configuration"
     # Wrapper buffers may have capacity beyond B * max_sequence_length.
@@ -887,8 +894,8 @@ def _sm80_thd_backward(
     bounds must cover every sequence; validating their contents would sync.
     """
     d_qk, d_v, h_q, h_kv = q.shape[-1], v.shape[-1], q.shape[2], k.shape[2]
-    fdqk, fdv = _SM80_BWD_FLAVOR_DIMS[_sm80_bwd_pick_flavor(d_qk, d_v)]
-    # Resolve from the user's width before envelope padding (e.g. D=96).
+    _sm80_bwd_pick_flavor(d_qk, d_v)
+    # The user's width determines scaling and native output shapes.
     if scale_softmax is None:
         scale_softmax = 1.0 / math.sqrt(d_qk)
     n_seq = cu_q.numel() - 1
@@ -898,10 +905,24 @@ def _sm80_thd_backward(
         if hint is not None:
             assert int(hint) > 0, f"{label} must be > 0; got {hint}"
 
-    if d_qk < fdqk or d_v < fdv or any(not t.is_contiguous() for t in (q, k, v, o, do)):
-        from cudnn.sdpa.packed_copy_sm80 import copy_packed_half
+    from cudnn.sdpa.native_sm80 import data_layout_mismatch
+    from cudnn.sdpa.graph_analyzer import thd_stats_packing
 
-        q, k, v, o, do = copy_packed_half((q, k, v, o, do), (fdqk, fdqk, fdv, fdv, fdv), (True, False, False, True, True), compact=True)
+    for name, tensor, tokens, heads, width in (
+        ("q", q, t_q, h_q, d_qk),
+        ("k", k, t_kv, h_kv, d_qk),
+        ("v", v, t_kv, h_kv, d_v),
+        ("o", o, t_q, h_q, d_v),
+        ("do", do, t_q, h_q, d_v),
+    ):
+        if tuple(tensor.shape) != (1, tokens, heads, width) or tensor.device != dev or tensor.dtype != q.dtype:
+            raise ValueError(f"SM80 THD {name} must match its packed shape and Q's device/dtype")
+        shape = tuple(tensor.shape[i] for i in (0, 2, 1, 3))
+        stride = tuple(tensor.stride(i) for i in (0, 2, 1, 3))
+        reason = data_layout_mismatch(name, shape, stride, thd=True)
+        desc = TensorDesc(q.dtype, shape, stride, (3, 1, 2, 0), dev)
+        if reason is not None or not SdpaBwdDslSm80._packed_bshd(desc):
+            raise NotImplementedError(reason or f"SM80 THD {name} requires non-overlapping native packed rows")
 
     # A zero-capacity wrapper operand gets one never-live row. Device prefixes
     # still contain the actual totals; no adapter-side degenerate computation.
@@ -911,15 +932,27 @@ def _sm80_thd_backward(
     q, k, v, o, do = map(packed, (q, k, v, o, do))
     tq_cap, tkv_cap = max(t_q, 1), max(t_kv, 1)
     stats_token_major = False
+    stats_head_stride = 0
     if t_q:
-        lse_t = lse if lse.dtype == torch.float32 and lse.device == dev else lse.to(dtype=torch.float32, device=dev)
-        if tuple(lse_t.shape) == (1, h_q, t_q) and lse_t.stride(1) == 1 and lse_t.stride(2) == h_q:
+        if lse.dtype != torch.float32 or lse.device != dev or tuple(lse.shape) != (1, h_q, t_q):
+            raise ValueError("SM80 THD Stats must be float32 [1,Hq,Tq] on Q's device")
+        lse_t = lse
+        # A singleton head's pitch is never stepped, including a zero stride.
+        stride_h = lse_t.stride(1) if h_q > 1 else t_q
+        packing = thd_stats_packing(stride_h, lse_t.stride(2), h_q)
+        if h_q == 1 and packing == "token_major":
+            # At T=H=1 both packings address the same element. Keep the
+            # head-major ABI, which ignores the caller's unused head pitch.
+            packing = "head_major"
+        if packing == "token_major":
             # Reuse the graph chain's existing compact token-major Stats ABI.
             # This is a view of the caller's storage, not a layout conversion.
             lse_t = lse_t[0].transpose(0, 1)
             stats_token_major = True
+        elif packing == "head_major" and stride_h >= t_q:
+            stats_head_stride = int(lse_t.stride(1)) if h_q > 1 and lse_t.stride(1) != t_q else 0
         else:
-            lse_t = lse_t.contiguous()
+            raise NotImplementedError("SM80 THD Stats requires native head-major or compact token-major storage")
     else:
         lse_t = torch.empty((1, h_q, 1), dtype=torch.float32, device=dev)
     cu_q_t = cu_q.to(dtype=torch.int32, device=dev).contiguous()
@@ -928,7 +961,7 @@ def _sm80_thd_backward(
     # The cast/fold only writes live rows. Keep the established zeroed dQ and
     # GQA output tails; MHA dK/dV remain direct kernel outputs.
     # The wrapper specialization folds this into workspace initialization.
-    dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+    dq, dk, dv = (torch.empty(t.shape, dtype=t.dtype, device=dev) for t in (q, k, v))
     dsink = torch.empty(h_q, dtype=torch.float32, device=dev) if sinks is not None else None
     wl, wr = window_size
     wl = None if wl is None or wl < 0 else int(wl)
@@ -937,8 +970,8 @@ def _sm80_thd_backward(
         n_seq,
         h_q,
         h_kv,
-        fdqk,
-        fdv,
+        d_qk,
+        d_v,
         tq_cap,
         tkv_cap,
         min(int(max_s_q), tq_cap) if max_s_q is not None else tq_cap,
@@ -951,6 +984,8 @@ def _sm80_thd_backward(
         sinks is not None,
         bool(deterministic),
         stats_token_major,
+        tuple((int(t.stride(2)), int(t.stride(1)), int(t.stride(3))) for t in (q, k, v, o, do, dq, dk, dv)),
+        stats_head_stride,
     )
     workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=dev)
     api.execute(
@@ -971,8 +1006,6 @@ def _sm80_thd_backward(
         dsink_tensor=dsink,
     )
     dQ_k, dK_k, dV_k = dq[:, :t_q], dk[:, :t_kv], dv[:, :t_kv]
-    if d_qk < fdqk or d_v < fdv:
-        dQ_k, dK_k, dV_k = copy_packed_half((dQ_k, dK_k, dV_k), (d_qk, d_qk, d_v), (True, False, False))
     out = TupleDict(dq_tensor=dQ_k, dk_tensor=dK_k, dv_tensor=dV_k)
     if dsink is not None:
         out["dsink_tensor"] = dsink
@@ -1225,9 +1258,8 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             self._value_error_if(int(val) <= 0, f"{label} must be > 0; got {val}")
         self._value_error_if(h_qo % h_kv != 0, f"H_q ({h_qo}) must be divisible by H_kv ({h_kv}) for GQA / MQA")
 
-        # The kernel supports d_qk != d_v (split sub-groups) but requires
-        # d_qk >= d_v; native masked loads cover the aligned flavor envelope.
-        self._value_error_if(d_qk < d_v, f"SM80 BPROP requires D_QK >= D_V; got D_QK={d_qk}, D_V={d_v}")
+        # The covering flavor retains D_QK >= D_V for its MMA geometry;
+        # logical Q/K and V widths are independently masked inside it.
         max_dqk = max(fdqk for fdqk, _ in _SM80_BWD_FLAVOR_DIMS.values())
         max_dv = max(fdv for _, fdv in _SM80_BWD_FLAVOR_DIMS.values())
         self._value_error_if(
