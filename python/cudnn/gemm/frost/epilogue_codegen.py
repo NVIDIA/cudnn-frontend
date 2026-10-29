@@ -198,7 +198,8 @@ def _emit_binary_ext(op: FusionOp, a_expr: str, b_expr: str, idx: int, new: str)
             lines += l2 + [f"_rmu{idx} = {m} * ({_fl(b, 1.0)} - {s2})"]
             m = f"_rmu{idx}"
         if slope is not None:
-            lines.append(f"_rf{idx} = {m} + {_fl(b, slope)} * ({_fl(b, 1.0)} - {m})")
+            # cuDNN RELU_BWD: the slope applies only where x <= lower (s1); x >= upper has zero gradient.
+            lines.append(f"_rf{idx} = {m} + {_fl(b, slope)} * {s1}")
             m = f"_rf{idx}"
         return lines + [f"{new} = {a} * {m}"], new
 
@@ -280,11 +281,12 @@ def _emit_op(
         rl = [f"_r{idx} = {prev}"]
         rv = f"_r{idx}"
         if slope is not None:
-            rl.append(f"_rk{idx} = cute.math.max({rv}, {_fl(rv, 0.0)}) + {_fl(rv, slope)} * cute.math.min({rv}, {_fl(rv, 0.0)})")
+            # cuDNN RELU_FWD: x < lower ? lower + slope * (x - lower) : x, with lower defaulting to 0.
+            # lower_clip is where the slope starts, not a clamp applied after it.
+            lo = 0.0 if lower is None else lower
+            shifted = rv if lo == 0.0 else f"({rv} - {_fl(rv, lo)})"
+            rl.append(f"_rk{idx} = cute.math.max({rv}, {_fl(rv, lo)}) + {_fl(rv, slope)} * cute.math.min({shifted}, {_fl(rv, 0.0)})")
             cur = f"_rk{idx}"
-            if lower is not None:
-                rl.append(f"_rl{idx} = cute.math.max({cur}, {_fl(rv, lower)})")
-                cur = f"_rl{idx}"
         else:
             rl.append(f"_rl{idx} = cute.math.max({rv}, {_fl(rv, lower if lower is not None else 0.0)})")
             cur = f"_rl{idx}"
