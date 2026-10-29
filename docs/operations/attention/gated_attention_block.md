@@ -39,7 +39,7 @@ gate, `serving_envelope()` and the test suite's markers read:
 | part | forms served | status |
 |---|---|---|
 | NVIDIA Rubin (SM107, cc 10.7) | every form: the three precisions, the fusion knobs, the serving forms (write-through, EXTEND, DECODE), the block-sparse / indexer modes, the e4m3 cache, the backward | measured (the tables below) |
-| cc 10.0 (SM100: B200 / GB200; 2026-10-29) | the DENSE bf16 / f16 INFERENCE forms only -- the dense prefill form (`kv_source="self"`), the EXTEND form and the DECODE form over the pools -- through the shared SM100 d256 kernels (the paged prefill tile with PackGQA, the SM100 d256 decode tile and its split combine in the combine module's own forms), the sigmoid gate as its own launch | FUNCTIONAL ONLY, unmeasured; declined by name there: `fuse_gate=True` (the sm100 row claims no gate epilogue), the fused projection forks (`fuse_norm_rope=True` outside the DECODE form's lowering, `fuse_norm_rope_small_m=True`, an explicit `fuse_cache_write=True`: `sm_107a` renderings), `quant` (FP8 / MXFP8), `save_for_backward=True` (the backward binds the Rubin SDPA backward), `thd=True` over the block's own K / V, every `QsaSpec` form (the sparse core, the lean tile through the block, the indexer, the e4m3 cache), `decode_q_tile_max`, an unpacked decode step of 17 .. 32 tokens off the SM100 wide-launch rule; `use_pdl` auto reads False |
+| cc 10.0 (SM100: B200 / GB200; 2026-10-29) | the DENSE bf16 / f16 INFERENCE forms only -- the dense prefill form (`kv_source="self"`), the EXTEND form and the DECODE form over the pools -- through the shared SM100 d256 kernels (the paged prefill tile with PackGQA, the SM100 d256 decode tile at 16 columns and its split combine in the combine module's own forms, unmeasured on this line), the sigmoid gate as its own launch | FUNCTIONAL ONLY, unmeasured (the cells ran 2026-10-29 on the GB200 class, cc 10.0, 152 SMs: 351 passed / 0 failed over the suites' cc 10.0 rows; no performance number); declined by name there: `fuse_gate=True` (the sm100 row claims no gate epilogue), the fused projection forks (`fuse_norm_rope=True` outside the DECODE form's lowering, `fuse_norm_rope_small_m=True`, an explicit `fuse_cache_write=True`: `sm_107a` renderings), `quant` (FP8 / MXFP8), `save_for_backward=True` (the backward binds the Rubin SDPA backward), `thd=True` over the block's own K / V, every `QsaSpec` form (the sparse core, the lean tile through the block, the indexer, the e4m3 cache), `decode_q_tile_max`, the 32-column decode arm (17 .. 32 packed rows on a wide launch, an unpacked step of 17 .. 32 tokens: `DECODE_WIDE_TILE_CCS`, empty until its cells run); `use_pdl` auto reads False |
 | cc 10.3 (B300) | none -- the same SM100 kernels, unproven through the block | declined BY NAME until its cells run |
 
 Three precisions share the signature, and two fp4 modes ride the MXFP8 one (both are fields on `MxQuantSpec`,
@@ -1036,7 +1036,8 @@ inside the write kernel and the in-kernel dequant are the levers a later change 
 Served on cc 10.7 (the cells below) and, since 2026-10-29, on cc 10.0 through the same binding -- the shared SM100 d256 paged THD body
 (`sm100/prefill_d256_f16.py`: CGA2, unsplit, unpacked, NATURAL, no gate, no LSE), the write-through before it, the sigmoid gate as its
 own launch; functional only, unmeasured there, `fuse_gate=True` and `fuse_norm_rope=True` typed declines by name (the part table at the
-top; `test_block_serving_extend.py`'s `requires_blackwell` cells, pending their first run on a cc 10.0 part of the 152-SM class).
+top; `test_block_serving_extend.py`'s `requires_blackwell` cells ran 2026-10-29 on a cc 10.0 part of the 152-SM class: 82 passed / 0
+failed in the module's cc 10.0 selection, within the suites' 351 / 0 record).
 
 Every serving prefill of a sequence with a cached prefix -- a chunked prefill, a prefix-cache hit, a speculative verify -- is an
 EXTEND step: the step's new tokens are written into the pools, and attention runs over each sequence's WHOLE logical KV range
@@ -1171,31 +1172,37 @@ seven-launch chain. The fused kernel the stage runs is a declaration fact:
 SM100 LINE's route -- `decode_route(geometry, S_q, device_cc=(10, 0), batch=, max_kv_len=)`, the SDPA adapter's own rule off cc 10.7,
 input for input (`config_sm100.decode_d256_q_tile` with the wide-launch reading `config_sm100.d256_wide_decode_launch(batch, groups,
 max_kv_len)`: at least 8 units streaming at least 4096 128-key tiles between them; `groups` = `H_kv` packed, `H_q` unpacked): packed rows
-`S_q x group <= 16` ride the 16-column tile in ONE unit; `16 < S_q x group <= 32` the 32-column tile in one unit for a WIDE launch only;
-else the paged PREFILL tile with the whole group packed wherever the group divides 128 (16 / 8 / 4 / 32), at ANY batch (the line has no
+`S_q x group <= 16` ride the 16-column tile in ONE unit; `16 < S_q x group <= 32` is the adapter's 32-column arm at a WIDE launch -- a
+typed decline naming the lift until that arm's cells run (`DECODE_WIDE_TILE_CCS`, empty: no cc 10.0 cell of the block has run the
+32-column tile; the lift is the tuple gaining `(10, 0)`); else the paged PREFILL tile with the whole group packed wherever the group divides 128 (16 / 8 / 4 / 32), at ANY batch (the line has no
 two-unit arm, so there is no fill rule) under BOTH policies (they coincide; `decode_route_policy` is recorded); else the 16-column tile
-UNPACKED (`group` KV streams) to 16 tokens; an unpacked step of 17 .. 32 tokens needs the 32-column width, routed for a wide launch
-only -- a typed decline otherwise, predicted by `serving_envelope(...).decode.routes` / `.route(S_q, batch, max_kv_len)` and raised at
-declaration; `decode_q_tile_max` (the Rubin table's cap) is refused by name; `DecodeRoute.claimed` is False on every SM100 cell (the
-claimed envelope is the Rubin measurement), `DecodeRoute.device_cc` / `.max_kv_len` read the inputs back.  The split count comes from the
-decode split model's Blackwell fit, the split combine runs the combine module's own forms (the decode-grid pin is the cc 10.7 rule's),
+UNPACKED (`group` KV streams) to 16 tokens; an unpacked step of 17 .. 32 tokens needs the 32-column width -- the same arm: routed by the
+adapter for a wide launch only and declined by the block at every launch until its cells run -- a typed decline predicted by
+`serving_envelope(...).decode.routes` / `.route(S_q, batch, max_kv_len)` and raised at declaration; `decode_q_tile_max` (the Rubin
+table's cap) is refused by name; `DecodeRoute.claimed` is False on every SM100 cell (the claimed envelope is the Rubin measurement),
+`DecodeRoute.device_cc` / `.max_kv_len` read the table's part and the bound back (an unserved part -- cc 10.3, an sm80 host -- reads the
+Rubin table on every reading, `device_cc` / `route_cc` None: the home reading).  The split count comes from the decode split model's
+Blackwell fit, the split combine runs the combine module's own forms, unmeasured on this line (the decode-grid pin is the cc 10.7 rule's),
 `fuse_gate=True` is a typed decline (the gate is its own launch after the combine), `use_pdl=None` reads False (the explicit `True` is
 served: the SM100 tile and the combine carry the `griddepcontrol` pair).  The small-launch table at the served groups (`tile 16` = the
-SM100 decode tile packed, `U16` / `U32` unpacked with `group` streams, `P` = the paged prefill tile packed, `[W]` = the 32-column tile
-under the wide rule, `--` = the typed decline off it):
+SM100 decode tile packed, `U16` unpacked with `group` streams, `P` = the paged prefill tile packed, `[W]` = at a wide launch this cell is
+the 32-column arm packed: a typed decline today, `--` = a typed decline at every launch, the same arm unpacked):
 
 | group (`H_q / H_kv`) | `S_q = 1` | `S_q = 2` | `S_q = 3 .. 5` | `S_q = 6 .. 8` | `S_q = 9 .. 16` | `S_q = 17 .. 32` |
 |---|---|---|---|---|---|---|
-| 6 (24 / 4) | tile 16 | tile 16 | U16 (6 streams) [W] | U16 | U16 | -- (W: U32) |
-| 12 (24 / 2) | tile 16 | U16 (12 streams) [W] | U16 | U16 | U16 | -- (W: U32) |
-| 16 (32 / 2, 16 / 1) | tile 16 | P [W] | P | P | U16 (16 streams) | -- (W: U32) |
-| 8 (8 / 1) | tile 16 | tile 16 | P [W at 3 / 4] | P | P | -- (W: U32) |
+| 6 (24 / 4) | tile 16 | tile 16 | U16 (6 streams) [W] | U16 | U16 | -- |
+| 12 (24 / 2) | tile 16 | U16 (12 streams) [W] | U16 | U16 | U16 | -- |
+| 16 (32 / 2, 16 / 1) | tile 16 | P [W] | P | P | U16 (16 streams) | -- |
+| 8 (8 / 1) | tile 16 | tile 16 | P [W at 3 / 4] | P | P | -- |
 | 4 (4 / 1) | tile 16 | tile 16 | tile 16 at 3 / 4, P at 5 [W at 5 .. 8] | P | P | P |
-| MHA | U16 | U16 | U16 | U16 | U16 | -- (W: U32) |
+| MHA | U16 | U16 | U16 | U16 | U16 | -- |
 
-(Wide-rule examples at group 6: `W` at B 2 x kv >= 64K or B 32 x kv >= 4K; `U32` at B 1 x kv >= 22K or B 4 x kv >= 5.5K.)  Functional
-only: nothing is measured on that part; the 32-column single unit for 17 .. 32 packed rows (the MTP T 3 .. 5 step at group 6) is the
-first lever to measure there.  The Rubin route of record follows.
+(The wide launches the arm would take, declined today, at group 6: `W` at B 2 x kv >= 64K or B 32 x kv >= 4K; `U32` at B 1 x kv >= 22K
+or B 4 x kv >= 5.5K.)  Functional only -- the cells of 2026-10-29 on a cc 10.0 part of the 152-SM class: the oracle matrix at every served
+group x `S_q` 1 .. 5, the 27B geometry, the pool matrix at every page size and dtype, two launches, capture / replay, the explicit PDL
+switch, the prefill route at the standard batch, all passed (the suites' record: 351 passed / 0 failed over the cc 10.0 rows); nothing is
+measured on that part; the 32-column arm's cells (the MTP T 3 .. 5 step at group 6 on a wide launch) are the first to run and measure
+there, and `DECODE_WIDE_TILE_CCS` gaining `(10, 0)` is their lift.  The Rubin route of record follows.
 
 The route is TABLE-DRIVEN (the default policy, `decode_route_policy="single_unit"`): ONE ordered table of the Rubin decode tile's
 single-unit widths, `config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES = (16, 32, 64)` (the 64-column tile landed 2026-10-15: four
