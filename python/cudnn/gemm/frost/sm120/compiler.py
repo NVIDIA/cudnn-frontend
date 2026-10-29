@@ -312,6 +312,31 @@ def _l2_swizzle_budget_bytes() -> int:
     return l2_swizzle_budget_bytes()
 
 
+def _single_gemm_ring_reject(chain: FusionChain, cfg: TileConfig, tmpl) -> "str | None":
+    """Decline a single-GEMM tile the plain templates would trace with an empty AB ring.
+
+    For one GEMM the renderer emits ``ab_stages = cfg.max_ab_stages(...)`` (operand bytes
+    only) with ``stg_epi_prefunded = False``; the template then gives up whole stages of its
+    ``_AB_STAGE_BYTES`` for the transposed-STG epilogue staging. The catalog sweep
+    (``_sm120_smem_feasible``) applies the same rule, but an explicit or knob-replayed
+    geometry reaches the renderer without it."""
+    if chain.is_multi_gemm or chain.has_block_scale or tmpl.family != _FAMILY:
+        return None
+    from ..tile_config import _SM120_STG_STAGE_ELEMS
+
+    stages = cfg.max_ab_stages(smem_fixed_reserve=tmpl.smem_fixed_reserve)
+    per_stage = (chain.num_a_operands * cfg.cta_tile_m + chain.num_b_operands * cfg.cta_smem_tile_n) * cfg.cta_tile_k_bytes + 16
+    staging = 4 * _SM120_STG_STAGE_ELEMS * (cfg.cta_tile_m // cfg.warp_tile_m) * (cfg.cta_tile_n // cfg.warp_tile_n)
+    given = -(-staging // per_stage)
+    if stages - given >= 1:
+        return None
+    return (
+        f"{tmpl.file}: config {cfg.name!r} leaves no AB pipeline stage -- the SMEM budget holds {stages} "
+        f"stage(s), and the template gives up {given} whole {per_stage}-B stage(s) for its {staging}-B "
+        "epilogue staging; pick a smaller CTA tile or K tile"
+    )
+
+
 def _render_tile_constants(
     cfg: TileConfig,
     chain: FusionChain,
@@ -332,6 +357,9 @@ def _render_tile_constants(
             raise NotImplementedError(f"{tmpl.file}: {_mg}")
         _ab_stages, _, _ = tmpl.multi_gemm_ab_stages(chain, cfg)
     else:
+        _ring = _single_gemm_ring_reject(chain, cfg, tmpl)
+        if _ring is not None:
+            raise NotImplementedError(_ring)
         _ab_stages = cfg.max_ab_stages(smem_fixed_reserve=tmpl.smem_fixed_reserve)
     if chain.has_moe:
         token_major = chain.matmul.b_major if isinstance(chain.moe, MoeSwapAbSpec) else chain.matmul.a_major
@@ -2051,6 +2079,9 @@ def _precheck_plain(
     if _arch_reason is not None:
         raise NotImplementedError(_arch_reason)
     _check_dtype_config_compat(chain, config)
+    _ring = _single_gemm_ring_reject(chain, config, select_template(chain, config))
+    if _ring is not None:
+        raise NotImplementedError(_ring)
     _check_input_alignment(chain)
     _compute_output_vec_bytes(chain)
     _check_block_quant_supported(chain, _epi_vec_bytes(chain, config), config)
@@ -2090,6 +2121,9 @@ def _precheck_moe(
         _mg = _tmpl.multi_gemm_reject(chain, config)
         if _mg is not None:
             raise NotImplementedError(f"{_tmpl.file}: {_mg}")
+    _ring = _single_gemm_ring_reject(chain, config, _tmpl)
+    if _ring is not None:
+        raise NotImplementedError(_ring)
     _check_input_alignment(chain)
     _compute_output_vec_bytes(chain)
     _check_block_quant_supported(chain, _epi_vec_bytes(chain, config), config)

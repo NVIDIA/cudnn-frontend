@@ -3398,6 +3398,60 @@ def test_sm120_scope_gates() -> None:
         assert [t for t, _c in candidates(nmaj) if t.pipeline == "sm120"], in_dt
 
 
+# MaxSharedMemoryPerBlockOptin of the SM 12.x parts, the budget the sm120 catalog is swept against.
+_SM120_OPTIN_SMEM_BYTES = 99 * 1024
+
+
+@pytest.mark.parametrize("kind", ["dense", "moe", "moe_swap_ab"])
+def test_sm120_single_gemm_tile_without_an_ab_stage_declines_at_probe(kind, monkeypatch) -> None:
+    """A single-GEMM tile whose only AB stage the template gives up to its
+    transposed-STG epilogue staging is declined by the probe, the JIT and the
+    engine's knob replay with the same NotImplementedError -- not admitted by the
+    probe and then failed in the DSL trace ("num_elems must be at least 1"). The
+    SMEM budget is pinned to the SM 12.x opt-in, so the case is the same on every
+    part the sm120 pipeline runs on."""
+    from dataclasses import replace
+
+    from cudnn.engines import MANIFEST
+    from cudnn.gemm.frost import tile_config
+    from cudnn.gemm.frost.knobs import GemmKnobs
+    from cudnn.gemm.frost.sm120 import compiler as C120
+    from test_moe_grouped_matmul_fwd import _build_graph as _build_moe_graph
+
+    monkeypatch.setattr(tile_config, "_sm_smem_budget_bytes", lambda device=None: _SM120_OPTIN_SMEM_BYTES)
+
+    def graph():
+        return _build_graph(512, 512, 512, "bf16", "bf16") if kind == "dense" else _build_moe_graph(2, 512, 512, 256)
+
+    def config(name):
+        return replace(by_name(name), swap_ab=True) if kind == "moe_swap_ab" else by_name(name)
+
+    # The budget holds one 64-KiB AB stage of the first tile, and the template gives it
+    # up to the 16896-B staging; only an explicit config or a knob record names that
+    # tile. The staging leaves the catalog's second tile exactly one stage.
+    empty, one_stage = "CONFIG_sm120_256x256x128_16x16x32_cluster1x1_warps4x2", "CONFIG_sm120_256x128x128_16x16x32_cluster1x1_warps4x2"
+    assert by_name(empty) not in CATALOG and by_name(one_stage) in CATALOG
+    cfg = config(empty)
+    declined = "leaves no AB pipeline stage"
+    with pytest.raises(NotImplementedError, match=declined):
+        C120.probe_supported(graph(), cfg)
+    with pytest.raises(NotImplementedError, match=declined):
+        C120.jit_from_cudnn_graph(graph(), config=cfg)
+    C120.probe_supported(graph(), config(one_stage))
+
+    if active_family() != "sm120":
+        return  # the knob replay builds through the active tree's compiler
+    g = graph()
+    g.validate()
+    g.build_operation_graph()
+    (row,) = [r for r in MANIFEST if r.name == "frost_gemm"]
+    g.create_execution_plan(row.engine_id, GemmKnobs.from_config(cfg).to_public())
+    g.select_plan(g.get_execution_plan_count() - 1)
+    g.check_support()
+    with pytest.raises(NotImplementedError, match=declined):
+        g.build_plans()
+
+
 def test_sm120_epi_vec_clamp_and_stg_only() -> None:
     """sm120 always renders the transposed-STG epilogue, with the chunk capped
     at the 8-element fragment row run; the sm100 derivation is untouched."""
