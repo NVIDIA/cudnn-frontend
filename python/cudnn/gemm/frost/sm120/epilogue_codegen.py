@@ -100,6 +100,10 @@ def _emit_moe_combine_store(tap_idx, i, src, spec, chain, vsize):
 
 _PARTIAL_REDUCTION_MODES = frozenset({"add", "avg", "norm1", "norm2", "amax", "max", "min"})
 
+# The MoE templates bind the routed rows their groups cover (the final first_token_offset, at most
+# the routed capacity) under this name; an ungrouped AVG over the token axis divides by it.
+_MOE_USED_ROWS = "moe_used_rows"
+
 
 def _reduction_uses_partial(red: ReductionSpec) -> bool:
     return red.dim[1] == 1 and red.dim[2] == 1 and red.mode in _PARTIAL_REDUCTION_MODES
@@ -202,7 +206,7 @@ def _emit_reduction_partial_flush(tap_idx: int, red_idx: int, red: ReductionSpec
         sh = f"_red_{red_idx}_sh{off}"
         lines.append(f"{sh} = cute.arch.shuffle_sync_bfly({tot}, offset={off})")
         lines.extend(_reduction_partial_fold(red, tot, sh))
-    body = _emit_reduction_avg_inverse(red_idx, red, chain) if red.mode == "avg" else []
+    body = _emit_reduction_avg_inverse(red_idx, red, chain, token_extent=_MOE_USED_ROWS) if red.mode == "avg" else []
     body += _emit_reduction_vector_atomic(tap_idx, red_idx, red, tot)
     lines.append("if lane == 0:")
     lines.extend(f"    {ln}" for ln in body)
@@ -218,7 +222,7 @@ def _emit_red_part_module(chain: FusionChain, parts: list, folds: "list | None" 
     lines = [f"red_part_slots = {max(1, len(parts), fold_slots)}", "", "", "@cute.jit", "def red_part_seed(_red_part):"]
     seed = [_reduction_partial_store(red, slot, _reduction_partial_identity(red)) for _ri, slot, red, _t in parts]
     lines += [f"    {ln}" for ln in (seed or ["pass"])]
-    ctx = "group_idx, group_begin, group_end" if chain.has_moe else "tile_l,"
+    ctx = f"group_idx, group_begin, group_end, {_MOE_USED_ROWS}" if chain.has_moe else "tile_l,"
     args = ", ".join(f"gC_tap_{tap}_ptr, red_stride_m_{ri}, red_stride_n_{ri}, red_stride_l_{ri}" for ri, tap in _red_part_arg_refs(parts, folds))
     for name, per_cta in (("red_part_flush_tile", False), ("red_part_flush_cta", True)):
         lines += ["", "", "@cute.jit", f"def {name}(_red_part, lane, M, N, _red_part_ctx, _red_part_args):"]
@@ -409,7 +413,7 @@ def _emit_lane_run_fold_flush(chain: FusionChain, folds: list, lane_run_tile: "t
             lines += [f"{t} = cute.arch.shuffle_sync_bfly({o}, offset={off})", f"if {t} > {o}:", f"    {o} = {t}"]
     for ri, red, tap, fold in folds:
         o = f"_fold_o_{fold.kind}"
-        avg = _emit_reduction_avg_inverse(ri, red, chain) if red.mode == "avg" else []
+        avg = _emit_reduction_avg_inverse(ri, red, chain, token_extent=_MOE_USED_ROWS) if red.mode == "avg" else []
         if fold.kind == "row":
             vals = []
             for s in range(2 * m_frags):
@@ -496,7 +500,7 @@ def _emit_reduction_atomic_body(
         lines.extend(_reduction_partial_slot_fold(red_idx, red, partial_slot, acc))
         return lines
     if red.mode == "avg":
-        lines.extend(_emit_reduction_avg_inverse(red_idx, red, chain))
+        lines.extend(_emit_reduction_avg_inverse(red_idx, red, chain, token_extent=_MOE_USED_ROWS))
     if red.dim[2] == 1:
         combine_lines, acc = _emit_reduction_local_combine(red_idx, red, src, vsize)
         lines.extend(combine_lines)
