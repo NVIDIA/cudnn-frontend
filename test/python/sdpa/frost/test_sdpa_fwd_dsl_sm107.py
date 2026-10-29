@@ -1374,36 +1374,24 @@ def test_sm107_quantized_rows_serve_d192_on_their_native_kernels():
             assert engines._selected_d_shape(caps, facts) == (192, 128), (row, dt)
 
 
-def test_sm107_d192_mxfp8_is_cga2_only_because_of_the_descriptor_window():
-    """REJECT side, and the reason is a DESCRIPTOR constraint rather than taste.
-
-    At cga1 the K/V rings are not halved, so this flavor's four scale-factor
-    tiles start at 256-278 KiB -- past the 256 KiB version-0 tcgen05 descriptor
-    window, where ``start_address`` wraps to 0 and the UTCCP copies Q DATA bytes
-    into the SF TMEM columns (LSE=+inf, O=NaN on 100% of cells, at every shape).
-
-    Two independent guards, and this test pins BOTH: the row keeps (192, 128) on
-    the default ``cgas={2}`` so a graph cannot request cga1, and the kernel body
-    raises at import if it is ever handed one anyway.  INVERTS-WHEN DESC_VERSION
-    is derived from the layout and the version-1 SF path is validated on Rubin
-    -- which is not free: desc_version=1 on the d128/d256 MXFP8 tiles turned 21
-    green tests red (2026-09-08)."""
-    import pytest as _pytest
+def test_sm107_d192_mxfp8_single_cta_stays_inside_the_descriptor_window():
+    """The MXFP8 d192x128 kernel declares the O slab after the scale-factor slabs and the ones tile, so its single-CTA
+    build keeps every tcgen05 operand inside the version-0 window; the row lists cga1 for the dense unsplit MHA causal
+    leg and keeps the pair elsewhere."""
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
 
     caps = _caps("sdpa_fwd_prefill_sm107_mxfp8")
-    facts = _quant_facts(d_qk=192, d_v=128, is_mx=True)
-    # Guard 1 -- knob domain. cga2 is honored, cga1 makes the plan ineligible.
-    assert engines.mismatch(caps, facts, SdpaFwdKnobs(cga=2)) is None
-    assert engines.mismatch(caps, facts, SdpaFwdKnobs(cga=1)) is not None
-    # SM100 serves the same shape at BOTH widths -- so this is Rubin-specific,
-    # which is what makes it worth pinning rather than assuming.
-    assert 1 in engines.effective_cgas(_caps("sdpa_fwd_prefill_sm100_mxfp8"), facts, 1)
+    dense = _quant_facts(d_qk=192, d_v=128, is_mx=True)
+    assert engines.mismatch(caps, dense, SdpaFwdKnobs(cga=2)) is None
+    assert engines.mismatch(caps, dense, SdpaFwdKnobs(cga=1)) is not None
+    causal = _quant_facts(d_qk=192, d_v=128, is_mx=True, causal=True)
+    assert engines.mismatch(caps, causal, SdpaFwdKnobs(cga=1)) is None
+    assert engines.mismatch(caps, _quant_facts(d_qk=192, d_v=128, is_mx=True, causal=True, h_q=8), SdpaFwdKnobs(cga=1)) is not None
+    assert 1 in engines.effective_cgas(_caps("sdpa_fwd_prefill_sm100_mxfp8"), dense, 1)
 
-    # Guard 2 -- the kernel body itself, so the constraint survives a row edit.
-    with _pytest.raises(ValueError, match="CTA_MMA must be 2"):
-        _load((192, 128), rubin=True, fp8=True, pertensor=False, dtype_qkv=_E4M3, dtype_o=_BF16_OUT, cta_mma=1)
+    mod = _load((192, 128), rubin=True, fp8=True, pertensor=False, dtype_qkv=_E4M3, dtype_o=_BF16_OUT, cta_mma=1)
+    assert mod._ONES_SMEM_OFFSET < mod._DESC_V0_WINDOW, (mod._ONES_SMEM_OFFSET, mod.CFG.CTA_MMA)
 
 
 def _quant_facts(**kw):

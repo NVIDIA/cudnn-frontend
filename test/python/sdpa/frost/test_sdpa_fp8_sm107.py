@@ -1932,7 +1932,7 @@ def test_sm107_d256_mxfp8_dense_legs_run_the_two_cta_pair():
     # the per-tensor d192x128 kernel lists the single CTA on the 107 line with an fp8 O only
     assert supported_cgas_for((192, 128), fp8=True, device_cc=(10, 7), pertensor=True, fp8_o=True) == (1, 2)
     assert supported_cgas_for((192, 128), fp8=True, device_cc=(10, 7), pertensor=True) == (2,)
-    assert supported_cgas_for((192, 128), fp8=True, device_cc=(10, 7), pertensor=False, fp8_o=True) == (2,)
+    assert supported_cgas_for((192, 128), fp8=True, device_cc=(10, 7), pertensor=False) == (1, 2)
     assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 7), pertensor=True) == (1, 2)
     assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 7), pertensor=False) == (1, 2)
     # the row domain, narrowed per graph
