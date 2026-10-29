@@ -120,6 +120,23 @@ class Tensor_attributes {
             error_code_t::ATTRIBUTE_NOT_SET,
             "Tensor '" + name + "' can't have both compile-time constant and runtime pass_by_value.");
 
+        // These values are owned by the frontend. The backend reads according to
+        // data_type, so a narrower active variant would leave that read outside
+        // the stored scalar (and outside the constant's byte buffer).
+        auto const scalar_bytes = detail::get_data_type_size(data_type);
+        auto const stored_bytes = [](pass_by_values_t const& value) {
+            return std::visit([](auto const& scalar) { return sizeof(scalar); }, value);
+        };
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            scalar_bytes != 0 && pass_by_value.has_value() && scalar_bytes > stored_bytes(*pass_by_value),
+            error_code_t::INVALID_VALUE,
+            "Tensor '" + name + "' runtime scalar storage is narrower than its data type.");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            scalar_bytes != 0 && compile_time_constant_value.has_value() &&
+                scalar_bytes > stored_bytes(*compile_time_constant_value),
+            error_code_t::INVALID_VALUE,
+            "Tensor '" + name + "' compile-time constant storage is narrower than its data type.");
+
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             has_ragged_offset_multiplier() && !ragged_offset,
             error_code_t::ATTRIBUTE_NOT_SET,

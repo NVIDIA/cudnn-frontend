@@ -94,11 +94,12 @@ tensor_bytes(Tensor_attributes const &tensor) {
 inline int64_t
 dump_bytes(Tensor_attributes const &tensor) {
     validate_shape(tensor);
-    if (std::find(tensor.get_dim().begin(), tensor.get_dim().end(), 0) != tensor.get_dim().end()) {
+    auto const dim = tensor.get_dim();
+    if (std::find(dim.begin(), dim.end(), 0) != dim.end()) {
         return 0;
     }
     int64_t count = 1;
-    for (auto extent : tensor.get_dim()) {
+    for (auto extent : dim) {
         require(count <= std::numeric_limits<int64_t>::max() / extent,
                 "Serialized tensor dump element count overflows");
         count *= extent;
@@ -274,9 +275,8 @@ parse(json const &j) {
                     "Serialized tensor alignment must be a positive power of two");
             validate_shape(*tensor);
             if (tensor->get_is_pass_by_value()) {
-                require(std::count_if(tensor->get_dim().begin(),
-                                      tensor->get_dim().end(),
-                                      [](int64_t extent) { return extent > 1; }) <= 1,
+                auto const dim = tensor->get_dim();
+                require(std::count_if(dim.begin(), dim.end(), [](int64_t extent) { return extent > 1; }) <= 1,
                         "Serialized pass-by-value tensor has multiple nonsingleton "
                         "dimensions");
             }

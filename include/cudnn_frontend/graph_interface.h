@@ -3735,6 +3735,7 @@ CustomReductionNode::validate_reducer_body(Graph const &body,
                                        error_code_t::INVALID_VALUE,
                                        "Custom reduction reducer-body tensor '" + tensor->get_name() +
                                            "' must be virtual or a compile-time constant.");
+        CHECK_CUDNN_FRONTEND_ERROR(tensor->validate());
     }
 
     std::unordered_set<Tensor_attributes const *> distinct_boundaries;

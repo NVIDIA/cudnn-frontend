@@ -323,3 +323,79 @@ TEST_CASE("Throwing reducers are contained and retry with FE exceptions disabled
         }
     }
 }
+
+TEST_CASE("Owned scalar storage covers the declared backend read width", "[custom_reduction][boundary][scalar_width]") {
+    for (bool compile_time : {false, true}) {
+        DYNAMIC_SECTION("compile-time " << compile_time) {
+            auto small =
+                Tensor(__float2half(1.0F),
+                       compile_time ? fe::graph::ScalarType::COMPILE_TIME_CONST : fe::graph::ScalarType::RUNTIME_PARAM)
+                    .set_data_type(fe::DataType_t::FLOAT);
+            REQUIRE(small.validate().get_code() == fe::error_code_t::INVALID_VALUE);
+            auto tensor = std::make_shared<Tensor>(small.set_uid(71));
+            BackendTensors backend;
+            REQUIRE(fe::detail::create_cudnn_tensor(tensor, backend).get_code() == fe::error_code_t::INVALID_VALUE);
+            REQUIRE(backend.empty());
+
+            auto wide =
+                Tensor(1.0F,
+                       compile_time ? fe::graph::ScalarType::COMPILE_TIME_CONST : fe::graph::ScalarType::RUNTIME_PARAM)
+                    .set_data_type(fe::DataType_t::DOUBLE);
+            REQUIRE(wide.validate().get_code() == fe::error_code_t::INVALID_VALUE);
+            auto equal_width =
+                Tensor(int32_t{1},
+                       compile_time ? fe::graph::ScalarType::COMPILE_TIME_CONST : fe::graph::ScalarType::RUNTIME_PARAM)
+                    .set_data_type(fe::DataType_t::FLOAT);
+            REQUIRE(equal_width.validate().is_good());
+            REQUIRE(
+                Tensor(__float2half(1.0F),
+                       compile_time ? fe::graph::ScalarType::COMPILE_TIME_CONST : fe::graph::ScalarType::RUNTIME_PARAM)
+                    .validate()
+                    .is_good());
+        }
+    }
+}
+
+TEST_CASE("Reducer rejects a narrow owned constant before committing its body",
+          "[custom_reduction][boundary][scalar_width_body]") {
+    if (CUDNN_VERSION < 92900 || fe::detail::get_backend_version() < 92900) {
+        SKIP("Requires cuDNN9.29");
+    }
+    using Attributes = fe::graph::Custom_reduction_attributes;
+    ExpandingGraph graph;
+    graph.set_io_data_type(fe::DataType_t::FLOAT).set_compute_data_type(fe::DataType_t::FLOAT);
+    auto input   = graph.tensor(Tensor().set_dim({2}).set_stride({1}).set_data_type(fe::DataType_t::FLOAT));
+    int calls    = 0;
+    auto reducer = [&](Attributes::Graph_t child, std::vector<TensorPtr> lhs, std::vector<TensorPtr> rhs) {
+        auto constant = child->tensor(__float2half(1.0F), fe::graph::ScalarType::COMPILE_TIME_CONST);
+        if (++calls == 1) {
+            constant->set_data_type(fe::DataType_t::FLOAT);
+        } else {
+            constant->set_compile_time_constant(Tensor::pass_by_values_t{1.0F}).set_data_type(fe::DataType_t::FLOAT);
+        }
+        auto sum = child->pointwise(lhs[0],
+                                    rhs[0],
+                                    fe::graph::Pointwise_attributes()
+                                        .set_mode(fe::PointwiseMode_t::ADD)
+                                        .set_compute_data_type(fe::DataType_t::FLOAT));
+        sum->set_data_type(fe::DataType_t::FLOAT);
+        auto result = child->pointwise(sum,
+                                       constant,
+                                       fe::graph::Pointwise_attributes()
+                                           .set_mode(fe::PointwiseMode_t::ADD)
+                                           .set_compute_data_type(fe::DataType_t::FLOAT));
+        result->set_data_type(fe::DataType_t::FLOAT);
+        return std::vector<TensorPtr>{result};
+    };
+    auto output = graph.custom_reduction({input},
+                                         Attributes()
+                                             .set_reducer(reducer, "boundary.width.v1")
+                                             .set_reduction_dims({0})
+                                             .set_identity_values({fe::graph::Custom_reduction_identity(0.0F)}))[0];
+    output->set_output(true);
+    REQUIRE(graph.validate().is_good());
+    REQUIRE(graph.expand().get_code() == fe::error_code_t::INVALID_VALUE);
+    REQUIRE(calls == 1);
+    REQUIRE(graph.expand().is_good());
+    REQUIRE(calls == 2);
+}
