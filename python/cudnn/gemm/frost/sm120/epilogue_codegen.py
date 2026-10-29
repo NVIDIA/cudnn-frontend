@@ -809,11 +809,11 @@ def _tap_fake_shape(tap, chain: FusionChain | None = None) -> str:
             chain.matmul.M,
             chain.matmul.N // q.block_size,
         )
-        logical_n = chain.matmul.N // q.block_size
-        m_expr = "1" if m == 1 else ("sym_m" if m == chain.matmul.M else str(m))
-        n_expr = "1" if n == 1 else (f"(sym_n // {q.block_size})" if n == logical_n else str(n))
-        l_expr = "1" if b == 1 else ("sym_l" if b == chain.matmul.batch else str(b))
-        return f"({m_expr}, {n_expr}, {l_expr})"
+        # Fresh symbols, never the kernel's sym_m / sym_n / sym_l: the blob's extents are plan constants the host
+        # checks (recipe._output_rule) and the kernel only takes its raw pointer, but one SymInt is one tvm-ffi Var,
+        # so sym_m held the padded F8_128x4 rows to the kernel's runtime M (S for MoE, the graph's N under swap-AB)
+        # and refused calls that _check_runtime_quant admits.
+        return "(" + ", ".join("1" if d == 1 else "cute.sym_int64()" for d in (m, n, b)) + ")"
     if tap.dim is None:
         l_expr = "1" if (chain is not None and chain.has_moe) else "sym_l"
         if tap.dtype == "fp4_e2m1":
