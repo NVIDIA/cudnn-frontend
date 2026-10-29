@@ -281,10 +281,14 @@ def _emit_op(
     if op.op == "identity":
         return [], prev
 
+    # relu (every slope / clip form), leaky_relu and elu keep a NaN input NaN, as torch does and as the frontend
+    # requests for RELU_FWD (CUDNN_PROPAGATE_NAN). The DSL's default max/min (maxnum/minnum) return the non-NaN
+    # operand, which turned NaN into 0 or lower_clip; propagate_nan=True lowers to arith.maximumf/minimumf. The
+    # binary max/min ops keep the default, which matches native cuDNN (eng10) MAX/MIN.
     if op.op == "relu":
         ra = dict(op.attrs)
         if not ra:
-            return [f"{new} = cute.math.max({prev}, cutlass.full_like({prev}, {_compute_literal(op.compute_dtype, 0)}))"], new
+            return [f"{new} = cute.math.max({prev}, cutlass.full_like({prev}, {_compute_literal(op.compute_dtype, 0)}), propagate_nan=True)"], new
         slope, lower, upper = ra.get("negative_slope"), ra.get("lower_clip"), ra.get("upper_clip")
         rl = [f"_r{idx} = {prev}"]
         rv = f"_r{idx}"
@@ -293,13 +297,15 @@ def _emit_op(
             # lower_clip is where the slope starts, not a clamp applied after it.
             lo = 0.0 if lower is None else lower
             shifted = rv if lo == 0.0 else f"({rv} - {_fl(rv, lo)})"
-            rl.append(f"_rk{idx} = cute.math.max({rv}, {_fl(rv, lo)}) + {_fl(rv, slope)} * cute.math.min({shifted}, {_fl(rv, 0.0)})")
+            rl.append(
+                f"_rk{idx} = cute.math.max({rv}, {_fl(rv, lo)}, propagate_nan=True) + {_fl(rv, slope)} * cute.math.min({shifted}, {_fl(rv, 0.0)}, propagate_nan=True)"
+            )
             cur = f"_rk{idx}"
         else:
-            rl.append(f"_rl{idx} = cute.math.max({rv}, {_fl(rv, lower if lower is not None else 0.0)})")
+            rl.append(f"_rl{idx} = cute.math.max({rv}, {_fl(rv, lower if lower is not None else 0.0)}, propagate_nan=True)")
             cur = f"_rl{idx}"
         if upper is not None:
-            rl.append(f"_ru{idx} = cute.math.min({cur}, {_fl(rv, upper)})")
+            rl.append(f"_ru{idx} = cute.math.min({cur}, {_fl(rv, upper)}, propagate_nan=True)")
             cur = f"_ru{idx}"
         return rl + [f"{new} = {cur}"], new
 
@@ -307,13 +313,13 @@ def _emit_op(
         slope = dict(op.attrs).get("negative_slope", 0.0)
         return [
             f"_lr{idx} = {prev}",
-            f"{new} = cute.math.max(_lr{idx}, {_fl(f'_lr{idx}', 0.0)}) + {_fl(f'_lr{idx}', slope)} * cute.math.min(_lr{idx}, {_fl(f'_lr{idx}', 0.0)})",
+            f"{new} = cute.math.max(_lr{idx}, {_fl(f'_lr{idx}', 0.0)}, propagate_nan=True) + {_fl(f'_lr{idx}', slope)} * cute.math.min(_lr{idx}, {_fl(f'_lr{idx}', 0.0)}, propagate_nan=True)",
         ], new
 
     if op.op == "elu":
         return [
             f"_el{idx} = {prev}",
-            f"{new} = cute.math.max(_el{idx}, {_fl(f'_el{idx}', 0.0)}) + cute.math.exp2(cute.math.min(_el{idx}, {_fl(f'_el{idx}', 0.0)}) * cutlass.full_like(_el{idx}, {_LOG2E}), fastmath=True) - {_fl(f'_el{idx}', 1.0)}",
+            f"{new} = cute.math.max(_el{idx}, {_fl(f'_el{idx}', 0.0)}, propagate_nan=True) + cute.math.exp2(cute.math.min(_el{idx}, {_fl(f'_el{idx}', 0.0)}, propagate_nan=True) * cutlass.full_like(_el{idx}, {_LOG2E}), fastmath=True) - {_fl(f'_el{idx}', 1.0)}",
         ], new
 
     if op.op == "softplus":
