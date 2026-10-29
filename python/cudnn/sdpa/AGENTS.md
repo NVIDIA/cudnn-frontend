@@ -279,6 +279,26 @@ that loops dimension subtiles must not also request multiple loads per subtile.
 `TestD256Fp8HeadPadding::test_paged_rebind_replay` covers partial K/V heads,
 short and wide pages, independent pools/tables, sinks and changed-length replay.
 
+Native backward gradient outputs must not overwrite each other.
+
+
+- A native route replacing ordered staged copy-back must reject overlapping
+  gradient address sets before any initialization or launch, on both graph and
+  standalone calls. Recheck current pointers on every binding.
+- Shared allocation or overlapping bounding spans do not imply overlapping
+  elements: disjoint interleaved Q/K/V gradients remain valid. Use declared
+  strides even when the graph binds flat storage or raw pointers.
+- Cache disjointness geometry at plan time. Regular padded interleaves need
+  a bounded check even when outer padding defeats the stride-GCD shortcut;
+  include head/batch carry gaps and recheck current pointer offsets. Compare
+  the result against an address-set oracle with mixed layouts, different block
+  widths and both pointer orders. Measure large declarations without walking
+  every row per bind.
+- Detectors: `test_sm80_gradient_overlap_rejected_before_entry`,
+  `test_sm80_shared_gradient_storage_matches_address_oracle`, and
+  `test_native_overlapping_gradients_rejected_before_writes`. Preserve the
+  existing legal interleaved-gradient and staged copy-order tests.
+
 **Rule S6 — A kernel feature lands on every arch line's test file, and its
 other-arch lowerings are smoke-compiled from whatever GPU you have.**
 
@@ -910,6 +930,18 @@ replay after previously active rows become fully masked. The detector is
 
 
 ## Adapter declines that other suites pin
+
+For SM80 native admission, distinguish stepped dense axes from packed THD
+addressing: THD never reads the declared batch stride. A shared dense-layout
+predicate can silently select staging for an otherwise valid packed graph.
+Keep per-port graph/standalone rejection checks and legal gapped THD controls
+in `test_sdpa_native_admission_sm80.py`, plus actual launch-count/replay checks.
+Keep declaration-only validators in `native_sm80.py`, outside prepared launch
+modules: the latter depend back on adapter helpers and can introduce import
+cycles when called by `check_support()`. After removing a supported route,
+remove its unreachable test branches and name the retained decline/replay
+cases for the contract they actually assert.
+
 
 `gated_attention_block` runs the SDPA forward adapter as its attention stage, and
 its tests pin the adapter's declines by message (`match="multiple of 128"`).

@@ -6639,10 +6639,9 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
     are deliberately NOT served: the capability row declines such graphs and
     the backend takes them.
 
-    Dense vector-aligned declarations with a native V width use one prepared
-    pointer host, including native GQA and strided Q/K/V/O/Stats. Other layouts,
-    and off-flavor widths use prepared bitwise copies and native GQA. RoPE
-    shares that plan, retaining only its standalone angle-table preprocessing.
+    Dense vector-aligned declarations use one prepared pointer host, including
+    native GQA, padded head widths and strided Q/K/V/O/Stats. Copy-dependent
+    declarations and RoPE decline before compilation.
     """
 
     def __init__(self, *args, scheduler: Optional[str] = None, bias_present: bool = False, bias_fp32: bool = False, rope_max_s: int = 0, **kwargs) -> None:
@@ -6919,6 +6918,11 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self.h_kv = int(h_kv)
         self.head_dim_qk = int(d_qk)
         self.head_dim_v = int(d_v)
+
+        from cudnn.sdpa.native_sm80 import forward_adapter_mismatch
+
+        reason = forward_adapter_mismatch(self)
+        self._not_implemented_error_if(reason is not None, reason)
 
         self._is_supported = True
         self._logger.debug("check_support completed successfully")

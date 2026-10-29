@@ -542,6 +542,9 @@ class Capabilities:
     # Exact native shapes with half Q/O and independent FP8 K/V storage.
     # This is plain sdpa: no FP8-Q quantization or scalar-descale contract.
     mixed_fp8_kv_d_shapes: frozenset[tuple[int, int]] = frozenset()
+    # Pure declaration constraints, shared with the standalone adapter.
+    # Appended to retain the historical positional constructor.
+    declaration_check: Optional[Callable[["ga.SdpaGraphFacts"], Optional[str]]] = None
 
 
 def _mixed_fp8_kv(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
@@ -2226,6 +2229,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if capabilities.skv_tile and facts.s_kv % capabilities.skv_tile != 0 and not capabilities.skv_tail_via_padding:
         if not (facts.padded or _band_covers_kv_tail(facts)):
             return f"S_kv ({facts.s_kv}) must be a multiple of {capabilities.skv_tile} unless a padding mask is given or the causal mask covers the KV tail"
+    if capabilities.declaration_check is not None:
+        reason = capabilities.declaration_check(facts)
+        if reason is not None:
+            return reason
     if facts.shape_overrides or _selected_d_shape(capabilities, facts, knobs) == SM100_NATIVE_D576_SHAPE:
         return _prepared_decline_reason(capabilities, facts, knobs.split_kv if knobs is not None else None)
     return None
@@ -3104,11 +3111,12 @@ def _sm107_mxfp8_spec() -> EngineSpec:
 def _sm80_spec() -> EngineSpec:
     """SM80 (A100) prefill row: lowers through ``lower_dsl_prefill`` onto the
     ``SdpaFwdDslSm80`` adapter (``fwd/api_dsl.py``), which owns kernel-flavor
-    selection (gptoss/llama/dsv3/qwen), host-side head-dim padding (hence
-    ``d_pad_multiple=1``), BHSD<->BSHD normalization, and per-shape kernel
-    caching. Native-flavor packed THD graphs bind the varlen template directly;
+    selection (gptoss/llama/dsv3/qwen), native eight-aligned head-dim envelopes,
+    declared data strides, and per-shape kernel caching. Native-flavor packed THD graphs bind the varlen template directly;
     the dense head-dim envelope is not offered to THD. Dense graphs expose
     scheduler tuning; THD requires the natural 3-D grid."""
+    from cudnn.sdpa.native_sm80 import graph_mismatch
+
     return EngineSpec(
         name="sdpa_fwd_prefill_sm80",
         capabilities=Capabilities(
@@ -3116,8 +3124,9 @@ def _sm80_spec() -> EngineSpec:
             sm_lo=80,
             sm_hi=80,  # A100 exactly: the kernels assume its 164 KiB opt-in SMEM
             phase="prefill",
-            d_shapes=frozenset({(256, 256)}),  # flavor envelopes; host-side zero-padding
-            d_pad_multiple=1,
+            d_shapes=frozenset({(256, 256)}),  # flavor envelopes; masked native loads
+            d_pad_multiple=8,
+            declaration_check=graph_mismatch,
             thd_d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256)}),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             bias=True,

@@ -5,6 +5,8 @@
 #include "sdpa_fixed_binding.h"
 
 #include <algorithm>
+#include <array>
+#include <numeric>
 #include <limits>
 #include <string>
 #include <utility>
@@ -24,6 +26,16 @@ class SdpaBwdBinder : private FixedSdpaOperands {
         bool contiguous = false;
         int length_bit  = -1;
     };
+    // SM80 writes gradients directly. Their declared address sets must be
+    // disjoint, including after rebinding raw graph pointers. Bounding spans
+    // alone cannot distinguish legal interleaved Q/K/V gradient storage.
+    struct Output {
+        size_t index;
+        int64_t block, period = 0;
+        Geometry axes;
+        int64_t minimum_gap = std::numeric_limits<int64_t>::max();
+    };
+    std::vector<Output> outputs_;
     std::vector<Carrier> carriers_;
     py::object fn_, owner_;
     int64_t workspace_bytes_;
@@ -47,6 +59,53 @@ class SdpaBwdBinder : private FixedSdpaOperands {
             step = multiply(step, f.shape[i - 1]);
         }
         return true;
+    }
+
+    bool
+    overlaps(const Output &a, int64_t ap, const Output &b, int64_t bp) const {
+        if (end(ap, operands_[a.index].bytes) <= bp || end(bp, operands_[b.index].bytes) <= ap) return false;
+        const auto period = std::gcd(a.period, b.period);
+        if (period > 0) {
+            auto delta = bp % period - ap % period;
+            if (delta < 0) delta += period;
+            if (delta >= a.block && period - delta >= b.block) return false;
+        }
+        if (a.axes == b.axes) {
+            // Matching run starts may have different block widths. A shift
+            // beyond the earlier block must leave the later block within
+            // the next gap. Include the carry across every outer axis:
+            // head/batch padding can defeat the GCD shortcut.
+            if (ap <= bp) {
+                if (bp - ap >= a.block && bp - ap <= b.minimum_gap) return false;
+            } else if (ap - bp >= b.block && ap - bp <= a.minimum_gap) {
+                return false;
+            }
+        }
+        // Rare shared-storage layouts that the modular check cannot separate:
+        // walk the sorted contiguous runs exactly, without allocating or
+        // inspecting device data. Ordinary separate/interleaved buffers return
+        // above in constant time.
+        std::array<int64_t, 4> ai{}, bi{};
+        auto advance = [](const Output &out, auto &index, int64_t &pointer) {
+            for (size_t d = 0; d < out.axes.size(); ++d) {
+                const auto [count, stride] = out.axes[d];
+                if (++index[d] < count) {
+                    pointer += stride;
+                    return true;
+                }
+                index[d] = 0;
+                pointer -= (count - 1) * stride;
+            }
+            return false;
+        };
+        while (true) {
+            if (ap < bp + b.block && bp < ap + a.block) return true;
+            if (ap + a.block <= bp) {
+                if (!advance(a, ai, ap)) return false;
+            } else if (!advance(b, bi, bp)) {
+                return false;
+            }
+        }
     }
 
    public:
@@ -81,6 +140,33 @@ class SdpaBwdBinder : private FixedSdpaOperands {
             add_operand(roles[i], value, declared[i]);
             if (!value.is_none() && py::cast<int64_t>(value.attr("itemsize")) != operands_.back().bits / 8)
                 invalid("operand dtype and element width disagree");
+            if (name_ == "sdpa_bwd_sm80" && !value.is_none() &&
+                (roles[i] == "dq" || roles[i] == "dk" || roles[i] == "dv")) {
+                auto shape   = py::cast<std::vector<int64_t>>(value.attr("shape"));
+                auto strides = py::cast<std::vector<int64_t>>(value.attr("strides"));
+                if (shape.size() > 4 || shape.size() != strides.size()) invalid("invalid gradient geometry");
+                auto axes = geometry(shape, strides);
+                std::sort(axes.begin(), axes.end(), [](auto a, auto b) { return a.second < b.second; });
+                Output out{i, operands_.back().bits / 8, 0, {}};
+                int64_t extent = out.block;
+                for (auto [count, stride] : axes) {
+                    stride = multiply(stride, operands_.back().bits / 8);
+                    if (count < 1 || stride < extent) invalid("gradient strides must not overlap");
+                    const auto tail = multiply(count - 1, stride);
+                    if (tail > std::numeric_limits<int64_t>::max() - extent) invalid("gradient span exceeds int64");
+                    const auto gap = stride - extent;
+                    extent += tail;
+                    if (out.axes.empty() && stride == out.block) {
+                        out.block = multiply(out.block, count);
+                    } else {
+                        out.axes.emplace_back(count, stride);
+                        out.period      = std::gcd(out.period, stride);
+                        out.minimum_gap = std::min(out.minimum_gap, gap);
+                    }
+                }
+                if (extent > operands_.back().bytes) invalid("gradient span is smaller than its declared geometry");
+                outputs_.push_back(std::move(out));
+            }
             carriers_.push_back(std::move(carrier));
         }
     }
@@ -149,6 +235,14 @@ class SdpaBwdBinder : private FixedSdpaOperands {
             if (workspace_bytes_ > 0 && workspace < operand_end && f.pointer < workspace_end)
                 invalid("caller workspace overlaps " + op.name);
             frame.append(py::int_(f.pointer));
+        }
+        for (size_t i = 0; i < outputs_.size(); ++i) {
+            for (size_t j = i + 1; j < outputs_.size(); ++j) {
+                const auto &a = outputs_[i];
+                const auto &b = outputs_[j];
+                if (overlaps(a, facts[a.index].pointer, b, facts[b.index].pointer))
+                    invalid(operands_[a.index].name + " overlaps " + operands_[b.index].name);
+            }
         }
         const auto scale_value = scale.is_none() ? scale_ : py::cast<double>(scale);
         frame.append(py::int_(workspace));

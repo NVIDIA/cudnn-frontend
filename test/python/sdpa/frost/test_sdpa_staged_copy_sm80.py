@@ -10,11 +10,12 @@ import torch
 from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm80
 from frost_test_utils import _SM, requires_dsl
 from test_sdpa_prepared_sm80 import _check
+from test_sdpa_bwd_staged_sm80 import _assert_kernel_count
 
 pytestmark = [pytest.mark.L0, requires_dsl, pytest.mark.skipif(_SM != 80, reason="requires native SM80")]
 
 
-def _case(d=96, dv=96, dtype=torch.bfloat16, pad=1, features=False, batch=2):
+def _case(d=96, dv=96, dtype=torch.bfloat16, pad=8, features=False, batch=2):
     torch.manual_seed(391)
     tensors = {}
     for name, heads, seq, dim in (("q", 4, 17, d), ("k", 2, 33, d), ("v", 2, 33, dv), ("o", 4, 17, dv)):
@@ -55,14 +56,32 @@ def _execute(api, case, workspace, stream=None):
     )
 
 
-@pytest.mark.parametrize("d,dv,pad", [(96, 96, 0), (192, 96, 1), (128, 128, 1), (63, 47, 1), (193, 193, 1)])
+@pytest.mark.parametrize(
+    "d,dv,pad,native",
+    [
+        (96, 96, 0, True),
+        (48, 32, 8, True),
+        (64, 96, 8, True),
+        (192, 112, 8, True),
+        (224, 208, 8, True),
+        (192, 96, 1, False),
+        (128, 128, 1, False),
+        (63, 47, 1, False),
+        (193, 193, 1, False),
+    ],
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("features", [False, True])
-def test_prepared_copy_avoids_torch_staging_and_replays(d, dv, pad, dtype, features, monkeypatch):
+def test_native_replays_or_declines_copy_dependent_layout(d, dv, pad, native, dtype, features, monkeypatch):
+    if not native:
+        with pytest.raises(NotImplementedError, match="SM80.*(stride|multiple)"):
+            _case(d, dv, dtype, pad, features)
+        return
     api, case = _case(d, dv, dtype, pad, features)
     required = api.scratch_workspace_bytes()
     api.compile()
-    assert api._sm80_copy_spec.core.native is not None
+    assert api._sm80_spec.native is not None
+    assert api._sm80_copy_spec is None and required == 0
     workspace = torch.empty(required, device="cuda", dtype=torch.uint8)
     _execute(api, case, workspace)
     _check(case)
@@ -81,10 +100,12 @@ def test_prepared_copy_avoids_torch_staging_and_replays(d, dv, pad, dtype, featu
 
     run()
     _check(case)
-    graph = torch.cuda.CUDAGraph()
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
     try:
         with torch.cuda.graph(graph):
             run()
+        if native:
+            _assert_kernel_count(graph, 1)
         case.bufs["v"].mul_(0.5)
         case.bufs["o"].fill_(float("nan"))
         graph.replay()
@@ -97,7 +118,7 @@ def test_wrapper_cache_distinguishes_current_input_strides():
     from cudnn.sdpa.fwd.api_dsl import _sm80_wrapper_cache, sdpa_fwd_wrapper_sm80
 
     _sm80_wrapper_cache.clear()
-    for pad in (0, 8, 1, 0):
+    for pad in (0, 8, 16, 0):
         _, case = _case(128, 128, pad=pad)
         out = sdpa_fwd_wrapper_sm80(*(case.bufs[name] for name in ("q", "k", "v")))
         case.bufs.update(o=out["o_tensor"], stats=out["lse_tensor"])
@@ -110,7 +131,7 @@ def test_wrapper_scratch_survives_explicit_stream_consumer(monkeypatch):
     from cudnn.sdpa.fwd import api_dsl
 
     monkeypatch.setattr(api_dsl, "_sm80_wrapper_cache", {})
-    _, case = _case(128, 128, pad=1)
+    _, case = _case(128, 128, pad=8)
     args = tuple(case.bufs[name] for name in ("q", "k", "v"))
     # Warm the real wrapper before replacing only its scratch consumer. Never
     # run attention with intentionally recycled storage in the negative control.
@@ -118,8 +139,11 @@ def test_wrapper_scratch_survives_explicit_stream_consumer(monkeypatch):
     case.bufs.update(o=warm["o_tensor"], stats=warm["lse_tensor"])
     _check(case)
     plan = next(iter(api_dsl._sm80_wrapper_cache.values()))
-    size = plan.scratch_workspace_bytes()
-    assert size > 0
+    assert plan.scratch_workspace_bytes() == 0
+    # The real native warmup needs no copy scratch. Retain the wrapper's
+    # independent lifetime detector by substituting only its scratch consumer.
+    size = 4096
+    monkeypatch.setattr(plan, "scratch_workspace_bytes", lambda: size)
     producer, target = torch.cuda.current_stream(), torch.cuda.Stream()
     done = torch.cuda.Event()
     replacements, pointers, allocation_streams, outputs = [], [], [], [warm]
@@ -164,7 +188,7 @@ def test_wrapper_scratch_survives_explicit_stream_consumer(monkeypatch):
 
 
 @pytest.mark.parametrize("explicit", [False, True])
-@pytest.mark.parametrize("d,dv,pad", [(128, 128, 0), (128, 128, 1), (63, 47, 1)])
+@pytest.mark.parametrize("d,dv,pad", [(128, 128, 0), (128, 128, 8), (96, 80, 16)])
 def test_wrapper_stream_outputs_and_replay(explicit, d, dv, pad):
     from contextlib import nullcontext
     from cuda.bindings import driver
@@ -214,21 +238,21 @@ def test_wrapper_stream_outputs_and_replay(explicit, d, dv, pad):
 def test_prepared_copies_follow_current_or_explicit_stream(explicit, monkeypatch):
     from contextlib import nullcontext
     from cuda.bindings import driver
-    from cudnn.sdpa.fwd import prepared_staged_sm80
+    from cudnn.sdpa.fwd import prepared_sm80
 
     api, case = _case(features=True)
     api.compile()
     workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
     target = torch.cuda.Stream()
     target.wait_stream(torch.cuda.current_stream())
-    seen, original = [], prepared_staged_sm80._copy
+    seen, original = [], prepared_sm80.execute_tensors
 
-    def copy(entry, frame, stream):
+    def copy(entry, frame, stream, **kwargs):
         assert stream == target.cuda_stream
         seen.append(stream)
-        original(entry, frame, stream)
+        original(entry, frame, stream, **kwargs)
 
-    monkeypatch.setattr(prepared_staged_sm80, "_copy", copy)
+    monkeypatch.setattr(prepared_sm80, "execute_tensors", copy)
     mode = torch.cuda.get_sync_debug_mode()
     try:
         torch.cuda.set_sync_debug_mode("error")
@@ -237,35 +261,16 @@ def test_prepared_copies_follow_current_or_explicit_stream(explicit, monkeypatch
     finally:
         torch.cuda.set_sync_debug_mode(mode)
     torch.cuda.current_stream().wait_stream(target)
-    assert len(seen) == 2
+    assert len(seen) == 1
     _check(case)
 
 
-@pytest.mark.parametrize("bad", ["missing", "short", "unaligned", "noncontiguous", "alias_q", "alias_stats"])
-def test_workspace_rejected_before_copy(bad, monkeypatch):
+def test_unsupported_layout_declines_before_workspace_or_copy(monkeypatch):
     from cudnn.sdpa.fwd import prepared_staged_sm80
 
-    api, case = _case()
-    api.compile()
-    size = api.scratch_workspace_bytes()
-    workspace = torch.empty(size + 32, device="cuda", dtype=torch.uint8)
-    if bad == "missing":
-        workspace = None
-    elif bad == "short":
-        workspace = workspace[: size - 1]
-    elif bad == "unaligned":
-        workspace = workspace[1:]
-    elif bad == "noncontiguous":
-        workspace = torch.empty(size * 2, device="cuda", dtype=torch.uint8)[::2]
-    else:
-        role = "q" if bad == "alias_q" else "stats"
-        t = case.bufs[role]
-        span = 1 + sum((n - 1) * st for n, st in zip(t.shape, t.stride()))
-        workspace = torch.empty(max(size, span * t.element_size()), device="cuda", dtype=torch.uint8)
-        case.bufs[role] = workspace.view(t.dtype).as_strided(t.shape, t.stride())
-    monkeypatch.setattr(prepared_staged_sm80, "_copy", lambda *a, **k: pytest.fail("invalid workspace reached copy"))
-    with pytest.raises(ValueError):
-        _execute(api, case, workspace)
+    monkeypatch.setattr(prepared_staged_sm80, "compile_plan", lambda *a, **k: pytest.fail("unsupported layout reached staging compilation"))
+    with pytest.raises(NotImplementedError, match="q.*stride"):
+        _case(pad=1)
 
 
 @pytest.mark.parametrize("role", ["q", "v", "o"])
@@ -283,7 +288,7 @@ def test_prepared_copy_physical_wide_addresses(role, product):
         pytest.skip("wide physical stride allocation unavailable")
     wide.copy_(old)
     case.bufs[role] = wide
-    # Conversion operands bind current source/output strides, not sample pointers.
+    api = SdpaFwdDslSm80(**{"sample_" + n: case.bufs[n] for n in ("q", "k", "v", "o")}, sample_lse=case.bufs["stats"])
     api.compile()
     workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
     _execute(api, case, workspace)
@@ -300,7 +305,7 @@ def test_prepared_copy_physical_wide_addresses(role, product):
         graph.reset()
 
 
-@pytest.mark.parametrize("d,dv", [(63, 47), (193, 193)])
+@pytest.mark.parametrize("d,dv", [(48, 32), (224, 208)])
 def test_prepared_copy_artifacts_reload_without_jit(d, dv, tmp_path):
     import json
     import os
@@ -325,10 +330,10 @@ if reload == "1":
     cute.compile = forbidden
 api, case = _case(int(d), int(dv), features=True)
 api.compile()
-spec = api._sm80_copy_spec
+spec = api._sm80_spec
+assert spec is not None and api._sm80_copy_spec is None
 if reload == "1":
-    assert hasattr(spec.core.artifact, "_compiled_cache_raw")
-    assert all(c is None or hasattr(c[0], "_compiled_cache_raw") for c in spec.copies)
+    assert hasattr(spec.artifact, "_compiled_cache_raw")
 workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
 _execute(api, case, workspace)
 _check(case)

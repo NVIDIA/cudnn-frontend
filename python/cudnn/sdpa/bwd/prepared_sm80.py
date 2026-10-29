@@ -13,30 +13,43 @@ from .prepared import ATTRIBUTES, BwdLaunchSpec, Operand, ROLES, execute
 RO_ROLES = ("ragged_q", "ragged_k", "ragged_v", "ragged_o", "ragged_do", "ragged_dq", "ragged_dk", "ragged_dv", "ragged_stats")
 
 
+def stats_storage_facts(tensor, fact, operand):
+    """Keep the standalone declared-stride binding without rebuilding a view."""
+    if fact.span < operand.span:
+        available = tensor.untyped_storage().nbytes() // tensor.element_size() - tensor.storage_offset()
+        if available < operand.span:
+            raise ValueError("sdpa_bwd_sm80: stats backing storage is too small for the declared strides")
+        fact = fact._replace(span=operand.span)
+    return fact
+
+
 def native_layouts(api):
     """Select native vector-aligned operands with complete declarations."""
-    from cudnn.sdpa.graph_analyzer import dense_layout_ok
+    return native_decline_reason(api) is None
 
-    if api._has_rope or (api.head_dim_qk, api.head_dim_v) != (api.flavor_d_qk, api.flavor_d_v):
-        return False
+
+def native_decline_reason(api):
+    from cudnn.sdpa.native_sm80 import data_layout_mismatch
+
+    if api._has_rope:
+        return "SM80 RoPE backward requires staging and is not supported by the native adapter"
     for role in ROLES[:5] + ROLES[6:9]:
         desc = getattr(api, role + "_desc")
-        if not dense_layout_ok(desc.shape, desc.stride) or any(n > 1 and st % 8 for n, st in zip(desc.shape[:-1], desc.stride[:-1])):
-            return False
-    # Older direct adapters declared only has_bias or omitted auxiliary gradient
-    # descriptors. Their optional runtime-output contract uses the staged
-    # prepared recipe, which validates and binds auxiliary outputs per call.
+        reason = data_layout_mismatch(role, desc.shape, desc.stride, thd=api.thd)
+        if reason is not None:
+            return reason
     if api._has_bias:
         if api.bias_desc is None or api.dbias_desc is None:
-            return False
+            return "SM80 bias and dbias must both be declared for native backward"
     elif api.bias_desc is not None or api.dbias_desc is not None:
-        return False
+        return "SM80 bias and dbias declarations require has_bias=True"
     if (api.sink_desc is not None) != (api.dsink_desc is not None):
-        return False
-    for desc in (api.sink_desc, api.dsink_desc, api.bias_desc, api.dbias_desc):
+        return "SM80 sink and dsink must both be declared for native backward"
+    for role in ("sink", "dsink", "bias", "dbias"):
+        desc = getattr(api, role + "_desc")
         if desc is not None and not desc.is_contiguous():
-            return False
-    return True
+            return f"SM80 {role}: native backward requires contiguous storage; got stride {tuple(desc.stride)}"
+    return None
 
 
 def build_spec(api, d64_module, *, staged=False):
@@ -183,6 +196,12 @@ def execute_tensors(api, tensors, workspace, stream, scale, ro_tensors=()):
         stream = torch.cuda.current_stream(tensors[0].device).cuda_stream
     facts = dict(zip(ROLES, map(facts_of_tensor, tensors)))
     facts.update(zip(RO_ROLES, map(facts_of_tensor, ro_tensors or (None,) * len(RO_ROLES))))
+    # Moving padded declarations off staging must preserve the standalone
+    # auxiliary-output shape checks, before any accumulator is initialized.
+    for role in ("dbias", "dsink"):
+        desc, fact = getattr(api, role + "_desc"), facts[role]
+        if desc is not None and fact is not None and fact.shape != tuple(desc.shape):
+            raise ValueError(f"sdpa_bwd_sm80: {role} must match the declared logical shape {tuple(desc.shape)}")
     if api.thd:
         for role in ("seq_q", "seq_kv"):
             f = facts[role]
@@ -196,6 +215,8 @@ def execute_tensors(api, tensors, workspace, stream, scale, ro_tensors=()):
                 raise ValueError("THD stats must match the declared packed layout")
         elif stats.numel != api.batch_size * api.h_q * api.s_q_max or (api._lse_stride is None and not stats.contiguous):
             raise ValueError("stats must match the declared element count and storage layout")
+        if not api.thd:
+            facts["stats"] = stats_storage_facts(tensors[5], stats, spec.operands[5])
     # Stats has always been a storage binding: compact plans accept flat buffers,
     # and strided plans reinterpret the declared strides after checking capacity.
     geometry = tuple((op.shape, op.strides) if op is not None and i < 9 and i != 5 else None for i, op in enumerate(spec.operands))

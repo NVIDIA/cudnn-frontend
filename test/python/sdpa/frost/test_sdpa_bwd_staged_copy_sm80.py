@@ -86,26 +86,9 @@ def test_auxiliary_casts_strided_outputs_and_replay(dtype, declare_aux):
     sink_owner = torch.full((8,), 17.0, device="cuda")
     case.bufs["dbias"] = bias_owner[..., 0]
     case.bufs["dsink"] = sink_owner[::2].view(1, 4, 1, 1)
-    api, workspace = _adapter(case, declare_aux=declare_aux)
-    _execute(api, case.bufs, workspace)
-    _check(case)
-    graph = torch.cuda.CUDAGraph()
-    try:
-        with torch.cuda.graph(graph):
-            _execute(api, case.bufs, workspace)
-        for role in case.expected:
-            case.bufs[role].fill_(float("nan"))
-        workspace.fill_(0xBD)
-        graph.replay()
-        _check(case)
-        assert (bias_owner[..., 1] == 11).all()
-        assert (sink_owner[1::2] == 17).all()
-    finally:
-        graph.reset()
-    if not declare_aux:
-        case.bufs["dbias"] = torch.empty_like(case.bufs["dbias"], dtype=torch.float32)
-        _execute(api, case.bufs, workspace)
-        _check(case)
+    with pytest.raises(NotImplementedError, match="dbias|dsink"):
+        _adapter(case, declare_aux=declare_aux)
+    assert (bias_owner == 11).all() and (sink_owner == 17).all()
 
 
 @pytest.mark.parametrize("role", ["bias", "sink", "dbias", "dsink"])
@@ -214,19 +197,51 @@ def test_staged_copies_follow_handle_stream():
         cudnn.destroy_handle(handle)
 
 
-def test_staged_stats_preserves_declared_storage_view():
+def _use_unaligned_q(case):
+    q = case.bufs["q"]
+    case.bufs["q"] = torch.empty((*q.shape[:-1], q.shape[-1] + 1), dtype=q.dtype, device=q.device)[..., :-1].copy_(q)
+
+
+@pytest.mark.parametrize("valid_capacity", [True, False])
+@pytest.mark.parametrize("native", [True, False])
+def test_staged_stats_preserves_declared_storage_view(valid_capacity, native, monkeypatch):
     case = _case(96, 80)
+    if not native:
+        _use_unaligned_q(case)
+        with pytest.raises(NotImplementedError, match="q.*stride"):
+            _adapter(case)
+        return
     api, workspace = _adapter(case)
+    assert (api._prepared is not None) == native
     bufs = dict(case.bufs)
     # The old standalone contract interprets Stats through the declared strides,
     # even if the runtime container is a flat view into a larger allocation.
     bufs["stats"] = bufs["stats"].as_strided((bufs["stats"].numel(),), (1,))
+    if not valid_capacity:
+        from cudnn.sdpa.bwd import prepared_sm80, staged_sm80
+
+        bufs["stats"] = torch.empty_like(bufs["stats"])
+        monkeypatch.setattr(prepared_sm80, "execute", lambda *a, **k: pytest.fail("short Stats storage reached launch"))
+        monkeypatch.setattr(staged_sm80, "_copy", lambda *a, **k: pytest.fail("short Stats storage reached gather"))
+        with pytest.raises(ValueError, match="stats backing storage"):
+            _execute(api, bufs, workspace)
+        return
     _execute(api, bufs, workspace)
     _check(case)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            _execute(api, bufs, workspace)
+        for name in case.expected:
+            bufs[name].fill_(float("nan"))
+        graph.replay()
+        _check(case)
+    finally:
+        graph.reset()
 
 
-@pytest.mark.parametrize("overlap", [False, True])
-def test_ordered_gradient_copy_back(overlap, monkeypatch):
+@pytest.mark.parametrize("native,overlap", [(True, False), (False, False), (False, True)])
+def test_native_interleaved_gradients_or_unaligned_decline(native, overlap, monkeypatch):
     from cudnn.sdpa.bwd import staged_sm80
 
     case = _case(96, 96, hk=4)
@@ -238,7 +253,15 @@ def test_ordered_gradient_copy_back(overlap, monkeypatch):
         owner = torch.empty((b, seq, h, 3, d), device="cuda", dtype=case.dtype)
         for i, role in enumerate(("dq", "dk", "dv")):
             case.bufs[role] = owner[..., i, :].transpose(1, 2)
+    if not native:
+        # Both overlapping and disjoint outputs decline when the input
+        # requires a staging copy; accepted interleaved outputs stay native.
+        _use_unaligned_q(case)
+        with pytest.raises(NotImplementedError, match="q.*stride"):
+            _adapter(case)
+        return
     api, workspace = _adapter(case)
+    assert (api._prepared is not None) == native
     calls = []
     original = staged_sm80._copy
 
@@ -248,11 +271,8 @@ def test_ordered_gradient_copy_back(overlap, monkeypatch):
 
     monkeypatch.setattr(staged_sm80, "_copy", record)
     _execute(api, case.bufs, workspace)
-    assert calls[-3:] == [1, 1, 1], "potentially overlapping gradient scatters must preserve copy-back ordering"
-    if overlap:
-        torch.testing.assert_close(case.bufs["dv"].float(), case.expected["dv"].float(), atol=0.03, rtol=0.03)
-    else:
-        _check(case)
+    assert not calls, "native interleaved gradients must not add layout copies"
+    _check(case)
 
 
 @pytest.mark.parametrize("explicit_stream", [False, True])
@@ -269,3 +289,31 @@ def test_staged_execution_preserves_other_current_device(explicit_stream):
             assert torch.cuda.current_device() == 1, "staged execution leaked Q's device into the caller"
         launch.synchronize()
         _check(case)
+
+
+@pytest.mark.parametrize("graph_api", [False, True])
+@pytest.mark.parametrize("pair", [("dq", "dk"), ("dq", "dv"), ("dk", "dv")])
+def test_native_overlapping_gradients_rejected_before_writes(graph_api, pair):
+    case = _case(96, 96, hk=4)
+    api, workspace = _adapter(case)
+    assert api._prepared is not None
+    first, second = pair
+    bad = dict(case.bufs)
+    bad[second] = bad[first]
+    ws = case.workspace if graph_api else workspace
+    ws.fill_(0xBD)
+    for role in ("dq", "dk", "dv"):
+        case.bufs[role].fill_(17)
+    with pytest.raises(ValueError, match=first + " overlaps " + second):
+        if graph_api:
+            case.graph.execute({case.refs[role]: tensor for role, tensor in bad.items()}, ws)
+        else:
+            _execute(api, bad, ws)
+    assert (ws == 0xBD).all(), "overlap rejection must precede accumulator initialization"
+    for role in ("dq", "dk", "dv"):
+        assert (case.bufs[role] == 17).all(), "overlap rejection must precede output writes"
+    if graph_api:
+        case.graph.execute(case.pack, ws)
+    else:
+        _execute(api, case.bufs, ws)
+    _check(case)

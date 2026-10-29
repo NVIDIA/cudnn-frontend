@@ -924,7 +924,7 @@ def _sdpa_kernel(
             cache=nvvm.LoadCacheModifier.CG,
             swizzle=True,
             valid_rows=kv_valid_rows,
-            valid_cols=None,  # V is always the full compile-time d_v wide (asserted)
+            valid_cols=V.shape[3] if cutlass.const_expr(V.shape[3] != d_v) else None,
             row_base=kv_row_base_cur,
         )
         cp_async_commit()  # group: V[i]
@@ -1536,18 +1536,20 @@ def _sdpa_kernel(
         gmem_addr = o_gmem + row.to(cutlass.Int64) * row_stride64 + (col_chunk * elems_per_chunk_i32).to(cutlass.Int64)
         # SMEM load is unconditional — sO_buf is sized for the full tile_m ×
         # D_V and any OOB lanes wrote dummy data there.  GMEM STG.128 must
-        # skip OOB rows so we don't touch GMEM past the user tensor.  Columns
-        # are never trimmed: O is always the compile-time d_v wide (the
-        # adapter pads V up to it, and padded-V columns compute to exact
-        # zero), while d_runtime is the Q/K head dim — trimming on it dropped
-        # the real O columns [D, d_v) whenever a graph declared d_qk < d_v.
+        # skip OOB rows and columns beyond the declared O width. Q/K's
+        # d_runtime is independent: using it here would drop valid V columns
+        # whenever a graph declares D_qk < D_v.
         vec = Pointer(smem_addr.data_ptr(), dtype=cutlass.Int32).load(alignment=16, count=4)
-        if cutlass.const_expr(is_even_mn):
-            Pointer(gmem_addr, dtype=cutlass.Int32).store(vec, alignment=16)
-        else:
-            row_abs_i32 = q_row_base_i32 + row
-            if row_abs_i32 < sq_store_bound:
+        column_live = True
+        if cutlass.const_expr(O.shape[3] != d_v):
+            column_live = col_chunk * elems_per_chunk_i32 < cutlass.Int32(O.shape[3])
+        if column_live:
+            if cutlass.const_expr(is_even_mn):
                 Pointer(gmem_addr, dtype=cutlass.Int32).store(vec, alignment=16)
+            else:
+                row_abs_i32 = q_row_base_i32 + row
+                if row_abs_i32 < sq_store_bound:
+                    Pointer(gmem_addr, dtype=cutlass.Int32).store(vec, alignment=16)
 
 
 _sdpa_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)

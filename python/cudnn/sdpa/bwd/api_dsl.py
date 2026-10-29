@@ -1229,7 +1229,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         self._value_error_if(h_qo % h_kv != 0, f"H_q ({h_qo}) must be divisible by H_kv ({h_kv}) for GQA / MQA")
 
         # The kernel supports d_qk != d_v (split sub-groups) but requires
-        # d_qk >= d_v; head dims inside a flavor envelope pad host-side.
+        # d_qk >= d_v; native masked loads cover the aligned flavor envelope.
         self._value_error_if(d_qk < d_v, f"SM80 BPROP requires D_QK >= D_V; got D_QK={d_qk}, D_V={d_v}")
         max_dqk = max(fdqk for fdqk, _ in _SM80_BWD_FLAVOR_DIMS.values())
         max_dv = max(fdv for _, fdv in _SM80_BWD_FLAVOR_DIMS.values())
@@ -1412,13 +1412,11 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         )
         if self._lse_stride is not None or self.thd:
             self._use_d64 = False  # preserve the dense, packed-Stats selection boundary
-        from .prepared_sm80 import native_layouts
+        from .prepared_sm80 import native_decline_reason
 
-        self._native_pointer = native_layouts(self)
-        if not self._native_pointer:
-            from .staged_sm80 import layout_for
-
-            self._staged_layout = layout_for(self)
+        reason = native_decline_reason(self)
+        self._not_implemented_error_if(reason is not None, reason)
+        self._native_pointer = True
 
         self._is_supported = True
         self._logger.debug("check_support completed")
@@ -1430,8 +1428,8 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         the specialized module via ``frost.template_loader`` (same seam as the
         SM120 adapter), and compile the full kernel chain for this shape.
         Native plans compile the entire pointer chain here, including packed
-        metadata setup or the dense d=64 kernel and its unpermute epilogue. Retained
-        staging layouts compile a pointer chain after their existing copies."""
+        metadata setup or the dense d=64 kernel and its unpermute epilogue.
+        check_support rejects declarations that would require staging."""
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         from cudnn.sdpa.bwd.config_sm80 import bwd_params_for_flavor

@@ -63,38 +63,21 @@ def test_rope_table_rejects_invalid_shape_before_allocation(shape, detail, monke
         prepare(plan, values, values.device, torch.cuda.current_stream().cuda_stream)
 
 
-@pytest.mark.parametrize("backward", [False, True])
-@pytest.mark.parametrize("explicit", [False, True])
-def test_rope_table_restores_caller_device(backward, explicit, monkeypatch):
-    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm80
-    from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm80
-    from test_sdpa_bwd_staged_sm80 import test_rope_staged_replay
-    from test_sdpa_rope_staged_copy_sm80 import _forward_case, _forward_run, _forward_check
+def test_rope_table_restores_caller_device():
+    from cudnn.sdpa.rope_table_sm80 import compile_plan, prepare
 
     if torch.cuda.device_count() < 2:
         pytest.skip("requires two GPUs")
     operand_device = torch.cuda.current_device()
     caller_device = (operand_device + 1) % torch.cuda.device_count()
-    adapter = SdpaBwdDslSm80 if backward else SdpaFwdDslSm80
-    original = adapter.execute
+    device = torch.device("cuda", operand_device)
+    values = torch.randn(17, 64, device=device)
+    plan = compile_plan(17, 64, device)
     target = torch.cuda.current_stream(operand_device)
-
-    def execute(self, *args, **kwargs):
-        if torch.cuda.is_current_stream_capturing():
-            return original(self, *args, **kwargs)
-        kwargs["current_stream"] = target.cuda_stream if explicit else None
-        with torch.cuda.device(caller_device):
-            result = original(self, *args, **kwargs)
-            assert torch.cuda.current_device() == caller_device
-        return result
-
-    monkeypatch.setattr(adapter, "execute", execute)
-    if backward:
-        test_rope_staged_replay(torch.bfloat16, 128)
-    else:
-        api, values, workspace, owners = _forward_case()
-        _forward_run(api, values, workspace)
-        _forward_check(values)
+    with torch.cuda.device(caller_device):
+        result = prepare(plan, values, device, target.cuda_stream)
+        assert torch.cuda.current_device() == caller_device
+    torch.testing.assert_close(result, _reference(values, 64, device), atol=0, rtol=0)
 
 
 def test_rope_table_artifact_reloads_in_fresh_process(tmp_path):
@@ -141,14 +124,14 @@ print(json.dumps(compiled_cache.stats()))
 
 @pytest.mark.parametrize("backward", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_rope_execution_uses_prepared_table(backward, dtype, monkeypatch):
+def test_rope_declines_before_prepared_execution(backward, dtype, monkeypatch):
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm80
     from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm80
-    from test_sdpa_bwd_staged_sm80 import test_rope_staged_replay
-    from test_sdpa_sm80_thd_forward_prepared import test_dense_staged_pointer_launch_and_rope_replay
+    from test_sdpa_bwd_staged_sm80 import test_rope_declines_before_compile
+    from test_sdpa_sm80_thd_forward_prepared import test_dense_native_replay_or_rope_decline
 
-    # Intercept only the actual execution; the independent references retain
-    # their own Torch sin/cos. This was RED on both original adapters.
+    # Keep the execution tripwires while the public adapters reject RoPE
+    # during preparation. Low-level table execution is tested separately.
     for adapter in (SdpaFwdDslSm80, SdpaBwdDslSm80):
         original = adapter.execute
 
@@ -161,9 +144,9 @@ def test_rope_execution_uses_prepared_table(backward, dtype, monkeypatch):
 
         monkeypatch.setattr(adapter, "execute", execute)
     if backward:
-        test_rope_staged_replay(dtype, 128)
+        test_rope_declines_before_compile(dtype, 128)
     else:
-        test_dense_staged_pointer_launch_and_rope_replay(128, 128, True, dtype, monkeypatch)
+        test_dense_native_replay_or_rope_decline(128, 128, True, dtype, monkeypatch)
 
 
 @pytest.mark.parametrize("overflow", ["stride", "product"])

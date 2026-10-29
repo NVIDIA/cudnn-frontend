@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The retained SM80 staging paths execute prepared pointer chains."""
+"""SM80 padding uses native pointer chains; remaining staging stays covered."""
 
 import pytest
 import torch
@@ -14,6 +14,23 @@ pytestmark = [
     pytest.mark.L0,
     pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0), reason="requires SM80"),
 ]
+
+
+def _assert_kernel_count(capture, expected):
+    """Count actual launches: padded operands must not add gather/scatter nodes."""
+    from cuda.bindings import runtime as cudart
+
+    graph = cudart.cudaGraph_t(capture.raw_cuda_graph())
+    error, _, count = cudart.cudaGraphGetNodes(graph, 0)
+    assert error == cudart.cudaError_t.cudaSuccess, error
+    error, nodes, _ = cudart.cudaGraphGetNodes(graph, count)
+    assert error == cudart.cudaError_t.cudaSuccess, error
+    kernels = 0
+    for node in nodes:
+        error, kind = cudart.cudaGraphNodeGetType(node)
+        assert error == cudart.cudaError_t.cudaSuccess, error
+        kernels += kind == cudart.cudaGraphNodeType.cudaGraphNodeTypeKernel
+    assert kernels == expected, f"expected {expected} algorithm kernels, captured {kernels}; hidden layout adaptation"
 
 
 @pytest.fixture(autouse=True)
@@ -52,10 +69,13 @@ def test_dense_staged_rebind_and_replay(dtype, d, dv, hk, features, deterministi
     workspace = torch.empty_like(case.workspace)
     case.graph.execute(pack, workspace)
     _check(case, bufs, expected)
-    capture = torch.cuda.CUDAGraph()
+    capture = torch.cuda.CUDAGraph(keep_graph=True)
     try:
         with torch.cuda.graph(capture):
             case.graph.execute(pack, workspace)
+        # Accumulator init, delta, main, dQ cast; GQA adds two final reductions.
+        # Features add dSink and the combined auxiliary-output conversion.
+        _assert_kernel_count(capture, 4 + 2 * (hk != 4) + 2 * features)
         for name in expected:
             bufs[name].fill_(float("nan"))
         workspace.fill_(0xBD)
@@ -83,10 +103,12 @@ def test_packed_staged_preserves_output_tail(dtype, d, dv, hkv, stats_layout):
         use_causal_mask=True,
         use_deterministic_algorithm=True,
     )
-    capture = torch.cuda.CUDAGraph()
+    capture = torch.cuda.CUDAGraph(keep_graph=True)
     try:
         with torch.cuda.graph(capture):
             graph.execute(pack, workspace)
+        # Packed metadata is one additional launch; tails remain untouched.
+        _assert_kernel_count(capture, 5 + 2 * (hkv != 4))
         changed = _thd_case((48, 32, 64), (64, 48, 80), 4, d, dtype, hkv=hkv, d_v=dv, cap_q=case.cap_q, cap_kv=case.cap_kv, poison=True, seed=23, causal=True)
         for port, tensor in pack.items():
             name = port.get_name()
@@ -122,89 +144,35 @@ def test_packed_staged_preserves_output_tail(dtype, d, dv, hkv, stats_layout):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("d", [64, 128])
-def test_rope_staged_replay(dtype, d):
+def test_rope_declines_before_compile(dtype, d):
     from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm80
 
-    torch.manual_seed(417)
-    q = torch.randn(2, 4, 128, d, device="cuda", dtype=dtype) * 0.2
-    k, v = (torch.randn(2, 2, 128, d, device="cuda", dtype=dtype) * 0.2 for _ in range(2))
-    do = torch.randn_like(q) * 0.2
-    freqs = torch.arange(128, device="cuda")[:, None] * torch.linspace(0.001, 0.02, d // 2, device="cuda")[None, :]
-
-    def reference():
-        qr, kr, vr = (x.detach().double().requires_grad_() for x in (q, k, v))
-
-        def rotate(x):
-            a, b = x.chunk(2, -1)
-            c, s = freqs.double().cos()[None, None], freqs.double().sin()[None, None]
-            return torch.cat((a * c - b * s, b * c + a * s), -1).to(dtype).double()
-
-        logits = rotate(qr) @ rotate(kr).repeat_interleave(2, 1).transpose(-1, -2) * d**-0.5
-        logits.masked_fill_(torch.arange(128, device="cuda")[None, :] > torch.arange(128, device="cuda")[:, None], -torch.inf)
-        out = logits.softmax(-1) @ vr.repeat_interleave(2, 1)
-        out.backward(do.double())
-        return out.detach().to(dtype), logits.detach().logsumexp(-1).float(), (qr.grad, kr.grad, vr.grad)
-
-    o, stats, expected = reference()
-    outputs = tuple(torch.empty_like(x) for x in (q, k, v))
-    api = SdpaBwdDslSm80(q, k, v, o, do, stats, *outputs, has_rope=True, rope_max_s=128, is_causal=True)
-    api.compile()
-    assert api._staged_prepared is not None
-    workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
-
-    def run():
-        api.execute(q, k, v, o, do, stats, *outputs, workspace=workspace, rope_freqs=freqs)
-
-    def check():
-        for got, want in zip(outputs, expected):
-            torch.testing.assert_close(got.double(), want, atol=0.006, rtol=0.04)
-
-    run()
-    check()
-    capture = torch.cuda.CUDAGraph()
-    try:
-        with torch.cuda.graph(capture):
-            run()
-        freqs.mul_(0.5)
-        q.mul_(0.75)
-        new_o, new_stats, expected = reference()
-        o.copy_(new_o)
-        stats.copy_(new_stats)
-        for output in outputs:
-            output.fill_(float("nan"))
-        workspace.fill_(0xBD)
-        capture.replay()
-        check()
-    finally:
-        capture.reset()
+    q = torch.empty(2, 4, 128, d, device="cuda", dtype=dtype)
+    stats = torch.empty(2, 4, 128, device="cuda", dtype=torch.float32)
+    api = SdpaBwdDslSm80(q, q, q, q, q, stats, q, q, q, has_rope=True, rope_max_s=128)
+    with pytest.raises(NotImplementedError, match="RoPE"):
+        api.compile()
+    assert api._prepared is None and api._staged_prepared is None
 
 
-def test_rope_eager_accepts_cpu_angles(monkeypatch):
-    from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm80
+def test_rope_eager_declines_cpu_angles():
+    from cudnn.sdpa.bwd.api_dsl import sdpa_bwd_wrapper_sm80
 
-    original = SdpaBwdDslSm80.execute
-    observed = []
-
-    def execute(self, *args, **kwargs):
-        if not torch.cuda.is_current_stream_capturing():
-            kwargs["rope_freqs"] = kwargs["rope_freqs"].cpu()
-            observed.append(True)
-        return original(self, *args, **kwargs)
-
-    monkeypatch.setattr(SdpaBwdDslSm80, "execute", execute)
-    test_rope_staged_replay(torch.float16, 128)
-    assert observed
+    q = torch.empty(1, 2, 128, 128, device="cuda", dtype=torch.float16)
+    stats = torch.empty(1, 2, 128, device="cuda", dtype=torch.float32)
+    with pytest.raises(NotImplementedError, match="RoPE"):
+        sdpa_bwd_wrapper_sm80(q, q, q, q, q, stats, rope_freqs=torch.zeros(128, 64))
 
 
-def test_staged_singleton_strides_keep_existing_copy_set():
+def test_native_singleton_ignores_unused_strides():
     from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm80
 
     q = torch.empty(1, 1, 128, 128, device="cuda", dtype=torch.float16).as_strided((1, 1, 128, 128), (7, 3, 128, 1))
     stats = torch.empty(1, 1, 128, device="cuda", dtype=torch.float32)
-    api = SdpaBwdDslSm80(q, q, q, q, q, stats, q, q, q, has_rope=True, rope_max_s=128)
+    api = SdpaBwdDslSm80(q, q, q, q, q, stats, q, q, q)
     api.check_support()
     assert q.transpose(1, 2).is_contiguous()
-    assert [role for role, _, _ in api._staged_layout.copies] == ["dq"]
+    assert api._native_pointer and api._staged_layout is None
 
 
 def test_sm80_direct_adapter_declines_old_dsl(monkeypatch):
@@ -248,10 +216,11 @@ def test_staged_workspace_slice_with_odd_extra_byte(features):
 
 @pytest.mark.parametrize("role", ["dbias", "dsink"])
 @pytest.mark.parametrize("problem", ["size", "shape", "unexpected", "missing", "dtype"])
-def test_staged_auxiliary_outputs_validate_before_writes(role, problem, monkeypatch):
+@pytest.mark.parametrize("d", [96], ids=["native_padded"])
+def test_staged_auxiliary_outputs_validate_before_writes(role, problem, d, monkeypatch):
     from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm80
 
-    q = torch.zeros(2, 4, 128, 96, device="cuda", dtype=torch.float16)
+    q = torch.zeros(2, 4, 128, d, device="cuda", dtype=torch.float16)
     v = torch.zeros(2, 4, 128, 80, device="cuda", dtype=torch.float16)
     stats = torch.zeros(2, 4, 128, device="cuda", dtype=torch.float32)
     outputs = (torch.empty_like(q), torch.empty_like(q), torch.empty_like(v))
@@ -274,7 +243,8 @@ def test_staged_auxiliary_outputs_validate_before_writes(role, problem, monkeypa
         **{"sample_" + role: aux if enabled else None},
     )
     api.compile()
-    assert api._staged_prepared is not None
+    spec_name = "_prepared" if d == 96 else "_staged_prepared"
+    assert getattr(api, spec_name) is not None
     workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
     if problem == "size":
         aux = torch.empty(aux.numel() + 1, device="cuda", dtype=aux.dtype)
@@ -296,6 +266,6 @@ def test_staged_auxiliary_outputs_validate_before_writes(role, problem, monkeypa
         guards.setattr(staged_sm80, "_copy", forbidden)
         from dataclasses import replace
 
-        guards.setattr(api, "_staged_prepared", replace(api._staged_prepared, fn=forbidden))
+        guards.setattr(api, spec_name, replace(getattr(api, spec_name), fn=forbidden))
         with pytest.raises(ValueError, match=role):
             api.execute(q, q, v, v, v, stats, *outputs, workspace=workspace, bias_tensor=bias, sink_tensor=sink, **{role + "_tensor": aux})

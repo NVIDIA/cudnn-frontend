@@ -952,10 +952,9 @@ def _sm80_spec() -> EngineSpec:
     """SM80 (A100) backward row: lowers through the shared ``lower_dsl_bwd``
     onto ``SdpaBwdDslSm80`` (``bwd/api_dsl.py``), which owns kernel-flavor selection
     (head-dim envelopes up to (256, 256), incl. rectangular 192/128),
-    host-side head-dim zero-padding, BHSD<->BSHD normalization, per-shape
-    kernel caching, and the dedicated plain-dense d=64 fast path.  The
-    CuTe-DSL JIT happens at compile(), except for that d=64 fast path, whose
-    module still self-caches on the first execute.  Knob domains are empty
+    native eight-aligned head-dim envelopes, declared data strides, per-shape
+    kernel caching, and the dedicated plain-dense d=64 fast path. The whole
+    chain is compiled at plan time. Knob domains are empty
     (no tunables wired).  sm80 exactly: the kernels assume the A100's 164 KiB
     opt-in SMEM, which the sm86/sm89 parts do not have.
 
@@ -972,6 +971,8 @@ def _sm80_spec() -> EngineSpec:
     sequences (TE's ``cu_seqlens_padded``) is served; whole-token offsets are
     a supported-input precondition.
     """
+    from cudnn.sdpa.native_sm80 import graph_mismatch
+
     return EngineSpec(
         name="sdpa_bwd_sm80",
         capabilities=Capabilities(
@@ -979,7 +980,9 @@ def _sm80_spec() -> EngineSpec:
             sm_lo=80,
             sm_hi=80,
             d=frozenset({256}),
-            d_envelope=True,  # flavor envelopes; host-side zero-padding
+            d_envelope=True,  # flavor envelopes; masked native loads
+            d_pad_multiple=8,
+            declaration_check=graph_mismatch,
             dqk_ge_dv=True,  # bprop kernel constraint relaxed to D_QK >= D_V
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             gqa=True,

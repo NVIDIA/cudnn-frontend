@@ -12,7 +12,7 @@ import torch
 from cudnn.sdpa.fwd.api_dsl import _torch_stream_context, ws_align
 from cudnn.sdpa.fwd.prepared import BufferFacts, facts_of_tensor
 from .prepared import ROLES, bind
-from .prepared_sm80 import RO_ROLES, build_spec
+from .prepared_sm80 import RO_ROLES, build_spec, stats_storage_facts
 from .kernels.sm80.prepared_host import workspace_regions
 
 
@@ -137,12 +137,8 @@ def run_staged(api, tensors, workspace, stream, scale, rope_freqs, ro_tensors=()
         # rebuilding its declared as_strided view. A flat runtime container can
         # expose fewer logical elements than its backing allocation covers.
         f, op = original_facts["stats"], spec.operands[5]
-        if f.span < op.span:
-            available = (stats.untyped_storage().nbytes() - stats.storage_offset() * 4) // 4
-            if available < op.span:
-                raise ValueError("sdpa_bwd_sm80: stats backing storage is too small for the declared strides")
-            f = f._replace(span=op.span)
-            original_facts["stats"] = f
+        f = stats_storage_facts(stats, f, op)
+        original_facts["stats"] = f
         if ws.ptr < f.ptr + op.span * 4 and f.ptr < ws.ptr + layout.workspace_bytes:
             raise ValueError("sdpa_bwd_sm80: caller workspace overlaps stats")
     for role in ("seq_q", "seq_kv"):

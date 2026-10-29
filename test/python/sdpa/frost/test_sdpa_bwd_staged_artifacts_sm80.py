@@ -21,7 +21,7 @@ pytestmark = [
 ]
 
 
-@pytest.mark.parametrize("route", ["dense", "packed", "aux", "rope"])
+@pytest.mark.parametrize("route", ["dense", "packed", "aux"])
 def test_staged_backward_artifact_fresh_process(route, tmp_path):
     child = r"""
 import json, sys
@@ -29,7 +29,7 @@ from pathlib import Path
 import torch, cudnn
 import cutlass.cute as cute
 from cudnn.frost import compiled_cache
-from cudnn.sdpa.bwd import staged_sm80
+from cudnn.sdpa.bwd import staged_sm80, prepared_sm80
 tests, package, route, reload = sys.argv[1:]
 assert Path(cudnn.__file__).resolve() == Path(package).resolve(), cudnn.__file__
 sys.path[:0] = [tests, str(Path(tests).parents[1])]
@@ -46,6 +46,12 @@ def record(api, *args, **kwargs):
         artifacts.extend(entry[1] for _, _, entries in auxiliary for entry in entries)
     return spec
 staged_sm80.compile_staged = record
+original_native = prepared_sm80.build_spec
+def record_native(*args, **kwargs):
+    spec = original_native(*args, **kwargs)
+    artifacts.append(spec.artifact)
+    return spec
+prepared_sm80.build_spec = record_native
 if reload == "1":
     def forbidden(*args, **kwargs):
         raise AssertionError("fresh-process staged backward invoked JIT")
@@ -57,7 +63,7 @@ elif route == "aux":
 elif route == "packed":
     helper.test_packed_staged_preserves_output_tail(torch.bfloat16, 160, 112, 2, "token_major")
 else:
-    helper.test_rope_staged_replay(torch.bfloat16, 128)
+    raise AssertionError("unknown native route")
 assert artifacts
 if reload == "1":
     assert all(hasattr(a, "_compiled_cache_raw") for a in artifacts)
@@ -82,7 +88,7 @@ print(json.dumps(compiled_cache.stats()))
     assert second["misses"] == 0 and second["hits"] > 0, second
 
 
-@pytest.mark.parametrize("route", ["dense", "packed", "aux", "rope"])
+@pytest.mark.parametrize("route", ["dense", "packed", "aux"])
 @pytest.mark.parametrize("cache_mode", ["disabled", "unknown_manifest"])
 def test_staged_backward_replan_without_disk_cache(route, cache_mode, tmp_path, monkeypatch):
     import cutlass.cute as cute
@@ -117,7 +123,7 @@ def test_staged_backward_replan_without_disk_cache(route, cache_mode, tmp_path, 
         elif route == "packed":
             helper.test_packed_staged_preserves_output_tail(torch.bfloat16, 160, 112, 2, "token_major")
         else:
-            helper.test_rope_staged_replay(torch.bfloat16, 128)
+            raise AssertionError("unknown native route")
 
     run()
 
