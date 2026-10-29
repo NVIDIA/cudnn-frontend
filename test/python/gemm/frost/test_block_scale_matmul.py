@@ -3561,11 +3561,22 @@ def test_sm120_mxfp8_partial_scale_block_graph_is_declined(K, a_major, b_major):
 @requires_sm120
 def test_sm120_mxfp8_partial_scale_block_call_is_refused():
     """The kernel binds K per call: a plan built at a whole-block K refuses a call whose K ends
-    inside a scale block before it writes anything, and still serves a K tail of whole blocks."""
+    inside a scale block before it launches or writes anything, and still serves a K tail of whole
+    blocks. A check of the declared scale factors against the call's problem size may refuse that
+    call first, in its own words, so the refusal is checked by its effect (ValueError, no launch,
+    output untouched) and by a message naming either reason, not by which guard fired."""
     M = N = 256
     g = _build_nvfp4_graph(M, N, 160, **_SM120_MXFP8)
     _, binding = analyze_with_binding(g)
     compiled = jit_from_cudnn_graph(g, **_kw(_SM120_BS_128))
+    launches, launch = [], compiled._launchable
+
+    def recorded_launch(*args, **kwargs):
+        launches.append(args)
+        return launch(*args, **kwargs)
+
+    # The launch path captures its launchable when the plan is lowered: lower a copy around the recorder.
+    compiled = dataclasses.replace(compiled, _launchable=recorded_launch)
     torch.manual_seed(0)
 
     def call(K):
@@ -3588,11 +3599,12 @@ def test_sm120_mxfp8_partial_scale_block_call_is_refused():
     compiled(pack)
     torch.cuda.synchronize()
     torch.testing.assert_close(c[0], ref, atol=2e-1, rtol=2e-2)
+    assert len(launches) == 1
     assert dict(compiled.deferrals) == {}
 
     pack, c, _ = call(144)
-    with pytest.raises(ValueError, match="not a multiple of the scale block size 32"):
+    with pytest.raises(ValueError, match=r"not a multiple of the scale block size 32|problem size.*\b144\b"):
         compiled(pack)
     torch.cuda.synchronize()
+    assert len(launches) == 1
     assert torch.all(c == 7.0)
-    assert dict(compiled.deferrals) == {"partial scale block": 1}
