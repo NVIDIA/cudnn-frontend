@@ -360,6 +360,11 @@ _D64_EARLY_SOFTMAX_HANDOFF = bool(
 # The SM100 D64/CGA1 schedule benefits from one max tree across both score
 # chunks before alpha publication. Keep other geometries on their existing tree.
 _D64_JOINT_ROW_MAX = _D64_EARLY_SOFTMAX_HANDOFF and CFG.CTA_MMA == 1
+# Join the masked row maxima for packed paged D128 on the measured SM100
+# geometry; the live-tile tree and all synchronization remain unchanged.
+_D128_PAGED_JOINT_ROW_MAX = bool(
+    _E2E_ENABLED and _E2E_PAGED_INTERIOR and CFG.TILE_M == 128 and CFG.TILE_N == 128 and CFG.CTA_MMA == 2 and CFG.PACK_GQA and CFG.PACK_G >= 4
+)
 _E2E_EMULATED_COLS = (_E2E_LIMIT // _E2E_FREQ) * _E2E_RES if _E2E_ENABLED else 0
 if _E2E_ENABLED:
     if not (0 <= _E2E_RES <= _E2E_FREQ and _E2E_FREQ % 2 == 0 and _E2E_RES % 2 == 0 and _E2E_LIMIT % _E2E_FREQ == 0):
@@ -2501,7 +2506,7 @@ def _softmax_kv_body(
             )
             for c in range(N_CHUNKS)
         ]
-        if cutlass.const_expr(_D64_JOINT_ROW_MAX):
+        if cutlass.const_expr(_D64_JOINT_ROW_MAX or _D128_PAGED_JOINT_ROW_MAX):
             chunks_max = [
                 row_max_reduction(cutlass.Vector.from_elements(tuple(chunks_S[c][i] for c in range(N_CHUNKS) for i in range(CHUNK)), cutlass.Float32))
             ]
