@@ -3888,7 +3888,26 @@ reduces the slab with the gate as for the dense d256 decode tile there -- its de
 module's own forms); `"auto"` / `"tcgen05"` there resolve the core and are declined by name (`sparse_tile_part_decline`, the text ending
 with the former Rubin-line spelling; the part set is also the record's `SparseCapabilities.lean_explicit_ccs`, appended, pinned equal to the
 rules constant), so the route can be measured on a B200-class part; the AUTO pin and the placement rule stay cc 10.7's, and the
-gated attention block's other stages keep their Rubin pins (the standalone adapter is the entry on those parts).
+gated attention block's other stages keep their Rubin pins (the standalone adapter is the entry on those parts).  **The lean route's
+combine FORM on cc 10.0 (2026-10-29, MEASURED):** `sparse_tile_rules.SPARSE_LEAN_COMBINE_RULE_CCS = ((10, 0),)` -- a LEAN plan there follows
+the cc 10.7 split-aware rule's shape (`sparse_lean_combine_rule_cc`; the decode-grid kernel on the 24-96-row grids at the lean splits, the
+module's own forms on the 384-row grid below split 32), from the 2026-10-28 measurement on the GB200 152-SM class (the decode-grid kernel
+3.0-3.8 us against the module's own forms 6.8-16.3 at 24-96 rows, 8.8-8.9 vs 7.4-16.3 at 384 rows; 15 of 16 cells named); cc 10.3 is
+UNMEASURED and keeps the module's own forms.  **The FUSED gated e4m3 store (2026-10-29; `SparseCapabilities.gated_e4m3_out`):** `o` declared
+`float8_e4m3fn` + `out_scale` (one fp32 element: the consumer's static per-tensor DEQUANT scale) + the epilogue gate on a SPLIT plan (the lean
+tile always splits; the tcgen05 core needs `split_kv >= 2`; never THD) takes the split combine's fused entry
+(`sm100/split_combine.compile_ptr(gate=True, gate_e4m3=True, dtype_o="e4m3")`): `e4m3(rn, satfinite)(O32 * sigmoid(G) * div.rn(1, scale))`,
+ONE rounding of the fp32 gated value with the inverse computed on device, dead rows 0, the LSE untouched -- within one e4m3 ulp of the
+unfused chain (the half O then `e4m3(half(O) * inv)`) and of the serving stacks' gate-and-quantize convention, never bitwise.  `out_scale` is a
+POSITIVE NORMAL fp32 by contract (its value is never read on the host; a zero / subnormal scale makes the on-device inverse +inf: the e4m3 NaN
+byte on a dead row, +-448 on the live rows).  Declines by name: `NotImplementedError` (the typed decline) for an unwired form -- an e4m3 `o`
+without the gate / unsplit / under THD, any other output dtype --, `ValueError` for a malformed declaration -- an e4m3 `o` without the scale,
+a scale with a half `o`, a scale that is not one contiguous fp32 element.  `gated_e4m3_out` is the record's LAST field (appended after
+`lean_explicit_ccs`).  Validated on the Rubin development class (every form of the entry -- AUTO / ON / OFF and the lean group walk -- against
+the unfused twin, the walk at two walk-selected geometries, the saturation at +-448, the strided element path, the PDL arm; the adapter's lean
+route end to end, and the tcgen05 route's split plan at split 4: the module's own forms inside the bound, the lean group walk on the
+192-lean-block grid); the lean-route adapter rows run on every SM100-line part (the explicit admission: the cc 10.0 / 10.3 CI parts) --
+`test_split_combine_gate_e4m3.py`.
 Kernel-alone evidence on the Rubin performance class (212 SMs at the 2376
 MHz lock, one process, A/B/A x 3 rounds x 10 replays of 100 launches, the control pair within 0.32 %, the oracle green before timing):
 B 1 x 8K x S_q 1 at `top_k` 512 on page-16 pools 3.341 us (3.352 with the build order rotated) against the tcgen05 core's 5.655 (+69.3 %),

@@ -857,7 +857,7 @@ class LeanRun:
         o = torch.full((B, SQ, H, D), _SENTINEL if dtype == torch.bfloat16 else 6.0e4, device=dev, dtype=dtype)
         lse = torch.full((B, H, SQ), _SENTINEL, device=dev, dtype=torch.float32)
         cc = torch.cuda.get_device_capability(dev)
-        form = _sparse_combine_decode_grid(B, H, SQ, self.split, cc)
+        form = _sparse_combine_decode_grid(B, H, SQ, self.split, cc, lean=True)  # the lean route's reading (the cc 10.0 rule follows cc 10.7's shape)
         tag = "bf16" if dtype == torch.bfloat16 else "f16"
         compile_combine = getattr(split_combine.compile_ptr, "__wrapped__", split_combine.compile_ptr)
         owner = compile_combine(dtype_o=tag, dtype_partial="f32", has_lse=True, stats_log2=False, gate=False, dtype_gate=None, decode_grid=form, use_pdl=False)
@@ -1821,8 +1821,9 @@ def test_split_bound_and_workspace_per_form():
 def test_explicit_lean_is_admitted_on_the_blackwell_parts_for_measurement():
     """cc 10.0 / 10.3 (``SPARSE_LEAN_TILE_EXPLICIT_CCS``: B200 / GB200, B300) serve the EXPLICIT ``tile_form="lean"`` only -- the lean body is
     SM100-legal instruction for instruction and its config pins no Rubin-only size, so the admission is a host rule (2026-10-28, admitted for
-    the B200 measurement; UNMEASURED there): the route resolves the lean tile at the lean split (65, k 1), the slab is the 65-partial one and
-    the combine form is the module's own (``DECODE_GRID_OFF``: the decode-grid rule is cc 10.7's); the 24 / 4 geometry (G 6) at S_q 4 builds the
+    the B200 measurement): the route resolves the lean tile at the lean split (65, k 1), the slab is the 65-partial one and the combine form
+    is the decode-grid kernel on cc 10.0 (``DECODE_GRID_AUTO``: the cc 10.7 split-aware rule's shape, measured there 2026-10-28 --
+    ``SPARSE_LEAN_COMBINE_RULE_CCS``) and the module's own on cc 10.3 (``DECODE_GRID_OFF``, unmeasured); the 24 / 4 geometry (G 6) at S_q 4 builds the
     lean record with the step rows (N_MT 2).  ``"auto"`` / ``"tcgen05"`` there resolve the tcgen05 core and are declined by name ('EXPLICIT lean
     tile only', ending with the former statement's spelling), the AUTO pin and the placement rule stay cc 10.7's, the lean body's own declines
     still apply, a part outside both sets keeps the former decline whatever the form, and the gather4 floor still answers first below cc 10.0."""
@@ -1839,7 +1840,10 @@ def test_explicit_lean_is_admitted_on_the_blackwell_parts_for_measurement():
     for cc in H.SPARSE_LEAN_TILE_EXPLICIT_CCS:
         a = _route_adapter(cc=cc, tile_form="lean")
         assert a.check_support() and a.tile_form == "lean" and a.kernel_template == H.SPARSE_TILE_LEAN and (a.split_kv, a.sub_tiles_per_cta) == (65, 1), cc
-        assert a.combine_form() == sc.DECODE_GRID_OFF and a.scratch_workspace_bytes() == rubin.scratch_workspace_bytes(), cc
+        want_form = (
+            sc.DECODE_GRID_AUTO if cc in H.SPARSE_LEAN_COMBINE_RULE_CCS else sc.DECODE_GRID_OFF
+        )  # cc 10.0 measured (the rules module's table), cc 10.3 not
+        assert a.combine_form() == want_form and a.scratch_workspace_bytes() == rubin.scratch_workspace_bytes(), cc
         g6 = _route_adapter(cc=cc, tile_form="lean", H=24, KH=4, SQ=4)  # 24 q / 4 kv heads (G 6), the shared list at S_q 4: N_MT = ceil(24 / 16) = 2
         assert g6.check_support() and g6.tile_form == "lean" and g6.template_params().decode_seqlen_q == 4 and g6.template_params().qh_per_kh == 6, cc
         assert not H.sparse_decode_lean_tile_selected(batch=1, h_kv=2, s_q=1, top_k=512, device_cc=cc)

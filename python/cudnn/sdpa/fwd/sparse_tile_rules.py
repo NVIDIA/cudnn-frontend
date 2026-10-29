@@ -150,6 +150,34 @@ def sparse_tile_part_decline(
     return core
 
 
+SPARSE_LEAN_COMBINE_RULE_CCS: Tuple[Tuple[int, int], ...] = ((10, 0),)
+"""The parts OUTSIDE the cc 10.7 line on which a LEAN plan's split-combine FORM follows the cc 10.7 split-aware rule's SHAPE
+(``heuristics.decode_combine_grid_selected`` evaluated at :data:`_SPARSE_LEAN_COMBINE_RULE_SOURCE_CC` through
+:func:`sparse_lean_combine_rule_cc`): the decode-grid kernel inside the combine module's bound on a small grid (<= 128 rows) from split 8
+and on a larger grid from split 32, the module's own forms otherwise; never the lean group walk (a cc 10.7 form; the lean splits are
+>= 9 anyway).  MEASURED 2026-10-28 on the GB200 class (cc 10.0, 152 SMs at the 1830 MHz lock; CUPTI medians over 50 cold-L2 replays of
+the lean chain's combine at 24 Q heads, d 256, two independent GPU-0 cells agreeing to <= 0.1 us; the oracle green before timing):
+the decode-grid kernel vs the module's own forms, us, at the lean splits 65 / 33 / 22 / 17 -- B 1 x S_q 1 (24 rows) 3.01 / 3.39 / 3.23 /
+3.52 vs 8.48 / 6.78 / 8.10 / 7.14; B 1 x S_q 4 (96 rows) 3.58 / 3.74 / 3.62 / 3.55 vs 16.22 / 10.05 / 9.41 / 6.88; B 4 x S_q 1 (96 rows)
+3.71 / 3.81 / 3.74 / 3.78 vs 8.38 / 6.82 / 8.16 / 7.65; B 4 x S_q 4 (384 rows) 8.83 / 8.93 / 8.80 / 8.80 vs 16.29 / 10.21 / 9.50 / 7.38 --
+the cc 10.7 shape names the measured winner in 15 of the 16 cells (the miss: 384 rows at split 22, the own forms 9.50 vs 8.80).  The
+measured-default rule: a part joins this tuple with its table; cc 10.3 (B300) is UNMEASURED and keeps the module's own forms, the
+tcgen05 body on every part reads as before."""
+_SPARSE_LEAN_COMBINE_RULE_SOURCE_CC = (10, 7)
+"""The line whose split-aware combine rule the parts above borrow (``heuristics._DECODE_COMBINE_RULE_CC``, pinned equal by the test
+suite: this module cannot import the heuristics, which import it)."""
+
+
+def sparse_lean_combine_rule_cc(device_cc, *, lean: bool) -> Tuple[int, int]:
+    """The device whose split-aware combine-form rule a sparse plan's combine entry follows: the plan's own device, except a LEAN plan on
+    a part of :data:`SPARSE_LEAN_COMBINE_RULE_CCS`, which follows :data:`_SPARSE_LEAN_COMBINE_RULE_SOURCE_CC` (cc 10.7: the rule's shape,
+    measured for the lean grids on that part -- the table above)."""
+    cc = (int(device_cc[0]), int(device_cc[1]))
+    if lean and cc in SPARSE_LEAN_COMBINE_RULE_CCS:
+        return _SPARSE_LEAN_COMBINE_RULE_SOURCE_CC
+    return cc
+
+
 LEAN_SPARSE_DEFAULT_MAX_SUB_TILES_PER_CTA = 1
 """The cap on the DEFAULT ``sub_tiles_per_cta`` (k): 1 -- one 32-key sub-tile per CTA, the kill-line rendering (REG 66-72, 4 CTAs per SM
 by registers).  The fill rule of :func:`sparse_lean_fill_sub_tiles` asks for k 2 / 3 / 4 / 7 at B 8 / B 4 x S_q 4 / B 16 / B 32 units,
