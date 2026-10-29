@@ -3999,12 +3999,24 @@ def _frost_listed(g) -> bool:
 def test_sm120_batch_past_grid_z_is_declined():
     # The sm120 dense launch is (ceil(M / tile_m), ceil(N / tile_n), batch * S). With S = 1 a batch
     # past 65535 used to plan, then fail every launch with cudaErrorInvalidValue and no fallback.
+    # Declined, the graph builds on the backend, which must run it exactly.
     from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
 
-    assert _frost_listed(_splitk_graph(65535, 32, 32, 64)[0])
-    assert not _frost_listed(_splitk_graph(65536, 32, 32, 64)[0])
+    batch, M, N, K = 65536, 32, 32, 64
+    assert _frost_listed(_splitk_graph(batch - 1, M, N, K)[0])
+    g, A, Bt, C = _splitk_graph(batch, M, N, K)
+    assert not _frost_listed(g)
     with pytest.raises(NotImplementedError, match=r"grid\.z = batch=65536 \* split_k_slices=1 = 65536"):
-        jit_from_cudnn_graph(_splitk_graph(65536, 32, 32, 64)[0], by_name(_SM120_SPLITK_CFG))
+        jit_from_cudnn_graph(_splitk_graph(batch, M, N, K)[0], by_name(_SM120_SPLITK_CFG))
+    g.check_support()
+    g.build_plans()
+    assert g.selected_engine is None  # the backend serves the graph
+    a = torch.randint(-2, 2, (batch, M, K), device="cuda").to(torch.bfloat16)
+    b = torch.randint(-2, 2, (batch, N, K), device="cuda").to(torch.bfloat16)
+    c = torch.full((batch, M, N), float("nan"), dtype=torch.bfloat16, device="cuda")
+    g.execute({A: a, Bt: b.transpose(1, 2), C: c}, torch.empty(max(1, g.get_workspace_size()), dtype=torch.uint8, device="cuda"))
+    torch.cuda.synchronize()
+    assert torch.equal(c, (a.float() @ b.float().transpose(1, 2)).to(torch.bfloat16))
 
 
 @requires_sm120
@@ -4030,7 +4042,7 @@ def test_sm120_n_past_grid_y_is_refused():
     operands = [resolved[id(t)] for t in plan.binding.bound_tensors()]
     messages = []
     for call in (lambda: plan.lowered(operands), lambda: plan.explain(operands)):
-        with pytest.raises(ValueError, match=r"grid\.y = ceil\(N=1048576 / 16\) = 65536") as refused:
+        with pytest.raises(ValueError, match=r"^cudnn\.frost gemm: .*grid\.y = ceil\(N=1048576 / 16\) = 65536.* rebuild for this shape$") as refused:
             call()
         messages.append(str(refused.value))
     assert messages[0] == messages[1]
