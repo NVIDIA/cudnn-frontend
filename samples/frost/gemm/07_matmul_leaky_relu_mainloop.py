@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import warnings
 from collections.abc import Callable
 
 import cudnn
@@ -51,26 +52,39 @@ def _build_graph(M: int, N: int, K: int, side: str, negative_slope: float, fuse:
     return g, A, B, C
 
 
-def _replay_us(call: Callable[[], None], iterations: int = 100) -> float:
-    # Warm and capture on a side stream, retaining the capture pool until timing ends.
+def _replay_us(call: Callable[[cudnn.Handle], None], check_replay: Callable[[Callable[[], None]], None], iterations: int = 100) -> float:
+    """Validate capture before timing warm replays with CUDA Events."""
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        for _ in range(5):
-            call()
-    torch.cuda.current_stream().wait_stream(stream)
+    handle = cudnn.create_handle()
     captured = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(captured, stream=stream):
-        call()
-    for _ in range(5):
-        captured.replay()
-    begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    begin.record()
-    for _ in range(iterations):
-        captured.replay()
-    end.record()
-    end.synchronize()
-    return begin.elapsed_time(end) * 1000 / iterations
+    try:
+        # Torch's stream context does not change a cuDNN handle's stream.
+        # Retain the explicit handle and capture pool through validation/timing.
+        cudnn.set_stream(handle, stream.cuda_stream)
+        with torch.cuda.stream(stream):
+            for _ in range(5):
+                call(handle)
+        torch.cuda.current_stream().wait_stream(stream)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", message="The CUDA Graph is empty.*")
+            with torch.cuda.graph(captured, stream=stream):
+                call(handle)
+        check_replay(captured.replay)
+        for _ in range(5):
+            captured.replay()
+        begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        begin.record()
+        for _ in range(iterations):
+            captured.replay()
+        end.record()
+        end.synchronize()
+        return begin.elapsed_time(end) * 1000 / iterations
+    finally:
+        # Also wait on validation/capture failure before releasing resources.
+        torch.cuda.synchronize()
+        captured.reset()
+        cudnn.destroy_handle(handle)
 
 
 def main(M: int = 512, N: int = 512, K: int = 264, side: str = "ab", negative_slope: float = 0.1, benchmark: bool = False) -> None:
@@ -95,12 +109,15 @@ def main(M: int = 512, N: int = 512, K: int = 264, side: str = "ab", negative_sl
     c = torch.empty((1, M, N), device="cuda", dtype=torch.float32)
     workspace = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
 
-    def fused() -> None:
-        g.execute({A: a, B: b, C: c}, workspace)
+    def fused(handle: cudnn.Handle | None = None) -> None:
+        g.execute({A: a, B: b, C: c}, workspace, handle=handle)
 
-    a_ref = torch.nn.functional.leaky_relu(a.float(), negative_slope).to(a.dtype) if side in ("a", "ab") else a
-    b_ref = torch.nn.functional.leaky_relu(b.float(), negative_slope).to(b.dtype) if side in ("b", "ab") else b
-    ref = a_ref.float() @ b_ref.float()
+    def reference() -> torch.Tensor:
+        a_ref = torch.nn.functional.leaky_relu(a.float(), negative_slope).to(a.dtype) if side in ("a", "ab") else a
+        b_ref = torch.nn.functional.leaky_relu(b.float(), negative_slope).to(b.dtype) if side in ("b", "ab") else b
+        return a_ref.float() @ b_ref.float()
+
+    ref = reference()
     fused()
     torch.cuda.synchronize()
     torch.testing.assert_close(c, ref, atol=1e-2, rtol=1e-2)
@@ -112,17 +129,31 @@ def main(M: int = 512, N: int = 512, K: int = 264, side: str = "ab", negative_sl
         c_base = torch.empty_like(c)
         base_workspace = torch.empty(max(base.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
 
-        def separate() -> None:
+        def separate(handle: cudnn.Handle | None = None) -> None:
             a_activated = torch.nn.functional.leaky_relu(a, negative_slope) if side in ("a", "ab") else a
             b_activated = torch.nn.functional.leaky_relu(b, negative_slope) if side in ("b", "ab") else b
-            base.execute({A_base: a_activated, B_base: b_activated, C_base: c_base}, base_workspace)
+            base.execute({A_base: a_activated, B_base: b_activated, C_base: c_base}, base_workspace, handle=handle)
+
+        def check_replay(replay: Callable[[], None], output: torch.Tensor) -> None:
+            # Keep storage addresses stable but change BOTH operands after capture.
+            # Poison the output so an empty or partial capture cannot reuse old work.
+            a.neg_()
+            b.mul_(0.5)
+            expected = reference()
+            output.fill_(float("nan"))
+            replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(output, expected, atol=1e-2, rtol=1e-2)
 
         separate()
         torch.cuda.synchronize()
         torch.testing.assert_close(c_base, ref, atol=1e-2, rtol=1e-2)
-        fused_us, separate_us = _replay_us(fused), _replay_us(separate)
-        torch.testing.assert_close(c, ref, atol=1e-2, rtol=1e-2)
-        torch.testing.assert_close(c_base, ref, atol=1e-2, rtol=1e-2)
+        fused_us = _replay_us(fused, lambda replay: check_replay(replay, c))
+        # Restore capture inputs so both paths validate/time the same data.
+        a.neg_()
+        b.mul_(2)
+        separate_us = _replay_us(separate, lambda replay: check_replay(replay, c_base))
+        torch.testing.assert_close(c, c_base, atol=1e-2, rtol=1e-2)
         print(f"[07] CUDA-graph replay: fused={fused_us:.2f} us, separate={separate_us:.2f} us, ratio={separate_us / fused_us:.3f}x")
 
 

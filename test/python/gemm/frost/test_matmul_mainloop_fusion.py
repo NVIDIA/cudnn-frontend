@@ -9,6 +9,9 @@ epilogue), codegen (generate_mainloop), and end-to-end JIT+run vs torch.
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  (installs hook)
 import pytest
@@ -368,6 +371,20 @@ def test_codegen_mainloop_empty_when_no_fusion() -> None:
 # ---------------------------------------------------------------------------
 
 _TORCH_OP = {"abs": torch.abs, "relu": torch.relu, "neg": torch.neg, "cos": torch.cos}
+
+
+@requires_sm100
+@pytest.mark.parametrize("side", ["a", "b", "ab"])
+def test_frost_leaky_relu_mainloop_sample_benchmark(side, capsys) -> None:
+    """Run the sample's actual capture, changed-input check and event timing."""
+    path = Path(__file__).resolve().parents[4] / "samples/frost/gemm/07_matmul_leaky_relu_mainloop.py"
+    spec = importlib.util.spec_from_file_location("leaky_relu_mainloop_sample", path)
+    sample = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sample)
+    sample.main(128, 128, 136, side, 0.1, True)
+    output = capsys.readouterr().out
+    assert "[07] PASS" in output
+    assert "CUDA-graph replay:" in output
 
 
 @requires_sm100
