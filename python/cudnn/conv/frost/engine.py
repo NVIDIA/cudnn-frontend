@@ -19,12 +19,14 @@ from cudnn import behavior_note, GraphContext, data_type
 from cudnn.datatypes import _cudnn_to_frost_dtype_name
 from cudnn.engines.base import BaseEngine, CompiledPlan, ExecutionContext, PlanConfig
 from cudnn.frost import buffers
+from cudnn.frost.workspace import Workspace
 from cudnn.frost.device import build_device, current_device
 from cudnn.conv.frost.graph_analyzer import analyze, ConvGraph
 from cudnn._pygraph import pygraph
 
 from ._cutedsl import BLOCK_SCALE_CUTEDSL_MIN_VERSION, DENSE_CUTEDSL_MIN_VERSION, requirement_error as cutedsl_requirement_error
 
+_MISSING_DEVICE = object()
 _ZERO = (0, 0, 0)
 _ONE = (1, 1, 1)
 _CUTLASS_STORAGE_DTYPES = {
@@ -271,7 +273,18 @@ class _Sm100FrostConvPlan(CompiledPlan):
             output_dtype=output_dtype,
         )
         input_channel_tile = _input_channel_tile(image_dtype)
-        if image.dim[1] % input_channel_tile:
+        c96_causal = (
+            image_dtype == output_dtype == "bfloat16"
+            and image.dim[1] == 96
+            and analysis.epilogue_node is None
+            and weight.dim[0] in (96, 192)
+            and tuple(weight.dim[2:]) == (3, 3, 3)
+            and _tuple_param(node, "stride", _ONE) == _ONE
+            and _tuple_param(node, "dilation", _ONE) == _ONE
+            and _tuple_param(node, "pre_padding", _ZERO) in ((0, 1, 1), (1, 1, 1), (2, 1, 1))
+            and _tuple_param(node, "post_padding", _ZERO) == (0, 1, 1)
+        )
+        if image.dim[1] % input_channel_tile and not c96_causal:
             raise NotImplementedError(
                 f"frost_conv requires input channels to be a multiple of the {input_channel_tile}-element mainloop tile for {image_dtype}; got {image.dim[1]}"
             )
@@ -298,6 +311,10 @@ class _Sm100FrostConvPlan(CompiledPlan):
         self._dtypes = tuple(_storage_dtype_name(t.data_type) for t in tensors)
         self._indices = None
         self._device = int(device)
+        self._workspace_bytes = int(getattr(compiled, "workspace_bytes", 0))
+
+    def get_workspace_size(self) -> int:
+        return self._workspace_bytes
 
     def execute(self, graph, variant_pack, ctx: ExecutionContext) -> None:
         # The compiled artifact bakes in device properties (max active clusters), so it
@@ -330,12 +347,32 @@ class _Sm100FrostConvPlan(CompiledPlan):
         image, weight, output = operands
         # The graph follows PyTorch/cuDNN's NCDHW/KCTRS convention, while the
         # im2col template consumes zero-copy NDHWC/KTRSC/NZPQK views.
-        self._compiled(
+        args = (
             image.permute(0, 2, 3, 4, 1),
             weight.permute(0, 2, 3, 4, 1),
             output.permute(0, 2, 3, 4, 1),
             _cuda.CUstream(ctx.stream or 0),
         )
+        if self._workspace_bytes:
+            device = getattr(ctx.workspace, "__dlpack_device__", None)
+            if device is None:
+                # Raw addresses have no observable placement; Python producers may.
+                observed = getattr(ctx.workspace, "device", _MISSING_DEVICE)
+                if observed is not _MISSING_DEVICE and (getattr(observed, "type", None) != "cuda" or getattr(observed, "index", None) != self._device):
+                    raise ValueError(f"frost_conv: workspace must be on CUDA device {self._device}")
+            elif tuple(device()) != (2, self._device):
+                raise ValueError(f"frost_conv: workspace must be on CUDA device {self._device}")
+            workspace = Workspace.over(variant_pack, self._workspace_bytes, "frost_conv")
+            start = variant_pack.workspace
+            end = start + self._workspace_bytes
+            for role, operand, shape, dtype in zip(("image", "weight", "Y"), operands, self._shapes, self._dtypes):
+                operand_start = operand.data_ptr()
+                operand_end = operand_start + prod(shape) * buffers.DTYPE_ITEMSIZE[dtype]
+                if start < operand_end and operand_start < end:
+                    raise ValueError(f"frost_conv: workspace must not overlap {role}")
+            self._compiled(*args, workspace.view(0, "int32", (96,)))
+        else:
+            self._compiled(*args)
 
 
 class _Sm100FrostBlockScaleConvPlan(CompiledPlan):

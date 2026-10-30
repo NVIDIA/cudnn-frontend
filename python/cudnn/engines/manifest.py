@@ -319,6 +319,8 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "cudnn.conv.frost.engine",
         "FrostConvEngines",
         slots={"frost_conv": EngineSlot(0, opt_in=True)},
+        analyzer=("cudnn.conv.frost.heuristics", "analyze_facts"),
+        heuristics=("cudnn.conv.frost.heuristics", "propose"),
     ),
     EngineFamily(
         FROST_NORM_FWD_ID_BASE,
