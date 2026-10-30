@@ -54,6 +54,39 @@ def _strategy_device(arch=100, name="NVIDIA B200", sm_count=148):
     return DeviceProperties(arch=arch, name=name, sm_count=sm_count, l2_bytes=132644864)
 
 
+@pytest.mark.L0
+def test_every_cost_profile_lies_inside_the_published_planner_envelope():
+    """``tile_config`` publishes the planner's shape envelope (``PLANNER_MN_BOUNDS`` / ``PLANNER_K_BOUNDS`` / ``PLANNER_MAX_BATCH``, the
+    ``CostProfile`` defaults) for host-side resolvers that must not import this module -- the gated attention block's projection driver names
+    the engine's baseline pick directly for a shape outside it.  A profile with WIDER bounds would let ``profile_for`` claim a shape such a
+    resolver reads as baseline-only, so every profile stays inside the envelope, and ``planner_may_claim`` agrees with ``profile_for`` at the
+    envelope's edges on a plain chain a calibrated profile owns."""
+    from cudnn.gemm.frost import planning
+    from cudnn.gemm.frost.tile_config import PLANNER_K_BOUNDS, PLANNER_MAX_BATCH, PLANNER_MN_BOUNDS, planner_may_claim
+
+    assert planning._PROFILES
+    for key, profile in planning._PROFILES.items():
+        assert PLANNER_MN_BOUNDS[0] <= profile.mn_bounds[0] <= profile.mn_bounds[1] <= PLANNER_MN_BOUNDS[1], key
+        assert PLANNER_K_BOUNDS[0] <= profile.k_bounds[0] <= profile.k_bounds[1] <= PLANNER_K_BOUNDS[1], key
+        assert profile.max_batch <= PLANNER_MAX_BATCH, key
+    config = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    device = _strategy_device()
+    (lo, hi), (klo, khi) = PLANNER_MN_BOUNDS, PLANNER_K_BOUNDS
+    cells = (
+        (lo, lo, klo, 1),
+        (hi, hi, khi, PLANNER_MAX_BATCH),
+        (lo - 1, lo, klo, 1),
+        (lo, hi + 1, klo, 1),
+        (lo, lo, klo - 1, 1),
+        (hi, hi, khi + 1, 1),
+        (lo, lo, klo, PLANNER_MAX_BATCH + 1),
+    )
+    for M, N, K, batch in cells:
+        claimed = planning.profile_for(_plain_strategy_chain(M=M, N=N, K=K, batch=batch), config, device) is not None
+        assert claimed is planner_may_claim(M, N, K, batch), (M, N, K, batch)
+    assert sum(planner_may_claim(*c) for c in cells) == 2
+
+
 @pytest.fixture(params=["b200", "rubin"])
 def calibrated_device(request):
     if request.param == "rubin":

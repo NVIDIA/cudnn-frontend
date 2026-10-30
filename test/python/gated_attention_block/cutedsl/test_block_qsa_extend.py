@@ -588,9 +588,21 @@ def test_extend_declaration_facts_route_carve_and_window_plan():
     window at the default budget, the pieces one per sequence, ``R`` floored at 16 and capped at ``T``, two windows at a lowered budget) and the gather's
     piece-table precondition (a malformed piece table is a ``RuntimeError`` naming the piece)."""
     with _no_host_sync():
+        from cudnn.gated_attention_block.kernels.proj_gemm import SMALL_M_MAX, large_m_tile_config
+        from cudnn.gemm.frost import arch_family
+        from cudnn.gemm.frost.tile_config import _sm_count, select_config
+
         for s_q, batch in ((17, 1), (128, 2), (300, 1)):
             blk = _declare_extend(GEOM_SMALL, batch, s_q, form=QSA_INDEX_SELECT_FORM_AUTO, n_pages=32)
             assert blk.indexer_decode and blk.indexer_extend and blk.index_select_form == "auto" and blk.index_select_form_resolved == "extend"
+            # the slab stage's capture flag is read off the GEMM driver's resolver (never re-spelled): this geometry's band slab (N 5760 = 45 x 128,
+            # off the 256 grid) keeps the graph route up to 128 rows on every served part (its 90 64-row tiles fit one wave) and takes the GEMM
+            # engine's own baseline tile past them (the large-M rule: N past the planner's bounds, K 512 too shallow to split) -- so the EXTEND
+            # form's chunks past 128 rows (T 256 / 300 here) compile capture-safe on the JIT-only route
+            assert blk._proj.capture_safe is blk._proj.resolves_a_jit_tile()
+            if arch_family.active_family() == "sm100" and batch * s_q > SMALL_M_MAX:
+                expect = select_config(batch * s_q, blk.geom.n_qkvg, 1, K=blk.geom.d_model, sm_count=_sm_count()).name
+                assert blk._proj.capture_safe and large_m_tile_config(batch * s_q, blk.geom.n_qkvg, blk.geom.d_model, dtype=BF16) == expect
             assert isinstance(blk._indexer_extend, _IndexerExtend) and blk._indexer_decode is None and blk._indexer is None and blk._prepare is None
             assert blk.fuse_prepare is False and blk.fuse_prepare_requested is None and blk.qsa_list_form == "per_row" and not blk.qsa_shared_list
             names = [st.name for st in blk._stages]
@@ -941,6 +953,16 @@ def test_extend_indexer_matches_the_two_stage_oracle(geom_kw, t, kv_lens, page, 
     case.compile()
     if split is not None:
         assert case.blk.decode_split_kv == split
+    from cudnn.gated_attention_block.kernels.proj_gemm import SMALL_M_MAX, large_m_tile_config
+
+    rows = len(kv_lens) * t
+    if rows > SMALL_M_MAX:
+        # past 128 rows the slab stage rides the GEMM engine's own baseline tile for its shape on the JIT-only route, capture-safe (the
+        # large-M rule; up to 128 rows this geometry's band slab keeps the graph route) -- the EXTEND form's lift, pinned where it matters
+        st = case.blk._proj
+        name = large_m_tile_config(rows, case.geom.n_qkvg, case.geom.d_model, dtype=case.dtype)
+        assert name is not None and st.capture_safe and st._plan.route == "jit-only" and st._plan.jit is not None, (st._plan.route, st._plan.tile_config_name)
+        assert st._plan.tile_config_name == name, (st._plan.tile_config_name, name)
     m = _two_launches_extend(case, "extend ladder")
     print(f"\n{case.label()}: {m}")
     if cache_dtype is not None:
