@@ -763,6 +763,17 @@ Related: inside a kernel body, `for x in (a, b)` over a Python tuple is
 rewritten into a dynamic `ir_loop` and cannot iterate heterogeneous objects
 (e.g. `GridConstant[TensorMap]`). Unroll it, or use `cutlass.range_constexpr`.
 
+**A named barrier reached from a warp-role branch is a subset barrier, even
+when its declared participant count is correct.** `pipeline.NamedBarrier`
+lowers its operations with the aligned-CTA promise by default; using it from
+only the producer, MMA, epilogue, or reduction warps is undefined. Lower both
+`barrier_cta_arrive` and `barrier_cta_sync` with `aligned=False`, including
+split-phase arrive/wait protocols and TMEM allocation/deallocation gates.
+Do not call `TmemAllocator.wait_for_alloc()` for such a gate: it rebuilds an
+aligned named barrier, so call the original subset barrier directly. Run the
+affected kernel under `compute-sanitizer --tool synccheck`; ordinary numerical
+tests do not diagnose this contract violation.
+
 **Detector.** These break at `compile()`, not at import — `python -c "import ..."`
 and `pytest --collect-only` both stay green. After any refactor of a kernel
 body, run that flavor's own tests.

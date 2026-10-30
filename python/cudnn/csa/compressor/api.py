@@ -540,7 +540,7 @@ class CSACompressorBackward(_CSACompressorBase):
                 raise ValueError(f"workspace must not overlap {name}")
 
     def compile(self) -> None:
-        """JIT-compile the backward kernel for this ``(ratio, head_dim, coff, device)`` (idempotent)."""
+        """JIT-compile the backward kernel and its plan-capacity schedule (idempotent)."""
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
@@ -550,7 +550,14 @@ class CSACompressorBackward(_CSACompressorBase):
             precompile_bwd_r128(self.ratio, self.head_dim, self.coff, self.target_device, deterministic=self.deterministic)
             run = run_bwd_r128
         else:
-            precompile_bwd(self.ratio, self.head_dim, self.coff, self.target_device, deterministic=self.deterministic)
+            precompile_bwd(
+                self.ratio,
+                self.head_dim,
+                self.coff,
+                self.target_device,
+                deterministic=self.deterministic,
+                nb_total=self.total_comp,
+            )
             run = run_bwd
 
         ratio, head_dim, coff, deterministic = self.ratio, self.head_dim, self.coff, self.deterministic
@@ -639,9 +646,10 @@ class CSACompressorBackward(_CSACompressorBase):
 
 # module-level bounded LRU cache of compiled API instances (thread-safe):
 #   (kind, ratio, coff, deterministic, head_dim, kv_shape, total_comp, n_seg, device) -> api
-# The compiled kernel underneath is shared per (ratio, head_dim, coff, device) through
-# compressor_sm100's compile cache, so shape changes only rebuild the cheap wrapper
-# object, never the JIT.
+# The compiled kernel underneath is shared per
+# (ratio, head_dim, coff, deterministic, rows_per_cta, device) through
+# compressor_sm100's compile cache. Shape changes within one schedule only rebuild the
+# cheap wrapper object, while crossing a schedule boundary selects its own JIT artifact.
 _api_cache = _LruDict()
 # serializes verdict construction + JIT so concurrent same-config callers cannot
 # compile the same kernel twice
