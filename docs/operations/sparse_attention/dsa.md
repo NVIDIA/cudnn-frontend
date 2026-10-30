@@ -275,8 +275,8 @@ If that preferred layout's complete FP32-plane and packed-mask allocation would
 exceed 32 GiB, the plan selects an eight-plane, sixteen-CTA memory-first relay.
 The long-query policy deliberately skips cluster-8: GB200 sweeps at 393K, 512K,
 and 768K KV found it slower than cluster-16 while retaining twice as many FP32
-planes. A setup kernel builds packed 16-bit, 8-bit, or 4-bit rank masks for every
-`(query wave, head block, KV row)`. Reducer threads wait only for lower cluster
+planes. A setup kernel builds packed 4-, 8-, 16-, 32-, or 64-bit rank masks for
+every `(query wave, head block, KV row)`. Reducer threads wait only for lower cluster
 ranks that actually update the same KV row, then publish that row with
 GPU-scope release/acquire ordering. The participating reducer-thread CTA
 barrier carries the release/acquire causality, so no additional GPU-wide fence
@@ -284,20 +284,41 @@ is needed. Rank zero skips the predecessor handoff, the last rank skips the
 successor publication, and the final release needs no second rendezvous.
 Disjoint sparse rows continue in parallel; the fixed rank order handles both
 low- and high-overlap top-k rows without a global semaphore dependency on
-non-resident CTAs. The selected 8, 16, or 32 planes are combined directly in
+non-resident CTAs. The selected 2, 4, 8, 16, or 32 planes are combined directly in
 the fixed-order conversion kernel, without an intermediate FP32 prefold.
 Duplicate top-k indices within one query row remain outside the deterministic
 contract, as in the bounded-wave path. This condition is not checked at
 runtime; callers that require bitwise repeatability must provide unique valid
 indices within each query's active top-k prefix.
 
+Callers that have profiled their exact SM100 workload may set
+`deterministic_relay_cluster_size` to `4`, `8`, `16`, `32`, or `64` to select
+that many CTAs per logical relay group instead of using the automatic policy.
+The corresponding number of FP32 relay planes is `32`, `16`, `8`, `4`, or
+`2`. Because SM100 hardware clusters contain at most 16 CTAs, the logical
+32- and 64-CTA groups run as two and four same-stream 16-CTA phases,
+respectively. Each kernel boundary completes the preceding physical phase
+before the next ranks reuse the same plane, avoiding cross-cluster residency
+dependencies. Cluster-64 uses a 64-bit packed row mask and is intended as an
+explicit emergency memory-first choice; the automatic policy never selects
+it because its lower per-phase parallelism regresses profiled workloads. This
+is a plan-time specialization: it is part of the compile/cache key, fixes the workspace size,
+and remains unchanged during `execute()` and CUDA Graph replay. The default
+`None` preserves automatic selection. Requests on non-deterministic plans,
+non-generic backends, or shapes that do not require the large-context relay are
+rejected rather than silently ignored. An explicit choice may exceed the
+automatic policy's 32 GiB memory-first budget, so callers should always allocate
+the exact value returned by `scratch_workspace_bytes()`.
+
 For the ordinary policy, additional dKV workspace is
 `selected_shards * K8 * D8 * sizeof(float)`, where
 `K8 = round_up(total_S_kv, 8)` and `D8 = round_up(D, 8)`. The cluster relay
 uses `relay_planes * (K8 + mask_rows) * D8 * sizeof(float)`, where
-`relay_planes` is 8, 16, or 32, `relay_width` is 16, 8, or 4, and
+`relay_planes = 128 / relay_width`. The packed mask uses a 32-bit word for
+relay widths up to 32 and a 64-bit word for relay width 64. With
+`mask_word_bits` equal to 32 or 64, its FP32 storage rows are
 `mask_rows = ceil(ceil(total_S_q / 128) * ceil(H / 64) *
-(K8 / (32 / relay_width)) / D8)`.
+ceil(K8 / (mask_word_bits / relay_width)) * (mask_word_bits / 32) / D8)`.
 One CTA per head reduces `d_sink`. Use `scratch_workspace_bytes()` as the
 authoritative full scratch size; a larger reusable workspace remains valid.
 Treat this as a reproducibility requirement rather than a performance-tuning
@@ -399,6 +420,7 @@ result = DSA.sparse_attention_backward_wrapper(
     softmax_scale=1.0 / math.sqrt(D),
     topk_length=topk_length,
     deterministic=True,  # optional; SM100 H16/H32/H64/H96/H128
+    deterministic_relay_cluster_size=None,  # optional: force 4, 8, 16, or 32 CTAs/group
     q_cluster_mode="off",  # optional: "adaptive_pair" for SM100 H16/H32 D576
 )
 dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
