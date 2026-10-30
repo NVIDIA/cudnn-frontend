@@ -4183,6 +4183,10 @@ Graph and standalone declarations decline unsupported pitches before compilation
 There is no dense layout gather/scatter or staging workspace. Split-KV retains
 its algorithmic partial/combine workspace, and quantized plans retain scalar
 scratch. THD packing and paged pool contracts remain independently checked.
+The SM107 fused epilogue gate port follows the same contract
+(`config_sm107.epilogue_gate_layout_declarable` is `dense_bind_strides`), so a
+batch-1, one-token gate sliced out of a projection slab, whose singleton axes
+carry the slab's token pitch, is declarable on the graph and the standalone path alike.
 
 ### SM100/SM103 large-head backward native dense strides
 

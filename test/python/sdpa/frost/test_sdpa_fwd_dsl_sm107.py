@@ -2256,6 +2256,38 @@ def test_sm107_gate_declines_the_interactions():
     assert why is not None and "virtual O" in why, why
 
 
+@pytest.mark.parametrize("h,h_kv,token_pitch", [(24, 4, 13312), (32, 2, 17408)])
+def test_gate_check_support_admits_the_slab_column_gate_at_batch_one_token(monkeypatch, h, h_kv, token_pitch):
+    """The decode form of a gated block at batch 1 x one query token: Q and G are column bands of ONE projection slab, so both
+    singleton axes carry the slab's token pitch ((13312, 256, 13312, 1) for 24 heads).  Canonicalized, the gate is BSHD-compact:
+    the engine row admits the graph (``graph_analyzer.gate_layout_ok``), so the adapter's twin must admit the same G (rule 8b) --
+    split, the plan rides the decode tile with the gate in its combine; unsplit, the prefill kernel's fused epilogue.  A head
+    pitch that is not a 16-byte multiple on the same geometry stays the typed ValueError."""
+    import torch
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    _fake_cc(monkeypatch, (10, 7))
+    d, s_kv = 256, 4096
+    band = (token_pitch, d, token_pitch, 1)
+
+    def plan(gate_stride, split_kv):
+        q = _desc((1, h, 1, d), torch.bfloat16, "q", stride=band)
+        k = _desc((1, h_kv, s_kv, d), torch.bfloat16, "k")
+        v = _desc((1, h_kv, s_kv, d), torch.bfloat16, "v")
+        o = _desc((1, h, 1, d), torch.bfloat16, "o")
+        gate = _desc((1, h, 1, d), torch.bfloat16, "gate", stride=gate_stride)
+        return SdpaFwdDslSm100(q, k, v, o, None, sample_gate=gate, split_kv=split_kv)
+
+    for split in (4, 8, 16):
+        api = plan(band, split)
+        assert api.check_support(), split
+        assert api._gate_in_combine() is True, split
+    assert plan(band, 1).check_support()
+    with pytest.raises(ValueError, match="TMA-expressible"):
+        plan((token_pitch, 260, token_pitch, 1), 4).check_support()
+
+
 def test_epilogue_gate_is_not_a_knob():
     """The gate is a graph FACT (the tail is there or it is not), never a tuning
     axis: the knob vocabulary has no such field and the heuristics cannot
