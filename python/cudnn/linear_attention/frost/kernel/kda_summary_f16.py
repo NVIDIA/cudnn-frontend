@@ -1289,6 +1289,7 @@ def compute1_warp_group(
     mState_out,
     mTransition,
     mState_init,
+    mComposed,
     sBeta_raw,
     sV_raw,
     sGate_exchange_raw,
@@ -1374,19 +1375,32 @@ def compute1_warp_group(
                 seed_exchange_ptr = sGate_exchange_raw.data_ptr() + (cum_chunk_base % cfg.gate_exchange_stages) * (cfg.d_k * cfg.b_t)
 
                 # ---- state seed: initial state GMEM -> packed b16 TMEM + fp32 state TMEM ----
-                if cutlass.const_expr(mState_init is not None):
-                    seed_vw = 16 // (mState_init.element_type.width // 8)
-                    seed_src = (mState_init.iterator + mState_init.layout((batch_idx, head_o, value_dim, 0))).raw_ptr()
+                if cutlass.const_expr(cfg.use_initial_state):
+                    if cutlass.const_expr(cfg.state_table):
+                        seed_vw = 16 // (mState_init.element_type.width // 8)
+                        seed_src = (mState_init.iterator + mState_init.layout((batch_idx, head_o, value_dim, 0))).raw_ptr()
+                    if cutlass.const_expr(cfg.has_composed):
+                        is_boundary = batch_idx == cutlass.Int32(0)
+                        composed_src = (mComposed.iterator + mComposed.layout((cutlass.Int32(0), head_o, value_dim, 0))).raw_ptr()
                     for seed_half in cutlass.range_constexpr(2):
                         seed_blocks_lo = seed_half * state_blocks_per_half
                         seed_blocks_hi = seed_blocks_lo + state_blocks_per_half
                         seed_vecs = []
                         for i in cutlass.range_constexpr(seed_blocks_lo, seed_blocks_hi):
                             seed_block = []
-                            for g in cutlass.range_constexpr(16 // seed_vw):
-                                seed_chunk = (seed_src + i * 16 + g * seed_vw).load(count=seed_vw, alignment=16)
-                                for t in cutlass.range_constexpr(seed_vw):
-                                    seed_block.append(seed_chunk[t].to(cutlass.Float32))
+                            if cutlass.const_expr(cfg.state_table):
+                                for g in cutlass.range_constexpr(16 // seed_vw):
+                                    seed_chunk = (seed_src + i * 16 + g * seed_vw).load(count=seed_vw, alignment=16)
+                                    for t in cutlass.range_constexpr(seed_vw):
+                                        seed_block.append(seed_chunk[t].to(cutlass.Float32))
+                            else:
+                                for t in cutlass.range_constexpr(16):
+                                    seed_block.append(cutlass.Float32(0.0))
+                            if cutlass.const_expr(cfg.has_composed):
+                                for g in cutlass.range_constexpr(4):
+                                    composed_chunk = (composed_src + i * 16 + g * 4).load(count=4, alignment=16)
+                                    for t in cutlass.range_constexpr(4):
+                                        seed_block[g * 4 + t] = composed_chunk[t] if is_boundary else seed_block[g * 4 + t]
                             seed_vecs.append(seed_block)
 
                         for i in cutlass.range_constexpr(seed_blocks_lo, seed_blocks_hi):
@@ -1507,7 +1521,7 @@ def compute1_warp_group(
                 beta0 = (sBeta_ptr + token0).load().to(cutlass.Float32)
                 beta1 = (sBeta_ptr + token0 + 1).load().to(cutlass.Float32)
                 beta_fp32[2 * reg_idx], beta_fp32[2 * reg_idx + 1] = beta0, beta1
-            if cutlass.const_expr(mState_init is not None):
+            if cutlass.const_expr(cfg.use_initial_state):
                 have_state_h = seed_state
             else:
                 have_state_h = cutlass.Boolean(False)
@@ -1977,7 +1991,24 @@ def compute1_warp_group(
         else:
             h_vw = 16 // (mState_out.element_type.width // 8)
             h_dst = (mState_out.iterator + mState_out.layout((batch_idx, head_o, value_dim, 0))).raw_ptr()
-            if cutlass.const_expr(mState_init is not None):
+            if cutlass.const_expr(cfg.has_composed):
+                is_boundary = batch_idx == cutlass.Int32(0)
+                composed_src = (mComposed.iterator + mComposed.layout((cutlass.Int32(0), head_o, value_dim, 0))).raw_ptr()
+                if cutlass.const_expr(cfg.state_table):
+                    seed_vw = 16 // (mState_init.element_type.width // 8)
+                    seed_src = (mState_init.iterator + mState_init.layout((batch_idx, head_o, value_dim, 0))).raw_ptr()
+                for g in cutlass.range_constexpr(cfg.d_k // 4):
+                    composed_chunk = (composed_src + g * 4).load(count=4, alignment=16)
+                    if cutlass.const_expr(cfg.state_table):
+                        table_chunk = (seed_src + g * 4).load(count=4, alignment=16)
+                    for t in cutlass.range_constexpr(4):
+                        pass_val = cutlass.Float32(0.0)
+                        if cutlass.const_expr(cfg.state_table):
+                            pass_val = table_chunk[t].to(cutlass.Float32)
+                        pass_val = composed_chunk[t] if is_boundary else pass_val
+                        if row_valid_h:
+                            (h_dst + g * 4 + t).store(pass_val.to(mState_out.element_type))
+            elif cutlass.const_expr(cfg.use_initial_state):
                 seed_vw = 16 // (mState_init.element_type.width // 8)
                 seed_src = (mState_init.iterator + mState_init.layout((batch_idx, head_o, value_dim, 0))).raw_ptr()
                 for g in cutlass.range_constexpr(cfg.d_k // seed_vw):
@@ -2165,6 +2196,7 @@ def host(
     beta: cute.Tensor,
     cu_seqlens: cute.Tensor,
     initial_state: cute.Tensor | None,
+    composed: cute.Tensor | None,
     final_state: cute.Tensor,
     transition: cute.Tensor,
     work_items: cute.Tensor,
@@ -2195,6 +2227,7 @@ def host(
             beta,
             cu_seqlens,
             initial_state,
+            composed,
             final_state,
             transition,
             work_items,
@@ -2224,6 +2257,7 @@ def frost_kda_summary(
     mBeta: cute.Tensor,
     cu_seqlens: cute.Tensor,
     mState_init: cute.Tensor | None,
+    mComposed: cute.Tensor | None,
     mState_out: cute.Tensor,
     mTransition: cute.Tensor,
     mWorkItems: cute.Tensor,
@@ -2472,6 +2506,7 @@ def frost_kda_summary(
             mState_out,
             mTransition,
             mState_init,
+            mComposed,
             sBeta_raw,
             sV_raw,
             sGate_exchange_raw,
@@ -2496,6 +2531,8 @@ class KdaSummaryCfg:
     max_active_clusters: int
     d_k: int
     d_v: int
+    state_table: bool = True
+    has_composed: bool = False
     scheduler_stages: int = CFG.SMEM_SCHEDULER_STAGES
 
     compute_group_0_warp_ids: tuple[int, ...] = CFG.COMPUTE_GROUP_0_WARP_IDS
@@ -2578,13 +2615,19 @@ def build_cfg(
     max_active_clusters: int,
     d_k: int,
     d_v: int,
+    state_table: bool | None = None,
+    has_composed: bool = False,
 ) -> KdaSummaryCfg:
     """Build the per-compile ``KdaSummaryCfg`` (io_dtype in {Float16, BFloat16});
     fills the derived TMEM column offsets and SMEM buffer cosizes."""
+    state_table = use_initial_state if state_table is None else bool(state_table)
+    has_composed = bool(has_composed)
     cfg = KdaSummaryCfg(
         io_dtype=io_dtype,
         gate_dtype=gate_dtype,
         use_initial_state=use_initial_state,
+        state_table=state_table,
+        has_composed=has_composed,
         l2norm=l2norm,
         safe_gate=safe_gate,
         gate_scale_log2=gate_scale_log2,
@@ -2676,6 +2719,7 @@ def get_compiled_cache(
     beta_sigmoid: bool,
     allow_neg_eigval: bool,
     run_order: bool,
+    has_composed: bool = False,
 ):
     """Return a mutable dict that lazily stores the compiled kernel."""
     return {}
@@ -2703,6 +2747,9 @@ def compile(
     beta_cute,
     cu_seqlens_cute,
     state_in_cute,
+    composed_cute=None,
+    state_table=None,
+    has_composed=False,
     state_out_cute,
     transition_cute,
     work_items_cute,
@@ -2716,6 +2763,8 @@ def compile(
         io_dtype,
         gate_dtype,
         use_initial_state=use_initial_state,
+        state_table=state_table,
+        has_composed=has_composed,
         l2norm=l2norm,
         safe_gate=safe_gate,
         gate_scale_log2=gate_scale_log2,
@@ -2738,6 +2787,7 @@ def compile(
         beta_cute,
         cu_seqlens_cute,
         state_in_cute,
+        composed_cute,
         state_out_cute,
         transition_cute,
         work_items_cute,
@@ -2777,6 +2827,7 @@ def chunk_kda_summary(
     num_sm: int,
     stream,
     own_prologue: bool = True,
+    composed=None,
 ) -> None:
     """BT=16 fused KDA state summary: one launch writes H (``output_state``, fp32; ``initial_state`` or zero on an empty
     sequence) and M (``output_transition``, fp32, stored domain ``M_buf = M^T`` with ``X_final = X_init @ M_buf + X_H``; identity on
@@ -2797,7 +2848,9 @@ def chunk_kda_summary(
         raise ValueError(f"output_transition must be (num_seqs, HO, DK, DK), got {tuple(output_transition.shape)}")
     if work_items is None or work_count is None or scheduler_counter is None:
         raise ValueError("work_items, work_count and scheduler_counter are required")
-    use_initial_state = initial_state is not None
+    state_table = initial_state is not None
+    has_composed = composed is not None
+    use_initial_state = state_table or has_composed
     run_order = order_in_prologue
     if run_order and scheduler_all is None:
         raise ValueError("order in the prologue requires scheduler_all (the prologue zeroes the scheduler rings)")
@@ -2830,6 +2883,7 @@ def chunk_kda_summary(
         use_beta_sigmoid,
         allow_neg_eigval,
         run_order,
+        has_composed=has_composed,
     )
 
     if "compiled" not in cache:
@@ -2844,8 +2898,11 @@ def chunk_kda_summary(
         cu_seqlens_cute = from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic()
 
         state_in_cute = None
-        if use_initial_state:
+        if state_table:
             state_in_cute = from_dlpack(initial_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        composed_cute = None
+        if has_composed:
+            composed_cute = from_dlpack(composed, assumed_align=16).mark_layout_dynamic(leading_dim=3)
         state_out_cute = from_dlpack(output_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
         transition_cute = from_dlpack(output_transition, assumed_align=16).mark_layout_dynamic(leading_dim=3)
 
@@ -2878,6 +2935,9 @@ def chunk_kda_summary(
             beta_cute=beta_cute,
             cu_seqlens_cute=cu_seqlens_cute,
             state_in_cute=state_in_cute,
+            composed_cute=composed_cute,
+            state_table=state_table,
+            has_composed=has_composed,
             state_out_cute=state_out_cute,
             transition_cute=transition_cute,
             work_items_cute=work_items_cute,
@@ -2938,7 +2998,8 @@ def chunk_kda_summary(
         dt_bias,
         beta,
         cu_seqlens,
-        initial_state if use_initial_state else None,
+        initial_state if state_table else None,
+        composed if has_composed else None,
         output_state,
         output_transition,
         work_items,
@@ -2969,6 +3030,7 @@ def run_summary(
     tensormap_workspace,
     stream,
     own_prologue=True,
+    composed=None,
 ) -> None:
     """Replay the compiled plan: the prologue launch, then the main launch.  The plan validated the contract at build,
     so nothing here raises."""
@@ -2994,6 +3056,7 @@ def run_summary(
         beta,
         cu_seqlens,
         initial_state,
+        composed,
         output_state,
         output_transition,
         work_items,

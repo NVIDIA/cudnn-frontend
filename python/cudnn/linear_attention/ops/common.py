@@ -205,6 +205,50 @@ def make_summary_cache_key(
     )
 
 
+def check_composed_summaries(op, state_name, transition_name, state_update, transition, state_shape, transition_shape, device) -> int:
+    """Validate one direction's composed context-parallel summaries, the summary ops' fp32 outputs over the preceding
+    or following ranks stacked as ``[P, *state_shape]`` and ``[P, *transition_shape]``, and return the rank count ``P``;
+    both ``None`` or a zero-length pair (a rank with no preceding or following ranks) is 0.  The graph declares both
+    ports from ``P`` and the state geometry, so the buffers' own rank count, shapes and dtype are checked here; their
+    layout is the plan's dense-layout check at execute."""
+    if (state_update is None) != (transition is None):
+        raise ValueError(f"{op}: {state_name} and {transition_name} come together")
+    if state_update is None:
+        return 0
+    if state_update.dtype != torch.float32 or transition.dtype != torch.float32:
+        raise TypeError(f"{op}: {state_name} and {transition_name} must be float32 (the summary ops' outputs); got {state_update.dtype} and {transition.dtype}")
+    if state_update.shape[0] != transition.shape[0]:
+        raise ValueError(
+            f"{op}: {state_name} and {transition_name} must carry the same rank count; got {tuple(state_update.shape)} and {tuple(transition.shape)}"
+        )
+    if state_update.shape[0] == 0:
+        return 0
+    if tuple(state_update.shape[1:]) != tuple(state_shape):
+        raise ValueError(f"{op}: {state_name} must be [P, {', '.join(str(d) for d in state_shape)}]; got {tuple(state_update.shape)}")
+    if tuple(transition.shape[1:]) != tuple(transition_shape):
+        raise ValueError(f"{op}: {transition_name} must be [P, {', '.join(str(d) for d in transition_shape)}]; got {tuple(transition.shape)}")
+    for name, t in ((state_name, state_update), (transition_name, transition)):
+        if t.device != device:
+            raise ValueError(f"{op}: {name} must be on the op's device ({device}); got {t.device}")
+    return int(state_update.shape[0])
+
+
+def check_composed_state(op, composed, state_shape, device):
+    """The forward's one-row composed boundary state handed to the backward: fp32 ``[1, *state_shape]`` on ``device``,
+    None when absent or zero-size (a rank with no preceding summaries)."""
+    if composed is None or composed.numel() == 0:
+        return None
+    if composed.dtype != torch.float32:
+        raise TypeError(f"{op}: composed_initial_state must be float32; got {composed.dtype}")
+    if tuple(composed.shape) != (1, *state_shape):
+        raise ValueError(
+            f"{op}: composed_initial_state must be [1, {', '.join(str(d) for d in state_shape)}] (the forward's one-row composed state); got {tuple(composed.shape)}"
+        )
+    if composed.device != device:
+        raise ValueError(f"{op}: composed_initial_state must be on the op's device ({device}); got {composed.device}")
+    return composed.contiguous()
+
+
 def summary_setup_context(ctx, inputs, output):
     """Mark summary outputs as non-differentiable for the torch autograd wrapper."""
     ctx.set_materialize_grads(False)

@@ -1879,6 +1879,7 @@ def compute1_warp_group(
     sO,
     sCheckpoint_raw,
     mState_init,
+    mComposed,
     mState_out,
     mSeedIndices,
     mFinalIndices,
@@ -1970,17 +1971,32 @@ def compute1_warp_group(
             checkpoint_mod = compute_start % checkpoint_chunks
         if n_local > 0:
             if cutlass.const_expr(cfg.use_initial_state):
-                gState_init = mState_init[None, None, head_o, seed_row]
+                if cutlass.const_expr(cfg.state_table):
+                    gState_init = mState_init[None, None, head_o, seed_row]
                 seed_state = compute_start == 0
                 if seed_state:
-                    seed_vw = 16 // (mState_init.element_type.width // 8)
-                    seed_src = (gState_init.iterator + gState_init.layout((state_gmem_row + v_offset, 0))).raw_ptr()
+                    if cutlass.const_expr(cfg.state_table):
+                        seed_vw = 16 // (mState_init.element_type.width // 8)
+                        seed_src = (gState_init.iterator + gState_init.layout((state_gmem_row + v_offset, 0))).raw_ptr()
+                    if cutlass.const_expr(cfg.has_composed):
+                        is_boundary = batch_idx == cutlass.Int32(0)
+                        gComposed = mComposed[None, None, head_o, cutlass.Int32(0)]
+                        composed_src = (gComposed.iterator + gComposed.layout((state_gmem_row + v_offset, 0))).raw_ptr()
                     for i in cutlass.range_constexpr(num_ldtms):
                         words = []
-                        for g in cutlass.range_constexpr(ldtm_width // seed_vw):
-                            seed_chunk = (seed_src + i * ldtm_width + g * seed_vw).load(count=seed_vw, alignment=16)
-                            for t in cutlass.range_constexpr(seed_vw):
-                                words.append(seed_chunk[t].to(cfg.acc_dtype))
+                        if cutlass.const_expr(cfg.state_table):
+                            for g in cutlass.range_constexpr(ldtm_width // seed_vw):
+                                seed_chunk = (seed_src + i * ldtm_width + g * seed_vw).load(count=seed_vw, alignment=16)
+                                for t in cutlass.range_constexpr(seed_vw):
+                                    words.append(seed_chunk[t].to(cfg.acc_dtype))
+                        else:
+                            for t in cutlass.range_constexpr(ldtm_width):
+                                words.append(cutlass.Float32(0.0))
+                        if cutlass.const_expr(cfg.has_composed):
+                            for g in cutlass.range_constexpr(ldtm_width // 4):
+                                composed_chunk = (composed_src + i * ldtm_width + g * 4).load(count=4, alignment=16)
+                                for t in cutlass.range_constexpr(4):
+                                    words[g * 4 + t] = composed_chunk[t] if is_boundary else words[g * 4 + t]
                         nvvm.tcgen05_st(
                             "32x32b",
                             nvvm.make_tmem_ptr(row_lo_addr + tmem_state_col + i * ldtm_width, cutlass.Float32),
@@ -2356,13 +2372,23 @@ def compute1_warp_group(
                         final_row = cutlass.Int32(mFinalIndices[final_dst])
                     gState_out = mState_out[None, None, head_o, final_row]
                     if cutlass.const_expr(cfg.use_initial_state):
-                        gState_in = mState_init[None, None, head_o, seed_row]
+                        if cutlass.const_expr(cfg.state_table):
+                            gState_in = mState_init[None, None, head_o, seed_row]
+                        if cutlass.const_expr(cfg.has_composed):
+                            is_boundary = batch_idx == cutlass.Int32(0)
+                            gComposed = mComposed[None, None, head_o, cutlass.Int32(0)]
                         for i in cutlass.range_constexpr(num_ldtms):
                             for k in cutlass.range_constexpr(32):
                                 if state_row_valid:
-                                    seed_val = gState_in[state_gmem_row + v_offset, i * ldtm_width + k]
-                                    if cutlass.const_expr(mState_init.element_type != mState_out.element_type):
-                                        seed_val = seed_val.to(mState_out.element_type)
+                                    if cutlass.const_expr(cfg.state_table):
+                                        seed_val = gState_in[state_gmem_row + v_offset, i * ldtm_width + k]
+                                        if cutlass.const_expr(mState_init.element_type != mState_out.element_type):
+                                            seed_val = seed_val.to(mState_out.element_type)
+                                    else:
+                                        seed_val = cutlass.Float32(0.0).to(mState_out.element_type)
+                                    if cutlass.const_expr(cfg.has_composed):
+                                        composed_val = gComposed[state_gmem_row + v_offset, i * ldtm_width + k].to(mState_out.element_type)
+                                        seed_val = composed_val if is_boundary else seed_val
                                     gState_out[state_gmem_row + v_offset, i * ldtm_width + k] = seed_val
                     else:
                         for i in cutlass.range_constexpr(num_ldtms):
@@ -2680,6 +2706,7 @@ def host(
     o: Optional[cute.Tensor],
     cu_seqlens: cute.Tensor,
     state_in: Optional[cute.Tensor],
+    composed: Optional[cute.Tensor],
     state_out: Optional[cute.Tensor],
     seed_indices: Optional[cute.Tensor],
     final_indices: Optional[cute.Tensor],
@@ -2715,6 +2742,14 @@ def host(
             cute.make_layout(
                 (state_in.shape[2], state_in.shape[3], state_in.shape[1], state_in.shape[0]),
                 stride=(state_in.stride[2], state_in.stride[3], state_in.stride[1], state_in.stride[0]),
+            ),
+        )
+    if cutlass.const_expr(composed is not None):
+        composed = cute.make_tensor(
+            composed.iterator,
+            cute.make_layout(
+                (composed.shape[2], composed.shape[3], composed.shape[1], composed.shape[0]),
+                stride=(composed.stride[2], composed.stride[3], composed.stride[1], composed.stride[0]),
             ),
         )
     if cutlass.const_expr(state_out is not None):
@@ -2764,6 +2799,7 @@ def host(
         beta,
         cu_seqlens,
         state_in,
+        composed,
         state_out,
         seed_indices,
         final_indices,
@@ -2803,6 +2839,7 @@ def frost_gdn_prefill(
     mBeta: Optional[cute.Tensor],
     cu_seqlens: cute.Tensor,
     mState_init: Optional[cute.Tensor],
+    mComposed: Optional[cute.Tensor],
     mState_out: Optional[cute.Tensor],
     mSeedIndices: Optional[cute.Tensor],
     mFinalIndices: Optional[cute.Tensor],
@@ -3106,6 +3143,7 @@ def frost_gdn_prefill(
             sO=sO,
             sCheckpoint_raw=sCheckpoint_raw,
             mState_init=mState_init,
+            mComposed=mComposed,
             mState_out=mState_out,
             mSeedIndices=mSeedIndices,
             mFinalIndices=mFinalIndices,
@@ -3237,6 +3275,8 @@ class GdnPrefillCfg:
     allow_neg_eigval: bool = False
     tinv_source: str = "compute"
     tiles_per_head: int = 1
+    state_table: bool = True
+    has_composed: bool = False
     scheduler_stages: int = CFG.SMEM_SCHEDULER_STAGES
 
     # ---- fixed constants stamped from CFG at build time ------------------------------
@@ -3325,6 +3365,8 @@ def build_cfg(
     v_slots: int = 1,
     beta_slots: int = 1,
     tiles_per_head: int = 1,
+    state_table: Optional[bool] = None,
+    has_composed: bool = False,
 ) -> GdnPrefillCfg:
     """Build the per-compile ``GdnPrefillCfg`` (io_dtype in {Float16, BFloat16}; acc is
     always Float32).  ``tinv_source`` "compute" builds the chunk factor in compute
@@ -3338,6 +3380,8 @@ def build_cfg(
         state_dtype=state_dtype,
         max_active_clusters=max_active_clusters,
         use_initial_state=use_initial_state,
+        state_table=use_initial_state if state_table is None else bool(state_table),
+        has_composed=bool(has_composed),
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
         log_gate=log_gate,
