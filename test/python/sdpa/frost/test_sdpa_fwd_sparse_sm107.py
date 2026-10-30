@@ -3768,7 +3768,9 @@ def _launch_thd_paged(inp, lens_q, lens_kv, top_k, scale, P, *, cu_q=False, laun
 def _dense_paged_rows(inp, b, lo, hi, L, top_k, scale, P, *, lens_present=True):
     """The CONTROL of one sequence: the dense paged BOTTOM-RIGHT per-row run of its ``q_len_b`` rows -- ``Q [1, q_len_b, H, D]`` the packed rows
     (a view at the packed strides), the same pools, the sequence's table row as a contiguous ``[1, max_pages]`` table, its own lists and KV
-    length; sentinel-filled O / LSE ``[1, q_len_b, H, D]`` / ``[1, H, q_len_b]``."""
+    length; sentinel-filled O / LSE ``[1, q_len_b, H, D]`` / ``[1, H, q_len_b]``.  The tcgen05 core pinned by name (``tile_form="tcgen05"``,
+    this module's convention): under ``"auto"`` the measured part takes the LEAN tile at one row per sequence, whose split would need the
+    partials workspace -- and the lean body is another arithmetic, never the bitwise control of the core's packed rendering."""
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
 
     q = inp["q"][:, lo:hi]
@@ -3792,8 +3794,9 @@ def _dense_paged_rows(inp, b, lo, hi, L, top_k, scale, P, *, lens_present=True):
         page_size=P,
         block_table=inp["table"][b : b + 1].contiguous(),
         bottom_right=True,
+        tile_form="tcgen05",
     )
-    assert a.check_support() and not a.template_params().thd_varlen
+    assert a.check_support() and not a.template_params().thd_varlen and a.tile_form == "tcgen05" and a.split_kv == 1
     a.compile()
     a.execute(stream=_stream())
     torch.cuda.synchronize()

@@ -43,6 +43,7 @@ the replay bitwise eager and over a NEW packing bitwise its eager twin; two laun
 import contextlib
 import os
 import sys
+import types
 
 import pytest
 import torch
@@ -121,6 +122,19 @@ def _geom(geom_kw, top_k=512, index_band=False, index_list_form=None, index_sour
 
 def _row(name):
     return next(r for r in _EXTEND_DECLINES if r[0] == name)
+
+
+def _dense_reference(h_full, w_qkvg_dense, w_q_norm, w_k_norm, cos_t, sin_t, w_o, ref_geom):
+    """The dense block reference over ONE sequence's full history: its post-norm / post-RoPE ``q`` / ``k`` / ``v`` and pre-sigmoid ``gate``
+    rows (the only outputs the step oracle reads; the attention is recomputed per row through the visible mask).  A ONE-token history is
+    computed on two rows and sliced to the first: the per-row stages are bitwise independent of the second row, and the reference's own
+    attention would otherwise issue a ``K = 1`` batched matmul that torch routes to a Triton outer-product kernel whose bundled ptxas does not
+    know every part this suite runs on."""
+    L = int(h_full.shape[1])
+    if L >= 2:
+        return gated_attention_block_reference(h_full, w_qkvg_dense, w_q_norm, w_k_norm, cos_t[:, :L], sin_t[:, :L], w_o, ref_geom)
+    ref = gated_attention_block_reference(h_full.repeat(1, 2, 1), w_qkvg_dense, w_q_norm, w_k_norm, cos_t[:, :2], sin_t[:, :2], w_o, ref_geom)
+    return types.SimpleNamespace(q=ref.q[:, :1], k=ref.k[:, :1], v=ref.v[:, :1], gate=ref.gate[:, :1])
 
 
 @contextlib.contextmanager
@@ -513,9 +527,7 @@ class _PackedCase:
             pages = self.pages[b]
             self.block_table[p, : len(pages)] = torch.tensor(pages, dtype=torch.int32, device=_DEV)
             h_full = randn(gb, 1, L, d_model, std=1.0)
-            ref = gated_attention_block_reference(
-                h_full, w_qkvg[:n_dense], self.w["w_q_norm"], self.w["w_k_norm"], cos_t[:, :L], sin_t[:, :L], self.w["w_o"], ref_geom
-            )
+            ref = _dense_reference(h_full, w_qkvg[:n_dense], self.w["w_q_norm"], self.w["w_k_norm"], cos_t, sin_t, self.w["w_o"], ref_geom)
             self.ref_rows[b] = ref
             pos = torch.arange(q, device=_DEV) + (L - q)
             live = pos >= 0
@@ -724,7 +736,7 @@ def _two_launches(case: _PackedCase, what: str):
     return case.check(what=what)
 
 
-def _dense_control(case: _PackedCase, members, *, split=None, index_list_form="per_row"):
+def _dense_control(case: _PackedCase, members, *, split=None, index_list_form="per_row", sparse_tile_form=None):
     """The TWO-RUN form's control for the packing positions ``members`` (all of one Q length ``S``): a DENSE ``[B_g, S]`` paged QsaSpec block
     over the SAME weights, pools (restored to the prefix-only state first), table rows (a contiguous copy), lists, lengths and slots, with
     the per-row list form (the packed form's) and ``decode_split_kv=split`` (``None`` = the fill rule the block resolves; read back by the
@@ -762,6 +774,8 @@ def _dense_control(case: _PackedCase, members, *, split=None, index_list_form="p
         return_lse=case.return_lse,
         decode_split_kv=split,
     )
+    if sparse_tile_form is not None:
+        kw["sparse_tile_form"] = sparse_tile_form  # the body pinned (the census control); None = the block's "auto" as a stack would declare it
     blk = GatedAttentionBlockFwd(h, case.w["w_qkvg"], case.w["w_q_norm"], case.w["w_k_norm"], cos, sin, case.w["w_o"], out, geom_c, **kw)
     assert isinstance(blk._sdpa, _SparseSdpa) and not blk._sdpa.thd and blk._sdpa.paged and not blk.qsa_shared_list
     assert blk.check_support()
@@ -814,9 +828,28 @@ def _same_slab_route(a: GatedAttentionBlockFwd, b: GatedAttentionBlockFwd) -> bo
 
 
 def _parity_class(case: _PackedCase, ctl) -> str:
-    """The class the RESOLUTION predicts for a control group (CRITIQUE G2): ``"bitwise"`` iff the control runs the sparse core unsplit (its
-    resolved ``decode_split_kv`` read back) AND its slab took the packed block's projection route; ``"reading_b"`` otherwise."""
-    return "bitwise" if (ctl["blk"].decode_split_kv == 1 and _same_slab_route(case.blk, ctl["blk"])) else "reading_b"
+    """The class the RESOLUTION predicts for a control group: ``"bitwise"`` iff the control runs the TCGEN05 core unsplit (its resolved body
+    and ``decode_split_kv`` read back; the lean tile the measured part picks for one-row sequences is another arithmetic) AND its slab took
+    the packed block's projection route; ``"reading_b"`` otherwise."""
+    c = ctl["blk"]
+    return "bitwise" if (c.decode_split_kv == 1 and c.sparse_tile == SPARSE_TILE_TCGEN05 and _same_slab_route(case.blk, c)) else "reading_b"
+
+
+def _predicted_split(case: _PackedCase, ctl, n_b: int, q: int) -> int:
+    """The split the block's rule predicts for the control's RESOLVED body at this device's SM count (the tcgen05 fill / wave rule, or the lean
+    split of the resolved ``k``), never a hard-coded number."""
+    c = ctl["blk"]
+    sm = torch.cuda.get_device_properties(0).multi_processor_count
+    return sparse_decode_split_choice(
+        batch=n_b,
+        h_kv=case.geom.h_kv,
+        s_q=q,
+        top_k=case.top_k,
+        sm_count=sm,
+        tile_form=c.sparse_tile_form,
+        sub_tiles_per_cta=c.sparse_sub_tiles_per_cta,
+        group=case.geom.gqa_ratio,
+    )
 
 
 def _assert_parity(case: _PackedCase, ctl, cls: str, what: str, *, packed=None):
@@ -839,7 +872,10 @@ def _assert_parity(case: _PackedCase, ctl, cls: str, what: str, *, packed=None):
                     assert float((lse[0, :, lo:hi][:, lv] - ctl["lse"][i][:, lv]).abs().max()) <= ATOL, f"{what}: position {p} LSE vs the two-run control"
             if (~lv).any():
                 assert (po[~lv] == 0).all() and (co[~lv] == 0).all()
-    print(f"\n{what}: class {cls} (control split {ctl['blk'].decode_split_kv}, control M {ctl['blk']._proj.m}, packed M {case.blk._proj.m})")
+    print(
+        f"\n{what}: class {cls} (control body {ctl['blk'].sparse_tile_form} split {ctl['blk'].decode_split_kv}, control M {ctl['blk']._proj.m}, "
+        f"packed M {case.blk._proj.m})"
+    )
 
 
 def _groups(case: _PackedCase):
@@ -919,7 +955,8 @@ def test_packed_sparse_extend_matches_the_two_run_form_per_sequence(name, geom_k
     for q, members in sorted(_groups(case).items()):
         ctl = _dense_control(case, members)
         cls = _parity_class(case, ctl)
-        classes[q] = (cls, ctl["blk"].decode_split_kv)
+        classes[q] = (cls, ctl["blk"].decode_split_kv, ctl["blk"].sparse_tile_form)
+        assert ctl["blk"].decode_split_kv == _predicted_split(case, ctl, len(members), q), (q, ctl["blk"].decode_split_kv, ctl["blk"].sparse_tile_form)
         _assert_parity(case, ctl, cls, f"{name}: group S_q={q} vs the two-run control (resolved split {ctl['blk'].decode_split_kv})", packed=packed)
         if cls == "bitwise":
             pinned = _dense_control(case, members, split=1)
@@ -938,13 +975,8 @@ def test_packed_sparse_extend_matches_the_two_run_form_per_sequence(name, geom_k
                 assert torch.equal(_bits(case.k_cache[s_ // page, :, s_ % page, :]), k_now) and torch.equal(
                     _bits(case.v_cache[s_ // page, :, s_ % page, :]), v_now
                 )
-    # the step's chunk (the longest Q length) must be the bitwise class whenever its control resolves split 1 on the same route -- the
-    # P1 design's claim; the decode groups are the budget class by construction (the small-M route and the fill rule's split)
-    sm = torch.cuda.get_device_properties(0).multi_processor_count
-    for q, (cls, split) in classes.items():
-        n_b = len(_groups(case)[q])
-        predicted = sparse_decode_split_choice(batch=n_b, h_kv=case.geom.h_kv, s_q=q, top_k=case.top_k, sm_count=sm)
-        assert split == predicted, f"group S_q={q}: the control resolved split {split}, the rule says {predicted} at {sm} SMs"
+    # the step's chunk (the longest Q length) is the bitwise class whenever its control resolves the core at split 1 on the same route; the
+    # decode groups are the budget class by construction (the small-M route, the fill rule's split or the lean tile at one row per sequence)
     print(f"\n{name}: classes per group {classes}")
 
 
@@ -957,11 +989,15 @@ def test_packed_sparse_extend_fill_rule_boundary_cells_assert_their_class():
     sm = torch.cuda.get_device_properties(0).multi_processor_count
     rows = []
     for T in (300, 128, 64):
-        split = sparse_decode_split_choice(batch=1, h_kv=2, s_q=T, top_k=512, sm_count=sm)
         case = _PackedCase(GEOM_SMALL, [(T, T + 2051), (1, 4097)], seed=23 + T)
         _two_launches(case, f"boundary T={T}")
         ctl = _dense_control(case, [0])
-        assert ctl["blk"].decode_split_kv == split, (T, ctl["blk"].decode_split_kv, split)
+        split = _predicted_split(case, ctl, 1, T)
+        assert ctl["blk"].decode_split_kv == split and ctl["blk"].sparse_tile == SPARSE_TILE_TCGEN05, (
+            T,
+            ctl["blk"].decode_split_kv,
+            ctl["blk"].sparse_tile_form,
+        )
         cls = _parity_class(case, ctl)
         expect = "bitwise" if (split == 1 and (T > SMALL_M_MAX) == (case.T_live > SMALL_M_MAX)) else "reading_b"
         assert cls == expect, (T, cls, expect)
@@ -1119,23 +1155,30 @@ def test_packed_sparse_extend_workspace_is_honest_and_the_execute_path_allocates
     chunk = _PackedCase(GEOM_SMALL, [(300, 2351)], seed=43)
     chunk.compile()
     chunk.run()
-    ctl = _dense_control(chunk, [0], split=1)
+    ctl = _dense_control(chunk, [0], split=1, sparse_tile_form="tcgen05")
     k_pk, m_pk = _cupti_kernels(lambda: chunk.execute())
     ctl_blk = ctl["blk"]
+    # the control's operands built OUTSIDE the profiled call (a stack / zeros inside it would be the harness's memcpys, not the block's)
+    h_c = torch.stack([chunk.h[lo:hi] for lo, hi in chunk.rows])
+    cos_c = torch.stack([chunk.cos[lo:hi] for lo, hi in chunk.rows])
+    sin_c = torch.stack([chunk.sin[lo:hi] for lo, hi in chunk.rows])
+    ws_c = torch.zeros(ctl_blk.get_workspace_size(), dtype=torch.uint8, device=_DEV)
+    ids_c, lens_c = chunk.block_ids[None].contiguous(), chunk.block_lens[None].contiguous()
+    torch.cuda.synchronize()
     k_ct, m_ct = _cupti_kernels(
         lambda: ctl_blk.execute(
-            torch.stack([chunk.h[lo:hi] for lo, hi in chunk.rows]),
+            h_c,
             chunk.w["w_qkvg"],
             chunk.w["w_q_norm"],
             chunk.w["w_k_norm"],
-            torch.stack([chunk.cos[lo:hi] for lo, hi in chunk.rows]),
-            torch.stack([chunk.sin[lo:hi] for lo, hi in chunk.rows]),
+            cos_c,
+            sin_c,
             chunk.w["w_o"],
             ctl["out"],
-            torch.zeros(ctl_blk.get_workspace_size(), dtype=torch.uint8, device=_DEV),
+            ws_c,
             lse=ctl["lse"],
-            block_ids=chunk.block_ids[None],
-            block_lens=chunk.block_lens[None],
+            block_ids=ids_c,
+            block_lens=lens_c,
             k_cache=chunk.k_cache,
             v_cache=chunk.v_cache,
             block_table=chunk.block_table,
