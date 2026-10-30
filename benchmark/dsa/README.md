@@ -301,10 +301,10 @@ Inputs are flat MQA tensors: `q (S_q, H, d_qk)`, a shared
 reference so that this benchmark isolates backward and does not include a
 forward launch.
 
-Each timed iteration is one full wrapper call — gradient-buffer zeroing,
-workspace allocation, and the preprocess/backward/convert kernels — i.e. the
-cost a training step pays per backward invocation. Timing uses a single
-CUDA-event window around `--repeat` iterations and reports the average.
+The benchmark allocates the compiled plan, gradient buffers, and workspace
+during setup. Each timed iteration reuses those buffers and executes the
+compiled backward plan. Timing uses a single CUDA-event window around
+`--repeat` iterations and reports the average.
 
 Reported TFLOPS use the 5-matmul model of the backward pass (recompute S, dV,
 dP, dQ, dK):
