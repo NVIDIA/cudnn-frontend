@@ -859,8 +859,8 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_workspace_respects_ba
     [
         pytest.param(257, 65537, 64, id="partial-wave-one-head-block"),
         pytest.param(385, 65543, 96, id="partial-wave-two-head-blocks"),
-        pytest.param(8191, 65537, 64, id="cluster8-policy-boundary"),
-        pytest.param(8192, 65537, 64, id="cluster4-policy-boundary"),
+        pytest.param(2047, 65537, 64, id="cluster8-policy-boundary"),
+        pytest.param(2048, 65537, 64, id="cluster4-policy-boundary"),
         pytest.param(16384, 278528, 64, id="one-million-cp64"),
         pytest.param(16384, 1048576, 64, id="memory-first-cluster16"),
     ],
