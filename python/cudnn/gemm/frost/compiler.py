@@ -1078,9 +1078,9 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
             return decline("scale factors without a block size")
         renorm = tuple(
             (
-                (j, tuple(op.declared), op.declared_layout[0] if len(op.declared_layout[0]) == 3 else None, op.declared_layout[1])
+                (j, tuple(op.declared), op.declared_layout[0] if len(op.declared_layout[0]) == 3 else None, op.declared_layout[1], op.graph_order)
                 for j, op in enumerate(r.inputs)
-                if op.declared != backend.KERNEL_AXES
+                if op.graph_order or op.declared != backend.KERNEL_AXES
             )
         )
         stride_ins = r.stride_ins
@@ -1104,6 +1104,8 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
             (o.index for o in r.outputs if o.role.startswith("quant_scale_") and self.chain.quants[int(o.role.rsplit("_", 1)[1])].scale_reorder == "F8_128x4")
         )
         mn_view_slots = (frozenset((o.index for o in r.outputs)) | frozenset((x.index for x in r.aux))) - packed_scale_slots
+        aux_views = {id(x.ref): x.transposed for x in r.aux}
+        tail = tuple((i, ref, (swap_ab ^ aux_views.get(id(ref), False)) if ref is not None else (swap_ab and i in mn_view_slots)) for i, ref in tail)
         if split_k_slices > 1:
             cta_k_elems = backend._cta_k_elems(self.chain, self.config)
         if needs_workspace:
@@ -1117,12 +1119,12 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
             """Validate resolved buffers and launch the already compiled GEMM plan."""
             backend._check_plan_device(device)
             vs = [operands[i] for i in in_slots]
-            for j, perm, dsh, dst in renorm:
+            for j, perm, dsh, dst, force_graph_order in renorm:
                 v = vs[j]
                 sh = v.shape
                 if len(sh) != 3:
                     continue
-                declared = bool(graph_order) and graph_order[in_slots[j]]
+                declared = force_graph_order or (bool(graph_order) and graph_order[in_slots[j]])
                 if not declared and dsh is not None:
                     declared = sh[0] == dsh[0] and sh[1] == dsh[1] and (sh[2] == dsh[2])
                     if declared:
@@ -1231,11 +1233,11 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                 *(v.permute(1, 2, 0) for v in vs),
                 *(
                     (
-                        (backend._swap_mn_view(operands[i]) if swap_ab and i in mn_view_slots else operands[i]).permute(1, 2, 0)
+                        (backend._swap_mn_view(operands[i]) if transpose_view else operands[i]).permute(1, 2, 0)
                         if ref is None
-                        else backend._reshape_aux_to_fake(backend._swap_mn_view(operands[i]) if swap_ab else operands[i], ref)
+                        else backend._reshape_aux_to_fake(backend._swap_mn_view(operands[i]) if transpose_view else operands[i], ref)
                     )
-                    for i, ref in tail
+                    for i, ref, transpose_view in tail
                 ),
                 *extra,
                 stream=backend._as_custream(stream),

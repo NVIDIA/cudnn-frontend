@@ -781,6 +781,13 @@ zero constant; subtract from a typed zero vector. Keep each graph node's compute
 `gemm/frost/test_matmul_mainloop_fusion.py::test_mainloop_int8_identity_preserves_signed_arithmetic`
 checks both operands, compute dtypes and B binding orders with exact comparisons.
 
+Operand transpose normalization must retain the original graph-input axis map,
+even when two transposes cancel. Equal M/N/K extents cannot identify the map;
+rebind unequal live extents and retain physical strides. Shared tensors can need
+different logical views but still have one caller binding. The host/native
+transport tests in `gemm/frost/test_matmul_transpose_mainloop.py` check these cases
+with raw addresses, ordered packs, overrides and swap-AB without copying storage.
+
 Named barriers inside warp-specific branches need unaligned sync and arrive
 instructions. CuTeDSL 4.8's `NamedBarrier.arrive_and_wait()` emits an aligned
 barrier, including through `TmemAllocator.wait_for_alloc()`. Check the launch

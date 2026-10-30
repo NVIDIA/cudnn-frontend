@@ -97,10 +97,11 @@ class Operand:
     declared_layout: tuple  # the (dim, stride) that order comes with
     dc: int  # where stride 1 lands in the graph's order
     kc: int  # ... and in the caller's
+    graph_order: bool = False  # normalized operands always bind in original graph-input coordinates
 
     def axes(self, shape, stride, graph_order: bool) -> "tuple | None":
         """Which axis holds which role, or None when the layout is not the major."""
-        if graph_order or (tuple(shape), tuple(stride)) == self.declared_layout:
+        if self.graph_order or graph_order or (tuple(shape), tuple(stride)) == self.declared_layout:
             return self.declared if stride[self.dc] == 1 else None
         return KERNEL_AXES if stride[self.kc] == 1 else None
 
@@ -148,6 +149,7 @@ class Aux:
     align: int
     ref: Any  # TensorRef, for the fake-shape reshape
     mainloop_scale: PerKScaleRule | None = None
+    transposed: bool = False
 
 
 @dataclass(frozen=True)
@@ -411,8 +413,12 @@ def _declared_layout(tensor) -> tuple:
         return (), ()
 
 
-def _operand(index: int, role: str, tensor, *, major: str, dtype: str, batch: int, is_b: bool, declared_is_b: bool | None = None) -> Operand:
+def _operand(
+    index: int, role: str, tensor, *, major: str, dtype: str, batch: int, is_b: bool, declared_is_b: bool | None = None, transposed=False, graph_order=False
+) -> Operand:
     declared = _DECLARED_AXES["b" if (is_b if declared_is_b is None else declared_is_b) else "a"]
+    if transposed:
+        declared = (declared[0], declared[2], declared[1])
     contiguous = AX_K if major == "k" else AX_MN
     modulus, pack = contiguous_modulus(dtype, contiguous == AX_K)
     return Operand(
@@ -429,6 +435,7 @@ def _operand(index: int, role: str, tensor, *, major: str, dtype: str, batch: in
         declared=declared,
         dc=declared[contiguous],
         kc=KERNEL_AXES[contiguous],
+        graph_order=graph_order,
     )
 
 
@@ -452,6 +459,8 @@ def build(compiled) -> GemmRecipe:
             batch=mm.a_batch,
             is_b=False,
             declared_is_b=swap_ab,
+            transposed=bool(binding.a_transposed and binding.a_transposed[i]),
+            graph_order=bool(binding.a_transposed),
         )
         for i, t in enumerate(binding.a_operands)
     ] + [
@@ -464,6 +473,8 @@ def build(compiled) -> GemmRecipe:
             batch=mm.b_batch,
             is_b=True,
             declared_is_b=not swap_ab,
+            transposed=bool(binding.b_transposed and binding.b_transposed[i]),
+            graph_order=bool(binding.b_transposed),
         )
         for i, t in enumerate(binding.b_operands)
     ]
@@ -489,7 +500,14 @@ def build(compiled) -> GemmRecipe:
         )
 
     aux = tuple(
-        Aux(index=order[id(t)], role=f"aux {compiled.aux_names[i]!r}", align=aux_reqs[compiled.aux_names[i]], ref=ref, mainloop_scale=_per_k_rule(ref, swap_ab))
+        Aux(
+            index=order[id(t)],
+            role=f"aux {compiled.aux_names[i]!r}",
+            align=aux_reqs[compiled.aux_names[i]],
+            ref=ref,
+            mainloop_scale=_per_k_rule(ref, swap_ab ^ bool(binding.aux_transposed and binding.aux_transposed[i])),
+            transposed=bool(binding.aux_transposed and binding.aux_transposed[i]),
+        )
         for i, (t, ref) in enumerate(zip(binding.aux, chain.aux_tensors))
     )
     na = len(binding.a_operands)

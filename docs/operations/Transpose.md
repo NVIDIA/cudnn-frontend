@@ -8,6 +8,29 @@ On supported cuDNN versions, the graph lowers to the backend **transpose** opera
 
 - Native backend transpose support requires **cuDNN 9.22.0** or newer. Older toolkits may report `GRAPH_NOT_SUPPORTED` for transpose nodes.
 
+## FROST GEMM operand views (Python)
+
+With `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`, the FROST GEMM provider can absorb rank-3 transposes with permutation `[0, 2, 1]`
+(or identity `[0, 1, 2]`) feeding a single plain matmul. Transposes may precede,
+follow or separate supported operand pointwise operations; successive transposes
+compose. For example, `transpose(relu(X))` is lowered as `relu` on a transposed
+input view, with no transpose kernel or intermediate storage.
+
+Each pointwise node keeps its compute dtype, output dtype, attributes and rounding
+boundary. Transpose itself preserves dtype. Bind the **original graph inputs** in
+their declared coordinates, including when supplying raw addresses or live
+shape/stride overrides. No caller-side transpose or contiguous conversion is needed.
+Scalar and supported per-K operands are projected into the same coordinates.
+Existing GEMM layout, alignment, architecture and pointwise support gates still apply.
+
+This lowering does not require the backend transpose descriptor, but it requires
+a supported FROST GEMM engine. It rejects materialized operand intermediates,
+epilogue/unrelated transposes, other ranks/permutations, dtype-changing transposes,
+MoE, block-scale dequantization and multi-GEMM graphs. General reshape normalization
+is not included.
+
+See the self-checking [transpose mainloop example](https://github.com/NVIDIA/cudnn-frontend/blob/develop/samples/frost/gemm/08_matmul_transpose_mainloop.py).
+
 ## C++ API
 
 ```cpp

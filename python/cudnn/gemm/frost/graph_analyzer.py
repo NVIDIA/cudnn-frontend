@@ -9,7 +9,7 @@ import logging
 from collections import deque
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
-from math import isfinite
+from math import isfinite, prod
 from typing import Any
 
 import cudnn
@@ -133,6 +133,7 @@ class _RecordedOp:
     op_attrs: tuple = ()  # pointwise scalar attrs (negative_slope/clips/swish_beta/axis)
     reduction_mode: str | None = None  # "add"/"amax"/"max"/"min"; None otherwise
     group_offset: int | None = None
+    permutation: tuple[int, ...] = ()
 
 
 @dataclass
@@ -149,6 +150,7 @@ class _TensorMeta:
     output_index: int | None = None
     explicit_dtype: Any = None
     dim_override: tuple[int, ...] | None = None
+    mn_transposed: bool | None = None  # None for ordinary bindings; bool for a normalized caller-axis view
 
 
 # Variant-pack binding — maps each graph role to its cuDNN tensor
@@ -168,6 +170,11 @@ class GemmBinding:
     token_index: Any = None
     token_ks: Any = None
     top_k_scores: Any = None
+    # Empty: historical graph/kernel-order binding. Nonempty: original graph axes,
+    # with the recorded M/N parity (including False when transposes cancel).
+    a_transposed: tuple[bool, ...] = ()
+    b_transposed: tuple[bool, ...] = ()
+    aux_transposed: tuple[bool, ...] = ()
 
     def bound_tensors(self) -> list[Any]:
         """List tensors bound by this GEMM plan."""
@@ -187,7 +194,8 @@ class GemmBinding:
             ts.append(self.token_ks)
         if self.top_k_scores is not None:
             ts.append(self.top_k_scores)
-        return [t for t in ts if t is not None]
+        # A shared input can occupy different roles/views but has one caller binding.
+        return list({id(t): t for t in ts if t is not None}.values())
 
 
 def swap_ab_binding(binding: "GemmBinding | None") -> "GemmBinding | None":
@@ -205,6 +213,9 @@ def swap_ab_binding(binding: "GemmBinding | None") -> "GemmBinding | None":
         token_index=binding.token_index,
         token_ks=binding.token_ks,
         top_k_scores=binding.top_k_scores,
+        a_transposed=binding.b_transposed,
+        b_transposed=binding.a_transposed,
+        aux_transposed=binding.aux_transposed,
     )
 
 
@@ -221,6 +232,7 @@ def _make_multi_binding(
     token_index=None,
     token_ks=None,
     top_k_scores=None,
+    aux_refs=(),
 ) -> GemmBinding:
     """Build a GemmBinding for the multi-operand builders (multi-GEMM / MoE):
     the cuDNN tensor per distinct A/B slot (+ its SF for block-scale) from ``meta``."""
@@ -233,6 +245,10 @@ def _make_multi_binding(
                 objs.append(meta[sid].tensor)
         return objs
 
+    def _transpose_flags(ids):
+        return tuple(bool(meta[i].mn_transposed) for i in ids) if any(meta[i].mn_transposed is not None for i in ids) else ()
+
+    views = {(m.name, id(m.tensor)): bool(m.mn_transposed) for m in meta.values() if m.mn_transposed is not None}
     return GemmBinding(
         a_operands=[meta[i].tensor for i in a_ids],
         b_operands=[meta[i].tensor for i in b_ids],
@@ -244,6 +260,9 @@ def _make_multi_binding(
         token_index=token_index,
         token_ks=token_ks,
         top_k_scores=top_k_scores,
+        a_transposed=_transpose_flags(a_ids),
+        b_transposed=_transpose_flags(b_ids),
+        aux_transposed=tuple(views.get((ref.name, id(tensor)), False) for ref, tensor in zip(aux_refs, aux_objs)) if views else (),
     )
 
 
@@ -354,6 +373,9 @@ def _node_to_recorded_op(node: Any) -> "_RecordedOp | None":
         A, B = node.inputs["A"], node.inputs["B"]
         out = node.outputs["C"]
         return _RecordedOp("matmul", name, [id(A), id(B)], id(out), out, compute_dtype=compute)
+    if node_type == "TRANSPOSE":
+        inp, out = node.inputs["input"], node.outputs["OUT_0"]
+        return _RecordedOp("transpose", name, [id(inp)], id(out), out, permutation=tuple(node.params.get("permutation") or ()))
     if node_type == "MOE_GROUPED_MATMUL":
         tok = node.inputs["token"]
         weight = node.inputs["weight"]
@@ -1500,6 +1522,98 @@ def _build_multi_moe_chain(
     return chain, binding
 
 
+def _normalize_operand_transposes(ops: list[_RecordedOp], meta: dict[int, _TensorMeta], io_dtype: Dtype, intermediate_dtype: Dtype) -> list[_RecordedOp]:
+    """Project rank-3 M/N transposes through pointwise operand chains.
+
+    Only metadata is rewritten. Original Tensor objects, node dtypes and
+    rounding boundaries remain authoritative, including for shared inputs.
+    """
+    transposes = [op for op in ops if op.cudnn_name == "transpose"]
+    if not transposes:
+        return ops
+    matmuls = [op for op in ops if op.cudnn_name == "matmul"]
+    if len(matmuls) != 1 or any(op.cudnn_name in ("moe_grouped_matmul", "block_scale_dequantize") for op in ops):
+        raise ValueError("operand transpose fusion requires one plain matmul (no MoE or block-scale dequantize)")
+    producers = {op.output: op for op in ops}
+    used_transposes, projected_ops = set(), []
+    names = {m.name for m in meta.values()}
+
+    @lru_cache(maxsize=None)
+    def shape(tid):
+        m, op = meta[tid], producers.get(tid)
+        if op is None:
+            return m.dim
+        if op.cudnn_name == "transpose":
+            dim = shape(op.inputs[0])
+            if len(dim) != 3 or op.permutation not in ((0, 1, 2), (0, 2, 1)):
+                raise ValueError(f"operand transpose {op.op_name!r}: only rank-3 identity or M/N permutation (0,2,1) is supported")
+            inferred = tuple(dim[i] for i in op.permutation)
+            if m.dim and m.dim != inferred:
+                raise ValueError(f"operand transpose {op.op_name!r}: expected output shape {inferred}, got {m.dim}")
+            return inferred
+        if m.dim:
+            return m.dim
+        dims = [shape(i) for i in op.inputs]
+        rank = max(map(len, dims), default=0)
+        padded = [(1,) * (rank - len(dim)) + dim for dim in dims]
+        if any(len({d for d in axis if d != 1}) > 1 for axis in zip(*padded)):
+            raise ValueError(f"operand pointwise {op.op_name!r}: incompatible broadcast shapes {dims}")
+        return tuple(max(axis) for axis in zip(*padded))
+
+    @lru_cache(maxsize=None)
+    def dtype(tid):
+        op, m = producers.get(tid), meta[tid]
+        if op is not None and op.cudnn_name == "transpose":
+            expected = dtype(op.inputs[0])
+            declared = _resolve_out_dtype(tid, m.tensor, io_dtype, intermediate_dtype, meta) if m.dtype is not None else expected
+            if declared != expected:
+                raise ValueError(f"operand transpose {op.op_name!r}: dtype changes are unsupported ({expected} -> {declared})")
+            return expected
+        return m.dtype if op is None else _resolve_out_dtype(tid, m.tensor, io_dtype, intermediate_dtype, meta)
+
+    def alias(tid, transposed):
+        m, dim = meta[tid], shape(tid)
+        if transposed and len(dim) != 3:
+            if dim and all(d == 1 for d in dim):
+                return tid  # a scalar broadcast is invariant under the permutation
+            raise ValueError(f"operand transpose input {m.name!r}: expected rank 3, got {dim}")
+        stride = m.stride or tuple(prod(dim[i + 1 :]) for i in range(len(dim)))
+        if transposed:
+            dim, stride = tuple(dim[i] for i in (0, 2, 1)), tuple(stride[i] for i in (0, 2, 1))
+        name = f"{m.name}_mn_view"
+        while name in names:
+            name += "_"
+        names.add(name)
+        view = replace(m, name=name, dim=dim, stride=stride, dtype=dtype(tid), mn_transposed=transposed)
+        meta[id(view)] = view
+        return id(view)
+
+    @lru_cache(maxsize=None)
+    def project(tid, transposed=False):
+        op = producers.get(tid)
+        if op is None:
+            return alias(tid, transposed)
+        if op.cudnn_name not in (*_UNARY_OP_MAP, *_BINARY_OP_MAP, "transpose"):
+            raise ValueError(f"operand transpose path {op.op_name!r}: unsupported producer {op.cudnn_name!r}")
+        if meta[tid].output_index is not None:
+            raise ValueError(f"operand transpose path {op.op_name!r}: materialized intermediate outputs cannot be absorbed")
+        if op.cudnn_name == "transpose":
+            shape(tid)
+            dtype(tid)
+            used_transposes.add(tid)
+            return project(op.inputs[0], transposed ^ (op.permutation == (0, 2, 1)))
+        inputs = [project(i, transposed) for i in op.inputs]
+        output = alias(tid, transposed)
+        projected_ops.append(replace(op, inputs=inputs, output=output))
+        return output
+
+    mm = matmuls[0]
+    inputs = [project(i) for i in mm.inputs]
+    if len(used_transposes) != len(transposes):
+        raise ValueError("transpose fusion is operand-only; epilogue or unrelated transposes are unsupported")
+    return [replace(op, inputs=inputs) if op is mm else op for op in ops if op.cudnn_name != "transpose"] + projected_ops
+
+
 def _walk_mainloop_chain(
     operand_id: int,
     label: str,
@@ -1913,6 +2027,7 @@ def _build_multi_gemm_chain(
         output_objs,
         aux_objs,
         block_scale_spec is not None,
+        aux_refs=aux_tensors,
     )
     return chain, binding
 
@@ -1948,7 +2063,7 @@ def _analyze_state(state: dict) -> tuple[FusionChain, GemmBinding | None]:
     if not state["ops"]:
         raise ValueError("graph has no ops; nothing to compile")
     return _build_chain(
-        state["ops"],
+        _normalize_operand_transposes(state["ops"], state["tensor_meta"], state["io_dtype"], state["intermediate_dtype"]),
         state["tensor_meta"],
         state["io_dtype"],
         state["intermediate_dtype"],
