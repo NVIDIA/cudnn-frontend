@@ -27,8 +27,9 @@ def _parameters(io_dtype, has_mean, has_beta):
 def make_forward(rows, cols, io_dtype, *, has_mean, has_beta, epsilon, sm_count):
     """Return ``launch(stream, x, gamma, beta, y, mean, rstd)``.
 
-    X/Y are contiguous [rows, cols], affine operands [cols], and statistics
-    FP32 [rows]; mean is None for RMSNorm. The unused beta operand may alias gamma.
+    X and affine operands retain their original shapes in row-major layout;
+    Y is [rows, cols], and statistics FP32 [rows]. Mean is None for RMSNorm.
+    The unused beta operand may alias gamma.
     ``sm_count`` keys the cache because the shared helpers derive launch geometry
     from the device.
     """
@@ -61,6 +62,11 @@ def make_forward(rows, cols, io_dtype, *, has_mean, has_beta, epsilon, sm_count)
 
     @cute.jit
     def launch(stream, x, gamma, beta, y, mean, rstd):
+        # The JAX bridge constrains row-major storage; change only CuTe metadata
+        # here because eager JAX reshapes can copy the input buffers.
+        x = cute.make_tensor(x.iterator, cute.make_layout((rows, cols), stride=(cols, 1)))
+        gamma = cute.make_tensor(gamma.iterator, cute.make_layout(cols))
+        beta = cute.make_tensor(beta.iterator, cute.make_layout(cols))
         if cutlass.const_expr(route == "cga"):
             flat_x = cute.make_tensor(x.iterator, cute.make_layout(rows * cols))
             flat_y = cute.make_tensor(y.iterator, cute.make_layout(rows * cols))
@@ -86,8 +92,9 @@ def make_backward(rows, cols, io_dtype, *, has_mean, has_beta, sm_count):
 
     ABI: ``launch(stream, dy, x, gamma, mean, rstd, dx, dgamma, dbeta,
     dgamma_partials, dbeta_partials)``.
-    DY/X/DX are contiguous [rows, cols], gamma/dgamma/dbeta [cols], statistics
-    FP32 [rows]. Dgamma and optional dbeta MUST be initialized to zero. Scratch
+    DY/X/gamma retain their original shapes in row-major layout. DX is
+    [rows, cols], dgamma/dbeta [cols], and statistics FP32 [rows].
+    Dgamma and optional dbeta MUST be initialized to zero. Scratch
     outputs are fully overwritten. Absent mean, dbeta, and partial buffers are None.
     """
     params = _parameters(io_dtype, has_mean, has_beta)
@@ -156,6 +163,10 @@ def make_backward(rows, cols, io_dtype, *, has_mean, has_beta, sm_count):
 
     @cute.jit
     def launch(stream, dy, x, gamma, mean, rstd, dx, dgamma, dbeta, dgamma_partials, dbeta_partials):
+        layout = cute.make_layout((rows, cols), stride=(cols, 1))
+        dy = cute.make_tensor(dy.iterator, layout)
+        x = cute.make_tensor(x.iterator, layout)
+        gamma = cute.make_tensor(gamma.iterator, cute.make_layout(cols))
         if cutlass.const_expr(route == "row"):
             host(dy, x, gamma, mean, rstd, dx, dgamma, dbeta, cutlass.Int32(rows), *constants, stream)
         elif cutlass.const_expr(route == "cga"):
