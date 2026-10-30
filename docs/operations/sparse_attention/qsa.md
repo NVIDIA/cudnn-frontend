@@ -162,8 +162,13 @@ atomic reductions can change low bits between runs.
 On Blackwell and Rubin, the 12:1 and 6:1 paths batch consecutive queries (two
 12-head or four 6-head queries fill one 24-column tile) and gather their selected
 block union once. Owner bits retain each query's mask while sharing K/V loads.
-Hopper and the 24:2 path process one query per CTA. Hopper uses warp MMA for
-the five matrix products, with three BF16 parts of dS preserving dQ cancellation.
+Hopper bitmap backward uses 32-query tiles for `512 < T <= 16384`.
+It reuses K/V across queries and reduces dK/dV within each tile before FP32
+atomic updates. Exact token masks preserve each query's selection and bounds.
+A fresh GPU check routes nonfinite K/V, extreme V, and wide spans to the
+single-query gather kernel. Other lengths and indexed inputs use that kernel.
+Both Hopper paths use warp MMA, with three BF16 parts of dS preserving dQ
+cancellation. The Blackwell and Rubin 24:2 path processes one query per CTA.
 On the Blackwell and Rubin batched paths, a device-side K/V scan selects a
 per-query fallback when nonfinite values are present. The fallback reuses the compact union but applies each query's owner
 bits and bounds before dQ arithmetic, preventing a masked NaN from crossing
@@ -211,7 +216,7 @@ The public functions select the architecture internally:
 
 | Family | Forward kernel | Backward kernel |
 |---|---|---|
-| Hopper SM90 (H200) | `cudnn_frost_qsa_fprop_sm90` | `cudnn_frost_qsa_bprop_sm90` |
+| Hopper SM90 (H200) | `cudnn_frost_qsa_fprop_sm90` | `cudnn_frost_qsa_bprop_dense_sm90`, `cudnn_frost_qsa_bprop_sm90` |
 | Blackwell SM100/SM103 | `cudnn_frost_qsa_fprop_sm100` | `cudnn_frost_qsa_bprop_sm100` (batched for 12:1 and 6:1, single-query for 24:2) |
 | Rubin SM107 | `cudnn_frost_qsa_fprop_sm107` | Batched `cudnn_frost_qsa_bprop_sm100` (12:1, 6:1), `cudnn_frost_qsa_bprop_sm107` (24:2) |
 
@@ -228,8 +233,9 @@ rebuilt from the current bitmap on each call. Forward scratch includes an int32
 use `[ceil(T/NQ), NB]` indices and `[ceil(T/NQ)]` counts (`NQ` = 2 at 12:1, 4 at 6:1);
 Hopper backward and the 24:2 backward use the forward shapes. Backward also uses FP32 gradient accumulators and `[T, Hq]`
 delta. The batched backward safety scan also uses four int32 flags per 1024
-K/V elements plus one reduced flag. The dense route also uses packed token
-masks, tile ranges and K/V check flags. These buffers are rebuilt on each call.
+K/V elements plus one reduced flag. Dense forward and Hopper bitmap backward
+also use packed token masks, tile ranges and K/V check flags. These buffers are
+rebuilt on each call.
 Full-call benchmarks must include forward preparation, compaction, backward
 preparation, and final gradient casts.
 At `T=131072` and `NB=32768`, the forward compact-index buffer alone uses 16 GiB.

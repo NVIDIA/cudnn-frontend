@@ -134,7 +134,6 @@ def qsa_backward(
         from cudnn.api_base import TupleDict
 
         stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
-        compiled = impl.compile_kernel(cutlass.BFloat16, hq, hkv, arch)
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         scratch = {
             "delta": torch.empty((total, hq), dtype=torch.float32, device=q.device),
@@ -142,9 +141,34 @@ def qsa_backward(
             "dk_acc": torch.empty_like(k, dtype=torch.float32),
             "dv_acc": torch.empty_like(v, dtype=torch.float32),
         }
-        ids, counts = _compact_backward(sel_blocks, lo, hi, block_first, block_last, arch, stream, hq, hkv)
         num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
-        impl.launch(
-            compiled, grad_out, q, k, v, out_fp32, lse, ids, counts, lo, hi, block_first, block_last, dq, dk, dv, scratch, float(scale), stream, num_sms
-        )
+        if arch == 90 and 512 < total <= 16384:
+            impl.launch_bitmap(
+                grad_out,
+                q,
+                k,
+                v,
+                out_fp32,
+                lse,
+                sel_blocks,
+                lo,
+                hi,
+                blk_base,
+                tok_base,
+                block_first,
+                block_last,
+                dq,
+                dk,
+                dv,
+                scratch,
+                float(scale),
+                stream,
+                num_sms,
+            )
+        else:
+            compiled = impl.compile_kernel(cutlass.BFloat16, hq, hkv, arch)
+            ids, counts = _compact_backward(sel_blocks, lo, hi, block_first, block_last, arch, stream, hq, hkv)
+            impl.launch(
+                compiled, grad_out, q, k, v, out_fp32, lse, ids, counts, lo, hi, block_first, block_last, dq, dk, dv, scratch, float(scale), stream, num_sms
+            )
         return TupleDict(dq=dq, dk=dk, dv=dv)

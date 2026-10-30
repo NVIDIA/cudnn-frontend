@@ -13,6 +13,22 @@ from QSA.cutedsl.test_qsa import supported_gpu
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("scale", [0.0, -0.125, 0.1])
+def test_dense_backward_bounds(supported_gpu, scale):
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("Hopper attention test")
+    from QSA.cutedsl.test_qsa import check_case, make_inputs
+
+    inputs = make_inputs((641,), 12, 1, empty=True)
+    inputs["scale"] = scale
+    inputs["lo"][256] = 256
+    inputs["hi"][383] = 0
+    inputs["lo"][511] = torch.iinfo(torch.int32).max
+    inputs["hi"][511] = -1
+    check_case(inputs)
+
+
+@pytest.mark.L0
 def test_attention_artifacts_reload(supported_gpu, tmp_path):
     if torch.cuda.get_device_capability() != (9, 0):
         pytest.skip("Hopper attention test")

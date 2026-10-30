@@ -348,8 +348,9 @@ def test_forward_large_values(supported_gpu, heads, score, magnitude):
 @pytest.mark.L0
 @pytest.mark.parametrize("heads", [(12, 1), (24, 2), (6, 1)])
 @pytest.mark.parametrize("large_logits", [False, True], ids=["constant-key", "large-logits"])
-def test_backward_cancellation(supported_gpu, heads, large_logits):
-    inputs = make_inputs((257,), *heads, all_selected=True)
+@pytest.mark.parametrize("total", [257, 513], ids=["gathered", "dense"])
+def test_backward_cancellation(supported_gpu, heads, large_logits, total):
+    inputs = make_inputs((total,), *heads, all_selected=True)
     inputs["k"].fill_(1)
     if large_logits:
         inputs["q"].fill_(8)

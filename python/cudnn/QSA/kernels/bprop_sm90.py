@@ -13,7 +13,8 @@ from cutlass.cute.nvgpu import warp as warp_mma
 from cuda.bindings import driver as cuda
 
 from cudnn.frost.compiled_cache import compile_cached, template_key
-from .bprop_helpers import compile_helpers, fake, launch_backward as launch
+from .bprop_helpers import compile_helpers, fake, launch_backward as launch, prepare_host, finish_host
+from . import bprop_dense_sm90, fprop_prepare
 
 D = 256
 
@@ -38,6 +39,7 @@ def frost_qsa_bprop_sm90(
     gDQ: cute.Tensor,
     gDKacc: cute.Tensor,
     gDVacc: cute.Tensor,
+    modes,
 ):
     tid, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
@@ -47,6 +49,9 @@ def frost_qsa_bprop_sm90(
     hkv = cute.size(gK, mode=[1])
     qid = bid // hkv
     kvh = bid - qid * hkv
+    if cutlass.const_expr(modes is not None):
+        if modes[qid // 128] == 0:
+            cute.arch.nvvm.exit()
     group = hq // hkv
     smem = cutlass.utils.SmemAllocator()
 
@@ -67,17 +72,17 @@ def frost_qsa_bprop_sm90(
     sDelta = smem.allocate_tensor(cutlass.Float32, cute.make_layout((16,)), byte_alignment=16)
     sKey = smem.allocate_tensor(cutlass.Int32, cute.make_layout((16,)), byte_alignment=16)
 
-    for it in cutlass.range_constexpr(32):
-        flat = tid + it * 128
-        row = flat // D
-        d = flat - row * D
-        qv = cutlass.BFloat16(0.0)
-        dov = cutlass.BFloat16(0.0)
+    zero = cutlass.Vector.from_elements([BFloat16(0)] * 8, BFloat16)
+    for it in cutlass.range_constexpr(4):
+        flat = (tid + it * 128) * 8
+        row, d = flat // D, flat % D
+        load_q, load_do = zero, zero
         if row < group:
-            qv = gQ[(qid, kvh * group + row, d)]
-            dov = gDO[(qid, kvh * group + row, d)]
-        sQ[(row, d)] = qv
-        sDO[(row, d)] = dov
+            offset = (Int64(qid) * hq + kvh * group + row) * D + d
+            load_q = (gQ.iterator.raw_ptr() + offset).load(count=8, alignment=16)
+            load_do = (gDO.iterator.raw_ptr() + offset).load(count=8, alignment=16)
+        (sQ.iterator.raw_ptr() + row * (D + 8) + d).store(load_q, alignment=16)
+        (sDO.iterator.raw_ptr() + row * (D + 8) + d).store(load_do, alignment=16)
 
     if tid < group:
         sDelta[tid] = gDelta[qid, kvh * group + tid]
@@ -128,18 +133,17 @@ def frost_qsa_bprop_sm90(
                     key = cutlass.Int32(-1)
             sKey[tid] = key
         cute.arch.barrier()
-        for it in cutlass.range_constexpr(32):
-            flat = tid + it * 128
-            row = flat // D
-            d = flat - row * D
+        for it in cutlass.range_constexpr(4):
+            flat = (tid + it * 128) * 8
+            row, d = flat // D, flat % D
             key = sKey[row]
-            kval = cutlass.BFloat16(0.0)
-            vval = cutlass.BFloat16(0.0)
+            load_k, load_v = zero, zero
             if key >= 0:
-                kval = gK[(key, kvh, d)]
-                vval = gV[(key, kvh, d)]
-            sK[(row, d)] = kval
-            sV[(row, d)] = vval
+                offset = (Int64(key) * hkv + kvh) * D + d
+                load_k = (gK.iterator.raw_ptr() + offset).load(count=8, alignment=16)
+                load_v = (gV.iterator.raw_ptr() + offset).load(count=8, alignment=16)
+            (sK.iterator.raw_ptr() + row * (D + 8) + d).store(load_k, alignment=16)
+            (sV.iterator.raw_ptr() + row * (D + 8) + d).store(load_v, alignment=16)
         cute.arch.barrier()
 
         rK = make_b(mmaS, thS, kW)
@@ -241,7 +245,7 @@ frost_qsa_bprop_sm90.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 @cute.jit
 def _host(q, k, v, dout, lse, delta, dq, dk, dv, ids, counts, lo, hi, first, last, scale: Float32, blocks: Int32, stream: cuda.CUstream):
-    frost_qsa_bprop_sm90(dout, q, k, v, delta, lse, ids, counts, lo, hi, first, last, scale, dq, dk, dv).launch(
+    frost_qsa_bprop_sm90(dout, q, k, v, delta, lse, ids, counts, lo, hi, first, last, scale, dq, dk, dv, None).launch(
         grid=(q.shape[0] * k.shape[1], 1, 1), block=(128, 1, 1), stream=stream
     )
 
@@ -278,3 +282,138 @@ def compile_kernel(dtype, hq, hkv, arch):
         symbol="qsa_backward_sm90",
     )
     return compiled
+
+
+@cute.jit
+def _bitmap_host(
+    q,
+    k,
+    v,
+    dout,
+    out,
+    lse,
+    sel,
+    lo,
+    hi,
+    bases,
+    origins,
+    first,
+    last,
+    dq,
+    dk,
+    dv,
+    delta,
+    aq,
+    ak,
+    av,
+    scratch,
+    scale: Float32,
+    blocks: Int32,
+    stream: cuda.CUstream,
+):
+    total, nb = Int64(q.shape[0]), Int64(sel.shape[1])
+    tiles, words = cute.ceil_div(total, 128), cute.ceil_div(total, 256) * 8
+    pieces = cute.ceil_div(Int64(cute.size(k)), 1024) * 4
+    modes_offset = pieces
+    ranges_offset = modes_offset + cute.ceil_div(tiles, 4) * 4
+    bits_offset = ranges_offset + cute.ceil_div(tiles * 2, 4) * 4
+    order_offset = bits_offset + total * words
+    ids_offset = order_offset + cute.ceil_div(tiles, 4) * 4
+    counts_offset = ids_offset + cute.ceil_div(total * nb, 4) * 4
+    partials = cute.make_tensor(scratch.iterator, cute.make_layout((pieces,)))
+    modes = cute.make_tensor(scratch.iterator + modes_offset, cute.make_layout((tiles,)))
+    ranges = cute.make_tensor(scratch.iterator + ranges_offset, cute.make_layout((tiles, 2), stride=(2, 1)))
+    bits = cute.make_tensor(scratch.iterator + bits_offset, cute.make_layout((total, words), stride=(words, 1)))
+    order = cute.make_tensor(scratch.iterator + order_offset, cute.make_layout((tiles,)))
+    ids = cute.make_tensor(scratch.iterator + ids_offset, cute.make_layout((total, nb), stride=(nb, 1)))
+    counts = cute.make_tensor(scratch.iterator + counts_offset, cute.make_layout((total,)))
+    flat_k = cute.make_tensor(k.iterator, cute.make_layout((cute.size(k),)))
+    flat_v = cute.make_tensor(v.iterator, cute.make_layout((cute.size(v),)))
+    fprop_prepare.prepare(flat_k, flat_v, sel, lo, hi, bases, origins, first, last, partials, modes, ranges, bits, order, ids, counts, stream, False, True)
+    prepare_host(out, dout, delta, aq, ak, av, blocks, stream)
+    bprop_dense_sm90.frost_qsa_bprop_dense_sm90(q, k, v, dout, lse, delta, bits, ranges, modes, aq, ak, av, scale).launch(
+        grid=(cute.ceil_div(total, bprop_dense_sm90.M), q.shape[1], 1), block=(bprop_dense_sm90.THREADS, 1, 1), stream=stream
+    )
+    frost_qsa_bprop_sm90(dout, q, k, v, delta, lse, ids, counts, lo, hi, first, last, scale, aq, ak, av, modes).launch(
+        grid=(total * k.shape[1], 1, 1), block=(128, 1, 1), stream=stream
+    )
+    finish_host(aq, ak, av, dq, dk, dv, blocks, stream)
+
+
+def compile_bitmap(hq, hkv, arch):
+    from . import bprop_helpers
+
+    sources = tuple(module.FROST_SOURCE_DIGEST for module in (bprop_dense_sm90, bprop_helpers, fprop_prepare, fprop_prepare._metadata))
+    key = template_key(globals(), {"hq": hq, "hkv": hkv, "arch": arch, "sources": sources}, "compile_bitmap")
+    total, blocks, workspace = (cute.sym_int64() for _ in range(3))
+    q, kv = fake(BFloat16, (total, hq, D)), fake(BFloat16, (total, hkv, D))
+    aq, ak = fake(Float32, (total, hq, D)), fake(Float32, (total, hkv, D))
+    rows, spans = fake(Int32, (total,), 4), fake(Int32, (blocks,), 4)
+    return compile_cached(
+        _bitmap_host,
+        q,
+        kv,
+        kv,
+        q,
+        aq,
+        fake(Float32, (hq, total), 4),
+        fake(cutlass.Uint8, (total, blocks), 1),
+        rows,
+        rows,
+        rows,
+        rows,
+        spans,
+        spans,
+        q,
+        kv,
+        kv,
+        fake(Float32, (total, hq)),
+        aq,
+        ak,
+        ak,
+        fake(Int32, (workspace,)),
+        Float32(1),
+        Int32(1),
+        make_fake_stream(use_tvm_ffi_env_stream=False),
+        options=f"--enable-tvm-ffi --gpu-arch=sm_{arch}a",
+        cache_key=key,
+        symbol="qsa_backward_bitmap_sm90",
+    )
+
+
+def launch_bitmap(grad_out, q, k, v, out_fp32, lse, sel, lo, hi, bases, origins, first, last, dq, dk, dv, scratch, scale, stream, num_sms):
+    import torch
+
+    total, hq, _ = q.shape
+    tiles, words = (total + 127) // 128, ((total + 255) // 256) * 8
+    pieces = ((k.numel() + 1023) // 1024) * 4
+    align4 = lambda value: (value + 3) // 4 * 4
+    elements = pieces + 2 * align4(tiles) + align4(2 * tiles) + total * words + align4(total * sel.shape[1]) + total
+    metadata = torch.empty(elements, dtype=torch.int32, device=q.device)
+    blocks = max(1, min(num_sms * 8, (q.numel() // 8 + 255) // 256))
+    compile_bitmap(hq, k.shape[1], 90)(
+        q,
+        k,
+        v,
+        grad_out,
+        out_fp32,
+        lse,
+        sel,
+        lo,
+        hi,
+        bases,
+        origins,
+        first,
+        last,
+        dq,
+        dk,
+        dv,
+        scratch["delta"],
+        scratch["dq_acc"],
+        scratch["dk_acc"],
+        scratch["dv_acc"],
+        metadata,
+        scale,
+        blocks,
+        stream,
+    )
