@@ -44,7 +44,7 @@ inputs. Use a finite positive `eps` within the FP32 representable range.
 
 ## Usage
 
-Install the frontend and a CUDA-enabled JAX build. The frontend already depends
+Install the frontend and a CUDA-enabled JAX build (>=0.6.0). The frontend already depends
 on CuTeDSL; these kernels require a build at least version 4.7.1 that provides
 `cutlass.experimental.primitives`. No additional frontend dependency is introduced.
 
