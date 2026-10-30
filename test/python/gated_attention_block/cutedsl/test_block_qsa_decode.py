@@ -1994,188 +1994,12 @@ def _set_vs_topk(in_set: torch.Tensor, scores: torch.Tensor, top_k: int, tol: fl
     return flips, int(differs.any(dim=-1).sum()), float(gap.max())
 
 
-class _IndexerCase(_CaseBase):
-    """One decode step of the IN-BLOCK INDEXER over the pools: ``_Case``'s batch of sequences (the whole-sequence inputs per entry, the
-    dense reference's Q / K / V / gate, the NaN pools holding the oracle's prefix K / V, the table, the slots) plus the indexer's state --
-    the band's raw keys of every position from the oracle's own projection, the PREFIX blocks compressed through the compress kernel
-    into the paged compressed-key cache (page 0 the null page, NaN everywhere unwritten), the ring primed with the last ``cap`` raw
-    keys below the step (block 0 the null block), the position tables over the table's whole reach -- and the block declared
-    ``QsaSpec(index_source="indexer")`` over them.  The oracle is formed AFTER the run from the KERNEL's own list per row (the
-    two-stage oracle's second stage); ``check_selection`` is its first stage."""
-
-    def __init__(
-        self,
-        geom_kw,
-        s_q,
-        kv_lens,
-        *,
-        page=16,
-        layout="hnd",
-        dtype=BF16,
-        seed=0,
-        top_k=512,
-        return_lse=False,
-        fuse_gate=False,
-        split=None,
-        n_pages=None,
-        fuse_prepare=None,
-        cap=None,
-        slot_form=False,
-        rope_tables_only=False,
-        outputs=True,
-        lens_out=True,
-        index_cache_dtype=None,
-        sparse_tile_form=None,  # the sparse core's BODY knob (None = the block's "auto"; "lean" / "tcgen05" explicit)
-        sparse_sub_tiles_per_cta=None,
-    ):
-        self.s_q, self.kv_lens, self.page, self.layout, self.dtype, self.top_k = int(s_q), [int(x) for x in kv_lens], page, layout, dtype, top_k
-        self.block_lens_given, self.return_lse, self.fuse_gate, self.index_band = False, bool(return_lse), bool(fuse_gate), True
-        self.index_list_form, self.shared, self.fuse_prepare = None, False, fuse_prepare
-        self.sparse_tile_form, self.sparse_sub_tiles_per_cta = sparse_tile_form, sparse_sub_tiles_per_cta
-        self.slot_form, self.rope_tables_only, self.outputs, self.lens_out = bool(slot_form), bool(rope_tables_only), bool(outputs), bool(lens_out)
-        # the indexer CACHE dtype (QsaSpec.index_cache_dtype): the paged compressed-key cache, ix_q and the prefix priming in it (e4m3 = the e4m3
-        # indexer cache, 2026-10-21: the compress kernel's e4m3 store arm primes the prefix exactly as a prefill form's cast would); the ring bf16
-        self.index_cache_dtype = index_cache_dtype
-        self.cache_dtype = dtype if index_cache_dtype is None else index_cache_dtype
-        kw_g = dict(geom_kw, causal_bottom_right=True)
-        self.geom = GatedAttentionBlockGeometry(**kw_g, qsa=QsaSpec(top_k=top_k, index_source="indexer", index_band=True, index_cache_dtype=index_cache_dtype))
-        self.ref_geom = RefGeometry(**kw_g)
-        geom, ref_geom = self.geom, self.ref_geom
-        h_q, h_kv, d_model, d_i, h_i = geom.h_q, geom.h_kv, geom.d_model, geom.qsa.index_head_dim, geom.qsa.index_heads
-        G = h_q // h_kv
-        B = len(self.kv_lens)
-        g = torch.Generator(device=_DEV).manual_seed(seed)
-        self.gen = g
-
-        def randn(*shape, std=0.02):
-            return (torch.randn(*shape, generator=g, device=_DEV, dtype=torch.float32) * std).to(dtype)
-
-        n_dense = sum(geom.qkvg_block_widths[:4])
-        w_qkvg = randn(geom.n_qkvg, d_model)
-        self.w = dict(
-            w_qkvg=w_qkvg,
-            w_q_norm=torch.ones(D, dtype=dtype, device=_DEV),
-            w_k_norm=torch.ones(D, dtype=dtype, device=_DEV),
-            w_o=randn(d_model, h_q * D),
-            w_iq_norm=(1.0 + 0.03 * randn(d_i, std=1.0).float()).to(dtype),
-            w_ik_norm=(1.0 + 0.02 * randn(d_i, std=1.0).float()).to(dtype),
-        )
-        self.w_band_k = w_qkvg[n_dense + h_i * d_i :]  # [d_i, d_model]: the band's raw-key head
-        L_max = max(max(self.kv_lens), s_q)
-        self.max_pages = max(-(-L_max // page), 1)
-        self.n_pos = self.max_pages * page  # the position tables cover the table's whole reach (the RoPE-table ceiling met with equality)
-        cos_t, sin_t = _rope_tables(self.n_pos, dtype, ref_geom)
-        self.cos_pos, self.sin_pos = cos_t, sin_t  # [1, n_pos, ROPE]
-        scale = geom.scale
-        self.scale, self.G = scale, G
-        self.h = torch.zeros(B, s_q, d_model, dtype=dtype, device=_DEV)
-        self.cos = cos_t[0, :1].expand(s_q, ROPE).clone()[None].expand(B, s_q, ROPE).clone()
-        self.sin = sin_t[0, :1].expand(s_q, ROPE).clone()[None].expand(B, s_q, ROPE).clone()
-        self.ref_out = torch.zeros(B, s_q, d_model, dtype=dtype, device=_DEV)
-        self.ref_o_gated = torch.zeros(B, s_q, h_q, D, dtype=dtype, device=_DEV)
-        self.ref_lse = torch.full((B, h_q, s_q), float("-inf"), dtype=torch.float32, device=_DEV)
-        self.ref_rows, self.refs, self.k_raw_full = {}, {}, {}
-        self.live_rows = torch.zeros(B, s_q, dtype=torch.bool, device=_DEV)
-        for b, L in enumerate(self.kv_lens):
-            pos = torch.arange(s_q, device=_DEV) + (L - s_q)
-            live = pos >= 0
-            self.live_rows[b] = live
-            if L == 0:
-                continue
-            h_full = randn(1, L, d_model, std=1.0)
-            ref = gated_attention_block_reference(
-                h_full, w_qkvg[:n_dense], self.w["w_q_norm"], self.w["w_k_norm"], cos_t[:, :L], sin_t[:, :L], self.w["w_o"], ref_geom
-            )
-            self.refs[b] = ref
-            self.ref_rows[b] = (ref.k[0], ref.v[0])
-            # the band's raw key of every position: the oracle's own projection, ONE rounding (the prefix blocks and the ring are built from it)
-            self.k_raw_full[b] = (h_full[0].float() @ self.w_band_k.float().t()).to(dtype)  # [L, d_i]
-            p_live = pos[live]
-            self.h[b, live] = h_full[0, p_live]
-            self.cos[b, live] = cos_t[0, p_live]
-            self.sin[b, live] = sin_t[0, p_live]
-        # pages: block 0 reserved (NULL); each live entry gets ceil(L / P) pages from a permutation of 1 .. n_pages - 1; -1 past them
-        need = sum(-(-L // page) for L in self.kv_lens)
-        self.n_pages = n_pages if n_pages is not None else need + 1 + 2
-        assert self.n_pages >= need + 1, (self.n_pages, need)
-        perm = (torch.randperm(self.n_pages - 1, generator=g, device=_DEV) + 1).tolist()
-        self.block_table = torch.full((B, self.max_pages), -1, dtype=torch.int32, device=_DEV)
-        it = iter(perm)
-        slots = torch.full((B * s_q,), -1, dtype=torch.int32, device=_DEV)
-        self.k_cache, self.v_cache = _pools(self.n_pages, h_kv, page, layout, dtype)
-        self.index_cache = None  # the raw-key pool of the caller-list band form: nothing here (the raw key lives in the ring)
-        self.rpp = page // BS
-        self.cap = int(cap) if cap is not None else (4 if s_q == 1 else 8)  # the serving stacks' ring: 4 without speculative rows, 8 with 1 .. 4
-        self.index_kv_cache = torch.full((self.n_pages, self.rpp, 1, d_i), float("nan"), dtype=self.cache_dtype, device=_DEV)
-        self.index_state_cache = torch.full((B + 1, self.cap, 1, d_i), float("nan"), dtype=dtype, device=_DEV)
-        self.index_state_block_table = torch.zeros(B, 1, dtype=torch.int32, device=_DEV)
-        self.pages = {}
-        for b, L in enumerate(self.kv_lens):
-            if L == 0:
-                self.block_table[b] = 0  # the dead entry: the NULL block / the null ring block, slots -1
-                continue
-            pages = [next(it) for _ in range(-(-L // page))]
-            self.pages[b] = pages
-            self.block_table[b, : len(pages)] = torch.tensor(pages, dtype=torch.int32, device=_DEV)
-            self.index_state_block_table[b, 0] = b + 1
-            k_rows, v_rows = self.ref_rows[b]
-            pos0 = L - s_q
-            for p in range(max(pos0, 0)):  # the PREFIX: the oracle's rows into the pools
-                pg, off = pages[p // page], p % page
-                self.k_cache[pg, :, off] = k_rows[p]
-                self.v_cache[pg, :, off] = v_rows[p]
-            for j in range(s_q):  # the step's live tokens: written through by the block
-                p = pos0 + j
-                if p >= 0:
-                    slots[b * s_q + j] = pages[p // page] * page + p % page
-            # the ring: the last `cap` raw keys below the step, position-indexed
-            for p in range(max(0, pos0 - self.cap), max(pos0, 0)):
-                self.index_state_cache[b + 1, p % self.cap, 0] = self.k_raw_full[b][p]
-        self.slot_mapping = slots
-        self.kv_lens_t = torch.tensor(self.kv_lens, dtype=torch.int32, device=_DEV)
-        self.prefix_bits = (_bits(self.k_cache).clone(), _bits(self.v_cache).clone())
-        # the ring's WRITE rows as the stack spells them (block x cap + pos % cap, -1 on a dead row), slot_mapping's dtype
-        pos_all = torch.tensor([[L - s_q + j for j in range(s_q)] for L in self.kv_lens], device=_DEV, dtype=torch.long)
-        blk_of = self.index_state_block_table.long()
-        self.ring_slots = (
-            torch.where((pos_all >= 0) & (blk_of > 0), blk_of * self.cap + pos_all % self.cap, torch.full_like(pos_all, -1)).reshape(-1).to(torch.int32)
-        )
-        self.block_ids_out = torch.full((B, s_q, top_k), _SENT_I32, dtype=torch.int32, device=_DEV) if outputs else None
-        self.block_lens_out = torch.full((B, s_q), _SENT_I32, dtype=torch.int32, device=_DEV) if lens_out else None
-        kw = dict(
-            paged_kv_page_size=page,
-            kv_source=KV_SOURCE_PAGED,
-            sample_k_cache=self.k_cache,
-            sample_v_cache=self.v_cache,
-            sample_block_table=self.block_table,
-            sample_index_kv_cache=self.index_kv_cache,
-            sample_index_state_cache=self.index_state_cache,
-            sample_index_state_block_table=self.index_state_block_table,
-            fuse_gate=fuse_gate,
-            return_lse=return_lse,
-            decode_split_kv=split,
-            fuse_prepare=fuse_prepare,
-            index_state_slot_mapping_present=self.slot_form,
-            rope_position_tables_only=self.rope_tables_only,
-        )
-        if sparse_tile_form is not None:
-            kw["sparse_tile_form"] = sparse_tile_form
-        if sparse_sub_tiles_per_cta is not None:
-            kw["sparse_sub_tiles_per_cta"] = sparse_sub_tiles_per_cta
-        self.blk_kw = kw
-        self.out = torch.empty(B, s_q, d_model, dtype=dtype, device=_DEV)
-        self.lse = torch.empty(B, h_q, s_q, dtype=torch.float32, device=_DEV) if return_lse else None
-        tables = (None, None) if self.rope_tables_only else (self.cos, self.sin)
-        self.blk = GatedAttentionBlockFwd(self.h, self.w["w_qkvg"], self.w["w_q_norm"], self.w["w_k_norm"], *tables, self.w["w_o"], self.out, self.geom, **kw)
-        assert (
-            isinstance(self.blk._sdpa, _SparseSdpa)
-            and self.blk.indexer_decode
-            and not self.blk.qsa_shared_list
-            and isinstance(self.blk._indexer_decode, _IndexerDecode)
-        )
-        assert self.blk.index_cache_dtype == self.cache_dtype and self.blk._indexer_decode.cache_dtype == self.cache_dtype
-        self.ws = None
-        self._compress = {}
+class _IndexerCaseBase(_CaseBase):
+    """The in-block indexer's methods shared by its two step forms -- the decode step's ``_IndexerCase`` below and the extend module's
+    ``_IndexerExtendCase`` (a T-row chunk per sequence behind its prefix): the prefix priming through the compress kernel and the compress
+    helper, compile / execute / run over the declared block, the slab views, the two-stage oracle (``check_selection`` on the KERNEL's list,
+    the inherited ``check`` over it), the label and the e4m3 twin check.  No ``__init__`` -- ``_CaseBase``'s rule: each form's case builds its
+    own state (a different declaration, prefix and ring priming), so neither skips a base initializer."""
 
     def prime_prefix(self):
         """The PREFIX blocks of every live sequence (``j < floor(pos0 / 4)``) into the paged compressed-key cache through the compress kernel
@@ -2461,6 +2285,190 @@ class _IndexerCase(_CaseBase):
             f"max gap {max_rel:.4f} x top)"
         )
         return dict(agreement=agreement, rows=agree_rows, same_rows=same_rows, flips=flips, max_rel=max_rel)
+
+
+class _IndexerCase(_IndexerCaseBase):
+    """One decode step of the IN-BLOCK INDEXER over the pools: ``_Case``'s batch of sequences (the whole-sequence inputs per entry, the
+    dense reference's Q / K / V / gate, the NaN pools holding the oracle's prefix K / V, the table, the slots) plus the indexer's state --
+    the band's raw keys of every position from the oracle's own projection, the PREFIX blocks compressed through the compress kernel
+    into the paged compressed-key cache (page 0 the null page, NaN everywhere unwritten), the ring primed with the last ``cap`` raw
+    keys below the step (block 0 the null block), the position tables over the table's whole reach -- and the block declared
+    ``QsaSpec(index_source="indexer")`` over them.  The oracle is formed AFTER the run from the KERNEL's own list per row (the
+    two-stage oracle's second stage); ``check_selection`` is its first stage."""
+
+    def __init__(
+        self,
+        geom_kw,
+        s_q,
+        kv_lens,
+        *,
+        page=16,
+        layout="hnd",
+        dtype=BF16,
+        seed=0,
+        top_k=512,
+        return_lse=False,
+        fuse_gate=False,
+        split=None,
+        n_pages=None,
+        fuse_prepare=None,
+        cap=None,
+        slot_form=False,
+        rope_tables_only=False,
+        outputs=True,
+        lens_out=True,
+        index_cache_dtype=None,
+        sparse_tile_form=None,  # the sparse core's BODY knob (None = the block's "auto"; "lean" / "tcgen05" explicit)
+        sparse_sub_tiles_per_cta=None,
+    ):
+        self.s_q, self.kv_lens, self.page, self.layout, self.dtype, self.top_k = int(s_q), [int(x) for x in kv_lens], page, layout, dtype, top_k
+        self.block_lens_given, self.return_lse, self.fuse_gate, self.index_band = False, bool(return_lse), bool(fuse_gate), True
+        self.index_list_form, self.shared, self.fuse_prepare = None, False, fuse_prepare
+        self.sparse_tile_form, self.sparse_sub_tiles_per_cta = sparse_tile_form, sparse_sub_tiles_per_cta
+        self.slot_form, self.rope_tables_only, self.outputs, self.lens_out = bool(slot_form), bool(rope_tables_only), bool(outputs), bool(lens_out)
+        # the indexer CACHE dtype (QsaSpec.index_cache_dtype): the paged compressed-key cache, ix_q and the prefix priming in it (e4m3 = the e4m3
+        # indexer cache, 2026-10-21: the compress kernel's e4m3 store arm primes the prefix exactly as a prefill form's cast would); the ring bf16
+        self.index_cache_dtype = index_cache_dtype
+        self.cache_dtype = dtype if index_cache_dtype is None else index_cache_dtype
+        kw_g = dict(geom_kw, causal_bottom_right=True)
+        self.geom = GatedAttentionBlockGeometry(**kw_g, qsa=QsaSpec(top_k=top_k, index_source="indexer", index_band=True, index_cache_dtype=index_cache_dtype))
+        self.ref_geom = RefGeometry(**kw_g)
+        geom, ref_geom = self.geom, self.ref_geom
+        h_q, h_kv, d_model, d_i, h_i = geom.h_q, geom.h_kv, geom.d_model, geom.qsa.index_head_dim, geom.qsa.index_heads
+        G = h_q // h_kv
+        B = len(self.kv_lens)
+        g = torch.Generator(device=_DEV).manual_seed(seed)
+        self.gen = g
+
+        def randn(*shape, std=0.02):
+            return (torch.randn(*shape, generator=g, device=_DEV, dtype=torch.float32) * std).to(dtype)
+
+        n_dense = sum(geom.qkvg_block_widths[:4])
+        w_qkvg = randn(geom.n_qkvg, d_model)
+        self.w = dict(
+            w_qkvg=w_qkvg,
+            w_q_norm=torch.ones(D, dtype=dtype, device=_DEV),
+            w_k_norm=torch.ones(D, dtype=dtype, device=_DEV),
+            w_o=randn(d_model, h_q * D),
+            w_iq_norm=(1.0 + 0.03 * randn(d_i, std=1.0).float()).to(dtype),
+            w_ik_norm=(1.0 + 0.02 * randn(d_i, std=1.0).float()).to(dtype),
+        )
+        self.w_band_k = w_qkvg[n_dense + h_i * d_i :]  # [d_i, d_model]: the band's raw-key head
+        L_max = max(max(self.kv_lens), s_q)
+        self.max_pages = max(-(-L_max // page), 1)
+        self.n_pos = self.max_pages * page  # the position tables cover the table's whole reach (the RoPE-table ceiling met with equality)
+        cos_t, sin_t = _rope_tables(self.n_pos, dtype, ref_geom)
+        self.cos_pos, self.sin_pos = cos_t, sin_t  # [1, n_pos, ROPE]
+        scale = geom.scale
+        self.scale, self.G = scale, G
+        self.h = torch.zeros(B, s_q, d_model, dtype=dtype, device=_DEV)
+        self.cos = cos_t[0, :1].expand(s_q, ROPE).clone()[None].expand(B, s_q, ROPE).clone()
+        self.sin = sin_t[0, :1].expand(s_q, ROPE).clone()[None].expand(B, s_q, ROPE).clone()
+        self.ref_out = torch.zeros(B, s_q, d_model, dtype=dtype, device=_DEV)
+        self.ref_o_gated = torch.zeros(B, s_q, h_q, D, dtype=dtype, device=_DEV)
+        self.ref_lse = torch.full((B, h_q, s_q), float("-inf"), dtype=torch.float32, device=_DEV)
+        self.ref_rows, self.refs, self.k_raw_full = {}, {}, {}
+        self.live_rows = torch.zeros(B, s_q, dtype=torch.bool, device=_DEV)
+        for b, L in enumerate(self.kv_lens):
+            pos = torch.arange(s_q, device=_DEV) + (L - s_q)
+            live = pos >= 0
+            self.live_rows[b] = live
+            if L == 0:
+                continue
+            h_full = randn(1, L, d_model, std=1.0)
+            ref = gated_attention_block_reference(
+                h_full, w_qkvg[:n_dense], self.w["w_q_norm"], self.w["w_k_norm"], cos_t[:, :L], sin_t[:, :L], self.w["w_o"], ref_geom
+            )
+            self.refs[b] = ref
+            self.ref_rows[b] = (ref.k[0], ref.v[0])
+            # the band's raw key of every position: the oracle's own projection, ONE rounding (the prefix blocks and the ring are built from it)
+            self.k_raw_full[b] = (h_full[0].float() @ self.w_band_k.float().t()).to(dtype)  # [L, d_i]
+            p_live = pos[live]
+            self.h[b, live] = h_full[0, p_live]
+            self.cos[b, live] = cos_t[0, p_live]
+            self.sin[b, live] = sin_t[0, p_live]
+        # pages: block 0 reserved (NULL); each live entry gets ceil(L / P) pages from a permutation of 1 .. n_pages - 1; -1 past them
+        need = sum(-(-L // page) for L in self.kv_lens)
+        self.n_pages = n_pages if n_pages is not None else need + 1 + 2
+        assert self.n_pages >= need + 1, (self.n_pages, need)
+        perm = (torch.randperm(self.n_pages - 1, generator=g, device=_DEV) + 1).tolist()
+        self.block_table = torch.full((B, self.max_pages), -1, dtype=torch.int32, device=_DEV)
+        it = iter(perm)
+        slots = torch.full((B * s_q,), -1, dtype=torch.int32, device=_DEV)
+        self.k_cache, self.v_cache = _pools(self.n_pages, h_kv, page, layout, dtype)
+        self.index_cache = None  # the raw-key pool of the caller-list band form: nothing here (the raw key lives in the ring)
+        self.rpp = page // BS
+        self.cap = int(cap) if cap is not None else (4 if s_q == 1 else 8)  # the serving stacks' ring: 4 without speculative rows, 8 with 1 .. 4
+        self.index_kv_cache = torch.full((self.n_pages, self.rpp, 1, d_i), float("nan"), dtype=self.cache_dtype, device=_DEV)
+        self.index_state_cache = torch.full((B + 1, self.cap, 1, d_i), float("nan"), dtype=dtype, device=_DEV)
+        self.index_state_block_table = torch.zeros(B, 1, dtype=torch.int32, device=_DEV)
+        self.pages = {}
+        for b, L in enumerate(self.kv_lens):
+            if L == 0:
+                self.block_table[b] = 0  # the dead entry: the NULL block / the null ring block, slots -1
+                continue
+            pages = [next(it) for _ in range(-(-L // page))]
+            self.pages[b] = pages
+            self.block_table[b, : len(pages)] = torch.tensor(pages, dtype=torch.int32, device=_DEV)
+            self.index_state_block_table[b, 0] = b + 1
+            k_rows, v_rows = self.ref_rows[b]
+            pos0 = L - s_q
+            for p in range(max(pos0, 0)):  # the PREFIX: the oracle's rows into the pools
+                pg, off = pages[p // page], p % page
+                self.k_cache[pg, :, off] = k_rows[p]
+                self.v_cache[pg, :, off] = v_rows[p]
+            for j in range(s_q):  # the step's live tokens: written through by the block
+                p = pos0 + j
+                if p >= 0:
+                    slots[b * s_q + j] = pages[p // page] * page + p % page
+            # the ring: the last `cap` raw keys below the step, position-indexed
+            for p in range(max(0, pos0 - self.cap), max(pos0, 0)):
+                self.index_state_cache[b + 1, p % self.cap, 0] = self.k_raw_full[b][p]
+        self.slot_mapping = slots
+        self.kv_lens_t = torch.tensor(self.kv_lens, dtype=torch.int32, device=_DEV)
+        self.prefix_bits = (_bits(self.k_cache).clone(), _bits(self.v_cache).clone())
+        # the ring's WRITE rows as the stack spells them (block x cap + pos % cap, -1 on a dead row), slot_mapping's dtype
+        pos_all = torch.tensor([[L - s_q + j for j in range(s_q)] for L in self.kv_lens], device=_DEV, dtype=torch.long)
+        blk_of = self.index_state_block_table.long()
+        self.ring_slots = (
+            torch.where((pos_all >= 0) & (blk_of > 0), blk_of * self.cap + pos_all % self.cap, torch.full_like(pos_all, -1)).reshape(-1).to(torch.int32)
+        )
+        self.block_ids_out = torch.full((B, s_q, top_k), _SENT_I32, dtype=torch.int32, device=_DEV) if outputs else None
+        self.block_lens_out = torch.full((B, s_q), _SENT_I32, dtype=torch.int32, device=_DEV) if lens_out else None
+        kw = dict(
+            paged_kv_page_size=page,
+            kv_source=KV_SOURCE_PAGED,
+            sample_k_cache=self.k_cache,
+            sample_v_cache=self.v_cache,
+            sample_block_table=self.block_table,
+            sample_index_kv_cache=self.index_kv_cache,
+            sample_index_state_cache=self.index_state_cache,
+            sample_index_state_block_table=self.index_state_block_table,
+            fuse_gate=fuse_gate,
+            return_lse=return_lse,
+            decode_split_kv=split,
+            fuse_prepare=fuse_prepare,
+            index_state_slot_mapping_present=self.slot_form,
+            rope_position_tables_only=self.rope_tables_only,
+        )
+        if sparse_tile_form is not None:
+            kw["sparse_tile_form"] = sparse_tile_form
+        if sparse_sub_tiles_per_cta is not None:
+            kw["sparse_sub_tiles_per_cta"] = sparse_sub_tiles_per_cta
+        self.blk_kw = kw
+        self.out = torch.empty(B, s_q, d_model, dtype=dtype, device=_DEV)
+        self.lse = torch.empty(B, h_q, s_q, dtype=torch.float32, device=_DEV) if return_lse else None
+        tables = (None, None) if self.rope_tables_only else (self.cos, self.sin)
+        self.blk = GatedAttentionBlockFwd(self.h, self.w["w_qkvg"], self.w["w_q_norm"], self.w["w_k_norm"], *tables, self.w["w_o"], self.out, self.geom, **kw)
+        assert (
+            isinstance(self.blk._sdpa, _SparseSdpa)
+            and self.blk.indexer_decode
+            and not self.blk.qsa_shared_list
+            and isinstance(self.blk._indexer_decode, _IndexerDecode)
+        )
+        assert self.blk.index_cache_dtype == self.cache_dtype and self.blk._indexer_decode.cache_dtype == self.cache_dtype
+        self.ws = None
+        self._compress = {}
 
 
 def _two_launches_indexer(case: _IndexerCase, what: str):

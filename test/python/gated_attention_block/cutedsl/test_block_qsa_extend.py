@@ -18,7 +18,7 @@ cc 10.0 / 10.3 reading declined by the sparse part statement), the envelope's ne
 rounding attribute's reach: EVERY writer of an indexer row (the prefill form, the decode step unfused and fused, the extend step) carries the
 declared value, the prefill form's ``compile()`` handing it to the compress recipe.
 
-Rubin cells (``requires_rubin``): the EXTEND ladder against the TWO-STAGE oracle of the decode module (``_IndexerCase``, here subclassed: the
+Rubin cells (``requires_rubin``): the EXTEND ladder against the TWO-STAGE oracle of the decode module (``_IndexerCaseBase``, the methods shared with ``_IndexerCase``, subclassed here: the
 prefix built from the oracle's own raw band -- the prefix blocks compressed into the paged cache, the ring primed with the last ``cap``
 positions below the chunk, exactly the form's ring INPUT contract --, ``n_vis`` derived on the HOST from ``kv_lens`` and the positions, never
 from the kernel's ``ix_counts``): chunk starts at every residue (incl. residue 2), a true shorter-than-the-remainder chunk (``T < 4 - P % 4``),
@@ -138,9 +138,9 @@ def _prefix_only_reference(h_full, w_dense, w_q_norm, w_k_norm, cos, sin, ref_ge
     return types.SimpleNamespace(q=q, k=k, v=v, gate=gate)
 
 
-class _IndexerExtendCase(_qsa._IndexerCase):
-    """One EXTEND step (a T-row chunk per sequence behind its prefix) of the IN-BLOCK INDEXER over the pools: the decode module's ``_IndexerCase``
-    state built for ``S_q = T`` rows -- the whole-sequence inputs per entry (the dense reference, or its prefix-only twin for a very long
+class _IndexerExtendCase(_qsa._IndexerCaseBase):
+    """One EXTEND step (a T-row chunk per sequence behind its prefix) of the IN-BLOCK INDEXER over the pools: the state of the decode module's
+    ``_IndexerCase``, built here on the shared ``_IndexerCaseBase`` methods for ``S_q = T`` rows -- the whole-sequence inputs per entry (the dense reference, or its prefix-only twin for a very long
     prefix), the NaN pools holding the oracle's prefix K / V, the paged compressed-key cache primed with the PREFIX blocks ``j < floor(P / 4)``
     through the compress kernel over the oracle's raw band, the ring primed with the last ``cap`` positions below the chunk (the form's ring
     INPUT contract), the stack's ring slots for the chunk's LAST ``cap`` positions and ``-1`` elsewhere -- and the block declared with
@@ -173,12 +173,9 @@ class _IndexerExtendCase(_qsa._IndexerCase):
         prefix_only=False,
         max_pages=None,
     ):
-        # ``_IndexerCase.__init__`` is deliberately NOT called: it declares and sizes the DECODE step's block (``S_q`` rows at the step, the
-        # prefix below it, the decode form's samples and slots) over the oracle state it builds -- a different declaration from this chunk
-        # form's (``index_select_form``, the stack's ring slots, the rounding attribute, ``cap`` free of ``S_q``) and a different prefix /
-        # ring priming; the base's state is rebuilt here field by field for the chunk, and only its METHODS (the oracle, the pools, the
-        # compress helper, ``check`` / ``run``) are inherited.  Calling the base init would declare a decode block and allocate its tensors
-        # for nothing.
+        # the chunk form's state, built from scratch on ``_IndexerCaseBase`` (which has no ``__init__``): the decode step's ``_IndexerCase``
+        # builds the DECODE declaration over the same oracle state -- this form's differs (``index_select_form``, the stack's ring slots, the
+        # rounding attribute, ``cap`` free of ``S_q``) and so does its prefix / ring priming
         self.s_q, self.kv_lens, self.page, self.layout, self.dtype, self.top_k = int(s_q), [int(x) for x in kv_lens], page, layout, dtype, top_k
         self.block_lens_given, self.return_lse, self.fuse_gate, self.index_band = False, bool(return_lse), bool(fuse_gate), True
         self.index_list_form, self.shared, self.fuse_prepare = None, False, fuse_prepare
@@ -390,8 +387,7 @@ class _IndexerExtendCase(_qsa._IndexerCase):
         return out
 
     def compile(self):
-        self.prime_prefix()
-        super(_qsa._IndexerCase, self).compile()
+        super().compile()  # the shared compile: this form's prefix priming, then the block's check_support / compile / workspace
         self.snapshot()
         return self
 
