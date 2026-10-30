@@ -269,7 +269,7 @@ combine those groups in fixed order.
 
 If the selected bounded-wave layout would exceed 16 GiB, the generic M64 plan
 keeps each query wave at 128 CTAs and assigns one FP32 dKV plane to each
-cluster. Queries below 2048 rows prefer sixteen eight-CTA clusters; larger
+cluster. Queries below 8192 rows prefer sixteen eight-CTA clusters; larger
 queries prefer thirty-two four-CTA clusters for additional reducer parallelism.
 If that preferred layout's complete FP32-plane and packed-mask allocation would
 exceed 32 GiB, the plan selects an eight-plane, sixteen-CTA memory-first relay.
@@ -346,16 +346,13 @@ scratch.
 The follow-up relay scheduling pass was measured against merged commit
 `1dea4471a6e6c05e29d3bf281281fd156d345a84` on the same SM100 environment with
 PyTorch 2.14.1+cu130, CuTe DSL 4.8.1, cuDNN 9.24.0, BF16 H64, top-k 2048,
-five warm-ups, and 40 allocation-free calls. It preserves the memory-bounded
-relay layouts except at the measured 2K/4K crossover, where four-CTA relays
-trade 2.25 GiB of additional scratch for substantially lower latency while
-remaining far below the 18 GiB 128-plane layout.
+five warm-ups, and 40 allocation-free calls. The automatic policy preserves
+the conservative eight-CTA layout below Q=8K because an earlier cluster-4
+crossover did not generalize across SM100 devices.
 
 | Dqk | Q | KV | Merged latency | Optimized latency | Speedup | Merged scratch | Optimized scratch |
 |---:|---:|---:|---:|---:|---:|---:|---:|
 | 576 | 1024 | 65536 | 6.957 ms | 4.466 ms | 1.56x | 2.258 GiB | 2.258 GiB |
-| 576 | 2048 | 65536 | 12.744 ms | 7.114 ms | 1.79x | 2.267 GiB | 4.517 GiB |
-| 576 | 4096 | 65536 | 24.332 ms | 11.980 ms | 2.03x | 2.283 GiB | 4.533 GiB |
 | 576 | 8192 | 131072 | 31.677 ms | 24.142 ms | 1.31x | 9.129 GiB | 9.129 GiB |
 | 576 | 16384 | 262144 | 64.390 ms | 48.320 ms | 1.33x | 18.508 GiB | 18.508 GiB |
 | 576 | 16384 | 524288 | 101.409 ms | 64.426 ms | 1.57x | 10.008 GiB | 10.008 GiB |

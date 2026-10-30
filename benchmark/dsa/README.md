@@ -339,9 +339,10 @@ python benchmark_dsa_sparse_attention_backward.py --nheads 128  # SM100/SM103 BF
 python benchmark_dsa_sparse_attention_backward.py --nheads 128 --head-dim 576 --csv d576_2cta.csv  # SM100/SM103 BF16 H128/D576 two-CTA backend
 ```
 
-The H128/D576 two-CTA route uses the same public-wrapper measurement, including
-workspace allocation and initialization. Add `--no-topk-length` to cover the
-variant without a lengths tensor; the default passes a full-length tensor.
+The H128/D576 two-CTA route uses the same compiled-plan measurement, with
+workspace allocation during setup and buffer reuse in timed calls. Add
+`--no-topk-length` to cover the variant without a lengths tensor; the default
+passes a full-length tensor.
 The existing benchmark arguments and CSV format apply to both variants.
 
 Options:
@@ -387,19 +388,20 @@ supported DSL.
 ##### SM100 deterministic relay scheduling (2026-10-30)
 
 Against merged commit `1dea4471a6e6c05e29d3bf281281fd156d345a84`, the
-deterministic H64/D576 relay path improved from 6.957/12.744/24.332 ms to
-4.466/7.114/11.980 ms at Q=1K/2K/4K and KV=64K. At Q=16K, KV=512K it
-improved from 101.409 to 64.426 ms with the same 10.008 GiB workspace.
+deterministic H64/D576 relay path improved from 6.957 to 4.466 ms at Q=1K,
+KV=64K and from 101.409 to 64.426 ms at Q=16K, KV=512K with the same
+10.008 GiB workspace.
 Inputs were BF16 with top-k 2048, full runtime lengths, synthetic forward
 statistics, five warm-ups, and 40 allocation-free calls on the SM100 test
 environment (PyTorch 2.14.1+cu130, CuTe DSL 4.8.1, cuDNN 9.24.0).
 
-The 2K/4K policy now uses four-CTA relays (4.517/4.533 GiB) instead of the
-2.267/2.283 GiB eight-CTA layout; the full 128-plane layout would require
-about 18 GiB. Other measured relay workspaces are unchanged. Nsys attributes
-the Q=4K gain primarily to the 32 main-kernel waves: their total falls from
-22.941 to 9.696 ms. The optimized trace has no separate dKV prefold kernel;
-fixed-order conversion takes 1.452 ms and workspace clearing 0.658 ms.
+The automatic policy keeps the conservative eight-CTA relay below Q=8K
+because the earlier cluster-4 crossover did not generalize across SM100
+devices. An explicit Q=4K cluster-4 profiling experiment attributed its local
+gain primarily to the 32 main-kernel waves, whose total fell from 22.941 to
+9.696 ms; this is implementation evidence, not the portable automatic policy.
+The optimized trace has no separate dKV prefold kernel; fixed-order conversion
+takes 1.452 ms and workspace clearing 0.658 ms.
 
 NCU reports 96 registers per thread and 231.42 KiB dynamic shared memory for
 the cluster-4 main kernel, limiting residency to one CTA per SM; achieved
