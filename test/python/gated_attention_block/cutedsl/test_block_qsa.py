@@ -404,7 +404,9 @@ def test_decode_indexer_declines_are_published_row_by_row_and_the_envelope_names
     assert dense.index_sources == () and dense.index_page_sizes == () and dense.index_query_rows_max == 0 and dense.fuse_prepare_default is False
     assert GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=(10, 0)).decode.fuse_prepare_default is False  # an unmeasured part
     assert not (set(tokens) & set(dense.declines))
-    assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-18:] == [  # the append-only tail: the EXTEND step's four fields after route_cc (2026-10-29)
+    # the append-only tail: the EXTEND step's four fields after route_cc (2026-10-29); `quant_modes` appended after them 2026-10-30 (the quant
+    # spellings the DENSE paged forms serve on the part -- the FP8-projection + bf16-attention mode; `()` on every QsaSpec geometry)
+    assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-19:] == [
         "index_sources",
         "index_cache_dtypes",
         "index_head_dims",
@@ -423,7 +425,9 @@ def test_decode_indexer_declines_are_published_row_by_row_and_the_envelope_names
         "index_extend_ring_rows_min",
         "index_extend_select_budget_bytes",
         "index_compress_roundings",
+        "quant_modes",
     ]
+    assert dense.quant_modes == (("QuantSpec(attention_dtype=torch.bfloat16)",) if dense.served else ()), "a served dense form on cc 10.7 names the mode"
 
 
 # ---------------------------------------------------------------------------

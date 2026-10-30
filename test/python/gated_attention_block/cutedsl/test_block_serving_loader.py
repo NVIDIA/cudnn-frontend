@@ -331,6 +331,77 @@ def test_qkvg_from_vllm_rejects():
 
 
 # ---------------------------------------------------------------------------
+# e4m3 codes: the permutation on the BYTES (a static-scale FP8 W8A8 checkpoint's merged weight), the per-tensor scale untouched
+# ---------------------------------------------------------------------------
+
+
+def _e4m3_layer(name: str):
+    """The HF layer's three projections as e4m3 CODES under ONE per-tensor scale (a serving stack's FP8 W8A8 checkpoint: the merged
+    qkv weight quantized at its amax), plus that scale."""
+    hf = _hf_layer(name)
+    merged = _merged(hf.q_proj, hf.k_proj, hf.v_proj).float()
+    scale = float(448.0 / merged.abs().amax())
+    codes = (merged * scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    rows_q, rows_kv = hf.q_proj.shape[0], hf.k_proj.shape[0]
+    return hf, codes, codes[:rows_q], codes[rows_q : rows_q + rows_kv], codes[rows_q + rows_kv :], scale
+
+
+@pytest.mark.parametrize("name", sorted(GEOMS))
+def test_qkvg_from_vllm_permutes_e4m3_codes_as_bytes_and_keeps_the_per_tensor_scale(name):
+    """A merged ``qkv_proj.weight`` of e4m3 CODES (one per-tensor scale): ``qkvg_from_vllm`` / ``qkvg_from_hf`` return e4m3 codes, contiguous --
+    BITWISE the independent permutation on the uint8 view, bitwise each other, and ``dequant(perm(codes)) == perm(dequant(codes))`` (the
+    permutation and the per-tensor dequant commute, so the stack's scale travels unchanged as ``QuantSpec.descale_w_qkvg``); the norm weights
+    come back in ``act_dtype`` exactly as for 16-bit values; a non-contiguous merged weight and the shard slices permute the same bytes."""
+    g = GEOMS[name]
+    hf, codes, q8, k8, v8, scale = _e4m3_layer(name)
+    got = qkvg_from_vllm(codes, hf.q_norm, hf.k_norm, g)
+    want = qkvg_from_hf(q8, k8, v8, hf.q_norm, hf.k_norm, g)
+    _assert_three_equal(got, want)
+    w8, w_q_norm, w_k_norm = got
+    assert w8.dtype == torch.float8_e4m3fn and w8.shape == codes.shape and w8.is_contiguous() and w_q_norm.dtype == torch.bfloat16
+    assert torch.equal(w8.view(torch.uint8), _permute_rows(codes.view(torch.uint8), g)), "the codes' bytes are not the permutation of the input's bytes"
+    assert torch.equal(w8.float() * (1.0 / scale), _permute_rows(codes.float() * (1.0 / scale), g)), "dequant and the permutation do not commute"
+    assert torch.equal(w_q_norm, (1.0 + hf.q_norm.float()).to(torch.bfloat16)) and torch.equal(w_k_norm, (1.0 + hf.k_norm.float()).to(torch.bfloat16))
+    # the bf16 VALUES' permutation is the dequantized codes' permutation, value for value (what a stack that dequantizes first would see)
+    w_vals, _, _ = qkvg_from_vllm((codes.float() * (1.0 / scale)).to(torch.bfloat16), hf.q_norm, hf.k_norm, g)
+    assert torch.equal(w_vals, (w8.float() * (1.0 / scale)).to(torch.bfloat16))
+    # a non-contiguous merged weight -- a COLUMN slice of a wider tensor (the row stride exceeds d_model; a leading-row slice would stay
+    # contiguous) -- permutes the same bytes
+    wide = torch.empty(codes.shape[0], g.d_model + 16, dtype=torch.float8_e4m3fn)[:, : g.d_model]
+    wide.copy_(codes)
+    assert not wide.is_contiguous() and torch.equal(wide.view(torch.uint8), codes.view(torch.uint8))
+    w8_nc, _, _ = qkvg_from_vllm(wide, hf.q_norm, hf.k_norm, g)
+    assert torch.equal(w8_nc.view(torch.uint8), w8.view(torch.uint8))
+    # the rank slices (TP 2): the shard of the TP 1 codes, bitwise
+    q, k, v, g_r, kv_rank = _rank_slices(HfLayer(q8, k8, v8, hf.q_norm, hf.k_norm), g, 2, 1)
+    w8_r, _, _ = qkvg_from_vllm(_merged(q, k, v), hf.q_norm, hf.k_norm, g_r)
+    assert torch.equal(w8_r.view(torch.uint8), _shard_of_the_tp1_weight(w8, g, g_r, 1, kv_rank).view(torch.uint8))
+
+
+def test_qkvg_from_vllm_refuses_mixed_e4m3_and_16_bit_projections_and_keeps_the_band_arm():
+    """e4m3 codes beside 16-bit values are refused by name (one per-tensor scale covers every projection of an FP8 checkpoint); the indexer
+    band's fifth band permutes as bytes too (appended rows or the separate argument), bitwise."""
+    hf, codes, q8, k8, v8, _scale = _e4m3_layer("24_2")
+    g = GEOMS["24_2"]
+    with pytest.raises(ValueError, match="q_proj_weight, v_proj_weight are e4m3 codes but k_proj_weight are not"):
+        qkvg_from_hf(q8, hf.k_proj, v8, hf.q_norm, hf.k_norm, g)
+    with pytest.raises(ValueError, match="are e4m3 codes but q_proj_weight, v_proj_weight are not"):
+        qkvg_from_hf(hf.q_proj, k8, hf.v_proj, hf.q_norm, hf.k_norm, g)
+    gb = GEOM_SMALL_BAND
+    d, hq, hkv, dm = gb.d_head, gb.h_q, gb.h_kv, gb.d_model
+    gen = torch.Generator(device="cpu").manual_seed(3)
+    merged = (torch.randn(2 * hq * d + 2 * hkv * d, dm, generator=gen) * 0.02).to(torch.float8_e4m3fn)
+    band = (torch.randn(gb.qsa.index_band_cols, dm, generator=gen) * 0.02).to(torch.float8_e4m3fn)
+    w_n = torch.zeros(d)
+    sep, _, _ = qkvg_from_vllm(merged, w_n, w_n, gb, index_qk_proj_weight=band)
+    packed, _, _ = qkvg_from_vllm(torch.cat([merged, band], 0), w_n, w_n, gb)
+    assert sep.dtype == torch.float8_e4m3fn and sep.shape == (gb.n_qkvg, dm) and torch.equal(sep.view(torch.uint8), packed.view(torch.uint8))
+    assert torch.equal(sep[gb.qkvg_offsets[4] :].view(torch.uint8), band.view(torch.uint8)), "the band rides below V as the checkpoint stores it"
+    with pytest.raises(ValueError, match="index_qk_proj_weight are e4m3 codes but q_proj_weight, k_proj_weight, v_proj_weight are not"):
+        qkvg_from_vllm(merged.float().to(torch.bfloat16), w_n, w_n, gb, index_qk_proj_weight=band)
+
+
+# ---------------------------------------------------------------------------
 # The export: the package's name, the lazy `cudnn.gated_attention_block` attribute, the API index row
 # ---------------------------------------------------------------------------
 

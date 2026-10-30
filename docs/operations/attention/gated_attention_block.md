@@ -49,6 +49,7 @@ so they are unspellable on the bf16 and per-tensor FP8 pipelines rather than dec
 |---|---|---|
 | bf16 / fp16 | `h`, weights and `cos`/`sin` in bf16 or fp16, `quant=None` | 5 stages, 5 launches (4 with `inplace_qkv`) |
 | FP8, per-tensor static scales | e4m3 `h` / `W_qkvg` / `W_o` and a `QuantSpec` | unfused: FP8 projections with the descale folded into the epilogue, bf16 norm+RoPE, two quantize passes (Q/K/V, gated O), the Rubin per-tensor FP8 SDPA and an FP8 out projection (9 launches); fully fused: 3 launches |
+| FP8 projections + bf16 attention + e4m3 gated O -- the PAGED serving forms (2026-10-30) | e4m3 `h` / `W_qkvg` / `W_o` and `QuantSpec(attention_dtype=torch.bfloat16)` (`QuantSpec.bf16_attention(descale_h, descale_w_qkvg, descale_w_o, scale_o)`), with `kv_source="paged"` | the two FP8 projections with the descale folded into their bf16 epilogue, bf16 norm+RoPE and pool write-through, the bf16 decode / prefill tiles over bf16 pools (the bf16 serving forms' own kernels and routes: the gate in the combine / the paged body's epilogue on cc 10.7, its own launch otherwise), ONE quantize pass (the gated O at `scale_o`) and the FP8 out projection -- launch counts MEASURED by the CUPTI census cell at decode row counts (B 2 x S_q 1, every kernel counted): cc 10.7 with the gate in the combine 6 (write-through folded) / 7 (separate cache write), 7 / 8 with the separate gate; cc 10.0 (the gate its own launch) 7 / 8 -- the bf16 serving chain's own counts for the same declaration: both FP8 forced-tile GEMMs are one kernel each where the bf16 chain's small-M out projection is a split-K kernel plus a reduce, so the quantize launch takes the reduce's place; the DECODE and EXTEND forms only ("Serving: FP8 projections with bf16 attention" below) |
 | MXFP8, per-32-element E8M0 block scales | e4m3 `h` / `W_qkvg` codes, the two scale-factor blobs (`h_sf`, `w_qkvg_sf`) and an `MxQuantSpec` | unfused: block-scale projection GEMM, bf16 norm+RoPE, MXFP8 quantize (Q/K rowwise, V columnwise), the Rubin d256 MXFP8 SDPA, per-tensor quantize of O, FP8 out projection (9 stages); fully fused: 3 launches |
 | MXFP8 with **MXFP4 weights** | `MxQuantSpec(w_qkvg_dtype=torch.float4_e2m1fn_x2)` and an e2m1 `W_qkvg [N, d_model // 2]`; `h`, `h_sf` and `w_qkvg_sf` unchanged | unfused: the MXFP8 pipeline with stage (1) on the catalog's mixed MXFP8 x MXFP4 block-scale row (E8M0 scales per 32 on both sides) -- the same 9 launches; fully fused: the same **3 launches**, the fused projection fork's e2m1-B arm reading the packed codes and the unchanged blob inside its norm+RoPE+quant epilogue (dense only, like the MXFP8 fused pipeline) |
 | MXFP8 with **fp4 O** (`NVFP4` or `MXFP4`) | `MxQuantSpec(o_fp4=Fp4Format.NVFP4 \| Fp4Format.MXFP4)`, an e2m1 `W_o [d_model, H_q * D // 2]` of the SAME format and its scale blob (`sample_w_o_sf` / `w_o_sf`) | the per-tensor tail is replaced: one `quantize_fp4` launch writes the gated `O` as e2m1 codes plus the out projection's scale blob, and stage (6) becomes the fp4 x fp4 block-scale GEMM (no per-tensor scale on either side). Unfused: 9 launches (`quantize_fp4` takes the per-tensor quantize's place); fully fused: **4 launches** (the gated MXFP8 SDPA writes bf16 `O`, then `quantize_fp4`, then the fp4 out projection). Composes with the MXFP4 weights on both pipelines (fully fused: the e2m1-B projection fork + the fp4 tail, 4 launches) |
@@ -701,7 +702,10 @@ Served on the bf16 / f16 inference pipelines (`inplace_qkv` on or off, `fuse_nor
 on or off, dense or packed); validated on Rubin at pages 16 / 32 / 64 / 128 on all three pool layouts, dense and packed, bf16
 and f16 (the live pool rows bitwise the K / V rows attention consumed; padded tokens unwritten). `quant` (the pools of a
 quantized cache arrive with a cache-dtype attribute and its cast kernel) and `save_for_backward` with `paged_kv_page_size` are
-typed `NotImplementedError`s naming the feature; a CuTe DSL below FROST's floor is declined at `check_support`, named with
+typed `NotImplementedError`s naming the feature -- with ONE exception since 2026-10-30: the FP8-projection + bf16-attention mode
+(`QuantSpec(attention_dtype=torch.bfloat16)`, "Serving: FP8 projections with bf16 attention" below) writes bf16 post-RoPE K / V
+into bf16 pools exactly as the bf16 block does and is served on the paged forms (the decline's text names it as the way in); a
+CuTe DSL below FROST's floor is declined at `check_support`, named with
 the installed version, before the kernel module is imported.
 
 `fuse_prepare=True` needs the attribute (a `ValueError` without it), the in-place pipeline (`inplace_qkv=True`, a `ValueError`
@@ -872,8 +876,16 @@ selected specialization cannot serve raise typed errors at construction (`check_
 
 Quantization specs:
 
-- `QuantSpec(descale_h, descale_w_qkvg, descale_w_o, scale_q, scale_k, scale_v, scale_o, dtype=torch.float8_e4m3fn)`
-  — static per-tensor scales for the FP8 pipeline.
+- `QuantSpec(descale_h, descale_w_qkvg, descale_w_o, scale_q, scale_k, scale_v, scale_o, dtype=torch.float8_e4m3fn,
+  attention_dtype=None)` — static per-tensor scales for the FP8 pipeline.  `attention_dtype` (appended 2026-10-30; an op
+  attribute, never a knob -- it changes the numerics) selects what stage (4) computes on: `None` = the fp8 d256 SDPA pipeline
+  above (Q / K / V quantized at `scale_q` / `scale_k` / `scale_v`), `torch.bfloat16` = the FP8-PROJECTION + BF16-ATTENTION mode
+  of the paged serving forms, under which `scale_q` / `scale_k` / `scale_v` MUST be `None` (there is no Q / K / V quantization
+  point: each is refused by name otherwise) and the three descales and `scale_o` stay finite positive floats;
+  `QuantSpec.bf16_attention(descale_h, descale_w_qkvg, descale_w_o, scale_o)` spells it, `QuantSpec.attention_bf16` reads it back.
+  `validate()` rows: the dtype (e4m3 only), `attention_dtype` None / bf16 only (`torch.float16` by name: the quantized pipelines'
+  activation dtype is bf16), a `None` scale under `attention_dtype=None` a typed `ValueError` naming the scale and the way in, a
+  Q / K / V scale set under the mode a `ValueError` naming it.  `attention_dtype` is a plan fact of `update_quant_scales` (below).
 - `MxQuantSpec(descale_w_o, scale_o=1.0, dtype=torch.float8_e4m3fn, block_size=32, w_qkvg_dtype=torch.float8_e4m3fn,
   o_fp4=None)` — the MXFP8 pipeline; the MXFP8 SDPA writes e4m3 `O` unscaled, so the fully fused path needs
   `scale_o == 1.0`. The two appended fields select the fp4 modes:
@@ -1033,7 +1045,8 @@ activation dtype) is the bf16 / f16 pool as before.  Two served forms, one attri
   `fuse_gate` says); `get_workspace_size()` grows by the scratch (2.2 MB per item) and holds it.
 
 Typed declines (each pinned by `test_block_qsa_fp8_kv.py`): `torch.float8_e5m2` (by name) and any other dtype; the attribute without
-`paged_kv_page_size`; `quant` / `save_for_backward` with it (the write-through's own rows); f16 activations; over the pools the EXTEND
+`paged_kv_page_size`; `quant` / `save_for_backward` with it (the write-through's own rows; the FP8-projection + bf16-attention mode
+too -- its pools STAY bf16, an e4m3 cache under it is a follow-up: the attribute's own row names it); f16 activations; over the pools the EXTEND
 form and the dense DECODE form (the paged THD body and the decode tile read bf16 / f16 pools: a dense e4m3 pool needs the tile's in-kernel
 dequant arm -- a follow-up), `S_q > 4` (the per-token list form: 2.2 MB of scratch per item), `return_lse` (the tile over the scratch
 writes item-major Stats), `decode_split_kv > 1` (unsplit over at most 17 KV tiles per item), `fuse_norm_rope` and an explicit
@@ -1051,6 +1064,8 @@ inside the write kernel and the in-kernel dequant are the levers a later change 
 
 ### Serving: the extend form (`kv_source="paged"`, `token_capacity`)
 
+Served for bf16 / f16 activations (`quant=None`) and, since 2026-10-30, under the FP8-projection + bf16-attention mode
+(`QuantSpec(attention_dtype=torch.bfloat16)` with e4m3 `h` / weights over the same bf16 pools: the section below; cc 10.7 and cc 10.0).
 Served on cc 10.7 (the cells below) and, since 2026-10-29, on cc 10.0 through the same binding -- the shared SM100 d256 paged THD body
 (`sm100/prefill_d256_f16.py`: CGA2, unsplit, unpacked, NATURAL, no gate, no LSE), the write-through before it, the sigmoid gate as its
 own launch; functional only, unmeasured there, `fuse_gate=True` and `fuse_norm_rope=True` typed declines by name (the part table at the
@@ -1096,7 +1111,7 @@ and `serving_envelope().extend.pdl_stages` says so before anything is declared.
 
 | appended | contract |
 |---|---|
-| `kv_source` | `"self"` (default) or `"paged"`; `"paged"` requires `paged_kv_page_size > 0`, `thd=True`, `geometry.is_causal=True` and `geometry.causal_bottom_right=True`, bf16 / f16 activations, inference (`save_for_backward=False`), `return_lse=False`, `fuse_gate` as declared (`True` folds stage (5) into the paged SDPA's epilogue), `window_left=-1`, `window_right` unbounded or 0, no `QsaSpec`, `d_head=256`; every other combination is a typed decline naming the feature (`GatedAttentionBlockFwd.serving_envelope` lists them) |
+| `kv_source` | `"self"` (default) or `"paged"`; `"paged"` requires `paged_kv_page_size > 0`, `thd=True`, `geometry.is_causal=True` and `geometry.causal_bottom_right=True`, bf16 / f16 activations (`quant=None`) or the FP8-projection + bf16-attention mode (`QuantSpec(attention_dtype=torch.bfloat16)`, e4m3 `h` / weights, bf16 pools), inference (`save_for_backward=False`), `return_lse=False`, `fuse_gate` as declared (`True` folds stage (5) into the paged SDPA's epilogue), `window_left=-1`, `window_right` unbounded or 0, no `QsaSpec`, `d_head=256`; every other combination is a typed decline naming the feature (`GatedAttentionBlockFwd.serving_envelope` lists them) |
 | `token_capacity` | THD only; `None` = the tight contract (lengths sum to `T`), an int = the BOUNDED form and must equal the samples' packed row count `T`: a step's lengths may sum to `T_live <= T`; rows `[T_live, T)` are pad rows -- finite `h` / `cos` / `sin`, slot `-1` (never written to the cache), never attended; their `out` rows are UNSPECIFIED but finite given finite inputs. Zero the workspace once and slice `out[:T_live]`: an unwritten `o` row then reads `0`, so pad rows of `out` are exactly `0` until a later, longer step overwrites those `o` rows (the `o` slot is aliased by no other stage's scratch -- pinned). Refused with `save_for_backward` (the backward's weight-gradient GEMMs contract over every row) |
 | `sample_k_cache`, `sample_v_cache`, `sample_block_table` | REQUIRED under `kv_source="paged"`, refused otherwise: the pools' `[num_pages, H_kv, P, D]` shape / dtype / strides (the three stride patterns of the write-through, K and V of one HND / NHD kind, every non-innermost stride a 16-byte multiple) and the `[num_sequences, max_pages]` int32 block table (its row stride is free -- a `[:, :max_pages]` slice of a wider table -- and compiled in); the logical `S_kv` the tables may address is `max_pages * P` |
 | `block_table` (execute) | `[num_sequences, >= max_pages]` int32 on `h`'s device, the page axis contiguous, the row stride as declared; row `b` lists sequence `b`'s pages in logical order (the serving stacks' NULL block `0` for a padded entry); read on device |
@@ -1331,7 +1346,8 @@ policy and the width cap the record reads are `serving_envelope(..., decode_rout
 helpers the declaration and `check_support` run, so no decline is reachable at `execute` that the record did not predict (the
 execute-time refusals are the caller's malformed tensors, form-checked by name). It never raises for a device the block does
 not serve. Typed declines of the form, at declaration: `kv_source="paged"` without `paged_kv_page_size`, a packed (`thd=True`)
-declaration (the EXTEND form is its own binding), a quantized `quant`, `save_for_backward`, a head dim other than 256, a sparse
+declaration (the EXTEND form is its own binding), a quantized `quant` other than the FP8-projection + bf16-attention mode
+(`QuantSpec(attention_dtype=torch.bfloat16)`: SERVED since 2026-10-30, the section below), `save_for_backward`, a head dim other than 256, a sparse
 geometry on the PACKED form (a dense `QsaSpec` declaration is the block-sparse decode mode below), `is_causal` without
 `causal_bottom_right`, a pool or table sample off its contract, `max_kv_len` past the table's reach, a step past
 `DECODE_MAX_ROWS = DECODE_MAX_S_Q = 32` tokens (dense geometries; the `decode_rows` row), a `decode_q_tile_max` held below the width
@@ -1502,6 +1518,77 @@ reach, the e4m3 cache twins, the 24 / 2 geometry, the extend pin at decode width
 budget, never bitwise), cache parity under both roundings, the two device-value reports, the workspace honesty with no allocation and no
 host sync, the launch census by kernel name, the capture after one warm-up, and the 301-token prompt as chunks [125, 2, 1, 173] followed by
 eight carried decode steps.
+
+### Serving: FP8 projections with bf16 attention (`QuantSpec(attention_dtype=torch.bfloat16)`)
+
+A serving stack whose attention projections are static per-tensor FP8 W8A8 while its KV cache and attention math are bf16 -- `qkv_proj`
+and `o_proj` each an FP8 linear with one input scale and one weight scale, the pools bf16, the `o_proj` INPUT an e4m3 tensor at the
+`o_proj` input scale -- declares the paged serving forms with e4m3 `h` / `W_qkvg` / `W_o` and
+`QuantSpec.bf16_attention(descale_h, descale_w_qkvg, descale_w_o, scale_o)` (= `QuantSpec(..., scale_q=None, scale_k=None,
+scale_v=None, ..., attention_dtype=torch.bfloat16)`; appended 2026-10-30; served on cc 10.7 and cc 10.0, `FP8_PROJ_BF16_ATTENTION_CCS`).  The pipeline:
+
+```
+(1)   proj        h8 x W8_qkvg -> fp32 -> * alpha_qkvg -> bf16 slab      the FP8 FROST GEMM (the forced 256-wide tile, the alpha epilogue): the unfused FP8 pipeline's stage (1)
+(2+3) norm+RoPE   in place on the slab's bf16 Q / K bands                 unchanged; the DECODE form's write-through fold (fuse_cache_write_small_m) admitted
+(4w)  write       post-RoPE K / V rows -> the bf16 pools at slot_mapping  unchanged (the pools STAY bf16)
+(4)   attention   the bf16 d256 decode tile [+ split combine] / the paged d256 prefill tile over the pools; Q / GATE = the slab bands    = the bf16 serving forms, route for route
+(5)   gate        in the combine (cc 10.7, the decode tile at split >= 2), in the paged body's epilogue (cc 10.7, fuse_gate=True), its own launch otherwise
+(5q)  quantize_o  o8 = cvt.rn.satfinite(bf16 O_gated * scale_o)           the one quantize launch of the mode (kernels/quantize.py)
+(6)   out_proj    o8 x W8_o -> fp32 -> * alpha_o -> bf16 out, alpha_o = descale_w_o / scale_o   the FP8 FROST GEMM
+```
+
+Launch counts, MEASURED by the CUPTI census cell (`test_fp8_proj_bf16_attention_launch_census_is_the_bf16_chain_plus_the_quantize_launch`,
+the 24 / 2 geometry at `d_model` 2560, B 2 x KV 512, S_q 1, the split ladder pinned at `decode_split_kv=4` -- the decode tile + its combine on
+every part --, no numerical reference; every kernel the profiler sees is counted and the per-arm totals are pinned, so
+a tree that changes a stage's kernel count turns the cell red and these numbers follow it): cc 10.7 -- six with the gate in the combine and
+the write-through folded, seven with the separate cache write, seven / eight with the separate gate (`fuse_gate=False`); cc 10.0, where the
+gate is always its own launch -- seven folded / eight with the separate cache write (`blk.cache_write_in_norm_rope` / `blk.gate_fused` read
+the arms back).  These are the bf16 serving chain's own counts for the same declaration: both FP8 forced-tile GEMMs run as one kernel each
+where the bf16 chain's small-M out projection runs as a split-K kernel plus a reduce kernel, so the mode's quantize launch takes the reduce's
+place; no memset or memcpy on either chain.  `scale_q` / `scale_k` / `scale_v` have no quantization point under the mode and are refused BY NAME if set;
+no descale reaches the SDPA; the workspace carves no compact e4m3 Q / K / V (`o8` alone); `MxQuantSpec` has no such attribute.
+
+**The static-scale mapping** (a stack's per-tensor FP8 W8A8 attention projections): `descale_h` = the qkv projection's INPUT scale
+(`x = x8 * s_in`); `descale_w_qkvg` = the merged qkv weight's ONE per-tensor weight scale (a stack that merges three per-matrix scales
+into one requantized scale hands that one -- the block has one alpha, three distinct scales are not its contract); `descale_w_o` = the o
+projection's weight scale; `scale_o` = `1 /` the o projection's INPUT scale (the stored e4m3 byte decodes as `byte * s_in_o`).  The merged
+weight's codes go through `qkvg_from_vllm` / `qkvg_from_hf` as e4m3 (the permutation runs on the bytes, the per-tensor scale is
+unchanged by it; per-tensor scales only).  Host / device contract: the scales are Python floats at declaration (finite positive,
+`validate()`), THREE 1-element fp32 device tensors (`alpha_qkvg`, `alpha_o`, `scale_o`) allocated at `compile()`, written on the launch
+stream at the first execute and by `update_quant_scales` (which refuses a differing `attention_dtype` as a plan fact); no host readback,
+no device read on the host path; a captured FIRST execute pins the captured values -- warm up before capturing (the rule above).
+
+**Numerics.** The block's byte is `cvt.rn.satfinite(bf16(O32 * sigmoid(G)) * scale_o)` on the combine / epilogue routes (one bf16
+rounding of the gated value) and `cvt.rn.satfinite(bf16(bf16(O32) * sigmoid(G)) * scale_o)` on the elementwise-gate routes; a serving
+stack's gate-and-quantize convention, `e4m3(bf16(bf16(O) * sigmoid(G)) * inv)` with `inv = scale_o`, is the same class -- within ONE e4m3
+ulp at the larger magnitude wherever one e4m3 ulp exceeds the chain's ABSOLUTE noise floor -- the e4m3 value band `|x| >= 4`, where one
+ulp is `>= 0.5`: near zero the two chains differ not by a rounding of a shared value but by the kernels' tanh-form sigmoid against torch's
+for strongly negative gates and by the attention's own accumulation order, an absolute floor that is many ulps of the `2^-9` subnormal
+spacing, so below the band the distances are reported, never claimed, and no tolerance is widened; never bitwise; the oracle of the cells replicates the mode's one quantization point and the bound is the bf16 serving forms' own
+(`cos(out) > 0.999`, never the fp8 suite's 0.99).  A padded entry (`kv_lens = 0`) stores the byte 0 and its `out` row is exactly 0; the
+`satfinite` store never produces NaN / inf.  Validated on a Rubin development node (cc 10.7, 204 SMs, shared, functional only -- no
+performance number is claimed for the mode: the FP8 forced-tile GEMM at decode row counts is a FUNCTIONAL claim; the tracker's
+"FP8-projection + bf16-attention mode" paragraph holds the run record) and on the SM100 development part (cc 10.0, 148 SMs, shared,
+functional only: the same cells with the gate as its own launch).
+
+**Served** (each an accept cell): `kv_source="paged"` on the dense DECODE form (every route the bf16 form takes) and the packed EXTEND
+form; pages 16 / 32 / 64 / 128, every pool layout, `inplace_qkv` None / True, `fuse_norm_rope=False`, `fuse_gate` as the bf16 form
+reads it, `fuse_cache_write_small_m` None / True / False on the DECODE form, `decode_route_policy` / `decode_q_tile_max` / `max_kv_len`
+/ `decode_split_kv` as before, `update_quant_scales`, CUDA-graph capture of the first execute (both projections on the capture-safe
+jit-only route), `serving_envelope(..., quant=spec)` (each form's `quant_modes` names the spelling served on the part).
+**Refused by name** (each a typed `NotImplementedError` / `ValueError` with its reject cell): `kv_source="self"` (dense or packed over the
+block's own K / V, with or without the write-through), `fuse_norm_rope=True` (the fused fork writes compact e4m3 Q / K / V, no bf16
+slab; `fuse_norm_rope_small_m` / an explicit `fuse_cache_write=True` fall with it), `inplace_qkv=False`, `save_for_backward` /
+`return_lse` (an inference form), `kv_cache_dtype=torch.float8_e4m3fn` (the pools stay bf16), a `QsaSpec` geometry, `use_pdl=True`
+(the quantize launch carries no griddepcontrol sites; AUTO reads False), `num_tokens_live` (the FP8 GEMMs' live-row launch), `MxQuantSpec`
+and `QuantSpec(attention_dtype=None)` on the paged forms (no paged leg: the write-through's decline names the mode as the way in),
+`attention_dtype=torch.float16`, 16-bit `h` beside the QuantSpec (FP8 needs both halves), and the mode on a served dense part off
+`FP8_PROJ_BF16_ATTENTION_CCS` (cc 10.7 and cc 10.0 today -- the cc 10.0 admission is the FP8 forced-tile GEMM cell of
+`test_block_fp8_bf16_attention.py` plus the mode's DECODE / EXTEND cells, run 2026-10-30 on the SM100 development part, functional only; a
+further part lifts in the same way: the tuple gains it together with the mode's cells on it).
+**Follow-ups** (not in this change): the fused gated e4m3 store in the dense decode tile's split combine (the sparse adapter carries it;
+the dense adapter has no `out_scale` yet), the FP8 small-M GEMM arm at decode row counts, the mode over the block's own K / V (the dense
+and packed prefill forms), an e4m3 KV cache under the mode, `use_pdl=True`, `num_tokens_live`.
 
 ### Backward
 
@@ -1888,13 +1975,20 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
 - Paged KV-cache write-through (`paged_kv_page_size`, a positive multiple of 16): bf16 / f16 inference, dense `[B, S, d_model]`
   and packed (`thd=True`); the pools are the activation dtype, `[num_pages, H_kv, P, D]` views with `D` contiguous and every other
   stride a whole number of 16-byte vectors (HND compact, NHD by strides, or the two halves of a unified `[num_pages, H_kv, P, 2D]`
-  row); `quant` and `save_for_backward` together with it are typed declines ("Serving: write-through into a paged KV cache" above).
+  row); `quant` and `save_for_backward` together with it are typed declines ("Serving: write-through into a paged KV cache" above) --
+  except the FP8-projection + bf16-attention mode on the paged forms (the bullet below).
 - The EXTEND form (`kv_source="paged"`): bf16 / f16 inference on a PACKED declaration with `paged_kv_page_size > 0`,
   `geometry.causal_bottom_right=True` (`is_causal=True`), no window, no `QsaSpec`, `d_head=256`, `return_lse=False`,
   `fuse_gate=False`; the three samples at declaration, `block_table` / `kv_lens` at execute (refused under `kv_source="self"`); the
   pools match the samples exactly; `token_capacity` (THD only, equal to `T`, inference only) bounds the live tokens. Validated at
   pages 16 / 32 / 64 / 128 on all three pool layouts, bf16 and f16 ("Serving: the extend form" above); every other combination is a
   typed decline `serving_envelope` predicts.
+- The FP8-projection + bf16-attention mode (`QuantSpec(attention_dtype=torch.bfloat16)`, 2026-10-30): the DECODE and EXTEND forms with
+  e4m3 `h` / `W_qkvg` / `W_o` under static per-tensor scales, bf16 pools and attention, the gated O quantized to e4m3 at `scale_o` for the
+  FP8 out projection; `scale_q` / `scale_k` / `scale_v` None; `fuse_norm_rope=False`, `inplace_qkv` None / True, inference only,
+  `kv_cache_dtype` None, no `QsaSpec`, no `use_pdl`, no `num_tokens_live`; cc 10.7 and cc 10.0 (`FP8_PROJ_BF16_ATTENTION_CCS`; the gate
+  its own launch on cc 10.0), declined by name on every other served dense part ("Serving: FP8 projections with bf16 attention" above);
+  functional claim only, no performance number.
 - The serving DECODE form (`kv_source="paged"` on a dense `[B, S_q]` block over `paged_kv_page_size > 0`): bf16 / f16 inference,
   `d_head = 256`, `is_causal` with `causal_bottom_right` (no window), the batch uniform, `block_table` + `kv_lens` at `execute`
   (`seq_lens` refused), the pools and the table exactly the declared samples; the served envelope `S_q <= 32` (the claimed envelope

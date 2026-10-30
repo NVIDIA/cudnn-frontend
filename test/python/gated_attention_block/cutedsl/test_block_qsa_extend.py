@@ -858,7 +858,8 @@ def test_extend_envelope_facts_are_published_and_the_tail_is_append_only(monkeyp
     """The envelope's EXTEND facts on a Rubin reading (the DSL state MODELED as the served one, the sibling modules' convention): ``index_select_forms
     == ("auto", "decode", "extend")``, ``index_extend_ring_rows_min == 3 == index_state_rows_extra`` (the kernel's ``min_ring_rows(..., ring_write=False)``,
     one spelling), ``index_extend_select_budget_bytes == QSA_EXTEND_SELECT_BUDGET_BYTES``, ``index_compress_roundings == ("single", "hf")``, the five
-    decline rows verbatim; empty / 0 under f16 and on a dense geometry; the record's tail append-only (the four fields after ``route_cc``)."""
+    decline rows verbatim; empty / 0 under f16 and on a dense geometry; the record's tail append-only (the four fields after ``route_cc``, then
+    ``quant_modes``)."""
     import dataclasses
 
     from cudnn.frost import buffers as _buffers
@@ -890,13 +891,17 @@ def test_extend_envelope_facts_are_published_and_the_tail_is_append_only(monkeyp
     assert (
         caller.index_select_forms == ("auto", "decode", "extend") and caller.index_extend_ring_rows_min == 3
     )  # the geometry's facts, read before a declaration
-    assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-5:] == [
+    # the append-only tail: the EXTEND step's four fields after `route_cc`, then `quant_modes` (appended 2026-10-30: the quant spellings the DENSE
+    # paged forms serve on the part -- the FP8-projection + bf16-attention mode; `()` on every QsaSpec geometry)
+    assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-6:] == [
         "route_cc",
         "index_select_forms",
         "index_extend_ring_rows_min",
         "index_extend_select_budget_bytes",
         "index_compress_roundings",
+        "quant_modes",
     ]
+    assert d.quant_modes == () == caller.quant_modes, "a QsaSpec geometry serves no quant spelling over the pools"
 
 
 # ---------------------------------------------------------------------------

@@ -531,6 +531,7 @@ cudnn.gated_attention_block.DecodeEnvelope.pdl_default
 cudnn.gated_attention_block.DecodeEnvelope.pdl_stages
 cudnn.gated_attention_block.DecodeEnvelope.policy
 cudnn.gated_attention_block.DecodeEnvelope.q_tile_max
+cudnn.gated_attention_block.DecodeEnvelope.quant_modes
 cudnn.gated_attention_block.DecodeEnvelope.route
 cudnn.gated_attention_block.DecodeEnvelope.route_cc
 cudnn.gated_attention_block.DecodeEnvelope.sparse_core
@@ -553,7 +554,9 @@ cudnn.gated_attention_block.DecodeRoute.served
 cudnn.gated_attention_block.ExtendEnvelope
 cudnn.gated_attention_block.ExtendEnvelope.inference_only
 cudnn.gated_attention_block.ExtendEnvelope.pdl_stages
+cudnn.gated_attention_block.ExtendEnvelope.quant_modes
 cudnn.gated_attention_block.ExtendEnvelope.writes_lse
+cudnn.gated_attention_block.FP8_PROJ_BF16_ATTENTION_CCS
 cudnn.gated_attention_block.Fp4Format
 cudnn.gated_attention_block.Fp4Format.MXFP4
 cudnn.gated_attention_block.Fp4Format.NVFP4
@@ -641,6 +644,7 @@ cudnn.gated_attention_block.QSA_INDEX_SELECT_FORMS
 cudnn.gated_attention_block.QSA_INDEX_SELECT_FORM_AUTO
 cudnn.gated_attention_block.QSA_INDEX_SELECT_FORM_DECODE
 cudnn.gated_attention_block.QSA_INDEX_SELECT_FORM_EXTEND
+cudnn.gated_attention_block.QUANT_MODE_FP8_PROJ_BF16_ATTENTION
 cudnn.gated_attention_block.QsaSpec
 cudnn.gated_attention_block.QsaSpec.block_size
 cudnn.gated_attention_block.QsaSpec.identity_bound
@@ -660,6 +664,9 @@ cudnn.gated_attention_block.QsaSpec.validate
 cudnn.gated_attention_block.QuantSpec
 cudnn.gated_attention_block.QuantSpec.alpha_o
 cudnn.gated_attention_block.QuantSpec.alpha_qkvg
+cudnn.gated_attention_block.QuantSpec.attention_bf16
+cudnn.gated_attention_block.QuantSpec.attention_dtype
+cudnn.gated_attention_block.QuantSpec.bf16_attention
 cudnn.gated_attention_block.QuantSpec.dtype
 cudnn.gated_attention_block.QuantSpec.validate
 cudnn.gated_attention_block.RecomputePolicy

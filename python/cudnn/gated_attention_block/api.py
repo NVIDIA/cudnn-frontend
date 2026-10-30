@@ -1222,6 +1222,8 @@ class DecodeEnvelope:
     served: bool
     reason: Optional[str]
     requires: Tuple[str, ...]
+    # the activation dtypes this form takes under the quant asked about: bf16 / f16 with quant=None; the e4m3 h under the FP8-projection +
+    # bf16-attention mode (serving_envelope(quant=) with attention_dtype=torch.bfloat16; 2026-10-30)
     dtypes: Tuple[torch.dtype, ...]
     page_sizes: Tuple[int, ...]
     pool_layouts: Tuple[str, ...]
@@ -1251,6 +1253,7 @@ class DecodeEnvelope:
     # appended (2026-10-14): the POOL dtypes this form serves at this geometry / activation dtype -- the activation dtype always; plus
     # torch.float8_e4m3fn (``kv_cache_dtype``: the gathered cast + the decode tile, S_q <= 4, no LSE) on a QsaSpec geometry with bf16
     # activations.  An e4m3 pool on a DENSE geometry is a typed decline (the decode tile reads bf16 / f16 pools).
+    # (under the FP8-projection + bf16-attention mode -- serving_envelope(quant=) -- the pools are bf16 whatever the e4m3 input; 2026-10-30)
     kv_cache_dtypes: Tuple[torch.dtype, ...] = ()
     # appended (2026-10-15): the route policy ``routes`` / ``route()`` were read under (``serving_envelope(decode_route_policy=)``) and
     # the CLAIMED bound (``DECODE_CLAIMED_MAX_S_Q``; ``max_s_q`` is the DECLARED one).
@@ -1318,6 +1321,10 @@ class DecodeEnvelope:
     index_extend_ring_rows_min: int = 0
     index_extend_select_budget_bytes: int = 0
     index_compress_roundings: Tuple[str, ...] = ()
+    # appended (the FP8-projection + bf16-attention mode): the ``quant`` spellings this form serves on this part BESIDE ``quant=None`` --
+    # ``(QUANT_MODE_FP8_PROJ_BF16_ATTENTION,)`` on a dense geometry the form serves on a part of :data:`FP8_PROJ_BF16_ATTENTION_CCS`, ``()``
+    # elsewhere (another part, a QsaSpec geometry, a geometry row the form declines, no DSL target).
+    quant_modes: Tuple[str, ...] = ()
 
     def sparse_tile(
         self, s_q: int, batch: int, *, sparse_tile_form: str = "auto", decode_split_kv: Optional[int] = None, kv_cache_dtype: Optional[torch.dtype] = None
@@ -1373,6 +1380,8 @@ class ExtendEnvelope:
     served: bool
     reason: Optional[str]
     requires: Tuple[str, ...]
+    # the activation dtypes this form takes under the quant asked about: bf16 / f16 with quant=None; the e4m3 h under the FP8-projection +
+    # bf16-attention mode (2026-10-30)
     dtypes: Tuple[torch.dtype, ...]
     page_sizes: Tuple[int, ...]
     pool_layouts: Tuple[str, ...]
@@ -1382,6 +1391,9 @@ class ExtendEnvelope:
     # appended (2026-10-15): the stage kinds that take the ``use_pdl`` switch on this form (:data:`EXTEND_PDL_STAGES`: never stage (4), the
     # paged prefill tile launches plain and the link serializes).
     pdl_stages: Tuple[str, ...] = ()
+    # appended (the FP8-projection + bf16-attention mode): the ``quant`` spellings this form serves on this part beside ``quant=None``
+    # (``(QUANT_MODE_FP8_PROJ_BF16_ATTENTION,)`` where served, ``()`` elsewhere) -- the DECODE record's twin.
+    quant_modes: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2022,6 +2034,17 @@ def qkvg_from_hf(
         three results are returned in it, contiguous. A quantized pipeline
         quantizes the returned ``w_qkvg`` afterwards and keeps the norm weights
         in this dtype, exactly as the block's descriptor contract requires.
+
+    **e4m3 codes** (appended; a checkpoint whose attention projections are static
+    per-tensor FP8 W8A8): when the three projection weights arrive as
+    ``torch.float8_e4m3fn`` CODES, the row permutation runs on the BYTES and
+    ``w_qkvg`` comes back as e4m3 codes, contiguous, with NO ``.to(act_dtype)`` (a
+    cast would turn codes into bf16 values and lose the scale's meaning); the norm
+    weights still come back in ``act_dtype``.  The merged weight's ONE per-tensor
+    scale is not an argument and is unchanged by a permutation -- it is the block's
+    ``QuantSpec.descale_w_qkvg`` as it is; per-tensor scales only (a per-row /
+    per-channel weight scale would need the same permutation and is not the FP8
+    pipeline's contract).  Mixing e4m3 and 16-bit projection weights is refused.
     """
     if not isinstance(act_dtype, torch.dtype) or not act_dtype.is_floating_point:
         raise ValueError(f"act_dtype must be a floating-point torch dtype (the block's activation dtype), got {act_dtype!r}")
@@ -2031,11 +2054,42 @@ def qkvg_from_hf(
             f"geometry.norm_weight_offset must be 0.0 (the block multiplies by the weight as given, so it receives 1 + w) or 1.0 "
             f"(the block adds the 1 itself, so it receives w); got {offset}"
         )
-    w_qkvg = (
-        build_fused_qkvg_weight(q_proj_weight, k_proj_weight, v_proj_weight, geometry, q_gate_layout="per_head", index_qk_proj_weight=index_qk_proj_weight)
-        .to(act_dtype)
-        .contiguous()
+    e4m3 = torch.float8_e4m3fn
+    parts = (
+        ("q_proj_weight", q_proj_weight),
+        ("k_proj_weight", k_proj_weight),
+        ("v_proj_weight", v_proj_weight),
+        ("index_qk_proj_weight", index_qk_proj_weight),
     )
+    codes = [nm for nm, w in parts if isinstance(w, torch.Tensor) and w.dtype == e4m3]
+    if codes:
+        values = [nm for nm, w in parts if isinstance(w, torch.Tensor) and w.dtype != e4m3]
+        if values:
+            raise ValueError(
+                f"{', '.join(codes)} are e4m3 codes but {', '.join(values)} are not: an FP8 checkpoint hands every attention projection weight as e4m3 "
+                "codes under ONE per-tensor scale (the block's QuantSpec.descale_w_qkvg) -- quantize them together, or hand 16-bit values for all"
+            )
+        # e4m3 CODES: the row permutation on the BYTES (uint8 views in, the result viewed back), no cast -- the codes travel unchanged
+        # and the merged weight's per-tensor scale keeps its meaning.
+        as_u8 = lambda w: None if w is None else w.view(torch.uint8)  # noqa: E731
+        w_qkvg = (
+            build_fused_qkvg_weight(
+                as_u8(q_proj_weight),
+                as_u8(k_proj_weight),
+                as_u8(v_proj_weight),
+                geometry,
+                q_gate_layout="per_head",
+                index_qk_proj_weight=as_u8(index_qk_proj_weight),
+            )
+            .contiguous()
+            .view(e4m3)
+        )
+    else:
+        w_qkvg = (
+            build_fused_qkvg_weight(q_proj_weight, k_proj_weight, v_proj_weight, geometry, q_gate_layout="per_head", index_qk_proj_weight=index_qk_proj_weight)
+            .to(act_dtype)
+            .contiguous()
+        )
 
     norms = []
     for name, w in (("q_norm_weight", q_norm_weight), ("k_norm_weight", k_norm_weight)):
@@ -2079,10 +2133,23 @@ def qkvg_from_vllm(
     bands with the same byte count, so a layer may replace its merged weight by it in place and run the block against the
     model's own ``o_proj.weight`` as ``W_o``; nothing is left to convert on the execute path.
 
+    **Static-scale FP8 W8A8 attention projections** (appended): a stack whose ``qkv_proj`` / ``o_proj`` are per-tensor FP8 linears
+    hands its merged ``qkv_proj.weight`` as e4m3 CODES here -- the permutation then runs on the bytes (:func:`qkvg_from_hf`) and
+    ``w_qkvg`` comes back as e4m3 codes, the norm weights in ``act_dtype`` -- and declares the block with
+    :meth:`QuantSpec.bf16_attention` (the FP8-projection + bf16-attention mode of the paged serving forms): ``descale_h`` = the
+    qkv projection's INPUT scale (``x = x8 * s_in``), ``descale_w_qkvg`` = the merged qkv weight's ONE per-tensor weight scale (a
+    stack that merges three per-matrix scales into one requantized scale hands that one; three distinct scales are not the
+    block's contract -- it has one alpha), ``descale_w_o`` = ``o_proj``'s weight scale, ``scale_o`` = ``1 /`` ``o_proj``'s INPUT
+    scale (the e4m3 O byte decodes as ``byte * s_in_o``), ``scale_q / scale_k / scale_v`` None.  The permutation leaves the
+    per-tensor scale as it is; per-tensor scales only (a per-row / per-channel weight scale is refused by the pipeline's
+    contract, not permuted).  The scales are Python floats at declaration, 1-element fp32 device tensors from ``compile()`` on,
+    written on the launch stream at the first execute and by ``update_quant_scales`` (no host readback).
+
     Parameters
     ----------
     qkv_proj_weight
-        The rank's merged weight, ``[2*H_q*D + 2*H_kv*D, d_model]`` at the rank's head counts.  Under an indexer band
+        The rank's merged weight, ``[2*H_q*D + 2*H_kv*D, d_model]`` at the rank's head counts (16-bit values, or e4m3 codes
+        under one per-tensor scale).  Under an indexer band
         (``geometry.qsa.index_band``) it may instead carry the indexer projection's rows APPENDED -- ``[..., +
         (index_heads + index_kv_heads) * index_head_dim]``, the form of a serving stack that packs the (replicated) indexer
         projection into the same GEMM -- with ``index_qk_proj_weight`` left ``None``.
@@ -2388,8 +2455,13 @@ def _plan_workspace(
     qsa_indexer_extend: Optional[int] = None,
     qsa_indexer_extend_window_rows: int = 0,
     qsa_indexer_extend_pieces: int = 0,
+    fp8_attention_bf16: bool = False,
 ) -> _Intermediates:
     """Reserve every intermediate, in stage order, and report the total.
+
+    ``fp8_attention_bf16`` (appended; False = today's carves) is the FP8-projection + bf16-attention mode of a per-tensor FP8 block
+    (``fp8=True``): stage (4) reads the bf16 slab, so the three compact e4m3 ``q8`` / ``k8`` / ``v8`` slots are NOT reserved (``-1``) and
+    only ``o8`` -- the quantized gated O the FP8 out projection reads -- is; every layout without the flag is byte-identical to before.
 
     ``qsa_indexer_decode`` (appended; ``None`` = no decode indexer) is the in-block indexer's DECODE step over the pools: the
     logits width ``n_blocks_max`` (the main block table's reach in compressed rows, ``max_pages x P / block_size``) -- the five slots
@@ -2627,11 +2699,12 @@ def _plan_workspace(
                 ("q", t * geom.h_q * geom.d_head * e),
                 ("k", t * geom.h_kv * geom.d_head * e),
             ]
-        slots += [
-            ("q8", t * geom.h_q * geom.d_head),
-            ("k8", t * geom.h_kv * geom.d_head),
-            ("v8", t * geom.h_kv * geom.d_head),
-        ]
+        if not fp8_attention_bf16:
+            slots += [
+                ("q8", t * geom.h_q * geom.d_head),
+                ("k8", t * geom.h_kv * geom.d_head),
+                ("v8", t * geom.h_kv * geom.d_head),
+            ]
     if want_saved:
         # TRAINING: the SDPA writes the caller's PRE-gate `saved.o` (the backward's dG
         # operand -- never gated in place); stage (5) gates OUT of place into `o_gated`,
@@ -3203,24 +3276,77 @@ class QuantSpec:
     ``descale_v * scale_o`` into ``inv_sum`` in-kernel and writes e4m3 O).  Only
     E4M3 is served today;
     E5M2 is a knob away once a use case asks for it.
+
+    **The FP8-projection + bf16-attention mode** (``attention_dtype=torch.bfloat16``, appended; an OP ATTRIBUTE -- it
+    changes the numerics -- never a knob): the two projections stay the FP8 GEMMs above (``alpha_qkvg`` / ``alpha_o`` in
+    their bf16 epilogues), but stage (4) runs the bf16 serving form's kernels on the bf16 slab -- no Q / K / V quantization
+    point, so ``scale_q`` / ``scale_k`` / ``scale_v`` MUST be ``None`` (each refused by name otherwise) -- and the one
+    activation quantized is the gated O, ``o8 = sat_e4m3(O_gated * scale_o)``, for the FP8 out projection.  The spelling of a
+    serving stack whose attention projections are static-scale FP8 W8A8 while its KV cache and attention math are 16-bit:
+    ``descale_h`` = the qkv projection's INPUT scale (``x = x8 * s_in``), ``descale_w_qkvg`` = the merged qkv weight's ONE
+    per-tensor weight scale, ``descale_w_o`` = the o projection's weight scale, ``scale_o`` = ``1 / s_in_o`` (the o projection's
+    input scale: the stored byte decodes as ``byte * s_in_o``) -- :meth:`bf16_attention` spells it.  Served on the paged
+    serving forms (``kv_source="paged"``: the DECODE and EXTEND forms over bf16 pools) on the parts of
+    :data:`FP8_PROJ_BF16_ATTENTION_CCS`; ``attention_dtype=None`` is the fp8 d256 SDPA pipeline above, unchanged.
     """
 
     descale_h: float
     descale_w_qkvg: float
     descale_w_o: float
-    scale_q: float
-    scale_k: float
-    scale_v: float
+    scale_q: Optional[float]
+    scale_k: Optional[float]
+    scale_v: Optional[float]
     scale_o: float
     dtype: torch.dtype = torch.float8_e4m3fn
+    # appended: None = the fp8 d256 SDPA (Q / K / V quantized at scale_q / scale_k / scale_v); torch.bfloat16 = the FP8-projection +
+    # bf16-attention mode (stage (4) on the bf16 slab, scale_q / scale_k / scale_v None).  A plan fact of update_quant_scales.
+    attention_dtype: Optional[torch.dtype] = None
+
+    @property
+    def attention_bf16(self) -> bool:
+        """Whether this spec selects the FP8-projection + bf16-attention mode (``attention_dtype`` set; ``validate`` admits bf16 alone)."""
+        return self.attention_dtype is not None
+
+    @classmethod
+    def bf16_attention(
+        cls, descale_h: float, descale_w_qkvg: float, descale_w_o: float, scale_o: float, *, dtype: torch.dtype = torch.float8_e4m3fn
+    ) -> "QuantSpec":
+        """The FP8-projection + bf16-attention mode's spelling: ``QuantSpec(descale_h, descale_w_qkvg, descale_w_o, None, None, None,
+        scale_o, dtype, torch.bfloat16)`` -- a serving stack's static per-tensor FP8 W8A8 attention projections (the qkv projection's input
+        scale, the merged qkv weight's per-tensor scale, the o projection's weight scale, ``1 /`` the o projection's input scale)."""
+        return cls(descale_h, descale_w_qkvg, descale_w_o, None, None, None, scale_o, dtype, torch.bfloat16)
 
     def validate(self) -> None:
         if self.dtype != torch.float8_e4m3fn:
             raise NotImplementedError(f"QuantSpec: only torch.float8_e4m3fn is served, got {self.dtype}")
-        for name in ("descale_h", "descale_w_qkvg", "descale_w_o", "scale_q", "scale_k", "scale_v", "scale_o"):
-            v = float(getattr(self, name))
+        if self.attention_dtype not in (None, torch.bfloat16):
+            raise NotImplementedError(
+                f"QuantSpec.attention_dtype must be None (the fp8 d256 SDPA: Q / K / V quantized at scale_q / scale_k / scale_v) or torch.bfloat16 "
+                f"(the FP8-projection + bf16-attention mode: stage (4) on the bf16 slab -- bf16 is the quantized pipelines' activation dtype, so "
+                f"torch.float16 has no such mode), got {self.attention_dtype!r}"
+            )
+        bf16_attention = self.attention_dtype is not None
+        required = ("descale_h", "descale_w_qkvg", "descale_w_o", "scale_o") + (() if bf16_attention else ("scale_q", "scale_k", "scale_v"))
+        for name in required:
+            raw = getattr(self, name)
+            if raw is None:
+                raise ValueError(
+                    f"QuantSpec.{name} is None: the fp8 d256 SDPA (attention_dtype=None) quantizes Q / K / V and the gated O at the four scales and "
+                    "the two projections dequantize through the three descales -- every one a finite positive float; declare "
+                    "attention_dtype=torch.bfloat16 for the FP8-projection + bf16-attention mode, which takes scale_q / scale_k / scale_v as None"
+                    if name in ("scale_q", "scale_k", "scale_v")
+                    else f"QuantSpec.{name} is None: a finite positive float is required on every QuantSpec (the projections' descales and scale_o)"
+                )
+            v = float(raw)
             if not (v > 0.0) or math.isnan(v) or v in (float("inf"),):
                 raise ValueError(f"QuantSpec.{name} must be a finite positive float, got {v}")
+        if bf16_attention:
+            for name in ("scale_q", "scale_k", "scale_v"):
+                if getattr(self, name) is not None:
+                    raise ValueError(
+                        f"QuantSpec.{name}={getattr(self, name)!r} is unused under attention_dtype=torch.bfloat16: the attention runs on the bf16 slab "
+                        "and there is no Q / K / V quantization point (the one activation quantized is the gated O, at scale_o); pass None"
+                    )
 
     @property
     def alpha_qkvg(self) -> float:
@@ -4908,6 +5034,43 @@ DENSE_SERVING_CCS: Tuple[Tuple[int, int], ...] = ((10, 7), (10, 0))
 # tuple gaining (10, 0) together with the arm's accept cells (the one-tuple flip; the plumbing -- the wide readings, the adapter's
 # wide_launch -- stays in place behind the gate).  Read by `decode_route`, the suite's host rows and a serving stack's dispatch predicate.
 DECODE_WIDE_TILE_CCS: Tuple[Tuple[int, int], ...] = ()
+# The parts serving the FP8-PROJECTION + BF16-ATTENTION MODE of the paged forms (``QuantSpec(attention_dtype=torch.bfloat16)``: the per-tensor FP8
+# projection GEMMs with the descale folded into their bf16 epilogue, the bf16 decode / prefill tiles over bf16 pools, the gated O quantized to e4m3
+# at ``scale_o`` for the FP8 out projection).  Every piece but the two GEMMs is the bf16 serving form's own kernel on the part; the GEMMs are the
+# FROST FP8 forced-tile plans, validated THROUGH THE BLOCK on cc 10.7 (the unfused FP8 pipeline's cells and the mode's own) and, since
+# 2026-10-30, on cc 10.0 (the SM100 line: the FP8 forced-tile GEMM cell at the mode's shapes and the mode's DECODE / EXTEND cells on the SM100
+# development part -- functional only, unmeasured there).  A served DENSE part off this tuple declines the mode by name
+# (`_fp8_proj_bf16_attention_part_decline`; the lift: the tuple gaining the part together with the mode's accept cells there -- the one-tuple
+# flip of DENSE_SERVING_CCS); an unserved part hears the dense part statement.
+FP8_PROJ_BF16_ATTENTION_CCS: Tuple[Tuple[int, int], ...] = ((10, 7), (10, 0))
+# The ONE spelling of the mode the envelopes publish (``quant_modes``) and the declines name.
+QUANT_MODE_FP8_PROJ_BF16_ATTENTION = "QuantSpec(attention_dtype=torch.bfloat16)"
+
+
+def _fp8_proj_bf16_attention_part_decline(cc) -> Optional[str]:
+    """Why ``cc`` -- a served DENSE part (:data:`DENSE_SERVING_CCS`) -- does not serve the FP8-projection + bf16-attention mode
+    (:data:`QUANT_MODE_FP8_PROJ_BF16_ATTENTION`); None on a part of :data:`FP8_PROJ_BF16_ATTENTION_CCS`.  The ONE statement the block's part
+    gate raises (``_check_part_support``) and the envelope publishes (``serving_envelope(quant=)``); an UNSERVED part hears the dense part
+    statement instead (``_dense_part_decline``)."""
+    if cc is not None and tuple(int(x) for x in cc)[:2] in FP8_PROJ_BF16_ATTENTION_CCS:
+        return None
+    found = "no CUDA device" if cc is None else f"cc {int(cc[0])}.{int(cc[1])}"
+    return (
+        f"{QUANT_MODE_FP8_PROJ_BF16_ATTENTION} on {found}: the FP8-projection + bf16-attention mode is served on "
+        + " / ".join(f"cc {a}.{b}" for a, b in FP8_PROJ_BF16_ATTENTION_CCS)
+        + " (FP8_PROJ_BF16_ATTENTION_CCS) -- the FP8 forced-tile projection GEMMs with the alpha epilogue have no cell through the block on this part "
+        "yet; the bf16 / f16 block is the pipeline served here (the lift: the tuple gains this part together with the mode's cells on it)"
+    )
+
+
+def _qsa_quant_decline_text(quant) -> str:
+    """The ONE text of the QsaSpec x ``quant`` decline (the constructor's row and the envelope's quant row on a QsaSpec geometry)."""
+    return (
+        f"QsaSpec with quant={type(quant).__name__}: the sparse core is bf16 / f16; the quantized pipelines (per-tensor FP8, MXFP8, the "
+        "fp4 modes) have no sparse arm -- the FP8-projection + bf16-attention mode (QuantSpec(attention_dtype=torch.bfloat16)) on the sparse "
+        "forms is a follow-up (the sparse cores are bf16 and the sparse adapter carries a fused gated e4m3 store, but no cell through the block "
+        "has run it); fuse_prepare keeps its own rows"
+    )
 
 
 def _dense_part_decline(cc) -> Optional[str]:
@@ -8825,7 +8988,9 @@ _DECODE_REQUIRES = (
     "name until its cells run, DECODE_WIDE_TILE_CCS; functional, unmeasured; decode_q_tile_max refused there)",
     "geometry.is_causal=True, geometry.causal_bottom_right=True, window_left=-1, window_right in (-1, 0), qsa=None, d_head=256",
     "sample_k_cache / sample_v_cache (the pools' [num_pages, H_kv, P, D] shape / dtype / strides) and sample_block_table ([B, max_pages] int32, any row stride)",
-    "bf16 / f16 activations (quant=None), save_for_backward=False, return_lse=False, token_capacity=None; fuse_gate rides the decode tile's split combine "
+    "bf16 / f16 activations (quant=None) or the FP8-projection + bf16-attention mode (e4m3 h / W_qkvg / W_o with QuantSpec(attention_dtype=torch.bfloat16) "
+    "on a part of FP8_PROJ_BF16_ATTENTION_CCS: FP8 projections, bf16 pools and attention, the gated O quantized to e4m3 at scale_o; fuse_norm_rope=False, "
+    "inplace_qkv None / True, kv_cache_dtype None), save_for_backward=False, return_lse=False, token_capacity=None; fuse_gate rides the decode tile's split combine "
     "on cc 10.7 and is a typed decline on cc 10.0 (the sm100 row claims no gate epilogue: fuse_gate=False, stage (5) its own launch)",
     "execute(block_table=, kv_lens=, k_cache=, v_cache=, slot_mapping=) with seq_lens=None (kv_lens binds the KV side only)",
 )
@@ -8976,8 +9141,10 @@ _EXTEND_REQUIRES = (
     "a part of DENSE_SERVING_CCS: cc 10.7 (measured) or cc 10.0 (the shared SM100 d256 paged THD body; functional, unmeasured)",
     "geometry.is_causal=True, geometry.causal_bottom_right=True, window_left=-1, window_right in (-1, 0), qsa=None, d_head=256",
     "sample_k_cache / sample_v_cache (the pools' [num_pages, H_kv, P, D] shape / dtype / strides) and sample_block_table ([B_max, max_pages] int32)",
-    "bf16 / f16 activations (quant=None), save_for_backward=False, return_lse=False; fuse_gate as declared (True folds stage (5) into the paged SDPA's epilogue "
-    "on cc 10.7; a typed decline on cc 10.0, where the sm100 row claims no gate epilogue)",
+    "bf16 / f16 activations (quant=None) or the FP8-projection + bf16-attention mode (e4m3 h / W_qkvg / W_o with QuantSpec(attention_dtype=torch.bfloat16) "
+    "on a part of FP8_PROJ_BF16_ATTENTION_CCS: FP8 projections, bf16 pools and attention, the gated O quantized to e4m3 at scale_o; fuse_norm_rope=False, "
+    "inplace_qkv None / True, kv_cache_dtype None, num_tokens_live None), save_for_backward=False, return_lse=False; fuse_gate as declared (True folds stage (5) "
+    "into the paged SDPA's epilogue on cc 10.7; a typed decline on cc 10.0, where the sm100 row claims no gate epilogue)",
 )
 
 
@@ -9186,6 +9353,33 @@ class GatedAttentionBlockFwd(APIBase):
     paged scorer reads it on its fp8 ``mma.sync`` arm, no cast kernel (the launch census is the bf16 form's); ``ix_q`` is carved at 1 B;
     ``decode.index_cache_dtypes`` reads ``(bf16, e4m3)``.  The selection is pinned EXACTLY against the fp64 top-k of the kernel's own e4m3
     operands (up to ties); the bf16-vs-e4m3 agreement is a statistic, never a gate.
+
+    **The FP8-projection + bf16-attention mode** (``QuantSpec(attention_dtype=torch.bfloat16)``, spelled
+    :meth:`QuantSpec.bf16_attention`; the PAGED serving forms -- ``kv_source="paged"``: the DECODE and EXTEND forms -- on the
+    parts of :data:`FP8_PROJ_BF16_ATTENTION_CCS`; 2026-10-30): a serving stack whose attention projections are static per-tensor
+    FP8 W8A8 while its KV cache and attention math are bf16.  e4m3 ``h`` / weights and the two FP8 projection GEMMs exactly as on
+    the UNFUSED FP8 pipeline (``alpha_qkvg`` / ``alpha_o`` folded into their bf16 epilogues), but stage (4) is the bf16 serving
+    form's own stage over bf16 pools (no ``quantize_q`` / ``quantize_kv``: ``scale_q`` / ``scale_k`` / ``scale_v`` are None and
+    refused by name if set; no descale reaches the SDPA; the slab's token stride) and the one activation quantized is the gated O
+    (a DISTINCT ``quantize_o`` launch at ``scale_o``) for the FP8 out projection::
+
+        (1)  proj         e4m3 h, e4m3 W_qkvg -> PROJ [T, N] bf16         FP8 FROST GEMM (forced tile, epilogue * alpha_qkvg)
+        (2+3) norm+rope   in place on PROJ's bf16 Q / K bands              kernels/qk_norm_rope*.py (the write-through fold admitted)
+        (4w) cache_write  post-RoPE K / V -> the bf16 pools               kernels/cache_write.py (unless folded into (2+3))
+        (4)  sdpa         the bf16 decode / prefill tile over the pools    the bf16 serving forms' routes [+ the split combine]
+        (5)  gate         in the combine / the paged body's epilogue / its own launch   as the bf16 forms
+        (5q) quantize_o   O_gated -> o8 (scale_o)                         kernels/quantize.py
+        (6)  out_proj     o8, e4m3 W_o -> out                             FP8 FROST GEMM (epilogue * alpha_o)
+
+    Launch counts measured by the CUPTI census cell (B 2 x S_q 1 at the 24 / 2 geometry, every kernel counted): cc 10.7 six with the
+    gate in the combine and the write-through folded (seven with the separate cache write; seven / eight with the separate gate),
+    cc 10.0 seven / eight (the gate its own launch) -- the bf16 serving chain's own counts: both FP8 forced-tile GEMMs are one kernel
+    each where the bf16 small-M out projection is a split-K kernel plus a reduce, so the quantize launch takes the reduce's place.
+    Refused by name: ``kv_source="self"``, ``fuse_norm_rope=True``, ``inplace_qkv=False``, training / an LSE, the e4m3 KV cache, a
+    QsaSpec geometry, ``use_pdl=True`` (AUTO False), ``num_tokens_live``, an ``MxQuantSpec`` or ``QuantSpec(attention_dtype=None)``
+    on the paged forms, the mode on a served dense part off the tuple.  The workspace holds ``o8`` and no compact e4m3 Q / K / V;
+    the three device scalars (``alpha_qkvg`` / ``alpha_o`` / ``scale_o``) follow the per-tensor contract (written on the launch
+    stream at the first execute, rewritten by ``update_quant_scales``, ``attention_dtype`` a plan fact of it).
 
     **MXFP8** (an :class:`MxQuantSpec` + e4m3 codes + F8_128x4 SF blobs for ``h`` /
     ``W_qkvg``), UNFUSED (9 stages = 9 kernel launches)::
@@ -9507,7 +9701,9 @@ class GatedAttentionBlockFwd(APIBase):
         if self.use_pdl and (quant is not None or kv_cache_dtype not in (None, torch.bfloat16, torch.float16)):
             raise NotImplementedError(
                 "use_pdl=True is served for the bf16 / f16 block only (no quant / QuantSpec, no e4m3 KV cache -- kv_cache_dtype None or the "
-                "activation dtype --): those pipelines' stages carry no programmatic-dependent-launch sites; declare use_pdl=False"
+                "activation dtype --): those pipelines' stages carry no programmatic-dependent-launch sites; declare use_pdl=False (the "
+                "FP8-projection + bf16-attention mode, QuantSpec(attention_dtype=torch.bfloat16), is declined too: its quantize launch carries no "
+                "sites and the switched chain is unmeasured there; None = auto reads False)"
             )
         if self.use_pdl and geometry.qsa is not None and thd:
             # ONE statement of the kernel fact (the adapter's `pdl_decline_reason`): raised verbatim here at declaration and again by the
@@ -9531,6 +9727,13 @@ class GatedAttentionBlockFwd(APIBase):
             raise TypeError(f"quant must be a QuantSpec (per-tensor FP8) or an MxQuantSpec (MXFP8), got {type(quant).__name__}")
         self.quant = quant
         self.mxfp8 = isinstance(quant, MxQuantSpec)
+        # THE FP8-PROJECTION + BF16-ATTENTION MODE (QuantSpec.attention_dtype=torch.bfloat16; an op attribute, never a knob): e4m3 h / weights
+        # and the two FP8 projection GEMMs exactly as on the UNFUSED FP8 pipeline, but stage (4) runs the bf16 serving form's kernels on the
+        # bf16 slab (no quantize_q / quantize_kv: scale_q / scale_k / scale_v are None, no descale reaches the SDPA) and the one activation
+        # quantized is the gated O (quantize_o at scale_o) for the FP8 out projection.  Served on the paged forms (kv_source="paged") on the
+        # parts of FP8_PROJ_BF16_ATTENTION_CCS alone; `fp8` below keeps meaning "e4m3 operands + FP8 GEMMs", the local `fp8_sdpa` =
+        # `fp8 and not attention_bf16` is what the attention side reads.
+        self.attention_bf16: bool = isinstance(quant, QuantSpec) and quant.attention_bf16
         if (self.dtype == torch.float8_e4m3fn) != (quant is not None):
             raise ValueError(
                 "FP8 needs both halves: an e4m3 `h` AND a QuantSpec / MxQuantSpec (static scales). "
@@ -9658,7 +9861,14 @@ class GatedAttentionBlockFwd(APIBase):
         # quantize pass, or a gate read from the bf16 slab) that nobody has
         # validated -- declined, typed, naming both knobs.
         _family = "MXFP8" if self.mxfp8 else "FP8"
-        if quant is not None and self.fuse_gate != self.fuse_norm_rope:
+        if self.attention_bf16 and self.fuse_norm_rope:
+            raise NotImplementedError(
+                "fuse_norm_rope=True with QuantSpec(attention_dtype=torch.bfloat16): the fused FP8 projection fork writes compact e4m3 Q / K / V and "
+                "no bf16 slab, while the FP8-projection + bf16-attention mode runs stage (4) on the bf16 slab the UNFUSED stage (1) writes -- declare "
+                "fuse_norm_rope=False (fuse_gate is free: it rides the decode tile's split combine / the paged body's epilogue or runs as its own "
+                "launch, as on the bf16 serving forms)"
+            )
+        if quant is not None and not self.attention_bf16 and self.fuse_gate != self.fuse_norm_rope:
             raise NotImplementedError(
                 f"the {_family} pipeline is either fully fused or unfused: fuse_norm_rope and fuse_gate must BOTH be True "
                 f"(3 launches) or BOTH be False ({'9' if self.mxfp8 else '7'} stages, 9 kernel launches); "
@@ -9699,7 +9909,9 @@ class GatedAttentionBlockFwd(APIBase):
                     "lengths ([B] int32 lengths, or [B+1] int32 prefix sums with cu_seqlens=True) for the Q and the KV side alike, and there "
                     "is no per-batch KV padding mask (the SDPA adapter sets its own seq_kv_lens_present under THD); pass seq_lens_present=False"
                 )
-            if quant is not None and (self.fuse_gate or self.fuse_norm_rope):
+            # (the FP8-projection + bf16-attention mode is exempt: its stage (4) IS the f16/bf16 d256 paged THD body, whose gate descriptor the
+            # EXTEND form binds; fuse_norm_rope was refused above for that mode on every form)
+            if quant is not None and not self.attention_bf16 and (self.fuse_gate or self.fuse_norm_rope):
                 raise NotImplementedError(
                     f"the fully fused {_family} pipeline (fuse_norm_rope + fuse_gate) is dense-only: its quantized gated SDPA specialization "
                     "has no THD gate descriptor (the SDPA's THD gate descriptor is the f16/bf16 d256 prefill's), and the fused MXFP8 projection "
@@ -9772,6 +9984,27 @@ class GatedAttentionBlockFwd(APIBase):
             sparse_tile_form=sparse_tile_form,
             sparse_sub_tiles_per_cta=sparse_sub_tiles_per_cta,
         )
+        # THE FP8-PROJECTION + BF16-ATTENTION MODE's own rows (typed, naming the mode; after the serving table, so kv_source is a validated word):
+        # an inference form on the PAGED forms with the norm in place on the bf16 slab -- the bf16 serving forms' own shape.
+        if self.attention_bf16:
+            if self.save_for_backward or self.return_lse:
+                raise NotImplementedError(
+                    f"QuantSpec(attention_dtype=torch.bfloat16) with save_for_backward={self.save_for_backward} / return_lse={self.return_lse}: the "
+                    "FP8-projection + bf16-attention mode is an INFERENCE form of the paged serving forms (no training record, no LSE over the pools); "
+                    "the fp8 d256 SDPA pipeline (attention_dtype=None) over the block's own K / V trains"
+                )
+            if self.kv_source != KV_SOURCE_PAGED:
+                raise NotImplementedError(
+                    f"QuantSpec(attention_dtype=torch.bfloat16) with kv_source={self.kv_source!r}: the FP8-projection + bf16-attention mode serves the paged "
+                    "serving forms (kv_source='paged': the DECODE form on a dense [B, S_q] declaration and the EXTEND form on a packed one, over bf16 "
+                    "pools); over the block's own K / V declare attention_dtype=None (the Rubin fp8 d256 SDPA pipeline) or the bf16 / f16 block -- the "
+                    "bf16-attention mode on the self-attention forms is a follow-up"
+                )
+            if not self.inplace_qkv:
+                raise NotImplementedError(
+                    "QuantSpec(attention_dtype=torch.bfloat16) with inplace_qkv=False: the FP8-projection + bf16-attention mode norms Q / K in place on "
+                    "the bf16 slab and reads stage (4)'s operands from it (inplace_qkv None / True); the out-of-place twin has no cell"
+                )
         # the dense / packed QsaSpec forms (kv_source="self"): the tcgen05 core; an explicit "lean" there is the lean body's own decline
         self._resolve_sparse_tile_form_off_decode()
         if self.kv_source == KV_SOURCE_PAGED and not self.thd:
@@ -9925,6 +10158,10 @@ class GatedAttentionBlockFwd(APIBase):
 
         fp8 = quant is not None  # fp8-CLASS pipeline (per-tensor FP8 or MXFP8): e4m3 h / weights, bf16 activations
         mxfp8 = self.mxfp8
+        # the ATTENTION side's reading: the fp8 d256 SDPA with its quantize stages, or -- under QuantSpec.attention_dtype=torch.bfloat16 -- the
+        # bf16 serving form's stage (4) on the bf16 slab (no quantize_q / quantize_kv, the slab's token stride, no descales), the gated O alone
+        # quantized (a DISTINCT quantize_o stage) for the FP8 out projection
+        fp8_sdpa = fp8 and not self.attention_bf16
         # FULLY FUSED: both knobs under a quant spec (the both-or-neither decline
         # above makes `fp8 and fuse_gate` == `fp8 and fuse_norm_rope`).
         # `fp8_fused` names the per-tensor pipeline (test-visible, unchanged);
@@ -10004,7 +10241,7 @@ class GatedAttentionBlockFwd(APIBase):
         # (two recipes, h_q / h_kv), V COLUMNWISE (its own recipe: a different
         # kernel arm AND a different SF byte order) -- each writing compact e4m3
         # + the SDPA's F8_128x4 SF blob.
-        quantize = fp8 and not self.quant_fused
+        quantize = fp8_sdpa and not self.quant_fused
         self._quant_q = self._quant_kv = self._quant_k = self._quant_v = None
         if quantize and not mxfp8:
             self._quant_q = _Quantize(geometry, batch=self.batch, seq_len=self.seq_len, dtype_in=act, heads=geometry.h_q, name="quantize_q")
@@ -10039,8 +10276,9 @@ class GatedAttentionBlockFwd(APIBase):
             sdpa_o_dtype = torch.float8_e4m3fn if self.o_fp4 is None else act
         else:
             # bf16: in-place reads the slab at its padded stride; FP8 / MXFP8
-            # unfused read the compact e4m3 buffers.  GATE is always a slab column slice.
-            sdpa_token_stride, sdpa_gate_token_stride, sdpa_o_dtype = (geometry.n_qkvg if self.inplace_qkv else 0) if not fp8 else 0, geometry.n_qkvg, act
+            # unfused read the compact e4m3 buffers; the FP8-projection + bf16-attention mode reads the bf16 slab in place like the bf16
+            # form.  GATE is always a slab column slice.
+            sdpa_token_stride, sdpa_gate_token_stride, sdpa_o_dtype = (geometry.n_qkvg if self.inplace_qkv else 0) if not fp8_sdpa else 0, geometry.n_qkvg, act
         if self.upcast_decode:
             # Stage (4) under QsaSpec over e4m3 POOLS: the gathered cast + the bf16 d256 decode tile over the scratch (the class
             # docstring); the compact normed Q (out of place) is its Q.
@@ -10099,7 +10337,9 @@ class GatedAttentionBlockFwd(APIBase):
                 geometry,
                 batch=self.batch,
                 seq_len=self.seq_len,
-                dtype=self.dtype,
+                # the FP8-projection + bf16-attention mode: the bf16 serving form's stage (4) on the bf16 slab (the stage's `fp8` False: the dense
+                # part gate, the device row's gate claim, no per-tensor descales)
+                dtype=act if self.attention_bf16 else self.dtype,
                 device=self.device,
                 want_lse=self.return_lse,
                 seq_lens_present=self.seq_lens_present and not prefill_route,
@@ -10259,7 +10499,8 @@ class GatedAttentionBlockFwd(APIBase):
         # (5q') fp4 O (MXFP8, unfused OR fused): ONE block-quantize launch (bf16 gated O -> e2m1 codes + the
         # out_proj GEMM's padded F8_128x4 blob) replaces the per-tensor quantize_o; the out projection becomes
         # the fp4 x fp4 block-scale GEMM (no alpha: both sides dequantize through their blobs in the MMA).
-        quant_o_distinct = mxfp8 and (quantize or self.o_fp4 is not None)
+        # ... and under the FP8-projection + bf16-attention mode: quantize_o is the mode's ONE quantize launch (no quantize_q to alias).
+        quant_o_distinct = (mxfp8 and (quantize or self.o_fp4 is not None)) or self.attention_bf16
         if self.o_fp4 is not None:
             self._quant_o = _QuantizeFp4(
                 geometry, batch=self.batch, seq_len=self.seq_len, dtype_in=act, heads=geometry.h_q, fmt=self.o_fp4, name="quantize_fp4_o"
@@ -10277,7 +10518,7 @@ class GatedAttentionBlockFwd(APIBase):
                 sf_dtype=self.o_fp4.sf_cudnn_dtype,
             )
         else:
-            if quantize and mxfp8:
+            if (quantize and mxfp8) or self.attention_bf16:
                 self._quant_o = _Quantize(geometry, batch=self.batch, seq_len=self.seq_len, dtype_in=act, heads=geometry.h_q, name="quantize_o")
             else:
                 self._quant_o = self._quant_q
@@ -10304,8 +10545,8 @@ class GatedAttentionBlockFwd(APIBase):
         # compile on different parts would otherwise carry a stale flag into the driver.
         self._flag_capture_safe_projections()
         # Stage order == pipeline order.  `_quant_o` is listed only where it is a
-        # DISTINCT stage (MXFP8: quantize_o, or quantize_fp4_o under o_fp4); under
-        # FP8 it aliases `_quant_q`, listed once.
+        # DISTINCT stage (MXFP8: quantize_o, or quantize_fp4_o under o_fp4; the FP8-projection
+        # + bf16-attention mode: quantize_o); under the fp8 SDPA pipeline it aliases `_quant_q`, listed once.
         self._stages = tuple(
             st
             for st in (
@@ -10373,10 +10614,7 @@ class GatedAttentionBlockFwd(APIBase):
                 "block's backward differentiates the dense record only"
             )
         if quant is not None:
-            raise NotImplementedError(
-                f"QsaSpec with quant={type(quant).__name__}: the sparse core is bf16 / f16; the quantized pipelines (per-tensor FP8, MXFP8, the "
-                "fp4 modes) have no sparse arm"
-            )
+            raise NotImplementedError(_qsa_quant_decline_text(quant))
         if self.fuse_gate and not rec.epilogue_gate:
             # Served while the record claims the arm (it does: the sparse core's epilogue gate, bound through _SparseSdpa);
             # the decline stays reachable for a record that retires it.
@@ -10835,7 +11073,8 @@ class GatedAttentionBlockFwd(APIBase):
     def _check_cache_write_declaration(self, page_size, quant) -> int:
         """``paged_kv_page_size`` at declaration: an ``int >= 0`` (``ValueError`` otherwise), a positive one a multiple of
         :data:`PAGED_KV_PAGE_ALIGN` (the serving stacks' page granularity; it also keeps every 4-token sparse block inside
-        one page); then the pipelines the write-through stage has no arm for, typed, naming the feature.  Returns the
+        one page); then the pipelines the write-through stage has no arm for, typed, naming the feature (every quantized
+        pipeline but the FP8-projection + bf16-attention mode, whose post-RoPE K / V are the bf16 rows the stage writes).  Returns the
         normalised page size (0 = off).  Device-free.  The packed form (``thd=True``) is SERVED: the stage addresses tokens,
         so a packed block runs the same launch over its ``[T, H_kv, D]`` views."""
         if isinstance(page_size, bool) or not isinstance(page_size, int):
@@ -10854,11 +11093,13 @@ class GatedAttentionBlockFwd(APIBase):
                 f"paged_kv_page_size={page_size} must be a multiple of QsaSpec.block_size={self.qsa.block_size}: a selectable block is gathered "
                 "as one unit and may not straddle two pages"
             )
-        if quant is not None:
+        if quant is not None and not self.attention_bf16:
             raise NotImplementedError(
                 f"paged_kv_page_size with quant={type(quant).__name__}: the write-through pools are bf16 / f16 (the activation dtype of the "
                 "post-RoPE K / V); a quantized cache (e4m3 pools) arrives with the cache-dtype attribute and its cast kernel -- declare "
-                "paged_kv_page_size on the bf16 / f16 pipeline"
+                "paged_kv_page_size on the bf16 / f16 pipeline, or on the FP8-projection + bf16-attention mode (QuantSpec(attention_dtype="
+                "torch.bfloat16): FP8 projections, the bf16 attention over bf16 pools, the gated O quantized to e4m3 for the FP8 out projection); "
+                "the fp8 d256 SDPA pipeline (attention_dtype=None), MXFP8, MXFP4 and the fp4 O modes have no paged leg"
             )
         if self.save_for_backward:
             raise NotImplementedError(
@@ -10965,8 +11206,9 @@ class GatedAttentionBlockFwd(APIBase):
         ``T >= 128`` with ``S_q > 1``, and the separate launch wherever an explicit ``fuse_cache_write=False`` asked for it by name: the request
         outranks the AUTO fold --, True / False by name -- this arm's own knob, the strongest request, followed under either reading of
         ``fuse_cache_write``; ``TypeError`` otherwise).  Served on the dense DECODE form's UNFUSED chain with
-        paged pools in the activation dtype (bf16 / f16, no quant, no indexer band, no e4m3 cache) when the TMA norm + RoPE kernel tiles the
-        geometry; AUTO reads False everywhere else and an explicit True is a typed decline naming the reason.  Device-free (the arch half --
+        paged pools in the activation dtype (bf16 / f16 -- or the FP8-projection + bf16-attention mode, whose slab and pools are bf16 --, no other
+        quant, no indexer band, no e4m3 cache) when the TMA norm + RoPE kernel tiles the geometry; AUTO reads False everywhere else and an
+        explicit True is a typed decline naming the reason.  Device-free (the arch half --
         sm_90+ for the TMA kernel -- is the stage's ``check_support``; the dense DECODE form itself is served on the parts of
         :data:`DENSE_SERVING_CCS`)."""
         if requested is not None and not isinstance(requested, bool):
@@ -10993,7 +11235,7 @@ class GatedAttentionBlockFwd(APIBase):
         # (`_check_cache_write_declaration`) and the no-dense-route row above (a QsaSpec geometry, with or without the indexer band, and the
         # e4m3 cache ride the block-sparse decode mode) speak first.  Kept so the resolver stays honest on its own facts should a form admit
         # one of those pipelines onto a decode route; the host cell pins their text on the resolver directly.
-        elif quant is not None:
+        elif quant is not None and not (isinstance(quant, QuantSpec) and quant.attention_bf16):
             why = f"serves the bf16 / f16 pipeline only, got quant={type(quant).__name__}"
         elif self.geom.index_band:
             why = "with an indexer band the raw indexer key's pool is the separate cache-write launch's; declare fuse_cache_write_small_m=False (or None)"
@@ -11163,10 +11405,13 @@ class GatedAttentionBlockFwd(APIBase):
                 "are written into and read from); without a cache there is nothing to quantize"
             )
         if quant is not None:
-            # unreachable through the constructor (the write-through's quant row speaks first); kept so the attribute is honest on its own
+            # reachable through the constructor under the FP8-projection + bf16-attention mode alone (the write-through's quant row speaks first for
+            # every other quantized pipeline); honest on its own facts either way
             raise NotImplementedError(
                 f"kv_cache_dtype=torch.float8_e4m3fn with quant={type(quant).__name__}: the e4m3 KV cache is a form of the bf16 pipeline -- the quantized "
-                "pipelines' K / V are e4m3 codes of another recipe (the per-tensor FP8 / MXFP8 SDPA rows take e4m3 Q / K / V together)"
+                "pipelines' K / V are e4m3 codes of another recipe (the per-tensor FP8 / MXFP8 SDPA rows take e4m3 Q / K / V together); under the "
+                "FP8-projection + bf16-attention mode (QuantSpec(attention_dtype=torch.bfloat16)) the pools STAY bf16 -- an e4m3 cache under it is a "
+                "follow-up (the write-through would quantize the bf16 rows a second time, at another scale) -- declare kv_cache_dtype=None"
             )
         if act != torch.bfloat16:
             raise NotImplementedError(
@@ -11371,7 +11616,9 @@ class GatedAttentionBlockFwd(APIBase):
         if self.quant is not None:
             raise NotImplementedError(
                 f"num_tokens_live={num_tokens_live} on a quantized pipeline ({type(self.quant).__name__}): its scale-factor blobs and quantize stages "
-                "are sized by the declared capacity; the live token count serves the bf16 / f16 pipelines (the serving forms)"
+                "are sized by the declared capacity; the live token count serves the bf16 / f16 pipelines (the serving forms) -- under the "
+                "FP8-projection + bf16-attention mode (QuantSpec(attention_dtype=torch.bfloat16)) the FP8 projections' live-row launch is a follow-up: "
+                "hand the capacity rows (pad to T_max)"
             )
         return None if num_tokens_live == self.token_capacity else int(num_tokens_live)
 
@@ -11735,6 +11982,7 @@ class GatedAttentionBlockFwd(APIBase):
         device_cc: Optional[Tuple[int, int]] = None,
         decode_route_policy: Optional[str] = None,
         decode_q_tile_max: Optional[int] = None,
+        quant: Optional[Union[QuantSpec, MxQuantSpec]] = None,
     ) -> ServingEnvelope:
         """The static serving envelope for ``(geometry, dtype, device)`` -- what a serving stack's INIT-time dispatch predicate
         reads instead of catching the block's exceptions.  Derived from the SAME code the constructor and ``check_support`` run:
@@ -11762,7 +12010,15 @@ class GatedAttentionBlockFwd(APIBase):
         indexer; False where ``decode.served`` is False) -- the
         per-step reading is ``decode.pdl_default and decode.route(s_q, batch).pdl_capable`` on the dense form and ``decode.pdl_default`` itself
         under ``sparse_core`` (the sparse core carries the sites at every served step width; the dense route table does not apply there);
-        ``decode.pdl_stages`` names the switched stage kinds on both forms."""
+        ``decode.pdl_stages`` names the switched stage kinds on both forms.
+        ``quant`` (appended; ``None`` = the bf16 / f16 forms as before) is the declaration's quant spec: a ``QuantSpec`` with
+        ``attention_dtype=torch.bfloat16`` reads the FP8-PROJECTION + BF16-ATTENTION mode's envelope -- ``dtype`` is then the e4m3 ``h``
+        (``torch.float8_e4m3fn``), the part row consults :data:`FP8_PROJ_BF16_ATTENTION_CCS`, a QsaSpec geometry is declined by name --
+        while every other spec (``QuantSpec(attention_dtype=None)``, an ``MxQuantSpec``) reads "no paged leg" on both forms; each form's
+        ``quant_modes`` (appended) names the spellings served on this part beside ``quant=None``, whatever ``quant`` was passed.  ``quant`` is
+        validated first (``QuantSpec.validate()``, as the constructor does at declaration): an invalid spec serves neither form and each
+        form's ``reason`` carries the constructor's text; under the mode each form's ``dtypes`` is the e4m3 ``h`` and ``decode.kv_cache_dtypes``
+        the bf16 pools (2026-10-30)."""
         from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 
         policy = _resolve_decode_route_policy(decode_route_policy)
@@ -11772,17 +12028,53 @@ class GatedAttentionBlockFwd(APIBase):
         if dsl_reason is None and cc == _SM107_CC:
             dsl_reason = cutedsl_arch_requirement_error(cc)
         # the part row: the statement the stage raises -- the dense forms' part set for a dense geometry, Rubin alone for a QsaSpec one
-        common = _sparse_part_decline(cc) if geometry.qsa is not None else _dense_part_decline(cc)
+        # the QuantSpec's own validation FIRST -- the constructor runs `quant.validate()` at declaration, before any row: a non-positive or NaN scale,
+        # attention_dtype=torch.float16, a Q / K / V scale set under the mode declare nothing, so neither form is served and the reason is the
+        # constructor's text (2026-10-30; an MxQuantSpec meets its "no paged leg" row below before its own validation would speak)
+        quant_invalid = None
+        if isinstance(quant, QuantSpec):
+            try:
+                quant.validate()
+            except (ValueError, NotImplementedError) as e:
+                quant_invalid = f"QuantSpec.validate(): {e}"
+        common = quant_invalid if quant_invalid is not None else (_sparse_part_decline(cc) if geometry.qsa is not None else _dense_part_decline(cc))
+        # the quant row: None = the bf16 / f16 forms; the FP8-projection + bf16-attention mode (QuantSpec(attention_dtype=torch.bfloat16)) reads
+        # its own part tuple over e4m3 h on a dense geometry; every other spec has no paged leg -- the constructor's rows, word for word
+        mode = isinstance(quant, QuantSpec) and quant.attention_bf16
         if common is not None:
             pass
         elif dsl_reason is not None:
             common = dsl_reason
-        elif dtype not in (torch.bfloat16, torch.float16):
-            common = f"the serving forms over the pools serve bf16 / f16 activations and pools only (quant=None), got {dtype}"
+        elif quant is not None and not mode:
+            common = (
+                f"the serving forms over the pools serve bf16 / f16 activations and pools (quant=None) and the FP8-projection + bf16-attention mode "
+                f"({QUANT_MODE_FP8_PROJ_BF16_ATTENTION}: FP8 projections, bf16 pools and attention, the gated O quantized to e4m3); got "
+                f"quant={type(quant).__name__}"
+                + (
+                    "(attention_dtype=None) -- the fp8 d256 SDPA pipeline has no paged leg"
+                    if isinstance(quant, QuantSpec)
+                    else " -- MXFP8, MXFP4 and the fp4 O modes have no paged leg"
+                )
+            )
+        elif mode and geometry.qsa is not None:
+            common = _qsa_quant_decline_text(quant)
+        elif mode and dtype != torch.float8_e4m3fn:
+            common = (
+                f"{QUANT_MODE_FP8_PROJ_BF16_ATTENTION} needs an e4m3 h (FP8 needs both halves: an e4m3 `h` AND a QuantSpec), got {dtype}; the bf16 / f16 "
+                "forms take quant=None"
+            )
+        elif mode and _fp8_proj_bf16_attention_part_decline(cc) is not None:
+            common = _fp8_proj_bf16_attention_part_decline(cc)
+        elif not mode and dtype not in (torch.bfloat16, torch.float16):
+            common = (
+                f"the serving forms over the pools serve bf16 / f16 activations and pools only (quant=None) -- and e4m3 h under the FP8-projection + "
+                f"bf16-attention mode, {QUANT_MODE_FP8_PROJ_BF16_ATTENTION}, handed as serving_envelope(quant=) --, got {dtype} with quant=None"
+            )
+        # the mode's spelling the two forms serve on this part beside quant=None (whatever `quant` was passed): a dense geometry on a part of
+        # FP8_PROJ_BF16_ATTENTION_CCS with the DSL target, each form's own geometry rows permitting (below)
+        mode_part_ok = geometry.qsa is None and _dense_part_decline(cc) is None and dsl_reason is None and _fp8_proj_bf16_attention_part_decline(cc) is None
 
-        def probe(thd: bool, s_q: int):
-            if common is not None:
-                return common
+        def table_reason(thd: bool, s_q: int):
             if thd and geometry.qsa is not None and not _sparse_record().thd:
                 # a record without the packed arm: the THD-only form meets the sparse declaration's own row before any row of the
                 # table (_check_qsa_declaration runs first); with the arm claimed (the shipped record) the table's `sparse` row speaks
@@ -11801,16 +12093,26 @@ class GatedAttentionBlockFwd(APIBase):
             )
             return None if hit is None else hit[2]
 
+        def probe(thd: bool, s_q: int):
+            return common if common is not None else table_reason(thd, s_q)
+
+        def quant_modes(thd: bool, s_q: int) -> Tuple[str, ...]:
+            return (QUANT_MODE_FP8_PROJ_BF16_ATTENTION,) if (mode_part_ok and table_reason(thd, s_q) is None) else ()
+
+        # the dtype rows under the quant asked about: the bf16 / f16 forms' activations with quant=None; under the mode the input is the e4m3 h
+        # and the DECODE pools are bf16 -- the constructor's own requirements, so a stack reading these rows allocates what the declaration accepts
+        form_dtypes = (torch.float8_e4m3fn,) if mode else (torch.bfloat16, torch.float16)
         extend_reason = probe(True, 0)
         extend = ExtendEnvelope(
             served=extend_reason is None,
             reason=extend_reason,
             requires=_EXTEND_REQUIRES,
-            dtypes=(torch.bfloat16, torch.float16),
+            dtypes=form_dtypes,
             page_sizes=SERVING_PAGE_SIZES,
             pool_layouts=SERVING_POOL_LAYOUTS,
             declines={name: msg for name, _exc, _pred, msg in _EXTEND_DECLINES},  # the whole table: every row a declaration can hit
             pdl_stages=EXTEND_PDL_STAGES,
+            quant_modes=quant_modes(True, 0),
         )
         decode_reason = probe(False, 1)
         has_group = int(geometry.h_kv) >= 1 and int(geometry.h_q) % int(geometry.h_kv) == 0
@@ -11825,7 +12127,7 @@ class GatedAttentionBlockFwd(APIBase):
             served=decode_reason is None,
             reason=decode_reason,
             requires=_SPARSE_DECODE_REQUIRES if sparse else _DECODE_REQUIRES,
-            dtypes=(torch.bfloat16, torch.float16),
+            dtypes=form_dtypes,
             page_sizes=SERVING_PAGE_SIZES,
             pool_layouts=SERVING_POOL_LAYOUTS,
             declines=decode_declines,
@@ -11842,7 +12144,7 @@ class GatedAttentionBlockFwd(APIBase):
             sparse_core=sparse,
             # the e4m3 cache (the gathered cast + the decode tile) is a form of the block-sparse decode mode with bf16 activations only --
             # under caller lists: its composition with the in-block indexer waits for the sparse core's in-kernel dequant arm
-            kv_cache_dtypes=(dtype,) + ((KV_CACHE_E4M3,) if (sparse and dtype == torch.bfloat16 and not indexer) else ()),
+            kv_cache_dtypes=(torch.bfloat16,) if mode else (dtype,) + ((KV_CACHE_E4M3,) if (sparse and dtype == torch.bfloat16 and not indexer) else ()),
             policy=policy,
             claimed_max_s_q=DECODE_CLAIMED_MAX_S_Q,
             q_tile_max=q_tile_max,
@@ -11855,13 +12157,18 @@ class GatedAttentionBlockFwd(APIBase):
             # served (`decode_reason`:
             # another part, an unserved dtype, a geometry row, no DSL target); the per-step reading is `pdl_default and route(s_q, batch).pdl_capable`
             # on the dense form and `pdl_default` itself under `sparse_core` (the dense route table does not apply to the sparse core's step)
-            pdl_default=(decode_reason is None) and not indexer and cc in (SPARSE_DECODE_PDL_DEFAULT_CCS if sparse else DECODE_PDL_DEFAULT_CCS),
+            # (never under a quant spec: the quantized chains decline the switch, AUTO reads False there -- the mode included)
+            pdl_default=(decode_reason is None)
+            and quant is None
+            and not indexer
+            and cc in (SPARSE_DECODE_PDL_DEFAULT_CCS if sparse else DECODE_PDL_DEFAULT_CCS),
             # the list form (QsaSpec.index_list_form) at this geometry: the indexer over the pools selects per row; caller lists take the
             # shared step-0 list at S_q <= the record's cap (requires spells it) or the per-row list at any S_q
             index_list_forms=((QSA_INDEX_LIST_FORM_PER_ROW,) if indexer else (QSA_INDEX_LIST_FORM_SHARED, QSA_INDEX_LIST_FORM_PER_ROW)) if sparse else (),
             index_list_form_default=(QSA_INDEX_LIST_FORM_PER_ROW if indexer else QSA_INDEX_LIST_FORM_SHARED) if sparse else "",
             **cls._indexer_envelope_fields(geometry, dtype, cc, decode_reason is None),
             **cls._sparse_tile_envelope_fields(sparse and decode_reason is None, cc),
+            quant_modes=quant_modes(False, 1),
         )
         forms = tuple(nm for nm, env in (("extend", extend), ("decode", decode)) if env.served)
         return ServingEnvelope(
@@ -11980,11 +12287,17 @@ class GatedAttentionBlockFwd(APIBase):
         if cc is None or cc == _SM107_CC or cc not in DENSE_SERVING_CCS:
             return
         part = f"cc {cc[0]}.{cc[1]}"
-        if self.quant is not None:
+        if self.attention_bf16:
+            # the FP8-projection + bf16-attention mode: its own part tuple (the FP8 forced-tile GEMMs' cells through the block per part)
+            why = _fp8_proj_bf16_attention_part_decline(cc)
+            if why is not None:
+                raise NotImplementedError(why)
+        elif self.quant is not None:
             raise NotImplementedError(
                 f"quant={type(self.quant).__name__} on {part}: the FP8 / MXFP8 pipelines bind the Rubin d256 FP8 / MXFP8 SDPA rows and the sm_107a "
-                "projection forks -- the bf16 / f16 block is the pipeline served on this part (the lift: the FP8-projection + bf16-attention mode, a "
-                "QuantSpec attribute that keeps stage (4) in bf16, with its cells on this part; 2026-10-29)"
+                "projection forks -- the bf16 / f16 block is the pipeline served on this part (the lift: the FP8-projection + bf16-attention mode, "
+                "QuantSpec(attention_dtype=torch.bfloat16), which keeps stage (4) in bf16 and is served on the parts of FP8_PROJ_BF16_ATTENTION_CCS; "
+                "2026-10-29)"
             )
         if self.save_for_backward:
             raise NotImplementedError(
@@ -12177,6 +12490,8 @@ class GatedAttentionBlockFwd(APIBase):
             qsa_indexer_extend=self._indexer_extend.n_blocks_max if self._indexer_extend is not None else None,
             qsa_indexer_extend_window_rows=self._indexer_extend.window_rows if self._indexer_extend is not None else 0,
             qsa_indexer_extend_pieces=self._indexer_extend.n_pieces if self._indexer_extend is not None else 0,
+            # the FP8-projection + bf16-attention mode: no compact e4m3 Q / K / V (stage (4) reads the bf16 slab), o8 alone
+            fp8_attention_bf16=self.attention_bf16,
         )
 
     def get_workspace_size(self) -> int:
@@ -12231,13 +12546,18 @@ class GatedAttentionBlockFwd(APIBase):
         for bf16; ``{}`` under ``o_fp4`` -- neither ``alpha_o`` nor ``scale_o`` exists there (both pinned 1.0: the fp4 out_proj has
         no alpha epilogue and the fp4 quantizer takes no scale); under MXFP8 only the out projection's per-tensor pair survives
         (D1) -- ``alpha_o`` for the GEMM epilogue, ``scale_o`` for the unfused quantize_o; under per-tensor FP8 the two GEMM alphas,
-        the four quantize scales and the fp8 SDPA's three descales."""
+        the four quantize scales and the fp8 SDPA's three descales; under the FP8-projection + bf16-attention mode the two GEMM alphas and
+        ``scale_o`` alone (three scalars)."""
         if spec is None:
             return None
         if self.o_fp4 is not None:
             return {}
         if self.mxfp8:
             return dict(alpha_o=float(spec.alpha_o), scale_o=float(spec.scale_o))
+        if self.attention_bf16:
+            # the FP8-projection + bf16-attention mode: the two GEMM alphas and quantize_o's scale -- no Q / K / V scale (no quantization
+            # point), no descale (the bf16 SDPA takes none)
+            return dict(alpha_qkvg=float(spec.alpha_qkvg), alpha_o=float(spec.alpha_o), scale_o=float(spec.scale_o))
         return dict(
             alpha_qkvg=float(spec.alpha_qkvg),
             alpha_o=float(spec.alpha_o),
@@ -12267,7 +12587,8 @@ class GatedAttentionBlockFwd(APIBase):
     def _check_quant_update(self, spec) -> None:
         """The typed refusals of :meth:`update_quant_scales`, every one BEFORE any write: a block declared without ``quant``
         (``ValueError``); a spec of the other class (``TypeError``: the two classes select different pipelines); a differing plan
-        fact -- ``dtype``, and under MXFP8 ``block_size`` / ``w_qkvg_dtype`` / ``o_fp4`` -- (``ValueError`` naming the field: those
+        fact -- ``dtype``, under a QuantSpec ``attention_dtype`` (the FP8-projection + bf16-attention mode selects stage (4)'s kernels and the
+        carve), and under MXFP8 ``block_size`` / ``w_qkvg_dtype`` / ``o_fp4`` -- (``ValueError`` naming the field: those
         select kernels and the workspace carve, only the scales may move); ``spec``'s own ``validate`` EXACTLY as the declaration
         applied it (``MxQuantSpec.validate(fused=...)`` -- the fully fused MXFP8 path pins ``scale_o == 1.0`` --, the bare
         ``QuantSpec.validate()``: a zero / inf / NaN scale is refused there); a block not yet compiled (``RuntimeError``)."""
@@ -12281,7 +12602,7 @@ class GatedAttentionBlockFwd(APIBase):
                 f"update_quant_scales(): spec must be a {type(self.quant).__name__}, the class this block was declared with (QuantSpec and "
                 f"MxQuantSpec select different pipelines), got {type(spec).__name__}"
             )
-        for name in ("dtype", "block_size", "w_qkvg_dtype", "o_fp4") if self.mxfp8 else ("dtype",):
+        for name in ("dtype", "block_size", "w_qkvg_dtype", "o_fp4") if self.mxfp8 else ("dtype", "attention_dtype"):
             if getattr(spec, name) != getattr(self.quant, name):
                 raise ValueError(
                     f"update_quant_scales(): {type(spec).__name__}.{name} is a plan fact (it selects kernels and the workspace carve): declared "
@@ -12333,7 +12654,8 @@ class GatedAttentionBlockFwd(APIBase):
     def update_quant_scales(self, spec: Union[QuantSpec, MxQuantSpec], *, current_stream: Optional[cuda.CUstream] = None) -> None:
         """Re-point a COMPILED quantized block's per-tensor scales at ``spec`` without recompiling: an in-place write of the
         device scalars of :meth:`_make_quant_dev` (``alpha_qkvg`` / ``alpha_o`` / ``scale_q`` / ``scale_k`` / ``scale_v`` /
-        ``scale_o`` / ``descale_q`` / ``descale_k`` / ``descale_v`` under a ``QuantSpec``; ``alpha_o`` / ``scale_o`` under an
+        ``scale_o`` / ``descale_q`` / ``descale_k`` / ``descale_v`` under a ``QuantSpec``, ``alpha_qkvg`` / ``alpha_o`` / ``scale_o``
+        under its FP8-projection + bf16-attention mode; ``alpha_o`` / ``scale_o`` under an
         ``MxQuantSpec``; and the fused fp8 fork's ``[alpha_qkvg, scale_q, scale_k, scale_v]`` vector where it exists) on the
         launch stream -- ``current_stream`` (a raw ``CUstream``), else torch's current stream on the block's device (Rule 5) --
         then ``self.quant = spec``.  Every consumer binds those tensors at ``execute``, so the next execute on that stream runs
@@ -12349,7 +12671,7 @@ class GatedAttentionBlockFwd(APIBase):
         backward rebuilds the SDPA operands at the forward's scales.
 
         Typed refusals, every one BEFORE any write (:meth:`_check_quant_update`): a block declared without ``quant``
-        (``ValueError``); a spec of the other class (``TypeError``); a differing plan fact -- ``dtype``, ``block_size``,
+        (``ValueError``); a spec of the other class (``TypeError``); a differing plan fact -- ``dtype``, ``attention_dtype``, ``block_size``,
         ``w_qkvg_dtype``, ``o_fp4`` -- (``ValueError`` naming the field: those select kernels and the carve); ``spec``'s own
         ``validate`` exactly as the declaration applied it (the fully fused MXFP8 path keeps its ``scale_o == 1.0`` rule; a zero
         / inf / NaN scale is its own ``ValueError``); a block not yet compiled (``RuntimeError``).  Under ``o_fp4``
@@ -12903,6 +13225,7 @@ class GatedAttentionBlockFwd(APIBase):
         fp8 = self.quant is not None
         mxfp8 = self.mxfp8
         act = self.act_dtype
+        fp8_sdpa = fp8 and not self.attention_bf16  # the attention side (the stage build's note): the fp8 d256 SDPA + its quantize stages, or the bf16 tile
         if self.fp8_fused:
             self._execute_fp8_fused(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_lens, lse, stream)
             return
@@ -12956,9 +13279,10 @@ class GatedAttentionBlockFwd(APIBase):
         sfq = sfk = sfv = None
         if fp8:
             e4 = torch.float8_e4m3fn
-            q8 = _view(workspace, ws.q8, (t, g.h_q, g.d_head), e4)
-            k8 = _view(workspace, ws.k8, (t, g.h_kv, g.d_head), e4)
-            v8 = _view(workspace, ws.v8, (t, g.h_kv, g.d_head), e4)
+            # the compact e4m3 Q / K / V: not reserved under the FP8-projection + bf16-attention mode (stage (4) reads the bf16 slab)
+            q8 = _view(workspace, ws.q8, (t, g.h_q, g.d_head), e4) if ws.q8 >= 0 else None
+            k8 = _view(workspace, ws.k8, (t, g.h_kv, g.d_head), e4) if ws.k8 >= 0 else None
+            v8 = _view(workspace, ws.v8, (t, g.h_kv, g.d_head), e4) if ws.v8 >= 0 else None
             o8 = _view(workspace, ws.o8, (t, g.h_q, g.d_head), e4) if ws.o8 >= 0 else None  # not reserved under o_fp4
             qd = self._quant_dev
         o4 = sfo = None
@@ -13101,9 +13425,10 @@ class GatedAttentionBlockFwd(APIBase):
             self._quant_k.execute(k_n, k8, sfk, current_stream=stream, **qkw)
             self._quant_v.execute(v_src, v8, sfv, current_stream=stream, **qkw)
             q_c, k_c, v_c = q8, k8, v8
-        elif fp8:
+        elif fp8_sdpa:
             # (3q) bf16 normed Q/K (+ the slab's V band) -> compact e4m3.  This IS the
             # compaction the FP8 SDPA needs (its adapter path takes no declared slab strides).
+            # (the FP8-projection + bf16-attention mode skips this arm: its stage (4) reads the slab bands below, as the bf16 form does)
             self._quant_q.execute(q_n, q8, qd["scale_q"], current_stream=stream)
             self._quant_kv.execute(k_n, k8, qd["scale_k"], current_stream=stream)
             self._quant_kv.execute(v_src, v8, qd["scale_v"], current_stream=stream)
@@ -13197,7 +13522,8 @@ class GatedAttentionBlockFwd(APIBase):
             # pool row is bitwise the row attention consumes; the raw indexer key (the fifth band's key head, pre-norm,
             # un-rotated: what a serving indexer cache keeps) into its own pool when the band is declared.  Nothing the
             # SDPA reads is touched, so `out` is bitwise the block's without write-through.  Only the bf16 / f16
-            # pipelines reach here (the quantized ones declined at declaration); their k_c / v_c are 16-bit views -- the
+            # pipelines and the FP8-projection + bf16-attention mode reach here (the other quantized pipelines declined at
+            # declaration); their k_c / v_c are 16-bit views (the bf16 slab's bands under that mode too) -- the
             # packed block's too (B = 1, S = T: the same [T, H_kv, D] views at the slab's token stride).
             # the raw-key arm: the band's pool (not under the decode indexer over the pools, whose raw key entered the ring -- the stage was
             # built without the arm and `index_k_raw` was refused up front)
@@ -13282,10 +13608,11 @@ class GatedAttentionBlockFwd(APIBase):
                 workspace=engine_ws,
                 current_stream=cuda.CUstream(stream),
                 gate=gate_src.view(self.batch, self.seq_len, g.h_q, g.d_head) if self.gate_fused else None,
-                # per-tensor FP8: scalar descales; MXFP8: the three SF blobs (and NO scalars -- _Sdpa refuses them)
-                descale_q=qd["descale_q"] if (fp8 and not mxfp8) else None,
-                descale_k=qd["descale_k"] if (fp8 and not mxfp8) else None,
-                descale_v=qd["descale_v"] if (fp8 and not mxfp8) else None,
+                # per-tensor FP8: scalar descales; MXFP8: the three SF blobs (and NO scalars -- _Sdpa refuses them); the FP8-projection +
+                # bf16-attention mode: none (a bf16 stage)
+                descale_q=qd["descale_q"] if (fp8_sdpa and not mxfp8) else None,
+                descale_k=qd["descale_k"] if (fp8_sdpa and not mxfp8) else None,
+                descale_v=qd["descale_v"] if (fp8_sdpa and not mxfp8) else None,
                 sf_q=sfq,
                 sf_k=sfk,
                 sf_v=sfv,
