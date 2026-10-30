@@ -469,6 +469,49 @@ class OperandBuffer {
         return new OperandBuffer(out, tensor_.device.device_id);
     }
 
+    // Fold only affine leading batch axes. Unlike reshape, this preserves the
+    // matrix strides and gaps between matrices; it never copies or owns storage.
+    OperandBuffer *
+    flatten_batch() const {
+        const auto &shape = operand_.shape;
+        if (shape.size() < 2) throw py::value_error("matrix batch view requires rank >= 2");
+        const auto strides = stride();
+        auto multiply      = [](int64_t a, int64_t b) {
+            if (a < 0 || b < 0 || (b != 0 && a > std::numeric_limits<int64_t>::max() / b))
+                throw py::value_error("matrix batch view exceeds signed 64-bit geometry");
+            return a * b;
+        };
+        int64_t span = 1;
+        for (size_t i = 0; i < shape.size(); ++i) {
+            if (shape[i] <= 0 || strides[i] < 0)
+                throw py::value_error("matrix batch view requires positive extents and nonnegative strides");
+            const int64_t term = multiply(shape[i] - 1, strides[i]);
+            if (span > std::numeric_limits<int64_t>::max() - term)
+                throw py::value_error("matrix batch view exceeds signed 64-bit geometry");
+            span += term;
+        }
+        const size_t row = shape.size() - 2, column = shape.size() - 1;
+        int64_t pitch = 0;
+        bool active   = false;
+        for (size_t i = 0; i < row; ++i)
+            if (shape[i] != 1) {
+                pitch  = strides[i];
+                active = true;
+            }
+        if (!active) pitch = std::max(multiply(shape[row], strides[row]), multiply(shape[column], strides[column]));
+        int64_t batch = 1;
+        for (size_t i = row; i-- > 0;) {
+            if (shape[i] != 1 && (pitch == 0 || strides[i] != multiply(pitch, batch)))
+                throw py::value_error("matrix batch axes are not affine and cannot be folded without copying");
+            batch = multiply(batch, shape[i]);
+        }
+        Operand out = operand_;
+        out.shape   = {batch, shape[row], shape[column]};
+        out.stride  = {pitch, strides[row], strides[column]};
+        out.ndim    = 3;
+        return new OperandBuffer(out, tensor_.device.device_id);
+    }
+
     // The same memory with its axes relabelled; exact for a strided operand too.
     OperandBuffer *
     permute(const std::vector<int64_t> &axes) const {
@@ -1493,6 +1536,7 @@ capsule built in python.
                                       }
                                       return self.reshape(std::move(shape));
                                   })
+                             .def("flatten_batch", &OperandBuffer::flatten_batch)
                              .def("permute",
                                   [](const OperandBuffer &self, py::args axes) {
                                       std::vector<int64_t> order;

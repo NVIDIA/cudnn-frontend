@@ -25,6 +25,7 @@ from cudnn.frost.workspace import Workspace
 from .arch_family import active_family
 from .dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS, _pow2_floor, tensor_alignment
 from .fusion_ir import Axis, FusionChain, MoeSwapAbSpec, TensorRef, segmented_row_scale_capacity_rows
+from .matrix_views import canonical_operands, matrix_shape
 from .recipe import AX_MN, FROM_M, FROM_N, REDUCTION_INIT_VALUE, _output_rule, contiguous_modulus, expected_shape
 
 
@@ -990,6 +991,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         r = self.recipe
         if r is None:
             return self.workspace_bytes
+        operands = canonical_operands(r.matrix_views, operands)
         mn = []
         for op in (r.a, r.b):
             v = operands[op.index]
@@ -1005,7 +1007,12 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         r = self.recipe
         if r is None:
             return self.workspace_bytes
-        dims = {uid: shape for uid, shape in zip(override_uids or (), override_shapes or ()) if len(shape) == 3}
+        matrix_rules = {self.bound[index].get_uid(): prefix for index, prefix in r.matrix_views}
+        dims = {
+            uid: matrix_shape(shape, matrix_rules[uid]) if uid in matrix_rules else shape
+            for uid, shape in zip(override_uids or (), override_shapes or ())
+            if uid in matrix_rules or len(shape) == 3
+        }
         mn = [None, None]
         for i, op in enumerate((r.a, r.b)):
             shape = dims.get(self.bound[op.index].get_uid())
@@ -1114,10 +1121,13 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         quant_reason = backend._runtime_quant_reason if quant_mn is not None else None
         quant_chain, quant_cfg = (self.chain, self.config)
         gave_up = self.deferrals
+        matrix_output_indices = frozenset(o.index for o in r.outputs)
 
         def lowered(operands, graph_order=None, stream=None, workspace=None):
             """Validate resolved buffers and launch the already compiled GEMM plan."""
             backend._check_plan_device(device)
+            original_operands = operands
+            operands = canonical_operands(r.matrix_views, operands, output_indices=matrix_output_indices)
             vs = [operands[i] for i in in_slots]
             for j, perm, dsh, dst, force_graph_order in renorm:
                 v = vs[j]
@@ -1135,7 +1145,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
             a_sh, b_sh = (vs[a_pos].shape, vs[b_pos].shape)
             if len(a_sh) != 3 or len(b_sh) != 3:
                 gave_up["A or B is not rank 3"] += 1
-                return refuse(operands, graph_order)
+                return refuse(original_operands, graph_order)
             m, n, k = (a_sh[1], b_sh[1], a_sh[2] * a_kpack)
             problem = [m, n, k, batch]
             for (kc, mod, ebatch, kpack, is_b, takes_stride), v in zip(ins, vs):
@@ -1150,12 +1160,12 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                     or (backend._pow2_floor(v.data_ptr()) < 16)
                 ):
                     gave_up["input layout"] += 1
-                    return refuse(operands, graph_order)
+                    return refuse(original_operands, graph_order)
                 if takes_stride:
                     problem += (st[1], st[2], st[0])
             if quant_mn is not None and (m, n) != quant_mn and (quant_reason(quant_chain, quant_cfg, m, n) is not None):
                 gave_up["quant extents"] += 1
-                return refuse(operands, graph_order)
+                return refuse(original_operands, graph_order)
             for idx, k0, v0, k1, v1, k2, v2, align in outs:
                 v = operands[idx]
                 sh, st = (v.shape, v.stride())
@@ -1167,7 +1177,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                     or (backend.tensor_alignment(tuple(sh), tuple(st), v.element_size(), ptr=v.data_ptr()) < align)
                 ):
                     gave_up["output layout"] += 1
-                    return refuse(operands, graph_order)
+                    return refuse(original_operands, graph_order)
                 problem += (st[2], st[1], st[0]) if swap_ab and idx in mn_view_slots else (st[1], st[2], st[0])
             for idx, align, scale_rule in auxs:
                 v = operands[idx]
@@ -1175,11 +1185,11 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                     scale_rule.check(v, k)
                 if backend.tensor_alignment(tuple(v.shape), tuple(v.stride()), v.element_size(), ptr=v.data_ptr()) < align:
                     gave_up["aux alignment"] += 1
-                    return refuse(operands, graph_order)
+                    return refuse(original_operands, graph_order)
             if sfs:
                 if whole_scale_blocks and k % block_size:
                     gave_up["partial scale block"] += 1
-                    return refuse(operands, graph_order)
+                    return refuse(original_operands, graph_order)
                 k4 = (k // block_size + 3) // 4
                 for idx, is_a, sf_batch in sfs:
                     v = operands[idx]
@@ -1191,13 +1201,13 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                         or (count * v.element_size() < 512 * k4 * (((m if is_a else n) + 127) // 128) * sf_batch)
                     ):
                         gave_up["scale-factor blob"] += 1
-                        return refuse(operands, graph_order)
+                        return refuse(original_operands, graph_order)
             for lead, followers in shared:
                 st = tuple(vs[lead].stride())
                 for j in followers:
                     if tuple(vs[j].stride()) != st:
                         gave_up["operands do not share a layout"] += 1
-                        return refuse(operands, graph_order)
+                        return refuse(original_operands, graph_order)
             if split_k_slices > 1:
                 backend.check_split_k_shape(k, n, batch, split_k_slices, cta_k_elems, reduce_elems if needs_workspace else 1)
             extra = ()
@@ -1213,7 +1223,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                     v = operands[idx]
                     if v.element_size() != elem_bytes:
                         gave_up["reduction seed dtype"] += 1
-                        return refuse(operands, graph_order)
+                        return refuse(original_operands, graph_order)
                     sh, st = (v.shape, v.stride())
                     if is_contiguous(sh, st):
                         fills.append((v.data_ptr(), None, int(v.numel()), word))
@@ -1221,7 +1231,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                     plan = fill_plan(sh, st)
                     if plan is None:
                         gave_up["reduction output writes an element twice"] += 1
-                        return refuse(operands, graph_order)
+                        return refuse(original_operands, graph_order)
                     fills.append((v.data_ptr(), plan, 0, word))
                 for ptr, plan, count, word in fills:
                     if plan is None:
@@ -1250,6 +1260,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         backend = self._compiler
         recipe = self.recipe
         backend._check_plan_device(recipe.device)
+        operands = canonical_operands(getattr(recipe, "matrix_views", ()), operands, output_indices=tuple(o.index for o in getattr(recipe, "outputs", ())))
         mnk, axes = recipe.problem(operands, graph_order)
         backend.check_shapes(recipe, operands, mnk, axes)
         backend.check_alignment(recipe, operands, axes)

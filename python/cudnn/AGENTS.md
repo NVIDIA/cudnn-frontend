@@ -787,6 +787,11 @@ rebind unequal live extents and retain physical strides. Shared tensors can need
 different logical views but still have one caller binding. The host/native
 transport tests in `gemm/frost/test_matmul_transpose_mainloop.py` check these cases
 with raw addresses, ordered packs, overrides and swap-AB without copying storage.
+For higher-rank matrices, fold batch axes only when all nonunit prefix strides
+follow one affine pitch. Use a checked native metadata view or Torch `view`, never
+`reshape` which may copy; preserve padded matrix/batch pitches and pin every
+original batch axis, not merely their product. `test_matmul_transpose_rank.py`
+checks rank-2/rank-N packs and rejection before launch, including native views.
 
 Named barriers inside warp-specific branches need unaligned sync and arrive
 instructions. CuTeDSL 4.8's `NamedBarrier.arrive_and_wait()` emits an aligned

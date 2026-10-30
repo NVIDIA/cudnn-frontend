@@ -12,6 +12,7 @@ from cudnn.frost.buffers import dtype_name, init_word, is_contiguous, strided_fi
 
 from .dtypes import DTYPE_BYTES, _aux_align_reqs, _output_align_reqs, _pow2_floor, tensor_alignment
 from .fusion_ir import FusionChain
+from .matrix_views import matrix_layout
 
 # An operand's three axes, named by role rather than by position.
 AX_BATCH, AX_MN, AX_K = 0, 1, 2
@@ -179,6 +180,7 @@ class GemmRecipe:
     stride_ins: tuple
     shared_layout: tuple
     seeds: tuple
+    matrix_views: tuple = ()
 
     @property
     def a(self) -> Operand:
@@ -414,11 +416,25 @@ def _declared_layout(tensor) -> tuple:
 
 
 def _operand(
-    index: int, role: str, tensor, *, major: str, dtype: str, batch: int, is_b: bool, declared_is_b: bool | None = None, transposed=False, graph_order=False
+    index: int,
+    role: str,
+    tensor,
+    *,
+    major: str,
+    dtype: str,
+    batch: int,
+    is_b: bool,
+    declared_is_b: bool | None = None,
+    transposed=False,
+    graph_order=False,
+    matrix_batch=None,
 ) -> Operand:
     declared = _DECLARED_AXES["b" if (is_b if declared_is_b is None else declared_is_b) else "a"]
     if transposed:
         declared = (declared[0], declared[2], declared[1])
+    layout = _declared_layout(tensor)
+    if matrix_batch is not None:
+        layout = matrix_layout(*layout)
     contiguous = AX_K if major == "k" else AX_MN
     modulus, pack = contiguous_modulus(dtype, contiguous == AX_K)
     return Operand(
@@ -431,7 +447,7 @@ def _operand(
         modulus=modulus,
         pack=pack,
         contiguous_role=contiguous,
-        declared_layout=_declared_layout(tensor),
+        declared_layout=layout,
         declared=declared,
         dc=declared[contiguous],
         kc=KERNEL_AXES[contiguous],
@@ -449,6 +465,7 @@ def build(compiled) -> GemmRecipe:
     for i, t in enumerate(binding.bound_tensors()):
         order.setdefault(id(t), i)
 
+    matrix_batches = {id(t): prefix for t, prefix in binding.matrix_batches}
     inputs = [
         _operand(
             order[id(t)],
@@ -461,6 +478,7 @@ def build(compiled) -> GemmRecipe:
             declared_is_b=swap_ab,
             transposed=bool(binding.a_transposed and binding.a_transposed[i]),
             graph_order=bool(binding.a_transposed),
+            matrix_batch=matrix_batches.get(id(t)),
         )
         for i, t in enumerate(binding.a_operands)
     ] + [
@@ -475,6 +493,7 @@ def build(compiled) -> GemmRecipe:
             declared_is_b=not swap_ab,
             transposed=bool(binding.b_transposed and binding.b_transposed[i]),
             graph_order=bool(binding.b_transposed),
+            matrix_batch=matrix_batches.get(id(t)),
         )
         for i, t in enumerate(binding.b_operands)
     ]
@@ -553,4 +572,5 @@ def build(compiled) -> GemmRecipe:
         stride_ins=stride_ins,
         shared_layout=shared_layout,
         seeds=tuple(seeds),
+        matrix_views=tuple((order[tid], prefix) for tid, prefix in matrix_batches.items() if tid in order),
     )
