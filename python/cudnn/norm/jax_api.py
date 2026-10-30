@@ -38,14 +38,15 @@ def _require_array(value, name):
 
 
 def _target_device(*arrays):
-    from cudnn.frost.device import compute_capability
+    from cudnn.frost.device import compute_capability, device_count, multiprocessor_count, shared_memory_per_block_optin
 
-    if jax.process_count() != 1 or jax.device_count() != 1:
-        raise NotImplementedError("JAX normalization requires a single process with one visible GPU; select it with CUDA_VISIBLE_DEVICES before importing JAX")
+    if jax.process_count() != 1:
+        raise NotImplementedError("JAX normalization requires a single process")
     placed = {device for x in arrays if isinstance(x, jax.Array) and not isinstance(x, jax.core.Tracer) for device in x.devices()}
     if len(placed) > 1:
         raise ValueError("JAX normalization arrays must be on the same GPU")
-    # Tracers have no concrete buffer placement; use the enclosing default device.
+    # Tracers have no concrete placement; this GPU supplies the common hardware
+    # facts checked below, while XLA controls the execution device.
     target = next(iter(placed)) if placed else (jax.config.jax_default_device or jax.local_devices()[0])
     if target.platform != "gpu":
         raise NotImplementedError(f"JAX normalization requires a CUDA GPU; got {target.platform}")
@@ -53,6 +54,11 @@ def _target_device(*arrays):
     capability = compute_capability(device)
     if capability != (10, 0):
         raise NotImplementedError(f"JAX normalization requires SM100 (compute capability 10.0); got {capability}")
+    # Include CUDA devices hidden from JAX: the DSL also queries the ambient
+    # architecture when choosing shared-memory limits and compiling kernels.
+    properties = {(compute_capability(index), multiprocessor_count(index), shared_memory_per_block_optin(index)) for index in range(device_count())}
+    if len(properties) != 1:
+        raise NotImplementedError("JAX normalization requires visible CUDA GPUs with matching compute capability, SM count, and shared-memory limit")
     return device
 
 
