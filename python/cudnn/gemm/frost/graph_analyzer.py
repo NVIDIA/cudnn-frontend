@@ -34,7 +34,7 @@ from .fusion_ir import (
 
 # Dtype + op tables
 
-from .matrix_views import matrix_layout
+from .dtypes import fold_batch_layout
 
 from .dtypes import CUDNN_FROM_DTYPE as _CUDNN_FROM_DTYPE
 from .dtypes import DTYPE_FROM_CUDNN as _DTYPE_FROM_CUDNN
@@ -1533,81 +1533,24 @@ def _build_multi_moe_chain(
     return chain, binding
 
 
-def _normalize_matrix_ranks(ops: list[_RecordedOp], meta: dict[int, _TensorMeta]) -> list[_RecordedOp]:
-    """Fold representable matrix batch axes to the kernel's (batch, row, column) ABI.
+def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta], io_dtype: Dtype, intermediate_dtype: Dtype) -> list[_RecordedOp]:
+    """Resolve logical shapes, project operand transposes, then fold the kernel ABI.
 
-    This is not general reshape algebra: every batch address must be affine,
-    and each input must either cover all output batches or broadcast all of them.
-    """
-    matmuls = [op for op in ops if op.cudnn_name == "matmul"]
-    # Specialized graph families keep their own lowering. Plain GEMM uses this
-    # one rank-independent view pass, including inputs already at kernel rank.
-    if len(matmuls) != 1 or any(op.cudnn_name not in (*_UNARY_OP_MAP, *_BINARY_OP_MAP, "matmul") for op in ops):
-        return ops
-    producers = {op.output: op for op in ops}
-
-    @lru_cache(maxsize=None)
-    def shape(tid):
-        m, op = meta[tid], producers.get(tid)
-        if op is None:
-            return m.dim
-        dims = [shape(i) for i in op.inputs]
-        if op.cudnn_name == "matmul":
-            a, b = dims
-            if len(a) != len(b) or len(a) < 2 or a[-1] != b[-2]:
-                raise ValueError(f"matrix rank or contraction mismatch: A={a}, B={b}")
-            if any(x != y and x != 1 and y != 1 for x, y in zip(a[:-2], b[:-2])):
-                raise ValueError(f"matrix batch dimensions do not broadcast: A={a}, B={b}")
-            expected = (*map(max, zip(a[:-2], b[:-2])), a[-2], b[-1])
-        else:
-            rank = max(map(len, dims))
-            padded = [(1,) * (rank - len(d)) + d for d in dims]
-            if any(len({d for d in axis if d != 1}) > 1 for axis in zip(*padded)):
-                raise ValueError(f"matrix pointwise inputs do not broadcast: {dims}")
-            expected = tuple(map(max, zip(*padded)))
-        if m.dim and m.dim != expected:
-            raise ValueError(f"matrix node {op.op_name!r}: expected output shape {expected}, got {m.dim}")
-        return expected
-
-    mm = matmuls[0]
-    batch_shape = shape(mm.output)[:-2]
-    ranked_shapes = {tid: shape(tid) for tid in meta}
-    for tid, m in list(meta.items()):
-        dim = ranked_shapes[tid]
-        if len(dim) < 2:
-            continue  # rank-one/scalar auxiliary ABI is already supported
-        prefix = dim[:-2]
-        width = max(len(prefix), len(batch_shape))
-        padded = (1,) * (width - len(prefix)) + prefix
-        expected_batch = (1,) * (width - len(batch_shape)) + batch_shape
-        if padded != expected_batch and any(d != 1 for d in padded):
-            raise ValueError(
-                f"matrix input {m.name!r}: partial/crossed batch broadcasting cannot be represented by one batch stride; got {prefix}, output {batch_shape}"
-            )
-        stride = m.stride or tuple(prod(dim[i + 1 :]) for i in range(len(dim)))
-        layout_dim, layout_stride = matrix_layout(dim, stride, writable=_is_output(meta, tid))
-        meta[tid] = replace(
-            m,
-            dim=layout_dim,
-            stride=layout_stride,
-            matrix_batch=prefix,
-            mn_transposed=False if m.is_input and m.mn_transposed is None and dim != layout_dim else m.mn_transposed,
-        )
-    return ops
-
-
-def _normalize_operand_transposes(ops: list[_RecordedOp], meta: dict[int, _TensorMeta], io_dtype: Dtype, intermediate_dtype: Dtype) -> list[_RecordedOp]:
-    """Project last-two-axis transposes through rank-N operand pointwise chains.
-
-    Only metadata is rewritten. Original Tensor objects, node dtypes and
-    rounding boundaries remain authoritative, including for shared inputs.
+    One immutable producer map and one logical-shape cache serve both steps.
+    Only the analysis snapshot changes; original tensors, pointwise dtypes and
+    observable epilogue branches retain their caller coordinates.
     """
     transposes = [op for op in ops if op.cudnn_name == "transpose"]
-    if not transposes:
-        return ops
     matmuls = [op for op in ops if op.cudnn_name == "matmul"]
     if len(matmuls) != 1 or any(op.cudnn_name in ("moe_grouped_matmul", "block_scale_dequantize") for op in ops):
-        raise ValueError("operand transpose fusion requires one plain matmul (no MoE or block-scale dequantize)")
+        if transposes:
+            raise ValueError("operand transpose fusion requires one plain matmul (no MoE or block-scale dequantize)")
+        return ops
+    # Specialized graph families keep their existing lowering and support gates.
+    fold_batches = all(op.cudnn_name in (*_UNARY_OP_MAP, *_BINARY_OP_MAP, "matmul", "transpose") for op in ops)
+    if not transposes and not fold_batches:
+        return ops
+    mm = matmuls[0]
     producers = {op.output: op for op in ops}
     used_transposes, projected_ops = set(), []
     names = {m.name for m in meta.values()}
@@ -1617,31 +1560,32 @@ def _normalize_operand_transposes(ops: list[_RecordedOp], meta: dict[int, _Tenso
         m, op = meta[tid], producers.get(tid)
         if op is None:
             return m.dim
+        dims = [shape(i) for i in op.inputs]
         if op.cudnn_name == "transpose":
-            dim = shape(op.inputs[0])
+            dim = dims[0]
             identity = tuple(range(len(dim)))
             swap = (*identity[:-2], len(dim) - 1, len(dim) - 2)
             if len(dim) < 2 or op.permutation not in (identity, swap):
                 raise ValueError(f"operand transpose {op.op_name!r}: only identity or last-two matrix axes may be permuted; batch axes must stay fixed")
-            inferred = tuple(dim[i] for i in op.permutation)
-            if m.dim and m.dim != inferred:
-                raise ValueError(f"operand transpose {op.op_name!r}: expected output shape {inferred}, got {m.dim}")
-            return inferred
-        if m.dim:
-            return m.dim
-        dims = [shape(i) for i in op.inputs]
-        if op.cudnn_name == "matmul":
+            expected = tuple(dim[i] for i in op.permutation)
+        elif op.cudnn_name == "matmul":
             a, b = dims
             if len(a) != len(b) or len(a) < 2 or a[-1] != b[-2]:
                 raise ValueError(f"matrix rank or contraction mismatch: A={a}, B={b}")
             if any(x != y and x != 1 and y != 1 for x, y in zip(a[:-2], b[:-2])):
                 raise ValueError(f"matrix batch dimensions do not broadcast: A={a}, B={b}")
-            return (*map(max, zip(a[:-2], b[:-2])), a[-2], b[-1])
-        rank = max(map(len, dims), default=0)
-        padded = [(1,) * (rank - len(dim)) + dim for dim in dims]
-        if any(len({d for d in axis if d != 1}) > 1 for axis in zip(*padded)):
-            raise ValueError(f"operand pointwise {op.op_name!r}: incompatible broadcast shapes {dims}")
-        return tuple(max(axis) for axis in zip(*padded))
+            expected = (*map(max, zip(a[:-2], b[:-2])), a[-2], b[-1])
+        elif op.cudnn_name in (*_UNARY_OP_MAP, *_BINARY_OP_MAP):
+            rank = max(map(len, dims))
+            padded = [(1,) * (rank - len(d)) + d for d in dims]
+            if any(len({d for d in axis if d != 1}) > 1 for axis in zip(*padded)):
+                raise ValueError(f"operand pointwise {op.op_name!r}: incompatible broadcast shapes {dims}")
+            expected = tuple(map(max, zip(*padded)))
+        else:
+            return m.dim  # specialized outputs are handled by their own lowerer
+        if m.dim and m.dim != expected:
+            raise ValueError(f"operand node {op.op_name!r}: expected output shape {expected}, got {m.dim}")
+        return expected
 
     @lru_cache(maxsize=None)
     def dtype(tid):
@@ -1690,17 +1634,42 @@ def _normalize_operand_transposes(ops: list[_RecordedOp], meta: dict[int, _Tenso
         projected_ops.append(replace(op, inputs=inputs, output=output))
         return output
 
-    # Keep shapes of the original DAG too: its pointwise branches may still be
-    # observed by the epilogue after operand projections remove transpose nodes.
-    for op in transposes:
-        tid = op.output
-        if not meta[tid].dim:
-            meta[tid] = replace(meta[tid], dim=shape(tid))
-    mm = matmuls[0]
-    inputs = [project(i) for i in mm.inputs]
-    if len(used_transposes) != len(transposes):
-        raise ValueError("transpose fusion is operand-only; epilogue or unrelated transposes are unsupported")
-    return [replace(op, inputs=inputs) if op is mm else op for op in ops if op.cudnn_name != "transpose"] + projected_ops
+    if transposes:
+        inputs = [project(i) for i in mm.inputs]
+        if len(used_transposes) != len(transposes):
+            raise ValueError("transpose fusion is operand-only; epilogue or unrelated transposes are unsupported")
+        # Original branches can still reference these logical outputs after the
+        # operand-only rewrite removes their transpose producers.
+        for op in transposes:
+            tid = op.output
+            if not meta[tid].dim:
+                meta[tid] = replace(meta[tid], dim=shape(tid))
+        ops = [replace(op, inputs=inputs) if op is mm else op for op in ops if op.cudnn_name != "transpose"] + projected_ops
+    if fold_batches:
+        batch_shape = shape(mm.output)[:-2]
+        ranked_shapes = {tid: shape(tid) for tid in meta}
+        for tid, m in list(meta.items()):
+            dim = ranked_shapes[tid]
+            if len(dim) < 2:
+                continue  # rank-one/scalar auxiliary ABI is already supported
+            prefix = dim[:-2]
+            width = max(len(prefix), len(batch_shape))
+            padded = (1,) * (width - len(prefix)) + prefix
+            expected_batch = (1,) * (width - len(batch_shape)) + batch_shape
+            if padded != expected_batch and any(d != 1 for d in padded):
+                raise ValueError(
+                    f"matrix input {m.name!r}: partial/crossed batch broadcasting cannot be represented by one batch stride; got {prefix}, output {batch_shape}"
+                )
+            stride = m.stride or tuple(prod(dim[i + 1 :]) for i in range(len(dim)))
+            layout_dim, layout_stride = fold_batch_layout(dim, stride, writable=_is_output(meta, tid))
+            meta[tid] = replace(
+                m,
+                dim=layout_dim,
+                stride=layout_stride,
+                matrix_batch=prefix,
+                mn_transposed=False if m.is_input and m.mn_transposed is None and dim != layout_dim else m.mn_transposed,
+            )
+    return ops
 
 
 def _walk_mainloop_chain(
@@ -2152,9 +2121,9 @@ def _analyze_state(state: dict) -> tuple[FusionChain, GemmBinding | None]:
     if not state["ops"]:
         raise ValueError("graph has no ops; nothing to compile")
     meta = dict(state["tensor_meta"])
-    ops = _normalize_operand_transposes(state["ops"], meta, state["io_dtype"], state["intermediate_dtype"])
+    ops = _normalize_operand_views(state["ops"], meta, state["io_dtype"], state["intermediate_dtype"])
     return _build_chain(
-        _normalize_matrix_ranks(ops, meta),
+        ops,
         meta,
         state["io_dtype"],
         state["intermediate_dtype"],

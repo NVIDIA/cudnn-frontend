@@ -7,12 +7,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+from math import prod
 
-from cudnn.frost.buffers import dtype_name, init_word, is_contiguous, strided_fill_plan
+from cudnn.frost.buffers import DeviceView, dtype_name, init_word, is_contiguous, strided_fill_plan
 
-from .dtypes import DTYPE_BYTES, _aux_align_reqs, _output_align_reqs, _pow2_floor, tensor_alignment
+from .dtypes import DTYPE_BYTES, _aux_align_reqs, _output_align_reqs, _pow2_floor, tensor_alignment, fold_batch_layout
 from .fusion_ir import FusionChain
-from .matrix_views import matrix_layout
 
 # An operand's three axes, named by role rather than by position.
 AX_BATCH, AX_MN, AX_K = 0, 1, 2
@@ -161,6 +161,14 @@ class ScaleFactor:
     operand_at: int  # the A or B operand this one scales, as an index into inputs
 
 
+def _batch_shape(shape, prefix):
+    """Pin each prepared batch axis while allowing dynamic matrix extents."""
+    shape = tuple(map(int, shape))
+    if len(shape) != len(prefix) + 2 or shape[:-2] != prefix:
+        raise ValueError(f"matrix batch view expected original batch axes {prefix}, got shape={shape}")
+    return (prod(prefix), *shape[-2:])
+
+
 @dataclass(frozen=True)
 class GemmRecipe:
     inputs: tuple  # every A operand then every B operand, in kernel slot order
@@ -189,6 +197,37 @@ class GemmRecipe:
     @property
     def b(self) -> Operand:
         return self.inputs[self.b_at]
+
+    def operand_shape(self, index, shape):
+        """Project a caller shape using this recipe's prepared batch axes."""
+        for slot, prefix in self.matrix_views:
+            if slot == index:
+                return _batch_shape(shape, prefix)
+        return shape
+
+    def operand_views(self, operands, *, check_outputs=True):
+        """Apply prepared metadata views, without allocating or copying device storage.
+
+        Workspace sizing can omit write-layout validation; launch and diagnostic
+        paths validate every output before any kernel or seed write.
+        """
+        if not self.matrix_views:
+            return operands
+        views = list(operands)
+        outputs = {o.index for o in self.outputs} if check_outputs else ()
+        for index, prefix in self.matrix_views:
+            value = views[index]
+            shape = _batch_shape(value.shape, prefix)
+            fold_batch_layout(value.shape, value.stride(), writable=index in outputs)
+            if tuple(value.shape) == shape:
+                continue  # identity view preserves singleton pitches too
+            if hasattr(value, "flatten_batch"):
+                views[index] = value.flatten_batch()  # native strided metadata
+            elif isinstance(value, DeviceView):
+                views[index] = value.reshape(shape)  # contiguous by contract
+            else:
+                views[index] = value.view(shape)  # Torch view cannot copy
+        return views
 
     def problem(self, operands, graph_order=None) -> tuple:
         """``((M, N, K), axes-per-input)``, located rather than assumed."""
@@ -434,7 +473,7 @@ def _operand(
         declared = (declared[0], declared[2], declared[1])
     layout = _declared_layout(tensor)
     if matrix_batch is not None:
-        layout = matrix_layout(*layout)
+        layout = fold_batch_layout(*layout)
     contiguous = AX_K if major == "k" else AX_MN
     modulus, pack = contiguous_modulus(dtype, contiguous == AX_K)
     return Operand(

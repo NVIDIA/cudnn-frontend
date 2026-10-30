@@ -25,7 +25,6 @@ from cudnn.frost.workspace import Workspace
 from .arch_family import active_family
 from .dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS, _pow2_floor, tensor_alignment
 from .fusion_ir import Axis, FusionChain, MoeSwapAbSpec, TensorRef, segmented_row_scale_capacity_rows
-from .matrix_views import canonical_operands, matrix_shape
 from .recipe import AX_MN, FROM_M, FROM_N, REDUCTION_INIT_VALUE, _output_rule, contiguous_modulus, expected_shape
 
 
@@ -991,7 +990,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         r = self.recipe
         if r is None:
             return self.workspace_bytes
-        operands = canonical_operands(r.matrix_views, operands)
+        operands = r.operand_views(operands, check_outputs=False)
         mn = []
         for op in (r.a, r.b):
             v = operands[op.index]
@@ -1007,9 +1006,9 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         r = self.recipe
         if r is None:
             return self.workspace_bytes
-        matrix_rules = {self.bound[index].get_uid(): prefix for index, prefix in r.matrix_views}
+        matrix_rules = {self.bound[index].get_uid(): index for index, _prefix in r.matrix_views}
         dims = {
-            uid: matrix_shape(shape, matrix_rules[uid]) if uid in matrix_rules else shape
+            uid: r.operand_shape(matrix_rules[uid], shape) if uid in matrix_rules else shape
             for uid, shape in zip(override_uids or (), override_shapes or ())
             if uid in matrix_rules or len(shape) == 3
         }
@@ -1121,13 +1120,12 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         quant_reason = backend._runtime_quant_reason if quant_mn is not None else None
         quant_chain, quant_cfg = (self.chain, self.config)
         gave_up = self.deferrals
-        matrix_output_indices = frozenset(o.index for o in r.outputs)
 
         def lowered(operands, graph_order=None, stream=None, workspace=None):
             """Validate resolved buffers and launch the already compiled GEMM plan."""
             backend._check_plan_device(device)
             original_operands = operands
-            operands = canonical_operands(r.matrix_views, operands, output_indices=matrix_output_indices)
+            operands = r.operand_views(operands)
             vs = [operands[i] for i in in_slots]
             for j, perm, dsh, dst, force_graph_order in renorm:
                 v = vs[j]
@@ -1260,7 +1258,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         backend = self._compiler
         recipe = self.recipe
         backend._check_plan_device(recipe.device)
-        operands = canonical_operands(getattr(recipe, "matrix_views", ()), operands, output_indices=tuple(o.index for o in getattr(recipe, "outputs", ())))
+        operands = recipe.operand_views(operands)
         mnk, axes = recipe.problem(operands, graph_order)
         backend.check_shapes(recipe, operands, mnk, axes)
         backend.check_alignment(recipe, operands, axes)
