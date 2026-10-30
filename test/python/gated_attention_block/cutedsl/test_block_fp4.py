@@ -984,6 +984,8 @@ _COMMON = dict(
     ix_logits=-1,
     ix_counts=-1,
     ix_cslot=-1,
+    ix_qpos=-1,  # the indexer's EXTEND step's two (appended 2026-10-29: the select pieces' first positions, the per-sequence report)
+    ix_seqrep=-1,
 )
 _SNAPSHOT = {
     ("test", "bf16_inplace"): dict(
