@@ -23,7 +23,7 @@ def matrix_layout(shape, stride, *, writable=False):
     prefix = shape[:-2]
     batch = prod(prefix)
     active = [i for i, dim in enumerate(prefix) if dim != 1]
-    pitch = stride[active[-1]] if active else max(shape[-2] * stride[-2], shape[-1] * stride[-1])
+    pitch = stride[active[-1]] if active else stride[len(prefix) - 1] if prefix else max(shape[-2] * stride[-2], shape[-1] * stride[-1])
     if active and (pitch <= 0 or any(stride[i] != pitch * prod(prefix[i + 1 :]) for i in active)):
         raise ValueError(f"matrix batch axes are not affine and cannot be folded without copying: shape={shape}, stride={stride}")
     span = 1 + sum((d - 1) * s for d, s in zip(shape, stride))
@@ -50,6 +50,8 @@ def matrix_view(tensor, prefix, *, writable=False):
     """Fold only checked batch axes; never use a copying reshape on caller data."""
     shape = matrix_shape(tensor.shape, prefix)
     matrix_layout(tensor.shape, tensor.stride(), writable=writable)
+    if tuple(tensor.shape) == shape:
+        return tensor
     if hasattr(tensor, "flatten_batch"):
         return tensor.flatten_batch()  # native OperandBuffer: exact strided metadata
     if isinstance(tensor, buffers.DeviceView):

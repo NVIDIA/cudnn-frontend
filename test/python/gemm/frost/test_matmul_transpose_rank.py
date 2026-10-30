@@ -3,7 +3,6 @@
 
 """Rank-2/rank-N matrix views: affine batch folding without storage conversion."""
 
-import ast
 import warnings
 from dataclasses import replace
 from math import prod
@@ -16,9 +15,9 @@ from cudnn.engines import ExecutionContext
 from cudnn.gemm.frost.engine import _FrostGemmPlan
 from cudnn.gemm.frost.graph_analyzer import analyze, analyze_with_binding
 from cudnn.gemm.frost.matrix_views import matrix_layout
-from cudnn.gemm.frost.sm100 import compiler, epilogue_codegen
+from cudnn.gemm.frost.sm100 import compiler
 from gemm_test_utils import requires_sm100
-from test_matmul_transpose_mainloop import BF16, F32, _config, _evaluate_frame, _mock_plan
+from test_matmul_transpose_mainloop import BF16, F32, _config, _mock_plan
 
 pytestmark = pytest.mark.L0
 
@@ -93,37 +92,6 @@ def _reference(buffers, transposed, scaled, epilogue=False):
     if epilogue:
         value = (value.float() + buffers["bias"].float()).bfloat16()
     return value
-
-
-@pytest.mark.parametrize("prefix", [(), (2, 3), (2, 1, 3)])
-@pytest.mark.parametrize("transposed", [False, True])
-@pytest.mark.parametrize("swapped", [False, True])
-@pytest.mark.parametrize("scaled", [False, True])
-def test_frost_transpose_rank_binding_and_rounding(monkeypatch, prefix, transposed, swapped, scaled):
-    g, tensors = _graph(prefix, transposed=transposed, scaled=scaled)
-    g.validate()
-    original = [(tuple(t.get_dim()), tuple(t.get_stride())) for t in tensors.values()]
-    chain, binding = analyze_with_binding(g)
-    assert (chain.matmul.M, chain.matmul.N, chain.matmul.K, chain.matmul.batch) == (128, 192, 136, prod(prefix))
-    assert binding.a_operands == [tensors["a"]] and binding.b_operands == [tensors["b"]]
-    assert chain.outputs[0].dim == (prod(prefix), 128, 192)
-    assert original == [(tuple(t.get_dim()), tuple(t.get_stride())) for t in tensors.values()]
-    plan, launches = _mock_plan(monkeypatch, g, swapped)
-    for m, n, k in ((128, 192, 136), (160, 224, 264)):
-        buffers = _buffers(tensors, m, n, k)
-        plan(_pack(tensors, buffers))
-        frame = launches[-1]
-        assert frame[0][:4] == ((n, m, k, prod(prefix)) if swapped else (m, n, k, prod(prefix)))
-        for i, (side, extent) in enumerate((("b", n), ("a", m)) if swapped else (("a", m), ("b", n)), 1):
-            assert tuple(frame[i].shape) == (extent, k, prod(prefix))
-            assert frame[i].data_ptr() == buffers[side].data_ptr()
-        assert frame[3].data_ptr() == buffers["y"].data_ptr()
-        got = _evaluate_frame(frame, plan.chain)
-        got = got.transpose(1, 2) if swapped else got
-        expected = _reference(buffers, transposed, scaled).reshape(prod(prefix), m, n)
-        torch.testing.assert_close(got.bfloat16(), expected, atol=0, rtol=0)
-    snippets = epilogue_codegen.generate(plan.chain, vec_bytes_epi=16, output_elem_bytes=2, tma_slots=compiler._tma_slots_for(plan.chain, plan.config))
-    ast.parse(compiler._render_template(plan.chain, snippets, plan.config))
 
 
 @pytest.mark.parametrize("prefix", [(), (2, 3)])
@@ -290,6 +258,7 @@ def test_frost_matrix_batch_int64_boundaries():
     [
         ((2, 2, 1, 1), (1 << 33, 1 << 32, 1, 1)),
         ((2, 1, 3, 4, 8), (120, 999, 40, 1, 4)),
+        ((1, 1, 4, 8), (500, 97, 8, 1)),
         ((2, 3, 4, 8), (160, 40, 1, 4)),
         ((1 << 32, 1 << 32, 1, 1), (1 << 32, 1, 1, 1)),
     ],

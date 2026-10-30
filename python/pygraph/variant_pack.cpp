@@ -498,7 +498,9 @@ class OperandBuffer {
                 pitch  = strides[i];
                 active = true;
             }
-        if (!active) pitch = std::max(multiply(shape[row], strides[row]), multiply(shape[column], strides[column]));
+        if (!active)
+            pitch = row > 0 ? strides[row - 1]
+                            : std::max(multiply(shape[row], strides[row]), multiply(shape[column], strides[column]));
         int64_t batch = 1;
         for (size_t i = row; i-- > 0;) {
             if (shape[i] != 1 && (pitch == 0 || strides[i] != multiply(pitch, batch)))

@@ -9,6 +9,7 @@ import textwrap
 import warnings
 from dataclasses import replace
 from pathlib import Path
+from math import prod
 
 import cudnn
 import pytest
@@ -29,29 +30,33 @@ def _config(swapped=False):
     return replace(by_name("CONFIG_sm100_128x128x64_128x128x32_cluster1x1_1ctamma"), swap_ab=swapped)
 
 
-def _graph(M=128, N=192, K=136, *, side="ab", position="after", scaled=False, batch=1, dtype=BF16):
+def _graph(M=128, N=192, K=136, *, side="ab", position="after", scaled=False, batch=1, dtype=BF16, prefix=None):
     g = cudnn.pygraph(io_data_type=dtype, intermediate_data_type=F32, compute_data_type=F32)
+    prefix = (batch,) if prefix is None else tuple(prefix)
+    permutation = [*range(len(prefix)), len(prefix) + 1, len(prefix)]
     tensors, operands = {}, {}
     for s, extent in (("a", M), ("b", N)):
-        odd = s in side and position != "double"
-        dim = [batch, K, extent] if (s == "a") == odd else [batch, extent, K]
-        stride = [K * extent, 1, K] if (s == "a") == odd else [K * extent, K, 1]
+        odd = s in side and position not in ("double", "consecutive")
+        dim = [*prefix, K, extent] if (s == "a") == odd else [*prefix, extent, K]
+        stride = [K * extent * prod(prefix[i + 1 :]) for i in range(len(prefix))] + ([1, K] if (s == "a") == odd else [K, 1])
         value = tensors[s] = g.tensor(name=s.upper(), dim=dim, stride=stride)
         if s not in side:
             operands[s] = value
             continue
-        if position in ("before", "double"):
-            value = g.transpose(input=value, permutation=[0, 2, 1])
+        if position in ("before", "double", "consecutive"):
+            value = g.transpose(input=value, permutation=permutation)
+        if position == "consecutive":
+            value = g.transpose(input=value, permutation=permutation)
         if position == "surrounded":
             value = g.cos(input=value).set_data_type(dtype)
         if scaled:
-            dim = [1, 1, K] if (s == "a") == (position == "before") else [1, K, 1]
-            stride = [K, K, 1] if dim[2] == K else [K, 1, K]
+            dim = [*(1,) * len(prefix), 1, K] if (s == "a") == (position in ("before", "consecutive")) else [*(1,) * len(prefix), K, 1]
+            stride = [K] * len(prefix) + ([K, 1] if dim[-1] == K else [1, K])
             scale = tensors[f"scale_{s}"] = g.tensor(name=f"scale_{s}", dim=dim, stride=stride, data_type=F32)
             value = g.mul(a=scale, b=value).set_data_type(dtype)
         value = g.leaky_relu(input=value, negative_slope=0.125).set_data_type(dtype)
-        if position != "before":
-            value = g.transpose(input=value, permutation=[0, 2, 1])
+        if position not in ("before", "consecutive"):
+            value = g.transpose(input=value, permutation=permutation)
         if position == "surrounded":
             value = g.relu(input=value).set_data_type(dtype)
         operands[s] = value
@@ -60,14 +65,16 @@ def _graph(M=128, N=192, K=136, *, side="ab", position="after", scaled=False, ba
 
 
 def _buffers(tensors, m=128, n=192, k=136, *, batch=1, device="cpu", dtype=torch.bfloat16):
-    result = {"y": torch.zeros(batch, m, n, dtype=dtype, device=device)}
+    prefix = tuple(tensors["a"].get_dim()[:-2])
+    result = {"y": torch.zeros(*prefix, m, n, dtype=dtype, device=device)}
     for s, extent in (("a", m), ("b", n)):
-        value = torch.randn(batch, extent, k, dtype=dtype, device=device)
-        result[s] = value.transpose(1, 2) if tensors[s].get_stride()[1] == 1 else value
+        value = torch.randn(*prefix, extent, k, dtype=dtype, device=device)
+        result[s] = value.transpose(-1, -2) if tensors[s].get_stride()[-2] == 1 else value
         key = f"scale_{s}"
         if key in tensors:
             scale = torch.linspace(-1.25, 1.25, k, dtype=torch.float32, device=device)
-            result[key] = scale.reshape(1, k, 1) if tensors[key].get_dim()[1] != 1 else scale.reshape(1, 1, k)
+            dim = (*(1,) * len(prefix), k, 1) if tensors[key].get_dim()[-2] != 1 else (*(1,) * len(prefix), 1, k)
+            result[key] = scale.reshape(dim)
     return result
 
 
@@ -121,9 +128,11 @@ def _evaluate_frame(frame, chain):
 
 
 @pytest.mark.parametrize("side", ["a", "b", "ab"])
-@pytest.mark.parametrize("position", ["before", "after", "surrounded", "double"])
-def test_frost_transpose_analysis_and_render(side, position):
-    g, tensors = _graph(side=side, position=position)
+@pytest.mark.parametrize("position", ["before", "after", "surrounded", "double", "consecutive"])
+@pytest.mark.parametrize("prefix", [(), (1,), (2, 3), (2, 1, 3)])
+@pytest.mark.parametrize("dtype", [BF16, cudnn.data_type.HALF])
+def test_frost_transpose_analysis_and_render(side, position, prefix, dtype):
+    g, tensors = _graph(side=side, position=position, prefix=prefix, dtype=dtype)
 
     def snapshot():
         return [
@@ -135,14 +144,14 @@ def test_frost_transpose_analysis_and_render(side, position):
     chain, binding = analyze_with_binding(g)
     assert (chain.matmul.M, chain.matmul.N, chain.matmul.K) == (128, 192, 136)
     assert binding.a_operands == [tensors["a"]] and binding.b_operands == [tensors["b"]]
-    assert binding.a_transposed == ("a" in side and position != "double",)
-    assert binding.b_transposed == ("b" in side and position != "double",)
+    assert binding.a_transposed == ("a" in side and position not in ("double", "consecutive"),)
+    assert binding.b_transposed == ("b" in side and position not in ("double", "consecutive"),)
     assert chain.ops == []
     for s in "ab":
         ops = getattr(chain, f"mainloop_{s}_ops")
         expected = (["cos", "leaky_relu", "relu"] if position == "surrounded" else ["leaky_relu"]) if s in side else []
         assert [op.op for op in ops] == expected
-        assert all(op.out_dtype == "bf16" and op.compute_dtype == "fp32" for op in ops)
+        assert all(op.out_dtype == ("bf16" if dtype == BF16 else "fp16") and op.compute_dtype == "fp32" for op in ops)
         assert all(op.attrs == (("negative_slope", 0.125),) for op in ops if op.op == "leaky_relu")
     assert before == snapshot()
     assert analyze(g) == chain
@@ -153,34 +162,55 @@ def test_frost_transpose_analysis_and_render(side, position):
         src = compiler._render_template(normalized, snippets, cfg)
         ast.parse(src)
         assert "@@INJECT_" not in src
-        assert ".to(cutlass.BFloat16)" in snippets.mainloop_transform_a + snippets.mainloop_transform_b
+        assert (".to(cutlass.BFloat16)" if dtype == BF16 else ".to(cutlass.Float16)") in snippets.mainloop_transform_a + snippets.mainloop_transform_b
         assert "mainloop_koob_fix = True" in src
 
 
 @pytest.mark.parametrize("side", ["a", "b", "ab"])
-@pytest.mark.parametrize("position", ["before", "after", "surrounded", "double"])
+@pytest.mark.parametrize("position", ["before", "after", "surrounded", "double", "consecutive"])
 @pytest.mark.parametrize("swapped", [False, True])
-def test_frost_transpose_original_axis_rebinding(monkeypatch, side, position, swapped):
-    g, tensors = _graph(side=side, position=position)
+@pytest.mark.parametrize("prefix", [(), (1,), (2, 3), (2, 1, 3)])
+@pytest.mark.parametrize("dtype,scaled", [(BF16, False), (BF16, True), (cudnn.data_type.HALF, True)])
+def test_frost_transpose_original_axis_rebinding(monkeypatch, side, position, swapped, prefix, dtype, scaled):
+    g, tensors = _graph(side=side, position=position, prefix=prefix, dtype=dtype, scaled=scaled)
+    tdtype = torch.bfloat16 if dtype == BF16 else torch.float16
     plan, launches = _mock_plan(monkeypatch, g, swapped)
     for m, n, k in ((128, 192, 136), (160, 224, 264)):
-        buffers = _buffers(tensors, m, n, k)
+        buffers = _buffers(tensors, m, n, k, dtype=tdtype)
         plan(_pack(tensors, buffers))
         frame = launches[-1]
         assert frame[0][:3] == ((n, m, k) if swapped else (m, n, k))
         ordered = (("b", n), ("a", m)) if swapped else (("a", m), ("b", n))
         for i, (s, extent) in enumerate(ordered, 1):
-            assert frame[i].shape == (extent, k, 1)
-            assert frame[i].stride() == (k, 1, extent * k)
+            assert frame[i].shape == (extent, k, prod(prefix))
+            assert frame[i].stride()[:2] == (k, 1)
+            if prod(prefix) > 1:
+                assert frame[i].stride()[2] == extent * k
             assert frame[i].data_ptr() == buffers[s].data_ptr()
         assert frame[3].data_ptr() == buffers["y"].data_ptr()
         got = _evaluate_frame(frame, plan.chain)
         got = got.transpose(1, 2) if swapped else got
-        torch.testing.assert_close(got.bfloat16(), _reference(buffers, side, position, False, torch.bfloat16), atol=0, rtol=0)
+        expected = _reference(buffers, side, position, scaled, tdtype).view(prod(prefix), m, n)
+        torch.testing.assert_close(got.to(tdtype), expected, atol=0, rtol=0)
     assert len(launches) == 2
 
 
-@pytest.mark.parametrize("position", ["before", "after", "surrounded", "double"])
+@pytest.mark.parametrize("prefix", [(), (1,), (2, 3), (2, 1, 3)])
+@pytest.mark.parametrize("swapped", [False, True])
+def test_frost_matrix_view_without_transpose(monkeypatch, prefix, swapped):
+    g, tensors = _graph(side="", prefix=prefix)
+    plan, launches = _mock_plan(monkeypatch, g, swapped)
+    buffers = _buffers(tensors)
+    plan(_pack(tensors, buffers))
+    frame = launches[-1]
+    assert frame[0][:4] == ((192, 128, 136, prod(prefix)) if swapped else (128, 192, 136, prod(prefix)))
+    got = _evaluate_frame(frame, plan.chain)
+    got = got.transpose(1, 2) if swapped else got
+    expected = _reference(buffers, "", "after", False, torch.bfloat16).view(prod(prefix), 128, 192)
+    torch.testing.assert_close(got.bfloat16(), expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("position", ["before", "after", "surrounded", "double", "consecutive"])
 @pytest.mark.parametrize("swapped", [False, True])
 def test_frost_transpose_per_k_binding(monkeypatch, position, swapped):
     g, tensors = _graph(position=position, scaled=True)
@@ -265,14 +295,14 @@ def _reference(buffers, side, position, scaled, dtype):
         value = buffers[s]
         if s in side:
             if position in ("before", "double"):
-                value = value.transpose(1, 2)
+                value = value.transpose(-1, -2)
             if position == "surrounded":
                 value = torch.cos(value.float()).to(dtype)
             if scaled:
                 value = (buffers[f"scale_{s}"].float() * value.float()).to(dtype)
             value = torch.where(value.float() >= 0, value.float(), value.float() * 0.125).to(dtype)
-            if position != "before":
-                value = value.transpose(1, 2)
+            if position not in ("before", "consecutive"):
+                value = value.transpose(-1, -2)
             if position == "surrounded":
                 value = torch.relu(value)
         values[s] = value
@@ -281,23 +311,26 @@ def _reference(buffers, side, position, scaled, dtype):
 
 @requires_sm100
 @pytest.mark.parametrize(
-    "side,position,scaled,swapped,dtype,batch",
+    "side,position,scaled,swapped,dtype,prefix",
     [
-        ("a", "after", False, False, BF16, 1),
-        ("b", "before", False, True, BF16, 1),
-        ("ab", "surrounded", True, False, BF16, 2),
-        ("ab", "after", True, True, cudnn.data_type.HALF, 1),
-        ("ab", "double", False, True, BF16, 1),
+        ("a", "after", False, False, BF16, (1,)),
+        ("b", "before", False, True, BF16, (1,)),
+        ("ab", "surrounded", True, False, BF16, (2,)),
+        ("ab", "after", True, True, cudnn.data_type.HALF, (1,)),
+        ("ab", "double", False, True, BF16, (1,)),
+        ("ab", "consecutive", True, False, cudnn.data_type.HALF, ()),
+        ("ab", "double", True, True, cudnn.data_type.HALF, (2, 3)),
+        ("ab", "surrounded", True, False, BF16, (2, 1, 3)),
     ],
 )
-def test_frost_transpose_gpu(side, position, scaled, swapped, dtype, batch):
-    g, tensors = _graph(side=side, position=position, scaled=scaled, dtype=dtype, batch=batch)
+def test_frost_transpose_gpu(side, position, scaled, swapped, dtype, prefix):
+    g, tensors = _graph(side=side, position=position, scaled=scaled, dtype=dtype, prefix=prefix)
     plan = compiler.jit_from_cudnn_graph(g, _config(swapped))
     tdtype = torch.bfloat16 if dtype == BF16 else torch.float16
     torch.manual_seed(42)
     stream = torch.cuda.Stream()
     for m, n, k in ((128, 192, 136), (160, 224, 264)):
-        buffers = _buffers(tensors, m, n, k, batch=batch, device="cuda", dtype=tdtype)
+        buffers = _buffers(tensors, m, n, k, device="cuda", dtype=tdtype)
         pack = _pack(tensors, buffers)
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
@@ -326,11 +359,11 @@ def test_frost_transpose_gpu(side, position, scaled, swapped, dtype, batch):
                 buffers["a"].zero_()
                 buffers["b"].zero_()
             else:
-                av = buffers["a"].transpose(1, 2) if tensors["a"].get_stride()[1] == 1 else buffers["a"]
-                bv = buffers["b"].transpose(1, 2) if tensors["b"].get_stride()[1] == 1 else buffers["b"]
-                av.copy_((torch.arange(k, device="cuda") % 17 - 8).to(tdtype).reshape(1, 1, k).expand_as(av))
+                av = buffers["a"].transpose(-1, -2) if tensors["a"].get_stride()[-2] == 1 else buffers["a"]
+                bv = buffers["b"].transpose(-1, -2) if tensors["b"].get_stride()[-2] == 1 else buffers["b"]
+                av.copy_((torch.arange(k, device="cuda") % 17 - 8).to(tdtype).reshape(*(1,) * len(prefix), 1, k).expand_as(av))
                 bv.zero_()
-                bv[:, torch.arange(n, device="cuda"), torch.arange(n, device="cuda") * 5 % k] = 1
+                bv.view(prod(prefix), n, k)[:, torch.arange(n, device="cuda"), torch.arange(n, device="cuda") * 5 % k] = 1
             if scaled:
                 for s in side:
                     buffers[f"scale_{s}"].copy_((torch.arange(k, device="cuda") % 5 - 2).reshape(buffers[f"scale_{s}"].shape))
@@ -552,13 +585,18 @@ def test_frost_pure_transpose_layout_binding(monkeypatch, m_major, swapped):
 
 
 @pytest.mark.parametrize("swapped", [False, True])
-def test_frost_transpose_keeps_untransposed_epilogue_branch(monkeypatch, swapped):
+@pytest.mark.parametrize("prefix", [(), (1,), (2, 3), (2, 1, 3)])
+@pytest.mark.parametrize("dtype", [BF16, cudnn.data_type.HALF])
+def test_frost_transpose_keeps_untransposed_epilogue_branch(monkeypatch, swapped, prefix, dtype):
     """A shared pre-transpose pointwise node remains in its original coordinates."""
-    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
-    a = g.tensor(name="A", dim=[1, 128, 128], stride=[16384, 1, 128])
-    b = g.tensor(name="B", dim=[1, 128, 128], stride=[16384, 1, 128])
-    pointwise = g.leaky_relu(input=a, negative_slope=0.125).set_data_type(BF16)
-    transposed = g.transpose(input=pointwise, permutation=[0, 2, 1])
+    g = cudnn.pygraph(io_data_type=dtype, intermediate_data_type=F32, compute_data_type=F32)
+    dim = [*prefix, 128, 128]
+    stride = [16384 * prod(prefix[i + 1 :]) for i in range(len(prefix))] + [1, 128]
+    permutation = [*range(len(prefix)), len(prefix) + 1, len(prefix)]
+    a = g.tensor(name="A", dim=dim, stride=stride)
+    b = g.tensor(name="B", dim=dim, stride=stride)
+    pointwise = g.leaky_relu(input=a, negative_slope=0.125).set_data_type(dtype)
+    transposed = g.transpose(input=pointwise, permutation=permutation)
     c = g.matmul(A=transposed, B=b)
     y = g.add(a=c, b=pointwise).set_output(True)
     chain, binding = analyze_with_binding(g)
@@ -567,12 +605,23 @@ def test_frost_transpose_keeps_untransposed_epilogue_branch(monkeypatch, swapped
     assert binding.aux == [a] and binding.aux_transposed == (False,)
     assert binding.bound_tensors() == [a, b, y]
     plan, launches = _mock_plan(monkeypatch, g, swapped)
-    av = torch.randn(1, 128, 128, dtype=torch.bfloat16).transpose(1, 2)
-    bv = torch.randn(1, 128, 128, dtype=torch.bfloat16).transpose(1, 2)
+    tdtype = torch.bfloat16 if dtype == BF16 else torch.float16
+    av = torch.randn(*prefix, 128, 128, dtype=tdtype).transpose(-1, -2)
+    bv = torch.randn(*prefix, 128, 128, dtype=tdtype).transpose(-1, -2)
     plan({a: av, b: bv, y: torch.empty_like(av)})
     aux = launches[-1][4]
     assert aux.data_ptr() == av.data_ptr()
-    assert tuple(aux.stride()) == tuple(av.transpose(1, 2).stride() if swapped else av.stride())
+    matrix_shape = (prod(prefix), 128, 128)
+    expected_aux = av if tuple(av.shape) == matrix_shape else av.view(matrix_shape)
+    if swapped:
+        expected_aux = expected_aux.transpose(1, 2)
+    assert tuple(aux.stride()) == tuple(expected_aux.stride())
+    torch.testing.assert_close(aux, expected_aux, atol=0, rtol=0)
+    got = _evaluate_frame(launches[-1], plan.chain)
+    got = got.transpose(1, 2) if swapped else got
+    activated = torch.nn.functional.leaky_relu(av.float(), 0.125).to(tdtype)
+    expected = activated.float().transpose(-1, -2) @ bv.float()
+    torch.testing.assert_close(got, expected.view(prod(prefix), 128, 128), atol=0, rtol=0)
 
 
 def test_frost_transpose_shared_epilogue_view_rejected():
@@ -580,5 +629,5 @@ def test_frost_transpose_shared_epilogue_view_rejected():
     transpose = next(n for n in g._nodes if n.node_type.name == "TRANSPOSE").outputs["OUT_0"]
     tensors["y"].set_output(False)
     g.add(a=tensors["y"], b=transpose).set_output(True)
-    with pytest.raises(ValueError, match="not a graph input|do not broadcast"):
+    with pytest.raises(ValueError, match="not a graph input|broadcast"):
         analyze(g)
