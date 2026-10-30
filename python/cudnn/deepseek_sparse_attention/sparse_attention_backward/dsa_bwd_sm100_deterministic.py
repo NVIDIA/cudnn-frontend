@@ -43,7 +43,15 @@ def _wait_lower_rank_mask(mask_ptr, lower_rank_mask: Uint32):
     with loop as [value]:
         value = cute.arch.load(mask_ptr, Uint32, sem="relaxed", scope="gpu")
         cutlass.yield_out([value])
-    cute.arch.load(mask_ptr, Uint32, sem="acquire", scope="gpu")
+    # Keep the acquire observation control-dependent: an unused final load is
+    # dead-code eliminated before PTX lowering and would lose the release/
+    # acquire visibility edge. The relaxed loop remains the common polling
+    # path; this second loop normally executes only its initial acquire load.
+    acquired = cute.arch.load(mask_ptr, Uint32, sem="acquire", scope="gpu")
+    acquire_loop = cutlass.while_generate([acquired], lambda value: (value & lower_rank_mask) != Uint32(0))
+    with acquire_loop as [value]:
+        value = cute.arch.load(mask_ptr, Uint32, sem="acquire", scope="gpu")
+        cutlass.yield_out([value])
 
 
 def deterministic_dkv_shards(total_seqlen_q: int) -> int:

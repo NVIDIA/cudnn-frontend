@@ -6,8 +6,10 @@
 Gradients are generated via autograd on the gather-based forward reference.
 """
 
+import ast
 import inspect
 import math
+import textwrap
 
 import pytest
 import torch
@@ -788,6 +790,7 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
     assert FlashAttentionDSABackwardSm100Deterministic64.num_dkv_final_terms == 8
     with pytest.raises(ValueError, match="at least one query row"):
         deterministic_dkv_shards(0)
+
     with pytest.raises(ValueError, match="at least one query row"):
         deterministic_dkv_relay_cluster_size(0, 256, 576)
     with pytest.raises(ValueError, match="positive KV, head-dimension, and head-count extents"):
@@ -806,6 +809,32 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
         deterministic_kernel_class(128, head_dim=576)
     assert FlashAttentionDSABackwardSm100.q_wave_ctas == 0
     assert not FlashAttentionDSABackwardSm100.serialize_head_blocks
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_relay_acquire_load_controls_exit():
+    """Keep the GPU acquire load live by feeding its value to loop control."""
+    deterministic = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_deterministic")
+    tree = ast.parse(textwrap.dedent(inspect.getsource(deterministic._wait_lower_rank_mask)))
+
+    acquire_values = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+            continue
+        if not isinstance(node.value.func, ast.Attribute) or node.value.func.attr != "load":
+            continue
+        if not any(keyword.arg == "sem" and isinstance(keyword.value, ast.Constant) and keyword.value.value == "acquire" for keyword in node.value.keywords):
+            continue
+        acquire_values.update(target.id for target in node.targets if isinstance(target, ast.Name))
+
+    controlled_values = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute) or node.func.attr != "while_generate" or not node.args:
+            continue
+        if isinstance(node.args[0], ast.List):
+            controlled_values.update(value.id for value in node.args[0].elts if isinstance(value, ast.Name))
+
+    assert acquire_values & controlled_values, "an unused acquire load is eliminated from generated PTX"
 
 
 @pytest.mark.L0
