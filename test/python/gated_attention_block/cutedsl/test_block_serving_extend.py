@@ -3161,7 +3161,9 @@ def test_fp8_proj_bf16_attention_extend_e4m3_o_is_the_cast_of_the_gated_o_and_tr
     o_ref = torch.cat([ref.o[0, p : p + q] for (lo, hi), ref, q, p in zip(rec["rows"], rec["refs"], rec["q_lens"], rec["prefix_lens"]) if q])
     g_ref = torch.cat([ref.gate[0, p : p + q] for (lo, hi), ref, q, p in zip(rec["rows"], rec["refs"], rec["q_lens"], rec["prefix_lens"]) if q])
     model = quant_e4m3((o_ref.float() * torch.sigmoid(g_ref.float())).to(torch.bfloat16), scale_o).float()
-    a = o8[live].float()
+    # the ulp distance on the HOST in fp32 (a handful of elements): torch.exp2 on a CUDA tensor is a jitted (NVRTC) kernel, and NVRTC does
+    # not know every part the block serves
+    a, model = o8[live].float().cpu(), model.cpu()
     mag = torch.maximum(a.abs(), model.abs())
     dist = (a - model).abs() / torch.exp2(torch.floor(torch.log2(mag.clamp_min(2.0**-6))) - 3.0)
     band = mag >= 4.0

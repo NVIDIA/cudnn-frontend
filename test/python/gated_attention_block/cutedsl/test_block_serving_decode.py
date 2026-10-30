@@ -3275,7 +3275,9 @@ def test_fp8_proj_bf16_attention_decode_the_27b_geometry_on_packed_kv_rows(page,
 
 def _e4m3_ulp_distance(a, b):
     """|a - b| in e4m3 ulps AT THE LARGER MAGNITUDE, in the e4m3 VALUE domain (fp32 tensors): the spacing ``2^(floor(log2 |x|) - 3)`` of a
-    normal value, the subnormal spacing ``2^-9`` below ``2^-6``."""
+    normal value, the subnormal spacing ``2^-9`` below ``2^-6``.  Computed on the HOST in fp32 (a handful of elements): ``torch.exp2`` on a
+    CUDA tensor is a jitted (NVRTC) kernel, and NVRTC does not know every part the block serves."""
+    a, b = a.detach().float().cpu(), b.detach().float().cpu()
     mag = torch.maximum(a.abs(), b.abs()).clamp_min(2.0**-6)
     return (a - b).abs() / torch.exp2(torch.floor(torch.log2(mag)) - 3.0)
 
@@ -3319,7 +3321,7 @@ def test_fp8_proj_bf16_attention_e4m3_o_is_the_cast_of_the_gated_o_and_tracks_th
     model = quant_e4m3((o_ref.float() * torch.sigmoid(g_ref.float())).to(torch.bfloat16), scale_o)
     a, m = o8[live].float(), model.float()
     dist = _e4m3_ulp_distance(a, m)
-    band = torch.maximum(a.abs(), m.abs()) >= 4.0
+    band = (torch.maximum(a.abs(), m.abs()) >= 4.0).cpu()
     full, in_band, below = _e4m3_histogram(dist), _e4m3_histogram(dist[band]), _e4m3_histogram(dist[~band])
     print(f"[mode 24/2 S_q 2 p16] e4m3 O vs the gate-quant model (scale_o {scale_o:.3f}): all {full}; band |x| >= 4: {in_band}; below the band: {below}")
     assert in_band["n"] > 0.5 * full["n"], "the band must hold most of the live elements for the claim to mean anything"
