@@ -1,0 +1,81 @@
+config_name,model_name,backend,data_type,attn_mask,batch_size,q_seqlen,kv_seqlen,num_q_heads,num_kv_heads,head_dim_qk,head_dim_vo,profile_pass,deterministic_bwd,time_ms,tflops,max_diff,num_iterations,sliding_window_size,layout,thd_min_fill,success,skipped,error_message,gpu_name,cudnn_version,cudnn_backend_version,peak_mma_tflops,backend_detail
+kimiK26,kimiK26,cudnn,bfloat16,top_left,2,32768,32768,64,64,192,128,fwd,False,383.933,115.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,eng8_k24=1_k27=0_k38=0_k40=2_k41=1
+kimiK26,kimiK26,cudnn,bfloat16,no_mask,2,32768,32768,64,64,192,128,fwd,False,767.850,115.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,eng8_k24=1_k27=0_k38=0_k40=2_k41=1
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,32768,32768,64,64,192,128,fwd,False,249.122,177.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,"sdpa_fwd_prefill_sm80[PACK_GQA=0, SCHED_POLICY=2, SPLIT_KV=1]"
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,32768,32768,64,64,192,128,bwd,False,1676.440,68.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,32768,32768,64,64,192,128,bwd,True,2647.982,43.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,32768,32768,64,64,192,128,fwd,False,477.811,184.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,"sdpa_fwd_prefill_sm80[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1]"
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,32768,32768,64,64,192,128,bwd,False,3381.766,68.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,32768,32768,64,64,192,128,bwd,True,5056.551,45.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_auto,bfloat16,top_left,2,32768,32768,64,64,192,128,fwd,False,382.713,115.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,eng8_k24=1_k27=0_k38=0_k40=2_k41=1
+kimiK26,kimiK26,cudnn_auto,bfloat16,top_left,2,32768,32768,64,64,192,128,bwd,False,1662.634,69.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_auto,bfloat16,top_left,2,32768,32768,64,64,192,128,bwd,True,2647.773,43.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_auto,bfloat16,no_mask,2,32768,32768,64,64,192,128,fwd,False,780.731,113.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,eng8_k24=1_k27=0_k38=0_k40=2_k41=1
+kimiK26,kimiK26,cudnn_auto,bfloat16,no_mask,2,32768,32768,64,64,192,128,bwd,False,3387.919,68.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_auto,bfloat16,no_mask,2,32768,32768,64,64,192,128,bwd,True,5036.767,45.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,flash_attention_4,bfloat16,top_left,2,32768,32768,64,64,192,128,fwd,False,277.239,159.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,
+kimiK26,kimiK26,flash_attention_4,bfloat16,no_mask,2,32768,32768,64,64,192,128,fwd,False,460.753,191.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,
+kimiK26,kimiK26,cudnn,bfloat16,top_left,2,16384,16384,64,64,192,128,fwd,False,94.062,117.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,eng8_k24=1_k27=0_k38=0_k40=2_k41=1
+kimiK26,kimiK26,cudnn,bfloat16,no_mask,2,16384,16384,64,64,192,128,fwd,False,186.765,118.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,eng8_k24=1_k27=0_k38=0_k40=2_k41=1
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,16384,16384,64,64,192,128,fwd,False,61.421,179.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,"sdpa_fwd_prefill_sm80[PACK_GQA=0, SCHED_POLICY=2, SPLIT_KV=1]"
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,16384,16384,64,64,192,128,bwd,False,409.332,70.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,16384,16384,64,64,192,128,bwd,True,609.387,47.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,16384,16384,64,64,192,128,fwd,False,116.137,189.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,"sdpa_fwd_prefill_sm80[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1]"
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,16384,16384,64,64,192,128,bwd,False,808.317,71.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,16384,16384,64,64,192,128,bwd,True,1230.885,46.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_auto,bfloat16,top_left,2,16384,16384,64,64,192,128,fwd,False,94.232,117.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,eng8_k24=1_k27=0_k38=0_k40=2_k41=1
+kimiK26,kimiK26,cudnn_auto,bfloat16,top_left,2,16384,16384,64,64,192,128,bwd,False,415.272,69.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_auto,bfloat16,top_left,2,16384,16384,64,64,192,128,bwd,True,610.383,47.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_auto,bfloat16,no_mask,2,16384,16384,64,64,192,128,fwd,False,190.041,116.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,eng8_k24=1_k27=0_k38=0_k40=2_k41=1
+kimiK26,kimiK26,cudnn_auto,bfloat16,no_mask,2,16384,16384,64,64,192,128,bwd,False,814.746,70.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_auto,bfloat16,no_mask,2,16384,16384,64,64,192,128,bwd,True,1238.086,46.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,flash_attention_4,bfloat16,top_left,2,16384,16384,64,64,192,128,fwd,False,68.085,162.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,
+kimiK26,kimiK26,flash_attention_4,bfloat16,no_mask,2,16384,16384,64,64,192,128,fwd,False,114.405,192.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,
+kimiK26,kimiK26,cudnn,bfloat16,top_left,2,8192,8192,64,64,192,128,fwd,False,23.647,116.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,eng8_k24=1_k27=0_k38=0_k40=2_k41=1
+kimiK26,kimiK26,cudnn,bfloat16,no_mask,2,8192,8192,64,64,192,128,fwd,False,46.191,119.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,eng8_k24=1_k27=0_k38=0_k40=2_k41=1
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,8192,8192,64,64,192,128,fwd,False,15.684,175.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,"sdpa_fwd_prefill_sm80[PACK_GQA=0, SCHED_POLICY=2, SPLIT_KV=1]"
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,8192,8192,64,64,192,128,bwd,False,102.666,70.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,8192,8192,64,64,192,128,bwd,True,147.103,49.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,8192,8192,64,64,192,128,fwd,False,28.240,195.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,"sdpa_fwd_prefill_sm80[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1]"
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,8192,8192,64,64,192,128,bwd,False,202.177,71.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,8192,8192,64,64,192,128,bwd,True,290.900,49.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_auto,bfloat16,top_left,2,8192,8192,64,64,192,128,fwd,False,23.489,117.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,eng8_k24=1_k27=0_k38=0_k40=2_k41=1
+kimiK26,kimiK26,cudnn_auto,bfloat16,top_left,2,8192,8192,64,64,192,128,bwd,False,104.024,69.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_auto,bfloat16,top_left,2,8192,8192,64,64,192,128,bwd,True,148.516,48.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_auto,bfloat16,no_mask,2,8192,8192,64,64,192,128,fwd,False,46.189,119.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,eng8_k24=1_k27=0_k38=0_k40=2_k41=1
+kimiK26,kimiK26,cudnn_auto,bfloat16,no_mask,2,8192,8192,64,64,192,128,bwd,False,201.633,71.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_auto,bfloat16,no_mask,2,8192,8192,64,64,192,128,bwd,True,290.453,49.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,flash_attention_4,bfloat16,top_left,2,8192,8192,64,64,192,128,fwd,False,16.683,165.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,
+kimiK26,kimiK26,flash_attention_4,bfloat16,no_mask,2,8192,8192,64,64,192,128,fwd,False,27.870,197.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,
+kimiK26,kimiK26,cudnn,bfloat16,top_left,2,4096,4096,64,64,192,128,fwd,False,6.004,114.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,eng8_k24=1_k27=0_k38=0_k40=2_k41=1
+kimiK26,kimiK26,cudnn,bfloat16,no_mask,2,4096,4096,64,64,192,128,fwd,False,11.367,121.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,eng8_k24=1_k27=0_k38=0_k40=2_k41=1
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,4096,4096,64,64,192,128,fwd,False,3.971,173.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,"sdpa_fwd_prefill_sm80[PACK_GQA=0, SCHED_POLICY=2, SPLIT_KV=1]"
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,4096,4096,64,64,192,128,bwd,False,26.531,67.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,4096,4096,64,64,192,128,bwd,True,39.791,45.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,4096,4096,64,64,192,128,fwd,False,6.730,204.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,"sdpa_fwd_prefill_sm80[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1]"
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,4096,4096,64,64,192,128,bwd,False,50.584,71.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,4096,4096,64,64,192,128,bwd,True,80.552,44.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_auto,bfloat16,top_left,2,4096,4096,64,64,192,128,fwd,False,6.063,113.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,eng8_k24=1_k27=0_k38=0_k40=2_k41=1
+kimiK26,kimiK26,cudnn_auto,bfloat16,top_left,2,4096,4096,64,64,192,128,bwd,False,26.466,68.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_auto,bfloat16,top_left,2,4096,4096,64,64,192,128,bwd,True,39.787,45.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_auto,bfloat16,no_mask,2,4096,4096,64,64,192,128,fwd,False,11.463,120.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,eng8_k24=1_k27=0_k38=0_k40=2_k41=1
+kimiK26,kimiK26,cudnn_auto,bfloat16,no_mask,2,4096,4096,64,64,192,128,bwd,False,50.631,71.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_auto,bfloat16,no_mask,2,4096,4096,64,64,192,128,bwd,True,80.603,44.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,flash_attention_4,bfloat16,top_left,2,4096,4096,64,64,192,128,fwd,False,4.251,162.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,
+kimiK26,kimiK26,flash_attention_4,bfloat16,no_mask,2,4096,4096,64,64,192,128,fwd,False,6.739,204.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,
+kimiK26,kimiK26,cudnn,bfloat16,top_left,2,2048,2048,64,64,192,128,fwd,False,1.645,104.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,eng8_k24=1_k27=0_k38=0_k40=2_k41=1
+kimiK26,kimiK26,cudnn,bfloat16,no_mask,2,2048,2048,64,64,192,128,fwd,False,2.877,119.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,eng8_k24=1_k27=0_k38=0_k40=2_k41=1
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,2048,2048,64,64,192,128,fwd,False,1.095,157.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,"sdpa_fwd_prefill_sm80[PACK_GQA=0, SCHED_POLICY=2, SPLIT_KV=1]"
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,2048,2048,64,64,192,128,bwd,False,7.034,64.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,2048,2048,64,64,192,128,bwd,True,11.138,40.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,2048,2048,64,64,192,128,fwd,False,1.721,200.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,"sdpa_fwd_prefill_sm80[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1]"
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,2048,2048,64,64,192,128,bwd,False,13.135,68.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,2048,2048,64,64,192,128,bwd,True,24.083,37.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_auto,bfloat16,top_left,2,2048,2048,64,64,192,128,fwd,False,1.640,105.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,eng8_k24=1_k27=0_k38=0_k40=2_k41=1
+kimiK26,kimiK26,cudnn_auto,bfloat16,top_left,2,2048,2048,64,64,192,128,bwd,False,7.035,64.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_auto,bfloat16,top_left,2,2048,2048,64,64,192,128,bwd,True,11.136,40.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_auto,bfloat16,no_mask,2,2048,2048,64,64,192,128,fwd,False,2.876,119.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,eng8_k24=1_k27=0_k38=0_k40=2_k41=1
+kimiK26,kimiK26,cudnn_auto,bfloat16,no_mask,2,2048,2048,64,64,192,128,bwd,False,13.156,68.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,cudnn_auto,bfloat16,no_mask,2,2048,2048,64,64,192,128,bwd,True,24.124,37.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,sdpa_bwd_sm80
+kimiK26,kimiK26,flash_attention_4,bfloat16,top_left,2,2048,2048,64,64,192,128,fwd,False,1.171,147.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,
+kimiK26,kimiK26,flash_attention_4,bfloat16,no_mask,2,2048,2048,64,64,192,128,fwd,False,1.702,202.000,0.000,20,,bshd,,True,False,,NVIDIA A100 80GB PCIe,1.33.0,92800.000,312.000,
