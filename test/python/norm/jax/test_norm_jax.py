@@ -191,10 +191,66 @@ def test_rejects_unsupported_gpu(kind, monkeypatch):
         invoke(kind, (x, None, None))
 
 
-def test_rejects_tracing_with_multiple_visible_devices(monkeypatch):
-    monkeypatch.setattr(jax, "device_count", lambda: 2)
-    with pytest.raises(NotImplementedError, match="one visible GPU"):
-        jax.jit(layer_norm_forward_jax).lower(jax.ShapeDtypeStruct((2, 8), jnp.float32))
+def test_rejects_multiple_processes(monkeypatch):
+    monkeypatch.setattr(jax, "process_count", lambda: 2)
+    with pytest.raises(NotImplementedError, match="single process"):
+        jax.jit(lambda x: layer_norm_forward_jax(x)).lower(jax.ShapeDtypeStruct((2, 8), jnp.float32))
+
+
+@pytest.mark.parametrize(
+    "property_name,other_value",
+    [("compute_capability", (10, 3)), ("multiprocessor_count", 132), ("shared_memory_per_block_optin", 163840)],
+)
+def test_tracing_rejects_heterogeneous_cuda_devices_with_closed_over_weight(monkeypatch, property_name, other_value):
+    from cudnn.frost import device
+
+    monkeypatch.setattr(device, "device_count", lambda: 2)
+    properties = {"compute_capability": (10, 0), "multiprocessor_count": 148, "shared_memory_per_block_optin": 232448}
+    for name, value in properties.items():
+        monkeypatch.setattr(device, name, lambda ordinal, value=value: value)
+    monkeypatch.setattr(device, property_name, lambda ordinal: other_value if ordinal == 1 else properties[property_name])
+    weight = jnp.ones((8,), jnp.float32)
+    with pytest.raises(NotImplementedError, match="matching compute capability"):
+        jax.jit(lambda x: layer_norm_forward_jax(x, weight)).lower(jax.ShapeDtypeStruct((2, 8), jnp.float32))
+
+
+@pytest.mark.parametrize("kind", ["layer", "rms"])
+def test_multiple_gpus_preserve_placement_and_reuse_compilation(kind):
+    from cudnn.frost import device
+
+    devices = [d for d in jax.local_devices() if d.platform == "gpu" and str(getattr(d, "compute_capability", "")) == "10.0"]
+    if len(devices) < 2:
+        pytest.skip("needs two visible SM100 GPUs")
+    properties = {(device.compute_capability(i), device.multiprocessor_count(i), device.shared_memory_per_block_optin(i)) for i in range(device.device_count())}
+    if len(properties) != 1:
+        pytest.skip("needs matching properties across all visible CUDA GPUs")
+    shape = (8, 4096)
+    forward = jax.jit(lambda args: invoke(kind, args))
+    gradients = jax.grad(lambda args, cotangent: jnp.sum(invoke(kind, args) * cotangent))
+    compiled_gradients = jax.jit(gradients)
+    reference_gradients = jax.grad(lambda args, cotangent: jnp.sum(reference(kind, args, shape[-1:], 1e-5) * cotangent))
+    rng = np.random.default_rng(42)
+    for iteration, target in enumerate((devices[0], devices[1], devices[0], devices[1])):
+        host_args = (
+            rng.normal(0.3 * iteration, 0.7, shape).astype(np.float32),
+            rng.uniform(0.5, 1.5, shape[-1:]).astype(np.float32),
+            rng.normal(0, 0.2, shape[-1:]).astype(np.float32) if kind == "layer" else None,
+        )
+        args, cotangent = jax.device_put((host_args, rng.normal(size=shape).astype(np.float32)), target)
+        expected = reference(kind, args, shape[-1:], 1e-5), reference_gradients(args, cotangent)
+        results = [(forward(args), compiled_gradients(args, cotangent))]
+        if iteration == 1:
+            results.append((invoke(kind, args), gradients(args, cotangent)))
+        for result in results:
+            for actual, desired in zip(jax.tree.leaves(result), jax.tree.leaves(expected), strict=True):
+                assert actual.devices() == {target}
+                assert_close(actual, desired, jnp.float32)
+        if iteration == 1:
+            cache_sizes = forward._cache_size(), compiled_gradients._cache_size()
+        elif iteration > 1:
+            assert (forward._cache_size(), compiled_gradients._cache_size()) == cache_sizes
+    with pytest.raises(ValueError, match="same GPU"):
+        invoke(kind, (args[0], jax.device_put(args[1], devices[0]), args[2]))
 
 
 def test_sm_count_follows_ambient_and_build_devices(monkeypatch):

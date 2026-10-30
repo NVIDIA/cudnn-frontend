@@ -984,8 +984,12 @@ Public functions (`cudnn.ops.<op>_<direction>(...)` / `cudnn.ops.<op>_<direction
 
 JAX tracers do not reveal eventual buffer placement. Do not choose device-specific
 launch geometry from `jax.local_devices()[0]` unless the API enforces a single
-visible device. Exercise that guard with `jax.jit(...).lower(ShapeDtypeStruct(...))`
-so validation of concrete eager arrays cannot mask a tracing-time mismatch (see
+visible device or proves all possible targets have equivalent specialization
+properties. Include CUDA devices hidden from JAX when the DSL queries ambient
+architecture. Exercise heterogeneous-property rejection with
+`jax.jit(...).lower(ShapeDtypeStruct(...))`, and reuse the same jitted function on
+non-default devices with changed inputs and gradients. Concrete closed-over
+operands do not establish a tracer's placement (see
 `test/python/norm/jax/test_norm_jax.py`).
 
 ## Adding a new frontend-only API — required checklist
