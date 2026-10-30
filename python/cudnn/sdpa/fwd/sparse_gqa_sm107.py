@@ -12,10 +12,12 @@ public 4.8.0 wheel; ``python/cudnn/AGENTS.md`` Rule 7 -- BEFORE the kernel modul
 version problem, never as a ``KeyError`` from inside the DSL), then every field of the record as a typed decline.  Every
 arm the body does not carry yet (a sink, a band, Q-length trimming of a dense batch, log2 stats, a pure caller list) is declined
 BY NAME; a later commit that lands an arm flips the record field, the config's wired-arm set and the support-matrix tracker in
-the same change.  THD (packed sequences) and paged K / V pools are carried --
-ONE of the two per declaration (``thd=True`` with ``paged_kv=True`` is a typed decline: the packed sequence's K / V row offset
-composes with a dense tensor only, never with a page pool) -- and so is the fused epilogue gate, which composes with either
-(it touches the item's Q^T slot ring and the epilogue only); see the contracts below.
+the same change.  THD (packed sequences) and paged K / V pools are carried, and so is their COMPOSITION on the bottom-right
+diagonal (``thd=True`` + ``paged_kv=True`` + ``bottom_right=True``, served since 2026-10-30: the packed EXTEND form over a cached
+prefix -- every sequence's K / V rows through its row of the page table, its rows' positions from the per-sequence KV lengths; the
+record's ``thd_paged_kv`` field); THD x paged on the TOP-LEFT diagonal is a typed decline (a packed self-attention over a page pool
+has no serving meaning).  The fused epilogue gate composes with every arm (it touches the item's Q^T slot ring and the epilogue
+only); see the contracts below.
 
 The fused epilogue gate (``epilogue_gate=`` the gate OPERAND, O's ``(B, S, H_q, D)`` shape in Q's dtype at its own (batch,
 seq, head) strides -- a slab column slice binds with no copy; the packed ``[1, T_q, H_q, D]`` form under THD) is served: the
@@ -173,6 +175,18 @@ metadata the setup launch writes.  Semantics per sequence ``b`` with Q length ``
 sees ``n_vis = min(pos + 1, S_kv_b)`` tokens (top-left causal); ``S_kv_b = 0`` makes every row of the sequence dead (``O = 0``,
 ``LSE = -inf`` stored); ``S_q_b = 0`` contributes no work; a one-sequence packing computes the dense ``B = 1`` function.
 Lengths are device values (Rule 3): the host validates the tensors' FORM only.
+
+THD x PAGED contract (``thd=True`` + ``paged_kv=True`` + ``bottom_right=True``; the packed EXTEND form over the pools, 2026-10-30; the
+record's ``thd_paged_kv``): Q / O ``[1, T_q, H, D]`` packed as above; K / V are the page POOLS of the paged contract, addressed through
+``block_table`` ``(B, max_pages)`` int32 with ``B`` = the SEQUENCE count (one table row per sequence of the packing, in the packing's
+order -- never Q's batch extent, which is 1); ``seq_kv_lens`` is the ``[B]`` per-sequence LOGICAL KV length AFTER the step (the serving
+stack's ``kv_lens``; the lengths form only -- ``cu_seq_kv_lens=True`` is declined by name --; ``0`` = a dead sequence: every one of its
+rows stores ``O = 0`` / ``LSE = -inf``), ``seq_q_lens`` the Q lengths in either form; row ``j`` of sequence ``b`` (``q_len_b = cu_q[b + 1] -
+cu_q[b]`` rows) sits at position ``kv_len_b - q_len_b + j`` (a negative position is a dead row, stored); ``block_ids`` one row per packed
+token with ids RELATIVE TO ITS SEQUENCE; any sequence order; the metadata workspace as under THD (the setup launch stores ``meta[b] =
+seq_kv_lens[b]`` and the K / V prefix sums, which the paged gather never reads: the gather row is ``page x rows_per_page + ...`` with the
+page from table row ``b``).  Refused by name on this form: the top-left diagonal, the split, the shared per-sequence list, the lean
+tile, ``use_pdl``, the e4m3 store, a prefix-form KV length.
 """
 
 from __future__ import annotations
@@ -211,13 +225,15 @@ class SparseCapabilities:
     dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})
     kv_cache_dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})  # the paged pools' dtype = Q's (reached through paged_kv)
     causal: bool = True  # the in-block mask: key <= the token's position (top-left, or bottom-right)
-    bottom_right: bool = True  # pos = kv_len_b - S_q + row: the decode / verify rows at the END of the sequence; dense BSHD or paged, never THD
+    bottom_right: bool = (
+        True  # pos = kv_len_b - S_q + row: the decode / verify rows at the END of the sequence; dense BSHD or paged -- and under THD over paged pools (thd_paged_kv, below)
+    )
     swa: bool = False
     sink: bool = False
     padded: bool = False  # per-batch Q lengths (the dense padding mask) are not carried ...
     kv_lens: bool = True  # ... per-batch KV lengths are (seq_kv_lens: the tail follows the visible range, a 0 length is a dead row)
-    # thd and paged_kv are served ONE AT A TIME -- a declaration with both is a typed decline (check_support by name, the config validator's
-    # predicate, the tracker's gaps row): the two fields below read as two arms, never as their composition.
+    # thd and paged_kv are two arms; their COMPOSITION is its own claim, `thd_paged_kv` (appended, below): served with bottom_right (the
+    # packed EXTEND form over the pools), declined by name on the top-left diagonal (check_support, the config validator's predicate).
     thd: bool = True  # packed sequences: cu_seqlens / per-sequence lengths, sequence-relative block ids, the persistent claim counter
     cu_seq_len: bool = True  # ... the lengths as [B + 1] prefix sums (cu_seq_q_lens / cu_seq_kv_lens, normalised on device) -- reached through thd
     paged_kv: bool = True  # page pools [num_pages, H_kv, page_size, D] (HND compact / NHD by strides) through a (B, max_pages) table; page_size % 4 == 0
@@ -251,6 +267,9 @@ class SparseCapabilities:
     )
     gated_e4m3_out_roundings: Tuple[str, ...] = (
         COMBINE_OUT_ROUNDINGS  # appended 2026-10-29: the fused store's rounding conventions (the `out_rounding` attribute: "single" = one rounding of the fp32 gated value, the default; "staged" = a serving stack's gate-and-quantize order, bf16 operands only) -- pinned equal to heuristics.COMBINE_OUT_ROUNDINGS by the suite
+    )
+    thd_paged_kv: bool = (
+        True  # appended 2026-10-30: the COMPOSITION of thd and paged_kv on the bottom-right diagonal -- the packed EXTEND form over the pools (THD x PAGED x BOTTOM_RIGHT: a sequence's K / V rows through its own table row, its rows' positions from the per-sequence KV lengths); the top-left composition stays declined; the conjunction flag the adapter's check_support, the config validator's predicate and the gated attention block's serving table read (a record without it declines the packed form by name)
     )
 
 
@@ -552,7 +571,8 @@ class SparseGqaFwdDslSm107:
         # THD (packed sequences): the Q lengths ride ``seq_q_lens`` (REQUIRED there; a dense batch's Q-length trimming is the
         # unserved ``seq_q_lens`` arm below), the KV lengths ``seq_kv_lens``; each as per-sequence lengths [B] or cumulative
         # [B + 1] per its ``cu_seq_*_lens`` flag; the metadata lives in the caller's ``workspace``.  THD together with the paged
-        # read is a typed decline in check_support (one of the two arms per declaration).
+        # read is served with ``bottom_right`` (the record's ``thd_paged_kv``: the KV lengths are then the [B] serving lengths, never a
+        # prefix) and declined by name on the top-left diagonal (check_support).
         self.thd = bool(thd)
         self.seq_q_lens = seq_q_lens
         self.cu_seq_q_lens, self.cu_seq_kv_lens = bool(cu_seq_q_lens), bool(cu_seq_kv_lens)
@@ -668,12 +688,19 @@ class SparseGqaFwdDslSm107:
             # `pdl_decline_reason`'s: ONE statement for this site and for the gated attention block's declaration-time decline.
             raise NotImplementedError(f"sparse d256 forward (sm107): {pdl_decline_reason(thd=True)}")
         if self.thd:
-            for name, requested in (("split_kv", self.split_kv > 1), ("list_per_sequence", self.list_per_sequence), ("bottom_right", self.bottom_right)):
+            for name, requested in (("split_kv", self.split_kv > 1), ("list_per_sequence", self.list_per_sequence)):
                 if requested:
                     raise NotImplementedError(
-                        f"sparse d256 forward (sm107): {name} with thd=True is not served -- the packed form keeps top-left positions, one list row per "
-                        "packed token and the claim-counter scheduler (no split axis); the decode form takes dense BSHD operands or paged pools"
+                        f"sparse d256 forward (sm107): {name} with thd=True is not served -- the packed form keeps one list row per packed token and "
+                        "the claim-counter scheduler (no split axis); the decode form's shared list and split take dense BSHD operands or paged pools"
                     )
+            if self.bottom_right and not self.paged_kv:
+                raise NotImplementedError(
+                    "sparse d256 forward (sm107): bottom_right with thd=True is not served on the block's own dense K / V -- the packed self-attention "
+                    "form keeps top-left positions (the token's offset in its sequence); the composition is served over PAGED pools (thd=True + "
+                    "paged_kv=True + bottom_right=True: the packed EXTEND form over a cached prefix, the position kv_len_b - q_len_b + j from the "
+                    "per-sequence KV lengths)"
+                )
         if self.list_per_sequence and not self.bottom_right:
             raise NotImplementedError(
                 "sparse d256 forward (sm107): list_per_sequence=True needs bottom_right=True -- the shared list is anchored at the step-0 position "
@@ -736,15 +763,29 @@ class SparseGqaFwdDslSm107:
                     f"sparse d256 forward (sm107): the epilogue gate (batch, seq, head) strides must be multiples of 8 elements (TMA's 16-byte rule); got {gst}"
                 )
 
-        # the two wired arms are served ONE AT A TIME: under THD the gather row is the sequence's packed row cu_k[b] + 4 blk + r
-        # on a dense [1, T_kv, H_kv, D] tensor, under the paged read the pool row page x rows_per_page + ...; nothing composes
-        # a sequence's row offset with a page pool, so the combination is declined by name until a serving stack asks for it
+        # THD x PAGED (the record's thd_paged_kv; the module docstring's THD x PAGED contract): under THD the dense arm's gather row is the
+        # sequence's packed row cu_k[b] + 4 blk + r, under the paged read the pool row page x rows_per_page + ... with the page from the table
+        # row of the sequence the THD decode found -- the two compose on the BOTTOM-RIGHT diagonal (the packed EXTEND form over a cached
+        # prefix); the top-left composition (a packed self-attention over a page pool) has no serving meaning, and the KV lengths must be
+        # the [B] serving lengths (the setup launch stores them as the per-sequence KV length; a prefix form is not wired)
         if self.thd and self.paged_kv:
-            raise NotImplementedError(
-                "sparse d256 forward (sm107): thd=True with paged_kv=True is not served -- the packed sequence's K / V row offset (cu_k[b]) composes "
-                "with a dense [1, T_kv, H_kv, D] tensor only, never with a page pool; declare one of the two (the combination lands with its own "
-                "accept cells when a serving stack asks for it)"
-            )
+            if not SPARSE_CAPABILITIES.thd_paged_kv:
+                raise NotImplementedError(
+                    "sparse d256 forward (sm107): thd=True with paged_kv=True -- the record declines the composition (thd_paged_kv=False: the kernel "
+                    "body does not carry the packed EXTEND form over the pools); declare one of the two"
+                )
+            if not self.bottom_right:
+                raise NotImplementedError(
+                    "sparse d256 forward (sm107): thd=True with paged_kv=True is served on the bottom-right diagonal only (bottom_right=True: the packed "
+                    "EXTEND form over a cached prefix -- row j of sequence b at position kv_len_b - q_len_b + j); a top-left packed self-attention "
+                    "over a page pool has no serving meaning -- declare bottom_right=True, or the dense [1, T_kv, H_kv, D] K / V"
+                )
+            if self.cu_seq_kv_lens:
+                raise NotImplementedError(
+                    "sparse d256 forward (sm107): thd=True with paged_kv=True takes seq_kv_lens as the [B] per-sequence LOGICAL KV lengths (the serving "
+                    "stack's kv_lens after the step; 0 = a dead sequence), never a prefix -- cu_seq_kv_lens=True is not served on this form; hand "
+                    "the lengths (cu_seq_kv_lens=False)"
+                )
 
         # the paged read's FORM: page_size a positive multiple of the block (the kernel's one-lookup-per-block premise), the
         # table and the KV lengths present; both appended arguments refused on a dense declaration (the mirror image)
@@ -758,8 +799,9 @@ class SparseGqaFwdDslSm107:
                 raise ValueError("sparse d256 forward (sm107): paged_kv needs block_table (int32 (B, max_pages): the sequence's pages in order)")
             if self.seq_kv_lens is None:
                 raise ValueError(
-                    "sparse d256 forward (sm107): paged_kv needs seq_kv_lens (int32 [B], the per-batch logical KV length): a page pool has no dense "
-                    "extent, so the visible range and the unwritten rows of a partially filled last page can only be bounded by it"
+                    "sparse d256 forward (sm107): paged_kv needs seq_kv_lens (int32 [B] -- B the batch, or the SEQUENCE count under thd=True -- the "
+                    "per-sequence logical KV length): a page pool has no dense extent, so the visible range and the unwritten rows of a partially "
+                    "filled last page can only be bounded by it"
                 )
         else:
             if self.block_table is not None:
@@ -782,6 +824,18 @@ class SparseGqaFwdDslSm107:
             raise ValueError(f"sparse d256 forward (sm107): V shape {vs} must equal K shape {ks}")
         if os_ != qs:
             raise ValueError(f"sparse d256 forward (sm107): O shape {os_} must equal Q shape {qs}")
+        # THD FIRST (the check ORDER matters): the packed operands' batch extent is 1 and the SEQUENCE count is the length tensors' --
+        # the paged checks below compare the table's rows and size the metadata against THAT count, never against Q's batch (a
+        # [n_seq, max_pages] table would otherwise be refused, and a [1, max_pages] one accepted with every sequence reading row 0)
+        n_seq = B
+        if self.thd:
+            if B != 1:
+                raise ValueError(
+                    f"sparse d256 forward (sm107): thd=True takes PACKED operands with batch extent 1 -- Q / O [1, T_q, H, D], K / V [1, T_kv, H_kv, D] "
+                    f"(or the page pools); got Q {qs}, K {ks}"
+                )
+            n_seq = self._check_thd_lens_form()
+        rows, rows_label = (n_seq, "num_sequences") if self.thd else (B, "B")
         if self.paged_kv:
             num_pages, KH, Pk, _ = ks
             if Pk != self.page_size:
@@ -790,25 +844,21 @@ class SparseGqaFwdDslSm107:
             if str(bt.dtype) != "torch.int32":
                 raise ValueError(f"sparse d256 forward (sm107): block_table must be int32; got {bt.dtype}")
             bts = _shape(bt)
-            if len(bts) != 2 or bts[0] != B or bts[1] < 1 or not bt.is_contiguous():
-                raise ValueError(f"sparse d256 forward (sm107): block_table must be a contiguous int32 (B, max_pages) = ({B}, >= 1); got {bt.dtype} {bts}")
+            if len(bts) != 2 or bts[0] != rows or bts[1] < 1 or not bt.is_contiguous():
+                raise ValueError(
+                    f"sparse d256 forward (sm107): block_table must be a contiguous int32 ({rows_label}, max_pages) = ({rows}, >= 1) -- one row per "
+                    f"{'sequence of the packing (the length tensors count them)' if self.thd else 'batch entry'}; got {bt.dtype} {bts}"
+                )
             max_pages = bts[1]
-            SKV = max_pages * self.page_size  # the table's capacity; the visible range per batch is seq_kv_lens
+            SKV = max_pages * self.page_size  # the table's capacity; the visible range per batch / sequence is seq_kv_lens
         else:
             Bk, SKV, KH, _ = ks
             if Bk != B:
                 raise ValueError(f"sparse d256 forward (sm107): batch mismatch: Q {qs}, K {ks}")
-        n_seq = B
-        if self.thd:
-            if B != 1:
-                raise ValueError(
-                    f"sparse d256 forward (sm107): thd=True takes PACKED operands with batch extent 1 -- Q / O [1, T_q, H, D], K / V [1, T_kv, H_kv, D]; got Q {qs}, K {ks}"
-                )
-            if SQ < 1 or SKV < 1:
-                raise ValueError(
-                    f"sparse d256 forward (sm107): thd=True needs packed capacities T_q, T_kv >= 1 (a zero-extent tensor map is invalid, not empty); got T_q {SQ}, T_kv {SKV}"
-                )
-            n_seq = self._check_thd_lens_form()
+        if self.thd and (SQ < 1 or SKV < 1):
+            raise ValueError(
+                f"sparse d256 forward (sm107): thd=True needs packed capacities T_q, T_kv >= 1 (a zero-extent tensor map is invalid, not empty); got T_q {SQ}, T_kv {SKV}"
+            )
         if self.list_per_sequence and SQ > SPARSE_CAPABILITIES.index_shared_list_max_tokens:
             raise NotImplementedError(
                 f"sparse d256 forward (sm107): list_per_sequence serves S_q <= {SPARSE_CAPABILITIES.index_shared_list_max_tokens} rows per sequence (the "

@@ -3003,11 +3003,15 @@ _REG_FILE_PER_CTA = 65536
 # "epilogue_gate": the item's gate tile (O's shape, the token's G heads) aliased into its freed Q^T slot after the item's last
 # BMM1 (GATE_TX_BYTES = the box), O gated in place after the dead-row SELECT, the LSE untouched; it touches the Q^T slot ring
 # and the epilogue only, so it composes with either of the two arms above (the gate is O-shaped on every arm).
-# The THD and paged arms are wired ONE AT A TIME: a record asking for both is refused by the validator below (the packed
-# sequence's K / V row offset cu_k[b] composes with a dense [1, T_kv, H_kv, D] tensor only, never with a page pool) until a
-# serving stack asks for the combination -- it then lands with its own accept cells.
+# The THD and paged arms COMPOSE with "bottom_right" only (2026-10-30: the packed EXTEND form over the pools -- a THD x PAGED x
+# BOTTOM_RIGHT record): under THD the paged arm's gather row comes from the block table's row of the sequence the THD decode found
+# (cu_k[b], the dense arm's row term, is unread there) and the row's position from the per-sequence KV lengths the setup launch stores
+# (meta[b] = the serving kv_lens[b]).  THD x PAGED on the TOP-LEFT diagonal is refused by the validator below (a packed self-attention
+# over a page pool has no serving meaning), as is THD x BOTTOM_RIGHT over the dense [1, T_kv, H_kv, D] K / V (there the position is
+# the token's offset in its sequence).
 # "bottom_right": the row's key-space position is tok + (eff_seqlen_kv_b - eff_seqlen_q_b) (the dense tiles' bottom-right
-# diagonal); the Q / O / LSE coordinate stays the row index; pos < 0 is a dead row.  Dense BSHD only (not under THD).
+# diagonal); the Q / O / LSE coordinate stays the row index; pos < 0 is a dead row.  Dense BSHD, paged pools, and under THD over
+# paged pools (the packed EXTEND form); never under THD over the dense K / V.
 # "list_per_sequence": the decode / MTP form -- block_ids [B, BLOCK_TOPK] and block_lens [B], ONE list per sequence read by every
 # item of the sequence (every KV head, split and token), the count and the appended tail anchored at the STEP-0 position
 # pos_0 = eff_seqlen_kv_b - eff_seqlen_q_b (0, 1 or 2 tail ids at S_q <= 4: every token from the step-0 tail start to the row's
@@ -3436,17 +3440,21 @@ def _validate_cfg_d256_sparse(cfg: CfgD256Sparse, flavor: str = _SPARSE_FLAVOR) 
                 f"form); a top-left per-sequence list has no serving meaning",
             ),
             (
-                not (cfg.BOTTOM_RIGHT and cfg.THD_VARLEN),
-                f"{flavor}: bottom_right under THD is not served -- the packed form's position is the token's offset in its sequence (top-left)",
+                not (cfg.BOTTOM_RIGHT and cfg.THD_VARLEN) or cfg.PAGED_KV == 1,
+                f"{flavor}: bottom_right under THD is not served on the DENSE packed form -- there the position is the token's offset in its sequence "
+                f"(top-left); the composition is served over PAGED pools only (THD x PAGED x BOTTOM_RIGHT: the packed EXTEND form over a cached prefix, "
+                f"the position tok + (kv_len_b - q_len_b) from the per-sequence KV lengths)",
             ),
             (
                 not cfg.THD_VARLEN or cfg.SEQ_KV_LENS_PRESENT == 1,
                 f"{flavor}: THD/varlen must force SEQ_KV_LENS_PRESENT=1, or every sequence attends the whole pack",
             ),
             (
-                not (cfg.THD_VARLEN and cfg.PAGED_KV),
-                f"{flavor}: THD x paged is not served -- the packed sequence's K / V row offset (cu_k[b]) composes with a dense [1, T_kv, H_kv, D] "
-                f"tensor only, never with a page pool; one of THD_VARLEN / PAGED_KV per record (the adapter declines the combination by name)",
+                not (cfg.THD_VARLEN and cfg.PAGED_KV) or cfg.BOTTOM_RIGHT == 1,
+                f"{flavor}: THD x paged is not served on the TOP-LEFT diagonal -- a packed self-attention over a page pool has no serving meaning "
+                f"(the dense arm's row term cu_k[b] is what a top-left packed form addresses K / V by); the composition is served with BOTTOM_RIGHT "
+                f"(THD x PAGED x BOTTOM_RIGHT: the packed EXTEND form over a cached prefix -- the K / V rows through the page table, the position "
+                f"from the per-sequence KV lengths; the adapter declines the top-left composition by name)",
             ),
             (not cfg.SEQ_Q_LENS_PRESENT or cfg.SEQ_KV_LENS_PRESENT == 1, f"{flavor}: SEQ_Q_LENS_PRESENT requires SEQ_KV_LENS_PRESENT"),
             (cfg.SCHEDULER_POLICY == SCHED_NATURAL, f"{flavor}: the item scheduler is NATURAL in v1 (LPT needs per-item costs)"),

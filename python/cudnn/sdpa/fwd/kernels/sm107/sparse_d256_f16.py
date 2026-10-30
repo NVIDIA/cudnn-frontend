@@ -382,6 +382,43 @@ index past the table and a -1 table entry (the page -1 convention of the dense p
 bytes credited -- so the rows of a partially filled last page beyond the KV length (another sequence's tokens, or garbage)
 never reach an MMA, and the straddling rows of the open block are masked exactly as in the dense arm (key_abs < the length).
 
+THD x PAGED (CFG.THD_VARLEN x CFG.PAGED_KV x CFG.BOTTOM_RIGHT [x CFG.EPILOGUE_GATE]; LIST_PER_SEQUENCE 0, SPLIT_KV 1 -- the packed EXTEND
+form over the pools, admitted 2026-10-30; the adapter's ``thd_paged_kv`` claim, the validator's two pair predicates): NO body change --
+three arms each validated alone compose because they touch DISJOINT facts of a work item.  The THD fold changes WHO decodes the item
+(``_decode_item``: the unit id from the claim counter -> head, tok_packed, the sequence b by ``_thd_find_batch`` over cu_q, tok =
+tok_packed - cu_q[b], eff_seqlen_q = cu_q[b + 1] - cu_q[b], item_row = tok_packed, the Q / O / LSE coordinate (tok_packed, 0)); the PAGED
+fold changes the gather ROW coordinate only (``_gather_block_pages``: page = block_table[b, (4 blk) // PAGE_SIZE] with b from the THD decode
+-- the table has B = the SEQUENCE count rows --, ``_gather_fill``: page x rows_per_page + head_rows + (4 blk) % PAGE_SIZE; kv_row_base =
+cu_k[b] is UNREAD); the BOTTOM_RIGHT fold changes ``visible_bounds``' position and dead predicate (pos = tok + (eff_seqlen_kv -
+eff_seqlen_q) with eff_seqlen_kv = meta[b] = the SERVING kv_lens[b] the setup launch stores -- the KV-lengths tensor the host hands it is
+the stack's per-sequence logical length AFTER the step, not a self-attention length --, dead when pos < 0 / tok >= eff_seqlen_q /
+eff_seqlen_kv == 0 / nothing listed) and the store predicate (live_row = tok < eff_seqlen_q).  All three are arithmetic in roles that
+already run once per item.  BARRIER TABLE under this rendering: every row of the table above holds with the SAME init count, arrive
+site, byte count, phase init and exit drain -- row 1 (the Q box at (tok_packed, 0): 1 == 1), row 2 (ONE commit per item: 1 == 1), row 3
+(the ids bulk copy at item_row = tok_packed, one row per packed token, dead items included: 1 == 1), row 4 (8 gather + 8 softmax elected
+arrives: IDS_EMPTY_ARRIVERS 16 == 16), rows 5 / 6 (each gather warp's ONE expect_tx of KV_TX_BYTES_PER_WARP then its 16 gather4 -- a -1
+page / a row past the length takes row -1: TMA zero-fills AND credits the bytes, the full-box arm -- KV_FULL_ARRIVERS 8 == 8; the MMA
+warp's one commit per stage 1 == 1; kv_state carried across items in the gather AND the MMA warp), rows 7-10 (per tile, carried, never
+reset at an item boundary: 1 / 256 / 256 / 1), rows 11 / 12 (the gate box at the same packed coordinate as O, 1 == 1; the 256-lane
+release, in ORDER at the exit path), row 13 (the persistent form: ONE elected arrive per publication after the claim, 1 == ONE_LANE),
+row 14 (18 == READ_TILE_ARRIVERS: every consuming warp credits once per item whatever the item mix), row 15 (256 == 256), the named
+barriers 16 / 17 (288 / 128) and barrier 0 (640) after fence_mbarrier_init -- with the dead-CTA exit ABOVE every init (a CTA at or past
+live exits WHOLE).  What the composition DOES change is the per-CTA ITEM MIX: 1-tile decode items beside 17-tile chunk items under one
+persistent loop, so the carried-state discipline (rows 5-10 per TILE, rows 1-4 / 11-14 per ITEM, the exit drains per role) is what the
+mixed-item sequence cells of the sparse suite stress on this rendering.  SMEM table and TMEM map: the dense arm's, unchanged (no new
+buffer, no new column).  Composed degenerate rows: a sequence with kv_lens 0 and Q rows -> every row dead (one -1 tile; O = 0 / LSE = -inf
+STORED); q_len_b = 0 -> no unit (T_live = cu_q[B] excludes it, the binary search steps over it); 0 < kv_lens < q_len_b -> the rows at a
+negative position dead, the rest live; a -1 table entry / a page index past the table under a VISIBLE block -> row -1 (zero rows, bytes
+credited); stale FINITE pool rows past kv_len inside the last live page -> (key0 + r) < eff_seqlen_kv per row, never gathered; the
+capacity tail past cu_q[B] never written; T_live x KH units below the occupancy grid -> the CTAs at or past live exit at entry, above it
+the counter hands the rest out.  THD x PDL stays declined (the pre-dispatch read and the claim counter sit above every role wait).
+Trace-compile record of the rendering (host sm_107a trace-compile, cutlass-dsl 4.8.0 with its CUDA 13.4 ptxas, 2026-10-30; nothing
+dispatched): the composed module renders TWO entries (the THD setup kernel REG 22 and the core) with no griddepcontrol; the core at G 4
+ungated REG 96 / STACK 8 / LOCAL 0 / STL 1 / LDL 1 -- IDENTICAL to the THD-dense rendering at the same toolchain (the THD arm's pre-existing
+pair; the dense arm 95 / 0 / 0 / 0, the paged bottom-right dense-Q arm 96 / 0 / 0 / 0), G 4 gated REG 93 / 0 / 0 / 0, G 12 ungated REG 96 /
+0 / 0 / 0; SYNCS 174 (182 gated) and UBLKCP 2 = the sibling renderings' counts, ATOM 5 = the dense arm's 4 + the claim counter's one: the
+96 FLAT register budget holds and the composition adds no spill, so no named fallback is selected.
+
 DECODE FORM (CFG.BOTTOM_RIGHT + CFG.LIST_PER_SEQUENCE + CFG.SPLIT_KV, each a const_expr arm; the dense rendering is unchanged):
 the serving step's S_q <= 4 rows per sequence sit at the END of the sequence (BOTTOM_RIGHT: pos = tok + L_b - S_q), share ONE
 block list (LIST_PER_SEQUENCE: block_ids [B, BLOCK_TOPK], block_lens [B]; item_row = b, so every item of the sequence -- every
@@ -395,7 +432,8 @@ EPILOGUE_GATE is refused under a split by the config).  An empty chunk is a DEAD
 LSE_s = -inf, exactly the combine's identity), so every ring advances exactly as on a live item (P14); SPLIT_KV <=
 MAX_TILES_PER_ITEM (a larger split has an empty chunk on every item).  No barrier init count, ring depth, SMEM buffer or TMEM
 column changes: the per-sequence list is a SOURCE change of barrier row 3, the split a tile-range change of rows 5-10 plus the
-epilogue's store target.  THD never composes with the three arms (the config refuses each pair).
+epilogue's store target.  THD composes with BOTTOM_RIGHT over PAGED pools only (the THD x PAGED paragraph above); the per-sequence list
+and the split stay refused under THD (the config refuses each pair).
 MTP rows as single-token items (the shared list at S_q <= 4): every row is its OWN work item re-gathering the sequence's list --
 per item IDS_TX_BYTES of ids (2 KiB at top_k 512; the copy runs for every item, dead ones included) plus (count + n_tail) x 4 rows x
 2 operands x 512 B of K / V (514 blocks = 2056 KiB at a saturated list with two tail ids; 17 tiles x 128 KiB credited with the
@@ -413,8 +451,9 @@ tile, no host read); padded Q rows -> dead, no store; B x H > 1 with n_tiles = 1
 -> clamped on device; B >= 2 / the slab stride -> the ROW coordinate carries b x S (cu_k[b] under THD), the COLUMN
 coordinate the head and the column offset; one CTA / one item -> cga1 init counts; THD: S_kv_b = 0 with Q tokens -> dead items
 stored, S_q_b = 0 -> no unit, the packed capacity tails untouched, a CTA past the live total exits at entry; a paged block whose
-page is -1 / past the table -> row -1 (zero rows, the keys masked by the length); THD x paged -> a typed decline at config /
-check_support (the sequence's row offset composes with a dense tensor only); page_size % 4 != 0, top_k outside [4, 512] or
+page is -1 / past the table -> row -1 (zero rows, the keys masked by the length); THD x paged TOP-LEFT -> a typed decline at config /
+check_support (a packed self-attention over a page pool has no serving meaning); THD x paged x bottom-right -> the composed rows of the
+THD x PAGED paragraph; page_size % 4 != 0, top_k outside [4, 512] or
 % 4 != 0, G > 16 -> typed declines at config / check_support.  Decode form: kv_len_b = 0 -> pos_0 = -S_q -> every row dead (stored
 0 / -inf; under a split every chunk dead -> the combine's all-dead identity); kv_len_b < S_q -> the rows with pos_j < 0 dead, the
 rest live; (L_b - S_q + 1) % 4 == 0 -> the step-0 row has no tail and row j >= 1 one tail block (the block that completed between
@@ -1063,8 +1102,9 @@ def _gather_fill(desc, sKV_raw, stage_idx, mbar, w, blks, pages, kv_row_base, ro
     item's ``kv_row_base`` (``batch x S_kv`` on the dense map whose rows are the tokens of every batch; ``cu_k[b]`` under THD,
     the sequence's first packed K / V row -- the block ids are the sequence's own) on the dense arm, and on the PAGED arm the
     pool row ``page x rows_per_page + head_rows + (4 blk) % PAGE_SIZE`` (``pages`` from ``_gather_block_pages``; ``head_rows``
-    = ``head x rows_per_head``, 0 for an NHD pool whose head lives in the column; ``kv_row_base`` is unread there -- THD x
-    paged is a typed decline); a ``-1`` block (or page), a block past the sequence's length or the straddling rows of its
+    = ``head x rows_per_head``, 0 for an NHD pool whose head lives in the column; ``kv_row_base`` is unread there -- under THD x
+    paged the page comes from the table row of the sequence the THD decode found, never from ``cu_k[b]``); a ``-1`` block (or page),
+    a block past the sequence's length or the straddling rows of its
     last block take row ``-1`` -> TMA zero-fills and still credits the bytes, so no foreign batch's / sequence's row (or its
     NaN) ever reaches an MMA under P = 0."""
     stage_off = stage_idx * cutlass.Int32(kvBufferElems)
@@ -2119,8 +2159,11 @@ def _host(
     ``THD_META_WORDS(B)`` words that the setup launch fills from ``thd_q_lens_ptr`` / ``thd_kv_lens_ptr`` (per-sequence lengths
     ``[B]``, or cumulative ``[B + 1]`` per ``thd_lens_form`` bit 0 / 1): ``[seq_kv_lens(B) | cu_q(B + 1) | cu_k(B + 1) | remap(B) |
     live | ctr]``; ``block_ids_ptr`` -> int32 [SQ, BLOCK_TOPK] (one row per packed token); ``n_ctas`` the occupancy-sized grid
-    (one CTA per SM, at most one per unit) that also seeds the claim counter.  THD x paged is never rendered (a validator
-    predicate): under THD ``n_q_batches`` is 1 and the gather maps span the packed capacity ``SKV``.
+    (one CTA per SM, at most one per unit) that also seeds the claim counter.  THD x paged renders with BOTTOM_RIGHT (the packed
+    EXTEND form over the pools; a validator predicate refuses the top-left composition): under THD ``n_q_batches`` is 1 and under
+    PAGED the gather maps span the pool's rows (``num_pages x rows_per_page``) whatever the Q form, the block table has ``B`` = the
+    SEQUENCE count rows and ``SKV`` is the table's capacity ``max_pages x PAGE_SIZE``; ``thd_kv_lens_ptr`` is then the serving
+    per-sequence KV length after the step (the lengths form), stored as ``meta[b]``.
     """
     B, QH, KH, SQ, SKV = problem_size
     num_pages, max_pages, k_rows_per_page, k_rows_per_head, v_rows_per_page, v_rows_per_head = paged_geom

@@ -552,9 +552,13 @@ cudnn.gated_attention_block.DecodeRoute.q_tile_max
 cudnn.gated_attention_block.DecodeRoute.reason
 cudnn.gated_attention_block.DecodeRoute.served
 cudnn.gated_attention_block.ExtendEnvelope
+cudnn.gated_attention_block.ExtendEnvelope.index_list_forms
+cudnn.gated_attention_block.ExtendEnvelope.index_sources
 cudnn.gated_attention_block.ExtendEnvelope.inference_only
 cudnn.gated_attention_block.ExtendEnvelope.pdl_stages
 cudnn.gated_attention_block.ExtendEnvelope.quant_modes
+cudnn.gated_attention_block.ExtendEnvelope.sparse_core
+cudnn.gated_attention_block.ExtendEnvelope.sparse_tiles
 cudnn.gated_attention_block.ExtendEnvelope.writes_lse
 cudnn.gated_attention_block.FP8_PROJ_BF16_ATTENTION_CCS
 cudnn.gated_attention_block.Fp4Format
