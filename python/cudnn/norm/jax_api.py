@@ -145,9 +145,9 @@ def _backward_call(config):
 
 
 def _forward(config, x, weight, bias):
-    gamma = jnp.ones((config.spec.M,), dtype=x.dtype) if weight is None else weight.reshape(-1)
-    beta = gamma if bias is None else bias.reshape(-1)
-    y, mean, rstd = _forward_call(config)(x.reshape(config.spec.R, config.spec.M), gamma, beta)
+    gamma = jnp.ones((config.spec.M,), dtype=x.dtype) if weight is None else weight
+    beta = gamma if bias is None else bias
+    y, mean, rstd = _forward_call(config)(x, gamma, beta)
     return y.reshape(x.shape), (x, weight, bias, gamma, mean, rstd)
 
 
@@ -158,8 +158,7 @@ def _normalize(config, x, weight, bias):
 
 def _backward(config, residual, dy):
     x, weight, bias, gamma, mean, rstd = residual
-    shape = (config.spec.R, config.spec.M)
-    dx, dgamma, dbeta, _, _ = _backward_call(config)(dy.reshape(shape), x.reshape(shape), gamma, mean, rstd)
+    dx, dgamma, dbeta, _, _ = _backward_call(config)(dy, x, gamma, mean, rstd)
     dweight = None if weight is None else dgamma.reshape(weight.shape).astype(weight.dtype)
     dbias = None if bias is None else dbeta.reshape(bias.shape).astype(bias.dtype)
     return dx.reshape(x.shape), dweight, dbias
@@ -174,6 +173,8 @@ def layer_norm_forward_jax(x, weight=None, bias=None, *, normalized_shape=None, 
     Inputs have matching BF16, FP16, or FP32 dtype. Affine parameters, when present,
     have exactly ``normalized_shape``; the default normalizes the last dimension.
     ``normalized_shape`` and positive ``eps`` are static under ``jax.jit``.
+    Weight and bias gradients use FP32 atomic accumulation and need not be
+    bitwise repeatable across calls with identical inputs.
     Returns ``(y,)``; ``y`` has the same shape and dtype as ``x``.
     """
     config = _configuration(x, weight, bias, normalized_shape, eps, NormVariant.LAYER_NORM)
@@ -185,6 +186,7 @@ def rms_norm_forward_jax(x, weight=None, *, normalized_shape=None, eps=1e-5):
 
     The dtype, shape, and static-argument contract matches :func:`layer_norm_forward_jax`.
     No bias is applied; omitted weight means one.
+    Weight gradients use FP32 atomic accumulation and need not be bitwise repeatable.
     Returns ``(y,)``; ``y`` has the same shape and dtype as ``x``.
     """
     config = _configuration(x, weight, None, normalized_shape, eps, NormVariant.RMS_NORM)
