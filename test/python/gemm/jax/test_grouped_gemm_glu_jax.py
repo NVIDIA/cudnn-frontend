@@ -109,7 +109,7 @@ def test_grouped_gemm_glu_jax_jit_matches_eager():
     import cutlass.jax
 
     if not cutlass.jax.is_available():
-        pytest.skip("CuTeDSL JAX extensions unavailable (jax >= 0.5 required)")
+        pytest.skip("CuTeDSL JAX extensions unavailable (jax >= 0.6.0 required)")
     skip_unless_sm100()
     from cudnn import grouped_gemm_glu_jax_sm100, grouped_gemm_glu_wrapper_sm100
 
@@ -233,7 +233,7 @@ def test_grouped_gemm_glu_jax_addressed_rows_survive_a_dirty_allocator():
     import cutlass.jax
 
     if not cutlass.jax.is_available():
-        pytest.skip("CuTeDSL JAX extensions unavailable (jax >= 0.5 required)")
+        pytest.skip("CuTeDSL JAX extensions unavailable (jax >= 0.6.0 required)")
     skip_unless_sm100()
     from cudnn import grouped_gemm_glu_jax_sm100, grouped_gemm_glu_wrapper_sm100
 

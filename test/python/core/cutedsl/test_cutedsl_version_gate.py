@@ -14,6 +14,7 @@ import pytest
 import torch
 
 import cudnn
+from cudnn._jax_requirements import JAX_MIN_CUTEDSL_VERSION
 from cudnn.frost import buffers
 
 pytestmark = pytest.mark.L0
@@ -56,7 +57,7 @@ def test_healthy_or_absent_dsl_yields_no_version_error(dsl_state, state):
 def test_jax_floor_does_not_raise_the_default_floor(dsl_state, version, too_old):
     dsl_state(True, ("nvidia-cutlass-dsl", version))
     assert buffers.cutedsl_requirement_error("native kernel") is None
-    message = buffers.cutedsl_requirement_error("cudnn.jax", min_version=buffers.JAX_MIN_CUTEDSL_VERSION)
+    message = buffers.cutedsl_requirement_error("cudnn.jax", min_version=JAX_MIN_CUTEDSL_VERSION)
     if too_old:
         assert "requires nvidia-cutlass-dsl >= 4.7.1" in message
         assert f"found {version}" in message

@@ -12,7 +12,8 @@ jax = pytest.importorskip("jax")
 ml_dtypes = pytest.importorskip("ml_dtypes")
 torch = pytest.importorskip("torch")
 import jax.numpy as jnp
-from cudnn.frost.buffers import JAX_MIN_CUTEDSL_VERSION, cutedsl_arch_requirement_error, cutedsl_requirement_error
+from cudnn._jax_requirements import JAX_MIN_CUTEDSL_VERSION
+from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 
 requirement_error = cutedsl_requirement_error("JAX grouped GEMM tests", min_version=JAX_MIN_CUTEDSL_VERSION)
 if requirement_error:

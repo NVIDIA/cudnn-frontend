@@ -19,6 +19,7 @@ process it stays, so an in-process assertion would pass for the wrong reason.
 
 import importlib.util
 import json
+from pathlib import Path
 import subprocess
 import sys
 
@@ -506,4 +507,31 @@ assert "cudnn.jax.call" not in sys.modules
 assert not any(name == "cutlass" or name.startswith("cutlass.") for name in set(sys.modules) - before)
 """
     run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+
+
+def test_jax_unavailable_bridge_reports_version_before_importing_symbols():
+    probe = """
+import runpy
+import sys
+from types import ModuleType
+
+for name in ("cutlass", "cutlass.cute", "cutlass.jax", "jax", "jax.numpy"):
+    module = ModuleType(name)
+    module.__path__ = []
+    sys.modules[name] = module
+    parent, _, child = name.rpartition(".")
+    if parent:
+        setattr(sys.modules[parent], child, module)
+sys.modules["cutlass.jax"].is_available = lambda: False
+
+try:
+    runpy.run_path(sys.argv[1])
+except ImportError as exc:
+    assert "jax >= 0.6.0" in str(exc), str(exc)
+else:
+    raise AssertionError("An unavailable JAX bridge was accepted")
+"""
+    source = Path(__file__).resolve().parents[3] / "python/cudnn/jax/call.py"
+    run = subprocess.run([sys.executable, "-c", probe, str(source)], capture_output=True, text=True)
     assert run.returncode == 0, run.stderr
