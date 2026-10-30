@@ -102,6 +102,45 @@ def test_forward_and_jitted_gradients(kind, shape, dtype, normalized_shape, has_
 
 
 @pytest.mark.parametrize("kind", ["layer", "rms"])
+def test_eager_multidimensional_inputs_reach_bridge_unchanged(kind, monkeypatch):
+    from cudnn.norm import jax_api
+
+    shape, normalized_shape = (2, 3, 5, 8), (5, 8)
+    rng = np.random.default_rng(42)
+    x = jnp.asarray(rng.normal(size=shape), jnp.float32)
+    weight = jnp.asarray(rng.uniform(0.5, 1.5, normalized_shape), jnp.float32)
+    bias = jnp.asarray(rng.normal(size=normalized_shape), jnp.float32) if kind == "layer" else None
+    dy = jnp.asarray(rng.normal(size=shape), jnp.float32)
+
+    def check_inputs(factory, expected):
+        def bind(config):
+            run = factory(config)
+
+            def checked(*arrays):
+                for actual, original in zip(arrays, expected):
+                    assert actual is original
+                return run(*arrays)
+
+            return checked
+
+        return bind
+
+    monkeypatch.setattr(jax_api, "_forward_call", check_inputs(jax_api._forward_call, (x, weight, weight if bias is None else bias)))
+    monkeypatch.setattr(jax_api, "_backward_call", check_inputs(jax_api._backward_call, (dy, x, weight)))
+    args = (x, weight, bias)
+    y, backward = jax.vjp(lambda args: invoke(kind, args, normalized_shape), args)
+    expected, reference_backward = jax.vjp(lambda args: reference(kind, args, normalized_shape, 1e-5), args)
+    assert_close(y, expected, jnp.float32)
+    actual_gradients = backward(dy)[0]
+    expected_gradients = reference_backward(dy)[0]
+    for actual, expected in zip(actual_gradients, expected_gradients):
+        if expected is None:
+            assert actual is None
+        else:
+            assert_close(actual, expected, jnp.float32)
+
+
+@pytest.mark.parametrize("kind", ["layer", "rms"])
 @pytest.mark.parametrize("eps", [0.0, -1e-5, float("nan"), float("inf"), 1e100, 1e-100])
 def test_rejects_invalid_epsilon(kind, eps):
     x = jnp.ones((2, 8), jnp.float32)

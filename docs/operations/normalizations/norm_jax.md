@@ -38,6 +38,11 @@ primal parameter's dtype. Input gradients also match the input dtype.
 The backward implementation is private and is invoked by JAX's reverse-mode
 transformations; these APIs do not expose a separate backward function.
 
+Weight and bias gradients are not guaranteed to be bitwise repeatable, even
+with identical inputs and random seeds. Their FP32 atomic additions combine
+contributions across rows or reduction chunks in an order that can vary
+between launches.
+
 `normalized_shape` and `eps` are static configuration: close over them in a
 jitted function, or mark them as static arguments. Arrays remain runtime
 inputs. Use a finite positive `eps` within the FP32 representable range.
@@ -108,7 +113,7 @@ qualified scope. The functions do not expose a cuDNN graph-planning interface.
 ## Validation
 
 The focused suite is
-[`test/python/norm/jax/test_norm_jax.py`](../../test/python/norm/jax/test_norm_jax.py).
+[`test/python/norm/jax/test_norm_jax.py`](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/norm/jax/test_norm_jax.py).
 It exercises the public entry points against numerical references and checks
 the documented input contract. Passing collection or an environment skip does
 not establish GPU support; qualify the suite on SM100 with CUDA-enabled JAX
