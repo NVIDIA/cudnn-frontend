@@ -3871,7 +3871,7 @@ per-sequence report), the DSA compact-logits scorer + fused radix top-k per row 
 (n_blocks_max x 4)))` rows per launch pair over ONE fp32 scratch slot; the 512 MiB budget a module constant published in the envelope, not a
 knob), the canonical-order kernel `cudnn_block_qsa_canonical_list` in place (ids descending, `-1` past the count); the cache-write stage's RING
 arm then writes the chunk's last `cap` raw keys at `execute(index_state_slot_mapping=)` (REQUIRED on this form), AFTER the chunk compress's ring
-reads in stream order.  `4 + 2 x n_windows` indexer launches (12 on the whole step at one window with a split).  Always unfused (`fuse_prepare`
+reads in stream order.  `4 + 2 x n_windows` indexer launches (the whole step: 12 launches at one window, 13 with a split -- the combine's --, + 2 per further window).  Always unfused (`fuse_prepare`
 None reads False; an explicit True is the typed `indexer_extend_fuse_prepare`); `rope_position_tables_only=False` (`indexer_extend_rope_tables_only`);
 the ring sample `cap >= 3` (`indexer_extend_ring_rows`: the kernel's TRUE bound `min_ring_rows(..., ring_write=False)`, spelled DSL-free as
 `index_extend_ring_rows_min` and drift-checked at plan time; the DECODE step keeps `cap >= S_q + 3`); `S_q <= max_kv_len`

@@ -1522,9 +1522,11 @@ def test_indexer_execute_allocates_nothing_of_its_own_and_never_synchronizes(cac
     n1 = stat()
     assert sort_calls[0] == 0, f"torch.sort ran {sort_calls[0]} times on the execute path: the canonical order is the FROST kernel's (2026-10-29)"
     assert n1 - n0 == 0, f"the indexer block made {n1 - n0} CUDA allocation(s) over three executes (allocation.all.allocated {n0} -> {n1}; cache {cache_dtype})"
-    assert (
-        blk._indexer.launches == 4 * blk._indexer.launches_per_execute(True) + c.ix["launches"] - blk._indexer.launches_per_execute(True) * len(c.runs) or True
-    )
+    # the stage's launch counter over EVERY execute of this block so far: the cell's own runs, the warm execute and the three executes above,
+    # each with the caller's cache handed in (launches_per_execute(True): the cache compress, the two compresses, the scorer pair, the canonical
+    # kernel; + the two casts on the e4m3 arm) -- a wrong launch count on the execute path fails here
+    want_launches = (len(c.runs) + 4) * blk._indexer.launches_per_execute(True)
+    assert blk._indexer.launches == want_launches, f"{blk._indexer.launches} indexer launches over {len(c.runs) + 4} executes, expected {want_launches}"
     assert torch.equal(_bits(out), _bits(c.runs[0][0])) and torch.equal(c.ix["ids_out"].view(B, S, top_k), c.ix["kernel_ids"]), "the re-executes differ"
     print(f"R9 census ({cache_dtype}): block 3 executes {n1 - n0} allocation(s), torch.sort calls {sort_calls[0]}, the block's own 0")
     if cache_dtype is E4M3:

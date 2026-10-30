@@ -34,7 +34,6 @@ sentinel past every piece's compact slab and past ``get_workspace_size()`` untou
 over three executes; the launch census by kernel NAME (control + 6 at one window, + 2 per further window); capture after one warm-up.
 """
 
-import contextlib
 import math
 import os
 import sys
@@ -64,7 +63,6 @@ from cudnn.gated_attention_block.api import (
     _align_up,
     _CacheWrite,
     _check_extend_piece_table,
-    _cols,
     _extend_window_plan,
     _IndexerDecode,
     _IndexerExtend,
@@ -88,7 +86,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_block_qsa_decode as _qsa  # noqa: E402  (the decode module's oracle, helpers and cases)
 from gated_block_bounds import assert_output_close  # noqa: E402
 from gated_block_census import cupti_kernels as _cupti_kernels  # noqa: E402
-from gated_block_qsa_reference import qsa_visible_mask  # noqa: E402
 from gated_block_reference import gated_attention_block_reference, qk_norm_rope_reference, split_qkvg  # noqa: E402
 
 _DEV, BF16, F16, D, ROPE, BS = _qsa._DEV, _qsa.BF16, _qsa.F16, _qsa.D, _qsa.ROPE, _qsa.BS
@@ -176,6 +173,12 @@ class _IndexerExtendCase(_qsa._IndexerCase):
         prefix_only=False,
         max_pages=None,
     ):
+        # ``_IndexerCase.__init__`` is deliberately NOT called: it declares and sizes the DECODE step's block (``S_q`` rows at the step, the
+        # prefix below it, the decode form's samples and slots) over the oracle state it builds -- a different declaration from this chunk
+        # form's (``index_select_form``, the stack's ring slots, the rounding attribute, ``cap`` free of ``S_q``) and a different prefix /
+        # ring priming; the base's state is rebuilt here field by field for the chunk, and only its METHODS (the oracle, the pools, the
+        # compress helper, ``check`` / ``run``) are inherited.  Calling the base init would declare a decode block and allocate its tensors
+        # for nothing.
         self.s_q, self.kv_lens, self.page, self.layout, self.dtype, self.top_k = int(s_q), [int(x) for x in kv_lens], page, layout, dtype, top_k
         self.block_lens_given, self.return_lse, self.fuse_gate, self.index_band = False, bool(return_lse), bool(fuse_gate), True
         self.index_list_form, self.shared, self.fuse_prepare = None, False, fuse_prepare
@@ -824,8 +827,8 @@ def test_every_indexer_writer_carries_the_declared_rounding(monkeypatch):
     sentinel, the plan constants it builds allocated on this device) hands ``rounding=`` to ``compile_qsa_compress`` -- the cell that is red when a
     stage compiles the default chain whatever the declaration says.  The device cells (the e2e module's chunked prefill + decode steps and its
     prefill-form cell, both parametrised over the roundings) pin the rows those recipes write."""
-    import cudnn.gated_attention_block.kernels.qsa_compress as compress_mod
     from cudnn.gated_attention_block.api import _Indexer
+    from cudnn.gated_attention_block.kernels import qsa_compress as compress_mod  # the module object: the recipe compile is stubbed on it
 
     geom_kw = GEOM_SMALL
     mk = lambda *shape: torch.empty(*shape, dtype=BF16, device=_DEV)  # noqa: E731
