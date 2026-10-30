@@ -892,7 +892,9 @@ def test_every_static_decline_of_the_decode_declaration_is_predicted_by_the_enve
     geom16, _ = _geom(16)
     d128 = GatedAttentionBlockGeometry(d_model=_D_MODEL, h_q=8, h_kv=2, d_head=128, rope_dim=_ROPE, causal_bottom_right=True)
     # a TOP-LEFT QsaSpec geometry meets the `diagonal` row like a dense one (a ValueError); with the bottom-right diagonal it is the
-    # block-sparse DECODE mode, SERVED since 2026-10-14 (test_block_qsa_decode.py) -- the former `sparse` row is the packed form's
+    # block-sparse DECODE mode, SERVED since 2026-10-14 (test_block_qsa_decode.py), and since 2026-10-30 the packed form over the pools
+    # is the packed block-sparse EXTEND form too (test_block_qsa_packed_extend.py): BOTH forms served; the table's `sparse` row is reached
+    # through a record without the composition claim
     sparse = GatedAttentionBlockGeometry(d_model=_D_MODEL, h_q=8, h_kv=2, d_head=_D, rope_dim=_ROPE, qsa=QsaSpec())
     rows = [
         (geom16, torch.float8_e4m3fn, "bf16 / f16", NotImplementedError),
@@ -908,7 +910,8 @@ def test_every_static_decline_of_the_decode_declaration_is_predicted_by_the_enve
         _DEV,
         device_cc=_SM107,
     )
-    assert served.decode.served and served.decode.sparse_core and served.forms == ("decode",) and served.decode.routes == ()
+    assert served.decode.served and served.decode.sparse_core and served.forms == ("extend", "decode") and served.decode.routes == ()
+    assert served.extend.served and served.extend.sparse_core  # INVERTED 2026-10-30: the packed block-sparse EXTEND form with caller lists
     # ... and the declaration raises the same row (device-free), the e4m3 one through the quant halves it needs first
     for geom, dtype, match, exc in rows[1:]:
         mk = lambda *shape: torch.empty(*shape, dtype=dtype, device=_DEV)  # noqa: E731

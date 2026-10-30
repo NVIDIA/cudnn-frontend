@@ -15,10 +15,12 @@ performance knob; the LSE is served over the pools (the core writes it).
 
 Host cells (any device; the declaration cells even on the CPU): the declaration FACTS (the sparse stage in the paged form, the
 list form per ``S_q``, no dense route, where the gate runs, the split's default rule, ``seq_lens_present`` forced, the stage
-order); the typed declines (the packed form under ``QsaSpec`` over the pools -- the serving table's ``sparse`` row --, a block
-table sample that is not contiguous, a split past the item's tile count, ``max_kv_len`` past the table's reach, the bottom-right
+order); the typed declines (the serving table's ``sparse`` row through a record without the THD x paged composition claim -- the
+packed form under ``QsaSpec`` over the pools CONSTRUCTS since 2026-10-30: the packed sparse EXTEND form, ``test_block_qsa_packed_extend.py`` --,
+a block table sample that is not contiguous, a split past the item's tile count, ``max_kv_len`` past the table's reach, the bottom-right
 diagonal on the block's own K / V, the in-block indexer over the pools); the static ``serving_envelope`` (the DECODE form served
-on a Rubin reading with ``sparse_core``, the EXTEND form declined with the ``sparse`` row); the execute-time form checks on an
+on a Rubin reading with ``sparse_core``, the EXTEND form served too -- the packed sparse form with caller lists --, the ``sparse`` row
+through the declining record); the execute-time form checks on an
 UNCOMPILED block under ``set_sync_debug_mode("error")`` (the list form per declaration, ``seq_lens`` refused, the whole table
 required, ``kv_lens`` required); the split rule.
 
@@ -429,18 +431,24 @@ def test_the_sparse_split_rule_over_the_measured_decode_cells(sm_count):
     assert _sparse_combine_decode_grid(4, h_q, 4, 6, cc) == _sparse_combine_decode_grid(4, h_q, 4, 7, cc) == split_combine.DECODE_GRID_OFF
 
 
-def test_typed_declines_of_the_sparse_decode_mode():
-    """Every request the mode cannot serve, declined at DECLARATION with the feature named: the PACKED form over the pools (the
-    serving table's ``sparse`` row -- the core serves THD and paged pools one at a time), a block-table sample that is not
-    contiguous (the sparse core binds the whole ``(B, max_pages)`` table), a split past the item's tile count, ``max_kv_len``
-    past the table's reach, the bottom-right diagonal on the block's OWN K / V (the decode mode is the paged one), the in-block
-    indexer over the pools, the prepare fusion over the pools."""
+def test_typed_declines_of_the_sparse_decode_mode(monkeypatch):
+    """Every request the mode cannot serve, declined at DECLARATION with the feature named: the serving table's ``sparse`` row through a
+    record WITHOUT the THD x paged composition claim (INVERTED 2026-10-30: with the claim the packed form over the pools CONSTRUCTS -- the
+    packed sparse EXTEND form with caller lists, stage (4) the sparse core with ``thd`` and ``paged``, unsplit, one list per row; its own
+    module is ``test_block_qsa_packed_extend.py``), a block-table sample that is not contiguous (the sparse core binds the whole ``(B,
+    max_pages)`` table), a split past the item's tile count, ``max_kv_len`` past the table's reach, the bottom-right diagonal on the block's
+    OWN K / V (the decode mode is the paged one), the in-block indexer over the pools, the prepare fusion over the pools."""
+    import dataclasses
+
+    from cudnn.sdpa.fwd import sparse_gqa_sm107 as S
+
     name, exc, _pred, msg = _row("sparse")
     mk = lambda *shape: torch.empty(*shape, dtype=BF16, device=_DEV)  # noqa: E731
     geom, _ = _geom(GEOM_SMALL)
     kc, vc = _pools(4, 2, 16, "hnd", BF16)
-    with pytest.raises(exc, match="thd=True") as e:
-        GatedAttentionBlockFwd(
+
+    def packed():
+        return GatedAttentionBlockFwd(
             mk(32, geom.d_model),
             mk(geom.n_qkvg, geom.d_model),
             mk(D),
@@ -460,7 +468,15 @@ def test_typed_declines_of_the_sparse_decode_mode():
             sample_v_cache=vc,
             sample_block_table=torch.zeros(2, 4, dtype=torch.int32, device=_DEV),
         )
-    assert str(e.value) == msg and "one at a time" in msg
+
+    blk = packed()  # the composition claimed: the packed sparse EXTEND form constructs
+    assert isinstance(blk._sdpa, _SparseSdpa) and blk._sdpa.thd and blk._sdpa.paged and blk.sparse_decode and blk.decode_split_kv == 1
+    assert blk.qsa_list_form == "per_row" and not blk.qsa_shared_list and blk.sparse_tile == "sparse_d256_f16" and blk.decode_route is None
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(S, "SPARSE_CAPABILITIES", dataclasses.replace(S.SPARSE_CAPABILITIES, thd_paged_kv=False))
+        with pytest.raises(exc, match="thd=True") as e:
+            packed()
+    assert str(e.value) == msg and "thd_paged_kv" in msg
     wide = torch.zeros(2, 9, dtype=torch.int32, device=_DEV)[:, :4]  # a row slice of a wider table: not contiguous
     with pytest.raises(ValueError, match="CONTIGUOUS under QsaSpec"):
         _declare(GEOM_SMALL, 2, 1, n_pages=4, table=wide)
@@ -561,27 +577,52 @@ def _declare_indexer(geom_kw=GEOM_FLASH_NEXT, batch=1, s_q=1, *, page=16, n_page
     )
 
 
-def test_the_envelope_serves_the_sparse_decode_mode_and_declines_the_packed_form(monkeypatch):
+def test_the_envelope_serves_the_sparse_decode_mode_and_the_packed_extend_form(monkeypatch):
     """The static record a serving stack reads: on a Rubin reading a QsaSpec geometry with the bottom-right diagonal SERVES the
-    DECODE form (``sparse_core`` names stage (4); the requires spell the shared list and the per-token form) and declines the
-    EXTEND form with the table's ``sparse`` row (the very message the packed declaration raises); the top-left QsaSpec geometry
-    meets the ``diagonal`` row like a dense one; on this device the verdict reads the part."""
+    DECODE form (``sparse_core`` names stage (4); the requires spell the shared list and the per-token form) AND, since 2026-10-30, the
+    EXTEND form -- the packed sparse form with caller lists (``extend.sparse_core``, ``index_sources`` / ``index_list_forms`` /
+    ``sparse_tiles`` on the appended tail, the LSE written, no PDL stage, the ``thd_paged_*`` rows beside the table's); the table's
+    ``sparse`` row keeps its text in the declines and becomes the EXTEND verdict through a record without the composition claim (the very
+    message the packed declaration then raises); the top-left QsaSpec geometry meets the ``diagonal`` row like a dense one on both forms;
+    on this device the verdict reads the part."""
+    import dataclasses
+
     from cudnn.frost import buffers
+    from cudnn.sdpa.fwd import sparse_gqa_sm107 as S
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     geom, _ = _geom(GEOM_SMALL)
     env = GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=_SM107)
     assert isinstance(env.decode, DecodeEnvelope) and env.decode.served and env.decode.sparse_core and env.decode.reason is None
-    assert env.forms == ("decode",) and not env.extend.served and env.extend.reason == _row("sparse")[3]
+    assert env.forms == ("extend", "decode") and env.extend.served and env.extend.reason is None and env.extend.sparse_core
+    assert env.extend.index_sources == ("caller",) and env.extend.index_list_forms == ("per_row",) and env.extend.sparse_tiles == ("sparse_d256_f16",)
+    assert env.extend.writes_lse and env.extend.pdl_stages == () and any("decode_split_kv None" in r for r in env.extend.requires)
     assert any("[B, top_k]" in r for r in env.decode.requires) and any("[B, S_q, top_k]" in r for r in env.decode.requires)
     assert env.decode.routes == () and "sparse" not in env.decode.declines and env.extend.declines["sparse"] == _row("sparse")[3]
+    assert {k for k in env.extend.declines if k.startswith("thd_paged_")} == {
+        "thd_paged_select_form",
+        "thd_paged_split",
+        "thd_paged_lean",
+        "thd_paged_shared_list",
+        "thd_paged_pdl",
+        "thd_paged_fuse_prepare",
+        "thd_paged_e4m3_pool",
+        "thd_paged_indexer",
+    }
     top_left = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**GEOM_SMALL, qsa=QsaSpec()), BF16, _DEV, device_cc=_SM107)
     assert not top_left.decode.served and top_left.decode.reason == _row("diagonal")[3] and top_left.decode.sparse_core  # a geometry fact, served or not
+    assert not top_left.extend.served and top_left.extend.reason == _row("diagonal")[3] and top_left.extend.sparse_core and top_left.forms == ()
     dense = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**GEOM_SMALL, causal_bottom_right=True), BF16, _DEV, device_cc=_SM107)
     assert dense.decode.served and not dense.decode.sparse_core and dense.decode.routes
+    assert dense.extend.served and not dense.extend.sparse_core and dense.extend.index_sources == () and dense.extend.sparse_tiles == ()
+    assert not any(k.startswith("thd_paged_") for k in dense.extend.declines), "a dense geometry's record carries the table's rows alone"
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(S, "SPARSE_CAPABILITIES", dataclasses.replace(S.SPARSE_CAPABILITIES, thd_paged_kv=False))
+        declined = GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=_SM107)
+    assert declined.forms == ("decode",) and not declined.extend.served and declined.extend.reason == _row("sparse")[3] and declined.extend.sparse_core
     monkeypatch.undo()
     here = GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV)
-    assert here.decode.served is (_cc() == _SM107 and here.cutedsl_ok)
+    assert here.decode.served is (_cc() == _SM107 and here.cutedsl_ok) and here.extend.served is (_cc() == _SM107 and here.cutedsl_ok)
 
 
 def test_execute_form_checks_of_the_sparse_decode_mode():

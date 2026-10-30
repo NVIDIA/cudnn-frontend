@@ -331,7 +331,9 @@ Served today:
   place like O; validated on Rubin: the gated packed block within one rounding of the activation dtype of the unfused packed
   block on O, the LSE bitwise). Not under `thd`: the in-block indexer (the scorer reads dense `[B, S]` prompts) -- a typed
   decline naming the feature. The paged write-through composes with the packed sparse block (the stage addresses tokens; the
-  packed write-through cell of the end-to-end module).
+  packed write-through cell of the end-to-end module), and so does the paged READ since 2026-10-30: `kv_source="paged"` on a packed
+  `QsaSpec` declaration is the packed block-sparse EXTEND form -- one execute for a mixed serving step of decode rows and prefill
+  chunks behind their cached prefixes ("The packed block-sparse EXTEND form" under "Serving: the extend form" below).
 - the in-block indexer: a block declared `QsaSpec(index_source="indexer", index_band=True)` derives the selection itself from
   the band -- `execute(..., w_iq_norm=, w_ik_norm=)` instead of `block_ids=` -- and hands it back through the optional
   `block_ids_out` / `block_lens_out` / `index_k_compressed`; the contract is "The in-block indexer" in the serving section
@@ -1115,7 +1117,7 @@ and `serving_envelope().extend.pdl_stages` says so before anything is declared.
 
 | appended | contract |
 |---|---|
-| `kv_source` | `"self"` (default) or `"paged"`; `"paged"` requires `paged_kv_page_size > 0`, `thd=True`, `geometry.is_causal=True` and `geometry.causal_bottom_right=True`, bf16 / f16 activations (`quant=None`) or the FP8-projection + bf16-attention mode (`QuantSpec(attention_dtype=torch.bfloat16)`, e4m3 `h` / weights, bf16 pools), inference (`save_for_backward=False`), `return_lse=False`, `fuse_gate` as declared (`True` folds stage (5) into the paged SDPA's epilogue), `window_left=-1`, `window_right` unbounded or 0, no `QsaSpec`, `d_head=256`; every other combination is a typed decline naming the feature (`GatedAttentionBlockFwd.serving_envelope` lists them) |
+| `kv_source` | `"self"` (default) or `"paged"`; `"paged"` requires `paged_kv_page_size > 0`, `thd=True`, `geometry.is_causal=True` and `geometry.causal_bottom_right=True`, bf16 / f16 activations (`quant=None`) or the FP8-projection + bf16-attention mode (`QuantSpec(attention_dtype=torch.bfloat16)`, e4m3 `h` / weights, bf16 pools), inference (`save_for_backward=False`), `return_lse=False`, `fuse_gate` as declared (`True` folds stage (5) into the paged SDPA's epilogue), `window_left=-1`, `window_right` unbounded or 0, `d_head=256`; a bottom-right `QsaSpec(index_source="caller")` geometry declares the packed block-sparse EXTEND form instead (its own paragraph below: bf16 / f16, `return_lse` served, `decode_split_kv` None, `use_pdl` None / False); every other combination is a typed decline naming the feature (`GatedAttentionBlockFwd.serving_envelope` lists them) |
 | `token_capacity` | THD only; `None` = the tight contract (lengths sum to `T`), an int = the BOUNDED form and must equal the samples' packed row count `T`: a step's lengths may sum to `T_live <= T`; rows `[T_live, T)` are pad rows -- finite `h` / `cos` / `sin`, slot `-1` (never written to the cache), never attended; their `out` rows are UNSPECIFIED but finite given finite inputs. Zero the workspace once and slice `out[:T_live]`: an unwritten `o` row then reads `0`, so pad rows of `out` are exactly `0` until a later, longer step overwrites those `o` rows (the `o` slot is aliased by no other stage's scratch -- pinned). Refused with `save_for_backward` (the backward's weight-gradient GEMMs contract over every row) |
 | `sample_k_cache`, `sample_v_cache`, `sample_block_table` | REQUIRED under `kv_source="paged"`, refused otherwise: the pools' `[num_pages, H_kv, P, D]` shape / dtype / strides (the three stride patterns of the write-through, K and V of one HND / NHD kind, every non-innermost stride a 16-byte multiple) and the `[num_sequences, max_pages]` int32 block table (its row stride is free -- a `[:, :max_pages]` slice of a wider table -- and compiled in); the logical `S_kv` the tables may address is `max_pages * P` |
 | `block_table` (execute) | `[num_sequences, >= max_pages]` int32 on `h`'s device, the page axis contiguous, the row stride as declared; row `b` lists sequence `b`'s pages in logical order (the serving stacks' NULL block `0` for a padded entry); read on device |
@@ -1142,6 +1144,51 @@ KV head -- the table under "Qwen3.8 family" above) each with one EXTEND step at 
 pages -- the rows of the support-matrix
 tracker's `Rubin d256 gated attention block -- serving forms` section; the standalone adapter's own paged-prefill contract applies to the
 pools (`docs/operations/Attention.md`, "Paged attention").
+
+**The packed block-sparse EXTEND form (`QsaSpec` with caller lists; 2026-10-30).**  `kv_source="paged"` on a PACKED declaration of a
+bottom-right `QsaSpec(index_source="caller")` geometry is the sparse core's THD x PAGED x BOTTOM_RIGHT composition: ONE execute serves a
+mixed serving step -- decode rows beside prefill chunks of any length, every sequence behind its cached prefix, in ANY sequence order.
+Stage (4) is the index-list sparse core reading the pools: row `j` of sequence `b` at position `kv_lens[b] - q_len_b + j`, the listed
+4-token blocks of its OWN sequence (`block_ids` `[T, top_k]` / `[1, T, top_k]` int32, sequence-relative ids, one list per packed row;
+`block_lens` optional) plus the open tail over `[0, kv_lens[b])` through `block_table[b]`, unsplit (the packed form's claim-counter
+scheduler has no split axis: `decode_split_kv` stays `None`), the gate in the core's epilogue (`fuse_gate=True`) or its own launch, the
+LSE served (`return_lse=True`: `[1, H_q, T]` fp32, head-major packed).  `execute(seq_lens=)` is the Q side (`[B_max]` lengths or
+`[B_max + 1]` prefix sums per `cu_seqlens`), `kv_lens` the KV side (`[B_max]`: each sequence's LOGICAL length INCLUDING this step's
+tokens; `0` = a dead entry whose rows, if any, are `out = 0` / `LSE = -inf`; a sequence shorter than its chunk leaves its rows at a
+negative position dead), `block_table` EXACTLY the declared table (`sample_block_table` CONTIGUOUS, one row per sequence of the packing
+-- never Q's batch extent of 1), `token_capacity` optional (`None` = the tight contract; the BOUNDED form is the serving contract: the
+CAPACITY launch over the `T` rows with the pad rows' slot `-1`, their `out` rows exactly 0 on the once-zeroed workspace; the live-count
+launch `num_tokens_live` where the dense projections resolve a JIT tile).  Device-value contract (reported, never raised):
+`kv_lens[b]` in `{0}` or `[q_len_b, max_pages x P]`.  Typed declines, each raised with EXACTLY the text of its `extend.declines` row:
+`thd_paged_select_form` (`index_select_form` other than `"auto"`), `thd_paged_split` (`decode_split_kv`), `thd_paged_lean`
+(`sparse_tile_form="lean"`: the lean tile has no claim-counter form), `thd_paged_shared_list` (`index_list_form="shared"`: no meaning over
+ragged packed rows), `thd_paged_pdl` (`use_pdl=True`), `thd_paged_fuse_prepare`, `thd_paged_e4m3_pool` (`kv_cache_dtype=torch.float8_e4m3fn`),
+`thd_paged_indexer` (`index_source="indexer"` on the packed form is a follow-up: hand the selection in under caller lists, or run the
+dense extend step per chunk-length group); the table's `sparse` row stays reachable through a sparse-adapter record without the
+composition claim (`SparseCapabilities.thd_paged_kv`).  The envelope reads `extend.sparse_core`, `extend.index_sources == ("caller",)`,
+`extend.index_list_forms == ("per_row",)`, `extend.sparse_tiles == ("sparse_d256_f16",)`, `extend.writes_lse` and `extend.pdl_stages ==
+()` (the appended tail of `ExtendEnvelope`; a dense geometry reads the defaults), and `extend.requires` spells the form.  Where the
+geometry alone refuses the packed form (`index_list_form="shared"`, `index_source="indexer"`) the envelope's verdict is the declaration's:
+`extend.served` is `False` with that row's text as `extend.reason`, `"extend"` is absent from `forms` and `extend.sparse_tiles` is empty
+(the geometry's DECODE record is its own).  A CUDA-graph
+capture takes the block after ONE eager warm-up on the capture stream (the first execute may create the projection route's per-stream
+state); the replay then serves new lengths / tables / lists / slots / pools through the captured tensors.  TWO-RUN EQUIVALENCE: the
+step computes the same function as a dense `[B_dec, S_q]` decode block plus one dense `[1, T]` paged QsaSpec block per chunk over the
+same pools -- per row BITWISE where the dense control runs the sparse core unsplit (`decode_split_kv == 1`, read back from the control)
+and its slab GEMM takes the same projection route (both past the small-M bound of 128 rows), within the sparse modules' bars (`cos(out) >
+0.999`, the gated O inside the bf16 / f16 OUTPUT bound, the LSE within `atol 2e-2`) otherwise -- the class follows from the control's
+resolution, never from a measurement.  No kernel body changed for the form: the composition is the three `const_expr` arms' disjoint
+facts (the item decode, the gather row, the position); the barrier bundle, the SMEM / TMEM maps and every arrive count are the dense
+arm's.  The cells: `test/python/gated_attention_block/cutedsl/test_block_qsa_packed_extend.py` (the mixed step vs the two-run form at
+the 8 / 2 and 24 / 2 geometries, pages 16 / 64 on HND / NHD / unified pools, bf16 and f16; the fill-rule boundary; any order; the
+degenerate rows at every residue; the capacity and live-count launches; the workspace / allocation / census pins; the capture) and the
+adapter's own in `test/python/sdpa/frost/test_sdpa_fwd_sparse_sm107.py` (every sequence of a packing bitwise the dense `[1, q_len_b]`
+paged bottom-right per-row run).  Validated on a Rubin development node (cc 10.7, 204 SMs; functional cells, no performance claim): the
+block module's 23 cells -- the 300-row chunk of the mixed step BITWISE its dense control (the control resolved the core at split 1 on the
+forced-tile route), the 128- and 160-row chunks and every decode group within the bars (their controls resolved splits 3 / 6 / 9 / 16, or
+the lean tile at one row per sequence), the gated O within 0.31 of the output bound and the LSE within 3.7e-4 of the oracle on every cell --
+and the adapter's 113 cells of the composition (every sequence bitwise its dense control; `max|dO|` 0.011 bf16 / 0.0012 f16, `max|dLSE|`
+2e-6 vs the oracle).  Functional only: the one-execute measurement against the two-run form follows.
 
 ### Serving: the decode form (`kv_source="paged"` on a dense `[B, S_q]` block)
 
@@ -1342,7 +1389,8 @@ under every value, measured or not -- so a replaying stack whose optimum differs
 `GatedAttentionBlockFwd.serving_envelope(geometry, dtype, device) -> ServingEnvelope` is the STATIC record a serving stack
 reads at construction instead of catching exceptions: the forms served (`forms`, drawn from `extend` / `decode`) and one record
 per form (`extend`: `ExtendEnvelope`, `decode`: `DecodeEnvelope` -- `served`, the `reason` it would decline with, every typed
-decline of the form in `declines`), `page_sizes` (16 / 32 / 64 / 128), `pool_layouts` (the three stride patterns), the decode
+decline of the form in `declines`; the EXTEND record's appended tail on a `QsaSpec` geometry -- `sparse_core`, `index_sources`,
+`index_list_forms`, `sparse_tiles`, 2026-10-30), `page_sizes` (16 / 32 / 64 / 128), `pool_layouts` (the three stride patterns), the decode
 route per `(group, S_q)` (`decode.routes` for `S_q` 1 .. 33 -- the served envelope and its first decline --, `decode.route(s_q)`
 for any step, `decode.max_s_q` = `decode.max_rows` = 32 / `decode.claimed_max_s_q` = 4, `decode.policy` / `decode.q_tile_max`; the
 policy and the width cap the record reads are `serving_envelope(..., decode_route_policy=, decode_q_tile_max=)`'s), the pool dtypes (`dtypes`: bf16 / f16 -- an e4m3 pool is not served), the part and the CuTe DSL facts
@@ -1377,9 +1425,10 @@ exactly that table -- a row slice of a wider table is a typed `ValueError`); `re
 natural log); `fuse_gate` is served at every split (the core's epilogue unsplit, the split combine otherwise); `decode_split_kv`
 is `None` (the fill rule: `ceil(SMs / (B x H_kv x S_q))` chunks, at most `min(16, ceil((top_k + 1) / 32))` -- the cap from the B 1 / B 4 x 32K x S_q 1 split sweeps on a 212-SM part with the pinned decode-grid combine; where that fill leaves a second wave of SMs (`B x H_kv x S_q x split > SMs`: a CTA streams its chunk serially, so 256 equal items on 212 SMs cost two item durations) the wave rule takes the split in `[1, that cap]` with the fewest `waves x (tiles per chunk + 1)`, ties to the smaller -- on a 212-SM part the T 128 step 3 chunks instead of none, B 32 x S_q 1 3 instead of 4, B 4 x S_q 4 6 instead of 7, every one-wave launch its fill-rule split) or an int in
 `[1, ceil((top_k + 1) / 32)]` -- the one performance knob (fp32 partials inside `get_workspace_size()`, one combine launch), the
-same function under every value; `max_kv_len` keeps its contract (at most the table's reach).  Typed declines: the packed
-(`thd=True`) form (the serving table's `sparse` row: the sparse core serves packed sequences and paged pools one at a time), the
-a split past the item's tile count, `causal_bottom_right` on the block's OWN K / V (`kv_source="self"`); the in-block indexer over the
+same function under every value; `max_kv_len` keeps its contract (at most the table's reach).  Typed declines: a split past the
+item's tile count, `causal_bottom_right` on the block's OWN K / V (`kv_source="self"`); the packed (`thd=True`) form over the pools
+is the packed block-sparse EXTEND form since 2026-10-30 ("Serving: the extend form" above; the serving table's `sparse` row stays
+reachable through a sparse-adapter record without the composition claim); the in-block indexer over the
 pools (`index_source="indexer"`) and `fuse_prepare` on this mode are SERVED since 2026-10-21 (the next paragraph).  The envelope's
 `decode.sparse_core` names the stage, `decode.requires` spells both list forms, `decode.routes` is empty (the dense tile's facts
 do not apply).  **Two bodies, one function (`sparse_tile_form`, the knobs table above):** the sparse core is the tcgen05 tile
@@ -1494,11 +1543,12 @@ compress's blocks past the table report `-2`); never raised, never read by the b
 from-scratch compress and bitwise a decode-written row of the same four keys -- one chain under either rounding convention (`"single"` the
 reference; `"hf"` the HF / vLLM rounding points, not their bits, for a stack that mixes vLLM-written rows; the attribute is a compile key
 of every writer -- the prefill form, the chunk form, the decode step unfused and fused -- and the multi-step cell runs under both values).
-MIXED STEPS (the interim
-contract until the packed sparse arm): a serving step with decodes AND prefills is TWO plans per layer -- the decode step at `S_q <= 16`
-and the extend step at `S_q = T` -- executed back to back on one stream (disjoint sequences, the order free); ragged chunks are several
-extend executes grouped by `T` (front-padding a shorter chunk into a uniform `T` would pool garbage raw keys into prefix groups, which the
-block cannot detect).  The workspace carve is the caller-list band block's plus nine slots at the end (the queries, the slot report, the
+MIXED STEPS under the in-block
+indexer: a serving step with decodes AND prefills is TWO plans per layer -- the decode step at `S_q <= 16` and the extend step at `S_q =
+T` -- executed back to back on one stream (disjoint sequences, the order free); ragged chunks are several extend executes grouped by `T`
+(front-padding a shorter chunk into a uniform `T` would pool garbage raw keys into prefix groups, which the block cannot detect).  With
+CALLER lists the same step is ONE execute of the packed block-sparse EXTEND form (`thd=True` + `kv_source="paged"`, 2026-10-30; "Serving:
+the extend form" above) -- the indexer's packed form is the follow-up that brings the one-execute step to the in-block selection.  The workspace carve is the caller-list band block's plus nine slots at the end (the queries, the slot report, the
 dense kbar `[B, max_pages x P / 4, 128]`, the piece positions, the counts, the report, the ids, the scores, the window scratch `R x
 max_pages x P / 4` fp32 -- 256 MiB at B 1 x T 2048 behind 128K; `get_workspace_size()` holds all of it).  The first execute of a fresh plan
 uploads the window plan's constants, so a CUDA-graph capture takes the block after ONE eager warm-up (the prefill form's rule; the decode
