@@ -1203,8 +1203,9 @@ def _dense_chain(m, k, n):
     """The engine's analyzed view of the graph ``build_proj_gemm`` declares for a dense bf16 ``[m, k] x [k, n]`` (the same tensors, strides and
     output dtype), validated and built on the host -- no backend plan, no kernel; what ``_baseline_config`` / ``_auto_split_k`` read."""
     import cudnn
-    import cudnn.gemm.frost  # noqa: F401  (the op-recording hook the analyzer reads the graph through)
-    from cudnn.gemm.frost.graph_analyzer import analyze
+    from cudnn.gemm.frost.graph_analyzer import (
+        analyze,
+    )  # importing the submodule loads the package (the op-recording hook the analyzer reads the graph through)
 
     g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     a = g.tensor(name="A", dim=[1, m, k], stride=[m * k, k, 1])
@@ -1301,7 +1302,9 @@ def test_large_m_rule_keeps_the_small_m_rows_the_256_grid_and_the_off_grid_shape
     bf16 = dict(dtype=torch.bfloat16, sm_count=_RUBIN_SMS)
     for m in (1, 4, 32, 64, 128):
         assert large_m_tile_config(m, _BAND_N, _BAND_K, **bf16) is None
-        assert _auto_tile_name(m, _BAND_N, _BAND_K, **_KW_DENSE, sm_count=_RUBIN_SMS) == small_m_tile_config(m, _BAND_N, _BAND_K, **bf16) is not None
+        small_name = small_m_tile_config(m, _BAND_N, _BAND_K, **bf16)
+        assert small_name is not None
+        assert _auto_tile_name(m, _BAND_N, _BAND_K, **_KW_DENSE, sm_count=_RUBIN_SMS) == small_name
     for m in (129, 256, 8192):
         assert large_m_tile_config(m, _FLASH_NEXT_24_2["n_qkvg"], _BAND_K, **bf16) is None  # 13312: the forced tile's grid
         assert _auto_tile_name(m, _FLASH_NEXT_24_2["n_qkvg"], _BAND_K, **_KW_DENSE, sm_count=_RUBIN_SMS) == _FORCED_TILE_NAME
@@ -1363,10 +1366,12 @@ def test_large_m_rule_resolves_without_the_planner_module(monkeypatch):
     (``gemm/frost/planning.py``), where an import of it would be a bare ``ModuleNotFoundError`` at declaration, never a typed decline.  With the
     planner module made unimportable in this process the large-M rule, the small-M route and ``_auto_tile_name`` still resolve the band slab at
     every row count, and the rule still reads the envelope (the planner-claimed shape keeps the graph route)."""
+    import importlib
     import sys
 
-    import cudnn.gemm.frost as frost_pkg
     from cudnn.gemm.frost import arch_family
+
+    frost_pkg = importlib.import_module("cudnn.gemm.frost")
     from cudnn.gemm.frost.tile_config import select_config
     from cudnn.gated_attention_block.kernels.proj_gemm import _auto_tile_name
 
@@ -1379,7 +1384,9 @@ def test_large_m_rule_resolves_without_the_planner_module(monkeypatch):
     for m in (129, 256, 2048, 8192):
         assert large_m_tile_config(m, _BAND_N, _BAND_K, **bf16) == select_config(m, _BAND_N, 1, K=_BAND_K, sm_count=_RUBIN_SMS).name
         assert _auto_tile_name(m, _BAND_N, _BAND_K, **_KW_DENSE, sm_count=_RUBIN_SMS) == large_m_tile_config(m, _BAND_N, _BAND_K, **bf16)
-    assert _auto_tile_name(64, _BAND_N, _BAND_K, **_KW_DENSE, sm_count=_RUBIN_SMS) == small_m_tile_config(64, _BAND_N, _BAND_K, **bf16) is not None
+    small_name_64 = small_m_tile_config(64, _BAND_N, _BAND_K, **bf16)
+    assert small_name_64 is not None
+    assert _auto_tile_name(64, _BAND_N, _BAND_K, **_KW_DENSE, sm_count=_RUBIN_SMS) == small_name_64
     assert large_m_tile_config(256, 640, 2048, **bf16) is None  # the planner-claimed shape keeps the graph route, read off the envelope
 
 
