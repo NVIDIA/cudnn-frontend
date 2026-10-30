@@ -796,7 +796,7 @@ def __getattr__(name: str) -> Any:
     if name == "jax":
         # `import cudnn; cudnn.jax.call` works like `import cudnn.jax`.
         # Deferred so torch-only users never pay the jax import (the submodule
-        # itself raises a descriptive ImportError when jax >= 0.5 is missing).
+        # itself raises a descriptive ImportError when jax >= 0.6.0 is missing).
         _jax = importlib.import_module(".jax", __name__)
         globals()["jax"] = _jax
         return _jax

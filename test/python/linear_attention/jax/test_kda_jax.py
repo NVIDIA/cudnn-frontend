@@ -8,7 +8,8 @@ from functools import partial
 
 import pytest
 
-from cudnn.frost.buffers import JAX_MIN_CUTEDSL_VERSION, cutedsl_requirement_error
+from cudnn._jax_requirements import JAX_MIN_CUTEDSL_VERSION
+from cudnn.frost.buffers import cutedsl_requirement_error
 
 requirement_error = cutedsl_requirement_error("JAX KDA tests", min_version=JAX_MIN_CUTEDSL_VERSION)
 if requirement_error:

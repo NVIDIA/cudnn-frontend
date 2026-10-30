@@ -167,7 +167,7 @@ def test_discrete_grouped_gemm_dswiglu_jax_jit_matches_eager():
     import cutlass.jax
 
     if not cutlass.jax.is_available():
-        pytest.skip("CuTeDSL JAX extensions unavailable (jax >= 0.5 required)")
+        pytest.skip("CuTeDSL JAX extensions unavailable (jax >= 0.6.0 required)")
     skip_unless_sm100()
     from cudnn import discrete_grouped_gemm_dswiglu_jax_sm100, discrete_grouped_gemm_dswiglu_wrapper_sm100
 

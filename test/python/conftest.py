@@ -431,7 +431,8 @@ def _jax_compiles_for_this_device():
 def _skip_unavailable_jax_tests(items):
     if not any(item.fspath.basename.endswith("_jax.py") for item in items):
         return  # do not pay for the probe on runs with no JAX tests
-    from cudnn.frost.buffers import JAX_MIN_CUTEDSL_VERSION, cutedsl_requirement_error
+    from cudnn._jax_requirements import JAX_MIN_CUTEDSL_VERSION
+    from cudnn.frost.buffers import cutedsl_requirement_error
 
     requirement_error = cutedsl_requirement_error("JAX tests", min_version=JAX_MIN_CUTEDSL_VERSION)
     if requirement_error is None and _jax_compiles_for_this_device():
