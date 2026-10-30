@@ -22,7 +22,7 @@ EQUAL to the envelope's row (the step form of the indexer, the split, the lean t
 pool, the in-block indexer; the table's record-driven ``sparse`` row through a record without the composition claim); the execute-time
 form checks on an UNCOMPILED block under ``set_sync_debug_mode("error")``.
 
-Rubin cells (``requires_rubin``): the P1 mixed step at test scale -- decode rows beside a chunk -- in ONE packed execute against the
+Rubin cells (``requires_rubin``): the mixed serving step at test scale -- decode rows beside a chunk -- in ONE packed execute against the
 TWO-RUN form (a dense ``[B_dec, S_q]`` paged QsaSpec block for the decodes and a dense ``[1, T]`` paged QsaSpec block for the chunk over
 the SAME weights / pools / table rows / lists, the pools restored to their prefix-only state between runs): the chunk rows BITWISE
 (``out``, the gated O, the LSE, the written pool rows) WHERE the control resolved ``decode_split_kv == 1`` (read back, never assumed) AND
@@ -887,7 +887,7 @@ def _groups(case: _PackedCase):
     return by
 
 
-# the P1 mixed step at test scale: (id, geometry, seqs (q_len, kv_len) per sequence id, dtype, page, layout, return_lse, block_lens, seed)
+# the mixed serving step at test scale: (id, geometry, seqs (q_len, kv_len) per sequence id, dtype, page, layout, return_lse, block_lens, seed)
 _MIXED = [
     pytest.param(
         "decodes-and-a-300-chunk",
@@ -943,7 +943,7 @@ _MIXED = [
 @requires_rubin
 @pytest.mark.parametrize("name, geom_kw, seqs, dtype, page, layout, return_lse, block_lens, seed", _MIXED)
 def test_packed_sparse_extend_matches_the_two_run_form_per_sequence(name, geom_kw, seqs, dtype, page, layout, return_lse, block_lens, seed):
-    """The P1 mixed step at test scale in ONE packed execute vs the TWO-RUN form (one dense paged QsaSpec block per Q-length group over the
+    """The mixed serving step at test scale in ONE packed execute vs the TWO-RUN form (one dense paged QsaSpec block per Q-length group over the
     same weights / pools / table rows / lists): every row within the suite's bars of the fp32 oracle per sequence, two launches bitwise; per
     group the parity class the control's RESOLUTION predicts -- BITWISE where the control runs unsplit on the packed block's projection
     route, READING B otherwise -- asserted, never discovered; then, where bitwise is the claim, the control's split PINNED to 1 and the
@@ -982,7 +982,7 @@ def test_packed_sparse_extend_matches_the_two_run_form_per_sequence(name, geom_k
 
 @requires_rubin
 def test_packed_sparse_extend_fill_rule_boundary_cells_assert_their_class():
-    """CRITIQUE G2 at the live SM count: three chunk lengths whose dense control resolves a DIFFERENT split under the fill / wave rule (the
+    """The fill-rule boundary at the live SM count: three chunk lengths whose dense control resolves a DIFFERENT split under the fill / wave rule (the
     values READ from ``sparse_decode_split_choice`` at this device's SM count, never hard-coded): the class each predicts (bitwise at
     split 1 on the shared route, READING B otherwise) is asserted per cell, so a flip of the rule flips an assertion rather than a
     discovered mismatch."""
