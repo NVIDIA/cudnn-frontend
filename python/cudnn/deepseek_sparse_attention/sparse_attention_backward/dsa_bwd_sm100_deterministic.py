@@ -518,6 +518,7 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
         head_block_idx: Int32,
         problem_shape: Tuple[Int32, Int32, Int32, Tuple[Int32, Int32]],
     ):
+        """Import predecessor releases before reducers update one dKV tile."""
         tidx, _, _ = cute.arch.thread_idx()
         _, _, batch_idx = cute.arch.block_idx()
         tidx_in_wg = tidx - self.reduce_warp_id[0] * self.threads_per_warp
@@ -553,6 +554,7 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
         head_block_idx: Int32,
         problem_shape: Tuple[Int32, Int32, Int32, Tuple[Int32, Int32]],
     ):
+        """Publish one dKV tile before later cluster ranks acquire it."""
         tidx, _, _ = cute.arch.thread_idx()
         _, _, batch_idx = cute.arch.block_idx()
         tidx_in_wg = tidx - self.reduce_warp_id[0] * self.threads_per_warp
