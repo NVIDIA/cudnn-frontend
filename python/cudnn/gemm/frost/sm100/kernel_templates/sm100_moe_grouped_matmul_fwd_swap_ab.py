@@ -1,6 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
+# SM100-family MoE NONE/SCATTER/COMBINE; GATHER uses its dedicated template.
+
 """SM100 MoE weight-by-token matmul with grouped N scheduling."""
 
 from __future__ import annotations
@@ -16,8 +18,6 @@ from cudnn.gemm.frost.tile_helpers import (
     moe_scatter_row,
     moe_combine_add,
     tma_scatter4,
-    moe_cache_token_indices,
-    tma_gather4,
     copy_tensormap_to_workspace as _copy_tensormap_to_workspace,
     epi_subtile_spans as _epi_subtile_spans,
     fence_tensormap_acquire as _fence_tensormap_acquire,
@@ -284,11 +284,6 @@ def _kernel(
         alignment=128,
     )
     # @@TMA_STORE_ONLY:END@@
-
-    gather_token_indices = [
-        cutlass.Array(cutlass.Int32, ((gather_token_rows + 31) // 32) * 32, space=cutlass.AddressSpace.smem, alignment=128)
-        for _ in range(1 if moe_gather else 0)
-    ]
 
     if cutlass.const_expr(cta_group == 2):
         ab_empty_count = cluster_size // cta_group if cutlass.const_expr(ab_empty_full_mask) else (cluster_m // cta_group) + cluster_n - 1
@@ -563,11 +558,11 @@ def _kernel(
             for _bj in range(num_b_operands)
         ]
         previous_group_begin = cutlass.Int32(-1)
-        if cutlass.const_expr(moe_gather or moe_aligned_offsets):
+        if cutlass.const_expr(moe_aligned_offsets):
             b_desc_load_list = [tma_b_descs[_bj].get_ptr() for _bj in range(num_b_operands)]
         else:
             b_desc_load_list = b_desc_tma_ptr_list
-        if elect_one and cutlass.const_expr(not moe_gather and not moe_aligned_offsets):
+        if elect_one and cutlass.const_expr(not moe_aligned_offsets):
             for _bj in cutlass.range_constexpr(num_b_operands):
                 _copy_tensormap_to_workspace(tma_b_descs[_bj].get_ptr(), tma_b_desc_smem_list[_bj])
         nvvm.bar_warp_sync(0xFFFFFFFF)
@@ -604,7 +599,7 @@ def _kernel(
                     coord_n_desc = coord_n_group
                 coord_n_per_cta = coord_n_desc + pair_member * cta_tile_mnk[1]
 
-                if group_begin != previous_group_begin and cutlass.const_expr(not moe_gather and not moe_aligned_offsets):
+                if group_begin != previous_group_begin and cutlass.const_expr(not moe_aligned_offsets):
                     previous_group_begin = group_begin
                     for _bj in cutlass.range_constexpr(num_b_operands):
                         _fence_tensormap_acquire(b_desc_tma_ptr_list[_bj])
@@ -618,19 +613,6 @@ def _kernel(
                             (cta_desc_base_list[_bj] + lane).store((tma_b_desc_smem_list[_bj].subview(lane)).load())
                         nvvm.bar_warp_sync(0xFFFFFFFF)
                         _fence_tensormap_release()
-
-                if cutlass.const_expr(moe_gather):
-                    gather_row_offset = cutlass.Int32(0)
-                    if cutlass.const_expr(b_mcast_slices > 1):
-                        gather_row_offset = pair_m_idx * gather_token_rows
-                    moe_cache_token_indices(
-                        gather_token_indices[0],
-                        token_index,
-                        group_begin + coord_n_group + pair_member * cta_tile_mnk[1] + gather_row_offset,
-                        group_end,
-                        mB_list[0].shape[0],
-                        gather_token_rows,
-                    )
 
                 for k_tile_idx in range(num_k_tiles):
                     stage = ab_iter % ab_stages
@@ -701,37 +683,16 @@ def _kernel(
                     if b_data_issue:
                         for _bj in cutlass.range_constexpr(num_b_operands):
                             sB_stage = smem_b_list[_bj].subview(sB_elems * stage)
-                            if cutlass.const_expr(moe_gather):
-                                for _bn in cutlass.range(cta_tile_mnk[1] // b_mcast_slices // 4, unroll_full=True):
-                                    if elect_one:
-                                        row = _bn * 4
-                                        r0 = gather_token_indices[0].subview(row).load()
-                                        r1 = gather_token_indices[0].subview(row + 1).load()
-                                        r2 = gather_token_indices[0].subview(row + 2).load()
-                                        r3 = gather_token_indices[0].subview(row + 3).load()
-                                        tma_gather4(
-                                            sB_stage.subview((_b_off + _bn * 4) * cta_tile_mnk[2]),
-                                            b_desc_load_list[_bj],
-                                            coord_k,
-                                            r0,
-                                            r1,
-                                            r2,
-                                            r3,
-                                            ab_full_mbar_ptr.subview(stage),
-                                            tma_mcast_mask_b,
-                                            cta_group,
-                                        )
-                            else:
-                                if elect_one:
-                                    nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                        sB_stage.subview(_b_off * cta_tile_mnk[2]),
-                                        b_desc_load_list[_bj],
-                                        (coord_k, coord_n_per_cta + _b_off, cutlass.Int32(0)),
-                                        ab_full_mbar_ptr.subview(stage),
-                                        [],
-                                        multicast_mask=tma_mcast_mask_b,
-                                        group=_CTA_GROUP,
-                                    )
+                            if elect_one:
+                                nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                    sB_stage.subview(_b_off * cta_tile_mnk[2]),
+                                    b_desc_load_list[_bj],
+                                    (coord_k, coord_n_per_cta + _b_off, cutlass.Int32(0)),
+                                    ab_full_mbar_ptr.subview(stage),
+                                    [],
+                                    multicast_mask=tma_mcast_mask_b,
+                                    group=_CTA_GROUP,
+                                )
                     ab_iter += 1
 
         tail_stage = ab_iter % ab_stages
@@ -1387,14 +1348,9 @@ def _host(
     tma_b_desc_list = []
     for _b_idx, _b_op in enumerate(_b_operands):
         b_stride_n, b_stride_k, b_stride_l = _b_stride_sets[_b_idx]
-        if cutlass.const_expr(moe_gather):
-            b_dims = [k_sym, _b_op.shape[0]]
-            b_strides = [b_stride_n * ab_dtype.width // 128]
-            b_box = [cta_tile_mnk[2], 1]
-        else:
-            b_dims = [k_sym, n, 1]
-            b_strides = [b_stride_n * ab_dtype.width // 128, b_stride_l * ab_dtype.width // 128]
-            b_box = [cta_tile_mnk[2], cta_tile_mnk[1] // b_mcast_slices, 1]
+        b_dims = [k_sym, n, 1]
+        b_strides = [b_stride_n * ab_dtype.width // 128, b_stride_l * ab_dtype.width // 128]
+        b_box = [cta_tile_mnk[2], cta_tile_mnk[1] // b_mcast_slices, 1]
         tma_b_desc_list.append(
             _tma.create_tensor_map_tiled(
                 global_address=_b_op.iterator.toint(),
@@ -1445,7 +1401,7 @@ def compile() -> Callable:
     sym_k = cute.sym_int64()
     sym_e = cute.sym_int64()
     sym_g = cute.sym_int64()
-    sym_source_n = cute.sym_int64() if moe_gather else sym_n
+    sym_source_n = sym_n
 
     def _make_fake_a():
         return make_fake_compact_tensor(

@@ -1157,7 +1157,10 @@ def _emit_block_quant_row(
         )
     elif quant.grouped_by_moe:
         lines.extend([f"{p}_local_row = row - group_begin", f"{p}_ncb = ((N // {bs}) + 3) // 4", f"{p}_base = start_sf_block_m * {p}_ncb * 512"])
+    vector_scales = not swapped and output_dtype == "fp4_e2m1" and bs == 16 and n_sub == 4 and quant.scale_reorder == "F8_128x4"
+    scalar_scale_indices: list[list[str]] = []
     for k in range(n_sub):
+        index_start = len(lines)
         col = "(col_j - group_begin)" if quant.grouped_by_moe and swapped else "col_j"
         lines.append(f"{p}_scol{k} = {col} // {bs} + {k}")
         if quant.scale_reorder == "F8_128x4":
@@ -1175,6 +1178,11 @@ def _emit_block_quant_row(
             lines.append(
                 f"{p}_sidx{k} = {batch_index_expr} * quant_scale_stride_l_{quant_idx} + row * quant_scale_stride_m_{quant_idx} + {p}_scol{k} * quant_scale_stride_n_{quant_idx}"
             )
+        if vector_scales:
+            scalar_scale_indices.append(lines[index_start:])
+            if k:
+                del lines[index_start:]
+            continue
         _st = f"(gC_tap_{scale_tap_idx}_ptr + {p}_sidx{k}).store({p}_scale{k}, alignment=1)"
         if row_pred is None:
             lines.append(_st)
@@ -1182,6 +1190,29 @@ def _emit_block_quant_row(
             width = (k + 1) * bs if swapped else vsize
             lines.append(f"if ({row_pred}) & (col_j + {width} <= {col_bound}):")
             lines.append(f"    {_st}")
+    if vector_scales:
+        # A whole F8_128x4 column atom is contiguous. Keep the scalar path for
+        # unaligned carriers, atom boundaries and a partial runtime N drain.
+        row_guard = f"({row_pred}) & " if row_pred is not None else ""
+        scale_ptr = f"(gC_tap_{scale_tap_idx}_ptr + {p}_sidx0)"
+        lines += [
+            f"if {row_guard}(col_j + {vsize} <= N) & (({p}_scol0 % 4) == 0) & (({scale_ptr}.toint() & 3) == 0):",
+            f"    {p}_sfword = cutlass.Uint32({p}_scale0.bitcast(cutlass.Uint8))",
+        ]
+        for k in range(1, 4):
+            lines.append(f"    {p}_sfword = {p}_sfword | (cutlass.Uint32({p}_scale{k}.bitcast(cutlass.Uint8)) << {8 * k})")
+        lines += [
+            f"    {p}_sfptr = cutlass.inttoptr({scale_ptr}.toint(), 1, cutlass.Uint32)",
+            f"    {p}_sfptr.store({p}_sfword, alignment=4)",
+            "else:",
+        ]
+        for k in range(4):
+            if k:
+                lines.extend("    " + line for line in scalar_scale_indices[k])
+            lines += [
+                f"    if {row_guard}(col_j + {(k + 1) * bs} <= N):",
+                f"        (gC_tap_{scale_tap_idx}_ptr + {p}_sidx{k}).store({p}_scale{k}, alignment=1)",
+            ]
     return lines
 
 

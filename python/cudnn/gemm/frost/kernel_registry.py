@@ -77,6 +77,24 @@ def classify_graph_type(chain: FusionChain) -> GraphType:
     return GraphType.MATMUL
 
 
+def _use_async_gather(chain: FusionChain, config: TileConfig) -> bool:
+    """Route supported sm100 MoE GATHER requests to their dedicated templates.
+
+    Token-major and block-scale K checks mirror the shared prechecks: requests
+    outside them are rejected, rather than served by a legacy GATHER fallback.
+    Other modes and the sm120 family use their existing pipelines.
+    """
+    swapped = isinstance(chain.moe, MoeSwapAbSpec)
+    if not (chain.has_moe and chain.moe.mode == "gather" and config.pipeline == "sm100" and (chain.matmul.b_major if swapped else chain.matmul.a_major) == "k"):
+        return False
+    if chain.has_block_scale:
+        return config.cta_tile_k_bytes == 128 and config.mma_tile_k_bytes in (32, 64)
+    # Shared gates own architecture, tile, cluster and resource admission. Each
+    # CTA gathers its token data locally; the weight TMA keeps the ordinary
+    # cluster multicast and operand-stage release protocol.
+    return True
+
+
 def _matmul_mma_type(chain: FusionChain) -> tuple:
     mm = chain.matmul
     return (mm.a_dtype, mm.b_dtype, mm.accum_dtype)
@@ -315,6 +333,7 @@ class KernelTemplate:
     supports_mainloop_fusion: bool = False
     supports_multi_gemm: bool = True
     supports_cluster_k_reduce: bool = False
+    async_gather: bool = False
 
     @property
     def block_scale(self) -> bool:
@@ -362,6 +381,8 @@ class KernelTemplate:
             return f"graph mainloop_fusion={chain.has_mainloop_fusion} != " f"template supports_mainloop_fusion={self.supports_mainloop_fusion}"
         if config.cluster_k_reduce and not self.supports_cluster_k_reduce:
             return f"template {self.file} does not support cluster_k_reduce"
+        if self.async_gather != _use_async_gather(chain, config):
+            return f"template {self.file} does not match the selected GATHER copy pipeline"
         if chain.is_multi_gemm and not self.supports_multi_gemm:
             return f"template {self.file} does not support multi-GEMM " f"({chain.num_gemms} parallel GEMMs); only the 1ctamma CLC " "template does this pass"
         return None
@@ -762,6 +783,7 @@ def _mm(
     supports_multi_gemm: bool = True,
     template_cls: "type[KernelTemplate] | None" = None,
     supports_cluster_k_reduce: bool = False,
+    async_gather: bool = False,
 ) -> KernelTemplate:
     """Describe a tcgen05 template and its supported geometry and strategy axes."""
     pipeline = _pipeline_from_file(file)
@@ -783,6 +805,7 @@ def _mm(
         supports_mainloop_fusion=supports_mainloop_fusion,
         supports_multi_gemm=supports_multi_gemm,
         supports_cluster_k_reduce=supports_cluster_k_reduce,
+        async_gather=async_gather,
     )
 
 
@@ -801,10 +824,24 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         graph_type=GraphType.MOE,
     ),
     _mm(
+        "sm100_moe_grouped_matmul_fwd_gather_mode.py",
+        graph_type=GraphType.MOE,
+        warps_per_cta=12,
+        smem_fixed_reserve=4096,
+        async_gather=True,
+    ),
+    _mm(
         "sm100_moe_grouped_block_scale_matmul_fwd.py",
         # + the per-CTA TMA tensormap scratch the per-group descriptor patch needs.
         smem_fixed_reserve=4096,
         graph_type=GraphType.MOE_BLOCK_SCALE,
+    ),
+    _mm(
+        "sm100_moe_grouped_block_scale_matmul_fwd_gather_mode.py",
+        graph_type=GraphType.MOE_BLOCK_SCALE,
+        warps_per_cta=20,
+        smem_fixed_reserve=4096,
+        async_gather=True,
     ),
     _mm(
         "sm100_moe_grouped_matmul_fwd_swap_ab.py",
@@ -812,9 +849,23 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         graph_type=GraphType.MOE_SWAP_AB,
     ),
     _mm(
+        "sm100_moe_grouped_matmul_fwd_gather_mode_swap_ab.py",
+        graph_type=GraphType.MOE_SWAP_AB,
+        warps_per_cta=12,
+        smem_fixed_reserve=4096,
+        async_gather=True,
+    ),
+    _mm(
         "sm100_moe_grouped_block_scale_matmul_fwd_swap_ab.py",
         smem_fixed_reserve=4096,
         graph_type=GraphType.MOE_BLOCK_SCALE_SWAP_AB,
+    ),
+    _mm(
+        "sm100_moe_grouped_block_scale_matmul_fwd_gather_mode_swap_ab.py",
+        graph_type=GraphType.MOE_BLOCK_SCALE_SWAP_AB,
+        warps_per_cta=20,
+        smem_fixed_reserve=4096,
+        async_gather=True,
     ),
     _mm(
         "sm103_block_scale_matmul.py",
@@ -914,7 +965,10 @@ def select_template(
     matches = [
         t
         for t in TEMPLATES
-        if isinstance(config, config_class_for_pipeline(t.pipeline)) and t.graph_type is gt and t.supports_mainloop_fusion == chain.has_mainloop_fusion
+        if isinstance(config, config_class_for_pipeline(t.pipeline))
+        and t.graph_type is gt
+        and t.supports_mainloop_fusion == chain.has_mainloop_fusion
+        and t.async_gather == _use_async_gather(chain, config)
     ]
     if len(matches) == 1:
         return matches[0]
