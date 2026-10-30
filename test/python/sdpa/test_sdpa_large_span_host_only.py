@@ -105,6 +105,8 @@ def test_flex_varlen_declines_int32_span(tokens, limit_ok):
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("needs a CUDA device to build the operand descriptors")
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("cudnn.flex_attention supports SM90 and newer")
     from cudnn.flex_attention.plan.validation import validate_create_mask_plan_inputs
 
     heads, dim = 8, 128  # 2**21 * 8 * 128 = 2**31 elements, one past INT32_MAX
