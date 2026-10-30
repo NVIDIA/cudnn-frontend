@@ -53,14 +53,14 @@ Install the frontend and a CUDA-enabled JAX build (>=0.6.0). The frontend alread
 on CuTeDSL; these kernels require a build at least version 4.7.1 that provides
 `cutlass.experimental.primitives`. No additional frontend dependency is introduced.
 
-Run in a single process with inputs placed on one SM100 GPU per invocation.
-The frontend imposes no limit on the number or architecture of other visible
-devices. Compilation explicitly targets SM100, and launch tuning uses the input
+Place inputs on one SM100 GPU per invocation. Independent local calls are allowed
+in multi-process JAX programs; process count and other visible devices do not
+restrict eligibility. Compilation explicitly targets SM100, and launch tuning uses the input
 device or, during tracing, JAX's default device. Use `jax.default_device` to
 select an SM100 for tracing and new arrays when the system default is another
 architecture. Existing committed arrays retain their placement and must already
-be on the intended SM100; the context does not move them. Distributed sharding
-remains unsupported.
+be on the intended SM100; the context does not move them. Automatic partitioning
+of globally sharded arrays remains outside the qualified scope.
 
 ```python
 import jax
@@ -106,7 +106,7 @@ with jax.default_device(target):
 
 | Feature | Supported contract |
 |---|---|
-| GPU | One SM100 GPU per invocation; no frontend restriction on other visible devices in the process |
+| GPU | One SM100 GPU per invocation; no frontend restriction on process count or other visible devices |
 | Operations | LayerNorm and RMSNorm |
 | Input and affine dtypes | BF16, FP16, FP32; matching dtypes |
 | Normalization axes | Positive static trailing dimensions; exact shape match |

@@ -191,10 +191,21 @@ def test_rejects_unsupported_gpu(kind, monkeypatch):
         invoke(kind, (x, None, None))
 
 
-def test_rejects_multiple_processes(monkeypatch):
-    monkeypatch.setattr(jax, "process_count", lambda: 2)
-    with pytest.raises(NotImplementedError, match="single process"):
-        jax.jit(lambda x: layer_norm_forward_jax(x)).lower(jax.ShapeDtypeStruct((2, 8), jnp.float32))
+@pytest.mark.parametrize("kind", ["layer", "rms"])
+def test_local_calls_allow_multiple_processes(kind, monkeypatch):
+    monkeypatch.setattr(jax, "process_count", lambda: 8)
+    args = (
+        jnp.arange(16, dtype=jnp.float32).reshape(2, 8) / 8,
+        jnp.linspace(0.5, 1.5, 8, dtype=jnp.float32),
+        jnp.linspace(-0.2, 0.2, 8, dtype=jnp.float32) if kind == "layer" else None,
+    )
+    expected = reference(kind, args, (8,), 1e-5)
+    assert_close(invoke(kind, args), expected, jnp.float32)
+    run = jax.jit(jax.value_and_grad(lambda values: jnp.square(invoke(kind, values)).sum()))
+    actual = run(args)
+    expected = jax.value_and_grad(lambda values: jnp.square(reference(kind, values, (8,), 1e-5)).sum())(args)
+    for result, desired in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+        assert_close(result, desired, jnp.float32)
 
 
 def test_tracing_ignores_unrelated_cuda_devices(monkeypatch):
