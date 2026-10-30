@@ -1414,6 +1414,15 @@ cudnn.ops.block_sparse_attention_fp8_forward
 cudnn.ops.causal_conv1d
 cudnn.ops.causal_conv1d_nwh
 cudnn.ops.causal_conv1d_update
+cudnn.ops.dsa
+cudnn.ops.dsa.compressor_backward_jax
+cudnn.ops.dsa.compressor_forward_jax
+cudnn.ops.dsa.dense_indexer_backward_jax
+cudnn.ops.dsa.indexer_backward_jax
+cudnn.ops.dsa.indexer_forward_jax
+cudnn.ops.dsa.indexer_top_k_forward_jax
+cudnn.ops.dsa.sparse_attention_backward_jax
+cudnn.ops.dsa.sparse_attention_forward_jax
 cudnn.ops.fft_causal_conv1d
 cudnn.ops.kimi_delta_attention_backward_jax
 cudnn.ops.kimi_delta_attention_forward_jax

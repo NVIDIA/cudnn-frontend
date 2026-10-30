@@ -229,6 +229,29 @@ pip install nvidia-cudnn-frontend
 
 ## API Usage
 
+### JAX ops (SM100 ratio-4 CSA / ratio-128 HCA)
+
+```python
+from cudnn.ops import dsa
+
+out = dsa.compressor_forward_jax(
+    kv, score, ape, cu_seqlens, cu_seqlens_comp, total_comp=static_output_rows
+)
+# DSv4 HCA: non-overlapping ratio-128 pooling, kv/score width == head_dim.
+out = dsa.compressor_forward_jax(
+    kv, score, ape, cu_seqlens, cu_seqlens_comp, total_comp=static_output_rows, ratio=128, coff=1
+)
+grad_kv, grad_score, grad_ape = dsa.compressor_backward_jax(
+    kv, score, ape, cu_seqlens, cu_seqlens_comp, grad_out, ratio=128, coff=1
+)
+```
+
+`cudnn.ops.dsa.compressor_forward_jax` and `cudnn.ops.dsa.compressor_backward_jax`
+accept JAX arrays, eagerly or under `jax.jit`, and require no PyTorch. They support
+`ratio=4, coff=2` (CSA) and `ratio=128, coff in {1, 2}` with `head_dim in {128, 512}`
+(HCA), BF16 KV/scores, FP32 APE and int32 packed-sequence metadata, on SM100-family
+GPUs. Forward and backward are separate calls; the caller owns the VJP.
+
 ### High-level wrappers
 
 ```python
