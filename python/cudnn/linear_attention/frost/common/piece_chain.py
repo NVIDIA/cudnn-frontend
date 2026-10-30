@@ -8,9 +8,13 @@ wave of ``num_seqs * pieces`` slots that run as independent sequences, every slo
 sequence fills slots in proportion to its length; their summaries ``H_j`` (state from a zero seed) and ``M_j``
 (transition, stored domain ``M_buf = M^T``) are chained in fp32::
 
-    X_{j+1} = X_j @ M_j + H_j                       (transpose=False)
-    X_j     = X_{j+1} @ M_j^T + G_j                 (transpose=True, H plays G)
+    X_{j+1} = X_j @ M_j + H_j                       (reverse=False, transpose=False)
+    X_j     = X_{j+1} @ M_j^T + G_j                 (reverse=True, transpose=True, H plays G)
+    X_j     = X_{j+1} @ M_j + G_j                   (reverse=True, transpose=False: M_j already stored transposed)
 
+``reverse`` is the walk order and ``transpose`` the read pattern of ``M``; the intra-GPU backward sets both, the
+context-parallel backward fold only ``reverse`` since the backward summary's transition is ``M_buf^T`` as stored.
+``emit_states`` stores every slot's entry state into ``X``; a fold that only needs ``tail`` turns it off and binds no ``X``.
 ``emit_summary`` also composes the running product ``summary_m`` so ``tail = seed @ summary_m + tail_zero_seed``.
 Layouts, fp32 unless stated: ``H``, ``X`` ``[num_seqs * pieces, HO, V, K]``; ``M`` ``[num_seqs * pieces, HO, K, K]``;
 ``seed`` / ``tail`` ``[num_seqs, HO, V, K]`` (fp32 or bf16); ``summary_m`` ``[num_seqs, HO, K, K]``.  Slots are flat in
@@ -376,10 +380,12 @@ def frost_state_chain(
     dim_k: cutlass.Constexpr[int],
     rows: cutlass.Constexpr[int],
     pieces: cutlass.Int32,
+    reverse: cutlass.Constexpr[bool],
     transpose: cutlass.Constexpr[bool],
     has_seed: cutlass.Constexpr[bool],
     has_tail: cutlass.Constexpr[bool],
     emit_summary: cutlass.Constexpr[bool],
+    emit_states: cutlass.Constexpr[bool],
     num_seqs: cutlass.Int32,
     mH: cute.Tensor | None,
     mM: cute.Tensor,
@@ -389,14 +395,17 @@ def frost_state_chain(
     mSummaryM: cute.Tensor | None,
     mMainRows: cute.Tensor | None,
     mSeedIndices: cute.Tensor | None,
+    mComposed: cute.Tensor | None,
 ):
     """CTA ``(seq, h, c)`` chains rows ``[c * rows, (c + 1) * rows)`` of the state and, under ``emit_summary``, the matching
     rows of the running M product.  Eight warps (two row groups times four k slices, lane ``l`` owning ``K / 32`` columns);
-    each ``M_j`` is staged whole in SMEM by double-buffered ``cp.async`` and read as 8-wide k tiles, the four slice partials
-    added to ``H_j`` in slice order by the row owner.  With ``mMainRows`` bound (the piece table's row bases) the walk
-    covers the sequence's flat slots ``main_rows[seq] // HO .. main_rows[seq + 1] // HO``; without it the fixed grid
-    ``seq * pieces + j``.  A one-slot walk copies the seed into ``X`` when there is no tail or summary and otherwise yields
-    ``tail = seed @ M_0 + H_0``.  With ``emit_summary`` and neither seed nor tail only the product is walked."""
+    each ``M_j`` is staged whole in SMEM by double-buffered ``cp.async`` and read as 8-wide k tiles (``transpose`` reads it
+    as ``M_j^T``), the four slice partials added to ``H_j`` in slice order by the row owner.  ``reverse`` walks the slots
+    last to first.  With ``mMainRows`` bound (the piece table's row bases) the walk covers the sequence's flat slots
+    ``main_rows[seq] // HO .. main_rows[seq + 1] // HO``; without it the fixed grid ``seq * pieces + j``.  ``emit_states``
+    stores every slot's entry state into ``X``.  A one-slot walk copies the seed into ``X`` when there is no tail or summary
+    and otherwise yields ``tail = seed @ M_0 + H_0``.  With ``emit_summary`` and neither seed nor tail only the product is
+    walked."""
     K = cutlass.const_expr(dim_k)
     V = cutlass.const_expr(dim_v)
     HO = heads_out
@@ -427,6 +436,9 @@ def frost_state_chain(
     seed_seq = seq
     if cutlass.const_expr(mSeedIndices is not None):
         seed_seq = cutlass.Int32(mSeedIndices[seq])
+    if cutlass.const_expr(mComposed is not None):
+        boundary_seq = cutlass.Int32(cute.arch.grid_dim()[0]) - cutlass.Int32(1) if cutlass.const_expr(reverse) else cutlass.Int32(0)
+        is_boundary = seq == boundary_seq
     row0 = cutlass.Int32(bid[2]) * cutlass.Int32(rows)
     product_row0 = cutlass.Int32(bid[2]) * cutlass.Int32(product_rows)
 
@@ -455,7 +467,7 @@ def frost_state_chain(
     if cutlass.const_expr(mMainRows is not None and not (has_tail or emit_summary)):
         one_piece = count == cutlass.Int32(1)
     if one_piece:
-        if cutlass.const_expr(walk_state):
+        if cutlass.const_expr(walk_state and emit_states):
             for rr in cutlass.range_constexpr(walk_own_rows):
                 seed_row = row_group * cutlass.Int32(walk_group_rows) + k_warp * cutlass.Int32(walk_own_rows) + cutlass.Int32(rr)
                 if cutlass.const_expr(has_seed):
@@ -485,6 +497,21 @@ def frost_state_chain(
                     seed_vals = [cutlass.Float32(0.0)] * cols_per_lane
                 for c in cutlass.range_constexpr(cols_per_lane):
                     cur[rr * cols_per_lane + c] = seed_vals[c]
+                if cutlass.const_expr(mComposed is not None):
+                    composed_offset = (
+                        cutlass.Int64(h) * cutlass.Int64(mComposed.stride[1])
+                        + cutlass.Int64(row0 + seed_row) * cutlass.Int64(mComposed.stride[2])
+                        + cutlass.Int64(col0)
+                    )
+                    composed_addr = mComposed.iterator.toint() + composed_offset * cutlass.Int64(4)
+                    composed_vals = []
+                    if cutlass.const_expr(cols_per_lane == 2):
+                        composed_vals = list(ld_global_v2(composed_addr, cutlass.Float32))
+                    else:
+                        for q in cutlass.range_constexpr(cols_per_lane // 4):
+                            composed_vals = composed_vals + list(ld_global_v4(composed_addr + cutlass.Int64(16 * q), cutlass.Float32))
+                    for c in cutlass.range_constexpr(cols_per_lane):
+                        cur[rr * cols_per_lane + c] = composed_vals[c] if is_boundary else cur[rr * cols_per_lane + c]
                 seed_x_row = row0 + seed_row
                 seed_x_offset = (
                     cutlass.Int64(seq_base) * cutlass.Int64(mX.stride[0])
@@ -531,6 +558,21 @@ def frost_state_chain(
                 seed_vals = [cutlass.Float32(0.0)] * cols_per_lane
             for c in cutlass.range_constexpr(cols_per_lane):
                 cur[rr * cols_per_lane + c] = seed_vals[c]
+            if cutlass.const_expr(mComposed is not None):
+                composed_offset = (
+                    cutlass.Int64(h) * cutlass.Int64(mComposed.stride[1])
+                    + cutlass.Int64(row0 + seed_row) * cutlass.Int64(mComposed.stride[2])
+                    + cutlass.Int64(col0)
+                )
+                composed_addr = mComposed.iterator.toint() + composed_offset * cutlass.Int64(4)
+                composed_vals = []
+                if cutlass.const_expr(cols_per_lane == 2):
+                    composed_vals = list(ld_global_v2(composed_addr, cutlass.Float32))
+                else:
+                    for q in cutlass.range_constexpr(cols_per_lane // 4):
+                        composed_vals = composed_vals + list(ld_global_v4(composed_addr + cutlass.Int64(16 * q), cutlass.Float32))
+                for c in cutlass.range_constexpr(cols_per_lane):
+                    cur[rr * cols_per_lane + c] = composed_vals[c] if is_boundary else cur[rr * cols_per_lane + c]
             seed_walk_ptr = sWalk.data_ptr(seed_row * K + col0)
             seed_walk_vals = [cur[rr * cols_per_lane + c] for c in range(cols_per_lane)]
             if cutlass.const_expr(cols_per_lane == 2):
@@ -566,21 +608,23 @@ def frost_state_chain(
         x_slot_bytes = cutlass.Int64(0)
         h_slot_bytes = cutlass.Int64(0)
         if cutlass.const_expr(walk_state):
-            x_slot_bytes = cutlass.Int64(mX.stride[0]) * cutlass.Int64(mX.element_type.width // 8)
             h_slot_bytes = cutlass.Int64(mH.stride[0]) * cutlass.Int64(mH.element_type.width // 8)
+            if cutlass.const_expr(emit_states):
+                x_slot_bytes = cutlass.Int64(mX.stride[0]) * cutlass.Int64(mX.element_type.width // 8)
             for rr in cutlass.range_constexpr(walk_own_rows):
                 row = row0 + row_group * cutlass.Int32(walk_group_rows) + k_warp * cutlass.Int32(walk_own_rows) + cutlass.Int32(rr)
-                x_row_addrs.append(
-                    mX.iterator.toint()
-                    + (cutlass.Int64(h) * cutlass.Int64(mX.stride[1]) + cutlass.Int64(row) * cutlass.Int64(mX.stride[2]) + cutlass.Int64(col0))
-                    * cutlass.Int64(mX.element_type.width // 8)
-                )
                 h_row_addrs.append(
                     mH.iterator.toint()
                     + (cutlass.Int64(h) * cutlass.Int64(mH.stride[1]) + cutlass.Int64(row) * cutlass.Int64(mH.stride[2]) + cutlass.Int64(col0))
                     * cutlass.Int64(mH.element_type.width // 8)
                 )
-        first_step = cutlass.Int32(0) if cutlass.const_expr(not transpose) else count - cutlass.Int32(1)
+                if cutlass.const_expr(emit_states):
+                    x_row_addrs.append(
+                        mX.iterator.toint()
+                        + (cutlass.Int64(h) * cutlass.Int64(mX.stride[1]) + cutlass.Int64(row) * cutlass.Int64(mX.stride[2]) + cutlass.Int64(col0))
+                        * cutlass.Int64(mX.element_type.width // 8)
+                    )
+        first_step = cutlass.Int32(0) if cutlass.const_expr(not reverse) else count - cutlass.Int32(1)
         first_buf_words = cutlass.Int32(0)
         first_slot_elems = cutlass.Int64(seq_base + first_step) * m_slot_elems + m_head_elems
         for q in cutlass.range_constexpr(K * K // 4 // CHAIN_THREADS):
@@ -592,19 +636,20 @@ def frost_state_chain(
         # ---- walk ---------------------------------------------------------------------------------
         i = cutlass.Int32(0)
         while i < count:
-            step = i if cutlass.const_expr(not transpose) else count - cutlass.Int32(1) - i
+            step = i if cutlass.const_expr(not reverse) else count - cutlass.Int32(1) - i
             slot = seq_base + step
             if cutlass.const_expr(walk_state):
                 x_slot_off = cutlass.Int64(slot) * x_slot_bytes
                 h_slot_off = cutlass.Int64(slot) * h_slot_bytes
                 for rr in cutlass.range_constexpr(walk_own_rows):
-                    x_addr = x_row_addrs[rr] + x_slot_off
-                    x_vals = [cur[rr * cols_per_lane + c] for c in range(cols_per_lane)]
-                    if cutlass.const_expr(cols_per_lane == 2):
-                        st_global_v2(x_addr, x_vals, cutlass.Float32)
-                    else:
-                        for q in cutlass.range_constexpr(cols_per_lane // 4):
-                            st_global_v4(x_addr + cutlass.Int64(16 * q), x_vals[4 * q : 4 * q + 4], cutlass.Float32)
+                    if cutlass.const_expr(emit_states):
+                        x_addr = x_row_addrs[rr] + x_slot_off
+                        x_vals = [cur[rr * cols_per_lane + c] for c in range(cols_per_lane)]
+                        if cutlass.const_expr(cols_per_lane == 2):
+                            st_global_v2(x_addr, x_vals, cutlass.Float32)
+                        else:
+                            for q in cutlass.range_constexpr(cols_per_lane // 4):
+                                st_global_v4(x_addr + cutlass.Int64(16 * q), x_vals[4 * q : 4 * q + 4], cutlass.Float32)
                     h_addr = h_row_addrs[rr] + h_slot_off
                     if cutlass.const_expr(cols_per_lane == 2):
                         h_vals = list(ld_global_v2(h_addr, cutlass.Float32))
@@ -613,7 +658,7 @@ def frost_state_chain(
                     for c in cutlass.range_constexpr(cols_per_lane):
                         piece_h[rr * cols_per_lane + c] = h_vals[c]
             if i + cutlass.Int32(1) < count:
-                next_step = step + cutlass.Int32(1) if cutlass.const_expr(not transpose) else step - cutlass.Int32(1)
+                next_step = step + cutlass.Int32(1) if cutlass.const_expr(not reverse) else step - cutlass.Int32(1)
                 next_buf_words = ((i + cutlass.Int32(1)) % cutlass.Int32(CHAIN_M_BUFFERS)) * cutlass.Int32(m_words)
                 next_slot_elems = cutlass.Int64(seq_base + next_step) * m_slot_elems + m_head_elems
                 for q in cutlass.range_constexpr(K * K // 4 // CHAIN_THREADS):
@@ -842,10 +887,12 @@ def launch_state_chain(
     dim_k: cutlass.Constexpr[int],
     rows: cutlass.Constexpr[int],
     pieces: cutlass.Int32,
+    reverse: cutlass.Constexpr[bool],
     transpose: cutlass.Constexpr[bool],
     has_seed: cutlass.Constexpr[bool],
     has_tail: cutlass.Constexpr[bool],
     emit_summary: cutlass.Constexpr[bool],
+    emit_states: cutlass.Constexpr[bool],
     num_seqs: cutlass.Int32,
     mH: cute.Tensor | None,
     mM: cute.Tensor,
@@ -855,6 +902,7 @@ def launch_state_chain(
     mSummaryM: cute.Tensor | None,
     mMainRows: cute.Tensor | None,
     mSeedIndices: cute.Tensor | None,
+    mComposed: cute.Tensor | None,
     stream: cuda.CUstream,
 ) -> None:
     slices = cutlass.const_expr(dim_v // rows)
@@ -864,10 +912,12 @@ def launch_state_chain(
         dim_k,
         rows,
         pieces,
+        reverse,
         transpose,
         has_seed,
         has_tail,
         emit_summary,
+        emit_states,
         num_seqs,
         mH,
         mM,
@@ -877,6 +927,7 @@ def launch_state_chain(
         mSummaryM,
         mMainRows,
         mSeedIndices,
+        mComposed,
     ).launch(grid=(num_seqs, heads_out, slices), block=(CHAIN_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
@@ -892,16 +943,19 @@ class CompiledStateChain(NamedTuple):
     dim_k: int
     pieces: int
     rows_per_cta: int
+    reverse: bool
     transpose: bool
     has_seed: bool
     has_tail: bool
     emit_summary: bool
+    emit_states: bool
     filled_only: bool
     seed_dtype: str
     tail_dtype: str
     summary_dtype: str
     device: int
     has_seed_indices: bool
+    has_composed: bool = False
 
 
 def chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, num_sm):
@@ -920,10 +974,12 @@ def build_state_chain(
     dim_k,
     pieces,
     rows_per_cta=None,
+    reverse,
     transpose,
     has_seed,
     has_tail,
     emit_summary,
+    emit_states=True,
     filled_only=False,
     seed_dtype="float32",
     tail_dtype="float32",
@@ -931,11 +987,15 @@ def build_state_chain(
     device,
     opt_level,
     has_seed_indices=False,
+    has_composed=False,
 ) -> CompiledStateChain:
     """Compile (cached per state geometry, flags, dtypes, device and ``opt_level``, the family's main-kernel level so the
     standalone chain is the one its hosts nest; ``heads_out`` and ``pieces`` are launch arguments and
     every tensor's layout is dynamic) the chain over ``pieces`` slots per sequence, ``rows_per_cta``
-    state rows per CTA (default ``dim_v // 8``).  ``filled_only`` binds the piece table's ``main_rows``; without ``has_tail``
+    state rows per CTA (default ``dim_v // 8``).  ``reverse`` walks the slots last to first and ``transpose`` reads each
+    ``M`` as its transpose (the intra-GPU backward sets both; a fold over backward summaries, whose transitions are already
+    transposed, sets ``reverse`` alone).  ``emit_states`` stores every slot's entry state into ``X``; off, no ``X`` is bound
+    and the walk exists for ``tail`` alone.  ``filled_only`` binds the piece table's ``main_rows``; without ``has_tail``
     and ``emit_summary`` one-slot sequences receive the seed copy and only multi-piece sequences are summarized, with
     either every filled slot carries a summary and the tail / product come out of the one-slot walk too.
     ``summary_dtype`` is the dtype of ``summary_m`` (fp32 or bf16, round to nearest even); ``has_seed_indices`` binds an int32
@@ -943,6 +1003,8 @@ def build_state_chain(
     HO, V, K, P = int(heads_out), int(dim_v), int(dim_k), int(pieces)
     rows = V // 8 if rows_per_cta is None else int(rows_per_cta)
     walk_state = bool(has_seed or has_tail or not emit_summary)
+    if walk_state and not (has_tail or emit_states):
+        raise ValueError("build_state_chain: a walked state needs a consumer, has_tail or emit_states")
     seed_name = dtype_name(seed_dtype) if has_seed else "float32"
     tail_name = dtype_name(tail_dtype) if has_tail else "float32"
     summary_name = dtype_name(summary_dtype) if emit_summary else "float32"
@@ -950,10 +1012,12 @@ def build_state_chain(
         V,
         K,
         rows,
+        bool(reverse),
         bool(transpose),
         bool(has_seed),
         bool(has_tail),
         bool(emit_summary),
+        bool(emit_states),
         bool(filled_only),
         seed_name,
         tail_name,
@@ -961,6 +1025,7 @@ def build_state_chain(
         int(device),
         int(opt_level),
         bool(has_seed_indices),
+        bool(has_composed),
     )
     if key not in state_chain_cache:
         state_chain_cache[key] = cute.compile(
@@ -970,14 +1035,20 @@ def build_state_chain(
             K,
             rows,
             cutlass.Int32(P),
+            bool(reverse),
             bool(transpose),
             bool(has_seed),
             bool(has_tail),
             bool(emit_summary),
+            bool(emit_states),
             cutlass.Int32(1),
             from_dlpack(DeviceView(256, (1, HO, V, K), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3) if walk_state else None,
             from_dlpack(DeviceView(256, (1, HO, K, K), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
-            from_dlpack(DeviceView(256, (1, HO, V, K), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3) if walk_state else None,
+            (
+                from_dlpack(DeviceView(256, (1, HO, V, K), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3)
+                if walk_state and emit_states
+                else None
+            ),
             from_dlpack(DeviceView(256, (1, HO, V, K), seed_name, int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3) if has_seed else None,
             from_dlpack(DeviceView(256, (1, HO, V, K), tail_name, int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3) if has_tail else None,
             (
@@ -987,6 +1058,7 @@ def build_state_chain(
             ),
             from_dlpack(DeviceView(256, (1,), "int32", int(device)), assumed_align=4).mark_layout_dynamic() if filled_only else None,
             from_dlpack(DeviceView(256, (1,), "int32", int(device)), assumed_align=4).mark_layout_dynamic() if has_seed_indices else None,
+            from_dlpack(DeviceView(256, (1, HO, V, K), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3) if has_composed else None,
             cuda.CUstream(0),
             options=f"--enable-tvm-ffi --opt-level {int(opt_level)}",
         )
@@ -997,25 +1069,29 @@ def build_state_chain(
         K,
         P,
         rows,
+        bool(reverse),
         bool(transpose),
         bool(has_seed),
         bool(has_tail),
         bool(emit_summary),
+        bool(emit_states),
         bool(filled_only),
         seed_name,
         tail_name,
         summary_name,
         int(device),
         bool(has_seed_indices),
+        bool(has_composed),
     )
 
 
-def run_state_chain(compiled: CompiledStateChain, num_seqs, H, M, X, seed, tail, summary_m, stream, main_rows=None, seed_indices=None) -> None:
+def run_state_chain(compiled: CompiledStateChain, num_seqs, H, M, X, seed, tail, summary_m, stream, main_rows=None, seed_indices=None, composed=None) -> None:
     """Chain ``num_seqs`` sequences over ``compiled.pieces`` slots each: ``H`` / ``X`` fp32 ``[num_seqs * pieces, HO, V, K]``
-    (None for a product-only chain), ``M`` fp32 ``[num_seqs * pieces, HO, K, K]``, ``seed`` / ``tail`` ``[num_seqs, HO, V, K]``
-    and ``summary_m`` ``[num_seqs, HO, K, K]`` in their built dtypes (None when not built), the piece table's ``main_rows``
-    int32 ``[num_seqs + 1]`` when ``filled_only`` (the slots are then flat in sequence order), ``seed_indices`` int32 ``[num_seqs]`` when
-    built with ``has_seed_indices``."""
+    (``H`` None for a product-only chain, ``X`` None without ``emit_states``), ``M`` fp32 ``[num_seqs * pieces, HO, K, K]``,
+    ``seed`` / ``tail`` ``[num_seqs, HO, V, K]`` and ``summary_m`` ``[num_seqs, HO, K, K]`` in their built dtypes (None when
+    not built), the piece table's ``main_rows`` int32 ``[num_seqs + 1]`` when ``filled_only`` (the slots are then flat in
+    sequence order), ``seed_indices`` int32 ``[num_seqs]`` when built with ``has_seed_indices``, ``composed`` fp32 ``[1, HO, V, K]`` when built with
+    ``has_composed`` (the context-parallel boundary sequence's entry state)."""
     walk_state = compiled.has_seed or compiled.has_tail or not compiled.emit_summary
     compiled.compiled(
         int(compiled.heads_out),
@@ -1023,12 +1099,13 @@ def run_state_chain(compiled: CompiledStateChain, num_seqs, H, M, X, seed, tail,
         int(num_seqs),
         H if walk_state else None,
         M,
-        X if walk_state else None,
+        X if walk_state and compiled.emit_states else None,
         seed if compiled.has_seed else None,
         tail if compiled.has_tail else None,
         summary_m if compiled.emit_summary else None,
         main_rows if compiled.filled_only else None,
         seed_indices if compiled.has_seed_indices else None,
+        composed if compiled.has_composed else None,
         cuda.CUstream(int(stream)),
     )
 
@@ -1045,25 +1122,32 @@ def frost_scalar_state_chain(
     dim_v: cutlass.Constexpr[int],
     dim_k: cutlass.Constexpr[int],
     rows: cutlass.Constexpr[int],
+    pieces: cutlass.Int32,
     has_seed: cutlass.Constexpr[bool],
     reverse: cutlass.Constexpr[bool],
+    has_tail: cutlass.Constexpr[bool],
+    emit_states: cutlass.Constexpr[bool],
     mH: cute.Tensor,
     mTransition: cute.Tensor,
-    mX: cute.Tensor,
+    mX: cute.Tensor | None,
     mSeed: cute.Tensor | None,
-    mMainRows: cute.Tensor,
+    mTail: cute.Tensor | None,
+    mMainRows: cute.Tensor | None,
     mSeedIndices: cute.Tensor | None,
+    mComposed: cute.Tensor | None,
 ):
     """CTA ``(seq, h, c)`` chains rows ``[c * rows, (c + 1) * rows)`` of the state over the sequence's filled slots
-    ``main_rows[seq] // HO .. main_rows[seq + 1] // HO`` (the piece table).  Forward: ``X[first] = seed`` (zero without
-    one) and ``X[j + 1] = gamma[j] X[j] + H[j]``, every slot's incoming state.  ``reverse`` (the backward chain):
-    ``X[last] = seed`` and ``X[j - 1] = gamma[j] X[j] + H[j]`` with ``H`` the per-slot gradient summaries, every slot's
-    outgoing gradient.  A one-slot sequence receives the seed copy.  Every lane owns four consecutive state columns.
+    ``main_rows[seq] // HO .. main_rows[seq + 1] // HO`` (the piece table), or without ``mMainRows`` over the fixed grid
+    ``seq * pieces + j``.  Forward: ``X[first] = seed`` (zero without one) and ``X[j + 1] = gamma[j] X[j] + H[j]``, every
+    slot's incoming state.  ``reverse`` (the backward chain): ``X[last] = seed`` and ``X[j - 1] = gamma[j] X[j] + H[j]``
+    with ``H`` the per-slot gradient summaries, every slot's outgoing gradient.  ``emit_states`` stores those entry
+    values into ``X``; ``has_tail`` also folds the last slot walked and stores the state beyond it into ``tail``.  A
+    one-slot sequence receives the seed copy.  Every lane owns four consecutive state columns.
     The slots go ``CHAIN_MAX_PIECES`` at a time (a long sequence of an uneven batch holds more): every summary and
     transition of a burst is loaded before its walk, from one base address per tensor advanced by the slot stride, so the
     walk is the stores and packed fma steps with no round trip.
     ``H`` / ``X`` fp32 ``[slots, HO, V, K]``, ``mTransition`` fp32 ``[slots, HO]`` the log2 of each slot's decay product,
-    ``seed`` fp32 or 16-bit ``[num_seqs, HO, V, K]`` (``mSeedIndices`` names its row per sequence)."""
+    ``seed`` / ``tail`` fp32 or 16-bit ``[num_seqs, HO, V, K]`` (``mSeedIndices`` names the seed row per sequence)."""
     K = cutlass.const_expr(dim_k)
     HO = heads_out
     n_vec = cutlass.const_expr(rows * K // 4)
@@ -1080,16 +1164,24 @@ def frost_scalar_state_chain(
     seed_seq = seq
     if cutlass.const_expr(mSeedIndices is not None):
         seed_seq = cutlass.Int32(mSeedIndices[seq])
+    if cutlass.const_expr(mComposed is not None):
+        boundary_seq = cutlass.Int32(cute.arch.grid_dim()[0]) - cutlass.Int32(1) if cutlass.const_expr(reverse) else cutlass.Int32(0)
+        is_boundary = seq == boundary_seq
 
     # ---- walk bounds --------------------------------------------------------------------------
-    row_base = cutlass.Int32(mMainRows[seq])
-    first = row_base // HO
-    filled = (cutlass.Int32(mMainRows[seq + 1]) - row_base) // HO
-    count = filled if filled > cutlass.Int32(0) else cutlass.Int32(1)
+    first = seq * pieces
+    count = pieces
+    if cutlass.const_expr(mMainRows is not None):
+        row_base = cutlass.Int32(mMainRows[seq])
+        first = row_base // HO
+        filled = (cutlass.Int32(mMainRows[seq + 1]) - row_base) // HO
+        count = filled if filled > cutlass.Int32(0) else cutlass.Int32(1)
     slot0 = first + count - cutlass.Int32(1) if reverse else first
 
     # ---- one base address per tensor, advanced by the slot stride ----------------------------
-    x_step = cutlass.Int64(mX.stride[0]) * cutlass.Int64(step_bytes)
+    x_step = cutlass.Int64(0)
+    if cutlass.const_expr(emit_states):
+        x_step = cutlass.Int64(mX.stride[0]) * cutlass.Int64(step_bytes)
     h_step = cutlass.Int64(mH.stride[0]) * cutlass.Int64(step_bytes)
     transition_step = cutlass.Int64(mTransition.stride[0]) * cutlass.Int64(step_bytes)
     transition_base = mTransition.iterator.toint() + (
@@ -1102,16 +1194,17 @@ def frost_scalar_state_chain(
         vec_owned = vec if vec < cutlass.Int32(n_vec) else cutlass.Int32(0)
         r = row0 + (vec_owned * cutlass.Int32(4)) // cutlass.Int32(K)
         c = (vec_owned * cutlass.Int32(4)) % cutlass.Int32(K)
-        x_base.append(
-            mX.iterator.toint()
-            + (
-                cutlass.Int64(slot0) * cutlass.Int64(mX.stride[0])
-                + cutlass.Int64(h) * cutlass.Int64(mX.stride[1])
-                + cutlass.Int64(r) * cutlass.Int64(mX.stride[2])
-                + cutlass.Int64(c)
+        if cutlass.const_expr(emit_states):
+            x_base.append(
+                mX.iterator.toint()
+                + (
+                    cutlass.Int64(slot0) * cutlass.Int64(mX.stride[0])
+                    + cutlass.Int64(h) * cutlass.Int64(mX.stride[1])
+                    + cutlass.Int64(r) * cutlass.Int64(mX.stride[2])
+                    + cutlass.Int64(c)
+                )
+                * cutlass.Int64(4)
             )
-            * cutlass.Int64(4)
-        )
         h_base.append(
             mH.iterator.toint()
             + (
@@ -1147,18 +1240,28 @@ def frost_scalar_state_chain(
                     seed_vals = [x for word in seed_words for x in f16x2_to_f32(word, dtype=mSeed.element_type)]
                 for e in cutlass.range_constexpr(4):
                     cur[4 * i + e] = seed_vals[e]
+            if cutlass.const_expr(mComposed is not None):
+                composed_offset = (
+                    cutlass.Int64(h) * cutlass.Int64(mComposed.stride[1]) + cutlass.Int64(r) * cutlass.Int64(mComposed.stride[2]) + cutlass.Int64(c)
+                )
+                composed_addr = mComposed.iterator.toint() + composed_offset * cutlass.Int64(4)
+                composed_vals = list(ld_global_v4(composed_addr, cutlass.Float32))
+                for e in cutlass.range_constexpr(4):
+                    cur[4 * i + e] = composed_vals[e] if is_boundary else cur[4 * i + e]
 
     # ---- the slots in bursts of CHAIN_MAX_PIECES: every summary and transition of the burst, then its walk ------
+    # (the last slot's summary is folded only toward a tail, since no slot follows it)
     gamma = cutlass.Array(cutlass.Float32, CHAIN_MAX_PIECES)
     summary = cutlass.Array(cutlass.Float32, 4 * per_thread * CHAIN_MAX_PIECES)
     burst_first = cutlass.Int32(0)
     while burst_first < count:
         left = count - burst_first
+        folded = left if cutlass.const_expr(has_tail) else left - cutlass.Int32(1)
         burst_x = cutlass.Int64(burst_first) * x_step
         burst_h = cutlass.Int64(burst_first) * h_step
         burst_transition = cutlass.Int64(burst_first) * transition_step
         for j in cutlass.range_constexpr(CHAIN_MAX_PIECES):
-            if cutlass.Int32(j + 1) < left:
+            if cutlass.Int32(j) < folded:
                 gamma[j] = cute.math.exp2(ld_global(transition_base + burst_transition + cutlass.Int64(j) * transition_step, cutlass.Float32), fastmath=True)
                 for i in cutlass.range_constexpr(per_thread):
                     vec = tidx + cutlass.Int32(i * CHAIN_THREADS)
@@ -1170,16 +1273,38 @@ def frost_scalar_state_chain(
         # ---- the walk: store this slot's incoming value, then fold its summary toward the next ---
         for j in cutlass.range_constexpr(CHAIN_MAX_PIECES):
             if cutlass.Int32(j) < left:
-                for i in cutlass.range_constexpr(per_thread):
-                    vec = tidx + cutlass.Int32(i * CHAIN_THREADS)
-                    if vec < cutlass.Int32(n_vec):
-                        st_global_v4(x_base[i] + burst_x + cutlass.Int64(j) * x_step, [cur[4 * i + e] for e in range(4)], cutlass.Float32)
-                if cutlass.Int32(j + 1) < left:
+                if cutlass.const_expr(emit_states):
+                    for i in cutlass.range_constexpr(per_thread):
+                        vec = tidx + cutlass.Int32(i * CHAIN_THREADS)
+                        if vec < cutlass.Int32(n_vec):
+                            st_global_v4(x_base[i] + burst_x + cutlass.Int64(j) * x_step, [cur[4 * i + e] for e in range(4)], cutlass.Float32)
+                if cutlass.Int32(j) < folded:
                     for i in cutlass.range_constexpr(per_thread):
                         base = (j * per_thread + i) * 4
                         cur[4 * i], cur[4 * i + 1] = ffma2(gamma[j], gamma[j], cur[4 * i], cur[4 * i + 1], summary[base], summary[base + 1])
                         cur[4 * i + 2], cur[4 * i + 3] = ffma2(gamma[j], gamma[j], cur[4 * i + 2], cur[4 * i + 3], summary[base + 2], summary[base + 3])
         burst_first = burst_first + cutlass.Int32(CHAIN_MAX_PIECES)
+
+    # ---- the tail: the state beyond the last slot walked -------------------------------------
+    if cutlass.const_expr(has_tail):
+        for i in cutlass.range_constexpr(per_thread):
+            vec = tidx + cutlass.Int32(i * CHAIN_THREADS)
+            if vec < cutlass.Int32(n_vec):
+                r = row0 + (vec * cutlass.Int32(4)) // cutlass.Int32(K)
+                c = (vec * cutlass.Int32(4)) % cutlass.Int32(K)
+                tail_offset = (
+                    cutlass.Int64(seq) * cutlass.Int64(mTail.stride[0])
+                    + cutlass.Int64(h) * cutlass.Int64(mTail.stride[1])
+                    + cutlass.Int64(r) * cutlass.Int64(mTail.stride[2])
+                    + cutlass.Int64(c)
+                )
+                tail_addr = mTail.iterator.toint() + tail_offset * cutlass.Int64(mTail.element_type.width // 8)
+                tail_vals = [cur[4 * i + e] for e in range(4)]
+                if cutlass.const_expr(mTail.element_type == cutlass.Float32):
+                    st_global_v4(tail_addr, tail_vals, cutlass.Float32)
+                else:
+                    tail_words = [fp32_to_fp16(tail_vals[2 * p], tail_vals[2 * p + 1], dtype=mTail.element_type) for p in range(2)]
+                    st_global_v2(tail_addr, tail_words, cutlass.Int32)
 
 
 @cute.jit
@@ -1188,21 +1313,26 @@ def launch_scalar_state_chain(
     dim_v: cutlass.Constexpr[int],
     dim_k: cutlass.Constexpr[int],
     rows: cutlass.Constexpr[int],
+    pieces: cutlass.Int32,
     has_seed: cutlass.Constexpr[bool],
     reverse: cutlass.Constexpr[bool],
+    has_tail: cutlass.Constexpr[bool],
+    emit_states: cutlass.Constexpr[bool],
     num_seqs: cutlass.Int32,
     mH: cute.Tensor,
     mTransition: cute.Tensor,
-    mX: cute.Tensor,
+    mX: cute.Tensor | None,
     mSeed: cute.Tensor | None,
-    mMainRows: cute.Tensor,
+    mTail: cute.Tensor | None,
+    mMainRows: cute.Tensor | None,
     mSeedIndices: cute.Tensor | None,
+    mComposed: cute.Tensor | None,
     stream: cuda.CUstream,
 ) -> None:
     slices = cutlass.const_expr(dim_v // rows)
-    frost_scalar_state_chain(heads_out, dim_v, dim_k, rows, has_seed, reverse, mH, mTransition, mX, mSeed, mMainRows, mSeedIndices).launch(
-        grid=(num_seqs, heads_out, slices), block=(CHAIN_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL
-    )
+    frost_scalar_state_chain(
+        heads_out, dim_v, dim_k, rows, pieces, has_seed, reverse, has_tail, emit_states, mH, mTransition, mX, mSeed, mTail, mMainRows, mSeedIndices, mComposed
+    ).launch(grid=(num_seqs, heads_out, slices), block=(CHAIN_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
 scalar_state_chain_cache = {}
@@ -1215,23 +1345,65 @@ class CompiledScalarStateChain(NamedTuple):
     heads_out: int
     dim_v: int
     dim_k: int
+    pieces: int
     rows_per_cta: int
     has_seed: bool
     reverse: bool
+    has_tail: bool
+    emit_states: bool
+    filled_only: bool
     seed_dtype: str
+    tail_dtype: str
     device: int
     has_seed_indices: bool
+    has_composed: bool = False
 
 
 def build_scalar_state_chain(
-    *, heads_out, dim_v, dim_k, rows_per_cta, has_seed, reverse=False, seed_dtype="float32", device, opt_level, has_seed_indices=False
+    *,
+    heads_out,
+    dim_v,
+    dim_k,
+    pieces,
+    rows_per_cta,
+    has_seed,
+    reverse=False,
+    has_tail=False,
+    emit_states=True,
+    filled_only=False,
+    seed_dtype="float32",
+    tail_dtype="float32",
+    device,
+    opt_level,
+    has_seed_indices=False,
+    has_composed=False,
 ):
-    """Compile (cached per state geometry, flags, seed dtype, device and ``opt_level``) the scalar-transition chain;
-    ``heads_out`` and ``num_seqs`` are launch arguments and every tensor's layout is dynamic."""
-    HO, V, K = int(heads_out), int(dim_v), int(dim_k)
+    """Compile (cached per state geometry, flags, dtypes, device and ``opt_level``) the scalar-transition chain over
+    ``pieces`` slots per sequence; ``heads_out``, ``pieces`` and ``num_seqs`` are launch arguments and every tensor's layout
+    is dynamic.  ``filled_only`` binds the piece table's ``main_rows``; ``has_tail`` folds the last slot too and stores the
+    state beyond it; ``emit_states`` stores every slot's entry state into ``X``."""
+    HO, V, K, P = int(heads_out), int(dim_v), int(dim_k), int(pieces)
     rows = int(rows_per_cta)
+    if not (has_tail or emit_states):
+        raise ValueError("build_scalar_state_chain: the walk needs a consumer, has_tail or emit_states")
     seed_name = dtype_name(seed_dtype) if has_seed else "float32"
-    key = (V, K, rows, bool(has_seed), bool(reverse), seed_name, int(device), int(opt_level), bool(has_seed_indices))
+    tail_name = dtype_name(tail_dtype) if has_tail else "float32"
+    key = (
+        V,
+        K,
+        rows,
+        bool(has_seed),
+        bool(reverse),
+        bool(has_tail),
+        bool(emit_states),
+        bool(filled_only),
+        seed_name,
+        tail_name,
+        int(device),
+        int(opt_level),
+        bool(has_seed_indices),
+        bool(has_composed),
+    )
     if key not in scalar_state_chain_cache:
         scalar_state_chain_cache[key] = cute.compile(
             launch_scalar_state_chain,
@@ -1239,28 +1411,137 @@ def build_scalar_state_chain(
             V,
             K,
             rows,
+            cutlass.Int32(P),
             bool(has_seed),
             bool(reverse),
+            bool(has_tail),
+            bool(emit_states),
             cutlass.Int32(1),
             from_dlpack(DeviceView(256, (1, HO, V, K), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
             from_dlpack(DeviceView(256, (1, HO), "float32", int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=1),
-            from_dlpack(DeviceView(256, (1, HO, V, K), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
+            from_dlpack(DeviceView(256, (1, HO, V, K), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3) if emit_states else None,
             from_dlpack(DeviceView(256, (1, HO, V, K), seed_name, int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3) if has_seed else None,
-            from_dlpack(DeviceView(256, (1,), "int32", int(device)), assumed_align=4).mark_layout_dynamic(),
+            from_dlpack(DeviceView(256, (1, HO, V, K), tail_name, int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3) if has_tail else None,
+            from_dlpack(DeviceView(256, (1,), "int32", int(device)), assumed_align=4).mark_layout_dynamic() if filled_only else None,
             from_dlpack(DeviceView(256, (1,), "int32", int(device)), assumed_align=4).mark_layout_dynamic() if has_seed_indices else None,
+            from_dlpack(DeviceView(256, (1, HO, V, K), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3) if has_composed else None,
             cuda.CUstream(0),
             options=f"--enable-tvm-ffi --opt-level {int(opt_level)}",
         )
     return CompiledScalarStateChain(
-        scalar_state_chain_cache[key], HO, V, K, rows, bool(has_seed), bool(reverse), seed_name, int(device), bool(has_seed_indices)
+        scalar_state_chain_cache[key],
+        HO,
+        V,
+        K,
+        P,
+        rows,
+        bool(has_seed),
+        bool(reverse),
+        bool(has_tail),
+        bool(emit_states),
+        bool(filled_only),
+        seed_name,
+        tail_name,
+        int(device),
+        bool(has_seed_indices),
+        bool(has_composed),
     )
 
 
-def run_scalar_state_chain(compiled: CompiledScalarStateChain, num_seqs, H, transition, X, seed, main_rows, stream, seed_indices=None) -> None:
-    """Chain ``num_seqs`` sequences over the piece table's filled slots: ``H`` / ``X`` fp32 ``[slots, HO, V, K]``,
-    ``transition`` fp32 ``[slots, HO]`` (log2 decay products), ``seed`` ``[num_seqs, HO, V, K]`` in its built dtype (None
-    when not built), ``main_rows`` int32 ``[num_seqs + 1]``, ``seed_indices`` int32 ``[num_seqs]`` when built with them."""
-    compiled.compiled(int(num_seqs), H, transition, X, seed, main_rows, seed_indices, cuda.CUstream(int(stream)))
+def run_scalar_state_chain(
+    compiled: CompiledScalarStateChain, num_seqs, H, transition, X, seed, tail, stream, main_rows=None, seed_indices=None, composed=None
+) -> None:
+    """Chain ``num_seqs`` sequences over ``compiled.pieces`` slots each: ``H`` / ``X`` fp32 ``[slots, HO, V, K]`` (``X`` None
+    without ``emit_states``), ``transition`` fp32 ``[slots, HO]`` (log2 decay products), ``seed`` / ``tail`` ``[num_seqs, HO,
+    V, K]`` in their built dtypes (None when not built), the piece table's ``main_rows`` int32 ``[num_seqs + 1]`` when
+    ``filled_only``, ``seed_indices`` int32 ``[num_seqs]`` when built with them, ``composed`` fp32 ``[1, HO, V, K]`` when built with
+    ``has_composed`` (the context-parallel boundary sequence's entry state)."""
+    compiled.compiled(
+        int(compiled.heads_out),
+        int(compiled.pieces),
+        int(num_seqs),
+        H,
+        transition,
+        X if compiled.emit_states else None,
+        seed if compiled.has_seed else None,
+        tail if compiled.has_tail else None,
+        main_rows if compiled.filled_only else None,
+        seed_indices if compiled.has_seed_indices else None,
+        composed if compiled.has_composed else None,
+        cuda.CUstream(int(stream)),
+    )
+
+
+def build_boundary_fold(composed, state_update, *, reverse, num_sm, device, seed_dtype=None, opt_level=2):
+    """Compile the context-parallel fold of the rank summaries into the one-row composed state ``composed`` (``[1, HO, V, K]``,
+    fp32): the state chain over a single sequence of ``state_update.shape[0]`` slots whose tail is that row.  ``seed_dtype``
+    names the caller's own state table when one is bound (the fold starts from its boundary row), None starts from zero.
+    ``reverse`` walks the following ranks' backward summaries, whose transitions are already transposed, so ``transpose``
+    stays off."""
+    HO, V, K = (int(d) for d in composed.shape[1:])
+    return build_state_chain(
+        heads_out=HO,
+        dim_v=V,
+        dim_k=K,
+        pieces=int(state_update.shape[0]),
+        rows_per_cta=chain_rows_per_cta(V, K, 1, HO, num_sm),
+        reverse=reverse,
+        transpose=False,
+        has_seed=seed_dtype is not None,
+        has_tail=True,
+        emit_summary=False,
+        emit_states=False,
+        seed_dtype=seed_dtype if seed_dtype is not None else "float32",
+        tail_dtype=composed.dtype,
+        device=device,
+        opt_level=opt_level,
+    )
+
+
+def run_boundary_fold(compiled, table, composed, state_update, transition, stream) -> None:
+    """Fold ``state_update`` / ``transition`` (fp32 ``[pieces, ...]``, rank order) into the one-row ``composed``: the walk starts
+    from the boundary row of the caller's ``table`` when the fold was built with one (row 0 forward, the last row in reverse,
+    the state beyond the farthest rank), from zero otherwise."""
+    seed = None
+    if compiled.has_seed:
+        row = int(table.shape[0]) - 1 if compiled.reverse else 0
+        row_elems = 1
+        for d in table.shape[1:]:
+            row_elems *= int(d)
+        seed = DeviceView(table.data_ptr() + row * row_elems * table.element_size(), (1, *table.shape[1:]), table.dtype, compiled.device)
+    run_state_chain(compiled, 1, state_update, transition, None, seed, composed, None, stream)
+
+
+def build_scalar_boundary_fold(composed, state_update, *, reverse, device, seed_dtype=None, opt_level=2):
+    """:func:`build_boundary_fold` for Mamba-2's scalar-transition chain (one decay per head per rank)."""
+    HO, V, K = (int(d) for d in composed.shape[1:])
+    return build_scalar_state_chain(
+        heads_out=HO,
+        dim_v=V,
+        dim_k=K,
+        pieces=int(state_update.shape[0]),
+        rows_per_cta=4 * CHAIN_THREADS // K,
+        has_seed=seed_dtype is not None,
+        reverse=reverse,
+        has_tail=True,
+        emit_states=False,
+        seed_dtype=seed_dtype if seed_dtype is not None else "float32",
+        tail_dtype=composed.dtype,
+        device=device,
+        opt_level=opt_level,
+    )
+
+
+def run_scalar_boundary_fold(compiled, table, composed, state_update, transition, stream) -> None:
+    """:func:`run_boundary_fold` for Mamba-2's scalar-transition chain."""
+    seed = None
+    if compiled.has_seed:
+        row = int(table.shape[0]) - 1 if compiled.reverse else 0
+        row_elems = 1
+        for d in table.shape[1:]:
+            row_elems *= int(d)
+        seed = DeviceView(table.data_ptr() + row * row_elems * table.element_size(), (1, *table.shape[1:]), table.dtype, compiled.device)
+    run_scalar_state_chain(compiled, 1, state_update, transition, None, seed, composed, stream)
 
 
 frost_scalar_state_chain.set_name_prefix("cudnn", remove_cutlass_symbol=False)

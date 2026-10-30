@@ -42,6 +42,12 @@ def frost_la_gate(engine: str, facts, op: str) -> None:
         raise NotImplementedError(f"{engine}: 'g' must be fp32/fp16/bf16, got {facts.g_dtype}")
     if facts.cu_dtype not in (cudnn.data_type.INT32, cudnn.data_type.INT64, None):
         raise NotImplementedError(f"{engine}: 'cu_seqlens' must be int32/int64, got {facts.cu_dtype}")
+    if facts.has_composed_state and facts.composed_state_port_dtype not in (None, cudnn.data_type.FLOAT):
+        raise NotImplementedError(f"{engine}: composed_initial_state must be fp32 (the fold's one-row result), got {facts.composed_state_port_dtype}")
+    if facts.has_composed_summaries:
+        for port, got in (("state", facts.composed_state_dtype), ("transition", facts.composed_transition_dtype)):
+            if got not in (cudnn.data_type.FLOAT, None):
+                raise NotImplementedError(f"{engine}: the composed summaries' {port} must be fp32 (the summary ops' output), got {got}")
 
 
 def summary_support_gates(engine: str, facts, graph) -> None:

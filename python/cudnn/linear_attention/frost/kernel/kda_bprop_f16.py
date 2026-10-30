@@ -2011,6 +2011,7 @@ def compute1_warp_group(
     mDbeta,
     mDstate0,
     mDstate_in,
+    mDcomposed,
     sV_raw,
     sDo_raw,
     sBeta_raw,
@@ -2078,15 +2079,29 @@ def compute1_warp_group(
                 dstate_smem_done_index = advance(dstate_smem_done_index, 1)
                 seed_scale_ptr = sDecay_scale_raw.data_ptr() + seed_stage * cfg.d_k
                 row_lo_addr = tmem_row << 16
-                seed_vw = 16 // (mDstate_in.element_type.width // 8)
-                dstate_src = (mDstate_in.iterator + mDstate_in.layout((batch_idx, head_idx, value_dim, 0))).raw_ptr()
+                if cutlass.const_expr(cfg.dstate_table):
+                    seed_vw = 16 // (mDstate_in.element_type.width // 8)
+                    dstate_src = (mDstate_in.iterator + mDstate_in.layout((batch_idx, head_idx, value_dim, 0))).raw_ptr()
+                if cutlass.const_expr(cfg.has_composed_dstate):
+                    is_boundary = batch_idx == cutlass.Int32(cu_seqlens.shape[0]) - cutlass.Int32(2)
+                    composed_src = (mDcomposed.iterator + mDcomposed.layout((cutlass.Int32(0), head_idx, value_dim, 0))).raw_ptr()
                 for i in cutlass.range(cfg.d_k // 16, unroll=1):
                     seed_block = cutlass.Array(cutlass.Float32, 16, alignment=16)
-                    for g in cutlass.range_constexpr(16 // seed_vw):
-                        seed_chunk = (dstate_src + i * 16 + g * seed_vw).load(count=seed_vw, alignment=16)
-                        for t in cutlass.range_constexpr(seed_vw):
-                            dval = seed_chunk[t].to(cutlass.Float32)
-                            seed_block[g * seed_vw + t] = dval if seed_true else cutlass.Float32(0.0)
+                    if cutlass.const_expr(cfg.dstate_table):
+                        for g in cutlass.range_constexpr(16 // seed_vw):
+                            seed_chunk = (dstate_src + i * 16 + g * seed_vw).load(count=seed_vw, alignment=16)
+                            for t in cutlass.range_constexpr(seed_vw):
+                                dval = seed_chunk[t].to(cutlass.Float32)
+                                seed_block[g * seed_vw + t] = dval if seed_true else cutlass.Float32(0.0)
+                    else:
+                        for t in cutlass.range_constexpr(16):
+                            seed_block[t] = cutlass.Float32(0.0)
+                    if cutlass.const_expr(cfg.has_composed_dstate):
+                        for g in cutlass.range_constexpr(4):
+                            composed_chunk = (composed_src + i * 16 + g * 4).load(count=4, alignment=16)
+                            for t in cutlass.range_constexpr(4):
+                                cval = composed_chunk[t] if seed_true else cutlass.Float32(0.0)
+                                seed_block[g * 4 + t] = cval if is_boundary else seed_block[g * 4 + t]
                     for g in cutlass.range_constexpr(4):
                         seed_frag = (seed_scale_ptr + i * 16 + g * 4).load(count=4, alignment=16)
                         for t in cutlass.range_constexpr(2):
@@ -2490,7 +2505,15 @@ def compute1_warp_group(
                     for key_dim_base in cutlass.range_constexpr(0, cfg.d_k, 32):
                         for kk_i in cutlass.range_constexpr(32):
                             kd = key_dim_base + kk_i
-                            if cutlass.const_expr(cfg.use_dstate_in):
+                            if cutlass.const_expr(cfg.has_composed_dstate):
+                                if cutlass.const_expr(cfg.dstate_table):
+                                    pass_val = mDstate_in[batch_idx, head_idx, value_dim, kd].to(cutlass.Float32)
+                                else:
+                                    pass_val = cutlass.Float32(0.0)
+                                composed_val = mDcomposed[cutlass.Int32(0), head_idx, value_dim, kd]
+                                pass_val = composed_val if batch_idx == cutlass.Int32(cu_seqlens.shape[0]) - cutlass.Int32(2) else pass_val
+                                mDstate0[dstate_dst, head_idx, value_dim, kd] = pass_val.to(mDstate0.element_type)
+                            elif cutlass.const_expr(cfg.use_dstate_in):
                                 mDstate0[dstate_dst, head_idx, value_dim, kd] = mDstate_in[batch_idx, head_idx, value_dim, kd].to(mDstate0.element_type)
                             else:
                                 mDstate0[dstate_dst, head_idx, value_dim, kd] = cutlass.Float32(0.0).to(mDstate0.element_type)
@@ -3457,6 +3480,7 @@ def host(
     cu_seqlens: cute.Tensor,
     d_initial_state: cute.Tensor | None,
     d_final_state: cute.Tensor | None,
+    dcomposed: cute.Tensor | None,
     work_items: cute.Tensor | None,
     work_count: cute.Tensor | None,
     scheduler_counter: cute.Tensor,
@@ -3488,6 +3512,7 @@ def host(
         dbeta,
         d_initial_state,
         d_final_state,
+        dcomposed,
         work_items,
         work_count,
         scheduler_counter,
@@ -3518,6 +3543,7 @@ def frost_kda_bprop(
     mDbeta: cute.Tensor,
     mDstate0: cute.Tensor | None,
     mDstate_in: cute.Tensor | None,
+    mDcomposed: cute.Tensor | None,
     mWorkItems: cute.Tensor,
     mCount: cute.Tensor,
     mScheduler: cute.Tensor,
@@ -3951,6 +3977,7 @@ def frost_kda_bprop(
             mDbeta,
             mDstate0,
             mDstate_in,
+            mDcomposed,
             sV_raw,
             sDo_raw,
             sBeta_raw,
@@ -3984,6 +4011,8 @@ class KdaBpropCfg:
     max_active_clusters: int
     d_k: int
     d_v: int
+    dstate_table: bool = True
+    has_composed_dstate: bool = False
     scheduler_stages: int = 8
 
     # ---- fixed constants stamped from CFG at build time ------------------------------
@@ -4082,12 +4111,16 @@ def build_cfg(
     max_active_clusters: int,
     d_k: int,
     d_v: int,
+    dstate_table: bool | None = None,
+    has_composed_dstate: bool = False,
 ) -> KdaBpropCfg:
     """Derive all buffer sizes from the configured tile and ring depths."""
     cfg = KdaBpropCfg(
         io_dtype=io_dtype,
         gate_dtype=gate_dtype,
         use_dstate_in=use_dstate_in,
+        dstate_table=use_dstate_in if dstate_table is None else bool(dstate_table),
+        has_composed_dstate=bool(has_composed_dstate),
         use_dstate0=use_dstate0,
         l2norm=l2norm,
         safe_gate=safe_gate,

@@ -174,6 +174,10 @@ class CompiledKda:
         K, V = q.dim[2], v.dim[2]
         B = node.inputs["cu_seqlens"].dim[0] - 1
         self.num_sm = multiprocessor_count(self.device)
+        from .common.piece_chain import build_boundary_fold, run_boundary_fold
+
+        self.build_boundary_fold, self.run_boundary_fold = build_boundary_fold, run_boundary_fold
+        self.composed_fold = None
         self.n_heads_out = HO
         self.num_seqs = B
         self.pieces, self.unit_chunks = choose_pieces(
@@ -287,12 +291,16 @@ class CompiledKda:
         self.index_state_checkpoints = pos.get("state_checkpoints")
         self.index_a_log = pos.get("a_log")
         self.index_dt_bias = pos.get("dt_bias")
+        self.index_preceding_state_update = pos.get("preceding_state_update")
+        self.index_preceding_transition = pos.get("preceding_transition")
+        self.index_composed = pos.get("composed_initial_state")
         if self.chain:
             positions = pos | {name: len(names) + i for i, name in enumerate(self.carve_names)}
             aliases = {
                 "gate": "g",
                 "o": "O",
                 "seed": "initial_state",
+                "composed": "composed_initial_state",
                 "seed_indices": "state_indices",
                 "final_indices": "state_indices",
                 "checkpoints": "state_checkpoints",
@@ -317,6 +325,15 @@ class CompiledKda:
             )
 
     def run(self, views, workspace, stream) -> None:
+        composed = views[self.index_composed] if self.index_composed is not None else None
+        if self.index_preceding_state_update is not None:
+            table = views[self.index_initial_state] if self.index_initial_state is not None else None
+            summaries = views[self.index_preceding_state_update]
+            if self.composed_fold is None:
+                self.composed_fold = self.build_boundary_fold(
+                    composed, summaries, reverse=False, num_sm=self.num_sm, device=self.device, seed_dtype=table.dtype if table is not None else None
+                )
+            self.run_boundary_fold(self.composed_fold, table, composed, summaries, views[self.index_preceding_transition], int(stream or 0))
         if self.chain and self.chain_launch is not None:
             buffers = self.chain_buffers((*views, *workspace.carve(self.carve), None))
             self.chain_launch(*self.chain_scalars, *buffers, self.stream_type(int(stream or 0)))
@@ -338,7 +355,7 @@ class CompiledKda:
 
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
         if self.chain:
-            self.run_chain(q, k, v, g, beta, cu, state0, o, final_state, state_checkpoints, a_log, dt_bias, state_indices, region, stream)
+            self.run_chain(q, k, v, g, beta, cu, state0, composed, o, final_state, state_checkpoints, a_log, dt_bias, state_indices, region, stream)
             return
         checkpoint = self.checkpoint if self.has_state_checkpoints else 0
         buffers = dict(
@@ -352,6 +369,7 @@ class CompiledKda:
             o=o,
             cu_seqlens=cu,
             state_in=state0,
+            composed=composed,
             state_out=final_state,
             seed_indices=state_indices,
             final_indices=state_indices,
@@ -389,7 +407,7 @@ class CompiledKda:
             )
         self.run_uncut_forward(self.uncut_launch, **buffers, checkpoint_every_n_tokens=checkpoint, scale=self.scale, stream=stream)
 
-    def run_chain(self, q, k, v, g, beta, cu, state0, o, final_state, state_checkpoints, a_log, dt_bias, state_indices, region, stream) -> None:
+    def run_chain(self, q, k, v, g, beta, cu, state0, composed, o, final_state, state_checkpoints, a_log, dt_bias, state_indices, region, stream) -> None:
         """Chain prologue, fused H and M summaries, fp32 state chain seeded with initial_state, prefill over the pieces seeded
         with X, all four launched from one compiled host (kernel/kda_chain_forward_f16.py); the checkpoint series keeps its
         unsplit layout."""
@@ -420,6 +438,7 @@ class CompiledKda:
             state_m=region["state_m"],
             state_x=region["state_x"],
             seed=state0,
+            composed=composed,
             seed_indices=state_indices,
             final_state=final_state,
             final_indices=state_indices,
@@ -522,6 +541,10 @@ class CompiledKdaBwd:
         self.n_heads_out, self.total = HO, total
         self.dim_k, self.dim_v = K, V
         self.num_sm = multiprocessor_count(self.device)
+        from .common.piece_chain import build_boundary_fold, run_boundary_fold
+
+        self.build_boundary_fold, self.run_boundary_fold = build_boundary_fold, run_boundary_fold
+        self.composed_fold = None
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.overwrite_initial_state = bool(node.params.get("overwrite_initial_state", False))
         self.num_seqs = B
@@ -571,6 +594,8 @@ class CompiledKdaBwd:
         self.work_item_rows = self.n_tiles
         regions.append(("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
         regions.append(("work_count", layout.add(4), "int32", (1,)))
+        if "following_state_grad" in node.inputs:
+            regions.append(("composed_dstate", layout.add(HO * V * K * 4, align=16), "float32", (1, HO, V, K)))
         if self.needs_recompute:
             self.state_checkpoints_rows = max(total // self.b_t + self.num_pieces, 1)
             regions.append(
@@ -658,6 +683,9 @@ class CompiledKdaBwd:
         self.index_d_initial_state = pos.get("d_initial_state")
         self.index_a_log = pos.get("a_log")
         self.index_dt_bias = pos.get("dt_bias")
+        self.index_following_state_grad = pos.get("following_state_grad")
+        self.index_following_transition = pos.get("following_transition")
+        self.index_composed = pos.get("composed_initial_state")
         self.index_d_a_log = pos.get("d_a_log")
         self.index_d_dt_bias = pos.get("d_dt_bias")
 
@@ -672,6 +700,7 @@ class CompiledKdaBwd:
         state_checkpoints = views[self.index_state_checkpoints] if self.index_state_checkpoints is not None else None
         state0 = views[self.index_initial_state] if self.index_initial_state is not None else None
         dstate_in = views[self.index_d_final_state] if self.index_d_final_state is not None else None
+        composed = views[self.index_composed] if self.index_composed is not None else None
         dq = views[self.index_dq]
         dk = views[self.index_dk]
         dv = views[self.index_dv]
@@ -685,6 +714,16 @@ class CompiledKdaBwd:
         stream = stream if stream is not None else 0
 
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
+        dcomposed = None
+        if self.index_following_state_grad is not None:
+            dcomposed = region["composed_dstate"]
+            table = dstate_in
+            summaries = views[self.index_following_state_grad]
+            if self.composed_fold is None:
+                self.composed_fold = self.build_boundary_fold(
+                    dcomposed, summaries, reverse=True, num_sm=self.num_sm, device=self.device, seed_dtype=table.dtype if table is not None else None
+                )
+            self.run_boundary_fold(self.composed_fold, table, dcomposed, summaries, views[self.index_following_transition], int(stream or 0))
         work_items = region["work_items"]
         work_count = region["work_count"]
         dq_out = region["dq_ho"] if self.fold_dq else dq
@@ -706,6 +745,8 @@ class CompiledKdaBwd:
                 checkpoint_series,
                 state0,
                 dstate_in,
+                composed,
+                dcomposed,
                 dq_out,
                 dk_out,
                 dv_out,
@@ -734,10 +775,12 @@ class CompiledKdaBwd:
                 checkpoints=checkpoint_series,
                 seed_checkpoints=state_checkpoints if coarse else None,
                 state_in=state0 if self.needs_recompute and not coarse else None,
+                composed=composed if self.needs_recompute and not coarse else None,
                 dgate=dg,
                 dbeta=dbeta,
                 dstate0=dstate0 if self.has_dstate0 else None,
                 dstate_in=dstate_in,
+                dcomposed=dcomposed,
                 work_items=work_items,
                 work_count=work_count,
                 series_items=(region["work_items_recompute"] if coarse else work_items) if self.needs_recompute else None,
@@ -764,7 +807,7 @@ class CompiledKdaBwd:
                 self.uncut_launch = self.build_uncut_backward(
                     **buffers,
                     **schedule,
-                    use_initial_state=state0 is not None,
+                    use_initial_state=state0 is not None or composed is not None,
                     num_sm=self.num_sm,
                     gate_lower_bound=self.gate_lower_bound,
                     use_qk_l2norm=self.use_qk_l2norm,
@@ -798,6 +841,8 @@ class CompiledKdaBwd:
         checkpoint_series,
         state0,
         dstate_in,
+        composed,
+        dcomposed,
         dq_out,
         dk_out,
         dv_out,
@@ -858,6 +903,8 @@ class CompiledKdaBwd:
             state_dx_end=region["state_dx_end"],
             seed=state0,
             dseed=dstate_in,
+            composed=composed,
+            dcomposed=dcomposed,
             dstate0=dstate0,
         )
         schedule = dict(
@@ -1268,6 +1315,7 @@ class CompiledKdaSummary:
                 dim_k=self.dim_k,
                 pieces=self.pieces,
                 rows_per_cta=self.chain_rows_per_cta(self.dim_v, self.dim_k, self.num_seqs, self.n_heads_out, self.num_sm),
+                reverse=False,
                 transpose=False,
                 has_seed=state0 is not None,
                 has_tail=True,
@@ -1561,6 +1609,7 @@ class CompiledKdaSummaryBwd:
                 dim_k=self.dim_k,
                 pieces=1,
                 rows_per_cta=self.chain_rows_per_cta(self.dim_v, self.dim_k, self.num_seqs, self.n_heads_out, self.num_sm),
+                reverse=True,
                 transpose=True,
                 has_seed=False,
                 has_tail=False,
@@ -1709,6 +1758,7 @@ class CompiledKdaSummaryBwd:
                 dim_k=self.dim_k,
                 pieces=self.pieces,
                 rows_per_cta=self.chain_rows_per_cta(self.dim_v, self.dim_k, self.num_seqs, self.n_heads_out, self.num_sm),
+                reverse=True,
                 transpose=True,
                 has_seed=dstate_in is not None,
                 has_tail=True,

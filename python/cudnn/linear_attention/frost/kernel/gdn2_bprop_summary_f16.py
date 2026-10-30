@@ -1188,6 +1188,7 @@ def compute1_warp_group(
     warp_idx,
     mDstate0,
     mDstate_in,
+    mDcomposed,
     mDstateScratch,
     sDecay_scale_raw,
     sSteepTile_ptr,
@@ -1243,15 +1244,29 @@ def compute1_warp_group(
                 seed_steep_ptr = sSteepTile_ptr + seed_stage * len(cfg.compute_group_0_warp_ids)
                 seed_steep_any = steep_tile_mask(cfg, seed_steep_ptr)
                 row_lo_addr = tmem_row << 16
-                seed_vw = 16 // (mDstate_in.element_type.width // 8)
-                dstate_src = (mDstate_in.iterator + mDstate_in.layout((batch_idx, head_idx, state_gmem_row, 0))).raw_ptr()
+                if cutlass.const_expr(cfg.dstate_table):
+                    seed_vw = 16 // (mDstate_in.element_type.width // 8)
+                    dstate_src = (mDstate_in.iterator + mDstate_in.layout((batch_idx, head_idx, state_gmem_row, 0))).raw_ptr()
+                if cutlass.const_expr(cfg.has_composed_dstate):
+                    is_boundary = batch_idx == cutlass.Int32(cu_seqlens.shape[0]) - cutlass.Int32(2)
+                    composed_src = (mDcomposed.iterator + mDcomposed.layout((cutlass.Int32(0), head_idx, state_gmem_row, 0))).raw_ptr()
                 for i in cutlass.range(cfg.d_k // 16, unroll=1):
                     seed_block = cutlass.Array(cutlass.Float32, 16, alignment=16)
-                    for g in cutlass.range_constexpr(16 // seed_vw):
-                        seed_chunk = (dstate_src + i * 16 + g * seed_vw).load(count=seed_vw, alignment=16)
-                        for t in cutlass.range_constexpr(seed_vw):
-                            dval = seed_chunk[t].to(cutlass.Float32)
-                            seed_block[g * seed_vw + t] = dval if seed_true else cutlass.Float32(0.0)
+                    if cutlass.const_expr(cfg.dstate_table):
+                        for g in cutlass.range_constexpr(16 // seed_vw):
+                            seed_chunk = (dstate_src + i * 16 + g * seed_vw).load(count=seed_vw, alignment=16)
+                            for t in cutlass.range_constexpr(seed_vw):
+                                dval = seed_chunk[t].to(cutlass.Float32)
+                                seed_block[g * seed_vw + t] = dval if seed_true else cutlass.Float32(0.0)
+                    else:
+                        for j in cutlass.range_constexpr(16):
+                            seed_block[j] = cutlass.Float32(0.0)
+                    if cutlass.const_expr(cfg.has_composed_dstate):
+                        for g in cutlass.range_constexpr(4):
+                            composed_chunk = (composed_src + i * 16 + g * 4).load(count=4, alignment=16)
+                            for t in cutlass.range_constexpr(4):
+                                cval = composed_chunk[t] if seed_true else cutlass.Float32(0.0)
+                                seed_block[g * 4 + t] = cval if is_boundary else seed_block[g * 4 + t]
 
                     seed_undecayed = cutlass.Array(cutlass.Float32, 16, alignment=16)
                     for j in cutlass.range_constexpr(16):
@@ -1412,11 +1427,19 @@ def compute1_warp_group(
                                     alignment=16,
                                 )
             else:
+                if cutlass.const_expr(cfg.has_composed_dstate):
+                    is_boundary = batch_idx == cutlass.Int32(cu_seqlens.shape[0]) - cutlass.Int32(2)
                 for key_dim_base in cutlass.range_constexpr(0, cfg.d_k, 32):
                     for kk_i in cutlass.range_constexpr(32):
                         kd = key_dim_base + kk_i
                         if state_row_valid:
-                            if cutlass.const_expr(cfg.use_dstate_in):
+                            if cutlass.const_expr(cfg.has_composed_dstate):
+                                value = cutlass.Float32(0.0)
+                                if cutlass.const_expr(cfg.dstate_table):
+                                    value = mDstate_in[batch_idx, head_idx, state_gmem_row, kd].to(cutlass.Float32)
+                                value = mDcomposed[cutlass.Int32(0), head_idx, state_gmem_row, kd] if is_boundary else value
+                                mDstate0[batch_idx, head_idx, state_gmem_row, kd] = value.to(mDstate0.element_type)
+                            elif cutlass.const_expr(cfg.use_dstate_in):
                                 mDstate0[batch_idx, head_idx, state_gmem_row, kd] = mDstate_in[batch_idx, head_idx, state_gmem_row, kd]
                             else:
                                 mDstate0[batch_idx, head_idx, state_gmem_row, kd] = cutlass.Float32(0.0).to(mDstate0.element_type)
@@ -1618,6 +1641,7 @@ def host(
     cu_seqlens: cute.Tensor,
     d_initial_state: cute.Tensor | None,
     d_final_state: cute.Tensor | None,
+    dcomposed: cute.Tensor | None,
     work_items: cute.Tensor | None,
     work_count: cute.Tensor | None,
     scheduler_counter: cute.Tensor,
@@ -1645,6 +1669,7 @@ def host(
             dt_bias,
             d_initial_state,
             d_final_state,
+            dcomposed,
             work_items,
             work_count,
             scheduler_counter,
@@ -1671,6 +1696,7 @@ def frost_gdn2_bprop_summary(
     mDt_bias: cute.Tensor | None,
     mDstate0: cute.Tensor | None,
     mDstate_in: cute.Tensor | None,
+    mDcomposed: cute.Tensor | None,
     mWorkItems: cute.Tensor,
     mCount: cute.Tensor,
     mScheduler: cute.Tensor,
@@ -1946,6 +1972,7 @@ def frost_gdn2_bprop_summary(
             warp_idx,
             mDstate0,
             mDstate_in,
+            mDcomposed,
             mDstateScratch,
             sDecay_scale_raw,
             sSteepTile_ptr,
@@ -1971,6 +1998,8 @@ class Gdn2BpropSummaryCfg:
     d_k: int
     d_v: int
     log_gate: bool = True
+    dstate_table: bool = True
+    has_composed_dstate: bool = False
     scheduler_stages: int = 8
 
     # ---- fixed constants stamped from CFG at build time ------------------------------
@@ -2040,11 +2069,15 @@ def build_cfg(
     d_k: int,
     d_v: int,
     log_gate: bool = True,
+    dstate_table: bool | None = None,
+    has_composed_dstate: bool = False,
 ) -> Gdn2BpropSummaryCfg:
     cfg = Gdn2BpropSummaryCfg(
         io_dtype=io_dtype,
         gate_dtype=gate_dtype,
         use_dstate_in=use_dstate_in,
+        dstate_table=use_dstate_in if dstate_table is None else bool(dstate_table),
+        has_composed_dstate=bool(has_composed_dstate),
         use_dstate0=use_dstate0,
         l2norm=l2norm,
         safe_gate=safe_gate,
@@ -2122,6 +2155,7 @@ def get_compiled_cache(
     beta_guard: bool,
     order_in_prologue: bool,
     log_gate: bool = True,
+    has_composed_dstate: bool = False,
 ):
     return {}
 
@@ -2149,6 +2183,7 @@ def compile(
     cu_seqlens_cute,
     dstate0_cute,
     dstate_in_cute,
+    dcomposed_cute=None,
     work_items_cute,
     work_count_cute,
     scheduler_counter_cute,
@@ -2156,12 +2191,16 @@ def compile(
     dstate_scratch_cute,
     scale,
     stream,
+    dstate_table=None,
+    has_composed_dstate=False,
 ):
     """JIT-compile the chunked GDN-2 bprop summary kernel for one static config."""
     cfg = build_cfg(
         io_dtype,
         gate_dtype,
         use_dstate_in=use_dstate_in,
+        dstate_table=dstate_table,
+        has_composed_dstate=has_composed_dstate,
         use_dstate0=use_dstate0,
         l2norm=l2norm,
         safe_gate=safe_gate,
@@ -2185,6 +2224,7 @@ def compile(
         cu_seqlens_cute,
         dstate0_cute,
         dstate_in_cute,
+        dcomposed_cute,
         work_items_cute,
         work_count_cute,
         scheduler_counter_cute,
@@ -2227,6 +2267,7 @@ def chunk_gdn2_bwd_summary(
     num_sm: int,
     stream,
     own_prologue: bool = True,
+    dcomposed=None,
 ) -> None:
     """BT=16 chunked GDN-2 backward state summary: the reverse state-gradient recurrence alone, writing
     ``d_initial_state`` = dL/dS0 (``(num_seqs, HO, DV, DK)``; the gradient-state pass G when ``d_final_state`` is None, else the full
@@ -2243,7 +2284,9 @@ def chunk_gdn2_bwd_summary(
     HO = max(HQ, HV)
     DK = q.shape[2]
     DV = do.shape[2]
-    use_dstate_in = d_final_state is not None
+    dstate_table = d_final_state is not None
+    has_composed_dstate = dcomposed is not None
+    use_dstate_in = dstate_table or has_composed_dstate
     use_dstate0 = d_initial_state is not None
     if not use_dstate0:
         raise ValueError("chunk_gdn2_bwd_summary requires d_initial_state (its single output)")
@@ -2281,6 +2324,7 @@ def chunk_gdn2_bwd_summary(
         beta_guard,
         order_in_prologue,
         log_gate=log_gate,
+        has_composed_dstate=has_composed_dstate,
     )
 
     if "compiled" not in cache:
@@ -2291,8 +2335,9 @@ def chunk_gdn2_bwd_summary(
         if use_dstate0:
             dstate0_cute = from_dlpack(d_initial_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
         dstate_in_cute = None
-        if use_dstate_in:
+        if dstate_table:
             dstate_in_cute = from_dlpack(d_final_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        dcomposed_cute = from_dlpack(dcomposed, assumed_align=16).mark_layout_dynamic(leading_dim=3) if has_composed_dstate else None
         work_items_cute = from_dlpack(work_items, assumed_align=16)
         work_items_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         work_count_cute = from_dlpack(work_count, assumed_align=4).mark_layout_dynamic()
@@ -2325,6 +2370,9 @@ def chunk_gdn2_bwd_summary(
             cu_seqlens_cute=cu_seqlens_cute,
             dstate0_cute=dstate0_cute,
             dstate_in_cute=dstate_in_cute,
+            dcomposed_cute=dcomposed_cute,
+            dstate_table=dstate_table,
+            has_composed_dstate=has_composed_dstate,
             work_items_cute=work_items_cute,
             work_count_cute=work_count_cute,
             scheduler_counter_cute=scheduler_counter_cute,
@@ -2390,6 +2438,7 @@ def chunk_gdn2_bwd_summary(
         cu_seqlens,
         d_initial_state,
         d_final_state,
+        dcomposed,
         work_items,
         work_count,
         scheduler_counter,
@@ -2423,6 +2472,7 @@ def run_bwd_summary(
     own_prologue=True,
     *,
     dstate_scratch,
+    dcomposed=None,
 ) -> None:
     """Replay the compiled plan: the prologue launch, then the main launch.  The plan validated the contract at build, so
     nothing here raises."""
@@ -2449,6 +2499,7 @@ def run_bwd_summary(
         cu_seqlens,
         d_initial_state,
         d_final_state,
+        dcomposed,
         work_items,
         work_count,
         scheduler_counter,

@@ -2749,8 +2749,10 @@ def compute2_warp_group(
     bidx,
     num_ctas,
     mWorkItems,
+    cu_seqlens,
     mDstate0_out,
     mDstate_in,
+    mDcomposed,
     tidx,
     tmem_base_slot,
     sCumsumlog,
@@ -2845,10 +2847,15 @@ def compute2_warp_group(
         # ---- dstate seed prologue ----------------------------------------------------
         if cutlass.const_expr(cfg.use_dstate_in):
             if num_item_chunks > 0:
-                gDstate_in = mDstate_in[None, None, head_idx, batch_idx]
+                if cutlass.const_expr(cfg.dstate_table):
+                    gDstate_in = mDstate_in[None, None, head_idx, batch_idx]
+                    dstate_src = (gDstate_in.iterator + gDstate_in.layout((dstate_gmem_row, 0))).raw_ptr()
+                    seed_vw = cutlass.const_expr(16 // (mDstate_in.element_type.width // 8))
+                if cutlass.const_expr(cfg.has_composed_dstate):
+                    is_boundary = batch_idx == cutlass.Int32(cu_seqlens.shape[0]) - cutlass.Int32(2)
+                    gDcomposed = mDcomposed[None, None, head_idx, cutlass.Int32(0)]
+                    composed_src = (gDcomposed.iterator + gDcomposed.layout((dstate_gmem_row, 0))).raw_ptr()
                 seed_from_dstate_in = compute_end == batch_num_chunks
-                dstate_src = (gDstate_in.iterator + gDstate_in.layout((dstate_gmem_row, 0))).raw_ptr()
-                seed_vw = cutlass.const_expr(16 // (mDstate_in.element_type.width // 8))
                 dstate_input_idx = dstate_input_index.idx
                 bars.mb_dstate_input_done[dstate_input_idx].wait(dstate_input_index.phase)
                 dstate_input_index = advance(dstate_input_index, cfg.tmem_dstate_input_stages)
@@ -2857,10 +2864,16 @@ def compute2_warp_group(
                     for t in cutlass.range_constexpr(16):
                         seed_block[t] = cutlass.Float32(0.0)
                     if seed_from_dstate_in:
-                        for g in cutlass.range_constexpr(16 // seed_vw):
-                            seed_chunk = (dstate_src + i * 16 + g * seed_vw).load(count=seed_vw, alignment=16)
-                            for t in cutlass.range_constexpr(seed_vw):
-                                seed_block[g * seed_vw + t] = seed_chunk[t].to(cutlass.Float32)
+                        if cutlass.const_expr(cfg.dstate_table):
+                            for g in cutlass.range_constexpr(16 // seed_vw):
+                                seed_chunk = (dstate_src + i * 16 + g * seed_vw).load(count=seed_vw, alignment=16)
+                                for t in cutlass.range_constexpr(seed_vw):
+                                    seed_block[g * seed_vw + t] = seed_chunk[t].to(cutlass.Float32)
+                        if cutlass.const_expr(cfg.has_composed_dstate):
+                            for g in cutlass.range_constexpr(4):
+                                composed_chunk = (composed_src + i * 16 + g * 4).load(count=4, alignment=16)
+                                for t in cutlass.range_constexpr(4):
+                                    seed_block[g * 4 + t] = composed_chunk[t] if is_boundary else seed_block[g * 4 + t]
                     nvvm.tcgen05_st(
                         "32x32b",
                         nvvm.make_tmem_ptr(row_lo_addr + tmem_dstate_acc_col + i * 16, cutlass.Float32),
@@ -3199,13 +3212,23 @@ def compute2_warp_group(
                 if dstate_dst >= 0:
                     gDstate0 = mDstate0_out[None, None, head_idx, dstate_dst]
                     if cutlass.const_expr(cfg.use_dstate_in):
-                        gDstate_in = mDstate_in[None, None, head_idx, batch_idx]
+                        if cutlass.const_expr(cfg.dstate_table):
+                            gDstate_in = mDstate_in[None, None, head_idx, batch_idx]
+                        if cutlass.const_expr(cfg.has_composed_dstate):
+                            is_boundary = batch_idx == cutlass.Int32(cu_seqlens.shape[0]) - cutlass.Int32(2)
+                            gDcomposed = mDcomposed[None, None, head_idx, cutlass.Int32(0)]
                         for i in cutlass.range_constexpr(num_ldtms):
                             for kk in cutlass.range_constexpr(32):
                                 if dstate_row_valid:
-                                    seed_val = gDstate_in[dstate_gmem_row, i * ldtm_width + kk]
-                                    if cutlass.const_expr(mDstate_in.element_type != mDstate0_out.element_type):
-                                        seed_val = seed_val.to(mDstate0_out.element_type)
+                                    if cutlass.const_expr(cfg.dstate_table):
+                                        seed_val = gDstate_in[dstate_gmem_row, i * ldtm_width + kk]
+                                        if cutlass.const_expr(mDstate_in.element_type != mDstate0_out.element_type):
+                                            seed_val = seed_val.to(mDstate0_out.element_type)
+                                    else:
+                                        seed_val = cutlass.Float32(0.0).to(mDstate0_out.element_type)
+                                    if cutlass.const_expr(cfg.has_composed_dstate):
+                                        composed_val = gDcomposed[dstate_gmem_row, i * ldtm_width + kk].to(mDstate0_out.element_type)
+                                        seed_val = composed_val if is_boundary else seed_val
                                     gDstate0[dstate_gmem_row, i * ldtm_width + kk] = seed_val
                     else:
                         for i in cutlass.range_constexpr(num_ldtms):
@@ -3578,6 +3601,7 @@ def host(
     cu_seqlens: cute.Tensor,
     dstate0: Optional[cute.Tensor],
     dstate_in: Optional[cute.Tensor],
+    dcomposed: Optional[cute.Tensor],
     inv_q: Optional[cute.Tensor],
     inv_k: Optional[cute.Tensor],
     tinv: Optional[cute.Tensor],
@@ -3659,6 +3683,7 @@ def host(
         dv,
         dstate0,
         dstate_in,
+        dcomposed,
         inv_q,
         inv_k,
         tinv,
@@ -3702,6 +3727,7 @@ def frost_gdn_bprop(
     mdV,
     mDstate0,
     mDstate_in,
+    mDcomposed,
     mInvQ: Optional[cute.Tensor],
     mInvK: Optional[cute.Tensor],
     mTinv: Optional[cute.Tensor],
@@ -3734,6 +3760,14 @@ def frost_gdn_bprop(
             cute.make_layout(
                 (mDstate_in.shape[2], mDstate_in.shape[3], mDstate_in.shape[1], mDstate_in.shape[0]),
                 stride=(mDstate_in.stride[2], mDstate_in.stride[3], mDstate_in.stride[1], mDstate_in.stride[0]),
+            ),
+        )
+    if cutlass.const_expr(mDcomposed is not None):
+        mDcomposed = cute.make_tensor(
+            mDcomposed.iterator,
+            cute.make_layout(
+                (mDcomposed.shape[2], mDcomposed.shape[3], mDcomposed.shape[1], mDcomposed.shape[0]),
+                stride=(mDcomposed.stride[2], mDcomposed.stride[3], mDcomposed.stride[1], mDcomposed.stride[0]),
             ),
         )
 
@@ -4222,8 +4256,10 @@ def frost_gdn_bprop(
             bidx,
             num_ctas,
             mWorkItems,
+            cu_seqlens,
             mDstate0,
             mDstate_in,
+            mDcomposed,
             tidx,
             tmem_base_slot=tmem_base_slot,
             sCumsumlog=sCumsumlog,
@@ -4363,6 +4399,8 @@ class GdnBpropCfg:
     allow_neg_eigval: bool = False
     fused_l2norm: bool = False
     tinv_source: str = "compute"
+    dstate_table: bool = True
+    has_composed_dstate: bool = False
 
     # ---- fixed constants stamped from CFG at build time ------------------------------
     b_t: int = CFG.B_T
@@ -4463,6 +4501,8 @@ def build_cfg(
     k_slots: int = 1,
     v_slots: int = 1,
     beta_slots: int = 1,
+    dstate_table: Optional[bool] = None,
+    has_composed_dstate: bool = False,
 ) -> GdnBpropCfg:
     """Build the per-compile ``GdnBpropCfg`` (io_dtype in {Float16, BFloat16}; acc is always Float32).
     ``tinv_source`` "compute" inverts the strict-masked M_kk in compute group 0; "gmem" bulk-loads the tiles of
@@ -4472,6 +4512,8 @@ def build_cfg(
     cfg = GdnBpropCfg(
         use_initial_state=use_initial_state,
         use_dstate_in=use_dstate_in,
+        dstate_table=use_dstate_in if dstate_table is None else bool(dstate_table),
+        has_composed_dstate=bool(has_composed_dstate),
         use_dstate0=use_dstate0,
         io_dtype=io_dtype,
         acc_dtype=cutlass.Float32,
@@ -4542,6 +4584,7 @@ def get_compiled_cache(
     order_gen: bool = False,
     tinv_source: str = "compute",
     layout_key: tuple = (),
+    has_composed_dstate: bool = False,
 ):
     """Return a mutable dict that lazily stores the compiled kernel."""
     return {}
@@ -4582,6 +4625,7 @@ def compile(
     cu_seqlens_cute,
     dstate0_cute=None,
     dstate_in_cute=None,
+    dcomposed_cute=None,
     inv_q_cute=None,
     inv_k_cute=None,
     tinv_cute=None,
@@ -4611,6 +4655,8 @@ def compile(
         k_slots=k_slots,
         v_slots=v_slots,
         beta_slots=beta_slots,
+        dstate_table=dstate_in_cute is not None,
+        has_composed_dstate=dcomposed_cute is not None,
     )
 
     return cute.compile(
@@ -4632,6 +4678,7 @@ def compile(
         cu_seqlens_cute,
         dstate0_cute,
         dstate_in_cute,
+        dcomposed_cute,
         inv_q_cute,
         inv_k_cute,
         tinv_cute,
@@ -4664,6 +4711,7 @@ def chunk_gdn_bwd(
     use_initial_state: bool = False,
     d_initial_state=None,
     d_final_state=None,
+    dcomposed=None,
     work_items=None,
     work_count=None,
     scheduler_counter=None,
@@ -4792,6 +4840,7 @@ def chunk_gdn_bwd(
         order_gen,
         tinv_source,
         layout_key=(len(k.shape), len(v.shape), len(beta.shape), k_slots, v_slots, beta_slots),
+        has_composed_dstate=dcomposed is not None,
     )
 
     if "compiled" not in cache:
@@ -4805,6 +4854,7 @@ def chunk_gdn_bwd(
         dstate_in_cute = None
         if d_final_state is not None:
             dstate_in_cute = from_dlpack(d_final_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        dcomposed_cute = from_dlpack(dcomposed, assumed_align=16).mark_layout_dynamic(leading_dim=3) if dcomposed is not None else None
         work_items_cute = from_dlpack(work_items, assumed_align=16)
         work_items_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         work_count_cute = from_dlpack(work_count, assumed_align=4).mark_layout_dynamic()
@@ -4816,7 +4866,7 @@ def chunk_gdn_bwd(
         cache["compiled"] = compile(
             io_dtype,
             use_initial_state=use_initial_state,
-            use_dstate_in=d_final_state is not None,
+            use_dstate_in=d_final_state is not None or dcomposed is not None,
             use_dstate0=d_initial_state is not None,
             log_gate=log_gate,
             safe_gate=safe_gate,
@@ -4847,6 +4897,7 @@ def chunk_gdn_bwd(
             cu_seqlens_cute=cu_seqlens_cute,
             dstate0_cute=dstate0_cute,
             dstate_in_cute=dstate_in_cute,
+            dcomposed_cute=dcomposed_cute,
             inv_q_cute=inv_q_cute,
             inv_k_cute=inv_k_cute,
             tinv_cute=tinv_cute,
@@ -4938,6 +4989,7 @@ def chunk_gdn_bwd(
         cu_seqlens,
         d_initial_state,
         d_final_state,
+        dcomposed,
         inv_q,
         inv_k,
         tinv,
@@ -4983,6 +5035,7 @@ def run_bwd(
     *,
     tinv=None,
     own_prologue=True,
+    dcomposed=None,
 ) -> None:
     """Replay the compiled plan: the prologue launch, then the main launch.
     The caller owns the contract, which the plan validated at build, so
@@ -5024,6 +5077,7 @@ def run_bwd(
         cu_seqlens,
         d_initial_state,
         d_final_state,
+        dcomposed,
         inv_q,
         inv_k,
         tinv,

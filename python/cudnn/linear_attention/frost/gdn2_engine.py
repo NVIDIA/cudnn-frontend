@@ -174,6 +174,10 @@ class CompiledGdn2:
         B = node.inputs["cu_seqlens"].dim[0] - 1
         self.cu_name = "int32" if node.inputs["cu_seqlens"].get_data_type().name == "INT32" else "int64"
         self.num_sm = multiprocessor_count(self.device)
+        from .common.piece_chain import build_boundary_fold, run_boundary_fold
+
+        self.build_boundary_fold, self.run_boundary_fold = build_boundary_fold, run_boundary_fold
+        self.composed_fold = None
         self.n_heads_out = HO
         self.num_seqs = B
         self.pieces, self.unit_chunks = choose_pieces(
@@ -304,12 +308,16 @@ class CompiledGdn2:
         self.index_state_checkpoints = pos.get("state_checkpoints")
         self.index_a_log = pos.get("a_log")
         self.index_dt_bias = pos.get("dt_bias")
+        self.index_preceding_state_update = pos.get("preceding_state_update")
+        self.index_preceding_transition = pos.get("preceding_transition")
+        self.index_composed = pos.get("composed_initial_state")
         if self.chain:
             positions = pos | {name: len(names) + i for i, name in enumerate(self.carve_names)}
             aliases = {
                 "gate": "g",
                 "o": "O",
                 "seed": "initial_state",
+                "composed": "composed_initial_state",
                 "seed_indices": "state_indices",
                 "final_indices": "state_indices",
                 "checkpoints": "state_checkpoints",
@@ -334,6 +342,15 @@ class CompiledGdn2:
             )
 
     def run(self, views, workspace, stream) -> None:
+        composed = views[self.index_composed] if self.index_composed is not None else None
+        if self.index_preceding_state_update is not None:
+            table = views[self.index_initial_state] if self.index_initial_state is not None else None
+            summaries = views[self.index_preceding_state_update]
+            if self.composed_fold is None:
+                self.composed_fold = self.build_boundary_fold(
+                    composed, summaries, reverse=False, num_sm=self.num_sm, device=self.device, seed_dtype=table.dtype if table is not None else None
+                )
+            self.run_boundary_fold(self.composed_fold, table, composed, summaries, views[self.index_preceding_transition], int(stream or 0))
         q = views[self.index_q]
         if self.chain and self.chain_launch is not None:
             carved = workspace.carve(self.carve)
@@ -355,7 +372,25 @@ class CompiledGdn2:
         stream = stream if stream is not None else 0
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
         if self.chain:
-            self.run_chain(q, k, v, g, beta, w, cu, state0, o, final_state, state_checkpoints, a_log, dt_bias, state_indices, region, stream)
+            self.run_chain(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                w,
+                cu,
+                state0,
+                composed,
+                o,
+                final_state,
+                state_checkpoints,
+                a_log,
+                dt_bias,
+                state_indices,
+                region,
+                stream,
+            )
             return
 
         checkpoint = self.checkpoint if self.has_state_checkpoints else 0
@@ -371,6 +406,7 @@ class CompiledGdn2:
             o=o,
             cu_seqlens=cu,
             state_in=state0,
+            composed=composed,
             state_out=final_state,
             seed_indices=state_indices,
             final_indices=state_indices,
@@ -410,7 +446,26 @@ class CompiledGdn2:
             )
         self.run_uncut_forward(self.uncut_launch, **buffers, checkpoint_every_n_tokens=checkpoint, scale=self.scale, stream=stream)
 
-    def run_chain(self, q, k, v, g, beta, w, cu, state0, o, final_state, state_checkpoints, a_log, dt_bias, state_indices, region, stream) -> None:
+    def run_chain(
+        self,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        w,
+        cu,
+        state0,
+        composed,
+        o,
+        final_state,
+        state_checkpoints,
+        a_log,
+        dt_bias,
+        state_indices,
+        region,
+        stream,
+    ) -> None:
         """Chain prologue, fused H and M summaries, fp32 state chain seeded with initial_state, prefill over the pieces seeded
         with X, all four launched from one compiled host (kernel/gdn2_chain_forward_f16.py); the checkpoint series keeps its
         unsplit layout."""
@@ -442,6 +497,7 @@ class CompiledGdn2:
             state_m=region["state_m"],
             state_x=region["state_x"],
             seed=state0,
+            composed=composed,
             seed_indices=state_indices,
             final_state=final_state,
             final_indices=state_indices,
@@ -544,6 +600,10 @@ class CompiledGdn2Bwd:
         self.n_heads_out, self.total = HO, total
         self.dim_k, self.dim_v = K, V
         self.num_sm = multiprocessor_count(self.device)
+        from .common.piece_chain import build_boundary_fold, run_boundary_fold
+
+        self.build_boundary_fold, self.run_boundary_fold = build_boundary_fold, run_boundary_fold
+        self.composed_fold = None
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.overwrite_initial_state = bool(node.params.get("overwrite_initial_state", False))
         self.num_seqs = B
@@ -660,6 +720,8 @@ class CompiledGdn2Bwd:
             if not self.has_state_checkpoints:
                 regions.append(("state_h", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
                 regions.append(("state_x", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
+        if "following_state_grad" in node.inputs:
+            regions.append(("composed_dstate", layout.add(HO * V * K * 4, align=16), "float32", (1, HO, V, K)))
         d_final = node.inputs.get("d_final_state")
         if self.steep_mode != STEEP_OFF and not self.chain and self.overwrite_initial_state and d_final is not None:
             # d_initial_state overwrites d_final_state: the bprop reads a copy so its exact twin can redo it.
@@ -695,6 +757,9 @@ class CompiledGdn2Bwd:
         self.index_d_initial_state = pos.get("d_initial_state")
         self.index_a_log = pos.get("a_log")
         self.index_dt_bias = pos.get("dt_bias")
+        self.index_following_state_grad = pos.get("following_state_grad")
+        self.index_following_transition = pos.get("following_transition")
+        self.index_composed = pos.get("composed_initial_state")
         self.index_d_a_log = pos.get("d_a_log")
         self.index_d_dt_bias = pos.get("d_dt_bias")
 
@@ -710,6 +775,7 @@ class CompiledGdn2Bwd:
         state_checkpoints = views[self.index_state_checkpoints] if self.index_state_checkpoints is not None else None
         state0 = views[self.index_initial_state] if self.index_initial_state is not None else None
         dstate_in = views[self.index_d_final_state] if self.index_d_final_state is not None else None
+        composed = views[self.index_composed] if self.index_composed is not None else None
         dq = views[self.index_dq]
         dk = views[self.index_dk]
         dv = views[self.index_dv]
@@ -724,6 +790,16 @@ class CompiledGdn2Bwd:
         stream = stream if stream is not None else 0
 
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
+        dcomposed = None
+        if self.index_following_state_grad is not None:
+            dcomposed = region["composed_dstate"]
+            table = dstate_in
+            summaries = views[self.index_following_state_grad]
+            if self.composed_fold is None:
+                self.composed_fold = self.build_boundary_fold(
+                    dcomposed, summaries, reverse=True, num_sm=self.num_sm, device=self.device, seed_dtype=table.dtype if table is not None else None
+                )
+            self.run_boundary_fold(self.composed_fold, table, dcomposed, summaries, views[self.index_following_transition], int(stream or 0))
         work_items = region["work_items"]
         work_count = region["work_count"]
         dq_out = region["dq_ho"] if self.fold_dq else dq
@@ -746,6 +822,8 @@ class CompiledGdn2Bwd:
                 checkpoint_series,
                 state0,
                 dstate_in,
+                composed,
+                dcomposed,
                 dq_out,
                 dk_out,
                 dv_out,
@@ -776,11 +854,13 @@ class CompiledGdn2Bwd:
                 checkpoints=checkpoint_series,
                 seed_checkpoints=state_checkpoints if coarse else None,
                 state_in=state0 if self.needs_recompute and not coarse else None,
+                composed=composed if self.needs_recompute and not coarse else None,
                 dgate=dg,
                 dw=dw,
                 dbeta=dbeta,
                 dstate0=dstate0 if self.has_dstate0 else None,
                 dstate_in=dstate_in,
+                dcomposed=dcomposed,
                 work_items=work_items,
                 work_count=work_count,
                 series_items=(region["work_items_recompute"] if coarse else work_items) if self.needs_recompute else None,
@@ -811,7 +891,7 @@ class CompiledGdn2Bwd:
                 self.uncut_launch = self.build_uncut_backward(
                     **buffers,
                     **schedule,
-                    use_initial_state=state0 is not None,
+                    use_initial_state=state0 is not None or composed is not None,
                     num_sm=self.num_sm,
                     gate_lower_bound=self.gate_lower_bound,
                     use_qk_l2norm=self.use_qk_l2norm,
@@ -845,6 +925,8 @@ class CompiledGdn2Bwd:
         checkpoint_series,
         state0,
         dstate_in,
+        composed,
+        dcomposed,
         dq_out,
         dk_out,
         dv_out,
@@ -909,6 +991,8 @@ class CompiledGdn2Bwd:
             state_dx_end=region["state_dx_end"],
             seed=state0,
             dseed=dstate_in,
+            composed=composed,
+            dcomposed=dcomposed,
             dstate0=dstate0,
         )
         schedule = dict(
@@ -1337,6 +1421,7 @@ class CompiledGdn2Summary:
                 dim_k=self.dim_k,
                 pieces=self.pieces,
                 rows_per_cta=self.chain_rows_per_cta(self.dim_v, self.dim_k, self.num_seqs, self.n_heads_out, self.num_sm),
+                reverse=False,
                 transpose=False,
                 has_seed=state0 is not None,
                 has_tail=True,
@@ -1646,6 +1731,7 @@ class CompiledGdn2SummaryBwd:
                 dim_k=self.dim_k,
                 pieces=1,
                 rows_per_cta=self.chain_rows_per_cta(self.dim_v, self.dim_k, self.num_seqs, self.n_heads_out, self.num_sm),
+                reverse=True,
                 transpose=True,
                 has_seed=False,
                 has_tail=False,
@@ -1801,6 +1887,7 @@ class CompiledGdn2SummaryBwd:
                 dim_k=self.dim_k,
                 pieces=self.pieces,
                 rows_per_cta=self.chain_rows_per_cta(self.dim_v, self.dim_k, self.num_seqs, self.n_heads_out, self.num_sm),
+                reverse=True,
                 transpose=True,
                 has_seed=dstate_in is not None,
                 has_tail=True,

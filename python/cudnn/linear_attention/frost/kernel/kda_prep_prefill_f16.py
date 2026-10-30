@@ -1072,6 +1072,7 @@ def compute2_warp_group(
     warp_idx,
     mState_out,
     mState_init,
+    mComposed,
     mSeedIndices,
     mFinalIndices,
     mO,
@@ -1159,13 +1160,17 @@ def compute2_warp_group(
             sV_ptr = sV_raw.data_ptr() + raw_index.idx * (cfg.d_v * cfg.b_t)
 
             # ---- state seed: initial state GMEM -> packed b16 TMEM + fp32 state TMEM ----
-            if cutlass.const_expr(mState_init is not None):
+            if cutlass.const_expr(cfg.use_initial_state):
                 if seed_from_initial_state:
                     seed_row = batch_idx
                     if cutlass.const_expr(mSeedIndices is not None):
                         seed_row = cutlass.Int32(mSeedIndices[batch_idx])
-                    seed_vw = 16 // (mState_init.element_type.width // 8)
-                    seed_src = (mState_init.iterator + mState_init.layout((seed_row, head_o, value_dim + v_offset, 0))).raw_ptr()
+                    if cutlass.const_expr(cfg.state_table):
+                        seed_vw = 16 // (mState_init.element_type.width // 8)
+                        seed_src = (mState_init.iterator + mState_init.layout((seed_row, head_o, value_dim + v_offset, 0))).raw_ptr()
+                    if cutlass.const_expr(cfg.has_composed):
+                        is_boundary = batch_idx == cutlass.Int32(0)
+                        composed_src = (mComposed.iterator + mComposed.layout((cutlass.Int32(0), head_o, value_dim + v_offset, 0))).raw_ptr()
                     bars.mb_raw_ready[raw_bar_index.idx].wait(raw_bar_index.phase)
                     seed_exchange_ptr = sGate_exchange_raw.data_ptr() + raw_index.idx * cfg.d_k
                     if cutlass.const_expr(cfg.enable_checkpoints):
@@ -1176,10 +1181,19 @@ def compute2_warp_group(
                         seed_vecs = []
                         for i in cutlass.range_constexpr(init_blocks_lo, init_blocks_hi):
                             seed_block = []
-                            for g in cutlass.range_constexpr(16 // seed_vw):
-                                seed_chunk = (seed_src + i * 16 + g * seed_vw).load(count=seed_vw, alignment=16)
-                                for t in cutlass.range_constexpr(seed_vw):
-                                    seed_block.append(seed_chunk[t].to(cutlass.Float32))
+                            if cutlass.const_expr(cfg.state_table):
+                                for g in cutlass.range_constexpr(16 // seed_vw):
+                                    seed_chunk = (seed_src + i * 16 + g * seed_vw).load(count=seed_vw, alignment=16)
+                                    for t in cutlass.range_constexpr(seed_vw):
+                                        seed_block.append(seed_chunk[t].to(cutlass.Float32))
+                            else:
+                                for t in cutlass.range_constexpr(16):
+                                    seed_block.append(cutlass.Float32(0.0))
+                            if cutlass.const_expr(cfg.has_composed):
+                                for g in cutlass.range_constexpr(4):
+                                    composed_chunk = (composed_src + i * 16 + g * 4).load(count=4, alignment=16)
+                                    for t in cutlass.range_constexpr(4):
+                                        seed_block[g * 4 + t] = composed_chunk[t] if is_boundary else seed_block[g * 4 + t]
                             seed_vecs.append(seed_block)
 
                         seed_packed_blocks = []
@@ -1262,7 +1276,7 @@ def compute2_warp_group(
                                 bars.mb_checkpoint_tmastg_ready[checkpoint_stage].arrive()
                             checkpoint_row_count = checkpoint_row_count + cutlass.Int32(1)
 
-            if cutlass.const_expr(cfg.enable_checkpoints and mState_init is None):
+            if cutlass.const_expr(cfg.enable_checkpoints and not cfg.use_initial_state):
                 if write_start == 0:
                     bars.mb_checkpoint_tmastg_done[checkpoint_stage].wait(checkpoint_stage_parity)
                     checkpoint_stage_base = checkpoint_stage * cfg.checkpoint_stage_elems
@@ -1303,7 +1317,7 @@ def compute2_warp_group(
 
             y_lo = [cutlass.Int32(0) for _ in range(4)]
             y_hi = [cutlass.Int32(0) for _ in range(4)]
-            if cutlass.const_expr(mState_init is not None):
+            if cutlass.const_expr(cfg.use_initial_state):
                 if seed_from_initial_state:
                     bars.mb_state_k_acc_ready.wait(state_k_acc_index.phase)
                     state_k_acc_index = advance(state_k_acc_index, 1)
@@ -1585,7 +1599,15 @@ def compute2_warp_group(
                     for key_block_start in cutlass.range_constexpr(0, cfg.d_k, 32):
                         for col in cutlass.range_constexpr(32):
                             key_dim = key_block_start + col
-                            if cutlass.const_expr(mState_init is not None):
+                            if cutlass.const_expr(cfg.has_composed):
+                                if cutlass.const_expr(cfg.state_table):
+                                    pass_val = mState_init[seed_row, head_o, value_dim + v_offset, key_dim].to(cutlass.Float32)
+                                else:
+                                    pass_val = cutlass.Float32(0.0)
+                                composed_val = mComposed[cutlass.Int32(0), head_o, value_dim + v_offset, key_dim]
+                                pass_val = composed_val if batch_idx == cutlass.Int32(0) else pass_val
+                                mState_out[final_row, head_o, value_dim + v_offset, key_dim] = pass_val.to(mState_out.element_type)
+                            elif cutlass.const_expr(cfg.use_initial_state):
                                 mState_out[final_row, head_o, value_dim + v_offset, key_dim] = mState_init[seed_row, head_o, value_dim + v_offset, key_dim].to(
                                     mState_out.element_type
                                 )
@@ -1963,6 +1985,7 @@ def host(
     beta: cute.Tensor,
     cu_seqlens: cute.Tensor,
     initial_state: cute.Tensor | None,
+    composed: cute.Tensor | None,
     out: cute.Tensor,
     final_state: cute.Tensor | None,
     seed_indices: cute.Tensor | None,
@@ -1997,6 +2020,7 @@ def host(
         beta,
         cu_seqlens,
         initial_state,
+        composed,
         out,
         final_state,
         seed_indices,
@@ -2030,6 +2054,7 @@ def frost_kda_prep_prefill(
     mBeta: cute.Tensor,
     cu_seqlens: cute.Tensor,
     mState_init: cute.Tensor | None,
+    mComposed: cute.Tensor | None,
     mO: cute.Tensor,
     mState_out: cute.Tensor | None,
     mSeedIndices: cute.Tensor | None,
@@ -2268,6 +2293,7 @@ def frost_kda_prep_prefill(
             warp_idx,
             mState_out,
             mState_init,
+            mComposed,
             mSeedIndices,
             mFinalIndices,
             mO,
@@ -2321,6 +2347,8 @@ class KdaPrepPrefillCfg:
     d_k: int
     d_v: int
     tiles_per_head: int = 1
+    state_table: bool = True
+    has_composed: bool = False
     scheduler_stages: int = CFG.SMEM_SCHEDULER_STAGES
 
     compute_group_0_warp_ids: tuple[int, ...] = (0, 1, 2, 3)
@@ -2397,6 +2425,8 @@ def build_cfg(
     d_k: int,
     d_v: int,
     tiles_per_head: int = 1,
+    state_table: bool | None = None,
+    has_composed: bool = False,
 ) -> KdaPrepPrefillCfg:
     """Build the per-compile ``KdaPrepPrefillCfg`` (io_dtype in {Float16, BFloat16}); fills the derived TMEM column
     offsets and SMEM buffer cosizes.  ``tiles_per_head`` > 1 runs every gate head as ``tiles_per_head`` tiles of ``d_v`` value
@@ -2406,6 +2436,8 @@ def build_cfg(
         state_dtype=state_dtype,
         gate_dtype=gate_dtype,
         use_initial_state=use_initial_state,
+        state_table=use_initial_state if state_table is None else bool(state_table),
+        has_composed=bool(has_composed),
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
         l2norm=l2norm,

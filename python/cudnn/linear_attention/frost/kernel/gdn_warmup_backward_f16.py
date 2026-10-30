@@ -303,6 +303,7 @@ def warmup_backward_host(
     checkpoints: cute.Tensor,
     seed_checkpoints: Optional[cute.Tensor],
     state_in: Optional[cute.Tensor],
+    composed: Optional[cute.Tensor],
     work_items: cute.Tensor,
     work_items_table: cute.Tensor,
     work_count: cute.Tensor,
@@ -426,6 +427,7 @@ def warmup_backward_host(
             dt_bias,
             cu_seqlens,
             state_in,
+            composed,
             None,
             seed_checkpoints,
             tinv,
@@ -512,6 +514,7 @@ def build_warmup_backward(
     checkpoints,
     seed_checkpoints,
     state_in,
+    composed=None,
     work_items,
     work_count,
     series_items,
@@ -579,6 +582,7 @@ def build_warmup_backward(
         str(a_log.dtype) if a_log is not None else "none",
         str(dt_bias.dtype) if dt_bias is not None else "none",
         str(state_in.dtype) if state_in is not None else "none",
+        composed is not None,
         int(device),
         int(num_sm),
         DK,
@@ -625,7 +629,9 @@ def build_warmup_backward(
                 io_dtype,
                 get_dtype(state_in.dtype) if state_in is not None else cutlass.Float32,
                 max_active_clusters=num_sm,
-                use_initial_state=state_in is not None,
+                use_initial_state=state_in is not None or composed is not None,
+                state_table=state_in is not None,
+                has_composed=composed is not None,
                 store_final_state=False,
                 enable_checkpoints=True,
                 seed_checkpoints=coarse,
@@ -669,6 +675,9 @@ def build_warmup_backward(
         state_in_placeholder = None
         if state_in is not None:
             state_in_placeholder = from_dlpack(state_in, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        composed_placeholder = None
+        if composed is not None:
+            composed_placeholder = from_dlpack(composed, assumed_align=16).mark_layout_dynamic(leading_dim=3)
         warmup_backward_cache[key] = cute.compile(
             warmup_backward_host,
             facts.split,
@@ -725,6 +734,7 @@ def build_warmup_backward(
             from_dlpack(checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=3),
             from_dlpack(seed_checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=3) if coarse else None,
             state_in_placeholder,
+            composed_placeholder,
             work_items_placeholder,
             work_items_table_placeholder,
             from_dlpack(work_count, assumed_align=4).mark_layout_dynamic(),
@@ -772,6 +782,7 @@ def run_warmup_backward(
     checkpoints,
     seed_checkpoints,
     state_in,
+    composed=None,
     work_items,
     work_count,
     series_items,
@@ -830,6 +841,7 @@ def run_warmup_backward(
         checkpoints,
         seed_checkpoints if coarse else None,
         state_in,
+        composed,
         work_items,
         work_items,
         work_count,

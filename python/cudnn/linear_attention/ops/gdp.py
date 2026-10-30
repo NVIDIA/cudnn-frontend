@@ -15,7 +15,17 @@ from typing import Dict, Optional, Tuple
 import torch
 import cudnn
 
-from .common import execute_graph, make_execution_resources, make_summary_cache_key, select_plan, summary_backward, summary_setup_context, torch_dtype_to_cudnn
+from .common import (
+    check_composed_state,
+    check_composed_summaries,
+    execute_graph,
+    make_execution_resources,
+    make_summary_cache_key,
+    select_plan,
+    summary_backward,
+    summary_setup_context,
+    torch_dtype_to_cudnn,
+)
 
 # ---------------------------------------------------------------------------
 # Module-level state
@@ -69,6 +79,7 @@ def make_fprop_cache_key(
     overwrite_initial_state,
     state_pool_rows=None,
     beta_shape=None,
+    composed_rows=None,
 ):
     return (
         "gdp_fprop",
@@ -104,6 +115,7 @@ def make_fprop_cache_key(
         bool(overwrite_initial_state),
         state_pool_rows,
         beta_shape,
+        composed_rows,
     )
 
 
@@ -140,6 +152,7 @@ def make_bprop_cache_key(
     device,
     plan_name,
     beta_shape=None,
+    composed_rows=None,
 ):
     return (
         "gdp_bprop",
@@ -175,6 +188,7 @@ def make_bprop_cache_key(
         device,
         plan_name,
         beta_shape,
+        composed_rows,
     )
 
 
@@ -247,6 +261,7 @@ def build_fprop_graph(
     k_shape=None,
     v_shape=None,
     beta_shape=None,
+    composed_rows=None,
 ):
     graph = cudnn.pygraph()
     HO = max(H, HV)
@@ -265,12 +280,18 @@ def build_fprop_graph(
     if state_indices_dtype is not None:
         state_indices_t = graph.tensor([N], data_type=state_indices_dtype, name="state_indices")
     pool_ports = {"state_indices": state_indices_t} if state_indices_t is not None else {}
+    composed_ports = {}
+    if composed_rows is not None:
+        composed_ports = dict(
+            preceding_state_update=graph.tensor([composed_rows, HO, V, K], data_type=cudnn.data_type.FLOAT, name="preceding_state_update"),
+            preceding_transition=graph.tensor([composed_rows, HO, K, K], data_type=cudnn.data_type.FLOAT, name="preceding_transition"),
+        )
     a_log_t = dt_bias_t = None
     if a_log_dtype is not None:
         a_log_t = graph.tensor([HO], data_type=a_log_dtype, name="a_log")
     if dt_bias_dtype is not None:
         dt_bias_t = graph.tensor([HO], data_type=dt_bias_dtype, name="dt_bias")
-    O_t, fs_t, state_checkpoints_t = graph.gdp(
+    O_t, fs_t, state_checkpoints_t, composed_t = graph.gdp(
         q=q_t,
         k=k_t,
         v=v_t,
@@ -279,6 +300,7 @@ def build_fprop_graph(
         cu_seqlens=cu_t,
         initial_state=state0_t,
         **pool_ports,
+        **composed_ports,
         a_log=a_log_t,
         dt_bias=dt_bias_t,
         num_householder=num_householder,
@@ -296,6 +318,8 @@ def build_fprop_graph(
     )
     if state_checkpoints_t is not None:
         state_checkpoints_t.set_data_type(cudnn.data_type.FLOAT if checkpoint_dtype == torch.float32 else io_dtype)
+    if composed_t is not None:
+        composed_t.set_data_type(cudnn.data_type.FLOAT)
     return graph, dict(
         q=q_t,
         k=k_t,
@@ -310,6 +334,8 @@ def build_fprop_graph(
         O=O_t,
         fs=fs_t,
         state_checkpoints=state_checkpoints_t,
+        composed_initial_state=composed_t,
+        **composed_ports,
     )
 
 
@@ -342,7 +368,9 @@ def run_gdp_fwd(
     plan_name: Optional[str] = None,
     final_state_out: Optional[torch.Tensor] = None,
     state_indices: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    preceding_state_update: Optional[torch.Tensor] = None,
+    preceding_transition: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal GDP forward over a cached single-node GDP pygraph in THD layout.
 
     Returns ``(o, final_state, state_checkpoints)``; ``final_state`` /
@@ -350,7 +378,12 @@ def run_gdp_fwd(
     is ``False`` / ``checkpoint_every_n_tokens`` is ``0``.
     ``final_state_out`` binds the final_state output to a caller buffer (the in-place op passes ``initial_state``);
     ``state_indices`` (int32 ``[N]``) makes ``initial_state`` a pool whose row ``state_indices[i]`` seeds sequence ``i``
-    and receives its final state.
+    and receives its final state.  ``preceding_state_update`` / ``preceding_transition`` (fp32 ``[P, HO, V, K]`` /
+    ``[P, HO, K, K]``, the forward summaries of the ``P`` preceding context-parallel ranks in rank order) are folded on
+    the device into the one-row ``composed_initial_state`` (fp32 ``[1, HO, V, K]``, the fourth output) that the first
+    local sequence starts from; the caller's ``initial_state`` row 0, when given, is the state beyond the farthest rank
+    and the other rows stay the other sequences' starts (zero without one).  Zero-size without summaries, as with an
+    empty ``P = 0`` pair.
     """
     total, H, K = q.shape
     n = int(num_householder)
@@ -423,6 +456,22 @@ def run_gdp_fwd(
             raise ValueError(f"gated_delta_product: {tensor_name} must be on q's device ({device}); got {tensor.device}")
     state0 = initial_state if initial_state is not None else None
     state_out_dtype = state0.dtype if state0 is not None else torch.float32
+    composed_rows = check_composed_summaries(
+        "gated_delta_product",
+        "preceding_state_update",
+        "preceding_transition",
+        preceding_state_update,
+        preceding_transition,
+        (max(H, HV), V, K),
+        (max(H, HV), K, K),
+        device,
+    )
+    composed = torch.empty(0, dtype=torch.float32, device=device)
+    if composed_rows:
+        if state_indices is not None or final_state_out is not None:
+            raise ValueError("gated_delta_product: preceding summaries cannot combine with state_indices or overwrite_initial_state")
+        composed = torch.empty(1, max(H, HV), V, K, dtype=torch.float32, device=device)
+    state_out_dtype = state0.dtype if state0 is not None else torch.float32
     checkpoint = int(checkpoint_every_n_tokens)
     if checkpoint_dtype not in (None, torch.float32, q.dtype):
         raise ValueError(f"gated_delta_product: checkpoint_dtype must be None, torch.float32 or the io dtype ({q.dtype}), got {checkpoint_dtype}")
@@ -464,6 +513,7 @@ def run_gdp_fwd(
         final_state_out is not None,
         state_pool_rows,
         tuple(beta.shape),
+        composed_rows=composed_rows or None,
     ) + (family_slots(k, n, 3), family_slots(v, n, 3), family_slots(beta, n, 2))
     if cache_key not in fprop_cache:
         fprop_cache[cache_key] = build_fprop_graph(
@@ -498,6 +548,7 @@ def run_gdp_fwd(
             k_shape=tuple(k.shape),
             v_shape=tuple(v.shape),
             beta_shape=tuple(beta.shape),
+            composed_rows=composed_rows or None,
         )
         select_plan(fprop_cache[cache_key][0], plan_name)
 
@@ -518,6 +569,10 @@ def run_gdp_fwd(
         variant_pack[t["state0"]] = state0
     if state_indices is not None:
         variant_pack[t["state_indices"]] = state_indices
+    if composed_rows:
+        variant_pack[t["preceding_state_update"]] = preceding_state_update
+        variant_pack[t["preceding_transition"]] = preceding_transition
+        variant_pack[t["composed_initial_state"]] = composed
     if a_log is not None:
         variant_pack[t["a_log"]] = a_log
     if dt_bias is not None:
@@ -536,7 +591,7 @@ def run_gdp_fwd(
         variant_pack[t["state_checkpoints"]] = state_checkpoints
     workspace, handle = make_execution_resources(graph, device)
     execute_graph(graph, variant_pack, workspace, handle)
-    return o, final_state, state_checkpoints
+    return o, final_state, state_checkpoints, composed
 
 
 @torch.library.custom_op("cudnn::gated_delta_product_fwd", mutates_args=())
@@ -562,7 +617,9 @@ def gdp_fwd(
     checkpoint_every_n_tokens: int = 0,
     checkpoint_dtype: Optional[torch.dtype] = None,
     plan_name: Optional[str] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    preceding_state_update: Optional[torch.Tensor] = None,
+    preceding_transition: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Functional GDP forward: :func:`run_gdp_fwd` with fresh outputs; the autograd formula registers below."""
     return run_gdp_fwd(
         q=q,
@@ -586,6 +643,8 @@ def gdp_fwd(
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         checkpoint_dtype=checkpoint_dtype,
         plan_name=plan_name,
+        preceding_state_update=preceding_state_update,
+        preceding_transition=preceding_transition,
     )
 
 
@@ -618,7 +677,7 @@ def gdp_fwd_overwrite_state(
     table addresses a state pool.  The engine runs the chain or the uncut schedule and
     never the split-K cut, so the state a sequence reads at its first chunk is the one it writes at its last.  Inference
     only: a mutating op registers no autograd formula.  Returns ``(o, state_checkpoints)``."""
-    o, _, state_checkpoints = run_gdp_fwd(
+    o, _, state_checkpoints, _ = run_gdp_fwd(
         q=q,
         k=k,
         v=v,
@@ -669,6 +728,8 @@ def gdp_fwd_fake(
     checkpoint_every_n_tokens=0,
     checkpoint_dtype=None,
     plan_name: Optional[str] = None,
+    preceding_state_update=None,
+    preceding_transition=None,
 ):
     total, H, K = q.shape
     HK = k.shape[-2]
@@ -689,6 +750,10 @@ def gdp_fwd_fake(
         raise ValueError(f"initial_state must carry one state per sequence: got {initial_state.shape[0]} for {N} sequences")
     o = q.new_empty(total, HO, V)
     state_dtype = initial_state.dtype if initial_state is not None else torch.float32
+    composed_rows = check_composed_summaries(
+        "gated_delta_product", "preceding_state_update", "preceding_transition", preceding_state_update, preceding_transition, (HO, V, K), (HO, K, K), q.device
+    )
+    composed = q.new_empty((1, HO, V, K) if composed_rows else (0,), dtype=torch.float32)
     final = q.new_empty((N, HO, V, K) if output_final_state else (0,), dtype=state_dtype)
     if checkpoint_every_n_tokens > 0:
         total_checkpoints = max(total * int(num_householder) // int(checkpoint_every_n_tokens) + N, 1)
@@ -701,7 +766,7 @@ def gdp_fwd_fake(
         )
     else:
         state_checkpoints = q.new_empty(0)
-    return o, final, state_checkpoints
+    return o, final, state_checkpoints, composed
 
 
 @gdp_fwd_overwrite_state.register_fake
@@ -729,7 +794,7 @@ def gdp_fwd_overwrite_state_fake(
     state_indices=None,
     output_final_state=True,
 ):
-    o, _, state_checkpoints = gdp_fwd_fake(
+    o, _, state_checkpoints, _ = gdp_fwd_fake(
         q=q,
         k=k,
         v=v,
@@ -790,6 +855,8 @@ def build_bprop_graph(
     v_shape=None,
     beta_shape=None,
     checkpoint_dtype=None,
+    composed_rows=None,
+    has_composed_state=False,
 ):
     graph = cudnn.pygraph()
     HO = max(H, HV)
@@ -801,6 +868,7 @@ def build_bprop_graph(
     beta_t = graph.tensor(list(beta_shape) if beta_shape is not None else [expanded, HO], data_type=beta_dtype, name="beta")
     cu_t = graph.tensor([N + 1], data_type=cu_dtype, name="cu_seqlens")
     dO_t = graph.tensor([total, HO, V], data_type=io_dtype, name="dO")
+    composed_state_t = graph.tensor([1, HO, V, K], data_type=cudnn.data_type.FLOAT, name="composed_initial_state") if has_composed_state else None
     state0_t = None
     if state_dtype is not None:
         state0_t = graph.tensor([N, HO, V, K], data_type=state_dtype, name="initial_state")
@@ -810,6 +878,12 @@ def build_bprop_graph(
     checkpoints_t = None
     if checkpoint_rows is not None:
         checkpoints_t = graph.tensor([checkpoint_rows, HO, V, K], data_type=checkpoint_dtype, name="state_checkpoints")
+    composed_ports = {}
+    if composed_rows is not None:
+        composed_ports = dict(
+            following_state_grad=graph.tensor([composed_rows, HO, V, K], data_type=cudnn.data_type.FLOAT, name="following_state_grad"),
+            following_transition=graph.tensor([composed_rows, HO, K, K], data_type=cudnn.data_type.FLOAT, name="following_transition"),
+        )
     a_log_t = dt_bias_t = None
     if a_log_dtype is not None:
         a_log_t = graph.tensor([HO], data_type=a_log_dtype, name="a_log")
@@ -826,6 +900,8 @@ def build_bprop_graph(
         state_checkpoints=checkpoints_t,
         initial_state=state0_t,
         d_final_state=dfs_t,
+        composed_initial_state=composed_state_t,
+        **composed_ports,
         a_log=a_log_t,
         dt_bias=dt_bias_t,
         num_householder=num_householder,
@@ -860,6 +936,8 @@ def build_bprop_graph(
         d_a_log=d_a_log_t,
         d_dt_bias=d_dt_bias_t,
         checkpoints=checkpoints_t,
+        composed_initial_state=composed_state_t,
+        **composed_ports,
     )
 
 
@@ -892,6 +970,9 @@ def gdp_bwd(
     a_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     plan_name: Optional[str] = None,
+    following_state_grad: Optional[torch.Tensor] = None,
+    following_transition: Optional[torch.Tensor] = None,
+    composed_initial_state: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal GDP backward over a cached single-node GDP_BWD pygraph in THD layout.
 
@@ -900,6 +981,12 @@ def gdp_bwd(
     when ``initial_state`` / ``a_log`` / ``dt_bias`` is ``None``. With
     ``use_beta_sigmoid_in_kernel``, ``beta`` is raw logits (float32 or the
     io dtype) and ``dbeta`` is the raw-logit gradient in ``beta``'s dtype.
+    ``following_state_grad`` / ``following_transition`` (fp32 ``[P, HO, V, K]`` / ``[P, HO, K, K]``, the backward summaries
+    of the ``P`` following context-parallel ranks in rank order) are folded on the device into a one-row gradient state
+    that the last local sequence starts from (the caller's ``d_final_state`` row, when given, is the gradient beyond the
+    farthest rank; every other sequence starts from its ``d_final_state`` row, or zero).  ``composed_initial_state`` (fp32
+    ``[1, HO, V, K]``, the forward's fourth output) is the first local sequence's initial state under context
+    parallelism, beside the caller's optional ``initial_state``.
     """
     total, H, K = q.shape
     n = int(num_householder)
@@ -972,6 +1059,18 @@ def gdp_bwd(
 
     from ..frost.common.host import family_slots
 
+    composed_rows = check_composed_summaries(
+        "gated_delta_product",
+        "following_state_grad",
+        "following_transition",
+        following_state_grad,
+        following_transition,
+        (max(H, HV), V, K),
+        (max(H, HV), K, K),
+        device,
+    )
+    composed_state = check_composed_state("gated_delta_product", composed_initial_state, (max(H, HV), V, K), device)
+
     cache_key = make_bprop_cache_key(
         total,
         N,
@@ -1005,7 +1104,8 @@ def gdp_bwd(
         device,
         plan_name,
         tuple(beta.shape),
-    ) + (family_slots(k, n, 3), family_slots(v, n, 3), family_slots(beta, n, 2))
+        composed_rows=composed_rows or None,
+    ) + (family_slots(k, n, 3), family_slots(v, n, 3), family_slots(beta, n, 2), composed_state is not None)
     if cache_key not in bprop_cache:
         bprop_cache[cache_key] = build_bprop_graph(
             total,
@@ -1037,6 +1137,8 @@ def gdp_bwd(
             k_shape=tuple(k.shape),
             v_shape=tuple(v.shape),
             beta_shape=tuple(beta.shape),
+            composed_rows=composed_rows or None,
+            has_composed_state=composed_state is not None,
         )
         select_plan(bprop_cache[cache_key][0], plan_name)
 
@@ -1070,6 +1172,11 @@ def gdp_bwd(
         variant_pack[t["dstate0"]] = dstate0
     if dstate_in is not None:
         variant_pack[t["dfs"]] = dstate_in
+    if composed_rows:
+        variant_pack[t["following_state_grad"]] = following_state_grad
+        variant_pack[t["following_transition"]] = following_transition
+    if composed_state is not None:
+        variant_pack[t["composed_initial_state"]] = composed_state
     if state_checkpoints is not None:
         variant_pack[t["checkpoints"]] = state_checkpoints
     d_a_log = torch.empty(0, dtype=torch.float32, device=device)
@@ -1114,6 +1221,9 @@ def gdp_bwd_fake(
     a_log=None,
     dt_bias=None,
     plan_name=None,
+    following_state_grad=None,
+    following_transition=None,
+    composed_initial_state=None,
 ):
     dstate_dtype = initial_state.dtype if initial_state is not None else torch.float32
     if d_final_state is not None and d_final_state.dtype != dstate_dtype:
@@ -1161,6 +1271,8 @@ def gdp_setup_context(ctx, inputs, output):
         checkpoint_every_n_tokens,
         checkpoint_dtype,
         plan_name,
+        preceding_state_update,
+        preceding_transition,
     ) = inputs
     saved = [q, k, v, g, beta, cu_seqlens]
     ctx.checkpoint_reuse = checkpoint_every_n_tokens > 0 and checkpoint_every_n_tokens % CHECKPOINT_CHUNK == 0 and output[2].numel() > 0
@@ -1176,7 +1288,11 @@ def gdp_setup_context(ctx, inputs, output):
     if ctx.has_dt_bias:
         saved.append(dt_bias)
     ctx.save_for_backward(*saved)
+    # under context parallelism the backward starts from the composed state, and the caller's initial_state (the
+    # state beyond the farthest preceding rank) gets no gradient
+    ctx.composed = output[3].numel() > 0
     ctx.initial_state = initial_state
+    ctx.composed_state = output[3] if ctx.composed else None
     ctx.num_householder = num_householder
     ctx.scale = scale
     ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
@@ -1185,10 +1301,10 @@ def gdp_setup_context(ctx, inputs, output):
     ctx.use_beta_sigmoid_in_kernel = bool(use_beta_sigmoid_in_kernel)
     ctx.allow_neg_eigval = bool(allow_neg_eigval)
     ctx.set_materialize_grads(False)
-    ctx.mark_non_differentiable(output[2])
+    ctx.mark_non_differentiable(output[2], output[3])
 
 
-def gdp_backward(ctx, dO, dFinal, dstate_checkpoints):
+def gdp_backward(ctx, dO, dFinal, dstate_checkpoints, d_composed_initial_state):
     # Non-reentrant activation checkpointing allows one saved-tensor unpack.
     saved_tensors = ctx.saved_tensors
     if ctx.checkpoint_reuse:
@@ -1217,6 +1333,7 @@ def gdp_backward(ctx, dO, dFinal, dstate_checkpoints):
         ctx.scale,
         initial_state=initial_state,
         d_final_state=dstate_in,
+        composed_initial_state=ctx.composed_state,
         state_checkpoints=state_checkpoints,
         checkpoint_every_n_tokens=ctx.checkpoint_every_n_tokens,
         use_qk_l2norm_in_kernel=ctx.use_qk_l2norm_in_kernel,
@@ -1238,7 +1355,7 @@ def gdp_backward(ctx, dO, dFinal, dstate_checkpoints):
         None,
         None,
         None,
-        dstate0 if initial_state is not None else None,
+        dstate0 if initial_state is not None and not ctx.composed else None,
         None,
         None,
         None,
@@ -1248,6 +1365,8 @@ def gdp_backward(ctx, dO, dFinal, dstate_checkpoints):
         None,
         d_a_log if ctx.has_a_log else None,
         d_dt_bias if ctx.has_dt_bias else None,
+        None,
+        None,
         None,
         None,
         None,
@@ -1290,6 +1409,8 @@ def gated_delta_product(
     plan_name: Optional[str] = None,
     overwrite_initial_state: bool = False,
     state_indices: Optional[torch.Tensor] = None,
+    preceding_state_update: Optional[torch.Tensor] = None,
+    preceding_transition: Optional[torch.Tensor] = None,
 ):
     """Gated DeltaProduct (GDP) linear attention.
 
@@ -1372,7 +1493,9 @@ def gated_delta_product(
             call.  Implies ``overwrite_initial_state``.  Forward only; cannot
             combine with ``checkpoint_every_n_tokens``.
 
-    Other arguments and returns match :func:`gated_delta_net`.
+    ``preceding_state_update`` / ``preceding_transition`` (context parallelism) and the fourth output
+    ``composed_initial_state`` they add follow :func:`gated_delta_net` as well.  Other arguments and returns match
+    :func:`gated_delta_net`.
     """
     if q.dim() != 3:
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
@@ -1383,6 +1506,8 @@ def gated_delta_product(
     if overwrite_initial_state or state_indices is not None:
         if initial_state is None:
             raise ValueError("gated_delta_product: overwrite_initial_state requires initial_state")
+        if preceding_state_update is not None or preceding_transition is not None:
+            raise ValueError("gated_delta_product: preceding summaries cannot combine with overwrite_initial_state or state_indices")
         o, state_checkpoints = torch.ops.cudnn.gated_delta_product_fwd_overwrite_state(
             q,
             k,
@@ -1409,7 +1534,7 @@ def gated_delta_product(
         )
         final_state = initial_state if (output_final_state or overwrite_initial_state) else initial_state.new_empty(0)
     else:
-        o, final_state, state_checkpoints = torch.ops.cudnn.gated_delta_product_fwd(
+        o, final_state, state_checkpoints, composed_initial_state = torch.ops.cudnn.gated_delta_product_fwd(
             q,
             k,
             v,
@@ -1431,7 +1556,11 @@ def gated_delta_product(
             checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
             checkpoint_dtype=checkpoint_dtype,
             plan_name=plan_name,
+            preceding_state_update=preceding_state_update,
+            preceding_transition=preceding_transition,
         )
+        if preceding_state_update is not None:
+            return o, final_state, state_checkpoints, composed_initial_state
     if checkpoint_every_n_tokens > 0:
         return o, final_state, state_checkpoints
     return o, final_state
