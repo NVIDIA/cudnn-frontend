@@ -3192,9 +3192,10 @@ def test_fp8_proj_bf16_attention_extend_e4m3_o_is_the_cast_of_the_gated_o_and_tr
     )
     assert in_band["n"] > 0.5 * full["n"] and in_band["more"] == 0 and full["exact"] > 0.5 * full["n"], (in_band, full)
     out1 = rec["out"].clone()
+    o8_first = o8[live].view(torch.uint8).clone()  # a SNAPSHOT: `o8` views the workspace slot the second launch overwrites
     hz.refill_pools()
     rec2 = hz.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
-    assert torch.equal(out1, rec2["out"]) and torch.equal(o8[live].view(torch.uint8), hz.o8()[live].view(torch.uint8)), "two launches differ"
+    assert torch.equal(out1, rec2["out"]) and torch.equal(o8_first, hz.o8()[live].view(torch.uint8)), "two launches differ"
 
 
 @pytest.mark.L1

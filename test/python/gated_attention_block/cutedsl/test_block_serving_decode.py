@@ -48,6 +48,7 @@ import contextlib
 import math
 import os
 import sys
+import time
 
 import pytest
 import torch
@@ -1330,13 +1331,17 @@ class _Case:
         heads=None,
         d_model=None,
         quant=None,
+        check_numerics=True,
     ):
         """``quant`` (appended; None = the bf16 / f16 form) selects the FP8-PROJECTION + BF16-ATTENTION mode (``QuantSpec(attention_dtype=
         torch.bfloat16)``): ``True`` calibrates the static per-tensor scales on this case's own data (amax scales for h / W_qkvg / W_o, ``scale_o``
         from the oracle's gated O: an offline calibration stand-in), a ``scales`` dict of another case reuses ITS scales (a sibling case whose e4m3
         codes a captured block must read under the same spec); ``h`` and the weights are then e4m3 codes, ``dtype`` stays the bf16 activation
-        dtype, and the oracle is the fp8 reference's ``attention_bf16`` arm (no Q / K / V quantization point, the gated O quantized at ``scale_o``)."""
+        dtype, and the oracle is the fp8 reference's ``attention_bf16`` arm (no Q / K / V quantization point, the gated O quantized at ``scale_o``).  ``check_numerics=False`` (appended) builds the case WITHOUT a reference -- random bf16 K / V rows fill
+        the pools, ``scale_o`` is 1.0, ``ref_out`` stays 0 and ``check_against_oracle`` / ``recompute_oracle`` refuse -- for the cells that pin
+        launches, not values (the census)."""
         self.group, self.s_q, self.kv_lens, self.page, self.layout, self.dtype = group, int(s_q), [int(x) for x in kv_lens], page, layout, dtype
+        self.check_numerics = bool(check_numerics)
         self.quant_mode = quant is not None
         self.d_model = _D_MODEL if d_model is None else int(d_model)  # the shrunk matrix width, or a shard's real one
         self.geom, self.ref_geom = _geom(group, heads=heads, d_model=self.d_model)
@@ -1385,14 +1390,21 @@ class _Case:
         self.ref_o, self.ref_gate, self.ref_og, self.ref_o8 = {}, {}, {}, {}  # the mode's oracle intermediates (the step's rows), per live entry
         if self.quant_mode:
             if self.scales["scale_o"] is None:
-                # scale_o from the oracle's gated O over every live entry (pass 1 at scale 1), then the oracle at that scale (pass 2)
-                og = torch.cat([self._mode_oracle(b, 1.0).o_gated.flatten() for b, L in enumerate(self.kv_lens) if L])
-                self.scales["scale_o"] = amax_scale(og)
+                if self.check_numerics:
+                    # scale_o from the oracle's gated O over every live entry (pass 1 at scale 1), then the oracle at that scale (pass 2)
+                    og = torch.cat([self._mode_oracle(b, 1.0).o_gated.flatten() for b, L in enumerate(self.kv_lens) if L])
+                    self.scales["scale_o"] = amax_scale(og)
+                else:
+                    self.scales["scale_o"] = 1.0  # no reference: any finite positive scale declares the same chain
             sc = self.scales
             self.quant = QuantSpec.bf16_attention(1.0 / sc["s_h"], 1.0 / sc["s_wq"], 1.0 / sc["s_wo"], sc["scale_o"])
             self.quant.validate()
         for b, L in enumerate(self.kv_lens):
             if L == 0:
+                continue
+            if not self.check_numerics:
+                # no reference (the launch census): random bf16 K / V rows fill the pools -- the kernel chain does not depend on the values
+                self.ref_rows[b] = (randn(L, h_kv, _D, std=1.0), randn(L, h_kv, _D, std=1.0))
                 continue
             if self.quant_mode:
                 ref = self._mode_oracle(b, self.scales["scale_o"])
@@ -1484,6 +1496,7 @@ class _Case:
 
     def recompute_oracle(self, scale_o):
         """The mode's ``out`` oracle at another ``scale_o`` (the recalibration cells), ``[B, s_q, d_model]`` bf16 with the dead rows 0."""
+        assert self.check_numerics, "a check_numerics=False case has no reference (the launch census)"
         out = torch.zeros_like(self.ref_out)
         for b, L in enumerate(self.kv_lens):
             if L:
@@ -1547,6 +1560,7 @@ class _Case:
         return _view(ws, lay.o8, (t, g.h_q, g.d_head), torch.float8_e4m3fn).view(self.blk.batch, self.blk.seq_len, g.h_q, g.d_head)
 
     def check_against_oracle(self, out=None, *, what="out"):
+        assert self.check_numerics, "a check_numerics=False case has no reference (the launch census)"
         out = self.out if out is None else out
         assert torch.isfinite(out.float()).all(), f"{what}: non-finite"
         dead = ~self.live
@@ -3454,10 +3468,11 @@ def test_fp8_proj_bf16_attention_l1_l2_l3_pools_are_bitwise_at_every_page_size(p
         ), f"{layout} != hnd at page {page}: max|diff| {(outs[layout].float() - outs['hnd'].float()).abs().max().item():.3e}"
 
 
-# The MEASURED launch counts of the mode's DECODE chain per served part -- the 24 / 2 geometry at d_model 2560, B 2 x KV 4096, S_q 1 -- by
-# (fuse_cache_write_small_m, fuse_gate).  The census cell below is the detector (EVERY kernel the profiler sees is counted, a GEMM's split-K
-# reduce included) and the docs quote these numbers; a tree that changes a stage's kernel count changes this table and the prose with it.
-# cc 10.0 serves the gate as its own launch only (fuse_gate=True is the part's typed decline), so it has the two write-through arms.
+# The MEASURED launch counts of the mode's DECODE chain per served part -- the 24 / 2 geometry at d_model 2560, B 2 x KV 512, S_q 1, the split
+# ladder pinned at decode_split_kv=4 (the decode tile + its combine on every part: the chain the docs describe; the split count sizes the grid,
+# never the kernel list) -- by (fuse_cache_write_small_m, fuse_gate).  The census cell below is the detector (EVERY kernel the profiler sees is
+# counted, a GEMM's split-K reduce included) and the docs quote these numbers; a tree that changes a stage's kernel count changes this table
+# and the prose with it.  cc 10.0 serves the gate as its own launch only (fuse_gate=True is the part's typed decline): the two write-through arms.
 _MODE_DECODE_LAUNCHES = {
     _SM107: {(False, True): 7, (True, True): 6, (False, False): 8, (True, False): 7},
     _SM100: {(False, False): 8, (True, False): 7},
@@ -3467,20 +3482,28 @@ _MODE_DECODE_LAUNCHES = {
 @requires_dense_part
 @requires_fp8_proj_bf16_attention_part
 def test_fp8_proj_bf16_attention_launch_census_is_the_bf16_chain_plus_the_quantize_launch():
-    """The DECODE chain's CUPTI census under the mode at the 24 / 2 geometry (``d_model`` 2560, B 2 x KV 4096, S_q 1) on every served part,
-    against the bf16 UNFUSED chain of the same declaration, per write-through arm and -- on cc 10.7 -- per gate placement.  EVERY kernel the
-    profiler sees is counted (a GEMM's split-K reduce included; the names are printed): the quantize kernel present exactly once and only
-    under the mode, the cache-write kernel exactly on the separate arm, the gate's own kernel exactly on the separate-gate arm, no hidden
-    copy, the fold dropping exactly one launch with ``out`` bitwise across it, and the TOTAL per arm = ``_MODE_DECODE_LAUNCHES`` (the number
-    the docs publish).  Batch 2, not 1: at the current develop the dense-layout binding's GATE predicate refuses the batch-1 singleton-stride
-    slab column on cc 10.7 (a defect outside this change); the chain has no batch-dependent stage, so the count is the count."""
+    """The DECODE chain's CUPTI census under the mode on every served part, against the bf16 UNFUSED chain of the same declaration, per
+    write-through arm and -- on cc 10.7 -- per gate placement.  EVERY kernel the profiler sees is counted (a GEMM's split-K reduce included;
+    the names are printed): the quantize kernel present exactly once and only under the mode, the cache-write kernel exactly on the separate
+    arm, the gate's own kernel exactly on the separate-gate arm, no hidden copy, the fold dropping exactly one launch with ``out`` bitwise
+    across it, and the TOTAL per arm = ``_MODE_DECODE_LAUNCHES`` (the number the docs publish).  A LAUNCH-COUNT cell, not a numerics cell:
+    declared small (B 2 x KV 512 at the 24 / 2 geometry, ``decode_split_kv=4`` pinned so the counted chain -- the decode tile + its combine --
+    does not depend on the part's split model) and built with ``check_numerics=False`` (no reference: the oracle matrix cells own the numerics;
+    the full-sequence fp8 reference at long KV made the earlier form of this cell too heavy for the smoke tier), so it stays in the module's
+    L0: on the development parts it costs ~40 s wall / 840 MiB peak allocated (cc 10.7, 204 SMs) and ~140 s / 520 MiB (cc 10.0, 148 SMs), the
+    eight chains' compiles included (measured with the compiled-plan cache disabled), against ~2.5 min and ~1.6 GiB per fp32 logits tensor for
+    the oracle form it replaces.  Batch 2, not 1: at the current develop the dense-layout binding's GATE predicate
+    refuses the batch-1 singleton-stride slab column on cc 10.7 (a defect outside this change); the chain has no batch-dependent stage."""
     part = _cc()
     arms = _MODE_DECODE_LAUNCHES[part]
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    t0 = time.perf_counter()
     cells = {}
     for cw, fg in arms:
-        bk = dict(fuse_cache_write_small_m=cw, fuse_gate=fg)
-        cells[("mode", cw, fg)] = _Case(12, 1, (4096, 4096), seed=1, d_model=2560, quant=True, blk_kw=bk).compile()
-        cells[("bf16", cw, fg)] = _Case(12, 1, (4096, 4096), seed=1, d_model=2560, blk_kw=dict(fuse_norm_rope=False, **bk)).compile()
+        bk = dict(fuse_cache_write_small_m=cw, fuse_gate=fg, decode_split_kv=4)
+        cells[("mode", cw, fg)] = _Case(12, 1, (512, 512), seed=1, d_model=2560, quant=True, blk_kw=bk, check_numerics=False).compile()
+        cells[("bf16", cw, fg)] = _Case(12, 1, (512, 512), seed=1, d_model=2560, blk_kw=dict(fuse_norm_rope=False, **bk), check_numerics=False).compile()
     census = {k: _cupti_kernels(lambda c=c: c.execute()) for k, c in cells.items()}
     if any(k is None for k, _ in census.values()):
         pytest.skip("torch.profiler recorded no CUDA events (CUPTI unavailable on this node); the launch count is unverified here")
@@ -3497,13 +3520,18 @@ def test_fp8_proj_bf16_attention_launch_census_is_the_bf16_chain_plus_the_quanti
     for cw, fg in arms:
         k_mode, m_mode = census[("mode", cw, fg)]
         k_bf, _ = census[("bf16", cw, fg)]
+        blk = cells[("mode", cw, fg)].blk
+        assert (blk.decode_split_kv, blk.gate_fused, blk.cache_write_in_norm_rope) == (4, fg, cw), "the declared arm is the one that compiled"
         assert sum("frost_quantize_fp8" in n for n in k_mode) == 1 and not any("frost_quantize" in n for n in k_bf)
         assert any("frost_cache_write" in n for n in k_mode) == (not cw) and any("frost_qk_norm_rope" in n for n in k_mode)
         assert sum("frost_elementwise_gate" in n for n in k_mode) == (0 if fg else 1), "the gate's own launch exactly on the separate-gate arm"
         assert not [n for n in m_mode if "memcpy" in n.lower()], "a hidden copy on the mode's execute path"
         assert len(k_mode) == arms[(cw, fg)], f"the mode's launch count at this arm is {len(k_mode)}, the published {arms[(cw, fg)]}: {k_mode}"
-        torch.cuda.synchronize()
-        cells[("mode", cw, fg)].check_against_oracle(what=f"mode census, fuse_cache_write_small_m {cw}, fuse_gate {fg}")
     for fg in sorted({fg for _, fg in arms}):
         assert len(census[("mode", True, fg)][0]) == len(census[("mode", False, fg)][0]) - 1, "the write-through fold drops exactly the cache-write launch"
         assert torch.equal(_bits(cells[("mode", True, fg)].out), _bits(cells[("mode", False, fg)].out))
+    torch.cuda.synchronize()
+    print(
+        f"[mode census cc {part[0]}.{part[1]}] cost: {time.perf_counter() - t0:.1f} s wall (declarations, compiles, the profiled launches), "
+        f"peak {torch.cuda.max_memory_allocated() / 2**20:.0f} MiB allocated"
+    )

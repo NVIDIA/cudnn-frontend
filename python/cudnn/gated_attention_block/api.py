@@ -1202,6 +1202,8 @@ class DecodeEnvelope:
     served: bool
     reason: Optional[str]
     requires: Tuple[str, ...]
+    # the activation dtypes this form takes under the quant asked about: bf16 / f16 with quant=None; the e4m3 h under the FP8-projection +
+    # bf16-attention mode (serving_envelope(quant=) with attention_dtype=torch.bfloat16; 2026-10-30)
     dtypes: Tuple[torch.dtype, ...]
     page_sizes: Tuple[int, ...]
     pool_layouts: Tuple[str, ...]
@@ -1231,6 +1233,7 @@ class DecodeEnvelope:
     # appended (2026-10-14): the POOL dtypes this form serves at this geometry / activation dtype -- the activation dtype always; plus
     # torch.float8_e4m3fn (``kv_cache_dtype``: the gathered cast + the decode tile, S_q <= 4, no LSE) on a QsaSpec geometry with bf16
     # activations.  An e4m3 pool on a DENSE geometry is a typed decline (the decode tile reads bf16 / f16 pools).
+    # (under the FP8-projection + bf16-attention mode -- serving_envelope(quant=) -- the pools are bf16 whatever the e4m3 input; 2026-10-30)
     kv_cache_dtypes: Tuple[torch.dtype, ...] = ()
     # appended (2026-10-15): the route policy ``routes`` / ``route()`` were read under (``serving_envelope(decode_route_policy=)``) and
     # the CLAIMED bound (``DECODE_CLAIMED_MAX_S_Q``; ``max_s_q`` is the DECLARED one).
@@ -1347,6 +1350,8 @@ class ExtendEnvelope:
     served: bool
     reason: Optional[str]
     requires: Tuple[str, ...]
+    # the activation dtypes this form takes under the quant asked about: bf16 / f16 with quant=None; the e4m3 h under the FP8-projection +
+    # bf16-attention mode (2026-10-30)
     dtypes: Tuple[torch.dtype, ...]
     page_sizes: Tuple[int, ...]
     pool_layouts: Tuple[str, ...]
@@ -11187,7 +11192,10 @@ class GatedAttentionBlockFwd(APIBase):
         ``attention_dtype=torch.bfloat16`` reads the FP8-PROJECTION + BF16-ATTENTION mode's envelope -- ``dtype`` is then the e4m3 ``h``
         (``torch.float8_e4m3fn``), the part row consults :data:`FP8_PROJ_BF16_ATTENTION_CCS`, a QsaSpec geometry is declined by name --
         while every other spec (``QuantSpec(attention_dtype=None)``, an ``MxQuantSpec``) reads "no paged leg" on both forms; each form's
-        ``quant_modes`` (appended) names the spellings served on this part beside ``quant=None``, whatever ``quant`` was passed."""
+        ``quant_modes`` (appended) names the spellings served on this part beside ``quant=None``, whatever ``quant`` was passed.  ``quant`` is
+        validated first (``QuantSpec.validate()``, as the constructor does at declaration): an invalid spec serves neither form and each
+        form's ``reason`` carries the constructor's text; under the mode each form's ``dtypes`` is the e4m3 ``h`` and ``decode.kv_cache_dtypes``
+        the bf16 pools (2026-10-30)."""
         from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 
         policy = _resolve_decode_route_policy(decode_route_policy)
@@ -11197,7 +11205,16 @@ class GatedAttentionBlockFwd(APIBase):
         if dsl_reason is None and cc == _SM107_CC:
             dsl_reason = cutedsl_arch_requirement_error(cc)
         # the part row: the statement the stage raises -- the dense forms' part set for a dense geometry, Rubin alone for a QsaSpec one
-        common = _sparse_part_decline(cc) if geometry.qsa is not None else _dense_part_decline(cc)
+        # the QuantSpec's own validation FIRST -- the constructor runs `quant.validate()` at declaration, before any row: a non-positive or NaN scale,
+        # attention_dtype=torch.float16, a Q / K / V scale set under the mode declare nothing, so neither form is served and the reason is the
+        # constructor's text (2026-10-30; an MxQuantSpec meets its "no paged leg" row below before its own validation would speak)
+        quant_invalid = None
+        if isinstance(quant, QuantSpec):
+            try:
+                quant.validate()
+            except (ValueError, NotImplementedError) as e:
+                quant_invalid = f"QuantSpec.validate(): {e}"
+        common = quant_invalid if quant_invalid is not None else (_sparse_part_decline(cc) if geometry.qsa is not None else _dense_part_decline(cc))
         # the quant row: None = the bf16 / f16 forms; the FP8-projection + bf16-attention mode (QuantSpec(attention_dtype=torch.bfloat16)) reads
         # its own part tuple over e4m3 h on a dense geometry; every other spec has no paged leg -- the constructor's rows, word for word
         mode = isinstance(quant, QuantSpec) and quant.attention_bf16
@@ -11259,12 +11276,15 @@ class GatedAttentionBlockFwd(APIBase):
         def quant_modes(thd: bool, s_q: int) -> Tuple[str, ...]:
             return (QUANT_MODE_FP8_PROJ_BF16_ATTENTION,) if (mode_part_ok and table_reason(thd, s_q) is None) else ()
 
+        # the dtype rows under the quant asked about: the bf16 / f16 forms' activations with quant=None; under the mode the input is the e4m3 h
+        # and the DECODE pools are bf16 -- the constructor's own requirements, so a stack reading these rows allocates what the declaration accepts
+        form_dtypes = (torch.float8_e4m3fn,) if mode else (torch.bfloat16, torch.float16)
         extend_reason = probe(True, 0)
         extend = ExtendEnvelope(
             served=extend_reason is None,
             reason=extend_reason,
             requires=_EXTEND_REQUIRES,
-            dtypes=(torch.bfloat16, torch.float16),
+            dtypes=form_dtypes,
             page_sizes=SERVING_PAGE_SIZES,
             pool_layouts=SERVING_POOL_LAYOUTS,
             declines={name: msg for name, _exc, _pred, msg in _EXTEND_DECLINES},  # the whole table: every row a declaration can hit
@@ -11284,7 +11304,7 @@ class GatedAttentionBlockFwd(APIBase):
             served=decode_reason is None,
             reason=decode_reason,
             requires=_SPARSE_DECODE_REQUIRES if sparse else _DECODE_REQUIRES,
-            dtypes=(torch.bfloat16, torch.float16),
+            dtypes=form_dtypes,
             page_sizes=SERVING_PAGE_SIZES,
             pool_layouts=SERVING_POOL_LAYOUTS,
             declines=decode_declines,
@@ -11301,7 +11321,7 @@ class GatedAttentionBlockFwd(APIBase):
             sparse_core=sparse,
             # the e4m3 cache (the gathered cast + the decode tile) is a form of the block-sparse decode mode with bf16 activations only --
             # under caller lists: its composition with the in-block indexer waits for the sparse core's in-kernel dequant arm
-            kv_cache_dtypes=(dtype,) + ((KV_CACHE_E4M3,) if (sparse and dtype == torch.bfloat16 and not indexer) else ()),
+            kv_cache_dtypes=(torch.bfloat16,) if mode else (dtype,) + ((KV_CACHE_E4M3,) if (sparse and dtype == torch.bfloat16 and not indexer) else ()),
             policy=policy,
             claimed_max_s_q=DECODE_CLAIMED_MAX_S_Q,
             q_tile_max=q_tile_max,

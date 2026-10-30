@@ -201,7 +201,7 @@ def test_quantspec_attention_dtype_is_appended_and_validate_names_every_row():
 def test_exports_the_part_tuple_and_the_api_index_rows():
     """The two constants are exported by the package and indexed; the appended field, the two readbacks and the envelopes' ``quant_modes``
     are in the API index; the tuple holds cc 10.7 and only served dense parts."""
-    import cudnn.gated_attention_block as pkg
+    pkg = sys.modules["cudnn.gated_attention_block"]  # the imported package object (ONE import style in this module: `from ... import`)
 
     assert "FP8_PROJ_BF16_ATTENTION_CCS" in pkg.__all__ and "QUANT_MODE_FP8_PROJ_BF16_ATTENTION" in pkg.__all__
     assert pkg.FP8_PROJ_BF16_ATTENTION_CCS is FP8_PROJ_BF16_ATTENTION_CCS and QUANT_MODE_FP8_PROJ_BF16_ATTENTION == "QuantSpec(attention_dtype=torch.bfloat16)"
@@ -430,7 +430,8 @@ def test_the_envelope_predicts_the_mode_on_both_readings():
         e = env(_GEOM, E4, _DEV, device_cc=_SM107, quant=_MODE)
         assert e.forms == ("extend", "decode") and e.decode.reason is None and e.extend.reason is None
         assert e.decode.quant_modes == e.extend.quant_modes == (QUANT_MODE_FP8_PROJ_BF16_ATTENTION,) and e.decode.pdl_default is False
-        assert e.decode.dtypes == (BF16, torch.float16) and "FP8_PROJ_BF16_ATTENTION_CCS" in " ".join(e.decode.requires) + " ".join(e.extend.requires)
+        assert e.decode.dtypes == (E4,) == e.extend.dtypes and e.decode.kv_cache_dtypes == (BF16,), "under the mode: the e4m3 h in, bf16 pools"
+        assert "FP8_PROJ_BF16_ATTENTION_CCS" in " ".join(e.decode.requires) + " ".join(e.extend.requires)
         plain = env(_GEOM, BF16, _DEV, device_cc=_SM107)
         assert plain.forms == ("extend", "decode") and plain.decode.quant_modes == (QUANT_MODE_FP8_PROJ_BF16_ATTENTION,) == plain.extend.quant_modes
         assert plain.decode.pdl_default is True, "the bf16 form's AUTO default on the measured part is untouched"
@@ -468,6 +469,44 @@ def test_the_envelope_predicts_the_mode_on_both_readings():
         # an unserved part: the dense part statement first, whatever the quant argument
         other = env(_GEOM, E4, _DEV, device_cc=(9, 0), quant=_MODE)
         assert other.forms == () and "SM90" in other.decode.reason and other.decode.quant_modes == ()
+
+
+def test_the_envelope_validates_the_quant_spec_first_and_states_the_modes_dtypes():
+    """``serving_envelope(quant=)`` runs ``QuantSpec.validate()`` FIRST, as the constructor does at declaration: an invalid spec -- a
+    non-positive ``scale_o``, ``attention_dtype=torch.float16``, a ``scale_q`` set under the mode -- serves NEITHER form, each form's ``reason``
+    carries the constructor's text (the very error the declaration raises), and ``quant_modes`` stays the part's fact; under a valid mode spec
+    the records state the mode's input dtype (the e4m3 ``h``) and the DECODE pools' dtype (bf16), where ``quant=None`` keeps bf16 / f16 and the
+    activation dtype as the pool dtype."""
+    import unittest.mock as um
+
+    from cudnn.frost import buffers
+
+    env = GatedAttentionBlockFwd.serving_envelope
+    zero = QuantSpec.bf16_attention(1.0, 1.0, 1.0, 0.0)
+    f16 = QuantSpec(0.01, 0.02, 0.03, None, None, None, 4.0, E4, torch.float16)
+    q_set = QuantSpec(0.01, 0.02, 0.03, 1.0, None, None, 4.0, E4, BF16)
+    with um.patch.object(buffers, "_cutedsl_has_sm107", lambda: True):
+        for cc in (_SM107, _SM100):
+            bad = env(_GEOM, E4, _DEV, device_cc=cc, quant=zero)
+            assert bad.forms == () and bad.decode.served is False and bad.extend.served is False
+            assert bad.decode.reason == bad.extend.reason and bad.decode.reason.startswith("QuantSpec.validate(): ")
+            assert "QuantSpec.scale_o must be a finite positive float, got 0.0" in bad.decode.reason
+            assert (
+                env(_GEOM, E4, _DEV, device_cc=cc, quant=f16).forms == ()
+                and "QuantSpec.attention_dtype must be None" in env(_GEOM, E4, _DEV, device_cc=cc, quant=f16).decode.reason
+            )
+            assert "is unused under attention_dtype=torch.bfloat16" in env(_GEOM, E4, _DEV, device_cc=cc, quant=q_set).extend.reason
+            if cc in FP8_PROJ_BF16_ATTENTION_CCS:
+                assert bad.decode.quant_modes == (QUANT_MODE_FP8_PROJ_BF16_ATTENTION,) == bad.extend.quant_modes, "the served spellings are the part's fact"
+            # the dtype rows
+            good = env(_GEOM, E4, _DEV, device_cc=cc, quant=_MODE)
+            assert good.decode.dtypes == (E4,) == good.extend.dtypes and good.decode.kv_cache_dtypes == (BF16,)
+            plain = env(_GEOM, BF16, _DEV, device_cc=cc)
+            assert plain.decode.dtypes == (BF16, torch.float16) == plain.extend.dtypes and plain.decode.kv_cache_dtypes == (BF16,)
+            assert env(_GEOM, torch.float16, _DEV, device_cc=cc).decode.kv_cache_dtypes == (torch.float16,)
+    # the constructor raises the same texts at declaration (the envelope's reason is the constructor's row, word for word)
+    with pytest.raises(ValueError, match="QuantSpec.scale_o must be a finite positive float, got 0.0"):
+        GatedAttentionBlockFwd(*_decode_args(4, 1), quant=zero, **_decode_kw(4))
 
 
 def test_on_a_cc_10_0_reading_the_part_gate_reads_the_tuple(monkeypatch):

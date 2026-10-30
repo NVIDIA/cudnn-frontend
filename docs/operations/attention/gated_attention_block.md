@@ -1476,7 +1476,8 @@ scale_v=None, ..., attention_dtype=torch.bfloat16)`; appended 2026-10-30; served
 ```
 
 Launch counts, MEASURED by the CUPTI census cell (`test_fp8_proj_bf16_attention_launch_census_is_the_bf16_chain_plus_the_quantize_launch`,
-the 24 / 2 geometry at `d_model` 2560, B 2 x KV 4096, S_q 1; every kernel the profiler sees is counted and the per-arm totals are pinned, so
+the 24 / 2 geometry at `d_model` 2560, B 2 x KV 512, S_q 1, the split ladder pinned at `decode_split_kv=4` -- the decode tile + its combine on
+every part --, no numerical reference; every kernel the profiler sees is counted and the per-arm totals are pinned, so
 a tree that changes a stage's kernel count turns the cell red and these numbers follow it): cc 10.7 -- six with the gate in the combine and
 the write-through folded, seven with the separate cache write, seven / eight with the separate gate (`fuse_gate=False`); cc 10.0, where the
 gate is always its own launch -- seven folded / eight with the separate cache write (`blk.cache_write_in_norm_rope` / `blk.gate_fused` read
