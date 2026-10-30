@@ -887,6 +887,8 @@ def test_frost_matrix_batch_int64_boundaries():
 @pytest.mark.parametrize(
     "shape,stride",
     [
+        ((4, 4, 8), (0, 8, 1)),
+        ((2, 3, 4, 8), (0, 0, 8, 1)),
         ((2, 2, 1, 1), (1 << 33, 1 << 32, 1, 1)),
         ((2, 1, 3, 4, 8), (120, 999, 40, 1, 4)),
         ((1, 1, 4, 8), (500, 97, 8, 1)),
@@ -976,11 +978,37 @@ def test_frost_matrix_identity_recipe_fast_path(monkeypatch, prefix):
     assert len(launches) == 2
 
 
+def _graph_coordinate_pack(graph, tensors, buffers):
+    """Declare live caller shapes/strides explicitly for native graph binding."""
+    return graph._normalize(
+        {t.get_uid(): buffers[key] for key, t in tensors.items()},
+        None,
+        [t.get_uid() for t in tensors.values()],
+        [list(buffers[key].shape) for key in tensors],
+        [list(buffers[key].stride()) for key in tensors],
+    )
+
+
+# Keep the original rank-2/rank-4 P1 probes and both failing rank-3 controls
+# in L0, with swapped and higher-rank representatives. Preserve all 16 cases.
+_GEN_INDEX_GPU_L0 = {
+    ((), 1, False),
+    ((1,), 0, False),
+    ((1,), 1, False),
+    ((2, 3), 0, False),
+    ((2, 3), 1, True),
+    ((2, 1, 3), 0, True),
+}
+
+
 @requires_sm100
-@pytest.mark.L0
-@pytest.mark.parametrize("prefix", [(), (1,), (2, 3), (2, 1, 3)])
-@pytest.mark.parametrize("matrix_axis", [0, 1])
-@pytest.mark.parametrize("swapped", [False, True])
+@pytest.mark.parametrize(
+    "prefix,matrix_axis,swapped",
+    [
+        pytest.param(p, a, s, marks=pytest.mark.L0 if (p, a, s) in _GEN_INDEX_GPU_L0 else pytest.mark.L1)
+        for p, a, s in product([(), (1,), (2, 3), (2, 1, 3)], [0, 1], [False, True])
+    ],
+)
 def test_frost_matrix_gen_index_gpu(prefix, matrix_axis, swapped):
     """Check actual logical indices, dynamic shapes and changed-input capture replay."""
     dtype = BF16 if matrix_axis == 0 else cudnn.data_type.HALF
@@ -988,22 +1016,23 @@ def test_frost_matrix_gen_index_gpu(prefix, matrix_axis, swapped):
     side = "ab" if swapped else ""
     g, tensors = _graph(prefix=prefix, side=side, dtype=dtype, index_axis=len(prefix) + matrix_axis)
     plan = compiler.jit_from_cudnn_graph(g, _config(swapped))
+    engine = _FrostGemmPlan(plan)
     stream = torch.cuda.Stream()
     for m, n, k in ((128, 192, 136), (160, 224, 264)):
         buffers = _buffers(tensors, m, n, k, device="cuda", dtype=tdtype)
         buffers["a"].zero_()
         buffers["b"].zero_()
-        pack = _pack(tensors, buffers)
+        pack = _graph_coordinate_pack(g, tensors, buffers)
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
-            plan(pack, stream=stream.cuda_stream)
+            engine.execute(g, pack, ExecutionContext(stream=stream.cuda_stream))
         stream.synchronize()
         captured = torch.cuda.CUDAGraph()
         try:
             with warnings.catch_warnings():
                 warnings.filterwarnings("error", message="The CUDA Graph is empty.*")
                 with torch.cuda.graph(captured, stream=stream):
-                    plan(pack, stream=torch.cuda.current_stream().cuda_stream)
+                    engine.execute(g, pack, ExecutionContext(stream=torch.cuda.current_stream().cuda_stream))
             for fill in (0.0, 0.0625):
                 # Changes and poisoning are ordered on the replay stream too.
                 with torch.cuda.stream(stream):
@@ -1026,3 +1055,88 @@ def test_frost_matrix_gen_index_gpu(prefix, matrix_axis, swapped):
         finally:
             stream.synchronize()
             captured.reset()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("side", ["a", "b", "ab"])
+def test_frost_identity_zero_batch_stride(monkeypatch, side):
+    """Retain read-only identity batch broadcasts without runtime folding."""
+    g, tensors = _graph(side="", prefix=(4,))
+    for key in side:
+        stride = list(tensors[key].get_stride())
+        stride[0] = 0
+        tensors[key].set_stride(stride)
+    plan, launches = _mock_plan(monkeypatch, g)
+    assert plan.recipe.matrix_views == ()
+    buffers = _buffers(tensors)
+    for key in side:
+        buffers[key] = buffers[key][:1].expand_as(buffers[key])
+    engine = _FrostGemmPlan(plan)
+    pack = _graph_coordinate_pack(g, tensors, buffers)
+    engine.execute(g, pack, ExecutionContext(stream=0))
+    assert len(launches) == 1
+    for i, key in enumerate("ab", 1):
+        assert launches[-1][i].data_ptr() == buffers[key].data_ptr()
+        if key in side:
+            assert launches[-1][i].stride()[-1] == 0
+    # Reconstruct the recorded native metadata over the known CPU storage.
+    a, b = [buffers[key].as_strided(tuple(arg.shape), tuple(arg.stride())).permute(2, 0, 1) for key, arg in zip("ab", launches[-1][1:3])]
+    got = a.float() @ b.float().transpose(1, 2)
+    expected = buffers["a"].float() @ buffers["b"].float()
+    torch.testing.assert_close(got, expected, atol=0, rtol=0)
+
+
+@pytest.mark.L0
+def test_frost_identity_zero_batch_output_rejected():
+    """Accept read-only broadcasting without permitting overlapping output writes."""
+    g, tensors = _graph(side="", prefix=(4,))
+    stride = list(tensors["y"].get_stride())
+    stride[0] = 0
+    tensors["y"].set_stride(stride)
+    with pytest.raises(ValueError, match="non-overlapping"):
+        analyze(g)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("prefix,side", [((4,), "ab"), ((2, 3), "")])
+def test_frost_matrix_view_zero_batch_stride_remains_rejected(prefix, side):
+    """Do not extend zero-pitch admission to unqualified runtime-view paths."""
+    g, tensors = _graph(prefix=prefix, side=side)
+    stride = list(tensors["a"].get_stride())
+    stride[:-2] = [0] * len(prefix)
+    tensors["a"].set_stride(stride)
+    with pytest.raises(ValueError, match="not affine"):
+        analyze(g)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("prefix", [(), (1,), (2, 3), (2, 1, 3)])
+@pytest.mark.parametrize("matrix_axis", [0, 1])
+@pytest.mark.parametrize("swapped", [False, True])
+def test_frost_matrix_gen_index_graph_binding(monkeypatch, prefix, matrix_axis, swapped):
+    """Bind both dynamic shapes in explicit graph coordinates before kernel entry."""
+    g, tensors = _graph(prefix=prefix, side="ab" if swapped else "", index_axis=len(prefix) + matrix_axis)
+    plan, launches = _mock_plan(monkeypatch, g, swapped)
+    engine = _FrostGemmPlan(plan)
+    for m, n, k in ((128, 192, 136), (160, 224, 264)):
+        buffers = _buffers(tensors, m, n, k)
+        pack = _graph_coordinate_pack(g, tensors, buffers)
+        engine.execute(g, pack, ExecutionContext(stream=0))
+        frame = launches[-1]
+        assert frame[0][:4] == ((n, m, k, prod(prefix)) if swapped else (m, n, k, prod(prefix)))
+        for index, (key, extent) in enumerate((("b", n), ("a", m)) if swapped else (("a", m), ("b", n)), 1):
+            assert tuple(frame[index].shape) == (extent, k, prod(prefix))
+            assert frame[index].data_ptr() == buffers[key].data_ptr()
+
+
+@pytest.mark.L0
+def test_frost_identity_broadcast_layout_scope():
+    """Zero-pitch opt-in cannot relax nonidentity folds or writable overlap checks."""
+    shape, stride = (4, 8, 16), (0, 16, 1)
+    assert fold_batch_layout(shape, stride, allow_identity_broadcast=True) == (shape, stride)
+    with pytest.raises(ValueError, match="not affine"):
+        fold_batch_layout(shape, stride)
+    with pytest.raises(ValueError, match="non-overlapping"):
+        fold_batch_layout(shape, stride, writable=True, allow_identity_broadcast=True)
+    with pytest.raises(ValueError, match="not affine"):
+        fold_batch_layout((2, 2, 8, 16), (0, 0, 16, 1), allow_identity_broadcast=True)

@@ -481,14 +481,14 @@ class OperandBuffer {
                 throw py::value_error("matrix batch view exceeds signed 64-bit geometry");
             return a * b;
         };
-        int64_t span = 1;
+        int64_t storage_span = 1;
         for (size_t i = 0; i < shape.size(); ++i) {
             if (shape[i] <= 0 || strides[i] < 0)
                 throw py::value_error("matrix batch view requires positive extents and nonnegative strides");
             const int64_t term = multiply(shape[i] - 1, strides[i]);
-            if (span > std::numeric_limits<int64_t>::max() - term)
+            if (storage_span > std::numeric_limits<int64_t>::max() - term)
                 throw py::value_error("matrix batch view exceeds signed 64-bit geometry");
-            span += term;
+            storage_span += term;
         }
         const size_t row = shape.size() - 2, column = shape.size() - 1;
         int64_t pitch = 0;

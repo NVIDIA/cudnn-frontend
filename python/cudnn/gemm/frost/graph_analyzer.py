@@ -1684,7 +1684,7 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
                     f"matrix input {m.name!r}: partial/crossed batch broadcasting cannot be represented by one batch stride; got {prefix}, output {batch_shape}"
                 )
             stride = m.stride or tuple(prod(dim[i + 1 :]) for i in range(len(dim)))
-            layout_dim, layout_stride = fold_batch_layout(dim, stride, writable=_is_output(meta, tid))
+            layout_dim, layout_stride = fold_batch_layout(dim, stride, writable=_is_output(meta, tid), allow_identity_broadcast=not matrix_views_required)
             meta[tid] = replace(
                 m,
                 dim=layout_dim,
