@@ -822,7 +822,9 @@ def _dense_control(case: _PackedCase, members, *, split=None, index_list_form="p
 
 def _same_slab_route(a: GatedAttentionBlockFwd, b: GatedAttentionBlockFwd) -> bool:
     """Whether the two blocks' dense projections resolve the SAME GEMM route (the small-M route at ``M <= SMALL_M_MAX``, else the forced
-    256-wide tile where 256 divides N; the graph route otherwise): the per-row GEMM arithmetic is bitwise across M only on one route."""
+    256-wide tile where 256 divides N -- every geometry these cells pair; a slab off the 256 grid takes the GEMM engine's own baseline tile
+    past 128 rows instead, a pick that follows M, and the graph route wherever the resolver names no tile): the per-row GEMM arithmetic is
+    bitwise across M only on one route."""
     ja, jb = a._proj.resolves_a_jit_tile(), b._proj.resolves_a_jit_tile()
     return ja and jb and ((a._proj.m <= SMALL_M_MAX) == (b._proj.m <= SMALL_M_MAX))
 
@@ -1214,7 +1216,8 @@ def test_packed_sparse_extend_capture_after_one_warm_up_replays_bitwise_and_over
     projection route's per-stream state, which a capture refuses to create), the captured execute under ``set_sync_debug_mode("error")``:
     the capture launches nothing, the replay is BITWISE the eager run; a NEW packing of the same shapes (other Q lengths summing to the same
     total, other KV lengths / table / lists / slots / pools / inputs) through the captured tensors replays bitwise its eager twin and passes
-    the sibling's oracle -- at GEOM_SMALL (N 5120: the forced tile past 128 rows) and on the indexer band's slab (N 5760, the graph route)."""
+    the sibling's oracle -- at GEOM_SMALL (N 5120: the forced tile past 128 rows) and on the indexer band's slab (N 5760, off the 256 grid:
+    the GEMM engine's own baseline tile past 128 rows, the graph route at or under them)."""
     seqs_a = [(1, 8192), (200, 2251), (0, 50), (4, 304), (1, 2052)]
     seqs_b = [(100, 2151), (1, 4097), (4, 0), (100, 4196), (1, 1)]
     case = _PackedCase(GEOM_SMALL, seqs_a, seed=53, index_band=band)
