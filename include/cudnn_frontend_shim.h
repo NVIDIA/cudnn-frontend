@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <type_traits>
 
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
@@ -1967,6 +1968,44 @@ set_attribute(cudnnBackendDescriptor_t descriptor,
                           attributeType,
                           elementCount,
                           arrayOfElements);
+}
+
+template <typename SetAttribute>
+inline cudnnStatus_t
+set_shared_memory_limit_if_supported(cudnnBackendDescriptor_t descriptor,
+                                     cudnnBackendAttributeName_t attribute_name,
+                                     int64_t requested_limit,
+                                     size_t backend_version,
+                                     SetAttribute &&set_attribute_fn) {
+    // A backend value of zero means no limit was specified. Leave non-positive
+    // frontend limits to the existing engine-config filter so its semantics do not change.
+    if (requested_limit <= 0 || backend_version < 92800) {
+        return CUDNN_STATUS_SUCCESS;
+    }
+
+    auto const backend_limit =
+        static_cast<int32_t>(std::min<int64_t>(requested_limit, std::numeric_limits<int32_t>::max()));
+    return set_attribute_fn(descriptor, attribute_name, CUDNN_TYPE_INT32, 1, &backend_limit);
+}
+
+inline cudnnStatus_t
+set_shared_memory_limit_if_supported(cudnnBackendDescriptor_t descriptor,
+                                     cudnnBackendAttributeName_t attribute_name,
+                                     int64_t requested_limit) {
+    if (requested_limit <= 0) {
+        return CUDNN_STATUS_SUCCESS;
+    }
+
+    return set_shared_memory_limit_if_supported(
+        descriptor,
+        attribute_name,
+        requested_limit,
+        get_backend_version(),
+        [](cudnnBackendDescriptor_t desc,
+           cudnnBackendAttributeName_t attr,
+           cudnnBackendAttributeType_t type,
+           int64_t count,
+           void const *value) { return set_attribute(desc, attr, type, count, value); });
 }
 
 inline cudnnStatus_t

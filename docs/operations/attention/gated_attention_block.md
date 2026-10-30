@@ -288,9 +288,13 @@ Served today:
   `index_band` (at `d_model=2560, h_q=24, h_kv=2`: `N = 13312 + 640 = 13952`, offsets `0, 6144, 12288, 12800, 13312`; a
   256-column tile plan is not defined there, a 64- or 128-column one is -- at decode row counts, `B x S_q <= 128`, the slab GEMM
   takes the small-M route's 128-row swap-AB tile, 109 CTAs, so the band declaration over the pools compiles with the opt-in flag
-  unset and is capture-safe like the four-band one; past 128 rows the band slab keeps the graph route.  The route reads the
-  part's SM count: the 128-row tile is its overflow branch, taken where the slab's 218 64-row tiles exceed one wave -- every
-  served part (&lt;= 212 SMs); a part with 218 or more SMs would keep the band slab on the graph route at every row count); a
+  unset and is capture-safe like the four-band one; past 128 rows the band slab takes the GEMM engine's OWN baseline tile for its
+  shape -- the kernel the graph route ran there (`select_config` at the part's SM count: 128x224 in a 2x1 cluster at 2048 rows on a
+  212-SM part, 128x256 past 4096 rows), named by the driver so the slab rides the same JIT-only route: the prefill / extend /
+  chunked forms of a band declaration compile flag-free and are capture-safe too.  Both rules read the part's SM count: the
+  small-M route's 128-row tile is its overflow branch, taken where the slab's 218 64-row tiles exceed one wave -- every served
+  part (&lt;= 212 SMs); a part with 218 or more SMs would keep the band slab on the graph route at decode row counts -- and the
+  baseline pick's tile and cluster follow the SM count, so a recorded plan name replays within one SM-count class); a
   geometry without the band keeps exactly its four-band tuples. Enumerate `geometry.qkvg_blocks`, never `ProjBlock` itself.
 - the loader: `qkvg_from_hf(..., index_qk_proj_weight=attn.index_qk_proj.weight)` and `build_fused_qkvg_weight(...,
   index_qk_proj_weight=)` append the band (required iff declared, refused otherwise); `qkvg_from_vllm` takes it the same way, or
@@ -1964,12 +1968,15 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   bf16 / f16 projection whose `N` the forced 256-wide GEMM tile divides (`n_qkvg`, `d_model` and `h_q * d_head` all
   `% 256 == 0`, as at every served geometry), or whose shape the small-M route names a tile for (`B x S_q <= 128` on a dense
   bf16 / f16 projection whose N the route's tile grid divides -- the indexer band's 13952-column slab included: 109 x 128-row
-  tiles), compiles with the flag UNSET on FROST's JIT-only route
+  tiles), or whose shape the large-M rule names the GEMM engine's own baseline tile for (past 128 rows on a dense bf16 / f16
+  projection whose N 128 divides and 256 does not -- the band slab at prefill / extend / chunked row counts; the kernel the
+  graph route ran there, named so the route is the JIT-only one), compiles with the flag UNSET on FROST's JIT-only route
   (`plan.route == "jit-only"`: no backend plan, no cuDNN handle at execute; `frost_gemm` never enters a ranked list), and the
   block-scale (MXFP8 / fp4-weight) projections log a warning and take the same route. With the flag set a plain declaration's
   backend admits the graph and pins the same JIT by name (`graph+jit`); a `capture_safe=True` declaration never enters the
   ranked list whatever the flag says. What still needs the flag: a dense shape WITHOUT a JIT tile (the graph route IS the plan
-  there: the band slab past 128 rows, an N off both tile grids) and the per-tensor-fp8 projections -- a `RuntimeError` at
+  there: an N off both tile grids, or a 128-grid shape the engine's planner could re-plan) and the per-tensor-fp8 projections --
+  a `RuntimeError` at
   `compile()` whose message names the flag (the GEMM plan is built there, not at `check_support()`). Nothing ever falls back
   to a cuDNN backend plan, so an unset flag is never a silently slower block. The SDPA stage binds its FROST class directly and
   does not consult the flag.
@@ -1983,9 +1990,11 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   the flag is set or not -- so the plan is on the JIT route by construction: a refused forced compile is a typed
   `NotImplementedError` naming the tile and the reason, never the warning + graph-heuristic fallback the plain declaration
   takes. The block sets `capture_safe` on each dense projection stage of a paged declaration iff the driver's `auto` resolver
-  names a JIT tile for the stage's own shape -- so the indexer band's slab (N 13952) is capture-safe at decode row counts
-  through the small-M route (the band capture / replay cell of `test_block_qsa_decode.py`) and eager past 128 rows, where a
-  capture is the driver's typed refusal. The quantized block's first-execute scale write is NOT refused under capture (the
+  names a JIT tile for the stage's own shape -- so the indexer band's slab (N 13952) is capture-safe at every row count: at
+  decode row counts through the small-M route (the band capture / replay cell of `test_block_qsa_decode.py`), past 128 rows
+  through the engine's own baseline tile (the large-M rule; the extend ladder's cells past 128 rows of `test_block_qsa_extend.py`).
+  A shape the resolver names no tile for runs eagerly, and a capture there is the driver's typed refusal. The quantized block's
+  first-execute scale write is NOT refused under capture (the
   warm-up / re-capture contract above is the rule): `test_block_serving_capture.py`.
 - Rubin (SM107) for every form, or cc 10.0 (SM100) for the dense bf16 / f16 inference forms alone (the part table at the top;
   functional only); cuDNN 9.x, `nvidia-cutlass-dsl >= 4.8.0.dev0` (the Rubin arch names; the 4.7.0 floor on cc 10.0), torch.

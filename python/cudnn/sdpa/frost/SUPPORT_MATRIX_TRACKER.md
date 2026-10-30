@@ -3792,8 +3792,11 @@ puts fp32 partials in the block's workspace (`get_workspace_size()` holds them) 
 split (the core's epilogue unsplit, the combine otherwise), `return_lse` is served (`[B, H_q, S_q]` fp32).  The indexer band's slab
 (`QsaSpec(index_band=True)`, N 13312 + 640 = 13952, off the 256 grid) takes the small-M projection route's 128-row swap-AB tile at
 `B x S_q <= 128` (13952 = 109 x 128 on the route's overflow branch; 2026-10-21), so the band declaration over the pools is capture-safe
-and compiles without the opt-in flag like the four-band one (the band capture / replay row below); past 128 rows the band slab keeps
-the graph route.  Typed declines: a non-contiguous table sample, a split
+and compiles without the opt-in flag like the four-band one (the band capture / replay row below); past 128 rows the band slab takes
+the GEMM engine's own baseline tile for its shape on the same JIT-only route (the large-M rule, 2026-10-30: `select_config` at the part's
+SM count -- the kernel the graph route ran there, named by the driver so the extend / chunked / prefill declarations past 128 rows
+compile capture-safe and flag-free too; the pick follows the SM count, so a recorded plan name replays within one SM-count class).
+Typed declines: a non-contiguous table sample, a split
 past the item's tile count (the packed form over the pools is the packed block-sparse EXTEND form since 2026-10-30 -- the `Served since
 2026-10-30` paragraph below; the table's `sparse` row stays reachable through a record without the composition claim); `causal_bottom_right` on the block's own K / V names this mode; the in-block indexer over the pools and
 `fuse_prepare` on this mode are served since 2026-10-21 (the next section).  Validated on a Rubin

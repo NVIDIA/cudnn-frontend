@@ -244,58 +244,81 @@ def test_declaration_facts_of_the_sparse_decode_mode(s_q, fuse_gate):
     assert pinned.decode_split_kv == 3 == pinned._sdpa.split_kv and pinned.max_kv_len == 70 and pinned.return_lse and pinned._sdpa.want_lse
     # the serving declaration's capture-safe projections: set per stage iff the GEMM driver's "auto" resolver names a JIT tile for the
     # stage's own shape -- the forced tile where 256 divides N (this geometry's two projections), the small-M route's tile at T <= 128
-    # (the indexer band's 13952-column slab of the 24 / 2 geometry: its own cell below).  THIS small geometry's band slab (N 5120 + 640
-    # = 5760 = 45 x 128, off the 256 grid) is not that case on any served part: its 90 64-row tiles FIT one wave at 90 SMs and more,
-    # where the route keeps the driver's graph route (eager steps; a capture is the driver's typed refusal); a part with fewer SMs
-    # overflows the wave and takes the route's 128-row tile at T <= 128.  So the expectation is read off the live resolver, as the
+    # (the indexer band's 13952-column slab of the 24 / 2 geometry: its own cell below), the GEMM engine's own baseline pick past 128
+    # rows (the large-M rule, every 128-grid band slab).  THIS small geometry's band slab (N 5120 + 640 = 5760 = 45 x 128, off the 256
+    # grid) is not the small-M case on any served part: its 90 64-row tiles FIT one wave at 90 SMs and more, where the route keeps the
+    # driver's graph route up to 128 rows (eager steps; a capture is the driver's typed refusal); a part with fewer SMs overflows the
+    # wave and takes the route's 128-row tile at T <= 128.  Past 128 rows (S_q 64: T 256) the large-M rule names the baseline on every
+    # part (N 5760 is past the planner's bounds, K 512 too shallow to split).  So the expectation is read off the live resolver, as the
     # 13952 cell reads it, and the one-wave fact is asserted where the live part has it; the out projection (N 512, on the 256 grid)
     # is capture-safe throughout
-    from cudnn.gated_attention_block.kernels.proj_gemm import SMALL_M_MAX, _auto_tile_name
+    from cudnn.gated_attention_block.kernels.proj_gemm import SMALL_M_MAX, _auto_tile_name, large_m_tile_config
     from cudnn.gemm.frost import arch_family
+    from cudnn.gemm.frost.tile_config import _sm_count, select_config
 
     assert blk._proj.capture_safe and blk._out_proj.capture_safe
     with _no_host_sync():
         band, baux = _declare(GEOM_SMALL, 4, s_q, n_pages=6, index_band=True)
     g = baux["geom"]
     assert g.n_qkvg % 256 != 0 and g.n_qkvg % 128 == 0
-    name = _auto_tile_name(4 * s_q, g.n_qkvg, g.d_model, dtype=BF16, a_major="k", b_major="k", block_scale=False, alpha=False)
+    t = 4 * s_q
+    name = _auto_tile_name(t, g.n_qkvg, g.d_model, dtype=BF16, a_major="k", b_major="k", block_scale=False, alpha=False)
     resolves = name is not None
-    if _DEV == "cuda" and arch_family.active_family() == "sm100":
-        one_wave = -(-g.n_qkvg // 64) <= sm  # the slab's 90 64-row tiles fit one wave: every served part
-        assert resolves is (4 * s_q <= SMALL_M_MAX and not one_wave), (sm, name)
+    if arch_family.active_family() == "sm100":
+        sm_live = _sm_count()  # the resolver's SM count: the device's, or the helper's CPU-only default
+        if _DEV == "cuda":
+            assert sm_live == sm
+        if t <= SMALL_M_MAX:
+            one_wave = -(-g.n_qkvg // 64) <= sm_live  # the slab's 90 64-row tiles fit one wave: every served part
+            assert resolves is (not one_wave), (sm_live, name)
+        else:
+            # the large-M rule: the engine's own baseline pick at the live SM count (the kernel the graph route ran there), never swap-AB
+            expect = select_config(t, g.n_qkvg, 1, K=g.d_model, sm_count=sm_live).name
+            assert resolves and name == large_m_tile_config(t, g.n_qkvg, g.d_model, dtype=BF16) == expect and "swapAB" not in name, (sm_live, name)
     else:
         assert not resolves, name  # the sm120 family's forced-tile fallback has no tile off the 256 grid
     assert getattr(band._proj, "capture_safe", False) is resolves and band._proj.resolves_a_jit_tile() is resolves and band._out_proj.capture_safe
 
 
 @pytest.mark.parametrize(
-    "batch, s_q, jit", [(1, 1, True), (4, 1, True), (32, 4, True), (4, 64, False)], ids=["B1-Sq1-T1", "B4-Sq1-T4", "B32-Sq4-T128", "B4-Sq64-T256"]
+    "batch, s_q, small_m", [(1, 1, True), (4, 1, True), (32, 4, True), (4, 64, False)], ids=["B1-Sq1-T1", "B4-Sq1-T4", "B32-Sq4-T128", "B4-Sq64-T256"]
 )
-def test_the_indexer_band_declaration_over_the_pools_is_capture_safe_at_decode_row_counts(batch, s_q, jit):
+def test_the_indexer_band_declaration_over_the_pools_is_capture_safe_at_every_row_count(batch, s_q, small_m):
     """The 24 / 2 geometry WITH the indexer band over the pools (N = 13312 + 640 = 13952, off the 256 grid): at decode row counts
     (``T = B x S_q <= 128``) the slab GEMM takes the small-M route's 128-row swap-AB tile (13952 = 109 x 128; its 218 64-row tiles
-    overflow a wave on every served part), so BOTH projection stages are declared capture-safe -- exactly where the driver's own
-    resolver names a tile (the predicate is read off it, never re-spelled); past 128 rows the band slab has no tile (256 does not
-    divide it) and keeps the graph route: the slab stage is not flagged (a capture is the driver's typed refusal), the out projection
-    (N 2560, on the 256 grid) is.  Declared on empty tensors with no host sync (any device)."""
-    from cudnn.gated_attention_block.kernels.proj_gemm import SMALL_M_MAX, _auto_tile_name
+    overflow a wave on every served part), past them (T 256) the GEMM engine's OWN baseline pick for the shape -- the kernel the graph
+    route ran there, named by the large-M rule so the slab rides the same JIT-only route -- so BOTH projection stages are declared
+    capture-safe at every row count, exactly where the driver's own resolver names a tile (the predicate is read off it, never
+    re-spelled); the out projection (N 2560, on the 256 grid) is capture-safe throughout.  Declared on empty tensors with no host sync
+    (any device)."""
+    from cudnn.gated_attention_block.kernels.proj_gemm import SMALL_M_MAX, _auto_tile_name, large_m_tile_config
     from cudnn.gemm.frost import arch_family
-    from cudnn.gemm.frost.tile_config import _sm_count
+    from cudnn.gemm.frost.tile_config import _sm_count, select_config
 
     with _no_host_sync():
         blk, aux = _declare(GEOM_FLASH_NEXT, batch, s_q, n_pages=6, index_band=True)
     g = aux["geom"]
     t = batch * s_q
-    assert g.n_qkvg == 13952 and g.n_qkvg % 256 != 0 and g.n_qkvg % 128 == 0 and (t <= SMALL_M_MAX) is jit
+    assert g.n_qkvg == 13952 and g.n_qkvg % 256 != 0 and g.n_qkvg % 128 == 0 and (t <= SMALL_M_MAX) is small_m
     # the resolver the block's predicate reads (its arch-family gate included), at the live part's SM count: on the sm100 family the
-    # small-M route's 128-row swap-AB tile below 218 SMs; the sm120 family keeps the forced-tile fallback, which has no tile off the 256 grid
+    # small-M route's 128-row swap-AB tile below 218 SMs up to 128 rows and the engine's baseline past them; the sm120 family keeps the
+    # forced-tile fallback, which has no tile off the 256 grid
     name = _auto_tile_name(t, g.n_qkvg, g.d_model, dtype=BF16, a_major="k", b_major="k", block_scale=False, alpha=False)
     resolves = name is not None
     if arch_family.active_family() == "sm100":
-        assert name is None or (name.startswith("CONFIG_sm100_128x") and name.endswith("_swapAB"))
-        # the one-wave boundary the route reads off the live SM count: the slab's 218 64-row tiles overflow the wave of every served part
-        # (<= 212 SMs) -> the small-M tile at T <= 128; a part with 218 SMs or more holds them in one wave and keeps the graph route
-        assert resolves is (jit and _sm_count() < -(-g.n_qkvg // 64)), (_sm_count(), name)
+        if small_m:
+            assert name is None or (name.startswith("CONFIG_sm100_128x") and name.endswith("_swapAB"))
+            # the one-wave boundary the route reads off the live SM count: the slab's 218 64-row tiles overflow the wave of every served part
+            # (<= 212 SMs) -> the small-M tile at T <= 128; a part with 218 SMs or more holds them in one wave and keeps the graph route
+            assert resolves is (_sm_count() < -(-g.n_qkvg // 64)), (_sm_count(), name)
+        else:
+            # the large-M rule: the engine's baseline at the live SM count (a 2-CTA pair tile, never swap-AB), the name `select_config` spells;
+            # at 256 rows the pick's grid fills a wave on every served part, so the split guard admits it everywhere
+            expect = select_config(t, g.n_qkvg, 1, K=g.d_model, sm_count=_sm_count()).name
+            assert resolves and name == large_m_tile_config(t, g.n_qkvg, g.d_model, dtype=BF16) == expect, (_sm_count(), name, expect)
+            assert name.endswith("_2ctamma") and "swapAB" not in name and "splitK" not in name, name
+    else:
+        assert not resolves, name
     assert getattr(blk._proj, "capture_safe", False) is resolves and blk._out_proj.capture_safe is True
     assert blk._proj.resolves_a_jit_tile() is resolves and blk._out_proj.resolves_a_jit_tile() is True
 
@@ -2763,7 +2786,8 @@ def test_decode_indexer_first_execute_captures_without_warm_up_and_replays_bitwi
     nothing, the replay is BITWISE a fresh eager run (``out``, the LSE, the list, the ring, the cache), and a new step through the captured
     tensors (new lengths / tables / slots / ring state / cache / inputs) replays bitwise the eager run over them."""
     # the 24 / 2 band geometry: its slab (N 13952) rides the small-M route's 128-row tile at B x S_q <= 128 rows, capture-safe from the
-    # first execute (the band capture cell above); the 8 / 2 band slab (N 5760) takes the GEMM graph route, whose handle is created eagerly
+    # first execute (the band capture cell above); the 8 / 2 band slab (N 5760) takes the GEMM graph route at decode row counts (its 90
+    # 64-row tiles fit one wave), whose handle is created eagerly -- past 128 rows it rides the engine's baseline tile on the JIT route
     kw = dict(page=16, split=4, fuse_gate=True, return_lse=True, fuse_prepare=fuse_prepare, index_cache_dtype=cache_dtype)
     case = _IndexerCase(GEOM_FLASH_NEXT, 2, (300, 0, 1000, 77), seed=141, **kw)
     case.prime_prefix()
