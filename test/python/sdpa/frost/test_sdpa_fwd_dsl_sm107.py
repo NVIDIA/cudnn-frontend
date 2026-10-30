@@ -8660,6 +8660,11 @@ def test_packed_sink_combine_counts_virtual_key_once(dtype_name, stats):
                 total.data_ptr(),
                 torch.cuda.current_stream().cuda_stream,
                 sinks.data_ptr(),
+                # The packed host's physical-origin slots (paged THD): compact partials carry none, so the compiled frame's two
+                # None operands, then n_batch -- the one batch the packed entry serves, as the prepared split host passes B.
+                None,
+                None,
+                b,
             )
 
         run()
