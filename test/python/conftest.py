@@ -431,10 +431,9 @@ def _jax_compiles_for_this_device():
 def _skip_unavailable_jax_tests(items):
     if not any(item.fspath.basename.endswith("_jax.py") for item in items):
         return  # do not pay for the probe on runs with no JAX tests
-    from cudnn._jax_requirements import JAX_MIN_CUTEDSL_VERSION
     from cudnn.frost.buffers import cutedsl_requirement_error
 
-    requirement_error = cutedsl_requirement_error("JAX tests", min_version=JAX_MIN_CUTEDSL_VERSION)
+    requirement_error = cutedsl_requirement_error("JAX tests", min_version=(4, 7, 1))
     if requirement_error is None and _jax_compiles_for_this_device():
         return
     skip = pytest.mark.skip(reason=requirement_error or "XLA cannot compile for this GPU (jaxlib emits PTX 9.0; sm_107a needs >= 9.4)")
