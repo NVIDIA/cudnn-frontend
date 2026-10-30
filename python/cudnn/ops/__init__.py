@@ -42,10 +42,14 @@ _LAZY_EXPORTS = {
     "block_sparse_attention_backward_jax": ("cudnn.block_sparse_attention.jax_api", "block_sparse_attention_backward"),
 }
 
-__all__ = list(_LAZY_EXPORTS)
+__all__ = [*_LAZY_EXPORTS, "dsa"]
 
 
 def __getattr__(name: str) -> Any:
+    if name == "dsa":
+        value = importlib.import_module("cudnn.ops.dsa")
+        globals()[name] = value
+        return value
     target = _LAZY_EXPORTS.get(name)
     if target is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
