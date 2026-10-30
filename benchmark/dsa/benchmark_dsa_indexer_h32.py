@@ -6,7 +6,7 @@
 
 The default benchmark compares two end-to-end paths:
 
-* ``compact_h32``: compact H32 tensors passed directly to the default backend;
+* ``compact_h32``: compact H32 tensors passed directly to the kernel;
 * ``eager_pad_h64``: caller-side ``torch.nn.functional.pad`` to H64 before the
   established kernel.
 
@@ -70,7 +70,7 @@ def _outputs(q: torch.Tensor, w: torch.Tensor, k: torch.Tensor):
 
 
 def _call(q, w, k, attn, predict, indices, grad_loss, outputs, *, deterministic, topk_indices_global, workspace):
-    """Launch the default indexer-backward backend into supplied outputs."""
+    """Launch the indexer backward into supplied outputs."""
     d_index_q, d_weights, d_index_k = outputs
     return DSA.indexer_backward_wrapper(
         q,
@@ -87,7 +87,6 @@ def _call(q, w, k, attn, predict, indices, grad_loss, outputs, *, deterministic,
         d_index_q=d_index_q,
         d_weights=d_weights,
         d_index_k=d_index_k,
-        backend="default",
         deterministic=deterministic,
         workspace=workspace,
     )
