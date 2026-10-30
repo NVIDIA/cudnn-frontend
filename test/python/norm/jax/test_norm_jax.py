@@ -197,33 +197,39 @@ def test_rejects_multiple_processes(monkeypatch):
         jax.jit(lambda x: layer_norm_forward_jax(x)).lower(jax.ShapeDtypeStruct((2, 8), jnp.float32))
 
 
-@pytest.mark.parametrize(
-    "property_name,other_value",
-    [("compute_capability", (10, 3)), ("multiprocessor_count", 132), ("shared_memory_per_block_optin", 163840)],
-)
-def test_tracing_rejects_heterogeneous_cuda_devices_with_closed_over_weight(monkeypatch, property_name, other_value):
+def test_tracing_ignores_unrelated_cuda_devices(monkeypatch):
     from cudnn.frost import device
+    from cudnn.norm import jax_api
 
-    monkeypatch.setattr(device, "device_count", lambda: 2)
-    properties = {"compute_capability": (10, 0), "multiprocessor_count": 148, "shared_memory_per_block_optin": 232448}
-    for name, value in properties.items():
-        monkeypatch.setattr(device, name, lambda ordinal, value=value: value)
-    monkeypatch.setattr(device, property_name, lambda ordinal: other_value if ordinal == 1 else properties[property_name])
+    selected = jax.config.jax_default_device.local_hardware_id
+    properties = {
+        "compute_capability": ((10, 0), (12, 0)),
+        "multiprocessor_count": (device.multiprocessor_count(selected), 68),
+        "shared_memory_per_block_optin": (device.shared_memory_per_block_optin(selected), 101376),
+    }
+    monkeypatch.setattr(device, "device_count", lambda: selected + 2)
+    monkeypatch.setattr(device, "ambient_device", lambda: selected + 1)
+    for name, values in properties.items():
+        monkeypatch.setattr(device, name, lambda ordinal, values=values: values[ordinal != selected])
+    options = []
+
+    def bridge(launch, *, output_shape_dtype, compile_options, **kwargs):
+        options.append(compile_options)
+        return lambda *args: jax.tree.map(lambda spec: jnp.zeros(spec.shape, spec.dtype), output_shape_dtype)
+
+    monkeypatch.setattr(jax_api, "call", bridge)
+    monkeypatch.setattr(jax_api, "_forward_call", jax_api._forward_call.__wrapped__)
+    monkeypatch.setattr(jax_api, "_backward_call", jax_api._backward_call.__wrapped__)
     weight = jnp.ones((8,), jnp.float32)
-    with pytest.raises(NotImplementedError, match="matching compute capability"):
-        jax.jit(lambda x: layer_norm_forward_jax(x, weight)).lower(jax.ShapeDtypeStruct((2, 8), jnp.float32))
+    jax.jit(jax.value_and_grad(lambda x: layer_norm_forward_jax(x, weight)[0].sum())).lower(jax.ShapeDtypeStruct((2, 8), jnp.float32))
+    assert options == ["--gpu-arch=sm_100a"] * 2
 
 
 @pytest.mark.parametrize("kind", ["layer", "rms"])
 def test_multiple_gpus_preserve_placement_and_reuse_compilation(kind):
-    from cudnn.frost import device
-
     devices = [d for d in jax.local_devices() if d.platform == "gpu" and str(getattr(d, "compute_capability", "")) == "10.0"]
     if len(devices) < 2:
         pytest.skip("needs two visible SM100 GPUs")
-    properties = {(device.compute_capability(i), device.multiprocessor_count(i), device.shared_memory_per_block_optin(i)) for i in range(device.device_count())}
-    if len(properties) != 1:
-        pytest.skip("needs matching properties across all visible CUDA GPUs")
     shape = (8, 4096)
     forward = jax.jit(lambda args: invoke(kind, args))
     gradients = jax.grad(lambda args, cotangent: jnp.sum(invoke(kind, args) * cotangent))
@@ -237,10 +243,11 @@ def test_multiple_gpus_preserve_placement_and_reuse_compilation(kind):
             rng.normal(0, 0.2, shape[-1:]).astype(np.float32) if kind == "layer" else None,
         )
         args, cotangent = jax.device_put((host_args, rng.normal(size=shape).astype(np.float32)), target)
-        expected = reference(kind, args, shape[-1:], 1e-5), reference_gradients(args, cotangent)
-        results = [(forward(args), compiled_gradients(args, cotangent))]
-        if iteration == 1:
-            results.append((invoke(kind, args), gradients(args, cotangent)))
+        with jax.default_device(target):
+            expected = reference(kind, args, shape[-1:], 1e-5), reference_gradients(args, cotangent)
+            results = [(forward(args), compiled_gradients(args, cotangent))]
+            if iteration == 1:
+                results.append((invoke(kind, args), gradients(args, cotangent)))
         for result in results:
             for actual, desired in zip(jax.tree.leaves(result), jax.tree.leaves(expected), strict=True):
                 assert actual.devices() == {target}
@@ -253,19 +260,21 @@ def test_multiple_gpus_preserve_placement_and_reuse_compilation(kind):
         invoke(kind, (args[0], jax.device_put(args[1], devices[0]), args[2]))
 
 
-def test_sm_count_follows_ambient_and_build_devices(monkeypatch):
+def test_device_properties_follow_ambient_and_build_devices(monkeypatch):
     from cudnn.frost import device
-    from cudnn.norm.utils import sm_count
+    from cudnn.norm.utils import sm_count, smem_capacity
 
     counts = {0: 68, 1: 148}
+    limits = {0: 101376, 1: 232448}
     monkeypatch.setattr(device, "multiprocessor_count", lambda ordinal: counts[ordinal])
+    monkeypatch.setattr(device, "shared_memory_per_block_optin", lambda ordinal: limits[ordinal])
     monkeypatch.setattr(device, "ambient_device", lambda: 0)
-    assert sm_count() == 68
+    assert (sm_count(), smem_capacity()) == (68, 101376)
     with device.build_device(1):
-        assert sm_count() == 148
-    assert sm_count() == 68
+        assert (sm_count(), smem_capacity()) == (148, 232448)
+    assert (sm_count(), smem_capacity()) == (68, 101376)
     monkeypatch.setattr(device, "ambient_device", lambda: 1)
-    assert sm_count() == 148
+    assert (sm_count(), smem_capacity()) == (148, 232448)
 
 
 def test_torch_free_forward_and_gradients():
@@ -279,14 +288,16 @@ sys.meta_path.insert(0, RejectTorch())
 import jax
 import jax.numpy as jnp
 from cudnn.ops import layer_norm_forward_jax, rms_norm_forward_jax
-for rows, cols in ((3, 31), (2, 16384)):
-    x = jnp.arange(rows * cols, dtype=jnp.float32).reshape(rows, cols) / (rows * cols)
-    weight = jnp.linspace(0.5, 1.5, cols, dtype=jnp.float32)
-    bias = jnp.linspace(-0.2, 0.2, cols, dtype=jnp.float32)
-    for op, args in ((layer_norm_forward_jax, (x, weight, bias)), (rms_norm_forward_jax, (x, weight))):
-        run = jax.jit(jax.value_and_grad(lambda args: jnp.square(op(*args)[0]).sum()))
-        value, gradients = jax.block_until_ready(run(args))
-        assert jnp.isfinite(value) and all(jnp.all(jnp.isfinite(g)) for g in gradients)
+target = next(device for device in jax.local_devices() if device.platform == "gpu" and str(getattr(device, "compute_capability", "")) == "10.0")
+with jax.default_device(target):
+    for rows, cols in ((3, 31), (2, 16384)):
+        x = jnp.arange(rows * cols, dtype=jnp.float32).reshape(rows, cols) / (rows * cols)
+        weight = jnp.linspace(0.5, 1.5, cols, dtype=jnp.float32)
+        bias = jnp.linspace(-0.2, 0.2, cols, dtype=jnp.float32)
+        for op, args in ((layer_norm_forward_jax, (x, weight, bias)), (rms_norm_forward_jax, (x, weight))):
+            run = jax.jit(jax.value_and_grad(lambda args: jnp.square(op(*args)[0]).sum()))
+            value, gradients = jax.block_until_ready(run(args))
+            assert jnp.isfinite(value) and all(jnp.all(jnp.isfinite(g)) for g in gradients)
 assert "torch" not in sys.modules
 """
     subprocess.run(
