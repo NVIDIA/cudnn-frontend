@@ -35,9 +35,12 @@ def _require_sm100_family():
 
 def _require_indexer_backward_v2_gpu():
     """Skip unless the v2 backend supports the current GPU capability."""
-    supported_capabilities = ((10, 0), (10, 3))
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in supported_capabilities:
-        pytest.skip(f"IndexerBackward v2 requires capability in {supported_capabilities}")
+    try:
+        from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import INDEXER_BACKWARD_SM100_CAPABILITIES
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in INDEXER_BACKWARD_SM100_CAPABILITIES:
+        pytest.skip(f"IndexerBackward v2 requires capability in {INDEXER_BACKWARD_SM100_CAPABILITIES}")
 
 
 def _allocate(cfg, sm_scale: float):
@@ -265,7 +268,7 @@ def test_DSA_indexer_backward_wrapper_compact_h32():
         pytest.param(64, 64, "requires D=128", id="d64"),
     ],
 )
-def test_DSA_indexer_backward_sm100_rejects_untested_sub_m64_heads(h, d, match):
+def test_DSA_indexer_backward_sm100_rejects_unsupported_heads_and_head_dim(h, d, match):
     """The new compact contract adds H32 only, and the kernel serves D=128 only; neither silently widens the domain."""
     try:
         from cudnn import DSA
@@ -387,6 +390,20 @@ def _idxbwd_inputs():
     return index_q, weights, index_k, attn_score, index_score, topk_indices, loss_coeff, grad_loss
 
 
+def _assert_rejected_before_mutation(check, call, attn_score, index_score):
+    """``call`` raises ValueError and leaves both score buffers untouched.
+
+    Kernel 1 overwrites ``attn_score`` in place, so a check that runs after
+    it is fail-dirty even when it raises; ``index_score`` is read-only.
+    """
+    snapshots = (attn_score.clone(), index_score.clone())
+    with pytest.raises(ValueError):
+        call()
+    torch.cuda.synchronize()
+    for name, buffer, before in zip(("attn_score", "index_score"), (attn_score, index_score), snapshots):
+        assert torch.equal(buffer, before), f"{name} mutated before the {check} (fail-dirty)"
+
+
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_DSA_indexer_backward_illegal_output_dtype_raises_before_mutation():
@@ -405,10 +422,6 @@ def test_DSA_indexer_backward_illegal_output_dtype_raises_before_mutation():
         ("fp16 d_index_k", {"d_index_k_dtype": torch.float16}),
     ):
         iq, w, ik, attn, idx, tk, loss_coeff, grad_loss = _idxbwd_inputs()
-        aq = attn.clone()
-        isc = idx.clone()
-        aq_pre = aq.clone()
-        isc_pre = isc.clone()
         outputs = {}
         if "d_index_q_dtype" in kw:
             outputs["d_index_q"] = torch.empty_like(iq, dtype=kw["d_index_q_dtype"])
@@ -417,11 +430,14 @@ def test_DSA_indexer_backward_illegal_output_dtype_raises_before_mutation():
         if "d_index_k_dtype" in kw:
             outputs["d_index_k"] = torch.empty_like(ik, dtype=kw["d_index_k_dtype"])
 
-        with pytest.raises(ValueError):
-            DSA.indexer_backward_wrapper(iq, w, ik, aq, isc, tk, sm_scale=_IDXBWD_SM_SCALE, loss_coeff=loss_coeff, grad_loss=grad_loss, block_I=128, **outputs)
-        torch.cuda.synchronize()
-        assert torch.equal(aq, aq_pre), f"{label}: attn_score mutated before the dtype check (fail-dirty)"
-        assert torch.equal(isc, isc_pre), f"{label}: index_score mutated before the dtype check (fail-dirty)"
+        _assert_rejected_before_mutation(
+            f"{label} dtype check",
+            lambda: DSA.indexer_backward_wrapper(
+                iq, w, ik, attn, idx, tk, sm_scale=_IDXBWD_SM_SCALE, loss_coeff=loss_coeff, grad_loss=grad_loss, block_I=128, **outputs
+            ),
+            attn,
+            idx,
+        )
 
 
 @pytest.mark.L0
@@ -531,45 +547,28 @@ def test_DSA_indexer_backward_direct_plan_shape_stride_mismatch_raises():
     b, s_q, _, _ = iq.shape
     topk = tk.shape[-1]
 
-    # Case 1: wrong-shaped attn_score (extra top-k column). Fill it with
-    # meaningful (nonzero) data and snapshot both score buffers so we can assert
-    # neither is mutated before the shape check raises.
-    aq_bad = torch.softmax(torch.randn(b, s_q, topk + 1, device=iq.device), dim=-1).float()
-    isc = idx.clone()
-    aq_bad_pre = aq_bad.clone()
-    isc_pre = isc.clone()
-    with pytest.raises(ValueError):
-        plan.execute(
-            iq, w, ik, torch.empty_like(iq), torch.empty_like(w), torch.empty_like(ik), aq_bad, isc, tk, grad_loss, loss_coeff=loss_coeff, workspace=ws
+    def run(attn_score, d_weights=None):
+        d_weights = torch.empty_like(w) if d_weights is None else d_weights
+        idx_copy = idx.clone()
+        return (
+            lambda: plan.execute(
+                iq, w, ik, torch.empty_like(iq), d_weights, torch.empty_like(ik), attn_score, idx_copy, tk, grad_loss, loss_coeff=loss_coeff, workspace=ws
+            ),
+            idx_copy,
         )
-    torch.cuda.synchronize()
-    assert torch.equal(aq_bad, aq_bad_pre), "attn_score mutated before the shape check (fail-dirty)"
-    assert torch.equal(isc, isc_pre), "index_score mutated before the shape check (fail-dirty)"
 
+    # Case 1: wrong-shaped attn_score (extra top-k column) holding meaningful data.
+    aq_bad = torch.softmax(torch.randn(b, s_q, topk + 1, device=iq.device), dim=-1).float()
+    call, isc = run(aq_bad)
+    _assert_rejected_before_mutation("shape check", call, aq_bad, isc)
     # Case 2: non-contiguous attn_score (right shape, strided storage).
     aq_nc = _noncontiguous_like(attn)
-    isc2 = idx.clone()
-    aq_nc_pre = aq_nc.clone()
-    isc2_pre = isc2.clone()
-    with pytest.raises(ValueError):
-        plan.execute(
-            iq, w, ik, torch.empty_like(iq), torch.empty_like(w), torch.empty_like(ik), aq_nc, isc2, tk, grad_loss, loss_coeff=loss_coeff, workspace=ws
-        )
-    torch.cuda.synchronize()
-    assert torch.equal(aq_nc, aq_nc_pre), "attn_score mutated before the stride check (fail-dirty)"
-    assert torch.equal(isc2, isc2_pre), "index_score mutated before the stride check (fail-dirty)"
-
-    # Case 3: non-contiguous OUTPUT (d_weights) is rejected before mutation too.
-    aq3 = attn.clone()
-    isc3 = idx.clone()
-    aq3_pre = aq3.clone()
-    isc3_pre = isc3.clone()
-    dw_nc = _noncontiguous_like(torch.empty_like(w))
-    with pytest.raises(ValueError):
-        plan.execute(iq, w, ik, torch.empty_like(iq), dw_nc, torch.empty_like(ik), aq3, isc3, tk, grad_loss, loss_coeff=loss_coeff, workspace=ws)
-    torch.cuda.synchronize()
-    assert torch.equal(aq3, aq3_pre), "attn_score mutated before the output-stride check (fail-dirty)"
-    assert torch.equal(isc3, isc3_pre), "index_score mutated before the output-stride check (fail-dirty)"
+    call, isc = run(aq_nc)
+    _assert_rejected_before_mutation("stride check", call, aq_nc, isc)
+    # Case 3: a non-contiguous OUTPUT (d_weights) is rejected before mutation too.
+    aq = attn.clone()
+    call, isc = run(aq, d_weights=_noncontiguous_like(torch.empty_like(w)))
+    _assert_rejected_before_mutation("output-stride check", call, aq, isc)
 
 
 @pytest.mark.L0
@@ -592,13 +591,12 @@ def test_DSA_indexer_backward_wrapper_cache_hit_stride_mismatch_raises():
     # non-contiguous attn_score. The cached plan must raise before mutation.
     aq_nc = _noncontiguous_like(attn)
     isc = idx.clone()
-    aq_nc_pre = aq_nc.clone()
-    isc_pre = isc.clone()
-    with pytest.raises(ValueError):
-        DSA.indexer_backward_wrapper(iq, w, ik, aq_nc, isc, tk, sm_scale=_IDXBWD_SM_SCALE, loss_coeff=loss_coeff, grad_loss=grad_loss, block_I=128)
-    torch.cuda.synchronize()
-    assert torch.equal(aq_nc, aq_nc_pre), "attn_score mutated before the cache-hit stride check (fail-dirty)"
-    assert torch.equal(isc, isc_pre), "index_score mutated before the cache-hit stride check (fail-dirty)"
+    _assert_rejected_before_mutation(
+        "cache-hit stride check",
+        lambda: DSA.indexer_backward_wrapper(iq, w, ik, aq_nc, isc, tk, sm_scale=_IDXBWD_SM_SCALE, loss_coeff=loss_coeff, grad_loss=grad_loss, block_I=128),
+        aq_nc,
+        isc,
+    )
 
 
 @pytest.mark.L0
@@ -621,16 +619,15 @@ def test_DSA_indexer_backward_wrong_shape_plan_rejected_before_kernel1():
     #     must raise before any kernel launch; the score buffers stay pristine.
     aq = attn.clone()
     isc = idx.clone()
-    aq_pre = aq.clone()
-    isc_pre = isc.clone()
     dw_bad = torch.empty(b, s_q, h + 1, dtype=torch.bfloat16, device=iq.device)
-    with pytest.raises(ValueError):
-        DSA.indexer_backward_wrapper(
+    _assert_rejected_before_mutation(
+        "wrong-shape check",
+        lambda: DSA.indexer_backward_wrapper(
             iq, w, ik, aq, isc, tk, sm_scale=_IDXBWD_SM_SCALE, loss_coeff=loss_coeff, grad_loss=grad_loss, block_I=128, d_weights=dw_bad
-        )
-    torch.cuda.synchronize()
-    assert torch.equal(aq, aq_pre), "attn_score mutated before the wrong-shape check (fail-dirty)"
-    assert torch.equal(isc, isc_pre), "index_score mutated before the wrong-shape check (fail-dirty)"
+        ),
+        aq,
+        isc,
+    )
 
     # (b) Directly-built plan with a wrong-shaped attn_score sample: check_support
     #     rejects the inconsistent signature (before compile / any kernel launch).
@@ -688,13 +685,12 @@ def test_DSA_indexer_backward_noncontiguous_index_k_plan_rejected():
     #     rejected before kernel 1 overwrites attn_score.
     aq = attn.clone()
     isc = idx.clone()
-    aq_pre = aq.clone()
-    isc_pre = isc.clone()
-    with pytest.raises(ValueError):
-        DSA.indexer_backward_wrapper(iq, w, ik_nc, aq, isc, tk, sm_scale=_IDXBWD_SM_SCALE, loss_coeff=loss_coeff, grad_loss=grad_loss, block_I=128)
-    torch.cuda.synchronize()
-    assert torch.equal(aq, aq_pre), "attn_score mutated before the non-contiguous check (fail-dirty)"
-    assert torch.equal(isc, isc_pre), "index_score mutated before the non-contiguous check (fail-dirty)"
+    _assert_rejected_before_mutation(
+        "non-contiguous check",
+        lambda: DSA.indexer_backward_wrapper(iq, w, ik_nc, aq, isc, tk, sm_scale=_IDXBWD_SM_SCALE, loss_coeff=loss_coeff, grad_loss=grad_loss, block_I=128),
+        aq,
+        isc,
+    )
 
 
 @pytest.mark.L0
@@ -1714,11 +1710,25 @@ def test_DSA_indexer_backward_deterministic_topk2048_boundary(backend, s_q, topk
     )
 
 
+_DEFAULT_CAPABILITY_ERROR = (ValueError, "deterministic IndexerBackward requires capability")
+_V2_CAPABILITY_ERROR = (RuntimeError, "backend='sm100_v2' requires capability")
+
+
 @pytest.mark.L0
-@pytest.mark.parametrize("capability,supported", [((9, 0), False), ((10, 3), True), ((10, 7), False)])
+@pytest.mark.parametrize(
+    "backend,capability,error",
+    [
+        pytest.param("default", (9, 0), _DEFAULT_CAPABILITY_ERROR, id="default-sm90"),
+        pytest.param("default", (10, 3), None, id="default-sm103"),
+        pytest.param("default", (10, 7), _DEFAULT_CAPABILITY_ERROR, id="default-sm107"),
+        pytest.param("sm100_v2", (9, 0), _V2_CAPABILITY_ERROR, id="v2-sm90"),
+        pytest.param("sm100_v2", (10, 3), None, id="v2-sm103"),
+        pytest.param("sm100_v2", (10, 7), _V2_CAPABILITY_ERROR, id="v2-sm107"),
+    ],
+)
 @torch_fork_set_rng(seed=1707)
-def test_DSA_indexer_backward_deterministic_capability_gate(monkeypatch, capability, supported):
-    """The deterministic path accepts SM100/SM103 and fails closed elsewhere."""
+def test_DSA_indexer_backward_deterministic_capability_gate(monkeypatch, backend, capability, error):
+    """Both deterministic backends accept SM100/SM103 and fail closed elsewhere."""
     try:
         from cudnn import DSA
     except ImportError:
@@ -1736,59 +1746,18 @@ def test_DSA_indexer_backward_deterministic_capability_gate(monkeypatch, capabil
         sample_attn_score=attn_score,
         sample_index_score=index_score,
         sample_topk_indices=topk_indices,
+        backend=backend,
         deterministic=True,
     )
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
 
     attn_before = attn_score.clone()
-    if supported:
+    if error is None:
         assert plan.check_support()
     else:
-        with pytest.raises(ValueError, match="deterministic IndexerBackward requires capability"):
+        with pytest.raises(error[0], match=error[1]):
             plan.check_support()
     assert torch.equal(attn_score, attn_before)
-
-
-@pytest.mark.L0
-@torch_fork_set_rng(seed=1708)
-def test_DSA_indexer_backward_v2_accepts_sm103_capability(monkeypatch):
-    """The v2 plan gate shares the deterministic SM100/SM103 capability set."""
-    try:
-        from cudnn import DSA
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-
-    cfg = dict(b=1, s_q=2, s_kv=128, head_dim=128, qhead_per_kv_head=64, topk=128)
-    index_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
-    plan = DSA.IndexerBackward(
-        sample_index_q=index_q,
-        sample_weights=weights,
-        sample_index_k=index_k,
-        sample_d_index_q=torch.empty_like(index_q),
-        sample_d_weights=torch.empty_like(weights),
-        sample_d_index_k=torch.empty_like(index_k),
-        sample_attn_score=attn_score,
-        sample_index_score=index_score,
-        sample_topk_indices=topk_indices,
-        backend="sm100_v2",
-        deterministic=True,
-    )
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 3))
-    assert plan.check_support()
-
-
-@pytest.mark.L0
-@pytest.mark.parametrize("capability,supported", [((10, 0), True), ((10, 3), True), ((10, 7), False)])
-def test_indexer_backward_v2_test_guard_matches_backend_capabilities(monkeypatch, capability, supported):
-    """The H32 runtime tests skip major-10 GPUs outside the v2 support set."""
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
-
-    if supported:
-        _require_indexer_backward_v2_gpu()
-    else:
-        with pytest.raises(pytest.skip.Exception):
-            _require_indexer_backward_v2_gpu()
 
 
 @torch_fork_set_rng(seed=1710)
@@ -3755,7 +3724,7 @@ def test_DSA_indexer_backward_sm100_score_grad_pdl_full_pipeline_matches_serial(
 )
 @pytest.mark.parametrize("seqlen_q", [17, 151])
 @pytest.mark.parametrize("dk_column_permuted", [False, True], ids=["dk-natural", "dk-permuted"])
-def test_DSA_indexer_backward_sm100_persistent_short_topk_matches_reference(
+def test_DSA_indexer_backward_sm100_gemm_matches_reference(
     dk_column_permuted,
     seqlen_q,
     topk,
