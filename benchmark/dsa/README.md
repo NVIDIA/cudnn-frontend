@@ -287,10 +287,9 @@ cuDNN Frontend `[cutedsl]` dependencies.
 ### Sparse Attention Backward
 
 Microbenchmark for the DeepSeek Sparse Attention (DSA) backward kernel in the
-cuDNN Frontend CuTe DSL package, driven through the public
-`cudnn.DSA.sparse_attention_backward_wrapper` API. The wrapper dispatches to
-the Hopper (SM90) or Blackwell (SM100) implementation based on the active
-CUDA device.
+cuDNN Frontend CuTe DSL package, driven through a compiled
+`DSA.SparseAttentionBackward` plan. Setup compiles the plan, and timed
+iterations call `plan.execute(...)` directly.
 
 #### What is measured
 
@@ -301,10 +300,10 @@ Inputs are flat MQA tensors: `q (S_q, H, d_qk)`, a shared
 reference so that this benchmark isolates backward and does not include a
 forward launch.
 
-Each timed iteration is one full wrapper call — gradient-buffer zeroing,
-workspace allocation, and the preprocess/backward/convert kernels — i.e. the
-cost a training step pays per backward invocation. Timing uses a single
-CUDA-event window around `--repeat` iterations and reports the average.
+The benchmark allocates the compiled plan, gradient buffers, and workspace
+during setup. Each timed iteration reuses those buffers and executes the
+compiled backward plan. Timing uses a single CUDA-event window around
+`--repeat` iterations and reports the average.
 
 Reported TFLOPS use the 5-matmul model of the backward pass (recompute S, dV,
 dP, dQ, dK):
@@ -340,9 +339,10 @@ python benchmark_dsa_sparse_attention_backward.py --nheads 128  # SM100/SM103 BF
 python benchmark_dsa_sparse_attention_backward.py --nheads 128 --head-dim 576 --csv d576_2cta.csv  # SM100/SM103 BF16 H128/D576 two-CTA backend
 ```
 
-The H128/D576 two-CTA route uses the same public-wrapper measurement, including
-workspace allocation and initialization. Add `--no-topk-length` to cover the
-variant without a lengths tensor; the default passes a full-length tensor.
+The H128/D576 two-CTA route uses the same compiled-plan measurement, with
+workspace allocation during setup and buffer reuse in timed calls. Add
+`--no-topk-length` to cover the variant without a lengths tensor; the default
+passes a full-length tensor.
 The existing benchmark arguments and CSV format apply to both variants.
 
 Options:
@@ -384,6 +384,31 @@ supported DSL.
 |     8192 |      8192 |  512 |  2.489 |     552.16 |
 |     8192 |      8192 | 1024 |  4.538 |     605.76 |
 |     8192 |      8192 | 2048 |  8.562 |     642.06 |
+
+##### SM100 deterministic relay scheduling (2026-10-30)
+
+Against merged commit `1dea4471a6e6c05e29d3bf281281fd156d345a84`, the
+deterministic H64/D576 relay path improved from 6.957 to 4.466 ms at Q=1K,
+KV=64K and from 101.409 to 64.426 ms at Q=16K, KV=512K with the same
+10.008 GiB workspace.
+Inputs were BF16 with top-k 2048, full runtime lengths, synthetic forward
+statistics, five warm-ups, and 40 allocation-free calls on the SM100 test
+environment (PyTorch 2.14.1+cu130, CuTe DSL 4.8.1, cuDNN 9.24.0).
+
+The automatic policy keeps the conservative eight-CTA relay below Q=8K
+because the earlier cluster-4 crossover did not generalize across SM100
+devices. An explicit Q=4K cluster-4 profiling experiment attributed its local
+gain primarily to the 32 main-kernel waves, whose total fell from 22.941 to
+9.696 ms; this is implementation evidence, not the portable automatic policy.
+The optimized trace has no separate dKV prefold kernel; fixed-order conversion
+takes 1.452 ms and workspace clearing 0.658 ms.
+
+NCU reports 96 registers per thread and 231.42 KiB dynamic shared memory for
+the cluster-4 main kernel, limiting residency to one CTA per SM; achieved
+occupancy is 26.33%, with 57.37% DRAM and 35.07% compute throughput. A
+144-CTA-wave experiment was rejected: 36 four-CTA clusters spill beyond one
+resident cluster wave and regress Q=4K from 12.017 ms/4.533 GiB to
+14.932 ms/5.096 GiB. The 128-CTA, 32-cluster wave is therefore intentional.
 
 #### Profiling
 

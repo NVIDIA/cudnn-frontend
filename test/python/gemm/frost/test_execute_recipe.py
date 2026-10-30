@@ -988,7 +988,7 @@ def test_sm120_swap_quant_diagnostic_uses_package_import(monkeypatch):
     compiled = object.__new__(compiler.CompiledFusedGemm)
     compiled.chain = swap_ab(chain)
     compiled.config = replace(by_name("CONFIG_sm120_64x64x64_16x16x32_cluster1x1_warps2x4"), swap_ab=True)
-    compiled.recipe = SimpleNamespace(device=0, problem=lambda *args: ((128, 128, 128), ()), batch=1)
+    compiled.recipe = SimpleNamespace(device=0, problem=lambda *args: ((128, 128, 128), ()), batch=1, operand_views=lambda operands: operands)
     for name in ("_check_plan_device", "check_shapes", "check_alignment"):
         monkeypatch.setattr(compiler, name, lambda *args: None)
 

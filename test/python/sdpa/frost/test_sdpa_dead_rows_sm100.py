@@ -145,7 +145,7 @@ def test_the_epilogue_selects_the_trimmed_rows_after_the_scale():
     sites = [i for i, ln in enumerate(src.splitlines()) if "o_scaled = o_chunk * inv_sum" in ln]
     assert len(sites) == 1, sites
     tail = "\n".join(src.splitlines()[sites[0] : sites[0] + 16])
-    assert "if cutlass.const_expr(CFG.SEQ_Q_LENS_PRESENT):" in tail and "vec_select_zero(row_trim | row_dead, o_scaled, O_CHUNK)" in tail, tail
+    assert "if cutlass.const_expr(CFG.SEQ_Q_LENS_PRESENT):" in tail and "vec_select_zero(row_trim | row_dead, o_scaled, O_CHUNK_EPI)" in tail, tail
     assert tail.index("vec_select_zero(") < tail.index("o_fp16 = o_scaled.to(STORAGE_DTYPE)"), "the select precedes the cast"
     assert "arith.select(" in inspect.getsource(pointwise.vec_select_zero), "a select, not a multiply"
 
