@@ -191,7 +191,14 @@ def _plot_phase(df, config, phase: str, outdir: Path) -> List[Path]:
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     fig.subplots_adjust(hspace=0.55)
     path = outdir / f"{config.name}_{phase}.webp"
-    fig.savefig(path, dpi=140, pil_kwargs={"lossless": True, "quality": 100, "method": 6, "exact": True})
+    # WebP hard-caps both image dimensions at 16383 px. The serving-form cases
+    # (paged / partial-fill clusters) grew some figures past 117 in wide, which
+    # at the fixed 140 dpi exceeds the cap and savefig raises — the chart is
+    # lost while the CSV survives. Scale dpi down just enough to fit: every
+    # element scales with the figure, so relative legibility is unchanged.
+    fig_h = 3.9 * len(row_keys)
+    dpi = min(140, int(16300 // max(fig_w, fig_h)))
+    fig.savefig(path, dpi=dpi, pil_kwargs={"lossless": True, "quality": 100, "method": 6, "exact": True})
     plt.close(fig)
     return [path]
 
