@@ -1803,6 +1803,51 @@ def test_dense_amax_only_no_dense_output() -> None:
     torch.testing.assert_close(out_am.flatten()[0], ref.abs().amax(), atol=1e-3, rtol=1e-3)
 
 
+@requires_sm120
+@pytest.mark.parametrize("split_k", [1, 2], ids=["no_split", "split_k2"])
+def test_sm120_reductions_skip_nan(split_k: int) -> None:
+    """AMAX, MAX and MIN skip NaN elements on every dense SM120 reduction path,
+    as the native cuDNN engines do. Without split-K the drain folds them (per-CTA
+    partials for the scalar, lane-run slots for rows and columns); the split-K
+    reducer issues per-chunk atomics (scalar, rows) and per-element atomics
+    (columns). These paths used to keep a NaN, drop it, or decide by its sign bit,
+    and a lane-run slot whose first chunk was all NaN lost the chunks after it, so
+    one graph gave NaN, the NaN-free result or neither, depending on the plan. A
+    set whose elements are all NaN yields the output's seed."""
+    from cudnn.gemm.frost.recipe import REDUCTION_INIT_VALUE
+
+    M, N, K = 128, 128, 256
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    C = g.matmul(A=A, B=B, name="mm")
+    reds = []
+    for src_name, src in (("c", C), ("neg", g.neg(input=C, name="neg"))):
+        for mode in ("amax", "max", "min"):
+            for dims in ((1, 1, 1), (1, M, 1), (1, 1, N)):
+                r = g.reduction(input=src, mode=getattr(cudnn.reduction_mode, mode.upper()), name=f"{src_name}_{mode}_{dims[1]}x{dims[2]}")
+                r.set_dim(list(dims)).set_stride([dims[1] * dims[2], dims[2], 1]).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+                reds.append((src_name, mode, dims, r))
+    compiled = _jit_splitk(g, split_k, base_cfg=by_name(_SM120_SPLITK_CFG))
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    a[0, 5, 7] = float("nan")  # row 5 of C is NaN
+    b[0, :8, 9] = float("nan")  # columns 0..7 of C are NaN: the first lane-run chunk of every row
+    outs = [torch.full(dims, 12345.0, device="cuda") for _s, _m, dims, _r in reds]
+    _run_splitk(compiled, {A: a, B: b, **{r: out for (_s, _m, _d, r), out in zip(reds, outs)}})
+
+    c = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
+    bad = []
+    for (src_name, mode, dims, _r), out in zip(reds, outs):
+        x = c if src_name == "c" else -c
+        x = torch.where(torch.isnan(x), REDUCTION_INIT_VALUE["fp32"][mode], x)  # a NaN element contributes nothing
+        axes = tuple(i for i in (1, 2) if dims[i] == 1)
+        want = x.abs().amax(axes, keepdim=True) if mode == "amax" else x.amax(axes, keepdim=True) if mode == "max" else x.amin(axes, keepdim=True)
+        if not torch.equal(out, want):
+            bad.append(f"{src_name} {mode} {dims}: {int(torch.isnan(out).sum())} NaN cells, {int((~torch.isnan(out) & (out != want)).sum())} other mismatches")
+    assert not bad, "\n".join(bad)
+
+
 @pytest.mark.parametrize("shape", _WEIRD_SHAPES, ids=[_shape_id(s) for s in _WEIRD_SHAPES])
 @pytest.mark.parametrize(
     "a_major,b_major",

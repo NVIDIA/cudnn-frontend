@@ -3002,6 +3002,65 @@ def test_moe_swap_ab_reduction_runtime_token_tail(mode):
         torch.testing.assert_close(red, torch.full_like(red, expected), atol=1e-4, rtol=1e-5)
 
 
+@requires_sm120
+@pytest.mark.parametrize("align", [1, 8], ids=["align1", "align8"])
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["token_by_weight", "weight_by_token"])
+def test_moe_reductions_skip_nan_sm120(swap_ab, align):
+    """AMAX, MAX and MIN skip NaN elements in both SM120 MoE orientations, as the
+    native cuDNN engines do. ``fusion_ir.swap_ab`` transposes each reduction, so a
+    per-token or per-feature reduction moves between per-element atomics and
+    per-chunk folds with the orientation; the swap-AB plan's chunks are as many
+    tokens wide as the declared ``first_token_offset`` alignment (1 or 8 here). The
+    scalar and per-expert ones fold through register partials. The NaN token used
+    to make every per-feature AMAX NaN on the normal plan and on the swap-AB plan at
+    alignment 1, but none on the swap-AB plan at alignment 8."""
+    from cudnn.gemm.frost.recipe import REDUCTION_INIT_VALUE
+
+    E, S, N, K = 2, 64, 64, 64
+    starts = [0, 24, S]
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
+    w = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
+    fto = g.tensor(name="first_token_offset", dim=[E + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    fto.set_alignment_value(align)
+    C = g.moe_grouped_matmul(tok, w, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe")
+    reds = []
+    for src_name, src in (("c", C), ("neg", g.neg(input=C, name="neg"))):
+        for mode in ("amax", "max", "min"):
+            for dims in ((1, 1, 1), (1, S, 1), (1, 1, N), (E, 1, 1)):
+                kw = {"group_offset": fto} if dims[0] == E else {}
+                r = g.reduction(input=src, mode=getattr(cudnn.reduction_mode, mode.upper()), name=f"{src_name}_{mode}_{'x'.join(map(str, dims))}", **kw)
+                r.set_dim(list(dims)).set_stride([dims[1] * dims[2], dims[2], 1]).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+                reds.append((src_name, mode, dims, r))
+    compiled = _plan(g, config=by_name(_SM120_CFG), swap_ab=swap_ab)
+
+    torch.manual_seed(0)
+    token = torch.randint(-3, 4, (1, S, K), device="cuda").to(torch.bfloat16)
+    weight = torch.randint(-3, 4, (E, N, K), device="cuda").to(torch.bfloat16)
+    token[0, 5, 3] = float("nan")  # token 5 (expert 0) is NaN in every feature
+    weight[1, 9, 3] = float("nan")  # feature 9 is NaN for every token of expert 1
+    offsets = torch.tensor(starts, dtype=torch.int32, device="cuda")
+    outs = [torch.full(dims, 12345.0, device="cuda") for _s, _m, dims, _r in reds]
+    compiled({tok: token, w: weight.transpose(1, 2), fto: offsets, **{r: out for (_s, _m, _d, r), out in zip(reds, outs)}})
+    torch.cuda.synchronize()
+
+    c = _ref_f32(token, weight, offsets, S, N, E)
+    bad = []
+    for (src_name, mode, dims, _r), out in zip(reds, outs):
+        x = c if src_name == "c" else -c
+        x = torch.where(torch.isnan(x), REDUCTION_INIT_VALUE["fp32"][mode], x)  # a NaN element contributes nothing
+        x = x.abs() if mode == "amax" else x
+        fold = torch.amin if mode == "min" else torch.amax
+        if dims[0] == E:
+            want = torch.stack([fold(x[starts[e] : starts[e + 1]]) for e in range(E)])
+        else:
+            want = fold(x, dim=tuple(i for i, extent in enumerate(dims[1:]) if extent == 1))
+        want = want.reshape(dims)
+        if not torch.equal(out, want):
+            bad.append(f"{src_name} {mode} {dims}: {int(torch.isnan(out).sum())} NaN cells, {int((~torch.isnan(out) & (out != want)).sum())} other mismatches")
+    assert not bad, "\n".join(bad)
+
+
 @requires_sm100
 @pytest.mark.parametrize("grouped", [False, True])
 @pytest.mark.parametrize("axis", ["scalar", "feature", "token"])
