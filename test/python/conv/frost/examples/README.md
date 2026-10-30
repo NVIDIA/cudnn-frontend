@@ -43,3 +43,33 @@ The example explicitly selects `frost_conv` to demonstrate coverage. C96 plans
 follow ordinary cuDNN plans in the default ordering; explicit selection and
 `OPENSOURCE` queries still expose FROST. Compare complete-operation latency
 before selecting a route for an application. Coverage does not imply a speedup.
+
+## Optional tiled caller conversions
+
+`--tiled-layout` uses the optional Triton dependency to assemble history and
+transpose the input in one kernel, then transpose the output and add bias in a
+second kernel. The helpers in `causal_c96_layout.py` are caller code shared by
+both providers. `graph.execute()` still receives prepared tensors and caller
+workspace. The helpers allocate their returned tensors; compilation must be
+warmed up before CUDA graph capture.
+
+```bash
+# Install the existing frontend triton extra, or use an environment with Triton.
+CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 \
+  python test/python/conv/frost/examples/03_causal_c96.py --tiled-layout
+CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 \
+  python test/python/conv/frost/examples/03_causal_c96.py --provider cudnn --tiled-layout
+```
+
+The conversion example accepts nonempty CUDA BF16 input with positive strides,
+C96, and zero to two history frames. Its output conversion takes compact
+channels-last K96/K192 tensors and a contiguous channel bias. Tensor offsets
+must fit in signed 32 bits, and batch size must be at most 65535. Bias is added after BF16 convolution rounding.
+The ordinary example does not import or require Triton.
+
+The public CuTe DSL 4.8.1 cu12 and cu13 wheels lack the native im2col API used
+by dense FROST. Both must decline C96 before importing its kernel template;
+`test_frost_conv_c96_dependency_gate.py` checks the installed dependency rather
+than substituting a version string. A skipped C96 execution test on these
+wheels is not evidence that C96 compiled or ran with CUDA 12. The cuDNN provider
+can still use the same tiled caller.
