@@ -3477,13 +3477,15 @@ def test_sm107_thd_gate_keyless_sequence_is_exactly_zero_and_a_zero_length_seque
 # Re-recorded after #1922: the BF16 causal dense case now uses fused correction/P1. The shared body's dense cubins
 # change on both compile targets; all eight THD / paged / gated records stay byte-identical. This direct-template
 # probe does not select the separate native SM107 dense body.
+# Re-recorded after #2064: fused dense P1 register math overlaps the previous PV. Both dense cubins change;
+# the eight THD / paged / gated renderings remain byte-identical.
 _PAGED_GATE_CUBIN_RECORD = {
     "nvidia-cutlass-dsl": "4.8.0",
-    "sm_100a_dense": "8550fc4d4eb48f233f7bba50e53cc434",
+    "sm_100a_dense": "89b5cba5c546804bc16ca9934226111c",
     "sm_100a_thd": "d10d4f3814461e315a33778705e1920c",
     "sm_100a_paged_thd": "066bb542a059b0c1c1083f85f60fddcb",
     "sm_100a_paged_thd_pack": "a812d2551488e2b3b19177b470003278",
-    "sm_107a_dense": "22cfb3e0850bc20c2e23a4f86a02f9fd",
+    "sm_107a_dense": "48b8f362d864ec60c670ef51ba88f588",
     "sm_107a_thd": "38403df53e25b064f21b0e0eb3471af3",
     "sm_107a_paged_thd": "3c106cb810219e1d3f1eab0433049b80",
     "sm_107a_paged_thd_pack": "cb43d702cddfa33ef699cfbe22441edb",
