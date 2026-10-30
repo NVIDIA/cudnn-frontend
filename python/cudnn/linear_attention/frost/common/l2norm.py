@@ -187,7 +187,9 @@ def run_l2norm_qk(r, q, k, q_n, k_n, inv_q, inv_k, stream) -> None:
     r.compiled(q, k, q_n, k_n, inv_q, inv_k, r.n_q_rows, r.n_rows, r.h_q, r.h_k, r.n_blocks, cuda.CUstream(int(stream)))
 
 
-def build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, *, expand_num=1, expand_phase=0, expand_fill=False, skip_q=False, k_slots=1, stream) -> L2NormQkRecipe:
+def build_l2norm_qk(
+    q, k, q_n, k_n, inv_q, inv_k, *, expand_num=1, expand_phase=0, expand_fill=False, skip_q=False, skip_k=False, k_slots=1, stream
+) -> L2NormQkRecipe:
     """Compile (cached), run once, and bake the q/k normalize: rows into the
     compact io workspace copies, fp32 inverse norms to their slots.  ``inv_q``
     and ``inv_k`` are given together or both None; with None the norms are not
@@ -204,7 +206,9 @@ def build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, *, expand_num=1, expand_phase=
     well, never the k source.  ``k_slots`` is :func:`common.host.family_slots` of ``k``: 1 for uniform rows
     (expanded ``[rows, HK, K]`` or a dense token-major view), else the token-major ``[token, k_slots, HK, K]`` with its
     own strides; a rank-4 ``k`` carries its rows per token (``num_householder``) as the slot extent, which the view takes
-    its row stride from (the ``expand_num`` here is the q-row expansion alone); ``k_n`` is always the dense expanded copy."""
+    its row stride from (the ``expand_num`` here is the q-row expansion alone); ``k_n`` is always the dense expanded copy.
+    ``skip_k`` walks the q rows alone (the k rows were normalized by the summary and handed over as ``k_n``, which is then
+    never written)."""
     assert (inv_q is None) == (inv_k is None), "inv_q and inv_k are given together or both None"
     if skip_q:
         q = q_n
@@ -213,7 +217,7 @@ def build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, *, expand_num=1, expand_phase=
     total_k = int(k.shape[0]) * (int(k.shape[1]) if len(k.shape) == 4 else 1)
     ROWS = (THREADS_PER_CTA // FWD_LANES) * FWD_ROWS_PER_GROUP
     n_q_rows = 0 if skip_q else total * h_q * (int(expand_num) if expand_fill else 1)
-    n_rows = n_q_rows + total_k * h_k
+    n_rows = n_q_rows + (0 if skip_k else total_k * h_k)
     args = (n_q_rows, n_rows, h_q, h_k, (n_rows + ROWS - 1) // ROWS)
     cu_stream = cuda.CUstream(int(stream))
     k_expand_num = int(k.shape[1]) if len(k.shape) == 4 else 1

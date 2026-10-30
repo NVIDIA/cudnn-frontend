@@ -1175,6 +1175,7 @@ def compute1_warp_group(
     warp_idx,
     mState_out,
     mState_init,
+    mComposed,
     mSeedCheckpoints,
     sBeta_raw,
     sV_raw,
@@ -1356,7 +1357,7 @@ def compute1_warp_group(
                 checkpoint_row_count = checkpoint_row_count + cutlass.Int32(1)
 
             # ---- state seed: initial state GMEM -> packed b16 TMEM + fp32 state TMEM ----
-            if cutlass.const_expr(mState_init is not None or cfg.seed_identity):
+            if cutlass.const_expr(cfg.use_initial_state or cfg.seed_identity):
                 if seed_from_initial_state:
                     bars.mb_gate_exchange_ready[raw_index.idx].wait(raw_index.phase)
                     init_exchange_ptr = sGate_exchange_raw.data_ptr() + (cum_chunk_base % cfg.gate_exchange_stages) * (cfg.d_k * cfg.b_t)
@@ -1373,15 +1374,28 @@ def compute1_warp_group(
                                     init_state_block.append(cutlass.Float32(1.0) if value_dim == i * 16 + j else cutlass.Float32(0.0))
                                 init_state_vecs.append(init_state_block)
                         else:
-                            seed_vw = 16 // (mState_init.element_type.width // 8)
-                            seed_src = (mState_init.iterator + mState_init.layout((batch_idx, head_o, value_dim, 0))).raw_ptr()
+                            if cutlass.const_expr(cfg.state_table):
+                                seed_vw = 16 // (mState_init.element_type.width // 8)
+                                seed_src = (mState_init.iterator + mState_init.layout((batch_idx, head_o, value_dim, 0))).raw_ptr()
+                            if cutlass.const_expr(cfg.has_composed):
+                                is_boundary = batch_idx == cutlass.Int32(0)
+                                composed_src = (mComposed.iterator + mComposed.layout((cutlass.Int32(0), head_o, value_dim, 0))).raw_ptr()
                             init_state_vecs = []
                             for i in cutlass.range_constexpr(init_blocks_lo, init_blocks_hi):
                                 init_state_block = []
-                                for g in cutlass.range_constexpr(16 // seed_vw):
-                                    seed_chunk = (seed_src + i * 16 + g * seed_vw).load(count=seed_vw, alignment=16)
-                                    for t in cutlass.range_constexpr(seed_vw):
-                                        init_state_block.append(seed_chunk[t].to(cutlass.Float32))
+                                if cutlass.const_expr(cfg.state_table):
+                                    for g in cutlass.range_constexpr(16 // seed_vw):
+                                        seed_chunk = (seed_src + i * 16 + g * seed_vw).load(count=seed_vw, alignment=16)
+                                        for t in cutlass.range_constexpr(seed_vw):
+                                            init_state_block.append(seed_chunk[t].to(cutlass.Float32))
+                                else:
+                                    for _ in cutlass.range_constexpr(16):
+                                        init_state_block.append(cutlass.Float32(0.0))
+                                if cutlass.const_expr(cfg.has_composed):
+                                    for g in cutlass.range_constexpr(4):
+                                        composed_chunk = (composed_src + i * 16 + g * 4).load(count=4, alignment=16)
+                                        for t in cutlass.range_constexpr(4):
+                                            init_state_block[g * 4 + t] = composed_chunk[t] if is_boundary else init_state_block[g * 4 + t]
                                 init_state_vecs.append(init_state_block)
 
                         init_packed_blocks = []
@@ -1463,7 +1477,7 @@ def compute1_warp_group(
                                 bars.mb_checkpoint_tmastg_ready[checkpoint_stage].arrive()
                             checkpoint_row_count = checkpoint_row_count + cutlass.Int32(1)
 
-            if cutlass.const_expr(cfg.enable_checkpoints and mState_init is None and not cfg.seed_checkpoints and not cfg.seed_identity):
+            if cutlass.const_expr(cfg.enable_checkpoints and not cfg.use_initial_state and not cfg.seed_checkpoints and not cfg.seed_identity):
                 if write_start == 0:
                     bars.mb_checkpoint_tmastg_done[checkpoint_stage].wait(checkpoint_stage_parity)
                     checkpoint_stage_base = checkpoint_stage * (cfg.d_k * cfg.d_v)
@@ -1513,7 +1527,7 @@ def compute1_warp_group(
 
             y_lo = [cutlass.Int32(0) for _ in range(4)]
             y_hi = [cutlass.Int32(0) for _ in range(4)]
-            if cutlass.const_expr(mState_init is not None or cfg.seed_checkpoints or cfg.seed_identity):
+            if cutlass.const_expr(cfg.use_initial_state or cfg.seed_checkpoints or cfg.seed_identity):
                 if seed_from_initial_state:
                     bars.mb_state_k_acc_ready.wait(state_k_acc_index.phase)
                     state_k_acc_index = advance(state_k_acc_index, 1)
@@ -1813,7 +1827,15 @@ def compute1_warp_group(
                     for key_block_start in cutlass.range_constexpr(0, cfg.d_k, 32):
                         for col in cutlass.range_constexpr(32):
                             key_dim = key_block_start + col
-                            if cutlass.const_expr(mState_init is not None):
+                            if cutlass.const_expr(cfg.has_composed):
+                                if cutlass.const_expr(cfg.state_table):
+                                    pass_val = mState_init[batch_idx, head_o, value_dim, key_dim].to(cutlass.Float32)
+                                else:
+                                    pass_val = cutlass.Float32(0.0)
+                                composed_val = mComposed[cutlass.Int32(0), head_o, value_dim, key_dim]
+                                pass_val = composed_val if batch_idx == cutlass.Int32(0) else pass_val
+                                mState_out[batch_idx, head_o, value_dim, key_dim] = pass_val.to(mState_out.element_type)
+                            elif cutlass.const_expr(cfg.use_initial_state):
                                 mState_out[batch_idx, head_o, value_dim, key_dim] = mState_init[batch_idx, head_o, value_dim, key_dim]
                             elif cutlass.const_expr(cfg.seed_identity):
                                 diag = cutlass.Float32(1.0) if value_dim == key_dim else cutlass.Float32(0.0)
@@ -2056,6 +2078,7 @@ def host(
     beta: cute.Tensor,
     cu_seqlens: cute.Tensor,
     initial_state: cute.Tensor | None,
+    composed: cute.Tensor | None,
     final_state: cute.Tensor | None,
     seed_state_checkpoints: cute.Tensor | None,
     work_items: cute.Tensor | None,
@@ -2089,6 +2112,7 @@ def host(
         beta,
         cu_seqlens,
         initial_state,
+        composed,
         final_state,
         seed_state_checkpoints,
         work_items,
@@ -2120,6 +2144,7 @@ def frost_kda_recompute(
     mBeta: cute.Tensor,
     cu_seqlens: cute.Tensor,
     mState_init: cute.Tensor | None,
+    mComposed: cute.Tensor | None,
     mState_out: cute.Tensor | None,
     mSeedCheckpoints: cute.Tensor | None,
     mWorkItems: cute.Tensor,
@@ -2350,6 +2375,7 @@ def frost_kda_recompute(
             warp_idx,
             mState_out,
             mState_init,
+            mComposed,
             mSeedCheckpoints,
             sBeta_raw,
             sV_raw,
@@ -2386,6 +2412,8 @@ class KdaRecomputeCfg:
     d_v: int
     seed_identity: bool = False
     v_is_zero: bool = False
+    state_table: bool = True
+    has_composed: bool = False
     scheduler_stages: int = CFG.SMEM_SCHEDULER_STAGES
 
     compute_group_0_warp_ids: tuple[int, ...] = CFG.COMPUTE_GROUP_0_WARP_IDS
@@ -2463,14 +2491,20 @@ def build_cfg(
     v_is_zero: bool = False,
     d_k: int,
     d_v: int,
+    state_table: bool | None = None,
+    has_composed: bool = False,
 ) -> KdaRecomputeCfg:
     """Build the per-compile ``KdaRecomputeCfg`` (io_dtype in {Float16, BFloat16});
     fills the derived TMEM column offsets and SMEM buffer cosizes."""
+    state_table = use_initial_state if state_table is None else bool(state_table)
+    has_composed = bool(has_composed)
     cfg = KdaRecomputeCfg(
         io_dtype=io_dtype,
         state_dtype=state_dtype,
         gate_dtype=gate_dtype,
         use_initial_state=use_initial_state,
+        state_table=state_table,
+        has_composed=has_composed,
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
         seed_checkpoints=seed_checkpoints,
@@ -2557,6 +2591,8 @@ def get_compiled_cache(
     seed_identity: bool,
     v_is_zero: bool,
     run_order: bool,
+    has_composed: bool = False,
+    state_table: bool = False,
 ):
     """Return a mutable dict that lazily stores the compiled kernel."""
     return {}
@@ -2592,6 +2628,9 @@ def compile(
     state_in_cute,
     state_out_cute,
     seed_checkpoints_cute=None,
+    composed_cute=None,
+    state_table=None,
+    has_composed=False,
     work_items_cute=None,
     work_count_cute=None,
     scheduler_counter_cute=None,
@@ -2606,6 +2645,8 @@ def compile(
         state_dtype,
         gate_dtype,
         use_initial_state=use_initial_state,
+        state_table=state_table,
+        has_composed=has_composed,
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
         seed_checkpoints=seed_checkpoints,
@@ -2633,6 +2674,7 @@ def compile(
         beta_cute,
         cu_seqlens_cute,
         state_in_cute,
+        composed_cute,
         state_out_cute,
         seed_checkpoints_cute,
         work_items_cute,
@@ -2680,6 +2722,7 @@ def chunk_kda_recompute(
     num_sm: int,
     stream,
     own_prologue: bool = True,
+    composed=None,
 ) -> None:
     """Execute the BT=16 chunked KDA recompute (state/checkpoints-only)
     kernel.
@@ -2747,13 +2790,15 @@ def chunk_kda_recompute(
         v.shape[1]
         DV = v.shape[2]
     if seed_identity:
-        if initial_state is not None:
-            raise ValueError("seed_identity replaces initial_state; pass one or the other")
+        if initial_state is not None or composed is not None:
+            raise ValueError("seed_identity replaces initial_state / composed; pass one or the other")
         if DK != DV:
             raise ValueError("seed_identity requires a square (DK, DK) state")
         if checkpoint_every_n_tokens > 0 or seed_state_checkpoints is not None:
             raise ValueError("seed_identity does not support checkpoint staging")
-    use_initial_state = initial_state is not None
+    state_table = initial_state is not None
+    has_composed = composed is not None
+    use_initial_state = state_table or has_composed
     store_final_state = output_state is not None
     enable_checkpoints = checkpoint_every_n_tokens > 0
     seed_checkpoints = seed_state_checkpoints is not None
@@ -2809,6 +2854,8 @@ def chunk_kda_recompute(
         seed_identity,
         v_is_zero,
         run_order,
+        has_composed=has_composed,
+        state_table=state_table,
     )
 
     if "compiled" not in cache:
@@ -2824,8 +2871,11 @@ def chunk_kda_recompute(
         cu_seqlens_cute = from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic()
 
         state_in_cute = None
-        if use_initial_state:
+        if state_table:
             state_in_cute = from_dlpack(initial_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        composed_cute = None
+        if has_composed:
+            composed_cute = from_dlpack(composed, assumed_align=16).mark_layout_dynamic(leading_dim=3)
 
         state_out_cute = None
         if store_final_state:
@@ -2870,6 +2920,9 @@ def chunk_kda_recompute(
             beta_cute=beta_cute,
             cu_seqlens_cute=cu_seqlens_cute,
             state_in_cute=state_in_cute,
+            composed_cute=composed_cute,
+            state_table=state_table,
+            has_composed=has_composed,
             state_out_cute=state_out_cute,
             seed_checkpoints_cute=seed_checkpoints_cute,
             work_items_cute=work_items_cute,
@@ -2943,7 +2996,8 @@ def chunk_kda_recompute(
         dt_bias,
         beta,
         cu_seqlens,
-        initial_state if use_initial_state else None,
+        initial_state if state_table else None,
+        composed if has_composed else None,
         output_state if store_final_state else None,
         seed_state_checkpoints,
         work_items,
@@ -2980,6 +3034,7 @@ def run_recompute(
     seed_every_n_tokens=0,
     seed_span_tokens=0,
     own_prologue=True,
+    composed=None,
 ) -> None:
     """Replay the compiled plan: the prologue launch, then the main launch.
     The caller owns the contract, which the plan validated at build, so
@@ -3009,6 +3064,7 @@ def run_recompute(
         beta,
         cu_seqlens,
         initial_state,
+        composed,
         output_state,
         seed_state_checkpoints,
         work_items,

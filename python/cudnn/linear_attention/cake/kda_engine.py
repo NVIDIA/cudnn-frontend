@@ -109,6 +109,10 @@ class KdaCakeEngine(BaseEngine):
             _decline("overwrite_initial_state is not supported (dynamic work-item scheduling)")
         if facts.has_state_indices:
             _decline("state_indices is not supported (dynamic work-item scheduling)")
+        if facts.has_composed_summaries or facts.has_composed_state:
+            _decline("composed context-parallel summaries and the composed_initial_state row (the fold into the boundary state row) are FROST-only")
+        if facts.intermediate_ports:
+            _decline(f"the backward summary's intermediates ({', '.join(facts.intermediate_ports)}) is FROST-only")
         if facts.gate_lower_bound is not None and facts.gate_lower_bound != LOWER_BOUND:
             _decline(f"gate_lower_bound is fixed at {LOWER_BOUND}, got {facts.gate_lower_bound}")
         if facts.scale is not None and not math.isclose(facts.scale, SCALE, rel_tol=1e-9, abs_tol=1e-12):

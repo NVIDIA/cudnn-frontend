@@ -693,6 +693,7 @@ def chain_warp_group(
     sCumsumlog,
     sCumprod,
     mState_init,
+    mComposed,
     mState_out,
     sScheduler,
     mb_state_input_ready,
@@ -775,16 +776,31 @@ def chain_warp_group(
             # ---- state seed: initial state / identity -> fp32 state TMEM -------------
             if cutlass.const_expr(is_h):
                 if cutlass.const_expr(cfg.use_initial_state):
-                    gState_init = mState_init[None, None, head_o, batch_idx]
+                    if cutlass.const_expr(cfg.state_table):
+                        gState_init = mState_init[None, None, head_o, batch_idx]
                     if seed_state:
-                        seed_vw = 16 // (mState_init.element_type.width // 8)
-                        seed_src = (gState_init.iterator + gState_init.layout((gmem_row, 0))).raw_ptr()
+                        if cutlass.const_expr(cfg.state_table):
+                            seed_vw = 16 // (mState_init.element_type.width // 8)
+                            seed_src = (gState_init.iterator + gState_init.layout((gmem_row, 0))).raw_ptr()
+                        if cutlass.const_expr(cfg.has_composed):
+                            is_boundary = batch_idx == cutlass.Int32(0)
+                            gComposed = mComposed[None, None, head_o, cutlass.Int32(0)]
+                            composed_src = (gComposed.iterator + gComposed.layout((gmem_row, 0))).raw_ptr()
                         for i in cutlass.range_constexpr(num_ldtms):
                             words = []
-                            for g in cutlass.range_constexpr(ldtm_width // seed_vw):
-                                seed_chunk = (seed_src + i * ldtm_width + g * seed_vw).load(count=seed_vw, alignment=16)
-                                for t in cutlass.range_constexpr(seed_vw):
-                                    words.append(seed_chunk[t].to(cfg.acc_dtype))
+                            if cutlass.const_expr(cfg.state_table):
+                                for g in cutlass.range_constexpr(ldtm_width // seed_vw):
+                                    seed_chunk = (seed_src + i * ldtm_width + g * seed_vw).load(count=seed_vw, alignment=16)
+                                    for t in cutlass.range_constexpr(seed_vw):
+                                        words.append(seed_chunk[t].to(cfg.acc_dtype))
+                            else:
+                                for _ in cutlass.range_constexpr(ldtm_width):
+                                    words.append(cutlass.Float32(0.0))
+                            if cutlass.const_expr(cfg.has_composed):
+                                for g in cutlass.range_constexpr(ldtm_width // 4):
+                                    composed_chunk = (composed_src + i * ldtm_width + g * 4).load(count=4, alignment=16)
+                                    for t in cutlass.range_constexpr(4):
+                                        words[g * 4 + t] = composed_chunk[t] if is_boundary else words[g * 4 + t]
                             nvvm.tcgen05_st(
                                 "32x32b",
                                 nvvm.make_tmem_ptr(row_lo_addr + tmem_state_col + i * ldtm_width, cutlass.Float32),
@@ -976,10 +992,21 @@ def chain_warp_group(
             if write_end == batch_num_chunks:
                 gState_out = mState_out[None, None, head_o, batch_idx]
                 if cutlass.const_expr(is_h and cfg.use_initial_state):
-                    gState_in = mState_init[None, None, head_o, batch_idx]
+                    if cutlass.const_expr(cfg.state_table):
+                        gState_in = mState_init[None, None, head_o, batch_idx]
+                    if cutlass.const_expr(cfg.has_composed):
+                        is_boundary = batch_idx == cutlass.Int32(0)
+                        gComposed = mComposed[None, None, head_o, cutlass.Int32(0)]
                     for r in cutlass.range(num_ldtms * ldtm_width):
                         if row_store:
-                            gState_out[gmem_row, r] = gState_in[gmem_row, r]
+                            if cutlass.const_expr(cfg.state_table):
+                                seed_val = gState_in[gmem_row, r]
+                            else:
+                                seed_val = cutlass.Float32(0.0).to(mState_out.element_type)
+                            if cutlass.const_expr(cfg.has_composed):
+                                composed_val = gComposed[gmem_row, r].to(mState_out.element_type)
+                                seed_val = composed_val if is_boundary else seed_val.to(mState_out.element_type)
+                            gState_out[gmem_row, r] = seed_val
                 else:
                     for i in cutlass.range_constexpr(num_ldtms):
                         for k in cutlass.range_constexpr(32):
@@ -1190,6 +1217,7 @@ def host(
     cu_seqlens: cute.Tensor,
     tinv: cute.Tensor,
     state_in: Optional[cute.Tensor],
+    composed: Optional[cute.Tensor],
     state_out: cute.Tensor,
     transition_out: cute.Tensor,
     work_items: cute.Tensor,
@@ -1214,6 +1242,14 @@ def host(
             cute.make_layout(
                 (state_in.shape[2], state_in.shape[3], state_in.shape[1], state_in.shape[0]),
                 stride=(state_in.stride[2], state_in.stride[3], state_in.stride[1], state_in.stride[0]),
+            ),
+        )
+    if cutlass.const_expr(composed is not None):
+        composed = cute.make_tensor(
+            composed.iterator,
+            cute.make_layout(
+                (composed.shape[2], composed.shape[3], composed.shape[1], composed.shape[0]),
+                stride=(composed.stride[2], composed.stride[3], composed.stride[1], composed.stride[0]),
             ),
         )
     state_out = cute.make_tensor(
@@ -1261,6 +1297,7 @@ def host(
         cu_seqlens,
         tinv,
         state_in,
+        composed,
         state_out,
         transition_out,
         work_items,
@@ -1292,6 +1329,7 @@ def frost_gdn_summary(
     cu_seqlens: cute.Tensor,
     mTinv: cute.Tensor,
     mState_init: Optional[cute.Tensor],
+    mComposed: Optional[cute.Tensor],
     mState_out: cute.Tensor,
     mTransition_out: cute.Tensor,
     mWorkItems: cute.Tensor,
@@ -1422,6 +1460,7 @@ def frost_gdn_summary(
             sCumsumlog=sCumsumlog,
             sCumprod=sCumprod,
             mState_init=None,
+            mComposed=None,
             mState_out=mTransition_out,
             sScheduler=sScheduler,
             mb_state_input_ready=bars.mb_state_input_m_ready,
@@ -1448,6 +1487,7 @@ def frost_gdn_summary(
             sCumsumlog=sCumsumlog,
             sCumprod=sCumprod,
             mState_init=mState_init,
+            mComposed=mComposed,
             mState_out=mState_out,
             sScheduler=sScheduler,
             mb_state_input_ready=bars.mb_state_input_h_ready,
@@ -1535,6 +1575,8 @@ class GdnSummaryCfg:
     log_gate: bool = False
     safe_gate: bool = False
     tiles_per_head: int = 1
+    state_table: bool = True
+    has_composed: bool = False
     scheduler_stages: int = CFG.SMEM_SCHEDULER_STAGES
 
     # ---- fixed constants stamped from CFG at build time ------------------------------
@@ -1596,6 +1638,8 @@ def build_cfg(
     k_slots: int = 1,
     v_slots: int = 1,
     tiles_per_head: int = 1,
+    state_table: Optional[bool] = None,
+    has_composed: bool = False,
 ) -> GdnSummaryCfg:
     """Build the per-compile ``GdnSummaryCfg`` (io_dtype in {Float16, BFloat16}; acc is always Float32).  ``tiles_per_head`` > 1
     runs every gate head as ``tiles_per_head`` tiles of ``d_v`` value columns of H each; chain M is stored by the first tile."""
@@ -1607,6 +1651,8 @@ def build_cfg(
         state_dtype=state_dtype,
         max_active_clusters=max_active_clusters,
         use_initial_state=use_initial_state,
+        state_table=use_initial_state if state_table is None else bool(state_table),
+        has_composed=bool(has_composed),
         log_gate=log_gate,
         safe_gate=safe_gate,
         d_k=d_k,
@@ -1658,6 +1704,8 @@ def get_compiled_cache(
     order_gen: bool,
     tiles_per_head: int,
     layout_key: tuple = (),
+    has_composed: bool = False,
+    state_table: bool = False,
 ):
     """Return a mutable dict that lazily stores the compiled kernel."""
     return {}
@@ -1685,6 +1733,9 @@ def compile(
     cu_seqlens_cute,
     tinv_cute,
     state_in_cute,
+    composed_cute=None,
+    state_table: Optional[bool] = None,
+    has_composed: bool = False,
     state_out_cute,
     transition_out_cute,
     work_items_cute,
@@ -1707,6 +1758,8 @@ def compile(
         k_slots=k_slots,
         v_slots=v_slots,
         tiles_per_head=tiles_per_head,
+        state_table=state_table,
+        has_composed=has_composed,
     )
 
     return cute.compile(
@@ -1720,6 +1773,7 @@ def compile(
         cu_seqlens_cute,
         tinv_cute,
         state_in_cute,
+        composed_cute,
         state_out_cute,
         transition_out_cute,
         work_items_cute,
@@ -1758,9 +1812,12 @@ def chunk_gdn_summary(
     num_sm: int,
     stream,
     own_prologue: bool = True,
+    composed=None,
 ) -> None:
     """Execute the fused GDN state-summary kernel (H and M in one launch, THD / varlen entry), compiled once per static
-    config and replayed; tensors are DLPack CUDA tensors with a stride-1 innermost dim.  ``initial_state`` None = zero seed.
+    config and replayed; tensors are DLPack CUDA tensors with a stride-1 innermost dim.  ``initial_state`` None = zero seed;
+    ``composed`` ``(1, HO, DV, DK)`` fp32 is the context-parallel boundary state sequence 0 starts from in place of its
+    ``initial_state`` row (the other sequences keep their row, or start from zero without a table).
     gate: raw linear alpha, natural-log decay under ``log_gate``, or raw logits under ``safe_gate`` (``-exp(a_log) * softplus(gate + dt_bias)``)
     tinv: the beta-folded chunk-factor tiles of ``gdn_tinv_f16.chunk_gdn_tinv`` over the same inputs (the kernel takes no beta)
     output_transition: ``(num_seqs, HO, DK, DK)`` in stored domain ``M_buf = M^T``, in its own fp32 / bf16 dtype (every
@@ -1786,7 +1843,9 @@ def chunk_gdn_summary(
         raise ValueError("initial_state and output_state must share a dtype")
     if work_items is None or work_count is None or scheduler_counter is None:
         raise ValueError("work_items, work_count and scheduler_counter are required")
-    use_initial_state = initial_state is not None
+    state_table = initial_state is not None
+    has_composed = composed is not None
+    use_initial_state = state_table or has_composed
     run_order = bool(order_in_prologue)
     order_gen = work_item_scratch is None
     if run_order and scheduler_all is None:
@@ -1820,6 +1879,8 @@ def chunk_gdn_summary(
         order_gen,
         tiles_per_head,
         layout_key=(len(k.shape), len(v.shape), k_slots, v_slots),
+        has_composed=has_composed,
+        state_table=state_table,
     )
 
     if "compiled" not in cache:
@@ -1832,8 +1893,11 @@ def chunk_gdn_summary(
         tinv_cute = from_dlpack(tinv, assumed_align=128).mark_layout_dynamic(leading_dim=3)
 
         state_in_cute = None
-        if use_initial_state:
+        if state_table:
             state_in_cute = from_dlpack(initial_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        composed_cute = None
+        if has_composed:
+            composed_cute = from_dlpack(composed, assumed_align=16).mark_layout_dynamic(leading_dim=3)
         state_out_cute = from_dlpack(output_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
         transition_out_cute = from_dlpack(output_transition, assumed_align=16).mark_layout_dynamic(leading_dim=3)
 
@@ -1866,6 +1930,9 @@ def chunk_gdn_summary(
             cu_seqlens_cute=cu_seqlens_cute,
             tinv_cute=tinv_cute,
             state_in_cute=state_in_cute,
+            composed_cute=composed_cute,
+            state_table=state_table,
+            has_composed=has_composed,
             state_out_cute=state_out_cute,
             transition_out_cute=transition_out_cute,
             work_items_cute=work_items_cute,
@@ -1940,6 +2007,7 @@ def chunk_gdn_summary(
         cu_seqlens,
         tinv,
         initial_state,
+        composed,
         output_state,
         output_transition,
         work_items,
@@ -1971,6 +2039,7 @@ def run_summary(
     a_log=None,
     dt_bias=None,
     own_prologue=True,
+    composed=None,
 ) -> None:
     """Replay the compiled plan: the prologue launch, then the main launch.  The plan validated the contract at build, so
     nothing here raises."""
@@ -1998,6 +2067,7 @@ def run_summary(
         cu_seqlens,
         tinv,
         initial_state,
+        composed,
         output_state,
         output_transition,
         work_items,

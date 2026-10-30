@@ -124,6 +124,14 @@ class LaGraphFacts:
     wants_d_initial_state: bool = False
     wants_state_checkpoints: bool = False
     wants_transition: bool = False
+    has_composed_summaries: bool = False
+    has_composed_state: bool = False
+    intermediate_ports: tuple = ()  # the summaries' intermediates bound on this node (a summary's outputs, an apply's inputs)
+    intermediate_dtypes: tuple = ()
+    composed_state_port_dtype: Any = None
+    composed_rows: int = 0  # the rank count P' of the bound summaries
+    composed_state_dtype: Any = None
+    composed_transition_dtype: Any = None
 
     # attributes
     scale: Optional[float] = None
@@ -152,6 +160,41 @@ class LaGraphFacts:
     dt_softplus: bool = True
     dt_min: float = 0.0
     dt_max: float = float("inf")
+
+
+BACKWARD_CONTEXT_PORTS = ("q_normalized", "k_normalized", "q_inv_norm", "k_inv_norm", "chunk_factors", "piece_transitions", "piece_state_grads")
+BACKWARD_CONTEXT_GROUPS = (("q_normalized", "k_normalized", "q_inv_norm", "k_inv_norm"), ("chunk_factors",), ("piece_transitions", "piece_state_grads"))
+
+
+PIECE_TABLE_ROWS = 16  # piece_chain.CHAIN_MAX_PIECES
+CHUNK_TOKENS = 64  # the GDN / GDP chunk
+
+
+def intermediate_dims(name, *, k_dim, q_dim=None, g_dim=None, do_dim=None):
+    """The dims of one of the summaries' intermediates from the dims of the ports it derives from (``None`` when they
+    cannot be derived): the normalized rows and inverse norms mirror q / k (a token-major k flattened onto its expanded
+    rows), the chunk factors carry one tile per chunk plus a spare row per piece, the per-piece tables the chain's row cap."""
+    if not k_dim:
+        return None
+    rows = int(k_dim[0]) * int(k_dim[1]) if len(k_dim) == 4 else int(k_dim[0])
+    h_o = int(g_dim[1]) if g_dim and len(g_dim) > 1 else None
+    if name == "k_normalized":
+        return [rows, int(k_dim[-2]), int(k_dim[-1])]
+    if name == "k_inv_norm":
+        return [rows, int(k_dim[-2])]
+    if name == "q_normalized":
+        return list(q_dim) if q_dim else None
+    if name == "q_inv_norm":
+        return [int(q_dim[0]), int(q_dim[1])] if q_dim else None
+    if h_o is None:
+        return None
+    if name == "chunk_factors":
+        return [rows // CHUNK_TOKENS + PIECE_TABLE_ROWS, h_o, CHUNK_TOKENS, CHUNK_TOKENS]
+    if name == "piece_transitions":
+        return [PIECE_TABLE_ROWS, h_o, int(k_dim[-1]), int(k_dim[-1])]
+    if name == "piece_state_grads":
+        return [PIECE_TABLE_ROWS, h_o, int(do_dim[-1]), int(k_dim[-1])] if do_dim else None
+    return None
 
 
 def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
@@ -199,6 +242,31 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
     # The sub-token families (GDP) take k / v / beta either expanded ([T*n, H, D] / [T*n, HO]) or token-major
     # ([T, n, H, D] / [T, n, HO] with any token stride); every other family keeps the rank-3 / rank-2 forms.
     sub_token = op in ("GDP", "GDP_SUMMARY")
+    composed_state_port, composed_transition_port = (
+        ("following_state_grad", "following_transition") if is_bwd else ("preceding_state_update", "preceding_transition")
+    )
+    composed_folds_into = "d_final_state" if is_bwd else "initial_state"  # the caller's own table, optional beside the summaries
+    composed_state, composed_transition = ins.get(composed_state_port), ins.get(composed_transition_port)
+    composed = composed_state is not None or composed_transition is not None
+    composed_out = outs.get("composed_initial_state") if not is_bwd else ins.get("composed_initial_state")
+    intermediate_side = outs if is_summary else ins
+    intermediates = tuple(name for name in BACKWARD_CONTEXT_PORTS if name in intermediate_side)
+    intermediates_partial = [group for group in BACKWARD_CONTEXT_GROUPS if 0 < sum(name in intermediates for name in group) < len(group)] if is_bwd else []
+    intermediates_wrong = []
+    for name in intermediates:
+        got = intermediate_side[name].dim
+        want = intermediate_dims(
+            name,
+            k_dim=ins["k"].dim,
+            q_dim=ins["q"].dim if ins.get("q") is not None else None,
+            g_dim=ins["g"].dim,
+            do_dim=ins["dO"].dim if ins.get("dO") is not None else None,
+        )
+        if want is not None and got and list(got) != want:
+            intermediates_wrong.append(f"{name} must be {want}, got {list(got)}")
+    intermediate_tables = any(name in intermediates for name in ("chunk_factors", "piece_transitions", "piece_state_grads"))
+    cu_dim = ins["cu_seqlens"].dim if ins.get("cu_seqlens") is not None else None
+    d_v_port = ins["dO"].dim[-1] if is_bwd and ins.get("dO") is not None and ins["dO"].dim else None
 
     invalid = None
     missing_in = [p for p in required_in if p not in ins]
@@ -207,6 +275,38 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         invalid = f"{node.node_type.name} node '{node.name}' is missing input(s) {missing_in}"
     elif missing_out:
         invalid = f"{node.node_type.name} node '{node.name}' is missing output(s) {missing_out}"
+    elif composed and (composed_state is None or composed_transition is None):
+        invalid = f"{composed_state_port} and {composed_transition_port} are bound together"
+    elif composed and not is_bwd and composed_out is None:
+        invalid = f"{composed_state_port} needs the one-row composed_initial_state output (the fold's result)"
+    elif not composed and not is_bwd and "composed_initial_state" in outs:
+        invalid = f"composed_initial_state requires {composed_state_port} and {composed_transition_port}"
+    elif not is_bwd and composed and composed_out.dim and composed_state.dim and list(composed_out.dim) != [1] + list(composed_state.dim[1:]):
+        invalid = f"composed_initial_state must be one state row [1, ...] shaped like one {composed_state_port} row {list(composed_state.dim[1:])}; got {list(composed_out.dim)}"
+    elif is_bwd and composed_out is not None and composed_out.dim and (len(composed_out.dim) != (4 if not is_mamba2 else 4) or int(composed_out.dim[0]) != 1):
+        invalid = f"composed_initial_state (the forward's one-row composed state) must be [1, ...]; got {list(composed_out.dim)}"
+    elif is_bwd and composed_out is not None and "state_indices" in ins:
+        invalid = "composed_initial_state cannot combine with state_indices"
+    elif composed and ("state_indices" in ins or overwrite_initial_state):
+        invalid = f"{composed_state_port} cannot combine with state_indices or overwrite_initial_state"
+    elif composed and composed_state.dim and composed_transition.dim and int(composed_state.dim[0]) != int(composed_transition.dim[0]):
+        invalid = f"{composed_state_port} and {composed_transition_port} must carry the same rank count; got {list(composed_state.dim)} and {list(composed_transition.dim)}"
+    elif (
+        composed
+        and composed_folds_into in ins
+        and composed_state.dim
+        and ins[composed_folds_into].dim
+        and list(composed_state.dim[1:]) != list(ins[composed_folds_into].dim[1:])
+    ):
+        invalid = f"{composed_state_port} rows must be shaped like one {composed_folds_into} row {list(ins[composed_folds_into].dim[1:])}; got {list(composed_state.dim)}"
+    elif (
+        composed
+        and composed_transition.dim
+        and composed_state.dim
+        and list(composed_transition.dim[1:])
+        != ([int(composed_state.dim[1])] if is_mamba2 else [int(composed_state.dim[1]), int(composed_state.dim[3]), int(composed_state.dim[3])])
+    ):
+        invalid = f"{composed_transition_port} must be [P, H] (Mamba-2) or [P, HO, K, K]; got {list(composed_transition.dim)}"
     elif not is_summary and "d_initial_state" in outs and "initial_state" not in ins:
         invalid = "d_initial_state requires initial_state"
     elif "state_indices" in ins and "initial_state" not in ins:
@@ -240,8 +340,24 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         invalid = "checkpoint_every_n_tokens > 0 requires the state_checkpoints output"
     elif not is_bwd and not is_summary and checkpoint == 0 and "state_checkpoints" in outs:
         invalid = "state_checkpoints output requires checkpoint_every_n_tokens > 0"
-    elif is_bwd and checkpoint > 0 and "state_checkpoints" not in ins:
+    elif is_bwd and not is_summary and checkpoint > 0 and "state_checkpoints" not in ins:
         invalid = "checkpoint_every_n_tokens > 0 on a bwd node requires the state_checkpoints input"
+    elif intermediates_partial:
+        invalid = " and ".join(", ".join(group) + " come together" for group in intermediates_partial) + " (the backward summary's intermediates)"
+    elif intermediates and not is_bwd and intermediates != ("k_normalized",):
+        invalid = "a forward takes only k_normalized of the forward summary's intermediates"
+    elif "k_normalized" in intermediates and not bool(params.get("use_qk_l2norm", False)):
+        invalid = "the normalized q/k intermediates require use_qk_l2norm"
+    elif intermediates and is_summary and not bool(params.get("output_intermediates", False)):
+        invalid = "the intermediate outputs require output_intermediates"
+    elif intermediates and is_summary and not bool(params.get("output_transition", False)):
+        invalid = "output_intermediates requires output_transition"
+    elif intermediates_wrong:
+        invalid = "; ".join(intermediates_wrong)
+    elif intermediate_tables and cu_dim and int(cu_dim[0]) != 2:
+        invalid = "the per-piece tables and chunk factors cover one local sequence"
+    elif "q_normalized" in intermediates and num_householder > 1 and d_v_port not in (None, 64):
+        invalid = "the normalized rows need the backward to normalize the summary's rows (num_householder 1 or d_v 64)"
     elif overwrite_initial_state and not is_bwd and not ("initial_state" in ins and "final_state" in outs):
         invalid = "overwrite_initial_state requires the initial_state input and the final_state output (one buffer may serve both)"
     elif overwrite_initial_state and is_bwd and not ("d_final_state" in ins and "d_initial_state" in outs):
@@ -415,6 +531,14 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         wants_d_initial_state="d_initial_state" in outs,
         wants_state_checkpoints="state_checkpoints" in outs,
         wants_transition="transition" in outs,
+        has_composed_summaries=composed,
+        has_composed_state=composed_out is not None,
+        intermediate_ports=intermediates,
+        intermediate_dtypes=tuple((name, (out_dt if is_summary else in_dt).get(name)) for name in intermediates),
+        composed_state_port_dtype=(in_dt if is_bwd else out_dt).get("composed_initial_state"),
+        composed_rows=int(composed_state.dim[0]) if composed and composed_state.dim else 0,
+        composed_state_dtype=in_dt.get(composed_state_port),
+        composed_transition_dtype=in_dt.get(composed_transition_port),
         scale=float(scale) if scale is not None else None,
         use_qk_l2norm=bool(params.get("use_qk_l2norm", False)),
         safe_gate=safe_gate,

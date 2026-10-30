@@ -42,6 +42,47 @@ def frost_la_gate(engine: str, facts, op: str) -> None:
         raise NotImplementedError(f"{engine}: 'g' must be fp32/fp16/bf16, got {facts.g_dtype}")
     if facts.cu_dtype not in (cudnn.data_type.INT32, cudnn.data_type.INT64, None):
         raise NotImplementedError(f"{engine}: 'cu_seqlens' must be int32/int64, got {facts.cu_dtype}")
+    if facts.has_composed_state and facts.composed_state_port_dtype not in (None, cudnn.data_type.FLOAT):
+        raise NotImplementedError(f"{engine}: composed_initial_state must be fp32 (the fold's one-row result), got {facts.composed_state_port_dtype}")
+    if facts.has_composed_summaries:
+        for port, got in (("state", facts.composed_state_dtype), ("transition", facts.composed_transition_dtype)):
+            if got not in (cudnn.data_type.FLOAT, None):
+                raise NotImplementedError(f"{engine}: the composed summaries' {port} must be fp32 (the summary ops' output), got {got}")
+    for port, got in facts.intermediate_dtypes:
+        want = (facts.io_dtype,) if port in ("q_normalized", "k_normalized", "chunk_factors") else (cudnn.data_type.FLOAT,)
+        if got not in want + (None,):
+            raise NotImplementedError(f"{engine}: '{port}' must be {want[0]} (the backward summary's intermediates), got {got}")
+
+
+def intermediates_gate(engine: str, facts, *, b_t: int, expand_num: int = 1, min_tokens: int = 0) -> None:
+    """Decline a backward whose per-piece tables (``piece_state_grads`` / ``piece_transitions``) were cut by its summary
+    differently from the way this backward cuts the same tokens: the summary chains with ``compose_tail`` and no floor,
+    the backward with ``min_tokens``; both cut alike whenever both get the same ``checkpoint_every_n_tokens``.  An uncut
+    backward has no leaf pass and ignores the tables."""
+    if not facts.is_bwd or facts.op.endswith("_SUMMARY") or "piece_state_grads" not in facts.intermediate_ports:
+        return
+    from cudnn.frost.device import current_device, multiprocessor_count
+
+    from .common.piece_chain import choose_pieces
+
+    geometry = dict(
+        num_seqs=facts.n_seq,
+        heads_out=facts.h_o,
+        num_sm=multiprocessor_count(current_device()),
+        total_tokens=facts.total_t,
+        b_t=int(b_t),
+        cadence_tokens=facts.checkpoint_every_n_tokens,
+        batch_invariant=facts.batch_invariant,
+        expand_num=int(expand_num),
+        reverse=True,
+    )
+    backward = choose_pieces(**geometry, min_tokens=min_tokens)
+    summary = choose_pieces(**geometry, compose_tail=True)
+    if backward[0] and summary != backward:
+        raise NotImplementedError(
+            f"{engine}: the backward summary cut these tokens into {summary[0]} pieces of {summary[1]} chunk units, this backward cuts them into "
+            f"{backward[0]} of {backward[1]}; give the summary the backward's checkpoint_every_n_tokens"
+        )
 
 
 def summary_support_gates(engine: str, facts, graph) -> None:

@@ -9,6 +9,8 @@ import threading
 import torch
 import cudnn
 
+from ..graph_analyzer import BACKWARD_CONTEXT_GROUPS, BACKWARD_CONTEXT_PORTS, intermediate_dims  # noqa: F401  (re-exported to the family ops)
+
 TORCH_DTYPE_TO_CUDNN = {
     torch.float16: cudnn.data_type.HALF,
     torch.bfloat16: cudnn.data_type.BFLOAT16,
@@ -205,12 +207,115 @@ def make_summary_cache_key(
     )
 
 
+def check_composed_summaries(op, state_name, transition_name, state_update, transition, state_shape, transition_shape, device) -> int:
+    """Validate one direction's composed context-parallel summaries, the summary ops' fp32 outputs over the preceding
+    or following ranks stacked as ``[P, *state_shape]`` and ``[P, *transition_shape]``, and return the rank count ``P``;
+    both ``None`` or a zero-length pair (a rank with no preceding or following ranks) is 0.  The graph declares both
+    ports from ``P`` and the state geometry, so the buffers' own rank count, shapes and dtype are checked here; their
+    layout is the plan's dense-layout check at execute."""
+    if (state_update is None) != (transition is None):
+        raise ValueError(f"{op}: {state_name} and {transition_name} come together")
+    if state_update is None:
+        return 0
+    if state_update.dtype != torch.float32 or transition.dtype != torch.float32:
+        raise TypeError(f"{op}: {state_name} and {transition_name} must be float32 (the summary ops' outputs); got {state_update.dtype} and {transition.dtype}")
+    if state_update.shape[0] != transition.shape[0]:
+        raise ValueError(
+            f"{op}: {state_name} and {transition_name} must carry the same rank count; got {tuple(state_update.shape)} and {tuple(transition.shape)}"
+        )
+    if state_update.shape[0] == 0:
+        return 0
+    if tuple(state_update.shape[1:]) != tuple(state_shape):
+        raise ValueError(f"{op}: {state_name} must be [P, {', '.join(str(d) for d in state_shape)}]; got {tuple(state_update.shape)}")
+    if tuple(transition.shape[1:]) != tuple(transition_shape):
+        raise ValueError(f"{op}: {transition_name} must be [P, {', '.join(str(d) for d in transition_shape)}]; got {tuple(transition.shape)}")
+    for name, t in ((state_name, state_update), (transition_name, transition)):
+        if t.device != device:
+            raise ValueError(f"{op}: {name} must be on the op's device ({device}); got {t.device}")
+    return int(state_update.shape[0])
+
+
+def check_composed_state(op, composed, state_shape, device):
+    """The forward's one-row composed boundary state handed to the backward: fp32 ``[1, *state_shape]`` on ``device``,
+    None when absent or zero-size (a rank with no preceding summaries)."""
+    if composed is None or composed.numel() == 0:
+        return None
+    if composed.dtype != torch.float32:
+        raise TypeError(f"{op}: composed_initial_state must be float32; got {composed.dtype}")
+    if tuple(composed.shape) != (1, *state_shape):
+        raise ValueError(
+            f"{op}: composed_initial_state must be [1, {', '.join(str(d) for d in state_shape)}] (the forward's one-row composed state); got {tuple(composed.shape)}"
+        )
+    if composed.device != device:
+        raise ValueError(f"{op}: composed_initial_state must be on the op's device ({device}); got {composed.device}")
+    return composed.contiguous()
+
+
 def summary_setup_context(ctx, inputs, output):
     """Mark summary outputs as non-differentiable for the torch autograd wrapper."""
     ctx.set_materialize_grads(False)
-    ctx.mark_non_differentiable(output[0], output[1])
+    ctx.mark_non_differentiable(*output)
 
 
-def summary_backward(ctx, d_output, d_transition):
+def summary_backward(ctx, *grads):
     """Reject differentiation through summary-only custom ops."""
     raise RuntimeError("summaries are non-differentiable")
+
+
+def backward_context_shapes(family, *, total, num_seqs, h_q, h_k, h_o, d_k, d_v, num_householder=1, use_qk_l2norm=False):
+    """Dims per intermediate port of a family's backward summary for one geometry (``None`` = not emitted): the normalized
+    q / k rows and their inverse norms for gdn / gdp under ``use_qk_l2norm`` where the backward normalizes the same rows
+    (``num_householder == 1`` or ``d_v == 64``); for one local sequence the chunk factors (gdn / gdp) and the per-piece
+    tables (every family but mamba2).  ``total`` is the k row count (the expanded timeline for gdp)."""
+    full = family in ("gdn", "gdp")
+    expand_num = max(1, int(num_householder))
+    dims = dict(
+        k_dim=[int(total), int(h_k), int(d_k)],
+        q_dim=[int(total) // expand_num, int(h_q), int(d_k)],
+        g_dim=[int(total), int(h_o)],
+        do_dim=[int(total), int(h_o), int(d_v)],
+    )
+    out = dict.fromkeys(BACKWARD_CONTEXT_PORTS)
+    if full and use_qk_l2norm and (expand_num == 1 or int(d_v) == 64):
+        out.update({name: intermediate_dims(name, **dims) for name in ("q_normalized", "k_normalized", "q_inv_norm", "k_inv_norm")})
+    if int(num_seqs) == 1 and family != "mamba2":
+        out.update({name: intermediate_dims(name, **dims) for name in (("chunk_factors",) if full else ()) + ("piece_transitions", "piece_state_grads")})
+    return out
+
+
+def check_backward_context(op, intermediates, shapes, io_dtype, device):
+    """Validate the backward summary's intermediates given to a backward op: ``intermediates`` maps the port names to tensors or
+    None (a zero-size tensor is one the summary did not emit and counts as None); ``shapes`` is ``backward_context_shapes``
+    for the backward's own geometry.  Each group comes together; a port this backward has no use for (the per-piece
+    tables of a one-sequence summary on a multi-sequence slab, the normalized rows where the backward normalizes other
+    rows) is left out; the rest must be dense, on ``device``, in the io dtype (rows and chunk factors) or fp32 (inverse
+    norms and piece tables) and shaped as ``shapes`` says.  Returns the ports to bind."""
+    present = {name: t for name, t in intermediates.items() if t is not None and t.numel() > 0}
+    for group in BACKWARD_CONTEXT_GROUPS:
+        got = [name for name in group if name in present]
+        if got and len(got) != len(group):
+            raise ValueError(f"{op}: {', '.join(group)} come together (the backward summary's intermediates); got {', '.join(got)}")
+    bound = {}
+    for name, t in present.items():
+        want = shapes.get(name)
+        if want is None:
+            continue
+        if tuple(t.shape) != tuple(want):
+            raise ValueError(f"{op}: {name} must be {list(want)} (the summary's intermediates for these tokens); got {tuple(t.shape)}")
+        want_dtype = io_dtype if name in ("q_normalized", "k_normalized", "chunk_factors") else torch.float32
+        if t.dtype != want_dtype:
+            raise TypeError(f"{op}: {name} must be {want_dtype} (the backward summary's output); got {t.dtype}")
+        if t.device != device:
+            raise ValueError(f"{op}: {name} must be on the op's device ({device}); got {t.device}")
+        bound[name] = t.contiguous()
+    return bound
+
+
+def backward_context_outputs(shapes, io_dtype, device):
+    """The summary op's intermediate outputs for ``shapes`` (``backward_context_shapes``): a dense tensor per emitted port, a
+    zero-size one per port the summary does not emit."""
+    out = {}
+    for name, dims in shapes.items():
+        dtype = io_dtype if name in ("q_normalized", "k_normalized", "chunk_factors") else torch.float32
+        out[name] = torch.empty(dims if dims is not None else (0,), dtype=dtype, device=device)
+    return out

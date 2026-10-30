@@ -972,6 +972,7 @@ def compute1_warp_group(
     sCumsumlog,
     sBeta,
     mState_init,
+    mComposed,
     mState_out,
     mSeedIndices,
     mFinalIndices,
@@ -1037,16 +1038,27 @@ def compute1_warp_group(
         if cutlass.const_expr(cfg.enable_checkpoints):
             checkpoint_chunks = checkpoint_every_n_tokens // cutlass.Int32(cfg.b_t)
             checkpoint_mod = compute_start % checkpoint_chunks
+        if cutlass.const_expr(cfg.has_composed):
+            gComposed = mComposed[None, None, head_o, cutlass.Int32(0)]
+            is_boundary = batch_idx == cutlass.Int32(0)
         if n_local > 0:
             # ---- state seed: initial state (V-major in GMEM) or zeros -> TMEM -------------
             if cutlass.const_expr(cfg.use_initial_state):
-                gState_init = mState_init[None, None, head_o, seed_row]
+                if cutlass.const_expr(cfg.state_table):
+                    gState_init = mState_init[None, None, head_o, seed_row]
                 seed_state = compute_start == 0
                 if seed_state:
                     for i in cutlass.range_constexpr(num_ldtms):
                         words = []
                         for t in cutlass.range_constexpr(ldtm_width):
-                            words.append(gState_init[i * ldtm_width + t + v_offset, cg1_tidx].to(cfg.acc_dtype))
+                            if cutlass.const_expr(cfg.state_table):
+                                value = gState_init[i * ldtm_width + t + v_offset, cg1_tidx].to(cfg.acc_dtype)
+                            else:
+                                value = cutlass.Float32(0.0)
+                            if cutlass.const_expr(cfg.has_composed):
+                                composed_value = gComposed[i * ldtm_width + t + v_offset, cg1_tidx].to(cfg.acc_dtype)
+                                value = composed_value if is_boundary else value
+                            words.append(value)
                         nvvm.tcgen05_st(
                             "32x32b",
                             nvvm.make_tmem_ptr(row_lo_addr + tmem_state_col + i * ldtm_width, cutlass.Float32),
@@ -1205,11 +1217,18 @@ def compute1_warp_group(
                         final_row = cutlass.Int32(mFinalIndices[final_destination])
                     gState_out = mState_out[None, None, head_o, final_row]
                     if cutlass.const_expr(cfg.use_initial_state):
-                        gState_in = mState_init[None, None, head_o, seed_row]
+                        if cutlass.const_expr(cfg.state_table):
+                            gState_in = mState_init[None, None, head_o, seed_row]
                         for p in cutlass.range_constexpr(cfg.d_v):
-                            seed_value = gState_in[p + v_offset, cg1_tidx]
-                            if cutlass.const_expr(mState_init.element_type != mState_out.element_type):
-                                seed_value = seed_value.to(mState_out.element_type)
+                            if cutlass.const_expr(cfg.state_table):
+                                seed_value = gState_in[p + v_offset, cg1_tidx]
+                                if cutlass.const_expr(mState_init.element_type != mState_out.element_type):
+                                    seed_value = seed_value.to(mState_out.element_type)
+                            else:
+                                seed_value = cutlass.Float32(0.0).to(mState_out.element_type)
+                            if cutlass.const_expr(cfg.has_composed):
+                                composed_value = gComposed[p + v_offset, cg1_tidx].to(mState_out.element_type)
+                                seed_value = composed_value if is_boundary else seed_value
                             gState_out[p + v_offset, cg1_tidx] = seed_value
                     else:
                         for p in cutlass.range_constexpr(cfg.d_v):
@@ -1423,6 +1442,7 @@ def frost_mamba2_prefill(
     mD: Optional[cute.Tensor],
     cu_seqlens: cute.Tensor,
     mState_init: Optional[cute.Tensor],
+    mComposed: Optional[cute.Tensor],
     mState_out: Optional[cute.Tensor],
     mSeedIndices: Optional[cute.Tensor],
     mFinalIndices: Optional[cute.Tensor],
@@ -1671,6 +1691,7 @@ def frost_mamba2_prefill(
             sCumsumlog=sCumsumlog,
             sBeta=sBeta,
             mState_init=mState_init,
+            mComposed=mComposed,
             mState_out=mState_out,
             mSeedIndices=mSeedIndices,
             mFinalIndices=mFinalIndices,
@@ -1805,6 +1826,8 @@ class Mamba2PrefillCfg:
     has_z: bool = False
     store_pre_gate: bool = False
     tiles_per_head: int = 1
+    state_table: bool = True
+    has_composed: bool = False
     scheduler_stages: int = CFG.SMEM_SCHEDULER_STAGES
 
     # ---- fixed constants stamped from CFG at build time ------------------------------
@@ -1884,6 +1907,8 @@ def build_cfg(
     store_pre_gate: bool = False,
     d_k: int,
     d_v: int,
+    state_table: Optional[bool] = None,
+    has_composed: bool = False,
 ) -> Mamba2PrefillCfg:
     """Build the per-compile ``Mamba2PrefillCfg`` (io_dtype in {Float16, BFloat16}; acc is always Float32); ``has_z``
     compiles run two gate-table stages; fp32 checkpoint rows (``checkpoint_dtype`` Float32) run one Q and one K stage and
@@ -1894,6 +1919,8 @@ def build_cfg(
         state_dtype=state_dtype,
         max_active_clusters=max_active_clusters,
         use_initial_state=use_initial_state,
+        state_table=use_initial_state if state_table is None else bool(state_table),
+        has_composed=bool(has_composed),
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
         dt_softplus=dt_softplus,
@@ -2191,6 +2218,7 @@ def host(
     o_pre: Optional[cute.Tensor],
     cu_seqlens: cute.Tensor,
     state_in: Optional[cute.Tensor],
+    composed: Optional[cute.Tensor],
     state_out: Optional[cute.Tensor],
     seed_indices: Optional[cute.Tensor],
     final_indices: Optional[cute.Tensor],
@@ -2222,6 +2250,14 @@ def host(
             cute.make_layout(
                 (state_in.shape[2], state_in.shape[3], state_in.shape[1], state_in.shape[0]),
                 stride=(state_in.stride[2], state_in.stride[3], state_in.stride[1], state_in.stride[0]),
+            ),
+        )
+    if cutlass.const_expr(composed is not None):
+        composed = cute.make_tensor(
+            composed.iterator,
+            cute.make_layout(
+                (composed.shape[2], composed.shape[3], composed.shape[1], composed.shape[0]),
+                stride=(composed.stride[2], composed.stride[3], composed.stride[1], composed.stride[0]),
             ),
         )
     if cutlass.const_expr(state_out is not None):
@@ -2273,6 +2309,7 @@ def host(
         d,
         cu_seqlens,
         state_in,
+        composed,
         state_out,
         seed_indices,
         final_indices,

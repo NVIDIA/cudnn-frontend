@@ -47,6 +47,8 @@ def chain_backward_host(
     length_rule: cutlass.Constexpr[bool],
     fused_h_m: cutlass.Constexpr[bool],
     series: cutlass.Constexpr[bool],
+    has_piece_transitions: cutlass.Constexpr[bool],
+    has_piece_state_grads: cutlass.Constexpr[bool],
     summary_cfg: cutlass.Constexpr,
     transition_cfg: cutlass.Constexpr,
     bwd_summary_cfg: cutlass.Constexpr,
@@ -110,12 +112,14 @@ def chain_backward_host(
     state_m_chain: cute.Tensor,
     state_x_chain: Optional[cute.Tensor],
     seed: Optional[cute.Tensor],
+    composed: Optional[cute.Tensor],
     state_x_series: Optional[cute.Tensor],
     state_g: cute.Tensor,
     state_g_chain: cute.Tensor,
     state_dx_end_chain: cute.Tensor,
     state_dx_end: cute.Tensor,
     dseed: Optional[cute.Tensor],
+    dcomposed: Optional[cute.Tensor],
     dstate0: Optional[cute.Tensor],
     stream: cuda.CUstream,
 ) -> None:
@@ -173,6 +177,7 @@ def chain_backward_host(
             beta,
             cu_pieces_main,
             None,
+            None,
             state_h_summary,
             state_m_main,
             work_items_summary,
@@ -188,9 +193,11 @@ def chain_backward_host(
             chain_rows,
             pieces,
             False,
+            False,
             has_seed,
             False,
             False,
+            True,
             num_seqs,
             state_h_chain,
             state_m_chain,
@@ -200,46 +207,51 @@ def chain_backward_host(
             None,
             main_rows,
             None,
+            composed,
             stream,
         )
     else:
-        kda_recompute_f16.host(
-            transition_cfg,
-            k,
-            k,
-            gate,
+        if cutlass.const_expr(not has_piece_transitions):
+            kda_recompute_f16.host(
+                transition_cfg,
+                k,
+                k,
+                gate,
+                a_log,
+                dt_bias,
+                beta,
+                cu_pieces_main,
+                None,
+                None,
+                state_m_main,
+                None,
+                work_items_summary,
+                summary_count,
+                scheduler_m,
+                recompute_m_words,
+                cutlass.Int32(0),
+                cutlass.Int32(0),
+                stream,
+            )
+    if cutlass.const_expr(not has_piece_state_grads):
+        kda_bprop_summary_f16.host(
+            bwd_summary_cfg,
+            q_ratio,
+            k_ratio,
             a_log,
             dt_bias,
             beta,
             cu_pieces_main,
+            state_g,
             None,
-            state_m_main,
             None,
             work_items_summary,
             summary_count,
-            scheduler_m,
-            recompute_m_words,
-            cutlass.Int32(0),
-            cutlass.Int32(0),
+            scheduler_summary,
+            bprop_summary_words,
+            scale,
             stream,
         )
-    kda_bprop_summary_f16.host(
-        bwd_summary_cfg,
-        q_ratio,
-        k_ratio,
-        a_log,
-        dt_bias,
-        beta,
-        cu_pieces_main,
-        state_g,
-        None,
-        work_items_summary,
-        summary_count,
-        scheduler_summary,
-        bprop_summary_words,
-        scale,
-        stream,
-    )
     launch_state_chain(
         heads_out,
         dim_v,
@@ -247,9 +259,11 @@ def chain_backward_host(
         chain_rows,
         pieces,
         True,
+        True,
         has_dseed,
         False,
         False,
+        True,
         num_seqs,
         state_g_chain,
         state_m_chain,
@@ -259,6 +273,7 @@ def chain_backward_host(
         None,
         main_rows,
         None,
+        dcomposed,
         stream,
     )
     if cutlass.const_expr(series):
@@ -272,6 +287,7 @@ def chain_backward_host(
             beta,
             cu_pieces_main,
             state_x_series,
+            None,
             None,
             seed_checkpoints,
             recompute_items,
@@ -297,6 +313,7 @@ def chain_backward_host(
         cu_pieces_main,
         dstate0,
         state_dx_end,
+        None,
         work_items,
         main_count,
         scheduler_bwd,
@@ -386,6 +403,8 @@ def build_chain_backward(
     state_dx_end,
     seed,
     dseed,
+    composed=None,
+    dcomposed=None,
     dstate0,
     pieces,
     heads_out,
@@ -409,10 +428,13 @@ def build_chain_backward(
     device,
     num_sm,
     stream,
+    has_piece_transitions=False,
+    has_piece_state_grads=False,
 ):
     """Compile (cached per static config) the chain backward launch over the buffers of one plan; ``pieces``, ``heads_out``
     and ``num_seqs`` are launch arguments.  The placeholders repeat the marks of the standalone modules' builds so every
-    kernel compiles as it does there."""
+    kernel compiles as it does there.  ``has_piece_transitions`` / ``has_piece_state_grads``: the transition arm and the leaf summary are skipped,
+    their buffers the backward summary's intermediates."""
     _HQ, DK = q.shape[1], q.shape[2]
     k.shape[1]
     _HV, DV = v.shape[1], v.shape[2]
@@ -457,7 +479,11 @@ def build_chain_backward(
         bool(allow_neg_eigval),
         has_seed,
         has_dseed,
+        composed is not None,
+        dcomposed is not None,
         int(chain_rows),
+        bool(has_piece_transitions),
+        bool(has_piece_state_grads),
     )
     if key not in chain_backward_cache:
         summary_cfg, transition_cfg, series_cfg, bwd_summary_cfg, bprop_cfg = build_configs(
@@ -494,6 +520,8 @@ def build_chain_backward(
             bool(length_rule),
             bool(fused_h_m),
             bool(series),
+            bool(has_piece_transitions),
+            bool(has_piece_state_grads),
             summary_cfg,
             transition_cfg,
             bwd_summary_cfg,
@@ -557,12 +585,22 @@ def build_chain_backward(
             from_dlpack(DeviceView(256, (1, HO, DK, DK), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
             from_dlpack(DeviceView(256, (1, HO, DV, DK), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3) if fused_h_m else None,
             from_dlpack(DeviceView(256, (1, HO, DV, DK), seed_name, int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3) if has_seed else None,
+            (
+                from_dlpack(DeviceView(256, (1, HO, DV, DK), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3)
+                if composed is not None
+                else None
+            ),
             from_dlpack(state_x, assumed_align=16).mark_layout_dynamic(leading_dim=3) if series and not coarse else None,
             from_dlpack(state_g, assumed_align=16).mark_layout_dynamic(leading_dim=3),
             from_dlpack(DeviceView(256, (1, HO, DV, DK), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
             from_dlpack(DeviceView(256, (1, HO, DV, DK), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
             from_dlpack(state_dx_end, assumed_align=16).mark_layout_dynamic(leading_dim=3),
             from_dlpack(DeviceView(256, (1, HO, DV, DK), dseed_name, int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3) if has_dseed else None,
+            (
+                from_dlpack(DeviceView(256, (1, HO, DV, DK), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3)
+                if dcomposed is not None
+                else None
+            ),
             from_dlpack(dstate0, assumed_align=16).mark_layout_dynamic(leading_dim=3) if dstate0 is not None else None,
             cuda.CUstream(int(stream)),
             options="--enable-tvm-ffi --opt-level 2",
@@ -616,6 +654,8 @@ def run_chain_backward(
     state_dx_end,
     seed,
     dseed,
+    composed=None,
+    dcomposed=None,
     dstate0,
     pieces,
     heads_out,
@@ -630,9 +670,11 @@ def run_chain_backward(
     safe_gate,
     scale,
     stream,
+    has_piece_transitions=False,
+    has_piece_state_grads=False,
 ) -> None:
-    """Replay the chain backward: one crossing into the DSL for its seven launches.  The plan validated the contract at
-    build, so nothing here raises."""
+    """Replay the chain backward: one crossing into the DSL for its seven launches (the passes the summary's intermediates replace compiled out).  The
+    plan validated the contract at build, so nothing here raises."""
     compiled(
         int(pieces),
         int(heads_out),
@@ -687,12 +729,14 @@ def run_chain_backward(
         state_m,
         state_x if fused_h_m else None,
         seed,
+        composed,
         state_x if series and not coarse else None,
         state_g,
         state_g,
         state_dx_end,
         state_dx_end,
         dseed,
+        dcomposed,
         dstate0,
         cuda.CUstream(int(stream)),
     )
