@@ -53,11 +53,12 @@ Install the frontend and a CUDA-enabled JAX build (>=0.6.0). The frontend alread
 on CuTeDSL; these kernels require a build at least version 4.7.1 that provides
 `cutlass.experimental.primitives`. No additional frontend dependency is introduced.
 
-Run in a single process with exactly one visible GPU. Select the SM100 device
-with `CUDA_VISIBLE_DEVICES` before importing JAX, for example
-`CUDA_VISIBLE_DEVICES=0 python train.py`. Traced arguments do not carry concrete
-device placement, so this restriction keeps capability checks and compilation
-on the execution device.
+Run in a single process with inputs placed on one SM100 GPU per invocation.
+Multiple CUDA GPUs may remain visible when they have matching compute capability,
+SM count, and per-block shared-memory limits. JAX controls execution placement,
+including calls on a non-default GPU. These matching hardware properties keep
+launch geometry and scratch sizes valid when tracing has no concrete placement.
+Mixed-hardware visibility and distributed sharding remain unsupported.
 
 ```python
 import jax
@@ -96,7 +97,7 @@ y, = normalize(x.reshape(8, 16, 64), weight.reshape(16, 64))
 
 | Feature | Supported contract |
 |---|---|
-| GPU | One visible SM100 GPU in a single process |
+| GPU | One SM100 GPU per invocation; multiple equivalent CUDA GPUs may be visible in a single process |
 | Operations | LayerNorm and RMSNorm |
 | Input and affine dtypes | BF16, FP16, FP32; matching dtypes |
 | Normalization axes | Positive static trailing dimensions; exact shape match |
@@ -119,8 +120,11 @@ the documented input contract. Passing collection or an environment skip does
 not establish GPU support; qualify the suite on SM100 with CUDA-enabled JAX
 and the required CuTeDSL runtime.
 
-Qualified on B200 with Python 3.12, JAX/jaxlib 0.9.1, CUDA 13, and the internal
-CuTeDSL build `4.9.0a0.dev0+internal.master.20261002010000.3617316`.
+The earlier single-GPU implementation was qualified on B200 with Python 3.12,
+JAX/jaxlib 0.9.1, CUDA 13, and the internal CuTeDSL build
+`4.9.0a0.dev0+internal.master.20261002010000.3617316`. Multiple-GPU execution
+requires a separate run of the placement and compilation-reuse tests with at
+least two equivalent SM100 GPUs visible.
 Run the focused suite without the parent Torch
 test fixtures:
 
