@@ -333,3 +333,17 @@ def sparse_tile_form_auto(
     if split_pinned is not None and int(split_pinned) not in sparse_lean_splits(top_k):
         return SPARSE_TILE_FORM_TCGEN05
     return SPARSE_TILE_FORM_LEAN
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+# The fused gated e4m3 store's ROUNDING CONVENTIONS (``sm100/split_combine.compile_ptr(out_rounding=)``; the sparse adapter's ``out_rounding=``
+# attribute -- an OP ATTRIBUTE of the declaration, never a knob: it changes the bytes).  "single" (the default) = ONE rounding of the fp32 gated
+# value (FROST's convention); "staged" = a serving stack's gate-and-quantize order (bf16 of the merged O, the exact sigmoid as a division, bf16
+# of the gated value, the fp32 multiply by div.rn(1, s), the saturating e4m3 cvt), so a provider can serve bytes identical to that stack's chain.
+# The vocabulary lives HERE, in the DSL-free module, because the adapter validates it at construction, BEFORE the DSL gate (python/cudnn/AGENTS.md
+# Rule 7: the kernel module is imported only after the gate), and a declaration's construction must not import ``cudnn.frost.tile_dsl`` -- the
+# heuristics module does so at module level and re-exports these names unchanged (its vocabulary for the kernel module and the suites).  A third
+# convention appends a name; the kernel's trailing ``quant_rounding`` constexpr appends a value.
+COMBINE_OUT_ROUNDING_SINGLE = "single"
+COMBINE_OUT_ROUNDING_STAGED = "staged"
+COMBINE_OUT_ROUNDINGS = (COMBINE_OUT_ROUNDING_SINGLE, COMBINE_OUT_ROUNDING_STAGED)

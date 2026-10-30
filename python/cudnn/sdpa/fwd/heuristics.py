@@ -700,16 +700,10 @@ DECODE_COMBINE_LEAN_WALK_MIN_LEAN_BLOCKS = DECODE_COMBINE_MAX_LEAN_BLOCKS + 1
 # overflow launch keeps the module's own forms (the forms it ran before the restore), and widening the bound takes a measurement
 # at a mid-overflow grid (B 8-16 x 24 heads at kv 32K-128K, where the split model picks 8-16) -- a refit of this one line.
 DECODE_COMBINE_LEAN_WALK_MAX_SPLIT = 4
-# The fused gated e4m3 store's ROUNDING CONVENTIONS (``sm100/split_combine.compile_ptr(out_rounding=)``; the sparse adapter's ``out_rounding=``
-# attribute -- an OP ATTRIBUTE of the declaration, never a knob: it changes the bytes).  "single" (the default) = ONE rounding of the fp32 gated
-# value (FROST's convention); "staged" = a serving stack's gate-and-quantize order (bf16 of the merged O, the exact sigmoid as a division, bf16
-# of the gated value, the fp32 multiply by div.rn(1, s), the saturating e4m3 cvt), so a provider can serve bytes identical to that stack's chain.
-# The vocabulary lives here because the adapter validates it BEFORE the DSL gate (python/cudnn/AGENTS.md Rule 7: the kernel module is imported
-# only after the gate) and the kernel module already imports this one.  A third convention appends a name; the kernel's trailing
-# ``quant_rounding`` constexpr appends a value.
-COMBINE_OUT_ROUNDING_SINGLE = "single"
-COMBINE_OUT_ROUNDING_STAGED = "staged"
-COMBINE_OUT_ROUNDINGS = (COMBINE_OUT_ROUNDING_SINGLE, COMBINE_OUT_ROUNDING_STAGED)
+# The fused gated e4m3 store's ROUNDING CONVENTIONS (``COMBINE_OUT_ROUNDING_SINGLE`` / ``_STAGED`` / ``COMBINE_OUT_ROUNDINGS``: the sparse adapter's
+# ``out_rounding=`` attribute, ``sm100/split_combine.compile_ptr(out_rounding=)``) live in the DSL-free sparse_tile_rules: the adapter validates the
+# attribute at construction, BEFORE the DSL gate, and a declaration's construction must not import ``cudnn.frost.tile_dsl`` (this module does, at
+# module level).  Re-exported below under their original names.
 
 
 def decode_combine_lean_blocks(b: int, h_q: int, s_q: int) -> int:
@@ -770,9 +764,12 @@ def decode_combine_force_lean(b: int, h_q: int, s_q: int, split: int, device_cc:
     return decode_combine_lean_blocks(b, h_q, s_q) <= DECODE_COMBINE_MAX_LEAN_BLOCKS and not decode_combine_grid_selected(b, h_q, s_q, split, device_cc)
 
 
-# The SM107 index-list sparse decode's tile_form vocabulary and lean-tile rules live in the DSL-free sparse_tile_rules (the gated
-# attention block reads them at declaration); re-exported here under their original names.
+# The SM107 index-list sparse decode's tile_form vocabulary and lean-tile rules, and the fused gated e4m3 store's rounding vocabulary, live in
+# the DSL-free sparse_tile_rules (the gated attention block reads them at declaration); re-exported here under their original names.
 from cudnn.sdpa.fwd.sparse_tile_rules import (  # noqa: E402,F401
+    COMBINE_OUT_ROUNDING_SINGLE,
+    COMBINE_OUT_ROUNDING_STAGED,
+    COMBINE_OUT_ROUNDINGS,
     SPARSE_TILE_FORM_AUTO,
     SPARSE_TILE_FORM_LEAN,
     SPARSE_TILE_FORM_TCGEN05,
