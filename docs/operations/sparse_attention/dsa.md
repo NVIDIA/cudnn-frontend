@@ -420,7 +420,7 @@ result = DSA.sparse_attention_backward_wrapper(
     softmax_scale=1.0 / math.sqrt(D),
     topk_length=topk_length,
     deterministic=True,  # optional; SM100 H16/H32/H64/H96/H128
-    deterministic_relay_cluster_size=None,  # optional: force 4, 8, 16, or 32 CTAs/group
+    deterministic_relay_cluster_size=None,  # optional: force 4, 8, 16, 32, or 64 CTAs/group
     q_cluster_mode="off",  # optional: "adaptive_pair" for SM100 H16/H32 D576
 )
 dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]

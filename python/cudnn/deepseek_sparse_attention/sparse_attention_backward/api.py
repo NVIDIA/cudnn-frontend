@@ -608,8 +608,8 @@ def sparse_attention_backward_wrapper(
     or workspace on the launch stream; the plan's ``execute()`` does neither.
 
     ``deterministic_relay_cluster_size`` optionally fixes a deterministic
-        SM100 generic-M64 large-context plan to a 4-, 8-, 16-, 32-, or 64-CTA
-        logical relay. Cluster-32/64 use two/four ordered 16-CTA hardware-cluster launches. The
+    SM100 generic-M64 large-context plan to a 4-, 8-, 16-, 32-, or 64-CTA
+    logical relay. Cluster-32/64 use two/four ordered 16-CTA hardware-cluster launches. The
     default ``None`` uses the automatic policy. This plan-time choice changes
     the required workspace and remains fixed across every execution and CUDA
     Graph replay of the cached plan.
