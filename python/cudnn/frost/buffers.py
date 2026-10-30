@@ -528,6 +528,7 @@ def fill_word_strided_async(ptr: int, shape, strides, elem_bytes: int, word: int
 # fail during codegen with errors that name a missing attribute rather than the
 # version, so the check belongs where an engine can still decline.
 CUTEDSL_MIN_VERSION = (4, 7, 0)
+JAX_MIN_CUTEDSL_VERSION = (4, 7, 1)
 
 _RELEASE_INT = _re.compile(r"^(\d+)")  # leading integer of one version component ("2rc1" -> 2)
 

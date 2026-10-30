@@ -10,9 +10,10 @@ import pytest
 
 import torch
 from cudnn.frost import cutedsl_runtime_available
-from cudnn.frost.buffers import cutedsl_requirement_error
 
-requirement_error = cutedsl_requirement_error("JAX KDA tests", floor=(4, 7, 1))
+from cudnn.frost.buffers import JAX_MIN_CUTEDSL_VERSION, cutedsl_requirement_error
+
+requirement_error = cutedsl_requirement_error("JAX KDA tests", floor=JAX_MIN_CUTEDSL_VERSION)
 if requirement_error:
     pytest.skip(requirement_error, allow_module_level=True)
 
