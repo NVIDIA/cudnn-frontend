@@ -1439,6 +1439,40 @@ An `S_q == 1` declaration is declined during eligibility, before adapter
 lowering. Runtime empty THD sequences within a prefill envelope remain supported;
 `test_decode_declines_before_lowering` distinguishes the two contracts.
 
+The native `sdpa_bwd_sm107_d128` row (slot 11, engine 20611) serves exact
+QK128/V128 on **SM107 only**, with **CuTe DSL >= 4.8.1** and target support.
+It is offered by default as a last-resort candidate after the backend;
+no measured placement lead is claimed. The
+prepared chain launches delta/zero, native accumulation, and dQ cast, using
+the caller's workspace for FP32 dQ and delta. Stats are contiguous natural-log
+FP32 `(B, H, S_q, 1)`; payloads and gradients use compact BSHD storage.
+
+| Native half D128 backward contract | Support |
+|---|---|
+| Uniform dense MHA, BF16/FP16, positive lengths greater than one, tails/unequal lengths | Yes |
+| Mask-free or top-left causal | Yes |
+| Positive attention scale and scale × log2(e), representable in FP32 | Yes |
+| Deterministic gradients | Declined: dQ uses unordered FP32 reduce-add |
+| THD/ragged, per-batch padding, GQA/MQA, single-query/key | Declined |
+| Other head pairs/architectures, padded or permuted payloads, strided Stats | Declined |
+| Bottom-right causal, windows/right-band, bias/dBias, sink/dSink, dropout, score modifiers | Declined |
+
+Validation record (2026-10-30, integration base `345c3755`): with DSL 4.8.1
+(compiler CUDA 13.4) and cuDNN 9.24, ordinary FE runs passed 28 checks plus
+93 subtests and 11 remaining cases. Coverage includes native binding,
+BF16/FP16 dense/causal FP64 gradients, tails, rebinding, capture/replay,
+standalone workspace and the three-launch contract. These runs preceded
+the floor-only host change; its 4.8.0-decline/4.8.1-accept boundaries have
+host coverage in `test_sdpa_bwd_d128_sm107_contract.py`. DSL 4.8.0 is declined
+for this row pending qualification; the package and shared target floors
+are unchanged. `test_sdpa_bwd_d128_sm107.py` gates GPU cases on this row's
+floor and target support. Subsequent target runs passed the five floor-boundary
+checks (plus seven subtests), artifact reload with compilation forbidden and
+changed inputs, and dense/causal integration-path synccheck (two cases, zero
+reported synchronization errors). A host-only source check is not device
+validation. Resource tuning, THD/grouped support and complete performance
+qualification remain unfinished.
+
 The f16/bf16 row is a separate engine from `sdpa_fwd_prefill_sm100` (which stops
 at cc 10.6) because the lowerings diverge: the Rubin kernels build **version-1
 tcgen05 SMEM descriptors**. A version-0 descriptor's `start_address` field is 14
@@ -2722,7 +2756,7 @@ envelope and fused bias/sinks remain unavailable to THD.
 | Gated attention block (frontend-only, no graph form): e4m3 (`kv_cache_dtype`) pools on the DENSE paged forms (the decode tile's in-kernel dequant arm), on the packed prefill's write-through, at `S_q > 4` and with an LSE / a split on the block-sparse decode mode (served 2026-10-14 at `S_q <= 4` through the gathered cast + the decode tile, and as the quantizing write-through on the dense prefill forms), the write-through folded into the projection epilogue, an LSE / a window / another head dim on the DENSE paged forms, a dense step wider than 32 rows (dense geometries), a `QsaSpec` on the PACKED EXTEND form | SM107 -- the block's paged KV-cache WRITE-THROUGH (`paged_kv_page_size`: bf16 / f16, dense and packed), the EXTEND form (`kv_source="paged"` + `token_capacity`: the packed step's attention over the pools through `block_table` / `kv_lens` on the bottom-right diagonal) AND the DECODE form (`kv_source="paged"` on a dense `[B, S_q <= 4]` block: the Rubin d256 decode tile, PackGQA + split-KV with the gate in the combine; the unpacked tile up to 32 rows declared, unmeasured) are served on HND / NHD / unified-row pools at pages 16 / 32 / 64 / 128, bf16 / f16, AND the BLOCK-SPARSE DECODE / extend-with-prefix mode (`kv_source="paged"` on a dense `[B, S_q]` `QsaSpec` block, 2026-10-14: the sparse core reading the pools, one list per sequence at `S_q <= 4` and one per row past it, the gate and the LSE, split-KV) on HND / NHD / unified-row pools at pages 16 / 32 / 64 (the `Rubin d256 gated attention block -- serving forms` section below) |
 | Index-list (block-sparse) forward: a GRAPH form (no `sdpa` node carries a block-index list), a sink, a band, Q-length trimming of a dense batch, log2 stats; THD together with the in-block indexer (through the block); THD and paged pools in ONE declaration; the decode form's arms (bottom-right, the per-sequence list, split-KV) under THD; a shared list at `S_q > 4` | SM107 — frontend-only: the gated attention block's sparse stage (`GatedAttentionBlockGeometry(qsa=QsaSpec(...))`, `execute(block_ids=, block_lens=)`) and the standalone `sparse_gqa_sm107` adapter serve dense BSHD bf16 / f16, d = 256, caller lists at `top_k` in [4, 512] (multiples of 4), query-head groups 1..16, per-batch KV lengths, the fused epilogue gate (`epilogue_gate=` the gate operand on the adapter, `fuse_gate=True` through the block: O gated in place, the LSE untouched; it composes with the paged read and with THD), and packed THD sequences (`thd=True`: per-sequence `[B]` or cumulative `[B + 1]` lengths (`cu_seq_len`), sequence-relative block ids; through the block `GatedAttentionBlockFwd(thd=True, num_sequences=, max_seq_len=, cu_seqlens=)` + `execute(seq_lens=, block_ids=)`); the standalone adapter also reads paged K / V pools (`paged_kv=True`: `[num_pages, H_kv, page_size, D]` HND compact or NHD by strides, one `(B, max_pages)` block table, `page_size` a positive multiple of 4, per-batch lengths required) -- one of the two arms per declaration (`thd=True` with `paged_kv=True` is a typed decline) -- and the DECODE form (`bottom_right=True`: positions `kv_len - S_q + row`; `list_per_sequence=True`: `block_ids [B, top_k]` shared by the sequence's `S_q <= 4` rows, anchored at the step-0 position; `split_kv=S` up to `ceil((top_k + 1) / 32)`: fp32 partials in the caller's workspace + the split combine, the gate riding the combine) -- through the gated attention block since 2026-10-14 (`kv_source="paged"` on a dense `[B, S_q]` `QsaSpec` block: `block_table` / `kv_lens` / `slot_mapping` / the pools through `_SparseSdpa`, the list form derived from `S_q`); every other arm is a typed decline by name (see the SM107 index-list section below) |
 | Backward pass entirely | SM90 |
-| Backward outside the documented D256/D512 half domains and exact half D192x128; outside exact D256/D192x128 for per-tensor FP8 or D256 for MXFP8 | SM107 — native half D192 is `sdpa_bwd_sm107_d192` (slot 10): dense/THD, independent origins and deterministic execution. The original D256 and D512 restrictions remain as documented in ᵇ, ᵐˣ and ᵇ³. |
+| Backward outside the documented D128/D256/D512 half domains and exact half D192x128; outside exact D256/D192x128 for per-tensor FP8 or D256 for MXFP8 | SM107 — native half D128 is `sdpa_bwd_sm107_d128` (slot 11): compact dense MHA, BF16/FP16, mask-free/top-left causal, non-deterministic FP32 dQ. THD/grouped, single-query/key, other masks and nonpositive scale remain declined. Native half D192 is `sdpa_bwd_sm107_d192` (slot 10): dense/THD, independent origins and deterministic execution. The original D256 and D512 restrictions remain as documented in ᵇ, ᵐˣ and ᵇ³. |
 | Backward outside d ∈ (256, 512] ∪ {256, 128} (f16/bf16) or d = 256 (MXFP8) | SM100, SM103 — d128 serves compact-BSHD dense MHA with unmasked or top-left causal attention. SM100 and SM103 additionally serve THD MHA and BF16 dense/THD GQA/MQA under the d128 gates above. Dense MHA selects one-launch recompute or three-launch accumulation; packed/grouped paths use the documented helper chains. f16/bf16 d = 256 uses the 2x2-datapath row ᵇ² |
 | Backward per-batch padding mask (`seq_len_q/kv`) on a DENSE graph | SM100, SM103 — a UNIFORM non-tile-multiple length is served, and the THD path carries per-sequence lengths; a per-batch mask on a dense graph is not |
 | Backward sink / dSink, bias / dBias | SM100, SM103 |

@@ -41,9 +41,14 @@ _SM107_MXFP8 = "SdpaBwdDslSm107Mxfp8"
 _SM100_D256 = "SdpaBwdDslSm100D256"
 _SM107_D512 = "SdpaBwdDslSm107D512"
 _SM100_D128 = "SdpaBwdDslSm100D128"
+_SM107_D128 = "SdpaBwdDslSm107D128"
 
 
 def _adapter(name: str):
+    if name == _SM107_D128:
+        from cudnn.sdpa.bwd.api_dsl_sm107_d128 import SdpaBwdDslSm107D128
+
+        return SdpaBwdDslSm107D128
     if name == _SM100_D128:
         from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
 
@@ -1849,6 +1854,35 @@ def _sm100_d128_spec() -> EngineSpec:
     )
 
 
+def _sm107_d128_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
+    from .d128_sm107_contract import validate_declaration
+
+    if facts.max_total_seq_len_q is not None or facts.max_total_seq_len_kv is not None:
+        return "native SM107 D128 backward does not support THD capacities"
+    try:
+        validate_declaration(facts.device_cc, version, facts.b, facts.h_q, facts.s_q, facts.s_kv, 128**-0.5 if facts.scale is None else facts.scale)
+    except ValueError as error:
+        return str(error)
+    return None
+
+
+def _sm107_d128_spec() -> EngineSpec:
+    """Native dense MHA only; FP32 dQ reduce-add is non-deterministic."""
+    return EngineSpec(
+        name="sdpa_bwd_sm107_d128",
+        capabilities=Capabilities(
+            sm_lo=107,
+            sm_hi=107,
+            d=frozenset({128}),
+            causal=True,
+            compact_bshd=True,
+            decode=False,
+            declaration_check=_sm107_d128_declaration_mismatch,
+        ),
+        lower=partial(lower_dsl_bwd, api_type=_SM107_D128),
+    )
+
+
 # Append-only: a row's position in this tuple is its rank in the ranked plan list, never its id (the manifest slot is).
 ENGINE_SPECS = (
     _sm120_spec(),
@@ -1862,6 +1896,7 @@ ENGINE_SPECS = (
     _sm107_d512_spec(),
     _sm100_d128_spec(),
     _sm107_d192_spec(),
+    _sm107_d128_spec(),
 )
 
 __all__ = [

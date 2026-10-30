@@ -179,7 +179,7 @@ def cga_wait():
 
 
 @cute.jit
-def named_barrier_fence(barrier_id: cutlass.Constexpr[int], thread_count: cutlass.Constexpr[int]):
+def named_barrier_fence(barrier_id: cutlass.Constexpr[int], thread_count: cutlass.Constexpr[int], *, aligned: cutlass.Constexpr[bool] = True):
     """``bar.sync id, n`` as inline PTX, used as a SCHEDULING fence for a publish the issuing warps do not consume.
 
     Why inline PTX and not ``nvvm.barrier_cta_sync``: ptxas list-schedules a basic block by readiness and sinks a
@@ -191,8 +191,14 @@ def named_barrier_fence(barrier_id: cutlass.Constexpr[int], thread_count: cutlas
     Pure data-dependency pins measured worse: a ``mov`` asm is copy-propagated away by ptxas, and routing the
     arrive's mbarrier state token into the consumers stalls them for the arrive round trip.  Named-barrier ids are
     per kernel; keep them disjoint from the kernel's synchronisation barriers.
+
+    ``aligned=False`` opts subset warps into unaligned CTA synchronization while retaining inline scheduling semantics.
+    The default preserves the legacy ``bar.sync`` instruction exactly.
     """
-    inline_ptx(f"bar.sync {barrier_id}, {thread_count};", write_only_types=[], read_only_args=[])
+    if cutlass.const_expr(aligned):
+        inline_ptx(f"bar.sync {barrier_id}, {thread_count};", write_only_types=[], read_only_args=[])
+    else:
+        inline_ptx(f"barrier.cta.sync {barrier_id}, {thread_count};", write_only_types=[], read_only_args=[])
 
 
 @cute.jit

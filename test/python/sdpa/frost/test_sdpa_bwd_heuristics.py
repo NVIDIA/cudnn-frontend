@@ -41,6 +41,7 @@ _OFFERED = {
     "sdpa_bwd_sm100_d256": 20607,
     "sdpa_bwd_sm107_d512": 20608,
     "sdpa_bwd_sm100_d128": 20609,
+    "sdpa_bwd_sm107_d128": 20611,
 }
 
 
