@@ -63,7 +63,7 @@ from cudnn.frost.tile_dsl.constants import (
 
 # The engine-contract record is deliberately SHARED: one lowering builds it, and
 # an arch-specific copy would let the two drift in ways the loader cannot see.
-from cudnn.sdpa.fwd.config_sm100 import TemplateParams, bshd_compact, bshd_zero_copy_stride
+from cudnn.sdpa.fwd.config_sm100 import TemplateParams, dense_bind_strides
 
 # The d512 2x2-DATAPATH record is shared with the SM100 line too (CfgD512X2 + its arch-neutral geometry checks); this
 # module adds only the Rubin arch facts to it (3-deep sub-chunk rings, DESC_VERSION derived from the layout, the 320 KiB
@@ -1470,23 +1470,30 @@ SM107_SCALE_PREFOLDED_FLAVORS = frozenset(
 
 def epilogue_gate_layout_declarable(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int = 2) -> bool:
     """Whether a logical BHSD gate ``G`` binds ZERO-COPY on the Rubin d256 gated
-    kernels: BSHD-compact, or a token-major declaration TMA can express
-    (``config_sm100.bshd_zero_copy_stride``: D innermost-contiguous, then heads,
-    then tokens; seq/head strides 16-byte multiples; covering).
+    kernels: the native dense layout contract, ``config_sm100.dense_bind_strides``
+    -- the singleton axes canonicalized first, then BSHD-compact or an aligned
+    covering B/H/S permutation (D innermost-contiguous; every stepped batch, seq
+    and head byte stride a 16-byte multiple).
 
     The gate has NO normalisation-copy fallback (a hidden per-execute repack is
     what the engine contract forbids), so this predicate is STRICTER than
-    ``graph_analyzer.dense_layout_ok`` -- which admits any B/H/S stride order
-    and any 16-byte-unaligned stride because the Q/K/V/O path copies those.  It
-    is the ONE rule both sides of rule 8b consume: ``engines.mismatch`` applies
-    it to G before admitting a gated graph, and
-    ``api_dsl.SdpaFwdDslSm100.check_support`` raises on exactly the layouts it
-    rejects, so a plan that entered the ranked list can never die on G's layout
-    in the lowering.  ``elem_bytes`` defaults to the 2 B every Rubin gate kernel
+    ``layout.dense_layout_ok``, which admits any alignment.  It is the ONE rule
+    every consumer of G's layout makes the same call for (rule 8b lockstep): the
+    graph half ``graph_analyzer.gate_layout_ok`` (the engine rows decline a G it
+    refuses), ``api_dsl.SdpaFwdDslSm100.check_support`` (raises on exactly that
+    G, so a plan that entered the ranked list can never die on G's layout in the
+    lowering) and the binder (``prepared._dense_role_layout`` admits the
+    epilogue-gate port through the same call; the gate-in-combine binds the raw
+    BSHD strides, where a singleton axis is never stepped).  Canonicalizing FIRST
+    is what makes the three agree: a gate sliced out of a fused projection slab at
+    batch 1 x one query token keeps the slab's token pitch on both singleton axes
+    (``(13312, 256, 13312, 1)`` for 24 heads) and is BSHD-compact once they are
+    normalized -- a compactness test on the raw strides refused it while the graph
+    half admitted it.  ``elem_bytes`` defaults to the 2 B every Rubin gate kernel
     stores (``_CfgSm107.GATE_BPE``: Q-dtype on the half kernels, bf16 on the
     quantized one).
     """
-    return bshd_compact(shape_bhsd, stride_bhsd) or bshd_zero_copy_stride(shape_bhsd, stride_bhsd, elem_bytes) is not None
+    return dense_bind_strides(tuple(int(x) for x in shape_bhsd), tuple(int(x) for x in stride_bhsd), int(elem_bytes)) is not None
 
 
 # ---------------------------------------------------------------------------
