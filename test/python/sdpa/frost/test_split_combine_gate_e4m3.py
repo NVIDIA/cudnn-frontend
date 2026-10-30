@@ -441,15 +441,19 @@ def test_adapter_declares_the_fused_store_by_operand_and_pins_the_combine_form_p
     for cc in ((10, 0), (10, 3)):
         with pytest.raises(NotImplementedError, match="EXPLICIT lean tile only"):
             _frame_adapter(cc=cc, tile_form="tcgen05", split=4).check_support()
-    # the record: the explicit part set is a field (the copy the adapter hands the part statement); the three new fields are APPENDED in order,
-    # the rounding conventions pinned equal to the heuristics vocabulary
+    # the record: the explicit part set is a field (the copy the adapter hands the part statement); the three fields of this change are
+    # APPENDED in order and stay adjacent -- later changes append AFTER them (the record is append-only), so the pin reads relative order,
+    # never the record's tail; the rounding conventions pinned equal to the heuristics vocabulary
     from cudnn.sdpa.fwd.heuristics import COMBINE_OUT_ROUNDINGS
 
     assert SPARSE_CAPABILITIES.lean_explicit_ccs == H.SPARSE_LEAN_TILE_EXPLICIT_CCS == ((10, 0), (10, 3))
     assert SPARSE_CAPABILITIES.gated_e4m3_out_roundings == COMBINE_OUT_ROUNDINGS == _ROUNDINGS
     names = [f.name for f in dataclasses.fields(SPARSE_CAPABILITIES)]
     assert names.index("cutedsl_min_version") < names.index("lean_explicit_ccs") < names.index("gated_e4m3_out"), "append-only: after the former last field"
-    assert names[-2:] == ["gated_e4m3_out", "gated_e4m3_out_roundings"], "append-only: the conventions field is the record's LAST field"
+    i_out = names.index("gated_e4m3_out")
+    assert names[i_out + 1] == "gated_e4m3_out_roundings", "append-only: the conventions field follows the fused-store field"
+    assert names.index("lean_explicit_ccs") == i_out - 1, "append-only: the three fields of this change are adjacent, in order"
+    assert all(n not in names[:i_out] for n in names[i_out:]), "append-only: nothing of this change precedes the former last field"
     # the ROUNDING CONVENTION attribute: accepted with the fused store on bf16 operands (both routes; the combine form unchanged), declined by name
     # otherwise -- a half `o` (nothing to apply it to) is a malformed declaration, f16 operands the typed decline, a bad spelling refused at construction
     st = _frame_adapter(cc=(10, 7), tile_form="lean", out_rounding="staged")
