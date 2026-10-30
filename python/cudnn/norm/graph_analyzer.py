@@ -413,12 +413,11 @@ def _safe_uid(t: Any) -> Optional[int]:
         uid = t.get_uid()
     except Exception:  # noqa: BLE001
         return None
-    return uid if isinstance(uid, int) and uid > 0 else None
+    return uid if isinstance(uid, int) and uid >= 0 else None
 
 
 def resolve_variant_pack(variant_pack: dict, binding: NormBinding) -> dict:
-    """Map a cuDNN variant-pack dict (keyed by IR tensor / uid / name) to buffers
-    keyed by ``id(ir_tensor)``. Mirrors ``cudnn.sdpa.graph_analyzer``."""
+    """Map tensor, UID, or name keys to buffers keyed by ``id(ir_tensor)``."""
     if not isinstance(variant_pack, dict):
         raise TypeError(
             "cudnn.norm: compiled plans are called with a variant-pack dict " f"{{cudnn_tensor | uid | name: buffer}}; got {type(variant_pack).__name__}"
