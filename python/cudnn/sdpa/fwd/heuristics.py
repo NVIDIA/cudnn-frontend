@@ -700,6 +700,16 @@ DECODE_COMBINE_LEAN_WALK_MIN_LEAN_BLOCKS = DECODE_COMBINE_MAX_LEAN_BLOCKS + 1
 # overflow launch keeps the module's own forms (the forms it ran before the restore), and widening the bound takes a measurement
 # at a mid-overflow grid (B 8-16 x 24 heads at kv 32K-128K, where the split model picks 8-16) -- a refit of this one line.
 DECODE_COMBINE_LEAN_WALK_MAX_SPLIT = 4
+# The fused gated e4m3 store's ROUNDING CONVENTIONS (``sm100/split_combine.compile_ptr(out_rounding=)``; the sparse adapter's ``out_rounding=``
+# attribute -- an OP ATTRIBUTE of the declaration, never a knob: it changes the bytes).  "single" (the default) = ONE rounding of the fp32 gated
+# value (FROST's convention); "staged" = a serving stack's gate-and-quantize order (bf16 of the merged O, the exact sigmoid as a division, bf16
+# of the gated value, the fp32 multiply by div.rn(1, s), the saturating e4m3 cvt), so a provider can serve bytes identical to that stack's chain.
+# The vocabulary lives here because the adapter validates it BEFORE the DSL gate (python/cudnn/AGENTS.md Rule 7: the kernel module is imported
+# only after the gate) and the kernel module already imports this one.  A third convention appends a name; the kernel's trailing
+# ``quant_rounding`` constexpr appends a value.
+COMBINE_OUT_ROUNDING_SINGLE = "single"
+COMBINE_OUT_ROUNDING_STAGED = "staged"
+COMBINE_OUT_ROUNDINGS = (COMBINE_OUT_ROUNDING_SINGLE, COMBINE_OUT_ROUNDING_STAGED)
 
 
 def decode_combine_lean_blocks(b: int, h_q: int, s_q: int) -> int:

@@ -4078,7 +4078,23 @@ POSITIVE NORMAL fp32 by contract (its value is never read on the host; a zero / 
 byte on a dead row, +-448 on the live rows).  Declines by name: `NotImplementedError` (the typed decline) for an unwired form -- an e4m3 `o`
 without the gate / unsplit / under THD, any other output dtype --, `ValueError` for a malformed declaration -- an e4m3 `o` without the scale,
 a scale with a half `o`, a scale that is not one contiguous fp32 element.  `gated_e4m3_out` is the record's LAST field (appended after
-`lean_explicit_ccs`).  Validated on the Rubin development class (every form of the entry -- AUTO / ON / OFF and the lean group walk -- against
+`lean_explicit_ccs`) -- then `gated_e4m3_out_roundings` (appended 2026-10-29): the fused store's TWO ROUNDING CONVENTIONS, the
+declaration's `out_rounding=` attribute (an OP ATTRIBUTE, never a knob -- it changes the bytes; the vocabulary `heuristics.COMBINE_OUT_ROUNDINGS`,
+the record field pinned equal to it): `single` (the default; the ONE rounding of the fp32 gated value above, FROST's convention, every existing
+declaration bitwise) and `staged` (a serving stack's gate-and-quantize order, `e4m3(rn, satfinite)(bf16(bf16(O32) / (1 + exp(-G))) * div.rn(1,
+scale))`: the merged O rounded to bf16 as that stack's attention kernel stores it, the exact sigmoid as a division, the gated value rounded to
+bf16, the fp32 multiply by the same inverse, the saturating cvt -- spelled with the DSL ops that stack's kernel spells,
+`sm100/split_combine.compile_ptr(out_rounding="staged")` -> the trailing `quant_rounding` constexpr of the combine kernels, so a provider whose
+speculative verify is tuned on the stack's bytes can take the fused launch without moving the acceptance length: the two conventions differ by
+one e4m3 code on a few percent of the elements, enough to flip a near-tie greedy token).  bf16 operands only (f16 is declined by name,
+`NotImplementedError`: the convention is a bf16 chain's; a half `o` with the attribute is a malformed declaration, `ValueError`; a value outside
+the vocabulary a `ValueError` at construction); the same forms (AUTO / OFF / the lean group walk per the part's rule), the LSE bitwise the half
+entry's, dead rows 0, the PDL arm bitwise the plain arm, deterministic; no barrier / SMEM / launch-geometry change (per-lane register
+arithmetic under a trace-time constant).  Validated on the Rubin development class: the staged bytes against the torch model of the
+stack's convention on the same form's ungated bf16 O (every form, the exact-merge cells where the merged value is the bf16 input itself, the
+walk geometries, saturation, the strided element path, the PDL arm, the boundary cell reading 52 where the single mode reads 48, the adapter's
+lean and tcgen05 routes) -- the histogram against the model and the single mode is the suite's record (`test_split_combine_gate_e4m3.py`).
+Validated on the Rubin development class (every form of the entry -- AUTO / ON / OFF and the lean group walk -- against
 the unfused twin, the walk at two walk-selected geometries, the f16 underflow boundary of the twin claim, the saturation at +-448, the strided
 element path, the PDL arm; the adapter's lean
 route end to end, and the tcgen05 route's split plan at split 4: the module's own forms inside the bound, the lean group walk on the
