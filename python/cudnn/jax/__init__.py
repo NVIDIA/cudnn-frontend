@@ -17,12 +17,13 @@ from importlib import import_module
 import jax as _jax
 
 from cudnn import CUTEDSL_MIN_JAX_VERSION, CUTEDSL_MIN_JAX_VERSION_STR
+from cudnn.frost.buffers import JAX_MIN_CUTEDSL_VERSION as _JAX_MIN_CUTEDSL_VERSION
 from cudnn.frost.buffers import cutedsl_requirement_error as _cutedsl_requirement_error
 
 if _jax.version.__version_info__ < CUTEDSL_MIN_JAX_VERSION:
     raise ImportError(f"cudnn.jax requires jax >= {CUTEDSL_MIN_JAX_VERSION_STR}; found {_jax.__version__}")
 
-_requirement_error = _cutedsl_requirement_error("cudnn.jax", floor=(4, 7, 1))
+_requirement_error = _cutedsl_requirement_error("cudnn.jax", floor=_JAX_MIN_CUTEDSL_VERSION)
 if _requirement_error:
     raise ImportError(_requirement_error)
 
