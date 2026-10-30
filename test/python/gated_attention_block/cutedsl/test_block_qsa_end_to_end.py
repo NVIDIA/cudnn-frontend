@@ -1307,8 +1307,10 @@ def test_indexer_prefill_form_writes_the_declared_rounding_bitwise(rounding, cac
 
 @requires_rubin
 def test_indexer_e4m3_cache_execute_captured_replays_bitwise_eager():
-    """The replay pin of the fp8 indexer cache: a FRESH e4m3-indexer declaration runs ONE eager execute on a new stream (the FROST GEMM's
-    graph route creates its handle there -- the route's own capture rule), then its next execute is captured in ``torch.cuda.graph`` on
+    """The replay pin of the fp8 indexer cache: a FRESH e4m3-indexer declaration runs ONE eager execute on a new stream (where a GEMM on
+    the graph route would create its handle -- the route's own capture rule; on this geometry both projections resolve JIT tiles, the
+    band slab through the engine's baseline past 128 rows, so the warm-up is the capture contract's first execute), then its next
+    execute is captured in ``torch.cuda.graph`` on
     that stream under ``set_sync_debug_mode("error")`` (no host sync inside: the casts' scale word, the unit scale blobs and the padded
     prefixes are plan constants or sync-free device math); the capture launches nothing, the replay is bitwise the eager run of the
     same declaration on ``out`` / the LSE, the list, the counts and the e4m3 cache, and a second replay is bitwise the first."""
@@ -1330,7 +1332,7 @@ def test_indexer_e4m3_cache_execute_captured_replays_bitwise_eager():
     args = (inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], out, ws)
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
-        blk.execute(*args, **kw)  # the one eager execute on the capture stream (the GEMM route's handle), its results checked below too
+        blk.execute(*args, **kw)  # the one eager execute on the capture stream (the warm-up the capture contract asks for), its results checked below too
     torch.cuda.synchronize()
     warm = (out.clone(), lse.clone(), ids_out.clone(), lens_out.clone(), kbar_out.clone())
     e_out, e_lse, _ = eager.runs[0]
