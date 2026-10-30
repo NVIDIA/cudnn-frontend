@@ -3,8 +3,6 @@
 
 """XLA buffer adapters for the existing LayerNorm and RMSNorm launchers."""
 
-from functools import lru_cache
-
 import cutlass
 import cutlass.cute as cute
 
@@ -23,15 +21,12 @@ def _parameters(io_dtype, has_mean, has_beta):
     return TemplateParams(variant, io_dtype, has_beta=has_beta)
 
 
-@lru_cache(maxsize=128)
-def make_forward(rows, cols, io_dtype, *, has_mean, has_beta, epsilon, sm_count):
+def make_forward(rows, cols, io_dtype, *, has_mean, has_beta, epsilon):
     """Return ``launch(stream, x, gamma, beta, y, mean, rstd)``.
 
     X and affine operands retain their original shapes in row-major layout;
     Y is [rows, cols], and statistics FP32 [rows]. Mean is None for RMSNorm.
     The unused beta operand may alias gamma.
-    ``sm_count`` keys the cache because the shared helpers derive launch geometry
-    from the device.
     """
     params = _parameters(io_dtype, has_mean, has_beta)
     spec = rowwise_spec(params.variant, (rows, cols))
@@ -86,7 +81,6 @@ def _finalize_geometry(cols, partitions):
     return threads, grid, chunks, (partitions + chunks - 1) // chunks
 
 
-@lru_cache(maxsize=128)
 def make_backward(rows, cols, io_dtype, *, has_mean, has_beta, sm_count):
     """Return a launcher and the shape of each FP32 partial-gradient output, or None.
 
