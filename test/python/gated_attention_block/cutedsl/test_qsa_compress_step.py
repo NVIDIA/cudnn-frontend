@@ -1475,3 +1475,28 @@ def test_e4m3_ring_read_only_chunk_rows_are_the_bf16_rows_cast(t):
         for blk in range((prefixes[b] + 3 * t) // _POOL):
             assert float(pg16.kbar_row(b, blk).float().abs().max()) < 448.0
             assert torch.equal(_bits(pg8.kbar_row(b, blk)), _bits(pg16.kbar_row(b, blk).to(_E4M3)))
+
+
+@requires_cuda
+def test_paged_kv_lens_at_the_int32_extremes_are_dead_and_never_wrap():
+    """``kv_lens`` in {INT_MIN, INT_MIN + 1, -1, 0} on LIVE table rows (a stack bug; a padding entry is the ``0``) beside a ``4`` control, S_q 4:
+    every ``L <= 0`` sequence is DEAD -- every slot ``-1``, no ring row, no cache row (the sentinel bit for bit) -- whatever the magnitude, because
+    the position is derived from ``max(L, 0) - S_q`` (``step_position``, the kbar gather's derivation): the int32 ``L - S_q`` that wrapped to a live
+    positive position at ``INT_MIN`` never enters (before the clamp the wrapped rows landed in the past-the-table path by accident: slots ``-2``,
+    nothing written).  The control's row 3 completes block 0 bitwise the prefill compress."""
+    dtype, s_tok, batch, rows = torch.bfloat16, 16, 5, 4
+    k_raw, w, cos, sin = _make(batch, s_tok, dtype, seed=31)
+    int_min = -(2**31)
+    kv_lens = [int_min, int_min + 1, -1, 0, 4]
+    k_new = k_raw[:, :rows].contiguous()
+    pg = _Paged(batch, s_tok, dtype, page=16, cap=8, seed=31)  # every sequence owns pages and a ring block: the dead ones are dead by LENGTH alone
+    slot = _step_paged(pg, k_new, w, cos, sin, kv_lens)
+    assert slot.tolist() == [[-1] * rows] * 4 + [[-1, -1, -1, 0]], slot.tolist()
+    assert pg.rows_written() == 1, "a dead sequence wrote a cache row"
+    assert int((pg.ring.float() != pg.sent).any(-1).sum()) == rows, "a dead sequence wrote a ring row"
+    for b in range(4):
+        assert bool((pg.ring[int(pg.state_table[b, 0]), :, 0].float() == pg.sent).all()), f"sequence {b} (kv_lens {kv_lens[b]}) wrote the ring"
+    ref, _ = _prefill(k_raw[4:5], w, cos, sin, _i32([s_tok]))
+    assert torch.equal(_bits(pg.kbar_row(4, 0)), _bits(ref[0, 0])), "the control's block 0 is not the prefill compress"
+    for p in range(rows):
+        assert torch.equal(_bits(pg.ring_row(4, p)), _bits(k_raw[4, p]))
