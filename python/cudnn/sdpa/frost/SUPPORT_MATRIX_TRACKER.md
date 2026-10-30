@@ -4090,11 +4090,13 @@ one e4m3 code on a few percent of the elements, enough to flip a near-tie greedy
 `NotImplementedError`: the convention is a bf16 chain's; a half `o` with the attribute is a malformed declaration, `ValueError`; a value outside
 the vocabulary a `ValueError` at construction); the same forms (AUTO / OFF / the lean group walk per the part's rule), the LSE bitwise the half
 entry's, dead rows 0, the PDL arm bitwise the plain arm, deterministic; no barrier / SMEM / launch-geometry change (per-lane register
-arithmetic under a trace-time constant).  Validated on the Rubin development class: the staged bytes against the torch model of the
-stack's convention on the same form's ungated bf16 O (every form, the exact-merge cells where the merged value is the bf16 input itself, the
-walk geometries, saturation, the strided element path, the PDL arm, the boundary cell reading 52 where the single mode reads 48, the adapter's
-lean and tcgen05 routes) -- the histogram against the model and the single mode is the suite's record (`test_split_combine_gate_e4m3.py`).
-Validated on the Rubin development class (every form of the entry -- AUTO / ON / OFF and the lean group walk -- against
+arithmetic under a trace-time constant).  The staged convention validated bitwise against the torch model of the convention on every cell
+on cc 10.0 and cc 10.7 (the model on the same form's ungated bf16 O: every form, the exact-merge cells where the merged value is the bf16
+input itself, the walk geometries, saturation, the strided element path, the PDL arm, the boundary cell reading 52 where the single mode
+reads 48, the adapter's lean and tcgen05 routes; the histogram against the model and the single mode is the suite's record,
+`test_split_combine_gate_e4m3.py`) and bitwise against a serving stack's gate-and-quantize kernel on the exact-merge probe cells (36 of 36
+on both parts).  The single convention validated on the Rubin development class (every form of the entry -- AUTO / ON / OFF and the lean
+group walk -- against
 the unfused twin, the walk at two walk-selected geometries, the f16 underflow boundary of the twin claim, the saturation at +-448, the strided
 element path, the PDL arm; the adapter's lean
 route end to end, and the tcgen05 route's split plan at split 4: the module's own forms inside the bound, the lean group walk on the

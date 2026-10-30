@@ -178,8 +178,12 @@ import hashlib
 from pathlib import Path
 
 from cudnn.sdpa.fwd.kernels._quantized import _unscale_amax_kernel
-from cudnn.sdpa.fwd.heuristics import DECODE_COMBINE_MAX_LEAN_BLOCKS as _DECODE_COMBINE_MAX_LEAN_BLOCKS
-from cudnn.sdpa.fwd.heuristics import COMBINE_OUT_ROUNDING_SINGLE, COMBINE_OUT_ROUNDING_STAGED, COMBINE_OUT_ROUNDINGS
+from cudnn.sdpa.fwd.heuristics import (
+    COMBINE_OUT_ROUNDING_SINGLE,
+    COMBINE_OUT_ROUNDING_STAGED,
+    COMBINE_OUT_ROUNDINGS,
+    DECODE_COMBINE_MAX_LEAN_BLOCKS as _DECODE_COMBINE_MAX_LEAN_BLOCKS,
+)
 from cudnn._cutlass_compat import SmemAllocator
 
 import cutlass
@@ -3341,6 +3345,11 @@ def compile_ptr(
         raise ValueError(
             "out_rounding='staged' belongs to the fused gated e4m3 entry (gate_e4m3=True): the half and quantized entries round once at their store "
             "and take no rounding convention"
+        )
+    if out_rounding != COMBINE_OUT_ROUNDING_SINGLE and dtype_gate is None:
+        raise ValueError(
+            "out_rounding='staged' needs the gate dtype declared: pass dtype_gate='bf16' (the convention rounds the merged O and the gated value to "
+            "bf16, the serving chain's dtype)"
         )
     if out_rounding != COMBINE_OUT_ROUNDING_SINGLE and dtype_gate != "bf16":
         raise ValueError(

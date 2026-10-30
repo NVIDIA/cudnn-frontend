@@ -289,6 +289,8 @@ def test_compile_ptr_validates_the_fused_entry_by_name():
         comb.compile_ptr(dtype_o="bf16", dtype_partial="f32", has_lse=True, out_rounding="staged")  # nor the plain half entry
     with pytest.raises(ValueError, match="defined for the bf16 half dtype"):
         comb.compile_ptr(**dict(base, dtype_gate="f16", dtype_o="e4m3"), gate_e4m3=True, out_rounding="staged")
+    with pytest.raises(ValueError, match="needs the gate dtype declared"):  # dtype_gate omitted: the missing declaration is named first
+        comb.compile_ptr(dtype_o="e4m3", dtype_partial="f32", has_lse=True, gate=True, gate_e4m3=True, out_rounding="staged")
     hp = inspect.signature(comb._host_ptr_gated_e4m3).parameters
     assert list(hp)[-2:] == ["use_pdl", "quant_rounding"] and hp["quant_rounding"].default == comb.QUANT_ROUNDING_SINGLE
 
