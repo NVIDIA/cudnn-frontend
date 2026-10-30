@@ -2869,6 +2869,7 @@ def test_sm100_extend_matrix_cell(dtype, layout, page):
     hz.check(rec, label=f"(cc 10.0) 8/2 {dtype} {layout} p{page}")
 
 
+@pytest.mark.L1
 @requires_blackwell
 def test_sm100_extend_the_27b_geometry_executes_within_the_budget():
     """One EXTEND step at the 24 / 4 geometry at its real width (``d_model`` 5120) on cc 10.0: two sequences at ``T_max`` 256, a
@@ -2882,6 +2883,7 @@ def test_sm100_extend_the_27b_geometry_executes_within_the_budget():
     assert rec["kv_lens"] == [160, 256] and rec["t_live"] == 256 == hz.t_max
 
 
+@pytest.mark.L1
 @requires_blackwell
 def test_sm100_extend_two_launches_are_bitwise_and_lengths_form():
     """Two launches bitwise on ``out`` and the pools; the ``[B]`` lengths form (``cu_seqlens=False``) within the budget on cc 10.0."""
@@ -2898,6 +2900,7 @@ def test_sm100_extend_two_launches_are_bitwise_and_lengths_form():
     lf.check(rec, label="(cc 10.0) the lengths form")
 
 
+@pytest.mark.L0
 @requires_blackwell
 def test_sm100_extend_declines_fuse_gate_and_the_fused_fork_by_name():
     """On the part itself: ``fuse_gate=True`` on the EXTEND form is the SM100 row's typed decline at ``check_support`` (the paged body's
@@ -3078,6 +3081,7 @@ def test_fp8_proj_bf16_attention_extend_matrix_cell(layout, page):
     hz.check(rec, label=f"mode 8/2 {layout} p{page}")
 
 
+@pytest.mark.L1
 @requires_dense_part
 @requires_fp8_proj_bf16_attention_part
 def test_fp8_proj_bf16_attention_extend_two_chunks_then_a_prefix_hit_on_l3():
@@ -3099,6 +3103,7 @@ def test_fp8_proj_bf16_attention_extend_two_chunks_then_a_prefix_hit_on_l3():
     assert torch.equal(_bits(k_p), _bits(rec["refs"][0].k[0, :200])) and torch.equal(_bits(v_p), _bits(rec["refs"][0].v[0, :200]))
 
 
+@pytest.mark.L0
 @requires_dense_part
 @requires_fp8_proj_bf16_attention_part
 def test_fp8_proj_bf16_attention_extend_padded_entries_a_live_q_over_kv_len_0_and_the_lengths_form():
@@ -3119,6 +3124,7 @@ def test_fp8_proj_bf16_attention_extend_padded_entries_a_live_q_over_kv_len_0_an
     lf.check(rec, label="mode, the lengths form")
 
 
+@pytest.mark.L1
 @requires_rubin
 @requires_fp8_proj_bf16_attention_part
 def test_fp8_proj_bf16_attention_extend_fuse_gate_rides_the_paged_body_epilogue():
@@ -3144,13 +3150,17 @@ def test_fp8_proj_bf16_attention_extend_fuse_gate_rides_the_paged_body_epilogue(
     assert bool((d <= bound).all()), "the two gate placements differ by more than one bf16 rounding of the gated O"
 
 
+@pytest.mark.L0
 @requires_dense_part
 @requires_fp8_proj_bf16_attention_part
 def test_fp8_proj_bf16_attention_extend_e4m3_o_is_the_cast_of_the_gated_o_and_tracks_the_gate_quant_model():
     """The mode's e4m3 O on the EXTEND form: (a) the store pin -- the ``o8`` slot BITWISE ``cvt.rn.satfinite(bf16 gated O * scale_o)`` of the
     block's own gated O on every live row; (b) the gate-and-quantize model of a serving stack, ``e4m3(bf16(bf16(O) * sigmoid(G)) * scale_o)`` on
-    the ORACLE's pre-gate O and gate: the e4m3-ulp histogram printed, the one-ulp claim on the band |x| >= 4 of the e4m3 value domain (one ulp
-    there >= 0.5, above the chain's bf16 noise ~ 2^-8 of the typical gated-O magnitude), the rest reported; two launches bitwise."""
+    the ORACLE's pre-gate O and gate: the e4m3-ulp histogram printed, the one-ulp claim on the band |x| >= 4 of the e4m3 value domain -- where one e4m3
+    ulp (>= 0.5) exceeds the chain's ABSOLUTE noise floor: near zero the two chains differ not by a rounding of a shared value but by the
+    kernels' tanh-form sigmoid against torch's for strongly negative gates and by the attention's own accumulation order, a floor that is
+    many ulps of the 2^-9 subnormal spacing (its size in e4m3 units is printed) -- the rest reported, no tolerance widened; two launches
+    bitwise."""
     hz = _mode_harness(4, 512, max_kv_len=512, page=16, layout="hnd", seed=9)
     rec = hz.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
     hz.check(rec, label="mode, the e4m3 O cell")
@@ -3175,7 +3185,11 @@ def test_fp8_proj_bf16_attention_extend_e4m3_o_is_the_cast_of_the_gated_o_and_tr
         max_ulp=float(d.max()) if d.numel() else 0.0,
     )  # noqa: E731
     full, in_band, below = hist(dist), hist(dist[band]), hist(dist[~band])
-    print(f"[mode EXTEND 8/2 p16] e4m3 O vs the gate-quant model (scale_o {scale_o:.2f}): all {full}; band |x| >= 4: {in_band}; below: {below}")
+    floor = float((a - model).abs()[~band].max()) if bool((~band).any()) else 0.0  # the chain's absolute noise floor below the band, in e4m3 units
+    print(
+        f"[mode EXTEND 8/2 p16] e4m3 O vs the gate-quant model (scale_o {scale_o:.2f}): all {full}; band |x| >= 4: {in_band}; below: {below}; "
+        f"max |block - model| below the band {floor:.4f} (e4m3 units; one ulp in the band is >= 0.5)"
+    )
     assert in_band["n"] > 0.5 * full["n"] and in_band["more"] == 0 and full["exact"] > 0.5 * full["n"], (in_band, full)
     out1 = rec["out"].clone()
     hz.refill_pools()
@@ -3183,6 +3197,7 @@ def test_fp8_proj_bf16_attention_extend_e4m3_o_is_the_cast_of_the_gated_o_and_tr
     assert torch.equal(out1, rec2["out"]) and torch.equal(o8[live].view(torch.uint8), hz.o8()[live].view(torch.uint8)), "two launches differ"
 
 
+@pytest.mark.L1
 @requires_dense_part
 @requires_fp8_proj_bf16_attention_part
 def test_fp8_proj_bf16_attention_extend_the_27b_geometry_executes_within_the_budget():

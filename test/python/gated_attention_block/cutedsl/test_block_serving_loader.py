@@ -365,9 +365,11 @@ def test_qkvg_from_vllm_permutes_e4m3_codes_as_bytes_and_keeps_the_per_tensor_sc
     # the bf16 VALUES' permutation is the dequantized codes' permutation, value for value (what a stack that dequantizes first would see)
     w_vals, _, _ = qkvg_from_vllm((codes.float() * (1.0 / scale)).to(torch.bfloat16), hf.q_norm, hf.k_norm, g)
     assert torch.equal(w_vals, (w8.float() * (1.0 / scale)).to(torch.bfloat16))
-    # a non-contiguous merged weight (a row slice of a wider tensor) permutes the same bytes
-    wide = torch.cat([codes, torch.zeros(3, g.d_model, dtype=torch.float8_e4m3fn)], 0)[:-3]
-    assert not wide.is_contiguous() or wide.data_ptr() == wide.data_ptr()
+    # a non-contiguous merged weight -- a COLUMN slice of a wider tensor (the row stride exceeds d_model; a leading-row slice would stay
+    # contiguous) -- permutes the same bytes
+    wide = torch.empty(codes.shape[0], g.d_model + 16, dtype=torch.float8_e4m3fn)[:, : g.d_model]
+    wide.copy_(codes)
+    assert not wide.is_contiguous() and torch.equal(wide.view(torch.uint8), codes.view(torch.uint8))
     w8_nc, _, _ = qkvg_from_vllm(wide, hf.q_norm, hf.k_norm, g)
     assert torch.equal(w8_nc.view(torch.uint8), w8.view(torch.uint8))
     # the rank slices (TP 2): the shard of the TP 1 codes, bitwise

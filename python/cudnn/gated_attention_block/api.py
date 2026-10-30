@@ -8652,7 +8652,10 @@ class GatedAttentionBlockFwd(APIBase):
         (5q) quantize_o   O_gated -> o8 (scale_o)                         kernels/quantize.py
         (6)  out_proj     o8, e4m3 W_o -> out                             FP8 FROST GEMM (epilogue * alpha_o)
 
-    Six launches at decode row counts with the gate in the combine and the write-through folded (cc 10.7), seven to eight otherwise.
+    Launch counts measured by the CUPTI census cell (B 2 x S_q 1 at the 24 / 2 geometry, every kernel counted): cc 10.7 six with the
+    gate in the combine and the write-through folded (seven with the separate cache write; seven / eight with the separate gate),
+    cc 10.0 seven / eight (the gate its own launch) -- the bf16 serving chain's own counts: both FP8 forced-tile GEMMs are one kernel
+    each where the bf16 small-M out projection is a split-K kernel plus a reduce, so the quantize launch takes the reduce's place.
     Refused by name: ``kv_source="self"``, ``fuse_norm_rope=True``, ``inplace_qkv=False``, training / an LSE, the e4m3 KV cache, a
     QsaSpec geometry, ``use_pdl=True`` (AUTO False), ``num_tokens_live``, an ``MxQuantSpec`` or ``QuantSpec(attention_dtype=None)``
     on the paged forms, the mode on a served dense part off the tuple.  The workspace holds ``o8`` and no compact e4m3 Q / K / V;

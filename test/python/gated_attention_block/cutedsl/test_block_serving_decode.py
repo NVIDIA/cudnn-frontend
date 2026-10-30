@@ -3299,10 +3299,12 @@ def test_fp8_proj_bf16_attention_e4m3_o_is_the_cast_of_the_gated_o_and_tracks_th
     block's own gated bf16 O (the ``o`` slot, gated in place) on every row -- one quantization convention, the padded entry's bytes 0.
     (b) THE GATE-AND-QUANTIZE MODEL of a serving stack, ``e4m3(bf16(bf16(O) * sigmoid(G)) * scale_o)`` on the ORACLE's pre-gate O and gate
     (two bf16 roundings; the block's combine route rounds the fp32 gated value ONCE): the histogram of e4m3-ulp distances is printed; the
-    one-ulp claim is made on the band |x| >= 4 of the e4m3 value domain (the exponent bands 2^2 and above, where one e4m3 ulp >= 0.5 is above
-    the chain's bf16 noise -- 2^-8 of the typical gated-O magnitude ~ amax / 4, i.e. ~0.44 in that domain -- so the two chains differ by at
-    most one code at a rounding boundary); below the band the distances are REPORTED, never claimed (a near-zero element's relative noise
-    is unbounded); never bitwise (the kernels' tanh-form sigmoid against torch's, the attention's own accumulation).  (c) SATURATION through
+    one-ulp claim is made on the band |x| >= 4 of the e4m3 value domain (the exponent bands 2^2 and above, where one e4m3 ulp >= 0.5 exceeds
+    the chain's ABSOLUTE noise floor: near zero the two chains differ not by a rounding of a shared value but by the kernels' tanh-form
+    sigmoid against torch's for strongly negative gates and by the attention's own accumulation order -- inside the band that floor is
+    below one ulp, so the two chains differ by at most one code at a rounding boundary); below the band the distances are REPORTED, never
+    claimed (the same floor is many ulps of the 2^-9 subnormal spacing; its size in e4m3 units is printed), no tolerance widened; never
+    bitwise.  (c) SATURATION through
     ``update_quant_scales``: ``scale_o x 4096`` drives every live byte that reaches the range to +-448 (``satfinite``: no NaN / inf), ``out``
     stays finite; the original spec restored, ``out`` is bitwise the first run (the three device scalars round-trip)."""
     case = _mode_case(("gq", 12, 2), 12, 2, _LENS)
@@ -3323,7 +3325,11 @@ def test_fp8_proj_bf16_attention_e4m3_o_is_the_cast_of_the_gated_o_and_tracks_th
     dist = _e4m3_ulp_distance(a, m)
     band = (torch.maximum(a.abs(), m.abs()) >= 4.0).cpu()
     full, in_band, below = _e4m3_histogram(dist), _e4m3_histogram(dist[band]), _e4m3_histogram(dist[~band])
-    print(f"[mode 24/2 S_q 2 p16] e4m3 O vs the gate-quant model (scale_o {scale_o:.3f}): all {full}; band |x| >= 4: {in_band}; below the band: {below}")
+    floor = float((a - m).abs().cpu()[~band].max()) if bool((~band).any()) else 0.0  # the chain's absolute noise floor below the band, in e4m3 units
+    print(
+        f"[mode 24/2 S_q 2 p16] e4m3 O vs the gate-quant model (scale_o {scale_o:.3f}): all {full}; band |x| >= 4: {in_band}; below the band: {below}; "
+        f"max |block - model| below the band {floor:.4f} (e4m3 units; one ulp in the band is >= 0.5)"
+    )
     assert in_band["n"] > 0.5 * full["n"], "the band must hold most of the live elements for the claim to mean anything"
     assert in_band["more"] == 0, f"an element in the one-ulp band is more than one e4m3 ulp from the gate-quant model: {in_band}"
     assert full["exact"] > 0.5 * full["n"], f"fewer than half the codes agree bitwise with the model: {full}"
@@ -3448,31 +3454,56 @@ def test_fp8_proj_bf16_attention_l1_l2_l3_pools_are_bitwise_at_every_page_size(p
         ), f"{layout} != hnd at page {page}: max|diff| {(outs[layout].float() - outs['hnd'].float()).abs().max().item():.3e}"
 
 
-@requires_rubin
+# The MEASURED launch counts of the mode's DECODE chain per served part -- the 24 / 2 geometry at d_model 2560, B 2 x KV 4096, S_q 1 -- by
+# (fuse_cache_write_small_m, fuse_gate).  The census cell below is the detector (EVERY kernel the profiler sees is counted, a GEMM's split-K
+# reduce included) and the docs quote these numbers; a tree that changes a stage's kernel count changes this table and the prose with it.
+# cc 10.0 serves the gate as its own launch only (fuse_gate=True is the part's typed decline), so it has the two write-through arms.
+_MODE_DECODE_LAUNCHES = {
+    _SM107: {(False, True): 7, (True, True): 6, (False, False): 8, (True, False): 7},
+    _SM100: {(False, False): 8, (True, False): 7},
+}
+
+
+@requires_dense_part
 @requires_fp8_proj_bf16_attention_part
 def test_fp8_proj_bf16_attention_launch_census_is_the_bf16_chain_plus_the_quantize_launch():
-    """The DECODE chain's CUPTI census under the mode at the 24 / 2 geometry (``d_model`` 2560, B 1 x KV 4096, S_q 1): against the bf16 UNFUSED
-    chain of the same declaration, the mode adds exactly ONE kernel -- the quantize launch -- on both write-through arms (the fold drops the
-    cache-write launch on both), the projection GEMMs' own kernel count aside (the FP8 forced tile against the bf16 small-M tile: printed);
-    no hidden copy.  Pinned: the quantize kernel present once, the cache write per arm, the fold's one-kernel saving."""
+    """The DECODE chain's CUPTI census under the mode at the 24 / 2 geometry (``d_model`` 2560, B 2 x KV 4096, S_q 1) on every served part,
+    against the bf16 UNFUSED chain of the same declaration, per write-through arm and -- on cc 10.7 -- per gate placement.  EVERY kernel the
+    profiler sees is counted (a GEMM's split-K reduce included; the names are printed): the quantize kernel present exactly once and only
+    under the mode, the cache-write kernel exactly on the separate arm, the gate's own kernel exactly on the separate-gate arm, no hidden
+    copy, the fold dropping exactly one launch with ``out`` bitwise across it, and the TOTAL per arm = ``_MODE_DECODE_LAUNCHES`` (the number
+    the docs publish).  Batch 2, not 1: at the current develop the dense-layout binding's GATE predicate refuses the batch-1 singleton-stride
+    slab column on cc 10.7 (a defect outside this change); the chain has no batch-dependent stage, so the count is the count."""
+    part = _cc()
+    arms = _MODE_DECODE_LAUNCHES[part]
     cells = {}
-    for arm in (False, True):
-        cells[("mode", arm)] = _Case(12, 1, (4096,), seed=1, d_model=2560, quant=True, blk_kw=dict(fuse_cache_write_small_m=arm)).compile()
-        cells[("bf16", arm)] = _Case(12, 1, (4096,), seed=1, d_model=2560, blk_kw=dict(fuse_norm_rope=False, fuse_cache_write_small_m=arm)).compile()
+    for cw, fg in arms:
+        bk = dict(fuse_cache_write_small_m=cw, fuse_gate=fg)
+        cells[("mode", cw, fg)] = _Case(12, 1, (4096, 4096), seed=1, d_model=2560, quant=True, blk_kw=bk).compile()
+        cells[("bf16", cw, fg)] = _Case(12, 1, (4096, 4096), seed=1, d_model=2560, blk_kw=dict(fuse_norm_rope=False, **bk)).compile()
     census = {k: _cupti_kernels(lambda c=c: c.execute()) for k, c in cells.items()}
     if any(k is None for k, _ in census.values()):
         pytest.skip("torch.profiler recorded no CUDA events (CUPTI unavailable on this node); the launch count is unverified here")
-    for arm in (False, True):
-        k_d1, m_d1 = census[("mode", arm)]
-        k_bf, _ = census[("bf16", arm)]
-        print(f"\nmode, fuse_cache_write_small_m={arm}: {len(k_d1)} kernels + {len(m_d1)} memset/memcpy:\n  " + "\n  ".join(n[:120] for n in k_d1))
-        print(f"bf16 unfused chain, fuse_cache_write_small_m={arm}: {len(k_bf)} kernels:\n  " + "\n  ".join(n[:120] for n in k_bf))
-        assert sum("frost_quantize_fp8" in n for n in k_d1) == 1 and not any("frost_quantize" in n for n in k_bf)
-        assert any("frost_cache_write" in n for n in k_d1) == (not arm) and any("frost_qk_norm_rope" in n for n in k_d1)
-        assert not [n for n in m_d1 if "memcpy" in n.lower()], "a hidden copy on the mode's execute path"
-        non_gemm = lambda ks: [n for n in ks if not any(t in n.lower() for t in ("gemm", "frost_proj", "split_k", "reduce"))]  # noqa: E731
-        assert len(non_gemm(k_d1)) == len(non_gemm(k_bf)) + 1, (non_gemm(k_d1), non_gemm(k_bf))
+    for cw, fg in arms:  # every arm's names first (a count that moved is read off one log), the pins after
+        k_mode, m_mode = census[("mode", cw, fg)]
+        k_bf, _ = census[("bf16", cw, fg)]
+        blk = cells[("mode", cw, fg)].blk
+        print(
+            f"\n[mode census cc {part[0]}.{part[1]}] fuse_cache_write_small_m={cw} fuse_gate={fg} (readbacks: cache_write_in_norm_rope="
+            f"{blk.cache_write_in_norm_rope}, gate_fused={blk.gate_fused}, decode_split_kv={blk.decode_split_kv}): {len(k_mode)} kernels + "
+            f"{len(m_mode)} memset/memcpy:\n  " + "\n  ".join(n[:120] for n in k_mode)
+        )
+        print(f"bf16 unfused chain, the same arms: {len(k_bf)} kernels:\n  " + "\n  ".join(n[:120] for n in k_bf))
+    for cw, fg in arms:
+        k_mode, m_mode = census[("mode", cw, fg)]
+        k_bf, _ = census[("bf16", cw, fg)]
+        assert sum("frost_quantize_fp8" in n for n in k_mode) == 1 and not any("frost_quantize" in n for n in k_bf)
+        assert any("frost_cache_write" in n for n in k_mode) == (not cw) and any("frost_qk_norm_rope" in n for n in k_mode)
+        assert sum("frost_elementwise_gate" in n for n in k_mode) == (0 if fg else 1), "the gate's own launch exactly on the separate-gate arm"
+        assert not [n for n in m_mode if "memcpy" in n.lower()], "a hidden copy on the mode's execute path"
+        assert len(k_mode) == arms[(cw, fg)], f"the mode's launch count at this arm is {len(k_mode)}, the published {arms[(cw, fg)]}: {k_mode}"
         torch.cuda.synchronize()
-        cells[("mode", arm)].check_against_oracle(what=f"mode census arm {arm}")
-    assert len(census[("mode", True)][0]) == len(census[("mode", False)][0]) - 1, "the write-through fold drops exactly the cache-write launch"
-    assert torch.equal(_bits(cells[("mode", True)].out), _bits(cells[("mode", False)].out))
+        cells[("mode", cw, fg)].check_against_oracle(what=f"mode census, fuse_cache_write_small_m {cw}, fuse_gate {fg}")
+    for fg in sorted({fg for _, fg in arms}):
+        assert len(census[("mode", True, fg)][0]) == len(census[("mode", False, fg)][0]) - 1, "the write-through fold drops exactly the cache-write launch"
+        assert torch.equal(_bits(cells[("mode", True, fg)].out), _bits(cells[("mode", False, fg)].out))

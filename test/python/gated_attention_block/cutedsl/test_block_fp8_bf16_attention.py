@@ -522,7 +522,7 @@ def test_fp8_forced_tile_projection_gemm_with_the_alpha_epilogue_runs_on_the_cap
 
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
     handles_before = dict(proj_gemm._GRAPH_HANDLES)
-    plan = build_proj_gemm(m=m, k=k, n=n, dtype=E4, out_dtype=BF16, alpha=True, label=f"d1_{label}_{m}x{k}x{n}", capture_safe=True)
+    plan = build_proj_gemm(m=m, k=k, n=n, dtype=E4, out_dtype=BF16, alpha=True, label=f"mode_{label}_{m}x{k}x{n}", capture_safe=True)
     assert plan.route == "jit-only" and plan.jit is not None and plan.capture_safe, (plan.route, plan.jit)
     assert plan.graph.plans == [], "the capture-safe plan built a ranked list"
     g = torch.Generator(device="cuda").manual_seed(m * 7 + n)
