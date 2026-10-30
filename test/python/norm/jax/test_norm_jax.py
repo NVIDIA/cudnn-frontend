@@ -8,10 +8,10 @@ import sys
 import numpy as np
 import pytest
 
-from cudnn.frost.buffers import cutedsl_requirement_error
+from cudnn.frost.buffers import JAX_MIN_CUTEDSL_VERSION, cutedsl_requirement_error
 from cudnn.norm._lazy import dsl_unavailable
 
-requirement_error = cutedsl_requirement_error("JAX norm tests", min_version=(4, 7, 1)) or dsl_unavailable("JAX norm tests")
+requirement_error = cutedsl_requirement_error("JAX norm tests", min_version=JAX_MIN_CUTEDSL_VERSION) or dsl_unavailable("JAX norm tests")
 if requirement_error:
     pytest.skip(requirement_error, allow_module_level=True)
 
