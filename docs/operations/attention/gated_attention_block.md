@@ -1167,7 +1167,10 @@ ragged packed rows), `thd_paged_pdl` (`use_pdl=True`), `thd_paged_fuse_prepare`,
 dense extend step per chunk-length group); the table's `sparse` row stays reachable through a sparse-adapter record without the
 composition claim (`SparseCapabilities.thd_paged_kv`).  The envelope reads `extend.sparse_core`, `extend.index_sources == ("caller",)`,
 `extend.index_list_forms == ("per_row",)`, `extend.sparse_tiles == ("sparse_d256_f16",)`, `extend.writes_lse` and `extend.pdl_stages ==
-()` (the appended tail of `ExtendEnvelope`; a dense geometry reads the defaults), and `extend.requires` spells the form.  A CUDA-graph
+()` (the appended tail of `ExtendEnvelope`; a dense geometry reads the defaults), and `extend.requires` spells the form.  Where the
+geometry alone refuses the packed form (`index_list_form="shared"`, `index_source="indexer"`) the envelope's verdict is the declaration's:
+`extend.served` is `False` with that row's text as `extend.reason`, `"extend"` is absent from `forms` and `extend.sparse_tiles` is empty
+(the geometry's DECODE record is its own).  A CUDA-graph
 capture takes the block after ONE eager warm-up on the capture stream (the first execute may create the projection route's per-stream
 state); the replay then serves new lengths / tables / lists / slots / pools through the captured tensors.  TWO-RUN EQUIVALENCE: the
 step computes the same function as a dense `[B_dec, S_q]` decode block plus one dense `[1, T]` paged QsaSpec block per chunk over the

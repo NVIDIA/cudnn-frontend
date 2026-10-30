@@ -1373,7 +1373,10 @@ class ExtendEnvelope:
 
     ``served`` is True iff a block declared as ``requires`` spells it would pass ``check_support`` on that device for that
     geometry and dtype -- the device / DSL facts (``reason`` names the first one that fails), the dtype (``dtypes``), the head
-    dim and the geometry rows below.  ``declines`` maps every typed decline the form raises AT DECLARATION to the message it
+    dim and the geometry rows below, and on a QsaSpec geometry the packed form's rows decided by the geometry alone (the shared
+    list, the in-block indexer: :func:`_qsa_thd_paged_geometry_decline`, the constructor's own predicate, so a geometry whose packed
+    declaration raises ``thd_paged_shared_list`` / ``thd_paged_indexer`` reads ``served=False`` with that row's text as ``reason``;
+    2026-10-30).  ``declines`` maps every typed decline the form raises AT DECLARATION to the message it
     raises with -- the SAME table the constructor reads (:data:`_EXTEND_DECLINES`), so a caller's dispatch predicate and the
     block's declines cannot drift: no decline is reachable at declaration that this record did not predict.  ``page_sizes``
     / ``pool_layouts`` are the validated matrix (every entry an accept cell on the target body).
@@ -9284,6 +9287,30 @@ def _qsa_thd_paged_decline_texts(geometry: GatedAttentionBlockGeometry, dtype: t
     }
 
 
+_QSA_THD_PAGED_GEOMETRY_ROWS: Tuple[Tuple[str, Callable[[QsaSpec], bool]], ...] = (
+    ("thd_paged_shared_list", lambda q: q.index_list_form == QSA_INDEX_LIST_FORM_SHARED),
+    ("thd_paged_indexer", lambda q: q.index_source == "indexer"),
+)
+"""The PACKED sparse EXTEND form's rows decided by the GEOMETRY alone (no knob, no record, no device), in the order the constructor
+raises them: the shared step-0 list, then the in-block indexer (``QsaSpec.validate`` pins ``index_band`` under the indexer)."""
+
+
+def _qsa_thd_paged_geometry_decline(geometry: GatedAttentionBlockGeometry, dtype: torch.dtype) -> Optional[Tuple[str, str]]:
+    """``(row, text)`` of the first :data:`_QSA_THD_PAGED_GEOMETRY_ROWS` row ``geometry`` meets -- the decline a packed (``thd=True``)
+    declaration with ``kv_source="paged"`` of this QsaSpec geometry raises whatever its knobs --, or None where the geometry takes the
+    form (caller lists, ``index_list_form`` None / ``'per_row'``) and for a dense geometry.  ONE predicate for the constructor
+    (``_check_qsa_declaration``, which raises the text) and :meth:`GatedAttentionBlockFwd.serving_envelope` (which folds it into
+    ``extend.served`` / ``reason`` / ``forms`` on a reading where the part, the DSL and the dtype permit), so a serving stack's dispatch
+    bit and the declaration cannot drift (2026-10-30); the texts are :func:`_qsa_thd_paged_decline_texts`'."""
+    q = geometry.qsa
+    if q is None:
+        return None
+    for row, pred in _QSA_THD_PAGED_GEOMETRY_ROWS:
+        if pred(q):
+            return row, _qsa_thd_paged_decline_texts(geometry, dtype)[row]
+    return None
+
+
 class GatedAttentionBlockFwd(APIBase):
     """Gated attention block, forward. One call, one workspace, three to five launches.
 
@@ -10787,6 +10814,13 @@ class GatedAttentionBlockFwd(APIBase):
         if paged and not rec.bottom_right:
             # the mode's arm, read off the record: a record that retires it declines here by name instead of binding a body without it
             raise NotImplementedError("QsaSpec with kv_source='paged': the sparse adapter's record declines bottom_right (the decode mode's diagonal)")
+        if paged and self.thd:
+            # The PACKED sparse EXTEND form's rows decided by the geometry alone -- the shared step-0 list (no meaning over ragged packed
+            # rows), the in-block indexer (its packed form over the pools is a follow-up) -- ONE predicate with the envelope's EXTEND verdict
+            # (_qsa_thd_paged_geometry_decline: `extend.served` reads False and `forms` drops "extend" exactly where this raises; 2026-10-30)
+            hit = _qsa_thd_paged_geometry_decline(g, self.dtype)
+            if hit is not None:
+                raise NotImplementedError(hit[1])
         # The list form (QsaSpec.index_list_form): the shared per-sequence list is the decode mode's MTP form -- over the pools, at most the
         # record's shared-list cap of rows per sequence, under caller lists (the in-block indexer selects per row: its own row below); on the
         # block's own K / V every row carries its own list, so "shared" is refused by name rather than read as the per-row form.
@@ -10797,18 +10831,13 @@ class GatedAttentionBlockFwd(APIBase):
                     f"{rec.index_shared_list_max_tokens}: one list per sequence anchored at the step-0 position); on the block's own K / V "
                     "(kv_source='self') every row carries its own list -- declare index_list_form=None or 'per_row'"
                 )
-            if self.thd:
-                # the PACKED sparse EXTEND form: a shared step-0 list has no meaning over ragged packed rows (the envelope's row)
-                raise NotImplementedError(_qsa_thd_paged_decline_texts(g, self.dtype)["thd_paged_shared_list"])
             if q.index_source != "indexer" and self.seq_len > rec.index_shared_list_max_tokens:
                 raise NotImplementedError(_qsa_decode_decline_texts(g, self.dtype)["shared_list_rows"])
         # The head dim, the block size, the top_k range, the GQA group and the dtype: the RECORD's claims, read, not transcribed.
         _check_qsa_geometry_against_record(g, self.dtype)
         if q.index_source == "indexer":
-            if paged and self.thd:
-                # the in-block indexer on the PACKED sparse EXTEND form over the pools is a follow-up (the envelope's row; the `indexer_thd` row
-                # below keeps the packed form over the block's own K / V)
-                raise NotImplementedError(_qsa_thd_paged_decline_texts(g, self.dtype)["thd_paged_indexer"])
+            # (the in-block indexer on the PACKED sparse EXTEND form over the pools -- a follow-up -- is declined above through the shared
+            # predicate, the envelope's row; the `indexer_thd` row below keeps the packed form over the block's own K / V)
             # The in-block indexer's own rows (device-free): the scorer's dtype / head dim, the packed form; on the prefill form the
             # prefill scorer's head groups, over the POOLS (the decode step) the paged scorer's envelope -- the query rows per sequence,
             # the page's power-of-two row count, the e4m3 cache, the e4m3 pool, the shared list -- each the envelope's row.
@@ -12173,7 +12202,9 @@ class GatedAttentionBlockFwd(APIBase):
         :data:`_EXTEND_DECLINES` (``diagonal``, ``window``, ``sparse``, ``head_dim``) evaluated on ``geometry`` for EACH paged form.
         The declaration rows (including ``return_lse`` and the EXTEND-only ``fuse_gate`` refusal) are listed in each form's
         ``declines``; a QsaSpec geometry meets the table's ``sparse`` row on both forms (:data:`_QSA_THD_DECLINE` only
-        through a record without the packed arm).  Thus
+        through a record without the packed arm), and on the EXTEND form the packed declaration's rows decided by the geometry alone
+        (:func:`_qsa_thd_paged_geometry_decline`: ``thd_paged_shared_list`` / ``thd_paged_indexer``, the constructor's own predicate,
+        met before the table as the constructor meets it; 2026-10-30).  Thus
         ``extend.served`` / ``decode.served`` are True iff a block declared as ``requires`` spells it passes its declaration and
         ``check_support`` here, and each form's ``declines`` lists every typed decline it raises at declaration with its message;
         ``decode.routes`` names the kernel per ``S_q`` (:func:`decode_route` read for the part, :func:`_route_part`: the Rubin table on
@@ -12259,6 +12290,13 @@ class GatedAttentionBlockFwd(APIBase):
                 # a record without the packed arm: the THD-only form meets the sparse declaration's own row before any row of the
                 # table (_check_qsa_declaration runs first); with the arm claimed (the shipped record) the table's `sparse` row speaks
                 return _QSA_THD_DECLINE
+            if thd and geometry.qsa is not None:
+                # the PACKED sparse EXTEND form's rows decided by the geometry alone (the shared list, the in-block indexer): the constructor's
+                # own predicate, met BEFORE the table as the constructor meets it, so `extend.served` / `reason` / `forms` are the declaration's
+                # verdict for every QsaSpec geometry (2026-10-30)
+                geometry_hit = _qsa_thd_paged_geometry_decline(geometry, dtype)
+                if geometry_hit is not None:
+                    return geometry_hit[1]
             hit = _first_serving_decline(
                 _ServingDecl(
                     kv_source=KV_SOURCE_PAGED,

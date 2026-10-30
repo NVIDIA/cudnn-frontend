@@ -17,7 +17,10 @@ Host cells (any device; the declaration cells even on the CPU): the declaration 
 (the sparse stage with ``thd`` and ``paged``, the per-row list, the tcgen05 body, split 1, no route, no indexer, the write-through in
 position, the gate where declared); the static ``serving_envelope`` (``extend.served`` with ``sparse_core`` on a Rubin reading, the
 appended tail ``index_sources`` / ``index_list_forms`` / ``sparse_tiles``, the LSE written, no PDL stage, the ``thd_paged_*`` rows
-beside the table's; a dense geometry's record unchanged); every typed decline of the form raised on a REAL declaration with its text
+beside the table's; a dense geometry's record unchanged); the EXTEND verdict EQUAL to the declaration's outcome per geometry (a
+caller-list geometry served and constructing; the shared list, the in-block indexer, both: declined with ``reason`` the very
+``NotImplementedError`` the declaration raises, ``"extend"`` out of ``forms``; the part row first on a cc 10.0 reading); every typed
+decline of the form raised on a REAL declaration with its text
 EQUAL to the envelope's row (the step form of the indexer, the split, the lean tile, the shared list, PDL, the prepare fusion, the e4m3
 pool, the in-block indexer; the table's record-driven ``sparse`` row through a record without the composition claim); the execute-time
 form checks on an UNCOMPILED block under ``set_sync_debug_mode("error")``.
@@ -338,6 +341,62 @@ def test_packed_sparse_extend_typed_declines_equal_the_envelope_row_by_row(monke
         assert str(e.value) == env.extend.declines["diagonal"]
         blk, _ = _declare(GEOM_SMALL, lens, return_lse=True)
         assert blk._sdpa.want_lse
+
+
+_VERDICT_GEOMETRIES = (
+    # (index_list_form, index_source, index_band) -> the thd_paged_* row the packed declaration raises, None where it constructs
+    ((None, "caller", False), None),
+    (("per_row", "caller", False), None),
+    ((None, "caller", True), None),  # the fifth band under caller lists: a wider slab, the form unchanged
+    (("shared", "caller", False), "thd_paged_shared_list"),
+    ((None, "indexer", True), "thd_paged_indexer"),
+    (("per_row", "indexer", True), "thd_paged_indexer"),
+    (("shared", "indexer", True), "thd_paged_shared_list"),  # both rows: the shared list first, the constructor's order
+)
+
+
+@pytest.mark.parametrize("dtype", [BF16, F16], ids=["bf16", "f16"])
+def test_packed_sparse_extend_verdict_equals_the_declaration_per_geometry(dtype, monkeypatch):
+    """The envelope's EXTEND verdict IS the declaration's outcome for every QsaSpec geometry the packed form decides by the geometry alone:
+    on the Rubin reading a caller-list geometry (``index_list_form`` None / ``'per_row'``, with or without the fifth band) is served and the
+    packed declaration CONSTRUCTS; a shared list, the in-block indexer, and both together are declined with ``extend.reason`` EQUAL to the
+    ``NotImplementedError`` the very same declaration raises -- the same ``thd_paged_*`` row, the shared list first where both hold (the
+    constructor's order) -- ``"extend"`` leaves ``forms`` and ``sparse_tiles`` empties, while the geometry's DECODE record is untouched
+    (served, ``sparse_core``).  On the cc 10.0 reading the part row speaks first for every one of them, the geometry rows changing nothing.
+    A verdict that disagreed with the declaration would route a serving stack's mixed step to a form it cannot construct."""
+    from cudnn.frost import buffers
+    from cudnn.gated_attention_block.api import _qsa_thd_paged_geometry_decline, _sparse_part_decline
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    lens = [300, 0, 128, 84]
+    part_reasons = set()
+    with _no_host_sync():
+        for (form, source, band), expected in _VERDICT_GEOMETRIES:
+            label = (form, source, band, dtype)
+            geom, _ = _geom(GEOM_SMALL, index_band=band, index_list_form=form, index_source=source)
+            env = GatedAttentionBlockFwd.serving_envelope(geom, dtype, _DEV, device_cc=_SM107)
+            try:
+                blk, _aux = _declare(GEOM_SMALL, lens, dtype=dtype, index_band=band, index_list_form=form, index_source=source)
+                outcome = None
+            except NotImplementedError as e:
+                outcome = str(e)
+            hit = _qsa_thd_paged_geometry_decline(geom, dtype)
+            if expected is None:
+                assert outcome is None and hit is None, label
+                assert env.extend.served and env.extend.reason is None and "extend" in env.forms, label
+                assert env.extend.sparse_tiles == (SPARSE_TILE_TCGEN05,) and isinstance(blk._sdpa, _SparseSdpa) and blk._sdpa.thd and blk._sdpa.paged, label
+            else:
+                assert outcome is not None and hit == (expected, outcome), label
+                assert not env.extend.served and env.extend.reason == outcome == env.extend.declines[expected], label
+                assert env.forms == ("decode",) and env.extend.sparse_tiles == (), label
+                # the record still DESCRIBES the form the geometry would have to take (the disambiguation the docs name)
+                assert env.extend.sparse_core and env.extend.index_sources == ("caller",) and env.extend.index_list_forms == ("per_row",), label
+            assert env.decode.served and env.decode.sparse_core, label  # the DECODE mode of the geometry is its own verdict
+            # another part: the part row first, whatever the geometry (a QsaSpec geometry is served on cc 10.7 alone)
+            other = GatedAttentionBlockFwd.serving_envelope(geom, dtype, _DEV, device_cc=(10, 0))
+            assert not other.extend.served and other.forms == () and other.extend.reason == _sparse_part_decline((10, 0)), label
+            part_reasons.add(other.extend.reason)
+    assert len(part_reasons) == 1
 
 
 def test_packed_sparse_extend_execute_form_checks():
