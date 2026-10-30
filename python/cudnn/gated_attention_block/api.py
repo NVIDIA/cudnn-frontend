@@ -7237,6 +7237,9 @@ class _Indexer(_PlanConstants, _Stage):
         self.fp8 = self.cache_dtype == INDEX_CACHE_E4M3
         self._q8 = self._k8 = None  # the two cast recipes (fp8 only; _k8 None when S < block_size: no complete block)
         self._one = None  # the casts' scale word, the plan constant 1.0 (fp8 only): self._const["one"] once compiled
+        # the two compress chains' rounding points (QsaSpec.index_compress_rounding): a compile key of BOTH recipes below -- the pool-4 key
+        # compress and the pool-1 query compress -- so a declaration's attribute reaches every row this form writes (the slots and the caller's cache)
+        self.rounding = str(q.index_compress_rounding)
 
     def launches_per_execute(self, cache: bool) -> int:
         """Launches one ``execute`` issues: the cache compress iff a caller passes ``index_k_compressed``; past the identity
@@ -7283,7 +7286,13 @@ class _Indexer(_PlanConstants, _Stage):
         b, s, t, top_k, dev = self.batch, self.seq_len, self.batch * self.seq_len, q.top_k, self.device
         # The key compress: block_size rows per compressed key; the per-batch lengths traced iff declared (the artifact folds the load).
         self._k_recipe = compile_qsa_compress(
-            dtype=self.dtype, d=q.index_head_dim, rope_dim=g.rope_dim, pool=q.block_size, has_seq_lens=self.seq_lens_present, table_dtype=self.dtype
+            dtype=self.dtype,
+            d=q.index_head_dim,
+            rope_dim=g.rope_dim,
+            pool=q.block_size,
+            has_seq_lens=self.seq_lens_present,
+            table_dtype=self.dtype,
+            rounding=self.rounding,
         )
         if self.fp8:
             from .kernels.quantize import compile_quantize
@@ -7313,7 +7322,9 @@ class _Indexer(_PlanConstants, _Stage):
             self._const_ready.record(torch.cuda.current_stream(dev))  # behind the allocations (a deterministic-mode fill included)
             return
         # The query norm + RoPE: pool = 1, batch = token, block = head; no per-batch lengths (every token's queries are normed).
-        self._q_recipe = compile_qsa_compress(dtype=self.dtype, d=q.index_head_dim, rope_dim=g.rope_dim, pool=1, has_seq_lens=False, table_dtype=self.dtype)
+        self._q_recipe = compile_qsa_compress(
+            dtype=self.dtype, d=q.index_head_dim, rope_dim=g.rope_dim, pool=1, has_seq_lens=False, table_dtype=self.dtype, rounding=self.rounding
+        )
         from .kernels.qsa_canonical_list import compile_qsa_canonical_list
 
         # the canonical order in place on ix_ids (the counts are the plan's: block_lens_out stays the DtoD copy of that constant)
@@ -7632,6 +7643,9 @@ class _IndexerDecode(_Stage):
         self._run_topk = None  # the kernel module's runner (imported behind the facade's gate)
         self._q_recipe = None  # unfused: the pool-1 query norm + RoPE
         self._step = None  # unfused: {slot dtype: the paged step recipe}
+        # the compress chains' rounding points (QsaSpec.index_compress_rounding): a compile key of the unfused arm's two recipes (the pool-1
+        # query compress, the step form); the fused arm carries it in the block's QsaPrepareIndexArms record
+        self.rounding = str(q.index_compress_rounding)
         self.launches = 0  # launches issued so far (a test pin; the block never reads it)
 
     @property
@@ -7741,7 +7755,14 @@ class _IndexerDecode(_Stage):
             from .kernels.qsa_compress import compile_qsa_compress, compile_qsa_compress_step
 
             self._q_recipe = compile_qsa_compress(
-                dtype=self.dtype, d=q.index_head_dim, rope_dim=g.rope_dim, pool=1, has_seq_lens=False, table_dtype=self.dtype, out_dtype=self.cache_dtype
+                dtype=self.dtype,
+                d=q.index_head_dim,
+                rope_dim=g.rope_dim,
+                pool=1,
+                has_seq_lens=False,
+                table_dtype=self.dtype,
+                out_dtype=self.cache_dtype,
+                rounding=self.rounding,
             )
             self._step = {
                 sd: compile_qsa_compress_step(
@@ -7756,6 +7777,7 @@ class _IndexerDecode(_Stage):
                     ring_slots=self.ring_slots,
                     ring_slot_dtype=sd,
                     index_cache_dtype=self.cache_dtype,
+                    rounding=self.rounding,
                 )
                 for sd in (torch.int32, torch.int64)
             }
@@ -8030,7 +8052,7 @@ class _IndexerExtend(_PlanConstants, _Stage):
                 f"{q.block_size} x n_blocks_max = {q.block_size * self.n_blocks_max} tokens) -- the compact-logits guard needs S_q <= max_pages x P"
             )
         self.use_pdl = bool(use_pdl)
-        # the select WINDOW PLAN (host ints): the window rows, the windows, the pieces; the gather's precondition on every piece (M1)
+        # the select WINDOW PLAN (host ints): the window rows, the windows, the pieces; the gather's precondition on every piece
         self.window_rows, self.windows, self.pieces, self.piece_table = _extend_window_plan(
             self.batch, self.seq_len, self.n_blocks_max, QSA_EXTEND_SELECT_BUDGET_BYTES
         )
@@ -10159,6 +10181,7 @@ class GatedAttentionBlockFwd(APIBase):
                     paged=True,
                     ring_slots=self.index_state_slot_mapping_present,
                     rope_table=self.rope_position_tables_only,
+                    rounding=str(q.index_compress_rounding),  # the query + compress arms' rounding points: the prepare artifact's compile key
                 )
             self._prepare = _QsaPrepare(
                 geometry,
@@ -10735,6 +10758,17 @@ class GatedAttentionBlockFwd(APIBase):
         self._check_index_side_caches(
             index_kv_cache, index_state_cache, index_state_block_table, dev, prefix="", ring_slots=self.index_state_slot_mapping_present
         )
+        if self.indexer_extend:
+            # the EXTEND step's cache-write ring arm compiled the DECLARED sample's cap in (the ring viewed as a pool of page_size = cap), so a
+            # ring of another cap -- legal by the floor above -- is refused HERE, before the indexer stage writes the cache and the pools (a
+            # refusal modifies nothing); the kernel's own check inside the ring-arm launch would come after those writes
+            cap_declared, cap_given = int(self._descs["index_state_cache"].shape[1]), int(index_state_cache.shape[1])
+            if cap_given != cap_declared:
+                raise ValueError(
+                    f"index_state_cache has cap={cap_given} rows per ring block, but the extend step was declared on a ring sample of cap={cap_declared}: "
+                    "the cache-write ring arm compiled the declared cap in, so a ring of another cap is refused before any stage runs -- declare the "
+                    "block on a sample of the ring it will execute with"
+                )
         for nm, x in (("index_kv_cache", index_kv_cache), ("index_state_cache", index_state_cache)):
             if int(x.data_ptr()) % 16:
                 raise ValueError(

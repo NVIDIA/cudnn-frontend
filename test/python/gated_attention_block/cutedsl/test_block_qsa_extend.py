@@ -11,10 +11,12 @@ decode step reads, with ONE rounding convention (``QsaSpec.index_compress_roundi
 Host cells (any device, no host sync): the declaration facts (the route ``"auto"`` -> the decode step inside the decode scorer's query-row
 envelope and the extend step past it, the pins, the stage in the indexer's slot, the cache write's ring arm, ``fuse_prepare`` reading False,
 the window plan), the carve (the nine slots at the END after the caller-list band carve, every slot 16-byte aligned, every layout without
-the form byte-identical), the M1 precondition on the piece table, the typed declines (every new row raised with its text EQUAL to the
+the form byte-identical), the gather's piece-table precondition, the typed declines (every new row raised with its text EQUAL to the
 envelope's -- the chunk-rows row the envelope's text + the two numbers --, the ``indexer_query_rows`` row kept under the explicit ``"decode"``
-pin, the vocabulary / off-form / rounding refusals, the execute refusals, a simulated cc 10.0 / 10.3 reading declined by the sparse part
-statement), the envelope's new facts and the append-only tail of ``DecodeEnvelope``.
+pin, the vocabulary / off-form / rounding refusals, the execute refusals incl. a ring whose cap differs from the declared sample's, a simulated
+cc 10.0 / 10.3 reading declined by the sparse part statement), the envelope's new facts and the append-only tail of ``DecodeEnvelope``, and the
+rounding attribute's reach: EVERY writer of an indexer row (the prefill form, the decode step unfused and fused, the extend step) carries the
+declared value, the prefill form's ``compile()`` handing it to the compress recipe.
 
 Rubin cells (``requires_rubin``): the EXTEND ladder against the TWO-STAGE oracle of the decode module (``_IndexerCase``, here subclassed: the
 prefix built from the oracle's own raw band -- the prefix blocks compressed into the paged cache, the ring primed with the last ``cap``
@@ -25,7 +27,7 @@ from the kernel's ``ix_counts``): chunk starts at every residue (incl. residue 2
 the 128K-token reach, the e4m3 cache twins, the 24 / 2 geometry; the SET == the fp64 top-k of the block's OWN ``(ix_q, kbar)`` up to ties;
 EVERY complete block of the stream bitwise a from-scratch compress after the chunk (the primed prefix untouched); the ring = the last ``cap``
 positions bitwise the stream's raw band, every other slot untouched; ``out`` / the gated O / the LSE within the module's bars; two executes
-bitwise with the side caches restored (F12); the extend pin at decode widths vs the decode form on the same inputs (the same function within
+bitwise with the side caches restored; the extend pin at decode widths vs the decode form on the same inputs (the same function within
 the budget, never bitwise); cache parity under both roundings (``"hf"`` additionally against the HF-rounding oracle with the kernel module's
 statistic gate); the device-value contract (the dead sequence exact; ``-2`` on ``0 < kv_lens < S_q``; ``-3`` past the table's reach with the
 sentinel past every piece's compact slab and past ``get_workspace_size()`` untouched); the workspace honesty + no allocation / no host sync
@@ -332,7 +334,7 @@ class _IndexerExtendCase(_qsa._IndexerCase):
         self._compress = {}
         self._snap = None
 
-    # -- the side caches between executes (F12): the chunk's tail write overwrites ring slots the straddling block reads, so two executes
+    # -- the side caches between executes: the chunk's tail write overwrites ring slots the straddling block reads, so two executes
     # are bitwise only with the side caches RESTORED in between
     def snapshot(self):
         self._snap = (self.index_kv_cache.clone(), self.index_state_cache.clone())
@@ -541,7 +543,7 @@ class _IndexerExtendCase(_qsa._IndexerCase):
 
 
 def _two_launches_extend(case: _IndexerExtendCase, what: str) -> dict:
-    """Two executes with the side caches restored in between (F12) are bitwise on ``out``, the gated O, the LSE, the list, the cache and the ring;
+    """Two executes with the side caches restored in between are bitwise on ``out``, the gated O, the LSE, the list, the cache and the ring;
     then the two-stage oracle."""
     case.restore()
     a = case.run().clone()
@@ -584,8 +586,8 @@ def test_extend_declaration_facts_route_carve_and_window_plan():
     arm (no raw-key pool arm), the per-row list, no PDL names; the ``"extend"`` pin at decode widths (``S_q`` 1 .. 4, cap 3) builds the same stage, the
     ``"decode"`` pin keeps the decode step; the carve = the caller-list band block's + the nine slots at the END in launch order (``ix_cand`` last),
     every slot 16-byte aligned, every bf16 / e4m3 layout without the form byte-identical to the band block's; the window plan's arithmetic (one
-    window at the default budget, the pieces one per sequence, ``R`` floored at 16 and capped at ``T``, two windows at a lowered budget) and the M1
-    precondition (a malformed piece table is a ``RuntimeError`` naming the piece)."""
+    window at the default budget, the pieces one per sequence, ``R`` floored at 16 and capped at ``T``, two windows at a lowered budget) and the gather's
+    piece-table precondition (a malformed piece table is a ``RuntimeError`` naming the piece)."""
     with _no_host_sync():
         for s_q, batch in ((17, 1), (128, 2), (300, 1)):
             blk = _declare_extend(GEOM_SMALL, batch, s_q, form=QSA_INDEX_SELECT_FORM_AUTO, n_pages=32)
@@ -692,7 +694,9 @@ def test_extend_typed_declines_equal_the_envelope_row_by_row_and_the_accept_cell
     under the explicit ``"decode"`` pin past the envelope (and ``"auto"`` past it SERVES: the extend stage built); ``cap 2`` refused and ``cap 3`` served
     on the extend form; ``S_q > max_kv_len`` refused naming both numbers; ``fuse_prepare=True`` / ``rope_position_tables_only=True`` /
     ``index_state_slot_mapping_present=False`` with their OWN texts; the vocabulary and a pin off the form (``ValueError``); the rounding attribute's
-    rows; the execute refusals on an uncompiled block; a simulated cc 10.0 / 10.3 reading declined by the sparse part statement at ``check_support``."""
+    rows; the execute refusals on an uncompiled block (incl. a ring whose cap differs from the declared sample's: legal by the ring floor, refused
+    before any stage because the cache-write ring arm compiled the declared cap in); a simulated cc 10.0 / 10.3 reading declined by the sparse part
+    statement at ``check_support``."""
     import re
 
     env = GatedAttentionBlockFwd.serving_envelope(_declare_extend().geom, BF16, _DEV, device_cc=_SM107).decode
@@ -788,6 +792,11 @@ def test_extend_typed_declines_equal_the_envelope_row_by_row_and_the_accept_cell
             (dict(n_commit=i32(1)), "n_commit .* is refused"),
             (dict(index_state_slot_mapping=None), "execute needs index_state_slot_mapping"),
             (dict(index_k_raw=mk(8, 16, 128)), "index_k_raw is the raw indexer key's pool of a caller-list band declaration"),
+            # a ring of cap 8 where the sample had cap 4: past the floor (>= 3) and every stride rule, refused by the declared cap before any stage
+            (
+                dict(index_state_cache=mk(2, 8, 1, 128)),
+                "index_state_cache has cap=8 rows per ring block, but the extend step was declared on a ring sample of cap=4",
+            ),
         ):
             kw = dict(base)
             kw.update(over)
@@ -803,6 +812,47 @@ def test_extend_typed_declines_equal_the_envelope_row_by_row_and_the_accept_cell
             mp.setattr(api_mod, "_device_cc_of", lambda device, _cc=cc: _cc)
             with pytest.raises(NotImplementedError, match=rf"sparse forms .* served on cc 10\.7 \(Rubin\) only.*found SM{cc[0]}{cc[1]}"):
                 _declare_extend().check_support()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the prefill form's compile() allocates its plan constants on a CUDA device")
+def test_every_indexer_writer_carries_the_declared_rounding(monkeypatch):
+    """``QsaSpec.index_compress_rounding`` reaches EVERY writer of an indexer row, not the extend step alone (the attribute is a declaration fact the
+    docs and the tracker state for the prefill form, the decode step and the fused prepare's arms -- a stack that declares ``"hf"`` for its
+    chunked prefill and its decode steps must get ONE chain): on a host declaration under both conventions the prefill form's stage
+    (``_Indexer``), the decode step's unfused stage (``_IndexerDecode``), the fused prepare's ``QsaPrepareIndexArms`` record and the extend step's
+    stage each carry the declared value; and the prefill form's ``compile()`` below the identity bound (its one compress recipe stubbed to a
+    sentinel, the plan constants it builds allocated on this device) hands ``rounding=`` to ``compile_qsa_compress`` -- the cell that is red when a
+    stage compiles the default chain whatever the declaration says.  The device cells (the e2e module's chunked prefill + decode steps and its
+    prefill-form cell, both parametrised over the roundings) pin the rows those recipes write."""
+    import cudnn.gated_attention_block.kernels.qsa_compress as compress_mod
+    from cudnn.gated_attention_block.api import _Indexer
+
+    geom_kw = GEOM_SMALL
+    mk = lambda *shape: torch.empty(*shape, dtype=BF16, device=_DEV)  # noqa: E731
+    ones = lambda: torch.ones(D, dtype=BF16, device=_DEV)  # noqa: E731
+
+    def prefill_block(rounding, s_q=8):
+        geom = GatedAttentionBlockGeometry(**geom_kw, qsa=QsaSpec(index_source="indexer", index_band=True, index_compress_rounding=rounding))
+        return GatedAttentionBlockFwd(mk(1, s_q, 512), mk(5760, 512), ones(), ones(), mk(1, s_q, ROPE), mk(1, s_q, ROPE), mk(512, 2048), mk(1, s_q, 512), geom)
+
+    seen = []
+    monkeypatch.setattr(compress_mod, "compile_qsa_compress", lambda **kw: seen.append(dict(kw)) or object())
+    with _no_host_sync():
+        for rounding in INDEX_COMPRESS_ROUNDINGS:
+            over = dict(index_compress_rounding=rounding)
+            # the extend step, the decode step (unfused: the stage's two recipes; fused: the prepare record the launch is traced from)
+            assert _declare_extend(qsa_over=over)._indexer_extend.rounding == rounding
+            off = _qsa._declare_indexer(geom_kw, 1, 1, cap=4, qsa_over=over, fuse_prepare=False)
+            on = _qsa._declare_indexer(geom_kw, 1, 1, cap=4, qsa_over=over, fuse_prepare=True)
+            assert isinstance(off._indexer_decode, _IndexerDecode) and off._indexer_decode.rounding == rounding and off._prepare is None
+            assert on._indexer_decode.fused and on._prepare is not None and on._prepare._index_arms().rounding == rounding
+            # the prefill form: the stage's attribute, then its compile() below the identity bound -- the one compress recipe is the key compress
+            blk = prefill_block(rounding)
+            assert isinstance(blk._indexer, _Indexer) and blk._indexer.rounding == rounding and not blk._indexer.selects
+            n0 = len(seen)
+            blk._indexer.compile()
+            assert len(seen) == n0 + 1 and seen[-1]["pool"] == BS and seen[-1]["rounding"] == rounding, seen[n0:]
+    assert [kw["rounding"] for kw in seen] == list(INDEX_COMPRESS_ROUNDINGS)
 
 
 def test_extend_envelope_facts_are_published_and_the_tail_is_append_only(monkeypatch):

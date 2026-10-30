@@ -73,7 +73,15 @@ if requirement_error:
 
 pytestmark = pytest.mark.L0
 
-from cudnn.gated_attention_block import KV_SOURCE_PAGED, GatedAttentionBlockFwd, GatedAttentionBlockGeometry, QsaSpec, index_k_raw_view  # noqa: E402
+from cudnn.gated_attention_block import (  # noqa: E402
+    INDEX_COMPRESS_ROUNDING_DEFAULT,
+    INDEX_COMPRESS_ROUNDINGS,
+    KV_SOURCE_PAGED,
+    GatedAttentionBlockFwd,
+    GatedAttentionBlockGeometry,
+    QsaSpec,
+    index_k_raw_view,
+)
 from cudnn.gated_attention_block.api import _cols, _SparseSdpa, _view  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -186,15 +194,23 @@ def _run(
     indexer_outputs=False,
     fuse_gate=False,
     index_cache_dtype=None,
+    index_compress_rounding=INDEX_COMPRESS_ROUNDING_DEFAULT,
 ) -> _Cell:
     """Declare, check, compile and run a QsaSpec block ``launches`` times on sentinel-filled outputs; the oracle on the same
     inputs and list.  ``lists`` overrides the generated ``(block_ids, block_lens)``; ``inp`` / ``ref`` reuse another cell's.
     ``indexer=True`` declares ``index_source="indexer"`` (the band implied): the block derives the selection and the oracle
     runs on the KERNEL's list (``ix`` records it); ``indexer_outputs`` hands the three optional caller buffers in;
     ``fuse_gate`` folds stage (5) into the sparse core's epilogue (the gated O is then the SDPA's own output in the same slot);
-    ``index_cache_dtype`` (appended) declares the indexer cache's dtype (``torch.float8_e4m3fn`` = the fp8 indexer cache)."""
+    ``index_cache_dtype`` (appended) declares the indexer cache's dtype (``torch.float8_e4m3fn`` = the fp8 indexer cache);
+    ``index_compress_rounding`` (appended) the indexer compress chains' rounding points (``QsaSpec.index_compress_rounding``)."""
     band = index_band or indexer
-    qsa = QsaSpec(top_k=top_k, index_band=band, index_source="indexer" if indexer else "caller", index_cache_dtype=index_cache_dtype)
+    qsa = QsaSpec(
+        top_k=top_k,
+        index_band=band,
+        index_source="indexer" if indexer else "caller",
+        index_cache_dtype=index_cache_dtype,
+        **({} if not indexer else dict(index_compress_rounding=index_compress_rounding)),  # refused under caller lists off the default
+    )
     ref_geom = RefQsaGeometry(**geom_kw, qsa=RefQsaSpec(top_k=top_k, index_band=band))
     geom = GatedAttentionBlockGeometry(**geom_kw, qsa=qsa)
     if inp is None:
@@ -1228,6 +1244,68 @@ def test_indexer_e4m3_cache_block_matches_the_two_stage_oracle_and_the_bf16_bloc
 
 
 @requires_rubin
+@pytest.mark.parametrize("cache_dtype", [None, E4M3], ids=["bf16", "e4m3"])
+@pytest.mark.parametrize("rounding", INDEX_COMPRESS_ROUNDINGS)
+def test_indexer_prefill_form_writes_the_declared_rounding_bitwise(rounding, cache_dtype):
+    """The PREFILL form (``kv_source="self"``, ``index_k_compressed`` out) under ``QsaSpec.index_compress_rounding``: the block's compressed keys
+    -- the caller's cache AND the workspace slot -- and its indexer queries (the ``ix_q`` slot) are BITWISE the compress kernel compiled with the
+    SAME attribute over the block's OWN raw band (the slab's index band read back from the workspace: the FROST GEMM's rows, so the chain alone is
+    under test), under both conventions and both cache dtypes (e4m3: the cast kernel's rows = the compress kernel's e4m3 store arm, the e4m3 cast of
+    the once-rounded bf16 row) -- red for ``"hf"`` when the form compiles the default chain whatever the declaration says.  The attention over the
+    list is the sibling cells'; this cell pins the WRITERS."""
+    from cudnn.gated_attention_block.kernels.qsa_compress import compile_qsa_compress, run_qsa_compress
+
+    geom_kw, B, S = GEOM_SMALL, 1, 2560  # past the identity bound (2051): the queries, the compressed keys and the scorer run
+    c = _run(geom_kw, B, S, indexer=True, indexer_outputs=True, seed=29, launches=1, ref=(), index_cache_dtype=cache_dtype, index_compress_rounding=rounding)
+    geom, inp, ix = c.geom, c.inp, c.ix
+    q = geom.qsa
+    assert ix["selects"] and c.blk._indexer.rounding == rounding
+    cd = BF16 if cache_dtype is None else cache_dtype
+    t, h_i, d_i, nb = B * S, q.index_heads, q.index_head_dim, S // BS
+    lay = c.blk._layout()
+    proj = _view(c.ws, lay.proj, (t, geom.n_qkvg), BF16)
+    k_raw = index_k_raw_view(proj, geom, B, S)[:, :, 0]  # [B, S, d_i]: the kernel's own raw indexer key band
+    q_raw = torch.as_strided(proj, (t, h_i, d_i), (geom.n_qkvg, d_i, 1), proj.storage_offset() + geom.qkvg_offsets[4])  # [T, H_i, d_i]
+    cos_q = inp["cos"].reshape(t, 1, geom.rope_dim).expand(t, h_i, geom.rope_dim)  # pool 1: batch = token, block = head (the stage's own launch form)
+    sin_q = inp["sin"].reshape(t, 1, geom.rope_dim).expand(t, h_i, geom.rope_dim)
+    eps, stream = float(q.index_norm_eps), torch.cuda.current_stream().cuda_stream
+
+    def compress(x, w, cos, sin, pool, out_dtype):  # the from-scratch compress under THIS cell's attribute
+        rec = compile_qsa_compress(
+            dtype=BF16, d=d_i, rope_dim=geom.rope_dim, pool=pool, has_seq_lens=False, table_dtype=BF16, out_dtype=out_dtype, rounding=rounding
+        )
+        out = torch.full((int(x.shape[0]), int(x.shape[1]) // pool, d_i), float("nan"), device="cuda", dtype=out_dtype)
+        run_qsa_compress(rec, x.contiguous(), out, w, cos, sin, None, eps=eps, norm_weight_offset=0.0, stream=stream)
+        torch.cuda.synchronize()
+        return out
+
+    bits = (lambda x: x.contiguous().view(torch.uint8)) if cd == E4M3 else _bits  # noqa: E731
+    kb16, qi16 = compress(k_raw, inp["w_ik_norm"], inp["cos"], inp["sin"], BS, BF16), compress(q_raw, inp["w_iq_norm"], cos_q, sin_q, 1, BF16)
+    assert torch.equal(_bits(ix["kbar"]), _bits(kb16)), f"{rounding}: the compressed-key slot is not the from-scratch compress under the attribute"
+    assert torch.equal(_bits(ix["qi"]), _bits(qi16)), f"{rounding}: the query slot is not the from-scratch pool-1 compress under the attribute"
+    kb, qi = (
+        (kb16, qi16)
+        if cd == BF16
+        else (compress(k_raw, inp["w_ik_norm"], inp["cos"], inp["sin"], BS, cd), compress(q_raw, inp["w_iq_norm"], cos_q, sin_q, 1, cd))
+    )
+    assert torch.equal(bits(ix["kbar_out"][:, :nb]), bits(kb)), f"{rounding} / {cd}: the caller's cache is not the from-scratch compress under the attribute"
+    assert torch.isnan(ix["kbar_out"][:, nb:].float()).all(), "a row past the prompt's complete blocks was written"
+    if cd == E4M3:
+        assert torch.equal(bits(ix["kbar8"]), bits(kb)) and torch.equal(bits(ix["qi8"]), bits(qi)), f"{rounding}: the e4m3 scorer operands"
+    # the two conventions are different functions on these rows (the attribute is not a no-op): the other chain's compress differs somewhere
+    other = [r for r in INDEX_COMPRESS_ROUNDINGS if r != rounding][0]
+    rec_o = compile_qsa_compress(dtype=BF16, d=d_i, rope_dim=geom.rope_dim, pool=BS, has_seq_lens=False, table_dtype=BF16, out_dtype=BF16, rounding=other)
+    kb_o = torch.full_like(kb16, float("nan"))
+    run_qsa_compress(rec_o, k_raw.contiguous(), kb_o, inp["w_ik_norm"], inp["cos"], inp["sin"], None, eps=eps, norm_weight_offset=0.0, stream=stream)
+    torch.cuda.synchronize()
+    frac = float((_bits(kb_o) == _bits(kb16)).float().mean())
+    assert frac < 1.0, f"the {other!r} chain is bitwise the {rounding!r} chain on {nb} blocks -- the attribute would be untestable here"
+    print(
+        f"\n{rounding} / {cd}: {nb} compressed keys + {t * h_i} query rows bitwise the from-scratch compress; {100 * frac:.2f} % of the keys' elements equal the {other!r} chain's"
+    )
+
+
+@requires_rubin
 def test_indexer_e4m3_cache_execute_captured_replays_bitwise_eager():
     """The replay pin of the fp8 indexer cache: a FRESH e4m3-indexer declaration runs ONE eager execute on a new stream (the FROST GEMM's
     graph route creates its handle there -- the route's own capture rule), then its next execute is captured in ``torch.cuda.graph`` on
@@ -2184,9 +2262,10 @@ def _decode_indexer_block(geom, inp, s_q, *, ps, k_cache, v_cache, table, icache
 
 
 @requires_rubin
+@pytest.mark.parametrize("rounding", INDEX_COMPRESS_ROUNDINGS)
 @pytest.mark.parametrize("cache_dtype", [None, E4M3], ids=["bf16", "e4m3"])
 @pytest.mark.parametrize("fuse_prepare", [False, True], ids=["unfused", "fused"])
-def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache(fuse_prepare, cache_dtype):
+def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache(fuse_prepare, cache_dtype, rounding):
     """The multi-step serving chain on ONE token stream, every writer the block's own (2026-10-29): a 301-token prompt as FOUR CHUNKS
     ``[125, 2, 1, 173]`` through the in-block indexer's EXTEND step over the pools (the first chunk IS the ``P = 0`` prefill through the serving
     caches; the chunk starts sit at residues 0 / 1 / 3 / 0 of the block grid; the two chunks shorter than ``cap = 8`` carry the ring's tail through
@@ -2205,7 +2284,10 @@ def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache
     a re-stepped block are one chain.  Both knob readings of the decode steps (the chunks are always unfused).  Under the e4m3 indexer cache
     (``cache_dtype`` e4m3): the chunks' and the steps' rows STORE e4m3 directly (the compress kernels' e4m3 store arm) and after every chunk /
     step the cache's rows are BITWISE a from-scratch e4m3 compress of the stream (``compile_qsa_compress(out_dtype=e4m3)``) -- the chunk form,
-    the step form and the fused prepare share ONE rounding convention; the ring stays bf16."""
+    the step form and the fused prepare share ONE rounding convention; the ring stays bf16.  Under BOTH values of
+    ``QsaSpec.index_compress_rounding`` (``rounding``): the chunks (the extend step), the decode steps (unfused and fused) and the from-scratch
+    compress are compiled with the SAME attribute, so a writer that compiled the default chain whatever the declaration says leaves rows the
+    from-scratch ``"hf"`` compress does not reproduce -- the cell is red for ``"hf"`` the moment one writer drops the attribute."""
     import test_block_qsa_decode as _qsa
     from cudnn.gated_attention_block.kernels.qsa_compress import compile_qsa_compress, run_qsa_compress
 
@@ -2214,7 +2296,9 @@ def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache
     assert sum(chunks) == S0
     cd = BF16 if cache_dtype is None else cache_dtype
     geom = GatedAttentionBlockGeometry(
-        **geom_kw, causal_bottom_right=True, qsa=QsaSpec(top_k=top_k, index_source="indexer", index_band=True, index_cache_dtype=cache_dtype)
+        **geom_kw,
+        causal_bottom_right=True,
+        qsa=QsaSpec(top_k=top_k, index_source="indexer", index_band=True, index_cache_dtype=cache_dtype, index_compress_rounding=rounding),
     )
     ref_geom = RefGeometry(**geom_kw, causal_bottom_right=True)
     d_i, h_q, h_kv, d_model, D_ = geom.qsa.index_head_dim, geom.h_q, geom.h_kv, geom.d_model, geom.d_head
@@ -2237,7 +2321,7 @@ def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache
     icache = torch.full((n_pages, rpp, 1, d_i), float("nan"), device="cuda", dtype=cd)
     ring = torch.full((2, cap, 1, d_i), float("nan"), device="cuda", dtype=BF16)  # block 0 the null block
     ring_table = torch.tensor([[1]], dtype=torch.int32, device="cuda")
-    recipe = compile_qsa_compress(dtype=BF16, d=d_i, rope_dim=geom.rope_dim, pool=BS, has_seq_lens=False, table_dtype=BF16, out_dtype=cd)
+    recipe = compile_qsa_compress(dtype=BF16, d=d_i, rope_dim=geom.rope_dim, pool=BS, has_seq_lens=False, table_dtype=BF16, out_dtype=cd, rounding=rounding)
 
     def compress(k_raw):  # the from-scratch prefill compress of a raw-key stream [1, 4 nb, d_i] -> [1, nb, d_i] in the CACHE dtype
         out = torch.full((1, int(k_raw.shape[1]) // BS, d_i), float("nan"), device="cuda", dtype=cd)
@@ -2265,7 +2349,7 @@ def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache
         blk, ws = _extend_indexer_block(
             geom, inp, T, ps=ps, k_cache=k_cache, v_cache=v_cache, table=table, icache=icache, ring=ring, ring_table=ring_table, form=form
         )
-        assert blk._indexer_extend.n_blocks_max == max_pages * rpp and blk._indexer_extend.n_windows == 1
+        assert blk._indexer_extend.n_blocks_max == max_pages * rpp and blk._indexer_extend.n_windows == 1 and blk._indexer_extend.rounding == rounding
         pos = torch.arange(T, device="cuda") + pos0
         ref = gated_attention_block_reference(
             inp["h"][:, :Lf], inp["w_qkvg"][:n_dense], inp["w_q_norm"], inp["w_k_norm"], cos_all[:, :Lf], sin_all[:, :Lf], inp["w_o"], ref_geom
@@ -2305,7 +2389,7 @@ def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache
             sin_pos=sin_all,
         )
         torch.cuda.synchronize()
-        label = f"chunk {ci} T={T} pos {pos0}..{Lf - 1} form={form}"
+        label = f"chunk {ci} T={T} pos {pos0}..{Lf - 1} form={form} rounding={rounding}"
         v = blk._indexer_extend.views(ws, blk._ws)
         assert v["seqrep"].tolist() == [Lf // BS], f"{label}: the gather's report {v['seqrep'].tolist()}"
         counts = v["counts"].view(T)
@@ -2363,6 +2447,9 @@ def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache
     blk1, ws1 = _decode_indexer_block(geom, inp, 1, **common)
     blk4, ws4 = _decode_indexer_block(geom, inp, 4, **common)
     assert blk1._indexer_decode.n_blocks_max == blk4._indexer_decode.n_blocks_max == max_pages * rpp
+    # the decode writers carry the declared rounding: the unfused stage's recipes, or the fused prepare's arms record
+    for blk in (blk1, blk4):
+        assert blk._indexer_decode.rounding == rounding and (blk._prepare is None or blk._prepare._index_arms().rounding == rounding)
     # (3) the steps: (S_q, rows accepted)
     plan = [(1, 1), (1, 1), (1, 1), (1, 1), (4, 2), (4, 4), (4, 3), (4, 4)]
     L, h_acc, completed = S0, inp["h"].clone(), []
@@ -2407,7 +2494,7 @@ def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache
             sin_pos=sin_all,
         )
         torch.cuda.synchronize()
-        label = f"step {step} S_q={s_q} pos {pos0}..{Lf - 1} accept {n_acc} fuse_prepare={fuse_prepare}"
+        label = f"step {step} S_q={s_q} pos {pos0}..{Lf - 1} accept {n_acc} fuse_prepare={fuse_prepare} rounding={rounding}"
         # the counts rule (a completing row sees its own block), the list form
         counts = blk._indexer_decode.views(ws, blk._ws)["counts"].view(s_q)
         want = ((pos + 1) // BS).clamp(max=blk._indexer_decode.n_blocks_max).to(torch.int32)
