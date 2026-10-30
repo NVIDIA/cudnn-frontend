@@ -4201,7 +4201,32 @@ on cc 10.0 and cc 10.7 (the model on the same form's ungated bf16 O: every form,
 input itself, the walk geometries, saturation, the strided element path, the PDL arm, the boundary cell reading 52 where the single mode
 reads 48, the adapter's lean and tcgen05 routes; the histogram against the model and the single mode is the suite's record,
 `test_split_combine_gate_e4m3.py`) and bitwise against a serving stack's gate-and-quantize kernel on the exact-merge probe cells (36 of 36
-on both parts).  The single convention validated on the Rubin development class (every form of the entry -- AUTO / ON / OFF and the lean
+on both parts).
+**Measured cost of the staged convention (2026-10-30, Rubin 212-SM class; a per-form PERFORMANCE fact of the attribute, not a numerics
+change -- the bytes are the convention's on every form):** an exclusive 212-SM cc 10.7 GPU at the 2376 MHz lock, a serving stack's decode
+chain (its prep -> the lean tile `sparse_lean_d256_f16` at the served k -> the fused combine / sigmoid gate / e4m3 store) with a `staged`
+twin arm declared beside the `single` arm in the same process, 3 cells x 2 captured twins x AB/BA = 12 pooled cold-L2 windows per arm, 100
+launches per window, us per layer (speed-up `single / staged - 1`; every arm's oracles green before timing).  (a) The SERVED combine form
+of the lean decode route on cc 10.7 (form 0, the decode-grid kernel, `sparse_lean_combine_rule_cc`): at 1x1 p16 (one sequence x one token
+on page-16 pools, k 2) staged vs single is a TIE inside the noise at kv 256 / 1024 / 2048 -- 13.47 -> 13.63, 13.82 -> 14.03, 14.24 -> 14.30
+us, margins -0.16 / -0.21 / -0.06 us inside the 0.18 / 0.31 / 0.20 us noise; at 1x4 p32 (one sequence x four tokens on page-32 pools, k 1)
+staged costs 0.13 / 0.30 / 0.27 us per layer beyond the noise (14.50 -> 14.62, 15.10 -> 15.41, 15.23 -> 15.50 us; -0.9 / -2.0 / -1.8 %) =
+under 0.15 % of a decode step (0.3 us x 16 attention layers of a ~4 ms speculative step).  (b) FORCING the module's own combine forms
+(`DECODE_GRID_OFF`, form 2 -- the lean-wide specialization at one token, the plain `_combine_kernel` specialization at four; NOT the served
+form on cc 10.7, where the own forms are themselves 1.5-2 us slower than form 0 at 1x1 and ~12 us at 1x4): staged costs 1.47 / 1.18 / 1.18 us
+per layer at 1x1 (15.76 -> 17.23, 16.13 -> 17.31, 16.61 -> 17.79 us; -8.5 / -6.8 / -6.7 %) and 0.26 / 0.50 / 0.70 us at 1x4 (-1.0 / -1.8 /
+-2.5 %), beyond the 0.16-0.26 us noise in every cell -- the pre-merge review of #2066 predicted a cost on these forms from the staged
+rendering's resource usage on sm_100a (the plain `_combine_kernel`: REG 112 -> 128, a 16-byte stack frame, two spills, eight extra
+subroutine calls = the `div.rn.f32` slow paths of the eight sigmoid divisions; the decode-grid, decode and lean-walk kernels add no register,
+frame or spill); the bitwise contract with the serving stack's kernel pins `div.rn` + two `cvt.rn.bf16` per element, so only scheduling /
+live-range changes could remove the cost.  GUIDANCE: prefer `single` on a declaration whose combine resolves to the module's own forms
+(S_q >= 3 under OFF, AUTO past the lean-block bound, cc 10.3) until the staged arithmetic is rescheduled; the served decode-grid form
+carries no measurable cost at 1x1 (the lean group walk, not in the timed cells, adds nothing under staged by its resource lines).  End to
+end on the same class (a serving stack's decode, fresh servers, median TPOT, the stack's `staged` default against `single` as the control):
+no bucket was slower under staged (plain 1x1 +0.09 %, speculative verify 1x4 +0.06 %, ties inside the band), while the acceptance-length
+gap of the speculative verify bucket closed only by a third (2.857 -> 2.884 against the stack's own 2.930) because the remainder is the
+attention core's accumulation order, which no convention of the store removes.
+The single convention validated on the Rubin development class (every form of the entry -- AUTO / ON / OFF and the lean
 group walk -- against
 the unfused twin, the walk at two walk-selected geometries, the f16 underflow boundary of the twin claim, the saturation at +-448, the strided
 element path, the PDL arm; the adapter's lean
