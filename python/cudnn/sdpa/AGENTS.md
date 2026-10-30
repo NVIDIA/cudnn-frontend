@@ -547,6 +547,12 @@ are invalid even when their immediate register counts match. Repeated CUDA
 Graph replay and sanitizer checks are also required; a single launch cannot
 establish liveness. See the [PTX setmaxnreg contract](https://docs.nvidia.com/cuda/parallel-thread-execution/#miscellaneous-instructions-setmaxnreg).
 
+`test_sdpa_fp8_sm107.py::TestNativeHalfRegisterRelease` cross-compiles the
+D32/D64/D128 half body, including packed Stats and three softmax warpgroups,
+and counts the two common release sites (correction and service groups).
+The selected SM107 CI entry collects these checks; they also cross-compile
+from other architectures when the installed tools support the target.
+
 
 **Rule S14 — Empty work must retain the buffer-acquisition acknowledgment.**
 

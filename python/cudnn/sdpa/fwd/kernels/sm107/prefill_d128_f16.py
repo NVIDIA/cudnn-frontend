@@ -1239,6 +1239,12 @@ def _kernel(
     softmax_regs = 184 if cutlass.const_expr(packed_stats_regs) else CFG.SOFTMAX_REGS
     other_regs = 56 if cutlass.const_expr(packed_stats_regs) else CFG.OTHER_REGS
 
+    # MMA, TMA load/store and scheduler occupy one complete warpgroup.
+    # setmaxnreg is warpgroup-collective: release at one common instruction
+    # before those four warps take their individual role branches.
+    if warp_idx >= CFG.MMA_WARP_ID:
+        nvvm.setmaxregister(other_regs, nvvm.SetMaxRegisterAction.DECREASE)
+
     # === Per-warp role dispatch ===
     if warp_idx >= CFG.SOFTMAX_WG0_BASE and warp_idx < CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS:
         nvvm.setmaxregister(softmax_regs, nvvm.SetMaxRegisterAction.INCREASE)
@@ -1379,7 +1385,6 @@ def _kernel(
 
     elif warp_idx == CFG.MMA_WARP_ID:
         # Under cga2 the non-leader CTA runs the quiet body (alloc + dealloc only).
-        nvvm.setmaxregister(other_regs, nvvm.SetMaxRegisterAction.DECREASE)
         if cutlass.const_expr(CFG.CTA_MMA == 2):
             if is_leader:
                 _mma_warp_group(
@@ -1425,7 +1430,6 @@ def _kernel(
             )
 
     elif warp_idx == CFG.TMALDG_WARP_ID:
-        nvvm.setmaxregister(other_regs, nvvm.SetMaxRegisterAction.DECREASE)
         nvvm.prefetch_tensormap(tma_q_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_k_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_v_desc.get_ptr())
@@ -1467,7 +1471,6 @@ def _kernel(
         )
 
     elif warp_idx == CFG.TMASTG_WARP_ID:
-        nvvm.setmaxregister(other_regs, nvvm.SetMaxRegisterAction.DECREASE)
         _tmastg_warp_group(
             tma_o_desc=tma_o_desc,
             sO=sO,
@@ -1487,7 +1490,6 @@ def _kernel(
         )
 
     else:  # warp_idx == CFG.SCHED_WARP_ID
-        nvvm.setmaxregister(other_regs, nvvm.SetMaxRegisterAction.DECREASE)
         # try_cancel.multicast::cluster::all — only (0,0,0) CTA issues; at cga1
         # cta_id_x == 0 always, so flag is 1 unconditionally.
         is_cga_first_cta = (bias_mcast_rank == cutlass.Int32(0)) if cutlass.const_expr(_BIAS_MCAST) else (cta_id_x == cutlass.Int32(0))

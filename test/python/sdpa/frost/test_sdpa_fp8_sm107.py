@@ -26,6 +26,14 @@ pytestmark = [pytest.mark.L0, requires_dsl]
 _E4M3, _BF16_OUT = 0, 2
 
 
+class TestNativeHalfRegisterRelease:
+    """Cross-compile the half kernel through the selected SM107 CI entry."""
+
+    from sm107_register_release_checks import test_service_warpgroup_has_one_register_release as _release
+
+    test_service_warpgroup_has_one_register_release = staticmethod(_release)
+
+
 @pytest.fixture(autouse=True)
 def _mock_target_for_cross_arch_contracts(monkeypatch):
     # This module tests Rubin metadata on non-Rubin hosts too. Match its fake
