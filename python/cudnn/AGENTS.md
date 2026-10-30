@@ -744,33 +744,55 @@ read by the family's analyzer under the spelling of EVERY op that takes it.**
 
 ## Frontend-only kernel package layout
 
-```
-python/cudnn/<operation>/            # or sdpa/<direction>/, gemm/cutedsl/<layout>/<fusion>/
-├── __init__.py                      # exports the public functions via __all__
-├── api.py                           # <op>_<direction>() / <op>_<direction>_jax() functions
-└── <kernel_module>.py               # CuTeDSL kernel implementation(s); some families use csrc/ per-arch trees
+Organize kernels by operation, then backend, then GPU architecture where needed.
+Keep shared public functions in the operation's `api.py` and backend-independent
+operation contracts in `ops.py` (or an `ops/` package for multiple modules).
+
+```text
+python/cudnn/
+├── <op0>/
+│   ├── __init__.py                  # lazy public exports
+│   ├── api.py                      # shared public functions
+│   ├── ops.py                      # backend-independent operation contracts
+│   ├── <backend0>/
+│   │   ├── sm_x/                   # kernels for one architecture family
+│   │   └── sm_y/
+│   └── <backend1>/
+└── <op1>/
+    ├── __init__.py
+    ├── api.py
+    ├── ops.py
+    ├── <backend0>/
+    └── <backend1>/
 ```
 
-All GEMM fusions live under `gemm/`, grouped by how the operands are laid out:
+Use backend names such as `frost` and `cutedsl`, and architecture names such as
+`sm100` and `sm120`. Backend-specific API adapters and layout/fusion subpackages
+stay inside their backend.
 
-```
+For example, `gemm/frost/` and `gemm/cutedsl/` are sibling backends. `frost/` uses
+architecture subdirectories; `cutedsl/` groups fusions by operand layout:
+
+```text
 python/cudnn/gemm/
 ├── cutedsl/
-│   ├── dense/<fusion>/              # amax, dsrelu, proj_rope_mxfp8, srelu, swiglu
-│   ├── grouped/<fusion>/            # dglu, dsrelu, dswiglu, glu, glu_hadamard,
-│   │                                #   quant, srelu, swiglu, unfused, wgrad
-│   └── discrete_grouped/<fusion>/   # dswiglu, swiglu (per-expert weight pointers)
-├── frost/                           # the FROST GEMM engine (JIT fused matmul chains from cuDNN graphs)
-│   ├── sm100/, sm120/               #   one tree per arch family: compiler.py + epilogue_codegen.py + kernel_templates/
-│   ├── compiler.py, epilogue_codegen.py  # facades: become the active family's module (arch_family.py)
-│   ├── kernel_templates/            #   template code SHARED by both trees (split-K reduction)
-│   └── ln_prologue/                 #   the LayerNorm-prologue gated dual GEMM substrate: host (__init__.py) + ONE RENDERED body per arch (two arms: pairing=columns = TriMul K1, pairing=accumulators = TriMul K3)
-│                                    #   (sm107_dual_gemm.py; a rendering for one arch is not a registry template, so not under kernel_templates/)
-├── ops/                             # backend-independent torch custom-op contracts
-└── reference/                       # pure-PyTorch MATMUL/POINTWISE correctness engine
+│   ├── dense/<fusion>/
+│   ├── grouped/<fusion>/
+│   └── discrete_grouped/<fusion>/   # per-expert weight pointers
+├── frost/                          # JIT-fused matmul chains from cuDNN graphs
+│   ├── sm100/                      # compiler.py, epilogue_codegen.py, kernel_templates/
+│   ├── sm120/                      # same structure for the SM120 family
+│   ├── compiler.py                 # facade for the active family's compiler
+│   ├── epilogue_codegen.py          # facade for the active family's codegen
+│   ├── kernel_templates/           # template code shared by architecture families
+│   └── ln_prologue/                # LayerNorm-prologue dual GEMM host and rendered per-arch kernels
+└── ops/                            # backend-independent torch custom-op contracts
 ```
 
-Shared helpers (schedulers, metadata utils, e.g. `gemm/cutedsl/grouped/moe_*.py`) stay internal to the family package — never exported through `cudnn`.
+Keep helpers in the narrowest package shared by their users. For example,
+`gemm/cutedsl/grouped/moe_*.py` serves grouped CuTeDSL fusions, while
+`gemm/frost/kernel_templates/` serves multiple FROST architecture families.
+Do not export these helpers through `cudnn`.
 
 ## CuTeDSL kernel bodies
 
