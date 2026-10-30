@@ -1253,7 +1253,6 @@ class IndexerBackwardSm100:
                 dk_acc_shape,
                 tDkDk_0,
                 tDkDk_1,
-                sm_scale,
                 seqlen_k,
                 tidx,
                 mbar,
@@ -1851,7 +1850,6 @@ class IndexerBackwardSm100:
                     dk_acc_shape,
                     tDkDk_0,
                     tDkDk_1,
-                    sm_scale,
                     seqlen_k,
                     tidx,
                     mbar,
@@ -2137,7 +2135,6 @@ class IndexerBackwardSm100:
                 dk_acc_shape,
                 tDkDk_0,
                 tDkDk_1,
-                sm_scale,
                 seqlen_k,
                 tidx,
                 mbar,
@@ -2297,6 +2294,9 @@ class IndexerBackwardSm100:
         tSrQ = tmma1.make_fragment_A(sQ)
         tSrK = tmma1.make_fragment_B(sK)  # 3-stage
         tDKrA_g2 = tmma2.make_fragment_A(sdS_g2a)  # SwapAB: A=dS, 2-stage
+        # GEMM2 reduces over heads. Compact H32 zero-fills Q and dS heads
+        # 32..63, so only the first half of the head K-blocks contributes.
+        gemm2_k_blocks = const_expr(cute.size(tDKrA_g2, mode=[2]) // (2 if self.heads == 32 else 1))
         tDKrB_g2 = tmma2.make_fragment_B(sQ_g2b)  # SwapAB: B=Q, 1-stage
         tDQrDS = tmma3.make_fragment_A(sdS)  # 2-stage
         tDQrKt = tmma3.make_fragment_B(sKt)  # 3-stage
@@ -2470,7 +2470,7 @@ class IndexerBackwardSm100:
                 _tcgen05_fence_after_thread_sync()
 
                 tmma2.set(tcgen05.Field.ACCUMULATE, False)
-                for k_block in cutlass.range(0, cute.size(tDKrA_g2, mode=[2]), unroll=4):
+                for k_block in cutlass.range(0, gemm2_k_blocks, unroll=4):
                     cute.gemm(tmma2, tDkDk_0, tDKrA_g2[None, None, k_block, 0], tDKrB_g2[None, None, k_block, 0], tDkDk_0)
                     tmma2.set(tcgen05.Field.ACCUMULATE, True)
                 with cute.arch.elect_one():
@@ -2527,7 +2527,7 @@ class IndexerBackwardSm100:
                 _tcgen05_fence_after_thread_sync()
 
                 tmma2.set(tcgen05.Field.ACCUMULATE, False)
-                for k_block in cutlass.range(0, cute.size(tDKrA_g2, mode=[2]), unroll=4):
+                for k_block in cutlass.range(0, gemm2_k_blocks, unroll=4):
                     cute.gemm(tmma2, tDkDk_1, tDKrA_g2[None, None, k_block, 1], tDKrB_g2[None, None, k_block, 0], tDkDk_1)
                     tmma2.set(tcgen05.Field.ACCUMULATE, True)
                 with cute.arch.elect_one():
@@ -2598,7 +2598,7 @@ class IndexerBackwardSm100:
             cute.arch.mbarrier_wait(mbar + MBAR_DS_READY_0, ds_ready_0_phase)
             _tcgen05_fence_after_thread_sync()
             tmma2.set(tcgen05.Field.ACCUMULATE, False)
-            for k_block in cutlass.range(0, cute.size(tDKrA_g2, mode=[2]), unroll=4):
+            for k_block in cutlass.range(0, gemm2_k_blocks, unroll=4):
                 cute.gemm(tmma2, tDkDk_0, tDKrA_g2[None, None, k_block, 0], tDKrB_g2[None, None, k_block, 0], tDkDk_0)
                 tmma2.set(tcgen05.Field.ACCUMULATE, True)
             with cute.arch.elect_one():
@@ -2649,7 +2649,7 @@ class IndexerBackwardSm100:
             cute.arch.mbarrier_wait(mbar + MBAR_DS_READY_1, ds_ready_1_phase)
             _tcgen05_fence_after_thread_sync()
             tmma2.set(tcgen05.Field.ACCUMULATE, False)
-            for k_block in cutlass.range(0, cute.size(tDKrA_g2, mode=[2]), unroll=4):
+            for k_block in cutlass.range(0, gemm2_k_blocks, unroll=4):
                 cute.gemm(tmma2, tDkDk_1, tDKrA_g2[None, None, k_block, 1], tDKrB_g2[None, None, k_block, 0], tDkDk_1)
                 tmma2.set(tcgen05.Field.ACCUMULATE, True)
             with cute.arch.elect_one():
@@ -2873,10 +2873,21 @@ class IndexerBackwardSm100:
         # For the production 64x128 accumulator and 16dp256b8x ownership,
         # every thread visits exactly two heads. Hoist those two conversions
         # instead of reloading BF16 weights for every score pair.
+        # sm_scale is folded into the dS weights (one BF16 rounding of the
+        # scaled dS, as in the v2 backend), so dK and dQ leave their GEMMs
+        # already scaled and the per-tile dK drain needs no FP32 multiplies.
         if const_expr(use_stmatrix_ds):
             h_base = warp_id_in_wg * 16 + lane_id // 4
-            weight_lo = Float32(sW[h_base])
-            weight_hi = Float32(sW[h_base + 8])
+            weight_lo = Float32(sW[h_base]) * Float32(sm_scale)
+            weight_hi = Float32(sW[h_base + 8]) * Float32(sm_scale)
+
+        # Compact H32 runs the M64 tile with heads 32..63 zero-filled. The two
+        # compute warps that own only those heads skip the TMEM readback and
+        # dS math; they still store the zero dS tile and keep the barrier
+        # protocol.
+        skip_padded_heads = False
+        if const_expr(use_stmatrix_ds and self.heads == 32):
+            skip_padded_heads = warp_id_in_wg >= 2
 
         for bi in cutlass.range(0, self.num_topk_blocks):
             i_st = bi * self.block_I
@@ -2889,68 +2900,74 @@ class IndexerBackwardSm100:
                 cute.arch.mbarrier_wait(mbar + MBAR_S_FULL_1, s_full_1_phase)
                 s_full_1_phase ^= 1
             _tcgen05_fence_after_thread_sync()
-            if bi % 2 == 0:
-                cute.copy(tiled_tmem_load_s_0, tStS_t2r_0, tSrS)
-            else:
-                cute.copy(tiled_tmem_load_s_1, tStS_t2r_1, tSrS)
-
-            # Phase 1: Compute dS (→ tSrS), accumulate dW — paired f32x2.
-            for ei in cutlass.range(0, cute.size(tSrS), 2):
-                if const_expr(use_stmatrix_ds):
-                    h0 = cute.get(tCcS[ei], mode=[0])
-                    n0 = cute.get(tCcS[ei], mode=[1])
-                    h1 = cute.get(tCcS[ei + 1], mode=[0])
-                    n1 = cute.get(tCcS[ei + 1], mode=[1])
-                else:
-                    h0 = cute.get(tCcS[ei], mode=[0, 0])
-                    n0 = cute.get(tCcS[ei], mode=[0, 1])
-                    h1 = cute.get(tCcS[ei + 1], mode=[0, 0])
-                    n1 = cute.get(tCcS[ei + 1], mode=[0, 1])
-
-                tSrS[ei], tSrS[ei + 1] = mul_packed_f32x2(
-                    (tSrS[ei], tSrS[ei + 1]),
-                    (Float32(sm_scale), Float32(sm_scale)),
-                )
-                s0 = tSrS[ei]
-                s1 = tSrS[ei + 1]
-
-                if const_expr(use_stmatrix_ds):
-                    # Pairs alternate between the thread's low/high head;
-                    # both elements in one pair share that head.
-                    pair_weight = weight_lo if (ei // 2) % 2 == 0 else weight_hi
-                    w0 = pair_weight
-                    w1 = pair_weight
-                else:
-                    w0 = Float32(sW[h0])
-                    w1 = Float32(sW[h1])
-                gs0 = sGradSignal[i_st + n0]
-                gs1 = sGradSignal[i_st + n1]
-
-                s_pos_0 = s0 > Float32(0.0)
-                s_pos_1 = s1 > Float32(0.0)
-                relu_s0 = s0 if s_pos_0 else Float32(0.0)
-                relu_s1 = s1 if s_pos_1 else Float32(0.0)
-
-                dw_accum[ei], dw_accum[ei + 1] = fma_packed_f32x2(
-                    (gs0, gs1),
-                    (relu_s0, relu_s1),
-                    (dw_accum[ei], dw_accum[ei + 1]),
-                )
-
-                ds0, ds1 = mul_packed_f32x2(
-                    (gs0, gs1),
-                    (w0, w1),
-                )
-                tSrS[ei] = ds0 if s_pos_0 else Float32(0.0)
-                tSrS[ei + 1] = ds1 if s_pos_1 else Float32(0.0)
-
-            cute.arch.fence_view_async_tmem_load()
-
-            # Phase 2: Convert dS f32→bf16, then use STSM on the production
-            # tile or the native-layout coordinate fallback on other shapes.
             tSrS_f16 = cute.make_rmem_tensor(tSrS.shape, self.q_dtype)
-            for ei in cutlass.range(cute.size(tSrS), unroll_full=True):
-                tSrS_f16[ei] = self.q_dtype(tSrS[ei])
+            if skip_padded_heads:
+                # Compact H32: this warp owns only the zero-filled heads 32..63,
+                # whose scores and dS are identically zero (Q rows are zero).
+                for ei in cutlass.range(cute.size(tSrS_f16), unroll_full=True):
+                    tSrS_f16[ei] = self.q_dtype(0.0)
+            else:
+                if bi % 2 == 0:
+                    cute.copy(tiled_tmem_load_s_0, tStS_t2r_0, tSrS)
+                else:
+                    cute.copy(tiled_tmem_load_s_1, tStS_t2r_1, tSrS)
+
+                # Phase 1: Compute dS (→ tSrS), accumulate dW — paired f32x2.
+                for ei in cutlass.range(0, cute.size(tSrS), 2):
+                    if const_expr(use_stmatrix_ds):
+                        h0 = cute.get(tCcS[ei], mode=[0])
+                        n0 = cute.get(tCcS[ei], mode=[1])
+                        h1 = cute.get(tCcS[ei + 1], mode=[0])
+                        n1 = cute.get(tCcS[ei + 1], mode=[1])
+                    else:
+                        h0 = cute.get(tCcS[ei], mode=[0, 0])
+                        n0 = cute.get(tCcS[ei], mode=[0, 1])
+                        h1 = cute.get(tCcS[ei + 1], mode=[0, 0])
+                        n1 = cute.get(tCcS[ei + 1], mode=[0, 1])
+
+                    tSrS[ei], tSrS[ei + 1] = mul_packed_f32x2(
+                        (tSrS[ei], tSrS[ei + 1]),
+                        (Float32(sm_scale), Float32(sm_scale)),
+                    )
+                    s0 = tSrS[ei]
+                    s1 = tSrS[ei + 1]
+
+                    if const_expr(use_stmatrix_ds):
+                        # Pairs alternate between the thread's low/high head;
+                        # both elements in one pair share that head.
+                        pair_weight = weight_lo if (ei // 2) % 2 == 0 else weight_hi
+                        w0 = pair_weight
+                        w1 = pair_weight
+                    else:
+                        w0 = Float32(sW[h0]) * Float32(sm_scale)
+                        w1 = Float32(sW[h1]) * Float32(sm_scale)
+                    gs0 = sGradSignal[i_st + n0]
+                    gs1 = sGradSignal[i_st + n1]
+
+                    s_pos_0 = s0 > Float32(0.0)
+                    s_pos_1 = s1 > Float32(0.0)
+                    relu_s0 = s0 if s_pos_0 else Float32(0.0)
+                    relu_s1 = s1 if s_pos_1 else Float32(0.0)
+
+                    dw_accum[ei], dw_accum[ei + 1] = fma_packed_f32x2(
+                        (gs0, gs1),
+                        (relu_s0, relu_s1),
+                        (dw_accum[ei], dw_accum[ei + 1]),
+                    )
+
+                    ds0, ds1 = mul_packed_f32x2(
+                        (gs0, gs1),
+                        (w0, w1),
+                    )
+                    tSrS[ei] = ds0 if s_pos_0 else Float32(0.0)
+                    tSrS[ei + 1] = ds1 if s_pos_1 else Float32(0.0)
+
+                cute.arch.fence_view_async_tmem_load()
+
+                # Phase 2: Convert dS f32→bf16, then use STSM on the production
+                # tile or the native-layout coordinate fallback on other shapes.
+                for ei in cutlass.range(cute.size(tSrS), unroll_full=True):
+                    tSrS_f16[ei] = self.q_dtype(tSrS[ei])
 
             if const_expr(use_stmatrix_ds):
                 tRS_rdS = tiled_smem_store.retile(tSrS_f16)
@@ -3046,13 +3063,9 @@ class IndexerBackwardSm100:
             cute.copy(tiled_tmem_load_dq, tDqDq_t2r, tDQrDQ)
 
         tDQrDQ_bf16 = cute.make_rmem_tensor(tDQrDQ.shape, self.q_dtype)
-        for ei in cutlass.range(0, cute.size(tDQrDQ), 2):
-            scaled0, scaled1 = mul_packed_f32x2(
-                (tDQrDQ[ei], tDQrDQ[ei + 1]),
-                (Float32(sm_scale), Float32(sm_scale)),
-            )
-            tDQrDQ_bf16[ei] = self.q_dtype(scaled0)
-            tDQrDQ_bf16[ei + 1] = self.q_dtype(scaled1)
+        # dS already carries sm_scale.
+        for ei in cutlass.range(cute.size(tDQrDQ), unroll_full=True):
+            tDQrDQ_bf16[ei] = self.q_dtype(tDQrDQ[ei])
 
         cute.arch.fence_view_async_tmem_load()
         _tcgen05_fence_before_thread_sync()
@@ -3148,13 +3161,15 @@ class IndexerBackwardSm100:
         dk_acc_shape,
         tDkDk_0,
         tDkDk_1,
-        sm_scale: Float32 | float,
         seqlen_k,
         tidx,
         mbar,
         persistent_row_phase,
     ):
         """Reduce dK into FP32 global memory.
+
+        The dK accumulator already carries ``sm_scale`` (folded into dS by the
+        compute warpgroup), so the drain only moves data.
 
         Natural layout: through padded SMEM and 512-byte bulk FP32 additions.
         Column-permuted layout (``dk_column_permuted``): 16-byte
@@ -3240,10 +3255,10 @@ class IndexerBackwardSm100:
                         for seg in cutlass.range_constexpr(4):
                             ei = row_pass * 64 + seg * 16 + row_half * 2
                             # lo = segment h = 2*seg (groups 4seg, 4seg+1), hi = h = 2*seg+1.
-                            lo0, lo1 = mul_packed_f32x2((tDKrDK[ei], tDKrDK[ei + 1]), (Float32(sm_scale), Float32(sm_scale)))
-                            lo2, lo3 = mul_packed_f32x2((tDKrDK[ei + 4], tDKrDK[ei + 5]), (Float32(sm_scale), Float32(sm_scale)))
-                            hi0, hi1 = mul_packed_f32x2((tDKrDK[ei + 8], tDKrDK[ei + 9]), (Float32(sm_scale), Float32(sm_scale)))
-                            hi2, hi3 = mul_packed_f32x2((tDKrDK[ei + 12], tDKrDK[ei + 13]), (Float32(sm_scale), Float32(sm_scale)))
+                            lo0, lo1 = tDKrDK[ei], tDKrDK[ei + 1]
+                            lo2, lo3 = tDKrDK[ei + 4], tDKrDK[ei + 5]
+                            hi0, hi1 = tDKrDK[ei + 8], tDKrDK[ei + 9]
+                            hi2, hi3 = tDKrDK[ei + 12], tDKrDK[ei + 13]
                             # The even quad keeps lo of its row and sends hi; the odd quad
                             # keeps hi of its row and sends lo.
                             x0 = cute.arch.shuffle_sync_bfly(lo0 if quad_odd else hi0, offset=4)
@@ -3285,12 +3300,8 @@ class IndexerBackwardSm100:
                             ei = (pass_idx // 2) * 64 + b6 * 32 + col_group * 4 + (pass_idx % 2) * 2
                             col = (lane_id % 4) * 2 + col_group * 8 + b6 * 64
                             dst = buffer_base + stage_row * self.DK_STAGE_ROW_FLOATS + col
-                            scaled0, scaled1 = mul_packed_f32x2(
-                                (tDKrDK[ei], tDKrDK[ei + 1]),
-                                (Float32(sm_scale), Float32(sm_scale)),
-                            )
-                            sdKStage[dst] = scaled0
-                            sdKStage[dst + 1] = scaled1
+                            sdKStage[dst] = tDKrDK[ei]
+                            sdKStage[dst + 1] = tDKrDK[ei + 1]
 
                     cute.arch.fence_view_async_shared()
                     cute.arch.sync_warp()
