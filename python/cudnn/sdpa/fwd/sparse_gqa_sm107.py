@@ -93,6 +93,20 @@ resolved arm back after ``check_support``.  On the Blackwell explicit-lean parts
 split-aware rule's shape (``sparse_tile_rules.SPARSE_LEAN_COMBINE_RULE_CCS`` = cc 10.0, measured on the GB200 class 2026-10-28; cc 10.3 keeps the
 module's own forms) -- :func:`_sparse_combine_decode_grid`.
 
+THE FUSED STORE's ROUNDING CONVENTION (``out_rounding``, appended last; an OP ATTRIBUTE of the declaration, never a knob -- it changes the bytes;
+the vocabulary is ``heuristics.COMBINE_OUT_ROUNDINGS``, validated by name at construction): ``"single"`` (the default) is the convention above, ONE
+rounding of the fp32 gated value (FROST's own); ``"staged"`` reproduces a serving stack's gate-and-quantize launch byte for byte,
+``e4m3(rn, satfinite)(bf16(bf16(O32) / (1 + exp(-G))) * div.rn(1, scale))`` -- the merged O rounded to bf16 as that stack's attention kernel
+stores it, the exact sigmoid as a division, the gated value rounded to bf16, the fp32 multiply by the same inverse, the saturating cvt -- spelled
+with the DSL ops that stack's kernel spells (``split_combine.compile_ptr(out_rounding="staged")``), so a provider whose speculative verify is
+tuned on the stack's bytes can take the fused launch without moving the acceptance length (the two conventions differ by one e4m3 code on a
+few percent of the elements, enough to flip a near-tie greedy token).  The LSE, the dead rows (0), the PDL arm and the combine FORM are the single
+mode's; the attribute is compiled into the combine entry (no new runtime slot).  Declines by name: ``"staged"`` with a half ``o`` (no fused store
+to apply it to) is a ``ValueError`` (a malformed declaration, like ``out_scale`` with a half ``o``); ``"staged"`` with f16 operands is a
+``NotImplementedError`` (the typed decline: the convention is a bf16 chain's -- refused by name rather than defined for f16, which has no
+consumer, no ground truth and a narrower range below which the two conventions part); a value outside the vocabulary is a ``ValueError`` at
+construction.  :attr:`SparseGqaFwdDslSm107.out_rounding` reads the attribute back.
+
 TWO BODIES, ONE FUNCTION (``tile_form``, appended; a PERFORMANCE knob): the tcgen05 core (``kernels/sm107/sparse_d256_f16.py``, the
 module above, ``kernel_template`` ``"sparse_d256_f16"``) and the LEAN decode tile (``kernels/sm107/sparse_lean_d256_f16.py``: ``mma.sync``
 m16n8k16 + ``cp.async``, one 128-thread CTA per (sequence, KV head, chunk of ``sub_tiles_per_cta`` 32-key sub-tiles), no TMEM / TMA / CLC,
@@ -165,6 +179,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import cudnn
+from cudnn.sdpa.fwd.heuristics import COMBINE_OUT_ROUNDING_SINGLE, COMBINE_OUT_ROUNDINGS  # DSL-free (no cutlass / torch import): importable before the DSL gate
 from cudnn.sdpa.fwd.sparse_tile_rules import SPARSE_LEAN_TILE_EXPLICIT_CCS
 
 KERNEL_FILE = "sm107/sparse_d256_f16.py"
@@ -226,6 +241,9 @@ class SparseCapabilities:
     )
     gated_e4m3_out: bool = (
         True  # appended 2026-10-29: O stored as float8_e4m3fn at a static per-tensor DEQUANT scale (out_scale, a positive normal fp32 by contract) through the GATED split combine's fused entry -- a split plan with the gate, dense or paged, never THD
+    )
+    gated_e4m3_out_roundings: Tuple[str, ...] = (
+        COMBINE_OUT_ROUNDINGS  # appended 2026-10-29: the fused store's rounding conventions (the `out_rounding` attribute: "single" = one rounding of the fp32 gated value, the default; "staged" = a serving stack's gate-and-quantize order, bf16 operands only) -- pinned equal to heuristics.COMBINE_OUT_ROUNDINGS by the suite
     )
 
 
@@ -458,6 +476,7 @@ class SparseGqaFwdDslSm107:
         tile_form: str = "auto",
         sub_tiles_per_cta: Optional[int] = None,
         out_scale=None,
+        out_rounding: str = COMBINE_OUT_ROUNDING_SINGLE,
     ):
         self.q, self.k, self.v, self.o, self.lse = q, k, v, o, lse
         # The TILE FORM (appended; a PERFORMANCE knob of the two bodies, the module docstring): "auto" / "lean" / "tcgen05" -- the
@@ -501,6 +520,17 @@ class SparseGqaFwdDslSm107:
         # resolved by check_support into `fused_e4m3`.
         self.out_scale = out_scale
         self.fused_e4m3 = False
+        # The fused store's ROUNDING CONVENTION (appended 2026-10-29; an OP ATTRIBUTE, never a knob -- it changes the bytes): "single" (the
+        # default) = the one rounding above, "staged" = a serving stack's gate-and-quantize order (bf16 of the merged O, the exact sigmoid as a
+        # division, bf16 of the gated value, then the same inverse and saturating cvt; compile_ptr(out_rounding="staged")).  The vocabulary is
+        # validated here by name (heuristics.COMBINE_OUT_ROUNDINGS, like tile_form's); its composition (the fused store, bf16 operands) in
+        # check_support once the dtypes are known.  Compiled into the combine entry: no runtime slot.
+        if not isinstance(out_rounding, str) or out_rounding not in COMBINE_OUT_ROUNDINGS:
+            raise ValueError(
+                f"sparse d256 forward (sm107): out_rounding must be one of {COMBINE_OUT_ROUNDINGS} ('single' = one rounding of the fp32 gated value, "
+                f"'staged' = a serving stack's gate-and-quantize order on the fused e4m3 store); got {out_rounding!r}"
+            )
+        self.out_rounding = out_rounding
         self.top_k, self.block_size = int(top_k), int(block_size)
         # The softmax scale is handed to the kernel SIGNED (as scale x log2 e): the body multiplies every raw score by it BEFORE the
         # column max, so a negative attn_scale is served as is -- the dense line's TemplateParams.negate_scores (BMM1 negates Q and
@@ -665,6 +695,20 @@ class SparseGqaFwdDslSm107:
         # O: Q's dtype (the half store), or float8_e4m3fn with out_scale + the gate (the FUSED store; its split requirement is checked
         # once the body and the split are resolved below)
         self.fused_e4m3 = self._resolve_fused_store(dt)
+        if self.out_rounding != COMBINE_OUT_ROUNDING_SINGLE:
+            # the staged convention is a property of the FUSED store (no half store takes a convention: it rounds once at its own cast) and of a
+            # bf16 chain (the f16 analogue is refused by name, not defined: no consumer, no ground truth, a narrower underflow range)
+            if not self.fused_e4m3:
+                raise ValueError(
+                    f"sparse d256 forward (sm107): out_rounding={self.out_rounding!r} belongs to the fused e4m3 store -- declare O as float8_e4m3fn with "
+                    "out_scale and the epilogue gate; a half O rounds once at its own store and takes no rounding convention"
+                )
+            if dt != "torch.bfloat16":
+                raise NotImplementedError(
+                    f"sparse d256 forward (sm107): out_rounding={self.out_rounding!r} is served with bf16 operands only (the convention is a bf16 serving "
+                    f"chain's: the merged O and the gated value are rounded to bf16); the f16 analogue is not wired -- got Q {dt}; declare bf16 operands or "
+                    "out_rounding='single'"
+                )
         if self.lse is not None and str(self.lse.dtype) != "torch.float32":
             raise ValueError(f"sparse d256 forward (sm107): LSE must be float32; got {self.lse.dtype}")
         if self.gate is not None:
@@ -1197,7 +1241,9 @@ class SparseGqaFwdDslSm107:
             tag = "bf16" if self._dtype_code == 2 else "f16"
             form = self.combine_form()
             compile_combine = getattr(split_combine.compile_ptr, "__wrapped__", split_combine.compile_ptr)
-            # the FUSED gated e4m3 store (fused_e4m3): the gated entry's frame plus the static DEQUANT scale, the e4m3 output rounded once
+            # the FUSED gated e4m3 store (fused_e4m3): the gated entry's frame plus the static DEQUANT scale, the e4m3 output rounded once --
+            # or, under out_rounding="staged" (check_support admits it with the fused store and bf16 operands only), a serving stack's
+            # gate-and-quantize order; the convention is compiled into the entry (in its cache key), never a runtime slot
             owner = compile_combine(
                 dtype_o="e4m3" if self.fused_e4m3 else tag,
                 dtype_partial="f32",
@@ -1208,6 +1254,7 @@ class SparseGqaFwdDslSm107:
                 decode_grid=form,
                 use_pdl=self.use_pdl,
                 gate_e4m3=self.fused_e4m3,
+                out_rounding=self.out_rounding,
             )
             entry = positional_entry(owner)
             if entry is None:
