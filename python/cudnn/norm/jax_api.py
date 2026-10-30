@@ -38,15 +38,15 @@ def _require_array(value, name):
 
 
 def _target_device(*arrays):
-    from cudnn.frost.device import compute_capability, device_count, multiprocessor_count, shared_memory_per_block_optin
+    from cudnn.frost.device import compute_capability
 
     if jax.process_count() != 1:
         raise NotImplementedError("JAX normalization requires a single process")
     placed = {device for x in arrays if isinstance(x, jax.Array) and not isinstance(x, jax.core.Tracer) for device in x.devices()}
     if len(placed) > 1:
         raise ValueError("JAX normalization arrays must be on the same GPU")
-    # Tracers have no concrete placement; this GPU supplies the common hardware
-    # facts checked below, while XLA controls the execution device.
+    # Tracers have no concrete placement. The default device supplies tuning
+    # properties; XLA places execution, and compilation explicitly targets SM100.
     target = next(iter(placed)) if placed else (jax.config.jax_default_device or jax.local_devices()[0])
     if target.platform != "gpu":
         raise NotImplementedError(f"JAX normalization requires a CUDA GPU; got {target.platform}")
@@ -54,11 +54,6 @@ def _target_device(*arrays):
     capability = compute_capability(device)
     if capability != (10, 0):
         raise NotImplementedError(f"JAX normalization requires SM100 (compute capability 10.0); got {capability}")
-    # Include CUDA devices hidden from JAX: the DSL also queries the ambient
-    # architecture when choosing shared-memory limits and compiling kernels.
-    properties = {(compute_capability(index), multiprocessor_count(index), shared_memory_per_block_optin(index)) for index in range(device_count())}
-    if len(properties) != 1:
-        raise NotImplementedError("JAX normalization requires visible CUDA GPUs with matching compute capability, SM count, and shared-memory limit")
     return device
 
 
@@ -101,7 +96,7 @@ def _configuration(x, weight, bias, normalized_shape, eps, variant):
 
 @lru_cache(maxsize=128)
 def _forward_call(config):
-    from cudnn.frost.device import build_device, multiprocessor_count
+    from cudnn.frost.device import build_device
 
     spec = config.spec
     with build_device(config.device):
@@ -112,12 +107,11 @@ def _forward_call(config):
             has_mean=spec.has_mean,
             has_beta=config.has_beta,
             epsilon=config.epsilon,
-            sm_count=multiprocessor_count(config.device),
         )
     dtype = {"bf16": jnp.bfloat16, "fp16": jnp.float16, "fp32": jnp.float32}[config.dtype]
     stats = jax.ShapeDtypeStruct((spec.R,), jnp.float32)
     outputs = (jax.ShapeDtypeStruct((spec.R, spec.M), dtype), stats if spec.has_mean else None, stats)
-    return call(launch, output_shape_dtype=outputs, use_static_tensors=True)
+    return call(launch, output_shape_dtype=outputs, use_static_tensors=True, compile_options="--gpu-arch=sm_100a")
 
 
 @lru_cache(maxsize=128)
@@ -147,7 +141,7 @@ def _backward_call(config):
     initialized = {1: zeros_init}
     if config.has_beta:
         initialized[2] = zeros_init
-    return call(launch, output_shape_dtype=outputs, initialized_outputs=initialized, use_static_tensors=True)
+    return call(launch, output_shape_dtype=outputs, initialized_outputs=initialized, use_static_tensors=True, compile_options="--gpu-arch=sm_100a")
 
 
 def _forward(config, x, weight, bias):

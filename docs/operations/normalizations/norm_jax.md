@@ -54,32 +54,40 @@ on CuTeDSL; these kernels require a build at least version 4.7.1 that provides
 `cutlass.experimental.primitives`. No additional frontend dependency is introduced.
 
 Run in a single process with inputs placed on one SM100 GPU per invocation.
-Multiple CUDA GPUs may remain visible when they have matching compute capability,
-SM count, and per-block shared-memory limits. JAX controls execution placement,
-including calls on a non-default GPU. These matching hardware properties keep
-launch geometry and scratch sizes valid when tracing has no concrete placement.
-Mixed-hardware visibility and distributed sharding remain unsupported.
+The frontend imposes no limit on the number or architecture of other visible
+devices. Compilation explicitly targets SM100, and launch tuning uses the input
+device or, during tracing, JAX's default device. Use `jax.default_device` to
+select an SM100 for tracing and new arrays when the system default is another
+architecture. Existing committed arrays retain their placement and must already
+be on the intended SM100; the context does not move them. Distributed sharding
+remains unsupported.
 
 ```python
 import jax
 import jax.numpy as jnp
 from cudnn.ops import layer_norm_forward_jax, rms_norm_forward_jax
 
-x = jnp.arange(8192, dtype=jnp.float32).reshape(8, 1024) / 8192
-weight = jnp.ones((1024,), dtype=x.dtype)
-bias = jnp.zeros_like(weight)
-
-y, = jax.jit(layer_norm_forward_jax)(x, weight, bias)
-rms_y, = jax.jit(rms_norm_forward_jax)(x, weight)
+target = next(
+    device for device in jax.local_devices()
+    if device.platform == "gpu"
+    and str(getattr(device, "compute_capability", "")) == "10.0"
+)
 
 def loss(x, weight, bias):
     y, = layer_norm_forward_jax(x, weight, bias, eps=1e-5)
     return jnp.square(y.astype(jnp.float32)).mean()
 
-dx, dweight, dbias = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))(
-    x, weight, bias
-)
-jax.block_until_ready((y, rms_y, dx, dweight, dbias))
+with jax.default_device(target):
+    x = jnp.arange(8192, dtype=jnp.float32).reshape(8, 1024) / 8192
+    weight = jnp.ones((1024,), dtype=x.dtype)
+    bias = jnp.zeros_like(weight)
+
+    y, = jax.jit(layer_norm_forward_jax)(x, weight, bias)
+    rms_y, = jax.jit(rms_norm_forward_jax)(x, weight)
+    dx, dweight, dbias = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))(
+        x, weight, bias
+    )
+    jax.block_until_ready((y, rms_y, dx, dweight, dbias))
 ```
 
 For multidimensional normalization, pass the complete trailing shape:
@@ -90,14 +98,15 @@ normalize = jax.jit(
         x, weight, normalized_shape=(16, 64)
     )
 )
-y, = normalize(x.reshape(8, 16, 64), weight.reshape(16, 64))
+with jax.default_device(target):
+    y, = normalize(x.reshape(8, 16, 64), weight.reshape(16, 64))
 ```
 
 ## Support matrix
 
 | Feature | Supported contract |
 |---|---|
-| GPU | One SM100 GPU per invocation; multiple equivalent CUDA GPUs may be visible in a single process |
+| GPU | One SM100 GPU per invocation; no frontend restriction on other visible devices in the process |
 | Operations | LayerNorm and RMSNorm |
 | Input and affine dtypes | BF16, FP16, FP32; matching dtypes |
 | Normalization axes | Positive static trailing dimensions; exact shape match |
@@ -124,7 +133,9 @@ The earlier single-GPU implementation was qualified on B200 with Python 3.12,
 JAX/jaxlib 0.9.1, CUDA 13, and the internal CuTeDSL build
 `4.9.0a0.dev0+internal.master.20261002010000.3617316`. Multiple-GPU execution
 requires a separate run of the placement and compilation-reuse tests with at
-least two equivalent SM100 GPUs visible.
+least two SM100 GPUs visible. Mixed-architecture visibility also requires
+validation with the installed CuTeDSL JAX runtime; mocked device properties
+exercise frontend selection but do not qualify the runtime's binary loading.
 Run the focused suite without the parent Torch
 test fixtures:
 
