@@ -53,14 +53,16 @@ call does not register a PyTorch autograd function.
 ## Finding QSA attention and its indexer
 
 QSA's public functions use the `cudnn.ops.qsa_*` prefix. Their implementations
-live under `cudnn.QSA`; the selector shares scorer and top-k kernels with DSA.
+live under `cudnn.QSA`. The selector shares the compact score layout and top-k
+kernel with DSA; Hopper has a native warp-MMA scorer.
 Choose an entry by its input and saved-state contract:
 
 | Need | Entry point | Contract |
 |---|---|---|
 | Packed training with a block-selection bitmap | `cudnn.ops.qsa_forward`, `qsa_backward` | The bitmap API documented on this page; 24Q/2KV, 12Q/1KV or 6Q/1KV |
-| Packed training with selected token IDs | `cudnn.ops.qsa_indexed_forward`, `qsa_indexed_backward` ([docs](/operations/sparse_attention/qsa/qsa_indexed), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/sparse_attention/qsa_indexed.md)) | 12Q/1KV or 6Q/1KV on SM100/SM103/SM107; shares the QSA attention kernels |
-| Generate selected blocks from indexer Q and compressed K | `cudnn.ops.qsa_select_forward`, `qsa_select_decode_forward` | QSA selector over the shared DSA scorer and top-k; returns local block IDs, not token IDs |
+| Packed training with selected token IDs | `cudnn.ops.qsa_indexed_forward`, `qsa_indexed_backward` ([docs](/operations/sparse_attention/qsa/qsa_indexed), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/sparse_attention/qsa_indexed.md)) | 12Q/1KV or 6Q/1KV on SM90/SM100/SM103/SM107; shares the QSA attention kernels |
+| Generate selected blocks from packed indexer Q and compressed K | `cudnn.ops.qsa_select_forward` | BF16 or plain FP8 on SM90 and the SM100 family; returns local block IDs |
+| Decode selection over a contiguous compressed-key cache | `cudnn.ops.qsa_select_decode_forward` | Uses the decode selector's own architecture requirements |
 | Decode selection over a paged compressed-key cache | `cudnn.ops.qsa_select_decode_paged_forward` | BF16 indexer cache; see the paged selector's architecture and layout requirements in its docstring |
 | Integrated projection, compression, selection and attention | `GatedAttentionBlockFwd` with `QsaSpec(index_source="indexer")` ([docs](/operations/Attention/gated_attention_block), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/attention/gated_attention_block.md)) | Use the integrated block's own architecture, layout and inference support matrix |
 
@@ -78,15 +80,19 @@ QSA's selector scores each complete compressed block as
 `scale * sum_h relu(qi[t, h] @ kbar[block])`. The existing
 `cudnn.DSA.indexer_forward_top_k_wrapper` provides this ratio-causal scorer and
 top-k operation with compression ratio four and constant head weights. Sharing
-these kernels avoids a second implementation. QSA-specific compression, block
-visibility and tail handling remain part of the QSA contract; this reuse does
+the compact layout and top-k kernel keeps the selection contract consistent.
+On Hopper, native warp MMA computes BF16 or plain FP8 scores. Optional head
+weights, packed sequences, chunked query positions, and deterministic ties
+use the same public arguments. The optional FP8 scale prefix is accepted but
+not used by the Hopper scorer; plain FP8 needs no scale storage.
+QSA-specific compression, block visibility and tail handling remain part of the QSA contract; this reuse does
 not make QSA and DeepSeek attention interchangeable. Numerical rounding and
 top-k tie rules must also be checked before replacing an external selector.
 
 The internal two-pass backend ([docs](/operations/sparse_attention/qsa/qsa_two_pass), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/sparse_attention/qsa_two_pass.md)) has a different
 saved-state and selection contract: 12Q/1KV or 24Q/2KV, canonical block lists,
 optional packed `cu_seqlens`, and native FP32 saved output / `[Hq, T]` LSE
-(or the earlier BF16 saved output / `[T, Hq]` LSE pair). For 12Q/1KV, the public
+(or the earlier BF16 saved output / `[T, Hq]` LSE pair). For 12Q/1KV on Blackwell, the public
 `qsa_indexed_backward(..., selection_mode="causal_topk")` selects this backend
 when the caller declares the stricter complete-block and causal-tail contract ([docs](/operations/sparse_attention/qsa/qsa_indexed#complete-blocks-and-causal-tails), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/sparse_attention/qsa_indexed.md#complete-blocks-and-causal-tails)).
 The default indexed and bitmap calls retain their general selection contracts.
@@ -139,7 +145,9 @@ Its block spans have at most four tokens; only the final block can be shorter.
 The spans, bases, and token bounds must agree. Values remain on the device and
 are a caller contract. No host read checks these relationships.
 
-Forward uses dense tiles for short key spans and gathers selected blocks for
+Hopper forward uses warp MMA for dense tiles and gathered blocks. Nonfinite
+K/V, extreme V, and wide tile spans use the gathered path. Blackwell and Rubin
+forward use dense tiles for short key spans and gather selected blocks for
 other tiles. GPU preparation checks the current K/V values and bounds, then
 builds exact masks. Nonfinite K/V uses the gather path to exclude unused values
 before arithmetic. Both paths compute scaled QK scores, apply the bounds, and
@@ -154,8 +162,9 @@ atomic reductions can change low bits between runs.
 On Blackwell and Rubin, the 12:1 and 6:1 paths batch consecutive queries (two
 12-head or four 6-head queries fill one 24-column tile) and gather their selected
 block union once. Owner bits retain each query's mask while sharing K/V loads.
-The 24:2 path processes one query per CTA.
-A device-side K/V scan selects a per-query fallback when nonfinite values are
+Hopper and the 24:2 path process one query per CTA. Hopper uses warp MMA for
+the five matrix products, with three BF16 parts of dS preserving dQ cancellation.
+On those batched paths, a device-side K/V scan selects a per-query fallback when nonfinite values are
 present. The fallback reuses the compact union but applies each query's owner
 bits and bounds before dQ arithmetic, preventing a masked NaN from crossing
 between queries or packed sequences. Both launches test the current device flag;
@@ -198,25 +207,26 @@ Supported geometry is BF16, head dimension 256, head counts 24Q/2KV, 12Q/1KV or
 head replicated at four-way), and `block_size=4`. `T > 0`, `NB > 0`, and `T * Hq * 256 <= INT32_MAX` are required.
 `scale` is a finite host scalar, normally `1 / sqrt(256)`.
 
-The public functions select one of two architecture families internally:
+The public functions select the architecture internally:
 
 | Family | Forward kernel | Backward kernel |
 |---|---|---|
+| Hopper SM90 (H200) | `cudnn_frost_qsa_fprop_sm90` | `cudnn_frost_qsa_bprop_sm90` |
 | Blackwell SM100/SM103 | `cudnn_frost_qsa_fprop_sm100` | `cudnn_frost_qsa_bprop_sm100` (batched for 12:1 and 6:1, single-query for 24:2) |
 | Rubin SM107 | `cudnn_frost_qsa_fprop_sm107` | Batched `cudnn_frost_qsa_bprop_sm100` (12:1, 6:1), `cudnn_frost_qsa_bprop_sm107` (24:2) |
 
 Kernel symbols are implementation details; Rubin kernels compile for SM107.
 Rubin compaction scans 16 selection bytes per lane and preserves block order.
-CuTeDSL 4.7 or newer is
+CuTeDSL 4.8 or newer is
 required; Rubin also requires a build with the `sm_107a` target.
 
 Calls allocate outputs and scratch on the input device and enqueue work on its
 current PyTorch CUDA stream. Warm up the chosen head geometry before CUDA graph
 capture. Compiled kernels reuse symbolic token and block extents; metadata is
 rebuilt from the current bitmap on each call. Forward scratch includes an int32
-`[T, NB]` compact-index buffer and int32 `[T]` counts. The batched backward path on both families
-uses `[ceil(T/NQ), NB]` indices and `[ceil(T/NQ)]` counts (`NQ` = 2 at 12:1, 4 at 6:1);
-the 24:2 backward uses the forward shapes. Backward also uses FP32 gradient accumulators and `[T, Hq]`
+`[T, NB]` compact-index buffer and int32 `[T]` counts. The Blackwell and Rubin batched backward paths
+use `[ceil(T/NQ), NB]` indices and `[ceil(T/NQ)]` counts (`NQ` = 2 at 12:1, 4 at 6:1);
+Hopper backward and the 24:2 backward use the forward shapes. Backward also uses FP32 gradient accumulators and `[T, Hq]`
 delta. The batched backward safety scan also uses four int32 flags per 1024
 K/V elements plus one reduced flag. The dense route also uses packed token
 masks, tile ranges and K/V check flags. These buffers are rebuilt on each call.

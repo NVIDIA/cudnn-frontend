@@ -17,8 +17,7 @@ This is exactly the ratio-causal, ReLU-summed, head-reduced score the DSA indexe
 compact-logits + fused top-k path (``cudnn.DSA.indexer_forward_top_k_wrapper``): the compression ratio is
 the block size, the per-head weights are the constant scale, and the dense ``[T, n_blocks]`` score tensor is
 never materialized -- the kernel writes only the ratio-causal candidates compactly and a radix pass selects
-the top-k per token. :func:`qsa_select_forward` is the thin host wrapper that spells the QSA geometry in that
-vocabulary.
+the top-k per token. Hopper uses a warp-MMA scorer and the same compact layout and radix selector.
 
 Contract (prefill, THD-packed queries):
 
@@ -35,7 +34,7 @@ Contract (prefill, THD-packed queries):
   (``-inf`` on the padding). With ``deterministic=True`` (the default) a tie at the k-th boundary keeps the
   smaller block id, so the selected SET is reproducible across runs; the slot order within a row is not.
 * **The fp8 indexer cache**: ``qi`` and ``kbar`` may both be ``float8_e4m3fn`` -- plain e4m3 of the RMSNormed values,
-  no scales (both are O(1) after their norms; the choice of the reference serving stacks). The scorer then runs
+  no scales (both are O(1) after their norms; the choice of the reference serving stacks). Hopper uses native e4m3 warp MMA. Blackwell runs
   the DSA MXFP8 arm with all-ones E8M0 scale blobs, which is exactly ``sum_h relu(e4m3(q_h) . e4m3(kbar_b))`` in
   fp32 -- the bf16 kernel on the upcast values gives the same scores -- so the selection differs from the bf16
   one only where the e4m3 rounding of the inputs moves a score across the k-th boundary. That is a NUMERICS
@@ -285,13 +284,14 @@ def qsa_select_forward(
         cu_seqlens_q_scale_padded: (appended) the e4m3 arm's padded Q scale prefix -- ``[B + 1]`` int32 CUDA, every
             sequence's length rounded up to the scale span of its heads (``_fp8_q_scale_prefix``) -- precomputed by a
             caller whose ``cu_seqlens_q`` is a plan constant (the block's indexer stage: nothing built per execute,
-            Rule 1); ``None`` = derived per call on device (five small ops); refused on the bf16 arm.
+            Rule 1); ``None`` = derived per call on device; refused on the bf16 arm. Hopper accepts
+            this prefix but uses plain FP8 MMA, so it needs no scale storage.
 
     Returns:
         ``TupleDict(block_ids=[T, top_k] int32, scores=[T, top_k] fp32)``.
 
     Raises:
-        NotImplementedError: a head count outside the packed groups, a device below the SM100 family, or a
+        NotImplementedError: a head count outside the packed groups, an unsupported device, or a
             CuTe DSL below the floor / without the target (the message names the version or the set).
         ValueError: a malformed input (shape, dtype, device, prefix, geometry).
     """
@@ -360,10 +360,7 @@ def qsa_select_forward(
                     f"complete blocks, but n_blocks_per_seq = {n_blocks_s} and kbar holds {n_blocks_max} rows per sequence"
                 )
 
-    # Rule 7 first: the CuTe DSL floor (device-free) BEFORE the head-group read -- the module that spells the scorer's packed head
-    # groups imports the DSA indexer package, whose __init__ imports its kernel modules, so a sub-floor DSL gets the typed version
-    # decline here and never an error from inside the DSL (qsa_select_decode_forward orders it the same way); then the head count (a property
-    # of the request, ahead of any device query), then the target and the device family, then the wrapper import.
+    # Gate the DSL before importing DSA, whose package initializer imports kernels.
     dsl_problem = cutedsl_requirement_error("qsa_select_forward")
     if dsl_problem is not None:
         raise NotImplementedError(dsl_problem)
@@ -375,8 +372,28 @@ def qsa_select_forward(
     arch_problem = cutedsl_arch_requirement_error(device_cc)
     if arch_problem is not None:
         raise NotImplementedError(arch_problem)
+    if device_cc == (9, 0):
+        from ._selection_sm90 import select
+
+        return select(
+            qi,
+            kbar,
+            cu_seqlens_q,
+            topk=top_k,
+            ratio=block_size,
+            pos=q_pos0,
+            max_q=max_seqlen_q,
+            scale=head_dim**-0.5 if scale is None else scale,
+            weights=w,
+            deterministic=deterministic,
+            ids=block_ids_out,
+            scores=scores_out,
+            cand=cand_buffer,
+            offsets=cand_batch_offsets,
+            stream=stream,
+        )
     if device_cc[0] != 10:
-        raise NotImplementedError(f"qsa_select_forward runs the SM100-family indexer scorer (cc 10.x); found cc {device_cc[0]}.{device_cc[1]}")
+        raise NotImplementedError(f"qsa_select_forward requires SM90 or the SM100 family; found cc {device_cc[0]}.{device_cc[1]}")
 
     from cudnn.deepseek_sparse_attention.indexer_forward import indexer_forward_top_k_wrapper
 

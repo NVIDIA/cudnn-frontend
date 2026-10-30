@@ -23,16 +23,15 @@ def _implementation(q, k, direction):
     if not installed or cutedsl_too_old(version):
         raise ImportError(cutedsl_requirement_error("QSA") or "QSA requires nvidia-cutlass-dsl")
     cc = device_info(q.device.index).compute_capability
-    if cc not in ((10, 0), (10, 3), (10, 7)):
-        raise NotImplementedError(f"QSA requires SM100, SM103 or SM107, got SM{cc[0]}{cc[1]}")
+    if cc not in ((9, 0), (10, 0), (10, 3), (10, 7)):
+        raise NotImplementedError(f"QSA requires SM90, SM100, SM103 or SM107, got SM{cc[0]}{cc[1]}")
     reason = cutedsl_arch_requirement_error(cc)
     if reason:
         raise NotImplementedError(reason)
     arch = cc[0] * 10 + cc[1]
-    family = 107 if arch == 107 else 100
-    if direction == "bprop":
-        # The batched backward (12:1 pairs, 6:1 quads) is one SM100 module compiled for every architecture; 24:2 runs
-        # the single-query backward, which has a Rubin copy.
+    family = 90 if arch == 90 else (107 if arch == 107 else 100)
+    if direction == "bprop" and arch != 90:
+        # Blackwell and Rubin share the batched backward for 12:1 and 6:1.
         if paired_backward(q.shape[1], k.shape[1]):
             family = 100
         elif family == 100:
@@ -50,7 +49,7 @@ def _compact(sel_blocks, lo, hi, block_first, block_last, arch, stream):
 
 
 def _compact_backward(sel_blocks, lo, hi, block_first, block_last, arch, stream, hq, hkv):
-    if paired_backward(hq, hkv):
+    if arch != 90 and paired_backward(hq, hkv):
         from ._metadata import compile_group_kernel
 
         nq = paired_queries(hq, hkv)
@@ -70,9 +69,8 @@ def _forward_runtime():
     """Resolve forward imports after the DSL gate."""
     from cuda.bindings import driver as cuda
     from cudnn.api_base import TupleDict, _raw_stream
-    from . import _forward
 
-    return cuda, TupleDict, _raw_stream, _forward
+    return cuda, TupleDict, _raw_stream
 
 
 def qsa_forward(
@@ -97,10 +95,12 @@ def qsa_forward(
     total, hq, hkv, _ = check_inputs(q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_first, block_last, scale, block_size)
     with torch.cuda.device(q.device):
         impl, arch = _implementation(q, k, "fprop")
-        cuda, TupleDict, raw_stream, _forward = _forward_runtime()
+        cuda, TupleDict, raw_stream = _forward_runtime()
         stream = cuda.CUstream(raw_stream(torch)(q.device.index))
         out, out_fp32 = torch.empty_like(q), torch.empty_like(q, dtype=torch.float32)
         lse = torch.empty((hq, total), dtype=torch.float32, device=q.device)
+        from . import _forward
+
         _forward.launch(impl, arch, q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_first, block_last, out, out_fp32, lse, float(scale), stream)
         return TupleDict(out=out, out_fp32=out_fp32, lse=lse)
 
