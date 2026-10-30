@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Hopper selector: head groups, native strides and changed-metadata replay."""
 
+import os
 import subprocess
 import sys
 
@@ -153,6 +154,7 @@ if sys.argv[1] == 'reload':
 for dtype in (torch.bfloat16, torch.float8_e4m3fn):
     test_weighted_heads_and_strided_outputs(4, dtype)
 """
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(path for path in sys.path if path))
     for mode in ("build", "reload"):
-        run = subprocess.run([sys.executable, "-c", script, mode], capture_output=True, text=True, timeout=180)
+        run = subprocess.run([sys.executable, "-c", script, mode], capture_output=True, text=True, timeout=180, env=env)
         assert run.returncode == 0, run.stdout + run.stderr

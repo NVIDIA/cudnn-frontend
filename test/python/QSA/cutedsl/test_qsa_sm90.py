@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Hopper attention artifact reload across processes and runtime extents."""
 
+import os
 import subprocess
 import sys
 
@@ -39,8 +40,9 @@ for heads in ((6, 1), (12, 1), (24, 2)):
         indices[:, :groups.shape[1]] = groups
         check_indexed(inputs, indices)
 """
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(path for path in sys.path if path))
     for mode in ("build", "reload"):
-        run = subprocess.run([sys.executable, "-c", script, mode], capture_output=True, text=True, timeout=240)
+        run = subprocess.run([sys.executable, "-c", script, mode], capture_output=True, text=True, timeout=240, env=env)
         assert run.returncode == 0, run.stdout + run.stderr
 
 

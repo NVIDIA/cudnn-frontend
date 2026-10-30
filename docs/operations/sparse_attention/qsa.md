@@ -164,8 +164,8 @@ On Blackwell and Rubin, the 12:1 and 6:1 paths batch consecutive queries (two
 block union once. Owner bits retain each query's mask while sharing K/V loads.
 Hopper and the 24:2 path process one query per CTA. Hopper uses warp MMA for
 the five matrix products, with three BF16 parts of dS preserving dQ cancellation.
-On those batched paths, a device-side K/V scan selects a per-query fallback when nonfinite values are
-present. The fallback reuses the compact union but applies each query's owner
+On the Blackwell and Rubin batched paths, a device-side K/V scan selects a
+per-query fallback when nonfinite values are present. The fallback reuses the compact union but applies each query's owner
 bits and bounds before dQ arithmetic, preventing a masked NaN from crossing
 between queries or packed sequences. Both launches test the current device flag;
 only one computes gradients. The flag is rebuilt during CUDA graph replay.
