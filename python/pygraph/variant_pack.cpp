@@ -1144,13 +1144,21 @@ read_native_execution_bindings(py::handle object) {
 // whether it came from the caller or from the workspace, and both are read
 // through the exchange vtable rather than a per-call capsule.
 OperandBuffer *
-make_operand_buffer(int64_t ptr, std::vector<int64_t> shape, int dtype_code, int dtype_bits, int32_t device_id) {
+make_operand_buffer(int64_t ptr,
+                    std::vector<int64_t> shape,
+                    int dtype_code,
+                    int dtype_bits,
+                    int32_t device_id,
+                    std::vector<int64_t> strides) {
+    if (!strides.empty() && strides.size() != shape.size())
+        throw py::value_error("make_operand_buffer: strides must be empty (dense) or one per shape extent");
     Operand operand;
     operand.data   = reinterpret_cast<void *>(ptr);
     operand.ndim   = static_cast<int32_t>(shape.size());
     operand.dtype  = DLDataType{static_cast<uint8_t>(dtype_code), static_cast<uint8_t>(dtype_bits), 1};
     operand.shape  = std::move(shape);
-    operand.filled = true;  // stride left empty: a carve is dense by construction
+    operand.stride = std::move(strides);  // empty: a carve is dense by construction
+    operand.filled = true;
     return new OperandBuffer(std::move(operand), device_id);
 }
 
@@ -1525,6 +1533,7 @@ capsule built in python.
           py::arg("dtype_code"),
           py::arg("dtype_bits"),
           py::arg("device_id"),
+          py::arg("strides") = std::vector<int64_t>{},
           "A DLPack producer over memory the caller did not supply -- a workspace carve.");
 
     m.def("_read_buffer_sequence", &read_native_buffer_sequence, py::arg("buffers"));

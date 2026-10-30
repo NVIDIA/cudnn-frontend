@@ -1990,7 +1990,7 @@ def compute1_warp_group(
                                 for t in cutlass.range_constexpr(seed_vw):
                                     words.append(seed_chunk[t].to(cfg.acc_dtype))
                         else:
-                            for t in cutlass.range_constexpr(ldtm_width):
+                            for _ in cutlass.range_constexpr(ldtm_width):
                                 words.append(cutlass.Float32(0.0))
                         if cutlass.const_expr(cfg.has_composed):
                             for g in cutlass.range_constexpr(ldtm_width // 4):

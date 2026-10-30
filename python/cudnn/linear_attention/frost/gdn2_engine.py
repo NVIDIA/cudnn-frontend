@@ -15,8 +15,8 @@ from cudnn.engines.base import BaseEngine, CompiledPlan
 
 from cudnn.frost.device import build_device, current_device, multiprocessor_count
 from cudnn.frost.workspace import WorkspaceLayout, carve_plan
-from ..graph_analyzer import analyze
-from .engine import FrostLaPlan, frost_la_gate, summary_support_gates
+from ..graph_analyzer import BACKWARD_CONTEXT_PORTS, analyze
+from .engine import FrostLaPlan, frost_la_gate, intermediates_gate, summary_support_gates
 
 # the d_v split takes the prep path up to this fraction of the SM count in (sequence, head) tiles (GB200 fit; Rubin retune pending)
 PREP_TILE_FRACTION = 0.425
@@ -54,6 +54,8 @@ class Gdn2FrostEngine(BaseEngine):
 
         facts = graph._facts_for(analyze)
         frost_la_gate("Gdn2FrostEngine", facts, "GDN2")
+        if facts.is_bwd and "piece_state_grads" in facts.intermediate_ports:
+            intermediates_gate("Gdn2FrostEngine", facts, b_t=16)
         if facts.d_qk not in (64, 128):
             raise NotImplementedError(f"Gdn2FrostEngine: q/k head dim must be 64 or 128, got {facts.d_qk}")
         if facts.d_v not in (64, 128):
@@ -622,6 +624,8 @@ class CompiledGdn2Bwd:
         self.length_rule = self.chain and self.batch_invariant
         self.num_pieces = B * self.pieces if self.chain else B
         self.fused_h_m = self.chain and not self.has_state_checkpoints
+        self.has_piece_tables = "piece_state_grads" in node.inputs and self.chain
+        self.has_piece_transitions = self.has_piece_tables and not self.fused_h_m
 
         layout = WorkspaceLayout()
         regions = []
@@ -713,10 +717,12 @@ class CompiledGdn2Bwd:
                 ("main_count", off_piece_table + table.main_count, "int32", (1,)),
                 ("summary_count", off_piece_table + table.summary_count, "int32", (1,)),
                 ("work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
-                ("state_m", layout.add(self.num_pieces * HO * K * K * 4), "float32", (self.num_pieces, HO, K, K)),
-                ("state_g", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape),
                 ("state_dx_end", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape),
             ]
+            if not self.has_piece_transitions:
+                regions.append(("state_m", layout.add(self.num_pieces * HO * K * K * 4), "float32", (self.num_pieces, HO, K, K)))
+            if not self.has_piece_tables:
+                regions.append(("state_g", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
             if not self.has_state_checkpoints:
                 regions.append(("state_h", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
                 regions.append(("state_x", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
@@ -762,6 +768,8 @@ class CompiledGdn2Bwd:
         self.index_composed = pos.get("composed_initial_state")
         self.index_d_a_log = pos.get("d_a_log")
         self.index_d_dt_bias = pos.get("d_dt_bias")
+        self.index_piece_transitions = pos.get("piece_transitions")
+        self.index_piece_state_grads = pos.get("piece_state_grads")
 
     def run(self, views, workspace, stream) -> None:
         q = views[self.index_q]
@@ -790,6 +798,8 @@ class CompiledGdn2Bwd:
         stream = stream if stream is not None else 0
 
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
+        state_m = views[self.index_piece_transitions] if self.has_piece_transitions else region.get("state_m")
+        state_g = views[self.index_piece_state_grads] if self.has_piece_tables else region.get("state_g")
         dcomposed = None
         if self.index_following_state_grad is not None:
             dcomposed = region["composed_dstate"]
@@ -835,6 +845,8 @@ class CompiledGdn2Bwd:
                 dt_bias,
                 region,
                 stream,
+                state_m,
+                state_g,
             )
         else:
             buffers = dict(
@@ -938,6 +950,8 @@ class CompiledGdn2Bwd:
         dt_bias,
         region,
         stream,
+        state_m,
+        state_g,
     ) -> None:
         """Chain prologue, H and M summaries (M alone when the series is passed back), forward chain X, G summary, reverse
         chain seeded with d_final_state, dense series (the forward's or the seeded recompute), bprop over the pieces: one
@@ -985,9 +999,9 @@ class CompiledGdn2Bwd:
             dw=dw,
             dbeta=dbeta,
             state_h=region.get("state_h"),
-            state_m=region["state_m"],
+            state_m=state_m,
             state_x=region.get("state_x"),
-            state_g=region["state_g"],
+            state_g=state_g,
             state_dx_end=region["state_dx_end"],
             seed=state0,
             dseed=dstate_in,
@@ -1010,6 +1024,8 @@ class CompiledGdn2Bwd:
             use_beta_sigmoid=self.use_beta_sigmoid,
             beta_guard=self.beta_guard,
             scale=self.scale,
+            has_piece_transitions=self.has_piece_transitions,
+            has_piece_state_grads=self.has_piece_tables,
         )
         if self.chain_launch is None:
             self.chain_launch = self.build_chain_backward(
@@ -1492,13 +1508,14 @@ class CompiledGdn2SummaryBwd:
         self.num_sm = multiprocessor_count(self.device)
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.overwrite_initial_state = bool(node.params.get("overwrite_initial_state", False))
+        self.checkpoint_cadence = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
         self.pieces, self.unit_chunks = choose_pieces(
             num_seqs=B,
             heads_out=HO,
             num_sm=self.num_sm,
             total_tokens=total,
             b_t=self.b_t,
-            cadence_tokens=0,
+            cadence_tokens=self.checkpoint_cadence,
             batch_invariant=self.batch_invariant,
             compose_tail=True,
             expand_num=1,
@@ -1507,6 +1524,7 @@ class CompiledGdn2SummaryBwd:
         self.chain = self.pieces > 0
         self.length_rule = self.chain and self.batch_invariant
         self.num_pieces = B * self.pieces if self.chain else B
+        self.has_piece_tables = "piece_state_grads" in node.outputs and self.chain
         layout = WorkspaceLayout()
         regions = []
         # One FP32 state and bounded-key ring per persistent CTA; sequential backward kernels share the arena.
@@ -1537,10 +1555,11 @@ class CompiledGdn2SummaryBwd:
                 ("main_count", off_piece_table + table.main_count, "int32", (1,)),
                 ("summary_count", off_piece_table + table.summary_count, "int32", (1,)),
                 ("work_items", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
-                ("state_g", layout.add(self.num_pieces * HO * V * K * 4), "float32", (self.num_pieces, HO, V, K)),
-                ("state_m", layout.add(self.num_pieces * HO * K * K * 4), "float32", (self.num_pieces, HO, K, K)),
                 ("state_x", layout.add(self.num_pieces * HO * V * K * 4), "float32", (self.num_pieces, HO, V, K)),
             ]
+            if not self.has_piece_tables:
+                regions.append(("state_g", layout.add(self.num_pieces * HO * V * K * 4), "float32", (self.num_pieces, HO, V, K)))
+                regions.append(("state_m", layout.add(self.num_pieces * HO * K * K * 4), "float32", (self.num_pieces, HO, K, K)))
             summary_bytes = tensormap_workspace_bytes(summary_module, self.num_pieces)
             regions.append(("summary_tensormaps", layout.add(summary_bytes, align=128), "int64", (summary_bytes // 8,)))
             recompute_bytes = tensormap_workspace_bytes(recompute_module, self.num_pieces)
@@ -1585,6 +1604,8 @@ class CompiledGdn2SummaryBwd:
         self.index_dt_bias = pos.get("dt_bias")
         self.index_d_initial_state = pos["d_initial_state"]
         self.index_transition = pos.get("transition")
+        self.index_piece_transitions = pos.get("piece_transitions")
+        self.index_piece_state_grads = pos.get("piece_state_grads")
 
     def run(self, views, workspace, stream) -> None:
         q = views[self.index_q]
@@ -1601,8 +1622,10 @@ class CompiledGdn2SummaryBwd:
         stream = stream if stream is not None else 0
 
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
+        state_m = views[self.index_piece_transitions] if self.has_piece_tables else region.get("state_m")
+        state_g = views[self.index_piece_state_grads] if self.has_piece_tables else region.get("state_g")
         if self.chain:
-            self.run_chain(q, k, g, beta, do, cu, dstate_in, dstate0, transition, a_log, dt_bias, region, stream)
+            self.run_chain(q, k, g, beta, do, cu, dstate_in, dstate0, transition, a_log, dt_bias, region, stream, state_m, state_g)
             return
         work_items = region["work_items"]
         work_count = region["work_count"]
@@ -1742,12 +1765,12 @@ class CompiledGdn2SummaryBwd:
             )
         self.run_state_chain(self.transition_chain, self.num_seqs, None, transition_m, None, None, None, transition, stream)
 
-    def run_chain(self, q, k, g, beta, do, cu, dstate_in, dstate0, transition, a_log, dt_bias, region, stream) -> None:
+    def run_chain(self, q, k, g, beta, do, cu, dstate_in, dstate0, transition, a_log, dt_bias, region, stream, state_m, state_g) -> None:
         """Chain prologue, M (recompute transition arm) and G (zero-seeded bprop summary) of every filled piece, one reverse
         fp32 state chain seeded with d_final_state whose tail is d_initial_state and whose running product is transition."""
         cu_pieces = region["cu_pieces"]
         work_items, work_count = region["work_items"], region["main_count"]
-        state_g, state_m, state_x = region["state_g"], region["state_m"], region["state_x"]
+        state_x = region["state_x"]
         gate_a = a_log if self.safe_gate else None
         gate_dt = dt_bias if self.safe_gate else None
         warm = self.chain_reverse is not None

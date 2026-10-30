@@ -1184,7 +1184,7 @@ def compute2_warp_group(
                                     for t in cutlass.range_constexpr(seed_vw):
                                         seed_block.append(seed_chunk[t].to(cutlass.Float32))
                             else:
-                                for t in cutlass.range_constexpr(16):
+                                for _ in cutlass.range_constexpr(16):
                                     seed_block.append(cutlass.Float32(0.0))
                             if cutlass.const_expr(cfg.has_composed):
                                 for g in cutlass.range_constexpr(4):

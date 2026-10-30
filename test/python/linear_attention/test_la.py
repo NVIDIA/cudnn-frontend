@@ -1027,7 +1027,7 @@ def test_bwd_skip_gate(backend, variant, per_channel, with_z):
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", ["mamba2"])
 def test_bwd_z_gate_strided_views_bitwise(backend, variant):
-    """z and dO handed in as head-padded views (stride-1 innermost dim, wider outer strides) give o, dz and the data
+    """z and dO intermediates in as head-padded views (stride-1 innermost dim, wider outer strides) give o, dz and the data
     gradients bitwise equal to their dense copies: the z-gate backward reads every tensor through its own strides."""
     case = make_case(variant, torch.bfloat16, B=2, T=320)
     tensors = case_tensors(case)
@@ -4318,7 +4318,7 @@ def chain_case(variant, seq_lens, *, H=4, HK=None, HV=None, K=128, V=None, cu_dt
 
 def chain_grads(backend, case, *, batch_invariant=False, checkpoint=0, initial_state=None, d_final_state=None, dO=None, cu=None, params=(), **kw):
     """(o, final_state, grads by leaf name, dO, outputs) of one pinned forward + backward on fresh leaves;
-    ``params`` are extra (name, tensor) leaves handed to the op as keywords."""
+    ``params`` are extra (name, tensor) leaves intermediates to the op as keywords."""
     leaves = dict(zip(LEAF_NAMES[case.variant], (t.requires_grad_(True) for t in thd_tensors(case))))
     extra = {name: t.detach().clone().requires_grad_(True) for name, t in params}
     state0 = initial_state.detach().clone().requires_grad_(True) if initial_state is not None else None
@@ -5800,7 +5800,7 @@ def state_pool(case, packed, spare_rows=5, fill=3.14159, padded=False):
 def test_state_indices_fwd_bitwise(backend, variant, schedule, padded):
     """``state_indices`` reads and writes the caller's pool through permuted, sparse rows: output and final states bitwise
     the packed run's (the pool implies ``overwrite_initial_state``, so a batch the split-K cut would serve runs uncut, the
-    ``batch_invariant`` run's schedule), rows outside the table untouched, the pool handed back as ``final_state``; a
+    ``batch_invariant`` run's schedule), rows outside the table untouched, the pool intermediates back as ``final_state``; a
     padded slot stride reads and writes the same rows."""
     case = chain_case(variant, [4096], H=4) if schedule == "chain" else make_case(variant, torch.bfloat16, B=8, T=2048, H=16, lo=0.99)
     packed = random_state(case)
@@ -6029,7 +6029,7 @@ def test_dv_split_checkpoint_series_bitwise(backend, variant):
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_dv_split_state_indices_bitwise(backend, variant, padded):
     """``state_indices`` on a split batch (the pool implies ``overwrite_initial_state``): output and pool rows bitwise the
-    packed run's, spare rows untouched, the pool handed back as ``final_state``."""
+    packed run's, spare rows untouched, the pool intermediates back as ``final_state``."""
     case = dv_split_case(variant)
     packed = random_state(case)
     o_ref, fs_ref = run_fwd(backend, case, initial_state=packed.clone(), output_final_state=True)
@@ -6105,7 +6105,7 @@ def test_prep_checkpoint_series(backend, variant):
 @pytest.mark.parametrize("variant", PREP_VARIANTS)
 def test_prep_state_indices_bitwise(backend, variant, padded):
     """``state_indices`` on a prep-path batch: output and pool rows bitwise the packed run's (the same path), spare rows
-    untouched, the pool handed back as ``final_state``."""
+    untouched, the pool intermediates back as ``final_state``."""
     case = prep_case(variant)
     packed = random_state(case)
     o_ref, fs_ref = run_fwd(backend, case, initial_state=packed.clone(), output_final_state=True)
@@ -6199,28 +6199,32 @@ def cp_forward_apply(case, leaves, cu, h_pre, m_pre, checkpoint_every_n_tokens=0
     return o, composed, checkpoints
 
 
-def cp_backward_prepare(case, leaves, cu, dO):
+def cp_backward_prepare(case, leaves, cu, dO, output_intermediates=False, checkpoint_every_n_tokens=0, **op_kw):
     """This rank's backward summary from a zero outgoing-state gradient: the backward summary op on the view of the FIRST
     local sequence (the one continuing from the previous rank) with ``output_transition``; fp32 ``(local_state_grad,
-    transition)``, the transition already the transpose the fold reads."""
+    transition)``, the transition already the transpose the fold reads, and with ``output_intermediates`` the summary's
+    intermediates as a third element (the raw backward's keywords; a zero-size entry is one the summary does not emit)."""
     summary_bwd = getattr(la_ops, f"{CP_PREFIX[case.variant]}_summary_bwd")
-    plan = dict(plan_name=f"{case.variant}_summary_frost")
+    plan = dict(plan_name=f"{case.variant}_summary_frost", output_transition=True, **op_kw)
+    if output_intermediates:
+        plan.update(output_intermediates=True, checkpoint_every_n_tokens=checkpoint_every_n_tokens)
     if case.variant in NO_BETA_VARIANTS:
         q, k, v, g = leaves
-        g_, t = summary_bwd(dO, g, case.gates["A"], q, cu[:2], dt_bias=case.gates["dt_bias"], output_transition=True, **plan)
+        out = summary_bwd(dO, g, case.gates["A"], q, cu[:2], dt_bias=case.gates["dt_bias"], **plan)
     else:
         q, k, v, g, beta, *w = leaves
         n = (case.n,) if case.variant in HOUSEHOLDER_VARIANTS else ()
-        g_, t = summary_bwd(q, k, g, beta, dO, cu[:2], *n, scale=float(case.K**-0.5), output_transition=True, **plan)
-    return g_[0], t[0]
+        out = summary_bwd(q, k, g, beta, dO, cu[:2], *n, scale=float(case.K**-0.5), **plan)
+    return (out[0][0], out[1][0], out[2]) if output_intermediates else (out[0][0], out[1][0])
 
 
-def cp_backward_apply(case, leaves, cu, dO, composed, g_fol, t_fol, state_checkpoints=None, checkpoint_every_n_tokens=0):
+def cp_backward_apply(case, leaves, cu, dO, composed, g_fol, t_fol, state_checkpoints=None, checkpoint_every_n_tokens=0, intermediates=None, **op_kw):
     """The local backward from the forward's composed state with the following ranks' summaries (``[P, ...]`` fp32, rank
     order) folded on the device into the one-row gradient state the last local sequence starts from: the raw
     ``torch.ops.cudnn.<op>_bwd`` with ``composed_initial_state`` and ``following_state_grad`` / ``following_transition``;
-    a zero-size composed state (no preceding rank) is ``None``.  Returns the input gradients in the raw op's order with
-    the state gradient dropped."""
+    a zero-size composed state (no preceding rank) is ``None``.  ``intermediates`` is the backward summary's dict
+    (``output_intermediates``), passed through as keywords.  Returns the input gradients in the raw op's order with the
+    state gradient dropped."""
     raw = getattr(torch.ops.cudnn, f"{CP_PREFIX[case.variant]}_bwd")
     extra = dict(
         composed_initial_state=composed if composed.numel() else None,
@@ -6229,6 +6233,8 @@ def cp_backward_apply(case, leaves, cu, dO, composed, g_fol, t_fol, state_checkp
         following_state_grad=g_fol,
         following_transition=t_fol,
         plan_name=f"{case.variant}_frost",
+        **(intermediates or {}),
+        **op_kw,
     )
     if case.variant in NO_BETA_VARIANTS:
         q, k, v, g = leaves
@@ -6242,8 +6248,8 @@ def cp_backward_apply(case, leaves, cu, dO, composed, g_fol, t_fol, state_checkp
 def cp_grad_leaves(variant):
     """The suite's leaf name behind each gradient the backward wrapper returns, in its order (``None`` skips an entry)."""
     if variant in NO_BETA_VARIANTS:
-        return ("v", "g", "A", "k", "q", None, "dt_bias", None)
-    return ("q", "k", "v", "g", "beta", "w") if variant == "gdn2" else ("q", "k", "v", "g", "beta")
+        return ["v", "g", "A", "k", "q", None, "dt_bias", None]
+    return ["q", "k", "v", "g", "beta", "w"] if variant == "gdn2" else ["q", "k", "v", "g", "beta"]
 
 
 def cp_forward_whole(case, leaves, **kw):
@@ -6257,6 +6263,13 @@ def cp_fold(variant, x, h, m):
     if variant in NO_BETA_VARIANTS:
         return torch.exp2(m)[:, None, None] * x + h
     return x @ m + h
+
+
+def cp_state_table(N, case, padded):
+    """A caller's fp32 state table ``[N, HO, V, K]``: dense, or a view of a wider buffer with every stride above the
+    innermost padded (the engines read the caller's strides; the folds must too)."""
+    storage = torch.randn(N, case.HO, case.V + 1, case.K + 4, device="cuda", dtype=torch.float32) * 0.1
+    return storage[:, :, : case.V, : case.K] if padded else storage[:, :, : case.V, : case.K].contiguous()
 
 
 def cp_case(variant, seq_lens, lo):
@@ -6298,8 +6311,8 @@ def test_context_parallel_protocol(backend, variant, layout, checkpoint):
     assert h_all.dtype == m_all.dtype == torch.float32 and h_all.shape == (slabs, case.HO, case.V, case.K)
     applied = []
     for r in range(slabs):
-        pre_start, _ = cp_rank_bounds(bounds, slab_len, r)
-        applied.append(cp_forward_apply(case, slab_leaves[r], cus[r], h_all[pre_start:r], m_all[pre_start:r], cadence))
+        preceding_rank_start, _ = cp_rank_bounds(bounds, slab_len, r)
+        applied.append(cp_forward_apply(case, slab_leaves[r], cus[r], h_all[preceding_rank_start:r], m_all[preceding_rank_start:r], cadence))
     assert_rms_close(f"o[{variant}, cp {layout}]", torch.cat([out[0] for out in applied]), o_whole, CP_TOL)
 
     summaries = [cp_backward_prepare(case, slab_leaves[r], cus[r], slab_dO[r]) for r in range(slabs)]
@@ -6307,7 +6320,7 @@ def test_context_parallel_protocol(backend, variant, layout, checkpoint):
     t_all = torch.stack([s[1] for s in summaries])
     grads = {}
     for r in range(slabs):
-        _, fol_stop = cp_rank_bounds(bounds, slab_len, r)
+        _, following_rank_stop = cp_rank_bounds(bounds, slab_len, r)
         composed, checkpoints = applied[r][1], applied[r][2]
         out = cp_backward_apply(
             case,
@@ -6315,8 +6328,8 @@ def test_context_parallel_protocol(backend, variant, layout, checkpoint):
             cus[r],
             slab_dO[r],
             composed,
-            g_all[r + 1 : fol_stop],
-            t_all[r + 1 : fol_stop],
+            g_all[r + 1 : following_rank_stop],
+            t_all[r + 1 : following_rank_stop],
             checkpoints if checkpoints.numel() else None,
             cadence,
         )
@@ -6327,6 +6340,124 @@ def test_context_parallel_protocol(backend, variant, layout, checkpoint):
         got = torch.stack(pieces).sum(0) if leaf in PARAM_NAMES.get(variant, ()) else torch.cat(pieces)
         tol = CP_TOL if leaf in ("q", "k", "v") else CP_GATE_TOL
         assert_rms_close(f"d{leaf}[{variant}, cp {layout}]", got, grads_whole[leaf].float(), tol)
+
+
+CP_INTERMEDIATE_VARIANTS = ("gdn", "kda", "gdn2", "gdp")
+CP_INTERMEDIATE_FULL = ("gdn", "gdp")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mode", ["recompute", "checkpoints", "l2norm"])
+@pytest.mark.parametrize("variant", CP_INTERMEDIATE_VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_context_parallel_intermediates(backend, variant, mode):
+    """The backward summary's intermediates (``output_intermediates``): one sequence per slab, the summary on the first
+    (only) local sequence returns the per-piece tables (GDN / GDP also the normalized rows and chunk factors; KDA and
+    GDN-2 normalize and factor in-kernel; Mamba-2's summary never chains and its backward has no per-piece pass) beside
+    ``G`` and the transition, and the raw backward given them is BITWISE the raw backward without them (the same kernels
+    read the same bytes), in recompute mode, with the forward's checkpoints at the chunk cadence, and with the q/k l2norm
+    fused in the kernels (GDP at d_v = 64, where the backward normalizes the compact rows the summary normalizes; the
+    forward summary's normalized k rows then feed the forward the same way)."""
+    l2norm = mode == "l2norm"
+    full = variant in CP_INTERMEDIATE_FULL
+    cadence = CP_CADENCE[variant] if mode == "checkpoints" else 0
+    V = 64 if (l2norm and variant == "gdp") else 128
+    case = make_case(variant, torch.bfloat16, seq_lens=[4096], H=2, K=128, V=V, lo=0.9)
+    slabs = 4
+    slab_len = case.T // slabs
+    bounds = case.cu.tolist()
+    cus = [cp_local_cu(bounds, slab_len, r) for r in range(slabs)]
+    slab_leaves = [thd_tensors(case, window=(r * slab_len, (r + 1) * slab_len)) for r in range(slabs)]
+    set_seed(SEED + 53)
+    dO = to_thd(torch.randn(case.B, case.T, case.HO, case.V, device="cuda") * 0.1).to(case.v.dtype)
+    op_kw = dict(use_qk_l2norm_in_kernel=True) if l2norm else {}
+    with waive_unsupported(backend, variant):
+        summaries = [cp_forward_prepare(case, slab_leaves[r], cus[r]) for r in range(slabs)]
+    h_all = torch.stack([s[0] for s in summaries])
+    m_all = torch.stack([s[1] for s in summaries])
+    applied = []
+    for r in range(slabs):
+        args, kw = cp_main_call(case, slab_leaves[r], cus[r])
+        o, _, checkpoints, composed = getattr(la_ops, CP_PREFIX[variant])(
+            *args, preceding_state_update=h_all[:r], preceding_transition=m_all[:r], checkpoint_every_n_tokens=cadence, **kw, **op_kw
+        )
+        applied.append((composed, checkpoints))
+        if l2norm and full:
+            q, k, v, g, beta, *w = slab_leaves[r]
+            n = (case.n,) if variant in HOUSEHOLDER_VARIANTS else ()
+            _, _, fwd_intermediates = getattr(la_ops, f"{CP_PREFIX[variant]}_summary")(
+                k, v, g, beta, *w, cus[r][-2:], *n, plan_name=f"{variant}_summary_frost", output_intermediates=True, **op_kw
+            )
+            assert set(fwd_intermediates) == {"k_normalized"} and fwd_intermediates["k_normalized"].dtype == k.dtype
+            assert (
+                fwd_intermediates["k_normalized"].shape == (k.shape[0] * (case.n if variant in HOUSEHOLDER_VARIANTS else 1), *k.shape[-2:])
+                or fwd_intermediates["k_normalized"].shape == k.shape
+            )
+            o_handed = getattr(la_ops, CP_PREFIX[variant])(
+                *args, preceding_state_update=h_all[:r], preceding_transition=m_all[:r], checkpoint_every_n_tokens=cadence, **kw, **op_kw, **fwd_intermediates
+            )[0]
+            assert_bitwise(f"o[{variant}, rank {r} intermediates k_normalized]", o_handed, o)
+    prepared = [cp_backward_prepare(case, slab_leaves[r], cus[r], dO[r * slab_len : (r + 1) * slab_len], True, cadence, **op_kw) for r in range(slabs)]
+    g_all = torch.stack([p[0] for p in prepared])
+    t_all = torch.stack([p[1] for p in prepared])
+    for r in range(slabs):
+        intermediates = prepared[r][2]
+        assert set(intermediates) == {"q_normalized", "k_normalized", "q_inv_norm", "k_inv_norm", "chunk_factors", "piece_transitions", "piece_state_grads"}
+        assert intermediates["piece_state_grads"].numel() > 0 and intermediates["piece_transitions"].numel() > 0
+        assert intermediates["piece_state_grads"].dtype == intermediates["piece_transitions"].dtype == torch.float32
+        assert (intermediates["chunk_factors"].numel() > 0) == full and intermediates["chunk_factors"].dtype == case.v.dtype
+        assert (intermediates["q_normalized"].numel() > 0) == (l2norm and full) and (intermediates["k_inv_norm"].numel() > 0) == (l2norm and full)
+        composed, checkpoints = applied[r]
+        common = (case, slab_leaves[r], cus[r], dO[r * slab_len : (r + 1) * slab_len], composed, g_all[r + 1 :], t_all[r + 1 :])
+        want = cp_backward_apply(*common, checkpoints if checkpoints.numel() else None, cadence, **op_kw)
+        got = cp_backward_apply(*common, checkpoints if checkpoints.numel() else None, cadence, intermediates=intermediates, **op_kw)
+        for name, a, b in zip(cp_grad_leaves(variant), got, want):
+            if name is not None:
+                assert_bitwise(f"d{name}[{variant}, {mode}, rank {r} intermediates]", a, b)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("variant", CP_INTERMEDIATE_VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_context_parallel_intermediates_geometry(backend, variant):
+    """The per-piece tables line up only with the summary's cut: intermediates to a backward over two local sequences they are
+    left out (the per-token rows still apply), prepared at another checkpoint cadence they are refused."""
+    case = make_case(variant, torch.bfloat16, seq_lens=[2048, 2048], H=2, K=128, V=128, lo=0.9)
+    leaves = thd_tensors(case)
+    set_seed(SEED + 59)
+    dO = to_thd(torch.randn(case.B, case.T, case.HO, case.V, device="cuda") * 0.1).to(case.v.dtype)
+    with waive_unsupported(backend, variant):
+        g_, t_, intermediates = cp_backward_prepare(case, leaves, case.cu, dO, True)
+    assert intermediates["piece_state_grads"].numel() > 0
+    want = cp_backward_apply(case, leaves, case.cu, dO, torch.empty(0, device="cuda"), g_[None][:0], t_[None][:0])
+    got = cp_backward_apply(case, leaves, case.cu, dO, torch.empty(0, device="cuda"), g_[None][:0], t_[None][:0], intermediates=intermediates)
+    for name, a, b in zip(cp_grad_leaves(variant), got, want):
+        if name is not None:
+            assert_bitwise(f"d{name}[{variant}, tables of a one-sequence summary on a two-sequence slab left out]", a, b)
+    one = thd_tensors(case, window=(0, 2048))
+    cu_one = case.cu[:2]
+    g_, t_, intermediates = cp_backward_prepare(case, one, cu_one, dO[:2048], True)
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="checkpoint_every_n_tokens"):
+        cp_backward_apply(
+            case, one, cu_one, dO[:2048], torch.empty(0, device="cuda"), g_[None][:0], t_[None][:0], None, 4 * CP_CADENCE[variant], intermediates=intermediates
+        )
+    leaf_only = {name: tensor for name, tensor in intermediates.items() if name in ("piece_transitions", "piece_state_grads")}
+    want = cp_backward_apply(case, one, cu_one, dO[:2048], torch.empty(0, device="cuda"), g_[None][:0], t_[None][:0])
+    got = cp_backward_apply(case, one, cu_one, dO[:2048], torch.empty(0, device="cuda"), g_[None][:0], t_[None][:0], intermediates=leaf_only)
+    for name, a, b in zip(cp_grad_leaves(variant), got, want):
+        if name is not None:
+            assert_bitwise(f"d{name}[{variant}, leaf tables alone]", a, b)
+    with pytest.raises(ValueError, match="come together"):
+        cp_backward_apply(
+            case,
+            one,
+            cu_one,
+            dO[:2048],
+            torch.empty(0, device="cuda"),
+            g_[None][:0],
+            t_[None][:0],
+            intermediates=dict(piece_state_grads=intermediates["piece_state_grads"]),
+        )
 
 
 @pytest.mark.L0
@@ -6347,15 +6478,15 @@ def test_context_parallel_composed_state(backend, variant):
     m_all = torch.stack([s[1] for s in summaries])
     main_op = getattr(la_ops, CP_PREFIX[variant])
     for r in range(slabs):
-        pre_start, _ = cp_rank_bounds(bounds, slab_len, r)
-        o, composed, _ = cp_forward_apply(case, slab_leaves[r], cus[r], h_all[pre_start:r], m_all[pre_start:r])
+        preceding_rank_start, _ = cp_rank_bounds(bounds, slab_len, r)
+        o, composed, _ = cp_forward_apply(case, slab_leaves[r], cus[r], h_all[preceding_rank_start:r], m_all[preceding_rank_start:r])
         args, kw = cp_main_call(case, slab_leaves[r], cus[r])
-        if pre_start == r:
+        if preceding_rank_start == r:
             assert composed.numel() == 0
             assert_bitwise(f"o[{variant}, rank {r} without preceding ranks]", o, main_op(*args, **kw)[0])
             continue
         x = torch.zeros(case.HO, case.V, case.K, device="cuda", dtype=torch.float64)
-        for j in range(pre_start, r):
+        for j in range(preceding_rank_start, r):
             x = cp_fold(variant, x, h_all[j].double(), m_all[j].double())
         assert composed.dtype == torch.float32 and composed.shape == (1, case.HO, case.V, case.K)
         assert rms_ratio(composed[0], x) < CP_FOLD_TOL, f"rank {r}: composed row rms ratio {rms_ratio(composed[0], x):.3e}"
@@ -6365,13 +6496,15 @@ def test_context_parallel_composed_state(backend, variant):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("padded", [False, True], ids=["dense", "padded"])
 @pytest.mark.parametrize("variant", VARIANTS)
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-def test_context_parallel_caller_state(backend, variant):
+def test_context_parallel_caller_state(backend, variant, padded):
     """A caller-given state table beside the summaries: forward, the composed row is the fold started from the table's
     row 0 (the state beyond the farthest rank) and the forward equals the plain op on the table with that row swapped
     in, bitwise; backward, a caller ``d_final_state`` beside the following summaries equals the raw backward on the
-    table with its last row replaced by the fold started from it, bitwise (every other row is read as given)."""
+    table with its last row replaced by the fold started from it, bitwise (every other row is read as given).  The
+    table is dense or a padded view; the plain op reads the swapped copy, which is dense either way."""
     case = cp_case(variant, [700, 1700, 100, 500, 1096], 0.9)
     bounds, slabs = case.cu.tolist(), 4
     slab_len = case.T // slabs
@@ -6390,14 +6523,16 @@ def test_context_parallel_caller_state(backend, variant):
     raw = getattr(torch.ops.cudnn, f"{CP_PREFIX[variant]}_bwd")
     checked = 0
     for r in range(slabs):
-        pre_start, fol_stop = cp_rank_bounds(bounds, slab_len, r)
+        preceding_rank_start, following_rank_stop = cp_rank_bounds(bounds, slab_len, r)
         N = cus[r].numel() - 1
         args, kw = cp_main_call(case, slab_leaves[r], cus[r])
-        if pre_start < r:
-            table = torch.randn(N, case.HO, case.V, case.K, device="cuda", dtype=torch.float32) * 0.1
-            o, _, _, composed = main_op(*args, initial_state=table, preceding_state_update=h_all[pre_start:r], preceding_transition=m_all[pre_start:r], **kw)
+        if preceding_rank_start < r:
+            table = cp_state_table(N, case, padded)
+            o, _, _, composed = main_op(
+                *args, initial_state=table, preceding_state_update=h_all[preceding_rank_start:r], preceding_transition=m_all[preceding_rank_start:r], **kw
+            )
             x = table[0].double()
-            for j in range(pre_start, r):
+            for j in range(preceding_rank_start, r):
                 x = cp_fold(variant, x, h_all[j].double(), m_all[j].double())
             assert composed.shape == (1, case.HO, case.V, case.K)
             assert rms_ratio(composed[0], x) < CP_FOLD_TOL, f"rank {r}: composed row from the caller's row rms ratio {rms_ratio(composed[0], x):.3e}"
@@ -6405,14 +6540,17 @@ def test_context_parallel_caller_state(backend, variant):
             swapped[0] = composed[0]
             assert_bitwise(f"o[{variant}, rank {r} caller table + summaries]", main_op(*args, initial_state=swapped, **kw)[0], o)
             checked += 1
-        if r + 1 < fol_stop:
-            dfs = torch.randn(N, case.HO, case.V, case.K, device="cuda", dtype=torch.float32) * 0.1
+        if r + 1 < following_rank_stop:
+            dfs = cp_state_table(N, case, padded)
             do_r = dO[r * slab_len : (r + 1) * slab_len]
             extra = dict(
-                d_final_state=dfs, following_state_grad=g_all[r + 1 : fol_stop], following_transition=t_all[r + 1 : fol_stop], plan_name=f"{variant}_frost"
+                d_final_state=dfs,
+                following_state_grad=g_all[r + 1 : following_rank_stop],
+                following_transition=t_all[r + 1 : following_rank_stop],
+                plan_name=f"{variant}_frost",
             )
             dx = dfs[-1].double()  # the reverse chain walks the following ranks from the farthest one down to rank r + 1
-            for j in range(fol_stop - 1, r, -1):
+            for j in range(following_rank_stop - 1, r, -1):
                 dx = cp_fold(variant, dx, g_all[j].double(), t_all[j].double())
             swapped = dfs.clone()
             swapped[-1] = dx.float()
@@ -6425,8 +6563,6 @@ def test_context_parallel_caller_state(backend, variant):
                 n = (int(case.n),) if variant in HOUSEHOLDER_VARIANTS else ()
                 got = raw(do_r, q, k, v, g, beta, *w, cus[r], *n, float(case.K**-0.5), **extra)
                 want = raw(do_r, q, k, v, g, beta, *w, cus[r], *n, float(case.K**-0.5), d_final_state=swapped, plan_name=f"{variant}_frost")
-            # the device fold's fp32 row and the fp64 fold cast to fp32 differ by rounding that the backward amplifies (2e-5
-            # rms on dk measured); a wrong row or sequence would be off by orders of magnitude
             for name, a, b in zip(cp_grad_leaves(variant), got, want):
                 if name is not None:
                     assert_rms_close(f"d{name}[{variant}, rank {r} caller d_final_state + following summaries]", a, b, CP_CALLER_BWD_TOL)
@@ -6502,8 +6638,9 @@ def test_context_parallel_arguments(backend):
 @pytest.mark.L0
 @pytest.mark.parametrize("backend, variant", [("cutile", "gdn"), ("hopper", "kda"), ("hopper_cuda", "kda")], indirect=["backend"])
 def test_context_parallel_declines_non_frost_engines(backend, variant):
-    """Only the FROST engines fold composed summaries into the boundary state row; a pinned non-FROST plan that serves the
-    graph without them declines the graph with them instead of running it without the fold."""
+    """Only the FROST engines fold composed summaries into the boundary state row and start the backward from the
+    forward's composed row; a pinned non-FROST plan that serves the graph without them declines the graph with them
+    (the summaries forward, the composed row alone backward: the last rank's call) instead of running it without them."""
     case = cp_case(variant, [512, 512], 0.9)
     q, k, v, g, beta = thd_tensors(case)
     with waive_unsupported(backend, variant):
@@ -6512,3 +6649,11 @@ def test_context_parallel_declines_non_frost_engines(backend, variant):
     m = torch.zeros(2, case.HO, case.K, case.K, device="cuda")
     with pytest.raises(cudnn.cudnnGraphNotSupportedError, match=backend.plan(variant)):
         pinned_op(backend, variant)(q, k, v, g, beta, case.cu, preceding_state_update=h, preceding_transition=m)
+    raw = getattr(torch.ops.cudnn, f"{CP_PREFIX[variant]}_bwd")
+    dO = torch.randn_like(v)
+    try:
+        raw(dO, q, k, v, g, beta, case.cu, float(case.K**-0.5), plan_name=backend.plan(variant))
+    except cudnn.cudnnGraphNotSupportedError:
+        return
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match=backend.plan(variant)):
+        raw(dO, q, k, v, g, beta, case.cu, float(case.K**-0.5), composed_initial_state=h[:1], plan_name=backend.plan(variant))

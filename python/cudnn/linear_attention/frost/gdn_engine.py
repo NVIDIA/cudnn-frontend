@@ -16,9 +16,9 @@ from cudnn.engines.base import BaseEngine, CompiledPlan
 
 from cudnn.frost.device import build_device, current_device, multiprocessor_count
 from cudnn.frost.workspace import WorkspaceLayout, carve_plan
-from ..graph_analyzer import analyze
+from ..graph_analyzer import BACKWARD_CONTEXT_PORTS, analyze
 from .common.host import family_slots
-from .engine import FrostLaPlan, frost_la_gate, summary_support_gates
+from .engine import FrostLaPlan, frost_la_gate, intermediates_gate, summary_support_gates
 
 
 def build_gdn(graph):
@@ -48,6 +48,8 @@ def gdn_support_gates(engine: str, facts) -> None:
     """The GDN kernel family's dtype/attribute gates, shared with the GDP engine."""
     import cudnn
 
+    if facts.is_bwd and "piece_state_grads" in facts.intermediate_ports:
+        intermediates_gate(engine, facts, b_t=64, expand_num=facts.num_householder)
     checkpoint = facts.checkpoint_every_n_tokens
     checkpoint_dtypes = (cudnn.data_type.FLOAT, facts.io_dtype)
     if checkpoint and checkpoint % 64 != 0:
@@ -246,6 +248,7 @@ class CompiledGdn:
         self.has_final_state = "final_state" in node.outputs
         self.checkpoint = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
         self.has_state_checkpoints = "state_checkpoints" in node.outputs
+        self.has_k_normalized = "k_normalized" in node.inputs
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.overwrite_initial_state = bool(node.params.get("overwrite_initial_state", False))
         self.num_sm = multiprocessor_count(self.device)
@@ -351,7 +354,8 @@ class CompiledGdn:
             regions.append(("tinv_row_count", layout.add(4), "int32", (1,)))
         if self.use_qk_l2norm:
             regions.append(("q_n", layout.add(self.q_rows * HQ * K * 2), self.io_name, (self.q_rows, HQ, K)))
-            regions.append(("k_n", layout.add(total * HK * K * 2), self.io_name, (total, HK, K)))
+            if not self.has_k_normalized:
+                regions.append(("k_n", layout.add(total * HK * K * 2), self.io_name, (total, HK, K)))
         self.workspace_size = layout.size
         self.carve_names = [name for name, off, dt, shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dt, shape) for name, off, dt, shape in regions])
@@ -368,6 +372,7 @@ class CompiledGdn:
         self.index_beta = pos["beta"]
         self.index_cu_seqlens = pos["cu_seqlens"]
         self.index_initial_state = pos.get("initial_state")
+        self.index_k_normalized = pos.get("k_normalized")
         self.index_o = pos["O"]
         self.index_final_state = pos.get("final_state")
         self.index_state_indices = pos.get("state_indices")
@@ -393,9 +398,9 @@ class CompiledGdn:
                 "prefill_words": "tensormaps",
             }
             if self.use_qk_l2norm:
-                aliases |= {"q": "q_n", "k": "k_n"}
+                aliases |= {"q": "q_n", "k": "k_normalized" if self.has_k_normalized else "k_n"}
                 self.carve_index_q_n = self.carve_names.index("q_n")
-                self.carve_index_k_n = self.carve_names.index("k_n")
+                self.carve_index_k_n = None if self.has_k_normalized else self.carve_names.index("k_n")
             absent = len(names) + len(self.carve_names)
             if not self.safe_gate:
                 positions.pop("a_log", None)
@@ -423,7 +428,7 @@ class CompiledGdn:
                     views[self.index_q],
                     views[self.index_k],
                     carved[self.carve_index_q_n],
-                    carved[self.carve_index_k_n],
+                    views[self.index_k_normalized] if self.has_k_normalized else carved[self.carve_index_k_n],
                     None,
                     None,
                     int(stream or 0),
@@ -445,9 +450,11 @@ class CompiledGdn:
         stream = stream if stream is not None else 0
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
         if self.use_qk_l2norm:
-            q_n, k_n = region["q_n"], region["k_n"]
+            q_n, k_n = region["q_n"], (views[self.index_k_normalized] if self.has_k_normalized else region["k_n"])
             if self.l2norm is None:
-                self.l2norm = self.build_l2norm_qk(q, k, q_n, k_n, None, None, k_slots=family_slots(k, self.num_householder, 3), stream=stream)
+                self.l2norm = self.build_l2norm_qk(
+                    q, k, q_n, k_n, None, None, skip_k=self.has_k_normalized, k_slots=family_slots(k, self.num_householder, 3), stream=stream
+                )
             else:
                 self.run_l2norm_qk(self.l2norm, q, k, q_n, k_n, None, None, stream)
             q, k = q_n, k_n
@@ -666,6 +673,10 @@ class CompiledGdnBwd:
         self.pack_bwd_needed = self.num_householder > 1 and not self.compact_qdo
         self.summary_q_step = self.num_householder if self.pack_bwd_needed and self.use_qk_l2norm else 1
         self.tinv_pass = self.chain or self.needs_recompute
+        self.has_normalized_rows = "q_normalized" in node.inputs
+        self.has_chunk_factors = "chunk_factors" in node.inputs and self.chain
+        self.has_piece_tables = "piece_state_grads" in node.inputs and self.chain
+        self.has_piece_transitions = self.has_piece_tables and not self.fused_h_m
         from .common.piece_chain import build_boundary_fold, run_boundary_fold
 
         self.build_boundary_fold, self.run_boundary_fold = build_boundary_fold, run_boundary_fold
@@ -744,7 +755,7 @@ class CompiledGdnBwd:
         if self.fold_dv:
             regions.append(("dv_ho", layout.add(total * HO * V * 2), self.io_name, (total, HO, V)))
         l2norm_rows = self.q_rows if self.compact_qdo else total
-        if self.use_qk_l2norm:
+        if self.use_qk_l2norm and not self.has_normalized_rows:
             regions.append(("q_n", layout.add(l2norm_rows * HQ * K * 2), self.io_name, (l2norm_rows, HQ, K)))
             regions.append(("k_n", layout.add(total * HK * K * 2), self.io_name, (total, HK, K)))
             regions.append(("inv_q", layout.add(l2norm_rows * HQ * 4), "float32", (l2norm_rows, HQ)))
@@ -783,18 +794,25 @@ class CompiledGdnBwd:
                 ("main_count", off_piece_table + table.main_count, "int32", (1,)),
                 ("summary_count", off_piece_table + table.summary_count, "int32", (1,)),
                 ("work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
-                ("state_m", layout.add(self.num_pieces * HO * K * K * 4), "float32", (self.num_pieces, HO, K, K)),
-                ("state_g", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape),
                 ("state_dx_end", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape),
             ]
+            if not self.has_piece_transitions:
+                regions.append(("state_m", layout.add(self.num_pieces * HO * K * K * 4), "float32", (self.num_pieces, HO, K, K)))
+            if not self.has_piece_tables:
+                regions.append(("state_g", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
             if not self.has_state_checkpoints:
                 regions.append(("state_h", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
                 regions.append(("state_x", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
         if self.tinv_pass:
             from .kernel import gdn_tinv_f16 as tinv_module
 
-            rows = tinv_module.tinv_rows(self.q_rows, self.num_pieces, self.expand_num, self.b_t)
-            regions.append(("tinv", layout.add(rows * HO * self.b_t * self.b_t * 2), self.io_name, (rows, HO, self.b_t, self.b_t)))
+            rows = (
+                int(node.inputs["chunk_factors"].dim[0])
+                if self.has_chunk_factors
+                else tinv_module.tinv_rows(self.q_rows, self.num_pieces, self.expand_num, self.b_t)
+            )
+            if not self.has_chunk_factors:
+                regions.append(("tinv", layout.add(rows * HO * self.b_t * self.b_t * 2), self.io_name, (rows, HO, self.b_t, self.b_t)))
             tinv_words = tensormap_workspace_bytes(tinv_module, self.num_pieces, self.num_householder) // 8
             regions.append(("tinv_tensormaps", layout.add(tinv_words * 8, align=128), "int64", (tinv_words,)))
             regions.append(("tinv_rows", layout.add(rows * 16), "int32", (rows, 4)))
@@ -833,6 +851,13 @@ class CompiledGdnBwd:
         self.index_following_state_grad = pos.get("following_state_grad")
         self.index_following_transition = pos.get("following_transition")
         self.index_composed = pos.get("composed_initial_state")
+        self.index_q_normalized = pos.get("q_normalized")
+        self.index_k_normalized = pos.get("k_normalized")
+        self.index_q_inv_norm = pos.get("q_inv_norm")
+        self.index_k_inv_norm = pos.get("k_inv_norm")
+        self.index_chunk_factors = pos.get("chunk_factors")
+        self.index_piece_transitions = pos.get("piece_transitions")
+        self.index_piece_state_grads = pos.get("piece_state_grads")
 
     def run(self, views, workspace, stream) -> None:
         q = views[self.index_q]
@@ -859,6 +884,13 @@ class CompiledGdnBwd:
         stream = stream if stream is not None else 0
 
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
+        q_n = views[self.index_q_normalized] if self.has_normalized_rows else region.get("q_n")
+        k_n = views[self.index_k_normalized] if self.has_normalized_rows else region.get("k_n")
+        inv_q = views[self.index_q_inv_norm] if self.has_normalized_rows else region.get("inv_q")
+        inv_k = views[self.index_k_inv_norm] if self.has_normalized_rows else region.get("inv_k")
+        tinv = views[self.index_chunk_factors] if self.has_chunk_factors else region.get("tinv")
+        state_m = views[self.index_piece_transitions] if self.has_piece_transitions else region.get("state_m")
+        state_g = views[self.index_piece_state_grads] if self.has_piece_tables else region.get("state_g")
         dcomposed = None
         if self.index_following_state_grad is not None:
             dcomposed = region["composed_dstate"]
@@ -890,28 +922,28 @@ class CompiledGdnBwd:
                 l2norm_kw = dict(expand_num=self.num_householder, expand_phase=self.num_householder - 1, expand_fill=True)
             dq_node = dq
             dq = region["dq_x"]
-        if self.use_qk_l2norm:
+        if self.use_qk_l2norm and not self.has_normalized_rows:
             if self.l2norm is None:
                 self.l2norm = self.build_l2norm_qk(
                     q,
                     k,
-                    region["q_n"],
-                    region["k_n"],
-                    region["inv_q"],
-                    region["inv_k"],
+                    q_n,
+                    k_n,
+                    inv_q,
+                    inv_k,
                     **l2norm_kw,
                     k_slots=family_slots(k, self.num_householder, 3),
                     stream=stream,
                 )
             else:
-                self.run_l2norm_qk(self.l2norm, q, k, region["q_n"], region["k_n"], region["inv_q"], region["inv_k"], stream)
-            q, k = region["q_n"], region["k_n"]
+                self.run_l2norm_qk(self.l2norm, q, k, q_n, k_n, inv_q, inv_k, stream)
+        if self.use_qk_l2norm:
+            q, k = q_n, k_n
         summary_q = q_compact if self.pack_expands_q else q
         summary_do = do_compact
         dq_out = region["dq_ho"] if self.fold_dq else dq
         dk_out = region["dk_ho"] if self.fold_dk else dk
         dv_out = region["dv_ho"] if self.fold_dv else dv
-        tinv = region.get("tinv")
         bwd_tinv = {} if self.compact_qdo else dict(tinv=tinv)
 
         if self.chain:
@@ -940,6 +972,11 @@ class CompiledGdnBwd:
                 dt_bias,
                 region,
                 stream,
+                tinv,
+                state_m,
+                state_g,
+                inv_q,
+                inv_k,
             )
         else:
             checkpoint_series = state_checkpoints if (self.has_state_checkpoints and not self.coarse_checkpoints) else region["state_checkpoints"]
@@ -1046,8 +1083,8 @@ class CompiledGdnBwd:
                     dcomposed=dcomposed,
                     a_log=a_log if self.safe_gate else None,
                     dt_bias=dt_bias if self.safe_gate else None,
-                    inv_q=region["inv_q"] if self.use_qk_l2norm else None,
-                    inv_k=region["inv_k"] if self.use_qk_l2norm else None,
+                    inv_q=inv_q,
+                    inv_k=inv_k,
                     own_prologue=False,
                     **bwd_tinv,
                 )
@@ -1080,8 +1117,8 @@ class CompiledGdnBwd:
                     work_count=work_count,
                     scheduler_counter=scheduler_bwd,
                     log_gate=self.log_gate,
-                    inv_q=region["inv_q"] if self.use_qk_l2norm else None,
-                    inv_k=region["inv_k"] if self.use_qk_l2norm else None,
+                    inv_q=inv_q,
+                    inv_k=inv_k,
                     expand_num=self.expand_num,
                     workspace=region["tensormaps"],
                     device=self.device,
@@ -1130,6 +1167,11 @@ class CompiledGdnBwd:
         dt_bias,
         region,
         stream,
+        tinv,
+        state_m,
+        state_g,
+        inv_q,
+        inv_k,
     ) -> None:
         """Chain prologue, T pass, H and M summaries (M alone when the series is passed back), forward chain X, G summary,
         reverse chain seeded with d_final_state, dense series (the forward's or the seeded recompute), bprop over the
@@ -1178,19 +1220,19 @@ class CompiledGdnBwd:
             dbeta=dbeta,
             summary_q=summary_q,
             summary_do=summary_do,
-            tinv=region["tinv"],
+            tinv=tinv,
             state_h=region.get("state_h"),
-            state_m=region["state_m"],
+            state_m=state_m,
             state_x=region.get("state_x"),
-            state_g=region["state_g"],
+            state_g=state_g,
             state_dx_end=region["state_dx_end"],
             seed=state0,
             dseed=dstate_in,
             composed=composed,
             dcomposed=dcomposed,
             dstate0=dstate0,
-            inv_q=region["inv_q"] if self.use_qk_l2norm else None,
-            inv_k=region["inv_k"] if self.use_qk_l2norm else None,
+            inv_q=inv_q,
+            inv_k=inv_k,
         )
         schedule = dict(
             pieces=self.pieces,
@@ -1204,6 +1246,9 @@ class CompiledGdnBwd:
             series_span_tokens=self.recompute_span_tokens if coarse else 0,
             seed_every_n_tokens=self.checkpoint_cadence if coarse else 0,
             scale=self.scale,
+            has_chunk_factors=self.has_chunk_factors,
+            has_piece_transitions=self.has_piece_transitions,
+            has_piece_state_grads=self.has_piece_tables,
         )
         if self.chain_launch is None:
             self.chain_launch = self.build_chain_backward(
@@ -1423,7 +1468,8 @@ class CompiledGdnSummary:
                 self.chunk_scratch_rows = split_scratch_rows(total, B, HO, self.b_t)
                 regions.append(("item_scratch", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
                 regions.append(("chunk_scratch", layout.add(self.chunk_scratch_rows * HO * 4), "float32", (self.chunk_scratch_rows, HO)))
-        if self.use_qk_l2norm:
+        self.has_k_normalized = "k_normalized" in node.outputs
+        if self.use_qk_l2norm and not self.has_k_normalized:
             regions.append(("k_n", layout.add(total * HK * K * 2), self.io_name, (total, HK, K)))
         self.needs_table = self.split
         self.workspace_size = layout.size
@@ -1445,6 +1491,7 @@ class CompiledGdnSummary:
         self.index_dt_bias = pos.get("dt_bias")
         self.index_final_state = pos["final_state"]
         self.index_transition = pos.get("transition")
+        self.index_k_normalized = pos.get("k_normalized")
 
     def run(self, views, workspace, stream) -> None:
         k = views[self.index_k]
@@ -1461,7 +1508,7 @@ class CompiledGdnSummary:
 
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
         if self.use_qk_l2norm:
-            k_n = region["k_n"]
+            k_n = views[self.index_k_normalized] if self.has_k_normalized else region["k_n"]
             if self.l2norm is None:
                 self.l2norm = self.build_l2norm_qk(k, k, k_n, k_n, None, None, skip_q=True, k_slots=family_slots(k, self.num_householder, 3), stream=stream)
             else:
@@ -1825,13 +1872,14 @@ class CompiledGdnSummaryBwd:
         self.n_heads_out, self.total = HO, total
         self.num_seqs = B
         self.dim_k, self.dim_v = K, V
+        self.checkpoint_cadence = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
         self.pieces, self.unit_chunks = choose_pieces(
             num_seqs=B,
             heads_out=HO,
             num_sm=self.num_sm,
             total_tokens=total // self.num_householder,
             b_t=self.b_t,
-            cadence_tokens=0,
+            cadence_tokens=self.checkpoint_cadence,
             batch_invariant=self.batch_invariant,
             compose_tail=True,
             expand_num=self.num_householder,
@@ -1841,6 +1889,9 @@ class CompiledGdnSummaryBwd:
         self.split = not self.chain and not self.batch_invariant and not self.overwrite_initial_state
         self.length_rule = self.chain and self.batch_invariant
         self.num_pieces = B * self.pieces if self.chain else B
+        self.has_normalized_rows = "q_normalized" in node.outputs
+        self.has_chunk_factors = "chunk_factors" in node.outputs and self.chain
+        self.has_piece_tables = "piece_state_grads" in node.outputs and self.chain
         layout = WorkspaceLayout()
         regions = []
         if self.chain:
@@ -1862,18 +1913,24 @@ class CompiledGdnSummaryBwd:
                 ("main_count", off_piece_table + table.main_count, "int32", (1,)),
                 ("summary_count", off_piece_table + table.summary_count, "int32", (1,)),
                 ("work_items", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
-                ("state_g", layout.add(self.num_pieces * HO * V * K * 4), "float32", (self.num_pieces, HO, V, K)),
-                ("state_m", layout.add(self.num_pieces * HO * K * K * 4), "float32", (self.num_pieces, HO, K, K)),
                 ("state_x", layout.add(self.num_pieces * HO * V * K * 4), "float32", (self.num_pieces, HO, V, K)),
             ]
+            if not self.has_piece_tables:
+                regions.append(("state_g", layout.add(self.num_pieces * HO * V * K * 4), "float32", (self.num_pieces, HO, V, K)))
+                regions.append(("state_m", layout.add(self.num_pieces * HO * K * K * 4), "float32", (self.num_pieces, HO, K, K)))
             summary_words = tensormap_workspace_bytes(summary_module, self.num_pieces, self.num_householder) // 8
             regions.append(("summary_tensormaps", layout.add(summary_words * 8, align=128), "int64", (summary_words,)))
             recompute_words = tensormap_workspace_bytes(recompute_module, self.num_pieces, self.num_householder) // 8
             regions.append(("recompute_tensormaps_m", layout.add(recompute_words * 8, align=128), "int64", (recompute_words,)))
             from .kernel import gdn_tinv_f16 as tinv_module
 
-            rows = tinv_module.tinv_rows(total // self.num_householder, self.num_pieces, self.num_householder, self.b_t)
-            regions.append(("tinv", layout.add(rows * HO * self.b_t * self.b_t * 2), self.io_name, (rows, HO, self.b_t, self.b_t)))
+            rows = (
+                int(node.outputs["chunk_factors"].dim[0])
+                if self.has_chunk_factors
+                else tinv_module.tinv_rows(total // self.num_householder, self.num_pieces, self.num_householder, self.b_t)
+            )
+            if not self.has_chunk_factors:
+                regions.append(("tinv", layout.add(rows * HO * self.b_t * self.b_t * 2), self.io_name, (rows, HO, self.b_t, self.b_t)))
             tinv_words = tensormap_workspace_bytes(tinv_module, self.num_pieces, self.num_householder) // 8
             regions.append(("tinv_tensormaps", layout.add(tinv_words * 8, align=128), "int64", (tinv_words,)))
             regions.append(("tinv_rows", layout.add(rows * 16), "int32", (rows, 4)))
@@ -1902,7 +1959,7 @@ class CompiledGdnSummaryBwd:
             regions.append(("tinv_tensormaps", layout.add(tinv_words * 8, align=128), "int64", (tinv_words,)))
             regions.append(("tinv_rows", layout.add(rows * 16), "int32", (rows, 4)))
             regions.append(("tinv_row_count", layout.add(4), "int32", (1,)))
-        if self.use_qk_l2norm:
+        if self.use_qk_l2norm and not self.has_normalized_rows:
             q_rows = total // self.num_householder
             regions.append(("q_n", layout.add(q_rows * HQ * K * 2), self.io_name, (q_rows, HQ, K)))
             regions.append(("k_n", layout.add(total * HK * K * 2), self.io_name, (total, HK, K)))
@@ -1941,6 +1998,13 @@ class CompiledGdnSummaryBwd:
         self.index_dt_bias = pos.get("dt_bias")
         self.index_d_initial_state = pos["d_initial_state"]
         self.index_transition = pos.get("transition")
+        self.index_q_normalized = pos.get("q_normalized")
+        self.index_k_normalized = pos.get("k_normalized")
+        self.index_q_inv_norm = pos.get("q_inv_norm")
+        self.index_k_inv_norm = pos.get("k_inv_norm")
+        self.index_chunk_factors = pos.get("chunk_factors")
+        self.index_piece_transitions = pos.get("piece_transitions")
+        self.index_piece_state_grads = pos.get("piece_state_grads")
 
     def run(self, views, workspace, stream) -> None:
         q = views[self.index_q]
@@ -1957,18 +2021,22 @@ class CompiledGdnSummaryBwd:
         stream = stream if stream is not None else 0
 
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
+        q_n = views[self.index_q_normalized] if self.has_normalized_rows else region.get("q_n")
+        k_n = views[self.index_k_normalized] if self.has_normalized_rows else region.get("k_n")
+        inv_q = views[self.index_q_inv_norm] if self.has_normalized_rows else None
+        inv_k = views[self.index_k_inv_norm] if self.has_normalized_rows else None
+        tinv = views[self.index_chunk_factors] if self.has_chunk_factors else region.get("tinv")
+        state_m = views[self.index_piece_transitions] if self.has_piece_tables else region.get("state_m")
+        state_g = views[self.index_piece_state_grads] if self.has_piece_tables else region.get("state_g")
         if self.use_qk_l2norm:
             if self.l2norm is None:
-                self.l2norm = self.build_l2norm_qk(
-                    q, k, region["q_n"], region["k_n"], None, None, k_slots=family_slots(k, self.num_householder, 3), stream=stream
-                )
+                self.l2norm = self.build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, k_slots=family_slots(k, self.num_householder, 3), stream=stream)
             else:
-                self.run_l2norm_qk(self.l2norm, q, k, region["q_n"], region["k_n"], None, None, stream)
-            q, k = region["q_n"], region["k_n"]
+                self.run_l2norm_qk(self.l2norm, q, k, q_n, k_n, inv_q, inv_k, stream)
+            q, k = q_n, k_n
         if self.chain:
-            self.run_chain(q, k, g, beta, do, cu, dstate_in, dstate0, transition, a_log, dt_bias, region, stream)
+            self.run_chain(q, k, g, beta, do, cu, dstate_in, dstate0, transition, a_log, dt_bias, region, stream, tinv, state_m, state_g)
             return
-        tinv = region["tinv"]
         self.tinv_cache = chunk_factor_pass(
             self.tinv_cache,
             k,
@@ -2159,14 +2227,13 @@ class CompiledGdnSummaryBwd:
             )
         self.run_state_chain(self.transition_chain, self.num_seqs, None, transition_m, None, None, None, transition, stream)
 
-    def run_chain(self, q, k, g, beta, do, cu, dstate_in, dstate0, transition, a_log, dt_bias, region, stream) -> None:
+    def run_chain(self, q, k, g, beta, do, cu, dstate_in, dstate0, transition, a_log, dt_bias, region, stream, tinv, state_m, state_g) -> None:
         """Chain prologue, T pass, M (recompute transition arm) and G (zero-seeded bprop summary) of every filled piece, one
         reverse fp32 state chain seeded with d_final_state whose tail is d_initial_state and whose running product is
         transition."""
         cu_pieces = region["cu_pieces"]
         work_items, work_count = region["work_items"], region["main_count"]
-        state_g, state_m, state_x = region["state_g"], region["state_m"], region["state_x"]
-        tinv = region["tinv"]
+        state_x = region["state_x"]
         gate_params = dict(a_log=a_log if self.safe_gate else None, dt_bias=dt_bias if self.safe_gate else None)
         warm = self.chain_reverse is not None
         self.run_chain_prologue(

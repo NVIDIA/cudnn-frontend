@@ -10,7 +10,9 @@ preceding ranks as ``preceding_state_update`` / ``preceding_transition``: the op
 one-row composed state the first local sequence starts from and returns it for the backward.  The backward mirrors it with ``mamba2_summary_bwd``
 on the first local sequence (a zero outgoing-state gradient) and ``torch.ops.cudnn.mamba2_bwd`` from the composed state
 with the following ranks' summaries folded into the one-row gradient state the last local sequence starts from.  The rank bounds come from
-the rank-bound rule on the global sequence boundaries; the slabs' outputs and gradients are checked against the unsplit op.
+the rank-bound rule on the global sequence boundaries; the slabs' outputs and gradients are checked against the unsplit op.  Mamba-2 has no backward hand-over
+(``output_intermediates`` of the other families): its summary runs the whole sequence as one item and its backward has no
+per-piece summary pass to skip.
 """
 
 from __future__ import annotations
@@ -84,17 +86,17 @@ def main(seq_lens=(700, 1700, 100, 500, 1096), cp_size: int = 4, H: int = 2, D: 
     # ---- forward apply: the preceding slice, folded by the op into the one-row composed state ----------------------
     outputs = []
     for rank, (t, cu) in enumerate(zip(slabs, cus)):
-        pre_start, _ = _rank_bounds(bounds, slab_len, rank)
-        h, m = h_all[pre_start:rank], m_all[pre_start:rank]
+        preceding_rank_start, _ = _rank_bounds(bounds, slab_len, rank)
+        h, m = h_all[preceding_rank_start:rank], m_all[preceding_rank_start:rank]
         o, _, _, composed = la_ops.mamba2(t["x"], t["dt"], A, t["B"], t["C"], cu, dt_bias=dt_bias, preceding_state_update=h, preceding_transition=m)
         outputs.append((o, composed))
     o_cp = torch.cat([out[0] for out in outputs])
     r_o = _rms_ratio(o_cp, o_whole)
     assert r_o < 2e-2, f"o rms ratio {r_o:.4g}"
     # the composed state of the last rank, against the fp64 fold of the gathered summaries
-    pre_start, _ = _rank_bounds(bounds, slab_len, cp_size - 1)
+    preceding_rank_start, _ = _rank_bounds(bounds, slab_len, cp_size - 1)
     x = torch.zeros(*(H, P, N_state), dtype=torch.float64, device=device)
-    for j in range(pre_start, cp_size - 1):
+    for j in range(preceding_rank_start, cp_size - 1):
         h, m = h_all[j].double(), m_all[j].double()
         x = torch.exp2(m)[:, None, None] * x + h
     r_x = _rms_ratio(outputs[-1][1][0], x)
@@ -109,8 +111,8 @@ def main(seq_lens=(700, 1700, 100, 500, 1096), cp_size: int = 4, H: int = 2, D: 
     t_all = torch.stack([s[1] for s in summaries])
     grads = {}
     for rank, (t, cu, do) in enumerate(zip(slabs, cus, dos)):
-        _, fol_stop = _rank_bounds(bounds, slab_len, rank)
-        composed, g_, t_ = outputs[rank][1], g_all[rank + 1 : fol_stop], t_all[rank + 1 : fol_stop]
+        _, following_rank_stop = _rank_bounds(bounds, slab_len, rank)
+        composed, g_, t_ = outputs[rank][1], g_all[rank + 1 : following_rank_stop], t_all[rank + 1 : following_rank_stop]
         for name, grad in zip(
             ("x", "dt", None, "B", "C"),
             torch.ops.cudnn.mamba2_bwd(

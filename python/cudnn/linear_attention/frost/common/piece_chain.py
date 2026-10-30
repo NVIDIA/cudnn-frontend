@@ -36,7 +36,8 @@ import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
 from cutlass.cute.runtime import from_dlpack
 
-from cudnn.frost.buffers import DeviceView
+from cudnn import _pybind_module
+from cudnn.frost.buffers import DTYPES, DeviceView
 from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fadd2, ffma2, fp32_to_fp16
 from cudnn.frost.tile_dsl.tma import (
@@ -1498,17 +1499,21 @@ def build_boundary_fold(composed, state_update, *, reverse, num_sm, device, seed
     )
 
 
+def boundary_seed_row(table, reverse, device):
+    """The one row of the caller's state ``table`` a boundary fold starts from, at the table's own strides (the table may be
+    a padded view): row 0 forward, the last row in reverse (the state beyond the farthest rank)."""
+    row = int(table.shape[0]) - 1 if reverse else 0
+    strides = [int(s) for s in table.stride()]
+    code, bits = DTYPES[str(table.dtype).split(".")[-1]]
+    shape = [1, *(int(d) for d in table.shape[1:])]
+    return _pybind_module.make_operand_buffer(table.data_ptr() + row * strides[0] * table.element_size(), shape, code, bits, int(device), strides)
+
+
 def run_boundary_fold(compiled, table, composed, state_update, transition, stream) -> None:
     """Fold ``state_update`` / ``transition`` (fp32 ``[pieces, ...]``, rank order) into the one-row ``composed``: the walk starts
     from the boundary row of the caller's ``table`` when the fold was built with one (row 0 forward, the last row in reverse,
     the state beyond the farthest rank), from zero otherwise."""
-    seed = None
-    if compiled.has_seed:
-        row = int(table.shape[0]) - 1 if compiled.reverse else 0
-        row_elems = 1
-        for d in table.shape[1:]:
-            row_elems *= int(d)
-        seed = DeviceView(table.data_ptr() + row * row_elems * table.element_size(), (1, *table.shape[1:]), table.dtype, compiled.device)
+    seed = boundary_seed_row(table, compiled.reverse, compiled.device) if compiled.has_seed else None
     run_state_chain(compiled, 1, state_update, transition, None, seed, composed, None, stream)
 
 
@@ -1534,13 +1539,7 @@ def build_scalar_boundary_fold(composed, state_update, *, reverse, device, seed_
 
 def run_scalar_boundary_fold(compiled, table, composed, state_update, transition, stream) -> None:
     """:func:`run_boundary_fold` for Mamba-2's scalar-transition chain."""
-    seed = None
-    if compiled.has_seed:
-        row = int(table.shape[0]) - 1 if compiled.reverse else 0
-        row_elems = 1
-        for d in table.shape[1:]:
-            row_elems *= int(d)
-        seed = DeviceView(table.data_ptr() + row * row_elems * table.element_size(), (1, *table.shape[1:]), table.dtype, compiled.device)
+    seed = boundary_seed_row(table, compiled.reverse, compiled.device) if compiled.has_seed else None
     run_scalar_state_chain(compiled, 1, state_update, transition, None, seed, composed, stream)
 
 
