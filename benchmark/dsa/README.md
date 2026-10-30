@@ -287,10 +287,9 @@ cuDNN Frontend `[cutedsl]` dependencies.
 ### Sparse Attention Backward
 
 Microbenchmark for the DeepSeek Sparse Attention (DSA) backward kernel in the
-cuDNN Frontend CuTe DSL package, driven through the public
-`cudnn.DSA.sparse_attention_backward_wrapper` API. The wrapper dispatches to
-the Hopper (SM90) or Blackwell (SM100) implementation based on the active
-CUDA device.
+cuDNN Frontend CuTe DSL package, driven through a compiled
+`DSA.SparseAttentionBackward` plan. Setup compiles the plan, and timed
+iterations call `plan.execute(...)` directly.
 
 #### What is measured
 

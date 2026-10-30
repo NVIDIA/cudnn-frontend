@@ -287,7 +287,9 @@ low- and high-overlap top-k rows without a global semaphore dependency on
 non-resident CTAs. The selected 8, 16, or 32 planes are combined directly in
 the fixed-order conversion kernel, without an intermediate FP32 prefold.
 Duplicate top-k indices within one query row remain outside the deterministic
-contract, as in the bounded-wave path.
+contract, as in the bounded-wave path. This condition is not checked at
+runtime; callers that require bitwise repeatability must provide unique valid
+indices within each query's active top-k prefix.
 
 For the ordinary policy, additional dKV workspace is
 `selected_shards * K8 * D8 * sizeof(float)`, where
