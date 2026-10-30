@@ -1176,7 +1176,12 @@ arm's.  The cells: `test/python/gated_attention_block/cutedsl/test_block_qsa_pac
 the 8 / 2 and 24 / 2 geometries, pages 16 / 64 on HND / NHD / unified pools, bf16 and f16; the fill-rule boundary; any order; the
 degenerate rows at every residue; the capacity and live-count launches; the workspace / allocation / census pins; the capture) and the
 adapter's own in `test/python/sdpa/frost/test_sdpa_fwd_sparse_sm107.py` (every sequence of a packing bitwise the dense `[1, q_len_b]`
-paged bottom-right per-row run).  Functional only: the one-execute measurement against the two-run form follows.
+paged bottom-right per-row run).  Validated on a Rubin development node (cc 10.7, 204 SMs; functional cells, no performance claim): the
+block module's 23 cells -- the 300-row chunk of the mixed step BITWISE its dense control (the control resolved the core at split 1 on the
+forced-tile route), the 128- and 160-row chunks and every decode group within the bars (their controls resolved splits 3 / 6 / 9 / 16, or
+the lean tile at one row per sequence), the gated O within 0.31 of the output bound and the LSE within 3.7e-4 of the oracle on every cell --
+and the adapter's 113 cells of the composition (every sequence bitwise its dense control; `max|dO|` 0.011 bf16 / 0.0012 f16, `max|dLSE|`
+2e-6 vs the oracle).  Functional only: the one-execute measurement against the two-run form follows.
 
 ### Serving: the decode form (`kv_source="paged"` on a dense `[B, S_q]` block)
 
