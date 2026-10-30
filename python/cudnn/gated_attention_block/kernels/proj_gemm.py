@@ -1413,8 +1413,9 @@ def small_m_tile_config(
 # `preferred_strategy` + `_auto_split_k`, then `planning.select_strategies`, which returns that baseline wherever no cost profile
 # claims the shape.  So the rule below names THAT pick -- the kernel the graph route runs for the same (M, N, K, dtype, SM count) --
 # and names it only where the identity holds: `preferred_strategy` is the identity for a dense bf16 / f16 chain on the sm100 family
-# (pipeline "sm100", MMA K 32 = the catalog's own spelling), the planner's cost profiles decline the shape (`_planner_may_replan`),
-# and `_auto_split_k` leaves the pick unsplit (`_auto_split_k_slices`).  The name moves the ROUTE (JIT-only: no ranked list, no
+# (pipeline "sm100", MMA K 32 = the catalog's own spelling), the planner's cost profiles decline the shape (`_planner_may_replan`: the
+# planner envelope `tile_config` publishes, so this resolver imports no graph-route module), and `_auto_split_k` leaves the pick unsplit
+# (`_auto_split_k_slices`).  The name moves the ROUTE (JIT-only: no ranked list, no
 # backend plan, no cuDNN handle at execute, capture-safe, flag-free) and not the kernel.  The pick follows the part's SM count (at
 # M 2048 x N 13952: 128x224 cluster2x1 on 212 SMs, 128x224 cluster2x4 on 204), so a recorded plan name replays within ONE SM-count
 # class -- the small-M route's existing rule.  Shape-only, no device sync: `_Projection.resolves_a_jit_tile` reads it at declaration.
@@ -1422,15 +1423,14 @@ def small_m_tile_config(
 
 def _planner_may_replan(m: int, n: int, k: int) -> bool:
     """Whether the GEMM engine's device-aware planner could serve ``[m, k] x [k, n]`` with a strategy OTHER than its baseline pick:
-    ``planning.select_strategies`` ranks candidates only under a cost profile, and ``planning.profile_for`` claims a shape only inside
-    the profile's ``mn_bounds`` (both M and N) and ``k_bounds`` -- mirrored here over the live profile table, so a shape no profile
-    can claim is served by the baseline alone (the planner's ``[baseline]``)."""
-    from cudnn.gemm.frost import planning
+    ``planning.select_strategies`` ranks candidates only under a cost profile, and a profile claims a shape only inside the planner
+    envelope the catalog module publishes (``tile_config.planner_may_claim``: ``PLANNER_MN_BOUNDS`` on both M and N, ``PLANNER_K_BOUNDS``;
+    the block's chain is batch 1) -- read THERE, never from the planner module, which a JIT-only deployment of this driver does not carry
+    (an import of it at declaration would be a bare ``ModuleNotFoundError``, not a typed decline).  A shape outside the envelope is served
+    by the baseline alone (the planner's ``[baseline]``)."""
+    from cudnn.gemm.frost.tile_config import planner_may_claim
 
-    return any(
-        p.mn_bounds[0] <= m <= p.mn_bounds[1] and p.mn_bounds[0] <= n <= p.mn_bounds[1] and p.k_bounds[0] <= k <= p.k_bounds[1]
-        for p in planning._PROFILES.values()
-    )
+    return planner_may_claim(m, n, k, batch=1)
 
 
 def _auto_split_k_slices(m: int, n: int, k: int, cfg, sm_count: int, elem_bits: int = 16) -> int:

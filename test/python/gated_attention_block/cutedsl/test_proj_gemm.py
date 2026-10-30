@@ -1318,15 +1318,33 @@ def test_large_m_rule_keeps_the_small_m_rows_the_256_grid_and_the_off_grid_shape
 def test_large_m_rule_keeps_the_graph_route_where_the_engines_planner_could_re_plan():
     """GUARD 1 -- the identity with the graph route needs the engine's device-aware planner to return its baseline: ``planning.select_strategies``
     ranks other strategies only under a cost profile, and ``profile_for`` claims a shape only inside the profile's M / N / K bounds.  The rule
-    mirrors those bounds over the live profile table: a shape every profile could claim (M 256, N 640 = 5 x 128, K 2048 -- inside every
-    profile's ``mn_bounds`` and ``k_bounds``) keeps the graph route (None); the band slabs lie past every profile's N bound, and the planner,
-    asked directly for the band chain with a modelled Rubin part and a modelled B200, returns ``[baseline]``."""
+    reads the planner ENVELOPE the catalog module publishes (``tile_config.planner_may_claim``: ``PLANNER_MN_BOUNDS`` on M and N,
+    ``PLANNER_K_BOUNDS``, ``PLANNER_MAX_BATCH`` -- ``CostProfile``'s defaults), never the planner module, so the guard is pinned two ways: every
+    live profile's bounds lie inside the envelope (a wider profile reddens this cell instead of widening the resolver silently), and the guard
+    IS the envelope at its edges.  A shape every profile could claim (M 256, N 640 = 5 x 128, K 2048) keeps the graph route (None); the band
+    slabs lie past every profile's N bound, and the planner, asked directly for the band chain with a modelled Rubin part and a modelled
+    B200, returns ``[baseline]``."""
     from cudnn.gemm.frost import planning
-    from cudnn.gemm.frost.tile_config import select_config
+    from cudnn.gemm.frost.tile_config import PLANNER_K_BOUNDS, PLANNER_MAX_BATCH, PLANNER_MN_BOUNDS, planner_may_claim, select_config
     from cudnn.gated_attention_block.kernels.proj_gemm import _planner_may_replan
 
     profiles = list(planning._PROFILES.values())
     assert profiles
+    for p in profiles:
+        assert PLANNER_MN_BOUNDS[0] <= p.mn_bounds[0] <= p.mn_bounds[1] <= PLANNER_MN_BOUNDS[1], p.name
+        assert PLANNER_K_BOUNDS[0] <= p.k_bounds[0] <= p.k_bounds[1] <= PLANNER_K_BOUNDS[1], p.name
+        assert p.max_batch <= PLANNER_MAX_BATCH, p.name
+    (lo, hi), (klo, khi) = PLANNER_MN_BOUNDS, PLANNER_K_BOUNDS
+    for m, n, k, claimed in (
+        (lo, lo, klo, True),
+        (hi, hi, khi, True),
+        (lo - 1, lo, klo, False),
+        (lo, hi + 1, klo, False),
+        (lo, lo, klo - 1, False),
+        (hi, hi, khi + 1, False),
+    ):
+        assert _planner_may_replan(m, n, k) is planner_may_claim(m, n, k) is claimed, (m, n, k)
+    assert planner_may_claim(lo, lo, klo, batch=PLANNER_MAX_BATCH) and not planner_may_claim(lo, lo, klo, batch=PLANNER_MAX_BATCH + 1)
     assert all(p.mn_bounds[0] <= 256 <= p.mn_bounds[1] and p.mn_bounds[0] <= 640 <= p.mn_bounds[1] and p.k_bounds[0] <= 2048 <= p.k_bounds[1] for p in profiles)
     assert _planner_may_replan(256, 640, 2048) and large_m_tile_config(256, 640, 2048, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) is None
     for n in (_BAND_N, _FLASH_NEXT_24_2["n_qkvg"] + 1024 + 640):  # the 24/2 band slab and the 24/4 one (14336 + 640 = 14976 = 117 x 128)
@@ -1337,6 +1355,32 @@ def test_large_m_rule_keeps_the_graph_route_where_the_engines_planner_could_re_p
         assert planning.profile_for(chain, cfg, dev) is None
         never = lambda *_: (_ for _ in ()).throw(AssertionError("the planner probed a candidate for a shape no profile claims"))  # noqa: E731
         assert planning.select_strategies(chain, cfg, probe=never, device=dev) == [cfg]
+
+
+def test_large_m_rule_resolves_without_the_planner_module(monkeypatch):
+    """The resolver runs at DECLARATION (``_Projection.resolves_a_jit_tile`` sets the capture flag of a paged declaration's slab stage) and
+    reaches no graph-route module: a JIT-only deployment of this driver carries the catalog (``tile_config``) and the compiler, not the planner
+    (``gemm/frost/planning.py``), where an import of it would be a bare ``ModuleNotFoundError`` at declaration, never a typed decline.  With the
+    planner module made unimportable in this process the large-M rule, the small-M route and ``_auto_tile_name`` still resolve the band slab at
+    every row count, and the rule still reads the envelope (the planner-claimed shape keeps the graph route)."""
+    import sys
+
+    import cudnn.gemm.frost as frost_pkg
+    from cudnn.gemm.frost import arch_family
+    from cudnn.gemm.frost.tile_config import select_config
+    from cudnn.gated_attention_block.kernels.proj_gemm import _auto_tile_name
+
+    monkeypatch.setattr(arch_family, "active_family", lambda: "sm100")
+    monkeypatch.delattr(frost_pkg, "planning", raising=False)
+    monkeypatch.setitem(sys.modules, "cudnn.gemm.frost.planning", None)  # any `import cudnn.gemm.frost.planning` raises here
+    with pytest.raises(ImportError):
+        import cudnn.gemm.frost.planning  # noqa: F401  (the tripwire is armed)
+    bf16 = dict(dtype=torch.bfloat16, sm_count=_RUBIN_SMS)
+    for m in (129, 256, 2048, 8192):
+        assert large_m_tile_config(m, _BAND_N, _BAND_K, **bf16) == select_config(m, _BAND_N, 1, K=_BAND_K, sm_count=_RUBIN_SMS).name
+        assert _auto_tile_name(m, _BAND_N, _BAND_K, **_KW_DENSE, sm_count=_RUBIN_SMS) == large_m_tile_config(m, _BAND_N, _BAND_K, **bf16)
+    assert _auto_tile_name(64, _BAND_N, _BAND_K, **_KW_DENSE, sm_count=_RUBIN_SMS) == small_m_tile_config(64, _BAND_N, _BAND_K, **bf16) is not None
+    assert large_m_tile_config(256, 640, 2048, **bf16) is None  # the planner-claimed shape keeps the graph route, read off the envelope
 
 
 def test_large_m_rule_split_k_mirror_follows_the_compilers_auto_split_k(monkeypatch):
