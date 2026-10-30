@@ -49,8 +49,10 @@ from cudnn.frost.buffers import cutedsl_requirement_error
 from cudnn.gated_attention_block import api as _api
 from cudnn.gated_attention_block import (
     DENSE_SERVING_CCS,
+    FP8_PROJ_BF16_ATTENTION_CCS,
     KV_SOURCE_PAGED,
     KV_SOURCE_SELF,
+    QUANT_MODE_FP8_PROJ_BF16_ATTENTION,
     SERVING_PAGE_SIZES,
     SERVING_POOL_LAYOUTS,
     DecodeEnvelope,
@@ -69,6 +71,7 @@ from cudnn.gated_attention_block.api import (
     _cols,
     _FusedQkvProjection,
     _Projection,
+    _Quantize,
     _Sdpa,
     _SparseSdpa,
     _view,
@@ -103,13 +106,16 @@ from gated_block_qsa_reference import (  # noqa: E402
 )
 from gated_block_reference import (  # noqa: E402
     RefGeometry,
+    amax_scale,
     build_rope_tables,
     cu_seqlens_of,
+    gated_attention_block_fp8_reference,
     gated_attention_block_reference,
     gated_attention_block_reference_packed,
     make_inputs,
     make_packed_inputs,
     qk_norm_rope_reference,
+    quant_e4m3,
 )
 
 _DEV = "cuda" if torch.cuda.is_available() else "cpu"
@@ -339,6 +345,32 @@ def test_typed_declines_at_declaration_name_the_feature():
             quant=spec,
             paged_kv_page_size=16,
         )
+    # The FP8-projection + bf16-attention mode (QuantSpec(attention_dtype=torch.bfloat16)) is the quant spelling the paged forms ACCEPT: the
+    # packed EXTEND declaration over e4m3 token matrices builds the bf16 paged THD stage, the separate cache write, the elementwise gate, the
+    # one quantize_o and the FP8 out projection; over the block's own K / V (kv_source="self") the mode is declined by name, as is the fused fork
+    mode, mode_inp, _ = _declare_extend_with(2, 128, _extend_samples(16, 9, 2, 8), quant=True)
+    assert (
+        mode.attention_bf16 and mode.quant is mode_inp["quant"] and mode_inp["h"].dtype == e4 and mode_inp["w_qkvg"].dtype == e4 and mode_inp["w_o"].dtype == e4
+    )
+    assert [st.name for st in mode._stages] == ["qkv_gate_proj", "qk_norm_rope", "cache_write", "sdpa", "sigmoid_gate", "quantize_o", "out_proj"]
+    assert (
+        isinstance(mode._sdpa, _Sdpa)
+        and mode._sdpa.dtype == torch.bfloat16
+        and mode._sdpa.fp8 is False
+        and mode._sdpa.thd
+        and mode._sdpa.kv_source == KV_SOURCE_PAGED
+    )
+    assert (
+        mode._quant_q is None
+        and isinstance(mode._quant_o, _Quantize)
+        and mode._proj.capture_safe
+        and mode._out_proj.capture_safe
+        and mode.paged_kv_page_size == 16
+    )
+    with pytest.raises(NotImplementedError, match=r"QuantSpec\(attention_dtype=torch.bfloat16\) with kv_source='self'"):
+        _declare_extend_with(2, 128, {}, quant=True, kv_source=KV_SOURCE_SELF, token_capacity=None)
+    with pytest.raises(NotImplementedError, match=r"fuse_norm_rope=True with QuantSpec\(attention_dtype=torch.bfloat16\)"):
+        _declare_extend_with(2, 128, _extend_samples(16, 9, 2, 8), quant=True, fuse_norm_rope=True)
     # The packed form is SERVED (the former ``thd=True`` decline, inverted): rank-2 token matrices declare without complaint.
     h_tokens = inp["h"].view(64, geom.d_model)
     blk_thd = GatedAttentionBlockFwd(
@@ -1252,18 +1284,53 @@ def _extend_samples(page, n_pages, b_max, max_pages, layout="hnd", dtype=torch.b
     return dict(sample_k_cache=k, sample_v_cache=v, sample_block_table=table[:, :max_pages])
 
 
+def _mode_static_scales(geom_kw):
+    """The FP8-projection + bf16-attention mode's STATIC per-tensor scales for the harness's data (an offline calibration stand-in): the
+    token matrix ``h`` is drawn standard-normal (``s_h`` = 448 / 6: the rare draw past 6 sigma saturates, in the block and the oracle alike),
+    the weights are quantized at their amax, ``scale_o`` assumes a gated-O amax of four projection sigmas (``0.02 x sqrt(d_model)``)."""
+    return dict(s_h=448.0 / 6.0, scale_o=448.0 / (4.0 * 0.02 * geom_kw["d_model"] ** 0.5))
+
+
 def _declare_extend_with(
-    b_max, t_max, samples, *, page=16, kv_source=KV_SOURCE_PAGED, cu=True, token_capacity="T", geom_kw=_EXTEND_GEOM, dtype=torch.bfloat16, seed=0, **blk_kw
+    b_max,
+    t_max,
+    samples,
+    *,
+    page=16,
+    kv_source=KV_SOURCE_PAGED,
+    cu=True,
+    token_capacity="T",
+    geom_kw=_EXTEND_GEOM,
+    dtype=torch.bfloat16,
+    seed=0,
+    quant=None,
+    **blk_kw,
 ):
     """A declared (not compiled) EXTEND block over EXPLICIT samples (the pools' shape / dtype / strides, the block table).  ``inp``
     carries the WEIGHTS every step shares and the step's token tensors (``h`` / ``cos`` / ``sin`` as ``[T_max, .]`` matrices the
-    steps rewrite in place).  Returns ``(blk, inp, out)``."""
+    steps rewrite in place).  Returns ``(blk, inp, out)``.  ``quant`` (appended; True) declares the FP8-PROJECTION + BF16-ATTENTION
+    mode: ``h`` an e4m3 ``[T_max, d_model]`` matrix (the steps write e4m3 codes at ``inp["scales"]["s_h"]``), the weights e4m3 codes at
+    their amax scales, the QuantSpec ``inp["quant"]`` = ``QuantSpec.bf16_attention(...)`` with ``scale_o`` from :func:`_mode_static_scales`."""
     geom = GatedAttentionBlockGeometry(**geom_kw)
     ref_geom = RefGeometry(
         **{k: v for k, v in geom_kw.items() if k in ("d_model", "h_q", "h_kv", "d_head", "rope_dim")}
     )  # the dims; the oracle's mask is its own
     inp = make_inputs(ref_geom, batch=1, seq_len=t_max, dtype=dtype, device=_DEV, seed=seed)
     inp = dict(inp, h=inp["h"].view(t_max, geom.d_model), cos=inp["cos"].view(t_max, -1).contiguous(), sin=inp["sin"].view(t_max, -1).contiguous())
+    if quant is not None:
+        assert dtype == torch.bfloat16, "the FP8-projection + bf16-attention mode's activations are bf16"
+        sc = dict(_mode_static_scales(geom_kw), s_wq=amax_scale(inp["w_qkvg"]), s_wo=amax_scale(inp["w_o"]))
+        spec = QuantSpec.bf16_attention(1.0 / sc["s_h"], 1.0 / sc["s_wq"], 1.0 / sc["s_wo"], sc["scale_o"])
+        spec.validate()
+        inp = dict(
+            inp,
+            h=torch.zeros(t_max, geom.d_model, device=_DEV, dtype=torch.float8_e4m3fn),
+            w_qkvg=quant_e4m3(inp["w_qkvg"], sc["s_wq"]),
+            w_o=quant_e4m3(inp["w_o"], sc["s_wo"]),
+            scales=sc,
+            quant=spec,
+        )
+        blk_kw = dict(blk_kw, quant=spec)
     out = torch.empty(t_max, geom.d_model, device=_DEV, dtype=dtype)
     blk = GatedAttentionBlockFwd(
         inp["h"],
@@ -1707,6 +1774,10 @@ class _ExtendHarness:
             b_max, t_max, max_kv_len=max_kv_len, page=page, layout=layout, dtype=dtype, cu=cu, row_stride=row_stride, seed=seed, **blk_kw
         )
         self.b_max, self.t_max, self.page, self.layout, self.dtype, self.cu = b_max, t_max, page, layout, dtype, cu
+        # the FP8-projection + bf16-attention mode (``quant=True`` in blk_kw): the histories stay bf16 VALUES; the steps hand the block their
+        # e4m3 codes at s_h and the oracle is the fp8 reference's attention_bf16 arm over the same codes (the gated O quantized at scale_o)
+        self.quant_mode = "quant" in self.inp
+        self.scales, self.spec = self.inp.get("scales"), self.inp.get("quant")
         geom_kw = blk_kw.get("geom_kw", _EXTEND_GEOM)  # the oracle's mirror follows the DECLARED geometry (a shard's, or the matrix's 8 / 2)
         self.geom, self.ref_geom = self.blk.geom, RefGeometry(**{k: v for k, v in geom_kw.items() if k in ("d_model", "h_q", "h_kv", "d_head", "rope_dim")})
         self.k_cache, self.v_cache, self.table = self.samples["sample_k_cache"], self.samples["sample_v_cache"], self.samples["sample_block_table"]
@@ -1760,6 +1831,30 @@ class _ExtendHarness:
         prefix are the step's expected rows, its ``k`` / ``v`` the pool rows."""
         h = self.hist[b]
         cos, sin = build_rope_tables(int(h.shape[0]), self.geom.rope_dim, base=self.ref_geom.rope_base, batch=1, device="cuda", dtype=self.dtype)
+        if self.quant_mode:
+            sc = self.scales
+            inp = dict(
+                h=quant_e4m3(h[None], sc["s_h"]),
+                w_qkvg=self.inp["w_qkvg"],
+                w_o=self.inp["w_o"],
+                w_q_norm=self.inp["w_q_norm"],
+                w_k_norm=self.inp["w_k_norm"],
+                cos=cos,
+                sin=sin,
+            )
+            return gated_attention_block_fp8_reference(
+                inp,
+                self.ref_geom,
+                descale_h=1.0 / sc["s_h"],
+                descale_w_qkvg=1.0 / sc["s_wq"],
+                descale_w_o=1.0 / sc["s_wo"],
+                scale_q=None,
+                scale_k=None,
+                scale_v=None,
+                scale_o=sc["scale_o"],
+                attention_bf16=True,
+                return_rows=True,
+            )
         return gated_attention_block_reference(
             h[None], self.inp["w_qkvg"], self.inp["w_q_norm"], self.inp["w_k_norm"], cos, sin, self.inp["w_o"], self.ref_geom
         )
@@ -1815,7 +1910,7 @@ class _ExtendHarness:
             q, p = q_lens[b], prefix_lens[b]
             rows.append((row, row + q))
             if q:
-                h[row : row + q] = self.hist[b][p : p + q]
+                h[row : row + q] = quant_e4m3(self.hist[b][p : p + q], self.scales["s_h"]) if self.quant_mode else self.hist[b][p : p + q]
                 c, s = build_rope_tables(
                     q,
                     self.geom.rope_dim,
@@ -1898,6 +1993,12 @@ class _ExtendHarness:
         """The gated O the SDPA + gate left in the ``o`` slot (in place under inference), ``[T_max, H_q, D]``."""
         g, lay = self.geom, self.blk._layout()
         return _view(self.ws, lay.o, (self.t_max, g.h_q, g.d_head), self.dtype)
+
+    def o8(self):
+        """The mode's e4m3 gated O in the ``o8`` slot (the FP8 out projection's A operand), ``[T_max, H_q, D]``."""
+        g, lay = self.geom, self.blk._layout()
+        assert lay.o8 >= 0, "no o8 slot: not a quantized declaration"
+        return _view(self.ws, lay.o8, (self.t_max, g.h_q, g.d_head), torch.float8_e4m3fn)
 
     def check(self, rec, *, label, out_cos=0.999, o_atol=2e-2):
         """Every assertion a step owes: ``isfinite(out)`` over EVERY row first; per live sequence the dense suite's budget vs the
@@ -2816,6 +2917,19 @@ def test_sm100_extend_declines_fuse_gate_and_the_fused_fork_by_name():
     plain._check_part_support()
     env = GatedAttentionBlockFwd.serving_envelope(plain.geom, torch.bfloat16, _DEV)
     assert env.device_cc == (10, 0) and env.forms == ("extend", "decode")
+    # the FP8-projection + bf16-attention mode ON the part: served iff FP8_PROJ_BF16_ATTENTION_CCS holds cc 10.0 (its cells below run then),
+    # else the mode's part statement at check_support and no spelling in the envelope's quant_modes
+    mode, mode_inp, _ = _declare_extend(2, 128, max_kv_len=128, quant=True)[:3]
+    mode_env = GatedAttentionBlockFwd.serving_envelope(mode.geom, torch.float8_e4m3fn, _DEV, quant=mode_inp["quant"])
+    if (10, 0) in FP8_PROJ_BF16_ATTENTION_CCS:
+        mode._check_declaration()
+        mode._check_part_support()
+        assert mode_env.forms == ("extend", "decode") and mode_env.extend.quant_modes == (QUANT_MODE_FP8_PROJ_BF16_ATTENTION,) == env.extend.quant_modes
+    else:
+        with pytest.raises(NotImplementedError, match=r"QuantSpec\(attention_dtype=torch.bfloat16\) on cc 10.0") as e:
+            mode.check_support()
+        assert "FP8_PROJ_BF16_ATTENTION_CCS" in str(e.value) and mode_env.forms == () and mode_env.extend.reason == str(e.value)
+        assert mode_env.extend.quant_modes == () == env.extend.quant_modes
 
 
 # ---------------------------------------------------------------------------
@@ -2879,3 +2993,202 @@ def test_extend_packed_kv_rows_of_a_serving_stack_bind_as_two_half_views(dtype, 
     assert torch.equal(
         out, rec_h["out"]
     ), f"{what}: out differs from the HND-compact twin's: max|diff| {(out.float() - rec_h['out'].float()).abs().max().item():.3e}"
+
+
+# ---------------------------------------------------------------------------
+# The FP8-PROJECTION + BF16-ATTENTION mode (QuantSpec(attention_dtype=torch.bfloat16)) on the EXTEND form
+# ---------------------------------------------------------------------------
+#
+# A serving stack whose attention projections are static per-tensor FP8 W8A8 while its KV cache and attention math are bf16: e4m3 h / W_qkvg
+# / W_o under one scale each, the FP8 forced-tile projection GEMMs with the descale in their bf16 epilogue, norm + RoPE and the write-through
+# in bf16, the bf16 paged THD body over bf16 pools (the EXTEND form's own stage: the gate in its epilogue under fuse_gate=True on cc 10.7, its
+# own launch otherwise), the gated O quantized to e4m3 at scale_o for the FP8 out projection.  The cells are the bf16 EXTEND cells' twins
+# through `_harness(..., quant=True)`: the oracle the fp8 reference's attention_bf16 arm over the SAME codes, the bars the suite's own
+# (`check`: out cos 0.999, gated-O cos 0.999 + atol 2e-2, dead rows exact, the pools bitwise the slab rows, stale rows untouched).  Served on
+# the parts of FP8_PROJ_BF16_ATTENTION_CCS: the cells skip by name off them (the part's decline is pinned in
+# test_sm100_extend_declines_fuse_gate_and_the_fused_fork_by_name on cc 10.0 and in the host rows above).
+
+
+def _cc():
+    return tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
+
+
+requires_fp8_proj_bf16_attention_part = pytest.mark.skipif(
+    _cc() not in FP8_PROJ_BF16_ATTENTION_CCS,
+    reason=f"the FP8-projection + bf16-attention mode is served on {FP8_PROJ_BF16_ATTENTION_CCS} (declined by name elsewhere); found {_cc()}",
+)
+
+
+def _mode_harness(b_max, t_max, **kw):
+    """ONE compiled mode block per declaration (the harness cache), the elementwise gate unless the cell says otherwise."""
+    return _harness(b_max, t_max, quant=True, **kw)
+
+
+def _mode_pin_extend(hz):
+    """The compiled mode block's facts on the EXTEND form: the attribute, the bf16 paged THD SDPA stage (``fp8`` False), no quantize_q /
+    quantize_kv, ONE distinct quantize_o, both FP8 projections on the jit-only capture-safe route with the alpha epilogue, the carve without
+    the compact e4m3 Q / K / V; on cc 10.0 the shared SM100 paged THD body (`_sm100_pin_extend`)."""
+    blk = hz.blk
+    assert blk.attention_bf16 and blk.quant.attention_bf16 and blk.dtype == torch.float8_e4m3fn and blk.act_dtype == torch.bfloat16 and blk.thd
+    names = [st.name for st in blk._stages]
+    assert names.count("quantize_o") == 1 and "quantize_q" not in names and names[-2:] == ["quantize_o", "out_proj"] and "cache_write" in names
+    sd = blk._sdpa
+    assert (
+        isinstance(sd, _Sdpa)
+        and sd.dtype == torch.bfloat16
+        and sd.fp8 is False
+        and sd.thd
+        and sd.kv_source == KV_SOURCE_PAGED
+        and sd.token_stride == blk.geom.n_qkvg
+    )
+    assert blk._quant_q is None and blk._quant_kv is None and isinstance(blk._quant_o, _Quantize) and blk._quant_o.heads == blk.geom.h_q
+    for st in (blk._proj, blk._out_proj):
+        assert isinstance(st, _Projection) and st.dtype == torch.float8_e4m3fn and st.alpha and st.capture_safe and st._plan.route == "jit-only", (
+            st.name,
+            st._plan.route,
+        )
+    lay = blk._ws
+    assert lay.q8 == lay.k8 == lay.v8 == -1 and lay.o8 >= 0 and set(blk._quant_dev) == {"alpha_qkvg", "alpha_o", "scale_o"} and blk.use_pdl is False
+    assert hz.inp["h"].dtype == torch.float8_e4m3fn and hz.inp["w_qkvg"].dtype == torch.float8_e4m3fn and hz.inp["w_o"].dtype == torch.float8_e4m3fn
+    if _cc() != (10, 7):
+        _sm100_pin_extend(hz)
+    else:
+        assert blk.gate_fused == blk.fuse_gate and (blk._gate is None) == blk.fuse_gate and sd._impl._k_mod.__file__.endswith("/sm100/prefill_d256_f16.py")
+
+
+@requires_dense_part
+@requires_fp8_proj_bf16_attention_part
+@pytest.mark.parametrize(
+    "layout, page",
+    [
+        pytest.param("hnd", 16, marks=pytest.mark.L0, id="hnd-16"),
+        pytest.param("unified", 32, marks=pytest.mark.L0, id="unified-32"),
+        pytest.param("nhd", 64, marks=pytest.mark.L1, id="nhd-64"),
+        pytest.param("hnd", 128, marks=pytest.mark.L1, id="hnd-128"),
+    ],
+)
+def test_fp8_proj_bf16_attention_extend_matrix_cell(layout, page):
+    """The degenerate matrix on serving buffers under the mode: four sequences at T_max 512 -- an empty prefix, a step over a prefix ending
+    mid-page, a PADDED entry, a tail tile -- within the suite's bars of the mode's oracle, the pools bitwise the slab rows, stale rows
+    untouched; the int64 slot dtype at pages 32 / 128; the stage pinned per part."""
+    hz = _mode_harness(4, 512, max_kv_len=512, page=page, layout=layout, slot_dtype=torch.int32 if page in (16, 64) else torch.int64)
+    _mode_pin_extend(hz)
+    rec = hz.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    assert rec["t_live"] == 412
+    hz.check(rec, label=f"mode 8/2 {layout} p{page}")
+
+
+@requires_dense_part
+@requires_fp8_proj_bf16_attention_part
+def test_fp8_proj_bf16_attention_extend_two_chunks_then_a_prefix_hit_on_l3():
+    """A 512-token sequence as TWO chunks on ONE compiled mode block over the UNIFIED content row (T_max 320: a bounded declaration with pad
+    rows): chunk 1 = tokens [0, 300) with an empty prefix, chunk 2 = tokens [300, 512) reading chunk 1's pool rows -- each within the bars of
+    the mode's oracle over the full history; then a prefix-hit step (56 new tokens over a 200-row prefix the torch reference wrote through the
+    stack's own views) on fresh sequences, the prefix rows untouched by the step."""
+    hz = _mode_harness(1, 320, max_kv_len=512, page=16, layout="unified")
+    _mode_pin_extend(hz)
+    rec1 = hz.step([300], prefix_lens=[0], prefill="none")
+    hz.check(rec1, label="mode chunk 1")
+    rec2 = hz.step([212], prefill="keep")
+    hz.check(rec2, label="mode chunk 2 over chunk 1's pool rows")
+    assert rec2["kv_lens"] == [512] and rec2["t_live"] == 212
+    hz.reset()
+    rec = hz.step([56], prefix_lens=[200], prefill="reference")
+    hz.check(rec, label="mode prefix hit on L3")
+    k_p, v_p = hz.pool_rows(0, 0, 200)
+    assert torch.equal(_bits(k_p), _bits(rec["refs"][0].k[0, :200])) and torch.equal(_bits(v_p), _bits(rec["refs"][0].v[0, :200]))
+
+
+@requires_dense_part
+@requires_fp8_proj_bf16_attention_part
+def test_fp8_proj_bf16_attention_extend_padded_entries_a_live_q_over_kv_len_0_and_the_lengths_form():
+    """The general packing under the mode: a zero-length sequence in the MIDDLE and a LIVE Q range (5 new tokens) over kv_len 0 with the NULL
+    block and slot -1 -- those 5 ``out`` rows EXACTLY 0 and their e4m3 O bytes 0 (the dead-row SELECT: no residue reaches the quantize), the
+    neighbours unaffected; the ``[B]`` lengths form (``cu_seqlens=False``) within the bars; ``num_tokens_live`` refused by name at execute."""
+    hz = _mode_harness(4, 512, max_kv_len=512, page=16, layout="hnd")
+    rec = hz.step([100, 0, 60, 5], prefix_lens=[0, 0, 0, 0], prefill="none", kv_lens=[100, 0, 60, 0])
+    hz.check(rec, label="mode middle pad + dead KV")
+    lo, hi = rec["rows"][3]
+    assert bool((rec["out"][lo:hi] == 0).all()) and bool((hz.o_gated()[lo:hi] == 0).all()) and bool((hz.o8()[lo:hi].view(torch.uint8) == 0).all())
+    assert rec["t_live"] == 165 and bool((hz.slot[lo:hi] == -1).all())
+    with pytest.raises(NotImplementedError, match=r"num_tokens_live=165 on a quantized pipeline \(QuantSpec\).*hand the capacity rows"):
+        hz.execute(num_tokens_live=165)
+    lf = _mode_harness(4, 512, max_kv_len=512, page=16, layout="hnd", cu=False, seed=21)
+    _mode_pin_extend(lf)
+    rec = lf.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    lf.check(rec, label="mode, the lengths form")
+
+
+@requires_rubin
+@requires_fp8_proj_bf16_attention_part
+def test_fp8_proj_bf16_attention_extend_fuse_gate_rides_the_paged_body_epilogue():
+    """``fuse_gate=True`` under the mode on cc 10.7: the gate in the bf16 paged body's epilogue (no sigmoid_gate stage; the e4m3 O then quantizes
+    the epilogue-gated bf16 O: ONE bf16 rounding), within the bars; the separate-gate twin on the same step within the one-rounding budget of it
+    on the gated O (bitwise never claimed: the two roundings)."""
+    fused = _mode_harness(4, 512, max_kv_len=512, page=16, layout="hnd", fuse_gate=True, seed=5)
+    assert fused.blk.gate_fused and fused.blk._gate is None and "sigmoid_gate" not in [st.name for st in fused.blk._stages] and fused.blk._sdpa.fuse_gate
+    _mode_pin_extend(fused)
+    rec = fused.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    fused.check(rec, label="mode, the gate in the paged body's epilogue")
+    sep = _mode_harness(4, 512, max_kv_len=512, page=16, layout="hnd", seed=5)
+    sep.adopt(fused)
+    rec_s = sep.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    sep.check(rec_s, label="mode, the separate gate launch")
+    live = slice(0, rec["t_live"])
+    a, b = fused.o_gated()[live].float(), sep.o_gated()[live].float()
+    d = (a - b).abs()
+    bound = torch.maximum(a.abs(), b.abs()) * 2.0**-7 + 2.0**-14  # one bf16 rounding of the gated value (the epilogue's) against two (the launch's)
+    print(
+        f"[mode EXTEND] gate in the epilogue vs the separate launch: max|diff| {d.max().item():.3e}, exact {(d == 0).float().mean().item():.3f} of the live gated O"
+    )
+    assert bool((d <= bound).all()), "the two gate placements differ by more than one bf16 rounding of the gated O"
+
+
+@requires_dense_part
+@requires_fp8_proj_bf16_attention_part
+def test_fp8_proj_bf16_attention_extend_e4m3_o_is_the_cast_of_the_gated_o_and_tracks_the_gate_quant_model():
+    """The mode's e4m3 O on the EXTEND form: (a) the store pin -- the ``o8`` slot BITWISE ``cvt.rn.satfinite(bf16 gated O * scale_o)`` of the
+    block's own gated O on every live row; (b) the gate-and-quantize model of a serving stack, ``e4m3(bf16(bf16(O) * sigmoid(G)) * scale_o)`` on
+    the ORACLE's pre-gate O and gate: the e4m3-ulp histogram printed, the one-ulp claim on the band |x| >= 4 of the e4m3 value domain (one ulp
+    there >= 0.5, above the chain's bf16 noise ~ 2^-8 of the typical gated-O magnitude), the rest reported; two launches bitwise."""
+    hz = _mode_harness(4, 512, max_kv_len=512, page=16, layout="hnd", seed=9)
+    rec = hz.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    hz.check(rec, label="mode, the e4m3 O cell")
+    scale_o = hz.spec.scale_o
+    og, o8 = hz.o_gated(), hz.o8()
+    live = slice(0, rec["t_live"])
+    assert torch.equal(o8[live].view(torch.uint8), quant_e4m3(og[live], scale_o).view(torch.uint8)), "o8 is not the e4m3 cast of the block's own gated O"
+    o_ref = torch.cat([ref.o[0, p : p + q] for (lo, hi), ref, q, p in zip(rec["rows"], rec["refs"], rec["q_lens"], rec["prefix_lens"]) if q])
+    g_ref = torch.cat([ref.gate[0, p : p + q] for (lo, hi), ref, q, p in zip(rec["rows"], rec["refs"], rec["q_lens"], rec["prefix_lens"]) if q])
+    model = quant_e4m3((o_ref.float() * torch.sigmoid(g_ref.float())).to(torch.bfloat16), scale_o).float()
+    a = o8[live].float()
+    mag = torch.maximum(a.abs(), model.abs())
+    dist = (a - model).abs() / torch.exp2(torch.floor(torch.log2(mag.clamp_min(2.0**-6))) - 3.0)
+    band = mag >= 4.0
+    hist = lambda d: dict(
+        n=int(d.numel()),
+        exact=int((d == 0).sum()),
+        one_ulp=int(((d > 0) & (d <= 1 + 1e-6)).sum()),
+        more=int((d > 1 + 1e-6).sum()),
+        max_ulp=float(d.max()) if d.numel() else 0.0,
+    )  # noqa: E731
+    full, in_band, below = hist(dist), hist(dist[band]), hist(dist[~band])
+    print(f"[mode EXTEND 8/2 p16] e4m3 O vs the gate-quant model (scale_o {scale_o:.2f}): all {full}; band |x| >= 4: {in_band}; below: {below}")
+    assert in_band["n"] > 0.5 * full["n"] and in_band["more"] == 0 and full["exact"] > 0.5 * full["n"], (in_band, full)
+    out1 = rec["out"].clone()
+    hz.refill_pools()
+    rec2 = hz.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    assert torch.equal(out1, rec2["out"]) and torch.equal(o8[live].view(torch.uint8), hz.o8()[live].view(torch.uint8)), "two launches differ"
+
+
+@requires_dense_part
+@requires_fp8_proj_bf16_attention_part
+def test_fp8_proj_bf16_attention_extend_the_27b_geometry_executes_within_the_budget():
+    """One EXTEND step at the 24 / 4 geometry at its real width (``d_model`` 5120) under the mode: two sequences at ``T_max`` 256, a 100-token
+    step over a 60-row prefix and a 156-token step over a 100-row prefix (the table row full), through the harness and ``check``."""
+    hz = _mode_harness(2, 256, max_kv_len=256, page=16, geom_kw=_Q38_27B_EXTEND_GEOM, seed=37)
+    assert hz.geom.d_model == 5120 and hz.geom.h_kv == 4 and hz.geom.n_qkvg % 256 == 0
+    _mode_pin_extend(hz)
+    rec = hz.step([100, 156], prefix_lens=[60, 100], prefill="reference")
+    hz.check(rec, label="mode 27B 24/4 d_model 5120 p16")
+    assert rec["kv_lens"] == [160, 256] and rec["t_live"] == 256 == hz.t_max

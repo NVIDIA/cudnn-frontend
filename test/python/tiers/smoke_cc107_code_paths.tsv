@@ -240,6 +240,8 @@ gated_attention_block/cutedsl/test_sigmoid_gate_bwd.py::test_gate_bwd_fp8_og_is_
 gated_attention_block/cutedsl/test_elementwise.py::test_sigmoid_gate_matches_torch[37-4-128-dtype0]	elementwise gate
 gated_attention_block/cutedsl/test_fp8_bwd_fused.py::test_prologue_is_bitwise_the_standalone_launches[1000-norm]	fused fp8 bwd prologue
 gated_attention_block/cutedsl/test_fp8_bwd_fused.py::test_epilogue_is_bitwise_the_standalone_launches[amax-cast-only]	fused fp8 bwd epilogue
+gated_attention_block/cutedsl/test_block_serving_decode.py::test_fp8_proj_bf16_attention_decode_matches_the_oracle_at_every_group_and_s_q[1-6]	gated block DECODE form, the FP8-projection + bf16-attention mode | FP8 forced-tile GEMMs with the alpha epilogue | the bf16 decode tile packed + the gate in the split combine | quantize_o | the write-through fold
+gated_attention_block/cutedsl/test_block_serving_extend.py::test_fp8_proj_bf16_attention_extend_matrix_cell[hnd-16]	gated block EXTEND form, the FP8-projection + bf16-attention mode | FP8 forced-tile GEMMs | the bf16 paged THD body | the separate gate | quantize_o | the separate cache write
 sdpa/graph/test_mhas_v2.py::test_sdpa_random_fwd_L0[test1]	graph suite fwd (FROST-routed where claimed)
 sdpa/graph/test_mhas_v2.py::test_sdpa_random_bwd_L0[test1]	graph suite bwd
 sdpa/graph/test_mhas_v2.py::test_sdpa_random_sq1_L0[test1]	graph suite decode

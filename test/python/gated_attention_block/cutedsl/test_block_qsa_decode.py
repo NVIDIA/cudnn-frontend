@@ -1663,7 +1663,9 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
         # the record's tail is append-only (a serving stack reads these by name; a new field goes after `route_cc` -- the part the dense
         # routes were read for, appended 2026-10-29 after the lean tile's rows: `sparse_tiles` / `sparse_tile_lean_default` and the part
         # the per-cell `sparse_tile(...)` reads)
-        assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-16:] == [
+        # (`quant_modes` appended after it 2026-10-30: the quant spellings the DENSE paged forms serve on the part -- the FP8-projection +
+        # bf16-attention mode; `()` on every QsaSpec geometry)
+        assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-17:] == [
             "index_list_forms",
             "index_list_form_default",
             "index_sources",
@@ -1680,7 +1682,9 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
             "sparse_tile_lean_default",
             "device_cc",
             "route_cc",
+            "quant_modes",
         ]
+        assert d.quant_modes == (), "a QsaSpec geometry serves no quant spelling over the pools"
         assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=(10, 0)).decode.fuse_prepare_default is False  # an unmeasured part
         f16 = GatedAttentionBlockFwd.serving_envelope(geom, F16, _DEV, device_cc=_SM107).decode
         assert f16.index_sources == ("caller",) and f16.index_cache_dtypes == () and f16.fuse_prepare_default is False

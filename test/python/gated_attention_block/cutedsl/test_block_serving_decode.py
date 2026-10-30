@@ -64,8 +64,10 @@ from cudnn.gated_attention_block import (
     DECODE_ROUTE_TOKEN_UNITS,
     DECODE_WIDE_TILE_CCS,
     DENSE_SERVING_CCS,
+    FP8_PROJ_BF16_ATTENTION_CCS,
     KV_SOURCE_PAGED,
     KV_SOURCE_SELF,
+    QUANT_MODE_FP8_PROJ_BF16_ATTENTION,
     SERVING_PAGE_SIZES,
     SERVING_POOL_LAYOUTS,
     DecodeEnvelope,
@@ -73,11 +75,23 @@ from cudnn.gated_attention_block import (
     GatedAttentionBlockFwd,
     GatedAttentionBlockGeometry,
     QsaSpec,
+    QuantSpec,
     ServingEnvelope,
     decode_route,
 )
 from cudnn.gated_attention_block import api as _api  # noqa: E402  (the device read the cc 10.0 host rows patch)
-from cudnn.gated_attention_block.api import DECODE_TILE, PREFILL_TILE, _CacheWrite, _cols, _Projection, _Sdpa, _SigmoidGate, _view, decode_split_choice
+from cudnn.gated_attention_block.api import (
+    DECODE_TILE,
+    PREFILL_TILE,
+    _CacheWrite,
+    _cols,
+    _Projection,
+    _Quantize,
+    _Sdpa,
+    _SigmoidGate,
+    _view,
+    decode_split_choice,
+)
 
 requirement_error = cutedsl_requirement_error("the gated attention block's serving tests")
 if requirement_error:
@@ -92,7 +106,14 @@ _SM100 = (10, 0)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from gated_block_reference import RefGeometry, build_rope_tables, gated_attention_block_reference  # noqa: E402
+from gated_block_reference import (  # noqa: E402
+    RefGeometry,
+    amax_scale,
+    build_rope_tables,
+    gated_attention_block_fp8_reference,
+    gated_attention_block_reference,
+    quant_e4m3,
+)
 
 _DEV = "cuda" if torch.cuda.is_available() else "cpu"
 _SM107 = (10, 7)
@@ -1308,8 +1329,15 @@ class _Case:
         blk_kw=None,
         heads=None,
         d_model=None,
+        quant=None,
     ):
+        """``quant`` (appended; None = the bf16 / f16 form) selects the FP8-PROJECTION + BF16-ATTENTION mode (``QuantSpec(attention_dtype=
+        torch.bfloat16)``): ``True`` calibrates the static per-tensor scales on this case's own data (amax scales for h / W_qkvg / W_o, ``scale_o``
+        from the oracle's gated O: an offline calibration stand-in), a ``scales`` dict of another case reuses ITS scales (a sibling case whose e4m3
+        codes a captured block must read under the same spec); ``h`` and the weights are then e4m3 codes, ``dtype`` stays the bf16 activation
+        dtype, and the oracle is the fp8 reference's ``attention_bf16`` arm (no Q / K / V quantization point, the gated O quantized at ``scale_o``)."""
         self.group, self.s_q, self.kv_lens, self.page, self.layout, self.dtype = group, int(s_q), [int(x) for x in kv_lens], page, layout, dtype
+        self.quant_mode = quant is not None
         self.d_model = _D_MODEL if d_model is None else int(d_model)  # the shrunk matrix width, or a shard's real one
         self.geom, self.ref_geom = _geom(group, heads=heads, d_model=self.d_model)
         h_q, h_kv = _GROUPS[group] if heads is None else heads
@@ -1328,7 +1356,24 @@ class _Case:
             w_o=randn(self.d_model, h_q * _D),
         )
         cos_t, sin_t = _rope_tables(L_max, dtype, self.ref_geom)
+        self._rope = (cos_t, sin_t)
         self.h_full = [randn(1, max(L, s_q), self.d_model, std=1.0) for L in self.kv_lens]
+        self.scales = self.quant = None
+        if self.quant_mode:
+            # the mode: e4m3 CODES for h / W_qkvg / W_o under static per-tensor scales (the same codes a serving stack's FP8 W8A8 projections hold)
+            assert dtype == torch.bfloat16, "the FP8-projection + bf16-attention mode's activations are bf16"
+            if quant is True:
+                self.scales = dict(
+                    s_h=amax_scale(torch.cat([hf.flatten() for hf in self.h_full])),
+                    s_wq=amax_scale(self.w["w_qkvg"]),
+                    s_wo=amax_scale(self.w["w_o"]),
+                    scale_o=None,
+                )
+            else:
+                self.scales = dict(quant)
+            self.w["w_qkvg"] = quant_e4m3(self.w["w_qkvg"], self.scales["s_wq"])
+            self.w["w_o"] = quant_e4m3(self.w["w_o"], self.scales["s_wo"])
+            self.h_full = [quant_e4m3(hf, self.scales["s_h"]) for hf in self.h_full]
         # the step's inputs: the LAST s_q rows (and their positions' RoPE rows); a padded entry takes its row 0 .. s_q-1 (never read)
         self.h = torch.stack([hf[0, -s_q:] for hf in self.h_full])  # [B, s_q, d_model]
         pos = [list(range(L - s_q, L)) if L else list(range(s_q)) for L in self.kv_lens]
@@ -1337,12 +1382,25 @@ class _Case:
         # the oracle per live entry over the FULL sequence: its K / V rows (bf16 -- the oracle's single rounding) fill the pools
         self.ref_out = torch.zeros(B, s_q, self.d_model, dtype=dtype, device=_DEV)
         self.ref_rows = {}
+        self.ref_o, self.ref_gate, self.ref_og, self.ref_o8 = {}, {}, {}, {}  # the mode's oracle intermediates (the step's rows), per live entry
+        if self.quant_mode:
+            if self.scales["scale_o"] is None:
+                # scale_o from the oracle's gated O over every live entry (pass 1 at scale 1), then the oracle at that scale (pass 2)
+                og = torch.cat([self._mode_oracle(b, 1.0).o_gated.flatten() for b, L in enumerate(self.kv_lens) if L])
+                self.scales["scale_o"] = amax_scale(og)
+            sc = self.scales
+            self.quant = QuantSpec.bf16_attention(1.0 / sc["s_h"], 1.0 / sc["s_wq"], 1.0 / sc["s_wo"], sc["scale_o"])
+            self.quant.validate()
         for b, L in enumerate(self.kv_lens):
             if L == 0:
                 continue
-            ref = gated_attention_block_reference(
-                self.h_full[b], self.w["w_qkvg"], self.w["w_q_norm"], self.w["w_k_norm"], cos_t[:, :L], sin_t[:, :L], self.w["w_o"], self.ref_geom
-            )
+            if self.quant_mode:
+                ref = self._mode_oracle(b, self.scales["scale_o"])
+                self.ref_o[b], self.ref_gate[b], self.ref_og[b], self.ref_o8[b] = ref.o[0, -s_q:], ref.gate[0, -s_q:], ref.o_gated[0, -s_q:], ref.o8[0, -s_q:]
+            else:
+                ref = gated_attention_block_reference(
+                    self.h_full[b], self.w["w_qkvg"], self.w["w_q_norm"], self.w["w_k_norm"], cos_t[:, :L], sin_t[:, :L], self.w["w_o"], self.ref_geom
+                )
             self.ref_out[b] = ref.out[0, -s_q:]
             self.ref_rows[b] = (ref.k[0], ref.v[0])  # [L, h_kv, D]
         # pages: block 0 reserved (NULL); each live entry gets ceil(L / P) pages from a permutation of 1 .. n_pages-1
@@ -1384,7 +1442,9 @@ class _Case:
             sample_v_cache=self.v_cache,
             sample_block_table=self.block_table,
             fuse_gate=True,
-            fuse_norm_rope=dtype == torch.bfloat16,
+            # the mode runs the UNFUSED stage (1) (fuse_norm_rope is refused there: no bf16 slab under the fork)
+            fuse_norm_rope=dtype == torch.bfloat16 and not self.quant_mode,
+            **({"quant": self.quant} if self.quant_mode else {}),
         )
         kw.update(blk_kw or {})
         self.blk_kw = kw
@@ -1393,6 +1453,42 @@ class _Case:
             self.h, self.w["w_qkvg"], self.w["w_q_norm"], self.w["w_k_norm"], self.cos, self.sin, self.w["w_o"], self.out, self.geom, **kw
         )
         self.ws = None
+
+    def _mode_oracle(self, b, scale_o):
+        """The mode's oracle over live entry ``b``'s FULL sequence: the fp8 reference's ``attention_bf16`` arm on this case's e4m3 codes
+        and scales, the gated O quantized at ``scale_o`` (``Fp8RefOutputs``: out, the bf16 K / V rows, the pre-gate O, the gate, the gated O, o8)."""
+        L, sc = self.kv_lens[b], self.scales
+        cos_t, sin_t = self._rope
+        inp = dict(
+            h=self.h_full[b],
+            w_qkvg=self.w["w_qkvg"],
+            w_o=self.w["w_o"],
+            w_q_norm=self.w["w_q_norm"],
+            w_k_norm=self.w["w_k_norm"],
+            cos=cos_t[:, :L],
+            sin=sin_t[:, :L],
+        )
+        return gated_attention_block_fp8_reference(
+            inp,
+            self.ref_geom,
+            descale_h=1.0 / sc["s_h"],
+            descale_w_qkvg=1.0 / sc["s_wq"],
+            descale_w_o=1.0 / sc["s_wo"],
+            scale_q=None,
+            scale_k=None,
+            scale_v=None,
+            scale_o=scale_o,
+            attention_bf16=True,
+            return_rows=True,
+        )
+
+    def recompute_oracle(self, scale_o):
+        """The mode's ``out`` oracle at another ``scale_o`` (the recalibration cells), ``[B, s_q, d_model]`` bf16 with the dead rows 0."""
+        out = torch.zeros_like(self.ref_out)
+        for b, L in enumerate(self.kv_lens):
+            if L:
+                out[b] = self._mode_oracle(b, scale_o).out[0, -self.s_q :]
+        return out
 
     def compile(self):
         self.blk.check_support()
@@ -1441,6 +1537,14 @@ class _Case:
         gate = _cols(proj, o_g, g.h_q, g.d_head).view(self.blk.batch, self.blk.seq_len, g.h_q, g.d_head)
         o = _view(ws, lay.o, (t, g.h_q, g.d_head), self.dtype).view(self.blk.batch, self.blk.seq_len, g.h_q, g.d_head)
         return q, gate, o, ws[lay.engine_scratch :]
+
+    def o8_view(self, ws=None):
+        """The mode's e4m3 gated O the last execute left in the workspace's ``o8`` slot, as ``[B, S_q, H_q, D]`` (the FP8 out projection's A operand)."""
+        ws = self.ws if ws is None else ws
+        g, lay = self.geom, self.blk._ws
+        assert lay.o8 >= 0, "no o8 slot: not a quantized declaration"
+        t = self.blk.batch * self.blk.seq_len
+        return _view(ws, lay.o8, (t, g.h_q, g.d_head), torch.float8_e4m3fn).view(self.blk.batch, self.blk.seq_len, g.h_q, g.d_head)
 
     def check_against_oracle(self, out=None, *, what="out"):
         out = self.out if out is None else out
@@ -1981,13 +2085,15 @@ def test_two_launches_are_bitwise():
     assert torch.equal(a, b)
 
 
-def _capture_replay_cell(**blk_kw):
+def _capture_replay_cell(quant=None, **blk_kw):
     """The serving stack's defaults: the FIRST execute of a fresh declaration captured on a NEW stream with no eager warm-up
     under ``set_sync_debug_mode("error")`` (no host sync in the DECODE path: lengths, tables and slots are device data); the
     capture launches nothing, the replay is BITWISE a fresh eager run; a padded batch replays correctly; new ``kv_lens`` /
-    ``block_table`` / ``slot_mapping`` / ``h`` through the captured tensors replay bitwise the eager run over them."""
+    ``block_table`` / ``slot_mapping`` / ``h`` through the captured tensors replay bitwise the eager run over them.  ``quant``
+    (appended; True = the FP8-projection + bf16-attention mode) hands the case the mode; the sibling step then reuses the captured
+    block's scales (its codes must read under the captured spec)."""
     lens = (300, 0, 1000, 77)
-    case = _Case(16, 2, lens, seed=23, blk_kw=blk_kw or None)  # fresh: never executed
+    case = _Case(16, 2, lens, seed=23, blk_kw=blk_kw or None, quant=quant)  # fresh: never executed
     case.blk.check_support()
     case.blk.compile()
     case.ws = torch.empty(case.blk.get_workspace_size(), dtype=torch.uint8, device=_DEV)
@@ -2017,7 +2123,7 @@ def _capture_replay_cell(**blk_kw):
         assert torch.equal(case.out, replayed), "the replay of the captured first execute differs from the eager run"
         # a NEW step through the captured tensors: new lengths (one entry longer by a token: its slot moves), a re-laid-out
         # table (pages swapped between two entries), new slots and new h -- the oracle of the new step through a sibling case
-        sib = _Case(16, 2, (301, 0, 1000, 77), seed=29, table_row_stride=case.block_table.shape[1])
+        sib = _Case(16, 2, (301, 0, 1000, 77), seed=29, table_row_stride=case.block_table.shape[1], quant=case.scales if quant else None)
         # the sibling's pools hold its oracle prefix; make the CAPTURED pools hold them (the captured pointers are the block's)
         case.k_cache.copy_(sib.k_cache)
         case.v_cache.copy_(sib.v_cache)
@@ -2437,6 +2543,17 @@ def test_fuse_cache_write_small_m_resolves_the_measured_rule_by_default_and_the_
         )
 
 
+@contextlib.contextmanager
+def monkeypatch_rubin_route():
+    """The Rubin reading of the route for one declaration (the ``_rubin_reading`` fixture's effect without a monkeypatch argument)."""
+    prev = _api._route_device_cc
+    _api._route_device_cc = lambda device: None
+    try:
+        yield
+    finally:
+        _api._route_device_cc = prev
+
+
 def test_fuse_cache_write_small_m_is_a_typed_decline_off_the_arm_and_auto_reads_false_there():
     """``fuse_cache_write_small_m=True`` off the arm's domain is a typed ``NotImplementedError`` naming the reason, and ``None`` reads False
     there with the separate cache-write stage built (where there is a write-through at all): the EXTEND form and the write-through on the
@@ -2494,6 +2611,37 @@ def test_fuse_cache_write_small_m_is_a_typed_decline_off_the_arm_and_auto_reads_
         GatedAttentionBlockFwd(*qargs, quant=spec, fuse_cache_write_small_m=True)
     quant = GatedAttentionBlockFwd(*qargs, quant=spec)
     assert quant.cache_write_in_norm_rope is False and quant._cache_write is None and quant.paged_kv_page_size == 0
+    # the FP8-projection + bf16-attention mode (QuantSpec(attention_dtype=torch.bfloat16)) on the DECODE form: the fold is ADMITTED (the bf16
+    # chain's TMA norm + RoPE kernel on a bf16 slab) -- AUTO True on the fold's domain, an explicit True followed, an explicit False the separate
+    # launch; the stage list is the bf16 chain's plus the one quantize launch
+    mode = QuantSpec.bf16_attention(0.01, 0.02, 0.03, 4.0)
+    kc8, vc8 = _pools(8, 2, 16, _D, "hnd", torch.bfloat16)
+    geom_br = GatedAttentionBlockGeometry(d_model=_D_MODEL, h_q=8, h_kv=2, d_head=_D, rope_dim=_ROPE, causal_bottom_right=True)  # the paged forms' diagonal
+    mode_args = (
+        e4(4, 1, _D_MODEL),
+        e4(geom_br.n_qkvg, _D_MODEL),
+        mk(_D),
+        mk(_D),
+        mk(4, 1, _ROPE),
+        mk(4, 1, _ROPE),
+        e4(_D_MODEL, 8 * _D),
+        mk(4, 1, _D_MODEL),
+        geom_br,
+    )
+    mode_kw = dict(
+        paged_kv_page_size=16, kv_source="paged", sample_k_cache=kc8, sample_v_cache=vc8, sample_block_table=torch.zeros(4, 8, dtype=torch.int32, device=_DEV)
+    )
+    with monkeypatch_rubin_route():
+        auto_mode = GatedAttentionBlockFwd(*mode_args, quant=mode, fuse_gate=True, decode_split_kv=2, **mode_kw)  # the gate in the combine
+        assert (
+            auto_mode.attention_bf16 and auto_mode.cache_write_in_norm_rope is True and auto_mode._cache_write is None and auto_mode._norm_rope.page_size == 16
+        )
+        assert [st.name for st in auto_mode._stages] == ["qkv_gate_proj", "qk_norm_rope", "sdpa", "quantize_o", "out_proj"] and auto_mode.gate_fused
+        on_mode = GatedAttentionBlockFwd(*mode_args, quant=mode, fuse_cache_write_small_m=True, **mode_kw)
+        assert on_mode.cache_write_in_norm_rope is True and on_mode._cache_write is None
+        off_mode = GatedAttentionBlockFwd(*mode_args, quant=mode, fuse_cache_write_small_m=False, fuse_gate=False, **mode_kw)
+        assert off_mode.cache_write_in_norm_rope is False and isinstance(off_mode._cache_write, _CacheWrite)
+        assert [st.name for st in off_mode._stages] == ["qkv_gate_proj", "qk_norm_rope", "cache_write", "sdpa", "sigmoid_gate", "quantize_o", "out_proj"]
     # fp32 activations on the dense DECODE form (declared here, declined by check_support): the activation row
     with pytest.raises(NotImplementedError, match="serves bf16 / f16 activations"):
         _make_block(12, 1, 1, dtype=torch.float32, fuse_cache_write_small_m=True)
@@ -2678,7 +2826,37 @@ def test_on_a_cc_10_0_reading_the_rubin_only_pipelines_are_declined_by_name_befo
     )
     with pytest.raises(NotImplementedError, match="quant=QuantSpec on cc 10.0") as e:
         GatedAttentionBlockFwd(*fp8, quant=spec).check_support()
-    assert "FP8-projection + bf16-attention" in str(e.value)
+    assert "FP8-projection + bf16-attention" in str(e.value) and "FP8_PROJ_BF16_ATTENTION_CCS" in str(e.value)
+    # the FP8-projection + bf16-attention mode on the cc 10.0 reading: the part statement of its OWN tuple -- declined by name while
+    # FP8_PROJ_BF16_ATTENTION_CCS lacks the part, the part rows passed once it holds it (the one-tuple lift)
+    mode = QuantSpec.bf16_attention(0.01, 0.02, 0.03, 4.0)
+    kc, vc = _pools(8, 1, 16, _D, "hnd", torch.bfloat16)
+    mode_args = (
+        e4(4, 1, _D_MODEL),
+        e4(geom.n_qkvg, _D_MODEL),
+        mk(_D),
+        mk(_D),
+        mk(4, 1, _ROPE),
+        mk(4, 1, _ROPE),
+        e4(_D_MODEL, 8 * _D),
+        mk(4, 1, _D_MODEL),
+        geom,
+    )
+    mode_kw = dict(
+        paged_kv_page_size=16, kv_source="paged", sample_k_cache=kc, sample_v_cache=vc, sample_block_table=torch.zeros(4, 8, dtype=torch.int32, device=_DEV)
+    )
+    mode_blk = GatedAttentionBlockFwd(*mode_args, quant=mode, fuse_gate=False, **mode_kw)
+    assert mode_blk.attention_bf16 and mode_blk.decode_route.device_cc == _SM100
+    mode_blk._check_declaration()
+    if _SM100 in FP8_PROJ_BF16_ATTENTION_CCS:
+        mode_blk._check_part_support()
+    else:
+        with pytest.raises(NotImplementedError, match=r"QuantSpec\(attention_dtype=torch.bfloat16\) on cc 10.0") as e:
+            mode_blk._check_part_support()
+        assert "FP8_PROJ_BF16_ATTENTION_CCS" in str(e.value) and "the lift" in str(e.value)
+    with monkeypatch.context() as m:
+        m.setattr(_api, "FP8_PROJ_BF16_ATTENTION_CCS", (_SM107, _SM100))
+        mode_blk._check_part_support()
     t = 256
     packed = (mk(t, _D_MODEL), mk(geom.n_qkvg, _D_MODEL), mk(_D), mk(_D), mk(t, _ROPE), mk(t, _ROPE), mk(_D_MODEL, 8 * _D), mk(t, _D_MODEL), geom)
     with pytest.raises(NotImplementedError, match="thd=True over the block's own K / V") as e:
@@ -2846,6 +3024,18 @@ def test_sm100_declines_the_rubin_only_knobs_by_name():
     with pytest.raises(NotImplementedError, match="the 32-column SM100 decode arm: its cc 10.0 accept cells have not run"):
         _make_block(6, 32, 3, max_kv_len=4096, n_pages=256)  # the adapter's 32-column arm at a wide launch: declined by name on the part
     assert _cc() == _SM100 and GatedAttentionBlockFwd.serving_envelope(_geom(16)[0], torch.bfloat16, _DEV).forms == ("extend", "decode")
+    # the FP8-projection + bf16-attention mode ON the part: served iff the tuple holds cc 10.0 (its cells below run then), else the part
+    # statement at check_support and no spelling in the envelope's quant_modes
+    mode = _mode_declaration(16, 4, 1)
+    env = GatedAttentionBlockFwd.serving_envelope(_geom(16)[0], torch.float8_e4m3fn, _DEV, quant=mode.quant)
+    if _SM100 in FP8_PROJ_BF16_ATTENTION_CCS:
+        mode._check_declaration()
+        mode._check_part_support()
+        assert env.forms == ("extend", "decode") and env.decode.quant_modes == (QUANT_MODE_FP8_PROJ_BF16_ATTENTION,)
+    else:
+        with pytest.raises(NotImplementedError, match=r"QuantSpec\(attention_dtype=torch.bfloat16\) on cc 10.0") as e:
+            mode.check_support()
+        assert "FP8_PROJ_BF16_ATTENTION_CCS" in str(e.value) and env.forms == () and env.decode.quant_modes == () and env.decode.reason == str(e.value)
 
 
 # ---------------------------------------------------------------------------
@@ -2947,3 +3137,340 @@ def test_packed_kv_rows_of_a_serving_stack_bind_as_two_half_views_on_the_decode_
         assert case.route_readback()["file"].endswith("/sm107/decode_d256_f16.py")
     else:
         _sm100_pin(case, _SM100_ROUTE_TABLE[6][s_q])
+
+
+# ---------------------------------------------------------------------------
+# The FP8-PROJECTION + BF16-ATTENTION mode (QuantSpec(attention_dtype=torch.bfloat16)) on the DECODE form
+# ---------------------------------------------------------------------------
+#
+# A serving stack whose attention projections are static per-tensor FP8 W8A8 while its KV cache and attention math are bf16: e4m3 h / W_qkvg
+# / W_o under one scale each, the two FP8 forced-tile projection GEMMs with the descale folded into their bf16 epilogue, QK-norm + RoPE and
+# the pool write-through in bf16, stage (4) the bf16 serving form's own kernels and routes over bf16 pools (the gate in the combine on cc 10.7,
+# its own launch on cc 10.0), the gated O quantized to e4m3 at scale_o (quantize_o: the mode's ONE quantize launch) for the FP8 out
+# projection.  The cells are the bf16 DECODE cells' twins through `_Case(quant=True)`: the oracle is the fp8 reference's attention_bf16 arm
+# (no Q / K / V quantization point; the gated O quantized at scale_o exactly as the block does), the bound the SIBLING's (cos > 0.999 on out,
+# a padded entry EXACTLY 0, block 0 untouched) -- never the fp8 suite's 0.99 (every quantization point of the mode is replicated).  Served on
+# the parts of FP8_PROJ_BF16_ATTENTION_CCS: the cells skip by name off them (a part off the tuple declines the mode at check_support, pinned
+# in test_sm100_declines_the_rubin_only_knobs_by_name on cc 10.0 and in the host rows above).
+
+requires_fp8_proj_bf16_attention_part = pytest.mark.skipif(
+    _cc() not in FP8_PROJ_BF16_ATTENTION_CCS,
+    reason=f"the FP8-projection + bf16-attention mode is served on {FP8_PROJ_BF16_ATTENTION_CCS} (declined by name elsewhere); found {_cc()}",
+)
+
+
+def _mode_part_kw():
+    """The mode's declaration knobs per served part: the gate in the combine on cc 10.7 (the `_Case` default, fuse_gate=True), its own launch
+    on every other part (the sm100 row claims no gate epilogue)."""
+    return {} if _cc() == _SM107 else dict(fuse_gate=False)
+
+
+def _mode_case(key, *args, blk_kw=None, **kw):
+    """ONE compiled mode cell per key (the cache the bf16 cells use), on the part's default chain."""
+    bk = _mode_part_kw()
+    bk.update(blk_kw or {})
+    return _case(("mode",) + tuple(key), *args, quant=True, blk_kw=bk, **kw)
+
+
+def _mode_declaration(group, batch, s_q, **blk_kw):
+    """A declared (not compiled) mode block on EMPTY e4m3 tensors over bf16 pools: the declaration cells."""
+    geom, _ = _geom(group)
+    h_q, h_kv = _GROUPS[group]
+    e4 = lambda *shape: torch.zeros(*shape, dtype=torch.float8_e4m3fn, device=_DEV)  # noqa: E731
+    mk = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16, device=_DEV)  # noqa: E731
+    kc, vc = _pools(64, h_kv, 16, _D, "hnd", torch.bfloat16)
+    kw = dict(
+        paged_kv_page_size=16,
+        kv_source="paged",
+        sample_k_cache=kc,
+        sample_v_cache=vc,
+        sample_block_table=torch.zeros(batch, 64, dtype=torch.int32, device=_DEV),
+    )
+    kw.update(_mode_part_kw())
+    kw.update(blk_kw)
+    return GatedAttentionBlockFwd(
+        e4(batch, s_q, _D_MODEL),
+        e4(geom.n_qkvg, _D_MODEL),
+        torch.ones(_D, dtype=torch.bfloat16, device=_DEV),
+        torch.ones(_D, dtype=torch.bfloat16, device=_DEV),
+        mk(batch, s_q, _ROPE),
+        mk(batch, s_q, _ROPE),
+        e4(_D_MODEL, h_q * _D),
+        mk(batch, s_q, _D_MODEL),
+        geom,
+        quant=QuantSpec.bf16_attention(0.01, 0.02, 0.03, 4.0),
+        **kw,
+    )
+
+
+def _mode_pin(case):
+    """The compiled mode block's facts: the attribute, a bf16 SDPA stage reading the slab in place, no quantize_q / quantize_kv, ONE distinct
+    quantize_o, both FP8 projections on the jit-only capture-safe route with the alpha epilogue, the carve without the compact e4m3 Q / K / V,
+    the route pinned on the compiled module (the part's table: the Rubin readback on cc 10.7, `_sm100_pin` on cc 10.0), block 0 untouched."""
+    blk = case.blk
+    assert blk.attention_bf16 and blk.quant.attention_bf16 and blk.dtype == torch.float8_e4m3fn and blk.act_dtype == torch.bfloat16 and blk.inplace_qkv
+    names = [st.name for st in blk._stages]
+    assert (
+        names.count("quantize_o") == 1 and "quantize_q" not in names and "quantize_kv" not in names and names[0] == "qkv_gate_proj" and names[-1] == "out_proj"
+    )
+    assert names.index("quantize_o") == len(names) - 2 and names.index("sdpa") < names.index("quantize_o")
+    sd = blk._sdpa
+    assert isinstance(sd, _Sdpa) and sd.dtype == torch.bfloat16 and sd.fp8 is False and not sd.mxfp8 and sd.o_dtype == torch.bfloat16
+    assert sd.token_stride == blk.geom.n_qkvg and sd.gate_token_stride == blk.geom.n_qkvg and sd.kv_source == KV_SOURCE_PAGED
+    assert blk._quant_q is None and blk._quant_kv is None and isinstance(blk._quant_o, _Quantize) and blk._quant_o.heads == blk.geom.h_q
+    for st in (blk._proj, blk._out_proj):
+        assert isinstance(st, _Projection) and st.dtype == torch.float8_e4m3fn and st.alpha and st.capture_safe and st._plan.route == "jit-only", (
+            st.name,
+            st._plan.route,
+        )
+    lay = blk._ws
+    assert lay.q8 == lay.k8 == lay.v8 == -1 and lay.o8 >= 0 and lay.q == lay.k == lay.v == -1
+    assert set(blk._quant_dev) == {"alpha_qkvg", "alpha_o", "scale_o"} and blk.use_pdl is False
+    r, rb = blk.decode_route, case.route_readback()
+    assert rb["template"] == r.tile and rb["adapter_split"] == blk.decode_split_kv and (rb["adapter_pack"] is True) == r.pack_gqa, (rb, r)
+    if _cc() == _SM107:
+        assert r.device_cc == _SM107 and (blk.gate_fused == (r.prefill_tile or blk.decode_split_kv >= 2))
+        if r.decode_tile:
+            assert rb["file"].endswith("/sm107/decode_d256_f16.py") and rb["n_q"] == r.n_q
+    else:
+        _sm100_pin(case, _SM100_ROUTE_TABLE[r.group][r.s_q])
+    k0, v0 = case.block0_bits
+    assert torch.equal(_bits(case.k_cache[0]), k0) and torch.equal(_bits(case.v_cache[0]), v0), "block 0 (the NULL block) must never be written"
+    return r, rb
+
+
+@requires_dense_part
+@requires_fp8_proj_bf16_attention_part
+@pytest.mark.parametrize("group", sorted(_GROUPS))
+@pytest.mark.parametrize("s_q", [1, 2, 3, 4, 5])
+def test_fp8_proj_bf16_attention_decode_matches_the_oracle_at_every_group_and_s_q(group, s_q):
+    """The mode's DECODE cells of the served-group matrix: every served group x S_q 1 .. 5 at the standard lengths (a tail tile, the
+    ring depth, four tiles with a tail, a PADDED entry) against the mode's oracle under the SIBLING's budget (cos > 0.999 on ``out``,
+    the padded entry EXACTLY 0, block 0 untouched), the route pinned against the compiled module as the bf16 cell of the same
+    declaration (the part's table), the stage list the bf16 chain's plus the one quantize launch, no compact e4m3 Q / K / V."""
+    case = _mode_case(("std", group, s_q), group, s_q, _LENS)
+    case.run()
+    case.check_against_oracle()
+    _mode_pin(case)
+
+
+@requires_dense_part
+@requires_fp8_proj_bf16_attention_part
+@pytest.mark.parametrize("page, s_q", _PACKED_KV_CELLS)
+def test_fp8_proj_bf16_attention_decode_the_27b_geometry_on_packed_kv_rows(page, s_q):
+    """The 24 / 4 geometry at its real width (``d_model`` 5120, n_qkvg 14336) under the mode on a serving stack's PACKED K|V cache (the two
+    half views of one ``[pages, 4, P, 512]`` tensor, int64 slots): page 16 x S_q 1 and page 32 x S_q 4 over kv 2048 / 0 (padded) / 5 / 1000 /
+    33 -- the oracle, the write-through in the right halves with nothing else touched, two launches bitwise, the route pinned per part."""
+    case = _mode_case(("q38_27b_packed", page, s_q), 6, s_q, _PACKED_KV_LENS, page=page, layout="unified", heads=(24, 4), d_model=5120, seed=11)
+    what = f"mode 24/4 d_model 5120 packed K|V p{page} S_q {s_q}"
+    assert case.geom.d_model == 5120 and case.geom.n_qkvg == 14336 and case.h.dtype == torch.float8_e4m3fn
+    out = _run_with_slots(case, torch.int64)
+    case.check_against_oracle(out, what=what)
+    n_rows = _assert_packed_kv_halves(case, what)
+    assert n_rows == sum(_PACKED_KV_LENS)
+    again = _run_with_slots(case, torch.int64)
+    assert torch.equal(out, again), f"{what}: two launches differ"
+    _mode_pin(case)
+
+
+def _e4m3_ulp_distance(a, b):
+    """|a - b| in e4m3 ulps AT THE LARGER MAGNITUDE, in the e4m3 VALUE domain (fp32 tensors): the spacing ``2^(floor(log2 |x|) - 3)`` of a
+    normal value, the subnormal spacing ``2^-9`` below ``2^-6``."""
+    mag = torch.maximum(a.abs(), b.abs()).clamp_min(2.0**-6)
+    return (a - b).abs() / torch.exp2(torch.floor(torch.log2(mag)) - 3.0)
+
+
+def _e4m3_histogram(dist):
+    return dict(
+        n=int(dist.numel()),
+        exact=int((dist == 0).sum()),
+        one_ulp=int(((dist > 0) & (dist <= 1.0 + 1e-6)).sum()),
+        more=int((dist > 1.0 + 1e-6).sum()),
+        max_ulp=float(dist.max()) if dist.numel() else 0.0,
+    )
+
+
+@requires_dense_part
+@requires_fp8_proj_bf16_attention_part
+def test_fp8_proj_bf16_attention_e4m3_o_is_the_cast_of_the_gated_o_and_tracks_the_gate_quant_model():
+    """The mode's e4m3 O, three readings.  (a) THE STORE PIN: the ``o8`` slot is BITWISE ``cvt.rn.satfinite(bf16 gated O * scale_o)`` of the
+    block's own gated bf16 O (the ``o`` slot, gated in place) on every row -- one quantization convention, the padded entry's bytes 0.
+    (b) THE GATE-AND-QUANTIZE MODEL of a serving stack, ``e4m3(bf16(bf16(O) * sigmoid(G)) * scale_o)`` on the ORACLE's pre-gate O and gate
+    (two bf16 roundings; the block's combine route rounds the fp32 gated value ONCE): the histogram of e4m3-ulp distances is printed; the
+    one-ulp claim is made on the band |x| >= 4 of the e4m3 value domain (the exponent bands 2^2 and above, where one e4m3 ulp >= 0.5 is above
+    the chain's bf16 noise -- 2^-8 of the typical gated-O magnitude ~ amax / 4, i.e. ~0.44 in that domain -- so the two chains differ by at
+    most one code at a rounding boundary); below the band the distances are REPORTED, never claimed (a near-zero element's relative noise
+    is unbounded); never bitwise (the kernels' tanh-form sigmoid against torch's, the attention's own accumulation).  (c) SATURATION through
+    ``update_quant_scales``: ``scale_o x 4096`` drives every live byte that reaches the range to +-448 (``satfinite``: no NaN / inf), ``out``
+    stays finite; the original spec restored, ``out`` is bitwise the first run (the three device scalars round-trip)."""
+    case = _mode_case(("gq", 12, 2), 12, 2, _LENS)
+    case.run()
+    case.check_against_oracle()
+    scale_o = case.quant.scale_o
+    _, _, og, _ = case.slab_views()
+    o8 = case.o8_view()
+    live, dead = case.live, ~case.live
+    # (a) the store pin
+    assert torch.equal(o8.view(torch.uint8), quant_e4m3(og, scale_o).view(torch.uint8)), "o8 is not the e4m3 cast of the block's own gated O at scale_o"
+    assert (o8[dead].view(torch.uint8) == 0).all() and (og[dead] == 0).all(), "a padded entry's gated O / e4m3 O must be exactly 0"
+    # (b) the model on the oracle's pre-gate O and gate (the step's rows of every live entry)
+    o_ref = torch.stack([case.ref_o[b] for b, L in enumerate(case.kv_lens) if L])
+    g_ref = torch.stack([case.ref_gate[b] for b, L in enumerate(case.kv_lens) if L])
+    model = quant_e4m3((o_ref.float() * torch.sigmoid(g_ref.float())).to(torch.bfloat16), scale_o)
+    a, m = o8[live].float(), model.float()
+    dist = _e4m3_ulp_distance(a, m)
+    band = torch.maximum(a.abs(), m.abs()) >= 4.0
+    full, in_band, below = _e4m3_histogram(dist), _e4m3_histogram(dist[band]), _e4m3_histogram(dist[~band])
+    print(f"[mode 24/2 S_q 2 p16] e4m3 O vs the gate-quant model (scale_o {scale_o:.3f}): all {full}; band |x| >= 4: {in_band}; below the band: {below}")
+    assert in_band["n"] > 0.5 * full["n"], "the band must hold most of the live elements for the claim to mean anything"
+    assert in_band["more"] == 0, f"an element in the one-ulp band is more than one e4m3 ulp from the gate-quant model: {in_band}"
+    assert full["exact"] > 0.5 * full["n"], f"fewer than half the codes agree bitwise with the model: {full}"
+    # the oracle's own e4m3 O (the block's quantization point replicated) against the block's: the same histogram shape, reported
+    o8_ref = torch.stack([case.ref_o8[b] for b, L in enumerate(case.kv_lens) if L]).float()
+    print(f"[mode 24/2 S_q 2 p16] e4m3 O vs the ORACLE's e4m3 O: {_e4m3_histogram(_e4m3_ulp_distance(a, o8_ref))}")
+    # (c) saturation through a recalibration, then the round-trip
+    q = case.quant
+    out0 = case.out.clone()
+    case.blk.update_quant_scales(QuantSpec.bf16_attention(q.descale_h, q.descale_w_qkvg, q.descale_w_o, q.scale_o * 4096.0))
+    case.execute()
+    torch.cuda.synchronize()
+    o8s = case.o8_view().float()
+    assert torch.isfinite(o8s).all() and (o8s.abs() <= 448.0).all(), "satfinite: never NaN / inf, never past +-448"
+    sat = (o8s[live].abs() == 448.0).float().mean().item()
+    print(f"[mode 24/2 S_q 2 p16] scale_o x 4096: {sat:.3f} of the live bytes saturate at +-448; out finite {bool(torch.isfinite(case.out.float()).all())}")
+    assert sat > 0.5 and torch.isfinite(case.out.float()).all() and (case.out[dead] == 0).all()
+    case.blk.update_quant_scales(q)
+    case.execute()
+    torch.cuda.synchronize()
+    assert torch.equal(case.out, out0), "the original scales restored must reproduce the first run bitwise"
+
+
+@requires_dense_part
+@requires_fp8_proj_bf16_attention_part
+def test_fp8_proj_bf16_attention_get_workspace_size_is_honest_and_the_carve_has_no_compact_qkv():
+    """The ``get_workspace_size()`` twin under the mode: the split partials inside, a sentinel tail untouched by an execute, the carve
+    without the compact e4m3 Q / K / V slots and with ``o8``; two launches bitwise."""
+    case = _mode_case(("std", 16, 2), 16, 2, _LENS)
+    blk = case.blk
+    lay = blk._layout()
+    assert lay.q8 == lay.k8 == lay.v8 == -1 and lay.o8 >= 0
+    scratch = blk._sdpa.scratch_workspace_bytes()
+    if _cc() == _SM107:
+        assert blk.decode_split_kv >= 2 and scratch > 0, (blk.decode_split_kv, scratch)
+    assert blk.get_workspace_size() >= lay.total_bytes + scratch
+    need = blk.get_workspace_size()
+    ws = torch.empty(need + 65536, dtype=torch.uint8, device=_DEV)
+    ws[need:].fill_(0xA5)
+    out = torch.empty_like(case.out)
+    case.execute(out=out, ws=ws)
+    torch.cuda.synchronize()
+    assert (ws[need:] == 0xA5).all(), "bytes past get_workspace_size() were written"
+    case.check_against_oracle(out, what="mode, sentinel-tailed workspace")
+    a = case.run().clone()
+    b = case.run().clone()
+    assert torch.equal(a, b) and torch.equal(a, out)
+
+
+@requires_dense_part
+@requires_fp8_proj_bf16_attention_part
+def test_fp8_proj_bf16_attention_capture_of_the_first_execute_replays_bitwise_and_takes_new_inputs():
+    """The capture cell's twin under the mode: the FIRST execute of a fresh declaration captured on a NEW stream with no warm-up (the FP8
+    forced-tile GEMMs on the jit-only route: no handle at the first execute; the first-execute scalar write captured WITH its values), the
+    replay bitwise the eager run, a new step (lengths / table / slots / e4m3 inputs under the SAME scales) through the captured tensors."""
+    _capture_replay_cell(quant=True, **_mode_part_kw())
+
+
+@requires_dense_part
+@requires_fp8_proj_bf16_attention_part
+def test_fp8_proj_bf16_attention_update_quant_scales_replays_the_live_values_after_a_warmed_up_capture():
+    """``update_quant_scales`` under the mode writes the THREE scalars (``alpha_qkvg`` / ``alpha_o`` / ``scale_o``) in place: a graph captured
+    after one eager warm-up replays with the LIVE values (bitwise the eager run after the update; the e4m3 point moved, so the output moved
+    too, and it matches the oracle at the new ``scale_o``); the plan facts refused by name."""
+    case = _Case(8, 1, (100, 384, 0, 500), seed=31, quant=True, blk_kw=_mode_part_kw()).compile()
+    case.execute()  # the warm-up: the first-execute scalar write lands eagerly
+    torch.cuda.synchronize()
+    out0 = case.out.clone()
+    case.check_against_oracle(out0, what="mode, warm-up")
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            case.execute()
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(case.out, out0), "the replay of a warmed-up capture differs from the eager run"
+        q = case.quant
+        half = QuantSpec.bf16_attention(q.descale_h, q.descale_w_qkvg, q.descale_w_o, q.scale_o * 0.5)
+        case.blk.update_quant_scales(half)
+        assert case.blk.quant is half
+        graph.replay()
+        torch.cuda.synchronize()
+        rep = case.out.clone()
+        case.execute()
+        torch.cuda.synchronize()
+        assert torch.equal(case.out, rep), "the replay did not read the live scalars"
+        assert not torch.equal(rep, out0), "a halved scale_o moves the e4m3 point: the output must move"
+        ref_half = case.recompute_oracle(q.scale_o * 0.5)
+        c = _cos(rep[case.live], ref_half[case.live])
+        print(f"[mode 8/1 S_q 1] replay after update_quant_scales(scale_o / 2) vs the oracle at that scale: cos {c:.6f}")
+        assert c > 0.999 and (rep[~case.live] == 0).all()
+        with pytest.raises(ValueError, match="QuantSpec.attention_dtype is a plan fact"):
+            case.blk.update_quant_scales(QuantSpec(q.descale_h, q.descale_w_qkvg, q.descale_w_o, 1.0, 1.0, 1.0, q.scale_o))
+        with pytest.raises(ValueError, match="is unused under attention_dtype=torch.bfloat16"):
+            case.blk.update_quant_scales(
+                QuantSpec(q.descale_h, q.descale_w_qkvg, q.descale_w_o, 1.0, None, None, q.scale_o, torch.float8_e4m3fn, torch.bfloat16)
+            )
+        case.blk.update_quant_scales(q)
+        case.execute()
+        torch.cuda.synchronize()
+        assert torch.equal(case.out, out0)
+    finally:
+        graph.reset()
+
+
+@requires_dense_part
+@requires_fp8_proj_bf16_attention_part
+@pytest.mark.parametrize("page", SERVING_PAGE_SIZES)
+def test_fp8_proj_bf16_attention_l1_l2_l3_pools_are_bitwise_at_every_page_size(page):
+    """The pool-layout matrix under the mode (bf16 pools): the three stride patterns holding the same values give a BITWISE ``out`` at pages
+    16 / 32 / 64 / 128, each within the oracle's budget."""
+    outs = {}
+    for layout in _LAYOUTS:
+        case = _mode_case(("layout", page, layout), 12, 2, (200, 0, 77, 1000), page=page, layout=layout, seed=3)
+        outs[layout] = case.run().clone()
+        case.check_against_oracle(what=f"mode {layout} p{page}")
+    for layout in _LAYOUTS[1:]:
+        assert torch.equal(
+            outs[layout], outs["hnd"]
+        ), f"{layout} != hnd at page {page}: max|diff| {(outs[layout].float() - outs['hnd'].float()).abs().max().item():.3e}"
+
+
+@requires_rubin
+@requires_fp8_proj_bf16_attention_part
+def test_fp8_proj_bf16_attention_launch_census_is_the_bf16_chain_plus_the_quantize_launch():
+    """The DECODE chain's CUPTI census under the mode at the 24 / 2 geometry (``d_model`` 2560, B 1 x KV 4096, S_q 1): against the bf16 UNFUSED
+    chain of the same declaration, the mode adds exactly ONE kernel -- the quantize launch -- on both write-through arms (the fold drops the
+    cache-write launch on both), the projection GEMMs' own kernel count aside (the FP8 forced tile against the bf16 small-M tile: printed);
+    no hidden copy.  Pinned: the quantize kernel present once, the cache write per arm, the fold's one-kernel saving."""
+    cells = {}
+    for arm in (False, True):
+        cells[("mode", arm)] = _Case(12, 1, (4096,), seed=1, d_model=2560, quant=True, blk_kw=dict(fuse_cache_write_small_m=arm)).compile()
+        cells[("bf16", arm)] = _Case(12, 1, (4096,), seed=1, d_model=2560, blk_kw=dict(fuse_norm_rope=False, fuse_cache_write_small_m=arm)).compile()
+    census = {k: _cupti_kernels(lambda c=c: c.execute()) for k, c in cells.items()}
+    if any(k is None for k, _ in census.values()):
+        pytest.skip("torch.profiler recorded no CUDA events (CUPTI unavailable on this node); the launch count is unverified here")
+    for arm in (False, True):
+        k_d1, m_d1 = census[("mode", arm)]
+        k_bf, _ = census[("bf16", arm)]
+        print(f"\nmode, fuse_cache_write_small_m={arm}: {len(k_d1)} kernels + {len(m_d1)} memset/memcpy:\n  " + "\n  ".join(n[:120] for n in k_d1))
+        print(f"bf16 unfused chain, fuse_cache_write_small_m={arm}: {len(k_bf)} kernels:\n  " + "\n  ".join(n[:120] for n in k_bf))
+        assert sum("frost_quantize_fp8" in n for n in k_d1) == 1 and not any("frost_quantize" in n for n in k_bf)
+        assert any("frost_cache_write" in n for n in k_d1) == (not arm) and any("frost_qk_norm_rope" in n for n in k_d1)
+        assert not [n for n in m_d1 if "memcpy" in n.lower()], "a hidden copy on the mode's execute path"
+        non_gemm = lambda ks: [n for n in ks if not any(t in n.lower() for t in ("gemm", "frost_proj", "split_k", "reduce"))]  # noqa: E731
+        assert len(non_gemm(k_d1)) == len(non_gemm(k_bf)) + 1, (non_gemm(k_d1), non_gemm(k_bf))
+        torch.cuda.synchronize()
+        cells[("mode", arm)].check_against_oracle(what=f"mode census arm {arm}")
+    assert len(census[("mode", True)][0]) == len(census[("mode", False)][0]) - 1, "the write-through fold drops exactly the cache-write launch"
+    assert torch.equal(_bits(cells[("mode", True)].out), _bits(cells[("mode", False)].out))
