@@ -277,7 +277,11 @@ def test_compile_ptr_validates_the_fused_entry_by_name():
     # the ROUNDING CONVENTION keyword (appended; "single" by default): the vocabulary by name, "staged" on the fused bf16 entry only; the host
     # entry's constexpr trails use_pdl (a Constexpr, never a runtime slot: the frame above is unchanged)
     from cudnn.sdpa.fwd.heuristics import COMBINE_OUT_ROUNDINGS
+    from cudnn.sdpa.fwd.sparse_tile_rules import COMBINE_OUT_ROUNDINGS as _RULES_ROUNDINGS
 
+    assert (
+        COMBINE_OUT_ROUNDINGS is _RULES_ROUNDINGS
+    ), "the vocabulary's home is the DSL-free rules module (a declaration's construction imports no DSL); the heuristics re-export it"
     assert COMBINE_OUT_ROUNDINGS == _ROUNDINGS == ("single", "staged")
     assert inspect.signature(comb.compile_ptr).parameters["out_rounding"].default == "single"
     assert (comb.QUANT_ROUNDING_SINGLE, comb.QUANT_ROUNDING_STAGED) == (0, 1)

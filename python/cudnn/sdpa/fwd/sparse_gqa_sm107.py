@@ -179,8 +179,11 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import cudnn
-from cudnn.sdpa.fwd.heuristics import COMBINE_OUT_ROUNDING_SINGLE, COMBINE_OUT_ROUNDINGS  # DSL-free (no cutlass / torch import): importable before the DSL gate
-from cudnn.sdpa.fwd.sparse_tile_rules import SPARSE_LEAN_TILE_EXPLICIT_CCS
+from cudnn.sdpa.fwd.sparse_tile_rules import (  # DSL-free (no cutlass / torch / tile_dsl import): importable before the DSL gate, as a declaration's construction must be
+    COMBINE_OUT_ROUNDING_SINGLE,
+    COMBINE_OUT_ROUNDINGS,
+    SPARSE_LEAN_TILE_EXPLICIT_CCS,
+)
 
 KERNEL_FILE = "sm107/sparse_d256_f16.py"
 KERNEL_FILE_LEAN = "sm107/sparse_lean_d256_f16.py"  # the second body (tile_form="lean"); the vocabulary and the kernel_template names are the heuristics'
