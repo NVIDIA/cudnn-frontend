@@ -1390,7 +1390,7 @@ def compute1_warp_group(
                                     for t in cutlass.range_constexpr(seed_vw):
                                         state_block.append(seed_chunk[t].to(cutlass.Float32))
                             else:
-                                for t in cutlass.range_constexpr(16):
+                                for _ in cutlass.range_constexpr(16):
                                     state_block.append(cutlass.Float32(0.0))
                             if cutlass.const_expr(cfg.has_composed):
                                 for g in cutlass.range_constexpr(4):
@@ -2755,6 +2755,7 @@ def get_compiled_cache(
     order_in_prologue: bool,
     log_gate: bool = True,
     has_composed: bool = False,
+    state_table: bool = False,
 ):
     """Return a mutable dict that lazily stores the compiled kernel."""
     return {}
@@ -3017,6 +3018,7 @@ def chunk_gdn2_recompute(
         order_in_prologue,
         log_gate=log_gate,
         has_composed=has_composed,
+        state_table=state_table,
     )
 
     if "compiled" not in cache:

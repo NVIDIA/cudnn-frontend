@@ -10,7 +10,8 @@ preceding ranks as ``preceding_state_update`` / ``preceding_transition``: the op
 one-row composed state the first local sequence starts from and returns it for the backward.  The backward mirrors it with ``gated_delta_net_v2_summary_bwd``
 on the first local sequence (a zero outgoing-state gradient) and ``torch.ops.cudnn.gated_delta_net_v2_bwd`` from the composed state
 with the following ranks' summaries folded into the one-row gradient state the last local sequence starts from.  The rank bounds come from
-the rank-bound rule on the global sequence boundaries; the slabs' outputs and gradients are checked against the unsplit op.
+the rank-bound rule on the global sequence boundaries; the slabs' outputs and gradients are checked against the unsplit op.  The backward prepare also returns its intermediates (``output_intermediates``), which the apply takes back and
+skips the passes that would recompute them (a multi-sequence slab takes the per-token rows and leaves the per-piece tables).
 """
 
 from __future__ import annotations
@@ -58,6 +59,7 @@ def main(seq_lens=(700, 1700, 100, 500, 1096), cp_size: int = 4, H: int = 2, D: 
     leaves = dict(q=q, k=k, v=v, g=gate, beta=beta, w=w)
     rows = {name: 1 for name in leaves}
     scale = D**-0.5
+    CHECKPOINT = 16
 
     do = (torch.randn(total, H, D, device=device) * 0.1).bfloat16()
 
@@ -83,19 +85,19 @@ def main(seq_lens=(700, 1700, 100, 500, 1096), cp_size: int = 4, H: int = 2, D: 
     # ---- forward apply: the preceding slice, folded by the op into the one-row composed state ----------------------
     outputs = []
     for rank, (t, cu) in enumerate(zip(slabs, cus)):
-        pre_start, _ = _rank_bounds(bounds, slab_len, rank)
-        h, m = h_all[pre_start:rank], m_all[pre_start:rank]
-        o, _, _, composed = la_ops.gated_delta_net_v2(
-            t["q"], t["k"], t["v"], t["g"], t["beta"], t["w"], cu, scale, preceding_state_update=h, preceding_transition=m
+        preceding_rank_start, _ = _rank_bounds(bounds, slab_len, rank)
+        h, m = h_all[preceding_rank_start:rank], m_all[preceding_rank_start:rank]
+        o, _, checkpoints, composed = la_ops.gated_delta_net_v2(
+            t["q"], t["k"], t["v"], t["g"], t["beta"], t["w"], cu, scale, preceding_state_update=h, preceding_transition=m, checkpoint_every_n_tokens=CHECKPOINT
         )
-        outputs.append((o, composed))
+        outputs.append((o, composed, checkpoints))
     o_cp = torch.cat([out[0] for out in outputs])
     r_o = _rms_ratio(o_cp, o_whole)
     assert r_o < 2e-2, f"o rms ratio {r_o:.4g}"
     # the composed state of the last rank, against the fp64 fold of the gathered summaries
-    pre_start, _ = _rank_bounds(bounds, slab_len, cp_size - 1)
+    preceding_rank_start, _ = _rank_bounds(bounds, slab_len, cp_size - 1)
     x = torch.zeros(*(H, D, D), dtype=torch.float64, device=device)
-    for j in range(pre_start, cp_size - 1):
+    for j in range(preceding_rank_start, cp_size - 1):
         h, m = h_all[j].double(), m_all[j].double()
         x = x @ m + h
     r_x = _rms_ratio(outputs[-1][1][0], x)
@@ -104,16 +106,17 @@ def main(seq_lens=(700, 1700, 100, 500, 1096), cp_size: int = 4, H: int = 2, D: 
     # ---- backward: prepare on the first local sequence, gather, apply with the following slice ------------------
     summaries = []
     for t, cu, do in zip(slabs, cus, dos):
-        g_, t_ = la_ops.gated_delta_net_v2_summary_bwd(
-            t["q"], t["k"], t["g"], t["beta"], do, cu[:2], scale=scale, output_transition=True
+        g_, t_, intermediates = la_ops.gated_delta_net_v2_summary_bwd(
+            t["q"], t["k"], t["g"], t["beta"], do, cu[:2], scale=scale, output_transition=True, output_intermediates=True, checkpoint_every_n_tokens=CHECKPOINT
         )  # the FIRST local sequence
-        summaries.append((g_[0], t_[0]))
+        summaries.append((g_[0], t_[0], intermediates))
     g_all = torch.stack([s[0] for s in summaries])
     t_all = torch.stack([s[1] for s in summaries])
     grads = {}
     for rank, (t, cu, do) in enumerate(zip(slabs, cus, dos)):
-        _, fol_stop = _rank_bounds(bounds, slab_len, rank)
-        composed, g_, t_ = outputs[rank][1], g_all[rank + 1 : fol_stop], t_all[rank + 1 : fol_stop]
+        _, following_rank_stop = _rank_bounds(bounds, slab_len, rank)
+        composed, checkpoints = outputs[rank][1], outputs[rank][2]
+        g_, t_ = g_all[rank + 1 : following_rank_stop], t_all[rank + 1 : following_rank_stop]
         for name, grad in zip(
             ("q", "k", "v", "g", "beta", "w"),
             torch.ops.cudnn.gated_delta_net_v2_bwd(
@@ -129,6 +132,9 @@ def main(seq_lens=(700, 1700, 100, 500, 1096), cp_size: int = 4, H: int = 2, D: 
                 composed_initial_state=composed if composed.numel() else None,
                 following_state_grad=g_,
                 following_transition=t_,
+                state_checkpoints=checkpoints if checkpoints.numel() else None,
+                checkpoint_every_n_tokens=CHECKPOINT,
+                **summaries[rank][2],
             )[:6],
         ):
             if name is not None:

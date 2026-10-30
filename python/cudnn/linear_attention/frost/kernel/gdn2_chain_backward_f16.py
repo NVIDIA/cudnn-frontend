@@ -48,6 +48,8 @@ def chain_backward_host(
     length_rule: cutlass.Constexpr[bool],
     fused_h_m: cutlass.Constexpr[bool],
     series: cutlass.Constexpr[bool],
+    has_piece_transitions: cutlass.Constexpr[bool],
+    has_piece_state_grads: cutlass.Constexpr[bool],
     summary_cfg: cutlass.Constexpr,
     transition_cfg: cutlass.Constexpr,
     bwd_summary_cfg: cutlass.Constexpr,
@@ -220,46 +222,48 @@ def chain_backward_host(
             stream,
         )
     else:
-        gdn2_recompute_f16.host(
-            transition_cfg,
-            k,
-            k,
-            gate,
+        if cutlass.const_expr(not has_piece_transitions):
+            gdn2_recompute_f16.host(
+                transition_cfg,
+                k,
+                k,
+                gate,
+                a_log,
+                dt_bias,
+                beta_recompute,
+                k,
+                cu_pieces_main,
+                None,
+                None,
+                state_m_main,
+                None,
+                work_items_summary,
+                summary_count,
+                scheduler_m,
+                recompute_m_words,
+                cutlass.Int32(0),
+                cutlass.Int32(0),
+                stream,
+            )
+    if cutlass.const_expr(not has_piece_state_grads):
+        gdn2_bprop_summary_f16.host(
+            bwd_summary_cfg,
+            q_ratio,
+            k_ratio,
             a_log,
             dt_bias,
-            beta_recompute,
-            k,
             cu_pieces_main,
+            state_g,
             None,
-            None,
-            state_m_main,
             None,
             work_items_summary,
             summary_count,
-            scheduler_m,
-            recompute_m_words,
-            cutlass.Int32(0),
-            cutlass.Int32(0),
+            scheduler_summary,
+            bprop_summary_words,
+            dstate_scratch,
+            scale,
             stream,
         )
-    gdn2_bprop_summary_f16.host(
-        bwd_summary_cfg,
-        q_ratio,
-        k_ratio,
-        a_log,
-        dt_bias,
-        cu_pieces_main,
-        state_g,
-        None,
-        None,
-        work_items_summary,
-        summary_count,
-        scheduler_summary,
-        bprop_summary_words,
-        dstate_scratch,
-        scale,
-        stream,
-    )
     launch_state_chain(
         heads_out,
         dim_v,
@@ -408,10 +412,13 @@ def build_chain_backward(
     device,
     num_sm,
     stream,
+    has_piece_transitions=False,
+    has_piece_state_grads=False,
 ):
     """Compile (cached per static config) the chain backward launch over the buffers of one plan; ``pieces``, ``heads_out``
     and ``num_seqs`` are launch arguments.  The placeholders repeat the marks of the standalone modules' builds so every
-    kernel compiles as it does there."""
+    kernel compiles as it does there.  ``has_piece_transitions`` / ``has_piece_state_grads``: the transition arm and the leaf summary are skipped,
+    their buffers the backward summary's intermediates."""
     _HQ, DK = q.shape[1], q.shape[2]
     k.shape[1]
     _HV, DV = v.shape[1], v.shape[2]
@@ -462,6 +469,8 @@ def build_chain_backward(
         composed is not None,
         dcomposed is not None,
         int(chain_rows),
+        bool(has_piece_transitions),
+        bool(has_piece_state_grads),
     )
     if key not in chain_backward_cache:
         flags = dict(
@@ -538,6 +547,8 @@ def build_chain_backward(
             bool(length_rule),
             bool(fused_h_m),
             bool(series),
+            bool(has_piece_transitions),
+            bool(has_piece_state_grads),
             summary_cfg,
             transition_cfg,
             bwd_summary_cfg,
@@ -696,9 +707,11 @@ def run_chain_backward(
     beta_guard,
     scale,
     stream,
+    has_piece_transitions=False,
+    has_piece_state_grads=False,
 ) -> None:
-    """Replay the chain backward: one crossing into the DSL for its seven launches.  The plan validated the contract at
-    build, so nothing here raises."""
+    """Replay the chain backward: one crossing into the DSL for its seven launches (the passes the summary's intermediates replace compiled out).  The
+    plan validated the contract at build, so nothing here raises."""
     compiled(
         int(pieces),
         int(heads_out),
