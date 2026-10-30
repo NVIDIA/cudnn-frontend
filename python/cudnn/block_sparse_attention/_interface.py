@@ -75,6 +75,7 @@ except ImportError as exc:
         ) from _SM100_BLK128_BWD_IMPORT_ERROR
 
 
+from cudnn.block_sparse_attention.csrc.bwd.sm90_blk64.bsa_bwd_sm90_paired import MixedKvBackwardSm90
 from cudnn.block_sparse_attention.csrc.bwd.sm90_blk64.bsa_bwd_sm90 import (
     BlockSparseAttnBackwardSm90Blk64,
     SM90_BWD_HEAD_DIM,
@@ -155,10 +156,10 @@ def _bshd_tma_compatible(t: torch.Tensor) -> bool:
 # The paired-KV backward rebuilds its pairing metadata on every call and splits each KV block's edges between two
 # kernels that share an FP32 dK/dV workspace. Below this many (batch, head, KV block) tasks that fixed cost is not
 # recovered (measured 1.33-1.38x slower on 4K/1K-token problems); production-scale masks start well above it.
-_SM100_BLK64_PAIRED_KV_MIN_KV_TASKS = 1024
+_BLK64_PAIRED_KV_MIN_KV_TASKS = 1024
 
 
-def _sm100_blk64_use_paired_kv(q2k_block_index: torch.Tensor, q2k_block_nums: Optional[torch.Tensor], num_kv_blocks: int, pair_bytes: int) -> bool:
+def _blk64_use_paired_kv(q2k_block_index: torch.Tensor, q2k_block_nums: Optional[torch.Tensor], num_kv_blocks: int, pair_bytes: int) -> bool:
     """Paired KV needs variable-count metadata it can rewrite, and enough KV tasks to amortize building it."""
     batch, heads = q2k_block_index.shape[:2]
     return (
@@ -167,7 +168,7 @@ def _sm100_blk64_use_paired_kv(q2k_block_index: torch.Tensor, q2k_block_nums: Op
         and q2k_block_index.is_contiguous()
         and q2k_block_nums.is_contiguous()
         and pair_bytes <= 64 * 1024 * 1024
-        and batch * heads * num_kv_blocks >= _SM100_BLK64_PAIRED_KV_MIN_KV_TASKS
+        and batch * heads * num_kv_blocks >= _BLK64_PAIRED_KV_MIN_KV_TASKS
     )
 
 
@@ -3270,6 +3271,23 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
 
         block_sizes_sm90 = variable_block_sizes if has_block_sizes else None
 
+        pair_words = (num_q_blocks + 31) // 32
+        pair_count = (num_kv_blocks + 1) // 2
+        pair_bytes = batch_size * num_heads * (num_kv_blocks * pair_words + 2 * pair_count + num_kv_blocks + num_q_groups * num_kv_blocks) * 4
+        use_paired_kv = _blk64_use_paired_kv(q2k_block_index, q2k_block_nums, num_kv_blocks, pair_bytes)
+        pair_tensors = ()
+        if use_paired_kv:
+            pair_tensors = (
+                q2k_block_index,
+                q2k_block_nums,
+                torch.empty((batch_size, num_heads, num_kv_blocks, pair_words), dtype=torch.int32, device=q.device),
+                torch.empty((batch_size, num_heads, pair_count), dtype=torch.int32, device=q.device),
+                torch.empty((batch_size, num_heads, num_kv_blocks + pair_count), dtype=torch.int32, device=q.device),
+                torch.empty((batch_size, num_heads, num_q_groups, num_kv_blocks), dtype=torch.int32, device=q.device),
+            )
+        scale_nonpositive = softmax_scale <= 0
+        has_kv_tail = seqlen_k % sparse_block_size != 0
+
         dtype = torch2cute_dtype_map[q.dtype]
         workspace = _empty_bwd_workspace_with_zeroed_accum(
             batch_size=batch_size,
@@ -3285,7 +3303,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         )
 
         current_stream = cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
-        bwd_kernel = BlockSparseAttnBackwardSm90Blk64(dtype, head_dim, head_dim)
+        stage_kernel = BlockSparseAttnBackwardSm90Blk64(dtype, head_dim, head_dim)
         problem_shape = (seqlen_q, seqlen_k, head_dim, (num_heads, batch_size))
 
         compile_key = _sm90_bwd_compile_key(
@@ -3294,14 +3312,16 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
             head_dim,
             block_sizes_sm90 is not None,
             (
-                bwd_kernel.dQaccum_stage,
-                bwd_kernel.PdS_stage,
-                bwd_kernel.Q_stage,
+                stage_kernel.dQaccum_stage,
+                stage_kernel.PdS_stage,
+                stage_kernel.Q_stage,
             ),
             (dout, out, q, k, v, dq, dk, dv, lse),
-        )
+        ) + ((bucket_size_blocks, scale_nonpositive, has_kv_tail) if use_paired_kv else (None,))
 
         if compile_key not in _bsa_attn_bwd_bucketed_k2q_csr.compile_cache:
+            # Building the paired kernel enumerates its matchings, so it happens only on a cache miss.
+            bwd_kernel = MixedKvBackwardSm90(dtype, head_dim, bucket_size_blocks, scale_nonpositive, has_kv_tail) if use_paired_kv else stage_kernel
             _bsa_attn_bwd_bucketed_k2q_csr.compile_cache[compile_key] = cute.compile(
                 bwd_kernel,
                 problem_shape,
@@ -3319,6 +3339,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
                 (_to_sm90_bwd_cute_tensor(block_sizes_sm90, assumed_align=4) if block_sizes_sm90 is not None else None),
                 _to_sm90_bwd_cute_tensor(workspace),
                 Float32(softmax_scale),
+                *(_to_sm90_bwd_cute_tensor(t, assumed_align=4) for t in pair_tensors),
                 cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
                 options="--enable-tvm-ffi",
             )
@@ -3339,6 +3360,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
             block_sizes_sm90,
             workspace,
             softmax_scale,
+            *pair_tensors,
             current_stream,
         )
 
@@ -3354,7 +3376,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
     pair_words = (num_q_blocks + 31) // 32
     pair_count = (num_kv_blocks + 1) // 2
     pair_bytes = batch_size * num_heads * (num_kv_blocks * pair_words + 2 * pair_count + num_kv_blocks + num_q_groups * num_kv_blocks) * 4
-    use_paired_kv = _sm100_blk64_use_paired_kv(q2k_block_index, q2k_block_nums, num_kv_blocks, pair_bytes)
+    use_paired_kv = _blk64_use_paired_kv(q2k_block_index, q2k_block_nums, num_kv_blocks, pair_bytes)
     # Paired and residual tasks share dK/dV, so they still need FP32 accumulation.
     # One Q group in the regular path gives each KV block one unique CTA owner. For aligned
     # physical KV64 tiles, that owner can scale/convert dK and dV directly

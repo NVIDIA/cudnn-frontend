@@ -373,6 +373,11 @@ For blk64, with contiguous per-row count metadata, at least two KV blocks and at
 1024 (batch, head, KV block) tasks, backward pairs KV neighborhoods to reuse
 common Q/dO loads and dQ accumulation; smaller problems do not recover the
 per-call pairing cost and use regular tasks.
+SM90 pairs KV neighborhoods the same way and runs each matched pair in one
+blk128-shaped kernel: a CTA walks the pair's Q blocks once, ordered
+first-only / common / second-only, and each of its two compute warpgroups
+computes only the Q blocks of its own KV block, so Q/dO loads and the dQ
+reduction are shared and Q/dO are read in a single sweep.
 Pairing metadata is limited to 64 MiB; fixed counts or unsupported metadata
 layouts use regular tasks. Duplicate sparse edges retain their multiplicity.
 Paired tasks retain FP32 dK/dV accumulation even with a single query bucket;

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Numerical and layout regressions for the SM100/SM103 blk64 path."""
+"""Numerical and layout regressions for the SM100/SM103 blk64 path and the SM90/SM100 paired-KV backward."""
 
 import importlib
 
@@ -21,6 +21,15 @@ def _bsa():
     return BSA
 
 
+def _paired_bsa():
+    """The paired-KV backward exists on SM90 and SM100/SM103."""
+    if torch.cuda.get_device_capability() not in ((9, 0), (10, 0), (10, 3)):
+        pytest.skip("requires SM90 or SM100/SM103")
+    from cudnn import BSA
+
+    return BSA
+
+
 def _force_paired_kv(monkeypatch):
     """Route eligible variable-count calls through the paired-KV kernel regardless of the size gate.
 
@@ -28,16 +37,17 @@ def _force_paired_kv(monkeypatch):
     without reading compile-cache key positions.
     """
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
-    monkeypatch.setattr(interface, "_SM100_BLK64_PAIRED_KV_MIN_KV_TASKS", 0)
+    monkeypatch.setattr(interface, "_BLK64_PAIRED_KV_MIN_KV_TASKS", 0)
     builds = []
-    paired_cls = interface.MixedKvBackwardSm100
+    name = "MixedKvBackwardSm90" if torch.cuda.get_device_capability()[0] == 9 else "MixedKvBackwardSm100"
+    paired_cls = getattr(interface, name)
 
     class RecordingMixedKvBackward(paired_cls):
         def __init__(self, *args, **kwargs):
             builds.append(args)
             super().__init__(*args, **kwargs)
 
-    monkeypatch.setattr(interface, "MixedKvBackwardSm100", RecordingMixedKvBackward)
+    monkeypatch.setattr(interface, name, RecordingMixedKvBackward)
     return builds
 
 
@@ -225,7 +235,7 @@ def test_sage_fp8_rejects_nonpositive_softmax_scale(scale):
 @pytest.mark.parametrize("duplicates", [False, True])
 @pytest.mark.parametrize("kv_blocks", [17, 35])
 def test_paired_multiset_and_graph_replay(monkeypatch, duplicates, kv_blocks):
-    bsa = _bsa()
+    bsa = _paired_bsa()
     paired_builds = _force_paired_kv(monkeypatch)
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     monkeypatch.setattr(interface._bsa_attn_bwd_bucketed_k2q_csr, "compile_cache", {})
@@ -278,8 +288,52 @@ def test_paired_multiset_and_graph_replay(monkeypatch, duplicates, kv_blocks):
 
 
 @pytest.mark.L1
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+@pytest.mark.parametrize("sq,sk", [(1024, 1025), (1088, 2177), (2048, 2048)])
+def test_paired_partial_blocks_and_buckets(layout, sq, sk, monkeypatch):
+    """Local KV windows give matched pairs real common edges; partial blocks, a KV tail and empty rows mask both halves."""
+    bsa = _paired_bsa()
+    paired_builds = _force_paired_kv(monkeypatch)
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    monkeypatch.setattr(interface._bsa_attn_bwd_bucketed_k2q_csr, "compile_cache", {})
+    torch.manual_seed(28000 + sk)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    q = torch.randn((2, 2, sq, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((2, 2, sk, 128), device="cuda", dtype=torch.bfloat16)
+    v, do = torch.randn_like(k), torch.randn_like(q)
+    nq, nk = sq // 64, (sk + 63) // 64
+    width = 6
+    centers = (torch.arange(nq, device="cuda") * nk // nq).clamp(max=nk - width)
+    window = centers[:, None] + torch.arange(width, device="cuda")
+    indices = window.expand(2, 2, nq, width).int().contiguous()
+    counts = torch.randint(width - 2, width + 1, (2, 2, nq), device="cuda", dtype=torch.int32)
+    counts[:, :, ::7] = 0
+    sizes = torch.randint(1, 65, (nk,), device="cuda", dtype=torch.int32)
+    sizes[::3] = 64
+    sizes[-1].clamp_(max=sk - (nk - 1) * 64)
+    mask = block_sparse_mask(indices, width, sizes, sq, sk, 64, counts)
+    qr, kr, vr = [t.float().detach().requires_grad_() for t in (q, k, v)]
+    scores = qr @ kr.transpose(-1, -2) / 128**0.5 + mask
+    nonempty = torch.isfinite(mask).any(-1, keepdim=True)
+    probabilities = torch.where(nonempty, scores, 0).softmax(-1).masked_fill(~torch.isfinite(mask), 0)
+    (probabilities @ vr).backward(do.float())
+    tensors = (q, k, v, do)
+    if layout == "bshd":
+        tensors = tuple(t.transpose(1, 2).contiguous() for t in tensors)
+    q, k, v, do = tensors
+    kwargs = dict(block_sparse_num=width, block_sizes=sizes, q2k_block_nums=counts, sparse_block_size=64, layout=layout)
+    output, lse = bsa.block_sparse_attention_forward(q, k, v, indices, **kwargs, allow_empty_block_nums=True)
+    for bucket_size in (3, nq):
+        gradients = bsa.block_sparse_attention_backward(do, q, k, v, output, lse, indices, **kwargs, bucket_size_blocks=bucket_size)
+        for got, ref in zip(gradients, (qr.grad, kr.grad, vr.grad)):
+            got = got.transpose(1, 2) if layout == "bshd" else got
+            torch.testing.assert_close(got.float(), ref, atol=0.03, rtol=0.03)
+    assert paired_builds, "the dispatcher did not build the paired-KV kernel"
+
+
+@pytest.mark.L1
 def test_paired_cache_rebinds_bitset_lengths(monkeypatch):
-    bsa = _bsa()
+    bsa = _paired_bsa()
     paired_builds = _force_paired_kv(monkeypatch)
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     monkeypatch.setattr(interface._bsa_attn_bwd_bucketed_k2q_csr, "compile_cache", {})
