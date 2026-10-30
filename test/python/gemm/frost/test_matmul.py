@@ -3765,6 +3765,7 @@ def test_sm120_quant_scale_k_padding_is_zeroed(axes, M, N) -> None:
     unchecked. ``row_col`` also runs the row quant under the col quant's row
     predicate."""
     cfg = _resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    _skip_unless_active(cfg)  # the sm100 tree's quant chunk check declines this config before its family check
     K, bs = 128, 32
     g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
@@ -3801,6 +3802,88 @@ def test_sm120_quant_scale_k_padding_is_zeroed(axes, M, N) -> None:
     for Q, QS, q_ref, addr, expected in checks:
         torch.testing.assert_close(vp[QS].view(torch.uint8).flatten()[addr], expected, atol=0, rtol=0)
         torch.testing.assert_close(vp[Q].float(), q_ref.float(), atol=0, rtol=0)
+
+
+class _Rendered(Exception):
+    """Raised in place of the DSL compile, to carry the rendered kernel source out of jit_from_cudnn_graph."""
+
+
+@pytest.mark.parametrize("case", ["plain", "bounded_rows", "swap_ab"])
+def test_sm120_quant_scale_k_padding_render(monkeypatch, case) -> None:
+    """Host-only twin of test_sm120_quant_scale_k_padding_is_zeroed: the kernel is
+    rendered, not compiled, through the sm120 tree's compiler by name, so this also
+    runs where those GPU tests skip. The sm120 ``_emit_block_quant`` appends the row
+    quant's padding stores behind the shared ``_emit_block_quant_row``, repeating that
+    emitter's store guard and reading its ``_q{i}_scol{k}`` / ``_q{i}_sidx{k}``. Each
+    row-quant scale store must be followed by a padding block under the same guard, so
+    changing either in the shared emitter fails here. ``plain`` has no row predicate,
+    ``bounded_rows`` runs the row quant under the col quant's row predicate (the col
+    quant pads right after each of its own stores), and ``swap_ab`` is the MoE
+    token-axis quant, bounded by ``group_end``."""
+    import re
+    from dataclasses import replace
+
+    from cudnn.gemm.frost.sm120 import compiler as C120
+
+    bs, bf16, f32 = 32, cudnn.data_type.BFLOAT16, cudnn.data_type.FLOAT
+    g = cudnn.pygraph(io_data_type=bf16, intermediate_data_type=f32, compute_data_type=f32)
+    if case == "swap_ab":  # the token-axis quant is the row quant of the weight-by-token kernel
+        E, M, N, K, axes = 4, 352, 128, 128, (1,)
+        tok = g.tensor(name="token", dim=[1, M, K], stride=[M * K, K, 1], data_type=bf16)
+        w = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K], data_type=bf16)
+        fto = g.tensor(name="first_token_offset", dim=[E + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+        fto.set_alignment_value(bs)
+        out = g.moe_grouped_matmul(tok, w, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=f32, name="moe")
+    else:
+        M, N, K, axes = (200, 2880, 128, (-1,)) if case == "plain" else (352, 320, 128, (-1, 1))
+        A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
+        B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"))
+        out = g.matmul(A=A, B=B, name="mm")
+    for qi, axis in enumerate(axes):
+        Q, QS = g.block_scale_quantize(input=out, block_size=bs, axis=axis, name=f"q{qi}")
+        Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+        rows, blocks = (M, N // bs) if axis == -1 else (N, M // bs)
+        dims = [1, (rows + 127) // 128 * 128, (blocks + 3) // 4 * 4]
+        QS.set_dim(dims).set_stride([dims[1] * dims[2], dims[2], 1])
+        QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+        QS.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
+
+    def render_only(src):
+        raise _Rendered(src)
+
+    monkeypatch.setattr(C120, "_import_kernel", render_only)
+    cfg = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    with pytest.raises(_Rendered) as rendered:
+        C120.jit_from_cudnn_graph(g, config=replace(cfg, swap_ab=case == "swap_ab"))
+    lines = rendered.value.args[0].splitlines()
+
+    def guard(i: int) -> str | None:
+        """The line that opens the block holding line ``i``."""
+        depth = len(lines[i]) - len(lines[i].lstrip())
+        return next((s.strip() for s in reversed(lines[:i]) if s.strip() and not s.lstrip().startswith("#") and len(s) - len(s.lstrip()) < depth), None)
+
+    define = re.compile(r"\s*(_q\d+_(?:scol|sidx)\d+) = .+")
+    row_store = re.compile(r"\s*\(gC_tap_\d+_ptr \+ (_q\d+)_sidx(\d+)\)\.store\(\1_scale\2, alignment=1\)")
+    row_pad = re.compile(rf"\s*if (_q\d+)_scol(\d+) \+ 1 == \(N // {bs}\):")
+    col_store = re.compile(r"\s*\(gC_tap_\d+_ptr \+ (_q\d+)_sidx\d+\)\.store\(\1_scale_mine\[\d+\], alignment=1\)")
+    defined, stores, pads, col_pads = set(), [], [], 0
+    for i, line in enumerate(lines):
+        m = define.fullmatch(line)
+        if m:
+            defined.add(m[1])
+        m = row_store.fullmatch(line)
+        if m:
+            stores.append((m[1], m[2], guard(i)))
+        m = row_pad.fullmatch(line)
+        if m:
+            assert {f"{m[1]}_scol{m[2]}", f"{m[1]}_sidx{m[2]}"} <= defined, f"padding reads names the shared row emitter no longer defines: {line.strip()}"
+            pads.append((m[1], m[2], guard(i)))
+        m = col_store.fullmatch(line)
+        if m:
+            assert lines[i + 1].strip() == f"if {m[1]}_mb + 1 == (M // {bs}):", lines[i : i + 2]
+            col_pads += 1
+    assert stores and pads == stores, f"row-quant scale stores {stores} vs padding blocks {pads}"
+    assert (col_pads > 0) == (case == "bounded_rows")
 
 
 # ---------------------------------------------------------------------------

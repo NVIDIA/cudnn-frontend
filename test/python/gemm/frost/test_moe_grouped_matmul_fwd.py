@@ -2117,6 +2117,9 @@ def test_moe_quant_scale_k_padding_is_zeroed_sm120(axis, swap_ab):
     """MoE twin of test_matmul.py::test_sm120_quant_scale_k_padding_is_zeroed: the
     slots after each real scale row's last block come out 0 from a 0xFF buffer. Each
     axis is the row quant in one kernel orientation and the col quant in the other."""
+    from gemm_test_utils import skip_unless_pipeline_active
+
+    skip_unless_pipeline_active(by_name(_SM120_CFG))  # the sm100 tree's quant chunk check declines this config before its family check
     E, K, bs = 4, 128, 32
     # 11 token blocks pad to 12, 5 feature blocks to 8; the last group ends at S.
     groups, N = ([96, 0, 128, 128], 128) if axis == 1 else ([100, 0, 120, 80], 160)
