@@ -14,10 +14,9 @@ pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group
 def test_bsa_jax_torch_parity(layout):
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("JAX BSA requires SM100")
-    from cudnn._jax_requirements import JAX_MIN_CUTEDSL_VERSION
     from cudnn.frost.buffers import cutedsl_requirement_error
 
-    requirement_error = cutedsl_requirement_error("JAX BSA parity tests", min_version=JAX_MIN_CUTEDSL_VERSION)
+    requirement_error = cutedsl_requirement_error("JAX BSA parity tests", min_version=(4, 7, 1))
     if requirement_error:
         pytest.skip(requirement_error)
     jax = pytest.importorskip("jax", minversion="0.9.1")

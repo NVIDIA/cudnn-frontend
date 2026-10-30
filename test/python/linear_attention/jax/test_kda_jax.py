@@ -8,10 +8,9 @@ from functools import partial
 
 import pytest
 
-from cudnn._jax_requirements import JAX_MIN_CUTEDSL_VERSION
 from cudnn.frost.buffers import cutedsl_requirement_error
 
-requirement_error = cutedsl_requirement_error("JAX KDA tests", min_version=JAX_MIN_CUTEDSL_VERSION)
+requirement_error = cutedsl_requirement_error("JAX KDA tests", min_version=(4, 7, 1))
 if requirement_error:
     pytest.skip(requirement_error, allow_module_level=True)
 

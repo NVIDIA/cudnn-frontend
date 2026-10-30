@@ -14,10 +14,9 @@ Requires jax >= 0.6.0 and nvidia-cutlass-dsl >= 4.7.1.
 
 from importlib import import_module
 
-from cudnn._jax_requirements import JAX_MIN_CUTEDSL_VERSION as _JAX_MIN_CUTEDSL_VERSION
 from cudnn.frost.buffers import cutedsl_requirement_error as _cutedsl_requirement_error
 
-_requirement_error = _cutedsl_requirement_error("cudnn.jax", min_version=_JAX_MIN_CUTEDSL_VERSION)
+_requirement_error = _cutedsl_requirement_error("cudnn.jax", min_version=(4, 7, 1))
 if _requirement_error:
     raise ImportError(_requirement_error)
 
