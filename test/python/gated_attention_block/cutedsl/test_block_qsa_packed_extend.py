@@ -1193,8 +1193,18 @@ def test_packed_sparse_extend_workspace_is_honest_and_the_execute_path_allocates
     assert not m_pk and not m_ct, "a memset / memcpy on the execute path"
     assert not any("combine" in nm.lower() for nm in k_pk), "the packed form runs the sparse core unsplit: no combine"
     assert len(k_pk) == len(k_ct) + 1, (len(k_pk), len(k_ct))
-    extra = Counter(k_pk) - Counter(k_ct)
-    assert sum(extra.values()) == 1, f"the packed form adds exactly the THD setup launch: {extra}"
+    # the packed chain = the control's chain + ONE launch (the THD setup that writes the packed metadata), the sparse core itself being
+    # ANOTHER RENDERING of the same module (the THD x paged x bottom-right specialization carries its own mangled name): the multiset
+    # difference holds the setup launch and the packed core, the control's difference its own core, and the two cores share the module's
+    # kernel-name prefix; every other launch (the slab GEMM, the norm + RoPE pass, the write-through, the out projection) is the same kernel
+    extra, missing = Counter(k_pk) - Counter(k_ct), Counter(k_ct) - Counter(k_pk)
+    setup = [nm for nm in extra if "thd_meta" in nm]
+    core_pk = [nm for nm in extra if "thd_meta" not in nm]
+    core_ct = list(missing)
+    assert len(setup) == 1 and extra[setup[0]] == 1, f"exactly one THD setup launch: {extra}"
+    assert len(core_pk) == 1 and len(core_ct) == 1 and sum(missing.values()) == 1, f"one core rendering on each side: {extra} / {missing}"
+    prefix = lambda nm: nm.split("_TensorMap")[0]  # noqa: E731  (the module's kernel name before the tensor-map suffix)
+    assert prefix(core_pk[0]) == prefix(core_ct[0]) and "_kernel_" in core_pk[0], (core_pk, core_ct)
 
 
 @requires_rubin
