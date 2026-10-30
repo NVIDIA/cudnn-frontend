@@ -1,71 +1,71 @@
 device: NVIDIA GB300
 shape: experts=8, tokens/expert=4096, M=32768, K=8192, N=4096
 dtype: torch.bfloat16
-torch: 2.12.0a0+5aff3928d8.nv26.05
-transformer_engine: 2.15.0+42b84005
-nvidia-cudnn-frontend: 1.23.0
-nvidia-cutlass-dsl: 4.4.1
+torch: 2.13.0a0+9186a08b2c.nv26.07
+transformer_engine: 2.17.0+2e559f06
+nvidia-cudnn-frontend: 1.33.0
+nvidia-cutlass-dsl: 4.8.1
 timing mode: CUDA graph replay
 
 activation: swiglu
 shape: experts=8, tokens/expert=4096, M=32768, K=8192, N=4096
 fused GEMM N=8192, fused C input N=None, activation output N=4096
 fused cuDNN avg: 1.323 ms
-unfused TE avg:  1.655 ms
-speedup vs TE:   1.25x
-fused samples:   [1.214, 1.232, 1.369, 1.404, 1.397]
-TE samples:      [1.776, 1.609, 1.583, 1.634, 1.671]
+unfused TE avg:  1.680 ms
+speedup vs TE:   1.27x
+fused samples:   [1.242, 1.242, 1.354, 1.389, 1.388]
+TE samples:      [1.805, 1.689, 1.632, 1.603, 1.673]
 
 activation: dswiglu
 shape: experts=8, tokens/expert=4096, M=32768, K=8192, N=4096
 fused GEMM N=4096, fused C input N=8192, activation output N=8192
-fused cuDNN avg: 0.718 ms
-unfused TE avg:  1.563 ms
-speedup vs TE:   2.18x
-fused samples:   [0.711, 0.717, 0.722, 0.721, 0.721]
-TE samples:      [1.977, 1.482, 1.473, 1.445, 1.436]
+fused cuDNN avg: 0.786 ms
+unfused TE avg:  1.618 ms
+speedup vs TE:   2.06x
+fused samples:   [0.739, 0.737, 0.793, 0.809, 0.852]
+TE samples:      [1.954, 1.706, 1.484, 1.478, 1.469]
 
 activation: srelu
 shape: experts=8, tokens/expert=4096, M=32768, K=8192, N=4096
 fused GEMM N=4096, fused C input N=None, activation output N=4096
-fused cuDNN avg: 0.666 ms
-unfused TE avg:  0.886 ms
+fused cuDNN avg: 0.673 ms
+unfused TE avg:  0.894 ms
 speedup vs TE:   1.33x
-fused samples:   [0.651, 0.647, 0.647, 0.65, 0.734]
-TE samples:      [0.943, 0.917, 0.869, 0.862, 0.839]
+fused samples:   [0.654, 0.651, 0.66, 0.7, 0.7]
+TE samples:      [0.95, 0.961, 0.857, 0.854, 0.847]
 
 activation: dsrelu
 shape: experts=8, tokens/expert=4096, M=32768, K=8192, N=4096
 fused GEMM N=4096, fused C input N=4096, activation output N=4096
-fused cuDNN avg: 0.701 ms
-unfused TE avg:  1.159 ms
-speedup vs TE:   1.65x
-fused samples:   [0.656, 0.657, 0.71, 0.727, 0.757]
-TE samples:      [1.344, 1.159, 1.102, 1.097, 1.093]
+fused cuDNN avg: 0.723 ms
+unfused TE avg:  1.185 ms
+speedup vs TE:   1.64x
+fused samples:   [0.688, 0.686, 0.736, 0.737, 0.77]
+TE samples:      [1.381, 1.201, 1.125, 1.112, 1.103]
 
 activation: geglu
 shape: experts=8, tokens/expert=4096, M=32768, K=8192, N=4096
 fused GEMM N=8192, fused C input N=None, activation output N=4096
-fused cuDNN avg: 1.316 ms
-unfused TE avg:  1.629 ms
-speedup vs TE:   1.24x
-fused samples:   [1.218, 1.216, 1.333, 1.407, 1.404]
-TE samples:      [1.742, 1.667, 1.614, 1.567, 1.554]
+fused cuDNN avg: 1.346 ms
+unfused TE avg:  1.648 ms
+speedup vs TE:   1.22x
+fused samples:   [1.247, 1.286, 1.36, 1.423, 1.412]
+TE samples:      [1.782, 1.681, 1.622, 1.564, 1.59]
 
 activation: dgeglu
 shape: experts=8, tokens/expert=4096, M=32768, K=8192, N=4096
 fused GEMM N=4096, fused C input N=8192, activation output N=8192
-fused cuDNN avg: 0.734 ms
-unfused TE avg:  1.638 ms
-speedup vs TE:   2.23x
-fused samples:   [0.716, 0.719, 0.721, 0.719, 0.793]
-TE samples:      [1.952, 1.584, 1.557, 1.55, 1.547]
+fused cuDNN avg: 0.797 ms
+unfused TE avg:  1.706 ms
+speedup vs TE:   2.14x
+fused samples:   [0.756, 0.759, 0.796, 0.821, 0.851]
+TE samples:      [2.077, 1.745, 1.576, 1.565, 1.564]
 
 summary:
 activation   cudnn_ms      te_ms   te/cudnn
-swiglu          1.323      1.655      1.25x
-dswiglu         0.718      1.563      2.18x
-srelu           0.666      0.886      1.33x
-dsrelu          0.701      1.159      1.65x
-geglu           1.316      1.629      1.24x
-dgeglu          0.734      1.638      2.23x
+swiglu          1.323      1.680      1.27x
+dswiglu         0.786      1.618      2.06x
+srelu           0.673      0.894      1.33x
+dsrelu          0.723      1.185      1.64x
+geglu           1.346      1.648      1.22x
+dgeglu          0.797      1.706      2.14x
