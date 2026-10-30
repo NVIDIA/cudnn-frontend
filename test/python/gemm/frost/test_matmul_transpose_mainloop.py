@@ -10,6 +10,7 @@ import warnings
 from dataclasses import replace
 from pathlib import Path
 from math import prod
+from itertools import product
 
 import cudnn
 import pytest
@@ -17,7 +18,7 @@ import torch
 
 from cudnn.engines import ExecutionContext
 from cudnn.gemm.frost.engine import _FrostGemmPlan
-from cudnn.gemm.frost.dtypes import fold_batch_layout
+from cudnn.gemm.frost.layouts import fold_batch_layout
 from cudnn.frost.buffers import DeviceView, dtype_name
 from cudnn.gemm.frost.fusion_ir import swap_ab
 from cudnn.gemm.frost.graph_analyzer import analyze, analyze_with_binding, resolve_variant_pack, swap_ab_binding
@@ -25,15 +26,16 @@ from cudnn.gemm.frost.sm100 import compiler, epilogue_codegen
 from cudnn.gemm.frost.tile_config import by_name
 from gemm_test_utils import requires_sm100
 
-pytestmark = pytest.mark.L0
 BF16, F32 = cudnn.data_type.BFLOAT16, cudnn.data_type.FLOAT
 
 
 def _config(swapped=False):
+    """Select the existing one-CTA configuration with optional operand swapping."""
     return replace(by_name("CONFIG_sm100_128x128x64_128x128x32_cluster1x1_1ctamma"), swap_ab=swapped)
 
 
 def _strides(prefix, matrix_shape, matrix_strides, gap=0):
+    """Construct affine batch pitches while preserving matrix strides and gaps."""
     pitch = max(d * s for d, s in zip(matrix_shape, matrix_strides)) + gap
     return [pitch * prod(prefix[i + 1 :]) for i in range(len(prefix))] + list(matrix_strides)
 
@@ -55,7 +57,9 @@ def _graph(
     a_prefix=None,
     bias_prefix=(),
     scale_prefix=None,
+    index_axis=None,
 ):
+    """Build a validated logical graph with configurable operand views and epilogue."""
     g = cudnn.pygraph(io_data_type=dtype, intermediate_data_type=F32, compute_data_type=F32)
     prefix = (batch,) if prefix is None else tuple(prefix)
     permutation = [*range(len(prefix)), len(prefix) + 1, len(prefix)]
@@ -92,12 +96,15 @@ def _graph(
     if epilogue:
         bias = tensors["bias"] = g.tensor(name="bias", dim=[*bias_prefix, 1, N], stride=_strides(bias_prefix, (1, N), (N, 1)), data_type=dtype)
         y = g.add(a=y, b=bias).set_data_type(dtype)
+    if index_axis is not None:
+        y = g.add(a=y, b=g.gen_index(input=y, axis=index_axis, name="index"))
     tensors["y"] = y.set_output(True)
     g.validate()
     return g, tensors
 
 
 def _buffers(tensors, m=128, n=192, k=136, *, device="cpu", dtype=torch.bfloat16, gap=0):
+    """Allocate caller-coordinate buffers with dynamic matrix extents and fixed batches."""
     prefix = tuple(tensors["y"].get_dim()[:-2])
     result = {"y": torch.zeros(*prefix, m, n, dtype=dtype, device=device)}
     for side, extent in (("a", m), ("b", n)):
@@ -119,10 +126,12 @@ def _buffers(tensors, m=128, n=192, k=136, *, device="cpu", dtype=torch.bfloat16
 
 
 def _pack(tensors, buffers):
+    """Bind graph tensors to their current runtime buffers."""
     return {tensor: buffers[key] for key, tensor in tensors.items()}
 
 
 def _mock_plan(monkeypatch, g, swapped=False):
+    """Record real binding frames without compiling or launching the full kernel."""
     chain, binding = analyze_with_binding(g)
     if swapped:
         chain, binding = swap_ab(chain), swap_ab_binding(binding)
@@ -167,14 +176,30 @@ def _evaluate_frame(frame, chain):
     return values[0] @ values[1].transpose(1, 2)
 
 
-@pytest.mark.parametrize("side", ["a", "b", "ab"])
-@pytest.mark.parametrize("position", ["before", "after", "surrounded", "double", "consecutive"])
-@pytest.mark.parametrize("prefix", [(), (1,), (2, 3), (2, 1, 3)])
-@pytest.mark.parametrize("dtype", [BF16, cudnn.data_type.HALF])
+def _transpose_cases(*, rebinding=False):
+    """Keep representative cells in L0 and the unchanged cross-product in L1."""
+    sides = ("a", "b", "ab")
+    positions = ("before", "after", "surrounded", "double", "consecutive")
+    prefixes = ((), (1,), (2, 3), (2, 1, 3))
+    dtypes = (BF16, cudnn.data_type.HALF)
+    representatives = {(sides[(p + j) % 3], positions[j], prefixes[p], dtypes[(p + j) % 2]) for p in range(4) for j in (p % 5, (p + 1) % 5, (p + 3) % 5)}
+    for side, position, prefix, dtype in product(sides, positions, prefixes, dtypes):
+        representative = (side, position, prefix, dtype) in representatives
+        if not rebinding:
+            yield pytest.param(side, position, prefix, dtype, marks=pytest.mark.L0 if representative else pytest.mark.L1)
+        else:
+            for swapped, scaled in product((False, True), (False, True) if dtype == BF16 else (True,)):
+                selected = representative and scaled == (dtype != BF16 or positions.index(position) % 2 == 0)
+                yield pytest.param(side, position, swapped, prefix, dtype, scaled, marks=pytest.mark.L0 if selected else pytest.mark.L1)
+
+
+@pytest.mark.parametrize("side,position,prefix,dtype", list(_transpose_cases()))
 def test_frost_transpose_analysis_and_render(side, position, prefix, dtype):
+    """Check immutable analysis and both operand orders against generated Python."""
     g, tensors = _graph(side=side, position=position, prefix=prefix, dtype=dtype)
 
     def snapshot():
+        """Record logical graph metadata to detect accidental analysis mutation."""
         return [
             (repr(n.params), [(id(t), list(t.get_dim()), list(t.get_stride()), t.get_data_type()) for t in (*n.inputs.values(), *n.outputs.values())])
             for n in g._nodes
@@ -206,12 +231,9 @@ def test_frost_transpose_analysis_and_render(side, position, prefix, dtype):
         assert "mainloop_koob_fix = True" in src
 
 
-@pytest.mark.parametrize("side", ["a", "b", "ab"])
-@pytest.mark.parametrize("position", ["before", "after", "surrounded", "double", "consecutive"])
-@pytest.mark.parametrize("swapped", [False, True])
-@pytest.mark.parametrize("prefix", [(), (1,), (2, 3), (2, 1, 3)])
-@pytest.mark.parametrize("dtype,scaled", [(BF16, False), (BF16, True), (cudnn.data_type.HALF, True)])
+@pytest.mark.parametrize("side,position,swapped,prefix,dtype,scaled", list(_transpose_cases(rebinding=True)))
 def test_frost_transpose_original_axis_rebinding(monkeypatch, side, position, swapped, prefix, dtype, scaled):
+    """Verify dynamic caller coordinates and rounding through recorded launch frames."""
     g, tensors = _graph(side=side, position=position, prefix=prefix, dtype=dtype, scaled=scaled)
     tdtype = torch.bfloat16 if dtype == BF16 else torch.float16
     plan, launches = _mock_plan(monkeypatch, g, swapped)
@@ -237,7 +259,9 @@ def test_frost_transpose_original_axis_rebinding(monkeypatch, side, position, sw
 
 @pytest.mark.parametrize("prefix", [(), (1,), (2, 3), (2, 1, 3)])
 @pytest.mark.parametrize("swapped", [False, True])
+@pytest.mark.L0
 def test_frost_matrix_view_without_transpose(monkeypatch, prefix, swapped):
+    """Normalize non-rank-3 GEMMs without requiring a transpose node."""
     g, tensors = _graph(side="", prefix=prefix)
     plan, launches = _mock_plan(monkeypatch, g, swapped)
     buffers = _buffers(tensors)
@@ -252,7 +276,9 @@ def test_frost_matrix_view_without_transpose(monkeypatch, prefix, swapped):
 
 @pytest.mark.parametrize("position", ["before", "after", "surrounded", "double", "consecutive"])
 @pytest.mark.parametrize("swapped", [False, True])
+@pytest.mark.L0
 def test_frost_transpose_per_k_binding(monkeypatch, position, swapped):
+    """Reject invalid scale layouts and dtypes before launch, then recover."""
     g, tensors = _graph(position=position, scaled=True)
     plan, launches = _mock_plan(monkeypatch, g, swapped)
     for m, n, k in ((128, 192, 136), (160, 224, 264)):
@@ -277,7 +303,9 @@ def test_frost_transpose_per_k_binding(monkeypatch, position, swapped):
             assert any(arg.data_ptr() == buffers[key].data_ptr() for key in ("scale_a", "scale_b"))
 
 
+@pytest.mark.L0
 def test_frost_transpose_shared_input_and_binding_keys(monkeypatch):
+    """Deduplicate shared storage across tensor, name and UID bindings."""
     g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
     x = g.tensor(name="shared", dim=[1, 128, 136], stride=[128 * 136, 136, 1])
     a = g.leaky_relu(input=x, negative_slope=0.125).set_data_type(BF16)
@@ -295,7 +323,9 @@ def test_frost_transpose_shared_input_and_binding_keys(monkeypatch):
         assert launches[-1][0][:3] == (160, 160, 264)
 
 
+@pytest.mark.L0
 def test_frost_transpose_dtype_inheritance():
+    """Keep transpose outputs at the original pointwise dtype."""
     g, _ = _graph()
     g.validate()
     assert analyze(g).mainloop_a_ops[0].out_dtype == "bf16"
@@ -306,7 +336,9 @@ def test_frost_transpose_dtype_inheritance():
 @pytest.mark.parametrize(
     "problem,reason", [("permutation", "rank-3|last-two"), ("dtype", "dtype changes"), ("shape", "expected output shape"), ("output", "materialized")]
 )
+@pytest.mark.L0
 def test_frost_transpose_rejection(problem, reason):
+    """Reject unsupported permutations, conversions, shapes and observable intermediates."""
     g, _ = _graph(side="a")
     node = next(n for n in g._nodes if n.node_type.name == "TRANSPOSE")
     if problem == "permutation":
@@ -321,7 +353,9 @@ def test_frost_transpose_rejection(problem, reason):
         analyze(g)
 
 
+@pytest.mark.L0
 def test_frost_transpose_epilogue_rejected():
+    """Decline epilogue transposes rather than silently dropping their semantics."""
     g, tensors = _graph(side="a")
     tensors["y"].set_output(False)
     g.transpose(input=tensors["y"], permutation=[0, 2, 1]).set_output(True)
@@ -330,6 +364,7 @@ def test_frost_transpose_epilogue_rejected():
 
 
 def _reference(buffers, side, position, scaled, dtype, epilogue=False):
+    """Evaluate logical operations with graph-prescribed per-node rounding."""
     values = {}
     for s in "ab":
         value = buffers[s]
@@ -352,7 +387,9 @@ def _reference(buffers, side, position, scaled, dtype, epilogue=False):
     return value.to(dtype)
 
 
+@pytest.mark.L0
 def test_frost_transpose_epilogue_reference_rounding():
+    """Keep virtual GEMM precision until the epilogue add rounds its output."""
     g, _ = _graph(prefix=(), epilogue=True)
     assert analyze(g).matmul.out_dtype == "fp32"
     buffers = {
@@ -384,7 +421,9 @@ def test_frost_transpose_epilogue_reference_rounding():
         ("ab", "after", False, True, BF16, (2, 1, 3), False, True),
     ],
 )
+@pytest.mark.L0
 def test_frost_transpose_gpu(side, position, scaled, swapped, dtype, prefix, broadcast, epilogue):
+    """Validate full kernels with dynamic shapes and changed-input capture replay."""
     g, tensors = _graph(side=side, position=position, scaled=scaled, dtype=dtype, prefix=prefix, broadcast=broadcast, epilogue=epilogue)
     plan = compiler.jit_from_cudnn_graph(g, _config(swapped))
     tdtype = torch.bfloat16 if dtype == BF16 else torch.float16
@@ -435,7 +474,9 @@ def test_frost_transpose_gpu(side, position, scaled, swapped, dtype, prefix, bro
             captured.reset()
 
 
+@pytest.mark.L0
 def test_frost_transpose_identity_pure_and_mixed_rounding():
+    """Preserve mixed pointwise rounding through identity and matrix transposes."""
     g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
     a = g.tensor(name="A", dim=[1, 136, 128], stride=[128 * 136, 1, 136])
     b = g.tensor(name="B", dim=[1, 136, 192], stride=[136 * 192, 1, 136])
@@ -462,7 +503,9 @@ def test_frost_transpose_identity_pure_and_mixed_rounding():
 
 
 @pytest.mark.parametrize("scalar_first", [False, True])
+@pytest.mark.L0
 def test_frost_transpose_scalar_and_shared_scale(monkeypatch, scalar_first):
+    """Retain scalar operand order and deduplicate shared scale storage."""
     g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
     a = g.tensor(name="A", dim=[1, 136, 128], stride=[128 * 136, 1, 136])
     b = g.tensor(name="B", dim=[1, 136, 192], stride=[136 * 192, 1, 136])
@@ -488,7 +531,9 @@ def test_frost_transpose_scalar_and_shared_scale(monkeypatch, scalar_first):
 
 
 @pytest.mark.parametrize("problem", ["rank", "unrelated", "multi", "transpose-output"])
+@pytest.mark.L0
 def test_frost_transpose_scope_rejection(problem):
+    """Reject paths outside the single unobservable operand-view contract."""
     g, tensors = _graph(side="a")
     if problem == "rank":
         node = next(n for n in g._nodes if n.node_type.name == "TRANSPOSE")
@@ -507,6 +552,7 @@ def test_frost_transpose_scope_rejection(problem):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for the transform fragment")
 @pytest.mark.parametrize("side", ["a", "b"])
 @pytest.mark.parametrize("dtype", [BF16, cudnn.data_type.HALF])
+@pytest.mark.L0
 def test_frost_transpose_generated_fragment(tmp_path, side, dtype):
     """Run normalized transforms on SM90+; not a full mainloop/MMA qualification."""
     major, minor = torch.cuda.get_device_capability()
@@ -565,7 +611,9 @@ compiled = cute.compile(entry, fake_data, fake_{ref.name}, fake_data, options="-
 
 
 @pytest.mark.parametrize("swapped", [False, True])
+@pytest.mark.L0
 def test_frost_transpose_invalid_input_preserves_output(monkeypatch, swapped):
+    """Validate bad operand views before output writes and allow subsequent recovery."""
     g, tensors = _graph()
     plan, launches = _mock_plan(monkeypatch, g, swapped)
     buffers = _buffers(tensors, 160, 224, 264)
@@ -581,7 +629,9 @@ def test_frost_transpose_invalid_input_preserves_output(monkeypatch, swapped):
 
 @pytest.mark.parametrize("m_major", [False, True])
 @pytest.mark.parametrize("swapped", [False, True])
+@pytest.mark.L0
 def test_frost_pure_transpose_layout_binding(monkeypatch, m_major, swapped):
+    """Bind pure transposes with either matrix-major layout without copying."""
     g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
     x = g.tensor(name="X", dim=[1, 136, 128], stride=[136 * 128, 128, 1] if m_major else [136 * 128, 1, 136])
     b = g.tensor(name="B", dim=[1, 136, 192], stride=[136 * 192, 1, 136])
@@ -604,6 +654,7 @@ def test_frost_pure_transpose_layout_binding(monkeypatch, m_major, swapped):
 @pytest.mark.parametrize("swapped", [False, True])
 @pytest.mark.parametrize("prefix", [(), (1,), (2, 3), (2, 1, 3)])
 @pytest.mark.parametrize("dtype", [BF16, cudnn.data_type.HALF])
+@pytest.mark.L0
 def test_frost_transpose_keeps_untransposed_epilogue_branch(monkeypatch, swapped, prefix, dtype):
     """A shared pre-transpose pointwise node remains in its original coordinates."""
     g = cudnn.pygraph(io_data_type=dtype, intermediate_data_type=F32, compute_data_type=F32)
@@ -641,7 +692,9 @@ def test_frost_transpose_keeps_untransposed_epilogue_branch(monkeypatch, swapped
     torch.testing.assert_close(got, expected.view(prod(prefix), 128, 128), atol=0, rtol=0)
 
 
+@pytest.mark.L0
 def test_frost_transpose_shared_epilogue_view_rejected():
+    """Reject a shared epilogue branch that still requires an observable transpose."""
     g, tensors = _graph(side="a")
     transpose = next(n for n in g._nodes if n.node_type.name == "TRANSPOSE").outputs["OUT_0"]
     tensors["y"].set_output(False)
@@ -654,7 +707,9 @@ def test_frost_transpose_shared_epilogue_view_rejected():
 @pytest.mark.parametrize("swapped", [False, True])
 @pytest.mark.parametrize("raw", [False, True])
 @pytest.mark.parametrize("ordered", [False, True])
+@pytest.mark.L0
 def test_frost_transpose_native_transport_and_overrides(monkeypatch, prefix, swapped, raw, ordered):
+    """Preserve original pointers and padded pitches through both native pack transports."""
     g, tensors = _graph(prefix=prefix, scaled=True, gap=16, scale_prefix=())
     g.validate()
     compiled, launches = _mock_plan(monkeypatch, g, swapped)
@@ -690,7 +745,9 @@ def test_frost_transpose_native_transport_and_overrides(monkeypatch, prefix, swa
 
 
 @pytest.mark.parametrize("swapped", [False, True])
+@pytest.mark.L0
 def test_frost_transpose_rank_broadcast_and_epilogue(monkeypatch, swapped):
+    """Fold full batch broadcast while retaining auxiliary and output storage."""
     g, tensors = _graph(prefix=(2, 3), broadcast=True, epilogue=True)
     chain, binding = analyze_with_binding(g)
     assert (chain.matmul.a_batch, chain.matmul.b_batch, chain.matmul.batch) == (1, 6, 6)
@@ -704,7 +761,9 @@ def test_frost_transpose_rank_broadcast_and_epilogue(monkeypatch, swapped):
     assert frame[3].data_ptr() == buffers["y"].data_ptr()
 
 
+@pytest.mark.L0
 def test_frost_transpose_rank_rejects_non_affine_batch(monkeypatch):
+    """Reject non-affine runtime and declared batch layouts without launching."""
     g, tensors = _graph(prefix=(2, 3))
     plan, launches = _mock_plan(monkeypatch, g)
     buffers = _buffers(tensors)
@@ -721,13 +780,17 @@ def test_frost_transpose_rank_rejects_non_affine_batch(monkeypatch):
 
 
 @pytest.mark.parametrize("prefix", [(2, 3), (1, 3)])
+@pytest.mark.L0
 def test_frost_transpose_rank_rejects_partial_batch_broadcast(prefix):
+    """Decline crossed or partial batches that need more than one linear pitch."""
     g, _ = _graph(prefix=prefix, a_prefix=(2, 1))
     with pytest.raises(ValueError, match="partial/crossed"):
         analyze(g)
 
 
+@pytest.mark.L0
 def test_frost_transpose_rank_rejects_batch_axis_permutation():
+    """Reject batch permutations even when equal extents hide the shape change."""
     g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
     a = g.tensor(name="A", dim=[2, 2, 136, 128], stride=[2 * 136 * 128, 136 * 128, 1, 136])
     b = g.tensor(name="B", dim=[2, 2, 136, 192], stride=[2 * 136 * 192, 136 * 192, 1, 136])
@@ -738,7 +801,9 @@ def test_frost_transpose_rank_rejects_batch_axis_permutation():
         analyze(g)
 
 
+@pytest.mark.L0
 def test_frost_transpose_rank_pins_batch_axes_and_rank(monkeypatch):
+    """Require every prepared batch axis and rank to remain in caller coordinates."""
     g, tensors = _graph(prefix=(2, 3))
     plan, launches = _mock_plan(monkeypatch, g)
     buffers = _buffers(tensors)
@@ -752,7 +817,9 @@ def test_frost_transpose_rank_pins_batch_axes_and_rank(monkeypatch):
 
 @pytest.mark.parametrize("prefix", [(), (1,), (2, 3)])
 @pytest.mark.parametrize("swapped", [False, True])
+@pytest.mark.L0
 def test_frost_transpose_workspace_uses_original_axes(monkeypatch, prefix, swapped):
+    """Derive dynamic split workspace from caller buffers or original-rank overrides."""
     g, tensors = _graph(prefix=prefix)
     plan, _ = _mock_plan(monkeypatch, g, swapped)
     plan = replace(plan, config=replace(plan.config, split_k_slices=2))
@@ -766,7 +833,9 @@ def test_frost_transpose_workspace_uses_original_axes(monkeypatch, prefix, swapp
     assert plan.workspace_bytes_for_overrides([tensors["y"].get_uid()], [list(buffers["y"].shape)]) == expected
 
 
+@pytest.mark.L0
 def test_frost_transpose_rank_rejects_overlapping_output(monkeypatch):
+    """Reject overlapping writes before launch and preserve recovery on the same plan."""
     g, tensors = _graph(prefix=(2, 3))
     plan, launches = _mock_plan(monkeypatch, g)
     buffers = _buffers(tensors)
@@ -782,7 +851,9 @@ def test_frost_transpose_rank_rejects_overlapping_output(monkeypatch):
 
 
 @pytest.mark.parametrize("prefix,bias_prefix", [((), (1,)), ((2, 3), (1, 1, 1))])
+@pytest.mark.L0
 def test_frost_transpose_rank_unit_aux_axes_and_recovery(monkeypatch, prefix, bias_prefix):
+    """Pin otherwise unobservable unit auxiliary axes to the prepared declaration."""
     g, tensors = _graph(prefix=prefix, epilogue=True, bias_prefix=bias_prefix)
     plan, launches = _mock_plan(monkeypatch, g)
     buffers = _buffers(tensors)
@@ -795,14 +866,18 @@ def test_frost_transpose_rank_unit_aux_axes_and_recovery(monkeypatch, prefix, bi
 
 
 @pytest.mark.parametrize("shape,stride", [((2, 3, 4, 8), (96, 32, 8, 1)), ((2, 3, 4, 8), (120, 40, 1, 4)), ((2, 1, 3, 4, 8), (120, 999, 40, 1, 4))])
+@pytest.mark.L0
 def test_frost_matrix_batch_layout_contract(shape, stride):
+    """Preserve matrix strides when folding contiguous, gapped and unit batch axes."""
     dim, st = fold_batch_layout(shape, stride)
     assert dim == (6, 4, 8)
     assert st[-2:] == stride[-2:]
 
 
+@pytest.mark.L0
 def test_frost_matrix_batch_int64_boundaries():
     # Validate host widths without attempting an enormous allocation.
+    """Accept wide pitches and reject signed-64-bit geometry overflow without allocation."""
     dim, stride = fold_batch_layout((2, 2, 1, 1), (1 << 33, 1 << 32, 1, 1))
     assert dim == (4, 1, 1) and stride[0] == 1 << 32
     with pytest.raises(ValueError, match="64-bit"):
@@ -819,7 +894,9 @@ def test_frost_matrix_batch_int64_boundaries():
         ((1 << 32, 1 << 32, 1, 1), (1 << 32, 1, 1, 1)),
     ],
 )
+@pytest.mark.L0
 def test_frost_matrix_batch_native_geometry(shape, stride):
+    """Compare native metadata-only folding with the independent Python geometry checks."""
     from cudnn import _pybind_module
 
     # A synthetic address is inspected only as metadata; no kernel or DLPack consumer reads it.
@@ -837,3 +914,115 @@ def test_frost_matrix_batch_native_geometry(shape, stride):
         assert tuple(folded.shape) == expected_shape and tuple(folded.stride()) == expected_stride
         assert folded.data_ptr() == value.data_ptr() == 4096
         assert folded.dtype == value.dtype and folded.element_size() == value.element_size()
+
+
+@pytest.mark.parametrize("prefix", [(), (1,), (2, 3), (2, 1, 3)])
+@pytest.mark.parametrize("matrix_axis", [0, 1])
+@pytest.mark.parametrize("side", ["", "ab"])
+@pytest.mark.L0
+def test_frost_matrix_gen_index_axes(prefix, matrix_axis, side):
+    """Logical row/column coordinates survive rank folding and swap-AB."""
+    axis = len(prefix) + matrix_axis
+    g, _ = _graph(prefix=prefix, side=side, index_axis=axis)
+    original = [dict(node.params) for node in g._nodes]
+    chain = analyze(g)
+    index = next(op for op in chain.ops if op.op == "gen_index")
+    assert dict(index.attrs)["axis"] == matrix_axis + 1
+    swapped = next(op for op in swap_ab(chain).ops if op.op == "gen_index")
+    assert dict(swapped.attrs)["axis"] == 2 - matrix_axis
+    assert original == [dict(node.params) for node in g._nodes]
+    for config_swapped in (False, True):
+        current = swap_ab(chain) if config_swapped else chain
+        snippets = epilogue_codegen.generate(
+            current, vec_bytes_epi=16, output_elem_bytes=2, tma_slots=compiler._tma_slots_for(current, _config(config_swapped))
+        )
+        ast.parse(compiler._render_template(current, snippets, _config(config_swapped)))
+
+
+@pytest.mark.parametrize("prefix,axis", [((1,), 0), ((2, 3), 0), ((2, 3), 1), ((2, 1, 3), 1), ((2, 1, 3), 2)])
+@pytest.mark.L0
+def test_frost_matrix_gen_index_batch_axis_rejected(prefix, axis):
+    """A flattened batch coordinate cannot stand in for a logical batch axis."""
+    g, _ = _graph(prefix=prefix, index_axis=axis)
+    with pytest.raises(NotImplementedError, match="gen_index.*batch axis"):
+        analyze(g)
+
+
+@pytest.mark.parametrize("prefix", [(1,), (2,)])
+@pytest.mark.L0
+def test_frost_matrix_identity_recipe_fast_path(monkeypatch, prefix):
+    """Plain rank-3 calls retain the original operands and runtime validation."""
+    from cudnn.gemm.frost import recipe
+
+    g, tensors = _graph(side="", prefix=prefix)
+    plan, launches = _mock_plan(monkeypatch, g)
+    assert plan.recipe.matrix_views == ()
+    buffers = _buffers(tensors)
+    ordered = [buffers[next(key for key, tensor in tensors.items() if tensor is t)] for t in plan.bound]
+
+    def unexpected_fold(*args, **kwargs):
+        """Fail if the prepared identity path invokes general batch geometry."""
+        raise AssertionError("identity-rank launch must not fold layouts")
+
+    monkeypatch.setattr(recipe, "fold_batch_layout", unexpected_fold)
+    assert plan.recipe.operand_views(ordered) is ordered
+    plan(_pack(tensors, buffers))
+    assert len(launches) == 1
+    for key, bad in (("a", buffers["a"].view(-1, 136)), ("a", buffers["a"].transpose(1, 2)), ("y", buffers["y"][..., :128])):
+        with pytest.raises(ValueError):
+            plan(_pack(tensors, dict(buffers, **{key: bad})))
+        assert len(launches) == 1
+    plan(_pack(tensors, buffers))
+    assert len(launches) == 2
+
+
+@requires_sm100
+@pytest.mark.L0
+@pytest.mark.parametrize("prefix", [(), (1,), (2, 3), (2, 1, 3)])
+@pytest.mark.parametrize("matrix_axis", [0, 1])
+@pytest.mark.parametrize("swapped", [False, True])
+def test_frost_matrix_gen_index_gpu(prefix, matrix_axis, swapped):
+    """Check actual logical indices, dynamic shapes and changed-input capture replay."""
+    dtype = BF16 if matrix_axis == 0 else cudnn.data_type.HALF
+    tdtype = torch.bfloat16 if dtype == BF16 else torch.float16
+    side = "ab" if swapped else ""
+    g, tensors = _graph(prefix=prefix, side=side, dtype=dtype, index_axis=len(prefix) + matrix_axis)
+    plan = compiler.jit_from_cudnn_graph(g, _config(swapped))
+    stream = torch.cuda.Stream()
+    for m, n, k in ((128, 192, 136), (160, 224, 264)):
+        buffers = _buffers(tensors, m, n, k, device="cuda", dtype=tdtype)
+        buffers["a"].zero_()
+        buffers["b"].zero_()
+        pack = _pack(tensors, buffers)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            plan(pack, stream=stream.cuda_stream)
+        stream.synchronize()
+        captured = torch.cuda.CUDAGraph()
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("error", message="The CUDA Graph is empty.*")
+                with torch.cuda.graph(captured, stream=stream):
+                    plan(pack, stream=torch.cuda.current_stream().cuda_stream)
+            for fill in (0.0, 0.0625):
+                # Changes and poisoning are ordered on the replay stream too.
+                with torch.cuda.stream(stream):
+                    buffers["a"].fill_(fill)
+                    buffers["b"].fill_(fill)
+                    buffers["y"].fill_(float("nan"))
+                    captured.replay()
+                stream.synchronize()
+                index = torch.arange(m if matrix_axis == 0 else n, device="cuda", dtype=torch.float32)
+                index = index.reshape((m, 1) if matrix_axis == 0 else (1, n))
+                expected = (index + k * fill * fill).expand(*prefix, m, n).to(tdtype)
+                torch.testing.assert_close(buffers["y"], expected, atol=0, rtol=0)
+                previous = buffers["y"].clone()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    buffers["y"].fill_(float("nan"))
+                    captured.replay()
+                stream.synchronize()
+                assert torch.equal(buffers["y"], previous)
+        finally:
+            stream.synchronize()
+            captured.reset()

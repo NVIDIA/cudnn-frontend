@@ -34,7 +34,7 @@ from .fusion_ir import (
 
 # Dtype + op tables
 
-from .dtypes import fold_batch_layout
+from .layouts import fold_batch_layout
 
 from .dtypes import CUDNN_FROM_DTYPE as _CUDNN_FROM_DTYPE
 from .dtypes import DTYPE_FROM_CUDNN as _DTYPE_FROM_CUDNN
@@ -251,6 +251,7 @@ def _make_multi_binding(
         return objs
 
     def _transpose_flags(ids):
+        """Collect prepared transpose flags for bound tensors in caller coordinates."""
         return tuple(bool(meta[i].mn_transposed) for i in ids) if any(meta[i].mn_transposed is not None for i in ids) else ()
 
     views = {(m.name, id(m.tensor)): bool(m.mn_transposed) for m in meta.values() if m.mn_transposed is not None}
@@ -1557,6 +1558,7 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
 
     @lru_cache(maxsize=None)
     def shape(tid):
+        """Infer logical dimensions before transpose projection or batch folding."""
         m, op = meta[tid], producers.get(tid)
         if op is None:
             return m.dim
@@ -1589,6 +1591,7 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
 
     @lru_cache(maxsize=None)
     def dtype(tid):
+        """Resolve each node dtype while rejecting conversion through a transpose."""
         op, m = producers.get(tid), meta[tid]
         if op is not None and op.cudnn_name == "transpose":
             expected = dtype(op.inputs[0])
@@ -1599,6 +1602,7 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
         return m.dtype if op is None else _resolve_out_dtype(tid, m.tensor, io_dtype, intermediate_dtype, meta)
 
     def alias(tid, transposed):
+        """Create private view metadata without changing the original graph tensor."""
         m, dim = meta[tid], shape(tid)
         if transposed and len(dim) < 2:
             if dim and all(d == 1 for d in dim):
@@ -1617,6 +1621,7 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
 
     @lru_cache(maxsize=None)
     def project(tid, transposed=False):
+        """Push a matrix permutation through an unobservable operand pointwise DAG."""
         op = producers.get(tid)
         if op is None:
             return alias(tid, transposed)
@@ -1648,6 +1653,24 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
     if fold_batches:
         batch_shape = shape(mm.output)[:-2]
         ranked_shapes = {tid: shape(tid) for tid in meta}
+        output_dim = ranked_shapes[mm.output]
+        matrix_views_required = bool(transposes) or output_dim != (prod(batch_shape), *output_dim[-2:])
+        # Index attributes describe the original logical tensor, not the kernel
+        # ABI. Only the final two axes have a one-to-one folded coordinate.
+        normalized_ops = []
+        for op in ops:
+            if op.cudnn_name == "gen_index":
+                rank = len(ranked_shapes[op.inputs[0]])
+                axis = dict(op.op_attrs).get("axis")
+                if axis not in (rank - 2, rank - 1):
+                    raise NotImplementedError(
+                        f"gen_index {op.op_name!r}: batch axis {axis} is unsupported; "
+                        f"only logical matrix axes {rank - 2} (M) and {rank - 1} (N) are supported"
+                    )
+                attrs = tuple((key, axis - rank + 3 if key == "axis" else value) for key, value in op.op_attrs)
+                op = replace(op, op_attrs=attrs)
+            normalized_ops.append(op)
+        ops = normalized_ops
         for tid, m in list(meta.items()):
             dim = ranked_shapes[tid]
             if len(dim) < 2:
@@ -1666,7 +1689,9 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
                 m,
                 dim=layout_dim,
                 stride=layout_stride,
-                matrix_batch=prefix,
+                # Identity geometry already binds through the existing ABI checks.
+                # Only prepare runtime views when the graph or this slot needs one.
+                matrix_batch=prefix if matrix_views_required or dim != layout_dim else None,
                 mn_transposed=False if m.is_input and m.mn_transposed is None and dim != layout_dim else m.mn_transposed,
             )
     return ops

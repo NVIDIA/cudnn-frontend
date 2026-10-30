@@ -11,8 +11,9 @@ from math import prod
 
 from cudnn.frost.buffers import DeviceView, dtype_name, init_word, is_contiguous, strided_fill_plan
 
-from .dtypes import DTYPE_BYTES, _aux_align_reqs, _output_align_reqs, _pow2_floor, tensor_alignment, fold_batch_layout
+from .dtypes import DTYPE_BYTES, _aux_align_reqs, _output_align_reqs, _pow2_floor, tensor_alignment
 from .fusion_ir import FusionChain
+from .layouts import fold_batch_layout
 
 # An operand's three axes, named by role rather than by position.
 AX_BATCH, AX_MN, AX_K = 0, 1, 2
@@ -468,6 +469,7 @@ def _operand(
     graph_order=False,
     matrix_batch=None,
 ) -> Operand:
+    """Prepare one operand contract in the kernel ABI and original caller axes."""
     declared = _DECLARED_AXES["b" if (is_b if declared_is_b is None else declared_is_b) else "a"]
     if transposed:
         declared = (declared[0], declared[2], declared[1])
