@@ -8,8 +8,9 @@ Builds a ``cudnn.DSA.SparseAttentionBackward`` plan and reusable output and
 workspace buffers during setup. Timed iterations call ``plan.execute()`` and
 dispatch to the Hopper (SM90) or Blackwell (SM100) CuTe DSL kernel based on
 the active CUDA device. Inputs are flat MQA tensors (shared K=V buffer, global
-per-query top-k indices). The forward ``out``/``lse`` consumed by the backward
-kernel are produced by a chunked PyTorch reference; the forward launch is
+per-query top-k indices). Unless ``--synthetic-forward`` is set, the forward
+``out``/``lse`` consumed by the backward kernel come from a chunked PyTorch
+reference; that option uses synthetic tensors instead. The forward launch is
 intentionally excluded so the benchmark isolates backward.
 
 Usage:
