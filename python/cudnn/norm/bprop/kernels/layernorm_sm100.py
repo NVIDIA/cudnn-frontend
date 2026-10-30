@@ -26,7 +26,7 @@ import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
-from cudnn.norm.utils import ws_bytes, ws_empty, ws_zeros, cur_stream, dyn, fake_stream, smem_capacity
+from cudnn.norm.utils import ws_bytes, ws_empty, ws_zeros, cur_stream, dyn, fake_stream, sm_count, smem_capacity
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from cudnn.norm._common_sm100 import (
     affine_gamma,
@@ -762,8 +762,6 @@ def _ln_bwd_tiled_host(
 
 
 _PIPE_STAGES = 2
-# Per-block smem limit, queried per architecture rather than fixed at Blackwell's.
-_SM_COUNT = None
 _KPIPE = {}
 
 
@@ -837,12 +835,7 @@ def _pipe_bwd_eligible(C, wn, ldgs, V, R, has_beta, eb):
 
 
 def _pipe_bwd_cap(R, wn, C, cache_xd, eb):
-    global _SM_COUNT
-    if _SM_COUNT is None:
-        import torch
-
-        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
-    NSM = _SM_COUNT
+    NSM = sm_count()
     if cache_xd:
         # Occupancy-aware cap: the optimum balances three limits (measured by a
         # per-shape cap sweep -- this formula reproduces every mid-C optimum exactly).
@@ -938,7 +931,7 @@ def _backward_tiled(spec, dy2d, x2d, gamma, rstd, *, params, wcfg, out_dx=None, 
             RPT = r
             break
     ntiles = R // RPT
-    ctas = min(ntiles, _sm_count() * 12)
+    ctas = min(ntiles, sm_count() * 12)
 
     dx = torch.empty_like(x2d) if out_dx is None else out_dx
     dgamma = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device) if out_dgamma is None else out_dgamma.zero_()
@@ -963,15 +956,6 @@ def _backward_tiled(spec, dy2d, x2d, gamma, rstd, *, params, wcfg, out_dx=None, 
         _KTILED[key] = fn
     fn(*args, cur_stream())
     return dx, dgamma, None
-
-
-def _sm_count():
-    global _SM_COUNT
-    if _SM_COUNT is None:
-        import torch
-
-        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
-    return _SM_COUNT
 
 
 _KCACHE = {}
@@ -999,7 +983,7 @@ def scratch_bytes(spec, params, shape=None, has_beta=False, knobs=None):
             if R % r == 0 and 2 * 2 * r * C * eb <= smem_capacity():
                 RPT = r
                 break
-        ctas = min(R // RPT, _sm_count() * 12)
+        ctas = min(R // RPT, sm_count() * 12)
         return ws_bytes((ctas * C, 4), (2 * spec.gamma_len, 4))
     if _pipe_bwd_eligible(C, wn, ldgs, V, R, has_beta, eb):
         ctas = _pipe_bwd_cap(R, wn, C, _bwd_cache_xd(ldgs, V, R, C, has_beta, wn, eb), eb)
