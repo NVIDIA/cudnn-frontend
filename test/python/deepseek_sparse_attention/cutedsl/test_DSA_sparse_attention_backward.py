@@ -6,8 +6,10 @@
 Gradients are generated via autograd on the gather-based forward reference.
 """
 
+import ast
 import inspect
 import math
+import textwrap
 
 import pytest
 import torch
@@ -763,6 +765,9 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
     ):
         dkv_shape = kernel_cls._get_workspace_size_dKV_for_q(16384, 524288, 576, 64, 1, cutlass.Float32)
         assert math.prod(dkv_shape) == _relay_workspace_bytes(16384, 524288, 576, 64, kernel_cls.dkv_relay_cluster_size)
+        assert not kernel_cls.run_dkv_prefold
+        assert kernel_cls.num_dkv_final_terms == kernel_cls.num_dkv_shards
+        assert kernel_cls.dkv_final_stride == 1
     assert deterministic_kernel_class(8191, 65537, 512) is FlashAttentionDSABackwardSm100DeterministicCluster8
     assert deterministic_kernel_class(8192, 65537, 512) is FlashAttentionDSABackwardSm100DeterministicCluster4
     assert deterministic_kernel_class(16384, 524288, 576) is FlashAttentionDSABackwardSm100DeterministicCluster16
@@ -785,6 +790,7 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
     assert FlashAttentionDSABackwardSm100Deterministic64.num_dkv_final_terms == 8
     with pytest.raises(ValueError, match="at least one query row"):
         deterministic_dkv_shards(0)
+
     with pytest.raises(ValueError, match="at least one query row"):
         deterministic_dkv_relay_cluster_size(0, 256, 576)
     with pytest.raises(ValueError, match="positive KV, head-dimension, and head-count extents"):
@@ -803,6 +809,32 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
         deterministic_kernel_class(128, head_dim=576)
     assert FlashAttentionDSABackwardSm100.q_wave_ctas == 0
     assert not FlashAttentionDSABackwardSm100.serialize_head_blocks
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_relay_acquire_load_controls_exit():
+    """Keep the GPU acquire load live by feeding its value to loop control."""
+    deterministic = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_deterministic")
+    tree = ast.parse(textwrap.dedent(inspect.getsource(deterministic._wait_lower_rank_mask)))
+
+    acquire_values = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+            continue
+        if not isinstance(node.value.func, ast.Attribute) or node.value.func.attr != "load":
+            continue
+        if not any(keyword.arg == "sem" and isinstance(keyword.value, ast.Constant) and keyword.value.value == "acquire" for keyword in node.value.keywords):
+            continue
+        acquire_values.update(target.id for target in node.targets if isinstance(target, ast.Name))
+
+    controlled_values = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute) or node.func.attr != "while_generate" or not node.args:
+            continue
+        if isinstance(node.args[0], ast.List):
+            controlled_values.update(value.id for value in node.args[0].elts if isinstance(value, ast.Name))
+
+    assert acquire_values & controlled_values, "an unused acquire load is eliminated from generated PTX"
 
 
 @pytest.mark.L0
@@ -1372,6 +1404,26 @@ def test_DSA_sparse_attention_backward_sm100_cluster8_repeat100():
             shared_topk=True,
             check_graph=True,
             check_short_workspace=True,
+            expected_relay_cluster_size=8,
+        )
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+
+@pytest.mark.L2
+@torch_fork_set_rng(seed=20261030)
+def test_DSA_sparse_attention_backward_sm100_cluster8_topk2048():
+    """The optimized production-width relay remains exact and repeatable."""
+    try:
+        _exercise_deterministic_sm100_case(
+            64,
+            576,
+            257,
+            65537,
+            repeats=3,
+            topk=2048,
+            has_topk_length=True,
+            check_graph=True,
             expected_relay_cluster_size=8,
         )
     except ImportError:
