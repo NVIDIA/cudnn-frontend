@@ -40,8 +40,6 @@ def _require_array(value, name):
 def _target_device(*arrays):
     from cudnn.frost.device import compute_capability
 
-    if jax.process_count() != 1:
-        raise NotImplementedError("JAX normalization requires a single process")
     placed = {device for x in arrays if isinstance(x, jax.Array) and not isinstance(x, jax.core.Tracer) for device in x.devices()}
     if len(placed) > 1:
         raise ValueError("JAX normalization arrays must be on the same GPU")

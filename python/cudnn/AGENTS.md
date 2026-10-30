@@ -986,7 +986,9 @@ JAX tracers do not reveal eventual buffer placement. A default device can supply
 tuning properties only when the resulting launch and scratch sizes remain valid
 on every supported execution device. Pin the compiler architecture explicitly and
 query shared-memory limits for the build device; unrelated visible GPUs must not
-affect eligibility. Cache launchers by the full configuration, including device.
+affect eligibility. Process count likewise does not constrain independent local
+kernel calls; global-array partitioning is a separate contract. Cache launchers
+by the full configuration, including device.
 Select an appropriate `jax.default_device` in architecture-specific tests without
 hiding other GPUs. Cover tracing with unrelated hardware properties and reuse
 jitted functions on non-default devices with changed inputs and gradients (see
