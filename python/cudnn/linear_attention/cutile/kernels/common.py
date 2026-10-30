@@ -21,6 +21,7 @@ Every buffer reaching this module comes from an engine (a variant-pack operand
 or a workspace carve), so it is contiguous and needs no probing.
 """
 
+import sys
 from types import SimpleNamespace
 
 import cuda.tile as ct
@@ -71,6 +72,14 @@ def opt(t, bufs, dtype_name: str = "float32"):
 launch_hint_cache: dict = {}
 
 
+def deterministic_requested() -> bool:
+    """Whether torch's deterministic-algorithms flag is on (a JAX-only process never loads torch, so it is off).
+
+    The timing-based pick can change the bits of some kernels (GDN), so a deterministic run skips tuning."""
+    torch = sys.modules.get("torch")
+    return torch is not None and torch.are_deterministic_algorithms_enabled()
+
+
 def launch_hint_configs(occ_choices, nww_choices=(4, 8)):
     """occupancy x num_worker_warps grid; deduped, default (occ=1,nww=4) first."""
     seen = set()
@@ -93,23 +102,30 @@ def autotuned_launch(kernel, cache_key, grid, args, occ_choices=(1, 2, 3, 4), nw
     Default config (occ=1, nww=4) is explored first so a no-improvement shape
     keeps the base behaviour. ``cache_key`` is qualified
     by the kernel's own name, so two kernels sharing a key shape stay apart.
+
+    Under ``torch.use_deterministic_algorithms(True)`` nothing is timed: the first config is used, so the pick cannot
+    vary between runs.
     """
     stream = 0 if stream is None else stream
-    cache_key = (getattr(getattr(kernel, "_pyfunc", None), "__name__", repr(kernel)), cache_key)
+    deterministic = deterministic_requested()
+    cache_key = (getattr(getattr(kernel, "_pyfunc", None), "__name__", repr(kernel)), cache_key, deterministic)
     if cache_key not in launch_hint_cache:
         tuned = None
         try:
             configs = launch_hint_configs(occ_choices, nww_choices)
-            with ct.compiler_timeout(timeout):
-                result = exhaustive_search(
-                    configs,
-                    stream,
-                    lambda cfg: grid,
-                    kernel,
-                    lambda cfg: args,
-                    lambda cfg: {"occupancy": cfg.occupancy, "num_worker_warps": cfg.num_worker_warps},
-                )
-            best = result.best.config
+            if deterministic:
+                best = configs[0]
+            else:
+                with ct.compiler_timeout(timeout):
+                    result = exhaustive_search(
+                        configs,
+                        stream,
+                        lambda cfg: grid,
+                        kernel,
+                        lambda cfg: args,
+                        lambda cfg: {"occupancy": cfg.occupancy, "num_worker_warps": cfg.num_worker_warps},
+                    )
+                best = result.best.config
             tuned = kernel.replace_hints(occupancy=best.occupancy, num_worker_warps=best.num_worker_warps)
         except Exception:
             tuned = None

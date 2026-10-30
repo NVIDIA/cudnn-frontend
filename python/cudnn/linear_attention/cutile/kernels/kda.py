@@ -26,6 +26,7 @@ from .common import (
     autotuned_launch,
     cdiv,
     ct_min,
+    deterministic_requested,
     dummy,
     exp,
     exp2,
@@ -94,6 +95,9 @@ def autotuned_launch_bv(kernel, cache_key, bv_choices, grid_fn, args_fn, timeout
     this search (the larger sweep mis-ranks BV).
     """
     stream = 0 if stream is None else stream
+    if deterministic_requested():
+        # BV never moves the numerics, but a deterministic run takes the fallback rather than a timed pick.
+        return ct.launch(stream, grid_fn(bv_choices[0]), kernel, args_fn(bv_choices[0]))
     if cache_key not in launch_hint_cache:
         chosen = None
         try:
