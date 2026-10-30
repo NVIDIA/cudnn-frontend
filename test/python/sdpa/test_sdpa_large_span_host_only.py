@@ -45,7 +45,11 @@ def _lower_sm120_bwd(b, s, h, kvh):
         run = subprocess.run([sys.executable, "-c", _SM120_BWD_PROBE, *map(str, (b, s, h, kvh))], env=env, capture_output=True, text=True)
         if run.returncode != 0:
             pytest.skip(f"the installed CuTe DSL cannot lower sm_120a here: {run.stderr[-300:]}")
-        text = "\n".join(open(path).read() for path in glob.glob(os.path.join(dump, "**", "*.ptx"), recursive=True))
+        texts = []
+        for path in glob.glob(os.path.join(dump, "**", "*.ptx"), recursive=True):
+            with open(path) as f:
+                texts.append(f.read())
+        text = "\n".join(texts)
     entries = {}
     for chunk in text.split(".entry ")[1:]:
         entries[re.match(r"(\w+?)(?:_tensorptr|_object)", chunk).group(1)] = chunk
@@ -86,10 +90,12 @@ def test_qat_triton_batch_head_offset_is_64_bit():
         "head_dim": "constexpr",
     }
     constexprs = {"block_n": 128, "head_dim": 128, "stride_d": 1, "fake_stride_d": 1}
+    ptx = None
     try:
         ptx = triton.compile(ASTSource(fn=_nvfp4.fake_quantize_kv, signature=signature, constexprs=constexprs), target=GPUTarget("cuda", 100, 32)).asm["ptx"]
     except Exception as exc:  # no sm_100 ptxas in this Triton build
         pytest.skip(f"Triton cannot lower sm_100 here: {exc}")
+    assert ptx is not None
     # stride_b * (batch_head // num_heads) and stride_h * (batch_head % num_heads): 64-bit products
     assert len(re.findall(r"mul\.lo\.s64", ptx)) >= 2
 
@@ -102,10 +108,12 @@ def test_flex_varlen_declines_int32_span(tokens, limit_ok):
     from cudnn.flex_attention.plan.validation import validate_create_mask_plan_inputs
 
     heads, dim = 8, 128  # 2**21 * 8 * 128 = 2**31 elements, one past INT32_MAX
+    q = None
     try:
         q = torch.empty((tokens, heads, dim), device="cuda", dtype=torch.bfloat16)
     except torch.OutOfMemoryError:
         pytest.skip("needs 4 GiB of device memory")
+    assert q is not None
     cu = torch.tensor([0, tokens], dtype=torch.int32, device="cuda")
     mask = torch.zeros((1, 1, tokens), dtype=torch.int32, device="cuda")
     call = dict(cu_seqlens_q=cu, cu_seqlens_k=cu, max_seqlen_q=tokens, max_seqlen_k=tokens)

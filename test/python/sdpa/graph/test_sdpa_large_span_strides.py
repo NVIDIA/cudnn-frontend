@@ -165,10 +165,8 @@ def test_sdpa_bwd_operand_spanning_4gib(dtype, target, axis):
             keep.append(store)
             outs[name] = view
 
-        bwd = _build_bwd(handle, cdt, strides["q"], strides["k"], strides["v"], strides["o"], strides["dO"],
-                         strides["dq"], strides["dk"], strides["dv"])
-        _run(bwd, {1: ops["q"], 2: ops["k"], 3: ops["v"], 4: ops["o"], 5: stats, 6: ops["dO"],
-                   7: outs["dq"], 8: outs["dk"], 9: outs["dv"]})
+        bwd = _build_bwd(handle, cdt, strides["q"], strides["k"], strides["v"], strides["o"], strides["dO"], strides["dq"], strides["dk"], strides["dv"])
+        _run(bwd, {1: ops["q"], 2: ops["k"], 3: ops["v"], 4: ops["o"], 5: stats, 6: ops["dO"], 7: outs["dq"], 8: outs["dk"], 9: outs["dv"]})
 
         _, rdq, rdk, rdv = _ref(q, k, v, dO)
         # Per-batch and per-head errors so a wrapped second batch/head is not averaged away.
