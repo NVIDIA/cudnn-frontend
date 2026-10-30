@@ -258,15 +258,22 @@ def test_DSA_indexer_backward_wrapper_compact_h32():
 
 
 @pytest.mark.L0
-def test_DSA_indexer_backward_sm100_rejects_untested_sub_m64_heads():
-    """The new compact contract adds H32 only; it does not silently widen the domain."""
+@pytest.mark.parametrize(
+    "h,d,match",
+    [
+        pytest.param(48, 128, "requires H=32 or H>=64", id="h48"),
+        pytest.param(64, 64, "requires D=128", id="d64"),
+    ],
+)
+def test_DSA_indexer_backward_sm100_rejects_untested_sub_m64_heads(h, d, match):
+    """The new compact contract adds H32 only, and the kernel serves D=128 only; neither silently widens the domain."""
     try:
         from cudnn import DSA
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
     _require_sm100()
 
-    b, s_q, s_k, h, d, topk = 1, 1, 128, 48, 128, 128
+    b, s_q, s_k, topk = 1, 1, 128, 128
     plan = DSA.IndexerBackward(
         sample_index_q=torch.empty((b, s_q, h, d), dtype=torch.bfloat16, device="cuda"),
         sample_weights=torch.empty((b, s_q, h), dtype=torch.bfloat16, device="cuda"),
@@ -280,7 +287,7 @@ def test_DSA_indexer_backward_sm100_rejects_untested_sub_m64_heads():
         sm_scale=1.0,
         block_I=128,
     )
-    with pytest.raises(ValueError, match="requires H=32 or H>=64"):
+    with pytest.raises(ValueError, match=match):
         plan.check_support()
 
 
@@ -448,6 +455,33 @@ def test_DSA_indexer_backward_fp32_dindexk_zeroed_internally():
     # atomic-add jitter between two runs is ~1e-3, so a <1.0 bound cleanly
     # proves the internal zero-init.
     assert max_diff < 1.0, f"fp32 d_index_k not zeroed internally: max|nonzero-init - zero-init| = {max_diff:.3e}"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_DSA_indexer_backward_bf16_dindexk_matches_fp32_accumulator():
+    """A bf16 d_index_k accumulates in private column-permuted scratch and is
+    un-permuted by the trailing cast; an fp32 d_index_k is accumulated in the
+    natural layout. Both must hold the same gradient, column for column."""
+    _require_sm100()
+    DSA, _ = _import_dsa()
+
+    iq, w, ik, attn, idx, tk, loss_coeff, grad_loss = _idxbwd_inputs()
+    common = dict(sm_scale=_IDXBWD_SM_SCALE, loss_coeff=loss_coeff, grad_loss=grad_loss, block_I=128)
+
+    def run(dk_dtype):
+        d_index_k = torch.empty_like(ik, dtype=dk_dtype)
+        return DSA.indexer_backward_wrapper(iq, w, ik, attn.clone(), idx.clone(), tk, d_index_k=d_index_k, **common)["d_index_k"]
+
+    dk_fp32 = run(torch.float32)
+    dk_bf16 = run(torch.bfloat16)
+    torch.cuda.synchronize()
+
+    assert dk_bf16.dtype == torch.bfloat16
+    assert dk_fp32.abs().amax() > 0
+    # Only the FP32 atomic order differs between the two runs; a wrong column
+    # order would move whole values, far outside one bf16 rounding step.
+    torch.testing.assert_close(dk_bf16.float(), dk_fp32.to(torch.bfloat16).float(), rtol=2**-7, atol=1e-3 * dk_fp32.abs().amax().item())
 
 
 def _workspace_for(plan, device="cuda"):
@@ -3712,21 +3746,26 @@ def test_DSA_indexer_backward_sm100_score_grad_pdl_full_pipeline_matches_serial(
     [
         pytest.param(topk, topk_indices_global, False, id=f"{'global' if topk_indices_global else 'local'}-{topk}")
         for topk_indices_global in (True, False)
-        for topk in (128, 256, 384)
+        for topk in (128, 256, 384, 1024)
     ]
     + [
         pytest.param(512, False, False, id="local-512"),
         pytest.param(512, True, True, id="global-512-manual-k-load"),
     ],
 )
+@pytest.mark.parametrize("seqlen_q", [17, 151])
+@pytest.mark.parametrize("dk_column_permuted", [False, True], ids=["dk-natural", "dk-permuted"])
 def test_DSA_indexer_backward_sm100_persistent_short_topk_matches_reference(
+    dk_column_permuted,
+    seqlen_q,
     topk,
     topk_indices_global,
     force_manual_k_load,
     monkeypatch,
     request,
 ):
-    """Check persistent phases and the manual K-load fallback against the reference."""
+    """Check persistent and one-row-per-CTA grids, the manual K-load fallback,
+    invalid and duplicate IDs, and both dK accumulation layouts against the reference."""
     if torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("SM100+ required")
 
@@ -3743,7 +3782,7 @@ def test_DSA_indexer_backward_sm100_persistent_short_topk_matches_reference(
 
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(20260825 + topk + int(topk_indices_global))
-    batch, seqlen_q, seqlen_k, heads, head_dim = 2, 151, 512, 64, 128
+    batch, seqlen_k, heads, head_dim = 2, 512, 64, 128
     sm_scale = head_dim**-0.5
     index_q = torch.randn((batch, seqlen_q, heads, head_dim), device=device, dtype=torch.bfloat16, generator=generator)
     index_k = torch.randn((batch, seqlen_k, head_dim), device=device, dtype=torch.bfloat16, generator=generator)
@@ -3778,8 +3817,12 @@ def test_DSA_indexer_backward_sm100_persistent_short_topk_matches_reference(
         block_I=128,
         topk_indices_global=topk_indices_global,
     )
-    kernel.gemm_only(index_q, weights, index_k, d_index_q, d_weights, d_index_k, grad_signal, kernel_ids)
+    kernel.gemm_only(index_q, weights, index_k, d_index_q, d_weights, d_index_k, grad_signal, kernel_ids, dk_column_permuted=dk_column_permuted)
     torch.cuda.synchronize()
+    if dk_column_permuted:
+        d_index_k_natural = torch.empty_like(d_index_k)
+        indexer_backward_sm100_module.dk_column_permuted_view(d_index_k_natural).copy_(d_index_k.view(*d_index_k.shape[:-1], 8, 4, 2, 2))
+        d_index_k = d_index_k_natural
 
     safe_ids = local_ids.clamp(min=0).long()
     selected_k = torch.gather(

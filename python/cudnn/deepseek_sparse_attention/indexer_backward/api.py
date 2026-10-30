@@ -12,7 +12,8 @@ Combines backend-specific CuTe-DSL kernels:
 In ordinary execution, a bf16 ``dIndexK`` output receives a trailing pure-torch
 cast from its FP32 accumulator (kernel 3); an fp32 ``dIndexK`` buffer is the
 accumulator itself. The ordinary fp32 accumulator behind a bf16 ``dIndexK`` is
-carved from the caller's workspace. The sm100_v2 H64 policy additionally carves
+carved from the caller's workspace; the default SM100 kernel accumulates that
+private buffer in a column-permuted layout which the same cast restores. The sm100_v2 H64 policy additionally carves
 a ticket counter; native H32 assigns one query row to each CTA and needs no
 counter. Deterministic execution instead uses a compile-time-selected set of
 CTA-private FP32 dK planes and a fixed-order reduction that converts directly to
@@ -241,7 +242,8 @@ class IndexerBackward(APIBase):
        launch. An fp32 ``d_index_k`` buffer is the target directly; a bf16
        ``d_index_k`` buffer instead accumulates into a ``B * S_k * D`` fp32
        view carved from the caller's ``workspace`` and receives a trailing cast
-       (kernel 3). ``scratch_workspace_bytes()`` is the size to allocate;
+       (kernel 3; on SM100 the private accumulator is column-permuted and the
+       cast restores the natural order). ``scratch_workspace_bytes()`` is the size to allocate;
        ``execute`` raises ``ValueError`` when it is non-zero and no workspace
        is passed, before ``attn_score`` is touched.
     4. Kernel 2 — warp-specialized backward GEMM producing the gradients.
@@ -442,6 +444,12 @@ class IndexerBackward(APIBase):
             self._value_error_if(
                 self.heads != 32 and self.heads < 64,
                 f"the default SM100 IndexerBackward requires H=32 or H>=64, got H={self.heads}",
+            )
+            # The reduce warpgroup's TMEM fragment map and dK scratch layouts
+            # cover exactly 128 columns.
+            self._value_error_if(
+                self.head_dim != 128,
+                f"the default SM100 IndexerBackward requires D=128, got D={self.head_dim}",
             )
         if self.use_v2:
             b, s_q, s_k = self.batch, self.seqlen, self.seqlen_k

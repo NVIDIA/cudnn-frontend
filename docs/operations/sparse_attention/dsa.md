@@ -805,7 +805,9 @@ indexer tower:
    warp-specialised GEMMs produce `d_index_q`, `d_weights`, and a
    `dIndexK_f32` accumulator.
 3. In ordinary execution, a pure-torch dtype cast (kernel 3) converts
-   `dIndexK_f32` to a BF16 output. Deterministic execution instead uses the
+   `dIndexK_f32` to a BF16 output. On SM100 and SM103 that private accumulator
+   is column-permuted, so kernel 2 can issue 16-byte reductions straight from
+   registers without SMEM staging; the same cast restores the natural order. Deterministic execution instead uses the
    fixed-order reduction below to write the requested output dtype directly.
 
 With `deterministic=True` on SM100 or SM103, kernel 2 launches a fixed producer
