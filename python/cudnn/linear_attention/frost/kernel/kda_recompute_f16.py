@@ -51,6 +51,11 @@ the checkpoint buffer; sizes at DK = DV = 128, bf16 io, fp32 Gate):
   T_inv (intermediate)             1024       2
   checkpoint staging              32768       2    <-- enable_checkpoints only (aliases V otherwise)
   scheduler ticket ring               4       8    <-- next-tile publish ring
+  steep ballot words                 64       -    <-- STEEP_FAST / STEEP_EXACT only; one element per array under STEEP_OFF
+  steep last-token decay factors      1024       -
+  steep k inverse norms             128       -
+  steep tile words                   16       2
+  steep correction tiles           2048       2
 
 TMEM layout (512 columns allocated):
   Buffer                  Cols
@@ -70,6 +75,7 @@ Warp assignments (16 warps = 512 threads):
   warp  15      : epilogue warp  - checkpoint TMA stores
 """
 
+import dataclasses
 from dataclasses import dataclass
 import functools
 from typing import NamedTuple, Type
@@ -84,6 +90,20 @@ from cutlass.cute.runtime import from_dlpack
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_work_item, gen_interval_items, expanded_cu_seqlen, order_body
 from ..common.host import get_dtype
 from ..common.blockwise_inverse import invert_unit_lower_16x16_fragments
+from ..common.steep_decay import (
+    STEEP_EXACT,
+    STEEP_FAST,
+    STEEP_OFF,
+    add_steep_corrections,
+    encode_gate_exchange,
+    lane_steep_bits,
+    row_operand_scales,
+    steep_mode_for,
+    steep_exit_unless_flagged,
+    steep_row_corrections,
+    steep_ticket,
+    steep_tile_mask,
+)
 from ..common.thd import TENSOR_MAP_QWORDS, emit_checkpoint_seq_descs, emit_seq_descs
 from .kda_recompute_config import CFG
 
@@ -194,7 +214,11 @@ def make_bars(cfg) -> KdaRecomputeBars:
             producer=Producer.THREAD,
         ),
         mb_k_decay_inv_cg0_ready=MBarrier(
-            alloc(cfg.smem_decay_stages), try_wait=True, stages=cfg.smem_decay_stages, init_count=CG0_GROUP_WARPS, producer=Producer.THREAD
+            alloc(cfg.smem_decay_stages),
+            try_wait=True,
+            stages=cfg.smem_decay_stages,
+            init_count=CG0_GROUP_WARPS,
+            producer=Producer.THREAD,
         ),
         mb_decay_tcgen05_done=MBarrier(alloc(cfg.smem_decay_stages), try_wait=True, stages=cfg.smem_decay_stages, init_count=1, producer=Producer.MMA_COMMIT),
         mb_decay_register_mma_done=MBarrier(alloc(cfg.smem_decay_stages), try_wait=True, stages=cfg.smem_decay_stages, init_count=1, producer=Producer.THREAD),
@@ -222,7 +246,7 @@ def scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, n
     """TMA-LDG-warp side: pull the next tile off the global ticket, publish it."""
     bars.mb_scheduler_done[scheduler_state.idx].wait(scheduler_state.phase)
     if elect_one:
-        fetched = cutlass.Int32(nvvm.atomicrmw("add", mScheduler.iterator, cutlass.Int32(1), mem_order="relaxed", syncscope="gpu"))
+        fetched = steep_ticket(cfg, mScheduler)
         sScheduler[scheduler_state.idx] = num_ctas + fetched
     nvvm.bar_warp_sync(cute.arch.FULL_MASK)
     next_tile = sScheduler[scheduler_state.idx]
@@ -339,6 +363,8 @@ def register_mma_warp(
     sIntermediate_raw,
     sBeta_raw,
     sK_decay_raw,
+    sSteepTile,
+    sSteepCorr,
     bars,
 ) -> None:
     """Register-MMA warp role (warp 12): persistent scheduler loop computing the
@@ -385,6 +411,8 @@ def register_mma_warp(
             sIntermediate_ptr = sIntermediate_raw.data_ptr() + intermediate_stage * (2 * cfg.b_t * cfg.b_t)
 
             bars.mb_k_decay_inv_cg0_ready[decay_stage].wait(decay_parity)
+            steep_tile_ptr = sSteepTile.data_ptr() + decay_stage * cfg.cg0_warps_per_group
+            steep_tile = steep_tile_mask(cfg, steep_tile_ptr)
 
             # ---- KK = K decay @ K inv^T ----------------------------------------------
             kk_acc = cutlass.Array(cutlass.Float32, 8, alignment=16)
@@ -404,6 +432,10 @@ def register_mma_warp(
                     N=16,
                     ab_dtype=cfg.io_dtype,
                 )
+
+            # ---- steep key channels: exact KK entries (common/steep_decay.py) ------
+            if steep_tile != 0:
+                add_steep_corrections(cfg, kk_acc, sSteepCorr.data_ptr() + decay_stage * (2 * cfg.b_t * cfg.b_t), lane_idx)
 
             # ---- L = Beta * tril(KK, -1) ---------------------------------------------
             bars.mb_beta_ready[raw_stage].wait(raw_parity)
@@ -773,6 +805,12 @@ def compute0_warp_group(
     sK_decay_raw,
     sK_restore_raw,
     sCheckpoint_raw,
+    sSteepScan,
+    sSteepLast,
+    sSteepNorm,
+    sSteepTile,
+    sSteepCorr,
+    mSteepSlot,
     sTmem_base,
     checkpoint_every_n_tokens,
     bars,
@@ -910,6 +948,10 @@ def compute0_warp_group(
                 for row in cutlass.range_constexpr(cfg.b_t):
                     g_prefix_regs[row] = cutlass.Float32(0.0) if chunk_start + cutlass.Int32(row) >= batch_seqlen else g_prefix_regs[row]
 
+            if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
+                for row in cutlass.range_constexpr(cfg.b_t):
+                    gate_raw[row] = g_prefix_regs[row]
+
             prefix_acc = cutlass.Float32(0.0)
             for row_pair in cutlass.range_constexpr(cfg.b_t // 2):
                 row0 = row_pair * 2
@@ -922,9 +964,26 @@ def compute0_warp_group(
                 g_prefix_regs[row1] = prefix1
                 prefix_acc = prefix1
 
-            # ---- exp2(g): stage prefixes + final-token decay -------------------------
-            for row in cutlass.range_constexpr(cfg.b_t):
-                g_prefix_regs[row] = cute.math.exp2(g_prefix_regs[row], fastmath=True)
+            # ---- exp2(g): stage prefixes + final-token decay; steep channels keep their token decay factors (common/steep_decay.py) ----
+            # Alternate scan words: a mild tile has no final group barrier, so
+            # another warp may start the next scan while this tile still reads them.
+            steep_scan_stage = (local_chunk_idx // cfg.cg0_group_count) % 2
+            steep_scan_ptr = sSteepScan.data_ptr() + (cg0_group_id * 2 + steep_scan_stage) * cfg.cg0_warps_per_group
+            steep_last_ptr = sSteepLast.data_ptr() + cg0_group_id * cfg.d_k
+            encode_gate_exchange(
+                cfg,
+                prefix_acc,
+                sK_ptr,
+                channel_dim,
+                channel_rows,
+                mSteepSlot,
+                lane_idx,
+                cg0_local_warp,
+                gate_raw,
+                g_prefix_regs,
+                steep_scan_ptr,
+                steep_last_ptr,
+            )
 
             for row_off in cutlass.range_constexpr(store_rows):
                 if cutlass.const_expr(channel_rows < cfg.threads_per_warp):
@@ -938,6 +997,10 @@ def compute0_warp_group(
             nvvm.barrier_cta_sync(cfg.cg0_group_sync_barrier_base_id + cg0_group_id, thread_count=cfg.cg0_threads_per_group)
             if nvvm.elect_sync():
                 bars.mb_gate_exchange_ready[raw_stage].arrive()
+            steep_any = steep_tile_mask(cfg, steep_scan_ptr)
+            steep_bits = cutlass.Int32(0)
+            if steep_any != 0:
+                steep_bits = lane_steep_bits(cfg, steep_scan_ptr, lane_in_row_group, channel_rows)
 
             k_inv_pack = cutlass.Array(cutlass.Int32, dk_halves * 4, alignment=16)
             k_restore_pack = cutlass.Array(cutlass.Int32, dk_halves * 4, alignment=16)
@@ -971,6 +1034,9 @@ def compute0_warp_group(
                 k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 2, 31, kind=nvvm.Shfl.BFLY))
                 k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 1, 31, kind=nvvm.Shfl.BFLY))
                 k_inv_norm = cute.math.rsqrt(k_sum_sq + cutlass.Float32(L2_NORM_EPS), fastmath=True)
+                if steep_any != 0:
+                    if lane_in_row_group == 0:
+                        (sSteepNorm.data_ptr() + cg0_group_id * cfg.b_t + decay_row).store(k_inv_norm)
 
             # ---- decay/restore operands: exp2(+-g) applied per key channel -----------
             exp_g_regs = cutlass.Array(cutlass.Float32, dk_halves * 8, alignment=16)
@@ -1009,14 +1075,34 @@ def compute0_warp_group(
                     dim1 = dim0 + 1
                     raw_reg_idx0 = reg_base + dim0
                     raw_reg_idx1 = reg_base + dim1
+                    exp_g0, exp_neg_g0, exp_g_last0 = row_operand_scales(
+                        cfg,
+                        steep_bits,
+                        raw_reg_idx0,
+                        decay_row,
+                        dim_base + dim0,
+                        exp_g_regs[raw_reg_idx0],
+                        exp_g_last_half[dim0],
+                        sGate_exchange_ptr,
+                        steep_last_ptr,
+                    )
+                    exp_g1, exp_neg_g1, exp_g_last1 = row_operand_scales(
+                        cfg,
+                        steep_bits,
+                        raw_reg_idx1,
+                        decay_row,
+                        dim_base + dim1,
+                        exp_g_regs[raw_reg_idx1],
+                        exp_g_last_half[dim1],
+                        sGate_exchange_ptr,
+                        steep_last_ptr,
+                    )
                     k_value0, k_value1 = fmul2(raw_k_regs[raw_reg_idx0], raw_k_regs[raw_reg_idx1], k_inv_norm, k_inv_norm)
-                    k_decay0, k_decay1 = fmul2(k_value0, k_value1, exp_g_regs[raw_reg_idx0], exp_g_regs[raw_reg_idx1])
+                    k_decay0, k_decay1 = fmul2(k_value0, k_value1, exp_g0, exp_g1)
                     k_decay_pack[pair_idx] = fp32_to_fp16(k_decay0, k_decay1, dtype=cfg.io_dtype)
-                    exp_neg_g0 = cute.math.rcp(exp_g_regs[raw_reg_idx0], approx=True, ftz=True)
-                    exp_neg_g1 = cute.math.rcp(exp_g_regs[raw_reg_idx1], approx=True, ftz=True)
                     k_inv0, k_inv1 = fmul2(k_value0, k_value1, exp_neg_g0, exp_neg_g1)
                     k_inv_pack[dim_half * 4 + pair_idx] = fp32_to_fp16(k_inv0, k_inv1, dtype=cfg.io_dtype)
-                    k_restore0, k_restore1 = fmul2(k_inv0, k_inv1, exp_g_last_half[dim0], exp_g_last_half[dim1])
+                    k_restore0, k_restore1 = fmul2(k_inv0, k_inv1, exp_g_last0, exp_g_last1)
                     k_restore_pack[dim_half * 4 + pair_idx] = fp32_to_fp16(k_restore0, k_restore1, dtype=cfg.io_dtype)
 
                 k_inv_vec = cutlass.Vector.from_elements(
@@ -1048,9 +1134,18 @@ def compute0_warp_group(
                 decay_segment = decay_col // 64
                 decay_swizzled_idx = decay_segment * (cfg.b_t * 64) + swizzle_xor_128b(decay_row, decay_row * 64 + decay_col - decay_segment * 64, elem_bytes=2)
                 (sK_decay_ptr + decay_swizzled_idx).store(k_decay_vec, alignment=16)
-            nvvm.fence_proxy("async.shared", space="cta")
-            if nvvm.elect_sync():
-                bars.mb_k_decay_inv_cg0_ready[decay_stage].arrive()
+
+            # ---- steep key channels: publish the tile flags, exact KK corrections --------------
+            if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
+                if lane_idx == 0:
+                    (sSteepTile.data_ptr() + decay_stage * cfg.cg0_warps_per_group + cg0_local_warp).store((steep_scan_ptr + cg0_local_warp).load())
+            if steep_any == 0:
+                nvvm.fence_proxy("async.shared", space="cta")
+                if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
+                    # Correction rows come from single-lane stores: join every lane's fence before one lane arrives for the warp.
+                    nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+                if nvvm.elect_sync():
+                    bars.mb_k_decay_inv_cg0_ready[decay_stage].arrive()
 
             # ---- K restore operand store ---------------------------------------------
             bars.mb_k_restore_done[decay_stage].wait(decay_free_parity)
@@ -1069,7 +1164,44 @@ def compute0_warp_group(
                     cutlass.Int32,
                 ).bitcast(cfg.io_dtype)
                 (sK_restore_ptr + k_restore_idx).store(k_restore_vec, alignment=16)
+            # ---- steep key channels (common/steep_decay.py): compute exact KK corrections;
+            # a steep tile publishes its K operands here instead of above ----
+            if steep_any != 0:
+                nvvm.barrier_cta_sync(cfg.cg0_group_sync_barrier_base_id + cg0_group_id, thread_count=cfg.cg0_threads_per_group)
+                steep_norm_ptr = None
+                if cutlass.const_expr(cfg.l2norm):
+                    steep_norm_ptr = sSteepNorm.data_ptr() + cg0_group_id * cfg.b_t
+                steep_row_corrections(
+                    cfg,
+                    steep_bits,
+                    decay_row,
+                    lane_in_row_group,
+                    k_inv_norm,
+                    k_inv_norm,
+                    sGate_exchange_ptr,
+                    steep_last_ptr,
+                    sK_ptr,
+                    None,
+                    None,
+                    steep_norm_ptr,
+                    sK_inv_ptr,
+                    sK_decay_ptr,
+                    None,
+                    sSteepCorr.data_ptr() + decay_stage * (2 * cfg.b_t * cfg.b_t),
+                )
+                # Finish reading the per-group scratch before the next chunk can reuse it.
+                # Each correction writer publishes its own stores below.
+                nvvm.barrier_cta_sync(cfg.cg0_group_sync_barrier_base_id + cg0_group_id, thread_count=cfg.cg0_threads_per_group)
+                nvvm.fence_proxy("async.shared", space="cta")
+                if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
+                    # Correction rows come from single-lane stores: join every lane's fence before one lane arrives for the warp.
+                    nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+                if nvvm.elect_sync():
+                    bars.mb_k_decay_inv_cg0_ready[decay_stage].arrive()
             nvvm.fence_proxy("async.shared", space="cta")
+            if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
+                # Correction rows come from single-lane stores: join every lane's fence before one lane arrives for the warp.
+                nvvm.bar_warp_sync(cute.arch.FULL_MASK)
             if nvvm.elect_sync():
                 bars.mb_qk_scale_ready[qk_scale_ready_stage].arrive()
 
@@ -2075,34 +2207,35 @@ def host(
 
     # ---- launch ----------------------------------------------------------------------
     grid_shape = (cutlass.min(cutlass.Int32(cfg.max_active_clusters), cutlass.max(cutlass.Int32(work_items.shape[0]), cutlass.Int32(1))), 1, 1)
-    frost_kda_recompute(
-        cfg,
-        k_ratio,
-        v_ratio,
-        tensormap_workspace,
-        cutlass.Int32(num_sequences),
-        k,
-        v,
-        raw_gate,
-        a_log,
-        dt_bias,
-        beta,
-        cu_seqlens,
-        initial_state,
-        final_state,
-        seed_state_checkpoints,
-        work_items,
-        work_count,
-        scheduler_counter,
-        checkpoint_every_n_tokens,
-        seed_every_n_tokens,
-    ).launch(
-        grid=grid_shape,
-        block=(cfg.threads_per_cta, 1, 1),
-        stream=stream,
-        use_pdl=USE_PDL,
-        min_blocks_per_mp=1,
-    )
+    for launch_idx in cutlass.range_constexpr(2 if cfg.steep_mode == STEEP_FAST else 1):
+        frost_kda_recompute(
+            cfg if launch_idx == 0 else dataclasses.replace(cfg, steep_mode=STEEP_EXACT),
+            k_ratio,
+            v_ratio,
+            tensormap_workspace,
+            cutlass.Int32(num_sequences),
+            k,
+            v,
+            raw_gate,
+            a_log,
+            dt_bias,
+            beta,
+            cu_seqlens,
+            initial_state,
+            final_state,
+            seed_state_checkpoints,
+            work_items,
+            work_count,
+            scheduler_counter,
+            checkpoint_every_n_tokens,
+            seed_every_n_tokens,
+        ).launch(
+            grid=grid_shape,
+            block=(cfg.threads_per_cta, 1, 1),
+            stream=stream,
+            use_pdl=USE_PDL,
+            min_blocks_per_mp=1,
+        )
 
 
 @cute.kernel
@@ -2132,6 +2265,7 @@ def frost_kda_recompute(
     role runs a tile-scheduler loop over the tiles."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
+    steep_exit_unless_flagged(cfg, mScheduler)
 
     tidx, _, _ = cute.arch.thread_idx()
     bidx = cute.arch.block_idx()[0]
@@ -2151,6 +2285,13 @@ def frost_kda_recompute(
     bars = make_bars(cfg)
     sTmem_base = cutlass.Array(cutlass.Int32, 1, space=SMEM, alignment=4)
     sScheduler = cutlass.Array(cutlass.Int32, cfg.scheduler_stages, space=SMEM, alignment=16)
+    # steep key channels (common/steep_decay.py): per CG0 group the scan's ballot words, last-token decay factors and
+    # k inverse norms; per decay stage the tile's ballot words and the KK corrections
+    sSteepScan = cutlass.Array(cutlass.Int32, cfg.steep_scan_cosize, space=SMEM, alignment=16)
+    sSteepLast = cutlass.Array(cutlass.Float32, cfg.steep_last_cosize, space=SMEM, alignment=16)
+    sSteepNorm = cutlass.Array(cutlass.Float32, cfg.steep_norm_cosize, space=SMEM, alignment=16)
+    sSteepTile = cutlass.Array(cutlass.Int32, cfg.steep_tile_cosize, space=SMEM, alignment=16)
+    sSteepCorr = cutlass.Array(cutlass.Float32, cfg.steep_corr_cosize, space=SMEM, alignment=16)
     sK_decay_raw = cutlass.Array(cfg.io_dtype, cfg.k_decay_cosize, space=SMEM, alignment=cfg.buffer_align_bytes)
     sK_restore_raw = cutlass.Array(cfg.io_dtype, cfg.k_restore_cosize, space=SMEM, alignment=cfg.buffer_align_bytes)
     sIntermediate_raw = cutlass.Array(cfg.io_dtype, cfg.intermediate_cosize, space=SMEM, alignment=cfg.buffer_align_bytes)
@@ -2279,6 +2420,8 @@ def frost_kda_recompute(
             sIntermediate_raw,
             sBeta_raw,
             sK_decay_raw,
+            sSteepTile,
+            sSteepCorr,
             bars,
         )
     elif warp_idx == cfg.tcgen05_mma_warp_id:
@@ -2332,6 +2475,12 @@ def frost_kda_recompute(
             sK_decay_raw,
             sK_restore_raw,
             sCheckpoint_raw,
+            sSteepScan,
+            sSteepLast,
+            sSteepNorm,
+            sSteepTile,
+            sSteepCorr,
+            mScheduler,
             sTmem_base,
             checkpoint_every_n_tokens,
             bars,
@@ -2441,6 +2590,12 @@ class KdaRecomputeCfg:
     tma_v_bytes: int = 0
     tma_gate_bytes: int = 0
     intermediate_cosize: int = 0
+    steep_mode: int = STEEP_FAST  # common/steep_decay.py: STEEP_OFF / STEEP_FAST / STEEP_EXACT
+    steep_scan_cosize: int = 0
+    steep_last_cosize: int = 0
+    steep_norm_cosize: int = 0
+    steep_tile_cosize: int = 0
+    steep_corr_cosize: int = 0
 
 
 def build_cfg(
@@ -2522,6 +2677,13 @@ def build_cfg(
     cfg.tma_k_bytes = cfg.d_k * cfg.b_t * (cfg.io_dtype.width // 8)
     cfg.tma_v_bytes = cfg.d_v * cfg.b_t * (cfg.io_dtype.width // 8)
     cfg.tma_gate_bytes = cfg.d_k * cfg.b_t * (cfg.gate_dtype.width // 8)
+    cfg.steep_mode = steep_mode_for(cfg.io_dtype, cfg.l2norm, cfg.safe_gate, cfg.gate_scale_log2, cfg.b_t)
+    steep = cfg.steep_mode != STEEP_OFF
+    cfg.steep_scan_cosize = cfg.cg0_group_count * 2 * cfg.cg0_warps_per_group if steep else 1
+    cfg.steep_last_cosize = cfg.cg0_group_count * cfg.d_k if steep else 1
+    cfg.steep_norm_cosize = cfg.cg0_group_count * cfg.b_t if steep else 1
+    cfg.steep_tile_cosize = cfg.smem_decay_stages * cfg.cg0_warps_per_group if steep else 1
+    cfg.steep_corr_cosize = cfg.smem_decay_stages * 2 * cfg.b_t * cfg.b_t if steep else 1
     return cfg
 
 

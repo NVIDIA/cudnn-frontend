@@ -50,7 +50,7 @@ SMEM layout (stage counts live in gdn2_bprop_config.py and the kernel cfg; sizes
   T_inv / A (intermediate)         2560       2    <-- five BT x BT tiles per stage, as the bprop
   sub-bank fill                   17408       1    <-- 1024 B plus two operand rings keeps the high group at 128 KB; holds the
                                                       steep scratch (STEEP_FAST / STEEP_EXACT): KK / A corrections 2 x 2048,
-                                                      last-token log2 gates 2 x 512, ballot words 2 x 16 + 2 x 16, k inverse
+                                                      last-token decay factors 2 x 512, ballot words 2 x 16 + 2 x 16, k inverse
                                                       norms 64
   scheduler ticket ring               4       8    <-- next-tile publish ring
 
@@ -1299,11 +1299,15 @@ def compute1_warp_group(
                     has_dstate = cutlass.Boolean(True)
                 if has_dstate:
                     decay_stage = gc % cfg.smem_decay_stages
-                    # Acquire generic-memory writes directly, independently of MMA completion.
-                    bars.mb_dstate_input_ready.wait(dstate_acquire_index.phase)
-                    dstate_acquire_index = advance(dstate_acquire_index, 1)
-                    bars.mb_k_decay_inv_ready[decay_stage].wait((gc // cfg.smem_decay_stages) % 2)
+                    # The tile's steep words are visible since the decay-scale wait. A mild tile has no dU correction, so it
+                    # waits for neither the FP32 dstate nor the steep keys.
                     words = sSteepTile_ptr + decay_stage * len(cfg.compute_group_0_warp_ids)
+                    steep_tile = steep_tile_mask(cfg, words)
+                    if steep_tile != 0:
+                        # Acquire generic-memory writes directly, independently of MMA completion.
+                        bars.mb_dstate_input_ready.wait(dstate_acquire_index.phase)
+                        bars.mb_k_decay_inv_ready[decay_stage].wait((gc // cfg.smem_decay_stages) % 2)
+                    dstate_acquire_index = advance(dstate_acquire_index, 1)
                     keys = dstate_scratch + cfg.d_v * cfg.d_k + decay_stage * cfg.b_t * cfg.d_k
                     du_vec_lo = add_steep_du(cfg, du_vec_lo, dstate_scratch, keys, words, tmem_sp * (cfg.d_v // 4), lane_idx)
                     if cutlass.const_expr(dv_halves == 2):

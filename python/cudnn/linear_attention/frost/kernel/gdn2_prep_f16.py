@@ -47,7 +47,7 @@ prefill's CG0 operand materialization (the four warps own the whole chunk), phas
   warp 3 : the other key half of T
 No register redistribution: the launch's occupancy floor (min_blocks_per_mp = CTAS_PER_SM) sets the register budget.
 
-Steep scratch (STEEP_FAST / STEEP_EXACT; one element per array under STEEP_OFF): ballot words 16 B, last-token log2 gates
+Steep scratch (STEEP_FAST / STEEP_EXACT; one element per array under STEEP_OFF): ballot words 16 B, last-token decay factors
 512 B, k inverse norms 64 B, KK / A corrections 2048 B.
 """
 
@@ -888,7 +888,7 @@ def frost_gdn2_prep(
     sK_decay_raw = cutlass.Array(cfg.io_dtype, RECS * cfg.d_k * cfg.b_t, space=SMEM, alignment=cfg.buffer_align_bytes)
     sQ_decay_raw = cutlass.Array(cfg.io_dtype, RECS * cfg.d_k * cfg.b_t, space=SMEM, alignment=cfg.buffer_align_bytes)
     sW_raw = cutlass.Array(cfg.io_dtype, RECS * cfg.d_k * cfg.b_t, space=SMEM, alignment=cfg.buffer_align_bytes)
-    # steep key channels (common/steep_decay.py): the scan's ballot words, last-token log2 gates, k inverse norms and the
+    # steep key channels (common/steep_decay.py): the scan's ballot words, last-token decay factors, k inverse norms and the
     # KK / A corrections of the CTA's current item
     sSteepScan = cutlass.Array(cutlass.Int32, cfg.steep_scan_cosize, space=SMEM, alignment=16)
     sSteepLast = cutlass.Array(cutlass.Float32, cfg.steep_last_cosize, space=SMEM, alignment=16)

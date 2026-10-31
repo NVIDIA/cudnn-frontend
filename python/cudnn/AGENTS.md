@@ -1027,15 +1027,17 @@ with fp16 operands (`k * 2^-g` overflows). Both lie inside the documented gate r
   it cost the backward 13%.
 - Bound the inverse operand with the key magnitude as well as the gate prefix:
   unnormalized `k=5` overflows fp16 at a prefix of -13.75.
-- Sum individual token logs over the interval. Never subtract inclusive fp32 prefixes:
-  a -1e8 gate erases the following -1 gates from both.
+- Multiply individual token factors `exp2(g)` over the interval. Never subtract inclusive fp32 prefixes:
+  a -1e8 gate erases the following -1 gates from both. Factors are at most 1, so a product only underflows.
 - Reduce corrections in a fixed order, including when several channels are steep.
 - Use `encode_gate_exchange` for scan classification and exchange encoding. Keep stage selection and
-  barriers in each schedule. All six chunk schedules share gate conditioning, scans, row normalization
-  and operand packing through the `@cute.jit` stages in `common/gdn2_operands.py`. The rolled FP32
+  barriers in each schedule. All six GDN-2 chunk schedules share gate conditioning, scans, row normalization
+  and operand packing through the `@cute.jit` stages in `common/gdn2_operands.py`; the six KDA schedules
+  keep their inline operand code and call the same `common/steep_decay.py` stages. KDA's scalar beta sits
+  outside K decay and is already in the strict dM tile, so its corrections pass `beta_ptr=None`. The rolled FP32
   backward scan retains its local load/store schedule. Read exchange scales before releasing a raw
   stage; register-only packing may follow that release. `encode_gate_exchange` accepts log2 prefixes
-  only, and returns exponentials or exact token logs according to the channel ballot. The forward kernels
+  only, and returns exponentials or exact token factors according to the channel ballot. The forward kernels
   declare the steep scratch arrays from their cfg cosizes; the backward kernels carve it from the bank fill
   at cfg byte offsets and assert the capacity in `build_cfg`.
 - Range tests must vary state-gradient magnitude independently of gate magnitude. A large finite
@@ -1066,7 +1068,7 @@ with fp16 operands (`k * 2^-g` overflows). Both lie inside the documented gate r
   alias them later. A forward graph without a final-state output cannot overwrite its seeds;
   indexed input pools in such graphs need no snapshot.
 
-Detectors, all in the steep section of `linear_attention/test_la.py`: `test_steep_channel_decay_fwd_bwd`
+Detectors, all in the steep section of `linear_attention/test_la.py` and run for GDN-2 and KDA: `test_steep_channel_decay_fwd_bwd`
 (and `test_steep_channel_decay_fp16`), `test_steep_fp16_inverse_range_without_normalization`,
 `test_steep_multiple_channels_repeatable`, `test_steep_forward_state_alias_after_graph_warmup`,
 `test_steep_channel_decay_overwrite_initial_state`, `test_steep_channel_decay_backward_overwrite_initial_state`,
