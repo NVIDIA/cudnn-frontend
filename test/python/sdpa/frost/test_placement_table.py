@@ -175,6 +175,22 @@ def test_cc103_borrows_only_the_studies_its_transfer_check_named(monkeypatch):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("s", [1, 512])
+def test_a_square_entry_reaches_the_runtime_from_either_corner(monkeypatch, s):
+    """The generator classifies through class_key; an entry it emits for a top-left square must be the one place() honors."""
+    from cudnn.sdpa.fwd import placement
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    tl, br = (_facts(s_q=s, s_kv=s, h_q=16, h_kv=2, d_qk=128, d_v=128, causal=True, bottom_right=a) for a in (False, True))
+    key = pt.class_key(spec.name, tl)
+    assert key == pt.class_key(spec.name, br) and ("none" if s == 1 else "causal_br") in key  # one row sees its only key
+    for verdict, expected in (("never", placement.TRAIL), ("always", placement.LEAD)):
+        monkeypatch.setattr(pt, "TABLE", {key: pt.Entry(verdict, None, "synthetic")})
+        assert placement.place(spec, tl) == placement.place(spec, br) == expected
+
+
+@pytest.mark.L0
 def test_cc103_d256_backward_thd_entries_are_its_own():
     """cc 10.3's own d256 backward entries answer with no transfer: THD on the 128-key tile (study sm103_d256_bwd_v2_20261031,
     THD half) and off it (study sm103_d256_bwd_thd_offtile_20261031). The same graph on cc 10.0 has no entry, so the

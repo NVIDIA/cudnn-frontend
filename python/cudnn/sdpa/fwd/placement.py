@@ -348,6 +348,10 @@ cases through the inference harness's paged context phase, exact and undeclared 
 admitted, the default dispatch ran 0.47-0.60 of the backend's time on the 18 full squares, 0.60-0.95 on the 16 GQA16
 chunks and 0.79-0.95 on the 10 undeclared GQA 4 / 8 chunks. No case was slower than develop's default. The squares'
 margin is the backend's: its engine 10 is slow at lengths off the 128 tile, and four on-tile probe squares ran 0.86-0.92.
+:func:`place` reads a square causal mask as bottom-right (the same tiles), so
+GQA 4 / 8 squares also take the packed full-prefill lead (#1809) from S = 512 and on cc 10.3 / page 64: 80 top-left
+squares (S 512-8192, page 16 / 64, b 1 / 3, cuDNN 9.29.0.18) ran FROST at 0.45-0.98 of the backend on a B100 and
+0.49-0.99 on a B300 (2026-10-31).
 
 Rows with no measurement (SM80, SM100 mxfp8) keep the historical order (LEAD); they are still
 opt-in, so the order is only observable with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``.
@@ -367,6 +371,8 @@ longer cache (equal Q and KV extents and, with packed totals declared, equal tot
 """
 
 from __future__ import annotations
+
+import copy
 
 import cudnn
 
@@ -524,8 +530,8 @@ def _d512_swa(facts) -> bool:
 
 
 TRAIL_ONLY_ROWS = frozenset({"sdpa_fwd_prefill_sm80"})
-"""Default-offered rows with no measured lead shard: offered after the backend's block, so they serve a graph only when the
-backend declines it (a correctness fallback, not a performance claim)."""
+"""Default-offered rows with no hand-written lead shard: offered after the backend's block, so they serve a graph only when
+the backend declines it (a correctness fallback), unless a generated ``placement_table`` entry leads the graph."""
 
 
 def place(spec, facts) -> str:
@@ -544,6 +550,11 @@ def place(spec, facts) -> str:
     rules below decide every graph the table has no entry for."""
     from cudnn.sdpa import placement_table
 
+    if facts.causal and not facts.bottom_right and facts.s_q == facts.s_kv:
+        # A square causal mask covers the same tiles from either corner (placement_table.class_key reads it the same way);
+        # a shallow copy, as dataclasses.replace re-runs every field's init.
+        facts = copy.copy(facts)
+        object.__setattr__(facts, "bottom_right", True)
     measured = placement_table.lookup(spec.name, facts)
     if measured is not None:
         return LEAD if measured else TRAIL
@@ -930,7 +941,7 @@ def _sm100_paged_gqa_prefill(facts) -> bool:
         and 2048 <= facts.s_kv <= 32768
         and facts.page_size == 16
         and facts.causal
-        and (facts.bottom_right or facts.s_q == facts.s_kv)
+        and facts.bottom_right
         and facts.window_left is None
         and not (facts.has_sink or facts.right_band_widening)
         and facts.k_t is not None
