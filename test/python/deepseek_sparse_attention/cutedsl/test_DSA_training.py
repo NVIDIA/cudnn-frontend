@@ -12,8 +12,8 @@ pytestmark = pytest.mark.L0
 
 @pytest.fixture(autouse=True)
 def supported():
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("native DSA training requires SM100")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("native DSA training requires SM100 or SM103")
     from cudnn.frost.buffers import cutedsl_requirement_error
 
     error = cutedsl_requirement_error("DSA training test")
