@@ -244,7 +244,7 @@ _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle 
         53,
         12,
     ),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait; +9: the early-BMM1 mainloop arm; +1: the decoded-tile wait
-    ("mxfp8", (192, 128)): (True, 36, 13),  # +1 ring wait: the P-slot hand-over wait
+    ("mxfp8", (192, 128)): (True, 35, 14),  # +1 ring wait: the P-slot hand-over wait; the softmax tile-top wait is the idle mb_o_full[0] wait
     ("f16", (256, 256)): (False, 30, 11),  # FP32 split-partial epilogue adds one output-ring wait
     ("fp8", (256, 256)): (False, 30, 11),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
     ("mxfp8", (256, 256)): (False, 29, 11),
@@ -4832,8 +4832,9 @@ _SM107_WAIT_FORM_PROBE = textwrap.dedent("""
 _WAIT_FORM_SLACK = {"SYNCS_PHASECHK": 1, "USYNCS_PHASECHK": 0, "NANOSLEEP": 0}
 _SM107_WAIT_FORM_PIN_ROWS = [
     # (quant, d_qk, d_v, dtype_o, SPIN_RING_WAITS, divergent SYNCS.PHASECHK, uniform USYNCS.PHASECHK, NANOSLEEP)
-    # develop (sleeping form everywhere): 142 / 75 / 73; 42 ring-wait instantiations flipped -> 58 / 117 / 31
-    pytest.param("mxfp8", 192, 128, _BF16_OUT, True, 58, 117, 31, id="mxfp8-d192x128-spin"),
+    # develop (sleeping form everywhere): 142 / 75 / 73; 42 ring-wait instantiations flipped -> 58 / 117 / 31; the softmax tile-top
+    # mb_o_full[0] wait (sleeping form, two instantiations) in place of the mb_o_empty ring wait -> 62 / 115 / 33
+    pytest.param("mxfp8", 192, 128, _BF16_OUT, True, 62, 115, 33, id="mxfp8-d192x128-spin"),
     # the opt-out must leave every wait opcode where it was
     pytest.param("fp8", 128, 128, _E4M3, False, 164, 86, 84, id="fp8-d128-sleep"),
 ]
