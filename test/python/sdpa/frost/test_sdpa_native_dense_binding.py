@@ -18,6 +18,16 @@ from cudnn.sdpa.fwd import prepared as prep
 pytestmark = [pytest.mark.L0]
 
 
+def _parts(cc):
+    """The parts a GPU case declared for ``cc`` runs on. The SM100 cases (the (10, 0) default) run on SM103 too, which serves the same sm100
+    bodies compiled for sm_103a; test_sdpa_native_arch_binding.py names its other cc 10.3 and cc 10.7 cases explicitly."""
+    return ((10, 0), (10, 3)) if cc == (10, 0) else (cc,)
+
+
+def _parts_label(cc):
+    return " or ".join(f"SM{major}{minor}" for major, minor in _parts(cc))
+
+
 def _fixture(dtype="bfloat16", paged=False, hnd=False, lse=True, lengths=True, d=128, sq=1, v_hnd=None, d_v=None):
     d_v = d if d_v is None else d_v
     s = prep.DenseLaunchSpec()
@@ -336,8 +346,8 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(
 ):
     import torch
 
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != cc:
-        pytest.skip(f"native dense test requires SM{cc[0]}{cc[1]}")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in _parts(cc):
+        pytest.skip(f"native dense test requires {_parts_label(cc)}")
     from frost_test_utils import _dsl_installed
     from test_sdpa_fwd_decode_d128_sm100 import _SM100_ID, _gather_kv, _ref
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
@@ -614,8 +624,8 @@ def test_native_dense_unknown_storage_contract_is_preserved():
 def test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, splits=1, stats_mode="ln", d_v=None, prefill=False, has_sink=False, cc=(10, 0)):
     import torch
 
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != cc:
-        pytest.skip(f"native standalone test requires SM{cc[0]}{cc[1]}")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in _parts(cc):
+        pytest.skip(f"native standalone test requires {_parts_label(cc)}")
     from frost_test_utils import _dsl_installed
 
     if not _dsl_installed():
