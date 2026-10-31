@@ -140,12 +140,19 @@ def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     return lead + [BACKEND] + trail if trail else lead
 
 
+def _lists_last(spec: EngineSpec, facts) -> bool:
+    """Rows listed after the other eligible rows: the d192 half row on a dense graph, where the d256 row's native
+    192/128 geometry serves the same declaration."""
+    return spec.name == "sdpa_bwd_sm100_d192" and not facts.thd
+
+
 def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
-    """One complete entry per eligible row, in ``ENGINE_SPECS`` order; ``kind``
+    """One complete entry per eligible row, in ``ENGINE_SPECS`` order except for :func:`_lists_last`; ``kind``
     does not change the answer (no runner-up candidates to thin out)."""
-    out: List[PlanConfig] = []
+    out: List[Tuple[EngineSpec, PlanConfig]] = []
     for engine_id, spec in _eligible(facts, offered):
         knobs = default_knobs(spec, facts)
         if knobs is None or mismatch(spec.capabilities, facts, knobs) is None:
-            out.append(PlanConfig(engine_id, knobs))
-    return out
+            out.append((spec, PlanConfig(engine_id, knobs)))
+    out.sort(key=lambda entry: _lists_last(entry[0], facts))
+    return [plan for _, plan in out]
