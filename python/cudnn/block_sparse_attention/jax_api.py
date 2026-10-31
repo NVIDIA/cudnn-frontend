@@ -117,18 +117,18 @@ def configuration(q_tensor, k_tensor, v_tensor, indices, nums, count, block_size
     if len(placed) > 1:
         raise ValueError("all BSA arrays must be on the same GPU")
     tracing = any(isinstance(x, jax.core.Tracer) for x in (q_tensor, k_tensor, v_tensor, indices, nums))
-    if not tracing:
+    if placed and not tracing:
         # Committed arrays: compile for the device they are on.
         gpu_arch = {_SM100_FAMILY[str(d.compute_capability)] for d in placed if is_sm100(d)}
     else:
-        # Under tracing -- every input a tracer, or only some, the rest captured concrete arrays -- the device XLA runs the call on
-        # is not visible here: read the target off the local SM100-family GPUs, and refuse a host that exposes both architectures
-        # rather than compile for the wrong one.
+        # Under tracing -- every input a tracer, or only some, the rest captured concrete arrays -- or with no committed array to
+        # read, the device XLA runs the call on is not visible here: read the target off the local SM100-family GPUs, and refuse a
+        # host that exposes both architectures rather than compile for the wrong one.
         gpu_arch = {_SM100_FAMILY[str(d.compute_capability)] for d in jax.local_devices() if is_sm100(d)}
         if len(gpu_arch) > 1:
             raise ValueError(
-                "JAX BSA under tracing cannot tell SM100 from SM103 when both are visible: call it eagerly on committed arrays, "
-                "or make GPUs of one architecture visible (CUDA_VISIBLE_DEVICES)"
+                "JAX BSA cannot tell SM100 from SM103 when both are visible and no committed array names the device (a traced "
+                "call): call it eagerly on committed arrays, or make GPUs of one architecture visible (CUDA_VISIBLE_DEVICES)"
             )
     if jax.process_count() != 1 or len(gpu_arch) != 1:
         raise ValueError("JAX BSA currently requires a single process and arrays on an SM100 or SM103 (compute capability 10.0 or 10.3) GPU")

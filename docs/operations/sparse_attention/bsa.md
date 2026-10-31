@@ -647,7 +647,7 @@ output buffers. XLA owns the outputs and workspaces.
 
 | Property | Supported |
 | --- | --- |
-| Device | All arrays on one CUDA GPU of compute capability 10.0 or 10.3 (SM100 or SM103); other GPUs may be visible. Under `jax.jit` the target is read off the visible GPUs, so a host exposing both SM100 and SM103 GPUs is refused there (eager calls on committed arrays are not). Single process |
+| Device | All arrays on one CUDA GPU of compute capability 10.0 or 10.3 (SM100 or SM103); other GPUs may be visible. Under `jax.jit` (any traced input, even with the others captured as committed arrays), or with no committed JAX array among the inputs, the target is read off the visible GPUs, so a host exposing both SM100 and SM103 GPUs is refused there (eager calls on committed arrays are not). Single process |
 | Data | BF16 Q/K/V/O/dO/dQ/dK/dV; FP32 LSE and accumulation |
 | Dimensions | MHA with equal head counts, D=64 or 128; positive sequence lengths divisible by 128 |
 | Layout | Compact BHSD or BSHD, independently specialized |
