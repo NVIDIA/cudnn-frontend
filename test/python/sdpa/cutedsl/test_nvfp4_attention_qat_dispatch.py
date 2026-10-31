@@ -73,6 +73,21 @@ def test_auto_architecture_selection_metadata_only(monkeypatch, capability):
 
 
 @pytest.mark.parametrize(
+    "capability,is_causal,launch",
+    [((10, 0), False, (64, 64, 8, 2, 3)), ((10, 3), False, (64, 64, 8, 2, 3)), ((10, 3), True, (32, 32, 4, 3, 3)), ((12, 0), False, (32, 32, 4, 3, 3))],
+    ids=["sm100", "sm103", "sm103_causal", "sm120"],
+)
+def test_triton_launch_config_per_part(monkeypatch, capability, is_causal, launch):
+    """The Triton route's tiles, metadata only: 64x64 / 8 warps on the noncausal SM100-family parts, 32x32 / 4 warps elsewhere."""
+    from cudnn import Nvfp4AttentionQatBackward
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: capability)
+    op = Nvfp4AttentionQatBackward(*_declaration(), backend="triton", is_causal=is_causal)
+    assert op.check_support() and op.selected_backend == "triton"
+    assert op._launch_config == launch
+
+
+@pytest.mark.parametrize(
     "declaration,options,reason",
     [
         ({"batch": 2}, {}, "B=1"),

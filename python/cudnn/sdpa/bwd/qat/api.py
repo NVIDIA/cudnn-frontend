@@ -198,7 +198,8 @@ class Nvfp4AttentionQatBackward(APIBase):
             f"NVFP4 QAT Triton requires {self._workspace_bytes} workspace bytes, exceeding workspace_limit_bytes={self.workspace_limit_bytes}",
         )
 
-        optimized_sm100 = capability == (10, 0) and not self.is_causal and seqlen_kv % 16 == 0
+        # 64x64 tiles: about 2x faster than 32x32 on cc 10.3 too (B300, H3 / H12 at 8K / 32K).
+        optimized_sm100 = capability in ((10, 0), (10, 3)) and not self.is_causal and seqlen_kv % 16 == 0
         block_size = 64 if optimized_sm100 else 32
         num_warps = 8 if optimized_sm100 else 4
         fallback_stages = 2 if capability[0] == 12 and max(seqlen_q, seqlen_kv) >= 8192 else 3

@@ -35,8 +35,8 @@ fully masked tiles while retaining the elementwise mask on the diagonal.
 The local-scale conversion uses precise division so exact E2M1 midpoints
 preserve round-to-nearest-even; no tolerance relaxation is required.
 The production
-non-causal SM100 configuration uses 64 by 64 tiles; other supported Blackwell
-configurations use 32 by 32 tiles.
+non-causal SM100 and SM103 configurations use 64 by 64 tiles; other supported
+Blackwell configurations use 32 by 32 tiles.
 
 ## Installation
 
