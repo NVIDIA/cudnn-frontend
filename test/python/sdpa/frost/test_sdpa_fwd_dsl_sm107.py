@@ -4796,7 +4796,7 @@ _SM107_WAIT_FORM_PROBE = textwrap.dedent("""
     os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
     from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module, supported_cgas_for
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
-    (cta_mma,) = supported_cgas_for((d_qk, d_v), fp8=True, device_cc=(10, 7), pertensor=(quant == "fp8"))
+    cta_mma = max(supported_cgas_for((d_qk, d_v), fp8=True, device_cc=(10, 7), pertensor=(quant == "fp8")))
     params = TemplateParams(dtype_qkv=0, dtype_o=dtype_o, cta_mma=cta_mma)
     mod = _load_sm100_kernel_module((d_qk, d_v), params, fp8=True, pertensor=(quant == "fp8"), rubin=True)
     kw = dict(b=1, qh=128, kh=128, sq=8192, skv=8192, d_qk=d_qk, d_v=d_v, has_lse=True)
