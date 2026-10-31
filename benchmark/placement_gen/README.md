@@ -15,6 +15,9 @@
    - `never`;
    - or one threshold halfway between the last training loss and the first win past it, in the direction that keeps more wins.
 
+   A threshold gives up the wins on its far side, so `always` / `never` replace it when every loss they accept is
+   marginal (within twice `--margin`) and their worst training cell, then their geomean regret, is lower.
+
    The feature with the lowest training regret is kept and recorded in the entry. Cells within `--margin` of parity (default 3%) never move a threshold. A class that no feature can split monotonically is **NON-MONOTONE** and gets no entry; refine the class key instead.
 4. **Qualify on the frozen holdout, once, at the frozen head.** The holdout must exercise every class the entries cover (on- and off-tile S_kv, every layout), was never used to fit or to choose a feature or constant, and is consumed by the run.
 5. **Score.** The tool prints generated vs measured-default vs backend-only regret on train and holdout. The holdout must show no case where the generated choice is slower than the measured default beyond noise.
