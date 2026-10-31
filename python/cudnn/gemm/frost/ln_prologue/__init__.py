@@ -55,6 +55,10 @@ B_STAGE_BYTES = {
 BODIES = {"sm107": "sm107_dual_gemm.py", "sm100": "sm100_dual_gemm.py"}
 ARCHS_BY_CC = {(10, 0): "sm100", (10, 3): "sm100", (10, 7): "sm107"}
 ARCH_GATE_CC = {"sm100": (10, 0), "sm107": (10, 7)}
+#: The arch-specific CuTe target each served part compiles its body for (:func:`target_for_cc`).  A body pins its home part's target
+#: (``HOME_TARGETS``); an ``sm_100a`` cubin does not load on cc 10.3, so that part compiles the sm100 body for ``sm_103a``.
+TARGETS_BY_CC = {(10, 0): "sm_100a", (10, 3): "sm_103a", (10, 7): "sm_107a"}
+HOME_TARGETS = {"sm100": "sm_100a", "sm107": "sm_107a"}
 
 
 def body_arch_for_cc(cc) -> str:
@@ -65,6 +69,12 @@ def body_arch_for_cc(cc) -> str:
         served = ", ".join(f"{a}.{b}" for a, b in sorted(ARCHS_BY_CC))
         raise NotImplementedError(f"the LayerNorm-prologue dual GEMM is rendered for compute capabilities {served} only today; found {key[0]}.{key[1]}")
     return ARCHS_BY_CC[key]
+
+
+def target_for_cc(cc) -> str:
+    """The CuTe ``--gpu-arch`` target for a device's compute capability (the same typed decline as :func:`body_arch_for_cc` off it)."""
+    body_arch_for_cc(cc)
+    return TARGETS_BY_CC[tuple(int(x) for x in cc)]
 
 
 def ring_stages(arch: str, pairing: str) -> int:
@@ -470,8 +480,9 @@ class LnDualGemmPlan:
 
 
 @lru_cache(maxsize=None)
-def build_ln_dual_gemm(params: LnDualGemmParams, arch: str = "sm107") -> LnDualGemmPlan:
-    """Load the ``arch`` body (:data:`BODIES`; :func:`body_arch_for_cc` names it from the device) specialized for ``params`` and cute-compile it."""
+def build_ln_dual_gemm(params: LnDualGemmParams, arch: str = "sm107", target: Optional[str] = None) -> LnDualGemmPlan:
+    """Load the ``arch`` body (:data:`BODIES`; :func:`body_arch_for_cc` names it from the device) specialized for ``params`` and cute-compile it
+    for ``target`` (:func:`target_for_cc`; None: the body's home target, ``HOME_TARGETS``)."""
     from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
     from cudnn.frost.template_loader import load_template
 
@@ -485,7 +496,14 @@ def build_ln_dual_gemm(params: LnDualGemmParams, arch: str = "sm107") -> LnDualG
     if msg:
         raise NotImplementedError(msg)
     validate_ln_dual_gemm_params(params, arch)
-    mod = load_template(body_path(arch), params, tag="ln_prologue_dual_gemm")
+    home = HOME_TARGETS[arch]
+    target = home if target is None else target
+    if target not in {TARGETS_BY_CC[cc] for cc, body in ARCHS_BY_CC.items() if body == arch}:
+        raise ValueError(f"the {arch} LayerNorm-prologue body does not compile for {target!r}")
+    # Another part's target renders its own module (the extra key): the two never share a module or a compiled artifact.
+    mod = load_template(body_path(arch), params, tag="ln_prologue_dual_gemm", extra_key=None if target == home else ("gpu_arch", target))
+    if target != home:
+        mod.frost_compile_options = mod.frost_compile_options.replace(f"--gpu-arch {home}", f"--gpu-arch {target}")
     return LnDualGemmPlan(params=params, module=mod, launch=mod.compile())
 
 

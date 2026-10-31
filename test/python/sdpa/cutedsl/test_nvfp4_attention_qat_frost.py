@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""SM100 FROST QAT backend: numerical, workspace and launch contracts."""
+"""SM100/SM103 FROST QAT backend: numerical, workspace and launch contracts."""
 
 import importlib.util
 import math
@@ -18,14 +18,14 @@ def _available():
     installed, version = cutedsl_state()
     return (
         torch.cuda.is_available()
-        and torch.cuda.get_device_capability() == (10, 0)
+        and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
         and installed
         and not cutedsl_too_old(version)
         and importlib.util.find_spec("triton") is not None
     )
 
 
-pytestmark = [pytest.mark.L0, pytest.mark.skipif(not _available(), reason="Requires SM100, Triton, and CuTe DSL >= 4.7.0")]
+pytestmark = [pytest.mark.L0, pytest.mark.skipif(not _available(), reason="Requires SM100 or SM103, Triton, and CuTe DSL >= 4.7.0")]
 
 
 def _prepare(inputs, **options):

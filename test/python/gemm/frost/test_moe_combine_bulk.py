@@ -18,7 +18,7 @@ from cudnn.gemm.frost import compiler as C
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.tile_config import by_name
 from gemm_test_utils import E2M1, Plan, graph_binding, requires_sm100, requires_sm107, to_blocked, unpack_fp4, vp_bs, with_static_segmented_capacity
-from test_moe_grouped_block_scale_matmul_fwd import _build_graph
+from moe_block_scale_test_utils import _build_graph
 
 pytestmark = pytest.mark.L0
 

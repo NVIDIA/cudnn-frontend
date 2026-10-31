@@ -1198,3 +1198,9 @@ operand as well as fully and partially traced inputs. Concrete captured arrays d
 not pin execution placement; detect the active trace independently of operand
 types. BSA's `test_fully_captured_public_call_refuses_mixed_arch_under_jit` checks
 that a modeled mixed-architecture host is rejected before the FFI factory.
+
+When a template-loader signature gains an optional target or part argument,
+update every monkeypatched loader spy to accept and forward it while retaining
+route assertions. Exercise the actual spy with both the legacy call and the new
+keyword; architecture-skipped GPU cases can otherwise hide a host-call failure
+until another lane runs, before any kernel executes.

@@ -17,7 +17,7 @@ import torch
 from test_utils import assert_bitwise_runs, bitwise_bits, torch_fork_set_rng
 
 from deepseek_sparse_attention.cutedsl.dsa_utils import (
-    _require_exact_sm100,
+    _require_sm100_family,
     _require_sm90,
     _require_sm100,
     dsa_init,
@@ -410,7 +410,7 @@ def test_DSA_sparse_attention_backward_qcluster_workspace_is_topk_bounded(heads,
 @pytest.mark.L1
 def test_DSA_sparse_attention_backward_qcluster_compile_key_is_shape_dynamic():
     """Reuse one compiled artifact across different Q and KV extents."""
-    _require_exact_sm100()
+    _require_sm100_family()
     from cudnn.deepseek_sparse_attention.sparse_attention_backward._qcluster_sm100 import _compile_artifacts, compile_plan
 
     capability = torch.cuda.get_device_capability()
@@ -502,7 +502,7 @@ def test_DSA_sparse_attention_backward_deterministic_compile_cache_is_device_sco
 @pytest.mark.parametrize("with_lengths", [False, True], ids=["full", "lengths"])
 def test_DSA_sparse_attention_backward_qcluster_matches_baseline_and_graph(heads, with_lengths, topk):
     """Shared, fallback, and odd-tail rows remain correct on graph replay."""
-    _require_exact_sm100()
+    _require_sm100_family()
     from cudnn import DSA
 
     torch.manual_seed(31)
@@ -598,7 +598,7 @@ def test_DSA_sparse_attention_backward_qcluster_matches_baseline_and_graph(heads
 @pytest.mark.parametrize("heads", [16, 32])
 def test_DSA_sparse_attention_backward_qcluster_graph_replay_switches_overlap_path(heads):
     """One captured graph follows in-place high/zero/high overlap changes."""
-    _require_exact_sm100()
+    _require_sm100_family()
     from cudnn import DSA
 
     torch.manual_seed(32)
@@ -1600,7 +1600,7 @@ def test_DSA_sparse_attention_backward_sm100_plan_is_cold_capture_safe(
 
     _require_sm100()
     if expected_backend == "h128_2cta_m64":
-        _require_exact_sm100()
+        _require_sm100_family()
     plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
         num_heads,
         head_dim,
@@ -2135,7 +2135,7 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_masks_active_positive_
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     if head_dim == 512:
-        _require_exact_sm100()
+        _require_sm100_family()
     else:
         _require_sm100()
         if torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
@@ -2228,7 +2228,7 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_masks_active_positive_
 @torch_fork_set_rng(seed=20260830)
 def test_DSA_sparse_attention_backward_sm100_h128_dsink_reduction_covers_tail():
     """Every query block, including a one-row tail, contributes to dSink."""
-    _require_exact_sm100()
+    _require_sm100_family()
     try:
         from cudnn import DSA
     except ImportError:
@@ -2291,7 +2291,7 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_cuda_graph(monkeypatch
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
-    _require_exact_sm100()
+    _require_sm100_family()
 
     s_q, s_kv, num_heads, head_dim, topk = 4, 192, 128, 512, 128
     q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device="cuda") / 10
@@ -3121,7 +3121,7 @@ def test_DSA_sparse_attention_backward_zero_topk_length(head_dim, num_heads, top
     if major * 10 + minor < 90:
         pytest.skip("sparse attention backward requires SM90+")
     if num_heads == 128 and head_dim == 512:
-        _require_exact_sm100()
+        _require_sm100_family()
     if num_heads == 128 and head_dim == 576 and (major, minor) not in _TWO_CTA_CAPABILITIES:
         # Lengths above max_topk are part of the two-CTA route's contract; the
         # generic M64 pipeline that serves H128/D576 elsewhere does not clamp them.
@@ -3509,7 +3509,7 @@ def test_DSA_sparse_attention_backward_h128_two_cta_handles_sink_limits(head_dim
     sink as owning all (or none) of the probability mass."""
     _require_sm100()
     if head_dim == 512:
-        _require_exact_sm100()
+        _require_sm100_family()
     elif torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
         pytest.skip("D576 2-CTA requires an SM100-class GPU (compute capability 10.0 or 10.3)")
     try:
@@ -3674,7 +3674,7 @@ def test_DSA_sparse_attention_backward_h128_two_cta_padded_slots_under_very_nega
     and must not touch unselected KV rows."""
     _require_sm100()
     if head_dim == 512:
-        _require_exact_sm100()
+        _require_sm100_family()
     elif torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
         pytest.skip("D576 2-CTA requires an SM100-class GPU (compute capability 10.0 or 10.3)")
     try:
@@ -4406,7 +4406,7 @@ def test_DSA_sparse_attention_backward_nondefault_stream_zero_init_ordering(num_
 
     _require_sm100()
     if num_heads == 128 and head_dim == 512:
-        _require_exact_sm100()
+        _require_sm100_family()
     if num_heads == 128 and head_dim == 576 and torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
         pytest.skip("D576 2-CTA requires an SM100-class GPU (compute capability 10.0 or 10.3)")
     if q_cluster_mode == "adaptive_pair" and torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
@@ -5051,7 +5051,7 @@ def test_DSA_sparse_attention_backward_sm100_execute_allocates_nothing_and_never
 
     _require_sm100()
     if expected_backend == "h128_2cta_m64":
-        _require_exact_sm100()
+        _require_sm100_family()
     device_capability = torch.cuda.get_device_capability()
     if expected_backend in ("h96_d576_2cta_m64", "h128_d576_2cta_m64") and device_capability not in _TWO_CTA_CAPABILITIES:
         if expected_backend == "h96_d576_2cta_m64":

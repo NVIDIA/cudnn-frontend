@@ -25,10 +25,10 @@ def _require_sm100():
         pytest.skip("SM100 GPU required")
 
 
-def _require_exact_sm100():
-    """Skip unless the device is exactly SM100 (capability ``(10, 0)``)."""
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("SM100 (10, 0) GPU required")
+def _require_sm100_family():
+    """Skip unless the device is an SM100-family part the DSA kernels compile for: SM100 or SM103 (``(10, 0)`` / ``(10, 3)``)."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("SM100 or SM103 GPU required")
 
 
 def _require_mxfp4_indexer():

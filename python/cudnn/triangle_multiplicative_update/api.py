@@ -56,6 +56,7 @@ from cudnn.api_base import APIBase, TensorDesc, check_buffers_disjoint
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 from cudnn.gemm.frost.ln_prologue import ARCHS_BY_CC as _ARCHS_BY_CC
 from cudnn.gemm.frost.ln_prologue import body_arch_for_cc as _body_arch_for_cc
+from cudnn.gemm.frost.ln_prologue import target_for_cc as _target_for_cc
 from cudnn.gemm.frost.ln_prologue import ln_once_tiles_per_item as _ln_once_tiles_per_item
 
 from . import heuristics as th
@@ -548,9 +549,10 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
         # (parameter set, arch body, device) -- :func:`_substrate_plan_on`, :func:`_compile_contraction`.
         k1_params, k3_params = self._stage_params()
         arch = self.arch if self.arch is not None else _body_arch_for_cc(self.cc)
+        target = _target_for_cc(self.cc)  # the part's own CuTe target: cc 10.3 compiles the sm100 body for sm_103a
         with torch.cuda.device(self.device_index):
-            self._plan_k1 = _substrate_plan_on(k1.build_trimul_proj, k1_params, self.device_index, arch)
-            self._plan_k3 = _substrate_plan_on(k3.build_trimul_tail, k3_params, self.device_index, arch)
+            self._plan_k1 = _substrate_plan_on(k1.build_trimul_proj, k1_params, self.device_index, arch, target)
+            self._plan_k3 = _substrate_plan_on(k3.build_trimul_tail, k3_params, self.device_index, arch, target)
             self._k2 = _compile_contraction(cudnn, self.c, self.batch, self.n_res, self.direction, self.k2_tile, self.device_index)
         self._k2_binding = self._k2.binding
         self._compiled_kernel = (self._plan_k1, self._k2, self._plan_k3)
@@ -694,24 +696,26 @@ _SUBSTRATE_LOCK = threading.Lock()
 _SUBSTRATE_PLANS: Dict[Tuple[Any, int], Any] = {}
 
 
-def _substrate_plan_on(build, params, device_index: int, arch: str = "sm107"):
-    """One cute-compiled launchable of the K1 / K3 substrate per (parameter set, arch body, device).  A CuTe-DSL launchable is bound to the CUDA
+def _substrate_plan_on(build, params, device_index: int, arch: str = "sm107", target: Optional[str] = None):
+    """One cute-compiled launchable of the K1 / K3 substrate per (parameter set, arch body, target, device).  A CuTe-DSL launchable is bound to the CUDA
     context it was first loaded in -- a K1 launchable built on ``cuda:0`` fails on ``cuda:1`` with ``cudaErrorInvalidValue`` at launch, and
     vice versa (measured on a two-GPU host) -- while the substrate's ``build_*`` cache is per parameter set only.  Under the plan's device:
-    when the substrate's cache fills NOW its launchable is bound here and is reused (the single-device case pays nothing extra); when it was
-    filled earlier -- by a plan on another device, or by a caller outside this API -- the same template module gets a second ``cute.compile``
-    for this device, cached per (params, device)."""
+    when this call runs the template module's first compile its launchable is bound here and is reused (the single-device case pays nothing
+    extra); when the module was compiled earlier -- by a plan on another device, or by a caller outside this API, under any spelling of the
+    same target -- it gets a second ``cute.compile`` for this device, cached per (params, device)."""
     from cudnn.gemm.frost import ln_prologue
 
-    key = (params, str(arch), int(device_index))
+    key = (params, str(arch), target, int(device_index))
     with _SUBSTRATE_LOCK:
         hit = _SUBSTRATE_PLANS.get(key)
     if hit is not None:
         return hit
     with torch.cuda.device(device_index), _SUBSTRATE_LOCK:
         before = ln_prologue.build_ln_dual_gemm.cache_info().currsize
-        base = build(params, arch)
-        built_here = ln_prologue.build_ln_dual_gemm.cache_info().currsize > before
+        base = build(params, arch, target)
+        # The builder's cache growing is not enough: its spellings of one module (no target, None, the home target) are separate entries
+        # that share the module's compile().  Bound here only if that compile() missed now, i.e. has never hit.
+        built_here = ln_prologue.build_ln_dual_gemm.cache_info().currsize > before and base.module.compile.cache_info().hits == 0
         plan = base if built_here else ln_prologue.LnDualGemmPlan(params=base.params, module=base.module, launch=base.module.compile.__wrapped__())
         return _SUBSTRATE_PLANS.setdefault(key, plan)
 
