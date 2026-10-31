@@ -636,7 +636,7 @@ All three accept JAX arrays, eagerly or under `jax.jit`, and require no PyTorch.
 `cudnn.jax.block_sparse_attention_forward` and `cudnn.jax.block_sparse_attention_backward`
 have been removed; use the `cudnn.ops` names.
 
-The JAX implementation reuses the SM100 blk128 forward, bucketed CSR, backward preprocess,
+The JAX implementation reuses the SM100/SM103 blk128 forward, bucketed CSR, backward preprocess,
 backward, and gradient conversion kernels. Install `jax[cuda13]` alongside the
 frontend (CuTeDSL >=4.7, JAX >=0.9.1). The runtime imports no PyTorch; torch parity tests are separate.
 
@@ -647,7 +647,7 @@ output buffers. XLA owns the outputs and workspaces.
 
 | Property | Supported |
 | --- | --- |
-| Device | All arrays on one CUDA GPU of exactly compute capability 10.0 (SM100); other GPUs may be visible. Single process |
+| Device | All arrays on one CUDA GPU of compute capability 10.0 or 10.3 (SM100 or SM103); other GPUs may be visible. Under `jax.jit` (including a zero-argument closure that captures every array), or with no committed JAX array among the inputs, the target is read off the visible GPUs, so a host exposing both SM100 and SM103 GPUs is refused there (eager calls on committed arrays are not). Single process |
 | Data | BF16 Q/K/V/O/dO/dQ/dK/dV; FP32 LSE and accumulation |
 | Dimensions | MHA with equal head counts, D=64 or 128; positive sequence lengths divisible by 128 |
 | Layout | Compact BHSD or BSHD, independently specialized |
