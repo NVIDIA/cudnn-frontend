@@ -13,8 +13,8 @@ import torch
 def mhc_api():
     pytest.importorskip("cuda.tile", minversion="1.5.0")
     pytest.importorskip("triton")
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("mHC projection backward requires SM100")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("mHC projection backward requires SM100 or SM103")
     from cudnn import MhcProjectionBackward
 
     return MhcProjectionBackward

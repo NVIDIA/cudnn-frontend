@@ -192,7 +192,7 @@ navigation:
               - page: Grouped GEMM + WGrad (Unified)
                 path: ../../operations/gemm_fusions/grouped_gemm_wgrad.md
                 slug: grouped_gemm_wgrad
-              - page: DSv4.1 mHC Projection/RMS Backward (SM100)
+              - page: DSv4.1 mHC Projection/RMS Backward (SM100/SM103)
                 path: ../../operations/gemm_fusions/mhc_projection_bwd.md
                 slug: mhc_projection_bwd
           - page: Triangle Multiplicative Update

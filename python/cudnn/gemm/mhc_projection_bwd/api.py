@@ -12,6 +12,8 @@ from cudnn.api_base import APIBase, TupleDict
 
 _M, _N, _K, _SPLITS = 4096, 24, 20480, 8
 _WORKSPACE_BYTES = _SPLITS * _N * _K * 4
+# The sm_100 cubins (cuTile partial, Triton reduction) run on both parts of the SM100 family.
+_SUPPORTED_CAPABILITIES = ((10, 0), (10, 3))
 _PORTS = {
     "x": ((_M, _K), (_K, 1), torch.bfloat16),
     "weight": ((_N, _K), (_K, 1), torch.float32),
@@ -83,8 +85,8 @@ class MhcProjectionBackward(APIBase):
             if device is not None and index != device:
                 raise ValueError("mHC projection backward requires all operands on the same device")
             device = index
-        if torch.cuda.get_device_capability(device) != (10, 0):
-            raise NotImplementedError("mHC projection backward currently supports SM100")
+        if torch.cuda.get_device_capability(device) not in _SUPPORTED_CAPABILITIES:
+            raise NotImplementedError("mHC projection backward currently supports SM100 and SM103")
         _dependencies()
         self._device = device
         self._is_supported = True
