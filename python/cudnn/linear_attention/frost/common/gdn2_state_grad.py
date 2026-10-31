@@ -103,8 +103,7 @@ def steep_dk_restore(cfg: cutlass.Constexpr, scratch, u_ptr, channel, token, dec
 def steep_dk_restore_tokens(cfg: cutlass.Constexpr, scratch, u_ptr, channel, tokens, decays, count: cutlass.Constexpr[int]):
     """``steep_dk_restore`` for ``count`` tokens of one channel, reading each FP32 state once.
 
-    Every token's sum keeps the per-token order (state times decay, times U, accumulated over values), so the results are
-    bitwise ``steep_dk_restore``'s; the global state column is read once per channel instead of once per token."""
+    Each token's sum keeps ``steep_dk_restore``'s order, so the results are bitwise equal."""
     totals = cutlass.Array(cutlass.Float32, count, alignment=16)
     for i in cutlass.range_constexpr(count):
         totals[i] = cutlass.Float32(0.0)
@@ -121,11 +120,9 @@ def steep_dk_restore_warp(cfg: cutlass.Constexpr, steep, lane_idx, warp_channel,
     """``steep_dk_restore`` of every token of a warp's steep channels into each owner's ``[BT]`` ``steep_dk``.
 
     Lane ``l`` owns channel ``warp_channel + l``; each token's restore scale is its bounded suffix product. Each pass of
-    ``steep_warp_pass`` computes one token per lane, so an owner does not walk its tokens in series. Called by every lane
-    of the warp."""
+    ``steep_warp_pass`` computes one token per lane. Called by every lane of the warp."""
     pending = cutlass.Int32(nvvm.vote_sync(0xFFFFFFFF, steep != 0, nvvm.VoteSync.BALLOT)).to(cutlass.Uint32)
     if cute.arch.popc(pending) > STEEP_COOP_MAX:
-        # Most lanes are steep: each reads its state column once for all of its tokens.
         if steep != 0:
             tokens = cutlass.Array(cutlass.Int32, cfg.b_t, alignment=16)
             restore = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)

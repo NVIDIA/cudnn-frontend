@@ -1207,8 +1207,6 @@ def compute0_warp_group(
                     exp_g_regs[f32_reg_base + 2] = exp_g_frag[2]
                     exp_g_regs[f32_reg_base + 3] = exp_g_frag[3]
             if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
-                # steep channels: bounded prefix / suffix factors for K decay / Q decay / K inv, and the bounded keys in FP32
-                # for compute group 1's dU (common/gdn2_state_grad.py)
                 inverse_g_regs = cutlass.Array(cutlass.Float32, dk_halves * 8, alignment=16)
                 for dim_half in cutlass.range_constexpr(dk_halves):
                     for j in cutlass.range_constexpr(8):
@@ -1455,8 +1453,6 @@ def compute1_warp_group(
                     has_dstate = cutlass.Boolean(True)
                 if has_dstate:
                     decay_stage = chunk_serial % cfg.smem_decay_stages
-                    # The tile's steep words are visible since the decay-scale wait. A mild tile has no dU correction, so it
-                    # waits for neither the FP32 dstate nor the steep keys.
                     words = sSteepTile_ptr + decay_stage * len(cfg.compute_group_0_warp_ids)
                     steep_tile = steep_tile_mask(cfg, words)
                     if steep_tile != 0:

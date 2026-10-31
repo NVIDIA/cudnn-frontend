@@ -1299,8 +1299,6 @@ def compute1_warp_group(
                     has_dstate = cutlass.Boolean(True)
                 if has_dstate:
                     decay_stage = gc % cfg.smem_decay_stages
-                    # The tile's steep words are visible since the decay-scale wait. A mild tile has no dU correction, so it
-                    # waits for neither the FP32 dstate nor the steep keys.
                     words = sSteepTile_ptr + decay_stage * len(cfg.compute_group_0_warp_ids)
                     steep_tile = steep_tile_mask(cfg, words)
                     if steep_tile != 0:

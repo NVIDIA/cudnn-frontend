@@ -2368,8 +2368,6 @@ def compute1_warp_group(
                     has_dstate = cutlass.Boolean(True)
                 if has_dstate:
                     decay_stage = gc % cfg.smem_decay_stages
-                    # The tile's steep words are visible since the decay-scale wait. A mild tile has no dU correction, so it
-                    # waits for neither the FP32 dstate nor the steep keys.
                     words = sSteepTile_ptr + decay_stage * len(cfg.compute_group_0_warp_ids)
                     steep_tile = steep_tile_mask(cfg, words)
                     if steep_tile != 0:
@@ -2811,9 +2809,7 @@ def compute2_warp_group(
                     value = (sGate_exchange_ptr + f32_seg * (cfg.b_t * 32) + t * 32 + swizzle_xor_128b(t ^ f32_seg, f32_dim, elem_bytes=4)).load()
                     eg[t] = value
                 if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
-                    # A steep channel's decay is its bounded prefix product; its inverse and restore scales are applied
-                    # where they are used, so no per-token arrays stay live across the tile.
-                    for _ in cutlass.range(steep_channel, unroll=1):  # a loop, not an if: see row_operand_scales
+                    for _ in cutlass.range(steep_channel, unroll=1):
                         steep_decay = cutlass.Float32(1.0)
                         for t in cutlass.range_constexpr(cfg.b_t):
                             steep_decay = steep_decay * steep_token_factor(cfg, sGate_exchange_ptr, steep_last_ptr, t, channel)
@@ -2859,7 +2855,7 @@ def compute2_warp_group(
                                 hval0 = (sDstate_raw.data_ptr() + dstate_addr0).load().to(cutlass.Float32)
                                 hval1 = (sDstate_raw.data_ptr() + dstate_addr1).load().to(cutlass.Float32)
                                 if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
-                                    for _ in cutlass.range(steep_channels[cs], unroll=1):  # a loop, not an if: see row_operand_scales
+                                    for _ in cutlass.range(steep_channels[cs], unroll=1):
                                         decay = (sGate_exchange_ptr + exchange_offset(cfg, cfg.b_t - 1, channel_cs)).load()
                                         hval0 = (dstate_scratch + v0 * cfg.d_k + channel_cs).load() * decay
                                         hval1 = (dstate_scratch + (v0 + 1) * cfg.d_k + channel_cs).load() * decay
@@ -2889,7 +2885,7 @@ def compute2_warp_group(
                             hval0 = (sDstate_raw.data_ptr() + dstate_addr0).load().to(cutlass.Float32)
                             hval1 = (sDstate_raw.data_ptr() + dstate_addr1).load().to(cutlass.Float32)
                             if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
-                                for _ in cutlass.range(steep_channel, unroll=1):  # a loop, not an if: see row_operand_scales
+                                for _ in cutlass.range(steep_channel, unroll=1):
                                     decay = (sGate_exchange_ptr + exchange_offset(cfg, cfg.b_t - 1, channel)).load()
                                     hval0 = (dstate_scratch + v0 * cfg.d_k + channel).load() * decay
                                     hval1 = (dstate_scratch + (v0 + 1) * cfg.d_k + channel).load() * decay
@@ -2902,7 +2898,6 @@ def compute2_warp_group(
                 if cutlass.const_expr(cfg.steep_mode != STEEP_EXACT):
                     bars.mb_dstate_smem_cg2_done.arrive()
                 else:
-                    # A mild tile's dK restore reads neither the FP32 dstate nor U: release them now, as the fast kernel does.
                     if steep_any == 0:
                         bars.mb_dstate_smem_cg2_done.arrive()
             bars.mb_state_input_cg2_done[gc % 2].arrive()

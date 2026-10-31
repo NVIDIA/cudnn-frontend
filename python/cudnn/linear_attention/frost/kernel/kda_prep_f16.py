@@ -347,7 +347,7 @@ def compute_warp_group(
             g_prefix_regs[row1] = prefix1
             prefix_acc = prefix1
 
-        # ---- exp2(g): stage prefixes + final-token decay; steep channels keep their token decay factors (common/steep_decay.py) ----
+        # ---- exp2(g): stage prefixes + final-token decay -------------------------
         steep_scan_ptr = sSteepScan.data_ptr()
         steep_last_ptr = sSteepLast.data_ptr()
         encode_gate_exchange(

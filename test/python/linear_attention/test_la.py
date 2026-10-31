@@ -2599,7 +2599,7 @@ def test_steep_fp16_inverse_range_without_normalization(backend, K, variant):
         gates["beta"].zero_()
         gates["w"].fill_(1.0)
     else:
-        gates["beta"].fill_(1.0 / 50.0)  # |k|^2 = 25: I - beta k k^T halves the channel; 1/25 would zero it, and dg with it
+        gates["beta"].fill_(1.0 / 50.0)  # beta |k|^2 = 1/2: at 1, I - beta k k^T projects channel 0 out and its true dg is 0
     case = case.clone(q=q, k=k, v=v, gates=gates)
     assert_fwd_parity(backend, case)
     assert_bwd_parity(backend, case)

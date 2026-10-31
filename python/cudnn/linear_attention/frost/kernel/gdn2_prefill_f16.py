@@ -1237,7 +1237,6 @@ def compute0_warp_group(
             if steep_any == 0:
                 nvvm.fence_proxy("async.shared", space="cta")
                 if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
-                    # Correction rows come from single-lane stores: join every lane's fence before one lane arrives for the warp.
                     nvvm.bar_warp_sync(cute.arch.FULL_MASK)
                 if nvvm.elect_sync():
                     bars.mb_k_decay_inv_cg0_ready[decay_stage].arrive()
@@ -1301,13 +1300,11 @@ def compute0_warp_group(
                 nvvm.barrier_cta_sync(cfg.cg0_group_sync_barrier_base_id + cg0_group_id, thread_count=cfg.cg0_threads_per_group)
                 nvvm.fence_proxy("async.shared", space="cta")
                 if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
-                    # Correction rows come from single-lane stores: join every lane's fence before one lane arrives for the warp.
                     nvvm.bar_warp_sync(cute.arch.FULL_MASK)
                 if nvvm.elect_sync():
                     bars.mb_k_decay_inv_cg0_ready[decay_stage].arrive()
             nvvm.fence_proxy("async.shared", space="cta")
             if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
-                # Correction rows come from single-lane stores: join every lane's fence before one lane arrives for the warp.
                 nvvm.bar_warp_sync(cute.arch.FULL_MASK)
             if nvvm.elect_sync():
                 bars.mb_qk_scale_ready[qk_scale_ready_stage].arrive()
