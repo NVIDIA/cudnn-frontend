@@ -12,7 +12,7 @@ from cudnn.api_base import APIBase, TupleDict
 
 _M, _N, _K, _SPLITS = 4096, 24, 20480, 8
 _WORKSPACE_BYTES = _SPLITS * _N * _K * 4
-# The sm_100 cubins (cuTile partial, Triton reduction) run on both parts of the SM100 family.
+# Both kernels (cuTile partial, Triton reduction) compile for the device's own part of the SM100 family (_compile._binaries).
 _SUPPORTED_CAPABILITIES = ((10, 0), (10, 3))
 _PORTS = {
     "x": ((_M, _K), (_K, 1), torch.bfloat16),

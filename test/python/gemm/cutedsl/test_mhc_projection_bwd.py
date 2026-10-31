@@ -171,6 +171,16 @@ def test_mhc_projection_prepared_graph_and_route(mhc_api, monkeypatch, tmp_path)
 
 
 @pytest.mark.L1
+def test_mhc_projection_reduction_compiles_for_the_device(mhc_api):
+    # Each part compiles its own kernels: an sm_100 cuTile cubin does not load on SM103, and Triton's cubin is architecture-specific.
+    import cudnn.gemm.mhc_projection_bwd._compile as compiler
+
+    major, minor = torch.cuda.get_device_capability()
+    _, reduction = compiler._binaries(torch.cuda.current_device())
+    assert f".target sm_{10 * major + minor}a" in reduction.asm["ptx"]
+
+
+@pytest.mark.L1
 def test_mhc_projection_wrapper(mhc_api):
     from cudnn import mhc_projection_backward
 
