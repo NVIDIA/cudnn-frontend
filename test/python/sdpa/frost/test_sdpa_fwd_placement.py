@@ -101,6 +101,26 @@ def test_trail_only_rows_rank_behind_the_backend():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("entry", [None, "always", "never"])
+def test_a_trail_only_row_leads_where_a_generated_entry_says_so(monkeypatch, entry):
+    """SM80 plans go after the last-resort marker unless a placement_table entry leads the graph; then they lead the backend."""
+    from cudnn.engines.heuristics import LAST_RESORT
+    from cudnn.sdpa import placement_table
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    name = "sdpa_fwd_prefill_sm80"
+    spec = next(s for s in ENGINE_SPECS if s.name == name)
+    facts = _facts(s_q=2048, s_kv=2048, h_q=32, h_kv=8, device_cc=(8, 0), device_sm_count=108)
+    table = {} if entry is None else {placement_table.class_key(name, facts): placement_table.Entry(entry, None, "synthetic")}
+    monkeypatch.setattr(placement_table, "TABLE", table)
+    ours = [PlanConfig(_OFFERED[name], object())]
+    monkeypatch.setattr(heuristics, "recommend", Mock(return_value=ours))
+    plans = heuristics.propose("A", facts, {name: _OFFERED[name]})
+    assert plans == (ours + [BACKEND] if entry == "always" else [BACKEND, LAST_RESORT] + ours)
+    assert placement.place(spec, facts) == (placement.LEAD if entry == "always" else placement.TRAIL)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("kind", ["A", "FALLBACK"])
 @pytest.mark.parametrize("verdict", [placement.LEAD, placement.TRAIL])
 def test_propose_preserves_recommendations_and_places_one_marker(monkeypatch, recommendations, kind, verdict):
@@ -974,9 +994,10 @@ def test_sm100_paged_full_square_leads_inside_its_box():
     for h_q, h_kv in ((8, 8), (16, 8)):
         assert not placement._sm100_paged_full_square(_sm107_paged_facts(**{**base, "h_q": h_q, "h_kv": h_kv}))
     assert place(h_q=8, h_kv=1, b=1, s_q=8192, s_kv=8192) == placement.LEAD
-    assert place(h_q=16, h_kv=4, s_q=512, s_kv=512) == placement.TRAIL
+    # A square is placed as its bottom-right twin, so the packed full-prefill box (Q from 512, cc 10.0 / 10.3) leads it too.
+    assert place(h_q=16, h_kv=4, s_q=512, s_kv=512) == placement.LEAD
+    assert place(h_q=16, h_kv=4, device_cc=(10, 3), device_sm_count=160) == placement.LEAD
     assert place(h_q=8, h_kv=1, b=1, s_q=16384, s_kv=16384) == placement.TRAIL
-    assert place(h_q=16, h_kv=4, device_cc=(10, 3), device_sm_count=160) == placement.TRAIL
 
 
 @pytest.mark.L0
@@ -1035,3 +1056,16 @@ def test_sm100_fp8_decode_shaped_gqa_leads_inside_the_measured_box():
     assert place(s_kv=512) == placement.TRAIL  # below the measured caches
     assert place(dtype=cudnn.data_type.FP8_E5M2) == placement.TRAIL  # E5M2 inputs not measured
     assert place(right_band_widening=True, right_bound=4) == placement.TRAIL  # widened band not measured
+
+
+@pytest.mark.L0
+def test_square_causal_places_the_same_from_either_corner():
+    """A square causal mask covers the same tiles anchored top-left or bottom-right, so both get one verdict."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    place = lambda **over: placement.place(spec, _sm107_paged_facts(**{"device_cc": (10, 0), "device_sm_count": 148, **over}))
+    paged_d512 = dict(h_q=64, h_kv=1, d_qk=512, d_v=512, page_size=64, max_total_seq_len_q=None)
+    for over in (dict(paged_d512, s_q=2048, s_kv=2048), dict(paged_d512, s_q=8192, s_kv=8192), dict(h_q=32, h_kv=2, s_q=4096, s_kv=4096)):
+        assert place(bottom_right=False, **over) == place(bottom_right=True, **over), over
+    assert place(bottom_right=False, s_q=8192, s_kv=8192, **paged_d512) == placement.LEAD

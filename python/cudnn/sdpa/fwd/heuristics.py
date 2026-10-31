@@ -85,6 +85,7 @@ from cudnn.sdpa.fwd.config_sm107 import (
     sm107_bias_auto_cga,
     sm107_pair_item_active,
     sm107_tile_n_pick,
+    supports_native_d64_pack,
 )
 from cudnn.sdpa.fwd.config_sm100 import sm100_bias_auto_cga, sm100_tile_n_pick
 from cudnn.sdpa.fwd.config_sm120 import (
@@ -2245,8 +2246,8 @@ def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int, split_kv: Optiona
     tokens in 60 rows of a 64-row tile).
     THD prefill packs only on a flavor advertising token-unit worklists and
     packed-head Stats stores; the decode tile's ragged-Q leg remains separate.
-    cc 10.7 half packs dense D128 on the shared SM100 bodies (issue #1472) and dense d256
-    on the decode tile (below); its other nonpaged half graphs stay unpacked.
+    cc 10.7 half packs dense D128 on the shared SM100 bodies (issue #1472), unsplit D64 on its
+    native tile (#2053) and dense d256 on the decode tile (below); its other nonpaged half graphs stay unpacked.
     The row's per-flavor wiring (``pack_gqa_d_shapes``) is honoured here as
     ``mismatch()`` honours it: a packed proposal on a flavor the row keeps
     unpacked would only be declined there, and when the base leg is a split the
@@ -2281,10 +2282,18 @@ def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int, split_kv: Optiona
     # The flavor the PACKED leg lands on, as mismatch() selects it: a dense-only small tile (Rubin d32 / d64) walks to d128.
     packed = SdpaFwdKnobs(pack_gqa=True, split_kv=split_kv, cga=cga)
     packed_shape = _selected_d_shape(caps, facts, packed)
+    native_d64 = supports_native_d64_pack(packed_shape, device_cc=facts.device_cc, fp8=not half, paged=facts.has_paged_kv, split_kv=split_kv or 1, cga=cga)
     return (
         True in caps.pack_gqas
         and (caps.pack_gqa_d_shapes is None or packed_shape in caps.pack_gqa_d_shapes)
-        and not (caps.sm_lo == 107 and half and not facts.has_paged_kv and not rubin_decode_tile and not rubin_dense_d128_shared_leg(caps, facts, packed))
+        and not (
+            caps.sm_lo == 107
+            and half
+            and not facts.has_paged_kv
+            and not rubin_decode_tile
+            and not native_d64
+            and not rubin_dense_d128_shared_leg(caps, facts, packed)
+        )
         and not (caps.sm_lo == 107 and half and packed_shape == (256, 256) and not rubin_decode_tile and not rubin_paged_thd_d256)
         and not (facts.thd and not _thd_decode_leg(caps, facts) and (facts.d_qk, facts.d_v) not in caps.thd_pack_gqa_d_shapes)
         and not (facts.has_epilogue_gate and not rubin_decode_tile)
@@ -2389,6 +2398,23 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
             # 103.7; b2 64/8 q64 KV 4k 31.2 vs 31.9 (the packed body's split-4 arm) and b8 64/4 q128 KV 2k 97.2 vs
             # 97.3 at parity.  Packing keeps the lead where no unpacked tile fits (b2 64/8 q256 KV 4k: packed 93.9 vs
             # unpacked 191.2) and under a band (_sm100_banded_gqa_packs below).  The packed set stays listed.
+            wins = False
+        if (
+            wins
+            and facts.window_left is None
+            and supports_native_d64_pack(
+                _selected_d_shape(caps, facts, SdpaFwdKnobs(pack_gqa=True, split_kv=split_kv, cga=cga)),
+                device_cc=facts.device_cc,
+                fp8=facts.is_fp8 or facts.is_mxfp8,
+                paged=facts.has_paged_kv,
+                split_kv=split_kv or 1,
+                cga=cga,
+            )
+            and facts.b * facts.h_q * _ceil_div(facts.s_q, tile_q) <= (facts.device_sm_count or 0)
+        ):
+            # Unsplit native D64 without a window: while the unpacked launch fits one wave, every CTA streams the whole KV once
+            # either way and the packed CTA also computes G heads' rows, so unpacked leads; past one wave, or under a window,
+            # packed does (measured on cc 10.7 across s_q 1-4 and KV 4k-128k with sinks, 2026-10-31; PR #2118).
             wins = False
         if _sm107_fp8_dense_d128(caps, facts):
             # Packed never trails unpacked here at any S_q: unpacked pads every head's last 512-row tile (q576: 1.43-1.75x
@@ -3198,8 +3224,9 @@ def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
 
     if opt_in_engines_enabled():
         return ours + [BACKEND]
-    name_of = {offered[s.name]: s.name for s in ENGINE_SPECS if s.name in offered}
-    last = [p for p in ours if name_of.get(p.engine_id) in TRAIL_ONLY_ROWS]
+    spec_of = {offered[s.name]: s for s in ENGINE_SPECS if s.name in offered}
+    # A trail-only row still leads where a generated placement_table entry says so.
+    last = [p for p in ours if p.engine_id in spec_of and spec_of[p.engine_id].name in TRAIL_ONLY_ROWS and place(spec_of[p.engine_id], facts) != LEAD]
     rest = [p for p in ours if p not in last]
     if not rest:
         return [BACKEND, LAST_RESORT] + last
