@@ -232,6 +232,7 @@ SCALE_PREFOLDED = int(PARAMS.softmax_scale_prefolded)
 # specialization keeps the shifted f32 scores for the exact LSE denominator and so never takes the fused arm.
 _FUSED_SHIFT_CVT = bool(SOFTMAX_F16 and SCALE_PREFOLDED and _softmax_f16.FUSED_SHIFT_CVT_AVAILABLE)
 _PSLOT = os.environ.get("FROST_EXP_PSLOT", "1") == "1"
+_P_ALIAS = CFG.CTA_MMA == 1
 _FP8_TAG_P = _softmax_f16.fp8_pair_tag(CFG.DTYPE_QKV)
 # The arms themselves (f16_exp_chunk / f16_exp_chunk_sum / fused_shift_f16_exp_chunk) live in
 # cudnn.frost.tile_dsl.softmax_f16, shared with the d128 / d256 / d512 quantized siblings; the softmax
@@ -400,8 +401,8 @@ class KernelTmemLayout:
     O0_OFF: int = _O0_OFF_D
     O1_OFF: int = _O1_OFF_D
 
-    P0_OFF: int = _P_SHARED_OFF_D if _PSLOT else 96
-    P1_OFF: int = _P_SHARED_OFF_D if _PSLOT else 224
+    P0_OFF: int = _P_SHARED_OFF_D if (_PSLOT and not _P_ALIAS) else 96
+    P1_OFF: int = _P_SHARED_OFF_D if (_PSLOT and not _P_ALIAS) else 224
 
     SF_Q0_OFF: int = _SF_BASE_D
     SF_K_OFF: int = _SF_BASE_D + SF_TMEM_COLS_Q
@@ -2129,7 +2130,7 @@ def _softmax_kv_body(
         nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
     bars.mb_stat_full[sub_tile_id].arrive()
-    if cutlass.const_expr(_PSLOT):
+    if cutlass.const_expr(_PSLOT and not _P_ALIAS):
         bars.mb_bmm2_done[1 - sub_tile_id].wait(p_free_phase, spin=SPIN_RING_WAITS)
         p_free_phase = p_free_phase ^ 1
 
@@ -2406,7 +2407,7 @@ def _softmax_warp_group(
         # total_sum is the exact fp32 row-sum when stats are requested (has_lse) and
         # the untouched zero vector otherwise -- O's denominator is in the row-sum
         # TMEM columns either way; word 1 feeds the LSE only.
-        if cutlass.const_expr(_PSLOT and CFG.MASK_FLAGS != 0):
+        if cutlass.const_expr(_PSLOT and not _P_ALIAS and CFG.MASK_FLAGS != 0):
             if bounds.right <= bounds.left:
                 p_free_phase = p_free_phase ^ 1
         total_sum_scalar = total_sum[0] + total_sum[1]
