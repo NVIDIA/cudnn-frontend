@@ -1446,19 +1446,14 @@ def test_sm107_ones_tile_stays_inside_the_v0_descriptor_window():
         ("d128-mx", (128, 128), 1, _BF16, False),
         ("d128-mx", (128, 128), 2, _E4M3_OUT, False),
         ("d128-mx", (128, 128), 2, _BF16, False),
+        ("d192-mx", (192, 128), 1, _E4M3_OUT, False),
+        ("d192-mx", (192, 128), 1, _BF16, False),
         ("d192-mx", (192, 128), 2, _E4M3_OUT, False),
         ("d192-mx", (192, 128), 2, _BF16, False),
     ]
     for _id, flavor, cta, dto, pertensor in safe:
         mod = _load(flavor, rubin=True, fp8=True, pertensor=pertensor, dtype_qkv=_E4M3, dtype_o=dto, cta_mma=cta)
         assert mod._ONES_SMEM_OFFSET < 256 * 1024, (_id, cta, dto, mod._ONES_SMEM_OFFSET)
-
-    # d192 MXFP8 x cga1 never reaches the ones guard: its own CTA_MMA raise
-    # fires first (the four SF tiles cross the window before the ones tile
-    # does).  Pin WHICH guard speaks, so a future reordering cannot silently
-    # swap a precise diagnostic for a vaguer one.
-    with _pytest.raises(ValueError, match="CTA_MMA must be 2"):
-        _load((192, 128), rubin=True, fp8=True, pertensor=False, dtype_qkv=_E4M3, dtype_o=_BF16, cta_mma=1)
 
     # The one unsafe combination: d192 x cga1 x half-precision O.
     with _pytest.raises(ValueError, match="version-0 tcgen05 descriptor window"):
@@ -1881,8 +1876,9 @@ def test_sm107_causal_ranking_picks_the_policy_by_gqa_and_wave_count():
     LPT -6.5 / -13 / -7.9 % at S=8K/16K/32K, LPT_L2 within 1 % there; Llama
     d128 H64/8 (GQA) -- LPT_L2 +4.2..+7.6 % at every S.  So: without GQA
     LPT_L2 has nothing to group and is never proposed first; LPT leads while
-    the grid is at most 24 waves of 2-CTA clusters and NATURAL beyond; with
-    GQA the L2-budget rule (LPT_L2) stands.  SM100 keeps its own rule."""
+    the grid is at most eight waves of 2-CTA clusters and NATURAL beyond; with
+    GQA the L2-budget rule (LPT_L2) stands once one KV head's K+V reaches
+    2 MiB, plain LPT under it.  SM100 keeps its own rule."""
     import cudnn
     from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
     from cudnn.sdpa.fwd import heuristics
@@ -1890,13 +1886,13 @@ def test_sm107_causal_ranking_picks_the_policy_by_gqa_and_wave_count():
     fp8 = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_fp8=True, causal=True, b=1)
     rubin = _caps("sdpa_fwd_prefill_sm107_fp8")
     dsv3 = dict(h_q=128, h_kv=128, d_qk=192, d_v=128, **fp8)
-    # 1 x 128 heads x 8 q-clusters / 106 clusters = 9.7 waves -> LPT; 19 waves at S=4K -> LPT; 39 waves at S=8K -> NATURAL.
-    assert heuristics._sched_points(rubin, _f16_facts(s_q=2048, s_kv=2048, **dsv3)) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL]
-    assert heuristics._sched_points(rubin, _f16_facts(s_q=4096, s_kv=4096, **dsv3)) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL]
-    for s in (8192, 16384, 32768):
+    # under the wave bound at S=1K -> LPT; from S=2K on -> NATURAL.
+    assert heuristics._sched_points(rubin, _f16_facts(s_q=1024, s_kv=1024, **dsv3)) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL]
+    for s in (2048, 4096, 8192, 16384, 32768):
         assert heuristics._sched_points(rubin, _f16_facts(s_q=s, s_kv=s, **dsv3)) == [SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2], s
     llama = dict(h_q=64, h_kv=8, d_qk=128, d_v=128, **fp8)
-    for s in (2048, 8192, 32768):
+    assert heuristics._sched_points(rubin, _f16_facts(s_q=2048, s_kv=2048, **llama)) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL]
+    for s in (8192, 32768):
         assert heuristics._sched_points(rubin, _f16_facts(s_q=s, s_kv=s, **llama)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL], s
     # The SM100 row is untouched by the Rubin rule: the L2-budget primary stays.
     sm100 = _caps("sdpa_fwd_prefill_sm100_fp8")
