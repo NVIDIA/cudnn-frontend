@@ -190,6 +190,7 @@ class GemmRecipe:
     shared_layout: tuple
     seeds: tuple
     matrix_views: tuple = ()
+    operand_reshapes: tuple = ()
 
     @property
     def a(self) -> Operand:
@@ -201,6 +202,9 @@ class GemmRecipe:
 
     def operand_shape(self, index, shape):
         """Project a caller shape using this recipe's prepared batch axes."""
+        for slot, view in self.operand_reshapes:
+            if slot == index:
+                return view.check_shape(shape)
         for slot, prefix in self.matrix_views:
             if slot == index:
                 return _batch_shape(shape, prefix)
@@ -212,10 +216,31 @@ class GemmRecipe:
         Workspace sizing can omit write-layout validation; launch and diagnostic
         paths validate every output before any kernel or seed write.
         """
-        if not self.matrix_views:
+        if not self.matrix_views and not self.operand_reshapes:
             return operands
-        views = list(operands)
-        outputs = {o.index for o in self.outputs} if check_outputs else ()
+        views = operands
+        for index, view in self.operand_reshapes:
+            value = views[index]
+            source_shape, source_stride = tuple(value.shape), tuple(value.stride())
+            shape, stride = view.layout(source_shape, source_stride)
+            if source_shape == shape and source_stride == stride:
+                continue
+            if hasattr(value, "metadata_view"):
+                value = value.metadata_view(shape, stride)
+            elif isinstance(value, DeviceView):
+                if not is_contiguous(shape, stride):
+                    raise ValueError("strided reshape/transpose execution requires a tensor or native variant pack")
+                value = value.reshape(shape)
+            elif hasattr(value, "as_strided"):
+                # Every intermediate index map was proved; inherit storage_offset
+                # and ownership, with one final view and no materializing reshape.
+                value = value.as_strided(shape, stride)
+            else:
+                raise ValueError("operand views require a tensor, DeviceView or native variant pack")
+            if views is operands:
+                views = list(operands)
+            views[index] = value
+        outputs = {o.index for o in self.outputs} if self.matrix_views and check_outputs else ()
         for index, prefix in self.matrix_views:
             value = views[index]
             shape = _batch_shape(value.shape, prefix)
@@ -223,11 +248,14 @@ class GemmRecipe:
             if tuple(value.shape) == shape:
                 continue  # identity view preserves singleton pitches too
             if hasattr(value, "flatten_batch"):
-                views[index] = value.flatten_batch()  # native strided metadata
+                value = value.flatten_batch()  # native strided metadata
             elif isinstance(value, DeviceView):
-                views[index] = value.reshape(shape)  # contiguous by contract
+                value = value.reshape(shape)  # contiguous by contract
             else:
-                views[index] = value.view(shape)  # Torch view cannot copy
+                value = value.view(shape)  # Torch view cannot copy
+            if views is operands:
+                views = list(operands)
+            views[index] = value
         return views
 
     def problem(self, operands, graph_order=None) -> tuple:
@@ -468,12 +496,15 @@ def _operand(
     transposed=False,
     graph_order=False,
     matrix_batch=None,
+    operand_view=None,
 ) -> Operand:
     """Prepare one operand contract in the kernel ABI and original caller axes."""
     declared = _DECLARED_AXES["b" if (is_b if declared_is_b is None else declared_is_b) else "a"]
     if transposed:
         declared = (declared[0], declared[2], declared[1])
     layout = _declared_layout(tensor)
+    if operand_view is not None:
+        layout = operand_view.layout(*layout)
     if matrix_batch is not None:
         layout = fold_batch_layout(*layout)
     contiguous = AX_K if major == "k" else AX_MN
@@ -507,6 +538,7 @@ def build(compiled) -> GemmRecipe:
         order.setdefault(id(t), i)
 
     matrix_batches = {id(t): prefix for t, prefix in binding.matrix_batches}
+    operand_views = {id(t): view for t, view in binding.operand_views}
     inputs = [
         _operand(
             order[id(t)],
@@ -520,6 +552,7 @@ def build(compiled) -> GemmRecipe:
             transposed=bool(binding.a_transposed and binding.a_transposed[i]),
             graph_order=bool(binding.a_transposed),
             matrix_batch=matrix_batches.get(id(t)),
+            operand_view=operand_views.get(id(t)),
         )
         for i, t in enumerate(binding.a_operands)
     ] + [
@@ -535,6 +568,7 @@ def build(compiled) -> GemmRecipe:
             transposed=bool(binding.b_transposed and binding.b_transposed[i]),
             graph_order=bool(binding.b_transposed),
             matrix_batch=matrix_batches.get(id(t)),
+            operand_view=operand_views.get(id(t)),
         )
         for i, t in enumerate(binding.b_operands)
     ]
@@ -613,5 +647,6 @@ def build(compiled) -> GemmRecipe:
         stride_ins=stride_ins,
         shared_layout=shared_layout,
         seeds=tuple(seeds),
-        matrix_views=tuple((order[tid], prefix) for tid, prefix in matrix_batches.items() if tid in order),
+        matrix_views=tuple((order[tid], prefix) for tid, prefix in matrix_batches.items() if tid in order and tid not in operand_views),
+        operand_reshapes=tuple((order[tid], view.folded() if tid in matrix_batches else view) for tid, view in operand_views.items() if tid in order),
     )
