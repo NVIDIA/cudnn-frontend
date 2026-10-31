@@ -17,7 +17,7 @@ hand-written rules in ``sdpa/fwd/placement.py`` / ``sdpa/bwd/heuristics.py`` dec
 from __future__ import annotations
 
 import math
-from typing import Dict, NamedTuple, Optional, Tuple
+from typing import Dict, FrozenSet, NamedTuple, Optional, Tuple
 
 import cudnn
 
@@ -136,15 +136,51 @@ FEATURES = {"cost": log2_work, "tiles": log2_tiles, "rows": log2_q_rows, "kv": l
 """The scalars a class may be thresholded on; the generator picks, per class, the one its data is monotone in."""
 
 
-def lookup(row: str, facts) -> Optional[bool]:
-    key = class_key(row, facts)
-    entry = TABLE.get(key) if key is not None else None
-    if entry is None:
-        return None
+PART_TRANSFERS: Dict[Tuple[int, int], Tuple[Tuple[int, int], FrozenSet[str]]] = {
+    # study sm103_transfer_20261031 (B300 SXM6 1100 W, cuDNN 9.29.0.17): a cost-stratified sample of each listed study's frozen
+    # cc 10.0 grid (201 cases) plus 56 off-lattice holdout cases, timed on cc 10.3 and scored through the full placement:
+    # regret 1.000-1.025 per family (holdout 1.000) against develop's 1.035-2.98; of 115 changed routes one is slower than
+    # develop (1.11x, the 32-tile d256 boundary the cc 10.0 grid also measured as mixed). Only these studies answer for
+    # cc 10.3 -- a new cc 10.0 study does not, until a transfer check names it here.
+    (10, 3): (
+        (10, 0),
+        frozenset(
+            {
+                "sm100_d256_decode_v3_20261028",
+                "sm100_d576_decode_v2_20261028",
+                "sm100_d512_paged_decode_b100_20261030",
+                "sm100_d512_paged_context_20261030",
+                "sm100_d256_paged_context_20261030",
+                "sm100_d576_dense_decode_20261030",
+            }
+        ),
+    ),
+}
+"""A part with no study of its own may borrow a measured part's entries, study by study, once a transfer check timed that
+study's classes on it."""
+
+
+def _answer(entry: Entry, facts) -> bool:
     if entry.direction in ("always", "never"):
         return entry.direction == "always"
     w = FEATURES[entry.feature](facts)
     return w >= entry.log2_work if entry.direction == "ge" else w <= entry.log2_work
+
+
+def lookup(row: str, facts) -> Optional[bool]:
+    key = class_key(row, facts)
+    if key is None:
+        return None
+    entry = TABLE.get(key)
+    if entry is not None:
+        return _answer(entry, facts)
+    if key[1] not in PART_TRANSFERS:
+        return None
+    base, studies = PART_TRANSFERS[key[1]]
+    entry = TABLE.get(key[:1] + (base,) + key[2:])
+    if entry is None or entry.study not in studies:
+        return None
+    return _answer(entry, facts)
 
 
 # ---------------------------------------------------------------------------------------------------------------- generated
