@@ -45,6 +45,7 @@ the write-through in the right halves with every other byte untouched, two launc
 """
 
 import contextlib
+import dataclasses
 import math
 import os
 import sys
@@ -101,9 +102,10 @@ if requirement_error:
 pytestmark = pytest.mark.L0
 
 requires_rubin = pytest.mark.requires_rubin  # the suite's registered marker (conftest.py): skipped off SM107
-requires_blackwell = pytest.mark.requires_blackwell  # the registered marker: an admitted Blackwell-line part of DENSE_SERVING_CCS (cc 10.0)
+requires_blackwell = pytest.mark.requires_blackwell  # the registered marker: an admitted Blackwell-line part of DENSE_SERVING_CCS (cc 10.0, cc 10.3)
 requires_dense_part = pytest.mark.requires_dense_part  # the registered marker: EVERY served part of DENSE_SERVING_CCS (cc 10.7 and cc 10.0)
 _SM100 = (10, 0)
+_SM103 = (10, 3)  # the second SM100-line part (2026-10-31): the same kernels, the same route rule
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -545,12 +547,13 @@ def test_the_sm100_route_table_is_the_adapters_rule(group, policy, monkeypatch):
             tu.pack_gqa,
             tu.kv_streams,
         ) == want and tu.policy == DECODE_ROUTE_TOKEN_UNITS, "both policies coincide on the line"
-        # an UNSERVED part (cc 10.3 until its cells admit it; an sm80 host) reads the Rubin table, the home reading, and says so
-        # (``device_cc`` None) -- the same reading the envelope's routes / route() and the declaration take there; the Rubin reading is the
-        # Rubin table under its own part
-        for other in ((10, 3), (8, 0)):
-            unserved = decode_route(geom, s_q, policy=policy, device_cc=other)
-            assert unserved == decode_route(geom, s_q, policy=policy) and unserved.device_cc is None, (other, s_q, unserved)
+        # cc 10.3 reads the SM100 line's rule cell for cell under its own part; an UNSERVED part (an sm80 host) reads the Rubin table, the
+        # home reading, and says so (``device_cc`` None) -- the same reading the envelope's routes / route() and the declaration take
+        # there; the Rubin reading is the Rubin table under its own part
+        sib = decode_route(geom, s_q, policy=policy, device_cc=_SM103)
+        assert sib == dataclasses.replace(r, device_cc=_SM103), (s_q, sib, r)
+        unserved = decode_route(geom, s_q, policy=policy, device_cc=(8, 0))
+        assert unserved == decode_route(geom, s_q, policy=policy) and unserved.device_cc is None, (s_q, unserved)
         rubin = decode_route(geom, s_q, policy=policy, device_cc=_SM107)
         assert rubin == decode_route(geom, s_q, policy=policy) and rubin.device_cc == _SM107
     if group == 6:
@@ -810,21 +813,19 @@ def test_the_envelope_requires_the_rubin_dsl_target(monkeypatch, version, has_ta
 
 @pytest.mark.parametrize(
     ("cc", "match"),
-    [((8, 0), "found SM80"), ((10, 3), "found SM103"), ((12, 0), "found SM120"), (None, "no CUDA device")],
-    ids=["sm80", "sm103", "sm120", "none"],
+    [((8, 0), "found SM80"), ((12, 0), "found SM120"), (None, "no CUDA device")],
+    ids=["sm80", "sm120", "none"],
 )
 def test_the_envelope_declines_every_other_part_without_raising(cc, match):
-    """Every part off ``DENSE_SERVING_CCS`` -- cc 10.3 among them: the same SM100 kernels, unproven through the block, declined BY NAME
-    until its cells run -- reads not served with the part statement on both forms; the routes stay listed (geometry facts)."""
+    """Every part off ``DENSE_SERVING_CCS`` reads not served with the part statement on both forms; the routes stay listed (geometry
+    facts)."""
     geom, _ = _geom(16)
     env = GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, "cpu" if cc is None else _DEV, device_cc=cc)
     assert not env.decode.served and not env.extend.served and env.forms == () and match in env.decode.reason and match in env.extend.reason
-    assert "served on cc 10.7 (Rubin, SM107: every form) and cc 10.0" in env.decode.reason and env.decode.reason == env.extend.reason
-    if cc == (10, 3):
-        assert "cc 10.3 runs the same SM100 kernels but is unproven through the block: declined by name" in env.decode.reason
+    assert "served on cc 10.7 (Rubin, SM107: every form) and cc 10.0 / 10.3" in env.decode.reason and env.decode.reason == env.extend.reason
     assert env.decode.routes  # the routes are geometry facts, listed either way
     assert env.decode.pdl_default is False  # the PDL default is the measured part's
-    assert cc not in DENSE_SERVING_CCS and DENSE_SERVING_CCS == (_SM107, _SM100)
+    assert cc not in DENSE_SERVING_CCS and DENSE_SERVING_CCS == (_SM107, _SM100, _SM103)
     # (2026-10-29, L5) an UNSERVED part reads the Rubin table on every reading -- the envelope's routes / route() and
     # decode_route(device_cc=) agree (one rule, _route_part) and both say which table they show (route_cc / device_cc None = the Rubin
     # table, the home reading)
@@ -2923,7 +2924,7 @@ def _sm100_pin(case, want):
     """The compiled kernel against the declared SM100 route: the SM100 decode tile (its file, the width, the packing) or the shared
     paged prefill tile with the group packed; no gate epilogue anywhere, the gate its own launch; block 0 untouched."""
     r, rb = case.blk.decode_route, case.route_readback()
-    assert (r.tile, r.n_q, r.token_units, r.pack_gqa, r.kv_streams) == want and r.device_cc == _SM100 and not r.claimed, (r, want)
+    assert (r.tile, r.n_q, r.token_units, r.pack_gqa, r.kv_streams) == want and r.device_cc == _cc() and not r.claimed, (r, want)
     assert rb["template"] == r.tile and rb["adapter_split"] == case.blk.decode_split_kv and (rb["adapter_pack"] is True) == r.pack_gqa, (rb, r)
     assert not case.blk.gate_fused and isinstance(case.blk._gate, _SigmoidGate) and not case.blk._sdpa.fuse_gate
     if r.decode_tile:
@@ -3028,11 +3029,11 @@ def test_sm100_declines_the_rubin_only_knobs_by_name():
     gated, _ = _make_block(16, 4, 1, fuse_gate=True)
     with pytest.raises(NotImplementedError, match="fuse_gate=True is not served by the f16/bf16 SM100 SDPA engine row") as e:
         gated.check_support()
-    assert "cc 10.0" in str(e.value) and "fuse_gate=False" in str(e.value)
+    assert f"cc {_cc()[0]}.{_cc()[1]}" in str(e.value) and "fuse_gate=False" in str(e.value)
     for kw in (dict(fuse_norm_rope=True, fuse_norm_rope_small_m=True), dict(fuse_norm_rope=True, fuse_cache_write=True)):
         fork, _ = _make_block(16, 4, 1, **kw)
         assert fork.fuse_norm_rope_effective and fork._norm_rope is None
-        with pytest.raises(NotImplementedError, match=r"rendered for sm_107a \(Rubin\); this device is SM100"):
+        with pytest.raises(NotImplementedError, match=rf"rendered for sm_107a \(Rubin\); this device is SM{_cc()[0]}{_cc()[1]}"):
             fork.check_support()
     with pytest.raises(NotImplementedError, match="decode_q_tile_max=32 caps the Rubin"):
         _make_block(16, 4, 1, decode_q_tile_max=32)
@@ -3040,17 +3041,17 @@ def test_sm100_declines_the_rubin_only_knobs_by_name():
         _make_block(6, 4, 17)
     with pytest.raises(NotImplementedError, match="the 32-column SM100 decode arm: its cc 10.0 accept cells have not run"):
         _make_block(6, 32, 3, max_kv_len=4096, n_pages=256)  # the adapter's 32-column arm at a wide launch: declined by name on the part
-    assert _cc() == _SM100 and GatedAttentionBlockFwd.serving_envelope(_geom(16)[0], torch.bfloat16, _DEV).forms == ("extend", "decode")
-    # the FP8-projection + bf16-attention mode ON the part: served iff the tuple holds cc 10.0 (its cells below run then), else the part
+    assert _cc() in (_SM100, _SM103) and GatedAttentionBlockFwd.serving_envelope(_geom(16)[0], torch.bfloat16, _DEV).forms == ("extend", "decode")
+    # the FP8-projection + bf16-attention mode ON the part: served iff the tuple holds this part (its cells below run then), else the part
     # statement at check_support and no spelling in the envelope's quant_modes
     mode = _mode_declaration(16, 4, 1)
     env = GatedAttentionBlockFwd.serving_envelope(_geom(16)[0], torch.float8_e4m3fn, _DEV, quant=mode.quant)
-    if _SM100 in FP8_PROJ_BF16_ATTENTION_CCS:
+    if _cc() in FP8_PROJ_BF16_ATTENTION_CCS:
         mode._check_declaration()
         mode._check_part_support()
         assert env.forms == ("extend", "decode") and env.decode.quant_modes == (QUANT_MODE_FP8_PROJ_BF16_ATTENTION,)
     else:
-        with pytest.raises(NotImplementedError, match=r"QuantSpec\(attention_dtype=torch.bfloat16\) on cc 10.0") as e:
+        with pytest.raises(NotImplementedError, match=rf"QuantSpec\(attention_dtype=torch.bfloat16\) on cc {_cc()[0]}\.{_cc()[1]}") as e:
             mode.check_support()
         assert "FP8_PROJ_BF16_ATTENTION_CCS" in str(e.value) and env.forms == () and env.decode.quant_modes == () and env.decode.reason == str(e.value)
 
@@ -3475,10 +3476,12 @@ def test_fp8_proj_bf16_attention_l1_l2_l3_pools_are_bitwise_at_every_page_size(p
 # ladder pinned at decode_split_kv=4 (the decode tile + its combine on every part: the chain the docs describe; the split count sizes the grid,
 # never the kernel list) -- by (fuse_cache_write_small_m, fuse_gate).  The census cell below is the detector (EVERY kernel the profiler sees is
 # counted, a GEMM's split-K reduce included) and the docs quote these numbers; a tree that changes a stage's kernel count changes this table
-# and the prose with it.  cc 10.0 serves the gate as its own launch only (fuse_gate=True is the part's typed decline): the two write-through arms.
+# and the prose with it.  cc 10.0 and cc 10.3 serve the gate as its own launch only (fuse_gate=True is the parts' typed decline): the two
+# write-through arms.
 _MODE_DECODE_LAUNCHES = {
     _SM107: {(False, True): 7, (True, True): 6, (False, False): 8, (True, False): 7},
     _SM100: {(False, False): 8, (True, False): 7},
+    _SM103: {(False, False): 8, (True, False): 7},
 }
 
 

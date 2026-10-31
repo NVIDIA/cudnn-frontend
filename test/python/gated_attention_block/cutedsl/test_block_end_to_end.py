@@ -683,14 +683,14 @@ def test_on_cc_10_0_the_dense_form_declines_the_rubin_only_knobs_by_name():
     that would compile; the plain dense inference block passes the part rows (the oracle cells above run it)."""
     fork, _, _ = _make_block(geom_kw=_COMMON, fuse_norm_rope=True)
     assert fork.fuse_norm_rope_effective and fork._norm_rope is None
-    with pytest.raises(NotImplementedError, match=r"rendered for sm_107a \(Rubin\); this device is SM100"):
+    with pytest.raises(NotImplementedError, match=rf"rendered for sm_107a \(Rubin\); this device is SM{_cc()[0]}{_cc()[1]}"):
         fork.check_support()
     gated, _, _ = _make_block(geom_kw=_COMMON, fuse_gate=True)
     with pytest.raises(NotImplementedError, match="fuse_gate=True is not served by the f16/bf16 SM100 SDPA engine row") as e:
         gated.check_support()
-    assert "cc 10.0" in str(e.value) and "fuse_gate=False" in str(e.value)
+    assert f"cc {_cc()[0]}.{_cc()[1]}" in str(e.value) and "fuse_gate=False" in str(e.value)
     train, _, _ = _make_block(geom_kw=_COMMON, save_for_backward=True)
-    with pytest.raises(NotImplementedError, match=r"save_for_backward=True on cc 10\.0") as e:
+    with pytest.raises(NotImplementedError, match=rf"save_for_backward=True on cc {_cc()[0]}\.{_cc()[1]}") as e:
         train.check_support()
     assert "SdpaBwdDslSm107" in str(e.value)
     plain, _, _ = _make_block(geom_kw=_COMMON)
