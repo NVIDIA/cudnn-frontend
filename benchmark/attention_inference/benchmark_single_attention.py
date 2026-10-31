@@ -45,6 +45,11 @@ from typing import Optional, Tuple
 
 import torch
 
+try:
+    from .config_types import attn_mask
+except ImportError:  # run as a script
+    from config_types import attn_mask
+
 # GPU-name substring -> peak DRAM bandwidth in GB/s, for % SOL reporting.
 # Override with CUDNN_BENCH_PEAK_BW_GBPS.
 PEAK_BW_GBPS = {
@@ -280,7 +285,8 @@ def setup_cudnn(args, dtype, oss=False, auto=False):
             sdpa_kwargs["diagonal_band_right_bound"] = 0
             # Chunked prefill (s_q < s_kv): the new chunk sits at the end of
             # the sequence, so the causal diagonal anchors bottom-right.
-            sdpa_kwargs["diagonal_alignment"] = cudnn.diagonal_alignment.TOP_LEFT if sq == skv else cudnn.diagonal_alignment.BOTTOM_RIGHT
+            top_left = attn_mask(args.phase, True, sq, skv, args.sliding_window_size) == "top_left"
+            sdpa_kwargs["diagonal_alignment"] = cudnn.diagonal_alignment.TOP_LEFT if top_left else cudnn.diagonal_alignment.BOTTOM_RIGHT
         if args.sliding_window_size:
             sdpa_kwargs["diagonal_band_left_bound"] = args.sliding_window_size
     else:
