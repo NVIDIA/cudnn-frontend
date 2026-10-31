@@ -144,8 +144,8 @@ def test_standalone_split_requires_caller_workspace_without_allocating(native, m
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100, sdpa_fwd_wrapper_dsl_sm100
     from cuda.bindings import driver
 
-    if torch.cuda.get_device_capability() != (10, 0) or not _dsl_installed():
-        pytest.skip("native split decode requires SM100 and CuTe DSL")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)) or not _dsl_installed():
+        pytest.skip("native split decode requires SM100 or SM103 and CuTe DSL")
     torch.manual_seed(19)
     q = torch.randn(2, 1, 8, 64, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
     k = torch.randn(2, 128, 2, 64, device="cuda", dtype=q.dtype).transpose(1, 2)
