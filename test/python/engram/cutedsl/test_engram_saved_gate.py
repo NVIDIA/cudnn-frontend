@@ -12,8 +12,10 @@ pytestmark = pytest.mark.L1
 
 @pytest.fixture(autouse=True)
 def supported():
-    if cutedsl_too_old(cutedsl_state()[1]) or torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("requires SM100 and CuTe DSL >=4.7.0")
+    from cudnn.frost.device import PORTABLE_ELEMENTWISE_CCS
+
+    if cutedsl_too_old(cutedsl_state()[1]) or torch.cuda.get_device_capability() not in PORTABLE_ELEMENTWISE_CCS:
+        pytest.skip(f"requires cc {PORTABLE_ELEMENTWISE_CCS} and CuTe DSL >=4.7.0")
     pytest.importorskip("triton", minversion="3.7.0")
 
 

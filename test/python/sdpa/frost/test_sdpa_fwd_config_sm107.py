@@ -272,7 +272,10 @@ def test_sparse_accepts_the_padding_and_stats_fields():
         (dict(lpt_head_group=2), "other kernels' specializations"),
         (dict(sched_policy=1), "sched_policy must be NATURAL"),
         (dict(paged_kv=True, page_size=6, seq_kv_lens_present=True), "multiple of 4"),
-        (dict(thd_varlen=True, paged_kv=True, page_size=16, seq_kv_lens_present=True), "THD x paged is not served"),  # both arms wired, never together
+        (
+            dict(thd_varlen=True, paged_kv=True, page_size=16, seq_kv_lens_present=True),
+            "THD x paged is not served",
+        ),  # the TOP-LEFT composition: no serving meaning (the triple with bottom_right builds -- the GREEN cell below)
         (dict(seq_q_lens_present=True), "SEQ_Q_LENS_PRESENT requires SEQ_KV_LENS_PRESENT"),
         (dict(qsa_block_topk=2), "multiple of 4 in"),
         (dict(qsa_block_topk=516), "multiple of 4 in"),
@@ -405,15 +408,46 @@ def test_sparse_accepts_the_decode_form_arms(split):
         (dict(split_kv=2, thd_varlen=True), "split_kv > 1 under THD"),
         (dict(qsa_list_per_sequence=True, bottom_right=True, thd_varlen=True), "list_per_sequence under THD"),
         (dict(qsa_list_per_sequence=True), "list_per_sequence requires BOTTOM_RIGHT"),
-        (dict(bottom_right=True, thd_varlen=True), "bottom_right under THD"),
+        (dict(bottom_right=True, thd_varlen=True), "bottom_right under THD"),  # on the DENSE packed form; over PAGED pools the triple builds (below)
     ],
 )
 def test_sparse_decode_form_arms_refuse_their_unserved_compositions(over, pattern):
     """The decode form's arms against each other at the factory (the adapter declines each by name first; this is the backstop):
-    a split past the item's tile count, the kernel's own gate under a split (the gate rides the combine), any of the three under
-    THD, the shared list without the bottom-right anchor."""
+    a split past the item's tile count, the kernel's own gate under a split (the gate rides the combine), the split and the shared list
+    under THD, bottom_right under THD on the DENSE packed form, the shared list without the bottom-right anchor."""
     with pytest.raises(ValueError, match=pattern):
         make_cfg_d256_sparse(_sparse(**over))
+
+
+@pytest.mark.parametrize("gate", [False, True], ids=["ungated", "gated"])
+@pytest.mark.parametrize("page_size", [16, 32, 64, 128])
+def test_sparse_thd_paged_bottom_right_composition_builds(gate, page_size):
+    """THD x PAGED x BOTTOM_RIGHT (2026-10-30, the record's ``thd_paged_kv``): the packed EXTEND form over the pools -- the two pair
+    predicates admit exactly the TRIPLE (THD x paged on the top-left diagonal and bottom_right under THD on the dense packed form stay
+    refused above): the factory builds it, gated and ungated, with the per-sequence KV lengths forced, no split and no shared list, and
+    changes no other field of the record; the validator passes it, and turns RED again when either composing arm is dropped from the
+    built record."""
+    over = dict(thd_varlen=True, paged_kv=True, page_size=page_size, bottom_right=True, epilogue_gate=gate)
+    cfg, _ = make_cfg_d256_sparse(_sparse(**over))
+    assert (cfg.THD_VARLEN, cfg.PAGED_KV, cfg.PAGE_SIZE, cfg.BOTTOM_RIGHT, cfg.SEQ_KV_LENS_PRESENT, cfg.SPLIT_KV, cfg.LIST_PER_SEQUENCE, cfg.EPILOGUE_GATE) == (
+        1,
+        1,
+        page_size,
+        1,
+        1,
+        1,
+        0,
+        int(gate),
+    )
+    dense, _ = make_cfg_d256_sparse(_sparse(epilogue_gate=gate))
+    assert (
+        dataclasses.replace(cfg, THD_VARLEN=0, PAGED_KV=0, PAGE_SIZE=0, BOTTOM_RIGHT=0, SEQ_KV_LENS_PRESENT=0) == dense
+    ), "the composition changes no other field"
+    _validate_cfg_d256_sparse(cfg)
+    with pytest.raises(ValueError, match="THD x paged is not served"):
+        _validate_cfg_d256_sparse(dataclasses.replace(cfg, BOTTOM_RIGHT=0))
+    with pytest.raises(ValueError, match="bottom_right under THD is not served"):
+        _validate_cfg_d256_sparse(dataclasses.replace(cfg, PAGED_KV=0, PAGE_SIZE=0))
 
 
 # ---------------------------------------------------------------------------- the validator, predicate by predicate (RED on a replaced field)
@@ -500,7 +534,10 @@ _RED_ROWS = [
     (dict(LIST_PER_SEQUENCE=1), "list_per_sequence requires BOTTOM_RIGHT"),
     (dict(BOTTOM_RIGHT=1, THD_VARLEN=1, SEQ_KV_LENS_PRESENT=1), "bottom_right under THD is not served"),
     (dict(THD_VARLEN=1), "force SEQ_KV_LENS_PRESENT=1"),
-    (dict(THD_VARLEN=1, PAGED_KV=1, PAGE_SIZE=16, SEQ_KV_LENS_PRESENT=1), "THD x paged is not served"),  # both wired arms, never in one record
+    (
+        dict(THD_VARLEN=1, PAGED_KV=1, PAGE_SIZE=16, SEQ_KV_LENS_PRESENT=1),
+        "THD x paged is not served",
+    ),  # the TOP-LEFT composition; with BOTTOM_RIGHT=1 the record is the served triple
     (dict(SEQ_Q_LENS_PRESENT=1), "SEQ_Q_LENS_PRESENT requires SEQ_KV_LENS_PRESENT"),
     (dict(SCHEDULER_POLICY=1), "NATURAL in v1"),
 ]
@@ -618,7 +655,7 @@ def test_index_list_fields_are_appended_with_inert_defaults():
     index_list = ["qsa_block_topk", "qsa_block_size", "qsa_include_open_block", "qsa_list_per_sequence", "qsa_softmax_groups"]
     start = names.index("qsa_block_topk")
     assert names[start : start + 5] == index_list, "append-only: the four index-list fields + the softmax-split knob stay contiguous, in landing order"
-    # ... and the only fields after them are the small-tile / resident-bias fields that landed next, in their order.
+    # Later tuning and storage fields remain appended in their landing order.
     assert names[start + 5 :] == [
         "bias_mode",
         "kv_mask_form",
@@ -631,11 +668,13 @@ def test_index_list_fields_are_appended_with_inert_defaults():
         "softmax_wgs",
         "s_slots",
         "q_in_tmem",
+        "dtype_kv",
     ], names[start:]
     assert TemplateParams() == TemplateParams(
         qsa_block_topk=0, qsa_block_size=0, qsa_include_open_block=True, qsa_list_per_sequence=False, qsa_softmax_groups=0
     )
     d = TemplateParams()
+    assert d.dtype_kv == -1  # Inherit the Q dtype unless mixed KV is requested.
     assert (d.qsa_block_topk, d.qsa_block_size, d.qsa_include_open_block, d.qsa_list_per_sequence, d.qsa_softmax_groups) == (0, 0, True, False, 0)
 
 
@@ -754,3 +793,55 @@ def test_sparse_factory_signature_is_append_only():
     assert params[0].name == "params" and params[0].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
     assert params[1].name == "gather_warps" and params[1].kind is inspect.Parameter.KEYWORD_ONLY and params[1].default == 8
     assert params[2].name == "softmax_groups" and params[2].kind is inspect.Parameter.KEYWORD_ONLY and params[2].default == 0, "appended after gather_warps"
+
+
+@pytest.mark.parametrize("s_kv", [129, 192, 257, 2048])
+@pytest.mark.parametrize("dtype_name", ["FP8_E4M3", "FP8_E5M2"])
+def test_fp8_d64_narrow_tile_keeps_graph_defaults(s_kv, dtype_name, monkeypatch):
+    """An explicit D64 width must not opt FP8 into the half-precision tail policy."""
+    import cudnn
+    from cudnn.frost import buffers
+    from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
+    from cudnn.sdpa.fwd import engines, heuristics
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    name = "sdpa_fwd_prefill_sm107_fp8"
+    facts = SdpaGraphFacts(
+        b=1,
+        h_q=4,
+        h_kv=4,
+        s_q=128,
+        s_kv=s_kv,
+        d_qk=64,
+        d_v=64,
+        dtype=getattr(cudnn.data_type, dtype_name),
+        dtype_o=cudnn.data_type.BFLOAT16,
+        is_fp8=True,
+        causal=True,
+        device_cc=(10, 7),
+        device_sm_count=216,
+    )
+    caps = next(spec.capabilities for spec in engines.ENGINE_SPECS if spec.name == name)
+    narrow = engines.SdpaFwdKnobs(tile_m=128, tile_n=64, cga=1, split_kv=1, sched_policy=0, pack_gqa=False)
+    assert engines.mismatch(caps, facts, narrow) is None
+    for kind in ("A", "FALLBACK"):
+        plans = heuristics.recommend(kind, facts, {name: 1})
+        assert plans, kind
+        assert all(plan.knobs.tile_n == 128 for plan in plans), (kind, plans)
+
+
+@pytest.mark.parametrize("dtype", [0, 1])
+@pytest.mark.parametrize("cga", [1, 2])
+def test_fp8_narrow_tile_stays_within_per_tensor_d64(dtype, cga):
+    """The block-scaled and wider kernels retain their 128-column requirement."""
+    params = TemplateParams(dtype_qkv=dtype, dtype_o=BF16, cta_mma=cga, tile_n=64)
+    cfg, _ = c107.make_cfg_d64(params)
+    assert cfg.TILE_N == 64
+    for factory in (
+        c107.make_cfg_d128,
+        c107.make_cfg_d192,
+        c107.make_cfg_d128_mxfp8,
+        c107.make_cfg_d192_mxfp8,
+    ):
+        with pytest.raises(ValueError, match="TILE_N"):
+            factory(params)

@@ -35,7 +35,7 @@ _CASES = [
 @pytest.mark.parametrize("cga", [1, 2])
 @pytest.mark.parametrize("in_key,out_dtype,mode,d,packed,splits,scheduler", _CASES)
 @torch_fork_set_rng(seed=1397)
-def test_native_d64_fp8_rebind_replay(in_key, out_dtype, mode, d, packed, splits, scheduler, cga, cudnn_handle, monkeypatch):
+def test_native_d64_fp8_rebind_replay(in_key, out_dtype, mode, d, packed, splits, scheduler, cga, cudnn_handle, monkeypatch, tile_n=128):
     import cudnn
     from cudnn.engines.manifest import MANIFEST
     from cudnn.sdpa.fwd import api_dsl
@@ -56,7 +56,7 @@ def test_native_d64_fp8_rebind_replay(in_key, out_dtype, mode, d, packed, splits
     monkeypatch.setattr(api_dsl, "load_template", record)
     b, hq, hk, sq, sk = 2, 8, 2, 385, 641
     in_dtype = torch.float8_e4m3fn if in_key == "e4m3" else torch.float8_e5m2
-    sink = mode in ("sink", "padded")
+    sink = mode in ("sink", "padded", "split_sink")
     padded = mode == "padded"
     causal = mode not in ("full", "optional", "padded")
     br = mode == "br"
@@ -117,13 +117,14 @@ def test_native_d64_fp8_rebind_replay(in_key, out_dtype, mode, d, packed, splits
         engine = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()["sdpa_fwd_prefill_sm107_fp8"]
         knobs = {
             getattr(cudnn.knob_type, name): value
-            for name, value in dict(TILE_M=128, TILE_N=128, TILE_CGA_M=cga, PACK_GQA=int(packed), SPLIT_KV=splits, SCHED_POLICY=scheduler).items()
+            for name, value in dict(TILE_M=128, TILE_N=tile_n, TILE_CGA_M=cga, PACK_GQA=int(packed), SPLIT_KV=splits, SCHED_POLICY=scheduler).items()
         }
         graph.create_execution_plan(engine, knobs)
         graph.select_plan(graph.get_execution_plan_count() - 1)
         graph.check_support()
         graph.build_plans()
         assert loaded and all((m.CFG.TILE_K, m.CFG.TILE_O, m.CFG.CTA_MMA) == (64, 64, cga) for m in loaded)
+        assert all(m.CFG.TILE_N == tile_n for m in loaded)
         workspace = torch.empty(max(1, graph.get_workspace_size()), device="cuda", dtype=torch.uint8)
 
         def bindings():
@@ -193,7 +194,7 @@ def test_native_d64_fp8_rebind_replay(in_key, out_dtype, mode, d, packed, splits
 @pytest.mark.parametrize("sk", [129, 192, 257])
 @pytest.mark.parametrize("in_key,cga", [("e4m3", 1), ("e5m2", 2)])
 @torch_fork_set_rng(seed=1398)
-def test_standalone_d64_padded_default_tile_n(in_key, cga, sk):
+def test_standalone_d64_padded_default_tile_n(in_key, cga, sk, tile_n=None):
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     if torch.cuda.get_device_capability() != (10, 7):
@@ -209,12 +210,12 @@ def test_standalone_d64_padded_default_tile_n(in_key, cga, sk):
     lse = torch.empty((b, hq, sq), device="cuda", dtype=torch.float32)
     qlens = torch.tensor([sq, 97], device="cuda", dtype=torch.int32)
     klens = torch.tensor([sk, 0], device="cuda", dtype=torch.int32)
-    api = SdpaFwdDslSm100(q, k, v, out, lse, pertensor_fp8=True, cga=cga, tile_n=None, seq_q_lens_present=True, seq_kv_lens_present=True, scale_softmax=0.125)
+    api = SdpaFwdDslSm100(q, k, v, out, lse, pertensor_fp8=True, cga=cga, tile_n=tile_n, seq_q_lens_present=True, seq_kv_lens_present=True, scale_softmax=0.125)
     assert api.check_support()
-    assert api.flavor == (64, 64) and api._effective_tile_n() == 128
+    assert api.flavor == (64, 64) and api._effective_tile_n() == (tile_n or 128)
     api.compile()
     assert api._k_mod.CFG.TILE_K == api._k_mod.CFG.TILE_O == 64
-    assert api._k_mod.CFG.TILE_N == 128
+    assert api._k_mod.CFG.TILE_N == (tile_n or 128)
     unit = torch.ones(1, device="cuda", dtype=torch.float32)
     workspace = torch.empty(max(1, api.scratch_workspace_bytes()), device="cuda", dtype=torch.uint8)
 

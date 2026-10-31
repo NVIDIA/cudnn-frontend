@@ -64,10 +64,23 @@ if requirement_error:
 pytestmark = pytest.mark.L0
 
 requires_rubin = pytest.mark.requires_rubin
+requires_blackwell = pytest.mark.requires_blackwell  # the registered marker: an admitted Blackwell-line part of DENSE_SERVING_CCS (cc 10.0; 2026-10-29)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from test_block_serving_decode import _GROUPS, _Case, _bits, _cos, _geom, _make_block, _written  # noqa: E402
+from test_block_serving_decode import (  # noqa: E402
+    _GROUPS,
+    _SM100_ROUTE_TABLE,
+    _Case,
+    _bits,
+    _cos,
+    _geom,
+    _make_block,
+    _rubin_reading,
+    _sm100_case,
+    _sm100_pin,
+    _written,
+)
 
 _DEV = "cuda" if torch.cuda.is_available() else "cpu"
 _SM107 = (10, 7)
@@ -412,6 +425,7 @@ def test_the_unpacked_fallback_to_32_tokens_and_the_decline_past_it(monkeypatch)
     from cudnn.frost import buffers
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    _rubin_reading(monkeypatch)
     geom16, _ = _geom(16)
     for policy in DECODE_ROUTE_POLICIES:
         for s_q in range(9, DECODE_MAX_S_Q + 1):
@@ -498,7 +512,8 @@ def test_the_unpacked_fallback_to_32_tokens_and_the_decline_past_it(monkeypatch)
         declare(33)
 
 
-def test_declaration_facts_on_the_prefill_route_and_the_policy_knob():
+def test_declaration_facts_on_the_prefill_route_and_the_policy_knob(monkeypatch):
+    _rubin_reading(monkeypatch)
     """A DECODE block whose route is the prefill tile builds stage (4) as the EXTEND form's binding at the dense step's envelope: a THD
     stage at ``(num_sequences=B, max_seq_len=S_q)`` carrying the route, unsplit, the group packed, the gate in the paged body's epilogue
     (``gate_fused`` with no separate launch); a pinned split there is a typed decline; ``decode_route_policy`` selects the two-unit tile
@@ -630,7 +645,8 @@ def test_declaration_facts_on_the_prefill_route_and_the_policy_knob():
         )
 
 
-def test_the_prefill_routes_q_lengths_are_a_workspace_slot_not_plan_owned_memory():
+def test_the_prefill_routes_q_lengths_are_a_workspace_slot_not_plan_owned_memory(monkeypatch):
+    _rubin_reading(monkeypatch)
     """The paged THD leg's per-sequence Q lengths on the prefill route (the constant ``S_q`` of every sequence) are a ``[B]`` int32 slot
     of the caller's workspace (Rule 8 recipes R2 + R4), reserved by the carve at the very END and only on that route: the layout with
     ``decode_q_lens=0`` is byte-identical to before, a block on the decode tile reserves none, a block on the prefill tile reserves it
@@ -744,6 +760,44 @@ def _pin_route(case):
 # and the token-unit arm replaced the unpacked 12-stream arm); the UNPACKED arm at 32 / 2 S_q 12 (the 16-column tile, one head per CTA,
 # 16 streams) and S_q 32 (the 32-column tile: the widest step the form serves).
 _ORACLE_CELLS = [(16, 4), (16, 5), (16, 8), (8, 5), (8, 8), (8, 9), (8, 16), (4, 17), (4, 32), (12, 4), (12, 8), (16, 12), (16, 32)]
+
+
+def test_the_sm100_line_has_no_token_unit_arm_and_takes_the_prefill_tile_at_any_batch():
+    """The MTP step on the SM100 line (``decode_route(device_cc=(10, 0))``, 2026-10-29): no token-unit arm -- ``token_units`` is 1 on
+    every decode-tile cell under BOTH policies (they coincide), the paged prefill tile packed at ANY batch for a group dividing 128 (the
+    fill rule is the Rubin line's: the SM100 line has no two-unit alternative below it), the 16-column tile unpacked at the groups the
+    prefill tile cannot pack (12, 6), the verify step past 16 tokens a typed decline off the wide rule; the Rubin table unchanged."""
+    for group in sorted(_GROUPS):
+        geom, _ = _geom(group)
+        for policy in DECODE_ROUTE_POLICIES:
+            for s_q in range(1, _MTP_MAX_S_Q + 1):
+                r = decode_route(geom, s_q, policy=policy, device_cc=(10, 0))
+                want = _SM100_ROUTE_TABLE[group][s_q]
+                assert r.served and (r.tile, r.n_q, r.token_units, r.pack_gqa, r.kv_streams) == want and r.token_units <= 1, (group, s_q, policy, r)
+                assert decode_route(geom, s_q, policy=policy, device_cc=(10, 0), batch=1, max_kv_len=512) == r, "no fill rule on the line"
+                assert decode_route(geom, s_q, policy=policy, device_cc=(10, 0), batch=64, max_kv_len=512) == r
+                assert not r.claimed and r.pdl_capable is r.decode_tile
+            r = decode_route(geom, 17, policy=policy, device_cc=(10, 0))
+            assert r.served is (128 % group == 0 and 17 * group <= DECODE_PREFILL_TILE_ROWS), (group, r)  # group 4 alone: the prefill tile
+            assert decode_route(geom, DECODE_MAX_S_Q + 1, policy=policy, device_cc=(10, 0)).served is False
+        # the Rubin reading is the Rubin table (the rows above), untouched
+        for s_q, want in _TABLES[DECODE_ROUTE_SINGLE_UNIT][group].items():
+            r = decode_route(geom, s_q, device_cc=_SM107)
+            assert (r.tile, r.n_q, r.token_units, r.pack_gqa, r.kv_streams, r.claimed) == want, (group, s_q, r)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("group, s_q", [(16, 2), (16, 5), (8, 3), (4, 5)], ids=["32_2_sq2", "32_2_sq5", "8_1_sq3", "4_1_sq5"])
+def test_sm100_the_prefill_route_matches_the_oracle_at_the_standard_batch(group, s_q):
+    """The MTP verify step on cc 10.0 where the SM100 line takes the paged PREFILL tile with the whole group packed at the standard
+    cell's four sequences (no fill rule on the line): against the per-sequence fp32 oracle under the dense suite's budget, the padded
+    entry exactly 0, the compiled kernel pinned (the shared SM100 paged THD body, the group packed, unsplit, no gate epilogue: the gate
+    its own launch)."""
+    case = _sm100_case(("mtp", group, s_q), group, s_q, _LENS)
+    case.run()
+    case.check_against_oracle()
+    r, rb = _sm100_pin(case, _SM100_ROUTE_TABLE[group][s_q])
+    assert r.prefill_tile and r.batch == len(_LENS) and case.blk._sdpa.thd and (case.blk._sdpa.num_sequences, case.blk._sdpa.max_seq_len) == (4, s_q)
 
 
 @requires_rubin

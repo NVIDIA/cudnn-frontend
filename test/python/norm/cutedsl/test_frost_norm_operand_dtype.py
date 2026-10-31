@@ -66,6 +66,7 @@ from cudnn.norm import NormVariant, norm_bprop, norm_fprop  # noqa: E402
 
 
 @pytest.mark.L0
+@pytest.mark.norm_rejects_before_launch
 def test_forward_refuses_mismatched_parameters():
     x = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)
     g = torch.ones(64, device="cuda", dtype=torch.float32)  # wrong dtype on purpose
@@ -109,4 +110,6 @@ def test_cache_entry_is_not_shared_across_parameter_dtypes():
     torch.cuda.synchronize()
     ref = F.group_norm(x2.double(), 24, g2.double(), b2.double(), 1e-5)
     err = (y.double() - ref).abs().max().item()
-    assert err < 2e-2, f"matching-dtype InstanceNorm wrong after the shared compile (max {err:.2e})"
+    torch.testing.assert_close(
+        y, ref, check_dtype=False, msg=lambda detail: f"matching-dtype InstanceNorm wrong after the shared compile (max {err:.2e}): {detail}"
+    )

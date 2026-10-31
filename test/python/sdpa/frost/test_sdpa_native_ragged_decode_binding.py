@@ -34,6 +34,41 @@ def _fixture(dtype="bfloat16", i64=False, stats="NH", rank=3, total=None):
     return s, facts, frames, combined
 
 
+@pytest.mark.parametrize("length_form", [1, 2], ids=["ordinary", "prefix"])
+@pytest.mark.parametrize("has_sink", [False, True])
+def test_ragged_declared_lengths_match_reference_and_rebind(length_form, has_sink):
+    s, facts, frames, combined = _fixture()
+    s.ragged_q_lens = length_form
+    s.has_sink = has_sink
+    if has_sink:
+        facts["sinks"] = prep.BufferFacts(0xA0000, "float32", (2, 0), s.qh, (s.qh,), (1,))
+    count = s.b + (length_form == 2)
+    facts["seq_q_lens"] = facts["seq_q_lens"]._replace(shape=(count,), strides=(1,), span=count)
+    s.native = cudnn._pybind_module._SdpaDenseBinder(s)
+    first = _equal(s, facts)
+    assert first[1][-2:] == (17, facts["seq_q_lens"].ptr)
+    changed = dict(facts, seq_q_lens=facts["seq_q_lens"]._replace(ptr=0x900000))
+    if has_sink:
+        assert first[1][-3] == facts["sinks"].ptr
+        changed["sinks"] = facts["sinks"]._replace(ptr=0xB0000)
+    second = _equal(s, changed, stream=29)
+    assert second[1][-2:] == (29, 0x900000)
+    assert second[0][s.index["seq_q_lens_addr"]] == 0x900000
+    if has_sink:
+        assert second[1][-3] == 0xB0000
+        bad_sink = dict(changed, sinks=changed["sinks"]._replace(span=s.qh - 1))
+        with pytest.raises(ValueError):
+            binding_reference.bind_dense_split(s, bad_sink, 0x100000, 29, 29)
+        with pytest.raises(ValueError):
+            s.native.execute(_pack(bad_sink), prep._NATIVE_DENSE_INDICES, 29, workspace=0x100000)
+    short = dict(changed, seq_q_lens=changed["seq_q_lens"]._replace(shape=(count - 1,), span=count - 1))
+    with pytest.raises(ValueError):
+        binding_reference.bind_dense_split(s, short, 0x100000, 29, 29)
+    with pytest.raises(ValueError):
+        s.native.execute(_pack(short), prep._NATIVE_DENSE_INDICES, 29, workspace=0x100000)
+    assert frames == combined == []
+
+
 def _equal(s, facts, workspace=0x100000, stream=17):
     expected = binding_reference.bind_dense_split(s, facts, workspace, stream, stream)
     actual = s.native.bind_split(_pack(facts), prep._NATIVE_DENSE_INDICES, workspace, stream)
@@ -151,7 +186,8 @@ def test_ragged_wide_token_table_strides_and_per_port_divisors():
         facts[role] = f._replace(strides=(2**33, 1), span=3 * 2**33 + 8)
     s.ragged_divs = (*token_strides, s.qh)
     s.native = cudnn._pybind_module._SdpaDenseBinder(s)
-    partial, combined = _equal(s, facts)
+    # Wide synthetic spans must not cover the synthetic split workspace.
+    partial, combined = _equal(s, facts, workspace=1 << 48)
     assert partial[s.index["q_strides"]][0] == 2**33
     assert combined[6][1] == 2**33 + 1 and combined[11] == s.ragged_divs
 

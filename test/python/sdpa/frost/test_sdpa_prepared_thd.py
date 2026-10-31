@@ -236,7 +236,7 @@ def _plan(g):
     return g._compiled_plans[g._plan_index]
 
 
-def _compact_thd_api(bufs, b, ql, kl, hq, hk, d):
+def _compact_thd_api(bufs, b, ql, kl, hq, hk, d, *, cga=2, pack_gqa=False):
     """Prepare the actual standalone compact-prefix contract independently of a graph plan."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
@@ -252,9 +252,9 @@ def _compact_thd_api(bufs, b, ql, kl, hq, hk, d):
         cu_seq_q_lens=True,
         cu_seq_kv_lens=True,
         thd=True,
-        cga=2,
+        cga=cga,
         split_kv=1,
-        pack_gqa=False,
+        pack_gqa=pack_gqa,
     )
     assert api.check_support()
     api.compile()
@@ -329,7 +329,7 @@ def test_rubin_ragged_pack_rebind_and_changed_lengths_replay(dtype, stats_layout
 
 
 def _check_rubin_ragged_pack_rebind(
-    dtype, stats_layout, stats_log2, geometry, *, cga, causal=True, bottom_right=False, window_left=None, packed=None, sched_policy=1, tile_n=None
+    dtype, stats_layout, stats_log2, geometry, *, cga, causal=True, bottom_right=False, window_left=None, packed=None, sched_policy=1, tile_n=None, head_dim=128
 ):
     import inspect
 
@@ -342,6 +342,7 @@ def _check_rubin_ragged_pack_rebind(
         "single_unpacked": (1, 4096, 4609, 32, 8, 128),
         "two_wave_pair": (2, 2048, 2305, 16, 4, 128),
     }[geometry]
+    d = head_dim
     padded = stats_layout == "padded"
     head_major = stats_layout == "head"
     cap = b * ql
@@ -380,6 +381,7 @@ def _check_rubin_ragged_pack_rebind(
     g.build_plans()
     api = inspect.getclosurevars(_plan(g)._compiled.default_stream).nonlocals["api"]
     assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
+    assert api._k_mod.CFG.TILE_K == api._k_mod.CFG.TILE_O == head_dim
     if tile_n is not None:
         assert api._k_mod.PARAMS.tile_n == api._k_mod.CFG.TILE_N == tile_n
         assert api._k_mod.PARAMS.s_slots == api._k_mod.CFG.S_SLOTS == (2 if tile_n == 64 else 1)
@@ -1091,9 +1093,7 @@ def test_decode_d128_prepared_rebind_and_capture(s_q, monkeypatch):
 @requires_pre_rubin_blackwell
 @requires_dsl
 def test_dense_f16_plan_is_prepared_and_matches_reference():
-    """A dense bf16 graph declared in BSHD storage executes through the prepared dense launch (no
-    tensor arm, no copies) and reproduces the reference O / LSE; a BHSD-declared graph (a layout the
-    tensor path repacks) keeps the tensor arm."""
+    """Dense BSHD and BHSD graphs both bind through prepared launches and reproduce O / LSE."""
     b, h, hk, s_q, s_kv, d = 2, 8, 2, 256, 512, 128
     g, t = _dense_graph(b, h, hk, s_q, s_kv, d)
     plan = _plan(g)
@@ -1114,7 +1114,7 @@ def test_dense_f16_plan_is_prepared_and_matches_reference():
     torch.testing.assert_close(bufs["o"].float(), o_ref, atol=5e-2, rtol=3e-2)
     torch.testing.assert_close(bufs["lse"].squeeze(-1), lse_ref, atol=5e-2, rtol=3e-2)
     g2, t2 = _dense_graph(b, h, hk, s_q, s_kv, d, bshd_storage=False)
-    assert _plan(g2)._prepared is None, "a BHSD-declared graph is repacked by the tensor path, not bound zero-copy"
+    assert _plan(g2)._prepared is not None and _plan(g2).takes_variant_pack
     bhsd = {n: bufs[n].contiguous() for n in ("q", "k", "v")}
     o2, lse2 = torch.empty(b, h, s_q, d, device=DEV, dtype=torch.bfloat16), torch.empty(b, h, s_q, 1, device=DEV, dtype=torch.float32)
     g2.execute(
@@ -1122,7 +1122,7 @@ def test_dense_f16_plan_is_prepared_and_matches_reference():
         torch.empty(max(g2.get_workspace_size(), 1), device=DEV, dtype=torch.uint8),
     )
     torch.cuda.synchronize()
-    assert torch.equal(o2, bufs["o"]) and torch.equal(lse2, bufs["lse"]), "the prepared dense launch and the tensor arm must agree bit for bit"
+    assert torch.equal(o2, bufs["o"]) and torch.equal(lse2, bufs["lse"]), "native BSHD and BHSD launches must agree bit for bit"
 
 
 @requires_pre_rubin_blackwell

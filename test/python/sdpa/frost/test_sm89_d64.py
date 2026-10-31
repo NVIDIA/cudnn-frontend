@@ -144,8 +144,7 @@ def test_sm80_row_is_unchanged_by_the_ada_addition():
 
 @requires_dsl
 @pytest.mark.L0
-@pytest.mark.parametrize("staged", [False, True], ids=["native", "staged"])
-def test_shared_dense_host_compiles_for_sm80(staged, monkeypatch):
+def test_shared_dense_host_compiles_for_sm80(monkeypatch):
     """The shared artifact must not inherit the compiling device's ISA."""
     from types import SimpleNamespace
 
@@ -162,7 +161,7 @@ def test_shared_dense_host_compiles_for_sm80(staged, monkeypatch):
     monkeypatch.setattr(prepared_host.cute.runtime, "make_ptr", lambda *args, **kwargs: None)
     params = SimpleNamespace(io_bf16=False, bias_is_fp32=False)
     operand = ((1, 128, 2, 64), (16384, 128, 64, 1))
-    geometry = (operand,) * 4 + (((1, 2, 128), (256, 128, 1)),) + (None,) * (5 if staged else 4)
+    geometry = (operand,) * 4 + (((1, 2, 128), (256, 128, 1)),) + (None,) * 4
     result = prepared_host.compile_host(SimpleNamespace(), params, geometry, 0, 0, "shared-sm80-sm89")
     assert result is artifact
     assert len(calls) == 1
@@ -342,13 +341,13 @@ def test_unknown_ctor_extra_is_rejected_at_lowering():
 @requires_dsl
 @pytest.mark.L1
 @pytest.mark.parametrize("first_cc", [(8, 9), (8, 0)], ids=["ada-to-a100", "a100-to-ada"])
-@pytest.mark.parametrize("head_dim", [64, 32], ids=["native_d64", "staged_d32"])
+@pytest.mark.parametrize("head_dim", [64, 32], ids=["native_d64", "native_d32"])
 def test_shared_d64_artifact_runs_on_both_device_families(first_cc, head_dim, monkeypatch):
     """Reuse one compiled artifact across devices, including the public DSL floor.
 
-    Run on DSL 4.7.1 as well as newer builds. The core artifact is shared;
-    staged d32 copies compile once per target family. Returning to the first
-    family forbids JIT. Both O and Stats match in either compilation order.
+    Run on DSL 4.7.1 as well as newer builds. The artifact is shared at d64 and
+    at d32 (the d64 kernel at a narrower logical width); the second family and the
+    return to the first forbid JIT. Both O and Stats match in either compilation order.
     """
     import cutlass.cute as cute
     from cudnn.sdpa.fwd.kernels.sm80 import prepared_host
@@ -364,13 +363,6 @@ def test_shared_d64_artifact_runs_on_both_device_families(first_cc, head_dim, mo
     generator = torch.Generator().manual_seed(1289)
     inputs = [torch.randn(1, 128, 2, head_dim, generator=generator, dtype=torch.float16) for _ in range(3)]
     second_cc = (8, 0) if first_cc == (8, 9) else (8, 9)
-    from cudnn.sdpa.fwd.kernels.sm80.staged_copy import compile_gather
-    from cudnn.sdpa.fwd.kernels.staged_copy import compile_copy
-    from cudnn.sdpa.fwd.prepared_staged_sm80 import _compile_core
-
-    _compile_core.cache_clear()
-    compile_gather.cache_clear()
-    compile_copy.cache_clear()
     shared, first_params, first_geometry = None, None, None
     observed = []
     for index, cc in enumerate((first_cc, second_cc, first_cc)):
@@ -393,10 +385,7 @@ def test_shared_d64_artifact_runs_on_both_device_families(first_cc, head_dim, mo
             assert api.check_support()
 
             def core_artifact():
-                # d64 is native; d32 pads V/O through the staged copies around the same core.
-                assert (api._sm80_copy_spec is not None) == (head_dim == 32)
-                spec = api._sm80_spec if api._sm80_spec is not None else api._sm80_copy_spec.core
-                return spec.artifact
+                return api._sm80_spec.artifact
 
             if shared is None:
                 real_compile = prepared_host.compile_host
@@ -421,20 +410,11 @@ def test_shared_d64_artifact_runs_on_both_device_families(first_cc, head_dim, mo
 
                 with monkeypatch.context() as patch:
                     patch.setattr(prepared_host, "compile_host", reuse_artifact)
-                    # The staged case compiles target-specific auxiliary copies
-                    # for the second family; the core artifact remains shared.
-                    if head_dim == 64 or index == 2:
-                        patch.setattr(cute, "compile", forbid_jit)
+                    patch.setattr(cute, "compile", forbid_jit)
                     api.compile()
                 assert core_artifact() is shared
-            if head_dim == 32:
-                expected_misses = min(index + 1, 2)
-                assert compile_gather.cache_info().misses == expected_misses
-                assert compile_copy.cache_info().misses == expected_misses
-            required = api.scratch_workspace_bytes()
-            assert (required > 0) == (head_dim == 32)
-            workspace = torch.empty(required, dtype=torch.uint8, device=device) if required else None
-            api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=stats, workspace=workspace)
+            assert api.scratch_workspace_bytes() == 0  # native at both widths: no staging workspace
+            api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=stats, workspace=None)
             torch.cuda.synchronize(device)
             expected_o, expected_stats = _ref(q, k, v, False, head_dim**-0.5)
             torch.testing.assert_close(o.double(), expected_o, atol=2e-3, rtol=2e-3)

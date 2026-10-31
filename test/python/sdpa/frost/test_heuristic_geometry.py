@@ -14,7 +14,7 @@ from frost_test_utils import requires_dsl
 import cudnn
 from cudnn.sdpa.fwd import heuristics as heur
 from cudnn.sdpa.fwd.config_sm100 import CfgD512, cga_ctas
-from cudnn.sdpa.fwd.engines import ENGINE_SPECS, mismatch
+from cudnn.sdpa.fwd.engines import ENGINE_SPECS, effective_cgas, mismatch
 from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
 
 pytestmark = pytest.mark.L0
@@ -195,6 +195,51 @@ def test_paged_split_proposal_preserves_selected_packing(monkeypatch, packed, ba
     assert placement.place(spec, facts) == placement.LEAD
 
 
+@requires_dsl
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
+def test_nonpaged_d256_thd_leads_inside_its_domain(device_cc):
+    """Nonpaged d256 THD bottom-right causal prefill: FROST first from 256 query tokens and KV > 512, the backend elsewhere."""
+    from cudnn.sdpa.fwd import placement
+
+    base = dict(h_q=32, h_kv=4, s_q=8192, s_kv=8192, d_qk=256, d_v=256, thd=True, padded=True, causal=True, bottom_right=True, device_cc=device_cc)
+    assert placement._place_sm100_f16(SPEC.capabilities, _facts(**base)) == placement.LEAD
+    assert placement._place_sm100_f16(SPEC.capabilities, _facts(**{**base, "b": 32, "s_q": 256, "s_kv": 256 + 512})) == placement.LEAD
+    # any batch; every integral group and MHA
+    assert placement._place_sm100_f16(SPEC.capabilities, _facts(**{**base, "b": 64, "s_q": 768, "s_kv": 768})) == placement.LEAD
+    for h_kv in (2, 8, 16, 32):
+        assert placement._place_sm100_f16(SPEC.capabilities, _facts(**{**base, "h_kv": h_kv})) == placement.LEAD, h_kv
+    # a shape-override graph declares the cache batch and takes the same choice
+    assert (
+        placement._place_sm100_f16(
+            SPEC.capabilities, _facts(**{**base, "b": 4096, "s_q": 65536, "s_kv": 65536, "shape_overrides": True, "max_total_seq_len_q": 16384})
+        )
+        == placement.LEAD
+    )
+    for other in (
+        dict(s_q=512, s_kv=512),  # KV at the floor
+        dict(s_q=128, s_kv=1024),  # queries below the 256-token floor
+        dict(h_kv=3),  # a non-integral group
+        dict(dtype=cudnn.data_type.HALF),
+        dict(window_left=127),
+        dict(has_sink=True),
+        dict(bottom_right=False),
+    ):
+        assert placement._place_sm100_f16(SPEC.capabilities, _facts(**{**base, **other})) == placement.TRAIL, other
+
+
+@requires_dsl
+@pytest.mark.parametrize("device_cc,page_size", [((10, 0), 16), ((10, 0), 64), ((10, 3), 16), ((10, 3), 64)])
+def test_paged_d128_full_prefill_lead_covers_cc103_and_page64(device_cc, page_size, monkeypatch):
+    """#1809's packed full-prefill domain, extended to cc 10.3 and page 64; other page sizes and long prefixes keep the backend."""
+    from cudnn.sdpa.fwd import placement
+
+    monkeypatch.setattr(heur, "paged_thd_split_choice", lambda caps, facts: (1, False))  # the unsplit path, where the clause decides
+    facts = _paged_split_facts(h_q=32, h_kv=8, s_q=8192, s_kv=8192, device_cc=device_cc, page_size=page_size)
+    assert placement._place_sm100_f16(SPEC.capabilities, facts) == placement.LEAD
+    assert placement._place_sm100_f16(SPEC.capabilities, replace(facts, page_size=32)) == placement.TRAIL
+    assert placement._place_sm100_f16(SPEC.capabilities, replace(facts, s_kv=4 * 8192)) == placement.TRAIL
+
+
 def _mla_split_facts(**overrides):
     base = dict(h_q=4, h_kv=4, s_q=129, s_kv=4097, d_qk=192, d_v=128, thd=True, padded=True)
     base.update(overrides)
@@ -334,7 +379,88 @@ def test_nonpaged_d128_thd_lead_serves_a_valid_packed_first_plan(group, causal, 
     first = heur._knob_sets(SPEC, facts)[0]
     assert mismatch(SPEC.capabilities, facts, first) is None
     if placement._place_sm100_f16(SPEC.capabilities, facts) == placement.LEAD and heur.nonpaged_thd_split_choice(SPEC.capabilities, facts)[0] == 1:
-        assert first.pack_gqa and first.split_kv in (None, 1)
+        assert (first.pack_gqa or facts.h_q == facts.h_kv) and first.split_kv in (None, 1)  # MHA leads unpacked
+
+
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
+def test_nonpaged_d128_mha_thd_lead_follows_the_module_bounds(device_cc, monkeypatch):
+    """Unpacked MHA d128 causal THD leads where the rule's own constants say so: a declaration without a prefix chunk (equal
+    extents, equal totals when declared), a cache of at least NONPAGED_D128_MHA_THD_MIN_KV_TOKENS and
+    NONPAGED_D128_MHA_THD_MIN_TOKENS declared Q tokens per sequence, on a cc in NONPAGED_D128_MHA_THD_CCS.  The bounds are read
+    from the module and moved under a monkeypatch, so no measured boundary is pinned; the declaration contract and the structural
+    exclusions (a Q total alone, HALF, non-causal, windowed, another cc) are the test."""
+    from cudnn.sdpa.fwd import placement
+
+    min_tokens, min_kv = placement.NONPAGED_D128_MHA_THD_MIN_TOKENS, placement.NONPAGED_D128_MHA_THD_MIN_KV_TOKENS
+    s = max(min_tokens, min_kv)
+
+    def place(**kw):
+        base = dict(d_qk=128, b=4, h_q=32, h_kv=32, s_q=s, s_kv=s, causal=True, bottom_right=True, dtype=cudnn.data_type.BFLOAT16, device_cc=device_cc)
+        return placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, **kw}))
+
+    assert place() == placement.LEAD
+    assert place(s_q=min_kv - 1, s_kv=min_kv - 1) == placement.TRAIL  # the cache floor
+    assert place(max_total_seq_len_q=4 * (min_tokens - 1), max_total_seq_len_kv=4 * (min_tokens - 1)) == placement.TRAIL  # below the per-sequence tokens
+    assert place(max_total_seq_len_q=4 * min_tokens, max_total_seq_len_kv=4 * min_tokens) == placement.LEAD  # at them
+    with monkeypatch.context() as m:
+        m.setattr(placement, "NONPAGED_D128_MHA_THD_MIN_KV_TOKENS", 2 * s)
+        assert place() == placement.TRAIL
+        assert place(s_q=2 * s, s_kv=2 * s) == placement.LEAD
+    # Declarations that admit a chunk over a longer cache.
+    assert place(s_q=s // 2) == placement.TRAIL  # unequal extents
+    assert place(max_total_seq_len_q=2 * s) == placement.TRAIL  # a Q total declared alone
+    cache = dict(b=4096, s_q=16 * s, s_kv=16 * s)
+    assert place(**cache) == placement.LEAD  # a cache-shape declaration
+    assert place(**cache, max_total_seq_len_q=4 * s) == placement.TRAIL  # a Q total declared alone
+    assert place(**cache, max_total_seq_len_q=4 * s, max_total_seq_len_kv=4 * s) == placement.TRAIL  # equal totals, a few tokens per declared sequence
+    for other in (
+        dict(dtype=cudnn.data_type.HALF),
+        dict(causal=False, bottom_right=False),
+        dict(window_left=128),
+        dict(max_total_seq_len_q=0),  # an explicit zero total
+        dict(device_cc=(12, 0)),
+    ):
+        assert place(**other) == placement.TRAIL, other
+
+
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("h_q,h_kv", [(32, 4), (32, 32), (64, 8)])
+def test_nonpaged_d64_thd_lead_follows_the_module_bounds(device_cc, h_q, h_kv, monkeypatch):
+    """Unpacked d64 causal THD leads where NONPAGED_D64_THD_MIN_TOKENS (the per-sequence Q tokens and the cache floor) and
+    NONPAGED_D64_THD_CCS say so, under a declaration without a prefix chunk; the bounds are read from the module and moved under a
+    monkeypatch, the declaration contract and the structural exclusions are the test."""
+    from cudnn.sdpa.fwd import placement
+
+    s = placement.NONPAGED_D64_THD_MIN_TOKENS
+
+    def place(**kw):
+        base = dict(
+            d_qk=64, d_v=64, b=4, h_q=h_q, h_kv=h_kv, s_q=s, s_kv=s, causal=True, bottom_right=True, dtype=cudnn.data_type.BFLOAT16, device_cc=device_cc
+        )
+        return placement._place_sm100_f16(SPEC.capabilities, _mla_split_facts(**{**base, **kw}))
+
+    assert place() == placement.LEAD
+    assert place(s_q=s - 1, s_kv=s - 1) == placement.TRAIL  # the cache floor
+    assert place(s_q=2 * s, s_kv=2 * s, max_total_seq_len_q=4 * (s - 1), max_total_seq_len_kv=4 * (s - 1)) == placement.TRAIL  # below the per-sequence tokens
+    assert place(s_q=2 * s, s_kv=2 * s, max_total_seq_len_q=4 * s, max_total_seq_len_kv=4 * s) == placement.LEAD  # at them
+    with monkeypatch.context() as m:
+        m.setattr(placement, "NONPAGED_D64_THD_MIN_TOKENS", 2 * s)
+        assert place() == placement.TRAIL
+        assert place(s_q=2 * s, s_kv=2 * s) == placement.LEAD
+    assert place(s_q=2 * s, s_kv=8 * s) == placement.TRAIL  # unequal extents: a chunk over a longer cache
+    assert place(s_q=8 * s, s_kv=8 * s, max_total_seq_len_q=16 * s) == placement.TRAIL  # a Q total declared alone
+    cache = dict(b=4096, s_q=128 * s, s_kv=128 * s)
+    assert place(**cache) == placement.LEAD  # a cache-shape declaration
+    assert place(**cache, max_total_seq_len_q=32 * s) == placement.TRAIL  # a Q total declared alone
+    assert place(**cache, max_total_seq_len_q=32 * s, max_total_seq_len_kv=32 * s) == placement.TRAIL  # equal totals, a few tokens per declared sequence
+    for other in (
+        dict(dtype=cudnn.data_type.HALF),
+        dict(causal=False, bottom_right=False),
+        dict(window_left=128),
+        dict(max_total_seq_len_q=0),  # an explicit zero total
+        dict(device_cc=(12, 0)),
+    ):
+        assert place(**other) == placement.TRAIL, other
 
 
 @requires_dsl
@@ -365,6 +491,63 @@ def test_nonpaged_d128_rubin_split_obeys_physical_wave_budget(monkeypatch, batch
         assert tiles * (h_q // group) * splits <= 2 * 204
         assert len(range(0, kv, 128)) // splits >= 4
         assert mismatch(spec.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=splits, pack_gqa=packed)) is None
+
+
+@requires_dsl
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("dtype", [cudnn.data_type.BFLOAT16, cudnn.data_type.HALF])
+@pytest.mark.parametrize("mask", ["bottom_right", "top_left", "none"])
+def test_sm100_nonpaged_d128_mha_thd_leads_with_the_single_cta_body(device_cc, dtype, mask):
+    """A nonpaged D128 half THD graph with one query head per KV head puts the single-CTA prefill body first (cga 1, unsplit),
+    keeps the pair tile as a runner, and both widths pass mismatch; the plan-time THD split still leads where it applies."""
+    causal = mask != "none"
+    facts = _mla_split_facts(
+        d_qk=128,
+        b=4,
+        h_q=32,
+        h_kv=32,
+        s_q=4096,
+        s_kv=4096,
+        causal=causal,
+        bottom_right=mask == "bottom_right",
+        dtype=dtype,
+        device_cc=device_cc,
+        max_total_seq_len_q=16384,
+        max_total_seq_len_kv=16384,
+    )
+    assert effective_cgas(SPEC.capabilities, facts, 1) == frozenset({1, 2})
+    sets = heur._knob_sets(SPEC, facts)
+    assert (sets[0].cga, sets[0].split_kv, sets[0].pack_gqa) == (1, 1, False)
+    assert any(k.cga == 2 and k.split_kv == 1 for k in sets)
+    for k in sets:
+        assert mismatch(SPEC.capabilities, facts, k) is None, k
+    if mask != "top_left":
+        chunk = replace(facts, b=1, s_q=256, s_kv=8192, max_total_seq_len_q=None, max_total_seq_len_kv=None)
+        splits, _ = heur.nonpaged_thd_split_choice(SPEC.capabilities, chunk)
+        assert splits > 1 and heur._knob_sets(SPEC, chunk)[0].split_kv == splits
+
+
+@requires_dsl
+@pytest.mark.parametrize(
+    "other",
+    [
+        dict(h_kv=8),
+        dict(window_left=512),
+        dict(has_sink=True),
+        dict(has_bias=True),
+        dict(has_kv_mask=True),
+        dict(attn_scale_prefolded=True),
+        dict(right_band_widening=True, right_bound=16),
+    ],
+    ids=["gqa", "window", "sink", "bias", "kv_mask", "prefolded_scale", "band"],
+)
+def test_sm100_d128_thd_graphs_off_the_single_cta_leg_keep_the_pair_tile(other):
+    """Grouped heads, a window or band, a sink, a bias, a kv_mask or a pre-folded scale keep the pair tile first, and the
+    single-CTA width is not admitted for them."""
+    base = dict(d_qk=128, b=4, h_q=32, h_kv=32, s_q=4096, s_kv=4096, causal=True, bottom_right=True, max_total_seq_len_q=16384, max_total_seq_len_kv=16384)
+    facts = _mla_split_facts(**{**base, **other})
+    assert heur._knob_sets(SPEC, facts)[0].cga == 2
+    assert mismatch(SPEC.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=1, pack_gqa=False, sched_policy=0, tile_m=128, tile_n=128)) is not None
 
 
 @requires_dsl
@@ -585,12 +768,17 @@ def test_split_chooser_receives_the_row_cost_profile(monkeypatch, row, device_cc
 
 
 @requires_dsl
+@pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize("s_q,window", [(1, None), (1, 128), (4, None), (4, 128)])
 @pytest.mark.parametrize("sink", [True, False])
-def test_rubin_d64_decode_proposes_the_packed_leg(monkeypatch, s_q, window, sink):
-    """A packed or split D64 leg lands on the d128 flavor (the native 64-wide tile is dense-only), so the proposal
-    reads that flavor as mismatch() does; reading the knob-less native d64 dropped every packed plan."""
+def test_rubin_decode_packing_uses_selected_flavor(monkeypatch, d, s_q, window, sink):
+    """D128 retains the shared decode tile; unsplit D64 packing is native.
+
+    Retain the shared decode proposal regression on D128. D64's native packed
+    capability is independent of its recommendation rank; split still uses D128.
+    """
     from cudnn.frost import buffers
+    from cudnn.sdpa.fwd.engines import _selected_d_shape
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
@@ -601,8 +789,8 @@ def test_rubin_d64_decode_proposes_the_packed_leg(monkeypatch, s_q, window, sink
         h_kv=8,
         s_q=s_q,
         s_kv=131072,
-        d_qk=64,
-        d_v=64,
+        d_qk=d,
+        d_v=d,
         causal=causal,
         bottom_right=causal,
         window_left=window,
@@ -611,9 +799,32 @@ def test_rubin_d64_decode_proposes_the_packed_leg(monkeypatch, s_q, window, sink
         device_sm_count=204,
     )
     plans = heur.recommend("A", facts, {spec.name: 20505})
-    assert plans[0].knobs.pack_gqa
+    assert plans
+    packed = heur.SdpaFwdKnobs(tile_m=128, tile_n=128, cga=1, pack_gqa=True, split_kv=1, sched_policy=0)
+    assert mismatch(spec.capabilities, facts, packed) is None
+    assert _selected_d_shape(spec.capabilities, facts, packed) == ((64, 64) if d == 64 else (128, 128))
+    if d == 128:
+        assert any(p.knobs.pack_gqa for p in plans)
     if sink:
-        assert plans[0].knobs.split_kv == 1  # no sink split on this row
+        assert all(p.knobs.split_kv == 1 for p in plans)  # no sink split on this row
     else:
         assert any((p.knobs.split_kv or 1) > 1 for p in plans)  # the split leg is proposed again; its rank is the wave model's
+        assert _selected_d_shape(spec.capabilities, facts, replace(packed, split_kv=2)) == (128, 128)
     assert all(mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
+
+
+@pytest.mark.L0
+def test_native_d576_has_launch_geometry_for_the_split_model():
+    """The native D576x512 shape (one 2x2 CTA pair) is a key of the geometry the wave model reads; planning a D576 graph
+    raised KeyError: 576 in _split_launch before."""
+    from cudnn.sdpa.fwd.config_sm100 import cga_ctas, cga_tile_m
+
+    assert (cga_ctas(576), cga_ctas(576, 2), cga_tile_m(576)) == (2, 2, 128)
+    facts = _facts(b=64, h_q=96, h_kv=1, s_q=1, s_kv=8192, d_qk=576, d_v=512, causal=False)
+    assert heur._selected_d_shape(SPEC.capabilities, facts) == (576, 512)
+    launch = heur._split_launch(SPEC.capabilities, facts, 64, 128, 2, 1, split_kv=2)
+    assert launch.ctas_per_tile == 2
+    # 128 Q rows per tile, not D512's 256: S_q=129 is two unpacked tiles, or ceil(129 / (128 // 32)) packed.
+    facts = _facts(b=1, h_q=96, h_kv=1, s_q=129, s_kv=8192, d_qk=576, d_v=512, causal=False)
+    assert heur._split_launch(SPEC.capabilities, facts, 64, 128, 2, 1).q_tiles == 2
+    assert heur._split_launch(SPEC.capabilities, facts, 64, 128, 2, 32).q_tiles == 33

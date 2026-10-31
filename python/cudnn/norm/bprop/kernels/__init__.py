@@ -15,7 +15,7 @@ live in :mod:`cudnn.norm._common_sm100`.
 Each module exposes ``backward(spec, dy, x, gamma, mean, rstd, *, has_beta, cfg, params)``.
 """
 
-# Deliberately NOT imported here. Each kernel module imports ``cutlass.primitives``
+# Deliberately NOT imported here. Each kernel module imports ``cutlass.experimental.primitives``
 # at its top, so a package-level fan-out would load the CuTe DSL for anything that
 # merely touches this package -- including the engine, before its gate runs.
 # Callers import the one module they need; the tests enumerate with pkgutil.

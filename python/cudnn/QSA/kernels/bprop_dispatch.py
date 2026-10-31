@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Keep nonfinite values in one sparse query out of its paired neighbor."""
+"""Keep nonfinite values in one sparse query out of the queries batched with it."""
 
 import hashlib
 from pathlib import Path
@@ -63,11 +63,12 @@ def _dispatch(
     bprop_helpers.finish_host(aq, ak, av, dq, dk, dv, blocks, stream)
 
 
-def compile_kernel(arch):
+def compile_kernel(arch, hq, hkv):
+    """Compile the two-launch backward for one batched head geometry (12/1 or 6/1); tensor extents stay dynamic."""
     fake = bprop_helpers.fake
     total, groups, capacity, blocks, flag_size = (cute.sym_int64() for _ in range(5))
-    q, kv = fake(cutlass.BFloat16, (total, 12, 256)), fake(cutlass.BFloat16, (total, 1, 256))
-    aq, ak = fake(Float32, (total, 12, 256)), fake(Float32, (total, 1, 256))
+    q, kv = fake(cutlass.BFloat16, (total, hq, 256)), fake(cutlass.BFloat16, (total, hkv, 256))
+    aq, ak = fake(Float32, (total, hq, 256)), fake(Float32, (total, hkv, 256))
     rows, spans = fake(Int32, (total,), 4), fake(Int32, (blocks,), 4)
     args = (
         q,
@@ -75,8 +76,8 @@ def compile_kernel(arch):
         kv,
         q,
         aq,
-        fake(Float32, (12, total), 4),
-        fake(Float32, (total, 12)),
+        fake(Float32, (hq, total), 4),
+        fake(Float32, (total, hq)),
         aq,
         ak,
         ak,
@@ -97,7 +98,7 @@ def compile_kernel(arch):
     return compile_cached(
         _dispatch,
         *args,
-        cache_key=template_key(globals(), {"arch": arch, "sources": SOURCE_DIGESTS}, "compile_kernel"),
+        cache_key=template_key(globals(), {"arch": arch, "hq": hq, "hkv": hkv, "sources": SOURCE_DIGESTS}, "compile_kernel"),
         symbol="qsa_backward_dispatch",
         options=f"--enable-tvm-ffi --gpu-arch=sm_{arch}a",
     )

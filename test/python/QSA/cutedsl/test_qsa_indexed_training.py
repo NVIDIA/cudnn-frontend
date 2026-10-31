@@ -19,9 +19,8 @@ pytestmark = pytest.mark.L0
 
 @pytest.fixture(autouse=True)
 def indexed_supported_device():
-    # The shared bitmap-QSA fixture also admits SM107; this indexed API does not.
-    if torch.cuda.is_available() and torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("Indexed QSA requires SM100 or SM103")
+    if torch.cuda.is_available() and torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Indexed QSA requires SM100, SM103 or SM107")
 
 
 def indices_for(inputs):
@@ -53,6 +52,22 @@ def check_case(inputs, indices):
 def test_indexed_packed_reference(supported_gpu, lengths):
     inputs = make_inputs(lengths, 12, 1, empty=True, all_selected=True)
     check_case(inputs, indices_for(inputs))
+
+
+@pytest.mark.parametrize("lengths", [(3, 5, 7), (129, 133)])
+def test_indexed_six_query_heads(supported_gpu, lengths):
+    """6Q/1KV shares the kernels; its backward batches four queries per compact-ID row (12Q/1KV batches two)."""
+    inputs = make_inputs(lengths, 6, 1, empty=True, all_selected=True)
+    indices = indices_for(inputs)
+    check_case(inputs, indices)
+    plan = _plan(inputs["q"].shape[0], indices.shape[1], inputs["q"].device, "bprop", 6)
+    assert plan.paired and plan.nq == 4 and "flags" in {name for name, _, _ in plan.layouts}
+    assert dict((name, shape) for name, shape, _ in plan.layouts)["ids"] == ((inputs["q"].shape[0] + 3) // 4, indices.shape[1])
+    paired = _plan(inputs["q"].shape[0], indices.shape[1], inputs["q"].device, "bprop")
+    assert paired.paired and paired.nq == 2
+    out = qsa_indexed_forward(inputs["q"], inputs["k"], inputs["v"], indices)
+    with pytest.raises(NotImplementedError, match="causal_topk requires 12Q/1KV"):
+        qsa_indexed_backward(inputs["q"], inputs["q"], inputs["k"], inputs["v"], out["out_fp32"], out["lse"], indices, selection_mode="causal_topk")
 
 
 def test_indexed_changed_values_replay(supported_gpu):
@@ -153,6 +168,8 @@ def canonical_inputs(supported_gpu):
     from cudnn.QSA.two_pass.api import _dsl_cuda_version
     from QSA.cutedsl.two_pass_reference import make_inputs as canonical
 
+    if torch.cuda.get_device_capability() == (10, 7):
+        pytest.skip("The canonical two-pass backward is currently qualified on SM100/SM103")
     if _dsl_cuda_version()[0] < 13:
         pytest.skip("12Q/1KV sparse two-pass requires the CUDA 13 DSL compiler")
     return canonical

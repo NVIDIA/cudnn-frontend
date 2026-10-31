@@ -24,7 +24,17 @@ from gated_block_reference import RefGeometry, gated_attention_block_reference, 
 
 pytestmark = pytest.mark.L0
 
+from cudnn.gated_attention_block import DENSE_SERVING_CCS  # noqa: E402  (the parts the bf16 / f16 stage is served on: cc 10.7 and cc 10.0)
+
 _SM107 = (10, 7)
+
+
+def _part():
+    """The part the STAGE reads its device for (``api._device_cc_of``: the one function its gates read -- torch's capability on a real host,
+    the simulated one under a host plugin that patches it)."""
+    from cudnn.gated_attention_block import api as _api
+
+    return _api._device_cc_of(torch.device("cuda")) if torch.cuda.is_available() else None
 
 
 def _cc():
@@ -53,13 +63,38 @@ def _cos(a, b):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(_cc() == _SM107, reason="this asserts the decline on NON-Rubin")
+@pytest.mark.skipif(_part() in DENSE_SERVING_CCS, reason="this asserts the decline on a part the bf16 / f16 stage is NOT served on")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device to report a cc")
 def test_declines_every_arch_but_rubin():
+    """Off the parts of ``DENSE_SERVING_CCS`` (cc 10.7, and cc 10.0 since 2026-10-29) the stage declines with the ONE part statement."""
     geom, _ = _geoms()
     stage = _Sdpa(geom, batch=1, seq_len=256, dtype=torch.bfloat16, device=torch.device("cuda"), want_lse=False)
-    with pytest.raises(NotImplementedError, match="Rubin"):
+    with pytest.raises(NotImplementedError, match="Rubin") as e:
         stage.check_support()
+    assert "served on cc 10.7 (Rubin, SM107: every form) and cc 10.0" in str(e.value) and f"found SM{_part()[0]}{_part()[1]}" in str(e.value)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_the_quantized_stage_and_the_gate_are_declined_on_a_cc_10_0_reading(monkeypatch):
+    """A cc 10.0 reading of the stage's device (the ONE function the stage reads, patched -- a host row on any CUDA device): the bf16
+    stage passes the part gate (the next check is the adapter's, on the real device), the FP8 stage is pinned to the Rubin FP8 row, and
+    ``fuse_gate=True`` at d256 is the DEVICE row's decline -- the sm100 f16 row claims no gate epilogue -- after the Rubin-row pins."""
+    from cudnn.gated_attention_block import api as _api
+
+    monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 0))
+    geom, _ = _geoms()
+    gated = _Sdpa(geom, batch=1, seq_len=256, dtype=torch.bfloat16, device=torch.device("cuda"), want_lse=False, fuse_gate=True)
+    assert gated._device_row_arch() == "sm100"
+    with pytest.raises(NotImplementedError, match="fuse_gate=True is not served by the f16/bf16 SM100 SDPA engine row") as e:
+        gated._check_gate_geometry()
+    assert "cc 10.0" in str(e.value) and "fuse_gate=False" in str(e.value)
+    d64, _ = _geoms(d_head=64, rope_dim=32)
+    with pytest.raises(NotImplementedError, match="256"):
+        _Sdpa(d64, batch=1, seq_len=256, dtype=torch.bfloat16, device=torch.device("cuda"), want_lse=False, fuse_gate=True)._check_gate_geometry()
+    fp8 = _Sdpa(geom, batch=1, seq_len=256, dtype=torch.float8_e4m3fn, device=torch.device("cuda"), want_lse=False)
+    with pytest.raises(NotImplementedError, match="FP8 SDPA stage binds the Rubin"):
+        fp8.check_support()
+    assert _api._dense_part_decline((10, 0)) is None and "found SM80" in _api._dense_part_decline((8, 0))
 
 
 def test_the_bshd_handover_is_zero_copy():
@@ -175,9 +210,19 @@ def test_gate_declines_a_gate_dtype_the_rows_do_not_claim(dtype, gate_dtype):
         stage.check_support()
     assert "Rubin" not in str(ei.value)  # the geometry / dtype pin fired, not the cc gate
     assert "bfloat16" in str(ei.value)  # both rows serve the block's activation dtype for these cases
-    # The block's own configuration is served: activation-dtype gate on both rows.
+    # The block's own configuration is served on the Rubin rows: activation-dtype gate on both; on an admitted Blackwell-line part the
+    # DEVICE's row speaks after the Rubin pins for the bf16 / f16 stage (the sm100 f16 row claims no gate epilogue: a typed decline,
+    # 2026-10-29), while a QUANTIZED stage keeps the Rubin row on every device (its gate geometry reads the same everywhere, as the
+    # MXFP8 suite pins) and is declined by name by its own part gate at check_support -- "binds the Rubin (cc 10.7) ... row only"
     ok = _Sdpa(geom, batch=1, seq_len=256, dtype=dtype, device=torch.device("cuda"), want_lse=False, fuse_gate=True, gate_dtype=torch.bfloat16)
-    ok._check_gate_geometry()
+    if _part() in DENSE_SERVING_CCS and _part() != _SM107 and dtype != torch.float8_e4m3fn:
+        with pytest.raises(NotImplementedError, match="SM100 SDPA engine row"):
+            ok._check_gate_geometry()
+    else:
+        ok._check_gate_geometry()
+        if _part() in DENSE_SERVING_CCS and _part() != _SM107:
+            with pytest.raises(NotImplementedError, match=r"binds the Rubin \(cc 10\.7\) d256 per-tensor FP8 row only"):
+                ok.check_support()
 
 
 def _run_gated_stage(geom, ref, *, batch, seq_len, gate, gate_token_stride, seq_lens=None, want_lse=True):

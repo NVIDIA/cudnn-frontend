@@ -159,6 +159,26 @@ def _diff(name_a, text_a, name_b, text_b):
     return "\n".join(difflib.unified_diff(text_a.splitlines(), text_b.splitlines(), fromfile=name_a, tofile=name_b, lineterm=""))
 
 
+def _base_drain(source):
+    """Compare the shared drain without the supported templates' cluster extension."""
+
+    class BaseDrain(ast.NodeTransformer):
+        """Remove only cluster reduction and its root-CTA output predicate."""
+
+        def visit_If(self, node):
+            """Preserve all other drain control flow, including output bounds."""
+            if ast.unparse(node.test) == "cutlass.const_expr(cluster_k_reduce)":
+                return None
+            node = self.generic_visit(node)
+            if isinstance(node.test, ast.Name) and node.test.id == "write_epilogue":
+                return node.body
+            if isinstance(node.test, ast.BoolOp) and isinstance(node.test.op, ast.And):
+                node.test.values = [value for value in node.test.values if not (isinstance(value, ast.Name) and value.id == "write_epilogue")]
+            return node
+
+    return ast.unparse(BaseDrain().visit(ast.parse(source)))
+
+
 @pytest.mark.parametrize("region,groups", [("SETUP", _SETUP_GROUPS), ("DRAIN", _DRAIN_GROUPS)])
 def test_every_template_is_assigned_to_exactly_one_group(region, groups):
     declared = [entry for names in groups.values() for entry in names]
@@ -177,17 +197,23 @@ def test_every_template_is_assigned_to_exactly_one_group(region, groups):
     [("SETUP", g) for g in _SETUP_GROUPS] + [("DRAIN", g) for g in _DRAIN_GROUPS],
 )
 def test_the_region_is_identical_within_its_group(region, group):
+    """Keep the common epilogue identical while allowing explicit cluster-only integration."""
     names = (_SETUP_GROUPS if region == "SETUP" else _DRAIN_GROUPS)[group]
     if {n for n, _ in names} <= _STANDALONE:
         pytest.skip(f"{group} is a family of one -- it shares no region to compare")
     ref_name, ref_group = names[0]
     ref = _region(template_path(ref_name), region, ref_group)
     assert ref.strip(), f"{ref_name}: empty {region} region"
+    cluster_extension = region == "DRAIN" and group in ("plain", "block_scale_1ctamma", "block_scale_2ctamma")
+    if cluster_extension:
+        ref = _base_drain(ref)
     for name, cta_group in names[1:]:
         got = _region(template_path(name), region, cta_group)
+        if cluster_extension:
+            got = _base_drain(got)
         assert got == ref, (
             f"{region} region of {name} (cta_group={cta_group}) has drifted from its group '{group}'.\n"
-            f"A new epilogue feature lands in EVERY template of the group, in the same shape.\n" + _diff(ref_name, ref, name, got)
+            f"The shared epilogue must agree across every template of the group.\n" + _diff(ref_name, ref, name, got)
         )
 
 
@@ -260,6 +286,30 @@ def test_the_overlap_arm_never_indexes_the_span_list():
     assert not offenders, "runtime index into a Python list:\n  " + "\n  ".join(offenders)
 
 
+@pytest.mark.parametrize("file", ["sm100_matmul_mainloop.py", "sm103_block_scale_matmul.py"])
+def test_unsupported_templates_have_no_cluster_reduction_path(file):
+    """An unsupported cluster mode must leave no incomplete device branch."""
+    source = template_path(file).read_text()
+    for name in ("cluster_split_k_reduce", "cluster_k_reduce", "cluster_reduce_iter", "cluster_mailbox", "write_epilogue"):
+        assert name not in source, (file, name)
+
+
+@pytest.mark.parametrize("file", ["sm100_matmul.py", "sm100_block_scale_matmul.py"])
+def test_cluster_reduction_uses_the_epilogue_participant_count(file):
+    """The collective must use the same lanes as its template's epilogue."""
+    tree = ast.parse(template_path(file).read_text())
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "cluster_split_k_reduce"]
+    assert len(calls) == 1
+    assert ast.unparse(calls[0].args[-1]) == "num_epilogue_warps * 32"
+
+
+@pytest.mark.parametrize("file", ["sm100_matmul.py", "sm100_matmul_mainloop.py", "sm100_block_scale_matmul.py", "sm103_block_scale_matmul.py"])
+def test_tma_epilogue_has_no_unused_primary_output_offset(file):
+    """Generated stores compute each output's own offset, including mixed layouts."""
+    tree = ast.parse(template_path(file).read_text())
+    assert not any(isinstance(node, ast.Name) and node.id == "linear_idx" for node in ast.walk(tree))
+
+
 def test_the_markers_do_not_break_the_template_parse():
     for path in _templates():
         ast.parse(path.read_text())
@@ -311,7 +361,8 @@ def test_l2_identity_fastpath_is_compile_time_and_used_by_every_mixed_cga_call()
                 offenders.append(f"{path.name}: MoE must keep its separate swizzle path")
             continue
 
-        expected_count = 4 if path.name.startswith("sm103_") else 3
+        # Dense block-scale's MMA warp tracks the raster for SFB sub-tiles too.
+        expected_count = 4 if path.name.startswith("sm103_") or path.name == "sm100_block_scale_matmul.py" else 3
         if len(calls) != expected_count:
             offenders.append(f"{path.name} (cta_group={cta_group}): expected {expected_count} L2-swizzle calls, found {len(calls)}")
         for call in calls:
@@ -320,6 +371,48 @@ def test_l2_identity_fastpath_is_compile_time_and_used_by_every_mixed_cga_call()
                 offenders.append(f"{path.name}:{call.lineno}: identity must be tile_swizzle_n == 1")
 
     assert not offenders, "L2 identity fastpath is incomplete:\n  " + "\n  ".join(offenders)
+
+
+@pytest.mark.parametrize("file", ["sm100_matmul.py", "sm100_matmul_mainloop.py", "sm100_block_scale_matmul.py", "sm103_block_scale_matmul.py"])
+def test_dense_swizzle_width_is_resolved_only_in_host(file):
+    """All dense pipelines resolve shape-only divisions once per launch."""
+    tree = ast.parse(template_path(file).read_text())
+    kernel = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_kernel")
+    host = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_host")
+    width = next(arg for arg in kernel.args.args if arg.arg == "swizzle_w")
+    assert ast.unparse(width.annotation) == "cutlass.Int32"
+    assert not any(_call_endswith(node, "_auto_swizzle_w") for node in ast.walk(kernel))
+    calls = [node for node in ast.walk(host) if _call_endswith(node, "_auto_swizzle_w")]
+    assert len(calls) == 1
+    assert [ast.unparse(arg) for arg in calls[0].args] == ["m", "n", "k_sym", "num_tile_n_host"]
+    launch = next(node for node in ast.walk(host) if _call_endswith(node, "_kernel"))
+    assert ast.unparse(launch.args[3]) == "swizzle_w_host"
+
+
+def test_l2_width_one_bypasses_runtime_divisions():
+    """Retain a bijective raster and skip all division for a runtime unit width."""
+    from types import SimpleNamespace
+
+    tree = ast.parse((pathlib.Path(cudnn.gemm.frost.__file__).parent / "tile_helpers.py").read_text())
+    helper = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "l2_swizzle_tile")
+    branch = next(node for node in helper.body if isinstance(node, ast.If) and ast.unparse(node.test) == "swizzle_w != 1")
+    divisions = [node for node in ast.walk(helper) if isinstance(node, ast.BinOp) and isinstance(node.op, ast.FloorDiv)]
+    assert len(divisions) == 2
+    assert all(node in list(ast.walk(branch)) for node in divisions)
+    helper.decorator_list = []
+    namespace = {"cutlass": SimpleNamespace(const_expr=bool, Int32=int, min=min)}
+    exec(compile(ast.Module(body=[helper], type_ignores=[]), "<l2-swizzle>", "exec"), namespace)
+    raster = namespace["l2_swizzle_tile"]
+    for nt_m in (1, 3, 13):
+        for nt_n in (1, 2, 7, 19):
+            raw = [(m, n) for n in range(nt_n) for m in range(nt_m)]
+            for width in (1, 2, 3, 8):
+                mapped = [raster(m, n, nt_m, nt_n, width) for m, n in raw]
+                assert set(mapped) == set(raw) and len(set(mapped)) == len(raw)
+                if width == 1:
+                    assert mapped == raw
+                elif nt_m > 1 and nt_n > 1:
+                    assert mapped[1] == (0, 1)
 
 
 def test_every_template_hoists_its_complete_smem_descriptor_inventory():
@@ -604,7 +697,11 @@ def test_mixed_cga_uses_host_constant_masks_and_shifts_at_every_use_site():
             kernel=kernel,
             parents=parents,
             target="n_rank",
-            preferred="cta_rank_in_cluster >> _preferred_cluster_m_shift",
+            preferred=(
+                "(cta_rank_in_cluster >> _preferred_cluster_m_shift) & (cluster_shape_mnk[1] - 1)"
+                if path.name in ("sm100_matmul.py", "sm100_block_scale_matmul.py")
+                else "cta_rank_in_cluster >> _preferred_cluster_m_shift"
+            ),
             fallback="cta_rank_in_cluster >> _fallback_cluster_m_shift",
             site="N rank",
             offenders=offenders,
@@ -685,7 +782,10 @@ def test_mixed_cga_uses_host_constant_masks_and_shifts_at_every_use_site():
 
 @pytest.mark.parametrize("stem", ["sm100_moe_grouped_matmul_fwd", "sm100_moe_grouped_block_scale_matmul_fwd"])
 def test_moe_swap_ab_preserves_mma_and_producer_barriers(stem):
+    """Preserve pipeline synchronization while allowing the bulk register policy."""
+
     def pipeline(file):
+        """Extract barrier/MMA regions with only the documented role normalization."""
         tree = ast.parse(template_path(file).read_text())
         kernel = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_kernel")
         # The gathered token SF is A normally and B after swapAB. Normalize
@@ -696,6 +796,18 @@ def test_moe_swap_ab_preserves_mma_and_producer_barriers(stem):
                 for name in ast.walk(call.args[1]):
                     if isinstance(name, ast.Name) and name.id == token_sf_count:
                         name.id = "num_token_sf_operands"
+        for mma in (node for node in kernel.body if isinstance(node, ast.If) and ast.unparse(node.test) == "warp_idx == mma_warp_id"):
+            register_adjustment = mma.body[0]
+            if isinstance(register_adjustment, ast.If) and ast.unparse(register_adjustment.test) == "cutlass.const_expr(not moe_combine_swap_bulk_enabled)":
+                # The swapped bulk specialization disables register redistribution.
+                # Normalize ONLY this exact prologue adjustment; every MMA operation
+                # and barrier (including its predicates/order) still compares verbatim.
+                expected = ast.parse("nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)").body
+                assert not register_adjustment.orelse
+                assert [ast.dump(node, include_attributes=False) for node in register_adjustment.body] == [
+                    ast.dump(node, include_attributes=False) for node in expected
+                ]
+                mma.body[:1] = register_adjustment.body
         warp_regions = [
             ast.dump(node, include_attributes=False)
             for node in kernel.body
@@ -712,3 +824,21 @@ def test_moe_swap_ab_preserves_mma_and_producer_barriers(stem):
         return warp_regions, barriers
 
     assert pipeline(f"{stem}_swap_ab.py") == pipeline(f"{stem}.py")
+
+
+@pytest.mark.parametrize("suffix", ["", "_swap_ab"])
+def test_moe_block_scale_mailbox_acknowledgements_order_prior_reads(suffix):
+    """Retain release acknowledgements that protect prior scheduler mailbox reads."""
+    # Empty slots still have a write-after-read hazard. Warp-local convergence
+    # alone does not replace the release/acquire handoff with the scheduler.
+    path = template_path(f"sm100_moe_grouped_block_scale_matmul_fwd{suffix}.py")
+    acknowledgements = []
+    for call in ast.walk(ast.parse(path.read_text())):
+        if not isinstance(call, ast.Call) or ast.unparse(call.func) != "nvvm.mbarrier_arrive":
+            continue
+        names = {node.id for node in ast.walk(call.args[0]) if isinstance(node, ast.Name)}
+        if names & {"sched_empty_mbar_ptr", "sched_bcast_empty_mbar_ptr"}:
+            acknowledgements.append(call)
+            relaxed = next((kw.value for kw in call.keywords if kw.arg == "relaxed"), ast.Constant(False))
+            assert isinstance(relaxed, ast.Constant) and relaxed.value is False, f"{path.name}:{call.lineno}: mailbox reuse needs release ordering"
+    assert len(acknowledgements) == 6

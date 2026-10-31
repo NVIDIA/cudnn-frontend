@@ -14,6 +14,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -287,6 +288,7 @@ def launch_f16(
         block_table_ptr=P(block_table_tensor, 4),
         block_table_v_ptr=P(block_table_v_tensor, 4),
         table_strides=t_st,
+        table_v_strides=(tuple(block_table_v_tensor.stride()) if block_table_v_tensor is not None else t_st) if paged else None,
         n_pages=n_pages,
         # The d128 decode tile's ragged-Q leg slots (dense launches leave them
         # dead: RAGGED_Q is off in every direct test's params); filtered out for
@@ -630,3 +632,64 @@ def run_d512_delayed_observer(tmp_path, engine):
     )
     (tmp_path / "delayed_observer.log").write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
     assert proc.returncode == 0 and "DELAYED_OBSERVER_PASS" in proc.stdout, f"rc={proc.returncode}\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+
+
+# ------------------------------------------------------------------------------------------------------------ per-kernel PTX md5 records
+# A chain's dumped PTX module holds one `.visible .entry` per kernel it launches.  A rendering record pins each kernel the module under test
+# OWNS by the md5 of that kernel's entry region alone, so a change to a kernel SHARED with other chains (listed below) never reddens the rows
+# of every chain that launches it: #1925 changed the grouped THD dK / dV fold and reddened the chain-wide records of three unrelated modules.
+# The module preamble (compiler banner, `.version` / `.target`, the dynamic-SMEM declaration) is the DSL build's -- the record's ``dsl=``
+# line -- and is not a kernel: not recorded.  Record row: ``<token> <arch> <variant> kernel=<name> rc=0 ptx_md5=<32 hex>``.
+D128_THD_SHARED_KERNELS = ("dkv_reduce_thd_origins_kernel",)  # the dK / dV group fold launched by the one-CTA AND the pair grouped THD chains
+_PTX_ENTRY = re.compile(r"^(?:\.visible )?\.entry (\S+?)\(", re.M)
+_KERNEL_NAME = re.compile(r"^cudnn_kernel_(\w+?_kernel)(?:_|$)")
+_RECORD_ROW = re.compile(r"^(\S+) (sm_\w+) (\S+) kernel=(\S+) rc=0 ptx_md5=([0-9a-f]{32})$")
+
+
+def ptx_kernel_name(mangled: str) -> str:
+    """The DSL function's name from a mangled entry symbol: ``cudnn_kernel_<name>_kernel<type mangling>`` -> ``<name>_kernel``."""
+    m = _KERNEL_NAME.match(mangled)
+    return m.group(1) if m else mangled
+
+
+def ptx_kernel_md5s(text: str) -> dict:
+    """{kernel: md5} over the entry regions of ONE dumped PTX module (text), in entry order: a region runs from its ``.entry`` line to the next
+    entry (or the end of the module); the preamble before the first entry is not a kernel and is not hashed."""
+    entries = list(_PTX_ENTRY.finditer(text))
+    out = {}
+    for i, m in enumerate(entries):
+        end = entries[i + 1].start() if i + 1 < len(entries) else len(text)
+        name = ptx_kernel_name(m.group(1))
+        assert name not in out, f"two entries named {name} in one module"
+        out[name] = hashlib.md5(text[m.start() : end].encode()).hexdigest()
+    return out
+
+
+def read_kernel_record(path, token: str, arch: str = "sm_100a") -> tuple:
+    """(dsl line or None, {variant: {kernel: md5}}) of a per-kernel record file for ``token`` / ``arch``; `#` lines are comments."""
+    dsl, want = None, {}
+    with open(path) as f:
+        for ln in f.read().splitlines():
+            if ln.startswith("dsl="):
+                dsl = ln[len("dsl=") :].strip()
+                continue
+            m = _RECORD_ROW.match(ln)
+            if m and m.group(1) == token and m.group(2) == arch:
+                want.setdefault(m.group(3), {})[m.group(4)] = m.group(5)
+    return dsl, want
+
+
+def kernel_record_rows(token: str, variant: str, kernels: dict, excluded=(), arch: str = "sm_100a") -> list:
+    """The record rows of a rendering (every kernel outside ``excluded``, in entry order): what a deliberate re-pin pastes into the file."""
+    return [f"{token} {arch} {variant} kernel={k} rc=0 ptx_md5={v}" for k, v in kernels.items() if k not in excluded]
+
+
+def assert_kernel_record(kernels: dict, want: dict, *, token: str, variant: str, excluded=(), what: str = "the rendering") -> None:
+    """Every recorded kernel renders the recorded md5 and every rendered kernel outside ``excluded`` is recorded (a new launch in a chain is a
+    protocol change, re-pinned deliberately); a shared kernel in ``excluded`` is never compared.  The message names the moved / new / missing
+    kernels and carries the rows a deliberate re-pin pastes into the record."""
+    own = {k: v for k, v in kernels.items() if k not in excluded}
+    moved = {k: (want[k], own[k]) for k in want if k in own and own[k] != want[k]}
+    new, missing = sorted(set(own) - set(want)), sorted(set(want) - set(own))
+    rows = "\n".join(kernel_record_rows(token, variant, kernels, excluded))
+    assert not moved and not new and not missing, f"{what}: moved (record -> rendered) {moved}; new {new}; missing {missing}; rendered rows:\n{rows}"

@@ -40,6 +40,9 @@ DTYPE = cudnn.data_type.HALF
 def _fake_sm100(monkeypatch):
     """Fake an SM100 device so the device-family gate passes without a real GPU."""
     monkeypatch.setattr(ga, "_device_cc", lambda: (10, 0))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: (10, 0))
     # Pure capability tests also construct Rubin facts on non-Rubin DSL builds.
     from cudnn.frost import buffers
 
@@ -159,6 +162,7 @@ def test_zero_attn_scale_claims():
         "sdpa_bwd_sm107_mxfp8",
         "sdpa_bwd_sm100_d256",
         "sdpa_bwd_sm107_d512",
+        "sdpa_bwd_sm107_d192",
     }
 
 
@@ -244,13 +248,13 @@ def test_sm120_override_admits_prepared_and_declines_legacy_routes(monkeypatch, 
 
 @pytest.mark.parametrize("d", [128, 256])
 def test_override_filter_preserves_compatible_split_candidates(monkeypatch, d):
-    """A plain-store O may serve split plans even when TMA cannot bind it unsplit."""
+    """Both split and unsplit plans enforce the declared native layout contract."""
     from cudnn.sdpa.fwd import heuristics
 
     graph = _mk_graph(is_override_shape_enabled=True)
     q, k, v, dims, strides = _mk_qkv(graph, d=d)
     o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
-    # Odd token pitch is legal for the combine's ordinary global stores, not TMA.
+    # Native-only admission rejects an unaligned pitch before proposing plans.
     output_strides = (H * S * (d + 1), S * (d + 1), d + 1, 1)
     _finish_output(o, dims, output_strides)
     facts = _facts(graph)
@@ -259,12 +263,12 @@ def test_override_filter_preserves_compatible_split_candidates(monkeypatch, d):
     from dataclasses import replace
 
     split = replace(unsplit, split_kv=2)
-    assert engines.analyze_for(spec, graph)[1] is None  # provider has a compatible plan
+    assert "16-byte" in engines.analyze_for(spec, graph)[1]
     assert engines.analyze_for(spec, graph, unsplit)[1] is not None
-    assert engines.analyze_for(spec, graph, split)[1] is None
+    assert engines.analyze_for(spec, graph, split)[1] is not None
     monkeypatch.setattr(heuristics, "_knob_sets", lambda *_: [unsplit, split])
     plans = heuristics.recommend("A", facts, {spec.name: 20511})
-    assert [p.knobs for p in plans] == [split]
+    assert plans == []
     # Restore a TMA-bindable output: both contracts become eligible, regardless of ranking.
     o.set_stride(strides)
     fresh = ga.analyze(graph)
@@ -1059,16 +1063,16 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
     # Capabilities.pack_gqa_partial_d_shapes as a module tuple because the
     # adapter has no engine row in hand when it validates a knob request.  Pin
     # the two together so the gate cannot drift: the f16 SM100 row declares
-    # exactly the adapter's flavors. Native SM107 additionally admits D512;
+    # exactly the adapter's flavors. Native SM107 admits D64 and D512;
     # native SM107 D128 uses a shared route predicate because dense CGA1 still
     # requires whole groups. Quantized and SM120 routes retain their gates.
     from cudnn.sdpa.fwd.api_dsl import _SM100_PARTIAL_PACK_GQA_FLAVORS
 
     by_name = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
     assert by_name[engines.engine_name()].pack_gqa_partial_d_shapes == frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS)
-    assert frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS) == frozenset({(128, 128), (256, 256)})
+    assert frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS) == frozenset({(128, 128), (256, 256), (576, 512)})
     native_sm107 = engines.engine_name(arch="sm107")
-    assert by_name[native_sm107].pack_gqa_partial_d_shapes == frozenset({(512, 512)})
+    assert by_name[native_sm107].pack_gqa_partial_d_shapes == frozenset({(64, 64), (512, 512)})
     others = {name: caps.pack_gqa_partial_d_shapes for name, caps in by_name.items() if name not in (engines.engine_name(), native_sm107)}
     assert all(v is None for v in others.values()), others
 
@@ -1112,9 +1116,69 @@ def test_capabilities_positional_prefix_is_append_only():
         "kv_mask_dtypes",
         "tile_ns_by_d_shape",
         "pack_gqa_requires_divisible",
-        "band",
+        "thd_excluded_d_shapes",
     )
-    legacy_order = [n for n in names if n not in appended]
+    legacy_order = (
+        "sm_lo",
+        "sm_hi",
+        "phase",
+        "d_shapes",
+        "d_pad_multiple",
+        "thd_d_shapes",
+        "d_envelope_floors",
+        "dtypes",
+        "is_mxfp8",
+        "is_fp8",
+        "out_dtypes",
+        "o_block_scales",
+        "bias",
+        "dropout",
+        "score_mod",
+        "paged_kv",
+        "alibi",
+        "block_mask",
+        "rng_dump",
+        "score_max",
+        "score_sum_exp",
+        "dynamic_scale",
+        "unfuse_fma",
+        "stats_log2",
+        "seq_q_trim",
+        "right_band_widening",
+        "causal",
+        "bottom_right",
+        "swa",
+        "padded",
+        "sink",
+        "sink_dtypes",
+        "stats",
+        "lse_optional",
+        "thd",
+        "cu_seq_len",
+        "padded_stats",
+        "decode",
+        "single_wave_only",
+        "skv_tail_via_padding",
+        "layouts",
+        "skv_tile",
+        "sched_policies",
+        "tile_ms",
+        "tile_ns",
+        "cgas",
+        "sched_policies_by_d_shape",
+        "cgas_by_d_shape",
+        "split_cgas_by_d_shape",
+        "pack_gqas",
+        "split_kv_supported",
+        "split_d_shapes",
+        "softmax_precisions",
+        "pack_gqa_d_shapes",
+        "thd_padded_stats",
+        "epilogue_gate",
+        "epilogue_gate_d_shapes",
+        "epilogue_gate_dtypes",
+    )
+    assert names[: len(legacy_order)] == list(legacy_order), names
     caps = engines.Capabilities(*[legacy_value(n) for n in legacy_order])
     assert caps.thd_padded_stats is True
     assert caps.pack_gqa_partial_d_shapes is None
@@ -1135,8 +1199,10 @@ def test_capabilities_positional_prefix_is_append_only():
     assert names[start : start + len(legacy_tail)] == legacy_tail, names[start:]
     # ... and every later field is appended after it, in the order it landed (the zero-scale and pre-folded-scale fields,
     # then the resident-bias / kv_mask fields of the Rubin small tiles and their per-shape TILE_N domain, then the PackGQA
-    # divisibility rule; the canonical band set (#601) is the newest and sits at the very end).
-    assert names[start + len(legacy_tail) :] == list(appended), names[start:]
+    # divisibility rule, last). The canonical band set (#601) is appended after every other field and stays the last one.
+    first_appended = start + len(legacy_tail)
+    assert names[first_appended : first_appended + len(appended)] == list(appended), names[start:]
+    assert names[-1] == "band", names[-3:]
 
     # Positional construction in the PRE-BAND order (every row's spelling before the canonical model landed) still binds every
     # field, and the appended band set is DERIVED from those flags rather than shadowing them.  The row built here carries the
@@ -1157,13 +1223,14 @@ def test_capabilities_positional_prefix_is_append_only():
     )
 
     bwd_names = [f.name for f in dataclasses.fields(bwd_engines.Capabilities)]
-    assert bwd_names[-7:] == [
+    assert bwd_names[-8:] == [
         "bottom_right_s_q_multiple",
         "thd_head_stride",
         "zero_scale",
         "thd_ragged_offsets",
         "compact_bshd",
         "declaration_check",
+        "independent_head_dims",
         "band",
     ], bwd_names
 
@@ -1358,7 +1425,7 @@ def test_sm107_small_tile_row_accepts_the_bias_and_kv_mask_in_their_served_forms
     po, _ = pad.sdpa(name="s", q=pq, k=pk, v=pv, attn_scale=0.1, is_inference=True, kv_mask=pm)
     _finish_output(po, (B, H, S, d), (S * H * d, d, H * d, 1), dtype=dt)
     why = engines.mismatch(caps, _facts(pad))
-    assert why is not None and "prepared launch" in why and "bind without a copy" in why, why
+    assert why is not None and "q:" in why and "16-byte" in why, why
 
 
 def test_additive_kv_mask_needs_a_whole_granule_extent(monkeypatch):
@@ -2512,10 +2579,9 @@ def _mk_paged_graph_fp8(*, d=128, page_size=16, max_pages=8, hnd=True, thd=False
 
 
 def test_paged_fp8_probe_accepts_and_declines():
-    """Paged per-tensor FP8 is the d128 FP8 kernel's PAGED_KV specialization: the fp8
-    row admits d128 (and d64 on its envelope) pools in HND or NHD, dense Q only; it
-    declines the d256 flavor, THD queries over pools and off-contract page sizes.
-    The f16/bf16 row never serves an sdpa_fp8 graph."""
+    """Paged per-tensor FP8 admits native D128/D256 with dense or THD Q.
+    D64 and aligned D256 envelope heads serve dense Q only. Off-contract pages remain declined, and the
+    f16/bf16 row never serves an sdpa_fp8 graph."""
     fp8_name = engines.engine_name(fp8=True)
     for hnd in (True, False):
         facts = _facts(_mk_paged_graph_fp8(hnd=hnd))
@@ -2524,17 +2590,26 @@ def test_paged_fp8_probe_accepts_and_declines():
         assert fp8_name in elig and engines.engine_name() not in elig
     assert fp8_name in _eligible(_mk_paged_graph_fp8(d=64)), "d=64 FP8 rides the d128 FP8 envelope"
     assert fp8_name in _eligible(_mk_paged_graph_fp8(page_size=128))
-    assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=256)), "paged per-tensor FP8 is wired on the d128 flavor only"
-    assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=192)), "(192, 192) would select the d256 FP8 flavor"
+    row = next(spec.capabilities for spec in engines.ENGINE_SPECS if spec.name == fp8_name)
+    for d in (192, 224, 256):
+        for hnd in (True, False):
+            graph = _mk_paged_graph_fp8(d=d, hnd=hnd)
+            assert fp8_name in _eligible(graph)
+            assert engines._selected_d_shape(row, _facts(graph)) == (256, 256)
+    assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=225)), "FP8 head widths must be 16-aligned"
     assert fp8_name not in _eligible(_mk_paged_graph_fp8(page_size=48)), "page_size must divide 128 or be a multiple of it"
-    assert fp8_name not in _eligible(_mk_paged_graph_fp8(thd=True)), "THD queries over FP8 pools clamp runtime K/V descriptors; declined"
+    for d in (128, 256):
+        for hnd in (True, False):
+            assert fp8_name in _eligible(_mk_paged_graph_fp8(d=d, hnd=hnd, thd=True))
+    for d in (64, 192, 224):
+        assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=d, thd=True))
 
 
 def test_paged_quantized_rows_mismatch_reasons():
     """The row-level reasons, by field: the SM100 MXFP8 row admits F8_128x4 pools at
     page_size % 128 only, the Rubin per-tensor FP8 row does not admit pools (its sibling
     kernel has no PAGED_KV specialization), and the SM100 FP8 row's paged sub-gates name
-    THD and the d128 envelope."""
+    THD and unsupported asymmetric head dimensions."""
 
     def paged_facts(**kw):
         base = dict(
@@ -2564,16 +2639,21 @@ def test_paged_quantized_rows_mismatch_reasons():
     assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=64, d_v=64)) is None
     assert "multiple of 128" in engines.mismatch(mxfp8, paged_facts(is_mxfp8=True))
     assert "paged attention" in engines.mismatch(fp8_rubin, paged_facts(is_fp8=True, device_cc=(10, 7)))
-    assert "THD" in engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True))
-    # The head-dim gate is the SELECTED flavor (Capabilities.paged_d_shapes = {(64, 64), (128, 128)} on the fp8 row).
-    assert "wired on the d64, d128 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=256, d_v=256))
-    assert "wired on the d64, d128 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=128))
+    for cc in ((10, 0), (10, 3)):
+        for d in (128, 256):
+            assert engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True, d_qk=d, d_v=d, device_cc=cc)) is None
+    assert "dense-only" in engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True, d_qk=64, d_v=64))
+    assert "native per-tensor D128/D256" in engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True, d_qk=512, d_v=512))
+    # D192/V192 selects the D256 envelope; D192/V128 selects the unpaged D192 flavor.
+    assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=256, d_v=256)) is None
+    assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=192)) is None
+    assert "wired on the d64, d128, d256 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=128))
     for d in (64, 128):
         sink_facts = paged_facts(is_fp8=True, has_sink=True, d_qk=d, d_v=d)
         assert engines.mismatch(fp8, sink_facts) is None
         split_knobs = engines.SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=2)
         assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=d, d_v=d), split_knobs) is None
-        assert "sink-free dense" in engines.mismatch(fp8, sink_facts, split_knobs)
+        assert engines.mismatch(fp8, sink_facts, split_knobs) is None
     # Block-scaled O (#1088) over pools: epilogue and loader are independent, but the pair is not validated.
     assert "block-scaled O" in engines.mismatch(fp8, paged_facts(is_fp8=True, dtype_o=cudnn.data_type.FP8_E4M3, o_block_scale=32))
     assert "block-scaled O" in engines.mismatch(mxfp8, paged_facts(is_mxfp8=True, page_size=128, dtype_o=cudnn.data_type.FP8_E4M3, o_block_scale=32))
@@ -2835,29 +2915,23 @@ def test_gate_tail_declines_a_broadcast_g_and_an_undeclared_o_v(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "gate_strides",
-    [(H * S * _D256, S * _D256, _D256, 1), (S * H * 260, 260, H * 260, 1)],
+    "gate_strides,accepted",
+    [((H * S * _D256, S * _D256, _D256, 1), True), ((S * H * 260, 260, H * 260, 1), False)],
     ids=["head-major", "unaligned-head-stride"],
 )
-def test_gate_tail_declines_a_g_the_kernel_cannot_tma_load(monkeypatch, gate_strides):
-    """G is TMA-loaded ZERO-COPY by the fused kernel (Q/K/V/O have a normalisation
-    copy in the lowering; G has none), so a rank-4, O-SHAPED G whose strides TMA
-    cannot express -- head-major (the seq stride does not cover the heads), or a
-    head stride that is not a 16-byte multiple -- is a legal graph that the tail
-    matcher recognises, ``epilogue_gate_layout_ok`` records as False, and the
-    row declines naming the zero-copy rule.  This is the analyzer half of the
-    adapter's ``TMA-expressible`` ValueError (rule 8b): without it the row
-    would admit a G ``check_support`` then rejects."""
+def test_gate_tail_uses_native_dense_stride_contract(monkeypatch, gate_strides, accepted):
+    """Aligned head-major gates bind directly; unaligned pitches decline early."""
     _rubin(monkeypatch)
     spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
     g, ts = _mk_gated_graph(gate_strides=gate_strides)
     facts = _facts(g)
     assert facts.has_epilogue_gate is True and facts.epilogue_gate_t is ts["gate"]
-    assert facts.epilogue_gate_shape_ok is True, "the shape is O's -- only the LAYOUT is at fault"
-    assert facts.epilogue_gate_layout_ok is False
-    assert not _eligible(g)
-    assert "zero-copy" in engines.analyze_for(spec, g)[1]
-    # The same G declared BSHD-compact is served: the layout fact is the only difference.
+    assert facts.epilogue_gate_shape_ok is True
+    assert facts.epilogue_gate_layout_ok is accepted
+    reason = engines.analyze_for(spec, g)[1]
+    assert (reason is None) is accepted
+    if not accepted:
+        assert "zero-copy" in reason
     assert _eligible(_mk_gated_graph()[0]) == {"sdpa_fwd_prefill_sm107"}
 
 
@@ -3088,12 +3162,14 @@ def test_prepared_mxfp8_override_contract(thd, override, split, accepted, rubin_
 MXFP8_ENGINE = engines.engine_name(mxfp8=True)
 
 
-def _mk_paged_mxfp8(*, page=128, max_pages=8, d=256, kh=2, s_q=1, thd=False, v_nhd=False, q_bhsd=False, dtype=cudnn.data_type.FP8_E4M3):
+def _mk_paged_mxfp8(*, page=128, max_pages=8, d=256, kh=2, s_q=1, thd=False, v_nhd=False, q_bhsd=False, dtype=cudnn.data_type.FP8_E4M3, q_unaligned=False):
     """sdpa_mxfp8 over HND page pools + pool-shaped descales."""
     g = cudnn.pygraph(io_data_type=dtype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     num_pages = B * max_pages + 3
     q_dims = (B, H, s_q, d)
     q_strides = (H * s_q * d, s_q * d, d, 1) if q_bhsd else (s_q * H * d, d, H * d, 1)
+    if q_unaligned:
+        q_strides = (H * s_q * (d + 1), s_q * (d + 1), d + 1, 1)
     pool_dims = (num_pages, kh, page, d)
     hnd = (kh * page * d, page * d, d, 1)
     nhd = (page * kh * d, d, kh * d, 1)
@@ -3162,8 +3238,9 @@ def test_paged_mxfp8_probe_accepts_and_declines():
     assert reason is not None and "multiple of 128" in reason, reason
     reason = _mxfp8_reason(_mk_paged_mxfp8(thd=True))
     assert reason is not None and "THD" in reason, reason
-    reason = _mxfp8_reason(_mk_paged_mxfp8(q_bhsd=True, s_q=4))  # s_q > 1: at s_q == 1 the two layouts coincide
-    assert reason is not None and "BSHD" in reason, reason
+    assert _mxfp8_reason(_mk_paged_mxfp8(q_bhsd=True, s_q=4)) is None
+    reason = _mxfp8_reason(_mk_paged_mxfp8(q_unaligned=True, s_q=4))
+    assert reason is not None and "16-byte outer-stride alignment" in reason, reason
 
 
 def test_paged_mxfp8_accepts_mixed_pool_layouts():
@@ -3398,3 +3475,117 @@ def test_fp8_bwd_d256_admitted_by_the_cpp_node_on_rubin(monkeypatch, d, sm_versi
     else:
         with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="hidden_dim"):
             g.validate()
+
+
+@pytest.mark.parametrize(
+    "shape,thd,admitted",
+    [((576, 512), False, True), ((576, 512), True, True), ((568, 512), False, False), ((576, 504), False, False), ((384, 256), True, True)],
+)
+def test_native_d576_admission_preserves_other_head_envelopes(shape, thd, admitted):
+    from dataclasses import replace
+
+    facts = replace(_facts(_mk_eligible_graph()), d_qk=shape[0], d_v=shape[1], thd=thd)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    reason = engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=2, pack_gqa=False))
+    assert (reason is None) == admitted, reason
+
+
+def test_native_d576_thd_requires_matching_native_extension(monkeypatch):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    facts = replace(_facts(_mk_eligible_graph()), d_qk=576, d_v=512, thd=True)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    knobs = engines.SdpaFwdKnobs(cga=2, pack_gqa=False)
+    assert engines.mismatch(caps, facts, knobs) is None
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", SimpleNamespace(supports_physical_origins=True))
+    reason = engines.mismatch(caps, facts, knobs)
+    assert "native D576x512 THD requires the matching" in reason
+
+
+@pytest.mark.parametrize("shape,admitted", [((576, 512), True), ((512, 512), False)])
+def test_native_d576_dense_padding_split_admission(shape, admitted):
+    from dataclasses import replace
+
+    facts = replace(_facts(_mk_eligible_graph()), d_qk=shape[0], d_v=shape[1], padded=True)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    reason = engines.mismatch(caps, facts, engines.SdpaFwdKnobs(cga=2, split_kv=4, pack_gqa=False))
+    assert (reason is None) == admitted, reason
+
+
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("splits", [2, 5])
+def test_native_d576_thd_split_admission(monkeypatch, cc, packed, splits):
+    from dataclasses import replace
+
+    facts = replace(_facts(_mk_eligible_graph()), device_cc=cc, d_qk=576, d_v=512, thd=True, stats_t=None)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    reason = engines.mismatch(caps, facts, engines.SdpaFwdKnobs(cga=2, split_kv=splits, pack_gqa=packed))
+    assert reason is None, reason
+
+    from cudnn.api_base import TensorDesc
+    from cudnn.sdpa.fwd import api_dsl, config_sm100
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: cc)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(api_dsl, "_device_sm_count", lambda device: 148)
+
+    def desc(heads, tokens, width):
+        return TensorDesc(torch.bfloat16, (3, heads, tokens, width), (tokens * heads * width, width, heads * width, 1), (3, 1, 2, 0), "cuda:0")
+
+    api = api_dsl.SdpaFwdDslSm100(
+        desc(24, 256, 576),
+        desc(2, 384, 576),
+        desc(2, 384, 512),
+        desc(24, 256, 512),
+        thd=True,
+        cga=2,
+        split_kv=splits,
+        pack_gqa=packed,
+        seq_kv_lens_present=True,
+        cu_seq_q_lens=True,
+        cu_seq_kv_lens=True,
+    )
+    assert api.check_support()
+    cfg = config_sm100.make_cfg_d512_2x2(api.template_params(), cga_m=2)[0]
+    assert cfg.THD_VARLEN and cfg.SPLIT_KV == splits
+    assert cfg.TILE_K == 576 and cfg.TILE_O == 512
+    bounded_override = replace(facts, shape_overrides=True, max_total_seq_len_q=None)
+    assert engines.mismatch(caps, bounded_override, engines.SdpaFwdKnobs(cga=2, split_kv=splits, pack_gqa=packed)) is None
+
+
+def test_native_d576_thd_split_requires_matching_extension(monkeypatch):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    facts = replace(_facts(_mk_eligible_graph()), d_qk=576, d_v=512, thd=True, stats_t=None)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    knobs = engines.SdpaFwdKnobs(cga=2, split_kv=5, pack_gqa=True)
+    assert engines.mismatch(caps, facts, knobs) is None
+    # Preserve every parent extension capability; omit only this new ABI.
+    previous_features = {
+        name: getattr(cudnn._pybind_module._SdpaThdBinder, name)
+        for name in dir(cudnn._pybind_module._SdpaThdBinder)
+        if name.startswith("supports_") and name != "supports_native_d576_packed_split"
+    }
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", SimpleNamespace(**previous_features))
+    assert "native D576x512 THD split requires the matching" in engines.mismatch(caps, facts, knobs)
+    # The unsplit parent remains supported by this older extension.
+    assert engines.mismatch(caps, facts, engines.SdpaFwdKnobs(cga=2, split_kv=1, pack_gqa=True)) is None
+
+
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("sink", [False, True])
+def test_native_d576_thd_split_scope(paged, sink):
+    from dataclasses import replace
+
+    graph = _mk_paged_graph(d=576, d_v=512, sink=sink) if paged else _mk_eligible_graph()
+    facts = replace(_facts(graph), d_qk=576, d_v=512, thd=True, stats_t=None, has_sink=sink)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    knobs = engines.SdpaFwdKnobs(cga=2, split_kv=5, pack_gqa=True)
+    assert engines.mismatch(caps, facts, knobs) is None
+    assert engines.mismatch(caps, facts, replace(knobs, cga=1)) is not None
+    assert engines.mismatch(caps, replace(facts, has_epilogue_gate=True), knobs) is not None
+    assert not engines.thd_split_domain(caps, replace(facts, shape_overrides=True, max_total_seq_len_q=facts.b * facts.s_q + 1))

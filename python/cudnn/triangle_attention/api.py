@@ -45,7 +45,7 @@ Everything else is a typed decline quoting the ENGINE's own reason (``NotImpleme
 ``ValueError`` for a malformed one) -- including ``return_aux=True``: the row max is a side output the small-tile bias arm does not
 store yet, so the request is declined rather than served by a second pass.
 
-Masked-row conventions (documented, not chosen in code -- see ``docs/fe-oss-apis/triangle_attention.md``): a row whose every key is
+Masked-row conventions (documented, not chosen in code -- see ``docs/operations/attention/triangle_attention.md``): a row whose every key is
 masked reads ``o = 0``, ``lse = max = -inf`` here (the FROST SDPA invariant for an empty key range, on BOTH mask forms);
 cuEquivariance's ``kv_lengths`` route zeroes such a row (``o = lse = max = 0``) and its dense-mask route folds a finite ``-1e9``
 (``o`` = the uniform average of ``v``, ``lse = max = -1e9``).  :func:`mask_to_kv_lengths` therefore changes what a fully masked row

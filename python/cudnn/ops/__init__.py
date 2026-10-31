@@ -34,6 +34,8 @@ _LAZY_EXPORTS = {
     "block_sparse_attention_forward": ("cudnn.block_sparse_attention", "block_sparse_attention_forward"),
     "block_sparse_attention_backward": ("cudnn.block_sparse_attention", "block_sparse_attention_backward"),
     "block_sparse_attention_fp8_forward": ("cudnn.block_sparse_attention", "block_sparse_attention_fp8_forward"),
+    "kpage_prepare_layout": ("cudnn.block_sparse_attention", "kpage_prepare_layout"),
+    "KPageLayout": ("cudnn.block_sparse_attention", "KPageLayout"),
     "kimi_delta_attention_forward_jax": ("cudnn.linear_attention.jax_api", "kimi_delta_attention_fwd"),
     "kimi_delta_attention_backward_jax": ("cudnn.linear_attention.jax_api", "kimi_delta_attention_bwd"),
     "block_sparse_attention_forward_jax": ("cudnn.block_sparse_attention.jax_api", "block_sparse_attention_forward"),

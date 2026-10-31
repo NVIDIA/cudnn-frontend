@@ -19,6 +19,9 @@ from .kernels import fprop_dense, fprop_prepare, fprop_sm100
 
 FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 SOURCE_DIGESTS = tuple(module.FROST_SOURCE_DIGEST for module in (_metadata, fprop_dense, fprop_prepare, fprop_sm100))
+_N64_SOURCE_DIGESTS = tuple(
+    hashlib.sha256(Path(__file__).with_name("kernels").joinpath(name).read_bytes()).hexdigest() for name in ("fprop_n64_sm107.py", "_fprop_n64_ops.py")
+)
 
 
 @cute.jit
@@ -41,6 +44,7 @@ def _launch(
     stream: cuda.CUstream,
     arch: cutlass.Constexpr,
     gated: cutlass.Constexpr,
+    n64: cutlass.Constexpr,
 ):
     total, blocks = Int64(q.shape[0]), Int64(sel.shape[1])
     ids_offset = Int64(0)
@@ -82,7 +86,12 @@ def _launch(
         counts_offset = cute.ceil_div(total * blocks, 4) * 4
         counts = cute.make_tensor(scratch.iterator + counts_offset, cute.make_layout((total,)))
         _metadata._compact_host(sel, lo, hi, first, last, ids, counts, stream, arch == 107)
-        fprop_sm100._fprop_host(q, k, v, out, out32, lse, ids, counts, lo, hi, first, last, None, scale, stream, arch)
+        if cutlass.const_expr(n64):
+            from .kernels import fprop_n64_sm107
+
+            fprop_n64_sm107._fprop_host(q, k, v, out, out32, lse, ids, counts, lo, hi, first, last, None, scale, stream, arch)
+        else:
+            fprop_sm100._fprop_host(q, k, v, out, out32, lse, ids, counts, lo, hi, first, last, None, scale, stream, arch)
 
 
 @lru_cache(maxsize=None)
@@ -116,23 +125,32 @@ def _compile_args(hq, hkv, gated):
 
 
 @lru_cache(maxsize=None)
-def _compile_key(hq, hkv, arch, gated):
+def _compile_key(hq, hkv, arch, gated, n64=False):
     return template_key(
-        globals(), {**locals(), "sources": SOURCE_DIGESTS, "sm107": fprop_sm100._FPROP_SM107_SOURCE_DIGEST if arch == 107 else None}, "compile_kernel"
+        globals(),
+        {
+            **locals(),
+            "sources": SOURCE_DIGESTS,
+            "sm107": fprop_sm100._FPROP_SM107_SOURCE_DIGEST if arch == 107 else None,
+            "n64_sources": _N64_SOURCE_DIGESTS if n64 else None,
+        },
+        "compile_kernel",
     )
 
 
-def compile_kernel(hq, hkv, arch, gated):
-    key = _compile_key(hq, hkv, arch, gated)
+def compile_kernel(hq, hkv, arch, gated, n64=False):
+    key = _compile_key(hq, hkv, arch, gated, n64)
     return compile_cached(
-        _launch, *_compile_args(hq, hkv, gated), arch, gated, cache_key=key, symbol="qsa_forward_host", options=f"--enable-tvm-ffi --gpu-arch=sm_{arch}a"
+        _launch, *_compile_args(hq, hkv, gated), arch, gated, n64, cache_key=key, symbol="qsa_forward_host", options=f"--enable-tvm-ffi --gpu-arch=sm_{arch}a"
     )
 
 
 def launch(impl, arch, q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_first, block_last, out, out_fp32, lse, scale, stream):
     total, hq, _ = q.shape
     gated = 512 < total <= 16384
-    compiled = compile_kernel(hq, k.shape[1], arch, gated)
+    # The 64-key Rubin forward is specialised for 12 heads per KV head; 6:1 stays on the shared gathered body.
+    n64 = arch == 107 and hq == 12 * k.shape[1] and total >= 32768
+    compiled = compile_kernel(hq, k.shape[1], arch, gated, n64)
     align4 = lambda value: (value + 3) // 4 * 4
     scratch_elements = align4(total * sel_blocks.shape[1]) + total
     if gated:

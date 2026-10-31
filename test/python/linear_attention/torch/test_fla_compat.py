@@ -5,7 +5,8 @@
 shim) must match real flash-linear-attention within FLA's own bf16 noise, on the
 output AND every gradient. A config cuDNN cannot match must fall back, not run.
 
-Skipped unless ``flash-linear-attention`` is importable and the device is SM100.
+Skipped unless ``flash-linear-attention`` is importable and the device is SM100+,
+or SM90 for the KDA tests (cuDNN serves KDA on Hopper; GDN stays SM100+).
 """
 
 from __future__ import annotations
@@ -23,13 +24,16 @@ naive_recurrent = fla_gdr.naive_recurrent_gated_delta_rule
 from cudnn.fla import last_path, accelerate_fla, restore_fla
 from cudnn.fla.gated_delta_rule import make_chunk_gated_delta_rule
 
+_CC = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
+IS_SM90 = _CC == (9, 0)
+
 pytestmark = [
     pytest.mark.L0,
-    pytest.mark.skipif(
-        not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10),
-        reason="cuDNN GDN kernels require SM100 (Blackwell)",
-    ),
+    pytest.mark.skipif(not (_CC[0] >= 10 or IS_SM90), reason="cuDNN GDN/KDA kernels require SM90 or SM100+"),
 ]
+
+sm100 = pytest.mark.skipif(_CC[0] < 10, reason="cuDNN GDN kernels and the FROST KDA engine require SM100 (Blackwell)")
+sm90 = pytest.mark.skipif(not IS_SM90, reason="Hopper KDA routing")
 
 shim = make_chunk_gated_delta_rule(chunk_gated_delta_rule)
 
@@ -73,6 +77,7 @@ def _run_truth(master):
     return o, lv
 
 
+@sm100
 @pytest.mark.parametrize(
     "cfg",
     [
@@ -151,6 +156,7 @@ def _run_fused(fn, lv, allow_neg_eigval=False):
     return o
 
 
+@sm100
 @pytest.mark.parametrize("with_dt_bias", [True, False], ids=["bias", "no_bias"])
 @pytest.mark.parametrize("allow_neg_eigval", [False, True], ids=["sigmoid", "neg_eigval"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
@@ -193,6 +199,7 @@ def test_parity_fused_layer_path(dtype, allow_neg_eigval, with_dt_bias):
         check("d" + n, lv_fla[n].grad, lv_cud[n].grad, lv_ref[n].grad)
 
 
+@sm100
 def test_parity_fused_layer_path_with_packed_qkv_views():
     """FLA's fused short-conv splits one packed output into non-compact Q/K/V
     views.  The shim must compact those views before entering native GDN while
@@ -240,7 +247,7 @@ def test_parity_fused_layer_path_with_packed_qkv_views():
 
 kda_ops = pytest.importorskip("fla.ops.kda")
 chunk_kda = kda_ops.chunk_kda
-from cudnn.fla.kda import make_chunk_kda, last_path as kda_last_path
+from cudnn.fla.kda import _BWD_CHECKED, make_chunk_kda, last_path as kda_last_path
 
 kda_shim = make_chunk_kda(chunk_kda)
 
@@ -296,6 +303,7 @@ def _run_kda(fn, lv, gate, allow_neg_eigval=False):
     return o
 
 
+@sm100
 @pytest.mark.parametrize(
     "cfg",
     [
@@ -366,6 +374,7 @@ def test_kda_parity_fused(cfg):
     assert lv_cud["beta"].grad.dtype == torch.float32
 
 
+@sm100
 def test_fallback_is_transparent():
     """A config the native engine does not serve falls back and returns FLA's exact result.
 
@@ -380,6 +389,7 @@ def test_fallback_is_transparent():
     torch.testing.assert_close(o_cud, o_fla, rtol=0, atol=0)
 
 
+@sm100
 @pytest.mark.parametrize("state_v_first", [True, False], ids=["v_major", "k_major"])
 @pytest.mark.parametrize("with_initial_state", [False, True], ids=["zero_state", "initial_state"])
 def test_state_layouts(state_v_first, with_initial_state):
@@ -413,6 +423,7 @@ def test_state_layouts(state_v_first, with_initial_state):
         assert _relL2(h0_cud.grad, h0_fla.grad) <= C_SLACK * FLOOR
 
 
+@sm100
 @pytest.mark.parametrize("state_v_first", [True, False], ids=["v_major", "k_major"])
 @pytest.mark.parametrize("layout", ["dense", "varlen"])
 def test_kda_intermediate_states(layout, state_v_first):
@@ -463,6 +474,165 @@ def test_kda_intermediate_states(layout, state_v_first):
     expect0 = (h0 if cu is None else h0[:1]).to(h_cud.dtype)
     torch.testing.assert_close(h_cud[:, 0], expect0, rtol=0, atol=0)
     torch.testing.assert_close(h_fla[:, 0], expect0, rtol=0, atol=0)
+
+
+def _filled_batch(heads):
+    """The smallest batch whose (sequence, head) pairs reach two thirds of the SMs: below
+    that the shim sends Hopper calls to FLA."""
+    return -(-2 * torch.cuda.get_device_properties(0).multi_processor_count // (3 * heads))
+
+
+def _kda_check(name, a, b, ref, slack):
+    e_fla = _relL2(a, ref)
+    e_cud = _relL2(b, ref)
+    assert e_cud <= slack * max(e_fla, FLOOR), f"{name}: e_cud={e_cud:.2e} vs e_fla={e_fla:.2e} (slack {slack})"
+
+
+def _kda_clone(src, dt):
+    return {n: t.detach().clone().to(torch.float32 if n in ("beta", "A_log", "dt_bias") else dt).requires_grad_(True) for n, t in src.items()}
+
+
+@sm90
+def test_kda_sm90_fused_inference_native():
+    """On Hopper a gradient-free call with the layer's fused transforms (q/k
+    L2-norm, beta sigmoid, lower-bounded gate with ``A_log`` and ``dt_bias``) is
+    served by the Hopper engine, within a fixed factor of FLA's own bf16 error."""
+    master = _kda_leaves(B=_filled_batch(4), T=128, H=4, HV=4, K=128, V=128, dtype=torch.bfloat16, seed=5)
+    with torch.no_grad():
+        o_fla = _run_kda(chunk_kda, _kda_clone(master, torch.bfloat16), "lower_bound")
+        o_cud = _run_kda(kda_shim, _kda_clone(master, torch.bfloat16), "lower_bound")
+        assert kda_last_path() == "native", f"expected cuDNN native path, got {kda_last_path()}"
+        o_ref = _run_kda(chunk_kda, _kda_clone(master, torch.float32), "lower_bound")
+    _kda_check("o", o_fla, o_cud, o_ref, 5.0)
+
+
+@sm90
+@pytest.mark.parametrize("gate", ["softplus", "lower_bound"])
+def test_kda_sm90_fused_training_falls_back(gate):
+    """The Hopper backward takes pre-normalized q/k and post-sigmoid beta, so a
+    training call with fused transforms falls back to FLA before the forward runs
+    (rather than failing in autograd), with FLA's exact output and gradients."""
+    B = _filled_batch(4)
+    master = _kda_leaves(B=B, T=128, H=4, HV=4, K=128, V=128, dtype=torch.bfloat16, seed=5)
+    do = torch.randn(B, 128, 4, 128, device="cuda", dtype=torch.bfloat16)
+    lv_fla, lv_cud = _kda_clone(master, torch.bfloat16), _kda_clone(master, torch.bfloat16)
+    o_fla = _run_kda(chunk_kda, lv_fla, gate)
+    o_cud = _run_kda(kda_shim, lv_cud, gate)
+    assert kda_last_path() == "fallback:_Decline", f"expected the backward check to decline, got {kda_last_path()}"
+    o_fla.backward(do)
+    o_cud.backward(do)
+    torch.testing.assert_close(o_cud, o_fla, rtol=0, atol=0)
+    for n in master:
+        torch.testing.assert_close(lv_cud[n].grad, lv_fla[n].grad, rtol=0, atol=0, msg=n)
+
+
+@sm90
+def test_kda_sm90_cached_backward_decline_keeps_no_inputs():
+    """The backward-check cache holds the decline's text, not the exception: a
+    re-raised cached exception grows its traceback and keeps every declined call's
+    frames, and so its CUDA inputs, alive for the life of the process."""
+    import gc
+    import weakref
+
+    B = _filled_batch(4)
+    master = _kda_leaves(B=B, T=128, H=4, HV=4, K=128, V=128, dtype=torch.bfloat16, seed=5)
+    do = torch.randn(B, 128, 4, 128, device="cuda", dtype=torch.bfloat16)
+    refs = []
+    _BWD_CHECKED.clear()
+    for _ in range(3):
+        lv = _kda_clone(master, torch.bfloat16)
+        o = _run_kda(kda_shim, lv, "softplus")
+        assert kda_last_path() == "fallback:_Decline", kda_last_path()
+        o.backward(do)
+        refs.append(weakref.ref(lv["q"]))
+        del lv, o
+    gc.collect()
+    assert all(r() is None for r in refs), "a declined call's q is still referenced after it returned"
+    assert len(_BWD_CHECKED) == 1 and all(isinstance(v, str) for v in _BWD_CHECKED.values()), _BWD_CHECKED
+
+
+@sm90
+@pytest.mark.parametrize("with_initial_state", [False, True], ids=["zero_state", "initial_state"])
+def test_kda_sm90_training_native(with_initial_state):
+    """A training call inside the Hopper backward's envelope (bf16 io, head dim
+    128, pre-normalized q/k, post-sigmoid fp32 beta, fp32 log-space g, default
+    scale, equal heads) runs natively in both directions; the output, final state
+    and every gradient are within a fixed factor of FLA's own bf16 error from a
+    fp32 FLA reference."""
+    T, H, K, V = 128, 4, 128, 128
+    B = _filled_batch(H)
+    gen = torch.Generator(device="cuda").manual_seed(11)
+    master = {
+        "q": F.normalize(torch.randn(B, T, H, K, generator=gen, device="cuda"), dim=-1),
+        "k": F.normalize(torch.randn(B, T, H, K, generator=gen, device="cuda"), dim=-1),
+        "v": torch.randn(B, T, H, V, generator=gen, device="cuda"),
+        "g": -torch.rand(B, T, H, K, generator=gen, device="cuda").mul(0.2),
+        "beta": torch.rand(B, T, H, generator=gen, device="cuda").sigmoid(),
+    }
+    if with_initial_state:
+        master["h0"] = torch.randn(B, H, K, V, generator=gen, device="cuda")
+    do = torch.randn(B, T, H, V, generator=gen, device="cuda")
+    dfs = torch.randn(B, H, K, V, generator=gen, device="cuda")
+
+    def run(fn, io_dtype):
+        lv = {n: t.detach().clone().to(io_dtype if n in ("q", "k", "v") else torch.float32).requires_grad_(True) for n, t in master.items()}
+        o, fs = fn(lv["q"], lv["k"], lv["v"], lv["g"], lv["beta"], initial_state=lv.get("h0"), output_final_state=True)
+        (o.float() * do).sum().add((fs * dfs).sum()).backward()
+        return o, fs, lv
+
+    o_fla, fs_fla, lv_fla = run(chunk_kda, torch.bfloat16)
+    o_cud, fs_cud, lv_cud = run(kda_shim, torch.bfloat16)
+    assert kda_last_path() == "native", f"expected cuDNN native path, got {kda_last_path()}"
+    o_ref, fs_ref, lv_ref = run(chunk_kda, torch.float32)
+    _kda_check("o", o_fla, o_cud, o_ref, 5.0)
+    _kda_check("final_state", fs_fla, fs_cud, fs_ref, 5.0)
+    for n in master:
+        _kda_check("d" + n, lv_fla[n].grad, lv_cud[n].grad, lv_ref[n].grad, 8.0 if n == "g" else 5.0)
+
+
+@sm90
+@pytest.mark.parametrize("layout", ["dense", "varlen"])
+def test_kda_sm90_underfilled_falls_back(layout):
+    """Fewer (sequence, head) pairs than two thirds of the SMs: FLA is faster there, so the
+    call goes to FLA with its exact result. One sequence short of the threshold is enough."""
+    H, K, V, T = 4, 128, 128, 128
+    n = _filled_batch(H) - 1
+    gen = torch.Generator(device="cuda").manual_seed(13)
+    B, cu = (n, None) if layout == "dense" else (1, torch.arange(0, (n + 1) * T, T, dtype=torch.long, device="cuda"))
+    tokens = T if layout == "dense" else n * T
+    io = lambda *shape: torch.randn(*shape, generator=gen, device="cuda", dtype=torch.bfloat16)
+    q, k, v = io(B, tokens, H, K), io(B, tokens, H, K), io(B, tokens, H, V)
+    g = -torch.rand(B, tokens, H, K, generator=gen, device="cuda").mul(0.2)
+    beta = torch.rand(B, tokens, H, generator=gen, device="cuda")
+    with torch.no_grad():
+        ref = chunk_kda(q, k, v, g, beta, output_final_state=True, use_qk_l2norm_in_kernel=True, cu_seqlens=cu)
+        out = kda_shim(q, k, v, g, beta, output_final_state=True, use_qk_l2norm_in_kernel=True, cu_seqlens=cu)
+    assert kda_last_path() == "fallback:underfilled", f"expected fallback:underfilled, got {kda_last_path()}"
+    for a, b in zip(out, ref):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+@sm90
+def test_kda_sm90_intermediate_states_fall_back():
+    """The Hopper kernel produces no per-chunk state series, so
+    ``return_intermediate_states`` falls back to FLA with its exact results."""
+    T, H, K, V = 200, 4, 128, 128
+    B = _filled_batch(H)
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    io = lambda *shape: torch.randn(*shape, generator=gen, device="cuda", dtype=torch.bfloat16)
+    q, k, v = io(B, T, H, K), io(B, T, H, K), io(B, T, H, V)
+    g = -torch.rand(B, T, H, K, generator=gen, device="cuda").mul(0.2)
+    beta = torch.rand(B, T, H, generator=gen, device="cuda")
+
+    def run(fn):
+        with torch.inference_mode():
+            return fn(q, k, v, g, beta, output_final_state=True, use_qk_l2norm_in_kernel=True, return_intermediate_states=True)
+
+    ref = run(chunk_kda)
+    out = run(kda_shim)
+    assert kda_last_path().startswith("fallback") and kda_last_path() != "fallback:underfilled", f"expected the engine to decline, got {kda_last_path()}"
+    for a, b in zip(out, ref):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
 
 
 def test_accelerate_fla_patches_and_restores():

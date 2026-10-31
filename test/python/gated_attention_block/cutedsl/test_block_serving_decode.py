@@ -18,6 +18,12 @@ capture-safe projections); the execute-time refusals on an UNCOMPILED block -- t
 under ``kv_source="paged"``, ``block_table`` + ``kv_lens`` REQUIRED, form checks -- under ``set_sync_debug_mode("error")``;
 the workspace carve unchanged by the read.
 
+cc 10.0 cells (``requires_blackwell``, 2026-10-29; the SM100 line of ``DENSE_SERVING_CCS``, functional only): the same oracle matrix at
+every served group x ``S_q`` 1 .. 5 with ``fuse_gate=False`` (the sm100 row claims no gate epilogue: stage (5) its own launch) on the
+SM100 decode tile (``sm100/decode_d256_f16.py``: the 16-column tile packed, the 16-column tile UNPACKED at groups 6 / 12 past 16 rows,
+the paged prefill tile packed at groups 16 / 8 / 4 -- the line's own rule, pinned on the compiled module), the 27B geometry (24 / 4 at
+``d_model`` 5120) at ``S_q`` 1 / 4, the pool matrix, capture / replay, two launches; the Rubin-only knobs declined by name there.
+
 Rubin cells (one compiled block per cell, cached): every served group x ``S_q`` 1 .. 5 against the per-sequence fp32 oracle
 (the block run on the FULL sequence, its last ``S_q`` rows; the prefix K / V of the pools ARE the oracle's bf16 rows), with
 ``kv_lens > S_q`` on every live row, a tail tile, one KV tile, ring depth 3 and 4, a padded entry (``kv_lens = 0`` + block 0 +
@@ -31,12 +37,18 @@ same values BITWISE on every page size (16 / 32 / 64 / 128) and f16; a block tab
 arbitrary row stride (bitwise the compact table); CUDA-graph capture of the FIRST execute on a NEW stream with no warm-up and
 the replay with new lengths / tables / slots / inputs bitwise the eager run; ``get_workspace_size()`` honest (the split
 partials inside, a sentinel past the carve untouched); two launches bitwise.
+
+Both-parts cells (``requires_dense_part``, 2026-10-29; the end of the module): a serving stack's PACKED K|V cache -- ONE ``[pages, 4, P, 512]``
+tensor, K in columns ``[0, D)`` and V in ``[D, 2D)`` of every row -- bound as the two half views at the 24 / 4 geometry, page 16 with one
+token per sequence and page 32 with a four-token step, kv to 2048 with a padded and a short entry, int64 slots, bf16 and f16: the oracle,
+the write-through in the right halves with every other byte untouched, two launches bitwise, bitwise the HND-compact twin.
 """
 
 import contextlib
 import math
 import os
 import sys
+import time
 
 import pytest
 import torch
@@ -48,10 +60,15 @@ from cudnn.gated_attention_block import (
     DECODE_MAX_ROWS,
     DECODE_MAX_S_Q,
     DECODE_PREFILL_ROUTE_MIN_CTAS,
+    DECODE_ROUTE_POLICIES,
     DECODE_ROUTE_SINGLE_UNIT,
     DECODE_ROUTE_TOKEN_UNITS,
+    DECODE_WIDE_TILE_CCS,
+    DENSE_SERVING_CCS,
+    FP8_PROJ_BF16_ATTENTION_CCS,
     KV_SOURCE_PAGED,
     KV_SOURCE_SELF,
+    QUANT_MODE_FP8_PROJ_BF16_ATTENTION,
     SERVING_PAGE_SIZES,
     SERVING_POOL_LAYOUTS,
     DecodeEnvelope,
@@ -59,10 +76,23 @@ from cudnn.gated_attention_block import (
     GatedAttentionBlockFwd,
     GatedAttentionBlockGeometry,
     QsaSpec,
+    QuantSpec,
     ServingEnvelope,
     decode_route,
 )
-from cudnn.gated_attention_block.api import DECODE_TILE, PREFILL_TILE, _CacheWrite, _cols, _Projection, _Sdpa, _SigmoidGate, _view, decode_split_choice
+from cudnn.gated_attention_block import api as _api  # noqa: E402  (the device read the cc 10.0 host rows patch)
+from cudnn.gated_attention_block.api import (
+    DECODE_TILE,
+    PREFILL_TILE,
+    _CacheWrite,
+    _cols,
+    _Projection,
+    _Quantize,
+    _Sdpa,
+    _SigmoidGate,
+    _view,
+    decode_split_choice,
+)
 
 requirement_error = cutedsl_requirement_error("the gated attention block's serving tests")
 if requirement_error:
@@ -71,10 +101,20 @@ if requirement_error:
 pytestmark = pytest.mark.L0
 
 requires_rubin = pytest.mark.requires_rubin  # the suite's registered marker (conftest.py): skipped off SM107
+requires_blackwell = pytest.mark.requires_blackwell  # the registered marker: an admitted Blackwell-line part of DENSE_SERVING_CCS (cc 10.0)
+requires_dense_part = pytest.mark.requires_dense_part  # the registered marker: EVERY served part of DENSE_SERVING_CCS (cc 10.7 and cc 10.0)
+_SM100 = (10, 0)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from gated_block_reference import RefGeometry, build_rope_tables, gated_attention_block_reference  # noqa: E402
+from gated_block_reference import (  # noqa: E402
+    RefGeometry,
+    amax_scale,
+    build_rope_tables,
+    gated_attention_block_fp8_reference,
+    gated_attention_block_reference,
+    quant_e4m3,
+)
 
 _DEV = "cuda" if torch.cuda.is_available() else "cpu"
 _SM107 = (10, 7)
@@ -267,11 +307,49 @@ _ROUTE_TABLE_CAP_32_BELOW_FILL = {
     4: {9: (_T, 32, 2, True)},
 }
 _ROUTE_TABLE = _ROUTE_TABLES[DECODE_ROUTE_SINGLE_UNIT]
+# THE SM100 LINE (cc 10.0; 2026-10-29): (tile, n_q, token units, packed, kv_streams) per (group, S_q) at the SMALL-LAUNCH reading (no
+# batch / no KV bound: never a wide launch) -- the SDPA adapter's own rule off cc 10.7, input for input (config_sm100.decode_d256_q_tile
+# with the wide-tile reading of config_sm100.d256_wide_decode_launch): packed rows <= 16 ride the 16-column tile in ONE unit; the
+# 32-column arm the adapter takes on a WIDE launch (>= 8 units streaming >= 4096 KV tiles: ``_SM100_WIDE`` below) is a typed decline
+# naming the lift until its cells run (``DECODE_WIDE_TILE_CCS``, EMPTY; the review follow-up of 2026-10-29); else the paged prefill tile
+# packed wherever the group divides 128 (16 / 8 / 4), at EVERY batch (no two-unit arm on the line) under BOTH policies; else the
+# 16-column tile UNPACKED (``group`` streams) to 16 tokens; 17 .. 32 tokens unpacked need the 32-column width = a typed decline at every
+# launch (``--``: the rule off the wide launch, the same arm on it); 33 the EXTEND form's business as on cc 10.7.  No cap
+# (``decode_q_tile_max`` names the Rubin table), ``claimed`` False everywhere (the claimed envelope is the Rubin measurement),
+# ``pdl_capable`` on the decode tile.
+_U = lambda g: (_T, 16, 1, False, g)  # noqa: E731  -- the 16-column tile unpacked, one head per CTA
+_SM100_ROUTE_TABLE = {
+    16: {1: (_T, 16, 1, True, 1), **{s: (_P, 0, 0, True, 1) for s in range(2, 9)}, **{s: _U(16) for s in range(9, 17)}, **{s: None for s in range(17, 34)}},
+    12: {1: (_T, 16, 1, True, 1), **{s: _U(12) for s in range(2, 17)}, **{s: None for s in range(17, 34)}},
+    8: {1: (_T, 16, 1, True, 1), 2: (_T, 16, 1, True, 1), **{s: (_P, 0, 0, True, 1) for s in range(3, 17)}, **{s: None for s in range(17, 34)}},
+    6: {1: (_T, 16, 1, True, 1), 2: (_T, 16, 1, True, 1), **{s: _U(6) for s in range(3, 17)}, **{s: None for s in range(17, 34)}},
+    4: {**{s: (_T, 16, 1, True, 1) for s in range(1, 5)}, **{s: (_P, 0, 0, True, 1) for s in range(5, 33)}, 33: None},
+}
+# The wide cells of the line at group 6 (24 / 4, the 27B): (batch, max_kv_len, S_q) -> (the route TODAY, the route once the 32-column arm is
+# admitted = ``DECODE_WIDE_TILE_CCS`` gaining (10, 0)): the SDPA adapter's rule takes the 32-column tile packed (W) or unpacked (U32) there and
+# the block declines that arm by name until its cells run (None today, the lift in the reason); the small launches of the same steps keep the
+# table above.  Units = batch x H_kv packed (4 KV heads), batch x H_q unpacked (24).
+_W32, _U32 = (_T, 32, 1, True, 1), (_T, 32, 1, False, 6)
+_SM100_WIDE = {
+    (2, 65536, 3): (None, _W32),  # 8 packed units x 512 tiles = 4096 tiles: W -- the arm, declined today
+    (32, 4096, 3): (None, _W32),  # 128 units x 32 tiles: W -- declined today
+    (1, 22528, 17): (None, _U32),  # 24 unpacked units x 176 tiles = 4224: U32 (6 streams) -- declined today
+    (4, 5632, 17): (None, _U32),  # 96 x 44 = 4224: U32 -- declined today
+    (1, 1024, 3): (_U(6), _U(6)),  # 4 packed units: not wide -> the table's U16 on both readings
+    (4, 1024, 17): (None, None),  # 96 x 8 = 768 tiles: not wide -> the unpacked decline on both readings (the width needs the wide rule AND the arm)
+}
+_WIDE_ARM_LIFT = "the 32-column SM100 decode arm: its cc 10.0 accept cells have not run; admitted when they do (DECODE_WIDE_TILE_CCS gains the part)"
 _SENTINEL = 1024.0  # the pools' fill: FINITE (a serving stack's cache is zero-initialized; the tail tile reads and masks the rows past kv_len)
 
 
 def _cc():
     return tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
+
+
+def _rubin_reading(monkeypatch):
+    """The RUBIN reading of the route on any host for the host rows that pin the Rubin table's facts on a DECLARED block: since 2026-10-29
+    a declaration reads its device's line (a cc 10.0 host records the SM100 table), so these rows pin the part the facts belong to."""
+    monkeypatch.setattr(_api, "_route_device_cc", lambda device: None)
 
 
 @contextlib.contextmanager
@@ -426,6 +504,127 @@ def test_the_route_table_per_group_and_s_q_is_the_adapters_rule(group, policy):
     assert not decode_route(d128, 1).served and "d_head=128" in decode_route(d128, 1).reason  # no decode tile outside the d256 flavor
 
 
+@pytest.mark.parametrize("policy", [DECODE_ROUTE_SINGLE_UNIT, DECODE_ROUTE_TOKEN_UNITS])
+@pytest.mark.parametrize("group", sorted(_GROUPS))
+def test_the_sm100_route_table_is_the_adapters_rule(group, policy, monkeypatch):
+    """The DECODE route on the SM100 line (``decode_route(device_cc=(10, 0))``, 2026-10-29) at every served group under BOTH policies
+    (they coincide there: the line has no token-unit arm): the table ``_SM100_ROUTE_TABLE`` cell for cell at the small-launch reading --
+    the 16-column tile packed, the paged prefill tile packed at every batch for a group dividing 128, the 16-column tile unpacked past
+    them, the typed decline of an unpacked step past 16 tokens (the 32-column arm), 33 the EXTEND form's --, the wide cells of
+    ``_SM100_WIDE`` at the (batch, max_kv_len) pairs that make the launch wide (the arm: declined by name today, the adapter's 32-column
+    tile once ``DECODE_WIDE_TILE_CCS`` names the part), ``claimed`` False on every cell, ``pdl_capable`` on the decode tile, the two
+    readbacks, the cap refused with the adapter's reason; an UNSERVED part (cc 10.3, sm80) reads the Rubin table -- the home reading,
+    ``device_cc`` None -- as the envelope and the declaration do (one rule), and the Rubin reading is the Rubin table."""
+    geom, _ = _geom(group)
+    for s_q, want in _SM100_ROUTE_TABLE[group].items():
+        r = decode_route(geom, s_q, policy=policy, device_cc=_SM100)
+        assert isinstance(r, DecodeRoute) and (r.s_q, r.group, r.policy, r.q_tile_max, r.device_cc, r.max_kv_len, r.batch) == (
+            s_q,
+            group,
+            policy,
+            None,
+            _SM100,
+            None,
+            None,
+        )
+        if want is None:
+            assert not r.served and r.tile is None and r.n_q == 0 and r.kv_streams == 0 and not r.claimed and not r.pdl_capable, (group, s_q, r)
+            assert ("EXTEND form" in r.reason) if s_q > DECODE_MAX_S_Q else ("WIDE launches only" in r.reason and _WIDE_ARM_LIFT in r.reason), (group, s_q, r)
+            continue
+        assert (r.tile, r.n_q, r.token_units, r.pack_gqa, r.kv_streams) == want, (group, s_q, policy, r)
+        assert r.served and r.reason == "" and r.claimed is False and r.pdl_capable is (want[0] == _T), (group, s_q, r)
+        assert r.decode_tile is (want[0] == _T) and r.prefill_tile is (want[0] == _P)
+        # the line is batch-blind below the wide rule: a small launch at any batch is the table's cell (the prefill tile needs no fill)
+        small = decode_route(geom, s_q, policy=policy, device_cc=_SM100, batch=1, max_kv_len=1024)
+        assert (small.tile, small.n_q, small.token_units, small.pack_gqa, small.kv_streams) == want and small.batch == 1 and small.max_kv_len == 1024
+        tu = decode_route(geom, s_q, policy=DECODE_ROUTE_TOKEN_UNITS, device_cc=_SM100)
+        assert (
+            tu.tile,
+            tu.n_q,
+            tu.token_units,
+            tu.pack_gqa,
+            tu.kv_streams,
+        ) == want and tu.policy == DECODE_ROUTE_TOKEN_UNITS, "both policies coincide on the line"
+        # an UNSERVED part (cc 10.3 until its cells admit it; an sm80 host) reads the Rubin table, the home reading, and says so
+        # (``device_cc`` None) -- the same reading the envelope's routes / route() and the declaration take there; the Rubin reading is the
+        # Rubin table under its own part
+        for other in ((10, 3), (8, 0)):
+            unserved = decode_route(geom, s_q, policy=policy, device_cc=other)
+            assert unserved == decode_route(geom, s_q, policy=policy) and unserved.device_cc is None, (other, s_q, unserved)
+        rubin = decode_route(geom, s_q, policy=policy, device_cc=_SM107)
+        assert rubin == decode_route(geom, s_q, policy=policy) and rubin.device_cc == _SM107
+    if group == 6:
+        for (b, kv, s_q), (want, flipped) in _SM100_WIDE.items():
+            r = decode_route(geom, s_q, policy=policy, device_cc=_SM100, batch=b, max_kv_len=kv)
+            got = None if not r.served else (r.tile, r.n_q, r.token_units, r.pack_gqa, r.kv_streams)
+            assert got == want and (r.batch, r.max_kv_len) == (b, kv) and not r.claimed, (b, kv, s_q, r)
+            if want is None:
+                # the arm's reason names the lift on both readings; a wide launch names itself, a small one the rule it is off
+                assert _WIDE_ARM_LIFT in r.reason and ("at a WIDE launch" in r.reason) is (flipped is not None), (b, kv, s_q, r.reason)
+            # the one-tuple lift: with the part in DECODE_WIDE_TILE_CCS the same inputs read the adapter's 32-column arm; nothing else moves
+            with monkeypatch.context() as m:
+                m.setattr(_api, "DECODE_WIDE_TILE_CCS", (_SM100,))
+                f = decode_route(geom, s_q, policy=policy, device_cc=_SM100, batch=b, max_kv_len=kv)
+                assert (None if not f.served else (f.tile, f.n_q, f.token_units, f.pack_gqa, f.kv_streams)) == flipped, (b, kv, s_q, f)
+    # the cap names the Rubin table: not served on the line with the adapter's own reason, under either policy
+    capped = decode_route(geom, 1, policy=policy, device_cc=_SM100, max_q_tile=32)
+    assert not capped.served and "decode_q_tile_max=32 caps the Rubin" in capped.reason and "decode_q_tile_max=None" in capped.reason
+    with pytest.raises(ValueError, match="max_kv_len must be >= 1"):
+        decode_route(geom, 1, device_cc=_SM100, max_kv_len=0)
+    mha = GatedAttentionBlockGeometry(d_model=_D_MODEL, h_q=4, h_kv=4, d_head=_D, rope_dim=_ROPE, causal_bottom_right=True)
+    r = decode_route(mha, 16, policy=policy, device_cc=_SM100)
+    assert (r.group, r.n_q, r.token_units, r.pack_gqa, r.kv_streams, r.claimed) == (1, 16, 1, False, 1, False)
+    # 17 tokens unpacked = the 32-column arm: declined at a small launch (off the rule) and at a wide one (the arm), the lift named on both
+    small17 = decode_route(mha, 17, policy=policy, device_cc=_SM100)
+    wide17 = decode_route(mha, 17, policy=policy, device_cc=_SM100, batch=8, max_kv_len=65536)
+    assert not small17.served and not wide17.served and _WIDE_ARM_LIFT in small17.reason and _WIDE_ARM_LIFT in wide17.reason
+    assert "WIDE launches only" in small17.reason and "at a WIDE launch" in wide17.reason and "batch 8 x H_q 4 = 32 units" in wide17.reason
+
+
+def test_the_32_column_sm100_decode_arm_is_declined_by_name_until_its_cells_run(monkeypatch):
+    """The cc 10.0 admission's review follow-up (2026-10-29, M1): the SDPA adapter's rule off cc 10.7 takes the 32-column decode tile for
+    17 .. 32 packed rows and for an unpacked step of 17 .. 32 tokens on a WIDE launch, but no cc 10.0 cell of the block has run that arm,
+    so ``decode_route`` declines it by name on every part off ``DECODE_WIDE_TILE_CCS`` (EMPTY today) with the lift in the reason -- at the
+    geometries that would have hit it: W at group 6 (B 32 x kv 4K, S_q 3), group 16 (B 8 x kv 32K, S_q 2: 32 packed rows) and group 4
+    (B 8 x kv 64K, S_q 8); U32 at group 6 (B 4 x kv 5.5K, S_q 17) and MHA (B 8 x kv 16K, S_q 17).  The small-launch reading of the same
+    steps is unchanged, the envelope predicts the verdict at the same inputs, the Rubin reading never meets the gate, and the one-tuple
+    lift restores the adapter's rule (the plumbing is intact): with ``(10, 0)`` in the tuple the same inputs read the 32-column tile,
+    packed or unpacked, in one unit.  A host row: ``decode_route`` is device-free."""
+    assert DECODE_WIDE_TILE_CCS == () and _api.DECODE_WIDE_TILE_CCS == ()
+    mha = GatedAttentionBlockGeometry(d_model=_D_MODEL, h_q=4, h_kv=4, d_head=_D, rope_dim=_ROPE, causal_bottom_right=True)
+    cells = [  # (geometry, S_q, batch, max_kv_len, the arm's reading once admitted, the small-launch reading of the same step today)
+        (_geom(6)[0], 3, 32, 4096, _W32, _U(6)),
+        (_geom(16)[0], 2, 8, 32768, _W32, (_P, 0, 0, True, 1)),
+        (_geom(4)[0], 8, 8, 65536, _W32, (_P, 0, 0, True, 1)),
+        (_geom(6)[0], 17, 4, 5632, _U32, None),
+        (mha, 17, 8, 16384, (_T, 32, 1, False, 1), None),
+    ]
+    for geom, s_q, b, kv, arm, small in cells:
+        for policy in DECODE_ROUTE_POLICIES:
+            r = decode_route(geom, s_q, policy=policy, device_cc=_SM100, batch=b, max_kv_len=kv)
+            assert not r.served and r.tile is None and r.n_q == 0 and r.kv_streams == 0 and not r.claimed and not r.pdl_capable, (s_q, b, kv, r)
+            assert _WIDE_ARM_LIFT in r.reason and "at a WIDE launch" in r.reason and f"batch {b} x" in r.reason and f"max_kv_len={kv}" in r.reason, r.reason
+            assert (r.device_cc, r.batch, r.max_kv_len, r.policy) == (_SM100, b, kv, policy)
+            s = decode_route(geom, s_q, policy=policy, device_cc=_SM100, batch=1, max_kv_len=1024)
+            assert (None if not s.served else (s.tile, s.n_q, s.token_units, s.pack_gqa, s.kv_streams)) == small, (s_q, s)
+            if small is None:
+                assert _WIDE_ARM_LIFT in s.reason and "WIDE launches only" in s.reason and "at a WIDE launch" not in s.reason
+        env = GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=_SM100).decode
+        assert (
+            env.served
+            and env.route_cc == _SM100
+            and env.route(s_q, batch=b, max_kv_len=kv) == decode_route(geom, s_q, device_cc=_SM100, batch=b, max_kv_len=kv)
+        )
+        assert not env.route(s_q, batch=b, max_kv_len=kv).served and _WIDE_ARM_LIFT in env.route(s_q, batch=b, max_kv_len=kv).reason
+        rubin = decode_route(geom, s_q, device_cc=_SM107, batch=b, max_kv_len=kv)  # cc 10.7 reads its own table at the same inputs
+        assert rubin == decode_route(geom, s_q, batch=b) and rubin.device_cc == _SM107 and rubin.served
+        with monkeypatch.context() as m:
+            m.setattr(_api, "DECODE_WIDE_TILE_CCS", (_SM100,))
+            f = decode_route(geom, s_q, device_cc=_SM100, batch=b, max_kv_len=kv)
+            assert f.served and (f.tile, f.n_q, f.token_units, f.pack_gqa, f.kv_streams) == arm and f.reason == "" and not f.claimed and f.pdl_capable, (s_q, f)
+            assert GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=_SM100).decode.route(s_q, batch=b, max_kv_len=kv) == f
+
+
 def test_the_split_choice_is_the_decode_split_model_floored_at_two_under_the_gate():
     """The block's split is the SDPA decode split model's on the same inputs -- the launch's units, KV tiles, SM count, the
     tile's width and the COMBINE GRID (``combine_grid`` = (B, H_q, S_q): the lean combine kernel's ceil(S_q / 4) x H_q x B blocks, which
@@ -462,7 +661,8 @@ def test_the_split_choice_is_the_decode_split_model_floored_at_two_under_the_gat
     assert decode_split_choice(r, batch=4, h_kv=2, max_kv_len=1000, sm_count=0, gated=True) == 1  # no device: declined later anyway
 
 
-def test_the_prefill_route_needs_the_step_to_fill_the_part():
+def test_the_prefill_route_needs_the_step_to_fill_the_part(monkeypatch):
+    _rubin_reading(monkeypatch)
     """The DECODE form's prefill route is ONE unsplit CTA per (sequence, KV head), so below ``DECODE_PREFILL_ROUTE_MIN_CTAS`` = 64 CTAs
     (``batch x H_kv``) it leaves the part idle while the decode tile's two-unit arm splits the same KV over it.  Measured on the Rubin
     performance class (212 SMs) at 32 / 2, ``S_q = 8``, kv 32K: B 1 took 330.6 us on the prefill route against 58.7 on two 64-column
@@ -610,15 +810,77 @@ def test_the_envelope_requires_the_rubin_dsl_target(monkeypatch, version, has_ta
 
 @pytest.mark.parametrize(
     ("cc", "match"),
-    [((8, 0), "found SM80"), ((10, 0), "found SM100"), ((10, 3), "found SM103"), (None, "no CUDA device")],
-    ids=["sm80", "sm100", "sm103", "none"],
+    [((8, 0), "found SM80"), ((10, 3), "found SM103"), ((12, 0), "found SM120"), (None, "no CUDA device")],
+    ids=["sm80", "sm103", "sm120", "none"],
 )
 def test_the_envelope_declines_every_other_part_without_raising(cc, match):
+    """Every part off ``DENSE_SERVING_CCS`` -- cc 10.3 among them: the same SM100 kernels, unproven through the block, declined BY NAME
+    until its cells run -- reads not served with the part statement on both forms; the routes stay listed (geometry facts)."""
     geom, _ = _geom(16)
     env = GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, "cpu" if cc is None else _DEV, device_cc=cc)
     assert not env.decode.served and not env.extend.served and env.forms == () and match in env.decode.reason and match in env.extend.reason
+    assert "served on cc 10.7 (Rubin, SM107: every form) and cc 10.0" in env.decode.reason and env.decode.reason == env.extend.reason
+    if cc == (10, 3):
+        assert "cc 10.3 runs the same SM100 kernels but is unproven through the block: declined by name" in env.decode.reason
     assert env.decode.routes  # the routes are geometry facts, listed either way
     assert env.decode.pdl_default is False  # the PDL default is the measured part's
+    assert cc not in DENSE_SERVING_CCS and DENSE_SERVING_CCS == (_SM107, _SM100)
+    # (2026-10-29, L5) an UNSERVED part reads the Rubin table on every reading -- the envelope's routes / route() and
+    # decode_route(device_cc=) agree (one rule, _route_part) and both say which table they show (route_cc / device_cc None = the Rubin
+    # table, the home reading)
+    assert env.decode.route_cc is None and all(r.device_cc is None for r in env.decode.routes)
+    home = tuple(decode_route(geom, s) for s in range(1, DECODE_MAX_S_Q + 2))
+    assert env.decode.routes == tuple(decode_route(geom, s, device_cc=cc) for s in range(1, DECODE_MAX_S_Q + 2)) == home
+    at_launch = env.decode.route(2, batch=64, max_kv_len=65536)
+    assert at_launch == decode_route(geom, 2, device_cc=cc, batch=64, max_kv_len=65536) == decode_route(geom, 2, batch=64)
+    assert at_launch.device_cc is None and at_launch.n_q == 32 and at_launch.pack_gqa, at_launch  # the Rubin table's 32-column single unit
+
+
+def test_the_envelope_on_a_cc_10_0_reading_serves_the_dense_forms_and_names_the_sm100_routes():
+    """The cc 10.0 reading (2026-10-29): both dense forms served for bf16 / f16, the DECODE routes the SM100 line's (the table above:
+    ``_SM100_ROUTE_TABLE``), ``route(s_q, batch, max_kv_len)`` reading the wide rule, the PDL default off (``DECODE_PDL_DEFAULT_CCS`` is
+    the measured part's), ``claimed`` False on every route, the cap refused in the routes, the declines table the dense form's, a
+    QsaSpec geometry NOT served there (the sparse forms stay Rubin-only through the block), fp32 declined on the dtype row."""
+    for group in sorted(_GROUPS):
+        geom, _ = _geom(group)
+        env = GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=_SM100)
+        assert env.forms == ("extend", "decode") and env.extend.served and env.decode.served and env.device_cc == _SM100, (group, env.decode.reason)
+        assert env.extend.reason is None and env.decode.reason is None and env.cutedsl_ok
+        d = env.decode
+        assert d.pdl_default is False and d.policy == DECODE_ROUTE_SINGLE_UNIT and d.q_tile_max is None and d.claimed_max_s_q == DECODE_CLAIMED_MAX_S_Q
+        assert [r.s_q for r in d.routes] == list(range(1, DECODE_MAX_S_Q + 2)) and all(r.device_cc == _SM100 and not r.claimed for r in d.routes)
+        for r in d.routes:
+            want = _SM100_ROUTE_TABLE[group][r.s_q]
+            got = None if not r.served else (r.tile, r.n_q, r.token_units, r.pack_gqa, r.kv_streams)
+            assert got == want, (group, r.s_q, r)
+            assert d.route(r.s_q) == r and d.route(r.s_q).device_cc == _SM100
+        assert all(r.pdl_capable is r.decode_tile for r in d.routes)
+        assert set(d.declines) == {"write_through", "decode_rows", "diagonal", "window", "head_dim", "return_lse", "token_capacity_dense"}
+        assert "a part of DENSE_SERVING_CCS" in " ".join(d.requires) and "a part of DENSE_SERVING_CCS" in " ".join(env.extend.requires)
+        assert GatedAttentionBlockFwd.serving_envelope(geom, torch.float16, _DEV, device_cc=_SM100).forms == ("extend", "decode")
+        fp32 = GatedAttentionBlockFwd.serving_envelope(geom, torch.float32, _DEV, device_cc=_SM100)
+        assert not fp32.decode.served and "bf16 / f16" in fp32.decode.reason and fp32.decode.pdl_default is False
+    g6, _ = _geom(6)
+    e6 = GatedAttentionBlockFwd.serving_envelope(g6, torch.bfloat16, _DEV, device_cc=_SM100).decode
+    assert e6.route(3).decode_tile and not e6.route(3).pack_gqa and e6.route(3).kv_streams == 6, "the small-launch reading: U16"
+    w = e6.route(3, batch=32, max_kv_len=4096)  # the wide reading: the adapter's 32-column arm = a typed decline naming the lift (M1)
+    assert not w.served and _WIDE_ARM_LIFT in w.reason and "at a WIDE launch" in w.reason and (w.batch, w.max_kv_len) == (32, 4096), w
+    u = e6.route(17, batch=4, max_kv_len=5632)
+    assert not e6.route(17).served and not u.served and _WIDE_ARM_LIFT in u.reason and "at a WIDE launch" in u.reason
+    assert u.max_kv_len == 5632 and u.batch == 4 and u.device_cc == _SM100
+    capped = GatedAttentionBlockFwd.serving_envelope(g6, torch.bfloat16, _DEV, device_cc=_SM100, decode_q_tile_max=32).decode
+    assert capped.q_tile_max == 32 and not any(r.served for r in capped.routes) and "decode_q_tile_max=32 caps the Rubin" in capped.route(1).reason
+    # the sparse forms: Rubin-only through the block (the standalone adapter's explicit lean tile on cc 10.0 is not the block's)
+    sparse = GatedAttentionBlockFwd.serving_envelope(
+        GatedAttentionBlockGeometry(**dict(d_model=_D_MODEL, h_q=8, h_kv=2, d_head=_D, rope_dim=_ROPE, causal_bottom_right=True, qsa=QsaSpec())),
+        torch.bfloat16,
+        _DEV,
+        device_cc=_SM100,
+    )
+    assert (
+        sparse.forms == () and not sparse.decode.served and "sparse forms" in sparse.decode.reason and "served on cc 10.7 (Rubin) only" in sparse.decode.reason
+    )
+    assert sparse.decode.routes == () and sparse.decode.pdl_default is False
 
 
 def test_every_static_decline_of_the_decode_declaration_is_predicted_by_the_envelope(monkeypatch):
@@ -630,7 +892,9 @@ def test_every_static_decline_of_the_decode_declaration_is_predicted_by_the_enve
     geom16, _ = _geom(16)
     d128 = GatedAttentionBlockGeometry(d_model=_D_MODEL, h_q=8, h_kv=2, d_head=128, rope_dim=_ROPE, causal_bottom_right=True)
     # a TOP-LEFT QsaSpec geometry meets the `diagonal` row like a dense one (a ValueError); with the bottom-right diagonal it is the
-    # block-sparse DECODE mode, SERVED since 2026-10-14 (test_block_qsa_decode.py) -- the former `sparse` row is the packed form's
+    # block-sparse DECODE mode, SERVED since 2026-10-14 (test_block_qsa_decode.py), and since 2026-10-30 the packed form over the pools
+    # is the packed block-sparse EXTEND form too (test_block_qsa_packed_extend.py): BOTH forms served; the table's `sparse` row is reached
+    # through a record without the composition claim
     sparse = GatedAttentionBlockGeometry(d_model=_D_MODEL, h_q=8, h_kv=2, d_head=_D, rope_dim=_ROPE, qsa=QsaSpec())
     rows = [
         (geom16, torch.float8_e4m3fn, "bf16 / f16", NotImplementedError),
@@ -646,7 +910,8 @@ def test_every_static_decline_of_the_decode_declaration_is_predicted_by_the_enve
         _DEV,
         device_cc=_SM107,
     )
-    assert served.decode.served and served.decode.sparse_core and served.forms == ("decode",) and served.decode.routes == ()
+    assert served.decode.served and served.decode.sparse_core and served.forms == ("extend", "decode") and served.decode.routes == ()
+    assert served.extend.served and served.extend.sparse_core  # INVERTED 2026-10-30: the packed block-sparse EXTEND form with caller lists
     # ... and the declaration raises the same row (device-free), the e4m3 one through the quant halves it needs first
     for geom, dtype, match, exc in rows[1:]:
         mk = lambda *shape: torch.empty(*shape, dtype=dtype, device=_DEV)  # noqa: E731
@@ -669,7 +934,7 @@ def test_every_static_decline_of_the_decode_declaration_is_predicted_by_the_enve
                 sample_block_table=torch.zeros(1, 4, dtype=torch.int32, device=_DEV),
             )
     # the device rows the SDPA stage raises at check_support are the envelope's device reasons (test_the_envelope_declines_every_other_part)
-    assert GatedAttentionBlockFwd.serving_envelope(geom16, torch.bfloat16, _DEV).decode.served is (_cc() == _SM107)
+    assert GatedAttentionBlockFwd.serving_envelope(geom16, torch.bfloat16, _DEV).decode.served is (_api._device_cc_of(_DEV) in DENSE_SERVING_CCS)
 
 
 # ---------------------------------------------------------------------------
@@ -677,7 +942,8 @@ def test_every_static_decline_of_the_decode_declaration_is_predicted_by_the_enve
 # ---------------------------------------------------------------------------
 
 
-def test_declaration_rows_are_typed_and_name_the_feature():
+def test_declaration_rows_are_typed_and_name_the_feature(monkeypatch):
+    _rubin_reading(monkeypatch)
     kc, vc = _pools(4, 2, 16, _D, "hnd", torch.bfloat16)
     bt = torch.zeros(2, 4, dtype=torch.int32, device=_DEV)
     with pytest.raises(ValueError, match="kv_source must be one of"):
@@ -782,11 +1048,14 @@ def test_the_thd_product_bound_names_the_decode_form():
 
 @pytest.mark.parametrize("group", sorted(_GROUPS))
 @pytest.mark.parametrize("s_q", [1, 2, 3, 4, 5])
-def test_declaration_facts(group, s_q):
+def test_declaration_facts(group, s_q, monkeypatch):
     """A declared DECODE block records its route, its split and where the gate runs BEFORE anything compiles; the stage list
     is the serving pipeline; both projections are capture-safe; ``seq_lens_present`` reads True whatever was passed.  On the
     decode tile the gate rides the split combine (the split floored at 2); on the prefill route stage (4) is the EXTEND form's
-    THD binding at the dense step's envelope, unsplit, the gate in the paged body's epilogue."""
+    THD binding at the dense step's envelope, unsplit, the gate in the paged body's epilogue.  The RUBIN reading of the route on any
+    host (the declaration reads the device's line since 2026-10-29: a cc 10.0 host would record the SM100 table -- its own facts row
+    is ``test_on_a_cc_10_0_reading_the_declaration_records_the_sm100_route``)."""
+    monkeypatch.setattr(_api, "_route_device_cc", lambda device: None)
     # Pin the split off CUDA: sm_count=0 leaves the gate outside the combine.
     blk, _ = _make_block(group, 4, s_q, fuse_gate=True, fuse_norm_rope=True, decode_split_kv=None if torch.cuda.is_available() else 2)
     r = blk.decode_route
@@ -982,7 +1251,8 @@ def test_execute_refusals_on_an_uncompiled_block_are_typed_and_sync_free():
             blk.execute(*inp, **good)
 
 
-def test_the_stage_refuses_the_paged_inputs_on_a_self_declaration_and_the_q_side_length_on_a_paged_one():
+def test_the_stage_refuses_the_paged_inputs_on_a_self_declaration_and_the_q_side_length_on_a_paged_one(monkeypatch):
+    _rubin_reading(monkeypatch)
     from cudnn.api_base import TensorDesc
 
     geom, _ = _geom(16)
@@ -1007,7 +1277,8 @@ def test_the_stage_refuses_the_paged_inputs_on_a_self_declaration_and_the_q_side
     assert st.paged_dense and st.decode_route.decode_tile and st.seq_lens_present and st.decode_split_kv == 2
 
 
-def test_the_workspace_carve_is_unchanged_by_the_paged_read():
+def test_the_workspace_carve_is_unchanged_by_the_paged_read(monkeypatch):
+    _rubin_reading(monkeypatch)
     """The read changes what stage (4) reads, not the carve: the SDPA's split scratch sits in the engine region (the max with
     the GEMMs'), so the intermediates' layout equals a ``kv_source="self"`` block's at the same shape."""
     blk, _ = _make_block(16, 4, 2, fuse_gate=True, fuse_norm_rope=True)
@@ -1062,8 +1333,19 @@ class _Case:
         blk_kw=None,
         heads=None,
         d_model=None,
+        quant=None,
+        check_numerics=True,
     ):
+        """``quant`` (appended; None = the bf16 / f16 form) selects the FP8-PROJECTION + BF16-ATTENTION mode (``QuantSpec(attention_dtype=
+        torch.bfloat16)``): ``True`` calibrates the static per-tensor scales on this case's own data (amax scales for h / W_qkvg / W_o, ``scale_o``
+        from the oracle's gated O: an offline calibration stand-in), a ``scales`` dict of another case reuses ITS scales (a sibling case whose e4m3
+        codes a captured block must read under the same spec); ``h`` and the weights are then e4m3 codes, ``dtype`` stays the bf16 activation
+        dtype, and the oracle is the fp8 reference's ``attention_bf16`` arm (no Q / K / V quantization point, the gated O quantized at ``scale_o``).  ``check_numerics=False`` (appended) builds the case WITHOUT a reference -- random bf16 K / V rows fill
+        the pools, ``scale_o`` is 1.0, ``ref_out`` stays 0 and ``check_against_oracle`` / ``recompute_oracle`` refuse -- for the cells that pin
+        launches, not values (the census)."""
         self.group, self.s_q, self.kv_lens, self.page, self.layout, self.dtype = group, int(s_q), [int(x) for x in kv_lens], page, layout, dtype
+        self.check_numerics = bool(check_numerics)
+        self.quant_mode = quant is not None
         self.d_model = _D_MODEL if d_model is None else int(d_model)  # the shrunk matrix width, or a shard's real one
         self.geom, self.ref_geom = _geom(group, heads=heads, d_model=self.d_model)
         h_q, h_kv = _GROUPS[group] if heads is None else heads
@@ -1082,7 +1364,24 @@ class _Case:
             w_o=randn(self.d_model, h_q * _D),
         )
         cos_t, sin_t = _rope_tables(L_max, dtype, self.ref_geom)
+        self._rope = (cos_t, sin_t)
         self.h_full = [randn(1, max(L, s_q), self.d_model, std=1.0) for L in self.kv_lens]
+        self.scales = self.quant = None
+        if self.quant_mode:
+            # the mode: e4m3 CODES for h / W_qkvg / W_o under static per-tensor scales (the same codes a serving stack's FP8 W8A8 projections hold)
+            assert dtype == torch.bfloat16, "the FP8-projection + bf16-attention mode's activations are bf16"
+            if quant is True:
+                self.scales = dict(
+                    s_h=amax_scale(torch.cat([hf.flatten() for hf in self.h_full])),
+                    s_wq=amax_scale(self.w["w_qkvg"]),
+                    s_wo=amax_scale(self.w["w_o"]),
+                    scale_o=None,
+                )
+            else:
+                self.scales = dict(quant)
+            self.w["w_qkvg"] = quant_e4m3(self.w["w_qkvg"], self.scales["s_wq"])
+            self.w["w_o"] = quant_e4m3(self.w["w_o"], self.scales["s_wo"])
+            self.h_full = [quant_e4m3(hf, self.scales["s_h"]) for hf in self.h_full]
         # the step's inputs: the LAST s_q rows (and their positions' RoPE rows); a padded entry takes its row 0 .. s_q-1 (never read)
         self.h = torch.stack([hf[0, -s_q:] for hf in self.h_full])  # [B, s_q, d_model]
         pos = [list(range(L - s_q, L)) if L else list(range(s_q)) for L in self.kv_lens]
@@ -1091,12 +1390,32 @@ class _Case:
         # the oracle per live entry over the FULL sequence: its K / V rows (bf16 -- the oracle's single rounding) fill the pools
         self.ref_out = torch.zeros(B, s_q, self.d_model, dtype=dtype, device=_DEV)
         self.ref_rows = {}
+        self.ref_o, self.ref_gate, self.ref_og, self.ref_o8 = {}, {}, {}, {}  # the mode's oracle intermediates (the step's rows), per live entry
+        if self.quant_mode:
+            if self.scales["scale_o"] is None:
+                if self.check_numerics:
+                    # scale_o from the oracle's gated O over every live entry (pass 1 at scale 1), then the oracle at that scale (pass 2)
+                    og = torch.cat([self._mode_oracle(b, 1.0).o_gated.flatten() for b, L in enumerate(self.kv_lens) if L])
+                    self.scales["scale_o"] = amax_scale(og)
+                else:
+                    self.scales["scale_o"] = 1.0  # no reference: any finite positive scale declares the same chain
+            sc = self.scales
+            self.quant = QuantSpec.bf16_attention(1.0 / sc["s_h"], 1.0 / sc["s_wq"], 1.0 / sc["s_wo"], sc["scale_o"])
+            self.quant.validate()
         for b, L in enumerate(self.kv_lens):
             if L == 0:
                 continue
-            ref = gated_attention_block_reference(
-                self.h_full[b], self.w["w_qkvg"], self.w["w_q_norm"], self.w["w_k_norm"], cos_t[:, :L], sin_t[:, :L], self.w["w_o"], self.ref_geom
-            )
+            if not self.check_numerics:
+                # no reference (the launch census): random bf16 K / V rows fill the pools -- the kernel chain does not depend on the values
+                self.ref_rows[b] = (randn(L, h_kv, _D, std=1.0), randn(L, h_kv, _D, std=1.0))
+                continue
+            if self.quant_mode:
+                ref = self._mode_oracle(b, self.scales["scale_o"])
+                self.ref_o[b], self.ref_gate[b], self.ref_og[b], self.ref_o8[b] = ref.o[0, -s_q:], ref.gate[0, -s_q:], ref.o_gated[0, -s_q:], ref.o8[0, -s_q:]
+            else:
+                ref = gated_attention_block_reference(
+                    self.h_full[b], self.w["w_qkvg"], self.w["w_q_norm"], self.w["w_k_norm"], cos_t[:, :L], sin_t[:, :L], self.w["w_o"], self.ref_geom
+                )
             self.ref_out[b] = ref.out[0, -s_q:]
             self.ref_rows[b] = (ref.k[0], ref.v[0])  # [L, h_kv, D]
         # pages: block 0 reserved (NULL); each live entry gets ceil(L / P) pages from a permutation of 1 .. n_pages-1
@@ -1138,7 +1457,9 @@ class _Case:
             sample_v_cache=self.v_cache,
             sample_block_table=self.block_table,
             fuse_gate=True,
-            fuse_norm_rope=dtype == torch.bfloat16,
+            # the mode runs the UNFUSED stage (1) (fuse_norm_rope is refused there: no bf16 slab under the fork)
+            fuse_norm_rope=dtype == torch.bfloat16 and not self.quant_mode,
+            **({"quant": self.quant} if self.quant_mode else {}),
         )
         kw.update(blk_kw or {})
         self.blk_kw = kw
@@ -1147,6 +1468,43 @@ class _Case:
             self.h, self.w["w_qkvg"], self.w["w_q_norm"], self.w["w_k_norm"], self.cos, self.sin, self.w["w_o"], self.out, self.geom, **kw
         )
         self.ws = None
+
+    def _mode_oracle(self, b, scale_o):
+        """The mode's oracle over live entry ``b``'s FULL sequence: the fp8 reference's ``attention_bf16`` arm on this case's e4m3 codes
+        and scales, the gated O quantized at ``scale_o`` (``Fp8RefOutputs``: out, the bf16 K / V rows, the pre-gate O, the gate, the gated O, o8)."""
+        L, sc = self.kv_lens[b], self.scales
+        cos_t, sin_t = self._rope
+        inp = dict(
+            h=self.h_full[b],
+            w_qkvg=self.w["w_qkvg"],
+            w_o=self.w["w_o"],
+            w_q_norm=self.w["w_q_norm"],
+            w_k_norm=self.w["w_k_norm"],
+            cos=cos_t[:, :L],
+            sin=sin_t[:, :L],
+        )
+        return gated_attention_block_fp8_reference(
+            inp,
+            self.ref_geom,
+            descale_h=1.0 / sc["s_h"],
+            descale_w_qkvg=1.0 / sc["s_wq"],
+            descale_w_o=1.0 / sc["s_wo"],
+            scale_q=None,
+            scale_k=None,
+            scale_v=None,
+            scale_o=scale_o,
+            attention_bf16=True,
+            return_rows=True,
+        )
+
+    def recompute_oracle(self, scale_o):
+        """The mode's ``out`` oracle at another ``scale_o`` (the recalibration cells), ``[B, s_q, d_model]`` bf16 with the dead rows 0."""
+        assert self.check_numerics, "a check_numerics=False case has no reference (the launch census)"
+        out = torch.zeros_like(self.ref_out)
+        for b, L in enumerate(self.kv_lens):
+            if L:
+                out[b] = self._mode_oracle(b, scale_o).out[0, -self.s_q :]
+        return out
 
     def compile(self):
         self.blk.check_support()
@@ -1196,7 +1554,16 @@ class _Case:
         o = _view(ws, lay.o, (t, g.h_q, g.d_head), self.dtype).view(self.blk.batch, self.blk.seq_len, g.h_q, g.d_head)
         return q, gate, o, ws[lay.engine_scratch :]
 
+    def o8_view(self, ws=None):
+        """The mode's e4m3 gated O the last execute left in the workspace's ``o8`` slot, as ``[B, S_q, H_q, D]`` (the FP8 out projection's A operand)."""
+        ws = self.ws if ws is None else ws
+        g, lay = self.geom, self.blk._ws
+        assert lay.o8 >= 0, "no o8 slot: not a quantized declaration"
+        t = self.blk.batch * self.blk.seq_len
+        return _view(ws, lay.o8, (t, g.h_q, g.d_head), torch.float8_e4m3fn).view(self.blk.batch, self.blk.seq_len, g.h_q, g.d_head)
+
     def check_against_oracle(self, out=None, *, what="out"):
+        assert self.check_numerics, "a check_numerics=False case has no reference (the launch census)"
         out = self.out if out is None else out
         assert torch.isfinite(out.float()).all(), f"{what}: non-finite"
         dead = ~self.live
@@ -1735,13 +2102,15 @@ def test_two_launches_are_bitwise():
     assert torch.equal(a, b)
 
 
-def _capture_replay_cell(**blk_kw):
+def _capture_replay_cell(quant=None, **blk_kw):
     """The serving stack's defaults: the FIRST execute of a fresh declaration captured on a NEW stream with no eager warm-up
     under ``set_sync_debug_mode("error")`` (no host sync in the DECODE path: lengths, tables and slots are device data); the
     capture launches nothing, the replay is BITWISE a fresh eager run; a padded batch replays correctly; new ``kv_lens`` /
-    ``block_table`` / ``slot_mapping`` / ``h`` through the captured tensors replay bitwise the eager run over them."""
+    ``block_table`` / ``slot_mapping`` / ``h`` through the captured tensors replay bitwise the eager run over them.  ``quant``
+    (appended; True = the FP8-projection + bf16-attention mode) hands the case the mode; the sibling step then reuses the captured
+    block's scales (its codes must read under the captured spec)."""
     lens = (300, 0, 1000, 77)
-    case = _Case(16, 2, lens, seed=23, blk_kw=blk_kw or None)  # fresh: never executed
+    case = _Case(16, 2, lens, seed=23, blk_kw=blk_kw or None, quant=quant)  # fresh: never executed
     case.blk.check_support()
     case.blk.compile()
     case.ws = torch.empty(case.blk.get_workspace_size(), dtype=torch.uint8, device=_DEV)
@@ -1771,7 +2140,7 @@ def _capture_replay_cell(**blk_kw):
         assert torch.equal(case.out, replayed), "the replay of the captured first execute differs from the eager run"
         # a NEW step through the captured tensors: new lengths (one entry longer by a token: its slot moves), a re-laid-out
         # table (pages swapped between two entries), new slots and new h -- the oracle of the new step through a sibling case
-        sib = _Case(16, 2, (301, 0, 1000, 77), seed=29, table_row_stride=case.block_table.shape[1])
+        sib = _Case(16, 2, (301, 0, 1000, 77), seed=29, table_row_stride=case.block_table.shape[1], quant=case.scales if quant else None)
         # the sibling's pools hold its oracle prefix; make the CAPTURED pools hold them (the captured pointers are the block's)
         case.k_cache.copy_(sib.k_cache)
         case.v_cache.copy_(sib.v_cache)
@@ -2105,7 +2474,8 @@ def test_the_write_through_in_the_norm_rope_launch_drops_the_cache_write_launch_
     assert torch.equal(_bits(cells[True].k_cache), _bits(cells[False].k_cache)) and torch.equal(_bits(cells[True].v_cache), _bits(cells[False].v_cache))
 
 
-def test_fuse_cache_write_small_m_resolves_the_measured_rule_by_default_and_the_arm_owns_the_write():
+def test_fuse_cache_write_small_m_resolves_the_measured_rule_by_default_and_the_arm_owns_the_write(monkeypatch):
+    _rubin_reading(monkeypatch)
     """``fuse_cache_write_small_m`` (appended; None = AUTO): where the paged write-through runs on the DECODE form's unfused chain.  AUTO is
     the MEASURED rule (``CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS``): the write-through folds into the norm + RoPE launch (the stage carries the
     page size, the separate stage is not built, the stage list loses ``cache_write``) at ``B x S_q < 128`` rows and at ``S_q = 1``
@@ -2190,6 +2560,17 @@ def test_fuse_cache_write_small_m_resolves_the_measured_rule_by_default_and_the_
         )
 
 
+@contextlib.contextmanager
+def monkeypatch_rubin_route():
+    """The Rubin reading of the route for one declaration (the ``_rubin_reading`` fixture's effect without a monkeypatch argument)."""
+    prev = _api._route_device_cc
+    _api._route_device_cc = lambda device: None
+    try:
+        yield
+    finally:
+        _api._route_device_cc = prev
+
+
 def test_fuse_cache_write_small_m_is_a_typed_decline_off_the_arm_and_auto_reads_false_there():
     """``fuse_cache_write_small_m=True`` off the arm's domain is a typed ``NotImplementedError`` naming the reason, and ``None`` reads False
     there with the separate cache-write stage built (where there is a write-through at all): the EXTEND form and the write-through on the
@@ -2247,6 +2628,37 @@ def test_fuse_cache_write_small_m_is_a_typed_decline_off_the_arm_and_auto_reads_
         GatedAttentionBlockFwd(*qargs, quant=spec, fuse_cache_write_small_m=True)
     quant = GatedAttentionBlockFwd(*qargs, quant=spec)
     assert quant.cache_write_in_norm_rope is False and quant._cache_write is None and quant.paged_kv_page_size == 0
+    # the FP8-projection + bf16-attention mode (QuantSpec(attention_dtype=torch.bfloat16)) on the DECODE form: the fold is ADMITTED (the bf16
+    # chain's TMA norm + RoPE kernel on a bf16 slab) -- AUTO True on the fold's domain, an explicit True followed, an explicit False the separate
+    # launch; the stage list is the bf16 chain's plus the one quantize launch
+    mode = QuantSpec.bf16_attention(0.01, 0.02, 0.03, 4.0)
+    kc8, vc8 = _pools(8, 2, 16, _D, "hnd", torch.bfloat16)
+    geom_br = GatedAttentionBlockGeometry(d_model=_D_MODEL, h_q=8, h_kv=2, d_head=_D, rope_dim=_ROPE, causal_bottom_right=True)  # the paged forms' diagonal
+    mode_args = (
+        e4(4, 1, _D_MODEL),
+        e4(geom_br.n_qkvg, _D_MODEL),
+        mk(_D),
+        mk(_D),
+        mk(4, 1, _ROPE),
+        mk(4, 1, _ROPE),
+        e4(_D_MODEL, 8 * _D),
+        mk(4, 1, _D_MODEL),
+        geom_br,
+    )
+    mode_kw = dict(
+        paged_kv_page_size=16, kv_source="paged", sample_k_cache=kc8, sample_v_cache=vc8, sample_block_table=torch.zeros(4, 8, dtype=torch.int32, device=_DEV)
+    )
+    with monkeypatch_rubin_route():
+        auto_mode = GatedAttentionBlockFwd(*mode_args, quant=mode, fuse_gate=True, decode_split_kv=2, **mode_kw)  # the gate in the combine
+        assert (
+            auto_mode.attention_bf16 and auto_mode.cache_write_in_norm_rope is True and auto_mode._cache_write is None and auto_mode._norm_rope.page_size == 16
+        )
+        assert [st.name for st in auto_mode._stages] == ["qkv_gate_proj", "qk_norm_rope", "sdpa", "quantize_o", "out_proj"] and auto_mode.gate_fused
+        on_mode = GatedAttentionBlockFwd(*mode_args, quant=mode, fuse_cache_write_small_m=True, **mode_kw)
+        assert on_mode.cache_write_in_norm_rope is True and on_mode._cache_write is None
+        off_mode = GatedAttentionBlockFwd(*mode_args, quant=mode, fuse_cache_write_small_m=False, fuse_gate=False, **mode_kw)
+        assert off_mode.cache_write_in_norm_rope is False and isinstance(off_mode._cache_write, _CacheWrite)
+        assert [st.name for st in off_mode._stages] == ["qkv_gate_proj", "qk_norm_rope", "cache_write", "sdpa", "sigmoid_gate", "quantize_o", "out_proj"]
     # fp32 activations on the dense DECODE form (declared here, declined by check_support): the activation row
     with pytest.raises(NotImplementedError, match="serves bf16 / f16 activations"):
         _make_block(12, 1, 1, dtype=torch.float32, fuse_cache_write_small_m=True)
@@ -2312,3 +2724,817 @@ def test_an_explicit_fuse_cache_write_false_keeps_the_separate_launch_under_the_
     # the resolver on its own facts: AUTO reads False with the control declared and True without it; an explicit value is followed either way
     assert ctl._resolve_cache_write_small_m(None, None) is False and auto._resolve_cache_write_small_m(None, None) is True
     assert ctl._resolve_cache_write_small_m(True, None) is True and ctl._resolve_cache_write_small_m(False, None) is False
+
+
+# ---------------------------------------------------------------------------
+# cc 10.0 (the SM100 line of DENSE_SERVING_CCS; 2026-10-29): the host rows on any device, the accept / reject cells on the part
+# ---------------------------------------------------------------------------
+#
+# The block's dense bf16 / f16 serving forms are admitted on cc 10.0 through the shared SM100 d256 kernels: the SM100 decode tile
+# (sm100/decode_d256_f16.py) under the line's own route (_SM100_ROUTE_TABLE), the paged prefill tile packed, the split combine in the
+# combine module's own forms, the sigmoid gate as its own launch (fuse_gate=True is a typed decline: the sm100 row claims no gate
+# epilogue), PDL off by default.  Functional cells only -- nothing measured there; every Rubin-only knob a typed decline by name.
+
+
+def _sm100_reading(monkeypatch):
+    """The cc 10.0 reading of the block's DEVICE on any host: the constructor's route / split / PDL reads and the part rows read this
+    one function (the stages' own gates read the real device: a host row that calls ``check_support`` reaches the part rows first)."""
+    monkeypatch.setattr(_api, "_device_cc_of", lambda device: _SM100)
+
+
+def test_on_a_cc_10_0_reading_the_declaration_records_the_sm100_route(monkeypatch):
+    """A DECODE block declared on a cc 10.0 reading records the SM100 line's route (the adapter's rule, the table above) with the
+    declared batch and KV bound, the split from the Blackwell fit (no floor: the gate is never in the combine there), the sigmoid gate
+    as its own stage, PDL AUTO False with the explicit switch honoured, the prefill route's THD binding at the dense envelope; the
+    declaration-time declines of the line -- the cap, an unpacked step past 16 tokens off the wide rule -- raised with the route's reason."""
+    _sm100_reading(monkeypatch)
+    for group in sorted(_GROUPS):
+        for s_q in (1, 2, 3, 4, 5, 9, 16):
+            want = _SM100_ROUTE_TABLE[group][s_q]
+            blk, _ = _make_block(group, 4, s_q)
+            r = blk.decode_route
+            assert (r.tile, r.n_q, r.token_units, r.pack_gqa, r.kv_streams) == want and (r.device_cc, r.batch, r.max_kv_len) == (_SM100, 4, 64 * 16), (
+                group,
+                s_q,
+                r,
+            )
+            assert r == decode_route(blk.geom, s_q, batch=4, device_cc=_SM100, max_kv_len=64 * 16) and not r.claimed
+            assert (
+                blk.use_pdl is False and blk.use_pdl_requested is None and blk.pdl_stages == () and not blk.gate_fused and isinstance(blk._gate, _SigmoidGate)
+            )
+            assert blk._sdpa.decode_route == r and blk.decode_split_kv >= 1 and blk._sdpa.decode_split_kv == blk.decode_split_kv
+            if r.prefill_tile:
+                assert blk._sdpa.thd and blk.decode_split_kv == 1 and (blk._sdpa.num_sequences, blk._sdpa.max_seq_len) == (4, s_q)
+            else:
+                assert blk._sdpa.paged_dense and not blk._sdpa.thd and blk._sdpa.seq_lens_present
+            names = [st.name for st in blk._stages]
+            assert names == ["qkv_gate_proj", "qk_norm_rope", "sdpa", "sigmoid_gate", "out_proj"], names  # fuse_norm_rope=False: the unfused chain
+            on, _ = _make_block(group, 4, s_q, use_pdl=True)
+            assert on.use_pdl is True and ("sdpa" in on.pdl_stages) is r.decode_tile and on._sdpa.use_pdl is r.decode_tile
+        # fuse_norm_rope=True at decode row counts LOWERS to the unfused chain on this part too (the fork would be the sm_107a decline)
+        low, _ = _make_block(group, 4, 1, fuse_norm_rope=True)
+        assert low.fuse_norm_rope and not low.fuse_norm_rope_effective and low.small_m_decode and low._norm_rope is not None and low.cache_write_in_norm_rope
+        # the declaration-time declines of the line: the cap (the Rubin table's knob) and the unpacked 17 .. 32-token step off the wide rule
+        with pytest.raises(NotImplementedError, match="decode_q_tile_max=32 caps the Rubin"):
+            _make_block(group, 4, 1, decode_q_tile_max=32)
+        with pytest.raises(NotImplementedError, match="decode_q_tile_max=16 caps the Rubin"):
+            _make_block(group, 4, 1, decode_q_tile_max=16)
+        if group != 4:
+            with pytest.raises(NotImplementedError, match="WIDE launches only") as e:
+                _make_block(group, 4, 17)
+            assert "32-column" in str(e.value) and f"batch 4 x H_q {_GROUPS[group][0]}" in str(e.value) and "EXTEND form" in str(e.value)
+            assert _WIDE_ARM_LIFT in str(e.value)  # the same arm, the lift named
+        env = GatedAttentionBlockFwd.serving_envelope(_geom(group)[0], torch.bfloat16, _DEV, device_cc=_SM100)
+        assert env.decode.route(17, batch=4, max_kv_len=64 * 16).served is (group == 4), "the envelope predicts the declaration's verdict"
+    # the wide launch through the declaration: group 6 at 32 sequences over a 4096-key bound is the adapter's 32-column arm packed at S_q 3
+    # -- a typed decline naming the lift until the arm's cells run (DECODE_WIDE_TILE_CCS), predicted by the envelope at the same inputs
+    with pytest.raises(NotImplementedError, match="the 32-column SM100 decode arm: its cc 10.0 accept cells have not run") as e:
+        _make_block(6, 32, 3, max_kv_len=4096, n_pages=256)
+    assert "at a WIDE launch" in str(e.value) and "batch 32 x H_kv 4 = 128 units over max_kv_len=4096" in str(e.value)
+    env6 = GatedAttentionBlockFwd.serving_envelope(_geom(6)[0], torch.bfloat16, _DEV, device_cc=_SM100).decode
+    assert not env6.route(3, batch=32, max_kv_len=4096).served and env6.route(3, batch=32, max_kv_len=4096).reason in str(e.value)
+    with monkeypatch.context() as m:  # the one-tuple lift through the declaration: the same inputs record the 32-column tile packed
+        m.setattr(_api, "DECODE_WIDE_TILE_CCS", (_SM100,))
+        wide, _ = _make_block(6, 32, 3, max_kv_len=4096, n_pages=256)
+        assert (wide.decode_route.n_q, wide.decode_route.pack_gqa, wide.decode_route.max_kv_len, wide.decode_route.batch) == (32, True, 4096, 32)
+    # the Rubin pins of the cell matrix hold on the OTHER reading of the same host (no cross-talk between the two readings)
+    monkeypatch.setattr(_api, "_device_cc_of", lambda device: _SM107)
+    blk, _ = _make_block(16, 4, 2)
+    assert blk.decode_route.n_q == 32 and blk.decode_route.pack_gqa and blk.decode_route.device_cc == _SM107 and blk.use_pdl is True
+
+
+def test_on_a_cc_10_0_reading_the_rubin_only_pipelines_are_declined_by_name_before_any_stage(monkeypatch):
+    """``check_support`` on a cc 10.0 reading declines the Rubin-only pipelines BEFORE any stage runs, each message naming the lift:
+    ``quant`` (the FP8 / MXFP8 d256 SDPA rows + the sm_107a forks), ``save_for_backward`` (the Rubin SDPA backward), ``thd=True`` over
+    the block's own K / V (no packed self-attention cell through the block there), and a QsaSpec geometry on any kv_source (the sparse
+    core, the lean tile through the block, the indexer, the e4m3 cache -- the sparse part statement, raised by the block before the
+    indexer stages and by the sparse stage itself).  A host row: the declaration is device-free and the part rows precede every stage."""
+    from cudnn.gated_attention_block import QuantSpec
+
+    _sm100_reading(monkeypatch)
+    geom, _ = _geom(8)  # 8 / 1 at d_model 512
+    mk = lambda *shape, dt=torch.bfloat16: torch.empty(*shape, dtype=dt, device=_DEV)  # noqa: E731
+    dense = (
+        mk(1, 256, _D_MODEL),
+        mk(geom.n_qkvg, _D_MODEL),
+        mk(_D),
+        mk(_D),
+        mk(1, 256, _ROPE),
+        mk(1, 256, _ROPE),
+        mk(_D_MODEL, 8 * _D),
+        mk(1, 256, _D_MODEL),
+        geom,
+    )
+    with pytest.raises(NotImplementedError, match="save_for_backward=True on cc 10.0") as e:
+        GatedAttentionBlockFwd(*dense, save_for_backward=True, inplace_qkv=False).check_support()
+    assert "SdpaBwdDslSm107" in str(e.value) and "the lift" in str(e.value)
+    e4 = lambda *shape: torch.zeros(*shape, dtype=torch.float8_e4m3fn, device=_DEV)  # noqa: E731
+    spec = QuantSpec(descale_h=0.01, descale_w_qkvg=0.02, descale_w_o=0.03, scale_q=1.0, scale_k=2.0, scale_v=3.0, scale_o=4.0)
+    fp8 = (
+        e4(1, 256, _D_MODEL),
+        e4(geom.n_qkvg, _D_MODEL),
+        mk(_D),
+        mk(_D),
+        mk(1, 256, _ROPE),
+        mk(1, 256, _ROPE),
+        e4(_D_MODEL, 8 * _D),
+        mk(1, 256, _D_MODEL),
+        geom,
+    )
+    with pytest.raises(NotImplementedError, match="quant=QuantSpec on cc 10.0") as e:
+        GatedAttentionBlockFwd(*fp8, quant=spec).check_support()
+    assert "FP8-projection + bf16-attention" in str(e.value) and "FP8_PROJ_BF16_ATTENTION_CCS" in str(e.value)
+    # the FP8-projection + bf16-attention mode on the cc 10.0 reading: the part statement of its OWN tuple -- declined by name while
+    # FP8_PROJ_BF16_ATTENTION_CCS lacks the part, the part rows passed once it holds it (the one-tuple lift)
+    mode = QuantSpec.bf16_attention(0.01, 0.02, 0.03, 4.0)
+    kc, vc = _pools(8, 1, 16, _D, "hnd", torch.bfloat16)
+    mode_args = (
+        e4(4, 1, _D_MODEL),
+        e4(geom.n_qkvg, _D_MODEL),
+        mk(_D),
+        mk(_D),
+        mk(4, 1, _ROPE),
+        mk(4, 1, _ROPE),
+        e4(_D_MODEL, 8 * _D),
+        mk(4, 1, _D_MODEL),
+        geom,
+    )
+    mode_kw = dict(
+        paged_kv_page_size=16, kv_source="paged", sample_k_cache=kc, sample_v_cache=vc, sample_block_table=torch.zeros(4, 8, dtype=torch.int32, device=_DEV)
+    )
+    mode_blk = GatedAttentionBlockFwd(*mode_args, quant=mode, fuse_gate=False, **mode_kw)
+    assert mode_blk.attention_bf16 and mode_blk.decode_route.device_cc == _SM100
+    mode_blk._check_declaration()
+    if _SM100 in FP8_PROJ_BF16_ATTENTION_CCS:
+        mode_blk._check_part_support()
+    else:
+        with pytest.raises(NotImplementedError, match=r"QuantSpec\(attention_dtype=torch.bfloat16\) on cc 10.0") as e:
+            mode_blk._check_part_support()
+        assert "FP8_PROJ_BF16_ATTENTION_CCS" in str(e.value) and "the lift" in str(e.value)
+    with monkeypatch.context() as m:
+        m.setattr(_api, "FP8_PROJ_BF16_ATTENTION_CCS", (_SM107, _SM100))
+        mode_blk._check_part_support()
+    t = 256
+    packed = (mk(t, _D_MODEL), mk(geom.n_qkvg, _D_MODEL), mk(_D), mk(_D), mk(t, _ROPE), mk(t, _ROPE), mk(_D_MODEL, 8 * _D), mk(t, _D_MODEL), geom)
+    with pytest.raises(NotImplementedError, match="thd=True over the block's own K / V") as e:
+        GatedAttentionBlockFwd(*packed, thd=True, num_sequences=2, max_seq_len=128).check_support()
+    assert "the EXTEND form" in str(e.value) and "the lift" in str(e.value)
+    # the EXTEND form itself (thd=True with kv_source='paged') and the dense inference form pass the part rows (the stages speak next:
+    # on this sm80 host the first stage's own decline, never the part statement)
+    ok = GatedAttentionBlockFwd(*dense)
+    ok._check_declaration()
+    ok._check_part_support()
+    # a QsaSpec geometry: the sparse part statement at the block level and on the sparse stage itself
+    sg = GatedAttentionBlockGeometry(d_model=_D_MODEL, h_q=8, h_kv=2, d_head=_D, rope_dim=_ROPE, causal_bottom_right=True, qsa=QsaSpec())
+    kc, vc = _pools(8, 2, 16, _D, "hnd", torch.bfloat16)
+    sblk = GatedAttentionBlockFwd(
+        mk(1, 1, _D_MODEL),
+        mk(sg.n_qkvg, _D_MODEL),
+        mk(_D),
+        mk(_D),
+        mk(1, 1, _ROPE),
+        mk(1, 1, _ROPE),
+        mk(_D_MODEL, 8 * _D),
+        mk(1, 1, _D_MODEL),
+        sg,
+        paged_kv_page_size=16,
+        kv_source="paged",
+        sample_k_cache=kc,
+        sample_v_cache=vc,
+        sample_block_table=torch.zeros(1, 8, dtype=torch.int32, device=_DEV),
+        sparse_tile_form="lean",
+    )
+    assert sblk.sparse_tile_form == "lean", "the declaration resolves the explicit lean body (the adapter admits it standalone on cc 10.0)"
+    with pytest.raises(NotImplementedError, match=r"sparse forms .* served on cc 10\.7 \(Rubin\) only") as e:
+        sblk.check_support()
+    assert "explicit lean tile on cc 10.0 / 10.3" in str(e.value) and "the lift" in str(e.value)
+    with pytest.raises(NotImplementedError, match=r"sparse forms .* served on cc 10\.7 \(Rubin\) only"):
+        sblk._sdpa.check_support()  # the sparse stage's own gate, before the adapter
+
+
+def _sm100_case(key, *args, **kw):
+    """One compiled cc 10.0 DECODE cell per key: ``fuse_gate=False`` (the served gate placement there) unless the cell says otherwise."""
+    blk_kw = dict(fuse_gate=False)
+    blk_kw.update(kw.pop("blk_kw", None) or {})
+    return _case(("sm100",) + tuple(key), *args, blk_kw=blk_kw, **kw)
+
+
+def _sm100_pin(case, want):
+    """The compiled kernel against the declared SM100 route: the SM100 decode tile (its file, the width, the packing) or the shared
+    paged prefill tile with the group packed; no gate epilogue anywhere, the gate its own launch; block 0 untouched."""
+    r, rb = case.blk.decode_route, case.route_readback()
+    assert (r.tile, r.n_q, r.token_units, r.pack_gqa, r.kv_streams) == want and r.device_cc == _SM100 and not r.claimed, (r, want)
+    assert rb["template"] == r.tile and rb["adapter_split"] == case.blk.decode_split_kv and (rb["adapter_pack"] is True) == r.pack_gqa, (rb, r)
+    assert not case.blk.gate_fused and isinstance(case.blk._gate, _SigmoidGate) and not case.blk._sdpa.fuse_gate
+    if r.decode_tile:
+        assert rb["file"].endswith("/sm100/decode_d256_f16.py") and rb["heads_per_tile"] == (r.group if r.pack_gqa else 1), rb
+        assert rb["n_q"] == r.n_q and rb["split"] == case.blk.decode_split_kv and rb["epilogue_gate"] is False, rb
+    else:
+        assert r.prefill_tile and rb["file"].endswith("/sm100/prefill_d256_f16.py") and rb["heads_per_tile"] == r.group and rb["n_q"] is None, rb
+        assert bool(rb["epilogue_gate"]) is False and case.blk.decode_split_kv == 1, rb
+    k0, v0 = case.block0_bits
+    assert torch.equal(_bits(case.k_cache[0]), k0) and torch.equal(_bits(case.v_cache[0]), v0), "block 0 (the NULL block) must never be written"
+    return r, rb
+
+
+@requires_blackwell
+@pytest.mark.parametrize("group", sorted(_GROUPS))
+@pytest.mark.parametrize("s_q", [1, 2, 3, 4, 5])
+def test_sm100_decode_matches_the_oracle_at_every_group_and_s_q(group, s_q):
+    """The cc 10.0 DECODE cells at every served group x S_q 1 .. 5 against the per-sequence fp32 oracle under the dense suite's budget
+    (cos > 0.999 on ``out``; nothing widened), the padded entry EXACTLY 0 with block 0 untouched, the compiled kernel pinned against the
+    SM100 line's route: the 16-column SM100 decode tile packed (S_q 1 everywhere, 2 at groups 8 / 6, 1 .. 4 at group 4), UNPACKED with
+    ``group`` KV streams at groups 6 / 12 past it, the paged prefill tile packed at groups 16 / 8 / 4; the gate its own launch."""
+    case = _sm100_case(("std", group, s_q), group, s_q, _LENS)
+    case.run()
+    case.check_against_oracle()
+    _sm100_pin(case, _SM100_ROUTE_TABLE[group][s_q])
+
+
+@requires_blackwell
+@pytest.mark.parametrize("s_q, page", [(1, 16), (4, 32)], ids=["sq1-p16", "sq4-p32"])
+def test_sm100_decode_the_27b_geometry_matches_the_oracle(s_q, page):
+    """The 24 / 4 geometry at its real width (``d_model`` 5120, n_qkvg 14336: a multiple of 256) on cc 10.0: S_q 1 at page 16 on the
+    16-column tile packed, S_q 4 at page 32 on the 16-column tile UNPACKED (24 rows exceed the small launch's width: 6 KV streams)."""
+    case = _sm100_case(("q38_27b", s_q, page), 6, s_q, _LENS, page=page, heads=(24, 4), d_model=5120)
+    case.run()
+    case.check_against_oracle(what=f"27B 24/4 d_model 5120 S_q {s_q} p{page}")
+    _sm100_pin(case, _SM100_ROUTE_TABLE[6][s_q])
+    assert case.geom.d_model == 5120 and case.geom.n_qkvg % 256 == 0
+
+
+@requires_blackwell
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+@pytest.mark.parametrize("page", SERVING_PAGE_SIZES)
+def test_sm100_l1_l2_l3_pools_are_bitwise_at_every_page_size(page, dtype):
+    """The pool-layout matrix on cc 10.0 (the tracker's cc 10.0 matrix): the three stride patterns holding the same values give a
+    BITWISE ``out`` at pages 16 / 32 / 64 / 128, bf16 and f16, at 24 / 2 S_q 2 (the 16-column tile unpacked, 12 streams), each
+    within the oracle's budget."""
+    outs = {}
+    for layout in _LAYOUTS:
+        case = _sm100_case(("layout", page, layout, dtype), 12, 2, (200, 0, 77, 1000), page=page, layout=layout, dtype=dtype, seed=3)
+        outs[layout] = case.run().clone()
+        case.check_against_oracle(what=f"cc 10.0 {layout} p{page} {dtype}")
+        _sm100_pin(case, _SM100_ROUTE_TABLE[12][2])
+    for layout in _LAYOUTS[1:]:
+        assert torch.equal(outs[layout], outs["hnd"]), f"{layout} != hnd at page {page} {dtype}"
+
+
+@requires_blackwell
+def test_sm100_two_launches_are_bitwise_and_the_workspace_is_honest():
+    case = _sm100_case(("two", 6, 2), 6, 2, _LENS)
+    a = case.run().clone()
+    b = case.run().clone()
+    assert torch.equal(a, b)
+    need = case.blk.get_workspace_size()
+    ws = torch.empty(need + 65536, dtype=torch.uint8, device=_DEV)
+    ws[need:].fill_(0xA5)
+    out = torch.empty_like(case.out)
+    case.execute(out=out, ws=ws)
+    torch.cuda.synchronize()
+    assert (ws[need:] == 0xA5).all() and torch.equal(out, a)
+
+
+@requires_blackwell
+def test_sm100_capture_of_the_first_execute_replays_bitwise_and_takes_new_lengths_tables_slots_and_inputs():
+    """The capture / replay cell on cc 10.0 (the serving stack's defaults: a fresh declaration, zero warm-ups, no host sync): the
+    default chain there -- the unfused chain with the write-through folded into the norm + RoPE launch, the plain (no PDL) decode tile
+    and its combine, the separate gate."""
+    _capture_replay_cell(fuse_gate=False)
+
+
+@requires_blackwell
+def test_sm100_the_explicit_pdl_switch_is_served_and_bitwise_the_plain_chain():
+    """``use_pdl=True`` is served on cc 10.0 (the SM100 decode tile and the combine carry the griddepcontrol pair; AUTO reads False: the
+    default is the measured part's): the switched chain BITWISE the plain one on ``out`` and on the pools, the stage list the same."""
+    off = _sm100_case(("pdl", 16, 1, False), 16, 1, _LENS, blk_kw=dict(use_pdl=False))
+    on = _sm100_case(("pdl", 16, 1, True), 16, 1, _LENS, blk_kw=dict(use_pdl=True))
+    assert on.blk.use_pdl is True and off.blk.use_pdl is False and "sdpa" in on.blk.pdl_stages and on.blk._sdpa.use_pdl is True
+    assert [st.name for st in on.blk._stages] == [st.name for st in off.blk._stages]
+    a = off.run().clone()
+    b = on.run().clone()
+    on.check_against_oracle(b, what="cc 10.0 use_pdl=True")
+    assert torch.equal(a, b) and torch.equal(_bits(on.k_cache), _bits(off.k_cache)) and torch.equal(_bits(on.v_cache), _bits(off.v_cache))
+    auto = _sm100_case(("pdl", 16, 1, None), 16, 1, _LENS)
+    assert auto.blk.use_pdl is False and auto.blk.use_pdl_requested is None, "AUTO reads False off the measured part"
+
+
+@requires_blackwell
+def test_sm100_declines_the_rubin_only_knobs_by_name():
+    """On the part itself: ``fuse_gate=True`` is the SM100 row's typed decline at ``check_support`` (the three dense forms), the fused
+    projection fork (``fuse_norm_rope_small_m=True``, an explicit ``fuse_cache_write=True``) the sm_107a rendering's, the width cap, the
+    unpacked 17-token step and the 32-column arm at a wide launch (``DECODE_WIDE_TILE_CCS``) the declaration's; the served twins build
+    and run (the oracle cells above)."""
+    gated, _ = _make_block(16, 4, 1, fuse_gate=True)
+    with pytest.raises(NotImplementedError, match="fuse_gate=True is not served by the f16/bf16 SM100 SDPA engine row") as e:
+        gated.check_support()
+    assert "cc 10.0" in str(e.value) and "fuse_gate=False" in str(e.value)
+    for kw in (dict(fuse_norm_rope=True, fuse_norm_rope_small_m=True), dict(fuse_norm_rope=True, fuse_cache_write=True)):
+        fork, _ = _make_block(16, 4, 1, **kw)
+        assert fork.fuse_norm_rope_effective and fork._norm_rope is None
+        with pytest.raises(NotImplementedError, match=r"rendered for sm_107a \(Rubin\); this device is SM100"):
+            fork.check_support()
+    with pytest.raises(NotImplementedError, match="decode_q_tile_max=32 caps the Rubin"):
+        _make_block(16, 4, 1, decode_q_tile_max=32)
+    with pytest.raises(NotImplementedError, match="WIDE launches only"):
+        _make_block(6, 4, 17)
+    with pytest.raises(NotImplementedError, match="the 32-column SM100 decode arm: its cc 10.0 accept cells have not run"):
+        _make_block(6, 32, 3, max_kv_len=4096, n_pages=256)  # the adapter's 32-column arm at a wide launch: declined by name on the part
+    assert _cc() == _SM100 and GatedAttentionBlockFwd.serving_envelope(_geom(16)[0], torch.bfloat16, _DEV).forms == ("extend", "decode")
+    # the FP8-projection + bf16-attention mode ON the part: served iff the tuple holds cc 10.0 (its cells below run then), else the part
+    # statement at check_support and no spelling in the envelope's quant_modes
+    mode = _mode_declaration(16, 4, 1)
+    env = GatedAttentionBlockFwd.serving_envelope(_geom(16)[0], torch.float8_e4m3fn, _DEV, quant=mode.quant)
+    if _SM100 in FP8_PROJ_BF16_ATTENTION_CCS:
+        mode._check_declaration()
+        mode._check_part_support()
+        assert env.forms == ("extend", "decode") and env.decode.quant_modes == (QUANT_MODE_FP8_PROJ_BF16_ATTENTION,)
+    else:
+        with pytest.raises(NotImplementedError, match=r"QuantSpec\(attention_dtype=torch.bfloat16\) on cc 10.0") as e:
+            mode.check_support()
+        assert "FP8_PROJ_BF16_ATTENTION_CCS" in str(e.value) and env.forms == () and env.decode.quant_modes == () and env.decode.reason == str(e.value)
+
+
+# ---------------------------------------------------------------------------
+# Both served parts (requires_dense_part; 2026-10-29): a serving stack's PACKED K|V cache rows bound as two half views
+# ---------------------------------------------------------------------------
+#
+# A serving stack keeps ONE cache tensor per layer, [num_pages, H_kv, P, 2D] -- K in columns [0, D) and V in [D, 2D) of every row (the HND cache
+# of the 24 / 4 model family: [pages, 4, 16 or 32, 512] bf16) -- and hands the block its two halves as the pools, kv[..., :D] / kv[..., D:]: the
+# "unified" layout of the matrix above at the stack's OWN shape.  The cells here mirror that binding literally -- 24 / 4 at d 256, page 16 with
+# one token per sequence and page 32 with a four-token speculative step, a 2048-key context next to a padded entry and a short one, the stack's
+# int64 slot mapping -- and prove the ONE tensor behind the views: the step's rows land in the K half and the V half alone (bitwise the slab
+# bands attention consumed), the prefix rows are untouched, and every byte of every row nobody addressed -- block 0 among them -- still holds
+# the sentinel in BOTH halves (a K store running past D would land in the V half of the same row, and vice versa); the oracle, two launches
+# bitwise, bitwise the HND-compact twin.  Both parts: the gate in the combine on cc 10.7, its own launch on cc 10.0.
+
+_PACKED_KV_LENS = (2048, 0, 5, 1000, 33)  # the stack's longest context, a PADDED entry, a short one (kv_lens >= S_q at S_q 4), two tails
+_PACKED_KV_CELLS = [pytest.param(16, 1, id="p16-plain"), pytest.param(32, 4, id="p32-mtp4")]  # (page, S_q): one token per sequence / a 4-token step
+
+
+def _packed_kv_case(page, s_q, dtype, *, layout="unified", seed=11):
+    """ONE compiled 24 / 4 DECODE cell per (page, S_q, dtype, layout) on the served part's default chain: the gate in the split combine on cc
+    10.7, its own launch on cc 10.0 (``fuse_gate=False``, the placement the SM100 row serves)."""
+    blk_kw = {} if _cc() == _SM107 else dict(fuse_gate=False)
+    return _case(("packed_kv", page, s_q, dtype, layout), 6, s_q, _PACKED_KV_LENS, page=page, layout=layout, dtype=dtype, seed=seed, blk_kw=blk_kw)
+
+
+def _run_with_slots(case, slot_dtype):
+    """One execute with the slot mapping in ``slot_dtype`` (the stack's int64), synchronized; ``out`` cloned."""
+    case.execute(slot_mapping=case.slot_mapping.to(slot_dtype))
+    torch.cuda.synchronize()
+    return case.out.clone()
+
+
+def _assert_packed_kv_halves(case, what):
+    """The ONE tensor behind ``case.k_cache`` / ``case.v_cache`` and the row contract on it after an execute: the two views are the halves of a
+    contiguous ``[num_pages, H_kv, P, 2D]`` tensor (the V view's base ``D`` elements past the K view's, both with strides ``(H_kv*P*2D, P*2D,
+    2D, 1)``); the step's slots hold the slab's K band in the K half and the slab's V band in the V half, bitwise; the prefix rows (written by
+    torch before the run) are unchanged in both halves; every row nobody addressed -- the NULL block 0, the stale rows past ``kv_lens`` on a
+    sequence's last page, the spare pages -- still holds the sentinel in BOTH halves.  Returns the number of addressed rows (slots)."""
+    kv, page, D = case.k_cache._base, case.page, _D
+    h_kv = int(case.k_cache.shape[1])
+    assert kv is case.v_cache._base and tuple(kv.shape) == (case.n_pages, h_kv, page, 2 * D) and kv.is_contiguous(), f"{what}: not ONE [P, H, page, 2D] tensor"
+    assert (
+        case.k_cache.data_ptr() == kv.data_ptr() and case.v_cache.data_ptr() == kv.data_ptr() + D * kv.element_size()
+    ), f"{what}: the views are not the two halves"
+    assert tuple(case.k_cache.stride()) == tuple(case.v_cache.stride()) == (h_kv * page * 2 * D, page * 2 * D, 2 * D, 1), f"{what}: the half views' strides"
+    _, _, k_band, v_band = _slab_bands(case)
+    slot = case.slot_mapping
+    live = slot >= 0
+    s = slot[live].long()
+    assert torch.equal(_bits(case.k_cache[s // page, :, s % page, :]), _bits(k_band[live])), f"{what}: the K half at the step's slots is not the slab's K band"
+    assert torch.equal(_bits(case.v_cache[s // page, :, s % page, :]), _bits(v_band[live])), f"{what}: the V half at the step's slots is not the slab's V band"
+    addressed = torch.zeros(case.n_pages * page, dtype=torch.bool, device=_DEV)
+    for b, L in enumerate(case.kv_lens):
+        if L == 0:
+            continue
+        pos = torch.arange(L, device=_DEV)
+        slots_b = case.block_table[b, : -(-L // page)].long()[pos // page] * page + pos % page
+        addressed[slots_b] = True
+        n_pre = L - case.s_q
+        if n_pre:
+            sp = slots_b[:n_pre]
+            k_ref, v_ref = (x[:n_pre].to(case.dtype) for x in case.ref_rows[b])
+            assert torch.equal(_bits(case.k_cache[sp // page, :, sp % page, :]), _bits(k_ref)), f"{what}: a prefix K row of sequence {b} changed"
+            assert torch.equal(_bits(case.v_cache[sp // page, :, sp % page, :]), _bits(v_ref)), f"{what}: a prefix V row of sequence {b} changed"
+    assert not bool(addressed[:page].any()), f"{what}: block 0 is the NULL block, never addressed"
+    rows = kv.permute(0, 2, 1, 3).reshape(case.n_pages * page, h_kv, 2 * D)  # one [H_kv, 2D] content row per slot
+    assert bool((rows[~addressed] == _SENTINEL).all()), f"{what}: a row nobody addressed was written, in one of the two halves"
+    return int(addressed.sum().item())
+
+
+@requires_dense_part
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+@pytest.mark.parametrize("page, s_q", _PACKED_KV_CELLS)
+def test_packed_kv_rows_of_a_serving_stack_bind_as_two_half_views_on_the_decode_form(page, s_q, dtype):
+    """The stack's ONE ``[pages, 4, P, 512]`` cache tensor bound as the two half views on the DECODE form at 24 / 4: page 16 with one token per
+    sequence, page 32 with a four-token speculative step, kv 2048 / 0 (padded) / 5 / 1000 / 33, int64 slots, bf16 and f16 -- ``out`` within the
+    oracle's budget (the padded entry exactly 0), the write-through in the right halves and nothing else touched (``_assert_packed_kv_halves``),
+    two launches bitwise, bitwise the HND-compact twin on the same inputs, the route pinned against the part's table."""
+    case = _packed_kv_case(page, s_q, dtype)
+    what = f"packed K|V rows 24/4 p{page} S_q {s_q} {dtype}"
+    out = _run_with_slots(case, torch.int64)
+    case.check_against_oracle(out, what=what)
+    n_rows = _assert_packed_kv_halves(case, what)
+    assert (
+        n_rows == sum(_PACKED_KV_LENS) and _written(case.k_cache) == _written(case.v_cache) == n_rows * 4
+    ), f"{what}: the written rows are not the addressed ones"
+    again = _run_with_slots(case, torch.int64)
+    assert torch.equal(out, again), f"{what}: two launches differ"
+    _assert_packed_kv_halves(case, what + " (second launch)")
+    twin = _packed_kv_case(page, s_q, dtype, layout="hnd")
+    assert twin.k_cache._base is None and twin.k_cache.is_contiguous(), "the twin: two compact tensors"
+    out_h = _run_with_slots(twin, torch.int64)
+    twin.check_against_oracle(out_h, what=what + " (HND twin)")
+    assert torch.equal(out, out_h), f"{what}: out differs from the HND-compact twin's: max|diff| {(out.float() - out_h.float()).abs().max().item():.3e}"
+    r = case.blk.decode_route
+    if _cc() == _SM107:
+        assert (r.tile, r.n_q, r.token_units, r.pack_gqa) == _ROUTE_TABLES[DECODE_ROUTE_SINGLE_UNIT][6][s_q] and case.blk.gate_fused, r
+        assert case.route_readback()["file"].endswith("/sm107/decode_d256_f16.py")
+    else:
+        _sm100_pin(case, _SM100_ROUTE_TABLE[6][s_q])
+
+
+# ---------------------------------------------------------------------------
+# The FP8-PROJECTION + BF16-ATTENTION mode (QuantSpec(attention_dtype=torch.bfloat16)) on the DECODE form
+# ---------------------------------------------------------------------------
+#
+# A serving stack whose attention projections are static per-tensor FP8 W8A8 while its KV cache and attention math are bf16: e4m3 h / W_qkvg
+# / W_o under one scale each, the two FP8 forced-tile projection GEMMs with the descale folded into their bf16 epilogue, QK-norm + RoPE and
+# the pool write-through in bf16, stage (4) the bf16 serving form's own kernels and routes over bf16 pools (the gate in the combine on cc 10.7,
+# its own launch on cc 10.0), the gated O quantized to e4m3 at scale_o (quantize_o: the mode's ONE quantize launch) for the FP8 out
+# projection.  The cells are the bf16 DECODE cells' twins through `_Case(quant=True)`: the oracle is the fp8 reference's attention_bf16 arm
+# (no Q / K / V quantization point; the gated O quantized at scale_o exactly as the block does), the bound the SIBLING's (cos > 0.999 on out,
+# a padded entry EXACTLY 0, block 0 untouched) -- never the fp8 suite's 0.99 (every quantization point of the mode is replicated).  Served on
+# the parts of FP8_PROJ_BF16_ATTENTION_CCS: the cells skip by name off them (a part off the tuple declines the mode at check_support, pinned
+# in test_sm100_declines_the_rubin_only_knobs_by_name on cc 10.0 and in the host rows above).
+
+requires_fp8_proj_bf16_attention_part = pytest.mark.skipif(
+    _cc() not in FP8_PROJ_BF16_ATTENTION_CCS,
+    reason=f"the FP8-projection + bf16-attention mode is served on {FP8_PROJ_BF16_ATTENTION_CCS} (declined by name elsewhere); found {_cc()}",
+)
+
+
+def _mode_part_kw():
+    """The mode's declaration knobs per served part: the gate in the combine on cc 10.7 (the `_Case` default, fuse_gate=True), its own launch
+    on every other part (the sm100 row claims no gate epilogue)."""
+    return {} if _cc() == _SM107 else dict(fuse_gate=False)
+
+
+def _mode_case(key, *args, blk_kw=None, **kw):
+    """ONE compiled mode cell per key (the cache the bf16 cells use), on the part's default chain."""
+    bk = _mode_part_kw()
+    bk.update(blk_kw or {})
+    return _case(("mode",) + tuple(key), *args, quant=True, blk_kw=bk, **kw)
+
+
+def _mode_declaration(group, batch, s_q, **blk_kw):
+    """A declared (not compiled) mode block on EMPTY e4m3 tensors over bf16 pools: the declaration cells."""
+    geom, _ = _geom(group)
+    h_q, h_kv = _GROUPS[group]
+    e4 = lambda *shape: torch.zeros(*shape, dtype=torch.float8_e4m3fn, device=_DEV)  # noqa: E731
+    mk = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16, device=_DEV)  # noqa: E731
+    kc, vc = _pools(64, h_kv, 16, _D, "hnd", torch.bfloat16)
+    kw = dict(
+        paged_kv_page_size=16,
+        kv_source="paged",
+        sample_k_cache=kc,
+        sample_v_cache=vc,
+        sample_block_table=torch.zeros(batch, 64, dtype=torch.int32, device=_DEV),
+    )
+    kw.update(_mode_part_kw())
+    kw.update(blk_kw)
+    return GatedAttentionBlockFwd(
+        e4(batch, s_q, _D_MODEL),
+        e4(geom.n_qkvg, _D_MODEL),
+        torch.ones(_D, dtype=torch.bfloat16, device=_DEV),
+        torch.ones(_D, dtype=torch.bfloat16, device=_DEV),
+        mk(batch, s_q, _ROPE),
+        mk(batch, s_q, _ROPE),
+        e4(_D_MODEL, h_q * _D),
+        mk(batch, s_q, _D_MODEL),
+        geom,
+        quant=QuantSpec.bf16_attention(0.01, 0.02, 0.03, 4.0),
+        **kw,
+    )
+
+
+def _mode_pin(case):
+    """The compiled mode block's facts: the attribute, a bf16 SDPA stage reading the slab in place, no quantize_q / quantize_kv, ONE distinct
+    quantize_o, both FP8 projections on the jit-only capture-safe route with the alpha epilogue, the carve without the compact e4m3 Q / K / V,
+    the route pinned on the compiled module (the part's table: the Rubin readback on cc 10.7, `_sm100_pin` on cc 10.0), block 0 untouched."""
+    blk = case.blk
+    assert blk.attention_bf16 and blk.quant.attention_bf16 and blk.dtype == torch.float8_e4m3fn and blk.act_dtype == torch.bfloat16 and blk.inplace_qkv
+    names = [st.name for st in blk._stages]
+    assert (
+        names.count("quantize_o") == 1 and "quantize_q" not in names and "quantize_kv" not in names and names[0] == "qkv_gate_proj" and names[-1] == "out_proj"
+    )
+    assert names.index("quantize_o") == len(names) - 2 and names.index("sdpa") < names.index("quantize_o")
+    sd = blk._sdpa
+    assert isinstance(sd, _Sdpa) and sd.dtype == torch.bfloat16 and sd.fp8 is False and not sd.mxfp8 and sd.o_dtype == torch.bfloat16
+    assert sd.token_stride == blk.geom.n_qkvg and sd.gate_token_stride == blk.geom.n_qkvg and sd.kv_source == KV_SOURCE_PAGED
+    assert blk._quant_q is None and blk._quant_kv is None and isinstance(blk._quant_o, _Quantize) and blk._quant_o.heads == blk.geom.h_q
+    for st in (blk._proj, blk._out_proj):
+        assert isinstance(st, _Projection) and st.dtype == torch.float8_e4m3fn and st.alpha and st.capture_safe and st._plan.route == "jit-only", (
+            st.name,
+            st._plan.route,
+        )
+    lay = blk._ws
+    assert lay.q8 == lay.k8 == lay.v8 == -1 and lay.o8 >= 0 and lay.q == lay.k == lay.v == -1
+    assert set(blk._quant_dev) == {"alpha_qkvg", "alpha_o", "scale_o"} and blk.use_pdl is False
+    r, rb = blk.decode_route, case.route_readback()
+    assert rb["template"] == r.tile and rb["adapter_split"] == blk.decode_split_kv and (rb["adapter_pack"] is True) == r.pack_gqa, (rb, r)
+    if _cc() == _SM107:
+        assert r.device_cc == _SM107 and (blk.gate_fused == (r.prefill_tile or blk.decode_split_kv >= 2))
+        if r.decode_tile:
+            assert rb["file"].endswith("/sm107/decode_d256_f16.py") and rb["n_q"] == r.n_q
+    else:
+        _sm100_pin(case, _SM100_ROUTE_TABLE[r.group][r.s_q])
+    k0, v0 = case.block0_bits
+    assert torch.equal(_bits(case.k_cache[0]), k0) and torch.equal(_bits(case.v_cache[0]), v0), "block 0 (the NULL block) must never be written"
+    return r, rb
+
+
+@requires_dense_part
+@requires_fp8_proj_bf16_attention_part
+@pytest.mark.parametrize("group", sorted(_GROUPS))
+@pytest.mark.parametrize("s_q", [1, 2, 3, 4, 5])
+def test_fp8_proj_bf16_attention_decode_matches_the_oracle_at_every_group_and_s_q(group, s_q):
+    """The mode's DECODE cells of the served-group matrix: every served group x S_q 1 .. 5 at the standard lengths (a tail tile, the
+    ring depth, four tiles with a tail, a PADDED entry) against the mode's oracle under the SIBLING's budget (cos > 0.999 on ``out``,
+    the padded entry EXACTLY 0, block 0 untouched), the route pinned against the compiled module as the bf16 cell of the same
+    declaration (the part's table), the stage list the bf16 chain's plus the one quantize launch, no compact e4m3 Q / K / V."""
+    case = _mode_case(("std", group, s_q), group, s_q, _LENS)
+    case.run()
+    case.check_against_oracle()
+    _mode_pin(case)
+
+
+@requires_dense_part
+@requires_fp8_proj_bf16_attention_part
+@pytest.mark.parametrize("page, s_q", _PACKED_KV_CELLS)
+def test_fp8_proj_bf16_attention_decode_the_27b_geometry_on_packed_kv_rows(page, s_q):
+    """The 24 / 4 geometry at its real width (``d_model`` 5120, n_qkvg 14336) under the mode on a serving stack's PACKED K|V cache (the two
+    half views of one ``[pages, 4, P, 512]`` tensor, int64 slots): page 16 x S_q 1 and page 32 x S_q 4 over kv 2048 / 0 (padded) / 5 / 1000 /
+    33 -- the oracle, the write-through in the right halves with nothing else touched, two launches bitwise, the route pinned per part."""
+    case = _mode_case(("q38_27b_packed", page, s_q), 6, s_q, _PACKED_KV_LENS, page=page, layout="unified", heads=(24, 4), d_model=5120, seed=11)
+    what = f"mode 24/4 d_model 5120 packed K|V p{page} S_q {s_q}"
+    assert case.geom.d_model == 5120 and case.geom.n_qkvg == 14336 and case.h.dtype == torch.float8_e4m3fn
+    out = _run_with_slots(case, torch.int64)
+    case.check_against_oracle(out, what=what)
+    n_rows = _assert_packed_kv_halves(case, what)
+    assert n_rows == sum(_PACKED_KV_LENS)
+    again = _run_with_slots(case, torch.int64)
+    assert torch.equal(out, again), f"{what}: two launches differ"
+    _mode_pin(case)
+
+
+def _e4m3_ulp_distance(a, b):
+    """|a - b| in e4m3 ulps AT THE LARGER MAGNITUDE, in the e4m3 VALUE domain (fp32 tensors): the spacing ``2^(floor(log2 |x|) - 3)`` of a
+    normal value, the subnormal spacing ``2^-9`` below ``2^-6``.  Computed on the HOST in fp32 (a handful of elements): ``torch.exp2`` on a
+    CUDA tensor is a jitted (NVRTC) kernel, and NVRTC does not know every part the block serves."""
+    a, b = a.detach().float().cpu(), b.detach().float().cpu()
+    mag = torch.maximum(a.abs(), b.abs()).clamp_min(2.0**-6)
+    return (a - b).abs() / torch.exp2(torch.floor(torch.log2(mag)) - 3.0)
+
+
+def _e4m3_histogram(dist):
+    return dict(
+        n=int(dist.numel()),
+        exact=int((dist == 0).sum()),
+        one_ulp=int(((dist > 0) & (dist <= 1.0 + 1e-6)).sum()),
+        more=int((dist > 1.0 + 1e-6).sum()),
+        max_ulp=float(dist.max()) if dist.numel() else 0.0,
+    )
+
+
+@requires_dense_part
+@requires_fp8_proj_bf16_attention_part
+def test_fp8_proj_bf16_attention_e4m3_o_is_the_cast_of_the_gated_o_and_tracks_the_gate_quant_model():
+    """The mode's e4m3 O, three readings.  (a) THE STORE PIN: the ``o8`` slot is BITWISE ``cvt.rn.satfinite(bf16 gated O * scale_o)`` of the
+    block's own gated bf16 O (the ``o`` slot, gated in place) on every row -- one quantization convention, the padded entry's bytes 0.
+    (b) THE GATE-AND-QUANTIZE MODEL of a serving stack, ``e4m3(bf16(bf16(O) * sigmoid(G)) * scale_o)`` on the ORACLE's pre-gate O and gate
+    (two bf16 roundings; the block's combine route rounds the fp32 gated value ONCE): the histogram of e4m3-ulp distances is printed; the
+    one-ulp claim is made on the band |x| >= 4 of the e4m3 value domain (the exponent bands 2^2 and above, where one e4m3 ulp >= 0.5 exceeds
+    the chain's ABSOLUTE noise floor: near zero the two chains differ not by a rounding of a shared value but by the kernels' tanh-form
+    sigmoid against torch's for strongly negative gates and by the attention's own accumulation order -- inside the band that floor is
+    below one ulp, so the two chains differ by at most one code at a rounding boundary); below the band the distances are REPORTED, never
+    claimed (the same floor is many ulps of the 2^-9 subnormal spacing; its size in e4m3 units is printed), no tolerance widened; never
+    bitwise.  (c) SATURATION through
+    ``update_quant_scales``: ``scale_o x 4096`` drives every live byte that reaches the range to +-448 (``satfinite``: no NaN / inf), ``out``
+    stays finite; the original spec restored, ``out`` is bitwise the first run (the three device scalars round-trip)."""
+    case = _mode_case(("gq", 12, 2), 12, 2, _LENS)
+    case.run()
+    case.check_against_oracle()
+    scale_o = case.quant.scale_o
+    _, _, og, _ = case.slab_views()
+    o8 = case.o8_view()
+    live, dead = case.live, ~case.live
+    # (a) the store pin
+    assert torch.equal(o8.view(torch.uint8), quant_e4m3(og, scale_o).view(torch.uint8)), "o8 is not the e4m3 cast of the block's own gated O at scale_o"
+    assert (o8[dead].view(torch.uint8) == 0).all() and (og[dead] == 0).all(), "a padded entry's gated O / e4m3 O must be exactly 0"
+    # (b) the model on the oracle's pre-gate O and gate (the step's rows of every live entry)
+    o_ref = torch.stack([case.ref_o[b] for b, L in enumerate(case.kv_lens) if L])
+    g_ref = torch.stack([case.ref_gate[b] for b, L in enumerate(case.kv_lens) if L])
+    model = quant_e4m3((o_ref.float() * torch.sigmoid(g_ref.float())).to(torch.bfloat16), scale_o)
+    a, m = o8[live].float(), model.float()
+    dist = _e4m3_ulp_distance(a, m)
+    band = (torch.maximum(a.abs(), m.abs()) >= 4.0).cpu()
+    full, in_band, below = _e4m3_histogram(dist), _e4m3_histogram(dist[band]), _e4m3_histogram(dist[~band])
+    floor = float((a - m).abs().cpu()[~band].max()) if bool((~band).any()) else 0.0  # the chain's absolute noise floor below the band, in e4m3 units
+    print(
+        f"[mode 24/2 S_q 2 p16] e4m3 O vs the gate-quant model (scale_o {scale_o:.3f}): all {full}; band |x| >= 4: {in_band}; below the band: {below}; "
+        f"max |block - model| below the band {floor:.4f} (e4m3 units; one ulp in the band is >= 0.5)"
+    )
+    assert in_band["n"] > 0.5 * full["n"], "the band must hold most of the live elements for the claim to mean anything"
+    assert in_band["more"] == 0, f"an element in the one-ulp band is more than one e4m3 ulp from the gate-quant model: {in_band}"
+    assert full["exact"] > 0.5 * full["n"], f"fewer than half the codes agree bitwise with the model: {full}"
+    # the oracle's own e4m3 O (the block's quantization point replicated) against the block's: the same histogram shape, reported
+    o8_ref = torch.stack([case.ref_o8[b] for b, L in enumerate(case.kv_lens) if L]).float()
+    print(f"[mode 24/2 S_q 2 p16] e4m3 O vs the ORACLE's e4m3 O: {_e4m3_histogram(_e4m3_ulp_distance(a, o8_ref))}")
+    # (c) saturation through a recalibration, then the round-trip
+    q = case.quant
+    out0 = case.out.clone()
+    case.blk.update_quant_scales(QuantSpec.bf16_attention(q.descale_h, q.descale_w_qkvg, q.descale_w_o, q.scale_o * 4096.0))
+    case.execute()
+    torch.cuda.synchronize()
+    o8s = case.o8_view().float()
+    assert torch.isfinite(o8s).all() and (o8s.abs() <= 448.0).all(), "satfinite: never NaN / inf, never past +-448"
+    sat = (o8s[live].abs() == 448.0).float().mean().item()
+    print(f"[mode 24/2 S_q 2 p16] scale_o x 4096: {sat:.3f} of the live bytes saturate at +-448; out finite {bool(torch.isfinite(case.out.float()).all())}")
+    assert sat > 0.5 and torch.isfinite(case.out.float()).all() and (case.out[dead] == 0).all()
+    case.blk.update_quant_scales(q)
+    case.execute()
+    torch.cuda.synchronize()
+    assert torch.equal(case.out, out0), "the original scales restored must reproduce the first run bitwise"
+
+
+@requires_dense_part
+@requires_fp8_proj_bf16_attention_part
+def test_fp8_proj_bf16_attention_get_workspace_size_is_honest_and_the_carve_has_no_compact_qkv():
+    """The ``get_workspace_size()`` twin under the mode: the split partials inside, a sentinel tail untouched by an execute, the carve
+    without the compact e4m3 Q / K / V slots and with ``o8``; two launches bitwise."""
+    case = _mode_case(("std", 16, 2), 16, 2, _LENS)
+    blk = case.blk
+    lay = blk._layout()
+    assert lay.q8 == lay.k8 == lay.v8 == -1 and lay.o8 >= 0
+    scratch = blk._sdpa.scratch_workspace_bytes()
+    if _cc() == _SM107:
+        assert blk.decode_split_kv >= 2 and scratch > 0, (blk.decode_split_kv, scratch)
+    assert blk.get_workspace_size() >= lay.total_bytes + scratch
+    need = blk.get_workspace_size()
+    ws = torch.empty(need + 65536, dtype=torch.uint8, device=_DEV)
+    ws[need:].fill_(0xA5)
+    out = torch.empty_like(case.out)
+    case.execute(out=out, ws=ws)
+    torch.cuda.synchronize()
+    assert (ws[need:] == 0xA5).all(), "bytes past get_workspace_size() were written"
+    case.check_against_oracle(out, what="mode, sentinel-tailed workspace")
+    a = case.run().clone()
+    b = case.run().clone()
+    assert torch.equal(a, b) and torch.equal(a, out)
+
+
+@requires_dense_part
+@requires_fp8_proj_bf16_attention_part
+def test_fp8_proj_bf16_attention_capture_of_the_first_execute_replays_bitwise_and_takes_new_inputs():
+    """The capture cell's twin under the mode: the FIRST execute of a fresh declaration captured on a NEW stream with no warm-up (the FP8
+    forced-tile GEMMs on the jit-only route: no handle at the first execute; the first-execute scalar write captured WITH its values), the
+    replay bitwise the eager run, a new step (lengths / table / slots / e4m3 inputs under the SAME scales) through the captured tensors."""
+    _capture_replay_cell(quant=True, **_mode_part_kw())
+
+
+@requires_dense_part
+@requires_fp8_proj_bf16_attention_part
+def test_fp8_proj_bf16_attention_update_quant_scales_replays_the_live_values_after_a_warmed_up_capture():
+    """``update_quant_scales`` under the mode writes the THREE scalars (``alpha_qkvg`` / ``alpha_o`` / ``scale_o``) in place: a graph captured
+    after one eager warm-up replays with the LIVE values (bitwise the eager run after the update; the e4m3 point moved, so the output moved
+    too, and it matches the oracle at the new ``scale_o``); the plan facts refused by name."""
+    case = _Case(8, 1, (100, 384, 0, 500), seed=31, quant=True, blk_kw=_mode_part_kw()).compile()
+    case.execute()  # the warm-up: the first-execute scalar write lands eagerly
+    torch.cuda.synchronize()
+    out0 = case.out.clone()
+    case.check_against_oracle(out0, what="mode, warm-up")
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            case.execute()
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(case.out, out0), "the replay of a warmed-up capture differs from the eager run"
+        q = case.quant
+        half = QuantSpec.bf16_attention(q.descale_h, q.descale_w_qkvg, q.descale_w_o, q.scale_o * 0.5)
+        case.blk.update_quant_scales(half)
+        assert case.blk.quant is half
+        graph.replay()
+        torch.cuda.synchronize()
+        rep = case.out.clone()
+        case.execute()
+        torch.cuda.synchronize()
+        assert torch.equal(case.out, rep), "the replay did not read the live scalars"
+        assert not torch.equal(rep, out0), "a halved scale_o moves the e4m3 point: the output must move"
+        ref_half = case.recompute_oracle(q.scale_o * 0.5)
+        c = _cos(rep[case.live], ref_half[case.live])
+        print(f"[mode 8/1 S_q 1] replay after update_quant_scales(scale_o / 2) vs the oracle at that scale: cos {c:.6f}")
+        assert c > 0.999 and (rep[~case.live] == 0).all()
+        with pytest.raises(ValueError, match="QuantSpec.attention_dtype is a plan fact"):
+            case.blk.update_quant_scales(QuantSpec(q.descale_h, q.descale_w_qkvg, q.descale_w_o, 1.0, 1.0, 1.0, q.scale_o))
+        with pytest.raises(ValueError, match="is unused under attention_dtype=torch.bfloat16"):
+            case.blk.update_quant_scales(
+                QuantSpec(q.descale_h, q.descale_w_qkvg, q.descale_w_o, 1.0, None, None, q.scale_o, torch.float8_e4m3fn, torch.bfloat16)
+            )
+        case.blk.update_quant_scales(q)
+        case.execute()
+        torch.cuda.synchronize()
+        assert torch.equal(case.out, out0)
+    finally:
+        graph.reset()
+
+
+@requires_dense_part
+@requires_fp8_proj_bf16_attention_part
+@pytest.mark.parametrize("page", SERVING_PAGE_SIZES)
+def test_fp8_proj_bf16_attention_l1_l2_l3_pools_are_bitwise_at_every_page_size(page):
+    """The pool-layout matrix under the mode (bf16 pools): the three stride patterns holding the same values give a BITWISE ``out`` at pages
+    16 / 32 / 64 / 128, each within the oracle's budget."""
+    outs = {}
+    for layout in _LAYOUTS:
+        case = _mode_case(("layout", page, layout), 12, 2, (200, 0, 77, 1000), page=page, layout=layout, seed=3)
+        outs[layout] = case.run().clone()
+        case.check_against_oracle(what=f"mode {layout} p{page}")
+    for layout in _LAYOUTS[1:]:
+        assert torch.equal(
+            outs[layout], outs["hnd"]
+        ), f"{layout} != hnd at page {page}: max|diff| {(outs[layout].float() - outs['hnd'].float()).abs().max().item():.3e}"
+
+
+# The MEASURED launch counts of the mode's DECODE chain per served part -- the 24 / 2 geometry at d_model 2560, B 2 x KV 512, S_q 1, the split
+# ladder pinned at decode_split_kv=4 (the decode tile + its combine on every part: the chain the docs describe; the split count sizes the grid,
+# never the kernel list) -- by (fuse_cache_write_small_m, fuse_gate).  The census cell below is the detector (EVERY kernel the profiler sees is
+# counted, a GEMM's split-K reduce included) and the docs quote these numbers; a tree that changes a stage's kernel count changes this table
+# and the prose with it.  cc 10.0 serves the gate as its own launch only (fuse_gate=True is the part's typed decline): the two write-through arms.
+_MODE_DECODE_LAUNCHES = {
+    _SM107: {(False, True): 7, (True, True): 6, (False, False): 8, (True, False): 7},
+    _SM100: {(False, False): 8, (True, False): 7},
+}
+
+
+@requires_dense_part
+@requires_fp8_proj_bf16_attention_part
+def test_fp8_proj_bf16_attention_launch_census_is_the_bf16_chain_plus_the_quantize_launch():
+    """The DECODE chain's CUPTI census under the mode on every served part, against the bf16 UNFUSED chain of the same declaration, per
+    write-through arm and -- on cc 10.7 -- per gate placement.  EVERY kernel the profiler sees is counted (a GEMM's split-K reduce included;
+    the names are printed): the quantize kernel present exactly once and only under the mode, the cache-write kernel exactly on the separate
+    arm, the gate's own kernel exactly on the separate-gate arm, no hidden copy, the fold dropping exactly one launch with ``out`` bitwise
+    across it, and the TOTAL per arm = ``_MODE_DECODE_LAUNCHES`` (the number the docs publish).  A LAUNCH-COUNT cell, not a numerics cell:
+    declared small (B 2 x KV 512 at the 24 / 2 geometry, ``decode_split_kv=4`` pinned so the counted chain -- the decode tile + its combine --
+    does not depend on the part's split model) and built with ``check_numerics=False`` (no reference: the oracle matrix cells own the numerics;
+    the full-sequence fp8 reference at long KV made the earlier form of this cell too heavy for the smoke tier), so it stays in the module's
+    L0: on the development parts it costs ~40 s wall / 840 MiB peak allocated (cc 10.7, 204 SMs) and ~140 s / 520 MiB (cc 10.0, 148 SMs), the
+    eight chains' compiles included (measured with the compiled-plan cache disabled), against ~2.5 min and ~1.6 GiB per fp32 logits tensor for
+    the oracle form it replaces.  Batch 2, not 1: at the current develop the dense-layout binding's GATE predicate
+    refuses the batch-1 singleton-stride slab column on cc 10.7 (a defect outside this change); the chain has no batch-dependent stage."""
+    part = _cc()
+    arms = _MODE_DECODE_LAUNCHES[part]
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    t0 = time.perf_counter()
+    cells = {}
+    for cw, fg in arms:
+        bk = dict(fuse_cache_write_small_m=cw, fuse_gate=fg, decode_split_kv=4)
+        cells[("mode", cw, fg)] = _Case(12, 1, (512, 512), seed=1, d_model=2560, quant=True, blk_kw=bk, check_numerics=False).compile()
+        cells[("bf16", cw, fg)] = _Case(12, 1, (512, 512), seed=1, d_model=2560, blk_kw=dict(fuse_norm_rope=False, **bk), check_numerics=False).compile()
+    census = {k: _cupti_kernels(lambda c=c: c.execute()) for k, c in cells.items()}
+    if any(k is None for k, _ in census.values()):
+        pytest.skip("torch.profiler recorded no CUDA events (CUPTI unavailable on this node); the launch count is unverified here")
+    for cw, fg in arms:  # every arm's names first (a count that moved is read off one log), the pins after
+        k_mode, m_mode = census[("mode", cw, fg)]
+        k_bf, _ = census[("bf16", cw, fg)]
+        blk = cells[("mode", cw, fg)].blk
+        print(
+            f"\n[mode census cc {part[0]}.{part[1]}] fuse_cache_write_small_m={cw} fuse_gate={fg} (readbacks: cache_write_in_norm_rope="
+            f"{blk.cache_write_in_norm_rope}, gate_fused={blk.gate_fused}, decode_split_kv={blk.decode_split_kv}): {len(k_mode)} kernels + "
+            f"{len(m_mode)} memset/memcpy:\n  " + "\n  ".join(n[:120] for n in k_mode)
+        )
+        print(f"bf16 unfused chain, the same arms: {len(k_bf)} kernels:\n  " + "\n  ".join(n[:120] for n in k_bf))
+    for cw, fg in arms:
+        k_mode, m_mode = census[("mode", cw, fg)]
+        k_bf, _ = census[("bf16", cw, fg)]
+        blk = cells[("mode", cw, fg)].blk
+        assert (blk.decode_split_kv, blk.gate_fused, blk.cache_write_in_norm_rope) == (4, fg, cw), "the declared arm is the one that compiled"
+        assert sum("frost_quantize_fp8" in n for n in k_mode) == 1 and not any("frost_quantize" in n for n in k_bf)
+        assert any("frost_cache_write" in n for n in k_mode) == (not cw) and any("frost_qk_norm_rope" in n for n in k_mode)
+        assert sum("frost_elementwise_gate" in n for n in k_mode) == (0 if fg else 1), "the gate's own launch exactly on the separate-gate arm"
+        assert not [n for n in m_mode if "memcpy" in n.lower()], "a hidden copy on the mode's execute path"
+        assert len(k_mode) == arms[(cw, fg)], f"the mode's launch count at this arm is {len(k_mode)}, the published {arms[(cw, fg)]}: {k_mode}"
+    for fg in sorted({fg for _, fg in arms}):
+        assert len(census[("mode", True, fg)][0]) == len(census[("mode", False, fg)][0]) - 1, "the write-through fold drops exactly the cache-write launch"
+        assert torch.equal(_bits(cells[("mode", True, fg)].out), _bits(cells[("mode", False, fg)].out))
+    torch.cuda.synchronize()
+    print(
+        f"[mode census cc {part[0]}.{part[1]}] cost: {time.perf_counter() - t0:.1f} s wall (declarations, compiles, the profiled launches), "
+        f"peak {torch.cuda.max_memory_allocated() / 2**20:.0f} MiB allocated"
+    )

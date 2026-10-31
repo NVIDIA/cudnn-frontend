@@ -19,6 +19,7 @@ here rather than agree with itself.
 from __future__ import annotations
 
 import dataclasses
+from typing import Optional
 
 import cudnn
 import pytest
@@ -83,6 +84,29 @@ def _dims(kind: str, caps):
         if _probe(kind)(caps, ga.SdpaGraphFacts(**_values(kind, caps, *pair))) is None:
             return pair
     return pairs[0]
+
+
+def declaration_reason(kind: str, caps, facts) -> Optional[str]:
+    """The row's own ``declaration_check`` on ``facts``: shape constraints the band model does not see (a window served at one
+    head dim only, a dense-MHA-only row).  The probes run it next to the band checks, so where it declines a sample its
+    sentence may be the probe's first reason; None when the row has no check or the check accepts."""
+    check = getattr(caps, "declaration_check", None)
+    if check is None:
+        return None
+    if kind == "fwd":
+        return check(facts)
+    from cudnn.frost.buffers import cutedsl_state
+
+    return check(facts, cutedsl_state()[1])
+
+
+def probe_matches(kind: str, caps, facts, expected) -> bool:
+    """The probe's reason is the band expectation, or -- where the row's declaration check declines the sample -- that check's."""
+    actual = _probe(kind)(caps, facts)
+    decl = declaration_reason(kind, caps, facts)
+    if decl is None:
+        return actual == expected
+    return actual in ({decl} if expected is None else {expected, decl})
 
 
 def legal_facts(kind: str, caps, **overrides) -> ga.SdpaGraphFacts:
@@ -169,6 +193,9 @@ def declares(caps, *, right=None, left_window=False, bottom_right=False) -> bool
         raise AssertionError(f"unknown right mode {right!r}")
     if left_window and not caps.swa:
         ok = False
+    # The one coupling a row declares beyond its flags: the right modes its window pairs with.
+    if left_window and caps.band.window_right is not None and (right or band.RIGHT_UNBOUNDED) not in caps.band.window_right:
+        ok = False
     if bottom_right and not caps.bottom_right:
         ok = False
     return ok
@@ -186,8 +213,8 @@ def test_every_row_carries_a_normalized_band_support():
         assert spec.name not in seen, f"duplicate engine id {spec.name}"
         seen.add(spec.name)
         assert isinstance(caps.band, band.BandSupport), f"{spec.name}: band not normalized"
-        # The normalization layer is the ONLY mapping of the legacy flags.
-        assert caps.band == band.BandSupport.from_legacy_flags(
+        # The normalization layer is the ONLY mapping of the legacy flags; an explicit claim may add the window coupling and nothing else.
+        assert dataclasses.replace(caps.band, window_right=None) == band.BandSupport.from_legacy_flags(
             causal=caps.causal,
             bottom_right=caps.bottom_right,
             swa=caps.swa,
@@ -221,6 +248,30 @@ def test_band_support_rejects_unknown_or_empty_axis_claims():
         band.BandSupport(anchors=frozenset({"middle"}))
     with pytest.raises(ValueError):
         band.BandSupport(right=frozenset())
+
+
+def test_a_window_coupling_is_declared_and_decided_after_the_anchor():
+    # ``window_right``: the right modes a left window pairs with -- the one
+    # coupling between axes a row declares (the SM100 MXFP8 backward serves a
+    # window under the causal diagonal only).  The model and the probe decline
+    # the unpaired window with the same sentence, after the anchor checks.
+    both_left = frozenset({band.LEFT_NONE, band.LEFT_WINDOW})
+    for right, left, window_right in (
+        (frozenset({band.RIGHT_UNBOUNDED}), both_left, frozenset({band.RIGHT_CAUSAL})),  # not a claimed right mode
+        (frozenset({band.RIGHT_UNBOUNDED, band.RIGHT_CAUSAL}), frozenset({band.LEFT_NONE}), frozenset({band.RIGHT_CAUSAL})),  # no window claimed
+        (frozenset({band.RIGHT_UNBOUNDED, band.RIGHT_CAUSAL}), both_left, frozenset()),  # empty
+    ):
+        with pytest.raises(ValueError):
+            band.BandSupport(right=right, left=left, window_right=window_right)
+    kind, caps = next((kind, spec.capabilities) for kind, spec in _rows() if spec.name == "sdpa_bwd_sm100_mxfp8")
+    assert caps.band.window_right == frozenset({band.RIGHT_CAUSAL}) and caps.swa and caps.causal
+    assert caps.band.as_dict()["window_right"] == [band.RIGHT_CAUSAL]
+    reason = band.window_right_reason(caps.band.window_right)
+    assert reason == "a sliding window is served with a causal mask only"
+    paired = legal_facts(kind, caps, s_kv=256, **band_window(3, causal=True))
+    unpaired = legal_facts(kind, caps, s_kv=256, **band_window(3))
+    assert caps.band.decline(paired.band) is None and _probe(kind)(caps, paired) is None
+    assert caps.band.decline(unpaired.band) == reason == _probe(kind)(caps, unpaired)
 
 
 def test_shipped_rows_express_both_a_full_and_a_restricted_claim():
@@ -497,11 +548,13 @@ def test_left_bound_presence_and_offsets():
         for window_left in (None, 0, 1, 3, 100000):
             facts = band_unmasked() if window_left is None else band_window(window_left)
             sample = legal_facts(kind, caps, s_kv=256, **facts)
-            if window_left is None:
+            if window_left is None or declares(caps, right=band.RIGHT_UNBOUNDED, left_window=True):
                 expected = None
+            elif caps.swa:  # served, but not without the causal diagonal
+                expected = band.window_right_reason(caps.band.window_right)
             else:
-                expected = None if declares(caps, right=band.RIGHT_UNBOUNDED, left_window=True) else band.REASON_LEFT_WINDOW
-            assert _probe(kind)(caps, sample) == expected, (spec.name, window_left)
+                expected = band.REASON_LEFT_WINDOW
+            assert probe_matches(kind, caps, sample, expected), (spec.name, window_left, _probe(kind)(caps, sample))
             if window_left is not None:
                 # window_left is the OFFSET: the API's length is offset + 1, so
                 # length 1 (the current token only) is offset 0 -- and 0 is NOT
@@ -528,7 +581,7 @@ def test_bottom_right_anchor_needs_a_diagonal_and_a_claim():
         # that first.
         incoherent = legal_facts(kind, caps, s_kv=256, **band_window(3, bottom_right=True))
         expected = band.REASON_ANCHOR_WITHOUT_DIAGONAL if caps.swa else band.REASON_LEFT_WINDOW
-        assert _probe(kind)(caps, incoherent) == expected, spec.name
+        assert probe_matches(kind, caps, incoherent, expected), (spec.name, _probe(kind)(caps, incoherent))
         assert caps.band.decline(incoherent.band) == expected, spec.name
         # The constraint cannot be derived from axis membership: this band asks
         # for exactly the unbounded right mode and the bottom-right anchor, both
@@ -537,7 +590,7 @@ def test_bottom_right_anchor_needs_a_diagonal_and_a_claim():
         assert caps.band.serves_right_mode(band.RIGHT_UNBOUNDED)
         assert caps.band.serves_anchor(anchor_without_diagonal) == bool(caps.bottom_right)
         sample = legal_facts(kind, caps, s_kv=256, causal=False, right_band_widening=False, right_bound=None, bottom_right=True, window_left=None)
-        assert _probe(kind)(caps, sample) == band.REASON_ANCHOR_WITHOUT_DIAGONAL, spec.name
+        assert probe_matches(kind, caps, sample, band.REASON_ANCHOR_WITHOUT_DIAGONAL), (spec.name, _probe(kind)(caps, sample))
         assert caps.band.decline(sample.band) == band.REASON_ANCHOR_WITHOUT_DIAGONAL, spec.name
         # Bottom-right WITH a diagonal: decided by the row's claim, and the
         # RIGHT AXIS is still asked first -- a row that declines the band
@@ -554,7 +607,7 @@ def test_bottom_right_anchor_needs_a_diagonal_and_a_claim():
                 expected = band.anchor_reason(anchor_noun)
             else:
                 expected = None
-            assert _probe(kind)(caps, sample) == expected, (spec.name, facts, _probe(kind)(caps, sample))
+            assert probe_matches(kind, caps, sample, expected), (spec.name, facts, _probe(kind)(caps, sample))
         # Left window + causal diagonal + bottom-right: the SWA axis and the
         # anchor are independent.
         combined = legal_facts(kind, caps, s_kv=256, **band_window(3, causal=True, bottom_right=True))
@@ -724,6 +777,8 @@ def test_model_and_probe_agree_on_every_band_sample():
             facts = legal_facts(kind, caps, s_kv=256, **sample)
             model_reason = caps.band.decline(facts.band)
             probe_reason = _probe(kind)(caps, facts)
+            if probe_reason is not None and probe_reason == declaration_reason(kind, caps, facts):
+                continue  # the row's shape constraint, which the band model does not see, decided first
             assert (model_reason is None) == (probe_reason is None), (spec.name, sample, model_reason, probe_reason)
             if model_reason is not None and probe_reason is not None and model_reason != probe_reason:
                 # The one wording that legitimately differs per pass: the

@@ -71,13 +71,20 @@ def test_classic_path_without_candidates(no_candidates):
     assert g._lowered_graph is not None
 
 
-def test_mixed_graph_still_lowers(frost_candidate):
-    """A node the GEMM validator does not cover (reshape) keeps the
-    classic eager lowering even with a candidate: the rule is every-node-covered."""
+def test_reshape_graph_uses_python_validation(frost_candidate):
+    """Reshape is now covered; validation does not construct backend operations."""
     g, c = _matmul_graph()
     g.reshape(input=c).set_dim([2, 32, 96]).set_stride([3072, 96, 1]).set_output(True)
     g.validate()
-    assert g._lowered_graph is not None
+    assert g._lowered_graph is None
+
+
+def test_uncovered_node_validator_declines():
+    """The every-node-covered rule retains the fallback for unknown families."""
+    from types import SimpleNamespace
+    from cudnn._gemm_validate import validate_graph
+
+    assert not validate_graph(SimpleNamespace(_nodes=[SimpleNamespace(node_type=object())]))
 
 
 @pytest.mark.parametrize("candidate", ["frost_candidate", "no_candidates"])
@@ -175,3 +182,56 @@ def test_family_without_validator_lowers_classically(frost_candidate, monkeypatc
     g, _ = _matmul_graph()
     g.validate()
     assert g._lowered_graph is not None
+
+
+def _transpose_graph():
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    a = g.tensor(name="A", dim=[1, 32, 64], stride=[2048, 1, 32])
+    b = g.tensor(name="B", dim=[1, 32, 48], stride=[1536, 1, 32])
+    value = g.relu(input=a).set_data_type(cudnn.data_type.HALF)
+    transposed = g.transpose(input=value, permutation=[0, 2, 1])
+    g.matmul(A=transposed, B=b).set_output(True)
+    return g, transposed
+
+
+def test_frost_transpose_validates_without_backend_descriptor(frost_candidate):
+    """A Python candidate does not require the backend's cuDNN 9.22 transpose op."""
+    g, output = _transpose_graph()
+    g.validate()
+    g.build_operation_graph()
+    assert output.get_data_type() == cudnn.data_type.HALF
+    assert g._lowered_graph is None
+
+
+def test_frost_transpose_without_candidate_keeps_classic_lowering(no_candidates):
+    g, _ = _transpose_graph()
+    g.validate()
+    assert g._lowered_graph is not None
+
+
+@pytest.mark.parametrize(
+    "permutation,message",
+    [(None, "Permutation must be set"), ([0, 1], "size must match"), ([0, 2, 3], "indices must be in range"), ([0, 2, 2], "indices must be unique")],
+)
+def test_frost_transpose_invalid_permutation(frost_candidate, permutation, message):
+    g, output = _transpose_graph()
+    output.set_dim([1, 64, 32])  # retain a declared shape so the attribute validator runs
+    node = next(n for n in g._nodes if n.node_type.name == "TRANSPOSE")
+    node.params["permutation"] = permutation
+    with pytest.raises(ValueError, match=message):
+        g.validate()
+    assert not g._is_validated and g._lowered_graph is None
+
+
+@pytest.mark.parametrize("problem", ["dtype", "shape"])
+def test_frost_transpose_invalid_output(frost_candidate, problem):
+    g, output = _transpose_graph()
+    if problem == "dtype":
+        output.set_data_type(cudnn.data_type.FLOAT)
+        error, message = ValueError, "data types must match"
+    else:
+        output.set_dim([1, 64, 40])
+        error, message = cudnn.cudnnGraphNotSupportedError, "Transpose output dims"
+    with pytest.raises(error, match=message):
+        g.validate()
+    assert not g._is_validated

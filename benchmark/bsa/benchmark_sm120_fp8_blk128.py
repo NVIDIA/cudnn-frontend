@@ -6,6 +6,8 @@
 Run from the repository root on an idle SM120 GPU. Results use paired,
 alternating CUDA-graph replays, not profiler times. Metadata conversion is
 baseline setup only and is never used by the native implementation.
+Use --compare-per-token to compare blk128 K quantization over 16 tokens
+versus one token instead, with unchanged per-token Q and per-channel V.
 """
 
 import argparse
@@ -74,6 +76,7 @@ def main():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=21)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--compare-per-token", action="store_true", help="compare blk128 K granularity 16 versus 1 instead of blk64 versus blk128")
     args = parser.parse_args()
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         raise RuntimeError("this benchmark requires SM120")
@@ -84,9 +87,11 @@ def main():
     torch.manual_seed(120128)
     shape = (1, args.heads, args.sequence, 128)
     q, k, v = (torch.randn(shape, dtype=torch.bfloat16, device="cuda") for _ in range(3))
+    configurations = ((128, 16), (128, 1)) if args.compare_per_token else ((64, 16), (128, 16))
+    labels = ("k16", "k1") if args.compare_per_token else ("blk64", "blk128")
     quantized = {
-        64: _quantize_sage_bhsd(q, k, v),
-        128: _quantize_sage_bhsd(q, k, v, v_block_size=128),
+        (block, granularity): _quantize_sage_bhsd(q, k, v, v_block_size=128 if block == 128 else 0, k_quant_block_size=granularity)
+        for block, granularity in configurations
     }
     report = {
         "gpu": torch.cuda.get_device_name(),
@@ -94,6 +99,7 @@ def main():
         "cutlass": str(_interface.cutlass.__version__),
         "shape": shape,
         "timing": "paired alternating CUDA-graph replay; medians; milliseconds",
+        "comparison": labels,
         "cases": [],
     }
     print(json.dumps({key: value for key, value in report.items() if key != "cases"}), flush=True)
@@ -105,19 +111,23 @@ def main():
             case = {"density": density, "effective_density": topk / (args.sequence // 128), "pattern": pattern, "topk128": topk}
             for mode in ("attention_only", "with_quantization"):
                 graphs, outputs = [], []
-                for block_size, indices in ((64, indices64), (128, indices128)):
+                for block_size, granularity in configurations:
+                    indices = indices128 if block_size == 128 else indices64
 
-                    def run(block_size=block_size, indices=indices):
+                    def run(block_size=block_size, granularity=granularity, indices=indices):
                         if mode == "attention_only":
                             return _interface._bsa_attn_fwd_sm120_fp8(
-                                *quantized[block_size],
+                                *quantized[block_size, granularity],
                                 indices,
                                 indices.shape[-1],
                                 128**-0.5,
                                 sparse_block_size=block_size,
                                 v_block_size=128 if block_size == 128 else 0,
+                                k_quant_block_size=granularity,
                             )[0]
-                        return ops.block_sparse_attention_fp8_forward(q, k, v, indices, sparse_block_size=block_size)["o_tensor"]
+                        return ops.block_sparse_attention_fp8_forward(q, k, v, indices, sparse_block_size=block_size, k_quant_block_size=granularity)[
+                            "o_tensor"
+                        ]
 
                     graph, output = _capture(run, args.warmup)
                     graphs.append(graph)
@@ -125,8 +135,8 @@ def main():
                 samples = _paired_times(graphs, args.repeats)
                 medians = [statistics.median(values) for values in samples]
                 case[mode] = {
-                    "blk64_ms": medians[0],
-                    "blk128_ms": medians[1],
+                    f"{labels[0]}_ms": medians[0],
+                    f"{labels[1]}_ms": medians[1],
                     "speedup": medians[0] / medians[1],
                     "sample_relative_l2": _sample_error(q, k, v, outputs, indices128),
                     "samples_ms": samples,

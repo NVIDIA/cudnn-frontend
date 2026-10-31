@@ -110,9 +110,15 @@ class DenseScoreRecomputeSm100:
         k_block_size: int | None = None,
         ratio: int = 1,
         is_varlen: bool = False,
+        page_size: int = 0,
     ):
         assert score_type in ("indexer", "attention")
         assert ratio >= 1, f"ratio must be >= 1, got {ratio}"
+        # Paged K streams each n-block as min(page, n_block) row boxes, so a box never straddles
+        # two pages. Boxes stack in 8-row swizzle atoms, hence the multiple of 8.
+        assert page_size % 8 == 0 and (
+            page_size % n_block_size == 0 or n_block_size % page_size == 0
+        ), f"page_size ({page_size}) must be a multiple of 8 that divides n_block_size ({n_block_size}) or is a multiple of it"
         self.score_type = score_type
         self.head_dim = head_dim
         self.qhead_per_kvhead = qhead_per_kvhead
@@ -121,6 +127,7 @@ class DenseScoreRecomputeSm100:
         self.kv_stage = kv_stage
         self.ratio = ratio
         self.is_varlen = is_varlen
+        self.page_size = page_size
         # Unified forward specializations opt in to compact output. The base
         # dense score kernel always retains its dense output contract.
         self.is_compressed_logits = False
@@ -203,6 +210,8 @@ class DenseScoreRecomputeSm100:
         mQCausalOffsets: cute.Tensor | None,
         stream: cuda.CUstream,
         mCandBatchOffsets: cute.Tensor | None = None,
+        mBlockTable: cute.Tensor | None = None,
+        mKvLens: cute.Tensor | None = None,
     ):
         """Host-side: layout transpose, PackGQA, TMA creation, kernel launch.
 
@@ -213,11 +222,17 @@ class DenseScoreRecomputeSm100:
         ``mDenom`` may be ``None`` only for a specialization that never writes
         the denominator (``compute_lse=False`` in the unified indexer subclass);
         the slot is then compiled out (Rule 8, recipe R3).
+
+        ``mBlockTable`` (bs, max_pages) int32 switches K to a page pool
+        ``(num_pages, page_size, n_heads_kv, head_dim)``: batch ``b`` reads its
+        ``i``-th page at pool row ``mBlockTable[b, i]`` and its key count from
+        ``mKvLens[b]``. ``mCuSeqlensK`` must then be ``None``.
         """
 
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
         is_varlen = mCuSeqlensQ is not None
+        is_paged = mBlockTable is not None
 
         self.tma_copy_bytes = {
             "Q": self.m_block_size * self.head_dim_padded * (self.q_dtype.width // 8),
@@ -226,16 +241,21 @@ class DenseScoreRecomputeSm100:
 
         if const_expr(is_varlen):
             assert self.is_varlen
-            assert mCuSeqlensQ is not None and mCuSeqlensK is not None
+            assert mCuSeqlensQ is not None and (mCuSeqlensK is not None or is_paged)
         else:
             assert not self.is_varlen
             assert mCuSeqlensQ is None and mCuSeqlensK is None
+        if const_expr(is_paged):
+            assert self.page_size > 0 and mKvLens is not None and mCuSeqlensK is None
+        else:
+            assert self.page_size == 0 and mKvLens is None
 
         # --- Layout transpose: sequence dim first for both BSHD and THD ---
         # BSHD: (bs, seqlen, heads, hdim) -> (seqlen, hdim, heads, bs)
         # THD:  (total, heads, hdim)      -> (total, hdim, heads)
+        # Paged K: (num_pages, page, heads, hdim) -> (page, hdim, heads, num_pages)
         Q_layout_transpose = [0, 2, 1] if const_expr(is_varlen) else [1, 3, 2, 0]
-        K_layout_transpose = [0, 2, 1] if const_expr(is_varlen) else [1, 3, 2, 0]
+        K_layout_transpose = [0, 2, 1] if const_expr(is_varlen and not is_paged) else [1, 3, 2, 0]
         mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose))
         mK = cute.make_tensor(mK.iterator, cute.select(mK.layout, mode=K_layout_transpose))
 
@@ -302,14 +322,25 @@ class DenseScoreRecomputeSm100:
             self.cluster_layout_vmnk.shape,
         )
 
-        tma_atom_K, mK = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_load_op,
-            mK,
-            cute.select(sK_layout, mode=[0, 1, 2]),
-            self.mma_tiler_qk,
-            tiled_mma_qk,
-            self.cluster_layout_vmnk.shape,
-        )
+        if const_expr(is_paged):
+            # One box per page row range: a (box_rows, k_block) swizzled tile that lands at a
+            # 1 KiB-aligned row offset of the stage, so stacked boxes equal the MMA's full tile.
+            k_box_rows = min(self.page_size, self.n_block_size)
+            k_box_layout = cute.make_composed_layout(
+                sK_layout.inner,
+                0,
+                cute.make_layout((k_box_rows, self.k_block_size), stride=(self.k_block_size, 1)),
+            )
+            tma_atom_K, mK = cpasync.make_tiled_tma_atom(tma_load_op, mK, k_box_layout, (k_box_rows, self.k_block_size))
+        else:
+            tma_atom_K, mK = cute.nvgpu.make_tiled_tma_atom_A(
+                tma_load_op,
+                mK,
+                cute.select(sK_layout, mode=[0, 1, 2]),
+                self.mma_tiler_qk,
+                tiled_mma_qk,
+                self.cluster_layout_vmnk.shape,
+            )
 
         self.sQ_layout = sQ_layout
         self.sK_layout = sK_layout
@@ -360,6 +391,8 @@ class DenseScoreRecomputeSm100:
             mCuSeqlensK,
             mQCausalOffsets,
             mCandBatchOffsets,
+            mBlockTable,
+            mKvLens,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -391,9 +424,12 @@ class DenseScoreRecomputeSm100:
         mCuSeqlensK: cute.Tensor | None,
         mQCausalOffsets: cute.Tensor | None,
         mCandBatchOffsets: cute.Tensor | None = None,
+        mBlockTable: cute.Tensor | None = None,
+        mKvLens: cute.Tensor | None = None,
     ):
         """Device-side kernel entry with CLC persistent scheduling."""
         is_varlen = mCuSeqlensQ is not None
+        is_paged = mBlockTable is not None
         if const_expr(is_varlen):
             assert self.is_varlen
         else:
@@ -401,13 +437,14 @@ class DenseScoreRecomputeSm100:
 
         # Static seqlens used as fallback when varlen is disabled.
         seqlen_q_static = max_seqlen_q if const_expr(is_varlen) else cute.size(mQ.shape[0]) // self.qhead_per_kvhead
-        seqlen_k_static = max_seqlen_k if const_expr(is_varlen) else cute.size(mK.shape[0])
+        seqlen_k_static = max_seqlen_k if const_expr(is_varlen or is_paged) else cute.size(mK.shape[0])
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
             seqlen_q_static=seqlen_q_static,
             seqlen_k_static=seqlen_k_static,
             mCuSeqlensQ=mCuSeqlensQ,
             mCuSeqlensK=mCuSeqlensK,
+            mSeqUsedK=mKvLens,
             tile_m=self.m_block_size,
             tile_n=self.n_block_size,
         )
@@ -626,26 +663,72 @@ class DenseScoreRecomputeSm100:
 
                         # TMA K load (reverse order, matching MMA direction)
                         K_producer.reset()
-                        mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, 0]
+                        if const_expr(is_paged):
+                            mK_src = mK
+                            sK_ptr = storage.sK.data_ptr()
+                            k_box_layout = cute.make_composed_layout(
+                                sK_layout.inner,
+                                0,
+                                cute.make_layout((min(self.page_size, self.n_block_size), self.k_block_size), stride=(self.k_block_size, 1)),
+                            )
+                        else:
+                            mK_src = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, 0]
                         n_block_k = num_n_blocks_compute - Int32(1)
                         while n_block_k >= Int32(0):
+                            if const_expr(is_paged):
+                                # Each n-block is k_boxes row boxes, one page lookup per box. The n-block
+                                # count is clamped by this batch's key count, so every slot is live. The slot
+                                # is still clamped into the table row so the read never leaves it.
+                                k_box_rows = min(self.page_size, self.n_block_size)
+                                k_boxes = self.n_block_size // k_box_rows
+                                last_slot = cute.size(mBlockTable.shape[1]) - Int32(1)
+                                mK_boxes = []
+                                box_rows = []
+                                for _j in cutlass.range_constexpr(k_boxes):
+                                    row = n_block_k * Int32(self.n_block_size) + Int32(_j * k_box_rows)
+                                    page_slot = row // Int32(self.page_size)
+                                    page_slot = page_slot if page_slot < last_slot else last_slot
+                                    page = mBlockTable[batch_idx, page_slot]
+                                    mK_boxes.append(mK_src[None, None, None, page][None, None, 0])
+                                    box_rows.append((row - page_slot * Int32(self.page_size)) // Int32(k_box_rows))
                             for _kc in cutlass.range_constexpr(self.num_k_chunks):
                                 handle_K = K_producer.acquire_and_advance()
-                                gK = cute.local_tile(
-                                    mK_cur,
-                                    (self.n_block_size, self.k_block_size),
-                                    (n_block_k, _kc),
-                                )
-                                sK_stage = sK[None, None, None, handle_K.index]
-                                load_K_fn, _, _ = copy_utils.tma_get_copy_fn(
-                                    tma_atom_K,
-                                    0,
-                                    cute.make_layout(1),
-                                    gK,
-                                    sK_stage,
-                                    single_stage=True,
-                                )
-                                load_K_fn(tma_bar_ptr=handle_K.barrier)
+                                if const_expr(is_paged):
+                                    for _j in cutlass.range_constexpr(k_boxes):
+                                        gK = cute.local_tile(
+                                            mK_boxes[_j],
+                                            (k_box_rows, self.k_block_size),
+                                            (box_rows[_j], _kc),
+                                        )
+                                        sK_box = cute.make_tensor(
+                                            sK_ptr + handle_K.index * Int32(self.n_block_size * self.k_block_size) + _j * k_box_rows * self.k_block_size,
+                                            k_box_layout,
+                                        )
+                                        load_K_fn, _, _ = copy_utils.tma_get_copy_fn(
+                                            tma_atom_K,
+                                            0,
+                                            cute.make_layout(1),
+                                            gK,
+                                            sK_box,
+                                            single_stage=True,
+                                        )
+                                        load_K_fn(tma_bar_ptr=handle_K.barrier)
+                                else:
+                                    gK = cute.local_tile(
+                                        mK_src,
+                                        (self.n_block_size, self.k_block_size),
+                                        (n_block_k, _kc),
+                                    )
+                                    sK_stage = sK[None, None, None, handle_K.index]
+                                    load_K_fn, _, _ = copy_utils.tma_get_copy_fn(
+                                        tma_atom_K,
+                                        0,
+                                        cute.make_layout(1),
+                                        gK,
+                                        sK_stage,
+                                        single_stage=True,
+                                    )
+                                    load_K_fn(tma_bar_ptr=handle_K.barrier)
                             n_block_k = n_block_k - 1
                         tile_count = tile_count + 1
 

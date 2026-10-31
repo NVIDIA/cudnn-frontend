@@ -15,6 +15,13 @@ pytestmark = [requires_dsl]
     "dim,dtype_name,pool_layout,stats_layout,cga,splits,pack_gqa",
     [
         pytest.param(128, "bfloat16", "hnd", "token", 2, 1, True, marks=pytest.mark.L0),
+        pytest.param((576, 512), "bfloat16", "mixed", "token", 2, 1, True, marks=pytest.mark.L0, id="d576_partial_pack_mixed"),
+        pytest.param((576, 512), "bfloat16", "hnd", "head", 2, 1, False, marks=pytest.mark.L0, id="d576_unpacked_hnd"),
+        pytest.param((576, 512), "float16", "nhd", "head", 2, 1, True, marks=pytest.mark.L1, id="d576_fp16_partial_pack"),
+        pytest.param((576, 512), "bfloat16", "mixed", "token", 2, 5, True, marks=pytest.mark.L0, id="d576_split5_partial_pack_mixed"),
+        pytest.param((576, 512), "bfloat16", "hnd", "head", 2, 2, False, marks=pytest.mark.L0, id="d576_split2_unpacked_hnd"),
+        pytest.param((576, 512), "float16", "nhd", "head", 2, 9, True, marks=pytest.mark.L1, id="d576_split9_fp16_partial_pack"),
+        pytest.param(128, "bfloat16", "nhd", "head", 2, 1, False, marks=pytest.mark.L1, id="unpacked_origins"),
         pytest.param(128, "float16", "nhd", "head", 2, 1, True, marks=pytest.mark.L1),
         pytest.param(128, "bfloat16", "mixed", "token", 2, 1, True, marks=pytest.mark.L1),
         pytest.param(256, "bfloat16", "hnd", "head", 2, 1, True, marks=pytest.mark.L0),
@@ -31,53 +38,75 @@ pytestmark = [requires_dsl]
         pytest.param(128, "bfloat16", "hnd", "head", 1, 2, False, marks=pytest.mark.L1, id="split2_unpacked"),
     ],
 )
-def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stats_layout, cga, splits, pack_gqa):
+def test_paged_thd_origins_rebind_and_capture(
+    dim, dtype_name, pool_layout, stats_layout, cga, splits, pack_gqa, page_size=16, window_left=None, sink=None, kv_dtype_name=None
+):
     import cudnn
     import torch
     from cudnn.engines.manifest import family_for
+    from cudnn.frost.buffers import cutedsl_arch_requirement_error
 
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("SM100/SM103 physical THD origin path")
-    if cga == 1 and splits == 1 and torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("CGA1 paged prefill is currently admitted on SM100")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("SM100/SM103/SM107 physical THD origin path")
+    rubin = torch.cuda.get_device_capability() == (10, 7)
+    if rubin and (reason := cutedsl_arch_requirement_error((10, 7))) is not None:
+        pytest.skip(reason)
+    if rubin and (dim != 128 or splits != 1 or cga not in (1, 2)):
+        pytest.skip("native SM107 paged origins: D128 unsplit CGA1/2")
+    engine = "sdpa_fwd_prefill_sm107" if rubin else "sdpa_fwd_prefill_sm100"
+    if cga == 1 and splits == 1 and torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
+        pytest.skip("CGA1 paged prefill is currently admitted on SM100/SM107")
     torch.manual_seed(261026737)
-    batch, heads, kv_heads, maximum, page, kv_max = 2, 16, 4, 320, 16, 8192
+    d_qk, d_v = dim if isinstance(dim, tuple) else (dim, dim)
+    batch, heads, kv_heads, maximum, page, kv_max = 2, (24 if d_qk == 576 else 16), (2 if d_qk == 576 else 4), 320, page_size, (1024 if d_qk == 576 else 8192)
     pages_per_sequence, page_count = kv_max // page, batch * kv_max // page
     dtype = getattr(torch, dtype_name)
+    kv_dtype = getattr(torch, kv_dtype_name) if kv_dtype_name is not None else dtype
     io_type = cudnn.data_type.HALF if dtype_name == "float16" else cudnn.data_type.BFLOAT16
     widths = {"q": torch.int64, "o": torch.int32, "stats": torch.int64}
-    multipliers = {"q": heads * dim, "o": dim, "stats": 1}
+    multipliers = {"q": heads * (16 if d_qk == 576 else d_qk), "o": d_v, "stats": 1}
     graph_ports = ("q", "k", "v", "o", "stats", "ql", "kl", "kt", "vt", "ro_q", "ro_o", "ro_stats")
+    if sink is not None:
+        graph_ports += ("sink",)
 
     def buffers(wide=False):
         q_capacity, o_capacity, stats_capacity = (640 if wide else 512), 640, 672
-        pitch = dim + (16 if wide else 0)
+        pitch = d_qk + (16 if wide else 0)
         result = {
-            "q": torch.empty(q_capacity, heads, pitch, device="cuda", dtype=dtype)[..., :dim],
+            "q": torch.empty(q_capacity, heads, pitch, device="cuda", dtype=dtype)[..., :d_qk],
             "backing_o": torch.empty(o_capacity, heads, pitch, device="cuda", dtype=dtype),
             "stats": torch.empty((stats_capacity, heads) if stats_layout == "token" else (heads, stats_capacity), device="cuda", dtype=torch.float32),
             "ql": torch.empty(batch, 1, 1, 1, device="cuda", dtype=torch.int32),
             "kl": torch.empty(batch, 1, 1, 1, device="cuda", dtype=torch.int32),
         }
-        result["o"] = result["backing_o"][..., :dim]
+        result["o"] = result["backing_o"][..., :d_v]
+        if sink is not None:
+            result["sink"] = torch.full((1, heads, 1, 1), sink, device="cuda", dtype=torch.float32)
         if pool_layout != "mixed":
-            shape = (page_count + 1, kv_heads, page, 2 * dim) if pool_layout == "hnd" else (page_count + 1, page, kv_heads, 2 * dim)
-            interleaved = torch.empty(shape, device="cuda", dtype=dtype)
+            shape = (page_count + 1, kv_heads, page, 2 * d_qk) if pool_layout == "hnd" else (page_count + 1, page, kv_heads, 2 * d_qk)
+            interleaved = torch.empty(shape, device="cuda", dtype=kv_dtype)
             if pool_layout == "nhd":
                 interleaved = interleaved.transpose(1, 2)
-            result["k"], result["v"] = interleaved.split(dim, dim=-1)
+            result["k"], value_record = interleaved.split(d_qk, dim=-1)
+            result["v"] = value_record[..., :d_v]
         else:
-            result["k"] = torch.empty(page_count + 1, kv_heads, page, dim, device="cuda", dtype=dtype)
-            result["v"] = torch.empty(page_count + 1, page, kv_heads, dim, device="cuda", dtype=dtype).transpose(1, 2)
+            result["k"] = torch.empty(page_count + 1, kv_heads, page, d_qk, device="cuda", dtype=kv_dtype)
+            result["v"] = torch.empty(page_count + 1, page, kv_heads, d_v, device="cuda", dtype=kv_dtype).transpose(1, 2)
         for name in ("kt", "vt"):
             result[name] = torch.empty(batch, 1, pages_per_sequence, 1, device="cuda", dtype=torch.int32)
+        if d_qk == 576:
+            # Independent table pitches must survive both binding and replay.
+            # A shared/contiguous stride reads the poisoned padding pages.
+            step = 3 if wide else 2
+            table_storage = torch.full((batch, 1, pages_per_sequence * step + 5, 1), page_count, device="cuda", dtype=torch.int32)
+            result["vt"] = table_storage[:, :, 1 : 1 + pages_per_sequence * step : step, :]
         for name, width in widths.items():
             result["ro_" + name] = torch.empty(batch + 1, 1, 1, 1, device="cuda", dtype=width)
         return result
 
     def fill(values, shift, replay=False, keyless=False, empty=False):
         ql = ([257, 49] if replay else [300, 177]) if not empty else [0, 0]
-        kl = [kv_max - 31, 4096 + 7] if replay else [kv_max, kv_max]
+        kl = [kv_max - 31, kv_max // 2 + 7] if replay else [kv_max, kv_max]
         if keyless:
             kl[1] = 0
         # shift=0 is the integration reproducer's shared [0,320,512] Q slots.
@@ -93,16 +122,21 @@ def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stat
             tensor = values[name]
             token_stride = tensor.stride(0) if name != "stats" or stats_layout == "token" else 1
             capacity = tensor.shape[0] if name != "stats" or stats_layout == "token" else tensor.shape[1]
+            assert all(x * token_stride % multipliers[name] == 0 for x in starts[name] + [capacity])
             offsets = [(x * token_stride) // multipliers[name] for x in starts[name] + [capacity]]
             values["ro_" + name].copy_(torch.tensor(offsets, device="cuda", dtype=widths[name]).view(batch + 1, 1, 1, 1))
         values["q"].fill_(float("nan"))
         for start, length in zip(starts["q"], ql):
-            values["q"][start : start + length].copy_(torch.randn(length, heads, dim, device="cuda", dtype=dtype))
+            values["q"][start : start + length].copy_(torch.randn(length, heads, d_qk, device="cuda", dtype=dtype))
         for name in ("k", "v"):
-            values[name].normal_()
+            if kv_dtype_name is None:
+                values[name].normal_()
+            else:
+                values[name].copy_(torch.randn(values[name].shape, device="cuda", dtype=dtype))
             values[name][-1].fill_(float("nan"))
         for name in ("kt", "vt"):
-            values[name].copy_(torch.randperm(page_count, device="cuda", dtype=torch.int32).view(batch, 1, pages_per_sequence, 1))
+            # Page order is host test data; avoid an unrelated GPU radix sort.
+            values[name].copy_(torch.randperm(page_count, dtype=torch.int32).view(batch, 1, pages_per_sequence, 1))
         return ql, kl, starts
 
     first = buffers()
@@ -113,15 +147,17 @@ def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stat
         is_override_shape_enabled=True,
     )
     nodes = {name: graph.tensor_like(first[name]) for name in graph_ports if name not in ("q", "o", "stats")}
-    nodes["q"] = graph.tensor(dim=(batch, heads, maximum, dim), stride=(maximum * heads * dim, dim, heads * dim, 1), data_type=io_type)
+    nodes["q"] = graph.tensor(dim=(batch, heads, maximum, d_qk), stride=(maximum * heads * d_qk, d_qk, heads * d_qk, 1), data_type=io_type)
     nodes["q"].set_ragged_offset(nodes["ro_q"]).set_ragged_offset_multiplier(multipliers["q"])
     nodes["o"], nodes["stats"] = graph.sdpa(
         q=nodes["q"],
         k=nodes["k"],
         v=nodes["v"],
         is_inference=False,
-        attn_scale=dim**-0.5,
+        attn_scale=d_qk**-0.5,
         use_causal_mask_bottom_right=True,
+        diagonal_band_left_bound=window_left,
+        sink_token=nodes.get("sink"),
         use_padding_mask=True,
         seq_len_q=nodes["ql"],
         seq_len_kv=nodes["kl"],
@@ -131,7 +167,7 @@ def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stat
         max_total_seq_len_q=477,
         stats_use_log2=stats_layout == "head",
     )
-    nodes["o"].set_output(True).set_dim((batch, heads, maximum, dim)).set_stride((maximum * heads * dim, dim, heads * dim, 1)).set_ragged_offset(
+    nodes["o"].set_output(True).set_dim((batch, heads, maximum, d_v)).set_stride((maximum * heads * d_qk, d_qk, heads * d_qk, 1)).set_ragged_offset(
         nodes["ro_o"]
     ).set_ragged_offset_multiplier(multipliers["o"])
     stats_stride = (maximum * heads, 1, heads, 1) if stats_layout == "token" else (maximum, first["stats"].shape[1], 1, 1)
@@ -142,16 +178,23 @@ def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stat
     graph.build_operation_graph()
     if cga is None:
         graph.create_execution_plans([cudnn.heur_mode.A])
-        graph.select_plan(next(i for i in range(len(graph.plans)) if graph.get_plan_name_at_index(i).startswith("sdpa_fwd_prefill_sm100")))
+        graph.select_plan(next(i for i in range(len(graph.plans)) if graph.get_plan_name_at_index(i).startswith(engine)))
     else:
         graph.create_execution_plan(
-            family_for(graph).offered_ids()["sdpa_fwd_prefill_sm100"],
+            family_for(graph).offered_ids()[engine],
             {cudnn.knob_type.TILE_CGA_M: cga, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.PACK_GQA: int(pack_gqa)},
         )
         graph.select_plan(0)
     graph.check_support()
     graph.build_plans()
-    assert graph.get_plan_name_at_index(graph._plan_index).startswith("sdpa_fwd_prefill_sm100")
+    assert graph.get_plan_name_at_index(graph._plan_index).startswith(engine)
+    if rubin:
+        import inspect
+
+        api = inspect.getclosurevars(graph._compiled_plans[graph._plan_index]._compiled.default_stream).nonlocals["api"]
+        assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
+        assert api._k_mod.CFG.STAGES_KV == 2 * cga
+        assert api._thd_origin_specs is not None
     print("ORIGIN_PLAN", graph.get_plan_name_at_index(graph._plan_index), flush=True)
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
 
@@ -168,15 +211,22 @@ def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stat
         for b, (nq, nk) in enumerate(zip(ql, kl)):
             if not nq:
                 continue
-            k = values["k"][values["kt"][b].flatten().long()].transpose(0, 1).reshape(kv_heads, kv_max, dim)[:, :nk].double()
-            v = values["v"][values["vt"][b].flatten().long()].transpose(0, 1).reshape(kv_heads, kv_max, dim)[:, :nk].double()
+            k = values["k"][values["kt"][b].flatten().long()].transpose(0, 1).reshape(kv_heads, kv_max, d_qk)[:, :nk].double()
+            v = values["v"][values["vt"][b].flatten().long()].transpose(0, 1).reshape(kv_heads, kv_max, d_v)[:, :nk].double()
             k, v = k.repeat_interleave(heads // kv_heads, 0), v.repeat_interleave(heads // kv_heads, 0)
             for lo in range(0, nq, 32):
                 hi = min(lo + 32, nq)
                 q = values["q"][starts["q"][b] + lo : starts["q"][b] + hi].double().transpose(0, 1)
-                scores = q @ k.transpose(-1, -2) * dim**-0.5
+                scores = q @ k.transpose(-1, -2) * d_qk**-0.5
                 scores.masked_fill_(torch.arange(nk, device="cuda")[None, :] > torch.arange(nk - nq + lo, nk - nq + hi, device="cuda")[:, None], -torch.inf)
-                expected = (scores.softmax(-1) @ v).transpose(0, 1)
+                if window_left is not None:
+                    scores.masked_fill_(
+                        torch.arange(nk, device="cuda")[None, :] <= torch.arange(nk - nq + lo, nk - nq + hi, device="cuda")[:, None] - window_left,
+                        -torch.inf,
+                    )
+                if sink is not None:
+                    scores = torch.cat((scores, values["sink"].reshape(heads, 1, 1).double().expand(heads, hi - lo, 1)), dim=-1)
+                expected = (scores.softmax(-1)[..., :nk] @ v).transpose(0, 1)
                 expected_stats = scores.logsumexp(-1).T * (math.log2(math.e) if stats_layout == "head" else 1)
                 os, ss = starts["o"][b], starts["stats"][b]
                 torch.testing.assert_close(values["o"][os + lo : os + hi].double(), expected, atol=0.004, rtol=0.004)
@@ -185,7 +235,7 @@ def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stat
             live_stats[starts["stats"][b] : starts["stats"][b] + nq] = True
         assert torch.all(values["o"][~live_o] == -17)
         assert torch.all(stats[~live_stats] == -29)
-        assert torch.all(values["backing_o"][..., dim:] == -17)
+        assert torch.all(values["backing_o"][..., d_v:] == -17)
         assert torch.isnan(values["k"][-1]).all() and torch.isnan(values["v"][-1]).all()
 
     captures = []
@@ -225,3 +275,23 @@ def test_paged_thd_origins_rebind_and_capture(dim, dtype_name, pool_layout, stat
     finally:
         for captured, _, _ in captures:
             captured.reset()
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("page_size", [8, 256])
+def test_native_sm107_paged_origin_page_boundaries(page_size):
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("native SM107 paged D128")
+    test_paged_thd_origins_rebind_and_capture(128, "bfloat16", "mixed", "head", 2, 1, True, page_size=page_size)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("cga,sink", [(1, -120.0), (2, 3.0)])
+def test_native_sm107_paged_origins_window_and_sink(cga, sink):
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("native SM107 paged D128")
+    test_paged_thd_origins_rebind_and_capture(128, "bfloat16", "mixed", "head", cga, 1, True, window_left=32, sink=sink)

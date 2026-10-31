@@ -167,6 +167,7 @@ enum HostSlot : size_t {
     GatePtr,
     GateStrides,
     OriginPtrs,
+    OriginCaps,
     NumHostSlots
 };
 constexpr std::array<const char *, NumHostSlots> host_slot_names = {"q_ptr",
@@ -197,7 +198,8 @@ constexpr std::array<const char *, NumHostSlots> host_slot_names = {"q_ptr",
                                                                     "partial_o_strides",
                                                                     "gate_ptr",
                                                                     "gate_strides",
-                                                                    "thd_origin_ptrs"};
+                                                                    "thd_origin_ptrs",
+                                                                    "thd_origin_caps"};
 constexpr std::array<HostSlot, 4> pointer_slots                  = {QPtr, KPtr, VPtr, OPtr};
 constexpr std::array<HostSlot, 4> stride_slots                   = {QStrides, KStrides, VStrides, OStrides};
 
@@ -210,6 +212,9 @@ class SdpaThdBinder {
    public:
     explicit SdpaThdBinder(const py::object &spec)
         : fn_(spec.attr("fn")), owner_(spec.attr("owner")), template_(py::tuple(py::object(spec.attr("template")))) {
+        // Metadata-only callers predating ordered execution may omit scratch.
+        // Such a binder can still bind frames, but cannot bypass plan guards.
+        scratch_bytes_   = py::hasattr(spec, "scratch_bytes") ? integer(spec, "scratch_bytes") : -1;
         lse_padded_      = py::cast<bool>(spec.attr("lse_padded"));
         py::object quant = py::none();
         if (py::hasattr(spec, "quant")) quant = spec.attr("quant");
@@ -217,9 +222,11 @@ class SdpaThdBinder {
         if (quantized_) {
             if ((py::len(py::object(quant.attr("sf_sizes"))) != 0 &&
                  py::len(py::object(quant.attr("sf_sizes"))) != 3) ||
-                !quant.attr("block_output").is_none() || py::cast<bool>(spec.attr("paged")) ||
+                !quant.attr("block_output").is_none() ||
+                (py::cast<bool>(spec.attr("paged")) && py::len(py::object(quant.attr("sf_sizes"))) != 0) ||
                 (py::hasattr(spec, "split_workspace") && !spec.attr("split_workspace").is_none()))
-                invalid("native THD FP8 binding requires nonpaged, unsplit per-tensor scales and scalar output");
+                invalid(
+                    "native THD quantized binding requires unsplit scalar output; paged KV requires per-tensor scales");
             if (py::len(py::object(quant.attr("sf_sizes")))) mx_scales_ = std::make_unique<SdpaMxScaleBinding>(spec);
             quant_offset_ = py::cast<int64_t>(quant.attr("scratch_offset"));
             add(quant_offset_, 8);
@@ -284,9 +291,10 @@ class SdpaThdBinder {
             const bool d128_split =
                 cga_tile_m_ == 128 && split_dv == 128 && (split_dq == 128 || (!paged_ && split_dq == 192));
             const bool d256_split = cga_tile_m_ == 256 && split_dq == 256 && split_dv == 256;
-            if ((has_sink_ && !(paged_ && d128_split && split_dq == 128)) || splits_ <= 1 || split_capacity_ <= 0 ||
-                split_capacity_ > INT32_MAX || off_partial_o_ < 0 || off_partial_lse_ < 0 || off_partial_o_ % 16 ||
-                off_partial_lse_ % 16 || !(d64_split || d128_split || d256_split))
+            const bool d576_split = cga_tile_m_ == 128 && split_dq == 576 && split_dv == 512;
+            if ((has_sink_ && !(d576_split || (paged_ && d128_split && split_dq == 128))) || splits_ <= 1 ||
+                split_capacity_ <= 0 || split_capacity_ > INT32_MAX || off_partial_o_ < 0 || off_partial_lse_ < 0 ||
+                off_partial_o_ % 16 || off_partial_lse_ % 16 || !(d64_split || d128_split || d256_split || d576_split))
                 invalid("invalid prepared packed split geometry");
             const int64_t partial_rows = multiply(multiply(splits_, split_capacity_), qh_);
             if (off_partial_o_ < add(off_o_desc_, multiply(add(b_, 3), 128)) ||
@@ -296,10 +304,14 @@ class SdpaThdBinder {
         }
         auto expect = py::cast<py::dict>(spec.attr("expect"));
         auto decl   = py::cast<py::dict>(spec.attr("decl"));
+        // Plain sdpa may retain half Q/O while the compiled kernel reads FP8 K/V.
+        // Cache each port's declared type; runtime binding still checks it exactly.
         for (size_t i = Q; i <= O; ++i) {
             const auto dtype = py::cast<std::string>(expect[names[i]]);
             const bool fp8   = dtype == "float8_e4m3fn" || dtype == "float8_e5m2";
-            if ((quantized_ && i != O) ? !fp8 : (dtype != "float16" && dtype != "bfloat16" && !(quantized_ && fp8)))
+            if ((quantized_ && i != O)
+                    ? !fp8
+                    : (dtype != "float16" && dtype != "bfloat16" && !(fp8 && (quantized_ || i == K || i == V))))
                 invalid("native THD binding has an unsupported operand dtype");
             dtype_code_[i]       = fp8 ? (dtype == "float8_e4m3fn" ? kDLFloat8_e4m3fn : kDLFloat8_e5m2)
                                        : (dtype == "float16" ? kDLFloat : kDLBfloat);
@@ -334,19 +346,31 @@ class SdpaThdBinder {
                 invalid("invalid native THD gate declaration");
         }
         if (py::hasattr(spec, "origin_specs") && !spec.attr("origin_specs").is_none()) {
-            const bool paged_d128_split = paged_ && cga_tile_m_ == 128 && integer(spec, "d_qk") == 128 &&
-                                          integer(spec, "d_v") == 128 && splits_ > 1;
-            if (quantized_ || (splits_ != 1 && !paged_d128_split) || has_gate_)
-                invalid("physical THD origins require ungated half unsplit or paged D128 split plans");
+            const bool d128_split = !quantized_ && cga_tile_m_ == 128 && integer(spec, "d_qk") == 128 &&
+                                    integer(spec, "d_v") == 128 && splits_ > 1;
+            const bool d576_split = !quantized_ && cga_tile_m_ == 128 && integer(spec, "d_qk") == 576 &&
+                                    integer(spec, "d_v") == 512 && splits_ > 1;
+            if ((quantized_ && (!paged_ || mx_scales_)) || (splits_ != 1 && !d128_split && !d576_split) || has_gate_)
+                invalid(
+                    "physical THD origins require ungated half unsplit/D128 split/native D576 split or unsplit "
+                    "per-tensor FP8 "
+                    "paged plans");
             auto specs = py::cast<py::tuple>(spec.attr("origin_specs"));
             if (specs.size() != 5) invalid("physical THD origins require five ports");
-            if (paged_d128_split) {
-                if (specs[static_cast<size_t>(Q)].is_none()) invalid("physical paged split plans require Q offsets");
+            if (d128_split || d576_split) {
+                if (d128_split && specs[static_cast<size_t>(Q)].is_none())
+                    invalid("physical D128 split plans require Q offsets");
                 // Origin maps/rows precede compact partials in the same caller workspace.
                 const int64_t origin_bytes =
                     add(multiply(add(b_, 1), 512), multiply(add(multiply(b_, 40), 127) / 128, 128));
                 if (off_partial_o_ < add(off_o_desc_, origin_bytes))
                     invalid("packed split partials overlap the physical-origin reservation");
+            }
+            if (quantized_) {
+                const int64_t origin_bytes =
+                    add(multiply(add(b_, 1), 512), multiply(add(multiply(b_, 40), 127) / 128, 128));
+                if (quant_offset_ < add(off_o_desc_, origin_bytes))
+                    invalid("quantized scratch overlaps physical THD descriptors");
             }
             has_origins_ = true;
             for (size_t i = 0; i < 5; ++i) {
@@ -365,6 +389,16 @@ class SdpaThdBinder {
         if (order.size() != template_.size()) invalid("native THD host argument template has the wrong size");
         for (size_t slot = 0; slot < NumHostSlots; ++slot) {
             if (slot == OriginPtrs && !has_origins_) continue;
+            if (slot == OriginCaps) {
+                // Optional: only a host that declares it (the SM90 D512 tile, which clamps origins and clips its port
+                // views to each port's own buffer) receives the per-port token capacities. The tq / tkv bounds
+                // below are live-token bounds (max_total_seq_len_*), not the physical spans of gapped buffers.
+                auto found = std::find(order.begin(), order.end(), host_slot_names[slot]);
+                if (!has_origins_ || found == order.end()) continue;
+                has_origin_caps_ = true;
+                index_[slot]     = static_cast<size_t>(found - order.begin());
+                continue;
+            }
             // Nonpaged hosts (including SM120) need not expose paged ABI slots.
             if (!paged_ && slot >= KTablePtr && slot <= NumPages) continue;
             if (splits_ == 1 && slot >= OPartialPtr && slot <= PartialOStrides) continue;
@@ -376,6 +410,13 @@ class SdpaThdBinder {
                 found = std::find(order.begin(), order.end(), "scale_softmax");
             if (found == order.end()) invalid(std::string("native THD host has no argument ") + host_slot_names[slot]);
             index_[slot] = static_cast<size_t>(found - order.begin());
+        }
+        if (paged_) {
+            const auto found = std::find(order.begin(), order.end(), "table_v_strides");
+            if (quantized_ && found == order.end())
+                invalid("native paged THD FP8 host has no independent V table strides");
+            has_v_table_strides_ = found != order.end();
+            if (has_v_table_strides_) table_v_strides_index_ = static_cast<size_t>(found - order.begin());
         }
         if (quantized_) {
             for (size_t role = mx_scales_ ? AmaxO : DescaleQ; role <= AmaxO; ++role) {
@@ -436,9 +477,8 @@ class SdpaThdBinder {
                 py::object stream,
                 py::object scale,
                 int64_t gate_index) const {
-        if (indices.size() != (has_origins_
-                                   ? HalfNumRoles + 5
-                                   : (mx_scales_ ? NumRoles : (quantized_ ? PerTensorNumRoles : HalfNumRoles))))
+        const size_t base_roles = mx_scales_ ? NumRoles : (quantized_ ? PerTensorNumRoles : HalfNumRoles);
+        if (indices.size() != base_roles + (has_origins_ ? 5 : 0))
             invalid("native THD binding has the wrong number of role indices");
         const auto facts = read_native_operand_views(pack, indices);
         // The epilogue gate is outside the role pack: its own index (-1 = none), validated both ways like every other
@@ -507,7 +547,7 @@ class SdpaThdBinder {
         if (has_origins_) {
             py::list pointers;
             for (size_t i = 0; i < 5; ++i) {
-                const auto &offset = facts[HalfNumRoles + i];
+                const auto &offset = facts[(quantized_ ? PerTensorNumRoles : HalfNumRoles) + i];
                 if (!origin_bits_[i]) {
                     if (offset.filled) invalid("unexpected THD physical-offset operand");
                     pointers.append(py::none());
@@ -590,6 +630,19 @@ class SdpaThdBinder {
         } else if (facts[Sinks].filled) {
             invalid("this specialization was compiled without a sink; construct the API with has_sink");
         }
+        py::object origin_caps = py::none();
+        if (has_origin_caps_) {
+            const int64_t stats_tokens =
+                !has_lse_
+                    ? 0
+                    : (lse_capacity >= 0 ? lse_capacity : (lse_head_major_ && lse_head_stride ? lse_head_stride : tq));
+            // Paged K/V carry no origin (their pages are bound through the block table).
+            origin_caps = py::make_tuple(capacity(facts[Q], geometry[Q], "q"),
+                                         paged_ ? 0 : capacity(facts[K], geometry[K], "k"),
+                                         paged_ ? 0 : capacity(facts[V], geometry[V], "v"),
+                                         capacity(facts[O], geometry[O], "o"),
+                                         stats_tokens);
+        }
         if (!workspace) invalid("prepared THD requires a non-null workspace");
         if (workspace % workspace_alignment_ != 0)
             invalid("the workspace must be " + std::to_string(workspace_alignment_) + "-byte aligned");
@@ -598,6 +651,7 @@ class SdpaThdBinder {
         // slots. No frame or runtime pointer is ever written into the plan.
         py::list frame(template_);
         if (has_origins_) put(frame, OriginPtrs, std::move(origin_ptrs));
+        if (has_origin_caps_) put(frame, OriginCaps, std::move(origin_caps));
         for (size_t i = Q; i <= O; ++i) {
             put(frame, pointer_slots[i], py::int_(facts[i].pointer));
             if (!paged_ || i == Q || i == O)
@@ -677,6 +731,54 @@ class SdpaThdBinder {
         return true;
     }
 
+    int64_t
+    ordered_workspace_bytes() const {
+        return scratch_bytes_;
+    }
+
+    py::object
+    execute_ordered(py::handle schema,
+                    py::handle buffers,
+                    py::handle tensor_uids,
+                    const py::dict &auto_bindings,
+                    py::handle workspace,
+                    py::handle override_uids,
+                    py::handle override_shapes,
+                    py::handle override_strides,
+                    const std::vector<int64_t> &indices,
+                    py::object stream) const {
+        DLDevice workspace_device{};
+        auto read = read_ordered_binding(schema,
+                                         buffers,
+                                         tensor_uids,
+                                         auto_bindings,
+                                         workspace,
+                                         override_uids,
+                                         override_shapes,
+                                         override_strides,
+                                         &workspace_device);
+        // Complete unsupported producer protocols in the existing shared Python
+        // normalizer. Never re-read supported operands or discard observations.
+        if (scratch_bytes_ < 0 || !py::cast<py::list>(read[1]).empty() || read[2].is_none()) return read;
+        const auto extent = py::cast<py::tuple>(read[2]);
+        const int64_t ptr = py::cast<int64_t>(extent[0]);
+        if (scratch_bytes_) {
+            if (!ptr)
+                invalid("requires a " + std::to_string(scratch_bytes_) +
+                        "-byte workspace but execute() received none; allocate graph.get_workspace_size() bytes");
+            const int64_t bytes = py::cast<int64_t>(extent[1]);
+            if (bytes < scratch_bytes_)
+                invalid("needs a " + std::to_string(scratch_bytes_) + "-byte workspace, got " + std::to_string(bytes) +
+                        " bytes (size it with graph.get_workspace_size())");
+            // The shared reader observed this call's device with its extent.
+            // Reuse that fact, not a cached placement or a second Python query.
+            if (workspace_device.device_type != kDLCUDA || workspace_device.device_id != device_)
+                invalid("workspace must be on CUDA device " + std::to_string(device_));
+        }
+        execute(read[0], indices, ptr, std::move(stream), py::none(), -1);
+        return py::none();
+    }
+
    private:
     void
     bind_quantized_scalars(const std::vector<NativeOperandView> &facts, BoundLaunch &bound, int64_t workspace) const {
@@ -720,10 +822,10 @@ class SdpaThdBinder {
             }
             if (!bytes) continue;
             const auto operand_end = add(f.pointer, bytes);
+            const auto name        = has_origins_ && role >= PerTensorNumRoles ? "THD physical offsets" : names[role];
             if (workspace < operand_end && f.pointer < end)
-                invalid("prepared FP8 workspace overlaps " + std::string(names[role]));
-            if (bound.amax < operand_end && f.pointer < amax_end)
-                invalid("amax_o overlaps " + std::string(names[role]));
+                invalid("prepared FP8 workspace overlaps " + std::string(name));
+            if (bound.amax < operand_end && f.pointer < amax_end) invalid("amax_o overlaps " + std::string(name));
         }
         if (mx_scales_) {
             for (size_t role = DescaleQ; role <= ScaleO; ++role)
@@ -892,7 +994,9 @@ class SdpaThdBinder {
         if (h == 1) hs = d;
         if (seq == 1) ss = multiply(h, hs);
         if (f.shape[0] == 1) bs = multiply(seq, ss);
-        if (hs < d || ss < multiply(h, hs) || bs < multiply(seq, ss) || hs % 8 || ss % 8 || (f.shape[0] > 1 && bs % 8))
+        const int64_t align_elements = 128 / dtype_bits_[role];
+        if (hs < d || ss < multiply(h, hs) || bs < multiply(seq, ss) || hs % align_elements || ss % align_elements ||
+            (f.shape[0] > 1 && bs % align_elements))
             invalid(name + ": page-pool strides must be covering and 16-byte aligned");
         const int64_t token = hnd ? hs : ss, head = hnd ? ss : hs;
         const auto need =
@@ -905,8 +1009,10 @@ class SdpaThdBinder {
     bind_paged(py::list &frame, const std::vector<NativeOperandView> &facts, int64_t b) const {
         const auto &kt = required(facts, KTable), &vt = required(facts, VTable);
         const auto kg = table_geometry(kt, KTable, b), vg = table_geometry(vt, VTable, b);
-        if (kg.pages != vg.pages || kg.batch_stride != vg.batch_stride || kg.page_stride != vg.page_stride)
-            invalid("paged K/V tables must share max_pages and strides");
+        if (kg.pages != vg.pages) invalid("paged K/V tables must share max_pages");
+        if (!has_v_table_strides_ && (kg.batch_stride != vg.batch_stride || kg.page_stride != vg.page_stride))
+            invalid("paged K/V tables must share strides on this host");
+        if (has_v_table_strides_) frame[table_v_strides_index_] = py::make_tuple(vg.batch_stride, vg.page_stride);
         const auto ks = pool_geometry(facts[K], K), vs = pool_geometry(facts[V], V);
         if (facts[K].shape[0] != facts[V].shape[0]) invalid("K and V pools must hold the same number of pages");
         put(frame, KStrides, py::make_tuple(ks[0], ks[1], ks[2]));
@@ -929,14 +1035,18 @@ class SdpaThdBinder {
     std::array<size_t, NumHostSlots> index_;
     std::array<std::array<int64_t, 6>, 4> declarations_;
     std::array<int, 4> dtype_code_, dtype_bits_;
-    bool has_origins_ = false;
+    bool has_origins_     = false;
+    bool has_origin_caps_ = false;
     std::array<int64_t, 5> origin_bits_{};
     bool has_gate_ = false;
     int gate_code_ = kDLBfloat;
     std::array<int64_t, 6> gate_decl_{};
     std::array<size_t, 5> quant_indices_;
+    bool has_v_table_strides_     = false;
+    size_t table_v_strides_index_ = 0;
     std::unique_ptr<SdpaMxScaleBinding> mx_scales_;
-    int64_t quant_offset_ = 0;
+    int64_t scratch_bytes_ = 0;
+    int64_t quant_offset_  = 0;
     bool quantized_ = false, has_amax_ = false;
     int64_t b_, qh_, kh_, device_, lens_form_, off_o_desc_, total_q_, total_kv_, lse_head_stride_;
     int64_t cga_tile_m_, units_, page_size_, workspace_alignment_;
@@ -955,9 +1065,28 @@ void
 init_sdpa_thd_binding(py::module_ &m) {
     py::class_<SdpaThdBinder>(m, "_SdpaThdBinder")
         .def(py::init<const py::object &>(), py::arg("spec"))
+        .def_prop_ro("ordered_workspace_bytes", &SdpaThdBinder::ordered_workspace_bytes)
+        .def("execute_ordered",
+             &SdpaThdBinder::execute_ordered,
+             py::arg("schema"),
+             py::arg("buffers"),
+             py::arg("tensor_uids"),
+             py::arg("auto_bindings"),
+             py::arg("workspace").none(),
+             py::arg("override_uids").none(),
+             py::arg("override_shapes").none(),
+             py::arg("override_strides").none(),
+             py::arg("indices"),
+             py::arg("stream").none())
         .def_prop_ro_static("supports_physical_origins", [](py::object) { return true; })
+        .def_prop_ro_static("supports_physical_origin_caps", [](py::object) { return true; })
+        .def_prop_ro_static("supports_native_d576", [](py::object) { return true; })
+        .def_prop_ro_static("supports_mixed_fp8_kv", [](py::object) { return true; })
+        .def_prop_ro_static("supports_native_d576_packed_split", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_physical_origins", [](py::object) { return true; })
+        .def_prop_ro_static("supports_paged_fp8_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_split_physical_origins", [](py::object) { return true; })
+        .def_prop_ro_static("supports_nonpaged_d128_split_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_initial_waves", [](py::object) { return true; })
         .def_prop_ro_static("supports_initial_wave_geometry", [](py::object) { return true; })
         .def_prop_ro_static("supports_stats_stride_override", [](py::object) { return true; })

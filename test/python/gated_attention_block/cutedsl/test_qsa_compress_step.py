@@ -29,6 +29,18 @@ and the paged step arms on the SAME token stream write rows BITWISE each other a
 block completing at the 4th token and the page boundaries served; the e4m3 artifact distinct from the bf16 one; the dtype refusals both
 ways (an e4m3 cache under a bf16 recipe and a bf16 cache under an e4m3 recipe name the recipe's dtype; an e4m3 RING stays the ring's rule;
 f16 io has no e4m3 arm).
+
+The CHUNK form (``ring_write=False``; 2026-10-29): a raw-key stream behind a prefix ``P`` of every residue mod 4, cut into chunks of
+``T`` rows (1 .. 2048, the ``T < 4 - P % 4`` chunks that complete no block included) over the PAGED side caches at page 16 / 32 / 64 and
+ring cap 3 / 4 / 8 -- the ring primed by the TEST with the stream's last ``cap`` positions (the tail arm is the cache-write kernel's,
+pinned in ``test_qsa_prepare.py``) and the rows the kernel must never read poisoned with NaN: after every chunk the cache rows of every
+complete block of the stream so far BITWISE the from-scratch prefill compress, the ring BITWISE untouched, the slot reports the position
+rule's; the key distinct from the step form's, ``ring_slots`` refused with it, cap 3 served and cap 2 refused naming ``pool - 1``, the
+dense form the paged form's twin, one launch and no allocation at 2048 rows, the e4m3 cache arm the bf16 rows' cast.
+
+The rounding attribute (``rounding="hf"``): the dense, the paged and the e4m3 stream cells and the chunk cells run under BOTH values --
+the step form, the chunk form and the prefill form stay bitwise one another under ``"hf"`` as under ``"single"`` (what "the writers
+round identically" means; the arm's numerics against the HF-rounding oracle are ``test_qsa_compress.py``'s).
 """
 
 import os
@@ -111,11 +123,11 @@ def _bits(x: torch.Tensor) -> torch.Tensor:
     return x.contiguous().view(torch.int8 if x.element_size() == 1 else torch.int16)
 
 
-def _prefill(k_raw, w, cos, sin, seq_lens, *, offset=1.0):
+def _prefill(k_raw, w, cos, sin, seq_lens, *, offset=1.0, rounding="single"):
     """The prefill kernel's compressed keys (sentinel where it writes nothing) and the per-sequence block counts."""
     batch, s_tok, _ = k_raw.shape
     out = _sentinel(batch, s_tok // _POOL, _D, dtype=k_raw.dtype)
-    build_qsa_compress(k_raw, out, w, cos, sin, seq_lens, rope_dim=_ROPE, eps=_EPS, norm_weight_offset=offset, stream=_stream())
+    build_qsa_compress(k_raw, out, w, cos, sin, seq_lens, rope_dim=_ROPE, eps=_EPS, norm_weight_offset=offset, stream=_stream(), rounding=rounding)
     torch.cuda.synchronize()
     return out, (seq_lens.long().clamp(0, s_tok) // _POOL)
 
@@ -139,10 +151,11 @@ def _step(k_new, ring, out, w, cos, sin, pos0, n_commit=None, *, offset=1.0, rop
     return slot
 
 
-def _run_stream(k_raw, lens, schedule, *, w, cos, sin, offset, ring_rows=_RING, n_blocks_cap=None, cache_dtype=None):
+def _run_stream(k_raw, lens, schedule, *, w, cos, sin, offset, ring_rows=_RING, n_blocks_cap=None, cache_dtype=None, rounding="single"):
     """Feed every sequence its tokens step by step (``schedule`` = rows per step, cycled; the batch shares the step
     shape, a sequence past its length commits nothing) and return the cache, the ring and the slot reports.  ``cache_dtype``
-    (``None`` = the io dtype) is the cache's dtype: ``float8_e4m3fn`` runs the e4m3 store arm (the ring stays the io dtype)."""
+    (``None`` = the io dtype) is the cache's dtype: ``float8_e4m3fn`` runs the e4m3 store arm (the ring stays the io dtype);
+    ``rounding`` the chain's rounding points."""
     batch, s_tok, _ = k_raw.shape
     nb = s_tok // _POOL if n_blocks_cap is None else n_blocks_cap
     out = _sentinel(batch, nb, _D, dtype=k_raw.dtype if cache_dtype is None else cache_dtype)
@@ -160,7 +173,7 @@ def _run_stream(k_raw, lens, schedule, *, w, cos, sin, offset, ring_rows=_RING, 
             if take:
                 k_new[b, :take] = k_raw[b, pos[b] : pos[b] + take]
             n_commit.append(take)
-        slot = _step(k_new, ring, out, w, cos, sin, _i32(pos), _i32(n_commit), offset=offset)
+        slot = _step(k_new, ring, out, w, cos, sin, _i32(pos), _i32(n_commit), offset=offset, rounding=rounding)
         for b in range(batch):
             slots[b].extend(slot[b].tolist())
             pos[b] += n_commit[b]
@@ -183,18 +196,20 @@ def test_min_ring_rows_is_rows_plus_pool_minus_one():
 
 
 @requires_cuda
+@pytest.mark.parametrize("rounding", ["single", "hf"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
 @pytest.mark.parametrize("offset", [0.0, 1.0], ids=["folded_1_plus_w", "zero_centred_w"])
 @pytest.mark.parametrize("schedule", [[1], [4], [1, 4, 2, 3, 5, 1, 2, 4]], ids=["one_row_steps", "four_row_steps", "mixed_steps"])
-def test_step_stream_equals_the_prefill_compress_bitwise(schedule, offset, dtype):
+def test_step_stream_equals_the_prefill_compress_bitwise(schedule, offset, dtype, rounding):
     """Four sequences (full, a 7-token tail, 37 tokens, EMPTY) fed through steps of the given row counts: every
     complete block of every sequence is written exactly once (its slot reported by the completing row), bitwise the
-    prefill kernel's row; incomplete groups, the empty sequence and the rows past a sequence's end write nothing."""
+    prefill kernel's row; incomplete groups, the empty sequence and the rows past a sequence's end write nothing.  Under
+    BOTH rounding attributes: the step form and the prefill form round identically."""
     s_tok, lens = 517, [517, 510, 37, 0]
     batch = len(lens)
     k_raw, w, cos, sin = _make(batch, s_tok, dtype, seed=1)
-    ref, n_blocks = _prefill(k_raw, w, cos, sin, _i32(lens), offset=offset)
-    out, ring, slots = _run_stream(k_raw, lens, schedule, w=w, cos=cos, sin=sin, offset=offset)
+    ref, n_blocks = _prefill(k_raw, w, cos, sin, _i32(lens), offset=offset, rounding=rounding)
+    out, ring, slots = _run_stream(k_raw, lens, schedule, w=w, cos=cos, sin=sin, offset=offset, rounding=rounding)
     sentinel = _sentinel(1, 1, _D, dtype=dtype)[0, 0]
     for b in range(batch):
         nb = int(n_blocks[b])
@@ -576,7 +591,7 @@ def _step_paged(pg: _Paged, k_new, w, cos, sin, kv_lens, n_commit=None, *, offse
     return slot
 
 
-def _run_stream_paged(k_raw, lens, schedule, *, w, cos, sin, offset, page, cap, padding=(), seed=0, use_slots=None, cache_dtype=None):
+def _run_stream_paged(k_raw, lens, schedule, *, w, cos, sin, offset, page, cap, padding=(), seed=0, use_slots=None, cache_dtype=None, rounding="single"):
     """The paged twin of ``_run_stream``: every step carries ``rows`` rows per sequence with ``kv_lens = pos + rows`` (the KV length
     after the step, the stack's ``seq_lens``) and the accepted prefix in ``n_commit``; a padding sequence keeps ``kv_lens 0``.
     ``cache_dtype`` as in ``_run_stream`` (the e4m3 store arm when ``float8_e4m3fn``)."""
@@ -597,7 +612,7 @@ def _run_stream_paged(k_raw, lens, schedule, *, w, cos, sin, offset, page, cap, 
             n_commit.append(take)
             kv_lens.append(pos[b] + rows if b not in padding else 0)
         rs = pg.ring_slots(kv_lens, rows, dtype=use_slots) if use_slots is not None else None
-        slot = _step_paged(pg, k_new, w, cos, sin, kv_lens, _i32(n_commit), offset=offset, ring_slots=rs)
+        slot = _step_paged(pg, k_new, w, cos, sin, kv_lens, _i32(n_commit), offset=offset, ring_slots=rs, rounding=rounding)
         for b in range(batch):
             slots[b].extend(slot[b].tolist())
             pos[b] += n_commit[b]
@@ -605,9 +620,10 @@ def _run_stream_paged(k_raw, lens, schedule, *, w, cos, sin, offset, page, cap, 
 
 
 @requires_cuda
+@pytest.mark.parametrize("rounding", ["single", "hf"])
 @pytest.mark.parametrize("page", [16, 32, 64], ids=["p16", "p32", "p64"])
 @pytest.mark.parametrize("schedule", [[1], [4], [1, 4, 2, 3, 5, 1, 2, 4]], ids=["one_row_steps", "four_row_steps", "mixed_steps"])
-def test_paged_step_stream_is_bitwise_the_dense_step_and_the_prefill_compress(schedule, page):
+def test_paged_step_stream_is_bitwise_the_dense_step_and_the_prefill_compress(schedule, page, rounding):
     """The same token stream through the dense step form and the PAGED one (ring blocks behind the state table, the cache's rows
     through a permuted block table at P 16 / 32 / 64 -- 4 / 8 / 16 compressed rows per page, so the blocks cross page boundaries):
     every compressed row the paged form writes is bitwise the dense form's and the prefill kernel's, the slot reports are
@@ -617,9 +633,9 @@ def test_paged_step_stream_is_bitwise_the_dense_step_and_the_prefill_compress(sc
     s_tok, lens = 517, [517, 510, 37, 0]
     batch = len(lens)
     k_raw, w, cos, sin = _make(batch, s_tok, dtype, seed=21)
-    ref, n_blocks = _prefill(k_raw, w, cos, sin, _i32(lens), offset=1.0)
-    out_d, ring_d, slots_d = _run_stream(k_raw, lens, schedule, w=w, cos=cos, sin=sin, offset=1.0)
-    pg, slots_p = _run_stream_paged(k_raw, lens, schedule, w=w, cos=cos, sin=sin, offset=1.0, page=page, cap=cap, padding=(3,))
+    ref, n_blocks = _prefill(k_raw, w, cos, sin, _i32(lens), offset=1.0, rounding=rounding)
+    out_d, ring_d, slots_d = _run_stream(k_raw, lens, schedule, w=w, cos=cos, sin=sin, offset=1.0, rounding=rounding)
+    pg, slots_p = _run_stream_paged(k_raw, lens, schedule, w=w, cos=cos, sin=sin, offset=1.0, page=page, cap=cap, padding=(3,), rounding=rounding)
     assert slots_p == slots_d, "the paged form's slot reports differ from the dense form's"
     for b in range(batch):
         nb = int(n_blocks[b])
@@ -1160,9 +1176,10 @@ def test_paged_compile_rejects_unsupported_declarations():
 
 
 @requires_sm89
+@pytest.mark.parametrize("rounding", ["single", "hf"])
 @pytest.mark.parametrize("page", [16, 32, 64], ids=["p16", "p32", "p64"])
 @pytest.mark.parametrize("schedule", [[1], [4], [1, 4, 2, 3, 5, 1, 2, 4]], ids=["one_row_steps", "four_row_steps", "mixed_steps"])
-def test_e4m3_step_stream_dense_and_paged_are_bitwise_the_bf16_rows_cast(schedule, page):
+def test_e4m3_step_stream_dense_and_paged_are_bitwise_the_bf16_rows_cast(schedule, page, rounding):
     """The e4m3 store arm (``index_cache_dtype=torch.float8_e4m3fn``) on the SAME token stream as the bf16 arm, dense AND paged: every
     compressed row the two e4m3 arms write is bitwise each other and bitwise the bf16 arm's row ``.to(float8_e4m3fn)`` (the e4m3 cast of
     the bf16 row -- the serving stacks' convention and the prefill form's), with ``|bf16 row| < 448`` asserted first; the slot reports
@@ -1172,10 +1189,12 @@ def test_e4m3_step_stream_dense_and_paged_are_bitwise_the_bf16_rows_cast(schedul
     s_tok, lens = 517, [517, 510, 37, 0]
     batch = len(lens)
     k_raw, w, cos, sin = _make(batch, s_tok, dtype, seed=41)
-    ref, n_blocks = _prefill(k_raw, w, cos, sin, _i32(lens), offset=1.0)
-    out16, ring16, slots16 = _run_stream(k_raw, lens, schedule, w=w, cos=cos, sin=sin, offset=1.0)
-    out8, ring8, slots8 = _run_stream(k_raw, lens, schedule, w=w, cos=cos, sin=sin, offset=1.0, cache_dtype=_E4M3)
-    pg, slots_p = _run_stream_paged(k_raw, lens, schedule, w=w, cos=cos, sin=sin, offset=1.0, page=page, cap=cap, padding=(3,), seed=41, cache_dtype=_E4M3)
+    ref, n_blocks = _prefill(k_raw, w, cos, sin, _i32(lens), offset=1.0, rounding=rounding)
+    out16, ring16, slots16 = _run_stream(k_raw, lens, schedule, w=w, cos=cos, sin=sin, offset=1.0, rounding=rounding)
+    out8, ring8, slots8 = _run_stream(k_raw, lens, schedule, w=w, cos=cos, sin=sin, offset=1.0, cache_dtype=_E4M3, rounding=rounding)
+    pg, slots_p = _run_stream_paged(
+        k_raw, lens, schedule, w=w, cos=cos, sin=sin, offset=1.0, page=page, cap=cap, padding=(3,), seed=41, cache_dtype=_E4M3, rounding=rounding
+    )
     assert out8.dtype == pg.cache.dtype == _E4M3 and ring8.dtype == pg.ring.dtype == dtype
     assert slots8 == slots16 and slots_p == slots16, "the e4m3 arms' slot reports differ from the bf16 arm's"
     assert torch.equal(_bits(ring8), _bits(ring16)), "the e4m3 arm changed the ring (a bf16 bit copy)"
@@ -1221,3 +1240,263 @@ def test_e4m3_block_completes_at_the_fourth_token_on_either_side_of_a_page_bound
             assert torch.equal(_bits(pg.ring_row(b, p)), _bits(k_raw[b, p]))
             ring_before[int(pg.state_table[b, 0]), p % 8, 0] = pg.ring_row(b, p)
     assert torch.equal(_bits(pg.cache), _bits(cache_before)) and torch.equal(_bits(pg.ring), _bits(ring_before))
+
+
+# ---------------------------------------------------------------------------
+# The CHUNK form (ring_write=False): a prefill chunk behind a cached prefix, the ring read-only
+# ---------------------------------------------------------------------------
+
+_CHUNK_RESIDUE_PREFIXES = [20, 21, 22, 23]  # one live sequence per residue mod 4 (every prefix >= cap and >= 4), plus a padding sequence
+_CHUNK_T = [1, 2, 3, 4, 5, 17, 128, 2048]
+
+
+def _run_chunk_stream(k_raw, prefixes, t, n_chunks, *, w, cos, sin, page, cap, padding=(), rounding="single", cache_dtype=None, offset=1.0):
+    """The chunk form over the paged side caches: every live sequence ``b`` starts behind its prefix ``prefixes[b]`` and receives
+    ``n_chunks`` chunks of ``t`` rows (the uniform-T contract); before every chunk the TEST primes the ring with the stream's last ``cap``
+    positions -- the tail arm's job (``cache_write`` over the ring's slots, pinned in ``test_qsa_prepare.py``) -- with the positions below
+    ``4 floor(P / 4)`` POISONED (NaN: the kernel must never read them), and the prefix's complete blocks sit in the cache from the
+    from-scratch compress (the cache-parity precondition).  Returns the paged caches, the reference, the per-chunk slot reports and, per
+    chunk, whether the ring came back bitwise untouched."""
+    batch, s_tot, _ = k_raw.shape
+    lens = [0 if b in padding else prefixes[b] + n_chunks * t for b in range(batch)]
+    ref, _ = _prefill(k_raw, w, cos, sin, _i32(lens), offset=offset, rounding=rounding)
+    ref_c = ref if cache_dtype is None else ref.to(cache_dtype)
+    pg = _Paged(batch, s_tot, k_raw.dtype, page=page, cap=cap, padding=padding, seed=t + page + cap, cache_dtype=cache_dtype)
+    nan_row = torch.full((_D,), float("nan"), device="cuda", dtype=k_raw.dtype)
+    for b in range(batch):
+        if b in padding:
+            continue
+        for blk in range(prefixes[b] // _POOL):  # the prefix's complete blocks: the cache holds them already
+            pg.cache[int(pg.block_table[b, blk // pg.rpp]), blk % pg.rpp, 0] = ref_c[b, blk]
+    slots, ring_untouched = [], []
+    for c in range(n_chunks):
+        kv_lens = []
+        for b in range(batch):
+            if b in padding:
+                kv_lens.append(0)
+                continue
+            kv_before = prefixes[b] + c * t
+            kv_lens.append(kv_before + t)
+            entry = int(pg.state_table[b, 0])
+            for p in range(kv_before - cap, kv_before):  # the ring INPUT contract: the last cap positions, the unread ones poisoned
+                pg.ring[entry, p % cap, 0] = k_raw[b, p] if p >= _POOL * (kv_before // _POOL) else nan_row
+        ring_before = pg.ring.clone()
+        k_new = torch.stack([k_raw[b, prefixes[b] + c * t : prefixes[b] + (c + 1) * t] for b in range(batch)]).contiguous()
+        slot = _step_paged(pg, k_new, w, cos, sin, kv_lens, None, offset=offset, ring_write=False, rounding=rounding)
+        slots.append(slot.tolist())
+        ring_untouched.append(torch.equal(_bits(pg.ring), _bits(ring_before)))
+    return pg, ref_c, slots, ring_untouched, lens
+
+
+def _assert_chunk_stream(pg: _Paged, ref_c, slots, ring_untouched, prefixes, t, n_chunks, padding, label):
+    """After the LAST chunk: every complete block of every live sequence bitwise the from-scratch compress, nothing past it, page 0 and
+    the null block untouched, the padding sequence untouched; per chunk: the ring untouched and the slot reports the position rule's."""
+    batch = pg.batch
+    assert all(ring_untouched), f"{label}: the ring was written by a ring_write=False launch (chunks {[i for i, ok in enumerate(ring_untouched) if not ok]})"
+    for c in range(n_chunks):
+        for b in range(batch):
+            if b in padding:
+                assert slots[c][b] == [-1] * t, f"{label}: the padding sequence reported a block"
+                continue
+            kv_before = prefixes[b] + c * t
+            want = [((kv_before + j) // _POOL if (kv_before + j) % _POOL == _POOL - 1 else -1) for j in range(t)]
+            assert slots[c][b] == want, f"{label}: chunk {c} sequence {b} (P {prefixes[b]}): slots {slots[c][b][:12]} != {want[:12]}"
+            if t < _POOL - kv_before % _POOL:  # a chunk shorter than the group remainder: no block completes
+                assert slots[c][b] == [-1] * t
+    n_written = 0
+    for b in range(batch):
+        if b in padding:
+            continue
+        kv_end = prefixes[b] + n_chunks * t
+        for blk in range(kv_end // _POOL):
+            assert torch.equal(_bits(pg.kbar_row(b, blk)), _bits(ref_c[b, blk])), f"{label}: sequence {b} block {blk} differs from the from-scratch compress"
+        n_written += kv_end // _POOL
+        if (kv_end // _POOL) < int(ref_c.shape[1]):  # the partially filled group's row (and every later row) untouched
+            assert bool((pg.kbar_row(b, kv_end // _POOL).float() == pg.sent).all()), f"{label}: sequence {b}: the incomplete group's row was written"
+    assert pg.rows_written() == n_written, f"{label}: rows written {pg.rows_written()} != the complete blocks {n_written}"
+    assert bool((pg.cache[0].float() == pg.sent).all()) and bool(
+        (pg.ring[0].float() == _sent_of(pg.dtype)).all()
+    ), f"{label}: page 0 / the null ring block were written"
+
+
+@requires_cuda
+@pytest.mark.parametrize("cap", [3, 4, 8], ids=["cap3", "cap4", "cap8"])
+@pytest.mark.parametrize("page", [16, 32, 64], ids=["p16", "p32", "p64"])
+@pytest.mark.parametrize("t", _CHUNK_T)
+def test_ring_read_only_chunk_stream_is_bitwise_the_prefill_compress(t, page, cap):
+    """Five sequences -- one live sequence per residue of the chunk start (prefixes 20 .. 23) and a padding one -- fed ``n`` chunks of ``t``
+    rows through the chunk form over the paged caches at this page size and ring cap (cap 3 = the chunk form's floor ``pool - 1``): after
+    every chunk the paged cache rows of every complete block of the stream so far are BITWISE the from-scratch prefill compress (the
+    straddling block pooled from the ring + the chunk's rows), the ring BITWISE untouched, the slot reports the position rule's; the
+    ``t < 4 - P % 4`` cells (t 1 / 2 at residue 1, t 1 at residue 2, t 1 / 2 / 3 at residue 0) write nothing and report ``-1``; the
+    poisoned ring rows below ``4 floor(P / 4)`` are never read (the rows stay bitwise); the padding sequence writes nothing."""
+    dtype = torch.bfloat16
+    n_chunks = 2 if t >= 128 else 4
+    prefixes = _CHUNK_RESIDUE_PREFIXES + [0]
+    padding = (4,)
+    s_tot = max(prefixes) + n_chunks * t
+    k_raw, w, cos, sin = _make(len(prefixes), s_tot, dtype, seed=100 + t)
+    pg, ref, slots, ring_ok, _ = _run_chunk_stream(k_raw, prefixes, t, n_chunks, w=w, cos=cos, sin=sin, page=page, cap=cap, padding=padding)
+    _assert_chunk_stream(pg, ref, slots, ring_ok, prefixes, t, n_chunks, padding, f"T {t} page {page} cap {cap}")
+    # the matrix carries the shorter-than-the-remainder cells by construction: name them
+    short = [(b, prefixes[b]) for b in range(4) if t < _POOL - prefixes[b] % _POOL]
+    if t <= 3:
+        assert short, "the matrix lost its shorter-than-the-remainder cells"
+
+
+@requires_cuda
+@pytest.mark.parametrize("rounding", ["single", "hf"])
+@pytest.mark.parametrize("t", [3, 17], ids=["T3", "T17"])
+def test_ring_read_only_chunk_stream_under_both_roundings_is_bitwise_the_prefill_compress(t, rounding):
+    """The chunk form and the prefill form round identically under ``"hf"`` as under ``"single"`` (page 16, cap 4: vLLM's defaults)."""
+    prefixes = _CHUNK_RESIDUE_PREFIXES + [0]
+    k_raw, w, cos, sin = _make(len(prefixes), max(prefixes) + 3 * t, torch.bfloat16, seed=300 + t)
+    pg, ref, slots, ring_ok, _ = _run_chunk_stream(k_raw, prefixes, t, 3, w=w, cos=cos, sin=sin, page=16, cap=4, padding=(4,), rounding=rounding)
+    _assert_chunk_stream(pg, ref, slots, ring_ok, prefixes, t, 3, (4,), f"rounding {rounding} T {t}")
+
+
+@requires_cuda
+def test_ring_write_false_keys_the_artifact_refuses_ring_slots_and_relaxes_the_cap_rule():
+    """The recipe's appended ``ring_write`` field; a DISTINCT compile key (the default key unchanged); ``ring_slots=True`` with
+    ``ring_write=False`` a ``ValueError``; ``min_ring_rows(rows, pool, ring_write=False) == pool - 1`` whatever the rows; cap 3 served at
+    ``S_q = 2048`` (a step form would need 2051), cap 2 refused naming ``pool - 1``; the DENSE form takes the key too and is bitwise the
+    paged form on one chunk (the existing twin pin)."""
+    dtype = torch.bfloat16
+    base = dict(dtype=dtype, d=_D, rope_dim=_ROPE, has_n_commit=False)
+    rw = compile_qsa_compress_step(paged=True, **base)
+    ro = compile_qsa_compress_step(paged=True, ring_write=False, **base)
+    assert rw.ring_write is True and ro.ring_write is False and ro.compiled is not rw.compiled
+    assert compile_qsa_compress_step(paged=True, ring_write=True, **base).compiled is rw.compiled
+    assert compile_qsa_compress_step(paged=True, ring_write=False, **base).compiled is ro.compiled
+    with pytest.raises(ValueError, match="ring_slots=True names the ring WRITE rows, but ring_write=False"):
+        compile_qsa_compress_step(paged=True, ring_slots=True, ring_write=False, **base)
+    assert min_ring_rows(2048, _POOL, ring_write=False) == 3 and min_ring_rows(1, _POOL, ring_write=False) == 3 and min_ring_rows(2048, _POOL) == 2051
+    # cap 3 served at 2048 rows; cap 2 refused naming the rule
+    t, prefixes = 2048, [21, 22]
+    k_raw, w, cos, sin = _make(2, max(prefixes) + t, dtype, seed=400)
+    pg3, ref, slots, ring_ok, _ = _run_chunk_stream(k_raw, prefixes, t, 1, w=w, cos=cos, sin=sin, page=16, cap=3)
+    _assert_chunk_stream(pg3, ref, slots, ring_ok, prefixes, t, 1, (), "cap 3 at T 2048")
+    pg2 = _Paged(2, max(prefixes) + t, dtype, page=16, cap=2, seed=1)
+    k_new = torch.stack([k_raw[b, prefixes[b] : prefixes[b] + t] for b in range(2)]).contiguous()
+    with pytest.raises(ValueError, match=r"ring holds 2 rows per block; this launch needs at least 3 \(raw-key ring, read-only in the chunk form"):
+        _step_paged(pg2, k_new, w, cos, sin, [p + t for p in prefixes], None, ring_write=False)
+    # the dense form: the same chunk over a dense ring [B, 3, D] and a dense cache, bitwise the paged form's rows and slots
+    ring_d = _sentinel(2, 3, _D, dtype=dtype)
+    for b in range(2):
+        for p in range(_POOL * (prefixes[b] // _POOL), prefixes[b]):
+            ring_d[b, p % 3] = k_raw[b, p]
+    ring_d_before = ring_d.clone()
+    out_d = _sentinel(2, (max(prefixes) + t) // _POOL, _D, dtype=dtype)
+    slot_d = _step(k_new, ring_d, out_d, w, cos, sin, _i32(prefixes), None, ring_write=False)
+    assert torch.equal(_bits(ring_d), _bits(ring_d_before))
+    assert slot_d.tolist() == slots[0]
+    for b in range(2):
+        for blk in range(prefixes[b] // _POOL, (prefixes[b] + t) // _POOL):
+            assert torch.equal(_bits(out_d[b, blk]), _bits(pg3.kbar_row(b, blk)))
+    with pytest.raises(ValueError, match=r"the chunk form needs at least 3 \(raw-key ring, read-only"):
+        _step(k_new, _sentinel(2, 2, _D, dtype=dtype), out_d, w, cos, sin, _i32(prefixes), None, ring_write=False)
+
+
+@requires_cuda
+def test_ring_read_only_chunk_is_one_launch_and_allocates_nothing_at_2048_rows():
+    """MEASURED: the chunk form at 2048 rows is ONE kernel launch (``torch.profiler``'s census), allocates nothing and never synchronises."""
+    from torch.profiler import ProfilerActivity, profile
+
+    dtype, t = torch.bfloat16, 2048
+    k_raw, w, cos, sin = _make(2, 22 + t, dtype, seed=500)
+    pg = _Paged(2, 22 + t, dtype, page=16, cap=4, seed=500)
+    r = compile_qsa_compress_step(dtype=dtype, d=_D, rope_dim=_ROPE, has_n_commit=False, paged=True, ring_write=False)
+    k_new = torch.stack([k_raw[b, 21 : 21 + t] for b in range(2)]).contiguous()
+    slot = torch.full((2, t), -9, dtype=torch.int32, device="cuda")
+    kv = _i32([21 + t, 21 + t])
+
+    def launch():
+        run_qsa_compress_step(
+            r,
+            k_new,
+            pg.ring,
+            pg.cache,
+            w,
+            cos,
+            sin,
+            None,
+            slot,
+            None,
+            eps=_EPS,
+            stream=_stream(),
+            kv_lens=kv,
+            block_table=pg.block_table,
+            index_state_block_table=pg.state_table,
+        )
+
+    launch()
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_stats()["allocation.all.allocated"]
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        for _ in range(3):
+            launch()
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == before, "the chunk form allocated on the execute path"
+    assert int((slot >= 0).sum()) == 2 * ((21 + t) // _POOL - 21 // _POOL)
+    prof = profile(activities=[ProfilerActivity.CUDA])
+    try:
+        prof.start()
+    except Exception:  # noqa: BLE001 -- CUPTI unavailable on this box: the bitwise cells stand
+        pytest.skip("the CUDA profiler recorded no kernel activity on this box (CUPTI unavailable)")
+    try:
+        launch()
+        torch.cuda.synchronize()
+    finally:
+        prof.stop()
+    names = [
+        e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA and "memset" not in e.name.lower() and "memcpy" not in e.name.lower()
+    ]
+    if not names:
+        pytest.skip("the CUDA profiler recorded no kernel activity on this box (CUPTI unavailable)")
+    assert len(names) == 1 and "frost_qsa_compress_step" in names[0], names
+
+
+@requires_sm89
+@pytest.mark.parametrize("t", [2, 5, 128], ids=["T2", "T5", "T128"])
+def test_e4m3_ring_read_only_chunk_rows_are_the_bf16_rows_cast(t):
+    """The e4m3 cache arm of the chunk form on every residue: the rows the chunk writes are bitwise the bf16 chunk's rows ``.to(e4m3)``
+    (= the from-scratch e4m3 compress), the ring stays the bf16 bit copy, the slot reports equal the bf16 arm's."""
+    prefixes = _CHUNK_RESIDUE_PREFIXES + [0]
+    k_raw, w, cos, sin = _make(len(prefixes), max(prefixes) + 3 * t, torch.bfloat16, seed=600 + t)
+    pg8, ref8, slots8, ring_ok8, _ = _run_chunk_stream(k_raw, prefixes, t, 3, w=w, cos=cos, sin=sin, page=16, cap=4, padding=(4,), cache_dtype=_E4M3)
+    pg16, ref16, slots16, ring_ok16, _ = _run_chunk_stream(k_raw, prefixes, t, 3, w=w, cos=cos, sin=sin, page=16, cap=4, padding=(4,))
+    assert pg8.cache.dtype == _E4M3 and pg8.ring.dtype == torch.bfloat16
+    _assert_chunk_stream(pg8, ref8, slots8, ring_ok8, prefixes, t, 3, (4,), f"e4m3 chunk T {t}")
+    assert slots8 == slots16
+    for b in range(4):
+        for blk in range((prefixes[b] + 3 * t) // _POOL):
+            assert float(pg16.kbar_row(b, blk).float().abs().max()) < 448.0
+            assert torch.equal(_bits(pg8.kbar_row(b, blk)), _bits(pg16.kbar_row(b, blk).to(_E4M3)))
+
+
+@requires_cuda
+def test_paged_kv_lens_at_the_int32_extremes_are_dead_and_never_wrap():
+    """``kv_lens`` in {INT_MIN, INT_MIN + 1, -1, 0} on LIVE table rows (a stack bug; a padding entry is the ``0``) beside a ``4`` control, S_q 4:
+    every ``L <= 0`` sequence is DEAD -- every slot ``-1``, no ring row, no cache row (the sentinel bit for bit) -- whatever the magnitude, because
+    the position is derived from ``max(L, 0) - S_q`` (``step_position``, the kbar gather's derivation): the int32 ``L - S_q`` that wrapped to a live
+    positive position at ``INT_MIN`` never enters (before the clamp the wrapped rows landed in the past-the-table path by accident: slots ``-2``,
+    nothing written).  The control's row 3 completes block 0 bitwise the prefill compress."""
+    dtype, s_tok, batch, rows = torch.bfloat16, 16, 5, 4
+    k_raw, w, cos, sin = _make(batch, s_tok, dtype, seed=31)
+    int_min = -(2**31)
+    kv_lens = [int_min, int_min + 1, -1, 0, 4]
+    k_new = k_raw[:, :rows].contiguous()
+    pg = _Paged(batch, s_tok, dtype, page=16, cap=8, seed=31)  # every sequence owns pages and a ring block: the dead ones are dead by LENGTH alone
+    slot = _step_paged(pg, k_new, w, cos, sin, kv_lens)
+    assert slot.tolist() == [[-1] * rows] * 4 + [[-1, -1, -1, 0]], slot.tolist()
+    assert pg.rows_written() == 1, "a dead sequence wrote a cache row"
+    assert int((pg.ring.float() != pg.sent).any(-1).sum()) == rows, "a dead sequence wrote a ring row"
+    for b in range(4):
+        assert bool((pg.ring[int(pg.state_table[b, 0]), :, 0].float() == pg.sent).all()), f"sequence {b} (kv_lens {kv_lens[b]}) wrote the ring"
+    ref, _ = _prefill(k_raw[4:5], w, cos, sin, _i32([s_tok]))
+    assert torch.equal(_bits(pg.kbar_row(4, 0)), _bits(ref[0, 0])), "the control's block 0 is not the prefill compress"
+    for p in range(rows):
+        assert torch.equal(_bits(pg.ring_row(4, p)), _bits(k_raw[4, p]))

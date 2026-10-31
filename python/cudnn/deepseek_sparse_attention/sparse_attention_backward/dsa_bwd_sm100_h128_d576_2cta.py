@@ -254,6 +254,22 @@ def _cp_async_g2s_b128_index(destination: cute.Pointer, source: cute.Pointer, *,
 
 
 @dsl_user_op
+def _cp_async_g2s_b128_index_zfill(destination: cute.Pointer, source: cute.Pointer, source_size: Int32, *, loc=None, ip=None) -> None:
+    """Issue one 16-byte index copy, zero-filling bytes beyond ``source_size``."""
+    destination_i32 = destination.toint(loc=loc, ip=ip).ir_value()
+    source_i64 = source.toint(loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None,
+        [destination_i32, source_i64, source_size.ir_value(loc=loc, ip=ip)],
+        "cp.async.cg.shared.global [$0], [$1], 16, $2;",
+        "r,l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def _load_f32x4(source: cute.Pointer, *, loc=None, ip=None) -> Tuple[Float32, Float32, Float32, Float32]:
     """Load four aligned FP32 accumulator values with one 128-bit load."""
     source_i64 = source.toint(loc=loc, ip=ip).ir_value()
@@ -541,8 +557,8 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
             raise ValueError("two-CTA DSA backward requires head_dim=576, head_dim_v=512")
         if block_tile != 64:
             raise ValueError(f"two-CTA DSA backward requires block_tile=64, got {block_tile}")
-        if max_topk not in (128, 512, 1024, 1152, 2048):
-            raise ValueError(f"two-CTA DSA backward requires max_topk in {{128, 512, 1024, 1152, 2048}}, got {max_topk}")
+        if max_topk not in (128, 512, 1024, 1152, 2048, 2049, 2050, 2051):
+            raise ValueError(f"two-CTA DSA backward requires max_topk in {{128, 512, 1024, 1152, 2048, 2049, 2050, 2051}}, got {max_topk}")
         if num_heads not in (96, 128):
             raise ValueError(f"two-CTA DSA backward requires num_heads in {{96, 128}}, got {num_heads}")
         self.element_dtype = element_dtype
@@ -855,13 +871,37 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
     def _prefetch_tile_indices(
         self, mTopkIdxs: cute.Tensor, tile_indices: cute.Tensor, token_idx: Int32, batch_idx: Int32, tile_index: Int32, slot: Int32, tidx: Int32
     ) -> None:
-        """Sixteen threads copy one complete N64 index tile to one SMEM slot."""
-        if tidx < Int32(16):
-            lane_base = tidx * Int32(4)
-            position = tile_index * Int32(self.N_TILE) + lane_base
-            source = mTopkIdxs.iterator + mTopkIdxs.layout((position, (token_idx, batch_idx)))
-            destination = tile_indices.iterator + tile_indices.layout((lane_base, slot))
-            _cp_async_g2s_b128_index(destination, source)
+        """Up to seventeen threads copy one complete N64 index tile to one SMEM slot.
+
+        Aligned widths retain one 16-byte copy per thread. The 2049--2051
+        widths align each row down, stage one extra 16-byte chunk, and zero-fill
+        the physical suffix of the final N64 tile.
+        """
+        if cutlass.const_expr(self.max_topk % 4 == 0):
+            if tidx < Int32(16):
+                lane_base = tidx * Int32(4)
+                position = tile_index * Int32(self.N_TILE) + lane_base
+                source = mTopkIdxs.iterator + mTopkIdxs.layout((position, (token_idx, batch_idx)))
+                destination = tile_indices.iterator + tile_indices.layout((lane_base, slot))
+                _cp_async_g2s_b128_index(destination, source)
+        else:
+            row_offset = mTopkIdxs.layout((Int32(0), (token_idx, batch_idx)))
+            row_prefix = Int32(row_offset % Int32(4))
+            row_source = mTopkIdxs.iterator + row_offset
+            if tidx < Int32(17):
+                lane_base = tidx * Int32(4)
+                position = tile_index * Int32(self.N_TILE) - row_prefix + lane_base
+                safe_position = position
+                source_size = Int32(16)
+                declared_topk = Int32(mTopkIdxs.shape[0])
+                if position >= declared_topk:
+                    safe_position = Int32(0) - row_prefix
+                    source_size = Int32(0)
+                elif position + Int32(4) > declared_topk:
+                    source_size = (declared_topk - position) * Int32(4)
+                source = row_source + safe_position
+                destination = tile_indices.iterator + tile_indices.layout((lane_base, slot)) - row_prefix
+                _cp_async_g2s_b128_index_zfill(destination, source, source_size)
 
     @cute.jit
     def _resolve_kdq_row_indices(self, tile_indices: cute.Tensor, tile_index: Int32, topk: Int32, rank: Int32, role_tidx: Int32):
@@ -1169,7 +1209,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
             assert not split_regime
             mdKV_acc = self.make_dKV_accumulator(workspace_dKV, mKV.shape[0])
             active_dkv_shards = min(Int32(self.num_dkv_shards), problem_shape[0] * Int32(self.dkv_shards_per_query))
-            if cutlass.const_expr(self.max_topk == 2048):
+            if cutlass.const_expr(self.max_topk >= 2048):
                 self.zero_dKV_shards(mdKV_acc, mKV.shape[0]).launch(
                     grid=[cute.ceil_div(mKV.shape[0], 16), active_dkv_shards, 1], block=[640, 1, 1], stream=stream
                 )
@@ -1307,9 +1347,9 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
                 stream=stream,
                 min_blocks_per_mp=1,
             )
-        self.block_seq = 4 if self.max_topk == 2048 else 32
+        self.block_seq = 4 if self.max_topk >= 2048 else 32
         self.num_threads_D_convert = 32
-        self.num_threads_seq = 4 if self.max_topk == 2048 else self.block_seq
+        self.num_threads_seq = 4 if self.max_topk >= 2048 else self.block_seq
         convert_grid_x = (mKV.shape[0] + self.block_seq - 1) // self.block_seq
         if cutlass.const_expr(not self.SINGLE_QUERY and (not self.deterministic)):
             dsink_chunks_per_block = self.num_threads_D_convert * self.num_threads_seq // self.DSINK_THREADS
@@ -2136,7 +2176,17 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
         flat_pds_block_layout = cute.make_layout((self.PDS_BLOCK_ELEMENTS,), stride=(1,))
         p_xchg_raw = storage.p_xchg.get_tensor(flat_pds_block_layout)
         softmax_stats = storage.stats.get_tensor(cute.make_layout((self.H_TILE_CTA, 2), stride=(1, self.H_TILE_CTA)))
-        staged_indices = storage.tile_indices.get_tensor(cute.make_layout((self.N_TILE, 2), stride=(1, self.N_TILE)))
+        index_slot_stride = self.N_TILE if cutlass.const_expr(self.max_topk % 4 == 0) else self.N_TILE + 4
+        staged_indices_raw = storage.tile_indices.get_tensor(cute.make_layout((index_slot_stride, 2), stride=(1, index_slot_stride)))
+        if cutlass.const_expr(self.max_topk % 4 == 0):
+            staged_indices = staged_indices_raw
+        else:
+            row_offset = mTopkIdxs.layout((Int32(0), (token_idx, batch_idx)))
+            row_prefix = Int32(row_offset % Int32(4))
+            staged_indices = cute.make_tensor(
+                staged_indices_raw.iterator + row_prefix,
+                cute.make_layout((self.N_TILE, 2), stride=(1, index_slot_stride)),
+            )
         s_q_tail = storage.q_tail.get_tensor(qt_a_layout_staged.outer, swizzle=qt_a_layout_staged.inner)
         s_kt_score = storage.kt_score.get_tensor(kt_score_layout_staged.outer, swizzle=kt_score_layout_staged.inner)
         s_kt_dq = storage.kt_dq.get_tensor(kt_dq_layout_staged.outer, swizzle=kt_dq_layout_staged.inner)
@@ -3392,6 +3442,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
         assert cute.cosize(dq_a_layout_staged) <= 8192
         assert cute.cosize(dq_b_layout_staged) <= 4096
         pds_mbar_count = 2 if split_regime else 4
+        index_stage_elements = 2 * (self.N_TILE if self.max_topk % 4 == 0 else self.N_TILE + 4)
 
         @cute.struct
         class SharedStorage:
@@ -3427,7 +3478,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTA:
             ds_image: cute.struct.Align[cute.struct.MemRange[element_dtype, 4096], 1024]
             ds_blocks: cute.struct.Align[cute.struct.MemRange[element_dtype, 4096], 1024]
             stats: cute.struct.Align[cute.struct.MemRange[Float32, 128], 1024]
-            tile_indices: cute.struct.Align[cute.struct.MemRange[Int32, 128], 16]
+            tile_indices: cute.struct.Align[cute.struct.MemRange[Int32, index_stage_elements], 16]
 
         assert SharedStorage.size_in_bytes() <= self.MAX_SMEM_BYTES
         return SharedStorage
@@ -4250,7 +4301,7 @@ class FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic(TwoCTADeterminis
         pitch = cute.round_up(seqlen, 8)
         slot_offset = cutlass.Int64(slot) * cutlass.Int64(pitch) * cutlass.Int64(self.COMPACT_RECORD)
         slot_tensor = cute.make_tensor(mdKV_acc.iterator + slot_offset, cute.make_layout((self.COMPACT_RECORD, pitch), stride=(1, self.COMPACT_RECORD)))
-        if cutlass.const_expr(self.max_topk == 2048):
+        if cutlass.const_expr(self.max_topk >= 2048):
             dim = tidx % Int32(80) * Int32(8)
             row_lane = tidx // Int32(80)
             for row_offset in cutlass.range_constexpr(2):

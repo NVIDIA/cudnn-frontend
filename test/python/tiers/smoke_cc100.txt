@@ -160,8 +160,8 @@ sdpa/frost/test_sdpa_bwd_mxfp8_sm107.py::test_reject_sink
 sdpa/frost/test_sdpa_bwd_prepared_mxfp8.py::TestPreparedMxfp8Bwd::test_rebind_and_explicit_stream_replay[False]
 sdpa/frost/test_sdpa_bwd_prepared_mxfp8.py::TestPreparedMxfp8Bwd::test_warm_execute_has_no_tensor_plumbing[False]
 sdpa/frost/test_sdpa_bwd_stage3_block_scale_sm107.py::test_block_scale_thd_leg_sf_prefix_contract_and_operand_refusals
-sdpa/frost/test_sdpa_bwd_staged_copy_sm100.py::test_staged_execute_uses_prepared_copies[dtype0]
-sdpa/frost/test_sdpa_bwd_staged_sm100.py::test_staged_rebind_stream_capture[roles0-264-4-False-dtype0]
+sdpa/frost/test_sdpa_bwd_native_execution_sm100.py::test_native_execute_uses_current_pointers[dtype0]
+sdpa/frost/test_sdpa_bwd_native_layouts_sm100.py::test_native_rebind_stream_capture[roles0-264-4-False-dtype0]
 sdpa/frost/test_sdpa_bwd_thd_fp8_sm107.py::test_capabilities_claim_thd_and_a_ragged_bottom_right
 sdpa/frost/test_sdpa_bwd_thd_fp8_sm107.py::test_fp8_thd_serves_the_external_delta
 sdpa/frost/test_sdpa_bwd_thd_mxfp8_sm107.py::test_capabilities_claim_thd_with_declared_totals
@@ -215,7 +215,7 @@ sdpa/frost/test_sdpa_native_sink_binding.py::test_sink_contiguous_shapes_and_dea
 sdpa/frost/test_sdpa_native_sink_binding.py::test_sink_native_graph_rebind_and_replay[bfloat16-128-1-False]
 sdpa/frost/test_sdpa_native_sm120_binding.py::test_sm120_native_graph_envelopes_fresh_storage_and_replay[bfloat16-1-128-128]
 sdpa/frost/test_sdpa_native_sm120_binding.py::test_sm120_native_graph_sinks[248-256]
-sdpa/frost/test_sdpa_native_sm80_binding.py::test_sm80_actual_host_frame_matches_python[0.125-False--0.5-0-False-bfloat16]
+sdpa/frost/test_sdpa_native_sm80_binding.py::test_sm80_actual_host_frame_matches_python[0.125--0.5-0-False-bfloat16]
 sdpa/frost/test_sdpa_native_sm90_binding.py::test_dense_permutation_frames_match_python[False-permutation0-bfloat16]
 sdpa/frost/test_sdpa_native_sm90_binding.py::test_thd_fixed_batch_and_tensor_map_alignment
 sdpa/frost/test_sdpa_native_split_binding.py::test_native_split_frames_match_python_and_rebind[2-128-1-False-False-False-False-bfloat16]
@@ -249,11 +249,11 @@ sdpa/frost/test_sdpa_python_validate.py::test_bottom_right_causal_with_bias
 sdpa/frost/test_sdpa_sm80_packed_init.py::test_initializer_rebinds_counts_and_preserves_guards[2]
 sdpa/frost/test_sdpa_split_combine_sm100.py::test_packed_combine_live_total_and_runtime_split_boundary[ln-bf16]
 sdpa/frost/test_sdpa_split_combine_sm100.py::test_pointer_combine_strided_outputs_and_dead_splits[compact-ln-bf16]
-sdpa/frost/test_sdpa_staged_forward_fp8.py::test_staged_block_output_matches_native_graph[dtype0-16]
-sdpa/frost/test_sdpa_staged_forward_fp8.py::test_staged_paged_qo_preserves_kv_pool_views[1-False]
-sdpa/frost/test_sdpa_staged_forward_half.py::test_half_staged_has_no_execute_allocations_and_replays_current_storage[1-dtype0-128-128]
-sdpa/frost/test_sdpa_staged_forward_half.py::test_half_staged_preserves_native_operands_and_split_output[1-converted0]
-sdpa/frost/test_sdpa_staged_forward_mxfp8.py::test_mxfp8_staged_block_output_matches_native_graph[dtype0-16]
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestNativeFp8Strides::test_native_block_output_matches_native_graph[dtype0-16]
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestNativeFp8Strides::test_native_paged_qo_preserves_kv_pool_views[1-False]
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestNativeHalfStrides::test_current_storage[role_split-1-dtype0-128-128]
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestNativeHalfStrides::test_mixed_layout[1-padded_roles0]
+sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::TestNativeMxfp8Strides::test_block_output[dtype0-16]
 sdpa/frost/test_sdpa_stream_ordering.py::test_fp8_dense_postprocessing_follows_explicit_stream[fp8]
 sdpa/frost/test_sdpa_stream_ordering.py::test_sdpa_fwd_dsl_side_stream_ordering[d128]
 sdpa/frost/test_sdpa_thd_tensormap_acquire.py::test_quantized_thd_tensormaps_rebind_and_replay[e4m3-d128_fp8]
@@ -269,3 +269,14 @@ sdpa/frost/test_tile_dsl_exp2_emul.py::test_exp2_emul_pair_matches_the_model_bit
 sdpa/frost/test_tile_dsl_q_loop_bounds.py::test_q_loop_bounds_match_reference[m0-W0-br0-R0-tq64-512x512]
 sdpa/frost/test_tile_dsl_sf_layout.py::test_atom_offset_matches_the_oracle_swizzle[128-4]
 sdpa/frost/test_tile_dsl_sf_layout.py::test_helper_traces_on_int32_and_matches_the_host[16]
+# gated attention block, cc 10.0 (2026-10-29: the dense bf16 / f16 serving forms admitted on the SM100 line; one cell per code path)
+gated_attention_block/cutedsl/test_block_serving_decode.py::test_sm100_decode_matches_the_oracle_at_every_group_and_s_q[1-6]
+gated_attention_block/cutedsl/test_block_serving_decode.py::test_sm100_decode_matches_the_oracle_at_every_group_and_s_q[3-6]
+gated_attention_block/cutedsl/test_block_serving_decode.py::test_sm100_decode_matches_the_oracle_at_every_group_and_s_q[2-16]
+gated_attention_block/cutedsl/test_block_serving_decode.py::test_sm100_the_explicit_pdl_switch_is_served_and_bitwise_the_plain_chain
+gated_attention_block/cutedsl/test_block_serving_extend.py::test_sm100_extend_matrix_cell[bf16-hnd-16]
+# the FP8-projection + bf16-attention mode of the paged forms on cc 10.0 (2026-10-30; QuantSpec(attention_dtype=torch.bfloat16)): one DECODE + one EXTEND cell
+gated_attention_block/cutedsl/test_block_serving_decode.py::test_fp8_proj_bf16_attention_decode_matches_the_oracle_at_every_group_and_s_q[1-6]
+gated_attention_block/cutedsl/test_block_serving_extend.py::test_fp8_proj_bf16_attention_extend_matrix_cell[hnd-16]
+gated_attention_block/cutedsl/test_block_end_to_end.py::test_matches_the_fp32_oracle[256-norm]
+gated_attention_block/cutedsl/test_block_end_to_end.py::test_dead_rows_do_not_poison_the_gate
