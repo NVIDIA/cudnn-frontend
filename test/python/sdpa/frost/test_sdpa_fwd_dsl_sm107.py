@@ -235,16 +235,16 @@ _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle 
     ),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o); +9: the early-BMM1 mainloop arm; +1: the decoded-tile wait
     ("mxfp8", (128, 128)): (
         True,
-        37,
+        38,
         13,
-    ),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o); +1: the FP32 split-partial epilogue's mb_o_empty wait
+    ),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o); +1: the FP32 split-partial epilogue's mb_o_empty wait; +1: the P-slot hand-over wait
     ("f16", (192, 128)): (True, 32, 11),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
     ("fp8", (192, 128)): (
         True,
         53,
         12,
     ),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait; +9: the early-BMM1 mainloop arm; +1: the decoded-tile wait
-    ("mxfp8", (192, 128)): (True, 35, 13),
+    ("mxfp8", (192, 128)): (True, 36, 13),  # +1 ring wait: the P-slot hand-over wait
     ("f16", (256, 256)): (False, 30, 11),  # FP32 split-partial epilogue adds one output-ring wait
     ("fp8", (256, 256)): (False, 30, 11),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
     ("mxfp8", (256, 256)): (False, 29, 11),
