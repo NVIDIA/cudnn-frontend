@@ -6,6 +6,8 @@
 from typing import Any
 
 _LAZY_EXPORTS = {
+    "KimiCPMerge": ("cudnn.linear_attention.merge", "KimiCPMerge"),
+    "kimi_cp_merge": ("cudnn.linear_attention.merge", "kimi_cp_merge"),
     "gated_delta_net": ("cudnn.linear_attention.ops", "gated_delta_net"),
     "kimi_delta_attention": ("cudnn.linear_attention.ops", "kimi_delta_attention"),
     "gated_delta_net_v2": ("cudnn.linear_attention.ops", "gated_delta_net_v2"),
