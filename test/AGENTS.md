@@ -1198,3 +1198,17 @@ update every monkeypatched loader spy to accept and forward it while retaining
 route assertions. Exercise the actual spy with both the legacy call and the new
 keyword; architecture-skipped GPU cases can otherwise hide a host-call failure
 until another lane runs, before any kernel executes.
+
+### Mixed-family shared-artifact qualification
+
+A portable SDPA core artifact can be shared by SM80 and SM89 plans. Test native
+d64 and d32 on SM80 and SM89 in both orders, then return to the first family
+with JIT forbidden, and compare O and LSE with independent references. Assert
+the plan reused the first family's artifact (`_sm80_spec.artifact`) so a fresh
+compile cannot stand in for the shared one.
+
+When an architecture row adopts a native adapter, test graph admission against
+that adapter's width and declared-stride restrictions before plan construction.
+The SM89 regression `test_sm89_probe_matches_native_width_and_stride_contract`
+keeps aligned d32/d64 controls and rejects d33 and a 65-element sequence stride.
+A staging-era capability envelope must not survive removal of the staging path.
