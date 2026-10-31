@@ -861,6 +861,7 @@ def _kernel(
                     mcast_mask=mcast_mask,
                     cta_in_pair=cta_in_pair,
                     qh_per_kh=qh_per_kh,
+                    sum_mma=lse_tensor is None,
                 )
             else:
                 _mma_warp_quiet(
@@ -900,6 +901,7 @@ def _kernel(
                 mcast_mask=mcast_mask,
                 cta_in_pair=cta_in_pair,
                 qh_per_kh=qh_per_kh,
+                sum_mma=lse_tensor is None,
             )
 
     elif warp_idx == CFG.TMALDG_WARP_ID:
@@ -1440,6 +1442,7 @@ def _mma_warp_group(
     mcast_mask,
     cta_in_pair,
     qh_per_kh,
+    sum_mma: cutlass.Constexpr[bool],
 ):
     """Leader MMA warp — block-scale MMA stream for BMM1 + BMM2.
 
@@ -1701,7 +1704,8 @@ def _mma_warp_group(
                     accum_b2 = cutlass.Boolean(True)
                 # Row sum, chunk 0's K-phases: queued behind chunk 0's PV so the tensor pipe stays busy across the
                 # wait for chunk 1 (same instructions and order as the former whole-tile call, see _rowsum_chunk).
-                _rowsum_chunk(0, sum_desc, tmem_raw.subview(LAYOUT.P0_OFF), desc_ones, tmem_raw.subview(_SUM0_OFF), is_not_first_bmm2)
+                if cutlass.const_expr(sum_mma):
+                    _rowsum_chunk(0, sum_desc, tmem_raw.subview(LAYOUT.P0_OFF), desc_ones, tmem_raw.subview(_SUM0_OFF), is_not_first_bmm2)
                 bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 1].wait(bmm2_ready_phase, spin=SPIN_RING_WAITS)
                 for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
                     mma_ts_step(
@@ -1721,7 +1725,8 @@ def _mma_warp_group(
                 # commit (which fires only after the MMA pipeline drains) also
                 # orders the row-sum for correction's read -- no extra barrier.
                 # Plain kind::f8f6f4, not block-scale (see sum_desc).
-                _rowsum_chunk(1, sum_desc, tmem_raw.subview(LAYOUT.P0_OFF), desc_ones, tmem_raw.subview(_SUM0_OFF), cutlass.Boolean(True))
+                if cutlass.const_expr(sum_mma):
+                    _rowsum_chunk(1, sum_desc, tmem_raw.subview(LAYOUT.P0_OFF), desc_ones, tmem_raw.subview(_SUM0_OFF), cutlass.Boolean(True))
                 if nvvm.elect_sync():
                     bars.mb_bmm2_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
 
@@ -1757,7 +1762,8 @@ def _mma_warp_group(
                     accum_b2 = cutlass.Boolean(True)
                 # Row sum, chunk 0's K-phases: queued behind chunk 0's PV so the tensor pipe stays busy across the
                 # wait for chunk 1 (same instructions and order as the former whole-tile call, see _rowsum_chunk).
-                _rowsum_chunk(0, sum_desc, tmem_raw.subview(LAYOUT.P1_OFF), desc_ones, tmem_raw.subview(_SUM1_OFF), is_not_first_bmm2)
+                if cutlass.const_expr(sum_mma):
+                    _rowsum_chunk(0, sum_desc, tmem_raw.subview(LAYOUT.P1_OFF), desc_ones, tmem_raw.subview(_SUM1_OFF), is_not_first_bmm2)
                 bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 1].wait(bmm2_ready_phase, spin=SPIN_RING_WAITS)
                 for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
                     mma_ts_step(
@@ -1777,7 +1783,8 @@ def _mma_warp_group(
                 # commit (which fires only after the MMA pipeline drains) also
                 # orders the row-sum for correction's read -- no extra barrier.
                 # Plain kind::f8f6f4, not block-scale (see sum_desc).
-                _rowsum_chunk(1, sum_desc, tmem_raw.subview(LAYOUT.P1_OFF), desc_ones, tmem_raw.subview(_SUM1_OFF), cutlass.Boolean(True))
+                if cutlass.const_expr(sum_mma):
+                    _rowsum_chunk(1, sum_desc, tmem_raw.subview(LAYOUT.P1_OFF), desc_ones, tmem_raw.subview(_SUM1_OFF), cutlass.Boolean(True))
                 if nvvm.elect_sync():
                     bars.mb_bmm2_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
                     bars.mb_v_empty[old_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
@@ -1824,7 +1831,8 @@ def _mma_warp_group(
                 accum_b2 = cutlass.Boolean(True)
             # Row sum, chunk 0's K-phases: queued behind chunk 0's PV so the tensor pipe stays busy across the
             # wait for chunk 1 (same instructions and order as the former whole-tile call, see _rowsum_chunk).
-            _rowsum_chunk(0, sum_desc, tmem_raw.subview(LAYOUT.P0_OFF), desc_ones, tmem_raw.subview(_SUM0_OFF), is_not_first_bmm2_epi)
+            if cutlass.const_expr(sum_mma):
+                _rowsum_chunk(0, sum_desc, tmem_raw.subview(LAYOUT.P0_OFF), desc_ones, tmem_raw.subview(_SUM0_OFF), is_not_first_bmm2_epi)
             bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 1].wait(bmm2_ready_phase, spin=SPIN_RING_WAITS)
             for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
                 mma_ts_step(
@@ -1843,7 +1851,8 @@ def _mma_warp_group(
             # the mb_bmm2_done[0] commit so that commit (which fires only after
             # the MMA pipeline drains) also orders the row-sum for correction's
             # read -- no extra barrier.  Plain kind::f8f6f4 (see sum_desc).
-            _rowsum_chunk(1, sum_desc, tmem_raw.subview(LAYOUT.P0_OFF), desc_ones, tmem_raw.subview(_SUM0_OFF), cutlass.Boolean(True))
+            if cutlass.const_expr(sum_mma):
+                _rowsum_chunk(1, sum_desc, tmem_raw.subview(LAYOUT.P0_OFF), desc_ones, tmem_raw.subview(_SUM0_OFF), cutlass.Boolean(True))
             if nvvm.elect_sync():
                 bars.mb_bmm2_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
 
@@ -1863,7 +1872,8 @@ def _mma_warp_group(
                 accum_b2 = cutlass.Boolean(True)
             # Row sum, chunk 0's K-phases: queued behind chunk 0's PV so the tensor pipe stays busy across the
             # wait for chunk 1 (same instructions and order as the former whole-tile call, see _rowsum_chunk).
-            _rowsum_chunk(0, sum_desc, tmem_raw.subview(LAYOUT.P1_OFF), desc_ones, tmem_raw.subview(_SUM1_OFF), is_not_first_bmm2_epi)
+            if cutlass.const_expr(sum_mma):
+                _rowsum_chunk(0, sum_desc, tmem_raw.subview(LAYOUT.P1_OFF), desc_ones, tmem_raw.subview(_SUM1_OFF), is_not_first_bmm2_epi)
             bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 1].wait(bmm2_ready_phase, spin=SPIN_RING_WAITS)
             for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
                 mma_ts_step(
@@ -1882,7 +1892,8 @@ def _mma_warp_group(
             # the mb_bmm2_done[1] commit so that commit (which fires only after
             # the MMA pipeline drains) also orders the row-sum for correction's
             # read -- no extra barrier.  Plain kind::f8f6f4 (see sum_desc).
-            _rowsum_chunk(1, sum_desc, tmem_raw.subview(LAYOUT.P1_OFF), desc_ones, tmem_raw.subview(_SUM1_OFF), cutlass.Boolean(True))
+            if cutlass.const_expr(sum_mma):
+                _rowsum_chunk(1, sum_desc, tmem_raw.subview(LAYOUT.P1_OFF), desc_ones, tmem_raw.subview(_SUM1_OFF), cutlass.Boolean(True))
             if nvvm.elect_sync():
                 bars.mb_bmm2_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
                 bars.mb_v_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
@@ -2417,7 +2428,7 @@ def _correction_warp_group(
     # right after O: the running denominator rescales by exactly the same alpha
     # as the running O, and the two are contiguous in TMEM precisely so one loop
     # does both.  The epilogue store loops keep the real TILE_O width.
-    N_CHUNKS_O_RESCALE = (CFG.TILE_O + _SIGMA_COLS) // O_CHUNK
+    N_CHUNKS_O_RESCALE = (CFG.TILE_O + (0 if lse_tensor is not None else _SIGMA_COLS)) // O_CHUNK
     # D_BLOCK_SIZE must use O_SWZ_B not V_SWZ_B — gptoss cga2 V drops to Swz64B while O stays Swz128B.
     # Sized in BPE_O so it stays consistent with the BPE_O-derived O_SWZ_BYTES (BF16/FP16 O).
     TMA_O_ITERS = (CFG.TILE_O * CFG.BPE_O) // CFG.O_SWZ_BYTES
@@ -2534,33 +2545,24 @@ def _correction_warp_group(
             # the existing _kv_empty guards on lse_val / O below then stay valid
             # because the denominator is forced to 0 on that path.
             _kv_empty = bounds.right <= bounds.left
-            _sum_vec = nvvm.tcgen05_ld(
-                "32x32b",
-                nvvm.make_tmem_ptr(tmem_base_epi + cutlass.Int32(tmem_O_off + CFG.TILE_O), cutlass.Float32),
-                num=1,
-            )
-            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+            if cutlass.const_expr(lse_tensor is not None):
+                _sum_word = stats_vec[1]
+            else:
+                _sum_vec = nvvm.tcgen05_ld(
+                    "32x32b",
+                    nvvm.make_tmem_ptr(tmem_base_epi + cutlass.Int32(tmem_O_off + CFG.TILE_O), cutlass.Float32),
+                    num=1,
+                )
+                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                _sum_word = _sum_vec[0]
             total_sum = cutlass.Float32(
                 arith.select(
                     _kv_empty.ir_value(),
                     cutlass.Float32(0.0).ir_value(),
-                    _sum_vec[0].ir_value(),
+                    _sum_word.ir_value(),
                 )
             )
-            # The LSE's denominator is the EXACT fp32 row-sum the softmax warps publish in
-            # stats word 1 when stats are requested (see _softmax_kv_body has_lse); the
-            # row-sum column above sums the QUANTIZED P, which normalizes O but is not the
-            # LSE cuDNN's backward recomputes P from.  Word 1 is dead (zeros) without
-            # stats.  Same empty-tile select so the -inf convention below holds on both.
             total_sum_lse = total_sum
-            if cutlass.const_expr(lse_tensor is not None):
-                total_sum_lse = cutlass.Float32(
-                    arith.select(
-                        _kv_empty.ir_value(),
-                        cutlass.Float32(0.0).ir_value(),
-                        stats_vec[1].ir_value(),
-                    )
-                )
 
             bars.mb_stat_empty[qs].arrive()
             # Release the MMA warp's NEXT-tile prologue BMM1 into this S_acc
