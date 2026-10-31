@@ -2412,10 +2412,9 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
             )
             and facts.b * facts.h_q * _ceil_div(facts.s_q, tile_q) <= (facts.device_sm_count or 0)
         ):
-            # Unsplit native D64 without a window: while the unpacked launch fits one wave, every CTA streams the whole
-            # KV once either way and the packed CTA also computes G heads' rows. MEASURED (cc 10.7, 216 SMs, cuDNN
-            # 9.27.0.42, 2026-10-31, sink, s_q 1-4, KV 4k / 128k): packed 1.04-1.18x of unpacked on all 60 one-wave
-            # cells, 0.09-0.66x on all 54 past one wave; with a window packed is 0.14-1.03x.
+            # Unsplit native D64 without a window: while the unpacked launch fits one wave, every CTA streams the whole KV once
+            # either way and the packed CTA also computes G heads' rows, so unpacked leads; past one wave, or under a window,
+            # packed does (measured on cc 10.7 across s_q 1-4 and KV 4k-128k with sinks, 2026-10-31; PR #2118).
             wins = False
         if _sm107_fp8_dense_d128(caps, facts):
             # Packed never trails unpacked here at any S_q: unpacked pads every head's last 512-row tile (q576: 1.43-1.75x

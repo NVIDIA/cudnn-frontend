@@ -365,7 +365,7 @@ longer cache (equal Q and KV extents and, with packed totals declared, equal tot
 
 from __future__ import annotations
 
-import dataclasses
+import copy
 
 import cudnn
 
@@ -543,7 +543,10 @@ def place(spec, facts) -> str:
     from cudnn.sdpa import placement_table
 
     if facts.causal and not facts.bottom_right and facts.s_q == facts.s_kv:
-        facts = dataclasses.replace(facts, bottom_right=True)  # a square causal mask covers the same tiles from either corner
+        # A square causal mask covers the same tiles from either corner (placement_table.class_key reads it the same way);
+        # a shallow copy, as dataclasses.replace re-runs every field's init.
+        facts = copy.copy(facts)
+        object.__setattr__(facts, "bottom_right", True)
     measured = placement_table.lookup(spec.name, facts)
     if measured is not None:
         return LEAD if measured else TRAIL

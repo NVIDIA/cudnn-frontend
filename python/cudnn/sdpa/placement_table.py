@@ -91,7 +91,7 @@ def class_key(row: str, facts) -> Optional[Tuple]:
     if facts.window_left is not None:
         mask = "window"
     elif facts.causal and not (facts.s_q == 1 and facts.bottom_right):  # one bottom-right row sees every key: no mask
-        mask = "causal_br" if facts.bottom_right else "causal_tl"
+        mask = "causal_br" if facts.bottom_right or facts.s_q == facts.s_kv else "causal_tl"  # a square reads the same from either corner
     else:
         mask = "none"
     group = "mha" if facts.h_q == facts.h_kv else ("gqa_unpacked" if _unpacked_decode(row, facts) else "gqa")
@@ -132,7 +132,12 @@ def log2_kv(facts) -> float:
     return math.log2(max(1, facts.s_kv))
 
 
-FEATURES = {"cost": log2_work, "tiles": log2_tiles, "rows": log2_q_rows, "kv": log2_kv}
+def log2_q(facts) -> float:
+    """log2 of the query tokens per request: separates decode-shaped graphs (one Q tile) from prefill in a class that holds both."""
+    return math.log2(max(1, facts.s_q))
+
+
+FEATURES = {"cost": log2_work, "tiles": log2_tiles, "rows": log2_q_rows, "kv": log2_kv, "q": log2_q}
 """The scalars a class may be thresholded on; the generator picks, per class, the one its data is monotone in."""
 
 
