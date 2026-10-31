@@ -357,6 +357,14 @@ _E2E_ENABLED = bool(PARAMS.exp2_fma_split) and ((PARAMS.d_flavor != 64 and (_E2E
 _D64_EARLY_SOFTMAX_HANDOFF = bool(
     _E2E_ENABLED and _E2E_D64_INTERIOR and CFG.TILE_M == 128 and CFG.TILE_N == 128 and CFG.TILES_Q == 2 and CFG.S_SLOTS == 1 and CFG.Q_IN_TMEM == 0
 )
+# The SM100 D64/CGA1 schedule benefits from one max tree across both score
+# chunks before alpha publication. Keep other geometries on their existing tree.
+_D64_JOINT_ROW_MAX = _D64_EARLY_SOFTMAX_HANDOFF and CFG.CTA_MMA == 1
+# Join the masked row maxima for packed paged D128 on the measured SM100
+# geometry; the live-tile tree and all synchronization remain unchanged.
+_D128_PAGED_JOINT_ROW_MAX = bool(
+    _E2E_ENABLED and _E2E_PAGED_INTERIOR and CFG.TILE_M == 128 and CFG.TILE_N == 128 and CFG.CTA_MMA == 2 and CFG.PACK_GQA and CFG.PACK_G >= 4
+)
 _E2E_EMULATED_COLS = (_E2E_LIMIT // _E2E_FREQ) * _E2E_RES if _E2E_ENABLED else 0
 if _E2E_ENABLED:
     if not (0 <= _E2E_RES <= _E2E_FREQ and _E2E_FREQ % 2 == 0 and _E2E_RES % 2 == 0 and _E2E_LIMIT % _E2E_FREQ == 0):
@@ -2498,7 +2506,12 @@ def _softmax_kv_body(
             )
             for c in range(N_CHUNKS)
         ]
-        chunks_max = [row_max_reduction(chunks_S[c]) for c in range(N_CHUNKS)]
+        if cutlass.const_expr(_D64_JOINT_ROW_MAX or _D128_PAGED_JOINT_ROW_MAX):
+            chunks_max = [
+                row_max_reduction(cutlass.Vector.from_elements(tuple(chunks_S[c][i] for c in range(N_CHUNKS) for i in range(CHUNK)), cutlass.Float32))
+            ]
+        else:
+            chunks_max = [row_max_reduction(chunks_S[c]) for c in range(N_CHUNKS)]
         from cudnn.frost.tile_dsl.regtile import vec_concat
 
         # vec_concat handles single-element lists too; keeps tracer Vector type uniform across N_CHUNKS.
@@ -2542,7 +2555,12 @@ def _softmax_kv_body(
             )
             for c in range(N_CHUNKS)
         ]
-        chunks_max = [row_max_reduction(raw_chunks[c]) for c in range(N_CHUNKS)]
+        if cutlass.const_expr(_D64_JOINT_ROW_MAX):
+            chunks_max = [
+                row_max_reduction(cutlass.Vector.from_elements(tuple(raw_chunks[c][i] for c in range(N_CHUNKS) for i in range(CHUNK)), cutlass.Float32))
+            ]
+        else:
+            chunks_max = [row_max_reduction(raw_chunks[c]) for c in range(N_CHUNKS)]
         reg_S_vec = vec_concat(raw_chunks)
         current_max_unscaled = chunks_max[0]
         for m in chunks_max[1:]:
@@ -2651,7 +2669,10 @@ def _softmax_kv_body(
 
     new_p_sum_pair = hoisted_sum
     if cutlass.const_expr(N_CHUNKS == 2):
-        new_p_sum_pair = new_p_sum_pair + row_reduction_pair(deferred_P_1)
+        # At D64/CGA1 the balanced tail sum shortens the dependency chain.
+        # Keep chunk 0 sequential: its sum overlaps the P conversion/publication,
+        # and balancing it regresses complete attention. CGA2 retains its schedule.
+        new_p_sum_pair = new_p_sum_pair + row_reduction_pair(deferred_P_1, balanced=_D64_EARLY_SOFTMAX_HANDOFF and CFG.CTA_MMA == 1)
     alpha_pair = cutlass.Vector.from_elements((alpha, alpha), cutlass.Float32)
     total_sum = total_sum * alpha_pair + new_p_sum_pair
 
@@ -3308,6 +3329,14 @@ def _correction_warp_group(
     # at 32, DSL regalloc spilled correction-warp regs to the stack.
     O_CHUNK = 16
     N_CHUNKS_O = CFG.TILE_O // O_CHUNK
+    # Keep alpha-rescale fragments at 16; its larger live range previously spilled.
+    # Final normalization has a different live set and may use a wider fragment.
+    O_CHUNK_EPI = (
+        32
+        if (CFG.TILE_K == 64 and CFG.TILE_O == 64 and CFG.CTA_MMA == 1 and STORAGE_DTYPE == cutlass.BFloat16 and SPLIT_KV == 1 and not CFG.THD_VARLEN)
+        else O_CHUNK
+    )
+    N_CHUNKS_O_EPI = CFG.TILE_O // O_CHUNK_EPI
     # Use O_SWZ_B (NOT V_SWZ_B): under cga2 V is split along d_v and may drop
     # to a narrower swizzle while O is full-row.  V-based stride here silently
     # produces correct TMEM but garbled SMEM → wrong O after TMA-STG.
@@ -3591,21 +3620,21 @@ def _correction_warp_group(
                     q_row_global,
                     row_head_idx,
                     CFG.TILE_O,
-                    O_CHUNK,
+                    O_CHUNK_EPI,
                 )
                 bars.mb_o_empty[qs].wait(o_empty_phase)
             else:
-                for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
+                for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O_EPI):
                     o_fp16 = cutlass.Vector.from_elements(
-                        tuple(STORAGE_DTYPE(0.0) for _ in range(O_CHUNK)),
+                        tuple(STORAGE_DTYPE(0.0) for _ in range(O_CHUNK_EPI)),
                         STORAGE_DTYPE,
                     )
                     if cutlass.const_expr(not MAY_BE_EMPTY) or (bounds.right > bounds.left):
-                        o_addr = tmem_base_epi + cutlass.Int32(tmem_O_off + chunk_idx * O_CHUNK)
+                        o_addr = tmem_base_epi + cutlass.Int32(tmem_O_off + chunk_idx * O_CHUNK_EPI)
                         o_chunk = nvvm.tcgen05_ld(
                             "32x32b",
                             nvvm.make_tmem_ptr(o_addr, cutlass.Float32),
-                            num=O_CHUNK,
+                            num=O_CHUNK_EPI,
                         )
                         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                         o_scaled = o_chunk * inv_sum
@@ -3618,11 +3647,11 @@ def _correction_warp_group(
                             # row: total_sum == 0, the value a dead sub-tile's rows publish) rides the same select.  Without per-batch Q
                             # lengths a dead sub-tile's rows are all >= S_q, which the O descriptor clips and the Stats store guards, so the
                             # select is confined to this arm: every rendering without it is byte-identical.
-                            o_scaled = vec_select_zero(row_trim | row_dead, o_scaled, O_CHUNK)
+                            o_scaled = vec_select_zero(row_trim | row_dead, o_scaled, O_CHUNK_EPI)
                         o_fp16 = o_scaled.to(STORAGE_DTYPE)
 
-                    col_offset_const = (chunk_idx * O_CHUNK) % D_BLOCK_SIZE
-                    block_idx_const = (chunk_idx * O_CHUNK) // D_BLOCK_SIZE
+                    col_offset_const = (chunk_idx * O_CHUNK_EPI) % D_BLOCK_SIZE
+                    block_idx_const = (chunk_idx * O_CHUNK_EPI) // D_BLOCK_SIZE
                     block_offset_const = block_idx_const * TMA_O_GRANU_ELEMS
                     smem_offset = cutlass.Int32(block_offset_const + col_offset_const) + tid_in_wg * cutlass.Int32(D_BLOCK_SIZE)
 

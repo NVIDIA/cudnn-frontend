@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 
 from cudnn.frost.compiled_cache import positional_entry
 
-ROLES = ("q", "k", "v", "o", "stats", "seq_kv", "seq_q", "sink", "bias", "rope")
+ROLES = ("q", "k", "v", "o", "stats", "seq_kv", "seq_q", "sink", "bias")
 
 
 @dataclass(frozen=True)
@@ -40,15 +40,12 @@ class LaunchSpec:
 
 def native_layouts(api):
     """Admit declarations the vector loads/stores can serve without staging."""
-    return (
-        not api._rope_max_s
-        and api.head_dim_v == api.flavor_d_v
-        and api.head_dim_qk % 8 == 0
-        and all(all(n == 1 or st % 8 == 0 for n, st in zip(desc.shape[:-1], desc.stride[:-1])) for desc in (api.q_desc, api.k_desc, api.v_desc, api.o_desc))
-    )
+    from cudnn.sdpa.native_sm80 import forward_adapter_mismatch
+
+    return forward_adapter_mismatch(api) is None
 
 
-def build_spec(api, *, compiler=None):
+def build_spec(api):
     from cudnn.frost.buffers import is_contiguous
     from cudnn.frost.compiled_cache import template_key
     from cudnn.sdpa.fwd.kernels.sm80.prepared_host import compile_host
@@ -86,15 +83,13 @@ def build_spec(api, *, compiler=None):
     else:
         operands.append(None)
         geometry.append(None)
-    if api._rope_max_s:
-        add((api._rope_max_s, api.flavor_d_qk // 2, 2), (api.flavor_d_qk, 2, 1), "float32", 4)
     geometry = tuple(geometry)
     key = template_key(
         vars(api._k_mod),
         dict(geometry=geometry, swa_window=api.swa_window_runtime, right_bound=api.right_bound_runtime),
         "prepared_dense",
     )
-    artifact = (compile_host if compiler is None else compiler)(api._k_mod, api._params, geometry, api.swa_window_runtime, api.right_bound_runtime, key)
+    artifact = compile_host(api._k_mod, api._params, geometry, api.swa_window_runtime, api.right_bound_runtime, key)
     fn = positional_entry(artifact)
     if fn is None:
         raise NotImplementedError("SM80 prepared forward requires a positional tvm-ffi entry")
@@ -102,7 +97,7 @@ def build_spec(api, *, compiler=None):
 
 
 def bind(spec, facts, stream_int, *, scale=None, overridden=None, raw_storage=False):
-    """Bind staged metadata through the template's sole native contract."""
+    """Bind native metadata through the template's sole native contract."""
     from .prepared import _native_pack_from_facts
 
     roles = ROLES[: len(spec.operands)]

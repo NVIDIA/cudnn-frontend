@@ -1364,7 +1364,7 @@ def grouped_gemm_dglu_wrapper_sm100(
     """Dispatch grouped GEMM dGLU once from an immutable normalized call.
 
     ``deterministic=True`` makes ``dprob`` bit-identical run to run (block-scaled kernel, torch,
-    no dbias). See docs/fe-oss-apis/gemm_fusions/grouped_gemm_dglu.md.
+    no dbias). See docs/operations/gemm_fusions/grouped_gemm_dglu.md.
     """
     if b_tensor is not None and detect_framework(a_tensor) == "jax":
         from ..canonical_jax import check_jax_wrapper_options

@@ -10,11 +10,24 @@ import torch
 import cudnn
 
 
+def _uses_fp4(node):
+    """A case quantizes to fp4 unless its ``quantization`` parameter or its name says fp8."""
+    callspec = getattr(node, "callspec", None)
+    if callspec is not None and "quantization" in callspec.params:
+        return callspec.params["quantization"] == "fp4"
+    return "fp8" not in node.originalname
+
+
 @pytest.fixture(autouse=True)
-def supported_device():
+def supported_device(request):
+    from cudnn.frost.device import FP4_CONVERT_CCS, PORTABLE_ELEMENTWISE_CCS
+
     pytest.importorskip("triton", minversion="3.7.0")
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("FROST RoPE QDQ requires SM100")
+    cc = torch.cuda.get_device_capability()
+    if cc not in PORTABLE_ELEMENTWISE_CCS:
+        pytest.skip(f"FROST RoPE QDQ requires cc {PORTABLE_ELEMENTWISE_CCS}")
+    if cc not in FP4_CONVERT_CCS and _uses_fp4(request.node):
+        pytest.skip(f"FROST RoPE QDQ fp4 requires cc {FP4_CONVERT_CCS} (e2m1x2 converts)")
 
 
 def reference(x, cache, positions, quantization, group_size=32):
@@ -303,6 +316,29 @@ def test_unsupported_format_combinations(quantization, group_size, scale_format)
     args = inputs((2, 512), group_size=16)
     with pytest.raises(ValueError, match="supported .*quantization, group_size, scale_format"):
         cudnn.RopeQDQInplace(*args[:3], quantization=quantization, group_size=group_size, scale_format=scale_format).check_support()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("cc", [(8, 0), (9, 0), (10, 0), (10, 3), (12, 0), (12, 1)])
+def test_architecture_gate_fp4_and_fp8(cc, monkeypatch):
+    """fp8 is served on every portable part; fp4 (e2m1x2 converts) on SM100 / SM103 / SM120. SM121 is not served yet.
+
+    The served matrix is spelled out here rather than read from ``qdq``, so a change to the
+    capability sets has to change this test too."""
+    served = {
+        "fp8": {(9, 0), (10, 0), (10, 3), (12, 0)},
+        "fp4": {(10, 0), (10, 3), (12, 0)},
+    }
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: cc)
+    for quantization, group_size, scale_format in (("fp4", 32, "ue8m0"), ("fp4", 16, "e4m3"), ("fp8", 32, "ue8m0")):
+        dim = 128 if (quantization, group_size) == ("fp4", 32) else 512
+        x, cache, positions, *_ = inputs((4, 1, dim), quantization=quantization, group_size=group_size)
+        op = cudnn.RopeQDQInplace(x, cache, positions, quantization=quantization, group_size=group_size, scale_format=scale_format)
+        if cc in served[quantization]:
+            assert op.check_support()
+        else:
+            with pytest.raises(NotImplementedError, match=rf"{quantization} supports cc .* got \({cc[0]}, {cc[1]}\)"):
+                op.check_support()
 
 
 @pytest.mark.L0

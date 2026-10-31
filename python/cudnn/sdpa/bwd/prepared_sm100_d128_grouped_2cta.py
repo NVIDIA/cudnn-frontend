@@ -15,11 +15,12 @@ from types import SimpleNamespace
 from cudnn.frost.compiled_cache import positional_entry
 from .config_sm100_d128_accum_2cta import resolve_diag_2cta
 from .config_sm100_d128_accum_2cta_stail import (
-    DBG_CLK,
     dbg_clk_records,
     dbg_clk_region_offset,
+    dbg_clk_for_stats_form,
     resolve_debug_clk,
     resolve_mask_form,
+    resolve_stats_form,
     resolve_warp_roles,
     validate_fields_for_roles,
 )
@@ -191,6 +192,17 @@ def warp_roles(api):
         raise ValueError(f"{api._NAME}: {error}") from None
 
 
+def stats_form(api):
+    """The adapter record's STATS FORM of the pair body (``SdpaBwdDslSm100D128.stats_form``: a name of the s_tail body's ``CFG.STATS_FORMS`` --
+    "tma_ring" (the default: the loader-fed two-stage SMEM stats ring; the delta launch pre-scales both rows; bitwise the same stats) | "ldg"
+    (the previous default: the softmax's per-tile LDG fetch under a named-barrier pair) -- or ``None`` = the role shape's form: "tma_ring" under
+    the default roles, "ldg" under "16w_fa4"), typed: a ``ValueError`` names the field, the domain and the map."""
+    try:
+        return resolve_stats_form(getattr(api, "stats_form", None), warp_roles(api))
+    except ValueError as error:
+        raise ValueError(f"{api._NAME}: {error}") from None
+
+
 def diag_2cta(api):
     """The adapter record's DIAGNOSTIC probe (``SdpaBwdDslSm100D128.diag_2cta``: a ``CFG.DIAG_2CTA_NAMES`` name or ``None`` = no probe,
     the shipped body), typed: a ``ValueError`` names the field and the domain.  A set value makes the OUTPUT WRONG BY DESIGN."""
@@ -210,6 +222,20 @@ def debug_clk(api):
         raise ValueError(f"{api._NAME}: {error}") from None
 
 
+def debug_clk_record(api):
+    """The STAMPS record of this adapter's rendering: the ONE value the carve (``check_support``), the dump reader (``debug_clk_records``) and
+    the tests read -- the record of the stats form and the role shape the body renders (``dbg_clk_for_stats_form``: 88 words under the default
+    tma_ring layout, 96 under ldg; the same word map), its WORDS / BYTES the bar block's spare DERIVED from that layout ((TMEM_HANDLE - the
+    layout's end) / 4; config = truth, never a literal) and asserted here against the form's geometry, so a layout change can never leave a
+    stale record size behind."""
+    from .config_sm100_d128_accum_2cta_stail import cfg_for_stats_form
+
+    form, roles = stats_form(api), warp_roles(api)
+    record = dbg_clk_for_stats_form(form, roles)
+    assert record.BYTES == 4 * record.WORDS == cfg_for_stats_form(form, roles).TMEM_HANDLE - record.SMEM, (form, roles, record)
+    return record
+
+
 def debug_clk_records(api, workspace):
     """The STAMPS dump of the LAST ``execute`` as an Int32 view ``[records, DBG_CLK.WORDS]`` of the caller's workspace tensor (the bytes the s_tail
     kernel wrote; no copy, no sync: the caller synchronizes); ``None`` when the lever is off.  Record r = the MAIN kernel's linear CTA
@@ -221,8 +247,9 @@ def debug_clk_records(api, workspace):
     import torch
 
     offset, n_rec = region
+    d = debug_clk_record(api)  # the record by stats form (88 words under the default tma_ring, 96 under ldg; the same word map)
     base = dbg_clk_region_offset(workspace.data_ptr()) - workspace.data_ptr() + offset
-    return workspace[base : base + n_rec * DBG_CLK.BYTES].view(torch.int32).view(n_rec, DBG_CLK.WORDS)
+    return workspace[base : base + n_rec * d.BYTES].view(torch.int32).view(n_rec, d.WORDS)
 
 
 def check_support(api):
@@ -240,26 +267,30 @@ def check_support(api):
         validate_thd_bounds(b, h, hk, sq, sk, api._thd_t_q, api._thd_t_kv, api._thd_t_q_phys, api._thd_t_kv_phys)
     except ValueError as error:
         require(False, str(error))
-    api._grouped_workspace_regions, api._grouped_workspace_bytes = thd_workspace_layout(b, h, api._thd_t_q, api._thd_t_kv)
     # The body's whole typed field bundle, resolved HERE: a value outside a domain is a ValueError BY NAME at support time (never first at
     # compile, after auto committed to the pair); then the role shape's cross-field rule (config_sm100_d128_accum_2cta_stail.
     # validate_fields_for_roles): a combination that is not built is a typed DECLINE -- under cta_pair=auto the dispatch then serves the
-    # one-CTA body with this text in its reason, under on it is the answer.
+    # one-CTA body with this text in its reason, under on it is the answer.  ``stats_form`` joins the bundle (tma_ring x 16w_fa4 declines here).
     mask_form(api)
-    roles, probe, stamps, accum = warp_roles(api), diag_2cta(api), debug_clk(api), dkv_accum(api)
+    roles, probe, stamps, accum, form = warp_roles(api), diag_2cta(api), debug_clk(api), dkv_accum(api), stats_form(api)
     try:
-        validate_fields_for_roles(roles, probe, debug_clk=stamps, dkv_accum=accum)
+        validate_fields_for_roles(roles, probe, debug_clk=stamps, dkv_accum=accum, stats_form=form)
     except ValueError as error:
         require(False, str(error))
+    # stats_form = tma_ring (s_tail only; typed above; the default): the compact delta region becomes the q-tile-padded pre-scaled stats region +
+    # the padded row offsets (the contract's layout under ``stats_ring``); the ldg layout is the merged one
+    ring = form == "tma_ring"
+    api._grouped_workspace_regions, api._grouped_workspace_bytes = thd_workspace_layout(b, h, api._thd_t_q, api._thd_t_kv, ring)
     api._dbg_clk_region = None
     if debug_clk(api):
         # STAMPS (s_tail only; typed above): the Int32 record dump of every CTA of the MAIN grid, carved PAST the chain's regions at the first
         # 256-B boundary (config dbg_clk_region_offset / dbg_clk_records: the prepared host derives the same offset and count at launch);
-        # the kernel writes every record at exit, so no zeroing; the caller's workspace grows by the region only under the lever.
-        offset = dbg_clk_region_offset(thd_workspace_offsets(b, h, api._thd_t_q, api._thd_t_kv)[-1])
+        # the kernel writes every record at exit, so no zeroing; the caller's workspace grows by the region only under the lever; the record's
+        # size follows the stats form (96 words under ldg, 88 under tma_ring: the re-based bar block's spare).
+        offset = dbg_clk_region_offset(thd_workspace_offsets(b, h, api._thd_t_q, api._thd_t_kv, ring)[-2])
         n_rec = dbg_clk_records(b, h, sk)
         api._dbg_clk_region = (offset, n_rec)
-        api._grouped_workspace_bytes = max(api._grouped_workspace_bytes, offset + n_rec * DBG_CLK.BYTES + WORKSPACE_SLACK)
+        api._grouped_workspace_bytes = max(api._grouped_workspace_bytes, offset + n_rec * debug_clk_record(api).BYTES + WORKSPACE_SLACK)
     api._implementation = IMPLEMENTATION
     api._is_supported = True
     return True
@@ -313,6 +344,7 @@ def compile_plan(api):
             mask_form=mask_form(api),
             dkv_accum=dkv_accum(api),
             warp_roles=warp_roles(api),
+            stats_form=stats_form(api),
         )
     fn = positional_entry(entry)
     if fn is None:

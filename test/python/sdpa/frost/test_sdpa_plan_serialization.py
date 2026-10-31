@@ -24,7 +24,7 @@ from frost_test_utils import select_engine, _SM
 from cudnn.sdpa.fwd.engines import engine_name
 b, h, s, d = 2, 8, 256, 128
 torch.manual_seed(0)
-# BSHD binds in place; contiguous BHSD adds the staged-copy kernels, so its plan carries several.
+# Both layouts bind in place; a split plan carries attention and combine artifacts.
 BHSD = os.environ.get("PLAN_TEST_LAYOUT") == "bhsd"
 alloc = (lambda f: f(b, h, s, d)) if BHSD else (lambda f: f(b, s, h, d).transpose(1, 2))
 mk = lambda: alloc(lambda *shape: torch.randn(*shape, device="cuda", dtype=torch.bfloat16))
@@ -44,7 +44,13 @@ q, k, v = (g.tensor_like(t).set_uid(UIDS[n]) for n, t in (("q", q_gpu), ("k", k_
 o, _ = g.sdpa(name="sdpa", q=q, k=k, v=v, generate_stats=False, attn_scale=1.0 / math.sqrt(d), use_causal_mask=True)
 o.set_output(True).set_dim(q_gpu.shape).set_stride(q_gpu.stride()).set_uid(UIDS["o"])
 g.validate(); g.build_operation_graph(); g.create_execution_plans([cudnn.heur_mode.A])
-select_engine(g, engine_name(arch="sm107" if _SM == 107 else "sm100")); g.check_support(); g.build_plans()
+select_engine(g, engine_name(arch="sm107" if _SM == 107 else "sm100"))
+if BHSD:
+    engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
+    knobs[cudnn.knob_type.SPLIT_KV] = 2
+    g.create_execution_plan(engine, knobs)
+    g.select_plan(len(g.plans) - 1)
+g.check_support(); g.build_plans()
 digest = run(g)
 open(sys.argv[1], "wb").write(g.serialize(as_bytes=True))
 open(sys.argv[1] + ".bare", "wb").write(g.serialize(as_bytes=True, include_kernels=False))

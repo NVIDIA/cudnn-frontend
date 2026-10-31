@@ -705,6 +705,7 @@ def _run_fp8(
     request_amax=_AMAX,
     ws_poison=None,
     attn_scale=None,
+    d_v=None,
 ):
     """Quantize unit-normal operands per tensor, run the oracle (forward for O / Stats, then backward with the oracle's
     Stats injected -- the kernel recomputes P from the forward's exact LSE), build the graph with the contract's twelve
@@ -713,23 +714,25 @@ def _run_fp8(
     ``ws_poison`` (a BYTE, 0xFF = NaN in e4m3 / bf16 / fp32) pre-fills the WORKSPACE before every run, so a stage-3 GEMM
     reading a dS tile the main kernel skipped lands NaN in an output (``check`` asserts finite first).  ``left`` without
     ``causal`` is a sliding window alone.  ``attn_scale`` (None = 1/sqrt(d)) declares an EXPLICIT scale on the graph and the
-    oracle alike -- 0.0 included, a valid scale the adapter must preserve."""
+    oracle alike -- 0.0 included, a valid scale the adapter must preserve.  ``d_v`` (None = ``_D``) is the value head
+    dimension of V / O / dO / dV for the rectangular rows."""
     from sdpa.fp8_ref import compute_ref, compute_ref_backward
     from sdpa.helpers import get_fp8_descale_factor, get_fp8_scale_factor
     from sdpa.ref_cache import cached_reference  # a node-local DISK cache of oracle outputs; off unless CUDNN_TEST_REF_CACHE names a dir
 
     hkv = hq if hkv is None else hkv
+    d_v = _D if d_v is None else d_v
     dev = "cuda"
     gen = torch.Generator(device="cpu").manual_seed(seed)
 
-    def draw(bb, s, h):
-        return torch.randn(bb, s, h, _D, generator=gen).to(dev)  # [B, S, H, D] storage
+    def draw(bb, s, h, d=_D):
+        return torch.randn(bb, s, h, d, generator=gen).to(dev)
 
     def quant(x):
         scale = get_fp8_scale_factor(x.abs().max().item(), _T_E4M3)
         return (x * scale).to(_T_E4M3), 1.0 / scale
 
-    q32, do32, k32, v32 = draw(b, sq, hq), draw(b, sq, hq), draw(b, skv, hkv), draw(b, skv, hkv)
+    q32, do32, k32, v32 = draw(b, sq, hq), draw(b, sq, hq, d_v), draw(b, skv, hkv), draw(b, skv, hkv, d_v)
     q8, q_ds = quant(q32)
     k8, k_ds = quant(k32)
     v8, v_ds = quant(v32)
@@ -746,7 +749,7 @@ def _run_fp8(
     # stack at the call), so an edit here is a miss; `quant` scales through sdpa/helpers.py, a listed reference source.
     fwd_key = ("fwd", b, hq, hkv, sq, skv, causal, bottom_right, left, seed, scale)
     _KEY_NAMES = ("b", "hq", "hkv", "sq", "skv", "causal", "bottom_right", "left", "seed", "scale")
-    _disk_key_common = dict(d=_D, in_dtype=str(_T_E4M3))
+    _disk_key_common = dict(d=_D, in_dtype=str(_T_E4M3)) if d_v == _D else dict(d=_D, d_v=d_v, in_dtype=str(_T_E4M3))
 
     def _fwd_oracle():
         return compute_ref(q8, k8, v8, scale, q_ds, k_ds, v_ds, s_scale, s_descale, _T_E4M3, _T_E4M3, left_bound=left, right_bound=right, diag_align=align)
@@ -815,6 +818,7 @@ def _run_fp8(
         _D,
         hkv=hkv,
         skv=skv,
+        d_v=d_v,
         causal=causal,
         bottom_right=bottom_right,
         left_bound=left,
@@ -829,7 +833,7 @@ def _run_fp8(
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
-    outs_t = {n: torch.empty(sh, device=dev, dtype=grad_dtype) for n, sh in (("dQ", (b, sq, hq, _D)), ("dK", (b, skv, hkv, _D)), ("dV", (b, skv, hkv, _D)))}
+    outs_t = {n: torch.empty(sh, device=dev, dtype=grad_dtype) for n, sh in (("dQ", (b, sq, hq, _D)), ("dK", (b, skv, hkv, _D)), ("dV", (b, skv, hkv, d_v)))}
     amax_t = {n: torch.full((1, 1, 1, 1), float("nan"), device=dev, dtype=torch.float32) for n in ("dQ", "dK", "dV", "dP") if f"amax_{n}" in request_amax}
     pack = {
         ts["q"]: _view_bhsd(q8),

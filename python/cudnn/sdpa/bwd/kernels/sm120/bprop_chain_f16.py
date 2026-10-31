@@ -270,8 +270,8 @@ class SM120DetDqGemmKernel:
             for col_frag in cutlass.range_constexpr(DQ_COL_FRAGS):
                 col = col_frag * 8 + 2 * p_lane
                 off = col_frag * 4
-                base_top = ((batch * S_Q + r0) * H_Q + q_head) * D + col
-                base_bot = ((batch * S_Q + r8) * H_Q + q_head) * D + col
+                base_top = ((wide_index(batch, dq) * S_Q + r0) * H_Q + q_head) * D + col
+                base_bot = ((wide_index(batch, dq) * S_Q + r8) * H_Q + q_head) * D + col
                 if (not cutlass.const_expr(PARTIAL_Q)) or (r0 < S_Q):
                     (dq_ptr + base_top).store(
                         pack_half2(acc_dq[off + 0] * attn_scale, acc_dq[off + 1] * attn_scale, io_dtype),
@@ -352,7 +352,7 @@ def convert_dq_kernel(
 
     t_row = tidx // 32
     t_col = tidx % 32
-    dq_accum_base = ((batch * S_Q_R + q_block * Q_TILE) * H + head) * D_QK
+    dq_accum_base = ((wide_index(batch, dq_accum) * S_Q_R + wide_index(q_block, dq_accum) * Q_TILE) * H + wide_index(head, dq_accum)) * D_QK
     for row_blk in cutlass.range_constexpr(DQ_ROW_BLOCKS):
         for col_frag in cutlass.range_constexpr(DQ_COL_FRAGS):
             frag = cutlass.Array(cutlass.Float32, 4)

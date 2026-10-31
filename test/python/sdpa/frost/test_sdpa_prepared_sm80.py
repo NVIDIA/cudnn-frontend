@@ -139,7 +139,7 @@ def _check(case):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("dq,dv", [(64, 64), (96, 128), (128, 128), (192, 128), (256, 256)])
+@pytest.mark.parametrize("dq,dv", [(48, 32), (64, 64), (64, 96), (96, 128), (128, 128), (192, 112), (192, 128), (224, 208), (256, 256)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["bshd", "bhsd", "gapped"])
 def test_sm80_prepared_native_layouts(dq, dv, dtype, layout):

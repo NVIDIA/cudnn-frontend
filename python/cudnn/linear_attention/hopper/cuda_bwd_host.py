@@ -340,11 +340,12 @@ def launch(
     total_tokens: int,
     n_heads: int,
     n_seqs: int,
+    scale: float,
 ) -> None:
     """One backward pass: k_meta (varlen only), k_prep, k_scan_t, k_bwd.
 
-    All tensor arguments are device addresses. Restated from the artifact's
-    ``kda_bwd_launch``.
+    All tensor arguments are device addresses; ``scale`` is the query scale the
+    forward applied. Restated from the artifact's ``kda_bwd_launch``.
     """
     lib = library(device)
     ws, ncs, _ = _layout(workspace, total_tokens, n_heads, n_seqs)
@@ -375,7 +376,7 @@ def launch(
         prep = _Params()
         for address in (q, k, v, g, beta, dO, ws["cs_t0"], ws["cs_len"], ws["amat"], ws["wneg"], ws["uu"], ws["kg"], ws["pmat"], ws["gn2"], ws["dvl"]):
             prep.ptr(address)
-        prep.i32(T).i32(H).b(single_sequence)
+        prep.i32(T).i32(H).f32(scale).b(single_sequence)
         compiler.launch(
             lib.function(f"k_prep<{'true' if full else 'false'}>"),
             grid=(ncs, H, 1),
@@ -435,7 +436,7 @@ def launch(
         bwd = _Params()
         for address in (q, k, v, g, beta, dO, ws["amat"], ws["vnew"], ws["dv2"], ws["hst"], ws["dhst"], ws["cs_t0"], ws["cs_len"], dq, dk, dv, dg, dbeta):
             bwd.ptr(address)
-        bwd.i32(T).i32(H).b(single_sequence)
+        bwd.i32(T).i32(H).f32(scale).b(single_sequence)
         compiler.launch(
             lib.function(f"k_bwd<{'true' if full else 'false'}>"),
             grid=(ncs, H, 1),

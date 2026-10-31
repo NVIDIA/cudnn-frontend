@@ -1,55 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""The LayerNorm-prologue gated dual GEMM substrate -- host side (params, geometry, build, launch).
+"""Configure and launch LayerNorm-prologue gated dual GEMMs.
 
-What it computes, per pair row ``r`` of a ``[rows, K]`` bf16 activation ``z`` (``K`` = the LayerNorm width = the GEMM's K):
-
-    x      = LayerNorm_K(z[r, :]; gamma, beta, eps)                      fp32 statistics, rounded ONCE to bf16 (the MMA operand)
-    acc    = x @ W^T                                                       W = [2 * c_out, K] bf16, fp32 accumulation
-    out[r, n] = sigmoid(acc[r, gate(n)] + b_g[n]) * (acc[r, value(n)] + b_p[n]) * mask[r]      n < c_out, fp32, rounded once to bf16
-
-with the VALUE column of output channel ``n`` and its GATE column in the SAME 256-wide GEMM N tile: the weight rows are
-INTERLEAVED per 128-channel block as ``[W_p[128j : 128j + 128]; W_g[128j : 128j + 128]]`` (:func:`interleave_value_gate`), so
-every N tile is ``[value block | gate block]`` and the epilogue pairs local columns ``n`` and ``128 + n`` thread-locally.
-``mask[r]`` is a per-row scalar applied in fp32 BEFORE the bf16 rounding; a zero mask row stores EXACTLY ``+0.0`` (a select, never
-``x * 0`` -- ``sdpa-invariants.md`` S 2) and a 256-row tile whose rows are all masked skips its MMA by a warp vote (bitwise the same
-output).  Several ``passes`` (the triangle multiplicative update's ``a`` and ``b`` projections) share one activation and take
-their own weight / bias / output plane; the per-row ``(mean, rstd)`` of the LayerNorm go to GMEM once (pass 0) for a backward.
-
-The kernel BODY is the rendered FROST GEMM template (``gemm/frost/sm100/kernel_templates/sm100_matmul.py``,
-``CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma``: a cta_group::2 pair computing 256 pair rows x 256 columns, K
-streamed in 64-wide stages, persistent CLC scheduler) plus two arms -- a LayerNorm PROLOGUE on the A stages in SMEM (4 extra
-warps, one pair row per lane) and the gated-pairing EPILOGUE with a channel-major (transposed) TMA store.  ONE rendered body per
-arch family lives in THIS package, named ``sm<NNN>_dual_gemm.py`` like the arch trees' templates (:data:`BODIES`, :func:`body_path`;
-:func:`body_arch_for_cc` picks it from the device's compute capability): ``sm107_dual_gemm.py`` for Rubin (cc 10.7: the 327 KiB
-carveout, 576 TMEM columns, a 9-deep operand ring) and ``sm100_dual_gemm.py`` for Blackwell (cc 10.0 / 10.3: the 227 KiB opt-in
-carveout, 512 TMEM columns, a 6-deep ring).  The two files differ ONLY in the arch constants the renderer itself moves between the
-two targets (the ring depth, the TMEM column count and allocation mode, the compile target, the L2 rasterization budget, the
-B-collector flag) and in the docstring paragraph that states them -- every kernel line, barrier and ``const_expr`` arm is the same
-text (``diff`` them: the K1 test module pins it), so a fix lands in the Rubin body and is carried to the other by that diff.  Each
-module docstring carries the barrier table with the per-warp arrival ledger, the SMEM table with swizzle + why, and the row-block
-tiling below.  A rendering for one arch is not a registry template, which is why it does not sit in a ``kernel_templates/``
-directory (the template inventory sweeps and the arch-family resolver define those files).  The per-arch GEOMETRY the host reads
-(:data:`RING_STAGES_BY_ARCH`, :data:`SMEM_BUDGET_BYTES_BY_ARCH`) is what sizes the LayerNorm-once resident region and bounds K.  Consumers: the triangle multiplicative update's K1
-(``cudnn.triangle_multiplicative_update.kernels.trimul_proj``, ``pairing = "columns"``) and its K3
-(``kernels.trimul_tail``, ``pairing = "accumulators"``: two GEMMs of N = c_out each, the value from a LayerNormed MN-major operand,
-the gate from a LayerNormed K-major one, the pairing ACROSS the two accumulators, a pair-major output -- :func:`run_ln_dual_gemm_tail`);
-the triangle-attention block's projection later -- they import THIS module, never copy the kernel.
-
-Row-block tiling (``row_block_geometry``).  The caller's rows are ``(bi, k)`` pairs -- ``bi`` = a batch-and-outer index in
-``[0, bn)``, ``k`` = the inner index in ``[0, n_res)`` -- stored pair-major in ``z`` (row ``bi * n_res + k``) and CHANNEL-major in
-the output: ``out[pass][c][bi][k]`` with the ``k`` axis padded to ``n_pad`` (a multiple of 8 so the TMA store's row stride is
-16-byte aligned; the kernel writes the ``k`` in ``[n_res, n_pad)`` as zeros).  A 256-row pair tile covers ``r_i`` consecutive
-``bi`` x ``kb`` consecutive ``k`` with ``r_i * kb == 256`` and ``kb`` a power of two (``kb = 256`` for ``n_res >= 256``, else the
-next power of two >= ``max(n_res, 8)``), so the A load is one 3-D TMA box ``(64 channels, min(kb, 128) k, 128 // min(kb, 128) bi)``
-per CTA, the store the matching ``(k, bi, 32 channels)`` box, and a row's ``(bi, k)`` are a shift and a mask of its tile row.
-The last ``k`` block of a ``bi`` and the last ``bi`` block are partial: TMA zero-fills the loads, clips the stores, and the
-kernel treats such rows as masked (``mask = 0``, no statistics).  ``kb`` is a RUNTIME operand of the compiled kernel (``lkb`` /
-``n_kb`` / ``kbc`` / ``rc`` in the launch's ``geom`` tuple, dynamic TMA box dims), so a caller may override the rule through
-``k_block`` on ``row_block_geometry`` / the two launchers -- a performance knob: every row's arithmetic is independent of the
-tile it sits in, so the output is bitwise the same under every admitted ``kb``.  Why one would: at ``n_res = 384`` the rule's
-``kb = 256`` pads 25 % of every pair tile's rows (the second k block holds 128 valid k of 256); ``kb = 128`` pads none.
+Protocol: python/cudnn/frost/README.md#layernorm-prologue-dual-gemm.
 """
 
 from __future__ import annotations
@@ -69,82 +23,28 @@ K_PAD_MULTIPLE = 8
 MIN_K_BLOCK = 8
 
 DIAG_ARMS = ("", "one_pass_stats", "no_ln_norm", "no_ln", "no_epi_math", "ln_first_tile_only")
-#: Tile order (performance only; the same function, bitwise): ``"major"`` = the pass is the grid's z axis (every row block of
-#: pass 0 before pass 1); ``"interleaved"`` = the pass folded into the scheduler's M axis so the two tiles reading one row block's
-#: z rows are adjacent (the second pass's z load is an L2 hit -- the HBM-side saving of a shared z load without resident weights).
 PASS_ORDERS = ("major", "interleaved")
-#: ``"columns"`` = ONE GEMM of N = 2 c_out whose 256-wide tiles pair value columns [0, 128) with gate columns [128, 256) (K1);
-#: ``"accumulators"`` = TWO GEMMs of N = c_out (value = operand 0's, gate = operand 1's accumulator), the pairing across them (K3).
 PAIRINGS = ("columns", "accumulators")
 A0_MAJORS = ("k", "mn")
-#: The MN-major operand's LayerNorm form (``pairing = "accumulators"`` only): ``"mn_major"`` normalises in place in the MN-major stage and the
-#: MMA reads it MN-major; ``"transpose"`` writes the normalised row K-major into the same stage (after a 4-warp barrier) and the MMA reads K-major.
 A0_PROLOGUES = ("mn_major", "transpose")
 #: The MN-major TMA box is 64 rows of ONE ``bi``: a pair tile's ``kb`` must be >= 64 (``n_res > 32``) in the accumulators arm.
 MIN_N_RES_MN_MAJOR = 33
 #: The same constraint on the LAUNCHED ``kb`` (a caller's ``k_block`` below 64 cannot serve the accumulators arm; the columns arm admits 8).
 MIN_K_BLOCK_MN_MAJOR = 64
-#: The LayerNorm warps' pass form (performance only; bitwise the same operand): ``"registers"`` = the row's ``K / 2`` packed words stay in
-#: registers between the statistics passes and the normalise pass (the residency that spills from K = 256 up at the flat entry allocation);
-#: ``"smem"`` = every pass re-reads the row's 16-byte chunks from the (unchanged) SMEM stage at the same swizzled offsets -- no residency;
-#: ``"smem_rolled"`` = the same with the per-stage chunk loops as runtime loops (the code-size lever against the instruction-cache stall);
-#: ``"smem_rolled_pf"`` = the rolled form with a 2-deep software pipeline over every chunk loop (the next chunk's loads issued before the
-#: current chunk's arithmetic; the same words into the same additions in the same order: bitwise the register form);
-#: ``"smem_rolled_tree"`` = the pipelined form with FOUR partial sums per statistics pass (word w of every chunk accumulates into partial w,
-#: combined once per pass as (t0 + t1) + (t2 + t3)) -- a 2-deep dependent chain per chunk instead of 8, at a DIFFERENT fp32 summation
-#: order: the one member of the vocabulary that is NOT bitwise the register form (:data:`LN_PASS_FORMS_REORDERED`; the fp64 oracle's
-#: bound decides, never a silent default).
 LN_PASS_FORMS = ("registers", "smem", "smem_rolled", "smem_rolled_pf", "smem_rolled_tree")
-#: The pass forms whose fp32 summation ORDER differs from the register form's: the same function to the oracle's bound, not bitwise --
-#: a bitwise pin excludes them, a heuristics default never names them without a decision on the measured oracle distance.
 LN_PASS_FORMS_REORDERED = ("smem_rolled_tree",)
-#: The gated epilogue's arithmetic form (performance only; the same fp32 operations per element): ``"scalar"`` = one element at a time;
-#: ``"packed"`` = channel PAIRS on the packed fp32x2 ALU (``add.f32x2`` / ``mul.f32x2`` / ``fma.rn.f32x2``: half the ALU issue per element);
-#: ``"packed_hoist"`` = ``packed`` with a subtile's bias words loaded from SMEM BEFORE its TMEM loads (the same words, the same ops; a schedule
-#: change on the renderings WITH biases, nothing on the others); ``"packed_biasfold"`` = ``packed_hoist`` with the GATE bias staged halved
-#: (``b_g / 2``, exact) and folded into the tanh argument as one ``fma.rn.f32x2`` in place of the bias ``add.f32x2`` + the halving
-#: ``mul.f32x2`` (``tile_dsl.pointwise.sigmoid2_biased_half``: output-bitwise, -16 FADD2 per 32-channel subtile per lane).  Without biases
-#: the three packed forms render ONE cubin (:data:`EPI_MATHS_PACKED`): their differences sit under ``has_bias``.
 EPI_MATHS = ("scalar", "packed", "packed_hoist", "packed_biasfold")
-#: The packed family -- one rendering (byte-identical cubins) on an artifact WITHOUT biases; a per-rendering rule keyed by the epilogue form
-#: (the triangle multiplicative update's register-split hint) treats them as one member there.
 EPI_MATHS_PACKED = ("packed", "packed_hoist", "packed_biasfold")
-#: The ``.minnctapersm`` launch hint (performance only; bitwise the same output): 0 = no directive (the rendering as shipped: ptxas drops the
-#: body's ``setmaxnreg`` split and allocates one flat count per warp), 1 = the hint under which ptxas honours the split -- the kernel is one CTA
-#: per SM by its SMEM footprint either way (:class:`LnDualGemmParams`).  2 or more would cap the allocation at 80 registers: refused.
 MIN_BLOCKS_PER_MP_DOMAIN = (0, 1)
-#: The LayerNorm-ONCE-per-row-block lever (performance only; bitwise by construction: the same normalised bf16 words feed every GEMM tile of the
-#: work item, where today each tile recomputes them from the same input).  ``""`` = today's work item, one GEMM tile (the A rows re-streamed and
-#: re-normalised once per (pass, N tile): 4x at K1 c_out 256, 2x at K1 c_out 128 and K3 c_out 256); ``"block"`` = the work item is the whole row
-#: block -- every pass x every N tile -- with the A operand(s) resident in SMEM across them and LayerNormed once; ``"passes"`` = the item is (row
-#: block, ONE N tile) across the passes (a finer persistent tail for small N; the LayerNorm multiplicity halves instead of vanishing).  An item of
-#: ONE tile (K3 at c_out 128; ``"passes"`` under the accumulators arm) is a typed decline: the resident region would be dead weight.
 LN_ONCE_FORMS = ("", "block", "passes")
-#: Each body's operand ring depth per pairing, PER ARCH FAMILY -- the renderer's own arithmetic for this tile at the part's per-CTA SMEM
-#: (floor((budget - 2048 reserve - 16400 staging) / 32 KiB) for the columns arm; the accumulators arm re-cuts the SAME bytes into 48 KiB stages):
-#: sm107 (327 KiB carveout) 9 x (16 + 16) KiB / 6 x (2 x 16 + 2 x 8) KiB = 288 KiB either way; sm100 (227 KiB opt-in) 6 x 32 KiB / 4 x 48 KiB
-#: = 192 KiB.  The lever's SMEM predicate (:func:`ln_once_a_slots`) reads them HERE, each body re-derives them from the same arm and checks the
-#: agreement at load, and the K1 test module pins it per arch (a drift would size the resident region against a ring the body no longer has).
 RING_STAGES_BY_ARCH = {
     "sm107": {"columns": 9, "accumulators": 6},
     "sm100": {"columns": 6, "accumulators": 4},
 }
 #: The sm107 body's ring depths (the historical name; :func:`ring_stages` is the per-arch accessor).
 RING_STAGES = RING_STAGES_BY_ARCH["sm107"]
-#: The per-CTA dynamic SMEM each arch family's part gives a CTA, what the bodies' load-time budget check reads: Rubin's 320 KiB oversized
-#: carveout (the body's ~309 KiB fits), Blackwell's 227 KiB opt-in limit (the ~220 KiB sm100 body fits; the overflow of either would not fail
-#: the launch visibly -- sdpa-invariants S 6).
 SMEM_BUDGET_BYTES_BY_ARCH = {"sm107": 320 * 1024, "sm100": 227 * 1024}
-#: The address window of the NON-versioned tcgen05 SMEM-descriptor builder: ``Tcgen05SmemDesc.build`` WITHOUT a ``version`` argument (the
-#: released nvidia-cutlass-dsl 4.7.0 = :data:`cudnn.frost.buffers.CUTEDSL_MIN_VERSION`, admitted on cc 10.0 / 10.3) lowers to the NVVM op that
-#: keeps 14 bits of ``start_address >> 4``, so an operand ring ROOT at or above this many bytes wraps to the bottom of SMEM and the MMA reads
-#: stage 0 -- EXACTLY zero accumulators, no fault.  The versioned builder (4.8.0+, ``version=1``) keeps 15 bits.  Both write the SAME version
-#: field (bits 46-48 = 1) and the same LBO / SBO / swizzle bits, so BELOW the line the two encodings are bit-identical (the K1 test module's
-#: descriptor-identity probe pins it on the installed DSL); per-stage / per-k-step offsets ride ``advance_start_address`` (an unmasked encoded
-#: add) either way.  Only the bodies' ring roots go through the builder (:func:`tcgen05_smem_desc_builder`).
 TCGEN05_SMEM_DESC_LEGACY_ADDR_LIMIT = 262144
-#: The descriptor version every ring-root descriptor is built with where the installed builder takes one -- never the DSL default (a default
-#: change would otherwise move the Rubin body's descriptors silently).
 TCGEN05_SMEM_DESC_VERSION = 1
 A_STAGE_BYTES = (PAIR_TILE_ROWS // 2) * K_STAGE * 2  #: one 128-row x 64-channel bf16 A stage per operand (16 KiB)
 B_STAGE_BYTES = {
@@ -153,8 +53,6 @@ B_STAGE_BYTES = {
 }  #: each CTA's half of the N tile per B operand
 #: The rendered kernel bodies, one per arch family (``sm<NNN>_dual_gemm.py`` beside this file); ``build_ln_dual_gemm`` picks by name.
 BODIES = {"sm107": "sm107_dual_gemm.py", "sm100": "sm100_dual_gemm.py"}
-#: The compute capabilities each body serves (SM103 runs the sm100 body: the same 227 KiB / 512-column part geometry) and, per body, the cc the
-#: CuTe-DSL target gate is asked about (``cutedsl_arch_requirement_error``: the sm_107a target exists only on DSL builds that know Rubin).
 ARCHS_BY_CC = {(10, 0): "sm100", (10, 3): "sm100", (10, 7): "sm107"}
 ARCH_GATE_CC = {"sm100": (10, 0), "sm107": (10, 7)}
 
@@ -192,9 +90,7 @@ def body_path(arch: str = "sm107") -> str:
 
 
 def smem_desc_wide_start_address_required(arch: str) -> bool:
-    """Whether the ``arch`` body can place an operand ring root at or above :data:`TCGEN05_SMEM_DESC_LEGACY_ADDR_LIMIT`: its part's per-CTA
-    SMEM (:data:`SMEM_BUDGET_BYTES_BY_ARCH`) reaches past the line.  Rubin's 320 KiB carveout does (the sm107 body's rings end at 288 KiB);
-    Blackwell's 227 KiB opt-in limit does not (no address a cc 10.0 / 10.3 CTA holds can reach the line, whatever the layout)."""
+    """Check whether the architecture needs wide shared-memory descriptor addresses."""
     if arch not in SMEM_BUDGET_BYTES_BY_ARCH:
         raise ValueError(f"the LayerNorm-prologue dual GEMM has a rendered body for {sorted(SMEM_BUDGET_BYTES_BY_ARCH)} only, not {arch!r}")
     return SMEM_BUDGET_BYTES_BY_ARCH[arch] > TCGEN05_SMEM_DESC_LEGACY_ADDR_LIMIT
@@ -208,12 +104,7 @@ def _tcgen05_smem_desc_build_is_versioned() -> bool:
 
 
 def tcgen05_smem_desc_requirement_error(arch: str) -> Optional[str]:
-    """Message naming the installed DSL when the ``arch`` body needs the wide start-address field (:func:`smem_desc_wide_start_address_required`)
-    and the installed ``Tcgen05SmemDesc.build`` has no ``version`` parameter (the released 4.7.0: 14 address bits, a root past the line wraps);
-    None when the installed builder serves the body -- the versioned 4.8.0+ builder, or a body whose part cannot place a root past the line.
-    One of the CuTe-DSL gates of :func:`build_ln_dual_gemm` (AGENTS.md Rule 7: a typed decline naming the version, never the DSL's own error
-    out of ``cute.compile``); the sm_107a target gate already holds the sm107 body at 4.8.0+, this states the descriptor requirement where it
-    is built.  Imports the DSL, so it runs after the floor gate like the target gate."""
+    """Check the DSL descriptor-address support required by the architecture."""
     if not smem_desc_wide_start_address_required(arch) or _tcgen05_smem_desc_build_is_versioned():
         return None
     from cudnn.frost.buffers import cutedsl_state
@@ -228,12 +119,7 @@ def tcgen05_smem_desc_requirement_error(arch: str) -> Optional[str]:
 
 
 class Tcgen05SmemDescBuilder:
-    """The tcgen05 SMEM-descriptor constructor one body builds its operand ring-root descriptors with, resolved ONCE per body load against the
-    installed DSL (:func:`tcgen05_smem_desc_builder`).  ``path`` names the resolution: ``"versioned"`` = ``Tcgen05SmemDesc.build(...,
-    version=TCGEN05_SMEM_DESC_VERSION)`` (a build() with the parameter, 4.8.0+ -- explicit, never the default); ``"legacy"`` = the
-    non-versioned build() of the 4.7.0 floor on a body whose roots cannot reach the 256 KiB line (bit-identical encodings there);
-    ``"declined"`` = a body that needs the wide field on a DSL without the versioned builder -- every call raises the typed decline of
-    :func:`tcgen05_smem_desc_requirement_error` (the body module still LOADS: the host tests execute it without compiling)."""
+    """Build architecture-compatible tcgen05 shared-memory descriptors."""
 
     __slots__ = ("arch", "path", "_decline")
 
@@ -270,17 +156,7 @@ def tcgen05_smem_desc_builder(arch: str) -> Tcgen05SmemDescBuilder:
 
 @dataclass(frozen=True)
 class LnDualGemmParams:
-    """Compile-time shape of one LayerNorm-prologue gated dual GEMM artifact (the template's ``FROST_TEMPLATE_PARAMS``).
-
-    ``k``: the LayerNorm width = GEMM K (a multiple of 64; the kernel keeps every K stage of a tile resident, so at most
-    ``ab_stages * 64`` -- :func:`max_k` per arch body and pairing: 576 / 384 on the sm_107a rendering, 384 / 256 on the sm_100a one).  ``c_out``: output channels per pass (a multiple of 128; the GEMM's
-    N is ``2 * c_out``).  ``passes``: weight / bias / output planes sharing one activation.  ``has_bias``: the projection
-    biases are present (else folded out at the ABI).  ``want_stats``: write ``(mean, rstd)`` per row.  ``has_mask``: a per-row
-    mask tensor is bound (else every valid row has mask 1).  ``skip_masked_tiles``: the warp-vote skip of fully masked tiles
-    (OFF renders the control arm the bitwise pin compares against).  ``eps``: the LayerNorm epsilon.  ``clc_stages``: the CLC
-    scheduler ring depth (performance only: every value computes the same function).  ``pass_order``: the tile order
-    (:data:`PASS_ORDERS`; performance only, bitwise the same output).
-    """
+    """Compile-time shape of one LayerNorm-prologue gated dual GEMM artifact (the template's ``FROST_TEMPLATE_PARAMS``)."""
 
     k: int = 128
     c_out: int = 128
@@ -290,72 +166,23 @@ class LnDualGemmParams:
     has_mask: bool = True
     skip_masked_tiles: bool = True
     eps: float = 1e-5
-    #: CLC scheduler ring depth.  The template's 1-deep ring lets the TMA / LayerNorm warps run only one tile ahead of the
-    #: epilogue (the next tile id is fetched once EVERY consumer has read the previous one); with 2 K stages per tile the
-    #: per-tile fixed costs (prologue, epilogue) ARE the pipeline, so the ring depth is the first lever (measured per node).
     clc_stages: int = 2
-    #: DIAGNOSTIC arms for relief measurements (never a production setting; the oracle tests pass only with ""):
-    #: "one_pass_stats" (sum / sum-of-squares in one pass), "no_ln_norm" (statistics, no normalise write-back), "no_ln" (the LN
-    #: warps only forward the stages), "no_epi_math" (the epilogue stores zeros without reading TMEM), "ln_first_tile_only" (the LN warps
-    #: normalise a row block's FIRST (pass, N tile) tile only and forward the others -- the upper bound of the LayerNorm-once-per-row-block lever).
     diag: str = ""
-    #: Tile order (:data:`PASS_ORDERS`): "major" = the rendering's z-axis pass; "interleaved" = the pass folded into the
-    #: scheduler's M axis (passes must be a power of two) -- the shared-z-load form; the output is bitwise the same.  The default stays
-    #: the rendering's "major" on purpose: the sign is PER WIDTH (measured on the 212-SM Rubin perf class, 400 x 3 iterations, CLEAN
-    #: windows, at the 2-deep ring: K = 128 interleaved +3.85 .. +4.13 %, K = 256 interleaved -0.76 .. -0.80 %; with a 1-deep ring the
-    #: whole-call sign at K = 128 reverses from N >= 512), so a consumer picks it per geometry (the
-    #: triangle multiplicative update's heuristics module does) rather than inheriting one value for every K.
     pass_order: str = "major"
-    #: :data:`PAIRINGS`.  "accumulators" (K3): operand 0 = the VALUE operand (``a0_major``), operand 1 = the GATE operand (K-major), both
-    #: LayerNormed with their own (gamma, beta) over the SAME K; N = ``c_out`` per GEMM; the output is pair-major ``[rows, c_out]``;
-    #: ``has_mask`` / ``skip_masked_tiles`` must be False and ``passes`` 1.
     pairing: str = "columns"
     #: operand 0's GMEM major (:data:`A0_MAJORS`): "mn" = its rows are MN-major (the K3 ``y`` rows: the inner index contiguous), "k" = K-major.
     a0_major: str = "k"
     #: the MN-major LayerNorm form (:data:`A0_PROLOGUES`; accumulators arm only).  Performance only: both forms compute the same function.
     a0_prologue: str = "mn_major"
-    #: NUMERICS MODE (an op attribute, NOT a performance knob: it changes the function, so no heuristic or autotuner may set it; OFF by
-    #: default).  Accumulators arm: operand 0's LayerNorm is the PURE ``(x - mean) * rstd`` -- the caller folded gamma into the value weights
-    #: and beta into the value bias (:func:`fold_output_affine`): a second bf16 rounding of the weights and the bias, measured ~2.3x the
-    #: unfolded max-abs error.
     affine_fold: bool = False
-    #: NUMERICS MODE (an op attribute, not a knob; OFF by default).  Accumulators arm: ``out = bf16(residual[row, :] + gate * value)`` in ONE
-    #: rounding (the fused block form); the unfused API rounds twice.
     fuse_residual: bool = False
     #: the TMA warp prefetches the tile's A boxes into L2 before waiting for a ring slot (performance only).
     prefetch_a_l2: bool = False
-    #: :data:`LN_PASS_FORMS` -- how the LayerNorm warps hold the row between their passes (performance only; bitwise the same operand for every
-    #: form outside :data:`LN_PASS_FORMS_REORDERED`, whose partial sums change the fp32 summation order -- the oracle's bound, not a bitwise pin).  The
-    #: default stays the rendering's register residency; a consumer picks the re-read form per width (its value is in the spill counts).
-    #: Under ``pairing = "accumulators"`` the re-read forms require ``a0_prologue = "mn_major"`` (the transpose form's K-major writes overlap
-    #: the channel rows every lane still re-reads -- the register form keeps all reads before its LN_SYNC barrier, the re-read form cannot).
     ln_pass_form: str = "registers"
     #: :data:`EPI_MATHS` -- the gated epilogue's arithmetic form (performance only).
     epi_math: str = "scalar"
-    #: The ``.minnctapersm`` hint handed to the kernel launch (the DSL's ``launch(..., min_blocks_per_mp=)``; performance only, bitwise the same
-    #: output).  0 = no directive = the rendering as shipped: ptxas DROPS the body's six ``setmaxnreg`` requests (neither ``.maxnreg`` nor
-    #: ``.minnctapersm`` -> C7508) and every warp runs at one flat allocation, which its occupancy heuristic may set at 80 = 65536 / (2 x 384)
-    #: -- two CTAs per SM -- with a few spills when the body's demand sits near it (the bias-OFF accumulators-arm c_out 256 rolled rendering:
-    #: REG 80, STACK 24, 5 / 7 spills reloaded per tile on the epilogue's hot path, +7-8 % on the kernel; its bias-ON twin is allocated 112
-    #: with no spill).  1 = the hint that lifts C7508: ptxas honours the split (USETMAXREG 6 -- epilogue + LN warps 232, producers 24; the
-    #: cubin is byte-identical to a ``.maxnreg 168`` build).  The ~309 KiB SMEM footprint makes the kernel one CTA per SM either way, so 1
-    #: states a fact; 2 or more would cap the allocation at 80 with the split impossible (refused).  A consumer sets it per RENDERING where
-    #: measured (the triangle multiplicative update's ``heuristics.register_split_hint``), never library-wide: the default keeps every
-    #: production cubin byte-identical.
     min_blocks_per_mp: int = 0
-    #: :data:`LN_ONCE_FORMS` -- the LayerNorm-once-per-row-block lever (performance only; bitwise by construction).  ``"block"`` / ``"passes"`` make
-    #: the row block [x the N-tile group] the scheduler's work item: the A operand(s) of a 256-row block are loaded and LayerNormed ONCE into a
-    #: resident SMEM region (``ln_once_a_slots`` slots of ``k_stages`` stages; double-buffered where the shipped layout's bytes allow it) and the
-    #: CTA pair runs the item's ``passes x n_tiles`` GEMM tiles from it while the B half-slab keeps streaming per tile; TMEM, the epilogue and the
-    #: accumulator protocol are per tile as today.  Requires ``pass_order = "major"`` (the pass lives inside the item), no ``prefetch_a_l2``, an item of
-    #: at least two tiles.  The default stays OFF: a consumer picks it per geometry (the triangle multiplicative update's heuristics) once measured.
     ln_once: str = ""
-    #: appended (2026-10-14, the SM100 lever B-TriMul-1): the B RING's depth under the LayerNorm-once item (performance only; bitwise by construction;
-    #: 0 = the body's shipped ring).  Honoured ONLY where the shallower ring buys the SECOND resident A slot that the shipped ring's bytes refuse
-    #: (:func:`ln_once_b_stages_effective`: the sm100 body's K1 at K = 256 -- 2 x 64 KiB region + 4 x 16 KiB ring = the shipped 192 KiB; the Rubin body
-    #: already holds two slots there and keeps its ring, the output stage's two-operand region never fits twice and keeps its ring) -- so the field
-    #: never trades B depth for nothing.  Requires ``ln_once``; 1 <= value <= the arch body's ring (:func:`ring_stages`).  The default keeps every
-    #: production cubin byte-identical; a consumer sets it per geometry once measured (the triangle multiplicative update's heuristics).
     ln_once_b_stages: int = 0
 
     @property
@@ -406,10 +233,7 @@ def _ln_once_a_slots_at(p: LnDualGemmParams, arch: str, b_stages: int) -> int:
 
 
 def ln_once_b_stages_effective(p: LnDualGemmParams, arch: str = "sm107") -> int:
-    """The B ring's depth under the LayerNorm-once item on the ``arch`` body: ``p.ln_once_b_stages`` where it is set, shallower than the shipped ring
-    AND buys the second resident A slot the shipped ring refuses (``ln_once_a_slots`` 1 -> 2); otherwise the shipped ring (:func:`ring_stages`) -- the
-    field never trades B depth for nothing.  The shipped ring when the lever is off.  One source for the bodies' ``_B_STAGES``, the slot predicate,
-    the validator and the tests (appended 2026-10-14, B-TriMul-1)."""
+    """Return the effective B-ring depth for LayerNorm reuse."""
     ring = ring_stages(arch, p.pairing)
     want = int(p.ln_once_b_stages or 0)
     if not p.ln_once or want <= 0 or want >= ring:
@@ -420,28 +244,17 @@ def ln_once_b_stages_effective(p: LnDualGemmParams, arch: str = "sm107") -> int:
 
 
 def ln_once_a_slots(p: LnDualGemmParams, arch: str = "sm107") -> int:
-    """The resident A region's slot count under the lever on the ``arch`` body: 2 (the next item's load + LayerNorm overlap this item's tiles)
-    where the two-slot region plus the B ring fit in the bytes of that body's shipped A/B ring (the layout the rendering already launches
-    at -- a self-referential predicate per arch, no carveout constant), else 1.  sm107: 1 at K3 c_out 256 only (2 operands x 4 stages x 2 slots =
-    256 KiB would leave one B stage); sm100 (the 6-deep ring): 1 at K3 c_out 256 AND at K1 K = 256 (2 x 64 KiB + the 96 KiB B ring > 192 KiB) --
-    there the next item's LayerNorm no longer overlaps the current item's tiles, UNLESS ``ln_once_b_stages`` shallows the B ring to the depth that
-    fits (4 at K1 K = 256: :func:`ln_once_b_stages_effective`).  0 when the lever is off.  One source for the body, the validator and the tests."""
+    """Return the resident A-slot count for LayerNorm reuse."""
     if not p.ln_once:
         return 0
     return _ln_once_a_slots_at(p, arch, ln_once_b_stages_effective(p, arch))
 
 
-#: The sm100 body's one rendering class ptxas cannot allocate (measured by host trace-compile for sm_100a, 2026-10-13: the whole K = 256 map of
-#: both arms x stats on / off x both MN-major prologues; the sm107 body renders every member, spilling 469-1124 words): the register-form LayerNorm
-#: (the row held in registers between the passes) with a PACKED epilogue at K >= 256 -- every accumulators-arm member (stats on or off), and the
-#: columns arm's bias-path members (`packed_hoist` / `packed_biasfold`) WITH the statistics write (the plain `packed` columns rendering and the
-#: no-statistics bias-path ones allocate).  No production pick is in the class (the heuristics choose a re-read form at c 256 on both
-#: architectures); a caller's knob that lands in it is a typed decline, never a `cute.compile` error.
 _SM100_UNALLOCATABLE_MIN_K = 4 * K_STAGE
 
 
 def sm100_register_form_unallocatable(p: LnDualGemmParams, arch: str) -> bool:
-    """Whether ``p`` is in the sm100 body's C7600 class (module comment above); always False for the sm107 body."""
+    """Reject SM100 register forms that ptxas cannot allocate."""
     if arch != "sm100" or p.ln_pass_form != "registers" or p.epi_math == "scalar" or p.k < _SM100_UNALLOCATABLE_MIN_K:
         return False
     if p.dual:
@@ -629,9 +442,7 @@ def row_block_geometry(n_res: int, bn: int, k_block: Optional[int] = None) -> Ro
 
 
 def interleave_value_gate(w_value, w_gate):
-    """``[c_out, K]`` value and gate weights -> the ``[2 * c_out, K]`` row order the kernel's pairing expects:
-    per 128-channel block ``j``: ``W_p[128j : 128j + 128]`` then ``W_g[128j : 128j + 128]``.  Works on any tensor library
-    with ``reshape`` / ``cat`` (torch); the inverse is :func:`deinterleave_value_gate`.  A COPY: do it once at plan time."""
+    """Interleave 128-channel value and gate weight blocks."""
     import torch
 
     if w_value.shape != w_gate.shape or w_value.ndim != 2:
@@ -660,16 +471,7 @@ class LnDualGemmPlan:
 
 @lru_cache(maxsize=None)
 def build_ln_dual_gemm(params: LnDualGemmParams, arch: str = "sm107") -> LnDualGemmPlan:
-    """Load the ``arch`` body (:data:`BODIES`; :func:`body_arch_for_cc` names it from the device) specialized for ``params`` and cute-compile it.
-    Shapes (rows, bn, n_res) are runtime.
-
-    The CuTe-DSL gates run HERE, not only in the API layer above (the substrate is a public module: the kernel test modules and the
-    triangle-attention projection build on it): below the DSL floor, or -- for the sm107 body -- on a DSL without the sm_107a target, the
-    failure is a typed ``NotImplementedError`` naming the version -- never the DSL's own ``KeyError: 'sm_107a'`` out of ``cute.compile``.
-    The target gate is asked about the BODY's arch (:data:`ARCH_GATE_CC`), not the device's: the sm100 body compiles on every DSL above the
-    floor.  The third gate is the descriptor builder's (:func:`tcgen05_smem_desc_requirement_error`): a body whose ring roots can sit past the
-    256 KiB line needs the versioned ``Tcgen05SmemDesc.build`` -- the sm107 body, which the target gate already holds at 4.8.0+; the sm100
-    body builds its roots through the floor DSL's non-versioned builder (bit-identical below the line)."""
+    """Load the ``arch`` body (:data:`BODIES`; :func:`body_arch_for_cc` names it from the device) specialized for ``params`` and cute-compile it."""
     from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
     from cudnn.frost.template_loader import load_template
 
@@ -758,8 +560,6 @@ def run_ln_dual_gemm(
         )
     else:
         _check(stats is None, "this artifact was compiled with want_stats=False; stats must be None")
-    # Alignment the kernel assumes (a contiguous but OFFSET view passes every shape check and would fault or read the wrong half-word):
-    # TMA operands and the 16-byte parameter loads at 16 B, the mask's aligned 32-bit word loads at 4 B, the (mean, rstd) v2 stores at 8 B.
     for name, t_ in (("z", z), ("w", w), ("out", out)):
         _check(t_.data_ptr() % 16 == 0, f"{name} must be 16-byte aligned (a TMA operand)")
     for name, t_ in (("ln_weight", ln_weight), ("ln_bias", ln_bias), ("bias", bias)):
@@ -788,10 +588,7 @@ def run_ln_dual_gemm(
 
 
 def fold_output_affine(w_value, b_value, ln_weight, ln_bias):
-    """The affine fold of ``LayerNorm(y) @ W^T + b`` (the ``affine_fold`` knob): ``W' = bf16(W * gamma[None, :])``,
-    ``b' = bf16(b + W @ beta)`` so that ``(y - mean) * rstd @ W'^T + b'`` equals the unfolded function up to the SECOND bf16 rounding
-    of the weights and of the bias (the knob's numerics class).  fp64 arithmetic, bf16 results; ``b_value`` may be None (then ``W @ beta``
-    alone).  A COPY at plan time."""
+    """Fold LayerNorm affine parameters into projection weights and bias."""
     import torch
 
     w64 = w_value.double()

@@ -830,6 +830,8 @@ def _sm80_thd_plan(
     has_sink,
     deterministic,
     stats_token_major=False,
+    io_strides=(),
+    stats_head_stride=0,
 ):
     """Cache immutable wrapper plans without retaining tensors or runtime pointers.
 
@@ -837,11 +839,15 @@ def _sm80_thd_plan(
     receives them as runtime scalars and reuses its artifact across plans.
     """
 
-    def desc(h, d, s):
-        return TensorDesc(dtype, (n_seq, h, s, d), (s * h * d, d, h * d, 1), (3, 1, 2, 0), device)
+    def desc(index, h, d, s):
+        hs, ts, ds = io_strides[index] if io_strides else (d, h * d, 1)
+        return TensorDesc(dtype, (n_seq, h, s, d), (s * ts, hs, ts, ds), (3, 1, 2, 0), device)
 
-    q, k, v, o = desc(h_q, d_qk, t_q), desc(h_kv, d_qk, t_kv), desc(h_kv, d_v, t_kv), desc(h_q, d_v, t_q)
-    stats = TensorDesc(torch.float32, (n_seq, h_q, t_q), (h_q * t_q, t_q, 1), (2, 1, 0), device)
+    q, k, v = desc(0, h_q, d_qk, t_q), desc(1, h_kv, d_qk, t_kv), desc(2, h_kv, d_v, t_kv)
+    o, do = desc(3, h_q, d_v, t_q), desc(4, h_q, d_v, t_q)
+    dq, dk, dv = desc(5, h_q, d_qk, t_q), desc(6, h_kv, d_qk, t_kv), desc(7, h_kv, d_v, t_kv)
+    hs = stats_head_stride or t_q
+    stats = TensorDesc(torch.float32, (n_seq, h_q, t_q), (h_q * hs, hs, 1), (2, 1, 0), device)
     sink = TensorDesc(torch.float32, (h_q,), (1,), (0,), device) if has_sink else None
     wl, wr = window_size
     api = SdpaBwdDslSm80(
@@ -849,11 +855,11 @@ def _sm80_thd_plan(
         k,
         v,
         o,
-        o,
+        do,
         stats,
-        q,
-        k,
-        v,
+        dq,
+        dk,
+        dv,
         sample_sink=sink,
         sample_dsink=sink,
         is_causal=is_causal,
@@ -865,6 +871,7 @@ def _sm80_thd_plan(
         max_total_seq_len_q=t_q,
         max_total_seq_len_kv=t_kv,
         thd_stats_token_major=stats_token_major,
+        thd_stats_head_stride=stats_head_stride,
     )
     assert api.check_support(), "Unsupported configuration"
     # Wrapper buffers may have capacity beyond B * max_sequence_length.
@@ -887,8 +894,8 @@ def _sm80_thd_backward(
     bounds must cover every sequence; validating their contents would sync.
     """
     d_qk, d_v, h_q, h_kv = q.shape[-1], v.shape[-1], q.shape[2], k.shape[2]
-    fdqk, fdv = _SM80_BWD_FLAVOR_DIMS[_sm80_bwd_pick_flavor(d_qk, d_v)]
-    # Resolve from the user's width before envelope padding (e.g. D=96).
+    _sm80_bwd_pick_flavor(d_qk, d_v)
+    # The user's width determines scaling and native output shapes.
     if scale_softmax is None:
         scale_softmax = 1.0 / math.sqrt(d_qk)
     n_seq = cu_q.numel() - 1
@@ -898,10 +905,24 @@ def _sm80_thd_backward(
         if hint is not None:
             assert int(hint) > 0, f"{label} must be > 0; got {hint}"
 
-    if d_qk < fdqk or d_v < fdv or any(not t.is_contiguous() for t in (q, k, v, o, do)):
-        from cudnn.sdpa.packed_copy_sm80 import copy_packed_half
+    from cudnn.sdpa.native_sm80 import data_layout_mismatch
+    from cudnn.sdpa.graph_analyzer import thd_stats_packing
 
-        q, k, v, o, do = copy_packed_half((q, k, v, o, do), (fdqk, fdqk, fdv, fdv, fdv), (True, False, False, True, True), compact=True)
+    for name, tensor, tokens, heads, width in (
+        ("q", q, t_q, h_q, d_qk),
+        ("k", k, t_kv, h_kv, d_qk),
+        ("v", v, t_kv, h_kv, d_v),
+        ("o", o, t_q, h_q, d_v),
+        ("do", do, t_q, h_q, d_v),
+    ):
+        if tuple(tensor.shape) != (1, tokens, heads, width) or tensor.device != dev or tensor.dtype != q.dtype:
+            raise ValueError(f"SM80 THD {name} must match its packed shape and Q's device/dtype")
+        shape = tuple(tensor.shape[i] for i in (0, 2, 1, 3))
+        stride = tuple(tensor.stride(i) for i in (0, 2, 1, 3))
+        reason = data_layout_mismatch(name, shape, stride, thd=True)
+        desc = TensorDesc(q.dtype, shape, stride, (3, 1, 2, 0), dev)
+        if reason is not None or not SdpaBwdDslSm80._packed_bshd(desc):
+            raise NotImplementedError(reason or f"SM80 THD {name} requires non-overlapping native packed rows")
 
     # A zero-capacity wrapper operand gets one never-live row. Device prefixes
     # still contain the actual totals; no adapter-side degenerate computation.
@@ -911,15 +932,27 @@ def _sm80_thd_backward(
     q, k, v, o, do = map(packed, (q, k, v, o, do))
     tq_cap, tkv_cap = max(t_q, 1), max(t_kv, 1)
     stats_token_major = False
+    stats_head_stride = 0
     if t_q:
-        lse_t = lse if lse.dtype == torch.float32 and lse.device == dev else lse.to(dtype=torch.float32, device=dev)
-        if tuple(lse_t.shape) == (1, h_q, t_q) and lse_t.stride(1) == 1 and lse_t.stride(2) == h_q:
+        if lse.dtype != torch.float32 or lse.device != dev or tuple(lse.shape) != (1, h_q, t_q):
+            raise ValueError("SM80 THD Stats must be float32 [1,Hq,Tq] on Q's device")
+        lse_t = lse
+        # A singleton head's pitch is never stepped, including a zero stride.
+        stride_h = lse_t.stride(1) if h_q > 1 else t_q
+        packing = thd_stats_packing(stride_h, lse_t.stride(2), h_q)
+        if h_q == 1 and packing == "token_major":
+            # At T=H=1 both packings address the same element. Keep the
+            # head-major ABI, which ignores the caller's unused head pitch.
+            packing = "head_major"
+        if packing == "token_major":
             # Reuse the graph chain's existing compact token-major Stats ABI.
             # This is a view of the caller's storage, not a layout conversion.
             lse_t = lse_t[0].transpose(0, 1)
             stats_token_major = True
+        elif packing == "head_major" and stride_h >= t_q:
+            stats_head_stride = int(lse_t.stride(1)) if h_q > 1 and lse_t.stride(1) != t_q else 0
         else:
-            lse_t = lse_t.contiguous()
+            raise NotImplementedError("SM80 THD Stats requires native head-major or compact token-major storage")
     else:
         lse_t = torch.empty((1, h_q, 1), dtype=torch.float32, device=dev)
     cu_q_t = cu_q.to(dtype=torch.int32, device=dev).contiguous()
@@ -928,7 +961,7 @@ def _sm80_thd_backward(
     # The cast/fold only writes live rows. Keep the established zeroed dQ and
     # GQA output tails; MHA dK/dV remain direct kernel outputs.
     # The wrapper specialization folds this into workspace initialization.
-    dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+    dq, dk, dv = (torch.empty(t.shape, dtype=t.dtype, device=dev) for t in (q, k, v))
     dsink = torch.empty(h_q, dtype=torch.float32, device=dev) if sinks is not None else None
     wl, wr = window_size
     wl = None if wl is None or wl < 0 else int(wl)
@@ -937,8 +970,8 @@ def _sm80_thd_backward(
         n_seq,
         h_q,
         h_kv,
-        fdqk,
-        fdv,
+        d_qk,
+        d_v,
         tq_cap,
         tkv_cap,
         min(int(max_s_q), tq_cap) if max_s_q is not None else tq_cap,
@@ -951,6 +984,8 @@ def _sm80_thd_backward(
         sinks is not None,
         bool(deterministic),
         stats_token_major,
+        tuple((int(t.stride(2)), int(t.stride(1)), int(t.stride(3))) for t in (q, k, v, o, do, dq, dk, dv)),
+        stats_head_stride,
     )
     workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=dev)
     api.execute(
@@ -971,8 +1006,6 @@ def _sm80_thd_backward(
         dsink_tensor=dsink,
     )
     dQ_k, dK_k, dV_k = dq[:, :t_q], dk[:, :t_kv], dv[:, :t_kv]
-    if d_qk < fdqk or d_v < fdv:
-        dQ_k, dK_k, dV_k = copy_packed_half((dQ_k, dK_k, dV_k), (d_qk, d_qk, d_v), (True, False, False))
     out = TupleDict(dq_tensor=dQ_k, dk_tensor=dK_k, dv_tensor=dV_k)
     if dsink is not None:
         out["dsink_tensor"] = dsink
@@ -1028,12 +1061,11 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
     dBias, RoPE) arrive as extra optional keywords, as the ``SdpaBwdDsl``
     contract permits.
 
-    Layouts: any dense layout with the head dim innermost-contiguous is
-    served. Native flavor widths with vector-aligned outer strides compile
-    a pointer chain that reads/writes each declared layout directly. Other
-    dense layouts and widths retain carved staging; strided Stats are read
-    natively in both paths. Prepared execute requires caller workspace, which
-    the graph and convenience wrapper provide outside the launch path.
+    Dense operands require D-contiguous, vector-aligned, non-overlapping
+    layouts and head widths divisible by eight. The native pointer chain
+    reads/writes each declared layout directly, including strided Stats.
+    Prepared execute requires caller workspace, which the graph and convenience
+    wrapper provide outside the launch path.
     """
 
     def __init__(
@@ -1085,8 +1117,6 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         self._lse_stride: "Optional[tuple[int, int, int]]" = None
         self._prepared = None
         self._native_pointer = False
-        self._staged_layout = None
-        self._staged_prepared = None
         # THD (packed) plan-time state: the compact token capacities that size
         # the scratch and bound the launch, the physical capacities of the
         # caller's buffers, the Stats packing, and the compiled lengths ->
@@ -1228,9 +1258,8 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             self._value_error_if(int(val) <= 0, f"{label} must be > 0; got {val}")
         self._value_error_if(h_qo % h_kv != 0, f"H_q ({h_qo}) must be divisible by H_kv ({h_kv}) for GQA / MQA")
 
-        # The kernel supports d_qk != d_v (split sub-groups) but requires
-        # d_qk >= d_v; head dims inside a flavor envelope pad host-side.
-        self._value_error_if(d_qk < d_v, f"SM80 BPROP requires D_QK >= D_V; got D_QK={d_qk}, D_V={d_v}")
+        # The covering flavor retains D_QK >= D_V for its MMA geometry;
+        # logical Q/K and V widths are independently masked inside it.
         max_dqk = max(fdqk for fdqk, _ in _SM80_BWD_FLAVOR_DIMS.values())
         max_dv = max(fdv for _, fdv in _SM80_BWD_FLAVOR_DIMS.values())
         self._value_error_if(
@@ -1412,13 +1441,11 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         )
         if self._lse_stride is not None or self.thd:
             self._use_d64 = False  # preserve the dense, packed-Stats selection boundary
-        from .prepared_sm80 import native_layouts
+        from .prepared_sm80 import native_decline_reason
 
-        self._native_pointer = native_layouts(self)
-        if not self._native_pointer:
-            from .staged_sm80 import layout_for
-
-            self._staged_layout = layout_for(self)
+        reason = native_decline_reason(self)
+        self._not_implemented_error_if(reason is not None, reason)
+        self._native_pointer = True
 
         self._is_supported = True
         self._logger.debug("check_support completed")
@@ -1430,8 +1457,8 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         the specialized module via ``frost.template_loader`` (same seam as the
         SM120 adapter), and compile the full kernel chain for this shape.
         Native plans compile the entire pointer chain here, including packed
-        metadata setup or the dense d=64 kernel and its unpermute epilogue. Retained
-        staging layouts compile a pointer chain after their existing copies."""
+        metadata setup or the dense d=64 kernel and its unpermute epilogue.
+        check_support rejects declarations that would require staging."""
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         from cudnn.sdpa.bwd.config_sm80 import bwd_params_for_flavor
@@ -1472,23 +1499,15 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             )
         self._kmod = _load_sm80_bwd_module(self._params)
         d64 = _sm80_bwd_kernel_mod("d64") if self._use_d64 else None
-        if self._native_pointer:
-            from .prepared_sm80 import build_spec
+        from .prepared_sm80 import build_spec
 
-            self._prepared = build_spec(self, d64)
-            self._compiled_kernel = self._prepared.artifact
-        else:
-            from .staged_sm80 import compile_staged
-
-            self._staged_prepared = compile_staged(self, d64)
-            self._compiled_kernel = self._staged_prepared.artifact
+        self._prepared = build_spec(self, d64)
+        self._compiled_kernel = self._prepared.artifact
         self._logger.debug("compile completed")
 
     def scratch_workspace_bytes(self) -> int:
-        """Plan-time bytes for the prepared chain and retained operand staging."""
+        """Plan-time bytes for the native backward algorithm."""
         self._ensure_support_checked()
-        if self._staged_layout is not None:
-            return self._staged_layout.workspace_bytes
         from .kernels.sm80.prepared_host import workspace_regions
 
         return workspace_regions(self)[1]
@@ -1517,9 +1536,8 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         rope_freqs: Optional[torch.Tensor] = None,
         thd_ragged_offsets: Optional[dict] = None,
     ) -> None:
-        """Run the compiled SM80 backward on caller workspace. Native operands
-        bind directly; the existing staged layouts retain their copies and
-        feed the same pointer chain. THD outputs remain row-bounded on device.
+        """Run the compiled SM80 backward on caller workspace using native strides.
+        THD outputs remain row-bounded on device.
         """
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
@@ -1575,36 +1593,9 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
                 scale_softmax,
                 ro_tensors,
             )
+            self._logger.debug("execute completed (THD)" if self.thd else "execute completed (d64 fast path)" if self._use_d64 else "execute completed")
             return
-
-        from .staged_sm80 import run_staged
-
-        run_staged(
-            self,
-            (
-                q_tensor,
-                k_tensor,
-                v_tensor,
-                o_tensor,
-                do_tensor,
-                stats_tensor,
-                dq_tensor,
-                dk_tensor,
-                dv_tensor,
-                seq_q_lens,
-                seq_kv_lens,
-                sink_tensor,
-                dsink_tensor,
-                bias_tensor,
-                dbias_tensor,
-            ),
-            workspace,
-            current_stream,
-            scale_softmax,
-            rope_freqs,
-            ro_tensors,
-        )
-        self._logger.debug("execute completed (THD)" if self.thd else "execute completed (d64 fast path)" if self._use_d64 else "execute completed")
+        raise RuntimeError("SM80 backward compiled without a native prepared plan")
 
 
 _sm80_bwd_cache: dict = {}
@@ -1945,19 +1936,6 @@ def _sm100_kernel_path(fname: str) -> str:
 _SM100_WS_BLOCK_ROWS = 128
 
 
-def _sm100_device_clusters(device, cga_m: int) -> int:
-    """Clusters that fit the device once, for the THD persistent grid.
-
-    Occupancy-sized rather than work-sized: the work list is a device value, so
-    the grid cannot be it.  One CTA per SM is this kernel's design point, so the
-    cluster count is simply SM count / CGA width.
-    """
-    from cudnn.frost import device as _dev
-
-    idx = device.index if hasattr(device, "index") and device.index is not None else 0
-    return max(1, _dev.multiprocessor_count(idx) // cga_m)
-
-
 def _sm100_head_chunk_thd(
     h_q: int, ws_rows: int, s_kv: int, bpe: int, budget: int = _SM100_WS_BUDGET_BYTES, group: int = 1, t_rows: Optional[int] = None
 ) -> int:
@@ -2045,8 +2023,7 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         """True when a logical-BHSD desc sits on compact BSHD storage.
 
         Same predicate the SM120 adapter uses; defined here rather than shared
-        because that one is private to its class and this row's staging decision
-        is the only other caller.
+        because this row retains the compact packed-token contract.
         """
         b, h, s, d = (int(x) for x in desc.shape)
         return tuple(int(x) for x in desc.stride) == (s * h * d, d, h * d, 1)
@@ -2079,7 +2056,6 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         self._skv_pad = -(-self.s_k_max // 128) * 128
         self._is_padded = self._sq_pad != self.s_q_max or self._skv_pad != self.s_k_max
         self._compiled = None
-        self._staged_prepared = None
         self._zero_ws = False
         self._thd_lse_token_major = bool(getattr(self, "thd_stats_token_major", False)) and self.thd
         # Head-major Stats only: the caller's head stride, which the compiled
@@ -2112,28 +2088,15 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             # The budget is charged on the token rows (`t_rows`), so equal
             # lengths get the dense plan's chunk (see _SM100_WS_THD_PAD_SLACK).
             self._qh_chunk = _sm100_head_chunk_thd(self.h_q, self._ws_rows_cap, self._skv_pad, self._bpe, group=self._gqa_group, t_rows=self._t_q_cap)
-        # Retain the grandfathered dense conversion fallback for layouts that
-        # cannot use the native TMA pointer host. It stages compact BSHD buffers
-        # from caller workspace, decided here from the declarations. Native
-        # legal TMA layouts clear these staging lists below; BHSD dO now goes
-        # directly to the kernel too. THD retains its compact BSHD boundary.
-        self._stage_in = tuple(
-            name
-            for name, desc in (("q", self.q_desc), ("k", self.k_desc), ("v", self.v_desc), ("o", self.o_desc), ("dO", self.do_desc))
-            if not self._bshd_physical_ok(desc)
-        )
-        self._stage_out = tuple(name for name, desc in (("dQ", self.dq_desc), ("dK", self.dk_desc), ("dV", self.dv_desc)) if not self._bshd_physical_ok(desc))
+        # Dense operands bind their declared TMA pitches. Packed operands keep
+        # their existing compact token/head contract; neither path stages IO.
+        self._prepared = None
+
+    def _native_layout_errors(self):
         from .prepared_sm100 import native_io_layout
 
-        self._prepared = None
-        self._prepared_native = all(
-            native_io_layout(desc) for desc in (self.q_desc, self.k_desc, self.v_desc, self.o_desc, self.do_desc, self.dq_desc, self.dk_desc, self.dv_desc)
-        )
-        if self.thd:
-            self._prepared_native = self._prepared_native and not (self._stage_in or self._stage_out)
-        elif self._prepared_native:
-            # TMA descriptors and strided stores address these layouts directly.
-            self._stage_in = self._stage_out = ()
+        accepted = self._bshd_physical_ok if self.thd else native_io_layout
+        return tuple(name for name in ("q", "k", "v", "o", "do", "dq", "dk", "dv") if not accepted(getattr(self, name + "_desc")))
 
     # --- capability backstop -------------------------------------------------
     def check_support(self) -> bool:
@@ -2181,10 +2144,6 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             # Keep the existing layout boundary: incompatible declarations
             # decline here before compiling or binding a pointer host.
             self._value_error_if(
-                bool(self._stage_in or self._stage_out),
-                f"SM100 bwd THD: {', '.join(self._stage_in + self._stage_out)} must be BSHD-physical " "(the packed path has no staging copy)",
-            )
-            self._value_error_if(
                 self._thd_lse_token_major and bool(self.thd_stats_head_stride),
                 "SM100 bwd THD: thd_stats_head_stride is head-major-only (token-major (T, H) Stats is compact)",
             )
@@ -2197,6 +2156,12 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             )
         else:
             self._value_error_if(self.seq_kv_lens_present or self.seq_q_lens_present, "SM100 bwd: padding masks (seq lens) are not implemented")
+        invalid = self._native_layout_errors()
+        self._value_error_if(
+            bool(invalid),
+            f"{self._NAME}: {', '.join(invalid)} requires "
+            + ("compact BSHD-physical packed strides" if self.thd else "non-overlapping dense strides with D stride 1 and 16-byte outer pitches"),
+        )
         self._value_error_if(self.deterministic, "SM100 bwd: deterministic mode is not implemented")
         return True
 
@@ -2223,9 +2188,6 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             # descriptor word), dead on the dense path (every read is under
             # const_expr(_THD)) but part of the compiled ABI: borrowed here (Rule 8).
             total = delta + 2 * ws + ws_align(self.batch_size * 4) + ws_align(8)
-        for name in self._stage_in + self._stage_out:
-            s_len = self.s_k_max if name in ("k", "v", "dK", "dV") else self.s_q_max
-            total += ws_align(self.batch_size * s_len * self.h_q * self.head_dim_qk * self._bpe)
         if self._gqa_group > 1:
             # One dK and one dV partial per Q head, reduced to the KV heads at
             # the end. Sized on h_q, not h_kv -- that is the whole point.
@@ -2283,9 +2245,8 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
     def compile(self) -> None:
         """Plan-time JIT for the whole chain: stage 2's specialized module plus
         the two stage-3 GEMM specializations (dV/dK share one; dQ needs the other
-        operand-major and the other causal K-trim direction). Native layouts
-        and the existing dense conversion path both compile the complete
-        pointer chain here."""
+        operand-major and the other causal K-trim direction). The complete
+        pointer chain reads and writes the declared native layouts."""
         self._ensure_support_checked()
         if self._compiled is not None:
             return self._compiled
@@ -2418,16 +2379,10 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         # refuses a value that is neither 1 nor the group).
         self._dq_b_head_group = int(p_hi.b_head_group)
         mm_hi = load_template(_sm100_kernel_path(_SM100_MATMUL_FILE), p_hi, tag="sdpa_bwd_sm100_mm_hi")
-        if self._prepared_native:
-            from .prepared_sm100 import compile_plan
+        from .prepared_sm100 import compile_plan
 
-            self._prepared = compile_plan(self, stage2_mod, mm_lo, mm_hi)
-            self._compiled = self._prepared
-            return self._compiled
-        from .prepared_sm100 import compile_staged
-
-        self._staged_prepared = compile_staged(self, stage2_mod, mm_lo, mm_hi)
-        self._compiled = self._staged_prepared
+        self._prepared = compile_plan(self, stage2_mod, mm_lo, mm_hi)
+        self._compiled = self._prepared
         return self._compiled
 
     # --- execution -----------------------------------------------------------
@@ -2462,19 +2417,9 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
 
         if self._compiled is None:
             self.compile()
-        if self._prepared is not None:
-            from .prepared_sm100 import execute_standalone
+        from .prepared_sm100 import execute_standalone
 
-            return execute_standalone(
-                self,
-                (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor, seq_q_lens, seq_kv_lens),
-                workspace,
-                current_stream,
-                scale_softmax,
-            )
-        from .prepared_sm100 import execute_staged
-
-        return execute_staged(
+        return execute_standalone(
             self,
             (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor, seq_q_lens, seq_kv_lens),
             workspace,

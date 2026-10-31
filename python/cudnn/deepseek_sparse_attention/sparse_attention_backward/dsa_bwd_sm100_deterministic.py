@@ -43,7 +43,15 @@ def _wait_lower_rank_mask(mask_ptr, lower_rank_mask: Uint32):
     with loop as [value]:
         value = cute.arch.load(mask_ptr, Uint32, sem="relaxed", scope="gpu")
         cutlass.yield_out([value])
-    cute.arch.load(mask_ptr, Uint32, sem="acquire", scope="gpu")
+    # Keep the acquire observation control-dependent: an unused final load is
+    # dead-code eliminated before PTX lowering and would lose the release/
+    # acquire visibility edge. The relaxed loop remains the common polling
+    # path; this second loop normally executes only its initial acquire load.
+    acquired = cute.arch.load(mask_ptr, Uint32, sem="acquire", scope="gpu")
+    acquire_loop = cutlass.while_generate([acquired], lambda value: (value & lower_rank_mask) != Uint32(0))
+    with acquire_loop as [value]:
+        value = cute.arch.load(mask_ptr, Uint32, sem="acquire", scope="gpu")
+        cutlass.yield_out([value])
 
 
 def deterministic_dkv_shards(total_seqlen_q: int) -> int:
@@ -89,8 +97,9 @@ def _relay_workspace_bytes(total_seqlen_q: int, total_seqlen_kv: int, head_dim: 
 def deterministic_dkv_relay_cluster_size(total_seqlen_q: int, total_seqlen_kv: int, head_dim: int, num_heads: int = 64) -> int:
     """Select the preferred relay or its minimum-workspace fallback.
 
-    Long query batches prefer four-CTA relays for reducer parallelism; shorter
-    batches prefer eight. Cluster-16 is the minimum-workspace fallback when the
+    Query batches with at least 8K rows prefer four-CTA relays for reducer
+    parallelism; shorter batches prefer eight. Cluster-16 is the
+    minimum-workspace fallback when the
     preferred layout would exceed the memory-first budget. The long-query path
     deliberately skips cluster-8: measured GB200 sweeps found it slower than
     cluster-16 while retaining twice as many FP32 planes.
@@ -517,10 +526,13 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
         head_block_idx: Int32,
         problem_shape: Tuple[Int32, Int32, Int32, Tuple[Int32, Int32]],
     ):
+        """Import predecessor releases before reducers update one dKV tile."""
         tidx, _, _ = cute.arch.thread_idx()
         _, _, batch_idx = cute.arch.block_idx()
         tidx_in_wg = tidx - self.reduce_warp_id[0] * self.threads_per_warp
         rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        # Rank zero owns the first update and therefore has no predecessor
+        # release to import. Avoid a CTA barrier and GPU fence on every tile.
         lower_rank_bits = (Uint32(1) << Uint32(rank)) - Uint32(1)
         if tidx_in_wg < self.block_tile and rank > 0:
             tile_begin = tile_index * self.block_tile
@@ -533,11 +545,10 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
                     mask_ptr = self._mask_word_ptr(mdKV_acc, max_seqlen_kv, token_idx, head_block_idx, problem_shape, kv_row)
                     _wait_lower_rank_mask(mask_ptr, lower_rank_mask)
         # The slot lanes import predecessor releases. The CTA barrier carries
-        # those observations to every reducer thread before it touches the
-        # shared plane; the GPU fence keeps the following GMEM updates after
-        # that handoff.
-        _partial_cta_sync(self.dkv_relay_barrier.barrier_id, self.dkv_relay_barrier.num_threads)
-        cute.arch.fence_acq_rel_gpu()
+        # that acquire causality to every reducer thread before its following
+        # GMEM updates; an additional GPU-wide fence is redundant.
+        if rank > 0:
+            _partial_cta_sync(self.dkv_relay_barrier.barrier_id, self.dkv_relay_barrier.num_threads)
 
     @cute.jit
     def release_dKV_tile_relay(
@@ -551,15 +562,19 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
         head_block_idx: Int32,
         problem_shape: Tuple[Int32, Int32, Int32, Tuple[Int32, Int32]],
     ):
+        """Publish one dKV tile before later cluster ranks acquire it."""
         tidx, _, _ = cute.arch.thread_idx()
         _, _, batch_idx = cute.arch.block_idx()
         tidx_in_wg = tidx - self.reduce_warp_id[0] * self.threads_per_warp
         rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        # No later rank can observe the last rank's ownership bit.
         # Publish every reducer thread's relaxed FP32 atomics through the CTA
         # barrier before a slot lane release-clears this rank's ownership bit.
-        cute.arch.fence_acq_rel_gpu()
-        _partial_cta_sync(self.dkv_relay_barrier.barrier_id, self.dkv_relay_barrier.num_threads)
-        if tidx_in_wg < self.block_tile:
+        # CTA-barrier causality is transitive into the release operation, so
+        # no GPU-wide fence is required here.
+        if rank < self.dkv_relay_cluster_size - 1:
+            _partial_cta_sync(self.dkv_relay_barrier.barrier_id, self.dkv_relay_barrier.num_threads)
+        if tidx_in_wg < self.block_tile and rank < self.dkv_relay_cluster_size - 1:
             tile_begin = tile_index * self.block_tile
             slot = tile_begin + tidx_in_wg
             if slot < topk:
@@ -574,7 +589,9 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
                     if (row_mask & ~current_bit) != Uint32(0):
                         keep_mask = ~(Uint32(1) << bit_shift)
                         cute.arch.atomic_and(mask_ptr.llvm_ptr, keep_mask, sem="release", scope="gpu")
-        _partial_cta_sync(self.dkv_relay_barrier.barrier_id, self.dkv_relay_barrier.num_threads)
+        # The next participating relay barrier is the rendezvous after the
+        # slot lanes publish their release; kernel completion covers the final
+        # tile. A second barrier here only stalls the non-slot reducer warps.
 
     @cute.kernel
     def fold_dKV_shards(self, mdKV_acc: cute.Tensor, seqlen: Int32):
@@ -599,7 +616,7 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
         mdKV: cute.Tensor,
         seqlen: Int32,
     ):
-        """Fold the prefolded plane groups and convert to output dtype."""
+        """Fold the relay planes in fixed order and convert to output dtype."""
         tidx, tidy, _ = cute.arch.thread_idx()
         seq_block_idx, _, batch_idx = cute.arch.block_idx()
         seq_id = self.block_seq * seq_block_idx + tidy
@@ -639,7 +656,9 @@ class FlashAttentionDSABackwardSm100DeterministicCluster8(_FlashAttentionDSABack
     dkv_row_rank_mask = (1 << dkv_relay_cluster_size) - 1
     dkv_cluster_shape = (dkv_relay_cluster_size, 1, 1)
     num_dkv_fold_groups = num_dkv_shards // _FlashAttentionDSABackwardSm100DeterministicRelay.dkv_fold_group_size
-    num_dkv_final_terms = num_dkv_fold_groups
+    run_dkv_prefold = False
+    num_dkv_final_terms = num_dkv_shards
+    dkv_final_stride = 1
 
 
 class FlashAttentionDSABackwardSm100DeterministicCluster16(_FlashAttentionDSABackwardSm100DeterministicRelay):
@@ -651,7 +670,11 @@ class FlashAttentionDSABackwardSm100DeterministicCluster16(_FlashAttentionDSABac
     dkv_row_rank_mask = (1 << dkv_relay_cluster_size) - 1
     dkv_cluster_shape = (dkv_relay_cluster_size, 1, 1)
     num_dkv_fold_groups = num_dkv_shards // _FlashAttentionDSABackwardSm100DeterministicRelay.dkv_fold_group_size
-    num_dkv_final_terms = num_dkv_fold_groups
+    # Eight planes fit comfortably in the conversion kernel's ordered loop.
+    # Sum them there instead of writing and rereading an FP32 prefold plane.
+    run_dkv_prefold = False
+    num_dkv_final_terms = num_dkv_shards
+    dkv_final_stride = 1
 
 
 class FlashAttentionDSABackwardSm100DeterministicCluster4(_FlashAttentionDSABackwardSm100DeterministicRelay):
@@ -663,7 +686,9 @@ class FlashAttentionDSABackwardSm100DeterministicCluster4(_FlashAttentionDSABack
     dkv_row_rank_mask = (1 << dkv_relay_cluster_size) - 1
     dkv_cluster_shape = (dkv_relay_cluster_size, 1, 1)
     num_dkv_fold_groups = num_dkv_shards // _FlashAttentionDSABackwardSm100DeterministicRelay.dkv_fold_group_size
-    num_dkv_final_terms = num_dkv_fold_groups
+    run_dkv_prefold = False
+    num_dkv_final_terms = num_dkv_shards
+    dkv_final_stride = 1
 
 
 _DETERMINISTIC_KERNELS = {

@@ -1,4 +1,4 @@
-name: Mark and close stale PRs
+name: schedule
 
 on:
   schedule:

@@ -19,9 +19,11 @@ run them:
   - `deepseek_v4.py` - DeepSeek-V4 Flash (H64, K=640) and Pro (H128, K=1152), 2k..32k
   - `deepseek_v41.py` - DeepSeek-V4.1 Flash (H64, K=640, same per-query gather as V4), 2k..32k
   - `glm53.py` - GLM-5.3 (H64, d=576/512, K=2048) and GLM-5.3-Flash (H64, NoPE d=512, K=2048), 2k..32k
+  - `qsa.py` - Query Sparse Attention (24Q/2KV, d=256, 512 four-token blocks per query) at TP 1/2/4/8, 2k..32k
 - `runner.py` - Configuration-based benchmark runner (one subprocess per case)
-- `benchmark_single_dsa.py` - Single-case worker the runner calls; prints a `RESULT,` line
-- `config_types.py` - `ModelPreset`, `DsaBenchmarkConfig`, `BenchmarkResult`
+- `benchmark_single_dsa.py` - Single-case worker the runner calls for `kind="dsa"` presets; prints a `RESULT,` line
+- `benchmark_single_qsa.py` - The same for `kind="qsa"` presets (`cudnn.ops.qsa_forward` / `qsa_backward`)
+- `config_types.py` - `ModelPreset`, `with_tp_shards`, `DsaBenchmarkConfig`, `BenchmarkResult`
 - `charts.py` - Chart generation
 - `run_all.sh` - Runs configs and lands results in `results/<config>/<gpu>/`
 - `results/` - Benchmark outputs (CSV and charts)
@@ -106,6 +108,24 @@ indexer selects 512 four-token pools = 2048 raw tokens (the incomplete tail
 pool, <= 3 tokens, is omitted). Like every preset here, the rows are
 gathered as independent random rows, not as 4-row pools.
 
+`qsa` (`configs/qsa.py`, `kind="qsa"`): Query Sparse Attention, the
+block-sparse attention of the packed Miles training interface
+([docs](../../docs/operations/sparse_attention/qsa.md)). Unlike the DSA
+presets it is GQA over per-head K/V (no shared record), `d = 256`, and the
+selection is a bitmap of four-token blocks: each query gets up to 512 random
+complete causal blocks plus its partial tail block, i.e. the indexer's block
+budget, so early queries gather fewer blocks than the budget. The case is one
+packed sequence (`s_kv == s_q`), timed as the public `qsa_forward` /
+`qsa_backward` call (allocation, selection compaction and kernels — QSA has no
+preallocated execute path); TFLOPS count the tokens actually gathered. The
+24Q/2KV model is swept across tensor-parallel shards with
+`with_tp_shards(..., [1, 2, 4, 8])`, the same rule as
+[`../attention_inference`](../attention_inference/README.md): q heads divide,
+the two KV heads divide at TP 2 and replicate from TP 4 on, so the per-rank
+shapes are 24/2, 12/1, 6/1 and 3/1 (`qsa`, `qsa-tp2`, `qsa-tp4`, `qsa-tp8`).
+The kernels serve the first three; `qsa-tp8` is declined by the QSA contract
+and lands as a `skipped=True` row.
+
 To add a model, copy `configs/deepseek_v4.py`, edit the `ModelPreset`s
 (`num_q_heads`, `head_dim_qk` in `{512, 576}`, `topk`, `indexer_topk`,
 `has_sink`) and the `DsaBenchmarkConfig` (`seqlens`, `profile_pass`,
@@ -113,7 +133,10 @@ To add a model, copy `configs/deepseek_v4.py`, edit the `ModelPreset`s
 forward variants are `(H, d_qk)` in `{(64, 512), (64, 576), (128, 512)}` with
 `indexer_topk` in `{0, 512, 1024}` (`2048` for H64 too); backward accepts any
 head count with `d_qk` in `{512, 576}` and a deterministic mode on SM100 for
-H16/H32/H64/H96/H128.
+H16/H32/H64/H96/H128. A QSA preset (`kind="qsa"`, `num_kv_heads`,
+`block_size=4`, `head_dim_qk = head_dim_vo = 256`) is served for 24/2, 12/1
+and 6/1 query/KV heads on SM100-family GPUs; wrap either kind in
+`with_tp_shards` to sweep tensor-parallel shards.
 
 ### Output
 
@@ -129,6 +152,24 @@ results/<config>/<gpu>/
 
 ![DeepSeek-V4 DSA on B200](results/deepseek_v4/b200/deepseek_v4.webp)
 - `dsv4_flash: H=64, d=512, K=640 (indexer_topk=512)`; `dsv4_pro: H=128, d=512, K=1152 (indexer_topk=1024)`; bf16, sink + `topk_length`, non-deterministic backward.
+
+#### SM100 (development part) - QSA at TP 1/2/4/8
+
+![QSA at TP 1/2/4/8 on an SM100 development part](results/qsa/sm100/qsa.webp)
+- `qsa: H24/2`, `qsa-tp2: H12/1`, `qsa-tp4: H6/1`; `d=256`, bf16, up to 512
+  complete causal four-token blocks + the tail block per query, one packed
+  sequence per case; `qsa-tp8` (H3/1) is in the CSV as `skipped`.
+- Measured on a 68-SM, 33 MB-L2 compute-capability 10.0 development part
+  (`gpu_name` in the CSV), not a B200: read the rows as a functional reference
+  and for the shard-to-shard ratios, not as the architecture's throughput.
+  Entries for production GPUs land in `results/qsa/<arch>/` from
+  `run_all.sh <arch> "" qsa`.
+- Ratios that carry over: at 16k+ the TP 4 forward costs about the TP 2
+  forward (six valid columns of the same 16-column tile), and the TP 4
+  backward is ~0.85x the TP 2 backward per token at 32k (four 6-head queries
+  batched per CTA against two 12-head queries). On this part the TFLOPS fall
+  beyond 8k although the gathered tokens per query are flat (~1.8k at 8k,
+  ~2.0k at 32k); a production run decides how much of that is the part.
 
 ## Single Scripts
 
@@ -246,10 +287,9 @@ cuDNN Frontend `[cutedsl]` dependencies.
 ### Sparse Attention Backward
 
 Microbenchmark for the DeepSeek Sparse Attention (DSA) backward kernel in the
-cuDNN Frontend CuTe DSL package, driven through the public
-`cudnn.DSA.sparse_attention_backward_wrapper` API. The wrapper dispatches to
-the Hopper (SM90) or Blackwell (SM100) implementation based on the active
-CUDA device.
+cuDNN Frontend CuTe DSL package, driven through a compiled
+`DSA.SparseAttentionBackward` plan. Setup compiles the plan, and timed
+iterations call `plan.execute(...)` directly.
 
 #### What is measured
 
@@ -260,10 +300,10 @@ Inputs are flat MQA tensors: `q (S_q, H, d_qk)`, a shared
 reference so that this benchmark isolates backward and does not include a
 forward launch.
 
-Each timed iteration is one full wrapper call — gradient-buffer zeroing,
-workspace allocation, and the preprocess/backward/convert kernels — i.e. the
-cost a training step pays per backward invocation. Timing uses a single
-CUDA-event window around `--repeat` iterations and reports the average.
+The benchmark allocates the compiled plan, gradient buffers, and workspace
+during setup. Each timed iteration reuses those buffers and executes the
+compiled backward plan. Timing uses a single CUDA-event window around
+`--repeat` iterations and reports the average.
 
 Reported TFLOPS use the 5-matmul model of the backward pass (recompute S, dV,
 dP, dQ, dK):
@@ -299,9 +339,10 @@ python benchmark_dsa_sparse_attention_backward.py --nheads 128  # SM100/SM103 BF
 python benchmark_dsa_sparse_attention_backward.py --nheads 128 --head-dim 576 --csv d576_2cta.csv  # SM100/SM103 BF16 H128/D576 two-CTA backend
 ```
 
-The H128/D576 two-CTA route uses the same public-wrapper measurement, including
-workspace allocation and initialization. Add `--no-topk-length` to cover the
-variant without a lengths tensor; the default passes a full-length tensor.
+The H128/D576 two-CTA route uses the same compiled-plan measurement, with
+workspace allocation during setup and buffer reuse in timed calls. Add
+`--no-topk-length` to cover the variant without a lengths tensor; the default
+passes a full-length tensor.
 The existing benchmark arguments and CSV format apply to both variants.
 
 Options:
@@ -343,6 +384,31 @@ supported DSL.
 |     8192 |      8192 |  512 |  2.489 |     552.16 |
 |     8192 |      8192 | 1024 |  4.538 |     605.76 |
 |     8192 |      8192 | 2048 |  8.562 |     642.06 |
+
+##### SM100 deterministic relay scheduling (2026-10-30)
+
+Against merged commit `1dea4471a6e6c05e29d3bf281281fd156d345a84`, the
+deterministic H64/D576 relay path improved from 6.957 to 4.466 ms at Q=1K,
+KV=64K and from 101.409 to 64.426 ms at Q=16K, KV=512K with the same
+10.008 GiB workspace.
+Inputs were BF16 with top-k 2048, full runtime lengths, synthetic forward
+statistics, five warm-ups, and 40 allocation-free calls on the SM100 test
+environment (PyTorch 2.14.1+cu130, CuTe DSL 4.8.1, cuDNN 9.24.0).
+
+The automatic policy keeps the conservative eight-CTA relay below Q=8K
+because the earlier cluster-4 crossover did not generalize across SM100
+devices. An explicit Q=4K cluster-4 profiling experiment attributed its local
+gain primarily to the 32 main-kernel waves, whose total fell from 22.941 to
+9.696 ms; this is implementation evidence, not the portable automatic policy.
+The optimized trace has no separate dKV prefold kernel; fixed-order conversion
+takes 1.452 ms and workspace clearing 0.658 ms.
+
+NCU reports 96 registers per thread and 231.42 KiB dynamic shared memory for
+the cluster-4 main kernel, limiting residency to one CTA per SM; achieved
+occupancy is 26.33%, with 57.37% DRAM and 35.07% compute throughput. A
+144-CTA-wave experiment was rejected: 36 four-CTA clusters spill beyond one
+resident cluster wave and regress Q=4K from 12.017 ms/4.533 GiB to
+14.932 ms/5.096 GiB. The 128-CTA, 32-cluster wave is therefore intentional.
 
 #### Profiling
 

@@ -63,7 +63,7 @@ from cudnn.frost.tile_dsl.constants import (
 
 # The engine-contract record is deliberately SHARED: one lowering builds it, and
 # an arch-specific copy would let the two drift in ways the loader cannot see.
-from cudnn.sdpa.fwd.config_sm100 import TemplateParams, bshd_compact, bshd_zero_copy_stride
+from cudnn.sdpa.fwd.config_sm100 import TemplateParams, dense_bind_strides
 
 # The d512 2x2-DATAPATH record is shared with the SM100 line too (CfgD512X2 + its arch-neutral geometry checks); this
 # module adds only the Rubin arch facts to it (3-deep sub-chunk rings, DESC_VERSION derived from the layout, the 320 KiB
@@ -310,7 +310,7 @@ def supports_fp8_padded_split(d_shape, *, device_cc, pertensor, thd, paged):
 # setup-kernel contract (the 14-arg build_thd_meta_o_descs_kernel + the 4B+4
 # metadata the shared decode reads).  Keyed by the `flavor` string
 # `_validate_params` already receives, so adding a ported flavor is one entry.
-_F16_THD_FLAVORS = frozenset({"sm107 d128", "sm107 d192xd128", "sm107 d256", "sm107 d512"})
+_F16_THD_FLAVORS = frozenset({"sm107 d64", "sm107 d128", "sm107 d192xd128", "sm107 d256", "sm107 d512"})
 
 # Paged KV (TemplateParams.paged_kv / page_size) on the Rubin line uses the native half D128 and MXFP8 D128/D256
 # K/V TMA-LDG sites. Half D256 prefill and the single-Q THD split retain their shared bodies. The page id is the TMA
@@ -328,7 +328,7 @@ _PAGED_KV_FLAVORS_SM107 = frozenset({"sm107 d128", "sm107 d128 mxfp8", "sm107 d2
 # same one-definition-two-consumers arrangement as SM107_FP8_THD_SHAPES above
 # (engine row + standalone adapter gate; contract rule 8b').  Must stay in step
 # with _F16_THD_FLAVORS, which is the same fact keyed by config-flavor name.
-SM107_F16_THD_SHAPES = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+SM107_F16_THD_SHAPES = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
 
 # MXFP8 flavor names whose kernel body carries the FROST THD contract (the 14-arg
 # build_thd_meta_o_descs_kernel setup launch, the 4B+4 metadata, the persistent
@@ -384,21 +384,23 @@ SM107_SCORE_STATS_SHAPES = frozenset({(128, 128)})
 # engine row's d_shapes / cga domain, the adapter's kernel-file map and the tests -- rule 8b'); D > 128 belongs to the
 # d192 / d256 / d512 rows.
 #
-# The small tiles carry the row's DENSE leg only (causal / bottom-right / right band / SWA / padded / sink / GQA / Stats, at
-# the cga widths of SM107_SMALL_D_CGAS).  A graph that asks for a leg beyond it -- THD, paged KV, split-KV, PackGQA, the
-# score side outputs (``sm107_small_tile_leg``) -- or for a cga outside the tile's domain is NOT declined: the pick walks
-# PAST the small tiles to the next covering width, i.e. the d128 flavor the graph rode before the tiles existed (zero-filled
-# to 128, where those legs are wired and validated), so nothing the row served before the tiles is withdrawn.  The engine
-# row says it as ``Capabilities.dense_only_d_shapes``; the adapter's flavor pool and ``sm107_f16_tile_width(leg=, cga=)``
-# are the twins (rule 8b').  Serving a leg natively on a small tile = validating it there and taking the tile out of that set.
+# D32 carries the dense leg. D64 additionally carries nonpaged THD and PackGQA.
+# The per-shape domains below are shared by graph selection and the adapter;
+# every requested feature must fit. Other legs retain the larger envelope.
 SM107_HEAD_DIM_TILE_WIDTHS = (32, 64, 128)
 SM107_F16_SMALL_D_SHAPES = frozenset({(32, 32), (64, 64)})
+SM107_SMALL_D_NATIVE_LEGS = {(32, 32): frozenset(), (64, 64): frozenset({"THD", "PackGQA"})}
 # cga widths the small tiles are VALIDATED at (the engine row's ``cgas_by_d_shape`` reads this; the factory refuses a width
 # outside it).  cga1 is the default: the narrow slabs need no collective MMA to halve K/V, and a 512-row cga2 cluster wastes
 # 25-50 % of its Q rows at the S = 256-384 crops these tiles exist for.  At TILE_O = 32 a cga2 V operand would be 16 columns
 # = a 32-byte MN-major swizzle atom, which no shipped kernel runs -- declined until measured (a cga2 request at D <= 32 lands
 # on the 64-wide tile, the smallest covering one validated at that width).
 SM107_SMALL_D_CGAS = {(32, 32): frozenset({1}), (64, 64): frozenset({1, 2})}
+
+
+def supports_native_d64_pack(d_shape, *, device_cc, fp8, paged, split_kv=1, cga=None):
+    """Native half D64 packs dense or ragged queries without paged KV or splitting."""
+    return device_cc == (10, 7) and d_shape == (64, 64) and not fp8 and not paged and split_kv == 1 and cga in (None, 1, 2)
 
 
 def supports_native_d128_narrow_tile(d_shape, *, device_cc, half_precision, thd, paged, cga, split_kv=1, has_bias=False, has_kv_mask=False):
@@ -441,25 +443,25 @@ def sm107_small_tile_leg(
     pack_gqa: Optional[bool] = False,
     score_stats: bool = False,
     prefolded: bool = False,
+    allowed_legs: frozenset[str] = frozenset(),
 ) -> Optional[str]:
-    """The leg a graph asks for BEYOND the dense one the Rubin small head-dim tiles carry -- ``"THD"``, ``"paged KV"``,
-    ``"split-KV"``, ``"PackGQA"``, ``"score side outputs"`` or ``"pre-folded attention scale"`` (the row serves
-    ``sdpa(attn_scale_prefolded=True)`` on its d128+ flavors; the small tiles' bias / kv_mask bodies carry no pre-folded arm) --
-    or ``None`` for a graph on the dense leg.  A non-None leg
-    routes the graph past the small tiles onto the d128 flavor (the pre-tile route); the engine row spells the same predicate
-    on its graph facts and knobs (``engines._selected_d_shape`` over ``Capabilities.dense_only_d_shapes``), the adapter calls
-    this one, and the tests assert the two agree on every (D, leg) cell (rule 8b')."""
-    if thd:
+    """First requested feature outside a tile's native legs, or ``None``.
+
+    D32 carries dense plans; D64 also carries THD and PackGQA. Every requested
+    feature is checked, so allowing THD cannot hide an unsupported paged or split
+    combination. Graph selection and standalone admission share this predicate.
+    """
+    if thd and "THD" not in allowed_legs:
         return "THD"
-    if paged:
+    if paged and "paged KV" not in allowed_legs:
         return "paged KV"
-    if (split_kv or 1) > 1:
+    if (split_kv or 1) > 1 and "split-KV" not in allowed_legs:
         return "split-KV"
-    if pack_gqa:
+    if pack_gqa and "PackGQA" not in allowed_legs:
         return "PackGQA"
-    if score_stats:
+    if score_stats and "score side outputs" not in allowed_legs:
         return "score side outputs"
-    if prefolded:
+    if prefolded and "pre-folded attention scale" not in allowed_legs:
         return "pre-folded attention scale"
     return None
 
@@ -470,8 +472,8 @@ def sm107_f16_tile_width(d_qk: int, d_v: int, *, leg: Optional[str] = None, cga:
     128 native -- or ``None`` when no width covers them (D > 128: the d192 / d256 / d512 rows) or a dim is not a multiple of 8
     (the TMA 16-byte global-stride rule at 2 B/elem: a typed decline, never a padded copy).
 
-    ``leg`` (:func:`sm107_small_tile_leg`) and ``cga`` make the pick feature-aware: a small tile is taken only for a graph on
-    the dense leg (``leg is None``) at a cga inside :data:`SM107_SMALL_D_CGAS` (or unset); otherwise the walk continues to the
+    ``leg`` (:func:`sm107_small_tile_leg`) and ``cga`` make the pick feature-aware: a small tile is taken for dense plans
+    or a feature in :data:`SM107_SMALL_D_NATIVE_LEGS`, at a cga inside :data:`SM107_SMALL_D_CGAS` (or unset); otherwise the walk continues to the
     next covering width -- a split-KV / score-output graph at D <= 64 lands on 128 (its pre-tile route), a cga2 request at
     D <= 32 on 64.  The engine row (``d_shapes`` + ``dense_only_d_shapes``, the envelope walk of ``engines._selected_d_shape``)
     and the adapter (``api_dsl._pick_flavor`` over its Rubin pool) implement the SAME pick; the tests assert the three agree for
@@ -482,7 +484,10 @@ def sm107_f16_tile_width(d_qk: int, d_v: int, *, leg: Optional[str] = None, cga:
     for width in SM107_HEAD_DIM_TILE_WIDTHS:
         if d <= width:
             small = (width, width) in SM107_F16_SMALL_D_SHAPES
-            if small and (leg is not None or (cga is not None and cga not in SM107_SMALL_D_CGAS[(width, width)])):
+            if small and (
+                (leg is not None and leg not in SM107_SMALL_D_NATIVE_LEGS[(width, width)])
+                or (cga is not None and cga not in SM107_SMALL_D_CGAS[(width, width)])
+            ):
                 continue
             return width
     return None
@@ -1465,23 +1470,30 @@ SM107_SCALE_PREFOLDED_FLAVORS = frozenset(
 
 def epilogue_gate_layout_declarable(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int = 2) -> bool:
     """Whether a logical BHSD gate ``G`` binds ZERO-COPY on the Rubin d256 gated
-    kernels: BSHD-compact, or a token-major declaration TMA can express
-    (``config_sm100.bshd_zero_copy_stride``: D innermost-contiguous, then heads,
-    then tokens; seq/head strides 16-byte multiples; covering).
+    kernels: the native dense layout contract, ``config_sm100.dense_bind_strides``
+    -- the singleton axes canonicalized first, then BSHD-compact or an aligned
+    covering B/H/S permutation (D innermost-contiguous; every stepped batch, seq
+    and head byte stride a 16-byte multiple).
 
     The gate has NO normalisation-copy fallback (a hidden per-execute repack is
     what the engine contract forbids), so this predicate is STRICTER than
-    ``graph_analyzer.dense_layout_ok`` -- which admits any B/H/S stride order
-    and any 16-byte-unaligned stride because the Q/K/V/O path copies those.  It
-    is the ONE rule both sides of rule 8b consume: ``engines.mismatch`` applies
-    it to G before admitting a gated graph, and
-    ``api_dsl.SdpaFwdDslSm100.check_support`` raises on exactly the layouts it
-    rejects, so a plan that entered the ranked list can never die on G's layout
-    in the lowering.  ``elem_bytes`` defaults to the 2 B every Rubin gate kernel
+    ``layout.dense_layout_ok``, which admits any alignment.  It is the ONE rule
+    every consumer of G's layout makes the same call for (rule 8b lockstep): the
+    graph half ``graph_analyzer.gate_layout_ok`` (the engine rows decline a G it
+    refuses), ``api_dsl.SdpaFwdDslSm100.check_support`` (raises on exactly that
+    G, so a plan that entered the ranked list can never die on G's layout in the
+    lowering) and the binder (``prepared._dense_role_layout`` admits the
+    epilogue-gate port through the same call; the gate-in-combine binds the raw
+    BSHD strides, where a singleton axis is never stepped).  Canonicalizing FIRST
+    is what makes the three agree: a gate sliced out of a fused projection slab at
+    batch 1 x one query token keeps the slab's token pitch on both singleton axes
+    (``(13312, 256, 13312, 1)`` for 24 heads) and is BSHD-compact once they are
+    normalized -- a compactness test on the raw strides refused it while the graph
+    half admitted it.  ``elem_bytes`` defaults to the 2 B every Rubin gate kernel
     stores (``_CfgSm107.GATE_BPE``: Q-dtype on the half kernels, bf16 on the
     quantized one).
     """
-    return bshd_compact(shape_bhsd, stride_bhsd) or bshd_zero_copy_stride(shape_bhsd, stride_bhsd, elem_bytes) is not None
+    return dense_bind_strides(tuple(int(x) for x in shape_bhsd), tuple(int(x) for x in stride_bhsd), int(elem_bytes)) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -2394,10 +2406,13 @@ def make_cfg_d32(params: TemplateParams) -> Tuple[CfgD32, TmaIters]:
 
 
 def make_cfg_d64(params: TemplateParams) -> Tuple[CfgD64, TmaIters]:
-    """The 64-wide head-dim tile of ``sm107/prefill_d128_f16.py`` (``TemplateParams.d_flavor=64``): every f16/bf16 head dim in
-    (32, 64] with D % 8 == 0 (40 / 48 / 56 / 64) by TMA zero fill; the same feature set and routing as ``make_cfg_d32`` (cga1
-    and cga2). Per-tensor FP8 uses the same native width in ``prefill_d128_fp8.py``,
-    including dense PackGQA and split-KV; its THD and paged forms remain unsupported."""
+    """The 64-wide head-dim tile of ``sm107/prefill_d128_f16.py`` (``TemplateParams.d_flavor=64``).
+
+    Half-precision dense plans use aligned logical widths up to 64 by TMA zero fill;
+    native THD uses exact D64. Both CTA widths carry THD and PackGQA.
+    Per-tensor FP8 uses the same native width in ``prefill_d128_fp8.py``,
+    including dense PackGQA and split-KV; its THD and paged forms remain unsupported.
+    """
     if params.dtype_qkv <= _DTYPE_E5M2 and params.thd_varlen:
         raise ValueError("sm107 d64: per-tensor FP8 THD is not wired at the native D64 width")
     return _make_cfg_d128_family(params, flavor="sm107 d64", tile_k=64, tile_o=64, mxfp8=False)
@@ -2988,11 +3003,15 @@ _REG_FILE_PER_CTA = 65536
 # "epilogue_gate": the item's gate tile (O's shape, the token's G heads) aliased into its freed Q^T slot after the item's last
 # BMM1 (GATE_TX_BYTES = the box), O gated in place after the dead-row SELECT, the LSE untouched; it touches the Q^T slot ring
 # and the epilogue only, so it composes with either of the two arms above (the gate is O-shaped on every arm).
-# The THD and paged arms are wired ONE AT A TIME: a record asking for both is refused by the validator below (the packed
-# sequence's K / V row offset cu_k[b] composes with a dense [1, T_kv, H_kv, D] tensor only, never with a page pool) until a
-# serving stack asks for the combination -- it then lands with its own accept cells.
+# The THD and paged arms COMPOSE with "bottom_right" only (2026-10-30: the packed EXTEND form over the pools -- a THD x PAGED x
+# BOTTOM_RIGHT record): under THD the paged arm's gather row comes from the block table's row of the sequence the THD decode found
+# (cu_k[b], the dense arm's row term, is unread there) and the row's position from the per-sequence KV lengths the setup launch stores
+# (meta[b] = the serving kv_lens[b]).  THD x PAGED on the TOP-LEFT diagonal is refused by the validator below (a packed self-attention
+# over a page pool has no serving meaning), as is THD x BOTTOM_RIGHT over the dense [1, T_kv, H_kv, D] K / V (there the position is
+# the token's offset in its sequence).
 # "bottom_right": the row's key-space position is tok + (eff_seqlen_kv_b - eff_seqlen_q_b) (the dense tiles' bottom-right
-# diagonal); the Q / O / LSE coordinate stays the row index; pos < 0 is a dead row.  Dense BSHD only (not under THD).
+# diagonal); the Q / O / LSE coordinate stays the row index; pos < 0 is a dead row.  Dense BSHD, paged pools, and under THD over
+# paged pools (the packed EXTEND form); never under THD over the dense K / V.
 # "list_per_sequence": the decode / MTP form -- block_ids [B, BLOCK_TOPK] and block_lens [B], ONE list per sequence read by every
 # item of the sequence (every KV head, split and token), the count and the appended tail anchored at the STEP-0 position
 # pos_0 = eff_seqlen_kv_b - eff_seqlen_q_b (0, 1 or 2 tail ids at S_q <= 4: every token from the step-0 tail start to the row's
@@ -3421,17 +3440,21 @@ def _validate_cfg_d256_sparse(cfg: CfgD256Sparse, flavor: str = _SPARSE_FLAVOR) 
                 f"form); a top-left per-sequence list has no serving meaning",
             ),
             (
-                not (cfg.BOTTOM_RIGHT and cfg.THD_VARLEN),
-                f"{flavor}: bottom_right under THD is not served -- the packed form's position is the token's offset in its sequence (top-left)",
+                not (cfg.BOTTOM_RIGHT and cfg.THD_VARLEN) or cfg.PAGED_KV == 1,
+                f"{flavor}: bottom_right under THD is not served on the DENSE packed form -- there the position is the token's offset in its sequence "
+                f"(top-left); the composition is served over PAGED pools only (THD x PAGED x BOTTOM_RIGHT: the packed EXTEND form over a cached prefix, "
+                f"the position tok + (kv_len_b - q_len_b) from the per-sequence KV lengths)",
             ),
             (
                 not cfg.THD_VARLEN or cfg.SEQ_KV_LENS_PRESENT == 1,
                 f"{flavor}: THD/varlen must force SEQ_KV_LENS_PRESENT=1, or every sequence attends the whole pack",
             ),
             (
-                not (cfg.THD_VARLEN and cfg.PAGED_KV),
-                f"{flavor}: THD x paged is not served -- the packed sequence's K / V row offset (cu_k[b]) composes with a dense [1, T_kv, H_kv, D] "
-                f"tensor only, never with a page pool; one of THD_VARLEN / PAGED_KV per record (the adapter declines the combination by name)",
+                not (cfg.THD_VARLEN and cfg.PAGED_KV) or cfg.BOTTOM_RIGHT == 1,
+                f"{flavor}: THD x paged is not served on the TOP-LEFT diagonal -- a packed self-attention over a page pool has no serving meaning "
+                f"(the dense arm's row term cu_k[b] is what a top-left packed form addresses K / V by); the composition is served with BOTTOM_RIGHT "
+                f"(THD x PAGED x BOTTOM_RIGHT: the packed EXTEND form over a cached prefix -- the K / V rows through the page table, the position "
+                f"from the per-sequence KV lengths; the adapter declines the top-left composition by name)",
             ),
             (not cfg.SEQ_Q_LENS_PRESENT or cfg.SEQ_KV_LENS_PRESENT == 1, f"{flavor}: SEQ_Q_LENS_PRESENT requires SEQ_KV_LENS_PRESENT"),
             (cfg.SCHEDULER_POLICY == SCHED_NATURAL, f"{flavor}: the item scheduler is NATURAL in v1 (LPT needs per-item costs)"),

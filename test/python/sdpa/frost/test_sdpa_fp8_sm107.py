@@ -26,6 +26,14 @@ pytestmark = [pytest.mark.L0, requires_dsl]
 _E4M3, _BF16_OUT = 0, 2
 
 
+class TestNativeHalfRegisterRelease:
+    """Cross-compile the half kernel through the selected SM107 CI entry."""
+
+    from sm107_register_release_checks import test_service_warpgroup_has_one_register_release as _release
+
+    test_service_warpgroup_has_one_register_release = staticmethod(_release)
+
+
 @pytest.fixture(autouse=True)
 def _mock_target_for_cross_arch_contracts(monkeypatch):
     # This module tests Rubin metadata on non-Rubin hosts too. Match its fake
@@ -1817,29 +1825,21 @@ def test_fp8_d256_compile_cli_uses_prepared_entry(rubin, monkeypatch):
     assert calls == [True]
 
 
-# Retain staged conversion coverage in the explicitly selected architecture CI entry.
-import test_sdpa_staged_forward_mxfp8 as _staged_mxfp8_checks
+# Retain native stride coverage in the explicitly selected architecture CI entry.
+import native_forward_mxfp8_cases as _native_mxfp8_checks
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7), reason="SM107 required")
-class TestStagedSm107Mxfp8:
-    test_mixed_layout = staticmethod(_staged_mxfp8_checks.test_sm107_d256_mxfp8_staging_preserves_each_native_operand)
-    test_pointer_rebind = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_uses_pointer_host_and_current_scales)
-    test_fp8_output = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_fp8_output_without_optional_outputs)
-    test_invalid_scales = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_sf_rejects_before_copy)
-    test_wide_stride = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_physical_wide_batch_stride)
-    test_pv_bf16 = staticmethod(_staged_mxfp8_checks.test_staged_pv_bf16_keeps_v_width_and_omits_sf_v)
-    test_artifact_reload = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_artifact_reloads_without_jit)
-    test_block_output = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_block_output_matches_native_graph)
-    test_compile_cli = staticmethod(_staged_mxfp8_checks.test_mxfp8_compile_cli_uses_prepared_entry)
-
-
-@pytest.mark.L0
-@requires_dsl
-class TestMixedStagedFp8:
-    from test_sdpa_staged_forward_fp8 import test_sm107_d256_staging_preserves_each_native_operand as _mixed_layout
-
-    test_mixed_layout = staticmethod(_mixed_layout)
+class TestNativeSm107Mxfp8Strides:
+    test_mixed_layout = staticmethod(_native_mxfp8_checks.test_sm107_d256_mxfp8_strided_preserves_each_native_operand)
+    test_pointer_rebind = staticmethod(_native_mxfp8_checks.test_mxfp8_native_uses_pointer_host_and_current_scales)
+    test_fp8_output = staticmethod(_native_mxfp8_checks.test_mxfp8_native_fp8_output_without_optional_outputs)
+    test_invalid_scales = staticmethod(_native_mxfp8_checks.test_mxfp8_native_sf_rejects_before_launch)
+    test_wide_stride = staticmethod(_native_mxfp8_checks.test_mxfp8_native_physical_wide_batch_stride)
+    test_pv_bf16 = staticmethod(_native_mxfp8_checks.test_native_pv_bf16_keeps_v_width_and_omits_sf_v)
+    test_artifact_reload = staticmethod(_native_mxfp8_checks.test_mxfp8_native_artifact_reloads_without_jit)
+    test_block_output = staticmethod(_native_mxfp8_checks.test_mxfp8_native_block_output_matches_native_graph)
+    test_compile_cli = staticmethod(_native_mxfp8_checks.test_mxfp8_compile_cli_uses_prepared_entry)
 
 
 @pytest.mark.parametrize("d", [128, 192, 512])
@@ -2140,3 +2140,37 @@ class TestNativeD64Fp8Narrow:
 
     test_rebind_replay = staticmethod(narrow_rebind_replay)
     test_standalone = staticmethod(narrow_standalone)
+
+
+import native_forward_fp8_cases as _native_fp8_checks
+
+
+@pytest.mark.L0
+@requires_dsl
+class TestNativeFp8Strides:
+    test_fp8_native_uses_pointer_host_and_current_storage = staticmethod(_native_fp8_checks.test_fp8_native_uses_pointer_host_and_current_storage)
+    test_native_default_stream_is_resolved_for_q_device = staticmethod(_native_fp8_checks.test_native_default_stream_is_resolved_for_q_device)
+    test_native_default_stream_with_another_device_current = staticmethod(_native_fp8_checks.test_native_default_stream_with_another_device_current)
+    test_fp8_native_strided_stats = staticmethod(_native_fp8_checks.test_fp8_native_strided_stats)
+    test_native_physical_wide_batch_stride = staticmethod(_native_fp8_checks.test_native_physical_wide_batch_stride)
+    test_native_artifact_reloads_without_jit = staticmethod(_native_fp8_checks.test_native_artifact_reloads_without_jit)
+    test_native_block_output_matches_native_graph = staticmethod(_native_fp8_checks.test_native_block_output_matches_native_graph)
+    test_native_invalid_operand_is_rejected_before_any_launch = staticmethod(_native_fp8_checks.test_native_invalid_operand_is_rejected_before_any_launch)
+    test_native_amax_alias_checks_original_operand = staticmethod(_native_fp8_checks.test_native_amax_alias_checks_original_operand)
+    test_native_sf_alias_checks_original_operand = staticmethod(_native_fp8_checks.test_native_sf_alias_checks_original_operand)
+    test_native_paged_qo_preserves_kv_pool_views = staticmethod(_native_fp8_checks.test_native_paged_qo_preserves_kv_pool_views)
+    test_sm107_d256_strided_preserves_each_native_operand = staticmethod(_native_fp8_checks.test_sm107_d256_strided_preserves_each_native_operand)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeD64Half:
+    """Native D64 regressions collected by the SM107 CI entrypoint."""
+
+    import native_d64_sm107_test_utils as _checks
+
+    test_independent_origins = staticmethod(_checks.test_native_d64_independent_origins)
+    test_ragged_replay = staticmethod(_checks.test_native_d64_ragged_replay)
+    test_dense_pack_replay = staticmethod(_checks.test_native_d64_dense_pack_replay)
+    test_standalone_compact_thd = staticmethod(_checks.test_native_d64_standalone_compact_thd)

@@ -36,7 +36,8 @@ class NormBwdKnobs:
 @dataclass(frozen=True)
 class Capabilities:
     variants: frozenset = _ALL_VARIANTS
-    arch: tuple = (10, 0)
+    # Device ccs served, matched exactly: B200 / GB200 and B300 / GB300 run the same kernels.
+    archs: frozenset = frozenset({(10, 0), (10, 3)})
     phase: str = "bprop"
     dtypes: frozenset = _ALL_DTYPES
 
@@ -45,17 +46,23 @@ def mismatch(capabilities: Capabilities, facts: "ga.NormGraphFacts", requested: 
     """First reason this engine cannot serve these facts, or None if it can."""
     if facts.invalid:
         return facts.invalid
+    if facts.extended_affine:
+        from cudnn.norm.affine import mismatch as affine_mismatch
+
+        reason = affine_mismatch(facts)
+        if reason is not None:
+            return reason
     if requested is not None and not isinstance(requested, NormBwdKnobs):
         return f"knob request is a {type(requested).__name__}, not NormBwdKnobs — wrong operation's vocabulary"
     if facts.phase != capabilities.phase:
         return f"engine serves {capabilities.phase}; graph is {facts.phase}"
     if facts.variant not in capabilities.variants:
         return f"engine does not serve norm variant {facts.variant.value}"
-    if facts.device_cc != capabilities.arch:
-        return f"requires SM{capabilities.arch[0]}{capabilities.arch[1]}; current device is {facts.device_cc}"
+    if facts.device_cc not in capabilities.archs:
+        return f"requires {' or '.join(f'SM{a}{b}' for a, b in sorted(capabilities.archs))}; current device is {facts.device_cc}"
     if facts.dtype not in capabilities.dtypes:
         return f"dtype {facts.dtype} not in {sorted(str(d) for d in capabilities.dtypes)}"
-    if not facts.uniform_dtype:
+    if not facts.uniform_dtype and not facts.extended_affine:
         return "DY dtype must match X"
     return None
 
@@ -68,7 +75,11 @@ class EngineSpec:
 
 
 ENGINE_NAME = "norm_bprop_sm100"
-ENGINE_SPECS = (EngineSpec(name=ENGINE_NAME, capabilities=Capabilities()),)
+# The SM90 row runs the same kernels (cp.async.bulk, clusters and mapa are all Hopper).
+ENGINE_SPECS = (
+    EngineSpec(name=ENGINE_NAME, capabilities=Capabilities()),
+    EngineSpec(name="norm_bprop_sm90", capabilities=Capabilities(archs=frozenset({(9, 0)}))),
+)
 
 
 def analyze_for(graph):
@@ -102,6 +113,11 @@ def lower_norm_bprop(spec: EngineSpec, facts: "ga.NormGraphFacts", requested: Op
     """Default lowering: resolve buffers at execute time and call
     :func:`cudnn.norm.bprop.api.norm_bprop` (dispatches by ``facts.variant``);
     outputs are copied into the graph's DX / Dscale / Dbias buffers."""
+    if facts.extended_affine:
+        from cudnn.norm.affine import lower
+
+        return lower(facts)
+
     from cudnn.norm.bprop.api import bprop_workspace_bytes, norm_bprop
 
     binding = ga.NormBinding(

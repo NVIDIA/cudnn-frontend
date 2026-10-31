@@ -14,7 +14,7 @@ and declined typed everywhere else (the one-batch-entry paths hand-unroll two su
 
 Tiers: CPU contract (the record field, the measured rule, the factory's derived warp table / split / arriver counts, the pool equality, the
 TMEM map, the bias budget at three slabs, the typed declines of the factory and the adapter incl. the knob-less rule cells), host rendering pins
-(sm_107a trace-compile: the three-group renderings of the default class carry the split (``USETMAXREG`` 7 = 2 INCREASE sites + 5 DECREASE), no
+(sm_107a trace-compile: the three-group renderings of the default class carry the split (``USETMAXREG`` 4 = 2 INCREASE sites + 2 DECREASE), no
 cluster drain, the bit-word mask form, and spill within the measured bound; the two-group renderings' byte identity to the committed records is
 pinned by the streamed module), GPU (Rubin): the DEFAULT class knob-less on both tiles (the pick -> record -> plan chain end to end, the
 record's ``softmax_wgs`` read off the loaded module) and the public option on the bias-only pair item (a ring wrap with a dead chunk tail, a
@@ -302,8 +302,8 @@ def _probe(tmp_path, params, tag):
 
 @pytest.mark.parametrize("arm", list(_WG3_ARMS))
 def test_the_three_group_rendering_carries_the_split_the_chain_and_the_mask_form(tmp_path, arm):
-    """Each 3-WG rendering traced for sm_107a is a different kernel from its 2-WG twin, keeps a real register split (`USETMAXREG` 7: the two
-    softmax INCREASE sites -- WG0's arm and the shared WG1 / WG2 arm -- + 5 DECREASE), no cluster-scope drain, one more TMA issue site per
+    """Each 3-WG rendering traced for sm_107a is a different kernel from its 2-WG twin, keeps a real register split (`USETMAXREG` 4: the two
+    softmax INCREASE sites -- WG0's arm and the shared WG1 / WG2 arm -- + 2 DECREASE (correction and the common service-warpgroup site)), no cluster-scope drain, one more TMA issue site per
     operand (the third Q / K / V / O slab), the bit-word mask form on the masked arm, 1.5x the MUFU.EX2 sites (three softmax bodies) and the
     extra named barrier of the hand-off chain; its spills stay within the measured bound (the pins above)."""
     base = _probe(tmp_path, dict(_WG3_ARMS[arm], softmax_wgs=2), f"wg2_{arm}")
@@ -311,7 +311,7 @@ def test_the_three_group_rendering_carries_the_split_the_chain_and_the_mask_form
     assert (base.expect["SOFTMAX_WARPGROUPS"], probe.expect["SOFTMAX_WARPGROUPS"]) == (2, 3)
     assert (probe.expect["TOTAL_WARPS"], probe.expect["TILES_Q"], probe.expect["READ_TILE_ARRIVERS"], probe.expect["BIAS_PRELOAD_EFF"]) == (20, 3, 19, 0)
     assert probe.cubin_md5 != base.cubin_md5
-    assert probe.stats["USETMAXREG"] == 7 and probe.stats["CGAERRBAR"] == 0, probe.stats
+    assert probe.stats["USETMAXREG"] == 4 and probe.stats["CGAERRBAR"] == 0, probe.stats
     assert probe.stats["UTMALDG"] > base.stats["UTMALDG"], (probe.stats, base.stats)
     assert probe.stats["BAR.SYNC"] > base.stats["BAR.SYNC"], "the chain's second link (named barrier 9) adds named-barrier sites"
     assert probe.stats["MUFU.EX2"] == base.stats["MUFU.EX2"] * 3 // 2, (probe.stats["MUFU.EX2"], base.stats["MUFU.EX2"])

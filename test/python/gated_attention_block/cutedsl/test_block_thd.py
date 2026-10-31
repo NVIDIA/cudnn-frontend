@@ -90,6 +90,7 @@ def _cc():
 
 # The REGISTERED marker of cutedsl/conftest.py (the skip is applied at collection).
 requires_rubin = pytest.mark.requires_rubin
+requires_blackwell = pytest.mark.requires_blackwell  # the registered marker: an admitted Blackwell-line part of DENSE_SERVING_CCS (cc 10.0; 2026-10-29)
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 
 _COMMON = dict(d_model=512, h_q=8, h_kv=2, d_head=256, rope_dim=64)
@@ -561,6 +562,18 @@ def test_thd_rejects_zero_tokens():
             num_sequences=1,
             max_seq_len=2,
         )
+
+
+@requires_blackwell
+def test_thd_over_the_blocks_own_kv_is_declined_by_name_on_cc_10_0():
+    """On cc 10.0 (2026-10-29) the packed self-attention form (``thd=True`` over the block's own K / V) is a typed decline at
+    ``check_support`` naming the lift (its oracle cells on that part); the EXTEND form -- ``thd=True`` with ``kv_source="paged"`` -- is
+    the packed form served there (``test_block_serving_extend.py``'s cc 10.0 cells)."""
+    blk, *_ = _declare_thd(_COMMON, _LENS)
+    assert blk.thd and blk.kv_source == "self"
+    with pytest.raises(NotImplementedError, match="thd=True over the block's own K / V") as e:
+        blk.check_support()
+    assert "cc 10.0" in str(e.value) and "EXTEND form" in str(e.value) and "the lift" in str(e.value)
 
 
 def _declared_for_execute(geom_kw=_COMMON, lens=_LENS, *, training=False, cu=False):

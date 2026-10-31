@@ -85,7 +85,7 @@ print(json.dumps(dict(digest=expected, stats=compiled_cache.stats())))
 
 
 def _fp8_case(
-    block, *, plane_stride=None, mxfp8=False, stats=False, dtype=torch.float8_e4m3fn, scale_o=True, amax=True, b=2, h=1, sq=128, skv=128, staged=False
+    block, *, plane_stride=None, mxfp8=False, stats=False, dtype=torch.float8_e4m3fn, scale_o=True, amax=True, b=2, h=1, sq=128, skv=128, strided=False
 ):
     cc = torch.cuda.get_device_capability()
     arch = "sm107" if cc == (10, 7) else "sm100" if cc in ((10, 0), (10, 3)) else "sm120"
@@ -102,8 +102,8 @@ def _fp8_case(
     vp, ts = {}, {}
     for name, seq in (("q", sq), ("k", skv), ("v", skv)):
         buf = (torch.randn(b, seq, h, d, device="cuda", generator=generator) * 0.4).to(dtype).transpose(1, 2)
-        if staged:
-            padded = torch.full((b, seq, h, d + 1), 12, device="cuda", dtype=dtype)
+        if strided:
+            padded = torch.full((b, seq, h, d + 16), 12, device="cuda", dtype=dtype)
             padded[..., :d].copy_(buf.transpose(1, 2))
             buf = padded[..., :d].transpose(1, 2)
         ts[name] = g.tensor_like(buf)
@@ -146,9 +146,9 @@ def _fp8_case(
     o.set_output(True).set_dim([b, h, sq, d]).set_stride([sq * h * d, d, h * d, 1])
     o.set_data_type(cudnn.data_type.FP4_E2M1 if block == 16 else cudnn.data_type.FP8_E4M3)
     output = torch.empty((b, sq, h, d // (2 if block == 16 else 1)), device="cuda", dtype=torch.uint8 if block == 16 else torch.float8_e4m3fn).transpose(1, 2)
-    if staged:
+    if strided:
         pack = 2 if block == 16 else 1
-        padded = torch.full((b, sq, h, d // pack + 1), 12, device="cuda", dtype=output.dtype)
+        padded = torch.full((b, sq, h, d // pack + 16), 12, device="cuda", dtype=output.dtype)
         output = padded[..., : d // pack].transpose(1, 2)
         o.set_stride([stride * pack if axis != 3 else 1 for axis, stride in enumerate(output.stride())])
     amax_buf = None
@@ -168,7 +168,7 @@ def _fp8_case(
     g.select_plan(len(g.plans) - 1)
     g.check_support()
     g.build_plans()
-    assert (g._compiled_plans[g._plan_index]._prepared is None) == staged
+    assert g._compiled_plans[g._plan_index]._prepared.spec.native is not None
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     ts.update(o=o, sf_o=sf_t)
     return g, vp, ws, output.view(torch.uint8), sf, amax_buf, ts

@@ -197,9 +197,7 @@ def test_sm120_does_not_split_a_full_part(zero_copy):
     than a fixed 1 that only holds on one device."""
     result = _sm120_case(64, 8, 1024, 16384, zero_copy=zero_copy)
     assert result.split == result.expected_split
-    conversion_bytes = 0 if zero_copy else 2 * (64 * 1024 + 8 * 16384) * 128 * 2
-    assert result.workspace_bytes >= conversion_bytes
-    assert (result.workspace_bytes > conversion_bytes) == (result.split > 1), "only splits add partial slabs beyond the conversion buffers"
+    assert (result.workspace_bytes > 0) == (result.split > 1), "both layouts bind natively; only splits need partial slabs"
     assert (result.output - result.reference).abs().max().item() <= 2e-2
 
 
@@ -437,19 +435,14 @@ def test_sm120_fp8_split_matches_unsplit(out_dtype):
 
 @pytest.mark.parametrize("zero_copy", [False, True])
 def test_sm120_quantized_split_reduces_in_half(zero_copy):
-    """Partials stay half; only the staged final-O buffer follows O's dtype."""
+    """Both layouts bind directly; partials stay half for either final-O dtype."""
     from cudnn.sdpa.fwd.api_dsl import ws_align
 
     _, _, _, ws_fp8 = _sm120_fp8_case(8, 1, 128, 8192, out_dtype=torch.float8_e4m3fn, split_kv=4, zero_copy=zero_copy)
     _, _, _, ws_half = _sm120_fp8_case(8, 1, 128, 8192, out_dtype=torch.float16, split_kv=4, zero_copy=zero_copy)
     partials = ws_align(4 * 8 * 128 * 128 * 2) + ws_align(4 * 8 * 128 * 4)
     core = partials + ws_align(8)  # Amax scratch and the identity scalar
-    # Q needs a compact copy on the staged path; the one-head K/V already
-    # have compact physical storage. The final O copy has its own dtype.
-    q_bytes = 0 if zero_copy else ws_align(8 * 128 * 128)
-    o_elements = 0 if zero_copy else 8 * 128 * 128
-    assert ws_fp8 == core + q_bytes + ws_align(o_elements)
-    assert ws_half == core + q_bytes + ws_align(o_elements * 2)
+    assert ws_fp8 == ws_half == core
 
 
 @pytest.mark.parametrize("scale", [0.5, 2.0])
