@@ -116,12 +116,14 @@ def configuration(q_tensor, k_tensor, v_tensor, indices, nums, count, block_size
     placed = {d for x in (q_tensor, k_tensor, v_tensor, indices, nums) if isinstance(x, jax.Array) and not isinstance(x, jax.core.Tracer) for d in x.devices()}
     if len(placed) > 1:
         raise ValueError("all BSA arrays must be on the same GPU")
-    if placed:
+    tracing = any(isinstance(x, jax.core.Tracer) for x in (q_tensor, k_tensor, v_tensor, indices, nums))
+    if not tracing:
         # Committed arrays: compile for the device they are on.
         gpu_arch = {_SM100_FAMILY[str(d.compute_capability)] for d in placed if is_sm100(d)}
     else:
-        # Traced arrays carry no device, and the device XLA runs the call on is not visible here: read the target off the local
-        # SM100-family GPUs, and refuse a host that exposes both architectures rather than compile for the wrong one.
+        # Under tracing -- every input a tracer, or only some, the rest captured concrete arrays -- the device XLA runs the call on
+        # is not visible here: read the target off the local SM100-family GPUs, and refuse a host that exposes both architectures
+        # rather than compile for the wrong one.
         gpu_arch = {_SM100_FAMILY[str(d.compute_capability)] for d in jax.local_devices() if is_sm100(d)}
         if len(gpu_arch) > 1:
             raise ValueError(

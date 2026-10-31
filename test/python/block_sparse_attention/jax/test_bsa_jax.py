@@ -117,7 +117,7 @@ def test_the_target_follows_the_arrays_eagerly_and_refuses_a_mixed_host_under_tr
     for the wrong one. Host-modeled: ``jax.local_devices`` is patched, the arrays stay on this GPU, nothing compiles."""
     from cudnn.block_sparse_attention import jax_api
 
-    q, k, v, indices, _ = inputs()
+    q, k, v, indices = inputs()[:4]
     (device,) = q.devices()
     own = jax_api._SM100_FAMILY[str(device.compute_capability)]
 
@@ -130,14 +130,20 @@ def test_the_target_follows_the_arrays_eagerly_and_refuses_a_mixed_host_under_tr
         seen.append(config(q, k, v, indices))
         return q
 
+    def traced_q(q):  # k / v / indices captured as committed arrays: still a traced call
+        seen.append(config(q, k, v, indices))
+        return q
+
     monkeypatch.setattr(jax, "local_devices", lambda *args, **kwargs: [_ModeledGpu(cc) for cc in visible])
     assert config(q, k, v, indices).gpu_arch == own
-    with pytest.raises(ValueError, match="cannot tell SM100 from SM103"):
-        jax.make_jaxpr(traced)(q, k, v, indices)
+    for run in (lambda: jax.make_jaxpr(traced)(q, k, v, indices), lambda: jax.make_jaxpr(traced_q)(q)):
+        with pytest.raises(ValueError, match="cannot tell SM100 from SM103"):
+            run()
     for cc in visible:
         monkeypatch.setattr(jax, "local_devices", lambda *args, cc=cc, **kwargs: [_ModeledGpu(cc), _ModeledGpu(cc)])
         jax.make_jaxpr(traced)(q, k, v, indices)
-        assert seen[-1].gpu_arch == jax_api._SM100_FAMILY[cc]
+        jax.make_jaxpr(traced_q)(q)
+        assert seen[-1].gpu_arch == seen[-2].gpu_arch == jax_api._SM100_FAMILY[cc]
         assert config(q, k, v, indices).gpu_arch == own
 
 
