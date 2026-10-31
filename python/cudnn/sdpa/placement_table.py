@@ -4,7 +4,7 @@
 """Measured placement table: FROST row vs the backend, per shape class, generated from frozen sweeps.
 
 A class is read off the graph facts (row, device, dtype, head pair, phase, layout, mask, sink, MHA vs GQA, and whether
-S_kv is off the 128-key tile). Each entry
+S_kv is off the 128-key tile; a decode-shaped GQA graph the row cannot pack is its own group). Each entry
 is a monotone rule on ONE scalar from :data:`FEATURES` -- the roofline-shaped cost proxy :func:`log2_work`, the
 parallel-tile count :func:`log2_tiles`, the query rows :func:`log2_q_rows` or the KV per request :func:`log2_kv`, whichever the class's data is monotone in: ``always``, ``never``, ``ge T`` (FROST leads
 from T up) or ``le T`` (FROST leads up to T). Entries are produced by ``benchmark/placement_gen`` from a training grid
@@ -55,6 +55,22 @@ def _unmeasured(facts) -> bool:
     )
 
 
+def _unpacked_decode(row: str, facts) -> bool:
+    """A decode-shaped GQA graph the FROST forward row cannot pack (every query head re-reads K/V): a different kernel regime
+    from the packed graphs the studies measured (paged d512 at G = 12-96 ran 5-21x slower than its packed neighbours). The
+    row's own heuristics decide it, so the class follows the kernel rather than a shape proxy."""
+    if not row.startswith("sdpa_fwd") or facts.s_q > 4 or facts.h_q == facts.h_kv:
+        return False
+    from cudnn.sdpa.fwd import heuristics
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next((s for s in ENGINE_SPECS if s.name == row), None)
+    if spec is None:
+        return False
+    caps = spec.capabilities
+    return heuristics._pack_gqa_group(caps, facts, 128, heuristics._pack_gqa_eligible(caps, facts, 128)) == 1
+
+
 def class_key(row: str, facts) -> Optional[Tuple]:
     dtype = _dtype_name(facts.dtype)
     if dtype is None or _unmeasured(facts) or not facts.h_kv or facts.h_q % facts.h_kv:
@@ -78,7 +94,7 @@ def class_key(row: str, facts) -> Optional[Tuple]:
         mask = "causal_br" if facts.bottom_right else "causal_tl"
     else:
         mask = "none"
-    group = "mha" if facts.h_q == facts.h_kv else "gqa"
+    group = "mha" if facts.h_q == facts.h_kv else ("gqa_unpacked" if _unpacked_decode(row, facts) else "gqa")
     # Off the 128-key tile dense KV cannot split and paged KV measures differently near the boundary: its own class, which
     # an on-tile study never answers.
     kv_off_tile = facts.s_kv % 128 != 0

@@ -25,17 +25,18 @@ import collections
 import json
 import math
 import sys
-from types import SimpleNamespace
 
 import cudnn
 from cudnn.sdpa import placement_table as pt
+from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
 
 _DTYPES = {"bf16": cudnn.data_type.BFLOAT16, "f16": cudnn.data_type.HALF}
 
 
 def _facts_inference(c, s):
     """Inference harness (generation phase): q tokens per request, dense or paged KV (case field, else the study default)."""
-    return SimpleNamespace(
+    paged = c.get("layout", s.get("layout", "dense")) == "paged"
+    return SdpaGraphFacts(
         b=c["b"],
         h_q=c["hq"],
         h_kv=c.get("hkv", 1),
@@ -48,8 +49,10 @@ def _facts_inference(c, s):
         bottom_right=True,
         window_left=c.get("window"),
         has_sink=bool(c.get("sink")),
-        has_paged_kv=c.get("layout", s.get("layout", "dense")) == "paged",
-        thd=False,
+        has_paged_kv=paged,
+        page_size=c.get("page", 64) if paged else 0,
+        padded=paged,
+        thd=bool(c.get("thd", False)),
         max_total_seq_len_q=None,
         device_cc=tuple(s["device_cc"]),
         has_bias=False,
@@ -62,7 +65,7 @@ def _facts_training(c, s):
     """Training harness: s_q == s_kv == s; THD at fill < 1 declares its live total (ragged)."""
     thd = c["layout"] == "thd"
     total = c["b"] * c["s"] if c.get("fill", 1.0) >= 1.0 else int(c["b"] * c["s"] * (1 + c["fill"]) / 2)
-    return SimpleNamespace(
+    return SdpaGraphFacts(
         b=c["b"],
         h_q=c["hq"],
         h_kv=c["hkv"],

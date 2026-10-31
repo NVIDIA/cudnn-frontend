@@ -5,12 +5,12 @@
 between table-decided and hand-rule graphs."""
 
 import math
-from types import SimpleNamespace
 
 import pytest
 
 import cudnn
 from cudnn.sdpa import placement_table as pt
+from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
 
 
 def _facts(**over):
@@ -36,7 +36,7 @@ def _facts(**over):
         right_band_widening=False,
     )
     base.update(over)
-    return SimpleNamespace(**base)
+    return SdpaGraphFacts(**base)
 
 
 @pytest.mark.L0
@@ -50,7 +50,7 @@ def test_entries_are_well_formed_and_name_known_rows():
         assert row in rows, key
         assert isinstance(cc, tuple) and len(cc) == 2 and dtype in ("bf16", "f16") and len(heads) == 2
         assert phase in ("q1", "mtp", "prefill") and layout in ("dense", "paged", "thd", "thd_ragged")
-        assert mask in ("none", "window", "causal_br", "causal_tl") and isinstance(sink, bool) and group in ("mha", "gqa")
+        assert mask in ("none", "window", "causal_br", "causal_tl") and isinstance(sink, bool) and group in ("mha", "gqa", "gqa_unpacked")
         assert isinstance(kv_off_tile, bool)
         assert entry.direction in ("always", "never", "ge", "le") and entry.study
         assert (entry.log2_work is None) == (entry.direction in ("always", "never"))
@@ -135,3 +135,18 @@ def test_off_tile_dense_d576_decode_reads_query_rows():
         assert pt.lookup(row, _facts(b=b, h_q=h_q, **dense)) is False
     for b, h_q in ((4, 96), (3, 128), (48, 8)):
         assert pt.lookup(row, _facts(b=b, h_q=h_q, **dense)) is True
+
+
+@pytest.mark.L0
+def test_decode_the_row_cannot_pack_is_its_own_group():
+    """A decode-shaped GQA graph the FROST row cannot pack re-reads K/V per query head -- another kernel regime (paged d512
+    at G = 12-96: 5-21x slower than packed neighbours). The row's own pack decision splits the class, so the packed study
+    never answers for it; a flavor that packs a partial group (D576 at G = 96 packs 32) keeps the packed class."""
+    row = "sdpa_fwd_prefill_sm100"
+    d512 = dict(d_qk=512, d_v=512, h_kv=1, b=8, s_kv=65536, page_size=64, padded=True)
+    assert pt.class_key(row, _facts(h_q=96, **d512))[8] == "gqa_unpacked"
+    assert pt.lookup(row, _facts(h_q=96, **d512)) is None  # no study measured it: the hand rule decides
+    assert pt.class_key(row, _facts(h_q=64, **d512))[8] == "gqa"
+    assert pt.lookup(row, _facts(h_q=64, **d512)) is True
+    assert pt.class_key(row, _facts(h_q=96, page_size=64, padded=True))[8] == "gqa"  # D576 packs 32 of 96
+    assert pt.class_key(row, _facts(h_q=96, s_q=1024, **d512))[8] == "gqa"  # prefill: s_q fills the tile, no packing regime
