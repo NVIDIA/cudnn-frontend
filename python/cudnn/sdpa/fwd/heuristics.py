@@ -2414,7 +2414,7 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
         ):
             # Unsplit native D64 without a window: while the unpacked launch fits one wave, every CTA streams the whole KV once
             # either way and the packed CTA also computes G heads' rows, so unpacked leads; past one wave, or under a window,
-            # packed does (measured on cc 10.7 across s_q 1-4 and KV 4k-128k with sinks, 2026-10-31; PR #2118).
+            # packed does (cc 10.7 study, PR #2118).
             wins = False
         if _sm107_fp8_dense_d128(caps, facts):
             # Packed never trails unpacked here at any S_q: unpacked pads every head's last 512-row tile (q576: 1.43-1.75x

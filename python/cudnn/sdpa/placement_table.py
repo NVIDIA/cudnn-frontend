@@ -332,8 +332,7 @@ TABLE: Dict[Tuple, Entry] = {
     # study sm107_dense_decode_20261031 (cuDNN 9.29.0.18; cc 10.7, 216 SMs; dense bf16 decode and MTP, s_q 1-4: d64 with the gpt-oss
     # masks (sink, window + sink, neither), GQA 4 / 8; d256 without a sink, GQA 4-16; b 1-128, S_kv 3k-128k on and off the tile;
     # 396 train + 52 scored random holdout cells incl. groups 5, 6, 12; d256 single-row decode keeps the hand order: its
-    # frontier moves with the group, which one cost threshold per class cannot follow; the 10-31 nightly found a G16 cell
-    # below the grid's S_kv where the fitted threshold would regress)
+    # frontier moves with the group, which one cost threshold per class cannot follow)
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "mtp", "dense", "causal_br", False, "gqa", False): Entry(
         "always", None, "sm107_dense_decode_20261031"
     ),
