@@ -154,7 +154,7 @@ def test_decode_the_row_cannot_pack_is_its_own_group():
 
 @pytest.mark.L0
 def test_cc103_borrows_only_the_studies_its_transfer_check_named(monkeypatch):
-    """cc 10.3 has no studies of its own; it answers with a cc 10.0 entry only when that entry's study is in
+    """Where cc 10.3 has no entry of its own, it answers with a cc 10.0 entry only when that entry's study is in
     PART_TRANSFERS[(10, 3)] (study sm103_transfer_20261031) -- never a later cc 10.0 study by default."""
     row = "sdpa_fwd_prefill_sm100"
     base, studies = pt.PART_TRANSFERS[(10, 3)]
@@ -188,3 +188,34 @@ def test_a_square_entry_reaches_the_runtime_from_either_corner(monkeypatch, s):
     for verdict, expected in (("never", placement.TRAIL), ("always", placement.LEAD)):
         monkeypatch.setattr(pt, "TABLE", {key: pt.Entry(verdict, None, "synthetic")})
         assert placement.place(spec, tl) == placement.place(spec, br) == expected
+
+
+@pytest.mark.L0
+def test_cc103_d256_backward_thd_entries_are_its_own():
+    """cc 10.3's own d256 backward entries answer with no transfer: THD on the 128-key tile (study sm103_d256_bwd_v2_20261031,
+    THD half) and off it (study sm103_d256_bwd_thd_offtile_20261031). The same graph on cc 10.0 has no entry, so the
+    hand-written box decides there. The mask-free MHA classes split on the cost proxy, at their own threshold off the tile.
+    Dense graphs have no entry: they lost on small-work holdout cases."""
+    row = "sdpa_bwd_sm100_d256"
+
+    def bwd(b, h_q, h_kv, s, causal=True, **over):
+        base = dict(b=b, h_q=h_q, h_kv=h_kv, s_q=s, s_kv=s, d_qk=256, d_v=256, causal=causal, has_paged_kv=False, device_cc=(10, 3))
+        base.update(thd=True, max_total_seq_len_q=b * s)
+        base.update(over)
+        return _facts(**base)
+
+    assert pt.lookup(row, bwd(2, 16, 2, 4096)) is True  # THD causal GQA: always
+    assert pt.lookup(row, bwd(2, 16, 2, 4096, max_total_seq_len_q=6 * 1024)) is True  # ragged causal GQA: always
+    assert pt.lookup(row, bwd(2, 16, 2, 4096, device_cc=(10, 0))) is None
+    small, large = bwd(1, 8, 8, 256, causal=False), bwd(1, 16, 16, 1024, causal=False)
+    assert pt.log2_work(small) < 28.5 <= pt.log2_work(large)
+    assert (pt.lookup(row, small), pt.lookup(row, large)) == (False, True)
+    assert pt.lookup(row, bwd(2, 16, 2, 4096, thd=False, max_total_seq_len_q=None)) is None  # dense: no entry
+    assert pt.lookup(row, bwd(2, 16, 2, 4096, dtype=cudnn.data_type.HALF)) is None  # f16: not measured
+    assert pt.lookup(row, bwd(2, 16, 2, 4000)) is True  # off the 128-key tile: THD causal GQA, always
+    assert pt.lookup(row, bwd(2, 16, 2, 4000, max_total_seq_len_q=6 * 1000)) is True  # ragged, off the tile
+    assert pt.lookup(row, bwd(2, 16, 2, 4000, device_cc=(10, 0))) is None
+    small, large = bwd(1, 8, 8, 1000, causal=False), bwd(1, 16, 16, 3000, causal=False)
+    assert pt.log2_work(small) < 30.374 <= pt.log2_work(large)
+    assert (pt.lookup(row, small), pt.lookup(row, large)) == (False, True)
+    assert pt.lookup(row, bwd(2, 16, 2, 4000, thd=False, max_total_seq_len_q=None)) is None  # dense off the tile: no entry

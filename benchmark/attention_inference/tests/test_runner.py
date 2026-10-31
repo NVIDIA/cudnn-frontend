@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
-from benchmark.attention_inference.config_types import InferenceBenchmarkConfig, ModelPreset
+from benchmark.attention_inference.config_types import InferenceBenchmarkConfig, ModelPreset, attn_mask
 from benchmark.attention_inference.configs.qwen35 import CONFIG as QWEN35
 from benchmark.attention_inference.runner import InferenceBenchmarkRunner
 
@@ -133,3 +133,13 @@ class RequestLensTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_attn_mask_names_the_alignment_the_graph_is_built_with():
+    """The result row records the diagonal alignment benchmark_single_attention gives the cuDNN graph."""
+    assert attn_mask("context", True, 2048, 2048, None) == "top_left"
+    assert attn_mask("context", True, 512, 65536, None) == "bottom_right"
+    assert attn_mask("context", False, 2048, 2048, None) == "no_mask"
+    assert attn_mask("generation", True, 1, 8192, None) == "no_mask"
+    assert attn_mask("generation", True, 1, 8192, 128) == "bottom_right"
+    assert attn_mask("generation", True, 4, 8192, None) == "bottom_right"

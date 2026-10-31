@@ -147,7 +147,8 @@ PART_TRANSFERS: Dict[Tuple[int, int], Tuple[Tuple[int, int], FrozenSet[str]]] = 
     # cc 10.0 grid (201 cases) plus 56 off-lattice holdout cases, timed on cc 10.3 and scored through the full placement:
     # regret 1.000-1.025 per family (holdout 1.000) against develop's 1.035-2.98; of 115 changed routes one is slower than
     # develop (1.11x, the 32-tile d256 boundary the cc 10.0 grid also measured as mixed). Only these studies answer for
-    # cc 10.3 -- a new cc 10.0 study does not, until a transfer check names it here.
+    # cc 10.3 -- a new cc 10.0 study does not, until a transfer check names it here. Entries keyed (10, 3) themselves (a
+    # study run on cc 10.3, e.g. the d256 backward below) answer first and need no transfer.
     (10, 3): (
         (10, 0),
         frozenset(
@@ -331,8 +332,8 @@ TABLE: Dict[Tuple, Entry] = {
     # study sm107_dense_decode_20261031 (cuDNN 9.29.0.18; cc 10.7, 216 SMs; dense bf16 decode and MTP, s_q 1-4: d64 with the gpt-oss
     # masks (sink, window + sink, neither), GQA 4 / 8; d256 without a sink, GQA 4-16; b 1-128, S_kv 3k-128k on and off the tile;
     # 396 train + 52 scored random holdout cells incl. groups 5, 6, 12; d256 single-row decode keeps the hand order: its
-    # frontier moves with the group, which one cost threshold per class cannot follow -- the 10-31 nightly found G16 at
-    # S_kv 2k, below the grid, 1.5x slower)
+    # frontier moves with the group, which one cost threshold per class cannot follow; the 10-31 nightly found a G16 cell
+    # below the grid's S_kv where the fitted threshold would regress)
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "mtp", "dense", "causal_br", False, "gqa", False): Entry(
         "always", None, "sm107_dense_decode_20261031"
     ),
@@ -441,4 +442,49 @@ TABLE: Dict[Tuple, Entry] = {
         "always", None, "sm103_swa_prefill_20261031"
     ),
     ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (64, 64), "prefill", "paged", "window", True, "gqa", True): Entry("always", None, "sm103_swa_prefill_20261031"),
+    # study sm103_d256_bwd_v2_20261031, THD half (B300 SXM6 1100 W, cuDNN 9.28.0.38; 129 train cases: S 128-32k, b 1-128, GQA 16/2 /
+    # 32/4 / 32/1 / 64/2 and MHA 16/16; 24 off-lattice holdout cases). The dense classes have no entry: they lost on small-work
+    # holdout cases there, and their refit (study sm103_d256_bwd_v3_20261031) lost again on its own holdout.
+    ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill", "thd", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm103_d256_bwd_v2_20261031"
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill", "thd", "causal_br", False, "mha", False): Entry("ge", 28.0, "sm103_d256_bwd_v2_20261031"),
+    ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill", "thd", "none", False, "gqa", False): Entry("ge", 28.5, "sm103_d256_bwd_v2_20261031"),
+    ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill", "thd", "none", False, "mha", False): Entry("ge", 28.5, "sm103_d256_bwd_v2_20261031"),
+    ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill", "thd_ragged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm103_d256_bwd_v2_20261031"
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill", "thd_ragged", "causal_br", False, "mha", False): Entry(
+        "ge", 28.5, "sm103_d256_bwd_v2_20261031"
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill", "thd_ragged", "none", False, "gqa", False): Entry(
+        "always", None, "sm103_d256_bwd_v2_20261031"
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill", "thd_ragged", "none", False, "mha", False): Entry("ge", 28.5, "sm103_d256_bwd_v2_20261031"),
+    # study sm103_d256_bwd_thd_offtile_20261031, the off-tile twins of the classes above (B300 SXM6 1100 W, cuDNN 9.28.0.38;
+    # 80 train cases: S 200-30000 off the 128-key tile, b 1-164, GQA 16/2 / 8/1 and MHA 16/16 / 6/6; 24 off-lattice holdout cases)
+    ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill", "thd", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm103_d256_bwd_thd_offtile_20261031"
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill", "thd", "causal_br", False, "mha", True): Entry(
+        "always", None, "sm103_d256_bwd_thd_offtile_20261031"
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill", "thd", "none", False, "gqa", True): Entry(
+        "always", None, "sm103_d256_bwd_thd_offtile_20261031"
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill", "thd", "none", False, "mha", True): Entry(
+        "ge", 30.374, "sm103_d256_bwd_thd_offtile_20261031"
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill", "thd_ragged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm103_d256_bwd_thd_offtile_20261031"
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill", "thd_ragged", "causal_br", False, "mha", True): Entry(
+        "always", None, "sm103_d256_bwd_thd_offtile_20261031"
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill", "thd_ragged", "none", False, "gqa", True): Entry(
+        "always", None, "sm103_d256_bwd_thd_offtile_20261031"
+    ),
+    ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill", "thd_ragged", "none", False, "mha", True): Entry(
+        "ge", 30.374, "sm103_d256_bwd_thd_offtile_20261031"
+    ),
 }

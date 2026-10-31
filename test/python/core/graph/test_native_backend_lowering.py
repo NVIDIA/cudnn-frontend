@@ -36,6 +36,14 @@ def _assert_ran_on_backend(g):
     assert g._cpp_plans_created and g._is_built
 
 
+def _bar_frost_norm(g):
+    """The FROST norm engines are default candidates on the parts they serve (cc 10.0 / 10.3; cc 9.0 opt-in) and claim these
+    norm graphs there: bar them by name, so the norm tests keep covering the generic structured-op lowering to the backend."""
+    from cudnn.engines.manifest import MANIFEST
+
+    return g.deselect_engines([name for fam in MANIFEST if fam.name in ("frost_norm_fwd", "frost_norm_bwd") for name in fam.slots])
+
+
 @pytest.mark.parametrize("implementation", [cudnn.attention_implementation.AUTO, cudnn.attention_implementation.UNIFIED])
 @pytest.mark.parametrize("opt_in", ["0", "1"])
 def test_sm10x_block_mask_requires_fixed_backend(cudnn_handle, monkeypatch, implementation, opt_in):
@@ -377,7 +385,7 @@ def test_native_layernorm_fwd_bwd_lowers_to_backend():
     Y.set_output(True).set_data_type(cudnn.data_type.HALF)
     mean.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     iv.set_output(True).set_data_type(cudnn.data_type.FLOAT)
-    g.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    _bar_frost_norm(g).build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     Yb = cl(torch.empty(Nb, C, 1, 1, device="cuda", dtype=torch.float16))
     mb = torch.empty(Nb, 1, 1, 1, device="cuda", dtype=torch.float32)
     ivb = torch.empty(Nb, 1, 1, 1, device="cuda", dtype=torch.float32)
@@ -399,7 +407,7 @@ def test_native_layernorm_fwd_bwd_lowers_to_backend():
     DX, DS, DB = g2.layernorm_backward(grad=DY, input=X2, scale=S2, mean=M2, inv_variance=IV2)
     for t in (DX, DS, DB):
         t.set_output(True).set_data_type(cudnn.data_type.HALF)
-    g2.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    _bar_frost_norm(g2).build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     dxb = cl(torch.empty(Nb, C, 1, 1, device="cuda", dtype=torch.float16))
     dsb = cl(torch.empty(1, C, 1, 1, device="cuda", dtype=torch.float16))
     dbb = cl(torch.empty(1, C, 1, 1, device="cuda", dtype=torch.float16))
@@ -474,7 +482,7 @@ def test_native_rmsnorm_lowers_to_backend():
     assert set(node.inputs) == {"input", "scale", "epsilon", "bias"}
     assert set(node.outputs) == {"Y", "inv_var"}
 
-    g.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    _bar_frost_norm(g).build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({X: x, S: scale, Bi: bias, E: eps_cpu, Y: Yb, iv: ivb}, ws, handle=h)
     torch.cuda.synchronize()
