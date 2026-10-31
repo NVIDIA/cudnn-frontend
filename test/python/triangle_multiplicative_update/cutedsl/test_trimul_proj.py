@@ -49,6 +49,11 @@ def _arch() -> str:
     return sub.body_arch_for_cc(_cc()) if _cc() in sub.ARCHS_BY_CC else "sm107"
 
 
+def _target():
+    """The live device's own CuTe target for that body (cc 10.3 compiles the sm100 body for ``sm_103a``); None off a served part."""
+    return sub.target_for_cc(_cc()) if _cc() in sub.ARCHS_BY_CC else None
+
+
 requires_served_arch = pytest.mark.skipif(
     _cc() not in _SERVED, reason=f"the LN-prologue dual GEMM is rendered for compute capabilities {_SERVED} only; found {_cc()}"
 )
@@ -233,6 +238,37 @@ def test_body_path_names_one_rendered_body_per_arch():
             sub.body_arch_for_cc(cc)
     with pytest.raises(ValueError, match="rendered body"):
         sub.validate_ln_dual_gemm_params(k1.proj_params(128, 128, has_bias=True, has_mask=True), "sm120")
+
+
+def test_each_served_part_compiles_the_body_for_its_own_target(monkeypatch):
+    """cc 10.3 runs the sm100 body but loads only an ``sm_103a`` cubin: the builder renders a module per target (the loader's extra key, so
+    the two parts never share a module or a compiled artifact) and compiles it for that target; the home target keeps the historical key.
+    Host-modeled: the loader is patched and ``compile()`` returns the options it would compile with."""
+    from cudnn.frost import template_loader
+
+    if cutedsl_requirement_error("the LayerNorm-prologue dual GEMM"):
+        pytest.skip("the builder's DSL gate declines before loading")
+    assert sub.TARGETS_BY_CC == {(10, 0): "sm_100a", (10, 3): "sm_103a", (10, 7): "sm_107a"}
+    assert [sub.target_for_cc(cc) for cc in ((10, 0), (10, 3), (10, 7))] == ["sm_100a", "sm_103a", "sm_107a"]
+    with pytest.raises(NotImplementedError, match="10.0, 10.3, 10.7"):
+        sub.target_for_cc((12, 0))
+    loads = []
+
+    def load(path, params, tag="template", extra_key=None):
+        loads.append(extra_key)
+        home = "sm_107a" if path.endswith("sm107_dual_gemm.py") else "sm_100a"
+        return SimpleNamespace(frost_compile_options=f"--enable-tvm-ffi --gpu-arch {home}", compile=lambda: None)
+
+    monkeypatch.setattr(template_loader, "load_template", load)
+    p = k1.proj_params(128, 128, has_bias=True, has_mask=True)
+    build = sub.build_ln_dual_gemm.__wrapped__
+    for target in (None, "sm_100a", "sm_103a"):
+        assert build(p, "sm100", target).module.frost_compile_options == f"--enable-tvm-ffi --gpu-arch {target or 'sm_100a'}"
+    assert build(p, "sm107", "sm_107a").module.frost_compile_options == "--enable-tvm-ffi --gpu-arch sm_107a"
+    assert loads == [None, None, ("gpu_arch", "sm_103a"), None]
+    for arch, target in (("sm100", "sm_107a"), ("sm107", "sm_103a")):
+        with pytest.raises(ValueError, match="does not compile for"):
+            build(p, arch, target)
 
 
 def test_the_k_cap_follows_the_arch_body():
@@ -524,7 +560,7 @@ def _reference(inp, c, eps):
 
 def _build_k1(params):
     """The K1 plan on the live device's body (:func:`_arch`): a cell's cubin is the arch's, never the Rubin body's on a Blackwell part."""
-    return k1.build_trimul_proj(params, _arch())
+    return k1.build_trimul_proj(params, _arch(), _target())
 
 
 def _launch(plan, inp, c, planes, stats, stream, *, w_stack=None, b_stack=None, k_block=None):

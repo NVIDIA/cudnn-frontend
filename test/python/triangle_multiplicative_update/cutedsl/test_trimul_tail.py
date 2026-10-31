@@ -51,6 +51,11 @@ def _arch() -> str:
     return sub.body_arch_for_cc(_cc()) if _cc() in sub.ARCHS_BY_CC else "sm107"
 
 
+def _target():
+    """The live device's own CuTe target for that body (cc 10.3 compiles the sm100 body for ``sm_103a``); None off a served part."""
+    return sub.target_for_cc(_cc()) if _cc() in sub.ARCHS_BY_CC else None
+
+
 requires_served_arch = pytest.mark.skipif(
     _cc() not in _SERVED, reason=f"the LN-prologue dual GEMM is rendered for compute capabilities {_SERVED} only; found {_cc()}"
 )
@@ -354,7 +359,7 @@ def _stacked_biases(inp, p_ob=None):
 
 def _build_k3(params):
     """The K3 plan on the live device's body (:func:`_arch`): a cell's cubin is the arch's, never the Rubin body's on a Blackwell part."""
-    return k3.build_trimul_tail(params, _arch())
+    return k3.build_trimul_tail(params, _arch(), _target())
 
 
 def _launch(plan, inp, out, stats, stream, *, weights=None, residual=None, biases=None, k_block=None):

@@ -67,6 +67,13 @@ def _arch() -> str:
     return _sub.body_arch_for_cc(_cc()) if _cc() in _sub.ARCHS_BY_CC else "sm107"
 
 
+def _target():
+    """The live device's own CuTe target for that body (cc 10.3 compiles the sm100 body for ``sm_103a``); None off a served part."""
+    from cudnn.gemm.frost import ln_prologue as _sub
+
+    return _sub.target_for_cc(_cc()) if _cc() in _sub.ARCHS_BY_CC else None
+
+
 requires_served_arch = pytest.mark.skipif(
     _cc() not in _SERVED, reason=f"triangle_multiplicative_update is rendered for compute capabilities {_SERVED} only; found {_cc()}"
 )
@@ -575,7 +582,7 @@ def test_api_equals_the_hand_chained_kernels_bitwise():
     flat = torch.full((math.prod(pshape) + k2.k2_slack_bytes(n_res) // 2,), _SENTINEL, device="cuda", dtype=torch.bfloat16)  # planes + the over-read slack
     planes = flat[: math.prod(pshape)].view(*pshape)
     k1.run_trimul_proj(
-        k1.build_trimul_proj(k1.proj_params(c, c, has_bias=True, has_mask=True, want_stats=False), _arch()),
+        k1.build_trimul_proj(k1.proj_params(c, c, has_bias=True, has_mask=True, want_stats=False), _arch(), _target()),
         x,
         w.w_in,
         planes,
@@ -593,7 +600,7 @@ def test_api_equals_the_hand_chained_kernels_bitwise():
     compiled({bd.a_operands[0]: a_v, bd.b_operands[0]: b_v, bd.outputs[0]: y_v}, stream=stream)
     out = torch.empty_like(x)
     k3.run_trimul_tail(
-        k3.build_trimul_tail(k3.tail_params(c, c, has_bias=True, want_stats=False), _arch()),
+        k3.build_trimul_tail(k3.tail_params(c, c, has_bias=True, want_stats=False), _arch(), _target()),
         y,
         x,
         w.p_out_weight,
