@@ -5,8 +5,8 @@
 
 A class is read off the graph facts (row, device, dtype, head pair, phase, layout, mask, sink, MHA vs GQA, and whether
 S_kv is off the 128-key tile). Each entry
-is a monotone rule on ONE scalar from :data:`FEATURES` -- the roofline-shaped cost proxy :func:`log2_work` or the
-parallel-tile count :func:`log2_tiles`, whichever the class's data is monotone in: ``always``, ``never``, ``ge T`` (FROST leads
+is a monotone rule on ONE scalar from :data:`FEATURES` -- the roofline-shaped cost proxy :func:`log2_work`, the
+parallel-tile count :func:`log2_tiles`, the query rows :func:`log2_q_rows` or the KV per request :func:`log2_kv`, whichever the class's data is monotone in: ``always``, ``never``, ``ge T`` (FROST leads
 from T up) or ``le T`` (FROST leads up to T). Entries are produced by ``benchmark/placement_gen`` from a training grid
 and qualified on a frozen holdout; every entry names its study. Do not edit entries by hand -- regenerate.
 
@@ -106,7 +106,17 @@ def log2_tiles(facts) -> float:
     return math.log2(max(1, facts.b * facts.h_kv * -(-facts.s_q * group // 128)))
 
 
-FEATURES = {"cost": log2_work, "tiles": log2_tiles}
+def log2_q_rows(facts) -> float:
+    """log2 of the query rows in flight, b * h_q * s_q: what fills the SMs when KV cannot split and one tile runs all heads."""
+    return math.log2(max(1, facts.b * facts.h_q * facts.s_q))
+
+
+def log2_kv(facts) -> float:
+    """log2 of the KV tokens per request: what amortizes a kernel's fixed per-launch cost over its KV loop."""
+    return math.log2(max(1, facts.s_kv))
+
+
+FEATURES = {"cost": log2_work, "tiles": log2_tiles, "rows": log2_q_rows, "kv": log2_kv}
 """The scalars a class may be thresholded on; the generator picks, per class, the one its data is monotone in."""
 
 
@@ -140,4 +150,34 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "q1", "paged", "none", False, "gqa", False): Entry("ge", 26.588, "sm100_d576_decode_v2_20261028"),
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "q1", "paged", "none", False, "gqa", True): Entry("ge", 26.131, "sm100_d576_decode_v2_20261028"),
+    # study sm100_d512_paged_decode_b100_20261030 (cc 10.0 B100 850 W, cuDNN 9.29.0.17; 120 on-tile + 27 off-tile cells, one KV head,
+    # h_q 8-128, b 1-128, S_kv 4k-128k, page 16/64, fill 0.25/1; the same threshold on the B200 grid: regret 1.002)
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (512, 512), "q1", "paged", "none", False, "gqa", False): Entry(
+        "ge", 26.5, "sm100_d512_paged_decode_b100_20261030"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (512, 512), "q1", "paged", "none", False, "gqa", True): Entry(
+        "ge", 26.486, "sm100_d512_paged_decode_b100_20261030"
+    ),
+    # study sm100_d512_paged_context_20261030 (cuDNN 9.29.0.17; one KV head, h_q 8-128, THD Q 16-8192 over S_kv 16-128k, b 1-4; B200 for
+    # the 512+ grid, B100 for off-tile and short-KV cells; short KV runs the kernel's fixed cost, so the on-tile class reads S_kv)
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (512, 512), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
+        "ge", 9.0, "sm100_d512_paged_context_20261030", "kv"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (512, 512), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
+        "ge", 30.5, "sm100_d512_paged_context_20261030"
+    ),
+    # study sm100_d256_paged_context_20261030 (cuDNN 9.29.0.17; GQA 4-32x, THD Q 16-8192 over S_kv 16-128k, page 16/64, b 1-4; same split
+    # of parts as the d512 context study)
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
+        "ge", 9.0, "sm100_d256_paged_context_20261030", "kv"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
+        "ge", 28.999, "sm100_d256_paged_context_20261030"
+    ),
+    # study sm100_d576_dense_decode_20261030 (cuDNN 9.29.0.17; dense K/V, h_q 8-128, b 1-128, S_kv 4k-128k: on the tile on B200,
+    # off it on B100 plus 18 cells at 384-768 query rows; off the tile KV cannot split, so the unsplit tile follows b * h_q)
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "q1", "dense", "none", False, "gqa", False): Entry("ge", 26.09, "sm100_d576_dense_decode_20261030"),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "q1", "dense", "none", False, "gqa", True): Entry(
+        "ge", 8.293, "sm100_d576_dense_decode_20261030", "rows"
+    ),
 }

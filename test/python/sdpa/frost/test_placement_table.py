@@ -122,3 +122,16 @@ def test_off_tile_dense_d256_decode_reads_parallel_tiles():
         assert pt.lookup(row, _facts(s_kv=s_kv, b=16, **d256)) is False
         assert pt.lookup(row, _facts(s_kv=s_kv, b=64, **d256)) is True
         assert pt.lookup(row, _facts(s_kv=s_kv, b=40, **d256)) is True  # 33-63 tiles measured on 9.28 and 9.26 (review on #1957)
+
+
+@pytest.mark.L0
+def test_off_tile_dense_d576_decode_reads_query_rows():
+    """Off the KV tile the unsplit tile runs every head of a request, so dense D576 decode follows the query rows b * h_q,
+    not the cost: 256 rows lose (1.13-1.25 on the training grid) and 384 win (0.86-0.90), for any b / h_q split."""
+    row = "sdpa_fwd_prefill_sm100"
+    dense = dict(has_paged_kv=False, d_qk=576, d_v=512, h_kv=1, s_kv=32765)
+    assert pt.TABLE[pt.class_key(row, _facts(b=1, h_q=8, **dense))].feature == "rows"
+    for b, h_q in ((8, 32), (2, 128), (32, 8)):
+        assert pt.lookup(row, _facts(b=b, h_q=h_q, **dense)) is False
+    for b, h_q in ((4, 96), (3, 128), (48, 8)):
+        assert pt.lookup(row, _facts(b=b, h_q=h_q, **dense)) is True
