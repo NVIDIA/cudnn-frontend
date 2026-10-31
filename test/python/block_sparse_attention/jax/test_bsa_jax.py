@@ -86,7 +86,7 @@ def test_multi_gpu_process_runs_on_the_arrays_device():
     devices = jax.local_devices()
     if len(devices) < 2:
         pytest.skip("needs a process with more than one visible GPU")
-    sm100 = [d for d in devices if d.platform == "gpu" and str(getattr(d, "compute_capability", "")) == "10.0"]
+    sm100 = [d for d in devices if d.platform == "gpu" and str(getattr(d, "compute_capability", "")) in ("10.0", "10.3")]
     target = sm100[-1]
     q, k, v, indices = [jax.device_put(x, target) for x in inputs()[:4]]
     expected, expected_lse = reference(q, k, v, indices, None, "bhsd")
@@ -270,8 +270,8 @@ import jax
 import jax.numpy as jnp
 from cudnn.jax import block_sparse_attention as attention
 from cudnn.tensor_adapter import get_compute_capability
-assert get_compute_capability() == (10, 0)
-assert get_compute_capability(0) == (10, 0)
+assert get_compute_capability() in ((10, 0), (10, 3))
+assert get_compute_capability(0) == get_compute_capability()
 q = jnp.ones((1, 1, 256, 64), jnp.bfloat16)
 i = jnp.broadcast_to(jnp.arange(2, dtype=jnp.int32), (1, 1, 2, 2))
 grad = jax.jit(jax.grad(lambda q: attention(q, q, q, i, 2).astype(jnp.float32).sum()))(q)
