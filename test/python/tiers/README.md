@@ -18,9 +18,9 @@ SMOKE is a subset of FULL, FULL of CI's L0, CI's L0 of NIGHTLY.
 carries a tier and moving a cell is a one-line edit of a list:
 
 - `smoke_<arch>.txt` -- one list per compute capability, `arch` = `cc<major><minor>` of the GPU the process runs on (`cc107`
-  on Rubin, `cc100` on B200 / GB200). A capability without a list has an EMPTY SMOKE tier -- `-m smoke` then selects nothing
-  (exit 5) and `conftest.py` says so in one `[tiers] no SMOKE list for this GPU ...` line on stderr. `CUDNN_TEST_TIER_ARCH=cc107`
-  applies another arch's list on any host (to inspect or collect it).
+  on Rubin, `cc100` on B200 / GB200, `cc103` on B300 / GB300). A capability without a list has an EMPTY SMOKE tier --
+  `-m smoke` then selects nothing (exit 5) and `conftest.py` says so in one `[tiers] no SMOKE list for this GPU ...` line on
+  stderr. `CUDNN_TEST_TIER_ARCH=cc107` applies another arch's list on any host (to inspect or collect it).
 - `nightly_only.txt` -- shared by every arch; `nightly_only_reasons.tsv` gives, per row, the reason and the FULL cell that
   keeps its arm (`arm:<tokens>` = shared dtype / mask / family / shape tokens; `module` = same module only -- review those).
 - `smoke_<arch>_code_paths.tsv` -- the code path each SMOKE cell stands for (one line per listed id; the reviewer's aid).
@@ -65,7 +65,8 @@ NIGHTLY-only -- a cell leaves FULL only with a named twin that keeps its arm (`n
    today; a cell that is its own contract -- an Int32-overflow probe -- stays in FULL.)
 4. Never: `gpu_exclusive` cells, reject / decline / typed-error cells, or any cell whose demotion would change a tolerance.
 
-Counts at the time of writing: SMOKE cc 10.7 = 358 cells (266 hand-picked + 92 rule-added), cc 10.0 = 267 (135 + 132);
+Counts at the time of writing: SMOKE cc 10.7 = 358 cells (266 hand-picked + 92 rule-added), cc 10.0 = 267 (135 + 132),
+cc 10.3 = 252 (the cc 10.0 cells that run on cc 10.3; the list's header names the 24 left out);
 NIGHTLY-only = 120 (96 codegen pins + 24 B / H / seed twins). Lists for other capabilities are added as they are reviewed.
 
 ## Running
