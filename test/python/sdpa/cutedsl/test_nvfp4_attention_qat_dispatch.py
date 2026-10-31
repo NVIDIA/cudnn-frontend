@@ -15,8 +15,8 @@ def _require_frost():
     from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
 
     installed, version = cutedsl_state()
-    if torch.cuda.get_device_capability() != (10, 0) or not installed or cutedsl_too_old(version):
-        pytest.skip("FROST execution requires SM100 and CuTe DSL >= 4.7.0")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)) or not installed or cutedsl_too_old(version):
+        pytest.skip("FROST execution requires SM100 or SM103 and CuTe DSL >= 4.7.0")
 
 
 def _declaration(batch=1, heads=2, sequence=256, kv_sequence=None):
@@ -58,7 +58,7 @@ def test_auto_selection_is_fixed_after_support_check(monkeypatch):
     assert op.scratch_workspace_bytes() == workspace_bytes
 
 
-@pytest.mark.parametrize("capability", [(10, 3), (12, 0), (12, 1)])
+@pytest.mark.parametrize("capability", [(12, 0), (12, 1)])
 def test_auto_architecture_selection_metadata_only(monkeypatch, capability):
     """Probe routing, not execution of a foreign architecture on this GPU."""
     from cudnn import Nvfp4AttentionQatBackward
@@ -82,8 +82,8 @@ def test_auto_architecture_selection_metadata_only(monkeypatch, capability):
     ],
 )
 def test_auto_unsupported_frost_declaration(declaration, options, reason):
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("Exercise SM100 shape rejection independently of the architecture gate")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Exercise SM100-family shape rejection independently of the architecture gate")
     from cudnn import Nvfp4AttentionQatBackward
 
     inputs = _declaration(**declaration)
@@ -101,7 +101,7 @@ def test_auto_old_dsl_falls_back_without_importing_frost(monkeypatch):
     from cudnn.frost import buffers
     from cudnn.sdpa.bwd.qat import api
 
-    if torch.cuda.get_device_capability() != (10, 0):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("Exercise the DSL rejection independently of the architecture gate")
     inputs, _ = _reference_case(256, 256, is_causal=False)
     q, k, v, o, do, lse, scale = inputs
