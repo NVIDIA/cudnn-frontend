@@ -34,7 +34,6 @@ import pytest
 import torch
 
 import cudnn
-import cudnn.sdpa  # noqa: F401 — the capability tables live here
 from cudnn.engines import MANIFEST
 from frost_test_utils import requires_dsl, select_engine
 
@@ -523,9 +522,6 @@ def test_sm89_d64_dense_forward_matches_fp64_reference(dtype, causal, s):
 def test_sm89_selected_plan_is_the_sm89_engine():
     """The numbers above are only evidence for this row if the plan really is it."""
     b, h, s, d = 1, 2, 256, 64
-    q = torch.randn(b, h, s, d, dtype=torch.float16, device="cuda")
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
     it = cudnn.data_type.HALF
     g = cudnn.pygraph(io_data_type=it, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     st = _bshd(b, h, s, d)
