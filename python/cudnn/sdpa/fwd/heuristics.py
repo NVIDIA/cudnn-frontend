@@ -3224,8 +3224,9 @@ def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
 
     if opt_in_engines_enabled():
         return ours + [BACKEND]
-    name_of = {offered[s.name]: s.name for s in ENGINE_SPECS if s.name in offered}
-    last = [p for p in ours if name_of.get(p.engine_id) in TRAIL_ONLY_ROWS]
+    spec_of = {offered[s.name]: s for s in ENGINE_SPECS if s.name in offered}
+    # A trail-only row still leads where a generated placement_table entry says so.
+    last = [p for p in ours if p.engine_id in spec_of and spec_of[p.engine_id].name in TRAIL_ONLY_ROWS and place(spec_of[p.engine_id], facts) != LEAD]
     rest = [p for p in ours if p not in last]
     if not rest:
         return [BACKEND, LAST_RESORT] + last

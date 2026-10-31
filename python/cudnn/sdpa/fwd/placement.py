@@ -522,8 +522,8 @@ def _d512_swa(facts) -> bool:
 
 
 TRAIL_ONLY_ROWS = frozenset({"sdpa_fwd_prefill_sm80"})
-"""Default-offered rows with no measured lead shard: offered after the backend's block, so they serve a graph only when the
-backend declines it (a correctness fallback, not a performance claim)."""
+"""Default-offered rows with no hand-written lead shard: offered after the backend's block, so they serve a graph only when
+the backend declines it (a correctness fallback), unless a generated ``placement_table`` entry leads the graph."""
 
 
 def place(spec, facts) -> str:

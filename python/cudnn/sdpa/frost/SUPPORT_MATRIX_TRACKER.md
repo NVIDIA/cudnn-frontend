@@ -119,9 +119,10 @@ right band, no left bound, top-left anchor) is part of the row's claim too.
 engine for that band, so it is the only provider there. `sdpa_bwd_sm100_d128` is a default candidate that ranks
 ahead of the backend for d128 THD without a window and behind it elsewhere; `sdpa_bwd_sm100_d256` is a default candidate that
 ranks ahead of the backend for d256 on cc 10.0 and behind it for mask-free ragged THD past S_q 4096, D192x128, other parts,
-and deterministic, bias, dropout, windowed or sink graphs (`sdpa/bwd/heuristics.py`). `sdpa_fwd_prefill_sm80`,
-`sdpa_bwd_sm80`, `sdpa_bwd_sm120`, `sdpa_bwd_sm107` and `sdpa_bwd_sm107_d512` are default candidates that always rank
-behind the backend (`TRAIL_ONLY_ROWS`): they serve a graph only when the backend declines it. Every other
+and deterministic, bias, dropout, windowed or sink graphs (`sdpa/bwd/heuristics.py`). `sdpa_bwd_sm80`, `sdpa_bwd_sm120`,
+`sdpa_bwd_sm107` and `sdpa_bwd_sm107_d512` are default candidates that always rank behind the backend (`TRAIL_ONLY_ROWS`):
+they serve a graph only when the backend declines it. `sdpa_fwd_prefill_sm80` ranks the same way except on the dense
+prefill classes a generated `placement_table` entry leads (A100 study `sm80_dense_prefill_20261031`). Every other
 FROST SDPA engine is `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before
 `import cudnn` or the graph runs a cuDNN backend plan. The flag also ranks FROST first everywhere.
 

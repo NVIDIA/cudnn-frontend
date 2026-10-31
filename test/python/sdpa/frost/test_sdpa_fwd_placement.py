@@ -101,6 +101,26 @@ def test_trail_only_rows_rank_behind_the_backend():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("entry", [None, "always", "never"])
+def test_a_trail_only_row_leads_where_a_generated_entry_says_so(monkeypatch, entry):
+    """SM80 plans go after the last-resort marker unless a placement_table entry leads the graph; then they lead the backend."""
+    from cudnn.engines.heuristics import LAST_RESORT
+    from cudnn.sdpa import placement_table
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    name = "sdpa_fwd_prefill_sm80"
+    spec = next(s for s in ENGINE_SPECS if s.name == name)
+    facts = _facts(s_q=2048, s_kv=2048, h_q=32, h_kv=8, device_cc=(8, 0), device_sm_count=108)
+    table = {} if entry is None else {placement_table.class_key(name, facts): placement_table.Entry(entry, None, "synthetic")}
+    monkeypatch.setattr(placement_table, "TABLE", table)
+    ours = [PlanConfig(_OFFERED[name], object())]
+    monkeypatch.setattr(heuristics, "recommend", Mock(return_value=ours))
+    plans = heuristics.propose("A", facts, {name: _OFFERED[name]})
+    assert plans == (ours + [BACKEND] if entry == "always" else [BACKEND, LAST_RESORT] + ours)
+    assert placement.place(spec, facts) == (placement.LEAD if entry == "always" else placement.TRAIL)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("kind", ["A", "FALLBACK"])
 @pytest.mark.parametrize("verdict", [placement.LEAD, placement.TRAIL])
 def test_propose_preserves_recommendations_and_places_one_marker(monkeypatch, recommendations, kind, verdict):
