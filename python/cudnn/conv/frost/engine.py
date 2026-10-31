@@ -120,8 +120,8 @@ def _operand_storage_bytes(operand) -> int:
 
 def _check_sm100():
     sm = buffers.current_sm()
-    if sm != 100:
-        raise NotImplementedError(f"frost_conv requires SM100, but found {sm}")
+    if sm not in (100, 103):  # the SM100-family kernels compile for the device's own target
+        raise NotImplementedError(f"frost_conv requires SM100 or SM103, but found {sm}")
 
 
 def _check_cutedsl(what: str, minimum_version: tuple[int, int]) -> None:
