@@ -2375,7 +2375,7 @@ def test_scalar_gate_head_tiling(backend, variant, H):
 
 
 # ---------------------------------------------------------------------------
-# Steep per-channel decay (GDN-2 exact intra-tile path)
+# Steep per-channel decay (GDN-2 and KDA exact intra-tile path)
 # ---------------------------------------------------------------------------
 
 
@@ -2417,6 +2417,7 @@ def steep_gate(case, pattern):
     return case.clone(gates=dict(case.gates, g=g))
 
 
+STEEP_VARIANTS = ("gdn2", "kda")
 STEEP_PATTERNS = ("steady", "spike", "huge_spike", "two_spikes", "offset_window", "extreme", "all_channels", "alternating")
 STEEP_SHAPES = {  # token geometry per schedule; two heads
     "prep": dict(seq_lens=[517, 0, 91, 128, 1], H=2),
@@ -2429,38 +2430,41 @@ STEEP_SHAPES = {  # token geometry per schedule; two heads
 @pytest.mark.parametrize("shape", list(STEEP_SHAPES))
 @pytest.mark.parametrize("pattern", STEEP_PATTERNS)
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-def test_steep_channel_decay_fwd_bwd(backend, pattern, shape, K):
+@pytest.mark.parametrize("variant", STEEP_VARIANTS)
+def test_steep_channel_decay_fwd_bwd(backend, pattern, shape, K, variant):
     """Per-channel log-decay far past the 16-token tile's exp2 range: the forward output and every gradient stay
     finite and match the fp64 reference (a tile sum of g below -126 * ln 2 = -87.3 used to return NaN for the
     rest of the sequence)."""
-    case = steep_gate(make_case("gdn2", torch.bfloat16, K=K, **STEEP_SHAPES[shape]), pattern)
+    case = steep_gate(make_case(variant, torch.bfloat16, K=K, **STEEP_SHAPES[shape]), pattern)
     assert_bwd_parity(backend, case, l2norm=True)
 
 
 @pytest.mark.parametrize("K", [64, 128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-def test_steep_channel_decay_initial_state(backend, K, dtype):
+@pytest.mark.parametrize("variant", STEEP_VARIANTS)
+def test_steep_channel_decay_initial_state(backend, K, dtype, variant):
     """The steep path with an initial state, a final state and no in-kernel L2 norm."""
-    case = steep_gate(make_case("gdn2", dtype, K=K, seq_lens=[96, 32, 160, 1]), "spike")
+    case = steep_gate(make_case(variant, dtype, K=K, seq_lens=[96, 32, 160, 1]), "spike")
     assert_fwd_parity(backend, case, use_initial_state=True)
     assert_bwd_parity(backend, case, use_initial_state=True, use_dfs=True)
 
 
 @pytest.mark.parametrize("K", [64, 128])
 @pytest.mark.parametrize("output_transition", [False, True])
-def test_steep_summary_matches_reference(summary_caches, K, output_transition):
+@pytest.mark.parametrize("variant", STEEP_VARIANTS)
+def test_steep_summary_matches_reference(summary_caches, K, output_transition, variant):
     """Both summary wrappers retain the seeded state and transition through steep/mild tiles."""
-    case = steep_gate(make_case("gdn2", torch.bfloat16, K=K, seq_lens=[96, 0, 32, 160]), "alternating")
+    case = steep_gate(make_case(variant, torch.bfloat16, K=K, seq_lens=[96, 0, 32, 160]), "alternating")
     state = random_state(case)
     _, expected = reference(case, initial_state=state)
-    with waive_engine_less("gdn2 frost summary engine"):
-        final_state, transition = torch.ops.cudnn.gated_delta_net_v2_summary(
+    with waive_engine_less(f"{variant} frost summary engine"):
+        final_state, transition = getattr(torch.ops.cudnn, SUMMARY_OPS[variant])(
             *op_args(case)[1:],
             initial_state=state,
             output_transition=output_transition,
             batch_invariant=True,
-            plan_name="gdn2_summary_frost",
+            plan_name=f"{variant}_summary_frost",
         )
     assert_state_close("summary final_state", final_state, expected, H_TOL[case.dtype])
     if output_transition:
@@ -2479,18 +2483,20 @@ def test_steep_channel_decay_beta_guard(backend, pattern):
 @pytest.mark.parametrize("K", [64, 128])
 @pytest.mark.parametrize("shape", list(STEEP_SHAPES))
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-def test_steep_channel_decay_fp16(backend, shape, K):
+@pytest.mark.parametrize("variant", STEEP_VARIANTS)
+def test_steep_channel_decay_fp16(backend, shape, K, variant):
     """fp16 operands overflow much sooner: K inv = k * 2^-g passes the fp16 maximum once a tile's log-decay sums
     below about -11, which an alpha of 0.3 per token reaches."""
-    case = steep_gate(make_case("gdn2", torch.float16, K=K, lo=0.3, **STEEP_SHAPES[shape]), "steady")
+    case = steep_gate(make_case(variant, torch.float16, K=K, lo=0.3, **STEEP_SHAPES[shape]), "steady")
     assert_bwd_parity(backend, case, l2norm=True)
 
 
 @pytest.mark.parametrize("state_dtype", STATE_DTYPES, ids=["fp32", "bf16", "fp16"])
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-def test_steep_channel_decay_overwrite_initial_state(backend, state_dtype):
+@pytest.mark.parametrize("variant", STEEP_VARIANTS)
+def test_steep_channel_decay_overwrite_initial_state(backend, state_dtype, variant):
     """A state snapshot preserves the output and final state when the state buffers alias."""
-    case = steep_gate(make_case("gdn2", torch.bfloat16, B=8, T=512, H=4), "spike")
+    case = steep_gate(make_case(variant, torch.bfloat16, B=8, T=512, H=4), "spike")
     state0 = random_state(case, dtype=state_dtype)
     o_ref, fs_ref = run_fwd(backend, case, initial_state=state0.clone(), output_final_state=True, batch_invariant=True)
     state = state0.clone()
@@ -2502,22 +2508,23 @@ def test_steep_channel_decay_overwrite_initial_state(backend, state_dtype):
 
 @pytest.mark.parametrize("state_dtype", STATE_DTYPES, ids=["fp32", "bf16", "fp16"])
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-def test_steep_channel_decay_backward_overwrite_initial_state(backend, state_dtype):
+@pytest.mark.parametrize("variant", STEEP_VARIANTS)
+def test_steep_channel_decay_backward_overwrite_initial_state(backend, state_dtype, variant):
     """A gradient snapshot preserves every gradient when the state-gradient buffers alias."""
-    case = steep_gate(make_case("gdn2", torch.bfloat16, B=8, T=512, H=4), "spike")
+    case = steep_gate(make_case(variant, torch.bfloat16, B=8, T=512, H=4), "spike")
     state0 = random_state(case, dtype=state_dtype)
     d_final = random_state(case, scale=0.1, seed=SEED + 3, dtype=state_dtype)
     _, _, grads, dO, _ = chain_grads(backend, case, initial_state=state0, d_final_state=d_final, batch_invariant=True)
-    names = LEAF_NAMES["gdn2"]
+    names = LEAF_NAMES[variant]
     inputs = dict(zip(names, op_args(case)[: len(names)]))
     inputs.update(cu_seqlens=case.cu, dO=dO, initial_state=state0, d_final_state=d_final)
     graph = cudnn.pygraph()
     ports = {name: graph.tensor(list(t.shape), data_type=CUDNN_DTYPE[t.dtype], name=name) for name, t in inputs.items()}
-    outs = graph.gdn2_bwd(**ports, scale=1.0 / math.sqrt(case.K), overwrite_initial_state=True, batch_invariant=True, name="bwd")
+    outs = getattr(graph, f"{variant}_bwd")(**ports, scale=1.0 / math.sqrt(case.K), overwrite_initial_state=True, batch_invariant=True, name="bwd")
     out_ports = dict(zip(list(names) + ["initial_state"], outs))
     for name, port in out_ports.items():
         port.set_output(True).set_data_type(CUDNN_DTYPE[grads[name].dtype])
-    build_and_pin(graph, "gdn2_frost")
+    build_and_pin(graph, f"{variant}_frost")
     d_state = d_final.clone()
     got = {name: torch.empty_like(grads[name]) for name in names}
     pack = {ports[name]: t for name, t in inputs.items()}
@@ -2542,9 +2549,10 @@ def test_steep_channel_decay_backward_overwrite_initial_state(backend, state_dty
 @pytest.mark.parametrize("K", [64, 128])
 @pytest.mark.parametrize("steep", [False, True])
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-def test_steep_read_only_state_pool(backend, K, steep):
+@pytest.mark.parametrize("variant", STEEP_VARIANTS)
+def test_steep_read_only_state_pool(backend, K, steep, variant):
     """An indexed input pool without a final-state output stays unchanged and needs no seed snapshot."""
-    case = make_case("gdn2", torch.bfloat16, B=8, T=64, H=4, K=K)
+    case = make_case(variant, torch.bfloat16, B=8, T=64, H=4, K=K)
     if steep:
         case = steep_gate(case, "spike")
     state0 = random_state(case)
@@ -2560,10 +2568,11 @@ def test_steep_read_only_state_pool(backend, K, steep):
 @pytest.mark.parametrize("K", [64, 128])
 @pytest.mark.parametrize("state_dtype", STATE_DTYPES, ids=["fp32", "bf16", "fp16"])
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-def test_steep_strided_state_overwrite(backend, K, state_dtype):
+@pytest.mark.parametrize("variant", STEEP_VARIANTS)
+def test_steep_strided_state_overwrite(backend, K, state_dtype, variant):
     """The snapshot follows the state's strides: a padded ``initial_state`` overwritten in place matches the
     separate-buffer run bitwise through a steep relaunch, and its padding is untouched."""
-    case = steep_gate(make_case("gdn2", torch.bfloat16, K=K, seq_lens=[96, 32, 160, 1]), "spike")
+    case = steep_gate(make_case(variant, torch.bfloat16, K=K, seq_lens=[96, 32, 160, 1]), "spike")
     state0 = random_state(case, dtype=state_dtype)
     o_ref, fs_ref = run_fwd(backend, case, initial_state=state0.clone(), output_final_state=True, batch_invariant=True)
     padded = torch.full((case.N, case.HO, case.V, K + 16), 7.0, device="cuda", dtype=state_dtype)
@@ -2577,16 +2586,20 @@ def test_steep_strided_state_overwrite(backend, K, state_dtype):
 
 @pytest.mark.parametrize("K", [64, 128])
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-def test_steep_fp16_inverse_range_without_normalization(backend, K):
+@pytest.mark.parametrize("variant", STEEP_VARIANTS)
+def test_steep_fp16_inverse_range_without_normalization(backend, K, variant):
     """A moderate prefix can overflow K inv when unnormalized keys exceed one."""
-    case = make_case("gdn2", torch.float16, T=32, K=K, H=2)
+    case = make_case(variant, torch.float16, T=32, K=K, H=2)
     q, k, v = torch.zeros_like(case.q), torch.zeros_like(case.k), torch.ones_like(case.v)
     q[..., 0] = 1.0
     k[..., 0] = 5.0
     gates = {name: value.clone() for name, value in case.gates.items()}
     gates["g"].fill_(-13.75 * math.log(2.0) / 16)
-    gates["beta"].zero_()
-    gates["w"].fill_(1.0)
+    if variant == "gdn2":
+        gates["beta"].zero_()
+        gates["w"].fill_(1.0)
+    else:
+        gates["beta"].fill_(1.0 / 50.0)  # beta |k|^2 = 1/2: at 1, I - beta k k^T projects channel 0 out and its true dg is 0
     case = case.clone(q=q, k=k, v=v, gates=gates)
     assert_fwd_parity(backend, case)
     assert_bwd_parity(backend, case)
@@ -2595,9 +2608,10 @@ def test_steep_fp16_inverse_range_without_normalization(backend, K):
 @pytest.mark.parametrize("K", [64, 128])
 @pytest.mark.parametrize("shape", list(STEEP_SHAPES))
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-def test_steep_multiple_channels_repeatable(backend, K, shape):
+@pytest.mark.parametrize("variant", STEEP_VARIANTS)
+def test_steep_multiple_channels_repeatable(backend, K, shape, variant):
     """The correction reduction has a fixed order in forward and backward."""
-    case = steep_gate(make_case("gdn2", torch.bfloat16, K=K, **STEEP_SHAPES[shape]), "all_channels")
+    case = steep_gate(make_case(variant, torch.bfloat16, K=K, **STEEP_SHAPES[shape]), "all_channels")
     state0 = random_state(case)
     d_final = random_state(case, seed=SEED + 3)
     o_ref, fs_ref, grads_ref, dO, _ = chain_grads(backend, case, initial_state=state0, d_final_state=d_final)
@@ -2613,15 +2627,16 @@ def test_steep_multiple_channels_repeatable(backend, K, shape):
 @pytest.mark.parametrize("state_dtype", STATE_DTYPES, ids=["fp32", "bf16", "fp16"])
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.filterwarnings("error:The CUDA Graph is empty")
-def test_steep_forward_state_alias_after_graph_warmup(backend, cudnn_handle, K, state_dtype):
+@pytest.mark.parametrize("variant", STEEP_VARIANTS)
+def test_steep_forward_state_alias_after_graph_warmup(backend, cudnn_handle, K, state_dtype, variant):
     """An overwrite-capable graph can bind separate buffers before binding an alias."""
-    case = steep_gate(make_case("gdn2", torch.bfloat16, B=8, T=64, H=4, K=K), "spike")
+    case = steep_gate(make_case(variant, torch.bfloat16, B=8, T=64, H=4, K=K), "spike")
     state0 = random_state(case, dtype=state_dtype)
-    inputs = dict(zip(LEAF_NAMES["gdn2"], op_args(case)))
+    inputs = dict(zip(LEAF_NAMES[variant], op_args(case)))
     inputs.update(cu_seqlens=case.cu, initial_state=state0)
     graph = cudnn.pygraph()
     ports = {name: graph.tensor(list(t.shape), data_type=CUDNN_DTYPE[t.dtype], name=name) for name, t in inputs.items()}
-    output, final_state = graph.gdn2(
+    output, final_state = getattr(graph, variant)(
         **ports,
         scale=1.0 / math.sqrt(K),
         output_final_state=True,
@@ -2631,7 +2646,7 @@ def test_steep_forward_state_alias_after_graph_warmup(backend, cudnn_handle, K, 
     )[:2]
     output.set_output(True).set_data_type(CUDNN_DTYPE[case.dtype])
     final_state.set_output(True).set_data_type(CUDNN_DTYPE[state_dtype])
-    build_and_pin(graph, "gdn2_frost")
+    build_and_pin(graph, f"{variant}_frost")
     o_ref, fs_ref = run_fwd(backend, case, initial_state=state0, output_final_state=True, batch_invariant=True)
     o = torch.empty_like(o_ref)
     separate_state = torch.empty_like(state0)
@@ -2678,7 +2693,8 @@ def test_steep_forward_state_alias_after_graph_warmup(backend, cudnn_handle, K, 
 @pytest.mark.parametrize("T,key_value", [(16, 0.0), (17, 0.0), (32, 0.0), (16, 1.0e-4), (17, 1.0e-4), (32, 1.0e-3)])
 @pytest.mark.parametrize("V", [64, 128])
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-def test_steep_fp16_large_final_state_gradient(backend, K, T, key_value, V):
+@pytest.mark.parametrize("variant", STEEP_VARIANTS)
+def test_steep_fp16_large_final_state_gradient(backend, K, T, key_value, V, variant):
     """A finite FP32 seed may exceed FP16 even when every returned gradient fits.
 
     The old decayed state operand is about 0.96 after a full tile; storing its
@@ -2687,11 +2703,14 @@ def test_steep_fp16_large_final_state_gradient(backend, K, T, key_value, V):
     The larger initial state and 32-token key keep beta gradients above the
     FP16 rounding floor, while the 16-token key exposes premature K narrowing.
     """
-    case = make_case("gdn2", torch.float16, B=1, T=T, H=1, K=K, V=V)
+    case = make_case(variant, torch.float16, B=1, T=T, H=1, K=K, V=V)
     gates = {name: value.clone() for name, value in case.gates.items()}
     gates["g"].fill_(-0.7)
-    gates["beta"].zero_()
-    gates["w"].fill_(1.0)
+    if variant == "gdn2":
+        gates["beta"].zero_()
+        gates["w"].fill_(1.0)
+    else:
+        gates["beta"].fill_(1.0)
     case = case.clone(q=torch.zeros_like(case.q), k=torch.full_like(case.k, key_value), v=torch.full_like(case.v, 1.0e-4), gates=gates)
     state0 = random_state(case, scale=50.0)
     d_final = torch.full_like(state0, 70000.0)
@@ -2707,14 +2726,18 @@ def test_steep_fp16_large_final_state_gradient(backend, K, T, key_value, V):
 @pytest.mark.parametrize("K", [64, 128])
 @pytest.mark.parametrize("V", [64, 128])
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-def test_steep_fp16_large_state_gradient_carry(backend, K, V):
+@pytest.mark.parametrize("variant", STEEP_VARIANTS)
+def test_steep_fp16_large_state_gradient_carry(backend, K, V, variant):
     """Finite FP16 output gradients can accumulate a carry above FP16's range."""
-    case = make_case("gdn2", torch.float16, B=1, T=32, H=1, K=K, V=V)
+    case = make_case(variant, torch.float16, B=1, T=32, H=1, K=K, V=V)
     gates = {name: value.clone() for name, value in case.gates.items()}
     gates["g"].zero_()
     gates["g"][:, :16].fill_(-0.7)
-    gates["beta"].zero_()
-    gates["w"].fill_(1.0)
+    if variant == "gdn2":
+        gates["beta"].zero_()
+        gates["w"].fill_(1.0)
+    else:
+        gates["beta"].fill_(1.0)
     q = torch.zeros_like(case.q)
     q[:, 16:, :, 0] = 1.0
     case = case.clone(q=q, k=torch.zeros_like(case.k), v=torch.zeros_like(case.v), gates=gates)
@@ -2733,11 +2756,12 @@ def test_steep_fp16_large_state_gradient_carry(backend, K, V):
 @pytest.mark.parametrize("K", [64, 128])
 @pytest.mark.parametrize("shape", list(STEEP_SHAPES))
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-def test_steep_cuda_graph_gate_transitions(backend, dtype, K, shape):
+@pytest.mark.parametrize("variant", STEEP_VARIANTS)
+def test_steep_cuda_graph_gate_transitions(backend, dtype, K, shape, variant):
     """One captured forward/backward workspace must reset dispatch on every replay."""
-    case = make_case("gdn2", dtype, K=K, **STEEP_SHAPES[shape])
+    case = make_case(variant, dtype, K=K, **STEEP_SHAPES[shape])
     leaves = [t.requires_grad_(True) for t in thd_tensors(case)]
-    gate = leaves[LEAF_NAMES["gdn2"].index("g")]
+    gate = leaves[LEAF_NAMES[variant].index("g")]
     patterns = [case, steep_gate(case, "steady"), case, steep_gate(case, "alternating"), steep_gate(case, "huge_spike"), case]
     gate_inputs = [item.gates["g"].reshape_as(gate).clone() for item in patterns]
     state0 = random_state(case).requires_grad_(True)
@@ -2745,12 +2769,12 @@ def test_steep_cuda_graph_gate_transitions(backend, dtype, K, shape):
     d_o = torch.randn(case.T, case.HO, case.V, device="cuda", dtype=dtype)
 
     def launch():
-        o, fs = pinned_op(backend, "gdn2")(*leaves, *op_tail(case), initial_state=state0, output_final_state=True)
+        o, fs = pinned_op(backend, variant)(*leaves, *op_tail(case), initial_state=state0, output_final_state=True)
         return [o, fs, *torch.autograd.grad([o, fs], leaves + [state0], [d_o, d_final])]
 
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side), waive_engine_less("gdn2 frost engine"):
+    with torch.cuda.stream(side), waive_engine_less(f"{variant} frost engine"):
         for _ in range(3):
             launch()
     torch.cuda.current_stream().wait_stream(side)
@@ -2773,9 +2797,10 @@ def test_steep_cuda_graph_gate_transitions(backend, dtype, K, shape):
 @pytest.mark.parametrize("gate_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("K", [64, 128])
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-def test_steep_narrow_gate_ragged_tail(backend, dtype, gate_dtype, K):
+@pytest.mark.parametrize("variant", STEEP_VARIANTS)
+def test_steep_narrow_gate_ragged_tail(backend, dtype, gate_dtype, K, variant):
     """Low-precision gate loads and padded scan rows share the exact-path contract."""
-    case = steep_gate(make_case("gdn2", dtype, K=K, gate_dtype=gate_dtype, seq_lens=[17, 0, 33, 1]), "steady")
+    case = steep_gate(make_case(variant, dtype, K=K, gate_dtype=gate_dtype, seq_lens=[17, 0, 33, 1]), "steady")
     assert_bwd_parity(backend, case, use_initial_state=True, use_dfs=True, l2norm=True)
 
 
