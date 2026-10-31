@@ -341,7 +341,10 @@ SM100 paged bf16 d128 full squares (2026-10-25, ``_sm100_paged_full_square``): Q
 b 1-4, page 16, head-major in-page K, causal, no window / sink: GQA 4 / 8 / 16 lead for 1024 <= S <= 8192. A
 legal-pool sweep over mixed-length full prefills found FROST's first plan ahead of engine 10 on these shapes, and a
 separately frozen holdout confirmed every GQA case in the box. MHA and group 2 keep the backend: an MHA holdout case at
-S = 2048 lost and group 2 was not covered.
+S = 2048 lost and group 2 was not covered. :func:`place` reads a square causal mask as bottom-right (the same tiles), so
+GQA 4 / 8 squares also take the packed full-prefill lead (#1809) from S = 512 and on cc 10.3 / page 64: 80 top-left
+squares (S 512-8192, page 16 / 64, b 1 / 3, cuDNN 9.29.0.18) ran FROST at 0.45-0.98 of the backend on a B100 and
+0.49-0.99 on a B300 (2026-10-31).
 
 Rows with no measurement (SM80, SM100 mxfp8) keep the historical order (LEAD); they are still
 opt-in, so the order is only observable with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``.
@@ -361,6 +364,8 @@ longer cache (equal Q and KV extents and, with packed totals declared, equal tot
 """
 
 from __future__ import annotations
+
+import dataclasses
 
 import cudnn
 
@@ -537,6 +542,8 @@ def place(spec, facts) -> str:
     rules below decide every graph the table has no entry for."""
     from cudnn.sdpa import placement_table
 
+    if facts.causal and not facts.bottom_right and facts.s_q == facts.s_kv:
+        facts = dataclasses.replace(facts, bottom_right=True)  # a square causal mask covers the same tiles from either corner
     measured = placement_table.lookup(spec.name, facts)
     if measured is not None:
         return LEAD if measured else TRAIL
@@ -923,7 +930,7 @@ def _sm100_paged_gqa_prefill(facts) -> bool:
         and 2048 <= facts.s_kv <= 32768
         and facts.page_size == 16
         and facts.causal
-        and (facts.bottom_right or facts.s_q == facts.s_kv)
+        and facts.bottom_right
         and facts.window_left is None
         and not (facts.has_sink or facts.right_band_widening)
         and facts.k_t is not None
