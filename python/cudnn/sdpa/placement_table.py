@@ -278,4 +278,15 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_bwd_sm100_d256", (10, 3), "bf16", (256, 256), "prefill", "thd_ragged", "none", False, "mha", True): Entry(
         "ge", 30.374, "sm103_d256_bwd_thd_offtile_20261031"
     ),
+    # study sm103_d128_fwd_chunk_20261031, GQA half (B300 SXM6 1100 W, cuDNN 9.28.0.38; dense K/V, bottom-right causal chunks
+    # s_q < s_kv: 84 train cases, s_q 128-2048 over S_kv 2048-32768 on the 128-key tile and 3000 / 10000 off it, b 1 / 4, GQA 32/8 /
+    # 16/2 / 64/8; 12 off-lattice holdout cases). FROST ran 0.076-0.994 of the backend's time on every one, so past
+    # fwd/placement's CHUNKED_MAX_Q_TILES / CHUNKED_MIN_KV_TOKENS bounds (B200) as well. Its MHA classes have no entry: on the
+    # tile MHA 16/16 lost a holdout case (1.78x at b 3, s_q 768, S_kv 16384).
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm103_d128_fwd_chunk_20261031"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm103_d128_fwd_chunk_20261031"
+    ),
 }
