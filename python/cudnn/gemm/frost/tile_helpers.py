@@ -212,6 +212,21 @@ def moe_gather_row(token_index, row, group_end, source_rows):
 
 
 @cute.jit
+def moe_cache_token_indices(cache, token_index, row_begin, group_end, source_rows, rows: cutlass.Constexpr):
+    """Cooperatively cache one work tile's routing indices in the loader warp.
+
+    Refresh on every scheduler tile, including graph replay. Only this warp
+    reads the cache, which is reused by both data and SF across all K tiles.
+    """
+    lane = cute.arch.lane_idx()
+    for part in cutlass.range_constexpr((rows + 31) // 32):
+        row = lane + part * 32
+        if row < rows:
+            cache.subview(row).store(moe_gather_row(token_index, row_begin + row, group_end, source_rows))
+    nvvm.bar_warp_sync(0xFFFFFFFF)
+
+
+@cute.jit
 def moe_combine_add(ptr, value, dtype: cutlass.Constexpr):
     """Add one weighted contribution in the declared output precision."""
     if cutlass.const_expr(dtype == cutlass.Float32):
@@ -508,6 +523,68 @@ def moe_gather_scales(
             kw = word % (scales // 4)
             packed = (row // 128) * (128 * (scales // 4)) + kw * 128 + (row % 32) * 4 + (row % 128) // 32
             (dst_words + packed).store((src_words + (row // 4) * 32 + (row % 4) * 4 + (scale_k % 16) // 4 + kw).load())
+    cute.arch.fence_view_async_shared()
+    nvvm.bar_warp_sync(0xFFFFFFFF)
+    with cute.arch.elect_one():
+        if cutlass.const_expr(cta_group == 2):
+            leader = cute.arch.block_idx_in_cluster() & ~1
+            nvvm.mbarrier_arrive(nvvm.mapa(ready_bar, leader), scope=nvvm.MemScope.CLUSTER)
+        else:
+            nvvm.mbarrier_arrive(ready_bar)
+
+
+@cute.jit
+def moe_gather_scales_cp_async(
+    dst,
+    scratch,
+    ready_bar,
+    source,
+    token_indices,
+    scale_k,
+    rows: cutlass.Constexpr,
+    scales: cutlass.Constexpr,
+    row_bytes: cutlass.Constexpr,
+    cta_group: cutlass.Constexpr = 1,
+):
+    """Warp-cooperative linear SF loads, packed into the same MMA 128x4 atoms.
+
+    Aligned 16-byte windows cover narrow K tiles too. Clip each copy to the
+    declared SF extent rather than reading row-stride padding. Invalid tokens
+    use a valid base pointer with zero source bytes. The scratch belongs to
+    this producer warp and is reused only after every lane finishes packing.
+    """
+    lane = cute.arch.lane_idx()
+    window = (scale_k // 16) * 16
+    for part in cutlass.range_constexpr((rows + 31) // 32):
+        row = lane + part * 32
+        if row < rows:
+            token = token_indices.subview(row).load()
+            live = (token >= 0) & (token < source.shape[0])
+            safe_token = cutlass.Int32(0)
+            if live:
+                safe_token = token
+            for chunk in cutlass.range_constexpr(row_bytes // 16):
+                column = window + chunk * 16
+                size = cutlass.Int32(0)
+                safe_column = cutlass.Int32(0)
+                if live & (column < source.shape[1]):
+                    safe_column = cutlass.Int32(column)
+                    size = cutlass.min(cutlass.Int32(16), cutlass.Int32(source.shape[1] - column))
+                address = source.iterator.toint() + cutlass.Int64(safe_token) * source.stride[0] + cutlass.Int64(safe_column)
+                src = cutlass.inttoptr(address, 1, cutlass.Uint8)
+                nvvm.cp_async_shared_global(scratch.subview(row * row_bytes + chunk * 16), src, 16, nvvm.LoadCacheModifier.CG, cp_size=size)
+    nvvm.cp_async_commit_group()
+    nvvm.cp_async_wait_group(0)
+    nvvm.bar_warp_sync(0xFFFFFFFF)
+    src_words = cutlass.inttoptr(scratch.data_ptr().toint(), 3, cutlass.Uint32)
+    dst_words = cutlass.inttoptr(dst.data_ptr().toint(), 3, cutlass.Uint32)
+    for part in cutlass.range((rows * (scales // 4) + 31) // 32, unroll_full=True):
+        word = lane + part * 32
+        if word < rows * (scales // 4):
+            row = word // (scales // 4)
+            kw = word % (scales // 4)
+            packed = (row // 128) * (128 * (scales // 4)) + kw * 128 + (row % 32) * 4 + (row % 128) // 32
+            (dst_words + packed).store((src_words + row * (row_bytes // 4) + (scale_k % 16) // 4 + kw).load())
     cute.arch.fence_view_async_shared()
     nvvm.bar_warp_sync(0xFFFFFFFF)
     with cute.arch.elect_one():
