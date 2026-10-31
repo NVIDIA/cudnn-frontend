@@ -319,7 +319,7 @@ _ROW = _TILE_ROWS[tuple(getattr(PARAMS, "cgrp_tile_mn", (512, 512)))]
 _K_STAGE_BYTES = 128
 _K_STAGE_ELEMS = _K_STAGE_BYTES // _AB_BPE
 _NATIVE_N192 = _ROW.cgrp_tile_mn == (128, 192)
-mma_inst_shape_mnk = (128, 192, 16) if _NATIVE_N192 else (256, _ROW.cgrp_tile_mn[1], 64 if _IS_FP8 else 16)
+mma_inst_shape_mnk = (128, 192, 16) if _NATIVE_N192 else (256, _ROW.cgrp_tile_mn[1] // _ROW.cluster_shape_mnk[1], 64 if _IS_FP8 else 16)
 mma_k_dim = 1 if _IS_FP8 else 0
 cta_group = 1 if _NATIVE_N192 else 2
 cgrp_tile_mnk = (_ROW.cgrp_tile_mn[0], _ROW.cgrp_tile_mn[1], _K_STAGE_ELEMS)
