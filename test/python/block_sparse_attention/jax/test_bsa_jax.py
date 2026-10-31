@@ -86,7 +86,7 @@ def test_multi_gpu_process_runs_on_the_arrays_device():
     devices = jax.local_devices()
     if len(devices) < 2:
         pytest.skip("needs a process with more than one visible GPU")
-    sm100 = [d for d in devices if d.platform == "gpu" and str(getattr(d, "compute_capability", "")) == "10.0"]
+    sm100 = [d for d in devices if d.platform == "gpu" and str(getattr(d, "compute_capability", "")) in ("10.0", "10.3")]
     target = sm100[-1]
     q, k, v, indices = [jax.device_put(x, target) for x in inputs()[:4]]
     expected, expected_lse = reference(q, k, v, indices, None, "bhsd")
@@ -101,6 +101,70 @@ def test_multi_gpu_process_runs_on_the_arrays_device():
     if other not in sm100:
         with pytest.raises(ValueError, match="SM100"):
             forward(*[jax.device_put(x, other) for x in (q, k, v, indices)], 2)
+
+
+class _ModeledGpu:
+    platform = "gpu"
+
+    def __init__(self, compute_capability):
+        self.compute_capability = compute_capability
+
+
+@pytest.mark.parametrize("visible", [("10.0", "10.3"), ("10.3", "10.0")], ids=["sm100_first", "sm103_first"])
+def test_the_target_follows_the_arrays_eagerly_and_refuses_a_mixed_host_under_tracing(monkeypatch, visible):
+    """The compile target of a call: eagerly, the committed arrays' device, whatever order the visible GPUs list in; under tracing
+    (no device on a tracer), the visible SM100-family GPUs -- one architecture gives its target, both are refused rather than compiled
+    for the wrong one. Host-modeled: ``jax.local_devices`` is patched, the arrays stay on this GPU, nothing compiles."""
+    from cudnn.block_sparse_attention import jax_api
+
+    q, k, v, indices = inputs()[:4]
+    (device,) = q.devices()
+    own = jax_api._SM100_FAMILY[str(device.compute_capability)]
+
+    def config(q, k, v, indices):
+        return jax_api.configuration(q, k, v, indices, None, 2, None, 128, "bhsd", None, False, None)
+
+    seen = []
+
+    def traced(q, k, v, indices):
+        seen.append(config(q, k, v, indices))
+        return q
+
+    def traced_capture():  # All operands captured: active tracing still controls placement.
+        seen.append(config(q, k, v, indices))
+        return q
+
+    def traced_q(q):  # k / v / indices captured as committed arrays: still a traced call
+        seen.append(config(q, k, v, indices))
+        return q
+
+    monkeypatch.setattr(jax, "local_devices", lambda *args, **kwargs: [_ModeledGpu(cc) for cc in visible])
+    assert config(q, k, v, indices).gpu_arch == own
+    for run in (lambda: jax.make_jaxpr(traced)(q, k, v, indices), lambda: jax.make_jaxpr(traced_q)(q), lambda: jax.make_jaxpr(traced_capture)()):
+        with pytest.raises(ValueError, match="cannot tell SM100 from SM103"):
+            run()
+    for cc in visible:
+        monkeypatch.setattr(jax, "local_devices", lambda *args, cc=cc, **kwargs: [_ModeledGpu(cc), _ModeledGpu(cc)])
+        jax.make_jaxpr(traced)(q, k, v, indices)
+        jax.make_jaxpr(traced_q)(q)
+        jax.make_jaxpr(traced_capture)()
+        assert seen[-1].gpu_arch == seen[-2].gpu_arch == seen[-3].gpu_arch == jax_api._SM100_FAMILY[cc]
+        assert config(q, k, v, indices).gpu_arch == own
+
+
+@pytest.mark.parametrize("visible", [("10.0", "10.3"), ("10.3", "10.0")])
+def test_fully_captured_public_call_refuses_mixed_arch_under_jit(monkeypatch, visible):
+    from cudnn.block_sparse_attention import jax_api
+
+    q, k, v, indices = inputs()[:4]
+    monkeypatch.setattr(jax, "local_devices", lambda *args, **kwargs: [_ModeledGpu(cc) for cc in visible])
+
+    def no_compile(config):
+        pytest.fail("A fully captured mixed-architecture JIT call reached the FFI factory")
+
+    monkeypatch.setattr(jax_api, "forward_call", no_compile)
+    with pytest.raises(ValueError, match="cannot tell SM100 from SM103"):
+        jax.jit(lambda: forward(q, k, v, indices, 2)).lower()
 
 
 def test_eager_backward_reuses_compilation():
@@ -270,8 +334,8 @@ import jax
 import jax.numpy as jnp
 from cudnn.jax import block_sparse_attention as attention
 from cudnn.tensor_adapter import get_compute_capability
-assert get_compute_capability() == (10, 0)
-assert get_compute_capability(0) == (10, 0)
+assert get_compute_capability() in ((10, 0), (10, 3))
+assert get_compute_capability(0) == get_compute_capability()
 q = jnp.ones((1, 1, 256, 64), jnp.bfloat16)
 i = jnp.broadcast_to(jnp.arange(2, dtype=jnp.int32), (1, 1, 2, 2))
 grad = jax.jit(jax.grad(lambda q: attention(q, q, q, i, 2).astype(jnp.float32).sum()))(q)

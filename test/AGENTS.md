@@ -1192,3 +1192,9 @@ forbidding normalization and rejecting unsupported inner strides before launch.
 Its singleton-Stats case uses T=H=1 with zero, compact and padded head pitches:
 both packings classify the same element, but the token-major binder requires
 exact strides, so the wrapper must retain the head-major ABI for unused pitches.
+
+For JAX device-target admission, test zero-argument JIT closures that capture every
+operand as well as fully and partially traced inputs. Concrete captured arrays do
+not pin execution placement; detect the active trace independently of operand
+types. BSA's `test_fully_captured_public_call_refuses_mixed_arch_under_jit` checks
+that a modeled mixed-architecture host is rejected before the FFI factory.
