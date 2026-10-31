@@ -18,7 +18,7 @@ from cudnn.engines import ExecutionContext
 from cudnn.gemm.frost.engine import _FrostGemmPlan
 from cudnn.gemm.frost.fusion_ir import swap_ab
 from cudnn.gemm.frost.graph_analyzer import analyze, analyze_with_binding, swap_ab_binding
-from cudnn.gemm.frost.layouts import reshape_layout
+from cudnn.gemm.frost.layouts import OperandView, ViewStep, reshape_layout
 from cudnn.gemm.frost.sm100 import compiler, epilogue_codegen
 from cudnn.gemm.frost.tile_config import by_name
 from gemm_test_utils import requires_sm100
@@ -300,7 +300,7 @@ def test_frost_reshape_rank_independent(source, target, monkeypatch):
     graph.validate()
     plan, _ = _mock(graph, monkeypatch)
     assert (plan.chain.matmul.M, plan.chain.matmul.N, plan.chain.matmul.K) == (128, 128, 64)
-    assert plan.recipe.operand_reshapes[0][1] == source
+    assert plan.recipe.operand_reshapes[0][1].source_shape == source
 
 
 @pytest.mark.L0
@@ -411,3 +411,257 @@ def test_frost_reshape_native_byte_width():
     source = native.operand(0, 0)
     with pytest.raises(ValueError, match="64-bit byte span"):
         source.metadata_view((1, 1 << 62), (1 << 62, 1))
+
+
+def _view_chain_graph(count):
+    """Build equal-shaped math with identity, one view or a long view composition."""
+    graph = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=FP32, compute_data_type=FP32)
+    source = (1, 2, 64, 128) if count else (1, 128, 128)
+    a = graph.tensor(name="A", dim=list(source), stride=[prod(source[i + 1 :]) for i in range(len(source))])
+    value = graph.leaky_relu(input=a, negative_slope=0.125).set_data_type(BF16)
+    for i in range(count):
+        target = (1, 128, 128) if i % 2 == 0 else source
+        value = graph.reshape(input=value).set_dim(list(target)).set_stride([prod(target[i + 1 :]) for i in range(len(target))])
+    b = graph.tensor(name="B", dim=[1, 128, 128], stride=[16384, 128, 1])
+    y = graph.matmul(A=value, B=b).set_output(True)
+    graph.validate()
+    return graph, {"a": a, "b": b, "y": y}
+
+
+def _native_operands(plan):
+    """Synthetic addresses for host-only metadata tests; no consumer dereferences."""
+    native = cudnn._pybind_module.VariantPackNative(len(plan.binding.bound_tensors()))
+    for i, tensor in enumerate(plan.binding.bound_tensors()):
+        native.set_operand(i, 4096 * (i + 1), tensor.get_dim(), tensor.get_stride(), 4, 16, 1, -1, 2, 0)
+    return [native.operand(i, 0) for i in range(len(plan.binding.bound_tensors()))]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "steps",
+    [
+        (ViewStep("reshape", (2, 12)),),
+        (ViewStep("reshape", (2, 3, 2, 2)), ViewStep("reshape", (2, 12))),
+        (ViewStep("transpose", (0, 2, 1)), ViewStep("transpose", (0, 2, 1)), ViewStep("reshape", (2, 12))),
+        (ViewStep("transpose", (2, 0, 1)), ViewStep("transpose", (1, 2, 0)), ViewStep("reshape", (2, 12))),
+    ],
+)
+def test_frost_view_composition_equivalence(steps):
+    """The geometry layer supports arbitrary permutations, unlike the GEMM gate."""
+    value = torch.arange(24).view(2, 3, 4)
+    expected = value
+    for step in steps:
+        expected = expected.view(step.argument) if step.kind == "reshape" else expected.permute(step.argument)
+    view = OperandView.prepare(value.shape, value.stride(), steps)
+    assert torch.equal(value.as_strided(view.target_shape, view.target_stride), expected)
+    assert view.target_shape == (2, 12) and view.target_stride == (12, 1)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "kind,argument,declared",
+    [
+        ("unknown", (2, 3), ()),
+        ("transpose", (0, 0, 2), ()),
+        ("transpose", (0, 2), ()),
+        ("transpose", (0, 1, 3), ()),
+        ("transpose", (0, 1, 2), (12, 4, 1)),
+        ("reshape", (2, 12), (12,)),
+        ("reshape", (2, 12), (12, 1, 1)),
+        ("reshape", (2, 12), (-12, 1)),
+        ("reshape", (2, 12), (12, 2)),
+        ("reshape", (0, 12), ()),
+        ("reshape", (-1, 12), ()),
+    ],
+)
+def test_frost_view_invalid_geometry(kind, argument, declared):
+    with pytest.raises(ValueError, match="unsupported|permutation|strides|extents"):
+        OperandView.prepare((2, 3, 4), (12, 4, 1), (ViewStep(kind, argument, declared),))
+
+
+@pytest.mark.L0
+def test_frost_view_composition_proves_intermediate_steps():
+    """A valid final shape must not conceal an illegal intermediate copy."""
+    steps = (ViewStep("transpose", (1, 0)), ViewStep("reshape", (6,)), ViewStep("reshape", (2, 3)))
+    with pytest.raises(ValueError, match="copying"):
+        OperandView.prepare((2, 3), (3, 1), steps)
+
+
+@pytest.mark.L0
+def test_frost_view_runtime_stride_rebinding():
+    """Re-prove changed runtime strides; never reuse cached layouts by shape alone."""
+    shape = (1, 2, 1, 64, 64)
+    stride = (8192, 4096, 4096, 64, 1)
+    view = OperandView.prepare(shape, stride, (ViewStep("reshape", (1, 128, 64), (8192, 64, 1)),), fold_batch=True)
+    assert view.layout(shape, stride) == (view.target_shape, view.target_stride)
+    value = torch.arange(8192).view(shape).as_strided(shape, (99, 4096, 777, 64, 1))
+    target, st = view.layout(value.shape, value.stride())
+    assert torch.equal(value.as_strided(target, st), value.view(target))
+    with pytest.raises(ValueError, match="copying|declared strides"):
+        view.layout(shape, (8192, 4097, 4096, 64, 1))
+    with pytest.raises(ValueError, match="prepared source shape"):
+        view.layout((1, 128, 64), (8192, 64, 1))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("count", [0, 1, 17])
+def test_frost_view_runtime_call_count(monkeypatch, count):
+    """Identity is allocation-free; long native chains create one final view."""
+    graph, _ = _view_chain_graph(count)
+    plan, _ = _mock(graph, monkeypatch)
+    ordered = _native_operands(plan)
+    calls = []
+
+    class CountedOperand:
+        def __init__(self, operand):
+            self.operand = operand
+            self.shape = operand.shape
+
+        def stride(self):
+            return self.operand.stride()
+
+        def metadata_view(self, shape, stride):
+            calls.append((shape, stride))
+            return self.operand.metadata_view(shape, stride)
+
+    ordered[0] = CountedOperand(ordered[0])
+    result = plan.recipe.operand_views(ordered)
+    assert len(calls) == bool(count)
+    if count:
+        assert tuple(result[0].shape) == (1, 128, 128)
+        assert result[0].data_ptr() == 4096
+        assert all(slot != 0 for slot, _ in plan.recipe.matrix_views)
+        view = plan.recipe.operand_reshapes[0][1]
+        # Warm launches must not replay geometry when source shape/stride match.
+        monkeypatch.setattr(ViewStep, "layout", lambda *args: pytest.fail("recomputed a prepared view"))
+        assert view.layout(ordered[0].shape, ordered[0].stride()) == (view.target_shape, view.target_stride)
+    else:
+        assert result is ordered
+
+
+@pytest.mark.L0
+def test_frost_view_tensor_storage_offset(monkeypatch):
+    graph, tensors = _view_chain_graph(17)
+    plan, frames = _mock(graph, monkeypatch)
+    buffers = _buffers(tensors)
+    storage = torch.arange(prod(tensors["a"].get_dim()) + 8, dtype=torch.float32).bfloat16()
+    buffers["a"] = storage[8:].view(tuple(tensors["a"].get_dim()))
+    plan({t: buffers[key] for key, t in tensors.items()})
+    argument = frames[-1][1]
+    assert argument.data_ptr() == buffers["a"].data_ptr()
+    assert argument.storage_offset() == 8
+    assert torch.equal(argument.permute(2, 0, 1), buffers["a"].view(1, 128, 128))
+
+
+@pytest.mark.L1
+def test_frost_view_host_cost_report(monkeypatch):
+    """Report bounded CPU view cost; timing rank is not a flaky CI assertion."""
+    from statistics import median
+    from time import perf_counter_ns
+
+    cases = {}
+    for count in (0, 1, 17):
+        graph, _ = _view_chain_graph(count)
+        plan, _ = _mock(graph, monkeypatch)
+        ordered = _native_operands(plan)
+        for _ in range(100):
+            plan.recipe.operand_views(ordered)
+        cases[count] = plan.recipe, ordered
+    samples = {count: [] for count in cases}
+    for sample in range(7):
+        for count in ((0, 1, 17) if sample % 2 == 0 else (17, 1, 0)):
+            recipe, ordered = cases[count]
+            start = perf_counter_ns()
+            for _ in range(200):
+                result = recipe.operand_views(ordered)
+            samples[count].append((perf_counter_ns() - start) / 200 / 1000)
+            assert result[0].data_ptr() == ordered[0].data_ptr()
+            assert tuple(result[0].shape) == (1, 128, 128)
+    print("CPU metadata view medians (us), no kernel/device timing:", {count: median(cost) for count, cost in samples.items()})
+
+
+@pytest.mark.L0
+def test_frost_view_shared_equivalent_paths(monkeypatch):
+    """Different view spellings share storage without discarding path constraints."""
+    graph = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=FP32, compute_data_type=FP32)
+    a = graph.tensor(name="A", dim=[1, 2, 64, 128], stride=[16384, 8192, 128, 1])
+    value = graph.relu(input=a).set_data_type(BF16)
+    left = graph.reshape(input=value).set_dim([1, 128, 128]).set_stride([16384, 128, 1])
+    right = graph.reshape(input=value).set_dim([1, 1, 128, 128]).set_stride([16384, 16384, 128, 1])
+    right = graph.reshape(input=right).set_dim([1, 128, 128]).set_stride([16384, 128, 1])
+    graph.matmul(A=left, B=right).set_output(True)
+    graph.validate()
+    plan, _ = _mock(graph, monkeypatch)
+    assert plan.binding.a_operands == plan.binding.b_operands == [a]
+    assert len(plan.recipe.operand_reshapes) == 1
+    assert len(plan.recipe.operand_reshapes[0][1].alternate_steps) == 1
+
+    shape, stride = (2, 3, 4), (12, 4, 1)
+    direct = OperandView.prepare(shape, stride, (ViewStep("reshape", shape),))
+    flattened = OperandView.prepare(shape, stride, (ViewStep("reshape", (24,)), ViewStep("reshape", shape)))
+    merged = direct.merged(flattened)
+    assert direct.layout(shape, (15, 5, 1)) == (shape, (15, 5, 1))
+    with pytest.raises(ValueError, match="copying"):
+        merged.layout(shape, (15, 5, 1))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("position", ["before", "after"])
+def test_frost_view_padded_pointwise_layout(monkeypatch, position):
+    """Virtual pointwise output inherits the projected input's padded row map."""
+    graph, tensors = _graph("a", position=position)
+    tensors["a"].set_stride([10240, 5120, 80, 1])
+    reshape = next(node for node in graph._nodes if node.node_type.name == "RESHAPE")
+    reshape.outputs["OUT_0"].set_stride([10240, 80, 1])
+    graph.validate()
+    plan, frames = _mock(graph, monkeypatch)
+    buffers = _buffers(tensors)
+    buffers["a"] = torch.empty_strided((2, 2, 64, 64), (10240, 5120, 80, 1), dtype=torch.bfloat16).normal_()
+    plan({t: buffers[key] for key, t in tensors.items()})
+    argument = frames[-1][1]
+    assert argument.data_ptr() == buffers["a"].data_ptr()
+    assert tuple(argument.stride()) == (80, 1, 10240)
+    assert torch.equal(argument.permute(2, 0, 1), buffers["a"].view(2, 128, 64))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("swapped", [False, True])
+def test_frost_view_rank_n_folded_transport(monkeypatch, swapped):
+    """Join rows and fold rank-N batches in the same final native operand view."""
+    graph = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=FP32, compute_data_type=FP32)
+    source = (2, 3, 2, 64, 64)
+    a = graph.tensor(name="A", dim=list(source), stride=[prod(source[i + 1 :]) for i in range(len(source))])
+    value = graph.reshape(input=graph.relu(input=a).set_data_type(BF16)).set_dim([2, 3, 128, 64]).set_stride([24576, 8192, 64, 1])
+    b = graph.tensor(name="B", dim=[2, 3, 64, 128], stride=[24576, 8192, 128, 1])
+    y = graph.matmul(A=value, B=b).set_output(True)
+    graph.validate()
+    plan, frames = _mock(graph, monkeypatch, swapped)
+    tensors = {"a": a, "b": b, "y": y}
+    for n in (128, 192):
+        buffers = {
+            "a": torch.randn(source, dtype=torch.bfloat16),
+            "b": torch.randn(2, 3, 64, n, dtype=torch.bfloat16),
+            "y": torch.empty(2, 3, 128, n, dtype=torch.bfloat16),
+        }
+        _FrostGemmPlan(plan).execute(graph, _pack(graph, tensors, buffers), ExecutionContext(stream=0))
+        slot, view = plan.recipe.operand_reshapes[0]
+        assert view.target_shape == (6, 128, 64)
+        assert all(index != slot for index, _ in plan.recipe.matrix_views)
+        argument = frames[-1][2 if swapped else 1]
+        assert argument.data_ptr() == buffers["a"].data_ptr()
+        got = buffers["a"].as_strided(tuple(argument.shape), tuple(argument.stride())).permute(2, 0, 1)
+        assert torch.equal(got, buffers["a"].view(6, 128, 64))
+
+
+@pytest.mark.L0
+def test_frost_view_identity_composition_preserves_operands(monkeypatch):
+    """A prepared identity reshape validates its contract without creating views."""
+    graph, tensors = _view_chain_graph(0)
+    mm = next(node for node in graph._nodes if node.node_type.name == "MATMUL")
+    value = graph.reshape(input=mm.inputs["A"]).set_dim([1, 128, 128]).set_stride([16384, 128, 1])
+    mm.inputs["A"] = value
+    graph.validate()
+    plan, _ = _mock(graph, monkeypatch)
+    buffers = _buffers(tensors)
+    ordered = [buffers[next(key for key, t in tensors.items() if t is tensor)] for tensor in plan.binding.bound_tensors()]
+    assert plan.recipe.operand_views(ordered) is ordered
