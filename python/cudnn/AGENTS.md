@@ -390,6 +390,26 @@ DSL satisfies your kernel.**
   the CUDA 13 flavor but crashes the CUDA 12 compiler in DSL 4.7/4.8; its
   `check_support` rejects that compiler before JIT compilation, and its tests
   exercise the rejection rather than crashing or silently skipping the gate.
+- **Validate both CUDA compiler flavors for new or changed CuTe DSL kernels
+  and DSL upgrades.** Run cold compilation and numerical GPU tests with cu12
+  and cu13 in separate environments/processes and empty, separate caches.
+  Cover the declared dependency floor and the newer supported DSL version
+  being qualified, when different, on every claimed architecture. Exercise
+  forward/backward paths, supported dtypes, and boundary/tail cases; check
+  finite outputs and the existing accuracy contract. Import-only or
+  compile-only success does not establish numerical correctness. Unsupported
+  compiler/architecture combinations must decline before JIT and have a test
+  for that rejection. Report unavailable lanes explicitly; do not loosen
+  tolerances or skip failing supported lanes to make this matrix pass.
+- Record the source revision, installed DSL distributions, loaded native
+  compiler path and `CUDA_VERSION.major` / `.minor`, GPU/driver, framework,
+  backend/NVRTC, and pass/fail/skip counts. With DSL 4.8, the default wheel
+  installs cu12; `[cu13]` adds another flavor and the loader can select it.
+  Verify the loaded flavor rather than assuming the install command selected
+  it. A cu12 DSL run with a CUDA 13 framework/backend isolates DSL compatibility;
+  it is not qualification of a deployment using CUDA 12 throughout. The
+  [integration skill](../../skills/cutedsl-kernel-integration/SKILL.md)
+  carries the test workflow.
 - Known floors — extend this list when you take a dependency on a newer API,
   and say so in the PR body if it raises the floor of a user-facing op:
   `cutlass.experimental.*` (primitives, `cuda.tensor_map`; everything under
