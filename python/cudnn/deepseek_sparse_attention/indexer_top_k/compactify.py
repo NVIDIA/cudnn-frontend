@@ -21,7 +21,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
 
-from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
+from cudnn.deepseek_sparse_attention.utils.compiler import compile_options, gpu_arch_flag
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     device_major,
     resolve_stream as _resolve_stream,
@@ -127,9 +127,9 @@ class CompactifyKernel:
 _compile_cache: dict[tuple, object] = {}
 
 
-def _compile_or_fetch(key, kernel_obj, *args):
+def _compile_or_fetch(key, kernel_obj, *args, gpu_arch):
     if key not in _compile_cache:
-        _compile_cache[key] = cute.compile(kernel_obj, *args, options=compile_options("--opt-level 3"))
+        _compile_cache[key] = cute.compile(kernel_obj, *args, options=compile_options("--opt-level 3", gpu_arch=gpu_arch))
     return _compile_cache[key]
 
 
@@ -159,7 +159,8 @@ def compactify(
         out = torch.empty_like(idxs)
         length = torch.empty(rows, dtype=torch.int32, device=idxs.device)
 
-        key = (cols,)
+        gpu_arch = gpu_arch_flag(idxs.device)
+        key = (cols, gpu_arch)
         if key not in _compile_cache:
             _compile_or_fetch(
                 key,
@@ -169,6 +170,7 @@ def compactify(
                 _to_cute(length),
                 Int32(int(rows)),
                 launch_stream,
+                gpu_arch=gpu_arch,
             )
         compiled = _compile_cache[key]
         compiled(idxs, out, length, Int32(int(rows)), launch_stream)
