@@ -23,9 +23,9 @@ def test_native_fp8_sink_split_rebind_replay(d, dv, split, dtype, output, monkey
     seen = []
     original = api_dsl._load_kernel_template
 
-    def record(filename, params, tag):
+    def record(filename, params, tag, part=None):
         seen.append(filename)
-        return original(filename, params, tag)
+        return original(filename, params, tag, part=part)
 
     monkeypatch.setattr(api_dsl, "_load_kernel_template", record)
     sq = 1 if split == 2 else 17

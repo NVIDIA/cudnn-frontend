@@ -698,8 +698,13 @@ def softmax_arms_of(k_mod, *, has_lse: bool) -> str:
     return tag
 
 
-def _load_kernel_template(filename: str, params: Hashable, tag: str):
-    """Load one uniquely named kernel module per template parameter set."""
+# The parts whose template modules keep the cache key every caller has had. Another SM100-line part (cc 10.3) folds itself into
+# the key: the module, its outer ``compile()`` cache and its compiled artifacts then never serve a different part in one process.
+_HOME_KEY_PARTS = frozenset({(10, 0), (10, 7)})
+
+
+def _load_kernel_template(filename: str, params: Hashable, tag: str, part=None):
+    """Load one uniquely named kernel module per template parameter set (and per part off :data:`_HOME_KEY_PARTS`)."""
 
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", filename)
     # The sm107 config module's private sweep seams specialize a body WITHOUT touching the record: fold their state into the module
@@ -711,10 +716,12 @@ def _load_kernel_template(filename: str, params: Hashable, tag: str):
     # The SM100 small tiles' own seam (config_sm100._STAGES_KV_OVERRIDE_FOR_SWEEPS) joins the key ONLY when it is set, so every key a
     # process without it builds is the key it always had (the sm107 seams' alone, or None).
     extra_key = seams if seams_sm100 is None else (seams, seams_sm100)
+    if part is not None and tuple(part) not in _HOME_KEY_PARTS:
+        extra_key = (extra_key, ("part", tuple(part)))
     return load_template(path, params, tag=tag, extra_key=extra_key)
 
 
-def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplateParams, fp8: bool = False, pertensor: bool = False, rubin: bool = False):
+def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplateParams, fp8: bool = False, pertensor: bool = False, rubin: bool = False, part=None):
     """Load one SM100-family module for the selected flavor and quantization
     path. Rubin uses its SM107 siblings, including paged D128 half, except for
     the shared half single-Q split and D256 paged pipelines, whose SMEM fits the version-0 descriptor window,
@@ -800,7 +807,7 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     else:
         filename = _SM100_KERNEL_FILES[flavor]
         tag = f"sdpa_fwd_sm100_{tag}"
-    return _load_kernel_template(filename, params, tag)
+    return _load_kernel_template(filename, params, tag, part=None if rubin else part)
 
 
 def _load_sm120_kernel_module(flavor: Optional[tuple[int, int]], params: Sm120TemplateParams, fp8: bool = False, pertensor: bool = False):
@@ -4060,7 +4067,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         params = self.template_params()
-        self._k_mod = _load_sm100_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)))
+        self._k_mod = _load_sm100_kernel_module(
+            self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)), part=self._device_cc
+        )
         # Which template serves this plan (its file stem, e.g. "prefill_d256_f16" /
         # "decode_d256_f16"): a lowering choice the engine's executor exposes so
         # a test can assert the route without inferring it from the source.

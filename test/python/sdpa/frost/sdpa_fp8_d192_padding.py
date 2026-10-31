@@ -24,9 +24,9 @@ def test_fp8_d192_padded_heads_rebind_replay(d, dv, split, pack, sched, sink, dt
     seen = []
     load = api_dsl._load_kernel_template
 
-    def record(filename, params, tag):
+    def record(filename, params, tag, part=None):
         seen.append(filename)
-        return load(filename, params, tag)
+        return load(filename, params, tag, part=part)
 
     monkeypatch.setattr(api_dsl, "_load_kernel_template", record)
     b, sq, skv = 2, 129 if split == 1 else 17, 256
