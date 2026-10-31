@@ -541,8 +541,8 @@ def _pick_flavor(d_qk: int, d_v: int, candidates: Optional[tuple[tuple[int, int]
 # sm100/prefill_d128_mxfp8.py, prefill_d128_fp8.py and prefill_d192_d128_f16.py) is claimed per KERNEL and per
 # ARCH.  It trades MUFU.EX2 pipe-time for FMA pipe-time, so its sign follows the part's MUFU rate -- MEASURED
 # 16 elements/clk/SM on cc 10.0 (B200) and 32 on cc 10.7 (Rubin: the same split is -9..-10 %, an emulated exp2
-# costs 1.99x the MUFU time it frees); cc 10.3 (GB300) DOCUMENTS the same doubled exp2 throughput, so the split
-# stays off there until a GB300 A/B says otherwise.  Positive gate on the measured cc, never a negative gate on
+# costs 1.99x the MUFU time it frees); cc 10.3 (GB300) DOCUMENTS the same doubled exp2 throughput, and a B300 A/B
+# (below) confirms it: the split stays off there.  Positive gate on the measured cc, never a negative gate on
 # 10.3: the engine rows are cc RANGES and an unmeasured part gets the develop (all-MUFU) kernel.  Precisely: with
 # the gate OFF the four kernels trace the all-MUFU exp2 spelling (``_E2E_ENABLED`` False, ``cute.math.exp2`` at
 # every softmax site), and the d128 MXFP8 kernel ADDITIONALLY carries its arch-independent Amax_O FMNMX fold
@@ -568,6 +568,13 @@ def _pick_flavor(d_qk: int, d_v: int, candidates: Optional[tuple[tuple[int, int]
 # ("mxfp8", (192, 128)) -3.3..-4.0 % dense -- neither block was merged, and neither is what those entries gate;
 # BF16 D64 nonpaged causal interiors also use the existing mix; masked tiles, dense bands and other layouts stay on MUFU.
 # Every d256 / d512 flavor is unmeasured.  Widening either set is a per-cc, per-kernel measurement -- never a default.
+# cc 10.3, MEASURED 2026-10-31 on a B300 SXM6 (1100 W, cuDNN 9.28.0.38) for the five entries above measured on B200 only:
+# _EXP2_FMA_SPLIT_CC widened to {(10, 0), (10, 3)} vs develop, FROST forward pinned (benchmark_single_sdpa.py
+# --sdpa_backend cudnn_oss), A/B/A/B in separate processes, CUDA-event medians, split-on / split-off time at the B200
+# cases: ("mxfp8", (128, 128)) B=1 H=24/8 S=16K 1.27x dense / 1.15x causal; ("fp8", (128, 128)) H=64/8 S=8K 1.05x dense /
+# 1.12x causal; ("f16", (192, 128)) H=128/128 S=8K 1.02x dense / 1.00x causal; ("f16", (128, 128)) H=64/8 S=8K 1.05x dense
+# / 1.00x causal (the kernel's dense-band gate keeps causal all-MUFU); ("f16", (64, 64)) causal H=32/32 S=8K 1.05x. No
+# entry wins on cc 10.3, so _EXP2_FMA_SPLIT_CC stays {(10, 0)}. The d64 decode tile's set was not measured there.
 _EXP2_FMA_SPLIT_CC: frozenset[tuple[int, int]] = frozenset({(10, 0)})
 _EXP2_FMA_SPLIT_KERNELS: frozenset[tuple[str, tuple[int, int]]] = frozenset(
     {("mxfp8", (128, 128)), ("fp8", (128, 128)), ("fp8", (192, 128)), ("mxfp8", (192, 128)), ("f16", (192, 128)), ("f16", (128, 128)), ("f16", (64, 64))}
