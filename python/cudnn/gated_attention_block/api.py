@@ -5057,10 +5057,11 @@ DECODE_WIDE_TILE_CCS: Tuple[Tuple[int, int], ...] = ()
 # at ``scale_o`` for the FP8 out projection).  Every piece but the two GEMMs is the bf16 serving form's own kernel on the part; the GEMMs are the
 # FROST FP8 forced-tile plans, validated THROUGH THE BLOCK on cc 10.7 (the unfused FP8 pipeline's cells and the mode's own) and, since
 # 2026-10-30, on cc 10.0 (the SM100 line: the FP8 forced-tile GEMM cell at the mode's shapes and the mode's DECODE / EXTEND cells on the SM100
-# development part -- functional only, unmeasured there).  A served DENSE part off this tuple declines the mode by name
+# development part -- functional only, unmeasured there) and, since 2026-10-31, on cc 10.3 (the same cells on a B300 -- functional only,
+# unmeasured).  A served DENSE part off this tuple declines the mode by name
 # (`_fp8_proj_bf16_attention_part_decline`; the lift: the tuple gaining the part together with the mode's accept cells there -- the one-tuple
 # flip of DENSE_SERVING_CCS); an unserved part hears the dense part statement.
-FP8_PROJ_BF16_ATTENTION_CCS: Tuple[Tuple[int, int], ...] = ((10, 7), (10, 0))
+FP8_PROJ_BF16_ATTENTION_CCS: Tuple[Tuple[int, int], ...] = ((10, 7), (10, 0), (10, 3))
 # The ONE spelling of the mode the envelopes publish (``quant_modes``) and the declines name.
 QUANT_MODE_FP8_PROJ_BF16_ATTENTION = "QuantSpec(attention_dtype=torch.bfloat16)"
 

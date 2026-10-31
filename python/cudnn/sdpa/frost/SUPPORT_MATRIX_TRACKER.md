@@ -3365,7 +3365,7 @@ The gated attention block (`cudnn.gated_attention_block`; `docs/operations/atten
 `sdpa` graph form: its serving forms are claims of the BLOCK, recorded here one row per form x pool layout x page size x dtype,
 each written in the same change as its accept cell (Rule S2). Rubin (cc 10.7) for every form -- including, since 2026-10-30, the
 FP8-PROJECTION + BF16-ATTENTION mode of the paged forms (`QuantSpec(attention_dtype=torch.bfloat16)`: FP8 projections, bf16 pools and
-attention, the gated O quantized to e4m3; the "Served since 2026-10-30" paragraph below; `FP8_PROJ_BF16_ATTENTION_CCS = ((10, 7), (10, 0))`: cc 10.0 too, functional only) --; the DENSE bf16 / f16 forms also on cc 10.0
+attention, the gated O quantized to e4m3; the "Served since 2026-10-30" paragraph below; `FP8_PROJ_BF16_ATTENTION_CCS = ((10, 7), (10, 0), (10, 3))`: cc 10.0 and cc 10.3 too, functional only) --; the DENSE bf16 / f16 forms also on cc 10.0
 since 2026-10-29 (`DENSE_SERVING_CCS`; the "Admitted 2026-10-29" paragraph below: functional only, UNMEASURED; the cells RAN 2026-10-29 on the GB200 class -- cc 10.0, 152 SMs, one exclusive GPU: 351 passed / 0 failed / 392 skipped over eleven selections, every skip a Rubin-only row -- with the Rubin regression green the same day (cc 10.7, 204 SMs, a shared GPU, functional: 679 / 0 / 56 over nine modules); the 32-column decode
 arm declined by name there until its own cells run, `DECODE_WIDE_TILE_CCS`; cc 10.3 since 2026-10-31 with the same forms and declines -- the "Admitted 2026-10-31" paragraph below). The pool contract is the SDPA adapter's own
 paged contract -- a 4-D view `[num_pages, H_kv, page_size, D]`, `D` contiguous, the other three strides free: **L1** HND compact
@@ -3675,7 +3675,7 @@ ring depth, four tiles with a tail, a padded entry), the 27B 24 / 4 geometry at 
 `S_q` 4), the e4m3 O store pin + gate-quant histogram + saturation through `update_quant_scales`, `get_workspace_size()` honesty, the capture of
 the first execute + the replay over a new step, `update_quant_scales` after a warmed-up capture (the live values, the oracle at the new
 `scale_o`), the pool matrix (L1 / L2 / L3 x pages 16 / 32 / 64 / 128), the launch census on both parts (B 2 x S_q 1, every kernel counted: cc 10.7 6 / 7
-with the gate in the combine and 7 / 8 with the separate gate, cc 10.0 7 / 8 -- folded / separate cache write, the bf16 unfused chain's own
+with the gate in the combine and 7 / 8 with the separate gate, cc 10.0 and cc 10.3 7 / 8 -- folded / separate cache write, the bf16 unfused chain's own
 counts with the quantize launch in the place of its small-M split-K reduce; the fold drops exactly the cache-write launch); EXTEND -- the degenerate matrix (hnd 16, unified 32; nhd 64 / hnd 128 at L1), two chunks then a prefix hit on L3, a
 middle pad + a live-Q dead-KV entry (bytes 0) + the lengths form, the gate in the paged body's epilogue vs the separate launch (one bf16
 rounding), the e4m3 O store pin + model, the 27B geometry; the FP8 forced-tile GEMM at the mode's shapes on the capture-safe route (both parts).
@@ -3684,7 +3684,8 @@ indicative only).  cc 10.0 (`FP8_PROJ_BF16_ATTENTION_CCS = ((10, 7), (10, 0))`):
 (`test_fp8_forced_tile_projection_gemm_with_the_alpha_epilogue_runs_on_the_capture_safe_route`: six shapes, the forced
 `128x256x128` cluster-2 tile, each within one bf16 ulp of the dequantized fp32 product) and the mode's DECODE / EXTEND cells on the SM100
 development part -- the gate always its own launch there (the sm100 row claims no gate epilogue), every other piece the bf16 forms' (admitted
-2026-10-29) plus the part-free quantize launch; functional only, unmeasured; a further part lifts the same way.  Follow-ups, not served: the fused gated e4m3 store in the dense decode tile's split combine
+2026-10-29) plus the part-free quantize launch; functional only, unmeasured; a further part lifts the same way.  cc 10.3
+(`FP8_PROJ_BF16_ATTENTION_CCS = ((10, 7), (10, 0), (10, 3))`): admitted 2026-10-31 the same way on a B300 -- the RUN RECORD: cc 10.3 RAN 2026-10-31 on a B300 (one exclusive GPU, functional only): the mode's own module, the FP8 forced-tile GEMM cell included, 16 passed / 0 failed; with the tuple holding cc 10.3 `test_block_serving_decode.py` 151 passed / 1 failed / 80 skipped and `test_block_serving_extend.py` 62 / 0 / 3 (every skip a Rubin-only row) -- the one failure the launch census, whose per-part table had no cc 10.3 row; with the row (8 / 7, the cc 10.0 counts) the census cell passed.  Follow-ups, not served: the fused gated e4m3 store in the dense decode tile's split combine
 (the sparse adapter carries it; the dense adapter has no `out_scale`), the FP8 small-M GEMM arm at decode row counts, the mode over the block's
 own K / V, an e4m3 KV cache under the mode, `use_pdl=True`, `num_tokens_live`.
 
@@ -3721,8 +3722,8 @@ the reason, "the 32-column SM100 decode arm: its cc 10.0 accept cells have not r
 
 **Admitted 2026-10-31 -- the same DENSE bf16 / f16 serving forms on cc 10.3 (B300 / GB300; `DENSE_SERVING_CCS = ((10, 7), (10, 0), (10, 3))`),
 FUNCTIONAL ONLY, UNMEASURED.**  cc 10.3 runs the cc 10.0 forms through the same SM100 d256 kernels with the same declines (`fuse_gate`, the
-fused projection forks, the quantized pipelines -- `FP8_PROJ_BF16_ATTENTION_CCS` does not hold it, so the FP8-projection + bf16-attention mode
-is declined by name there --, `save_for_backward`, `thd=True` over the block's own K / V, a QsaSpec geometry, the 32-column decode arm); the
+fused projection forks, the quantized pipelines other than the FP8-projection + bf16-attention mode -- which `FP8_PROJ_BF16_ATTENTION_CCS`
+holds for cc 10.3 too, the FP8-mode run record below --, `save_for_backward`, `thd=True` over the block's own K / V, a QsaSpec geometry, the 32-column decode arm); the
 route reads the SM100 line's rule under its own part (`decode_route(device_cc=(10, 3))` is the cc 10.0 cell with `device_cc` (10, 3)).
 The cells RAN 2026-10-31 on one B300 (cc 10.3, one exclusive GPU) over the whole `gated_attention_block/cutedsl` directory: 2564 passed / 0 failed / 1524 skipped -- Rubin-only rows, the FP8-projection mode's decline, environment skips (no nvdisasm / cuobjdump on PATH, one visible GPU, an optional transformers check) and two rows that cannot fire on a served part (develop on the same part: 2466 passed / 1623 skipped -- the cc 10.3 rows declined).  The three modules whose test pins this change also corrected (`test_block_serving_decode.py`, `test_block_serving_extend.py`, `test_block_end_to_end.py`) ran again with the final change: 215 / 0 / 143.
 

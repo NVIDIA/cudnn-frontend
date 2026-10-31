@@ -3476,10 +3476,12 @@ def test_fp8_proj_bf16_attention_l1_l2_l3_pools_are_bitwise_at_every_page_size(p
 # ladder pinned at decode_split_kv=4 (the decode tile + its combine on every part: the chain the docs describe; the split count sizes the grid,
 # never the kernel list) -- by (fuse_cache_write_small_m, fuse_gate).  The census cell below is the detector (EVERY kernel the profiler sees is
 # counted, a GEMM's split-K reduce included) and the docs quote these numbers; a tree that changes a stage's kernel count changes this table
-# and the prose with it.  cc 10.0 serves the gate as its own launch only (fuse_gate=True is the part's typed decline): the two write-through arms.
+# and the prose with it.  cc 10.0 and cc 10.3 serve the gate as its own launch only (fuse_gate=True is the parts' typed decline): the two
+# write-through arms.
 _MODE_DECODE_LAUNCHES = {
     _SM107: {(False, True): 7, (True, True): 6, (False, False): 8, (True, False): 7},
     _SM100: {(False, False): 8, (True, False): 7},
+    _SM103: {(False, False): 8, (True, False): 7},
 }
 
 
