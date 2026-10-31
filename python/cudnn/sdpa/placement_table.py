@@ -88,10 +88,11 @@ def class_key(row: str, facts) -> Optional[Tuple]:
         layout = "thd_ragged" if total is not None and total < facts.b * facts.s_q else "thd"
     else:
         layout = "dense"
+    bottom_right = facts.bottom_right or facts.s_q == facts.s_kv  # a square reads the same from either corner
     if facts.window_left is not None:
         mask = "window"
-    elif facts.causal and not (facts.s_q == 1 and facts.bottom_right):  # one bottom-right row sees every key: no mask
-        mask = "causal_br" if facts.bottom_right or facts.s_q == facts.s_kv else "causal_tl"  # a square reads the same from either corner
+    elif facts.causal and not (facts.s_q == 1 and bottom_right):  # one bottom-right row sees every key: no mask
+        mask = "causal_br" if bottom_right else "causal_tl"
     else:
         mask = "none"
     group = "mha" if facts.h_q == facts.h_kv else ("gqa_unpacked" if _unpacked_decode(row, facts) else "gqa")
