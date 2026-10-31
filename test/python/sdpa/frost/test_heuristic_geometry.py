@@ -828,3 +828,20 @@ def test_native_d576_has_launch_geometry_for_the_split_model():
     facts = _facts(b=1, h_q=96, h_kv=1, s_q=129, s_kv=8192, d_qk=576, d_v=512, causal=False)
     assert heur._split_launch(SPEC.capabilities, facts, 64, 128, 2, 1).q_tiles == 2
     assert heur._split_launch(SPEC.capabilities, facts, 64, 128, 2, 32).q_tiles == 33
+
+
+@pytest.mark.parametrize("order", [((10, 0), (10, 3)), ((10, 3), (10, 0))], ids=["sm100_then_sm103", "sm103_then_sm100"])
+@requires_dsl
+def test_sm100_line_parts_load_their_own_template_modules(order):
+    """cc 10.0 and cc 10.3 trace the same SM100 bodies, but a module's outer ``compile()`` cache and its compiled artifacts belong to the
+    part that loaded it: the loader keys cc 10.3 by itself, in either load order, while cc 10.0 keeps the key every caller has had."""
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
+
+    # a fresh record per order, so each order loads its modules for the first time
+    params = TemplateParams(dtype_qkv=DTYPE_BF16 if order[0] == (10, 0) else DTYPE_FP16)
+    mods = {cc: _load_sm100_kernel_module((128, 128), params, part=cc) for cc in order}
+    assert mods[(10, 0)] is _load_sm100_kernel_module((128, 128), params)
+    assert mods[(10, 3)] is not mods[(10, 0)] and mods[(10, 3)].compile is not mods[(10, 0)].compile
+    assert all(_load_sm100_kernel_module((128, 128), params, part=cc) is mods[cc] for cc in order)
