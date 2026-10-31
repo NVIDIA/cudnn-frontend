@@ -955,9 +955,9 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
             measured = facts.has_paged_kv and facts.dtype == cudnn.data_type.BFLOAT16 and facts.window_left is None and not facts.has_sink
             return LEAD if measured and facts.h_q * facts.b * facts.s_kv >= SQ1_D576_MIN_WORK else TRAIL
         if facts.has_paged_kv and flavor == (512, 512):
-            # Paged d512 decode runs the role-split PREFILL tile (no d512 decode tile yet) and measures
-            # behind the backend's paged decode engine (module docstring: 77.8 vs 65.1 us
-            # at 64/1); the dense d512 rule below was fitted on dense K/V. TRAIL until the tile lands.
+            # Fallback where placement_table has no entry (other SM100-row parts, unmeasured features): the 2026-10-07
+            # FlashInfer-shape measurement (b 8, KV <= 4096: 77.8 vs 65.1 us) trailed; on cc 10.0 the generated entry
+            # (study sm100_d512_paged_decode_b100_20261030) leads past a cost threshold.
             return TRAIL
         if flavor in ((256, 256), (512, 512)) and _synth_kv_padding(caps, facts):
             # S_kv off the KV tile cannot split; unsplit small launches lose (b3 h_kv=1: 1.98x d512, d256 12 units: 2.03x).

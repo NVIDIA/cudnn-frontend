@@ -193,17 +193,18 @@ def test_sm120_d256_decode_of_a_group_the_tile_does_not_divide_trails(h_q, b):
 
 
 @pytest.mark.L0
-def test_paged_d512_decode_trails_until_its_decode_tile():
-    """Paged d512 at s_q == 1 runs the role-split prefill tile (no d512 decode tile) and
-    measured behind the backend's paged decode engine, so it TRAILS by default, while the
-    same launch over dense K/V keeps the measured dense-d512 rule (LEAD at these KV tokens
-    in flight); multi-token paged d512 keeps the decode-shaped LEAD and paged d512 prefill
-    stays backend-first like every other paged prefill (the paged d256 THD shard excepted)."""
+def test_paged_d512_decode_follows_the_generated_entry_and_trails_without_one():
+    """Paged d512 at s_q == 1 on cc 10.0 follows the generated entry (study sm100_d512_paged_decode_b100_20261030): it
+    leads past the cost threshold and trails tiny launches. Without an entry (another SM100-row part) the hand rule's
+    TRAIL stands. Dense K/V keeps the dense-d512 rule; multi-token paged d512 keeps the decode-shaped LEAD; a mask-free
+    paged prefill has no entry and stays backend-first."""
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     spec = next(spec for spec in ENGINE_SPECS if spec.name == _SM100)
     paged = dict(d_qk=512, d_v=512, b=8, h_q=64, h_kv=1, s_kv=4096, has_paged_kv=True, padded=True, page_size=16, causal=False, bottom_right=False)
-    assert placement.place(spec, _facts(s_q=1, **paged)) == placement.TRAIL
+    assert placement.place(spec, _facts(s_q=1, **paged)) == placement.LEAD  # measured neighbours win 0.26-0.81
+    assert placement.place(spec, _facts(s_q=1, **{**paged, "b": 1, "h_q": 8})) == placement.TRAIL  # measured loss 2.7x
+    assert placement.place(spec, _facts(s_q=1, device_cc=(10, 3), **paged)) == placement.TRAIL
     assert placement.place(spec, _facts(s_q=1, **{**paged, "has_paged_kv": False, "page_size": 0})) == placement.LEAD
     assert placement.place(spec, _facts(s_q=4, **paged)) == placement.LEAD
     assert placement.place(spec, _facts(s_q=128, **paged)) == placement.TRAIL
@@ -231,7 +232,9 @@ def test_paged_d576_mla_decode_leads_past_its_work_floor():
                 assert placement.place(spec, facts) == want, (h_q, b, s_kv)
     lead = dict(h_q=64, b=64, s_kv=8192)
     assert placement.place(spec, _facts(s_q=1, **lead, **mla)) == placement.LEAD
-    assert placement.place(spec, _facts(s_q=1, **lead, **{**mla, "has_paged_kv": False, "page_size": 0})) == placement.TRAIL
+    dense = {**mla, "has_paged_kv": False, "page_size": 0}
+    assert placement.place(spec, _facts(s_q=1, **lead, **dense)) == placement.LEAD  # study sm100_d576_dense_decode_20261030
+    assert placement.place(spec, _facts(s_q=1, device_cc=(10, 3), **lead, **dense)) == placement.TRAIL  # no entry: hand floor (paged only)
     assert placement.place(spec, _facts(s_q=1, dtype=cudnn.data_type.HALF, **lead, **mla)) == placement.TRAIL
     assert placement.place(spec, _facts(s_q=1, window_left=128, **lead, **mla)) == placement.TRAIL
     assert placement.place(spec, _facts(s_q=1, has_sink=True, **lead, **mla)) == placement.TRAIL
@@ -263,8 +266,12 @@ def test_paged_d576_mla_decode_leads_past_its_work_floor():
     ],
 )
 def test_paged_prefill_placement_stays_inside_configured_domain(monkeypatch, outside):
-    """Synthetic shard bounds check isolation, not measured workload winners."""
+    """Synthetic shard bounds check isolation, not measured workload winners: the generated table is emptied so only the
+    hand-written shard decides."""
+    from cudnn.sdpa import placement_table
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    monkeypatch.setattr(placement_table, "TABLE", {})
 
     monkeypatch.setattr(placement, "PAGED_D256_PREFILL_HEADS", frozenset({(6, 2)}), raising=False)
     monkeypatch.setattr(placement, "PAGED_D256_PREFILL_PAGE_SIZES", frozenset({32}), raising=False)

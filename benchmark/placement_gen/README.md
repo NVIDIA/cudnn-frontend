@@ -10,7 +10,7 @@
    - head pair defaults (`d_qk`, `d_v`), an optional `layout` default;
    - the `train` / `holdout` JSONL paths.
 2. **Sweep on the target part.** Run the `cudnn` (backend only), `cudnn_oss` (FROST first) and `cudnn_auto` (default dispatch) legs. Write one JSON line per (case, leg) with `ms`, `plan` and the `case` dict. Use a full-power board, and record co-tenant GPU processes at start and end.
-3. **Fit:** `python benchmark/placement_gen/gen.py study.json`. Every case becomes graph facts, classified with `placement_table.class_key`, the same code the runtime uses. Per class, every scalar in `placement_table.FEATURES` is fit (today: `cost`, the roofline proxy, and `tiles`, the parallel tiles before a KV split). Each fit is:
+3. **Fit:** `python benchmark/placement_gen/gen.py study.json`. Every case becomes graph facts, classified with `placement_table.class_key`, the same code the runtime uses. Per class, every scalar in `placement_table.FEATURES` is fit (today: `cost`, the roofline proxy; `tiles`, the parallel tiles before a KV split; `rows`, the query rows b * h_q * s_q; `kv`, the KV tokens per request). Each fit is:
    - `always`;
    - `never`;
    - or one threshold halfway between the last training loss and the first win past it, in the direction that keeps more wins.
