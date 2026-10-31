@@ -3523,6 +3523,10 @@ def lower_dsl_prefill(
         **({"sample_kv_mask": ga.tensor_desc_from_ir(facts.kv_mask_t, name="kv_mask")} if ("sample_kv_mask" in _ctor_params and facts.has_kv_mask) else {}),
     )
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
+    if facts.thd and spec.name == "sdpa_fwd_prefill_sm80":
+        # Variant-pack buffers may be flat or capacity-shaped; the graph's
+        # Stats descriptor, rather than the carrier's shape, owns the packing.
+        api._thd_lse_raw_storage = True
     if getattr(api, "thd_decode_leg", False):
         # Physical offsets choose addresses; declared Q lengths choose live rows.
         api._ragged_q_lens = 2 if facts.cu_seq_q_t is not None else 1 if facts.seq_q_t is not None else 0

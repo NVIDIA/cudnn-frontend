@@ -6660,6 +6660,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._thd_meta_fn = None
         self._thd_lse_head_stride = 0
         self._thd_lse_token_major = False
+        self._thd_lse_raw_storage = False
         self._t_q_cap = 0
         self._t_kv_cap = 0
         self._thd_launch = None
@@ -7053,6 +7054,18 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 lse_tensor.dtype != torch.float32 or lse_tensor.device != device,
                 f"SM80 THD Stats must be fp32 on {device}",
             )
+            if self._thd_lse_raw_storage:
+                # Graph variant packs bind storage, not a packed carrier shape.
+                # Bound the view by the exposed carrier span, not unused bytes
+                # elsewhere in its backing allocation. No device lengths read.
+                head_stride, token_stride = map(int, self.lse_desc.stride[1:3])
+                required = 0 if t_q == 0 else (self.h_q - 1) * head_stride + (t_q - 1) * token_stride + 1
+                span = 0 if lse_tensor.numel() == 0 else 1 + sum((n - 1) * st for n, st in zip(lse_tensor.shape, lse_tensor.stride()))
+                self._value_error_if(span < required, f"SM80 THD Stats storage capacity {span} is smaller than the declared span {required}")
+                if self._thd_lse_token_major:
+                    lse_tensor = lse_tensor.as_strided((t_q, self.h_q), (token_stride, head_stride), lse_tensor.storage_offset())
+                else:
+                    lse_tensor = lse_tensor.as_strided((1, self.h_q, t_q), (0, head_stride, token_stride), lse_tensor.storage_offset())
             if self._thd_lse_token_major:
                 self._value_error_if(
                     not (lse_tensor.ndim == 2 or (lse_tensor.ndim == 3 and lse_tensor.shape[2] == 1))
