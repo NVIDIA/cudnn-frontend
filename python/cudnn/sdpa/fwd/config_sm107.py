@@ -2293,6 +2293,8 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
                 f"its 128-register softmax holds one 64-column chunk and the one-batch-entry paths hand-unroll two sub-tiles"
             )
     softmax_regs, correction_regs = _D128_REG_SPLIT[2 if softmax_wgs == 2 else (softmax_wgs, tile_k)]
+    if mxfp8:
+        softmax_regs, correction_regs = 184, 104
     total_warps = _d128_total_warps(softmax_wgs)
     corr_warp_base = softmax_wgs * _D128_SOFTMAX_WG_WARPS
     mma_warp_id = corr_warp_base + _D128_CORRECTION_WARPS
