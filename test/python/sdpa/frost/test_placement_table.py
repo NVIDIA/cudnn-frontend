@@ -203,3 +203,22 @@ def test_cc103_d256_backward_thd_entries_are_its_own():
     assert pt.log2_work(small) < 30.374 <= pt.log2_work(large)
     assert (pt.lookup(row, small), pt.lookup(row, large)) == (False, True)
     assert pt.lookup(row, bwd(2, 16, 2, 4000, thd=False, max_total_seq_len_q=None)) is None  # dense off the tile: no entry
+
+
+@pytest.mark.L0
+def test_cc103_d128_forward_dense_causal_gqa_entries_are_its_own():
+    """cc 10.3's own d128 forward entries (study sm103_d128_fwd_dense_20261031, causal GQA half): dense causal GQA squares lead
+    on and off the 128-key tile, with no transfer. The same graphs on cc 10.0, mask-free graphs and MHA have no entry."""
+    row = "sdpa_fwd_prefill_sm100"
+
+    def fwd(b, h_q, h_kv, s, causal=True, **over):
+        base = dict(b=b, h_q=h_q, h_kv=h_kv, s_q=s, s_kv=s, d_qk=128, d_v=128, causal=causal, has_paged_kv=False, device_cc=(10, 3))
+        base.update(over)
+        return _facts(**base)
+
+    assert pt.lookup(row, fwd(2, 32, 8, 4096)) is True  # on the tile
+    assert pt.lookup(row, fwd(4, 16, 2, 3000)) is True  # off the tile: its own class and entry
+    assert pt.lookup(row, fwd(2, 32, 8, 4096, device_cc=(10, 0))) is None
+    assert pt.lookup(row, fwd(2, 32, 8, 4096, causal=False)) is None  # mask-free: lost on its holdout
+    assert pt.lookup(row, fwd(2, 16, 16, 4096)) is None  # MHA: no entry
+    assert pt.lookup(row, fwd(2, 32, 8, 4096, dtype=cudnn.data_type.HALF)) is None  # f16: not measured
