@@ -71,13 +71,20 @@ def test_classic_path_without_candidates(no_candidates):
     assert g._lowered_graph is not None
 
 
-def test_mixed_graph_still_lowers(frost_candidate):
-    """A node the GEMM validator does not cover (reshape) keeps the
-    classic eager lowering even with a candidate: the rule is every-node-covered."""
+def test_reshape_graph_uses_python_validation(frost_candidate):
+    """Reshape is now covered; validation does not construct backend operations."""
     g, c = _matmul_graph()
     g.reshape(input=c).set_dim([2, 32, 96]).set_stride([3072, 96, 1]).set_output(True)
     g.validate()
-    assert g._lowered_graph is not None
+    assert g._lowered_graph is None
+
+
+def test_uncovered_node_validator_declines():
+    """The every-node-covered rule retains the fallback for unknown families."""
+    from types import SimpleNamespace
+    from cudnn._gemm_validate import validate_graph
+
+    assert not validate_graph(SimpleNamespace(_nodes=[SimpleNamespace(node_type=object())]))
 
 
 @pytest.mark.parametrize("candidate", ["frost_candidate", "no_candidates"])

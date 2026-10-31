@@ -3795,6 +3795,7 @@ _STRUCTURED_OPS = {
         inputs=("input",),
         attrs=("reshape_mode",),
         outputs=("OUT_0",),
+        dtype_like={"OUT_0": "input"},
         push_output_dims=True,  # target shape comes from out_dims / set_dim
         no_cdt=True,
     ),
