@@ -27,7 +27,7 @@ def attention_backward_preprocess(
 ):
     """Compute the per-query dot product between forward output and dO."""
     row_offsets = tl.program_id(0) * block_m + tl.arange(0, block_m)
-    batch_head = tl.program_id(1)
+    batch_head = tl.program_id(1).to(tl.int64)  # Rule S7: widen before the stride products
     col_offsets = tl.arange(0, head_dim)
     valid = row_offsets < seqlen_q
     tensor_offsets = batch_head * head_dim * seqlen_q + row_offsets[:, None] * head_dim + col_offsets[None, :]
@@ -63,7 +63,7 @@ def attention_backward_dq(
     causal: tl.constexpr,
 ):
     """Compute one query tile of the straight-through-estimator dQ."""
-    batch_head = tl.program_id(1)
+    batch_head = tl.program_id(1).to(tl.int64)  # Rule S7: widen before the stride products
     q_batch_head_offset = q_stride_h * (batch_head % num_heads) + q_stride_b * (batch_head // num_heads)
     kv_batch_head_offset = kv_stride_h * (batch_head % num_heads) + kv_stride_b * (batch_head // num_heads)
     q += q_batch_head_offset
@@ -156,7 +156,7 @@ def attention_backward_dkdv(
     causal: tl.constexpr,
 ):
     """Compute one key/value tile of dK and probability-quantized dV."""
-    batch_head = tl.program_id(1)
+    batch_head = tl.program_id(1).to(tl.int64)  # Rule S7: widen before the stride products
     q_batch_head_offset = q_stride_h * (batch_head % num_heads) + q_stride_b * (batch_head // num_heads)
     kv_batch_head_offset = kv_stride_h * (batch_head % num_heads) + kv_stride_b * (batch_head // num_heads)
     q += q_batch_head_offset

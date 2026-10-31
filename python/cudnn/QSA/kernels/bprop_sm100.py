@@ -2,7 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from sdpa/bwd/kernels/sm100/bprop_sparse_d256_f16.py.
 
-"""Paired 12:1 QSA backward for Blackwell and Rubin."""
+"""Batched QSA backward for Blackwell and Rubin: NQ consecutive queries per CTA (two 12-head or four 6-head queries).
+
+Each CTA gathers the union of its NQ queries' selected K/V blocks once; the queries' heads fill the 24 columns of one
+MMA tile, and owner bits in the compact IDs keep every query's own mask.
+"""
 
 import hashlib
 from pathlib import Path
@@ -15,6 +19,7 @@ from cutlass.cute.runtime import make_fake_stream
 from cutlass.experimental import primitives as prims
 
 from cudnn.frost.compiled_cache import compile_cached, template_key
+from .._contract import BLK_BITS, PAIRED_BACKWARD_COLUMNS, paired_backward
 
 FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
 
@@ -24,14 +29,14 @@ I64 = cutlass.Int64
 F32 = cutlass.Float32
 BF16 = cutlass.BFloat16
 
-GQ = 12
 D = 256
 LOG2E = 1.4426950408889634
 
 NTHREADS = 512
 CHB = 24
-NQ = 2  # Two queries fill 24 MMA columns.
-BLK_BITS = 28  # Two owner bits follow the block index.
+# NQ = N_COLS // GQ consecutive queries fill the MMA columns: 2 x 12 heads (12/1) or 4 x 6 heads (6/1); 24/2 takes
+# the single-query kernels. One owner bit per batched query follows the block index in the compact IDs.
+N_COLS = PAIRED_BACKWARD_COLUMNS
 BLK_MASK = (1 << BLK_BITS) - 1
 
 
@@ -62,7 +67,7 @@ NSL = 5  # the most 64-column dV/dK slices that fit in the 512 TMEM columns afte
 L2_EVICT_FIRST = 0x12F0000000000000
 TM_COLS = 512
 
-Q_BOX_BYTES = (NQ * GQ) * 128
+Q_BOX_BYTES = N_COLS * 128
 
 
 @cute.jit
@@ -131,6 +136,8 @@ def frost_qsa_bprop_sm100(
     if cutlass.const_expr(nonfinite is not None):
         if nonfinite[0] != 0:
             cute.arch.nvvm.exit()
+    GQ = HQ // HKV  # query heads per KV head: 12 (12/1) or 6 (6/1)
+    NQ = N_COLS // GQ  # queries batched per CTA; their heads fill the MMA columns
     hint_ld = cutlass.Int64(L2_EVICT_FIRST)
     tidx, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
@@ -360,7 +367,7 @@ def frost_qsa_bprop_sm100(
                 c_dtype=F32,
                 a_dtype=BF16,
                 b_dtype=BF16,
-                n_dim=NQ * GQ,
+                n_dim=N_COLS,
                 m_dim=128,
                 a_major=0,
                 b_major=0,
@@ -378,7 +385,7 @@ def frost_qsa_bprop_sm100(
                 c_dtype=F32,
                 a_dtype=BF16,
                 b_dtype=BF16,
-                n_dim=NQ * GQ,
+                n_dim=N_COLS,
                 m_dim=128,
                 a_major=1,
                 b_major=1,
@@ -510,12 +517,16 @@ def frost_qsa_bprop_sm100(
                 lrow = p_sparse_blocks + I64(qi) * capacity
                 nchunks = (nblk + (CHB - 1)) // CHB
                 qbase = qi * NQ
-                q0 = qbase
-                q1 = qbase + 1
-                if q1 >= T:
-                    q1 = q0
-                lo0, hi0 = (p_lo + q0).load(), (p_hi + q0).load()
-                lo1, hi1 = (p_lo + q1).load(), (p_hi + q1).load()
+                # A row past T reads the first query's bounds; no owner bit is set for it, so no key is valid for it.
+                qrows, bnd_lo, bnd_hi = [], [], []
+                for i in cutlass.range_constexpr(NQ):
+                    qrow = qbase + i
+                    if cutlass.const_expr(i > 0):
+                        if qrow >= T:
+                            qrow = qbase
+                    qrows.append(qrow)
+                    bnd_lo.append((p_lo + qrow).load())
+                    bnd_hi.append((p_hi + qrow).load())
                 for c in cutlass.range(nchunks, unroll=1):
                     cgc = gc + c
                     st = cgc & 1
@@ -532,23 +543,28 @@ def frost_qsa_bprop_sm100(
                     okslot = m < nblk
                     if jrow >= CHB:
                         okslot = False
+                    # Values assigned under a dynamic branch must be plain names (the DSL yields names, not list items),
+                    # so the per-query validity is four names of which the first NQ are used.
                     ok0 = okslot
                     ok1 = okslot
+                    ok2 = okslot
+                    ok3 = okslot
                     if okslot:
                         code = (lrow + m).load()
                         blk = code & BLK_MASK
                         token = (p_first + blk).load() + trow
                         span = (token <= (p_last + blk).load()) & (token >= 0) & (token < T)
-                        ok0 = span & (((code >> BLK_BITS) & 1) != 0) & (token >= lo0) & (token <= hi0)
-                        ok1 = span & (((code >> (BLK_BITS + 1)) & 1) != 0) & (token >= lo1) & (token <= hi1)
+                        ok0 = span & (((code >> BLK_BITS) & 1) != 0) & (token >= bnd_lo[0]) & (token <= bnd_hi[0])
+                        ok1 = span & (((code >> (BLK_BITS + 1)) & 1) != 0) & (token >= bnd_lo[1]) & (token <= bnd_hi[1])
+                        if cutlass.const_expr(NQ > 2):
+                            ok2 = span & (((code >> (BLK_BITS + 2)) & 1) != 0) & (token >= bnd_lo[2]) & (token <= bnd_hi[2])
+                            ok3 = span & (((code >> (BLK_BITS + 3)) & 1) != 0) & (token >= bnd_lo[3]) & (token <= bnd_hi[3])
+                    oks = [ok0, ok1, ok2, ok3]
                     pw = []
                     dw = []
                     for i in cutlass.range_constexpr(NQ):
-                        vi = ok0
-                        qrow = q0
-                        if cutlass.const_expr(i == 1):
-                            vi = ok1
-                            qrow = q1
+                        vi = oks[i]
+                        qrow = qrows[i]
                         for j in cutlass.range_constexpr(GQ):
                             lj = (p_lse + j * T + qrow).load()
                             ej = (p_delta + qrow * HQ + j).load()
@@ -566,7 +582,7 @@ def frost_qsa_bprop_sm100(
                     pfull = []
                     dfull = []
                     for n in cutlass.range_constexpr(32):
-                        if cutlass.const_expr(n < NQ * GQ):
+                        if cutlass.const_expr(n < N_COLS):
                             pfull.append(pw[n])
                             dfull.append(dw[n])
                         else:
@@ -597,7 +613,7 @@ def frost_qsa_bprop_sm100(
                     if prims.elect_sync():
                         prims.mbarrier_arrive(b_pf.subview(st))
 
-                # Each CTA owns both queries' complete dQ.
+                # Each CTA owns its batched queries' complete dQ.
                 _wait(b_dqf, nq & 1)
                 prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
                 dqv = []
@@ -752,12 +768,14 @@ def _bprop_host(
 ):
     total = q.shape[0]
     hq, hkv = cutlass.const_expr(q.shape[1]), cutlass.const_expr(k.shape[1])
+    nq = N_COLS // (hq // hkv)
+    # One box holds the NQ consecutive queries' heads; the TMA unit zero-fills the rows past T * Hq of the last group.
     flat = cute.make_layout((total * hq, D), stride=(D, 1))
     tma_q = cuda.create_tensor_map_tiled_from_view(
-        cute.make_tensor(q.iterator, flat), box_dims=(NQ * GQ, 64), stride_order=(1, 0), swizzle=cuda.TensorMapSwizzle.s128b
+        cute.make_tensor(q.iterator, flat), box_dims=(N_COLS, 64), stride_order=(1, 0), swizzle=cuda.TensorMapSwizzle.s128b
     )
     tma_do = cuda.create_tensor_map_tiled_from_view(
-        cute.make_tensor(dout.iterator, flat), box_dims=(NQ * GQ, 64), stride_order=(1, 0), swizzle=cuda.TensorMapSwizzle.s128b
+        cute.make_tensor(dout.iterator, flat), box_dims=(N_COLS, 64), stride_order=(1, 0), swizzle=cuda.TensorMapSwizzle.s128b
     )
     layout = cute.make_layout((total, hkv, 4, 64), stride=(hkv * D, D, 64, 1))
     tma_k = cuda.create_tensor_map_tiled_from_view(
@@ -783,7 +801,7 @@ def _bprop_host(
         first,
         last,
         I32(total),
-        (I32(total) + I32(NQ - 1)) // I32(NQ),
+        (I32(total) + I32(nq - 1)) // I32(nq),
         nctas,
         scale,
         hq,
@@ -794,16 +812,16 @@ def _bprop_host(
 
 def compile_kernel(dtype, query_heads, kv_heads, arch):
     """Compile native THD geometry; tensor extents remain dynamic."""
-    if kv_heads == 2:
+    if not paired_backward(query_heads, kv_heads):
         from .bprop_sm100_base import compile_kernel as compile_baseline
 
         return compile_baseline(dtype, query_heads, kv_heads, arch)
     from .bprop_helpers import compile_helpers, fake
 
-    if dtype != BF16 or (query_heads, kv_heads) != (GQ, 1):
-        raise ValueError("Batched QSA backward requires BF16, D256 and 12/1 heads")
+    if dtype != BF16:
+        raise ValueError("Batched QSA backward requires BF16, D256 and 12/1 or 6/1 heads")
     if arch not in (100, 103, 107):
-        raise ValueError(f"Paired QSA backward requires SM100, SM103 or SM107, got SM{arch}")
+        raise ValueError(f"Batched QSA backward requires SM100, SM103 or SM107, got SM{arch}")
     key = template_key(globals(), {"query_heads": query_heads, "kv_heads": kv_heads, "arch": arch}, "compile_kernel")
     total, capacity, blocks, groups = cute.sym_int64(), cute.sym_int64(), cute.sym_int64(), cute.sym_int64()
     q, kv = fake(BF16, (total, query_heads, D)), fake(BF16, (total, kv_heads, D))
@@ -839,13 +857,13 @@ def compile_kernel(dtype, query_heads, kv_heads, arch):
     )
     from . import bprop_dispatch
 
-    compiled["dispatch"] = bprop_dispatch.compile_kernel(arch)
+    compiled["dispatch"] = bprop_dispatch.compile_kernel(arch, query_heads, kv_heads)
     return compiled
 
 
 def launch(compiled, grad_out, q, k, v, out_fp32, lse, ids, counts, lo, hi, first, last, dq, dk, dv, scratch, scale, stream, num_sms):
     """Launch with caller-owned outputs and scratch."""
-    if k.shape[1] == 2:
+    if not paired_backward(q.shape[1], k.shape[1]):
         from .bprop_sm100_base import launch as launch_baseline
 
         return launch_baseline(compiled, grad_out, q, k, v, out_fp32, lse, ids, counts, lo, hi, first, last, dq, dk, dv, scratch, scale, stream, num_sms)

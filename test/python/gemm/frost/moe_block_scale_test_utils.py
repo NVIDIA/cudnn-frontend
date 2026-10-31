@@ -48,11 +48,13 @@ def _build_graph(
     scatter_top_k=None,
     combine_top_k=None,
     gather_rows=None,
+    scale_k=None,
+    negative_scale=(False, False),
 ):
     block_size, default_dt, sf_dt = _COMBOS[combo]
     a_dt = default_dt if a_dt_override is None else a_dt_override
     b_dt = default_dt if b_dt_override is None else b_dt_override
-    sf_k = K // block_size
+    sf_k = K // block_size if scale_k is None else scale_k
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -82,8 +84,9 @@ def _build_graph(
         data_type=offset_dt,
     )
     fto.set_alignment_value(offset_multiple)
-    tok_d = g.block_scale_dequantize(input=tok, descale=SFA, block_size=[1, block_size]) if dequant_a else tok
-    w_d = g.block_scale_dequantize(input=w, descale=SFB, block_size=[block_size, 1]) if dequant_b else w
+    # ``negative_scale`` = (token side, weight side); None leaves is_negative_scale unset.
+    tok_d = g.block_scale_dequantize(input=tok, descale=SFA, block_size=[1, block_size], is_negative_scale=negative_scale[0] or None) if dequant_a else tok
+    w_d = g.block_scale_dequantize(input=w, descale=SFB, block_size=[block_size, 1], is_negative_scale=negative_scale[1] or None) if dequant_b else w
     routing = {}
     mode = cudnn.moe_grouped_matmul_mode.NONE
     if gather_rows is not None:

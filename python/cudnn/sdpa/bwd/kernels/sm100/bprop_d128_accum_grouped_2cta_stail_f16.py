@@ -43,8 +43,11 @@ only (NOTE [2CTA schedules], the pipelined MMA loop, the deferred dS commit, ``Q
 
 4. WARP MAP        role | warps | regs (setmaxnreg) | what it credits (names = the audit's table)
     softmax   | 0-7   | 144 | s_read (NEW: pair-wide on the leader, after the S^T ld pair, EVERY tile), p_ready, ds_ready (pair-wide),
-                             ds_tmem (local), stats consumption; mask_form predicated (section 11): the keep-word mask body of _p_values
-                             only on `tile_may_mask` tiles (a CTA-uniform per-tile scalar: no live register added, no barrier touched)
+                             ds_tmem (local), stats consumption (ldg: the per-tile `_stats` fetch under the SOFTMAX_BARRIER pair; tma_ring: the
+                             stats_full[2] wait after the s_read arrive + the stats_empty[2] bare release (256) after _ds_values, stats_state
+                             st(0) +1 per tile: the LDG chain, its STS and both `bar.sync 1,256` are not traced); mask_form predicated
+                             (section 11): the keep-word mask body of _p_values only on `tile_may_mask` tiles (a CTA-uniform per-tile scalar:
+                             no live register added, no barrier touched)
     epilogue  | 8-11  | 144 | dp_empty (leader; MOVED: after the dS^T readout, before the recv arm), ds_smem (own half by STS),
                              ds_recv_full (expect_tx) + the XCHG ship, s_tail_empty (NEW: leader, after the dQ readout), dq_full x 2
                              slots x 2 rounds per tile, dv_full, dk_full
@@ -52,7 +55,10 @@ only (NOTE [2CTA schedules], the pipelined MMA loop, the deferred dS commit, ``Q
                              tail for dQ(hi-1)), *_empty releases; the follower's MMA warp runs the quiet body (alloc, the
                              ds_pair_ready relay, dealloc)
     tma_ldg   | 13    |  80 | q1_full[1] (ONE stage), q2_full, do1_full[2], do2_full, k1_full, k2_full, v_full (expect_tx on the
-                             LEADER for 2x bytes; the follower issues its half naming the leader's mbar); dv_full (32, fix A)
+                             LEADER for 2x bytes; the follower issues its half naming the leader's mbar); dv_full (32, fix A);
+                             stats_form tma_ring (section 11): stats_full[2] (expect_tx STATS_TX 1024 on its OWN copy, pred=elect_sync(), +
+                             ONE 1 KiB bulk copy per q tile right after Q1(t)) after its stats_empty[2] credit wait (stats_ld st(1), +1 per tile)
+                             -- RESOURCE-NOTE: split 144/144/80 unchanged; loader +~6 live regs: STL/LDL 0 gate; fallback 144/136/88
     tma_stg   | 14    |  80 | dq_empty x 2 slots per ROUND (reduce-add source read drained; the closed per-round release), dvk_empty
                              (leader), k2_empty
     sched     | 15    |  80 | sched_full / sched_empty (CLC payload delivered to the pair); never credits its own ring
@@ -158,6 +164,42 @@ only (NOTE [2CTA schedules], the pipelined MMA loop, the deferred dS commit, ``Q
         waiter: scheduler(L) before re-arming the slot (every phase observed in-loop)   st(0) x T
     tmem_dealloc[1]  THREAD (+peer)    2 / 2          MMA warp, each CTA, after the final CTA sync: `if elect: arrive(); arrive_on_peer(peer rank)` = 1 + 1 == 2
         waiter: the MMA warp of each CTA, wait(0) -> tcgen05_fence -> tcgen05.dealloc.cta_group::2  x 1
+    stats_form tma_ring (section 11; the barrier audit's S1 SKELETON 2026-10-27 17:30 + its 17:46 reconciliation with the bulk-copy form,
+    resources/s1-barrier-table.md sections 1 / 2 / 14; the resource plan s1-stats-ring.md; ``config_sm100_d128_accum_2cta_stail.BAR_LAYOUT_RING``
+    = the 35 rows above RE-BASED onto CFG_RING.BARS 231424 (+1024 per row: ring stage 1 took the 1 KiB the scaffold sat on) + the two rows below,
+    37 names / 44 slots, END 232016; LOCAL rows: each CTA arms / waits its OWN copy, no "(-)" copy, no pair interaction; AUDIT of the committed
+    body owed; NOT built under 16w_fa4 (declines by name)):
+    name[st]         kind              init L / F     SUM(issuing lanes) == init        waiter (own copy)                  start  fires
+    stats_full[2] NEW TMA_LOAD / LOCAL  1 / 1 /stage   loader warp 13 `bars.stats_full[s].arrive(n_bytes=CFG.STATS_TX, pred=own_pred)`, own_pred =
+                     (kind "tma", the                 elect_sync() ONCE per item (1 per warp = 1 per CTA; NEVER is_leader: a plain bulk copy lands on
+                     sched_full kind)                 the ISSUING CTA) = 1 == ONE_LANE; tx = ONE `bulk_copy` of the (head, q tile) record = 1024 ==
+                                                      STATS_TX (2 x 128 fp32: the LSE row, the delta row; a FULL record every tile incl. the ragged
+                                                      tail: the pad rows are real 0.0 words of the padded region, no OOB clip, no partial arm)
+                                                      waiter: the 8 softmax warps, `_wait` (plain: no tcgen05 fence, no proxy fence -- the copy's
+                                                      complete_tx + the acquire wait publish the async-proxy write to every lane) AFTER
+                                                      `_arrive_leader(bars.s_read)` and BEFORE `_p_values`; stats_state st(0), +1 per tile
+                                                                                                                                st(0)  x N
+        site (loader, iteration t): after Q1(t)'s tma_load_tile and BEFORE `_wait(bars.do1_empty)`: `_wait(stats_empty[s])` -> arm -> `bulk_copy(
+        stage s, stats2 record (head, rowoff[b] / N + t), STATS_TX, bars.stats_full[s].smem_ptr)` (internal elect; `cp.async.bulk.shared::cluster
+        .global.mbarrier::complete_tx::bytes`, no cta_group modifier, no multicast); `stats_ld = advance(stats_ld, CFG_RING.STATS_STAGES)`
+    stats_empty[2] NEW THREAD / LOCAL   256 / 256 /st  the 8 softmax warps bare `bars.stats_empty[s].arrive()` right after `words = _ds_values(..)`
+                                                      (the tile's LAST stats read: the delta LDS) and before the STORE wait = 8 x 32 = 256 ==
+                                                      SOFTMAX_LANES (the arrive's release orders the lane's LDS; the loader's acquire wait + program
+                                                      order gate the next copy into the stage: no proxy fence)
+                                                      waiter: the loader, `_wait(bars.stats_empty[s], stats_ld.phase)` before the arm; stats_ld
+                                                      st(1) PRE-ARMED (P5 b: wait k <-> release k - 2 = the stage's previous tenant; the kernel's
+                                                      first two waits pass on the pre-arm; NO bootstrap arrive)                   st(1)  x N
+        P2: ONE `stats_state` (softmax) / ONE `stats_ld` (loader) per CTA indexes BOTH the barrier and the SMEM stage base, declared BEFORE the
+        persistent loop and CARRIED across items: tile lo of an item takes stage K % 2 for K = this CTA's running tile count (both states advanced
+        exactly once per tile, never on a zero-trip item, NEVER reset at the item top -- a reset at an odd K puts the copy and the wait on different
+        stages = the P2 hang).  P14 flips per item (both CTAs, pair-uniform lo / hi): stats_full N / N, stats_empty N / N; zero-trip 0 / 0 (no site
+        outside the two tile loops); n_q == 1: 1 / 1; kernel-wide W copies == W waits, the last two releases unwaited (LOCAL THREAD: harmless).
+        P14-B back-edges: stats_full[s]'s next completion needs the loader past the softmax's release of the stage, which follows the softmax's own
+        wait; stats_empty[s]'s next release needs the softmax past the next copy, which needs the loader past the release -- the closed pair, no lap.
+        P15 / P6: no cross-CTA arrive on either row, every issued copy consumed in-loop before the final CTA sync -> no drain anywhere.
+        Named barrier CFG.SOFTMAX_BARRIER (id 1, 256): RETIRED under tma_ring (its only two sites were `_stats`' fences); id 2 XCHG unchanged.
+        STAMPS: +2 words `wait:softmax:stats_full`, `wait:loader:stats_empty` appended after every ldg word (indices 82 / 83); the record =
+        (TMEM_HANDLE - BAR_LAYOUT_RING_END) / 4 = 88 words (84 used), DBG_CLK_RING; the ldg record stays 96 words at 230960.
     DIAGNOSTIC PROBES vs this table: `exchange_off` moves NO row -- the epilogue's `ds_recv_full.arrive(n_bytes=..)` keeps its one elected
     lane and arms CFG.DIAG_EXCHANGE_OFF_TX = 0 bytes, so each phase completes AT ITS OWN ARM (1 == 1, nothing in flight: no tx-pending
     over-arrival window exists), the XCHG ship is not issued, and the three dS gates (xchg_state), the follower relay, the XCHG STS / proxy
@@ -177,8 +219,8 @@ only (NOTE [2CTA schedules], the pipelined MMA loop, the deferred dS commit, ``Q
     other row unchanged (dvk_empty / k2_empty still after the final drain = round 2's).  PTX census: arrive sites 41 / wait sites 69 under
     fp32_reduce (40 / 68 under the default); reduce-adds 4 -> 12, bf16 tile stores 4 -> 0; the default rendering has no instruction on the row.
     Lane ledger: every row above written as SUM == init on BOTH CTAs the barrier audit, PASS 0); unresolved: none.  Non-mbarrier
-    sites: named barrier 0 (3 x barrier_cta_sync: init, TMEM-base publish, final), CFG.SOFTMAX_BARRIER (256 lanes, 2 per _stats),
-    CFG.XCHG_BARRIER (128 lanes, 1 per tile, P11 KEEP: the ship's operand is all four warps' XCHG stores).
+    sites: named barrier 0 (3 x barrier_cta_sync: init, TMEM-base publish, final), CFG.SOFTMAX_BARRIER (256 lanes, 2 per _stats; ldg only --
+    0 sites under stats_form tma_ring), CFG.XCHG_BARRIER (128 lanes, 1 per tile, P11 KEEP: the ship's operand is all four warps' XCHG stores).
     the alternate role shape (``warp_roles = "16w_fa4"``; the barrier audit;
     ``config_sm100_d128_accum_2cta_stail.BAR_LAYOUT_XFA4`` = 32 names / 37 slots / END 230912, re-packed; its rows = the 34 above MINUS:
       ds_tmem[1]   DEL  (THREAD 256: producer and consumer both vanish -- the softmax writes sDS from registers, nobody reads dS^T out of TMEM)
@@ -305,7 +347,8 @@ only (NOTE [2CTA schedules], the pipelined MMA loop, the deferred dS commit, ``Q
       readout / pre-armed]; s_read(lo); NO dQ; dV(lo); S^T(lo+1) with q1_full only; dK(lo).
 
 6. INIT + PHASE DISCIPLINE + EXIT DRAINS  (P4 / P5 / P6 / P14 / P15; code: the kernel entry + the helpers above the role bodies)
-    init: warp 0, `if elect_sync():` every stage of every Bars field (ONE lane, both gates) -> fence_mbarrier_init -> barrier_cta_sync
+    init: warp 0, `if elect_sync():` every stage of every Bars field (ONE lane, both gates; under stats_form tma_ring the bundle is BarsRing =
+          the 35 fields + stats_full[2] / stats_empty[2], the same loop: +4 mbarrier.init) -> fence_mbarrier_init -> barrier_cta_sync
           -> cga_arrive / cga_wait (before ANY cross-CTA arrive) -> MMA warp: tmem_alloc(TMEM_COLS, cta_group::2) on BOTH CTAs
           -> barrier_cta_sync (publishes the TMEM base) -> role dispatch.  NO bootstrap arrive anywhere (D3: the store warp's dq_empty
           bootstrap of the first body left with the staging alias); every MMA-fed or pair-fed consumer starts pre-armed where the table says
@@ -317,7 +360,9 @@ only (NOTE [2CTA schedules], the pipelined MMA loop, the deferred dS commit, ``Q
           commit is issued before it leaves its loop and depends on nothing of the softmax: the drain cannot hang; a CTA with no live item passes on
           the pre-arm).  Everything else of this section (seams, zero-trip, drains) holds unchanged; the ds_own / XCHG seams now end at the
           SOFTMAX's dS STS, which waits dq_war_done(t-1) directly (the WAR) and dp_done(t) (dvk_empty's dK-staging seam).
-    phase trackers: section 5's PER-ROLE PHASE TABLE (never bit math -- P2 / P14).
+    phase trackers: section 5's PER-ROLE PHASE TABLE (never bit math -- P2 / P14); stats_form tma_ring adds softmax `stats_state` st(0) and
+      loader `stats_ld` st(1), +1 per tile each, CFG_RING.STATS_STAGES = 2 stages, carried across items (section 5's ring rows); nothing on a
+      zero-trip item; no drain.
     zero-trip item (lo >= hi, PAIR-UNIFORM from _item_bounds; a padded CTA inside a live pair runs every tile with P = 0): MMA(L) one
       empty dq_done commit (live pipe, multicast); both epilogues wait it (dq_state +1); the store warps run the native zero stores,
       arrive dvk_empty (-> L) + k2_empty; the loaders wait k2_empty + arrive dv_full; softmax / MMA(F) only credit the scheduler.
@@ -371,7 +416,12 @@ only (NOTE [2CTA schedules], the pipelined MMA loop, the deferred dS commit, ``Q
     (its diagonal): ~2 of 64.5 tiles per item at 16K; every other tile of a full-length sequence is interior.
 
 8. SMEM TABLE  (REQUIRED; per CTA, DECLARATION order; the SMEM audit PASS: total 231424 B of the part's 232448-B opt-in cap, slack 1024 B
-   (scaffold); bank check PASS 0 / 7; DESC_VERSION implied 0, the baseline's 1 inherited)
+   (scaffold); bank check PASS 0 / 7; DESC_VERSION implied 0, the baseline's 1 inherited.  stats_form tma_ring = the CFG_RING geometry (the
+   resource plan resources/s1-stats-ring.md section 1, `vs-smem predict` PASS: total 232448 == the cap, slack 0): the sSTATS + sDELTA bytes become
+   ring stage 0, stage 1 takes the 1 KiB of cap slack at 230400, and the scaffold follows by derivation (+1024: BARS = SLABS_END 231424, the bar
+   block [231424, 232016) 592 B + the 352-B STAMPS record [232016, 232368) + TMEM handle 16 @ 232368 + CLC payload 64 @ 232384); no other slab,
+   alias, root or descriptor moves -- the ldg table below is unchanged.  RESOURCE-NOTE: pipe/tile: async +8 (stats TMA), LSU -8 (STS.32 gone),
+   LDS.128 512 unchanged: ~3620)
     name[stages]   | bytes  | 1024-al | desc | swizzle + WHY                                  | lifetime / alias   | offset
     sQ1[1]         | 16384  | 16384   | yes  | SW128 K-major: MATCH the S^T B descriptor       | tile; q1 ring (ONE stage, FAv4 Q_stage 1) | 0
     sQ2[1]         | 16384  | 16384   | yes  | SW128 MN-major (64-d rows = one atom): MATCH dK B | tile; freed by dK | 16384
@@ -390,8 +440,14 @@ only (NOTE [2CTA schedules], the pipelined MMA loop, the deferred dS commit, ``Q
                    |        |         |      | half s's warp pair                               | reduce-add -> dq_empty   |
     sSTATS (LSE)   | 512    | 512     | no   | none: 4-B lane stride                            | tile               | 229376
     sDELTA         | 512    | 512     | no   | none                                             | tile               | 229888
+    sSTATS_RING[2] | 1024   | 1024    | no   | none: stage s = STATS_RING + s * 1024, the LSE row | tma_ring ONLY: stage s live from the loader's
+      (tma_ring)   | x 2    |         |      | at +0, the delta row at +512 (= today's slab    | bulk copy for tile t (~slot 5 of t-2) to the
+                   |        |         |      | image: the LDS.128 immediates unchanged); the    | softmax's last delta LDS of t (stats_empty);
+                   |        |         |      | warp-uniform reads are broadcasts (no bank job) | next tenant t+2; aliases NOTHING | 229376 (st 0 = sSTATS+sDELTA), 230400 (st 1 = the former cap slack)
     scaffold       | 1024   |         |      | bars [230400, 230960) 560 B + 384 spare [230960, 231344) = the STAMPS record (config DBG_CLK: 96 x Int32,
                    |        |         |      | written only under `debug_clk`) + TMEM handle 16 @ 231344 + CLC payload 64 @ 231360 | 230400
+                   |        |         |      | (tma_ring: bars [231424, 232016) 592 B + 352 spare = the record DBG_CLK_RING 88 x Int32 + TMEM handle @ 232368
+                   |        |         |      | + CLC payload @ 232384 -> SMEM_BYTES 232448 == the cap) | 231424 (tma_ring)
     aliases (3; config ALIASES): dK native store (2 x 16 KiB) over ds_own(rank) + XCHG at the item end (seam: dq_done(t_last) + dvk_empty);
     dV native store (2 x 16 KiB) over sK2 (seam: dq_done(t_last) + k2_empty); ds_recv(rank) = the peer's half (the peer's timeline).
     dkv_accum fp32_reduce: round 1 = dV's four fp32 [128 kv x 32 d] slices + dK's slice 0 over
@@ -430,9 +486,44 @@ only (NOTE [2CTA schedules], the pipelined MMA loop, the deferred dS commit, ``Q
     for both CTAs' halves (2 x); TMA OOB zero-fills padded rows; sequence-local maps clip the tails.  ONE tensor-map acquire per
     consuming warp per work item (`acquire=False` on every per-tile load / reduce).  LOAD FORM: every cga2 load carries the one-CTA
     multicast mask (`.multicast::cluster.cta_group::2`), the validated form; the bytes complete on the pair LEADER's mbarrier.
+    stats_form tma_ring: NO tensor map for the stats (a per-head row of a token-major [T, H] Stats port is not TMA-able: 4-B inner box; the padded
+    per-sequence row base is not 16-B aligned for `emit_seq_descs`) -- the chain's delta launch (``delta_zero_stats_thd_d128_2cta_kernel``) writes
+    the pre-scaled stat rows into the q-tile-PADDED fp32 region ``stats2`` [heads][PAD_TOTAL / N][2 kinds][N] (kind 0 = -log2(e) * LSE with the
+    -inf -> 0 guard, kind 1 = -scale * delta; pad rows [S_b, ceil(S_b / N) * N) = 0.0; PAD_TOTAL = rounded_q + N * B; the contract
+    d128_grouped_2cta_contract, ABI 2) and the setup kernel writes the padded row offsets ``rowoff[b] = sum_{i<b} ceil(S_i / N) * N`` into an Int32
+    [B + 1] region (``tile_dsl.thd.write_thd_row_offsets`` with ``dst``: the 4B+4 metadata tensor keeps its shape); the loader's ONE plain 1 KiB
+    `cp.async.bulk` per q tile reads record `stats2 + ((head * PAD_TOTAL + rowoff[b]) / N + t) * 1024` (1024-B aligned; 16 B needed): a tile never
+    crosses its sequence's padded block, so there is no extent guard to rely on -- RESOURCE-NOTE: src = stats2 + ((head*PAD_TOTAL + rowoff[b])/128
+    + t)*1024: 1024-B aligned (16 needed).  The nine maps and their acquires are unchanged under both forms.
 
 11. OPTIONAL ARMS (const_expr; each states what the default rendering does)
     THD (the unit is 256 kv rows per pair) | GQA grouped loaders (head // ratio) | causal |
+    stats_form (``stats_form_code`` Constexpr[int] from config_sm100_d128_accum_2cta_stail.STATS_FORM_CODES; lever S1 = the user's "LSE
+    optimization", day 4): "ldg" = the previous default, selectable (the form "16w_fa4" resolves to when the field is unset; main-kernel md5
+    7de23bd7 @ 4/32/4, ca665f06 @ 2/8/2 = the merged rendering's main body, byte-identical; per-kernel records): the softmax's
+    per-tile `_stats` -- one LDG per lane (group 0 the LSE through the Stats port's token origin, group 1 the delta), the FMUL scale with the -inf
+    -> 0 guard and the `row < seq_q -> 0` zero, one STS into sSTATS / sDELTA, inside a `bar.sync SOFTMAX_BARRIER, 256` pair (the item prologue for
+    tile lo, the per-tile lookahead for t+1: 1257 clk per tile = 34 % of the pacing role at 16K, profiler-ncu 13:32) | "tma_ring" (FAv4's form:
+    the LSElog2 preprocess + one bulk copy per tile; THE default since the day-4 measurement: +1.8 / +1.9 % at the step at 16K / 32K, +1.4..+1.9 %
+    at every served cell, +3.3 % on the graph replay against ldg, bitwise; main-kernel md5 306ad223 @ 4/32/4, d9b419aa @ 2/8/2): the chain's delta launch
+    (``delta_zero_stats_thd_d128_2cta_kernel``, grid x = ceil(max_sq / N) * N / ROWS_PER_CTA so every pad row is written) performs the SAME two fp32
+    multiplies once per q row (-log2(e) * LSE with the -inf -> 0 guard, -scale * delta; `-x * y` lowers to the same negate + mul.rn.f32, the rowsum
+    operand is the one the ldg form stores raw and reads back) into the padded region ``stats2`` (section 10; pad rows 0.0 = the ldg form's `stat =
+    0`), the LOADER bulk-copies the (head, q tile) record one tile ahead into stage s of the two-stage SMEM ring behind stats_full[s] /
+    stats_empty[s] (section 5), the softmax waits the stage after its s_read arrive and reads the SAME LDS.128 words (`_p_values` / `_ds_values`
+    with the stage base), releases the stage right after its last delta read; the `_stats` chain, its two STS and both `bar.sync 1,256` are not
+    traced -- RESOURCE-NOTE: named barrier 1 retired under tma_ring (its only sites were _stats'); id 2 unchanged.  BITWISE vs ldg on P / dS
+    and therefore dQ (per reduce-add order) / dK / dV (the test module's twins over both Stats layouts, S % 128 != 0, len % 128 == 1, empty and
+    zero-trip cells).  Geometry CFG_RING (SMEM_BYTES 232448 == the cap; the first tma_ring smoke IS the launch proof at the cap; a launch failure
+    = the resource plan's fallback sDQ 2 -> 1 slot).  Census vs ldg @ 4/32/4 (host render): `bar.sync 1,256` 4 -> 0, `st.shared.b32` 4 -> 0, the
+    plain `cp.async.bulk` global -> shared 0 -> 1, `mbarrier.init` 39 -> 43, arrive 40 -> 42, try_wait 68 -> 70, expect_tx 11 -> 12, `bar.warp.sync`
+    67 -> 69, `ld.global` 24 -> 19 in the MAIN kernel (-6 softmax, +1 loader), `mul.f32` 37 -> 33 / `neg.f32` 1 -> 0 / `setp.eq.f32` 2 -> 0 (the
+    deleted `_stats` arithmetic, present once in the delta launch), `fence.proxy.async` 15 / `tcgen05.fence::after_thread_sync` 32 / LDS.128 38 /
+    mapa 17 unchanged; SASS (host estimate, ptxas 13.3): STL / LDL 0, REG 128 entry, the 144 / 144 / 80 split, `BAR.SYNC` 9 -> 5, `UBLKCP` 1 -> 2,
+    LDG 24 -> 19, the softmax segment 598 -> 509 instructions, the loader segment 319 -> 359.  Declines BY NAME under warp_roles "16w_fa4" (the
+    first build sites the ring in the 16w bundle: BAR_LAYOUT_RING); SERVED with debug_clk (DBG_CLK_RING: 88 words, the two ring wait words), with
+    every diag_2cta probe (`stats_one_chunk` reads one chunk of the stage) and every mask_form / dkv_accum value.  Measured: pending (the
+    optimizer's pre-registered estimate +1.9 / +1.6 % step at 16K / 32K; the stop rule is the day-4 brief's) |
     warp_roles (``warp_roles_code`` Constexpr[int] from config_sm100_d128_accum_2cta_stail.WARP_ROLES_CODES: "16w" = THE default = the
     shipped rendering, byte-identical (md5 4b3d0bbb @ 4/32/4, 645f8a24 @ 2/8/2) | "16w_fa4" = an alternate role shape kept for follow-up
     work: the softmax writes sDS own + XCHG from its dS^T registers and ships, warps 8-11 = the REDUCE group (`_reduce_loop`), ds_tmem +
@@ -515,7 +606,14 @@ only (NOTE [2CTA schedules], the pipelined MMA loop, the deferred dS commit, ``Q
     zero-trip owner (CLC envelope) on BOTH CTAs (the zero-trip protocol of section 6: no dq_empty traffic at all) |
     a zero-trip item between two live items (the pending s_tail_empty / dp_empty completions of the previous live item's tail stay for
     the next live item's prologue: the states are never re-armed per item) | the kernel's first item (s_tail_empty / dp_empty / dvk_empty
-    pre-armed st(1); dq_empty pre-armed on the epilogue side).
+    pre-armed st(1); dq_empty pre-armed on the epilogue side) |
+    stats_form tma_ring: a partial last q tile (S % 128 != 0: the record's pad rows [S_b, ceil(S_b / 128) * 128) hold 0.0 written by the delta
+    launch = the ldg form's `stat = 0`; `delta_zero_stats` grid covers ceil(max_sq / 128) * 128 rows so the longest sequence's pads are written) |
+    len % 128 == 1 (one live row + 127 pad rows in the record) | an empty sequence (no record read: the item is dead; PAD_TOTAL = rounded_q + 128 B
+    bounds every sequence's padded block, asserted in validate_config) | tile lo of the kernel's second item (stage K % 2 for the carried K, never
+    stage 0) | n_q == 1 items between zero-trips (one copy / one release each; the release consumed two live tiles later, whichever item) |
+    both Stats layouts (token-major [T, H] and head-major [1, H, pitch]: the delta launch reads either through the Stats port's token origin) |
+    the kernel's first two tiles (the loader's stats_empty waits pass on the pre-arm; the softmax's first stats_full wait blocks until the copy lands).
 
 13. MEASURED LEVERS  (A/B/A x 3 x 100 in one process, control twin, band max(1 %, |pair|); one GB200-class node, clock locked, the sampled
     busy clock recorded per process; in-process ratios are the figures, absolutes are clock-capped lower bounds; the record
@@ -538,15 +636,20 @@ only (NOTE [2CTA schedules], the pipelined MMA loop, the deferred dS commit, ``Q
     fields of this body.
 
 14. LAUNCH ABI
-    positional args (maps, lse, delta, meta, origins, n_batch, nheads, max_skv, stats_origin, scale, causal, dtype, ratio, diag_2cta_code,
-    warp_roles_code, mask_form_code, dkv_fp32, debug_clk, dbg_clk [Optional: the Int32 STAMPS dump of config dbg_clk_records(n_batch, nheads,
-    max_skv) x DBG_CLK.WORDS words, None = dropped unless debug_clk], stream) + cluster (CFG.CGA_M, CFG.CGA_N, 1); grid x = ceil(max_skv /
-    CFG.THD_UNIT_ROWS) * CFG.CGA_M, the declared envelope; the prepared host's RUNTIME signature is the grouped THD chain's (every typed field
-    is a Constexpr keyed by NAME in the compile cache).
+    positional args (maps, stats_tokens, stats_rows, meta, origins, n_batch, nheads, max_skv, stats_origin, scale, causal, dtype, ratio,
+    diag_2cta_code, warp_roles_code, mask_form_code, stats_form_code, dkv_fp32, debug_clk, dbg_clk [Optional: the Int32 STAMPS dump of config
+    dbg_clk_records(n_batch, nheads, max_skv) x DBG_CLK(_RING).WORDS words, None = dropped unless debug_clk], stream) + cluster (CFG.CGA_M,
+    CFG.CGA_N, 1); grid x = ceil(max_skv / CFG.THD_UNIT_ROWS) * CFG.CGA_M, the declared envelope; the prepared host's RUNTIME signature is the
+    grouped THD chain's (every typed field is a Constexpr keyed by NAME in the compile cache).  The two STATS SLOTS carry the stats form's operands
+    -- ldg: the user's LSE tensor ([T, H] or [1, H, pitch]) and the chain's compact delta [1, H, rounded]; tma_ring: the padded row offsets
+    ``rowoff`` [B + 1] Int32 and the padded pre-scaled stats region ``stats2`` [H][PAD_TOTAL / N][2][N] fp32 -- two plain `cute.Tensor` slots
+    under both forms, because an `Optional` annotation or an added operand changes the ldg rendering's mangled entry name (its md5 pin) even
+    when the value is None.  Workspace (d128_grouped_2cta_contract, ABI 2): under tma_ring the compact delta region is REPLACED by `stats2` +
+    `rowoff` (every later offset follows); the ldg layout is the shipped one; the STAMPS region (debug_clk) follows the form's record size.
 
 PDL SITES: none in the accum family today (CLC-scheduled persistent envelope); unchanged.
 
-Sources: config_sm100_d128_accum_2cta_stail.py (the pasted barrier tables); the one-CTA grouped THD body bprop_d128_accum_grouped_f16.py
+Sources: config_sm100_d128_accum_2cta_stail.py (the pasted barrier tables; BAR_LAYOUT_RING derived); the one-CTA grouped THD body bprop_d128_accum_grouped_f16.py
 (the chain's other launches); FAv4 flash_bwd_sm100.py NOTE [2CTA schedules] + the pipelined MMA loop (read as the structural cross-check only:
 S(t+1) first, dQ before dV, Q_stage 1, sdQaccum not aliased, the deferred dS commit = our dS gates + s_read, pipeline_dQ empty before S(t+1) =
 our s_tail_empty; nothing copied).
@@ -568,6 +671,7 @@ from cudnn.frost.tile_dsl.pointwise import ffma2, fmul2, fp32_to_fp16, opaque_i3
 from cudnn.frost.tile_dsl.scheduler import Sched, read_clc_payload, read_tile_id_arrive_on_leader, scheduler_warp_loop
 from cudnn.frost.tile_dsl.thd import TENSOR_MAP_QWORDS, thd_port_origin
 from cudnn.frost.tile_dsl.tma import (
+    bulk_copy,
     cp_async_bulk_shared_cluster_shared_cta,
     tma_load_subtiles,
     tma_load_tile,
@@ -583,14 +687,19 @@ from ...config_sm100_d128_accum_2cta import diag_2cta_code
 from ...config_sm100_d128_accum_2cta_stail import (
     ALIASES,
     BAR_LAYOUT,
+    BAR_LAYOUT_RING,
     ADDED_BARRIERS_XFA4,
     BAR_LAYOUT_XFA4,
     CFG,
+    CFG_RING,
     DBG_CLK,
+    DBG_CLK_RING,
     DELETED_BARRIERS_XFA4,
+    STATS_RING_ROWS,
     UNSERVED_BARRIERS_XFA4,
     bar_layout_for_roles,
     mask_form_code,
+    stats_form_code,
     warp_roles_code,
 )
 
@@ -598,6 +707,16 @@ LOG2E = 1.4426950408889634
 # The 2-CTA per-sequence tensor-map set (header section 10); box rows per slot = CFG.MAP_BOX_ROWS, in this order (== the first body's).
 MAP_Q1, MAP_K, MAP_V, MAP_DO1, MAP_DQ, MAP_DK, MAP_DV, MAP_Q2, MAP_DO2 = range(CFG.MAPS_PER_SEQUENCE)
 MAP_COUNT = CFG.MAPS_PER_SEQUENCE
+# STATS FORM (header section 11): the typed adapter field ``stats_form`` reaches the kernel as the ``stats_form_code`` Constexpr[int]
+# (config_sm100_d128_accum_2cta_stail.STATS_FORM_CODES).  STATS_FORM_LDG = the default (the softmax's per-tile `_stats` LDG fetch under the
+# SOFTMAX_BARRIER pair, today's rendering); STATS_FORM_TMA_RING = the loader-fed two-stage SMEM stats ring (stats_full / stats_empty, the
+# CFG_RING geometry: SMEM_BYTES == the cap, the scaffold re-based +1024) fed by ONE 1 KiB bulk copy per q tile from the chain's padded
+# pre-scaled stats region (the delta launch writes it; no tensor map).
+STATS_FORM_LDG = stats_form_code("ldg")
+STATS_FORM_TMA_RING = stats_form_code("tma_ring")
+assert (STATS_FORM_LDG, STATS_FORM_TMA_RING) == (0, 1)
+STATS_RECORD_ELEMS = CFG.STATS_RECORD_BYTES // CFG.BPE_ACC  # 256 fp32: one (head, q tile) record of the padded region = one ring stage [LSE 128 | delta 128]
+assert CFG.STATS_RECORD_BYTES == CFG.STATS_STAGE_BYTES == CFG.STATS_TX == 1024 and CFG_RING.STATS_STAGES == 2 and CFG.STATS_PAD_GRAN == CFG.N
 
 # Role warp ids (CFG.SOFTMAX_WARPS softmax, CFG.EPILOGUE_WARPS epilogue, then the four service warps).
 SOFTMAX_WARP_END = CFG.SOFTMAX_WARPS
@@ -727,6 +846,13 @@ DVK_STAGE_EMPTY_ROW = Bars._fields.index("dvk_stage_empty")  # fp32_reduce: the 
 # The 16w_fa4 bundle: the audit's 32 rows + dq_war_done (BAR_LAYOUT_XFA4) in order; the two deleted names have no field, no init, no arrive, no
 # wait, no state; the fp32_reduce row dvk_stage_empty is UNSERVED there (fp32_reduce declines by name under 16w_fa4) and has no field either.
 BarsXFA4 = NamedTuple("BarsXFA4", [(row[0], MBarrier) for row in BAR_LAYOUT_XFA4])
+# The 16w x tma_ring bundle (header sections 5 / 11; the S1 skeleton): the 35 ldg rows re-based onto CFG_RING.BARS + stats_full[2] (TMA_LOAD /
+# LOCAL, ONE_LANE: the loader's one expect_tx arm + ONE bulk copy per tile) + stats_empty[2] (THREAD / LOCAL, SOFTMAX_LANES: the 8 softmax warps bare
+# after _ds_values); the row guard index of dvk_stage_empty is the same (the ring rows are appended after it).  The table's STATUS text stays in
+# the config (the body carries no unused alias of it: the PR's hygiene rule).
+BarsRing = NamedTuple("BarsRing", [(row[0], MBarrier) for row in BAR_LAYOUT_RING])
+assert tuple(BarsRing._fields) == tuple(Bars._fields) + tuple(row[0] for row in STATS_RING_ROWS) == tuple(Bars._fields) + ("stats_full", "stats_empty")
+assert BarsRing._fields.index("dvk_stage_empty") == DVK_STAGE_EMPTY_ROW
 assert (
     tuple(BarsXFA4._fields)
     == tuple(row[0] for row in BAR_LAYOUT_XFA4)
@@ -759,10 +885,11 @@ def _view(slab, offset, dtype, count, alignment=16):
     return cutlass.Array(ptr.ir_value(), shape=count, dtype=dtype, alignment=alignment)
 
 
-def _bars(slab, fa4_roles: bool = False):
+def _bars(slab, fa4_roles: bool = False, tma_ring: bool = False):
     """The inspector's table as typed barriers: one MBarrier per row of the role shape's layout (``BAR_LAYOUT`` -> :class:`Bars` under ``16w``;
-    ``BAR_LAYOUT_XFA4`` -> :data:`BarsXFA4` under ``16w_fa4``), producer and scope from the row's kind."""
-    bundle = BarsXFA4 if fa4_roles else Bars
+    ``BAR_LAYOUT_XFA4`` -> :data:`BarsXFA4` under ``16w_fa4``; ``BAR_LAYOUT_RING`` -> :data:`BarsRing` under ``16w x tma_ring``: the rows
+    re-based onto CFG_RING.BARS + the stats ring's two rows), producer and scope from the row's kind."""
+    bundle = BarsRing if tma_ring else (BarsXFA4 if fa4_roles else Bars)
     return bundle(
         *(
             MBarrier(
@@ -773,7 +900,7 @@ def _bars(slab, fa4_roles: bool = False):
                 scope=_KINDS[kind][1],
                 try_wait=True,
             )
-            for _, off, slots, count, kind, _scope in bar_layout_for_roles("16w_fa4" if fa4_roles else "16w")
+            for _, off, slots, count, kind, _scope in bar_layout_for_roles("16w_fa4" if fa4_roles else "16w", "tma_ring" if tma_ring else "ldg")
         )
     )
 
@@ -918,19 +1045,21 @@ def _clk_recv(
 
 
 @cute.jit
-def _clk_init(words):
-    """STAMPS, warp 0's elected lane inside the P4 init block (published by the CTA sync that follows): zero the record, stamp the body
-    start (clock lo32, %globaltimer lo32; the dump closes both spans -> clk / ns = the SM clock the body actually ran at)."""
-    for w in cutlass.range_constexpr(DBG_CLK.WORDS):
+def _clk_init(words, n_words: cutlass.Constexpr[int]):
+    """STAMPS, warp 0's elected lane inside the P4 init block (published by the CTA sync that follows): zero the record (``n_words`` = the
+    geometry's record size: DBG_CLK.WORDS under ldg, DBG_CLK_RING.WORDS under tma_ring), stamp the body start (clock lo32, %globaltimer lo32;
+    the dump closes both spans -> clk / ns = the SM clock the body actually ran at)."""
+    for w in cutlass.range_constexpr(n_words):
         words.subview(w).store(cutlass.Int32(0))
     words.subview(_W["body_clk"]).store(cutlass.Int32(cute.arch.clock64()))
     words.subview(_W["body_ns"]).store(cutlass.Int32(cute.arch.globaltimer()))
 
 
 @cute.jit
-def _clk_dump(words, dbg_clk, rank):
+def _clk_dump(words, dbg_clk, rank, n_words: cutlass.Constexpr[int]):
     """STAMPS, warp 0's elected lane after the final CTA sync (every role returned, every record word written): close the body clock and
-    its %globaltimer span, write the magic and the rank, copy the record to dbg_clk[(linear CTA) x DBG_CLK.WORDS ..] (plain stores)."""
+    its %globaltimer span, write the magic and the rank, copy the record to dbg_clk[(linear CTA) x n_words ..] (plain stores; ``n_words`` =
+    the geometry's record size)."""
     c = words.subview(_W["body_clk"])
     c.store(cutlass.Int32(cute.arch.clock64()) - c.load())
     n = words.subview(_W["body_ns"])
@@ -939,9 +1068,9 @@ def _clk_dump(words, dbg_clk, rank):
     words.subview(_W["rank"]).store(rank)
     x, y, z = cute.arch.block_idx()
     nx, ny, nz = cute.arch.grid_dim()
-    base = (x + nx * (y + ny * z)) * cutlass.Int32(DBG_CLK.WORDS)
+    base = (x + nx * (y + ny * z)) * cutlass.Int32(n_words)
     out = cutlass.make_array_view(dbg_clk)
-    for w in cutlass.range_constexpr(DBG_CLK.WORDS):
+    for w in cutlass.range_constexpr(n_words):
         out[base + cutlass.Int32(w)] = words.subview(w).load()
 
 
@@ -1306,6 +1435,7 @@ def _s_values(tmem_base, group):
 @cute.jit
 def _p_values(
     slab,
+    stats_base,
     tmem_base,
     group,
     key,
@@ -1328,7 +1458,10 @@ def _p_values(
     ``mask_form_code`` (header section 11): MASK_FORM_FSEL = the keep-word band mask selected on EVERY tile (today's rendering);
     MASK_FORM_PREDICATED = the SAME mask body under the CTA-uniform runtime branch ``if mask_tile:`` (``mask_tile`` = tile_may_mask of section 7,
     read under this form only: FALSE on an interior tile = no cell of this CTA's tile can be masked, so the exp2 values are packed straight);
-    MASK_FORM_DIAG_OFF = no mask on any tile (the DIAGNOSTIC ceiling: OUTPUT WRONG BY DESIGN)."""
+    MASK_FORM_DIAG_OFF = no mask on any tile (the DIAGNOSTIC ceiling: OUTPUT WRONG BY DESIGN).
+    ``stats_base`` = the SMEM byte base of the tile's 128 LSE stat words (-log2(e) * LSE; 0 for a padded / masked row): ``CFG.STATS`` under
+    stats_form ldg (the single slab `_stats` fills), the ring stage's LSE row under tma_ring (header section 8); read by the same 16-B
+    broadcast LDS form either way."""
     q_lo = group * CFG.GROUP_QUARTER
     scaled = scale * cutlass.Float32(LOG2E)
     # KV-major transpose of the shared mask band: Q columns >= key for causal, below the actual Q length, and entirely
@@ -1343,12 +1476,12 @@ def _p_values(
         col0 = q_lo + half * (CFG.N // 2)
         values = []
         if cutlass.const_expr(one_chunk):  # DIAGNOSTIC stats_one_chunk: the one chunk every column of the quarter reuses
-            stat_one = _view(slab, CFG.STATS, cutlass.Float32, CFG.N).subview(col0 + CFG.DIAG_STATS_CHUNK * 4).load(vector_size=4, alignment=16)
+            stat_one = _view(slab, stats_base, cutlass.Float32, CFG.N).subview(col0 + CFG.DIAG_STATS_CHUNK * 4).load(vector_size=4, alignment=16)
         for chunk in cutlass.range_constexpr(CFG.DIAG_STATS_CHUNKS_PER_QUARTER):
             if cutlass.const_expr(one_chunk):
                 stat = stat_one
             else:
-                stat = _view(slab, CFG.STATS, cutlass.Float32, CFG.N).subview(col0 + chunk * 4).load(vector_size=4, alignment=16)
+                stat = _view(slab, stats_base, cutlass.Float32, CFG.N).subview(col0 + chunk * 4).load(vector_size=4, alignment=16)
             for pair in cutlass.range_constexpr(2):
                 i = chunk * 4 + pair * 2
                 e0, e1 = ffma2(scaled, scaled, scores[i], scores[i + 1], stat[pair * 2], stat[pair * 2 + 1])
@@ -1370,11 +1503,13 @@ def _p_values(
 
 
 @cute.jit
-def _ds_values(slab, tmem_base, group, p, scale, dtype: cutlass.Constexpr, one_chunk: cutlass.Constexpr[bool]):
+def _ds_values(slab, delta_base, tmem_base, group, p, scale, dtype: cutlass.Constexpr, one_chunk: cutlass.Constexpr[bool]):
     """dP^T -> dS^T = P^T * (dP^T - delta) * scale for the group's two quarters; packed bf16 in place into the group's columns.  Returns the 32
     packed Int32 words (quarter g = words [0, 16), quarter g + 2 = words [16, 32), q ascending inside each): under 16w_fa4 the softmax stores
     them to sDS own + XCHG itself (:func:`_store_words_quarter`); under 16w the value is unused (the epilogue reads the same words back by LDTM).
-    ``one_chunk`` (DIAGNOSTIC stats_one_chunk): ONE delta chunk per quarter reused for all eight, as in :func:`_p_values`."""
+    ``one_chunk`` (DIAGNOSTIC stats_one_chunk): ONE delta chunk per quarter reused for all eight, as in :func:`_p_values`.
+    ``delta_base`` = the SMEM byte base of the tile's 128 delta stat words (-scale * delta; 0 for a padded row): ``CFG.DELTA`` under stats_form
+    ldg, the ring stage's delta row under tma_ring (header section 8)."""
     q_lo = group * CFG.GROUP_QUARTER
     a = _tmem_load(tmem_base + CFG.DP_COL + q_lo, CFG.GROUP_QUARTER)
     b = _tmem_load(tmem_base + CFG.DP_COL + q_lo + CFG.N // 2, CFG.GROUP_QUARTER)
@@ -1384,12 +1519,12 @@ def _ds_values(slab, tmem_base, group, p, scale, dtype: cutlass.Constexpr, one_c
         dp = (a, b)[half]
         col0 = q_lo + half * (CFG.N // 2)
         if cutlass.const_expr(one_chunk):  # DIAGNOSTIC stats_one_chunk: the one chunk every column of the quarter reuses
-            stat_one = _view(slab, CFG.DELTA, cutlass.Float32, CFG.N).subview(col0 + CFG.DIAG_STATS_CHUNK * 4).load(vector_size=4, alignment=16)
+            stat_one = _view(slab, delta_base, cutlass.Float32, CFG.N).subview(col0 + CFG.DIAG_STATS_CHUNK * 4).load(vector_size=4, alignment=16)
         for chunk in cutlass.range_constexpr(CFG.DIAG_STATS_CHUNKS_PER_QUARTER):
             if cutlass.const_expr(one_chunk):
                 stat = stat_one
             else:
-                stat = _view(slab, CFG.DELTA, cutlass.Float32, CFG.N).subview(col0 + chunk * 4).load(vector_size=4, alignment=16)
+                stat = _view(slab, delta_base, cutlass.Float32, CFG.N).subview(col0 + chunk * 4).load(vector_size=4, alignment=16)
             for pair in cutlass.range_constexpr(2):
                 i = chunk * 4 + pair * 2
                 d0, d1 = ffma2(scale, scale, dp[i], dp[i + 1], stat[pair * 2], stat[pair * 2 + 1])
@@ -1604,6 +1739,7 @@ def _softmax_loop(
     fa4_roles: cutlass.Constexpr[bool],
     regs: cutlass.Constexpr[int],
     mask_form_code: cutlass.Constexpr[int],
+    stats_form_code: cutlass.Constexpr[int],
     dbg,
 ):
     """Warps 0-7, BOTH CTAs (lane = own kv row; group g owns q quarters {g, g+2}): S^T / dP^T -> P^T / dS^T packed in place; under
@@ -1627,7 +1763,17 @@ def _softmax_loop(
     #   -> _arrive_leader(bars.ds_ready)  [LEADER, 512]  and  bars.ds_tmem.arrive()          [THREAD local, bare, 256]
     #   tile_state = advance(tile_state, 1)
     # Required waits: s_done, dp_done (own copies of the leader's multicast commits).  Zero-trip item: credit only (pair-uniform lo / hi).
-    # Non-mbarrier: _stats -> named_barrier_fence(CFG.SOFTMAX_BARRIER, CFG.SOFTMAX_LANES) x 2 per call (both CTAs hold all 128 q stats).
+    # Non-mbarrier (stats_form ldg): _stats -> named_barrier_fence(CFG.SOFTMAX_BARRIER, CFG.SOFTMAX_LANES) x 2 per call (both CTAs hold all 128 q stats).
+    # BARRIER under stats_form tma_ring (the S1 skeleton 2026-10-27 17:30 / 17:46, resources/s1-barrier-table.md sections 1 / 7.1 / 14; stats_state =
+    #   PipelineState.start(), CFG_RING.STATS_STAGES = 2 stages, declared BEFORE the persistent loop and CARRIED across items: tile lo of an item takes
+    #   stage K % 2 for K = this CTA's running tile count, NEVER a per-item reset to stage 0):
+    #   per tile t, after _arrive_leader(bars.s_read): _wait(bars.stats_full[stats_state.idx], stats_state.phase)   [plain _wait, NO tcgen05 fence, NO
+    #     proxy fence: the bulk copy's complete_tx + the acquire wait publish the stage to the 256 lanes; st(0): wait k <-> the copy of tile k]
+    #   -> _p_values reads the LSE row at CFG.stats_lse(stats_state.idx) -> ... -> _ds_values reads the delta row at CFG.stats_delta(stats_state.idx)
+    #   -> bars.stats_empty[stats_state.idx].arrive()   [THREAD local, bare, 8 warps = 256 == SOFTMAX_LANES; right after the tile's LAST stats read;
+    #     the arrive's release orders this lane's LDS: no fence]  -> stats_state = advance(stats_state, CFG_RING.STATS_STAGES) with tile_state's advance
+    #   The two _stats call sites (the item prologue, the per-tile lookahead) and the SOFTMAX_BARRIER pair are NOT traced.  Zero-trip item: 0 / 0 (no
+    #   site outside the tile loop); n_q == 1: 1 / 1; no bootstrap, no drain (LOCAL rows, every copy consumed in-loop).
     # BARRIER under fa4_roles (16w_fa4; the barrier audit x-fa4 table section 9, the softmax stub order; dq_war = PipelineState.start(phase=1)):
     #   per item, first: _credit; ship_pred = (warp == SOFTMAX_LEAD_WARP) & nvvm.elect_sync()   [ONCE per item, P16]
     #   per tile t, steps 1-3 as above up to _arrive_leader(bars.ds_ready) [STTM + wait(STORE) + fence BEFORE the WAR wait: dK(t) never waits dQ(t-1)];
@@ -1655,8 +1801,12 @@ def _softmax_loop(
     # DIAGNOSTIC exchange_off (exchange_off) RE-SITED for 16w_fa4 : this role arms ds_recv_full with 0 bytes and issues no ship; every wait stays
     exchange_off = cutlass.const_expr(diag_2cta_code == DIAG_EXCHANGE_OFF)
     xchg_tx = CFG.DIAG_EXCHANGE_OFF_TX if cutlass.const_expr(diag_2cta_code == DIAG_EXCHANGE_OFF) else CFG.XCHG_TX
+    tma_ring = cutlass.const_expr(stats_form_code == STATS_FORM_TMA_RING)  # the stats form (header section 11): the ring sites below trace under it only
     tile_state = PipelineState.start()
     sched_state = PipelineState.start()
+    if cutlass.const_expr(tma_ring):
+        # RESOURCE-NOTE: stage base = STATS_RING + idx*1024; LSE @+0, delta @+512: today's LDS.128 immediates
+        stats_state = PipelineState.start()  # st(0): wait k <-> the loader's copy k; ONE state for the barrier index AND the stage byte base (P2); carried
     if cutlass.const_expr(fa4_roles):
         # lo_base=rank?XCHG:DS, hi_base=rank?DS+16K:XCHG; vec 4g..4g+3; (row%8)^vec: floor
         own_base = cutlass.Int32(CFG.DS) + rank * cutlass.Int32(CFG.DS_HALF_BYTES)  # CFG.ds_own(rank): our 128 kv rows of sDS
@@ -1676,8 +1826,9 @@ def _softmax_loop(
             ship_pred = is_lead_warp & nvvm.elect_sync()  # ONE lane of warp SOFTMAX_LEAD_WARP per item (P16): the arm + the ship
         lo, hi, seq_q, seq_k, q_start = _item_bounds(pair, meta, batch, n_batch, causal)
         key = pair * CFG.PAIR_KV_ROWS + rank * CFG.M + row
-        if lo < hi:
-            _stats(slab, lse, delta, row, group, lo * CFG.N, batch, head, scale, q_start, seq_q, origins, stats_origin)
+        if cutlass.const_expr(not tma_ring):  # stats_form ldg: the item prologue's stats fetch (tile lo) under the SOFTMAX_BARRIER pair
+            if lo < hi:
+                _stats(slab, lse, delta, row, group, lo * CFG.N, batch, head, scale, q_start, seq_q, origins, stats_origin)
         for qtile in cutlass.range(lo, hi, 1, unroll=1):
             _wait_tcgen(bars.s_done, tile_state.phase, dbg, _W["wait:softmax:s_done"])
             if cutlass.const_expr(DEBUG_SOFTMAX_S_READ_DELAY_US > 0):
@@ -1687,15 +1838,27 @@ def _softmax_loop(
             a, b = _s_values(tmem_base, group)
             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
             _arrive_leader(bars.s_read)
+            stats_base = CFG.STATS  # stats_form ldg: the single slab `_stats` filled (a trace-time constant: the LDS immediates of today's rendering)
+            if cutlass.const_expr(tma_ring):
+                # RESOURCE-NOTE: stats_full wait AFTER the s_read arrive, before _p_values: dQ(t-1) never waits stats
+                # BARRIER: stats_full[s] st(0) = the loader's bulk copy of THIS tile's (head, q tile) record landed in stage s; plain _wait (the
+                # complete_tx + acquire publish the async-proxy write to every lane: no tcgen05 fence, no proxy fence); the STAMPS word brackets it
+                _wait(bars.stats_full[stats_state.idx], stats_state.phase, dbg, _W["wait:softmax:stats_full"])
+                stats_base = cutlass.Int32(CFG.STATS_RING) + stats_state.idx * cutlass.Int32(CFG.STATS_STAGE_BYTES)  # the stage's LSE row (delta at +512)
             mask_tile = None  # read under MASK_FORM_PREDICATED only (section 7's CTA-uniform per-tile scalar; the other forms trace no predicate)
             if cutlass.const_expr(mask_form_code == MASK_FORM_PREDICATED):
                 mask_tile = tile_may_mask(pair, rank, qtile, seq_q, seq_k, causal)
-            p = _p_values(slab, tmem_base, group, key, qtile, seq_q, seq_k, scale, a, b, causal, dtype, one_chunk, mask_form_code, mask_tile)
+            p = _p_values(slab, stats_base, tmem_base, group, key, qtile, seq_q, seq_k, scale, a, b, causal, dtype, one_chunk, mask_form_code, mask_tile)
             nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
             _arrive_leader(bars.p_ready)
             _wait_tcgen(bars.dp_done, tile_state.phase, dbg, _W["wait:softmax:dp_done"])
-            words = _ds_values(slab, tmem_base, group, p, scale, dtype, one_chunk)
+            words = _ds_values(slab, stats_base + CFG.STATS_DELTA_OFF, tmem_base, group, p, scale, dtype, one_chunk)
+            if cutlass.const_expr(tma_ring):
+                # RESOURCE-NOTE: stats_empty bare 256 right after _ds_values (last delta LDS); st(0) +2; no proxy fence
+                # BARRIER: stats_empty[s] THREAD local, bare (8 warps x 32 = 256 == SOFTMAX_LANES) right after the tile's LAST stats read (the delta
+                # LDS of _ds_values): the release orders this lane's loads; the loader's acquire wait + program order gate the next copy into the stage
+                bars.stats_empty[stats_state.idx].arrive()
             nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
             _arrive_leader(bars.ds_ready)
@@ -1726,8 +1889,11 @@ def _softmax_loop(
                 bars.ds_recv_full.arrive(n_bytes=xchg_tx, pred=ship_pred)  # XCHG_TX; the probe arms CFG.DIAG_EXCHANGE_OFF_TX = 0 (completes at the arm)
                 if cutlass.const_expr(not exchange_off):  # DIAGNOSTIC exchange_off (re-sited): the ship only; the arm above expects 0 bytes, every wait stays
                     _ship_xchg(slab, bars, rank, ship_pred)
-            if qtile + 1 < hi:
-                _stats(slab, lse, delta, row, group, (qtile + 1) * CFG.N, batch, head, scale, q_start, seq_q, origins, stats_origin)
+            if cutlass.const_expr(not tma_ring):  # stats_form ldg: the per-tile lookahead fetch of tile t+1 under the SOFTMAX_BARRIER pair
+                if qtile + 1 < hi:
+                    _stats(slab, lse, delta, row, group, (qtile + 1) * CFG.N, batch, head, scale, q_start, seq_q, origins, stats_origin)
+            if cutlass.const_expr(tma_ring):
+                stats_state = advance(stats_state, CFG_RING.STATS_STAGES)  # +1 per tile, the same count on both sides of the ring (P14)
             tile_state = advance(tile_state, 1)
         # section 15: NO zero-trip wait and NO zero-trip advance on dq_war -- dq_war_done flips at dQ issues only (0 / 0 on every zero-trip path)
         pair, head, batch, valid, sched_state = _next_tile(sched, bars, sched_state, dbg, _W["wait:softmax:sched_full"])
@@ -2176,11 +2342,29 @@ def _load_loop(
     dtype: cutlass.Constexpr,
     ratio: cutlass.Constexpr[int],
     regs: cutlass.Constexpr[int],
+    stats_form_code: cutlass.Constexpr[int],
+    stats2,
+    rowoff,
     dbg,
 ):
     """Warp 13, BOTH CTAs: Q1 / Q2 / dO1 / dO2 per q tile, K1 / K2 / V per kv block (grouped head // ratio), each CTA its own boxes.
     Unchanged from the first body except the Q1 ring depth (Q1_STAGES = 1: one slot, st(1) adv 1, drain x 1).  ``dbg`` (STAMPS): the
     *_empty wait sums (the drains included) and sched_full.
+    ``stats_form_code`` (header section 11): under STATS_FORM_TMA_RING this warp ALSO feeds the softmax's stats ring: per q tile, right after Q1(t),
+    ONE 1 KiB `bulk_copy` of the (head, q tile) record of the chain's padded pre-scaled stats region ``stats2`` (fp32 [heads][PAD_TOTAL / N][2][N]:
+    the LSE row then the delta row; the record's padded token base = ``rowoff[batch]``, one word per item) into ring stage s behind `stats_full[s]`
+    (expect_tx CFG.STATS_TX = 1024 on THIS CTA's copy: a plain bulk copy lands on the issuing CTA) after the `stats_empty[s]` credit; ``stats2`` /
+    ``rowoff`` are None (dropped) under ldg.
+
+    # BARRIER under stats_form tma_ring (the S1 skeleton 2026-10-27 17:30 / 17:46, resources/s1-barrier-table.md sections 1 / 7.1 / 14):
+    #   stats_ld = PipelineState.start(phase=1)  [PRE-ARMED, CFG_RING.STATS_STAGES = 2: wait k <-> the softmax's release of tile k-2 = the stage's
+    #     previous tenant; the kernel's first two waits pass on the pre-arm; declared with the other states, CARRIED across items, never reset]
+    #   per item: own_pred = nvvm.elect_sync() [beside arm_pred; BOTH CTAs arm their OWN copy]; rowoff_b = rowoff[batch] (one meta word per item)
+    #   per tile t, after Q1(t)'s tma_load_tile and BEFORE _wait(bars.do1_empty):
+    #     _wait(bars.stats_empty[stats_ld.idx], stats_ld.phase) -> bars.stats_full[stats_ld.idx].arrive(n_bytes=CFG.STATS_TX, pred=own_pred) [1 == ONE_LANE;
+    #     1024 == the record] -> bulk_copy(stage stats_ld.idx, stats2 record (head, rowoff_b / N + t), CFG.STATS_TX, bars.stats_full[stats_ld.idx].smem_ptr)
+    #     [internal elect; cp.async.bulk.shared::cluster.global complete_tx on OUR mbar: never cta_group 2, never multicast]
+    #   stats_ld = advance(stats_ld, CFG_RING.STATS_STAGES) with the other advances.  Zero-trip item: nothing (the tile loop runs 0 times); no drain.
 
     # arm_pred = is_leader & nvvm.elect_sync()  (P9: a cga2 tensor load completes on the pair LEADER's mbar whoever issued it; the
     # leader arms BOTH CTAs' bytes = the *_TX constants; the follower NEVER arms).  tma_mask = cutlass.Int16(1) << rank (self-only)
@@ -2214,6 +2398,11 @@ def _load_loop(
     kv_state = PipelineState.start(phase=1)
     k2e_state = PipelineState.start(phase=1)
     sched_state = PipelineState.start()
+    tma_ring = cutlass.const_expr(stats_form_code == STATS_FORM_TMA_RING)  # the stats form (header section 11)
+    if cutlass.const_expr(tma_ring):
+        stats_ld = PipelineState.start(phase=1)  # P5 (b): pre-armed = the ring's two free passes; +1 per tile; carried across items (P2)
+        stats_src_base = Pointer(stats2.iterator.raw_ptr(), dtype=cutlass.Float32)  # the padded pre-scaled stats region (fp32, element-addressed)
+        rowoff_view = cutlass.make_array_view(rowoff)  # rowoff[b] = sum_{i<b} ceil(S_i / N) * N: the sequence's padded token base (the setup kernel)
     tma_mask = cutlass.Int16(1) << rank  # the one-CTA multicast mask of every cga2 load (the bytes complete on the leader's mbar)
     d_half = rank * cutlass.Int32(CFG.D_HALF)
     q_half = rank * cutlass.Int32(CFG.Q_HALF)
@@ -2225,6 +2414,15 @@ def _load_loop(
                 nvvm.inline_ptx("nanosleep.u32 1000;", read_only_args=[])
         arm_pred = is_leader & nvvm.elect_sync()
         lo, hi, seq_q, seq_k, q_start = _item_bounds(pair, meta, batch, n_batch, causal)
+        if cutlass.const_expr(tma_ring):
+            # RESOURCE-NOTE: stats_full arm = pred=elect_sync() on BOTH CTAs: a plain bulk copy never routes (P9)
+            own_pred = nvvm.elect_sync()  # ONE lane of this warp per item (P16): the local stats_full arm; the copy elects inside bulk_copy
+            # RESOURCE-NOTE: src = stats2 + ((head*PAD_TOTAL + rowoff[b])/128 + t)*1024: 1024-B aligned (16 needed)
+            # the item's record base: head stride + the sequence's padded tile base (rowoff[b] is a multiple of N); + t records per tile below
+            stats_src = stats_src_base + (
+                cutlass.Int64(head) * cutlass.Int64(stats2.stride[0])
+                + cutlass.Int64(cutlass.Int32(rowoff_view[batch]) // cutlass.Int32(CFG.STATS_PAD_GRAN)) * cutlass.Int64(stats2.stride[1])
+            )
         q1_desc = _map_ptr(maps, batch, n_batch, MAP_Q1)
         q2_desc = _map_ptr(maps, batch, n_batch, MAP_Q2)
         k_desc = _map_ptr(maps, batch, n_batch, MAP_K)
@@ -2292,6 +2490,24 @@ def _load_loop(
                 mcast_mask=tma_mask,
                 acquire=False,
             )
+            if cutlass.const_expr(tma_ring):
+                # RESOURCE-NOTE: stats(t) after Q1(t), before dO1(t): need order; lands ~1 period before P(t)
+                # BARRIER: stats_empty[s] st(1) -> the stage's previous tenant (tile t-2) was read out by the softmax (the pre-arm passes the kernel's
+                # first two tiles); then the ONE expect_tx arm of the record (1 == ONE_LANE, 1024 == STATS_TX) and the ONE bulk copy on OUR mbar
+                _wait(bars.stats_empty[stats_ld.idx], stats_ld.phase, dbg, _W["wait:loader:stats_empty"])
+                bars.stats_full[stats_ld.idx].arrive(n_bytes=CFG.STATS_TX, pred=own_pred)
+                bulk_copy(
+                    _view(
+                        slab,
+                        cutlass.Int32(CFG.STATS_RING) + stats_ld.idx * cutlass.Int32(CFG.STATS_STAGE_BYTES),
+                        cutlass.Uint8,
+                        CFG.STATS_STAGE_BYTES,
+                        alignment=1024,
+                    ),
+                    stats_src + qtile * cutlass.Int32(STATS_RECORD_ELEMS),
+                    CFG.STATS_TX,
+                    bars.stats_full[stats_ld.idx].smem_ptr,
+                )
             _wait(bars.do1_empty, do1_state.phase, dbg, _W["wait:loader:do1_empty"])
             for half in cutlass.range_constexpr(CFG.D_HALVES):
                 bars.do1_full[half].arrive(n_bytes=CFG.DO1_HALF_TX, pred=arm_pred)
@@ -2330,6 +2546,8 @@ def _load_loop(
             do1_state = advance(do1_state, 1)
             do2_state = advance(do2_state, 1)
             q2_state = advance(q2_state, 1)
+            if cutlass.const_expr(tma_ring):
+                stats_ld = advance(stats_ld, CFG_RING.STATS_STAGES)  # +1 per tile = the softmax's count (P14); nothing on a zero-trip item
         pair, head, batch, valid, sched_state = _next_tile(sched, bars, sched_state, dbg, _W["wait:loader:sched_full"])
     if cutlass.const_expr(CFG.CTA_MMA == 2):
         # P15: whole-ring drains from the CARRIED states (the leader's last multicast commits must land on a resident follower).
@@ -2470,8 +2688,8 @@ def _scheduler_loop(sched, is_leader, regs: cutlass.Constexpr[int]):
 @cute.kernel
 def bprop_d128_accum_grouped_2cta_stail_kernel(
     maps: cute.Tensor,
-    lse: cute.Tensor,
-    delta: cute.Tensor,
+    stats_tokens: cute.Tensor,
+    stats_rows: cute.Tensor,
     meta: cute.Tensor,
     origins: cute.Tensor,
     n_batch: cutlass.Int32,
@@ -2483,11 +2701,17 @@ def bprop_d128_accum_grouped_2cta_stail_kernel(
     diag_2cta_code: cutlass.Constexpr[int],
     warp_roles_code: cutlass.Constexpr[int],
     mask_form_code: cutlass.Constexpr[int],
+    stats_form_code: cutlass.Constexpr[int],
     dkv_fp32: cutlass.Constexpr[bool],
     debug_clk: cutlass.Constexpr[bool],
     dbg_clk: Optional[cute.Tensor],
 ):
     """Slab, scaffold views, the barrier init block (P4), the pair TMEM allocation, the role dispatch, the pair-symmetric teardown.
+    ``stats_tokens`` / ``stats_rows`` = the two stats operand slots, read by the stats form (header sections 11 / 14): under ``ldg`` the
+    user's LSE tensor and the chain's compact delta region (the softmax's `_stats` fetch); under ``tma_ring`` the padded row offsets ``rowoff``
+    [batch + 1] Int32 and the padded pre-scaled stats region ``stats2`` [heads][PAD_TOTAL / N][2][N] fp32 (the loader's bulk copies).  Two plain
+    ``cute.Tensor`` slots under both forms: an ``Optional`` annotation or an added operand changes the mangled entry name of the ldg rendering
+    (its md5 pin) even when the value is None, so the form selects the slots' meaning, never the signature.
     ``warp_roles_code`` = the ROLE SHAPE (header sections 4 / 5 / 11; WARP_ROLES_16W = the default, today's rendering; WARP_ROLES_16W_FA4 =
     the alternate role shape: the softmax ships the exchange from its registers, warps 8-11 run ``_reduce_loop``, the bar bundle is ``BarsXFA4``), from the typed
     ``warp_roles`` field.
@@ -2497,12 +2721,35 @@ def bprop_d128_accum_grouped_2cta_stail_kernel(
     ``diag_2cta`` field; ``debug_clk`` / ``dbg_clk`` = the STAMPS lever (header section 11) and its Int32 dump tensor (None = dropped from the
     signature when off: byte-identical rendering).
     ``dkv_fp32`` = the op-level ``dkv_accum`` field (header section 11: False = bf16 partials + the fold, the default rendering; True = fp32
-    reduce-adds of dK / dV into the per-KV-head workspace, a ROUNDING CHANGE)."""
+    reduce-adds of dK / dV into the per-KV-head workspace, a ROUNDING CHANGE).
+    ``stats_form_code`` = the STATS FORM (header section 11: STATS_FORM_LDG = the default, the softmax's per-tile LDG fetch of LSE / delta under
+    the SOFTMAX_BARRIER pair, ``lse`` / ``delta`` present; STATS_FORM_TMA_RING = the loader-fed two-stage SMEM stats ring behind stats_full /
+    stats_empty fed from ``stats2`` (the chain's padded pre-scaled stats region) at ``rowoff[batch]`` (the sequence's padded token base), ``lse`` /
+    ``delta`` None = dropped, the CFG_RING geometry: SMEM_BYTES == the cap, the bar block / TMEM handle / CLC payload re-based +1024), from the
+    typed ``stats_form`` field; read by the softmax and the loader; declines by name under 16w_fa4."""
     softmax_regs, epilogue_regs, service_regs = CFG.SOFTMAX_REGS, CFG.EPILOGUE_REGS, CFG.SERVICE_REGS  # config = truth: the 144 / 144 / 80 split
     fa4_roles = warp_roles_code == WARP_ROLES_16W_FA4  # the role shape (trace-time)
+    tma_ring = stats_form_code == STATS_FORM_TMA_RING  # the stats form (trace-time)
     # Trace-time invariants (const_expr: a Python raise, never a staged early exit); the config's validate_fields_for_roles declines first by name.
     if cutlass.const_expr(warp_roles_code not in (WARP_ROLES_16W, WARP_ROLES_16W_FA4)):
         raise ValueError(f"warp_roles_code must be one of {(WARP_ROLES_16W, WARP_ROLES_16W_FA4)}; got {warp_roles_code!r}")
+    if cutlass.const_expr(stats_form_code not in (STATS_FORM_LDG, STATS_FORM_TMA_RING)):
+        raise ValueError(f"stats_form_code must be one of {(STATS_FORM_LDG, STATS_FORM_TMA_RING)}; got {stats_form_code!r}")
+    if cutlass.const_expr(tma_ring and fa4_roles):  # the first build: the stats ring rows are the 16w bundle's (validate_fields_for_roles)
+        raise ValueError("stats_form tma_ring is not built under warp_roles 16w_fa4 (the stats ring rows and waits are sited in the 16w bundle)")
+    # the two stats slots by form (the host hands the form's tensors; the shapes differ, so a slot mix-up is a trace-time shape error, never silent)
+    if cutlass.const_expr(tma_ring):
+        lse, delta = None, None
+        rowoff, stats2 = stats_tokens, stats_rows
+        if cutlass.const_expr(len(rowoff.shape) != 1 or len(stats2.shape) != 4):
+            raise ValueError("stats_form tma_ring: stats_tokens = rowoff [batch + 1] and stats_rows = stats2 [heads][tiles][2][N] (the prepared host)")
+    else:
+        lse, delta = stats_tokens, stats_rows
+        rowoff, stats2 = None, None
+        if cutlass.const_expr(len(lse.shape) not in (2, 3) or len(delta.shape) != 3):
+            raise ValueError("stats_form ldg: stats_tokens = the LSE tensor ([T, H] or [1, H, pitch]) and stats_rows = the compact delta [1, H, rounded]")
+    geo = CFG_RING if cutlass.const_expr(tma_ring) else CFG  # the geometry by form (header section 8): the ring's second stage re-bases the scaffold
+    dbg_rec = DBG_CLK_RING if cutlass.const_expr(tma_ring) else DBG_CLK  # the STAMPS record by form (the spare: 96 / 88 words, the same word map)
     if cutlass.const_expr(fa4_roles and debug_clk):  # the merge: the STAMPS record layout is the 16w roles' (no words for the fa4 waits)
         raise ValueError("debug_clk is not defined under warp_roles 16w_fa4 (the STAMPS record layout names the 16w roles' waits)")
     if cutlass.const_expr(fa4_roles and dkv_fp32):  # the merge: the fp32 dK / dV staging rounds live in the 16w epilogue loop
@@ -2512,14 +2759,14 @@ def bprop_d128_accum_grouped_2cta_stail_kernel(
     rank = cute.arch.block_idx_in_cluster() & cutlass.Int32(1)  # pair rank under cluster (2,1,1): 0 = LEADER, 1 = FOLLOWER
     is_leader = rank == cutlass.Int32(LEADER_RANK)  # the loader's arm predicate and the scheduler / MMA role select
     pair, head, batch = x // CFG.CGA_M, y, z  # grid x = pairs x CGA_M: both CTAs of a cluster decode the same pair
-    slab = cutlass.Array(cutlass.Uint8, CFG.SMEM_BYTES, alignment=1024, space=cutlass.AddressSpace.smem)
-    bars = _bars(slab, fa4_roles)  # 35 fields (16w) or 33 (16w_fa4): the init loop below runs over the bundle it was handed
-    tmem_slot = _view(slab, CFG.TMEM_HANDLE, cutlass.Int32, 1, alignment=4)
-    sched_words = _view(slab, CFG.SCHED_PAYLOAD, cutlass.Int32, CFG.SCHED_PAYLOAD_BYTES // 4, alignment=16)
+    slab = cutlass.Array(cutlass.Uint8, geo.SMEM_BYTES, alignment=1024, space=cutlass.AddressSpace.smem)  # 231424 (ldg) / 232448 == the cap (tma_ring)
+    bars = _bars(slab, fa4_roles, tma_ring)  # 35 fields (16w) / 33 (16w_fa4) / 37 (16w x tma_ring): the init loop below runs over the bundle it was handed
+    tmem_slot = _view(slab, geo.TMEM_HANDLE, cutlass.Int32, 1, alignment=4)
+    sched_words = _view(slab, geo.SCHED_PAYLOAD, cutlass.Int32, CFG.SCHED_PAYLOAD_BYTES // 4, alignment=16)
     sched = Sched(bars.sched_full.base_ptr, bars.sched_empty.base_ptr, sched_words, x, y, z)
     # --- STAMPS contexts (header section 11): the record view in the bar block's spare + ONE representative warp per role; None when off.
     if cutlass.const_expr(debug_clk):
-        dbg_words = _view(slab, DBG_CLK.SMEM, cutlass.Int32, DBG_CLK.WORDS, alignment=16)
+        dbg_words = _view(slab, dbg_rec.SMEM, cutlass.Int32, dbg_rec.WORDS, alignment=16)
         dbg_softmax = Dbg(dbg_words, warp == cutlass.Int32(0))
         dbg_epilogue = Dbg(dbg_words, warp == cutlass.Int32(EPILOGUE_LEAD_WARP))
         dbg_single = Dbg(dbg_words, True)
@@ -2540,7 +2787,7 @@ def bprop_d128_accum_grouped_2cta_stail_kernel(
                     for stage in cutlass.range_constexpr(bars[i].stages):
                         bars[i][stage].init()
             if cutlass.const_expr(debug_clk):
-                _clk_init(dbg_words)  # STAMPS: the record zeroed + the body start stamped before the CTA sync publishes it
+                _clk_init(dbg_words, dbg_rec.WORDS)  # STAMPS: the record zeroed + the body start stamped before the CTA sync publishes it
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
     cga_arrive()  # required before ANY cross-CTA arrive (multicast commits, leader arrives, the remote CLC arm, the DSMEM ship)
@@ -2576,6 +2823,7 @@ def bprop_d128_accum_grouped_2cta_stail_kernel(
             fa4_roles,
             softmax_regs,
             mask_form_code,
+            stats_form_code,
             dbg_softmax,
         )
     elif warp < EPILOGUE_WARP_END:
@@ -2607,7 +2855,27 @@ def bprop_d128_accum_grouped_2cta_stail_kernel(
         else:
             _mma_loop_follower(bars, sched, pair, head, batch, meta, n_batch, causal, service_regs, dbg_single)
     elif warp == TMA_LOAD_WARP:
-        _load_loop(slab, bars, sched, maps, pair, head, batch, meta, n_batch, rank, is_leader, causal, dtype, ratio, service_regs, dbg_single)
+        _load_loop(
+            slab,
+            bars,
+            sched,
+            maps,
+            pair,
+            head,
+            batch,
+            meta,
+            n_batch,
+            rank,
+            is_leader,
+            causal,
+            dtype,
+            ratio,
+            service_regs,
+            stats_form_code,
+            stats2,
+            rowoff,
+            dbg_single,
+        )
     elif warp == TMA_STORE_WARP:
         _store_loop(
             slab,
@@ -2636,7 +2904,7 @@ def bprop_d128_accum_grouped_2cta_stail_kernel(
     if cutlass.const_expr(debug_clk):
         if warp == 0:
             if nvvm.elect_sync():
-                _clk_dump(dbg_words, dbg_clk, rank)  # STAMPS: every role returned and every record word is published by the CTA sync above
+                _clk_dump(dbg_words, dbg_clk, rank, dbg_rec.WORDS)  # STAMPS: every role returned and every record word is published by the CTA sync above
     if warp == MMA_WARP:
         _tmem_dealloc_pair(bars, tmem_slot, rank)
 
@@ -2647,8 +2915,8 @@ bprop_d128_accum_grouped_2cta_stail_kernel.set_name_prefix("cudnn", remove_cutla
 @cute.jit
 def main_thd_2cta_stail_host(
     maps,
-    lse,
-    delta,
+    stats_tokens,
+    stats_rows,
     meta,
     origins,
     n_batch,
@@ -2662,12 +2930,15 @@ def main_thd_2cta_stail_host(
     diag_2cta_code: cutlass.Constexpr[int],
     warp_roles_code: cutlass.Constexpr[int],
     mask_form_code: cutlass.Constexpr[int],
+    stats_form_code: cutlass.Constexpr[int],
     dkv_fp32: cutlass.Constexpr[bool],
     debug_clk: cutlass.Constexpr[bool],
     dbg_clk,
     stream,
 ):
-    """One owner PAIR per Q head and declared 256-row KV-envelope unit (header section 14); no host length read.  ``dbg_clk`` (the Int32
+    """One owner PAIR per Q head and declared 256-row KV-envelope unit (header section 14); no host length read.  ``stats_tokens`` /
+    ``stats_rows`` = the stats form's two operands (ldg: the LSE tensor and the compact delta; tma_ring: the padded row offsets and the padded
+    pre-scaled stats region -- the same two positional slots, header section 14).  ``dbg_clk`` (the Int32
     STAMPS dump, config dbg_clk_records x DBG_CLK.WORDS words) is passed to the kernel ONLY under ``debug_clk``; otherwise it is None =
     dropped from the specialised signature (the default rendering stays byte-identical).  ``warp_roles_code`` = the role shape (header
     section 11; 0 = 16w, the default)."""
@@ -2675,8 +2946,8 @@ def main_thd_2cta_stail_host(
     dbg_clk_on = dbg_clk if cutlass.const_expr(debug_clk) else None
     bprop_d128_accum_grouped_2cta_stail_kernel(
         maps,
-        lse,
-        delta,
+        stats_tokens,
+        stats_rows,
         meta,
         origins,
         n_batch,
@@ -2688,6 +2959,7 @@ def main_thd_2cta_stail_host(
         diag_2cta_code,
         warp_roles_code,
         mask_form_code,
+        stats_form_code,
         dkv_fp32,
         debug_clk,
         dbg_clk_on,

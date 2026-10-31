@@ -81,7 +81,7 @@ def test_f16_routes_to_the_sm107_sibling(flavor):
 def test_f16_host_entries_carry_only_record_reproducible_defaults(flavor, rubin):
     """The compiled-plan cache persists a ``--enable-tvm-ffi`` host only when every default of its calling convention is a value the
     artifact record carries (None / bool / int / float / str): a tuple default silently leaves the host un-persistable, and the staged
-    artifact JITs again in every process (``TestStagedHalf::test_artifact_reload`` is the GPU detector).  Pinned on the host for every
+    artifact JITs again in every process (``TestNativeHalfStrides::test_artifact_reload`` is the GPU detector).  Pinned on the host for every
     f16 flavor of both arch trees."""
     import inspect
     from cudnn.frost.compiled_cache import _json_plain
@@ -909,12 +909,10 @@ def test_sm107_f16_thd_is_served_on_every_flavor():
     caps = _caps("sdpa_fwd_prefill_sm107")
     assert caps.thd is True
     assert caps.thd_d_shapes is SM107_F16_THD_SHAPES
-    assert (
-        SM107_F16_THD_SHAPES < caps.d_shapes and caps.d_shapes - SM107_F16_THD_SHAPES == SM107_F16_SMALL_D_SHAPES
-    ), "THD = every f16 shape but the small tiles"
+    assert SM107_F16_THD_SHAPES < caps.d_shapes and caps.d_shapes - SM107_F16_THD_SHAPES == {(32, 32)}, "THD = every f16 shape except D32"
     for d_qk, d_v in sorted(SM107_F16_THD_SHAPES):
         assert engines.mismatch(caps, _f16_facts(thd=True, padded=True, d_qk=d_qk, d_v=d_v)) is None, (d_qk, d_v)
-    for d_qk, d_v in sorted(SM107_F16_SMALL_D_SHAPES):
+    for d_qk, d_v in sorted(SM107_F16_SMALL_D_SHAPES - SM107_F16_THD_SHAPES):
         why = engines.mismatch(caps, _f16_facts(thd=True, padded=True, d_qk=d_qk, d_v=d_v))
         assert why is not None and "THD" in why, (d_qk, d_v, why)
 
@@ -2258,6 +2256,38 @@ def test_sm107_gate_declines_the_interactions():
     assert why is not None and "virtual O" in why, why
 
 
+@pytest.mark.parametrize("h,h_kv,token_pitch", [(24, 4, 13312), (32, 2, 17408)])
+def test_gate_check_support_admits_the_slab_column_gate_at_batch_one_token(monkeypatch, h, h_kv, token_pitch):
+    """The decode form of a gated block at batch 1 x one query token: Q and G are column bands of ONE projection slab, so both
+    singleton axes carry the slab's token pitch ((13312, 256, 13312, 1) for 24 heads).  Canonicalized, the gate is BSHD-compact:
+    the engine row admits the graph (``graph_analyzer.gate_layout_ok``), so the adapter's twin must admit the same G (rule 8b) --
+    split, the plan rides the decode tile with the gate in its combine; unsplit, the prefill kernel's fused epilogue.  A head
+    pitch that is not a 16-byte multiple on the same geometry stays the typed ValueError."""
+    import torch
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    _fake_cc(monkeypatch, (10, 7))
+    d, s_kv = 256, 4096
+    band = (token_pitch, d, token_pitch, 1)
+
+    def plan(gate_stride, split_kv):
+        q = _desc((1, h, 1, d), torch.bfloat16, "q", stride=band)
+        k = _desc((1, h_kv, s_kv, d), torch.bfloat16, "k")
+        v = _desc((1, h_kv, s_kv, d), torch.bfloat16, "v")
+        o = _desc((1, h, 1, d), torch.bfloat16, "o")
+        gate = _desc((1, h, 1, d), torch.bfloat16, "gate", stride=gate_stride)
+        return SdpaFwdDslSm100(q, k, v, o, None, sample_gate=gate, split_kv=split_kv)
+
+    for split in (4, 8, 16):
+        api = plan(band, split)
+        assert api.check_support(), split
+        assert api._gate_in_combine() is True, split
+    assert plan(band, 1).check_support()
+    with pytest.raises(ValueError, match="TMA-expressible"):
+        plan((token_pitch, 260, token_pitch, 1), 4).check_support()
+
+
 def test_epilogue_gate_is_not_a_knob():
     """The gate is a graph FACT (the tail is there or it is not), never a tuning
     axis: the knob vocabulary has no such field and the heuristics cannot
@@ -3479,13 +3509,15 @@ def test_sm107_thd_gate_keyless_sequence_is_exactly_zero_and_a_zero_length_seque
 # Re-recorded after #1922: the BF16 causal dense case now uses fused correction/P1. The shared body's dense cubins
 # change on both compile targets; all eight THD / paged / gated records stay byte-identical. This direct-template
 # probe does not select the separate native SM107 dense body.
+# Re-recorded after #2064: fused dense P1 register math overlaps the previous PV. Both dense cubins change;
+# the eight THD / paged / gated renderings remain byte-identical.
 _PAGED_GATE_CUBIN_RECORD = {
     "nvidia-cutlass-dsl": "4.8.0",
-    "sm_100a_dense": "8550fc4d4eb48f233f7bba50e53cc434",
+    "sm_100a_dense": "89b5cba5c546804bc16ca9934226111c",
     "sm_100a_thd": "d10d4f3814461e315a33778705e1920c",
     "sm_100a_paged_thd": "066bb542a059b0c1c1083f85f60fddcb",
     "sm_100a_paged_thd_pack": "a812d2551488e2b3b19177b470003278",
-    "sm_107a_dense": "22cfb3e0850bc20c2e23a4f86a02f9fd",
+    "sm_107a_dense": "48b8f362d864ec60c670ef51ba88f588",
     "sm_107a_thd": "38403df53e25b064f21b0e0eb3471af3",
     "sm_107a_paged_thd": "3c106cb810219e1d3f1eab0433049b80",
     "sm_107a_paged_thd_pack": "cb43d702cddfa33ef699cfbe22441edb",
@@ -4815,20 +4847,20 @@ def test_sm107_ring_wait_form_sass_pins(tmp_path, quant, d_qk, d_v, dtype_o, spi
 
 
 # The CI arch targets select this module explicitly; imported tests need L0.
-import test_sdpa_staged_forward_half as _staged_half_checks
+import native_forward_half_cases as _native_half_checks
 
 
 @pytest.mark.L0
 @requires_dsl
-class TestStagedHalf:
-    test_current_storage = staticmethod(_staged_half_checks.test_half_staged_has_no_execute_allocations_and_replays_current_storage)
-    test_partial_staging = staticmethod(_staged_half_checks.test_half_staged_preserves_native_operands_and_split_output)
-    test_wrapper_workspace = staticmethod(_staged_half_checks.test_sm100_wrapper_supplies_current_workspace)
-    test_compiled_budget = staticmethod(_staged_half_checks.test_half_compiled_workspace_query_uses_prepared_budget)
-    test_invalid_bindings = staticmethod(_staged_half_checks.test_half_staged_rejects_invalid_bindings_before_copy)
-    test_physical_wide_stride = staticmethod(_staged_half_checks.test_half_staged_physical_wide_stride)
-    test_artifact_reload = staticmethod(_staged_half_checks.test_half_staged_artifact_reloads_without_jit)
-    test_launch_stream = staticmethod(_staged_half_checks.test_half_staged_copies_follow_launch_stream)
+class TestNativeHalfStrides:
+    test_current_storage = staticmethod(_native_half_checks.test_half_native_has_no_execute_allocations_and_replays_current_storage)
+    test_mixed_layout = staticmethod(_native_half_checks.test_half_native_preserves_native_operands_and_split_output)
+    test_wrapper_workspace = staticmethod(_native_half_checks.test_sm100_wrapper_supplies_current_workspace)
+    test_compiled_budget = staticmethod(_native_half_checks.test_half_compiled_workspace_query_uses_prepared_budget)
+    test_invalid_bindings = staticmethod(_native_half_checks.test_half_native_rejects_invalid_bindings_before_launch)
+    test_physical_wide_stride = staticmethod(_native_half_checks.test_half_native_physical_wide_stride)
+    test_artifact_reload = staticmethod(_native_half_checks.test_half_native_artifact_reloads_without_jit)
+    test_launch_stream = staticmethod(_native_half_checks.test_half_native_follows_launch_stream)
 
 
 # ============================================================================
@@ -8628,6 +8660,11 @@ def test_packed_sink_combine_counts_virtual_key_once(dtype_name, stats):
                 total.data_ptr(),
                 torch.cuda.current_stream().cuda_stream,
                 sinks.data_ptr(),
+                # The packed host's physical-origin slots (paged THD): compact partials carry none, so the compiled frame's two
+                # None operands, then n_batch -- the one batch the packed entry serves, as the prepared split host passes B.
+                None,
+                None,
+                b,
             )
 
         run()
@@ -8724,3 +8761,15 @@ class TestMixedFp8Kv:
     test_compact_split = staticmethod(compact_split)
     test_dense_paged_decline = staticmethod(dense_paged_decline)
     test_uniform_control = staticmethod(uniform_control)
+
+
+# Keep native stride coverage in the architecture-specific CI entry.
+from native_forward_stride_cases import check_native_dense_permutations as _native_dense_permutations
+from native_forward_stride_cases import check_native_gate_permutations as _native_gate_permutations
+
+
+@pytest.mark.L0
+@requires_dsl
+class TestNativeDenseStrides:
+    test_permutations = staticmethod(_native_dense_permutations)
+    test_gate_permutations = staticmethod(_native_gate_permutations)

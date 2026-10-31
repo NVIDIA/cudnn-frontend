@@ -565,6 +565,22 @@ def supports_nonpaged_d128_thd_prefill(d_shape, *, device_cc, fp8, thd, paged, c
     return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and not paged and cga in (None, 1, 2) and split_kv == 1
 
 
+def supports_sm100_nonpaged_d128_thd_single_cta(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv, one_head_per_kv, plain_mask):
+    """SM100 single-CTA D128 half THD prefill: the two-slab 256-row body for nonpaged ragged graphs with one query head
+    per KV head, unsplit, under a plain mask (none, causal or padding: no window, band, sink, bias or kv_mask)."""
+    return (
+        tuple(device_cc or ()) in ((10, 0), (10, 3))
+        and tuple(d_shape) == (128, 128)
+        and not fp8
+        and thd
+        and not paged
+        and one_head_per_kv
+        and plain_mask
+        and cga in (None, 1, 2)
+        and split_kv == 1
+    )
+
+
 def supports_paged_d128_partial_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
     """Rubin's two-CTA D128 paged half body packs a divisor of the GQA group."""
     return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and paged and cga in (None, 2) and split_kv == 1
@@ -854,42 +870,23 @@ def bshd_compact(shape_bhsd: tuple, stride_bhsd: tuple) -> bool:
 
 
 def bshd_zero_copy_stride(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int) -> Optional[tuple]:
-    """The BSHD ``(b, s, h, d)`` stride tuple a dense prefill kernel is COMPILED
-    at for a logical BHSD operand, or None.
+    """Return declared B/S/H/D strides for an aligned covering dense layout.
 
-    None means EITHER "compact, nothing to declare" (``bshd_compact``) OR "a
-    layout the kernels cannot bind zero-copy"; a caller that must tell the two
-    apart tests ``bshd_compact`` first (the epilogue gate does -- it has no
-    copy fallback). The rules describe the kernels' TMA layout requirements,
-    checked before compilation so the engine rows
-    (``engines.mismatch`` via ``config_sm107.epilogue_gate_layout_declarable``)
-    and the standalone adapter's admission and prepared binder
-    judge a layout with ONE function (rule 8b lockstep):
-
-      * the head dim is innermost-contiguous (stride 1);
-      * the batch, seq and head strides are 16-byte multiples (TMA global-stride rule;
-        the DSL floors a misaligned stride to TMA units, so a violation would mis-address);
-      * the declaration is TOKEN-MAJOR and COVERING: head >= d, seq >= h*head,
-        batch >= s*seq.  A head-major nest (a torch-contiguous ``[B, H, S, D]``:
-        seq stride d < h*head) returns None because the kernels' TMA
-        descriptors are built in BSHD order and no other nesting has been
-        validated zero-copy; an overlapping declaration returns None because
-        it would alias distinct rows onto one address (a write race on O).
-
-    ``graph_analyzer.dense_layout_ok`` is deliberately WIDER (any B/H/S stride
-    order, any alignment): that is the contract of the copy-normalising Q/K/V/O
-    path, not of a zero-copy binding.
+    Descriptor axes describe logical coordinates; their global strides need not
+    follow the same physical nesting. B/H/S may therefore be any permutation,
+    with padding, provided every stepped outer stride is 16-byte aligned.
+    Compact BSHD returns None because it needs no explicit stride declaration;
+    callers distinguish that case with ``bshd_compact``.
     """
-    b, h, s, d = (int(x) for x in shape_bhsd)
-    bs, hs, ss, es = (int(x) for x in stride_bhsd)
+    from cudnn.sdpa.layout import dense_layout_ok
+
+    if not dense_layout_ok(shape_bhsd, stride_bhsd):
+        return None
+    _b, h, s, d = (int(x) for x in shape_bhsd)
+    bs, hs, ss, es = canonical_bhsd_strides(shape_bhsd, stride_bhsd)
+    if es != 1 or any(st * elem_bytes % 16 for st in (bs, hs, ss)):
+        return None
     if (bs, ss, hs, es) == (s * h * d, h * d, d, 1):
-        return None  # compact: nothing to declare
-    if es != 1:
-        return None
-    per16 = 16 // elem_bytes
-    if ss % per16 or hs % per16 or (b > 1 and bs % per16):  # every non-innermost TMA global stride, the batch one included
-        return None
-    if hs < d or ss < h * hs or bs < s * ss:
         return None
     return (bs, ss, hs, es)
 
@@ -916,7 +913,7 @@ def canonical_bhsd_strides(shape_bhsd: tuple, stride_bhsd: tuple) -> tuple:
 @lru_cache(maxsize=256)
 def dense_bind_strides(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int) -> Optional[tuple]:
     """The ``(batch, seq, head)`` element strides a dense prefill kernel binds a logical BHSD
-    operand at zero-copy, or None when the layout needs a repack: singleton axes canonicalized,
+    operand natively, or None for an unsupported layout: singleton axes canonicalized,
     then BSHD-compact or ``bshd_zero_copy_stride``. ONE predicate for the lowering's decision to
     attach the prepared launch and for the binder's per-call admission (rule 8b lockstep).
 
@@ -924,6 +921,8 @@ def dense_bind_strides(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int) -
     device, address alignment, observed span and compiled shape envelope. The bounded
     cache retains no buffers, pointers or per-call frames."""
     st = canonical_bhsd_strides(shape_bhsd, stride_bhsd)
+    if any(stride * elem_bytes % 16 for stride in st[:3]):
+        return None
     if not (bshd_compact(shape_bhsd, st) or bshd_zero_copy_stride(shape_bhsd, st, elem_bytes) is not None):
         return None
     bs, hs, ss, _es = st

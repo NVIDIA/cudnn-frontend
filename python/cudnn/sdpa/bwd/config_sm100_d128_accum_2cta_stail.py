@@ -42,10 +42,11 @@ What the body does against the base geometry:
   "fp32_reduce"`` are not built: both decline BY NAME.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .config_sm100_d128_accum_2cta import CFG as CFG_BASE
 from .config_sm100_d128_accum_2cta import Config, resolve_diag_2cta
+from .d128_grouped_2cta_contract import STATS_KINDS, stats2_pad_total, stats2_shape_strides  # noqa: F401  (the tma_ring stats region: chain-level truth)
 
 
 @dataclass(frozen=True)
@@ -64,8 +65,8 @@ class ConfigSTail(Config):
     TMEM_MAP: str = "s_tail"  # the body's identity: the dQ image lives in S^T's dead tail (the resolution token `tmem_map=s_tail`, the record names)
     # --- the STAMPS lever (typed adapter field ``debug_clk``; header section 11): default OFF = the shipped rendering, byte-identical ---
     DEBUG_CLK_DEFAULT: bool = False
-    DBG_CLK_WORDS: int = 96  # Int32 words per CTA record = the WHOLE bar-block spare [BAR_LAYOUT_END, TMEM_HANDLE) = 384 B since the fp32_reduce row
-    # dvk_stage_empty took 16 B of it (was 100 words / 400 B at the 34-row layout); validate_config pins the exact fit, the layout uses 82 words
+    # (the record's word count is DERIVED per (roles, stats_form) as the WHOLE bar-block spare (TMEM_HANDLE - BAR_LAYOUT_END) / 4: 96 under ldg
+    # (82 used), 88 under tma_ring (84 used: + the two ring wait words) -- never a literal; ``DBG_CLK`` / ``DBG_CLK_RING`` below)
     DBG_CLK_BLOCKED_THRESH: int = 128  # a wait above this many clk really waited (a first-test pass costs ~30-60 clk of issue): the d512 bodies' value
     DBG_CLK_HIST_EDGES: tuple = (100, 400, 1600)  # clk bins of the per-tile "ship issue - ds_tmem pass" segment (bin 0 = under 100 clk)
     DBG_CLK_MAGIC: int = 0x5354414D  # "STAM": the record's first word (a decoder refuses a record without it)
@@ -77,6 +78,26 @@ class ConfigSTail(Config):
     WARP_ROLES_DEFAULT: str = "16w"
     # XCHG_BARRIER lanes: SOFTMAX_LANES 256 under 16w_fa4, EPILOGUE_LANES 128 under 16w
     SOFTMAX_LEAD_WARP: int = 0  # 16w_fa4: the softmax warp whose elected lane arms ds_recv_full and ships XCHG (FAv4's tidx 0; inspector X4)
+    # --- the STATS FORM (typed adapter field ``stats_form``; kernel header section 11): how the softmax gets the q tile's LSE / delta rows ---
+    #   "ldg" (the previous default, selectable; the form the "16w_fa4" role shape resolves to when the field is unset, the ring rows being the
+    #         16w bundle's): the softmax's per-tile `_stats` -- one LDG per lane (LSE for group 0, delta for group 1), the FMUL scale, one STS
+    #         into the single sSTATS / sDELTA slab, inside a `bar.sync SOFTMAX_BARRIER, 256` pair.
+    #   "tma_ring" (THE default since the day-4 measurement -- +1.8 / +1.9 % at the step at 16K / 32K, +1.4..+1.9 % at every served cell, +3.3 %
+    #         on the graph replay against "ldg", bitwise the same outputs; FAv4's form: the LSElog2 preprocess + a bulk copy per tile): the
+    #         chain's delta launch writes the two stat rows PRE-SCALED
+    #         (-log2(e) * LSE with the -inf -> 0 guard, -scale * delta: the SAME two fp32 multiplies the ldg softmax performs, once per q row) into a
+    #         q-tile-PADDED workspace region (pad rows 0.0 = the ldg form's `stat = 0` for a row past the sequence, bit for bit); the LOADER warp
+    #         bulk-copies ONE 1 KiB (head, q tile) record per tile into stage s of a STATS_STAGES-deep SMEM ring one tile ahead; `stats_full[s]`
+    #         (TMA_LOAD, expect_tx STATS_TX) / `stats_empty[s]` (THREAD, the 8 softmax warps) replace the LDG chain, the STS and both named-barrier
+    #         fences; `_p_values` / `_ds_values` read the stage by the same LDS.128 broadcast form.  The ring's second stage is the 1 KiB of
+    #         cap slack past today's SMEM_BYTES: the scaffold follows it (+1024, every offset derived from SLABS_END) and SMEM_BYTES == the cap.
+    STATS_FORM_DEFAULT: str = "tma_ring"  # the unset field under the default role shape (the day-4 decision; "ldg" stays selectable)
+    STATS_FORM_FA4: str = "ldg"  # the unset field under "16w_fa4": the only form sited in that bundle (a NAMED "tma_ring" there declines by name)
+    # RESOURCE-NOTE: stats ring 2 x 1 KiB @229376: stage 1 = the cap slack; SMEM_BYTES 232448 == cap, slack 0 (CFG_RING)
+    STATS_STAGES: int = 1  # ldg: ONE slab (today's sSTATS + sDELTA); the tma_ring geometry CFG_RING = replace(CFG, STATS_STAGES=2) (the ring depth)
+    SMEM_OPT_IN_CAP: int = (
+        232448  # the part's per-CTA dynamic SMEM opt-in cap (the SKU card's 232448-B figure): the tma_ring footprint fills it exactly (validate_config)
+    )
 
     @property
     def DIAG_2CTA_NAMES_ON_MAP(self):
@@ -108,10 +129,6 @@ class ConfigSTail(Config):
     @property
     def DIAG_STATS_LDS_REMOVED_PER_LANE(self):
         return self.DIAG_STATS_LDS_PER_LANE - 2 * self.QUARTERS_PER_GROUP  # 28 of 32 (-448 of 512 wavefronts per tile per CTA at 16 warps)
-
-    @property
-    def DBG_CLK_RECORD_BYTES(self):
-        return self.DBG_CLK_WORDS * 4  # Int32 words
 
     @property
     def MASK_FORMS(self):
@@ -253,8 +270,104 @@ class ConfigSTail(Config):
     def TMEM_DEAD_COL(self):
         return self.DS_COL + self.PACK_COLS  # 192: [TMEM_DEAD_COL, DV_COL) is DEAD (was the first body's dQ image)
 
+    # --- the STATS FORM (header section 11): the typed domain, the stats ring's bytes and roots (the slab chain), the padded stats region ---
+    @property
+    def STATS_FORMS(self):
+        return ("ldg", "tma_ring")  # ldg = the previous rendering (selectable); tma_ring = the loader-fed SMEM stats ring, the default (bitwise the same stats)
+
+    @property
+    def STATS_FORM_DEFAULT_BY_ROLES(self):
+        """The form an UNSET ``stats_form`` resolves to per role shape: ``STATS_FORM_DEFAULT`` under the default roles, ``STATS_FORM_FA4`` under
+        "16w_fa4" (the ring's two barrier rows are sited in the 16w bundle only)."""
+        return {self.WARP_ROLES_DEFAULT: self.STATS_FORM_DEFAULT, "16w_fa4": self.STATS_FORM_FA4}
+
+    @property
+    def STATS_STAGE_BYTES(self):
+        return self.STATS_BYTES + self.DELTA_BYTES  # 1024: one ring stage = the LSE row (512 B) then the delta row (512 B) of one q tile
+
+    @property
+    def STATS_DELTA_OFF(self):
+        return self.STATS_BYTES  # 512: the delta row's offset inside a stage (= today's DELTA - STATS)
+
+    @property
+    def STATS_TX(self):
+        # RESOURCE-NOTE: STATS_TX 1024 = ONE expect_tx per stage; 1 (or 2) cp.async.bulk name the same mbar
+        return self.STATS_STAGE_BYTES  # 1024: the ONE bulk copy of a (head, q tile) record lands on THIS CTA's stats_full[s] (x 1, never routed)
+
+    @property
+    def STATS_RING(self):
+        return self.STATS  # 229376: stage 0 = today's sSTATS + sDELTA bytes; stage s = STATS_RING + s * STATS_STAGE_BYTES
+
+    @property
+    def STATS_RING_BYTES(self):
+        return self.STATS_STAGES * self.STATS_STAGE_BYTES  # 1024 (ldg: the one slab) / 2048 (tma_ring)
+
+    @property
+    def SLABS_END(self):
+        # RESOURCE-NOTE: BARS = SLABS_END 231424 under tma_ring: bar rows re-based +1024; layout = f(roles, form)
+        return self.STATS_RING + self.STATS_RING_BYTES  # 230400 (ldg, == the base chain) / 231424 (tma_ring: stage 1 took the cap slack)
+
+    def stats_stage(self, stage):
+        """Byte base of ring stage ``stage`` (0 .. STATS_STAGES - 1): the LSE row at +0, the delta row at +STATS_DELTA_OFF."""
+        return self.STATS_RING + stage * self.STATS_STAGE_BYTES
+
+    def stats_lse(self, stage):
+        return self.stats_stage(stage)
+
+    def stats_delta(self, stage):
+        return self.stats_stage(stage) + self.STATS_DELTA_OFF
+
+    @property
+    def STATS_KINDS(self):
+        return STATS_KINDS  # 2: the LSE row and the delta row of one (head, q tile) record of the padded stats region (the contract's truth)
+
+    @property
+    def STATS_RECORD_BYTES(self):
+        return self.STATS_KINDS * self.N * self.BPE_ACC  # 1024: one (head, q tile) record of the padded region = one SMEM ring stage image
+
+    @property
+    def STATS_PAD_GRAN(self):
+        return self.N  # 128: every sequence's stat rows are padded to a whole q tile (write_thd_row_offsets gran); pad rows hold 0.0
+
 
 CFG = ConfigSTail()
+# The tma_ring geometry: the SAME record with the ring depth 2 -> SLABS_END 231424, SMEM_BYTES 232448 (== the cap), BARS / TMEM_HANDLE /
+# SCHED_PAYLOAD re-based +1024 by derivation; every other property equal (validate_config asserts the equality field by field).
+CFG_RING = replace(CFG, STATS_STAGES=2)
+
+
+# The stats form's kernel code space (``Constexpr[int]`` ``stats_form_code``; the body names STATS_FORM_LDG / STATS_FORM_TMA_RING from these).
+STATS_FORM_CODES = {"ldg": 0, "tma_ring": 1}
+
+
+def resolve_stats_form(name=None, roles=None):
+    """The softmax's STATS FORM, typed: ``None`` -> the form the (resolved) role shape renders when the field is unset
+    (``CFG.STATS_FORM_DEFAULT_BY_ROLES``: "tma_ring" under the default roles, "ldg" under "16w_fa4" -- the only form sited in that bundle;
+    ``roles`` None = the default role shape); a name outside ``CFG.STATS_FORMS`` is a ``ValueError`` BY NAME.  Both values compute the same
+    function (bitwise LSE / delta words: header section 2); a NAMED "tma_ring" under "16w_fa4" declines by name in validate_fields_for_roles."""
+    if name is None:
+        shape = CFG.WARP_ROLES_DEFAULT if roles is None else roles
+        if shape not in CFG.STATS_FORM_DEFAULT_BY_ROLES:
+            raise ValueError(f"warp_roles must be one of {CFG.WARP_ROLES}; got {roles!r}")
+        form = CFG.STATS_FORM_DEFAULT_BY_ROLES[shape]
+    else:
+        form = name
+    if type(form) is not str or form not in CFG.STATS_FORMS:
+        raise ValueError(f"stats_form must be one of {CFG.STATS_FORMS}; got {form!r}")
+    return form
+
+
+def stats_form_code(name=None, roles=None):
+    """The body's ``stats_form_code`` Constexpr[int] for a (resolved) form name (``STATS_FORM_CODES``; 0 = ldg, 1 = tma_ring); ``None`` resolves
+    per role shape; declines exactly as :func:`resolve_stats_form`."""
+    return STATS_FORM_CODES[resolve_stats_form(name, roles)]
+
+
+def cfg_for_stats_form(name=None, roles=None):
+    """The geometry record a (resolved or ``None``) stats form renders with: ``CFG`` (ldg: one stats slab, the merged scaffold) or ``CFG_RING``
+    (tma_ring: the two-stage ring, the scaffold re-based +1024, SMEM_BYTES == the cap).  Every property the two records share is equal
+    (validate_config); the body reads the form-dependent ones (SMEM_BYTES, BARS, TMEM_HANDLE, SCHED_PAYLOAD, the ring bases) through this."""
+    return CFG_RING if resolve_stats_form(name, roles) == "tma_ring" else CFG
 
 
 # The mask form's kernel code space (``Constexpr[int]`` ``mask_form_code``; the body names MASK_FORM_FSEL / _PREDICATED / _DIAG_OFF from these).
@@ -320,19 +433,29 @@ def warp_roles_code(name=None):
     return WARP_ROLES_CODES[resolve_warp_roles(name)]
 
 
-def validate_fields_for_roles(roles, diag_2cta=None, debug_clk=False, dkv_accum=None):
+def validate_fields_for_roles(roles, diag_2cta=None, debug_clk=False, dkv_accum=None, stats_form=None):
     """The field bundle a (resolved) role shape SERVES, typed BY NAME: under ``16w_fa4`` the STAMPS lever ``debug_clk`` (its record layout names
-    the 16w roles' waits) and ``dkv_accum = "fp32_reduce"`` (its fp32 dK / dV staging rounds live in the 16w epilogue loop) are not built and
-    decline; every ``diag_2cta`` probe of ``CFG.DIAG_2CTA_NAMES`` serves both shapes.  Called by ``compile_host`` before any trace; returns ``roles``."""
+    the 16w roles' waits), ``dkv_accum = "fp32_reduce"`` (its fp32 dK / dV staging rounds live in the 16w epilogue loop) and ``stats_form =
+    "tma_ring"`` NAMED (the stats ring's two rows are the 16w bundle's; the first build of the ring is sited under the 16w roles only -- an UNSET
+    ``stats_form`` resolves to "ldg" there) are not built and decline; every ``diag_2cta`` probe of ``CFG.DIAG_2CTA_NAMES`` serves both shapes;
+    ``stats_form = "tma_ring"`` x ``debug_clk`` is SERVED (the record derives its 88 words from the re-based spare and carries the two ring wait
+    words).  Called by ``compile_host`` before any trace; returns ``roles``."""
     if roles not in CFG.WARP_ROLES:
         raise ValueError(f"warp_roles must be one of {CFG.WARP_ROLES}; got {roles!r}")
     resolve_diag_2cta(diag_2cta)
+    form = resolve_stats_form(stats_form, roles)
     if roles == CFG.WARP_ROLES_DEFAULT:
         return roles
     if debug_clk:  # the STAMPS record layout (DBG_CLK.ROLE_WAITS / WORD) is the 16w roles'
         raise ValueError(
             f"debug_clk is not defined under warp_roles {roles!r} (the STAMPS record layout names the 16w roles' waits: no words for the softmax's "
             f"dq_war_done wait or the reduce group); choose warp_roles {CFG.WARP_ROLES_DEFAULT!r}"
+        )
+    if form != CFG.STATS_FORM_FA4:  # the stats ring rows live in the 16w bundle only (the first build; the inspector's table rules a 16w_fa4 merge)
+        raise ValueError(
+            f"stats_form {form!r} is not built under warp_roles {roles!r} (the stats ring's stats_full / stats_empty rows and the softmax's ring "
+            f"waits are sited in the 16w bundle; the 16w_fa4 softmax keeps the ldg form); choose warp_roles {CFG.WARP_ROLES_DEFAULT!r} or "
+            f"stats_form {CFG.STATS_FORM_FA4!r}"
         )
     from .d128_grouped_contract import DKV_ACCUM_DEFAULT, resolve_dkv_accum  # local: the contract module is the field's truth, the config stays light
 
@@ -402,7 +525,40 @@ BAR_LAYOUT = (
     # user under the default rendering, which stays byte-identical); AUDIT owed with the the alternate role shape AUDIT
     ("dvk_stage_empty", 230944, 1, CFG.STORE_LANES, "thread", "LOCAL"),
 )
-BAR_LAYOUT_END = 230960  # next free byte of the bar block (384 B of the 944 spare); 35 names / 40 slots, 560 B
+BAR_LAYOUT_END = 230960  # next free byte of the bar block (384 B of the 944 spare); 35 names / 40 slots, 560 B (ldg: the audited table verbatim)
+# --- stats_form = tma_ring (the barrier audit's S1 skeleton 2026-10-27 17:30 + its 17:46 reconciliation, resources/s1-barrier-table.md sections 1 and 14;
+# the resource-manager's slab plan s1-stats-ring.md section 1): the 35 rows above RE-BASED onto CFG_RING.BARS (= SLABS_END 231424: stage 1 of the ring
+# took the 1 KiB the scaffold sat on), then the ring's two rows appended -- 37 names / 44 slots / 592 B, END 232016; the STAMPS record = the spare
+# [232016, 232368) = 88 words.  Derived, never pasted twice: the ldg table is the truth, the re-base is arithmetic (validate_config pins both).
+#   stats_full[2]   TMA_LOAD / LOCAL (kind "tma" = the sched_full kind), init ONE_LANE: the loader's `arrive(n_bytes=STATS_TX, pred=elect_sync())`
+#                   on BOTH CTAs (never is_leader: a plain bulk copy lands on the issuing CTA) + ONE `bulk_copy` of the (head, q tile) record into
+#                   stage s; waited by the 8 softmax warps (stats_state st(0), +1 per tile) after the s_read arrive, before _p_values
+#   stats_empty[2]  THREAD / LOCAL, init SOFTMAX_LANES: the 8 softmax warps bare `.arrive()` right after _ds_values (the tile's last stats read);
+#                   waited by the loader (stats_ld st(1) PRE-ARMED, +1 per tile: wait k <-> release k - 2) before the arm; no bootstrap, no drain
+STATS_RING_ROWS = (
+    ("stats_full", 2, CFG.ONE_LANE, "tma", "LOCAL"),
+    ("stats_empty", 2, CFG.SOFTMAX_LANES, "thread", "LOCAL"),
+)
+
+
+def _rebase_layout(layout, base):
+    """The audited table's rows at ``base + 16 i`` (declaration order, 16 B per row): the ldg table at CFG.BARS is the identity."""
+    return tuple((name, base + 16 * i, slots, count, kind, scope) for i, (name, _off, slots, count, kind, scope) in enumerate(layout))
+
+
+def _ring_layout(layout, base):
+    rows = _rebase_layout(layout, base)
+    return rows + tuple((name, base + 16 * (len(rows) + j), slots, count, kind, scope) for j, (name, slots, count, kind, scope) in enumerate(STATS_RING_ROWS))
+
+
+BAR_LAYOUT_RING = _ring_layout(BAR_LAYOUT, CFG_RING.BARS)
+BAR_LAYOUT_RING_END = CFG_RING.BARS + 16 * len(BAR_LAYOUT_RING)  # 232016
+BAR_KIND_COUNTS_RING = {"tma_leader": 7, "mma": 9, "thread": 10, "leader": 6, "peer": 2, "tma_dsmem": 1, "tma": 2}  # 37
+BAR_LAYOUT_RING_STATUS = (
+    "SKELETON by the barrier audit (S1 2026-10-27 17:30 + the 17:46 reconciliation with the bulk-copy form): the 35 ldg rows re-based onto "
+    "CFG_RING.BARS + stats_full[2] (TMA_LOAD / LOCAL, ONE_LANE, expect_tx STATS_TX) + stats_empty[2] (THREAD / LOCAL, SOFTMAX_LANES); AUDIT of the "
+    "committed body owed"
+)
 BAR_LAYOUT_STATUS = (
     "FILLED by the barrier audit (SKELETON, ARM (ii), the audit record sections 1-10): 34 names / 39 slots; "
     "NEW s_read (512) + s_tail_empty (256), dp_empty arrive MOVED to the dS^T readout, xchg_state split (P2), q1 ring 1 stage, dq rings 2 slots "
@@ -473,6 +629,11 @@ DBG_CLK_SEGMENTS = (
 )
 
 
+# The stats ring's two wait words (stats_form = tma_ring; the barrier audit S1-12): appended AFTER the segments so every ldg word keeps its index
+# (the ldg x debug_clk rendering is unchanged); unused (never written) under ldg, where no site waits either barrier.
+DBG_CLK_RING_WAITS = (("softmax", "stats_full"), ("loader", "stats_empty"))
+
+
 def _dbg_clk_layout():
     names = list(DBG_CLK_HEADER)
     names += [f"wait:leader:{b}" for b in DBG_CLK_ROLE_WAITS["leader"]]
@@ -480,6 +641,7 @@ def _dbg_clk_layout():
     for role in ("softmax", "epilogue", "follower", "loader", "store"):
         names += [f"wait:{role}:{b}" for b in DBG_CLK_ROLE_WAITS[role]]
     names += list(DBG_CLK_SEGMENTS)
+    names += [f"wait:{role}:{b}" for role, b in DBG_CLK_RING_WAITS]
     return {name: index for index, name in enumerate(names)}
 
 
@@ -508,23 +670,38 @@ class DbgClk:
     SEGMENTS: tuple
 
 
-DBG_CLK = DbgClk(
-    SMEM=BAR_LAYOUT_END,
-    WORDS=CFG.DBG_CLK_WORDS,
-    BYTES=CFG.DBG_CLK_RECORD_BYTES,
-    MAGIC=CFG.DBG_CLK_MAGIC,
-    BLOCKED_THRESH=CFG.DBG_CLK_BLOCKED_THRESH,
-    HIST_EDGES=CFG.DBG_CLK_HIST_EDGES,
-    LEADER_BLOCKED_STRIDE=len(DBG_CLK_ROLE_WAITS["leader"]),
-    RECORD_ALIGN=CFG.DBG_CLK_RECORD_ALIGN,
-    TAG_BACK_IN_TILE=2,
-    TAG_BACK_TAIL=1,
-    TAG_BACK_RELAY=1,
-    WORD=_dbg_clk_layout(),
-    ROLE_WAITS=DBG_CLK_ROLE_WAITS,
-    HEADER=DBG_CLK_HEADER,
-    SEGMENTS=DBG_CLK_SEGMENTS,
-)
+def _dbg_clk(layout_end, tmem_handle):
+    """The STAMPS record of one (roles, stats_form) geometry: it IS the bar block's spare [layout_end, tmem_handle) -- SMEM = the layout's END,
+    WORDS = the spare / 4 (DERIVED: 96 under ldg, 88 under tma_ring), the same word map for every geometry."""
+    words = (tmem_handle - layout_end) // 4
+    return DbgClk(
+        SMEM=layout_end,
+        WORDS=words,
+        BYTES=words * 4,
+        MAGIC=CFG.DBG_CLK_MAGIC,
+        BLOCKED_THRESH=CFG.DBG_CLK_BLOCKED_THRESH,
+        HIST_EDGES=CFG.DBG_CLK_HIST_EDGES,
+        LEADER_BLOCKED_STRIDE=len(DBG_CLK_ROLE_WAITS["leader"]),
+        RECORD_ALIGN=CFG.DBG_CLK_RECORD_ALIGN,
+        TAG_BACK_IN_TILE=2,
+        TAG_BACK_TAIL=1,
+        TAG_BACK_RELAY=1,
+        WORD=_dbg_clk_layout(),
+        ROLE_WAITS=DBG_CLK_ROLE_WAITS,
+        HEADER=DBG_CLK_HEADER,
+        SEGMENTS=DBG_CLK_SEGMENTS,
+    )
+
+
+DBG_CLK = _dbg_clk(BAR_LAYOUT_END, CFG.TMEM_HANDLE)  # ldg (16w): [230960, 231344) = 96 words, 82 used
+# RESOURCE-NOTE: STAMPS record = (TMEM_HANDLE - BAR_LAYOUT_END) / 4 = 88 words under tma_ring: derive it
+DBG_CLK_RING = _dbg_clk(BAR_LAYOUT_RING_END, CFG_RING.TMEM_HANDLE)  # tma_ring (16w): [232016, 232368) = 88 words, 84 used
+
+
+def dbg_clk_for_stats_form(name=None, roles=None):
+    """The STAMPS record a (resolved or ``None``) stats form renders with: ``DBG_CLK`` (ldg) or ``DBG_CLK_RING`` (tma_ring; the same word map);
+    ``None`` resolves per role shape."""
+    return DBG_CLK_RING if resolve_stats_form(name, roles) == "tma_ring" else DBG_CLK
 
 
 def dbg_clk_records(n_batch, nheads, max_skv):
@@ -537,8 +714,8 @@ def dbg_clk_records(n_batch, nheads, max_skv):
     return max((max_skv + CFG.THD_UNIT_ROWS - 1) // CFG.THD_UNIT_ROWS, 1) * CFG.CGA_M * nheads * n_batch
 
 
-def dbg_clk_bytes(n_batch, nheads, max_skv):
-    return dbg_clk_records(n_batch, nheads, max_skv) * DBG_CLK.BYTES
+def dbg_clk_bytes(n_batch, nheads, max_skv, stats_form=None):
+    return dbg_clk_records(n_batch, nheads, max_skv) * dbg_clk_for_stats_form(stats_form).BYTES
 
 
 def dbg_clk_region_offset(regions_end):
@@ -634,17 +811,28 @@ BAR_LAYOUT_XFA4_STATUS = (
 )
 
 
-def bar_layout_for_roles(roles):
-    """The barrier table a (resolved) role shape renders with: the audited 34-row ``BAR_LAYOUT`` (``16w``) or the audit's 32-row ``BAR_LAYOUT_XFA4``."""
-    return {"16w": BAR_LAYOUT, "16w_fa4": BAR_LAYOUT_XFA4}[roles]
+def bar_layout_for_roles(roles, stats_form=None):
+    """The barrier table a (resolved) role shape renders with under a stats form (``None`` = the form the shape renders when the field is unset:
+    tma_ring under 16w, ldg under 16w_fa4): the audited 35-row ``BAR_LAYOUT`` (``16w`` x ldg) or the audit's 33-row ``BAR_LAYOUT_XFA4``; under
+    ``tma_ring`` the rows re-based onto CFG_RING.BARS + the stats ring's two rows (the 16w_fa4 x tma_ring table is derived for completeness: the
+    combination declines by name in validate_fields_for_roles until the lift)."""
+    base = {"16w": BAR_LAYOUT, "16w_fa4": BAR_LAYOUT_XFA4}[roles]
+    if resolve_stats_form(stats_form, roles) == "ldg":  # the base tables are the ldg layouts (the merged rendering's)
+        return base
+    return BAR_LAYOUT_RING if roles == "16w" else _ring_layout(base, CFG_RING.BARS)
 
 
-def bar_layout_end_for_roles(roles):
-    return {"16w": BAR_LAYOUT_END, "16w_fa4": BAR_LAYOUT_XFA4_END}[roles]
+def bar_layout_end_for_roles(roles, stats_form=None):
+    layout = bar_layout_for_roles(roles, stats_form)
+    return layout[-1][1] + 16
 
 
-def bar_kind_counts_for_roles(roles):
-    return {"16w": BAR_KIND_COUNTS, "16w_fa4": BAR_KIND_COUNTS_XFA4}[roles]
+def bar_kind_counts_for_roles(roles, stats_form=None):
+    counts = dict({"16w": BAR_KIND_COUNTS, "16w_fa4": BAR_KIND_COUNTS_XFA4}[roles])
+    if resolve_stats_form(stats_form, roles) != "ldg":
+        for _name, _slots, _count, kind, _scope in STATS_RING_ROWS:
+            counts[kind] = counts.get(kind, 0) + 1
+    return counts
 
 
 def validate_config():
@@ -737,7 +925,7 @@ def validate_config():
         else:
             raise AssertionError((bad_flag, "debug_clk must decline by name"))
     d = DBG_CLK
-    assert d.SMEM == BAR_LAYOUT_END == 230960 and d.WORDS == 96 and d.BYTES == 384 and d.SMEM % 16 == 0
+    assert d.SMEM == BAR_LAYOUT_END == 230960 and d.WORDS == 96 and d.BYTES == 384 and d.SMEM % 16 == 0  # derived: the ldg spare (82 words used)
     assert d.SMEM + d.BYTES == c.TMEM_HANDLE and d.BYTES == c.TMEM_HANDLE - BAR_LAYOUT_END  # the record IS the spare: no byte past it, none left
     assert len(d.WORD) <= d.WORDS and sorted(d.WORD.values()) == list(range(len(d.WORD))) and d.MAGIC == c.DBG_CLK_MAGIC != 0
     assert d.BLOCKED_THRESH == 128 and d.HIST_EDGES == (100, 400, 1600) == tuple(sorted(d.HIST_EDGES)) and d.RECORD_ALIGN == 256
@@ -748,12 +936,15 @@ def validate_config():
     for b in d.ROLE_WAITS["leader"]:
         assert d.WORD[f"blocked:leader:{b}"] - d.WORD[f"wait:leader:{b}"] == d.LEADER_BLOCKED_STRIDE == 17, b
     assert [d.WORD[n] for n in d.HEADER] == list(range(len(d.HEADER))) and d.HEADER[0] == "magic" and len(d.SEGMENTS) == 18
-    assert set(d.ROLE_WAITS) == {"leader", "softmax", "epilogue", "follower", "loader", "store"} and len(d.WORD) == 82
+    assert set(d.ROLE_WAITS) == {"leader", "softmax", "epilogue", "follower", "loader", "store"} and len(d.WORD) == 84  # 82 ldg words + the 2 ring words
+    assert DBG_CLK_RING_WAITS == (("softmax", "stats_full"), ("loader", "stats_empty"))
+    assert [d.WORD[f"wait:{r}:{b}"] for r, b in DBG_CLK_RING_WAITS] == [82, 83]  # appended AFTER every ldg word: the ldg x debug_clk rendering is unchanged
     assert (d.TAG_BACK_IN_TILE, d.TAG_BACK_TAIL, d.TAG_BACK_RELAY) == (2, 1, 1)  # the handshake's tag arithmetic (DbgClk's comment)
     assert (
         dbg_clk_records(1, 1, 1) == c.CGA_M == 2
         and dbg_clk_records(4, 32, 16384) == 64 * 2 * 32 * 4
-        and dbg_clk_bytes(1, 1, 256) == 2 * c.DBG_CLK_RECORD_BYTES == 2 * 384
+        and dbg_clk_bytes(1, 1, 256, "ldg") == 2 * DBG_CLK.BYTES == 2 * 384
+        and dbg_clk_bytes(1, 1, 256) == dbg_clk_bytes(1, 1, 256, "tma_ring") == 2 * DBG_CLK_RING.BYTES == 2 * 352  # the default form's record
     )
     assert dbg_clk_region_offset(0) == 0 and dbg_clk_region_offset(1) == 256 and dbg_clk_region_offset(256) == 256 and dbg_clk_region_offset(257) == 512
     for bad in ((0, 1, 1), (1, -1, 1), (1, 1, 0), (1.0, 1, 1)):
@@ -782,6 +973,113 @@ def validate_config():
     assert c.MASK_WORD_COLS == 32 == c.GROUP_QUARTER and c.QUARTERS_PER_GROUP == 2 and c.SOFTMAX_GROUPS == 2
     assert c.MASK_SELECTS_PER_LANE_PER_TILE == 64 == c.QUARTERS_PER_GROUP * c.GROUP_QUARTER and c.MASK_WORDS_PER_LANE_PER_TILE == 2
     assert c.MASK_SELECTS_PER_LANE_PER_TILE * c.SOFTMAX_GROUPS == c.N and c.MASK_SELECTS_PER_LANE_PER_TILE * c.SOFTMAX_LANES == c.M * c.N
+    # --- the STATS FORM (typed; the default is the tma_ring rendering under the default roles, ldg under 16w_fa4): the domain, the ring's bytes /
+    # roots / depth per geometry, the padded stats region, the two geometries' equality on everything else, the declines ---
+    assert c.STATS_FORMS == ("ldg", "tma_ring") and c.STATS_FORM_DEFAULT == "tma_ring" == c.STATS_FORMS[1] and tuple(STATS_FORM_CODES) == c.STATS_FORMS
+    assert c.STATS_FORM_FA4 == "ldg" == c.STATS_FORMS[0] and c.STATS_FORM_DEFAULT_BY_ROLES == {"16w": "tma_ring", "16w_fa4": "ldg"}
+    assert set(c.STATS_FORM_DEFAULT_BY_ROLES) == set(c.WARP_ROLES) and STATS_FORM_CODES == {"ldg": 0, "tma_ring": 1}
+    assert resolve_stats_form(None) == "tma_ring" == resolve_stats_form("tma_ring") == resolve_stats_form(None, "16w")
+    assert resolve_stats_form("ldg") == "ldg" == resolve_stats_form(None, "16w_fa4") == resolve_stats_form("ldg", "16w")
+    assert (stats_form_code(None), stats_form_code("ldg"), stats_form_code("tma_ring"), stats_form_code(None, "16w_fa4")) == (1, 0, 1, 0)
+    try:
+        resolve_stats_form(None, "bogus")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unknown role shape must decline the unset stats form by name")
+    for bad_stats in ("bogus", "", 1, "LDG", "tma"):
+        try:
+            resolve_stats_form(bad_stats)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(bad_stats)
+    assert cfg_for_stats_form(None) is cfg_for_stats_form("tma_ring") is CFG_RING and cfg_for_stats_form("ldg") is cfg_for_stats_form(None, "16w_fa4") is CFG
+    r = CFG_RING
+    assert (c.STATS_STAGES, r.STATS_STAGES) == (
+        1,
+        2,
+    ) and c.STATS_STAGE_BYTES == r.STATS_STAGE_BYTES == c.STATS_BYTES + c.DELTA_BYTES == 1024 == c.STATS_TX == r.STATS_TX
+    assert c.STATS_DELTA_OFF == r.STATS_DELTA_OFF == c.STATS_BYTES == 512 == c.DELTA - c.STATS and c.STATS_RING == r.STATS_RING == c.STATS == 229376
+    assert (c.STATS_RING_BYTES, r.STATS_RING_BYTES) == (1024, 2048) and c.STATS_RING_BYTES == c.STATS_BYTES + c.DELTA_BYTES  # ldg: the one slab as today
+    # the ldg geometry IS the base chain's (every scaffold offset unchanged: the ldg rendering stays byte-identical to the merged one)
+    assert (c.SLABS_END, c.SMEM_BYTES, c.BARS, c.TMEM_HANDLE, c.SCHED_PAYLOAD) == (230400, 231424, 230400, 231344, 231360)
+    # the tma_ring geometry: stage 1 = the 1 KiB the scaffold sat on; the scaffold follows by derivation; the footprint is exactly the cap
+    assert (r.SLABS_END, r.SMEM_BYTES, r.BARS, r.TMEM_HANDLE, r.SCHED_PAYLOAD, r.BAR_BLOCK_BYTES) == (231424, 232448, 231424, 232368, 232384, 944)
+    assert r.SMEM_BYTES == c.SMEM_OPT_IN_CAP == 232448 and r.SMEM_BYTES == c.SMEM_BYTES + c.STATS_STAGE_BYTES and r.SLABS_END == c.SMEM_BYTES
+    stages = [r.stats_stage(st) for st in range(r.STATS_STAGES)]
+    assert stages == [229376, 230400] and all(st % 1024 == 0 for st in stages) and stages[1] == c.SLABS_END  # stage 1 begins where the ldg slabs end
+    assert [r.stats_lse(st) for st in range(r.STATS_STAGES)] == stages and [r.stats_delta(st) for st in range(r.STATS_STAGES)] == [st + 512 for st in stages]
+    assert (r.stats_lse(0), r.stats_delta(0), c.stats_lse(0), c.stats_delta(0)) == (c.STATS, c.DELTA, c.STATS, c.DELTA)  # stage 0 = today's slab, both forms
+    assert stages[-1] + r.STATS_STAGE_BYTES == r.SLABS_END == r.BARS  # the ring ends where the re-based bar block begins: no gap, no overlap
+    # every property but the ring depth and the scaffold chain is equal between the two geometries (the body reads them through CFG)
+    moved = {"STATS_STAGES", "STATS_RING_BYTES", "SLABS_END", "SMEM_BYTES", "BARS", "TMEM_HANDLE", "SCHED_PAYLOAD"}
+    props = [n for n in dir(type(c)) if not n.startswith("_") and isinstance(getattr(type(c), n), property)]
+    assert moved <= set(props) | set(type(c).__dataclass_fields__), moved - (set(props) | set(type(c).__dataclass_fields__))
+    for n in props:
+        if n not in moved:
+            assert getattr(c, n) == getattr(r, n), n
+    for n in type(c).__dataclass_fields__:
+        if n not in moved:
+            assert getattr(c, n) == getattr(r, n), n
+    # the padded pre-scaled stats region (the contract's truth; one (head, q tile) record = one ring stage image)
+    assert c.STATS_KINDS == STATS_KINDS == 2 and c.STATS_RECORD_BYTES == 2 * c.N * c.BPE_ACC == 1024 == c.STATS_STAGE_BYTES and c.STATS_PAD_GRAN == c.N == 128
+    assert stats2_pad_total(4, 16384) == 16384 + 4 * 128 and stats2_pad_total(1, 128) == 256
+    shape, strides = stats2_shape_strides(32, stats2_pad_total(4, 16384))
+    assert shape == (32, (16384 + 512) // 128, 2, 128) and strides == (shape[1] * 256, 256, 128, 1)
+    for b, lens in ((3, (129, 0, 127)), (4, (1, 1, 1, 1)), (2, (16384, 16384)), (5, (300, 128, 1000, 0, 257))):
+        tq = sum(lens)
+        rounded_q = (tq + 127) // 128 * 128
+        assert sum((n + 127) // 128 * 128 for n in lens) <= stats2_pad_total(b, rounded_q), (b, lens)  # PAD_TOTAL bounds every sequence's padded block
+    # the declines: tma_ring x 16w_fa4 by name; tma_ring passes under 16w with every other field at its default, and WITH debug_clk (the record re-plan)
+    assert validate_fields_for_roles("16w", None, stats_form="tma_ring") == "16w" and validate_fields_for_roles("16w", None, stats_form="ldg") == "16w"
+    assert validate_fields_for_roles("16w", None, debug_clk=True, stats_form="tma_ring") == "16w"
+    assert validate_fields_for_roles("16w_fa4", None, stats_form="ldg") == "16w_fa4"
+    assert validate_fields_for_roles("16w_fa4") == "16w_fa4" and validate_fields_for_roles("16w") == "16w"  # unset: ldg under 16w_fa4, tma_ring under 16w
+    try:
+        validate_fields_for_roles("16w_fa4", None, stats_form="tma_ring")
+    except ValueError as error:
+        assert "stats_form 'tma_ring' is not built under warp_roles '16w_fa4'" in str(error), str(error)
+    else:
+        raise AssertionError("tma_ring must decline by name under 16w_fa4 (the first build)")
+    # the ring barrier table: the ldg rows re-based onto CFG_RING.BARS + the two ring rows; END 232016; the record = the spare (88 words, 84 used)
+    assert STATS_RING_ROWS == (("stats_full", 2, c.ONE_LANE, "tma", "LOCAL"), ("stats_empty", 2, c.SOFTMAX_LANES, "thread", "LOCAL"))
+    assert len(BAR_LAYOUT_RING) == 37 and sum(row[2] for row in BAR_LAYOUT_RING) == 44 and BAR_LAYOUT_RING_END == 232016 == r.BARS + 16 * 37
+    assert BAR_LAYOUT_RING[:35] == tuple((n, off + r.BARS - c.BARS, sl, cnt, k, sc) for n, off, sl, cnt, k, sc in BAR_LAYOUT)  # the re-base = +1024 per row
+    assert [row[:1] + row[2:] for row in BAR_LAYOUT_RING[35:]] == [(n, sl, cnt, k, sc) for n, sl, cnt, k, sc in STATS_RING_ROWS]
+    assert (BAR_LAYOUT_RING[35][1], BAR_LAYOUT_RING[36][1]) == (231984, 232000) and BAR_LAYOUT_RING_STATUS.startswith("SKELETON")
+    assert (
+        BAR_KIND_COUNTS_RING == {"tma_leader": 7, "mma": 9, "thread": 10, "leader": 6, "peer": 2, "tma_dsmem": 1, "tma": 2}
+        and sum(BAR_KIND_COUNTS_RING.values()) == 37
+    )
+    ring_addresses = set()
+    for name, offset, slots_n, count, kind, scope in BAR_LAYOUT_RING:
+        for i in range(slots_n):
+            address = offset + i * 8
+            assert r.BARS <= address and address + 8 <= r.TMEM_HANDLE and address not in ring_addresses, name
+            ring_addresses.add(address)
+    assert (
+        bar_layout_for_roles("16w", "tma_ring") is BAR_LAYOUT_RING
+        and bar_layout_for_roles("16w", None) is BAR_LAYOUT_RING  # unset under 16w = the default form's table
+        and bar_layout_for_roles("16w", "ldg") is BAR_LAYOUT
+        and bar_layout_for_roles("16w_fa4", None) is BAR_LAYOUT_XFA4  # unset under 16w_fa4 = the ldg table
+    )
+    assert (
+        bar_layout_end_for_roles("16w", "tma_ring") == BAR_LAYOUT_RING_END == bar_layout_end_for_roles("16w")
+        and bar_layout_end_for_roles("16w", "ldg") == BAR_LAYOUT_END
+    )
+    assert (
+        bar_kind_counts_for_roles("16w", "tma_ring") == BAR_KIND_COUNTS_RING == bar_kind_counts_for_roles("16w")
+        and bar_kind_counts_for_roles("16w", "ldg") == BAR_KIND_COUNTS
+    )
+    fa4_ring = bar_layout_for_roles("16w_fa4", "tma_ring")  # derived for completeness (the combination declines by name): 35 names / 42 slots, END 231984
+    assert (
+        len(fa4_ring) == 35 and sum(row[2] for row in fa4_ring) == 42 and bar_layout_end_for_roles("16w_fa4", "tma_ring") == 231984 and fa4_ring[0][1] == r.BARS
+    )
+    dr = DBG_CLK_RING
+    assert dr.SMEM == BAR_LAYOUT_RING_END == 232016 and dr.WORDS == 88 and dr.BYTES == 352 and dr.SMEM + dr.BYTES == r.TMEM_HANDLE and dr.SMEM % 16 == 0
+    assert dr.WORD == DBG_CLK.WORD and len(dr.WORD) == 84 <= dr.WORDS and dr.MAGIC == DBG_CLK.MAGIC and dbg_clk_for_stats_form("tma_ring") is dr
+    assert dbg_clk_for_stats_form(None) is DBG_CLK_RING and dbg_clk_for_stats_form("ldg") is DBG_CLK is dbg_clk_for_stats_form(None, "16w_fa4")
     # BAR_LAYOUT: 34 names / 39 slots, 16-B rows, contiguous from BARS, disjoint, inside [BARS, TMEM_HANDLE); counts by kind; scope by kind
     assert BAR_LAYOUT_STATUS.startswith("FILLED") and len(BAR_LAYOUT) == 35 and sum(row[2] for row in BAR_LAYOUT) == 40
     expected_counts = dict(
@@ -912,9 +1210,13 @@ def validate_config():
     assert [n for n in names if n not in DELETED_BARRIERS_XFA4 and n not in UNSERVED_BARRIERS_XFA4] + list(ADDED_BARRIERS_XFA4) == [
         row[0] for row in BAR_LAYOUT_XFA4
     ]  # 32 kept in order + the new row
-    assert bar_layout_for_roles("16w") is BAR_LAYOUT and bar_layout_for_roles("16w_fa4") is BAR_LAYOUT_XFA4
-    assert (bar_layout_end_for_roles("16w"), bar_layout_end_for_roles("16w_fa4")) == (BAR_LAYOUT_END, BAR_LAYOUT_XFA4_END)
-    assert (bar_kind_counts_for_roles("16w"), bar_kind_counts_for_roles("16w_fa4")) == (BAR_KIND_COUNTS, BAR_KIND_COUNTS_XFA4)
+    assert (
+        bar_layout_for_roles("16w", "ldg") is BAR_LAYOUT
+        and bar_layout_for_roles("16w_fa4") is BAR_LAYOUT_XFA4
+        and bar_layout_for_roles("16w_fa4", "ldg") is BAR_LAYOUT_XFA4
+    )
+    assert (bar_layout_end_for_roles("16w", "ldg"), bar_layout_end_for_roles("16w_fa4")) == (BAR_LAYOUT_END, BAR_LAYOUT_XFA4_END)
+    assert (bar_kind_counts_for_roles("16w", "ldg"), bar_kind_counts_for_roles("16w_fa4")) == (BAR_KIND_COUNTS, BAR_KIND_COUNTS_XFA4)
 
 
 validate_config()

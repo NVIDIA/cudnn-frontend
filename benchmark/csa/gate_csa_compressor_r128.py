@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""ratio=128 CSA fused-compressor numerics contract gate (see docs/fe-oss-apis/csa.md).
+"""ratio=128 CSA fused-compressor numerics contract gate (see docs/operations/sparse_attention/csa.md).
 
 Runs the contract over the full validation envelope — 15 union cases (coff {1, 2} x
 head_dim {128, 512} x {8k / 3x8k / ragged / edge / 64k / 128k token packs}; the 128k
@@ -60,7 +60,7 @@ gates bit-stable replay of the NaN pattern and NaN-mask equality vs eager on all
 outputs; the non-finite clause of the contract is THIS committed case, not an
 order-independence theorem — near fp32 max the fused evaluation order can saturate
 earlier than the eager one (un-normalized chunk partials; see the Numerics caveat in
-docs/fe-oss-apis/csa.md).
+docs/operations/sparse_attention/csa.md).
 
 Padding cases put static row-capacity padding (`total_comp > cu_seqlens_comp[-1]`)
 AND token-capacity padding (`kv/score` rows beyond `cu_seqlens[-1]`) on a ragged

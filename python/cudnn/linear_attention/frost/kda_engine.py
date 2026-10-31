@@ -207,6 +207,10 @@ class CompiledKda:
         self.io_name = "float16" if q.get_data_type().name == "HALF" else "bfloat16"
         self.length_rule = self.chain and self.batch_invariant
 
+        from .common.host import get_dtype
+        from .common.steep_decay import STEEP_OFF, steep_mode_for
+
+        self.steep_mode = steep_mode_for(get_dtype(self.io_name), self.use_qk_l2norm, self.safe_gate, self.gate_lower_bound * kernel_module.LOG2_E, self.b_t)
         layout = WorkspaceLayout()
         regions = []
         if self.chain:
@@ -264,6 +268,19 @@ class CompiledKda:
             prefill_module = kernel_module
         self.tensormap_bytes = tensormap_workspace_bytes(prefill_module, self.num_pieces)
         regions.append(("tensormaps", layout.add(self.tensormap_bytes, align=128), "int64", (self.tensormap_bytes // 8,)))
+        seed = node.inputs.get("initial_state")
+        if (
+            self.steep_mode != STEEP_OFF
+            and not self.chain
+            and self.has_final_state
+            and not self.prep
+            and seed is not None
+            and (self.overwrite_initial_state or "state_indices" in node.inputs)
+        ):
+            # The final state may overwrite the seeds (the graph contract, not this call's pointers: buffers can alias
+            # after warmup), so the prefill seeds from a copy its exact twin can reread (common/state_snapshot.py).
+            seed_name, seed_bytes = {"BFLOAT16": ("bfloat16", 2), "HALF": ("float16", 2)}.get(seed.get_data_type().name, ("float32", 4))
+            regions.append(("state_snapshot", layout.add(B * HO * V * K * seed_bytes, align=128), seed_name, (B, HO, V, K)))
         self.workspace_size = layout.size
         self.workspace_regions = tuple(regions)
         self.carve_names = [name for name, off, dt, shape in regions]
@@ -368,6 +385,7 @@ class CompiledKda:
             prep_words=region.get("prep_tensormaps"),
             prep_rows=region.get("prep_rows"),
             prep_row_count=region.get("prep_row_count"),
+            state_snapshot=region.get("state_snapshot"),
         )
         if self.uncut_launch is None:
             self.uncut_launch = self.build_uncut_forward(
@@ -542,8 +560,17 @@ class CompiledKdaBwd:
         self.num_pieces = B * self.pieces if self.chain else B
         self.fused_h_m = self.chain and not self.has_state_checkpoints
 
+        from .common.host import get_dtype
+        from .common.steep_decay import STEEP_OFF, steep_mode_for
+
         layout = WorkspaceLayout()
         regions = []
+        # One FP32 state and bounded-key ring per persistent CTA; sequential backward kernels share the arena.
+        self.steep_mode = steep_mode_for(get_dtype(self.io_name), self.use_qk_l2norm, self.safe_gate, self.gate_lower_bound * bwd_module.LOG2_E, self.b_t)
+        dstate_scratch_elements = (
+            max(1, min(self.num_sm, self.num_pieces * HO)) * (V * K + bwd_module.CFG.SMEM_DECAY_STAGES * self.b_t * K) if self.steep_mode != STEEP_OFF else 1
+        )
+        regions.append(("dstate_scratch", layout.add(dstate_scratch_elements * 4), "float32", (dstate_scratch_elements,)))
         off_scheduler = layout.add(40 if self.chain else 16)
         regions += [
             ("scheduler_recompute", off_scheduler, "int32", (2,)),
@@ -630,6 +657,11 @@ class CompiledKdaBwd:
                 regions.append(("state_x", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
         self.bwd_tensormap_bytes = tensormap_workspace_bytes(bwd_module, self.num_pieces)
         regions.append(("bwd_tensormaps", layout.add(self.bwd_tensormap_bytes, align=128), "int64", (self.bwd_tensormap_bytes // 8,)))
+        d_final = node.inputs.get("d_final_state")
+        if self.steep_mode != STEEP_OFF and not self.chain and self.overwrite_initial_state and d_final is not None:
+            # d_initial_state overwrites d_final_state: the bprop reads a copy so its exact twin can redo it.
+            d_name, d_bytes = {"BFLOAT16": ("bfloat16", 2), "HALF": ("float16", 2)}.get(d_final.get_data_type().name, ("float32", 4))
+            regions.append(("dstate_snapshot", layout.add(B * HO * V * K * d_bytes, align=128), d_name, (B, HO, V, K)))
         self.workspace_size = layout.size
         self.workspace_regions = tuple(regions)
         self.carve_names = [name for name, off, dt, shape in regions]
@@ -747,6 +779,8 @@ class CompiledKdaBwd:
                 scheduler_bwd=region["scheduler_bwd"],
                 recompute_words=region.get("recompute_tensormaps"),
                 bprop_words=region["bwd_tensormaps"],
+                dstate_scratch=region["dstate_scratch"],
+                dstate_snapshot=region.get("dstate_snapshot"),
             )
             schedule = dict(
                 b_t=self.b_t,
@@ -844,6 +878,7 @@ class CompiledKdaBwd:
             series_words=region.get("recompute_tensormaps_series"),
             bprop_summary_words=region["summary_tensormaps"],
             bprop_words=region["bwd_tensormaps"],
+            dstate_scratch=region["dstate_scratch"],
             checkpoints=checkpoint_series,
             seed_checkpoints=state_checkpoints if coarse else None,
             dq=dq_out,
@@ -1354,6 +1389,18 @@ class CompiledKdaSummaryBwd:
         self.num_pieces = B * self.pieces if self.chain else B
         layout = WorkspaceLayout()
         regions = []
+        # One FP32 state and bounded-key ring per persistent CTA; sequential backward kernels share the arena.
+        from .common.host import get_dtype
+        from .common.steep_decay import STEEP_OFF, steep_mode_for
+
+        io_name = "float16" if node.inputs["q"].get_data_type().name == "HALF" else "bfloat16"
+        self.steep_mode = steep_mode_for(get_dtype(io_name), self.use_qk_l2norm, self.safe_gate, self.gate_lower_bound * summary_module.LOG2_E, self.b_t)
+        dstate_scratch_elements = (
+            max(1, min(self.num_sm, self.num_pieces * HO)) * (V * K + summary_module.CFG.SMEM_DECAY_STAGES * self.b_t * K)
+            if self.steep_mode != STEEP_OFF
+            else 1
+        )
+        regions.append(("dstate_scratch", layout.add(dstate_scratch_elements * 4), "float32", (dstate_scratch_elements,)))
         if self.chain:
             from .kernel import kda_recompute_f16 as recompute_module
 
@@ -1463,6 +1510,7 @@ class CompiledKdaSummaryBwd:
                 stream,
                 a_log=a_log if self.safe_gate else None,
                 dt_bias=dt_bias if self.safe_gate else None,
+                dstate_scratch=region["dstate_scratch"],
             )
             if self.has_transition:
                 self.run_transition(k, g, beta, cu, transition, a_log, dt_bias, region, stream)
@@ -1491,6 +1539,7 @@ class CompiledKdaSummaryBwd:
             scheduler_all=region["scheduler_all"],
             order_in_prologue=True,
             tensormap_workspace=region["tensormaps"],
+            dstate_scratch=region["dstate_scratch"],
             device=self.device,
             num_sm=self.num_sm,
             stream=stream,
@@ -1645,6 +1694,7 @@ class CompiledKdaSummaryBwd:
                 a_log=gate_a_log,
                 dt_bias=gate_dt_bias,
                 own_prologue=False,
+                dstate_scratch=region["dstate_scratch"],
             )
         else:
             self.state_m_cache = self.recompute.chunk_kda_recompute(
@@ -1697,6 +1747,7 @@ class CompiledKdaSummaryBwd:
                 scheduler_counter=region["scheduler_g"],
                 scheduler_all=region["scheduler_all"],
                 tensormap_workspace=region["summary_tensormaps"],
+                dstate_scratch=region["dstate_scratch"],
                 device=self.device,
                 num_sm=self.num_sm,
                 stream=stream,

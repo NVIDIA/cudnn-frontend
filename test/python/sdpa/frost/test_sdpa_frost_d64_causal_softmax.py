@@ -104,6 +104,7 @@ def test_d64_causal_softmax_rebind_and_replay(cga, packed, bottom_right, with_si
             assert module.CFG.CTA_MMA == cga
             assert module._E2E_ENABLED is (torch.cuda.get_device_capability() == (10, 0)), "the graph lost its architecture-specific exp2 path"
             assert module._D64_EARLY_SOFTMAX_HANDOFF is (torch.cuda.get_device_capability() == (10, 0))
+            assert module._D64_JOINT_ROW_MAX is (torch.cuda.get_device_capability() == (10, 0) and cga == 1)
         workspace = torch.empty(max(1, graph.get_workspace_size()), device="cuda", dtype=torch.uint8)
 
         def bindings():

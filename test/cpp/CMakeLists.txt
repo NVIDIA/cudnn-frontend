@@ -36,6 +36,7 @@ add_executable(
     plan_selection.cpp
     legacy_slice.cpp
     cuda_graph_lifetime.cpp
+    shared_memory_limit.cpp
 )
 
 if (MSVC)

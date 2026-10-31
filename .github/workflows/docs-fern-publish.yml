@@ -1,4 +1,4 @@
-name: Publish docs
+name: docs
 
 # Publishes the Fern docs site with `fern generate --docs`.
 #
@@ -43,7 +43,7 @@ env:
   STAGING_INSTANCE: nvidia-cudnn-staging.docs.buildwithfern.com/cudnn
 
 jobs:
-  publish:
+  fern-publish:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -30,6 +30,11 @@ padded tokens unwritten on a NaN-poisoned pool, ``out`` bitwise the block's with
 unchanged -- plus the other bf16 pipelines (fused norm + RoPE, dense and packed; out-of-place Q / K / V; the fused gate) and
 the indexer band's raw-key pool on the sparse block (the stage walk, then the whole block with the full caller list against the
 fp32 QSA oracle).
+
+Both-parts cells (``requires_dense_part``, 2026-10-29; the end of the module): a serving stack's PACKED K|V cache -- ONE ``[pages, 4, P, 512]``
+tensor, K in columns ``[0, D)`` and V in ``[D, 2D)`` of every row -- bound as the two half views on the EXTEND form at the 24 / 4 geometry,
+pages 16 and 32, a 2048-key context next to an empty-prefix sequence, a padded entry and a short prefix, int64 slots, bf16 and f16: the
+oracle through both halves with every unaddressed row stale in both, two launches bitwise, bitwise the HND-compact twin.
 """
 
 import contextlib
@@ -41,9 +46,13 @@ import pytest
 import torch
 
 from cudnn.frost.buffers import cutedsl_requirement_error
+from cudnn.gated_attention_block import api as _api
 from cudnn.gated_attention_block import (
+    DENSE_SERVING_CCS,
+    FP8_PROJ_BF16_ATTENTION_CCS,
     KV_SOURCE_PAGED,
     KV_SOURCE_SELF,
+    QUANT_MODE_FP8_PROJ_BF16_ATTENTION,
     SERVING_PAGE_SIZES,
     SERVING_POOL_LAYOUTS,
     DecodeEnvelope,
@@ -62,6 +71,7 @@ from cudnn.gated_attention_block.api import (
     _cols,
     _FusedQkvProjection,
     _Projection,
+    _Quantize,
     _Sdpa,
     _SparseSdpa,
     _view,
@@ -75,6 +85,8 @@ if requirement_error:
     pytest.skip(requirement_error, allow_module_level=True)
 
 requires_rubin = pytest.mark.requires_rubin  # the suite's registered marker (conftest.py): skipped off SM107
+requires_blackwell = pytest.mark.requires_blackwell  # the registered marker: an admitted Blackwell-line part of DENSE_SERVING_CCS (cc 10.0; 2026-10-29)
+requires_dense_part = pytest.mark.requires_dense_part  # the registered marker: EVERY served part of DENSE_SERVING_CCS (cc 10.7 and cc 10.0)
 # The capture cell (g) needs the projection GEMM driver's capture-safe route (``build_proj_gemm(capture_safe=True)``: the forced-tile JIT
 # route, no cuDNN handle at the first execute).  Where the driver has no such route, a fresh declaration's first execute inside a capture
 # is the graph route's handle creation, so the cell is skipped there instead of asserting what that tree cannot deliver; the serving
@@ -94,13 +106,16 @@ from gated_block_qsa_reference import (  # noqa: E402
 )
 from gated_block_reference import (  # noqa: E402
     RefGeometry,
+    amax_scale,
     build_rope_tables,
     cu_seqlens_of,
+    gated_attention_block_fp8_reference,
     gated_attention_block_reference,
     gated_attention_block_reference_packed,
     make_inputs,
     make_packed_inputs,
     qk_norm_rope_reference,
+    quant_e4m3,
 )
 
 _DEV = "cuda" if torch.cuda.is_available() else "cpu"
@@ -330,6 +345,32 @@ def test_typed_declines_at_declaration_name_the_feature():
             quant=spec,
             paged_kv_page_size=16,
         )
+    # The FP8-projection + bf16-attention mode (QuantSpec(attention_dtype=torch.bfloat16)) is the quant spelling the paged forms ACCEPT: the
+    # packed EXTEND declaration over e4m3 token matrices builds the bf16 paged THD stage, the separate cache write, the elementwise gate, the
+    # one quantize_o and the FP8 out projection; over the block's own K / V (kv_source="self") the mode is declined by name, as is the fused fork
+    mode, mode_inp, _ = _declare_extend_with(2, 128, _extend_samples(16, 9, 2, 8), quant=True)
+    assert (
+        mode.attention_bf16 and mode.quant is mode_inp["quant"] and mode_inp["h"].dtype == e4 and mode_inp["w_qkvg"].dtype == e4 and mode_inp["w_o"].dtype == e4
+    )
+    assert [st.name for st in mode._stages] == ["qkv_gate_proj", "qk_norm_rope", "cache_write", "sdpa", "sigmoid_gate", "quantize_o", "out_proj"]
+    assert (
+        isinstance(mode._sdpa, _Sdpa)
+        and mode._sdpa.dtype == torch.bfloat16
+        and mode._sdpa.fp8 is False
+        and mode._sdpa.thd
+        and mode._sdpa.kv_source == KV_SOURCE_PAGED
+    )
+    assert (
+        mode._quant_q is None
+        and isinstance(mode._quant_o, _Quantize)
+        and mode._proj.capture_safe
+        and mode._out_proj.capture_safe
+        and mode.paged_kv_page_size == 16
+    )
+    with pytest.raises(NotImplementedError, match=r"QuantSpec\(attention_dtype=torch.bfloat16\) with kv_source='self'"):
+        _declare_extend_with(2, 128, {}, quant=True, kv_source=KV_SOURCE_SELF, token_capacity=None)
+    with pytest.raises(NotImplementedError, match=r"fuse_norm_rope=True with QuantSpec\(attention_dtype=torch.bfloat16\)"):
+        _declare_extend_with(2, 128, _extend_samples(16, 9, 2, 8), quant=True, fuse_norm_rope=True)
     # The packed form is SERVED (the former ``thd=True`` decline, inverted): rank-2 token matrices declare without complaint.
     h_tokens = inp["h"].view(64, geom.d_model)
     blk_thd = GatedAttentionBlockFwd(
@@ -1243,18 +1284,53 @@ def _extend_samples(page, n_pages, b_max, max_pages, layout="hnd", dtype=torch.b
     return dict(sample_k_cache=k, sample_v_cache=v, sample_block_table=table[:, :max_pages])
 
 
+def _mode_static_scales(geom_kw):
+    """The FP8-projection + bf16-attention mode's STATIC per-tensor scales for the harness's data (an offline calibration stand-in): the
+    token matrix ``h`` is drawn standard-normal (``s_h`` = 448 / 6: the rare draw past 6 sigma saturates, in the block and the oracle alike),
+    the weights are quantized at their amax, ``scale_o`` assumes a gated-O amax of four projection sigmas (``0.02 x sqrt(d_model)``)."""
+    return dict(s_h=448.0 / 6.0, scale_o=448.0 / (4.0 * 0.02 * geom_kw["d_model"] ** 0.5))
+
+
 def _declare_extend_with(
-    b_max, t_max, samples, *, page=16, kv_source=KV_SOURCE_PAGED, cu=True, token_capacity="T", geom_kw=_EXTEND_GEOM, dtype=torch.bfloat16, seed=0, **blk_kw
+    b_max,
+    t_max,
+    samples,
+    *,
+    page=16,
+    kv_source=KV_SOURCE_PAGED,
+    cu=True,
+    token_capacity="T",
+    geom_kw=_EXTEND_GEOM,
+    dtype=torch.bfloat16,
+    seed=0,
+    quant=None,
+    **blk_kw,
 ):
     """A declared (not compiled) EXTEND block over EXPLICIT samples (the pools' shape / dtype / strides, the block table).  ``inp``
     carries the WEIGHTS every step shares and the step's token tensors (``h`` / ``cos`` / ``sin`` as ``[T_max, .]`` matrices the
-    steps rewrite in place).  Returns ``(blk, inp, out)``."""
+    steps rewrite in place).  Returns ``(blk, inp, out)``.  ``quant`` (appended; True) declares the FP8-PROJECTION + BF16-ATTENTION
+    mode: ``h`` an e4m3 ``[T_max, d_model]`` matrix (the steps write e4m3 codes at ``inp["scales"]["s_h"]``), the weights e4m3 codes at
+    their amax scales, the QuantSpec ``inp["quant"]`` = ``QuantSpec.bf16_attention(...)`` with ``scale_o`` from :func:`_mode_static_scales`."""
     geom = GatedAttentionBlockGeometry(**geom_kw)
     ref_geom = RefGeometry(
         **{k: v for k, v in geom_kw.items() if k in ("d_model", "h_q", "h_kv", "d_head", "rope_dim")}
     )  # the dims; the oracle's mask is its own
     inp = make_inputs(ref_geom, batch=1, seq_len=t_max, dtype=dtype, device=_DEV, seed=seed)
     inp = dict(inp, h=inp["h"].view(t_max, geom.d_model), cos=inp["cos"].view(t_max, -1).contiguous(), sin=inp["sin"].view(t_max, -1).contiguous())
+    if quant is not None:
+        assert dtype == torch.bfloat16, "the FP8-projection + bf16-attention mode's activations are bf16"
+        sc = dict(_mode_static_scales(geom_kw), s_wq=amax_scale(inp["w_qkvg"]), s_wo=amax_scale(inp["w_o"]))
+        spec = QuantSpec.bf16_attention(1.0 / sc["s_h"], 1.0 / sc["s_wq"], 1.0 / sc["s_wo"], sc["scale_o"])
+        spec.validate()
+        inp = dict(
+            inp,
+            h=torch.zeros(t_max, geom.d_model, device=_DEV, dtype=torch.float8_e4m3fn),
+            w_qkvg=quant_e4m3(inp["w_qkvg"], sc["s_wq"]),
+            w_o=quant_e4m3(inp["w_o"], sc["s_wo"]),
+            scales=sc,
+            quant=spec,
+        )
+        blk_kw = dict(blk_kw, quant=spec)
     out = torch.empty(t_max, geom.d_model, device=_DEV, dtype=dtype)
     blk = GatedAttentionBlockFwd(
         inp["h"],
@@ -1385,10 +1461,25 @@ def test_extend_o_slot_is_aliased_by_no_other_stage_scratch():
         assert lay.engine_scratch >= o_hi
 
 
+@contextlib.contextmanager
+def _declined_record(**over):
+    """The sparse adapter's record with a claim DROPPED (``thd_paged_kv=False``: the THD x paged composition the packed sparse EXTEND form
+    needs), so the record-driven rows stay reachable (frost-engine-contract section 2: every row of a table a test can trip)."""
+    import dataclasses
+
+    from cudnn.sdpa.fwd import sparse_gqa_sm107 as S
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(S, "SPARSE_CAPABILITIES", dataclasses.replace(S.SPARSE_CAPABILITIES, **over))
+        yield
+
+
 def _declare_dense_sparse_paged():
     """A DENSE paged declaration on a QsaSpec geometry with the bottom-right diagonal CONSTRUCTS (2026-10-14): the block-sparse DECODE /
     extend-with-prefix mode -- stage (4) is the sparse core reading the pools (``test_block_qsa_decode.py``); the serving table's
-    `sparse` row is the PACKED form's (the sparse core serves THD and paged pools one at a time).  Returns the declared block."""
+    `sparse` row is the PACKED form's through a record WITHOUT the THD x paged composition claim (with the claim -- the record's
+    ``thd_paged_kv``, 2026-10-30 -- the packed declaration over the pools constructs too: the packed sparse EXTEND form,
+    ``test_block_qsa_packed_extend.py``).  Returns the declared block."""
     geom = GatedAttentionBlockGeometry(**_SMALL_D256, causal_bottom_right=True, qsa=QsaSpec())
     mk = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16, device=_DEV)  # noqa: E731
     kc, vc = (torch.empty(4, geom.h_kv, 16, geom.d_head, dtype=torch.bfloat16, device=_DEV) for _ in range(2))
@@ -1431,8 +1522,9 @@ def test_extend_typed_declines_match_the_envelope_row_by_row(monkeypatch):
         # unpacked, its widest step) it is the decode_rows row; 160 packed rows (64 / 2 = group 32 at S_q 5) ride the unpacked arm
         "decode_rows": lambda: _make_block(_EXTEND_GEOM, 1, 33, paged_kv_page_size=16, kv_source=KV_SOURCE_PAGED),
         "diagonal": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=_SMALL_D256),
-        # the PACKED form over the pools on a QsaSpec geometry (a dense one is the block-sparse decode mode since 2026-10-14: _declare_dense_sparse_paged)
-        "sparse": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=dict(_SMALL_D256, qsa=QsaSpec())),
+        # the PACKED form over the pools on a bottom-right QsaSpec geometry through a record WITHOUT the composition claim (with the claim the
+        # declaration constructs: the packed sparse EXTEND form, 2026-10-30; a dense one is the block-sparse decode mode since 2026-10-14)
+        "sparse": lambda: _trip_sparse_row(),
         "window": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=dict(_EXTEND_GEOM, window_left=64)),
         "head_dim": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=d128),
         "return_lse": lambda: _declare_extend(2, 128, max_kv_len=128, return_lse=True),
@@ -1442,6 +1534,11 @@ def test_extend_typed_declines_match_the_envelope_row_by_row(monkeypatch):
         ),
     }
     assert set(trips) == set(names)
+
+    def _trip_sparse_row():
+        with _declined_record(thd_paged_kv=False):
+            _declare_extend(2, 128, max_kv_len=128, geom_kw=dict(_SMALL_D256, causal_bottom_right=True, qsa=QsaSpec()))
+
     for name, exc, _pred, msg in _EXTEND_DECLINES:
         with pytest.raises(exc, match=re.escape(msg[:80])) as e:
             trips[name]()
@@ -1455,7 +1552,7 @@ def test_extend_typed_declines_match_the_envelope_row_by_row(monkeypatch):
     assert [st.name for st in gated._stages].count("sigmoid_gate") == 0 and "cache_write" in [st.name for st in gated._stages]
     assert "fuse_gate as declared" in env.extend.requires[-1]
     # the served verdict reads the device: Rubin serves the form, every other part names itself in the reason
-    cc = tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
+    cc = _api._device_cc_of(_DEV)  # the device read the envelope takes (torch's capability on a real host)
     assert env.device_cc == cc
     if cc == (10, 7):
         if not env.cutedsl_ok:
@@ -1469,30 +1566,47 @@ def test_extend_typed_declines_match_the_envelope_row_by_row(monkeypatch):
         for geom_kw, row in ((dict(_EXTEND_GEOM, window_left=64), "window"), (_SMALL_D256, "diagonal"), (d128, "head_dim")):
             bad = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**geom_kw), torch.bfloat16, _DEV)
             assert not bad.extend.served and bad.extend.reason == env.extend.declines[row] and bad.forms == (), row
+    elif cc in DENSE_SERVING_CCS:
+        # cc 10.0 (2026-10-29): both dense forms served through the shared SM100 d256 paged THD body; the geometry rows the same table's
+        assert env.extend.served and env.forms == ("extend", "decode") and env.extend.reason is None and env.cutedsl_ok
+        for geom_kw, row in ((dict(_EXTEND_GEOM, window_left=64), "window"), (_SMALL_D256, "diagonal"), (d128, "head_dim")):
+            bad = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**geom_kw), torch.bfloat16, _DEV)
+            assert not bad.extend.served and bad.extend.reason == env.extend.declines[row] and bad.forms == (), row
     else:
-        assert not env.extend.served and env.forms == () and "targets Rubin" in env.extend.reason
-    # a sparse geometry: the block serves the packed sparse stage (the sparse declaration's THD row is record-driven and the record claims
-    # the arm), so the THD-only form reaches the table like the dense one and meets its `sparse` row -- the PACKED form's row since
-    # 2026-10-14 (the sparse core serves THD and paged pools one at a time) -- the envelope says so wherever the device / dtype facts let
-    # it speak (on Rubin: the very message the block raises for that declaration)
+        assert not env.extend.served and env.forms == () and "served on cc 10.7 (Rubin, SM107: every form) and cc 10.0" in env.extend.reason
+    # a sparse geometry (INVERTED 2026-10-30): the block serves the packed sparse stage AND the THD x paged composition (both record claims), so
+    # a bottom-right QsaSpec packed declaration over the pools CONSTRUCTS -- the packed sparse EXTEND form with caller lists (stage (4) the
+    # sparse core with thd and paged, unsplit, one list per row; test_block_qsa_packed_extend.py) -- while the TOP-LEFT one meets the
+    # `diagonal` row like a dense declaration; the table's `sparse` row is reached through a record without the composition claim -- the
+    # envelope says so wherever the device / dtype facts let it speak (on Rubin: the very message the block raises for that declaration)
+    bottom_right_qsa = dict(_SMALL_D256, causal_bottom_right=True, qsa=QsaSpec())
+    blk, *_ = _declare_extend(2, 128, max_kv_len=128, geom_kw=bottom_right_qsa)
+    assert isinstance(blk._sdpa, _SparseSdpa) and blk._sdpa.thd and blk._sdpa.paged and blk.decode_split_kv == 1 and blk.qsa_list_form == "per_row"
     sparse = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec()), torch.bfloat16, _DEV)
     assert not sparse.extend.served
-    with pytest.raises(NotImplementedError, match="kv_source='paged' with geometry.qsa") as e:
+    with pytest.raises(ValueError, match=re.escape(env.extend.declines["diagonal"][:60])) as e_tl:
         _declare_extend(2, 128, max_kv_len=128, geom_kw=dict(_SMALL_D256, qsa=QsaSpec()))
-    assert str(e.value) == env.extend.declines["sparse"]
+    assert str(e_tl.value) == env.extend.declines["diagonal"]
+    with _declined_record(thd_paged_kv=False):
+        with pytest.raises(NotImplementedError, match="kv_source='paged' with geometry.qsa") as e:
+            _declare_extend(2, 128, max_kv_len=128, geom_kw=bottom_right_qsa)
+        declined = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**bottom_right_qsa), torch.bfloat16, _DEV)
+    assert str(e.value) == env.extend.declines["sparse"] and "thd_paged_kv" in str(e.value)
     if cc == (10, 7):
-        assert sparse.extend.reason == str(e.value)
-    # ... and the Rubin reading on ANY host (device_cc=): the EXTEND half says the table's `sparse` row; the DECODE half of a TOP-LEFT
-    # QsaSpec geometry says the `diagonal` row like a dense one (the `sparse` row is no dense-form row any more), and the bottom-right
-    # QsaSpec geometry SERVES the decode form -- the block-sparse decode mode (test_block_qsa_decode.py), stage (4) the sparse core
+        assert sparse.extend.reason == str(e_tl.value) and declined.extend.reason == str(e.value)
+    # ... and the Rubin reading on ANY host (device_cc=): the TOP-LEFT QsaSpec geometry says the `diagonal` row on both forms like a dense one
+    # (the `sparse` row is no dense-form row any more), and the bottom-right QsaSpec geometry SERVES both forms -- the block-sparse decode
+    # mode (test_block_qsa_decode.py) and the packed sparse EXTEND form, stage (4) the sparse core on each
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     rubin = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec()), torch.bfloat16, _DEV, device_cc=(10, 7))
     assert rubin.cutedsl_ok and rubin.forms == ()
-    assert rubin.extend.reason == str(e.value) and rubin.decode.reason == env.decode.declines["diagonal"] and "sparse" not in env.decode.declines
-    served = GatedAttentionBlockFwd.serving_envelope(
-        GatedAttentionBlockGeometry(**_SMALL_D256, causal_bottom_right=True, qsa=QsaSpec()), torch.bfloat16, _DEV, device_cc=(10, 7)
-    )
-    assert served.forms == ("decode",) and served.decode.served and served.decode.sparse_core and served.extend.reason == str(e.value)
+    assert rubin.extend.reason == str(e_tl.value) and rubin.decode.reason == env.decode.declines["diagonal"] and "sparse" not in env.decode.declines
+    served = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**bottom_right_qsa), torch.bfloat16, _DEV, device_cc=(10, 7))
+    assert served.forms == ("extend", "decode") and served.decode.served and served.decode.sparse_core
+    assert served.extend.served and served.extend.sparse_core and served.extend.reason is None and served.extend.declines["sparse"] == str(e.value)
+    with _declined_record(thd_paged_kv=False):
+        rubin_declined = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**bottom_right_qsa), torch.bfloat16, _DEV, device_cc=(10, 7))
+    assert rubin_declined.forms == ("decode",) and rubin_declined.extend.reason == str(e.value)
     assert isinstance(_declare_dense_sparse_paged(), GatedAttentionBlockFwd)  # the dense QsaSpec declaration over the pools constructs
 
 
@@ -1692,6 +1806,10 @@ class _ExtendHarness:
             b_max, t_max, max_kv_len=max_kv_len, page=page, layout=layout, dtype=dtype, cu=cu, row_stride=row_stride, seed=seed, **blk_kw
         )
         self.b_max, self.t_max, self.page, self.layout, self.dtype, self.cu = b_max, t_max, page, layout, dtype, cu
+        # the FP8-projection + bf16-attention mode (``quant=True`` in blk_kw): the histories stay bf16 VALUES; the steps hand the block their
+        # e4m3 codes at s_h and the oracle is the fp8 reference's attention_bf16 arm over the same codes (the gated O quantized at scale_o)
+        self.quant_mode = "quant" in self.inp
+        self.scales, self.spec = self.inp.get("scales"), self.inp.get("quant")
         geom_kw = blk_kw.get("geom_kw", _EXTEND_GEOM)  # the oracle's mirror follows the DECLARED geometry (a shard's, or the matrix's 8 / 2)
         self.geom, self.ref_geom = self.blk.geom, RefGeometry(**{k: v for k, v in geom_kw.items() if k in ("d_model", "h_q", "h_kv", "d_head", "rope_dim")})
         self.k_cache, self.v_cache, self.table = self.samples["sample_k_cache"], self.samples["sample_v_cache"], self.samples["sample_block_table"]
@@ -1745,6 +1863,30 @@ class _ExtendHarness:
         prefix are the step's expected rows, its ``k`` / ``v`` the pool rows."""
         h = self.hist[b]
         cos, sin = build_rope_tables(int(h.shape[0]), self.geom.rope_dim, base=self.ref_geom.rope_base, batch=1, device="cuda", dtype=self.dtype)
+        if self.quant_mode:
+            sc = self.scales
+            inp = dict(
+                h=quant_e4m3(h[None], sc["s_h"]),
+                w_qkvg=self.inp["w_qkvg"],
+                w_o=self.inp["w_o"],
+                w_q_norm=self.inp["w_q_norm"],
+                w_k_norm=self.inp["w_k_norm"],
+                cos=cos,
+                sin=sin,
+            )
+            return gated_attention_block_fp8_reference(
+                inp,
+                self.ref_geom,
+                descale_h=1.0 / sc["s_h"],
+                descale_w_qkvg=1.0 / sc["s_wq"],
+                descale_w_o=1.0 / sc["s_wo"],
+                scale_q=None,
+                scale_k=None,
+                scale_v=None,
+                scale_o=sc["scale_o"],
+                attention_bf16=True,
+                return_rows=True,
+            )
         return gated_attention_block_reference(
             h[None], self.inp["w_qkvg"], self.inp["w_q_norm"], self.inp["w_k_norm"], cos, sin, self.inp["w_o"], self.ref_geom
         )
@@ -1800,7 +1942,7 @@ class _ExtendHarness:
             q, p = q_lens[b], prefix_lens[b]
             rows.append((row, row + q))
             if q:
-                h[row : row + q] = self.hist[b][p : p + q]
+                h[row : row + q] = quant_e4m3(self.hist[b][p : p + q], self.scales["s_h"]) if self.quant_mode else self.hist[b][p : p + q]
                 c, s = build_rope_tables(
                     q,
                     self.geom.rope_dim,
@@ -1883,6 +2025,12 @@ class _ExtendHarness:
         """The gated O the SDPA + gate left in the ``o`` slot (in place under inference), ``[T_max, H_q, D]``."""
         g, lay = self.geom, self.blk._layout()
         return _view(self.ws, lay.o, (self.t_max, g.h_q, g.d_head), self.dtype)
+
+    def o8(self):
+        """The mode's e4m3 gated O in the ``o8`` slot (the FP8 out projection's A operand), ``[T_max, H_q, D]``."""
+        g, lay = self.geom, self.blk._layout()
+        assert lay.o8 >= 0, "no o8 slot: not a quantized declaration"
+        return _view(self.ws, lay.o8, (self.t_max, g.h_q, g.d_head), torch.float8_e4m3fn)
 
     def check(self, rec, *, label, out_cos=0.999, o_atol=2e-2):
         """Every assertion a step owes: ``isfinite(out)`` over EVERY row first; per live sequence the dense suite's budget vs the
@@ -2709,3 +2857,388 @@ def test_extend_qwen35_shards_execute_within_the_budget(name):
         worst_cos = min(worst_cos, _cos(rec["out"][lo:hi], ref.out[0, p : p + q]))
         worst_err = max(worst_err, (og[lo:hi].float() - ref.o_gated[0, p : p + q].float()).abs().max().item())
     print(f"(shard) {name} p{page}: t_live {rec['t_live']} kv_lens {rec['kv_lens']} worst out cos {worst_cos:.6f} gated-O max|err| {worst_err:.3e}")
+
+
+# ---------------------------------------------------------------------------
+# cc 10.0 (the SM100 line of DENSE_SERVING_CCS; 2026-10-29): the EXTEND form through the shared SM100 d256 paged THD body
+# ---------------------------------------------------------------------------
+#
+# The same declaration, the same harness, the same check (nothing widened): the paged THD leg of the sm100 f16 row (CGA2, unsplit,
+# unpacked, NATURAL, no gate, no LSE), the write-through before it, the sigmoid gate its own launch.  Functional cells only; fuse_gate=True
+# and the fused projection fork are typed declines by name there.
+
+_Q38_27B_EXTEND_GEOM = dict(d_model=5120, h_q=24, h_kv=4, d_head=256, rope_dim=64, causal_bottom_right=True)
+
+
+def _sm100_pin_extend(hz):
+    """The compiled stage (4) on cc 10.0: the shared SM100 paged THD body, unsplit, unpacked, no gate epilogue, the gate its own stage."""
+    sd = hz.blk._sdpa
+    impl = sd._impl
+    assert sd.kv_source == KV_SOURCE_PAGED and sd.thd and not sd.fuse_gate and impl.kernel_template == "prefill_d256_f16", impl.kernel_template
+    assert impl._k_mod.__file__.endswith("/sm100/prefill_d256_f16.py") and impl.split_kv == 1 and not impl.pack_gqa
+    assert impl.template_params().epilogue_gate is False and not hz.blk.gate_fused and hz.blk._gate is not None
+    assert hz.blk.decode_route is None and hz.blk.use_pdl is False and hz.blk.pdl_stages == ()
+
+
+@requires_blackwell
+@pytest.mark.parametrize(
+    "dtype, layout, page",
+    [
+        pytest.param(torch.bfloat16, "hnd", 16, marks=pytest.mark.L0, id="bf16-hnd-16"),
+        pytest.param(torch.float16, "unified", 64, marks=pytest.mark.L1, id="f16-unified-64"),
+        pytest.param(torch.bfloat16, "nhd", 32, marks=pytest.mark.L1, id="bf16-nhd-32"),
+        pytest.param(torch.float16, "hnd", 128, marks=pytest.mark.L1, id="f16-hnd-128"),
+    ],
+)
+def test_sm100_extend_matrix_cell(dtype, layout, page):
+    """The degenerate matrix on serving buffers on cc 10.0 (the cells of the tracker's cc 10.0 EXTEND table): four sequences at T_max
+    512 -- an empty prefix, a step over a prefix ending mid-page, a PADDED entry, a tail tile -- within the dense suite's budget of the
+    per-sequence oracle, the pools bitwise the slab rows, stale rows untouched; the int64 slot dtype at pages 32 / 128."""
+    hz = _harness(4, 512, max_kv_len=512, page=page, layout=layout, dtype=dtype, slot_dtype=torch.int32 if page in (16, 64) else torch.int64)
+    _sm100_pin_extend(hz)
+    rec = hz.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    assert rec["t_live"] == 412
+    hz.check(rec, label=f"(cc 10.0) 8/2 {dtype} {layout} p{page}")
+
+
+@pytest.mark.L1
+@requires_blackwell
+def test_sm100_extend_the_27b_geometry_executes_within_the_budget():
+    """One EXTEND step at the 24 / 4 geometry at its real width (``d_model`` 5120) on cc 10.0: two sequences at ``T_max`` 256, a
+    100-token step over a 60-row prefix and a 156-token step over a 100-row prefix (the table row full), through the suite's harness and
+    ``check``; the stage pinned on the shared SM100 paged THD body."""
+    hz = _harness(2, 256, max_kv_len=256, page=16, geom_kw=_Q38_27B_EXTEND_GEOM, seed=37)
+    assert hz.geom.d_model == 5120 and hz.geom.h_kv == 4 and hz.geom.n_qkvg % 256 == 0
+    _sm100_pin_extend(hz)
+    rec = hz.step([100, 156], prefix_lens=[60, 100], prefill="reference")
+    hz.check(rec, label="(cc 10.0) 27B 24/4 d_model 5120 p16")
+    assert rec["kv_lens"] == [160, 256] and rec["t_live"] == 256 == hz.t_max
+
+
+@pytest.mark.L1
+@requires_blackwell
+def test_sm100_extend_two_launches_are_bitwise_and_lengths_form():
+    """Two launches bitwise on ``out`` and the pools; the ``[B]`` lengths form (``cu_seqlens=False``) within the budget on cc 10.0."""
+    hz = _harness(4, 512, max_kv_len=512, page=16, layout="hnd", seed=41)
+    rec1 = hz.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    out1 = rec1["out"].clone()
+    hz.refill_pools()
+    rec2 = hz.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    assert torch.equal(out1, rec2["out"])
+    hz.check(rec2, label="(cc 10.0) second launch")
+    lf = _harness(4, 512, max_kv_len=512, page=16, layout="hnd", cu=False, seed=21)
+    _sm100_pin_extend(lf)
+    rec = lf.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    lf.check(rec, label="(cc 10.0) the lengths form")
+
+
+@pytest.mark.L0
+@requires_blackwell
+def test_sm100_extend_declines_fuse_gate_and_the_fused_fork_by_name():
+    """On the part itself: ``fuse_gate=True`` on the EXTEND form is the SM100 row's typed decline at ``check_support`` (the paged body's
+    gate epilogue is the Rubin rendering's), ``fuse_norm_rope=True`` the sm_107a projection fork's; the plain declaration passes the part
+    rows and builds (the cells above)."""
+    gated, *_ = _declare_extend(2, 128, max_kv_len=128, fuse_gate=True)
+    assert gated.gate_fused, "the declaration records the fused gate; the part speaks at check_support"
+    with pytest.raises(NotImplementedError, match="fuse_gate=True is not served by the f16/bf16 SM100 SDPA engine row") as e:
+        gated.check_support()
+    assert "cc 10.0" in str(e.value) and "fuse_gate=False" in str(e.value)
+    fork, *_ = _declare_extend(2, 128, max_kv_len=128, fuse_norm_rope=True)
+    assert fork.fuse_norm_rope_effective
+    with pytest.raises(NotImplementedError, match=r"rendered for sm_107a \(Rubin\); this device is SM100"):
+        fork.check_support()
+    plain, *_ = _declare_extend(2, 128, max_kv_len=128)
+    plain._check_declaration()
+    plain._check_part_support()
+    env = GatedAttentionBlockFwd.serving_envelope(plain.geom, torch.bfloat16, _DEV)
+    assert env.device_cc == (10, 0) and env.forms == ("extend", "decode")
+    # the FP8-projection + bf16-attention mode ON the part: served iff FP8_PROJ_BF16_ATTENTION_CCS holds cc 10.0 (its cells below run then),
+    # else the mode's part statement at check_support and no spelling in the envelope's quant_modes
+    mode, mode_inp, _ = _declare_extend(2, 128, max_kv_len=128, quant=True)[:3]
+    mode_env = GatedAttentionBlockFwd.serving_envelope(mode.geom, torch.float8_e4m3fn, _DEV, quant=mode_inp["quant"])
+    if (10, 0) in FP8_PROJ_BF16_ATTENTION_CCS:
+        mode._check_declaration()
+        mode._check_part_support()
+        assert mode_env.forms == ("extend", "decode") and mode_env.extend.quant_modes == (QUANT_MODE_FP8_PROJ_BF16_ATTENTION,) == env.extend.quant_modes
+    else:
+        with pytest.raises(NotImplementedError, match=r"QuantSpec\(attention_dtype=torch.bfloat16\) on cc 10.0") as e:
+            mode.check_support()
+        assert "FP8_PROJ_BF16_ATTENTION_CCS" in str(e.value) and mode_env.forms == () and mode_env.extend.reason == str(e.value)
+        assert mode_env.extend.quant_modes == () == env.extend.quant_modes
+
+
+# ---------------------------------------------------------------------------
+# Both served parts (requires_dense_part; 2026-10-29): a serving stack's PACKED K|V cache rows bound as two half views -- the EXTEND form
+# ---------------------------------------------------------------------------
+#
+# The stack's ONE cache tensor per layer, [num_pages, H_kv, P, 2D] (K in columns [0, D), V in [D, 2D) of every row; the 24 / 4 model family's
+# HND cache [pages, 4, 16 or 32, 512]), handed to the block as its two halves kv[..., :D] / kv[..., D:] -- the "unified" layout of the matrix
+# above at the stack's own shape.  The cell mirrors the binding literally (24 / 4 at d 256, pages 16 and 32, a 148-token chunk completing a
+# 2048-key context next to an empty-prefix sequence, a padded entry and a 5-row prefix, the stack's int64 slot mapping, bf16 and f16) and
+# proves the one tensor behind the views: `check` reads the step's rows back through both halves (bitwise the slab rows attention consumed)
+# and finds every row nobody addressed still stale in BOTH halves (a K store running past D would land in the V half of the same row, and
+# vice versa), the NULL page zero; two launches bitwise; bitwise the HND-compact twin on the same histories and pages.
+
+_PACKED_KV_GEOM = dict(d_model=512, h_q=24, h_kv=4, d_head=256, rope_dim=64, causal_bottom_right=True)  # the 24 / 4 model family at a shrunk d_model
+_PACKED_KV_STEP = dict(q_lens=[148, 128, 0, 100], prefix_lens=[1900, 0, 0, 5])  # kv_lens 2048 / 128 / 0 / 105, T_live 376 of 512
+
+
+def _assert_one_packed_tensor(hz, what):
+    """``hz.k_cache`` / ``hz.v_cache`` are the two halves of ONE contiguous ``[num_pages, H_kv, P, 2D]`` tensor: the same base, the V view's
+    data pointer ``D`` elements past the K view's, both with strides ``(H_kv*P*2D, P*2D, 2D, 1)`` (``D`` contiguous, every other stride a whole
+    number of 16-byte vectors: the contract ``check_pool`` admits).  Returns the tensor."""
+    k, v = hz.k_cache, hz.v_cache
+    kv, page, D, h_kv = k._base, hz.page, hz.geom.d_head, hz.geom.h_kv
+    assert kv is v._base and tuple(kv.shape) == (hz.n_pages, h_kv, page, 2 * D) and kv.is_contiguous(), f"{what}: not ONE [P, H, page, 2D] tensor"
+    assert k.data_ptr() == kv.data_ptr() and v.data_ptr() == kv.data_ptr() + D * kv.element_size(), f"{what}: the views are not the two halves"
+    assert tuple(k.stride()) == tuple(v.stride()) == (h_kv * page * 2 * D, page * 2 * D, 2 * D, 1), f"{what}: the half views' strides"
+    return kv
+
+
+@pytest.mark.L0
+@requires_dense_part
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+@pytest.mark.parametrize("page", [16, 32], ids=["p16", "p32"])
+def test_extend_packed_kv_rows_of_a_serving_stack_bind_as_two_half_views(dtype, page):
+    """The stack's ONE ``[pages, 4, P, 512]`` cache tensor bound as the two half views on the EXTEND form at 24 / 4 (``d_model`` 512), pages 16
+    and 32, int64 slots, bf16 and f16: four sequences at ``T_max`` 512 -- a 148-token chunk over a 1900-row prefix (kv_len 2048: 128 pages at 16,
+    64 at 32), a 128-token sequence with an empty prefix, a PADDED entry (the NULL block), a 100-token step over a 5-row prefix (kv_len 105, a
+    tail tile) -- ``T_live`` 376; the suite's ``check`` (the oracle over every live sequence, the rows read back through both halves, the stale
+    rows untouched in both halves, the NULL page zero), two launches bitwise, bitwise the HND-compact twin on the same histories and pages; on
+    cc 10.0 the stage pinned on the shared SM100 paged THD body."""
+    hz = _harness(4, 512, max_kv_len=2048, page=page, layout="unified", dtype=dtype, slot_dtype=torch.int64, geom_kw=_PACKED_KV_GEOM, seed=29)
+    what = f"packed K|V rows 24/4 {dtype} p{page}"
+    kv = _assert_one_packed_tensor(hz, what)
+    assert hz.geom.h_kv == 4 and hz.geom.d_head == 256 and tuple(kv.shape[1:]) == (4, page, 512) and hz.slot.dtype == torch.int64
+    if tuple(torch.cuda.get_device_capability()) == (10, 0):
+        _sm100_pin_extend(hz)
+    rec = hz.step(_PACKED_KV_STEP["q_lens"], prefix_lens=_PACKED_KV_STEP["prefix_lens"], prefill="reference")
+    assert rec["kv_lens"] == [2048, 128, 0, 105] and rec["t_live"] == 376
+    hz.check(rec, label=what)
+    out = rec["out"].clone()
+    hz.refill_pools()
+    rec2 = hz.step(_PACKED_KV_STEP["q_lens"], prefix_lens=_PACKED_KV_STEP["prefix_lens"], prefill="reference")
+    assert torch.equal(out, rec2["out"]), f"{what}: two launches differ"
+    hz.check(rec2, label=what + " (second launch)")
+    twin = _harness(4, 512, max_kv_len=2048, page=page, layout="hnd", dtype=dtype, slot_dtype=torch.int64, geom_kw=_PACKED_KV_GEOM, seed=29)
+    assert twin.k_cache._base is None and twin.v_cache._base is None and twin.k_cache.is_contiguous(), "the twin: two compact tensors"
+    twin.adopt(hz)
+    rec_h = twin.step(_PACKED_KV_STEP["q_lens"], prefix_lens=_PACKED_KV_STEP["prefix_lens"], prefill="reference")
+    twin.check(rec_h, label=what + " (HND twin)")
+    assert torch.equal(
+        out, rec_h["out"]
+    ), f"{what}: out differs from the HND-compact twin's: max|diff| {(out.float() - rec_h['out'].float()).abs().max().item():.3e}"
+
+
+# ---------------------------------------------------------------------------
+# The FP8-PROJECTION + BF16-ATTENTION mode (QuantSpec(attention_dtype=torch.bfloat16)) on the EXTEND form
+# ---------------------------------------------------------------------------
+#
+# A serving stack whose attention projections are static per-tensor FP8 W8A8 while its KV cache and attention math are bf16: e4m3 h / W_qkvg
+# / W_o under one scale each, the FP8 forced-tile projection GEMMs with the descale in their bf16 epilogue, norm + RoPE and the write-through
+# in bf16, the bf16 paged THD body over bf16 pools (the EXTEND form's own stage: the gate in its epilogue under fuse_gate=True on cc 10.7, its
+# own launch otherwise), the gated O quantized to e4m3 at scale_o for the FP8 out projection.  The cells are the bf16 EXTEND cells' twins
+# through `_harness(..., quant=True)`: the oracle the fp8 reference's attention_bf16 arm over the SAME codes, the bars the suite's own
+# (`check`: out cos 0.999, gated-O cos 0.999 + atol 2e-2, dead rows exact, the pools bitwise the slab rows, stale rows untouched).  Served on
+# the parts of FP8_PROJ_BF16_ATTENTION_CCS: the cells skip by name off them (the part's decline is pinned in
+# test_sm100_extend_declines_fuse_gate_and_the_fused_fork_by_name on cc 10.0 and in the host rows above).
+
+
+def _cc():
+    return tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
+
+
+requires_fp8_proj_bf16_attention_part = pytest.mark.skipif(
+    _cc() not in FP8_PROJ_BF16_ATTENTION_CCS,
+    reason=f"the FP8-projection + bf16-attention mode is served on {FP8_PROJ_BF16_ATTENTION_CCS} (declined by name elsewhere); found {_cc()}",
+)
+
+
+def _mode_harness(b_max, t_max, **kw):
+    """ONE compiled mode block per declaration (the harness cache), the elementwise gate unless the cell says otherwise."""
+    return _harness(b_max, t_max, quant=True, **kw)
+
+
+def _mode_pin_extend(hz):
+    """The compiled mode block's facts on the EXTEND form: the attribute, the bf16 paged THD SDPA stage (``fp8`` False), no quantize_q /
+    quantize_kv, ONE distinct quantize_o, both FP8 projections on the jit-only capture-safe route with the alpha epilogue, the carve without
+    the compact e4m3 Q / K / V; on cc 10.0 the shared SM100 paged THD body (`_sm100_pin_extend`)."""
+    blk = hz.blk
+    assert blk.attention_bf16 and blk.quant.attention_bf16 and blk.dtype == torch.float8_e4m3fn and blk.act_dtype == torch.bfloat16 and blk.thd
+    names = [st.name for st in blk._stages]
+    assert names.count("quantize_o") == 1 and "quantize_q" not in names and names[-2:] == ["quantize_o", "out_proj"] and "cache_write" in names
+    sd = blk._sdpa
+    assert (
+        isinstance(sd, _Sdpa)
+        and sd.dtype == torch.bfloat16
+        and sd.fp8 is False
+        and sd.thd
+        and sd.kv_source == KV_SOURCE_PAGED
+        and sd.token_stride == blk.geom.n_qkvg
+    )
+    assert blk._quant_q is None and blk._quant_kv is None and isinstance(blk._quant_o, _Quantize) and blk._quant_o.heads == blk.geom.h_q
+    for st in (blk._proj, blk._out_proj):
+        assert isinstance(st, _Projection) and st.dtype == torch.float8_e4m3fn and st.alpha and st.capture_safe and st._plan.route == "jit-only", (
+            st.name,
+            st._plan.route,
+        )
+    lay = blk._ws
+    assert lay.q8 == lay.k8 == lay.v8 == -1 and lay.o8 >= 0 and set(blk._quant_dev) == {"alpha_qkvg", "alpha_o", "scale_o"} and blk.use_pdl is False
+    assert hz.inp["h"].dtype == torch.float8_e4m3fn and hz.inp["w_qkvg"].dtype == torch.float8_e4m3fn and hz.inp["w_o"].dtype == torch.float8_e4m3fn
+    if _cc() != (10, 7):
+        _sm100_pin_extend(hz)
+    else:
+        assert blk.gate_fused == blk.fuse_gate and (blk._gate is None) == blk.fuse_gate and sd._impl._k_mod.__file__.endswith("/sm100/prefill_d256_f16.py")
+
+
+@requires_dense_part
+@requires_fp8_proj_bf16_attention_part
+@pytest.mark.parametrize(
+    "layout, page",
+    [
+        pytest.param("hnd", 16, marks=pytest.mark.L0, id="hnd-16"),
+        pytest.param("unified", 32, marks=pytest.mark.L0, id="unified-32"),
+        pytest.param("nhd", 64, marks=pytest.mark.L1, id="nhd-64"),
+        pytest.param("hnd", 128, marks=pytest.mark.L1, id="hnd-128"),
+    ],
+)
+def test_fp8_proj_bf16_attention_extend_matrix_cell(layout, page):
+    """The degenerate matrix on serving buffers under the mode: four sequences at T_max 512 -- an empty prefix, a step over a prefix ending
+    mid-page, a PADDED entry, a tail tile -- within the suite's bars of the mode's oracle, the pools bitwise the slab rows, stale rows
+    untouched; the int64 slot dtype at pages 32 / 128; the stage pinned per part."""
+    hz = _mode_harness(4, 512, max_kv_len=512, page=page, layout=layout, slot_dtype=torch.int32 if page in (16, 64) else torch.int64)
+    _mode_pin_extend(hz)
+    rec = hz.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    assert rec["t_live"] == 412
+    hz.check(rec, label=f"mode 8/2 {layout} p{page}")
+
+
+@pytest.mark.L1
+@requires_dense_part
+@requires_fp8_proj_bf16_attention_part
+def test_fp8_proj_bf16_attention_extend_two_chunks_then_a_prefix_hit_on_l3():
+    """A 512-token sequence as TWO chunks on ONE compiled mode block over the UNIFIED content row (T_max 320: a bounded declaration with pad
+    rows): chunk 1 = tokens [0, 300) with an empty prefix, chunk 2 = tokens [300, 512) reading chunk 1's pool rows -- each within the bars of
+    the mode's oracle over the full history; then a prefix-hit step (56 new tokens over a 200-row prefix the torch reference wrote through the
+    stack's own views) on fresh sequences, the prefix rows untouched by the step."""
+    hz = _mode_harness(1, 320, max_kv_len=512, page=16, layout="unified")
+    _mode_pin_extend(hz)
+    rec1 = hz.step([300], prefix_lens=[0], prefill="none")
+    hz.check(rec1, label="mode chunk 1")
+    rec2 = hz.step([212], prefill="keep")
+    hz.check(rec2, label="mode chunk 2 over chunk 1's pool rows")
+    assert rec2["kv_lens"] == [512] and rec2["t_live"] == 212
+    hz.reset()
+    rec = hz.step([56], prefix_lens=[200], prefill="reference")
+    hz.check(rec, label="mode prefix hit on L3")
+    k_p, v_p = hz.pool_rows(0, 0, 200)
+    assert torch.equal(_bits(k_p), _bits(rec["refs"][0].k[0, :200])) and torch.equal(_bits(v_p), _bits(rec["refs"][0].v[0, :200]))
+
+
+@pytest.mark.L0
+@requires_dense_part
+@requires_fp8_proj_bf16_attention_part
+def test_fp8_proj_bf16_attention_extend_padded_entries_a_live_q_over_kv_len_0_and_the_lengths_form():
+    """The general packing under the mode: a zero-length sequence in the MIDDLE and a LIVE Q range (5 new tokens) over kv_len 0 with the NULL
+    block and slot -1 -- those 5 ``out`` rows EXACTLY 0 and their e4m3 O bytes 0 (the dead-row SELECT: no residue reaches the quantize), the
+    neighbours unaffected; the ``[B]`` lengths form (``cu_seqlens=False``) within the bars; ``num_tokens_live`` refused by name at execute."""
+    hz = _mode_harness(4, 512, max_kv_len=512, page=16, layout="hnd")
+    rec = hz.step([100, 0, 60, 5], prefix_lens=[0, 0, 0, 0], prefill="none", kv_lens=[100, 0, 60, 0])
+    hz.check(rec, label="mode middle pad + dead KV")
+    lo, hi = rec["rows"][3]
+    assert bool((rec["out"][lo:hi] == 0).all()) and bool((hz.o_gated()[lo:hi] == 0).all()) and bool((hz.o8()[lo:hi].view(torch.uint8) == 0).all())
+    assert rec["t_live"] == 165 and bool((hz.slot[lo:hi] == -1).all())
+    with pytest.raises(NotImplementedError, match=r"num_tokens_live=165 on a quantized pipeline \(QuantSpec\).*hand the capacity rows"):
+        hz.execute(num_tokens_live=165)
+    lf = _mode_harness(4, 512, max_kv_len=512, page=16, layout="hnd", cu=False, seed=21)
+    _mode_pin_extend(lf)
+    rec = lf.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    lf.check(rec, label="mode, the lengths form")
+
+
+@pytest.mark.L1
+@requires_rubin
+@requires_fp8_proj_bf16_attention_part
+def test_fp8_proj_bf16_attention_extend_fuse_gate_rides_the_paged_body_epilogue():
+    """``fuse_gate=True`` under the mode on cc 10.7: the gate in the bf16 paged body's epilogue (no sigmoid_gate stage; the e4m3 O then quantizes
+    the epilogue-gated bf16 O: ONE bf16 rounding), within the bars; the separate-gate twin on the same step within the one-rounding budget of it
+    on the gated O (bitwise never claimed: the two roundings)."""
+    fused = _mode_harness(4, 512, max_kv_len=512, page=16, layout="hnd", fuse_gate=True, seed=5)
+    assert fused.blk.gate_fused and fused.blk._gate is None and "sigmoid_gate" not in [st.name for st in fused.blk._stages] and fused.blk._sdpa.fuse_gate
+    _mode_pin_extend(fused)
+    rec = fused.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    fused.check(rec, label="mode, the gate in the paged body's epilogue")
+    sep = _mode_harness(4, 512, max_kv_len=512, page=16, layout="hnd", seed=5)
+    sep.adopt(fused)
+    rec_s = sep.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    sep.check(rec_s, label="mode, the separate gate launch")
+    live = slice(0, rec["t_live"])
+    a, b = fused.o_gated()[live].float(), sep.o_gated()[live].float()
+    d = (a - b).abs()
+    bound = torch.maximum(a.abs(), b.abs()) * 2.0**-7 + 2.0**-14  # one bf16 rounding of the gated value (the epilogue's) against two (the launch's)
+    print(
+        f"[mode EXTEND] gate in the epilogue vs the separate launch: max|diff| {d.max().item():.3e}, exact {(d == 0).float().mean().item():.3f} of the live gated O"
+    )
+    assert bool((d <= bound).all()), "the two gate placements differ by more than one bf16 rounding of the gated O"
+
+
+@pytest.mark.L0
+@requires_dense_part
+@requires_fp8_proj_bf16_attention_part
+def test_fp8_proj_bf16_attention_extend_e4m3_o_is_the_cast_of_the_gated_o_and_tracks_the_gate_quant_model():
+    """The mode's e4m3 O on the EXTEND form: (a) the store pin -- the ``o8`` slot BITWISE ``cvt.rn.satfinite(bf16 gated O * scale_o)`` of the
+    block's own gated O on every live row; (b) the gate-and-quantize model of a serving stack, ``e4m3(bf16(bf16(O) * sigmoid(G)) * scale_o)`` on
+    the ORACLE's pre-gate O and gate: the e4m3-ulp histogram printed, the one-ulp claim on the band |x| >= 4 of the e4m3 value domain -- where one e4m3
+    ulp (>= 0.5) exceeds the chain's ABSOLUTE noise floor: near zero the two chains differ not by a rounding of a shared value but by the
+    kernels' tanh-form sigmoid against torch's for strongly negative gates and by the attention's own accumulation order, a floor that is
+    many ulps of the 2^-9 subnormal spacing (its size in e4m3 units is printed) -- the rest reported, no tolerance widened; two launches
+    bitwise."""
+    hz = _mode_harness(4, 512, max_kv_len=512, page=16, layout="hnd", seed=9)
+    rec = hz.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    hz.check(rec, label="mode, the e4m3 O cell")
+    scale_o = hz.spec.scale_o
+    og, o8 = hz.o_gated(), hz.o8()
+    live = slice(0, rec["t_live"])
+    assert torch.equal(o8[live].view(torch.uint8), quant_e4m3(og[live], scale_o).view(torch.uint8)), "o8 is not the e4m3 cast of the block's own gated O"
+    o_ref = torch.cat([ref.o[0, p : p + q] for (lo, hi), ref, q, p in zip(rec["rows"], rec["refs"], rec["q_lens"], rec["prefix_lens"]) if q])
+    g_ref = torch.cat([ref.gate[0, p : p + q] for (lo, hi), ref, q, p in zip(rec["rows"], rec["refs"], rec["q_lens"], rec["prefix_lens"]) if q])
+    model = quant_e4m3((o_ref.float() * torch.sigmoid(g_ref.float())).to(torch.bfloat16), scale_o).float()
+    # the ulp distance on the HOST in fp32 (a handful of elements): torch.exp2 on a CUDA tensor is a jitted (NVRTC) kernel, and NVRTC does
+    # not know every part the block serves
+    a, model = o8[live].float().cpu(), model.cpu()
+    mag = torch.maximum(a.abs(), model.abs())
+    dist = (a - model).abs() / torch.exp2(torch.floor(torch.log2(mag.clamp_min(2.0**-6))) - 3.0)
+    band = mag >= 4.0
+    hist = lambda d: dict(
+        n=int(d.numel()),
+        exact=int((d == 0).sum()),
+        one_ulp=int(((d > 0) & (d <= 1 + 1e-6)).sum()),
+        more=int((d > 1 + 1e-6).sum()),
+        max_ulp=float(d.max()) if d.numel() else 0.0,
+    )  # noqa: E731
+    full, in_band, below = hist(dist), hist(dist[band]), hist(dist[~band])
+    floor = float((a - model).abs()[~band].max()) if bool((~band).any()) else 0.0  # the chain's absolute noise floor below the band, in e4m3 units
+    print(
+        f"[mode EXTEND 8/2 p16] e4m3 O vs the gate-quant model (scale_o {scale_o:.2f}): all {full}; band |x| >= 4: {in_band}; below: {below}; "
+        f"max |block - model| below the band {floor:.4f} (e4m3 units; one ulp in the band is >= 0.5)"
+    )
+    assert in_band["n"] > 0.5 * full["n"] and in_band["more"] == 0 and full["exact"] > 0.5 * full["n"], (in_band, full)
+    out1 = rec["out"].clone()
+    o8_first = o8[live].view(torch.uint8).clone()  # a SNAPSHOT: `o8` views the workspace slot the second launch overwrites
+    hz.refill_pools()
+    rec2 = hz.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    assert torch.equal(out1, rec2["out"]) and torch.equal(o8_first, hz.o8()[live].view(torch.uint8)), "two launches differ"
+
+
+@pytest.mark.L1
+@requires_dense_part
+@requires_fp8_proj_bf16_attention_part
+def test_fp8_proj_bf16_attention_extend_the_27b_geometry_executes_within_the_budget():
+    """One EXTEND step at the 24 / 4 geometry at its real width (``d_model`` 5120) under the mode: two sequences at ``T_max`` 256, a 100-token
+    step over a 60-row prefix and a 156-token step over a 100-row prefix (the table row full), through the harness and ``check``."""
+    hz = _mode_harness(2, 256, max_kv_len=256, page=16, geom_kw=_Q38_27B_EXTEND_GEOM, seed=37)
+    assert hz.geom.d_model == 5120 and hz.geom.h_kv == 4 and hz.geom.n_qkvg % 256 == 0
+    _mode_pin_extend(hz)
+    rec = hz.step([100, 156], prefix_lens=[60, 100], prefill="reference")
+    hz.check(rec, label="mode 27B 24/4 d_model 5120 p16")
+    assert rec["kv_lens"] == [160, 256] and rec["t_live"] == 256 == hz.t_max

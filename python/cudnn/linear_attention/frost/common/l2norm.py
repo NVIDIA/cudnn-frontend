@@ -198,8 +198,10 @@ def build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, *, expand_num=1, expand_phase=
     off-phase rows untouched.  ``expand_fill`` instead walks every expanded q
     row and normalizes a zero row on the off-phase ones, so q_n and inv_q come
     out fully written on the expanded timeline.  ``skip_q`` walks the k rows
-    alone (the state summaries take no q); q, q_n and inv_q are then never
-    read and may alias the k buffers.  ``k_slots`` is :func:`common.host.family_slots` of ``k``: 1 for uniform rows
+    alone (the state summaries take no q); q is then never read, but the
+    compiled signature still carries ``q_n``'s rank and dtype in its place, so
+    :func:`run_l2norm_qk` must be handed ``q_n`` (or ``k_n``) as ``q`` as
+    well, never the k source.  ``k_slots`` is :func:`common.host.family_slots` of ``k``: 1 for uniform rows
     (expanded ``[rows, HK, K]`` or a dense token-major view), else the token-major ``[token, k_slots, HK, K]`` with its
     own strides; a rank-4 ``k`` carries its rows per token (``num_householder``) as the slot extent, which the view takes
     its row stride from (the ``expand_num`` here is the q-row expansion alone); ``k_n`` is always the dense expanded copy."""

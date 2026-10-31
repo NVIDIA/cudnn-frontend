@@ -85,12 +85,24 @@ def _leads(spec: EngineSpec, facts) -> bool:
     d256 GQA 16/2, 32/4 and MHA 16/16, D192x128 MHA 16-128 heads, S 1k-16k, causal / mask-free, BSHD and THD at equal and
     half-to-full lengths): d256 wins 0.73-0.98 -> ahead, except a mask-free ragged THD declaration (declared total below
     b * S_q) at S_q >= 4096 (0.95-1.10); D192x128 loses 1.08-1.91 everywhere -> behind. Only cc 10.0 was measured, and
-    deterministic / bias / dropout / window / sink graphs were not. Every other row keeps ours-first."""
+    deterministic / bias / dropout / window / sink graphs were not. Every other row keeps ours-first.
+
+    A measured entry in ``cudnn.sdpa.placement_table`` answers first; the rules above decide every graph without one."""
+    from cudnn.sdpa import placement_table
+
+    measured = placement_table.lookup(spec.name, facts)
+    if measured is not None:
+        return measured
     if spec.name == "sdpa_bwd_sm100_d128":
         return facts.thd and facts.window_left is None and (facts.d_qk, facts.d_v) == (128, 128)
     if spec.name == "sdpa_bwd_sm100_d256":
         return _d256_leads(facts)
-    return True
+    return spec.name not in TRAIL_ONLY_ROWS
+
+
+TRAIL_ONLY_ROWS = frozenset({"sdpa_bwd_sm80", "sdpa_bwd_sm120", "sdpa_bwd_sm107", "sdpa_bwd_sm107_d512"})
+"""Default-offered rows with no measured lead shard: ranked after the backend's block, so they serve a graph only when the
+backend declines it (a correctness fallback, not a performance claim)."""
 
 
 SM100_D256_BWD_RAGGED_MASKFREE_MAX_S_Q = 4095  # mask-free ragged THD d256 past this length: 0.95-1.10 of the backend
@@ -114,11 +126,14 @@ def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
 
     if not ours or opt_in_engines_enabled():
         return ours
-    from cudnn.engines.heuristics import BACKEND
+    from cudnn.engines.heuristics import BACKEND, LAST_RESORT
 
     spec_of = {offered[s.name]: s for s in ENGINE_SPECS if s.name in offered}
-    lead = [p for p in ours if _leads(spec_of[p.engine_id], facts)]
-    trail = [p for p in ours if p not in lead]
+    last = [p for p in ours if spec_of[p.engine_id].name in TRAIL_ONLY_ROWS]
+    lead = [p for p in ours if p not in last and _leads(spec_of[p.engine_id], facts)]
+    trail = [p for p in ours if p not in last and p not in lead]
+    if last:
+        return lead + [BACKEND] + trail + [LAST_RESORT] + last
     return lead + [BACKEND] + trail if trail else lead
 
 
