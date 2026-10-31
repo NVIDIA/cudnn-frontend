@@ -103,6 +103,44 @@ def test_multi_gpu_process_runs_on_the_arrays_device():
             forward(*[jax.device_put(x, other) for x in (q, k, v, indices)], 2)
 
 
+class _ModeledGpu:
+    platform = "gpu"
+
+    def __init__(self, compute_capability):
+        self.compute_capability = compute_capability
+
+
+@pytest.mark.parametrize("visible", [("10.0", "10.3"), ("10.3", "10.0")], ids=["sm100_first", "sm103_first"])
+def test_the_target_follows_the_arrays_eagerly_and_refuses_a_mixed_host_under_tracing(monkeypatch, visible):
+    """The compile target of a call: eagerly, the committed arrays' device, whatever order the visible GPUs list in; under tracing
+    (no device on a tracer), the visible SM100-family GPUs -- one architecture gives its target, both are refused rather than compiled
+    for the wrong one. Host-modeled: ``jax.local_devices`` is patched, the arrays stay on this GPU, nothing compiles."""
+    from cudnn.block_sparse_attention import jax_api
+
+    q, k, v, indices, _ = inputs()
+    (device,) = q.devices()
+    own = jax_api._SM100_FAMILY[str(device.compute_capability)]
+
+    def config(q, k, v, indices):
+        return jax_api.configuration(q, k, v, indices, None, 2, None, 128, "bhsd", None, False, None)
+
+    seen = []
+
+    def traced(q, k, v, indices):
+        seen.append(config(q, k, v, indices))
+        return q
+
+    monkeypatch.setattr(jax, "local_devices", lambda *args, **kwargs: [_ModeledGpu(cc) for cc in visible])
+    assert config(q, k, v, indices).gpu_arch == own
+    with pytest.raises(ValueError, match="cannot tell SM100 from SM103"):
+        jax.make_jaxpr(traced)(q, k, v, indices)
+    for cc in visible:
+        monkeypatch.setattr(jax, "local_devices", lambda *args, cc=cc, **kwargs: [_ModeledGpu(cc), _ModeledGpu(cc)])
+        jax.make_jaxpr(traced)(q, k, v, indices)
+        assert seen[-1].gpu_arch == jax_api._SM100_FAMILY[cc]
+        assert config(q, k, v, indices).gpu_arch == own
+
+
 def test_eager_backward_reuses_compilation():
     q, k, v, indices, _ = inputs("bshd")
     o, lse = forward(q, k, v, indices, 2, layout="bshd")
