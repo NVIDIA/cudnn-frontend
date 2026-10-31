@@ -83,7 +83,7 @@ def test_threshold_entries_split_on_log2_work():
     low, high = _facts(h_q=16, b=1, s_kv=2048), _facts(h_q=128, b=128, s_kv=131072)
     assert pt.log2_work(low) < entry.log2_work < pt.log2_work(high)
     assert pt.lookup(row, low) is False and pt.lookup(row, high) is True
-    assert pt.lookup(row, _facts(device_cc=(10, 3))) is None  # another part: no study, hand rules decide
+    assert pt.lookup(row, _facts(device_cc=(10, 1))) is None  # another part: no study, hand rules decide
 
 
 @pytest.mark.L0
@@ -150,3 +150,25 @@ def test_decode_the_row_cannot_pack_is_its_own_group():
     assert pt.lookup(row, _facts(h_q=64, **d512)) is True
     assert pt.class_key(row, _facts(h_q=96, page_size=64, padded=True))[8] == "gqa"  # D576 packs 32 of 96
     assert pt.class_key(row, _facts(h_q=96, s_q=1024, **d512))[8] == "gqa"  # prefill: s_q fills the tile, no packing regime
+
+
+@pytest.mark.L0
+def test_cc103_borrows_only_the_studies_its_transfer_check_named(monkeypatch):
+    """cc 10.3 has no studies of its own; it answers with a cc 10.0 entry only when that entry's study is in
+    PART_TRANSFERS[(10, 3)] (study sm103_transfer_20261031) -- never a later cc 10.0 study by default."""
+    row = "sdpa_fwd_prefill_sm100"
+    base, studies = pt.PART_TRANSFERS[(10, 3)]
+    assert base == (10, 0)
+    cases = (
+        dict(),  # paged D576 decode
+        dict(d_qk=512, d_v=512, b=8, s_kv=65536, page_size=64, padded=True),  # paged d512 decode
+        dict(d_qk=576, d_v=512, has_paged_kv=False, b=1, h_q=96, s_kv=131072),  # dense D576 decode
+        dict(d_qk=256, d_v=256, h_q=32, h_kv=2, s_q=2048, s_kv=65536, causal=True, bottom_right=True),  # paged d256 context
+    )
+    for kw in cases:
+        on_100, on_103 = pt.lookup(row, _facts(**kw)), pt.lookup(row, _facts(device_cc=(10, 3), **kw))
+        assert on_100 is not None and on_103 == on_100, kw
+    key = pt.class_key(row, _facts())
+    monkeypatch.setitem(pt.TABLE, key, pt.Entry("always", None, "a_later_cc100_study"))
+    assert pt.lookup(row, _facts()) is True
+    assert pt.lookup(row, _facts(device_cc=(10, 3))) is None
