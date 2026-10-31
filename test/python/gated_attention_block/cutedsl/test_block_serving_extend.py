@@ -2871,7 +2871,7 @@ _Q38_27B_EXTEND_GEOM = dict(d_model=5120, h_q=24, h_kv=4, d_head=256, rope_dim=6
 
 
 def _sm100_pin_extend(hz):
-    """The compiled stage (4) on cc 10.0: the shared SM100 paged THD body, unsplit, unpacked, no gate epilogue, the gate its own stage."""
+    """The compiled stage (4) on cc 10.0 / 10.3: the shared SM100 paged THD body, unsplit, unpacked, no gate epilogue, the gate its own stage."""
     sd = hz.blk._sdpa
     impl = sd._impl
     assert sd.kv_source == KV_SOURCE_PAGED and sd.thd and not sd.fuse_gate and impl.kernel_template == "prefill_d256_f16", impl.kernel_template
@@ -2942,26 +2942,26 @@ def test_sm100_extend_declines_fuse_gate_and_the_fused_fork_by_name():
     assert gated.gate_fused, "the declaration records the fused gate; the part speaks at check_support"
     with pytest.raises(NotImplementedError, match="fuse_gate=True is not served by the f16/bf16 SM100 SDPA engine row") as e:
         gated.check_support()
-    assert "cc 10.0" in str(e.value) and "fuse_gate=False" in str(e.value)
+    assert f"cc {_cc()[0]}.{_cc()[1]}" in str(e.value) and "fuse_gate=False" in str(e.value)
     fork, *_ = _declare_extend(2, 128, max_kv_len=128, fuse_norm_rope=True)
     assert fork.fuse_norm_rope_effective
-    with pytest.raises(NotImplementedError, match=r"rendered for sm_107a \(Rubin\); this device is SM100"):
+    with pytest.raises(NotImplementedError, match=rf"rendered for sm_107a \(Rubin\); this device is SM{_cc()[0]}{_cc()[1]}"):
         fork.check_support()
     plain, *_ = _declare_extend(2, 128, max_kv_len=128)
     plain._check_declaration()
     plain._check_part_support()
     env = GatedAttentionBlockFwd.serving_envelope(plain.geom, torch.bfloat16, _DEV)
-    assert env.device_cc == (10, 0) and env.forms == ("extend", "decode")
-    # the FP8-projection + bf16-attention mode ON the part: served iff FP8_PROJ_BF16_ATTENTION_CCS holds cc 10.0 (its cells below run then),
+    assert env.device_cc == _cc() and env.forms == ("extend", "decode")
+    # the FP8-projection + bf16-attention mode ON the part: served iff FP8_PROJ_BF16_ATTENTION_CCS holds this part (its cells below run then),
     # else the mode's part statement at check_support and no spelling in the envelope's quant_modes
     mode, mode_inp, _ = _declare_extend(2, 128, max_kv_len=128, quant=True)[:3]
     mode_env = GatedAttentionBlockFwd.serving_envelope(mode.geom, torch.float8_e4m3fn, _DEV, quant=mode_inp["quant"])
-    if (10, 0) in FP8_PROJ_BF16_ATTENTION_CCS:
+    if _cc() in FP8_PROJ_BF16_ATTENTION_CCS:
         mode._check_declaration()
         mode._check_part_support()
         assert mode_env.forms == ("extend", "decode") and mode_env.extend.quant_modes == (QUANT_MODE_FP8_PROJ_BF16_ATTENTION,) == env.extend.quant_modes
     else:
-        with pytest.raises(NotImplementedError, match=r"QuantSpec\(attention_dtype=torch.bfloat16\) on cc 10.0") as e:
+        with pytest.raises(NotImplementedError, match=rf"QuantSpec\(attention_dtype=torch.bfloat16\) on cc {_cc()[0]}\.{_cc()[1]}") as e:
             mode.check_support()
         assert "FP8_PROJ_BF16_ATTENTION_CCS" in str(e.value) and mode_env.forms == () and mode_env.extend.reason == str(e.value)
         assert mode_env.extend.quant_modes == () == env.extend.quant_modes
@@ -3005,12 +3005,12 @@ def test_extend_packed_kv_rows_of_a_serving_stack_bind_as_two_half_views(dtype, 
     64 at 32), a 128-token sequence with an empty prefix, a PADDED entry (the NULL block), a 100-token step over a 5-row prefix (kv_len 105, a
     tail tile) -- ``T_live`` 376; the suite's ``check`` (the oracle over every live sequence, the rows read back through both halves, the stale
     rows untouched in both halves, the NULL page zero), two launches bitwise, bitwise the HND-compact twin on the same histories and pages; on
-    cc 10.0 the stage pinned on the shared SM100 paged THD body."""
+    cc 10.0 / 10.3 the stage pinned on the shared SM100 paged THD body."""
     hz = _harness(4, 512, max_kv_len=2048, page=page, layout="unified", dtype=dtype, slot_dtype=torch.int64, geom_kw=_PACKED_KV_GEOM, seed=29)
     what = f"packed K|V rows 24/4 {dtype} p{page}"
     kv = _assert_one_packed_tensor(hz, what)
     assert hz.geom.h_kv == 4 and hz.geom.d_head == 256 and tuple(kv.shape[1:]) == (4, page, 512) and hz.slot.dtype == torch.int64
-    if tuple(torch.cuda.get_device_capability()) == (10, 0):
+    if tuple(torch.cuda.get_device_capability()) in ((10, 0), (10, 3)):
         _sm100_pin_extend(hz)
     rec = hz.step(_PACKED_KV_STEP["q_lens"], prefix_lens=_PACKED_KV_STEP["prefix_lens"], prefill="reference")
     assert rec["kv_lens"] == [2048, 128, 0, 105] and rec["t_live"] == 376

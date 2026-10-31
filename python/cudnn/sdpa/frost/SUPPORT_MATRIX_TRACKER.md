@@ -3367,7 +3367,7 @@ each written in the same change as its accept cell (Rule S2). Rubin (cc 10.7) fo
 FP8-PROJECTION + BF16-ATTENTION mode of the paged forms (`QuantSpec(attention_dtype=torch.bfloat16)`: FP8 projections, bf16 pools and
 attention, the gated O quantized to e4m3; the "Served since 2026-10-30" paragraph below; `FP8_PROJ_BF16_ATTENTION_CCS = ((10, 7), (10, 0))`: cc 10.0 too, functional only) --; the DENSE bf16 / f16 forms also on cc 10.0
 since 2026-10-29 (`DENSE_SERVING_CCS`; the "Admitted 2026-10-29" paragraph below: functional only, UNMEASURED; the cells RAN 2026-10-29 on the GB200 class -- cc 10.0, 152 SMs, one exclusive GPU: 351 passed / 0 failed / 392 skipped over eleven selections, every skip a Rubin-only row -- with the Rubin regression green the same day (cc 10.7, 204 SMs, a shared GPU, functional: 679 / 0 / 56 over nine modules); the 32-column decode
-arm declined by name there until its own cells run, `DECODE_WIDE_TILE_CCS`; cc 10.3 declined by name). The pool contract is the SDPA adapter's own
+arm declined by name there until its own cells run, `DECODE_WIDE_TILE_CCS`; cc 10.3 since 2026-10-31 with the same forms and declines -- the "Admitted 2026-10-31" paragraph below). The pool contract is the SDPA adapter's own
 paged contract -- a 4-D view `[num_pages, H_kv, page_size, D]`, `D` contiguous, the other three strides free: **L1** HND compact
 `(H*P*D, P*D, D, 1)`; **L2** NHD by strides `(P*H*D, D, H*D, 1)`; **L3** a serving stack's unified `[num_pages, H_kv, P, 2D]`
 content row (K at `+0`, V at `+D`, token stride `2D`) bound as its two halves -- nothing is repacked; every non-innermost stride a
@@ -3717,13 +3717,18 @@ table's cap; the adapter refuses it off cc 10.7 too); the 32-COLUMN decode arm (
 2026-10-29: 17 .. 32 packed rows on a wide launch -- `W` --, an unpacked step of 17 .. 32 tokens at any launch -- `U32` --; the SDPA
 adapter's own rule takes the 32-column tile there and no cell of the block has run it on cc 10.0, so the route declines it with the lift in
 the reason, "the 32-column SM100 decode arm: its cc 10.0 accept cells have not run; admitted when they do"; the lift is the tuple gaining
-`(10, 0)` with those cells -- the plumbing stays behind the gate).  cc 10.3 (B300):
-the same SM100 kernels, unproven THROUGH THE BLOCK -- declined by name until its cells run (the tuple gains `(10, 3)` with that run, never
-before).
+`(10, 0)` with those cells -- the plumbing stays behind the gate).
+
+**Admitted 2026-10-31 -- the same DENSE bf16 / f16 serving forms on cc 10.3 (B300 / GB300; `DENSE_SERVING_CCS = ((10, 7), (10, 0), (10, 3))`),
+FUNCTIONAL ONLY, UNMEASURED.**  cc 10.3 runs the cc 10.0 forms through the same SM100 d256 kernels with the same declines (`fuse_gate`, the
+fused projection forks, the quantized pipelines -- `FP8_PROJ_BF16_ATTENTION_CCS` does not hold it, so the FP8-projection + bf16-attention mode
+is declined by name there --, `save_for_backward`, `thd=True` over the block's own K / V, a QsaSpec geometry, the 32-column decode arm); the
+route reads the SM100 line's rule under its own part (`decode_route(device_cc=(10, 3))` is the cc 10.0 cell with `device_cc` (10, 3)).
+The cells RAN 2026-10-31 on one B300 (cc 10.3, one exclusive GPU) over the whole `gated_attention_block/cutedsl` directory: 2564 passed / 0 failed / 1524 skipped -- Rubin-only rows, the FP8-projection mode's decline, environment skips (no nvdisasm / cuobjdump on PATH, one visible GPU, an optional transformers check) and two rows that cannot fire on a served part (develop on the same part: 2466 passed / 1623 skipped -- the cc 10.3 rows declined).  The three modules whose test pins this change also corrected (`test_block_serving_decode.py`, `test_block_serving_extend.py`, `test_block_end_to_end.py`) ran again with the final change: 215 / 0 / 143.
 
 The SM100 DECODE route (`decode_route(geometry, S_q, device_cc=(10, 0), batch=, max_kv_len=)`; `DecodeRoute.device_cc` / `.max_kv_len`
-appended; the part read through `_route_part`, ONE rule with the declaration and the envelope -- an unserved part such as cc 10.3 reads the
-Rubin table, the home reading, `device_cc` None): the SDPA adapter's own rule off cc 10.7, input for input -- `config_sm100.decode_d256_q_tile`
+appended; the part read through `_route_part`, ONE rule with the declaration and the envelope -- cc 10.3 reads this rule under its own
+part; an unserved part such as an sm80 host reads the Rubin table, the home reading, `device_cc` None): the SDPA adapter's own rule off cc 10.7, input for input -- `config_sm100.decode_d256_q_tile`
 with the wide-launch reading `config_sm100.d256_wide_decode_launch(batch, groups, max_kv_len)` (`>= 8` units streaming `>= 4096` 128-key
 tiles between them; `groups` = `H_kv` packed, `H_q` unpacked) -- with its 32-column arm gated behind `DECODE_WIDE_TILE_CCS` (empty: a typed
 decline naming the lift wherever the rule would take that width); no single-unit table, no token-unit arm, no cap, both policies coincide,

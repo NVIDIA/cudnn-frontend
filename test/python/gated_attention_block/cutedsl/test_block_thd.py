@@ -573,7 +573,7 @@ def test_thd_over_the_blocks_own_kv_is_declined_by_name_on_cc_10_0():
     assert blk.thd and blk.kv_source == "self"
     with pytest.raises(NotImplementedError, match="thd=True over the block's own K / V") as e:
         blk.check_support()
-    assert "cc 10.0" in str(e.value) and "EXTEND form" in str(e.value) and "the lift" in str(e.value)
+    assert f"cc {_cc()[0]}.{_cc()[1]}" in str(e.value) and "EXTEND form" in str(e.value) and "the lift" in str(e.value)
 
 
 def _declared_for_execute(geom_kw=_COMMON, lens=_LENS, *, training=False, cu=False):

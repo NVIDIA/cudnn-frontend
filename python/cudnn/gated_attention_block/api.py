@@ -80,14 +80,15 @@ them: ``fuse_norm_rope`` (stages (2)+(3) into (1)'s epilogue) and ``fuse_gate``
 (stage (5) into (4)'s epilogue); with both on the block is THREE launches,
 ``proj(+norm+rope) -> sdpa(+gate) -> out_proj``. The block targets **Rubin
 (SM107)** for every form and, since 2026-10-29, **cc 10.0 (the SM100 line:
-B200 / GB200)** for the DENSE bf16 / f16 INFERENCE forms alone -- the dense
+B200 / GB200)** and, since 2026-10-31, **cc 10.3 (B300 / GB300)** for the
+DENSE bf16 / f16 INFERENCE forms alone -- the dense
 prefill form, the EXTEND form and the DECODE form through the shared SM100
 d256 kernels (:data:`DENSE_SERVING_CCS`; functional only, unmeasured there,
 ``fuse_gate`` declined by name because the sm100 row claims no gate epilogue);
 the fused projection forks (``sm_107a`` renderings), the quantized pipelines,
 the sparse / QsaSpec / indexer machinery, the e4m3 cache and the backward stay
-Rubin-only, cc 10.3 is declined by name until proven through the block, and
-every other arch is declined explicitly rather than served slowly.
+Rubin-only, and every other arch is declined explicitly rather than served
+slowly.
 
 **The default pipeline is deliberately UNFUSED**: five stages, five launches
 (four under ``inplace_qkv``), every intermediate materialised in the caller's
@@ -848,9 +849,9 @@ def decode_route(
 
     ``device_cc`` / ``max_kv_len`` (appended 2026-10-29): the PART the route is read for and the declared KV bound.  The part is read
     through :func:`_route_part` -- ONE rule for this function, the declaration and the envelope: ``None``, cc 10.7 and every part that
-    serves no dense form (an sm80 host, cc 10.3 until it is admitted) read the Rubin table above, value for value (every reading before
+    serves no dense form (an sm80 host, say) read the Rubin table above, value for value (every reading before
     this change; the home reading -- ``DecodeRoute.device_cc`` None says so); a served Blackwell-line part of :data:`DENSE_SERVING_CCS`
-    (cc 10.0) reads the SM100 LINE's rule -- the SDPA adapter's own off cc 10.7 (``SdpaFwdDslSm100._decode_q_tile_for``:
+    (cc 10.0, cc 10.3) reads the SM100 LINE's rule -- the SDPA adapter's own off cc 10.7 (``SdpaFwdDslSm100._decode_q_tile_for``:
     ``config_sm100.decode_d256_q_tile`` with the launch's wide-tile reading ``config_sm100.d256_wide_decode_launch(batch, groups,
     max_kv_len)``, ``groups`` = ``H_kv`` packed and ``H_q`` unpacked), input for input, so ``_Sdpa.compile``'s pin holds there: (a) a
     ``max_q_tile`` cap is NOT served (the cap names the Rubin table; the adapter refuses it off cc 10.7 for the same reason); (b) packed
@@ -5040,9 +5041,9 @@ _SM107_CC = (10, 7)
 # EXTEND form and the DECODE form of the bf16 / f16 block through the shared SM100 d256 kernels -- the paged prefill tile with PackGQA,
 # the SM100 d256 decode tile and its split combine in the module's own forms --; functional only, UNMEASURED there, every Rubin-only
 # knob declined by name: fuse_gate (the sm100 row claims no gate epilogue), the fused projection forks, quant, save_for_backward,
-# thd=True over the block's own K / V, a QsaSpec geometry).  cc 10.3 (B300) runs the same SM100 kernels but is unproven through the
-# block: DECLINED BY NAME until its cells run (a served part has an accept row or a decline row, never neither).
-DENSE_SERVING_CCS: Tuple[Tuple[int, int], ...] = ((10, 7), (10, 0))
+# thd=True over the block's own K / V, a QsaSpec geometry).  cc 10.3 (B300 / GB300, 2026-10-31) runs the same SM100 kernels with the
+# same knobs declined; its accept cells (the dense, EXTEND and DECODE oracle rows) ran on a B300 -- functional only, UNMEASURED there.
+DENSE_SERVING_CCS: Tuple[Tuple[int, int], ...] = ((10, 7), (10, 0), (10, 3))
 # The Blackwell-line parts whose 32-COLUMN SM100 decode arm the block ROUTES (2026-10-29, the review follow-up of the cc 10.0 admission):
 # the SDPA adapter's own rule off cc 10.7 takes the 32-column decode tile (`sm100/decode_d256_f16.py` at N_Q 32) for 17 .. 32 packed rows
 # and for an UNPACKED step of 17 .. 32 tokens on a WIDE launch (config_sm100.d256_wide_decode_launch), but no cc 10.0 cell of the block
@@ -5097,11 +5098,9 @@ def _dense_part_decline(cc) -> Optional[str]:
         return None
     found = "no CUDA device" if cc is None else f"SM{int(cc[0])}{int(cc[1])}"
     why = (
-        "gated_attention_block's dense bf16 / f16 forms are served on cc 10.7 (Rubin, SM107: every form) and cc 10.0 (SM100: the dense prefill, "
-        f"EXTEND and DECODE inference forms through the SM100 d256 decode / prefill tiles -- functional only, unmeasured); found {found}"
+        "gated_attention_block's dense bf16 / f16 forms are served on cc 10.7 (Rubin, SM107: every form) and cc 10.0 / 10.3 (SM100 / SM103: the "
+        f"dense prefill, EXTEND and DECODE inference forms through the SM100 d256 decode / prefill tiles -- functional only, unmeasured); found {found}"
     )
-    if cc is not None and tuple(int(x) for x in cc)[:2] == (10, 3):
-        why += " -- cc 10.3 runs the same SM100 kernels but is unproven through the block: declined by name until its cells run (2026-10-29)"
     return why
 
 
