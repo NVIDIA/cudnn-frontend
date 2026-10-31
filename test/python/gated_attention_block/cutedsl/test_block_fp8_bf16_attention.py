@@ -17,7 +17,7 @@ of the mode (``serving_envelope(quant=)``, ``quant_modes``) on the Rubin and the
 
 Both-parts cell (``requires_dense_part``): the FP8 forced-tile projection GEMMs at the mode's shapes (decode row counts and 128 rows; the
 8 / 2 test geometry and the 24 / 4 geometry at ``d_model`` 5120), the ``jit-only`` capture-safe route, the alpha epilogue, against the fp32
-product of the dequantized codes rounded once to bf16 -- the cell whose cc 10.0 verdict admits the part into
+product of the dequantized codes rounded once to bf16 -- the cell whose cc 10.0 / 10.3 verdict admits the part into
 :data:`FP8_PROJ_BF16_ATTENTION_CCS`.  The whole-block DECODE / EXTEND cells of the mode live beside the bf16 forms' cells
 (``test_block_serving_decode.py`` / ``test_block_serving_extend.py``: the ``quant=`` arms of their harnesses).
 """
@@ -51,7 +51,7 @@ if requirement_error:
 
 pytestmark = pytest.mark.L0
 
-requires_dense_part = pytest.mark.requires_dense_part  # the registered marker: EVERY served part of DENSE_SERVING_CCS (cc 10.7 and cc 10.0)
+requires_dense_part = pytest.mark.requires_dense_part  # the registered marker: EVERY served part of DENSE_SERVING_CCS (cc 10.7, 10.0, 10.3)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
