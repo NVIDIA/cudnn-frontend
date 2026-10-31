@@ -597,7 +597,8 @@ expressible, with one discipline separating them:
   (`BandSupport`). The legacy mask flags stay the declaration spelling and are
   mapped onto that set once, in `Capabilities.__post_init__`; a row that serves
   only unmasked graphs, or only a causal diagonal, says so instead of leaving an
-  axis to default, and the matcher asks every axis in both directions so an
+  axis to default (one coupling is expressible: `window_right`, the right modes
+  a left window pairs with), and the matcher asks every axis in both directions so an
   unset graph flag cannot bypass a restricted claim. See `sdpa/frost/SUPPORT_MATRIX_TRACKER.md`.
 - A notch is a rule in `mismatch()` gated by a conjunction flag on the row
   (e.g. `padded_stats: bool` — padding mask + generate_stats needs the

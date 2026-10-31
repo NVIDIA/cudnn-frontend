@@ -63,10 +63,7 @@ here is that a RESTRICTED claim is expressible at all.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
-
-if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
-    from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
+from typing import Optional
 
 # --- right-bound modes ------------------------------------------------------
 RIGHT_UNBOUNDED = "unbounded"
@@ -123,6 +120,11 @@ REASON_LEFT_WINDOW = REASON_LEFT[LEFT_WINDOW]
 REASON_ANCHOR_WITHOUT_DIAGONAL = "bottom-right alignment requires a causal upper bound (plain or right-widened)"
 
 
+def window_right_reason(window_right) -> str:
+    """The decline sentence for a left window paired with a right mode the row does not pair it with."""
+    return f"a {LABEL_LEFT_WINDOW} is served with a {' or '.join(LABEL_RIGHT[m] for m in sorted(window_right))} only"
+
+
 def anchor_reason(noun: str = "kernel", *, anchor: str = ANCHOR_BOTTOM_RIGHT) -> str:
     """The anchor decline sentence, for either anchor.
 
@@ -157,7 +159,7 @@ class BandFacts:
 
     # ---- construction ------------------------------------------------------
     @classmethod
-    def from_sdpa_facts(cls, facts: "SdpaGraphFacts") -> "BandFacts":
+    def from_sdpa_facts(cls, facts) -> "BandFacts":
         """Normalize the analyzer's resolved mask facts into the canonical band.
 
         Deliberately total (never raises): facts are descriptive and every
@@ -241,6 +243,10 @@ class BandSupport:
     right: frozenset = frozenset({RIGHT_UNBOUNDED})
     left: frozenset = frozenset({LEFT_NONE})
     anchors: frozenset = frozenset({ANCHOR_TOP_LEFT})
+    # The right modes a LEFT WINDOW may be combined with -- the one coupling
+    # between axes a row can declare (None: every claimed right mode).
+    # ``sdpa_bwd_sm100_mxfp8`` serves a window under the causal diagonal only.
+    window_right: Optional[frozenset] = None
 
     def __post_init__(self) -> None:
         for label, domain, values in (
@@ -253,6 +259,11 @@ class BandSupport:
                 raise ValueError(f"BandSupport.{label} has unknown members {sorted(unknown)}; known: {sorted(domain)}")
             if not values:
                 raise ValueError(f"BandSupport.{label} is empty; a row must claim at least one {label} member")
+        if self.window_right is not None and not (self.window_right and set(self.window_right) <= set(self.right) and LEFT_WINDOW in self.left):
+            raise ValueError(
+                f"BandSupport.window_right {sorted(self.window_right)} must be a non-empty subset of right {sorted(self.right)} "
+                "on a row that claims the left window"
+            )
 
     # ---- the three declaration shapes --------------------------------------
     @classmethod
@@ -262,7 +273,7 @@ class BandSupport:
 
     @classmethod
     def causal_and_unmasked(cls) -> "BandSupport":
-        """Unmasked plus a plain causal diagonal, top-left: ``sdpa_bwd_sm100_mxfp8``."""
+        """Unmasked plus a plain causal diagonal, top-left."""
         return cls(right=frozenset({RIGHT_UNBOUNDED, RIGHT_CAUSAL}))
 
     @classmethod
@@ -308,10 +319,15 @@ class BandSupport:
         """Whether this row serves the band's ANCHOR (coherence is checked separately)."""
         return band.anchor in self.anchors
 
+    def serves_window_with(self, band: BandFacts) -> bool:
+        """Whether this row pairs the band's left window with its right mode (``window_right``)."""
+        return band.left_mode != LEFT_WINDOW or self.window_right is None or band.right_mode in self.window_right
+
     def decline(self, band: BandFacts) -> Optional[str]:
         """The canonical first reason this row cannot serve ``band``, or None.
 
-        Order: right mode, left bound, coherence of the anchor, anchor support.
+        Order: right mode, left bound, coherence of the anchor, anchor support,
+        the window coupling.
         The probes ask the same predicates in their own historical order (the
         non-band features interleave), so this is the band-only view of the
         decision, not a second implementation of it.
@@ -324,10 +340,15 @@ class BandSupport:
             return REASON_ANCHOR_WITHOUT_DIAGONAL
         if not self.serves_anchor(band):
             return anchor_reason(anchor=band.anchor)
+        if not self.serves_window_with(band):
+            return window_right_reason(self.window_right)
         return None
 
     def serves(self, band: BandFacts) -> bool:
         return self.decline(band) is None
 
     def as_dict(self) -> dict:
-        return {"right": sorted(self.right), "left": sorted(self.left), "anchors": sorted(self.anchors)}
+        out = {"right": sorted(self.right), "left": sorted(self.left), "anchors": sorted(self.anchors)}
+        if self.window_right is not None:
+            out["window_right"] = sorted(self.window_right)
+        return out

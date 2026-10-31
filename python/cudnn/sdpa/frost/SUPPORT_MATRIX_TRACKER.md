@@ -105,8 +105,8 @@ unbounded · causal · finite-right / top-left · bottom-right anchor, plus the
 row serves (`BandSupport`, held on each row as `Capabilities.band` and derived
 from the legacy flags by one normalization layer). The legacy flags stay the
 declaration spelling of every row below; the point of the model is that a
-RESTRICTED row is expressible — the causal-and-unmasked claim of the MXFP8 backward, or
-the top-left-anchor-only claim of the SM89 forward row — instead of an
+RESTRICTED row is expressible — the MXFP8 backward's window served under the causal diagonal only (`window_right`, the
+one coupling between axes a row may declare), or the top-left-anchor-only claim of the SM89 forward row — instead of an
 unmentioned axis silently meaning yes. The matcher asks every axis in BOTH
 directions, so a mode the graph requests by leaving a flag unset (unbounded
 right band, no left bound, top-left anchor) is part of the row's claim too.

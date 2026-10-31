@@ -330,8 +330,8 @@ class Capabilities:
     # model the probe decides with.  APPENDED at the end for the append-only
     # contract; ``None`` means "derive from the legacy flags above", and a row
     # needing a restricted claim passes an explicit BandSupport (the MXFP8
-    # backward row's legacy ``causal=True`` already derives the restricted
-    # causal-and-unmasked set, ``BandSupport.causal_and_unmasked()``).  __post_init__
+    # backward row: causal + swa with the window paired with the causal
+    # diagonal only, ``window_right``).  __post_init__
     # resolves it, so ``capabilities.band`` is never None after construction,
     # and a legacy flag that is SET outside an explicit claim is refused there.
     band: Optional["band.BandSupport"] = None
@@ -571,6 +571,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         # The backward probe has always said "engine" here (the forward one says
         # "kernel"); band.anchor_reason keeps both wordings in one definition.
         return band.anchor_reason("engine", anchor=band_facts.anchor)
+    if not band_support.serves_window_with(band_facts):
+        return band.window_right_reason(band_support.window_right)
     m = capabilities.bottom_right_s_q_multiple
     if facts.bottom_right and m > 1 and facts.s_q % m != 0:
         return (
@@ -1313,8 +1315,7 @@ def _sm100_mxfp8_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Op
         return f"the mxfp8 row serves (D_QK, D_V) in {_SM100_MXFP8_HEAD_PAIRS}; graph has ({facts.d_qk}, {facts.d_v})"
     if facts.window_left is not None and facts.d_qk == 256:
         return "the mxfp8 row serves a sliding window on the kernel pair route (D_QK 64, 128, 192) only"
-    if facts.window_left is not None and not facts.causal:
-        return "the mxfp8 row serves a sliding window under the causal mask only"
+    # A window without the causal mask is the row's band claim (``window_right``), not a declaration check.
     if facts.window_left is not None and facts.s_q > facts.s_kv + facts.window_left:
         return "the mxfp8 row serves a sliding window while every query row keeps a key (S_q <= S_kv + left offset)"
     if facts.d_qk != 256 and facts.scale is not None and not (math.isfinite(facts.scale) and facts.scale > 0):
@@ -1363,6 +1364,12 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             declaration_check=_sm100_mxfp8_declaration_mismatch,
+            # causal + swa, with the window served under the causal diagonal only
+            band=band.BandSupport(
+                right=frozenset({band.RIGHT_UNBOUNDED, band.RIGHT_CAUSAL}),
+                left=frozenset({band.LEFT_NONE, band.LEFT_WINDOW}),
+                window_right=frozenset({band.RIGHT_CAUSAL}),
+            ),
         ),
         lower=partial(lower_dsl_bwd_mxfp8, api_type=_SM100_MXFP8),
     )

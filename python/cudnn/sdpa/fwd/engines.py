@@ -2302,6 +2302,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         return band.REASON_ANCHOR_WITHOUT_DIAGONAL
     if not band_support.serves_anchor(band_facts):
         return band.anchor_reason("kernel", anchor=band_facts.anchor)
+    if not band_support.serves_window_with(band_facts):
+        return band.window_right_reason(band_support.window_right)
     if facts.padded and facts.wants_stats and not facts.thd and not capabilities.padded_stats:
         return "padding mask with generate_stats is not supported by this kernel"
 
