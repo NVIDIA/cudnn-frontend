@@ -2081,7 +2081,6 @@ def _softmax_warp_group(
     # Phase trackers persist (XOR) across tile boundaries.
     bmm1_phase = cutlass.Int32(0)
     stat_empty_phase = cutlass.Int32(1)  # bootstrap pre-armed at phase 1 so first wait passes
-    # init phase=1, XOR after; each softmax wg waits its own O slot (see the top-of-tile wait).
     epilogue_state = cutlass.Int32(1)
 
     # total_sum is Vector[Float32, 2] (even/odd partials) so per-iter update
@@ -2119,12 +2118,7 @@ def _softmax_warp_group(
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
-        # Each softmax warpgroup waits ITS OWN O slot.  Slot 0's producer chain (MMA bmm2_done[0] -> correction qs=0 epilogue ->
-        # o_full[0] -> TMA-STG -> o_empty[0]) never passes through warpgroup 1, so TMA-STG could complete a SECOND phase of slot 0
-        # before warpgroup 1 performed this parity wait -- shortest on an EMPTY (q-tile, split) unit -- and the wait aliased: warpgroup 1
-        # never published that tile's stats and the correction (stat_full[1]) and TMA-STG (o_full[1]) deadlocked (GitHub #1532, #1525).
-        # Slot sub_tile_id's chain runs through this warpgroup's own stats publish, so its producer is bounded to one phase ahead.
-        bars.mb_o_empty[sub_tile_id].wait(epilogue_state, spin=SPIN_RING_WAITS)
+        bars.mb_o_full[0].wait(epilogue_state)
         epilogue_state = epilogue_state ^ cutlass.Int32(1)
 
         total_max = NEG_INF
@@ -2401,6 +2395,7 @@ def _correction_warp_group(
     # bmm2_done starts at phase=0; iter 0 skipped — first wait at kv_loop=1.
     bmm2_done_phase = cutlass.Int32(0)
     o_empty_phase = cutlass.Int32(1)  # bootstrap pre-armed at phase 1 so first wait passes
+    first_tile = cutlass.Int32(1)
 
     q_super_idx, head_idx, batch_idx, split_idx = _decode_initial_split(
         sched.bidx_init,
@@ -2426,14 +2421,16 @@ def _correction_warp_group(
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
         # Iter-0 skip: MMA's iter-0 BMM2 uses init_d=False so α-rescale is unneeded.
         if bounds.right > bounds.left:
-            for qs in cutlass.range_constexpr(CFG.TILES_Q):
-                bars.mb_bmm2_ready[qs * CFG.N_BMM2_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+            if first_tile > cutlass.Int32(0):
+                for qs in cutlass.range_constexpr(CFG.TILES_Q):
+                    bars.mb_bmm2_ready[qs * CFG.N_BMM2_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
             for qs in cutlass.range_constexpr(CFG.TILES_Q):
                 bars.mb_stat_full[qs].wait(stat_full_phase, spin=SPIN_RING_WAITS)
                 bars.mb_stat_empty[qs].arrive()
             stat_full_phase = stat_full_phase ^ 1
         else:
             bars.mb_empty_mainloop.arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+        first_tile = cutlass.Int32(0)
 
         for kv_loop in cutlass.range(bounds.left + cutlass.Int32(1), bounds.right, 1, unroll=1):
             tmem_base_iter = tmem_ptr_i32.load()
@@ -2495,6 +2492,27 @@ def _correction_warp_group(
 
             stat_full_phase = stat_full_phase ^ 1
             bmm2_done_phase = bmm2_done_phase ^ 1
+
+        wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
+        nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
+        nxt_q_super_idx, nxt_head_idx, nxt_batch_idx, nxt_split_idx = _decode_payload_split(
+            nxt_q,
+            nxt_hb,
+            cta_in_pair,
+            n_q_supers,
+            n_qh,
+            n_batch,
+            seq_kv_lens_tensor,
+            qh_per_kh,
+            seqlen_kv,
+        )
+        nxt_valid = nxt_v & cutlass.Int32(1)
+        sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
+        nxt_eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, nxt_batch_idx, seqlen_kv)
+        nxt_eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, nxt_batch_idx, seqlen_q, n_batch, seq_q_lens_addr)
+        nxt_bounds = _bounds_for_tile_split(
+            nxt_q_super_idx, nxt_eff_seqlen_q, nxt_eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, nxt_batch_idx, nxt_split_idx, CFG.QH_PER_KH
+        )
 
         tmem_base_epi = tmem_ptr_i32.load()
         for qs in cutlass.range_constexpr(CFG.TILES_Q):
@@ -2765,6 +2783,10 @@ def _correction_warp_group(
                         bars.mb_o_empty[qs].wait(o_empty_phase, spin=SPIN_RING_WAITS)
                     smem_ptr.store_swizzled(o_half, alignment=64, swizzle=_O_SMEM_SWIZZLE)
 
+            if nxt_valid > cutlass.Int32(0):
+                if nxt_bounds.right > nxt_bounds.left:
+                    bars.mb_bmm2_ready[qs * CFG.N_BMM2_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+
             # Under KV split this epilogue sees only its OWN partial, and the
             # recombined O is a convex combination of the partials -- so a max
             # over partials over-reports the output amax (~2.9x at 8 splits).
@@ -2787,24 +2809,12 @@ def _correction_warp_group(
         # n_kv=1 multi-wave deadlocks on the 2nd tile without this.
         bmm2_done_phase = bmm2_done_phase ^ 1
 
-        wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
-        nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
-        q_super_idx, head_idx, batch_idx, split_idx = _decode_payload_split(
-            nxt_q,
-            nxt_hb,
-            cta_in_pair,
-            n_q_supers,
-            n_qh,
-            n_batch,
-            seq_kv_lens_tensor,
-            qh_per_kh,
-            seqlen_kv,
-        )
-        is_valid_tile = nxt_v & cutlass.Int32(1)
-        sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
-        eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-        eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_addr)
-        bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx, CFG.QH_PER_KH)
+        q_super_idx = nxt_q_super_idx
+        head_idx = nxt_head_idx
+        batch_idx = nxt_batch_idx
+        split_idx = nxt_split_idx
+        is_valid_tile = nxt_valid
+        bounds = nxt_bounds
 
     # tmem_dealloc fan-out: fire one arrive per lane; cga2 also DSMEM-arrives
     # on the peer so peer's local mbar accumulates the full CGA count.
