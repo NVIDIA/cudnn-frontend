@@ -35,3 +35,56 @@ def fold_batch_layout(shape, stride, *, writable=False, allow_identity_broadcast
                 raise ValueError("matrix output view requires non-overlapping storage")
             occupied += (d - 1) * s
     return (batch, *shape[-2:]), (pitch, *stride[-2:])
+
+
+def reshape_layout(shape, stride, target):
+    """Compute a lexicographic zero-copy reshape using contiguous stride chunks.
+
+    Unit axes do not break a chunk. Matrix padding and noncontiguous layouts
+    are accepted only when the requested shape does not merge across a gap.
+    No tensor/framework calls, allocation or address dereference is involved.
+    """
+    shape, stride, target = tuple(map(int, shape)), tuple(map(int, stride)), tuple(map(int, target))
+    limit = (1 << 63) - 1
+    if not shape or not target or len(shape) != len(stride) or any(d <= 0 for d in (*shape, *target)) or any(s < 0 for s in stride):
+        raise ValueError("reshape view requires positive extents and nonnegative strides")
+    if prod(shape) != prod(target):
+        raise ValueError("reshape view must preserve element count")
+    if max(prod(shape), 1 + sum((d - 1) * s for d, s in zip(shape, stride)), *shape, *target, *stride) > limit:
+        raise ValueError("reshape view exceeds signed 64-bit geometry")
+    if shape == target:
+        return target, stride
+    result = [0] * len(target)
+    axis = len(target) - 1
+    chunk_stride, chunk_size, view_size = stride[-1], 1, 1
+    for i in range(len(shape) - 1, -1, -1):
+        chunk_size *= shape[i]
+        boundary = i == 0 or (shape[i - 1] != 1 and stride[i - 1] != chunk_size * chunk_stride)
+        if not boundary:
+            continue
+        while axis >= 0 and (view_size < chunk_size or target[axis] == 1):
+            result[axis] = view_size * chunk_stride
+            view_size *= target[axis]
+            axis -= 1
+        if view_size != chunk_size:
+            raise ValueError("reshape view would require copying across a stride gap")
+        if i > 0:
+            chunk_stride, chunk_size, view_size = stride[i - 1], 1, 1
+    if axis != -1 or max(result) > limit:
+        raise ValueError("reshape view cannot represent requested shape in signed 64-bit geometry")
+    return target, tuple(result)
+
+
+def operand_view_layout(shape, stride, steps):
+    """Apply a prepared sequence of logical reshape and last-two-axis views."""
+    shape, stride = tuple(shape), tuple(stride)
+    for kind, argument, declared_stride in steps:
+        if kind == "reshape":
+            shape, stride = reshape_layout(shape, stride, argument)
+            if declared_stride and any(d > 1 and x != y for d, x, y in zip(shape, stride, declared_stride)):
+                raise ValueError("reshape declared strides do not match a logical zero-copy view")
+        elif kind == "transpose":
+            shape, stride = tuple(shape[i] for i in argument), tuple(stride[i] for i in argument)
+        else:
+            raise ValueError(f"unsupported operand view {kind!r}")
+    return shape, stride

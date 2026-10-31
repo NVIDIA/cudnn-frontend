@@ -469,6 +469,53 @@ class OperandBuffer {
         return new OperandBuffer(out, tensor_.device.device_id);
     }
 
+    // A checked metadata-only view; logical index mapping is proved by the caller.
+    OperandBuffer *
+    metadata_view(const std::vector<int64_t> &shape, const std::vector<int64_t> &strides) const {
+        if (shape.empty() || shape.size() != strides.size())
+            throw py::value_error("metadata view requires matching nonempty shape and strides");
+        auto geometry = [](const std::vector<int64_t> &dim, const std::vector<int64_t> &st) {
+            if (dim.empty() || dim.size() != st.size())
+                throw py::value_error("metadata view requires matching source shape and strides");
+            int64_t volume = 1, storage_span = 1;
+            for (size_t i = 0; i < dim.size(); ++i) {
+                if (dim[i] <= 0 || st[i] < 0 || volume > std::numeric_limits<int64_t>::max() / dim[i])
+                    throw py::value_error("metadata view exceeds positive signed 64-bit geometry");
+                volume *= dim[i];
+                if (st[i] != 0 && dim[i] - 1 > (std::numeric_limits<int64_t>::max() - storage_span) / st[i])
+                    throw py::value_error("metadata view exceeds signed 64-bit storage span");
+                storage_span += (dim[i] - 1) * st[i];
+            }
+            return std::make_pair(volume, storage_span);
+        };
+        auto source_strides = operand_.stride;
+        if (source_strides.empty()) {
+            source_strides.resize(operand_.shape.size());
+            int64_t pitch = 1;
+            for (size_t i = operand_.shape.size(); i-- > 0;) {
+                if (operand_.shape[i] <= 0 || pitch > std::numeric_limits<int64_t>::max() / operand_.shape[i])
+                    throw py::value_error("metadata view exceeds positive signed 64-bit geometry");
+                source_strides[i] = pitch;
+                pitch *= operand_.shape[i];
+            }
+        }
+        auto source         = geometry(operand_.shape, source_strides);
+        auto target         = geometry(shape, strides);
+        const int64_t bytes = (operand_.dtype.bits * operand_.dtype.lanes + 7) / 8;
+        if (bytes <= 0) throw py::value_error("metadata view requires a valid element width");
+        if (source.second > std::numeric_limits<int64_t>::max() / bytes ||
+            target.second > std::numeric_limits<int64_t>::max() / bytes)
+            throw py::value_error("metadata view exceeds signed 64-bit byte span");
+        if (target.first != source.first || target.second > source.second ||
+            (operand_.observed_bytes >= 0 && target.second > operand_.observed_bytes / bytes))
+            throw py::value_error("metadata view exceeds original operand storage or changes element count");
+        Operand out = operand_;
+        out.shape   = shape;
+        out.stride  = strides;
+        out.ndim    = static_cast<int32_t>(shape.size());
+        return new OperandBuffer(out, tensor_.device.device_id);
+    }
+
     // Fold only affine leading batch axes. Unlike reshape, this preserves the
     // matrix strides and gaps between matrices; it never copies or owns storage.
     OperandBuffer *
@@ -1539,6 +1586,7 @@ capsule built in python.
                                       return self.reshape(std::move(shape));
                                   })
                              .def("flatten_batch", &OperandBuffer::flatten_batch)
+                             .def("metadata_view", &OperandBuffer::metadata_view)
                              .def("permute",
                                   [](const OperandBuffer &self, py::args axes) {
                                       std::vector<int64_t> order;

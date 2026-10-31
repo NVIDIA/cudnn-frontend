@@ -34,7 +34,7 @@ from .fusion_ir import (
 
 # Dtype + op tables
 
-from .layouts import fold_batch_layout
+from .layouts import fold_batch_layout, operand_view_layout
 
 from .dtypes import CUDNN_FROM_DTYPE as _CUDNN_FROM_DTYPE
 from .dtypes import DTYPE_FROM_CUDNN as _DTYPE_FROM_CUDNN
@@ -136,6 +136,7 @@ class _RecordedOp:
     reduction_mode: str | None = None  # "add"/"amax"/"max"/"min"; None otherwise
     group_offset: int | None = None
     permutation: tuple[int, ...] = ()
+    reshape_mode: str = "VIEW_ONLY"
 
 
 @dataclass
@@ -154,6 +155,7 @@ class _TensorMeta:
     dim_override: tuple[int, ...] | None = None
     mn_transposed: bool | None = None  # None for ordinary bindings; bool for a normalized caller-axis view
     matrix_batch: tuple[int, ...] | None = None  # original leading axes before rank normalization
+    operand_view: tuple | None = None  # fixed source shape and ordered zero-copy operations
 
 
 # Variant-pack binding — maps each graph role to its cuDNN tensor
@@ -179,6 +181,7 @@ class GemmBinding:
     b_transposed: tuple[bool, ...] = ()
     aux_transposed: tuple[bool, ...] = ()
     matrix_batches: tuple[tuple[Any, tuple[int, ...]], ...] = ()
+    operand_views: tuple = ()
 
     def bound_tensors(self) -> list[Any]:
         """List tensors bound by this GEMM plan."""
@@ -221,6 +224,7 @@ def swap_ab_binding(binding: "GemmBinding | None") -> "GemmBinding | None":
         b_transposed=binding.a_transposed,
         aux_transposed=binding.aux_transposed,
         matrix_batches=binding.matrix_batches,
+        operand_views=binding.operand_views,
     )
 
 
@@ -271,6 +275,7 @@ def _make_multi_binding(
         b_transposed=_transpose_flags(b_ids),
         aux_transposed=tuple(views.get((ref.name, id(tensor)), False) for ref, tensor in zip(aux_refs, aux_objs)) if views else (),
         matrix_batches=tuple(matrix_batches.values()),
+        operand_views=tuple({id(m.tensor): (m.tensor, *m.operand_view) for m in meta.values() if m.operand_view is not None}.values()),
     )
 
 
@@ -381,6 +386,11 @@ def _node_to_recorded_op(node: Any) -> "_RecordedOp | None":
         A, B = node.inputs["A"], node.inputs["B"]
         out = node.outputs["C"]
         return _RecordedOp("matmul", name, [id(A), id(B)], id(out), out, compute_dtype=compute)
+    if node_type == "RESHAPE":
+        inp, out = node.inputs["input"], node.outputs["OUT_0"]
+        raw_mode = node.params.get("reshape_mode")
+        mode = "VIEW_ONLY" if raw_mode is None else getattr(raw_mode, "name", "unsupported")
+        return _RecordedOp("reshape", name, [id(inp)], id(out), out, reshape_mode=mode)
     if node_type == "TRANSPOSE":
         inp, out = node.inputs["input"], node.outputs["OUT_0"]
         return _RecordedOp("transpose", name, [id(inp)], id(out), out, permutation=tuple(node.params.get("permutation") or ()))
@@ -1534,6 +1544,132 @@ def _build_multi_moe_chain(
     return chain, binding
 
 
+def _normalize_operand_reshapes(ops, meta, io_dtype, intermediate_dtype):
+    """Project operand-only logical views through elementwise chains.
+
+    Ordered transformations retain index semantics when reshape and transpose
+    do not commute. Runtime source shapes are pinned in this initial contract;
+    no dynamic reshape is guessed from element counts. Other graph paths retain
+    their existing lowering without additional execute-time work.
+    """
+    if not any(op.cudnn_name == "reshape" for op in ops):
+        return ops
+    matmuls = [op for op in ops if op.cudnn_name == "matmul"]
+    if len(matmuls) != 1 or any(op.cudnn_name not in (*_UNARY_OP_MAP, *_BINARY_OP_MAP, "matmul", "reshape", "transpose") for op in ops):
+        raise ValueError("operand reshape fusion requires one plain pointwise/GEMM graph")
+    mm = matmuls[0]
+    producers = {op.output: op for op in ops}
+    projected, used, input_views = [], set(), {}
+
+    @lru_cache(maxsize=None)
+    def logical_shape(tid):
+        m, op = meta[tid], producers.get(tid)
+        if m.dim:
+            return m.dim
+        if op is None:
+            raise ValueError(f"reshape operand {m.name!r}: explicit source dimensions are required")
+        if op.cudnn_name in _UNARY_OP_MAP:
+            return logical_shape(op.inputs[0])
+        if op.cudnn_name in _BINARY_OP_MAP:
+            return max((logical_shape(i) for i in op.inputs), key=lambda d: prod(d))
+        raise ValueError(f"reshape operand {m.name!r}: explicit view dimensions are required")
+
+    def scalar(tid):
+        return all(d == 1 for d in logical_shape(tid))
+
+    def alias(tid, dim, stride, view=None):
+        m = meta[tid]
+        result = replace(
+            m,
+            name=f"{m.name}_reshape_view_{len(meta)}",
+            dim=dim,
+            stride=stride,
+            dtype=_resolve_out_dtype(tid, m.tensor, io_dtype, intermediate_dtype, meta),
+            mn_transposed=False if m.is_input else None,
+            operand_view=view,
+        )
+        meta[id(result)] = result
+        return id(result)
+
+    @lru_cache(maxsize=None)
+    def project(tid, steps=()):
+        op, m = producers.get(tid), meta[tid]
+        dim = logical_shape(tid)
+        if op is None:
+            if not steps:
+                return tid
+            if m.dtype not in ("bf16", "fp16", "fp32"):
+                raise ValueError("operand reshape currently supports BF16, FP16 and FP32 storage only")
+            stride = m.stride or tuple(prod(dim[i + 1 :]) for i in range(len(dim)))
+            target, target_stride = operand_view_layout(dim, stride, steps)
+            previous = input_views.setdefault(id(m.tensor), (dim, steps))
+            if previous != (dim, steps):
+                raise ValueError("shared reshape input requires incompatible operand views")
+            return alias(tid, target, target_stride, (dim, steps))
+        if op.cudnn_name in ("reshape", "transpose"):
+            if _is_output(meta, tid):
+                raise ValueError("materialized operand reshape/transpose outputs cannot be absorbed")
+            source_dim = logical_shape(op.inputs[0])
+            source_dtype = _resolve_out_dtype(op.inputs[0], meta[op.inputs[0]].tensor, io_dtype, intermediate_dtype, meta)
+            output_dtype = _resolve_out_dtype(tid, m.tensor, io_dtype, intermediate_dtype, meta)
+            if source_dtype != output_dtype:
+                raise ValueError("operand reshape/transpose dtype changes are unsupported")
+            if op.cudnn_name == "reshape":
+                if op.reshape_mode not in ("LOGICAL", "VIEW_ONLY") or prod(source_dim) != prod(dim):
+                    raise ValueError("operand reshape must preserve element count and have a supported mode")
+                step = ("reshape", dim, m.stride)
+            else:
+                identity = tuple(range(len(source_dim)))
+                swap = (*identity[:-2], len(source_dim) - 1, len(source_dim) - 2)
+                if len(source_dim) < 2 or op.permutation not in (identity, swap):
+                    raise ValueError("reshape operand transpose must preserve batch axes")
+                step = ("transpose", op.permutation, ())
+            used.add(tid)
+            return project(op.inputs[0], (step, *steps))
+        if op.cudnn_name not in (*_UNARY_OP_MAP, *_BINARY_OP_MAP) or op.cudnn_name == "gen_index":
+            raise ValueError(f"reshape operand producer {op.cudnn_name!r} is unsupported")
+        if _is_output(meta, tid):
+            if steps:
+                raise ValueError("materialized pointwise operands cannot be absorbed through reshape")
+            return tid
+        primary = next((i for i in op.inputs if not scalar(i)), op.inputs[0])
+        if any(not scalar(i) and logical_shape(i) != logical_shape(primary) for i in op.inputs):
+            raise ValueError("reshape fusion supports equal-shaped pointwise operands or scalar auxiliaries, not partial broadcasts")
+        inputs = [i if scalar(i) and i != primary else project(i, steps) for i in op.inputs]
+        parent = meta[inputs[op.inputs.index(primary)]]
+        output = alias(tid, parent.dim, parent.stride)
+        projected.append(replace(op, inputs=inputs, output=output))
+        return output
+
+    inputs = [project(i) for i in mm.inputs]
+    structural = {op.output for op in ops if op.cudnn_name in ("reshape", "transpose")}
+    if structural != used:
+        raise ValueError("reshape/transpose fusion is operand-only; epilogue or unrelated views are unsupported")
+    rewritten = [replace(op, inputs=inputs) if op is mm else op for op in ops if op.output not in structural] + projected
+    by_output = {op.output: op for op in rewritten}
+    live = set()
+
+    def visit(tid):
+        if tid in live:
+            return
+        live.add(tid)
+        if tid in by_output:
+            for i in by_output[tid].inputs:
+                visit(i)
+
+    for tid, m in list(meta.items()):
+        if _is_output(meta, tid):
+            visit(tid)
+    visit(mm.output)
+    for tid in list(meta):
+        if tid not in live:
+            del meta[tid]
+    for m in meta.values():
+        if m.is_input and id(m.tensor) in input_views and m.operand_view is None:
+            raise ValueError("shared reshape input has an observable branch in incompatible coordinates")
+    return [op for op in rewritten if op.output in live]
+
+
 def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta], io_dtype: Dtype, intermediate_dtype: Dtype) -> list[_RecordedOp]:
     """Resolve logical shapes, project operand transposes, then fold the kernel ABI.
 
@@ -2146,7 +2282,8 @@ def _analyze_state(state: dict) -> tuple[FusionChain, GemmBinding | None]:
     if not state["ops"]:
         raise ValueError("graph has no ops; nothing to compile")
     meta = dict(state["tensor_meta"])
-    ops = _normalize_operand_views(state["ops"], meta, state["io_dtype"], state["intermediate_dtype"])
+    ops = _normalize_operand_reshapes(state["ops"], meta, state["io_dtype"], state["intermediate_dtype"])
+    ops = _normalize_operand_views(ops, meta, state["io_dtype"], state["intermediate_dtype"])
     return _build_chain(
         ops,
         meta,
