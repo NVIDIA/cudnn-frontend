@@ -377,7 +377,7 @@ def test_loader_binds_the_flavor_to_the_record():
         )
         assert mod.LAYOUT.TOTAL_COLS == 576 and mod.DESC_VERSION == 0 and mod.SPIN_RING_WAITS is True
         assert f"d{width}" in mod.__name__, mod.__name__
-        assert sorted(mod._MAKE_CFG) == [32, 64, 128]
+        assert sorted(mod._MAKE_CFG) == [32, 64, 128, 192]
 
 
 def test_expect_tx_is_the_full_box_and_every_box_is_the_tile():
