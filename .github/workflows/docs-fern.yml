@@ -1,4 +1,4 @@
-name: Docs check
+name: docs
 
 # Validates the Fern docs project under docs/fern: the navigation in
 # versions/latest.yml must stay in sync with the MDX/Markdown under docs/,
