@@ -328,6 +328,31 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "prefill", "dense", "window", True, "gqa", True): Entry("always", None, "sm80_dense_prefill_20261031"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "prefill", "dense", "window", True, "mha", False): Entry("always", None, "sm80_dense_prefill_20261031"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "prefill", "dense", "window", True, "mha", True): Entry("always", None, "sm80_dense_prefill_20261031"),
+    # study sm107_dense_decode_20261031 (cuDNN 9.29.0.18; cc 10.7, 216 SMs; dense bf16 decode and MTP, s_q 1-4: d64 with the gpt-oss
+    # masks (sink, window + sink, neither), GQA 4 / 8; d256 without a sink, GQA 4-16; b 1-128, S_kv 3k-128k on and off the tile;
+    # 396 train + 52 scored random holdout cells incl. groups 5, 6, 12; d256 single-row decode keeps the hand order: its
+    # frontier moves with the group, which one cost threshold per class cannot follow -- the 10-31 nightly found G16 at
+    # S_kv 2k, below the grid, 1.5x slower)
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "mtp", "dense", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm107_dense_decode_20261031"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "mtp", "dense", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm107_dense_decode_20261031"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "dense", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm107_dense_decode_20261031"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "dense", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm107_dense_decode_20261031"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "dense", "causal_br", True, "gqa", False): Entry(
+        "always", None, "sm107_dense_decode_20261031"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "dense", "causal_br", True, "gqa", True): Entry("always", None, "sm107_dense_decode_20261031"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "dense", "window", True, "gqa", False): Entry("always", None, "sm107_dense_decode_20261031"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "dense", "window", True, "gqa", True): Entry("always", None, "sm107_dense_decode_20261031"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "q1", "dense", "none", False, "gqa", False): Entry("never", None, "sm107_dense_decode_20261031"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "q1", "dense", "none", False, "gqa", True): Entry("never", None, "sm107_dense_decode_20261031"),
     # study sm103_swa_prefill_20261031 (cuDNN 9.29.0.18; B300; sliding-window context, dense and paged, d64 with and without
     # a sink, d128 / d256 without, windows 128 / 4096 in training; 320 train + 64 random + 32 on-tile holdout cells)
     ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (128, 128), "prefill", "dense", "window", False, "gqa", False): Entry(
