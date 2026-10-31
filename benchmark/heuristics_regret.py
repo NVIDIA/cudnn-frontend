@@ -112,16 +112,36 @@ def _defaults(paths):
     return out
 
 
+def _pairs(now, then):
+    """(case, now, baseline) for every case of `now` with exactly one counterpart in `then`. Two cases are counterparts when
+    one row's columns include the other's (a run that added a column still pairs with its predecessor) and they agree on
+    the shared ones; a case with several counterparts is dropped as ambiguous."""
+    schema = lambda case: frozenset(k for k, _ in case)
+    by_schema = defaultdict(dict)
+    for case, v in then.items():
+        by_schema[schema(case)][case] = v
+    groups = defaultdict(list)
+    for case in now:
+        groups[schema(case)].append(case)
+    for s_now, cases in groups.items():
+        found = defaultdict(list)
+        for s_then, prev in by_schema.items():
+            if not (s_then <= s_now or s_now <= s_then):
+                continue
+            cols = s_now & s_then
+            index = defaultdict(list)
+            for c, v in prev.items():
+                index[tuple(kv for kv in c if kv[0] in cols)].append(v)
+            for case in cases:
+                found[case] += index.get(tuple(kv for kv in case if kv[0] in cols), [])
+        for case in cases:
+            if len(found[case]) == 1:
+                yield case, now[case], found[case][0]
+
+
 def _report_baseline(paths, baseline, regress, top):
-    now, then = _defaults(paths), _defaults(baseline)
-    cols = {k for case in now for k, _ in case} & {k for case in then for k, _ in case}
-    project = lambda case: tuple((k, v) for k, v in case if k in cols)
-    then = {project(c): v for c, v in then.items()}
     ratios, changed, same, lost = [], [], [], []
-    for case, (t, detail) in now.items():
-        prev = then.get(project(case))
-        if prev is None:
-            continue
+    for case, (t, detail), prev in _pairs(_defaults(paths), _defaults(baseline)):
         if t is None:
             if prev[0] is not None:
                 lost.append((case, prev))

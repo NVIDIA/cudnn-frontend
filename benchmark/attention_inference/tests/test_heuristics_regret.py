@@ -105,3 +105,24 @@ def test_a_file_with_duplicate_legs_is_skipped_not_fatal(tmp_path):
     out = subprocess.run([sys.executable, "-m", "benchmark.heuristics_regret", str(tmp_path)], capture_output=True, text=True)
     assert out.returncode == 0 and "compared cases: 1" in out.stdout, out.stdout + out.stderr
     assert "skipping" in out.stderr and "dup.csv" in out.stderr
+
+
+def test_baseline_pairs_within_compatible_schemas(tmp_path):
+    """A training CSV that already records attn_mask must not hide an inference regression whose baseline predates it."""
+    for run in ("then", "now"):
+        (tmp_path / run).mkdir()
+        _write(
+            tmp_path / run / "train.csv",
+            [dict(backend="cudnn_auto", q_tokens=9, kv_len=9, time_ms="1.0", backend_detail="T", attn_mask="top_left", profile_pass="fwd")],
+            extra=("attn_mask", "profile_pass"),
+        )
+    auto = lambda ms, plan: dict(backend="cudnn_auto", q_tokens=1, kv_len=8192, time_ms=ms, backend_detail=f"cudnn_auto plan={plan}")
+    _write(tmp_path / "then" / "inf.csv", [auto("1.0", "A")])
+    _write(tmp_path / "now" / "inf.csv", [dict(auto("3.0", "B"), attn_mask="no_mask")], extra=("attn_mask",))
+    out = subprocess.run(
+        [sys.executable, "-m", "benchmark.heuristics_regret", str(tmp_path / "now"), "--baseline", str(tmp_path / "then"), "--fail"],
+        capture_output=True,
+        text=True,
+    )
+    assert "matched cases: 2" in out.stdout and "1 with a new default plan" in out.stdout, out.stdout
+    assert out.returncode == 1
