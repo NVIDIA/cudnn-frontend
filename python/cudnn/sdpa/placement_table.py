@@ -238,6 +238,18 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "q1", "dense", "none", False, "gqa", True): Entry(
         "ge", 8.293, "sm100_d576_dense_decode_20261030", "rows"
     ),
+    # study sm107_d256_paged_decode_20261031 (cuDNN 9.29.0.18; cc 10.7, 216 SMs; paged bf16 d256 decode and MTP, s_q 1-4,
+    # GQA 4-16 incl. G12, b 1-64, S_kv 2k-128k on and off the tile, page 64 and 16; 252 train + 48 random holdout cells)
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "mtp", "paged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm107_d256_paged_decode_20261031"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "mtp", "paged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm107_d256_paged_decode_20261031"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", False): Entry(
+        "ge", 26.506, "sm107_d256_paged_decode_20261031"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", True): Entry("ge", 26.585, "sm107_d256_paged_decode_20261031"),
     # study sm103_swa_prefill_20261031 (cuDNN 9.29.0.18; B300; sliding-window context, dense and paged, d64 with and without
     # a sink, d128 / d256 without, windows 128 / 4096 in training; 320 train + 64 random + 32 on-tile holdout cells)
     ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (128, 128), "prefill", "dense", "window", False, "gqa", False): Entry(
