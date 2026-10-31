@@ -462,7 +462,7 @@ def test_expect_tx_is_the_full_box_and_every_box_is_the_tile():
                         assert env["K_BOXES"] == env["V_BOXES"] == 1
     for bad in (r"TransactionBytes\s*=.*\bd_(qk|v)\b", r"box_[qkvo]\s*=.*\bd_(qk|v)\b", r"BufferElems\s*=.*\bd_(qk|v)\b"):
         assert not re.search(bad, code), bad
-    assert "_MAKE_CFG = {32: make_cfg_d32, 64: make_cfg_d64, 128: make_cfg_d128}" in code
+    assert "_MAKE_CFG = {32: make_cfg_d32, 64: make_cfg_d64, 128: make_cfg_d128, 192: make_cfg_d192_paged}" in code
     assert "d128_family_tmem_layout(CFG)" in code and not re.search(r"^\s*(S1|O0|O1|STATS)_OFF: int = \d+\s*$", code, re.M), "no TMEM literal survives"
     assert re.search(r"CHUNK = CFG\.BMM2_CHUNK_SIZE", code) and not re.search(r"^\s*CHUNK = 64\s*$", code, re.M)
 

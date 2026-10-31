@@ -170,6 +170,7 @@ __all__ = [
     "make_cfg_d128",
     "make_cfg_d128_mxfp8",
     "make_cfg_d192",
+    "make_cfg_d192_paged",
     "make_cfg_d192_mxfp8",
     "make_cfg_d256",
     "make_cfg_d256_mxfp8",
@@ -310,7 +311,7 @@ def supports_fp8_padded_split(d_shape, *, device_cc, pertensor, thd, paged):
 # setup-kernel contract (the 14-arg build_thd_meta_o_descs_kernel + the 4B+4
 # metadata the shared decode reads).  Keyed by the `flavor` string
 # `_validate_params` already receives, so adding a ported flavor is one entry.
-_F16_THD_FLAVORS = frozenset({"sm107 d64", "sm107 d128", "sm107 d192xd128", "sm107 d256", "sm107 d512"})
+_F16_THD_FLAVORS = frozenset({"sm107 d64", "sm107 d128", "sm107 d192xd128", "sm107 d192xd128 paged", "sm107 d256", "sm107 d512"})
 
 # Paged KV (TemplateParams.paged_kv / page_size) on the Rubin line uses the native half D128 and MXFP8 D128/D256
 # K/V TMA-LDG sites. Half D256 prefill and the single-Q THD split retain their shared bodies. The page id is the TMA
@@ -322,7 +323,7 @@ _F16_THD_FLAVORS = frozenset({"sm107 d64", "sm107 d128", "sm107 d192xd128", "sm1
 # route, the SM100 decode record re-validated for Rubin) and sm107/sparse_d256_f16.py (make_cfg_d256_sparse -- the
 # index-list core's gather warps read K / V from the pools through the (B, max_pages) table; page_size a multiple of
 # the 4-token block).
-_PAGED_KV_FLAVORS_SM107 = frozenset({"sm107 d128", "sm107 d128 mxfp8", "sm107 d256 mxfp8"})
+_PAGED_KV_FLAVORS_SM107 = frozenset({"sm107 d128", "sm107 d192xd128 paged", "sm107 d128 mxfp8", "sm107 d256 mxfp8"})
 
 # Head-dim shapes whose Rubin f16/bf16 kernel carries the THD/varlen leg -- the
 # same one-definition-two-consumers arrangement as SM107_FP8_THD_SHAPES above
@@ -396,6 +397,11 @@ SM107_SMALL_D_NATIVE_LEGS = {(32, 32): frozenset(), (64, 64): frozenset({"THD", 
 # = a 32-byte MN-major swizzle atom, which no shipped kernel runs -- declined until measured (a cga2 request at D <= 32 lands
 # on the 64-wide tile, the smallest covering one validated at that width).
 SM107_SMALL_D_CGAS = {(32, 32): frozenset({1}), (64, 64): frozenset({1, 2})}
+
+
+def supports_native_d192_paged(d_shape, *, device_cc, fp8, paged, cga=None, split_kv=1):
+    """Native half D192/V128 page-pool loader, dense or ragged Q."""
+    return device_cc == (10, 7) and d_shape == (192, 128) and not fp8 and paged and cga in (None, 2) and split_kv == 1
 
 
 def supports_native_d64_pack(d_shape, *, device_cc, fp8, paged, split_kv=1, cga=None):
@@ -1705,9 +1711,10 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
             )
         if not k.seq_kv_lens_present:
             raise ValueError(f"{flavor}: paged_kv requires seq_kv_lens_present (the per-batch KV length bounds the block-table walk)")
-        if flavor == "sm107 d128":
-            if k.dtype_qkv not in (_DTYPE_BF16, _DTYPE_FP16) or k.d_flavor != 128:
-                raise ValueError(f"{flavor}: paged_kv is not wired for this dtype/tile; native paged half prefill requires the D128 half body")
+        if flavor in ("sm107 d128", "sm107 d192xd128 paged"):
+            expected_d = 192 if flavor == "sm107 d192xd128 paged" else 128
+            if k.dtype_qkv not in (_DTYPE_BF16, _DTYPE_FP16) or k.d_flavor != expected_d:
+                raise ValueError(f"{flavor}: native paged half prefill requires half inputs and d_flavor={expected_d}")
             p = k.page_size
             if p < 8 or p % 8 or (p < 128 and 128 % p) or (p > 128 and p % 128):
                 raise ValueError(f"{flavor}: page_size must be a multiple of 8 dividing 128, or a multiple of 128; got {p}")
@@ -2434,6 +2441,18 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
     and ``CfgD192`` only widens ``TILE_K``.
     """
     return _make_cfg_d128_family(params, flavor="sm107 d192xd128", tile_k=192, tile_o=128, mxfp8=False)
+
+
+def make_cfg_d192_paged(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
+    """Paged half D192/V128 in the shared native prefill body.
+
+    Two CTAs keep Q/O and both K/V stages within 240 KiB, below the
+    version-0 descriptor window. The older nonpaged D192 body cannot read
+    page tables and retains its separate factory and admission boundary.
+    """
+    if not params.paged_kv or params.cta_mma != 2 or (params.split_kv or 1) != 1:
+        raise ValueError("sm107 d192xd128 paged: requires paged KV, two CTAs and no split")
+    return _make_cfg_d128_family(params, flavor="sm107 d192xd128 paged", tile_k=192, tile_o=128, mxfp8=False)
 
 
 def make_cfg_d192_mxfp8(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
