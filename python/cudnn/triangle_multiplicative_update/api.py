@@ -700,9 +700,9 @@ def _substrate_plan_on(build, params, device_index: int, arch: str = "sm107", ta
     """One cute-compiled launchable of the K1 / K3 substrate per (parameter set, arch body, target, device).  A CuTe-DSL launchable is bound to the CUDA
     context it was first loaded in -- a K1 launchable built on ``cuda:0`` fails on ``cuda:1`` with ``cudaErrorInvalidValue`` at launch, and
     vice versa (measured on a two-GPU host) -- while the substrate's ``build_*`` cache is per parameter set only.  Under the plan's device:
-    when the substrate's cache fills NOW its launchable is bound here and is reused (the single-device case pays nothing extra); when it was
-    filled earlier -- by a plan on another device, or by a caller outside this API -- the same template module gets a second ``cute.compile``
-    for this device, cached per (params, device)."""
+    when this call runs the template module's first compile its launchable is bound here and is reused (the single-device case pays nothing
+    extra); when the module was compiled earlier -- by a plan on another device, or by a caller outside this API, under any spelling of the
+    same target -- it gets a second ``cute.compile`` for this device, cached per (params, device)."""
     from cudnn.gemm.frost import ln_prologue
 
     key = (params, str(arch), target, int(device_index))
@@ -713,7 +713,9 @@ def _substrate_plan_on(build, params, device_index: int, arch: str = "sm107", ta
     with torch.cuda.device(device_index), _SUBSTRATE_LOCK:
         before = ln_prologue.build_ln_dual_gemm.cache_info().currsize
         base = build(params, arch, target)
-        built_here = ln_prologue.build_ln_dual_gemm.cache_info().currsize > before
+        # The builder's cache growing is not enough: its spellings of one module (no target, None, the home target) are separate entries
+        # that share the module's compile().  Bound here only if that compile() missed now, i.e. has never hit.
+        built_here = ln_prologue.build_ln_dual_gemm.cache_info().currsize > before and base.module.compile.cache_info().hits == 0
         plan = base if built_here else ln_prologue.LnDualGemmPlan(params=base.params, module=base.module, launch=base.module.compile.__wrapped__())
         return _SUBSTRATE_PLANS.setdefault(key, plan)
 

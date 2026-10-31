@@ -1392,6 +1392,54 @@ def test_stock_caller_invocation_shape_hits_the_caches_and_matches_the_class_api
     assert out1.grad_fn is None and not out1.requires_grad
 
 
+def test_a_launch_compiled_on_another_device_is_never_reused_under_another_target_spelling(monkeypatch):
+    """A direct builder call warms the sm100 module on cuda:0 with no target (or the explicit home target); a plan on cuda:1 then asks for
+    the other spelling.  The builder caches the two spellings apart but they share one module and its compile(), so the plan must still
+    compile for its own device.  Host-modeled: the real builder, loader and module caches run, ``torch.cuda.device`` only records the
+    device, and ``cute.compile`` records (device, target) instead of compiling."""
+    import contextlib
+    import functools
+
+    import cutlass.cute as cute
+    from cudnn.frost import template_loader
+    from cudnn.gemm.frost import ln_prologue as sub
+
+    current, compiled = [0], []
+
+    @contextlib.contextmanager
+    def on(index):
+        before, current[0] = current[0], int(index)
+        try:
+            yield
+        finally:
+            current[0] = before
+
+    def record(*args, options, **kwargs):
+        compiled.append((current[0], options.split("--gpu-arch ")[1]))
+        return compiled[-1]
+
+    fresh = functools.lru_cache(maxsize=None)(sub.build_ln_dual_gemm.__wrapped__)
+    for module in (sub, k1, k3):
+        monkeypatch.setattr(module, "build_ln_dual_gemm", fresh)
+    monkeypatch.setattr(template_loader, "_MODULES", {})
+    monkeypatch.setattr(tapi, "_SUBSTRATE_PLANS", {})
+    monkeypatch.setattr(torch.cuda, "device", on)
+    monkeypatch.setattr(cute, "compile", record)
+    proj, tail = k1.proj_params(128, 128, has_bias=True, has_mask=True), k3.tail_params(128, 128, has_bias=True)
+    k1.build_trimul_proj(proj, "sm100")  # the legacy spelling, on cuda:0
+    sub.build_ln_dual_gemm(tail, "sm100", "sm_100a")  # the explicit home target, on cuda:0
+    assert compiled == [(0, "sm_100a"), (0, "sm_100a")]
+    for build, params, target in ((k1.build_trimul_proj, proj, "sm_100a"), (k3.build_trimul_tail, tail, None)):
+        for _ in range(2):
+            assert tapi._substrate_plan_on(build, params, 1, "sm100", target).launch == (1, "sm_100a")
+    assert compiled[2:] == [(1, "sm_100a"), (1, "sm_100a")]
+    # A module compiled first by the plan itself is bound to the plan's device and reused; another part's target is its own module.
+    fresh_k = k1.proj_params(256, 128, has_bias=True, has_mask=True)
+    for device, target in ((2, "sm_100a"), (3, "sm_103a")):
+        assert tapi._substrate_plan_on(k1.build_trimul_proj, fresh_k, device, "sm100", target).launch == (device, target)
+    assert compiled[4:] == [(2, "sm_100a"), (3, "sm_103a")]
+
+
 @requires_served_arch
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two visible GPUs")
 def test_plan_declared_on_a_non_current_device_compiles_and_runs_there():
