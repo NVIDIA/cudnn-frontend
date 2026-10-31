@@ -4430,14 +4430,31 @@ Packed token/head-major and explicitly padded Stats retain their existing
 contracts. Independent physical origins and runtime length rebinding use the
 prepared THD chain without staging copies. Dense PackGQA uses the native
 64-wide tile, including smaller aligned head dimensions through its envelope.
-Paged KV, splitting, score side outputs and pre-folded scale keep their
-existing larger-flavor selection and admission boundaries. D32 THD remains
+Paged KV, score side outputs and pre-folded scale keep their existing
+larger-flavor selection and admission boundaries. D32 THD remains
 outside this native flavor.
 
 Unsplit nonpaged native D64 PackGQA is currently available through explicit
 plans. Automatic packed proposals still use the historical shared-D128
 eligibility predicate; extending that policy is a separate heuristics change.
-The existing split candidates keep their D128 selection.
-`test_sdpa_fp8_sm107.py::TestNativeD64Half` exposes all 60 native regression
+Dense split plans use the native D64 selection described below.
+`test_sdpa_fp8_sm107.py::TestNativeD64Half` exposes the native regression
 cases through the SM107 CI entrypoint; its shared helper module is not
 collected separately.
+
+
+### SM107 native half D64 dense split-KV
+
+Dense FP16/BF16 split plans with aligned logical head dimensions up to 64
+use the native 64-wide operands, MMA and FP32 partial stores. Both one- and
+two-CTA plans support packed or unpacked GQA, including partial head groups,
+and TILE_N 64 or 128. Attention sinks are excluded from the partials and
+folded exactly once by the shared combine; final Stats can use natural or
+base-2 logarithms. Graph and standalone APIs use the same feature domain.
+Existing mask, scalar-tail and per-request padding restrictions still apply.
+Native D64 THD remains nonpaged and unsplit; paged plans retain their existing
+flavor selection. Automatic split/packing policy is a separate workstream.
+
+The physical D64 dense split uses the shared single-Q half body at CGA1/N128,
+compiled for SM107, and native SM107 prefill at CGA2 or N64. Both store FP32
+partials and support proper-divisor PackGQA. Existing unsplit routes are unchanged.
