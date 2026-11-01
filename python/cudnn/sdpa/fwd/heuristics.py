@@ -153,6 +153,9 @@ _SM100_D128_LPT_L2_MIN_BYTES = 8 * 1024 * 1024
 _SM107_CGA_Q_ROWS = 256
 _SM107_MEASURED_SMS = 212
 _SM107_NO_GQA_LPT_MAX_WAVES = 24
+# Rubin half THD causal prefill on the d128 flavor without packing: LPT ahead of NATURAL up to ~10 waves (9.48 and 11.85
+# measured; 311 FI-path cells, ragged and paged, 2026-11-01). d256 measured mixed from 5 waves on and keeps NATURAL.
+_SM107_THD_LPT_MAX_WAVES = 10
 # cc 10.7 half, the shared d128 DECODE tile (sm100/decode_d128_f16.py compiled for sm_107a, issue #1472) carrying a
 # packed GQA group: plain LPT leads NATURAL from a 2k cache on.  MEASURED on a 216-SM cc 10.7 board (cuDNN 9.26.0.51
 # and 9.27.0.28, CUDA-graph replay, kernel time, every plan of the unified list timed round-robin; the dense sink decode /
@@ -1326,6 +1329,11 @@ def _prefer_paged_d256_lpt(facts) -> bool:
     )
 
 
+def _sm107_cluster_waves(facts) -> float:
+    """Rubin causal grid size in waves: (batch, head, 256-row Q block) units per 2-CTA cluster."""
+    return (int(facts.b) * int(facts.h_q) * -(-int(facts.s_q) // _SM107_CGA_Q_ROWS)) / ((facts.device_sm_count or _SM107_MEASURED_SMS) // 2)
+
+
 def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
     """Ordered scheduler-policy candidates.
 
@@ -1374,6 +1382,20 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
                 primary = SCHED_LPT
             elif SCHED_LPT in domain and _prefer_paged_d256_lpt(facts):
                 primary = SCHED_LPT
+            elif (
+                SCHED_LPT in domain
+                and caps.sm_lo == 107
+                and facts.causal
+                and facts.window_left is None
+                and not (facts.has_sink or facts.right_band_widening)
+                and (
+                    _selected_d_shape(caps, facts) == (64, 64)
+                    or (_selected_d_shape(caps, facts) == (128, 128) and _sm107_cluster_waves(facts) <= _SM107_THD_LPT_MAX_WAVES)
+                )
+            ):
+                # Unpacked cc 10.7 causal THD: LPT balances the triangle while the d128 grid is a few waves; the 1-CTA d64
+                # flavor never measured behind NATURAL (rubin_sched_thd study, 2026-11-01).
+                primary = SCHED_LPT
             return [primary] + sorted(domain - {primary})
         return [SCHED_NATURAL]
     causal_ish = facts.causal or facts.right_band_widening
@@ -1404,8 +1426,7 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # The bound is the arch LINE, not `>= 107`: the SM120 rows sit at sm_lo=120 and
         # keep the SM100/SM120 L2-budget rule below (the wave-count constants above
         # are Rubin's cluster count and CGA rows, unmeasured on GeForce Blackwell).
-        waves = (int(facts.b) * int(facts.h_q) * -(-int(facts.s_q) // _SM107_CGA_Q_ROWS)) / ((facts.device_sm_count or _SM107_MEASURED_SMS) // 2)
-        primary = SCHED_LPT if waves <= _SM107_NO_GQA_LPT_MAX_WAVES else SCHED_NATURAL
+        primary = SCHED_LPT if _sm107_cluster_waves(facts) <= _SM107_NO_GQA_LPT_MAX_WAVES else SCHED_NATURAL
     elif causal_ish and rubin_dense_d128_shared_leg(caps, facts) and _q_clusters_per_unit(caps, facts, None) == 1:
         # The cc 10.7 half row's shared d128 bodies (issue #1472) measured the one-cluster band their own way, so they
         # take this arm instead of the SM100 rule below.  Decode tile (S_q x PACK_G <= 128), a packed group, no window
