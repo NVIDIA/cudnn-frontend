@@ -30,7 +30,7 @@ _POINTS = [
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("thd", [False, True])
 @pytest.mark.parametrize("graph_mode", [False, True])
-def test_native_paged_adapter_rebind_replay(point, dtype, thd, graph_mode, cudnn_handle, monkeypatch, single_q=False, case_index=None):
+def test_native_paged_adapter_rebind_replay(point, dtype, thd, graph_mode, cudnn_handle, monkeypatch, single_q=False, case_index=None, graph_knobs=None):
     import cutlass.cute as cute
 
     index = (_POINTS.index(point) if case_index is None else case_index) * 4 + (2 if dtype == torch.float16 else 0) + int(thd)
@@ -151,7 +151,10 @@ def test_native_paged_adapter_rebind_replay(point, dtype, thd, graph_mode, cudnn
         fe.validate()
         fe.build_operation_graph()
         fe.create_execution_plans([cudnn.heur_mode.A])
-        select_engine(fe, "sdpa_fwd_prefill_sm80")
+        selected = select_engine(fe, "sdpa_fwd_prefill_sm80")
+        if graph_knobs is not None:
+            fe.create_execution_plan(selected.engine_id, graph_knobs)
+            fe.select_plan(len(fe.plans) - 1)
         fe.check_support()
         fe.build_plans()
         artifact = fe

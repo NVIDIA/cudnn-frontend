@@ -46,6 +46,36 @@ QWEN_CFG = Cfg(D_QK=256, D_V=256, TILE_M=128, TILE_N=64, NUM_WARPS=8)
 WIDE512_CFG = Cfg(D_QK=512, D_V=512, TILE_M=32, TILE_N=16, NUM_WARPS=4)
 MLA576_CFG = Cfg(D_QK=576, D_V=512, TILE_M=32, TILE_N=16, NUM_WARPS=4)
 
+FLAVOR_CFGS = {
+    "gptoss": GPTOSS_CFG,
+    "llama": LLAMA_CFG,
+    "dsv3": DSV3_CFG,
+    "qwen": QWEN_CFG,
+    "wide512": WIDE512_CFG,
+    "mla576": MLA576_CFG,
+}
+
+
+def pick_flavor(d_qk: int, d_v: int) -> str:
+    """Smallest native envelope, shared by graph admission and lowering."""
+    for name, cfg in FLAVOR_CFGS.items():
+        if d_qk <= cfg.D_QK and d_v <= cfg.D_V:
+            return name
+    dims = {name: (cfg.D_QK, cfg.D_V) for name, cfg in FLAVOR_CFGS.items()}
+    raise ValueError(f"SM80 SDPA: no flavor envelope covers (D_QK={d_qk}, D_V={d_v}).  Supported envelopes: {dims}.")
+
+
+def graph_tile_domains(d_qk: int, d_v: int) -> tuple[frozenset[int], frozenset[int]]:
+    """Explicit graph tuning domain; this does not prescribe default tiles.
+
+    The 256-wide double K/V buffers at N128 need 256 KiB, exceeding
+    A100's 164 KiB limit. Wide heads use the fixed column-partition tile.
+    """
+    cfg = FLAVOR_CFGS[pick_flavor(d_qk, d_v)]
+    if cfg.D_QK > 256 or cfg.D_V > 256:
+        return frozenset({32}), frozenset({16})
+    return frozenset({64, 128}), frozenset({32, 64} if cfg == QWEN_CFG else {64, 128})
+
 
 # ---------------------------------------------------------------------------
 # TemplateParams — the compile-time identity of one SM80 kernel specialization.
@@ -161,7 +191,7 @@ def validate_params(p: TemplateParams) -> None:
 
 def params_for_flavor(flavor: str, **overrides) -> TemplateParams:
     """A TemplateParams seeded from one native flavor's Cfg row."""
-    cfg = {"gptoss": GPTOSS_CFG, "llama": LLAMA_CFG, "dsv3": DSV3_CFG, "qwen": QWEN_CFG, "wide512": WIDE512_CFG, "mla576": MLA576_CFG}[flavor]
+    cfg = FLAVOR_CFGS[flavor]
     base = dict(d_qk=cfg.D_QK, d_v=cfg.D_V, tile_m=cfg.TILE_M, num_warps=cfg.NUM_WARPS, tile_n=cfg.TILE_N)
     base.update(overrides)
     p = TemplateParams(**base)

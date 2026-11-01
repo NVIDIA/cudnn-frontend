@@ -36,6 +36,7 @@ from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURA
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import band
 from cudnn.sdpa import graph_analyzer as ga
+from cudnn.sdpa.fwd.config_sm80 import graph_tile_domains as _sm80_graph_tile_domains
 from cudnn.sdpa.fwd.config_sm100 import (
     d256_mxfp8_pair_leg,
     SM100_SCORE_STATS_SHAPES,
@@ -1103,10 +1104,28 @@ def effective_sched_policies(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     return capabilities.sched_policies
 
 
+def _sm80_explicit_tile_domains(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs]):
+    if capabilities.sm_lo == 80 and knobs is not None and (knobs.tile_m is not None or knobs.tile_n is not None):
+        try:
+            return _sm80_graph_tile_domains(facts.d_qk, facts.d_v)
+        except ValueError:
+            return frozenset(), frozenset()
+    return None
+
+
+def effective_tile_ms(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> frozenset[int]:
+    """Explicit native query tiles; keep the default proposal domain unchanged."""
+    sm80_domains = _sm80_explicit_tile_domains(capabilities, facts, knobs)
+    return sm80_domains[0] if sm80_domains is not None else capabilities.tile_ms
+
+
 def effective_tile_ns(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> frozenset[int]:
     """KV tile-width domain of the native flavor the lowering will pick: row-wide ``tile_ns`` is the floor, a
     ``tile_ns_by_d_shape`` entry for the selected flavor replaces it (the Rubin small tiles render 64 and 128, the
     native D128 rendering additionally admits explicit 64 on its double-score pipeline)."""
+    sm80_domains = _sm80_explicit_tile_domains(capabilities, facts, knobs)
+    if sm80_domains is not None:
+        return sm80_domains[1]
     selected = _selected_d_shape(capabilities, facts, knobs)
     if selected == (64, 64) and facts.thd and knobs is not None and (knobs.split_kv or 1) > 1 and not (facts.is_fp8 or facts.is_mxfp8):
         return frozenset({128})  # the packed split host selects the single-Q body
@@ -1232,6 +1251,8 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
     cga1-only 32-wide one), so the domain returned is that flavor's.  Without
     it (the heuristics' auto pick) the domain is the dense selection's."""
 
+    if capabilities.sm_lo == 80 and cga is not None:
+        return frozenset({1})
     _knobs = SdpaFwdKnobs(split_kv=split_kv, cga=cga) if (split_kv is not None or cga is not None) else None
     selected = _selected_d_shape(capabilities, facts, _knobs)
     if capabilities.sm_lo == 107 and not (facts.is_fp8 or facts.is_mxfp8) and facts.has_paged_kv and selected == (192, 128):
@@ -1579,7 +1600,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return f"knob request is a {type(knobs).__name__}, not SdpaFwdKnobs — wrong operation's vocabulary"
         for value, domain, label in (
             (knobs.sched_policy, effective_sched_policies(capabilities, facts, knobs), "sched_policy"),
-            (knobs.tile_m, capabilities.tile_ms, "tile_m"),
+            (knobs.tile_m, effective_tile_ms(capabilities, facts, knobs), "tile_m"),
             (knobs.tile_n, effective_tile_ns(capabilities, facts, knobs), "tile_n"),
             (knobs.cga, effective_cgas(capabilities, facts, knobs.split_kv, knobs.cga), "cga"),
             (knobs.pack_gqa, capabilities.pack_gqas, "pack_gqa"),
@@ -3329,6 +3350,8 @@ def _sm80_spec() -> EngineSpec:
             # Dense graphs serve all three schedulers; the THD grid is 3-D
             # and the THD-only mismatch above accepts natural scheduling only.
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
+            # Explicit geometry is admitted by the shared native flavor domains
+            # above. Leave the row domains empty to preserve A/FALLBACK choices.
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM80),
     )
