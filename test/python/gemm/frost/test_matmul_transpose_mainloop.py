@@ -18,6 +18,7 @@ import torch
 
 from cudnn.engines import ExecutionContext
 from cudnn.gemm.frost.engine import _FrostGemmPlan
+from cudnn.gemm.frost.epilogue_codegen import _FragmentCoordinates
 from cudnn.gemm.frost.layouts import fold_batch_layout
 from cudnn.frost.buffers import DeviceView, dtype_name
 from cudnn.gemm.frost.fusion_ir import Axis, swap_ab
@@ -950,9 +951,7 @@ def test_frost_logical_index_public_graph_composition(prefix):
     snippets = epilogue_codegen.generate(chain, vec_bytes_epi=16, output_elem_bytes=4, tma_slots=compiler._tma_slots_for(chain, _config()))
     ast.parse(compiler._render_template(chain, snippets, _config()))
     # Verify the DAG transports a caller's fragment map, not only _emit_op.
-    fragment = epilogue_codegen._FragmentCoordinates(
-        ((Axis.BATCH, ("plane",) * 4), (Axis.M, tuple(f"lane_row + {i}" for i in range(4))), (Axis.N, ("lane_column",) * 4))
-    )
+    fragment = _FragmentCoordinates(((Axis.BATCH, ("plane",) * 4), (Axis.M, tuple(f"lane_row + {i}" for i in range(4))), (Axis.N, ("lane_column",) * 4)))
     lines, _ = epilogue_codegen._emit_pointwise_dag(
         chain, vsize=4, bounded=False, aux_load_expr=lambda *args, **kwargs: "unused", fragment_coordinates=fragment
     )
