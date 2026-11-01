@@ -1161,6 +1161,7 @@ class SdpaFwdDsl(APIBase):
                     f"decode_q_tile_max must be one of {_widths} (the Rubin d256 decode tile's single-unit widths) or None; got {decode_q_tile_max}"
                 )
         self.use_pdl = bool(use_pdl)
+        self._cluster_combine = False
         # THD Stats declared WITHOUT ragged offsets: per-batch padded (b, s_max, h)
         # rows (FlashInfer's form). The kernel stores per batch; the adapter fills
         # the rows past each sequence's length with -inf, as the backend does.
@@ -4323,6 +4324,22 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if "use_pdl" in accepted and self.use_pdl:
             # The programmatic-dependent-launch form (the launch attribute + the griddepcontrol pair); compile() declined a kernel without the knob.
             kw["use_pdl"] = True
+        if "cluster_combine" in accepted:
+            from cudnn import _pybind_module
+
+            # A native implementation of an already selected split8 plan, not a
+            # candidate or split-policy change. Old extensions retain two launches.
+            self._cluster_combine = bool(
+                getattr(_pybind_module._SdpaDenseBinder, "supports_fused_split", False)
+                and self._device_cc == (10, 7)
+                and not self.thd
+                and self.s_q_max == 1
+                and not self.use_pdl
+                and not self.stats_log2
+                and self.gate_desc is None
+                and km.cluster_combine_supported(self.head_dim_qk, self.head_dim_v)
+            )
+            kw.update(cluster_combine=self._cluster_combine, has_final_lse=self.lse_desc is not None)
         return kw
 
     def _build_prepared_specs(self) -> None:
@@ -4523,7 +4540,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             if inv_scale != spec.template[spec.index["inv_scale_softmax"]]:
                 frame[spec.index["inv_scale_softmax"]] = inv_scale
         spec.fn(*frame)
-        if self.split_kv > 1:
+        if self.split_kv > 1 and not spec.fused_split:
             spec.combine.fn(*combine_args)
         self._logger.debug("execute completed")
 

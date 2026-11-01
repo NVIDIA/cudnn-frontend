@@ -2193,6 +2193,18 @@ class TestNativeD192PagedHalf:
 @pytest.mark.L0
 @requires_dsl
 @requires_rubin
+class TestNativeClusterSplit:
+    """Run native regression coverage from the architecture CI entrypoint."""
+
+    import sdpa_cluster_split_sm107 as _checks
+
+    test_cluster_split_standalone_rebind_and_retained_replay = staticmethod(_checks.test_cluster_split_standalone_rebind_and_retained_replay)
+    test_cluster_split_graph_contract = staticmethod(_checks.test_cluster_split_graph_contract)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
 class TestNativeScalarTailSplit:
     """Run native regression coverage from the architecture CI entrypoint."""
 

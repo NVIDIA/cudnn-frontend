@@ -98,6 +98,10 @@ enum Slot : size_t {
     RaggedQPtr,
     GatePtr,
     GateStrides,
+    FinalOPtr,
+    FinalLSEPtr,
+    FinalOStrides,
+    FinalLSEStrides,
     NumSlots
 };
 constexpr std::array<const char *, NumSlots> slot_names = {"q_ptr",           "k_ptr",
@@ -112,7 +116,9 @@ constexpr std::array<const char *, NumSlots> slot_names = {"q_ptr",           "k
                                                            "n_pages",         "problem_size",
                                                            "o_partial_ptr",   "scale_softmax_log2",
                                                            "stream",          "ragged_q_addr",
-                                                           "gate_ptr",        "gate_strides"};
+                                                           "gate_ptr",        "gate_strides",
+                                                           "final_o_ptr",     "final_lse_ptr",
+                                                           "final_o_strides", "final_lse_strides"};
 struct BoundGeometry {
     int64_t extent0 = 0, extent1 = 0, need = 0;
     py::tuple bound;
@@ -169,6 +175,7 @@ class SdpaDenseBinder {
         if (ragged_q_lens_ < 0 || ragged_q_lens_ > 2 || (ragged_q_lens_ && !ragged_))
             invalid("ragged Q lengths require a ragged decode plan");
         split_        = integer("split");
+        fused_split_  = py::hasattr(spec, "fused_split") && flag("fused_split");
         b_            = integer("b");
         qh_           = integer("qh");
         kh_           = integer("kh");
@@ -202,6 +209,9 @@ class SdpaDenseBinder {
         tail_native_  = flag("kv_tail_native");
         causal_       = flag("causal");
         bottom_right_ = flag("causal_bottom_right");
+        if (fused_split_ && (split_ < 2 || !fp32_partial_ || quantized_ || ragged_ || paged_ || has_sink_ || seq_q_ ||
+                             seq_kv_ || !spec.attr("gate_expect").is_none()))
+            invalid("native fused split requires dense FP32 partials without lengths, a sink, or a gate");
         if (b_ <= 0 || qh_ <= 0 || kh_ <= 0 || sq_ <= 0 || sk_ <= 0 || device_ < 0 || tile_n_ <= 0 ||
             (paged_ && page_size_ <= 0))
             invalid("invalid native dense plan geometry");
@@ -289,7 +299,8 @@ class SdpaDenseBinder {
             const bool paged_slot = slot >= KTablePtr && slot <= NPages;
             if (found == order.end() && slot != VTableStrides && !(slot == PartialOPtr && !fp32_partial_) &&
                 !(paged_slot && !paged_) && !(slot == RaggedQPtr && !ragged_) &&
-                !((slot == GatePtr || slot == GateStrides) && !has_gate_))
+                !((slot == GatePtr || slot == GateStrides) && !has_gate_) &&
+                !(slot >= FinalOPtr && slot <= FinalLSEStrides && !fused_split_))
                 invalid(std::string("native dense host has no argument ") + slot_names[slot]);
             index_[slot] = static_cast<size_t>(found - order.begin());
         }
@@ -527,6 +538,12 @@ class SdpaDenseBinder {
             cf.append(stream);
             if (ragged_q_lens_) cf.append(q_lens_address);
             combine_frame = py::tuple(cf);
+            if (fused_split_) {
+                put(frame, FinalOPtr, py::int_(facts[O].pointer));
+                put(frame, FinalLSEPtr, py::borrow<py::object>(frame[index_[LSEPtr]]));
+                put(frame, FinalOStrides, o.bound);
+                put(frame, FinalLSEStrides, py::borrow<py::object>(frame[index_[LSEStrides]]));
+            }
             put(frame, OPtr, py::int_(workspace));
             if (fp32_partial_) put(frame, PartialOPtr, py::int_(workspace));
             put(frame, OStrides, partial_o_strides_);
@@ -553,7 +570,7 @@ class SdpaDenseBinder {
         if (bound.identity) fill_word_(bound.identity, 1, 0x3f800000, py::int_(stream));
         auto result = py::steal<py::object>(PyObject_CallObject(fn_.ptr(), frame.ptr()));
         if (!result) throw py::python_error();
-        if (split_ > 1) {
+        if (split_ > 1 && !fused_split_) {
             auto combined = py::steal<py::object>(PyObject_CallObject(combine_fn_.ptr(), bound.second.ptr()));
             if (!combined) throw py::python_error();
         }
@@ -896,6 +913,7 @@ class SdpaDenseBinder {
     bool paged_, hnd_, v_hnd_, has_lse_, has_sink_, seq_kv_, seq_q_, shape_fixed_, lpt_fixed_, tail_native_, causal_,
         bottom_right_, fp32_partial_, dense_flex_;
     bool combine_q_lens_ = false;
+    bool fused_split_    = false;
 };
 }  // namespace
 void
@@ -913,6 +931,7 @@ init_sdpa_dense_binding(py::module_ &m) {
         .def_prop_ro_static("supports_ragged_q_lens", [](py::object) { return true; })
         .def_prop_ro_static("supports_quantized_split_sink", [](py::object) { return true; })
         .def_prop_ro_static("supports_native_d576", [](py::object) { return true; })
+        .def_prop_ro_static("supports_fused_split", [](py::object) { return true; })
         .def_prop_ro_static("supports_mixed_fp8_kv", [](py::object) { return true; })
         .def("bind", &SdpaDenseBinder::bind, py::arg("pack"), py::arg("indices"), py::arg("stream"))
         .def("bind_split",
