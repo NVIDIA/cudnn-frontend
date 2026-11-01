@@ -1211,7 +1211,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
 
             def ref_bwd(return_intermediates=False):
                 # One closure, so a flip attribution re-runs the reference with exactly these arguments.
-                # dO carries its own dtype/descale. torch_itype still names P/dS quantization, not dO's format.
+                # P follows QKV; the per-tensor backend casts dS to the dO descriptor's format.
                 return compute_ref_backward(
                     q_ref_bwd, k_ref_bwd, v_ref_bwd, o_ref_bwd, dO_ref_bwd, attn_scale=attn_scale,
                     q_descale=q_descale_gpu, k_descale=k_descale_gpu, v_descale=v_descale_gpu,
@@ -1226,11 +1226,12 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
                     # The dS scale pair this harness feeds its graph below (dP_scale_gpu from torch_otype, dP_descale_gpu
                     # from torch_itype), named so the reference rounds and descales dS exactly where the graph does.  With
                     # a half output_type the two disagree (scale 1.0, descale 1 / scale_e4m3): graph and reference then
-                    # both carry dQ / dK scaled by 1 / scale_e4m3 from an e4m3 dS rounded at UNIT scale.  Deriving both
-                    # scalars from torch_itype -- the dtype dS is rounded to, the reference's default -- is the pending
+                    # both carry dQ / dK scaled by 1 / scale_e4m3 from dS rounded in dO's format at UNIT scale. Deriving both
+                    # scalars from torch_dO_type -- the dtype dS is rounded to -- is the pending
                     # fix for the graph scalars and this mirror TOGETHER; the comparison must not move alone.
                     dP_scale_dtype=torch_otype,
                     dP_descale_dtype=torch_itype,
+                    torch_ds_type=torch_dO_type,
                 )
             dQ_ref, dK_ref, dV_ref, dSink_token_ref, dP_amax, dQ_amax, dK_amax, dV_amax = ref_bwd()
 
@@ -1356,16 +1357,16 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
                 dV_out[t_idx_kv:] = 0
                 dV_ref_float[t_idx_kv:] = 0
 
-            # P/dS keep the QKV format even when dO uses E5M2; the reference consumes the same quantized dO.
+            # P follows QKV and dS follows dO; retain the existing numerical tolerances.
             atol, rtol = (0.125 if torch_itype == torch.float8_e5m2 else 0.08), 0.2
             # As for O: a bad row above the cap must be ONE dS (dQ, dK) or P (dV) flip by the reference's own
             # intermediates; ragged keeps the plain cap (packed rows do not name (b, s)), and so does h_k != h_v
             # (compute_ref_backward's intermediates need one GQA group size for dK and dV; the suites draw h_k == h_v).
             bwd_intermediates = None if (is_ragged or h_k != h_v) else (lambda selection: ref_bwd(return_intermediates=selection)[8])
             assert_close_fp8_grad(dQ_out, dQ_ref_float, atol, rtol, tag="dQ", keys=s_kv, operand=k_gen, flip_unit=dP_descale_gpu.item(),
-                                  intermediates=bwd_intermediates, fp8_dtype=torch_itype, out_dtype=torch_otype)
+                                  intermediates=bwd_intermediates, fp8_dtype=torch_dO_type, out_dtype=torch_otype)
             assert_close_fp8_grad(dK_out, dK_ref_float, atol, rtol, tag="dK", keys=s_qo, operand=q_gen, flip_unit=dP_descale_gpu.item(),
-                                  intermediates=bwd_intermediates, fp8_dtype=torch_itype, out_dtype=torch_otype)
+                                  intermediates=bwd_intermediates, fp8_dtype=torch_dO_type, out_dtype=torch_otype)
             assert_close_fp8_grad(dV_out, dV_ref_float, atol, rtol, tag="dV", keys=s_qo, operand=dO_gen, flip_unit=s_descale_gpu.item(),
                                   intermediates=bwd_intermediates, fp8_dtype=torch_itype, out_dtype=torch_otype)
 
