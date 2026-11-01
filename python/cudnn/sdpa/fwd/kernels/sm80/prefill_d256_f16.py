@@ -24,7 +24,9 @@ Wide512/512 and MLA576/512 use TILE_M=32, TILE_N=16 and four warps.
 Pairs of warps own separate 256-column V slices of each 16-query slab.
 Q remains in shared memory throughout the KV loop, with four-register
 fragments reloaded for each QK step; V has a separate double buffer.
-Shared storage is 96/104 KiB respectively. The narrow Q/V aliasing and
+Each pair also splits the QK reduction in half, exchanging FP32 partial
+scores through 4 KiB of shared memory before softmax. Shared storage is
+100/108 KiB respectively. The narrow Q/V aliasing and
 prologue register caching described below apply only to D256.
 
 Pipeline shape (qwen, d_qk = d_v = 256):
@@ -249,6 +251,8 @@ def _sdpa_kernel(
     ELEMS_PER_ROW_K = d_qk  # fp16 per K row (== d_qk by construction)
     ELEMS_PER_ROW_V = d_v  # fp16 per V row (DSv3: 128 != d_qk=192)
     QK_K_CHUNKS = d_qk // 16  # k_chunks of 16 fp16 along QK reduction
+    QK_STEPS_PER_WARP = QK_K_CHUNKS // v_warps
+    SCORE_ELEMS_PER_LANE = m_blocks * (tile_n // 8) * 4
     SV_N_FRAGS = v_per_warp // 8
     elems_q = tile_m * ELEMS_PER_ROW_Q
     # Tile_n-derived constants.
@@ -382,6 +386,7 @@ def _sdpa_kernel(
         # alongside wide O accumulators would spill. The narrow body retains
         # its Q/V alias and cached Q fragments.
         sV_buf = cutlass.Array(io_dtype, 2 * ELEMS_KV_V, alignment=128, space=cutlass.AddressSpace.smem)
+        sQK_partials = cutlass.Array(cutlass.Float32, threads * SCORE_ELEMS_PER_LANE, alignment=128, space=cutlass.AddressSpace.smem)
     else:
         sV_buf = sQ_buf
 
@@ -1083,17 +1088,28 @@ def _sdpa_kernel(
         # instruction count vs the x2 variant (load 2 adjacent n_frags per
         # call).  tile_n must be a multiple of 16 (N//8 even).
         # below unconditionally (byte-identical codegen).
-        K_frag_cur = load_b_smem_x4(sK_cur, k_step=0, N=tile_n, sB_elems_per_row=ELEMS_PER_ROW_K, b_trans=False, lane=lane, swizzle=True, elem_bytes=ELEM_BYTES)
-        for k_chunk in cutlass.range_constexpr(QK_K_CHUNKS):
-            if cutlass.const_expr(k_chunk + 1 < QK_K_CHUNKS):
+        qk_col_base = warp_v * (QK_STEPS_PER_WARP * 16)
+        K_frag_cur = load_b_smem_x4(
+            sK_cur, k_step=0, N=tile_n, sB_elems_per_row=ELEMS_PER_ROW_K, b_trans=False, lane=lane, swizzle=True, elem_bytes=ELEM_BYTES, col_base=qk_col_base
+        )
+        for k_chunk in cutlass.range_constexpr(QK_STEPS_PER_WARP):
+            if cutlass.const_expr(k_chunk + 1 < QK_STEPS_PER_WARP):
                 K_frag_next = load_b_smem_x4(
-                    sK_cur, k_step=k_chunk + 1, N=tile_n, sB_elems_per_row=ELEMS_PER_ROW_K, b_trans=False, lane=lane, swizzle=True, elem_bytes=ELEM_BYTES
+                    sK_cur,
+                    k_step=k_chunk + 1,
+                    N=tile_n,
+                    sB_elems_per_row=ELEMS_PER_ROW_K,
+                    b_trans=False,
+                    lane=lane,
+                    swizzle=True,
+                    elem_bytes=ELEM_BYTES,
+                    col_base=qk_col_base,
                 )
             if cutlass.const_expr(wide):
                 q_step = [None] * (m_blocks * 4)
                 for m_block in cutlass.range_constexpr(m_blocks):
                     wide_q_row = warp_m_base + m_block * 16 + a_row
-                    wide_q_col = k_chunk * 16 + a_col_chunk * 8
+                    wide_q_col = qk_col_base + k_chunk * 16 + a_col_chunk * 8
                     wide_q_swz = swizzle_xor_128b(wide_q_row, wide_q_col, elem_bytes=ELEM_BYTES)
                     wide_q_ptr = sQ_buf.subview(wide_q_row * ELEMS_PER_ROW_Q + wide_q_swz)
                     q_values = nvvm.ldmatrix(wide_q_ptr.data_ptr(), 4, nvvm.MMALayout.ROW)
@@ -1102,8 +1118,17 @@ def _sdpa_kernel(
                 mma_step(S_acc, q_step, K_frag_cur, k_step=0, M=m_per_warp, N=tile_n, ab_dtype=io_dtype)
             else:
                 mma_step(S_acc, Q_frag, K_frag_cur, k_step=k_chunk, M=m_per_warp, N=tile_n, ab_dtype=io_dtype)
-            if cutlass.const_expr(k_chunk + 1 < QK_K_CHUNKS):
+            if cutlass.const_expr(k_chunk + 1 < QK_STEPS_PER_WARP):
                 K_frag_cur = K_frag_next
+
+        if cutlass.const_expr(wide):
+            # Paired V warps compute disjoint K halves, then share each score.
+            # The existing loop barrier fences reuse before the next tile.
+            for score_index in cutlass.range_constexpr(SCORE_ELEMS_PER_LANE):
+                sQK_partials[score_index * threads + tidx] = S_acc[score_index]
+            nvvm.barrier_cta_sync()
+            for score_index in cutlass.range_constexpr(SCORE_ELEMS_PER_LANE):
+                S_acc[score_index] += sQK_partials[score_index * threads + (tidx ^ cutlass.Int32(32))]
 
         # ---- ONLINE SOFTMAX -----------------------------------------------
         # Per-lane: rowwise max → reduce → update m_state → rescale O & l →
