@@ -1711,7 +1711,7 @@ def test_sm107_d128_sink_free_decode_sets_are_admissible(sm107_metadata_target):
     "over, first_sched",
     [
         (dict(), SCHED_LPT),
-        (dict(b=1, s_q=1, s_kv=32768), SCHED_LPT),
+        (dict(s_q=1, s_kv=32768), SCHED_LPT),  # b=128: no split; at b=1 the split leads, sink or not
         (dict(b=32, s_q=16, s_kv=8192), SCHED_LPT),
         (dict(b=8, s_q=1, s_kv=1024), 0),
         (dict(b=8, s_q=4, s_kv=4096, d_qk=128, d_v=128, window_left=128), 0),
@@ -1721,7 +1721,7 @@ def test_sm107_d128_sink_free_decode_sets_are_admissible(sm107_metadata_target):
     ],
     ids=[
         "issue_cell_lpt",
-        "long_cache_b1_lpt",
+        "long_cache_lpt",
         "q16_g8_one_tile_lpt",
         "short_cache_natural",
         "swa_decode_natural",
@@ -1732,7 +1732,7 @@ def test_sm107_d128_sink_free_decode_sets_are_admissible(sm107_metadata_target):
 )
 def test_sm107_shared_d128_scheduler_follows_the_measured_tables(sm107_metadata_target, over, first_sched):
     """The scheduler lead of the cc 10.7 shared dense d128 legs (issue #1472's tables, heuristics._SM107_DECODE_TILE_LPT_MIN_KV
-    and the two cc 10.7 arms of _sched_points): the packed decode tile walks plain LPT first from a 2k cache on; a short
+    and the two cc 10.7 arms of _sched_points): the unsplit packed decode tile walks plain LPT first from a 2k cache on; a short
     cache, a sliding window (on the decode tile and on the packed cga2 prefill body alike) and the one-cluster packed cga2
     band keep NATURAL first.  The other policy is always listed as a runner and every proposed set stays admissible; the
     SM100 row's one-cluster NATURAL lead on the same decode shape is untouched."""

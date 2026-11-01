@@ -2401,7 +2401,6 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
             wins = False
         if (
             wins
-            and facts.has_sink
             and facts.window_left is None
             and supports_native_d64_pack(
                 _selected_d_shape(caps, facts, SdpaFwdKnobs(pack_gqa=True, split_kv=split_kv, cga=cga)),
@@ -2412,11 +2411,11 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
                 cga=cga,
             )
             and facts.b * facts.h_q * _ceil_div(facts.s_q, tile_q) <= (facts.device_sm_count or 0)
+            and _split_points(caps, facts, tile_m, None, cga, _pack_gqa_group(caps, facts, tile_m, True, split_kv))[0] == 1
         ):
-            # Unsplit native D64 with a sink (which this row cannot split) and no window: while the unpacked launch fits one
-            # wave, every CTA streams the whole KV once either way and the packed CTA also computes G heads' rows, so unpacked
-            # leads; past one wave, or under a window, packed does. Without a sink the packed set splits and leads (cc 10.7
-            # studies; PR #2118 and its follow-up).
+            # Native D64 without a window whose packed set does not split: while the unpacked launch fits one wave, every CTA
+            # streams the whole KV once either way and the packed CTA also computes G heads' rows, so unpacked leads; past one
+            # wave, or under a window, packed does. A packed set that splits leads (cc 10.7 studies, 2026-10-31 / 11-01).
             wins = False
         if _sm107_fp8_dense_d128(caps, facts):
             # Packed never trails unpacked here at any S_q: unpacked pads every head's last 512-row tile (q576: 1.43-1.75x
@@ -2570,7 +2569,14 @@ def _split_points(
         (facts.thd and not ragged_decode)
         or (
             facts.has_sink
-            and (facts.is_fp8 or facts.is_mxfp8 or facts.has_epilogue_gate or not ((caps.sm_lo == 100 and caps.sm_hi < 107) or caps.sm_lo == 120))
+            and (
+                facts.is_fp8
+                or facts.is_mxfp8
+                or facts.has_epilogue_gate
+                or caps.sm_lo not in (100, 107, 120)
+                # cc 10.7: a window already bounds the KV walk, and the split's combine measured slower there (sink-split study 2026-11-01)
+                or (caps.sm_lo == 107 and facts.window_left is not None)
+            )
         )
         or (facts.padded and not facts.has_paged_kv)
         or facts.seq_q_trim
