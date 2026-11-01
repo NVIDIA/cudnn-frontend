@@ -11,6 +11,8 @@ build on ``cudnn.frost.tile_dsl`` + ``cutlass.experimental.primitives``.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 from cutlass.cute.runtime import from_dlpack
 
 
@@ -185,6 +187,10 @@ def on_stream(raw):
     if raw is None:
         return torch.cuda.stream(None)  # no stream requested: leave the current one alone
     handle = int(raw)
+    from cudnn._torch_stream import _raw_current_stream
+
+    if handle == _raw_current_stream(torch, torch.cuda.current_device()):
+        return nullcontext()  # the requested stream is already current (the usual call): entering it again is pure cost
     if handle == 0:
         return torch.cuda.stream(torch.cuda.default_stream())  # explicitly the default stream
     s = _EXT_STREAMS.get(handle)
