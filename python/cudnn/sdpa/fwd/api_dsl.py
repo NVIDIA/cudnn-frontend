@@ -4919,7 +4919,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             units = env if env <= initial_limit else resident
             wave_envelope = env
             if (
-                ((self._device_cc == (10, 0) and self.paged) or (self._device_cc == (10, 7) and not self.paged))
+                (
+                    (self._device_cc == (10, 0) and self.paged)
+                    # cc 10.3: GQA4 only (B300 A/B: GQA4 0.80-0.97x the resident-wave count, GQA8 0.996-1.03x)
+                    or (self._device_cc == (10, 3) and self.paged and cfg.PACK_G == 4)
+                    or (self._device_cc == (10, 7) and not self.paged)
+                )
                 and self.dtype == torch.bfloat16
                 and self.head_dim_qk == self.head_dim_v == 128
                 and self.batch_size == 1
