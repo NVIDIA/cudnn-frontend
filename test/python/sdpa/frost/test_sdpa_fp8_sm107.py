@@ -2295,3 +2295,16 @@ class TestNativeD256PhysicalOrigins:
     from native_d256_origins_sm107_checks import test_native_d256_independent_origins
 
     test_native_d256_independent_origins = staticmethod(test_native_d256_independent_origins)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeSingleQ:
+    """Explicit one-Q configuration through the native CI entry."""
+
+    import native_single_q_sm107_checks as _checks
+
+    test_one_q_origins = staticmethod(_checks.test_one_q_origins)
+    test_one_q_public_identity_and_domain = staticmethod(_checks.test_one_q_public_identity_and_domain)
+    test_one_q_forced_rescale = staticmethod(_checks.test_one_q_forced_rescale)

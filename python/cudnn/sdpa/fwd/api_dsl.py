@@ -53,7 +53,7 @@ from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES as _SM107_F16_THD_S
 from cudnn.sdpa.fwd.config_sm107 import supports_native_d128_dense_partial_pack, supports_native_d128_narrow_tile, supports_native_d512_dense_pack_split
 from cudnn.sdpa.fwd.config_sm107 import SM107_F16_SMALL_D_SHAPES as _SM107_F16_SMALL_D_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import SM107_SMALL_D_NATIVE_LEGS as _SM107_SMALL_D_NATIVE_LEGS
-from cudnn.sdpa.fwd.config_sm107 import supports_native_d64_pack, supports_native_d256_dense_split
+from cudnn.sdpa.fwd.config_sm107 import supports_native_d64_pack, supports_native_d256_dense_split, supports_native_d128_single_q
 from cudnn.sdpa.fwd.config_sm107 import SM107_SMALL_D_CGAS as _SM107_SMALL_D_CGAS
 from cudnn.sdpa.fwd.config_sm107 import sm107_small_tile_leg as _sm107_small_tile_leg
 from cudnn.sdpa.fwd.config_sm107 import SM107_FP8_THD_SHAPES as _SM107_FP8_THD_SHAPES
@@ -736,6 +736,8 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     and native D128 prefill under PackGQA."""
 
     tag = _flavor_tag(flavor)
+    if rubin and not fp8 and flavor == (128, 128) and params.softmax_wgs == 1:
+        return _load_kernel_template("sm107/prefill_d256_f16.py", params, "sdpa_fwd_sm107_d128_single_q")
     if params.dtype_kv != -1 and (fp8 or flavor != (128, 128)):
         raise ValueError("independent FP8 KV storage requires the SM100/SM107 D128 half pipeline")
     if rubin and not fp8 and flavor == (192, 128) and params.paged_kv:
@@ -971,6 +973,8 @@ class SdpaFwdDsl(APIBase):
         fallback the heuristics pick above the resident budget); None = the pick (``config_sm107.sm107_bias_mode_pick``).
         ``bias_stages`` (APPENDED, optional): the streamed ring's depth, 2 or 3 (None = the deepest that fits); a request on a
         plan that runs the resident block is a typed decline.
+        ``softmax_wgs=1`` selects the one-Q native D128 half THD topology at cga1 / TILE_M128 / TILE_N128,
+        unsplit, unpacked and nonpaged, without bias, KV mask, gate or mixed KV storage.
         ``softmax_wgs`` (APPENDED, optional): the number of softmax warp groups of the Rubin f16/bf16 d128-file body -- 2 (the
         classic 16-warp body) or 3 (the third softmax warp group: a 20-warp body whose pair work item takes THREE rows of the chunk per
         step; an EXPERIMENT, served on the (n, n+1) pair item at tile_n 64 / cga 1 only and declined typed elsewhere).  None = 2 (or
@@ -2000,6 +2004,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         """The ``TemplateParams.s_slots`` of this plan: Two for the native D128 narrow tile. On Rubin 32- / 64-wide f16/bf16 tiles,
         ``config_sm107.sm107_s_slots_pick`` decides (the MEASURED rule: 2 on the plain body -- no bias, no kv_mask -- at TILE_N 64, 1 on
         every other form; the sweep seam's value verbatim, which the factory validates against TILE_N 64 and the TMEM fit)."""
+        if self.softmax_wgs == 1:
+            return 2
         # D128's explicit narrow tile uses the double-buffered score pipeline.
         # Its default tile width remains 128; this does not choose a plan.
         if self._native_d128_narrow_tile() and self._effective_tile_n() == 64:
@@ -2974,13 +2980,33 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 self.cga == 1 or (self.cga is None and self.flavor == (64, 64)),
                 "score_max / score_sum_exp are stored by the 2-CTA prefill tile; cga=1 selects a tile without the store (pin cga=2)",
             )
+        if self.softmax_wgs == 1:
+            self._not_implemented_error_if(
+                not supports_native_d128_single_q(
+                    (d_qk, d_v),
+                    device_cc=self._device_cc,
+                    half_precision=self.q_desc.dtype in (torch.float16, torch.bfloat16),
+                    thd=self.thd,
+                    paged=self.paged,
+                    cga=self.cga,
+                    split_kv=self.split_kv,
+                    pack_gqa=self.pack_gqa,
+                    tile_m=self.tile_m,
+                    tile_n=self.tile_n,
+                    has_bias=self.bias_desc is not None,
+                    has_kv_mask=self.kv_mask_desc is not None,
+                    has_gate=self.gate_desc is not None,
+                    mixed_kv=self.k_desc.dtype != self.q_desc.dtype or self.v_desc.dtype != self.q_desc.dtype,
+                ),
+                "softmax_wgs=1 requires native half D128 THD, CTA1 M128 N128, unsplit/unpacked/unpaged, without bias, KV mask or gate",
+            )
         if self.bias_desc is None:
             # n_chunk is the resident-bias arm's work-item form (the (n, n+1) pair item): typed decline on a plan without a bias.
             self._not_implemented_error_if(
                 self.n_chunk is not None and self.n_chunk >= 1, "n_chunk is the resident-bias arm's work-item form; this plan has no bias"
             )
             self._not_implemented_error_if(
-                self._resident_arm_softmax_wgs() != 2,
+                self._resident_arm_softmax_wgs() not in (1, 2),
                 "softmax_wgs=3 (the third softmax warp group) is the resident-bias pair item's arm; this plan has no bias",
             )
         # The PLAIN padded body's tail form (padded_tail_form=): a REQUEST is honoured on the Rubin small tiles' padded, band-less,
