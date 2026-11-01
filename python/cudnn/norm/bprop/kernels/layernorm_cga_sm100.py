@@ -48,7 +48,7 @@ from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from cudnn.norm.fprop.kernels.layernorm_cga_sm100 import _MAX_CGA, _pick_cga
-from cudnn.norm.utils import ws_bytes, ws_empty, ws_zeros, cur_stream, fake_rows, fake_stream, ffi, sm_count
+from cudnn.norm.utils import ws_bytes, ws_empty, cur_stream, fake_rows, fake_stream, ffi, sm_count
 
 from .layernorm_sm100 import _ln_bwd_finalize_kernel
 
