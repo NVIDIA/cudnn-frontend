@@ -2401,6 +2401,7 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
             wins = False
         if (
             wins
+            and facts.has_sink
             and facts.window_left is None
             and supports_native_d64_pack(
                 _selected_d_shape(caps, facts, SdpaFwdKnobs(pack_gqa=True, split_kv=split_kv, cga=cga)),
@@ -2412,9 +2413,10 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
             )
             and facts.b * facts.h_q * _ceil_div(facts.s_q, tile_q) <= (facts.device_sm_count or 0)
         ):
-            # Unsplit native D64 without a window: while the unpacked launch fits one wave, every CTA streams the whole KV once
-            # either way and the packed CTA also computes G heads' rows, so unpacked leads; past one wave, or under a window,
-            # packed does (cc 10.7 study, PR #2118).
+            # Unsplit native D64 with a sink (which this row cannot split) and no window: while the unpacked launch fits one
+            # wave, every CTA streams the whole KV once either way and the packed CTA also computes G heads' rows, so unpacked
+            # leads; past one wave, or under a window, packed does. Without a sink the packed set splits and leads (cc 10.7
+            # studies; PR #2118 and its follow-up).
             wins = False
         if _sm107_fp8_dense_d128(caps, facts):
             # Packed never trails unpacked here at any S_q: unpacked pads every head's last 512-row tile (q576: 1.43-1.75x
