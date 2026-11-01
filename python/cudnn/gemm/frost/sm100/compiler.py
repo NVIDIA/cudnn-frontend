@@ -129,6 +129,7 @@ from ..compiler import (
     _tma_alignment_reject,
     _alignment_reject,
     _sf_blob_reject,
+    _partial_scale_block_reject,
     _grouped_row_quant_scale_blob_reject,
     _moe_dense_layout_bad,
     _moe_operand_layout_bad,
@@ -1930,6 +1931,7 @@ class CompiledFusedGemm(_CompiledFusedGemm[TileConfig, GemmBinding]):
     """Execute a compiled fused GEMM."""
 
     _compiler = sys.modules[__name__]
+    _validate_whole_scale_blocks = True
 
 
 def _mma_a_dtype(chain: FusionChain) -> str:
@@ -2691,6 +2693,16 @@ def _precheck_moe(
     _check_own_family(select_template(chain, config))
 
 
+def _check_whole_scale_blocks(chain: FusionChain) -> None:
+    """Decline a block-scale K that ends inside a scale block.
+
+    The fp8 TMA rule admits K % 32 == 16, but the block-scale templates size the F8_128x4
+    scale-factor view from floor(K / block_size) scales per row."""
+    reason = _partial_scale_block_reject(chain.matmul.K, chain.block_scale.block_size)
+    if reason is not None:
+        raise NotImplementedError(reason)
+
+
 def _precheck_block_scale(
     chain: FusionChain,
     config: TileConfig,
@@ -2699,6 +2711,7 @@ def _precheck_block_scale(
 
     _check_block_scale_supported(chain, config.pipeline)
     _check_input_alignment(chain)
+    _check_whole_scale_blocks(chain)
     _epi_pipelines = ("sm100",)
     if chain.reductions:
         if config.pipeline not in _epi_pipelines:
@@ -2726,6 +2739,8 @@ def _precheck_moe_block_scale(
     from ..kernel_registry import GraphType, mma_arch_reject, select_template
 
     _check_executable(chain)
+    # Ahead of mma_arch_reject, whose GATHER token-SF check would name a floor(K / block_size) shape.
+    _check_whole_scale_blocks(chain)
     reason = mma_arch_reject(chain, GraphType.MOE_BLOCK_SCALE, config.pipeline)
     if reason is not None:
         raise NotImplementedError(reason)
@@ -3052,6 +3067,7 @@ class CompiledMoeBlockScaleGemm(_CompiledMoeBlockScaleGemm[TileConfig, GemmBindi
     """Execute a compiled grouped block-scale GEMM."""
 
     _compiler = sys.modules[__name__]
+    _validate_whole_scale_blocks = True
 
 
 def _jit_moe_block_scale(
