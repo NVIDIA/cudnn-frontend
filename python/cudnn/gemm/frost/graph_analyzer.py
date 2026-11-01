@@ -10,6 +10,7 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from math import isfinite, prod
+from operator import index
 from typing import Any
 
 import cudnn
@@ -25,8 +26,8 @@ from .fusion_ir import (
     Dtype,
     FusionChain,
     FusionOp,
+    Axis,
     IndexExpr,
-    matrix_axis_index,
     MatmulSpec,
     ReductionSpec,
     TensorRef,
@@ -1547,6 +1548,28 @@ def _build_multi_moe_chain(
         top_k_scores=scores_meta.tensor if scores_meta is not None else None,
     )
     return chain, binding
+
+
+def matrix_axis_index(shape, axis):
+    """Map a logical rank-N matrix axis to folded (batch, M, N) coordinates.
+
+    Batch extents are prepared constants, matching the existing fixed-prefix
+    binding contract. Matrix coordinates remain dynamic; no M/N value is baked.
+    """
+    shape, axis = tuple(map(index, shape)), index(axis)
+    if len(shape) < 2 or any(d <= 0 for d in shape) or not 0 <= axis < len(shape):
+        raise ValueError(f"gen_index requires positive matrix dimensions and a valid logical axis; got shape={shape}, axis={axis}")
+    if max(prod(shape[:-2]), *shape) > (1 << 63) - 1:
+        raise ValueError("gen_index batch geometry exceeds Int64")
+    if axis == len(shape) - 2:
+        return IndexExpr.coordinate(Axis.M)
+    if axis == len(shape) - 1:
+        return IndexExpr.coordinate(Axis.N)
+    if shape[axis] == 1:
+        return IndexExpr.constant(0)
+    coordinate = IndexExpr.coordinate(Axis.BATCH).floor_div(prod(shape[axis + 1 : -2]))
+    # The leading batch axis has no higher digits to discard.
+    return coordinate if axis == 0 else coordinate.modulo(shape[axis])
 
 
 def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta], io_dtype: Dtype, intermediate_dtype: Dtype) -> list[_RecordedOp]:

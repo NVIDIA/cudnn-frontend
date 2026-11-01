@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 
 from .arch_family import active_family
 from .dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS, _allowed_vsize, dense_output_layout
-from .fusion_ir import Axis, BlockQuantizeSpec, Dtype, FusionChain, FusionOp, MoeSwapAbSpec, ReductionSpec, TensorRef, gemm_index, is_gemm_source
+from .fusion_ir import Axis, BlockQuantizeSpec, Dtype, FusionChain, FusionOp, IndexExpr, MoeSwapAbSpec, ReductionSpec, TensorRef, gemm_index, is_gemm_source
 
 
 @dataclass(frozen=True)
@@ -61,6 +61,58 @@ def _compute_literal(dtype: Dtype, value: float | int) -> str:
 def _elem_coord(e: int) -> tuple[str, str]:
     """Return an epilogue element coordinate."""
     return ("row", f"col_j + {e}")
+
+
+def _render_index_expr(expr: IndexExpr, coordinates: dict[Axis, str]) -> str:
+    """Lower integer IR through a caller-owned coordinate map, not IR symbol names."""
+    if expr.op == "axis":
+        return f"cutlass.Int64({coordinates[expr.value]})"
+    if expr.op == "constant":
+        return str(expr.value)
+    operand = _render_index_expr(expr.operand, coordinates)
+    return f"({operand} {'//' if expr.op == 'floor_div' else '%'} {expr.value})"
+
+
+@dataclass(frozen=True)
+class _FragmentCoordinates:
+    """Per-element axis expressions for one register vector, supplied at codegen.
+
+    This is a coordinate table, not a storage/thread layout system. Equality of
+    supplied expressions conservatively proves an axis invariant in the vector;
+    no particular axis is inherently uniform or varying.
+    """
+
+    coordinates: tuple[tuple[Axis, tuple[str, ...]], ...]
+
+    def __post_init__(self):
+        if not self.coordinates or len({axis for axis, _ in self.coordinates}) != len(self.coordinates):
+            raise ValueError("fragment coordinates require nonempty, unique axes")
+        size = len(self.coordinates[0][1])
+        if size == 0 or any(
+            not isinstance(axis, Axis) or len(values) != size or any(not isinstance(value, str) or not value for value in values)
+            for axis, values in self.coordinates
+        ):
+            raise ValueError("fragment coordinates require equally sized nonempty coordinate columns")
+
+    @property
+    def size(self):
+        return len(self.coordinates[0][1])
+
+    @classmethod
+    def row_vector(cls, size):
+        """Describe the row-run vector exposed by the existing shared epilogues."""
+        return cls(
+            ((Axis.BATCH, ("tile_l",) * size), (Axis.M, tuple(_elem_coord(i)[0] for i in range(size))), (Axis.N, tuple(_elem_coord(i)[1] for i in range(size))))
+        )
+
+    def is_uniform(self, expr):
+        if not expr.axes <= {axis for axis, _ in self.coordinates}:
+            raise ValueError("index expression references an axis absent from the fragment")
+        invariant = {axis for axis, values in self.coordinates if all(value == values[0] for value in values)}
+        return expr.axes <= invariant
+
+    def render(self, expr, element):
+        return _render_index_expr(expr, {axis: values[element] for axis, values in self.coordinates})
 
 
 def tma_out_value(j: int) -> str:
@@ -274,6 +326,7 @@ def _emit_op(
     other_in_chain: str | None = None,
     third_in_chain: str | None = None,
     vsize: int = 32,
+    fragment_coordinates: _FragmentCoordinates | None = None,
 ) -> tuple[list[str], str]:
     """Emit lines computing this op, given the previous-step var name."""
     new = f"_op_{idx}"
@@ -336,29 +389,21 @@ def _emit_op(
         return ll + [f"{new} = {_fl(nz, 1.0)} - {nz}"], new
 
     if op.op == "gen_index":
-        axis = dict(op.attrs).get("axis")
-        # An int32-compute index comes straight from the Int32 coordinate: Float32 rounds indices above 2**24.
+        # Normalize the legacy rank-3 attribute ABI into the same integer IR.
+        expr = op.index_expr
+        if expr is None:
+            expr = IndexExpr.coordinate(Axis.M if dict(op.attrs).get("axis") == 1 else Axis.N)
+        fragment = fragment_coordinates if fragment_coordinates is not None else _FragmentCoordinates.row_vector(vsize)
+        if fragment.size != vsize:
+            raise ValueError("index fragment size must match the epilogue vector size")
+        # Integer arithmetic precedes compute-dtype rounding (notably above 2**24).
         idx_t = DTYPE_TO_CUTLASS[op.compute_dtype]
-        if op.index_expr is not None:
-
-            def coordinate(col):
-                return op.index_expr.render({Axis.BATCH: "cutlass.Int64(tile_l)", Axis.M: "cutlass.Int64(row)", Axis.N: f"cutlass.Int64({col})"})
-
-            if Axis.N not in op.index_expr.axes:
-                return [f"{new} = cutlass.full_like({prev}, {idx_t}({coordinate('col_j')}))"], new
-            gl = [f"_gi{idx} = cute.make_rmem_tensor({vsize}, {idx_t})"]
-            for k in range(vsize):
-                _, col = _elem_coord(k)
-                gl.append(f"_gi{idx}[{k}] = {idx_t}({coordinate(col)})")
-            return gl + [f"{new} = _gi{idx}.load().to_vector()"], new
-        if axis == 1:
-            return [f"{new} = cutlass.full_like({prev}, {idx_t}(row))"], new
+        if fragment.is_uniform(expr):
+            return [f"{new} = cutlass.full_like({prev}, {idx_t}({fragment.render(expr, 0)}))"], new
         gl = [f"_gi{idx} = cute.make_rmem_tensor({vsize}, {idx_t})"]
         for k in range(vsize):
-            _, col = _elem_coord(k)
-            gl.append(f"_gi{idx}[{k}] = {idx_t}({col})")
-        gl.append(f"{new} = _gi{idx}.load().to_vector()")
-        return gl, new
+            gl.append(f"_gi{idx}[{k}] = {idx_t}({fragment.render(expr, k)})")
+        return gl + [f"{new} = _gi{idx}.load().to_vector()"], new
 
     if op.op == "binary_select":
         assert other_in_chain is not None and third_in_chain is not None
@@ -980,9 +1025,11 @@ class _AuxCodegen:
         raise AssertionError(f"unknown bcast_mode {aux.bcast_mode!r}")
 
 
-def _emit_pointwise_dag(chain, *, vsize, bounded, aux_load_expr, gemm_out_dtype=None):
+def _emit_pointwise_dag(chain, *, vsize, bounded, aux_load_expr, gemm_out_dtype=None, fragment_coordinates=None):
     """Generate per-GEMM rounding and the shared pointwise DAG."""
     scatter = chain.has_moe and chain.moe.mode == "scatter"
+    if fragment_coordinates is None and any(op.op == "gen_index" for op in chain.ops):
+        fragment_coordinates = _FragmentCoordinates.row_vector(vsize)
     body_lines = []
     result_var: dict[int, str] = {}
     gemm_var: dict[int, str] = {}
@@ -1029,7 +1076,7 @@ def _emit_pointwise_dag(chain, *, vsize, bounded, aux_load_expr, gemm_out_dtype=
         if third_in_chain is not None:
             cast_lines, third_in_chain = _compute_cast(third_in_chain, op.compute_dtype, f"{i}_c", source_dtype=_parent_dtype(op.parent_idx_c))
             body_lines.extend(cast_lines)
-        lines, cur = _emit_op(op, parent_var, i, aux_loads, other_in_chain, third_in_chain, vsize=vsize)
+        lines, cur = _emit_op(op, parent_var, i, aux_loads, other_in_chain, third_in_chain, vsize=vsize, fragment_coordinates=fragment_coordinates)
         if scatter and op.op == "gen_index":
             token_axis = 2 if isinstance(chain.moe, MoeSwapAbSpec) else 1
             if dict(op.attrs).get("axis") == token_axis:
@@ -1169,6 +1216,8 @@ _SHARED_EXPORTS = {
     "_compute_cast": _compute_cast,
     "_compute_literal": _compute_literal,
     "_elem_coord": _elem_coord,
+    "_render_index_expr": _render_index_expr,
+    "_FragmentCoordinates": _FragmentCoordinates,
     "tma_out_value": tma_out_value,
     "tma_out_ready_marker": tma_out_ready_marker,
     "_aux_reads_row": _aux_reads_row,

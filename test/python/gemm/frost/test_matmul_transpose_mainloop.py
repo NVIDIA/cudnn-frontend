@@ -20,8 +20,8 @@ from cudnn.engines import ExecutionContext
 from cudnn.gemm.frost.engine import _FrostGemmPlan
 from cudnn.gemm.frost.layouts import fold_batch_layout
 from cudnn.frost.buffers import DeviceView, dtype_name
-from cudnn.gemm.frost.fusion_ir import Axis, matrix_axis_index, swap_ab
-from cudnn.gemm.frost.graph_analyzer import analyze, analyze_with_binding, resolve_variant_pack, swap_ab_binding
+from cudnn.gemm.frost.fusion_ir import Axis, swap_ab
+from cudnn.gemm.frost.graph_analyzer import matrix_axis_index, analyze, analyze_with_binding, resolve_variant_pack, swap_ab_binding
 from cudnn.gemm.frost.sm100 import compiler, epilogue_codegen
 from cudnn.gemm.frost.tile_config import by_name
 from gemm_test_utils import requires_sm100, requires_sm120
@@ -916,6 +916,37 @@ def test_frost_matrix_batch_native_geometry(shape, stride):
         assert tuple(folded.shape) == expected_shape and tuple(folded.stride()) == expected_stride
         assert folded.data_ptr() == value.data_ptr() == 4096
         assert folded.dtype == value.dtype and folded.element_size() == value.element_size()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("prefix", [(), (1,), (2, 3), (2, 1, 3)])
+def test_frost_logical_index_public_graph_composition(prefix):
+    """Keep the removed sample's all-axis public graph composition as a regression."""
+    g, tensors = _graph(prefix=prefix, side="")
+    value = tensors["y"].set_output(False)
+    for axis in range(len(prefix) + 2):
+        value = g.add(a=value, b=g.gen_index(input=value, axis=axis))
+    value.set_output(True).set_data_type(F32)
+    g.validate()
+    chain = analyze(g)
+    indices = [op for op in chain.ops if op.op == "gen_index"]
+    assert len(indices) == len(prefix) + 2
+    assert [op.index_expr for op in indices] == [matrix_axis_index((*prefix, 128, 192), axis) for axis in range(len(prefix) + 2)]
+    snippets = epilogue_codegen.generate(chain, vec_bytes_epi=16, output_elem_bytes=4, tma_slots=compiler._tma_slots_for(chain, _config()))
+    ast.parse(compiler._render_template(chain, snippets, _config()))
+    # Verify the DAG transports a caller's fragment map, not only _emit_op.
+    fragment = epilogue_codegen._FragmentCoordinates(
+        ((Axis.BATCH, ("plane",) * 4), (Axis.M, tuple(f"lane_row + {i}" for i in range(4))), (Axis.N, ("lane_column",) * 4))
+    )
+    lines, _ = epilogue_codegen._emit_pointwise_dag(
+        chain, vsize=4, bounded=False, aux_load_expr=lambda *args, **kwargs: "unused", fragment_coordinates=fragment
+    )
+    source = "\n".join(lines)
+    for i, op in enumerate(chain.ops):
+        if op.op == "gen_index" and op.index_expr.axes == {Axis.M}:
+            assert f"_gi{i} = cute.make_rmem_tensor" in source and "lane_row" in source
+        elif op.op == "gen_index" and op.index_expr.axes == {Axis.N}:
+            assert f"_op_{i} = cutlass.full_like" in source and "lane_column" in source
 
 
 @pytest.mark.parametrize("prefix,axis", [(p, a) for p in [(), (1,), (2, 3), (2, 1, 3)] for a in range(len(p) + 2)])

@@ -12,8 +12,9 @@ from math import prod
 import pytest
 import torch
 
-from cudnn.gemm.frost.epilogue_codegen import _emit_op
-from cudnn.gemm.frost.fusion_ir import Axis, FusionOp, IndexExpr, matrix_axis_index
+from cudnn.gemm.frost.epilogue_codegen import _FragmentCoordinates, _emit_op, _render_index_expr
+from cudnn.gemm.frost.fusion_ir import Axis, FusionOp, IndexExpr
+from cudnn.gemm.frost.graph_analyzer import matrix_axis_index
 
 
 @pytest.mark.L0
@@ -91,6 +92,48 @@ def test_frost_logical_index_legacy_ir(axis):
     assert ("row" if axis == 1 else "col_j") in "\n".join(legacy)
     ast.parse("\n".join(mapped))
     assert "Int64" in "\n".join(mapped)
+    assert legacy == mapped
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("axis", [Axis.M, Axis.N, Axis.BATCH])
+def test_frost_index_fragment_uniformity_is_layout_owned(axis):
+    """A column vector reverses M/N uniformity; batch can vary too."""
+    fragment = _FragmentCoordinates(((Axis.M, ("r", "r + 1", "r + 2", "r + 3")), (Axis.N, ("c",) * 4), (Axis.BATCH, ("l", "l + 1", "l + 2", "l + 3"))))
+    expr = IndexExpr.coordinate(axis)
+    lines, _ = _emit_op(FusionOp("gen_index", index_expr=expr), "previous", 0, {}, vsize=4, fragment_coordinates=fragment)
+    assert fragment.is_uniform(expr) == (axis == Axis.N)
+    assert ("full_like" in "\n".join(lines)) == (axis == Axis.N)
+    assert ("make_rmem_tensor" in "\n".join(lines)) == (axis != Axis.N)
+    assert fragment.is_uniform(IndexExpr.constant(0))
+    # Symbol names are supplied by lowering, never embedded in the IR.
+    assert _render_index_expr(expr.floor_div(3).modulo(5), {axis: "coordinate"}) == "((cutlass.Int64(coordinate) // 3) % 5)"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "axes", [(), ((Axis.M, ()),), ((Axis.M, ("r",)), (Axis.M, ("r",))), ((Axis.M, ("r",)), (Axis.N, ("c", "c + 1"))), (("M", ("r",)),), ((Axis.M, ("",)),)]
+)
+def test_frost_index_fragment_invalid_coordinates(axes):
+    with pytest.raises(ValueError, match="fragment coordinates"):
+        _FragmentCoordinates(axes)
+
+
+@pytest.mark.L0
+def test_frost_index_fragment_rejects_missing_axis_or_vector_size():
+    fragment = _FragmentCoordinates(((Axis.M, ("r",) * 4),))
+    with pytest.raises(ValueError, match="absent"):
+        fragment.is_uniform(IndexExpr.coordinate(Axis.N))
+    with pytest.raises(ValueError, match="size"):
+        _emit_op(FusionOp("gen_index", index_expr=IndexExpr.coordinate(Axis.M)), "previous", 0, {}, vsize=8, fragment_coordinates=fragment)
+
+
+def _test_fragment(kind, batch, size=4):
+    """Explicit alternative register-vector coordinates, not new kernel layouts."""
+    rows = tuple(f"row + {i if kind == 'column' else i // 2 if kind == 'mixed' else 0}" for i in range(size))
+    cols = tuple(f"col_j + {0 if kind == 'column' else i % 2 if kind == 'mixed' else i}" for i in range(size))
+    batches = tuple(f"(tile_l + {i}) % {batch}" if kind == "batch" else "tile_l" for i in range(size))
+    return _FragmentCoordinates(((Axis.M, rows), (Axis.N, cols), (Axis.BATCH, batches)))
 
 
 # Small arrays exercise large logical coordinates without enormous allocations.
@@ -105,13 +148,20 @@ _FRAGMENT_CASES = [
     ((3, (1 << 40) + 3, 7, 8), 0, (1 << 40) + 4),
     ((3, (1 << 40) + 3, 7, 8), 1, (1 << 39) + 1),
 ]
+_FRAGMENT_CASES = [(*case, "row") for case in _FRAGMENT_CASES] + [
+    ((7, 8), 0, 0, "column"),
+    ((7, 8), 1, 0, "column"),
+    ((7, 8), 0, 0, "mixed"),
+    ((7, 8), 1, 0, "mixed"),
+    ((2, 3, 7, 8), 1, 0, "batch"),
+]
 
 
 @pytest.mark.L0
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for emitted epilogue fragments")
-@pytest.mark.parametrize("shape,axis,offset", _FRAGMENT_CASES)
+@pytest.mark.parametrize("shape,axis,offset,fragment_kind", _FRAGMENT_CASES)
 @pytest.mark.parametrize("compute_dtype", ["int32", "fp32"])
-def test_frost_logical_index_generated_fragment(tmp_path, shape, axis, offset, compute_dtype):
+def test_frost_logical_index_generated_fragment(tmp_path, shape, axis, offset, fragment_kind, compute_dtype):
     """Execute the actual shared Int64 div/mod emitter on SM90+, then cast.
 
     This tests coordinate arithmetic and compute rounding, not the full Blackwell
@@ -120,7 +170,8 @@ def test_frost_logical_index_generated_fragment(tmp_path, shape, axis, offset, c
     if torch.cuda.get_device_capability()[0] < 9:
         pytest.skip("generated epilogue fragment requires SM90+")
     op = FusionOp("gen_index", compute_dtype=compute_dtype, out_dtype=compute_dtype, index_expr=matrix_axis_index(shape, axis))
-    lines, result = _emit_op(op, "previous", 0, {}, vsize=4)
+    fragment = None if fragment_kind == "row" else _test_fragment(fragment_kind, prod(shape[:-2]))
+    lines, result = _emit_op(op, "previous", 0, {}, vsize=4, fragment_coordinates=fragment)
     dtype = "cutlass.Int32" if compute_dtype == "int32" else "cutlass.Float32"
     source = f"""import cutlass
 import cutlass.cute as cute
@@ -156,12 +207,18 @@ compiled = cute.compile(entry, fake, cutlass.Int64(0), options="--enable-tvm-ffi
         output.fill_(-1)
         module.compiled(output, live_offset)
         lanes = torch.arange(32, device="cuda", dtype=torch.int64) + live_offset
+        element = torch.arange(128, device="cuda", dtype=torch.int64) % 4
         if axis == len(shape) - 1:
-            expected = torch.arange(128, device="cuda", dtype=torch.int64) + live_offset
+            expected = (lanes - live_offset).repeat_interleave(4) * 4 + live_offset
+            expected += 0 if fragment_kind == "column" else element % 2 if fragment_kind == "mixed" else element
         elif axis == len(shape) - 2:
             expected = lanes.repeat_interleave(4)
+            expected += element if fragment_kind == "column" else element // 2 if fragment_kind == "mixed" else 0
         else:
-            expected = (((lanes % prod(shape[:-2])) // prod(shape[axis + 1 : -2])) % shape[axis]).repeat_interleave(4)
+            batch = (lanes % prod(shape[:-2])).repeat_interleave(4)
+            if fragment_kind == "batch":
+                batch = (batch + element) % prod(shape[:-2])
+            expected = (batch // prod(shape[axis + 1 : -2])) % shape[axis]
         if axis == 0 and shape[0] > (1 << 24):
             assert torch.all(expected > (1 << 24))
         torch.testing.assert_close(output, expected.to(output.dtype), atol=0, rtol=0)

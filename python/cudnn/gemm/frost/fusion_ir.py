@@ -8,7 +8,6 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from math import prod
 from operator import index
 from typing import Literal
 
@@ -143,37 +142,6 @@ class IndexExpr:
         if not 0 <= value <= (1 << 63) - 1:
             raise ValueError("index coordinate exceeds nonnegative Int64")
         return value
-
-    def render(self, coordinates):
-        """Render through a lowering-owned Axis-to-code map; no eval or parsing."""
-        if self.op == "axis":
-            return coordinates[self.value]
-        if self.op == "constant":
-            return str(self.value)
-        operand = self.operand.render(coordinates)
-        return f"({operand} {'//' if self.op == 'floor_div' else '%'} {self.value})"
-
-
-def matrix_axis_index(shape, axis):
-    """Map a logical rank-N matrix axis to folded (batch, M, N) coordinates.
-
-    Batch extents are prepared constants, matching the existing fixed-prefix
-    binding contract. Matrix coordinates remain dynamic; no M/N value is baked.
-    """
-    shape, axis = tuple(map(index, shape)), index(axis)
-    if len(shape) < 2 or any(d <= 0 for d in shape) or not 0 <= axis < len(shape):
-        raise ValueError(f"gen_index requires positive matrix dimensions and a valid logical axis; got shape={shape}, axis={axis}")
-    if max(prod(shape[:-2]), *shape) > (1 << 63) - 1:
-        raise ValueError("gen_index batch geometry exceeds Int64")
-    if axis == len(shape) - 2:
-        return IndexExpr.coordinate(Axis.M)
-    if axis == len(shape) - 1:
-        return IndexExpr.coordinate(Axis.N)
-    if shape[axis] == 1:
-        return IndexExpr.constant(0)
-    coordinate = IndexExpr.coordinate(Axis.BATCH).floor_div(prod(shape[axis + 1 : -2]))
-    # The leading batch axis has no higher digits to discard.
-    return coordinate if axis == 0 else coordinate.modulo(shape[axis])
 
 
 ReductionMode = Literal["add", "amax", "max", "min", "avg", "mul", "mul_no_zeros", "norm1", "norm2"]
