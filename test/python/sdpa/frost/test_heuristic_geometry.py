@@ -817,12 +817,14 @@ def test_rubin_decode_packing_uses_selected_flavor(monkeypatch, d, s_q, window, 
 
 
 @requires_dsl
+@pytest.mark.parametrize("sink", [True, False])
 @pytest.mark.parametrize("window", [None, 128])
 @pytest.mark.parametrize("b", [1, 16])
 @pytest.mark.parametrize("s_q", [1, 2])
-def test_rubin_native_d64_packs_past_one_unpacked_wave(monkeypatch, window, b, s_q):
-    """Unsplit native D64 packing leads under a window or once the unpacked launch needs a second wave; a one-wave
-    unpacked launch without a window keeps the unpacked plan first and the packed one listed."""
+def test_rubin_native_d64_packs_past_one_unpacked_wave(monkeypatch, window, b, s_q, sink):
+    """With a sink (no split on this row), unsplit native D64 packing leads under a window or once the unpacked launch needs
+    a second wave; a one-wave unpacked launch without a window keeps the unpacked plan first and the packed one listed.
+    Without a sink the packed set can split and leads everywhere, splitting the one-wave launch."""
     from cudnn.frost import buffers
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
@@ -839,14 +841,16 @@ def test_rubin_native_d64_packs_past_one_unpacked_wave(monkeypatch, window, b, s
         causal=causal,
         bottom_right=causal,
         window_left=window,
-        has_sink=True,
+        has_sink=sink,
         device_cc=(10, 7),
         device_sm_count=216,
     )
     plans = heur.recommend("A", facts, {spec.name: 20505})
     one_wave = b * facts.h_q <= facts.device_sm_count
-    assert plans[0].knobs.pack_gqa == (window is not None or not one_wave)
+    assert plans[0].knobs.pack_gqa == (not sink or window is not None or not one_wave)
     assert any(p.knobs.pack_gqa for p in plans) and any(not p.knobs.pack_gqa for p in plans)
+    if not sink and window is None and one_wave:
+        assert (plans[0].knobs.split_kv or 1) > 1
 
 
 @pytest.mark.L0
