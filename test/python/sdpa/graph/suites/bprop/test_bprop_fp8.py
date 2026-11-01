@@ -1,8 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bprop (training fwd+bwd) suites, fp8 (e4m3 in; see issue #955 for
-the QKV-vs-dO dtype-mix extension)."""
+"""FP8 training suites: E4M3 QKV with independent E4M3/E5M2 dO (2:1 E5M2)."""
 
 import torch
 import pytest
@@ -56,6 +55,7 @@ def fp8_bwd():
         is_ragged_or_padded_or_full=RandomChoice({"full": 1}),
         is_deterministic=RandomChoice({True: 1, False: 1}),
         with_sink_token=RandomChoice({True: 1, False: 2}),
+        dO_type=RandomChoice({torch.float8_e5m2: 2, torch.float8_e4m3fn: 1}),
     )
 
 
@@ -69,7 +69,7 @@ DENSE = SuiteSpec(
     knobs=fp8_bwd,
     exec_kind="fp8",
     post=post_train,
-    fuzzed=COMMON_FUZZ + MASK_FUZZ + ("out fp8/fp16", "deterministic", "sink"),
+    fuzzed=COMMON_FUZZ + MASK_FUZZ + ("dO e4m3/e5m2 (1:2)", "out fp8/fp16", "deterministic", "sink"),
     pinned=("train", "e4m3 in", "layout full"),
 )
 
@@ -102,6 +102,7 @@ def fp8_thd_bwd():
         is_deterministic=RandomChoice({True: 1, False: 1}),
         with_sink_token=RandomChoice({True: 1, False: 2}),
         total_token_slack=RandomChoice({"packed": 1, "slack": 1}),
+        dO_type=RandomChoice({torch.float8_e5m2: 2, torch.float8_e4m3fn: 1}),
     )
 
 
@@ -115,7 +116,7 @@ THD = SuiteSpec(
     knobs=fp8_thd_bwd,
     exec_kind="fp8",
     post=post_train,
-    fuzzed=COMMON_FUZZ + MASK_FUZZ + ("out fp8/fp16", "deterministic", "sink", "total_q/kv slack"),
+    fuzzed=COMMON_FUZZ + MASK_FUZZ + ("dO e4m3/e5m2 (1:2)", "out fp8/fp16", "deterministic", "sink", "total_q/kv slack"),
     pinned=(
         "train",
         "e4m3 in",

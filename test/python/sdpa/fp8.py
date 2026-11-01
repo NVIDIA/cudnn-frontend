@@ -224,7 +224,7 @@ def generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d
 
     return graph_fwd
 
-def generate_graph_bwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d_qk, d_vo, attn_scale, deterministic, is_ragged=False, left_bound=None, right_bound=None, diag_align=None, with_sink_token=False):
+def generate_graph_bwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d_qk, d_vo, attn_scale, deterministic, is_ragged=False, left_bound=None, right_bound=None, diag_align=None, with_sink_token=False, cudnn_dO_type=None):
     graph_bwd = cudnn.pygraph(io_data_type=cudnn_itype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
 
     stride_q = (s_qo * h_q * d_qk, d_qk, h_q * d_qk, 1)
@@ -237,7 +237,7 @@ def generate_graph_bwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d
     k = graph_bwd.tensor(uid=GraphBwdUid.k, dim=(b, h_k, s_kv, d_qk), stride=stride_k, data_type=cudnn_itype)
     v = graph_bwd.tensor(uid=GraphBwdUid.v, dim=(b, h_v, s_kv, d_vo), stride=stride_v, data_type=cudnn_itype)
     o = graph_bwd.tensor(uid=GraphBwdUid.o, dim=(b, h_q, s_qo, d_vo), stride=stride_o, data_type=cudnn_otype)
-    dO = graph_bwd.tensor(uid=GraphBwdUid.dO, dim=(b, h_q, s_qo, d_vo), stride=stride_o, data_type=cudnn_itype)
+    dO = graph_bwd.tensor(uid=GraphBwdUid.dO, dim=(b, h_q, s_qo, d_vo), stride=stride_o, data_type=cudnn_itype if cudnn_dO_type is None else cudnn_dO_type)
     stats = graph_bwd.tensor(uid=GraphBwdUid.stats, dim=(b, h_q, s_qo, 1), stride=stats_stride, data_type=cudnn.data_type.FLOAT)
 
     use_padding_mask = False
@@ -848,6 +848,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         assert cfg.is_infer, "is_cu_seq_len=True is forward-only (cu_seq_len is not plumbed for backward)"
 
     torch_itype = cfg.data_type
+    torch_dO_type = getattr(cfg, 'dO_type', None) or torch_itype
     torch_otype = cfg.output_type if hasattr(cfg, 'output_type') and cfg.output_type else cfg.data_type
     cudnn_itype = convert_to_cudnn_type(torch_itype)
     cudnn_otype = convert_to_cudnn_type(torch_otype)
@@ -1181,10 +1182,10 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     if not cfg.is_infer:
         dO_gen = create_sparse_int_tensor((b, s_qo, h_q, d_vo), torch.float, rng_data)
         dO_amax = dO_gen.abs().max().item()
-        dO_fp8 = (dO_gen * get_fp8_scale_factor(dO_amax, torch_itype)).to(torch_itype)
+        dO_fp8 = (dO_gen * get_fp8_scale_factor(dO_amax, torch_dO_type)).to(torch_dO_type)
 
         o_descale_gpu = torch.tensor([get_fp8_descale_factor(o_amax, torch_otype)], dtype=torch.float, device="cuda")
-        dO_descale_gpu = torch.tensor([get_fp8_descale_factor(dO_amax, torch_itype)], dtype=torch.float, device="cuda")
+        dO_descale_gpu = torch.tensor([get_fp8_descale_factor(dO_amax, torch_dO_type)], dtype=torch.float, device="cuda")
 
         if perf:
             dP_amax = 1.0
@@ -1210,6 +1211,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
 
             def ref_bwd(return_intermediates=False):
                 # One closure, so a flip attribution re-runs the reference with exactly these arguments.
+                # dO carries its own dtype/descale. torch_itype still names P/dS quantization, not dO's format.
                 return compute_ref_backward(
                     q_ref_bwd, k_ref_bwd, v_ref_bwd, o_ref_bwd, dO_ref_bwd, attn_scale=attn_scale,
                     q_descale=q_descale_gpu, k_descale=k_descale_gpu, v_descale=v_descale_gpu,
@@ -1239,7 +1241,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         dP_scale_gpu = torch.tensor([get_fp8_scale_factor(dP_amax, torch_otype)], dtype=torch.float, device="cuda")
 
         try:
-            graph_bwd = generate_graph_bwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d_qk, d_vo, attn_scale, deterministic, is_ragged=is_ragged, left_bound=left_bound, right_bound=right_bound, diag_align=diag_align, with_sink_token=with_sink_token)
+            graph_bwd = generate_graph_bwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d_qk, d_vo, attn_scale, deterministic, is_ragged=is_ragged, left_bound=left_bound, right_bound=right_bound, diag_align=diag_align, with_sink_token=with_sink_token, cudnn_dO_type=convert_to_cudnn_type(torch_dO_type))
             graph_bwd.validate()
             graph_bwd.build_operation_graph()
             graph_bwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
@@ -1354,7 +1356,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
                 dV_out[t_idx_kv:] = 0
                 dV_ref_float[t_idx_kv:] = 0
 
-            # E5M2 is less precise than E4M3, so its P quantization needs one wider step.
+            # P/dS keep the QKV format even when dO uses E5M2; the reference consumes the same quantized dO.
             atol, rtol = (0.125 if torch_itype == torch.float8_e5m2 else 0.08), 0.2
             # As for O: a bad row above the cap must be ONE dS (dQ, dK) or P (dV) flip by the reference's own
             # intermediates; ragged keeps the plain cap (packed rows do not name (b, s)), and so does h_k != h_v

@@ -18,6 +18,7 @@ from .helpers import (
     time_execution,
     profile_execution,
     note_frost_routing,
+    convert_to_cudnn_type,
 )
 from .mxfp8_ref import compute_ref, compute_ref_backward
 from .fp8 import BACKEND_AMAX_O_ISSUE, assert_amax_o, assert_close_fp8_grad, block_scaled_o_sf_dims, p_code_step
@@ -362,7 +363,7 @@ def generate_graph_bwd(b, h_q, h_k, h_v,
                        cudnn_itype=cudnn.data_type.FP8_E4M3,
                        cudnn_otype=cudnn.data_type.HALF,
                        left_bound=None, right_bound=None, diag_align=None,
-                       with_sink_token=False):
+                       with_sink_token=False, cudnn_dO_type=None):
     # Compute padded dimensions for F8_128x4 scale factors
     s_qo_padded = ceil_div(s_qo, 128) * 128
     s_kv_padded = ceil_div(s_kv, 128) * 128
@@ -421,13 +422,13 @@ def generate_graph_bwd(b, h_q, h_k, h_v,
         uid=GraphBwdUid.dO,
         dim=(b, h_q, s_qo, d_vo),
         stride=(h_q * s_qo * d_vo, s_qo * d_vo, d_vo, 1),
-        data_type=cudnn_itype
+        data_type=cudnn_itype if cudnn_dO_type is None else cudnn_dO_type
     )
     dO_t = graph_bwd.tensor(
         uid=GraphBwdUid.dO_t,
         dim=(b, h_q, s_qo, d_vo),
         stride=(h_q * s_qo * d_vo, s_qo * d_vo, d_vo, 1),
-        data_type=cudnn_itype
+        data_type=cudnn_itype if cudnn_dO_type is None else cudnn_dO_type
     )
     dO_f16 = graph_bwd.tensor(
         uid=GraphBwdUid.dO_f16,
@@ -1011,6 +1012,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle, *, plan_pin=None):
 
     # Get input/output types from config
     torch_itype = cfg.data_type if hasattr(cfg, 'data_type') and cfg.data_type else torch.float8_e4m3fn
+    torch_dO_type = getattr(cfg, 'dO_type', None) or torch_itype
     torch_otype = cfg.output_type if hasattr(cfg, 'output_type') and cfg.output_type else torch.bfloat16
 
     # Block-scaled O (sf_o): run the draw where the FROST d128 MXFP8 epilogue
@@ -1339,7 +1341,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle, *, plan_pin=None):
     if not cfg.is_infer:
         dO_f32 = torch.empty(b, h_q, s_qo, d_vo, dtype=torch.float32, device="cuda")
         fill_sparse_small_int(dO_f32, rng_data, sparsity=0.8, abs_max=2)
-        dO_fp8_d, sf_dO_d_ref, sf_dO_d_swizzle, dO_fp8_s, sf_dO_s_ref, sf_dO_s_swizzle = quantize_to_mxfp8(dO_f32, b, h_q, s_qo, d_vo, block_size, torch_itype, with_ref=not perf)
+        dO_fp8_d, sf_dO_d_ref, sf_dO_d_swizzle, dO_fp8_s, sf_dO_s_ref, sf_dO_s_swizzle = quantize_to_mxfp8(dO_f32, b, h_q, s_qo, d_vo, block_size, torch_dO_type, with_ref=not perf)
 
         dO_f16 = dO_f32.to(torch.bfloat16)
 
@@ -1352,6 +1354,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle, *, plan_pin=None):
                 cudnn_itype, cudnn_otype,
                 left_bound=left_bound, right_bound=right_bound, diag_align=diag_align,
                 with_sink_token=with_sink_token,
+                cudnn_dO_type=convert_to_cudnn_type(torch_dO_type),
             )
             graph_bwd.validate()
             graph_bwd.build_operation_graph()
@@ -1452,6 +1455,8 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle, *, plan_pin=None):
 
 
         if not perf:
+            # The reference dequantizes each dO orientation with its own SF;
+            # torch_itype continues to select the P/dS formats, independent of dO.
             dQ_ref, dK_ref, dV_ref, dSink_token_ref = compute_ref_backward(
                 q_fp8_d, q_fp8_s, k_fp8_d, k_fp8_s, v_fp8_d,
                 o_f16, dO_f16, dO_fp8_d, dO_fp8_s,
