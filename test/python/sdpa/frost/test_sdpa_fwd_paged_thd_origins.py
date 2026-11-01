@@ -39,7 +39,20 @@ pytestmark = [requires_dsl]
     ],
 )
 def test_paged_thd_origins_rebind_and_capture(
-    dim, dtype_name, pool_layout, stats_layout, cga, splits, pack_gqa, page_size=16, window_left=None, sink=None, kv_dtype_name=None
+    dim,
+    dtype_name,
+    pool_layout,
+    stats_layout,
+    cga,
+    splits,
+    pack_gqa,
+    page_size=16,
+    window_left=None,
+    sink=None,
+    kv_dtype_name=None,
+    tile_n=None,
+    sched_policy=None,
+    cpu_reference=False,
 ):
     import cudnn
     import torch
@@ -72,7 +85,7 @@ def test_paged_thd_origins_rebind_and_capture(
     kv_dtype = getattr(torch, kv_dtype_name) if kv_dtype_name is not None else dtype
     io_type = cudnn.data_type.HALF if dtype_name == "float16" else cudnn.data_type.BFLOAT16
     widths = {"q": torch.int64, "o": torch.int32, "stats": torch.int64}
-    multipliers = {"q": heads * (16 if d_qk in (192, 576) else d_qk), "o": d_v, "stats": 1}
+    multipliers = {"q": heads * (16 if d_qk in (192, 576) or tile_n == 64 else d_qk), "o": 16 if tile_n == 64 else d_v, "stats": 1}
     graph_ports = ("q", "k", "v", "o", "stats", "ql", "kl", "kt", "vt", "ro_q", "ro_o", "ro_stats")
     if sink is not None:
         graph_ports += ("sink",)
@@ -188,10 +201,12 @@ def test_paged_thd_origins_rebind_and_capture(
         graph.create_execution_plans([cudnn.heur_mode.A])
         graph.select_plan(next(i for i in range(len(graph.plans)) if graph.get_plan_name_at_index(i).startswith(engine)))
     else:
-        graph.create_execution_plan(
-            family_for(graph).offered_ids()[engine],
-            {cudnn.knob_type.TILE_CGA_M: cga, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.PACK_GQA: int(pack_gqa)},
-        )
+        knobs = {cudnn.knob_type.TILE_CGA_M: cga, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.PACK_GQA: int(pack_gqa)}
+        if tile_n is not None:
+            knobs[cudnn.knob_type.TILE_N] = tile_n
+        if sched_policy is not None:
+            knobs[cudnn.knob_type.SCHED_POLICY] = sched_policy
+        graph.create_execution_plan(family_for(graph).offered_ids()[engine], knobs)
         graph.select_plan(0)
     graph.check_support()
     graph.build_plans()
@@ -203,6 +218,9 @@ def test_paged_thd_origins_rebind_and_capture(
         assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
         assert api._k_mod.CFG.STAGES_KV == (2 if d_qk == 192 else 2 * cga)
         assert (api._k_mod.CFG.TILE_K, api._k_mod.CFG.TILE_O) == (d_qk, d_v)
+        if tile_n is not None:
+            assert api._k_mod.CFG.TILE_N == tile_n
+            assert api._k_mod.CFG.S_SLOTS == (2 if tile_n == 64 else 1)
         assert api._thd_origin_specs is not None
     print("ORIGIN_PLAN", graph.get_plan_name_at_index(graph._plan_index), flush=True)
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
@@ -213,10 +231,15 @@ def test_paged_thd_origins_rebind_and_capture(
         workspace.fill_(255)
 
     def check(values, state):
+        # Keep sanitizer work focused on the attention execution, while still
+        # checking every live row against the same FP64 reference and tolerances.
+        if cpu_reference:
+            values = {name: tensor.cpu() for name, tensor in values.items()}
+        reference_device = values["q"].device
         ql, kl, starts = state
         stats = values["stats"] if stats_layout == "token" else values["stats"].T
-        live_o = torch.zeros(values["o"].shape[0], device="cuda", dtype=torch.bool)
-        live_stats = torch.zeros(stats.shape[0], device="cuda", dtype=torch.bool)
+        live_o = torch.zeros(values["o"].shape[0], device=reference_device, dtype=torch.bool)
+        live_stats = torch.zeros(stats.shape[0], device=reference_device, dtype=torch.bool)
         for b, (nq, nk) in enumerate(zip(ql, kl)):
             if not nq:
                 continue
@@ -227,10 +250,13 @@ def test_paged_thd_origins_rebind_and_capture(
                 hi = min(lo + 32, nq)
                 q = values["q"][starts["q"][b] + lo : starts["q"][b] + hi].double().transpose(0, 1)
                 scores = q @ k.transpose(-1, -2) * d_qk**-0.5
-                scores.masked_fill_(torch.arange(nk, device="cuda")[None, :] > torch.arange(nk - nq + lo, nk - nq + hi, device="cuda")[:, None], -torch.inf)
+                scores.masked_fill_(
+                    torch.arange(nk, device=reference_device)[None, :] > torch.arange(nk - nq + lo, nk - nq + hi, device=reference_device)[:, None], -torch.inf
+                )
                 if window_left is not None:
                     scores.masked_fill_(
-                        torch.arange(nk, device="cuda")[None, :] <= torch.arange(nk - nq + lo, nk - nq + hi, device="cuda")[:, None] - window_left,
+                        torch.arange(nk, device=reference_device)[None, :]
+                        <= torch.arange(nk - nq + lo, nk - nq + hi, device=reference_device)[:, None] - window_left,
                         -torch.inf,
                     )
                 if sink is not None:

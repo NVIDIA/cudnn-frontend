@@ -412,14 +412,14 @@ def supports_native_d64_pack(d_shape, *, device_cc, fp8, paged, split_kv=1, cga=
 def supports_native_d128_narrow_tile(d_shape, *, device_cc, half_precision, thd, paged, cga, split_kv=1, has_bias=False, has_kv_mask=False):
     """Whether TILE_N=64 selects the native D128 two-score-slot pipeline.
 
-    Dense CGA1, paged and ragged split plans use different bodies. Keep the
+    Dense CGA1 and ragged split plans use different bodies. Keep the
     explicit knob domain shared by graph validation and standalone lowering.
     """
     return (
         device_cc == (10, 7)
         and half_precision
         and d_shape == (128, 128)
-        and not paged
+        and (not paged or (thd and split_kv == 1))
         and not has_bias
         and not has_kv_mask
         and ((thd and split_kv == 1 and cga in (None, 1, 2)) or (not thd and cga in (None, 2)))
