@@ -1030,6 +1030,26 @@ def test_sm100_paged_gqa_prefill_leads_inside_its_box():
 
 
 @pytest.mark.L0
+def test_sm103_fp8_d192_long_causal_chunks_lead():
+    """cc 10.3 per-tensor FP8 d192x128 causal chunks from SM103_FP8_D192_LONG_CHUNK_MIN_S_Q query tokens lead past
+    FP8_D192_MAX_Q_TILES; shorter chunks, mask-free chunks and cc 10.0 keep the tile bound."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100_fp8")
+    base = dict(b=4, h_q=128, h_kv=128, s_q=1024, s_kv=8192, d_qk=192, d_v=128, causal=True, bottom_right=True, device_cc=(10, 3), device_sm_count=148)
+
+    def place(**over):
+        return placement.place(spec, _facts(**{**base, **_SM107_FP8_QUANT, "dtype_o": cudnn.data_type.FP8_E4M3, **over}))
+
+    assert place() == placement.LEAD  # 4096 Q tiles, s_q 1024
+    assert place(s_q=placement.SM103_FP8_D192_LONG_CHUNK_MIN_S_Q, b=1) == placement.LEAD
+    assert place(s_q=256, b=2) == placement.TRAIL  # 512 tiles below the long-chunk bound: B200 tile bound
+    assert place(causal=False, bottom_right=False) == placement.TRAIL  # mask-free: mixed, not admitted
+    assert place(device_cc=(10, 0)) == placement.TRAIL  # cc 10.0 keeps FP8_D192_MAX_Q_TILES
+    assert place(s_q=128, b=1, h_q=16, h_kv=16) == placement.LEAD  # 16 tiles: the B200 tile bound still leads
+
+
+@pytest.mark.L0
 def test_sm100_fp8_decode_shaped_gqa_leads_inside_the_measured_box():
     """SM100 per-tensor FP8 decode-shaped GQA (module docstring): 2 <= s_q <= 16 leads at d128 / d256 and d64 with a sink,
     s_q == 1 only for the d64 sink graph under a window or from 32 KV units; outside the measured box the backend leads."""

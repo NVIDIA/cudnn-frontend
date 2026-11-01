@@ -495,6 +495,7 @@ SM107_PAGED_D256_MTP_PAGE_SIZES = (16,)
 FP8_D512_WIDE_Q_HEADS = 32  # d512 with >= 32 query heads wins at every measured cache (0.20-0.73 GPU, 0.20-0.91 eager)
 FP8_MIN_KV_TOKENS = 1024  # below, a single-wave launch is host-bound: FROST's ~4 us extra submit cost loses eager 1.03-1.37
 FP8_D192_MAX_Q_TILES = 64  # d192 chunks: 16-64 tiles win 0.34-0.90; 128 tiles lose 1.19-1.72
+SM103_FP8_D192_LONG_CHUNK_MIN_S_Q = 512  # cc 10.3 causal d192 chunks from this many query tokens lead past FP8_D192_MAX_Q_TILES (B300)
 FP8_D128_ANY_TILES_MAX_S_Q = 128  # d128 chunks with s_q <= 128 win at 64-512 tiles (0.21-0.68)
 SM100_FP8_DECODE_MIN_KV = 1024  # the measured decode caches: 4k / 64k grid, 1k-128k hold-out
 SM100_FP8_SINK_DECODE_MIN_KV_UNITS = 32  # d64 sink below 32 KV units: full-cache s_q == 1 loses 1.20-1.23, paged SWA s_q >= 2 1.09-1.49
@@ -811,7 +812,11 @@ def _place_sm100_fp8(caps: Capabilities, facts) -> str:
     if facts.s_q >= facts.s_kv:
         return TRAIL  # d128 squares parity (0.85-1.05), d192 0.84-1.01
     if flavor == (192, 128):
-        return LEAD if tiles <= FP8_D192_MAX_Q_TILES else TRAIL
+        # cc 10.3: causal long chunks lead at any launch size; shorter or mask-free ones keep the B200 tile bound (B300: causal
+        # s_q >= 512 ran 0.84-0.99x the backend over 160-16384 tiles, s_q <= 256 lost 1.41-1.56x at 128-512 tiles, mask-free
+        # was mixed: 0.93-1.03x and 1.34x at 96 tiles)
+        long_chunk = facts.device_cc == (10, 3) and facts.causal and facts.s_q >= SM103_FP8_D192_LONG_CHUNK_MIN_S_Q
+        return LEAD if tiles <= FP8_D192_MAX_Q_TILES or long_chunk else TRAIL
     return LEAD if tiles <= CHUNKED_MAX_Q_TILES or facts.s_q <= FP8_D128_ANY_TILES_MAX_S_Q else TRAIL
 
 
