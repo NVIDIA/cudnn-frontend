@@ -1831,15 +1831,23 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # the lowering (contract rule 8b'). Mirrors the pack_gqa gate below.
             # ... plus the d256 decode tile's dense / paged split (fp32 partials into the split-major
             # workspace the shared combine reduces, packed or not). Native per-tensor FP8
-            # D256 prefill also has dense FP32 partials; half prefill keeps its THD split.
+            # D256 prefill and unpacked half D256 prefill also have dense FP32 partials.
             if (
                 capabilities.sm_lo == 107
                 and not facts.is_fp8
                 and _selected_d_shape(capabilities, facts, knobs) == (256, 256)
                 and not packed_split
                 and not decode_tile
+                and not _config_sm107.supports_native_d256_dense_split(
+                    _selected_d_shape(capabilities, facts, knobs),
+                    device_cc=facts.device_cc,
+                    fp8=facts.is_fp8 or facts.is_mxfp8,
+                    thd=facts.thd,
+                    paged=facts.has_paged_kv,
+                    pack_gqa=knobs.pack_gqa,
+                )
             ):
-                return "SM107 D256 split is qualified for half THD and the d256 decode tile (a decode-shaped graph: S_q x G packed rows within its routed envelope) only"
+                return "SM107 D256 split requires native dense unpacked prefill, half THD or the d256 decode tile"
             # Select with the requested knobs: small half split plans use D64;
             # other restricted flavors retain their larger-envelope walk.
             if capabilities.split_d_shapes is not None and _selected_d_shape(capabilities, facts, knobs) not in capabilities.split_d_shapes:
@@ -2587,7 +2595,8 @@ def _sm107_spec() -> EngineSpec:
       sink once in the combine; nonpaged THD sink splits stay declined.
       On d256 the split is the decode tile's (dense or paged, packed or not:
       fp32 partials into the split-major workspace the shared combine reduces)
-      and the paged THD packed split; the d256 prefill kernel has no dense split.
+      and the paged THD packed split; native half dense unpacked prefill also
+      writes FP32 partials and uses the same workspace combine.
     - ``pack_gqas``: D128 dense CGA2 and unsplit nonpaged THD use native SM107 prefill. Dense CGA1 uses the
       shared decode tile; D128 paged/nonpaged split THD and D256 paged unsplit THD use the shared half pipeline.
       Existing packing admission still excludes the pre-folded scale;
@@ -2688,7 +2697,7 @@ def _sm107_spec() -> EngineSpec:
             pack_gqa_partial_d_shapes=frozenset({(64, 64), (192, 128), (512, 512)}),
             thd_pack_gqa_d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256)}),
             split_kv_supported=True,
-            # (256, 256) = the paged THD packed split and the decode tile's dense / paged split.
+            # (256, 256) = native dense unpacked prefill, paged THD packed split and dense / paged decode split.
             split_d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)}),
             # NATURAL row-wide; LPT advertised PER D-SHAPE for what is validated.
             #

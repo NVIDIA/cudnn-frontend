@@ -241,8 +241,8 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     # study sm80_dense_prefill_20261031 (cuDNN 9.29.0.18; A100 80GB PCIe; dense bf16 context d64 / d128 / d192x128 / d256, causal,
     # mask-free and d64 sink / window + sink, s_q 8-8192 over S_kv on and off the tile; 2,448 train cells incl. two consumed
-    # holdouts, 96-cell holdout 3; d128 GQA causal is non-monotone, and d256 mask-free MHA failed holdout 3 (both keep the
-    # hand-written order)
+    # holdouts, 96-cell holdout 3; d128 GQA causal is non-monotone and keeps the hand-written order; d256 mask-free MHA,
+    # dropped after holdout 3, is refit in round 4 below)
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "mha", False): Entry(
         "le", 10.0, "sm80_dense_prefill_20261031", "kv"
     ),
@@ -259,39 +259,17 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
         "ge", 8.085, "sm80_dense_prefill_20261031", "q"
     ),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "dense", "causal_br", False, "mha", False): Entry(
-        "ge", 6.293, "sm80_dense_prefill_20261031", "q"
-    ),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "dense", "causal_br", False, "mha", True): Entry(
-        "ge", 5.575, "sm80_dense_prefill_20261031", "q"
-    ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "dense", "none", False, "gqa", False): Entry(
         "ge", 8.085, "sm80_dense_prefill_20261031", "q"
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "dense", "none", False, "gqa", True): Entry(
         "ge", 8.085, "sm80_dense_prefill_20261031", "q"
     ),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "dense", "none", False, "mha", False): Entry(
-        "ge", 6.293, "sm80_dense_prefill_20261031", "q"
-    ),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "dense", "none", False, "mha", True): Entry(
-        "ge", 5.793, "sm80_dense_prefill_20261031", "q"
-    ),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "gqa", False): Entry(
-        "ge", 10.0, "sm80_dense_prefill_20261031", "q"
-    ),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
-        "ge", 9.278, "sm80_dense_prefill_20261031", "tiles"
-    ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "mha", False): Entry(
         "ge", 6.293, "sm80_dense_prefill_20261031", "tiles"
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "mha", True): Entry(
         "ge", 6.293, "sm80_dense_prefill_20261031", "tiles"
-    ),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "dense", "none", False, "gqa", False): Entry("ge", 34.293, "sm80_dense_prefill_20261031"),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "dense", "none", False, "gqa", True): Entry(
-        "ge", 9.006, "sm80_dense_prefill_20261031", "tiles"
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "prefill", "dense", "causal_br", False, "gqa", False): Entry(
         "ge", 8.085, "sm80_dense_prefill_20261031", "q"
@@ -329,6 +307,39 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "prefill", "dense", "window", True, "gqa", True): Entry("always", None, "sm80_dense_prefill_20261031"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "prefill", "dense", "window", True, "mha", False): Entry("always", None, "sm80_dense_prefill_20261031"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (64, 64), "prefill", "dense", "window", True, "mha", True): Entry("always", None, "sm80_dense_prefill_20261031"),
+    # study sm80_dense_prefill_r4_20261101 (round 4 after the SM80 short-query tiles: D128 / D256 S_q <= 128 and D192 S_q <= 64
+    # re-timed, 575 cells, plus consumed holdout 3 outside that domain; an entry replaces its round-3 parent only where no
+    # training cell runs > 5 % slower than under the parent -- the D192 GQA classes keep theirs; 108-cell holdout 4)
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "dense", "causal_br", False, "mha", False): Entry(
+        "always", None, "sm80_dense_prefill_r4_20261101"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "dense", "causal_br", False, "mha", True): Entry(
+        "always", None, "sm80_dense_prefill_r4_20261101"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "dense", "none", False, "mha", False): Entry(
+        "always", None, "sm80_dense_prefill_r4_20261101"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "dense", "none", False, "mha", True): Entry(
+        "always", None, "sm80_dense_prefill_r4_20261101"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "gqa", False): Entry(
+        "ge", 6.793, "sm80_dense_prefill_r4_20261101", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
+        "ge", 6.793, "sm80_dense_prefill_r4_20261101", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "dense", "none", False, "gqa", False): Entry(
+        "ge", 6.793, "sm80_dense_prefill_r4_20261101", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "dense", "none", False, "gqa", True): Entry(
+        "ge", 7.155, "sm80_dense_prefill_r4_20261101", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "dense", "none", False, "mha", False): Entry(
+        "ge", 6.293, "sm80_dense_prefill_r4_20261101", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "dense", "none", False, "mha", True): Entry(
+        "always", None, "sm80_dense_prefill_r4_20261101"
+    ),
     # study sm107_dense_decode_20261031 (cuDNN 9.29.0.18; cc 10.7, 216 SMs; dense bf16 decode and MTP, s_q 1-4: d64 with the gpt-oss
     # masks (sink, window + sink, neither), GQA 4 / 8; d256 without a sink, GQA 4-16; b 1-128, S_kv 3k-128k on and off the tile;
     # 396 train + 52 scored random holdout cells incl. groups 5, 6, 12; d256 single-row decode keeps the hand order: its
