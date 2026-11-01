@@ -881,6 +881,12 @@ def test_native_d192_thd_split_frames(layout, splits):
     _wide_thd_split_frames(False, layout, splits, 192, 128)
 
 
+@pytest.mark.parametrize("layout", [None, "NH", "HN"])
+@pytest.mark.parametrize("splits", [2, 5])
+def test_native_d64_thd_split_frames(layout, splits):
+    _wide_thd_split_frames(False, layout, splits, 64, 64)
+
+
 def _wide_thd_split_frames(paged, layout, splits, d_qk, d_v):
     """Asymmetric partial widths, origins and independent tables survive rebinding."""
     from cudnn.sdpa.fwd.thd_origins import ROLES

@@ -236,7 +236,7 @@ def _plan(g):
     return g._compiled_plans[g._plan_index]
 
 
-def _compact_thd_api(bufs, b, ql, kl, hq, hk, d, *, cga=2, pack_gqa=False):
+def _compact_thd_api(bufs, b, ql, kl, hq, hk, d, *, cga=2, pack_gqa=False, split_kv=1):
     """Prepare the actual standalone compact-prefix contract independently of a graph plan."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
@@ -253,7 +253,7 @@ def _compact_thd_api(bufs, b, ql, kl, hq, hk, d, *, cga=2, pack_gqa=False):
         cu_seq_kv_lens=True,
         thd=True,
         cga=cga,
-        split_kv=1,
+        split_kv=split_kv,
         pack_gqa=pack_gqa,
     )
     assert api.check_support()

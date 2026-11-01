@@ -747,7 +747,7 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         and flavor == (64, 64)
         and params.cta_mma == 1
         and (params.split_kv > 1 or params.decode_tile)
-        and not params.thd_varlen
+        and (not params.thd_varlen or params.split_kv > 1)
         and not params.paged_kv
         and params.tile_n == 128
     ):
@@ -1880,6 +1880,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         ``check_support`` declines an explicit 128 for it typed), else 128."""
         if self.tile_n is not None:
             return int(self.tile_n)
+        if self.packed_thd_split and self.flavor == (64, 64):
+            return 128  # the shared one-Q split body has a fixed 128-column KV tile
         if self.flavor in dict(_SM107_TILE_NS_BY_D_SHAPE) and self._device_cc == (10, 7) and not self._fp8:
             return _sm107_tile_n_pick(
                 self.flavor[0],
@@ -2577,7 +2579,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                         "supports_native_d576_packed_split"
                         if (int(d_qk), int(d_v)) == SM100_NATIVE_D576_SHAPE
                         else (
-                            "supports_paged_d64_packed_split"
+                            ("supports_paged_d64_packed_split" if self.paged else "supports_nonpaged_d64_packed_split")
                             if int(d_v) == 64
                             else (
                                 ("supports_paged_d256_packed_split" if self.paged else "supports_nonpaged_d256_packed_split")
@@ -2877,6 +2879,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             _tile_ns = dict(_SM107_FP8_TILE_NS_BY_D_SHAPE).get(self.flavor, frozenset({128}))
         if self._native_d128_narrow_tile():
             _tile_ns = frozenset({64, 128})
+        if self.packed_thd_split and self.flavor == (64, 64):
+            _tile_ns = frozenset({128})
         self._value_error_if(
             self.tile_n is not None and self.tile_n not in _tile_ns,
             f"SM100 DSL SDPA serves tile_n in {sorted(_tile_ns)} on the {self.flavor} flavor; got {self.tile_n}",
@@ -3468,7 +3472,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         self._not_implemented_error_if(
             self.thd and self._device_cc == (10, 7) and not self._fp8 and (int(d_qk), int(d_v)) == (64, 64) and not self._rubin_native_d64_pack_leg(),
-            "native D64 THD requires nonpaged, unsplit half-precision plans on the D64 tile",
+            "native D64 THD requires nonpaged half-precision plans, with one CTA for split execution",
         )
         if self.gate_desc is not None:
             # STANDALONE twin of the rows' `epilogue_gate` / `epilogue_gate_d_shapes`
@@ -3774,7 +3778,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         decode tile serves the d64 flavor's whole graph contract (paged / dense,
         padding, causal bottom-right, SWA, right band, sink, Stats natural or
         base-2, split-KV partials) for graphs whose S_q x packed heads fit one
-        128-row tile -- S_q = 1 decode and MTP. Explicit paged THD split
+        128-row tile -- S_q = 1 decode and MTP. Explicit THD split
         plans use the same tile across multiple Q blocks. Other THD, larger
         dense S_q and an explicit cga2 stay on the prefill tile. SM107 uses
         this specialization for dense unsplit N128 without prefolded scale.
@@ -3783,6 +3787,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         """
         if self._fp8 or self.flavor != (64, 64):
             return False
+        if self.thd and self.packed_thd_split and not self.paged:
+            return True  # D64 nonpaged split uses the same physical-width single-Q body.
         if self._device_cc == (10, 7) and (self.thd or self.paged or self.split_kv != 1 or self.softmax_scale_prefolded or self._effective_tile_n() != 128):
             # Native THD, paged/envelope and prefolded-scale contracts keep
             # their existing bodies. Dense split selection is handled by the

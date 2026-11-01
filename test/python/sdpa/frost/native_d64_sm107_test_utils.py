@@ -100,16 +100,16 @@ def test_native_d64_dense_pack_replay(dtype_name, cga, head_dims, geometry, tile
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("cga", [1, 2])
 @pytest.mark.parametrize("packed", [False, True])
-def test_native_d64_standalone_compact_thd(dtype, cga, packed):
+def test_native_d64_standalone_compact_thd(dtype, cga, packed, heads=24, splits=1, cpu_reference=False):
     from itertools import accumulate
 
     from sm107_half_test_utils import _dense_mask, _half_oracle
     from test_sdpa_prepared_thd import _buffers, _compact_thd_api, _execute_compact_thd
 
-    b, ql, kl, hq, hk, d = 3, 257, 1025, 24, 2, 64
+    b, ql, kl, hq, hk, d = 3, 257, 1025, heads, 2, 64
     a = _buffers(b, ql, kl, hq, hk, d, seed=721, dtype=dtype)
     fresh = _buffers(b, ql, kl, hq, hk, d, seed=722, dtype=dtype)
-    api = _compact_thd_api(a, b, ql, kl, hq, hk, d, cga=cga, pack_gqa=packed)
+    api = _compact_thd_api(a, b, ql, kl, hq, hk, d, cga=cga, pack_gqa=packed, split_kv=splits)
     assert api.flavor == (64, 64) and api._k_mod.CFG.TILE_K == api._k_mod.CFG.TILE_O == 64
     ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
 
@@ -133,9 +133,15 @@ def test_native_d64_standalone_compact_thd(dtype, cga, packed):
             q = bufs["q"][lo:hi].transpose(0, 1).unsqueeze(0)
             k = bufs["k"][klo:khi].transpose(0, 1).unsqueeze(0)
             v = bufs["v"][klo:khi].transpose(0, 1).unsqueeze(0)
-            out, lse = _half_oracle(q, k, v, logit_scale=d**-0.5, masked=_dense_mask(hi - lo, khi - klo, causal=True))
-            torch.testing.assert_close(bufs["o"][lo:hi].double(), out[0].transpose(0, 1), atol=4e-3, rtol=4e-3)
-            torch.testing.assert_close(bufs["lse"][lo:hi].double(), lse[0].T, atol=4e-4, rtol=0)
+            mask = _dense_mask(hi - lo, khi - klo, causal=True)
+            actual_o, actual_lse = bufs["o"][lo:hi].double(), bufs["lse"][lo:hi].double()
+            if cpu_reference:
+                # Keep cuBLAS JIT initialization outside the kernel sanitizer scope.
+                q, k, v, mask = q.cpu(), k.cpu(), v.cpu(), mask.cpu()
+                actual_o, actual_lse = actual_o.cpu(), actual_lse.cpu()
+            out, lse = _half_oracle(q, k, v, logit_scale=d**-0.5, masked=mask)
+            torch.testing.assert_close(actual_o, out[0].transpose(0, 1), atol=4e-3, rtol=4e-3)
+            torch.testing.assert_close(actual_lse, lse[0].T, atol=4e-4, rtol=0)
         assert torch.all(bufs["o"][cq[-1] :] == 19)
         assert torch.all(bufs["lse"][cq[-1] :] == 19)
 

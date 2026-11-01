@@ -641,14 +641,15 @@ def test_d256_thd_split_explicit_contract(monkeypatch, splits, cga, device_cc, p
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("cga", [None, 1])
 def test_paged_d64_split_explicit_contract(monkeypatch, device_cc, splits, packed, cga):
-    """D64 THD uses its native decode tile only for an explicit paged split."""
+    """D64 THD uses its physical-width single-Q tile for explicit splits."""
     facts = _paged_split_facts(device_cc=device_cc, d_qk=64, d_v=64)
     knobs = heur.SdpaFwdKnobs(cga=cga, split_kv=splits, pack_gqa=packed)
     assert mismatch(SPEC.capabilities, facts, knobs) is None
     assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in knobs.to_public().items()}) == knobs
     for invalid in (replace(knobs, cga=2), replace(knobs, split_kv=1, pack_gqa=True)):
         assert mismatch(SPEC.capabilities, facts, invalid) is not None
-    for invalid in (replace(facts, has_paged_kv=False), replace(facts, has_sink=True), replace(facts, has_epilogue_gate=True)):
+    assert mismatch(SPEC.capabilities, replace(facts, has_paged_kv=False), knobs) is None
+    for invalid in (replace(facts, has_sink=True), replace(facts, has_epilogue_gate=True)):
         assert mismatch(SPEC.capabilities, invalid, knobs) is not None
     previous = type("PreviousNativeBinder", (), {"supports_paged_packed_split": True})
     monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", previous)

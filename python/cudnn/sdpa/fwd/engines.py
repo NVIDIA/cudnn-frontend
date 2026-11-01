@@ -1108,6 +1108,8 @@ def effective_tile_ns(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
     ``tile_ns_by_d_shape`` entry for the selected flavor replaces it (the Rubin small tiles render 64 and 128, the
     native D128 rendering additionally admits explicit 64 on its double-score pipeline)."""
     selected = _selected_d_shape(capabilities, facts, knobs)
+    if selected == (64, 64) and facts.thd and knobs is not None and (knobs.split_kv or 1) > 1 and not (facts.is_fp8 or facts.is_mxfp8):
+        return frozenset({128})  # the packed split host selects the single-Q body
     if capabilities.sm_lo == 107 and facts.is_fp8 and not facts.is_mxfp8:
         # Explicit per-tensor widths do not inherit the half-precision resident-arm
         # default picker. Keep the row's default128 while admitting the D64 option.
@@ -1690,7 +1692,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if packed_split and not getattr(
             cudnn._pybind_module._SdpaThdBinder,
             (
-                "supports_paged_d64_packed_split"
+                ("supports_paged_d64_packed_split" if facts.has_paged_kv else "supports_nonpaged_d64_packed_split")
                 if facts.d_v == 64
                 else (
                     ("supports_paged_d256_packed_split" if facts.has_paged_kv else "supports_nonpaged_d256_packed_split")
@@ -2042,7 +2044,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             cga=knobs.cga if knobs is not None else None,
             thd=facts.thd,
         ):
-            return "native D64 THD requires nonpaged, unsplit half-precision plans on the D64 tile"
+            return "native D64 THD requires nonpaged half-precision plans, with one CTA for split execution"
     if facts.thd and capabilities.sm_lo == capabilities.sm_hi == 80 and capabilities.phase == "prefill":
         from cudnn.sdpa.native_sm80 import forward_thd_layout_mismatch
 
@@ -3659,7 +3661,7 @@ def lower_dsl_prefill(
             and facts.epilogue_gate_t is None
             and spec.name in ("sdpa_fwd_prefill_sm100", "sdpa_fwd_prefill_sm107")
             and facts.device_cc in ((10, 0), (10, 3), (10, 7))
-            and (facts.d_qk, facts.d_v) == (192, 128)
+            and ((facts.d_qk, facts.d_v) == (192, 128) or ((facts.d_qk, facts.d_v) == (64, 64) and api.packed_thd_split))
             and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
             and not facts.has_paged_kv
         )
