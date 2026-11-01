@@ -9,7 +9,7 @@ import torch
 import cudnn
 
 from cudnn.api_base import TensorDesc
-from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm80, _sm80_pick_flavor
+from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm80, _sm80_pick_flavor, _SM80_FLAVOR_DIMS
 from frost_test_utils import _SM, requires_dsl, select_engine
 
 pytestmark = [pytest.mark.L0, requires_dsl, pytest.mark.skipif(_SM != 80, reason="requires native SM80")]
@@ -30,21 +30,23 @@ _POINTS = [
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("thd", [False, True])
 @pytest.mark.parametrize("graph_mode", [False, True])
-def test_native_paged_adapter_rebind_replay(point, dtype, thd, graph_mode, cudnn_handle, monkeypatch):
+def test_native_paged_adapter_rebind_replay(point, dtype, thd, graph_mode, cudnn_handle, monkeypatch, single_q=False, case_index=None):
     import cutlass.cute as cute
 
-    index = _POINTS.index(point) * 4 + (2 if dtype == torch.float16 else 0) + int(thd)
+    index = (_POINTS.index(point) if case_index is None else case_index) * 4 + (2 if dtype == torch.float16 else 0) + int(thd)
     observations = []
     d, dv, page, klayout, vlayout, mask = point
     torch.manual_seed(721 + index)
     b, h, hk, max_sq, max_skv, tq = 3, 8, 2, 65, 129, 89
+    if single_q:
+        max_sq = 1
     cap = (tq + 64 if graph_mode else tq) if thd else max_sq
     qbatch = 1 if thd else b
     npages = (max_skv + page - 1) // page
     causal, br, swa = mask in ("causal", "br", "br_swa"), mask in ("br", "br_swa"), mask in ("swa", "br_swa")
     flavor = _sm80_pick_flavor(d, dv)
-    fd, fv = {"gptoss": (64, 64), "llama": (128, 128), "dsv3": (192, 128), "qwen": (256, 256)}[flavor]
-    m, n, w = (128, 64, 4) if fd == 64 else (64, 32 if fd == 256 else 64, 4)
+    fd, fv = _SM80_FLAVOR_DIMS[flavor]
+    m, n, w = (32, 16, 4) if max(fd, fv) > 256 else (128, 64, 4) if fd == 64 else (64, 32 if fd == 256 else 64, 4)
 
     def allocate():
         q = torch.randn(qbatch, cap, h, d + 8, dtype=dtype, device="cuda")[..., :d]
@@ -165,7 +167,8 @@ def test_native_paged_adapter_rebind_replay(point, dtype, thd, graph_mode, cudnn
         graph = torch.cuda.CUDAGraph()
         origin_buffers = [torch.empty(b + 1, dtype=torch.int64, device="cuda") for _ in range(3)] if graph_mode and thd else []
         try:
-            for phase, (qs, ks) in enumerate((((65, 8, 16), (129, 33, 0)), ((8, 33, 0), (33, 129, 0)))):
+            phases = (((1, 0, 1), (129, 33, 0)), ((0, 1, 1), (33, 129, 0))) if single_q else (((65, 8, 16), (129, 33, 0)), ((8, 33, 0), (33, 129, 0)))
+            for phase, (qs, ks) in enumerate(phases):
                 cq, ck = [0], [0]
                 for x, y in zip(qs, ks):
                     cq.append(cq[-1] + x)
