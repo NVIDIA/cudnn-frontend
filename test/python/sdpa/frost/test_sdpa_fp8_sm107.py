@@ -2284,3 +2284,14 @@ class TestNativePagedNarrow:
 
     test_admission_and_record = staticmethod(_checks.test_admission_and_record)
     test_origins_rebind_and_replay = staticmethod(_checks.test_origins_rebind_and_replay)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeD256PhysicalOrigins:
+    """Exercise native unsplit physical origins from the architecture CI entry."""
+
+    from native_d256_origins_sm107_checks import test_native_d256_independent_origins
+
+    test_native_d256_independent_origins = staticmethod(test_native_d256_independent_origins)

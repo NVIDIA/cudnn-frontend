@@ -3689,6 +3689,20 @@ def lower_dsl_prefill(
             and not facts.has_paged_kv
         )
         or (
+            # Native D256 unsplit uses sequence-local maps for independent
+            # Q/K/V/O origins, including interior padding in every port.
+            facts.thd
+            and facts.epilogue_gate_t is None
+            and spec.name == "sdpa_fwd_prefill_sm107"
+            and facts.device_cc == (10, 7)
+            and (facts.d_qk, facts.d_v) == (256, 256)
+            and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+            and not facts.has_paged_kv
+            and not api.pack_gqa
+            and api.split_kv == 1
+            and api.cga in (None, 2)
+        )
+        or (
             # The SM90 row (f16/bf16, nonpaged, unsplit, ungated by its capabilities) reads every
             # port's offsets: its setup launch builds per-sequence K/V/O maps at the origins.
             facts.thd
