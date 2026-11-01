@@ -1758,6 +1758,32 @@ def test_sm107_shared_d128_scheduler_follows_the_measured_tables(sm107_metadata_
     assert sm100_plans and sm100_plans[0].knobs.sched_policy in (None, 0), sm100_plans[0].knobs
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over, lpt",
+    [
+        (dict(b=1, s_q=4096, s_kv=4096), True),  # d128, 4.7 waves
+        (dict(b=16, s_q=8192, s_kv=8192), False),  # d128, 152 waves
+        (dict(b=16, s_q=8192, s_kv=8192, d_qk=64, d_v=64), True),  # the 1-CTA d64 flavor at any size
+        (dict(b=1, s_q=4096, s_kv=4096, d_qk=256, d_v=256), False),  # d256 keeps NATURAL
+        (dict(b=1, s_q=4096, s_kv=4096, window_left=1024), False),
+        (dict(b=1, s_q=4096, s_kv=4096, has_sink=True), False),
+        (dict(b=1, s_q=4096, s_kv=4096, causal=False, bottom_right=False), False),
+    ],
+    ids=["d128_few_waves", "d128_many_waves", "d64_any_size", "d256", "window", "sink", "no_mask"],
+)
+def test_sm107_unpacked_causal_thd_scheduler(sm107_metadata_target, over, lpt):
+    """cc 10.7 half THD prefill without packing (MHA here): LPT leads on d64 and on d128 up to
+    _SM107_THD_LPT_MAX_WAVES, NATURAL otherwise; the other policy stays listed for autotune (rubin_sched_thd study)."""
+    from cudnn.sdpa.fwd.heuristics import _sched_points
+
+    caps = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16).capabilities
+    facts = _sm107_d128_facts(**{**dict(h_q=32, h_kv=32, thd=True, padded=True, has_sink=False), **over})
+    points = _sched_points(caps, facts)
+    assert points[0] == (SCHED_LPT if lpt else SCHED_NATURAL), points
+    assert set(points) == {SCHED_LPT, SCHED_NATURAL}, points
+
+
 def _decode_d256_facts(**over):
     """Qwen3.5 decode as served: 32/2 heads (packed 16:1), d=256, S_q=1, paged
     (page 16) over a 4096-key table, on a 148-SM SM100 part."""
