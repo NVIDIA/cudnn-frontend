@@ -522,10 +522,12 @@ def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_sta
 
 
 def supports_scalar_kv_tail_split(d_shape, *, device_cc, fp8, pertensor):
-    """Scalar-tail masking composes with D128 and native Rubin half D512 split."""
-    return (device_cc in ((10, 0), (10, 3), (10, 7)) and d_shape == (128, 128) and (not fp8 or pertensor)) or (
-        device_cc == (10, 7) and d_shape == (512, 512) and not fp8
-    )
+    """Scalar-tail masking composes with the native half split flavors."""
+    if device_cc not in ((10, 0), (10, 3), (10, 7)):
+        return False
+    if fp8:
+        return d_shape == (128, 128) and pertensor
+    return d_shape in ((64, 64), (128, 128), (192, 128), (256, 256), (512, 512))
 
 
 def supports_quantized_split_sink(*, device_cc, pertensor, thd):

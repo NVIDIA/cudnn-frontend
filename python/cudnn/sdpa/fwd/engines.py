@@ -1804,7 +1804,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 _synth_kv_padding(capabilities, facts)
                 and not native_fp8_padded_split
                 and not supports_scalar_kv_tail_split(
-                    (facts.d_qk, facts.d_v),
+                    (facts.d_qk, facts.d_v) if facts.is_fp8 or facts.is_mxfp8 else _selected_d_shape(capabilities, facts, knobs),
                     device_cc=facts.device_cc,
                     fp8=facts.is_fp8 or facts.is_mxfp8,
                     pertensor=facts.is_fp8,

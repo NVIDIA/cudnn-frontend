@@ -3625,7 +3625,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 self._kv_tail_mask
                 and (self.split_kv or 1) > 1
                 and not native_fp8_padded_split
-                and not supports_scalar_kv_tail_split((int(d_qk), int(d_v)), device_cc=self._device_cc, fp8=self._fp8, pertensor=self._pertensor),
+                and not supports_scalar_kv_tail_split(
+                    (int(d_qk), int(d_v)) if self._fp8 else self.flavor,
+                    device_cc=self._device_cc,
+                    fp8=self._fp8,
+                    pertensor=self._pertensor,
+                ),
                 f"S_kv ({s_kv}) is not a multiple of {_SM100_TILE_N}: split-KV needs a padding mask (seq_len_kv) or a causal mask covering the KV tail",
             )
 

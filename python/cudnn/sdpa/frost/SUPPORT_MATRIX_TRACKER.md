@@ -215,15 +215,20 @@ eligibility is unchanged.
 
 ### Explicit scalar KV-tail split
 
-SM100/SM103/SM107 exact D128/V128 FP16/BF16 and per-tensor FP8 dense
-forward plans can explicitly combine split-KV with a mask-free, non-tile-aligned
-KV extent. The existing scalar-tail mask bounds each split; empty partitions
+SM100/SM103/SM107 FP16/BF16 dense forward plans using the D64/V64,
+D128/V128, D192/V128, D256/V256 and D512/V512 native flavors can explicitly
+combine split-KV with a mask-free, non-tile-aligned KV extent. Their existing
+logical head-dimension envelopes use the same scalar-tail mask. Per-tensor
+FP8 retains its exact D128/V128 domain here and its separately qualified
+native padded-split routes. The existing scalar-tail mask bounds each split; empty partitions
 emit the combine identity. No per-batch length tensor or execute-time staging
 is introduced. Native shape overrides may shrink KV within the declaration,
 with the requested O, Stats and FP8 Amax contracts preserved. CGA domains are
-unchanged (FP8 split uses CGA2). Other dimensions, MXFP8, dense padding and
+unchanged (FP8 split uses CGA2). Other flavors, MXFP8, dense padding and
 sink combinations retain their existing restrictions. Automatic scalar-tail
 selection remains unsplit pending independent tuning.
+This preserves the existing split-body domain: on SM107, dense half D256
+still requires its decode tile; its general prefill body remains unsplit.
 
 > **Keeping this current is a hard rule.** A change to any FROST SDPA
 > `Capabilities` row, or adding/retiring an `EngineSpec`, updates this file in
