@@ -175,6 +175,22 @@ def test_cc103_borrows_only_the_studies_its_transfer_check_named(monkeypatch):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("s", [1, 512])
+def test_a_square_entry_reaches_the_runtime_from_either_corner(monkeypatch, s):
+    """The generator classifies through class_key; an entry it emits for a top-left square must be the one place() honors."""
+    from cudnn.sdpa.fwd import placement
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    tl, br = (_facts(s_q=s, s_kv=s, h_q=16, h_kv=2, d_qk=128, d_v=128, causal=True, bottom_right=a) for a in (False, True))
+    key = pt.class_key(spec.name, tl)
+    assert key == pt.class_key(spec.name, br) and ("none" if s == 1 else "causal_br") in key  # one row sees its only key
+    for verdict, expected in (("never", placement.TRAIL), ("always", placement.LEAD)):
+        monkeypatch.setattr(pt, "TABLE", {key: pt.Entry(verdict, None, "synthetic")})
+        assert placement.place(spec, tl) == placement.place(spec, br) == expected
+
+
+@pytest.mark.L0
 def test_cc103_d256_backward_thd_entries_are_its_own():
     """cc 10.3's own d256 backward entries answer with no transfer: THD on the 128-key tile (study sm103_d256_bwd_v2_20261031,
     THD half) and off it (study sm103_d256_bwd_thd_offtile_20261031). The same graph on cc 10.0 has no entry, so the
@@ -203,3 +219,23 @@ def test_cc103_d256_backward_thd_entries_are_its_own():
     assert pt.log2_work(small) < 30.374 <= pt.log2_work(large)
     assert (pt.lookup(row, small), pt.lookup(row, large)) == (False, True)
     assert pt.lookup(row, bwd(2, 16, 2, 4000, thd=False, max_total_seq_len_q=None)) is None  # dense off the tile: no entry
+
+
+@pytest.mark.L0
+def test_cc103_d128_forward_dense_chunk_gqa_entries_are_its_own():
+    """cc 10.3's own d128 forward entries for dense bottom-right causal GQA chunks (study sm103_d128_fwd_chunk_20261031, GQA
+    half): they lead on and off the 128-key tile, past the hand rules' chunk-size and cache bounds, with no transfer. The same
+    graphs on cc 10.0, MHA, f16 and top-left chunks have no entry."""
+    row = "sdpa_fwd_prefill_sm100"
+
+    def chunk(b, h_q, h_kv, s_q, s_kv, **over):
+        base = dict(b=b, h_q=h_q, h_kv=h_kv, s_q=s_q, s_kv=s_kv, d_qk=128, d_v=128, causal=True, bottom_right=True, has_paged_kv=False, device_cc=(10, 3))
+        base.update(over)
+        return _facts(**base)
+
+    assert pt.lookup(row, chunk(4, 64, 8, 128, 2048)) is True  # 256 Q tiles from a 2k cache: past both hand-rule bounds
+    assert pt.lookup(row, chunk(2, 16, 2, 512, 10000)) is True  # off the tile: its own class and entry
+    assert pt.lookup(row, chunk(4, 64, 8, 128, 2048, device_cc=(10, 0))) is None
+    assert pt.lookup(row, chunk(4, 32, 32, 128, 2048)) is None  # MHA: no entry
+    assert pt.lookup(row, chunk(4, 64, 8, 128, 2048, dtype=cudnn.data_type.HALF)) is None  # f16: not measured
+    assert pt.lookup(row, chunk(4, 64, 8, 128, 2048, bottom_right=False)) is None  # top-left chunk: not this class

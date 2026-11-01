@@ -772,10 +772,10 @@ def test_split_chooser_receives_the_row_cost_profile(monkeypatch, row, device_cc
 @pytest.mark.parametrize("s_q,window", [(1, None), (1, 128), (4, None), (4, 128)])
 @pytest.mark.parametrize("sink", [True, False])
 def test_rubin_decode_packing_uses_selected_flavor(monkeypatch, d, s_q, window, sink):
-    """D128 retains the shared decode tile; unsplit D64 packing is native.
+    """D128 retains the shared decode tile; D64 packing keeps its native width.
 
     Retain the shared decode proposal regression on D128. D64's native packed
-    capability is independent of its recommendation rank; split still uses D128.
+    capability is independent of its recommendation rank, including split-KV.
     """
     from cudnn.frost import buffers
     from cudnn.sdpa.fwd.engines import _selected_d_shape
@@ -808,9 +808,45 @@ def test_rubin_decode_packing_uses_selected_flavor(monkeypatch, d, s_q, window, 
     if sink:
         assert all(p.knobs.split_kv == 1 for p in plans)  # no sink split on this row
     else:
-        assert any((p.knobs.split_kv or 1) > 1 for p in plans)  # the split leg is proposed again; its rank is the wave model's
-        assert _selected_d_shape(spec.capabilities, facts, replace(packed, split_kv=2)) == (128, 128)
+        if d == 128:
+            assert any((p.knobs.split_kv or 1) > 1 for p in plans)
+        split_packed = replace(packed, split_kv=2)
+        assert mismatch(spec.capabilities, facts, split_packed) is None
+        assert _selected_d_shape(spec.capabilities, facts, split_packed) == (d, d)
     assert all(mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
+
+
+@requires_dsl
+@pytest.mark.parametrize("window", [None, 128])
+@pytest.mark.parametrize("b", [1, 16])
+@pytest.mark.parametrize("s_q", [1, 2])
+def test_rubin_native_d64_packs_past_one_unpacked_wave(monkeypatch, window, b, s_q):
+    """Unsplit native D64 packing leads under a window or once the unpacked launch needs a second wave; a one-wave
+    unpacked launch without a window keeps the unpacked plan first and the packed one listed."""
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    causal = s_q > 1 or window is not None
+    facts = _facts(
+        b=b,
+        h_q=16,
+        h_kv=2,
+        s_q=s_q,
+        s_kv=131072,
+        d_qk=64,
+        d_v=64,
+        causal=causal,
+        bottom_right=causal,
+        window_left=window,
+        has_sink=True,
+        device_cc=(10, 7),
+        device_sm_count=216,
+    )
+    plans = heur.recommend("A", facts, {spec.name: 20505})
+    one_wave = b * facts.h_q <= facts.device_sm_count
+    assert plans[0].knobs.pack_gqa == (window is not None or not one_wave)
+    assert any(p.knobs.pack_gqa for p in plans) and any(not p.knobs.pack_gqa for p in plans)
 
 
 @pytest.mark.L0

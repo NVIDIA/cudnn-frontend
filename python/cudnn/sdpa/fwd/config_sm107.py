@@ -385,12 +385,12 @@ SM107_SCORE_STATS_SHAPES = frozenset({(128, 128)})
 # engine row's d_shapes / cga domain, the adapter's kernel-file map and the tests -- rule 8b'); D > 128 belongs to the
 # d192 / d256 / d512 rows.
 #
-# D32 carries the dense leg. D64 additionally carries nonpaged THD and PackGQA.
+# D32 carries the dense leg. D64 also carries nonpaged THD, PackGQA and dense splitting.
 # The per-shape domains below are shared by graph selection and the adapter;
 # every requested feature must fit. Other legs retain the larger envelope.
 SM107_HEAD_DIM_TILE_WIDTHS = (32, 64, 128)
 SM107_F16_SMALL_D_SHAPES = frozenset({(32, 32), (64, 64)})
-SM107_SMALL_D_NATIVE_LEGS = {(32, 32): frozenset(), (64, 64): frozenset({"THD", "PackGQA"})}
+SM107_SMALL_D_NATIVE_LEGS = {(32, 32): frozenset(), (64, 64): frozenset({"THD", "PackGQA", "split-KV"})}
 # cga widths the small tiles are VALIDATED at (the engine row's ``cgas_by_d_shape`` reads this; the factory refuses a width
 # outside it).  cga1 is the default: the narrow slabs need no collective MMA to halve K/V, and a 512-row cga2 cluster wastes
 # 25-50 % of its Q rows at the S = 256-384 crops these tiles exist for.  At TILE_O = 32 a cga2 V operand would be 16 columns
@@ -404,9 +404,9 @@ def supports_native_d192_paged(d_shape, *, device_cc, fp8, paged, cga=None, spli
     return device_cc == (10, 7) and d_shape == (192, 128) and not fp8 and paged and cga in (None, 2) and split_kv == 1
 
 
-def supports_native_d64_pack(d_shape, *, device_cc, fp8, paged, split_kv=1, cga=None):
-    """Native half D64 packs dense or ragged queries without paged KV or splitting."""
-    return device_cc == (10, 7) and d_shape == (64, 64) and not fp8 and not paged and split_kv == 1 and cga in (None, 1, 2)
+def supports_native_d64_pack(d_shape, *, device_cc, fp8, paged, split_kv=1, cga=None, thd=False):
+    """Native half D64 packs dense splits and unsplit ragged queries."""
+    return device_cc == (10, 7) and d_shape == (64, 64) and not fp8 and not paged and (not thd or split_kv == 1) and cga in (None, 1, 2)
 
 
 def supports_native_d128_narrow_tile(d_shape, *, device_cc, half_precision, thd, paged, cga, split_kv=1, has_bias=False, has_kv_mask=False):
@@ -453,7 +453,7 @@ def sm107_small_tile_leg(
 ) -> Optional[str]:
     """First requested feature outside a tile's native legs, or ``None``.
 
-    D32 carries dense plans; D64 also carries THD and PackGQA. Every requested
+    D32 carries dense plans; D64 also carries THD, PackGQA and dense split-KV. Every requested
     feature is checked, so allowing THD cannot hide an unsupported paged or split
     combination. Graph selection and standalone admission share this predicate.
     """
@@ -480,7 +480,7 @@ def sm107_f16_tile_width(d_qk: int, d_v: int, *, leg: Optional[str] = None, cga:
 
     ``leg`` (:func:`sm107_small_tile_leg`) and ``cga`` make the pick feature-aware: a small tile is taken for dense plans
     or a feature in :data:`SM107_SMALL_D_NATIVE_LEGS`, at a cga inside :data:`SM107_SMALL_D_CGAS` (or unset); otherwise the walk continues to the
-    next covering width -- a split-KV / score-output graph at D <= 64 lands on 128 (its pre-tile route), a cga2 request at
+    next covering width -- a split-KV graph at D <= 64 lands on 64, score outputs on 128, a cga2 request at
     D <= 32 on 64.  The engine row (``d_shapes`` + ``dense_only_d_shapes``, the envelope walk of ``engines._selected_d_shape``)
     and the adapter (``api_dsl._pick_flavor`` over its Rubin pool) implement the SAME pick; the tests assert the three agree for
     every served D and every leg (rule 8b')."""
@@ -2156,9 +2156,9 @@ def _validate_q_in_tmem(cfg, flavor: str) -> None:
 
 
 def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, tile_o: int, mxfp8: bool):
-    # Per-tensor FP8 D64/D128/D192 and half D128/D192 share FP32 split partials.
+    # Per-tensor FP8 and half D64/D128/D192 share FP32 split partials.
     # MXFP8 has no split loop yet.
-    split_shapes = SM107_FP8_SPLIT_SHAPES if params.dtype_qkv <= _DTYPE_E5M2 else {(128, 128), (192, 128)}
+    split_shapes = SM107_FP8_SPLIT_SHAPES if params.dtype_qkv <= _DTYPE_E5M2 else {(64, 64), (128, 128), (192, 128)}
     split_wired = not mxfp8 and (tile_k, tile_o) in split_shapes
     # The block-scaled O epilogue lives in the two d128 kernels (per-tensor fp8 and
     # mxfp8); the d192xd128 siblings share this config family but not the epilogue.
@@ -2416,12 +2416,15 @@ def make_cfg_d64(params: TemplateParams) -> Tuple[CfgD64, TmaIters]:
     """The 64-wide head-dim tile of ``sm107/prefill_d128_f16.py`` (``TemplateParams.d_flavor=64``).
 
     Half-precision dense plans use aligned logical widths up to 64 by TMA zero fill;
-    native THD uses exact D64. Both CTA widths carry THD and PackGQA.
+    native THD uses exact D64. Both CTA widths carry THD and PackGQA;
+    dense split plans use FP32 partials and the shared sink-aware combine.
     Per-tensor FP8 uses the same native width in ``prefill_d128_fp8.py``,
     including dense PackGQA and split-KV; its THD and paged forms remain unsupported.
     """
     if params.dtype_qkv <= _DTYPE_E5M2 and params.thd_varlen:
         raise ValueError("sm107 d64: per-tensor FP8 THD is not wired at the native D64 width")
+    if params.thd_varlen and (params.split_kv or 1) > 1:
+        raise ValueError("sm107 d64: native THD split partials are not wired")
     return _make_cfg_d128_family(params, flavor="sm107 d64", tile_k=64, tile_o=64, mxfp8=False)
 
 

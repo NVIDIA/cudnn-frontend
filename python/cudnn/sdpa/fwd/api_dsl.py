@@ -741,6 +741,21 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     if rubin and not fp8 and flavor == (192, 128) and params.paged_kv:
         params = replace(params, d_flavor=192)
         return _load_kernel_template("sm107/prefill_d128_f16.py", params, f"sdpa_fwd_sm107_{tag}_paged")
+    if (
+        rubin
+        and not fp8
+        and flavor == (64, 64)
+        and params.cta_mma == 1
+        and params.split_kv > 1
+        and not params.thd_varlen
+        and not params.paged_kv
+        and params.tile_n == 128
+    ):
+        # The single-Q body also serves physical D64 on SM107. A second Q slab
+        # wastes an MMA/softmax chain on decode; retain the native prefill body
+        # for two CTAs and N64. The shared body is compiled for the actual part.
+        params = replace(params, d_flavor=64, decode_tile=True)
+        return _load_kernel_template(_SM100_DECODE_KERNEL_FILE, params, f"sdpa_fwd_sm107_{tag}_single_q")
     if rubin and not fp8 and flavor == _SM100_DECODE_FLAVOR and params.ragged_q:
         # The single-query paged split ABI uses the shared decode tile, as
         # on SM100/SM103, compiled for the actual SM107 target.
@@ -1652,7 +1667,7 @@ class SdpaFwdDsl(APIBase):
 
         * SM120: its ``sO`` aliases ``sKV``, so there is no room to widen the O
           tile, and it keeps half partials.
-        * SM107 (Rubin) outside per-tensor FP8 D64/D128/D192, half D128/D192, native
+        * SM107 (Rubin) outside per-tensor FP8 and half D64/D128/D192, native
           half D512 2x2, and the d256 DECODE tile: the other siblings do not carry the FP32
           partial-output slot.  The decode tile (sm107/decode_d256_f16.py) is
           the SM100 body and stores fp32 partials unconditionally under a split
@@ -1674,7 +1689,7 @@ class SdpaFwdDsl(APIBase):
             return False
         if self._device_cc == (10, 7):
             return (
-                bool(not self._fp8 and self.flavor in ((128, 128), (192, 128)))
+                bool(not self._fp8 and self.flavor in ((64, 64), (128, 128), (192, 128)))
                 or bool(self._fp8 and self._pertensor and self.flavor in _SM107_FP8_SPLIT_SHAPES)
                 or self._decode_q_tile() > 0
                 or self._rubin_native_d512_leg()
@@ -2189,6 +2204,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             paged=self.paged,
             split_kv=self.split_kv,
             cga=self.cga,
+            thd=self.thd,
         )
 
     def _rubin_shared_dense_leg(self) -> bool:
@@ -2632,7 +2648,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             )
         elif self._device_cc == (10, 7):
             # Each small tile admits its own feature set and CTA widths. D32
-            # remains dense-only; D64 also carries THD and PackGQA. Check every
+            # remains dense-only; D64 also carries THD, PackGQA and dense splitting. Check every
             # requested feature before selecting a tile, matching the graph's
             # native_legs_by_d_shape walk (rule 8b').
             _legs = dict(
@@ -3340,24 +3356,26 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 and self.pack_gqa
                 and not _rubin_decode_tile
                 and not self._rubin_native_d512_leg()
+                and not self._rubin_native_d64_pack_leg()
                 and not (
                     self.thd_decode_leg
                     or self.packed_thd_split
                     or (self._fp8 and self._pertensor and self.flavor in _SM107_FP8_PACK_GQA_SHAPES)
                     or self._rubin_shared_dense_leg()
                 ),
-                "split_kv > 1 with PackGQA on cc10.7 requires per-tensor FP8 D64/D128/D192x128/D256, half D128 paged THD, a dense D128 half graph, native dense D512 half, or the d256 decode tile",
+                "split_kv > 1 with PackGQA on cc10.7 requires per-tensor FP8 D64/D128/D192x128/D256, half D128 paged THD, a dense D64/D128 half graph, native dense D512 half, or the d256 decode tile",
             )
             self._not_implemented_error_if(
                 self._device_cc == (10, 7)
                 and not _rubin_decode_tile
                 and not self._rubin_native_d512_leg()
+                and not self._rubin_native_d64_pack_leg()
                 and not (
                     self.packed_thd_split
                     or (not self._fp8 and self.flavor in ((128, 128), (192, 128)))
                     or (self._fp8 and self._pertensor and self.flavor in _SM107_FP8_SPLIT_SHAPES)
                 ),
-                "split_kv > 1 on cc10.7 requires per-tensor FP8 D64, half/per-tensor FP8 D128 or D192/V128, per-tensor FP8 D256, half D256 THD, native dense D512 half, or the d256 decode tile",
+                "split_kv > 1 on cc10.7 requires half/per-tensor FP8 D64/D128 or D192/V128, per-tensor FP8 D256, half D256 THD, native dense D512 half, or the d256 decode tile",
             )
             # The MXFP8 row serves its native d64 leg dense / unsplit / unpaged
             # (split_d_shapes leaves (64, 64) out); mirror it here.
@@ -4939,7 +4957,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             units = env if env <= initial_limit else resident
             wave_envelope = env
             if (
-                ((self._device_cc == (10, 0) and self.paged) or (self._device_cc == (10, 7) and not self.paged))
+                (
+                    (self._device_cc == (10, 0) and self.paged)
+                    # cc 10.3: GQA4 only (B300 A/B: GQA4 0.80-0.97x the resident-wave count, GQA8 0.996-1.03x)
+                    or (self._device_cc == (10, 3) and self.paged and cfg.PACK_G == 4)
+                    or (self._device_cc == (10, 7) and not self.paged)
+                )
                 and self.dtype == torch.bfloat16
                 and self.head_dim_qk == self.head_dim_v == 128
                 and self.batch_size == 1
