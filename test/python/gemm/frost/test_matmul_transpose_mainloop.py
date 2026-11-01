@@ -59,6 +59,7 @@ def _graph(
     scale_prefix=None,
     index_axis=None,
     index_source="matmul",
+    index_pitch=None,
 ):
     """Build a validated logical graph with configurable operand views and epilogue."""
     g = cudnn.pygraph(io_data_type=dtype, intermediate_data_type=F32, compute_data_type=F32)
@@ -102,7 +103,7 @@ def _graph(
         if index_source != "matmul":
             dim = [*prefix, M, N]
             dim[index_axis] = 1
-            stride = [prod(dim[i + 1 :]) for i in range(len(dim))]
+            stride = _strides(prefix, dim[-2:], (dim[-1], 1), gap=0 if index_pitch is None else index_pitch - prod(dim[-2:]))
             source = tensors["index_input"] = g.tensor(name="index_input", dim=dim, stride=stride, data_type=dtype)
             if index_source == "aux_unary":
                 source = g.relu(input=source).set_data_type(dtype)
@@ -134,7 +135,8 @@ def _buffers(tensors, m=128, n=192, k=136, *, device="cpu", dtype=torch.bfloat16
     if "index_input" in tensors:
         dim = tensors["index_input"].get_dim()
         shape = (*dim[:-2], 1 if dim[-2] == 1 else m, 1 if dim[-1] == 1 else n)
-        result["index_input"] = torch.ones(shape, device=device, dtype=dtype)
+        # The compiled auxiliary entry pins strides, even when M/N are symbolic.
+        result["index_input"] = torch.empty_strided(shape, tensors["index_input"].get_stride(), device=device, dtype=dtype).fill_(1)
     return result
 
 
@@ -968,7 +970,7 @@ def test_frost_logical_index_public_graph_composition(prefix):
 @pytest.mark.parametrize("index_source", ["aux", "aux_unary"])
 def test_frost_gen_index_broadcast_source_coordinates(monkeypatch, prefix, matrix_axis, index_source):
     """Singleton producer coordinates are zero, not the consumer GEMM coordinates."""
-    g, tensors = _graph(prefix=prefix, side="", index_axis=len(prefix) + matrix_axis, index_source=index_source)
+    g, tensors = _graph(prefix=prefix, side="", index_axis=len(prefix) + matrix_axis, index_source=index_source, index_pitch=256)
     chain = analyze(g)
     op = next(op for op in chain.ops if op.op == "gen_index")
     assert op.index_expr.evaluate({Axis.BATCH: 0, Axis.M: 17, Axis.N: 23}) == 0
@@ -977,6 +979,7 @@ def test_frost_gen_index_broadcast_source_coordinates(monkeypatch, prefix, matri
     engine = _FrostGemmPlan(plan)
     for m, n, k in ((128, 192, 136), (160, 224, 264)):
         buffers = _buffers(tensors, m, n, k)
+        assert tuple(buffers["index_input"].stride()) == tuple(tensors["index_input"].get_stride())
         engine.execute(g, _graph_coordinate_pack(g, tensors, buffers), ExecutionContext(stream=0))
         assert any(arg.data_ptr() == buffers["index_input"].data_ptr() for arg in frames[-1][4:])
     # Fixed singleton axes are part of the real FFI entry contract. The mock
@@ -992,6 +995,70 @@ def test_frost_gen_index_broadcast_source_coordinates(monkeypatch, prefix, matri
     assert len(frames) == before and torch.all(buffers["y"] == 123)
     engine.execute(g, _graph_coordinate_pack(g, tensors, buffers), ExecutionContext(stream=0))
     assert len(frames) == before + 1
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for the auxiliary FFI stride contract")
+@pytest.mark.parametrize("matrix_axis", [0, 1])
+def test_frost_gen_index_auxiliary_rebind_ffi_contract(tmp_path, matrix_axis):
+    """Run real FFI checks on the rank-4 fixtures without requiring Blackwell MMA."""
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("auxiliary probe requires SM90+")
+    g, tensors = _graph(prefix=(2, 3), side="", index_axis=2 + matrix_axis, index_source="aux_unary", index_pitch=256)
+    ref = next(ref for ref in analyze(g).aux_tensors if ref.name == "index_input")
+    fake = compiler._aux_fake_block([ref], dynamic_strides=True)
+    element = "index_input[tid, 0, index_input.shape[2] - 1]" if matrix_axis == 0 else "index_input[tid, index_input.shape[1] - 1, 0]"
+    source = f"""import cutlass
+import cutlass.cute as cute
+from cuda.bindings import driver as cuda
+
+@cute.kernel
+def kernel(index_input: cute.Tensor, C: cute.Tensor):
+    tid = cute.arch.thread_idx()[0]
+    if tid < C.shape[0]:
+        C[tid] = cutlass.Float32({element})
+
+@cute.jit
+def entry(index_input: cute.Tensor, C: cute.Tensor, stream: cuda.CUstream):
+    kernel(index_input, C).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+
+sym_m, sym_n, sym_l = cute.sym_int64(), cute.sym_int64(), cute.sym_int64()
+{fake}
+fake_output = cute.runtime.make_fake_tensor(cutlass.Float32, (6,), stride=(1,), assumed_align=16)
+compiled = cute.compile(entry, fake_index_input, fake_output, cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False), options="--enable-tvm-ffi")
+"""
+    path = tmp_path / "auxiliary_rebind_entry.py"
+    path.write_text(source)
+    spec = importlib.util.spec_from_file_location("auxiliary_rebind_entry", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    stream = torch.cuda.current_stream().cuda_stream
+    output = torch.full((6,), float("nan"), device="cuda")
+    values = torch.arange(1, 7, device="cuda", dtype=torch.float32)
+    for m, n, k in ((128, 192, 136), (160, 224, 264), (128, 192, 136)):
+        aux = _buffers(tensors, m, n, k, device="cuda")["index_input"]
+        aux.copy_(values.reshape(2, 3, 1, 1))
+        shape, stride = fold_batch_layout(tuple(aux.shape), tuple(aux.stride()))
+        folded = aux.as_strided(shape, stride)
+        assert folded.data_ptr() == aux.data_ptr() and tuple(folded.stride()) == ref.stride
+        module.compiled(folded, output, stream)
+        torch.testing.assert_close(output, values, atol=0, rtol=0)
+        output.fill_(123)
+        with pytest.raises((ValueError, RuntimeError), match=r"index_input.strides"):
+            module.compiled(folded.contiguous(), output, stream)
+        assert torch.all(output == 123)
+        captured = torch.cuda.CUDAGraph()
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("error", message="The CUDA Graph is empty.*")
+                with torch.cuda.graph(captured):
+                    module.compiled(folded, output, torch.cuda.current_stream().cuda_stream)
+            aux.copy_((values + 7).reshape(2, 3, 1, 1))
+            output.fill_(float("nan"))
+            captured.replay()
+            torch.testing.assert_close(output, values + 7, atol=0, rtol=0)
+        finally:
+            captured.reset()
 
 
 @pytest.mark.L0
@@ -1137,7 +1204,9 @@ def test_frost_matrix_gen_index_gpu(prefix, axis, swapped, route, index_source):
     dtype = BF16 if axis % 2 == 0 else cudnn.data_type.HALF
     tdtype = torch.bfloat16 if dtype == BF16 else torch.float16
     side = "ab" if swapped and route != "sm120" else ""
-    g, tensors = _graph(prefix=prefix, side=side, dtype=dtype, index_axis=axis, index_source=index_source)
+    g, tensors = _graph(
+        prefix=prefix, side=side, dtype=dtype, index_axis=axis, index_source=index_source, index_pitch=256 if index_source != "matmul" else None
+    )
     if route == "sm120":
         from cudnn.gemm.frost.sm120 import compiler as backend
 

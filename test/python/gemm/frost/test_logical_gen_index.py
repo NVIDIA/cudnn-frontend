@@ -36,6 +36,7 @@ def test_frost_logical_index_coordinate_grid(shape):
 @pytest.mark.L0
 @pytest.mark.parametrize("shape,axis", [((), 0), ((2,), 0), ((2, 0), 0), ((2, 3), -1), ((2, 3), 2), ((1 << 62, 4, 2, 3), 0)])
 def test_frost_logical_index_invalid_geometry(shape, axis):
+    """Reject unsupported ranks, invalid axes and overflowing batch geometry."""
     with pytest.raises(ValueError, match="gen_index"):
         matrix_axis_index(shape, axis)
 
@@ -53,12 +54,14 @@ def test_frost_logical_index_invalid_geometry(shape, axis):
     ],
 )
 def test_frost_logical_index_invalid_expression(op, value, operand):
+    """Reject malformed integer expressions before graph or codegen lowering."""
     with pytest.raises(ValueError, match="index"):
         IndexExpr(op, value, operand)
 
 
 @pytest.mark.L0
 def test_frost_logical_index_composition_and_validation():
+    """Pin structural substitution, constant simplification and Int64 bounds."""
     m, n = IndexExpr.coordinate(Axis.M), IndexExpr.coordinate(Axis.N)
     expr = m.floor_div(3).modulo(5)
     substituted = expr.substitute({Axis.M: n})
@@ -115,12 +118,14 @@ def test_frost_index_fragment_uniformity_is_layout_owned(axis):
     "axes", [(), ((Axis.M, ()),), ((Axis.M, ("r",)), (Axis.M, ("r",))), ((Axis.M, ("r",)), (Axis.N, ("c", "c + 1"))), (("M", ("r",)),), ((Axis.M, ("",)),)]
 )
 def test_frost_index_fragment_invalid_coordinates(axes):
+    """Reject duplicate, missing, unequal-sized or malformed coordinate columns."""
     with pytest.raises(ValueError, match="fragment coordinates"):
         _FragmentCoordinates(axes)
 
 
 @pytest.mark.L0
 def test_frost_index_fragment_rejects_missing_axis_or_vector_size():
+    """Reject expressions or vector sizes incompatible with the caller fragment."""
     fragment = _FragmentCoordinates(((Axis.M, ("r",) * 4),))
     with pytest.raises(ValueError, match="absent"):
         fragment.is_uniform(IndexExpr.coordinate(Axis.N))
