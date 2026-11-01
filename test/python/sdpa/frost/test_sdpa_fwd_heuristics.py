@@ -1963,8 +1963,9 @@ def test_rubin_decode_tile_packs_the_whole_group_and_takes_the_decode_split_mode
     assert sink[0].pack_gqa is True and all(k.split_kv == 1 for k in sink), sink
     prefill = facts(s_q=512, h_q=16, causal=True, has_paged_kv=False, page_size=0, padded=False)
     assert all(k.pack_gqa is not True and k.split_kv == 1 for k in sets(s_q=512, h_q=16, causal=True, has_paged_kv=False, page_size=0, padded=False))
-    why = engines.mismatch(row, prefill, engines.SdpaFwdKnobs(split_kv=2))
-    assert why and "decode tile" in why, why
+    # Native unpacked prefill now supports an explicit split request; this
+    # does not change the existing heuristic's unsplit recommendation above.
+    assert engines.mismatch(row, prefill, engines.SdpaFwdKnobs(split_kv=2)) is None
     # The paged THD d256 packed graph is NOT the decode tile's (it has no THD scheduler): unsplit at CGA2 it is served by
     # the paged half prefill pipeline's own D256 PackGQA (config_sm100.supports_paged_d256_pack_gqa); a SPLIT packed
     # request has no route on either path and the decline names both.
