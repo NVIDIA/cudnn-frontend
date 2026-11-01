@@ -1974,8 +1974,8 @@ def test_packed_thd_grid_capture_changes_lengths(hnd, dtype, page, geometry):
     """Live scheduling and the packed grid preserve O/Stats under old captures."""
     from test_sdpa_fwd_paged_sm100 import _pools
 
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("Live-length scheduler is initially admitted only on SM100")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Live-length scheduler is admitted on SM100 and SM103")
     b, h, hk, d, qcap, kcap = (1, 32, 8, 128, 2049, 2560)
     if geometry == "d128_short":
         qcap = 1025

@@ -11,6 +11,30 @@ pytestmark = [pytest.mark.L0, requires_dsl, requires_rubin]
 
 
 @pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
+@pytest.mark.parametrize(
+    "case,tile_n,stats,sink,graph_api",
+    [
+        (case, tile_n, stats, sink, graph_api)
+        for case, tile_n, stats, sink in (
+            ("decode64", 128, "log2", True),
+            ("singleq64partial", 128, "natural", True),
+            ("native64plain", 64, "none", False),
+            ("native64partial", 64, "natural", True),
+            ("native64empty", 128, "log2", False),
+            ("native64keyless", 128, "log2", False),
+        )
+        for graph_api in (False, True)
+        if case != "native64keyless" or not graph_api
+    ],
+)
+def test_native_d64_dense_split_replay(dtype_name, graph_api, case, tile_n, stats, sink, cudnn_handle):
+    """Both public APIs bind native D64 partials and retain each captured workspace."""
+    from test_sdpa_sink_split_sm107 import _check_sink_split
+
+    _check_sink_split(case, dtype_name, stats, graph_api=graph_api, handle=cudnn_handle, tile_n=tile_n, sink=sink)
+
+
+@pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
 @pytest.mark.parametrize("cga", [1, 2])
 @pytest.mark.parametrize("packed", [False, True])
 def test_native_d64_independent_origins(dtype_name, cga, packed, monkeypatch):
