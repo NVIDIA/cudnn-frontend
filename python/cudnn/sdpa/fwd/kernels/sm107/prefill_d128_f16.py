@@ -4551,7 +4551,7 @@ def _softmax_warp_group(
                         s_idx = _r[5]
 
             if cutlass.const_expr(_ZERO_CAUSAL_TAIL):
-                for _kv_loop in cutlass.range(live_right, bounds.right, 1, unroll=1):
+                for unused in cutlass.range(live_right, bounds.right, 1, unroll=1):
                     _r = _softmax_kv_body_quiet(
                         sub_tile_id,
                         tmem_ptr_i32,
