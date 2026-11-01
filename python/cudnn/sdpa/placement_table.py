@@ -497,4 +497,14 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
         "always", None, "sm103_d128_fwd_chunk_20261031"
     ),
+    # study sm103_d128_fwd_dense_20261031, causal GQA half (B300 SXM6 1100 W, cuDNN 9.28.0.38; dense BSHD squares, 39 train
+    # cases: S 512-16384 on the 128-key tile and 700-12000 off it, b 1-64, GQA 32/8 / 16/2 / 64/4; 8 off-lattice holdout cases).
+    # Its mask-free classes lost on short-S large-batch holdout cases (S 768: 1.34x GQA 48/6, 1.24x MHA 20/20) and its MHA
+    # classes are thin and non-uniform: no entry, so those graphs keep fwd/placement's hand rules.
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (128, 128), "prefill", "dense", "causal_tl", False, "gqa", False): Entry(
+        "always", None, "sm103_d128_fwd_dense_20261031"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (128, 128), "prefill", "dense", "causal_tl", False, "gqa", True): Entry(
+        "always", None, "sm103_d128_fwd_dense_20261031"
+    ),
 }
