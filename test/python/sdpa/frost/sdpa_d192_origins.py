@@ -7,7 +7,7 @@ import pytest
 
 @pytest.mark.parametrize("dtype_name", ["bfloat16", "float16"])
 @pytest.mark.parametrize("stats_layout", ["token", "head"])
-@pytest.mark.parametrize("cga,policy,total_hints", [(2, 0, False), (2, 1, True), (1, 0, True)])
+@pytest.mark.parametrize("cga,policy,total_hints", [(2, 0, False), (2, 1, True), (1, 0, True), (1, 0, False), (1, 1, False)])
 def test_independent_origins(dtype_name, stats_layout, cga, policy, total_hints, monkeypatch):
     import cudnn
     import torch

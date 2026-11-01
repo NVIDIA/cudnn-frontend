@@ -1294,8 +1294,13 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
         return frozenset({1})
     if (split_kv or 1) > 1 and thd_split_domain(capabilities, facts):
         return frozenset({2 if (facts.d_qk, facts.d_v) in ((256, 256), SM100_NATIVE_D576_SHAPE) else 1})
-    if capabilities.sm_lo == 107 and thd_split_domain(capabilities, facts) and not facts.has_paged_kv and selected == (192, 128):
-        return frozenset({1, 2})
+    if capabilities.sm_lo == 107 and not facts.has_paged_kv and selected == (192, 128):
+        # An explicit unsplit request uses no partial workspace, so it does not
+        # need the split path's total-Q capacity bound for shape overrides.
+        # Keep all other flavor restrictions and the automatic domain intact.
+        domain_facts = replace(facts, shape_overrides=False) if cga == 1 and (split_kv or 1) == 1 else facts
+        if thd_split_domain(capabilities, domain_facts):
+            return frozenset({1, 2})
     if (
         capabilities.sm_lo == 107
         and selected == (128, 128)
