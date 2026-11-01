@@ -124,8 +124,9 @@ def kernel_scale(scale: float) -> float:
 def validate_params(p: TemplateParams) -> None:
     """Raising validator — a failure here means the capability row or the
     adapter lied about what this template can serve (README Rule 2)."""
-    if p.tile_n not in _SM80_SEQ_TILES_N:
-        raise ValueError(f"sm80: tile_n must be one of {_SM80_SEQ_TILES_N}; got {p.tile_n}")
+    tile_ns = (32, *_SM80_SEQ_TILES_N) if (p.d_qk, p.d_v) == (256, 256) else _SM80_SEQ_TILES_N
+    if p.tile_n not in tile_ns:
+        raise ValueError(f"sm80: tile_n must be one of {tile_ns}; got {p.tile_n}")
     if p.num_warps not in (4, 8):
         raise ValueError(f"sm80: num_warps must be 4 or 8; got {p.num_warps}")
     if p.tile_m % (p.num_warps * 16) != 0:

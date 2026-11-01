@@ -15,28 +15,39 @@ pytestmark = [pytest.mark.L0, requires_dsl, pytest.mark.skipif(_SM != 80, reason
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
-    "sq,tile_m,mask,d,dv",
+    "sq,tile_m,mask,d,dv,tile_n",
     [
-        (8, None, "none", 128, 128),
-        (64, None, "causal", 128, 128),
-        (8, None, "br", 128, 128),
-        (64, None, "swa", 128, 128),
-        (8, None, "br_swa", 128, 128),
-        (65, None, "none", 128, 128),
-        (129, 64, "causal", 128, 128),
-        (64, 128, "none", 128, 128),
-        (129, 64, "causal", 96, 96),
-        (96, None, "br", 128, 128),
-        (128, None, "swa", 128, 128),
-        (129, None, "none", 128, 128),
-        (8, None, "none", 192, 128),
-        (64, None, "br_swa", 192, 128),
-        (65, None, "causal", 192, 128),
-        (64, 128, "none", 192, 128),
-        (129, 64, "causal", 192, 128),
+        (8, None, "none", 128, 128, None),
+        (64, None, "causal", 128, 128, None),
+        (8, None, "br", 128, 128, None),
+        (64, None, "swa", 128, 128, None),
+        (8, None, "br_swa", 128, 128, None),
+        (65, None, "none", 128, 128, None),
+        (129, 64, "causal", 128, 128, None),
+        (64, 128, "none", 128, 128, None),
+        (129, 64, "causal", 96, 96, None),
+        (96, None, "br", 128, 128, None),
+        (128, None, "swa", 128, 128, None),
+        (129, None, "none", 128, 128, None),
+        (8, None, "none", 192, 128, None),
+        (64, None, "br_swa", 192, 128, None),
+        (65, None, "causal", 192, 128, None),
+        (64, 128, "none", 192, 128, None),
+        (129, 64, "causal", 192, 128, None),
+        (8, None, "none", 256, 256, None),
+        (64, None, "causal", 256, 256, None),
+        (65, None, "br", 256, 256, None),
+        (96, None, "swa", 256, 256, None),
+        (128, None, "br_swa", 256, 256, None),
+        (129, None, "none", 256, 256, None),
+        (64, 128, "none", 256, 256, None),
+        (8, None, "br_swa", 256, 256, 64),
+        (129, 64, "causal", 256, 256, 32),
+        (64, 128, "none", 256, 256, 32),
+        (129, 64, "br_swa", 248, 200, 32),
     ],
 )
-def test_short_q_masked_rebind_replay(sq, tile_m, mask, d, dv, dtype):
+def test_short_q_masked_rebind_replay(sq, tile_m, mask, d, dv, tile_n, dtype):
     torch.manual_seed(721)
     b, h, hk, sk = 2, 8, 2, 257
     causal = mask in ("causal", "br", "br_swa")
@@ -60,12 +71,15 @@ def test_short_q_masked_rebind_replay(sq, tile_m, mask, d, dv, dtype):
         window_size_left=window,
         stats_log2=log2,
         tile_m=tile_m,
+        tile_n=tile_n,
         sched_policy=2 if causal else 0,
     )
     assert api.check_support()
-    short_q = (d == dv == 128 and sq <= 128) or (d == 192 and dv == 128 and sq <= 64)
+    short_q = (d == dv and d in (128, 256) and sq <= 128) or (d == 192 and dv == 128 and sq <= 64)
     expected = tile_m if tile_m is not None else (64 if short_q else 128)
     assert (api.kernel_tile_m, api.kernel_num_warps) == (expected, expected // 16)
+    expected_n = tile_n if tile_n is not None else (32 if d == dv == 256 and sq <= 128 and expected == 64 else 64)
+    assert api.kernel_tile_n == expected_n
     api.compile()
     artifact = api._compiled_kernel
     assert api.scratch_workspace_bytes() == 0
@@ -107,13 +121,13 @@ def test_short_q_masked_rebind_replay(sq, tile_m, mask, d, dv, dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("d", [128, 192])
-def test_thd_explicit_64_row_tile(dtype, d):
+@pytest.mark.parametrize("d,dv,tile_n", [(128, 128, None), (192, 128, None), (256, 256, None), (256, 256, 32), (248, 200, 32)])
+def test_thd_explicit_64_row_tile(dtype, d, dv, tile_n):
     from cudnn.api_base import TensorDesc
     from test_sdpa_fwd_thd_sm80 import _make_graph
 
     torch.manual_seed(722)
-    _, pack, nodes, (cq, ck) = _make_graph((8, 129), (257, 193), hkv=1, d=d, dv=128, dtype=dtype, causal=True)
+    _, pack, nodes, (cq, ck) = _make_graph((8, 129), (257, 193), hkv=1, d=d, dv=dv, dtype=dtype, causal=True)
     q, k, v, o, stats = nodes
     descs = {
         "sample_"
@@ -133,6 +147,7 @@ def test_thd_explicit_64_row_tile(dtype, d):
         **descs,
         thd=True,
         tile_m=64,
+        tile_n=tile_n,
         is_causal=True,
         seq_q_lens_present=True,
         seq_kv_lens_present=True,
@@ -141,7 +156,7 @@ def test_thd_explicit_64_row_tile(dtype, d):
     )
     assert api.check_support()
     api.compile()
-    assert (api._params.tile_m, api._params.num_warps) == (64, 4)
+    assert (api._params.tile_m, api._params.num_warps, api._params.tile_n) == (64, 4, 64 if tile_n is None else tile_n)
     lengths = {node.get_name(): tensor for node, tensor in pack.items() if node.get_name().startswith("seq_len_")}
     workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
     captured = torch.cuda.CUDAGraph()
