@@ -76,7 +76,9 @@ for _preset in CATALOG:
                     knobs=partial(knobs.model_knobs_fp8, _preset, _phase),
                     exec_kind="fp8",
                     post=_model_post(_phase),
-                    fuzzed=("batch", "seq lens", "layout", "mask flavor", "data", "e4m3/e5m2 in", "out fp8/fp16")
+                    fuzzed=("batch", "seq lens", "layout", "mask flavor", "data")
+                    + (("e4m3 QKV", "dO e4m3/e5m2 (1:2)") if _phase == "bprop" else ("e4m3/e5m2 in",))
+                    + ("out fp8/fp16",)
                     + (("paged 50%",) if _phase == "generation" else ()),
                     pinned=(
                         f"h_q={_preset.num_q_heads}",
@@ -126,7 +128,7 @@ for _preset in CATALOG:
                 exec_kind="mxfp8",
                 min_sm=(10, 0),
                 post=combine(post_mxfp8, post_mxfp8_bwd_flags, post_train) if _phase == "bprop" else post_mxfp8,
-                fuzzed=("batch", "seq lens", "mask flavor", "data", "e4m3/e5m2 in", "out fp16/bf16"),
+                fuzzed=("batch", "seq lens", "mask flavor", "data", "e4m3/e5m2 in", "out fp16/bf16") + (("dO e4m3/e5m2 (1:2)",) if _phase == "bprop" else ()),
                 pinned=(
                     f"h_q={_preset.num_q_heads}",
                     f"h_kv={_preset.num_kv_heads}",

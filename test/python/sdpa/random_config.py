@@ -92,6 +92,7 @@ class ExecConfig:
     _ENUM_FIELDS = {
         'data_type': torch,
         'output_type': torch,
+        'dO_type': torch,
         'diag_align': cudnn.diagonal_alignment,
         'implementation': cudnn.attention_implementation,
         'softmax_precision': cudnn.data_type,
@@ -260,6 +261,10 @@ class ExecConfig:
     # SF_V addressing rather than contiguous-pool luck).  The MXFP8 harness reads paged_pool_layout ("nhd") and
     # sink_token_value above as the f16 harness does.
     paged_distinct_v_table: bool = False
+
+    # Backward only: None preserves the Q/K/V dtype used by old repros.
+    # Append so existing positional configs and seeded field order stay intact.
+    dO_type: torch.dtype = None
 
     @property
     def is_train(self):

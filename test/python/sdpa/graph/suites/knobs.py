@@ -174,6 +174,7 @@ def model_knobs_fp8(preset, phase):
             is_ragged_or_padded_or_full=RandomChoice({"ragged": 2, "full": 1} if thd_ok else {"full": 1}),
             is_deterministic=RandomChoice({True: 1, False: 1}),
             total_token_slack=RandomChoice({"packed": 1, "slack": 1}),
+            dO_type=RandomChoice({torch.float8_e5m2: 2, torch.float8_e4m3fn: 1}),
         )
 
     # Seq cap 2048 and tiny batches: these presets carry 64-128 heads, so
@@ -228,4 +229,5 @@ def model_knobs_mxfp8(preset, phase):
         diag_align=RandomChoice(DIAG_BOTH),
         is_ragged_or_padded_or_full=RandomChoice({"full": 1}),
         with_sink_token=sink,
+        dO_type=RandomChoice({torch.float8_e5m2: 2, torch.float8_e4m3fn: 1}) if phase == "bprop" else Fixed(None),
     )
