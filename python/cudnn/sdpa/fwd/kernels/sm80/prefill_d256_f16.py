@@ -1095,8 +1095,8 @@ def _sdpa_kernel(
                     wide_q_swz = swizzle_xor_128b(wide_q_row, wide_q_col, elem_bytes=ELEM_BYTES)
                     wide_q_ptr = sQ_buf.subview(wide_q_row * ELEMS_PER_ROW_Q + wide_q_swz)
                     q_values = nvvm.ldmatrix(wide_q_ptr.data_ptr(), 4, nvvm.MMALayout.ROW)
-                    for i in cutlass.range_constexpr(4):
-                        q_step[m_block * 4 + i] = q_values[i]
+                    for q_reg in cutlass.range_constexpr(4):
+                        q_step[m_block * 4 + q_reg] = q_values[q_reg]
                 mma_step(S_acc, q_step, K_frag_cur, k_step=0, M=m_per_warp, N=tile_n, ab_dtype=io_dtype)
             else:
                 mma_step(S_acc, Q_frag, K_frag_cur, k_step=k_chunk, M=m_per_warp, N=tile_n, ab_dtype=io_dtype)
