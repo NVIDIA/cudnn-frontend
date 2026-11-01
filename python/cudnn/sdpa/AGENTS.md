@@ -1001,6 +1001,16 @@ for the old message.
 
 ## Prepared THD launch bounds and setup
 
+Compiled host defaults must be serializable by `compiled_cache._json_plain`.
+A tuple default such as `table_strides=(0, 0)` silently prevents artifact
+persistence, even when normal execution passes. Use `None` for optional runtime
+metadata defaults and supply the actual tuple through the binder. Run
+`test_f16_host_entries_carry_only_record_reproducible_defaults` and the affected
+flavor's `TestNativeHalfStrides::test_artifact_reload`. D256 also needs
+`test_prefill_artifact_reload`: the short-Q fixture selects the separate decode
+host. The prefill test asserts its actual module; both tests forbid JIT in the
+second process and check output after replay.
+
 Ragged-offset integer widths are compiled pointer-ABI facts. Include the whole
 per-port dtype tuple in the prepared artifact key, alongside origin strides and
 multipliers. A valid second plan can otherwise read INT64 offsets as INT32 (or

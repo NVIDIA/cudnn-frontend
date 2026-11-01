@@ -2372,7 +2372,7 @@ def _host(
     thd_origin_specs: cutlass.Constexpr = None,
     block_table_ptr: Optional[cute.Pointer] = None,
     block_table_v_ptr: Optional[cute.Pointer] = None,
-    table_strides: Tuple[cutlass.Int64, cutlass.Int64] = (0, 0),
+    table_strides: Optional[Tuple[cutlass.Int64, cutlass.Int64]] = None,
     n_pages: cutlass.Int32 = 0,
     paged_hnd: cutlass.Constexpr[bool] = False,
     paged_v_hnd: cutlass.Constexpr[bool] = False,

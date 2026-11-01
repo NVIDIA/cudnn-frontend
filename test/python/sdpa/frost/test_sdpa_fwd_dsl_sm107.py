@@ -4857,6 +4857,7 @@ class TestNativeHalfStrides:
     test_invalid_bindings = staticmethod(_native_half_checks.test_half_native_rejects_invalid_bindings_before_launch)
     test_physical_wide_stride = staticmethod(_native_half_checks.test_half_native_physical_wide_stride)
     test_artifact_reload = staticmethod(_native_half_checks.test_half_native_artifact_reloads_without_jit)
+    test_prefill_artifact_reload = staticmethod(_native_half_checks.test_half_native_prefill_artifact_reloads_without_jit)
     test_launch_stream = staticmethod(_native_half_checks.test_half_native_follows_launch_stream)
 
 
