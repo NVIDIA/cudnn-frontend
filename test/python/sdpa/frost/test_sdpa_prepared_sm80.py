@@ -30,6 +30,7 @@ def _case(
     heads=(4, 2),
     scale=None,
     sq=33,
+    graph_knobs=None,
 ):
     scale = dq**-0.5 if scale is None else scale
     torch.manual_seed(3217)
@@ -107,7 +108,10 @@ def _case(
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
     selected = select_engine(graph, "sdpa_fwd_prefill_sm80")
-    if selected.knobs.sched_policy != scheduler:
+    if graph_knobs is not None:
+        graph.create_execution_plan(selected.engine_id, graph_knobs)
+        graph.select_plan(len(graph.plans) - 1)
+    elif selected.knobs.sched_policy != scheduler:
         graph.create_execution_plan(selected.engine_id, replace(selected.knobs, sched_policy=scheduler))
         graph.select_plan(len(graph.plans) - 1)
     graph.check_support()

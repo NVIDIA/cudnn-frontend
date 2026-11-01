@@ -6586,14 +6586,7 @@ def sdpa_fwd_wrapper_dsl_sm120(
 
 from cudnn.sdpa.fwd import config_sm80 as _sm80_config
 
-_SM80_FLAVOR_CFGS = {
-    "gptoss": _sm80_config.GPTOSS_CFG,
-    "llama": _sm80_config.LLAMA_CFG,
-    "dsv3": _sm80_config.DSV3_CFG,
-    "qwen": _sm80_config.QWEN_CFG,
-    "wide512": _sm80_config.WIDE512_CFG,
-    "mla576": _sm80_config.MLA576_CFG,
-}
+_SM80_FLAVOR_CFGS = _sm80_config.FLAVOR_CFGS
 
 # (D_QK, D_V) envelope per flavor.
 _SM80_FLAVOR_DIMS = {name: (cfg.D_QK, cfg.D_V) for name, cfg in _SM80_FLAVOR_CFGS.items()}
@@ -6626,15 +6619,7 @@ def _sm80_pick_flavor(d_qk: int, d_v: int) -> str:
     ``(d_qk, d_v)``.  Exact-match wins when both axes match; otherwise walk
     the supported flavors in ascending order and pick the first that fits.
     Raises if either head dimension exceeds the native envelopes."""
-    for flavor in _SM80_SUPPORTED_FLAVORS:
-        fdqk, fdv = _SM80_FLAVOR_DIMS[flavor]
-        if d_qk == fdqk and d_v == fdv:
-            return flavor
-    for flavor in _SM80_SUPPORTED_FLAVORS:
-        fdqk, fdv = _SM80_FLAVOR_DIMS[flavor]
-        if d_qk <= fdqk and d_v <= fdv:
-            return flavor
-    raise ValueError(f"SM80 SDPA: no flavor envelope covers (D_QK={d_qk}, D_V={d_v}).  " f"Supported envelopes: {_SM80_FLAVOR_DIMS}.")
+    return _sm80_config.pick_flavor(d_qk, d_v)
 
 
 def _sm80_resolve_scheduler(
