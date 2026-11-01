@@ -30,7 +30,7 @@ _POINTS = [
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("thd", [False, True])
 @pytest.mark.parametrize("graph_mode", [False, True])
-def test_native_paged_adapter_rebind_replay(point, dtype, thd, graph_mode, cudnn_handle, monkeypatch):
+def test_native_paged_adapter_rebind_replay(point, dtype, thd, graph_mode, cudnn_handle, monkeypatch, single_q=False):
     import cutlass.cute as cute
 
     index = _POINTS.index(point) * 4 + (2 if dtype == torch.float16 else 0) + int(thd)
@@ -38,6 +38,8 @@ def test_native_paged_adapter_rebind_replay(point, dtype, thd, graph_mode, cudnn
     d, dv, page, klayout, vlayout, mask = point
     torch.manual_seed(721 + index)
     b, h, hk, max_sq, max_skv, tq = 3, 8, 2, 65, 129, 89
+    if single_q:
+        max_sq = 1
     cap = (tq + 64 if graph_mode else tq) if thd else max_sq
     qbatch = 1 if thd else b
     npages = (max_skv + page - 1) // page
@@ -165,7 +167,8 @@ def test_native_paged_adapter_rebind_replay(point, dtype, thd, graph_mode, cudnn
         graph = torch.cuda.CUDAGraph()
         origin_buffers = [torch.empty(b + 1, dtype=torch.int64, device="cuda") for _ in range(3)] if graph_mode and thd else []
         try:
-            for phase, (qs, ks) in enumerate((((65, 8, 16), (129, 33, 0)), ((8, 33, 0), (33, 129, 0)))):
+            phases = (((1, 0, 1), (129, 33, 0)), ((0, 1, 1), (33, 129, 0))) if single_q else (((65, 8, 16), (129, 33, 0)), ((8, 33, 0), (33, 129, 0)))
+            for phase, (qs, ks) in enumerate(phases):
                 cq, ck = [0], [0]
                 for x, y in zip(qs, ks):
                     cq.append(cq[-1] + x)

@@ -2678,7 +2678,11 @@ and independent K/V page-table strides. Page loads predicate both logical rows
 and head columns before reading the table. Paged pools cannot also carry ragged
 origins. No data staging or pool copies are used; THD retains its device lengths
 metadata launch. `test_sdpa_fwd_paged_sm80.py` covers native loading and binding.
-Paged backward and graph decode (`S_q == 1`) remain declined.
+Paged backward remains declined. Single-query forward graphs (`S_q == 1`)
+use the same predicated native prefill bodies, including dense, packed THD and
+paged KV. This is functional coverage, not a dedicated split/decode kernel or
+a claim that it leads the backend. `test_sdpa_fwd_single_q_sm80.py` checks
+empty Q/KV sequences, sink/bias/masks, independent origins and retained replay.
 
 Dense forward and backward admit head dimensions divisible by eight, within
 their existing flavor envelopes, and require every stepped data-port outer
@@ -2729,7 +2733,7 @@ early declines and legal dense/THD declarations without GPU allocation.
 | Deterministic | — / ✅ | — / ✅ | — / ✅ | — / ✅ |
 | Paged KV (dense / THD queries) | ✅ / ❌ | ✅ / ❌ | ✅ / ❌ | ✅ / ❌ |
 | Ragged `S_kv` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
-| Decode-shaped (`S_q == 1`) | ❌ / ❌ | ❌ / ❌ | ❌ / ❌ | ❌ / ❌ |
+| Decode-shaped (`S_q == 1`; existing native prefill body) | ✅ / ❌ | ✅ / ❌ | ✅ / ❌ | ✅ / ❌ |
 
 Native SM80 backward eight-aligned widths with 16-byte-aligned Q/K/V/O/dO and
 D-gradient bases and stepped outer strides divisible by eight elements use

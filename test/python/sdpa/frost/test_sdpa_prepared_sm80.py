@@ -29,10 +29,11 @@ def _case(
     wide_axis="batch",
     heads=(4, 2),
     scale=None,
+    sq=33,
 ):
     scale = dq**-0.5 if scale is None else scale
     torch.manual_seed(3217)
-    b, h, hk, sq, skv = (5 if product else 2), *heads, 33, 65
+    b, h, hk, skv = (5 if product else 2), *heads, 65
     if wide_axis == "row":
         b, sq, skv = 1, (3 if product else 2), (3 if product else 2)
     elif wide_axis == "tile":
@@ -54,7 +55,7 @@ def _case(
         storage["stats"] = torch.full((b, h, sq * 2), float("nan"), device="cuda")
         bufs["stats"] = storage["stats"][..., ::2].unsqueeze(-1)
     if features:
-        bufs["seq_q"] = torch.tensor([sq - 3, 0], dtype=torch.int32, device="cuda")
+        bufs["seq_q"] = torch.tensor([1 if sq == 1 else sq - 3, 0], dtype=torch.int32, device="cuda")
         bufs["seq_kv"] = torch.tensor([skv - 7, 0], dtype=torch.int32, device="cuda")
         bufs["sink"] = torch.randn(h, device="cuda")
         bufs["bias"] = torch.randn(1, h, sq, skv, device="cuda") * 0.1
