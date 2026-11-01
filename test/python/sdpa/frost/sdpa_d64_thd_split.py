@@ -83,4 +83,4 @@ def test_standalone_compact_replay(dtype_name, packed, splits):
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("SM100/SM103/SM107 nonpaged D64 split")
-    run(getattr(torch, dtype_name), 1, packed, heads=8, splits=splits)
+    run(getattr(torch, dtype_name), 1, packed, heads=8, splits=splits, cpu_reference=True)
