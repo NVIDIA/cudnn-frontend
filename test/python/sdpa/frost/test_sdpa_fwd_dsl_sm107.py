@@ -1496,7 +1496,7 @@ def test_sm107_mxfp8_tmem_map_fills_the_rubin_allocation_exactly():
 
 @pytest.mark.L0
 def test_sm107_advertises_lpt_only_for_the_validated_d_shape():
-    """D128/D256 serve LPT; the row-wide default stays NATURAL-only.
+    """D128/D192/D256 serve LPT; the row-wide default stays NATURAL-only.
 
     An accept AND a reject, because a capability that is only ever exercised on
     its accepting side is an untested assertion (engine contract, Rule 9).
@@ -1509,8 +1509,8 @@ def test_sm107_advertises_lpt_only_for_the_validated_d_shape():
 
     for d in (128, 256):
         assert SCHED_LPT in engines.effective_sched_policies(caps, _f16_facts(d_qk=d, d_v=d))
-    for dq, dv in ((192, 128), (512, 512)):
-        assert SCHED_LPT not in engines.effective_sched_policies(caps, _f16_facts(d_qk=dq, d_v=dv))
+    assert SCHED_LPT in engines.effective_sched_policies(caps, _f16_facts(d_qk=192, d_v=128))
+    assert SCHED_LPT not in engines.effective_sched_policies(caps, _f16_facts(d_qk=512, d_v=512))
 
     # LPT_L2 is a separate, still-open gap: its decode needs qh_per_kh and
     # seqlen_kv, which the SM107 call sites do not pass. No flavor claims it.
