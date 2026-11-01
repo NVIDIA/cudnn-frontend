@@ -719,16 +719,22 @@ def _sdpa_kernel(
     # ``is_even_*`` flag is False — fully eliminated otherwise.
     # THD packs sequences back-to-back, so valid_rows must be the PER-BATCH
     # length (eff_sq / eff_skv) — over-reading into the next sequence's rows
-    # (or past T on the last sequence) would corrupt / fault.  Dense uses the
-    # physical SQ / SKV.
-    # Logical padding must not enter either MMA: zero times a masked NaN V
-    # is still NaN, and trimmed Q rows must produce zero rather than NaN.
-    if cutlass.const_expr(THD_VARLEN or has_seq_len_q):
+    # (or past T on the last sequence) would corrupt / fault.  Dense bounds
+    # each load by both its live length and its physical capacity.
+    # Runtime padding is unread data: masked NaNs must never enter an MMA.
+    # In particular, a zero softmax weight does not cancel a NaN V value.
+    if cutlass.const_expr(THD_VARLEN):
         q_valid_rows = eff_sq
+    elif cutlass.const_expr(has_seq_len_q):
+        q_capacity = cutlass.Int32(sq_runtime)
+        q_valid_rows = cutlass.Int32(arith.select((eff_sq < q_capacity).ir_value(), eff_sq.ir_value(), q_capacity.ir_value()))
     else:
         q_valid_rows = None if cutlass.const_expr(is_even_mn) else sq_runtime
-    if cutlass.const_expr(THD_VARLEN or has_seq_kv_lens or PARAMS.paged_page_size):
+    if cutlass.const_expr(THD_VARLEN):
         kv_valid_rows = eff_skv
+    elif cutlass.const_expr(has_seq_kv_lens):
+        kv_capacity = cutlass.Int32(skv_runtime)
+        kv_valid_rows = cutlass.Int32(arith.select((eff_skv < kv_capacity).ir_value(), eff_skv.ir_value(), kv_capacity.ir_value()))
     else:
         kv_valid_rows = None if cutlass.const_expr(is_even_mn) else skv_runtime
     valid_cols = None if cutlass.const_expr(is_even_k) else d_runtime
