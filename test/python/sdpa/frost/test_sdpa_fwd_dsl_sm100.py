@@ -3386,3 +3386,14 @@ class TestD192Lpt:
 
     test_dense_replay = staticmethod(_checks.test_dense_replay)
     test_ragged_replay = staticmethod(_checks.test_ragged_replay)
+
+
+@pytest.mark.L0
+@requires_dsl
+@pytest.mark.skipif(_SM not in (100, 103), reason="D192 origins on SM100/SM103; SM107 has its own CI entry")
+class TestD192PhysicalOrigins:
+    """Independent Q/K/V/O/Stats offsets through the native CI entrypoint."""
+
+    import sdpa_d192_origins as _checks
+
+    test_independent_origins = staticmethod(_checks.test_independent_origins)
