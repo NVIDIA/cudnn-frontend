@@ -168,7 +168,7 @@ def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None, tile_n
     else:
         api.compile()
         ws_bytes = api.scratch_workspace_bytes()
-    if max(dims) <= 64 and cga == 1 and tile_n == 128:
+    if max(dims) <= 64 and cga == 1 and tile_n == 128 and (splits > 1 or api._d64_decode_tile()):
         kernel = "sm100/decode_d128_f16.py"
         assert api._k_mod.CFG.TILES_Q == 1
     assert api._k_mod.__file__.endswith(kernel), api._k_mod.__file__
@@ -176,9 +176,12 @@ def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None, tile_n
     if max(dims) <= 64:
         assert api.flavor == (64, 64) and api._k_mod.CFG.TILE_K == api._k_mod.CFG.TILE_O == 64
         assert api._k_mod.CFG.CTA_MMA == cga
-        if kernel.startswith("sm107/"):
-            assert not api._k_mod.FOLD_SINK
-        assert api._fp32_partial_split() and api._partial_torch_dtype() == torch.float32
+        if splits > 1:
+            if kernel.startswith("sm107/"):
+                assert not api._k_mod.FOLD_SINK
+            assert api._fp32_partial_split() and api._partial_torch_dtype() == torch.float32
+        else:
+            assert not api._fp32_partial_split()
     if tile_n == 64:
         assert api._k_mod.CFG.TILE_N == 64 and api._k_mod.CFG.S_SLOTS == 2
     try:

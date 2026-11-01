@@ -746,7 +746,7 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         and not fp8
         and flavor == (64, 64)
         and params.cta_mma == 1
-        and params.split_kv > 1
+        and (params.split_kv > 1 or params.decode_tile)
         and not params.thd_varlen
         and not params.paged_kv
         and params.tile_n == 128
@@ -3753,10 +3753,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         base-2, split-KV partials) for graphs whose S_q x packed heads fit one
         128-row tile -- S_q = 1 decode and MTP. Explicit paged THD split
         plans use the same tile across multiple Q blocks. Other THD, larger
-        dense S_q and an explicit cga2 stay on the prefill tile.  d128 keys the same
+        dense S_q and an explicit cga2 stay on the prefill tile. SM107 uses
+        this specialization for dense unsplit N128 without prefolded scale.
+        d128 keys the same
         tile off cga1; d64 cannot, because cga1 IS its prefill width.
         """
-        if self._fp8 or self.flavor != (64, 64) or self._device_cc == (10, 7):
+        if self._fp8 or self.flavor != (64, 64):
+            return False
+        if self._device_cc == (10, 7) and (self.thd or self.paged or self.split_kv != 1 or self.softmax_scale_prefolded or self._effective_tile_n() != 128):
+            # Native THD, paged/envelope and prefolded-scale contracts keep
+            # their existing bodies. Dense split selection is handled by the
+            # loader independently of the short-Q unsplit specialization.
             return False
         if self.bias_desc is not None or self.kv_mask_desc is not None:
             # The decode tile carries no additive-bias / kv_mask arm (compile() refuses the operands): a d64 plan with either
@@ -6703,6 +6710,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._thd_meta_fn = None
         self._thd_lse_head_stride = 0
         self._thd_lse_token_major = False
+        self._thd_lse_raw_storage = False
         self._t_q_cap = 0
         self._t_kv_cap = 0
         self._thd_launch = None
@@ -6874,8 +6882,12 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self.flavor = _sm80_pick_flavor(d_qk, d_v)
         self.flavor_d_qk, self.flavor_d_v = _SM80_FLAVOR_DIMS[self.flavor]
         tile_m_default, num_warps_default, tile_n_default = _SM80_FLAVOR_KNOBS[self.flavor]
+        # Short dense D128 queries need only half of the 128-row CTA. Keep
+        # sixteen rows per warp and leave explicit TILE_M requests intact.
+        if not self.thd and d_qk == d_v == 128 and s_qo <= 64:
+            tile_m_default = 64
         self.kernel_tile_m = tile_m_default if self.tile_m is None else int(self.tile_m)
-        self.kernel_num_warps = num_warps_default
+        self.kernel_num_warps = 4 if self.flavor == "llama" and self.kernel_tile_m == 64 else num_warps_default
         self.kernel_tile_n = tile_n_default if self.tile_n is None else int(self.tile_n)
         self._value_error_if(
             self.cga not in (None, 1),
@@ -7096,6 +7108,18 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 lse_tensor.dtype != torch.float32 or lse_tensor.device != device,
                 f"SM80 THD Stats must be fp32 on {device}",
             )
+            if self._thd_lse_raw_storage:
+                # Graph variant packs bind storage, not a packed carrier shape.
+                # Bound the view by the exposed carrier span, not unused bytes
+                # elsewhere in its backing allocation. No device lengths read.
+                head_stride, token_stride = map(int, self.lse_desc.stride[1:3])
+                required = 0 if t_q == 0 else (self.h_q - 1) * head_stride + (t_q - 1) * token_stride + 1
+                span = 0 if lse_tensor.numel() == 0 else 1 + sum((n - 1) * st for n, st in zip(lse_tensor.shape, lse_tensor.stride()))
+                self._value_error_if(span < required, f"SM80 THD Stats storage capacity {span} is smaller than the declared span {required}")
+                if self._thd_lse_token_major:
+                    lse_tensor = lse_tensor.as_strided((t_q, self.h_q), (token_stride, head_stride), lse_tensor.storage_offset())
+                else:
+                    lse_tensor = lse_tensor.as_strided((1, self.h_q, t_q), (0, head_stride, token_stride), lse_tensor.storage_offset())
             if self._thd_lse_token_major:
                 self._value_error_if(
                     not (lse_tensor.ndim == 2 or (lse_tensor.ndim == 3 and lse_tensor.shape[2] == 1))

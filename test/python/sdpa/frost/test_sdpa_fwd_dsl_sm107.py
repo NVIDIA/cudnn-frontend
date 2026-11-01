@@ -8807,3 +8807,59 @@ def test_native_d192_paged_pack_keeps_nonpaged_decline(thd, cga, splits):
     knobs = engines.SdpaFwdKnobs(cga=cga, split_kv=splits, pack_gqa=False)
     assert engines.mismatch(caps, facts, knobs) is None
     assert engines.mismatch(caps, facts, dataclasses.replace(knobs, pack_gqa=True)) is not None
+
+
+@pytest.mark.parametrize(
+    "group,sq,packed,tile_n,cga,prefolded,expected",
+    [
+        (1, 1, False, 128, 1, False, True),
+        (8, 4, True, 128, 1, False, True),
+        (12, 9, True, 128, 1, False, True),
+        (1, 128, False, 128, 1, False, True),
+        (1, 129, False, 128, 1, False, False),
+        (8, 17, True, 128, 1, False, False),
+        (1, 1, False, 64, 1, False, False),
+        (1, 1, False, 128, 2, False, False),
+        (1, 1, False, 128, 1, True, False),
+    ],
+)
+def test_native_d64_unsplit_selects_single_q(monkeypatch, group, sq, packed, tile_n, cga, prefolded, expected):
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+    import torch
+
+    _fake_cc(monkeypatch, (10, 7))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    q = _desc((1, 2 * group, sq, 64), torch.float16, "q")
+    k = _desc((1, 2, 1024, 64), torch.float16, "k")
+    v = _desc((1, 2, 1024, 64), torch.float16, "v")
+    o = _desc((1, 2 * group, sq, 64), torch.float16, "o")
+    api = SdpaFwdDslSm100(q, k, v, o, cga=cga, tile_n=tile_n, pack_gqa=packed, softmax_scale_prefolded=prefolded)
+    if prefolded:
+        with pytest.raises(NotImplementedError, match="softmax_scale_prefolded"):
+            api.check_support()
+        return
+    assert api.check_support()
+    params = api.template_params()
+    assert bool(params.decode_tile) is expected
+    mod = _load_sm100_kernel_module(api.flavor, params, rubin=True)
+    assert mod.CFG.TILES_Q == (1 if expected else 2)
+    assert mod.CFG.TILE_K == mod.CFG.TILE_O == 64
+
+
+@pytest.mark.parametrize("operand", ["bias", "kv_mask"])
+def test_native_d64_unsplit_preserves_score_operands(monkeypatch, operand):
+    from test_sdpa_bias_sm107 import _api
+    from cudnn.sdpa.fwd import api_dsl
+    import torch
+
+    _fake_cc(monkeypatch, (10, 7))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(api_dsl, "_device_sm_count", lambda device: 204)
+    shape = (1, 4, 4, 128) if operand == "bias" else (1, 1, 1, 128)
+    api = _api(d=64, b=1, h=4, s_q=4, s_kv=128, cga=1, tile_n=128, **{operand: shape})
+    assert api.check_support()
+    params = api.template_params()
+    assert not params.decode_tile
+    mod = _load_sm100_kernel_module(api.flavor, params, rubin=True)
+    assert mod.__file__.endswith("sm107/prefill_d128_f16.py")
+    assert mod.CFG.BIAS_MODE if operand == "bias" else mod.CFG.KV_MASK_FORM
