@@ -211,16 +211,17 @@ def test_dense_replay(dtype_name, case):
 
 
 @pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
-@pytest.mark.parametrize("case", ["causal", "bottom", "window", "runtime_waves"])
+@pytest.mark.parametrize("case", ["causal", "bottom", "window", "runtime_waves", "persistent_tail"])
 def test_ragged_replay(dtype_name, case):
     import torch
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     cc = _require_device()
     torch.manual_seed(1211)
-    if case == "runtime_waves" and cc != (10, 7):
+    wave_case = case in ("runtime_waves", "persistent_tail")
+    if wave_case and cc != (10, 7):
         pytest.skip("native SM107 D192 runtime initial waves")
-    b, h, hk, sq, sk = 3, (24 if case == "runtime_waves" else 8), (6 if case == "runtime_waves" else 2), 1537, 2048
+    b, h, hk, sq, sk = 3, (24 if wave_case else 8), (6 if wave_case else 2), 1537, 2048
     d, dv = (160, 96) if case == "logical_width" else (192, 128)
     dtype = getattr(torch, dtype_name)
     bottom, window = case != "causal", 127 if case == "window" else None
@@ -268,9 +269,22 @@ def test_ragged_replay(dtype_name, case):
             plan = api._thd_plan()
             resident = torch.cuda.get_device_properties(0).multi_processor_count // 2
             assert plan.units <= getattr(api._k_mod, "THD_INITIAL_WAVES", 1) * resident
-            if case == "runtime_waves":
+            if wave_case:
                 assert plan.wave_policy is not None and plan.wave_policy[2] == 2
             ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
+            if case == "persistent_tail":
+                from cudnn.sdpa.fwd import prepared
+
+                buffers = (q, k, v, o, cq, ck, lse, None, None, None)
+                facts = {name: prepared.facts_of_tensor(tensor) for name, tensor in zip(prepared._NATIVE_THD_ROLES, buffers) if tensor is not None}
+                spec = api._thd_spec
+                frame = spec.native.bind(
+                    prepared._native_pack_from_facts(facts), prepared._NATIVE_THD_INDICES, ws.data_ptr(), torch.cuda.current_stream().cuda_stream
+                )
+                # Prove valid work exceeds the actual bound launch, rather than
+                # only checking the sample plan's nominal wave limit.
+                live_units = b * h * math.ceil(sq / api._k_mod.CGA_TILE_M)
+                assert live_units > frame[spec.index["n_thd_units"]]
 
             def run():
                 # Bind a smaller current capacity than the graph-free sample
@@ -285,7 +299,10 @@ def test_ragged_replay(dtype_name, case):
             apis.append(api)
             workspaces.append(ws)
             graphs.append(graph)
-        for qs, ks in [([1537, 0, 513], [2048, 0, 769]), ([17, 513, 0], [65, 0, 0]), ([0, 0, 0], [0, 0, 0])]:
+        replay_lengths = [([1537, 0, 513], [2048, 0, 769]), ([17, 513, 0], [65, 0, 0]), ([0, 0, 0], [0, 0, 0])]
+        if case == "persistent_tail":
+            replay_lengths.insert(0, ([sq] * b, [sk] * b))
+        for qs, ks in replay_lengths:
             qprefix, kprefix = [0, *accumulate(qs)], [0, *accumulate(ks)]
             cq.copy_(torch.tensor(qprefix, device="cuda", dtype=torch.int32))
             ck.copy_(torch.tensor(kprefix, device="cuda", dtype=torch.int32))
