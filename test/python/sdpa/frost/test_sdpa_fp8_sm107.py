@@ -837,6 +837,7 @@ def test_sm107_split_is_wired_only_for_supported_flavors():
     cfg.make_cfg_d256(tp(dtype_qkv=_E4M3, dtype_o=_BF16_OUT))
     cfg.make_cfg_d128(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
     cfg.make_cfg_d192(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
+    cfg.make_cfg_d256(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
 
     cfg.make_cfg_d512(tp(dtype_qkv=_E4M3, dtype_o=_BF16_OUT))
 
@@ -2188,3 +2189,21 @@ class TestNativeD192PagedHalf:
 
     test_dense_replay = staticmethod(_checks.test_dense_replay)
     test_independent_origins = staticmethod(_checks.test_independent_origins)
+
+
+@pytest.mark.L0
+@requires_rubin
+class TestNativeD256PrefillHalfSplit:
+    """Collect half D256 split regressions through the selected SM107 CI entry."""
+
+    from test_sdpa_d256_prefill_split_sm107 import (
+        test_native_d256_prefill_split_admission as _admission,
+        test_native_d256_prefill_partial_workspace_dtype as _workspace_dtype,
+        test_native_d256_prefill_split_replay as _replay,
+        test_native_d256_prefill_split_graph as _graph,
+    )
+
+    test_admission = staticmethod(_admission)
+    test_workspace_dtype = staticmethod(_workspace_dtype)
+    test_replay = staticmethod(_replay)
+    test_graph = staticmethod(_graph)
