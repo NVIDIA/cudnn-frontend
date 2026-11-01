@@ -3385,6 +3385,18 @@ class TestNativeDenseStrides:
 
 @pytest.mark.L0
 @requires_dsl
+@pytest.mark.skipif(_SM not in (100, 103), reason="D192 LPT on SM100/SM103; native SM107 has its own CI entry")
+class TestD192Lpt:
+    """D192 work scheduling through retained dense and ragged replay."""
+
+    import sdpa_d192_lpt as _checks
+
+    test_dense_replay = staticmethod(_checks.test_dense_replay)
+    test_ragged_replay = staticmethod(_checks.test_ragged_replay)
+
+
+@pytest.mark.L0
+@requires_dsl
 @pytest.mark.skipif(_SM not in (100, 103), reason="native SM100/SM103; SM107 has its own CI entry")
 class TestNativeScalarTailSplit:
     """Run native regression coverage from the architecture CI entrypoint."""
