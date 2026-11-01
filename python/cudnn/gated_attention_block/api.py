@@ -858,7 +858,7 @@ def decode_route(
     rows ``S_q x G <= 16`` ride the 16-column tile in ONE unit (1 stream); (c) ``16 < S_q x G <= 32`` is the adapter's 32-COLUMN arm where
     the launch is WIDE -- ``batch x H_kv >= config_sm100.D256_WIDE_DECODE_MIN_UNITS`` units streaming at least
     ``D256_WIDE_DECODE_MIN_KV_TILES`` 128-key tiles between them (``batch`` or ``max_kv_len`` None = not wide: the small-launch reading,
-    the envelope's ``routes``) -- and that arm is a typed decline on every part off :data:`DECODE_WIDE_TILE_CCS` (empty today: no cc 10.0
+    the envelope's ``routes``) -- and that arm is a typed decline on every part off :data:`DECODE_WIDE_TILE_CCS` (cc 10.3 since 2026-11-01: no cc 10.0
     cell of the block has run it; the reason names the lift); (d) else the paged PREFILL tile with the whole group packed wherever that
     body packs the group within its 128 rows (a group dividing 128), at EVERY batch -- the line has no two-unit arm to hold the step
     below the fill -- under BOTH policies (they coincide on this line; ``policy`` is recorded); (e) else the decode tile UNPACKED: the
@@ -921,7 +921,7 @@ def decode_route(
     if sm100_line:
         # THE SM100 LINE (cc 10.0): the adapter's rule off cc 10.7, input for input -- config_sm100.decode_d256_q_tile with the launch's
         # wide-tile reading; no single-unit table, no token-unit arm, no cap (section (a) .. (e) of the docstring).  The 32-column arm
-        # that rule takes on a WIDE launch is served on the parts of DECODE_WIDE_TILE_CCS only (empty until its cells run): the plumbing
+        # that rule takes on a WIDE launch is served on the parts of DECODE_WIDE_TILE_CCS only (cc 10.3: the parts whose cells ran): the plumbing
         # stays, the width is gated -- the lift is that tuple gaining the part, nothing else moves.
         from cudnn.sdpa.fwd.config_sm100 import D256_DECODE_MAX_Q_ROWS, d256_wide_decode_launch
         from cudnn.sdpa.fwd.config_sm100 import decode_d256_q_tile as decode_d256_q_tile_sm100
@@ -1036,8 +1036,9 @@ def _decode_unpacked_decline_sm100(cc: Tuple[int, int], s_q: int, group: int, ba
         f"kv_source='paged' on a dense [B, S_q] declaration (the DECODE form): S_q={s_q} at group {group} rides the d256 decode tile UNPACKED on its "
         f"32-column width (17 .. 32 live rows per head), which cc {cc[0]}.{cc[1]} routes for WIDE launches only -- batch x H_q >= "
         f"{D256_WIDE_DECODE_MIN_UNITS} units streaming at least {D256_WIDE_DECODE_MIN_KV_TILES} 128-key tiles between them "
-        f"(config_sm100.d256_wide_decode_launch); this step reads {launch} -- and even there it is {_DECODE_WIDE_ARM_LIFT} -- declare a step of "
-        "at most 16 tokens or the EXTEND form (thd=True: the step packed)"
+        f"(config_sm100.d256_wide_decode_launch); this step reads {launch} -- "
+        + ("a wide launch routes it on this part" if tuple(cc) in DECODE_WIDE_TILE_CCS else f"and even there it is {_DECODE_WIDE_ARM_LIFT}")
+        + " -- declare a step of at most 16 tokens or the EXTEND form (thd=True: the step packed)"
     )
 
 
@@ -5048,10 +5049,12 @@ DENSE_SERVING_CCS: Tuple[Tuple[int, int], ...] = ((10, 7), (10, 0), (10, 3))
 # the SDPA adapter's own rule off cc 10.7 takes the 32-column decode tile (`sm100/decode_d256_f16.py` at N_Q 32) for 17 .. 32 packed rows
 # and for an UNPACKED step of 17 .. 32 tokens on a WIDE launch (config_sm100.d256_wide_decode_launch), but no cc 10.0 cell of the block
 # has run that arm (the 2026-10-29 cc 10.0 run read every DECODE cell at the small-launch reading: the 16-column tile packed / unpacked
-# and the paged prefill tile packed), so `decode_route` declines it by name on every part off this tuple -- EMPTY today.  The lift is this
-# tuple gaining (10, 0) together with the arm's accept cells (the one-tuple flip; the plumbing -- the wide readings, the adapter's
-# wide_launch -- stays in place behind the gate).  Read by `decode_route`, the suite's host rows and a serving stack's dispatch predicate.
-DECODE_WIDE_TILE_CCS: Tuple[Tuple[int, int], ...] = ()
+# and the paged prefill tile packed), so `decode_route` declines it by name on every part off this tuple.  cc 10.3 (B300, 2026-11-01):
+# the arm's accept cells ran on a B300 -- W at 24 / 4 (B 2 x kv 64K and B 32 x kv 4K, S_q 3: 18 packed rows) and U32 (B 1 x kv 22K and
+# B 4 x kv 5.5K, S_q 17), each against the fp32 oracle with the compiled kernel pinned to the 32-column tile -- functional only, UNMEASURED.
+# cc 10.0's lift is the same: the tuple gaining (10, 0) together with its cells (the plumbing -- the wide readings, the adapter's
+# wide_launch -- is shared).  Read by `decode_route`, the suite's host rows and a serving stack's dispatch predicate.
+DECODE_WIDE_TILE_CCS: Tuple[Tuple[int, int], ...] = ((10, 3),)
 # The parts serving the FP8-PROJECTION + BF16-ATTENTION MODE of the paged forms (``QuantSpec(attention_dtype=torch.bfloat16)``: the per-tensor FP8
 # projection GEMMs with the descale folded into their bf16 epilogue, the bf16 decode / prefill tiles over bf16 pools, the gated O quantized to e4m3
 # at ``scale_o`` for the FP8 out projection).  Every piece but the two GEMMs is the bf16 serving form's own kernel on the part; the GEMMs are the

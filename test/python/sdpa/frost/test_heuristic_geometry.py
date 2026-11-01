@@ -806,14 +806,13 @@ def test_rubin_decode_packing_uses_selected_flavor(monkeypatch, d, s_q, window, 
     assert _selected_d_shape(spec.capabilities, facts, packed) == ((64, 64) if d == 64 else (128, 128))
     if d == 128:
         assert any(p.knobs.pack_gqa for p in plans)
-    if sink:
-        assert all(p.knobs.split_kv == 1 for p in plans)  # no sink split on this row
+    split_packed = replace(packed, split_kv=2)
+    assert mismatch(spec.capabilities, facts, split_packed) is None
+    assert _selected_d_shape(spec.capabilities, facts, split_packed) == (d, d)
+    if sink and window is not None:
+        assert all(p.knobs.split_kv == 1 for p in plans)  # a window bounds the KV walk; the sink split is not proposed
     else:
-        if d == 128:
-            assert any((p.knobs.split_kv or 1) > 1 for p in plans)
-        split_packed = replace(packed, split_kv=2)
-        assert mismatch(spec.capabilities, facts, split_packed) is None
-        assert _selected_d_shape(spec.capabilities, facts, split_packed) == (d, d)
+        assert any((p.knobs.split_kv or 1) > 1 for p in plans)
     assert all(mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
 
 
@@ -822,10 +821,12 @@ def test_rubin_decode_packing_uses_selected_flavor(monkeypatch, d, s_q, window, 
 @pytest.mark.parametrize("window", [None, 128])
 @pytest.mark.parametrize("b", [1, 16])
 @pytest.mark.parametrize("s_q", [1, 2])
-def test_rubin_native_d64_packs_past_one_unpacked_wave(monkeypatch, window, b, s_q, sink):
-    """With a sink (no split on this row), unsplit native D64 packing leads under a window or once the unpacked launch needs
-    a second wave; a one-wave unpacked launch without a window keeps the unpacked plan first and the packed one listed.
-    Without a sink the packed set can split and leads everywhere, splitting the one-wave launch."""
+@pytest.mark.parametrize("s_kv", [131072, 100000])
+def test_rubin_native_d64_packs_past_one_unpacked_wave(monkeypatch, window, b, s_q, s_kv, sink):
+    """Native D64 packing leads under a window, once the unpacked launch needs a second wave, or when the packed set splits
+    (which then splits the one-wave launch); a one-wave unpacked launch whose packed set cannot split keeps the unpacked plan
+    first and the packed one listed. Without a window a sink does not stop the split: only single-Q off the 128-key tile
+    stays unsplit."""
     from cudnn.frost import buffers
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
@@ -836,7 +837,7 @@ def test_rubin_native_d64_packs_past_one_unpacked_wave(monkeypatch, window, b, s
         h_q=16,
         h_kv=2,
         s_q=s_q,
-        s_kv=131072,
+        s_kv=s_kv,
         d_qk=64,
         d_v=64,
         causal=causal,
@@ -848,10 +849,13 @@ def test_rubin_native_d64_packs_past_one_unpacked_wave(monkeypatch, window, b, s
     )
     plans = heur.recommend("A", facts, {spec.name: 20505})
     one_wave = b * facts.h_q <= facts.device_sm_count
-    assert plans[0].knobs.pack_gqa == (not sink or window is not None or not one_wave)
+    packed_splits = any(p.knobs.pack_gqa and (p.knobs.split_kv or 1) > 1 for p in plans)
+    assert plans[0].knobs.pack_gqa == (window is not None or not one_wave or packed_splits)
     assert any(p.knobs.pack_gqa for p in plans) and any(not p.knobs.pack_gqa for p in plans)
-    if not sink and window is None and one_wave:
-        assert (plans[0].knobs.split_kv or 1) > 1
+    if window is None:
+        assert packed_splits == (s_kv % 128 == 0 or s_q > 1)
+        if one_wave and packed_splits:
+            assert (plans[0].knobs.split_kv or 1) > 1
 
 
 @pytest.mark.L0

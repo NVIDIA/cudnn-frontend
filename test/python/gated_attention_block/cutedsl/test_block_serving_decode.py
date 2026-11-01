@@ -313,7 +313,7 @@ _ROUTE_TABLE = _ROUTE_TABLES[DECODE_ROUTE_SINGLE_UNIT]
 # batch / no KV bound: never a wide launch) -- the SDPA adapter's own rule off cc 10.7, input for input (config_sm100.decode_d256_q_tile
 # with the wide-tile reading of config_sm100.d256_wide_decode_launch): packed rows <= 16 ride the 16-column tile in ONE unit; the
 # 32-column arm the adapter takes on a WIDE launch (>= 8 units streaming >= 4096 KV tiles: ``_SM100_WIDE`` below) is a typed decline
-# naming the lift until its cells run (``DECODE_WIDE_TILE_CCS``, EMPTY; the review follow-up of 2026-10-29); else the paged prefill tile
+# naming the lift until its cells run (``DECODE_WIDE_TILE_CCS``: cc 10.3 only, 2026-11-01; the review follow-up of 2026-10-29); else the paged prefill tile
 # packed wherever the group divides 128 (16 / 8 / 4), at EVERY batch (no two-unit arm on the line) under BOTH policies; else the
 # 16-column tile UNPACKED (``group`` streams) to 16 tokens; 17 .. 32 tokens unpacked need the 32-column width = a typed decline at every
 # launch (``--``: the rule off the wide launch, the same arm on it); 33 the EXTEND form's business as on cc 10.7.  No cap
@@ -587,13 +587,13 @@ def test_the_sm100_route_table_is_the_adapters_rule(group, policy, monkeypatch):
 def test_the_32_column_sm100_decode_arm_is_declined_by_name_until_its_cells_run(monkeypatch):
     """The cc 10.0 admission's review follow-up (2026-10-29, M1): the SDPA adapter's rule off cc 10.7 takes the 32-column decode tile for
     17 .. 32 packed rows and for an unpacked step of 17 .. 32 tokens on a WIDE launch, but no cc 10.0 cell of the block has run that arm,
-    so ``decode_route`` declines it by name on every part off ``DECODE_WIDE_TILE_CCS`` (EMPTY today) with the lift in the reason -- at the
+    so ``decode_route`` declines it by name on every part off ``DECODE_WIDE_TILE_CCS`` (cc 10.3 only) with the lift in the reason -- at the
     geometries that would have hit it: W at group 6 (B 32 x kv 4K, S_q 3), group 16 (B 8 x kv 32K, S_q 2: 32 packed rows) and group 4
     (B 8 x kv 64K, S_q 8); U32 at group 6 (B 4 x kv 5.5K, S_q 17) and MHA (B 8 x kv 16K, S_q 17).  The small-launch reading of the same
     steps is unchanged, the envelope predicts the verdict at the same inputs, the Rubin reading never meets the gate, and the one-tuple
     lift restores the adapter's rule (the plumbing is intact): with ``(10, 0)`` in the tuple the same inputs read the 32-column tile,
     packed or unpacked, in one unit.  A host row: ``decode_route`` is device-free."""
-    assert DECODE_WIDE_TILE_CCS == () and _api.DECODE_WIDE_TILE_CCS == ()
+    assert DECODE_WIDE_TILE_CCS == ((10, 3),) and _api.DECODE_WIDE_TILE_CCS == ((10, 3),) and _SM100 not in DECODE_WIDE_TILE_CCS
     mha = GatedAttentionBlockGeometry(d_model=_D_MODEL, h_q=4, h_kv=4, d_head=_D, rope_dim=_ROPE, causal_bottom_right=True)
     cells = [  # (geometry, S_q, batch, max_kv_len, the arm's reading once admitted, the small-launch reading of the same step today)
         (_geom(6)[0], 3, 32, 4096, _W32, _U(6)),
@@ -3039,8 +3039,13 @@ def test_sm100_declines_the_rubin_only_knobs_by_name():
         _make_block(16, 4, 1, decode_q_tile_max=32)
     with pytest.raises(NotImplementedError, match="WIDE launches only"):
         _make_block(6, 4, 17)
-    with pytest.raises(NotImplementedError, match="the 32-column SM100 decode arm: its cc 10.0 accept cells have not run"):
-        _make_block(6, 32, 3, max_kv_len=4096, n_pages=256)  # the adapter's 32-column arm at a wide launch: declined by name on the part
+    if _cc() in DECODE_WIDE_TILE_CCS:  # the adapter's 32-column arm at a wide launch: routed on a part whose cells ran
+        wide, _ = _make_block(6, 32, 3, max_kv_len=4096, n_pages=256)
+        r = wide.decode_route
+        assert (r.tile, r.n_q, r.token_units, r.pack_gqa, r.kv_streams) == _W32 and r.served and r.device_cc == _cc(), r
+    else:
+        with pytest.raises(NotImplementedError, match="the 32-column SM100 decode arm: its cc 10.0 accept cells have not run"):
+            _make_block(6, 32, 3, max_kv_len=4096, n_pages=256)  # declined by name on the part
     assert _cc() in (_SM100, _SM103) and GatedAttentionBlockFwd.serving_envelope(_geom(16)[0], torch.bfloat16, _DEV).forms == ("extend", "decode")
     # the FP8-projection + bf16-attention mode ON the part: served iff the tuple holds this part (its cells below run then), else the part
     # statement at check_support and no spelling in the envelope's quant_modes
@@ -3054,6 +3059,20 @@ def test_sm100_declines_the_rubin_only_knobs_by_name():
         with pytest.raises(NotImplementedError, match=rf"QuantSpec\(attention_dtype=torch.bfloat16\) on cc {_cc()[0]}\.{_cc()[1]}") as e:
             mode.check_support()
         assert "FP8_PROJ_BF16_ATTENTION_CCS" in str(e.value) and env.forms == () and env.decode.quant_modes == () and env.decode.reason == str(e.value)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("batch, kv, s_q", [(2, 65536, 3), (32, 4096, 3), (1, 22528, 17), (4, 5632, 17)])
+def test_sm100_wide_decode_arm_matches_the_oracle(batch, kv, s_q):
+    """The 32-column arm's accept cells (:data:`DECODE_WIDE_TILE_CCS`) on a part that routes it: the wide cells of ``_SM100_WIDE`` at the 24 / 4
+    geometry -- W (18 packed rows on the 32-column tile, one KV stream) and U32 (an unpacked step of 17 tokens, 6 KV streams) -- against the
+    per-sequence fp32 oracle under the dense suite's budget, the compiled kernel pinned to the 32-column SM100 decode tile, block 0 untouched."""
+    if _cc() not in DECODE_WIDE_TILE_CCS:
+        pytest.skip(f"cc {_cc()[0]}.{_cc()[1]} does not route the 32-column arm (DECODE_WIDE_TILE_CCS)")
+    case = _sm100_case(("wide", batch, kv, s_q), 6, s_q, (kv,) * batch, heads=(24, 4))
+    case.run()
+    case.check_against_oracle(what=f"32-column arm B {batch} x kv {kv}, S_q {s_q}")
+    _sm100_pin(case, _SM100_WIDE[(batch, kv, s_q)][1])
 
 
 # ---------------------------------------------------------------------------
