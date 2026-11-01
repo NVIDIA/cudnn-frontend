@@ -42,6 +42,9 @@ CFG, BAR_LAYOUT = make_config(int(_PARAMS[0]), int(_PARAMS[1]), MX, k_hw=K_HW)
 TS = bool(CFG.T_SHARED)
 P_SMEM = bool(CFG.P_SMEM)
 EXP2_FMA_SPLIT = bool(_PARAMS[2]) if len(_PARAMS) > 2 else False
+SPLIT_DP = bool(K_HW == 64 and not MX and CFG.N == 128 and CFG.DV == 128 and CFG.V_SWZ == 128 and CFG.TMEM_COLS == 512)
+TMEM_ALLOC_COLS = 576 if SPLIT_DP else CFG.TMEM_COLS
+TMEM_DP_H0 = 512
 
 
 def _emulated(pair: int) -> bool:
@@ -451,6 +454,8 @@ def _softmax_tile(
         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
         bars.p_full[ring_idx].arrive()
     _wait_tcgen(bars.dp_done, phase)
+    if cutlass.const_expr(SPLIT_DP):
+        address = tmem_base + CFG.TMEM_DP + group * 64 + (cutlass.Int32(1) - group) * cutlass.Int32(TMEM_DP_H0 - CFG.TMEM_DP)
     a = _tmem_load(address, 32)
     b = _tmem_load(address + 32, 32)
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
@@ -919,51 +924,53 @@ def _load_t(slab, bars, qt_desc, dot_desc, sf_qt_desc, sf_dot_desc, q_idx, q_pha
 
 
 @cute.jit
-def _grad_products(slab, bars, tmem_base, do_state, q_state, qt_state, ring, dvdesc, dkdesc, dv, dk, accumulate):
-    _wait_tcgen(bars.p_full[ring.idx], ring.phase)
-    if cutlass.const_expr(TS):
-        _wait_tcgen(bars.dot_full[do_state.idx], do_state.phase)
-        _dot_scales(slab, tmem_base, do_state.idx)
-    dot = _operand(
-        slab, CFG.DO + do_state.idx * CFG.DO_STAGE_BYTES + (CFG.DO_BYTES if (MX and not TS) else 0), FP8, CFG.N, CFG.DV, transpose=True, swz=CFG.V_SWZ
-    ).desc()
-    sf_p = _sf_ptr(tmem_base, CFG.TMEM_SF_P) if MX else None
-    sf_dot = _sf_ptr(tmem_base, CFG.TMEM_SF_DOT + do_state.idx * CFG.SF_COLS_V) if MX else None
-    if cutlass.const_expr(P_SMEM):
-        mma_ss(dvdesc, _ring(slab, CFG.P, ring.idx, False), dot, dv, tmem_sf_a=sf_p, tmem_sf_b=sf_dot, accumulate=accumulate)
-    else:
-        mma_ts(
-            dvdesc,
-            nvvm.make_tmem_ptr(tmem_base + CFG.TMEM_P + ring.idx * CFG.P_COLS, cutlass.Int8),
-            dot,
-            dv,
-            tmem_sf_a=sf_p,
-            tmem_sf_b=sf_dot,
-            accumulate=accumulate,
-        )
-    _commit(bars.do_empty[do_state.idx])
-    _commit(bars.p_empty[ring.idx])
-    _wait_tcgen(bars.ds_full[ring.idx], ring.phase)
-    if cutlass.const_expr(TS):
-        _wait_tcgen(bars.qt_full[q_state.idx], q_state.phase)
-        _qt_scales(slab, tmem_base, q_state.idx)
-        _sf_copy(tmem_base, CFG.TMEM_SF_DS + ring.idx * CFG.SF_COLS_V, _sf_tile(slab, CFG.SF_DS + ring.idx * 512, 512).desc(), 1)
-        qt = _operand(slab, CFG.Q + q_state.idx * CFG.Q_STAGE_BYTES, FP8, CFG.N, CFG.DQK, transpose=True, swz=CFG.QK_SWZ).desc()
-    elif cutlass.const_expr(MX):
-        _wait_tcgen(bars.qt_full[qt_state.idx], qt_state.phase)
-        _qt_scales(slab, tmem_base, qt_state.idx)
-        _sf_copy(tmem_base, CFG.TMEM_SF_DS + ring.idx * CFG.SF_COLS_V, _sf_tile(slab, CFG.SF_DS + ring.idx * 512, 512).desc(), 1)
-        qt = _operand(slab, CFG.QT + qt_state.idx * CFG.Q_BYTES, FP8, CFG.N, CFG.DQK, transpose=True, swz=CFG.QK_SWZ).desc()
-    else:
-        qt = _operand(slab, CFG.Q + q_state.idx * CFG.Q_STAGE_BYTES, FP8, CFG.N, CFG.DQK, transpose=True, swz=CFG.QK_SWZ).desc()
-    sf_ds = _sf_ptr(tmem_base, CFG.TMEM_SF_DS + ring.idx * CFG.SF_COLS_V) if MX else None
-    sf_qt = _sf_ptr(tmem_base, CFG.TMEM_SF_QT + (q_state.idx if TS else qt_state.idx) * CFG.SF_COLS_QK) if MX else None
-    mma_ss(dkdesc, _ring(slab, CFG.DS, ring.idx, False), qt, dk, tmem_sf_a=sf_ds, tmem_sf_b=sf_qt, accumulate=accumulate)
-    if cutlass.const_expr(MX and not TS):
-        _commit(bars.qt_empty[qt_state.idx])
-    else:
-        _commit(bars.q_empty[q_state.idx])
-    _commit(bars.ds_empty[ring.idx])
+def _grad_products(slab, bars, tmem_base, do_state, q_state, qt_state, ring, dvdesc, dkdesc, dv, dk, accumulate, which: cutlass.Constexpr[int] = 0):
+    if cutlass.const_expr(which != 2):
+        _wait_tcgen(bars.p_full[ring.idx], ring.phase)
+        if cutlass.const_expr(TS):
+            _wait_tcgen(bars.dot_full[do_state.idx], do_state.phase)
+            _dot_scales(slab, tmem_base, do_state.idx)
+        dot = _operand(
+            slab, CFG.DO + do_state.idx * CFG.DO_STAGE_BYTES + (CFG.DO_BYTES if (MX and not TS) else 0), FP8, CFG.N, CFG.DV, transpose=True, swz=CFG.V_SWZ
+        ).desc()
+        sf_p = _sf_ptr(tmem_base, CFG.TMEM_SF_P) if MX else None
+        sf_dot = _sf_ptr(tmem_base, CFG.TMEM_SF_DOT + do_state.idx * CFG.SF_COLS_V) if MX else None
+        if cutlass.const_expr(P_SMEM):
+            mma_ss(dvdesc, _ring(slab, CFG.P, ring.idx, False), dot, dv, tmem_sf_a=sf_p, tmem_sf_b=sf_dot, accumulate=accumulate)
+        else:
+            mma_ts(
+                dvdesc,
+                nvvm.make_tmem_ptr(tmem_base + CFG.TMEM_P + ring.idx * CFG.P_COLS, cutlass.Int8),
+                dot,
+                dv,
+                tmem_sf_a=sf_p,
+                tmem_sf_b=sf_dot,
+                accumulate=accumulate,
+            )
+        _commit(bars.do_empty[do_state.idx])
+        _commit(bars.p_empty[ring.idx])
+    if cutlass.const_expr(which != 1):
+        _wait_tcgen(bars.ds_full[ring.idx], ring.phase)
+        if cutlass.const_expr(TS):
+            _wait_tcgen(bars.qt_full[q_state.idx], q_state.phase)
+            _qt_scales(slab, tmem_base, q_state.idx)
+            _sf_copy(tmem_base, CFG.TMEM_SF_DS + ring.idx * CFG.SF_COLS_V, _sf_tile(slab, CFG.SF_DS + ring.idx * 512, 512).desc(), 1)
+            qt = _operand(slab, CFG.Q + q_state.idx * CFG.Q_STAGE_BYTES, FP8, CFG.N, CFG.DQK, transpose=True, swz=CFG.QK_SWZ).desc()
+        elif cutlass.const_expr(MX):
+            _wait_tcgen(bars.qt_full[qt_state.idx], qt_state.phase)
+            _qt_scales(slab, tmem_base, qt_state.idx)
+            _sf_copy(tmem_base, CFG.TMEM_SF_DS + ring.idx * CFG.SF_COLS_V, _sf_tile(slab, CFG.SF_DS + ring.idx * 512, 512).desc(), 1)
+            qt = _operand(slab, CFG.QT + qt_state.idx * CFG.Q_BYTES, FP8, CFG.N, CFG.DQK, transpose=True, swz=CFG.QK_SWZ).desc()
+        else:
+            qt = _operand(slab, CFG.Q + q_state.idx * CFG.Q_STAGE_BYTES, FP8, CFG.N, CFG.DQK, transpose=True, swz=CFG.QK_SWZ).desc()
+        sf_ds = _sf_ptr(tmem_base, CFG.TMEM_SF_DS + ring.idx * CFG.SF_COLS_V) if MX else None
+        sf_qt = _sf_ptr(tmem_base, CFG.TMEM_SF_QT + (q_state.idx if TS else qt_state.idx) * CFG.SF_COLS_QK) if MX else None
+        mma_ss(dkdesc, _ring(slab, CFG.DS, ring.idx, False), qt, dk, tmem_sf_a=sf_ds, tmem_sf_b=sf_qt, accumulate=accumulate)
+        if cutlass.const_expr(MX and not TS):
+            _commit(bars.qt_empty[qt_state.idx])
+        else:
+            _commit(bars.q_empty[q_state.idx])
+        _commit(bars.ds_empty[ring.idx])
 
 
 @cute.jit
@@ -991,6 +998,9 @@ def _mma_loop(
     vd = _operand(slab, CFG.V, FP8, CFG.M, CFG.DV, swz=CFG.V_SWZ).desc()
     s = nvvm.make_tmem_ptr(tmem_base + CFG.TMEM_S, cutlass.Float32)
     dp = nvvm.make_tmem_ptr(tmem_base + CFG.TMEM_DP, cutlass.Float32)
+    dpdesc_h = _mma_desc(CFG.M, 64, CFG.DV) if SPLIT_DP else None
+    dp_h0 = nvvm.make_tmem_ptr(tmem_base + TMEM_DP_H0, cutlass.Float32)
+    dp_h1 = nvvm.make_tmem_ptr(tmem_base + CFG.TMEM_DP + 64, cutlass.Float32)
     dv = nvvm.make_tmem_ptr(tmem_base + CFG.TMEM_DV, cutlass.Float32)
     dk = nvvm.make_tmem_ptr(tmem_base + CFG.TMEM_DK, cutlass.Float32)
     sf_k = _sf_ptr(tmem_base, CFG.TMEM_SF_K) if MX else None
@@ -1049,14 +1059,28 @@ def _mma_loop(
                 if cutlass.const_expr(MX):
                     _do_scales(slab, tmem_base, do_state.idx)
                 dod = _operand(slab, CFG.DO + do_state.idx * CFG.DO_STAGE_BYTES, FP8, CFG.N, CFG.DV, swz=CFG.V_SWZ).desc()
-                _wait_tcgen(bars.s_free, sfree_state.phase)
-                sfree_state = advance(sfree_state, 1)
-                mma_ss(dpdesc, vd, dod, dp, tmem_sf_a=sf_v, tmem_sf_b=_sf_ptr(tmem_base, CFG.TMEM_SF_DO + do_state.idx * CFG.SF_COLS_V) if MX else None)
-                _commit(bars.dp_done)
-                if cutlass.const_expr(TS):
-                    _commit(bars.do_used[do_state.idx])
-                if t > 0:
-                    _grad_products(slab, bars, tmem_base, prev_do, prev_q, prev_qt, prev_ring, dvdesc, dkdesc, dv, dk, t > 1)
+                if cutlass.const_expr(SPLIT_DP):
+                    mma_ss(dpdesc_h, vd, dod, dp_h0)
+                    if t > 0:
+                        _grad_products(slab, bars, tmem_base, prev_do, prev_q, prev_qt, prev_ring, dvdesc, dkdesc, dv, dk, t > 1, 1)
+                    _wait_tcgen(bars.s_free, sfree_state.phase)
+                    sfree_state = advance(sfree_state, 1)
+                    dod_h1 = _operand(slab, CFG.DO + do_state.idx * CFG.DO_STAGE_BYTES + 64 * CFG.V_SWZ, FP8, 64, CFG.DV, swz=CFG.V_SWZ).desc()
+                    mma_ss(dpdesc_h, vd, dod_h1, dp_h1)
+                    _commit(bars.dp_done)
+                    if cutlass.const_expr(TS):
+                        _commit(bars.do_used[do_state.idx])
+                    if t > 0:
+                        _grad_products(slab, bars, tmem_base, prev_do, prev_q, prev_qt, prev_ring, dvdesc, dkdesc, dv, dk, t > 1, 2)
+                else:
+                    _wait_tcgen(bars.s_free, sfree_state.phase)
+                    sfree_state = advance(sfree_state, 1)
+                    mma_ss(dpdesc, vd, dod, dp, tmem_sf_a=sf_v, tmem_sf_b=_sf_ptr(tmem_base, CFG.TMEM_SF_DO + do_state.idx * CFG.SF_COLS_V) if MX else None)
+                    _commit(bars.dp_done)
+                    if cutlass.const_expr(TS):
+                        _commit(bars.do_used[do_state.idx])
+                    if t > 0:
+                        _grad_products(slab, bars, tmem_base, prev_do, prev_q, prev_qt, prev_ring, dvdesc, dkdesc, dv, dk, t > 1)
                 _wait_tcgen(bars.dp_empty, dpempty_state.phase)
                 dpempty_state = advance(dpempty_state, 1)
                 if t + 1 < total:
@@ -1322,7 +1346,10 @@ def bprop_d192_dkdv_fp8_kernel(
     sched_words = _view(slab, CFG.SCHED_PAYLOAD, cutlass.Int32, 16, alignment=16)
     sched = Sched(bars.sched_full.base_ptr, bars.sched_empty.base_ptr, sched_words, x, y, z)
     if warp == 0:
-        nvvm.tcgen05_alloc(tmem_slot, cutlass.Int32(CFG.TMEM_COLS), group=nvvm.CTAGroup.CTA_1)
+        if cutlass.const_expr(SPLIT_DP):
+            nvvm.tcgen05_alloc(tmem_slot, cutlass.Int32(TMEM_ALLOC_COLS), is_exclusive=True, group=nvvm.CTAGroup.CTA_1)
+        else:
+            nvvm.tcgen05_alloc(tmem_slot, cutlass.Int32(TMEM_ALLOC_COLS), group=nvvm.CTAGroup.CTA_1)
         nvvm.tcgen05_relinquish_alloc_permit(group=nvvm.CTAGroup.CTA_1)
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
         if nvvm.elect_sync():
@@ -1429,7 +1456,7 @@ def bprop_d192_dkdv_fp8_kernel(
     nvvm.barrier_cta_sync()
     if warp == 0:
         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
-        nvvm.tcgen05_dealloc(nvvm.make_tmem_ptr(tmem_slot.load(), cutlass.Int8), cutlass.Int32(CFG.TMEM_COLS), group=nvvm.CTAGroup.CTA_1)
+        nvvm.tcgen05_dealloc(nvvm.make_tmem_ptr(tmem_slot.load(), cutlass.Int8), cutlass.Int32(TMEM_ALLOC_COLS), group=nvvm.CTAGroup.CTA_1)
 
 
 bprop_d192_dkdv_fp8_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
