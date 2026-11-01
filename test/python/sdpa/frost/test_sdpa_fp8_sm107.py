@@ -2308,3 +2308,14 @@ class TestNativeSingleQ:
     test_one_q_origins = staticmethod(_checks.test_one_q_origins)
     test_one_q_public_identity_and_domain = staticmethod(_checks.test_one_q_public_identity_and_domain)
     test_one_q_forced_rescale = staticmethod(_checks.test_one_q_forced_rescale)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeSingleQPaged:
+    """Exercise explicit paged one-Q topology from the architecture CI entry."""
+
+    from native_single_q_paged_sm107_checks import test_paged_one_q_origins
+
+    test_paged_one_q_origins = staticmethod(test_paged_one_q_origins)

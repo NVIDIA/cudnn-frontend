@@ -2998,7 +2998,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     has_gate=self.gate_desc is not None,
                     mixed_kv=self.k_desc.dtype != self.q_desc.dtype or self.v_desc.dtype != self.q_desc.dtype,
                 ),
-                "softmax_wgs=1 requires native half D128 THD, CTA1 M128 N128, unsplit/unpacked/unpaged, without bias, KV mask or gate",
+                "softmax_wgs=1 requires native half D128 THD, CTA1 M128 N128, unsplit/unpacked, without bias, KV mask or gate",
             )
         if self.bias_desc is None:
             # n_chunk is the resident-bias arm's work-item form (the (n, n+1) pair item): typed decline on a plan without a bias.
