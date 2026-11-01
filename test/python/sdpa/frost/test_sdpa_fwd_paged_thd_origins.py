@@ -52,6 +52,7 @@ def test_paged_thd_origins_rebind_and_capture(
     kv_dtype_name=None,
     tile_n=None,
     sched_policy=None,
+    cpu_reference=False,
 ):
     import cudnn
     import torch
@@ -230,10 +231,15 @@ def test_paged_thd_origins_rebind_and_capture(
         workspace.fill_(255)
 
     def check(values, state):
+        # Keep sanitizer work focused on the attention execution, while still
+        # checking every live row against the same FP64 reference and tolerances.
+        if cpu_reference:
+            values = {name: tensor.cpu() for name, tensor in values.items()}
+        reference_device = values["q"].device
         ql, kl, starts = state
         stats = values["stats"] if stats_layout == "token" else values["stats"].T
-        live_o = torch.zeros(values["o"].shape[0], device="cuda", dtype=torch.bool)
-        live_stats = torch.zeros(stats.shape[0], device="cuda", dtype=torch.bool)
+        live_o = torch.zeros(values["o"].shape[0], device=reference_device, dtype=torch.bool)
+        live_stats = torch.zeros(stats.shape[0], device=reference_device, dtype=torch.bool)
         for b, (nq, nk) in enumerate(zip(ql, kl)):
             if not nq:
                 continue
@@ -244,10 +250,13 @@ def test_paged_thd_origins_rebind_and_capture(
                 hi = min(lo + 32, nq)
                 q = values["q"][starts["q"][b] + lo : starts["q"][b] + hi].double().transpose(0, 1)
                 scores = q @ k.transpose(-1, -2) * d_qk**-0.5
-                scores.masked_fill_(torch.arange(nk, device="cuda")[None, :] > torch.arange(nk - nq + lo, nk - nq + hi, device="cuda")[:, None], -torch.inf)
+                scores.masked_fill_(
+                    torch.arange(nk, device=reference_device)[None, :] > torch.arange(nk - nq + lo, nk - nq + hi, device=reference_device)[:, None], -torch.inf
+                )
                 if window_left is not None:
                     scores.masked_fill_(
-                        torch.arange(nk, device="cuda")[None, :] <= torch.arange(nk - nq + lo, nk - nq + hi, device="cuda")[:, None] - window_left,
+                        torch.arange(nk, device=reference_device)[None, :]
+                        <= torch.arange(nk - nq + lo, nk - nq + hi, device=reference_device)[:, None] - window_left,
                         -torch.inf,
                     )
                 if sink is not None:

@@ -91,4 +91,5 @@ def test_origins_rebind_and_replay(dim, dtype_name, pool_layout, stats_layout, c
         sink=sink,
         tile_n=64,
         sched_policy=policy,
+        cpu_reference=True,
     )
