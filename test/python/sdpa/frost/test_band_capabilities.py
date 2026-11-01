@@ -519,7 +519,9 @@ def test_negative_right_bound_is_still_refused_by_the_forward_probe():
         caps = spec.capabilities
         reason = _probe(kind)(caps, legal_facts(kind, caps, s_kv=128, **band_right(-1)))
         if kind == "fwd":
-            assert reason == "negative diagonal_band_right_bound (-1) is not supported", spec.name
+            assert reason == (
+                "negative diagonal_band_right_bound (-1) is not supported" if caps.right_band_widening else band.feature_reason(band.LABEL_RIGHT_FINITE)
+            ), spec.name
         else:
             # The backward probe has no such early value guard: the row's band
             # claim decides, so a row that serves widening still serves -1 (the

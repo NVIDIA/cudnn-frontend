@@ -6609,17 +6609,96 @@ _SM80_FLAVOR_CAUSAL_L2_MIB = {
 # Ascending (D_QK, D_V) order so the flavor pick walks closest-from-above.
 _SM80_SUPPORTED_FLAVORS = ("gptoss", "llama", "dsv3", "qwen", "wide512", "mla576")
 
+# --- SM89 (Ada / L20) flavor view -------------------------------------------
+# Same kernel file (``sm80/prefill_f16.py``), same frozen geometry for the
+# flavors Ada can hold; the SUPPORTED SET is narrower.  A cc 8.9 part has
+# 99 KiB of opt-in SMEM per block (101376 B on the L20), while the shared
+# skeleton's d256 point needs 128 KiB, so the SM89 row serves only the flavors
+# whose compile-time allocation fits — today just gptoss (d64, 32 KiB).
+_SM89_FLAVOR_CFGS = {"gptoss": _sm80_config.GPTOSS_CFG}
+_SM89_FLAVOR_DIMS = {name: (cfg.D_QK, cfg.D_V) for name, cfg in _SM89_FLAVOR_CFGS.items()}
+_SM89_FLAVOR_KNOBS = {name: (cfg.TILE_M, cfg.NUM_WARPS, cfg.TILE_N) for name, cfg in _SM89_FLAVOR_CFGS.items()}
+_SM89_FLAVOR_CAUSAL_L2_MIB = {"gptoss": 16}
+
 # Flavors that route to the dedicated d=256 kernel (symmetric K+V prefetch);
 # all others use the shared generic kernel.
 _SM80_D256_FLAVORS = ("qwen", "wide512", "mla576")
 
 
-def _sm80_pick_flavor(d_qk: int, d_v: int) -> str:
+# Device families the SM80-family kernels are validated on.  Each entry names
+# the exact (major, minor) set a row may claim; THIS is the gate the row's
+# capabilities.sm_lo/sm_hi must agree with, so widening one without the other
+# is caught by test_sm89_d64.py::test_sm89_row_and_adapter_gate_agree.
+_SM80_DEVICE_FAMILIES = {
+    "sm80": {
+        "cc": ((8, 0),),
+        "dims": _SM80_FLAVOR_DIMS,
+        "knobs": _SM80_FLAVOR_KNOBS,
+        "flavors": _SM80_SUPPORTED_FLAVORS,
+        "l2_mib": _SM80_FLAVOR_CAUSAL_L2_MIB,
+        "label": "SM80 (A100, cc 8.0)",
+    },
+    "sm89": {
+        "cc": ((8, 9),),
+        "dims": _SM89_FLAVOR_DIMS,
+        "knobs": _SM89_FLAVOR_KNOBS,
+        "flavors": _sm80_config.SM89_SUPPORTED_FLAVORS,
+        "l2_mib": _SM89_FLAVOR_CAUSAL_L2_MIB,
+        "label": "SM89 (Ada / L20, cc 8.9)",
+    },
+}
+
+
+def _sm80_device_family(device_cc) -> str:
+    """The family token a (major, minor) belongs to; raises for anything the
+    SM80-family kernels were never validated on."""
+    for name, entry in _SM80_DEVICE_FAMILIES.items():
+        if device_cc in entry["cc"]:
+            return name
+    known = sorted(cc for entry in _SM80_DEVICE_FAMILIES.values() for cc in entry["cc"])
+    raise ValueError(f"the SM80-family SDPA kernels are validated on cc {known} only; found SM{device_cc[0]}{device_cc[1]}")
+
+
+def _device_cc_set(device_cc):
+    """A row's ``device_cc`` declaration as a frozen set of (major, minor) pairs.
+
+    Rows state the SET they were validated on -- ``((8, 9),)`` for Ada.  A FLAT
+    pair (``(8, 9)``) is the shape a caller reaches for by mistake and is refused
+    by name here: the membership test against it would compare a (major, minor)
+    tuple with the ints of that pair and reject every device, which reads as a
+    gate that does not work rather than as a wrong declaration.
+    """
+    if device_cc is None:
+        return None
+    if not device_cc or not all(isinstance(pair, (tuple, list)) and len(pair) == 2 for pair in device_cc):
+        raise ValueError(f"device_cc must be a non-empty iterable of (major, minor) pairs, e.g. ((8, 9),); got {device_cc!r}")
+    return frozenset((int(major), int(minor)) for major, minor in device_cc)
+
+
+def _sm80_pick_flavor(d_qk: int, d_v: int, family: str = "sm80") -> str:
     """Smallest kernel flavor whose ``(D_QK, D_V)`` envelope covers
-    ``(d_qk, d_v)``.  Exact-match wins when both axes match; otherwise walk
-    the supported flavors in ascending order and pick the first that fits.
-    Raises if either head dimension exceeds the native envelopes."""
-    return _sm80_config.pick_flavor(d_qk, d_v)
+    ``(d_qk, d_v)``.  The SM80 family defers to the shared
+    ``config_sm80.pick_flavor`` so graph admission and lowering agree; other
+    families take an exact match first, otherwise walk their supported flavors
+    in ascending order and pick the first that fits.  Raises if either head
+    dimension exceeds the family's envelopes."""
+    if family == "sm80":
+        return _sm80_config.pick_flavor(d_qk, d_v)
+    entry = _SM80_DEVICE_FAMILIES[family]
+    flavors, dims = entry["flavors"], entry["dims"]
+    for flavor in flavors:
+        fdqk, fdv = dims[flavor]
+        if d_qk == fdqk and d_v == fdv:
+            return flavor
+    for flavor in flavors:
+        fdqk, fdv = dims[flavor]
+        if d_qk <= fdqk and d_v <= fdv:
+            return flavor
+    raise ValueError(
+        f"{entry['label']} SDPA: no flavor envelope covers (D_QK={d_qk}, D_V={d_v}).  "
+        f"Supported envelopes on this device family: {dims}.  Larger heads are not "
+        f"ported to {entry['label']}."
+    )
 
 
 def _sm80_resolve_scheduler(
@@ -6629,9 +6708,10 @@ def _sm80_resolve_scheduler(
     is_causal: bool,
     swa_window: int,
     skv: int,
+    family: str = "sm80",
 ) -> tuple[str, int]:
     """Return ``(sched_token, sched_l2_mib)`` to pass to the kernel."""
-    l2_mib = _SM80_FLAVOR_CAUSAL_L2_MIB[flavor]
+    l2_mib = _SM80_DEVICE_FAMILIES[family]["l2_mib"][flavor]
     if scheduler == "auto":
         if is_causal:
             return "lpt_l2", l2_mib
@@ -6715,16 +6795,26 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         sample_ragged_o=None,
         sample_ragged_lse=None,
         ragged_offset_multipliers=(1, 1, 1, 1, 1),
+        device_cc: Optional[tuple[tuple[int, int], ...]] = None,
+        flavor_params: Optional[dict] = None,
         **kwargs,
     ) -> None:
-        # SM80-only plan-time axes (see class docstring). ``scheduler`` is the
+        # SM80-family plan-time axes (see class docstring). ``scheduler`` is the
         # token override for standalone callers; the graph path leaves it None
         # and carries the heuristic's explicit sched_policy knob instead
-        # (None = derive via "auto", explicit ints map to their tokens).
+        # (None = derive via "auto"; explicit ints map to their tokens).
         self._scheduler_token = scheduler
         self._bias_present = bool(bias_present)
         self._bias_fp32 = bool(bias_fp32)
         self._rope_max_s = int(rope_max_s)
+        # Device family this plan was built for: the row states the (major,
+        # minor) SET it was validated on, so the gate is plan-time data rather
+        # than a constant baked into a shared adapter.  None keeps the
+        # historical cc 8.0 behaviour for standalone callers.
+        self._declared_device_cc = _device_cc_set(device_cc)
+        # The kernel BOX (flavor + tile geometry) this row was validated on.
+        # None = derive from the flavor tables, i.e. the A100 sweep's point.
+        self._flavor_params_override = dict(flavor_params) if flavor_params else None
         super().__init__(*args, **kwargs)
         # Element offsets address each port independently; lengths still own
         # the live rows. Device values never enter a compile key.
@@ -6867,8 +6957,15 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             origin_geometry.append((str(desc.dtype), stepped[0][1], multiplier))
         self._sm80_origin_geometry = tuple(origin_geometry) if any(g is not None for g in origin_geometry) else None
 
-        max_d_qk = max(fdqk for fdqk, _ in _SM80_FLAVOR_DIMS.values())
-        max_d_v = max(fdv for _, fdv in _SM80_FLAVOR_DIMS.values())
+        # The family is a pure function of the device, so derive it here rather
+        # than reading self._device_cc (assigned by the later device gate): the
+        # envelope this row advertises and the device it runs on must not be able
+        # to disagree, and an ordering dependency between the two is exactly how
+        # they would.
+        _cc = torch.cuda.get_device_capability(self.q_desc.device)
+        _family_dims = _SM80_DEVICE_FAMILIES[_sm80_device_family(_cc)]["dims"]
+        max_d_qk = max(fdqk for fdqk, _ in _family_dims.values())
+        max_d_v = max(fdv for _, fdv in _family_dims.values())
         self._value_error_if(
             d_qk > max_d_qk or d_v > max_d_v,
             f"SM80 SDPA: head dim (D_QK={d_qk}, D_V={d_v}) exceeds "
@@ -6974,27 +7071,76 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         device = self.q_desc.device
         major, minor = torch.cuda.get_device_capability(device)
         self._device_cc = (major, minor)
-        self._value_error_if(
-            (major, minor) != (8, 0),
-            f"SdpaFwdDslSm80 requires SM80 (A100); found SM{major}{minor} on {device}",
-        )
+        # A row that declared its device family admits exactly that family;
+        # otherwise the historical SM80-only behaviour is kept.
+        if self._declared_device_cc is not None:
+            self._value_error_if(
+                self._device_cc not in self._declared_device_cc,
+                f"SdpaFwdDslSm80 was built for cc {sorted(self._declared_device_cc)}; " f"found SM{major}{minor} on {device}",
+            )
+        else:
+            self._value_error_if(
+                self._device_cc != (8, 0),
+                f"SdpaFwdDslSm80 requires SM80 (A100); found SM{major}{minor} on {device}",
+            )
+        self.device_family = _sm80_device_family(self._device_cc)
+        family = _SM80_DEVICE_FAMILIES[self.device_family]
 
-        self.flavor = _sm80_pick_flavor(d_qk, d_v)
-        self.flavor_d_qk, self.flavor_d_v = _SM80_FLAVOR_DIMS[self.flavor]
-        tile_m_default, num_warps_default, tile_n_default = _SM80_FLAVOR_KNOBS[self.flavor]
-        # Smaller CTAs expose more parallelism for short dense queries. At
-        # D192, 64 rows also shrink the Q/V shared-memory region. Keep sixteen
-        # rows per warp and leave explicit TILE_M requests intact.
-        short_d256 = not self.thd and d_qk == d_v == 256 and s_qo <= 128
-        if short_d256 or (not self.thd and ((d_qk == d_v == 128 and s_qo <= 128) or (d_qk == 192 and d_v == 128 and s_qo <= 64))):
-            tile_m_default = 64
-        self.kernel_tile_m = tile_m_default if self.tile_m is None else int(self.tile_m)
-        self.kernel_num_warps = 4 if self.flavor in ("llama", "dsv3", "qwen") and self.kernel_tile_m == 64 else num_warps_default
-        # At D256 the 64-key double buffers still occupy 128 KiB. Pair the
-        # smaller Q tile with 32-key buffers to reduce that total to 64 KiB.
-        if short_d256 and self.kernel_tile_m == 64:
-            tile_n_default = 32
-        self.kernel_tile_n = tile_n_default if self.tile_n is None else int(self.tile_n)
+        self.flavor = _sm80_pick_flavor(d_qk, d_v, self.device_family)
+        self.flavor_d_qk, self.flavor_d_v = family["dims"][self.flavor]
+        tile_m_default, num_warps_default, tile_n_default = family["knobs"][self.flavor]
+        self.kernel_num_warps = num_warps_default
+        if self._flavor_params_override is not None:
+            # The row's validated box wins over both the swept default and a
+            # caller knob: an unvalidated tile geometry is exactly what this
+            # axis exists to prevent.
+            override = self._flavor_params_override
+            unknown = set(override) - {"flavor", "d_qk", "d_v", "tile_m", "tile_n", "num_warps"}
+            self._value_error_if(
+                bool(unknown),
+                f"SM80 SDPA: unknown flavor_params keys {sorted(unknown)}",
+            )
+            self.flavor = override.get("flavor", self.flavor)
+            self.flavor_d_qk = int(override.get("d_qk", self.flavor_d_qk))
+            self.flavor_d_v = int(override.get("d_v", self.flavor_d_v))
+            self.kernel_tile_m = int(override.get("tile_m", tile_m_default))
+            self.kernel_tile_n = int(override.get("tile_n", tile_n_default))
+            self.kernel_num_warps = int(override.get("num_warps", num_warps_default))
+        else:
+            # Smaller CTAs expose more parallelism for short dense queries. At
+            # D192, 64 rows also shrink the Q/V shared-memory region. Keep sixteen
+            # rows per warp and leave explicit TILE_M requests intact.
+            short_d256 = not self.thd and d_qk == d_v == 256 and s_qo <= 128
+            if short_d256 or (not self.thd and ((d_qk == d_v == 128 and s_qo <= 128) or (d_qk == 192 and d_v == 128 and s_qo <= 64))):
+                tile_m_default = 64
+            self.kernel_tile_m = tile_m_default if self.tile_m is None else int(self.tile_m)
+            self.kernel_num_warps = 4 if self.flavor in ("llama", "dsv3", "qwen") and self.kernel_tile_m == 64 else num_warps_default
+            # At D256 the 64-key double buffers still occupy 128 KiB. Pair the
+            # smaller Q tile with 32-key buffers to reduce that total to 64 KiB.
+            if short_d256 and self.kernel_tile_m == 64:
+                tile_n_default = 32
+            self.kernel_tile_n = tile_n_default if self.tile_n is None else int(self.tile_n)
+        # Resource gate.  The kernels' SMEM is a compile-time constant of the
+        # (flavor box, tile_m, tile_n) specialization and is NOT reduced by a
+        # smaller graph head dim, so an unsupported geometry must be declined
+        # here rather than surfacing as a launch failure or a silent fallback.
+        if self.device_family == "sm89":
+            from cudnn.sdpa.fwd import config_sm80 as _cfg_sm
+
+            _probe = _cfg_sm.TemplateParams(
+                d_qk=self.flavor_d_qk,
+                d_v=self.flavor_d_v,
+                tile_m=self.kernel_tile_m,
+                tile_n=self.kernel_tile_n,
+                num_warps=self.kernel_num_warps,
+            )
+            _need = _cfg_sm.sm89_smem_bytes(_probe)
+            _have = int(torch.cuda.get_device_properties(device).shared_memory_per_block_optin)
+            self._value_error_if(
+                _need > _have,
+                f"SM89 SDPA: the d64 kernel at tile_m={self.kernel_tile_m}, tile_n={self.kernel_tile_n} "
+                f"allocates {_need} B of shared memory but SM{major}{minor} offers {_have} B per block",
+            )
         self._value_error_if(
             self.flavor in ("wide512", "mla576") and (self.kernel_tile_m, self.kernel_tile_n, self.kernel_num_warps) != (32, 16, 4),
             "SM80 wide heads require TILE_M=32 and TILE_N=16 with four warps",
@@ -7051,6 +7197,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             is_causal=self.is_causal,
             swa_window=self.swa_window_runtime,
             skv=int(s_kv),
+            family=self.device_family,
         )
 
         if self.scale_softmax is None:
@@ -7710,6 +7857,7 @@ def sdpa_fwd_wrapper_sm80(
                 seq_q_lens_present=seq_len_q is not None,
                 has_sink=sinks is not None,
                 scheduler=scheduler,
+                device_cc=_SM80_DEVICE_FAMILIES["sm80"]["cc"],
                 bias_present=bias_tensor is not None,
                 bias_fp32=(bias_tensor is not None and bias_tensor.dtype == torch.float32),
                 rope_max_s=rope_max_s,
