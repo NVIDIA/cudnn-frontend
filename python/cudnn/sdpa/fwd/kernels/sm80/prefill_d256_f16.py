@@ -229,7 +229,10 @@ def _sdpa_kernel(
     # ---- derived shape / layout constants ---------------------------------
     # Folded at trace time — one compiled fn per (tile_m, num_warps, tile_n,
     # d_qk, d_v) tuple.
-    m_per_warp = tile_m // num_warps  # 16 (TILE_M=64/4w or 128/8w) or 32 (128/4w)
+    wide = d_qk > 256 or d_v > 256
+    v_warps = 2 if wide else 1
+    v_per_warp = d_v // v_warps
+    m_per_warp = tile_m // (num_warps // v_warps)
     m_blocks = m_per_warp // 16  # 1 in 64/4w & 128/8w cases; 2 in 128/4w
     threads = num_warps * 32  # 128 or 256
     # Per-d derived layout constants — fold to Python ints at trace time.
@@ -239,7 +242,7 @@ def _sdpa_kernel(
     ELEMS_PER_ROW_K = d_qk  # fp16 per K row (== d_qk by construction)
     ELEMS_PER_ROW_V = d_v  # fp16 per V row (DSv3: 128 != d_qk=192)
     QK_K_CHUNKS = d_qk // 16  # k_chunks of 16 fp16 along QK reduction
-    SV_N_FRAGS = d_v // 8  # n_frags of 8 cols (SV output N)
+    SV_N_FRAGS = v_per_warp // 8
     elems_q = tile_m * ELEMS_PER_ROW_Q
     # Tile_n-derived constants.
     QK_N_FRAGS = tile_n // 8  # 8 (tile_n=64) or 16 (tile_n=128)
@@ -340,6 +343,8 @@ def _sdpa_kernel(
 
     tidx, _, _ = cute.arch.thread_idx()
     warp_idx = tidx // 32
+    warp_v = warp_idx % v_warps
+    warp_v_col = warp_v * v_per_warp
     lane = tidx % 32
 
     # ---- SMEM allocations -------------------------------------------------
@@ -361,10 +366,17 @@ def _sdpa_kernel(
     # Double-buffering V removes the need for a per-iter end-of-iter
     # barrier (V[i+2]'s write to sV[i%2] is naturally fenced by iter
     # (i+1)'s K-wait + V-wait barriers).
-    SQ_BUF_ELEMS = max(elems_q, 2 * ELEMS_KV_V, tile_m * d_v)
+    SQ_BUF_ELEMS = max(elems_q, tile_m * d_v) if wide else max(elems_q, 2 * ELEMS_KV_V, tile_m * d_v)
     SK_BUF_ELEMS = 2 * ELEMS_KV_K
     sQ_buf = cutlass.Array(io_dtype, SQ_BUF_ELEMS, alignment=128, space=cutlass.AddressSpace.smem)
     sK_buf = cutlass.Array(io_dtype, SK_BUF_ELEMS, alignment=128, space=cutlass.AddressSpace.smem)
+    if cutlass.const_expr(wide):
+        # Preserve Q through the KV loop: caching every Q fragment in registers
+        # alongside wide O accumulators would spill. The narrow body retains
+        # its Q/V alias and cached Q fragments.
+        sV_buf = cutlass.Array(io_dtype, 2 * ELEMS_KV_V, alignment=128, space=cutlass.AddressSpace.smem)
+    else:
+        sV_buf = sQ_buf
 
     # ---- GMEM base pointers + row strides ---------------------------------
     Q_view = cutlass.make_array_view(Q)
@@ -688,14 +700,16 @@ def _sdpa_kernel(
     # length (eff_sq / eff_skv) — over-reading into the next sequence's rows
     # (or past T on the last sequence) would corrupt / fault.  Dense uses the
     # physical SQ / SKV.
-    if cutlass.const_expr(THD_VARLEN):
+    # Logical padding must not enter either MMA: zero times a masked NaN V
+    # is still NaN, and trimmed Q rows must produce zero rather than NaN.
+    if cutlass.const_expr(THD_VARLEN or has_seq_len_q):
         q_valid_rows = eff_sq
-        kv_valid_rows = eff_skv
     else:
         q_valid_rows = None if cutlass.const_expr(is_even_mn) else sq_runtime
-        kv_valid_rows = None if cutlass.const_expr(is_even_mn) else skv_runtime
-    if cutlass.const_expr(PARAMS.paged_page_size):
+    if cutlass.const_expr(THD_VARLEN or has_seq_kv_lens or PARAMS.paged_page_size):
         kv_valid_rows = eff_skv
+    else:
+        kv_valid_rows = None if cutlass.const_expr(is_even_mn) else skv_runtime
     valid_cols = None if cutlass.const_expr(is_even_k) else d_runtime
     q_row_base_i = cutlass.Int32(q_row_base)
     load_tile_2d(
@@ -784,25 +798,26 @@ def _sdpa_kernel(
     # Per (m_block, k_chunk): 4 i32/lane via one ldmatrix.x4 .row.
     Q_frag = [None] * (m_blocks * QK_K_CHUNKS * 4)
 
-    warp_m_base = warp_idx * m_per_warp  # 0, 32, 64, 96  for TILE_M=128
+    warp_m_base = (warp_idx // v_warps) * m_per_warp
     a_row = lane % 16
     a_col_chunk = lane // 16
-    for m_block in cutlass.range_constexpr(m_blocks):
-        for k_chunk in cutlass.range_constexpr(QK_K_CHUNKS):
-            # Same Swz128B XOR as the Q cp.async writer: read lands at the
-            # physical SMEM slot the writer chose, but the per-warp
-            # ldmatrix m8n8 atom now spreads its 8 row-ptrs across 8
-            # disjoint bank groups.
-            q_row = warp_m_base + m_block * 16 + a_row
-            q_col_log = k_chunk * 16 + a_col_chunk * 8
-            q_col_swz = swizzle_xor_128b(q_row, q_col_log, elem_bytes=ELEM_BYTES)
-            ptr = sQ_buf.subview(q_row * ELEMS_PER_ROW_Q + q_col_swz)
-            v = nvvm.ldmatrix(ptr.data_ptr(), 4, nvvm.MMALayout.ROW)
-            base = m_block * QK_K_CHUNKS * 4 + k_chunk * 4
-            Q_frag[base + 0] = v[0]
-            Q_frag[base + 1] = v[1]
-            Q_frag[base + 2] = v[2]
-            Q_frag[base + 3] = v[3]
+    if cutlass.const_expr(not wide):
+        for m_block in cutlass.range_constexpr(m_blocks):
+            for k_chunk in cutlass.range_constexpr(QK_K_CHUNKS):
+                # Same Swz128B XOR as the Q cp.async writer: read lands at the
+                # physical SMEM slot the writer chose, but the per-warp
+                # ldmatrix m8n8 atom now spreads its 8 row-ptrs across 8
+                # disjoint bank groups.
+                q_row = warp_m_base + m_block * 16 + a_row
+                q_col_log = k_chunk * 16 + a_col_chunk * 8
+                q_col_swz = swizzle_xor_128b(q_row, q_col_log, elem_bytes=ELEM_BYTES)
+                ptr = sQ_buf.subview(q_row * ELEMS_PER_ROW_Q + q_col_swz)
+                v = nvvm.ldmatrix(ptr.data_ptr(), 4, nvvm.MMALayout.ROW)
+                base = m_block * QK_K_CHUNKS * 4 + k_chunk * 4
+                Q_frag[base + 0] = v[0]
+                Q_frag[base + 1] = v[1]
+                Q_frag[base + 2] = v[2]
+                Q_frag[base + 3] = v[3]
 
     # End-of-prologue barrier: all warps must finish ldmatrix Q before the
     # V prologue cp.async overwrites sQ_buf (= sV[0]).
@@ -816,7 +831,7 @@ def _sdpa_kernel(
     # after the end-of-prologue barrier above).
     v_prologue_gmem = v_gmem_batch_head + v_prologue_off64
     load_kv_tile(
-        sQ_buf,
+        sV_buf,
         v_prologue_gmem,
         rows=tile_n,
         elems_per_row=ELEMS_PER_ROW_V,
@@ -907,8 +922,8 @@ def _sdpa_kernel(
         next_stage = cutlass.Int32(1) - cur_stage
         sK_cur = sK_buf.subview(cur_stage * cutlass.Int32(ELEMS_KV_K))
         sK_next = sK_buf.subview(next_stage * cutlass.Int32(ELEMS_KV_K))
-        sV_cur = sQ_buf.subview(cur_stage * cutlass.Int32(ELEMS_KV_V))
-        sV_next = sQ_buf.subview(next_stage * cutlass.Int32(ELEMS_KV_V))
+        sV_cur = sV_buf.subview(cur_stage * cutlass.Int32(ELEMS_KV_V))
+        sV_next = sV_buf.subview(next_stage * cutlass.Int32(ELEMS_KV_V))
 
         # ---- QK mma : S[M=m_per_warp, N=TILE_N] per warp, regs accumulator
         # mma_step internally loops m_blocks m16n8k16 sub-calls per k_step,
@@ -1059,7 +1074,19 @@ def _sdpa_kernel(
                 K_frag_next = load_b_smem_x4(
                     sK_cur, k_step=k_chunk + 1, N=tile_n, sB_elems_per_row=ELEMS_PER_ROW_K, b_trans=False, lane=lane, swizzle=True, elem_bytes=ELEM_BYTES
                 )
-            mma_step(S_acc, Q_frag, K_frag_cur, k_step=k_chunk, M=m_per_warp, N=tile_n, ab_dtype=io_dtype)
+            if cutlass.const_expr(wide):
+                q_step = [None] * (m_blocks * 4)
+                for m_block in cutlass.range_constexpr(m_blocks):
+                    wide_q_row = warp_m_base + m_block * 16 + a_row
+                    wide_q_col = k_chunk * 16 + a_col_chunk * 8
+                    wide_q_swz = swizzle_xor_128b(wide_q_row, wide_q_col, elem_bytes=ELEM_BYTES)
+                    wide_q_ptr = sQ_buf.subview(wide_q_row * ELEMS_PER_ROW_Q + wide_q_swz)
+                    q_values = nvvm.ldmatrix(wide_q_ptr.data_ptr(), 4, nvvm.MMALayout.ROW)
+                    for i in cutlass.range_constexpr(4):
+                        q_step[m_block * 4 + i] = q_values[i]
+                mma_step(S_acc, q_step, K_frag_cur, k_step=0, M=m_per_warp, N=tile_n, ab_dtype=io_dtype)
+            else:
+                mma_step(S_acc, Q_frag, K_frag_cur, k_step=k_chunk, M=m_per_warp, N=tile_n, ab_dtype=io_dtype)
             if cutlass.const_expr(k_chunk + 1 < QK_K_CHUNKS):
                 K_frag_cur = K_frag_next
 
@@ -1317,13 +1344,16 @@ def _sdpa_kernel(
         # SV B-operand (V) also via ldmatrix.x4 — bigger win here than QK
         # because d_v // 8 is large (32 at d_v=256, 16 at d_v=128), so the
         # halving cuts the per-k-step ldmatrix count from {32,16} to {16,8}.
-        V_frag_cur = load_b_smem_x4(sV_cur, k_step=0, N=d_v, sB_elems_per_row=ELEMS_PER_ROW_V, b_trans=True, lane=lane, swizzle=True, elem_bytes=ELEM_BYTES)
+        sV_warp = sV_cur.subview(warp_v_col)
+        V_frag_cur = load_b_smem_x4(
+            sV_warp, k_step=0, N=v_per_warp, sB_elems_per_row=ELEMS_PER_ROW_V, b_trans=True, lane=lane, swizzle=True, elem_bytes=ELEM_BYTES
+        )
         for k_chunk in cutlass.range_constexpr(SV_K_CHUNKS):
             if cutlass.const_expr(k_chunk + 1 < SV_K_CHUNKS):
                 V_frag_next = load_b_smem_x4(
-                    sV_cur, k_step=k_chunk + 1, N=d_v, sB_elems_per_row=ELEMS_PER_ROW_V, b_trans=True, lane=lane, swizzle=True, elem_bytes=ELEM_BYTES
+                    sV_warp, k_step=k_chunk + 1, N=v_per_warp, sB_elems_per_row=ELEMS_PER_ROW_V, b_trans=True, lane=lane, swizzle=True, elem_bytes=ELEM_BYTES
                 )
-            mma_step(O_acc, P_frag, V_frag_cur, k_step=k_chunk, M=m_per_warp, N=d_v, ab_dtype=io_dtype)
+            mma_step(O_acc, P_frag, V_frag_cur, k_step=k_chunk, M=m_per_warp, N=v_per_warp, ab_dtype=io_dtype)
             if cutlass.const_expr(k_chunk + 1 < SV_K_CHUNKS):
                 V_frag_cur = V_frag_next
 
@@ -1447,16 +1477,17 @@ def _sdpa_kernel(
             def _stf(ptr, val):
                 cutlass.Array(ptr, (1,), dtype=cutlass.Float32)[0] = val
 
-            if cutlass.const_expr(is_even_mn):
-                _stf(lse_top_ptr, lse_top)
-                _stf(lse_bot_ptr, lse_bot)
-            else:
-                top_abs = q_row_base_i32 + block_row_top
-                bot_abs = q_row_base_i32 + block_row_bot
-                if top_abs < sq_store_bound:
+            if warp_v == 0:
+                if cutlass.const_expr(is_even_mn):
                     _stf(lse_top_ptr, lse_top)
-                if bot_abs < sq_store_bound:
                     _stf(lse_bot_ptr, lse_bot)
+                else:
+                    top_abs = q_row_base_i32 + block_row_top
+                    bot_abs = q_row_base_i32 + block_row_bot
+                    if top_abs < sq_store_bound:
+                        _stf(lse_top_ptr, lse_top)
+                    if bot_abs < sq_store_bound:
+                        _stf(lse_bot_ptr, lse_bot)
 
     # ---- Final normalization + SMEM-staged STG.128 epilogue --------------
     # Naïve scalar per-lane STG (the previous epilogue) emits 2-fp16 stores
@@ -1537,8 +1568,8 @@ def _sdpa_kernel(
             h_top = fp32_to_fp16(O_acc[o_off + 0] * inv_l_top, O_acc[o_off + 1] * inv_l_top, dtype=io_dtype)
             h_bot = fp32_to_fp16(O_acc[o_off + 2] * inv_l_bot, O_acc[o_off + 3] * inv_l_bot, dtype=io_dtype)
             # chunk_idx for col = n_frag*8 + 2p (2p ∈ {0,2,4,6} < 8) is n_frag.
-            swz_chunk_top = cutlass.Int32(n_frag) ^ swz_top_mask
-            swz_chunk_bot = cutlass.Int32(n_frag) ^ swz_bot_mask
+            swz_chunk_top = (cutlass.Int32(n_frag) + warp_v_col // 8) ^ swz_top_mask
+            swz_chunk_bot = (cutlass.Int32(n_frag) + warp_v_col // 8) ^ swz_bot_mask
             smem_top = sO_buf.subview(block_row_top * cutlass.Int32(d_v) + swz_chunk_top * cutlass.Int32(ELEMS_PER_CHUNK) + cutlass.Int32(2 * p_lane))
             smem_bot = sO_buf.subview(block_row_bot * cutlass.Int32(d_v) + swz_chunk_bot * cutlass.Int32(ELEMS_PER_CHUNK) + cutlass.Int32(2 * p_lane))
             # Re-type pointer to Int32 → single st.shared.b32 of the

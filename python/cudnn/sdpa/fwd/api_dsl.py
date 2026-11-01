@@ -6538,6 +6538,8 @@ _SM80_FLAVOR_CFGS = {
     "llama": _sm80_config.LLAMA_CFG,
     "dsv3": _sm80_config.DSV3_CFG,
     "qwen": _sm80_config.QWEN_CFG,
+    "wide512": _sm80_config.WIDE512_CFG,
+    "mla576": _sm80_config.MLA576_CFG,
 }
 
 # (D_QK, D_V) envelope per flavor.
@@ -6553,14 +6555,16 @@ _SM80_FLAVOR_CAUSAL_L2_MIB = {
     "gptoss": 16,
     "dsv3": 8,
     "qwen": 8,
+    "wide512": 8,
+    "mla576": 8,
 }
 
 # Ascending (D_QK, D_V) order so the flavor pick walks closest-from-above.
-_SM80_SUPPORTED_FLAVORS = ("gptoss", "llama", "dsv3", "qwen")
+_SM80_SUPPORTED_FLAVORS = ("gptoss", "llama", "dsv3", "qwen", "wide512", "mla576")
 
 # Flavors that route to the dedicated d=256 kernel (symmetric K+V prefetch);
 # all others use the shared generic kernel.
-_SM80_D256_FLAVORS = ("qwen",)
+_SM80_D256_FLAVORS = ("qwen", "wide512", "mla576")
 
 
 def _sm80_pick_flavor(d_qk: int, d_v: int) -> str:

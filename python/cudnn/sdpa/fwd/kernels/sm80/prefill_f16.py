@@ -721,14 +721,16 @@ def _sdpa_kernel(
     # length (eff_sq / eff_skv) — over-reading into the next sequence's rows
     # (or past T on the last sequence) would corrupt / fault.  Dense uses the
     # physical SQ / SKV.
-    if cutlass.const_expr(THD_VARLEN):
+    # Logical padding must not enter either MMA: zero times a masked NaN V
+    # is still NaN, and trimmed Q rows must produce zero rather than NaN.
+    if cutlass.const_expr(THD_VARLEN or has_seq_len_q):
         q_valid_rows = eff_sq
-        kv_valid_rows = eff_skv
     else:
         q_valid_rows = None if cutlass.const_expr(is_even_mn) else sq_runtime
-        kv_valid_rows = None if cutlass.const_expr(is_even_mn) else skv_runtime
-    if cutlass.const_expr(PARAMS.paged_page_size):
+    if cutlass.const_expr(THD_VARLEN or has_seq_kv_lens or PARAMS.paged_page_size):
         kv_valid_rows = eff_skv
+    else:
+        kv_valid_rows = None if cutlass.const_expr(is_even_mn) else skv_runtime
     valid_cols = None if cutlass.const_expr(is_even_k) else d_runtime
     q_row_base_i = cutlass.Int32(q_row_base)
     load_tile_2d(
