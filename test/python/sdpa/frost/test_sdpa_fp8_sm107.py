@@ -2207,6 +2207,18 @@ class TestD192Lpt:
 @pytest.mark.L0
 @requires_dsl
 @requires_rubin
+class TestNativeClusterSplit:
+    """Run native regression coverage from the architecture CI entrypoint."""
+
+    import sdpa_cluster_split_sm107 as _checks
+
+    test_cluster_split_standalone_rebind_and_retained_replay = staticmethod(_checks.test_cluster_split_standalone_rebind_and_retained_replay)
+    test_cluster_split_graph_contract = staticmethod(_checks.test_cluster_split_graph_contract)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
 class TestD192PhysicalOrigins:
     """Independent Q/K/V/O/Stats offsets through the native CI entrypoint."""
 
@@ -2229,3 +2241,15 @@ class TestD64ThdSplit:
     test_origins_and_replay = staticmethod(_checks.test_origins_and_replay)
     test_proper_divisor_pack_replay = staticmethod(_checks.test_proper_divisor_pack_replay)
     test_standalone_compact_replay = staticmethod(_checks.test_standalone_compact_replay)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeScalarTailSplit:
+    """Run native regression coverage from the architecture CI entrypoint."""
+
+    import sdpa_scalar_tail_split as _checks
+
+    test_half_scalar_tail_explicit_candidate_admission = staticmethod(_checks.test_half_scalar_tail_explicit_candidate_admission)
+    test_half_scalar_tail_graph_overrides_and_replay = staticmethod(_checks.test_half_scalar_tail_graph_overrides_and_replay)
