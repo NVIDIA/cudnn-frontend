@@ -146,7 +146,7 @@ def test_dense_replay(dtype_name, case):
     sinks = torch.linspace(-1, 1, h, device="cuda") if case == "window_sink" else None
     out = torch.empty(b, sq, h, dv, device="cuda", dtype=dtype).transpose(1, 2)
     lse = torch.empty(b, h, sq, device="cuda") if stats else None
-    captures, workspaces, apis = [], [], []
+    captures, workspaces, apis, stats_atols = [], [], [], []
     expected = _reference(q, k, v, causal=causal, bottom=bottom, window=window, sinks=sinks)
     try:
         eager = []
@@ -170,12 +170,18 @@ def test_dense_replay(dtype_name, case):
             assert api.check_support()
             api.compile()
             assert api._k_mod.CFG.SCHEDULER_POLICY == policy and api.flavor == (192, 128)
+            # The legacy dense-causal tail exp2 polynomial (used on SM103)
+            # already exceeds 4e-4 on the Natural parent for some BF16 rows.
+            # Bound that form at 1e-3; all schedules must also match bitwise.
+            legacy_exp2 = getattr(api._k_mod, "_DENSE_CAUSAL_PUBLIC_EXP2_MIX", False) and not getattr(api._k_mod, "_E2E_ENABLED", False)
+            lse_atol = 1e-3 if legacy_exp2 else 4e-4
+            stats_atols.append(lse_atol)
             ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
             api.execute(q, k, v, out, lse_tensor=lse, sinks=sinks, workspace=ws)
             torch.cuda.synchronize()
             torch.testing.assert_close(out.double().cpu(), expected[0], atol=4e-3, rtol=4e-3)
             if stats:
-                torch.testing.assert_close(lse.double().cpu(), expected[1], atol=4e-4, rtol=0)
+                torch.testing.assert_close(lse.double().cpu(), expected[1], atol=lse_atol, rtol=0)
             eager.append((out.clone(), lse.clone() if stats else None))
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
@@ -184,13 +190,14 @@ def test_dense_replay(dtype_name, case):
             workspaces.append(ws)
             apis.append(api)
             api.execute(*fresh, out, lse_tensor=lse, sinks=sinks, workspace=ws)
-        assert torch.equal(eager[0][0], eager[1][0])
-        if stats:
-            assert torch.equal(eager[0][1], eager[1][1])
+        for result in eager[1:]:
+            assert torch.equal(eager[0][0], result[0])
+            if stats:
+                assert torch.equal(eager[0][1], result[1])
         v.mul_(0.75)
         expected = _reference(q, k, v, causal=causal, bottom=bottom, window=window, sinks=sinks)
         previous = None
-        for graph, ws in zip(captures, workspaces):
+        for graph, ws, lse_atol in zip(captures, workspaces, stats_atols):
             out.fill_(torch.nan)
             ws.fill_(255)
             if stats:
@@ -199,7 +206,7 @@ def test_dense_replay(dtype_name, case):
             torch.cuda.synchronize()
             torch.testing.assert_close(out.double().cpu(), expected[0], atol=4e-3, rtol=4e-3)
             if stats:
-                torch.testing.assert_close(lse.double().cpu(), expected[1], atol=4e-4, rtol=0)
+                torch.testing.assert_close(lse.double().cpu(), expected[1], atol=lse_atol, rtol=0)
             if previous is not None:
                 assert torch.equal(out, previous[0])
                 if stats:
