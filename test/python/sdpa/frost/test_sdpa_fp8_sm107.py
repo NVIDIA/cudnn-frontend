@@ -2176,3 +2176,15 @@ class TestNativeD64Half:
     test_dense_split_replay = staticmethod(_checks.test_native_d64_dense_split_replay)
     test_dense_unsplit_replay = staticmethod(_checks.test_native_d64_dense_unsplit_replay)
     test_standalone_compact_thd = staticmethod(_checks.test_native_d64_standalone_compact_thd)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeD192PagedHalf:
+    """Half paged regressions collected by the SM107 CI entrypoint."""
+
+    import native_d192_paged_sm107_test_utils as _checks
+
+    test_dense_replay = staticmethod(_checks.test_dense_replay)
+    test_independent_origins = staticmethod(_checks.test_independent_origins)

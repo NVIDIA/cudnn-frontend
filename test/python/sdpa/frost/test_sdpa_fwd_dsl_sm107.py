@@ -8772,6 +8772,43 @@ class TestNativeDenseStrides:
     test_gate_permutations = staticmethod(_native_gate_permutations)
 
 
+@pytest.mark.parametrize("thd", [False, True])
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("dims", [(192, 128), (160, 96)])
+def test_native_d192_paged_admission_boundaries(thd, packed, dims):
+    from cudnn.sdpa.fwd import engines
+
+    caps = _caps("sdpa_fwd_prefill_sm107")
+    facts = _f16_facts(
+        d_qk=dims[0],
+        d_v=dims[1],
+        thd=thd,
+        padded=True,
+        has_paged_kv=True,
+        page_size=16,
+        h_q=24,
+        h_kv=2,
+        has_sink=True,
+    )
+    knobs = engines.SdpaFwdKnobs(cga=2, split_kv=1, pack_gqa=packed)
+    reason = engines.mismatch(caps, facts, knobs)
+    # Ragged inputs retain their existing exact-native-width contract.
+    assert (reason is None) == (not thd or dims == (192, 128)), reason
+    for bad in (dataclasses.replace(knobs, cga=1), dataclasses.replace(knobs, split_kv=2)):
+        assert engines.mismatch(caps, facts, bad) is not None
+
+
+@pytest.mark.parametrize("thd,cga,splits", [(False, 2, 1), (True, 1, 2), (True, 2, 1)])
+def test_native_d192_paged_pack_keeps_nonpaged_decline(thd, cga, splits):
+    from cudnn.sdpa.fwd import engines
+
+    facts = _f16_facts(d_qk=192, d_v=128, thd=thd, padded=thd, h_q=16, h_kv=4)
+    caps = _caps("sdpa_fwd_prefill_sm107")
+    knobs = engines.SdpaFwdKnobs(cga=cga, split_kv=splits, pack_gqa=False)
+    assert engines.mismatch(caps, facts, knobs) is None
+    assert engines.mismatch(caps, facts, dataclasses.replace(knobs, pack_gqa=True)) is not None
+
+
 @pytest.mark.parametrize(
     "group,sq,packed,tile_n,cga,prefolded,expected",
     [

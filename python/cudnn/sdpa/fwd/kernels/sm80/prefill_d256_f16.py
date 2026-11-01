@@ -723,6 +723,8 @@ def _sdpa_kernel(
         kv_valid_rows = cutlass.Int32(arith.select((eff_skv < kv_capacity).ir_value(), eff_skv.ir_value(), kv_capacity.ir_value()))
     else:
         kv_valid_rows = None if cutlass.const_expr(is_even_mn) else skv_runtime
+    if cutlass.const_expr(PARAMS.paged_page_size):
+        kv_valid_rows = eff_skv
     valid_cols = None if cutlass.const_expr(is_even_k) else d_runtime
     q_row_base_i = cutlass.Int32(q_row_base)
     load_tile_2d(
