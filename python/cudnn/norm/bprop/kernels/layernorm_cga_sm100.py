@@ -48,7 +48,7 @@ from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from cudnn.norm.fprop.kernels.layernorm_cga_sm100 import _MAX_CGA, _pick_cga
-from cudnn.norm.utils import ws_bytes, ws_empty, ws_zeros, cur_stream, dyn, fake_stream, sm_count
+from cudnn.norm.utils import ws_bytes, ws_empty, cur_stream, fake_rows, fake_stream, ffi, sm_count
 
 from .layernorm_sm100 import _ln_bwd_finalize_kernel
 
@@ -404,25 +404,17 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, knobs=None
         nchunk = nclusters
     CHUNK = (nclusters + nchunk - 1) // nchunk
 
-    args = (
-        dyn(dy2d.reshape(-1)),
-        dyn(x2d.reshape(-1)),
-        dyn(dx.reshape(-1)),
-        dyn(gamma),
-        dyn(mean),
-        dyn(rstd),
-        dyn(dgp),
-        dyn(dbp),
-        dyn(dgamma),
-        dyn(dbeta),
-        cutlass.Int32(R),
-        cutlass.Int32(nclusters),
-    )
     ce = (C, CS, CGA, _BT, V, VPT, KS, it_ty, et, float(C), bool(spec.has_mean), has_beta, nclusters * CGA, FB, fgrid, nchunk, CHUNK, smem_bytes)
     key = (params.io_dtype, nclusters) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        fn = cute.compile(_ln_bwd_cga_host, *args, *ce, fake_stream())
+        io, stat, part = cute.sym_int(), cute.sym_int(), cute.sym_int()
+        f32 = cutlass.Float32
+        fakes = (fake_rows(et, rows=io), fake_rows(et, rows=io), fake_rows(et, rows=io), fake_rows(et, rows=C))
+        fakes += (fake_rows(f32, rows=stat), fake_rows(f32, rows=stat), fake_rows(f32, rows=part), fake_rows(f32, rows=part))
+        fakes += (fake_rows(f32, rows=C), fake_rows(f32, rows=C))
+        fn = cute.compile(_ln_bwd_cga_host, *fakes, cutlass.Int32(0), cutlass.Int32(0), *ce, fake_stream(), options="--enable-tvm-ffi")
         _KCACHE[key] = fn
-    fn(*args, cur_stream())
+    operands = (dy2d.reshape(-1), x2d.reshape(-1), dx.reshape(-1), gamma, mean, rstd, dgp, dbp, dgamma, dbeta)
+    fn(*(ffi(t) for t in operands), R, nclusters, cur_stream())
     return dx, dgamma, (dbeta if has_beta else None)

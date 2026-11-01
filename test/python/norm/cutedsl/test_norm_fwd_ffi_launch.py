@@ -4,7 +4,7 @@
 tensors bind directly (no per-call DLPack export), so the compile key must stay row-count free, autograd-tape operands
 must still be accepted, and a launch must land on torch's current stream.
 
-    pytest test/python/norm/cutedsl/test_frost_norm_fwd_ffi_launch.py
+    pytest test/python/norm/cutedsl/test_norm_fwd_ffi_launch.py
 """
 
 import pytest
