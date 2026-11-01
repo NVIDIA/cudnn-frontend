@@ -3381,3 +3381,15 @@ from native_forward_stride_cases import check_native_dense_permutations as _nati
 @requires_dsl
 class TestNativeDenseStrides:
     test_permutations = staticmethod(_native_dense_permutations)
+
+
+@pytest.mark.L0
+@requires_dsl
+@pytest.mark.skipif(_SM not in (100, 103), reason="native SM100/SM103; SM107 has its own CI entry")
+class TestNativeScalarTailSplit:
+    """Run native regression coverage from the architecture CI entrypoint."""
+
+    import sdpa_scalar_tail_split as _checks
+
+    test_half_scalar_tail_explicit_candidate_admission = staticmethod(_checks.test_half_scalar_tail_explicit_candidate_admission)
+    test_half_scalar_tail_graph_overrides_and_replay = staticmethod(_checks.test_half_scalar_tail_graph_overrides_and_replay)
