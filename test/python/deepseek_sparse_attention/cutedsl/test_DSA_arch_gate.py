@@ -45,7 +45,7 @@ def test_indexer_backward_declines_cc12(monkeypatch):
 @pytest.mark.parametrize(
     "cc,declined", [((8, 0), True), ((9, 0), False), ((10, 0), False), ((10, 3), False), ((11, 0), False), ((12, 0), True), ((12, 1), True)]
 )
-def test_score_recompute_arch_gate(monkeypatch, cc, declined):
+def test_score_recompute_capability_gate(monkeypatch, cc, declined):
     try:
         from cudnn.deepseek_sparse_attention.score_recompute import api
     except ImportError:
