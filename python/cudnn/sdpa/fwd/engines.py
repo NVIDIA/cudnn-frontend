@@ -335,7 +335,7 @@ class Capabilities:
     # padded-Q trim itself (a graph with per-batch Q lengths compiles the
     # SEQ_Q_LENS_PRESENT specialization), so there is no separate capability.
     padded_stats: bool = False
-    # s_q == 1 (decode-shaped) graphs; the SM80 prefill kernels are gated off.
+    # Whether the row serves s_q == 1 (decode-shaped) graphs.
     decode: bool = True
 
     # Escape hatch for kernels whose persistent multi-wave rescheduling is
@@ -1804,7 +1804,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 _synth_kv_padding(capabilities, facts)
                 and not native_fp8_padded_split
                 and not supports_scalar_kv_tail_split(
-                    (facts.d_qk, facts.d_v),
+                    (facts.d_qk, facts.d_v) if facts.is_fp8 or facts.is_mxfp8 else _selected_d_shape(capabilities, facts, knobs),
                     device_cc=facts.device_cc,
                     fp8=facts.is_fp8 or facts.is_mxfp8,
                     pertensor=facts.is_fp8,
@@ -2400,7 +2400,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         reason = capabilities.declaration_check(facts)
         if reason is not None:
             return reason
-    if facts.shape_overrides or _selected_d_shape(capabilities, facts, knobs) == SM100_NATIVE_D576_SHAPE:
+    if facts.shape_overrides or (capabilities.sm_lo in (100, 107) and _selected_d_shape(capabilities, facts, knobs) == SM100_NATIVE_D576_SHAPE):
         return _prepared_decline_reason(capabilities, facts, knobs.split_kv if knobs is not None else None)
     return None
 
@@ -3273,7 +3273,7 @@ def _sm107_mxfp8_spec() -> EngineSpec:
 def _sm80_spec() -> EngineSpec:
     """SM80 (A100) prefill row: lowers through ``lower_dsl_prefill`` onto the
     ``SdpaFwdDslSm80`` adapter (``fwd/api_dsl.py``), which owns kernel-flavor
-    selection (gptoss/llama/dsv3/qwen), native eight-aligned head-dim envelopes,
+    selection through the 576/512 envelope, native eight-aligned head dimensions,
     declared data strides, and per-shape kernel caching. Dense and packed THD
     graphs share the eight-aligned head-dim envelope. Dense graphs expose
     scheduler tuning; THD requires the natural 3-D grid."""
@@ -3286,7 +3286,7 @@ def _sm80_spec() -> EngineSpec:
             sm_lo=80,
             sm_hi=80,  # A100 exactly: the kernels assume its 164 KiB opt-in SMEM
             phase="prefill",
-            d_shapes=frozenset({(256, 256)}),  # flavor envelopes; masked native loads
+            d_shapes=frozenset({(256, 256), (512, 512), (576, 512)}),  # masked native loads
             d_pad_multiple=8,
             declaration_check=graph_mismatch,
             thd_d_shapes=None,  # logical widths reach the masked native packed host
@@ -3305,7 +3305,9 @@ def _sm80_spec() -> EngineSpec:
             stats=True,
             stats_log2=True,
             padded_stats=True,
-            decode=False,
+            # One live query uses the same predicated native forward body.
+            # Dense, THD and paged inputs retain their own addressing contracts.
+            decode=True,
             # The kernels implement the dense padded-Q trim natively
             # (per-batch ``seq_len_q`` forward kwarg): rows >= seq_len_q[b]
             # are written explicitly by the kernel (O := 0, LSE := -inf).

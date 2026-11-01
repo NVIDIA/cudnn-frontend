@@ -594,6 +594,7 @@ class PreparedThdLaunch:
 
 # Constants written at build, and slots the native dense binder writes per call.
 _FILLED_AT_BUILD_DENSE = frozenset(
+    "final_o_ptr final_lse_ptr final_o_strides final_lse_strides "
     "lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_q_lens_ptr thd_kv_lens_ptr thd_lens_form thd_origin_ptrs thd_origin_caps o_partial_ptr "
     "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr ragged_q_div "
     "score_max_ptr score_sum_exp_ptr score_max_strides score_sum_exp_strides "
@@ -726,6 +727,7 @@ class DenseLaunchSpec:
         "gate_expect",
         "split",
         "fp32_partial",
+        "fused_split",
         "combine",
         # The split sink combine takes the per-batch Q lengths (int32 (B,)) after the sink pointer: a plan with a split sink AND the dense padded-Q
         # trim (``seq_q_present``).  The combine cannot tell a padded query row from a valid keyless one without them (the native binder appends the
@@ -829,6 +831,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.paged_hnd = _declared_paged_hnd(api) if s.paged else False
     s.paged_v_hnd = _declared_paged_hnd(api, which_v=True) if s.paged else False
     s.split = int(api.split_kv)
+    s.fused_split = bool(getattr(api, "_cluster_combine", False))
     s.fp32_partial = bool(api._fp32_partial_split()) if s.split > 1 else False
     s.expect = {n: str(getattr(api, f"{n}_desc").dtype).split(".")[-1] for n in ("q", "k", "v", "o")}
     if s.split > 1:  # the main kernel writes the split-major partial slabs, in the partial dtype
@@ -913,34 +916,36 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
                 "cudnn.sdpa: a split attention sink over padded query lengths needs the native binder that passes them to the combine; rebuild the extension"
             )
 
-        # The combine kernel's FORM (a plan-time specialization: the declared B / H_q / S_q, the split and the plan's device,
-        # never a runtime value; _split_combine_decode_grid states the rule and reads the device the adapter recorded).
-        decode_grid = _split_combine_decode_grid(api, s.b, s.qh, s.s_q_max, s.split)
-        owner = split_combine.compile_ptr(
-            dtype_o=api._combine_dtype_tag(),
-            dtype_partial=api._partial_dtype_tag(),
-            has_lse=api.lse_desc is not None,
-            stats_log2=api.stats_log2,
-            ragged=s.ragged,
-            ragged_i64=s.ragged_i64,
-            ragged_q_lens=s.ragged_q_lens,
-            quantized=s.quant is not None,
-            has_amax=s.quant.has_amax if s.quant is not None else False,
-            has_scale_o=api._split_scale_o() if s.quant is not None else False,
-            has_scale_o_input=not (s.quant is not None and s.quant.sf_sizes),
-            gate=gate_in_combine,
-            dtype_gate=({"bfloat16": "bf16", "float16": "f16"}[gate_dtype] if gate_in_combine else None),
-            # The plan's programmatic-dependent-launch form reaches the combine too (the dense half entries; a split tile
-            # compiled with its griddepcontrol sites releases this pass early, and this pass waits before its first read).
-            **({"use_pdl": True} if getattr(api, "use_pdl", False) else {}),
-            decode_grid=decode_grid,
-            # Every admitted split sink is folded once over sink-free partials.
-            has_sink=bool(s.has_sink),
-            has_q_lens=s.combine_q_lens,
-        )
-        fn = positional_entry(owner)
-        if fn is None:
-            raise NotImplementedError("the split combine artifact exposes no positional tvm-ffi entry")
+        owner = fn = None
+        if not s.fused_split:
+            # The combine kernel's FORM (a plan-time specialization: the declared B / H_q / S_q, the split and the plan's device,
+            # never a runtime value; _split_combine_decode_grid states the rule and reads the device the adapter recorded).
+            decode_grid = _split_combine_decode_grid(api, s.b, s.qh, s.s_q_max, s.split)
+            owner = split_combine.compile_ptr(
+                dtype_o=api._combine_dtype_tag(),
+                dtype_partial=api._partial_dtype_tag(),
+                has_lse=api.lse_desc is not None,
+                stats_log2=api.stats_log2,
+                ragged=s.ragged,
+                ragged_i64=s.ragged_i64,
+                ragged_q_lens=s.ragged_q_lens,
+                quantized=s.quant is not None,
+                has_amax=s.quant.has_amax if s.quant is not None else False,
+                has_scale_o=api._split_scale_o() if s.quant is not None else False,
+                has_scale_o_input=not (s.quant is not None and s.quant.sf_sizes),
+                gate=gate_in_combine,
+                dtype_gate=({"bfloat16": "bf16", "float16": "f16"}[gate_dtype] if gate_in_combine else None),
+                # The plan's programmatic-dependent-launch form reaches the combine too (the dense half entries; a split tile
+                # compiled with its griddepcontrol sites releases this pass early, and this pass waits before its first read).
+                **({"use_pdl": True} if getattr(api, "use_pdl", False) else {}),
+                decode_grid=decode_grid,
+                # Every admitted split sink is folded once over sink-free partials.
+                has_sink=bool(s.has_sink),
+                has_q_lens=s.combine_q_lens,
+            )
+            fn = positional_entry(owner)
+            if fn is None:
+                raise NotImplementedError("the split combine artifact exposes no positional tvm-ffi entry")
         rows, sq, h, d = s.split * s.b, s.s_q_max, s.qh, s.d_v
         device = (_DLPACK_CUDA, s.device_index)
         combine_gate = CombineGate(fn, gate_dtype, (s.b, h, sq, d), device) if gate_in_combine else None
@@ -963,6 +968,10 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
         if name in s.index:
             t[s.index[name]] = value
 
+    put("final_o_ptr", None)
+    put("final_lse_ptr", None)
+    put("final_o_strides", (0, 0, 0))
+    put("final_lse_strides", (0, 0, 0))
     put("lse_strides", (0, 0, 0))
     put("lse_ext", 0)
     # Score side outputs: None / zero strides in the template; bind_dense fills the requested ones per call.
@@ -1588,6 +1597,11 @@ def bind_dense_split(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFact
     lse_partial_ptr = workspace_ptr + combine.lse_offset
     partials = dict(facts, o=combine.o._replace(ptr=workspace_ptr), lse=combine.lse._replace(ptr=lse_partial_ptr))
     frame = bind_dense(spec, partials, stream, stream_int)
+    if getattr(spec, "fused_split", False):
+        frame[spec.index["final_o_ptr"]] = o_ptr
+        frame[spec.index["final_lse_ptr"]] = lse_ptr
+        frame[spec.index["final_o_strides"]] = o_strides[:3]
+        frame[spec.index["final_lse_strides"]] = lse_strides
     combine_args = (
         workspace_ptr,
         lse_partial_ptr,
@@ -1715,7 +1729,8 @@ class PreparedDenseLaunch:
                 return  # ragged-Q leg: no addressable token / empty producer -> no launch
             frame, combine_args = bound
             self.spec.fn(*frame)
-            self.spec.combine.fn(*combine_args)
+            if not self.spec.fused_split:
+                self.spec.combine.fn(*combine_args)
         else:
             self.spec.fn(*bind_dense(self.spec, facts, stream, stream_int))
 

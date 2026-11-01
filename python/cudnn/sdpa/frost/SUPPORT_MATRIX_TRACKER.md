@@ -226,15 +226,20 @@ admission and lowering restrictions.
 
 ### Explicit scalar KV-tail split
 
-SM100/SM103/SM107 exact D128/V128 FP16/BF16 and per-tensor FP8 dense
-forward plans can explicitly combine split-KV with a mask-free, non-tile-aligned
-KV extent. The existing scalar-tail mask bounds each split; empty partitions
+SM100/SM103/SM107 FP16/BF16 dense forward plans using the D64/V64,
+D128/V128, D192/V128, D256/V256 and D512/V512 native flavors can explicitly
+combine split-KV with a mask-free, non-tile-aligned KV extent. Their existing
+logical head-dimension envelopes use the same scalar-tail mask. Per-tensor
+FP8 retains its exact D128/V128 domain here and its separately qualified
+native padded-split routes. The existing scalar-tail mask bounds each split; empty partitions
 emit the combine identity. No per-batch length tensor or execute-time staging
 is introduced. Native shape overrides may shrink KV within the declaration,
 with the requested O, Stats and FP8 Amax contracts preserved. CGA domains are
-unchanged (FP8 split uses CGA2). Other dimensions, MXFP8, dense padding and
+unchanged (FP8 split uses CGA2). Other flavors, MXFP8, dense padding and
 sink combinations retain their existing restrictions. Automatic scalar-tail
 selection remains unsplit pending independent tuning.
+This preserves the existing split-body domain: on SM107, dense half D256
+still requires its decode tile; its general prefill body remains unsplit.
 
 > **Keeping this current is a hard rule.** A change to any FROST SDPA
 > `Capabilities` row, or adding/retiring an `EngineSpec`, updates this file in
@@ -2683,13 +2688,17 @@ device-value preconditions cannot be host-validated without breaking capture.
 `test_sdpa_fwd_origins_sm80.py` covers independent origins, poisoned gaps,
 metadata rebinding and changed offsets/lengths under retained replay.
 
-Forward paged KV serves all four native flavors and their aligned logical head
+Forward paged KV serves all six native flavors and their aligned logical head
 envelopes, with dense or THD Q/O, independent HND/NHD pool strides and capacities,
 and independent K/V page-table strides. Page loads predicate both logical rows
 and head columns before reading the table. Paged pools cannot also carry ragged
 origins. No data staging or pool copies are used; THD retains its device lengths
 metadata launch. `test_sdpa_fwd_paged_sm80.py` covers native loading and binding.
-Paged backward and graph decode (`S_q == 1`) remain declined.
+Paged backward remains declined. Single-query forward graphs (`S_q == 1`)
+use the same predicated native prefill bodies, including dense, packed THD and
+paged KV. This is functional coverage, not a dedicated split/decode kernel or
+a claim that it leads the backend. `test_sdpa_fwd_single_q_sm80.py` checks
+empty Q/KV sequences, sink/bias/masks, independent origins and retained replay.
 
 Dense forward and backward admit head dimensions divisible by eight, within
 their existing flavor envelopes, and require every stepped data-port outer
@@ -2699,7 +2708,16 @@ gapped layouts and strided Stats directly; no gather/pad/scatter fallback is
 selected. Graph eligibility and standalone `check_support()` share the
 addressing contract and decline unsupported declarations before compilation.
 Dense and THD share the eight-aligned head-width envelope, with independent
-logical Q/K and V widths up to 256 in both directions. The covering backward
+logical Q/K and V widths up to 576/512 in forward and 256/256 in backward.
+Forward adds native512/512 and576/512 envelopes using a32-query,16-key,
+four-warp tile with two V-column partitions. Other explicit wide-head tile
+requests decline before compilation. These envelopes support dense, THD and
+paged inputs under the same feature restrictions as the smaller families;
+wide backward remains declined. `test_sdpa_fwd_wide_sm80.py` checks full
+reference outputs, independent origins, empty lengths, rebinding and replay.
+This is functional coverage; it does not establish a faster default route.
+The feature table below describes the original four forward/backward families.
+The covering backward
 MMA flavor retains its own ordered tile dimensions; logical widths need not
 satisfy D_QK >= D_V. THD retains its packed-layout constraints; its unused
 batch stride is ignored. Packed forward
@@ -2740,7 +2758,7 @@ early declines and legal dense/THD declarations without GPU allocation.
 | Deterministic | — / ✅ | — / ✅ | — / ✅ | — / ✅ |
 | Paged KV (dense / THD queries) | ✅ / ❌ | ✅ / ❌ | ✅ / ❌ | ✅ / ❌ |
 | Ragged `S_kv` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
-| Decode-shaped (`S_q == 1`) | ❌ / ❌ | ❌ / ❌ | ❌ / ❌ | ❌ / ❌ |
+| Decode-shaped (`S_q == 1`; existing native prefill body) | ✅ / ❌ | ✅ / ❌ | ✅ / ❌ | ✅ / ❌ |
 
 Native SM80 backward eight-aligned widths with 16-byte-aligned Q/K/V/O/dO and
 D-gradient bases and stepped outer strides divisible by eight elements use

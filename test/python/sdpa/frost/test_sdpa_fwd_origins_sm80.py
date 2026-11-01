@@ -21,11 +21,19 @@ pytestmark = [
 @pytest.mark.parametrize("d,dv", [(48, 32), (96, 80), (192, 128), (256, 256)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("token_major", [False, True])
-def test_independent_origins_rebind_replay(d, dv, dtype, token_major, cudnn_handle, monkeypatch, dense_o=False):
+def test_independent_origins_rebind_replay(d, dv, dtype, token_major, cudnn_handle, monkeypatch, dense_o=False, single_q=False):
     torch.manual_seed(812 + d)
     h, hk, capacity = 4, 2, 160
     graph, vp, nodes, _ = _make_graph(
-        (33, 0, 17), (41, 3, 23), h=h, hkv=hk, d=d, dv=dv, dtype=dtype, cu_lens=(d == 256), stats_layout="token_major" if token_major else "head_major"
+        (1, 0, 1) if single_q else (33, 0, 17),
+        (41, 3, 23),
+        h=h,
+        hkv=hk,
+        d=d,
+        dv=dv,
+        dtype=dtype,
+        cu_lens=(d == 256),
+        stats_layout="token_major" if token_major else "head_major",
     )
     q, k, v, o, stats = nodes
     ports = (q, k, v, o, stats)
@@ -93,7 +101,8 @@ def test_independent_origins_rebind_replay(d, dv, dtype, token_major, cudnn_hand
         capture = torch.cuda.CUDAGraph()
         graph_lifetimes.append(capture)
         try:
-            for phase, (ql, kl) in enumerate((((33, 0, 17), (41, 3, 23)), ((0, 25, 25), (26, 0, 41)))):
+            phases = (((1, 0, 1), (41, 3, 23)), ((0, 1, 1), (26, 0, 41))) if single_q else (((33, 0, 17), (41, 3, 23)), ((0, 25, 25), (26, 0, 41)))
+            for phase, (ql, kl) in enumerate(phases):
                 starts = [(tuple((3 + 2 * i, 48 + i, 85 - i)) if phase == 0 else tuple((6 + i, 50 - i, 91 + i))) for i in range(5)]
                 if dense_o:
                     starts[3] = (0, 48, 96)

@@ -2207,3 +2207,27 @@ class TestNativeD256PrefillHalfSplit:
     test_workspace_dtype = staticmethod(_workspace_dtype)
     test_replay = staticmethod(_replay)
     test_graph = staticmethod(_graph)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeClusterSplit:
+    """Run native regression coverage from the architecture CI entrypoint."""
+
+    import sdpa_cluster_split_sm107 as _checks
+
+    test_cluster_split_standalone_rebind_and_retained_replay = staticmethod(_checks.test_cluster_split_standalone_rebind_and_retained_replay)
+    test_cluster_split_graph_contract = staticmethod(_checks.test_cluster_split_graph_contract)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeScalarTailSplit:
+    """Run native regression coverage from the architecture CI entrypoint."""
+
+    import sdpa_scalar_tail_split as _checks
+
+    test_half_scalar_tail_explicit_candidate_admission = staticmethod(_checks.test_half_scalar_tail_explicit_candidate_admission)
+    test_half_scalar_tail_graph_overrides_and_replay = staticmethod(_checks.test_half_scalar_tail_graph_overrides_and_replay)
