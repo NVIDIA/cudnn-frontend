@@ -25,6 +25,8 @@ from .fusion_ir import (
     Dtype,
     FusionChain,
     FusionOp,
+    IndexExpr,
+    matrix_axis_index,
     MatmulSpec,
     ReductionSpec,
     TensorRef,
@@ -137,6 +139,7 @@ class _RecordedOp:
     group_offset: int | None = None
     permutation: tuple[int, ...] = ()
     reshape_mode: str = "VIEW_ONLY"
+    index_expr: IndexExpr | None = None
 
 
 @dataclass
@@ -471,7 +474,7 @@ def _node_to_recorded_op(node: Any) -> "_RecordedOp | None":
         )
     if node_type == "POINTWISE":
         out = node.outputs["OUT_0"]
-        attrs = tuple(sorted((k, float(v)) for k, v in node.params.items() if k in _POINTWISE_ATTR_KEYS and v is not None))
+        attrs = tuple(sorted((k, int(v) if k == "axis" else float(v)) for k, v in node.params.items() if k in _POINTWISE_ATTR_KEYS and v is not None))
         return _RecordedOp(
             node.params.get("mode"),
             name,
@@ -1032,9 +1035,11 @@ def _build_epilogue_dag(
     for next_op in ordered_ops:
         if next_op.cudnn_name in _UNARY_OP_MAP:
             (parent_id,) = next_op.inputs
-            if next_op.cudnn_name == "gen_index" and dict(next_op.op_attrs).get("axis") not in (1, 2):
+            if next_op.cudnn_name == "gen_index" and next_op.index_expr is None and dict(next_op.op_attrs).get("axis") not in (1, 2):
                 raise NotImplementedError(f"gen_index {next_op.op_name!r}: only axis 1 (M) or 2 (N) is supported " "in cudnn.gemm.frost")
-            fop = FusionOp(op=_UNARY_OP_MAP[next_op.cudnn_name], parent_idx=_operand_ref(parent_id, next_op.op_name), attrs=next_op.op_attrs)
+            fop = FusionOp(
+                op=_UNARY_OP_MAP[next_op.cudnn_name], parent_idx=_operand_ref(parent_id, next_op.op_name), attrs=next_op.op_attrs, index_expr=next_op.index_expr
+            )
         elif next_op.cudnn_name in _BINARY_OP_MAP:
             inp0, inp1 = next_op.inputs
             in0, in1 = _is_in_chain(inp0), _is_in_chain(inp1)
@@ -1722,19 +1727,13 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
         # untouched rank-3 slots on the general batch-fold path.
         matrix_views_required = (bool(structural) and not has_reshape) or output_dim != (prod(batch_shape), *output_dim[-2:])
         # Index attributes describe the original logical tensor, not the kernel
-        # ABI. Only the final two axes have a one-to-one folded coordinate.
+        # ABI. Decode batch digits before applying the operation compute dtype.
         normalized_ops = []
         for op in ops:
             if op.cudnn_name == "gen_index":
-                rank = len(ranked_shapes[op.inputs[0]])
+                dim = ranked_shapes[op.inputs[0]]
                 axis = dict(op.op_attrs).get("axis")
-                if axis not in (rank - 2, rank - 1):
-                    raise NotImplementedError(
-                        f"gen_index {op.op_name!r}: batch axis {axis} is unsupported; "
-                        f"only logical matrix axes {rank - 2} (M) and {rank - 1} (N) are supported"
-                    )
-                attrs = tuple((key, axis - rank + 3 if key == "axis" else value) for key, value in op.op_attrs)
-                op = replace(op, op_attrs=attrs)
+                op = replace(op, index_expr=matrix_axis_index(dim, axis))
             normalized_ops.append(op)
         ops = normalized_ops
         for tid, m in list(meta.items()):

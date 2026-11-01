@@ -20,11 +20,11 @@ from cudnn.engines import ExecutionContext
 from cudnn.gemm.frost.engine import _FrostGemmPlan
 from cudnn.gemm.frost.layouts import fold_batch_layout
 from cudnn.frost.buffers import DeviceView, dtype_name
-from cudnn.gemm.frost.fusion_ir import swap_ab
+from cudnn.gemm.frost.fusion_ir import Axis, matrix_axis_index, swap_ab
 from cudnn.gemm.frost.graph_analyzer import analyze, analyze_with_binding, resolve_variant_pack, swap_ab_binding
 from cudnn.gemm.frost.sm100 import compiler, epilogue_codegen
 from cudnn.gemm.frost.tile_config import by_name
-from gemm_test_utils import requires_sm100
+from gemm_test_utils import requires_sm100, requires_sm120
 
 BF16, F32 = cudnn.data_type.BFLOAT16, cudnn.data_type.FLOAT
 
@@ -918,36 +918,42 @@ def test_frost_matrix_batch_native_geometry(shape, stride):
         assert folded.dtype == value.dtype and folded.element_size() == value.element_size()
 
 
-@pytest.mark.parametrize("prefix", [(), (1,), (2, 3), (2, 1, 3)])
-@pytest.mark.parametrize("matrix_axis", [0, 1])
+@pytest.mark.parametrize("prefix,axis", [(p, a) for p in [(), (1,), (2, 3), (2, 1, 3)] for a in range(len(p) + 2)])
 @pytest.mark.parametrize("side", ["", "ab"])
 @pytest.mark.L0
-def test_frost_matrix_gen_index_axes(prefix, matrix_axis, side):
-    """Logical row/column coordinates survive rank folding and swap-AB."""
-    axis = len(prefix) + matrix_axis
+def test_frost_matrix_gen_index_axes(prefix, axis, side):
+    """Every logical coordinate survives rank folding and swap-AB without graph mutation."""
     g, _ = _graph(prefix=prefix, side=side, index_axis=axis)
     original = [dict(node.params) for node in g._nodes]
     chain = analyze(g)
     index = next(op for op in chain.ops if op.op == "gen_index")
-    assert dict(index.attrs)["axis"] == matrix_axis + 1
+    assert dict(index.attrs)["axis"] == axis
+    assert index.index_expr == matrix_axis_index((*prefix, 128, 192), axis)
     swapped = next(op for op in swap_ab(chain).ops if op.op == "gen_index")
-    assert dict(swapped.attrs)["axis"] == 2 - matrix_axis
+    assert dict(swapped.attrs)["axis"] == axis
+    assert swapped.index_expr.evaluate({Axis.BATCH: 0, Axis.M: 19, Axis.N: 13}) == index.index_expr.evaluate({Axis.BATCH: 0, Axis.M: 13, Axis.N: 19})
+    assert next(op for op in swap_ab(swap_ab(chain)).ops if op.op == "gen_index") == index
     assert original == [dict(node.params) for node in g._nodes]
+    from cudnn.gemm.frost.sm120 import compiler as sm120_compiler, epilogue_codegen as sm120_epilogue
+
     for config_swapped in (False, True):
         current = swap_ab(chain) if config_swapped else chain
-        snippets = epilogue_codegen.generate(
-            current, vec_bytes_epi=16, output_elem_bytes=2, tma_slots=compiler._tma_slots_for(current, _config(config_swapped))
-        )
-        ast.parse(compiler._render_template(current, snippets, _config(config_swapped)))
-
-
-@pytest.mark.parametrize("prefix,axis", [((1,), 0), ((2, 3), 0), ((2, 3), 1), ((2, 1, 3), 1), ((2, 1, 3), 2)])
-@pytest.mark.L0
-def test_frost_matrix_gen_index_batch_axis_rejected(prefix, axis):
-    """A flattened batch coordinate cannot stand in for a logical batch axis."""
-    g, _ = _graph(prefix=prefix, index_axis=axis)
-    with pytest.raises(NotImplementedError, match="gen_index.*batch axis"):
-        analyze(g)
+        for slices in (1, 2):
+            config = replace(_config(config_swapped), split_k_slices=slices)
+            for force_stg in (False, True):
+                with compiler.force_stg_epi(force_stg):
+                    slots = frozenset({0}) if config.workspace_split_k and not force_stg else compiler._tma_slots_for(current, config)
+                    snippets = epilogue_codegen.generate(
+                        current, vec_bytes_epi=16, output_elem_bytes=2, tma_slots=slots, workspace_split_k=config.workspace_split_k
+                    )
+                    ast.parse(compiler._render_template(current, snippets, config))
+            # The SM120 STG and split-K routes consume the shared coordinate IR.
+            config = replace(by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"), swap_ab=config_swapped, split_k_slices=slices)
+            snippets = sm120_epilogue.generate(current, vec_bytes_epi=16, output_elem_bytes=2, workspace_split_k=config.workspace_split_k)
+            if current.has_mainloop_fusion:
+                ast.parse(snippets.epilogue)  # SM120 has no operand pointwise template.
+            else:
+                ast.parse(sm120_compiler._render_template(current, snippets, config))
 
 
 @pytest.mark.parametrize("prefix", [(1,), (2,)])
@@ -978,51 +984,73 @@ def test_frost_matrix_identity_recipe_fast_path(monkeypatch, prefix):
     assert len(launches) == 2
 
 
-def _graph_coordinate_pack(graph, tensors, buffers):
+def _graph_coordinate_pack(graph, tensors, buffers, workspace=None):
     """Declare live caller shapes/strides explicitly for native graph binding."""
     return graph._normalize(
         {t.get_uid(): buffers[key] for key, t in tensors.items()},
-        None,
+        workspace,
         [t.get_uid() for t in tensors.values()],
         [list(buffers[key].shape) for key in tensors],
         [list(buffers[key].stride()) for key in tensors],
     )
 
 
-# Keep the original rank-2/rank-4 P1 probes and both failing rank-3 controls
-# in L0, with swapped and higher-rank representatives. Preserve all 16 cases.
+# Preserve the original wrong-axis controls and add logical batch-axis probes.
 _GEN_INDEX_GPU_L0 = {
     ((), 1, False),
     ((1,), 0, False),
     ((1,), 1, False),
+    ((1,), 2, False),
+    ((2, 3), 2, False),
+    ((2, 3), 3, True),
+    ((2, 1, 3), 3, True),
     ((2, 3), 0, False),
     ((2, 3), 1, True),
-    ((2, 1, 3), 0, True),
+    ((2, 1, 3), 1, False),
+    ((2, 1, 3), 2, True),
 }
 
 
-@requires_sm100
 @pytest.mark.parametrize(
-    "prefix,matrix_axis,swapped",
+    "prefix,axis,swapped,route",
     [
-        pytest.param(p, a, s, marks=pytest.mark.L0 if (p, a, s) in _GEN_INDEX_GPU_L0 else pytest.mark.L1)
-        for p, a, s in product([(), (1,), (2, 3), (2, 1, 3)], [0, 1], [False, True])
+        pytest.param(p, a, s, "sm100", marks=[requires_sm100, pytest.mark.L0 if (p, a, s) in _GEN_INDEX_GPU_L0 else pytest.mark.L1])
+        for p in [(), (1,), (2, 3), (2, 1, 3)]
+        for a in range(len(p) + 2)
+        for s in (False, True)
+    ]
+    + [
+        pytest.param(
+            p, a, s, route, marks=[requires_sm120 if route == "sm120" else requires_sm100, pytest.mark.L0 if route == "sm120" and a < 2 else pytest.mark.L1]
+        )
+        for route in ("sm100_stg", "sm100_split", "sm120")
+        for p, a, s in [((2, 3), 0, False), ((2, 3), 1, True), ((2, 1, 3), 4, True)]
     ],
 )
-def test_frost_matrix_gen_index_gpu(prefix, matrix_axis, swapped):
-    """Check actual logical indices, dynamic shapes and changed-input capture replay."""
-    dtype = BF16 if matrix_axis == 0 else cudnn.data_type.HALF
+def test_frost_matrix_gen_index_gpu(prefix, axis, swapped, route):
+    """Check logical indices, dynamic shapes and changed-input capture on both families."""
+    dtype = BF16 if axis % 2 == 0 else cudnn.data_type.HALF
     tdtype = torch.bfloat16 if dtype == BF16 else torch.float16
-    side = "ab" if swapped else ""
-    g, tensors = _graph(prefix=prefix, side=side, dtype=dtype, index_axis=len(prefix) + matrix_axis)
-    plan = compiler.jit_from_cudnn_graph(g, _config(swapped))
+    side = "ab" if swapped and route != "sm120" else ""
+    g, tensors = _graph(prefix=prefix, side=side, dtype=dtype, index_axis=axis)
+    if route == "sm120":
+        from cudnn.gemm.frost.sm120 import compiler as backend
+
+        config = replace(by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"), swap_ab=swapped)
+        plan = backend.jit_from_cudnn_graph(g, config)
+    else:
+        config = replace(_config(swapped), split_k_slices=2 if route == "sm100_split" else 1)
+        with compiler.force_stg_epi(route == "sm100_stg"):
+            plan = compiler.jit_from_cudnn_graph(g, config)
     engine = _FrostGemmPlan(plan)
     stream = torch.cuda.Stream()
     for m, n, k in ((128, 192, 136), (160, 224, 264)):
         buffers = _buffers(tensors, m, n, k, device="cuda", dtype=tdtype)
         buffers["a"].zero_()
         buffers["b"].zero_()
-        pack = _graph_coordinate_pack(g, tensors, buffers)
+        size = engine.get_workspace_size_for_shapes([t.get_uid() for t in tensors.values()], [list(buffers[key].shape) for key in tensors])
+        workspace = torch.empty(size, device="cuda", dtype=torch.uint8) if size else None
+        pack = _graph_coordinate_pack(g, tensors, buffers, workspace)
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             engine.execute(g, pack, ExecutionContext(stream=stream.cuda_stream))
@@ -1041,8 +1069,11 @@ def test_frost_matrix_gen_index_gpu(prefix, matrix_axis, swapped):
                     buffers["y"].fill_(float("nan"))
                     captured.replay()
                 stream.synchronize()
-                index = torch.arange(m if matrix_axis == 0 else n, device="cuda", dtype=torch.float32)
-                index = index.reshape((m, 1) if matrix_axis == 0 else (1, n))
+                shape = (*prefix, m, n)
+                index = torch.arange(shape[axis], device="cuda", dtype=torch.float32)
+                view_shape = [1] * len(shape)
+                view_shape[axis] = shape[axis]
+                index = index.reshape(view_shape)
                 expected = (index + k * fill * fill).expand(*prefix, m, n).to(tdtype)
                 torch.testing.assert_close(buffers["y"], expected, atol=0, rtol=0)
                 previous = buffers["y"].clone()
@@ -1110,12 +1141,11 @@ def test_frost_matrix_view_zero_batch_stride_remains_rejected(prefix, side):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("prefix", [(), (1,), (2, 3), (2, 1, 3)])
-@pytest.mark.parametrize("matrix_axis", [0, 1])
+@pytest.mark.parametrize("prefix,axis", [(p, a) for p in [(), (1,), (2, 3), (2, 1, 3)] for a in range(len(p) + 2)])
 @pytest.mark.parametrize("swapped", [False, True])
-def test_frost_matrix_gen_index_graph_binding(monkeypatch, prefix, matrix_axis, swapped):
+def test_frost_matrix_gen_index_graph_binding(monkeypatch, prefix, axis, swapped):
     """Bind both dynamic shapes in explicit graph coordinates before kernel entry."""
-    g, tensors = _graph(prefix=prefix, side="ab" if swapped else "", index_axis=len(prefix) + matrix_axis)
+    g, tensors = _graph(prefix=prefix, side="ab" if swapped else "", index_axis=axis)
     plan, launches = _mock_plan(monkeypatch, g, swapped)
     engine = _FrostGemmPlan(plan)
     for m, n, k in ((128, 192, 136), (160, 224, 264)):
@@ -1127,6 +1157,15 @@ def test_frost_matrix_gen_index_graph_binding(monkeypatch, prefix, matrix_axis, 
         for index, (key, extent) in enumerate((("b", n), ("a", m)) if swapped else (("a", m), ("b", n)), 1):
             assert tuple(frame[index].shape) == (extent, k, prod(prefix))
             assert frame[index].data_ptr() == buffers[key].data_ptr()
+    if len(prefix) > 1 and prod(prefix) > 1:
+        # Same flattened count is insufficient: logical batch digits are fixed.
+        bad = dict(buffers)
+        bad["a"] = buffers["a"].reshape(*reversed(prefix), *buffers["a"].shape[-2:])
+        before = len(launches)
+        buffers["y"].fill_(123)
+        with pytest.raises(ValueError, match="original batch axes"):
+            engine.execute(g, _graph_coordinate_pack(g, tensors, bad), ExecutionContext(stream=0))
+        assert len(launches) == before and torch.all(buffers["y"] == 123)
 
 
 @pytest.mark.L0

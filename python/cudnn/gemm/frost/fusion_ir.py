@@ -8,6 +8,8 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from math import prod
+from operator import index
 from typing import Literal
 
 Dtype = Literal[
@@ -53,6 +55,125 @@ class Axis(Enum):
     K = auto()
     BATCH = auto()
     GROUP = auto()
+
+
+@dataclass(frozen=True)
+class IndexExpr:
+    """Nonnegative Int64 coordinate expression, independent of codegen names.
+
+    Constants, axis references, floor division and remainder are sufficient for
+    rank folding. Divisors are positive constants in this initial vocabulary;
+    this does not introduce symbolic reshape dimensions or runtime shape guesses.
+    """
+
+    op: Literal["constant", "axis", "floor_div", "mod"]
+    value: int | Axis
+    operand: IndexExpr | None = None
+
+    def __post_init__(self):
+        if self.op == "axis":
+            if not isinstance(self.value, Axis) or self.operand is not None:
+                raise ValueError("index axis requires an Axis and no operand")
+        elif self.op in ("constant", "floor_div", "mod"):
+            value = index(self.value)
+            object.__setattr__(self, "value", value)
+            if not 0 <= value <= (1 << 63) - 1:
+                raise ValueError("index expression constant exceeds nonnegative Int64")
+            if self.op == "constant":
+                if self.operand is not None:
+                    raise ValueError("index constant takes no operand")
+            elif value == 0 or not isinstance(self.operand, IndexExpr):
+                raise ValueError("index division requires a positive divisor and an expression operand")
+        else:
+            raise ValueError(f"unsupported index expression {self.op!r}")
+
+    @classmethod
+    def coordinate(cls, axis):
+        return cls("axis", axis)
+
+    @classmethod
+    def constant(cls, value):
+        return cls("constant", value)
+
+    def floor_div(self, divisor):
+        divisor = index(divisor)
+        if not 0 < divisor <= (1 << 63) - 1:
+            raise ValueError("index division requires a positive Int64 divisor")
+        if divisor == 1:
+            return self
+        if self.op == "constant":
+            return self.constant(self.value // divisor)
+        return IndexExpr("floor_div", divisor, self)
+
+    def modulo(self, divisor):
+        divisor = index(divisor)
+        if not 0 < divisor <= (1 << 63) - 1:
+            raise ValueError("index remainder requires a positive Int64 divisor")
+        if divisor == 1:
+            return self.constant(0)
+        if self.op == "constant":
+            return self.constant(self.value % divisor)
+        return IndexExpr("mod", divisor, self)
+
+    @property
+    def axes(self):
+        return frozenset((self.value,)) if self.op == "axis" else self.operand.axes if self.operand is not None else frozenset()
+
+    def substitute(self, coordinates):
+        """Compose coordinate maps structurally, never by editing source strings."""
+        if self.op == "axis":
+            replacement = coordinates.get(self.value, self)
+            if not isinstance(replacement, IndexExpr):
+                raise ValueError("index substitution requires expression values")
+            return replacement
+        if self.operand is None:
+            return self
+        operand = self.operand.substitute(coordinates)
+        return operand.floor_div(self.value) if self.op == "floor_div" else operand.modulo(self.value)
+
+    def evaluate(self, coordinates):
+        """Independent host evaluator for index-map/reference checks."""
+        if self.op == "axis":
+            value = index(coordinates[self.value])
+        elif self.op == "constant":
+            value = self.value
+        else:
+            operand = self.operand.evaluate(coordinates)
+            value = operand // self.value if self.op == "floor_div" else operand % self.value
+        if not 0 <= value <= (1 << 63) - 1:
+            raise ValueError("index coordinate exceeds nonnegative Int64")
+        return value
+
+    def render(self, coordinates):
+        """Render through a lowering-owned Axis-to-code map; no eval or parsing."""
+        if self.op == "axis":
+            return coordinates[self.value]
+        if self.op == "constant":
+            return str(self.value)
+        operand = self.operand.render(coordinates)
+        return f"({operand} {'//' if self.op == 'floor_div' else '%'} {self.value})"
+
+
+def matrix_axis_index(shape, axis):
+    """Map a logical rank-N matrix axis to folded (batch, M, N) coordinates.
+
+    Batch extents are prepared constants, matching the existing fixed-prefix
+    binding contract. Matrix coordinates remain dynamic; no M/N value is baked.
+    """
+    shape, axis = tuple(map(index, shape)), index(axis)
+    if len(shape) < 2 or any(d <= 0 for d in shape) or not 0 <= axis < len(shape):
+        raise ValueError(f"gen_index requires positive matrix dimensions and a valid logical axis; got shape={shape}, axis={axis}")
+    if max(prod(shape[:-2]), *shape) > (1 << 63) - 1:
+        raise ValueError("gen_index batch geometry exceeds Int64")
+    if axis == len(shape) - 2:
+        return IndexExpr.coordinate(Axis.M)
+    if axis == len(shape) - 1:
+        return IndexExpr.coordinate(Axis.N)
+    if shape[axis] == 1:
+        return IndexExpr.constant(0)
+    coordinate = IndexExpr.coordinate(Axis.BATCH).floor_div(prod(shape[axis + 1 : -2]))
+    # The leading batch axis has no higher digits to discard.
+    return coordinate if axis == 0 else coordinate.modulo(shape[axis])
 
 
 ReductionMode = Literal["add", "amax", "max", "min", "avg", "mul", "mul_no_zeros", "norm1", "norm2"]
@@ -359,6 +480,7 @@ class FusionOp:
     attrs: tuple[tuple[str, float], ...] = ()  # scalar attrs (negative_slope/clips/swish_beta/axis)
     compute_dtype: Dtype = "fp32"
     out_dtype: Dtype = "fp32"
+    index_expr: IndexExpr | None = None
 
     def __post_init__(self) -> None:
         if self.op not in ALL_OPS:
@@ -367,6 +489,11 @@ class FusionOp:
             raise ValueError(f"op {self.op!r}: compute_data_type {self.compute_dtype!r} is not " f"supported — expected one of {COMPUTE_DTYPES}.")
         if self.out_dtype not in SUPPORTED_DTYPES:
             raise ValueError(f"op {self.op!r}: unsupported out_dtype {self.out_dtype!r}; " f"expected one of {SUPPORTED_DTYPES}")
+        if self.index_expr is not None:
+            if self.op != "gen_index" or not isinstance(self.index_expr, IndexExpr):
+                raise ValueError("only gen_index can carry a coordinate expression")
+            if not self.index_expr.axes <= {Axis.BATCH, Axis.M, Axis.N}:
+                raise ValueError("epilogue index expression may reference only batch, M and N")
         if self.op == "aux_load":
             if self.aux is None:
                 raise ValueError("aux_load requires an aux tensor name")
@@ -847,6 +974,8 @@ def swap_ab(chain: FusionChain) -> FusionChain:
         return {"per_row": "per_col", "per_col": "per_row"}.get(mode, mode)
 
     def _op(op):
+        if op.index_expr is not None:
+            return dataclasses.replace(op, index_expr=op.index_expr.substitute({Axis.M: IndexExpr.coordinate(Axis.N), Axis.N: IndexExpr.coordinate(Axis.M)}))
         attrs = tuple((key, 3 - value if key == "axis" and value in (1, 2) else value) for key, value in op.attrs)
         return dataclasses.replace(op, attrs=attrs) if attrs != op.attrs else op
 

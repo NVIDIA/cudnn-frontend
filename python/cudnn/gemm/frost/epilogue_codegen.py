@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 
 from .arch_family import active_family
 from .dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS, _allowed_vsize, dense_output_layout
-from .fusion_ir import BlockQuantizeSpec, Dtype, FusionChain, FusionOp, MoeSwapAbSpec, ReductionSpec, TensorRef, gemm_index, is_gemm_source
+from .fusion_ir import Axis, BlockQuantizeSpec, Dtype, FusionChain, FusionOp, MoeSwapAbSpec, ReductionSpec, TensorRef, gemm_index, is_gemm_source
 
 
 @dataclass(frozen=True)
@@ -339,6 +339,18 @@ def _emit_op(
         axis = dict(op.attrs).get("axis")
         # An int32-compute index comes straight from the Int32 coordinate: Float32 rounds indices above 2**24.
         idx_t = DTYPE_TO_CUTLASS[op.compute_dtype]
+        if op.index_expr is not None:
+
+            def coordinate(col):
+                return op.index_expr.render({Axis.BATCH: "cutlass.Int64(tile_l)", Axis.M: "cutlass.Int64(row)", Axis.N: f"cutlass.Int64({col})"})
+
+            if Axis.N not in op.index_expr.axes:
+                return [f"{new} = cutlass.full_like({prev}, {idx_t}({coordinate('col_j')}))"], new
+            gl = [f"_gi{idx} = cute.make_rmem_tensor({vsize}, {idx_t})"]
+            for k in range(vsize):
+                _, col = _elem_coord(k)
+                gl.append(f"_gi{idx}[{k}] = {idx_t}({coordinate(col)})")
+            return gl + [f"{new} = _gi{idx}.load().to_vector()"], new
         if axis == 1:
             return [f"{new} = cutlass.full_like({prev}, {idx_t}(row))"], new
         gl = [f"_gi{idx} = cute.make_rmem_tensor({vsize}, {idx_t})"]
