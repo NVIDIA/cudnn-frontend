@@ -6831,8 +6831,12 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self.flavor = _sm80_pick_flavor(d_qk, d_v)
         self.flavor_d_qk, self.flavor_d_v = _SM80_FLAVOR_DIMS[self.flavor]
         tile_m_default, num_warps_default, tile_n_default = _SM80_FLAVOR_KNOBS[self.flavor]
+        # Short dense D128 queries need only half of the 128-row CTA. Keep
+        # sixteen rows per warp and leave explicit TILE_M requests intact.
+        if not self.thd and d_qk == d_v == 128 and s_qo <= 64:
+            tile_m_default = 64
         self.kernel_tile_m = tile_m_default if self.tile_m is None else int(self.tile_m)
-        self.kernel_num_warps = num_warps_default
+        self.kernel_num_warps = 4 if self.flavor == "llama" and self.kernel_tile_m == 64 else num_warps_default
         self.kernel_tile_n = tile_n_default if self.tile_n is None else int(self.tile_n)
         self._value_error_if(
             self.cga not in (None, 1),
