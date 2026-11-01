@@ -26,7 +26,7 @@ import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
-from cudnn.norm.utils import ws_bytes, ws_empty, ws_zeros, cur_stream, dyn, fake_stream, smem_capacity
+from cudnn.norm.utils import ws_bytes, ws_empty, ws_zeros, cur_stream, fake_rows, fake_stream, ffi, smem_capacity
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from cudnn.norm._common_sm100 import (
     affine_gamma,
@@ -951,14 +951,14 @@ def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg
         nchunk = ctas
     CHUNK = (ctas + nchunk - 1) // nchunk
 
-    args = (dyn(dy2d), dyn(x2d), dyn(dx), dyn(gamma), dyn(mean), dyn(rstd), dyn(dgp), dyn(dbp), dyn(dgamma), dyn(dbeta), cutlass.Int32(R), cutlass.Int32(ctas))
     ce = (C, V, tpr, wn, ldgs, block_threads, et, it_ty, eb, STAGES, cache_xd, spec.has_mean, has_beta, FB, fgrid, nchunk, CHUNK, smem_bytes)
     key = ("pipe", params.io_dtype) + ce
     fn = _KPIPE.get(key)
     if fn is None:
-        fn = cute.compile(_ln_bwd_pipe_host, *args, *ce, fake_stream())
+        fakes = _fakes(et, C, ("io", "io", "io", "g", "stat", "stat", "part", "part", "dg", "dg"))
+        fn = cute.compile(_ln_bwd_pipe_host, *fakes, cutlass.Int32(0), cutlass.Int32(0), *ce, fake_stream(), options="--enable-tvm-ffi")
         _KPIPE[key] = fn
-    fn(*args, cur_stream())
+    fn(ffi(dy2d), ffi(x2d), ffi(dx), ffi(gamma), ffi(mean), ffi(rstd), dgp, dbp, ffi(dgamma), ffi(dbeta), R, ctas, cur_stream())
     return dx, dgamma, (dbeta if has_beta else None)
 
 
@@ -996,14 +996,14 @@ def _backward_tiled(spec, dy2d, x2d, gamma, rstd, *, params, wcfg, out_dx=None, 
     CHUNK = (ctas + nchunk - 1) // nchunk
     smem_bytes = 2 * STAGES * RPT * C * eb + C * eb + (2 * STAGES + 1) * 8 + 64
 
-    args = (dyn(dy2d), dyn(x2d), dyn(dx), dyn(gamma), dyn(rstd), dyn(dgp), dyn(dgamma), cutlass.Int32(R), cutlass.Int32(ctas))
     ce = (C, V, tpr, ldgs, RPT, et, it_ty, eb, STAGES, FB, fgrid, nchunk, CHUNK, smem_bytes)
     key = ("tiled", params.io_dtype) + ce
     fn = _KTILED.get(key)
     if fn is None:
-        fn = cute.compile(_ln_bwd_tiled_host, *args, *ce, fake_stream())
+        fakes = _fakes(et, C, ("io", "io", "io", "g", "stat", "part", "dg"))
+        fn = cute.compile(_ln_bwd_tiled_host, *fakes, cutlass.Int32(0), cutlass.Int32(0), *ce, fake_stream(), options="--enable-tvm-ffi")
         _KTILED[key] = fn
-    fn(*args, cur_stream())
+    fn(ffi(dy2d), ffi(x2d), ffi(dx), ffi(gamma), ffi(rstd), dgp, ffi(dgamma), R, ctas, cur_stream())
     return dx, dgamma, None
 
 
@@ -1017,6 +1017,22 @@ def _sm_count():
 
 
 _KCACHE = {}
+
+
+def _fakes(et, C, roles):
+    """Compile-time placeholders for a launch's tensor operands, in order: ``"io"`` a ``[R, C]`` row block,
+    ``"g"`` the ``[C]`` gamma, ``"stat"`` a ``[R]`` fp32 statistic, ``"part"`` a fp32 partial buffer, ``"dg"`` a ``[C]``
+    fp32 gradient. R and the partial length are dynamic symbols, so one artifact serves every row count."""
+    rows, parts = cute.sym_int(), cute.sym_int()
+    make = {
+        "io": lambda: fake_rows(et, C, rows=rows),
+        "g": lambda: fake_rows(et, rows=C),
+        "stat": lambda: fake_rows(cutlass.Float32, rows=rows),
+        "part": lambda: fake_rows(cutlass.Float32, rows=parts),
+        "dg": lambda: fake_rows(cutlass.Float32, rows=C),
+    }
+    return [make[r]() for r in roles]
+
 
 # The plain route's dgamma / dbeta atomics: every one of R rows adds into the same M addresses, so a tall backward
 # serializes on them (C = 96: 1.08 ms at 130k rows where the native backend takes 0.15). Spread the rows over slots of
@@ -1111,32 +1127,22 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_d
         fgrid = (M + FB - 1) // FB
         nchunk = min(nslots, max(1, min(32, 256 // fgrid)))
         CHUNK = (nslots + nchunk - 1) // nchunk
-        args = (dyn(dy2d), dyn(x2d), dyn(gamma), dyn(mean), dyn(rstd), dyn(dx), dyn(dgp), dyn(dbp), dyn(dgamma), dyn(dbeta), cutlass.Int32(spec.R))
         ce = (M, cfg.V, cfg.block_threads, cfg.elem_bytes, cfg.stage_mode, cfg.vec, spec.has_mean, has_beta, nslots, FB, fgrid, nchunk, CHUNK)
         key = ("slots", params.io_dtype) + ce
         fn = _KCACHE.get(key)
         if fn is None:
-            fn = cute.compile(_ln_bwd_slots_host, *args, *ce, fake_stream())
+            fakes = _fakes(DTYPE_TO_CUTLASS[params.io_dtype], M, ("io", "io", "g", "stat", "stat", "io", "part", "part", "dg", "dg"))
+            fn = cute.compile(_ln_bwd_slots_host, *fakes, cutlass.Int32(0), *ce, fake_stream(), options="--enable-tvm-ffi")
             _KCACHE[key] = fn
-        fn(*args, cur_stream())
+        fn(ffi(dy2d), ffi(x2d), ffi(gamma), ffi(mean), ffi(rstd), ffi(dx), dgp, dbp, ffi(dgamma), ffi(dbeta), spec.R, cur_stream())
         return dx, dgamma, (dbeta if has_beta else None)
 
-    args = (
-        dyn(dy2d),
-        dyn(x2d),
-        dyn(gamma),
-        dyn(mean),
-        dyn(rstd),
-        dyn(dx),
-        dyn(dgamma),
-        dyn(dbeta),
-        cutlass.Int32(spec.R),
-    )
     ce = (spec.M, cfg.V, cfg.block_threads, cfg.elem_bytes, cfg.stage_mode, cfg.vec, spec.has_mean, has_beta)
     key = (params.io_dtype,) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        fn = cute.compile(_ln_bwd_host, *args, *ce, fake_stream())
+        fakes = _fakes(DTYPE_TO_CUTLASS[params.io_dtype], spec.M, ("io", "io", "g", "stat", "stat", "io", "dg", "dg"))
+        fn = cute.compile(_ln_bwd_host, *fakes, cutlass.Int32(0), *ce, fake_stream(), options="--enable-tvm-ffi")
         _KCACHE[key] = fn
-    fn(*args, cur_stream())
+    fn(ffi(dy2d), ffi(x2d), ffi(gamma), ffi(mean), ffi(rstd), ffi(dx), ffi(dgamma), ffi(dbeta), spec.R, cur_stream())
     return dx, dgamma, (dbeta if has_beta else None)

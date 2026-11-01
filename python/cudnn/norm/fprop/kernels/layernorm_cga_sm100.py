@@ -40,7 +40,7 @@ from cutlass.memory import SmemAllocator
 
 from cudnn.norm._common_sm100 import shifted_stats
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import cur_stream, dyn, fake_stream
+from cudnn.norm.utils import cur_stream, fake_rows, fake_stream, ffi
 
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
 _FULL = 0xFFFFFFFF
@@ -342,7 +342,6 @@ def forward(spec, x2d, gamma, beta, *, eps, params, knobs=None, out_y=None, out_
     rstd = torch.empty(R, dtype=torch.float32, device=x2d.device) if out_rstd is None else out_rstd
     mean = (out_mean if out_mean is not None else torch.empty(R, dtype=torch.float32, device=x2d.device)) if spec.has_mean else rstd
 
-    args = (dyn(x2d.reshape(-1)), dyn(y.reshape(-1)), dyn(gamma), dyn(beta), dyn(mean), dyn(rstd))
     ce = (C, CS, CGA, _BT, V, VPT, KC, it_ty, et, float(C), float(eps), bool(spec.has_mean), has_beta, R * CGA)
     # eps is baked in as a constexpr, so it MUST be part of the key: a caller may
     # change epsilon without rebuilding the graph (it is a pass-by-value operand),
@@ -350,7 +349,10 @@ def forward(spec, x2d, gamma, beta, *, eps, params, knobs=None, out_y=None, out_
     key = (params.io_dtype,) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        fn = cute.compile(_ln_fwd_cga_host, *args, *ce, fake_stream())
+        flat, rows = cute.sym_int(), cute.sym_int()
+        fakes = (fake_rows(et, rows=flat), fake_rows(et, rows=flat), fake_rows(et, rows=C), fake_rows(et, rows=C))
+        fakes += (fake_rows(cutlass.Float32, rows=rows), fake_rows(cutlass.Float32, rows=rows))
+        fn = cute.compile(_ln_fwd_cga_host, *fakes, *ce, fake_stream(), options="--enable-tvm-ffi")
         _KCACHE[key] = fn
-    fn(*args, cur_stream())
+    fn(ffi(x2d.reshape(-1)), ffi(y.reshape(-1)), ffi(gamma), ffi(beta), ffi(mean), ffi(rstd), cur_stream())
     return y, mean, rstd
