@@ -359,11 +359,12 @@ def test_nonpaged_d128_split_explicit_contract(device_cc, pack_gqa, monkeypatch)
         assert unsplit is not None
     for invalid in (replace(facts, has_sink=True), replace(facts, has_epilogue_gate=True), replace(facts, d_qk=256, d_v=256)):
         assert mismatch(spec.capabilities, invalid, knobs) is not None
+    mla = replace(facts, d_qk=192)
+    assert mismatch(spec.capabilities, mla, replace(knobs, pack_gqa=False)) is None
     previous = type("PreviousNativeBinder", (), {"supports_nonpaged_packed_split": True, "supports_paged_packed_split": True})
     monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", previous)
     assert "matching native" in mismatch(spec.capabilities, facts, knobs)
-    mla = replace(facts, d_qk=192)
-    assert mismatch(spec.capabilities, mla, replace(knobs, pack_gqa=False)) is None
+    assert "matching native" in mismatch(spec.capabilities, mla, replace(knobs, pack_gqa=False))
 
 
 @requires_dsl
