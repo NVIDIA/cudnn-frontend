@@ -2284,3 +2284,14 @@ class TestNativePagedNarrow:
 
     test_admission_and_record = staticmethod(_checks.test_admission_and_record)
     test_origins_rebind_and_replay = staticmethod(_checks.test_origins_rebind_and_replay)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeCausalZeroTail:
+    """Run causal suffix and phase-reuse checks in the native CI entry."""
+
+    from native_causal_zero_tail_sm107_checks import test_causal_tail_origins_and_replay
+
+    test_causal_tail_origins_and_replay = staticmethod(test_causal_tail_origins_and_replay)
