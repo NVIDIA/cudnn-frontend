@@ -4525,3 +4525,18 @@ flavor selection. Automatic split/packing policy is a separate workstream.
 The physical D64 dense split uses the shared single-Q half body at CGA1/N128,
 compiled for SM107, and native SM107 prefill at CGA2 or N64. Both store FP32
 partials and support proper-divisor PackGQA. Existing unsplit routes are unchanged.
+
+
+### D192/V128 nonpaged split physical origins
+
+The existing unpacked half single-CTA split path on SM100/SM103/SM107 honors
+independent Q/K/V/O/Stats offsets, including mixed Int32/Int64 declarations
+and per-port multipliers. Input tensor maps use sequence-local origins;
+FP32 partials remain compact and the final combine uses O/Stats origins.
+A matching native extension is required. Existing positive packed-Q bounds,
+mask, packing, sink and padded-Stats restrictions are unchanged.
+
+`TestD192PhysicalOrigins.test_split_independent_origins` is collected through
+the SM100 and SM107 architecture entries. It covers split2 and split9,
+FP16/BF16, NH/HN Stats, independent physical strides, poisoned gaps, changed
+pointers/offsets/lengths, keyless rows and empty retained-capture replay.

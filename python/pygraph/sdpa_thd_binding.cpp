@@ -348,18 +348,22 @@ class SdpaThdBinder {
         if (py::hasattr(spec, "origin_specs") && !spec.attr("origin_specs").is_none()) {
             const bool d128_split = !quantized_ && cga_tile_m_ == 128 && integer(spec, "d_qk") == 128 &&
                                     integer(spec, "d_v") == 128 && splits_ > 1;
+            const bool d192_split = !quantized_ && !paged_ && cga_tile_m_ == 128 && integer(spec, "d_qk") == 192 &&
+                                    integer(spec, "d_v") == 128 && splits_ > 1;
             const bool d576_split = !quantized_ && cga_tile_m_ == 128 && integer(spec, "d_qk") == 576 &&
                                     integer(spec, "d_v") == 512 && splits_ > 1;
-            if ((quantized_ && (!paged_ || mx_scales_)) || (splits_ != 1 && !d128_split && !d576_split) || has_gate_)
+            if ((quantized_ && (!paged_ || mx_scales_)) ||
+                (splits_ != 1 && !d128_split && !d192_split && !d576_split) || has_gate_)
                 invalid(
-                    "physical THD origins require ungated half unsplit/D128 split/native D576 split or unsplit "
+                    "physical THD origins require ungated half unsplit/D128 split/nonpaged D192 split/native D576 "
+                    "split or unsplit "
                     "per-tensor FP8 "
                     "paged plans");
             auto specs = py::cast<py::tuple>(spec.attr("origin_specs"));
             if (specs.size() != 5) invalid("physical THD origins require five ports");
-            if (d128_split || d576_split) {
-                if (d128_split && specs[static_cast<size_t>(Q)].is_none())
-                    invalid("physical D128 split plans require Q offsets");
+            if (d128_split || d192_split || d576_split) {
+                if ((d128_split || d192_split) && specs[static_cast<size_t>(Q)].is_none())
+                    invalid("physical D128/D192 split plans require Q offsets");
                 // Origin maps/rows precede compact partials in the same caller workspace.
                 const int64_t origin_bytes =
                     add(multiply(add(b_, 1), 512), multiply(add(multiply(b_, 40), 127) / 128, 128));
@@ -1087,6 +1091,7 @@ init_sdpa_thd_binding(py::module_ &m) {
         .def_prop_ro_static("supports_paged_fp8_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_split_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_nonpaged_d128_split_physical_origins", [](py::object) { return true; })
+        .def_prop_ro_static("supports_nonpaged_d192_split_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_initial_waves", [](py::object) { return true; })
         .def_prop_ro_static("supports_initial_wave_geometry", [](py::object) { return true; })
         .def_prop_ro_static("supports_stats_stride_override", [](py::object) { return true; })

@@ -3034,8 +3034,8 @@ def compile_thd_split(*, has_lse: bool = True, lse_kind: str = "head", paged_hnd
     )
     if not (CFG.THD_VARLEN and SPLIT_KV > 1 and supported_shape):
         raise ValueError("packed split requires paged D64, D128, or unpacked nonpaged D192 THD")
-    if thd_origin_specs is not None and not (CFG.TILE_K == CFG.TILE_O == 128 and thd_origin_specs[0] is not None):
-        raise ValueError("physical split origins require D128 with Q offsets")
+    if thd_origin_specs is not None and not (CFG.TILE_O == 128 and thd_origin_specs[0] is not None):
+        raise ValueError("physical split origins require D128 or nonpaged D192 with Q offsets")
     cache_key = _template_key(globals(), locals(), "compile_thd_split")
     if has_sink and not (CFG.TILE_K == CFG.TILE_O == 128 and PAGED_KV and not CFG.HAS_SINK):
         raise ValueError("packed split sinks require sink-free D128 paged partials")
