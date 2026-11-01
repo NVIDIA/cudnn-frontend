@@ -1572,6 +1572,40 @@ def matrix_axis_index(shape, axis):
     return coordinate if axis == 0 else coordinate.modulo(shape[axis])
 
 
+def _lower_matrix_indices(
+    ops: list[_RecordedOp], ranked_shapes: dict[int, tuple[int, ...]], producers: dict[int, _RecordedOp], matmul_output: int
+) -> list[_RecordedOp]:
+    """Lower graph index coordinates before matrix shapes are batch-folded.
+
+    This handles the plain pointwise/GEMM scope only: epilogue structural views
+    and reductions are excluded by the caller. Prepared batch extents are fixed,
+    while GEMM descendants retain live M/N even when prepared at extent one.
+    """
+
+    @lru_cache(maxsize=None)
+    def follows_matmul_shape(tid):
+        if tid == matmul_output:
+            return True
+        producer = producers.get(tid)
+        return producer is not None and any(follows_matmul_shape(i) for i in producer.inputs)
+
+    lowered = []
+    for op in ops:
+        if op.cudnn_name == "gen_index":
+            source = op.inputs[0]
+            dim = ranked_shapes[source]
+            expr = matrix_axis_index(dim, dict(op.op_attrs).get("axis"))
+            # Consumer matrix coordinates -> singleton producer coordinates.
+            # Auxiliary-only branches keep their unit extents when broadcast;
+            # compose before codegen/dtype rounding, not as a kernel fixup.
+            broadcast = {a: IndexExpr.constant(0) for a, extent in zip((Axis.M, Axis.N), dim[-2:]) if extent == 1}
+            if broadcast and not follows_matmul_shape(source):
+                expr = expr.substitute(broadcast)
+            op = replace(op, index_expr=expr)
+        lowered.append(op)
+    return lowered
+
+
 def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta], io_dtype: Dtype, intermediate_dtype: Dtype) -> list[_RecordedOp]:
     """Project ordered operand views through pointwise DAGs, then fold matrix rank.
 
@@ -1750,36 +1784,7 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
         # untouched rank-3 slots on the general batch-fold path.
         matrix_views_required = (bool(structural) and not has_reshape) or output_dim != (prod(batch_shape), *output_dim[-2:])
 
-        # Index attributes describe the original logical tensor, not the kernel
-        # ABI. Decode batch digits before applying the operation compute dtype.
-        @lru_cache(maxsize=None)
-        def follows_matmul_shape(tid):
-            """Pointwise descendants inherit live M/N even when prepared at one.
-
-            In this plain pointwise/GEMM scope, epilogue structural views and
-            reductions are excluded. A singleton auxiliary-only branch instead
-            keeps its unit extent when broadcast into the consumer matrix.
-            """
-            if tid == mm.output:
-                return True
-            producer = producers.get(tid)
-            return producer is not None and any(follows_matmul_shape(i) for i in producer.inputs)
-
-        normalized_ops = []
-        for op in ops:
-            if op.cudnn_name == "gen_index":
-                source = op.inputs[0]
-                dim = ranked_shapes[source]
-                axis = dict(op.op_attrs).get("axis")
-                expr = matrix_axis_index(dim, axis)
-                # Consumer matrix coordinates -> singleton producer coordinates.
-                # Compose before codegen/dtype rounding, not as a kernel fixup.
-                broadcast = {a: IndexExpr.constant(0) for a, extent in zip((Axis.M, Axis.N), dim[-2:]) if extent == 1}
-                if broadcast and not follows_matmul_shape(source):
-                    expr = expr.substitute(broadcast)
-                op = replace(op, index_expr=expr)
-            normalized_ops.append(op)
-        ops = normalized_ops
+        ops = _lower_matrix_indices(ops, ranked_shapes, producers, mm.output)
         for tid, m in list(meta.items()):
             dim = ranked_shapes[tid]
             if len(dim) < 2:
