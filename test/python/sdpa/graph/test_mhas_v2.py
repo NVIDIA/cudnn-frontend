@@ -4764,8 +4764,8 @@ def test_sdpa_fwd_cc107_decode_tile_sink_keyless_rows_L0(env_info, request, cudn
 
 
 _P3_ENVELOPE_CASES = {
-    # GPT-OSS uses the native SM107 d64 tile; pin its unpacked cga1 plan.
-    "gpt_oss_d64_sink_swa": dict(cfg=dict(b=4, h_q=64, h_kv=8, s_q=4, s_kv=4096, d=64, left_bound=128, stats=True, seq_len_q=[4] * 4, seq_len_kv=[4096, 4095, 129, 1]), pin="u1n", cga=None, knobs=None, template="prefill_d128_f16"),
+    # GPT-OSS uses the native D64 single-Q body on SM107; pin its unpacked cga1 plan.
+    "gpt_oss_d64_sink_swa": dict(cfg=dict(b=4, h_q=64, h_kv=8, s_q=4, s_kv=4096, d=64, left_bound=128, stats=True, seq_len_q=[4] * 4, seq_len_kv=[4096, 4095, 129, 1]), pin="u1n", cga=None, knobs=None, template="decode_d128_f16"),
     "mha_q8_sink": dict(cfg=dict(b=8, h_q=8, h_kv=8, s_q=8, s_kv=2048), pin=None, cga=1, knobs=dict(pack_gqa=False), template="decode_d128_f16"),
     "fp16_b64_q8_kv8192": dict(cfg=dict(b=64, h_q=64, h_kv=8, s_q=8, s_kv=8192, dtype=torch.float16), pin=None, cga=1, knobs=None, template="decode_d128_f16"),
     "mha_decode_small": dict(cfg=dict(b=1, h_q=4, h_kv=4, s_q=1, s_kv=128, causal=False, stats=True), pin=None, cga=1, knobs=None, template="decode_d128_f16"),
