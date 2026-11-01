@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""SM80 short dense D128 queries use a smaller CTA without overriding knobs."""
+"""SM80 short dense D128 and D192 queries use a smaller CTA without overriding knobs."""
 
 import pytest
 import torch
@@ -18,14 +18,25 @@ pytestmark = pytest.mark.L0
         (1, 128, 128, False, None, (64, 4)),
         (8, 128, 128, False, None, (64, 4)),
         (64, 128, 128, False, None, (64, 4)),
-        (65, 128, 128, False, None, (128, 8)),
+        (65, 128, 128, False, None, (64, 4)),
+        (96, 128, 128, False, None, (64, 4)),
+        (128, 128, 128, False, None, (64, 4)),
         (129, 128, 128, False, None, (128, 8)),
         (8, 128, 128, False, 128, (128, 8)),
         (129, 128, 128, False, 64, (64, 4)),
         (8, 96, 80, False, None, (128, 8)),
         (8, 96, 80, False, 64, (64, 4)),
         (8, 64, 64, False, None, (128, 4)),
-        (8, 192, 128, False, None, (128, 8)),
+        (1, 192, 128, False, None, (64, 4)),
+        (8, 192, 128, False, None, (64, 4)),
+        (64, 192, 128, False, None, (64, 4)),
+        (65, 192, 128, False, None, (128, 8)),
+        (8, 192, 128, False, 128, (128, 8)),
+        (129, 192, 128, False, 64, (64, 4)),
+        (8, 136, 128, False, None, (128, 8)),
+        (8, 136, 128, False, 64, (64, 4)),
+        (8, 192, 128, True, None, (128, 8)),
+        (8, 192, 128, True, 64, (64, 4)),
         (8, 256, 256, False, None, (128, 8)),
         (8, 128, 128, True, None, (128, 8)),
         (8, 128, 128, True, 64, (64, 4)),
