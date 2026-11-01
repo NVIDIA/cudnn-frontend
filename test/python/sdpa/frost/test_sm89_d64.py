@@ -138,7 +138,7 @@ def test_sm80_row_is_unchanged_by_the_ada_addition():
     adds a sibling row, it does not widen an existing gate."""
     caps = _spec(_FWD_SM80).capabilities
     assert (caps.sm_lo, caps.sm_hi) == (80, 80)
-    assert caps.d_shapes == frozenset({(256, 256)})
+    assert caps.d_shapes == frozenset({(256, 256), (512, 512), (576, 512)})
     assert caps.bias and caps.padded and caps.sink
 
 
@@ -159,7 +159,7 @@ def test_shared_dense_host_compiles_for_sm80(monkeypatch):
 
     monkeypatch.setattr(prepared_host, "compile_cached", compile_spy)
     monkeypatch.setattr(prepared_host.cute.runtime, "make_ptr", lambda *args, **kwargs: None)
-    params = SimpleNamespace(io_bf16=False, bias_is_fp32=False)
+    params = SimpleNamespace(io_bf16=False, bias_is_fp32=False, paged_page_size=0)
     operand = ((1, 128, 2, 64), (16384, 128, 64, 1))
     geometry = (operand,) * 4 + (((1, 2, 128), (256, 128, 1)),) + (None,) * 4
     result = prepared_host.compile_host(SimpleNamespace(), params, geometry, 0, 0, "shared-sm80-sm89")
