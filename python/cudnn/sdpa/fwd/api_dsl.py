@@ -738,6 +738,9 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     tag = _flavor_tag(flavor)
     if params.dtype_kv != -1 and (fp8 or flavor != (128, 128)):
         raise ValueError("independent FP8 KV storage requires the SM100/SM107 D128 half pipeline")
+    if rubin and not fp8 and flavor == (192, 128) and params.paged_kv:
+        params = replace(params, d_flavor=192)
+        return _load_kernel_template("sm107/prefill_d128_f16.py", params, f"sdpa_fwd_sm107_{tag}_paged")
     if (
         rubin
         and not fp8
@@ -2241,6 +2244,18 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             ),
         )
 
+    def _rubin_native_d192_paged_leg(self) -> bool:
+        from cudnn.sdpa.fwd.config_sm107 import supports_native_d192_paged
+
+        return supports_native_d192_paged(
+            self.flavor,
+            device_cc=self._device_cc,
+            fp8=self._fp8,
+            paged=self.paged,
+            cga=self.cga,
+            split_kv=self.split_kv,
+        )
+
     def _rubin_native_thd_prefill_leg(self) -> bool:
         """The exact-D128 native THD prefill domain, shared with graph admission."""
         if self.thd and self._rubin_native_d64_pack_leg():
@@ -2724,6 +2739,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 self.thd
                 and not self.thd_decode_leg
                 and not self._rubin_native_d64_pack_leg()
+                and not self._rubin_native_d192_paged_leg()
                 and not (self.packed_thd_split and int(d_qk) in (64, 128, 576))
                 and not supports_paged_d256_pack_gqa(
                     (int(d_qk), int(d_v)),
@@ -2750,6 +2766,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             _partial = (
                 (not self._fp8 and self._device_cc != (10, 7) and self.flavor in _SM100_PARTIAL_PACK_GQA_FLAVORS)
                 or self._rubin_native_d512_leg()
+                or self._rubin_native_d192_paged_leg()
                 or self._rubin_native_d64_pack_leg()
                 or self._rubin_shared_thd_pack_leg()
                 or supports_paged_d128_partial_pack_gqa(
@@ -3232,7 +3249,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._not_implemented_error_if(
                 self._device_cc == (10, 7)
                 and ((self._fp8 and self._pertensor) or (not self._fp8 and not self.thd) or self.flavor not in ((128, 128), (256, 256)))
-                and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv)),
+                and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv))
+                and not self._rubin_native_d192_paged_leg(),
                 "Rubin paged KV serves half THD queries, MXFP8 pools on D128/D256, and decode-shaped half D256 graphs on the decode tile (per-tensor FP8 pools and other dense half queries are not wired)",
             )
             self._not_implemented_error_if(
@@ -4010,6 +4028,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 s_q=self.s_q_max,
                 s_kv=self.s_k_max,
             )
+            if self._rubin_native_d192_paged_leg():
+                params = replace(params, cta_mma=2)
         elif self.flavor == (256, 256):
             from cudnn.sdpa.fwd.heuristics import select_d256_auto_knobs
 

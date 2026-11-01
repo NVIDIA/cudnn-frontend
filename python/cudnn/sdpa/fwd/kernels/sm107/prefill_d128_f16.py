@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 """
-DSL prefill SDPA kernel — classic pipeline, f16/bf16, d=128, SM107 (Rubin).
+DSL prefill SDPA kernel — classic half pipeline, D32/D64/D128 and paged D192/V128, SM107.
 
 The native pipeline uses two Q slabs and softmax warpgroups, four correction
 warps, and the persistent scheduler. D128 at CGA2 keeps four KV stages
@@ -17,14 +17,16 @@ scheduler's token span, sinks and Stats all use that mapping. At PACK_G=1
 the coordinates fold to the unpacked case. THD uses device length metadata
 and per-sequence output descriptors, including changed lengths under replay.
 
-The 32- and 64-wide tiles below run four KV stages at CGA1. Their packing
-requests still select the D128 flavor through the existing engine contract.
+The 32- and 64-wide tiles below run four KV stages at CGA1. D64 also
+serves native packing. Paged D192/V128 uses two KV stages at CGA2; its
+240 KiB of operand buffers stay inside the version-0 descriptor window.
 
-**Head-dim tile flavors (``TemplateParams.d_flavor`` in {32, 64, 128}).**  One
-body, three ``Cfg`` geometries: ``make_cfg_d32`` / ``make_cfg_d64`` /
-``make_cfg_d128`` set ``TILE_K = TILE_O`` and everything coupled to it -- the
+**Head-dim tile flavors (``TemplateParams.d_flavor`` in {32, 64, 128, 192}).**  One
+body, four ``Cfg`` geometries: ``make_cfg_d32`` / ``make_cfg_d64`` /
+``make_cfg_d128`` use equal K/O widths; ``make_cfg_d192_paged`` uses K=192,
+O=128. The factories set the widths and everything coupled to them -- the
 Q/K/V/O TMA boxes and swizzle atoms (64-byte rows at TILE_K = 32), the BMM1
-k-step count (``TILE_K / 16``: 2 / 4 / 8), BMM2's N, the O slab and the TMEM O
+k-step count (``TILE_K / 16``: 2 / 4 / 8 / 12), BMM2's N, the O slab and the TMEM O
 slot width (``config_sm107.d128_family_tmem_layout``: S 0 / 128, P in the S
 tails, O at 256 + qs * TILE_O, STATS at the top).  Any head dim D <= TILE_K
 with D % 8 == 0 rides the width: the TMA descriptors carry the TRUE extents
@@ -73,7 +75,7 @@ from dataclasses import dataclass, replace
 # parameters travel as typed dataclasses). The loader injects
 # FROST_TEMPLATE_PARAMS before this body runs; the default keeps a direct
 # `import` usable as a standalone driver.
-from cudnn.sdpa.fwd.config_sm107 import TemplateParams, d128_family_tmem_layout, make_cfg_d32, make_cfg_d64, make_cfg_d128
+from cudnn.sdpa.fwd.config_sm107 import TemplateParams, d128_family_tmem_layout, make_cfg_d32, make_cfg_d64, make_cfg_d128, make_cfg_d192_paged
 from cudnn.sdpa.fwd.config_sm107 import KV_MASK_BOOL_WORD, KV_MASK_ADDITIVE_16, KV_MASK_ADDITIVE_F32
 from cudnn.sdpa.fwd.config_sm107 import (
     BIAS_MODE_RESIDENT,
@@ -87,9 +89,10 @@ from cudnn.sdpa.fwd.config_sm107 import (
 from cudnn.sdpa.fwd.config_sm107 import BIAS_MAX_HW_UPPER_BOUND
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
-# One body, three head-dim tile geometries (TILE_K = TILE_O = d_flavor); the record field selects the factory, the
-# sm100 sibling's `_MAKE_CFG` convention.  128 is the default so a direct import keeps the classic d128 geometry.
-_MAKE_CFG = {32: make_cfg_d32, 64: make_cfg_d64, 128: make_cfg_d128}
+# The record selects equal-width D32/D64/D128 or paged D192/V128. The latter
+# has its own factory so the nonpaged D192 body cannot admit page-pool records.
+# A plain import retains the default D128 geometry.
+_MAKE_CFG = {32: make_cfg_d32, 64: make_cfg_d64, 128: make_cfg_d128, 192: make_cfg_d192_paged}
 if PARAMS.d_flavor not in _MAKE_CFG:
     raise ValueError(f"prefill_d128_f16_sm107: d_flavor must be one of {sorted(_MAKE_CFG)}; got {PARAMS.d_flavor}")
 CFG, _TMA = _MAKE_CFG[PARAMS.d_flavor](PARAMS)
