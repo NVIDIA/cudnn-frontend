@@ -1029,11 +1029,15 @@ _PLAIN_SLOT_BUDGET = 1 << 21  # partial elements per gradient (8 MB of fp32): bo
 
 
 def _plain_bwd_slots(R, M):
-    """Slot count of the plain route's dgamma / dbeta partials; 0 = atomics straight into the [M] outputs."""
+    """Slot count of the plain route's dgamma / dbeta partials; 0 = atomics straight into the [M] outputs.
+
+    A power of two: the count is part of the compile key, so it takes at most five values from the row floor up (64 ...
+    1024) rather than one per row count -- a key derived from R would recompile for every new batch.
+    """
     if R < _PLAIN_MIN_ROWS:
         return 0
     nslots = min(_PLAIN_MAX_SLOTS, R // _PLAIN_ROWS_PER_SLOT, _PLAIN_SLOT_BUDGET // M)
-    return nslots if nslots >= 2 else 0
+    return 1 << (nslots.bit_length() - 1) if nslots >= 2 else 0
 
 
 def _plain_scratch_bytes(spec, has_beta):

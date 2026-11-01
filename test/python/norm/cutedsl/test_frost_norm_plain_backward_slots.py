@@ -58,3 +58,11 @@ def test_plain_route_gradients(variant, dtype, rows, cols):
     for what, got, want in pairs:
         err = (got.double() - want).abs().max().item() / max(1.0, want.abs().max().item())
         assert err <= 3e-2, f"{what}: rel {err:.2e}"
+
+
+@pytest.mark.L0
+def test_plain_route_slot_count_does_not_follow_every_row_count():
+    """The slot count is a compile-key value: it must not change with each new row count (one JIT compile per batch)."""
+    counts = {_plain_bwd_slots(rows, 96) for rows in range(1024, 70000, 37)}
+    assert counts <= {64, 128, 256, 512, 1024}, counts
+    assert _plain_bwd_slots(2050, 96) == _plain_bwd_slots(3333, 96)
