@@ -2959,6 +2959,7 @@ def test_sm120_moe_block_scale_declines_signed_negative_scale() -> None:
     engine.check_support(_build_graph(2, 512, 256, 512, num_groups=2, combo="mxfp4", negative_scale=(True, True)))
 
 
+@requires_sm120
 @pytest.mark.parametrize("public", [False, True], ids=["jit", "knob_replay"])
 @pytest.mark.parametrize("swap_ab", [False, True], ids=["fwd", "swap_ab"])
 @pytest.mark.parametrize("config_name", [_SM120_BS_512x16, _SM120_BS_32x384], ids=["m512", "n384"])

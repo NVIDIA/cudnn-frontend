@@ -2047,7 +2047,7 @@ def test_gather_numerics_sm120(cfg_name, m_major, activation, swiglu):
     _run_gather_numerics(C120, by_name(cfg_name), m_major=m_major, activation=activation, swiglu=swiglu)
 
 
-@requires_matmul_gpu
+@requires_sm120
 @pytest.mark.parametrize(
     "gather,swap_ab,call_n",
     [(False, False, 256), (False, True, 224), (True, False, 256), (True, True, 224)],
@@ -2110,7 +2110,7 @@ def _f8_128x4_logical(blob: torch.Tensor, cols: int) -> torch.Tensor:
     return logical.view(-1, cols)
 
 
-@requires_matmul_gpu
+@requires_sm120
 @pytest.mark.parametrize("swap_ab", [False, True], ids=["token_by_weight", "weight_by_token"])
 @pytest.mark.parametrize("axis", [-1, 1], ids=["feature_axis", "token_axis"])
 def test_moe_quant_scale_k_padding_is_zeroed_sm120(axis, swap_ab):

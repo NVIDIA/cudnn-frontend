@@ -3624,6 +3624,7 @@ def test_sm120_all_major_combos(a_major: str, b_major: str, out_major: str) -> N
     )
 
 
+@requires_sm120
 @pytest.mark.parametrize(
     "axis,swap_ab,build_m,call_m,call_n",
     [(-1, False, 256, 200, 256), (-1, False, 200, 256, 256), (1, False, 256, 224, 256), (-1, True, 256, 256, 224)],
@@ -3755,6 +3756,7 @@ def test_sm120_render_smoke() -> None:
                 assert f"b_is_n_major = {b_major == 'n'}" in src, combo
 
 
+@requires_sm120
 @pytest.mark.parametrize("axes,M,N", [((-1,), 200, 2880), ((-1, 1), 352, 320)], ids=["row", "row_col"])
 def test_sm120_quant_scale_k_padding_is_zeroed(axes, M, N) -> None:
     """An F8_128x4 quant-scale row holds roundup(blocks, 4) slots. A block-scaled
