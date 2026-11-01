@@ -38,7 +38,8 @@ def forward_adapter_mismatch(api):
         return "SM80 RoPE forward requires staging and is not supported by the native adapter"
     for role in ("q", "k", "v", "o"):
         desc = getattr(api, role + "_desc")
-        reason = forward_thd_layout_mismatch(role, desc.shape, desc.stride) if api.thd else data_layout_mismatch(role, desc.shape, desc.stride)
+        thd = api.thd and not (api.paged and role in ("k", "v"))
+        reason = forward_thd_layout_mismatch(role, desc.shape, desc.stride) if thd else data_layout_mismatch(role, desc.shape, desc.stride)
         if reason is not None:
             return reason
     return None

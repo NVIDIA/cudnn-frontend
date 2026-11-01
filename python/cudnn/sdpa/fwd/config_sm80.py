@@ -110,6 +110,8 @@ class TemplateParams:
     sink_natural: bool = False
     # Sign of attn_scale: the kernel negates (-1) or zeroes (0) the raw scores and runs at kernel_scale() (#1435).
     score_sign: int = 1
+    # Zero retains contiguous K/V; positive values select device page tables.
+    paged_page_size: int = 0
 
 
 def score_sign(scale: float) -> int:
@@ -141,6 +143,8 @@ def validate_params(p: TemplateParams) -> None:
         raise ValueError(f"sm80: sched_policy must be a tile_dsl SCHED_* value; got {p.sched_policy}")
     if p.score_sign not in (-1, 0, 1):
         raise ValueError(f"sm80: score_sign must be -1, 0 or 1; got {p.score_sign}")
+    if p.paged_page_size < 0:
+        raise ValueError("sm80: paged_page_size must be nonnegative")
     if p.sched_l2_mib <= 0:
         raise ValueError(f"sm80: sched_l2_mib must be > 0; got {p.sched_l2_mib}")
     if p.causal_bottom_right and not (p.is_causal or p.has_swa):

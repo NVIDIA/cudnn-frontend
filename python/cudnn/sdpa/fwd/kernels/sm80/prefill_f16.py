@@ -109,6 +109,7 @@ from cudnn.frost.tile_dsl.mma import load_b_smem_x4, mma_step  # noqa: E402
 from cudnn.frost.tile_dsl.pointwise import fp32_to_fp16  # noqa: E402
 from cudnn.frost.tile_dsl.rope import rope_rotate_smem_tile  # noqa: E402
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b  # noqa: E402
+from cudnn.sdpa.fwd.kernels.sm80.paged_load import load_kv_tile
 from cudnn.frost.tile_dsl.tma import load_tile_2d, cp_async_commit, cp_async_wait  # noqa: E402
 from cudnn.frost.tile_dsl.mask import (  # noqa: E402
     MASK_NONE,
@@ -241,6 +242,8 @@ def _sdpa_kernel(
     inv_softmax_scale: cutlass.Float32,  # = 1 / scale.  Multiplies the additive bias
     # before it is added to the un-scaled S_acc
     # (consulted only when has_bias).
+    paged_k_table: Optional[cute.Tensor] = None,
+    paged_v_table: Optional[cute.Tensor] = None,
 ):
     # ---- derived shape / layout constants ---------------------------------
     # Folded at trace time — one compiled fn per (tile_m, num_warps, tile_n,
@@ -309,7 +312,7 @@ def _sdpa_kernel(
             #
             # active_groups = clamp(sched_l2_bytes / per_group, 1, num_groups).
             BPE_K_V = 2  # fp16 K, fp16 V
-            SKV_i32 = cutlass.Int32(K.shape[1])
+            SKV_i32 = skv_runtime if cutlass.const_expr(PARAMS.paged_page_size) else cutlass.Int32(K.shape[1])
             per_group = SKV_i32 * cutlass.Int32((d_qk + d_v) * BPE_K_V)
             l2_budget = cutlass.Int32(sched_l2_bytes)
             num_groups = cutlass.Int32(Hkv_for_decode * B_for_decode)
@@ -393,7 +396,7 @@ def _sdpa_kernel(
     # KV-head; the kernel maps ``kv_head_idx = head_idx // heads_per_kv``
     # at GMEM-offset time.  MHA is the H_q == H_kv special case.
     SQ = Q.shape[1]
-    SKV = K.shape[1]
+    SKV = skv_runtime if cutlass.const_expr(PARAMS.paged_page_size) else K.shape[1]
     H = Q.shape[2]  # H_q
     H_kv = K.shape[2]  # H_kv (== H for MHA)
     heads_per_kv = H // H_kv  # Python int — folds at trace time
@@ -718,6 +721,8 @@ def _sdpa_kernel(
     else:
         q_valid_rows = None if cutlass.const_expr(is_even_mn) else sq_runtime
         kv_valid_rows = None if cutlass.const_expr(is_even_mn) else skv_runtime
+    if cutlass.const_expr(PARAMS.paged_page_size):
+        kv_valid_rows = eff_skv
     valid_cols = None if cutlass.const_expr(is_even_k) else d_runtime
     q_row_base_i = cutlass.Int32(q_row_base)
     load_tile_2d(
@@ -763,7 +768,7 @@ def _sdpa_kernel(
     v_prologue_off64 = prologue_kv_i64 * V_TILE_STRIDE_E.to(cutlass.Int64)
     k_prologue_gmem = k_gmem_batch_head + k_prologue_off64
     kv_prologue_row_abs = prologue_kv_iter * cutlass.Int32(tile_n)
-    load_tile_2d(
+    load_kv_tile(
         sK_buf,
         k_prologue_gmem,
         rows=tile_n,
@@ -778,6 +783,11 @@ def _sdpa_kernel(
         valid_rows=kv_valid_rows,
         valid_cols=valid_cols,
         row_base=kv_prologue_row_abs,
+        page_table=paged_k_table,
+        page_size=PARAMS.paged_page_size,
+        pool_base=K_view.data_ptr() + K_HEAD_OFF,
+        page_stride=K.stride[0],
+        batch=batch_idx,
     )
     cp_async_commit()  # group 1: K[kv_right-1]
     cp_async_wait(1)  # leave K in flight
@@ -911,7 +921,7 @@ def _sdpa_kernel(
         # v_cur_gmem advanced at iter-end below (running-pointer form).
         # row_base = kv_iter * tile_n (V[i]'s absolute starting row).
         kv_row_base_cur = kv_iter * cutlass.Int32(tile_n)
-        load_tile_2d(
+        load_kv_tile(
             sV_cur,
             v_cur_gmem,
             rows=tile_n,
@@ -926,6 +936,11 @@ def _sdpa_kernel(
             valid_rows=kv_valid_rows,
             valid_cols=V.shape[3] if cutlass.const_expr(V.shape[3] != d_v) else None,
             row_base=kv_row_base_cur,
+            page_table=paged_v_table,
+            page_size=PARAMS.paged_page_size,
+            pool_base=V_view.data_ptr() + V_HEAD_OFF,
+            page_stride=V.stride[0],
+            batch=batch_idx,
         )
         cp_async_commit()  # group: V[i]
 
@@ -946,7 +961,7 @@ def _sdpa_kernel(
         cp_size_bytes = not_last * cutlass.Int32(bytes_per_copy_full)
         # k_next_gmem holds iter-i's K[i-1] base (decremented at iter-end).
         kv_row_base_prev = (kv_iter - cutlass.Int32(1)) * cutlass.Int32(tile_n)
-        load_tile_2d(
+        load_kv_tile(
             sK_next,
             k_next_gmem,
             rows=tile_n,
@@ -962,6 +977,11 @@ def _sdpa_kernel(
             valid_rows=kv_valid_rows,
             valid_cols=valid_cols,
             row_base=kv_row_base_prev,
+            page_table=paged_k_table,
+            page_size=PARAMS.paged_page_size,
+            pool_base=K_view.data_ptr() + K_HEAD_OFF,
+            page_stride=K.stride[0],
+            batch=batch_idx,
         )
         cp_async_commit()  # group: K[i-1] (no-op on first kv_iter == kv_left)
 
@@ -1602,7 +1622,11 @@ def _sdpa_host(
     thd_q_tiles: cutlass.Int32,  # THD: ceil(max_s_q / tile_m) (over-provisioned)
     thd_n_batch: cutlass.Int32,  # THD: logical sequence count B
     stream: cuda.CUstream,
+    paged_k_table: Optional[cute.Tensor] = None,
+    paged_v_table: Optional[cute.Tensor] = None,
 ):
+    if cutlass.const_expr((paged_k_table is not None) != bool(PARAMS.paged_page_size) or (paged_v_table is not None) != bool(PARAMS.paged_page_size)):
+        raise ValueError("SM80 page tables must match the paged specialization")
     SQ = Q.shape[1]
     H = Q.shape[2]
     B = Q.shape[0]
@@ -1660,6 +1684,8 @@ def _sdpa_host(
         d_runtime,
         causal_band_right,
         inv_softmax_scale,
+        paged_k_table,
+        paged_v_table,
     ).launch(
         grid=grid,
         block=(threads, 1, 1),

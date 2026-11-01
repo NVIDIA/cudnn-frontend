@@ -1212,6 +1212,18 @@ class SdpaFwdDsl(APIBase):
     def paged(self) -> bool:
         return self.paged_page_size > 0
 
+    @staticmethod
+    def _paged_pool_stride(desc) -> tuple:
+        """Container strides ``[num_pages, H_kv, page_size, D]`` re-expressed in
+        the kernel's ``[num_pages, page_size, H_kv, D]`` order (a permutation,
+        so HND and NHD storage both bind as views)."""
+        s = tuple(int(x) for x in desc.stride)
+        return (s[0], s[2], s[1], s[3])
+
+    def _paged_table_expected_stride(self, which_v: bool, n_pages: int) -> tuple:
+        declared = self.paged_table_v_stride if which_v else self.paged_table_stride
+        return declared if declared is not None else (n_pages, 1)
+
     @abstractmethod
     def _initialize_implementation(self) -> None:
         """Initialize state private to specific implementations."""
@@ -4465,18 +4477,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             spec.combine.fn(*combine_args)
         self._logger.debug("execute completed")
 
-    @staticmethod
-    def _paged_pool_stride(desc) -> tuple:
-        """Container strides ``[num_pages, H_kv, page_size, D]`` re-expressed in
-        the kernel's ``[num_pages, page_size, H_kv, D]`` order (a permutation,
-        so HND and NHD storage both bind as views)."""
-        s = tuple(int(x) for x in desc.stride)
-        return (s[0], s[2], s[1], s[3])
-
-    def _paged_table_expected_stride(self, which_v: bool, n_pages: int) -> tuple:
-        declared = self.paged_table_v_stride if which_v else self.paged_table_stride
-        return declared if declared is not None else (n_pages, 1)
-
     def scratch_workspace_bytes(self) -> int:
         """Per-execute scratch ``execute()`` carves from its ``workspace``.
 
@@ -6600,7 +6600,9 @@ def _sm80_load_kernel_module(flavor: str, params):
     # Tag from the BASENAME: `filename` carries the arch subdirectory, and a
     # slash would land in the generated template module name.
     stem = os.path.splitext(os.path.basename(filename))[0]
-    return load_template(path, params, tag=f"sm80_{stem}")
+    from cudnn.sdpa.fwd.kernels.sm80.paged_load import FROST_SOURCE_DIGEST as paged_load_digest
+
+    return load_template(path, params, tag=f"sm80_{stem}", extra_key=paged_load_digest)
 
 
 def _sm80_sched_policy_int(token: str) -> int:
@@ -6663,6 +6665,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._t_q_cap = 0
         self._t_kv_cap = 0
         self._thd_launch = None
+        self._sm80_paged_table_geometry = None
 
     # ------------------------------------------------------------------
     def check_support(self) -> bool:
@@ -6680,7 +6683,21 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         from cudnn.sdpa.graph_analyzer import dense_layout_ok, thd_stats_packing
         from cudnn.sdpa.native_sm80 import forward_thd_layout_mismatch
 
-        self._not_implemented_error_if(self.paged, "paged KV is served by the SM100 f16/bf16 engine only")
+        if self.paged:
+            from cudnn import _pybind_module
+
+            self._not_implemented_error_if(
+                not getattr(_pybind_module._SdpaSm80FwdBinder, "supports_paged_kv", False),
+                "SM80 paged KV requires the matching native cuDNN Frontend extension",
+            )
+            self._value_error_if(
+                self.paged_max_seq_len_kv is None or not 0 < self.paged_max_seq_len_kv < 2**31,
+                "SM80 paged KV requires a positive int32 paged_max_seq_len_kv",
+            )
+            self._not_implemented_error_if(
+                not self.seq_kv_lens_present and not (self.thd and self.cu_seq_kv_lens),
+                "SM80 paged KV requires per-request KV lengths",
+            )
         self._not_implemented_error_if(self.gate_desc is not None, "epilogue gate fusion is served by the SM107 d256 SDPA engines only")
         for desc in (self.q_desc, self.k_desc, self.v_desc, self.o_desc):
             self._value_error_if(
@@ -6688,7 +6705,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 f"{desc.name} must be rank-4 (B, H, S, D); got {desc.ndim}",
             )
             _shape, _stride = tuple(desc.shape), tuple(desc.stride)
-            if self.thd:
+            if self.thd and not (self.paged and desc in (self.k_desc, self.v_desc)):
                 reason = forward_thd_layout_mismatch(desc.name, _shape, _stride)
                 self._not_implemented_error_if(reason is not None, reason)
             else:
@@ -6704,8 +6721,25 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         _, _, _, d_v = self.v_desc.shape
 
         self._check_tensor_shape(self.q_desc, (b, h_qo, s_qo, d_qk), name="Q")
-        self._check_tensor_shape(self.k_desc, (b, h_kv, s_kv, d_qk), name="K")
-        self._check_tensor_shape(self.v_desc, (b, h_kv, s_kv, d_v), name="V")
+        if self.paged:
+            self._value_error_if(s_kv != self.paged_page_size, "K pool page size must match paged_page_size")
+            self._check_tensor_shape(self.k_desc, (self.k_desc.shape[0], h_kv, self.paged_page_size, d_qk), name="K")
+            self._check_tensor_shape(self.v_desc, (self.v_desc.shape[0], h_kv, self.paged_page_size, d_v), name="V")
+            self._value_error_if(self.k_desc.shape[0] <= 0 or self.v_desc.shape[0] <= 0, "K/V page pools must have positive capacity")
+            s_kv = int(self.paged_max_seq_len_kv)
+            n_pages = (s_kv + self.paged_page_size - 1) // self.paged_page_size
+            table_geometry = []
+            for which_v in (False, True):
+                strides = self._paged_table_expected_stride(which_v, n_pages)
+                self._value_error_if(
+                    len(strides) != 2 or not dense_layout_ok((b, 1, n_pages, 1), (strides[0], 0, strides[1], 1)),
+                    "SM80 page table must have non-overlapping batch/page strides",
+                )
+                table_geometry.append(((int(b), n_pages), tuple(strides)))
+            self._sm80_paged_table_geometry = tuple(table_geometry)
+        else:
+            self._check_tensor_shape(self.k_desc, (b, h_kv, s_kv, d_qk), name="K")
+            self._check_tensor_shape(self.v_desc, (b, h_kv, s_kv, d_v), name="V")
         self._check_tensor_shape(self.o_desc, (b, h_qo, s_qo, d_v), name="O")
 
         for label, val in (("B", b), ("H_q", h_qo), ("H_kv", h_kv), ("S_q", s_qo), ("S_kv", s_kv), ("D_QK", d_qk), ("D_V", d_v)):
@@ -6955,6 +6989,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             has_lse=self.lse_desc is not None,
             sink_natural=True,
             score_sign=_sm80_cfg.score_sign(self.scale_softmax),
+            paged_page_size=self.paged_page_size,
         )
         self._k_mod = _sm80_load_kernel_module(self.flavor, self._params)
         if self.thd:
@@ -6970,6 +7005,15 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 initialize_outputs=False,
                 o_stride=(int(self.o_desc.stride[2]), int(self.o_desc.stride[1])),
                 dimensions=(self.head_dim_qk, self.head_dim_v),
+                paged_geometry=(
+                    (
+                        *((tuple(desc.shape[i] for i in (0, 2, 1, 3)), self._paged_pool_stride(desc)) for desc in (self.k_desc, self.v_desc)),
+                        *self._sm80_paged_table_geometry,
+                    )
+                    if self.paged
+                    else None
+                ),
+                max_skv=self.s_k_max if self.paged else 0,
             )
             self._compile_thd_meta()
             self._logger.debug("compile completed")
@@ -7020,6 +7064,8 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         scale_softmax: Optional[float],
         workspace: Optional[torch.Tensor],
         current_stream: Optional[cuda.CUstream],
+        block_table: Optional[torch.Tensor] = None,
+        block_table_v: Optional[torch.Tensor] = None,
     ) -> None:
         """Bind native packed buffers and launch the already-compiled THD artifact."""
         import cutlass
@@ -7049,9 +7095,13 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             # when the caller did not supply max_total_seq_len_q. Q/O may
             # legitimately carry extra allocation capacity beyond it.
             t_q = min(t_q, self._thd_lse_head_stride)
-        t_kv = min(capacity(k_tensor, self.k_desc), capacity(v_tensor, self.v_desc))
-        if self.max_total_seq_len_kv is not None:
-            t_kv = min(t_kv, self.max_total_seq_len_kv)
+        if self.paged:
+            self._check_sm80_paged_buffers(k_tensor, v_tensor, block_table, block_table_v)
+            t_kv = self._t_kv_cap
+        else:
+            t_kv = min(capacity(k_tensor, self.k_desc), capacity(v_tensor, self.v_desc))
+            if self.max_total_seq_len_kv is not None:
+                t_kv = min(t_kv, self.max_total_seq_len_kv)
         # Planned capacities bound live totals (caller contract); extra
         # allocation beyond them is never addressed.
         t_q = min(t_q, self._t_q_cap)
@@ -7149,7 +7199,28 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 int(self.right_bound_runtime),
                 (1, 1, 1),
                 int(launch_stream),
+                *((block_table.data_ptr(), block_table_v.data_ptr()) if self.paged else ()),
             )
+
+    def _check_sm80_paged_buffers(self, k_tensor, v_tensor, block_table, block_table_v):
+        """Validate the fixed pools/tables before the packed metadata launch."""
+        for tensor, desc in ((k_tensor, self.k_desc), (v_tensor, self.v_desc)):
+            self._value_error_if(
+                tensor.dtype != desc.dtype or tensor.device != self.q_desc.device, f"{desc.name}: runtime dtype/device must match its declaration"
+            )
+            self._value_error_if(tensor.data_ptr() % 16 != 0, f"{desc.name}: runtime base must be 16-byte aligned")
+            self._value_error_if(
+                tuple(tensor.shape) != tuple(desc.shape) or any(n > 1 and a != b for n, a, b in zip(desc.shape, tensor.stride(), desc.stride)),
+                f"{desc.name}: page pool shape/strides must match its declaration",
+            )
+        for name, tensor, (shape, strides) in zip(("block_table", "block_table_v"), (block_table, block_table_v), self._sm80_paged_table_geometry):
+            self._value_error_if(tensor is None, f"{name} is required by this paged plan")
+            self._value_error_if(tensor.dtype != torch.int32 or tensor.device != self.q_desc.device, f"{name} must be int32 on Q's device")
+            self._value_error_if(tensor.data_ptr() % 4 != 0, f"{name} must be 4-byte aligned")
+            self._value_error_if(
+                tensor.ndim != 2 or tensor.shape[0] != shape[0] or tensor.shape[1] < shape[1], f"{name} must cover the declared batch and logical page count"
+            )
+            self._value_error_if(any(n > 1 and a != b for n, a, b in zip(shape, tensor.stride(), strides)), f"{name} strides must match its declaration")
 
     # ------------------------------------------------------------------
     def execute(
@@ -7167,21 +7238,42 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         current_stream: Optional[cuda.CUstream] = None,
         bias_tensor: Optional[torch.Tensor] = None,
         rope_freqs: Optional[torch.Tensor] = None,
+        block_table: Optional[torch.Tensor] = None,
+        block_table_v: Optional[torch.Tensor] = None,
     ) -> None:
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaFwdDslSm80 is not compiled")
+        self._value_error_if(
+            not self.paged and (block_table is not None or block_table_v is not None),
+            "page tables were not compiled into this specialization",
+        )
         if self.thd:
             self._value_error_if(
                 sinks is not None or bias_tensor is not None or rope_freqs is not None, "SM80 THD does not accept sinks, bias, or RoPE tensors"
             )
-            self._execute_thd(q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, seq_q_lens, seq_kv_lens, scale_softmax, workspace, current_stream)
+            self._execute_thd(
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                o_tensor,
+                lse_tensor,
+                seq_q_lens,
+                seq_kv_lens,
+                scale_softmax,
+                workspace,
+                current_stream,
+                block_table,
+                block_table_v,
+            )
             return
         if self._sm80_spec is not None:
             from cudnn.sdpa.fwd.prepared_sm80 import execute_tensors
 
             self._value_error_if(rope_freqs is not None, "rope_freqs was not compiled into this specialization")
             buffers = (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, seq_kv_lens, seq_q_lens, sinks, bias_tensor)
+            if self.paged:
+                buffers += (block_table, block_table_v)
             device = q_tensor.device
             context = nullcontext() if torch.cuda.current_device() == device.index else torch.cuda.device(device)
             with context:
