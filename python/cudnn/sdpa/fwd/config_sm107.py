@@ -409,6 +409,42 @@ def supports_native_d64_pack(d_shape, *, device_cc, fp8, paged, split_kv=1, cga=
     return device_cc == (10, 7) and d_shape == (64, 64) and not fp8 and not paged and (not thd or split_kv == 1 or cga in (None, 1)) and cga in (None, 1, 2)
 
 
+def supports_native_d128_single_q(
+    d_shape,
+    *,
+    device_cc,
+    half_precision,
+    thd,
+    paged,
+    cga,
+    split_kv=1,
+    pack_gqa=False,
+    tile_m=None,
+    tile_n=None,
+    has_bias=False,
+    has_kv_mask=False,
+    has_gate=False,
+    mixed_kv=False,
+):
+    """Explicit one-Q warp topology, shared by graph and standalone admission."""
+    return (
+        device_cc == (10, 7)
+        and d_shape == (128, 128)
+        and half_precision
+        and thd
+        and not paged
+        and cga == 1
+        and split_kv == 1
+        and not pack_gqa
+        and tile_m in (None, 128)
+        and tile_n in (None, 128)
+        and not has_bias
+        and not has_kv_mask
+        and not has_gate
+        and not mixed_kv
+    )
+
+
 def supports_native_d128_narrow_tile(d_shape, *, device_cc, half_precision, thd, paged, cga, split_kv=1, has_bias=False, has_kv_mask=False):
     """Whether TILE_N=64 selects the native D128 two-score-slot pipeline.
 
@@ -2517,7 +2553,27 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     cta_mma = params.cta_mma
     dtype_o = resolve_dtype_o(params)
     b, b_o = bpe(params.dtype_qkv), bpe(dtype_o)
-    tile_k = tile_o = 256
+    # The explicit one-Q D128 topology reuses this family's parity pipeline.
+    single_q_d128 = params.softmax_wgs == 1
+    if single_q_d128 and not (
+        not mxfp8
+        and params.dtype_qkv in (_DTYPE_BF16, _DTYPE_FP16)
+        and params.d_flavor == 128
+        and params.cta_mma == 1
+        and params.thd_varlen
+        and not params.paged_kv
+        and not params.pack_gqa
+        and params.split_kv == 1
+        and params.tile_n == 128
+        and params.s_slots == 2
+        and not params.q_in_tmem
+        and not params.epilogue_gate
+        and not params.bias_mode
+        and not params.kv_mask_form
+        and params.dtype_kv == -1
+    ):
+        raise ValueError("single-Q D128 requires half THD CTA1 N128, unsplit/unpacked/unpaged and two S slots")
+    tile_k = tile_o = 128 if single_q_d128 else 256
     tile_n = 128
     # STAGES_KV is a TUNING KNOB again (2..4), and the note that said otherwise
     # was WRONG about why.

@@ -86,6 +86,7 @@ from cudnn.sdpa.fwd.config_sm107 import (
     SM107_TILE_NS_BY_D_SHAPE,
     SM107_FP8_TILE_NS_BY_D_SHAPE,
     supports_native_d128_narrow_tile,
+    supports_native_d128_single_q,
 )
 from cudnn.sdpa.fwd.config_sm120 import (
     D512_FLAVOR,
@@ -170,6 +171,8 @@ class SdpaFwdKnobs:
     # KV-split count: each Q tile's KV range cut into this many chunks, each
     # run by its own CTA, recombined by the split_combine pass. 1 = off.
     split_kv: Optional[int] = None
+    # Warp-specialization topology: 0 = existing topology, 1 = one full Q tile.
+    warp_spec_cfg: Optional[int] = None
 
     # field name -> cudnn.knob_type member name (resolved lazily: the compiled
     # module is not importable at class-definition time in every build).
@@ -180,6 +183,7 @@ class SdpaFwdKnobs:
         ("cga", "TILE_CGA_M"),
         ("pack_gqa", "PACK_GQA"),
         ("split_kv", "SPLIT_KV"),
+        ("warp_spec_cfg", "WARP_SPEC_CFG"),
     )
 
     def to_public(self) -> dict:
@@ -605,6 +609,9 @@ class Capabilities:
                 "spellings must state the same claim (clear the flags or widen the band) -- conflicting declarations "
                 "are never silently resolved"
             )
+
+    # Append-only public warp-topology knob domain.
+    warp_spec_cfgs: frozenset[int] = frozenset({0})
 
 
 def _mixed_fp8_kv(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
@@ -1609,6 +1616,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             (knobs.tile_n, effective_tile_ns(capabilities, facts, knobs), "tile_n"),
             (knobs.cga, effective_cgas(capabilities, facts, knobs.split_kv, knobs.cga), "cga"),
             (knobs.pack_gqa, capabilities.pack_gqas, "pack_gqa"),
+            (knobs.warp_spec_cfg, capabilities.warp_spec_cfgs, "warp_spec_cfg"),
         ):
             if value is not None and value not in domain:
                 return f"requested {label}={value} is outside this engine's domain {sorted(domain, key=int)}"
@@ -1620,6 +1628,23 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             and not native_d192_paged_leg(capabilities, facts, knobs)
         ):
             return "native SM107 paged D192/V128 requires two CTAs and no split"
+        if knobs.warp_spec_cfg == 1 and not supports_native_d128_single_q(
+            (facts.d_qk, facts.d_v),
+            device_cc=facts.device_cc,
+            half_precision=facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16),
+            thd=facts.thd,
+            paged=facts.has_paged_kv,
+            cga=knobs.cga,
+            split_kv=knobs.split_kv or 1,
+            pack_gqa=knobs.pack_gqa,
+            tile_m=knobs.tile_m,
+            tile_n=knobs.tile_n,
+            has_bias=facts.bias_t is not None,
+            has_kv_mask=facts.kv_mask_t is not None,
+            has_gate=facts.epilogue_gate_t is not None,
+            mixed_kv=not facts.uniform_dtype,
+        ):
+            return "WARP_SPEC_CFG=1 requires native half D128 THD, CTA1 M128 N128, unsplit/unpacked/unpaged, without bias, KV mask or gate"
         grid_reason = launch_grid_mismatch(capabilities, facts, knobs)
         if grid_reason is not None:
             return grid_reason
@@ -2765,6 +2790,7 @@ def _sm107_spec() -> EngineSpec:
                 ((192, 128), frozenset({SCHED_NATURAL, SCHED_LPT})),
                 ((256, 256), frozenset({SCHED_NATURAL, SCHED_LPT})),
             ),
+            warp_spec_cfgs=frozenset({0, 1}),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
@@ -3581,6 +3607,7 @@ def lower_dsl_prefill(
         cga=knobs.cga if knobs is not None else None,
         pack_gqa=knobs.pack_gqa if knobs is not None else None,
         split_kv=knobs.split_kv if knobs is not None else None,
+        **({"softmax_wgs": 1} if knobs is not None and knobs.warp_spec_cfg == 1 else {}),
         softmax_precision=facts.softmax_precision,  # op attribute (None = the f32 pipeline)
         # Op attribute attn_scale_prefolded -> the adapter's softmax_scale_prefolded (the row's
         # attn_scale_prefolded_d_shapes claim gated it; every forward adapter declares the kwarg).

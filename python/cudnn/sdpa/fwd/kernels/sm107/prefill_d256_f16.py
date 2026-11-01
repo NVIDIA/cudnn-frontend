@@ -293,6 +293,10 @@ _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
 # The THD body already claims work through a device counter. Bound its
 # launch to resident workers rather than the declared sequence envelope.
 THD_PERSISTENT = True
+if PARAMS.softmax_wgs == 1:
+    # Bound the explicit one-Q topology from storage capacity without a D2H read.
+    THD_INITIAL_WAVES = 2
+    THD_INITIAL_WORK_RATIO = (1, 1)
 _dispatch_decode_initial = _sdpa_h.dispatch_decode_initial
 _dispatch_decode_payload = _sdpa_h.dispatch_decode_payload
 _thd_tma_offsets = _sdpa_h.thd_tma_offsets

@@ -1204,7 +1204,11 @@ def test_capabilities_positional_prefix_is_append_only():
     # divisibility rule). The canonical band set and independent-pool capability are appended in that order.
     first_appended = start + len(legacy_tail)
     assert names[first_appended : first_appended + len(appended)] == list(appended), names[start:]
-    assert names[-2:] == ["band", "independent_paged_pool_counts"], names[-3:]
+    # Pin this historical segment while permitting future fields after it.
+    band_start = names.index("band")
+    band_segment = ["band", "independent_paged_pool_counts", "warp_spec_cfgs"]
+    assert names[band_start : band_start + len(band_segment)] == band_segment, names[band_start:]
+    assert caps.warp_spec_cfgs == frozenset({0})
 
     # Positional construction in the PRE-BAND order (every row's spelling before the canonical model landed) still binds every
     # field, and the appended band set is DERIVED from those flags rather than shadowing them.  The row built here carries the
