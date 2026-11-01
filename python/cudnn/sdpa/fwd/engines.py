@@ -335,7 +335,7 @@ class Capabilities:
     # padded-Q trim itself (a graph with per-batch Q lengths compiles the
     # SEQ_Q_LENS_PRESENT specialization), so there is no separate capability.
     padded_stats: bool = False
-    # s_q == 1 (decode-shaped) graphs; the SM80 prefill kernels are gated off.
+    # Whether the row serves s_q == 1 (decode-shaped) graphs.
     decode: bool = True
 
     # Escape hatch for kernels whose persistent multi-wave rescheduling is
@@ -3296,7 +3296,9 @@ def _sm80_spec() -> EngineSpec:
             stats=True,
             stats_log2=True,
             padded_stats=True,
-            decode=False,
+            # One live query uses the same predicated native forward body.
+            # Dense, THD and paged inputs retain their own addressing contracts.
+            decode=True,
             # The kernels implement the dense padded-Q trim natively
             # (per-batch ``seq_len_q`` forward kwarg): rows >= seq_len_q[b]
             # are written explicitly by the kernel (O := 0, LSE := -inf).
