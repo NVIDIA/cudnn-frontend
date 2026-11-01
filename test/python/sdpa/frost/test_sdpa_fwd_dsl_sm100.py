@@ -3397,3 +3397,5 @@ class TestD192PhysicalOrigins:
     import sdpa_d192_origins as _checks
 
     test_independent_origins = staticmethod(_checks.test_independent_origins)
+    test_split_independent_origins = staticmethod(_checks.test_split_independent_origins)
+    test_split_origins_require_matching_extension = staticmethod(_checks.test_split_origins_require_matching_extension)

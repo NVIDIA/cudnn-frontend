@@ -1679,6 +1679,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             and not getattr(cudnn._pybind_module._SdpaThdBinder, "supports_nonpaged_d128_split_physical_origins", False)
         ):
             return "nonpaged D128 split physical origins require the matching native cuDNN Frontend extension"
+        if (
+            packed_split
+            and facts.device_cc in ((10, 0), (10, 3), (10, 7))
+            and not facts.has_paged_kv
+            and (facts.d_qk, facts.d_v) == (192, 128)
+            and not getattr(cudnn._pybind_module._SdpaThdBinder, "supports_nonpaged_d192_split_physical_origins", False)
+        ):
+            return "nonpaged D192 split physical origins require the matching native cuDNN Frontend extension"
         if packed_split and not getattr(
             cudnn._pybind_module._SdpaThdBinder,
             (
@@ -3645,7 +3653,6 @@ def lower_dsl_prefill(
             and (facts.d_qk, facts.d_v) == (192, 128)
             and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
             and not facts.has_paged_kv
-            and api.split_kv == 1
         )
         or (
             # The SM90 row (f16/bf16, nonpaged, unsplit, ungated by its capabilities) reads every
