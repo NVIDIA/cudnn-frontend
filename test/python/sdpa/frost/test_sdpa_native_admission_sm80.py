@@ -85,6 +85,32 @@ def _mismatch(direction, facts):
     return module.mismatch(module._sm80_spec().capabilities, facts)
 
 
+@pytest.mark.parametrize("d,dv", [(512, 512), (576, 512), (288, 384), (520, 504)])
+@pytest.mark.parametrize("thd", [False, True])
+def test_wide_forward_admission_keeps_backward_boundary(d, dv, thd):
+    descs, facts = _forward_thd_case(d, dv) if thd else (_descs(d, dv), _facts("fwd", _descs(d, dv)))
+    api = _api("fwd", descs, thd=thd, seq_kv_lens_present=thd, max_total_seq_len_q=64 if thd else None)
+    assert api.check_support()
+    assert (api.kernel_tile_m, api.kernel_tile_n, api.kernel_num_warps) == (32, 16, 4)
+    assert _mismatch("fwd", facts) is None
+    assert _mismatch("bwd", _facts("bwd", descs, thd=thd)) is not None
+
+
+@pytest.mark.parametrize("tile_m,tile_n", [(64, None), (128, None), (None, 32), (None, 64)])
+def test_wide_forward_declines_unbounded_explicit_geometry(tile_m, tile_n):
+    api = _api("fwd", _descs(576, 512), tile_m=tile_m, tile_n=tile_n)
+    with pytest.raises(ValueError, match="wide heads require"):
+        api.check_support()
+
+
+@pytest.mark.parametrize("d,dv", [(584, 512), (512, 520)])
+def test_wide_forward_declines_outside_native_envelope(d, dv):
+    api = _api("fwd", _descs(d, dv))
+    with pytest.raises(ValueError, match="exceeds supported envelope"):
+        api.check_support()
+    assert _mismatch("fwd", _facts("fwd", _descs(d, dv))) is not None
+
+
 @pytest.mark.parametrize("direction,role", [("fwd", n) for n in DATA_ROLES[:4]] + [("bwd", n) for n in DATA_ROLES])
 def test_unaligned_data_declines_before_compile(direction, role):
     descs = _descs(bad_role=role)

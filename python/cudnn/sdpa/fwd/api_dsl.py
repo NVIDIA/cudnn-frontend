@@ -6558,12 +6558,15 @@ _SM80_FLAVOR_CFGS = {
     "llama": _sm80_config.LLAMA_CFG,
     "dsv3": _sm80_config.DSV3_CFG,
     "qwen": _sm80_config.QWEN_CFG,
+    "wide512": _sm80_config.WIDE512_CFG,
+    "mla576": _sm80_config.MLA576_CFG,
 }
 
 # (D_QK, D_V) envelope per flavor.
 _SM80_FLAVOR_DIMS = {name: (cfg.D_QK, cfg.D_V) for name, cfg in _SM80_FLAVOR_CFGS.items()}
 
-# (tile_m, num_warps, tile_n) per flavor — frozen from the A100 perf sweep.
+# (tile_m, num_warps, tile_n) per flavor. Wide heads use a bounded
+# two-column-partition tile; their geometry has no performance claim yet.
 _SM80_FLAVOR_KNOBS = {name: (cfg.TILE_M, cfg.NUM_WARPS, cfg.TILE_N) for name, cfg in _SM80_FLAVOR_CFGS.items()}
 
 # Causal L2 budget (MiB) for ``sched=lpt_l2`` per flavor.  Larger d_qk
@@ -6573,22 +6576,23 @@ _SM80_FLAVOR_CAUSAL_L2_MIB = {
     "gptoss": 16,
     "dsv3": 8,
     "qwen": 8,
+    "wide512": 8,
+    "mla576": 8,
 }
 
 # Ascending (D_QK, D_V) order so the flavor pick walks closest-from-above.
-_SM80_SUPPORTED_FLAVORS = ("gptoss", "llama", "dsv3", "qwen")
+_SM80_SUPPORTED_FLAVORS = ("gptoss", "llama", "dsv3", "qwen", "wide512", "mla576")
 
 # Flavors that route to the dedicated d=256 kernel (symmetric K+V prefetch);
 # all others use the shared generic kernel.
-_SM80_D256_FLAVORS = ("qwen",)
+_SM80_D256_FLAVORS = ("qwen", "wide512", "mla576")
 
 
 def _sm80_pick_flavor(d_qk: int, d_v: int) -> str:
     """Smallest kernel flavor whose ``(D_QK, D_V)`` envelope covers
     ``(d_qk, d_v)``.  Exact-match wins when both axes match; otherwise walk
-    gptoss → llama → dsv3 → qwen and pick the first that fits.  Raises if
-    nothing fits (heads bigger than the qwen envelope are not supported on
-    SM80 yet)."""
+    the supported flavors in ascending order and pick the first that fits.
+    Raises if either head dimension exceeds the native envelopes."""
     for flavor in _SM80_SUPPORTED_FLAVORS:
         fdqk, fdv = _SM80_FLAVOR_DIMS[flavor]
         if d_qk == fdqk and d_v == fdv:
@@ -6597,11 +6601,7 @@ def _sm80_pick_flavor(d_qk: int, d_v: int) -> str:
         fdqk, fdv = _SM80_FLAVOR_DIMS[flavor]
         if d_qk <= fdqk and d_v <= fdv:
             return flavor
-    raise ValueError(
-        f"SM80 SDPA: no flavor envelope covers (D_QK={d_qk}, D_V={d_v}).  "
-        f"Supported envelopes: {_SM80_FLAVOR_DIMS}.  Heads larger than qwen "
-        "(256/256) are not yet ported to SM80."
-    )
+    raise ValueError(f"SM80 SDPA: no flavor envelope covers (D_QK={d_qk}, D_V={d_v}).  " f"Supported envelopes: {_SM80_FLAVOR_DIMS}.")
 
 
 def _sm80_resolve_scheduler(
@@ -6977,6 +6977,10 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         if short_d256 and self.kernel_tile_m == 64:
             tile_n_default = 32
         self.kernel_tile_n = tile_n_default if self.tile_n is None else int(self.tile_n)
+        self._value_error_if(
+            self.flavor in ("wide512", "mla576") and (self.kernel_tile_m, self.kernel_tile_n, self.kernel_num_warps) != (32, 16, 4),
+            "SM80 wide heads require TILE_M=32 and TILE_N=16 with four warps",
+        )
         self._value_error_if(
             self.cga not in (None, 1),
             f"SM80 SDPA has no CGA clustering; cga must be 1 (or unset), got {self.cga}",
