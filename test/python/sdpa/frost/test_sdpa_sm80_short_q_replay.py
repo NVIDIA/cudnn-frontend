@@ -15,20 +15,28 @@ pytestmark = [pytest.mark.L0, requires_dsl, pytest.mark.skipif(_SM != 80, reason
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
-    "sq,tile_m,mask,d",
+    "sq,tile_m,mask,d,dv",
     [
-        (8, None, "none", 128),
-        (64, None, "causal", 128),
-        (8, None, "br", 128),
-        (64, None, "swa", 128),
-        (8, None, "br_swa", 128),
-        (65, None, "none", 128),
-        (129, 64, "causal", 128),
-        (64, 128, "none", 128),
-        (129, 64, "causal", 96),
+        (8, None, "none", 128, 128),
+        (64, None, "causal", 128, 128),
+        (8, None, "br", 128, 128),
+        (64, None, "swa", 128, 128),
+        (8, None, "br_swa", 128, 128),
+        (65, None, "none", 128, 128),
+        (129, 64, "causal", 128, 128),
+        (64, 128, "none", 128, 128),
+        (129, 64, "causal", 96, 96),
+        (96, None, "br", 128, 128),
+        (128, None, "swa", 128, 128),
+        (129, None, "none", 128, 128),
+        (8, None, "none", 192, 128),
+        (64, None, "br_swa", 192, 128),
+        (65, None, "causal", 192, 128),
+        (64, 128, "none", 192, 128),
+        (129, 64, "causal", 192, 128),
     ],
 )
-def test_short_q_masked_rebind_replay(sq, tile_m, mask, d, dtype):
+def test_short_q_masked_rebind_replay(sq, tile_m, mask, d, dv, dtype):
     torch.manual_seed(721)
     b, h, hk, sk = 2, 8, 2, 257
     causal = mask in ("causal", "br", "br_swa")
@@ -38,11 +46,11 @@ def test_short_q_masked_rebind_replay(sq, tile_m, mask, d, dtype):
 
     def buffers():
         tensors = []
-        for heads, seq in ((h, sq), (hk, sk), (hk, sk)):
-            tensors.append(torch.randn(b, seq, heads, d + 8, device="cuda", dtype=dtype)[..., :d].transpose(1, 2))
-        ob = torch.full((b, sq, h, d + 8), 77, device="cuda", dtype=dtype)
+        for heads, seq, width in ((h, sq, d), (hk, sk, d), (hk, sk, dv)):
+            tensors.append(torch.randn(b, seq, heads, width + 8, device="cuda", dtype=dtype)[..., :width].transpose(1, 2))
+        ob = torch.full((b, sq, h, dv + 8), 77, device="cuda", dtype=dtype)
         lb = torch.full((b, h, sq * 2), 77.0, device="cuda")
-        return [*tensors, ob[..., :d].transpose(1, 2), lb[..., ::2]], ob, lb
+        return [*tensors, ob[..., :dv].transpose(1, 2), lb[..., ::2]], ob, lb
 
     values, ob, lb = buffers()
     api = SdpaFwdDslSm80(
@@ -55,7 +63,8 @@ def test_short_q_masked_rebind_replay(sq, tile_m, mask, d, dtype):
         sched_policy=2 if causal else 0,
     )
     assert api.check_support()
-    expected = tile_m if tile_m is not None else (64 if sq <= 64 else 128)
+    short_q = (d == dv == 128 and sq <= 128) or (d == 192 and dv == 128 and sq <= 64)
+    expected = tile_m if tile_m is not None else (64 if short_q else 128)
     assert (api.kernel_tile_m, api.kernel_num_warps) == (expected, expected // 16)
     api.compile()
     artifact = api._compiled_kernel
@@ -78,7 +87,7 @@ def test_short_q_masked_rebind_replay(sq, tile_m, mask, d, dtype):
             ref_o = scores.softmax(-1) @ v.double().repeat_interleave(h // hk, 1)
             torch.testing.assert_close(o.double(), ref_o, atol=4e-3, rtol=1e-2)
             torch.testing.assert_close(lse.double(), ref_lse * (math.log2(math.e) if log2 else 1), atol=2e-3, rtol=1e-3)
-            assert torch.all(ob[..., d:] == 77)
+            assert torch.all(ob[..., dv:] == 77)
             assert torch.all(lb[..., 1::2] == 77)
 
         api.execute(*values)
@@ -98,12 +107,13 @@ def test_short_q_masked_rebind_replay(sq, tile_m, mask, d, dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_thd_explicit_64_row_tile(dtype):
+@pytest.mark.parametrize("d", [128, 192])
+def test_thd_explicit_64_row_tile(dtype, d):
     from cudnn.api_base import TensorDesc
     from test_sdpa_fwd_thd_sm80 import _make_graph
 
     torch.manual_seed(722)
-    _, pack, nodes, (cq, ck) = _make_graph((8, 129), (257, 193), hkv=1, dtype=dtype, causal=True)
+    _, pack, nodes, (cq, ck) = _make_graph((8, 129), (257, 193), hkv=1, d=d, dv=128, dtype=dtype, causal=True)
     q, k, v, o, stats = nodes
     descs = {
         "sample_"
@@ -144,7 +154,7 @@ def test_thd_explicit_64_row_tile(dtype):
             qs = pack[q][0, cq[i] : cq[i + 1]].transpose(0, 1).double()
             ks = pack[k][0, ck[i] : ck[i + 1]].transpose(0, 1).double().repeat_interleave(2, 0)
             vs = pack[v][0, ck[i] : ck[i + 1]].transpose(0, 1).double().repeat_interleave(2, 0)
-            scores = qs @ ks.transpose(-1, -2) / math.sqrt(128)
+            scores = qs @ ks.transpose(-1, -2) / math.sqrt(d)
             scores.masked_fill_(torch.arange(ks.shape[1], device="cuda")[None, :] > torch.arange(qs.shape[1], device="cuda")[:, None], float("-inf"))
             expected = (scores.softmax(-1) @ vs).transpose(0, 1)
             torch.testing.assert_close(pack[o][0, cq[i] : cq[i + 1]].double(), expected, atol=4e-3, rtol=1e-2)
