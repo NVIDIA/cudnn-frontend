@@ -53,7 +53,7 @@ from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES as _SM107_F16_THD_S
 from cudnn.sdpa.fwd.config_sm107 import supports_native_d128_dense_partial_pack, supports_native_d128_narrow_tile, supports_native_d512_dense_pack_split
 from cudnn.sdpa.fwd.config_sm107 import SM107_F16_SMALL_D_SHAPES as _SM107_F16_SMALL_D_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import SM107_SMALL_D_NATIVE_LEGS as _SM107_SMALL_D_NATIVE_LEGS
-from cudnn.sdpa.fwd.config_sm107 import supports_native_d64_pack
+from cudnn.sdpa.fwd.config_sm107 import supports_native_d64_pack, supports_native_d256_dense_split
 from cudnn.sdpa.fwd.config_sm107 import SM107_SMALL_D_CGAS as _SM107_SMALL_D_CGAS
 from cudnn.sdpa.fwd.config_sm107 import sm107_small_tile_leg as _sm107_small_tile_leg
 from cudnn.sdpa.fwd.config_sm107 import SM107_FP8_THD_SHAPES as _SM107_FP8_THD_SHAPES
@@ -1681,7 +1681,7 @@ class SdpaFwdDsl(APIBase):
         * SM120: its ``sO`` aliases ``sKV``, so there is no room to widen the O
           tile, and it keeps half partials.
         * SM107 (Rubin) outside per-tensor FP8 and half D64/D128/D192, native
-          half D512 2x2, and the d256 DECODE tile: the other siblings do not carry the FP32
+          half D256 dense prefill, half D512 2x2, and the d256 DECODE tile: the other siblings do not carry the FP32
           partial-output slot.  The decode tile (sm107/decode_d256_f16.py) is
           the SM100 body and stores fp32 partials unconditionally under a split
           (its O slot and o_partial slot are both Float32 then), so it takes
@@ -1706,6 +1706,7 @@ class SdpaFwdDsl(APIBase):
                 or bool(self._fp8 and self._pertensor and self.flavor in _SM107_FP8_SPLIT_SHAPES)
                 or self._decode_q_tile() > 0
                 or self._rubin_native_d512_leg()
+                or self._rubin_native_d256_split_leg()
             )
         if self._fp8 and not self._pertensor and self.flavor == (512, 512):
             return False  # MXFP8 d512: split-capable, no o_partial_f32 slot
@@ -2205,6 +2206,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and self.thd
             and ((self.flavor == (192, 128) and not self.paged) or (self.flavor == (128, 128) and self.split_kv > 1))
         )
+
+    def _rubin_native_d256_split_leg(self) -> bool:
+        return supports_native_d256_dense_split(self.flavor, device_cc=self._device_cc, fp8=self._fp8, thd=self.thd, paged=self.paged, pack_gqa=self.pack_gqa)
 
     def _rubin_native_d512_leg(self) -> bool:
         return supports_native_d512_dense_pack_split(self.flavor, device_cc=self._device_cc, fp8=self._fp8, thd=self.thd, paged=self.paged, cga=self.cga)
@@ -3361,8 +3365,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # (sm107/decode_d256_f16.py) writes the SM100 tile's fp32 split partials into the split-major
             # workspace that sm100/split_combine reduces, packed or not, over a dense or paged cache -- so a
             # decode-shaped half d256 graph keeps its split on cc 10.7 (engines.mismatch lifts the same two
-            # rules through d256_decode_tile_selected); the d256 PREFILL kernel's split stays the paged THD
-            # packed split.
+            # rules through d256_decode_tile_selected); half d256 prefill also splits on its native dense
+            # unpacked body and the shared paged THD packed body.
             _rubin_decode_tile = self._device_cc == (10, 7) and self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv)) > 0
             self._not_implemented_error_if(
                 self._device_cc == (10, 7)
@@ -3381,6 +3385,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._not_implemented_error_if(
                 self._device_cc == (10, 7)
                 and not _rubin_decode_tile
+                and not self._rubin_native_d256_split_leg()
                 and not self._rubin_native_d512_leg()
                 and not self._rubin_native_d64_pack_leg()
                 and not (
@@ -3388,7 +3393,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     or (not self._fp8 and self.flavor in ((128, 128), (192, 128)))
                     or (self._fp8 and self._pertensor and self.flavor in _SM107_FP8_SPLIT_SHAPES)
                 ),
-                "split_kv > 1 on cc10.7 requires half/per-tensor FP8 D64/D128 or D192/V128, per-tensor FP8 D256, half D256 THD, native dense D512 half, or the d256 decode tile",
+                "split_kv > 1 on cc10.7 requires half/per-tensor FP8 D64/D128 or D192/V128, per-tensor FP8 D256, half D256 THD or native dense unpacked prefill, native dense D512 half, or the d256 decode tile",
             )
             # The MXFP8 row serves its native d64 leg dense / unsplit / unpaged
             # (split_d_shapes leaves (64, 64) out); mirror it here.

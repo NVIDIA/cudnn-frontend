@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 import weakref
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 import cudnn
@@ -395,9 +395,32 @@ def analyze(graph: "cudnn.pygraph") -> Optional[NormGraphFacts]:
 @dataclass
 class NormBinding:
     tensors: dict  # role -> IR tensor
+    _index: Optional[tuple] = field(default=None, init=False, repr=False, compare=False)
 
     def bound_tensors(self) -> list:
         return [t for t in self.tensors.values() if t is not None]
+
+    def index(self) -> tuple:
+        """``(by_obj, by_uid, by_name)`` -- the resolution tables, built on the first execute (the graph is built by then,
+        so names and UIDs are final) and reused by every later one, as ``SdpaBinding.index`` does. A name or UID carried
+        by two bound tensors identifies neither."""
+        if self._index is None:
+            bound = self.bound_tensors()
+            name_counts: dict = {}
+            uid_counts: dict = {}
+            for t in bound:
+                nm = _safe_name(t)
+                if nm is not None:
+                    name_counts[nm] = name_counts.get(nm, 0) + 1
+                uid = _safe_uid(t)
+                if uid is not None:
+                    uid_counts[uid] = uid_counts.get(uid, 0) + 1
+            by_name = {_safe_name(t): t for t in bound if name_counts.get(_safe_name(t)) == 1}
+            by_uid = {_safe_uid(t): t for t in bound if uid_counts.get(_safe_uid(t)) == 1}
+            by_name.pop(None, None)
+            by_uid.pop(None, None)
+            self._index = ({id(t): t for t in bound}, by_uid, by_name)
+        return self._index
 
 
 def _safe_name(t: Any) -> Optional[str]:
@@ -422,22 +445,7 @@ def resolve_variant_pack(variant_pack: dict, binding: NormBinding) -> dict:
         raise TypeError(
             "cudnn.norm: compiled plans are called with a variant-pack dict " f"{{cudnn_tensor | uid | name: buffer}}; got {type(variant_pack).__name__}"
         )
-    bound = binding.bound_tensors()
-    by_obj = {id(t): t for t in bound}
-
-    name_counts: dict = {}
-    uid_counts: dict = {}
-    for t in bound:
-        nm = _safe_name(t)
-        if nm is not None:
-            name_counts[nm] = name_counts.get(nm, 0) + 1
-        uid = _safe_uid(t)
-        if uid is not None:
-            uid_counts[uid] = uid_counts.get(uid, 0) + 1
-    by_name = {_safe_name(t): t for t in bound if name_counts.get(_safe_name(t)) == 1}
-    by_uid = {_safe_uid(t): t for t in bound if uid_counts.get(_safe_uid(t)) == 1}
-    by_name.pop(None, None)
-    by_uid.pop(None, None)
+    by_obj, by_uid, by_name = binding.index()
 
     resolved: dict = {}
     for key, buf in variant_pack.items():
