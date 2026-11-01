@@ -56,7 +56,6 @@ from __future__ import annotations
 
 import math
 from functools import partial
-import torch
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -81,9 +80,6 @@ from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 
 from cudnn.deepseek_sparse_attention.utils.copy import cpasync_reduce_bulk_add_f32
-from cudnn.deepseek_sparse_attention.utils.runtime import (
-    resolve_stream as _resolve_stream,
-)
 from cudnn.deepseek_sparse_attention.utils.seqlen import seqlen_info as _seqlen_info
 
 mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd="rn")
@@ -2251,6 +2247,11 @@ def dense_indexer_backward_sm100(
 
 
 def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_scale, block_I, ratio, is_varlen, has_q_causal_offsets):
+    # torch is only needed by this PyTorch launch path; keep it out of module import so the
+    # JAX bindings can import the kernel classes without a torch install.
+    import torch
+
+    from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream as _resolve_stream
     from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
     if torch.cuda.get_device_capability()[0] < 10:

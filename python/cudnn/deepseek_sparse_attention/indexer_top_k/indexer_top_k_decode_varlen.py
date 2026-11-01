@@ -18,7 +18,6 @@
 import math
 
 import cuda.bindings.driver as cuda
-import torch
 from cudnn._cutlass_compat import SmemAllocator
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 
@@ -608,11 +607,14 @@ def _next_positive_power_of_2(x: int) -> int:
     return 1 << (x - 1).bit_length()
 
 
-_TORCH_TO_CUTLASS_DTYPE = {
-    torch.float16: cutlass.Float16,
-    torch.bfloat16: cutlass.BFloat16,
-    torch.float32: cutlass.Float32,
-}
+def _torch_to_cutlass_dtype(torch_dtype):
+    import torch  # lazy: the JAX path imports this module without torch installed
+
+    return {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+    }[torch_dtype]
 
 
 def _sm100_deterministic_bitmap_max_cols(dtype, top_k: int, large_occupancy: bool) -> int:
@@ -662,6 +664,8 @@ BUFFER_ALIGN = 32
 
 def buffer_numbers(torch_dtype) -> int:
     """int32 radix-scratch words per input element: two histogram passes for fp32."""
+    import torch  # lazy: the JAX path imports this module without torch installed
+
     return 2 if torch_dtype == torch.float32 else 1
 
 
@@ -684,7 +688,9 @@ def compile_topk_kernel(
     CURRENT device, which is part of the cache key; callers wrap this in
     ``torch.cuda.device(...)``.
     """
-    dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
+    import torch  # lazy: the JAX path imports this module without torch installed
+
+    dtype = _torch_to_cutlass_dtype(torch_dtype)
     bucketed_num_cols = _bucket_num_cols(num_cols)
 
     large_occupancy = num_rows > 148

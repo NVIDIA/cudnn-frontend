@@ -78,6 +78,36 @@ pip install nvidia-cudnn-frontend
 
 ## API Usage
 
+### JAX ops (SM100 DSv4)
+
+```python
+import jax.numpy as jnp
+from cudnn.ops import dsa
+
+scores = dsa.indexer_forward_jax(q, compressed_k, weights, ratio=4)
+topk_indices = dsa.indexer_top_k_forward_jax(scores, seq_lens, top_k=512)
+out, _, lse, _ = dsa.sparse_attention_forward_jax(
+    q_main, kv, global_indices, topk_lengths, attention_sinks,
+    indexer_topk=512, softmax_scale=1.0,
+)
+dq, dkv, dsink = dsa.sparse_attention_backward_jax(
+    q_main, kv, out, dout, lse, attention_sinks, global_indices, topk_lengths, softmax_scale=1.0
+)
+```
+
+`cudnn.ops.dsa` exports these JAX ops. They accept JAX arrays, eagerly or under
+`jax.jit`, require no PyTorch, and run on SM100-family GPUs. Forward and backward
+are separate calls; the caller owns the VJP.
+
+| Op | Contract |
+| --- | --- |
+| `indexer_forward_jax` | BF16 `q (B, S_q, 64, 128)`, `k (B, S_k, 1, 128)`, `weights (B, S_q, 64)`; `ratio=4`; `S_k` a multiple of 4. Returns FP32 ratio-causal scores, plus the row LSE with `return_lse=True` |
+| `indexer_top_k_forward_jax` | `scores (n_rows, num_cols)` FP32/FP16/BF16, int32 `seq_lens (n_rows,)`; `top_k <= 2048`. Returns unsorted int32 column ids, `-1`-padded |
+| `indexer_backward_jax` | Top-k KL indexer loss backward; `topk=512` only. `d_k` is FP32 |
+| `dense_indexer_backward_jax` | Dense KL indexer loss backward from `indexer_forward_jax(..., return_lse=True)`. `d_k` is FP32 |
+| `sparse_attention_forward_jax` | BF16 `q (T_q, 64, 512)`, `kv (T_kv, 512)`; int32 global indices `(T_q, K)` with `K` a multiple of 64 |
+| `sparse_attention_backward_jax` | Gradients of `q`, `kv` and the FP32 attention sinks |
+
 ### DSA Namespace
 
 ```python
