@@ -61,12 +61,18 @@ def _ln_bwd_kernel(
     has_mean: cutlass.Constexpr,
     has_beta: cutlass.Constexpr,
     affine: cutlass.Constexpr = None,
+    nslots: cutlass.Constexpr = 0,
 ) -> None:
     tid, _, _ = cute.arch.thread_idx()
     r, _, _ = cute.arch.block_idx()
     per_row: cutlass.Constexpr = affine is not None and affine[3]
     gamma_step: cutlass.Constexpr = 0 if per_row else 1
     gamma_base = cutlass.Int64(0)
+    # nslots > 0 (no affine): mDGamma / mDBeta are [nslots, M] partials and row r adds into slot r % nslots, so each
+    # address takes R / nslots atomics instead of R; _ln_bwd_finalize_kernel sums the slots.
+    slot_base = cutlass.Int64(0)
+    if cutlass.const_expr(nslots > 0):
+        slot_base = cutlass.Int64(r % nslots) * M
     if cutlass.const_expr(per_row):
         gamma_base = cutlass.Int64(r)
     elif cutlass.const_expr(affine is not None):
@@ -113,9 +119,9 @@ def _ln_bwd_kernel(
             else:
                 s_dxhat = s_dxhat + dxhat
                 s_dxhat_xhat = s_dxhat_xhat + dxhat * xhat
-                cute.arch.atomic_add(mDGamma.iterator + gamma_base + j * gamma_step, dy * xhat)
+                cute.arch.atomic_add(mDGamma.iterator + slot_base + gamma_base + j * gamma_step, dy * xhat)
                 if cutlass.const_expr(has_beta):
-                    cute.arch.atomic_add(mDBeta.iterator + gamma_base + j * gamma_step, dy)
+                    cute.arch.atomic_add(mDBeta.iterator + slot_base + gamma_base + j * gamma_step, dy)
             j = j + bt
     elif cutlass.const_expr(vec):
         xv = cute.zipped_divide(mX[r, None], (V,))
@@ -139,9 +145,9 @@ def _ln_bwd_kernel(
                 else:
                     s_dxhat = s_dxhat + dxhat
                     s_dxhat_xhat = s_dxhat_xhat + dxhat * xhat
-                    cute.arch.atomic_add(mDGamma.iterator + gamma_base + (j0 + e) * gamma_step, dy * xhat)
+                    cute.arch.atomic_add(mDGamma.iterator + slot_base + gamma_base + (j0 + e) * gamma_step, dy * xhat)
                     if cutlass.const_expr(has_beta):
-                        cute.arch.atomic_add(mDBeta.iterator + gamma_base + (j0 + e) * gamma_step, dy)
+                        cute.arch.atomic_add(mDBeta.iterator + slot_base + gamma_base + (j0 + e) * gamma_step, dy)
             vi = vi + bt
     else:
         j = tid
@@ -157,9 +163,9 @@ def _ln_bwd_kernel(
             else:
                 s_dxhat = s_dxhat + dxhat
                 s_dxhat_xhat = s_dxhat_xhat + dxhat * xhat
-                cute.arch.atomic_add(mDGamma.iterator + gamma_base + j * gamma_step, dy * xhat)
+                cute.arch.atomic_add(mDGamma.iterator + slot_base + gamma_base + j * gamma_step, dy * xhat)
                 if cutlass.const_expr(has_beta):
-                    cute.arch.atomic_add(mDBeta.iterator + gamma_base + j * gamma_step, dy)
+                    cute.arch.atomic_add(mDBeta.iterator + slot_base + gamma_base + j * gamma_step, dy)
             j = j + bt
 
     s_dxhat, s_dxhat_xhat = block_reduce_sum2(s_dxhat, s_dxhat_xhat, tid, red, bt)
@@ -255,6 +261,42 @@ def _ln_bwd_host(
         has_mean,
         has_beta,
     ).launch(stream=stream, grid=(R, 1, 1), block=(bt, 1, 1))
+
+
+@cute.jit
+def _ln_bwd_slots_host(
+    mDY,
+    mX,
+    mGamma,
+    mMean,
+    mRstd,
+    mDX,
+    mDGp,
+    mDBp,
+    mDGamma,
+    mDBeta,
+    R: cutlass.Int32,
+    M: cutlass.Constexpr,
+    V: cutlass.Constexpr,
+    bt: cutlass.Constexpr,
+    elem_bytes: cutlass.Constexpr,
+    stage_mode: cutlass.Constexpr,
+    vec: cutlass.Constexpr,
+    has_mean: cutlass.Constexpr,
+    has_beta: cutlass.Constexpr,
+    nslots: cutlass.Constexpr,
+    FB: cutlass.Constexpr,
+    fgrid: cutlass.Constexpr,
+    nchunk: cutlass.Constexpr,
+    CHUNK: cutlass.Constexpr,
+    stream: cuda.CUstream,
+) -> None:
+    _ln_bwd_kernel(mDY, mX, mGamma, mMean, mRstd, mDX, mDGp, mDBp, M, V, bt, elem_bytes, stage_mode, vec, has_mean, has_beta, None, nslots).launch(
+        stream=stream, grid=(R, 1, 1), block=(bt, 1, 1)
+    )
+    _ln_bwd_finalize_kernel(mDGp, mDBp, mDGamma, mDBeta, cutlass.Int32(nslots), M, FB, CHUNK, has_beta).launch(
+        stream=stream, grid=(fgrid, nchunk, 1), block=(FB, 1, 1)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -976,12 +1018,35 @@ def _sm_count():
 
 _KCACHE = {}
 
+# The plain route's dgamma / dbeta atomics: every one of R rows adds into the same M addresses, so a tall backward
+# serializes on them (C = 96: 1.08 ms at 130k rows where the native backend takes 0.15). Spread the rows over slots of
+# a [nslots, M] partial buffer, summed by the finalize kernel, once there are enough rows to pay for the extra launch
+# (B300: a loss of ~1.5 us below 512 rows, a win from 1024).
+_PLAIN_MIN_ROWS = 1024
+_PLAIN_ROWS_PER_SLOT = 16
+_PLAIN_MAX_SLOTS = 1024
+_PLAIN_SLOT_BUDGET = 1 << 21  # partial elements per gradient (8 MB of fp32): bounds the zeroing and the finalize read
+
+
+def _plain_bwd_slots(R, M):
+    """Slot count of the plain route's dgamma / dbeta partials; 0 = atomics straight into the [M] outputs."""
+    if R < _PLAIN_MIN_ROWS:
+        return 0
+    nslots = min(_PLAIN_MAX_SLOTS, R // _PLAIN_ROWS_PER_SLOT, _PLAIN_SLOT_BUDGET // M)
+    return nslots if nslots >= 2 else 0
+
+
+def _plain_scratch_bytes(spec, has_beta):
+    nslots = _plain_bwd_slots(spec.R, spec.M)
+    parts = [(nslots * spec.M, 4)] * ((2 if has_beta else 1) if nslots else 0)
+    return ws_bytes((spec.R, 4), *parts)  # the RMS mean placeholder, then the partials
+
 
 def scratch_bytes(spec, params, shape=None, has_beta=False, knobs=None):
     """Upper bound on the workspace this backward may carve.
 
     Mirrors ``backward``'s own dispatch rather than taking a blanket max over
-    the three routes: the plain route carves no partials at all, and the tiled
+    the three routes: the plain route carves partials only past its slot threshold, and the tiled
     route's grid cap (sm*12) is far above the pipelined one's, so a blanket max
     reported 58 MB where the chosen route used 9.7. The conditions live a dozen
     lines below in this same file, so they cannot drift the way a cross-module
@@ -991,7 +1056,7 @@ def scratch_bytes(spec, params, shape=None, has_beta=False, knobs=None):
     C, R = spec.M, spec.R
     wcfg = _bwd_pipe_cfg(C, eb)
     if wcfg is None:
-        return ws_bytes((R, 4))  # plain route: only the RMS mean placeholder
+        return _plain_scratch_bytes(spec, has_beta)
     _tpr, wn, ldgs, V = wcfg
     if wn == 1 and V >= 2 and not spec.has_mean and (R % 2 == 0) and not has_beta:
         RPT = 1
@@ -1005,7 +1070,7 @@ def scratch_bytes(spec, params, shape=None, has_beta=False, knobs=None):
         ctas = _pipe_bwd_cap(R, wn, C, _bwd_cache_xd(ldgs, V, R, C, has_beta, wn, eb), eb)
         parts = [(ctas * C, 4)] * (2 if has_beta else 1)
         return ws_bytes(*parts, (2 * spec.gamma_len, 4))
-    return ws_bytes((R, 4))  # plain route
+    return _plain_scratch_bytes(spec, has_beta)
 
 
 def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_dx=None, out_dgamma=None, out_dbeta=None, ws=None):
@@ -1032,6 +1097,25 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_d
     dx = torch.empty_like(x2d) if out_dx is None else out_dx
     dgamma = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device) if out_dgamma is None else out_dgamma.zero_()
     dbeta = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device) if out_dbeta is None else out_dbeta.zero_()
+
+    nslots = _plain_bwd_slots(spec.R, spec.M)
+    if nslots:
+        M = spec.M
+        dgp = ws_zeros(ws, nslots * M, torch.float32, x2d.device)
+        dbp = ws_zeros(ws, nslots * M, torch.float32, x2d.device) if has_beta else dgp
+        FB = 128 if M < 256 else 256
+        fgrid = (M + FB - 1) // FB
+        nchunk = min(nslots, max(1, min(32, 256 // fgrid)))
+        CHUNK = (nslots + nchunk - 1) // nchunk
+        args = (dyn(dy2d), dyn(x2d), dyn(gamma), dyn(mean), dyn(rstd), dyn(dx), dyn(dgp), dyn(dbp), dyn(dgamma), dyn(dbeta), cutlass.Int32(spec.R))
+        ce = (M, cfg.V, cfg.block_threads, cfg.elem_bytes, cfg.stage_mode, cfg.vec, spec.has_mean, has_beta, nslots, FB, fgrid, nchunk, CHUNK)
+        key = ("slots", params.io_dtype) + ce
+        fn = _KCACHE.get(key)
+        if fn is None:
+            fn = cute.compile(_ln_bwd_slots_host, *args, *ce, fake_stream())
+            _KCACHE[key] = fn
+        fn(*args, cur_stream())
+        return dx, dgamma, (dbeta if has_beta else None)
 
     args = (
         dyn(dy2d),
