@@ -3647,6 +3647,16 @@ def lower_dsl_prefill(
             and (api._rubin_native_d64_pack_leg() or api._rubin_native_d192_paged_leg())
         )
         or (
+            facts.thd
+            and facts.epilogue_gate_t is None
+            and spec.name in ("sdpa_fwd_prefill_sm100", "sdpa_fwd_prefill_sm107")
+            and facts.device_cc in ((10, 0), (10, 3), (10, 7))
+            and (facts.d_qk, facts.d_v) == (192, 128)
+            and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+            and not facts.has_paged_kv
+            and api.split_kv == 1
+        )
+        or (
             # The SM90 row (f16/bf16, nonpaged, unsplit, ungated by its capabilities) reads every
             # port's offsets: its setup launch builds per-sequence K/V/O maps at the origins.
             facts.thd

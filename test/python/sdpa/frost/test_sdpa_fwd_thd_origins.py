@@ -54,8 +54,9 @@ def test_independent_thd_origins_rebind_and_capture(
     dtype = getattr(torch, dtype_name)
     ports = ("q", "k", "v", "o", "stats")
     widths = (torch.int64, torch.int32, torch.int64, torch.int32, torch.int64)
-    # D576's +16 head padding must still represent integral token origins.
-    multipliers = (heads * (16 if d_qk == 576 else d_qk), 16 if d_qk == 576 else d_qk, 1, d_v, 1)
+    # D192/D576's +16 head padding must still represent integral token origins.
+    qk_multiplier = 16 if d_qk in (192, 576) else d_qk
+    multipliers = (heads * qk_multiplier, qk_multiplier, 1, d_v, 1)
     q_lengths, kv_lengths = [129, 0, 65, 33], [147, 0, 92, 50]
     log2_stats = stats_layout == "head"
 

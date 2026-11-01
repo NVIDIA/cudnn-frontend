@@ -1,5 +1,16 @@
 # FROST SDPA — support matrix
 
+**Half D192/V128 nonpaged THD origins:** SM100/SM103 and SM107 unsplit
+plans bind independent physical Q/K/V/O/Stats offsets. The two-CTA native
+bodies and existing single-CTA half path keep logical device lengths separate
+from storage origins, including mixed INT32/INT64 offsets and per-port
+multipliers. Sequence-local TMA maps clip interior tails; compact two-CTA
+origins retain one map per load port. Stats retains its token/head/padded
+layout, and retained captures consume current lengths and offsets. No tensor
+staging or caller API change is involved; split plans keep their existing
+origin contract. Native regressions are collected by `TestD192PhysicalOrigins`
+in both architecture CI entries.
+
 **Independent FP8 KV storage:** the SM100/SM103 and SM107 half forward rows serve exact
 D128 Q/K/V through plain `sdpa()` with BF16 or FP16 Q/O and matching E4M3 or
 E5M2 K/V. K/V are loaded and converted on chip; Q retains its original half
