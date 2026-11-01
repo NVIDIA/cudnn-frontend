@@ -743,7 +743,7 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         and not fp8
         and flavor == (64, 64)
         and params.cta_mma == 1
-        and params.split_kv > 1
+        and (params.split_kv > 1 or params.decode_tile)
         and not params.thd_varlen
         and not params.paged_kv
         and params.tile_n == 128
@@ -3747,10 +3747,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         base-2, split-KV partials) for graphs whose S_q x packed heads fit one
         128-row tile -- S_q = 1 decode and MTP. Explicit paged THD split
         plans use the same tile across multiple Q blocks. Other THD, larger
-        dense S_q and an explicit cga2 stay on the prefill tile.  d128 keys the same
+        dense S_q and an explicit cga2 stay on the prefill tile. SM107 uses
+        this specialization for dense unsplit N128 without prefolded scale.
+        d128 keys the same
         tile off cga1; d64 cannot, because cga1 IS its prefill width.
         """
-        if self._fp8 or self.flavor != (64, 64) or self._device_cc == (10, 7):
+        if self._fp8 or self.flavor != (64, 64):
+            return False
+        if self._device_cc == (10, 7) and (self.thd or self.paged or self.split_kv != 1 or self.softmax_scale_prefolded or self._effective_tile_n() != 128):
+            # Native THD, paged/envelope and prefolded-scale contracts keep
+            # their existing bodies. Dense split selection is handled by the
+            # loader independently of the short-Q unsplit specialization.
             return False
         if self.bias_desc is not None or self.kv_mask_desc is not None:
             # The decode tile carries no additive-bias / kv_mask arm (compile() refuses the operands): a d64 plan with either
