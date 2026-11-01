@@ -436,6 +436,11 @@ def supports_native_d128_dense_partial_pack(d_shape, *, device_cc, fp8, thd, pag
     return device_cc == (10, 7) and not fp8 and not thd and not paged and d_shape == (128, 128) and cga in (None, 2)
 
 
+def supports_native_d256_dense_split(d_shape, *, device_cc, fp8, thd, paged, pack_gqa):
+    """Dense unpacked half D256 uses native prefill FP32 split partials."""
+    return device_cc == (10, 7) and not fp8 and not thd and not paged and not pack_gqa and d_shape == (256, 256)
+
+
 def supports_native_d512_dense_pack_split(d_shape, *, device_cc, fp8, thd, paged, cga):
     """Dense half D512 uses the native 2x2 body for packed and split plans."""
     return device_cc == (10, 7) and not fp8 and not thd and not paged and d_shape == (512, 512) and cga in (None, 2)
@@ -1651,7 +1656,7 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     must also be a Capabilities decline — reaching this is an engine-row bug.
 
     ``split_wired`` identifies kernels with both SplitHelpers and FP32
-    partial-output stores: half and per-tensor FP8 D128/D192, plus per-tensor FP8 D256. The engine
+    partial-output stores: half and per-tensor FP8 D128/D192/D256. The engine
     row and standalone adapter expose the same flavor domain.
 
     ``block_scaled_o_wired`` says whether THIS flavor's kernel carries the
@@ -2498,10 +2503,12 @@ def _d256_read_tile_arrivers(cta_mma: int) -> int:
 def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     """The cc 10.7 d256 config (per-tensor FP8 or MXFP8): tile geometry, ring depths, warp layout and the SMEM / descriptor-window
     checks for the one-CTA and the 2-CTA-pair builds (``params.cta_mma``); raises with the failing tally on an impossible layout."""
-    split_wired = not mxfp8 and params.dtype_qkv in (_DTYPE_E4M3, _DTYPE_E5M2)
+    split_wired = not mxfp8 and params.dtype_qkv in (_DTYPE_E4M3, _DTYPE_E5M2, _DTYPE_BF16, _DTYPE_FP16)
     _validate_params(flavor, params, split_wired=split_wired)
     if (params.split_kv or 1) > 1 and params.thd_varlen:
-        raise ValueError(f"{flavor}: per-tensor FP8 split-KV is dense-only")
+        raise ValueError(f"{flavor}: native split-KV is dense-only")
+    if (params.split_kv or 1) > 1 and params.pack_gqa and params.dtype_qkv in (_DTYPE_BF16, _DTYPE_FP16):
+        raise ValueError(f"{flavor}: native half prefill split is unpacked")
     if params.pack_gqa and not mxfp8:
         if params.thd_varlen:
             raise ValueError(f"{flavor}: per-tensor FP8 PackGQA is dense-only")
