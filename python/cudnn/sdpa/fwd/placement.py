@@ -495,6 +495,8 @@ SM107_PAGED_D256_MTP_PAGE_SIZES = (16,)
 FP8_D512_WIDE_Q_HEADS = 32  # d512 with >= 32 query heads wins at every measured cache (0.20-0.73 GPU, 0.20-0.91 eager)
 FP8_MIN_KV_TOKENS = 1024  # below, a single-wave launch is host-bound: FROST's ~4 us extra submit cost loses eager 1.03-1.37
 FP8_D192_MAX_Q_TILES = 64  # d192 chunks: 16-64 tiles win 0.34-0.90; 128 tiles lose 1.19-1.72
+SM103_FP8_D192_LONG_CHUNK_MIN_S_Q = 512  # cc 10.3 causal d192 chunks from this many query tokens lead past FP8_D192_MAX_Q_TILES (B300)
+SM103_FP8_D192_LONG_CHUNK_MIN_S_KV = 4096  # shorter KV caches retain the existing query-tile policy
 FP8_D128_ANY_TILES_MAX_S_Q = 128  # d128 chunks with s_q <= 128 win at 64-512 tiles (0.21-0.68)
 SM100_FP8_DECODE_MIN_KV = 1024  # the measured decode caches: 4k / 64k grid, 1k-128k hold-out
 SM100_FP8_SINK_DECODE_MIN_KV_UNITS = 32  # d64 sink below 32 KV units: full-cache s_q == 1 loses 1.20-1.23, paged SWA s_q >= 2 1.09-1.49
@@ -811,7 +813,21 @@ def _place_sm100_fp8(caps: Capabilities, facts) -> str:
     if facts.s_q >= facts.s_kv:
         return TRAIL  # d128 squares parity (0.85-1.05), d192 0.84-1.01
     if flavor == (192, 128):
-        return LEAD if tiles <= FP8_D192_MAX_Q_TILES else TRAIL
+        # cc 10.3: the long-chunk study covers bottom-right causal MHA with E4M3 Q/K/V/O.
+        # Keep the existing tile policy for other alignments, grouped heads and dtypes.
+        # The long-chunk override is qualified from this KV length. Keep the existing tile policy on shorter caches.
+        # Per-tensor FP8 classes are excluded from the generated placement table, so this remains in the FP8 policy.
+        long_chunk = (
+            facts.device_cc == (10, 3)
+            and facts.causal
+            and facts.bottom_right
+            and facts.h_q == facts.h_kv
+            and facts.dtype == cudnn.data_type.FP8_E4M3
+            and facts.dtype_o == cudnn.data_type.FP8_E4M3
+            and facts.s_q >= SM103_FP8_D192_LONG_CHUNK_MIN_S_Q
+            and facts.s_kv >= SM103_FP8_D192_LONG_CHUNK_MIN_S_KV
+        )
+        return LEAD if tiles <= FP8_D192_MAX_Q_TILES or long_chunk else TRAIL
     return LEAD if tiles <= CHUNKED_MAX_Q_TILES or facts.s_q <= FP8_D128_ANY_TILES_MAX_S_Q else TRAIL
 
 

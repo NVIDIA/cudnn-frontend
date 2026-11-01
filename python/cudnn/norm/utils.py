@@ -29,6 +29,22 @@ def dyn(t):
     return from_dlpack(t, assumed_align=16).mark_layout_dynamic()
 
 
+def ffi(t):
+    """A torch tensor as a tvm-ffi launch argument: the tensor itself, detached when it is on an autograd tape (the same
+    export rule as :func:`dyn`). The tvm-ffi entry binds torch tensors natively, without a per-call DLPack round trip."""
+    return t.detach() if t.requires_grad else t
+
+
+def fake_rows(dtype, *cols, rows=None, align=16):
+    """A compile-time placeholder for a row-major ``[rows, *cols]`` operand whose row count is DYNAMIC (one compiled
+    artifact serves every R); ``rows`` is the shared ``cute.sym_int`` (pass the same symbol to every row-indexed
+    operand), ``dtype`` a cutlass element type. ``cols=()`` is a ``[rows]`` vector."""
+    import cutlass.cute as cute
+
+    shape = (rows,) + tuple(cols)
+    return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=tuple(range(len(shape) - 1, -1, -1)), assumed_align=align)
+
+
 def sm_count():
     """Multiprocessor count of the current device (cached)."""
     global _SM_COUNT
@@ -216,7 +232,11 @@ def cur_stream():
     """
     import torch
 
-    h = torch.cuda.current_stream().cuda_stream
+    from cudnn._torch_stream import _raw_current_stream
+
+    h = _raw_current_stream(torch, torch.cuda.current_device())  # ~0.3 us; current_stream() builds a Stream (~6 us)
+    if h is None:
+        h = torch.cuda.current_stream().cuda_stream
     s = _CU_STREAMS.get(h)
     if s is None:
         from cuda.bindings import driver as _drv
