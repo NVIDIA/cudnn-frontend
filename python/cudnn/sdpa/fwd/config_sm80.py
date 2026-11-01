@@ -144,7 +144,7 @@ def validate_params(p: TemplateParams) -> None:
     if p.d_v % 16 != 0 or p.d_v <= 0:
         raise ValueError(f"sm80: template d_v must be a positive multiple of 16 (cp.async + STG.128 epilogue); got {p.d_v}")
     if (p.d_qk, p.d_v) not in {(cfg.D_QK, cfg.D_V) for cfg in (GPTOSS_CFG, LLAMA_CFG, DSV3_CFG, QWEN_CFG, WIDE512_CFG, MLA576_CFG)}:
-        raise ValueError(f"sm80: (d_qk, d_v) = ({p.d_qk}, {p.d_v}) is not a swept flavor envelope")
+        raise ValueError(f"sm80: (d_qk, d_v) = ({p.d_qk}, {p.d_v}) is not a supported flavor envelope")
     if p.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2):
         raise ValueError(f"sm80: sched_policy must be a tile_dsl SCHED_* value; got {p.sched_policy}")
     if p.score_sign not in (-1, 0, 1):
@@ -160,7 +160,7 @@ def validate_params(p: TemplateParams) -> None:
 
 
 def params_for_flavor(flavor: str, **overrides) -> TemplateParams:
-    """A TemplateParams seeded from one swept flavor's Cfg row."""
+    """A TemplateParams seeded from one native flavor's Cfg row."""
     cfg = {"gptoss": GPTOSS_CFG, "llama": LLAMA_CFG, "dsv3": DSV3_CFG, "qwen": QWEN_CFG, "wide512": WIDE512_CFG, "mla576": MLA576_CFG}[flavor]
     base = dict(d_qk=cfg.D_QK, d_v=cfg.D_V, tile_m=cfg.TILE_M, num_warps=cfg.NUM_WARPS, tile_n=cfg.TILE_N)
     base.update(overrides)

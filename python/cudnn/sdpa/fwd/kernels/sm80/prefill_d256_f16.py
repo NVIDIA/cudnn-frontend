@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""SM80 (Ampere / A100) SDPA prefill at d_qk = d_v = 256, FP16 (qwen).
+"""SM80 (Ampere / A100) half SDPA prefill for D256 and wide heads.
 
 This file is a TEMPLATE: ``frost.template_loader.load_template`` re-executes
 it as a fresh module per ``config_sm80.TemplateParams`` (injected as the
@@ -19,6 +19,13 @@ but with a symmetric K + V prefetch pipeline that's a small perf gain
 at d=256 but a regression at d ≤ 192 (Llama / DSv3 / GPT-OSS) — those
 flavors stay on the simpler K-only-prefetch pipeline in
 ``sm80/prefill_f16.py``.
+
+Wide512/512 and MLA576/512 use TILE_M=32, TILE_N=16 and four warps.
+Pairs of warps own separate 256-column V slices of each 16-query slab.
+Q remains in shared memory throughout the KV loop, with four-register
+fragments reloaded for each QK step; V has a separate double buffer.
+Shared storage is 96/104 KiB respectively. The narrow Q/V aliasing and
+prologue register caching described below apply only to D256.
 
 Pipeline shape (qwen, d_qk = d_v = 256):
 

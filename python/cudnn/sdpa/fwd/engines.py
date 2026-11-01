@@ -2357,7 +2357,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         reason = capabilities.declaration_check(facts)
         if reason is not None:
             return reason
-    if facts.shape_overrides or _selected_d_shape(capabilities, facts, knobs) == SM100_NATIVE_D576_SHAPE:
+    if facts.shape_overrides or (capabilities.sm_lo in (100, 107) and _selected_d_shape(capabilities, facts, knobs) == SM100_NATIVE_D576_SHAPE):
         return _prepared_decline_reason(capabilities, facts, knobs.split_kv if knobs is not None else None)
     return None
 
@@ -3229,7 +3229,7 @@ def _sm107_mxfp8_spec() -> EngineSpec:
 def _sm80_spec() -> EngineSpec:
     """SM80 (A100) prefill row: lowers through ``lower_dsl_prefill`` onto the
     ``SdpaFwdDslSm80`` adapter (``fwd/api_dsl.py``), which owns kernel-flavor
-    selection (gptoss/llama/dsv3/qwen), native eight-aligned head-dim envelopes,
+    selection through the 576/512 envelope, native eight-aligned head dimensions,
     declared data strides, and per-shape kernel caching. Dense and packed THD
     graphs share the eight-aligned head-dim envelope. Dense graphs expose
     scheduler tuning; THD requires the natural 3-D grid."""
@@ -3242,7 +3242,7 @@ def _sm80_spec() -> EngineSpec:
             sm_lo=80,
             sm_hi=80,  # A100 exactly: the kernels assume its 164 KiB opt-in SMEM
             phase="prefill",
-            d_shapes=frozenset({(256, 256)}),  # flavor envelopes; masked native loads
+            d_shapes=frozenset({(256, 256), (512, 512), (576, 512)}),  # masked native loads
             d_pad_multiple=8,
             declaration_check=graph_mismatch,
             thd_d_shapes=None,  # logical widths reach the masked native packed host
