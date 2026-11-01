@@ -2295,3 +2295,14 @@ class TestNativeD256PhysicalOrigins:
     from native_d256_origins_sm107_checks import test_native_d256_independent_origins
 
     test_native_d256_independent_origins = staticmethod(test_native_d256_independent_origins)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeCausalZeroTail:
+    """Run causal suffix and phase-reuse checks in the native CI entry."""
+
+    from native_causal_zero_tail_sm107_checks import test_causal_tail_origins_and_replay
+
+    test_causal_tail_origins_and_replay = staticmethod(test_causal_tail_origins_and_replay)

@@ -10,6 +10,7 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from math import isfinite, prod
+from operator import index
 from typing import Any
 
 import cudnn
@@ -25,6 +26,8 @@ from .fusion_ir import (
     Dtype,
     FusionChain,
     FusionOp,
+    Axis,
+    IndexExpr,
     MatmulSpec,
     ReductionSpec,
     TensorRef,
@@ -137,6 +140,7 @@ class _RecordedOp:
     group_offset: int | None = None
     permutation: tuple[int, ...] = ()
     reshape_mode: str = "VIEW_ONLY"
+    index_expr: IndexExpr | None = None
 
 
 @dataclass
@@ -471,7 +475,7 @@ def _node_to_recorded_op(node: Any) -> "_RecordedOp | None":
         )
     if node_type == "POINTWISE":
         out = node.outputs["OUT_0"]
-        attrs = tuple(sorted((k, float(v)) for k, v in node.params.items() if k in _POINTWISE_ATTR_KEYS and v is not None))
+        attrs = tuple(sorted((k, int(v) if k == "axis" else float(v)) for k, v in node.params.items() if k in _POINTWISE_ATTR_KEYS and v is not None))
         return _RecordedOp(
             node.params.get("mode"),
             name,
@@ -1032,9 +1036,11 @@ def _build_epilogue_dag(
     for next_op in ordered_ops:
         if next_op.cudnn_name in _UNARY_OP_MAP:
             (parent_id,) = next_op.inputs
-            if next_op.cudnn_name == "gen_index" and dict(next_op.op_attrs).get("axis") not in (1, 2):
+            if next_op.cudnn_name == "gen_index" and next_op.index_expr is None and dict(next_op.op_attrs).get("axis") not in (1, 2):
                 raise NotImplementedError(f"gen_index {next_op.op_name!r}: only axis 1 (M) or 2 (N) is supported " "in cudnn.gemm.frost")
-            fop = FusionOp(op=_UNARY_OP_MAP[next_op.cudnn_name], parent_idx=_operand_ref(parent_id, next_op.op_name), attrs=next_op.op_attrs)
+            fop = FusionOp(
+                op=_UNARY_OP_MAP[next_op.cudnn_name], parent_idx=_operand_ref(parent_id, next_op.op_name), attrs=next_op.op_attrs, index_expr=next_op.index_expr
+            )
         elif next_op.cudnn_name in _BINARY_OP_MAP:
             inp0, inp1 = next_op.inputs
             in0, in1 = _is_in_chain(inp0), _is_in_chain(inp1)
@@ -1544,6 +1550,62 @@ def _build_multi_moe_chain(
     return chain, binding
 
 
+def matrix_axis_index(shape, axis):
+    """Map a logical rank-N matrix axis to folded (batch, M, N) coordinates.
+
+    Batch extents are prepared constants, matching the existing fixed-prefix
+    binding contract. Matrix coordinates remain dynamic; no M/N value is baked.
+    """
+    shape, axis = tuple(map(index, shape)), index(axis)
+    if len(shape) < 2 or any(d <= 0 for d in shape) or not 0 <= axis < len(shape):
+        raise ValueError(f"gen_index requires positive matrix dimensions and a valid logical axis; got shape={shape}, axis={axis}")
+    if max(prod(shape[:-2]), *shape) > (1 << 63) - 1:
+        raise ValueError("gen_index batch geometry exceeds Int64")
+    if axis == len(shape) - 2:
+        return IndexExpr.coordinate(Axis.M)
+    if axis == len(shape) - 1:
+        return IndexExpr.coordinate(Axis.N)
+    if shape[axis] == 1:
+        return IndexExpr.constant(0)
+    coordinate = IndexExpr.coordinate(Axis.BATCH).floor_div(prod(shape[axis + 1 : -2]))
+    # The leading batch axis has no higher digits to discard.
+    return coordinate if axis == 0 else coordinate.modulo(shape[axis])
+
+
+def _lower_matrix_indices(
+    ops: list[_RecordedOp], ranked_shapes: dict[int, tuple[int, ...]], producers: dict[int, _RecordedOp], matmul_output: int
+) -> list[_RecordedOp]:
+    """Lower graph index coordinates before matrix shapes are batch-folded.
+
+    This handles the plain pointwise/GEMM scope only: epilogue structural views
+    and reductions are excluded by the caller. Prepared batch extents are fixed,
+    while GEMM descendants retain live M/N even when prepared at extent one.
+    """
+
+    @lru_cache(maxsize=None)
+    def follows_matmul_shape(tid):
+        if tid == matmul_output:
+            return True
+        producer = producers.get(tid)
+        return producer is not None and any(follows_matmul_shape(i) for i in producer.inputs)
+
+    lowered = []
+    for op in ops:
+        if op.cudnn_name == "gen_index":
+            source = op.inputs[0]
+            dim = ranked_shapes[source]
+            expr = matrix_axis_index(dim, dict(op.op_attrs).get("axis"))
+            # Consumer matrix coordinates -> singleton producer coordinates.
+            # Auxiliary-only branches keep their unit extents when broadcast;
+            # compose before codegen/dtype rounding, not as a kernel fixup.
+            broadcast = {a: IndexExpr.constant(0) for a, extent in zip((Axis.M, Axis.N), dim[-2:]) if extent == 1}
+            if broadcast and not follows_matmul_shape(source):
+                expr = expr.substitute(broadcast)
+            op = replace(op, index_expr=expr)
+        lowered.append(op)
+    return lowered
+
+
 def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta], io_dtype: Dtype, intermediate_dtype: Dtype) -> list[_RecordedOp]:
     """Project ordered operand views through pointwise DAGs, then fold matrix rank.
 
@@ -1721,22 +1783,8 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
         # Ordered reshape views already prove their own layout. Do not put
         # untouched rank-3 slots on the general batch-fold path.
         matrix_views_required = (bool(structural) and not has_reshape) or output_dim != (prod(batch_shape), *output_dim[-2:])
-        # Index attributes describe the original logical tensor, not the kernel
-        # ABI. Only the final two axes have a one-to-one folded coordinate.
-        normalized_ops = []
-        for op in ops:
-            if op.cudnn_name == "gen_index":
-                rank = len(ranked_shapes[op.inputs[0]])
-                axis = dict(op.op_attrs).get("axis")
-                if axis not in (rank - 2, rank - 1):
-                    raise NotImplementedError(
-                        f"gen_index {op.op_name!r}: batch axis {axis} is unsupported; "
-                        f"only logical matrix axes {rank - 2} (M) and {rank - 1} (N) are supported"
-                    )
-                attrs = tuple((key, axis - rank + 3 if key == "axis" else value) for key, value in op.op_attrs)
-                op = replace(op, op_attrs=attrs)
-            normalized_ops.append(op)
-        ops = normalized_ops
+
+        ops = _lower_matrix_indices(ops, ranked_shapes, producers, mm.output)
         for tid, m in list(meta.items()):
             dim = ranked_shapes[tid]
             if len(dim) < 2:
