@@ -568,6 +568,8 @@ class Capabilities:
     # construction -- and a legacy flag that is SET but outside an explicit
     # claim is refused there, rather than letting field order decide.
     band: Optional["band.BandSupport"] = None
+    # Independent physical pool capacities are separate from shared H/page geometry.
+    independent_paged_pool_counts: bool = False
 
     def __post_init__(self) -> None:
         """Single normalization layer: legacy mask flags -> canonical band set."""
@@ -2002,6 +2004,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if knobs is not None and knobs.sched_policy not in (None, SCHED_NATURAL):
             return "SM80 THD forward requires the natural scheduler (the varlen grid is 3-D)"
         for name, tensor in (("Q", facts.q_t), ("K", facts.k_t), ("V", facts.v_t), ("O", facts.o_t)):
+            if facts.has_paged_kv and name in ("K", "V"):
+                continue  # Native pool layout/alignment is checked by declaration_check.
             reason = forward_thd_layout_mismatch(name, tensor.get_dim(), tensor.get_stride())
             if reason is not None:
                 return reason
@@ -2205,6 +2209,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "declare dim AND stride on the sdpa node's virtual O (set_dim/set_stride) -- the classic frontend requires it and FROST binds the mul output as O"
 
     if facts.has_paged_kv:
+        if not capabilities.independent_paged_pool_counts and facts.paged_pool_counts[0] != facts.paged_pool_counts[1]:
+            return "this engine requires equal K/V page-pool capacities"
         # The paged PREFILL pipeline on cc 10.7 is qualified for THD queries (with or without an
         # attention sink -- the per-row sink fold); the d256 DECODE tile (sm107/decode_d256_f16.py)
         # walks the block table itself and folds the sink per Q row, so a decode-shaped half d256
@@ -3248,6 +3254,8 @@ def _sm80_spec() -> EngineSpec:
             swa=True,
             padded=True,
             thd=True,
+            paged_kv=True,
+            independent_paged_pool_counts=True,
             cu_seq_len=True,
             sink=True,
             stats=True,
@@ -3494,6 +3502,25 @@ def lower_dsl_prefill(
         # Epilogue gate (sample_gate=) and the Amax_O fold-out (has_amax_o=):
         # feature-detected on the adapter's constructor, see the helper.
         **_epilogue_gate_ctor_kwargs(facts, _ctor_params, _exec_params, spec.name),
+        # SM80 reads physical element offsets independently of logical lengths.
+        **(
+            {
+                **{
+                    "sample_ragged_"
+                    + ("lse" if name == "stats" else name): (
+                        ga.tensor_desc_from_ir(getattr(getattr(facts, name + "_t"), "ragged_offset"), name="ragged_" + name)
+                        if getattr(getattr(facts, name + "_t"), "ragged_offset", None) is not None
+                        else None
+                    )
+                    for name in ("q", "k", "v", "o", "stats")
+                },
+                "ragged_offset_multipliers": tuple(
+                    int(t.get_ragged_offset_multiplier() or 1) if t is not None else 1 for t in (facts.q_t, facts.k_t, facts.v_t, facts.o_t, facts.stats_t)
+                ),
+            }
+            if facts.thd and "sample_ragged_q" in _ctor_params
+            else {}
+        ),
         # Score side outputs (score_max / score_sum_exp): plan-time state of the adapter like
         # sample_lse (None compiles the store out).  Forwarded only to a constructor that declares
         # them -- every other row's mismatch declined the ports already (the row-level flags).
@@ -3523,6 +3550,12 @@ def lower_dsl_prefill(
         **({"sample_bias": ga.tensor_desc_from_ir(facts.bias_t, name="bias")} if ("sample_bias" in _ctor_params and facts.has_bias) else {}),
         **({"sample_kv_mask": ga.tensor_desc_from_ir(facts.kv_mask_t, name="kv_mask")} if ("sample_kv_mask" in _ctor_params and facts.has_kv_mask) else {}),
     )
+    if facts.thd and spec.name == "sdpa_fwd_prefill_sm80":
+        # No ragged declaration means the port keeps its dense batch pitch.
+        api._thd_origin_batch_strides = tuple(
+            int(t.get_stride()[0]) if t is not None and getattr(t, "ragged_offset", None) is None and not (facts.has_paged_kv and i in (1, 2)) else None
+            for i, t in enumerate((facts.q_t, facts.k_t, facts.v_t, facts.o_t, facts.stats_t))
+        )
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
     if facts.thd and spec.name == "sdpa_fwd_prefill_sm80":
         # Variant-pack buffers may be flat or capacity-shaped; the graph's
@@ -3799,6 +3832,12 @@ def lower_dsl_prefill(
                 block_table=_table_view(bt_k, binding.paged_k_table, facts.b),
                 block_table_v=_table_view(bt_v, binding.paged_v_table, facts.b),
             )
+        if facts.thd and "sample_ragged_q" in _ctor_params:
+            for name in ("q", "k", "v", "o", "stats"):
+                offsets = getattr(binding, "ragged_" + name)
+                execute_kwargs["ragged_" + ("lse" if name == "stats" else name)] = (
+                    _need(resolved, offsets, name + " ragged offsets") if offsets is not None else None
+                )
         if thd_decode_leg:
             # The ragged offsets are bound operands of this leg (device reads).
             execute_kwargs.update(

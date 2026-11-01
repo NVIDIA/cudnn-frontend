@@ -2662,9 +2662,23 @@ head-major or token-major Stats. The head dimension is contiguous, head rows and
 token rows do not overlap, and the unused batch stride is ignored.
 The packed caller contract still applies: every sequence length is within its
 declared `S_max`, the Q/KV length sums fit the respective bound packed buffers
-and any `max_total_seq_len_*`, and ragged offsets describe the same adjacent
-sequences. Runtime lengths stay on device; the adapter cannot host-validate
-these values without breaking graph capture.
+and any `max_total_seq_len_*`. Forward Q/K/V/O/Stats each read their own
+INT32/INT64 physical offsets and positive element multiplier. Lengths describe
+live rows independently of gaps; O without offsets uses its declared dense
+batch pitch. Nonpaged graph inputs retain the shared requirement that Q/K/V
+all declare ragged offsets. Standalone packed-prefix calls remain supported. Physical live
+segments must fit their bound storage and preserve vector alignment; these
+device-value preconditions cannot be host-validated without breaking capture.
+`test_sdpa_fwd_origins_sm80.py` covers independent origins, poisoned gaps,
+metadata rebinding and changed offsets/lengths under retained replay.
+
+Forward paged KV serves all four native flavors and their aligned logical head
+envelopes, with dense or THD Q/O, independent HND/NHD pool strides and capacities,
+and independent K/V page-table strides. Page loads predicate both logical rows
+and head columns before reading the table. Paged pools cannot also carry ragged
+origins. No data staging or pool copies are used; THD retains its device lengths
+metadata launch. `test_sdpa_fwd_paged_sm80.py` covers native loading and binding.
+Paged backward and graph decode (`S_q == 1`) remain declined.
 
 Dense forward and backward admit head dimensions divisible by eight, within
 their existing flavor envelopes, and require every stepped data-port outer
@@ -2713,6 +2727,7 @@ early declines and legal dense/THD declarations without GPU allocation.
 | Bias / dBias | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | GQA / MQA | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | Deterministic | — / ✅ | — / ✅ | — / ✅ | — / ✅ |
+| Paged KV (dense / THD queries) | ✅ / ❌ | ✅ / ❌ | ✅ / ❌ | ✅ / ❌ |
 | Ragged `S_kv` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | Decode-shaped (`S_q == 1`) | ❌ / ❌ | ❌ / ❌ | ❌ / ❌ | ❌ / ❌ |
 

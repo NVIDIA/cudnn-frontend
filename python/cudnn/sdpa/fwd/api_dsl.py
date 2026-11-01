@@ -6625,7 +6625,9 @@ def _sm80_load_kernel_module(flavor: str, params):
     stem = os.path.splitext(os.path.basename(filename))[0]
     from cudnn.sdpa.fwd.kernels.sm80.paged_load import FROST_SOURCE_DIGEST as paged_load_digest
 
-    return load_template(path, params, tag=f"sm80_{stem}", extra_key=paged_load_digest)
+    from cudnn.sdpa.fwd.kernels.sm80.ragged_origin import FROST_SOURCE_DIGEST as ragged_origin_digest
+
+    return load_template(path, params, tag=f"sm80_{stem}", extra_key=f"{paged_load_digest}:{ragged_origin_digest}")
 
 
 def _sm80_sched_policy_int(token: str) -> int:
@@ -6655,7 +6657,21 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
     declarations and RoPE decline before compilation.
     """
 
-    def __init__(self, *args, scheduler: Optional[str] = None, bias_present: bool = False, bias_fp32: bool = False, rope_max_s: int = 0, **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        scheduler: Optional[str] = None,
+        bias_present: bool = False,
+        bias_fp32: bool = False,
+        rope_max_s: int = 0,
+        sample_ragged_q=None,
+        sample_ragged_k=None,
+        sample_ragged_v=None,
+        sample_ragged_o=None,
+        sample_ragged_lse=None,
+        ragged_offset_multipliers=(1, 1, 1, 1, 1),
+        **kwargs,
+    ) -> None:
         # SM80-only plan-time axes (see class docstring). ``scheduler`` is the
         # token override for standalone callers; the graph path leaves it None
         # and carries the heuristic's explicit sched_policy knob instead
@@ -6665,6 +6681,14 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._bias_fp32 = bool(bias_fp32)
         self._rope_max_s = int(rope_max_s)
         super().__init__(*args, **kwargs)
+        # Element offsets address each port independently; lengths still own
+        # the live rows. Device values never enter a compile key.
+        self._sm80_origin_multipliers = tuple(ragged_offset_multipliers)
+        self._value_error_if(len(self._sm80_origin_multipliers) != 5, "SM80 requires five ragged offset multipliers")
+        self._sm80_origin_descs = tuple(
+            self._make_tensor_desc(tensor, name="ragged_" + name)
+            for name, tensor in zip(("q", "k", "v", "o", "lse"), (sample_ragged_q, sample_ragged_k, sample_ragged_v, sample_ragged_o, sample_ragged_lse))
+        )
 
     def _initialize_implementation(self) -> None:
         self.flavor: Optional[str] = None
@@ -6690,6 +6714,10 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._t_kv_cap = 0
         self._thd_launch = None
         self._sm80_paged_table_geometry = None
+        self._sm80_origin_descs = (None,) * 5
+        self._sm80_origin_geometry = None
+        self._thd_origin_batch_strides = (None,) * 5
+        self._sm80_extended_origins = False
 
     # ------------------------------------------------------------------
     def check_support(self) -> bool:
@@ -6773,6 +6801,26 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             h_qo % h_kv != 0,
             f"H_q ({h_qo}) must be divisible by H_kv ({h_kv}) for GQA / MQA",
         )
+
+        origin_geometry = []
+        for index, desc in enumerate(self._sm80_origin_descs):
+            if desc is None:
+                origin_geometry.append(None)
+                continue
+            self._not_implemented_error_if(not self.thd, "SM80 physical origins require THD lengths")
+            self._not_implemented_error_if(self.paged and index in (1, 2), "paged K/V pools cannot also have ragged origins")
+            self._value_error_if(index == 4 and self.lse_desc is None, "Stats origins require a Stats output")
+            self._check_dtype(desc, [torch.int32, torch.int64], name=desc.name)
+            stepped = [(int(n), int(st)) for n, st in zip(desc.shape, desc.stride) if n != 1]
+            self._value_error_if(
+                len(stepped) != 1 or stepped[0][0] != b + 1 or stepped[0][1] <= 0,
+                f"{desc.name} must declare B+1 offsets along one positive-stride axis",
+            )
+            self._value_error_if(desc.device != self.q_desc.device, f"{desc.name} must be on Q's device")
+            multiplier = self._sm80_origin_multipliers[index]
+            self._value_error_if(type(multiplier) is not int or not 0 < multiplier < 2**63, f"{desc.name}: multiplier must be a positive int64 integer")
+            origin_geometry.append((str(desc.dtype), stepped[0][1], multiplier))
+        self._sm80_origin_geometry = tuple(origin_geometry) if any(g is not None for g in origin_geometry) else None
 
         max_d_qk = max(fdqk for fdqk, _ in _SM80_FLAVOR_DIMS.values())
         max_d_v = max(fdv for _, fdv in _SM80_FLAVOR_DIMS.values())
@@ -7019,6 +7067,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         if self.thd:
             from cudnn.sdpa.fwd.kernels.sm80.prepared_host import compile_thd_host
 
+            self._sm80_extended_origins = self.paged or self._sm80_origin_geometry is not None or any(s is not None for s in self._thd_origin_batch_strides)
             self._compiled_kernel, self._thd_launch = compile_thd_host(
                 self._k_mod,
                 self.h_q,
@@ -7038,6 +7087,8 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                     else None
                 ),
                 max_skv=self.s_k_max if self.paged else 0,
+                ragged_geometry=self._sm80_origin_geometry,
+                origin_batch_strides=self._thd_origin_batch_strides,
             )
             self._compile_thd_meta()
             self._logger.debug("compile completed")
@@ -7090,6 +7141,11 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         current_stream: Optional[cuda.CUstream],
         block_table: Optional[torch.Tensor] = None,
         block_table_v: Optional[torch.Tensor] = None,
+        ragged_q: Optional[torch.Tensor] = None,
+        ragged_k: Optional[torch.Tensor] = None,
+        ragged_v: Optional[torch.Tensor] = None,
+        ragged_o: Optional[torch.Tensor] = None,
+        ragged_lse: Optional[torch.Tensor] = None,
     ) -> None:
         """Bind native packed buffers and launch the already-compiled THD artifact."""
         import cutlass
@@ -7235,8 +7291,32 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 int(self.right_bound_runtime),
                 (1, 1, 1),
                 int(launch_stream),
-                *((block_table.data_ptr(), block_table_v.data_ptr()) if self.paged else ()),
+                *((block_table.data_ptr(), block_table_v.data_ptr()) if self.paged else (None, None) if self._sm80_extended_origins else ()),
+                *(
+                    (tuple(t.data_ptr() if t is not None else None for t in (ragged_q, ragged_k, ragged_v, ragged_o, ragged_lse)))
+                    if self._sm80_extended_origins
+                    else ()
+                ),
             )
+
+    def _check_sm80_origins(self, tensors):
+        """Check observable storage before any metadata/output write, without D2H.
+
+        Values are caller-owned element offsets: each live segment must fit
+        its port's storage and preserve the declared vector alignment.
+        """
+        for desc, tensor in zip(self._sm80_origin_descs, tensors):
+            self._value_error_if((desc is None) != (tensor is None), "SM80 ragged-origin presence must match the compiled plan")
+            if desc is None:
+                continue
+            self._value_error_if(
+                tensor.dtype != desc.dtype or tensor.device != self.q_desc.device, f"{desc.name}: runtime dtype/device must match its declaration"
+            )
+            self._value_error_if(tensor.data_ptr() % tensor.element_size() != 0, f"{desc.name}: runtime base must be element-aligned")
+            self._value_error_if(any(st < 0 for st in tensor.stride()), f"{desc.name}: negative storage strides are unsupported")
+            span = 0 if tensor.numel() == 0 else 1 + sum((n - 1) * st for n, st in zip(tensor.shape, tensor.stride()))
+            required = 1 + sum((n - 1) * st for n, st in zip(desc.shape, desc.stride))
+            self._value_error_if(span < required, f"{desc.name}: exposed storage span {span} is smaller than declared span {required}")
 
     def _check_sm80_paged_buffers(self, k_tensor, v_tensor, block_table, block_table_v):
         """Validate the fixed pools/tables before the packed metadata launch."""
@@ -7276,6 +7356,11 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         rope_freqs: Optional[torch.Tensor] = None,
         block_table: Optional[torch.Tensor] = None,
         block_table_v: Optional[torch.Tensor] = None,
+        ragged_q: Optional[torch.Tensor] = None,
+        ragged_k: Optional[torch.Tensor] = None,
+        ragged_v: Optional[torch.Tensor] = None,
+        ragged_o: Optional[torch.Tensor] = None,
+        ragged_lse: Optional[torch.Tensor] = None,
     ) -> None:
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
@@ -7284,6 +7369,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             not self.paged and (block_table is not None or block_table_v is not None),
             "page tables were not compiled into this specialization",
         )
+        self._check_sm80_origins((ragged_q, ragged_k, ragged_v, ragged_o, ragged_lse))
         if self.thd:
             self._value_error_if(
                 sinks is not None or bias_tensor is not None or rope_freqs is not None, "SM80 THD does not accept sinks, bias, or RoPE tensors"
@@ -7301,6 +7387,11 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 current_stream,
                 block_table,
                 block_table_v,
+                ragged_q,
+                ragged_k,
+                ragged_v,
+                ragged_o,
+                ragged_lse,
             )
             return
         if self._sm80_spec is not None:

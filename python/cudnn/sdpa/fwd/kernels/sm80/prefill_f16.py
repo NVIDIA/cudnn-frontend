@@ -110,6 +110,7 @@ from cudnn.frost.tile_dsl.pointwise import fp32_to_fp16  # noqa: E402
 from cudnn.frost.tile_dsl.rope import rope_rotate_smem_tile  # noqa: E402
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b  # noqa: E402
 from cudnn.sdpa.fwd.kernels.sm80.paged_load import load_kv_tile
+from cudnn.sdpa.fwd.kernels.sm80.ragged_origin import sequence_base
 from cudnn.frost.tile_dsl.tma import load_tile_2d, cp_async_commit, cp_async_wait  # noqa: E402
 from cudnn.frost.tile_dsl.mask import (  # noqa: E402
     MASK_NONE,
@@ -244,6 +245,13 @@ def _sdpa_kernel(
     # (consulted only when has_bias).
     paged_k_table: Optional[cute.Tensor] = None,
     paged_v_table: Optional[cute.Tensor] = None,
+    ragged_q: Optional[cute.Tensor] = None,
+    ragged_k: Optional[cute.Tensor] = None,
+    ragged_v: Optional[cute.Tensor] = None,
+    ragged_o: Optional[cute.Tensor] = None,
+    ragged_stats: Optional[cute.Tensor] = None,
+    origin_batch_strides: cutlass.Constexpr = (None, None, None, None, None),
+    origin_multipliers: cutlass.Constexpr = (1, 1, 1, 1, 1),
 ):
     # ---- derived shape / layout constants ---------------------------------
     # Folded at trace time — one compiled fn per (tile_m, num_warps, tile_n,
@@ -418,12 +426,9 @@ def _sdpa_kernel(
     if cutlass.const_expr(has_rope):
         rope_cs_ptr = Pointer(cutlass.make_array_view(rope_cs).data_ptr(), dtype=cutlass.Float32)
 
-    # THD/varlen: read per-batch cumulative seqlens → packed seq origins +
-    # per-batch lengths.  Q/O are packed [1,T,H,D]: sequence b's rows live at
-    # [cu_q[b], cu_q[b+1]); K/V at [cu_k[b], cu_k[b+1]).  The GMEM bases below
-    # use the seq origin (in rows) instead of the dense batch*S term; the dense
-    # path keeps batch*S.  s_q_b / s_kv_b feed the per-batch eff lengths +
-    # predication below.
+    # THD lengths come from device prefixes. Physical origins below can come
+    # from independent element offsets, a declared dense batch pitch, or these
+    # packed prefixes. Gaps in storage never change the effective lengths.
     if cutlass.const_expr(THD_VARLEN):
         _cuq = Pointer(cutlass.make_array_view(cu_q).data_ptr(), dtype=cu_q.element_type)
         _cuk = Pointer(cutlass.make_array_view(cu_k).data_ptr(), dtype=cu_k.element_type)
@@ -453,10 +458,10 @@ def _sdpa_kernel(
     O_ROW_STRIDE_E = cutlass.Int64(O.stride[1])
     q_row_base = q_tile_idx * tile_m
     if cutlass.const_expr(THD_VARLEN):
-        Q_BATCH_OFF = q_seq_origin * Q_ROW_STRIDE_E
-        O_BATCH_OFF = q_seq_origin * O_ROW_STRIDE_E
-        K_BATCH_OFF = kv_seq_origin * K_ROW_STRIDE_E
-        V_BATCH_OFF = kv_seq_origin * V_ROW_STRIDE_E
+        Q_BATCH_OFF = sequence_base(ragged_q, batch_idx, q_seq_origin * Q_ROW_STRIDE_E, origin_batch_strides[0], origin_multipliers[0])
+        O_BATCH_OFF = sequence_base(ragged_o, batch_idx, q_seq_origin * O_ROW_STRIDE_E, origin_batch_strides[3], origin_multipliers[3])
+        K_BATCH_OFF = sequence_base(ragged_k, batch_idx, kv_seq_origin * K_ROW_STRIDE_E, origin_batch_strides[1], origin_multipliers[1])
+        V_BATCH_OFF = sequence_base(ragged_v, batch_idx, kv_seq_origin * V_ROW_STRIDE_E, origin_batch_strides[2], origin_multipliers[2])
     else:
         Q_BATCH_OFF = cutlass.Int64(batch_idx) * cutlass.Int64(Q.stride[0])
         O_BATCH_OFF = cutlass.Int64(batch_idx) * cutlass.Int64(O.stride[0])
@@ -472,7 +477,8 @@ def _sdpa_kernel(
         LSE_view = cutlass.make_array_view(LSE)
         LSE_S_STRIDE_E = cutlass.Int64(LSE.stride[2])
         if cutlass.const_expr(THD_VARLEN):
-            LSE_BASE = cutlass.Int64(head_idx) * cutlass.Int64(LSE.stride[1]) + (q_seq_origin + cutlass.Int64(q_row_base)) * LSE_S_STRIDE_E
+            LSE_BATCH_OFF = sequence_base(ragged_stats, batch_idx, q_seq_origin * LSE_S_STRIDE_E, origin_batch_strides[4], origin_multipliers[4])
+            LSE_BASE = LSE_BATCH_OFF + cutlass.Int64(head_idx) * cutlass.Int64(LSE.stride[1]) + cutlass.Int64(q_row_base) * LSE_S_STRIDE_E
         else:
             LSE_BASE = (
                 cutlass.Int64(batch_idx) * cutlass.Int64(LSE.stride[0])
@@ -1624,6 +1630,13 @@ def _sdpa_host(
     stream: cuda.CUstream,
     paged_k_table: Optional[cute.Tensor] = None,
     paged_v_table: Optional[cute.Tensor] = None,
+    ragged_q: Optional[cute.Tensor] = None,
+    ragged_k: Optional[cute.Tensor] = None,
+    ragged_v: Optional[cute.Tensor] = None,
+    ragged_o: Optional[cute.Tensor] = None,
+    ragged_stats: Optional[cute.Tensor] = None,
+    origin_batch_strides: cutlass.Constexpr = (None, None, None, None, None),
+    origin_multipliers: cutlass.Constexpr = (1, 1, 1, 1, 1),
 ):
     if cutlass.const_expr((paged_k_table is not None) != bool(PARAMS.paged_page_size) or (paged_v_table is not None) != bool(PARAMS.paged_page_size)):
         raise ValueError("SM80 page tables must match the paged specialization")
@@ -1686,6 +1699,13 @@ def _sdpa_host(
         inv_softmax_scale,
         paged_k_table,
         paged_v_table,
+        ragged_q,
+        ragged_k,
+        ragged_v,
+        ragged_o,
+        ragged_stats,
+        origin_batch_strides,
+        origin_multipliers,
     ).launch(
         grid=grid,
         block=(threads, 1, 1),

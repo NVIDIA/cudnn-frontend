@@ -245,6 +245,13 @@ def _thd_host(
     paged_v: Optional[cute.Pointer] = None,
     paged_geometry: cutlass.Constexpr = None,
     max_skv: cutlass.Constexpr = 0,
+    ragged_q: Optional[cute.Pointer] = None,
+    ragged_k: Optional[cute.Pointer] = None,
+    ragged_v: Optional[cute.Pointer] = None,
+    ragged_o: Optional[cute.Pointer] = None,
+    ragged_stats: Optional[cute.Pointer] = None,
+    ragged_geometry: cutlass.Constexpr = (None, None, None, None, None),
+    origin_batch_strides: cutlass.Constexpr = (None, None, None, None, None),
 ):
     p = module.PARAMS
     d_qk, d_v = dimensions
@@ -311,6 +318,13 @@ def _thd_host(
         stream,
         _view(paged_k, paged_geometry[2]) if cutlass.const_expr(p.paged_page_size > 0) else None,
         _view(paged_v, paged_geometry[3]) if cutlass.const_expr(p.paged_page_size > 0) else None,
+        _view(ragged_q, ((n_seq + 1,), (ragged_geometry[0][1],))) if cutlass.const_expr(ragged_q is not None) else None,
+        _view(ragged_k, ((n_seq + 1,), (ragged_geometry[1][1],))) if cutlass.const_expr(ragged_k is not None) else None,
+        _view(ragged_v, ((n_seq + 1,), (ragged_geometry[2][1],))) if cutlass.const_expr(ragged_v is not None) else None,
+        _view(ragged_o, ((n_seq + 1,), (ragged_geometry[3][1],))) if cutlass.const_expr(ragged_o is not None) else None,
+        _view(ragged_stats, ((n_seq + 1,), (ragged_geometry[4][1],))) if cutlass.const_expr(ragged_stats is not None) else None,
+        origin_batch_strides,
+        tuple(g[2] if g is not None else 1 for g in ragged_geometry),
     )
 
 
@@ -398,6 +412,8 @@ def compile_thd_host(
     dimensions=None,
     paged_geometry=None,
     max_skv=0,
+    ragged_geometry=None,
+    origin_batch_strides=(None, None, None, None, None),
 ):
     """One pointer artifact per immutable flavor/head/mask contract."""
     p = module.PARAMS
@@ -435,11 +451,24 @@ def compile_thd_host(
             dimensions=dimensions,
             paged_geometry=paged_geometry,
             max_skv=max_skv,
+            ragged_geometry=ragged_geometry,
+            origin_batch_strides=origin_batch_strides,
         ),
         "prepared_thd",
     )
+    extended = bool(p.paged_page_size) or ragged_geometry is not None or any(s is not None for s in origin_batch_strides)
+    extra = ()
+    if p.paged_page_size or extended:
+        table_ptr = lambda: cute.runtime.make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=4)
+        extra = (table_ptr() if p.paged_page_size else None, table_ptr() if p.paged_page_size else None, paged_geometry, max_skv)
+    if extended:
+        ragged_geometry = (None,) * 5 if ragged_geometry is None else ragged_geometry
+        extra += tuple(
+            cute.runtime.make_ptr(aux_types[g[0]], 16, cute.AddressSpace.gmem, assumed_align=aux_types[g[0]].width // 8) if g is not None else None
+            for g in ragged_geometry
+        ) + (ragged_geometry, origin_batch_strides)
     artifact = compile_cached(
-        _thd_host if p.paged_page_size else thd_host,
+        _thd_host if p.paged_page_size or extended else thd_host,
         *pointers,
         *(cutlass.Int64(0) for _ in range(9)),
         cutlass.Float32(0),
@@ -456,16 +485,7 @@ def compile_thd_host(
         o_stride,
         dimensions,
         driver.CUstream(0),
-        *(
-            (
-                cute.runtime.make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=4),
-                cute.runtime.make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=4),
-                paged_geometry,
-                max_skv,
-            )
-            if p.paged_page_size
-            else ()
-        ),
+        *extra,
         options="--enable-tvm-ffi --gpu-arch=sm_80",
         cache_key=key,
         symbol="frost_sdpa_fwd_thd",

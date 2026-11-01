@@ -51,7 +51,12 @@ def _api(direction, descs, **kwargs):
 
 def _facts(direction, descs, *, thd=False):
     def ref(desc):
-        return SimpleNamespace(get_dim=lambda: desc.shape, get_stride=lambda: desc.stride, get_data_type=lambda: cudnn.data_type.BFLOAT16)
+        return SimpleNamespace(
+            get_dim=lambda: desc.shape,
+            get_stride=lambda: desc.stride,
+            get_data_type=lambda: cudnn.data_type.BFLOAT16,
+            ragged_offset=SimpleNamespace() if thd else None,
+        )
 
     q, k, v = (descs[n] for n in ("q", "k", "v"))
     return ga.SdpaGraphFacts(
@@ -182,3 +187,12 @@ def test_backward_incomplete_auxiliary_declarations_decline(missing):
     kwargs = {"sample_" + n: desc for n, desc in aux.items() if n != missing}
     with pytest.raises(NotImplementedError, match=missing):
         _api("bwd", descs, has_bias=True, bias_is_fp32=True, **kwargs).check_support()
+
+
+def test_forward_thd_dense_port_keeps_batch_stride():
+    descs, facts = _forward_thd_case(128, 128)
+    facts.o_t.ragged_offset = None
+    assert "o" in _mismatch("fwd", facts)
+    dense_o = _descs(128, 128)["o"]
+    facts.o_t.get_stride = lambda: dense_o.stride
+    assert _mismatch("fwd", facts) is None

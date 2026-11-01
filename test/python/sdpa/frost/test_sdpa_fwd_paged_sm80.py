@@ -6,10 +6,11 @@ import math
 
 import pytest
 import torch
+import cudnn
 
 from cudnn.api_base import TensorDesc
 from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm80, _sm80_pick_flavor
-from frost_test_utils import _SM, requires_dsl
+from frost_test_utils import _SM, requires_dsl, select_engine
 
 pytestmark = [pytest.mark.L0, requires_dsl, pytest.mark.skipif(_SM != 80, reason="requires native SM80")]
 
@@ -28,7 +29,8 @@ _POINTS = [
 @pytest.mark.parametrize("point", _POINTS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("thd", [False, True])
-def test_native_paged_adapter_rebind_replay(point, dtype, thd, monkeypatch):
+@pytest.mark.parametrize("graph_mode", [False, True])
+def test_native_paged_adapter_rebind_replay(point, dtype, thd, graph_mode, cudnn_handle, monkeypatch):
     import cutlass.cute as cute
 
     index = _POINTS.index(point) * 4 + (2 if dtype == torch.float16 else 0) + int(thd)
@@ -36,7 +38,7 @@ def test_native_paged_adapter_rebind_replay(point, dtype, thd, monkeypatch):
     d, dv, page, klayout, vlayout, mask = point
     torch.manual_seed(721 + index)
     b, h, hk, max_sq, max_skv, tq = 3, 8, 2, 65, 129, 89
-    cap = tq if thd else max_sq
+    cap = (tq + 64 if graph_mode else tq) if thd else max_sq
     qbatch = 1 if thd else b
     npages = (max_skv + page - 1) // page
     causal, br, swa = mask in ("causal", "br", "br_swa"), mask in ("br", "br_swa"), mask in ("swa", "br_swa")
@@ -107,14 +109,61 @@ def test_native_paged_adapter_rebind_replay(point, dtype, thd, monkeypatch):
         paged_table_v_stride=tuple(vt.stride()),
     )
     assert api.check_support()
-    api.compile()
-    artifact = api._compiled_kernel
-    workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda") if thd else None
+    if graph_mode:
+        io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+        fe = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        inputs = [fe.tensor(name=desc.name, dim=desc.shape, stride=desc.stride, data_type=io) for desc in descs[:3]]
+        lengths = [fe.tensor(name=name, dim=(b + int(thd), 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32) for name in ("qlen", "klen")]
+        tables = [
+            fe.tensor(name=name, dim=(b, 1, npages, 1), stride=(table.stride(0), 0, table.stride(1), 1), data_type=cudnn.data_type.INT32)
+            for name, table in (("kt", kt), ("vt", vt))
+        ]
+        opts = {("cu_seq_len_q" if thd else "seq_len_q"): lengths[0], ("cu_seq_len_kv" if thd else "seq_len_kv"): lengths[1]}
+        if thd:
+            opts["max_total_seq_len_q"] = cap
+        out, st = fe.sdpa(
+            q=inputs[0],
+            k=inputs[1],
+            v=inputs[2],
+            name="paged",
+            attn_scale=1 / math.sqrt(d),
+            generate_stats=True,
+            use_padding_mask=True,
+            use_causal_mask=causal and not br,
+            use_causal_mask_bottom_right=causal and br,
+            sliding_window_length=32 if swa else None,
+            stats_use_log2=br,
+            paged_attention_k_table=tables[0],
+            paged_attention_v_table=tables[1],
+            paged_attention_max_seq_len_kv=max_skv,
+            **opts,
+        )
+        out.set_output(True).set_data_type(io).set_dim(descs[3].shape).set_stride(descs[3].stride)
+        st.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim((*lse_desc.shape, 1)).set_stride((*lse_desc.stride, 1))
+        origins = []
+        if thd:
+            for name, node in (("q", inputs[0]), ("o", out), ("stats", st)):
+                origin = fe.tensor(name=name + "_origin", dim=(b + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64)
+                node.set_ragged_offset(origin)
+                origins.append(origin)
+        fe.validate()
+        fe.build_operation_graph()
+        fe.create_execution_plans([cudnn.heur_mode.A])
+        select_engine(fe, "sdpa_fwd_prefill_sm80")
+        fe.check_support()
+        fe.build_plans()
+        artifact = fe
+        workspace = torch.empty(max(1, fe.get_workspace_size()), dtype=torch.uint8, device="cuda")
+    else:
+        api.compile()
+        artifact = api._compiled_kernel
+        workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda") if thd else None
     for binding in range(2):
         if binding:
             buffers, ob, lb = allocate()
         q, k, v, o, stats, klens, qlens, kt, vt = buffers
         graph = torch.cuda.CUDAGraph()
+        origin_buffers = [torch.empty(b + 1, dtype=torch.int64, device="cuda") for _ in range(3)] if graph_mode and thd else []
         try:
             for phase, (qs, ks) in enumerate((((65, 8, 16), (129, 33, 0)), ((8, 33, 0), (33, 129, 0)))):
                 cq, ck = [0], [0]
@@ -123,6 +172,12 @@ def test_native_paged_adapter_rebind_replay(point, dtype, thd, monkeypatch):
                     ck.append(ck[-1] + y)
                 qlens.copy_(torch.tensor(cq if thd else qs, device="cuda", dtype=torch.int32))
                 klens.copy_(torch.tensor(ck if thd else ks, device="cuda", dtype=torch.int32))
+                qstarts = ([5, 75, 105] if phase == 0 else [3, 49, 113]) if graph_mode and thd else cq[:-1]
+                ostarts = [x + 7 for x in qstarts] if graph_mode and thd else qstarts
+                lstarts = [x + 13 for x in qstarts] if graph_mode and thd else qstarts
+                if origin_buffers:
+                    for buf, starts, stride in zip(origin_buffers, (qstarts, ostarts, lstarts), (q.stride(1), o.stride(1), stats.stride(2))):
+                        buf.copy_(torch.tensor([x * stride for x in starts] + [cap * stride], dtype=torch.int64, device="cuda"))
                 q.mul_(-0.7)
                 k.fill_(float("nan"))
                 v.fill_(float("nan"))
@@ -140,7 +195,7 @@ def test_native_paged_adapter_rebind_replay(point, dtype, thd, monkeypatch):
                         count = min(page, sk - pg * page)
                         k[ki, :count].copy_(kk[pg * page : pg * page + count])
                         v[vi, :count].copy_(vv[pg * page : pg * page + count])
-                    qq = q[0, cq[batch] : cq[batch + 1]] if thd else q[batch, :sq]
+                    qq = q[0, qstarts[batch] : qstarts[batch] + sq] if thd else q[batch, :sq]
                     scores = qq.transpose(0, 1).double() @ kk.transpose(0, 1).double().repeat_interleave(h // hk, 0).transpose(-1, -2) / math.sqrt(d)
                     qp = torch.arange(sq, device="cuda")[:, None] + (sk - sq if br else 0)
                     kp = torch.arange(sk, device="cuda")[None, :]
@@ -168,23 +223,48 @@ def test_native_paged_adapter_rebind_replay(point, dtype, thd, monkeypatch):
                             guard.setattr(torch, "zeros", forbidden)
                             guard.setattr(torch.Tensor, "contiguous", forbidden)
                             guard.setattr(torch.Tensor, "clone", forbidden)
-                            api.execute(
-                                q.transpose(1, 2),
-                                k.transpose(1, 2),
-                                v.transpose(1, 2),
-                                o.transpose(1, 2),
-                                stats,
-                                seq_q_lens=qlens,
-                                seq_kv_lens=klens,
-                                workspace=workspace,
-                                block_table=kt,
-                                block_table_v=vt,
-                            )
+                            if graph_mode:
+                                vp = dict(
+                                    zip(
+                                        (*inputs, out, st, *lengths, *tables, *origins),
+                                        (
+                                            q.transpose(1, 2),
+                                            k.transpose(1, 2),
+                                            v.transpose(1, 2),
+                                            o.transpose(1, 2),
+                                            stats,
+                                            qlens,
+                                            klens,
+                                            kt,
+                                            vt,
+                                            *origin_buffers,
+                                        ),
+                                    )
+                                )
+                                previous = cudnn.get_stream(cudnn_handle)
+                                try:
+                                    cudnn.set_stream(cudnn_handle, torch.cuda.current_stream().cuda_stream)
+                                    fe.execute(vp, workspace, handle=cudnn_handle)
+                                finally:
+                                    cudnn.set_stream(cudnn_handle, previous)
+                            else:
+                                api.execute(
+                                    q.transpose(1, 2),
+                                    k.transpose(1, 2),
+                                    v.transpose(1, 2),
+                                    o.transpose(1, 2),
+                                    stats,
+                                    seq_q_lens=qlens,
+                                    seq_kv_lens=klens,
+                                    workspace=workspace,
+                                    block_table=kt,
+                                    block_table_v=vt,
+                                )
                     finally:
                         torch.cuda.set_sync_debug_mode(before)
-                    assert api._compiled_kernel is artifact
+                    assert (fe if graph_mode else api._compiled_kernel) is artifact
 
-                if phase == 0 and binding == 0 and point == _POINTS[0] and dtype == torch.bfloat16:
+                if not graph_mode and phase == 0 and binding == 0 and point == _POINTS[0] and dtype == torch.bfloat16:
                     for bad_table in (None, kt.to(torch.int64), kt[: b - 1], kt.contiguous()):
                         with pytest.raises(ValueError):
                             api.execute(
@@ -205,8 +285,8 @@ def test_native_paged_adapter_rebind_replay(point, dtype, thd, monkeypatch):
                 else:
                     graph.replay()
                 for batch, (sq, sk) in enumerate(zip(qs, ks)):
-                    actual_o = o[0, cq[batch] : cq[batch + 1]] if thd else o[batch, :sq]
-                    actual_l = stats[0, :, cq[batch] : cq[batch + 1]] if thd else stats[batch, :, :sq]
+                    actual_o = o[0, ostarts[batch] : ostarts[batch] + sq] if thd else o[batch, :sq]
+                    actual_l = stats[0, :, lstarts[batch] : lstarts[batch] + sq] if thd else stats[batch, :, :sq]
                     torch.testing.assert_close(actual_o.double(), refs[batch][0], atol=4e-3, rtol=1e-2)
                     torch.testing.assert_close(actual_l.double(), refs[batch][1], atol=2e-3, rtol=1e-3)
                     if not thd:
@@ -215,7 +295,12 @@ def test_native_paged_adapter_rebind_replay(point, dtype, thd, monkeypatch):
                 assert torch.all(ob[..., dv:] == 77)
                 assert torch.all(lb[..., cap:] == 77) if thd else torch.all(lb[..., 1::2] == 77)
                 if thd:
-                    assert torch.all(o[0, cq[-1] :] == 77) and torch.all(stats[0, :, cq[-1] :] == 77)
+                    om = torch.ones(cap, dtype=torch.bool, device="cuda")
+                    lm = torch.ones_like(om)
+                    for so, sl, count in zip(ostarts, lstarts, qs):
+                        om[so : so + count] = False
+                        lm[sl : sl + count] = False
+                    assert torch.all(o[0, om] == 77) and torch.all(stats[0, :, lm] == 77)
                 rec = dict(index=index, point=point, dtype=str(dtype), thd=thd, binding=binding, phase=phase, pass_full_reference=True)
                 observations.append(rec)
                 if phase == 0:
