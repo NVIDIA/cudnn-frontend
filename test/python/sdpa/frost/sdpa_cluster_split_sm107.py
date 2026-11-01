@@ -8,8 +8,6 @@ import pytest
 
 import cudnn
 
-pytestmark = [pytest.mark.L0]
-
 
 def _device():
     import torch
