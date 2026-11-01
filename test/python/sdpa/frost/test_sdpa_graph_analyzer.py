@@ -464,13 +464,15 @@ def test_d192_fp8_sink_dtype_support():
     assert engines.mismatch(spec.capabilities, facts(cudnn.data_type.FP8_E5M2, sink=True)) is None
 
 
-def test_probe_rejects_wrong_device_family(monkeypatch):
-    monkeypatch.setattr(ga, "_device_cc", lambda: (8, 0))
+@pytest.mark.parametrize("device_cc, expected", [((7, 0), set()), ((8, 0), {"sdpa_fwd_prefill_sm80"})])
+def test_probe_rejects_wrong_device_family(monkeypatch, device_cc, expected):
+    monkeypatch.setattr(ga, "_device_cc", lambda: device_cc)
     g = _mk_graph()
     q, k, v, dims, strides = _mk_qkv(g)
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
     _finish_output(o, dims, strides)
-    assert not _eligible(g)
+    # SM80 now supports this D512 graph; engines for other families must decline.
+    assert _eligible(g) == expected
 
 
 def test_probe_rejects_bias():
