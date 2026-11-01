@@ -42,7 +42,7 @@ import cutlass.experimental.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import ws_bytes, ws_empty, ws_zeros, cur_stream, fake_rows, fake_stream, ffi, sm_count, smem_capacity
+from cudnn.norm.utils import ws_bytes, ws_zeros, cur_stream, fake_rows, fake_stream, ffi, sm_count, smem_capacity
 
 from .groupnorm_fast_sm100 import _gn_bwd_finalize_kernel, _vec_for, red_scratch_len
 
