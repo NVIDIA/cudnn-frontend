@@ -51,20 +51,28 @@ def test_paged_thd_origins_rebind_and_capture(
     rubin = torch.cuda.get_device_capability() == (10, 7)
     if rubin and (reason := cutedsl_arch_requirement_error((10, 7))) is not None:
         pytest.skip(reason)
-    if rubin and (dim != 128 or splits != 1 or cga not in (1, 2)):
-        pytest.skip("native SM107 paged origins: D128 unsplit CGA1/2")
+    native_rubin_shape = (dim == 128 and cga in (1, 2)) or (dim == (192, 128) and cga == 2)
+    if rubin and (not native_rubin_shape or splits != 1):
+        pytest.skip("native SM107 paged origins: D128 CGA1/2 or D192/V128 CGA2, unsplit")
     engine = "sdpa_fwd_prefill_sm107" if rubin else "sdpa_fwd_prefill_sm100"
     if cga == 1 and splits == 1 and torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
         pytest.skip("CGA1 paged prefill is currently admitted on SM100/SM107")
     torch.manual_seed(261026737)
     d_qk, d_v = dim if isinstance(dim, tuple) else (dim, dim)
-    batch, heads, kv_heads, maximum, page, kv_max = 2, (24 if d_qk == 576 else 16), (2 if d_qk == 576 else 4), 320, page_size, (1024 if d_qk == 576 else 8192)
+    batch, heads, kv_heads, maximum, page, kv_max = (
+        2,
+        (24 if d_qk in (192, 576) else 16),
+        (2 if d_qk in (192, 576) else 4),
+        320,
+        page_size,
+        (1024 if d_qk == 576 else 8192),
+    )
     pages_per_sequence, page_count = kv_max // page, batch * kv_max // page
     dtype = getattr(torch, dtype_name)
     kv_dtype = getattr(torch, kv_dtype_name) if kv_dtype_name is not None else dtype
     io_type = cudnn.data_type.HALF if dtype_name == "float16" else cudnn.data_type.BFLOAT16
     widths = {"q": torch.int64, "o": torch.int32, "stats": torch.int64}
-    multipliers = {"q": heads * (16 if d_qk == 576 else d_qk), "o": d_v, "stats": 1}
+    multipliers = {"q": heads * (16 if d_qk in (192, 576) else d_qk), "o": d_v, "stats": 1}
     graph_ports = ("q", "k", "v", "o", "stats", "ql", "kl", "kt", "vt", "ro_q", "ro_o", "ro_stats")
     if sink is not None:
         graph_ports += ("sink",)
@@ -193,7 +201,8 @@ def test_paged_thd_origins_rebind_and_capture(
 
         api = inspect.getclosurevars(graph._compiled_plans[graph._plan_index]._compiled.default_stream).nonlocals["api"]
         assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
-        assert api._k_mod.CFG.STAGES_KV == 2 * cga
+        assert api._k_mod.CFG.STAGES_KV == (2 if d_qk == 192 else 2 * cga)
+        assert (api._k_mod.CFG.TILE_K, api._k_mod.CFG.TILE_O) == (d_qk, d_v)
         assert api._thd_origin_specs is not None
     print("ORIGIN_PLAN", graph.get_plan_name_at_index(graph._plan_index), flush=True)
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
