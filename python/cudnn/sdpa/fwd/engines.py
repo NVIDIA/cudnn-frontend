@@ -2705,8 +2705,9 @@ def _sm107_spec() -> EngineSpec:
             #
             # D128 is also qualified through dense and live-length THD
             # capture/replay, including the shared paged PackGQA pipeline.
-            # D192 and D512 remain unqualified; D512 is cga4x1 role-split
-            # with a different scheduler shape.
+            # D192 also supports LPT through dense, ragged and paged replay.
+            # D512 remains unqualified: its cga4x1 roles use a different
+            # scheduler shape.
             # SCHED_LPT_L2 is claimed by NO f16 flavor -- its decode
             # needs `qh_per_kh` and `seqlen_kv` at every call site, which the
             # f16 kernels do not pass (the d128 / d192x128 FP8 and MXFP8
@@ -2716,6 +2717,7 @@ def _sm107_spec() -> EngineSpec:
             sched_policies_by_d_shape=(
                 ((64, 64), frozenset({SCHED_NATURAL, SCHED_LPT})),
                 ((128, 128), frozenset({SCHED_NATURAL, SCHED_LPT})),
+                ((192, 128), frozenset({SCHED_NATURAL, SCHED_LPT})),
                 ((256, 256), frozenset({SCHED_NATURAL, SCHED_LPT})),
             ),
             tile_ms=frozenset({128}),

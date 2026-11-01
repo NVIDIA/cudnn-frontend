@@ -1567,9 +1567,9 @@ def test_sm107_lpt_knob_is_honored_or_ineligible_per_d_shape():
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
 
     caps = _caps("sdpa_fwd_prefill_sm107")
-    for d in (128, 256):
-        assert engines.mismatch(caps, _f16_facts(d_qk=d, d_v=d), SdpaFwdKnobs(sched_policy=SCHED_LPT)) is None
-    for dq, dv in ((192, 128), (512, 512)):
+    for dq, dv in ((128, 128), (192, 128), (256, 256)):
+        assert engines.mismatch(caps, _f16_facts(d_qk=dq, d_v=dv), SdpaFwdKnobs(sched_policy=SCHED_LPT)) is None
+    for dq, dv in ((512, 512),):
         why = engines.mismatch(caps, _f16_facts(d_qk=dq, d_v=dv), SdpaFwdKnobs(sched_policy=SCHED_LPT))
         assert why is not None and "sched_policy" in why
 
@@ -8863,3 +8863,12 @@ def test_native_d64_unsplit_preserves_score_operands(monkeypatch, operand):
     mod = _load_sm100_kernel_module(api.flavor, params, rubin=True)
     assert mod.__file__.endswith("sm107/prefill_d128_f16.py")
     assert mod.CFG.BIAS_MODE if operand == "bias" else mod.CFG.KV_MASK_FORM
+
+
+@pytest.mark.L0
+@requires_dsl
+class TestD192LptContract:
+    import sdpa_d192_lpt as _checks
+
+    test_work_order = staticmethod(_checks.test_thd_work_order)
+    test_admission = staticmethod(_checks.test_native_admission)

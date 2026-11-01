@@ -35,14 +35,10 @@ Same kernel shape as the C++ source: pipeline, TMEM/SMEM layout,
 barrier inventory + init counts, scheduler, warp dispatch, register
 split match.  Canonical reference port; reaches ~0.99x C++ TFLOPS.
 
-THD / varlen is **NOT** ported.  The pre-upstream body carried a packed-varlen
-entry point (``CFG.THD_VARLEN=1``: packed ``[1,T,H,D]`` + ``cu_seqlens`` coord
-offset, per-batch O TMA-descriptor array, packed ``[1,QH,T]`` LSE), but its
-setup-kernel call site still speaks the pre-upstream 7-arg contract against a
-14-arg helper and the metadata layout differs (3B+2 vs 4B+4).  ``compile()``
-raises on ``CFG.THD_VARLEN`` rather than half-serving it, ``config_sm107``
-rejects THD for f16/bf16, and no engine row advertises it.  Only the dense
-``[B,S,H,D]`` path is served.
+Dense and THD / varlen use the same native body. THD uses sequence-local
+TMA maps and a device-bounded persistent scheduler; all warp roles decode
+the same work order for NATURAL and LPT. The adapter binds current runtime
+capacity before choosing the initial worker waves.
 """
 
 from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
@@ -211,6 +207,11 @@ from cudnn.sdpa.fwd.kernels._common_blackwell import (
 )
 
 CGA_SIZE = CFG.CGA_M * CFG.CGA_N
+# The THD scheduler claims compact work from a device counter after setup.
+THD_PERSISTENT = True
+# Small runtime workloads keep up to two initial waves; broad declarations
+# are tightened again by the shared binder using current storage capacity.
+THD_INITIAL_WAVES = 2
 
 CTA_GROUP_KIND = nvvm.CTAGroup.CTA_2 if CFG.CTA_MMA == 2 else nvvm.CTAGroup.CTA_1
 

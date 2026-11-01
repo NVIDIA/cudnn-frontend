@@ -2188,3 +2188,17 @@ class TestNativeD192PagedHalf:
 
     test_dense_replay = staticmethod(_checks.test_dense_replay)
     test_independent_origins = staticmethod(_checks.test_independent_origins)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestD192Lpt:
+    """Native D192 work scheduling through retained dense and ragged replay."""
+
+    import sdpa_d192_lpt as _checks
+
+    test_dense_replay = staticmethod(_checks.test_dense_replay)
+    test_ragged_replay = staticmethod(_checks.test_ragged_replay)
+    test_paged_independent_origins = staticmethod(_checks.test_paged_independent_origins)
+    test_paged_replay = staticmethod(_checks.test_paged_replay)
