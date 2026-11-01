@@ -717,14 +717,17 @@ def test_dsl_sm100_band_right_uncovered_tail_via_padding():
     + [(dt, dt, 4, 2) for dt in (torch.float8_e4m3fn, torch.float8_e5m2)],
 )
 @torch_fork_set_rng(seed=0)
-def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(input_dtype, output_dtype, monkeypatch, splits, cga):
+def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(
+    input_dtype, output_dtype, monkeypatch, splits, cga, d_shape=(128, 128), stats_output=True, knob_overrides=None, query_length=64
+):
     """A mask-free S_kv off the KV tile compiles the padded mask against the scalar S_kv (#1425): no lengths buffer,
     the native prepared launch, and execute-time S_kv overrides on and off the tile within the declared envelope."""
     _require_dsl()
     import cudnn
     from cudnn.sdpa.fwd import prepared as prep
 
-    b, hq, hk, s_q, d, declared = 2, 4, 2, 64, 128, 257
+    b, hq, hk, s_q, declared = 2, 4, 2, query_length, 257
+    d, dv = d_shape
     fp8 = input_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     dtype_enum = {
         torch.float16: cudnn.data_type.HALF,
@@ -734,19 +737,19 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(input_dtype, ou
     }
     io = dtype_enum[input_dtype]
 
-    def make(h, s):
+    def make(h, s, width=d):
         # Poison backing storage beyond the live logical tensor extent. TMA
         # must zero-fill it; masking logits alone cannot remove NaNs from PV.
-        x = torch.randn(b, s + 16, h, d, device="cuda")
+        x = torch.randn(b, s + 16, h, width, device="cuda")
         x[:, s:] = torch.nan
         x = x.to(input_dtype)
         return x[:, :s].transpose(1, 2)
 
-    def bshd_stride(h, s):
-        return [(s + 16) * h * d, d, h * d, 1]
+    def bshd_stride(h, s, width=d):
+        return [(s + 16) * h * width, width, h * width, 1]
 
     g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, is_override_shape_enabled=True)
-    q0, k0, v0 = make(hq, s_q), make(hk, declared), make(hk, declared)
+    q0, k0, v0 = make(hq, s_q), make(hk, declared), make(hk, declared, dv)
     qd, kd, vd = (g.tensor_like(t) for t in (q0, k0, v0))
     pack = {}
     if fp8:
@@ -762,24 +765,25 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(input_dtype, ou
             scale_s=scales[4],
             scale_o=scales[5],
             attn_scale=d**-0.5,
-            generate_stats=True,
+            generate_stats=stats_output,
         )
         ad.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
         pack.update({t: torch.full((1, 1, 1, 1), val, device="cuda") for t, val in zip(scales, (2.0, 0.5, 0.25, 1.0, 1.0, 2.0))})
         pack[ad] = torch.zeros(1, 1, 1, 1, device="cuda")
     else:
-        od, stats = g.sdpa(q=qd, k=kd, v=vd, attn_scale=d**-0.5, generate_stats=True)
-    o = torch.empty(b, s_q, hq, d, device="cuda", dtype=output_dtype).transpose(1, 2)
+        od, stats = g.sdpa(q=qd, k=kd, v=vd, attn_scale=d**-0.5, generate_stats=stats_output)
+    o = torch.empty(b, s_q, hq, dv, device="cuda", dtype=output_dtype).transpose(1, 2)
     od.set_output(True).set_dim(list(o.shape)).set_stride(list(o.stride())).set_data_type(dtype_enum[output_dtype])
-    lse = torch.empty(b, hq, s_q, 1, device="cuda")
-    stats.set_output(True).set_dim(list(lse.shape)).set_stride(list(lse.stride())).set_data_type(cudnn.data_type.FLOAT)
-    pack[stats] = lse
+    lse = torch.full((b, hq, s_q, 1), 77.0, device="cuda")
+    if stats_output:
+        stats.set_output(True).set_dim(list(lse.shape)).set_stride(list(lse.stride())).set_data_type(cudnn.data_type.FLOAT)
+        pack[stats] = lse
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     _select_engine(g, engine_name(arch="sm107" if _SM == 107 else "sm100", fp8=fp8))
     engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
-    g.create_execution_plan(engine, {**knobs, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.TILE_CGA_M: cga})
+    g.create_execution_plan(engine, {**knobs, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.TILE_CGA_M: cga, **(knob_overrides or {})})
     g.select_plan(g.get_execution_plan_count() - 1)
     g.check_support()
     g.build_plans()
@@ -793,7 +797,7 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(input_dtype, ou
     forbid_python_forward_binding(monkeypatch)
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     for s_kv in (declared, 1, 127, 128, 129, 255):
-        q, k, v = q0, make(hk, s_kv), make(hk, s_kv)
+        q, k, v = q0, make(hk, s_kv), make(hk, s_kv, dv)
         o.zero_()
 
         def run():
@@ -801,8 +805,8 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(input_dtype, ou
                 {**pack, qd: q, kd: k, vd: v, od: o},
                 ws,
                 override_uids=[kd.get_uid(), vd.get_uid()],
-                override_shapes=[[b, hk, s_kv, d]] * 2,
-                override_strides=[bshd_stride(hk, s_kv)] * 2,
+                override_shapes=[[b, hk, s_kv, d], [b, hk, s_kv, dv]],
+                override_strides=[bshd_stride(hk, s_kv), bshd_stride(hk, s_kv, dv)],
             )
 
         run()
@@ -815,7 +819,10 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(input_dtype, ou
             torch.cuda.synchronize()
             qf, kf, vf = (t.float().repeat_interleave(hq // t.shape[1], dim=1) for t in (q, k, v))
             o_ref = torch.nn.functional.scaled_dot_product_attention(qf, kf, vf, scale=d**-0.5)
-            torch.testing.assert_close(lse[..., 0], (qf.double() @ kf.double().transpose(-1, -2) * d**-0.5).logsumexp(-1).float(), atol=1e-3, rtol=1e-3)
+            if stats_output:
+                torch.testing.assert_close(lse[..., 0], (qf.double() @ kf.double().transpose(-1, -2) * d**-0.5).logsumexp(-1).float(), atol=1e-3, rtol=1e-3)
+            else:
+                assert (lse == 77).all()
             if fp8:
                 torch.testing.assert_close(pack[ad].flatten()[0], o_ref.abs().max() * 0.25, atol=0.03, rtol=0.03)
                 o_ref = o_ref * 0.25 * 2.0  # descale_v, then scale_o; Amax excludes scale_o
@@ -3399,3 +3406,15 @@ class TestD192PhysicalOrigins:
     test_independent_origins = staticmethod(_checks.test_independent_origins)
     test_split_independent_origins = staticmethod(_checks.test_split_independent_origins)
     test_split_origins_require_matching_extension = staticmethod(_checks.test_split_origins_require_matching_extension)
+
+
+@pytest.mark.L0
+@requires_dsl
+@pytest.mark.skipif(_SM not in (100, 103), reason="native SM100/SM103; SM107 has its own CI entry")
+class TestNativeScalarTailSplit:
+    """Run native regression coverage from the architecture CI entrypoint."""
+
+    import sdpa_scalar_tail_split as _checks
+
+    test_half_scalar_tail_explicit_candidate_admission = staticmethod(_checks.test_half_scalar_tail_explicit_candidate_admission)
+    test_half_scalar_tail_graph_overrides_and_replay = staticmethod(_checks.test_half_scalar_tail_graph_overrides_and_replay)
