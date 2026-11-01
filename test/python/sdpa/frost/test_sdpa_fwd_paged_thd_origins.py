@@ -53,6 +53,11 @@ def test_paged_thd_origins_rebind_and_capture(
     tile_n=None,
     sched_policy=None,
     cpu_reference=False,
+    attention_scale=None,
+    bottom_right=True,
+    window_right=0,
+    kv_bound=None,
+    key_growth=1.0,
     independent_table_strides=False,
     single_q=False,
 ):
@@ -82,6 +87,9 @@ def test_paged_thd_origins_rebind_and_capture(
         page_size,
         (1024 if d_qk == 576 else 8192),
     )
+    if kv_bound is not None:
+        kv_max = kv_bound
+    scale = d_qk**-0.5 if attention_scale is None else attention_scale
     pages_per_sequence, page_count = kv_max // page, batch * kv_max // page
     dtype = getattr(torch, dtype_name)
     kv_dtype = getattr(torch, kv_dtype_name) if kv_dtype_name is not None else dtype
@@ -160,6 +168,19 @@ def test_paged_thd_origins_rebind_and_capture(
         for name in ("kt", "vt"):
             # Page order is host test data; avoid an unrelated GPU radix sort.
             values[name].copy_(torch.randperm(page_count, dtype=torch.int32).view(batch, 1, pages_per_sequence, 1))
+        if key_growth != 1.0:
+            # Positive scores with increasing logical-key magnitudes force online
+            # max changes; physical page order remains independently randomized.
+            values["q"].abs_()
+            # Exactly representable, bounded V keeps this QK-rescale stress
+            # focused on the pipeline; ordinary cases retain normal random V.
+            # Leave the final poisoned page untouched.
+            values["v"][:-1].sign_()
+            for b in range(batch):
+                pages = values["kt"][b].flatten().long()
+                factors = key_growth ** (torch.arange(kv_max, device="cuda") // 64)
+                keys = values["k"][pages].abs() * factors.view(pages_per_sequence, 1, page, 1)
+                values["k"][pages] = keys.to(kv_dtype)
         return ql, kl, starts
 
     first = buffers()
@@ -172,13 +193,21 @@ def test_paged_thd_origins_rebind_and_capture(
     nodes = {name: graph.tensor_like(first[name]) for name in graph_ports if name not in ("q", "o", "stats")}
     nodes["q"] = graph.tensor(dim=(batch, heads, maximum, d_qk), stride=(maximum * heads * d_qk, d_qk, heads * d_qk, 1), data_type=io_type)
     nodes["q"].set_ragged_offset(nodes["ro_q"]).set_ragged_offset_multiplier(multipliers["q"])
+    mask_options = (
+        dict(use_causal_mask=not bottom_right, use_causal_mask_bottom_right=bottom_right)
+        if window_right == 0
+        else dict(
+            diagonal_band_right_bound=window_right,
+            diagonal_alignment=cudnn.diagonal_alignment.BOTTOM_RIGHT if bottom_right else cudnn.diagonal_alignment.TOP_LEFT,
+        )
+    )
     nodes["o"], nodes["stats"] = graph.sdpa(
         q=nodes["q"],
         k=nodes["k"],
         v=nodes["v"],
         is_inference=False,
-        attn_scale=d_qk**-0.5,
-        use_causal_mask_bottom_right=True,
+        attn_scale=scale,
+        **mask_options,
         diagonal_band_left_bound=window_left,
         sink_token=nodes.get("sink"),
         use_padding_mask=True,
@@ -242,6 +271,7 @@ def test_paged_thd_origins_rebind_and_capture(
             values = {name: tensor.cpu() for name, tensor in values.items()}
         reference_device = values["q"].device
         ql, kl, starts = state
+        rescale_seen = False
         stats = values["stats"] if stats_layout == "token" else values["stats"].T
         live_o = torch.zeros(values["o"].shape[0], device=reference_device, dtype=torch.bool)
         live_stats = torch.zeros(stats.shape[0], device=reference_device, dtype=torch.bool)
@@ -254,16 +284,20 @@ def test_paged_thd_origins_rebind_and_capture(
             for lo in range(0, nq, 32):
                 hi = min(lo + 32, nq)
                 q = values["q"][starts["q"][b] + lo : starts["q"][b] + hi].double().transpose(0, 1)
-                scores = q @ k.transpose(-1, -2) * d_qk**-0.5
-                scores.masked_fill_(
-                    torch.arange(nk, device=reference_device)[None, :] > torch.arange(nk - nq + lo, nk - nq + hi, device=reference_device)[:, None], -torch.inf
-                )
+                scores = q @ k.transpose(-1, -2) * scale
+                diagonal = nk - nq if bottom_right else 0
+                query_positions = torch.arange(diagonal + lo, diagonal + hi, device=reference_device)
+                scores.masked_fill_(torch.arange(nk, device=reference_device)[None, :] > query_positions[:, None] + window_right, -torch.inf)
                 if window_left is not None:
                     scores.masked_fill_(
-                        torch.arange(nk, device=reference_device)[None, :]
-                        <= torch.arange(nk - nq + lo, nk - nq + hi, device=reference_device)[:, None] - window_left,
+                        torch.arange(nk, device=reference_device)[None, :] <= query_positions[:, None] - window_left,
                         -torch.inf,
                     )
+                if key_growth != 1.0 and nk:
+                    maxima = torch.stack([scores[..., begin : begin + tile_n].amax(-1) for begin in range(0, nk, tile_n)], dim=-1)
+                    previous = maxima.cummax(-1).values[..., :-1]
+                    jumps_log2 = (maxima[..., 1:] - previous) * math.log2(math.e)
+                    rescale_seen |= bool(torch.any(torch.isfinite(previous) & (jumps_log2 > 8.0)))
                 if sink is not None:
                     scores = torch.cat((scores, values["sink"].reshape(heads, 1, 1).double().expand(heads, hi - lo, 1)), dim=-1)
                 expected = (scores.softmax(-1)[..., :nk] @ v).transpose(0, 1)
@@ -273,6 +307,8 @@ def test_paged_thd_origins_rebind_and_capture(
                 torch.testing.assert_close(stats[ss + lo : ss + hi].double(), expected_stats, atol=0.0006, rtol=0)
             live_o[starts["o"][b] : starts["o"][b] + nq] = True
             live_stats[starts["stats"][b] : starts["stats"][b] + nq] = True
+        if key_growth != 1.0 and any(nq and nk for nq, nk in zip(ql, kl)):
+            assert rescale_seen, "the stress data must cross the half-precision rescale threshold"
         assert torch.all(values["o"][~live_o] == -17)
         assert torch.all(stats[~live_stats] == -29)
         assert torch.all(values["backing_o"][..., d_v:] == -17)

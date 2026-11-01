@@ -2319,3 +2319,14 @@ class TestNativeSingleQPaged:
     from native_single_q_paged_sm107_checks import test_paged_one_q_origins
 
     test_paged_one_q_origins = staticmethod(test_paged_one_q_origins)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeCausalZeroTail:
+    """Run causal suffix and phase-reuse checks in the native CI entry."""
+
+    from native_causal_zero_tail_sm107_checks import test_causal_tail_origins_and_replay
+
+    test_causal_tail_origins_and_replay = staticmethod(test_causal_tail_origins_and_replay)

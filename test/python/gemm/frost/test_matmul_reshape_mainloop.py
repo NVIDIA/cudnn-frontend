@@ -96,6 +96,25 @@ def _pack(graph, tensors, buffers):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("position", ["plain", "before", "after"])
+def test_frost_gen_index_operand_scope_remains_explicit(position):
+    """Coordinate IR does not silently enable gen_index mainloop/reshape lowering."""
+    graph = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=FP32, compute_data_type=FP32)
+    shape = (2, 128, 64) if position == "plain" else (2, 2, 64, 64)
+    a = graph.tensor(name="A", dim=list(shape), stride=[prod(shape[i + 1 :]) for i in range(len(shape))])
+    value = graph.gen_index(input=a, axis=1).set_data_type(BF16) if position == "before" else a
+    if position != "plain":
+        value = graph.reshape(input=value).set_dim([2, 128, 64]).set_stride([8192, 64, 1])
+    if position != "before":
+        value = graph.gen_index(input=value, axis=1).set_data_type(BF16)
+    b = graph.tensor(name="B", dim=[2, 64, 128], stride=[8192, 128, 1])
+    graph.matmul(A=value, B=b).set_output(True)
+    graph.validate()
+    with pytest.raises(ValueError, match="gen_index.*unsupported"):
+        analyze(graph)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "shape,stride,target",
     [
