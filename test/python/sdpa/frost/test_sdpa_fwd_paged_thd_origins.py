@@ -58,6 +58,8 @@ def test_paged_thd_origins_rebind_and_capture(
     window_right=0,
     kv_bound=None,
     key_growth=1.0,
+    independent_table_strides=False,
+    single_q=False,
 ):
     import cudnn
     import torch
@@ -123,7 +125,7 @@ def test_paged_thd_origins_rebind_and_capture(
             result["v"] = torch.empty(page_count + 1, page, kv_heads, d_v, device="cuda", dtype=kv_dtype).transpose(1, 2)
         for name in ("kt", "vt"):
             result[name] = torch.empty(batch, 1, pages_per_sequence, 1, device="cuda", dtype=torch.int32)
-        if d_qk == 576:
+        if d_qk == 576 or independent_table_strides:
             # Independent table pitches must survive both binding and replay.
             # A shared/contiguous stride reads the poisoned padding pages.
             step = 3 if wide else 2
@@ -244,12 +246,15 @@ def test_paged_thd_origins_rebind_and_capture(
         import inspect
 
         api = inspect.getclosurevars(graph._compiled_plans[graph._plan_index]._compiled.default_stream).nonlocals["api"]
-        assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
+        assert api._k_mod.__file__.endswith("sm107/prefill_d256_f16.py" if single_q else "sm107/prefill_d128_f16.py")
         assert api._k_mod.CFG.STAGES_KV == (2 if d_qk == 192 else 2 * cga)
         assert (api._k_mod.CFG.TILE_K, api._k_mod.CFG.TILE_O) == (d_qk, d_v)
         if tile_n is not None:
             assert api._k_mod.CFG.TILE_N == tile_n
-            assert api._k_mod.CFG.S_SLOTS == (2 if tile_n == 64 else 1)
+            if single_q:
+                assert api._k_mod.PARAMS.s_slots == 2 and api._k_mod.CFG.TILES_Q == 1
+            else:
+                assert api._k_mod.CFG.S_SLOTS == (2 if tile_n == 64 else 1)
         assert api._thd_origin_specs is not None
     print("ORIGIN_PLAN", graph.get_plan_name_at_index(graph._plan_index), flush=True)
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)

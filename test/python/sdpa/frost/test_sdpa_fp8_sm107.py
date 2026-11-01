@@ -2313,6 +2313,17 @@ class TestNativeSingleQ:
 @pytest.mark.L0
 @requires_dsl
 @requires_rubin
+class TestNativeSingleQPaged:
+    """Exercise explicit paged one-Q topology from the architecture CI entry."""
+
+    from native_single_q_paged_sm107_checks import test_paged_one_q_origins
+
+    test_paged_one_q_origins = staticmethod(test_paged_one_q_origins)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
 class TestNativeCausalZeroTail:
     """Run causal suffix and phase-reuse checks in the native CI entry."""
 

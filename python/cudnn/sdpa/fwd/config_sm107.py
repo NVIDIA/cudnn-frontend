@@ -432,7 +432,6 @@ def supports_native_d128_single_q(
         and d_shape == (128, 128)
         and half_precision
         and thd
-        and not paged
         and cga == 1
         and split_kv == 1
         and not pack_gqa
@@ -2561,7 +2560,6 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
         and params.d_flavor == 128
         and params.cta_mma == 1
         and params.thd_varlen
-        and not params.paged_kv
         and not params.pack_gqa
         and params.split_kv == 1
         and params.tile_n == 128
@@ -2572,7 +2570,7 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
         and not params.kv_mask_form
         and params.dtype_kv == -1
     ):
-        raise ValueError("single-Q D128 requires half THD CTA1 N128, unsplit/unpacked/unpaged and two S slots")
+        raise ValueError("single-Q D128 requires half THD CTA1 N128, unsplit/unpacked and two S slots")
     tile_k = tile_o = 128 if single_q_d128 else 256
     tile_n = 128
     # STAGES_KV is a TUNING KNOB again (2..4), and the note that said otherwise
@@ -2758,7 +2756,8 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
 
 
 def make_cfg_d256(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
-    return _make_cfg_d256_family(params, flavor="sm107 d256", mxfp8=False)
+    flavor = "sm107 d128" if params.softmax_wgs == 1 and params.paged_kv else "sm107 d256"
+    return _make_cfg_d256_family(params, flavor=flavor, mxfp8=False)
 
 
 def make_cfg_d256_mxfp8(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:

@@ -7,6 +7,15 @@ never renumber.
 
 ## Hard rules
 
+Paged live-page counts are scalar integer arithmetic. Preserve the existing
+`(length + page_size - 1) // page_size` expression in persistent loaders:
+CuTe DSL 4.8 can lower `cute.ceil_div(Int32, Int32)` through tile operations
+and fail with an illegal `cute.derefine`, even when both inputs are scalar.
+The page8 case in `TestNativeSingleQPaged` exercises the initial and next-work
+page counts. For an opaque compiler failure, retain the module after the
+failing pass with line information; raw pre-pass IR can point at unrelated
+constants with the same value.
+
 **Rule S1 — Respect the declared Stats (LSE) packing: packed and explicitly
 padded Stats are different contracts.**
 
@@ -991,6 +1000,16 @@ for the old message.
 
 
 ## Prepared THD launch bounds and setup
+
+Compiled host defaults must be serializable by `compiled_cache._json_plain`.
+A tuple default such as `table_strides=(0, 0)` silently prevents artifact
+persistence, even when normal execution passes. Use `None` for optional runtime
+metadata defaults and supply the actual tuple through the binder. Run
+`test_f16_host_entries_carry_only_record_reproducible_defaults` and the affected
+flavor's `TestNativeHalfStrides::test_artifact_reload`. D256 also needs
+`test_prefill_artifact_reload`: the short-Q fixture selects the separate decode
+host. The prefill test asserts its actual module; both tests forbid JIT in the
+second process and check output after replay.
 
 Ragged-offset integer widths are compiled pointer-ABI facts. Include the whole
 per-port dtype tuple in the prepared artifact key, alongside origin strides and

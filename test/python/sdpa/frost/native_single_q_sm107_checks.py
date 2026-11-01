@@ -96,13 +96,13 @@ def test_one_q_public_identity_and_domain(monkeypatch):
     assert SdpaFwdKnobs.from_public({cudnn.knob_type.WARP_SPEC_CFG: 0}).warp_spec_cfg == 0
     valid = dict(d_shape=(128, 128), device_cc=(10, 7), half_precision=True, thd=True, paged=False, cga=1)
     assert supports_native_d128_single_q(**valid)
+    assert supports_native_d128_single_q(**{**valid, "paged": True})
     for change in (
         {"d_shape": (64, 64)},
         {"d_shape": (256, 256)},
         {"device_cc": (10, 0)},
         {"half_precision": False},
         {"thd": False},
-        {"paged": True},
         {"cga": 2},
         {"cga": None},
         {"tile_m": 64},

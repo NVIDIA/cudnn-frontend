@@ -21,8 +21,9 @@ graph.create_execution_plan(
 ```
 
 The option requires exact QK/V head dimensions of 128, fp16 or bf16 Q/K/V,
-nonpaged THD storage, one CTA, no head packing, and no KV split. Bias,
-per-key masks, mixed KV storage, and epilogue gates are not supported by
+THD query storage, one CTA, no head packing, and no KV split. Both ragged
+and paged K/V are supported. Bias, per-key masks, mixed Q/K/V dtypes, and
+epilogue gates are not supported by
 this topology. Requests outside this domain are rejected. Independent
 physical origins, padded tensor strides, supported diagonal bands, natural
 or LPT scheduling, and optional Stats use the existing graph contract.
@@ -32,3 +33,9 @@ The selected value is returned by `get_engine_and_knobs_at_index`; preserve
 it when caching and recreating explicit plan choices. The standalone DSL
 adapter exposes the same topology through its existing `softmax_wgs=1`
 argument, with the same geometry restrictions.
+
+For paged K/V, this option accepts pages that are multiples of 8 dividing 128,
+or multiples of 128. K and V can independently use HND or NHD pools and
+different block-table strides. Q, O and Stats retain their declared physical
+origins; page tables address K/V independently. Packing and KV split remain
+outside this explicit topology.
