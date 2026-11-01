@@ -2245,3 +2245,15 @@ class TestNativeScalarTailSplit:
 
     test_half_scalar_tail_explicit_candidate_admission = staticmethod(_checks.test_half_scalar_tail_explicit_candidate_admission)
     test_half_scalar_tail_graph_overrides_and_replay = staticmethod(_checks.test_half_scalar_tail_graph_overrides_and_replay)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativePagedNarrow:
+    """Paged THD N64 admission and native lifecycle through the CI entry."""
+
+    import native_d128_paged_narrow_sm107_test_utils as _checks
+
+    test_admission_and_record = staticmethod(_checks.test_admission_and_record)
+    test_origins_rebind_and_replay = staticmethod(_checks.test_origins_rebind_and_replay)

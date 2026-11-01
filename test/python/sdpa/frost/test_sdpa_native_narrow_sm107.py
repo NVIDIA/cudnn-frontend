@@ -48,7 +48,7 @@ def test_native_narrow_graph_admission(thd, cga, split, packed, monkeypatch):
     assert engines.mismatch(caps, facts, dataclasses.replace(knobs, tile_n=128)) is None
 
 
-@pytest.mark.parametrize("change", ["dense_cga1", "ragged_split", "paged", "bias", "kv_mask", "sm100"])
+@pytest.mark.parametrize("change", ["dense_cga1", "ragged_split", "dense_paged", "paged_split", "bias", "kv_mask", "sm100"])
 def test_native_narrow_keeps_other_body_domains(change, monkeypatch):
     from test_sdpa_fwd_dsl_sm107 import _caps, _f16_facts
 
@@ -64,8 +64,11 @@ def test_native_narrow_keeps_other_body_domains(change, monkeypatch):
     elif change == "ragged_split":
         facts = dataclasses.replace(facts, thd=True)
         knobs = dataclasses.replace(knobs, cga=1, split_kv=2)
-    elif change == "paged":
+    elif change == "dense_paged":
+        facts = dataclasses.replace(facts, has_paged_kv=True)
+    elif change == "paged_split":
         facts = dataclasses.replace(facts, thd=True, has_paged_kv=True)
+        knobs = dataclasses.replace(knobs, cga=1, split_kv=2)
     elif change == "bias":
         facts = dataclasses.replace(facts, has_bias=True)
     elif change == "kv_mask":
