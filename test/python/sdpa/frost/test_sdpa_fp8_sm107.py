@@ -2215,3 +2215,17 @@ class TestD192PhysicalOrigins:
     test_independent_origins = staticmethod(_checks.test_independent_origins)
     test_split_independent_origins = staticmethod(_checks.test_split_independent_origins)
     test_split_origins_require_matching_extension = staticmethod(_checks.test_split_origins_require_matching_extension)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestD64ThdSplit:
+    """Nonpaged D64 split and physical origins through the native CI entrypoint."""
+
+    import sdpa_d64_thd_split as _checks
+
+    test_explicit_contract_and_template = staticmethod(_checks.test_explicit_contract_and_template)
+    test_origins_and_replay = staticmethod(_checks.test_origins_and_replay)
+    test_proper_divisor_pack_replay = staticmethod(_checks.test_proper_divisor_pack_replay)
+    test_standalone_compact_replay = staticmethod(_checks.test_standalone_compact_replay)

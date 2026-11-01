@@ -100,16 +100,16 @@ def test_native_d64_dense_pack_replay(dtype_name, cga, head_dims, geometry, tile
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("cga", [1, 2])
 @pytest.mark.parametrize("packed", [False, True])
-def test_native_d64_standalone_compact_thd(dtype, cga, packed):
+def test_native_d64_standalone_compact_thd(dtype, cga, packed, heads=24, splits=1):
     from itertools import accumulate
 
     from sm107_half_test_utils import _dense_mask, _half_oracle
     from test_sdpa_prepared_thd import _buffers, _compact_thd_api, _execute_compact_thd
 
-    b, ql, kl, hq, hk, d = 3, 257, 1025, 24, 2, 64
+    b, ql, kl, hq, hk, d = 3, 257, 1025, heads, 2, 64
     a = _buffers(b, ql, kl, hq, hk, d, seed=721, dtype=dtype)
     fresh = _buffers(b, ql, kl, hq, hk, d, seed=722, dtype=dtype)
-    api = _compact_thd_api(a, b, ql, kl, hq, hk, d, cga=cga, pack_gqa=packed)
+    api = _compact_thd_api(a, b, ql, kl, hq, hk, d, cga=cga, pack_gqa=packed, split_kv=splits)
     assert api.flavor == (64, 64) and api._k_mod.CFG.TILE_K == api._k_mod.CFG.TILE_O == 64
     ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
 

@@ -418,6 +418,13 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
         and not getattr(_pybind_module._SdpaThdBinder, "supports_nonpaged_d192_split_physical_origins", False)
     ):
         raise NotImplementedError("nonpaged D192 split physical THD origins require rebuilding the native extension")
+    if (
+        s.split_workspace is not None
+        and not s.paged
+        and (s.d_qk, s.d_v) == (64, 64)
+        and not getattr(_pybind_module._SdpaThdBinder, "supports_nonpaged_d64_packed_split", False)
+    ):
+        raise NotImplementedError("nonpaged D64 THD split requires rebuilding the native extension")
     if s.quant is not None and s.paged and not getattr(_pybind_module._SdpaThdBinder, "supports_paged_fp8_physical_origins", False):
         raise NotImplementedError("paged FP8 THD requires rebuilding the native extension")
     s.native = _pybind_module._SdpaThdBinder(s)
