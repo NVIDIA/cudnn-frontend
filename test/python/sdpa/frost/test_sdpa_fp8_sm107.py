@@ -2173,4 +2173,5 @@ class TestNativeD64Half:
     test_independent_origins = staticmethod(_checks.test_native_d64_independent_origins)
     test_ragged_replay = staticmethod(_checks.test_native_d64_ragged_replay)
     test_dense_pack_replay = staticmethod(_checks.test_native_d64_dense_pack_replay)
+    test_dense_split_replay = staticmethod(_checks.test_native_d64_dense_split_replay)
     test_standalone_compact_thd = staticmethod(_checks.test_native_d64_standalone_compact_thd)

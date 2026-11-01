@@ -3744,9 +3744,10 @@ def make_cfg_d64_decode(params: TemplateParams) -> Tuple[CfgD64Decode, TmaIters]
         SPLIT_KV=int(params.split_kv),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=int(params.qh_per_kh),
-        # partial=False, as on the d64 prefill tile: the capability row leaves
-        # (64, 64) out of pack_gqa_partial_d_shapes.
-        PACK_G=_pack_g(params, CfgD64Decode.TILE_M, partial=False),
+        # The shared single-Q body addresses packed rows through PACK_G,
+        # including a proper divisor of G on the native-width SM107 split leg.
+        # SM100 graph admission retains its existing whole-group domain.
+        PACK_G=_pack_g(params, CfgD64Decode.TILE_M, partial=True),
         PAGED_KV=int(params.paged_kv),
         PAGE_SIZE=int(params.page_size),
     )

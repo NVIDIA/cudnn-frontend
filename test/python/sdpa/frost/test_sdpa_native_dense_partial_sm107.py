@@ -105,8 +105,7 @@ def test_native_dense_partial_graph_rebind(cudnn_handle, dtype_name, with_stats,
     g.create_execution_plans([cudnn.heur_mode.A])
     index = next(i for i in range(g.get_execution_plan_count()) if g.get_plan_name_at_index(i).startswith("sdpa_fwd_prefill_sm107"))
     engine, knobs = g.get_engine_and_knobs_at_index(index)
-    # Packing/splitting moves the small-D graph to D128. Pin that flavor's
-    # tiles, rather than inheriting the 64-wide native flavor's default.
+    # Pin the same tile knobs for native D64 and the larger flavors.
     chosen = {
         **knobs,
         cudnn.knob_type.TILE_M: 128,
