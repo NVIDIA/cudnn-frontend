@@ -222,3 +222,50 @@ compiled = cute.compile(entry, fake, cutlass.Int64(0), options="--enable-tvm-ffi
         if axis == 0 and shape[0] > (1 << 24):
             assert torch.all(expected > (1 << 24))
         torch.testing.assert_close(output, expected.to(output.dtype), atol=0, rtol=0)
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for the prepared broadcast entry")
+@pytest.mark.parametrize("unit_axis", [1, 2])
+def test_frost_index_broadcast_unit_extent_ffi_contract(tmp_path, unit_axis):
+    """Exercise actual FFI unit-axis checks, which a launch-recorder mock omits."""
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("generated epilogue fragment requires SM90+")
+    lines, result = _emit_op(FusionOp("gen_index", index_expr=IndexExpr.constant(0)), "previous", 0, {}, vsize=4)
+    shape = "(1, 1, cute.sym_int64())" if unit_axis == 1 else "(1, cute.sym_int64(), 1)"
+    stride = "(cute.sym_int64(), cute.sym_int64(), 1)" if unit_axis == 1 else "(cute.sym_int64(), 1, cute.sym_int64())"
+    source = f"""import cutlass
+import cutlass.cute as cute
+
+@cute.kernel
+def kernel(aux: cute.Tensor, C: cute.Tensor):
+    tid = cute.arch.thread_idx()[0]
+    previous = cutlass.full((4,), 0.0, cutlass.Float32)
+{textwrap.indent(chr(10).join(lines), '    ')}
+    (C.iterator.raw_ptr() + tid * 4).store({result}, alignment=16)
+
+@cute.jit
+def entry(aux: cute.Tensor, C: cute.Tensor):
+    kernel(aux, C).launch(grid=(1, 1, 1), block=(32, 1, 1))
+
+fake_aux = cute.runtime.make_fake_tensor(cutlass.BFloat16, {shape}, stride={stride}, assumed_align=16)
+fake_output = cute.runtime.make_fake_tensor(cutlass.Float32, (128,), stride=(1,), assumed_align=16)
+compiled = cute.compile(entry, fake_aux, fake_output, options="--enable-tvm-ffi")
+"""
+    path = tmp_path / "broadcast_index_entry.py"
+    path.write_text(source)
+    spec = importlib.util.spec_from_file_location("broadcast_index_entry", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    dims = (1, 1, 128) if unit_axis == 1 else (1, 128, 1)
+    aux = torch.ones(dims, device="cuda", dtype=torch.bfloat16)
+    output = torch.full((128,), float("nan"), device="cuda")
+    module.compiled(aux, output)
+    torch.testing.assert_close(output, torch.zeros_like(output), atol=0, rtol=0)
+    output.fill_(123)
+    with pytest.raises((ValueError, RuntimeError)):
+        module.compiled(aux.expand(1, 128, 128), output)
+    assert torch.all(output == 123)
+    output.fill_(float("nan"))
+    module.compiled(aux, output)
+    torch.testing.assert_close(output, torch.zeros_like(output), atol=0, rtol=0)

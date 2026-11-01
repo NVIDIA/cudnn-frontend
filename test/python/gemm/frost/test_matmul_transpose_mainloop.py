@@ -58,6 +58,7 @@ def _graph(
     bias_prefix=(),
     scale_prefix=None,
     index_axis=None,
+    index_source="matmul",
 ):
     """Build a validated logical graph with configurable operand views and epilogue."""
     g = cudnn.pygraph(io_data_type=dtype, intermediate_data_type=F32, compute_data_type=F32)
@@ -97,7 +98,15 @@ def _graph(
         bias = tensors["bias"] = g.tensor(name="bias", dim=[*bias_prefix, 1, N], stride=_strides(bias_prefix, (1, N), (N, 1)), data_type=dtype)
         y = g.add(a=y, b=bias).set_data_type(dtype)
     if index_axis is not None:
-        y = g.add(a=y, b=g.gen_index(input=y, axis=index_axis, name="index"))
+        source = y
+        if index_source != "matmul":
+            dim = [*prefix, M, N]
+            dim[index_axis] = 1
+            stride = [prod(dim[i + 1 :]) for i in range(len(dim))]
+            source = tensors["index_input"] = g.tensor(name="index_input", dim=dim, stride=stride, data_type=dtype)
+            if index_source == "aux_unary":
+                source = g.relu(input=source).set_data_type(dtype)
+        y = g.add(a=y, b=g.gen_index(input=source, axis=index_axis, name="index"))
     tensors["y"] = y.set_output(True)
     g.validate()
     return g, tensors
@@ -122,6 +131,10 @@ def _buffers(tensors, m=128, n=192, k=136, *, device="cpu", dtype=torch.bfloat16
             result[key] = scale.reshape(dim)
     if "bias" in tensors:
         result["bias"] = torch.randn(*tensors["bias"].get_dim()[:-2], 1, n, dtype=dtype, device=device)
+    if "index_input" in tensors:
+        dim = tensors["index_input"].get_dim()
+        shape = (*dim[:-2], 1 if dim[-2] == 1 else m, 1 if dim[-1] == 1 else n)
+        result["index_input"] = torch.ones(shape, device=device, dtype=dtype)
     return result
 
 
@@ -949,6 +962,49 @@ def test_frost_logical_index_public_graph_composition(prefix):
             assert f"_op_{i} = cutlass.full_like" in source and "lane_column" in source
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("prefix", [(), (1,), (2, 3)])
+@pytest.mark.parametrize("matrix_axis", [0, 1])
+@pytest.mark.parametrize("index_source", ["aux", "aux_unary"])
+def test_frost_gen_index_broadcast_source_coordinates(monkeypatch, prefix, matrix_axis, index_source):
+    """Singleton producer coordinates are zero, not the consumer GEMM coordinates."""
+    g, tensors = _graph(prefix=prefix, side="", index_axis=len(prefix) + matrix_axis, index_source=index_source)
+    chain = analyze(g)
+    op = next(op for op in chain.ops if op.op == "gen_index")
+    assert op.index_expr.evaluate({Axis.BATCH: 0, Axis.M: 17, Axis.N: 23}) == 0
+    assert not op.index_expr.axes
+    plan, frames = _mock_plan(monkeypatch, g)
+    engine = _FrostGemmPlan(plan)
+    for m, n, k in ((128, 192, 136), (160, 224, 264)):
+        buffers = _buffers(tensors, m, n, k)
+        engine.execute(g, _graph_coordinate_pack(g, tensors, buffers), ExecutionContext(stream=0))
+        assert any(arg.data_ptr() == buffers["index_input"].data_ptr() for arg in frames[-1][4:])
+    # Fixed singleton axes are part of the real FFI entry contract. The mock
+    # records pointers only; exercise its recipe-level rejection on the output.
+    ref = next(ref for ref in plan.chain.aux_tensors if ref.name == "index_input")
+    assert ref.symbolic_shape[-2 + matrix_axis] == 1
+    invalid = dict(buffers)
+    invalid["y"] = buffers["y"][..., :-1]
+    buffers["y"].fill_(123)
+    before = len(frames)
+    with pytest.raises(ValueError):
+        engine.execute(g, _graph_coordinate_pack(g, tensors, invalid), ExecutionContext(stream=0))
+    assert len(frames) == before and torch.all(buffers["y"] == 123)
+    engine.execute(g, _graph_coordinate_pack(g, tensors, buffers), ExecutionContext(stream=0))
+    assert len(frames) == before + 1
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("matrix_axis", [0, 1])
+@pytest.mark.parametrize("epilogue", [False, True])
+def test_frost_gen_index_unit_anchor_axes_remain_dynamic(matrix_axis, epilogue):
+    """A prepared unit GEMM axis can grow; broadcasting auxiliaries cannot."""
+    g, _ = _graph(M=1 if matrix_axis == 0 else 128, N=1 if matrix_axis == 1 else 192, prefix=(1,), side="", epilogue=epilogue, index_axis=matrix_axis + 1)
+    op = next(op for op in analyze(g).ops if op.op == "gen_index")
+    assert op.index_expr.axes == {Axis.M if matrix_axis == 0 else Axis.N}
+    assert op.index_expr.evaluate({Axis.M: 17, Axis.N: 23}) == (17 if matrix_axis == 0 else 23)
+
+
 @pytest.mark.parametrize("prefix,axis", [(p, a) for p in [(), (1,), (2, 3), (2, 1, 3)] for a in range(len(p) + 2)])
 @pytest.mark.parametrize("side", ["", "ab"])
 @pytest.mark.L0
@@ -1043,27 +1099,45 @@ _GEN_INDEX_GPU_L0 = {
 
 
 @pytest.mark.parametrize(
-    "prefix,axis,swapped,route",
+    "prefix,axis,swapped,route,index_source",
     [
-        pytest.param(p, a, s, "sm100", marks=[requires_sm100, pytest.mark.L0 if (p, a, s) in _GEN_INDEX_GPU_L0 else pytest.mark.L1])
+        pytest.param(p, a, s, "sm100", "matmul", marks=[requires_sm100, pytest.mark.L0 if (p, a, s) in _GEN_INDEX_GPU_L0 else pytest.mark.L1])
         for p in [(), (1,), (2, 3), (2, 1, 3)]
         for a in range(len(p) + 2)
         for s in (False, True)
     ]
     + [
         pytest.param(
-            p, a, s, route, marks=[requires_sm120 if route == "sm120" else requires_sm100, pytest.mark.L0 if route == "sm120" and a < 2 else pytest.mark.L1]
+            p,
+            a,
+            s,
+            route,
+            "matmul",
+            marks=[requires_sm120 if route == "sm120" else requires_sm100, pytest.mark.L0 if route == "sm120" and a < 2 else pytest.mark.L1],
         )
         for route in ("sm100_stg", "sm100_split", "sm120")
         for p, a, s in [((2, 3), 0, False), ((2, 3), 1, True), ((2, 1, 3), 4, True)]
+    ]
+    + [
+        pytest.param(
+            p,
+            len(p) + a,
+            bool(a),
+            route,
+            "aux_unary",
+            marks=[requires_sm120 if route == "sm120" else requires_sm100, pytest.mark.L0 if p == (1,) else pytest.mark.L1],
+        )
+        for route in ("sm100", "sm120")
+        for p in [(1,), (2, 3)]
+        for a in (0, 1)
     ],
 )
-def test_frost_matrix_gen_index_gpu(prefix, axis, swapped, route):
+def test_frost_matrix_gen_index_gpu(prefix, axis, swapped, route, index_source):
     """Check logical indices, dynamic shapes and changed-input capture on both families."""
     dtype = BF16 if axis % 2 == 0 else cudnn.data_type.HALF
     tdtype = torch.bfloat16 if dtype == BF16 else torch.float16
     side = "ab" if swapped and route != "sm120" else ""
-    g, tensors = _graph(prefix=prefix, side=side, dtype=dtype, index_axis=axis)
+    g, tensors = _graph(prefix=prefix, side=side, dtype=dtype, index_axis=axis, index_source=index_source)
     if route == "sm120":
         from cudnn.gemm.frost.sm120 import compiler as backend
 
@@ -1101,9 +1175,10 @@ def test_frost_matrix_gen_index_gpu(prefix, axis, swapped, route):
                     captured.replay()
                 stream.synchronize()
                 shape = (*prefix, m, n)
-                index = torch.arange(shape[axis], device="cuda", dtype=torch.float32)
+                extent = shape[axis] if index_source == "matmul" else 1
+                index = torch.arange(extent, device="cuda", dtype=torch.float32)
                 view_shape = [1] * len(shape)
-                view_shape[axis] = shape[axis]
+                view_shape[axis] = extent
                 index = index.reshape(view_shape)
                 expected = (index + k * fill * fill).expand(*prefix, m, n).to(tdtype)
                 torch.testing.assert_close(buffers["y"], expected, atol=0, rtol=0)

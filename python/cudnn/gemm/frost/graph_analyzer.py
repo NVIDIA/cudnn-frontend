@@ -1749,14 +1749,35 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
         # Ordered reshape views already prove their own layout. Do not put
         # untouched rank-3 slots on the general batch-fold path.
         matrix_views_required = (bool(structural) and not has_reshape) or output_dim != (prod(batch_shape), *output_dim[-2:])
+
         # Index attributes describe the original logical tensor, not the kernel
         # ABI. Decode batch digits before applying the operation compute dtype.
+        @lru_cache(maxsize=None)
+        def follows_matmul_shape(tid):
+            """Pointwise descendants inherit live M/N even when prepared at one.
+
+            In this plain pointwise/GEMM scope, epilogue structural views and
+            reductions are excluded. A singleton auxiliary-only branch instead
+            keeps its unit extent when broadcast into the consumer matrix.
+            """
+            if tid == mm.output:
+                return True
+            producer = producers.get(tid)
+            return producer is not None and any(follows_matmul_shape(i) for i in producer.inputs)
+
         normalized_ops = []
         for op in ops:
             if op.cudnn_name == "gen_index":
-                dim = ranked_shapes[op.inputs[0]]
+                source = op.inputs[0]
+                dim = ranked_shapes[source]
                 axis = dict(op.op_attrs).get("axis")
-                op = replace(op, index_expr=matrix_axis_index(dim, axis))
+                expr = matrix_axis_index(dim, axis)
+                # Consumer matrix coordinates -> singleton producer coordinates.
+                # Compose before codegen/dtype rounding, not as a kernel fixup.
+                broadcast = {a: IndexExpr.constant(0) for a, extent in zip((Axis.M, Axis.N), dim[-2:]) if extent == 1}
+                if broadcast and not follows_matmul_shape(source):
+                    expr = expr.substitute(broadcast)
+                op = replace(op, index_expr=expr)
             normalized_ops.append(op)
         ops = normalized_ops
         for tid, m in list(meta.items()):
