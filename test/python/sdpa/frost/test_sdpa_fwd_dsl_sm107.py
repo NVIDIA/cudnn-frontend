@@ -233,7 +233,7 @@ _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle 
     ("f16", (192, 128)): (True, 32, 11),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
     ("fp8", (192, 128)): (True, 43, 12),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
     ("mxfp8", (192, 128)): (True, 35, 13),
-    ("f16", (256, 256)): (False, 29, 11),
+    ("f16", (256, 256)): (False, 30, 11),  # FP32 split-partial epilogue adds one output-ring wait
     ("fp8", (256, 256)): (False, 30, 11),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
     ("mxfp8", (256, 256)): (False, 29, 11),
     ("f16", (512, 512)): (True, 23, 14),  # +1 ring wait: the in-loop mb_bmm2_done wait is spelled once per CORR_READY_BEFORE_DONE arm (ONE traced site)
@@ -925,15 +925,12 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
     assert caps.split_kv_supported is True
     for d_qk, d_v in _FLAVORS:
         why = engines.mismatch(caps, _f16_facts(d_qk=d_qk, d_v=d_v), engines.SdpaFwdKnobs(split_kv=2))
-        assert (why is None) == (d_v == 128 or (d_qk, d_v) == (512, 512)), (d_qk, d_v, why)
-    # The small head-dim tiles carry the dense leg only: a split graph at D <= 64 is selected past them onto the d128 flavor
-    # (its pre-tile route) and served there, never declined (engines.Capabilities.dense_only_d_shapes).
+        assert (why is None) == (d_v == 128 or (d_qk, d_v) in ((256, 256), (512, 512))), (d_qk, d_v, why)
+    # Dense split graphs at D <= 64 select the native D64 tile, including its envelope.
     for d in (24, 32, 64):
         knobs = engines.SdpaFwdKnobs(split_kv=2)
         assert engines.mismatch(caps, _f16_facts(d_qk=d, d_v=d), knobs) is None, d
-        assert engines._selected_d_shape(caps, _f16_facts(d_qk=d, d_v=d), knobs) == (128, 128) and engines._selected_d_shape(
-            caps, _f16_facts(d_qk=d, d_v=d)
-        ) != (128, 128), d
+        assert engines._selected_d_shape(caps, _f16_facts(d_qk=d, d_v=d), knobs) == (64, 64), d
     for feature in (dict(thd=True, padded=True), dict(padded=True)):
         assert engines.mismatch(caps, _f16_facts(**feature), engines.SdpaFwdKnobs(split_kv=2)) is not None
     assert engines.mismatch(caps, _f16_facts(has_sink=True), engines.SdpaFwdKnobs(split_kv=2)) is None
@@ -1499,7 +1496,7 @@ def test_sm107_mxfp8_tmem_map_fills_the_rubin_allocation_exactly():
 
 @pytest.mark.L0
 def test_sm107_advertises_lpt_only_for_the_validated_d_shape():
-    """D128/D256 serve LPT; the row-wide default stays NATURAL-only.
+    """D128/D192/D256 serve LPT; the row-wide default stays NATURAL-only.
 
     An accept AND a reject, because a capability that is only ever exercised on
     its accepting side is an untested assertion (engine contract, Rule 9).
@@ -1512,8 +1509,8 @@ def test_sm107_advertises_lpt_only_for_the_validated_d_shape():
 
     for d in (128, 256):
         assert SCHED_LPT in engines.effective_sched_policies(caps, _f16_facts(d_qk=d, d_v=d))
-    for dq, dv in ((192, 128), (512, 512)):
-        assert SCHED_LPT not in engines.effective_sched_policies(caps, _f16_facts(d_qk=dq, d_v=dv))
+    assert SCHED_LPT in engines.effective_sched_policies(caps, _f16_facts(d_qk=192, d_v=128))
+    assert SCHED_LPT not in engines.effective_sched_policies(caps, _f16_facts(d_qk=512, d_v=512))
 
     # LPT_L2 is a separate, still-open gap: its decode needs qh_per_kh and
     # seqlen_kv, which the SM107 call sites do not pass. No flavor claims it.
@@ -1570,9 +1567,9 @@ def test_sm107_lpt_knob_is_honored_or_ineligible_per_d_shape():
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
 
     caps = _caps("sdpa_fwd_prefill_sm107")
-    for d in (128, 256):
-        assert engines.mismatch(caps, _f16_facts(d_qk=d, d_v=d), SdpaFwdKnobs(sched_policy=SCHED_LPT)) is None
-    for dq, dv in ((192, 128), (512, 512)):
+    for dq, dv in ((128, 128), (192, 128), (256, 256)):
+        assert engines.mismatch(caps, _f16_facts(d_qk=dq, d_v=dv), SdpaFwdKnobs(sched_policy=SCHED_LPT)) is None
+    for dq, dv in ((512, 512),):
         why = engines.mismatch(caps, _f16_facts(d_qk=dq, d_v=dv), SdpaFwdKnobs(sched_policy=SCHED_LPT))
         assert why is not None and "sched_policy" in why
 
@@ -8773,3 +8770,105 @@ from native_forward_stride_cases import check_native_gate_permutations as _nativ
 class TestNativeDenseStrides:
     test_permutations = staticmethod(_native_dense_permutations)
     test_gate_permutations = staticmethod(_native_gate_permutations)
+
+
+@pytest.mark.parametrize("thd", [False, True])
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("dims", [(192, 128), (160, 96)])
+def test_native_d192_paged_admission_boundaries(thd, packed, dims):
+    from cudnn.sdpa.fwd import engines
+
+    caps = _caps("sdpa_fwd_prefill_sm107")
+    facts = _f16_facts(
+        d_qk=dims[0],
+        d_v=dims[1],
+        thd=thd,
+        padded=True,
+        has_paged_kv=True,
+        page_size=16,
+        h_q=24,
+        h_kv=2,
+        has_sink=True,
+    )
+    knobs = engines.SdpaFwdKnobs(cga=2, split_kv=1, pack_gqa=packed)
+    reason = engines.mismatch(caps, facts, knobs)
+    # Ragged inputs retain their existing exact-native-width contract.
+    assert (reason is None) == (not thd or dims == (192, 128)), reason
+    for bad in (dataclasses.replace(knobs, cga=1), dataclasses.replace(knobs, split_kv=2)):
+        assert engines.mismatch(caps, facts, bad) is not None
+
+
+@pytest.mark.parametrize("thd,cga,splits", [(False, 2, 1), (True, 1, 2), (True, 2, 1)])
+def test_native_d192_paged_pack_keeps_nonpaged_decline(thd, cga, splits):
+    from cudnn.sdpa.fwd import engines
+
+    facts = _f16_facts(d_qk=192, d_v=128, thd=thd, padded=thd, h_q=16, h_kv=4)
+    caps = _caps("sdpa_fwd_prefill_sm107")
+    knobs = engines.SdpaFwdKnobs(cga=cga, split_kv=splits, pack_gqa=False)
+    assert engines.mismatch(caps, facts, knobs) is None
+    assert engines.mismatch(caps, facts, dataclasses.replace(knobs, pack_gqa=True)) is not None
+
+
+@pytest.mark.parametrize(
+    "group,sq,packed,tile_n,cga,prefolded,expected",
+    [
+        (1, 1, False, 128, 1, False, True),
+        (8, 4, True, 128, 1, False, True),
+        (12, 9, True, 128, 1, False, True),
+        (1, 128, False, 128, 1, False, True),
+        (1, 129, False, 128, 1, False, False),
+        (8, 17, True, 128, 1, False, False),
+        (1, 1, False, 64, 1, False, False),
+        (1, 1, False, 128, 2, False, False),
+        (1, 1, False, 128, 1, True, False),
+    ],
+)
+def test_native_d64_unsplit_selects_single_q(monkeypatch, group, sq, packed, tile_n, cga, prefolded, expected):
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+    import torch
+
+    _fake_cc(monkeypatch, (10, 7))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    q = _desc((1, 2 * group, sq, 64), torch.float16, "q")
+    k = _desc((1, 2, 1024, 64), torch.float16, "k")
+    v = _desc((1, 2, 1024, 64), torch.float16, "v")
+    o = _desc((1, 2 * group, sq, 64), torch.float16, "o")
+    api = SdpaFwdDslSm100(q, k, v, o, cga=cga, tile_n=tile_n, pack_gqa=packed, softmax_scale_prefolded=prefolded)
+    if prefolded:
+        with pytest.raises(NotImplementedError, match="softmax_scale_prefolded"):
+            api.check_support()
+        return
+    assert api.check_support()
+    params = api.template_params()
+    assert bool(params.decode_tile) is expected
+    mod = _load_sm100_kernel_module(api.flavor, params, rubin=True)
+    assert mod.CFG.TILES_Q == (1 if expected else 2)
+    assert mod.CFG.TILE_K == mod.CFG.TILE_O == 64
+
+
+@pytest.mark.parametrize("operand", ["bias", "kv_mask"])
+def test_native_d64_unsplit_preserves_score_operands(monkeypatch, operand):
+    from test_sdpa_bias_sm107 import _api
+    from cudnn.sdpa.fwd import api_dsl
+    import torch
+
+    _fake_cc(monkeypatch, (10, 7))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(api_dsl, "_device_sm_count", lambda device: 204)
+    shape = (1, 4, 4, 128) if operand == "bias" else (1, 1, 1, 128)
+    api = _api(d=64, b=1, h=4, s_q=4, s_kv=128, cga=1, tile_n=128, **{operand: shape})
+    assert api.check_support()
+    params = api.template_params()
+    assert not params.decode_tile
+    mod = _load_sm100_kernel_module(api.flavor, params, rubin=True)
+    assert mod.__file__.endswith("sm107/prefill_d128_f16.py")
+    assert mod.CFG.BIAS_MODE if operand == "bias" else mod.CFG.KV_MASK_FORM
+
+
+@pytest.mark.L0
+@requires_dsl
+class TestD192LptContract:
+    import sdpa_d192_lpt as _checks
+
+    test_work_order = staticmethod(_checks.test_thd_work_order)
+    test_admission = staticmethod(_checks.test_native_admission)

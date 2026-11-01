@@ -670,7 +670,9 @@ def test_dense_layout_envelope_decisions():
 @pytest.mark.parametrize("engines_module", [fwd_engines, bwd_engines])
 def test_positional_construction_in_the_legacy_order_still_binds(engines_module):
     fields = {f.name: f for f in dataclasses.fields(engines_module.Capabilities)}
-    names = [n for n in fields if n != "band"]
+    # Only the prefix before band existed when this positional API was frozen.
+    # Later append-only fields must not be passed into the omitted band slot.
+    names = list(fields)[: list(fields).index("band")]
     required = {"sm_lo": 89, "sm_hi": 89, "phase": "prefill", "d_shapes": frozenset({(64, 64)}), "d": frozenset({64})}
 
     def value(name):

@@ -512,7 +512,7 @@ def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_sta
         and thd
         and not padded_stats
         and (
-            (device_cc in ((10, 0), (10, 3)) and paged and d_shape == (64, 64) and max_q > 0)
+            (d_shape == (64, 64) and max_q > 0 and (not paged or device_cc in ((10, 0), (10, 3))))
             or (d_shape == (128, 128) and max_q > (1 if paged else 0))
             or (not paged and d_shape == (192, 128) and max_q > 0)
             or (d_shape == (256, 256) and max_q > 0)
@@ -522,10 +522,12 @@ def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_sta
 
 
 def supports_scalar_kv_tail_split(d_shape, *, device_cc, fp8, pertensor):
-    """Scalar-tail masking composes with D128 and native Rubin half D512 split."""
-    return (device_cc in ((10, 0), (10, 3), (10, 7)) and d_shape == (128, 128) and (not fp8 or pertensor)) or (
-        device_cc == (10, 7) and d_shape == (512, 512) and not fp8
-    )
+    """Scalar-tail masking composes with the native half split flavors."""
+    if device_cc not in ((10, 0), (10, 3), (10, 7)):
+        return False
+    if fp8:
+        return d_shape == (128, 128) and pertensor
+    return d_shape in ((64, 64), (128, 128), (192, 128), (256, 256), (512, 512))
 
 
 def supports_quantized_split_sink(*, device_cc, pertensor, thd):
@@ -693,7 +695,7 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
         # Each of these would need extra machinery in the combine pass, so the
         # backstop rejects them rather than silently producing a wrong answer.
         if k.thd_varlen and not (
-            (flavor == "d64" and k.decode_tile and k.cta_mma == 1 and k.paged_kv and not fp8)
+            (flavor == "d64" and k.decode_tile and k.cta_mma == 1 and not fp8)
             or (flavor == "d256" and k.cta_mma == 2 and not fp8 and not k.pack_gqa)
             or (flavor == "d512" and k.d_flavor == 576 and k.cta_mma == 2 and not fp8)
             or (
@@ -718,7 +720,7 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
         if k.thd_varlen and not (
             not fp8
             and (
-                (flavor == "d64" and k.decode_tile and k.cta_mma == 1 and k.paged_kv and k.split_kv > 1)
+                (flavor == "d64" and k.decode_tile and k.cta_mma == 1 and k.split_kv > 1)
                 or (
                     flavor == "d128"
                     and (
@@ -731,7 +733,7 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
             )
         ):
             raise ValueError(
-                f"{flavor}: THD PackGQA requires half d128 cga2 unsplit/cga1 split, paged half d64 cga1 split, "
+                f"{flavor}: THD PackGQA requires half d128 cga2 unsplit/cga1 split, half d64 cga1 split, "
                 "paged half d256 cga2 unsplit, or native half d576 cga2"
             )
     if k.ragged_q:
@@ -3687,7 +3689,7 @@ def _validate_cfg_d64_decode(cfg: CfgD64Decode) -> None:
         ),
         (cfg.READ_TILE_ARRIVERS == 11, f"d64 decode: expected READ_TILE_ARRIVERS=11, got {cfg.READ_TILE_ARRIVERS}"),
         (cfg.TILE_K_HW_BMM1 == 16 and cfg.TILE_K_HW_BMM2 == 16, "d64 decode: f16 K=16 MMA phases"),
-        (not cfg.THD_VARLEN or cfg.PAGED_KV, "d64 decode: THD requires paged KV"),
+        (not cfg.THD_VARLEN or cfg.PAGED_KV or cfg.SPLIT_KV > 1, "d64 decode: unsplit THD requires paged KV"),
         (cfg.N_BMM2_CHUNKS * cfg.BMM2_CHUNK_SIZE == cfg.TILE_N, "d64 decode: BMM2 chunking is TILE_N-derived"),
         (
             cfg.Q_SWZ_BYTES == 128 and cfg.K_SWZ_BYTES == 128 and cfg.V_SWZ_BYTES == 128 and cfg.O_SWZ_BYTES == 128,
@@ -3709,11 +3711,10 @@ def make_cfg_d64_decode(params: TemplateParams) -> Tuple[CfgD64Decode, TmaIters]
         raise ValueError(f"d64 decode: the decode tile is cga1 only (cta_mma=1); got cta_mma={params.cta_mma}")
     if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"d64 decode: f16/bf16 inputs only (DTYPE_QKV 2/3); got {params.dtype_qkv}")
-    if params.thd_varlen and not params.paged_kv:
-        # The THD leg of this tile rides the paged loader (page pools through block tables): a ragged K/V
-        # needs the prefill tile's clamped descriptors.  Unsplit, the per-batch O descriptors place the
-        # rows (LSE_KINDS token / head / padded); split, the combine does.
-        raise ValueError("d64 decode: THD requires paged KV")
+    if params.thd_varlen and not params.paged_kv and params.split_kv == 1:
+        # Nonpaged split loads use compact or per-sequence input descriptors;
+        # the shared combine owns final O/Stats origins. Unsplit stays on prefill.
+        raise ValueError("d64 decode: unsplit THD requires paged KV")
     if params.pv_bf16 or not params.emit_amax_o:
         raise ValueError("d64 decode: pv_bf16 / emit_amax_o are MXFP8-only experiment axes")
     b = bpe(params.dtype_qkv)
@@ -3744,9 +3745,10 @@ def make_cfg_d64_decode(params: TemplateParams) -> Tuple[CfgD64Decode, TmaIters]
         SPLIT_KV=int(params.split_kv),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=int(params.qh_per_kh),
-        # partial=False, as on the d64 prefill tile: the capability row leaves
-        # (64, 64) out of pack_gqa_partial_d_shapes.
-        PACK_G=_pack_g(params, CfgD64Decode.TILE_M, partial=False),
+        # The shared single-Q body addresses packed rows through PACK_G,
+        # including a proper divisor of G on the native-width SM107 split leg.
+        # SM100 graph admission retains its existing whole-group domain.
+        PACK_G=_pack_g(params, CfgD64Decode.TILE_M, partial=True),
         PAGED_KV=int(params.paged_kv),
         PAGE_SIZE=int(params.page_size),
     )

@@ -25,6 +25,7 @@ from cudnn.tensor_adapter import (
     default_stream,
     detect_framework,
     get_compute_capability,
+    has_tcgen05,
     get_data_ptr,
     get_device,
     get_shape,
@@ -317,8 +318,8 @@ class GroupedGemmBf16API(APIBase):
             raise RuntimeError("CUDA is not available")
         major, minor = get_compute_capability()
         compute_capability = major * 10 + minor
-        if compute_capability < 100:
-            raise RuntimeError(f"GroupedGemmSm100 requires SM100+, found SM{compute_capability}")
+        if not has_tcgen05(major):
+            raise RuntimeError(f"GroupedGemmSm100 requires SM100+ with tcgen05 (not cc 12.x), found SM{compute_capability}")
 
         self._is_supported = True
         return True

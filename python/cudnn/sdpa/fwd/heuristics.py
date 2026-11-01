@@ -85,6 +85,7 @@ from cudnn.sdpa.fwd.config_sm107 import (
     sm107_bias_auto_cga,
     sm107_pair_item_active,
     sm107_tile_n_pick,
+    supports_native_d64_pack,
 )
 from cudnn.sdpa.fwd.config_sm100 import sm100_bias_auto_cga, sm100_tile_n_pick
 from cudnn.sdpa.fwd.config_sm120 import (
@@ -152,6 +153,9 @@ _SM100_D128_LPT_L2_MIN_BYTES = 8 * 1024 * 1024
 _SM107_CGA_Q_ROWS = 256
 _SM107_MEASURED_SMS = 212
 _SM107_NO_GQA_LPT_MAX_WAVES = 24
+# Rubin half THD causal prefill on the d128 flavor without packing: LPT ahead of NATURAL up to ~10 waves (9.48 and 11.85
+# measured; 311 FI-path cells, ragged and paged, 2026-11-01). d256 measured mixed from 5 waves on and keeps NATURAL.
+_SM107_THD_LPT_MAX_WAVES = 10
 # cc 10.7 half, the shared d128 DECODE tile (sm100/decode_d128_f16.py compiled for sm_107a, issue #1472) carrying a
 # packed GQA group: plain LPT leads NATURAL from a 2k cache on.  MEASURED on a 216-SM cc 10.7 board (cuDNN 9.26.0.51
 # and 9.27.0.28, CUDA-graph replay, kernel time, every plan of the unified list timed round-robin; the dense sink decode /
@@ -1325,6 +1329,11 @@ def _prefer_paged_d256_lpt(facts) -> bool:
     )
 
 
+def _sm107_cluster_waves(facts) -> float:
+    """Rubin causal grid size in waves: (batch, head, 256-row Q block) units per 2-CTA cluster."""
+    return (int(facts.b) * int(facts.h_q) * -(-int(facts.s_q) // _SM107_CGA_Q_ROWS)) / ((facts.device_sm_count or _SM107_MEASURED_SMS) // 2)
+
+
 def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
     """Ordered scheduler-policy candidates.
 
@@ -1373,6 +1382,20 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
                 primary = SCHED_LPT
             elif SCHED_LPT in domain and _prefer_paged_d256_lpt(facts):
                 primary = SCHED_LPT
+            elif (
+                SCHED_LPT in domain
+                and caps.sm_lo == 107
+                and facts.causal
+                and facts.window_left is None
+                and not (facts.has_sink or facts.right_band_widening)
+                and (
+                    _selected_d_shape(caps, facts) == (64, 64)
+                    or (_selected_d_shape(caps, facts) == (128, 128) and _sm107_cluster_waves(facts) <= _SM107_THD_LPT_MAX_WAVES)
+                )
+            ):
+                # Unpacked cc 10.7 causal THD: LPT balances the triangle while the d128 grid is a few waves; the 1-CTA d64
+                # flavor never measured behind NATURAL (rubin_sched_thd study, 2026-11-01).
+                primary = SCHED_LPT
             return [primary] + sorted(domain - {primary})
         return [SCHED_NATURAL]
     causal_ish = facts.causal or facts.right_band_widening
@@ -1403,8 +1426,7 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # The bound is the arch LINE, not `>= 107`: the SM120 rows sit at sm_lo=120 and
         # keep the SM100/SM120 L2-budget rule below (the wave-count constants above
         # are Rubin's cluster count and CGA rows, unmeasured on GeForce Blackwell).
-        waves = (int(facts.b) * int(facts.h_q) * -(-int(facts.s_q) // _SM107_CGA_Q_ROWS)) / ((facts.device_sm_count or _SM107_MEASURED_SMS) // 2)
-        primary = SCHED_LPT if waves <= _SM107_NO_GQA_LPT_MAX_WAVES else SCHED_NATURAL
+        primary = SCHED_LPT if _sm107_cluster_waves(facts) <= _SM107_NO_GQA_LPT_MAX_WAVES else SCHED_NATURAL
     elif causal_ish and rubin_dense_d128_shared_leg(caps, facts) and _q_clusters_per_unit(caps, facts, None) == 1:
         # The cc 10.7 half row's shared d128 bodies (issue #1472) measured the one-cluster band their own way, so they
         # take this arm instead of the SM100 rule below.  Decode tile (S_q x PACK_G <= 128), a packed group, no window
@@ -2245,8 +2267,8 @@ def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int, split_kv: Optiona
     tokens in 60 rows of a 64-row tile).
     THD prefill packs only on a flavor advertising token-unit worklists and
     packed-head Stats stores; the decode tile's ragged-Q leg remains separate.
-    cc 10.7 half packs dense D128 on the shared SM100 bodies (issue #1472) and dense d256
-    on the decode tile (below); its other nonpaged half graphs stay unpacked.
+    cc 10.7 half packs dense D128 on the shared SM100 bodies (issue #1472), unsplit D64 on its
+    native tile (#2053) and dense d256 on the decode tile (below); its other nonpaged half graphs stay unpacked.
     The row's per-flavor wiring (``pack_gqa_d_shapes``) is honoured here as
     ``mismatch()`` honours it: a packed proposal on a flavor the row keeps
     unpacked would only be declined there, and when the base leg is a split the
@@ -2281,10 +2303,18 @@ def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int, split_kv: Optiona
     # The flavor the PACKED leg lands on, as mismatch() selects it: a dense-only small tile (Rubin d32 / d64) walks to d128.
     packed = SdpaFwdKnobs(pack_gqa=True, split_kv=split_kv, cga=cga)
     packed_shape = _selected_d_shape(caps, facts, packed)
+    native_d64 = supports_native_d64_pack(packed_shape, device_cc=facts.device_cc, fp8=not half, paged=facts.has_paged_kv, split_kv=split_kv or 1, cga=cga)
     return (
         True in caps.pack_gqas
         and (caps.pack_gqa_d_shapes is None or packed_shape in caps.pack_gqa_d_shapes)
-        and not (caps.sm_lo == 107 and half and not facts.has_paged_kv and not rubin_decode_tile and not rubin_dense_d128_shared_leg(caps, facts, packed))
+        and not (
+            caps.sm_lo == 107
+            and half
+            and not facts.has_paged_kv
+            and not rubin_decode_tile
+            and not native_d64
+            and not rubin_dense_d128_shared_leg(caps, facts, packed)
+        )
         and not (caps.sm_lo == 107 and half and packed_shape == (256, 256) and not rubin_decode_tile and not rubin_paged_thd_d256)
         and not (facts.thd and not _thd_decode_leg(caps, facts) and (facts.d_qk, facts.d_v) not in caps.thd_pack_gqa_d_shapes)
         and not (facts.has_epilogue_gate and not rubin_decode_tile)
@@ -2389,6 +2419,24 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
             # 103.7; b2 64/8 q64 KV 4k 31.2 vs 31.9 (the packed body's split-4 arm) and b8 64/4 q128 KV 2k 97.2 vs
             # 97.3 at parity.  Packing keeps the lead where no unpacked tile fits (b2 64/8 q256 KV 4k: packed 93.9 vs
             # unpacked 191.2) and under a band (_sm100_banded_gqa_packs below).  The packed set stays listed.
+            wins = False
+        if (
+            wins
+            and facts.window_left is None
+            and supports_native_d64_pack(
+                _selected_d_shape(caps, facts, SdpaFwdKnobs(pack_gqa=True, split_kv=split_kv, cga=cga)),
+                device_cc=facts.device_cc,
+                fp8=facts.is_fp8 or facts.is_mxfp8,
+                paged=facts.has_paged_kv,
+                split_kv=split_kv or 1,
+                cga=cga,
+            )
+            and facts.b * facts.h_q * _ceil_div(facts.s_q, tile_q) <= (facts.device_sm_count or 0)
+            and _split_points(caps, facts, tile_m, None, cga, _pack_gqa_group(caps, facts, tile_m, True, split_kv))[0] == 1
+        ):
+            # Native D64 without a window whose packed set does not split: while the unpacked launch fits one wave, every CTA
+            # streams the whole KV once either way and the packed CTA also computes G heads' rows, so unpacked leads; past one
+            # wave, or under a window, packed does. A packed set that splits leads (cc 10.7 studies, 2026-10-31 / 11-01).
             wins = False
         if _sm107_fp8_dense_d128(caps, facts):
             # Packed never trails unpacked here at any S_q: unpacked pads every head's last 512-row tile (q576: 1.43-1.75x
@@ -2542,7 +2590,14 @@ def _split_points(
         (facts.thd and not ragged_decode)
         or (
             facts.has_sink
-            and (facts.is_fp8 or facts.is_mxfp8 or facts.has_epilogue_gate or not ((caps.sm_lo == 100 and caps.sm_hi < 107) or caps.sm_lo == 120))
+            and (
+                facts.is_fp8
+                or facts.is_mxfp8
+                or facts.has_epilogue_gate
+                or caps.sm_lo not in (100, 107, 120)
+                # cc 10.7: a window already bounds the KV walk, and the split's combine measured slower there (sink-split study 2026-11-01)
+                or (caps.sm_lo == 107 and facts.window_left is not None)
+            )
         )
         or (facts.padded and not facts.has_paged_kv)
         or facts.seq_q_trim
@@ -3198,8 +3253,9 @@ def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
 
     if opt_in_engines_enabled():
         return ours + [BACKEND]
-    name_of = {offered[s.name]: s.name for s in ENGINE_SPECS if s.name in offered}
-    last = [p for p in ours if name_of.get(p.engine_id) in TRAIL_ONLY_ROWS]
+    spec_of = {offered[s.name]: s for s in ENGINE_SPECS if s.name in offered}
+    # A trail-only row still leads where a generated placement_table entry says so.
+    last = [p for p in ours if p.engine_id in spec_of and spec_of[p.engine_id].name in TRAIL_ONLY_ROWS and place(spec_of[p.engine_id], facts) != LEAD]
     rest = [p for p in ours if p not in last]
     if not rest:
         return [BACKEND, LAST_RESORT] + last

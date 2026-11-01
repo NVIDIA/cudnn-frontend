@@ -15,7 +15,7 @@ pytestmark = [pytest.mark.L1, requires_dsl]
 
 # dims, group, Q, KV, CGA, splits, packed, causal, left window, kernel
 CASES = {
-    "decode64": ((64, 64), 8, 4, 1025, 1, 8, True, True, None, "sm100/decode_d128_f16.py"),
+    "decode64": ((64, 64), 8, 4, 1025, 1, 8, True, True, None, "sm107/prefill_d128_f16.py"),
     "decode128": ((128, 128), 4, 7, 769, 1, 3, True, True, 127, "sm100/decode_d128_f16.py"),
     "native128": ((128, 128), 4, 129, 513, 2, 8, True, True, None, "sm107/prefill_d128_f16.py"),
     "partial6": ((96, 80), 6, 129, 385, 2, 4, True, True, 31, "sm107/prefill_d128_f16.py"),
@@ -23,10 +23,17 @@ CASES = {
     "native192": ((192, 128), 2, 257, 385, 2, 8, False, True, 47, "sm107/prefill_d192_d128_f16.py"),
     "keyless": ((128, 128), 4, 257, 65, 2, 8, True, True, None, "sm107/prefill_d128_f16.py"),
     "decode256": ((256, 256), 4, 4, 513, 2, 4, True, True, None, "sm107/decode_d256_f16.py"),
+    "native64plain": ((64, 64), 1, 1, 4096, 1, 8, False, False, None, "sm107/prefill_d128_f16.py"),
+    "singleq64partial": ((48, 32), 12, 129, 385, 1, 3, True, True, 47, "sm100/decode_d128_f16.py"),
+    "native64partial": ((48, 32), 12, 129, 385, 2, 3, True, True, 47, "sm107/prefill_d128_f16.py"),
+    "native64keyless": ((64, 64), 4, 257, 65, 2, 8, True, True, None, "sm107/prefill_d128_f16.py"),
+    "native64empty": ((64, 64), 4, 65, 65, 2, 8, True, True, None, "sm107/prefill_d128_f16.py"),
 }
+# The public graph rejects bottom-right Q capacity larger than KV capacity.
+GRAPH_CASES = [name for name, case in CASES.items() if case[2] <= case[3]]
 
 
-@pytest.mark.parametrize("case", [name for name in CASES if name != "keyless"])
+@pytest.mark.parametrize("case", GRAPH_CASES)
 def test_sink_split_graph_admission(case, monkeypatch):
     from test_sdpa_fwd_dsl_sm107 import _caps, _f16_facts
     from cudnn.frost import buffers
@@ -66,7 +73,7 @@ def test_sink_split_standalone_replay(case, dtype_name, stats):
     _check_sink_split(case, dtype_name, stats, graph_api=False)
 
 
-@pytest.mark.parametrize("case", [name for name in CASES if name != "keyless"])
+@pytest.mark.parametrize("case", GRAPH_CASES)
 def test_sink_split_graph_rebind(case, cudnn_handle):
     _check_sink_split(case, "bfloat16", "log2", graph_api=True, handle=cudnn_handle)
 
@@ -82,7 +89,7 @@ def test_sink_split_narrow_graph_rebind(case, cudnn_handle):
     _check_sink_split(case, "bfloat16", "log2", graph_api=True, handle=cudnn_handle, tile_n=64)
 
 
-def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None, tile_n=128):
+def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None, tile_n=128, sink=True):
     import cudnn
     import torch
     from cuda.bindings import driver as cuda
@@ -104,7 +111,7 @@ def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None, tile_n
         causal=causal,
         bottom_right=causal,
         window_left=window,
-        sink=True,
+        sink=sink,
         pack_gqa=packed,
     )
     api.cga = cga
@@ -116,24 +123,26 @@ def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None, tile_n
     saved_stream = cudnn.get_stream(handle) if graph_api else None
     captures, bindings = [], []
     if graph_api:
-        dt = cudnn.data_type.BFLOAT16
+        dt = cudnn.data_type.BFLOAT16 if dtype_name == "bfloat16" else cudnn.data_type.HALF
         graph = cudnn.pygraph(io_data_type=dt, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
         ts = {n: graph.tensor_like(bufs[n]) for n in ("q", "k", "v")}
-        ts["sinks"] = graph.tensor_like(bufs["sinks"]).set_dim([1, 2 * group, 1, 1]).set_stride([2 * group, 1, 1, 1])
+        if sink:
+            ts["sinks"] = graph.tensor_like(bufs["sinks"]).set_dim([1, 2 * group, 1, 1]).set_stride([2 * group, 1, 1, 1])
         ts["out"], lse = graph.sdpa(
             q=ts["q"],
             k=ts["k"],
             v=ts["v"],
-            generate_stats=True,
+            generate_stats=stats != "none",
             attn_scale=bufs["attn_scale"],
             use_causal_mask_bottom_right=causal,
             sliding_window_length=None if window is None else window + 1,
-            sink_token=ts["sinks"],
-            stats_use_log2=True,
+            sink_token=ts.get("sinks"),
+            stats_use_log2=stats == "log2",
         )
         ts["out"].set_output(True).set_dim(list(bufs["out"].shape)).set_stride(list(bufs["out"].stride()))
-        bufs["lse"] = bufs["lse"].unsqueeze(-1)
-        ts["lse"] = lse.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim(list(bufs["lse"].shape)).set_stride(list(bufs["lse"].stride()))
+        if stats != "none":
+            bufs["lse"] = bufs["lse"].unsqueeze(-1)
+            ts["lse"] = lse.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim(list(bufs["lse"].shape)).set_stride(list(bufs["lse"].stride()))
         graph.validate()
         graph.build_operation_graph()
         graph.create_execution_plans([cudnn.heur_mode.A])
@@ -159,8 +168,20 @@ def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None, tile_n
     else:
         api.compile()
         ws_bytes = api.scratch_workspace_bytes()
+    if max(dims) <= 64 and cga == 1 and tile_n == 128 and (splits > 1 or api._d64_decode_tile()):
+        kernel = "sm100/decode_d128_f16.py"
+        assert api._k_mod.CFG.TILES_Q == 1
     assert api._k_mod.__file__.endswith(kernel), api._k_mod.__file__
     assert api._k_mod.CFG.SPLIT_KV == splits
+    if max(dims) <= 64:
+        assert api.flavor == (64, 64) and api._k_mod.CFG.TILE_K == api._k_mod.CFG.TILE_O == 64
+        assert api._k_mod.CFG.CTA_MMA == cga
+        if splits > 1:
+            if kernel.startswith("sm107/"):
+                assert not api._k_mod.FOLD_SINK
+            assert api._fp32_partial_split() and api._partial_torch_dtype() == torch.float32
+        else:
+            assert not api._fp32_partial_split()
     if tile_n == 64:
         assert api._k_mod.CFG.TILE_N == 64 and api._k_mod.CFG.S_SLOTS == 2
     try:
@@ -169,7 +190,8 @@ def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None, tile_n
             for n, t in current.items():
                 t.copy_(bufs[n])
             current["v"].mul_(1 if ordinal == 0 else -1)
-            current["sinks"].add_(ordinal * 2)
+            if sink:
+                current["sinks"].add_(ordinal * 2)
             ws = torch.empty(max(ws_bytes, 1), dtype=torch.uint8, device="cuda")
 
             def execute():
@@ -182,7 +204,7 @@ def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None, tile_n
                         v_tensor=current["v"],
                         o_tensor=current["out"],
                         lse_tensor=current.get("lse"),
-                        sinks=current["sinks"],
+                        sinks=current.get("sinks"),
                         workspace=ws,
                         current_stream=cuda.CUstream(stream.cuda_stream),
                     )
@@ -198,7 +220,8 @@ def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None, tile_n
             bindings.append((current, ws))
         for capture, (current, ws) in zip(captures, bindings):
             current["v"].neg_()
-            current["sinks"].add_(0.75)
+            if sink:
+                current["sinks"].add_(0.75)
             current["out"].fill_(torch.nan)
             ws.fill_(0xA5)
             if "lse" in current:
@@ -212,7 +235,7 @@ def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None, tile_n
                 current["v"],
                 logit_scale=bufs["attn_scale"],
                 masked=_dense_mask(sq, sk, causal=causal, bottom_right=causal, window_left=window),
-                sinks=current["sinks"],
+                sinks=current.get("sinks"),
             )
             torch.testing.assert_close(current["out"].double(), ref_o, atol=4e-3, rtol=4e-3)
             if "lse" in current:

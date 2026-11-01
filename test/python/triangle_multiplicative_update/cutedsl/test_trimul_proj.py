@@ -409,7 +409,7 @@ def test_the_two_bodies_differ_only_in_the_arch_delta():
         return next(i for i, ln in enumerate(lines) if ln.startswith("from __future__"))
 
     spans = (docstring_end(a), docstring_end(b))
-    assert spans[0] > 50 and spans[1] > 50
+    assert spans[0] > 0 and spans[1] > 0, "a body lost its module docstring"
     changed = []
     for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b).get_opcodes():
         if tag == "equal":

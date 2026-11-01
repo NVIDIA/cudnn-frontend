@@ -623,9 +623,10 @@ with variable per-row effective length.
   the selected indices in CTA shared memory. The compiled specialization
   chooses between an index-bitmap scan and an in-place bitonic sort according
   to the target architecture and shape; on SM100, `top_k < 256` uses bitonic
-  ordering directly. Neither path adds a kernel, device allocation, or host
-  synchronization; the default specialization retains the existing selection
-  path.
+  ordering directly, and on SM103 bitonic ordering is used from 128K bucketed
+  columns at `top_k <= 128` (`<= 512` with more than 148 rows). Neither path
+  adds a kernel, device allocation, or host synchronization; the default
+  specialization retains the existing selection path.
 - **Constraints** — SM90+, `0 < top_k ≤ 2048`, nonzero row/column/batch
   extents, and `next_n > 0`. `seq_lens` is contiguous INT32 on the input CUDA
   device, and every entry must be in `[0, num_cols]`; the device-resident

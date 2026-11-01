@@ -51,7 +51,12 @@ def _api(direction, descs, **kwargs):
 
 def _facts(direction, descs, *, thd=False):
     def ref(desc):
-        return SimpleNamespace(get_dim=lambda: desc.shape, get_stride=lambda: desc.stride, get_data_type=lambda: cudnn.data_type.BFLOAT16)
+        return SimpleNamespace(
+            get_dim=lambda: desc.shape,
+            get_stride=lambda: desc.stride,
+            get_data_type=lambda: cudnn.data_type.BFLOAT16,
+            ragged_offset=SimpleNamespace() if thd else None,
+        )
 
     q, k, v = (descs[n] for n in ("q", "k", "v"))
     return ga.SdpaGraphFacts(
@@ -78,6 +83,32 @@ def _facts(direction, descs, *, thd=False):
 def _mismatch(direction, facts):
     module = backward if direction == "bwd" else forward
     return module.mismatch(module._sm80_spec().capabilities, facts)
+
+
+@pytest.mark.parametrize("d,dv", [(512, 512), (576, 512), (288, 384), (520, 504)])
+@pytest.mark.parametrize("thd", [False, True])
+def test_wide_forward_admission_keeps_backward_boundary(d, dv, thd):
+    descs, facts = _forward_thd_case(d, dv) if thd else (_descs(d, dv), _facts("fwd", _descs(d, dv)))
+    api = _api("fwd", descs, thd=thd, seq_kv_lens_present=thd, max_total_seq_len_q=64 if thd else None)
+    assert api.check_support()
+    assert (api.kernel_tile_m, api.kernel_tile_n, api.kernel_num_warps) == (32, 16, 4)
+    assert _mismatch("fwd", facts) is None
+    assert _mismatch("bwd", _facts("bwd", descs, thd=thd)) is not None
+
+
+@pytest.mark.parametrize("tile_m,tile_n", [(64, None), (128, None), (None, 32), (None, 64)])
+def test_wide_forward_declines_unbounded_explicit_geometry(tile_m, tile_n):
+    api = _api("fwd", _descs(576, 512), tile_m=tile_m, tile_n=tile_n)
+    with pytest.raises(ValueError, match="wide heads require"):
+        api.check_support()
+
+
+@pytest.mark.parametrize("d,dv", [(584, 512), (512, 520)])
+def test_wide_forward_declines_outside_native_envelope(d, dv):
+    api = _api("fwd", _descs(d, dv))
+    with pytest.raises(ValueError, match="exceeds supported envelope"):
+        api.check_support()
+    assert _mismatch("fwd", _facts("fwd", _descs(d, dv))) is not None
 
 
 @pytest.mark.parametrize("direction,role", [("fwd", n) for n in DATA_ROLES[:4]] + [("bwd", n) for n in DATA_ROLES])
@@ -182,3 +213,12 @@ def test_backward_incomplete_auxiliary_declarations_decline(missing):
     kwargs = {"sample_" + n: desc for n, desc in aux.items() if n != missing}
     with pytest.raises(NotImplementedError, match=missing):
         _api("bwd", descs, has_bias=True, bias_is_fp32=True, **kwargs).check_support()
+
+
+def test_forward_thd_dense_port_keeps_batch_stride():
+    descs, facts = _forward_thd_case(128, 128)
+    facts.o_t.ragged_offset = None
+    assert "o" in _mismatch("fwd", facts)
+    dense_o = _descs(128, 128)["o"]
+    facts.o_t.get_stride = lambda: dense_o.stride
+    assert _mismatch("fwd", facts) is None

@@ -11,6 +11,30 @@ pytestmark = [pytest.mark.L0, requires_dsl, requires_rubin]
 
 
 @pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
+@pytest.mark.parametrize(
+    "case,tile_n,stats,sink,graph_api",
+    [
+        (case, tile_n, stats, sink, graph_api)
+        for case, tile_n, stats, sink in (
+            ("decode64", 128, "log2", True),
+            ("singleq64partial", 128, "natural", True),
+            ("native64plain", 64, "none", False),
+            ("native64partial", 64, "natural", True),
+            ("native64empty", 128, "log2", False),
+            ("native64keyless", 128, "log2", False),
+        )
+        for graph_api in (False, True)
+        if case != "native64keyless" or not graph_api
+    ],
+)
+def test_native_d64_dense_split_replay(dtype_name, graph_api, case, tile_n, stats, sink, cudnn_handle):
+    """Both public APIs bind native D64 partials and retain each captured workspace."""
+    from test_sdpa_sink_split_sm107 import _check_sink_split
+
+    _check_sink_split(case, dtype_name, stats, graph_api=graph_api, handle=cudnn_handle, tile_n=tile_n, sink=sink)
+
+
+@pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
 @pytest.mark.parametrize("cga", [1, 2])
 @pytest.mark.parametrize("packed", [False, True])
 def test_native_d64_independent_origins(dtype_name, cga, packed, monkeypatch):
@@ -76,16 +100,16 @@ def test_native_d64_dense_pack_replay(dtype_name, cga, head_dims, geometry, tile
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("cga", [1, 2])
 @pytest.mark.parametrize("packed", [False, True])
-def test_native_d64_standalone_compact_thd(dtype, cga, packed):
+def test_native_d64_standalone_compact_thd(dtype, cga, packed, heads=24, splits=1, cpu_reference=False):
     from itertools import accumulate
 
     from sm107_half_test_utils import _dense_mask, _half_oracle
     from test_sdpa_prepared_thd import _buffers, _compact_thd_api, _execute_compact_thd
 
-    b, ql, kl, hq, hk, d = 3, 257, 1025, 24, 2, 64
+    b, ql, kl, hq, hk, d = 3, 257, 1025, heads, 2, 64
     a = _buffers(b, ql, kl, hq, hk, d, seed=721, dtype=dtype)
     fresh = _buffers(b, ql, kl, hq, hk, d, seed=722, dtype=dtype)
-    api = _compact_thd_api(a, b, ql, kl, hq, hk, d, cga=cga, pack_gqa=packed)
+    api = _compact_thd_api(a, b, ql, kl, hq, hk, d, cga=cga, pack_gqa=packed, split_kv=splits)
     assert api.flavor == (64, 64) and api._k_mod.CFG.TILE_K == api._k_mod.CFG.TILE_O == 64
     ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
 
@@ -109,9 +133,15 @@ def test_native_d64_standalone_compact_thd(dtype, cga, packed):
             q = bufs["q"][lo:hi].transpose(0, 1).unsqueeze(0)
             k = bufs["k"][klo:khi].transpose(0, 1).unsqueeze(0)
             v = bufs["v"][klo:khi].transpose(0, 1).unsqueeze(0)
-            out, lse = _half_oracle(q, k, v, logit_scale=d**-0.5, masked=_dense_mask(hi - lo, khi - klo, causal=True))
-            torch.testing.assert_close(bufs["o"][lo:hi].double(), out[0].transpose(0, 1), atol=4e-3, rtol=4e-3)
-            torch.testing.assert_close(bufs["lse"][lo:hi].double(), lse[0].T, atol=4e-4, rtol=0)
+            mask = _dense_mask(hi - lo, khi - klo, causal=True)
+            actual_o, actual_lse = bufs["o"][lo:hi].double(), bufs["lse"][lo:hi].double()
+            if cpu_reference:
+                # Keep cuBLAS JIT initialization outside the kernel sanitizer scope.
+                q, k, v, mask = q.cpu(), k.cpu(), v.cpu(), mask.cpu()
+                actual_o, actual_lse = actual_o.cpu(), actual_lse.cpu()
+            out, lse = _half_oracle(q, k, v, logit_scale=d**-0.5, masked=mask)
+            torch.testing.assert_close(actual_o, out[0].transpose(0, 1), atol=4e-3, rtol=4e-3)
+            torch.testing.assert_close(actual_lse, lse[0].T, atol=4e-4, rtol=0)
         assert torch.all(bufs["o"][cq[-1] :] == 19)
         assert torch.all(bufs["lse"][cq[-1] :] == 19)
 
@@ -139,3 +169,25 @@ def test_native_d64_standalone_compact_thd(dtype, cga, packed):
         check(fresh, qf, kf)
     finally:
         capture.reset()
+
+
+@pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
+@pytest.mark.parametrize("graph_api", [False, True])
+@pytest.mark.parametrize(
+    "dims,group,sq,sk,packed,causal,window,stats,sink",
+    [
+        ((64, 64), 1, 1, 1025, False, False, None, "none", False),
+        ((64, 64), 8, 4, 1025, True, True, None, "log2", True),
+        ((48, 32), 12, 9, 257, True, True, 47, "natural", True),
+        ((64, 64), 1, 128, 257, False, False, None, "natural", False),
+        ((64, 64), 1, 129, 257, False, False, None, "natural", False),
+    ],
+    ids=["plain", "packed", "partial", "tile_boundary", "prefill_control"],
+)
+def test_native_d64_dense_unsplit_replay(dtype_name, graph_api, dims, group, sq, sk, packed, causal, window, stats, sink, monkeypatch, cudnn_handle):
+    """The short-Q single-slab leg and the taller prefill control share public bindings."""
+    from test_sdpa_sink_split_sm107 import CASES, _check_sink_split
+
+    case = (dims, group, sq, sk, 1, 1, packed, causal, window, "sm107/prefill_d128_f16.py")
+    monkeypatch.setitem(CASES, "unsplit64", case)
+    _check_sink_split("unsplit64", dtype_name, stats, graph_api=graph_api, handle=cudnn_handle, tile_n=128, sink=sink)

@@ -359,11 +359,12 @@ def test_nonpaged_d128_split_explicit_contract(device_cc, pack_gqa, monkeypatch)
         assert unsplit is not None
     for invalid in (replace(facts, has_sink=True), replace(facts, has_epilogue_gate=True), replace(facts, d_qk=256, d_v=256)):
         assert mismatch(spec.capabilities, invalid, knobs) is not None
+    mla = replace(facts, d_qk=192)
+    assert mismatch(spec.capabilities, mla, replace(knobs, pack_gqa=False)) is None
     previous = type("PreviousNativeBinder", (), {"supports_nonpaged_packed_split": True, "supports_paged_packed_split": True})
     monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", previous)
     assert "matching native" in mismatch(spec.capabilities, facts, knobs)
-    mla = replace(facts, d_qk=192)
-    assert mismatch(spec.capabilities, mla, replace(knobs, pack_gqa=False)) is None
+    assert "matching native" in mismatch(spec.capabilities, mla, replace(knobs, pack_gqa=False))
 
 
 @requires_dsl
@@ -640,14 +641,15 @@ def test_d256_thd_split_explicit_contract(monkeypatch, splits, cga, device_cc, p
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("cga", [None, 1])
 def test_paged_d64_split_explicit_contract(monkeypatch, device_cc, splits, packed, cga):
-    """D64 THD uses its native decode tile only for an explicit paged split."""
+    """D64 THD uses its physical-width single-Q tile for explicit splits."""
     facts = _paged_split_facts(device_cc=device_cc, d_qk=64, d_v=64)
     knobs = heur.SdpaFwdKnobs(cga=cga, split_kv=splits, pack_gqa=packed)
     assert mismatch(SPEC.capabilities, facts, knobs) is None
     assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in knobs.to_public().items()}) == knobs
     for invalid in (replace(knobs, cga=2), replace(knobs, split_kv=1, pack_gqa=True)):
         assert mismatch(SPEC.capabilities, facts, invalid) is not None
-    for invalid in (replace(facts, has_paged_kv=False), replace(facts, has_sink=True), replace(facts, has_epilogue_gate=True)):
+    assert mismatch(SPEC.capabilities, replace(facts, has_paged_kv=False), knobs) is None
+    for invalid in (replace(facts, has_sink=True), replace(facts, has_epilogue_gate=True)):
         assert mismatch(SPEC.capabilities, invalid, knobs) is not None
     previous = type("PreviousNativeBinder", (), {"supports_paged_packed_split": True})
     monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", previous)
@@ -772,10 +774,10 @@ def test_split_chooser_receives_the_row_cost_profile(monkeypatch, row, device_cc
 @pytest.mark.parametrize("s_q,window", [(1, None), (1, 128), (4, None), (4, 128)])
 @pytest.mark.parametrize("sink", [True, False])
 def test_rubin_decode_packing_uses_selected_flavor(monkeypatch, d, s_q, window, sink):
-    """D128 retains the shared decode tile; unsplit D64 packing is native.
+    """D128 retains the shared decode tile; D64 packing keeps its native width.
 
     Retain the shared decode proposal regression on D128. D64's native packed
-    capability is independent of its recommendation rank; split still uses D128.
+    capability is independent of its recommendation rank, including split-KV.
     """
     from cudnn.frost import buffers
     from cudnn.sdpa.fwd.engines import _selected_d_shape
@@ -805,12 +807,56 @@ def test_rubin_decode_packing_uses_selected_flavor(monkeypatch, d, s_q, window, 
     assert _selected_d_shape(spec.capabilities, facts, packed) == ((64, 64) if d == 64 else (128, 128))
     if d == 128:
         assert any(p.knobs.pack_gqa for p in plans)
-    if sink:
-        assert all(p.knobs.split_kv == 1 for p in plans)  # no sink split on this row
+    split_packed = replace(packed, split_kv=2)
+    assert mismatch(spec.capabilities, facts, split_packed) is None
+    assert _selected_d_shape(spec.capabilities, facts, split_packed) == (d, d)
+    if sink and window is not None:
+        assert all(p.knobs.split_kv == 1 for p in plans)  # a window bounds the KV walk; the sink split is not proposed
     else:
-        assert any((p.knobs.split_kv or 1) > 1 for p in plans)  # the split leg is proposed again; its rank is the wave model's
-        assert _selected_d_shape(spec.capabilities, facts, replace(packed, split_kv=2)) == (128, 128)
+        assert any((p.knobs.split_kv or 1) > 1 for p in plans)
     assert all(mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
+
+
+@requires_dsl
+@pytest.mark.parametrize("sink", [True, False])
+@pytest.mark.parametrize("window", [None, 128])
+@pytest.mark.parametrize("b", [1, 16])
+@pytest.mark.parametrize("s_q", [1, 2])
+@pytest.mark.parametrize("s_kv", [131072, 100000])
+def test_rubin_native_d64_packs_past_one_unpacked_wave(monkeypatch, window, b, s_q, s_kv, sink):
+    """Native D64 packing leads under a window, once the unpacked launch needs a second wave, or when the packed set splits
+    (which then splits the one-wave launch); a one-wave unpacked launch whose packed set cannot split keeps the unpacked plan
+    first and the packed one listed. Without a window a sink does not stop the split: only single-Q off the 128-key tile
+    stays unsplit."""
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    causal = s_q > 1 or window is not None
+    facts = _facts(
+        b=b,
+        h_q=16,
+        h_kv=2,
+        s_q=s_q,
+        s_kv=s_kv,
+        d_qk=64,
+        d_v=64,
+        causal=causal,
+        bottom_right=causal,
+        window_left=window,
+        has_sink=sink,
+        device_cc=(10, 7),
+        device_sm_count=216,
+    )
+    plans = heur.recommend("A", facts, {spec.name: 20505})
+    one_wave = b * facts.h_q <= facts.device_sm_count
+    packed_splits = any(p.knobs.pack_gqa and (p.knobs.split_kv or 1) > 1 for p in plans)
+    assert plans[0].knobs.pack_gqa == (window is not None or not one_wave or packed_splits)
+    assert any(p.knobs.pack_gqa for p in plans) and any(not p.knobs.pack_gqa for p in plans)
+    if window is None:
+        assert packed_splits == (s_kv % 128 == 0 or s_q > 1)
+        if one_wave and packed_splits:
+            assert (plans[0].knobs.split_kv or 1) > 1
 
 
 @pytest.mark.L0

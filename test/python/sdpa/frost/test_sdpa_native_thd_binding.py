@@ -872,12 +872,28 @@ def test_physical_paged_split_origins_bind_independent_frames(layout, splits):
 @pytest.mark.parametrize("layout", [None, "NH", "HN"])
 @pytest.mark.parametrize("splits", [2, 5])
 def test_native_d576_thd_split_frames(paged, layout, splits):
+    _wide_thd_split_frames(paged, layout, splits, 576, 512)
+
+
+@pytest.mark.parametrize("layout", [None, "NH", "HN"])
+@pytest.mark.parametrize("splits", [2, 5])
+def test_native_d192_thd_split_frames(layout, splits):
+    _wide_thd_split_frames(False, layout, splits, 192, 128)
+
+
+@pytest.mark.parametrize("layout", [None, "NH", "HN"])
+@pytest.mark.parametrize("splits", [2, 5])
+def test_native_d64_thd_split_frames(layout, splits):
+    _wide_thd_split_frames(False, layout, splits, 64, 64)
+
+
+def _wide_thd_split_frames(paged, layout, splits, d_qk, d_v):
     """Asymmetric partial widths, origins and independent tables survive rebinding."""
     from cudnn.sdpa.fwd.thd_origins import ROLES
 
     s, facts, _ = _paged_fixture(hnd=True, layout=layout, v_hnd=False) if paged else _fixture(layout=layout)
-    s.d_qk, s.d_v, s.cga_tile_m = 576, 512, 128
-    for role, dim in (("q", 576), ("k", 576), ("v", 512), ("o", 512)):
+    s.d_qk, s.d_v, s.cga_tile_m = d_qk, d_v, 128
+    for role, dim in (("q", d_qk), ("k", d_qk), ("v", d_v), ("o", d_v)):
         h, _, ts, hs, _, span = s.decl[role]
         s.decl[role] = (h, dim, ts * dim // 128, hs * dim // 128, 1, span * dim // 128)
         f = facts[role]
@@ -910,7 +926,7 @@ def test_native_d576_thd_split_frames(paged, layout, splits):
             current["block_table_v"] = table._replace(shape=(4, 1, 4, 1), strides=(4 * step + 5, 1, step, 1), span=3 * (4 * step + 5) + 3 * step + 1)
         frame = s.native.bind(prep._native_pack_from_facts(current, roles), indices, 0x4000000, 17)
         assert list(frame) == binding_reference._bind_thd_python(s, current, 0x4000000, 17, 17)
-        assert frame[s.index["partial_o_strides"]] == (capacity * s.qh * 512, s.qh * 512, 512)
+        assert frame[s.index["partial_o_strides"]] == (capacity * s.qh * d_v, s.qh * d_v, d_v)
         assert frame[s.index["o_partial_ptr"]] == 0x4000000 + off_o
         if paged:
             assert frame[s.index["table_v_strides"]] == (4 * step + 5, step)

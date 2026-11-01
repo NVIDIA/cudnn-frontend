@@ -3645,19 +3645,20 @@ def _p2_frost(cfg, request, cudnn_handle, *, cga=None, pin=None):
     anyway) keeps the graph on the python engines as the sibling cc 10.7 sweeps do, so a FROST decline is the
     failure text instead of a backend fallback; _exec_sdpa_on_frost pins the row and the shared paged template;
     _must_run turns a WAIVED skip into a failure.  ``pin`` appends + selects one explicit knob set
-    (ExecConfig.plan_pin); the cell's keyless rows are asserted bit-exact (_p2_exact_keyless_checker).  Returns the
-    served plan's knobs (asserted unsplit, never a winner)."""
+    (ExecConfig.plan_pin); without one, SPLIT_KV=1 is pinned over the row's first set: a sink graph without a window
+    may split by default on cc 10.7, and this route covers the unsplit shared paged body (the default twin runs the
+    split).  The cell's keyless rows are asserted bit-exact (_p2_exact_keyless_checker).  Returns the served plan's
+    knobs (asserted unsplit, never a winner)."""
     engine = _cc107_engine("half")
     cfg.softmax_precision = cudnn.data_type.FLOAT
-    if pin is not None:
-        cfg.plan_pin = {"engine": engine, "knobs": pin}
+    cfg.plan_pin = {"engine": engine, "knobs": pin if pin is not None else {"SPLIT_KV": 1}}
     with _must_run(request):
         _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine=engine, cga=cga, template=_P2_TEMPLATE[cfg.d_qk], tensor_checker=_p2_exact_keyless_checker(cfg))
     if request.config.option.dryrun:
         return None
     served, knobs = frost_routing.LAST_PLAN
     assert served == engine and knobs is not None, frost_routing.LAST_PLAN
-    assert knobs.split_kv in (None, 1), f"sink x split-KV is declined on every row, yet the served plan was {knobs}"
+    assert knobs.split_kv in (None, 1), f"this route pins an unsplit plan, yet the served plan was {knobs}"
     print(f"@@@@ P2 plan on {engine}: TILE_CGA_M={knobs.cga} PACK_GQA={knobs.pack_gqa} SCHED_POLICY={knobs.sched_policy}")
     return knobs
 
@@ -3686,7 +3687,8 @@ def test_sdpa_fwd_paged_thd_sink_cc107_half_L0(env_info, test_no, request, cudnn
     head-major (single-request head-major batches included, #1482: test_sdpa_paged_thd_sink_head_major_batch_one_cc107_L0);
     HND / NHD pools; dead pool pages
     NaN-poisoned; f16:bf16 1:2.  The sink-free half is the control (served before this change); every case is strict
-    and asserts routing onto the row and the f32 arm (_exec_cc107); a served sink graph is unsplit."""
+    and asserts routing onto the row and the f32 arm (_exec_cc107); a served sink graph under a left window is unsplit
+    (without one the heuristics may split it)."""
     _require_p2_env()
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
     geom_seed = abs(hash(test_no))
@@ -3724,7 +3726,7 @@ def test_sdpa_fwd_paged_thd_sink_cc107_half_L0(env_info, test_no, request, cudnn
     test.showConfig(test_no, request)
     with _must_run(request):
         _exec_cc107(test, request, cudnn_handle, "half")
-    if cfg.with_sink_token and not request.config.option.dryrun:
+    if cfg.with_sink_token and cfg.left_bound is not None and not request.config.option.dryrun:
         assert frost_routing.LAST_PLAN[1].split_kv in (None, 1), frost_routing.LAST_PLAN
 
 
@@ -4764,8 +4766,8 @@ def test_sdpa_fwd_cc107_decode_tile_sink_keyless_rows_L0(env_info, request, cudn
 
 
 _P3_ENVELOPE_CASES = {
-    # GPT-OSS uses the native SM107 d64 tile; pin its unpacked cga1 plan.
-    "gpt_oss_d64_sink_swa": dict(cfg=dict(b=4, h_q=64, h_kv=8, s_q=4, s_kv=4096, d=64, left_bound=128, stats=True, seq_len_q=[4] * 4, seq_len_kv=[4096, 4095, 129, 1]), pin="u1n", cga=None, knobs=None, template="prefill_d128_f16"),
+    # GPT-OSS uses the native D64 single-Q body on SM107; pin its unpacked cga1 plan.
+    "gpt_oss_d64_sink_swa": dict(cfg=dict(b=4, h_q=64, h_kv=8, s_q=4, s_kv=4096, d=64, left_bound=128, stats=True, seq_len_q=[4] * 4, seq_len_kv=[4096, 4095, 129, 1]), pin="u1n", cga=None, knobs=None, template="decode_d128_f16"),
     "mha_q8_sink": dict(cfg=dict(b=8, h_q=8, h_kv=8, s_q=8, s_kv=2048), pin=None, cga=1, knobs=dict(pack_gqa=False), template="decode_d128_f16"),
     "fp16_b64_q8_kv8192": dict(cfg=dict(b=64, h_q=64, h_kv=8, s_q=8, s_kv=8192, dtype=torch.float16), pin=None, cga=1, knobs=None, template="decode_d128_f16"),
     "mha_decode_small": dict(cfg=dict(b=1, h_q=4, h_kv=4, s_q=1, s_kv=128, causal=False, stats=True), pin=None, cga=1, knobs=None, template="decode_d128_f16"),
