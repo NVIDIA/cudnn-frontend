@@ -14,6 +14,7 @@ class SdpaSm80FwdBinder : private FixedSdpaOperands {
         int64_t numel   = 0;
         bool contiguous = false;
         Geometry bias_plane;
+        std::vector<int64_t> shape, strides;
     };
     py::object fn_, owner_;
     std::vector<Carrier> carriers_;
@@ -42,9 +43,16 @@ class SdpaSm80FwdBinder : private FixedSdpaOperands {
           fn_(spec.attr("fn")),
           owner_(spec.attr("artifact")),
           scale_(py::cast<double>(spec.attr("scale"))) {
-        const std::vector<std::string> roles{"q", "k", "v", "o", "stats", "seq_kv", "seq_q", "sink", "bias", "rope"};
         const auto ops = py::cast<py::tuple>(spec.attr("operands"));
-        if (ops.size() != 9 && ops.size() != roles.size()) invalid("invalid native forward operand declarations");
+        std::vector<std::string> roles{"q", "k", "v", "o", "stats", "seq_kv", "seq_q", "sink", "bias"};
+        if (ops.size() == 11) {
+            roles.push_back("paged_k");
+            roles.push_back("paged_v");
+        } else if (ops.size() == 10) {
+            roles.push_back("rope");
+        } else if (ops.size() != 9) {
+            invalid("invalid native forward operand declarations");
+        }
         for (size_t i = 0; i < ops.size(); ++i) {
             Carrier carrier;
             py::object declared = py::none();
@@ -52,6 +60,8 @@ class SdpaSm80FwdBinder : private FixedSdpaOperands {
                 auto shape         = py::cast<std::vector<int64_t>>(ops[i].attr("shape"));
                 auto strides       = py::cast<std::vector<int64_t>>(ops[i].attr("strides"));
                 declared           = py::make_tuple(shape, strides);
+                carrier.shape      = shape;
+                carrier.strides    = strides;
                 carrier.numel      = numel(shape);
                 carrier.contiguous = py::cast<bool>(ops[i].attr("contiguous"));
                 if (roles[i] == "bias") {
@@ -94,6 +104,15 @@ class SdpaSm80FwdBinder : private FixedSdpaOperands {
                         geometry(f.shape.subspan(1), f.stride.empty() ? f.stride : f.stride.subspan(1)) !=
                             carrier.bias_plane)
                         invalid("bias must have a contiguous [H,SQ,SKV] first plane");
+                } else if (!raw_storage && (op.name == "paged_k" || op.name == "paged_v")) {
+                    if (f.shape.size() != 2 || f.shape[0] != carrier.shape[0] || f.shape[1] < carrier.shape[1])
+                        invalid(op.name + " must cover the declared batch and logical page count");
+                    const std::array<int64_t, 2> observed_stride =
+                        f.stride.empty() ? std::array<int64_t, 2>{f.shape[1], 1}
+                                         : std::array<int64_t, 2>{f.stride[0], f.stride[1]};
+                    for (size_t axis = 0; axis < 2; ++axis)
+                        if (carrier.shape[axis] > 1 && observed_stride[axis] != carrier.strides[axis])
+                            invalid(op.name + " strides must match the declared page table");
                 } else if ((!raw_storage ||
                             std::find(overridden.begin(), overridden.end(), indices[i]) != overridden.end()) &&
                            geometry(f.shape, f.stride) != op.geometry) {
@@ -131,6 +150,7 @@ class SdpaSm80FwdBinder : private FixedSdpaOperands {
 void
 init_sdpa_sm80_binding(py::module_ &m) {
     py::class_<SdpaSm80FwdBinder>(m, "_SdpaSm80FwdBinder")
+        .def_prop_ro_static("supports_paged_kv", [](py::handle) { return true; })
         .def(py::init<const py::object &>())
         .def("bind",
              &SdpaSm80FwdBinder::bind,

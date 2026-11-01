@@ -1199,15 +1199,15 @@ def test_capabilities_positional_prefix_is_append_only():
     assert names[start : start + len(legacy_tail)] == legacy_tail, names[start:]
     # ... and every later field is appended after it, in the order it landed (the zero-scale and pre-folded-scale fields,
     # then the resident-bias / kv_mask fields of the Rubin small tiles and their per-shape TILE_N domain, then the PackGQA
-    # divisibility rule, last). The canonical band set (#601) is appended after every other field and stays the last one.
+    # divisibility rule). The canonical band set and independent-pool capability are appended in that order.
     first_appended = start + len(legacy_tail)
     assert names[first_appended : first_appended + len(appended)] == list(appended), names[start:]
-    assert names[-1] == "band", names[-3:]
+    assert names[-2:] == ["band", "independent_paged_pool_counts"], names[-3:]
 
     # Positional construction in the PRE-BAND order (every row's spelling before the canonical model landed) still binds every
     # field, and the appended band set is DERIVED from those flags rather than shadowing them.  The row built here carries the
     # pre-band defaults, so its claim is unmasked-only.
-    pre_band_order = [n for n in names if n != "band"]
+    pre_band_order = names[: names.index("band")]
     pre_band = engines.Capabilities(*[legacy_value(n) for n in pre_band_order])
     assert pre_band.sm_lo == 100 and pre_band.d_shapes == frozenset({(128, 128)})
     assert pre_band.causal is False and pre_band.swa is False
@@ -3589,3 +3589,20 @@ def test_native_d576_thd_split_scope(paged, sink):
     assert engines.mismatch(caps, facts, replace(knobs, cga=1)) is not None
     assert engines.mismatch(caps, replace(facts, has_epilogue_gate=True), knobs) is not None
     assert not engines.thd_split_domain(caps, replace(facts, shape_overrides=True, max_total_seq_len_q=facts.b * facts.s_q + 1))
+
+
+def test_paged_independent_pool_counts_are_capability_gated(monkeypatch):
+    graph = _mk_paged_graph()
+    original = _facts(graph)
+    for node in (original.q_t, original.o_t):
+        node.set_dim((B, H, 8, 128)).set_stride((8 * H * 128, 128, H * 128, 1))
+    dims = tuple(original.v_t.get_dim())
+    original.v_t.set_dim((dims[0] + 3, *dims[1:]))
+    monkeypatch.setattr(ga, "_device_cc", lambda: (8, 0))
+    facts = _facts(graph)
+    assert engines.mismatch(engines._sm80_spec().capabilities, facts) is None
+    from dataclasses import replace
+
+    assert "equal K/V" in engines.mismatch(engines._sm100_spec().capabilities, replace(facts, device_cc=(10, 0)))
+    original.v_t.set_dim((dims[0], dims[1], dims[2] * 2, dims[3]))
+    assert ga.analyze(graph).invalid is not None

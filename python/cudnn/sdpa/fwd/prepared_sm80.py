@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from cudnn.frost.compiled_cache import positional_entry
 
 ROLES = ("q", "k", "v", "o", "stats", "seq_kv", "seq_q", "sink", "bias")
+PAGED_ROLES = ROLES + ("paged_k", "paged_v")
 
 
 @dataclass(frozen=True)
@@ -83,13 +84,16 @@ def build_spec(api):
     else:
         operands.append(None)
         geometry.append(None)
+    if api.paged:
+        for shape, strides in api._sm80_paged_table_geometry:
+            add(shape, strides, "int32", 4)
     geometry = tuple(geometry)
     key = template_key(
         vars(api._k_mod),
-        dict(geometry=geometry, swa_window=api.swa_window_runtime, right_bound=api.right_bound_runtime),
+        dict(geometry=geometry, swa_window=api.swa_window_runtime, right_bound=api.right_bound_runtime, max_skv=api.s_k_max if api.paged else None),
         "prepared_dense",
     )
-    artifact = compile_host(api._k_mod, api._params, geometry, api.swa_window_runtime, api.right_bound_runtime, key)
+    artifact = compile_host(api._k_mod, api._params, geometry, api.swa_window_runtime, api.right_bound_runtime, key, api.s_k_max if api.paged else None)
     fn = positional_entry(artifact)
     if fn is None:
         raise NotImplementedError("SM80 prepared forward requires a positional tvm-ffi entry")
@@ -100,7 +104,7 @@ def bind(spec, facts, stream_int, *, scale=None, overridden=None, raw_storage=Fa
     """Bind native metadata through the template's sole native contract."""
     from .prepared import _native_pack_from_facts
 
-    roles = ROLES[: len(spec.operands)]
+    roles = PAGED_ROLES[: len(spec.operands)]
     pack = _native_pack_from_facts(facts, roles)
     overridden_indices = tuple(i for i, role in enumerate(roles) if overridden is not None and role in overridden)
     return list(spec.native.bind(pack, tuple(range(len(roles))), stream_int, scale, overridden_indices, raw_storage))
@@ -113,9 +117,9 @@ def execute(spec, facts, stream_int, *, scale=None, overridden=None, raw_storage
 class PreparedSm80Launch:
     def __init__(self, spec, binding):
         self.spec = spec
-        attributes = ("q", "k", "v", "o", "stats", "seq_len_kv", "seq_len_q", "sink_token", "bias")
-        tensors = [getattr(binding, name) for name in attributes]
-        self._roles = [name for name, t in zip(ROLES, tensors) if t is not None]
+        attributes = ("q", "k", "v", "o", "stats", "seq_len_kv", "seq_len_q", "sink_token", "bias", "paged_k_table", "paged_v_table")
+        tensors = [getattr(binding, name) for name in attributes[: len(spec.operands)]]
+        self._roles = [name for name, t in zip(PAGED_ROLES, tensors) if t is not None]
         self._uids = [t.get_uid() for t in tensors if t is not None]
         self._indices = None
         self._native_indices = None
@@ -125,7 +129,7 @@ class PreparedSm80Launch:
             self._indices = [pack.index_of(uid) for uid in self._uids]
         if self._native_indices is None:
             roles = dict(zip(self._roles, self._indices))
-            self._native_indices = tuple(roles.get(role, -1) for role in ROLES[: len(self.spec.operands)])
+            self._native_indices = tuple(roles.get(role, -1) for role in PAGED_ROLES[: len(self.spec.operands)])
         self.spec.native.execute(pack.native, self._native_indices, stream_int, None, tuple(pack.overridden), True)
 
 

@@ -324,7 +324,11 @@ def test_graph_thd_execute_does_not_allocate_or_sync(monkeypatch):
         artifact, launch = compile_thd_host(*args, **kwargs)
 
         def launch_spy(*launch_args):
-            assert launch_args[-2] == (1, 1, 1)
+            import inspect
+
+            # Physical-origin operands append after the legacy stream slot.
+            aux_index = tuple(inspect.signature(inspect.unwrap(prepared_host.thd_host)).parameters).index("aux_strides")
+            assert launch_args[aux_index] == (1, 1, 1)
             launches.append(True)
             return launch(*launch_args)
 
@@ -706,10 +710,9 @@ def test_graph_thd_independent_pitches_rebind_replay(d, dv, stats_layout, stats_
         if node is not o:
             view[:, :total].normal_()
         node.set_stride((7, head_stride, token_stride, 1))
-        for offset in vp:
-            if offset.get_name() == node.get_name() + "_ro":
-                # The graph still describes adjacent sequences; physical token pitches differ by port.
-                vp[offset].div_(node.get_dim()[1] * width, rounding_mode="floor").mul_(token_stride)
+        # Bind by declared tensor identity: an SDPA output need not be named "o".
+        offset = node.ragged_offset
+        vp[offset].div_(node.get_dim()[1] * width, rounding_mode="floor").mul_(token_stride)
         vp[node] = view
         storage[node] = backing
     output_padding = torch.ones_like(storage[o], dtype=torch.bool)
@@ -788,7 +791,7 @@ def test_graph_thd_independent_pitches_rebind_replay(d, dv, stats_layout, stats_
             elif name.endswith("_ro"):
                 lengths = new_kv if name in ("k_ro", "v_ro") else new_q
                 prefix = [0, lengths[0], lengths[0] + lengths[1], sum(lengths)]
-                data_node = next((n for n in (q, k, v, o) if n.get_name() + "_ro" == name), None)
+                data_node = next((n for n in (q, k, v, o) if n.ragged_offset is node), None)
                 pitch = data_node.get_stride()[2] if data_node is not None else (4 if stats_layout == "token_major" else 1)
                 vp[node].copy_(torch.tensor(prefix, dtype=torch.int64, device="cuda").view_as(vp[node]) * pitch)
         captured.replay()

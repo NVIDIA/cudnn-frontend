@@ -105,6 +105,13 @@ and layout, not just its paged path. Assert the prepared THD spec contains
 THD cases cover mixed KV and uniform half, packed and unpacked, with poisoned
 gaps, independent port origins, rebinding, and changed-length replay.
 
+A test that changes a port's token pitch must update that port's physical
+ragged offsets too. Bind offsets through the tensor's `ragged_offset` reference;
+an SDPA output's generated name need not be `o`. A prefix-only kernel can mask
+an incorrect fixture until physical-origin addressing is enabled. The SM80
+`test_graph_thd_independent_pitches_rebind_replay` and
+`test_independent_origins_rebind_replay` check these two contracts separately.
+
 For single-Q ragged split decode, physical Q-offset differences can include
 storage gaps. The combine must use the declared device Q lengths (ordinary or
 cumulative), independently of output addresses. Exercise an empty sequence with
