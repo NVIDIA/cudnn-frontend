@@ -163,3 +163,25 @@ def test_native_d64_standalone_compact_thd(dtype, cga, packed):
         check(fresh, qf, kf)
     finally:
         capture.reset()
+
+
+@pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
+@pytest.mark.parametrize("graph_api", [False, True])
+@pytest.mark.parametrize(
+    "dims,group,sq,sk,packed,causal,window,stats,sink",
+    [
+        ((64, 64), 1, 1, 1025, False, False, None, "none", False),
+        ((64, 64), 8, 4, 1025, True, True, None, "log2", True),
+        ((48, 32), 12, 9, 257, True, True, 47, "natural", True),
+        ((64, 64), 1, 128, 257, False, False, None, "natural", False),
+        ((64, 64), 1, 129, 257, False, False, None, "natural", False),
+    ],
+    ids=["plain", "packed", "partial", "tile_boundary", "prefill_control"],
+)
+def test_native_d64_dense_unsplit_replay(dtype_name, graph_api, dims, group, sq, sk, packed, causal, window, stats, sink, monkeypatch, cudnn_handle):
+    """The short-Q single-slab leg and the taller prefill control share public bindings."""
+    from test_sdpa_sink_split_sm107 import CASES, _check_sink_split
+
+    case = (dims, group, sq, sk, 1, 1, packed, causal, window, "sm107/prefill_d128_f16.py")
+    monkeypatch.setitem(CASES, "unsplit64", case)
+    _check_sink_split("unsplit64", dtype_name, stats, graph_api=graph_api, handle=cudnn_handle, tile_n=128, sink=sink)
