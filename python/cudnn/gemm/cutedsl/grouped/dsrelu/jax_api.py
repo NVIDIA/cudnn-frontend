@@ -567,9 +567,11 @@ def dsrelu_plan(inputs, outputs, mma_tiler_mn, cluster_shape_mn, discrete_col_sf
             raise ValueError("Unsupported grouped GEMM dSReLU dtype, tile, cluster, alignment, or layout configuration")
         validated_configs.add(validation_key)
     if config not in kernel_cache:
+        from cudnn.tensor_adapter import has_tcgen05
+
         major, minor = get_compute_capability()
-        if major < 10:
-            raise RuntimeError(f"Grouped GEMM dSReLU requires SM100+, found SM{major}{minor}")
+        if not has_tcgen05(major):
+            raise RuntimeError(f"Grouped GEMM dSReLU requires SM100+ with tcgen05 (not cc 12.x), found SM{major}{minor}")
         mac = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]) - margin
         if mac <= 0:
             raise ValueError("CUDNNFE_CLUSTER_OVERLAP_MARGIN leaves no active clusters")
