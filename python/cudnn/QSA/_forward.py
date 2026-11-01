@@ -15,10 +15,10 @@ import torch
 
 from cudnn.frost.compiled_cache import compile_cached, template_key
 from . import _metadata
-from .kernels import fprop_dense, fprop_prepare, fprop_sm100
+from .kernels import fprop_dense, fprop_dense_sm90, fprop_prepare, fprop_sm90, fprop_sm100
 
 FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-SOURCE_DIGESTS = tuple(module.FROST_SOURCE_DIGEST for module in (_metadata, fprop_dense, fprop_prepare, fprop_sm100))
+SOURCE_DIGESTS = tuple(module.FROST_SOURCE_DIGEST for module in (_metadata, fprop_dense, fprop_dense_sm90, fprop_prepare, fprop_sm90, fprop_sm100))
 _N64_SOURCE_DIGESTS = tuple(
     hashlib.sha256(Path(__file__).with_name("kernels").joinpath(name).read_bytes()).hexdigest() for name in ("fprop_n64_sm107.py", "_fprop_n64_ops.py")
 )
@@ -67,26 +67,35 @@ def _launch(
         counts = cute.make_tensor(scratch.iterator + counts_offset, cute.make_layout((total,)))
         flat_k = cute.make_tensor(k.iterator, cute.make_layout((cute.size(k),)))
         flat_v = cute.make_tensor(v.iterator, cute.make_layout((cute.size(v),)))
-        fprop_prepare.prepare(flat_k, flat_v, sel, lo, hi, bases, origins, first, last, partials, modes, ranges, bits, order, ids, counts, stream, arch == 107)
-        total, hq, dim = q.shape
-        hkv = k.shape[1]
-        q_view = cute.make_tensor(q.iterator, cute.make_layout((total, dim, hq), stride=(hq * dim, 1, dim)))
-        k_view = cute.make_tensor(k.iterator, cute.make_layout((total, dim, hkv), stride=(hkv * dim, 1, dim)))
-        v_view = cute.make_tensor(v.iterator, cute.make_layout((dim, total, hkv), stride=(1, hkv * dim, dim)))
-        flat_bits = cute.make_tensor(bits.iterator, cute.make_layout((cute.size(bits),)))
-        flat_out = cute.make_tensor(out.iterator, cute.make_layout((cute.size(out),)))
-        flat_out32 = cute.make_tensor(out32.iterator, cute.make_layout((cute.size(out32),)))
-        flat_lse = cute.make_tensor(lse.iterator, cute.make_layout((cute.size(lse),)))
-        fprop_dense._attn_launch(
-            q_view, k_view, v_view, flat_bits, ranges, modes, order, flat_out, flat_out32, flat_lse, scale, Int32(bits.shape[1]), stream, hq // hkv, hq
+        fprop_prepare.prepare(
+            flat_k, flat_v, sel, lo, hi, bases, origins, first, last, partials, modes, ranges, bits, order, ids, counts, stream, arch == 107, arch == 90
         )
-        fprop_sm100._fprop_host(q, k, v, out, out32, lse, ids, counts, lo, hi, first, last, modes, scale, stream, arch)
+        if cutlass.const_expr(arch == 90):
+            fprop_dense_sm90._host(q, k, v, bits, ranges, modes, order, out, out32, lse, scale, q.shape[1] // k.shape[1], 256, stream)
+            fprop_sm90._host(q, k, v, out, out32, lse, ids, counts, lo, hi, first, last, scale, stream, modes)
+        else:
+            total, hq, dim = q.shape
+            hkv = k.shape[1]
+            q_view = cute.make_tensor(q.iterator, cute.make_layout((total, dim, hq), stride=(hq * dim, 1, dim)))
+            k_view = cute.make_tensor(k.iterator, cute.make_layout((total, dim, hkv), stride=(hkv * dim, 1, dim)))
+            v_view = cute.make_tensor(v.iterator, cute.make_layout((dim, total, hkv), stride=(1, hkv * dim, dim)))
+            flat_bits = cute.make_tensor(bits.iterator, cute.make_layout((cute.size(bits),)))
+            flat_out = cute.make_tensor(out.iterator, cute.make_layout((cute.size(out),)))
+            flat_out32 = cute.make_tensor(out32.iterator, cute.make_layout((cute.size(out32),)))
+            flat_lse = cute.make_tensor(lse.iterator, cute.make_layout((cute.size(lse),)))
+            fprop_dense._attn_launch(
+                q_view, k_view, v_view, flat_bits, ranges, modes, order, flat_out, flat_out32, flat_lse, scale, Int32(bits.shape[1]), stream, hq // hkv, hq
+            )
+            fprop_sm100._fprop_host(q, k, v, out, out32, lse, ids, counts, lo, hi, first, last, modes, scale, stream, arch)
+
     else:
         ids = cute.make_tensor(scratch.iterator, cute.make_layout((total, blocks), stride=(blocks, 1)))
         counts_offset = cute.ceil_div(total * blocks, 4) * 4
         counts = cute.make_tensor(scratch.iterator + counts_offset, cute.make_layout((total,)))
         _metadata._compact_host(sel, lo, hi, first, last, ids, counts, stream, arch == 107)
-        if cutlass.const_expr(n64):
+        if cutlass.const_expr(arch == 90):
+            fprop_sm90._host(q, k, v, out, out32, lse, ids, counts, lo, hi, first, last, scale, stream)
+        elif cutlass.const_expr(n64):
             from .kernels import fprop_n64_sm107
 
             fprop_n64_sm107._fprop_host(q, k, v, out, out32, lse, ids, counts, lo, hi, first, last, None, scale, stream, arch)

@@ -19,8 +19,8 @@ pytestmark = pytest.mark.L0
 
 @pytest.fixture(autouse=True)
 def indexed_supported_device():
-    if torch.cuda.is_available() and torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
-        pytest.skip("Indexed QSA requires SM100, SM103 or SM107")
+    if torch.cuda.is_available() and torch.cuda.get_device_capability() not in ((9, 0), (10, 0), (10, 3), (10, 7)):
+        pytest.skip("Indexed QSA requires SM90, SM100, SM103 or SM107")
 
 
 def indices_for(inputs):
@@ -56,15 +56,18 @@ def test_indexed_packed_reference(supported_gpu, lengths):
 
 @pytest.mark.parametrize("lengths", [(3, 5, 7), (129, 133)])
 def test_indexed_six_query_heads(supported_gpu, lengths):
-    """6Q/1KV shares the kernels; its backward batches four queries per compact-ID row (12Q/1KV batches two)."""
+    """Check 6Q/1KV numerics and each architecture's backward workspace."""
     inputs = make_inputs(lengths, 6, 1, empty=True, all_selected=True)
     indices = indices_for(inputs)
     check_case(inputs, indices)
     plan = _plan(inputs["q"].shape[0], indices.shape[1], inputs["q"].device, "bprop", 6)
-    assert plan.paired and plan.nq == 4 and "flags" in {name for name, _, _ in plan.layouts}
-    assert dict((name, shape) for name, shape, _ in plan.layouts)["ids"] == ((inputs["q"].shape[0] + 3) // 4, indices.shape[1])
-    paired = _plan(inputs["q"].shape[0], indices.shape[1], inputs["q"].device, "bprop")
-    assert paired.paired and paired.nq == 2
+    hopper = torch.cuda.get_device_capability() == (9, 0)
+    assert plan.paired == (not hopper)
+    assert plan.nq == (1 if hopper else 4)
+    assert ("flags" in {name for name, _, _ in plan.layouts}) == (not hopper)
+    assert dict((name, shape) for name, shape, _ in plan.layouts)["ids"] == ((inputs["q"].shape[0] + plan.nq - 1) // plan.nq, plan.nq * indices.shape[1] // 4)
+    plan12 = _plan(inputs["q"].shape[0], indices.shape[1], inputs["q"].device, "bprop")
+    assert plan12.paired == (not hopper) and plan12.nq == (1 if hopper else 2)
     out = qsa_indexed_forward(inputs["q"], inputs["k"], inputs["v"], indices)
     with pytest.raises(NotImplementedError, match="causal_topk requires 12Q/1KV"):
         qsa_indexed_backward(inputs["q"], inputs["q"], inputs["k"], inputs["v"], out["out_fp32"], out["lse"], indices, selection_mode="causal_topk")
@@ -104,13 +107,16 @@ def test_indexed_changed_values_replay(supported_gpu):
         graph.reset()
 
 
-def test_indexed_execute_uses_only_caller_storage(supported_gpu, monkeypatch):
+@pytest.mark.parametrize("direction", ["fprop", "bprop"])
+def test_indexed_execute_uses_only_caller_storage(supported_gpu, monkeypatch, direction):
     inputs = make_inputs((3, 9), 12, 1, all_selected=True)
     q, k, v = (inputs[name] for name in ("q", "k", "v"))
     indices = indices_for(inputs)
-    out, expected = check_case(inputs, indices)
-    plan = _plan(q.shape[0], indices.shape[1], q.device, "bprop")
-    outputs = tuple(torch.empty_like(expected[name]) for name in ("dq", "dk", "dv"))
+    out, grads = check_case(inputs, indices)
+    expected = out if direction == "fprop" else grads
+    saved = {} if direction == "fprop" else dict(grad=q, out32=out["out_fp32"], lse=out["lse"])
+    plan = _plan(q.shape[0], indices.shape[1], q.device, direction)
+    outputs = tuple(torch.empty_like(value) for value in expected)
     workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device=q.device)
 
     def forbidden(*args, **kwargs):
@@ -122,18 +128,18 @@ def test_indexed_execute_uses_only_caller_storage(supported_gpu, monkeypatch):
         patch.setattr(torch.cuda, "synchronize", forbidden)
         for name in ("cpu", "to", "item", "tolist", "numpy"):
             patch.setattr(torch.Tensor, name, forbidden)
-        plan.execute(q, k, v, indices, outputs, 1 / 16, workspace, q, out["out_fp32"], out["lse"])
+        plan.execute(q, k, v, indices, outputs, 1 / 16, workspace, **saved)
     for actual, ref in zip(outputs, expected):
         assert_close(actual, ref)
     with monkeypatch.context() as patch:
         patch.setattr(plan, "_metadata", forbidden)
         with pytest.raises(ValueError, match="workspace"):
-            plan.execute(q, k, v, indices, outputs, 1 / 16, workspace[:0], q, out["out_fp32"], out["lse"])
+            plan.execute(q, k, v, indices, outputs, 1 / 16, workspace[:0], **saved)
         with pytest.raises(ValueError, match="overlap"):
-            plan.execute(q, k, v, indices, (q, *outputs[1:]), 1 / 16, workspace, q, out["out_fp32"], out["lse"])
+            plan.execute(q, k, v, indices, (q, *outputs[1:]), 1 / 16, workspace, **saved)
         with pytest.raises(ValueError, match="aligned"):
             bad = torch.empty(q.numel() + 1, device=q.device, dtype=q.dtype)[1:].view(q.shape)
-            plan.execute(bad, k, v, indices, outputs, 1 / 16, workspace, q, out["out_fp32"], out["lse"])
+            plan.execute(bad, k, v, indices, outputs, 1 / 16, workspace, **saved)
 
 
 def test_indexed_contract_rejection(supported_gpu):
@@ -170,7 +176,7 @@ def canonical_inputs(supported_gpu):
 
     if torch.cuda.get_device_capability() == (10, 7):
         pytest.skip("The canonical two-pass backward is currently qualified on SM100/SM103")
-    if _dsl_cuda_version()[0] < 13:
+    if torch.cuda.get_device_capability() != (9, 0) and _dsl_cuda_version()[0] < 13:
         pytest.skip("12Q/1KV sparse two-pass requires the CUDA 13 DSL compiler")
     return canonical
 
@@ -191,12 +197,12 @@ def _canonical_call(inputs, **kwargs):
 
 
 @pytest.mark.parametrize("total, bounds", [(4099, None), (32769, None), (32769, [0, 3, 3, 32769])])
-def test_public_causal_topk_uses_two_pass_and_native_saved_state(canonical_inputs, monkeypatch, total, bounds):
+def test_public_causal_topk_uses_native_saved_state(canonical_inputs, monkeypatch, total, bounds):
     from QSA.cutedsl.two_pass_reference import reference_backward, assert_grads_close
     from cudnn.QSA.two_pass import api as two_pass
 
     inputs = canonical_inputs(total, 71, h_kv=1, cu_seqlens=bounds, width=2052, saved_output_dtype=torch.float32)
-    # Use saved state from the actual public forward, not a private test-only path.
+    # Backward consumes the public forward's saved state.
     out = qsa_indexed_forward(inputs["q"], inputs["k"], inputs["v"], inputs["topk_idxs"])
     inputs["out"], inputs["lse"] = out["out_fp32"], out["lse"]
     calls = []
@@ -211,7 +217,8 @@ def test_public_causal_topk_uses_two_pass_and_native_saved_state(canonical_input
     expected = reference_backward(**{k: inputs[k] for k in ("q", "k", "v", "out", "dout", "lse", "topk_idxs")})
     for name, value, ref in zip(("dq", "dk", "dv"), actual, expected):
         assert_grads_close(name, value, ref)
-    assert calls == [(inputs["out"].data_ptr(), inputs["lse"].data_ptr())]
+    expected_calls = [] if torch.cuda.get_device_capability() == (9, 0) else [(inputs["out"].data_ptr(), inputs["lse"].data_ptr())]
+    assert calls == expected_calls
     assert tuple(actual.keys()) == ("dq", "dk", "dv")
 
 
@@ -297,5 +304,6 @@ def test_indexed_dsl_gate_precedes_kernel_import(supported_gpu, monkeypatch, ver
 
     plan = _QsaIndexedPlan(7, 4, torch.device("cuda", torch.cuda.current_device()), "bprop")
     monkeypatch.setattr(buffers, "cutedsl_state", lambda: (version is not None, version))
-    with pytest.raises(ImportError, match="nvidia-cutlass-dsl.*4.7.0"):
+    minimum = ".".join(map(str, buffers.CUTEDSL_MIN_VERSION))
+    with pytest.raises(ImportError, match=f"nvidia-cutlass-dsl.*{minimum}"):
         plan.compile()

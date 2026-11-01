@@ -352,6 +352,11 @@ SDPA-specific hard rules (cited as Rule S1, S2, ...) live in
 - Use the decorated function's actual name, keep the default
   ``keep_mangled_name=True``, and do not use compiler flags or symbol rewriting
   instead.
+- QSA's SM90 dense backward kernel retains the `cutlass` component. With
+  CuTeDSL 4.8.1/CUDA 13.4, removing it adds a 1,376-byte local stack and nearly
+  doubles the 4K/6-head kernel time on H200. Keep its `cudnn` prefix. Before
+  removing this workaround, compare generated stack usage and rerun the
+  matched-input QSA benchmark across all head geometries.
 - Verify with ``(cd test/python && pytest -q test_frost_kernel_name_prefix.py)``.
 - This call runs at module import, and DSL APIs used this way can be newer than
   the `pyproject.toml` floor admits. It is legal only because Rule 7's gate runs

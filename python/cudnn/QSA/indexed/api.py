@@ -47,8 +47,8 @@ class _QsaIndexedPlan(APIBase):
         with torch.cuda.device(device):
             super().__init__()
         self.total, self.width, self.device, self.direction, self.hq = total, width, device, direction, hq
-        # The backward batches consecutive queries (two at 12:1, four at 6:1) with owner bits in the compact IDs.
-        self.paired = direction == "bprop" and paired_backward(hq, 1)
+        # Hopper uses one query per compact-ID row; Blackwell and Rubin batch queries.
+        self.paired = direction == "bprop" and torch.cuda.get_device_capability(device) != (9, 0) and paired_backward(hq, 1)
         self.nq = paired_queries(hq, 1) if self.paired else 1
         groups = (total + self.nq - 1) // self.nq
         self.layouts = [
@@ -78,8 +78,8 @@ class _QsaIndexedPlan(APIBase):
                 cutedsl_requirement_error("Indexed QSA") or f"Indexed QSA requires nvidia-cutlass-dsl >= {'.'.join(str(x) for x in CUTEDSL_MIN_VERSION)}"
             )
         cc = torch.cuda.get_device_capability(self.device)
-        if cc not in ((10, 0), (10, 3), (10, 7)):
-            raise NotImplementedError(f"Indexed QSA requires SM100, SM103 or SM107, got SM{cc[0]}{cc[1]}")
+        if cc not in ((9, 0), (10, 0), (10, 3), (10, 7)):
+            raise NotImplementedError(f"Indexed QSA requires SM90, SM100, SM103 or SM107, got SM{cc[0]}{cc[1]}")
         reason = cutedsl_arch_requirement_error(cc)
         if reason:
             raise NotImplementedError(reason)
@@ -97,7 +97,9 @@ class _QsaIndexedPlan(APIBase):
 
         with torch.cuda.device(self.device):
             module = f"{self.direction}_sm100"
-            if self.direction == "fprop" and self.arch == 107 and self.total >= 32768 and self.hq == 12:
+            if self.arch == 90:
+                module = f"{self.direction}_sm90"
+            elif self.direction == "fprop" and self.arch == 107 and self.total >= 32768 and self.hq == 12:
                 module = "fprop_n64_sm107"  # specialised for 12 heads per KV head
             elif self.direction == "bprop" and not self.paired:
                 module = "bprop_sm107" if self.arch == 107 else "bprop_sm100_base"
@@ -219,12 +221,12 @@ def qsa_indexed_backward(grad_out, q, k, v, out_fp32, lse, indices, scale=1 / 16
             if not isinstance(cu_seqlens, torch.Tensor) or cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
                 raise ValueError("cu_seqlens must have shape [B + 1] with B >= 1")
             check_tensor("cu_seqlens", cu_seqlens, cu_seqlens.shape, torch.int32, q.device)
-        # Explicit selection semantics admit this backend; tensor shape alone
-        # must never route general selections (notably empty rows) into it.
-        from cudnn.QSA.two_pass.api import _backward
+        if torch.cuda.get_device_capability(q.device) != (9, 0):
+            # Only an explicit contract enables the Blackwell two-pass backend.
+            from cudnn.QSA.two_pass.api import _backward
 
-        with torch.cuda.device(q.device):
-            return _backward(q, k, v, out_fp32, grad_out, lse, indices, softmax_scale=scale, cu_seqlens=cu_seqlens, max_seq_len=max_seq_len)
+            with torch.cuda.device(q.device):
+                return _backward(q, k, v, out_fp32, grad_out, lse, indices, softmax_scale=scale, cu_seqlens=cu_seqlens, max_seq_len=max_seq_len)
     plan = _plan(total, width, q.device, "bprop", q.shape[1])
     with torch.cuda.device(q.device):
         outputs = (torch.empty_like(q), torch.empty_like(k), torch.empty_like(v))
