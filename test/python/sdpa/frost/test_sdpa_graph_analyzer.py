@@ -1461,6 +1461,49 @@ def test_tile_n_knob_domain_is_per_flavor_on_the_sm107_f16_row(monkeypatch):
     assert min(caps.tile_ns) == 128, "the heuristics' default width stays 128 (min of the row-wide floor)"
 
 
+@pytest.mark.parametrize("dtype", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16])
+@pytest.mark.parametrize("policy", [0, 1])
+def test_rubin_d192_unsplit_cta_does_not_require_split_workspace_bound(monkeypatch, dtype, policy):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    _rubin(monkeypatch)
+    caps = _sm107_f16_caps()
+    facts = ga.SdpaGraphFacts(
+        b=4096,
+        h_q=32,
+        h_kv=8,
+        s_q=128,
+        s_kv=65536,
+        d_qk=192,
+        d_v=128,
+        dtype=dtype,
+        dtype_o=dtype,
+        causal=True,
+        bottom_right=True,
+        padded=True,
+        thd=True,
+        device_cc=(10, 7),
+        shape_overrides=True,
+    )
+    unsplit = engines.SdpaFwdKnobs(cga=1, split_kv=1, tile_n=128, pack_gqa=False, sched_policy=policy)
+    assert engines.mismatch(caps, facts, unsplit) is None
+    assert engines.mismatch(caps, facts, replace(unsplit, cga=2)) is None
+    # No partial workspace is needed by the unsplit plan. Split plans still
+    # require the caller's bound, and unrelated unsupported features stay out.
+    assert not engines.thd_split_domain(caps, facts)
+    assert engines.mismatch(caps, facts, replace(unsplit, split_kv=2)) is not None
+    for unsupported in (
+        replace(facts, has_epilogue_gate=True),
+        replace(facts, stats_t=SimpleNamespace(ragged_offset=None)),
+    ):
+        assert engines.mismatch(caps, unsupported, unsplit) is not None
+    bounded = replace(facts, max_total_seq_len_q=128)
+    assert engines.thd_split_domain(caps, bounded)
+    assert engines.mismatch(caps, bounded, unsplit) is None
+    assert facts.max_total_seq_len_q is None and facts.shape_overrides
+
+
 @pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("h_q,h_kv", [(32, 8), (48, 8), (96, 8), (256, 1)])
