@@ -225,7 +225,7 @@ def test_cc103_d256_backward_thd_entries_are_its_own():
 def test_cc103_d128_forward_dense_chunk_gqa_entries_are_its_own():
     """cc 10.3's own d128 forward entries for dense bottom-right causal GQA chunks (study sm103_d128_fwd_chunk_20261031, GQA
     half): they lead on and off the 128-key tile, past the hand rules' chunk-size and cache bounds, with no transfer. The same
-    graphs on cc 10.0, MHA, f16 and top-left chunks have no entry."""
+    graphs on cc 10.0, MHA and f16 have no entry; top-left chunks belong to a separate study."""
     row = "sdpa_fwd_prefill_sm100"
 
     def chunk(b, h_q, h_kv, s_q, s_kv, **over):
@@ -238,4 +238,36 @@ def test_cc103_d128_forward_dense_chunk_gqa_entries_are_its_own():
     assert pt.lookup(row, chunk(4, 64, 8, 128, 2048, device_cc=(10, 0))) is None
     assert pt.lookup(row, chunk(4, 32, 32, 128, 2048)) is None  # MHA: no entry
     assert pt.lookup(row, chunk(4, 64, 8, 128, 2048, dtype=cudnn.data_type.HALF)) is None  # f16: not measured
-    assert pt.lookup(row, chunk(4, 64, 8, 128, 2048, bottom_right=False)) is None  # top-left chunk: not this class
+    # The top-left counterpart has its own measured entry after #2120.
+    top_left = chunk(4, 64, 8, 128, 2048, bottom_right=False)
+    key = pt.class_key(row, top_left)
+    assert key[6] == "causal_tl"
+    assert pt.TABLE[key].study == "sm103_d128_fwd_dense_20261031"
+
+
+@pytest.mark.L0
+def test_cc103_d128_forward_dense_causal_gqa_entries_are_its_own():
+    """cc 10.3's own d128 forward entries (study sm103_d128_fwd_dense_20261031, causal GQA half): dense unequal-length top-left causal GQA graphs lead
+    on and off the 128-key tile, with no transfer. The same graphs on cc 10.0, mask-free graphs and MHA have no entry."""
+    row = "sdpa_fwd_prefill_sm100"
+
+    def fwd(b, h_q, h_kv, s, causal=True, **over):
+        base = dict(b=b, h_q=h_q, h_kv=h_kv, s_q=s // 2, s_kv=s, d_qk=128, d_v=128, causal=causal, has_paged_kv=False, device_cc=(10, 3))
+        base.update(over)
+        return _facts(**base)
+
+    assert pt.lookup(row, fwd(2, 32, 8, 4096)) is True  # on the tile
+    assert pt.lookup(row, fwd(4, 16, 2, 3000)) is True  # off the tile: its own class and entry
+    assert pt.lookup(row, fwd(2, 32, 8, 4096, device_cc=(10, 0))) is None
+    assert pt.lookup(row, fwd(2, 32, 8, 4096, causal=False)) is None  # mask-free: lost on its holdout
+    assert pt.lookup(row, fwd(2, 16, 16, 4096)) is None  # MHA: no entry
+    assert pt.lookup(row, fwd(2, 32, 8, 4096, dtype=cudnn.data_type.HALF)) is None  # f16: not measured
+    # Squares share the bottom-right class; the top-left study must not claim them.
+    square = fwd(2, 32, 8, 4096, s_q=4096)
+    key = pt.class_key(row, square)
+    assert key[6] == "causal_br"
+    assert pt.TABLE[key].study == "sm103_d128_fwd_chunk_20261031"
+    for s_q in (5, 64, 8192):
+        facts = fwd(1, 16, 2, 2048, s_q=s_q)
+        assert pt.lookup(row, facts) is True
+        assert pt.TABLE[pt.class_key(row, facts)].study == "sm103_d128_fwd_dense_20261031"

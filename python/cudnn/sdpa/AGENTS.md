@@ -534,6 +534,9 @@ production kernels gain no debug knob or timing-dependent assertion.
   qualified on a frozen holdout that exercises every class it covers and is used once. Write a hand rule in `placement.py` only for what the table cannot express (a
   non-monotone class the generator reports, or a feature the class key excludes), and say why in the rule.
 - A class the generator reports as NON-MONOTONE needs a finer key, not a hand-tuned region around its points.
+- Test study ownership through `class_key` and the matched entry's `study`, not a global absence of entries for another
+  measured class. Square causal masks canonicalize to bottom-right; use unequal Q/KV lengths to test the top-left class.
+  Re-run placement-table tests on the actual develop integration when another study lands in the same table.
 - An entry answers for its whole class, so the grid must reach the class's extremes and straddle every boundary. Three
   misses each found in review or on a holdout:
   - an `always` fitted on long prefills that also claimed q = KV = 16 (FROST 2x slower there);
