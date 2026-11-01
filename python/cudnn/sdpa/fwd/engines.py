@@ -1625,6 +1625,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 paged=facts.has_paged_kv,
                 split_kv=knobs.split_kv or 1,
                 cga=knobs.cga,
+                thd=facts.thd,
             )
             and not _config_sm107.supports_native_d512_dense_pack_split(
                 _selected_d_shape(capabilities, facts, knobs),
@@ -1806,9 +1807,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 and not decode_tile
             ):
                 return "SM107 D256 split is qualified for half THD and the d256 decode tile (a decode-shaped graph: S_q x G packed rows within its routed envelope) only"
-            # With the knobs: a dense-only tile (the Rubin d32 / d64) is walked
-            # past, so a split graph at D <= 64 selects the d128 flavor it
-            # rode before the tiles -- served, not declined.
+            # Select with the requested knobs: small half split plans use D64;
+            # other restricted flavors retain their larger-envelope walk.
             if capabilities.split_d_shapes is not None and _selected_d_shape(capabilities, facts, knobs) not in capabilities.split_d_shapes:
                 return f"split_kv > 1 is wired only in the {sorted(capabilities.split_d_shapes)} kernel flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
         if knobs.pack_gqa and capabilities.pack_gqa_d_shapes is not None:
@@ -1993,6 +1993,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             paged=facts.has_paged_kv,
             split_kv=(knobs.split_kv or 1) if knobs is not None else 1,
             cga=knobs.cga if knobs is not None else None,
+            thd=facts.thd,
         ):
             return "native D64 THD requires nonpaged, unsplit half-precision plans on the D64 tile"
     if facts.thd and capabilities.sm_lo == capabilities.sm_hi == 80 and capabilities.phase == "prefill":
@@ -2637,7 +2638,7 @@ def _sm107_spec() -> EngineSpec:
             thd_pack_gqa_d_shapes=frozenset({(64, 64), (128, 128), (256, 256)}),
             split_kv_supported=True,
             # (256, 256) = the paged THD packed split and the decode tile's dense / paged split.
-            split_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
+            split_d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)}),
             # NATURAL row-wide; LPT advertised PER D-SHAPE for what is validated.
             #
             # The old note here said the ported decode "does not honor
@@ -3523,6 +3524,10 @@ def lower_dsl_prefill(
         **({"sample_kv_mask": ga.tensor_desc_from_ir(facts.kv_mask_t, name="kv_mask")} if ("sample_kv_mask" in _ctor_params and facts.has_kv_mask) else {}),
     )
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
+    if facts.thd and spec.name == "sdpa_fwd_prefill_sm80":
+        # Variant-pack buffers may be flat or capacity-shaped; the graph's
+        # Stats descriptor, rather than the carrier's shape, owns the packing.
+        api._thd_lse_raw_storage = True
     if getattr(api, "thd_decode_leg", False):
         # Physical offsets choose addresses; declared Q lengths choose live rows.
         api._ragged_q_lens = 2 if facts.cu_seq_q_t is not None else 1 if facts.seq_q_t is not None else 0

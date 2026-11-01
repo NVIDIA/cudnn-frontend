@@ -670,12 +670,12 @@ def test_graph_thd_declines_overlapping_token_stride():
 @pytest.mark.parametrize("d,dv", [(48, 32), (64, 64), (64, 96), (96, 80), (128, 128), (192, 112), (192, 128), (224, 208), (256, 256)])
 @pytest.mark.parametrize("stats_layout", ["head_major_padded", "token_major"])
 @pytest.mark.parametrize("stats_carrier", ["canonical", "th1"])
-def test_graph_thd_independent_pitches_rebind_replay(d, dv, stats_layout, stats_carrier, cudnn_handle):
+def test_graph_thd_independent_pitches_rebind_replay(d, dv, stats_layout, stats_carrier, cudnn_handle, dtype=None):
     """Declared pitches reach every address; padding and allocation tails stay untouched."""
     from test_sdpa_bwd_staged_sm80 import _assert_kernel_count
 
     lens_q, lens_kv = (33, 0, 17), (41, 3, 23)
-    dtype = torch.bfloat16 if d == 192 else torch.float16
+    dtype = dtype if dtype is not None else (torch.bfloat16 if d == 192 else torch.float16)
     graph, vp, nodes, _ = _make_graph(lens_q, lens_kv, h=4, hkv=2, d=d, dv=dv, dtype=dtype, stats_layout=stats_layout, cap_extra=5)
     q, k, v, o, stats = nodes
     stats_view = vp[stats]
@@ -686,6 +686,12 @@ def test_graph_thd_independent_pitches_rebind_replay(d, dv, stats_layout, stats_
         vp[stats] = stats_view
         if stats_carrier == "th1":
             vp[stats] = stats_view.unsqueeze(-1) if stats_layout == "token_major" else stats_view[0, :, : sum(lens_q)].T.unsqueeze(-1)
+        elif stats_carrier == "flat":
+            vp[stats] = stats_view.view(-1)
+        elif stats_carrier == "capacity":
+            # Like the nightly's BSHD allocation: its logical axes are a
+            # carrier only. The graph's descriptor owns Stats packing.
+            vp[stats] = stats_view.view(2, -1, 4, 1).transpose(1, 2)
 
     bind_stats()
     storage = {}
@@ -743,12 +749,9 @@ def test_graph_thd_independent_pitches_rebind_replay(d, dv, stats_layout, stats_
     check(lens_q, lens_kv)
     if stats_carrier == "th1":
         good = vp[stats]
-        token_stride, head_stride, _ = good.stride()
-        for bad in (
-            good[:-1],
-            torch.empty_strided(good.shape, (token_stride + 1, head_stride, 1), dtype=good.dtype, device=good.device),
-            torch.empty_strided(good.shape, (token_stride, head_stride + 1, 1), dtype=good.dtype, device=good.device),
-        ):
+        # Graph buffers are raw storage: carrier strides cannot override the
+        # declared layout. A short exposed span must still fail before launch.
+        for bad in (good[:-1],):
             poison()
             vp[stats] = bad
             with pytest.raises(ValueError, match="SM80 THD .*Stats"):
@@ -793,6 +796,14 @@ def test_graph_thd_independent_pitches_rebind_replay(d, dv, stats_layout, stats_
         check(new_q, new_kv)
     finally:
         captured.reset()
+
+
+@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("stats_layout", ["token_major", "head_major_padded"])
+@pytest.mark.parametrize("stats_carrier", ["flat", "capacity"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_graph_thd_stats_storage_carriers(d, stats_layout, stats_carrier, dtype, cudnn_handle):
+    test_graph_thd_independent_pitches_rebind_replay(d, d, stats_layout, stats_carrier, cudnn_handle, dtype)
 
 
 def test_graph_thd_rejects_undersized_workspace():

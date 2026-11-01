@@ -15,6 +15,11 @@ padded Stats are different contracts.**
   callers take head-major `(H, head_stride)`. A dense-padded declaration
   (per-sequence stride) mis-addresses under that packing — it must be
   rejected for a packed Stats declaration, not silently accepted and mis-read.
+- The packed-layout requirement applies to the **graph declaration**, not
+  the shape of a variant-pack buffer. A flat or capacity-shaped carrier is raw
+  storage: bind the declared strides after checking its exposed storage span.
+  Do not require a packed carrier shape or infer packing from its strides.
+  Standalone APIs without graph storage semantics retain their layout checks.
 - Validate by stride, not by a `thd`/`packed` flag: token-major is
   `stride_h == 1 and stride_s == H`; head-major is `stride_s == 1` with
   `stride_h` the declared head stride, which must cover the **packed token
