@@ -33,7 +33,8 @@ def _case(
 ):
     scale = dq**-0.5 if scale is None else scale
     torch.manual_seed(3217)
-    b, h, hk, skv = (5 if product else 2), *heads, 65
+    b, skv = (5 if product else 2), 65
+    h, hk = heads
     if wide_axis == "row":
         b, sq, skv = 1, (3 if product else 2), (3 if product else 2)
     elif wide_axis == "tile":
