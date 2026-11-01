@@ -1257,8 +1257,8 @@ SM100 LINE's route -- `decode_route(geometry, S_q, device_cc=(10, 0), batch=, ma
 input for input (`config_sm100.decode_d256_q_tile` with the wide-launch reading `config_sm100.d256_wide_decode_launch(batch, groups,
 max_kv_len)`: at least 8 units streaming at least 4096 128-key tiles between them; `groups` = `H_kv` packed, `H_q` unpacked): packed rows
 `S_q x group <= 16` ride the 16-column tile in ONE unit; `16 < S_q x group <= 32` is the adapter's 32-column arm at a WIDE launch -- a
-typed decline naming the lift until that arm's cells run (`DECODE_WIDE_TILE_CCS`, empty: no cc 10.0 cell of the block has run the
-32-column tile; the lift is the tuple gaining `(10, 0)`); else the paged PREFILL tile with the whole group packed wherever the group divides 128 (16 / 8 / 4 / 32), at ANY batch (the line has no
+typed decline naming the lift until that arm's cells run (`DECODE_WIDE_TILE_CCS`: cc 10.3 since 2026-11-01, functional only; no
+cc 10.0 cell of the block has run the 32-column tile, and its lift is the tuple gaining `(10, 0)`); else the paged PREFILL tile with the whole group packed wherever the group divides 128 (16 / 8 / 4 / 32), at ANY batch (the line has no
 two-unit arm, so there is no fill rule) under BOTH policies (they coincide; `decode_route_policy` is recorded); else the 16-column tile
 UNPACKED (`group` KV streams) to 16 tokens; an unpacked step of 17 .. 32 tokens needs the 32-column width -- the same arm: routed by the
 adapter for a wide launch only and declined by the block at every launch until its cells run -- a typed decline predicted by
