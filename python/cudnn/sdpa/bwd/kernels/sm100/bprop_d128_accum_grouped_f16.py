@@ -5,6 +5,11 @@
 The qualified MHA math, epilogue, store and scheduler roles are imported
 unchanged. Only the loaders map Q heads to shared K/V heads. Separate fold
 kernels consume the uniquely owned native partials after this main pass.
+
+Op-level field ``dkv_accum = "fp32_reduce"`` (``Constexpr[bool]`` ``dkv_fp32`` on the THD kernel and ``main_thd_host``, default False = the
+shipped chain, rendered PTX-identical): the epilogue / store roles of the packed body take their fp32 store path (``bprop_d128_accum_thd_f16``
+header), reduce-adding each owner's fp32 dK / dV tile into the per-KV-head workspace maps (kv head = head // ratio) instead of storing a
+bf16 partial; the fold launch is then not needed.
 """
 
 import cutlass
@@ -159,6 +164,7 @@ def bprop_d128_accum_grouped_dense_kernel(
     swizzle: cutlass.Constexpr[int],
     dtype: cutlass.Constexpr,
     ratio: cutlass.Constexpr[int],
+    diag_delete_dq_reduce_add: cutlass.Constexpr[bool] = False,
 ):
     warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     x, y, z = cute.arch.block_idx()
@@ -192,7 +198,9 @@ def bprop_d128_accum_grouped_dense_kernel(
     elif warp == 13:
         _load_dense(slab, bars, sched, q_desc, k_desc, v_desc, do_desc, block, head, batch, sq, nk, nheads, batch_heads, swizzle, causal, dtype, ratio)
     elif warp == 14:
-        dense._store_loop(slab, bars, sched, dq_desc, dk_desc, dv_desc, block, head, batch, sq, nk, nheads, batch_heads, swizzle, causal, dtype)
+        dense._store_loop(
+            slab, bars, sched, dq_desc, dk_desc, dv_desc, block, head, batch, sq, nk, nheads, batch_heads, swizzle, causal, dtype, diag_delete_dq_reduce_add
+        )
     else:
         dense._scheduler_loop(bars, sched)
     nvvm.barrier_cta_sync()
@@ -217,6 +225,8 @@ def bprop_d128_accum_grouped_thd_kernel(
     causal: cutlass.Constexpr[bool],
     dtype: cutlass.Constexpr,
     ratio: cutlass.Constexpr[int],
+    diag_delete_dq_reduce_add: cutlass.Constexpr[bool] = False,
+    dkv_fp32: cutlass.Constexpr[bool] = False,
 ):
     warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     x, y, z = cute.arch.block_idx()
@@ -240,13 +250,13 @@ def bprop_d128_accum_grouped_thd_kernel(
     if warp < 8:
         packed._softmax_loop(slab, bars, sched, tmem_base, lse, delta, origins, stats_origin, block, head, batch, meta, n_batch, scale, causal, dtype)
     elif warp < 12:
-        packed._epilogue_loop(slab, bars, sched, tmem_base, block, head, batch, meta, n_batch, causal, dtype)
+        packed._epilogue_loop(slab, bars, sched, tmem_base, block, head, batch, meta, n_batch, causal, dtype, dkv_fp32)
     elif warp == 12:
         packed._mma_loop(slab, bars, sched, tmem_base, block, head, batch, meta, n_batch, causal, dtype)
     elif warp == 13:
         _load_thd(slab, bars, sched, maps, block, head, batch, meta, n_batch, causal, dtype, ratio)
     elif warp == 14:
-        packed._store_loop(slab, bars, sched, maps, block, head, batch, meta, n_batch, causal, dtype)
+        packed._store_loop(slab, bars, sched, maps, block, head, batch, meta, n_batch, causal, dtype, diag_delete_dq_reduce_add, dkv_fp32, ratio)
     else:
         packed._scheduler_loop(bars, sched)
     nvvm.barrier_cta_sync()
@@ -259,7 +269,21 @@ bprop_d128_accum_grouped_thd_kernel.set_name_prefix("cudnn", remove_cutlass_symb
 
 
 @cute.jit
-def main_dense_host(q, k, v, do, lse, delta, dq_accum, dk_part, dv_part, scale, causal: cutlass.Constexpr[bool], stream):
+def main_dense_host(
+    q,
+    k,
+    v,
+    do,
+    lse,
+    delta,
+    dq_accum,
+    dk_part,
+    dv_part,
+    scale,
+    causal: cutlass.Constexpr[bool],
+    stream,
+    diag_delete_dq_reduce_add: cutlass.Constexpr[bool] = False,
+):
     """Qualified dense geometry, with the partial output head axis equal to Hq."""
     if cutlass.const_expr(q.element_type not in (cutlass.BFloat16, cutlass.Float16)):
         raise ValueError("grouped d128 accumulation requires BF16/FP16")
@@ -290,6 +314,7 @@ def main_dense_host(q, k, v, do, lse, delta, dq_accum, dk_part, dv_part, scale, 
         swizzle,
         q.element_type,
         q.shape[2] // k.shape[2],
+        diag_delete_dq_reduce_add,
     ).launch(grid=grid, block=(CFG.THREADS, 1, 1), stream=stream, min_blocks_per_mp=1)
 
 
@@ -309,6 +334,8 @@ def main_thd_host(
     dtype: cutlass.Constexpr,
     ratio: cutlass.Constexpr[int],
     stream,
+    diag_delete_dq_reduce_add: cutlass.Constexpr[bool] = False,
+    dkv_fp32: cutlass.Constexpr[bool] = False,
 ):
     """One owner per Q head and declared KV-envelope tile; no host length read."""
     nk = cute.math.max((max_skv + CFG.M - 1) // CFG.M, cutlass.Int32(1))
@@ -324,4 +351,6 @@ def main_thd_host(
         causal,
         dtype,
         ratio,
+        diag_delete_dq_reduce_add,
+        dkv_fp32,
     ).launch(grid=(nk, nheads, n_batch), block=(CFG.THREADS, 1, 1), stream=stream, min_blocks_per_mp=1)

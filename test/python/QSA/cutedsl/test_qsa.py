@@ -189,10 +189,17 @@ def check_case(inputs):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("heads", [(12, 1), (24, 2)])
+@pytest.mark.parametrize("heads", [(12, 1), (24, 2), (6, 1)])
 @pytest.mark.parametrize("lengths", [(1,), (3, 5, 9), (61, 68)])
 def test_packed_forward_backward(supported_gpu, heads, lengths):
     check_case(make_inputs(lengths, *heads, empty=True))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("lengths", [(513,), (2056,)], ids=["gated-dense", "gathered"])
+def test_six_query_heads_forward_routes(supported_gpu, lengths):
+    """6Q/1KV takes the dense-tile route and the gathered route like 12Q/1KV; neither is specialised for 12 heads."""
+    check_case(make_inputs(lengths, 6, 1, empty=True))
 
 
 @pytest.mark.L1
@@ -218,7 +225,7 @@ def test_runtime_scale(supported_gpu, scale):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("heads", [(12, 1), (24, 2)])
+@pytest.mark.parametrize("heads", [(12, 1), (24, 2), (6, 1)])
 @pytest.mark.parametrize("score,magnitude", [(8.0, 1e34), (-86.0, 1e38)], ids=["selected-large-v", "tiny-probability-large-v"])
 def test_forward_large_values(supported_gpu, heads, score, magnitude):
     inputs = make_inputs((513,), *heads)
@@ -246,7 +253,7 @@ def test_forward_large_values(supported_gpu, heads, score, magnitude):
     raises=AssertionError,
     strict=False,
 )
-@pytest.mark.parametrize("heads", [(12, 1), (24, 2)])
+@pytest.mark.parametrize("heads", [(12, 1), (24, 2), (6, 1)])
 @pytest.mark.parametrize("large_logits", [False, True], ids=["constant-key", "large-logits"])
 def test_backward_cancellation(supported_gpu, heads, large_logits):
     skip_without_cuda13_for_12q1kv(heads[1])
@@ -267,7 +274,7 @@ def test_backward_cancellation(supported_gpu, heads, large_logits):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("heads", [(12, 1), (24, 2)])
+@pytest.mark.parametrize("heads", [(12, 1), (24, 2), (6, 1)])
 @pytest.mark.parametrize("poison", [(torch.nan, torch.inf), (torch.inf, torch.nan), (1e20, -1e20)], ids=["nan-inf", "inf-nan", "finite"])
 def test_masked_kv_poison(supported_gpu, heads, poison):
     skip_without_cuda13_for_12q1kv(heads[1])
@@ -356,11 +363,18 @@ def test_dynamic_extents_reuse_compile(supported_gpu, monkeypatch, lengths, next
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("lengths", [(3, 5, 9), (257,)])
-def test_paired_backward_mask_replay(supported_gpu, lengths):
-    skip_without_cuda13_for_12q1kv(1)
-    inputs = make_inputs(lengths, 12, 1, all_selected=True)
+@pytest.mark.parametrize("heads", [(12, 1), (6, 1)])
+@pytest.mark.parametrize("lengths", [(1,), (3, 5, 9), (61, 68), (257,)])
+def test_paired_backward_mask_replay(supported_gpu, heads, lengths):
+    """Replays over changed selections and bounds: batched queries with disjoint blocks, each member position of a pair
+    or quad emptied in turn (odd parity inside a quad), partial bounds, and packed boundaries inside a group."""
+    skip_without_cuda13_for_12q1kv(heads[1])
+    nq = 24 // heads[0]  # consecutive queries that share one 24-column tile in the paired kernels: the group the states exercise
+    inputs = make_inputs(lengths, *heads, all_selected=True)
     selected, lower, upper = (inputs[name].clone() for name in ("sel_blocks", "lo", "hi"))
+    total, blocks = selected.shape
+    # Member m of every group keeps the blocks congruent to m modulo nq: no two batched queries share a block.
+    disjoint = ((torch.arange(total)[:, None] % nq) == (torch.arange(blocks)[None] % nq)).to(selected.device)
     grad = inputs["q"].clone()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -374,17 +388,16 @@ def test_paired_backward_mask_replay(supported_gpu, lengths):
         with torch.cuda.graph(graph, stream=stream):
             result = qsa_forward(**inputs)
             grads = qsa_backward(grad, **inputs, out_fp32=result["out_fp32"], lse=result["lse"])
-        for state in ("disjoint", "even-empty", "odd-empty", "partial", "restore"):
+        for state in ("disjoint", *(f"member{member}-empty" for member in range(nq)), "partial", "restore"):
             inputs["sel_blocks"].copy_(selected)
             inputs["lo"].copy_(lower)
             inputs["hi"].copy_(upper)
             if state == "disjoint":
-                inputs["sel_blocks"][::2, 1::2] = 0
-                inputs["sel_blocks"][1::2, ::2] = 0
-            elif state in ("even-empty", "odd-empty"):
-                parity = int(state == "odd-empty")
-                inputs["lo"][parity::2] = torch.iinfo(torch.int32).max
-                inputs["hi"][parity::2] = -1
+                inputs["sel_blocks"][~disjoint] = 0
+            elif state.startswith("member"):
+                member = int(state[len("member") : -len("-empty")])
+                inputs["lo"][member::nq] = torch.iinfo(torch.int32).max
+                inputs["hi"][member::nq] = -1
             elif state == "partial":
                 inputs["lo"].copy_(torch.maximum(lower, upper - 2))
             grad.mul_(-0.5)
@@ -405,7 +418,7 @@ def test_paired_backward_mask_replay(supported_gpu, lengths):
 
 
 @pytest.mark.L1
-@pytest.mark.parametrize("heads", [(12, 1), (24, 2)])
+@pytest.mark.parametrize("heads", [(12, 1), (24, 2), (6, 1)])
 def test_dense_gather_replay(supported_gpu, heads):
     skip_without_cuda13_for_12q1kv(heads[1])
     inputs = make_inputs((67, 446), *heads, empty=True)
@@ -464,14 +477,18 @@ def test_reject_before_launch(supported_gpu, monkeypatch):
         qsa_forward(**inputs, block_size=8)
     with pytest.raises(ValueError, match="lse"):
         qsa_backward(inputs["q"], **inputs, out_fp32=inputs["q"].float(), lse=torch.empty((17, 12), device="cuda"))
+    for heads in ((3, 1), (24, 1), (6, 2), (12, 2)):
+        with pytest.raises(NotImplementedError, match="6/1, 12/1 or 24/2"):
+            qsa_forward(**make_inputs((17,), *heads))
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("heads", [(12, 1), (6, 1)])
 @pytest.mark.parametrize("packed", [False, True])
-def test_paired_backward_nonfinite_isolation(supported_gpu, packed):
-    """A selected NaN in one query must not poison another query's masked dQ."""
-    skip_without_cuda13_for_12q1kv(1)
-    inputs = make_inputs((3, 5) if packed else (8,), 12, 1, all_selected=True)
+def test_paired_backward_nonfinite_isolation(supported_gpu, heads, packed):
+    """A selected NaN in one query must not poison a batched neighbour's masked dQ."""
+    skip_without_cuda13_for_12q1kv(heads[1])
+    inputs = make_inputs((3, 5) if packed else (8,), *heads, all_selected=True)
     if not packed:
         inputs["sel_blocks"][2:] = 0
         inputs["lo"][1] = 1
@@ -507,7 +524,7 @@ def test_paired_backward_nonfinite_isolation(supported_gpu, packed):
 
 
 @pytest.mark.L1
-@pytest.mark.parametrize("blocks", [1, 15, 16, 31, 32, 511, 512, 513, 1023, 1024, 1025, 32768])
+@pytest.mark.parametrize("blocks", [1, 15, 16, 31, 32, 511, 512, 513, 1023, 1024, 1025, 8192, 8193, 32768])
 @pytest.mark.parametrize("offset", [0, 1])
 def test_compaction_boundaries_and_replay(supported_gpu, blocks, offset):
     from cuda.bindings import driver as cuda
@@ -534,10 +551,12 @@ def test_compaction_boundaries_and_replay(supported_gpu, blocks, offset):
     try:
         with torch.cuda.graph(graph):
             launch()
-        for pattern in ("full", "alternate", "empty"):
+        for pattern in ("full", "alternate", "byte_values", "empty"):
             sel.fill_(0 if pattern == "empty" else 255)
             if pattern == "alternate":
                 sel[:, 1::2] = 0
+            elif pattern == "byte_values":
+                sel.copy_(torch.arange(sel.numel(), device=sel.device).remainder(256).to(torch.uint8).view_as(sel))
             valid = (sel != 0) & (last[None] >= lo[:, None]) & (first[None] <= hi[:, None]) & (lo[:, None] <= hi[:, None])
             expected_counts = valid.sum(1).int()
             expected_ids = torch.full_like(ids, -1)

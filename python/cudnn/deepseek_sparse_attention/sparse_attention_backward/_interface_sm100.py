@@ -40,6 +40,7 @@ _SM100_FAMILY_ARCH_FLAGS = {
 }
 _DETERMINISTIC_HEAD_COUNTS = (16, 32, 64, 96, 128)
 _STATIC_TOPK_STRIDE_BACKENDS = ("h16_m128", "h32_m64", "h96_h64_h32", "h96_d576_2cta_m64")
+_H96_D576_TWO_CTA_TOPKS = (128, 512, 1024, 1152, 2048, 2049, 2050, 2051)
 
 
 def _sm100_gpu_arch_flag(device_capability: Tuple[int, int]) -> str:
@@ -137,7 +138,7 @@ def _select_sm100_backend(
         and num_heads == 96
         and head_dim == 576
         and head_dim_v == 512
-        and max_topk in (128, 512, 1024, 1152, 2048)
+        and max_topk in _H96_D576_TWO_CTA_TOPKS
         and is_contiguous
     ):
         return "h96_d576_2cta_m64", 64

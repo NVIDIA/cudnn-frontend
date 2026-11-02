@@ -91,7 +91,7 @@ indexer scores, selects 512 complete causal blocks, and appends the incomplete
 tail. It does not substitute the Miles implementation for the Relax baseline.
 
 For the public bounded-workspace backward, add `--causal-topk`. This declares
-the stricter [canonical selection contract](../../docs/fe-oss-apis/qsa_indexed.md#complete-blocks-and-causal-tails)
+the stricter [canonical selection contract](../../docs/operations/sparse_attention/qsa_indexed.md#complete-blocks-and-causal-tails)
 and passes packed `cu_seqlens` and the maximum document length to the public
 entry point. Sparse 12Q/1KV requires the CUDA 13 CuTeDSL compiler. Add
 `--compare-general` to measure the default indexed backward on the same saved

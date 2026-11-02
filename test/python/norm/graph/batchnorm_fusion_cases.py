@@ -3,6 +3,7 @@
 
 from dataclasses import dataclass
 from enum import Enum, auto
+from hashlib import sha256
 from typing import Optional, Tuple
 
 import torch
@@ -164,3 +165,64 @@ BATCHNORM_CASES = (
         uses_fp8=True,
     ),
 )
+
+
+def _fp8_expansion_cases():
+    shapes = (
+        (400, 128, 56, 56),
+        (400, 256, 14, 14),
+        (400, 512, 28, 28),
+        (400, 1024, 14, 14),
+        (400, 64, 56, 56),
+        (400, 128, 28, 28),
+        (400, 512, 14, 14),
+        (400, 512, 7, 7),
+        (400, 2048, 7, 7),
+        (400, 256, 56, 56),
+        (400, 256, 28, 28),
+    )
+    forward_types = (("e4m3", FP8_E4M3), ("e5m2", FP8_E5M2))
+    backward_types = (
+        ("e4m3_e4m3", FP8_E4M3, FP8_E4M3),
+        ("e5m2_e5m2", FP8_E5M2, FP8_E5M2),
+        ("e4m3_e5m2", FP8_E4M3, FP8_E5M2),
+    )
+    existing_ids = {case.case_id for case in BATCHNORM_CASES}
+    for pattern in BatchNormPattern:
+        types = tuple((name, dtype, None) for name, dtype in forward_types) if pattern.is_forward else backward_types
+        for shape in shapes:
+            n, c, h, w = shape
+            for dtype_name, input_dtype, grad_dtype in types:
+                case_id = f"{pattern.name.lower()}_n{n}_c{c}_h{h}_w{w}_{dtype_name}"
+                # Retain the original parameters and seeds for already covered problems.
+                # Symbolic IDs also remain distinct when PyTorch lacks an FP8 dtype.
+                if case_id in existing_ids:
+                    continue
+                if pattern == BatchNormPattern.BN:
+                    rtol, atol = (0.2, 0.5) if dtype_name == "e4m3" else (0.25, 0.25)
+                    mismatch_rate = 0.0
+                elif pattern.is_forward:
+                    rtol, atol = 0.2, 0.2
+                    mismatch_rate = 0.002 if pattern.has_add else 0.003
+                else:
+                    rtol, atol = 0.25, 0.25
+                    mismatch_rate = 0.0
+                yield BatchNormCase(
+                    case_id=case_id,
+                    # Identity-based seeds do not shift when cases are inserted or reordered.
+                    seed=int.from_bytes(sha256(case_id.encode("ascii")).digest()[:4], "big"),
+                    pattern=pattern,
+                    shape=shape,
+                    input_dtype=input_dtype,
+                    output_dtype=input_dtype if pattern.is_forward else grad_dtype,
+                    level="L1",
+                    rtol=rtol,
+                    atol=atol,
+                    min_compute_capability=(9, 0) if pattern.has_backward_mask else (8, 9),
+                    max_mismatch_rate=mismatch_rate,
+                    grad_dtype=grad_dtype,
+                    uses_fp8=True,
+                )
+
+
+BATCHNORM_CASES += tuple(_fp8_expansion_cases())

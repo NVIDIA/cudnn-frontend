@@ -42,9 +42,12 @@ class _FrostSdpaPlan(CompiledPlan):
         self.takes_variant_pack = self._prepared is not None
         self._stream_handles: dict = {}
         native = getattr(getattr(self._prepared, "spec", None), "native", None)
-        # Only a zero-scratch native launch can bypass the workspace guards
-        # below. This is an internal transport hook, not another plan/API step.
-        self._ordered_native = native if not self._workspace_bytes and hasattr(native, "execute_ordered") else None
+        # A scratch-using binder must validate the complete advertised workspace
+        # before bypassing the Python guards. Older extensions keep that path.
+        native_workspace = getattr(native, "ordered_workspace_bytes", None)
+        self._ordered_native = (
+            native if hasattr(native, "execute_ordered") and (not self._workspace_bytes or native_workspace == self._workspace_bytes) else None
+        )
 
     def get_workspace_size(self) -> int:
         return self._workspace_bytes

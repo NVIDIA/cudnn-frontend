@@ -79,7 +79,7 @@ def _destroy_default_handles() -> None:
 atexit.register(_destroy_default_handles)
 
 
-_PYTHON_ONLY_BOOL_ATTRS = frozenset({"attn_scale_prefolded"})
+_PYTHON_ONLY_BOOL_ATTRS = frozenset({"attn_scale_prefolded", "adaptive"})
 
 
 def _python_only_attr_is_set(attr: str, value) -> bool:
@@ -163,6 +163,28 @@ def _in_axis_order_of(shape, stride, reference_stride):
     for rank, axis in enumerate(by_stride):
         permutation[reference[rank]] = axis
     return tuple(shape[a] for a in permutation), tuple(stride[a] for a in permutation)
+
+
+def _python_plan_deserialize_args(args: tuple, kwargs: Dict[str, Any]):
+    """``(handle, data, enforce_precompiled)`` when a deserialize call carries a python-engine
+    plan blob, else None. Mirrors the two classic overloads: ``(data)`` and
+    ``(handle, data, enforce_precompiled=...)``, positional or by the pybind names."""
+    from . import _plan_serdes
+
+    rest = list(args)
+    handle = kwargs.get("handle_")
+    data = kwargs.get("pyobj")
+    if data is not None and handle is None and rest:
+        handle = rest.pop(0)
+    elif data is None and rest and _plan_serdes.is_python_plan(rest[0]):
+        data = rest.pop(0)
+    elif data is None and len(rest) >= 2 and _plan_serdes.is_python_plan(rest[1]):
+        handle, data = rest[0], rest[1]
+        rest = rest[2:]
+    if data is None or not _plan_serdes.is_python_plan(data):
+        return None
+    enforce = kwargs.get("enforce_precompiled", rest[0] if rest else False)
+    return handle, data, bool(enforce)
 
 
 def cudnn_graph_not_supported(message: str) -> Exception:
@@ -289,6 +311,7 @@ class pygraph:
         self._backend_heuristics: Optional[List] = None  # heur modes for a backend plan
         self._cpp_plans_created: bool = False  # C++ create_execution_plans ran
         self._compiled_plans: Dict[int, Any] = {}  # plan_index -> CompiledPlan (python plans)
+        self._plan_kernel_entries: Dict[int, List[Any]] = {}  # plan_index -> compiled_cache entries its build used (serialize)
         self._cpp_bog_done: bool = False  # C++ build_operation_graph ran
         self._cpp_tensors: Dict[int, Any] = {}  # IR uid -> lowered C++ tensor
         self._reserved_uids: set = set()  # user-specified uids _alloc_uid must skip
@@ -1825,7 +1848,11 @@ class pygraph:
         eng = self._engine_for(cfg)
         if eng is not None:
             if index not in self._compiled_plans:
-                self._compiled_plans[index] = eng.build_plan(self, cfg, ctx or self._build_context())
+                from .frost import compiled_cache
+
+                with compiled_cache.record_entries() as entries:
+                    self._compiled_plans[index] = eng.build_plan(self, cfg, ctx or self._build_context())
+                self._plan_kernel_entries[index] = entries
             self._prepare_ordered_binding_schema()
             return
         cfg = self._materialize_backend_plan(index)
@@ -2592,16 +2619,27 @@ class pygraph:
 
         return json.dumps(self.inspect(), default=str, indent=2)
 
-    def serialize(self, *, as_bytes: bool = False):
-        """Serialize the graph's cuDNN backend execution plan.
+    def serialize(self, *, as_bytes: bool = False, include_kernels: bool = True):
+        """Serialize the graph's selected execution plan.
 
         Returns a list of byte values by default. Set ``as_bytes=True`` to
         return the same binary data as compact ``bytes`` without constructing
         a Python list. ``deserialize`` accepts either representation.
+
+        A backend plan serializes in the cuDNN backend's format. A python-engine
+        plan (FROST, ...) serializes as the graph plus its ``(engine_id, knobs)``
+        and, with ``include_kernels``, its compiled kernels (see
+        ``cudnn._plan_serdes``); only ``pygraph.deserialize`` reads that format.
         """
+        if self._planning_done and self.selected_engine is not None:
+            from . import _plan_serdes
+
+            if not self._is_built or self._plan_index not in self._compiled_plans:
+                raise RuntimeError("serialize(): build the selected plan first (build_plans())")
+            blob = _plan_serdes.serialize(self, include_kernels=include_kernels)
+            return blob if as_bytes else list(blob)
         if self._lowered_graph is None:
-            # Serialization is the cuDNN graph format by definition — lower on
-            # demand (independent of which plan is selected for execution).
+            # Backend-selected or unplanned: the cuDNN graph format — lower on demand.
             node = self._unlowerable_node()
             if node is not None:
                 # As key(): the format has no field for what the backend cannot
@@ -2622,7 +2660,17 @@ class pygraph:
         or as the ``handle_`` keyword (the pybind overload's name); unwrap a
         Handle to its backend int and leave the ``data`` blob (the other overload)
         untouched. Binary data may be ``bytes`` or the legacy list of byte
-        values; JSON strings retain their structural-graph meaning."""
+        values; JSON strings retain their structural-graph meaning. A
+        python-engine blob from ``serialize()`` is rebuilt here, into an empty
+        graph, and its plan built."""
+        python_plan = _python_plan_deserialize_args(args, kwargs)
+        if python_plan is not None:
+            from . import _plan_serdes
+
+            handle, data, enforce_precompiled = python_plan
+            _plan_serdes.deserialize(self, data, handle=handle, enforce_precompiled=enforce_precompiled)
+            self._sorted_uids = None
+            return
         if args and isinstance(args[0], Handle):
             args = (args[0].backend_handle,) + args[1:]
         if isinstance(kwargs.get("handle_"), Handle):
@@ -2829,7 +2877,7 @@ class pygraph:
                     if n:
                         kw[lp] = [tensor_map[node.inputs[f"{lp}_{i}"].uid] for i in range(n)]
                 for ak in spec.get("attrs", ()):
-                    if ak in node.params:
+                    if ak in node.params and ak not in spec.get("python_only_attrs", ()):
                         kw[ak] = node.params[ak]
                 result = getattr(graph, method)(**kw)
                 cpp_outs = list(result) if isinstance(result, (list, tuple)) else [result]
@@ -3075,6 +3123,21 @@ def _block_quant_scale_dims(node):
     return d
 
 
+def _adaptive_norm_stats(node):
+    dims = node.inputs["input"].dim
+    scale = node.inputs.get("scale")
+    if len(dims) == 3 and scale is not None and tuple(scale.dim) in ((dims[0], 1, dims[2]), (1, dims[1], dims[2])):
+        return [*dims[:-1], 1]
+    # Preserve legacy AdaLN inference for other normalization shapes.
+    return _norm_stats_like(1)(node)
+
+
+def _rmsnorm_stats(node):
+    if node.params.get("adaptive", False):
+        return _adaptive_norm_stats(node)
+    return _norm_stats_like(0)(node)
+
+
 def _norm_stats_like(first_axis):  # the C++ node's rule: input dims, 1 wherever scale is not 1 (from first_axis on)
     def infer(node):
         d = node.inputs["input"].dim if "input" in node.inputs else None
@@ -3118,15 +3181,17 @@ _STRUCTURED_OPS = {
     "rmsnorm": dict(
         node_type=NodeType.RMSNORM,
         inputs=("input", "scale", "bias", "epsilon"),
-        attrs=("norm_forward_phase",),
+        attrs=("norm_forward_phase", "adaptive"),
+        python_only_attrs=("adaptive",),
         outputs=("Y", "inv_var"),
         maybe={"inv_var": _training_phase},
-        infer={"Y": _like("input"), "inv_var": _norm_stats_like(0)},
+        infer={"Y": _like("input"), "inv_var": _rmsnorm_stats},
     ),
     "rmsnorm_backward": dict(
         node_type=NodeType.RMSNORM_BWD,
         inputs=("grad", "input", "scale", "inv_variance"),
-        attrs=("has_dbias",),
+        attrs=("has_dbias", "adaptive"),
+        python_only_attrs=("adaptive",),
         outputs=("DX", "DScale", "DBias"),
         # classic rmsnorm_backward names its outputs ::Dscale/::Dbias (mixed
         # case), unlike the other norm backwards (::DSCALE/::DBIAS)
@@ -3135,6 +3200,7 @@ _STRUCTURED_OPS = {
         infer=_NORM_BWD_INFER,
     ),
     "layernorm": dict(
+        adaptive_op="adalayernorm",
         node_type=NodeType.LAYERNORM,
         inputs=("input", "scale", "bias", "epsilon"),
         attrs=("norm_forward_phase",),
@@ -3144,6 +3210,7 @@ _STRUCTURED_OPS = {
         reinfer=("mean", "inv_var"),
     ),
     "layernorm_backward": dict(
+        adaptive_op="adalayernorm_backward",
         node_type=NodeType.LAYERNORM_BWD,
         inputs=("grad", "input", "scale", "mean", "inv_variance"),
         outputs=("DX", "DScale", "DBias"),
@@ -3167,7 +3234,8 @@ _STRUCTURED_OPS = {
     "instancenorm": dict(
         node_type=NodeType.INSTANCENORM,
         inputs=("input", "scale", "bias", "epsilon"),
-        attrs=("norm_forward_phase",),
+        attrs=("norm_forward_phase", "adaptive"),
+        python_only_attrs=("adaptive",),
         outputs=("Y", "mean", "inv_var"),
         maybe=_NORM_FWD_MAYBE,
         infer={"Y": _like("input"), "mean": _stats_like("input", (0, 1)), "inv_var": _stats_like("input", (0, 1))},
@@ -3175,6 +3243,8 @@ _STRUCTURED_OPS = {
     "instancenorm_backward": dict(
         node_type=NodeType.INSTANCENORM_BWD,
         inputs=("grad", "input", "scale", "mean", "inv_variance"),
+        attrs=("adaptive",),
+        python_only_attrs=("adaptive",),
         outputs=("DX", "DScale", "DBias"),
         infer=_NORM_BWD_INFER,
     ),
@@ -3725,6 +3795,7 @@ _STRUCTURED_OPS = {
         inputs=("input",),
         attrs=("reshape_mode",),
         outputs=("OUT_0",),
+        dtype_like={"OUT_0": "input"},
         push_output_dims=True,  # target shape comes from out_dims / set_dim
         no_cdt=True,
     ),
@@ -3742,6 +3813,7 @@ _STRUCTURED_OPS = {
         attrs=("permutation",),
         outputs=("OUT_0",),
         infer={"OUT_0": lambda n: ([n.inputs["input"].dim[i] for i in n.params["permutation"]] if n.inputs["input"].dim else None)},
+        dtype_like={"OUT_0": "input"},  # transpose preserves values, including their storage dtype
     ),
     "concatenate": dict(
         node_type=NodeType.CONCATENATE,
@@ -3786,6 +3858,24 @@ def _install_structured_builders() -> None:
         maybe = spec.get("maybe", {})
 
         def builder(self, *args, name: str = "", compute_data_type: Any = None, out_dims: Any = None, **kwargs):
+            # Canonicalize the LayerNorm convenience spelling to the existing
+            # AdaLN node so backend lowering and serialized graphs stay shared.
+            adaptive_op = spec.get("adaptive_op")
+            if adaptive_op is not None:
+                adaptive = kwargs.pop("adaptive", False)
+                if not isinstance(adaptive, bool):
+                    raise TypeError(f"{op}(): adaptive must be a bool")
+                if adaptive:
+                    outputs = getattr(self, adaptive_op)(*args, name=name, compute_data_type=compute_data_type, out_dims=out_dims, **kwargs)
+                    if op == "layernorm":
+                        # Pin per-token statistics: legacy backend inference
+                        # can otherwise normalize the batch axis in sequence-first layouts.
+                        node = self._nodes[-1]
+                        dims = _adaptive_norm_stats(node)
+                        for port in ("mean", "inv_var"):
+                            if port in node.outputs and dims and not (isinstance(out_dims, dict) and port in out_dims):
+                                node.outputs[port].set_dim(dims).set_stride(_row_major_stride(dims))
+                    return outputs
             name_ = self._get_name(op, name)
             node = Node(name_, spec["node_type"], compute_data_type or self._context.compute_data_type)
             # classic positional order: tensor ports first, then attrs
@@ -3817,6 +3907,8 @@ def _install_structured_builders() -> None:
             for ak in attr_kws:
                 v = kwargs.pop(ak, None)
                 if v is not None:
+                    if ak == "adaptive" and not isinstance(v, bool):
+                        raise TypeError(f"{op}(): adaptive must be a bool")
                     node.params[ak] = v
             if kwargs:
                 raise TypeError(f"{op}() got unexpected arguments {sorted(kwargs)}; tensor ports are {input_ports}, attrs are {attr_kws}")
@@ -3851,6 +3943,8 @@ def _install_structured_builders() -> None:
         builder.__name__ = op
         builder.__qualname__ = f"pygraph.{op}"
         builder.__doc__ = f"{op}({', '.join(input_ports)}) -> ({', '.join(spec['outputs'])})."
+        if spec.get("adaptive_op") or "adaptive" in attr_kws:
+            builder.__doc__ += " adaptive=False; True uses per-sample affine parameters and parameter gradients."
         return builder
 
     for op, spec in _STRUCTURED_OPS.items():

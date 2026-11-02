@@ -68,13 +68,37 @@ class CfgBwdD128:
         assert self.TILE_K_HW == 16
         assert self.HEAD_GRANULE * self.BPE == self.SWIZZLE_BYTES
         assert self.INPUT + self.INPUT_STAGES * self.INPUT_STAGE_ELEMS == self.AUX
-        assert self.AUX + self.TILE_M * self.HEAD_DIM == self.SLAB_ELEMS
+        assert self.AUX + self.TILE_M * max(self.HEAD_DIM, self.TILE_N) == self.SLAB_ELEMS
         assert self.INPUT_STAGE_ELEMS == 2 * self.INPUT_OPERAND_ELEMS
         assert self.COMPUTE_WARPS * self.WARP_LANES == self.COMPUTE_ARRIVERS
         assert self.STATS_WARPS * self.WARP_LANES == self.STATS_ARRIVERS
         assert (self.COMPUTE_WARPS + 4) * self.WARP_LANES == self.THREADS
-        assert self.dynamic_smem_bytes == 230660 and self.smem_bytes <= 227 * 1024
-        assert self.TMEM_G1 + self.HEAD_DIM == self.TMEM_COLS
+        assert self.dynamic_smem_bytes == (132356 if self.HEAD_DIM == 64 else 230660)
+        assert self.smem_bytes <= 227 * 1024
+        assert self.TMEM_G1 + self.HEAD_DIM <= self.TMEM_COLS
+
+
+@dataclass(frozen=True)
+class CfgBwdD64(CfgBwdD128):
+    """Native D64 operands; score/dS columns and their synchronization stay N128."""
+
+    HEAD_DIM: int = 64
+    RESIDENT1: int = 8192
+    INPUT: int = 16384
+    INPUT_STAGE_ELEMS: int = 16384
+    INPUT_OPERAND_ELEMS: int = 8192
+    AUX: int = 49152
+    # The auxiliary slab holds either O (128x64) or the wider dS (128x128).
+    SLAB_ELEMS: int = 65536
 
 
 CFG = CfgBwdD128()
+CFG_D64 = CfgBwdD64()
+
+
+def make_cfg(head_dim):
+    if head_dim == 64:
+        return CFG_D64
+    if head_dim == 128:
+        return CFG
+    raise ValueError("dense backward requires head dimension 64 or 128")

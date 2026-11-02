@@ -774,6 +774,19 @@ def _family(name):
     return next(f for f in MANIFEST if f.name == name)
 
 
+def test_every_manifest_engine_declares_runtime_compilation():
+    """Every in-tree python engine JIT-compiles in build_plans(), so deselect_behavior_notes([RUNTIME_COMPILATION]) must bar
+    all of them; one that inherits BaseEngine's empty notes slips through (review on #1962)."""
+    import cudnn
+    from cudnn.engines import manifest
+
+    missing = []
+    for family in manifest.MANIFEST:
+        ids = {name: family.engine_id + slot.slot for name, slot in family.slots.items()}
+        missing += [e.name for e in manifest.instantiate(family, ids) if cudnn.behavior_note.RUNTIME_COMPILATION not in e.behavior_notes]
+    assert not missing, missing
+
+
 def test_note_filters_reach_python_plans(monkeypatch):
     """The four classic note filters used to fall through to C++, so they
     filtered backend plans and silently skipped every python one. A python

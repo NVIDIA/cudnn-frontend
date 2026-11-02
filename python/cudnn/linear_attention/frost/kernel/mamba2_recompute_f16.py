@@ -556,11 +556,14 @@ def compute1_warp_group(
     mSeedIndices,
     mFinalIndices,
     checkpoint_every_n_tokens,
+    seed_every_n_tokens,
     sScheduler,
     bars,
 ):
     """Compute warp-group 1 role (warps 0-3): the state seed, the checkpoint copy, the in-place rescale, the U' build and
-    the final-state store; one state row per thread, one key token per thread in the U' build."""
+    the final-state store; one state row per thread, one key token per thread in the U' build.  Under
+    ``cfg.seed_checkpoints`` ``mState_init`` is the checkpoint series (io or fp32 rows, ``seed_every_n_tokens`` apart) and
+    every item seeds from the row at its start."""
     nvvm.setmaxregister(cfg.num_regs_compute_group_1, nvvm.SetMaxRegisterAction.INCREASE)
 
     gate_index = PipelineState.start(phase=0)
@@ -606,15 +609,25 @@ def compute1_warp_group(
         seed_row = batch_idx
         if cutlass.const_expr(mSeedIndices is not None):
             seed_row = cutlass.Int32(mSeedIndices[batch_idx])
+        if cutlass.const_expr(cfg.seed_checkpoints):
+            # the item's checkpoint row: its start over the row cadence, past the rows of the earlier sequences
+            seed_row = write_start // (seed_every_n_tokens // cutlass.Int32(cfg.b_t))
+            seed_b = cutlass.Int32(0)
+            while seed_b < batch_idx:
+                seed_len = cutlass.Int32(cu_seqlens[seed_b + 1]) - cutlass.Int32(cu_seqlens[seed_b])
+                seed_row = seed_row + (seed_len + seed_every_n_tokens - cutlass.Int32(1)) // seed_every_n_tokens
+                seed_b = seed_b + cutlass.Int32(1)
         n_local = write_end - compute_start
         if cutlass.const_expr(cfg.enable_checkpoints):
             checkpoint_chunks = checkpoint_every_n_tokens // cutlass.Int32(cfg.b_t)
             checkpoint_mod = compute_start % checkpoint_chunks
         if n_local > 0:
-            # ---- state seed: initial state (V-major in GMEM) or zeros -> TMEM -------------
+            # ---- state seed: initial state or checkpoint row (V-major in GMEM) or zeros -> TMEM -------------
             if cutlass.const_expr(cfg.use_initial_state):
                 gState_init = mState_init[None, None, head_o, seed_row]
                 seed_state = compute_start == 0
+                if cutlass.const_expr(cfg.seed_checkpoints):
+                    seed_state = compute_start == write_start
                 if seed_state:
                     for i in cutlass.range_constexpr(num_ldtms):
                         words = []
@@ -795,6 +808,7 @@ def frost_mamba2_recompute(
     mScheduler: cute.Tensor,
     mTransition: Optional[cute.Tensor],
     checkpoint_every_n_tokens: cutlass.Int32,
+    seed_every_n_tokens: cutlass.Int32,
     dt_min: cutlass.Float32,
     dt_max: cutlass.Float32,
     cumsumlog_smem_layout_staged: cute.Layout,
@@ -930,6 +944,7 @@ def frost_mamba2_recompute(
             mSeedIndices=mSeedIndices,
             mFinalIndices=mFinalIndices,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            seed_every_n_tokens=seed_every_n_tokens,
             sScheduler=sScheduler,
             bars=bars,
         )
@@ -1022,6 +1037,7 @@ class Mamba2RecomputeCfg:
     d_k: int
     d_v: int
     dt_softplus: bool = True
+    seed_checkpoints: bool = False
     tiles_per_head: int = 1
     scheduler_stages: int = CFG.SMEM_SCHEDULER_STAGES
 
@@ -1071,6 +1087,7 @@ def build_cfg(
     store_final_state: bool = True,
     enable_checkpoints: bool = False,
     dt_softplus: bool = True,
+    seed_checkpoints: bool = False,
     d_k: int,
     d_v: int,
 ) -> Mamba2RecomputeCfg:
@@ -1084,6 +1101,7 @@ def build_cfg(
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
         dt_softplus=dt_softplus,
+        seed_checkpoints=seed_checkpoints,
         d_k=d_k,
         d_v=d_v,
     )
@@ -1299,6 +1317,7 @@ def host(
     scheduler_counter: cute.Tensor,
     transition: Optional[cute.Tensor],
     checkpoint_every_n_tokens: cutlass.Int32,
+    seed_every_n_tokens: cutlass.Int32,
     dt_min: cutlass.Float32,
     dt_max: cutlass.Float32,
     tensormap_workspace: cute.Tensor,
@@ -1367,6 +1386,7 @@ def host(
         scheduler_counter,
         transition,
         checkpoint_every_n_tokens,
+        seed_every_n_tokens,
         dt_min,
         dt_max,
         cumsumlog_smem_layout_staged,

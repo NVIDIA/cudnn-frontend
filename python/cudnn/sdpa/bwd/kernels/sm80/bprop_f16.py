@@ -578,6 +578,7 @@ def _bprop_kernel(
         rows=tile_kv,
         elems_per_row=d_qk,
         gmem_row_stride_elems=K_RS,
+        valid_cols=K.shape[3] if cutlass.const_expr(K.shape[3] != d_qk) else None,
         tidx=tidx,
         num_threads=threads,
         elems_per_copy=_COPY_ELEMS,
@@ -592,6 +593,7 @@ def _bprop_kernel(
         rows=tile_kv,
         elems_per_row=d_v,
         gmem_row_stride_elems=VV_RS,
+        valid_cols=V.shape[3] if cutlass.const_expr(V.shape[3] != d_v) else None,
         tidx=tidx,
         num_threads=threads,
         elems_per_copy=_COPY_ELEMS,
@@ -695,6 +697,7 @@ def _bprop_kernel(
         rows=tile_q,
         elems_per_row=d_qk,
         gmem_row_stride_elems=QK_RS,
+        valid_cols=Q.shape[3] if cutlass.const_expr(Q.shape[3] != d_qk) else None,
         tidx=tidx,
         num_threads=threads,
         elems_per_copy=_COPY_ELEMS,
@@ -713,6 +716,7 @@ def _bprop_kernel(
         rows=tile_q,
         elems_per_row=d_v,
         gmem_row_stride_elems=V_RS,
+        valid_cols=dO.shape[3] if cutlass.const_expr(dO.shape[3] != d_v) else None,
         tidx=tidx,
         num_threads=threads,
         elems_per_copy=_COPY_ELEMS,
@@ -758,6 +762,7 @@ def _bprop_kernel(
                 rows=tile_q,
                 elems_per_row=d_qk,
                 gmem_row_stride_elems=QK_RS,
+                valid_cols=Q.shape[3] if cutlass.const_expr(Q.shape[3] != d_qk) else None,
                 tidx=tidx,
                 num_threads=threads,
                 elems_per_copy=_COPY_ELEMS,
@@ -781,6 +786,7 @@ def _bprop_kernel(
                 rows=tile_q,
                 elems_per_row=d_v,
                 gmem_row_stride_elems=V_RS,
+                valid_cols=dO.shape[3] if cutlass.const_expr(dO.shape[3] != d_v) else None,
                 tidx=tidx,
                 num_threads=threads,
                 elems_per_copy=_COPY_ELEMS,
@@ -1198,6 +1204,7 @@ def _bprop_kernel(
                     rows=tile_q,
                     elems_per_row=d_qk,
                     gmem_row_stride_elems=QK_RS,
+                    valid_cols=Q.shape[3] if cutlass.const_expr(Q.shape[3] != d_qk) else None,
                     tidx=tidx,
                     num_threads=threads,
                     elems_per_copy=_COPY_ELEMS,
@@ -1221,6 +1228,7 @@ def _bprop_kernel(
                     rows=tile_q,
                     elems_per_row=d_v,
                     gmem_row_stride_elems=V_RS,
+                    valid_cols=dO.shape[3] if cutlass.const_expr(dO.shape[3] != d_v) else None,
                     tidx=tidx,
                     num_threads=threads,
                     elems_per_copy=_COPY_ELEMS,
@@ -1254,16 +1262,20 @@ def _bprop_kernel(
             off = nf * 4
             base_top = DV_BATCH + (cutlass.Int64(kv_base) + cutlass.Int64(kv_row_g)) * DV_RS + cutlass.Int64(head) * cutlass.Int64(dV.stride[2]) + d0
             base_bot = DV_BATCH + (cutlass.Int64(kv_base) + cutlass.Int64(kv_row_g8)) * DV_RS + cutlass.Int64(head) * cutlass.Int64(dV.stride[2]) + d0
-            _vt = fp32_to_fp16(acc_grad[off + 0], acc_grad[off + 1], dtype=io_dtype)
-            _vb = fp32_to_fp16(acc_grad[off + 2], acc_grad[off + 3], dtype=io_dtype)
-            if cutlass.const_expr(GATE_KV):
-                if kv_top_ok:
+            column_live = True
+            if cutlass.const_expr(dV.shape[3] != d_v):
+                column_live = d0 < cutlass.Int32(dV.shape[3])
+            if column_live:
+                _vt = fp32_to_fp16(acc_grad[off + 0], acc_grad[off + 1], dtype=io_dtype)
+                _vb = fp32_to_fp16(acc_grad[off + 2], acc_grad[off + 3], dtype=io_dtype)
+                if cutlass.const_expr(GATE_KV):
+                    if kv_top_ok:
+                        Pointer((dV_view.data_ptr() + base_top), dtype=cutlass.Int32).store(_vt, alignment=4)
+                    if kv_bot_ok:
+                        Pointer((dV_view.data_ptr() + base_bot), dtype=cutlass.Int32).store(_vb, alignment=4)
+                else:
                     Pointer((dV_view.data_ptr() + base_top), dtype=cutlass.Int32).store(_vt, alignment=4)
-                if kv_bot_ok:
                     Pointer((dV_view.data_ptr() + base_bot), dtype=cutlass.Int32).store(_vb, alignment=4)
-            else:
-                Pointer((dV_view.data_ptr() + base_top), dtype=cutlass.Int32).store(_vt, alignment=4)
-                Pointer((dV_view.data_ptr() + base_bot), dtype=cutlass.Int32).store(_vb, alignment=4)
     else:
         # ---- RoPE: un-rotate dK' (R(-pos_kv)) IN-FRAGMENT before the store.
         #      Col i (<d2, n-frag nf<n_frags/2) pairs with col i+d2 (n-frag
@@ -1297,16 +1309,20 @@ def _bprop_kernel(
             off = nf * 4
             base_top = DK_BATCH + (cutlass.Int64(kv_base) + cutlass.Int64(kv_row_g)) * DK_RS + cutlass.Int64(head) * cutlass.Int64(dK.stride[2]) + d0
             base_bot = DK_BATCH + (cutlass.Int64(kv_base) + cutlass.Int64(kv_row_g8)) * DK_RS + cutlass.Int64(head) * cutlass.Int64(dK.stride[2]) + d0
-            _kt = fp32_to_fp16(acc_grad[off + 0], acc_grad[off + 1], dtype=io_dtype)
-            _kb = fp32_to_fp16(acc_grad[off + 2], acc_grad[off + 3], dtype=io_dtype)
-            if cutlass.const_expr(GATE_KV):
-                if kv_top_ok:
+            column_live = True
+            if cutlass.const_expr(dK.shape[3] != d_qk):
+                column_live = d0 < cutlass.Int32(dK.shape[3])
+            if column_live:
+                _kt = fp32_to_fp16(acc_grad[off + 0], acc_grad[off + 1], dtype=io_dtype)
+                _kb = fp32_to_fp16(acc_grad[off + 2], acc_grad[off + 3], dtype=io_dtype)
+                if cutlass.const_expr(GATE_KV):
+                    if kv_top_ok:
+                        Pointer((dK_view.data_ptr() + base_top), dtype=cutlass.Int32).store(_kt, alignment=4)
+                    if kv_bot_ok:
+                        Pointer((dK_view.data_ptr() + base_bot), dtype=cutlass.Int32).store(_kb, alignment=4)
+                else:
                     Pointer((dK_view.data_ptr() + base_top), dtype=cutlass.Int32).store(_kt, alignment=4)
-                if kv_bot_ok:
                     Pointer((dK_view.data_ptr() + base_bot), dtype=cutlass.Int32).store(_kb, alignment=4)
-            else:
-                Pointer((dK_view.data_ptr() + base_top), dtype=cutlass.Int32).store(_kt, alignment=4)
-                Pointer((dK_view.data_ptr() + base_bot), dtype=cutlass.Int32).store(_kb, alignment=4)
 
 
 _bprop_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -1401,11 +1417,15 @@ def _do_dot_kernel(
         Ob = cutlass.make_array_view(O).data_ptr()
         dOb = cutlass.make_array_view(dO).data_ptr()
         acc = cutlass.Float32(0.0)
-        for k in cutlass.range_constexpr(d_v // 32):
+        for k in cutlass.range_constexpr((d_v + 31) // 32):
             col = lane + cutlass.Int32(k * 32)  # coalesced across lanes
-            o = Pointer(Ob + o_base + col, dtype=io_dtype).load()
-            d = Pointer(dOb + do_base + col, dtype=io_dtype).load()
-            acc = acc + o.to(cutlass.Float32) * d.to(cutlass.Float32)
+            column_live = True
+            if cutlass.const_expr(d_v % 32):
+                column_live = col < cutlass.Int32(d_v)
+            if column_live:
+                o = Pointer(Ob + o_base + col, dtype=io_dtype).load()
+                d = Pointer(dOb + do_base + col, dtype=io_dtype).load()
+                acc = acc + o.to(cutlass.Float32) * d.to(cutlass.Float32)
         # Warp butterfly reduce → all lanes hold the row sum; lane 0 stores.
         for off in cutlass.range_constexpr(5):
             acc = acc + nvvm.shfl_sync(0xFFFFFFFF, acc, 1 << (4 - off), 0x1F, nvvm.Shfl.BFLY)
@@ -1452,11 +1472,15 @@ def _do_dot_thd_kernel(
             o_base = o_row + cutlass.Int64(h) * cutlass.Int64(O.stride[2])
             do_base = do_row + cutlass.Int64(h) * cutlass.Int64(dO.stride[2])
             acc = cutlass.Float32(0.0)
-            for k in cutlass.range_constexpr(d_v // 32):
+            for k in cutlass.range_constexpr((d_v + 31) // 32):
                 col = lane + cutlass.Int32(k * 32)
-                o = Pointer(Ob + o_base + col, dtype=io_dtype).load()
-                d = Pointer(dOb + do_base + col, dtype=io_dtype).load()
-                acc = acc + o.to(cutlass.Float32) * d.to(cutlass.Float32)
+                column_live = True
+                if cutlass.const_expr(d_v % 32):
+                    column_live = col < cutlass.Int32(d_v)
+                if column_live:
+                    o = Pointer(Ob + o_base + col, dtype=io_dtype).load()
+                    d = Pointer(dOb + do_base + col, dtype=io_dtype).load()
+                    acc = acc + o.to(cutlass.Float32) * d.to(cutlass.Float32)
             for off in cutlass.range_constexpr(5):
                 acc = acc + nvvm.shfl_sync(0xFFFFFFFF, acc, 1 << (4 - off), 0x1F, nvvm.Shfl.BFLY)
             if lane == cutlass.Int32(0):
@@ -1571,7 +1595,8 @@ def _cast_kernel(
         row = (pair // (d * hq)) % sq
         batch = pair // (d * hq * sq)
         out_off = batch * cutlass.Int64(dQ_out.stride[0]) + row * cutlass.Int64(dQ_out.stride[1]) + head * cutlass.Int64(dQ_out.stride[2]) + col
-        v = Pointer(src + pair, dtype=cutlass.Float32).load(count=2)
+        in_off = batch * cutlass.Int64(dQ_acc.stride[0]) + row * cutlass.Int64(dQ_acc.stride[1]) + head * cutlass.Int64(dQ_acc.stride[2]) + col
+        v = Pointer(src + in_off, dtype=cutlass.Float32).load(count=2)
         Pointer(dst + out_off, dtype=cutlass.Int32).store(fp32_to_fp16(v[0], v[1], dtype=io_dtype), alignment=4)
 
 

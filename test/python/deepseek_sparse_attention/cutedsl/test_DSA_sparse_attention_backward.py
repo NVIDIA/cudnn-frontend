@@ -6,8 +6,10 @@
 Gradients are generated via autograd on the gather-based forward reference.
 """
 
+import ast
 import inspect
 import math
+import textwrap
 
 import pytest
 import torch
@@ -15,7 +17,7 @@ import torch
 from test_utils import assert_bitwise_runs, bitwise_bits, torch_fork_set_rng
 
 from deepseek_sparse_attention.cutedsl.dsa_utils import (
-    _require_exact_sm100,
+    _require_sm100_family,
     _require_sm90,
     _require_sm100,
     dsa_init,
@@ -235,24 +237,25 @@ def test_DSA_sparse_attention_backward_sm100_h96_dispatch():
     assert _select_sm100_backend(96, 576, max_topk=512) == ("h96_h64_h32", 64)
     assert _select_sm100_backend(96, 576, max_topk=1024) == ("h96_h64_h32", 64)
     assert _select_sm100_backend(96, 576, max_topk=2048, deterministic=True) == ("h96_h64_h32", 64)
-    assert _select_sm100_backend(
-        96,
-        576,
-        head_dim_v=512,
-        dtype=torch.bfloat16,
-        max_topk=2048,
-        device_capability=(10, 0),
-        deterministic=False,
-    ) == ("h96_d576_2cta_m64", 64)
-    assert _select_sm100_backend(
-        96,
-        576,
-        head_dim_v=512,
-        dtype=torch.bfloat16,
-        max_topk=2048,
-        device_capability=(10, 0),
-        deterministic=True,
-    ) == ("h96_d576_2cta_m64", 64)
+    for max_topk in range(2048, 2052):
+        assert _select_sm100_backend(
+            96,
+            576,
+            head_dim_v=512,
+            dtype=torch.bfloat16,
+            max_topk=max_topk,
+            device_capability=(10, 0),
+            deterministic=False,
+        ) == ("h96_d576_2cta_m64", 64)
+        assert _select_sm100_backend(
+            96,
+            576,
+            head_dim_v=512,
+            dtype=torch.bfloat16,
+            max_topk=max_topk,
+            device_capability=(10, 0),
+            deterministic=True,
+        ) == ("h96_d576_2cta_m64", 64)
     assert _select_sm100_backend(
         96,
         576,
@@ -407,7 +410,7 @@ def test_DSA_sparse_attention_backward_qcluster_workspace_is_topk_bounded(heads,
 @pytest.mark.L1
 def test_DSA_sparse_attention_backward_qcluster_compile_key_is_shape_dynamic():
     """Reuse one compiled artifact across different Q and KV extents."""
-    _require_exact_sm100()
+    _require_sm100_family()
     from cudnn.deepseek_sparse_attention.sparse_attention_backward._qcluster_sm100 import _compile_artifacts, compile_plan
 
     capability = torch.cuda.get_device_capability()
@@ -499,7 +502,7 @@ def test_DSA_sparse_attention_backward_deterministic_compile_cache_is_device_sco
 @pytest.mark.parametrize("with_lengths", [False, True], ids=["full", "lengths"])
 def test_DSA_sparse_attention_backward_qcluster_matches_baseline_and_graph(heads, with_lengths, topk):
     """Shared, fallback, and odd-tail rows remain correct on graph replay."""
-    _require_exact_sm100()
+    _require_sm100_family()
     from cudnn import DSA
 
     torch.manual_seed(31)
@@ -595,7 +598,7 @@ def test_DSA_sparse_attention_backward_qcluster_matches_baseline_and_graph(heads
 @pytest.mark.parametrize("heads", [16, 32])
 def test_DSA_sparse_attention_backward_qcluster_graph_replay_switches_overlap_path(heads):
     """One captured graph follows in-place high/zero/high overlap changes."""
-    _require_exact_sm100()
+    _require_sm100_family()
     from cudnn import DSA
 
     torch.manual_seed(32)
@@ -762,6 +765,9 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
     ):
         dkv_shape = kernel_cls._get_workspace_size_dKV_for_q(16384, 524288, 576, 64, 1, cutlass.Float32)
         assert math.prod(dkv_shape) == _relay_workspace_bytes(16384, 524288, 576, 64, kernel_cls.dkv_relay_cluster_size)
+        assert not kernel_cls.run_dkv_prefold
+        assert kernel_cls.num_dkv_final_terms == kernel_cls.num_dkv_shards
+        assert kernel_cls.dkv_final_stride == 1
     assert deterministic_kernel_class(8191, 65537, 512) is FlashAttentionDSABackwardSm100DeterministicCluster8
     assert deterministic_kernel_class(8192, 65537, 512) is FlashAttentionDSABackwardSm100DeterministicCluster4
     assert deterministic_kernel_class(16384, 524288, 576) is FlashAttentionDSABackwardSm100DeterministicCluster16
@@ -784,6 +790,7 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
     assert FlashAttentionDSABackwardSm100Deterministic64.num_dkv_final_terms == 8
     with pytest.raises(ValueError, match="at least one query row"):
         deterministic_dkv_shards(0)
+
     with pytest.raises(ValueError, match="at least one query row"):
         deterministic_dkv_relay_cluster_size(0, 256, 576)
     with pytest.raises(ValueError, match="positive KV, head-dimension, and head-count extents"):
@@ -802,6 +809,32 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
         deterministic_kernel_class(128, head_dim=576)
     assert FlashAttentionDSABackwardSm100.q_wave_ctas == 0
     assert not FlashAttentionDSABackwardSm100.serialize_head_blocks
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_relay_acquire_load_controls_exit():
+    """Keep the GPU acquire load live by feeding its value to loop control."""
+    deterministic = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_deterministic")
+    tree = ast.parse(textwrap.dedent(inspect.getsource(deterministic._wait_lower_rank_mask)))
+
+    acquire_values = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+            continue
+        if not isinstance(node.value.func, ast.Attribute) or node.value.func.attr != "load":
+            continue
+        if not any(keyword.arg == "sem" and isinstance(keyword.value, ast.Constant) and keyword.value.value == "acquire" for keyword in node.value.keywords):
+            continue
+        acquire_values.update(target.id for target in node.targets if isinstance(target, ast.Name))
+
+    controlled_values = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute) or node.func.attr != "while_generate" or not node.args:
+            continue
+        if isinstance(node.args[0], ast.List):
+            controlled_values.update(value.id for value in node.args[0].elts if isinstance(value, ast.Name))
+
+    assert acquire_values & controlled_values, "an unused acquire load is eliminated from generated PTX"
 
 
 @pytest.mark.L0
@@ -1248,6 +1281,104 @@ def test_DSA_sparse_attention_backward_sm100_h96_d576_topk2048_repeat():
 
 
 @pytest.mark.L1
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("topk", [2048, 2049, 2050, 2051])
+@pytest.mark.parametrize("deterministic", [False, True], ids=["ordinary", "deterministic"])
+@torch_fork_set_rng(seed=20261029)
+def test_DSA_sparse_attention_backward_sm100_h96_d576_unaligned_topk_widths(topk, deterministic):
+    """Top-K 2048--2051 remains on the native H96 route with correct gradients."""
+    _require_sm100()
+    if torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
+        pytest.skip("H96/D576 two-CTA requires compute capability 10.0 or 10.3")
+    try:
+        from cuda.bindings import driver as cuda
+        from cudnn import DSA
+    except ImportError:
+        return pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    s_q, s_kv = 4, topk + 17
+    num_heads, head_dim = 96, 576
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+    device = torch.device("cuda")
+    q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device) / 10
+    kv = torch.randn(s_kv, head_dim, dtype=torch.bfloat16, device=device) / 10
+    attn_sink = torch.randn(num_heads, dtype=torch.float32, device=device)
+    topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
+    out, lse = ref_sparse_attention_forward_chunked(q, kv, attn_sink, topk_idxs, softmax_scale=softmax_scale)
+    dout = torch.randn_like(out)
+
+    plan = DSA.SparseAttentionBackward(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        softmax_scale=softmax_scale,
+        deterministic=deterministic,
+    )
+    assert plan.check_support()
+    assert plan._backend == "h96_d576_2cta_m64"
+    plan.compile()
+    workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device=device)
+    dq, dkv, d_sink = torch.empty_like(q), torch.empty_like(kv), torch.empty_like(attn_sink)
+    result = plan.execute(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        dq,
+        dkv,
+        softmax_scale=softmax_scale,
+        workspace=workspace,
+        current_stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        d_sink=d_sink,
+    )
+    assert all(actual is expected for actual, expected in zip(result, (dq, dkv, d_sink), strict=True))
+    if deterministic:
+        first = tuple(tensor.clone() for tensor in result)
+        for buffer in (workspace, dq, dkv, d_sink):
+            buffer.view(torch.uint8).fill_(0xA5)
+        plan.execute(
+            q,
+            kv,
+            out,
+            dout,
+            lse,
+            attn_sink,
+            topk_idxs,
+            dq,
+            dkv,
+            softmax_scale=softmax_scale,
+            workspace=workspace,
+            current_stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            d_sink=d_sink,
+        )
+        for actual, expected in zip((dq, dkv, d_sink), first):
+            assert torch.equal(bitwise_bits(actual), bitwise_bits(expected))
+    check_ref_dsa_sparse_attention_backward(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        out,
+        dout,
+        lse,
+        dq,
+        dkv,
+        d_sink,
+        softmax_scale=softmax_scale,
+        atol=5e-2,
+        rtol=5e-2,
+    )
+
+
+@pytest.mark.L1
 @torch_fork_set_rng(seed=420)
 @pytest.mark.parametrize("s_q", [128, 129], ids=["shards32", "shards64"])
 def test_DSA_sparse_attention_backward_sm100_deterministic_adaptive_shards_repeat100(s_q):
@@ -1273,6 +1404,26 @@ def test_DSA_sparse_attention_backward_sm100_cluster8_repeat100():
             shared_topk=True,
             check_graph=True,
             check_short_workspace=True,
+            expected_relay_cluster_size=8,
+        )
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+
+@pytest.mark.L2
+@torch_fork_set_rng(seed=20261030)
+def test_DSA_sparse_attention_backward_sm100_cluster8_topk2048():
+    """The optimized production-width relay remains exact and repeatable."""
+    try:
+        _exercise_deterministic_sm100_case(
+            64,
+            576,
+            257,
+            65537,
+            repeats=3,
+            topk=2048,
+            has_topk_length=True,
+            check_graph=True,
             expected_relay_cluster_size=8,
         )
     except ImportError:
@@ -1449,7 +1600,7 @@ def test_DSA_sparse_attention_backward_sm100_plan_is_cold_capture_safe(
 
     _require_sm100()
     if expected_backend == "h128_2cta_m64":
-        _require_exact_sm100()
+        _require_sm100_family()
     plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
         num_heads,
         head_dim,
@@ -1984,7 +2135,7 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_masks_active_positive_
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     if head_dim == 512:
-        _require_exact_sm100()
+        _require_sm100_family()
     else:
         _require_sm100()
         if torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
@@ -2077,7 +2228,7 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_masks_active_positive_
 @torch_fork_set_rng(seed=20260830)
 def test_DSA_sparse_attention_backward_sm100_h128_dsink_reduction_covers_tail():
     """Every query block, including a one-row tail, contributes to dSink."""
-    _require_exact_sm100()
+    _require_sm100_family()
     try:
         from cudnn import DSA
     except ImportError:
@@ -2140,7 +2291,7 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_cuda_graph(monkeypatch
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
-    _require_exact_sm100()
+    _require_sm100_family()
 
     s_q, s_kv, num_heads, head_dim, topk = 4, 192, 128, 512, 128
     q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device="cuda") / 10
@@ -2970,7 +3121,7 @@ def test_DSA_sparse_attention_backward_zero_topk_length(head_dim, num_heads, top
     if major * 10 + minor < 90:
         pytest.skip("sparse attention backward requires SM90+")
     if num_heads == 128 and head_dim == 512:
-        _require_exact_sm100()
+        _require_sm100_family()
     if num_heads == 128 and head_dim == 576 and (major, minor) not in _TWO_CTA_CAPABILITIES:
         # Lengths above max_topk are part of the two-CTA route's contract; the
         # generic M64 pipeline that serves H128/D576 elsewhere does not clamp them.
@@ -3358,7 +3509,7 @@ def test_DSA_sparse_attention_backward_h128_two_cta_handles_sink_limits(head_dim
     sink as owning all (or none) of the probability mass."""
     _require_sm100()
     if head_dim == 512:
-        _require_exact_sm100()
+        _require_sm100_family()
     elif torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
         pytest.skip("D576 2-CTA requires an SM100-class GPU (compute capability 10.0 or 10.3)")
     try:
@@ -3523,7 +3674,7 @@ def test_DSA_sparse_attention_backward_h128_two_cta_padded_slots_under_very_nega
     and must not touch unselected KV rows."""
     _require_sm100()
     if head_dim == 512:
-        _require_exact_sm100()
+        _require_sm100_family()
     elif torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
         pytest.skip("D576 2-CTA requires an SM100-class GPU (compute capability 10.0 or 10.3)")
     try:
@@ -4255,7 +4406,7 @@ def test_DSA_sparse_attention_backward_nondefault_stream_zero_init_ordering(num_
 
     _require_sm100()
     if num_heads == 128 and head_dim == 512:
-        _require_exact_sm100()
+        _require_sm100_family()
     if num_heads == 128 and head_dim == 576 and torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
         pytest.skip("D576 2-CTA requires an SM100-class GPU (compute capability 10.0 or 10.3)")
     if q_cluster_mode == "adaptive_pair" and torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
@@ -4900,7 +5051,7 @@ def test_DSA_sparse_attention_backward_sm100_execute_allocates_nothing_and_never
 
     _require_sm100()
     if expected_backend == "h128_2cta_m64":
-        _require_exact_sm100()
+        _require_sm100_family()
     device_capability = torch.cuda.get_device_capability()
     if expected_backend in ("h96_d576_2cta_m64", "h128_d576_2cta_m64") and device_capability not in _TWO_CTA_CAPABILITIES:
         if expected_backend == "h96_d576_2cta_m64":

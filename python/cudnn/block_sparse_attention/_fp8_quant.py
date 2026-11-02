@@ -29,8 +29,9 @@ class _SageFp8Quantizer:
     ROWS_PER_CHUNK = 256
     SM90_ROWS_PER_CHUNK = 64
 
-    def __init__(self, is_sm120: bool = False, v_block_size: int = 0, v_layout: str = "bhsd", is_sm90: bool = False):
+    def __init__(self, is_sm120: bool = False, v_block_size: int = 0, v_layout: str = "bhsd", is_sm90: bool = False, k_quant_block_size: int = 16):
         self.is_sm120 = is_sm120
+        self.k_quant_block_size = k_quant_block_size
         self.v_block_size = v_block_size
         if v_block_size:
             from cudnn.block_sparse_attention.csrc.fwd.sm120_blk128.sage_v_quant import SageFp8VQuantizerSm120Blk128
@@ -263,6 +264,54 @@ class _SageFp8Quantizer:
         mKMean[group_idx * self.HEAD_DIM + dim_idx] = cute.math.div(total, seqlen_k_float, full=True)
 
     @cute.kernel
+    def _quantize_q_four_rows_kernel(self, mQ: cute.Tensor, mQFp8: cute.Tensor, mQScale: cute.Tensor, num_rows: Int32):
+        """Vectorized four-warp CTA with the unchanged Sage Q rounding."""
+        row = cute.arch.block_idx()[0] * 4 + cute.arch.warp_idx()
+        lane = cute.arch.lane_idx()
+        if row < num_rows:
+            offset = row * 128 + lane * 4
+            values = cute.make_rmem_tensor(cute.make_layout(4), BFloat16)
+            cute.autovec_copy(cute.make_tensor((mQ.iterator + offset).align(8), cute.make_layout(4)), values)
+            maximum = Float32(0.0)
+            for c in cutlass.range_constexpr(4):
+                x = values[c].to(Float32)
+                maximum = cute.arch.fmax(maximum, cute.arch.fmax(x, -x))
+            scale = cute.math.div(cute.arch.fmax(self._warp_amax(maximum), Float32(1.0e-3)), Float32(448.0), full=True)
+            if lane == 0:
+                mQScale[row] = scale
+            reciprocal = (BFloat16(1.0) / scale.to(BFloat16)).to(BFloat16)
+            result = cute.make_rmem_tensor(cute.make_layout(4), Float8E4M3FN)
+            for c in cutlass.range_constexpr(4):
+                result[c] = (values[c] * reciprocal).to(BFloat16).to(Float8E4M3FN)
+            cute.autovec_copy(result, cute.make_tensor((mQFp8.iterator + offset).align(4), cute.make_layout(4)))
+
+    @cute.kernel
+    def _quantize_k_per_token_kernel(self, mK: cute.Tensor, mKFp8: cute.Tensor, mKScale: cute.Tensor, mKMean: cute.Tensor, seqlen_k: Int32, num_rows: Int32):
+        """Four independent rows per CTA; no cross-warp reduction or scratch."""
+        row = cute.arch.block_idx()[0] * 4 + cute.arch.warp_idx()
+        lane = cute.arch.lane_idx()
+        if row < num_rows:
+            channel = lane * 4
+            offset = row * 128 + channel
+            mean_offset = (row // seqlen_k) * 128 + channel
+            values = cute.make_rmem_tensor(cute.make_layout(4), BFloat16)
+            means = cute.make_rmem_tensor(cute.make_layout(4), Float32)
+            cute.autovec_copy(cute.make_tensor((mK.iterator + offset).align(8), cute.make_layout(4)), values)
+            cute.autovec_copy(cute.make_tensor((mKMean.iterator + mean_offset).align(16), cute.make_layout(4)), means)
+            centered = cute.make_rmem_tensor(cute.make_layout(4), Float32)
+            centered.store(values.load().to(Float32) - means.load())
+            maximum = Float32(0.0)
+            for c in cutlass.range_constexpr(4):
+                maximum = cute.arch.fmax(maximum, cute.arch.fmax(centered[c], -centered[c]))
+            scale = cute.math.div(cute.arch.fmax(self._warp_amax(maximum), Float32(1.0e-3)), Float32(448.0), full=True)
+            if lane == 0:
+                mKScale[row] = scale
+            result = cute.make_rmem_tensor(cute.make_layout(4), Float8E4M3FN)
+            for c in cutlass.range_constexpr(4):
+                result[c] = cute.math.div(centered[c], scale, full=True).to(Float8E4M3FN)
+            cute.autovec_copy(result, cute.make_tensor((mKFp8.iterator + offset).align(4), cute.make_layout(4)))
+
+    @cute.kernel
     def _quantize_k_kernel(
         self,
         mK: cute.Tensor,
@@ -460,11 +509,14 @@ class _SageFp8Quantizer:
         num_groups = batch_size * num_heads
         num_k_blocks = (seqlen_k + self.K_BLOCK_ROWS - 1) // self.K_BLOCK_ROWS
 
-        self._quantize_q_kernel(mQ, mQFp8, mQScale).launch(
-            grid=(num_q_rows // 4 if self.is_sm90 else num_q_rows, 1, 1),
-            block=(128 if self.is_sm90 else self.Q_THREADS, 1, 1),
-            stream=stream,
-        )
+        if cutlass.const_expr(self.k_quant_block_size == 1):
+            self._quantize_q_four_rows_kernel(mQ, mQFp8, mQScale, num_q_rows).launch(grid=((num_q_rows + 3) // 4, 1, 1), block=(128, 1, 1), stream=stream)
+        else:
+            self._quantize_q_kernel(mQ, mQFp8, mQScale).launch(
+                grid=(num_q_rows // 4 if self.is_sm90 else num_q_rows, 1, 1),
+                block=(128 if self.is_sm90 else self.Q_THREADS, 1, 1),
+                stream=stream,
+            )
         if cutlass.const_expr(self.is_sm90):
             self._kv_partial_sm90_kernel(mK, mV, mKMeanPartial, mVAmaxPartial, num_heads, seqlen_k, num_k_chunks, num_v_chunks).launch(
                 grid=(num_k_chunks, num_heads, batch_size), block=(128, 1, 1), stream=stream
@@ -495,19 +547,24 @@ class _SageFp8Quantizer:
                 block=(self.REDUCTION_THREADS, 1, 1),
                 stream=stream,
             )
-        self._quantize_k_kernel(
-            mK,
-            mKFp8,
-            mKScale,
-            mKMean,
-            seqlen_k,
-            num_k_blocks,
-        ).launch(
-            grid=(num_groups * num_k_blocks, 1, 1),
-            block=(self.K_THREADS, 1, 1),
-            smem=self.K_WARPS * 4 + 4,
-            stream=stream,
-        )
+        if cutlass.const_expr(self.k_quant_block_size == 1):
+            self._quantize_k_per_token_kernel(mK, mKFp8, mKScale, mKMean, seqlen_k, num_groups * seqlen_k).launch(
+                grid=((num_groups * seqlen_k + 3) // 4, 1, 1), block=(128, 1, 1), stream=stream
+            )
+        else:
+            self._quantize_k_kernel(
+                mK,
+                mKFp8,
+                mKScale,
+                mKMean,
+                seqlen_k,
+                num_k_blocks,
+            ).launch(
+                grid=(num_groups * num_k_blocks, 1, 1),
+                block=(self.K_THREADS, 1, 1),
+                smem=self.K_WARPS * 4 + 4,
+                stream=stream,
+            )
         if cutlass.const_expr(not self.is_sm90):
             self._v_amax_partial_kernel(
                 mV,
@@ -571,10 +628,13 @@ def _quantize_sage_bhsd(
     *,
     v_block_size: int = 0,
     v_layout: str = "bhsd",
+    k_quant_block_size: int = 16,
 ):
     """Quantize BF16 Q/K/V; optionally store V as [B, H, KV-block, D, token]."""
     if v_block_size not in (0, 128):
         raise ValueError("v_block_size must be 0 or 128")
+    if type(k_quant_block_size) is not int or k_quant_block_size not in (1, 16):
+        raise ValueError("k_quant_block_size must be 1 or 16")
     if v_layout not in {"bhsd", "bhds"}:
         raise ValueError("v_layout must be 'bhsd' or 'bhds'")
     if v_block_size and v_layout != "bhsd":
@@ -608,6 +668,8 @@ def _quantize_sage_bhsd(
         raise ValueError("BHDS V quantization requires Sk to be a multiple of 64")
     capability = torch.cuda.get_device_capability(q_bhsd.device)
     is_sm120 = capability[0] == 12
+    if k_quant_block_size == 1 and not is_sm120:
+        raise NotImplementedError("per-token K quantization requires SM120")
     if v_block_size and not is_sm120:
         raise NotImplementedError("blocked V quantization requires SM120")
     if not is_sm120 and capability not in {(10, 0), (10, 3)} and (seqlen_q % 64 or seqlen_k % 64):
@@ -617,7 +679,7 @@ def _quantize_sage_bhsd(
     rows_per_chunk = _SageFp8Quantizer.SM90_ROWS_PER_CHUNK if torch.cuda.get_device_capability(q_bhsd.device)[0] == 9 else _SageFp8Quantizer.ROWS_PER_CHUNK
     num_k_chunks = (seqlen_k + rows_per_chunk - 1) // rows_per_chunk
     num_v_chunks = (batch_size * seqlen_k + rows_per_chunk - 1) // rows_per_chunk
-    num_k_blocks = (seqlen_k + _SageFp8Quantizer.K_BLOCK_ROWS - 1) // _SageFp8Quantizer.K_BLOCK_ROWS
+    num_k_blocks = (seqlen_k + k_quant_block_size - 1) // k_quant_block_size
     device = q_bhsd.device
 
     with torch.cuda.device(device):
@@ -680,10 +742,14 @@ def _quantize_sage_bhsd(
         )
         cute_tensors = tuple(_to_dynamic_cute_tensor(tensor) for tensor in runtime_tensors)
         current_stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
-        compile_key = (device.index, capability, v_block_size, v_layout)
+        compile_key = (device.index, capability, v_block_size, v_layout, k_quant_block_size)
         if compile_key not in _quantize_sage_bhsd.compile_cache:
             quantizer = _SageFp8Quantizer(
-                is_sm120=is_sm120, v_block_size=v_block_size, v_layout=v_layout, is_sm90=torch.cuda.get_device_capability(device)[0] == 9
+                is_sm120=is_sm120,
+                v_block_size=v_block_size,
+                v_layout=v_layout,
+                is_sm90=torch.cuda.get_device_capability(device)[0] == 9,
+                k_quant_block_size=k_quant_block_size,
             )
             _quantize_sage_bhsd.compile_cache[compile_key] = cute.compile(
                 quantizer,

@@ -246,6 +246,7 @@ def build_warmup_forward(
         seed_indices is not None,
         final_indices is not None,
         int(checkpoint_every_n_tokens) > 0,
+        str(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else "none",
         transition is not None,
     )
     if key not in warmup_forward_cache:
@@ -256,6 +257,7 @@ def build_warmup_forward(
             use_initial_state=state_in is not None,
             store_final_state=state_out is not None,
             enable_checkpoints=int(checkpoint_every_n_tokens) > 0,
+            checkpoint_dtype=get_dtype(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else None,
             dt_softplus=dt_softplus,
             has_d=d is not None,
             d_per_channel=d is not None and len(d.shape) == 2,
@@ -546,6 +548,7 @@ def recompute_host(
         scheduler,
         transition,
         checkpoint_every_n,
+        cutlass.Int32(0),
         dt_min,
         dt_max,
         workspace,

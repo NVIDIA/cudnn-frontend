@@ -255,6 +255,7 @@ def test_template_params_and_cfg_are_appended():
     import dataclasses
 
     fields = [f.name for f in dataclasses.fields(TemplateParams)]
+    fields = fields[: fields.index("q_in_tmem") + 1]  # Later appended fields are legal.
     assert (
         fields[-8:] == ["n_chunk", "bias_stages", "padded_tail_form", "dead_subtile_quiet", "bias_max_form", "softmax_wgs", "s_slots", "q_in_tmem"]
         and TemplateParams().n_chunk == 0

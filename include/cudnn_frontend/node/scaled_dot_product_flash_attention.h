@@ -2681,7 +2681,7 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "Unified SDPA accumulation type must be FLOAT or HALF");
         if (compute_type != DataType_t::FLOAT) {
-#if (CUDNN_VERSION >= 92900) && defined(CUDNN_HAS_SDPA_FWD_COMP_TYPE)
+#if (CUDNN_VERSION >= 92900)
             auto compute_type_version_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED,
                                                       "Unified SDPA compute type requires backend attribute support"};
             NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92900, compute_type_version_error);
@@ -2694,7 +2694,7 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
                                                            &backend_compute_type));
 #else
             return {error_code_t::GRAPH_NOT_SUPPORTED,
-                    "Unified SDPA compute type requires headers with CUDNN_HAS_SDPA_FWD_COMP_TYPE"};
+                    "Unified SDPA compute type requires cuDNN 9.29.0 or newer headers"};
 #endif
         }
 

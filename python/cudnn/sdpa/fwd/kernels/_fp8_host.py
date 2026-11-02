@@ -65,6 +65,9 @@ def host(
     sfo_geometry: cutlass.Constexpr,
     amax_prescaled: cutlass.Constexpr[bool],
     table_v_strides: Optional[Tuple[cutlass.Int64, cutlass.Int64]],
+    thd_origin_ptrs: Optional[tuple] = None,
+    thd_origin_specs: cutlass.Constexpr = None,
+    # The prepared binder requires the runtime stream slot to remain last.
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """Bind dense or THD pointer views and launch the selected FP8 host.
@@ -138,6 +141,8 @@ def host(
     if cutlass.const_expr(split_kv == 1 and (has_amax or not optional_amax)):
         _reset_amax_kernel(amax_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     kernel_kwargs = dict(prepared=True)
+    if cutlass.const_expr(thd_origin_specs is not None):
+        kernel_kwargs.update(thd_origin_ptrs=thd_origin_ptrs, thd_origin_specs=thd_origin_specs)
     if cutlass.const_expr(epilogue_gate):
         b, qh, _, sq, _, _ = problem_size
         kernel_kwargs.update(gate_tensor=cute.make_tensor(gate_ptr, cute.make_layout((b, sq, qh, d_v), stride=(*gate_strides, 1))))
@@ -197,6 +202,7 @@ def compile_host(
     optional_amax=False,
     sfo_geometry=None,
     amax_prescaled=False,
+    thd_origin_specs=None,
 ):
     if amax_prescaled:
         cache_key = f"{cache_key}:amax_prescaled"
@@ -268,6 +274,12 @@ def compile_host(
         sfo_geometry,
         amax_prescaled,
         (cutlass.Int64(0), cutlass.Int64(0)) if getattr(cfg, "PAGED_KV", False) else None,
+        thd_origin_ptrs=(
+            tuple(P(cutlass.Int64 if spec[3] == 64 else cutlass.Int32, 8 if spec[3] == 64 else 4) if spec is not None else None for spec in thd_origin_specs)
+            if thd_origin_specs is not None
+            else None
+        ),
+        thd_origin_specs=thd_origin_specs,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=cache_key,

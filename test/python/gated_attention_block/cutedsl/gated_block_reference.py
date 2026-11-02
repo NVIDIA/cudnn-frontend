@@ -587,6 +587,20 @@ def make_fp8_inputs(geom: RefGeometry, batch: int, seq_len: int, *, device: torc
     return quantize_block_inputs(make_inputs(geom, batch=batch, seq_len=seq_len, device=device, dtype=torch.bfloat16, seed=seed))
 
 
+@dataclass
+class Fp8RefOutputs:
+    """The FP8 oracle's intermediates (``return_rows=True``), so a mismatch localizes to a stage: the bf16 post-RoPE K / V rows (the
+    pool rows of the paged forms), the bf16 PRE-gate O and the bf16 gate, the bf16 gated O and its e4m3 codes at ``scale_o``."""
+
+    out: torch.Tensor  # [B, S, d_model] bf16
+    k: torch.Tensor  # [B, S, H_kv, D] bf16, post-norm post-RoPE
+    v: torch.Tensor  # [B, S, H_kv, D] bf16
+    o: torch.Tensor  # [B, S, H_q, D] bf16, PRE-gate (the SDPA's output as the kernel writes it)
+    gate: torch.Tensor  # [B, S, H_q, D] bf16, pre-sigmoid
+    o_gated: torch.Tensor  # [B, S, H_q, D] bf16
+    o8: torch.Tensor  # [B, S, H_q, D] e4m3: sat_e4m3(o_gated * scale_o)
+
+
 def gated_attention_block_fp8_reference(
     inp: dict,
     geom: RefGeometry,
@@ -594,14 +608,23 @@ def gated_attention_block_fp8_reference(
     descale_h: float,
     descale_w_qkvg: float,
     descale_w_o: float,
-    scale_q: float,
-    scale_k: float,
-    scale_v: float,
+    scale_q: Optional[float],
+    scale_k: Optional[float],
+    scale_v: Optional[float],
     scale_o: float,
     seq_lens: Optional[torch.Tensor] = None,
     fused: bool = False,
-) -> torch.Tensor:
+    attention_bf16: bool = False,
+    return_rows: bool = False,
+):
     """fp32 chain with the FP8 block's exact quantization points -> bf16 ``[B, S, d_model]``.
+
+    ``attention_bf16=True`` (appended) mirrors the FP8-PROJECTION + BF16-ATTENTION mode (``QuantSpec(attention_dtype=torch.bfloat16)``):
+    the projection epilogue rounds ``alpha * acc`` to bf16 (the slab), Q / K / V are NOT quantized (``scale_q`` / ``scale_k`` /
+    ``scale_v`` are ignored and may be None: the attention runs on the bf16 slab), the SDPA writes bf16 O, the gate kernel bf16
+    O_gated, and the gated O alone is quantized at ``scale_o`` for the dequantized out projection -- the unfused chain's roundings with
+    the two Q / K / V quantization points removed.  ``return_rows=True`` (appended) returns :class:`Fp8RefOutputs` (the bf16 K / V
+    rows the paged forms' pools hold, the pre-gate O, the gate, the gated O and its e4m3 codes) instead of the bare ``out``.
 
     ``fused=False`` mirrors the UNFUSED FP8 pipeline: the projection epilogue
     rounds ``alpha * acc`` to bf16 (the slab), the SDPA writes bf16 O, the gate
@@ -631,9 +654,15 @@ def gated_attention_block_fp8_reference(
     v = proj[:, o_v : o_v + hkv * d].reshape(b, s, hkv, d)
     qn, _ = qk_norm_rope_reference(q, inp["w_q_norm"], inp["cos"], inp["sin"], r, geom.qk_norm_eps, qk_norm=geom.qk_norm)
     kn, _ = qk_norm_rope_reference(k, inp["w_k_norm"], inp["cos"], inp["sin"], r, geom.qk_norm_eps, qk_norm=geom.qk_norm)
-    q32 = dequant_e4m3(quant_e4m3(qn, scale_q), 1.0 / scale_q)
-    k32 = dequant_e4m3(quant_e4m3(kn, scale_k), 1.0 / scale_k)
-    v32 = dequant_e4m3(quant_e4m3(v, scale_v), 1.0 / scale_v)
+    if attention_bf16:
+        if fused:
+            raise ValueError("attention_bf16=True mirrors the unfused chain (the mode refuses fuse_norm_rope); fused=True has no meaning there")
+        # the bf16-attention mode: no Q / K / V quantization point -- the bf16 slab values as the kernels read them
+        q32, k32, v32 = qn.float(), kn.float(), v.float()
+    else:
+        q32 = dequant_e4m3(quant_e4m3(qn, scale_q), 1.0 / scale_q)
+        k32 = dequant_e4m3(quant_e4m3(kn, scale_k), 1.0 / scale_k)
+        v32 = dequant_e4m3(quant_e4m3(v, scale_v), 1.0 / scale_v)
     # fp32 SDPA with GQA broadcast on the dequantized fp8 operands
     rep = hq // hkv
     qb = q32.transpose(1, 2)  # [b, hq, s, d]
@@ -656,9 +685,15 @@ def gated_attention_block_fp8_reference(
     else:
         o = o.to(torch.bfloat16)  # the SDPA writes bf16 O
         og = (o.float() * torch.sigmoid(gate.float())).to(torch.bfloat16)  # the gate kernel writes bf16 O_gated
-    og32 = dequant_e4m3(quant_e4m3(og, scale_o), 1.0 / scale_o).reshape(t, hq * d)  # o was transposed: reshape copies
+    o8 = quant_e4m3(og, scale_o)
+    og32 = dequant_e4m3(o8, 1.0 / scale_o).reshape(t, hq * d)  # o was transposed: reshape copies
     wo32 = dequant_e4m3(inp["w_o"], descale_w_o)
-    return (og32 @ wo32.t()).to(torch.bfloat16).view(b, s, dm)
+    out = (og32 @ wo32.t()).to(torch.bfloat16).view(b, s, dm)
+    if not return_rows:
+        return out
+    return Fp8RefOutputs(
+        out=out, k=kn.to(torch.bfloat16), v=v.to(torch.bfloat16), o=o.to(torch.bfloat16), gate=gate.to(torch.bfloat16), o_gated=og.to(torch.bfloat16), o8=o8
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -447,7 +447,10 @@ class SM120FusedMultiHeadAttentionForward:
         chunks = self.v_tma_swizzle_chunks if is_v else self.k_tma_swizzle_chunks
         chunk_elems = self.v_swizzle_chunk_elems if is_v else self.k_swizzle_chunk_elems
         sf_bytes = sf_copies * sf_copy_bytes
-        if prims.elect_sync():
+        # One complete warp owns this pipeline. Keep the same producer for
+        # successive K/V loads: a fresh election can run before the preceding
+        # producer reconverges on older PTX assemblers. CTA barriers gate reuse.
+        if cute.arch.lane_idx() == 0:
             if cutlass.const_expr(envelope):
                 # Every copy completes with its full box (OOB regions arrive as
                 # zeros but still count), so the expected transaction total is

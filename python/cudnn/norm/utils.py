@@ -6,10 +6,12 @@
 Mirrors the role of ``cudnn.sdpa.utils``: DLPack -> cute.Tensor conversion and a
 couple of small launch-side helpers. The heavy device-side primitives (cp.async
 staging, block reductions) live in each pass's ``kernels/_common_sm100.py`` and
-build on ``cudnn.frost.tile_dsl`` + ``cutlass.primitives``.
+build on ``cudnn.frost.tile_dsl`` + ``cutlass.experimental.primitives``.
 """
 
 from __future__ import annotations
+
+from contextlib import nullcontext
 
 from cutlass.cute.runtime import from_dlpack
 
@@ -27,6 +29,22 @@ def dyn(t):
     if t.requires_grad:
         t = t.detach()
     return from_dlpack(t, assumed_align=16).mark_layout_dynamic()
+
+
+def ffi(t):
+    """A torch tensor as a tvm-ffi launch argument: the tensor itself, detached when it is on an autograd tape (the same
+    export rule as :func:`dyn`). The tvm-ffi entry binds torch tensors natively, without a per-call DLPack round trip."""
+    return t.detach() if t.requires_grad else t
+
+
+def fake_rows(dtype, *cols, rows=None, align=16):
+    """A compile-time placeholder for a row-major ``[rows, *cols]`` operand whose row count is DYNAMIC (one compiled
+    artifact serves every R); ``rows`` is the shared ``cute.sym_int`` (pass the same symbol to every row-indexed
+    operand), ``dtype`` a cutlass element type. ``cols=()`` is a ``[rows]`` vector."""
+    import cutlass.cute as cute
+
+    shape = (rows,) + tuple(cols)
+    return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=tuple(range(len(shape) - 1, -1, -1)), assumed_align=align)
 
 
 def sm_count():
@@ -110,6 +128,30 @@ def smem_budget(preferred_bytes):
     return min(int(preferred_bytes), smem_capacity())
 
 
+def coop_launch_too_large(exc):
+    """Whether ``exc`` is a cooperative launch whose grid cannot co-reside. The driver spells
+    it CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE, the runtime cudaErrorCooperativeLaunchTooLarge,
+    and the DSL can surface either."""
+    return "COOPERATIVELAUNCHTOOLARGE" in str(exc).upper().replace("_", "")
+
+
+_HAS_TMEM = {}
+
+
+def has_tmem():
+    """Whether the current device has tensor memory (``tcgen05``): the SM10x/SM11x
+    parts. On SM90 the TMEM cache tiers are disabled and the smem tiers serve.
+
+    Cached per device ordinal: the kernels launch on the current device, and a
+    process can hold an SM100 and an SM90 part."""
+    import torch
+
+    device = torch.cuda.current_device()
+    if device not in _HAS_TMEM:
+        _HAS_TMEM[device] = torch.cuda.get_device_capability(device)[0] in (10, 11)
+    return _HAS_TMEM[device]
+
+
 _SMEM_PER_SM = None
 
 
@@ -161,6 +203,10 @@ def on_stream(raw):
     if raw is None:
         return torch.cuda.stream(None)  # no stream requested: leave the current one alone
     handle = int(raw)
+    from cudnn._torch_stream import _raw_current_stream
+
+    if handle == _raw_current_stream(torch, torch.cuda.current_device()):
+        return nullcontext()  # the requested stream is already current (the usual call): entering it again is pure cost
     if handle == 0:
         return torch.cuda.stream(torch.cuda.default_stream())  # explicitly the default stream
     s = _EXT_STREAMS.get(handle)
@@ -192,7 +238,11 @@ def cur_stream():
     """
     import torch
 
-    h = torch.cuda.current_stream().cuda_stream
+    from cudnn._torch_stream import _raw_current_stream
+
+    h = _raw_current_stream(torch, torch.cuda.current_device())  # ~0.3 us; current_stream() builds a Stream (~6 us)
+    if h is None:
+        h = torch.cuda.current_stream().cuda_stream
     s = _CU_STREAMS.get(h)
     if s is None:
         from cuda.bindings import driver as _drv

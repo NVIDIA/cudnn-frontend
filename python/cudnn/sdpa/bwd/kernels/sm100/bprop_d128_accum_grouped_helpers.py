@@ -16,10 +16,28 @@ from ...config_sm100_d128_accum import CFG
 
 
 @cute.jit
-def host_dense(q, k, v, o, do, lse, dq, dk, dv, dq_accum, delta, dk_part, dv_part, scale, causal: cutlass.Constexpr[bool], stream):
+def host_dense(
+    q,
+    k,
+    v,
+    o,
+    do,
+    lse,
+    dq,
+    dk,
+    dv,
+    dq_accum,
+    delta,
+    dk_part,
+    dv_part,
+    scale,
+    causal: cutlass.Constexpr[bool],
+    stream,
+    diag_delete_dq_reduce_add: cutlass.Constexpr[bool] = False,
+):
     """Four native launches; uniquely owned partials are folded in FP32."""
     delta_zero_host(o, do, delta, dq_accum, stream)
-    main_dense_host(q, k, v, do, lse, delta, dq_accum, dk_part, dv_part, scale, causal, stream)
+    main_dense_host(q, k, v, do, lse, delta, dq_accum, dk_part, dv_part, scale, causal, stream, diag_delete_dq_reduce_add)
     cast_dq_host(dq_accum, dq, q.element_type, stream)
     dkv_reduce_host(dk_part, dv_part, dk, dv, CFG.D, CFG.D, q.shape[2] // k.shape[2], q.element_type, False, stream)
 
@@ -53,23 +71,36 @@ def host_thd(
     scale,
     causal: cutlass.Constexpr[bool],
     stream,
+    diag_delete_dq_reduce_add: cutlass.Constexpr[bool] = False,
+    dkv_fp32: cutlass.Constexpr[bool] = False,
+    dk_acc=None,
+    dv_acc=None,
 ):
-    """Five native launches, with compact partials and independent final origins."""
+    """Five native launches, with compact partials and independent final origins; FOUR under ``dkv_fp32`` (dkv_accum = fp32_reduce): the
+    per-KV-head fp32 dK / dV accumulators ``dk_acc`` / ``dv_acc`` take the MAP_DK / MAP_DV slots as fp32 [M x DQ_BOX]-box maps (compact KV
+    origins, the sequence-local clip), delta_zero zero-fills them over the kv rows, the main kernel reduce-adds every owner's fp32 tile,
+    cast_dq converts them once to the IO dtype at each output's own origin, and the fold is not launched."""
+    if cutlass.const_expr(dkv_fp32):
+        dk_map, dv_map = _tensor_map(dk_acc, CFG.DQ_BOX), _tensor_map(dv_acc, CFG.DQ_BOX)
+        dk_ws, dv_ws = dk_acc, dv_acc
+    else:
+        dk_map, dv_map = _tensor_map(dk_part, CFG.HEAD_BOX), _tensor_map(dv_part, CFG.HEAD_BOX)
+        dk_ws, dv_ws = dk_part, dv_part
     setup_thd_d128_kernel(
         _tensor_map(q, CFG.HEAD_BOX),
         _tensor_map(k, CFG.HEAD_BOX),
         _tensor_map(v, CFG.HEAD_BOX),
         _tensor_map(do, CFG.HEAD_BOX),
         _tensor_map(dq_accum, CFG.DQ_BOX),
-        _tensor_map(dk_part, CFG.HEAD_BOX),
-        _tensor_map(dv_part, CFG.HEAD_BOX),
+        dk_map,
+        dv_map,
         q,
         k,
         v,
         do,
         dq_accum,
-        dk_part,
-        dv_part,
+        dk_ws,
+        dv_ws,
         meta,
         origins,
         maps,
@@ -82,9 +113,17 @@ def host_thd(
         partial_dkv=True,
     ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
     q_grid = cute.math.max((max_sq + ROWS_PER_CTA - 1) // ROWS_PER_CTA, cutlass.Int32(1))
-    delta_zero_thd_d128_kernel(o, do, delta, dq_accum, meta, origins, cutlass.Int32(batch), origin_specs).launch(
-        grid=(q_grid, batch, q.shape[2]), block=(THREADS, 1, 1), stream=stream
-    )
+    if cutlass.const_expr(dkv_fp32):
+        # the row extent covers the q rows (Delta, dQ zero) AND the kv rows (the fp32 dK / dV zero fill / convert); z = Hq, kv heads = the first Hkv
+        kv_grid = cute.math.max((max_skv + ROWS_PER_CTA - 1) // ROWS_PER_CTA, cutlass.Int32(1))
+        rows_grid = cute.math.max(q_grid, kv_grid)
+        delta_zero_thd_d128_kernel(o, do, delta, dq_accum, meta, origins, cutlass.Int32(batch), origin_specs, dk_acc, dv_acc).launch(
+            grid=(rows_grid, batch, q.shape[2]), block=(THREADS, 1, 1), stream=stream
+        )
+    else:
+        delta_zero_thd_d128_kernel(o, do, delta, dq_accum, meta, origins, cutlass.Int32(batch), origin_specs).launch(
+            grid=(q_grid, batch, q.shape[2]), block=(THREADS, 1, 1), stream=stream
+        )
     main_thd_host(
         maps,
         lse,
@@ -100,23 +139,42 @@ def host_thd(
         q.element_type,
         q.shape[2] // k.shape[2],
         stream,
+        diag_delete_dq_reduce_add,
+        dkv_fp32,
     )
-    cast_dq_thd_d128_kernel(dq_accum, dq, meta, origins, cutlass.Int32(batch), _origin_row(origin_specs, 5), q.element_type).launch(
-        grid=(q_grid, batch, q.shape[2]), block=(THREADS, 1, 1), stream=stream
-    )
-    dkv_reduce_thd_origins_host(
-        dk_part,
-        dv_part,
-        dk,
-        dv,
-        meta,
-        origins,
-        cutlass.Int32(batch),
-        max_skv,
-        _origin_row(origin_specs, 6),
-        _origin_row(origin_specs, 7),
-        CFG.D,
-        q.shape[2] // k.shape[2],
-        q.element_type,
-        stream,
-    )
+    if cutlass.const_expr(dkv_fp32):
+        cast_dq_thd_d128_kernel(
+            dq_accum,
+            dq,
+            meta,
+            origins,
+            cutlass.Int32(batch),
+            _origin_row(origin_specs, 5),
+            q.element_type,
+            dk_acc,
+            dv_acc,
+            dk,
+            dv,
+            _origin_row(origin_specs, 6),
+            _origin_row(origin_specs, 7),
+        ).launch(grid=(rows_grid, batch, q.shape[2]), block=(THREADS, 1, 1), stream=stream)
+    else:
+        cast_dq_thd_d128_kernel(dq_accum, dq, meta, origins, cutlass.Int32(batch), _origin_row(origin_specs, 5), q.element_type).launch(
+            grid=(q_grid, batch, q.shape[2]), block=(THREADS, 1, 1), stream=stream
+        )
+        dkv_reduce_thd_origins_host(
+            dk_part,
+            dv_part,
+            dk,
+            dv,
+            meta,
+            origins,
+            cutlass.Int32(batch),
+            max_skv,
+            _origin_row(origin_specs, 6),
+            _origin_row(origin_specs, 7),
+            CFG.D,
+            q.shape[2] // k.shape[2],
+            q.element_type,
+            stream,
+        )

@@ -66,6 +66,8 @@ import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.typing import Float32, Int32, AddressSpace
+from cutlass._mlir.dialects import nvvm
+from cutlass.cutlass_dsl import dsl_user_op
 from ..moe_persistent_scheduler import (
     MoEPersistentTileScheduler,
     MoESchedulerParams,
@@ -97,6 +99,18 @@ from .moe_kernel_helpers import (
     compute_grid,
     can_implement,
 )
+
+
+@dsl_user_op
+def _partial_cta_sync(barrier, *, loc=None, ip=None):
+    """Synchronize participating warps without an aligned-CTA promise."""
+    nvvm.barrier_cta_sync(
+        Int32(barrier.barrier_id).ir_value(loc=loc, ip=ip),
+        thread_count=Int32(barrier.num_threads).ir_value(loc=loc, ip=ip),
+        aligned=False,
+        loc=loc,
+        ip=ip,
+    )
 
 
 class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
@@ -263,6 +277,10 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         self.epilog_sync_barrier_group1 = pipeline.NamedBarrier(
             barrier_id=6,
             num_threads=32 * self.epilogue_warp_group_size,
+        )
+        self.epilog_tile_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=7,
+            num_threads=32 * len(self.epilog_warp_id),
         )
 
         self.num_smem_capacity = get_smem_capacity_in_bytes("sm_100")
@@ -642,15 +660,10 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         self.d_quant = self.d_dtype == cutlass.Float4E2M1FN
         self.rht_dtype = rht.element_type if cutlass.const_expr(self.generate_rht) else self.d_dtype
         self.rht_quant = self.generate_rht and self.rht_dtype == cutlass.Float4E2M1FN
-        # The rht STORE has no orientation logic anywhere in this kernel; only the
-        # SCALE tensor is orientation-aware below: rowwise uses swizzled SF for
-        # logical (m, f), while colwise uses swizzled SF for logical (f, m).
-        # RHT warps run for the RHT output and/or the D quantization (both read sD).
-        # When neither is on (plain bf16 mode) the warpgroup is COMPILED OUT: no
-        # pingpong, no ACT<->RHT barriers, and the tile-info pipeline's consumer
-        # count shrinks by the 4 RHT warps (forget that and the scheduler deadlocks
-        # after num_tile_stage tiles).
+        # Recompute the consumer count when a cached kernel changes output modes.
+        # RHT warps run for either RHT output or D quantization.
         self.run_rht = self.generate_rht or self.d_quant
+        self.threads_wo_sched = self.threads_per_cta - self.threads_per_warp
         if cutlass.const_expr(not self.run_rht):
             self.threads_wo_sched = self.threads_per_cta - self.threads_per_warp - self.threads_per_warp * len(self.epilog_rht_store_warp_id)
         if cutlass.const_expr(self.d_dtype not in (cutlass.BFloat16, cutlass.Float4E2M1FN)):
@@ -1081,14 +1094,14 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         tRS_rC.store(tTR_rAcc_up.load().to(self.c_dtype))
         cute.copy(tiled_copy_r2s, tRS_rC[(None, None, 0)], tRS_sC[(None, None, 1, c_buffer)])
         cute.arch.fence_proxy("async.shared", space="cta")
-        self.epilog_sync_barrier_group0.arrive_and_wait()
+        _partial_cta_sync(self.epilog_sync_barrier_group0)
         if warp_idx == self.epilog_act_warp_id[0]:
             cute.copy(tma_atom_c, bSG_sC[(None, c_buffer)], bSG_gC[(None, real_subtile_idx)])
             c_pipeline.producer_commit()
             if not cutlass.const_expr(self.delay_tma_store_acquire_sync):
                 c_pipeline.producer_acquire()
         if not cutlass.const_expr(self.delay_tma_store_acquire_sync):
-            self.epilog_sync_barrier_group0.arrive_and_wait()
+            _partial_cta_sync(self.epilog_sync_barrier_group0)
 
     @cute.jit
     def store_c_unary(
@@ -1109,14 +1122,14 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         tRS_rC.store(tTR_rAcc.load().to(self.c_dtype))
         cute.copy(tiled_copy_r2s, tRS_rC[(None, None, 0)], tRS_sC[(None, None, 0, c_buffer)])
         cute.arch.fence_proxy("async.shared", space="cta")
-        self.epilog_sync_barrier_group0.arrive_and_wait()
+        _partial_cta_sync(self.epilog_sync_barrier_group0)
         if warp_idx == self.epilog_act_warp_id[0]:
             cute.copy(tma_atom_c, bSG_sC[(None, c_buffer)], bSG_gC[(None, real_subtile_idx)])
             c_pipeline.producer_commit()
             if not cutlass.const_expr(self.delay_tma_store_acquire_sync):
                 c_pipeline.producer_acquire()
         if not cutlass.const_expr(self.delay_tma_store_acquire_sync):
-            self.epilog_sync_barrier_group0.arrive_and_wait()
+            _partial_cta_sync(self.epilog_sync_barrier_group0)
 
     @cute.jit
     def geglu_act(self, tCompute, acc_vec_up, acc_vec_gate, mProb, linear_offset=1.0):
@@ -1637,7 +1650,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                     sInfo[(2, tile_info_producer_state.index)] = work_tile_info.tile_n_idx
                     sInfo[(3, tile_info_producer_state.index)] = work_tile_info.k_tile_cnt
                 cute.arch.fence_proxy("async.shared", space="cta")
-                self.sched_sync_barrier.arrive_and_wait()
+                _partial_cta_sync(self.sched_sync_barrier)
                 tile_info_pipeline.producer_commit(tile_info_producer_state)
                 tile_info_producer_state.advance()
                 work_tile_info = scheduler.advance_to_next_work()
@@ -1650,7 +1663,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                 sInfo[(2, tile_info_producer_state.index)] = cutlass.Int32(0)
                 sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(0)
             cute.arch.fence_proxy("async.shared", space="cta")
-            self.sched_sync_barrier.arrive_and_wait()
+            _partial_cta_sync(self.sched_sync_barrier)
             tile_info_pipeline.producer_commit(tile_info_producer_state)
             tile_info_producer_state.advance()
             tile_info_pipeline.producer_tail(tile_info_producer_state)
@@ -1793,7 +1806,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         # Specialized MMA warp
         # ---------------------------------------------------------------
         if warp_idx == self.mma_warp_id:
-            tmem.wait_for_alloc()
+            _partial_cta_sync(self.tmem_alloc_barrier)
             acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             tCtAcc_base = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
 
@@ -1999,7 +2012,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
             #
             # Bar sync for retrieve tensor memory ptr from shared memory
             #
-            tmem.wait_for_alloc()
+            _partial_cta_sync(self.tmem_alloc_barrier)
 
             #
             # Retrieving tensor memory ptr and make accumulator tensor
@@ -2355,7 +2368,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                         tRS_sD[(None, None, None, d_buffer)],
                     )
                     cute.arch.fence_proxy("async.shared", space="cta")
-                    self.epilog_sync_barrier_group0.arrive_and_wait()
+                    _partial_cta_sync(self.epilog_sync_barrier_group0)
                     if cutlass.const_expr(not self.d_quant):
                         if warp_idx == self.epilog_act_warp_id[0]:
                             cute.copy(
@@ -2383,16 +2396,14 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                             if cutlass.const_expr(not self.d_quant):
                                 d_pipeline.producer_acquire()
                             c_pipeline.producer_acquire()
-                        self.epilog_sync_barrier_group0.arrive_and_wait()
+                        _partial_cta_sync(self.epilog_sync_barrier_group0)
 
                     if cutlass.const_expr(self.run_rht):
-                        self.epilog_sync_barrier.arrive_and_wait()
+                        _partial_cta_sync(self.epilog_sync_barrier)
 
-                #
-                # Full epilogue barrier (ACT + RHT must both arrive)
-                #
+                # Keep tile completion separate from RHT's nonblocking subtile arrival.
                 if cutlass.const_expr(self.run_rht):
-                    self.epilog_sync_barrier.arrive_and_wait()
+                    _partial_cta_sync(self.epilog_tile_sync_barrier)
 
                 #
                 # Async arrive accumulator buffer empty
@@ -2417,7 +2428,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
             # Dealloc the tensor memory buffer
             #
             tmem.relinquish_alloc_permit()
-            self.epilog_sync_barrier_group0.arrive_and_wait()
+            _partial_cta_sync(self.epilog_sync_barrier_group0)
             tmem.free(tmem_ptr)
             #
             # Wait for C store / pingpong complete
@@ -2563,11 +2574,8 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                             if rht_reverse:
                                 real_subtile_idx = self.cta_tile_shape_mnk[1] // self.epi_tile_n_required - 1 - real_subtile_idx
                         #
-                        # Load this subtile's sD values to registers, then ARRIVE the
-                        # lockstep barrier immediately: the ACT warps' arrive_and_wait
-                        # releases, and their next subtile overlaps ALL the FWHT/quant
-                        # compute and stores below. The RHT side never waits on this
-                        # barrier (the pingpong gates it).
+                        # Read sD before releasing ACT to overwrite it. Only RHT
+                        # warps arrive here; pingpong gates their next subtile.
                         #
                         if cutlass.const_expr(self.generate_rht):
                             if cutlass.const_expr(self.rht_rowwise):
@@ -2576,7 +2584,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                                 rht_ld = load_colwise_pairs_bf16(sD, d_buffer, epi_tidx)
                         if cutlass.const_expr(self.d_quant):
                             dq_ld = load_row_bf16(sD, d_buffer, epi_tidx)
-                        self.epilog_sync_barrier.arrive()
+                        self.epilog_sync_barrier.arrive_unaligned()
                         # RHT output: write the transform (x0.25) to sRht. rht_rowwise
                         # picks the transform axis (16-feature blocks per token vs
                         # 16-token blocks per feature); NVFP4 quantization is inferred
@@ -2618,7 +2626,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                         # store, including the overlapping_accum subtile-column reversal).
                         #
                         cute.arch.fence_proxy("async.shared", space="cta")
-                        self.epilog_sync_barrier_group1.arrive_and_wait()
+                        _partial_cta_sync(self.epilog_sync_barrier_group1)
                         if warp_idx == self.epilog_rht_store_warp_id[0]:
                             if cutlass.const_expr(self.generate_rht and not self.rht_per_expert):
                                 cute.copy(
@@ -2636,7 +2644,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                                 )
                                 dq_pipeline.producer_commit()
                                 dq_pipeline.producer_acquire()
-                        self.epilog_sync_barrier_group1.arrive_and_wait()
+                        _partial_cta_sync(self.epilog_sync_barrier_group1)
 
                     #
                     # Release pingpong consumer slot
@@ -2644,18 +2652,8 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                     pingpong_pipeline.consumer_release(pingpong_rht_consumer_state)
                     pingpong_rht_consumer_state.advance()
                     num_prev_d_subtiles = num_prev_d_subtiles + 1
-                    # Lockstep barrier: under run_rht the 128 RHT arrivals already
-                    # happened right after the sD reads (arrive() above); only the
-                    # idle-RHT plain mode still pairs arrive_and_wait here.
-                    if cutlass.const_expr(not self.run_rht):
-                        self.epilog_sync_barrier.arrive_and_wait()
 
-                #
-                # NVFP4: one contiguous 8-byte scale-row store per thread per tile.
-                # Rowwise: the thread wrote all its own smem slots (no barrier needed).
-                # Colwise: rows were filled ACROSS warps — the loop-end epilog_sync
-                # barrier above already ordered those writes.
-                #
+                # Colwise scale rows are ordered by the RHT group barrier above.
                 _num_sf = self.cta_tile_shape_mnk_d[1] // HADAMARD_SIZE
                 if cutlass.const_expr(self.rht_quant and self.rht_rowwise):
                     self.store_swizzled_sf_row(
@@ -2687,10 +2685,8 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                         epi_tidx,
                     )
 
-                #
-                # Full epilogue barrier (ACT + RHT must both arrive)
-                #
-                self.epilog_sync_barrier.arrive_and_wait()
+                # RHT can finish before ACT resets the last subtile barrier.
+                _partial_cta_sync(self.epilog_tile_sync_barrier)
 
                 #
                 # Toggle the subtile-column reversal for the next tile.

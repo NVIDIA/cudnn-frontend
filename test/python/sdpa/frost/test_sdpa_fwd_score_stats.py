@@ -146,9 +146,10 @@ def test_capabilities_field_is_appended():
     from cudnn.sdpa.fwd.engines import Capabilities
 
     names = [f.name for f in fields(Capabilities)]
+    names = names[: names.index("thd_excluded_d_shapes") + 1]  # Preserve this historical segment.
     # ... the zero-scale and pre-folded-scale fields after it, then the resident-bias / kv_mask fields of the Rubin small tiles
-    # and their per-shape TILE_N domain after THOSE, then the PackGQA divisibility rule.
-    assert names[-11:] == [
+    # and their per-shape TILE_N domain after THOSE, then the PackGQA divisibility rule and per-shape THD exclusions.
+    assert names[-12:] == [
         "thd_pack_gqa_d_shapes",
         "zero_scale",
         "attn_scale_prefolded_d_shapes",
@@ -160,6 +161,7 @@ def test_capabilities_field_is_appended():
         "kv_mask_dtypes",
         "tile_ns_by_d_shape",
         "pack_gqa_requires_divisible",
+        "thd_excluded_d_shapes",
     ], names[-12:]
     assert Capabilities.__dataclass_fields__["score_stats_d_shapes"].default is None
     assert Capabilities.__dataclass_fields__["dense_only_d_shapes"].default == frozenset()

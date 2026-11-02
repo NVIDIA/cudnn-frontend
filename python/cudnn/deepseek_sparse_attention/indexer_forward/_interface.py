@@ -32,8 +32,10 @@ from cudnn.deepseek_sparse_attention.score_recompute._block_scaled import (
 )
 from .indexer_fwd_sm100 import IndexerForwardSm100
 from ._support import (
+    check_paged_args as _check_paged_args,
     check_q_covered_by_k as _check_q_covered_by_k,
     resolve_m_block_size as _resolve_m_block_size,
+    resolve_paged_k as _resolve_paged_k,
     validate_qhead_per_kv_head as _validate_indexer_qhead_per_kv_head,
 )
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
@@ -128,6 +130,8 @@ def indexer_fwd(
     return_softmax: Optional[bool] = None,
     softmax_out: Optional[torch.Tensor] = None,
     deterministic: bool = False,
+    block_table: Optional[torch.Tensor] = None,
+    kv_lens: Optional[torch.Tensor] = None,
     current_stream=None,
 ):
     """
@@ -181,6 +185,16 @@ def indexer_fwd(
         sf_vec_size: scale vector size for MXFP8 and MXFP4, currently must be 32.
         q_causal_offsets: optional int32 CUDA tensor of shape ``(batch,)``.
             Each entry is the global uncompressed token index for local q[0].
+        block_table: optional int32 ``(batch, max_pages)`` CUDA tensor. When
+            given, ``k`` is a page pool ``(num_pages, page_size, n_heads_kv,
+            head_dim)`` or ``(num_pages, page_size, head_dim)`` (``page_size``
+            a multiple of 8 that divides 128 or is a multiple of it): batch
+            ``b`` reads its ``i``-th page at pool row ``block_table[b, i]``.
+            ``cu_seqlens_k`` must be ``None``; ``max_seqlen_k`` defaults to
+            ``max_pages * page_size``. BF16 only, local key ids only.
+        kv_lens: int32 ``(batch,)`` CUDA tensor of visible compressed keys per
+            sequence; required with ``block_table``. Keys at or past
+            ``max_seqlen_k`` are never scored.
 
     Returns:
         S_sum: BSHD ``(bs, seqlen_q, seqlen_k)`` or THD
@@ -188,6 +202,11 @@ def indexer_fwd(
     """
     current_stream = resolve_stream(current_stream)
     precision = validate_indexer_precision(precision)
+    paged = _check_paged_args(block_table, kv_lens)
+    if paged and k.ndim == 3:
+        k = k.unsqueeze(2)  # a single-head key cache may omit the head axis
+    if paged and max_seqlen_k is None and k.ndim == 4 and block_table.ndim == 2:
+        max_seqlen_k = int(block_table.shape[1]) * int(k.shape[1])
     if precision == "bf16" and w.dtype == torch.float32 and w.stride(-1) != 1:
         raise NotImplementedError(f"FP32 w requires unit last stride, got strides {w.stride()}")
     validate_sf_vec_size(precision, sf_vec_size)
@@ -219,7 +238,7 @@ def indexer_fwd(
             q_scale = _maybe_contiguous(q_scale, current_stream)
             k_scale = _maybe_contiguous(k_scale, current_stream)
             if cu_seqlens_q is not None or cu_seqlens_k is not None:
-                if cu_seqlens_q is None or cu_seqlens_k is None:
+                if cu_seqlens_q is None or (cu_seqlens_k is None and not paged):
                     raise ValueError("THD compressed-logits top-k requires both cu_seqlens_q and cu_seqlens_k")
                 return _indexer_fwd_compress_topk_thd(
                     q,
@@ -253,6 +272,8 @@ def indexer_fwd(
                     return_lse=return_lse,
                     lse_out=lse_out,
                     deterministic=deterministic,
+                    block_table=block_table,
+                    kv_lens=kv_lens,
                 )
             else:
                 if cand_batch_offsets is not None:
@@ -282,6 +303,9 @@ def indexer_fwd(
                     softmax_out=softmax_out,
                     q_causal_offsets=q_causal_offsets,
                     deterministic=deterministic,
+                    block_table=block_table,
+                    kv_lens=kv_lens,
+                    max_seqlen_k=max_seqlen_k,
                 )
 
     # Dense convenience layer (torch-op semantics; ``IndexerForward`` binds
@@ -289,7 +313,7 @@ def indexer_fwd(
     q, k, w = [_maybe_contiguous(t, current_stream) for t in (q, k, w)]
     q_scale = _maybe_contiguous(q_scale, current_stream)
     k_scale = _maybe_contiguous(k_scale, current_stream)
-    out_shape, seqlen_k_dim = _dense_out_shape(q, k, cu_seqlens_q, max_seqlen_k)
+    out_shape, seqlen_k_dim = _dense_out_shape(q, k, cu_seqlens_q, max_seqlen_k, paged=paged)
     out_orig = out
     if out is not None:
         if out.dtype != torch.float32 or not out.is_cuda or out.device != q.device:
@@ -328,6 +352,8 @@ def indexer_fwd(
         cu_seqlens_q_scale_padded=cu_seqlens_q_scale_padded,
         cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
         sf_vec_size=sf_vec_size,
+        block_table=block_table,
+        kv_lens=kv_lens,
         current_stream=current_stream,
     )
     return _finish_dense_out(out, out_orig, need_pad=need_pad, current_stream=current_stream)
@@ -338,6 +364,7 @@ def _dense_out_shape(
     k: torch.Tensor,
     cu_seqlens_q: Optional[torch.Tensor],
     max_seqlen_k: Optional[int],
+    paged: bool = False,
 ) -> tuple[tuple[int, ...], int]:
     if cu_seqlens_q is not None:
         if max_seqlen_k is None:
@@ -345,6 +372,10 @@ def _dense_out_shape(
         return (int(q.shape[0]), int(max_seqlen_k)), int(max_seqlen_k)
     if q.ndim != 4 or k.ndim != 4:
         raise ValueError(f"BSHD q/k must be 4D, got q {tuple(q.shape)} k {tuple(k.shape)}")
+    if paged:
+        if max_seqlen_k is None:
+            raise ValueError("paged K requires max_seqlen_k")
+        return (int(q.shape[0]), int(q.shape[1]), int(max_seqlen_k)), int(max_seqlen_k)
     return (int(q.shape[0]), int(q.shape[1]), int(k.shape[1])), int(k.shape[1])
 
 
@@ -390,14 +421,22 @@ def _indexer_fwd_bound(
     cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
     sf_vec_size: int = 32,
+    block_table: Optional[torch.Tensor] = None,
+    kv_lens: Optional[torch.Tensor] = None,
     current_stream=None,
 ) -> torch.Tensor:
     """Strict dense entry (what ``IndexerForward.execute`` calls): binds a validated padded-stride ``out``
-    directly; never allocates, never copies, raises on strided inputs or an unbindable ``out``."""
+    directly; never allocates, never copies, raises on strided inputs or an unbindable ``out``.
+
+    ``block_table`` + ``kv_lens`` switch ``k`` to a page pool (see ``indexer_fwd``); ``max_seqlen_k`` is then
+    the ``out`` column count and must be given."""
     current_stream = resolve_stream(current_stream)
     precision = validate_indexer_precision(precision)
     if ratio <= 0:
         raise ValueError(f"ratio must be > 0, got {ratio}")
+    paged = _check_paged_args(block_table, kv_lens)
+    if paged and precision != "bf16":
+        raise NotImplementedError("paged K is served by the BF16 indexer only")
 
     if precision == "bf16":
         for tensor, name in ((q, "q"), (k, "k")):
@@ -419,22 +458,24 @@ def _indexer_fwd_bound(
 
     is_varlen_q = cu_seqlens_q is not None
     is_varlen_k = cu_seqlens_k is not None
-    assert is_varlen_q == is_varlen_k, "THD input requires both cu_seqlens_q and cu_seqlens_k"
+    assert paged or is_varlen_q == is_varlen_k, "THD input requires both cu_seqlens_q and cu_seqlens_k"
     is_varlen = is_varlen_q
     if is_varlen:
-        assert cu_seqlens_q is not None and cu_seqlens_k is not None, "THD input requires both cu_seqlens_q and cu_seqlens_k"
+        assert cu_seqlens_q is not None and (cu_seqlens_k is not None or paged), "THD input requires both cu_seqlens_q and cu_seqlens_k"
         for t, name in ((cu_seqlens_q, "cu_seqlens_q"), (cu_seqlens_k, "cu_seqlens_k")):
+            if t is None:
+                continue
             assert t.dtype == torch.int32, f"{name} must be int32"
             assert t.ndim == 1, f"{name} must be 1D"
             assert t.stride(0) == 1, f"{name} must be contiguous"
             assert t.is_cuda, f"{name} must be on CUDA device"
         assert q.ndim == 3, f"THD q must be 3D (total_q, n_heads_q, head_dim), got {q.ndim}D"
-        assert k.ndim == 3, f"THD k must be 3D (total_k, n_heads_kv, head_dim), got {k.ndim}D"
+        assert k.ndim == (4 if paged else 3), f"THD k must be 3D (total_k, n_heads_kv, head_dim) or a 4D page pool, got {k.ndim}D"
         assert w.ndim == 2, f"THD w must be 2D (total_q, n_heads_q), got {w.ndim}D"
         total_q, n_heads_q, head_dim = q.shape
-        total_k, n_heads_kv, head_dim_k = k.shape
+        n_heads_kv, head_dim_k = k.shape[-2], k.shape[-1]
         bs = cu_seqlens_q.shape[0] - 1
-        assert cu_seqlens_k.shape == (bs + 1,), "cu_seqlens_k must have shape (batch_size + 1,)"
+        assert cu_seqlens_k is None or cu_seqlens_k.shape == (bs + 1,), "cu_seqlens_k must have shape (batch_size + 1,)"
         assert cu_seqlens_q.shape == (bs + 1,), "cu_seqlens_q must have shape (batch_size + 1,)"
         if head_dim != head_dim_k:
             raise ValueError(f"q last dim ({head_dim}) != k last dim ({head_dim_k})")
@@ -447,13 +488,19 @@ def _indexer_fwd_bound(
         out_shape = (total_q, seqlen_k_dim)
     else:
         bs, seqlen_q_dim, n_heads_q, head_dim = q.shape
-        _, seqlen_k_dim, n_heads_kv, head_dim_k = k.shape
+        if paged:
+            if max_seqlen_k is None:
+                raise ValueError("paged K requires max_seqlen_k")
+            seqlen_k_dim, n_heads_kv, head_dim_k = int(max_seqlen_k), int(k.shape[2]), int(k.shape[3])
+        else:
+            _, seqlen_k_dim, n_heads_kv, head_dim_k = k.shape
         if head_dim != head_dim_k:
             raise ValueError(f"q last dim ({head_dim}) != k last dim ({head_dim_k})")
         device = q.device
         _check_q_covered_by_k(seqlen_q_dim, seqlen_k_dim, ratio)
         out_shape = (bs, seqlen_q_dim, seqlen_k_dim)
     head_dim = logical_head_dim(precision, head_dim)
+    page_size = _resolve_paged_k(k, block_table, kv_lens, cu_seqlens_k, n_block_size=n_block_size, batch=int(bs), device=device)[0] if paged else 0
 
     if n_heads_kv != 1:
         raise ValueError("SM100 indexer forward currently requires n_heads_kv=1 (MQA); " f"got n_heads_kv={n_heads_kv}")
@@ -635,6 +682,7 @@ def _indexer_fwd_bound(
         num_threads,
         is_varlen,
         q_causal_offsets is not None,
+        page_size,
     )
 
     if compile_key not in _compile_cache:
@@ -644,8 +692,10 @@ def _indexer_fwd_bound(
         out_cute = _to_cute_tensor(out)
         denom_cute = None  # compute_lse=False: dead slot, compiled out (R3)
         cu_q_cute = _to_cute_tensor(cu_seqlens_q, leading_dim=0) if is_varlen else None
-        cu_k_cute = _to_cute_tensor(cu_seqlens_k, leading_dim=0) if is_varlen else None
+        cu_k_cute = _to_cute_tensor(cu_seqlens_k, leading_dim=0) if is_varlen and not paged else None
         q_offsets_cute = _to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
+        bt_cute = _to_cute_tensor(block_table, assumed_align=4, leading_dim=1) if paged else None
+        kvl_cute = _to_cute_tensor(kv_lens, assumed_align=4, leading_dim=0) if paged else None
 
         kernel_obj = IndexerForwardSm100(
             head_dim=head_dim,
@@ -658,6 +708,7 @@ def _indexer_fwd_bound(
             is_varlen=is_varlen,
             compute_lse=False,
             is_compressed_logits=False,
+            page_size=page_size,
         )
 
         scale_arg = cutlass.Float32(sm_scale)
@@ -678,6 +729,9 @@ def _indexer_fwd_bound(
             cu_k_cute,
             q_offsets_cute,
             current_stream,
+            None,
+            bt_cute,
+            kvl_cute,
             options=compile_options(),
         )
 
@@ -698,8 +752,11 @@ def _indexer_fwd_bound(
             max_q_arg,
             max_k_arg,
             cu_seqlens_q if is_varlen else None,
-            cu_seqlens_k if is_varlen else None,
+            cu_seqlens_k if is_varlen and not paged else None,
             q_causal_offsets,
             current_stream,
+            None,
+            block_table,
+            kv_lens,
         )
     return out

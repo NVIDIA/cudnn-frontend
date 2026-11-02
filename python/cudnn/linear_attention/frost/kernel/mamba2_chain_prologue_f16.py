@@ -11,6 +11,7 @@ Phases (two blocks: both build the piece table, block 0 the work-item tables, bl
   descriptor arrays  : the per-piece TMA descriptor arrays of the prefill (its K, V, checkpoint arrays read by the
                        recompute kernel's summary and regenerate passes, all seven by the main forward pass) and of the
                        bprop (its summary and main passes)
+  exit tables        : the exit-slot table and the per-piece exit slot bases
 
 Warp assignments (descriptor phase, one warp per array; a launch builds the prefill's, the bprop's or both):
   warps 0-6     : prefill (Q, K, V, O, checkpoints, z, pre-gate O)
@@ -28,7 +29,7 @@ import cutlass.experimental.primitives as nvvm
 from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 
 from ..common.piece_chain import piece_table_body
-from ..common.gate_bwd import exit_slot_table_body
+from ..common.gate_bwd import exit_base_table_body, exit_slot_table_body
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, order_body
 from . import mamba2_bprop_f16, mamba2_prefill_f16
 
@@ -79,6 +80,7 @@ def frost_mamba2_chain_prologue(
     dk: Optional[cute.Tensor],
     dv: Optional[cute.Tensor],
     exit_slots: Optional[cute.Tensor],
+    exit_base: Optional[cute.Tensor],
 ) -> None:
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
@@ -106,9 +108,10 @@ def frost_mamba2_chain_prologue(
     nvvm.barrier_cta_sync()
     n_pieces = num_seqs * cutlass.Int32(pieces)
     if cutlass.const_expr(exit_slots is not None):
-        # ---- the gate backward's exit-slot table over the piece boundaries, by the descriptor CTA -------------
+        # ---- exit-slot table + exit slot bases ---------------------------------------
         if bidx == cutlass.Int32(1):
-            exit_slot_table_body(b_t, tidx, ORDER_THREADS, n_pieces, cu_pieces, exit_slots)
+            exit_slot_table_body(b_t, tidx, ORDER_THREADS, num_seqs, cu_seqlens, exit_slots)
+            exit_base_table_body(b_t, tidx, ORDER_THREADS, n_heads_out, n_pieces, cu_seqlens, cu_pieces, main_rows, exit_base)
 
     if bidx == cutlass.Int32(0):
         # ---- work-item tables --------------------------------------------------------
@@ -240,10 +243,11 @@ def chain_prologue(
     dk: Optional[cute.Tensor],
     dv: Optional[cute.Tensor],
     exit_slots: Optional[cute.Tensor],
+    exit_base: Optional[cute.Tensor],
     stream: cuda.CUstream,
 ) -> None:
     """One-launch chain prologue: the piece table, the LPT-ordered work-item tables, the per-piece TMA-descriptor
-    arrays of the prefill and the bprop, and in the backward the gate's exit-slot table."""
+    arrays of the prefill and the bprop, and in the backward the exit-slot table and the per-piece exit slot bases."""
     h_q = q.shape[1]
     h_k = k.shape[1]
     h_v = v.shape[1]
@@ -344,6 +348,7 @@ def chain_prologue(
         dk,
         dv,
         exit_slots,
+        exit_base,
     ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 

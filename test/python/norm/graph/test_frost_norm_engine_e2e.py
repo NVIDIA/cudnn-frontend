@@ -82,14 +82,31 @@ def _mkf(n):
     return _T(torch.empty(n, device="cuda", dtype=torch.float32))
 
 
-def _tol(dt, base):
-    return base if dt != torch.float32 else base * 5e-3
+def _close(actual, expected, label):
+    try:
+        torch.testing.assert_close(actual, expected, check_dtype=False)
+        ok = True
+    except AssertionError as exc:
+        print(f"{label}: {exc}")
+        ok = False
+    _expect(ok, label)
+
+
+def _specs_for_device():
+    """The forward and backward rows serving the current device, or None where no row does."""
+    cc = torch.cuda.get_device_capability()
+    fspec = next((s for s in fe.ENGINE_SPECS if cc in s.capabilities.archs), None)
+    bspec = next((s for s in be.ENGINE_SPECS if cc in s.capabilities.archs), None)
+    return (fspec, bspec) if fspec is not None and bspec is not None else None
 
 
 def main():
     assert torch.cuda.is_available(), "CUDA required"
-    fspec = fe.ENGINE_SPECS[0]
-    bspec = be.ENGINE_SPECS[0]
+    specs = _specs_for_device()
+    if specs is None:
+        print(f"no norm engine row for cc {torch.cuda.get_device_capability()}")
+        return
+    fspec, bspec = specs
 
     for dt in (torch.float16, torch.float32):
         print(f"\n=== dtype={dt} ===")
@@ -108,10 +125,15 @@ def main():
         _expect(fe.probe(fspec, g), "LAYERNORM: fprop probe True")
         fe.build(fspec, g)({xt: xt.buf, gt: gt.buf, bt: bt.buf, yt: yt.buf, mt: mt.buf, ivt: ivt.buf})
         ref = F.layer_norm(xt.buf.float(), (D,), gt.buf.float(), bt.buf.float(), 1e-5)
-        _expect((yt.buf.float() - ref).abs().max().item() <= _tol(dt, 6e-2), "LAYERNORM: Y matches torch")
+        _close(yt.buf, ref, "LAYERNORM: Y matches torch")
 
         # --- LayerNorm backward through the bprop engine (reuse mean/inv_var) ---
-        dyt = _T(torch.randn(N, D, device="cuda", dtype=dt))
+        xr = xt.buf.float().detach().requires_grad_(True)
+        gr = gt.buf.float().detach().requires_grad_(True)
+        br = bt.buf.float().detach().requires_grad_(True)
+        yref = F.layer_norm(xr, (D,), gr, br, 1e-5)
+        loss = F.mse_loss(yref, torch.randn_like(xt.buf).float(), reduction="mean")
+        dyt = _T(torch.autograd.grad(loss, yref, retain_graph=True)[0].to(dt))
         dxt = _T(torch.empty(N, D, device="cuda", dtype=dt))
         dst = _mkf(D)
         dbt = _mkf(D)
@@ -124,14 +146,9 @@ def main():
         _expect(be.probe(bspec, bg), "LAYERNORM_BWD: bprop probe True")
         _expect(fe.probe(fspec, bg) is False, "LAYERNORM_BWD: fprop probe False")
         be.build(bspec, bg)({dyt: dyt.buf, xt: xt.buf, gt: gt.buf, mtin: mtin.buf, ivtin: ivtin.buf, dxt: dxt.buf, dst: dst.buf, dbt: dbt.buf})
-        xr = xt.buf.float().detach().requires_grad_(True)
-        gr = gt.buf.float().detach().requires_grad_(True)
-        br = bt.buf.float().detach().requires_grad_(True)
-        yref = F.layer_norm(xr, (D,), gr, br, 1e-5)
         dxr, dgr, dbr = torch.autograd.grad(yref, [xr, gr, br], grad_outputs=dyt.buf.float())
-        tol = _tol(dt, 4e-2)
-        _expect((dxt.buf.float() - dxr).abs().max().item() <= tol * max(1, dxr.abs().max().item()), "LAYERNORM_BWD: DX matches")
-        _expect((dst.buf - dgr).abs().max().item() <= tol * max(1, dgr.abs().max().item()), "LAYERNORM_BWD: DScale matches")
+        _close(dxt.buf, dxr, "LAYERNORM_BWD: DX matches")
+        _close(dst.buf, dgr, "LAYERNORM_BWD: DScale matches")
 
         # --- GroupNorm + BatchNorm forward through the SAME fprop engine (variant dispatch) ---
         torch.manual_seed(1)
@@ -146,7 +163,7 @@ def main():
         _expect(fe.probe(fspec, gG), "GROUPNORM: fprop probe True (same engine)")
         fe.build(fspec, gG)({xg: xg.buf, gg: gg.buf, bg2: bg2.buf, yg: yg.buf, mg: mg.buf, ig: ig.buf})
         gref = F.group_norm(xg.buf.float(), 4, gg.buf.float(), bg2.buf.float(), 1e-5)
-        _expect((yg.buf.float() - gref).abs().max().item() <= _tol(dt, 6e-2), "GROUPNORM: Y matches torch")
+        _close(yg.buf, gref, "GROUPNORM: Y matches torch")
 
         torch.manual_seed(2)
         xb = _mk((16, 8, 4), dt)
@@ -160,7 +177,7 @@ def main():
         _expect(fe.probe(fspec, bnG), "BATCHNORM: fprop probe True (same engine)")
         fe.build(fspec, bnG)({xb: xb.buf, gbt: gbt.buf, bbt: bbt.buf, yb: yb.buf, mb: mb.buf, ib: ib.buf})
         bref = F.batch_norm(xb.buf.float(), None, None, gbt.buf.float(), bbt.buf.float(), True, 0.1, 1e-5)
-        _expect((yb.buf.float() - bref).abs().max().item() <= _tol(dt, 6e-2), "BATCHNORM: Y matches torch")
+        _close(yb.buf, bref, "BATCHNORM: Y matches torch")
 
     print("\n" + ("ALL PASS" if _OK else "SOME FAILED"))
     sys.exit(0 if _OK else 1)
@@ -173,6 +190,8 @@ if __name__ == "__main__":
 @pytest.mark.L0
 def test_frost_norm_engine_e2e():
     """pytest entry point; this module also runs standalone via ``__main__``."""
+    if not torch.cuda.is_available() or _specs_for_device() is None:
+        pytest.skip("no norm engine row serves this device")
     try:
         main()
     except SystemExit as exc:

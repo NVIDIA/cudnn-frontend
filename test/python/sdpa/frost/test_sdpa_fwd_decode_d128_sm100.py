@@ -695,6 +695,35 @@ def test_decode_kernel_mtp_bottom_right_with_q_trim(s_q):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("s_q,h,kh", [(1, 16, 2), (4, 16, 2), (5, 16, 2), (16, 16, 2), (17, 16, 2), (1, 64, 1), (1, 128, 1), (9, 24, 2)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("splits", [1, 4])
+def test_decode_paged_query_warp_boundaries(s_q, h, kh, dtype, splits):
+    """Whole/partial dead warps across Q tiles, including partial GQA and empty Q.
+
+    Live outputs and Stats retain the masked/sink semantics while inactive
+    warps still contribute every pipeline handshake and zero probability row.
+    """
+    _run_kernel(
+        4,
+        h,
+        kh,
+        16,
+        24,
+        [257, 129, 383, 1],
+        hnd=True,
+        splits=splits,
+        s_q=s_q,
+        q_lens=[s_q, max(1, s_q // 2), 0, 1],
+        causal_br=True,
+        window_left=63,
+        sink=-120.0,
+        dtype=dtype,
+        pack=True,
+    )
+
+
+@pytest.mark.L0
 def test_decode_kernel_mtp_split_kv():
     """MTP s_q=4 bottom-right causal with a forced 4-way split (the small-batch lever)."""
     _run_kernel(2, 8, 2, 16, 64, [1000, 513], hnd=False, splits=4, s_q=4, causal_br=True)
@@ -1320,9 +1349,12 @@ def test_ragged_q_leg_predicate_and_heuristics():
         _ragged_paged_facts(cu_seq_kv_t=object()),  # the cu form is not plumbed on the dense kernel
     ):
         assert not _thd_decode_leg(caps, off), off
-    # Rubin has no decode tile: its row's capabilities (sm 107) never admit the leg.
-    rubin = [s for s in specs if s.capabilities.sm_lo == 107 and not (s.capabilities.is_fp8 or s.capabilities.is_mxfp8)]
-    assert rubin and all(not _thd_decode_leg(s.capabilities, leg) for s in rubin)
+    # The SM107 half row rides the leg too; FP8 / MXFP8 rows and the rows of other
+    # architectures never admit it.
+    rubin_half = next(s for s in specs if s.name == "sdpa_fwd_prefill_sm107").capabilities
+    assert _thd_decode_leg(rubin_half, leg)
+    others = [s for s in specs if s.capabilities.sm_lo not in (100, 107) or s.capabilities.is_fp8 or s.capabilities.is_mxfp8]
+    assert others and all(not _thd_decode_leg(s.capabilities, leg) for s in others)
     plans = _plans(leg)
     assert plans and all(p.knobs.cga == 1 for p in plans), [p.knobs for p in plans]
     assert all(p.knobs.split_kv >= 2 for p in plans), "the ragged final rows exist only through the combine"

@@ -38,7 +38,7 @@ import sys
 import pytest
 import torch
 
-import cudnn.gated_attention_block.api as _api
+from cudnn.gated_attention_block import api as _api
 from cudnn.frost import buffers as _buffers
 from cudnn.frost.buffers import cutedsl_requirement_error
 from cudnn.gated_attention_block import GatedAttentionBlockFwd, GatedAttentionBlockGeometry, QsaSpec, QuantSpec, decode_route
@@ -62,11 +62,12 @@ if requirement_error:
 pytestmark = pytest.mark.L0
 
 requires_rubin = pytest.mark.requires_rubin  # the suite's registered marker (conftest.py): skipped off SM107
+requires_blackwell = pytest.mark.requires_blackwell  # the registered marker: an admitted Blackwell-line part of DENSE_SERVING_CCS (cc 10.0; 2026-10-29)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from gated_block_pdl_probe import cuda_versions, delayed_write, retrace  # noqa: E402
-from test_block_serving_decode import _D, _D_MODEL, _DEV, _ROPE, _Case, _bits, _geom, _make_block, _written  # noqa: E402
+from test_block_serving_decode import _D, _D_MODEL, _DEV, _ROPE, _Case, _bits, _geom, _make_block, _pools, _written  # noqa: E402
 
 _LENS = (100, 384, 500, 0)  # the decode module's standard cell: a tail tile, ring depth 3 and 4, a PADDED entry
 _CASES = {}
@@ -148,12 +149,13 @@ def test_auto_and_the_explicit_switch_answer_for_one_domain_on_the_measured_part
     the knob answer for one domain.  Pools declared in the activation dtype (``kv_cache_dtype=torch.bfloat16``, the ``None`` spelling)
     take the default and the explicit True alike -- a serving stack that spells the dtype can form its own A/B --, a 16-bit pool of the
     other width hears the attribute's own ``ValueError``, not the switch's decline.  On every pipeline the default excludes -- the EXTEND
-    form, ``kv_source="self"``, a QuantSpec pipeline, a QsaSpec geometry (with and without the indexer band; the decode indexer over the
-    pools on both readings of ``fuse_prepare``), the e4m3 cache -- AUTO
+    form, ``kv_source="self"``, a QuantSpec pipeline, a QsaSpec geometry under the in-block indexer (the decode indexer over the pools on
+    both readings of ``fuse_prepare``), the e4m3 cache -- AUTO
     reads False with no stage switched; the explicit True is served per stage on the two bf16 forms without a decode route (their
-    prefill tiles carry no sites), SERVED on the block-sparse decode mode (the sparse core and its combine carry the sites; its own AUTO
-    tuple is empty until measured) and is the typed decline on the QuantSpec pipeline, the e4m3 cache, the sparse core's packed form and the
-    in-block indexer (its kernels would take the switch unmeasured)."""
+    prefill tiles carry no sites), SERVED on the block-sparse decode mode (the sparse core and its combine carry the sites) -- where AUTO
+    resolves True too on the caller-list block, with and without the indexer band, since the measured part entered
+    ``SPARSE_DECODE_PDL_DEFAULT_CCS`` (2026-10-27) -- and is the typed decline on the QuantSpec pipeline, the e4m3 cache, the sparse core's
+    packed form and the in-block indexer (its kernels would take the switch unmeasured)."""
     import test_block_qsa_decode as _qsa
     import test_block_qsa_fp8_kv as _qkv
     import test_block_serving_extend as _ext
@@ -206,19 +208,50 @@ def test_auto_and_the_explicit_switch_answer_for_one_domain_on_the_measured_part
     assert off(GatedAttentionBlockFwd(*qargs, quant=spec))
     with pytest.raises(NotImplementedError, match=decline):
         GatedAttentionBlockFwd(*qargs, quant=spec, use_pdl=True)
-    # the block-sparse decode mode: a QsaSpec geometry (with and without the indexer band) -- AUTO False (the sparse chain's own measured-parts
-    # tuple is EMPTY until the switched chain is measured), the explicit True SERVED: the sparse core and its split combine carry the sites,
-    # so the sparse stage takes the switch beside the chain's other switched stages (the inversion of the former decline pin)
-    assert _api.SPARSE_DECODE_PDL_DEFAULT_CCS == ()
+    # the FP8-projection + bf16-attention mode (QuantSpec(attention_dtype=torch.bfloat16)) on the DECODE form: AUTO False (the quantize
+    # launch carries no griddepcontrol sites; the switched chain is unmeasured there), the explicit True the same decline, naming the mode
+    mode = QuantSpec.bf16_attention(0.01, 0.02, 0.03, 4.0)
+    kc, vc = _pools(8, 2, 16, _D, "hnd", torch.bfloat16)
+    geom_br = GatedAttentionBlockGeometry(d_model=_D_MODEL, h_q=8, h_kv=2, d_head=_D, rope_dim=_ROPE, causal_bottom_right=True)  # the paged forms' diagonal
+    mode_args = (
+        e4(4, 1, _D_MODEL),
+        e4(geom_br.n_qkvg, _D_MODEL),
+        mk(_D),
+        mk(_D),
+        mk(4, 1, _ROPE),
+        mk(4, 1, _ROPE),
+        e4(_D_MODEL, 8 * _D),
+        mk(4, 1, _D_MODEL),
+        geom_br,
+    )
+    mode_kw = dict(
+        paged_kv_page_size=16, kv_source="paged", sample_k_cache=kc, sample_v_cache=vc, sample_block_table=torch.zeros(4, 8, dtype=torch.int32, device=_DEV)
+    )
+    mode_blk = GatedAttentionBlockFwd(*mode_args, quant=mode, **mode_kw)
+    assert mode_blk.attention_bf16 and mode_blk.decode_route is not None and mode_blk.decode_route.pdl_capable and off(mode_blk)
+    assert mode_blk._sdpa.use_pdl is False and mode_blk._norm_rope.use_pdl is False
+    with pytest.raises(NotImplementedError, match=decline) as e:
+        GatedAttentionBlockFwd(*mode_args, quant=mode, use_pdl=True, **mode_kw)
+    assert "FP8-projection + bf16-attention mode" in str(e.value) and "None = auto reads False" in str(e.value)
+    env_mode = GatedAttentionBlockFwd.serving_envelope(geom_br, torch.float8_e4m3fn, _DEV, device_cc=(10, 7), quant=mode)
+    assert env_mode.decode.pdl_default is False
+    # the block-sparse decode mode: a QsaSpec geometry under CALLER lists (with and without the indexer band) -- AUTO True on the measured
+    # part (the sparse chain's own measured-parts tuple holds cc 10.7 since 2026-10-27: the switched block measured bitwise the plain one and
+    # never slower over B 1 / 4 / 32), the explicit True SERVED the same way: the sparse core and its split combine carry the sites, so the
+    # sparse stage takes the switch beside the chain's other switched stages; the explicit False pins the plain chain on the measured part
+    assert _api.SPARSE_DECODE_PDL_DEFAULT_CCS == ((10, 7),)
     sparse = _qsa._declare(_qsa.GEOM_SMALL, 2, 1, n_pages=4)[0]
-    assert off(sparse) and sparse.decode_route is None and sparse.sparse_decode
+    assert sparse.use_pdl is True and sparse.use_pdl_requested is None and sparse._sdpa.use_pdl is True and sparse.decode_route is None and sparse.sparse_decode
+    assert "sdpa_sparse" in sparse.pdl_stages and sparse.use_pdl_effective is True
     sparse_on = _qsa._declare(_qsa.GEOM_SMALL, 2, 1, n_pages=4, use_pdl=True)[0]
     assert sparse_on.use_pdl is True and sparse_on.use_pdl_requested is True and sparse_on._sdpa.use_pdl is True and sparse_on.sparse_decode
-    assert "sdpa_sparse" in sparse_on.pdl_stages and sparse_on.use_pdl_effective is True
+    assert "sdpa_sparse" in sparse_on.pdl_stages and sparse_on.use_pdl_effective is True and sparse_on.pdl_stages == sparse.pdl_stages
     assert sparse_on.pdl_stages == tuple(st.name for st in sparse_on._stages if getattr(st, "use_pdl", False))
-    assert _qsa._declare(_qsa.GEOM_SMALL, 2, 1, n_pages=4, use_pdl=False)[0].pdl_stages == ()
+    sparse_off = _qsa._declare(_qsa.GEOM_SMALL, 2, 1, n_pages=4, use_pdl=False)[0]
+    assert sparse_off.use_pdl is False and sparse_off.use_pdl_requested is False and sparse_off.pdl_stages == () and sparse_off._sdpa.use_pdl is False
     band = _qsa._declare(_qsa.GEOM_SMALL, 4, 1, n_pages=6, index_band=True, fuse_norm_rope=False)[0]
-    assert off(band) and band.geom.index_band
+    assert band.use_pdl is True and band.use_pdl_requested is None and band.geom.index_band, "AUTO True with the indexer band under caller lists"
+    assert "sdpa_sparse" in band.pdl_stages and "cache_write" in band.pdl_stages and band.use_pdl_effective is True
     # the in-block indexer's DECODE step over the pools (2026-10-21): AUTO False on both readings of fuse_prepare (its stage threads the
     # switch it is handed -- `pdl_names` spells the kernels that would take it -- and is handed False), the explicit True the same decline
     for fused in (False, True):
@@ -311,14 +344,18 @@ def test_the_prefill_route_keeps_the_switch_off_stage_four_and_reads_back_which_
     fp32 = GatedAttentionBlockFwd.serving_envelope(geom, torch.float32, _DEV, device_cc=(10, 7)).decode
     assert not fp32.served and fp32.pdl_default is False, "the default is a reading of a served form"
     monkeypatch.undo()
+    # the Rubin table's route facts on a Rubin reading (a cc 10.0 host's own reading records the SM100 line: group 16 at S_q 4 is the
+    # prefill tile there, pinned in test_block_serving_decode.py)
+    rubin_routes = GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=(10, 7)).decode
     assert (
         all(r.pdl_capable is r.decode_tile for r in env.decode.routes)
-        and env.decode.route(5, batch=32).pdl_capable is False
-        and env.decode.route(4).pdl_capable
+        and rubin_routes.route(5, batch=32).pdl_capable is False
+        and rubin_routes.route(4).pdl_capable
     )
-    assert env.decode.route(5).pdl_capable is True
+    assert rubin_routes.route(5).pdl_capable is True
     # the token-unit policy takes the same step on the decode tile at any batch, where the switch reaches stage (4); so does the default
-    # policy below the fill
+    # policy below the fill (the Rubin reading on any host)
+    monkeypatch.setattr(_api, "_route_device_cc", lambda device: None)
     for extra in (dict(decode_route_policy="token_units"), dict()):
         tu = _Case(16, 5, (100,), seed=1, blk_kw=dict(use_pdl=True, **extra))
         assert tu.blk.decode_route.decode_tile and tu.blk.decode_route.pdl_capable and tu.blk._sdpa.use_pdl is True and tu.blk.use_pdl_effective is True
@@ -364,6 +401,31 @@ def test_the_decode_step_is_bitwise_with_and_without_pdl(decl, s_q):
     # a second PDL step is bitwise the first: nothing in the chain raced
     c = on.run().clone()
     assert torch.equal(b, c)
+
+
+@requires_blackwell
+@pytest.mark.parametrize(
+    "decl, group, s_q", [("auto", 16, 1), ("unfused-auto", 6, 1), ("unfused-unsplit", 6, 4)], ids=["auto-16-sq1", "unfused-auto-6-sq1", "unfused-unsplit-6-sq4"]
+)
+def test_the_decode_step_is_bitwise_with_and_without_pdl_on_cc_10_0(decl, group, s_q):
+    """The explicit switch on cc 10.0 (2026-10-29; AUTO reads False there -- the default is the measured part's): the SM100 decode tile
+    and its combine carry the griddepcontrol pair, so the switched chain is BITWISE the plain one on ``out`` and on the pools, the same
+    kernels (``fuse_gate=False``: the gate its own launch on this part; the fused-fork declarations are the sm_107a decline there)."""
+    kw = dict(_DECLARATIONS[decl], fuse_gate=False)
+    off = _case(group, s_q, pdl=False, **kw)
+    on = _case(group, s_q, pdl=True, **kw)
+    assert on.route_readback() == off.route_readback() and _stage_names(on) == _stage_names(off)
+    assert on.route_readback()["template"] == DECODE_TILE and on.route_readback()["file"].endswith("/sm100/decode_d256_f16.py")
+    assert on.blk.use_pdl is True and on.blk._sdpa.use_pdl is True and "sdpa" in on.blk.pdl_stages and off.blk.use_pdl is False
+    a = off.run().clone()
+    b = on.run().clone()
+    on.check_against_oracle(b, what=f"cc 10.0 {decl} group {group} s_q={s_q} use_pdl=True")
+    assert torch.equal(a, b), f"{decl}: out differs with use_pdl on cc 10.0 (max|diff| {(a.float() - b.float()).abs().max().item():.3e})"
+    assert torch.equal(_bits(on.k_cache), _bits(off.k_cache)) and torch.equal(_bits(on.v_cache), _bits(off.v_cache)), "the write-through differs"
+    c = on.run().clone()
+    assert torch.equal(b, c)
+    auto = _Case(group, s_q, _LENS, seed=0, blk_kw=dict(fuse_gate=False, **_DECLARATIONS[decl]))
+    assert auto.blk.use_pdl is False and auto.blk.use_pdl_requested is None and auto.blk.pdl_stages == ()
 
 
 @requires_rubin

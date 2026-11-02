@@ -66,10 +66,16 @@ turns the in-process memo off (a test of the reload path wants every call to
 reach the files; an A/B of the memo itself). A caller
 that manages its own workspace (FlashInfer) points :func:`set_cache_dir` at
 it once per process.
+
+Plan serialization (``cudnn._plan_serdes``) carries entries between processes:
+:func:`record_entries` collects the entries a build used, :func:`read_entry`
+reads one with its manifest, and :func:`seed_entry` installs it only under an
+identical manifest.
 """
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
 import inspect
@@ -101,7 +107,7 @@ _DIGEST_DIR = re.compile(r"[0-9a-f]{24}")  # ... and of an environment / entry d
 _LOG = logging.getLogger("cudnn.frost.compiled_cache")
 _LOCK = threading.Lock()
 _dir_override: Optional[Path] = None
-_stats = {"hits": 0, "misses": 0, "bypassed": 0, "invalid": 0, "export_failed": 0, "pruned": 0, "memo_hits": 0}
+_stats = {"hits": 0, "misses": 0, "bypassed": 0, "invalid": 0, "export_failed": 0, "pruned": 0, "memo_hits": 0, "seeded": 0, "seed_rejected": 0}
 _pruned_this_process = False
 # The in-process memo: (target device, live device, cache_key, symbol, options) -> the object compile_cached handed out
 # for it in THIS process, whatever the files did (a reloaded artifact or the in-process object); the two devices are
@@ -113,6 +119,10 @@ _pruned_this_process = False
 # would need a reuse pattern to evict by and would reintroduce the full recompile the memo exists to avoid; a caller
 # that mints ever-new keys (a sweep over shapes) pays a compile per key anyway and has clear_memo() as the release valve.
 _MEMO: Dict[tuple, Any] = {}
+# Per-thread stack of lists that record_entries() hands out; compile_cached appends to the innermost.
+_RECORDING = threading.local()
+# Per-thread depth of refuse_compiles() scopes; nonzero makes a cache miss raise instead of compiling.
+_REFUSING = threading.local()
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +183,8 @@ def get_cache_dir() -> Path:
 
 def stats() -> Dict[str, int]:
     """Counters for this process: hits, misses, bypassed (not cacheable), invalid (entry rejected), export_failed, pruned (environment
-    directories removed), memo_hits (served from the in-process memo: neither the files nor the compiler were reached)."""
+    directories removed), memo_hits (served from the in-process memo: neither the files nor the compiler were reached), seeded /
+    seed_rejected (:func:`seed_entry` installed an entry / refused one from another environment)."""
     with _LOCK:
         return dict(_stats)
 
@@ -644,6 +655,7 @@ def compile_cached(fn: Callable, *args: Any, cache_key: Optional[str], symbol: s
 
     options = str(kwargs.get("options") or "")
     if cache_key is None:
+        _refuse_compile(symbol)
         _count("bypassed")
         return cute.compile(fn, *args, **kwargs)
     memo_key = (*_memo_device(), cache_key, symbol, options) if memo_enabled() else None
@@ -652,6 +664,7 @@ def compile_cached(fn: Callable, *args: Any, cache_key: Optional[str], symbol: s
             memo = _MEMO.get(memo_key)
         if memo is not None:
             _count("memo_hits")
+            _record(cache_key, symbol, options)
             return memo
     compiled = _compile_persistent(fn, args, kwargs, cache_key=cache_key, symbol=symbol, options=options)
     if memo_key is not None:
@@ -659,6 +672,7 @@ def compile_cached(fn: Callable, *args: Any, cache_key: Optional[str], symbol: s
             # Threads that raced on an empty slot each compiled once; every one of them leaves with the
             # FIRST object stored, so one key means one object for the rest of the process.
             compiled = _MEMO.setdefault(memo_key, compiled)
+    _record(cache_key, symbol, options)
     return compiled
 
 
@@ -667,12 +681,14 @@ def _compile_persistent(fn: Callable, args: tuple, kwargs: Dict[str, Any], *, ca
     import cutlass.cute as cute
 
     if not enabled() or "--enable-tvm-ffi" not in options:
+        _refuse_compile(symbol)
         _count("bypassed")
         return cute.compile(fn, *args, **kwargs)
     manifest = environment_manifest()
     if any(v == "unknown" for v in manifest.values()):
         # An environment that cannot identify itself shares nothing: two
         # incompatible stacks with the same unknowns would otherwise hash alike.
+        _refuse_compile(symbol)
         _count("bypassed")
         return cute.compile(fn, *args, **kwargs)
     root = get_cache_dir()  # one root for the export and the prune that follows it
@@ -689,6 +705,7 @@ def _compile_persistent(fn: Callable, args: tuple, kwargs: Dict[str, Any], *, ca
         if loaded is not None:
             _count("hits")
             return loaded
+        _refuse_compile(symbol)
         return _compile_and_export(fn, args, kwargs, root, entry, cache_key, symbol, manifest)
 
 
@@ -749,3 +766,109 @@ def _compile_and_export(fn, args, kwargs, root, entry, cache_key, symbol, manife
     # miss run the same thing and a bad artifact fails here, not next start-up.
     loaded = _try_load(entry, cache_key, symbol)
     return loaded if loaded is not None else compiled
+
+
+# ---------------------------------------------------------------------------
+# Carrying entries to another process (plan serialization)
+# ---------------------------------------------------------------------------
+
+
+class CompileRefused(RuntimeError):
+    """A kernel had to compile inside :func:`refuse_compiles`."""
+
+
+def _refuse_compile(symbol: str) -> None:
+    if getattr(_REFUSING, "depth", 0):
+        raise CompileRefused(f"{symbol} is not in the compiled cache and compiling is refused here")
+
+
+@contextlib.contextmanager
+def refuse_compiles():
+    """Make a ``compile_cached`` miss in this thread raise :class:`CompileRefused` instead of compiling."""
+    _REFUSING.depth = getattr(_REFUSING, "depth", 0) + 1
+    try:
+        yield
+    finally:
+        _REFUSING.depth -= 1
+
+
+@contextlib.contextmanager
+def record_entries():
+    """Collect the on-disk entry of every ``compile_cached`` call this thread makes inside the block.
+
+    Yields a list of entry directories, filled as kernels are compiled, reloaded or served from the
+    memo. A kernel that was not persisted (uncacheable, cache disabled, export failed) leaves nothing.
+    """
+    stack = getattr(_RECORDING, "stack", None)
+    if stack is None:
+        stack = _RECORDING.stack = []
+    entries: list = []
+    stack.append(entries)
+    try:
+        yield entries
+    finally:
+        stack.pop()
+
+
+def _record(cache_key: str, symbol: str, options: str) -> None:
+    stack = getattr(_RECORDING, "stack", None)
+    if not stack or not enabled() or "--enable-tvm-ffi" not in options:
+        return
+    manifest = environment_manifest()
+    if any(v == "unknown" for v in manifest.values()):
+        return
+    entry = _entry_dir(get_cache_dir(), manifest, f"{cache_key}|{symbol}|{options}")
+    if (entry / _ENTRY).is_file() and (entry / _OBJECT).is_file() and entry not in stack[-1]:
+        stack[-1].append(entry)
+
+
+def read_entry(entry: Path) -> Optional[Tuple[Dict[str, Any], bytes]]:
+    """``(description, object bytes)`` of a persisted entry, or None if it is gone or unreadable.
+
+    The description carries the environment manifest the entry was compiled under, which
+    :func:`seed_entry` compares against its own before installing anything."""
+    manifest = _read_json(entry.parent / _MANIFEST)
+    record = _read_json(entry / _ENTRY)
+    try:
+        data = (entry / _OBJECT).read_bytes()
+    except OSError:
+        return None
+    if not isinstance(manifest, dict) or not isinstance(record, dict):
+        return None
+    return {"environment": manifest, "entry": entry.name, "record": record}, data
+
+
+def seed_entry(description: Dict[str, Any], data: bytes, device: Optional[int] = None) -> bool:
+    """Install an entry produced by :func:`read_entry` in another process; True when it is (or already was) present.
+
+    Installed only when its environment manifest equals this process's exactly -- the same rule that
+    keeps a stale artifact out of the cache, so a seeded entry is never one this process could not
+    have compiled itself. ``device`` is the one the plan will build on (default: the current device). Anything else is refused and the kernel compiles as usual. The entry is
+    written like an export (object first, record last), and loading it still goes through the key
+    check in ``compile_cached``.
+    """
+    if not enabled():
+        return False
+    manifest = environment_manifest(device)
+    record = description.get("record")
+    name = str(description.get("entry", ""))
+    if (
+        description.get("environment") != manifest
+        or any(v == "unknown" for v in manifest.values())
+        or not _DIGEST_DIR.fullmatch(name)
+        or not isinstance(record, dict)
+        or record.get("schema") != _SCHEMA
+    ):
+        _count("seed_rejected")
+        return False
+    entry = get_cache_dir() / _SCHEMA / _digest(_canonical(manifest)) / name
+    if (entry / _ENTRY).is_file() and (entry / _OBJECT).is_file():
+        return True
+    entry.mkdir(parents=True, exist_ok=True)
+    manifest_path = entry.parent / _MANIFEST
+    if not manifest_path.exists():
+        _write_atomic(manifest_path, json.dumps(manifest, indent=1, sort_keys=True).encode("utf-8"))
+    _write_atomic(entry / _OBJECT, data)
+    _write_atomic(entry / _ENTRY, json.dumps(record, indent=1, sort_keys=True).encode("utf-8"))
+    _count("seeded")
+    return True

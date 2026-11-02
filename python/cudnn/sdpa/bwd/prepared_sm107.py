@@ -14,12 +14,14 @@ not convert tensors or allocate execute-time storage.
 """
 
 import math
+from dataclasses import replace
 from contextlib import nullcontext
 from types import SimpleNamespace
 
 from cudnn.frost.compiled_cache import positional_entry
 from cudnn.sdpa.fwd.api_dsl import ws_align
 from .prepared import ATTRIBUTES, BwdLaunchSpec, Operand, ROLES
+from .d128_thd_contract import ORIGIN_PORTS as THD_ORIGIN_PORTS, RAGGED_ROLES, KV_PORTS
 
 # Every dense row binds the nine tensor operands plus two APPENDED slots -- the LAST two of its role list, in the order they
 # landed, each an operand exactly when its plan fact says so and None-specialized otherwise (the fixed-ABI rule the fp8 row's
@@ -91,7 +93,22 @@ MXFP8_SF_Q_SIDE = ("sf_q", "sf_q_T", "sf_do", "sf_do_T")
 MXFP8_SF_KV_SIDE = ("sf_k", "sf_k_T", "sf_v")
 
 # Workspace region slots the hosts index (``prepared_host.R_*``), by ``_scratch_plan`` name.
-_REGION_SLOTS_F16 = ("delta", "ds_ws", "seq_kv", "desc_words", "q_pad", "do_pad", "lse_pad", "k_pad", "v_pad", "dv_part", "dk_part", "dk_fold", "dv_fold")
+_REGION_SLOTS_F16 = (
+    "delta",
+    "ds_ws",
+    "seq_kv",
+    "desc_words",
+    "q_pad",
+    "do_pad",
+    "lse_pad",
+    "k_pad",
+    "v_pad",
+    "dv_part",
+    "dk_part",
+    "dk_fold",
+    "dv_fold",
+    "thd_origins",
+)
 _REGION_SLOTS_FP8 = (
     "delta",
     "ds_ws",
@@ -297,7 +314,7 @@ def compile_plan(api, main, mm_dk, mm_dq):
     )
     entry = compile_host_f16(
         main._host,
-        mm_dk._host,
+        None if getattr(main.CFG, "FUSE_DK", False) else mm_dk._host,
         mm_dq._host,
         config,
         geometry,
@@ -316,6 +333,65 @@ def compile_plan(api, main, mm_dk, mm_dq):
     )
 
 
+def check_thd_origins(api):
+    """Per-port declarations only: origins remain device operands at every call."""
+    import torch
+
+    spec = api._thd_ro_spec
+    fail = api._value_error_if
+    fail(bool(set(spec) - set(THD_ORIGIN_PORTS)), f"{api._NAME}: unknown THD origin port")
+    fail(api.max_total_seq_len_q is None or api.max_total_seq_len_kv is None, f"{api._NAME}: THD origins require declared capacities")
+    tq, tk = int(api.max_total_seq_len_q), int(api.max_total_seq_len_kv)
+    fail(min(tq, tk) < 1 or max(tq, tk) > 2**32 - 1, f"{api._NAME}: physical capacities must fit positive tensor-map extents")
+    fail(max(api._t_q_cap, api._t_kv_cap, api.s_q_max, api.s_k_max) > 2**31 - 256, f"{api._NAME}: packed prefix or tile count exceeds Int32")
+    origins, dtypes = [], []
+    for row, port in enumerate(THD_ORIGIN_PORTS):
+        if port not in spec:
+            origins.append(None)
+            dtypes.append(None)
+            continue
+        item = spec[port]
+        fail(not isinstance(item, (tuple, list)) or len(item) != 2, f"{api._NAME}: {port} offsets require (dtype, multiplier)")
+        dtype, mult = item
+        fail(dtype not in (torch.int32, torch.int64), f"{api._NAME}: {port} offsets must be INT32 or INT64")
+        fail(type(mult) is not int or not 0 < mult <= 2**63 - 1, f"{api._NAME}: {port} offset multiplier must be a positive Int64 integer")
+        desc = getattr(api, port + "_desc")
+        stride = (api.h_q if api._thd_lse_token_major else 1) if port == "stats" else int(desc.stride[2])
+        capacity = tk if port in KV_PORTS else tq
+        fail(port != "stats" and capacity * stride * desc.dtype.itemsize >= 2**40, f"{api._NAME}: {port} tensor-map byte stride is too large")
+        origins.append((row, mult, stride))
+        dtypes.append(_dtype_name(dtype))
+    if "stats" in spec and not api._thd_lse_token_major:
+        pitch = api._thd_lse_head_stride or tq
+        fail(pitch < tq, f"{api._NAME}: Stats head stride must cover physical capacity")
+    api._thd_origins, api._thd_origin_dtypes = tuple(origins), tuple(dtypes)
+
+
+class _ThdOriginEntry:
+    """Reject gradient/metadata aliases before any prepared setup writes."""
+
+    def __init__(self, fn, operands, workspace_bytes):
+        self.fn, self.workspace_bytes = fn, workspace_bytes
+        self.spans = tuple(0 if op is None else op.span * op.itemsize for op in operands)
+
+    def __call__(self, *frame):
+        if len(frame) != 25:
+            raise ValueError("D256 THD origin frame requires twenty-one operands and four runtime slots")
+        form = frame[23]
+        if form not in (0, 1, 2, 3):
+            raise ValueError("D256 THD length form must encode Q and KV prefix bits")
+        spans = tuple(n + (4 if i == 9 and form & 1 or i == 10 and form & 2 else 0) for i, n in enumerate(self.spans))
+        from .d128_thd_contract import validate_launch
+
+        validate_launch(frame[:11] + frame[12:21], spans[:11] + spans[12:21], frame[21], self.workspace_bytes, frame[22])
+        if spans[11]:
+            lo, hi = frame[11], frame[11] + spans[11]
+            for i in (6, 7, 8):
+                if lo < frame[i] + spans[i] and frame[i] < hi:
+                    raise ValueError("D256 THD external delta overlaps a gradient output")
+        self.fn(*frame)
+
+
 def _thd_geometry(api, roles=ROLES[:9]):
     """``(geometry, operands)`` of the tensor roles ``roles`` (default: the nine shared ones; the MXFP8 THD plan adds its four
     payloads) on a THD plan: PACKED ``[1, T, H, D]`` views at the plan's token capacities with the port's own head / token /
@@ -328,12 +404,14 @@ def _thd_geometry(api, roles=ROLES[:9]):
     geometry, operands = [], []
     for role in roles:
         desc = getattr(api, role + "_desc")
+        role_tq = int(api.max_total_seq_len_q) if role in api._thd_ro_spec else tq
+        role_tk = int(api.max_total_seq_len_kv) if role in api._thd_ro_spec else tk
         shape, strides = tuple(int(x) for x in desc.shape), tuple(int(x) for x in desc.stride)
         if role == "stats":
-            geom = compact((tq, h)) if api._thd_lse_token_major else compact((1, h, api._thd_lse_head_stride or tq))
+            geom = compact((role_tq, h)) if api._thd_lse_token_major else compact((1, h, api._thd_lse_head_stride or role_tq))
             alignment = 4
         else:
-            tokens = tk if role in ("k", "v", "dk", "dv", "k_T") else tq
+            tokens = role_tk if role in ("k", "v", "dk", "dv", "k_T") else role_tq
             shape = (1, shape[1], tokens, shape[3])
             strides = (max(tokens, 1) * strides[2], *strides[1:])
             geom = tuple(shape[i] for i in (0, 2, 1, 3)), tuple(strides[i] for i in (0, 2, 1, 3))
@@ -358,25 +436,60 @@ def compile_plan_thd(api, main, mm_dk, mm_dq):
     operands += [Operand("int32", (b,), (1,), b, 4, 4, (b, b + 1)) for _ in range(2)]
     operands += [_thd_delta_operand(api)]
     external = bool(api.external_delta)
+    origins = bool(api._thd_ro_spec)
+    if origins:
+        for name in api._thd_origin_dtypes:
+            width = 8 if name == "int64" else 4
+            operands.append(None if name is None else Operand(name, (b + 1,), (1,), b + 1, width, width))
     regions, offset = _regions(api, _REGION_SLOTS_F16)
     config = _thd_config(api)  # the half row's dS element size IS its io itemsize
     sm = _sm(api)
     dtype = _dsl_dtype(api.dtype)
-    key = repr((tuple(mod.FROST_SOURCE_DIGEST for mod in (main, mm_dk, mm_dq)), "thd", config, geometry, regions, _dtype_name(api.dtype), sm, external))
-    entry = compile_host_f16_thd(main._host, mm_dk._host, mm_dq._host, config, geometry, regions, dtype, sm, key, external_delta=external)
-    return _spec(
+    key = repr(
+        (
+            tuple(mod.FROST_SOURCE_DIGEST for mod in (main, mm_dk, mm_dq)),
+            "thd",
+            config,
+            geometry,
+            regions,
+            _dtype_name(api.dtype),
+            sm,
+            external,
+            api._thd_origins if origins else None,
+            api._thd_origin_dtypes if origins else None,
+        )
+    )
+    extra = dict(origin_specs=api._thd_origins, origin_dtypes=api._thd_origin_dtypes) if origins else {}
+    entry = compile_host_f16_thd(
+        main._host_origins if origins else main._host,
+        None if getattr(main.CFG, "FUSE_DK", False) else (mm_dk._host_chain if origins else mm_dk._host),
+        mm_dq._host_chain if origins else mm_dq._host,
+        config,
+        geometry,
+        regions,
+        dtype,
+        sm,
+        key,
+        external_delta=external,
+        symbol=f"frost_{api._NAME}_thd_prepared",
+        **extra,
+    )
+    spec = _spec(
         api,
         entry,
         operands,
         offset,
-        "sdpa_bwd_sm107",
-        ROLES_F16_THD,
-        ATTRIBUTES_F16_THD,
+        api._NAME,
+        ROLES_F16_THD + (RAGGED_ROLES if origins else ()),
+        ATTRIBUTES_F16_THD + (RAGGED_ROLES if origins else ()),
         scale_log2=False,
         standalone_only_roles=(EXTERNAL_DELTA_ROLE,),
         length_form=True,
         native_binding=True,
     )
+    if origins:
+        spec = replace(spec, fn=_ThdOriginEntry(spec.fn, operands, offset))
+    return spec
 
 
 def _fp8_scalar_operands(api):
@@ -734,6 +847,10 @@ def execute_standalone(api, tensors, workspace, current_stream, scale):
                 stats = facts["stats"]
                 if stats is not None and (not stats.contiguous or stats.numel != math.prod(op.shape)):
                     raise ValueError(f"{spec.name}: Stats must be contiguous with {math.prod(op.shape)} elements")
+            elif spec.roles[i].startswith("ragged_"):
+                actual = facts[spec.roles[i]]
+                if actual is not None and (not actual.contiguous or actual.numel != api.batch_size + 1):
+                    raise ValueError(f"{spec.name}: {spec.roles[i]} must be contiguous with B+1 elements")
             elif len(op.shape) == 4:
                 # The declared logical-BHSD geometry of the kernels' [B, S, H, D] operand view (the nine shared roles and the
                 # MXFP8 row's four extra payloads); the fp8 row's [1] scalars and the opaque SF blobs bind by facts alone.

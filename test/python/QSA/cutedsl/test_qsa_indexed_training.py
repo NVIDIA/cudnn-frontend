@@ -17,6 +17,12 @@ from QSA.cutedsl.test_qsa import make_inputs, reference, assert_close, supported
 pytestmark = pytest.mark.L0
 
 
+@pytest.fixture(autouse=True)
+def indexed_supported_device():
+    if torch.cuda.is_available() and torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Indexed QSA requires SM100, SM103 or SM107")
+
+
 def indices_for(inputs):
     total, blocks = inputs["sel_blocks"].shape
     tokens = inputs["block_first"][None, :, None] + torch.arange(4, device="cuda", dtype=torch.int32)
@@ -46,6 +52,16 @@ def check_case(inputs, indices):
 def test_indexed_packed_reference(supported_gpu, lengths):
     inputs = make_inputs(lengths, 12, 1, empty=True, all_selected=True)
     check_case(inputs, indices_for(inputs))
+
+
+@pytest.mark.parametrize("lengths", [(3, 5, 7), (129, 133)])
+def test_indexed_six_query_heads(supported_gpu, lengths):
+    """6Q/1KV runs the same forward kernels and backward engine as 12Q/1KV, with six head rows per query."""
+    inputs = make_inputs(lengths, 6, 1, empty=True, all_selected=True)
+    indices = indices_for(inputs)
+    check_case(inputs, indices)
+    plan = _plan(inputs["q"].shape[0], indices.shape[1], inputs["q"].device, "bprop", 0, 6)
+    assert plan.hq == 6 and dict((name, shape) for name, shape, _ in plan.layouts)["ids"] == (inputs["q"].shape[0], indices.shape[1])
 
 
 def test_indexed_changed_values_replay(supported_gpu):

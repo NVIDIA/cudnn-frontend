@@ -142,14 +142,15 @@ class BenchmarkRunner:
             # exactly one row regardless of what deterministic_bwd contains.
             # For bwd cases, iterate over the configured deterministic_bwd values.
             det_values = [False] if profile_pass == "fwd" else list(config.deterministic_bwd)
+            fills = list(config.thd_min_fills) if config.layout == "thd" else [None]
 
-            for det_bwd in det_values:
+            for det_bwd, thd_min_fill in itertools.product(det_values, fills):
                 # FP8/MXFP8 constraints: cuDNN Frontend paths only (native or
                 # FROST OSS engines). FA4's cute interface rejects non-fp16/bf16
                 # inputs outright, so emitting those cases just produces
                 # tracebacks in the CSV.
                 if data_type in ("fp8", "mxfp8"):
-                    if backend not in ("cudnn", "cudnn_oss"):
+                    if backend not in ("cudnn", "cudnn_oss", "cudnn_auto"):
                         continue
                 # Block-scaled O modes (fp8 or mxfp8 inputs, FP4 / MXFP8 O + sf_o): a
                 # forward-only inference epilogue of the FROST OSS fp8 / mxfp8 kernels.
@@ -172,6 +173,8 @@ class BenchmarkRunner:
                     "skip_ref": config.skip_ref,
                     "deterministic_bwd": det_bwd,
                     "sliding_window_size": config.sliding_window_size,
+                    "layout": config.layout,
+                    "thd_min_fill": thd_min_fill,
                 }
 
     def run_single(self, case: Dict[str, Any]) -> BenchmarkResult:
@@ -211,6 +214,8 @@ class BenchmarkRunner:
                 skip_ref=case["skip_ref"],
                 deterministic_bwd=case["deterministic_bwd"],
                 sliding_window_size=case["sliding_window_size"],
+                layout=case["layout"],
+                thd_min_fill=case["thd_min_fill"] if case["thd_min_fill"] is not None else 1.0,
             )
 
             return BenchmarkResult(
@@ -229,6 +234,8 @@ class BenchmarkRunner:
                 profile_pass=case["profile_pass"],
                 deterministic_bwd=case["deterministic_bwd"],
                 sliding_window_size=case["sliding_window_size"],
+                layout=case["layout"],
+                thd_min_fill=case["thd_min_fill"],
                 time_ms=result["time_ms"],
                 tflops=result["tflops"],
                 max_diff=result["max_diff"],
@@ -238,6 +245,7 @@ class BenchmarkRunner:
                 cudnn_version=result.get("cudnn_version"),
                 cudnn_backend_version=result.get("cudnn_backend_version"),
                 peak_mma_tflops=result.get("peak_mma_tflops"),
+                backend_detail=result.get("backend_detail"),
             )
 
         except UnsupportedConfigError as e:
@@ -261,6 +269,8 @@ class BenchmarkRunner:
                 profile_pass=case["profile_pass"],
                 deterministic_bwd=case["deterministic_bwd"],
                 sliding_window_size=case["sliding_window_size"],
+                layout=case["layout"],
+                thd_min_fill=case["thd_min_fill"],
                 time_ms=float("inf"),
                 tflops=0.0,
                 max_diff=0.0,
@@ -288,6 +298,8 @@ class BenchmarkRunner:
                 profile_pass=case["profile_pass"],
                 deterministic_bwd=case["deterministic_bwd"],
                 sliding_window_size=case["sliding_window_size"],
+                layout=case["layout"],
+                thd_min_fill=case["thd_min_fill"],
                 time_ms=float("inf"),
                 tflops=0.0,
                 max_diff=0.0,
@@ -340,6 +352,8 @@ class BenchmarkRunner:
             model = case["model"]
             det_str = "det" if case["deterministic_bwd"] else "non-det"
             swa_str = f" | swa={case['sliding_window_size']}" if case["sliding_window_size"] else ""
+            if case["layout"] == "thd":
+                swa_str += f" | thd fill={case['thd_min_fill']:g}"
             logger.info(
                 f"[{i}/{len(cases)}] {model.name} | "
                 f"seq={case['q_seqlen']}x{case['kv_seqlen']} | "
@@ -356,7 +370,8 @@ class BenchmarkRunner:
                 # the measurement window (not NVML max clock).
                 peak = result.peak_mma_tflops
                 sol = f", {result.tflops / peak * 100:.1f}% SOL" if peak and result.tflops > 0 else ""
-                logger.info(f"  -> {result.profile_pass}: {result.time_ms:.3f}ms ({result.tflops:.0f} TFLOPS{sol})")
+                detail = f" [{result.backend_detail}]" if result.backend_detail else ""
+                logger.info(f"  -> {result.profile_pass}: {result.time_ms:.3f}ms ({result.tflops:.0f} TFLOPS{sol}){detail}")
             elif result.skipped:
                 logger.info(f"  -> SKIPPED (unsupported): {result.error_message}")
             else:
@@ -524,6 +539,8 @@ Examples:
             model = case["model"]
             det_str = "det" if case["deterministic_bwd"] else "non-det"
             swa_str = f" | swa={case['sliding_window_size']}" if case["sliding_window_size"] else ""
+            if case["layout"] == "thd":
+                swa_str += f" | thd fill={case['thd_min_fill']:g}"
             print(
                 f"  [{i}] {model.name} | "
                 f"seq={case['q_seqlen']}x{case['kv_seqlen']} | "

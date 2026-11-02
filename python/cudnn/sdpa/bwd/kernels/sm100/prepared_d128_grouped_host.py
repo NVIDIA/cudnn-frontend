@@ -40,6 +40,7 @@ def host(
     regions: cutlass.Constexpr,
     causal: cutlass.Constexpr[bool],
     stream: driver.CUstream,
+    diag_delete_dq_reduce_add: cutlass.Constexpr[bool] = False,
 ):
     q = _view(q_ptr, geometry[0])
     k = _view(k_ptr, geometry[1])
@@ -55,11 +56,17 @@ def host(
     delta = _scratch(payload, regions[1], cutlass.Float32)
     dk_part = _scratch(payload, regions[2], q.element_type)
     dv_part = _scratch(payload, regions[3], q.element_type)
-    host_dense(q, k, v, o, do, lse, dq, dk, dv, dq_accum, delta, dk_part, dv_part, scale, causal, stream)
+    host_dense(q, k, v, o, do, lse, dq, dk, dv, dq_accum, delta, dk_part, dv_part, scale, causal, stream, diag_delete_dq_reduce_add)
 
 
-def compile_host(geometry, regions, dtype, causal, sm):
-    """Compile from declarations only; addresses and scale remain runtime slots."""
+def compile_host(geometry, regions, dtype, causal, sm, *, diag_delete_dq_reduce_add=False):
+    """Compile from declarations only; addresses and scale remain runtime slots.
+
+    ``diag_delete_dq_reduce_add`` (DIAGNOSTIC, default False) renders the shipped kernels under the unchanged cache key; the
+    armed build (dQ stays zero by design) is keyed apart so it can never be served to a default plan."""
+    key = ("sdpa_bwd_sm100_d128_grouped_dense", ABI_VERSION, geometry, regions, str(dtype), bool(causal), sm)
+    if diag_delete_dq_reduce_add:
+        key += ("diag_delete_dq_reduce_add",)
     types = [dtype] * 5 + [cutlass.Float32] + [dtype] * 3
     args = [cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=4 if i == 5 else 16) for i, t in enumerate(types)]
     return compile_cached(
@@ -71,7 +78,8 @@ def compile_host(geometry, regions, dtype, causal, sm):
         regions,
         bool(causal),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+        bool(diag_delete_dq_reduce_add),
         options=f"--enable-tvm-ffi --gpu-arch sm_{sm}a",
-        cache_key=repr(("sdpa_bwd_sm100_d128_grouped_dense", ABI_VERSION, geometry, regions, str(dtype), bool(causal), sm)),
+        cache_key=repr(key),
         symbol="frost_sdpa_bwd_sm100_d128_grouped_dense_prepared",
     )

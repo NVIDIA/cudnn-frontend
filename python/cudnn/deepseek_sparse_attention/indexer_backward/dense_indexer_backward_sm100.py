@@ -76,6 +76,7 @@ from cutlass.utils.blackwell_helpers import (
 )
 
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
+from cudnn.tensor_adapter import has_tcgen05
 from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator
 
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
@@ -2253,8 +2254,8 @@ def dense_indexer_backward_sm100(
 def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_scale, block_I, ratio, is_varlen, has_q_causal_offsets):
     from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
-    if torch.cuda.get_device_capability()[0] < 10:
-        raise RuntimeError("Requires SM100+")
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
+        raise RuntimeError("Requires SM100+ with tcgen05 (not cc 12.x)")
 
     # Kernel 1: ScoreGradDense — applies ratio causal mask so
     # masked / padding columns produce grad_signal=0 (won't contaminate GEMM).

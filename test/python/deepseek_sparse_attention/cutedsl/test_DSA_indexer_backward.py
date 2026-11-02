@@ -21,17 +21,23 @@ from deepseek_sparse_attention.cutedsl.dsa_reference import (
 )
 
 
-def _require_exact_sm100():
-    """Keep hardware-validation cases on the available SM100 runner.
+def _require_sm100_family():
+    """Keep hardware-validation cases on the SM100-family parts the public gate accepts.
 
     ``dsa_init(min_compute_capability=100)`` means "SM100 **or newer**" — it
-    compares ``major * 10 + minor`` — so an SM103/SM107/SM120 runner falls
-    straight through it. The public gate also accepts SM103, covered by a
-    capability unit test; end-to-end SM103 execution is intentionally not
-    required by this suite yet.
+    compares ``major * 10 + minor`` — so an SM107/SM120 runner would fall
+    straight through it. The public gate accepts SM100 and SM103
+    (``INDEXER_BACKWARD_SM100_CAPABILITIES``), and these cases run on both.
     """
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("this hardware-validation case requires an SM100 (10, 0) GPU")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("this hardware-validation case requires an SM100 or SM103 GPU")
+
+
+def _require_indexer_backward_v2_gpu():
+    """Skip unless the v2 backend supports the current GPU capability."""
+    supported_capabilities = ((10, 0), (10, 3))
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in supported_capabilities:
+        pytest.skip(f"IndexerBackward v2 requires capability in {supported_capabilities}")
 
 
 def _allocate(cfg, sm_scale: float):
@@ -702,9 +708,9 @@ def test_DSA_indexer_backward_wrong_ndim_rejected():
 
 def _require_backend_gpu(backend):
     """Skip unless the current GPU runs ``backend``: ``default`` resolves to the
-    sm90 or sm100 kernels by device, ``sm100_v2`` is exact (10, 0)."""
+    sm90 or sm100 kernels by device, ``sm100_v2`` is the SM100 family ((10, 0) / (10, 3))."""
     if backend == "sm100_v2":
-        _require_exact_sm100()
+        _require_sm100_family()
         return
     major = torch.cuda.get_device_capability()[0]
     if major != 9 and major < 10:
@@ -825,7 +831,7 @@ def test_v2_counter_lives_in_caller_workspace():
     synchronization reproduce it too, and after a call the carve order is
     visible in the buffer (zero counter words, then the fp32 accumulator whose
     bf16 rounding is exactly the returned d_index_k)."""
-    _require_exact_sm100()
+    _require_sm100_family()
     DSA, cuda = _import_dsa()
     inputs = _idxbwd_inputs()
     iq, w, ik, attn, idx, tk, loss_coeff, grad_loss = inputs
@@ -1044,7 +1050,7 @@ def test_DSA_indexer_backward_deterministic_contract(backend, dk_dtype, repeats,
         )
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     cfg = dict(b=2, s_q=NUM_DK_PRODUCER_CTAS // 2 + 1, s_kv=257, head_dim=128, qhead_per_kv_head=64, topk=512)
     index_q, weights, index_k, attn_source, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
@@ -1160,7 +1166,7 @@ def test_DSA_indexer_backward_deterministic_compact_h32(dk_dtype, topk_indices_g
         from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import deterministic_dk_workspace_bytes
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     # With 96 planes, 194 rows makes producer zero revisit its dK plane twice.
     cfg = dict(b=2, s_q=97, s_kv=seqlen_k, head_dim=128, qhead_per_kv_head=32, topk=topk)
@@ -1252,7 +1258,7 @@ def test_DSA_indexer_backward_deterministic_plane_specializations(backend, dk_pl
         from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import deterministic_dk_workspace_bytes
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     cfg = dict(b=1, s_q=s_q, s_kv=128, head_dim=128, qhead_per_kv_head=64, topk=128)
     index_q, weights, index_k, attn_source, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
@@ -1331,7 +1337,7 @@ def test_DSA_indexer_backward_deterministic_workspace_alias_rejected_before_laun
         from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import deterministic_dk_workspace_bytes
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     cfg = dict(b=1, s_q=96, s_kv=128, head_dim=128, qhead_per_kv_head=64, topk=128)
     index_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
@@ -1398,7 +1404,7 @@ def test_DSA_indexer_backward_deterministic_workspace_allows_disjoint_view_of_sa
         from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import deterministic_dk_workspace_bytes
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     cfg = dict(b=1, s_q=96, s_kv=128, head_dim=128, qhead_per_kv_head=64, topk=128)
     source_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
@@ -1543,7 +1549,7 @@ def test_DSA_indexer_backward_deterministic_cuda_graph(backend, s_q):
         from cudnn import DSA
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     cfg = dict(b=1, s_q=s_q, s_kv=128, head_dim=128, qhead_per_kv_head=64, topk=128)
     index_q, weights, index_k, attn_source, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
@@ -1623,7 +1629,7 @@ def test_DSA_indexer_backward_deterministic_topk2048_boundary(backend, s_q, topk
         from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import deterministic_dk_workspace_bytes
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     # With 96 planes, 193 rows makes a producer consume three different rows.
     cfg = dict(b=1, s_q=s_q, s_kv=2048, head_dim=128, qhead_per_kv_head=64, topk=topk)
@@ -1737,6 +1743,204 @@ def test_DSA_indexer_backward_v2_accepts_sm103_capability(monkeypatch):
     assert plan.check_support()
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("capability,supported", [((10, 0), True), ((10, 3), True), ((10, 7), False)])
+def test_indexer_backward_v2_test_guard_matches_backend_capabilities(monkeypatch, capability, supported):
+    """The H32 runtime tests skip major-10 GPUs outside the v2 support set."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+
+    if supported:
+        _require_indexer_backward_v2_gpu()
+    else:
+        with pytest.raises(pytest.skip.Exception):
+            _require_indexer_backward_v2_gpu()
+
+
+@torch_fork_set_rng(seed=1710)
+@pytest.mark.parametrize(
+    "topk,b,topk_indices_global,dw_dtype,dk_dtype",
+    [
+        pytest.param(129, 2, False, torch.float32, torch.float32, marks=pytest.mark.L0, id="tail-129-local-b2-fp32dw-fp32dk"),
+        pytest.param(2048, 2, False, torch.bfloat16, torch.float32, marks=pytest.mark.L1, id="aligned-2048-local-b2-bf16dw-fp32dk"),
+        pytest.param(2051, 2, True, torch.float32, torch.bfloat16, marks=pytest.mark.L1, id="csa-tail-2051-global-b2-fp32dw-bf16dk"),
+        pytest.param(2051, 2, False, torch.float32, torch.float32, marks=pytest.mark.L1, id="csa-tail-2051-local-b2-fp32dw-fp32dk"),
+    ],
+)
+def test_DSA_indexer_backward_wrapper_v2_native_h32(topk, b, topk_indices_global, dw_dtype, dk_dtype):
+    """Native H32 accepts both production logical extents without caller padding.
+
+    The established backend remains the numeric control: for the CSA case it
+    receives an internal-tile-equivalent 2176-slot tensor whose tail is invalid
+    and zero.  The native plan uses no ticket-counter workspace with FP32 dK.
+    """
+    _require_indexer_backward_v2_gpu()
+    DSA = None
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    assert DSA is not None
+
+    padded_topk = ((topk + 127) // 128) * 128
+    cfg = dict(b=b, s_q=16, s_kv=2176, head_dim=128, qhead_per_kv_head=32, topk=topk)
+    index_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
+    if topk_indices_global:
+        batch_offsets = torch.arange(cfg["b"], dtype=torch.int32, device="cuda").view(cfg["b"], 1, 1) * cfg["s_kv"]
+        topk_indices = torch.where(topk_indices >= 0, topk_indices + batch_offsets, topk_indices)
+    grad_loss = torch.ones((), dtype=torch.float32, device="cuda")
+    loss_coeff = float(cfg["b"] * cfg["s_q"])
+
+    d_index_q = torch.empty_like(index_q)
+    d_weights = torch.empty_like(weights, dtype=dw_dtype)
+    d_index_k = torch.empty_like(index_k, dtype=dk_dtype)
+    plan = DSA.IndexerBackward(
+        sample_index_q=index_q,
+        sample_weights=weights,
+        sample_index_k=index_k,
+        sample_d_index_q=d_index_q,
+        sample_d_weights=d_weights,
+        sample_d_index_k=d_index_k,
+        sample_attn_score=attn_score,
+        sample_index_score=index_score,
+        sample_topk_indices=topk_indices,
+        sm_scale=1.0,
+        block_I=128,
+        topk_indices_global=topk_indices_global,
+        backend="sm100_v2",
+    )
+    assert plan.check_support()
+    expected_workspace_bytes = 0 if dk_dtype == torch.float32 else ws_align(index_k.numel() * 4)
+    assert plan.scratch_workspace_bytes() == expected_workspace_bytes
+    workspace = torch.empty(expected_workspace_bytes, dtype=torch.uint8, device="cuda") if expected_workspace_bytes else None
+    plan.compile()
+    native_attn = attn_score.clone()
+    plan.execute(
+        index_q,
+        weights,
+        index_k,
+        d_index_q,
+        d_weights,
+        d_index_k,
+        native_attn,
+        index_score,
+        topk_indices,
+        grad_loss,
+        loss_coeff=loss_coeff,
+        workspace=workspace,
+    )
+
+    pad = padded_topk - topk
+    default_attn = F.pad(attn_score, (0, pad))
+    default_index_score = F.pad(index_score, (0, pad))
+    default_indices = F.pad(topk_indices, (0, pad), value=-1)
+    default_dq = torch.empty_like(index_q)
+    default_dw = torch.empty_like(weights)
+    default_dk = torch.empty_like(index_k, dtype=dk_dtype)
+    DSA.indexer_backward_wrapper(
+        index_q,
+        weights,
+        index_k,
+        default_attn,
+        default_index_score,
+        default_indices,
+        grad_loss,
+        sm_scale=1.0,
+        loss_coeff=loss_coeff,
+        block_I=128,
+        topk_indices_global=topk_indices_global,
+        d_index_q=default_dq,
+        d_weights=default_dw,
+        d_index_k=default_dk,
+        backend="default",
+    )
+    torch.cuda.synchronize()
+
+    # The native and padded paths reduce different physical extents. Their
+    # softmax updates need numerical agreement, not bitwise identity; the
+    # deterministic test below owns the bitwise-stability contract.
+    torch.testing.assert_close(native_attn, default_attn[..., :topk], rtol=3e-6, atol=2e-7)
+    torch.testing.assert_close(d_index_q, default_dq, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(d_weights.float(), default_dw.float(), rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(d_index_k, default_dk, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=1712)
+def test_DSA_indexer_backward_wrapper_v2_native_h32_deterministic():
+    """The public deterministic H32 policy is bitwise stable and accurate."""
+    _require_indexer_backward_v2_gpu()
+    DSA = None
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    assert DSA is not None
+
+    cfg = dict(b=1, s_q=3, s_kv=128, head_dim=128, qhead_per_kv_head=32, topk=128)
+    index_q, weights, index_k, attn_source, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
+    d_index_q = torch.empty_like(index_q)
+    d_weights = torch.empty_like(weights, dtype=torch.float32)
+    d_index_k = torch.empty_like(index_k, dtype=torch.float32)
+    grad_loss = torch.ones((), dtype=torch.float32, device="cuda")
+    loss_coeff = float(cfg["b"] * cfg["s_q"])
+    plan = DSA.IndexerBackward(
+        sample_index_q=index_q,
+        sample_weights=weights,
+        sample_index_k=index_k,
+        sample_d_index_q=d_index_q,
+        sample_d_weights=d_weights,
+        sample_d_index_k=d_index_k,
+        sample_attn_score=attn_source,
+        sample_index_score=index_score,
+        sample_topk_indices=topk_indices,
+        sm_scale=1.0,
+        block_I=128,
+        backend="sm100_v2",
+        deterministic=True,
+    )
+    assert plan.check_support()
+    plan.compile()
+    workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
+
+    def run():
+        attn = attn_source.clone()
+        workspace.fill_(0xA5)
+        plan.execute(
+            index_q,
+            weights,
+            index_k,
+            d_index_q,
+            d_weights,
+            d_index_k,
+            attn,
+            index_score,
+            topk_indices,
+            grad_loss,
+            loss_coeff=loss_coeff,
+            workspace=workspace,
+        )
+        torch.cuda.synchronize()
+        return tuple(t.clone() for t in (d_index_q, d_weights, d_index_k, attn))
+
+    assert_bitwise_runs(run, label="sm100_v2 deterministic H32")
+    check_ref_indexer_backward(
+        index_q,
+        weights,
+        index_k,
+        attn_source,
+        index_score,
+        topk_indices,
+        d_index_q,
+        d_weights,
+        d_index_k,
+        sm_scale=1.0,
+        grad_scale=1.0,
+        cos_min=0.99,
+        rms_rel_max=0.02,
+    )
+
+
 @torch_fork_set_rng(seed=0)
 @pytest.mark.parametrize("topk", _V2_TOPK_PARAMS)
 @with_dsa_indexer_backward_params
@@ -1751,7 +1955,7 @@ def test_DSA_indexer_backward_wrapper_v2(
 ):
     """``backend="sm100_v2"`` keeps the wrapper contract with two-term
     bf16-expansion GEMMs and a deterministic d_weights reduction. Exactly
-    SM100 (``_require_exact_sm100``); every parametrized config here is inside
+    SM100 (``_require_sm100_family``); every parametrized config here is inside
     the declared support envelope, so any error past the gate is a real failure
     and MUST fail -- no skip conversion. topk coverage: 128 = the 1-tile floor
     (odd-tile dK drain, K/S pipes clamped to 1); 256 = 2 tiles (paired dK
@@ -1767,7 +1971,7 @@ def test_DSA_indexer_backward_wrapper_v2(
         from cuda.bindings import driver as cuda  # noqa: F401
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     cfg = dsa_init(
         request=request,
@@ -1892,7 +2096,7 @@ def test_DSA_indexer_backward_wrapper_v2_low_tile_metadata_war(
         from cudnn import DSA  # noqa: F401
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     cfg = dsa_init(
         request=request,
@@ -1971,7 +2175,7 @@ def test_DSA_indexer_backward_wrapper_v2_full_valid_topk2048(
         from cudnn import DSA  # noqa: F401
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     cfg = dsa_init(
         request=request,
@@ -2053,7 +2257,7 @@ def test_DSA_indexer_backward_wrapper_v2_envelope_rejection(
         from cuda.bindings import driver as cuda  # noqa: F401
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     topk = {"topk_2176": 2176, "topk_not_mult_128": 1000}.get(bad, 512)
     cfg = dsa_init(
@@ -2152,7 +2356,7 @@ def test_DSA_indexer_backward_wrapper_v2_batch_local_global_oob(
         from cudnn import DSA  # noqa: F401
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     cfg = dsa_init(
         request=request,
@@ -2254,7 +2458,7 @@ def test_DSA_indexer_backward_wrapper_v2_sm_scale(
         from cuda.bindings import driver as cuda
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     cfg = dsa_init(
         request=request,
@@ -2353,7 +2557,7 @@ def test_DSA_indexer_backward_wrapper_v2_fp32_outputs(
         from cudnn import DSA  # noqa: F401
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     cfg = dsa_init(
         request=request,
@@ -2423,7 +2627,7 @@ def test_DSA_indexer_backward_wrapper_v2_multi_stream(
         from cuda.bindings import driver as cuda
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     cfg = dsa_init(
         request=request,
@@ -2540,7 +2744,7 @@ def test_DSA_indexer_backward_wrapper_v2_stream_none_ambient_streams(
         from cudnn import DSA
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     cfg = dsa_init(
         request=request,
@@ -2644,7 +2848,7 @@ def test_DSA_indexer_backward_wrapper_v2_two_threads(
         from cuda.bindings import driver as cuda
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     cfg = dsa_init(
         request=request,
@@ -2756,12 +2960,12 @@ def test_DSA_indexer_backward_wrapper_v2_multi_device(
         from cuda.bindings import driver as cuda  # noqa: F401
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     if torch.cuda.device_count() < 2:
         pytest.skip("2+ CUDA devices required")
-    if torch.cuda.get_device_capability(1) != (10, 0):
-        pytest.skip("SM100 required on the second device")
+    if torch.cuda.get_device_capability(1) not in ((10, 0), (10, 3)):
+        pytest.skip("SM100 or SM103 required on the second device")
 
     cfg = dsa_init(
         request=request,
@@ -2909,7 +3113,7 @@ def test_DSA_indexer_backward_v2_plan_device_capability(
         from cuda.bindings import driver as cuda  # noqa: F401
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     # Build a real, valid backend="sm100_v2" plan on the true (SM100) device
     # BEFORE patching, so dsa_init's own capability gate and the tensor

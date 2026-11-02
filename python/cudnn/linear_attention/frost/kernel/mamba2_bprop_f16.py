@@ -41,6 +41,8 @@ transposed, key token j on the TMEM lane):
   head the dA^T diagonal, per channel the raw-row dots); the per-token dots and the
   parameter gradients are the helpers' (common/gate_bwd.py, common/head_reduce.py) over the written dQ, dK, dV and the
   inputs.  The dQ and dK written here are per head; the fold to the B / C groups takes the row dots on the way.
+  The exit dots and the D-skip partials are indexed by the exit-slot formula over sequences (chunk 0 of sequence b at
+  slot cu[b] // 128 + 2 b, the dot of chunk c at slot c + 1); a chain piece's slot base comes from the prologue's table.
 
 SMEM layout (227 KB cap):
   Buffer                           Size (B)  Stages
@@ -86,7 +88,7 @@ import cutlass.experimental.cuda.tensor_map as tma
 
 from ..common.thd import emit_checkpoint_seq_descs, emit_seq_descs, TENSOR_MAP_QWORDS
 from ..common.gate_bwd import exit_slot_table_body
-from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, WORK_ITEM_DSTATE_DST, decode_head, decode_work_item, order_body
+from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, WORK_ITEM_DSTATE_DST, WORK_ITEM_FINAL_DST, decode_head, decode_work_item, order_body
 
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log decays -> the kernel's log2 domain
 from cudnn.frost.tile_dsl.barrier import (
@@ -1239,6 +1241,7 @@ def compute1_warp_group(
         )
         head_o, v_offset = decode_head(cfg, head_idx)
         n_local = compute_end - write_start
+        final_dst = mWorkItems[tile_idx, WORK_ITEM_FINAL_DST]
         if cutlass.const_expr(cfg.has_d):
             if cutlass.const_expr(cfg.d_per_channel):
                 if n_local > 0:
@@ -1313,7 +1316,7 @@ def compute1_warp_group(
             bars.mb_dv_unscaled_ready[0].wait(dv_unscaled_index.phase)
             dv_unscaled_index = advance(dv_unscaled_index, 1)
             do_row_address = do_address + do_buffer * do_stage_bytes
-            final_tile = reverse_idx == 0 and write_end == batch_num_chunks
+            final_tile = reverse_idx == 0 and write_end == batch_num_chunks and final_dst >= cutlass.Int32(0)
             u_dot_lo = zero
             u_dot_hi = zero
             for i in cutlass.range_constexpr(num_ldtms):
@@ -1424,6 +1427,7 @@ def compute2_warp_group(
     mDstate0,
     mExit,
     mSkipPart,
+    mExitBase,
     sScheduler,
     bars,
 ):
@@ -1482,6 +1486,11 @@ def compute2_warp_group(
         )
         head_o, v_offset = decode_head(cfg, head_idx)
         n_local = compute_end - write_start
+        final_dst = mWorkItems[tile_idx, WORK_ITEM_FINAL_DST]
+        if cutlass.const_expr(mExitBase is not None):
+            exit_base = cutlass.Int32(mExitBase[batch_idx])
+        else:
+            exit_base = batch_start // cutlass.Int32(cfg.b_t) + 2 * batch_idx
         if n_local > 0:
             # ---- dS seed: d_final_state or zeros -> TMEM + bf16 SMEM ------------------------
             if cutlass.const_expr(cfg.use_dstate_in):
@@ -1523,7 +1532,7 @@ def compute2_warp_group(
                 # ---- D-skip partials: per head the warp's 32 diagonal entries of dA^T = V dO^T (the per-token <x_j, dO_j>),
                 # per channel the raw-row dots of the warp's 32 tokens, one channel pair per lane; one row per warp per slot ----
                 if cutlass.const_expr(cfg.skip_bwd_partials):
-                    skip_row = (batch_start // cutlass.Int32(cfg.b_t) + 2 * batch_idx + chunk_idx) * 4 + warp_in_group
+                    skip_row = (exit_base + chunk_idx) * 4 + warp_in_group
                     if cutlass.const_expr(cfg.d_per_channel):
                         bars.mb_v_ready[0].wait(v_index.phase)
                         v_index = advance(v_index, 1)
@@ -1575,7 +1584,7 @@ def compute2_warp_group(
                 # ---- dstate pass: exit dot, bf16 SMEM copy, pre-scale ----------------------------
                 bars.mb_state_ready[0].wait(state_index.phase)
                 state_index = advance(state_index, 1)
-                final_tile = reverse_idx == 0 and write_end == batch_num_chunks
+                final_tile = reverse_idx == 0 and write_end == batch_num_chunks and final_dst >= cutlass.Int32(0)
                 state_panel = sState_base + (cg2_tidx // box_elements) * (cfg.d_v * box_elements)
                 state_col = cg2_tidx % box_elements
                 final_dot = zero
@@ -1625,7 +1634,7 @@ def compute2_warp_group(
                     dv_scaled_index = advance(dv_scaled_index, 1)
                 nvvm.barrier_cta_sync_aligned(cfg.cg2_sync_barrier_id, thread_count=num_threads_cg2)
                 if cg2_tidx == 0:
-                    exit_slot = batch_start // cutlass.Int32(cfg.b_t) + 2 * batch_idx + chunk_idx
+                    exit_slot = exit_base + chunk_idx
                     if chunk_idx < write_end:
                         mExit[exit_slot, head_o] = ((sExit[0] + sExit[1]) + sExit[2]) + sExit[3]
                     if final_tile:
@@ -1731,6 +1740,7 @@ def frost_mamba2_bprop(
     mDstate0: Optional[cute.Tensor],
     mExit: cute.Tensor,
     mSkipPart: Optional[cute.Tensor],
+    mExitBase: Optional[cute.Tensor],
     mWorkItems: cute.Tensor,
     mCount: cute.Tensor,
     mScheduler: cute.Tensor,
@@ -1966,6 +1976,7 @@ def frost_mamba2_bprop(
             mDstate0=mDstate0,
             mExit=mExit,
             mSkipPart=mSkipPart,
+            mExitBase=mExitBase,
             sScheduler=sScheduler,
             bars=bars,
         )
@@ -2468,6 +2479,7 @@ def host(
     state_checkpoints: cute.Tensor,
     exit_dots: cute.Tensor,
     skip_bwd_part: Optional[cute.Tensor],
+    exit_base: Optional[cute.Tensor],
     cu_seqlens: cute.Tensor,
     dstate_in: Optional[cute.Tensor],
     dstate0: Optional[cute.Tensor],
@@ -2553,6 +2565,7 @@ def host(
         dstate0,
         exit_dots,
         skip_bwd_part,
+        exit_base,
         work_items,
         work_count,
         scheduler_counter,

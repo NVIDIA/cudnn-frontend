@@ -971,7 +971,7 @@ artifact can never be reused by accident:
   `$XDG_CACHE_HOME/cudnn_frontend/compiled_plans`; `set_cache_dir()` for a
   caller that owns a workspace (FlashInfer); `CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1`
   turns it off; `stats()` reports hits / misses / bypassed / invalid / pruned /
-  memo_hits per process. Bump `_SCHEMA` on any incompatible change.
+  memo_hits / seeded / seed_rejected per process. Bump `_SCHEMA` on any incompatible change.
 - **Dead environments are retired.** The manifest hashes the package's source,
   so every edited checkout and every CI commit mints an environment directory
   that will never be hit again — a few hundred MB per commit on a runner with a
@@ -987,6 +987,40 @@ Not yet routed: kernels compiled from real tensors at call time (the
 remaining linear-attention `chunk_*` launchers, the SDPA adapters' `_dot_fn` /
 `_reduce_fn` / `_setup_fn` helpers): a key for them has to spell the traced
 tensors' dtype, rank and dynamic marks; same hook once it does.
+
+### Serializing a python-engine plan
+
+`serialize()` / `deserialize()` keep their classic signatures and follow the
+SELECTED plan. A backend plan is the cuDNN backend's blob, as before. A python
+engine's plan is not a blob: it is a deterministic function of the graph and its
+`(engine_id, knobs)`, the pair `create_execution_plan` replays. So its blob
+(`cudnn._plan_serdes`, magic `CUDNN_FE_PYPLAN`) carries:
+
+- **the graph**: every node and tensor of the IR, tensors by uid. A value the
+  format cannot represent exactly (a `score_mod` callback, a framework object)
+  refuses serialization; nothing is dropped. Buffers bound at build time
+  (`_data_bindings`) are not carried; pass them to `execute()`.
+- **the plan**: engine id, engine name (checked on load) and public knobs. Ids
+  and knob values are append-only, so the recipe stays valid on any frontend
+  that still ships the engine.
+- **the kernels** (`include_kernels=True`, the default): the compiled-cache
+  entries the plan's build used (`compiled_cache.record_entries()` around
+  `build_plan`), each with the environment manifest it was compiled under.
+
+`pygraph().deserialize(blob)` rebuilds the IR into an empty graph, installs each
+kernel with `compiled_cache.seed_entry` **only when its manifest equals this
+process's exactly** (the same identity as the cache directory, so a stale
+object is never loaded), then replays `create_execution_plan`, pins it and
+builds it: `compile_cached` hits the seeded entries and still checks each
+record's key. A refused or missing kernel compiles as usual;
+`enforce_precompiled=True` raises instead. Measured on B200 (bf16 SDPA prefill
+b2 h8 s1024 d128): build 3.1 s; deserialize into another process with an
+empty cache 33 ms, with imports already done (a backend plan takes 23-30 ms).
+3 kernels seeded, zero compiles, O bitwise equal.
+
+The kernels are native code: deserialize only blobs from a trusted source. The
+C++ `Graph::deserialize` does not read this format. Running a python-engine
+plan from C++ is a separate problem: the engine's host logic is Python.
 
 ## Key invariants
 

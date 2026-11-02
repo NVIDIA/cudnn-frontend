@@ -9,7 +9,7 @@ in a **single run** that emits two tables:
 
   * per-call    -- each variant timed with a pair of CUDA events and a synchronize,
                    launch/host overhead included (reproduces the methodology behind the
-                   per-call wall-clock table in docs/fe-oss-apis/csa.md).
+                   per-call wall-clock table in docs/operations/sparse_attention/csa.md).
   * graph       -- the SAME region captured into a CUDA graph and timed as a replay.
 
 Graph variants are captured **symmetrically** for eager and fused, as two directly

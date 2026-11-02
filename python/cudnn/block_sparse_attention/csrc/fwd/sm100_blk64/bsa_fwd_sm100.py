@@ -305,9 +305,7 @@ class BlockSparseAttnForwardSm100Blk64:
         self.is_sage_fp8 = mQScale is not None
         # The persistent BF16 path keeps the epilogue exchange buffer + sO inside ONE KV smem stage (two column
         # passes of 32 KB), so the next tile's K0/K1 can be prefetched into the other two stages.
-        self.epi_single_stage = (
-            self.short_tile_opt and self.is_persistent and not self.is_sage_fp8 and not self.is_split_kv and self.o_dtype == cutlass.BFloat16
-        )
+        self.epi_single_stage = self.short_tile_opt and self.is_persistent and not self.is_sage_fp8 and self.o_dtype == cutlass.BFloat16
         if const_expr(self.epi_single_stage):
             self.epi_exchange_f32_count = 2 * 4 * 32 * 32
         self.epi_sO_input_offset = self.epi_exchange_f32_count * (Float32.width // self.k_dtype.width)

@@ -37,7 +37,7 @@ def _prefill_fixture(dq, dv, paged, split, dtype, hnd=False, arch="sm100"):
     if arch == "sm120":
         path = path.with_name("prepared_host.py")
     host = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == ("host" if arch == "sm120" else "_host"))
-    s.order = [arg.arg for arg in host.args.args if "Constexpr" not in ast.unparse(arg.annotation)]
+    s.order = [arg.arg for arg in host.args.args if arg.annotation is None or "Constexpr" not in ast.unparse(arg.annotation)]
     s.index = {name: i for i, name in enumerate(s.order)}
     s.template = [None] * len(s.order)
     for name in ("seq_q_lens_addr", "lse_ext", "n_thd_units"):

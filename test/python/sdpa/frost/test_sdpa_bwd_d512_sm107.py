@@ -107,7 +107,7 @@ def _spec(name=_ENGINE):
 # =========================================================================== registration / capabilities (host)
 
 
-def test_engine_is_registered_and_opt_in():
+def test_engine_is_registered_and_offered_by_default():
     from cudnn.engines.engine_ids import FROST_SDPA_BWD_ID_BASE
     from cudnn.engines.manifest import MANIFEST
     from cudnn.sdpa.bwd.engines import ENGINE_SPECS
@@ -116,7 +116,8 @@ def test_engine_is_registered_and_opt_in():
     fam = next(f for f in MANIFEST if f.name == _FAMILY_NAME)
     assert _ENGINE in fam.slots, f"{_ENGINE} has no manifest slot (append slot {_SLOT}; never reuse a retired slot)"
     slot = fam.slots[_ENGINE]
-    assert slot.slot == _SLOT and slot.opt_in, "new engines stay opt-in until they earn arch coverage + benchmarks"
+    # Default since 2026-10-27, behind the backend (cudnn.sdpa.bwd.heuristics.TRAIL_ONLY_ROWS).
+    assert slot.slot == _SLOT and not slot.opt_in
     assert FROST_SDPA_BWD_ID_BASE + slot.slot == _ENGINE_ID
     names = [s.name for s in ENGINE_SPECS]
     # Append-only: this row ranks after every row that existed when it landed (a membership + order pin; the position is the

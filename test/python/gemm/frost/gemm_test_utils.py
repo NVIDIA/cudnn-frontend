@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import cudnn
+import re
 from dataclasses import replace
 
 import pytest
@@ -50,6 +51,21 @@ def with_static_segmented_capacity(live: torch.Tensor, total_rows: int, num_grou
     result = torch.ones((1, capacity_rows, scale_cols), dtype=live.dtype, device=live.device)
     result.view(-1)[: live.numel()].copy_(live.reshape(-1))
     return result
+
+
+def plan_as_sm100(monkeypatch):
+    """The SM100 compiler, for planning-only checks of SM100 configs on any GPU.
+
+    Its arch probe and the active family's compiler's (the template gate reads that
+    one) are pinned to SM100, so the active GPU's own gate does not answer first. On
+    SM120 the active family is the sm120 tree, so the SM100 compiler is named
+    explicitly rather than reached through ``cudnn.gemm.frost.compiler``."""
+    from cudnn.gemm.frost import compiler as active
+    from cudnn.gemm.frost.sm100 import compiler as sm100
+
+    for module in {id(sm100): sm100, id(active): active}.values():
+        monkeypatch.setattr(module, "_current_arch", lambda device=None: 100)
+    return sm100
 
 
 def skip_unless_pipeline_active(cfg) -> None:
@@ -114,9 +130,11 @@ class Plan:
     FROST engine's auto-select). Exposes chain / binding / block_scale /
     aux_names; callable with a variant pack."""
 
-    def __init__(self, graph, config=None, cta_group=None, force_stg_epi=False, swap_ab=False):
+    def __init__(self, graph, config=None, cta_group=None, force_stg_epi=False, swap_ab=False, padded_e2m1=False):
         self.g = graph
         kw = {}
+        if padded_e2m1:
+            kw["padded_e2m1"] = True
         if swap_ab:
             config = replace(config or DEFAULT_CONFIG, swap_ab=True)
         if config is not None:
@@ -151,6 +169,36 @@ def resolve(name):
 def kw(name):
     """resolve() packaged as jit/Plan kwargs."""
     return dict(config=by_name(name))
+
+
+# --- kernel PTX -------------------------------------------------------------
+
+
+def keep_kernel_ptx(monkeypatch, compiler, dump_dir) -> None:
+    """Compile the kernels ``compiler`` (a family compiler module) renders in this test
+    with ``--keep-ptx`` and without the persistent compiled cache, whose reloaded object
+    carries no PTX; the PTX files and the generated sources (unique to ``dump_dir``) stay
+    under ``dump_dir``. :func:`kernel_ptx` reads the PTX back."""
+    monkeypatch.setenv("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", "1")
+    monkeypatch.setenv("CUDNN_FRONTEND_GEMM_KERNEL_CACHE", str(dump_dir))
+    monkeypatch.setattr(compiler, "_FROST_COMPILE_OPTIONS", f"{compiler._FROST_COMPILE_OPTIONS} --keep-ptx --dump-dir={dump_dir}".strip())
+
+
+def kernel_ptx(compiled) -> str:
+    """The PTX of a plan (or :class:`Plan`) compiled under :func:`keep_kernel_ptx`."""
+    ptx = getattr(compiled, "_compiled", compiled)._launchable.__ptx__
+    assert ptx, "the kernel carries no PTX: compile it under keep_kernel_ptx"
+    return ptx
+
+
+def brev_bfind_types(ptx: str) -> list[str]:
+    """The type (``s32``, ``u32``, ...) of every ``bfind`` in ``ptx`` that reads a ``brev.b32``
+    result of the same function: each lowest-set-bit search ``31 - bfind(brev(x))``."""
+    types = []
+    for body in re.split(r"\.(?:entry|func)\s", ptx)[1:]:  # PTX registers are scoped to their function
+        reversed_regs = set(re.findall(r"\bbrev\.b32\s+(%r\d+),", body))
+        types += [t for t, src in re.findall(r"\bbfind\.([\w.]+)\s+%r\d+,\s*(%r\d+);", body) if src in reversed_regs]
+    return types
 
 
 # --- variant packs ----------------------------------------------------------
@@ -221,11 +269,15 @@ def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-def to_blocked(x: torch.Tensor) -> torch.Tensor:
-    """Reorder a (rows, cols) SF tensor into the F8_128x4 blocked layout."""
+def to_blocked(x: torch.Tensor, k_pad_byte: int = 0) -> torch.Tensor:
+    """Reorder a (rows, cols) SF tensor into the F8_128x4 blocked layout.
+
+    ``k_pad_byte`` fills the K-padding slots (columns ``cols`` up to the next multiple of 4) of every row."""
     rows, cols = x.shape
     nrb, ncb = ceil_div(rows, 128), ceil_div(cols, 4)
     pad = torch.zeros(nrb * 128, ncb * 4, dtype=x.dtype, device=x.device)
+    if k_pad_byte:
+        pad.view(torch.uint8)[:, cols:] = k_pad_byte
     pad[:rows, :cols] = x
     blocks = pad.view(nrb, 128, ncb, 4).permute(0, 2, 1, 3)
     return blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16).flatten()
@@ -337,6 +389,23 @@ def assert_block_scale_reduction_close(actual, expected, mode):
         torch.testing.assert_close(actual, expected, atol=2.0, rtol=1e-4)
     else:
         torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-5)
+
+
+# --- integer output reference ------------------------------------------------
+
+# Ties, fractions, both int8 / uint8 range edges, values past the int16 range and non-finite values, all exact in bf16.
+INT8_STORE_VALUES = (0.5, -0.5, 1.5, 2.5, -2.5, 2.75, -2.75, 126.5, 127.5, -127.5, 128.0, -129.0, 200.0, 255.0, 256.0, 300.0, -300.0, 40960.0, -40960.0) + (
+    float("inf"),
+    float("-inf"),
+    float("nan"),
+)
+
+
+def int8_store_ref(x: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """What cuDNN's native engines store for an int8 / uint8 output (cvt.rni.sat):
+    round half to even, saturate to the dtype's range (inf included), NaN -> 0."""
+    info = torch.iinfo(out_dtype)
+    return torch.nan_to_num(x.float(), nan=0.0).round().clamp(info.min, info.max).to(out_dtype)
 
 
 # --- shared MoE fixtures -----------------------------------------------------

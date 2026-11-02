@@ -132,7 +132,14 @@ def _sparse_score_recompute(
     assert num_head > num_head_kv and num_head % num_head_kv == 0, f"MQA required: num_head={num_head}, num_head_kv={num_head_kv}"
     qhead_per_kvhead = num_head // num_head_kv
 
-    tile_m, num_head_tiles = _compute_tile_m(qhead_per_kvhead)
+    if not is_index_scores and qhead_per_kvhead == 96:
+        # H96 is not divisible by the usual H64 tile. H48 x 2 preserves
+        # complete head coverage and is faster than externally padding the
+        # attention Q/LSE inputs to H128. Keep this target-only specialization
+        # out of the indexer and dense score-recompute paths.
+        tile_m, num_head_tiles = 48, 2
+    else:
+        tile_m, num_head_tiles = _compute_tile_m(qhead_per_kvhead)
 
     _require_int32_contiguous(topk_indices, "topk_indices")
     topk_max = topk_indices.shape[-1]

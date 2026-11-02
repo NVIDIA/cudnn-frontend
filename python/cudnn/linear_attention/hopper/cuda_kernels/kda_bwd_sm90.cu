@@ -43,7 +43,6 @@ static constexpr int BT        = 64;   // chunk length
 static constexpr int BCB       = 16;   // anchor sub-block
 static constexpr int NSB       = BT / BCB;
 static constexpr float RCP_LN2 = 1.4426950408889634f;
-static constexpr float KSCALE  = 0.08838834764831845f;  // 1/sqrt(128)
 // 136 words spreads 8 mma rows x 4 column pairs over all 32 banks; a 132-word
 // stride puts rows r and r+1 four banks apart, so the 16-lane phase of every
 // LDS.64 at mma coordinates is 2-way conflicted.
@@ -555,6 +554,7 @@ __launch_bounds__(PNT, 1) void k_prep(const bf16* __restrict__ q,
                                       bf16* __restrict__ dvl,
                                       int T,
                                       int H,
+                                      float scale,
                                       bool single_sequence) {
     const int cs = blockIdx.x, h = blockIdx.y;
     const int L = chunk_len_t<FULL>(cs, cs_len, T, single_sequence);
@@ -734,7 +734,7 @@ __launch_bounds__(PNT, 1) void k_prep(const bf16* __restrict__ q,
                 const int i = sb * 16 + (lane >> 2) + (rp << 3), r = rp * 2;
                 if (isQ)
                     *reinterpret_cast<uint32_t*>(sAqk + swz(i, j0, 64)) =
-                        bf2((j0 <= i) ? ac[t][r] * KSCALE : 0.f, (j0 + 1 <= i) ? ac[t][r + 1] * KSCALE : 0.f);
+                        bf2((j0 <= i) ? ac[t][r] * scale : 0.f, (j0 + 1 <= i) ? ac[t][r + 1] * scale : 0.f);
                 else {
                     const float bi       = sBeta[i];
                     sM[i * MST + j0]     = (j0 < i) ? ac[t][r] * bi : 0.f;
@@ -878,8 +878,8 @@ __launch_bounds__(PNT, 1) void k_prep(const bf16* __restrict__ q,
 #pragma unroll
         for (int t = 0; t < 4; ++t) {
             const float eg = ex2(g.v[t]);
-            // qg carries 1/sqrt(D): its only consumer is  P += scale * qg^T dO
-            qv.v[t] *= eg * KSCALE;
+            // qg carries the query scale: its only consumer is  P += scale * qg^T dO
+            qv.v[t] *= eg * scale;
             kv.v[t] *= ex2(gnl.v[t] - g.v[t]);
             wv.v[t] *= b * eg;
         }
@@ -1369,6 +1369,7 @@ __launch_bounds__(BNT, 1) void k_bwd(const bf16* __restrict__ q,
                                      float* __restrict__ dbeta,
                                      int T,
                                      int H,
+                                     float scale,
                                      bool single_sequence) {
     const int cs = blockIdx.x, h = blockIdx.y;
     const int L = chunk_len_t<FULL>(cs, cs_len, T, single_sequence);
@@ -1510,7 +1511,7 @@ __launch_bounds__(BNT, 1) void k_bwd(const bf16* __restrict__ q,
 #pragma unroll
             for (int rp = 0; rp < 2; ++rp) {
                 const int i = i0 + rp * 8, r = rp * 2;
-                const float v0 = dAq[j][r] * KSCALE, v1 = dAq[j][r + 1] * KSCALE;
+                const float v0 = dAq[j][r] * scale, v1 = dAq[j][r + 1] * scale;
                 *reinterpret_cast<uint32_t*>(sdAqk + o0 + rp * (8 * 64)) =
                     bf2((c0 < i) ? v0 : 0.f, (c0 + 1 < i) ? v1 : 0.f);
                 if (c0 == i) sDiag[i] = v0;
@@ -1579,8 +1580,8 @@ __launch_bounds__(BNT, 1) void k_bwd(const bf16* __restrict__ q,
         for (int rp = 0; rp < 2; ++rp) {
             const int i = i0 + rp * 8, r = rp * 2;
             const float2 gi = *reinterpret_cast<const float2*>(sG + i * GST + d0);
-            dqa[j][r]       = KSCALE * dqa[j][r] * ex2(gi.x);
-            dqa[j][r + 1]   = KSCALE * dqa[j][r + 1] * ex2(gi.y);
+            dqa[j][r]       = scale * dqa[j][r] * ex2(gi.x);
+            dqa[j][r + 1]   = scale * dqa[j][r + 1] * ex2(gi.y);
             dka[j][r]       = dka[j][r] * ex2(gn.x - gi.x);
             dka[j][r + 1]   = dka[j][r + 1] * ex2(gn.y - gi.y);
             *reinterpret_cast<uint32_t*>(sDW + o0 + rp * (8 * 128)) = bf2(-dwa[j][r], -dwa[j][r + 1]);

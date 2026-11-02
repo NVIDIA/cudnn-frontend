@@ -150,6 +150,7 @@ def chain_forward_host(
         None,
         None,
         None,
+        None,
         stream,
     )
     mamba2_recompute_f16.host(
@@ -171,6 +172,7 @@ def chain_forward_host(
         summary_count,
         scheduler_summary,
         transition,
+        cutlass.Int32(0),
         cutlass.Int32(0),
         dt_min,
         dt_max,
@@ -222,7 +224,21 @@ def chain_forward_host(
     )
 
 
-def build_configs(io_dtype, *, store_final_state, enable_checkpoints, dt_softplus, has_d, d_per_channel, has_z, store_pre_gate, max_active_clusters, d_k, d_v):
+def build_configs(
+    io_dtype,
+    *,
+    store_final_state,
+    enable_checkpoints,
+    dt_softplus,
+    has_d,
+    d_per_channel,
+    has_z,
+    store_pre_gate,
+    max_active_clusters,
+    d_k,
+    d_v,
+    checkpoint_dtype=None,
+):
     """The summary pass's recompute config (zero state in, every slot's end state out; the prefill's K, V descriptor
     arrays) and the main pass's config (seeded from the fp32 chain state)."""
     summary_cfg = mamba2_recompute_f16.build_cfg(
@@ -243,6 +259,7 @@ def build_configs(io_dtype, *, store_final_state, enable_checkpoints, dt_softplu
         use_initial_state=True,
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
+        checkpoint_dtype=checkpoint_dtype,
         dt_softplus=dt_softplus,
         has_d=has_d,
         d_per_channel=d_per_channel,
@@ -329,6 +346,7 @@ def build_chain_forward(
         bool(length_rule),
         bool(dt_softplus),
         int(checkpoint_every_n_tokens) > 0,
+        str(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else "none",
         final_state is not None,
         has_seed,
         seed_indices is not None,
@@ -340,6 +358,7 @@ def build_chain_forward(
             io_dtype,
             store_final_state=final_state is not None,
             enable_checkpoints=int(checkpoint_every_n_tokens) > 0,
+            checkpoint_dtype=get_dtype(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else None,
             dt_softplus=dt_softplus,
             has_d=d is not None,
             d_per_channel=d is not None and len(d.shape) == 2,

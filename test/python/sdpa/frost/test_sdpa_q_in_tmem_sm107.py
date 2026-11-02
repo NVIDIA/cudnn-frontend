@@ -65,9 +65,8 @@ def test_the_field_is_appended_the_seam_is_private_and_the_pick_without_the_geom
     from cudnn.sdpa.fwd import config_sm107 as c
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
-    assert [f.name for f in dataclasses.fields(TemplateParams)][
-        -1
-    ] == "q_in_tmem" and TemplateParams().q_in_tmem == 0, "append-only; 0 renders every record byte-identically"
+    names = [f.name for f in dataclasses.fields(TemplateParams)]
+    assert names[names.index("s_slots") + 1] == "q_in_tmem" and TemplateParams().q_in_tmem == 0, "append-only; 0 renders every record byte-identically"
     assert c._Q_IN_TMEM_OVERRIDE_FOR_SWEEPS is None, "the seam is a per-test / per-sweep pin, never a module default"
     assert c.SMALL_D_Q_IN_TMEM == frozenset({0, 1}) and "SMALL_D_Q_IN_TMEM" in c.__all__ and "sm107_q_in_tmem_pick" in c.__all__
     assert c._CfgSm107.Q_IN_TMEM == 0

@@ -7,9 +7,7 @@ are warp-uniform, dQ reductions elected; both return 32-lane credits.
 
 Sequence lengths need not be tile multiples: the tail Q / K / V / dO boxes
 zero-fill, the tail dK / dV stores and dQ reductions clip, the tail Stats rows
-publish -inf and the tail key rows are masked before the exponent, so every tail
-P and dS entry is exactly zero (a zero-filled key row must not exponentiate
-exp(-LSE), which overflows for a very negative LSE).
+publish -inf and the tail key rows are masked before the exponent.
 """
 
 from typing import NamedTuple
@@ -29,9 +27,13 @@ from cudnn.frost.tile_dsl.pointwise import ffma2, fmul2, fp32_to_fp16
 from cudnn.frost.tile_dsl.scheduler import Sched, read_clc_payload
 from cudnn.frost.tile_dsl.tma import tma_load_subtiles, tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait
 
-from ...config_sm100_d128_accum import BAR_LAYOUT, CFG
+from cudnn.sdpa.bwd.config_sm100_d128_accum import make_bar_layout, make_config
 
+HEAD_DIM = globals().get("FROST_TEMPLATE_PARAMS", 128)
+CFG = make_config(HEAD_DIM)
+BAR_LAYOUT = make_bar_layout(CFG)
 LOG2E = 1.4426950408889634
+_DO_STEPS = CFG.D // CFG.K_HW // CFG.DO_SUBTILES
 
 
 class Bars(NamedTuple):
@@ -90,11 +92,11 @@ def _operand(slab, offset, dtype, *, transpose=False, fp32=False):
     )
 
 
-def _mma_desc(dtype, *, atranspose=False, btranspose=False):
+def _mma_desc(dtype, *, atranspose=False, btranspose=False, N=CFG.N, K=CFG.D):
     return MmaDesc(
         M=CFG.M,
-        N=CFG.N,
-        K=CFG.D,
+        N=N,
+        K=K,
         bpe_a=CFG.BPE,
         bpe_b=CFG.BPE,
         tile_k_hw=CFG.K_HW,
@@ -102,7 +104,7 @@ def _mma_desc(dtype, *, atranspose=False, btranspose=False):
         btranspose=btranspose,
         cta_group=1,
         idesc=nvvm.Tcgen05InstrDesc.build(
-            c_dtype=cutlass.Float32, a_dtype=dtype, b_dtype=dtype, m_dim=CFG.M, n_dim=CFG.N, a_major=int(atranspose), b_major=int(btranspose)
+            c_dtype=cutlass.Float32, a_dtype=dtype, b_dtype=dtype, m_dim=CFG.M, n_dim=N, a_major=int(atranspose), b_major=int(btranspose)
         ),
         kind=nvvm.Tcgen05MMAKind.F16,
     )
@@ -188,11 +190,14 @@ def _tensor_map(tensor, box):
 
 
 @cute.jit
-def _bounds(block, sq, causal: cutlass.Constexpr[bool]):
+def _bounds(block, sq, causal: cutlass.Constexpr[bool], window: cutlass.Constexpr[int] = 0):
     lo = cutlass.Int32(0)
     if cutlass.const_expr(causal):
         lo = block
-    return lo, (sq + CFG.N - 1) // CFG.N
+    hi = (sq + CFG.N - 1) // CFG.N
+    if cutlass.const_expr(window > 0):
+        hi = cute.math.min(hi, (block * CFG.M + CFG.M + window - 1 + CFG.N - 1) // CFG.N)
+    return lo, hi
 
 
 @cute.jit
@@ -220,7 +225,9 @@ def _stats(slab, lse, delta, row, group, qbase, sq, batch, head, scale):
 
 
 @cute.jit
-def _p_values(slab, tmem_base, row, group, block, qtile, lo, skv, scale, causal: cutlass.Constexpr[bool], dtype: cutlass.Constexpr):
+def _p_values(
+    slab, tmem_base, row, group, block, qtile, lo, skv, scale, causal: cutlass.Constexpr[bool], dtype: cutlass.Constexpr, window: cutlass.Constexpr[int] = 0
+):
     address = tmem_base + group * 64
     a = _tmem_load(address, 32)
     b = _tmem_load(address + 32, 32)
@@ -236,16 +243,22 @@ def _p_values(slab, tmem_base, row, group, block, qtile, lo, skv, scale, causal:
     # would put NaN into dQ.  Only the last KV tile pays the select.
     key_tail = (block + 1) * CFG.M > skv
     key_valid = kr < skv
+    if cutlass.const_expr(window > 0):
+        window_edge = (qtile + 1) * CFG.N - 1 - block * CFG.M >= window
     for chunk in cutlass.range_constexpr(16):
         stat = _view(slab, CFG.STATS, cutlass.Float32, CFG.N).subview(group * 64 + chunk * 4).load(vector_size=4, alignment=16)
         for pair in cutlass.range_constexpr(2):
             i = chunk * 4 + pair * 2
             s0, s1 = scores[i], scores[i + 1]
+            qc = qtile * CFG.N + group * 64 + i
             if cutlass.const_expr(causal):
                 if qtile == lo:
-                    qc = qtile * CFG.N + group * 64 + i
                     s0 = cutlass.Float32(arith.select((kr <= qc).ir_value(), s0.ir_value(), neg_inf.ir_value()))
                     s1 = cutlass.Float32(arith.select((kr <= qc + 1).ir_value(), s1.ir_value(), neg_inf.ir_value()))
+            if cutlass.const_expr(window > 0):
+                if window_edge:
+                    s0 = cutlass.Float32(arith.select((kr + (window - 1) >= qc).ir_value(), s0.ir_value(), neg_inf.ir_value()))
+                    s1 = cutlass.Float32(arith.select((kr + (window - 1) >= qc + 1).ir_value(), s1.ir_value(), neg_inf.ir_value()))
             if key_tail:
                 s0 = cutlass.Float32(arith.select(key_valid.ir_value(), s0.ir_value(), neg_inf.ir_value()))
                 s1 = cutlass.Float32(arith.select(key_valid.ir_value(), s1.ir_value(), neg_inf.ir_value()))
@@ -296,6 +309,7 @@ def _softmax_loop(
     scale,
     causal: cutlass.Constexpr[bool],
     dtype: cutlass.Constexpr,
+    window: cutlass.Constexpr[int] = 0,
 ):
     nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
     tid = cute.arch.thread_idx()[0]
@@ -307,12 +321,12 @@ def _softmax_loop(
     while valid != 0:
         if cutlass.const_expr(not causal):
             _credit(bars.sched_empty[sched_state.idx])
-        lo, hi = _bounds(block, sq, causal)
+        lo, hi = _bounds(block, sq, causal, window)
         if lo < hi:
             _stats(slab, lse, delta, row, group, lo * CFG.N, sq, batch, head, scale)
         for qtile in cutlass.range(lo, hi, 1, unroll=1):
             _wait_tcgen(bars.s_done, state.phase)
-            p = _p_values(slab, tmem_base, row, group, block, qtile, lo, skv, scale, causal, dtype)
+            p = _p_values(slab, tmem_base, row, group, block, qtile, lo, skv, scale, causal, dtype, window)
             nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
             bars.p_ready.arrive()
@@ -347,10 +361,10 @@ def _store_dq_slice(slab, row, values, index: cutlass.Constexpr[int]):
 
 @cute.jit
 def _native_epilogue(slab, tmem_base, bars, row, live, empty_phase, dtype: cutlass.Constexpr, dk: cutlass.Constexpr[bool]):
-    plane = 384 if cutlass.const_expr(dk) else 256
+    plane = 256 + CFG.D if cutlass.const_expr(dk) else 256
     base = CFG.ALIAS + (CFG.OPERAND_BYTES if cutlass.const_expr(dk) else 0)
-    last_slice = 3 if cutlass.const_expr(dk) else 1
-    for half in cutlass.range_constexpr(2):
+    last_slice = (CFG.OPERAND_BYTES * (2 if cutlass.const_expr(dk) else 1)) // CFG.SLICE_BYTES - 1
+    for half in cutlass.range_constexpr(CFG.D // 64):
         vals = cutlass.Vector.from_elements(tuple(cutlass.Float32(0.0) for _ in range(64)), cutlass.Float32)
         if live:
             vals = _tmem_load(tmem_base + plane + half * 64, 64)
@@ -383,6 +397,7 @@ def _epilogue_loop(
     swizzle: cutlass.Constexpr[int],
     causal: cutlass.Constexpr[bool],
     dtype: cutlass.Constexpr,
+    window: cutlass.Constexpr[int] = 0,
 ):
     nvvm.setmaxregister(CFG.EPILOGUE_REGS, nvvm.SetMaxRegisterAction.INCREASE)
     row = cute.arch.thread_idx()[0] % CFG.M
@@ -393,7 +408,7 @@ def _epilogue_loop(
     valid = cutlass.Int32(1)
     while valid != 0:
         _credit(bars.sched_empty[sched_state.idx])
-        lo, hi = _bounds(block, sq, causal)
+        lo, hi = _bounds(block, sq, causal, window)
         for qtile in cutlass.range(lo, hi, 1, unroll=1):
             _wait_tcgen(bars.ds_ready, ds_state.phase)
             ds0 = _tmem_load(tmem_base + 128, 32, cutlass.Int32)
@@ -408,12 +423,16 @@ def _epilogue_loop(
             bars.ds_smem.arrive()
             _wait_tcgen(bars.dq_done, dq_state.phase)
             dq0 = _tmem_load(tmem_base + 128, 64)
-            dq1 = _tmem_load(tmem_base + 192, 64)
+            if cutlass.const_expr(CFG.D == 128):
+                dq1 = _tmem_load(tmem_base + 192, 64)
             nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
             bars.dp_empty.arrive()
-            vals = cutlass.Vector.from_elements(tuple(dq0[i] for i in range(64)) + tuple(dq1[i] for i in range(64)), cutlass.Float32)
-            for i in cutlass.range_constexpr(4):
+            if cutlass.const_expr(CFG.D == 128):
+                vals = cutlass.Vector.from_elements(tuple(dq0[i] for i in range(64)) + tuple(dq1[i] for i in range(64)), cutlass.Float32)
+            else:
+                vals = cutlass.Vector.from_elements(tuple(dq0[i] for i in range(64)), cutlass.Float32)
+            for i in cutlass.range_constexpr(CFG.DQ_SLICES):
                 _wait(bars.dq_empty[i], empty_state.phase)
                 _store_dq_slice(slab, row, vals, i)
                 nvvm.fence_proxy("async.shared", space="cta")
@@ -429,7 +448,7 @@ def _epilogue_loop(
         # slices 1/3, leaving slices 0/2 unobserved after the final dQ or a
         # zero-trip owner. Each completed mbarrier phase needs a successful
         # wait before an arrival in its next phase.
-        for i in cutlass.range_constexpr(4):
+        for i in cutlass.range_constexpr(CFG.DQ_SLICES):
             _wait(bars.dq_empty[i], empty_state.phase)
         _native_epilogue(slab, tmem_base, bars, row, lo < hi, empty_state.phase, dtype, False)
         _native_epilogue(slab, tmem_base, bars, row, lo < hi, empty_state.phase, dtype, True)
@@ -439,7 +458,7 @@ def _epilogue_loop(
 
 @cute.jit
 def _ts(desc, plane, bdesc, dst, accum):
-    for k in cutlass.range_constexpr(CFG.D // CFG.K_HW):
+    for k in cutlass.range_constexpr(CFG.N // CFG.K_HW):
         mma_ts_step(
             desc, nvvm.make_tmem_ptr(plane + (k // 4) * 32, cutlass.Int8), bdesc, dst, k_idx=k, accumulate=accum if cutlass.const_expr(k == 0) else True
         )
@@ -461,11 +480,12 @@ def _mma_loop(
     swizzle: cutlass.Constexpr[int],
     causal: cutlass.Constexpr[bool],
     dtype: cutlass.Constexpr,
+    window: cutlass.Constexpr[int] = 0,
 ):
     nvvm.setmaxregister(CFG.SERVICE_REGS, nvvm.SetMaxRegisterAction.DECREASE)
     score = _mma_desc(dtype)
-    grad = _mma_desc(dtype, btranspose=True)
-    dqdesc = _mma_desc(dtype, atranspose=True, btranspose=True)
+    grad = _mma_desc(dtype, btranspose=True, N=CFG.D, K=CFG.N)
+    dqdesc = _mma_desc(dtype, atranspose=True, btranspose=True, N=CFG.D, K=CFG.M)
     kd = _operand(slab, CFG.K, dtype).desc()
     vd = _operand(slab, CFG.V, dtype).desc()
     dod = _operand(slab, CFG.DO, dtype).desc()
@@ -475,7 +495,7 @@ def _mma_loop(
     s = nvvm.make_tmem_ptr(tmem_base, cutlass.Float32)
     dp = nvvm.make_tmem_ptr(tmem_base + 128, cutlass.Float32)
     dv = nvvm.make_tmem_ptr(tmem_base + 256, cutlass.Float32)
-    dk = nvvm.make_tmem_ptr(tmem_base + 384, cutlass.Float32)
+    dk = nvvm.make_tmem_ptr(tmem_base + 256 + CFG.D, cutlass.Float32)
     q_state = PipelineState.start()
     do_state = PipelineState.start()
     kv_state = PipelineState.start()
@@ -486,7 +506,7 @@ def _mma_loop(
     valid = cutlass.Int32(1)
     while valid != 0:
         _credit(bars.sched_empty[sched_state.idx])
-        lo, hi = _bounds(block, sq, causal)
+        lo, hi = _bounds(block, sq, causal, window)
         if lo < hi:
             _wait_tcgen(bars.k_full, kv_state.phase)
             _wait_tcgen(bars.q_full[q_state.idx], q_state.phase)
@@ -498,10 +518,9 @@ def _mma_loop(
         out_empty = advance(out_empty, 1)
         for qtile in cutlass.range(lo, hi, 1, unroll=1):
             _wait_tcgen(bars.dp_empty, dp_empty.phase)
-            _wait_tcgen(bars.do_full[0], do_state.phase)
-            mma_ss(score, vd, dod, dp, k_start=0, k_count=4)
-            _wait_tcgen(bars.do_full[1], do_state.phase)
-            mma_ss(score, vd, dod, dp, k_start=4, k_count=4, accumulate=True)
+            for half in cutlass.range_constexpr(CFG.DO_SUBTILES):
+                _wait_tcgen(bars.do_full[half], do_state.phase)
+                mma_ss(score, vd, dod, dp, k_start=half * _DO_STEPS, k_count=_DO_STEPS, accumulate=half > 0)
             _commit(bars.dp_done)
             _wait_tcgen(bars.p_ready, ready_state.phase)
             _ts(grad, tmem_base, dot, dv, qtile > lo)
@@ -551,6 +570,7 @@ def _load_loop(
     swizzle: cutlass.Constexpr[int],
     causal: cutlass.Constexpr[bool],
     dtype: cutlass.Constexpr,
+    window: cutlass.Constexpr[int] = 0,
 ):
     nvvm.setmaxregister(CFG.SERVICE_REGS, nvvm.SetMaxRegisterAction.DECREASE)
     q_state = PipelineState.start(phase=1)
@@ -560,7 +580,7 @@ def _load_loop(
     valid = cutlass.Int32(1)
     while valid != 0:
         _credit(bars.sched_empty[sched_state.idx])
-        lo, hi = _bounds(block, sq, causal)
+        lo, hi = _bounds(block, sq, causal, window)
         if lo < hi:
             _wait(bars.k_empty, kv_state.phase)
             bars.k_full.arrive(n_bytes=CFG.OPERAND_BYTES, pred=nvvm.elect_sync())
@@ -578,15 +598,20 @@ def _load_loop(
                 bars.q_full[q_state.idx].smem_ptr,
             )
             _wait(bars.do_empty, do_state.phase)
-            for half in cutlass.range_constexpr(2):
+            for half in cutlass.range_constexpr(CFG.DO_SUBTILES):
                 bars.do_full[half].arrive(n_bytes=CFG.SLICE_BYTES, pred=nvvm.elect_sync())
-            for half in cutlass.range_constexpr(2):
+            for half in cutlass.range_constexpr(CFG.DO_SUBTILES):
                 tma_load_subtiles(_operand(slab, CFG.DO, dtype), GmemTileTma(do_desc)(0, qtile * CFG.N, head, batch), bars.do_full[half].smem_ptr, half, 1)
             q_state = advance(q_state, CFG.Q_STAGES)
             do_state = advance(do_state, 1)
         block, head, batch, valid, sched_state = _next_tile(sched, bars, sched_state, nheads, nk, causal, swizzle, batch_heads)
 
 
+# DIAGNOSTIC lever ``diag_delete_dq_reduce_add`` (``Constexpr[bool]``, default False = the shipped kernel, rendered PTX-identical):
+# the store warp skips the four fp32 dQ reduce-add issues per q tile and nothing else (every dq_full wait, commit, wait_group and
+# dq_empty arrive stays: the barrier table is unchanged).  Armed, the OUTPUT IS WRONG BY DESIGN (dQ stays zero) -- a timing-only
+# ceiling for the L2 reduce-add term; the dense MHA entry never arms it, the grouped dense kernel threads it from its adapter record.
+# The THD twin's header (bprop_d128_accum_thd_f16.py) carries the full statement.
 @cute.jit
 def _store_loop(
     slab,
@@ -605,6 +630,8 @@ def _store_loop(
     swizzle: cutlass.Constexpr[int],
     causal: cutlass.Constexpr[bool],
     dtype: cutlass.Constexpr,
+    diag_delete_dq_reduce_add: cutlass.Constexpr[bool] = False,
+    window: cutlass.Constexpr[int] = 0,
 ):
     nvvm.setmaxregister(CFG.SERVICE_REGS, nvvm.SetMaxRegisterAction.DECREASE)
     dq_state = PipelineState.start()
@@ -613,16 +640,18 @@ def _store_loop(
     valid = cutlass.Int32(1)
     while valid != 0:
         _credit(bars.sched_empty[sched_state.idx])
-        for i in cutlass.range_constexpr(4):
+        for i in cutlass.range_constexpr(CFG.DQ_SLICES):
             bars.dq_empty[i].arrive()  # all32 lanes, one bootstrap per KV tile
-        lo, hi = _bounds(block, sq, causal)
+        lo, hi = _bounds(block, sq, causal, window)
         for qtile in cutlass.range(lo, hi, 1, unroll=1):
-            for i in cutlass.range_constexpr(4):
+            for i in cutlass.range_constexpr(CFG.DQ_SLICES):
                 _wait(bars.dq_full[i], dq_state.phase)
-                tma_reduce_subtile(_operand(slab, CFG.ALIAS, cutlass.Float32, fp32=True), GmemTileTma(dq_desc)(0, qtile * CFG.N, head, batch), i)
+                # DIAGNOSTIC D2 (default off = the shipped code): only the reduce-add issue is deleted; commit / wait / arrives stay.
+                if cutlass.const_expr(not diag_delete_dq_reduce_add):
+                    tma_reduce_subtile(_operand(slab, CFG.ALIAS, cutlass.Float32, fp32=True), GmemTileTma(dq_desc)(0, qtile * CFG.N, head, batch), i)
                 tma_store_commit()
-            for i in cutlass.range_constexpr(4):
-                tma_store_wait(3 - i)
+            for i in cutlass.range_constexpr(CFG.DQ_SLICES):
+                tma_store_wait(CFG.DQ_SLICES - 1 - i)
                 bars.dq_empty[i].arrive()  # all32 after corresponding source read
             dq_state = advance(dq_state, 1)
         _wait(bars.dv_full, out_state.phase)
@@ -673,6 +702,7 @@ def bprop_d128_accum_kernel(
     causal: cutlass.Constexpr[bool],
     swizzle: cutlass.Constexpr[int],
     dtype: cutlass.Constexpr,
+    window: cutlass.Constexpr[int] = 0,
 ):
     warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     x, y, z = cute.arch.block_idx()
@@ -699,15 +729,15 @@ def bprop_d128_accum_kernel(
     nvvm.barrier_cta_sync()
     tmem_base = tmem_slot.load()
     if warp < 8:
-        _softmax_loop(slab, bars, sched, tmem_base, lse, delta, block, head, batch, sq, skv, nk, nheads, batch_heads, swizzle, scale, causal, dtype)
+        _softmax_loop(slab, bars, sched, tmem_base, lse, delta, block, head, batch, sq, skv, nk, nheads, batch_heads, swizzle, scale, causal, dtype, window)
     elif warp < 12:
-        _epilogue_loop(slab, bars, sched, tmem_base, block, head, batch, sq, nk, nheads, batch_heads, swizzle, causal, dtype)
+        _epilogue_loop(slab, bars, sched, tmem_base, block, head, batch, sq, nk, nheads, batch_heads, swizzle, causal, dtype, window)
     elif warp == 12:
-        _mma_loop(slab, bars, sched, tmem_base, block, head, batch, sq, nk, nheads, batch_heads, swizzle, causal, dtype)
+        _mma_loop(slab, bars, sched, tmem_base, block, head, batch, sq, nk, nheads, batch_heads, swizzle, causal, dtype, window)
     elif warp == 13:
-        _load_loop(slab, bars, sched, q_desc, k_desc, v_desc, do_desc, block, head, batch, sq, nk, nheads, batch_heads, swizzle, causal, dtype)
+        _load_loop(slab, bars, sched, q_desc, k_desc, v_desc, do_desc, block, head, batch, sq, nk, nheads, batch_heads, swizzle, causal, dtype, window)
     elif warp == 14:
-        _store_loop(slab, bars, sched, dq_desc, dk_desc, dv_desc, block, head, batch, sq, nk, nheads, batch_heads, swizzle, causal, dtype)
+        _store_loop(slab, bars, sched, dq_desc, dk_desc, dv_desc, block, head, batch, sq, nk, nheads, batch_heads, swizzle, causal, dtype, False, window)
     else:
         _scheduler_loop(bars, sched)
     nvvm.barrier_cta_sync()
@@ -733,6 +763,7 @@ def host(
     scale: cutlass.Float32,
     causal: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
+    window: cutlass.Constexpr[int] = 0,
 ):
     if cutlass.const_expr(q.element_type not in (cutlass.BFloat16, cutlass.Float16)):
         raise ValueError("dense d128 accumulation requires BF16/FP16")
@@ -762,4 +793,5 @@ def host(
         causal,
         swizzle,
         q.element_type,
+        window,
     ).launch(grid=grid, block=(CFG.THREADS, 1, 1), stream=stream, min_blocks_per_mp=1)

@@ -20,6 +20,7 @@ both profiles and the twin's GPU matrix (``test_sdpa_bwd_dsl_sm107.py -k twox2``
 
 from __future__ import annotations
 
+import ast
 import math
 import os
 import re
@@ -53,7 +54,7 @@ pytestmark = [pytest.mark.L0, requires_dsl]
 
 _ENGINE = "sdpa_bwd_sm100_d256"
 _FAMILY_NAME = "frost_sdpa_bwd"
-_SLOT = 7  # engines/manifest.py: EngineSlot(7, opt_in=True) -> FROST_SDPA_BWD_ID_BASE + 7 (slot 6 is sdpa_bwd_sm107_mxfp8)
+_SLOT = 7  # engines/manifest.py: EngineSlot(7) -> FROST_SDPA_BWD_ID_BASE + 7 (slot 6 is sdpa_bwd_sm107_mxfp8)
 _ENGINE_ID = 20_607
 _D = 256
 _SM100_CC = (10, 0)
@@ -95,7 +96,7 @@ def _spec(name=_ENGINE):
 # =========================================================================== registration / capabilities (host)
 
 
-def test_engine_is_registered_and_opt_in():
+def test_engine_is_registered_and_offered_by_default():
     from cudnn.engines.engine_ids import FROST_SDPA_BWD_ID_BASE
     from cudnn.engines.manifest import MANIFEST
 
@@ -103,7 +104,8 @@ def test_engine_is_registered_and_opt_in():
     fam = next(f for f in MANIFEST if f.name == _FAMILY_NAME)
     assert _ENGINE in fam.slots, f"{_ENGINE} has no manifest slot (append slot {_SLOT}; never reuse a retired slot)"
     slot = fam.slots[_ENGINE]
-    assert slot.slot == _SLOT and slot.opt_in, "new engines stay opt-in until they earn arch coverage + benchmarks"
+    # Default since the 2026-10-27 B200 qualification; cudnn.sdpa.bwd.heuristics._leads ranks it against the backend.
+    assert slot.slot == _SLOT and not slot.opt_in
     assert FROST_SDPA_BWD_ID_BASE + slot.slot == _ENGINE_ID
     from cudnn.sdpa.bwd.engines import ENGINE_SPECS
 
@@ -118,15 +120,18 @@ def test_capabilities_match_what_is_implemented():
     """The row claims exactly what the accept tests run; every deferral is pinned False with its reject test."""
     c = _spec().capabilities
     assert (c.sm_lo, c.sm_hi) == _SM_RANGE, "SM100 / SM103 (cc 10.0-10.6); the native Rubin row owns 107+"
-    assert c.d == frozenset({_D}) and not c.d_envelope and not c.dqk_ge_dv, "exact d_qk == d_v == 256 (the body hardcodes the 256-wide tiles)"
+    assert c.d == frozenset({128, 192, 256}) and not c.d_envelope and c.dqk_ge_dv
+    assert c.declaration_check is not None, "only the exact D256 and D192x128 head pairs are qualified"
     assert c.dtypes == frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})
     assert not c.is_fp8 and not c.is_mxfp8 and c.out_dtypes == frozenset()
     assert c.causal and c.bottom_right and c.swa and c.gqa
-    assert not c.right_band_widening and not c.thd and not c.thd_declared_totals and not c.cu_seq_len
+    assert c.thd and c.thd_declared_totals and c.thd_ragged_offsets
+    assert not c.right_band_widening and not c.cu_seq_len
     assert not c.bias and not c.dbias and not c.decode
     assert c.layouts == frozenset({"bshd"})
     assert not c.tile_ms and not c.tile_ns, "fixed geometry: no tile axis, the heuristics list {} as the complete record"
-    for deferred in ("padded", "sink", "dsink", "deterministic"):
+    assert c.deterministic
+    for deferred in ("padded", "sink", "dsink"):
         assert not getattr(c, deferred), f"{deferred} is deferred: claim it together with its accept test here and the tracker line"
     for never in (
         "dropout",
@@ -251,22 +256,23 @@ def test_reject_sink(monkeypatch):
     assert _decline_reason(monkeypatch, sink=True) is not None
 
 
-def test_reject_thd(monkeypatch):
-    assert _decline_reason(monkeypatch, thd=True) is not None
+def test_accept_thd(monkeypatch):
+    """The shared graph builder supplies declared capacities and ragged offsets."""
+    assert _decline_reason(monkeypatch, thd=True) is None
+    assert _decline_reason(monkeypatch, thd=True, use_causal_mask=True, hq=8, hkv=2) is None
 
 
 @pytest.mark.parametrize("dt", _DTYPES, ids=_DTYPE_IDS)
 @pytest.mark.parametrize("kv_heads", [4, 2], ids=["mha", "gqa"])
-def test_standalone_adapter_rejects_thd(dt, kv_heads):
-    """A direct adapter must decline packed THD even when no graph capability filter runs."""
+def test_standalone_adapter_accepts_thd(dt, kv_heads):
+    """Both half adapters admit the same declared packed THD geometry."""
     from cudnn.sdpa.bwd.api_dsl_sm100_d256 import SdpaBwdDslSm100D256
     from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
 
     options = dict(hq=4, hkv=kv_heads, dt=dt, thd=True, max_total_seq_len_q=1024, max_total_seq_len_kv=1024)
     # These descriptors are valid for the parent row that implements packed THD.
     assert _adapter(SdpaBwdDslSm107, **options).check_support()
-    with pytest.raises(ValueError, match="sdpa_bwd_sm100_d256: THD / ragged is not implemented"):
-        _adapter(SdpaBwdDslSm100D256, **options).check_support()
+    assert _adapter(SdpaBwdDslSm100D256, **options).check_support()
 
 
 def test_reject_decode_shaped(monkeypatch):
@@ -933,8 +939,9 @@ def test_head_subgroups_rebind_stream_replay_and_launch_count(monkeypatch):
         dict(sq=500, skv=500, is_causal=True, window_size_left=256),
         dict(b=1, hq=2, sq=500, skv=1024, is_causal=True, causal_bottom_right=True),
         dict(sq=257, skv=129),
+        dict(deterministic=True),
     ],
-    ids=["dense", "fp16", "gqa", "swa-padded", "br-ragged-sq", "257x129"],
+    ids=["dense", "fp16", "gqa", "swa-padded", "br-ragged-sq", "257x129", "deterministic"],
 )
 def test_adapter_backstop_admits_the_served_matrix_and_sizes_its_workspace_at_build(kw):
     from cudnn.sdpa.bwd.api_dsl_sm100_d256 import SdpaBwdDslSm100D256
@@ -959,12 +966,11 @@ def test_adapter_backstop_admits_the_served_matrix_and_sizes_its_workspace_at_bu
         (dict(sq=1), "decode"),
         (dict(is_causal=True, window_size_right=16), "right-band"),
         (dict(window_size_left=0), "window_left > 0"),
-        (dict(deterministic=True), "deterministic"),
         (dict(seq_kv_lens_present=True), "padding masks"),
         (dict(thd=True), "THD"),
         (dict(d=512), "d_qk = d_v = 256"),
     ],
-    ids=["fp32", "gqa-ratio", "decode", "right-band", "swa-zero", "deterministic", "padded", "thd", "d512"],
+    ids=["fp32", "gqa-ratio", "decode", "right-band", "swa-zero", "padded", "thd", "d512"],
 )
 def test_adapter_backstop_refuses_what_the_row_declines(kw, needle):
     from cudnn.sdpa.bwd.api_dsl_sm100_d256 import SdpaBwdDslSm100D256
@@ -1008,7 +1014,7 @@ def test_descriptor_version_is_derived_per_profile(profile):
 def test_every_smem_tile_takes_the_module_desc_version():
     code = _code_lines(_kernel_source())
     n_tiles = len(re.findall(r"\bSmemTile\(", code))
-    assert n_tiles == 8, "sQ, sdO, sdO_dv, sK, sV, sP, sdS, sdV"
+    assert n_tiles == 11, "sQ, sdO, sdO_dv, sK, sV, sP, sdS, sdV; fused D192 adds sQdk, sdS_mma and sdK"
     assert code.count("desc_version=DESC_VERSION") == n_tiles
     assert not re.search(r"desc_version=[01]\b", code)
     assert len(re.findall(r"^DESC_VERSION\b.*=", code, re.M)) == 1
@@ -1044,7 +1050,7 @@ def test_idesc_k_dim_and_q_loop_bounds_come_from_the_shared_primitives():
         "mma_ts(" not in code and "tcgen05_cp" not in code and "tcgen05_st(" not in code
     ), "every operand is an SMEM SS operand: no TS MMA, no UTCCP, no TMEM P store"
     assert "m_dim=CFG.MMA_M" in code and "m_dim=CFG.TILE_M * CFG.CTA_MMA" not in code, "every idesc carries the 2x2 collective M = 128"
-    assert code.count("elect_once=True") == 5, "the five mma_ss sites (prologue S, NATURAL S, dP, lookahead S, BMM2) elect once per call"
+    assert code.count("elect_once=True") == 6, "prologue S, NATURAL S, dP, lookahead S, BMM2 and optional dK elect once per call"
     assert "Producer.LEADER_RELEASE" in code, "mb_p_full publishes the lane-written sP slab with the .release.cta leader arrive"
 
 
@@ -1053,13 +1059,19 @@ def test_mbarrier_ledger_matches_the_config():
     ledger derives, for both profiles; LEADER / LEADER_RELEASE producers carry the LEADER scope."""
     from cudnn.sdpa.bwd import config_d256_2x2 as c2
 
-    src = _kernel_source()
-    bars_src = src[src.index("def _make_bars") : src.index("# Tile decode")]
-    pat = re.compile(r"(mb_\w+)=MBarrier\(_alloc\(([^)]+)\),\s*stages=([^,]+),\s*init_count=([^,]+),\s*producer=Producer\.(\w+)(?:,\s*scope=Scope\.(\w+))?\)")
-    rows = pat.findall(bars_src)
-    assert len(rows) == 25
-    for profile in (1, 2):
-        mod = _load_kernel(profile)
+    from cudnn.frost.template_loader import load_template
+
+    tree = ast.parse(_kernel_source())
+    factory = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_make_bars")
+    rows = next(n.value.keywords for n in factory.body if isinstance(n, ast.Return))
+    assert len(rows) == 29
+    modules = [_load_kernel(1), _load_kernel(2)]
+    modules += [
+        load_template(modules[0].__file__, c2.TemplateParams2x2(datapath_2x2_profile=1, head_dim_qk=192, head_dim_v=128, fuse_dk=True, thd_varlen=thd))
+        for thd in (False, True)
+    ]
+    for mod in modules:
+        profile = mod.CFG.DATAPATH_2X2_PROFILE
         want_stages, want_counts = c2.mbar_stage_counts_2x2(mod.CFG), c2.mbar_init_counts_2x2(mod.CFG)
         env = {
             k: getattr(mod, k)
@@ -1067,13 +1079,23 @@ def test_mbarrier_ledger_matches_the_config():
         }
         env["cfg"] = mod.CFG
         seen = set()
-        for name, alloc, stages, count, prod, scope in rows:
+        for row in rows:
+            name, call = row.arg, row.value
+            if isinstance(call, ast.IfExp):
+                call = call.body if eval(ast.unparse(call.test), {}, env) else call.orelse
+            if isinstance(call, ast.Constant) and call.value is None:
+                continue
+            assert isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "MBarrier"
+            kw = {item.arg: item.value for item in call.keywords}
+            alloc, stages, count = (ast.unparse(n) for n in (call.args[0].args[0], kw["stages"], kw["init_count"]))
+            prod, scope = kw["producer"].attr, kw["scope"].attr if "scope" in kw else None
             seen.add(name)
             assert eval(stages, {}, env) == eval(alloc, {}, env) == want_stages[name], (profile, name)
             assert eval(count, {}, env) == want_counts[name], (profile, name)
             assert (prod in ("LEADER", "LEADER_RELEASE")) == (scope == "LEADER"), (profile, name)
         assert seen == set(want_stages)
-        assert (mod.qTmaTransactionBytes, mod.kTmaTransactionBytes) == (65536, 65536 * profile)
+        q_bytes = 128 * mod.CFG.TILE_K * 2
+        assert (mod.qTmaTransactionBytes, mod.kTmaTransactionBytes) == (q_bytes, q_bytes * profile)
         assert mod.READ_TILE_ARRIVERS_TOT == 21
 
 

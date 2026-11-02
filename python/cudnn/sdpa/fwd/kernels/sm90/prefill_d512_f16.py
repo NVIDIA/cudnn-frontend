@@ -60,7 +60,7 @@ from cudnn.frost.tile_dsl.mask import compute_kv_loop_bounds
 from cudnn.frost.tile_dsl.pointwise import fp32_to_fp16, opaque_f32_zero
 from cudnn.frost.tile_dsl.regtile import RegTile, vec_concat
 from cudnn.frost.tile_dsl.scheduler import SCHED_LPT_L2, SCHED_NATURAL, lpt_l2_tile_coords, lpt_tile_coords
-from cudnn.frost.tile_dsl.thd import TENSOR_MAP_QWORDS, THD_MAPS_META_WORDS, THD_MAPS_OFF
+from cudnn.frost.tile_dsl.thd import TENSOR_MAP_QWORDS, THD_MAPS_OFF, thd_port_origin
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait
 from cudnn.sdpa.fwd.config_sm90 import (
     D_TILE,
@@ -70,9 +70,13 @@ from cudnn.sdpa.fwd.config_sm90 import (
     TILE_N,
     TemplateParams,
     head_dims_mismatch,
+    thd_meta_words,
+    thd_origin_maps,
+    thd_origins_off,
     validate_params,
 )
 from cudnn.sdpa.fwd.kernels.sm90.prepared_host import host as _host, compile_host
+from cudnn.sdpa.fwd.kernels.sm90.thd_origins import ROW_Q, ROW_STATS, build_thd_origin_setup_kernel, origin_row
 from cudnn.sdpa.fwd.kernels.thd_helpers import THD_SETUP_THREADS, build_thd_meta_o_descs_kernel
 from cudnn.sdpa.fwd.kernels.sm90._common_hopper import (
     FLT_MAX_F64,
@@ -179,6 +183,7 @@ class SM90FusedMultiHeadAttentionForward:
         qh_per_kh: int = 1,
         scale_mode: int = SCALE_POSITIVE,
         stats_log2: bool = False,
+        thd_origins: tuple | None = None,
     ):
         """Initialize the SM90 D512 FMHA prefill kernel configuration.
 
@@ -227,6 +232,9 @@ class SM90FusedMultiHeadAttentionForward:
         :param stats_log2: Store Stats in base 2. The store multiplies each natural-log
             row LSE by ``log2(e)`` after normalization; ``-inf`` stays ``-inf``, and
             ``lse`` None removes it.
+        :param thd_origins: THD only: ``config_sm90.TemplateParams.thd_origins``, the
+            ports whose bound ragged offsets give each sequence's origin in the caller's
+            buffer. ``None`` keeps the packed layout.
         """
 
         _, h_q, h_kv, _, _ = shape
@@ -251,6 +259,7 @@ class SM90FusedMultiHeadAttentionForward:
         self.kv_loop_bottom_right = self.bottom_right if self.banded else True
         self.has_sink = has_sink
         self.thd_varlen = thd_varlen
+        self.thd_origins = thd_origins if thd_varlen else None
         # Dense graphs clamp per-sequence device lengths to the declared envelope; THD
         # reads its lengths from the setup launch's metadata instead.
         self.dense_q_lengths = not thd_varlen and seq_q_lens_present
@@ -328,7 +337,8 @@ class SM90FusedMultiHeadAttentionForward:
         The coordinates are listed in the map's own axis order. A dense box reads the
         grid-constant ``tma_desc`` with ``desc_ptr`` None. Under THD a runtime
         ``desc_ptr`` overrides it: O reads its own sequence's map, K and V the one
-        clamped map every sequence shares, and Q keeps the grid-constant map. THD maps
+        clamped map every sequence shares (their own sequence's maps under caller-buffer
+        origins), and Q keeps the grid-constant map. THD maps
         drop the batch axis. A PackGQA Q/O box spans ``heads_per_tile`` heads from
         ``head_idx``. ``tma_order`` is the port's ``self.tma_orders`` entry, the view
         modes ``__call__`` listed innermost first.
@@ -387,7 +397,8 @@ class SM90FusedMultiHeadAttentionForward:
         :param tma_desc: The port's grid-constant map.
         :param mbar: The port's FULL barrier.
         :param work: The decoded work tile, read for its KV head, batch, THD token
-            origin and, under THD, the clamped map every sequence shares on this port.
+            origin and, under THD, the clamped map every sequence shares on this port
+            (this sequence's own map under caller-buffer origins).
         :param kv_seq_idx: The first token of the box, from the caller's reverse KV
             walk.
         :param is_v: Select the V port over the K one: its THD map pointer and map axis
@@ -399,7 +410,8 @@ class SM90FusedMultiHeadAttentionForward:
         kv_coord = kv_seq_idx + work.kv_offset if cutlass.const_expr(self.thd_varlen) else kv_seq_idx
         source = self.tma_slice(tma_desc, desc_ptr, work.kv_head, kv_coord, work.batch, self.tma_orders[2 if is_v else 1])
         mbar.arrive(n_bytes=tma_desc.global_tx_bytes() * s_dst.tma_loads_per_tile, pred=prims.elect_sync())
-        tma_load_tile(s_dst, source, mbar.smem_ptr)
+        # Caller-origin maps were acquired once at the top of tmaldg_warp_group.
+        tma_load_tile(s_dst, source, mbar.smem_ptr, acquire=self.thd_origins is None)
 
     @cute.jit
     def tmaldg_warp_group(self, sQ, sK, sV, bars, tma_q_desc, tma_k_desc, tma_v_desc, work):
@@ -417,6 +429,13 @@ class SM90FusedMultiHeadAttentionForward:
                 # needs no branch. One state serves K and V, which refill together.
                 q_empty_state = PipelineState.start(phase=1)
                 kv_empty_state = PipelineState.start(phase=1)
+                if cutlass.const_expr(self.thd_origins is not None):
+                    # This sequence's own K/V maps: acquire each once for this warp and
+                    # start their fetch before the Q load, so the K/V loads below need no
+                    # per-tile acquire (with shared maps every CTA hits one cached map).
+                    for desc_ptr in (work.k_desc_ptr, work.v_desc_ptr):
+                        prims.fence_proxy_acquire(prims.MemScope.GPU, desc_ptr, 128, from_proxy=prims.Proxy.GENERIC, to_proxy=prims.Proxy.TENSORMAP)
+                        prims.prefetch_tensormap(desc_ptr)
                 bars.mb_tma_q_empty.wait(q_empty_state.phase)
                 q_empty_state = advance(q_empty_state, 1)
                 self.load_q_tile_tma(sQ, tma_q_desc, bars.mb_tma_q_full, work)
@@ -815,6 +834,7 @@ class SM90FusedMultiHeadAttentionForward:
         # the TMA coordinate of every port but O, and anchor packed Stats.
         k_desc_ptr, v_desc_ptr, o_desc_ptr = None, None, None
         q_offset, kv_offset = cutlass.Int32(0), cutlass.Int32(0)
+        lse_offset = cutlass.Int32(0)
         if cutlass.const_expr(self.thd_varlen):
             # seq_kv_lens is the setup launch's metadata, Int32 [seq_kv(B), cu_q(B+1),
             # cu_k(B+1), remap(B), live, ctr], then the tensor maps at THD_MAPS_OFF.
@@ -837,6 +857,22 @@ class SM90FusedMultiHeadAttentionForward:
             o_desc_ptr = base + batch * TENSOR_MAP_QWORDS
             k_desc_ptr = base + (self.b + 1) * TENSOR_MAP_QWORDS
             v_desc_ptr = base + (self.b + 2) * TENSOR_MAP_QWORDS
+            lse_offset = q_offset
+            if cutlass.const_expr(self.thd_origins is not None):
+                # Caller-buffer origins: O, K and V read their own sequence's map, based at
+                # the port's origin and clipped to the sequence (slots 0..B-1, B+1..2B,
+                # 2B+1..3B), so K/V tiles address from the sequence start and a tile tail
+                # is TMA-OOB zeros, never the gap after it. Q keeps the grid-constant map at
+                # its clamped origin (an overhanging Q tile lands rows O's clip discards),
+                # and Stats rows start at theirs.
+                k_desc_ptr = base + (self.b + 1 + batch) * TENSOR_MAP_QWORDS
+                v_desc_ptr = base + (2 * self.b + 1 + batch) * TENSOR_MAP_QWORDS
+                kv_offset = cutlass.Int32(0)
+                org = cute.make_tensor(
+                    cute.recast_ptr(seq_kv_lens.iterator + thd_origins_off(self.b), dtype=cutlass.Int64), cute.make_layout((5, self.b), stride=(self.b, 1))
+                )
+                q_offset = cutlass.Int32(thd_port_origin(org, origin_row(self.thd_origins, ROW_Q), batch, q_offset))
+                lse_offset = cutlass.Int32(thd_port_origin(org, origin_row(self.thd_origins, ROW_STATS), batch, lse_offset))
         # Dense device lengths are clamped to the declared envelopes, so an
         # out-of-contract value can neither address past the TMA descriptors nor move a
         # written row outside O or Stats.
@@ -879,6 +915,7 @@ class SM90FusedMultiHeadAttentionForward:
             kv_len=kv_len,
             q_offset=q_offset,
             kv_offset=kv_offset,
+            lse_offset=lse_offset,
             q_output_limit=q_output_limit,
             iterations=iterations,
             k_desc_ptr=k_desc_ptr,
@@ -1086,12 +1123,17 @@ class SM90FusedMultiHeadAttentionForward:
                             token, subhead = row // self.heads_per_tile + work.q_base, row % self.heads_per_tile
                             # Trimmed dense rows are declared rows, and receive -inf
                             # past q_len.
-                            if token < work.q_output_limit:
+                            # Caller-origin Stats rows also stop at the buffer's end: the
+                            # origin is clamped into it, the sequence may still overrun it.
+                            live = token < work.q_output_limit
+                            if cutlass.const_expr(self.thd_origins is not None):
+                                live = live & (cutlass.Int64(work.lse_offset) + cutlass.Int64(token) < cutlass.Int64(lse.shape[2]))
+                            if live:
                                 q_head = work.head * self.heads_per_tile + subhead
                                 if cutlass.const_expr(not self.thd_varlen):
                                     origin = cutlass.Int64(work.batch) * cutlass.Int64(lse.stride[0])
                                 else:
-                                    origin = cutlass.Int64(work.q_offset) * cutlass.Int64(lse.stride[2])
+                                    origin = cutlass.Int64(work.lse_offset) * cutlass.Int64(lse.stride[2])
                                 # Base-2 Stats fold at the store: finalization without
                                 # KV work writes a sink logit or -inf without
                                 # normalizing. -inf stays -inf.
@@ -1375,6 +1417,11 @@ class SM90FusedMultiHeadAttentionForward:
         thd_q_lens: Optional[cute.Tensor],
         thd_kv_lens: Optional[cute.Tensor],
         thd_lens_form: Optional[cutlass.Int32],
+        thd_ro_q: Optional[cute.Tensor],
+        thd_ro_k: Optional[cute.Tensor],
+        thd_ro_v: Optional[cute.Tensor],
+        thd_ro_o: Optional[cute.Tensor],
+        thd_ro_lse: Optional[cute.Tensor],
         stream: cuda_driver.CUstream,
     ) -> None:
         """Build the port maps, run the THD setup when packed, and launch the kernel.
@@ -1397,7 +1444,8 @@ class SM90FusedMultiHeadAttentionForward:
             ``has_sink``.
         :param seq_q_lens: Int32 ``(B,)`` Q lengths, or a dead null view.
         :param seq_kv_lens: Int32 ``(B,)`` KV lengths, or a dead null view. Under THD, the
-            128-byte-aligned ``THD_MAPS_META_WORDS(B)`` scratch: metadata, then maps.
+            128-byte-aligned ``config_sm90.thd_meta_words(B, origins)`` scratch: metadata,
+            then maps (then the token origins).
         :param scale: The host softmax scale in natural units; the kernel folds
             ``log2(e)`` itself. Its sign must match ``scale_mode``.
         :param thd_max_sq: THD only: the declared S_q envelope, which sizes the grid.
@@ -1405,6 +1453,9 @@ class SM90FusedMultiHeadAttentionForward:
             sums. ``None`` when dense.
         :param thd_kv_lens: THD only: the same for KV.
         :param thd_lens_form: THD only: bit 0: Q is cu, bit 1: KV is cu.
+        :param thd_ro_q: Caller-origin THD only: Q's bound ``(B+1,)`` ragged offsets, or
+            ``None`` for a port without them; likewise ``thd_ro_k`` .. ``thd_ro_lse``.
+            Each THD view's token extent is then that port's own capacity.
         :param stream: CUDA stream of the THD setup launch and the attention launch.
         """
 
@@ -1432,10 +1483,52 @@ class SM90FusedMultiHeadAttentionForward:
         if cutlass.const_expr(self.sched_policy != SCHED_NATURAL):
             grid = (self.q_tiles * self.heads * self.b, 1, 1)
         if cutlass.const_expr(self.thd_varlen):
-            if cutlass.const_expr(tuple(seq_kv_lens.shape) != (THD_MAPS_META_WORDS(self.b),)):
-                raise ValueError(f"prefill_d512_f16_sm90: THD seq_kv_lens must be the ({THD_MAPS_META_WORDS(self.b)},) metadata tensor")
+            meta_words = thd_meta_words(self.b, self.thd_origins is not None)
+            if cutlass.const_expr(tuple(seq_kv_lens.shape) != (meta_words,)):
+                raise ValueError(f"prefill_d512_f16_sm90: THD seq_kv_lens must be the ({meta_words},) metadata tensor")
             q_tiles = (thd_max_sq + self.tokens_per_tile - 1) // self.tokens_per_tile
             grid = (q_tiles, cutlass.Int32(self.heads), cutlass.Int32(self.b))
+        if cutlass.const_expr(self.thd_origins is not None):
+            # Caller-buffer origins: metadata, the clamped per-port token origins and one
+            # map per sequence for O, K and V, released to the tensor-map proxy exactly as
+            # the shared setup launch does (thd_origins.py).
+            capacities = (q.shape[2], k.shape[2], v.shape[2], o.shape[2], lse.shape[2] if cutlass.const_expr(lse is not None) else cutlass.Int32(0))
+            token_strides = (
+                cutlass.Int64(q.stride[2]),
+                cutlass.Int64(k.stride[2]),
+                cutlass.Int64(v.stride[2]),
+                cutlass.Int64(o.stride[2]),
+                cutlass.Int64(lse.stride[2]) if cutlass.const_expr(lse is not None) else cutlass.Int64(1),
+            )
+            build_thd_origin_setup_kernel(
+                k,
+                v,
+                o,
+                tma_o_desc,
+                tma_k_desc,
+                tma_v_desc,
+                cute.make_tensor(
+                    cute.recast_ptr(seq_kv_lens.iterator + THD_MAPS_OFF(self.b), dtype=cutlass.Int64),
+                    cute.make_layout((thd_origin_maps(self.b) * TENSOR_MAP_QWORDS,), stride=(1,)),
+                ),
+                cute.make_tensor(
+                    cute.recast_ptr(seq_kv_lens.iterator + thd_origins_off(self.b), dtype=cutlass.Int64), cute.make_layout((5, self.b), stride=(self.b, 1))
+                ),
+                seq_kv_lens,
+                thd_q_lens,
+                thd_kv_lens,
+                thd_lens_form,
+                cutlass.Int32(self.b),
+                thd_ro_q,
+                thd_ro_k,
+                thd_ro_v,
+                thd_ro_o,
+                thd_ro_lse,
+                token_strides,
+                capacities,
+                self.thd_origins,
+            ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
+        elif cutlass.const_expr(self.thd_varlen):
             # The shared THD setup launch: one elected thread writes the metadata, the
             # per-sequence O maps and the two clamped K/V maps, then issues one
             # GENERIC->TENSORMAP release fence. Stream order publishes all of it before
@@ -1554,6 +1647,7 @@ def _compile(b, h_q, h_kv, s_q, s_kv, q_stride, k_stride, v_stride, o_stride, ls
         qh_per_kh=PARAMS.qh_per_kh,
         scale_mode=PARAMS.scale_mode,
         stats_log2=PARAMS.stats_log2,
+        thd_origins=PARAMS.thd_origins,
     )
 
     # Axis order is plan metadata, shared by descriptor construction and kernel

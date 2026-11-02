@@ -35,7 +35,7 @@ from ._block_scaled import (
     validate_indexer_precision,
     validate_sf_vec_size,
 )
-from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
+from cudnn.deepseek_sparse_attention.utils.compiler import compile_options, gpu_arch_flag
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     ceil_div as _ceil_div,
     device_major as _get_device_capability,
@@ -291,6 +291,7 @@ def _sparse_indexer_score_recompute(
         # decode of topk ids).
         compile_key = (
             "indexer",
+            gpu_arch_flag(),
             q_indexer.dtype,
             head_dim,
             qhead_per_kv_head,
@@ -503,6 +504,7 @@ def _sparse_attn_score_recompute(
     if compute_capability >= 10:
         compile_key = (
             "attention",
+            gpu_arch_flag(),
             q_attn.dtype,
             head_dim,
             qhead_per_kv_head,
@@ -593,6 +595,14 @@ def _dispatch_sparse_attn_tile_params(
     Rules tuned on B200 via tests/sweep_tile_params.py (--compact / default).
     """
     m = qhead_per_kv_head
+
+    # H96 cannot use the default n64 attention epilogue: Ld16x64bOp would
+    # require Repetition(96 // 2), but 48 is not a supported TMEM repetition.
+    # The existing n128 epilogue uses its fixed Repetition(8) load and covers
+    # all 96 heads natively.  Split D576 into three K192 chunks to retain two
+    # KV pipeline stages within the SM100 shared-memory budget.
+    if head_dim == 576 and qhead_per_kv_head == 96:
+        return m, 128, 192
 
     if compact:
         # --- Compact tuned configs ---
@@ -1010,6 +1020,7 @@ def _dense_indexer_score_recompute(
         assert q_scale is not None and k_scale is not None
         compile_key = (
             "dense_indexer",
+            gpu_arch_flag(),
             precision,
             q.dtype,
             k.dtype,
@@ -1030,6 +1041,7 @@ def _dense_indexer_score_recompute(
         )
     else:
         base_compile_key = (
+            gpu_arch_flag(),
             q.dtype,
             head_dim,
             qhead_per_kv_head,
@@ -1333,6 +1345,7 @@ def _dense_attn_score_recompute(
         assert q_scale is not None and k_scale is not None
         compile_key = (
             "dense_attention",
+            gpu_arch_flag(),
             "mxfp8",
             q.dtype,
             k.dtype,
@@ -1354,6 +1367,7 @@ def _dense_attn_score_recompute(
     else:
         compile_key = (
             "dense_attention",
+            gpu_arch_flag(),
             q.dtype,
             head_dim,
             qhead_per_kv_head,

@@ -313,3 +313,67 @@ def test_d256_direct_aten_op():
     o_ref.backward(torch.ones_like(o_ref))
     assert (o.float() - o_ref).abs().max().item() < 0.05
     assert (q.grad.float() - q_ref.grad).abs().max().item() < 0.5
+
+
+@pytest.mark.L0
+def test_varlen_attn_out_writes_into_out(monkeypatch):
+    """`_varlen_attn_out` declares the caller's `out` as O: the op writes it in place (no O copy afterwards)."""
+    from cudnn.torch import sdpa_provider as sp
+
+    torch.manual_seed(0)
+    lens = [200, 312, 96]
+    H, D = 8, 128
+    lens_t = torch.tensor(lens, device="cuda")
+    cu = torch.nn.functional.pad(lens_t.cumsum(0), (1, 0)).to(torch.int32)
+    T, mx = int(cu[-1]), int(lens_t.max())
+    q, k, v = (torch.randn(T, H, D, dtype=torch.bfloat16, device="cuda") for _ in range(3))
+    impl, returned = sp._cudnn_ops._sdpa_fwd_impl, []
+
+    def spy(*args, **kwargs):
+        returned.append(impl(*args, **kwargs))
+        return returned[-1]
+
+    monkeypatch.setattr(sp._cudnn_ops, "_sdpa_fwd_impl", spy)
+    out = torch.empty(T, H, D, dtype=torch.bfloat16, device="cuda")
+    lse = sp._varlen_fwd_out(out, q, k, v, cu, cu, mx, mx, is_causal=True)
+    assert returned and returned[0][0].data_ptr() == out.data_ptr(), "O must be written into `out` itself"
+    ref_o, ref_lse, _ = sp._varlen_fwd(q, k, v, cu, cu, mx, mx, is_causal=True)
+    assert torch.equal(out, ref_o) and torch.equal(lse, ref_lse)
+
+
+def _varlen_inputs(lens, H, D):
+    lens_t = torch.tensor(lens, device="cuda")
+    cu = torch.nn.functional.pad(lens_t.cumsum(0), (1, 0)).to(torch.int32)
+    T, mx = int(cu[-1]), int(lens_t.max())
+    q, k, v = (torch.randn(T, H, D, dtype=torch.bfloat16, device="cuda") for _ in range(3))
+    return q, k, v, cu, T, mx
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("alias", ["k", "v"])
+def test_varlen_attn_out_aliasing_an_input_is_not_written_in_place(alias):
+    """An `out` that IS an input (out=K / out=V) must not be written while the kernels read it (review on #2003)."""
+    from cudnn.torch import sdpa_provider as sp
+
+    torch.manual_seed(0)
+    q, k, v, cu, T, mx = _varlen_inputs([2048, 4096], 4, 64)
+    ref_o, ref_lse, _ = sp._varlen_fwd(q, k, v, cu, cu, mx, mx, is_causal=True)
+    out = k if alias == "k" else v
+    lse = sp._varlen_fwd_out(out, q, k, v, cu, cu, mx, mx, is_causal=True)
+    assert torch.equal(out, ref_o) and torch.equal(lse, ref_lse)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("strides", [(257, 64, 1), (260, 65, 1)])
+def test_varlen_attn_out_with_an_undeclarable_pitch_falls_back(strides):
+    """An aligned-base `out` whose outer pitch is not a 16-byte multiple cannot be declared; it gets the
+    allocate-then-copy path instead of a descriptor rejection (review on #2003)."""
+    from cudnn.torch import sdpa_provider as sp
+
+    torch.manual_seed(0)
+    H, D = 4, 64
+    q, k, v, cu, T, mx = _varlen_inputs([128, 256], H, D)
+    ref_o, ref_lse, _ = sp._varlen_fwd(q, k, v, cu, cu, mx, mx, is_causal=True)
+    out = torch.empty(T * strides[0] + 64, dtype=torch.bfloat16, device="cuda").as_strided((T, H, D), strides)
+    lse = sp._varlen_fwd_out(out, q, k, v, cu, cu, mx, mx, is_causal=True)
+    assert torch.equal(out, ref_o) and torch.equal(lse, ref_lse)

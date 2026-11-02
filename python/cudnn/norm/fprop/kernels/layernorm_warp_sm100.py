@@ -3,7 +3,7 @@
 
 """LayerNorm/RMSNorm forward, sm_100 — warp-per-row, CUTLASS primitives.
 
-Modeled on cuDNN's ln_fwd kernel. Built on ``cutlass.primitives`` (nvvm):
+Modeled on cuDNN's ln_fwd kernel. Built on ``cutlass.experimental.primitives`` (nvvm):
 
 - ``tpr`` threads own one row. For large C the row is spread over ``wn = tpr//32``
   warps (``THREADS_PER_ROW = wn*32``) so each thread caches only ~``ldgs*V``
@@ -23,11 +23,11 @@ from __future__ import annotations
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-import cutlass.primitives as nvvm
+import cutlass.experimental.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import cur_stream, dyn, fake_stream, smem_capacity
+from cudnn.norm.utils import cur_stream, fake_rows, fake_stream, ffi, smem_capacity
 
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
 
@@ -611,15 +611,29 @@ def forward(spec, x2d, gamma, beta, *, eps, wcfg, params, out_y=None, out_mean=N
     nsteps = int(intra).bit_length() - 1
     full_warp = int(intra) == 32
 
-    args = (dyn(x2d), dyn(y), dyn(gamma), dyn(beta), dyn(mean), dyn(rstd), cutlass.Int32(R), cutlass.Int32(ctas), cutlass.Float32(eps))
     ce = (C, V, tpr, wn, intra, ldgs, rpc, block_threads, et, it_ty, nsteps, full_warp, spec.has_mean, has_beta, _MBPM)
     key = (params.io_dtype,) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        fn = cute.compile(_warp_fwd_host, *args, *ce, fake_stream())
+        fn = cute.compile(
+            _warp_fwd_host, *_fakes(et, C), cutlass.Int32(0), cutlass.Int32(0), cutlass.Float32(0), *ce, fake_stream(), options="--enable-tvm-ffi"
+        )
         _KCACHE[key] = fn
-    fn(*args, cur_stream())
+    fn(ffi(x2d), ffi(y), ffi(gamma), ffi(beta), ffi(mean), ffi(rstd), R, ctas, eps, cur_stream())
     return y, mean, rstd
+
+
+def _fakes(et, C):
+    """Compile-time placeholders of (x, y, gamma, beta, mean, rstd): the row count is one dynamic symbol."""
+    rows = cute.sym_int()
+    return (
+        fake_rows(et, C, rows=rows),
+        fake_rows(et, C, rows=rows),
+        fake_rows(et, rows=C),
+        fake_rows(et, rows=C),
+        fake_rows(cutlass.Float32, rows=rows),
+        fake_rows(cutlass.Float32, rows=rows),
+    )
 
 
 def _forward_pipe(spec, x2d, gamma, beta, *, eps, wcfg, params, has_beta, out_y=None, out_mean=None, out_rstd=None):
@@ -644,12 +658,13 @@ def _forward_pipe(spec, x2d, gamma, beta, *, eps, wcfg, params, has_beta, out_y=
     it_ty = _INT_TY[eb]
     smem_bytes = _pipe_smem(C, has_beta, wn, STAGES, eb)
 
-    args = (dyn(x2d), dyn(y), dyn(gamma), dyn(beta), dyn(mean), dyn(rstd), cutlass.Int32(R), cutlass.Int32(ctas), cutlass.Float32(eps))
     ce = (C, V, tpr, wn, ldgs, block_threads, et, it_ty, eb, STAGES, spec.has_mean, has_beta, smem_bytes)
     key = ("pipe", params.io_dtype) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        fn = cute.compile(_warp_fwd_pipe_host, *args, *ce, fake_stream())
+        fn = cute.compile(
+            _warp_fwd_pipe_host, *_fakes(et, C), cutlass.Int32(0), cutlass.Int32(0), cutlass.Float32(0), *ce, fake_stream(), options="--enable-tvm-ffi"
+        )
         _KCACHE[key] = fn
-    fn(*args, cur_stream())
+    fn(ffi(x2d), ffi(y), ffi(gamma), ffi(beta), ffi(mean), ffi(rstd), R, ctas, eps, cur_stream())
     return y, mean, rstd

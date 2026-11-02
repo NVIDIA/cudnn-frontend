@@ -208,12 +208,13 @@ class ThdLaunchSpec:
         "split_workspace",
         "neg_inf",
         "device_index",
+        "origin_specs",
     )
 
 
 # The host slot vocabulary the prepared launch binds: constants written once at build, and slots the native THD binder writes per call.
 _FILLED_AT_BUILD = frozenset(
-    "q_strides o_strides k_strides v_strides lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_lens_form o_partial_ptr "
+    "q_strides o_strides k_strides v_strides lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_lens_form thd_origin_ptrs thd_origin_caps o_partial_ptr "
     "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr ragged_q_div "
     "score_max_ptr score_sum_exp_ptr score_max_strides score_sum_exp_strides "
     # The bias / kv_mask slots of the sm107 f16 d128-file host (dense-only arms; a THD plan never requests them).
@@ -289,6 +290,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     s = ThdLaunchSpec()
     s.fn, s.owner, s.order = raw, compiled, order
     s.index = {n: i for i, n in enumerate(order)}
+    s.origin_specs = getattr(api, "_thd_origin_specs", None)
     s.quant = _quant_spec(api)
     s.b, s.qh, s.kh, s.d_qk, s.d_v = api.batch_size, api.h_q, api.h_kv, api.head_dim_qk, api.head_dim_v
     s.paged, s.page_size = bool(api.paged), int(api.paged_page_size or 0)
@@ -395,6 +397,36 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
         raise NotImplementedError("cudnn.sdpa: this prepared THD launch requires runtime initial-wave binding; rebuild the extension")
     if s.wave_geometry is not None and not getattr(_pybind_module._SdpaThdBinder, "supports_initial_wave_geometry", False):
         raise NotImplementedError("cudnn.sdpa: this prepared THD launch requires packed initial-wave geometry; rebuild the extension")
+    if s.origin_specs is not None and not getattr(_pybind_module._SdpaThdBinder, "supports_physical_origins", False):
+        raise NotImplementedError("physical THD origins require rebuilding the native extension")
+    if s.origin_specs is not None and "thd_origin_caps" in s.index and not getattr(_pybind_module._SdpaThdBinder, "supports_physical_origin_caps", False):
+        # The SM90 D512 host clamps origins into each port's own buffer; an older binder would leave the slot at None.
+        raise NotImplementedError("per-port physical THD origin capacities require rebuilding the native extension")
+    if s.origin_specs is not None and s.paged and not getattr(_pybind_module._SdpaThdBinder, "supports_paged_physical_origins", False):
+        raise NotImplementedError("paged physical THD origins require rebuilding the native extension")
+    if (
+        s.origin_specs is not None
+        and s.split_workspace is not None
+        and not getattr(_pybind_module._SdpaThdBinder, "supports_paged_split_physical_origins", False)
+    ):
+        raise NotImplementedError("paged split physical THD origins require rebuilding the native extension")
+    if (
+        s.origin_specs is not None
+        and s.split_workspace is not None
+        and not s.paged
+        and (s.d_qk, s.d_v) == (192, 128)
+        and not getattr(_pybind_module._SdpaThdBinder, "supports_nonpaged_d192_split_physical_origins", False)
+    ):
+        raise NotImplementedError("nonpaged D192 split physical THD origins require rebuilding the native extension")
+    if (
+        s.split_workspace is not None
+        and not s.paged
+        and (s.d_qk, s.d_v) == (64, 64)
+        and not getattr(_pybind_module._SdpaThdBinder, "supports_nonpaged_d64_packed_split", False)
+    ):
+        raise NotImplementedError("nonpaged D64 THD split requires rebuilding the native extension")
+    if s.quant is not None and s.paged and not getattr(_pybind_module._SdpaThdBinder, "supports_paged_fp8_physical_origins", False):
+        raise NotImplementedError("paged FP8 THD requires rebuilding the native extension")
     s.native = _pybind_module._SdpaThdBinder(s)
     return s
 
@@ -448,6 +480,10 @@ def execute_native_thd_tensors(spec, buffers, workspace_ptr, stream, scale, *, l
     from cudnn import _pybind_module
 
     roles = _NATIVE_THD_ROLES + _native_quant_roles(getattr(spec, "quant", None))
+    if getattr(spec, "origin_specs", None) is not None:
+        from .thd_origins import ROLES
+
+        roles += ROLES
     buffers = tuple(buffers) + (None,) * (len(roles) - len(buffers))
     gate_index = -1
     if gate is not None:
@@ -537,22 +573,33 @@ class PreparedThdLaunch:
                 tensor = getattr(binding, name)
                 if tensor is not None:
                     uids[name] = tensor.get_uid()
+        if spec.origin_specs is not None:
+            from .thd_origins import ROLES
+
+            for role, origin in zip(ROLES, spec.origin_specs):
+                if origin is not None:
+                    uids[role] = getattr(binding, role).get_uid()
         self._roles = list(uids)
         self._uids = [uids[r] for r in self._roles]
         self._indices: Optional[List[int]] = None
         self._native_indices = None
 
+    def _prepare_indices(self, index_of):
+        try:
+            self._indices = [index_of(u) for u in self._uids]
+        except KeyError as exc:
+            raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
+        roles = dict(zip(self._roles, self._indices))
+        native_roles = _NATIVE_THD_ROLES + _native_quant_roles(self.spec.quant)
+        if self.spec.origin_specs is not None:
+            from .thd_origins import ROLES
+
+            native_roles += ROLES
+        self._native_indices = tuple(roles.get(role, -1) for role in native_roles)
+
     def execute(self, pack, workspace_ptr: int, stream, stream_int: int) -> None:
-        indices = self._indices
-        if indices is None:
-            try:
-                indices = self._indices = [pack.index_of(u) for u in self._uids]
-            except KeyError as exc:
-                raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
         if self._native_indices is None:
-            roles = dict(zip(self._roles, indices))
-            native_roles = _NATIVE_THD_ROLES + _native_quant_roles(self.spec.quant)
-            self._native_indices = tuple(roles.get(role, -1) for role in native_roles)
+            self._prepare_indices(pack.index_of)
         self.spec.native.execute(pack.native, self._native_indices, workspace_ptr, stream)
 
 
@@ -562,7 +609,8 @@ class PreparedThdLaunch:
 
 # Constants written at build, and slots the native dense binder writes per call.
 _FILLED_AT_BUILD_DENSE = frozenset(
-    "lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_q_lens_ptr thd_kv_lens_ptr thd_lens_form o_partial_ptr "
+    "final_o_ptr final_lse_ptr final_o_strides final_lse_strides "
+    "lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_q_lens_ptr thd_kv_lens_ptr thd_lens_form thd_origin_ptrs thd_origin_caps o_partial_ptr "
     "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr ragged_q_div "
     "score_max_ptr score_sum_exp_ptr score_max_strides score_sum_exp_strides "
     "bias_ptr bias_strides bias_extents kv_mask_ptr kv_mask_batch_stride inv_scale_softmax".split()
@@ -694,11 +742,13 @@ class DenseLaunchSpec:
         "gate_expect",
         "split",
         "fp32_partial",
+        "fused_split",
         "combine",
         # The split sink combine takes the per-batch Q lengths (int32 (B,)) after the sink pointer: a plan with a split sink AND the dense padded-Q
         # trim (``seq_q_present``).  The combine cannot tell a padded query row from a valid keyless one without them (the native binder appends the
         # bound Q-length address to the combine frame).
         "combine_q_lens",
+        "ragged_q_lens",
         "tile_n",
         "kv_tail_native",
         "causal",
@@ -796,6 +846,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.paged_hnd = _declared_paged_hnd(api) if s.paged else False
     s.paged_v_hnd = _declared_paged_hnd(api, which_v=True) if s.paged else False
     s.split = int(api.split_kv)
+    s.fused_split = bool(getattr(api, "_cluster_combine", False))
     s.fp32_partial = bool(api._fp32_partial_split()) if s.split > 1 else False
     s.expect = {n: str(getattr(api, f"{n}_desc").dtype).split(".")[-1] for n in ("q", "k", "v", "o")}
     if s.split > 1:  # the main kernel writes the split-major partial slabs, in the partial dtype
@@ -850,6 +901,15 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.device_index = int(api.q_desc.device.index or 0)
     # The decode tile's ragged-Q leg (api.thd_decode_leg): a split launch by construction.
     s.ragged = bool(getattr(api, "thd_decode_leg", False))
+    # Standalone THD always requires Q lengths. Graph lowering may explicitly
+    # select the legacy offset-only form when the graph has no length operand.
+    s.ragged_q_lens = int(getattr(api, "_ragged_q_lens", 2 if getattr(api, "cu_seq_q_lens", False) else 1)) if s.ragged else 0
+    if s.ragged_q_lens:
+        from cudnn import _pybind_module
+
+        if not getattr(_pybind_module._SdpaDenseBinder, "supports_ragged_q_lens", False):
+            raise NotImplementedError("ragged decode Q lengths require the matching native cuDNN Frontend extension")
+        s.seq_q_present = True
     s.ragged_divs = tuple(int(d) for d in getattr(api, "ragged_divisors", (1, 1, 1))) if s.ragged else (1, 1, 1)
     s.ragged_i64 = bool(getattr(api, "ragged_offsets_int64", False)) if s.ragged else False
     s.ragged_lse_head_major = bool(getattr(api, "thd_stats_head_major", False)) if s.ragged else False
@@ -863,39 +923,44 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
         from cudnn.sdpa.fwd.kernels.sm100 import split_combine
         from cudnn import _pybind_module
 
-        s.combine_q_lens = bool(s.has_sink) and s.quant is None and s.seq_q_present and not s.ragged
+        if s.has_sink and s.quant is not None and not getattr(_pybind_module._SdpaDenseBinder, "supports_quantized_split_sink", False):
+            raise NotImplementedError("cudnn.sdpa: FP8 split attention with a sink needs the native quantized sink-combine binder; rebuild the extension")
+        s.combine_q_lens = bool(s.has_sink) and s.seq_q_present and not s.ragged
         if s.combine_q_lens and not getattr(_pybind_module._SdpaDenseBinder, "supports_combine_q_lens", False):
             raise NotImplementedError(
                 "cudnn.sdpa: a split attention sink over padded query lengths needs the native binder that passes them to the combine; rebuild the extension"
             )
 
-        # The combine kernel's FORM (a plan-time specialization: the declared B / H_q / S_q, the split and the plan's device,
-        # never a runtime value; _split_combine_decode_grid states the rule and reads the device the adapter recorded).
-        decode_grid = _split_combine_decode_grid(api, s.b, s.qh, s.s_q_max, s.split)
-        owner = split_combine.compile_ptr(
-            dtype_o=api._combine_dtype_tag(),
-            dtype_partial=api._partial_dtype_tag(),
-            has_lse=api.lse_desc is not None,
-            stats_log2=api.stats_log2,
-            ragged=s.ragged,
-            ragged_i64=s.ragged_i64,
-            quantized=s.quant is not None,
-            has_amax=s.quant.has_amax if s.quant is not None else False,
-            has_scale_o=api._split_scale_o() if s.quant is not None else False,
-            has_scale_o_input=not (s.quant is not None and s.quant.sf_sizes),
-            gate=gate_in_combine,
-            dtype_gate=({"bfloat16": "bf16", "float16": "f16"}[gate_dtype] if gate_in_combine else None),
-            # The plan's programmatic-dependent-launch form reaches the combine too (the dense half entries; a split tile
-            # compiled with its griddepcontrol sites releases this pass early, and this pass waits before its first read).
-            **({"use_pdl": True} if getattr(api, "use_pdl", False) else {}),
-            decode_grid=decode_grid,
-            # Half flavors fold the attention sink in the combine (sink-free partials).
-            has_sink=bool(s.has_sink) and s.quant is None,
-            has_q_lens=s.combine_q_lens,
-        )
-        fn = positional_entry(owner)
-        if fn is None:
-            raise NotImplementedError("the split combine artifact exposes no positional tvm-ffi entry")
+        owner = fn = None
+        if not s.fused_split:
+            # The combine kernel's FORM (a plan-time specialization: the declared B / H_q / S_q, the split and the plan's device,
+            # never a runtime value; _split_combine_decode_grid states the rule and reads the device the adapter recorded).
+            decode_grid = _split_combine_decode_grid(api, s.b, s.qh, s.s_q_max, s.split)
+            owner = split_combine.compile_ptr(
+                dtype_o=api._combine_dtype_tag(),
+                dtype_partial=api._partial_dtype_tag(),
+                has_lse=api.lse_desc is not None,
+                stats_log2=api.stats_log2,
+                ragged=s.ragged,
+                ragged_i64=s.ragged_i64,
+                ragged_q_lens=s.ragged_q_lens,
+                quantized=s.quant is not None,
+                has_amax=s.quant.has_amax if s.quant is not None else False,
+                has_scale_o=api._split_scale_o() if s.quant is not None else False,
+                has_scale_o_input=not (s.quant is not None and s.quant.sf_sizes),
+                gate=gate_in_combine,
+                dtype_gate=({"bfloat16": "bf16", "float16": "f16"}[gate_dtype] if gate_in_combine else None),
+                # The plan's programmatic-dependent-launch form reaches the combine too (the dense half entries; a split tile
+                # compiled with its griddepcontrol sites releases this pass early, and this pass waits before its first read).
+                **({"use_pdl": True} if getattr(api, "use_pdl", False) else {}),
+                decode_grid=decode_grid,
+                # Every admitted split sink is folded once over sink-free partials.
+                has_sink=bool(s.has_sink),
+                has_q_lens=s.combine_q_lens,
+            )
+            fn = positional_entry(owner)
+            if fn is None:
+                raise NotImplementedError("the split combine artifact exposes no positional tvm-ffi entry")
         rows, sq, h, d = s.split * s.b, s.s_q_max, s.qh, s.d_v
         device = (_DLPACK_CUDA, s.device_index)
         combine_gate = CombineGate(fn, gate_dtype, (s.b, h, sq, d), device) if gate_in_combine else None
@@ -918,6 +983,10 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
         if name in s.index:
             t[s.index[name]] = value
 
+    put("final_o_ptr", None)
+    put("final_lse_ptr", None)
+    put("final_o_strides", (0, 0, 0))
+    put("final_lse_strides", (0, 0, 0))
     put("lse_strides", (0, 0, 0))
     put("lse_ext", 0)
     # Score side outputs: None / zero strides in the template; bind_dense fills the requested ones per call.
@@ -1306,7 +1375,7 @@ def _dense_role_layout(shape, strides, heads, d, s_max, b_max, elem_bytes, tma, 
         rule = (
             "contiguous, every live B/H/S byte stride a 16-byte multiple, and the layout a covering permutation (config_sm90.dense_bind_strides)"
             if dense_flex
-            else "contiguous, seq and head strides 16-byte multiples, and the layout token-major and covering (config_sm100.dense_bind_strides)"
+            else "contiguous, every B/H/S byte stride a 16-byte multiple, and the layout a covering permutation (config_sm100.dense_bind_strides)"
         )
         raise ValueError(
             f"cudnn.sdpa: {name}: shape {tuple(shape)} strides {tuple(strides)} is not a layout the kernel binds zero-copy: the head dim must be {rule}"
@@ -1455,12 +1524,13 @@ def bind_dense(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], s
         if f is None:
             raise ValueError(f"cudnn.sdpa: {name} is required by this compiled specialization")
         _on_plan_device(spec, name, f)
-        if f.dtype != "int32" or not f.contiguous or f.numel < b:
-            raise ValueError(f"cudnn.sdpa: {name} must be a contiguous int32 tensor of at least {b} elements; got {f.dtype} x {f.numel}")
+        count = b + int(name == "seq_q_lens" and getattr(spec, "ragged_q_lens", 0) == 2)
+        if f.dtype != "int32" or not f.contiguous or f.numel < count:
+            raise ValueError(f"cudnn.sdpa: {name} must be a contiguous int32 tensor of at least {count} elements; got {f.dtype} x {f.numel}")
         if f.ptr % _ALIGN_F32:
             raise ValueError(f"cudnn.sdpa: {name} must be 4-byte aligned")
-        if f.span >= 0 and f.span < b:
-            raise ValueError(f"cudnn.sdpa: {name} spans {f.span} elements; this launch reads {b}")
+        if f.span >= 0 and f.span < count:
+            raise ValueError(f"cudnn.sdpa: {name} spans {f.span} elements; this launch reads {count}")
         return f.ptr
 
     # Dense hosts retain these pointer slots, but only SEQ_KV_PRESENT reads
@@ -1531,9 +1601,22 @@ def bind_dense_split(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFact
             raise ValueError("cudnn.sdpa: split output must match the declared (B, S_q)")
         o_ptr, o_strides = o.ptr, (*o.strides, 1)
         lse_ptr, lse_strides = _dense_lse(spec, facts.get("lse"), spec.b, spec.s_q_max, required=combine.has_stats)
+    if spec.quant is None:
+        workspace_end = workspace_ptr + combine.lse_offset + combine.lse.numel * 4
+        for name, fact in facts.items():
+            if fact is None or fact.numel == 0:
+                continue
+            span = fact.span if fact.span >= 0 else 1 + sum((n - 1) * st for n, st in zip(fact.shape, fact.strides, strict=True))
+            if workspace_ptr < fact.ptr + span * _buffers.DTYPE_ITEMSIZE[fact.dtype] and fact.ptr < workspace_end:
+                raise ValueError(f"cudnn.sdpa: split workspace overlaps {name}")
     lse_partial_ptr = workspace_ptr + combine.lse_offset
     partials = dict(facts, o=combine.o._replace(ptr=workspace_ptr), lse=combine.lse._replace(ptr=lse_partial_ptr))
     frame = bind_dense(spec, partials, stream, stream_int)
+    if getattr(spec, "fused_split", False):
+        frame[spec.index["final_o_ptr"]] = o_ptr
+        frame[spec.index["final_lse_ptr"]] = lse_ptr
+        frame[spec.index["final_o_strides"]] = o_strides[:3]
+        frame[spec.index["final_lse_strides"]] = lse_strides
     combine_args = (
         workspace_ptr,
         lse_partial_ptr,
@@ -1545,6 +1628,7 @@ def bind_dense_split(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFact
         lse_strides,
         *ragged_args,
         stream,
+        *((facts["seq_q_lens"].ptr,) if getattr(spec, "ragged_q_lens", 0) else ()),
     )
     return frame, combine_args
 
@@ -1660,7 +1744,8 @@ class PreparedDenseLaunch:
                 return  # ragged-Q leg: no addressable token / empty producer -> no launch
             frame, combine_args = bound
             self.spec.fn(*frame)
-            self.spec.combine.fn(*combine_args)
+            if not self.spec.fused_split:
+                self.spec.combine.fn(*combine_args)
         else:
             self.spec.fn(*bind_dense(self.spec, facts, stream, stream_int))
 

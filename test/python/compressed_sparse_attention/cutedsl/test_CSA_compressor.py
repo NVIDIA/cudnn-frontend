@@ -15,7 +15,7 @@ measurements and numerics in https://github.com/NVIDIA/Megatron-LM/issues/5968).
     so absolute deviations scale with input magnitude — and carry fp64-oracle parity
     on inputs whose fp32 intermediates stay finite (inputs that overflow the
     reference's fp32 intermediates reproduce its NaN pattern instead: the committed
-    gate's overflow-intermediate case; see docs/fe-oss-apis/csa.md and the gate's
+    gate's overflow-intermediate case; see docs/operations/sparse_attention/csa.md and the gate's
     scaled-input case). Both families are also compared against the verbatim
     upstream eager numerics (tolerance), over ragged THD packs including segments
     shorter than ``ratio``;
@@ -844,15 +844,96 @@ def test_backward_fills_uninitialized_buffers(lens, d, ratio, coff, pad, tok_pad
 
 
 @pytest.mark.L0
-def test_ratio4_deterministic_workspace_includes_hierarchical_stage():
+@pytest.mark.parametrize("nb_total,expected_rows", [(65535, 8), (65536, 24)])
+def test_ratio4_deterministic_workspace_includes_hierarchical_stage(nb_total, expected_rows):
     """Ratio 4 reserves disjoint producer and stage-1 planes."""
-    from cudnn.csa.compressor.compressor_sm100 import bwd_dape_workspace_bytes
+    from cudnn.csa.compressor.compressor_sm100 import _bwd_rows, bwd_dape_workspace_bytes
 
-    nb_total, ratio, d, coff = 65536, 4, 128, 1
-    npartials = (nb_total + 7) // 8
+    ratio, d, coff = 4, 128, 1
+    rows_per_cta = _bwd_rows(ratio, True, nb_total)
+    assert rows_per_cta == expected_rows
+    npartials = (nb_total + rows_per_cta - 1) // rows_per_cta
     nelems = ratio * coff * d
     ngroups = (npartials + 31) // 32
     assert bwd_dape_workspace_bytes(nb_total, ratio, d, coff) == (npartials + ngroups) * nelems * 4
+
+
+@pytest.mark.L0
+def test_ratio4_deterministic_compile_cache_separates_long_schedule(monkeypatch):
+    """Plan compilation keeps the short and long producer schedules distinct."""
+    _require_sm100()
+    compressor = _import_compressor()
+    from cudnn.csa.compressor import compressor_sm100
+
+    compiled = {}
+    compiled_rows = []
+
+    def fake_compile(key, args, ratio, d, coff, rows_per_cta, deterministic=False):
+        compiled_rows.append(rows_per_cta)
+        compiled[key] = object()
+        return compiled[key]
+
+    def fake_reduce(device, split=False):
+        compiled[("dape_reduce", bool(split), device.index)] = object()
+
+    monkeypatch.setattr(compressor_sm100, "_COMPILED", compiled)
+    monkeypatch.setattr(compressor_sm100, "_compile_bwd", fake_compile)
+    monkeypatch.setattr(compressor_sm100, "precompile_dape_reduce", fake_reduce)
+
+    d, ratio, coff = 128, 4, 1
+    kv, score, ape, cu, cuc, _, _ = _make_inputs([ratio], d, ratio, coff)
+    for total_comp in (65535, 65536, 65535):
+        plan = compressor.CSACompressorBackward(
+            sample_kv=kv.view(kv.shape[0], -1),
+            sample_score=score.view(score.shape[0], -1),
+            sample_ape=ape,
+            sample_cu_seqlens=cu,
+            sample_cu_seqlens_comp=cuc,
+            sample_out=torch.empty(total_comp, d, dtype=torch.bfloat16, device="meta"),
+            ratio=ratio,
+            coff=coff,
+            deterministic=True,
+        )
+        assert plan.check_support()
+        plan.compile()
+
+    assert compiled_rows == [8, 24]
+
+
+@pytest.mark.L0
+def test_ratio4_long_deterministic_schedule_matches_reference():
+    """The first 24-row bucket is deterministic and keeps the gradient contract."""
+    _require_sm100()
+    compressor = _import_compressor()
+    lens = [1024, 3072, 8192, 16384, 32768, 65536, 135168]
+    ratio, d, coff = 4, 128, 1
+    kv, score, ape, cu, cuc, total_comp, go = _make_inputs(lens, d, ratio, coff)
+    assert total_comp == 65536
+
+    def run():
+        return compressor.csa_compressor_backward_wrapper(
+            kv.view(kv.shape[0], -1),
+            score.view(score.shape[0], -1),
+            ape,
+            cu,
+            cuc,
+            go.view(total_comp, d),
+            ratio=ratio,
+            head_dim=d,
+            coff=coff,
+            deterministic=True,
+        )
+
+    first = run()
+    second = run()
+    torch.cuda.synchronize()
+    for name in ("grad_kv", "grad_score", "grad_ape"):
+        assert torch.equal(first[name], second[name]), name
+
+    reference = _run_eager(kv, score, ape, cu, cuc, total_comp, ratio, d, coff, go, mode="fp32")
+    assert torch.equal(first["grad_kv"].view_as(reference[1]), reference[1])
+    assert torch.equal(first["grad_score"].view_as(reference[2]), reference[2])
+    assert (first["grad_ape"] - reference[3]).abs().max().item() <= 1e-3
 
 
 @pytest.mark.L0

@@ -127,7 +127,7 @@ surviving external line(s) in each file (blame on `origin/develop`).
 > Note: `dlpack_version.txt` is a plain version-string file that cannot carry
 > a header comment; it is listed here and governed by MIT via this manifest.
 
-## Category 2 — Third-party-derived files retaining MIT terms (36 files)
+## Category 2 — Third-party-derived files retaining MIT terms (38 files)
 
 Derived from FlashAttention or CUTLASS (both BSD-3-Clause) and/or QuACK
 (Apache-2.0); they retain their original authors' copyright notices. See
@@ -142,10 +142,12 @@ every later import; the source headers and third-party notices also cover those.
 | `python/cudnn/block_sparse_attention/csrc/bwd/bsa_bwd_postprocess.py` | [`afd575d`](https://github.com/NVIDIA/cudnn-frontend/commit/afd575d6ecf9cb86bc35325b9a961547f0d4d272) (#333)<br>[`5b9c94a`](https://github.com/NVIDIA/cudnn-frontend/commit/5b9c94a67763d4d6ebf4158b49edca4aad2d81e7) (#349) |
 | `python/cudnn/block_sparse_attention/csrc/bwd/bsa_bwd_preprocess.py` | [`afd575d`](https://github.com/NVIDIA/cudnn-frontend/commit/afd575d6ecf9cb86bc35325b9a961547f0d4d272) (#333) |
 | `python/cudnn/block_sparse_attention/csrc/bwd/sm100_blk128/bsa_bwd_sm100.py` | [`afd575d`](https://github.com/NVIDIA/cudnn-frontend/commit/afd575d6ecf9cb86bc35325b9a961547f0d4d272) (#333)<br>[`0041a2b`](https://github.com/NVIDIA/cudnn-frontend/commit/0041a2bb917f886a46388b0b59781ee185ed8f11) (#382)<br>[`d380fab`](https://github.com/NVIDIA/cudnn-frontend/commit/d380fabf3ae9b7002f0511143d1e27a29341bb2f) (#350) |
+| `python/cudnn/block_sparse_attention/csrc/bwd/sm100_blk128/bsa_bwd_sm100_kpage.py` | derived from `bsa_bwd_sm100.py` above (KPage contribution) |
 | `python/cudnn/block_sparse_attention/csrc/fwd/sm100_blk64/bsa_fwd_combine.py` | [`afd575d`](https://github.com/NVIDIA/cudnn-frontend/commit/afd575d6ecf9cb86bc35325b9a961547f0d4d272) (#333) |
 | `python/cudnn/block_sparse_attention/csrc/fwd/sm100_blk64/bsa_fwd_helpers.py` | [`afd575d`](https://github.com/NVIDIA/cudnn-frontend/commit/afd575d6ecf9cb86bc35325b9a961547f0d4d272) (#333) |
 | `python/cudnn/block_sparse_attention/csrc/utils/block_info.py` | [`afd575d`](https://github.com/NVIDIA/cudnn-frontend/commit/afd575d6ecf9cb86bc35325b9a961547f0d4d272) (#333) |
 | `python/cudnn/block_sparse_attention/csrc/utils/block_sparse_tile_scheduler.py` | [`afd575d`](https://github.com/NVIDIA/cudnn-frontend/commit/afd575d6ecf9cb86bc35325b9a961547f0d4d272) (#333) |
+| `python/cudnn/block_sparse_attention/csrc/utils/kpage_tile_scheduler.py` | derived from `block_sparse_tile_scheduler.py` above (KPage contribution) |
 | `python/cudnn/block_sparse_attention/csrc/utils/copy_utils.py` | [`afd575d`](https://github.com/NVIDIA/cudnn-frontend/commit/afd575d6ecf9cb86bc35325b9a961547f0d4d272) (#333)<br>[`0041a2b`](https://github.com/NVIDIA/cudnn-frontend/commit/0041a2bb917f886a46388b0b59781ee185ed8f11) (#382) |
 | `python/cudnn/block_sparse_attention/csrc/utils/cute_dsl_utils.py` | [`afd575d`](https://github.com/NVIDIA/cudnn-frontend/commit/afd575d6ecf9cb86bc35325b9a961547f0d4d272) (#333) |
 | `python/cudnn/block_sparse_attention/csrc/utils/kernel_utils.py` | [`afd575d`](https://github.com/NVIDIA/cudnn-frontend/commit/afd575d6ecf9cb86bc35325b9a961547f0d4d272) (#333) |

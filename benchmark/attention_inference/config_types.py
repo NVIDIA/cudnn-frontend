@@ -125,6 +125,13 @@ class InferenceBenchmarkConfig:
     # would only repeat the row). Backend layout constraints are applied before deduplication; the effective page size
     # lands in the CSV's ``page_size`` column. Appended, defaulted.
     page_sizes: Optional[List[int]] = None
+    # cudnn legs: "dense" K/V, and/or "paged" -- the form serving stacks hand cuDNN (FlashInfer's cudnn backend): paged
+    # K/V with a shuffled block table, per-request lengths and a padding mask, THD Q/O for a prefill. Other backends keep
+    # their native layout. One case per entry.
+    kv_layouts: List[str] = field(default_factory=lambda: ["dense"])
+    # Generation: per-request KV lengths drawn (seeded) from [fill * kv_len, kv_len], one case per entry; 1.0 = every
+    # request at kv_len. Applies to the paged cudnn legs and flashinfer.
+    kv_min_fills: List[float] = field(default_factory=lambda: [1.0])
 
 
 @dataclass
@@ -157,3 +164,17 @@ class BenchmarkResult:
     gpu_name: Optional[str] = None
     backend_detail: Optional[str] = None  # e.g. flashinfer kernel backend / num_splits used
     cudnn_backend_version: Optional[str] = None
+    kv_layout: str = "dense"
+    kv_min_fill: float = 1.0
+    attn_mask: str = "no_mask"  # the training suite's vocabulary: top_left / bottom_right / no_mask
+    has_sink: bool = False
+
+
+def attn_mask(phase: str, context_causal: bool, q_tokens: int, kv_len: int, sliding_window_size: Optional[int]) -> str:
+    """Diagonal alignment of the case's causal mask. A context square is top-left; a context chunk and every decode row sit at
+    the end of the sequence (bottom-right); a single decode row is unmasked unless a window anchors it."""
+    if phase == "context":
+        if not context_causal:
+            return "no_mask"
+        return "top_left" if q_tokens == kv_len else "bottom_right"
+    return "bottom_right" if q_tokens > 1 or sliding_window_size else "no_mask"

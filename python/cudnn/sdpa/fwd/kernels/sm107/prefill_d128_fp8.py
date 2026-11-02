@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 """
-DSL prefill SDPA kernel — classic pipeline, per-tensor FP8 (E4M3 / E5M2), d=128, SM107 (Rubin).
+DSL prefill SDPA kernel — classic pipeline, per-tensor FP8 (E4M3 / E5M2), d=64/128, SM107 (Rubin).
 
 Verbatim sibling of ``sm100/prefill_d128_fp8.py`` (at 923fcb1a9) with the
 Rubin-specific deltas baked in — the ``_rubin`` sibling-module pattern from
@@ -70,12 +70,12 @@ import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls c
 
 from dataclasses import dataclass
 
-from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d128
+from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d64, make_cfg_d128
 
 # The template loader (api_dsl._load_kernel_module) injects FROST_TEMPLATE_PARAMS
 # as a module global before this body runs; the default keeps direct import usable.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
-CFG, _TMA = make_cfg_d128(PARAMS)
+CFG, _TMA = (make_cfg_d64 if PARAMS.d_flavor == 64 else make_cfg_d128)(PARAMS)
 if PARAMS.dual_kv_stream:
     raise ValueError("sm107/prefill_d128_fp8: dual_kv_stream (two KV streams over one Q tile) is served by sm100/prefill_d128_fp8.py only")
 if PARAMS.paged_kv:
@@ -374,7 +374,7 @@ class KernelTmemLayout:
     STATS_STRIDE: int = 128
 
 
-# Row-sum-in-MMA: O widens to 144 per sub-tile (128 O + 16 Sigma); the sm107
+# Row-sum-in-MMA: each O slot includes 16 Sigma columns after TILE_O; the sm107
 # EXCLUSIVE TMEM allocation grants all 576 columns regardless of the request
 # and dealloc must return the grant, so TOTAL_COLS carries it.
 LAYOUT = KernelTmemLayout(TOTAL_COLS=576, O1_OFF=400)

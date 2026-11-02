@@ -611,3 +611,66 @@ def test_representative_conv_tile_configs(tile_config: ConvTileConfig) -> None:
 @pytest.mark.parametrize("tile_config", _DENSE_CATALOG, ids=lambda config: config.name)
 def test_all_bf16_conv_tile_configs_compile_and_execute(tile_config: ConvTileConfig) -> None:
     _run_bf16_config(tile_config)
+
+
+def _model_two_parts(monkeypatch, template, order):
+    """Two modeled GPUs (ordinals 0 and 1, of the parts in ``order``): the frost build device and capability are patched, the
+    template's context switch is a no-op, and ``cute.compile`` records the build device and options instead of compiling."""
+    import contextlib
+
+    from cudnn.frost import device as frost_device
+
+    current, compiled = [0], []
+    monkeypatch.setattr(frost_device, "current_device", lambda: current[0])
+    monkeypatch.setattr(frost_device, "compute_capability", lambda device: order[device])
+
+    def record(*args, options, **kwargs):
+        compiled.append((current[0], options))
+        return compiled[-1]
+
+    monkeypatch.setattr(template, "device_context", lambda device: contextlib.nullcontext())
+    monkeypatch.setattr(template.cute, "compile", record)
+    return current, compiled
+
+
+_PART_ORDERS = pytest.mark.parametrize("order", [((10, 0), (10, 3)), ((10, 3), (10, 0))], ids=["sm100_then_sm103", "sm103_then_sm100"])
+_TARGETS = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+
+
+@pytest.mark.L0
+@_PART_ORDERS
+@requires_block_scale_cutedsl
+def test_block_scale_compiler_cache_keys_on_the_build_device(monkeypatch, order) -> None:
+    """An SM100 and an SM103 GPU in one process each compile their own artifact for their own target, in either order, and a
+    repeat on either reuses its own: never the other part's launchable."""
+    from cudnn.conv.frost.templates import sm100_block_scale_conv
+
+    current, compiled = _model_two_parts(monkeypatch, sm100_block_scale_conv, order)
+    sm100_block_scale_conv._compile_cached.cache_clear()
+    try:
+        for device in (0, 1, 0, 1):
+            current[0] = device
+            result = sm100_block_scale_conv.compile(ncdhw=(1, 64, 1, 1, 128), ktrs=(64, 1, 1, 1), tile_config=ConvTileConfig(128, 64, 32, 1))
+            assert result[0] == device
+    finally:
+        sm100_block_scale_conv._compile_cached.cache_clear()
+    assert compiled == [(device, f"--enable-tvm-ffi --gpu-arch {_TARGETS[order[device]]}") for device in (0, 1)]
+
+
+@pytest.mark.L0
+@_PART_ORDERS
+@requires_dense_cutedsl
+def test_dense_compiler_cache_keys_on_the_build_device(monkeypatch, order) -> None:
+    """The dense template's cache follows the build device and its target the same way."""
+    from cudnn.conv.frost.templates import sm100_conv
+
+    current, compiled = _model_two_parts(monkeypatch, sm100_conv, order)
+    monkeypatch.setattr(sm100_conv.utils, "HardwareInfo", lambda: type("HardwareInfo", (), {"get_max_active_clusters": lambda self, size: 1})())
+    sm100_conv._compile_cached.cache_clear()
+    try:
+        for device in (0, 1, 0, 1):
+            current[0] = device
+            assert sm100_conv.compile(ncdhw=(1, 128, 1, 1, 1), ktrs=(128, 1, 1, 1), tile_config=ConvTileConfig(128, 128, 128, 1))[0] == device
+    finally:
+        sm100_conv._compile_cached.cache_clear()
+    assert compiled == [(device, f"--enable-tvm-ffi --gpu-arch {_TARGETS[order[device]]}") for device in (0, 1)]
