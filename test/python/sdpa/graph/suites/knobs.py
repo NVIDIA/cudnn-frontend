@@ -87,8 +87,7 @@ def model_knobs(preset, phase):
             data_type=_f16(),
             with_sliding_mask=SlidingWindowMaskGenerator(**SW_NONE),
             diag_align=RandomChoice(DIAG_BOTH),
-            # THD and padded decode both; paging is drawn in the post hook and
-            # only when the layout is not ragged (paged+ragged is not a form).
+            # THD and padded decode both; paging is drawn independently in the post hook.
             is_ragged_or_padded_or_full=RandomChoice({"ragged": 1, "padded": 1}),
             block_size=RandomBlockSize(min=16, max=256, with_high_probability=[16, 32, 128]),
             total_token_slack=RandomChoice({"packed": 1, "slack": 1}),
@@ -149,7 +148,7 @@ def model_knobs_fp8(preset, phase):
             output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float16: 2}),
             with_sliding_mask=SlidingWindowMaskGenerator(**SW_NONE),
             diag_align=RandomChoice(DIAG_BOTH),
-            # THD and padded decode both; paging only when not ragged (post hook).
+            # THD and padded decode both; paging is independent (post hook).
             is_ragged_or_padded_or_full=RandomChoice({"ragged": 1, "padded": 1} if thd_ok else {"padded": 1}),
             block_size=RandomBlockSize(min=16, max=128, with_high_probability=[16, 32, 64]),
             total_token_slack=RandomChoice({"packed": 1, "slack": 1}),
