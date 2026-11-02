@@ -144,6 +144,7 @@ def compress_topk_cand_buffer_size(
     return_lse: bool = False,
     q_causal_offsets: torch.Tensor | None = None,
     precision: str = "bf16",
+    paged: bool = False,
 ) -> int:
     """Number of float32 elements a caller-provided ``cand_buffer`` must hold for
     ``indexer_fwd_compress_topk`` at this BSHD shape.  It is ``bs * per_batch_floats``; for a
@@ -162,7 +163,11 @@ def compress_topk_cand_buffer_size(
 
     Pass the launch's ``precision``: block-scaled precisions (``"mxfp8"``, ``"mxfp4"``)
     always run a single launch, so this returns the full buffer and an explicit
-    ``microbatch_rows > 0`` raises, as at launch."""
+    ``microbatch_rows > 0`` raises, as at launch.
+
+    Pass ``paged=True`` when the launch reads K through ``block_table`` / ``kv_lens``
+    (``seqlen_k`` is then the launch's ``max_seqlen_k``): paged K also runs a single
+    launch, with the same full-buffer sizing and the same ``microbatch_rows > 0`` error."""
     from ..indexer_top_k.compress_top_k_sm100 import per_batch_floats
 
     _check_q_covered_by_k(seqlen_q, seqlen_k, ratio)
@@ -170,6 +175,10 @@ def compress_topk_cand_buffer_size(
     if precision in BLOCK_SCALED_FORMATS:
         if microbatch_rows > 0:
             raise NotImplementedError(f"microbatch_rows is not supported with precision={precision!r} " "(per-window scale repacking is not implemented)")
+        microbatch_rows = 0
+    if paged:
+        if microbatch_rows > 0:
+            raise NotImplementedError("microbatch_rows > 0 is not supported with paged K; pass microbatch_rows=0")
         microbatch_rows = 0
     if q_causal_offsets is not None:
         if not q_causal_offsets.is_cuda or q_causal_offsets.dtype != torch.int32 or q_causal_offsets.ndim != 1 or q_causal_offsets.shape[0] != bs:

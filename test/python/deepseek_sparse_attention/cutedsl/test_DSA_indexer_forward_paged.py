@@ -303,6 +303,13 @@ def test_DSA_indexer_forward_paged_declines():
         DSA.indexer_forward_top_k_wrapper(q, pool, w, **{**kwargs, "topk_indices_global": True})
     with pytest.raises(NotImplementedError, match="microbatch_rows"):
         DSA.indexer_forward_top_k_wrapper(q, pool, w, microbatch_rows=4, **kwargs)
+    # The BSHD sizing helper follows the same single-launch rule: at a length where the dense default sizes an
+    # auto-microbatch window, paged sizing is the full buffer.
+    full = DSA.compress_topk_cand_buffer_size(2, 32768, 8192, 4, microbatch_rows=0)
+    assert DSA.compress_topk_cand_buffer_size(2, 32768, 8192, 4, paged=True) == full
+    assert DSA.compress_topk_cand_buffer_size(2, 32768, 8192, 4) < full
+    with pytest.raises(NotImplementedError, match="microbatch_rows"):
+        DSA.compress_topk_cand_buffer_size(2, 32768, 8192, 4, microbatch_rows=4096, paged=True)
     with pytest.raises(NotImplementedError, match="BF16"):
         q8, k8 = q.to(torch.float8_e4m3fn), pool.to(torch.float8_e4m3fn)
         sf = torch.ones((1, 128, 4), device=device).to(torch.float8_e8m0fnu)

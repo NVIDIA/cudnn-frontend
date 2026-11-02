@@ -1237,7 +1237,8 @@ def test_capabilities_positional_prefix_is_append_only():
     )
 
     bwd_names = [f.name for f in dataclasses.fields(bwd_engines.Capabilities)]
-    assert bwd_names[-8:] == [
+    bwd_start = bwd_names.index("bottom_right_s_q_multiple")
+    assert bwd_names[bwd_start : bwd_start + 8] == [
         "bottom_right_s_q_multiple",
         "thd_head_stride",
         "zero_scale",
@@ -1247,6 +1248,7 @@ def test_capabilities_positional_prefix_is_append_only():
         "independent_head_dims",
         "band",
     ], bwd_names
+    assert bwd_names[bwd_start + 8 : bwd_start + 10] == ["thd_tile_ms", "thd_tile_ns"], bwd_names
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
