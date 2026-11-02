@@ -39,6 +39,13 @@ except ImportError:
 import torch.nn.functional as F  # noqa: E402
 
 import cudnn.torch as provider  # noqa: E402
+from cudnn.torch import sdpa_provider  # noqa: E402
+
+# Where torch's varlen ops take a `backend` argument, the provider serves only
+# calls that selected cuDNN, and torch's rules decide which configs can select
+# it: full or causal windows only (test_torch_provider_backend.py covers the
+# routing itself).
+_SELECTS_BACKEND = sdpa_provider._has_backend_arg(torch.ops.torch_attn._varlen_attn.default)
 
 
 @pytest.fixture(autouse=True)
@@ -178,6 +185,8 @@ VARLEN_CASES = [
 @pytest.mark.L0
 @pytest.mark.parametrize("Hq,Hkv,D,lens,window,enable_gqa,kv_packed", VARLEN_CASES)
 def test_varlen_attn(Hq, Hkv, D, lens, window, enable_gqa, kv_packed):
+    if _SELECTS_BACKEND and window not in ((-1, -1), (-1, 0)):
+        pytest.skip("torch's varlen_attn does not select cuDNN for this window")
     torch.manual_seed(0)
     lens_t = torch.tensor(lens, device="cuda")
     cu = torch.nn.functional.pad(lens_t.cumsum(0), (1, 0)).to(torch.int32)
@@ -191,7 +200,8 @@ def test_varlen_attn(Hq, Hkv, D, lens, window, enable_gqa, kv_packed):
         v = torch.randn(T, Hkv, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
 
     fwd0, bwd0 = provider.calls["fwd"], provider.calls["bwd"]
-    out, lse = varlen_attn(q, k, v, cu, cu, mx, mx, window_size=window, enable_gqa=enable_gqa, return_aux=AuxRequest(lse=True))
+    with sdpa_kernel([SDPBackend.CUDNN_ATTENTION]):
+        out, lse = varlen_attn(q, k, v, cu, cu, mx, mx, window_size=window, enable_gqa=enable_gqa, return_aux=AuxRequest(lse=True))
     grad = torch.randn_like(out)
     out.backward(grad)
     assert provider.calls["fwd"] == fwd0 + 1 and provider.calls["bwd"] == bwd0 + 1, "provider did not intercept"
@@ -238,7 +248,8 @@ def test_varlen_backward_does_not_sync():
     q, k, v = (torch.randn(T, H, D, dtype=torch.bfloat16, device="cuda", requires_grad=True) for _ in range(3))
 
     bwd0 = provider.calls["bwd"]
-    out = varlen_attn(q, k, v, cu, cu, mx, mx, window_size=(-1, 0))
+    with sdpa_kernel([SDPBackend.CUDNN_ATTENTION]):
+        out = varlen_attn(q, k, v, cu, cu, mx, mx, window_size=(-1, 0))
     grad = torch.randn_like(out)
 
     # Any blocking D2H inside the backward raises here.
