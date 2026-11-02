@@ -36,8 +36,8 @@ Kernel 2 — Warp specialization (16 warps, 512 threads):
   Warps 2-3:   Idle
   Warps 4-7:   Compute warpgroup
                (per-block sGradSignal load, TMEM readback S → dS → dW, dQ TMA store)
-  Warps 8-11:  K loading warpgroup (TMA Gather4 for either ID convention
-               when available; manual cp.async fallback otherwise, 3-stage sK)
+  Warps 8-11:  K loading warpgroup (TMA Gather4 for either ID convention,
+               3-stage sK)
   Warps 12-15: Reduce warpgroup (wide TMEM readback → padded ping-pong SMEM
                → cp.reduce.async.bulk to f32 gmem, 2-stage; or, column-permuted,
                xor-4 quad exchange → red.global.add.v4.f32)
@@ -50,8 +50,7 @@ indexes them by **global flat KV ids**. With ``topk_indices_global=True``
 ``topk_indices_global=False`` (the backward wrapper's compatibility default),
 the kernel validates local ids against ``S_k_per_batch`` and adds
 ``batch_idx * S_k_per_batch`` in registers. Both conventions feed the same
-Gather4 path when the installed CuTe DSL supports it; callers do not need a
-separate local-to-global launch. (THD will reuse the same flat-id contract:
+Gather4 path; callers do not need a separate local-to-global launch. (THD will reuse the same flat-id contract:
 ``cu_seqlens_k[b] + local`` indexes the ``(T_k, D)`` packed buffer.)
 grad_signal (precomputed by kernel 1) is loaded per topk-block by the compute warpgroup.
 
@@ -138,17 +137,6 @@ from .deterministic_dk_sm100 import (
     deterministic_dk_workspace_bytes,
     reduce_deterministic_dk,
     validate_deterministic_dk_plane_policy,
-)
-
-_HAS_TMA_GATHER4 = all(
-    hasattr(_cute_nvgpu_ir, name)
-    for name in (
-        "atom_make_non_exec_2d_gather4_tma_load",
-        "GatherScatterTmaLoadEnum",
-        "TmaDescriptorTiledType",
-        "atom_make_exec_tma",
-        "get_tma_desc_addr",
-    )
 )
 
 mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd="rn")
@@ -298,8 +286,8 @@ def _make_tiled_tma_gather4_atom(
     its public Python helper/export is absent.  This is the minimal equivalent
     of ``make_tiled_tma_atom(..., gmem_coord_tensor=...)`` documented by that
     same wheel; it deliberately reuses the standard executable TMA-load trait.
-    DSL 4.5.x lacks the underlying MLIR operation, so callers capability-gate
-    this helper and retain the equivalent manual ``cp.async`` K-load path.
+    ``IndexerBackward.check_support`` declines DSLs below the repository's
+    runtime floor (Rule 7), all of which predate this helper's requirements.
     """
     smem_rank = cute_core.rank(smem_layout)
     assert smem_rank == 3 or smem_rank == 4
@@ -512,15 +500,10 @@ class IndexerBackwardSm100:
         # range-checked and normalized to flat global IDs in registers before
         # issue. This preserves the local-ID OOB contract without a separate
         # conversion kernel or temporary index tensor.
-        # Public DSL 4.5.x wheels do not contain the private MLIR operation
-        # needed to construct a Gather4 descriptor. Keep those wheels on the
-        # existing manual cp.async loader; both paths feed identical BF16 K
-        # tiles into the same FP32 GEMMs.
-        self.use_tma_gather = _HAS_TMA_GATHER4
         # Cross-row double buffering is sized for the established short-row
         # variants. Deterministic TopK 1024/2048 uses the fully drained serial
         # persistent loop so its one-row SMEM footprint stays within the cap.
-        self.use_cross_row_persistent = self.use_persistent and self.use_tma_gather and topk <= 512
+        self.use_cross_row_persistent = self.use_persistent and topk <= 512
 
         # GEMM tilers (M, N, K) — cute.gemm, SMEM operands, TMEM acc
         # GEMM1: S[H,TileN] = Q[H,D] @ K[TileN,D].  A=Q K-major, B=K K-major
@@ -687,35 +670,33 @@ class IndexerBackwardSm100:
         )
         self.tma_copy_Q_bytes = cute.size_in_bytes(self.q_dtype, Q_smem_layout_tma)
 
-        tma_atom_K_gather = None
-        if const_expr(self.use_tma_gather):
-            # Hardware sparse gather. The index-coordinate tensor has the
-            # same logical 2-D shape as K, but its D mode is broadcast
-            # (stride 0): each group of four row coordinates supplies one
-            # Gather4 instruction. The coordinate tensor is descriptor
-            # metadata; the issuing lanes pass row IDs explicitly.
-            gI_desc = cute.make_tensor(
-                mTopkIdx.iterator,
-                cute.make_layout(
-                    (cute.size(mK.shape[0]), self.head_dim_padded),
-                    stride=(1, 0),
-                ),
-            )
-            mK_gather = cute.make_tensor(
-                mK.iterator,
-                cute.make_layout(
-                    (cute.size(mK.shape[0]), self.head_dim_padded),
-                    stride=(self.head_dim_padded, 1),
-                ),
-            )
-            K_smem_layout_tma = cute.select(sK_layout, mode=[0, 1, 2])
-            tma_atom_K_gather, _ = _make_tiled_tma_gather4_atom(
-                mK_gather,
-                gI_desc,
-                K_smem_layout_tma,
-                self.gemm1_tiler,
-                tmma1,
-            )
+        # Hardware sparse gather. The index-coordinate tensor has the
+        # same logical 2-D shape as K, but its D mode is broadcast
+        # (stride 0): each group of four row coordinates supplies one
+        # Gather4 instruction. The coordinate tensor is descriptor
+        # metadata; the issuing lanes pass row IDs explicitly.
+        gI_desc = cute.make_tensor(
+            mTopkIdx.iterator,
+            cute.make_layout(
+                (cute.size(mK.shape[0]), self.head_dim_padded),
+                stride=(1, 0),
+            ),
+        )
+        mK_gather = cute.make_tensor(
+            mK.iterator,
+            cute.make_layout(
+                (cute.size(mK.shape[0]), self.head_dim_padded),
+                stride=(self.head_dim_padded, 1),
+            ),
+        )
+        K_smem_layout_tma = cute.select(sK_layout, mode=[0, 1, 2])
+        tma_atom_K_gather, _ = _make_tiled_tma_gather4_atom(
+            mK_gather,
+            gI_desc,
+            K_smem_layout_tma,
+            self.gemm1_tiler,
+            tmma1,
+        )
 
         # Epilogue SMEM layout for dQ store (bf16, row-major = D contiguous)
         sdQ_epi_layout = _make_smem_layout_epi(
@@ -841,9 +822,8 @@ class IndexerBackwardSm100:
         if warp_idx == self.load_warp_id:
             cpasync.prefetch_descriptor(tma_atom_Q)
             cpasync.prefetch_descriptor(tma_atom_dQ)
-        if const_expr(self.use_tma_gather):
-            if warp_idx == self.k_load_warp_id[0]:
-                cpasync.prefetch_descriptor(tma_atom_K_gather)
+        if warp_idx == self.k_load_warp_id[0]:
+            cpasync.prefetch_descriptor(tma_atom_K_gather)
 
         # SMEM allocation
         sQ_size = cute.cosize(sQ_layout)
@@ -1033,16 +1013,11 @@ class IndexerBackwardSm100:
             cute.arch.mbarrier_init(mbar + MBAR_DK_FULL_1, 1)
             cute.arch.mbarrier_init(mbar + MBAR_DK_EMPTY_0, self.WARPGROUP_SIZE)
             cute.arch.mbarrier_init(mbar + MBAR_DK_EMPTY_1, self.WARPGROUP_SIZE)
-            if const_expr(self.use_tma_gather):
-                # Transaction barrier: one explicit arrive-and-expect plus the
-                # 32 KiB Gather4 completion for each K stage.
-                cute.arch.mbarrier_init(mbar + MBAR_K_LOADED_0, 1)
-                cute.arch.mbarrier_init(mbar + MBAR_K_LOADED_1, 1)
-                cute.arch.mbarrier_init(mbar + MBAR_K_LOADED_2, 1)
-            else:
-                cute.arch.mbarrier_init(mbar + MBAR_K_LOADED_0, self.WARPGROUP_SIZE)
-                cute.arch.mbarrier_init(mbar + MBAR_K_LOADED_1, self.WARPGROUP_SIZE)
-                cute.arch.mbarrier_init(mbar + MBAR_K_LOADED_2, self.WARPGROUP_SIZE)
+            # Transaction barrier: one explicit arrive-and-expect plus the
+            # 32 KiB Gather4 completion for each K stage.
+            cute.arch.mbarrier_init(mbar + MBAR_K_LOADED_0, 1)
+            cute.arch.mbarrier_init(mbar + MBAR_K_LOADED_1, 1)
+            cute.arch.mbarrier_init(mbar + MBAR_K_LOADED_2, 1)
             cute.arch.mbarrier_init(mbar + MBAR_K_CONSUMED_0, 1)
             cute.arch.mbarrier_init(mbar + MBAR_K_CONSUMED_1, 1)
             cute.arch.mbarrier_init(mbar + MBAR_K_CONSUMED_2, 1)
@@ -1966,14 +1941,9 @@ class IndexerBackwardSm100:
             cute.arch.mbarrier_init(mbar + MBAR_DK_FULL_1, 1)
             cute.arch.mbarrier_init(mbar + MBAR_DK_EMPTY_0, self.WARPGROUP_SIZE)
             cute.arch.mbarrier_init(mbar + MBAR_DK_EMPTY_1, self.WARPGROUP_SIZE)
-            if const_expr(self.use_tma_gather):
-                cute.arch.mbarrier_init(mbar + MBAR_K_LOADED_0, 1)
-                cute.arch.mbarrier_init(mbar + MBAR_K_LOADED_1, 1)
-                cute.arch.mbarrier_init(mbar + MBAR_K_LOADED_2, 1)
-            else:
-                cute.arch.mbarrier_init(mbar + MBAR_K_LOADED_0, self.WARPGROUP_SIZE)
-                cute.arch.mbarrier_init(mbar + MBAR_K_LOADED_1, self.WARPGROUP_SIZE)
-                cute.arch.mbarrier_init(mbar + MBAR_K_LOADED_2, self.WARPGROUP_SIZE)
+            cute.arch.mbarrier_init(mbar + MBAR_K_LOADED_0, 1)
+            cute.arch.mbarrier_init(mbar + MBAR_K_LOADED_1, 1)
+            cute.arch.mbarrier_init(mbar + MBAR_K_LOADED_2, 1)
             cute.arch.mbarrier_init(mbar + MBAR_K_CONSUMED_0, 1)
             cute.arch.mbarrier_init(mbar + MBAR_K_CONSUMED_1, 1)
             cute.arch.mbarrier_init(mbar + MBAR_K_CONSUMED_2, 1)
@@ -3343,119 +3313,56 @@ class IndexerBackwardSm100:
         mbar,
         persistent_row_phase,
     ):
-        """K loading warpgroup: sparse cp.async gather into 3-stage sK.
+        """K loading warpgroup: sparse TMA Gather4 into 3-stage sK.
 
         3-stage pipeline allows K-load to run 3 blocks ahead of MMA,
         hiding the scatter gather latency (~5300 clk per block).
         """
         wg_tidx = tidx % self.WARPGROUP_SIZE
 
-        if const_expr(self.use_tma_gather):
-            if const_expr(self.use_cross_row_persistent):
-                # Treat every row's K blocks as one flattened producer stream.
-                # Rotating by global block number avoids restarting stage 0 at
-                # row boundaries and lets gather remain three blocks ahead.
-                topk_row_ptr = mTopkIdx[seq_idx, None, batch_idx].iterator
-                batch_count = cute.size(mTopkIdx.shape[2])
-                seqlen_k_per_batch = seqlen_k // batch_count
-                batch_offset_l2g = batch_idx * seqlen_k_per_batch
-                K_STAGE_BYTES = const_expr(self.block_I * self.head_dim_padded * self.k_dtype.width // 8)
-                warp_in_wg = wg_tidx // self.WARP_SIZE
-                lane_in_warp = wg_tidx % self.WARP_SIZE
-                for bi in cutlass.range_constexpr(self.num_topk_blocks):
-                    global_block = persistent_row_phase * self.num_topk_blocks + bi
-                    stage = global_block % 3
-                    stage_occurrence = global_block // 3
-                    if global_block >= 3:
-                        cute.arch.mbarrier_wait(
-                            mbar + MBAR_K_CONSUMED_0 + stage,
-                            Int32((stage_occurrence - 1) & 1),
-                        )
-
-                    if wg_tidx == 0:
-                        cute.arch.mbarrier_arrive_and_expect_tx(
-                            mbar + MBAR_K_LOADED_0 + stage,
-                            K_STAGE_BYTES,
-                        )
-                    if lane_in_warp < 8:
-                        n = warp_in_wg * 32 + lane_in_warp * 4
-                        idx_pos = bi * self.block_I + n
-                        row0, row1, row2, row3 = _load_global_i32x4(
-                            topk_row_ptr + idx_pos,
-                        )
-                        if const_expr(self.topk_indices_global):
-                            row0 = row0 if row0 >= 0 and row0 < seqlen_k else Int32(-1)
-                            row1 = row1 if row1 >= 0 and row1 < seqlen_k else Int32(-1)
-                            row2 = row2 if row2 >= 0 and row2 < seqlen_k else Int32(-1)
-                            row3 = row3 if row3 >= 0 and row3 < seqlen_k else Int32(-1)
-                        else:
-                            row0 = row0 + batch_offset_l2g if row0 >= 0 and row0 < seqlen_k_per_batch else Int32(-1)
-                            row1 = row1 + batch_offset_l2g if row1 >= 0 and row1 < seqlen_k_per_batch else Int32(-1)
-                            row2 = row2 + batch_offset_l2g if row2 >= 0 and row2 < seqlen_k_per_batch else Int32(-1)
-                            row3 = row3 + batch_offset_l2g if row3 >= 0 and row3 < seqlen_k_per_batch else Int32(-1)
-                        for stripe in cutlass.range_constexpr(2):
-                            dst_offset = stage * self.block_I * self.head_dim_padded + stripe * self.block_I * 64 + n * 64
-                            _tma_gather4_k_rows(
-                                tma_atom_K_gather,
-                                sK_raw_ptr + dst_offset,
-                                stripe * 64,
-                                row0,
-                                row1,
-                                row2,
-                                row3,
-                                mbar + MBAR_K_LOADED_0 + stage,
-                            )
-                return
-
-            k_consumed_0_phase_tma = Int32(0)
-            k_consumed_1_phase_tma = Int32(persistent_row_phase & 1)
-            k_consumed_2_phase_tma = Int32(persistent_row_phase & 1)
+        if const_expr(self.use_cross_row_persistent):
+            # Treat every row's K blocks as one flattened producer stream.
+            # Rotating by global block number avoids restarting stage 0 at
+            # row boundaries and lets gather remain three blocks ahead.
+            topk_row_ptr = mTopkIdx[seq_idx, None, batch_idx].iterator
+            batch_count = cute.size(mTopkIdx.shape[2])
+            seqlen_k_per_batch = seqlen_k // batch_count
+            batch_offset_l2g = batch_idx * seqlen_k_per_batch
             K_STAGE_BYTES = const_expr(self.block_I * self.head_dim_padded * self.k_dtype.width // 8)
+            warp_in_wg = wg_tidx // self.WARP_SIZE
+            lane_in_warp = wg_tidx % self.WARP_SIZE
             for bi in cutlass.range_constexpr(self.num_topk_blocks):
-                if bi >= 3:
-                    if bi % 3 == 0:
-                        cute.arch.mbarrier_wait(
-                            mbar + MBAR_K_CONSUMED_0,
-                            k_consumed_0_phase_tma,
-                        )
-                        k_consumed_0_phase_tma ^= 1
-                    elif bi % 3 == 1:
-                        cute.arch.mbarrier_wait(
-                            mbar + MBAR_K_CONSUMED_1,
-                            k_consumed_1_phase_tma,
-                        )
-                        k_consumed_1_phase_tma ^= 1
-                    else:
-                        cute.arch.mbarrier_wait(
-                            mbar + MBAR_K_CONSUMED_2,
-                            k_consumed_2_phase_tma,
-                        )
-                        k_consumed_2_phase_tma ^= 1
+                global_block = persistent_row_phase * self.num_topk_blocks + bi
+                stage = global_block % 3
+                stage_occurrence = global_block // 3
+                if global_block >= 3:
+                    cute.arch.mbarrier_wait(
+                        mbar + MBAR_K_CONSUMED_0 + stage,
+                        Int32((stage_occurrence - 1) & 1),
+                    )
 
-                stage = const_expr(bi % 3)
                 if wg_tidx == 0:
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         mbar + MBAR_K_LOADED_0 + stage,
                         K_STAGE_BYTES,
                     )
-                # One Gather4 atom is 4 rows x 64 bf16 columns. Lanes 0..7 of
-                # each warp issue two stripes, matching the hardware layout.
-                warp_in_wg = wg_tidx // self.WARP_SIZE
-                lane_in_warp = wg_tidx % self.WARP_SIZE
                 if lane_in_warp < 8:
                     n = warp_in_wg * 32 + lane_in_warp * 4
                     idx_pos = bi * self.block_I + n
-                    row0 = Int32(sTopkIdxs[idx_pos])
-                    row1 = Int32(sTopkIdxs[idx_pos + 1])
-                    row2 = Int32(sTopkIdxs[idx_pos + 2])
-                    row3 = Int32(sTopkIdxs[idx_pos + 3])
-                    row0 = row0 if row0 >= 0 and row0 < seqlen_k else Int32(-1)
-                    row1 = row1 if row1 >= 0 and row1 < seqlen_k else Int32(-1)
-                    row2 = row2 if row2 >= 0 and row2 < seqlen_k else Int32(-1)
-                    row3 = row3 if row3 >= 0 and row3 < seqlen_k else Int32(-1)
+                    row0, row1, row2, row3 = _load_global_i32x4(
+                        topk_row_ptr + idx_pos,
+                    )
+                    if const_expr(self.topk_indices_global):
+                        row0 = row0 if row0 >= 0 and row0 < seqlen_k else Int32(-1)
+                        row1 = row1 if row1 >= 0 and row1 < seqlen_k else Int32(-1)
+                        row2 = row2 if row2 >= 0 and row2 < seqlen_k else Int32(-1)
+                        row3 = row3 if row3 >= 0 and row3 < seqlen_k else Int32(-1)
+                    else:
+                        row0 = row0 + batch_offset_l2g if row0 >= 0 and row0 < seqlen_k_per_batch else Int32(-1)
+                        row1 = row1 + batch_offset_l2g if row1 >= 0 and row1 < seqlen_k_per_batch else Int32(-1)
+                        row2 = row2 + batch_offset_l2g if row2 >= 0 and row2 < seqlen_k_per_batch else Int32(-1)
+                        row3 = row3 + batch_offset_l2g if row3 >= 0 and row3 < seqlen_k_per_batch else Int32(-1)
                     for stripe in cutlass.range_constexpr(2):
-                        # Raw (unswizzled) stage address. The descriptor's
-                        # 128B swizzle maps this base to sK's UMMA layout.
                         dst_offset = stage * self.block_I * self.head_dim_padded + stripe * self.block_I * 64 + n * 64
                         _tma_gather4_k_rows(
                             tma_atom_K_gather,
@@ -3469,95 +3376,66 @@ class IndexerBackwardSm100:
                         )
             return
 
-        async_copy_atom = cute.make_copy_atom(
-            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
-            self.k_dtype,
-            num_bits_per_copy=128,
-        )
-        async_thr_copy = cute.make_tiled_copy_tv(
-            async_copy_atom,
-            cute.make_layout((1,)),
-            cute.make_layout((8,)),
-        ).get_slice(0)
-
-        GROUP_SIZE = const_expr(8)
-        NUM_GROUPS = const_expr(self.WARPGROUP_SIZE // 8)
-        ROWS_PER_GROUP = const_expr(self.block_I // NUM_GROUPS)
-        idx_in_group = wg_tidx % GROUP_SIZE
-        group_idx_local = wg_tidx // GROUP_SIZE
-
-        # 3-stage sK slices.
-        sK_slice_0 = cute.composition(
-            sK[None, None, None, 0],
-            cute.make_layout((self.block_I, self.head_dim_padded)),
-        )
-        sK_slice_1 = cute.composition(
-            sK[None, None, None, 1],
-            cute.make_layout((self.block_I, self.head_dim_padded)),
-        )
-        sK_slice_2 = cute.composition(
-            sK[None, None, None, 2],
-            cute.make_layout((self.block_I, self.head_dim_padded)),
-        )
-        # mK is the flat (B*S_k, D) view; SMEM already holds global IDs.
-
-        k_consumed_0_phase_kload = Int32(0)
-        k_consumed_1_phase_kload = Int32(persistent_row_phase)
-        k_consumed_2_phase_kload = Int32(persistent_row_phase)
-
+        k_consumed_0_phase_tma = Int32(0)
+        k_consumed_1_phase_tma = Int32(persistent_row_phase & 1)
+        k_consumed_2_phase_tma = Int32(persistent_row_phase & 1)
+        K_STAGE_BYTES = const_expr(self.block_I * self.head_dim_padded * self.k_dtype.width // 8)
         for bi in cutlass.range_constexpr(self.num_topk_blocks):
-            # Back-pressure: wait for MMA to finish using sK[bi%3].
-            # K_CONSUMED[s] fires after GEMM3 (last read of sKt[s]).
-            # bi=0,1,2: sK stages fresh, no wait. bi>=3: must wait.
             if bi >= 3:
                 if bi % 3 == 0:
-                    cute.arch.mbarrier_wait(mbar + MBAR_K_CONSUMED_0, k_consumed_0_phase_kload)
-                    k_consumed_0_phase_kload ^= 1
-                elif bi % 3 == 1:
-                    cute.arch.mbarrier_wait(mbar + MBAR_K_CONSUMED_1, k_consumed_1_phase_kload)
-                    k_consumed_1_phase_kload ^= 1
-                else:
-                    cute.arch.mbarrier_wait(mbar + MBAR_K_CONSUMED_2, k_consumed_2_phase_kload)
-                    k_consumed_2_phase_kload ^= 1
-
-            sK_slice = sK_slice_0 if bi % 3 == 0 else (sK_slice_1 if bi % 3 == 1 else sK_slice_2)
-
-            for r in cutlass.range_constexpr(ROWS_PER_GROUP):
-                row = r * NUM_GROUPS + group_idx_local
-                idx_pos = bi * self.block_I + row
-                topk_idx = Int32(sTopkIdxs[idx_pos])
-                if topk_idx >= 0 and topk_idx < seqlen_k:
-                    gK_raw = mK[topk_idx, None]
-                    gK = cute.make_tensor(
-                        cute.make_ptr(self.k_dtype, gK_raw.iterator.llvm_ptr, cute.AddressSpace.gmem, assumed_align=16),
-                        gK_raw.layout,
+                    cute.arch.mbarrier_wait(
+                        mbar + MBAR_K_CONSUMED_0,
+                        k_consumed_0_phase_tma,
                     )
-                    gChunks = cute.flat_divide(gK, (8,))
-                    sRow = sK_slice[row, None]
-                    sChunks = cute.flat_divide(sRow, (8,))
-                    for tile in cutlass.range_constexpr(self.head_dim_padded // 64):
-                        chunk_idx = tile * 8 + idx_in_group
-                        tSg = async_thr_copy.partition_S(gChunks[None, chunk_idx])
-                        tSs = async_thr_copy.partition_D(sChunks[None, chunk_idx])
-                        cute.copy(async_copy_atom, tSg, tSs)
+                    k_consumed_0_phase_tma ^= 1
+                elif bi % 3 == 1:
+                    cute.arch.mbarrier_wait(
+                        mbar + MBAR_K_CONSUMED_1,
+                        k_consumed_1_phase_tma,
+                    )
+                    k_consumed_1_phase_tma ^= 1
                 else:
-                    sRow = sK_slice[row, None]
-                    sChunks = cute.flat_divide(sRow, (8,))
-                    for tile in cutlass.range_constexpr(self.head_dim_padded // 64):
-                        chunk_idx = tile * 8 + idx_in_group
-                        sChunks[None, chunk_idx].fill(0)
+                    cute.arch.mbarrier_wait(
+                        mbar + MBAR_K_CONSUMED_2,
+                        k_consumed_2_phase_tma,
+                    )
+                    k_consumed_2_phase_tma ^= 1
 
-            cute.arch.cp_async_commit_group()
-            cute.arch.cp_async_wait_group(0)
-            cute.arch.fence_view_async_shared()
-
-            # Signal K loaded (3-stage barrier)
-            if bi % 3 == 0:
-                cute.arch.mbarrier_arrive(mbar + MBAR_K_LOADED_0)
-            elif bi % 3 == 1:
-                cute.arch.mbarrier_arrive(mbar + MBAR_K_LOADED_1)
-            else:
-                cute.arch.mbarrier_arrive(mbar + MBAR_K_LOADED_2)
+            stage = const_expr(bi % 3)
+            if wg_tidx == 0:
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    mbar + MBAR_K_LOADED_0 + stage,
+                    K_STAGE_BYTES,
+                )
+            # One Gather4 atom is 4 rows x 64 bf16 columns. Lanes 0..7 of
+            # each warp issue two stripes, matching the hardware layout.
+            warp_in_wg = wg_tidx // self.WARP_SIZE
+            lane_in_warp = wg_tidx % self.WARP_SIZE
+            if lane_in_warp < 8:
+                n = warp_in_wg * 32 + lane_in_warp * 4
+                idx_pos = bi * self.block_I + n
+                row0 = Int32(sTopkIdxs[idx_pos])
+                row1 = Int32(sTopkIdxs[idx_pos + 1])
+                row2 = Int32(sTopkIdxs[idx_pos + 2])
+                row3 = Int32(sTopkIdxs[idx_pos + 3])
+                row0 = row0 if row0 >= 0 and row0 < seqlen_k else Int32(-1)
+                row1 = row1 if row1 >= 0 and row1 < seqlen_k else Int32(-1)
+                row2 = row2 if row2 >= 0 and row2 < seqlen_k else Int32(-1)
+                row3 = row3 if row3 >= 0 and row3 < seqlen_k else Int32(-1)
+                for stripe in cutlass.range_constexpr(2):
+                    # Raw (unswizzled) stage address. The descriptor's
+                    # 128B swizzle maps this base to sK's UMMA layout.
+                    dst_offset = stage * self.block_I * self.head_dim_padded + stripe * self.block_I * 64 + n * 64
+                    _tma_gather4_k_rows(
+                        tma_atom_K_gather,
+                        sK_raw_ptr + dst_offset,
+                        stripe * 64,
+                        row0,
+                        row1,
+                        row2,
+                        row3,
+                        mbar + MBAR_K_LOADED_0 + stage,
+                    )
 
     @cute.jit
     def get_tmem_tensor(self, s_acc_layout, dq_acc_layout, dk_acc_layout, tmem_ptr_base: cute.Pointer):
@@ -3610,7 +3488,7 @@ def indexer_backward_sm100(
     #   False:           mTopkIdx carries local-per-batch ids — kernel checks
     #                    the per-batch bound and adds ``batch_idx * S_k`` in
     #                    registers for the flat (B*S_k, D) K/dK view.
-    # Both conventions use Gather4 when the installed DSL supports it.
+    # Both conventions use the same Gather4 path.
     # Const_expr-branched in the kernel, so it **is** part of the compile key.
     # THD packed varlen is supported at the wrapper level by treating the
     # packed tensors as a single B=1 BSHD batch (sparse path's topk indices

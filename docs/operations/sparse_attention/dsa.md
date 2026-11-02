@@ -886,8 +886,7 @@ indices. FP8, MXFP8, and MXFP4 indexer backward are not currently supported
 because the backward wrapper requires BF16 Q/K/W inputs.
 
 On SM100, `topk_indices_global` describes the input
-encoding; it is not a performance-tuning switch. When Gather4 is available,
-local ids are range-checked and converted to flat ids in registers before the
+encoding; it is not a performance-tuning switch. Local ids are range-checked and converted to flat ids in registers before the
 same optimized gather path. Do not add a separate `local_to_global_wrapper`
 launch only for Indexer Backward; preserve the producer's id convention and
 set `topk_indices_global` to match it.

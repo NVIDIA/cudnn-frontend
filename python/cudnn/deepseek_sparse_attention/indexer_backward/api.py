@@ -34,7 +34,7 @@ from cudnn.tensor_adapter import has_tcgen05
 
 from cudnn._torch_stream import contiguous_on_stream, copy_into_on_stream
 from cudnn.api_base import APIBase, TupleDict, WorkspaceCarver, ws_align
-from cudnn.frost.buffers import memset_zero_async
+from cudnn.frost.buffers import cutedsl_requirement_error, memset_zero_async
 from cudnn.tensor_adapter import canonicalize_unit_dim_strides
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     resolve_stream as _resolve_stream,
@@ -406,6 +406,11 @@ class IndexerBackward(APIBase):
             major != 9 and capability not in INDEXER_BACKWARD_SM100_CAPABILITIES,
             f"IndexerBackward requires SM90 or capability in {INDEXER_BACKWARD_SM100_CAPABILITIES}, found {capability}",
         )
+        # Rule 7: decline a CuTe DSL below the runtime floor by version here,
+        # before kernel 1 touches attn_score; the SM100 kernel builds its K
+        # loads on the TMA Gather4 operation that every DSL at the floor ships.
+        dsl_error = cutedsl_requirement_error("IndexerBackward")
+        self._runtime_error_if(dsl_error is not None, dsl_error)
         if major == 9:
             # The SM90 warpgroup GEMMs use the head count as their M, and
             # WGMMA's M is fixed at 64.
@@ -900,9 +905,9 @@ def indexer_backward_wrapper(
             flat KV ids. The cudnn top-k wrapper returns local per-batch ids by
             default, so this wrapper defaults to ``False`` and lets the kernel
             validate each local id and add the batch offset internally. On
-            SM100, both conventions use the same optimized Gather4 path when
-            the installed CuTe DSL exposes it; converting local ids in a
-            separate launch is unnecessary for this backward kernel.
+            SM100, both conventions use the same optimized Gather4 path;
+            converting local ids in a separate launch is unnecessary for this
+            backward kernel.
         sm_scale: indexer softmax scale baked into the forward via the
             weights-scaling trick.
         loss_coeff: coefficient scaling the KL-divergence loss in the

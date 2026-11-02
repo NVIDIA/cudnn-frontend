@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import importlib
 import math
 
 import pytest
@@ -1580,6 +1579,44 @@ def test_DSA_indexer_backward_architecture_gate(monkeypatch, capability, heads, 
     assert torch.equal(attn_score, attn_before)
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("capability", [(9, 0), (10, 0)], ids=["sm90", "sm100"])
+@torch_fork_set_rng(seed=1709)
+def test_DSA_indexer_backward_declines_old_cutedsl(monkeypatch, capability):
+    """Rule 7: a CuTe DSL below the runtime floor is declined by check_support
+    with an error that names the installed and required versions, before
+    ``attn_score`` is touched and before any kernel is traced."""
+    try:
+        from cudnn import DSA
+        import cudnn.frost.buffers as buffers
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required to build IndexerBackward tensor descriptors")
+
+    cfg = dict(b=1, s_q=2, s_kv=128, head_dim=128, qhead_per_kv_head=64, topk=128)
+    index_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
+    plan = DSA.IndexerBackward(
+        sample_index_q=index_q,
+        sample_weights=weights,
+        sample_index_k=index_k,
+        sample_d_index_q=torch.empty_like(index_q),
+        sample_d_weights=torch.empty_like(weights),
+        sample_d_index_k=torch.empty_like(index_k),
+        sample_attn_score=attn_score,
+        sample_index_score=index_score,
+        sample_topk_indices=topk_indices,
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+    monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.6.2")))
+
+    floor = ".".join(str(x) for x in buffers.CUTEDSL_MIN_VERSION)
+    attn_before = attn_score.clone()
+    with pytest.raises(RuntimeError, match=rf"IndexerBackward requires nvidia-cutlass-dsl >= {floor}; found 4\.6\.2"):
+        plan.check_support()
+    assert torch.equal(attn_score, attn_before)
+
+
 # The frozen ``develop`` positional-or-keyword parameter order of
 # ``indexer_backward_wrapper``. Legacy positional callers depend on this exact
 # order; newer options are appended keyword-only so they never perturb a
@@ -1788,7 +1825,7 @@ def test_DSA_indexer_backward_sm100_persistent_short_topk_dispatch_threshold():
         pytest.skip("SM100+ required")
 
     try:
-        from cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm100 import IndexerBackwardSm100, _HAS_TMA_GATHER4
+        from cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm100 import IndexerBackwardSm100
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
@@ -1814,20 +1851,20 @@ def test_DSA_indexer_backward_sm100_persistent_short_topk_dispatch_threshold():
         )
         assert not short.use_persistent
         assert long.use_persistent
-        assert short.use_tma_gather is _HAS_TMA_GATHER4
-        assert long.use_tma_gather is _HAS_TMA_GATHER4
-        assert long.use_cross_row_persistent is _HAS_TMA_GATHER4
+        assert not short.use_cross_row_persistent
+        assert long.use_cross_row_persistent
 
 
 @pytest.mark.L1
 @pytest.mark.parametrize("topk", [512, 1024, 2048])
-def test_DSA_indexer_backward_sm100_local_ids_use_tma_gather(topk):
-    """Normalize local ids in-kernel without giving up the Gather4 path."""
+def test_DSA_indexer_backward_sm100_local_ids_keep_cross_row_dispatch(topk):
+    """Local ids are normalized in-kernel on the shared Gather4 path, so they
+    keep the same cross-row persistent dispatch as global ids."""
     if torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("SM100+ required")
 
     try:
-        from cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm100 import IndexerBackwardSm100, _HAS_TMA_GATHER4
+        from cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm100 import IndexerBackwardSm100
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
@@ -1841,8 +1878,7 @@ def test_DSA_indexer_backward_sm100_local_ids_use_tma_gather(topk):
         persistent_grid_size=sm_count,
         topk_indices_global=False,
     )
-    assert kernel.use_tma_gather is _HAS_TMA_GATHER4
-    assert kernel.use_cross_row_persistent is (_HAS_TMA_GATHER4 and topk == 512)
+    assert kernel.use_cross_row_persistent is (topk == 512)
 
 
 @pytest.mark.L1
@@ -1993,15 +2029,11 @@ def test_DSA_indexer_backward_sm100_score_grad_pdl_full_pipeline_matches_serial(
 
 @pytest.mark.L1
 @pytest.mark.parametrize(
-    "topk,topk_indices_global,force_manual_k_load",
+    "topk,topk_indices_global",
     [
-        pytest.param(topk, topk_indices_global, False, id=f"{'global' if topk_indices_global else 'local'}-{topk}")
+        pytest.param(topk, topk_indices_global, id=f"{'global' if topk_indices_global else 'local'}-{topk}")
         for topk_indices_global in (True, False)
-        for topk in (128, 256, 384, 1024)
-    ]
-    + [
-        pytest.param(512, False, False, id="local-512"),
-        pytest.param(512, True, True, id="global-512-manual-k-load"),
+        for topk in (128, 256, 384, 512, 1024)
     ],
 )
 @pytest.mark.parametrize("seqlen_q", [17, 151])
@@ -2011,25 +2043,16 @@ def test_DSA_indexer_backward_sm100_gemm_matches_reference(
     seqlen_q,
     topk,
     topk_indices_global,
-    force_manual_k_load,
-    monkeypatch,
-    request,
 ):
-    """Check persistent and one-row-per-CTA grids, the manual K-load fallback,
-    invalid and duplicate IDs, and both dK accumulation layouts against the reference."""
+    """Check persistent and one-row-per-CTA grids, invalid and duplicate IDs,
+    and both dK accumulation layouts against the reference."""
     if torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("SM100+ required")
 
     try:
-        indexer_backward_sm100_module = importlib.import_module("cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm100")
+        from cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm100 import dk_column_permuted_view, indexer_backward_sm100
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-
-    if force_manual_k_load:
-        monkeypatch.setattr(indexer_backward_sm100_module, "_HAS_TMA_GATHER4", False)
-        indexer_backward_sm100_module._compile_cache.clear()
-        request.addfinalizer(indexer_backward_sm100_module._compile_cache.clear)
-    indexer_backward_sm100 = indexer_backward_sm100_module.indexer_backward_sm100
 
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(20260825 + topk + int(topk_indices_global))
@@ -2072,7 +2095,7 @@ def test_DSA_indexer_backward_sm100_gemm_matches_reference(
     torch.cuda.synchronize()
     if dk_column_permuted:
         d_index_k_natural = torch.empty_like(d_index_k)
-        indexer_backward_sm100_module.dk_column_permuted_view(d_index_k_natural).copy_(d_index_k.view(*d_index_k.shape[:-1], 8, 4, 2, 2))
+        dk_column_permuted_view(d_index_k_natural).copy_(d_index_k.view(*d_index_k.shape[:-1], 8, 4, 2, 2))
         d_index_k = d_index_k_natural
 
     safe_ids = local_ids.clamp(min=0).long()
