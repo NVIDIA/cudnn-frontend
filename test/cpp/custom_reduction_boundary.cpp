@@ -276,6 +276,62 @@ TEST_CASE("Shared acyclic ragged offsets are reused", "[custom_reduction][bounda
     REQUIRE(backend.at(55) == descriptor);
 }
 
+TEST_CASE("Ragged offset local fields are checked before descriptor creation",
+          "[custom_reduction][boundary][ragged_fields]") {
+    auto offset = std::make_shared<Tensor>(
+        Tensor().set_uid(81).set_data_type(fe::DataType_t::INT32).set_dim({2, 1, 1, 1}).set_stride({1, 1, 1, 1}));
+    auto parent = std::make_shared<Tensor>(Tensor()
+                                               .set_uid(82)
+                                               .set_data_type(fe::DataType_t::FLOAT)
+                                               .set_dim({1, 1, 8, 64})
+                                               .set_stride({512, 512, 64, 1})
+                                               .set_ragged_offset(offset));
+    offset->set_is_virtual(true).set_is_pass_by_value(true);
+    REQUIRE(parent->validate().get_code() == fe::error_code_t::ATTRIBUTE_NOT_SET);
+    BackendTensors backend;
+    REQUIRE(fe::detail::create_cudnn_tensor(parent, backend).get_code() == fe::error_code_t::ATTRIBUTE_NOT_SET);
+    REQUIRE(backend.empty());
+
+    offset->set_is_virtual(false).set_is_pass_by_value(false);
+    REQUIRE(parent->validate().is_good());
+    REQUIRE(fe::detail::create_cudnn_tensor(parent, backend).is_good());
+    REQUIRE(backend.size() == 2);
+
+    auto narrow = std::make_shared<Tensor>(Tensor(__float2half(1.0F), fe::graph::ScalarType::COMPILE_TIME_CONST)
+                                               .set_uid(83)
+                                               .set_data_type(fe::DataType_t::DOUBLE));
+    parent->set_ragged_offset(narrow);
+    REQUIRE(parent->validate().get_code() == fe::error_code_t::INVALID_VALUE);
+}
+
+TEST_CASE("Custom reduction validates intermediate ragged inputs", "[custom_reduction][boundary][ragged_input]") {
+    using Attributes = fe::graph::Custom_reduction_attributes;
+    fe::graph::Graph graph;
+    graph.set_io_data_type(fe::DataType_t::FLOAT).set_compute_data_type(fe::DataType_t::FLOAT);
+    auto input        = graph.tensor(Tensor().set_dim({2}).set_stride({1}).set_data_type(fe::DataType_t::FLOAT));
+    auto intermediate = graph.pointwise(input,
+                                        fe::graph::Pointwise_attributes()
+                                            .set_mode(fe::PointwiseMode_t::IDENTITY)
+                                            .set_compute_data_type(fe::DataType_t::FLOAT));
+    auto offset       = std::make_shared<Tensor>(
+        Tensor().set_uid(84).set_data_type(fe::DataType_t::INT32).set_dim({2}).set_stride({1}));
+    intermediate->set_data_type(fe::DataType_t::FLOAT).set_ragged_offset(offset);
+    auto output = graph.custom_reduction(
+        {intermediate},
+        Attributes()
+            .set_reducer([](Attributes::Graph_t, std::vector<TensorPtr> lhs, std::vector<TensorPtr>) { return lhs; },
+                         "boundary.ragged-input.v1")
+            .set_reduction_dims({0})
+            .set_identity_values({fe::graph::Custom_reduction_identity(0.0F)}))[0];
+    output->set_data_type(fe::DataType_t::FLOAT).set_output(true);
+    offset->set_is_virtual(true).set_is_pass_by_value(true);
+    REQUIRE(graph.validate().get_code() == fe::error_code_t::ATTRIBUTE_NOT_SET);
+    offset->set_is_virtual(false).set_is_pass_by_value(false);
+    auto retry = graph.validate();
+    INFO(retry.get_message());
+    REQUIRE(retry.is_good());
+}
+
 TEST_CASE("Throwing reducers are contained and retry with FE exceptions disabled too",
           "[custom_reduction][boundary][callback_flag]") {
     if (CUDNN_VERSION < 92900 || fe::detail::get_backend_version() < 92900) {

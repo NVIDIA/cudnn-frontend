@@ -73,16 +73,7 @@ class Tensor_attributes {
 
     error_t
     validate() const {
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            dim.empty(), error_code_t::ATTRIBUTE_NOT_SET, "Tensor '" + name + "' dims not set.");
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            stride.empty(), error_code_t::ATTRIBUTE_NOT_SET, "Tensor '" + name + "' strides not set.");
-        RETURN_CUDNN_FRONTEND_ERROR_IF(dim.size() != stride.size(),
-                                       error_code_t::ATTRIBUTE_NOT_SET,
-                                       "Tensor '" + name + "' does not equal dimensionality in dim and stride.");
-        RETURN_CUDNN_FRONTEND_ERROR_IF(dim.size() > CUDNN_DIM_MAX || stride.size() > CUDNN_DIM_MAX,
-                                       error_code_t::INVALID_VALUE,
-                                       "Tensor '" + name + "' rank exceeds CUDNN_DIM_MAX.");
+        CHECK_CUDNN_FRONTEND_ERROR(validate_shape());
         if (ragged_offset != nullptr) {
             std::unordered_set<Tensor_attributes const*> offset_chain;
             std::unordered_set<uid_t> offset_uids;
@@ -94,6 +85,34 @@ class Tensor_attributes {
                     "Tensor '" + name + "' has a cyclic ragged offset.");
             }
         }
+        CHECK_CUDNN_FRONTEND_ERROR(validate_local_properties());
+        // Validate every descriptor reached through the offset chain after proving
+        // it is acyclic. Descriptor creation may consume these fields directly.
+        for (auto const* current = ragged_offset.get(); current != nullptr; current = current->ragged_offset.get()) {
+            CHECK_CUDNN_FRONTEND_ERROR(current->validate_shape());
+            CHECK_CUDNN_FRONTEND_ERROR(current->validate_local_properties());
+        }
+        return {error_code_t::OK, ""};
+    }
+
+   private:
+    error_t
+    validate_shape() const {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            dim.empty(), error_code_t::ATTRIBUTE_NOT_SET, "Tensor '" + name + "' dims not set.");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            stride.empty(), error_code_t::ATTRIBUTE_NOT_SET, "Tensor '" + name + "' strides not set.");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(dim.size() != stride.size(),
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "Tensor '" + name + "' does not equal dimensionality in dim and stride.");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(dim.size() > CUDNN_DIM_MAX || stride.size() > CUDNN_DIM_MAX,
+                                       error_code_t::INVALID_VALUE,
+                                       "Tensor '" + name + "' rank exceeds CUDNN_DIM_MAX.");
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    validate_local_properties() const {
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             is_virtual && is_pass_by_value,
             error_code_t::ATTRIBUTE_NOT_SET,
@@ -149,7 +168,6 @@ class Tensor_attributes {
         return {error_code_t::OK, ""};
     }
 
-   private:
     template <typename>
     friend class Attributes;
     friend class CustomReductionNode;

@@ -3682,6 +3682,9 @@ CustomReductionNode::post_validate_node() const {
     for (size_t i = 0; i < stream_count; ++i) {
         auto const &input  = attributes.inputs[i];
         auto const &output = attributes.outputs.at(static_cast<int64_t>(i));
+        // Intermediate inputs may not be full graph inputs. Validate their
+        // descriptors after inference, including any ragged-offset chain.
+        CHECK_CUDNN_FRONTEND_ERROR(input->validate());
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             output->get_data_type() != input->get_data_type(),
             error_code_t::INVALID_VALUE,
