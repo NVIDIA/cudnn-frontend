@@ -1699,6 +1699,9 @@ def _kernel(
         sched_stage = cutlass.Int32(0)
         sched_full_phase = cutlass.Int32(0)
 
+        # AVG uses routed rows in use; clamp empty routing to a finite divisor.
+        moe_used_rows = cutlass.max(cutlass.min(cutlass.Int64(first_token_arr[num_groups]), N), cutlass.Int64(1))
+
         # @@EPILOGUE_SETUP:BEGIN@@
         row_id_with_warp_offset = base_row_id + warp_idx * 32
 

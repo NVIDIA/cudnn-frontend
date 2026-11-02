@@ -3033,9 +3033,10 @@ def _check_moe_avg_divides_by_used_rows(compiler, config_name, block_scale, swap
     rows = 64 if gather else S  # token rows; under GATHER, S is the routed capacity len(token_index)
     F = cudnn.data_type.FLOAT
     if block_scale:
-        graph = build_bs(E, S, N, K, G, combo="nvfp4", output_dt=F, offset_multiple=8)
+        graph = build_bs(E, rows, N, K, G, combo="nvfp4", output_dt=F, offset_multiple=8, gather_rows=S if gather else None)
         _, binding = analyze_with_binding(graph)
         token_t, weight_t, fto_t, out_t = binding.a_operands[0], binding.b_operands[0], binding.first_token_offset, binding.outputs[0]
+        index_t = binding.token_index
     else:
         graph = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=F, compute_data_type=F)
         token_t = graph.tensor(name="token", dim=[1, rows, K], stride=[rows * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
@@ -3062,10 +3063,13 @@ def _check_moe_avg_divides_by_used_rows(compiler, config_name, block_scale, swap
     vp = {}
     if block_scale:
         codes = torch.tensor([0, 2, 4, 5], device="cuda", dtype=torch.uint8)  # E2M1 codes of 0, 1, 2, 3
-        vp[token_t] = (codes[x.long()] * 17).view(1, S, 1).expand(1, S, K // 2).contiguous().view(torch.float4_e2m1fn_x2)
+        vp[token_t] = (codes[x.long()] * 17).view(1, rows, 1).expand(1, rows, K // 2).contiguous().view(torch.float4_e2m1fn_x2)
         w_codes = codes[w.abs().long()] + (w < 0).to(torch.uint8) * 8
         vp[weight_t] = (w_codes * 17)[:, :, None].expand(E, N, K // 2).contiguous().view(torch.float4_e2m1fn_x2)
-        vp[binding.sfa_operands[0]] = torch.ones((1, segmented_row_scale_capacity_rows(S, G), K // 16), device="cuda").to(torch.float8_e4m3fn)
+        if gather:
+            vp[binding.sfa_operands[0]] = torch.ones((1, rows, 16), device="cuda").to(torch.float8_e4m3fn)[:, :, : K // 16]
+        else:
+            vp[binding.sfa_operands[0]] = torch.ones((1, segmented_row_scale_capacity_rows(S, G), K // 16), device="cuda").to(torch.float8_e4m3fn)
         vp[binding.sfb_operands[0]] = torch.ones((E, N, K // 16), device="cuda").to(torch.float8_e4m3fn)
     else:
         vp[token_t] = x.view(1, rows, 1).expand(1, rows, K).to(torch.bfloat16).contiguous()
@@ -3115,8 +3119,26 @@ def test_moe_avg_divides_by_used_rows_sm120(block_scale, swap, gather):
 @requires_sm100
 @pytest.mark.parametrize(
     "block_scale,swap,gather",
-    [(False, False, False), (False, True, False), (False, False, True), (True, False, False), (True, True, False)],
-    ids=["plain", "plain_swap_ab", "plain_gather", "block_scale", "block_scale_swap_ab"],
+    [
+        (False, False, False),
+        (False, True, False),
+        (False, False, True),
+        (False, True, True),
+        (True, False, False),
+        (True, True, False),
+        (True, False, True),
+        (True, True, True),
+    ],
+    ids=[
+        "plain",
+        "plain_swap_ab",
+        "plain_gather",
+        "plain_gather_swap_ab",
+        "block_scale",
+        "block_scale_swap_ab",
+        "block_scale_gather",
+        "block_scale_gather_swap_ab",
+    ],
 )
 def test_moe_avg_divides_by_used_rows_sm100(block_scale, swap, gather):
     from cudnn.gemm.frost.sm100 import compiler as C100
