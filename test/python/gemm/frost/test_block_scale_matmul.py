@@ -1068,6 +1068,7 @@ _SPLITK_BS_CFG = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
 @pytest.mark.parametrize("arch", [100, 107])
 @pytest.mark.parametrize("cta_m,cta_n", [(128, 24), (128, 128), (128, 256), (256, 128), (512, 32)])
 @pytest.mark.parametrize("kind", ["dense", "moe", "moe_swap_ab", "dual"])
+@requires_sm100
 def test_block_scale_resident_sf_tmem_budget(arch, cta_m, cta_n, kind, monkeypatch):
     """Reserve accumulators and real scale operands before choosing resident SF words."""
     import ast

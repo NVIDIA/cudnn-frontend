@@ -1299,7 +1299,7 @@ def test_analyzer_offset_dtype_int64() -> None:
 def test_moe_block_scale_tma_store_uses_rank2_output_descriptor() -> None:
     """The block-scale MoE template shares the flat (S, N) TMA output surface
     with plain MoE; neither descriptor nor store coordinates carry batch=1."""
-    from cudnn.gemm.frost.compiler import _epi_n, _host_tma_c_descs, _tma_store_sequence
+    from cudnn.gemm.frost.sm100.compiler import _epi_n, _host_tma_c_descs, _tma_store_sequence
 
     chain = analyze(_build_graph(E=4, S=512, N=256, K=512, num_groups=4))
     cfg = by_name(_CFG)

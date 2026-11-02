@@ -2820,7 +2820,7 @@ def test_narrow_n_under_two_cta_mma_still_takes_the_tma_store(name: str) -> None
     theory that a subtile would split across the MMA pair. It does not: each
     CTA drains its own half and the subtile span walk already halves to fit.
     Measured bit-identical to STG on 16 (config) pairs."""
-    from cudnn.gemm.frost.compiler import _use_tma_store_epi
+    from cudnn.gemm.frost.sm100.compiler import _use_tma_store_epi
     from cudnn.gemm.frost.graph_analyzer import analyze
 
     g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
@@ -2842,6 +2842,7 @@ def test_narrow_n_under_two_cta_mma_still_takes_the_tma_store(name: str) -> None
     ],
 )
 @pytest.mark.parametrize("shape", [(4096, 4096, 512), (255, 256, 240)])
+@requires_sm100
 def test_tma_store_serves_every_drain_height(name: str, cta_group: int, shape: tuple) -> None:
     """`mma_inst_m` is 64 or 128 by construction, and the TMA-store epilogue
     stages all three drain layouts: the full thread->row one at 128, the 1-CTA
@@ -2903,7 +2904,7 @@ def test_epi_smem_row_bytes_is_the_real_staging_alignment(name: str, cta_group: 
     `store_swizzled` forwards it as `assumed_align`, so an over-claim is a false
     promise the backend may exploit. It is per OUTPUT, not shared: `epi_n` is a
     column count and only the element width differs."""
-    from cudnn.gemm.frost.compiler import _epi_n, _tma_store_sequence
+    from cudnn.gemm.frost.sm100.compiler import _epi_n, _tma_store_sequence
     from cudnn.gemm.frost.dtypes import DTYPE_BYTES
     from cudnn.gemm.frost.graph_analyzer import analyze
 
@@ -2930,12 +2931,10 @@ def test_no_template_hardcodes_the_staging_alignment() -> None:
     would go stale the next time `_epi_n` moves."""
     import pathlib
 
-    from cudnn.gemm.frost.compiler import _epi_n, _tma_store_sequence
+    from cudnn.gemm.frost.sm100.compiler import _TMA_STORE_EPI_PIPELINES, _epi_n, _tma_store_sequence
     from cudnn.gemm.frost.graph_analyzer import analyze
     from cudnn.gemm.frost.kernel_registry import TEMPLATES
     from cudnn.gemm.frost.tile_config import by_name
-
-    from cudnn.gemm.frost.compiler import _TMA_STORE_EPI_PIPELINES
 
     files = template_files()
     assert {p.name for p in files} == {template.file for template in TEMPLATES}
@@ -3002,6 +3001,7 @@ def test_epilogue_chunk_is_the_width_the_arm_hands_the_snippet(name: str, cta_gr
         ("CONFIG_sm100_64x128x128_64x128x32_cluster2x1", 2),
     ],
 )
+@requires_sm100
 def test_m_major_tma_store_serves_a_narrow_drain(name: str, cta_group: int) -> None:
     """The M-major store stages an M-contiguous column with one scalar store per
     drain column, so a narrow `epi_n` is just fewer stores. The arm it replaced
@@ -3508,7 +3508,10 @@ def test_sm120_single_gemm_tile_without_an_ab_stage_declines_at_probe(kind, monk
 def test_sm120_epi_vec_clamp_and_stg_only() -> None:
     """sm120 always renders the transposed-STG epilogue, with the chunk capped
     at the 8-element fragment row run; the sm100 derivation is untouched."""
-    from cudnn.gemm.frost.compiler import _use_tma_store_epi
+    # Name each tree: cudnn.gemm.frost.compiler is the active GPU's family, so on an
+    # SM120 part it would answer the sm100 half with the sm120 gate.
+    from cudnn.gemm.frost.sm100 import compiler as C100
+    from cudnn.gemm.frost.sm120 import compiler as C120
 
     chain = analyze(_build_graph(384, 768, 384, "bf16", "bf16"))
     for name in (
@@ -3517,18 +3520,18 @@ def test_sm120_epi_vec_clamp_and_stg_only() -> None:
         "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
     ):
         c = by_name(name)
-        v = _epi_vec_bytes(chain, c)
+        v = C120._epi_vec_bytes(chain, c)
         assert v == 16, name  # 8-element bf16 run (template: 8 % _STG_V == 0)
-        assert _use_tma_store_epi(chain, c) is False, name
+        assert C120._use_tma_store_epi(chain, c) is False, name
 
     # the sm100 chunk derivation and its TMA-store gate are untouched
     cfg100 = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1")
-    v100 = _epi_vec_bytes(chain, cfg100)
-    assert v100 >= 16 and _use_tma_store_epi(chain, cfg100) is True
+    v100 = C100._epi_vec_bytes(chain, cfg100)
+    assert v100 >= 16 and C100._use_tma_store_epi(chain, cfg100) is True
 
     # 8B-aligned output rows (N=100 bf16) narrow the chunk to 4 elements
     narrow = analyze(_build_graph(256, 100, 256, "bf16", "bf16"))
-    assert _epi_vec_bytes(narrow, by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")) == 8
+    assert C120._epi_vec_bytes(narrow, by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")) == 8
 
 
 # (graph builder, torch reference) for the activations whose emitters use max/min. relu with both negative_slope and
