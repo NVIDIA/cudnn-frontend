@@ -6,7 +6,7 @@ If you are interested in contributing to cudnn-frontend, we encourage you to:
 
 ## Development environment
 
-Requirements: an NVIDIA GPU (Hopper/Blackwell for attention and OSS kernels), CUDA toolkit, cuDNN 9.x, CMake ≥ 3.23, a C++17 compiler, Python ≥ 3.9. If cuDNN/CUDA are not installed system-wide, point `CUDNN_PATH` and `CUDAToolkit_ROOT` at them.
+Requirements: an NVIDIA GPU (Hopper/Blackwell for attention and OSS kernels), CUDA toolkit, cuDNN 9.x, CMake ≥ 3.26, a C++17 compiler, Python ≥ 3.10. If cuDNN/CUDA are not installed system-wide, point `CUDNN_PATH` and `CUDAToolkit_ROOT` at them.
 
 ```bash
 git clone https://github.com/NVIDIA/cudnn-frontend.git
