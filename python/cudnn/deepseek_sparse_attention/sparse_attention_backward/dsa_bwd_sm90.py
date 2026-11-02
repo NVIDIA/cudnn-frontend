@@ -459,6 +459,7 @@ class _FlashAttentionDSABackwardDSinkSm90:
         mdSink: cute.Tensor,
         stream: cuda.CUstream,
     ):
+        """Launch one fixed-order warp reduction per batch and query head."""
         self.kernel(mdPsum, mLSE, mAttnSink, mdSink).launch(
             grid=[mLSE.shape[2], mLSE.shape[0], 1],
             block=[32, 1, 1],
@@ -473,6 +474,7 @@ class _FlashAttentionDSABackwardDSinkSm90:
         mAttnSink: cute.Tensor,
         mdSink: cute.Tensor,
     ):
+        """Accumulate each lane's strided queries and reduce them in lane order."""
         head_idx, batch_idx, _ = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
         LOG2_E = math.log2(math.e)
@@ -506,6 +508,7 @@ class _FlashAttentionDSABackwardRelayMasksSm90:
         padded_seqlen_kv: int,
         padded_head_dim: int,
     ):
+        """Record the logical relay geometry and packed ownership-word layout."""
         self.relay_cluster_size = relay_cluster_size
         self.q_wave_ctas = q_wave_ctas
         self.num_head_tiles = num_head_tiles
@@ -609,6 +612,7 @@ class FlashAttentionDSABackwardSm90:
         padded_seqlen_kv: int = 0,
         padded_head_dim: int = 0,
     ):
+        """Specialize the Hopper backward kernel and optional deterministic relay."""
         self.dtype = dtype
         hdim_multiple_of = 16
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
@@ -2607,6 +2611,7 @@ class _FlashAttentionDSABackwardPostprocessSm90:
         N_hdim_chunks: int = 4,
         num_dkv_shards: int = 1,
     ):
+        """Configure the fixed-order shard reduction and output conversion."""
         self.dtype = dtype
         self.hdim_chunk = hdim_chunk
         self.tile_n = tile_n
@@ -2627,6 +2632,7 @@ class _FlashAttentionDSABackwardPostprocessSm90:
         seqlen_k: cutlass.Int32,
         stream: cuda.CUstream,
     ):
+        """Launch one postprocess CTA per KV-row tile and head-dimension chunk."""
         num_head_kv = mdKV.shape[2]
         num_batch = mdKVaccum.shape[0]
         num_n_blocks = cute.ceil_div(mdKV.shape[1], self.tile_n)
@@ -2648,6 +2654,7 @@ class _FlashAttentionDSABackwardPostprocessSm90:
         mdKV: cute.Tensor,
         seqlen_k: cutlass.Int32,
     ):
+        """Sum relay shards in index order, convert, and store one output tile."""
         tidx, _, _ = cute.arch.thread_idx()
         m_block = cute.arch.block_idx()[0]
         head_idx = cute.arch.block_idx()[1]

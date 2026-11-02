@@ -362,6 +362,7 @@ def comma_separated_ints(s):
 
 
 def parse_args():
+    """Parse command-line options for the DSA backward benchmark."""
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument(
         "mode",
