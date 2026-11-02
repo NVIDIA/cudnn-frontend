@@ -93,6 +93,102 @@ def test_native_d64_exports_the_prepared_pointer_contract():
     assert tuple(signature(native.compile).parameters) == tuple(signature(control.compile).parameters)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "extra,flavor",
+    [
+        pytest.param({}, "d64", id="dense"),
+        pytest.param(dict(has_sink=True), "d512", id="sink"),
+        pytest.param(dict(is_causal=True, window_size_left=16), "d512", id="window"),
+        pytest.param(dict(seq_q_lens_present=True, seq_kv_lens_present=True), "d512", id="lengths"),
+        pytest.param(dict(pack_gqa=True), "d512", id="pack-gqa"),
+        pytest.param(dict(thd=True), "d512", id="thd"),
+        pytest.param(dict(is_causal=True, window_size_right=8), "d512", id="right-band"),
+    ],
+)
+def test_standalone_d64_retains_existing_feature_routes(monkeypatch, dtype, extra, flavor):
+    """Host admission/selection only: stop at the loader, before any Hopper JIT or launch."""
+    from cudnn.frost import buffers
+    from cudnn.sdpa.fwd import api_dsl
+
+    q, o = (torch.empty(1, 64, 2, 64, device="cuda", dtype=dtype).transpose(1, 2) for _ in range(2))
+    k, v = (torch.empty(1, 64, 1, 64, device="cuda", dtype=dtype).transpose(1, 2) for _ in range(2))
+    # Model the declaration target only. Real storage/device/layout validation
+    # remains active; the loader trap makes this test incapable of launching.
+    monkeypatch.setattr(buffers, "current_sm", lambda: 90)
+    selected = []
+
+    class TemplateSelected(Exception):
+        pass
+
+    def stop_at_template(filename, *args, **kwargs):
+        selected.append(filename)
+        raise TemplateSelected
+
+    monkeypatch.setattr(api_dsl, "_load_kernel_template", stop_at_template)
+    api = api_dsl.SdpaFwdDslSm90(q, k, v, o, **extra)
+    assert api.check_support()
+    with pytest.raises(TemplateSelected):
+        api.compile()
+    assert selected == [f"sm90/prefill_{flavor}_f16.py"]
+
+
+@pytest.mark.skipif(_SM != 90, reason="standalone D512-envelope execution requires actual Hopper SM90")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("feature", ["sink", "window", "lengths", "pack-gqa"])
+def test_standalone_d64_d512_envelope_reference_and_replay(dtype, feature):
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
+
+    extra = {
+        "sink": dict(has_sink=True),
+        "window": dict(is_causal=True, window_size_left=16),
+        "lengths": dict(seq_q_lens_present=True, seq_kv_lens_present=True),
+        "pack-gqa": dict(pack_gqa=True),
+    }[feature]
+    api = None
+    for _ in range(2):
+        # Rebind every storage object, then replay changed device values.
+        q = torch.randn(1, 64, 2, 64, device="cuda", dtype=dtype).transpose(1, 2)
+        k, v = (torch.randn(1, 64, 1, 64, device="cuda", dtype=dtype).transpose(1, 2) for _ in range(2))
+        o, stats = torch.empty_like(q), torch.empty(1, 2, 64, device="cuda", dtype=torch.float32)
+        sinks = torch.tensor([1.0, 5.0], device="cuda") if feature == "sink" else None
+        q_lens = torch.tensor([64], device="cuda", dtype=torch.int32) if feature == "lengths" else None
+        kv_lens = torch.tensor([45], device="cuda", dtype=torch.int32) if feature == "lengths" else None
+        if api is None:
+            api = SdpaFwdDslSm90(q, k, v, o, sample_lse=stats, **extra)
+            api.compile()
+            assert Path(api._k_mod.__file__).name == "prefill_d512_f16.py"
+
+        def execute():
+            api.execute(q, k, v, o, lse_tensor=stats, sinks=sinks, seq_q_lens=q_lens, seq_kv_lens=kv_lens)
+
+        execute()
+        capture = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(capture):
+                execute()
+            v.mul_(0.5)
+            if sinks is not None:
+                sinks.add_(1.0)
+            if kv_lens is not None:
+                kv_lens.fill_(23)
+            capture.replay()
+            torch.cuda.synchronize()
+            scores = (q.double() @ k.double().repeat_interleave(2, dim=1).transpose(-1, -2)) * 64**-0.5
+            rows, keys = torch.arange(64, device="cuda")[:, None], torch.arange(64, device="cuda")[None, :]
+            if feature == "window":
+                scores = scores.masked_fill((keys > rows) | (keys < rows - 16), -float("inf"))
+            if feature == "lengths":
+                scores = scores.masked_fill(keys >= 23, -float("inf"))
+            if sinks is not None:
+                scores = torch.cat((scores, sinks.double().view(1, 2, 1, 1).expand(1, 2, 64, 1)), dim=-1)
+            expected = scores.softmax(-1)[..., :64] @ v.double().repeat_interleave(2, dim=1)
+            torch.testing.assert_close(o, expected.to(dtype), atol=5e-2, rtol=3e-2)
+            torch.testing.assert_close(stats, scores.logsumexp(-1).float(), atol=2e-2, rtol=2e-2)
+        finally:
+            capture.reset()
+
+
 def test_native_d64_recommendations_stay_unpacked():
     plans = recommend("A", _facts(h_q=8, h_kv=1, causal=True), {"sdpa_fwd_prefill_sm90": 20517})
     assert plans

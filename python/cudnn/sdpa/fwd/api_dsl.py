@@ -5380,6 +5380,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
     def _initialize_implementation(self) -> None:
         """Initialize prepared-launch and packed-Stats plan metadata."""
         self._dense_spec = self._thd_spec = None
+        self._native_d64 = False
         self.thd_stats_head_major = False
         self.thd_stats_head_stride = 0
 
@@ -5552,6 +5553,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             seq_q_lens_present=self.seq_q_lens_present,
             seq_kv_lens_present=self.seq_kv_lens_present,
         )
+        self._native_d64 = False
         if (d_qk, d_v) == (64, 64):
             from cudnn.sdpa.fwd.config_sm90 import native_d64_mismatch
 
@@ -5567,7 +5569,9 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
                 s_q=s_q,
                 s_kv=s_kv,
             )
-            self._not_implemented_error_if(why is not None, why)
+            # The standalone adapter already serves these richer declarations
+            # on the D512 envelope; only select D64 inside its native subset.
+            self._native_d64 = why is None
         self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max = b, h_q, h_kv, s_q, s_kv
         self.head_dim_qk, self.head_dim_v = d_qk, d_v
         self.dtype = self.q_desc.dtype
@@ -5588,7 +5592,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             # (row, multiplier, token stride, bits) entry becomes the template's (bits, multiplier).
             self.params = replace(self.params, thd_origins=tuple((spec[3], spec[1]) if spec is not None else None for spec in origin_specs))
             _sm90_validate_params(self.params)
-        flavor = "d64" if (self.head_dim_qk, self.head_dim_v) == (64, 64) else "d512"
+        flavor = "d64" if self._native_d64 else "d512"
         self._k_mod = template = _load_kernel_template(f"sm90/prefill_{flavor}_f16.py", self.params, tag=f"sdpa_fwd_sm90_{flavor}")
         self._compiled_kernel = template.compile(
             self.batch_size,

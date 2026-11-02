@@ -290,8 +290,11 @@ except the exact native D64 leg below, gets no FROST plan and falls back to the 
 this row led the preference order and took such graphs at up to 64x
 zero-padding. Deliberate asymmetry: `config_sm90.head_dims_mismatch` still
 serves every multiple of 8 in `(0, 512]`; outside the exact D64 specialization,
-the standalone adapter keeps the existing full D512 envelope. Exact D64 uses
-the native body and its narrower feature checks.
+the standalone adapter keeps the existing full D512 envelope. Exact D64 selects
+the native body only when its feature checks pass. Otherwise, standalone
+declarations retain the existing D512 path, including sinks, window/right bands,
+device lengths, THD and PackGQA when that path supports them. The graph D64 row
+keeps its narrower admission.
 
 **Native D64 draft (not Hopper-qualified).** Exact `D_QK=D_V=64` dense FP16/BF16
 MHA and unpacked GQA select `sm90/prefill_d64_f16.py`: two warpgroups (256
