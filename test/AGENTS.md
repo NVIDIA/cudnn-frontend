@@ -65,6 +65,20 @@ and tune a serialized/reloaded plan whose engine-config list is absent.
 
 ## Python tests (`test/python`)
 
+For an unresolved MXFP8 backward numerical failure, set `MXFP8_CAPTURE_DIR` to
+a fresh retained artifact directory in the original failing job. The normal
+pytest report hook saves the first failing backward case per process: raw
+FP8/E8M0 bytes, logical shapes/strides, backward bindings, references, full
+configuration, both selected plans and software/device settings. No external
+pytest plugin is needed. Capture stays disabled without the variable, and
+capture errors retain the original failure. `sdpa/test_mxfp8_failure_capture.py`
+checks both report outcomes and byte preservation, with a CUDA payload control.
+Load bundles with `torch.load(path, map_location="cpu", weights_only=True)`;
+storage gaps, offsets and aliases are not retained. Matching a seed or test
+index is not proof of identical tensors across GPUs with different SM counts
+or Torch builds. Capture actual failed operands before changing reference
+arithmetic or numerical tolerances.
+
 When moving Python modules, build the validation wheel with fresh Python build
 output. Reusing `build/lib.*` can ship removed modules even when the source tree
 and its import tests are clean. Inspect the wheel's module paths, then run the
