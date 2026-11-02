@@ -1710,6 +1710,9 @@ def _kernel(
         is_valid = cutlass.Int32(1)
         sched_stage = cutlass.Int32(0)
         sched_full_phase = cutlass.Int32(0)
+        # Routed rows the groups cover (the final offset, at most the capacity N): the count an
+        # ungrouped AVG over tokens divides by. At least 1, so an empty routing flushes 0, not NaN.
+        moe_used_rows = cutlass.max(cutlass.min(cutlass.Int64(first_token_arr[num_groups]), N), cutlass.Int64(1))
 
         # @@EPILOGUE_SETUP:BEGIN@@
         row_id_with_warp_offset = base_row_id + warp_idx * 32

@@ -3019,13 +3019,7 @@ def test_moe_avg_fp32(grouped, axis):
     )
 
 
-@requires_sm120
-@pytest.mark.parametrize(
-    "block_scale,swap,gather",
-    [(False, False, False), (False, True, False), (False, False, True), (True, False, False), (True, True, False)],
-    ids=["plain", "plain_swap_ab", "plain_gather", "block_scale", "block_scale_swap_ab"],
-)
-def test_moe_avg_divides_by_used_rows_sm120(block_scale, swap, gather):
+def _check_moe_avg_divides_by_used_rows(compiler, config_name, block_scale, swap, gather):
     """An ungrouped AVG over the token axis averages the rows the groups cover,
     first_token_offset[G], not the routed capacity (Token.shape[1], or
     len(token_index) under GATHER): trailing routed rows are unused, and ADD/MAX and
@@ -3033,7 +3027,6 @@ def test_moe_avg_divides_by_used_rows_sm120(block_scale, swap, gather):
     the per-feature AVG adds per chunk."""
     from cudnn.gemm.frost.fusion_ir import segmented_row_scale_capacity_rows
     from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
-    from cudnn.gemm.frost.sm120 import compiler as C120
     from moe_block_scale_test_utils import _build_graph as build_bs
 
     E, S, N, K, G = 2, 192, 128, 128, 4
@@ -3060,7 +3053,7 @@ def test_moe_avg_divides_by_used_rows_sm120(block_scale, swap, gather):
         red = graph.reduction(input=out_t, mode=cudnn.reduction_mode.AVG, name=name, compute_data_type=F)
         red.set_dim(list(dims)).set_stride([dims[1] * dims[2], dims[2], 1]).set_data_type(F).set_output(True)
         reductions.append(red)
-    compiled = C120.jit_from_cudnn_graph(graph, config=replace(by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"), swap_ab=swap))
+    compiled = compiler.jit_from_cudnn_graph(graph, config=replace(by_name(config_name), swap_ab=swap))
 
     # Exact integer products that do not cancel across features: out[s, n] = K * x[s] * w[g % E, n].
     x = (torch.arange(rows, device="cuda") % 3 + 1).float()
@@ -3105,6 +3098,30 @@ def test_moe_avg_divides_by_used_rows_sm120(block_scale, swap, gather):
         expected_feature = ref[:used].mean(0) if used else torch.zeros(N, device="cuda")
         torch.testing.assert_close(avg_scalar, expected_scalar.view(1, 1, 1), atol=1e-3, rtol=1e-5, msg=lambda m: f"scalar AVG, offsets {starts}: {m}")
         torch.testing.assert_close(avg_feature, expected_feature.view(1, 1, N), atol=1e-3, rtol=1e-5, msg=lambda m: f"per-feature AVG, offsets {starts}: {m}")
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "block_scale,swap,gather",
+    [(False, False, False), (False, True, False), (False, False, True), (True, False, False), (True, True, False)],
+    ids=["plain", "plain_swap_ab", "plain_gather", "block_scale", "block_scale_swap_ab"],
+)
+def test_moe_avg_divides_by_used_rows_sm120(block_scale, swap, gather):
+    from cudnn.gemm.frost.sm120 import compiler as C120
+
+    _check_moe_avg_divides_by_used_rows(C120, "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2", block_scale, swap, gather)
+
+
+@requires_sm100
+@pytest.mark.parametrize(
+    "block_scale,swap,gather",
+    [(False, False, False), (False, True, False), (False, False, True), (True, False, False), (True, True, False)],
+    ids=["plain", "plain_swap_ab", "plain_gather", "block_scale", "block_scale_swap_ab"],
+)
+def test_moe_avg_divides_by_used_rows_sm100(block_scale, swap, gather):
+    from cudnn.gemm.frost.sm100 import compiler as C100
+
+    _check_moe_avg_divides_by_used_rows(C100, "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma", block_scale, swap, gather)
 
 
 def test_moe_reduction_initialization_validates_all_outputs_before_writing():
