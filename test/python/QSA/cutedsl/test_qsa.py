@@ -196,6 +196,23 @@ def test_packed_forward_backward(supported_gpu, heads, lengths):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("heads", [(12, 1), (24, 2), (6, 1)])
+@pytest.mark.parametrize("lengths", [(8,), (3, 5, 9), (257,)])
+def test_backward_bounds_reach_keys_after_the_query(supported_gpu, heads, lengths):
+    """The selection is lo <= j <= hi, keys after the query included; the backward follows the forward's selection."""
+    inputs = make_inputs(lengths, *heads, all_selected=True)
+    end = inputs["lo"].clone()
+    start = 0
+    for length in lengths:
+        end[start : start + length] = start + length - 1
+        start += length
+    inputs["hi"].copy_(end)
+    first, last = inputs["block_first"], inputs["block_last"]
+    inputs["sel_blocks"].copy_(((last[None] >= inputs["lo"][:, None]) & (first[None] <= end[:, None])).to(torch.uint8))
+    check_case(inputs)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("lengths", [(513,), (2056,)], ids=["gated-dense", "gathered"])
 def test_six_query_heads_forward_routes(supported_gpu, lengths):
     """6Q/1KV takes the dense-tile route and the gathered route like 12Q/1KV; neither is specialised for 12 heads."""

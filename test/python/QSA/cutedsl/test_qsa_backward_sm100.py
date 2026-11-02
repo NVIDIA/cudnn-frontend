@@ -11,7 +11,7 @@ import torch
 
 from cudnn.ops import qsa_backward, qsa_indexed_backward
 
-from QSA.cutedsl.qsa_index_list_reference import assert_grads_close, make_inputs, reference_backward
+from QSA.cutedsl.qsa_index_list_reference import assert_grads_close, make_inputs, reference_backward, reference_forward
 
 SCALE = 1.0 / 16.0
 _INPUT_NAMES = ("q", "k", "v", "out", "dout", "lse", "topk_idxs")
@@ -227,6 +227,47 @@ def test_sparse_query_past_513_blocks_marks_dq():
     meta = _miles_metadata(inputs["topk_idxs"], (seq_len,))
     meta[0][row, : row // 4 + 1] = 1
     dq, dk, dv = _bitmap_backward(inputs, meta)
+    assert dq[row].isnan().all()
+    expected = reference_backward(*(inputs[name] for name in _INPUT_NAMES))
+    keep = torch.arange(seq_len, device=dq.device) != row
+    assert_grads_close("dq", dq[keep], expected[0][keep])
+    assert_grads_close("dk", dk, expected[1])
+    assert_grads_close("dv", dv, expected[2])
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("h_kv", [2, 1])
+def test_sparse_rows_reach_keys_after_the_query(h_kv):
+    _skip_cu12(h_kv)
+    # Past the dense prefix a query may select blocks after itself when hi allows. Rows whose own block is complete
+    # (query position 3 mod 4) take one block 64 tokens ahead in their tail slots and a bound covering it, so the
+    # bitmap entry and the index-list oracle see the same tokens.
+    seq_len = 24000
+    inputs = _inputs((seq_len,), h_kv, seed=3)
+    idx = inputs["topk_idxs"]
+    rows = torch.arange(20503, 23900, 700, device=idx.device)
+    future = (rows + 64) // 4 * 4
+    idx[rows, -4:] = (future[:, None] + torch.arange(4, device=idx.device)[None]).to(idx.dtype)
+    inputs["out"], lse = reference_forward(inputs["q"], inputs["k"], inputs["v"], idx, torch.float32)
+    inputs["lse"] = lse.T.contiguous()
+    meta = list(_miles_metadata(idx, (seq_len,)))
+    meta[2][rows] = (future + 3).to(meta[2].dtype)
+    meta[0][rows, future // 4] = 1
+    _check(inputs, _bitmap_backward(inputs, tuple(meta)))
+
+
+@pytest.mark.L0
+def test_dense_query_selecting_past_its_prefix_marks_dq():
+    _skip_cu12(1)
+    # A query of the dense prefix sees keys up to the end of that prefix; a selected block past it leaves the query's
+    # dQ NaN. With a zero output gradient the query contributes nothing to the reference.
+    seq_len, row, block = 24000, 100, 21000
+    inputs = _inputs((seq_len,), 1, seed=9)
+    inputs["dout"][row] = 0
+    meta = list(_miles_metadata(inputs["topk_idxs"], (seq_len,)))
+    meta[2][row] = seq_len - 1
+    meta[0][row, block // 4] = 1
+    dq, dk, dv = _bitmap_backward(inputs, tuple(meta))
     assert dq[row].isnan().all()
     expected = reference_backward(*(inputs[name] for name in _INPUT_NAMES))
     keep = torch.arange(seq_len, device=dq.device) != row

@@ -660,8 +660,6 @@ def qsa_bwd_sparse_query_kernel(
                     # the inclusive key bounds of the query: a block's tokens outside them have zero P / dS
                     lo_q = (p_lo + qr).load()
                     hi_q = (p_hi + qr).load()
-                    if hi_q > qr:
-                        hi_q = qr
                     nchunks = (nblk + (CHB - 1)) // CHB
                     # record slot and first token of this row's block entry, loaded one chunk ahead
                     prow_pp = p_sparse_block_slots + (jr * PART_W + o0)
@@ -1922,10 +1920,12 @@ def qsa_bwd_seq_fill_kernel(
     g_seq_start: cute.Tensor,
     g_dense_hi: cute.Tensor,
     g_sparse_queries: cute.Tensor,
+    g_first_group: cute.Tensor,
     T: I32,
 ):
     # one thread per token: its sequence by binary search, the first row past its sequence's dense queries, then its
-    # entry in the compacted sparse list
+    # entry in the compacted sparse list. The thread of a key tile's first token also resets the tile's first-group
+    # entry, which the bitmap kernel lowers for queries that see keys after themselves.
     tidx, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
     t = bid * 256 + tidx
@@ -1948,6 +1948,8 @@ def qsa_bwd_seq_fill_kernel(
         (g_dense_hi.iterator.raw_ptr() + t).store(s + nd)
         if p >= nd:
             (g_sparse_queries.iterator.raw_ptr() + ((g_seq_sparse_base.iterator.raw_ptr() + lo).load() + (p - nd))).store(t)
+        if t % DP_TT == 0:
+            (g_first_group.iterator.raw_ptr() + t // DP_TT).store(I32(2**31 - 1))
 
 
 qsa_bwd_seq_fill_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -1961,10 +1963,11 @@ def _seq_fill_host(
     seq_start: cute.Tensor,
     dense_hi: cute.Tensor,
     sparse_queries: cute.Tensor,
+    first_group: cute.Tensor,
     T: I32,
     stream: cuda_driver.CUstream,
 ):
-    qsa_bwd_seq_fill_kernel(cu, nseq, seq_sparse_base, seq_start, dense_hi, sparse_queries, T).launch(
+    qsa_bwd_seq_fill_kernel(cu, nseq, seq_sparse_base, seq_start, dense_hi, sparse_queries, first_group, T).launch(
         grid=((T + 255) // 256, 1, 1), block=(256, 1, 1), stream=stream
     )
 
@@ -2302,13 +2305,18 @@ def qsa_bwd_bitmap_kernel(
     g_seq_start: cute.Tensor,
     g_dense_hi: cute.Tensor,
     g_dense_block_bitmap: cute.Tensor,
+    g_first_group: cute.Tensor,
+    g_dq_acc: cute.Tensor,
     T: I32,
     cap: I32,
     NW: I32,
+    HQD: I32,
 ):
     # Row qi of the bitmap holds one bit per sequence-relative key token a dense query attends: the tokens of its
-    # selected blocks within [lo, min(hi, query)], so the dense kernel tests the bit alone and a block may start
-    # anywhere.
+    # selected blocks within [lo, hi] and the dense prefix, so the dense kernel tests the bit alone and a block may
+    # start anywhere. A query that sees keys after itself lowers the first query group of the key tiles up to hi, so
+    # the dense kernel walks those groups; keys past the dense prefix have no bits, and selecting one leaves the
+    # query's dQ NaN (the sparse path alone reaches them).
     tidx, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
     lane = tidx % 32
@@ -2317,19 +2325,26 @@ def qsa_bwd_bitmap_kernel(
     p_first = g_first.iterator.raw_ptr()
     p_dense_block_bitmap = g_dense_block_bitmap.iterator.raw_ptr()
     if qi < T:
-        if qi < (g_dense_hi.iterator.raw_ptr() + qi).load():
+        dense_end = (g_dense_hi.iterator.raw_ptr() + qi).load()
+        if qi < dense_end:
             s = (g_seq_start.iterator.raw_ptr() + qi).load()
             n = (g_counts.iterator.raw_ptr() + qi).load()
             floor = (g_lo.iterator.raw_ptr() + qi).load()
             if floor < s:
                 floor = s
-            ceil = (g_hi.iterator.raw_ptr() + qi).load()
-            if ceil > qi:
-                ceil = qi
+            hi_q = (g_hi.iterator.raw_ptr() + qi).load()
+            ceil = hi_q
+            if ceil > dense_end - 1:
+                ceil = dense_end - 1
             lrow = p_ids + cutlass.Int64(qi) * cutlass.Int64(cap)
             prow = p_dense_block_bitmap + qi * NW
+            beyond = False
             for m in cutlass.range(lane, n, 32, unroll=1):
                 tok = _block_tok(p_first, lrow, m)
+                # a token of the block past the dense prefix and within the bounds (a whole-sequence prefix ends at
+                # the sequence, which hi never reaches)
+                if (hi_q >= dense_end) & (tok + 3 >= dense_end) & (tok <= hi_q) & (tok + 3 >= floor):
+                    beyond = True
                 b0 = tok
                 if b0 < floor:
                     b0 = floor
@@ -2361,6 +2376,23 @@ def qsa_bwd_bitmap_kernel(
                             mem_order=prims.MemOrder.RELAXED,
                             mem_scope=prims.MemScope.GPU,
                         )
+            if (hi_q > qi) & (ceil > qi):
+                # the key tiles after the query's own, up to its bound, must walk down to this query's group
+                p_fg = g_first_group.iterator.raw_ptr()
+                for tile in cutlass.range(qi // DP_TT + 1 + lane, ceil // DP_TT + 1, 32, unroll=1):
+                    prims.red(
+                        prims.ReductionOp.MIN,
+                        prims.ReductionType.S32,
+                        p_fg + tile,
+                        qi // DP_G,
+                        mem_order=prims.MemOrder.RELAXED,
+                        mem_scope=prims.MemScope.GPU,
+                    )
+            if prims.vote_sync(0xFFFFFFFF, beyond, prims.VoteSync.ANY):
+                nanv = cutlass.Vector.from_elements([F32(float("nan"))] * 8, F32)
+                p_dq_acc = g_dq_acc.iterator.raw_ptr()
+                for v in cutlass.range(lane, HQD // 8, 32, unroll=1):
+                    (p_dq_acc + (qi * HQD + v * 8)).store(nanv, alignment=16)
 
 
 qsa_bwd_bitmap_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -2376,12 +2408,15 @@ def _bitmap_host(
     seq_start: cute.Tensor,
     dense_hi: cute.Tensor,
     dense_block_bitmap: cute.Tensor,
+    first_group: cute.Tensor,
+    dq_acc: cute.Tensor,
     NW: I32,
+    HQD: I32,
     stream: cuda_driver.CUstream,
 ):
     T = counts.shape[0]
     cap = ids.shape[1]
-    qsa_bwd_bitmap_kernel(ids, counts, first, lo, hi, seq_start, dense_hi, dense_block_bitmap, I32(T), I32(cap), NW).launch(
+    qsa_bwd_bitmap_kernel(ids, counts, first, lo, hi, seq_start, dense_hi, dense_block_bitmap, first_group, dq_acc, I32(T), I32(cap), NW, HQD).launch(
         grid=((I32(T) + 7) // 8, 1, 1), block=(256, 1, 1), stream=stream
     )
 
@@ -2535,6 +2570,7 @@ def qsa_bwd_dense_pair_kernel(
     g_seq_start: cute.Tensor,
     g_dense_hi: cute.Tensor,
     g_unit: cute.Tensor,
+    g_first_group: cute.Tensor,
     T: I32,
     NW: I32,
     ntiles: I32,
@@ -2580,6 +2616,10 @@ def qsa_bwd_dense_pair_kernel(
     if g_top > g_cap:
         g_top = g_cap
     g_lo = a0 // DP_G
+    # queries before the tile that see keys in it (bounds past themselves) lower the first group to walk
+    fg = (g_first_group.iterator.raw_ptr() + tile).load()
+    if fg < g_lo:
+        g_lo = fg
     # Without a sparse grid to backfill, the unit is one wave of the longest sequence's causal work per pair slot
     # (decided on the device, where the sequences are known), raised when the tile's parts could not cover its groups
     # otherwise. With a sparse grid, the tuned unit backfills the key-major grid.
@@ -3174,6 +3214,7 @@ def _dpair_host(
     seq_start: cute.Tensor,
     dense_hi: cute.Tensor,
     unit: cute.Tensor,
+    first_group: cute.Tensor,
     NW: I32,
     ntiles: I32,
     U: I32,
@@ -3218,6 +3259,7 @@ def _dpair_host(
         seq_start,
         dense_hi,
         unit,
+        first_group,
         I32(T),
         NW,
         ntiles,
@@ -3356,6 +3398,7 @@ class LaunchPlan:
             ("dense_hi", (T4,), torch.int32),
             ("nseq", (4,), torch.int32),
             ("dense_unit", (4,), torch.int32),
+            ("first_group", (((T + DP_TT - 1) // DP_TT + 3) // 4 * 4,), torch.int32),  # seq_fill resets every tile of the buffer
             ("active_count", (4 if sp else 0,), torch.int32),
             ("sparse_queries", ((nsq + 3) // 4 * 4 if sp else 0,), torch.int32),
             ("sparse_blocks", (self.window_capacity * PART_W + 16 if sp else 0,), torch.int32),
@@ -3459,6 +3502,7 @@ def compile_kernels(plan: LaunchPlan) -> dict:
             f_i(),
             f_i(),
             f_i(),
+            f_i(),
             I32(1),
             I32(1),
             I32(1),
@@ -3469,7 +3513,7 @@ def compile_kernels(plan: LaunchPlan) -> dict:
         fin_fakes = (f_h, f_h, f_dense_dkv, f_dense_dkv, f_dq_acc, f_kv, f_kv, f_q, I32(1))
         builders = {
             "seq_scan": lambda: (_seq_scan_host, f_c(), f_c(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), I32(0), I32(0), I32(1), I32(1), stream),
-            "seq_fill": lambda: (_seq_fill_host, f_c(), f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), stream),
+            "seq_fill": lambda: (_seq_fill_host, f_c(), f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), stream),
             "prep": lambda: (
                 _prep_host,
                 f_out,
@@ -3488,7 +3532,7 @@ def compile_kernels(plan: LaunchPlan) -> dict:
                 gq,
                 stream,
             ),
-            "bitmap": lambda: (_bitmap_host, f_ids(), f_c(), f_c(), f_c(), f_c(), f_i(), f_i(), f_i(), I32(1), stream),
+            "bitmap": lambda: (_bitmap_host, f_ids(), f_c(), f_c(), f_c(), f_c(), f_i(), f_i(), f_i(), f_i(), f_dq_acc, I32(1), I32(8), stream),
             "window": lambda: (_window_host, f_i(), f_i(), f_i(), I32(0), I32(1), stream),
             "part": lambda: (_part_host, f_ids(), f_c(), f_c(), f_dq_acc, f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), I32(1), I32(1), hkv, gq, stream),
             "scan": lambda: (_scan_host, f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), stream),
@@ -3577,7 +3621,7 @@ def launch(plan, fns, q, k, v, out, dout, lse, ids, counts, first, lo, hi, dq, d
         plan.num_sms,
         stream,
     )
-    fns["seq_fill"](cu, s["nseq"], s["seq_sparse_base"], s["seq_start"], s["dense_hi"], s["sparse_queries"], T, stream)
+    fns["seq_fill"](cu, s["nseq"], s["seq_sparse_base"], s["seq_start"], s["dense_hi"], s["sparse_queries"], s["first_group"], T, stream)
     fns["prep"](
         out,
         dout,
@@ -3593,7 +3637,9 @@ def launch(plan, fns, q, k, v, out, dout, lse, ids, counts, first, lo, hi, dq, d
         plan.prep_blocks,
         stream,
     )
-    fns["bitmap"](ids, counts, first, lo, hi, s["seq_start"], s["dense_hi"], s["dense_block_bitmap"], plan.nw, stream)
+    fns["bitmap"](
+        ids, counts, first, lo, hi, s["seq_start"], s["dense_hi"], s["dense_block_bitmap"], s["first_group"], s["dq_acc"], plan.nw, plan.gq * HKV * D, stream
+    )
     dense_args = (
         k,
         v,
@@ -3609,6 +3655,7 @@ def launch(plan, fns, q, k, v, out, dout, lse, ids, counts, first, lo, hi, dq, d
         s["seq_start"],
         s["dense_hi"],
         s["dense_unit"],
+        s["first_group"],
         plan.nw,
         plan.dense_tiles,
         plan.dense_unit,
