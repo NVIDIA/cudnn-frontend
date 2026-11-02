@@ -2703,6 +2703,7 @@ _SM120_BS_CFGS = [
     "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps2x4",
 ]
 _SM120_BS_CFG = _SM120_BS_CFGS[0]
+_SM100_BS_CFG = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
 
 
 def test_sm120_moe_block_scale_template_is_registered_in_the_sm120_tree() -> None:
@@ -3162,10 +3163,7 @@ def test_e2e_auto_config_sm120() -> None:
     torch.testing.assert_close(output[0], ref.to(torch.bfloat16), atol=1e-1, rtol=1e-2)
 
 
-@requires_sm120
-@pytest.mark.parametrize("swap_ab", [False, True], ids=["normal", "swap_ab"])
-@pytest.mark.parametrize("mode", ["none", "gather"])
-def test_sm120_moe_mxfp8_partial_scale_block_graph_is_declined(mode, swap_ab) -> None:
+def _check_moe_mxfp8_partial_scale_block_graph_is_declined(config_name, mode, swap_ab):
     """MXFP8 scales whole 32-element K blocks, but the token's 16-byte TMA rule only needs
     K % 16. Both orientations size the F8_128x4 scale-factor views from floor(K / 32) scales per
     row, so at K = 144 the last K tile read zero-filled scales and every 128-row SF block past the
@@ -3176,17 +3174,29 @@ def test_sm120_moe_mxfp8_partial_scale_block_graph_is_declined(mode, swap_ab) ->
     else:
         g = _build_graph(2, 256, 256, 144, 2, combo="mxfp8")
     with pytest.raises(NotImplementedError, match="not a multiple of the scale block size 32"):
-        _plan(g, config=by_name(_SM120_BS_CFG), swap_ab=swap_ab)
+        _plan(g, config=by_name(config_name), swap_ab=swap_ab)
 
 
 @requires_sm120
 @pytest.mark.parametrize("swap_ab", [False, True], ids=["normal", "swap_ab"])
-def test_sm120_moe_mxfp8_partial_scale_block_call_is_refused(swap_ab) -> None:
+@pytest.mark.parametrize("mode", ["none", "gather"])
+def test_sm120_moe_mxfp8_partial_scale_block_graph_is_declined(mode, swap_ab) -> None:
+    _check_moe_mxfp8_partial_scale_block_graph_is_declined(_SM120_BS_CFG, mode, swap_ab)
+
+
+@requires_sm100
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["normal", "swap_ab"])
+@pytest.mark.parametrize("mode", ["none", "gather"])
+def test_sm100_moe_mxfp8_partial_scale_block_graph_is_declined(mode, swap_ab) -> None:
+    _check_moe_mxfp8_partial_scale_block_graph_is_declined(_SM100_BS_CFG, mode, swap_ab)
+
+
+def _check_moe_mxfp8_partial_scale_block_call_is_refused(config_name, swap_ab):
     """The kernel binds K per call: a plan built at a whole-block K refuses a call whose K ends
     inside a scale block before it writes anything, and still serves a K tail of whole blocks."""
     E, S, N = 2, 256, 256
     offsets_list = [0, 128, S]
-    compiled = _plan(_build_graph(E, S, N, 160, 2, combo="mxfp8"), config=by_name(_SM120_BS_CFG), swap_ab=swap_ab)
+    compiled = _plan(_build_graph(E, S, N, 160, 2, combo="mxfp8"), config=by_name(config_name), swap_ab=swap_ab)
     torch.manual_seed(0)
 
     def call(K):
@@ -3216,3 +3226,15 @@ def test_sm120_moe_mxfp8_partial_scale_block_call_is_refused(swap_ab) -> None:
         compiled(vp)
     torch.cuda.synchronize()
     assert torch.all(out == 7.0)
+
+
+@requires_sm120
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["normal", "swap_ab"])
+def test_sm120_moe_mxfp8_partial_scale_block_call_is_refused(swap_ab) -> None:
+    _check_moe_mxfp8_partial_scale_block_call_is_refused(_SM120_BS_CFG, swap_ab)
+
+
+@requires_sm100
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["normal", "swap_ab"])
+def test_sm100_moe_mxfp8_partial_scale_block_call_is_refused(swap_ab) -> None:
+    _check_moe_mxfp8_partial_scale_block_call_is_refused(_SM100_BS_CFG, swap_ab)
