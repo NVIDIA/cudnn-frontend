@@ -13,8 +13,9 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass import Boolean, Float32, Int32, Uint32, const_expr
-from cutlass._mlir.dialects import arith
+from cutlass._mlir.dialects import arith, nvvm
 from cutlass.cute.nvgpu import cpasync, warpgroup
+from cutlass.cutlass_dsl import dsl_user_op
 from cudnn._cutlass_compat import LayoutEnum, SmemAllocator
 
 from cudnn.deepseek_sparse_attention.utils.copy import (
@@ -50,6 +51,18 @@ from cudnn.deepseek_sparse_attention.utils.sm90.primitives import (
     transpose_view,
     warp_reduce,
 )
+
+
+@dsl_user_op
+def _partial_cta_sync(barrier_id: int, thread_count: int, *, loc=None, ip=None):
+    """Synchronize the relay warpgroup without an aligned-CTA promise."""
+    nvvm.barrier_cta_sync(
+        Int32(barrier_id).ir_value(loc=loc, ip=ip),
+        thread_count=Int32(thread_count).ir_value(loc=loc, ip=ip),
+        aligned=False,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @cute.jit
@@ -1228,10 +1241,7 @@ class FlashAttentionDSABackwardSm90:
                     mask_ptr = self._relay_mask_word_ptr(mdKVaccum, m_block, head_idx, batch_idx, kv_row)
                     _wait_lower_relay_ranks(mask_ptr, lower_rank_mask)
         if rank > 0:
-            cute.arch.barrier(
-                barrier_id=int(NamedBarrierBwd.DKVRelay),
-                number_of_threads=self.num_threads_per_warp_group,
-            )
+            _partial_cta_sync(int(NamedBarrierBwd.DKVRelay), self.num_threads_per_warp_group)
 
     @cute.jit
     def release_dkv_relay(
@@ -1249,10 +1259,7 @@ class FlashAttentionDSABackwardSm90:
         """Publish this CTA's dKV updates before a later relay rank acquires them."""
         rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         if rank < self.relay_cluster_size - 1:
-            cute.arch.barrier(
-                barrier_id=int(NamedBarrierBwd.DKVRelay),
-                number_of_threads=self.num_threads_per_warp_group,
-            )
+            _partial_cta_sync(int(NamedBarrierBwd.DKVRelay), self.num_threads_per_warp_group)
         if wg_tidx < self.tile_n and rank < self.relay_cluster_size - 1:
             slot = n_block * self.tile_n + wg_tidx
             if slot < topk:
