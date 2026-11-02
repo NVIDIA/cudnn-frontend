@@ -14,18 +14,14 @@ from pathlib import Path
 
 import pytest
 import torch
+from block_sparse_attention.cutedsl.bsa_utils import import_bsa
 
 pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
 
 @pytest.fixture
 def require_sm100():
-    if torch.cuda.get_device_capability() not in {(10, 0), (10, 3)}:
-        pytest.skip("requires SM100/SM103")
-    from cudnn.block_sparse_attention import _interface
-
-    if _interface._cutlass_dsl_version() < (4, 6, 2):
-        pytest.skip("requires CuTe DSL >= 4.6.2")
+    import_bsa(archs=(100, 103), min_cutedsl=(4, 6, 2), reason="requires SM100/SM103")
 
 
 def quantize_sage_bhsd(*args):

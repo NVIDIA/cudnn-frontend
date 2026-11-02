@@ -9,25 +9,9 @@ import pytest
 import torch
 
 from block_sparse_attention.cutedsl.bsa_reference import attention_reference, block_sparse_mask
+from block_sparse_attention.cutedsl.bsa_utils import import_bsa
 
 pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
-
-
-def _bsa():
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("requires SM100/SM103")
-    from cudnn import BSA
-
-    return BSA
-
-
-def _paired_bsa():
-    """The paired-KV backward exists on SM90 and SM100/SM103."""
-    if torch.cuda.get_device_capability() not in ((9, 0), (10, 0), (10, 3)):
-        pytest.skip("requires SM90 or SM100/SM103")
-    from cudnn import BSA
-
-    return BSA
 
 
 def _force_paired_kv(monkeypatch):
@@ -67,7 +51,7 @@ def test_large_bucket_policy_is_a_valid_choice(num_q_blocks):
 @pytest.mark.parametrize("tensor_index", [0, 1, 2], ids=["q", "k", "v"])
 @pytest.mark.parametrize("splits", [1, 2])
 def test_bshd_sliced_inputs(misalignment, tensor_index, splits):
-    bsa = _bsa()
+    bsa = import_bsa(archs=(100, 103), reason="requires SM100/SM103")
     torch.manual_seed(20260911)
     torch.backends.cuda.matmul.allow_tf32 = False
     inputs = [torch.randn((2, 64, 3, 128), device="cuda", dtype=torch.bfloat16) for _ in range(3)]
@@ -92,7 +76,7 @@ def test_bshd_sliced_inputs(misalignment, tensor_index, splits):
 @pytest.mark.parametrize("clc,splits", [(False, 1), (True, 1), (True, 2)])
 @pytest.mark.parametrize("seqlen", [193, 1089])
 def test_forward_empty_rows_and_partial_tiles(clc, splits, seqlen):
-    bsa = _bsa()
+    bsa = import_bsa(archs=(100, 103), reason="requires SM100/SM103")
     torch.manual_seed(19000 + seqlen)
     torch.backends.cuda.matmul.allow_tf32 = False
     q, k, v = [torch.randn((1, 2, seqlen, 128), device="cuda", dtype=torch.bfloat16) for _ in range(3)]
@@ -123,7 +107,7 @@ def test_forward_empty_rows_and_partial_tiles(clc, splits, seqlen):
 @pytest.mark.parametrize("clc,splits", [(False, 1), (False, 2), (True, 1), (True, 2)])
 @pytest.mark.parametrize("variable", [False, True])
 def test_signed_scale_forward_backward_and_cache(monkeypatch, clc, splits, variable):
-    bsa = _paired_bsa()
+    bsa = import_bsa(archs=(90, 100, 103), reason="requires SM90 or SM100/SM103")
     sm90 = torch.cuda.get_device_capability()[0] == 9
     if sm90 and clc:
         pytest.skip("CLC scheduling is SM100-only")
@@ -179,7 +163,7 @@ def test_signed_scale_forward_backward_and_cache(monkeypatch, clc, splits, varia
 @pytest.mark.parametrize("sq,sk", [(193, 129), (248, 2177), (320, 1088), (513, 1025)])
 @pytest.mark.parametrize("variable", [False, True])
 def test_backward_partial_tiles_and_buckets(layout, sq, sk, variable, monkeypatch):
-    bsa = _bsa()
+    bsa = import_bsa(archs=(100, 103), reason="requires SM100/SM103")
     if variable:
         _force_paired_kv(monkeypatch)
     torch.manual_seed(27000 + sq)
@@ -237,7 +221,7 @@ def test_backward_partial_tiles_and_buckets(layout, sq, sk, variable, monkeypatc
 def test_sage_fp8_rejects_nonpositive_softmax_scale(scale):
     """Sage FP8 folds the softmax scale into its Q*K dequantization scales; a nonpositive scale would turn fully
     masked groups into NaN/+inf, so the public entry point rejects it instead of returning non-finite output."""
-    bsa = _bsa()
+    bsa = import_bsa(archs=(100, 103), reason="requires SM100/SM103")
     q, k, v = [torch.randn((1, 2, 128, 128), device="cuda", dtype=torch.bfloat16) for _ in range(3)]
     indices = torch.zeros((1, 2, 2, 1), device="cuda", dtype=torch.int32)
     with pytest.raises(ValueError, match="softmax_scale must be positive"):
@@ -248,7 +232,7 @@ def test_sage_fp8_rejects_nonpositive_softmax_scale(scale):
 @pytest.mark.parametrize("duplicates", [False, True])
 @pytest.mark.parametrize("kv_blocks", [17, 35])
 def test_paired_multiset_and_graph_replay(monkeypatch, duplicates, kv_blocks):
-    bsa = _paired_bsa()
+    bsa = import_bsa(archs=(90, 100, 103), reason="requires SM90 or SM100/SM103")
     paired_builds = _force_paired_kv(monkeypatch)
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     monkeypatch.setattr(interface._bsa_attn_bwd_bucketed_k2q_csr, "compile_cache", {})
@@ -305,7 +289,7 @@ def test_paired_multiset_and_graph_replay(monkeypatch, duplicates, kv_blocks):
 @pytest.mark.parametrize("sq,sk", [(1024, 1025), (1088, 2177), (2048, 2048)])
 def test_paired_partial_blocks_and_buckets(layout, sq, sk, monkeypatch):
     """Local KV windows give matched pairs real common edges; partial blocks, a KV tail and empty rows mask both halves."""
-    bsa = _paired_bsa()
+    bsa = import_bsa(archs=(90, 100, 103), reason="requires SM90 or SM100/SM103")
     paired_builds = _force_paired_kv(monkeypatch)
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     monkeypatch.setattr(interface._bsa_attn_bwd_bucketed_k2q_csr, "compile_cache", {})
@@ -346,7 +330,7 @@ def test_paired_partial_blocks_and_buckets(layout, sq, sk, monkeypatch):
 
 @pytest.mark.L1
 def test_paired_cache_rebinds_bitset_lengths(monkeypatch):
-    bsa = _paired_bsa()
+    bsa = import_bsa(archs=(90, 100, 103), reason="requires SM90 or SM100/SM103")
     paired_builds = _force_paired_kv(monkeypatch)
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     monkeypatch.setattr(interface._bsa_attn_bwd_bucketed_k2q_csr, "compile_cache", {})
