@@ -320,6 +320,56 @@ def forward(q: Tensor, k: Tensor, v: Tensor, layout: KPageLayout, softmax_scale:
     return out, lse
 
 
+def _bwd_sm90_refined(
+    dout: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    lse: Tensor,
+    layout: KPageLayout,
+    softmax_scale: float,
+    dq: Optional[Tensor],
+    dk: Optional[Tensor],
+    dv: Optional[Tensor],
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """SM90 blk128: the blk64 backward on the refined metadata ([1, B * H, S, D] views).
+
+    Padding Q rows get LSE = +inf, so P and dS vanish on them and their q / do rows take no part, as in the SM100
+    KPage backward; the caller zeroes the padding rows of the gradients.
+    """
+    from cudnn.block_sparse_attention._interface import bsa_attn_bwd
+
+    refined = layout._refined
+    if layout._has_partial_q is not False:
+        lse = lse.masked_fill(layout._pad_q_rows, float("inf"))
+    # resolve_layout admits compact BHSD or BSHD (batch 1) views; run BSHD storage as BSHD instead of copying it.
+    bshd = not q.is_contiguous()
+    swap = (lambda t: None if t is None else t.transpose(1, 2)) if bshd else (lambda t: t)
+    grads = bsa_attn_bwd(
+        *(swap(t) for t in (dout, q, k, v, out)),
+        lse,
+        refined.block_index,
+        refined.block_index.shape[-1],
+        refined.block_sizes,
+        q2k_block_nums=refined.block_count,
+        softmax_scale=softmax_scale,
+        dq=swap(dq),
+        dk=swap(dk),
+        dv=swap(dv),
+        sparse_block_size=64,
+        layout="bshd" if bshd else "bhsd",
+    )
+    result = []
+    for given, got in zip((dq, dk, dv), grads):
+        got = swap(got)
+        if given is not None and given.data_ptr() != got.data_ptr():
+            given.copy_(got)
+            got = given
+        result.append(got)
+    return tuple(result)
+
+
 def backward(
     dout: Tensor,
     q: Tensor,
@@ -336,6 +386,11 @@ def backward(
     """Backward over a prepared layout; dq/dk/dv are exact on valid rows and zero on padding rows."""
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(HEAD_DIM)
+    if layout._refined is not None:
+        dq, dk, dv = _bwd_sm90_refined(dout, q, k, v, out, lse, layout, float(softmax_scale), dq, dk, dv)
+        if layout._has_partial_q is not False or layout._has_partial_kv is not False:
+            zero_pad_rows(dq, dk, dv, layout._q_sizes, layout._kv_sizes)
+        return dq, dk, dv
     dq = torch.empty_like(q) if dq is None else dq
     dk = torch.empty_like(k) if dk is None else dk
     dv = torch.empty_like(v) if dv is None else dv

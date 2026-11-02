@@ -29,12 +29,10 @@ def _require_cutedsl() -> None:
 
 
 def _require_arch(arch: int, sparse_block_size: int) -> None:
-    """KPage runs on SM100/SM103, and on SM90 for the blk64 forward."""
-    if arch // 10 == 10 or (arch // 10 == 9 and sparse_block_size == 64):
+    """KPage runs on SM100/SM103 and SM90."""
+    if arch // 10 in (9, 10):
         return
-    if arch // 10 == 9:
-        raise NotImplementedError("SM90 kpage supports sparse_block_size=64 (forward only)")
-    raise NotImplementedError(f"kpage requires an SM100/SM103 GPU, or SM90 for the blk64 forward; found SM{arch}")
+    raise NotImplementedError(f"kpage requires an SM90 or SM100/SM103 GPU; found SM{arch}")
 
 
 def _normalize_metadata(
@@ -188,11 +186,12 @@ def resolve_layout(
         raise ValueError("the number of query heads must be divisible by the number of KV heads")
     if head_dim != 128:
         raise NotImplementedError("kpage requires head_dim=128")
-    if sparse_block_size == 64:
+    if sparse_block_size == 64 or arch // 10 == 9:
+        path = "blk64" if sparse_block_size == 64 else "SM90 blk128"
         if heads != k.shape[1]:
-            raise NotImplementedError("the blk64 KPage path supports MHA only")
+            raise NotImplementedError(f"the {path} KPage path supports MHA only")
         if seqlen_q % 64 or seqlen_k % 64:
-            raise NotImplementedError("the blk64 KPage path requires seqlen_q and seqlen_k to be multiples of 64")
+            raise NotImplementedError(f"the {path} KPage path requires seqlen_q and seqlen_k to be multiples of 64")
     for name, t in (("q", q), ("k", k), ("v", v), *zip(("do_tensor", "o_tensor", "lse_tensor", "dq_tensor", "dk_tensor", "dv_tensor"), extra)):
         if t is not None:
             folded = _fold(t, name)

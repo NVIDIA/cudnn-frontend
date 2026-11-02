@@ -239,12 +239,7 @@ def test_kpage_blk64_rejects_unsupported_configurations():
     with pytest.raises(ValueError, match="block_sizes"):
         BSA.kpage_prepare_layout(q2k, 2, torch.full((num_blocks,), 100, dtype=torch.int32, device="cuda"), sparse_block_size=BLOCK)
     q2k_128 = torch.tensor([0, 1], dtype=torch.int32, device="cuda").view(1, 1, 1, 2).expand(1, heads, 2, 2).contiguous()
-    if torch.cuda.get_device_capability()[0] == 9:
-        # SM90 runs the blk64 forward only
-        with pytest.raises(NotImplementedError, match="sparse_block_size=64"):
-            BSA.kpage_prepare_layout(q2k_128, 2, torch.full((2,), 128, dtype=torch.int32, device="cuda"))
-    else:
-        # a layout is bound to its sparse_block_size
-        layout_128 = BSA.kpage_prepare_layout(q2k_128, 2, torch.full((2,), 128, dtype=torch.int32, device="cuda"))
-        with pytest.raises(ValueError, match="sparse_block_size"):
-            _run(BSA, q, k, v, q2k, None, bs, kpage=layout_128)
+    # a layout is bound to its sparse_block_size
+    layout_128 = BSA.kpage_prepare_layout(q2k_128, 2, torch.full((2,), 128, dtype=torch.int32, device="cuda"))
+    with pytest.raises(ValueError, match="sparse_block_size"):
+        _run(BSA, q, k, v, q2k, None, bs, kpage=layout_128)

@@ -409,7 +409,7 @@ with forward. Valid tokens occupy the prefix of each physical block; callers
 zero `dout` for padded queries and discard their outputs. SM110 blk128 backward
 still requires `block_sizes=None`.
 
-## KPage (SM100/SM103 blk128, partially occupied blocks)
+## KPage (blk128 on SM100/SM103 and SM90, partially occupied blocks)
 
 `kpage=True` on `block_sparse_attention_forward` and
 `block_sparse_attention_backward` selects a second set of blk128 kernels for
@@ -424,6 +424,17 @@ most 64 valid rows (see `q_block_sizes` below) run on an M64 x N256 kernel,
 the others on M128 x N128. Backward packs K/V pages into owner tiles the same
 way and walks the union of their Q pages with a per-step page-pair mask, so
 `block_sizes` is supported in backward on this path.
+
+On SM90 the same calls run without a separate blk128 KPage kernel. The layout
+rewrites the metadata as 64-row halves: KV block `j` becomes halves `2j`
+(`min(block_sizes[j], 64)` rows) and `2j + 1` (the rest), and Q block `i`
+becomes halves `2i` and `2i + 1` with the same list. Halves without valid
+rows are dropped: a KV half leaves every list, and a Q half (from
+`q_block_sizes`) gets an empty list. The forward runs the SM90 blk64 KPage
+kernel on these halves (described below), where each pair of halves is one
+128-row query block. The backward runs the SM90 blk64 backward on them, with
+`LSE = +inf` on padding query rows so they take no part. The outputs follow
+the same contract as on SM100/SM103.
 
 ```python
 from cudnn.ops import block_sparse_attention_forward, block_sparse_attention_backward, kpage_prepare_layout
@@ -465,6 +476,9 @@ Contract, in addition to the metadata ranges above:
   `block_sizes` is shared across the batch (as on the base SM100 path) and a
   BSHD batch must be 1. `kv_splits`, `use_clc`, and `bucket_size_blocks`
   are not taken; a fixed count may be odd.
+- SM90 differs: MHA only, `seqlen_q` and `seqlen_k` must be multiples of 64
+  (a sequence may end 64 rows into its final block), and `bwd_kv_groups` is
+  not taken.
 - `allow_empty_block_nums` has the base meaning: with `True`, a query block
   with `q2k_block_nums == 0` gets `O = 0`, `LSE = -inf`, and `dQ = 0`; with
   `False` (default) such a block is a metadata error. Backward accepts empty
@@ -490,10 +504,13 @@ compute the same function and differ only in the execution layout.
 
 When to use it: the gain comes from padding (`block_sizes < 128`, and
 `q_block_sizes` for the query side) and grows with the padding fraction
-(1.2-1.3x at 10%, 3.2-3.8x at 59% in `benchmark/bsa`). Without
+(1.2-1.3x at 10%, 3.2-3.8x at 59% in `benchmark/bsa`; on SM90, forward
+1.2-1.4x at 10% and 3.6-3.8x at 59%, forward + backward 1.1-1.2x and
+2.5-2.7x). Without
 padding the page gather costs more than the base kernel's whole-block load,
 so with `block_sizes=None` the base path is faster (measured 0.6x at four
-blocks per row, 0.96x at 128). GQA/MQA run with per-query-head metadata; the
+blocks per row, 0.96x at 128; SM90 forward 0.84-0.91x, backward
+0.98-1.12x). GQA/MQA run with per-query-head metadata; the
 base path's packed GQA is not available here. BSHD inputs are supported but
 the strided page gathers make the forward slower than on BHSD (measured 1.3x
 on a 16-head layout); prefer BHSD. A `seqlen_k` that is not a multiple of 16
@@ -565,6 +582,7 @@ independent top-k selections, run slower than the base kernel.
 | SM100/SM103 | 128, `kpage=True` | BF16 | QK=128, V=128 | MHA, GQA, MQA |
 | SM100/SM103 | 64, `kpage=True` | BF16 | QK=128, V=128 | MHA |
 | SM90 | 64, `kpage=True` | BF16 | QK=128, V=128 | MHA |
+| SM90 | 128, `kpage=True` | BF16 | QK=128, V=128 | MHA |
 | SM120 | 64 | FP16, BF16 | QK=128, V=128 | MHA, GQA, MQA |
 | SM120 | 128 (explicit) | FP16, BF16 | QK=128, V=128 | MHA, GQA, MQA |
 | SM120 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
@@ -591,9 +609,10 @@ blk128 supports empty rows and explicit split-KV; its default remains unsplit.
 | SM100/SM103 | 64 | BF16 | 128 | MHA |
 | SM100/SM103 | 128 | BF16 | 64 or 128 | MHA |
 | SM100/SM103 | 128, `kpage=True` | BF16 | 128 | MHA, GQA, MQA; `block_sizes` supported |
+| SM90 | 128, `kpage=True` | BF16 | 128 | MHA; `block_sizes` supported |
 
 Backward is not implemented for SM120. It requires equal QK/V dimensions and,
-except on the KPage path, does not currently support GQA/MQA.
+except on the SM100/SM103 KPage path, does not currently support GQA/MQA.
 
 SM90 native blk128 requires CuTe DSL >= 4.6.2. Q/K/V, O/dO and gradient
 buffers must have a contiguous head dimension, 16-byte aligned base pointers,

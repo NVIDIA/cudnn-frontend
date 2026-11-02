@@ -822,6 +822,63 @@ class OrderQRouteWork:
             normal_base += chunk_normal
 
 
+class RefineBlk128ToBlk64:
+    """Rewrite each blk128 KV list as the 64-row half blocks that hold valid rows, for both 64-row halves of its Q block.
+
+    KV block ``j`` with ``s`` valid rows becomes half ``2j`` (``min(s, 64)`` rows) and half ``2j + 1`` (``s - 64``
+    rows); a half without valid rows is dropped from the list.  Q half ``2i`` keeps the list when Q block ``i`` has
+    a valid row and half ``2i + 1`` when it has more than 64; otherwise the half gets count 0.  One thread per walk.
+    """
+
+    def __init__(self):
+        self.num_threads = 128
+
+    @cute.jit
+    def __call__(
+        self,
+        mBlockIndex: cute.Tensor,  # [W, cap] int32, W = heads * nQ
+        mBlockCount: cute.Tensor,  # [W]
+        mQSizes: cute.Tensor,  # [nQ]
+        mBlockSizes: cute.Tensor,  # [nKV]
+        mBlockIndex64: cute.Tensor,  # [2W, 2 * cap], zero-initialized
+        mBlockCount64: cute.Tensor,  # [2W]
+        stream: cuda.CUstream,
+    ):
+        grid = ((mBlockCount.shape[0] + self.num_threads - 1) // self.num_threads, 1, 1)
+        self.kernel(mBlockIndex, mBlockCount, mQSizes, mBlockSizes, mBlockIndex64, mBlockCount64).launch(
+            grid=grid, block=(self.num_threads, 1, 1), stream=stream
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mBlockIndex: cute.Tensor,
+        mBlockCount: cute.Tensor,
+        mQSizes: cute.Tensor,
+        mBlockSizes: cute.Tensor,
+        mBlockIndex64: cute.Tensor,
+        mBlockCount64: cute.Tensor,
+    ):
+        walk = cute.arch.block_idx()[0] * self.num_threads + cute.arch.thread_idx()[0]
+        if walk < mBlockCount.shape[0]:
+            n_kv = mBlockSizes.shape[0]
+            count = Int32(0)
+            for e in cutlass.range(mBlockCount[walk], unroll=1):
+                j = mBlockIndex[walk, e]
+                valid = min(max(mBlockSizes[min(max(j, 0), n_kv - 1)], 0), BLOCK)
+                if valid > 0:
+                    mBlockIndex64[2 * walk, count] = 2 * j
+                    mBlockIndex64[2 * walk + 1, count] = 2 * j
+                    count += 1
+                if valid > BLOCK // 2:
+                    mBlockIndex64[2 * walk, count] = 2 * j + 1
+                    mBlockIndex64[2 * walk + 1, count] = 2 * j + 1
+                    count += 1
+            q_valid = mQSizes[walk % mQSizes.shape[0]]
+            mBlockCount64[2 * walk] = count if q_valid > 0 else Int32(0)
+            mBlockCount64[2 * walk + 1] = count if q_valid > BLOCK // 2 else Int32(0)
+
+
 class BwdKvNoStraddlePack:
     """Pack Page16 groups without allowing a group to cross a Page8 tile."""
 
@@ -1783,6 +1840,27 @@ def pair_walk_fill(
 
 
 pair_walk_fill.compile_cache = {}
+
+
+def refine_blk128_to_blk64(
+    block_index: Tensor,
+    block_count: Tensor,
+    q_sizes: Tensor,
+    block_sizes: Tensor,
+    block_index64: Tensor,
+    block_count64: Tensor,
+    stream: cuda.CUstream = None,
+) -> None:
+    _run_metadata_kernel(
+        "kpage_refine_blk128_to_blk64",
+        RefineBlk128ToBlk64(),
+        (block_index, block_count, q_sizes, block_sizes, block_index64, block_count64),
+        refine_blk128_to_blk64.compile_cache,
+        stream,
+    )
+
+
+refine_blk128_to_blk64.compile_cache = {}
 
 
 def order_q_route_work(

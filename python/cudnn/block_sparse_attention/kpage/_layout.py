@@ -11,6 +11,11 @@ backward gradient rows that fall on padding are zero.
 ``sparse_block_size`` is 128 or 64.  The blk64 layout is forward only and its Q
 rows are all valid: on SM100/SM103 it holds the M64 x N256 page walks, one Q
 block per tile; on SM90 the walks of Q block pairs (2p, 2p + 1).
+
+On SM90 a blk128 layout is the blk64 one of the same function: the metadata is
+rewritten as 64-row halves (``_refined``), the forward runs the Q-pair walks of
+those halves (one pair is one 128-row Q block) and the backward runs the blk64
+backward on them.
 """
 
 from __future__ import annotations
@@ -22,7 +27,16 @@ import torch
 from torch import Tensor
 
 from cudnn.block_sparse_attention.csrc.utils.kpage_utils import BLOCK
-from ._build import Blk64ForwardTables, Blk64PairForwardTables, WalkTables, build_pair_walk_tables_blk64, build_walk_tables, build_walk_tables_blk64
+from ._build import (
+    Blk64ForwardTables,
+    Blk64PairForwardTables,
+    Blk64Refinement,
+    WalkTables,
+    build_pair_walk_tables_blk64,
+    build_walk_tables,
+    build_walk_tables_blk64,
+    refine_blk128_to_blk64,
+)
 
 __all__ = ["KPageLayout", "prepare_layout"]
 
@@ -45,13 +59,15 @@ class KPageLayout:
     device: torch.device
     _q_sizes: Tensor  # [nQ] int32
     _kv_sizes: Tensor  # [nKV] int32
-    _tables: Optional[WalkTables]  # None for sparse_block_size == 64
+    _tables: Optional[WalkTables]  # None for sparse_block_size == 64 and on SM90
     _blk64_tables: Optional[Blk64ForwardTables]  # None on SM90
-    _pair_tables: Optional[Blk64PairForwardTables]  # SM90 blk64 only
+    _pair_tables: Optional[Blk64PairForwardTables]  # SM90 only
     _has_partial_q: Optional[bool]  # None when validate=False
     _has_partial_kv: Optional[bool]
     _source: tuple = ()  # identity of the metadata arguments the layout was built from
     sparse_block_size: int = 128
+    _refined: Optional[Blk64Refinement] = None  # SM90 blk128: the blk64 metadata the kernels run on
+    _pad_q_rows: Optional[Tensor] = None  # SM90 blk128: [seqlen_q] bool, the padding Q rows
 
     def __repr__(self) -> str:
         return (
@@ -63,7 +79,8 @@ class KPageLayout:
         """Build the backward tables now instead of on the first backward call."""
         if self.sparse_block_size != 128:
             raise NotImplementedError("the KPage backward is available for sparse_block_size=128 only")
-        self._tables.resolve_bwd_tables()
+        if self._tables is not None:  # SM90 runs the blk64 backward on the refined metadata, built with the layout
+            self._tables.resolve_bwd_tables()
 
 
 def _validate_metadata(
@@ -179,8 +196,10 @@ def prepare_layout(
     for name, seqlen, n in (("seqlen_q", seqlen_q, nQ), ("seqlen_k", seqlen_k, kv_sizes.numel())):
         if not (n - 1) * block < seqlen <= n * block:
             raise ValueError(f"{name} = {seqlen} does not fit the {n} blocks of the metadata")
-    if block == 64 and (seqlen_q % block or seqlen_k % block):
-        raise NotImplementedError("the blk64 KPage path requires seqlen_q and seqlen_k to be multiples of 64")
+    sm90 = torch.cuda.get_device_capability(idx.device)[0] == 9
+    if (block == 64 or sm90) and (seqlen_q % 64 or seqlen_k % 64):
+        path = "blk64" if block == 64 else "SM90 blk128"
+        raise NotImplementedError(f"the {path} KPage path requires seqlen_q and seqlen_k to be multiples of 64")
     if seqlen_q % block:  # device-side clamp of the final block: no host-device copy, no sync
         q_sizes = q_sizes.clone()
         q_sizes[-1:].clamp_(max=seqlen_q % block)
@@ -188,11 +207,20 @@ def prepare_layout(
         kv_sizes = kv_sizes.clone()
         kv_sizes[-1:].clamp_(max=seqlen_k % block)
     partial_q, partial_kv = _validate_metadata(idx, cnt, q_sizes, kv_sizes, allow_empty_block_nums, block) if validate else (None, None)
-    pair_tables = None
-    if block == 64:
+    pair_tables = refined = pad_q_rows = None
+    if block == 128 and sm90:
+        if bwd_kv_groups is not None:
+            raise NotImplementedError("bwd_kv_groups is specific to the SM100/SM103 KPage backward")
+        # The 64-row halves of the blk128 metadata, padding halves dropped; the pair walks of one 128-row Q block.
+        refined = refine_blk128_to_blk64(idx, cnt, q_sizes, kv_sizes, seqlen_q, seqlen_k)
+        pair_tables = build_pair_walk_tables_blk64(refined.block_index, refined.block_count, refined.block_sizes)
+        tables = blk64_tables = None
+        rows = torch.arange(seqlen_q, device=idx.device, dtype=torch.int32)
+        pad_q_rows = rows % block >= q_sizes.repeat_interleave(block)[:seqlen_q]
+    elif block == 64:
         # Forward only, every Q row valid: SM90 walks Q block pairs, SM100/SM103 the M64 x N256 walks of one Q block.
         tables = blk64_tables = None
-        if torch.cuda.get_device_capability(idx.device)[0] == 9:
+        if sm90:
             pair_tables = build_pair_walk_tables_blk64(idx, cnt, kv_sizes)
         else:
             blk64_tables = build_walk_tables_blk64(idx, cnt, kv_sizes)
@@ -216,4 +244,6 @@ def prepare_layout(
         _has_partial_kv=partial_kv if seqlen_k % block == 0 else True,
         _source=source,
         sparse_block_size=block,
+        _refined=refined,
+        _pad_q_rows=pad_q_rows,
     )

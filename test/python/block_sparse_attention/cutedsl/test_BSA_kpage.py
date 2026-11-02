@@ -25,8 +25,8 @@ def _import_bsa():
     if not torch.cuda.is_available():
         pytest.skip("block sparse attention tests require CUDA")
     major, _ = torch.cuda.get_device_capability()
-    if major != 10:
-        pytest.skip("kpage is specific to SM100/SM103")
+    if major not in (9, 10):
+        pytest.skip("the blk128 KPage path runs on SM90 and SM100/SM103")
     try:
         from cudnn import BSA
 
@@ -39,6 +39,10 @@ def _import_bsa():
     if _cutlass_dsl_version() < KPAGE_MIN_CUTEDSL:
         pytest.skip(f"kpage requires nvidia-cutlass-dsl>={'.'.join(map(str, KPAGE_MIN_CUTEDSL))}")
     return BSA
+
+
+def _is_sm90() -> bool:
+    return torch.cuda.get_device_capability()[0] == 9
 
 
 def _valid_rows(block_sizes: torch.Tensor) -> torch.Tensor:
@@ -100,14 +104,16 @@ def test_kpage_q_padding_matches_reference(block_sizes, pad_fill):
     o_ref, lse_ref, dq_ref, dk_ref, dv_ref = attention_backward_reference(q, k, v, do_ref, mask)
 
     layout = BSA.kpage_prepare_layout(q2k, None, bs, nums, q_block_sizes=bs)
-    forward = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, kpage=layout)
+    forward = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, kpage=layout, sparse_block_size=BLOCK)
     _check(forward["o_tensor"], o_ref, valid, tol=2e-2)
     torch.testing.assert_close(forward["lse_tensor"][0, :, valid], lse_ref[0, :, valid], atol=1e-3, rtol=1e-3)
     # same K masking on the valid query rows as the base kernel
-    base = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums)
+    base = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, sparse_block_size=BLOCK)
     torch.testing.assert_close(forward["o_tensor"][0, :, valid].float(), base["o_tensor"][0, :, valid].float(), atol=2e-2, rtol=2e-2)
 
-    backward = BSA.block_sparse_attention_backward(do, q, k, v, forward["o_tensor"], forward["lse_tensor"], q2k, None, bs, nums, kpage=layout)
+    backward = BSA.block_sparse_attention_backward(
+        do, q, k, v, forward["o_tensor"], forward["lse_tensor"], q2k, None, bs, nums, kpage=layout, sparse_block_size=BLOCK
+    )
     _check(backward["dq_tensor"], dq_ref, valid, tol=3e-2)
     _check(backward["dk_tensor"], dk_ref, valid, tol=3e-2)
     _check(backward["dv_tensor"], dv_ref, valid, tol=3e-2)
@@ -139,14 +145,16 @@ def test_kpage_bsa_semantics_matches_base_kernel(seqlen_q_blocks, kv_block_sizes
     mask = block_sparse_mask(q2k, 0, bs, seqlen_q, seqlen_k, BLOCK, q2k_block_nums=nums)
     o_ref, lse_ref, dq_ref, dk_ref, dv_ref = attention_backward_reference(q, k, v, do, mask)
 
-    forward = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, kpage=True)
-    base = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums)
+    forward = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, kpage=True, sparse_block_size=BLOCK)
+    base = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, sparse_block_size=BLOCK)
     torch.testing.assert_close(forward["o_tensor"].float(), base["o_tensor"].float(), atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(forward["lse_tensor"], base["lse_tensor"], atol=1e-3, rtol=1e-3)
     torch.testing.assert_close(forward["o_tensor"].float(), o_ref, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(forward["lse_tensor"], lse_ref, atol=1e-3, rtol=1e-3)
 
-    backward = BSA.block_sparse_attention_backward(do, q, k, v, forward["o_tensor"], forward["lse_tensor"], q2k, None, bs, nums, kpage=True)
+    backward = BSA.block_sparse_attention_backward(
+        do, q, k, v, forward["o_tensor"], forward["lse_tensor"], q2k, None, bs, nums, kpage=True, sparse_block_size=BLOCK
+    )
     torch.testing.assert_close(backward["dq_tensor"].float(), dq_ref, atol=3e-2, rtol=3e-2)
     _check(backward["dk_tensor"], dk_ref, kv_valid, tol=3e-2)
     _check(backward["dv_tensor"], dv_ref, kv_valid, tol=3e-2)
@@ -178,12 +186,12 @@ def test_kpage_softmax_scale_sign_with_partial_blocks(softmax_scale, route):
     mask = block_sparse_mask(q2k, num_blocks, bs, seqlen, seqlen, BLOCK)
     o_ref, lse_ref, dq_ref, dk_ref, dv_ref = attention_backward_reference(q, k, v, do, mask, softmax_scale=softmax_scale)
 
-    forward = BSA.block_sparse_attention_forward(q, k, v, q2k, num_blocks, bs, kpage=layout, softmax_scale=softmax_scale)
+    forward = BSA.block_sparse_attention_forward(q, k, v, q2k, num_blocks, bs, kpage=layout, softmax_scale=softmax_scale, sparse_block_size=BLOCK)
     _check(forward["o_tensor"], o_ref, q_valid, tol=2e-2)
     torch.testing.assert_close(forward["lse_tensor"][0, :, q_valid], lse_ref[0, :, q_valid], atol=1e-3, rtol=1e-3)
 
     backward = BSA.block_sparse_attention_backward(
-        do, q, k, v, forward["o_tensor"], forward["lse_tensor"], q2k, num_blocks, bs, kpage=layout, softmax_scale=softmax_scale
+        do, q, k, v, forward["o_tensor"], forward["lse_tensor"], q2k, num_blocks, bs, kpage=layout, softmax_scale=softmax_scale, sparse_block_size=BLOCK
     )
     _check(backward["dq_tensor"], dq_ref, q_valid, tol=3e-2)
     _check(backward["dk_tensor"], dk_ref, kv_valid, tol=3e-2)
@@ -204,11 +212,25 @@ def test_kpage_layout_reuse_and_preallocated_outputs():
         q, k, v, do = _inputs(heads, bs)
         mask = block_sparse_mask(q2k, 0, bs, num_blocks * BLOCK, num_blocks * BLOCK, BLOCK, q2k_block_nums=nums)
         o_ref, _, dq_ref, dk_ref, dv_ref = attention_backward_reference(q, k, v, do, mask)
-        forward = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, kpage=layout)
+        forward = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, kpage=layout, sparse_block_size=BLOCK)
         _check(forward["o_tensor"], o_ref, valid, tol=2e-2)
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         backward = BSA.block_sparse_attention_backward(
-            do, q, k, v, forward["o_tensor"], forward["lse_tensor"], q2k, None, bs, nums, dq_tensor=dq, dk_tensor=dk, dv_tensor=dv, kpage=layout
+            do,
+            q,
+            k,
+            v,
+            forward["o_tensor"],
+            forward["lse_tensor"],
+            q2k,
+            None,
+            bs,
+            nums,
+            dq_tensor=dq,
+            dk_tensor=dk,
+            dv_tensor=dv,
+            kpage=layout,
+            sparse_block_size=BLOCK,
         )
         assert backward["dq_tensor"].data_ptr() == dq.data_ptr()
         assert backward["dk_tensor"].data_ptr() == dk.data_ptr()
@@ -232,9 +254,9 @@ def test_kpage_fixed_count_full_blocks_matches_base_kernel(softmax_scale, block_
     v = torch.randn_like(q)
     selected = torch.tensor([0, 2, 3], dtype=torch.int32, device="cuda")
     q2k = selected.view(1, 1, 1, 3).expand(1, heads, num_blocks, 3).contiguous()
-    paged = BSA.block_sparse_attention_forward(q, k, v, q2k, block_sparse_num, None, softmax_scale=softmax_scale, kpage=True)
+    paged = BSA.block_sparse_attention_forward(q, k, v, q2k, block_sparse_num, None, softmax_scale=softmax_scale, kpage=True, sparse_block_size=BLOCK)
     if block_sparse_num % 2 == 0:
-        base = BSA.block_sparse_attention_forward(q, k, v, q2k, block_sparse_num, None, softmax_scale=softmax_scale)
+        base = BSA.block_sparse_attention_forward(q, k, v, q2k, block_sparse_num, None, softmax_scale=softmax_scale, sparse_block_size=BLOCK)
         torch.testing.assert_close(paged["o_tensor"].float(), base["o_tensor"].float(), atol=1e-2, rtol=1e-2)
         torch.testing.assert_close(paged["lse_tensor"], base["lse_tensor"], atol=1e-3, rtol=1e-3)
     bs = torch.full((num_blocks,), BLOCK, dtype=torch.int32, device="cuda")
@@ -256,23 +278,23 @@ def test_kpage_rejects_unsupported_configurations():
     bs = torch.full((num_blocks,), BLOCK, dtype=torch.int32, device="cuda")
 
     with pytest.raises(NotImplementedError, match="contiguous q2k_block_index"):
-        BSA.block_sparse_attention_forward(q, k, v, q2k.transpose(2, 3).contiguous().transpose(2, 3), 2, bs, kpage=True)
+        BSA.block_sparse_attention_forward(q, k, v, q2k.transpose(2, 3).contiguous().transpose(2, 3), 2, bs, kpage=True, sparse_block_size=BLOCK)
     q2, k2, v2 = (torch.randn((2, seqlen, heads, 128), device="cuda", dtype=torch.bfloat16) for _ in range(3))
     with pytest.raises(NotImplementedError, match="BSHD batch > 1"):
-        BSA.block_sparse_attention_forward(q2, k2, v2, q2k.expand(2, -1, -1, -1).contiguous(), 2, bs, layout="bshd", kpage=True)
+        BSA.block_sparse_attention_forward(q2, k2, v2, q2k.expand(2, -1, -1, -1).contiguous(), 2, bs, layout="bshd", kpage=True, sparse_block_size=BLOCK)
     with pytest.raises(NotImplementedError, match="BF16"):
-        BSA.block_sparse_attention_forward(q.half(), k.half(), v.half(), q2k, 2, bs, kpage=True)
+        BSA.block_sparse_attention_forward(q.half(), k.half(), v.half(), q2k, 2, bs, kpage=True, sparse_block_size=BLOCK)
     with pytest.raises(ValueError, match="q_block_sizes"):
         BSA.kpage_prepare_layout(q2k, 2, bs, q_block_sizes=bs[:2])
     with pytest.raises(ValueError, match="seqlen_k"):
         BSA.kpage_prepare_layout(q2k, 2, bs, seqlen_k=2 * BLOCK)
     k_strided = torch.randn((1, heads, seqlen, 256), device="cuda", dtype=torch.bfloat16)[..., :128]
     with pytest.raises(NotImplementedError, match="compact"):
-        BSA.block_sparse_attention_forward(q, k_strided, v, q2k, 2, bs, kpage=True)
+        BSA.block_sparse_attention_forward(q, k_strided, v, q2k, 2, bs, kpage=True, sparse_block_size=BLOCK)
     with pytest.raises(NotImplementedError, match="pack_gqa"):
-        BSA.block_sparse_attention_forward(q, k, v, q2k, 2, bs, kv_splits=2, kpage=True)
+        BSA.block_sparse_attention_forward(q, k, v, q2k, 2, bs, kv_splits=2, kpage=True, sparse_block_size=BLOCK)
     with pytest.raises(TypeError, match="kpage must be"):
-        BSA.block_sparse_attention_forward(q, k, v, q2k, 2, bs, kpage="yes")
+        BSA.block_sparse_attention_forward(q, k, v, q2k, 2, bs, kpage="yes", sparse_block_size=BLOCK)
 
     # metadata contract: duplicate ids, out-of-range ids, empty rows, bad block_sizes
     dup = torch.tensor([1, 1], dtype=torch.int32, device="cuda").view(1, 1, 1, 2).expand(1, heads, num_blocks, 2).contiguous()
@@ -286,7 +308,7 @@ def test_kpage_rejects_unsupported_configurations():
     with pytest.raises(ValueError, match="at least one KV block"):
         BSA.kpage_prepare_layout(q2k, None, bs, nums)
     with pytest.raises(ValueError, match="at least one KV block"):
-        BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, kpage=True)
+        BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, kpage=True, sparse_block_size=BLOCK)
     nums[0, 0, 1] = -1
     with pytest.raises(ValueError, match="at least one KV block"):
         BSA.kpage_prepare_layout(q2k, None, bs, nums, allow_empty_block_nums=True)
@@ -296,16 +318,16 @@ def test_kpage_rejects_unsupported_configurations():
     # a layout built for another problem, or from other metadata tensors, is rejected
     other = BSA.kpage_prepare_layout(q2k[:, :1], 2, bs)
     with pytest.raises(ValueError, match="heads"):
-        BSA.block_sparse_attention_forward(q, k, v, q2k, 2, bs, kpage=other)
+        BSA.block_sparse_attention_forward(q, k, v, q2k, 2, bs, kpage=other, sparse_block_size=BLOCK)
     with pytest.raises(ValueError, match="key tokens"):
         BSA.block_sparse_attention_forward(
-            q, k[:, :, :BLOCK].contiguous(), v[:, :, :BLOCK].contiguous(), q2k, 2, bs[:1], kpage=BSA.kpage_prepare_layout(q2k, 2, bs)
+            q, k[:, :, :BLOCK].contiguous(), v[:, :, :BLOCK].contiguous(), q2k, 2, bs[:1], kpage=BSA.kpage_prepare_layout(q2k, 2, bs), sparse_block_size=BLOCK
         )
     layout = BSA.kpage_prepare_layout(q2k, 2, bs)
     with pytest.raises(ValueError, match="different sparse metadata"):
-        BSA.block_sparse_attention_forward(q, k, v, q2k.clone(), 2, bs, kpage=layout)
+        BSA.block_sparse_attention_forward(q, k, v, q2k.clone(), 2, bs, kpage=layout, sparse_block_size=BLOCK)
     with pytest.raises(ValueError, match="different sparse metadata"):
-        BSA.block_sparse_attention_forward(q, k, v, q2k, 2, None, kpage=layout)
+        BSA.block_sparse_attention_forward(q, k, v, q2k, 2, None, kpage=layout, sparse_block_size=BLOCK)
 
 
 @pytest.mark.L0
@@ -320,16 +342,18 @@ def test_kpage_bshd_layout_matches_bhsd():
     q2k, nums = _random_metadata(heads, num_blocks, kmax=3)
     layout = BSA.kpage_prepare_layout(q2k, None, bs, nums, q_block_sizes=bs, with_backward=True)
 
-    ref_fwd = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, kpage=layout)
-    ref_bwd = BSA.block_sparse_attention_backward(do, q, k, v, ref_fwd["o_tensor"], ref_fwd["lse_tensor"], q2k, None, bs, nums, kpage=layout)
+    ref_fwd = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, kpage=layout, sparse_block_size=BLOCK)
+    ref_bwd = BSA.block_sparse_attention_backward(
+        do, q, k, v, ref_fwd["o_tensor"], ref_fwd["lse_tensor"], q2k, None, bs, nums, kpage=layout, sparse_block_size=BLOCK
+    )
 
     q_s, k_s, v_s, do_s = (t.transpose(1, 2).contiguous() for t in (q, k, v, do))
-    fwd = BSA.block_sparse_attention_forward(q_s, k_s, v_s, q2k, None, bs, nums, layout="bshd", kpage=layout)
+    fwd = BSA.block_sparse_attention_forward(q_s, k_s, v_s, q2k, None, bs, nums, layout="bshd", kpage=layout, sparse_block_size=BLOCK)
     assert fwd["o_tensor"].shape == q_s.shape and fwd["o_tensor"].is_contiguous() and fwd["lse_tensor"].shape == (1, heads, seqlen)
     assert torch.equal(fwd["o_tensor"].transpose(1, 2), ref_fwd["o_tensor"]) and torch.equal(fwd["lse_tensor"], ref_fwd["lse_tensor"])
     dq_s = torch.empty_like(q_s)
     bwd = BSA.block_sparse_attention_backward(
-        do_s, q_s, k_s, v_s, fwd["o_tensor"], fwd["lse_tensor"], q2k, None, bs, nums, layout="bshd", kpage=layout, dq_tensor=dq_s
+        do_s, q_s, k_s, v_s, fwd["o_tensor"], fwd["lse_tensor"], q2k, None, bs, nums, layout="bshd", kpage=layout, dq_tensor=dq_s, sparse_block_size=BLOCK
     )
     assert bwd["dq_tensor"] is dq_s and bwd["dk_tensor"].is_contiguous()
     for name in ("dq_tensor", "dk_tensor", "dv_tensor"):
@@ -348,6 +372,8 @@ def test_kpage_seqlen_not_multiple_of_128(with_block_sizes, seqlen_q):
     differ from ceil(seqlen_q / 64) unless the scheduler takes the stride from the metadata.
     """
     BSA = _import_bsa()
+    if _is_sm90():
+        pytest.skip("SM90 KPage takes sequences that are multiples of 64 (test_kpage_sm90_sequences_of_64_row_multiples)")
     heads, seqlen_k = 2, 700  # 5 + 60 rows on the key side
     nq, nk = (seqlen_q + BLOCK - 1) // BLOCK, (seqlen_k + BLOCK - 1) // BLOCK
     q, do = (torch.randn((1, heads, seqlen_q, 128), device="cuda", dtype=torch.bfloat16) for _ in range(2))
@@ -359,8 +385,8 @@ def test_kpage_seqlen_not_multiple_of_128(with_block_sizes, seqlen_q):
     bs_eff[-1] = min(int(bs_eff[-1]), seqlen_k % BLOCK)
     kv_valid = _valid_rows(bs_eff)[:seqlen_k]
 
-    forward = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, kpage=True)
-    base = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs_eff, nums)
+    forward = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, kpage=True, sparse_block_size=BLOCK)
+    base = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs_eff, nums, sparse_block_size=BLOCK)
     assert forward["o_tensor"].shape == q.shape and forward["lse_tensor"].shape == (1, heads, seqlen_q)
     torch.testing.assert_close(forward["o_tensor"].float(), base["o_tensor"].float(), atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(forward["lse_tensor"], base["lse_tensor"], atol=1e-3, rtol=1e-3)
@@ -369,13 +395,15 @@ def test_kpage_seqlen_not_multiple_of_128(with_block_sizes, seqlen_q):
     o_ref, _, dq_ref, dk_ref, dv_ref = attention_backward_reference(q, k, v, do, mask)
     torch.testing.assert_close(forward["o_tensor"].float(), o_ref, atol=2e-2, rtol=2e-2)
     layout = BSA.kpage_prepare_layout(q2k, None, bs, nums, seqlen_q=seqlen_q, seqlen_k=seqlen_k, with_backward=True)
-    backward = BSA.block_sparse_attention_backward(do, q, k, v, forward["o_tensor"], forward["lse_tensor"], q2k, None, bs, nums, kpage=layout)
+    backward = BSA.block_sparse_attention_backward(
+        do, q, k, v, forward["o_tensor"], forward["lse_tensor"], q2k, None, bs, nums, kpage=layout, sparse_block_size=BLOCK
+    )
     assert backward["dq_tensor"].shape == q.shape and backward["dk_tensor"].shape == k.shape
     torch.testing.assert_close(backward["dq_tensor"].float(), dq_ref, atol=3e-2, rtol=3e-2)
     _check(backward["dk_tensor"], dk_ref, kv_valid, tol=3e-2)
     _check(backward["dv_tensor"], dv_ref, kv_valid, tol=3e-2)
     with pytest.raises(ValueError, match="key tokens"):  # a layout built for the padded length does not fit the shorter tensors
-        BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, kpage=BSA.kpage_prepare_layout(q2k, None, bs, nums))
+        BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, kpage=BSA.kpage_prepare_layout(q2k, None, bs, nums), sparse_block_size=BLOCK)
 
 
 @pytest.mark.L0
@@ -398,8 +426,10 @@ def test_kpage_empty_query_blocks():
     with pytest.raises(ValueError, match="at least one KV block"):
         BSA.kpage_prepare_layout(q2k, None, bs, nums, q_block_sizes=bs)
     layout = BSA.kpage_prepare_layout(q2k, None, bs, nums, q_block_sizes=bs, allow_empty_block_nums=True)
-    forward = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, kpage=layout, allow_empty_block_nums=True)
-    backward = BSA.block_sparse_attention_backward(do, q, k, v, forward["o_tensor"], forward["lse_tensor"], q2k, None, bs, nums, kpage=layout)
+    forward = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, kpage=layout, allow_empty_block_nums=True, sparse_block_size=BLOCK)
+    backward = BSA.block_sparse_attention_backward(
+        do, q, k, v, forward["o_tensor"], forward["lse_tensor"], q2k, None, bs, nums, kpage=layout, sparse_block_size=BLOCK
+    )
 
     # The reference cannot take an all-masked row; give empty rows a dense row with dO = 0 (no dK/dV contribution).
     mask = block_sparse_mask(q2k, 0, bs, seqlen, seqlen, BLOCK, q2k_block_nums=nums)
@@ -441,8 +471,8 @@ def test_kpage_empty_query_blocks_ignore_stale_tmem():
     poison = torch.full_like(q, float("nan"))
     full_sizes, full_nums = torch.full_like(bs, BLOCK), torch.full_like(nums, 3)
     for _ in range(4):
-        BSA.block_sparse_attention_forward(poison, poison, poison, q2k, None, full_sizes, full_nums)
-    forward = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, kpage=layout, allow_empty_block_nums=True)
+        BSA.block_sparse_attention_forward(poison, poison, poison, q2k, None, full_sizes, full_nums, sparse_block_size=BLOCK)
+    forward = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, kpage=layout, allow_empty_block_nums=True, sparse_block_size=BLOCK)
     o, lse = forward["o_tensor"][0], forward["lse_tensor"][0]
     assert torch.equal(o[empty], torch.zeros_like(o[empty]))
     assert torch.equal(lse[empty], torch.full_like(lse[empty], -float("inf")))
@@ -462,8 +492,10 @@ def test_kpage_backward_accepts_base_forward_output():
     mask = block_sparse_mask(q2k, 0, bs, seqlen, seqlen, BLOCK, q2k_block_nums=nums)
     _, _, dq_ref, dk_ref, dv_ref = attention_backward_reference(q, k, v, do, mask)
     layout = BSA.kpage_prepare_layout(q2k, None, bs, nums, with_backward=True)
-    base = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums)
-    backward = BSA.block_sparse_attention_backward(do, q, k, v, base["o_tensor"], base["lse_tensor"], q2k, None, bs, nums, kpage=layout)
+    base = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, sparse_block_size=BLOCK)
+    backward = BSA.block_sparse_attention_backward(
+        do, q, k, v, base["o_tensor"], base["lse_tensor"], q2k, None, bs, nums, kpage=layout, sparse_block_size=BLOCK
+    )
     valid = _valid_rows(bs)
     _check(backward["dq_tensor"], dq_ref, valid, tol=3e-2)
     _check(backward["dk_tensor"], dk_ref, valid, tol=3e-2)
@@ -482,18 +514,23 @@ def test_kpage_compile_cache_is_shape_independent():
         q, k, v, do = _inputs(heads, bs)
         q2k, nums = _random_metadata(heads, bs.numel(), kmax=3)
         layout = BSA.kpage_prepare_layout(q2k, None, bs, nums, q_block_sizes=bs)
-        fwd = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, kpage=layout)
-        BSA.block_sparse_attention_backward(do, q, k, v, fwd["o_tensor"], fwd["lse_tensor"], q2k, None, bs, nums, kpage=layout)
+        fwd = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, kpage=layout, sparse_block_size=BLOCK)
+        BSA.block_sparse_attention_backward(do, q, k, v, fwd["o_tensor"], fwd["lse_tensor"], q2k, None, bs, nums, kpage=layout, sparse_block_size=BLOCK)
 
     def run_tail(heads, seqlen_q, seqlen_k):
         q, do = (torch.randn((1, heads, seqlen_q, 128), device="cuda", dtype=torch.bfloat16) for _ in range(2))
         k, v = (torch.randn((1, heads, seqlen_k, 128), device="cuda", dtype=torch.bfloat16) for _ in range(2))
         nq, nk = (seqlen_q + BLOCK - 1) // BLOCK, (seqlen_k + BLOCK - 1) // BLOCK
         q2k = torch.stack([torch.randperm(nk, device="cuda")[:2] for _ in range(heads * nq)]).view(1, heads, nq, 2).to(torch.int32)
-        fwd = BSA.block_sparse_attention_forward(q, k, v, q2k, 2, None, kpage=True)
-        BSA.block_sparse_attention_backward(do, q, k, v, fwd["o_tensor"], fwd["lse_tensor"], q2k, 2, None, kpage=True)
+        fwd = BSA.block_sparse_attention_forward(q, k, v, q2k, 2, None, kpage=True, sparse_block_size=BLOCK)
+        BSA.block_sparse_attention_backward(do, q, k, v, fwd["o_tensor"], fwd["lse_tensor"], q2k, 2, None, kpage=True, sparse_block_size=BLOCK)
 
-    caches = [_interface._fwd_m128.compile_cache, _interface._fwd_m64.compile_cache, _interface._bwd_paged_kv.compile_cache]
+    caches = [
+        _interface._fwd_m128.compile_cache,
+        _interface._fwd_m64.compile_cache,
+        _interface._bwd_paged_kv.compile_cache,
+        _interface._fwd_sm90_pairs.compile_cache,
+    ]
     caches += [getattr(_build_kernels, name).compile_cache for name in dir(_build_kernels) if hasattr(getattr(_build_kernels, name), "compile_cache")]
     run(2, [128, 40, 64, 7])
     sizes = [len(c) for c in caches]
@@ -502,10 +539,10 @@ def test_kpage_compile_cache_is_shape_independent():
     # A K/V length that ends inside a 16-row page selects the row-extent forward descriptors: at most one
     # more forward compile (none if an earlier test compiled it), shared by every such length; the
     # backward is not specialized on it.
-    run_tail(2, 1000, 700)
+    run_tail(2, 960, 704) if _is_sm90() else run_tail(2, 1000, 700)  # SM90 takes multiples of 64
     sizes_tail = [len(c) for c in caches]
     assert sizes[0] <= sizes_tail[0] <= sizes[0] + 1 and sizes_tail[1:] == sizes[1:]
-    run_tail(3, 1500, 900)
+    run_tail(3, 1472, 896) if _is_sm90() else run_tail(3, 1500, 900)
     assert [len(c) for c in caches] == sizes_tail
 
 
@@ -526,8 +563,10 @@ def test_kpage_batched_matches_per_sample_reference():
     )
     nums = torch.randint(1, 4, (batch, heads, num_blocks), device="cuda", dtype=torch.int32)
     layout = BSA.kpage_prepare_layout(q2k, None, bs, nums, q_block_sizes=bs)
-    forward = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, kpage=layout)
-    backward = BSA.block_sparse_attention_backward(do, q, k, v, forward["o_tensor"], forward["lse_tensor"], q2k, None, bs, nums, kpage=layout)
+    forward = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, kpage=layout, sparse_block_size=BLOCK)
+    backward = BSA.block_sparse_attention_backward(
+        do, q, k, v, forward["o_tensor"], forward["lse_tensor"], q2k, None, bs, nums, kpage=layout, sparse_block_size=BLOCK
+    )
     assert forward["o_tensor"].shape == q.shape and forward["lse_tensor"].shape == (batch, heads, seqlen)
     do_ref = do.clone()
     do_ref[:, :, ~valid] = 0
@@ -547,6 +586,8 @@ def test_kpage_batched_matches_per_sample_reference():
 def test_kpage_gqa_forward_backward(batch, heads_kv):
     """GQA/MQA: the q heads of one kv head read the same K/V pages and sum into one dK/dV."""
     BSA = _import_bsa()
+    if _is_sm90():
+        pytest.skip("SM90 KPage is MHA only (test_kpage_sm90_sequences_of_64_row_multiples checks the error)")
     heads, num_blocks = 4, 6
     group = heads // heads_kv
     seqlen = num_blocks * BLOCK
@@ -562,8 +603,10 @@ def test_kpage_gqa_forward_backward(batch, heads_kv):
     nums = torch.randint(1, 4, (batch, heads, num_blocks), device="cuda", dtype=torch.int32)
 
     layout = BSA.kpage_prepare_layout(q2k, None, bs, nums, q_block_sizes=bs)
-    forward = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, kpage=layout)
-    backward = BSA.block_sparse_attention_backward(do, q, k, v, forward["o_tensor"], forward["lse_tensor"], q2k, None, bs, nums, kpage=layout)
+    forward = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, kpage=layout, sparse_block_size=BLOCK)
+    backward = BSA.block_sparse_attention_backward(
+        do, q, k, v, forward["o_tensor"], forward["lse_tensor"], q2k, None, bs, nums, kpage=layout, sparse_block_size=BLOCK
+    )
     assert backward["dk_tensor"].shape == k.shape and backward["dv_tensor"].shape == v.shape
     do_ref = do.clone()
     do_ref[:, :, ~valid] = 0
@@ -579,3 +622,50 @@ def test_kpage_gqa_forward_backward(batch, heads_kv):
         _check(backward["dq_tensor"][sl], q_ref.grad, valid, tol=3e-2)
         _check(backward["dk_tensor"][sl], k_ref.grad, valid, tol=3e-2)
         _check(backward["dv_tensor"][sl], v_ref.grad, valid, tol=3e-2)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=21)
+@pytest.mark.parametrize("with_block_sizes", [False, True])
+def test_kpage_sm90_sequences_of_64_row_multiples(with_block_sizes):
+    """SM90 runs blk128 KPage on the metadata's 64-row halves: a sequence may end halfway into its final block.
+
+    Sequences that are not multiples of 64 and GQA are rejected on SM90.
+    """
+    BSA = _import_bsa()
+    if not _is_sm90():
+        pytest.skip("SM90-specific contract")
+    heads, seqlen_q, seqlen_k = 2, 960, 704  # 7 blocks + 64 rows; 5 blocks + 64 rows
+    nq, nk = (seqlen_q + BLOCK - 1) // BLOCK, (seqlen_k + BLOCK - 1) // BLOCK
+    q, do = (torch.randn((1, heads, seqlen_q, 128), device="cuda", dtype=torch.bfloat16) for _ in range(2))
+    k, v = (torch.randn((1, heads, seqlen_k, 128), device="cuda", dtype=torch.bfloat16) for _ in range(2))
+    q2k = torch.stack([torch.randperm(nk, device="cuda")[:3] for _ in range(heads * nq)]).view(1, heads, nq, 3).to(torch.int32)
+    nums = torch.randint(1, 4, (1, heads, nq), device="cuda", dtype=torch.int32)
+    bs = torch.tensor([128, 40, 128, 7, 128, 128], dtype=torch.int32, device="cuda") if with_block_sizes else None  # last entry exceeds the 64-row tail
+    bs_eff = torch.full((nk,), BLOCK, dtype=torch.int32, device="cuda") if bs is None else bs.clone()
+    bs_eff[-1] = min(int(bs_eff[-1]), seqlen_k % BLOCK)
+    kv_valid = _valid_rows(bs_eff)[:seqlen_k]
+    k[0, :, ~kv_valid] = v[0, :, ~kv_valid] = 1000.0
+
+    mask = block_sparse_mask(q2k, 0, bs_eff, seqlen_q, seqlen_k, BLOCK, q2k_block_nums=nums)
+    o_ref, lse_ref, dq_ref, dk_ref, dv_ref = attention_backward_reference(q, k, v, do, mask)
+    forward = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, kpage=True, sparse_block_size=BLOCK)
+    torch.testing.assert_close(forward["o_tensor"].float(), o_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(forward["lse_tensor"], lse_ref, atol=1e-3, rtol=1e-3)
+    layout = BSA.kpage_prepare_layout(q2k, None, bs, nums, seqlen_q=seqlen_q, seqlen_k=seqlen_k)
+    backward = BSA.block_sparse_attention_backward(
+        do, q, k, v, forward["o_tensor"], forward["lse_tensor"], q2k, None, bs, nums, kpage=layout, sparse_block_size=BLOCK
+    )
+    torch.testing.assert_close(backward["dq_tensor"].float(), dq_ref, atol=3e-2, rtol=3e-2)
+    _check(backward["dk_tensor"], dk_ref, kv_valid, tol=3e-2)
+    _check(backward["dv_tensor"], dv_ref, kv_valid, tol=3e-2)
+
+    with pytest.raises(NotImplementedError, match="multiples of 64"):
+        q_1000 = torch.randn((1, heads, 1000, 128), device="cuda", dtype=torch.bfloat16)  # the same 8 query blocks
+        BSA.block_sparse_attention_forward(q_1000, k, v, q2k, None, bs, nums, kpage=True, sparse_block_size=BLOCK)
+    with pytest.raises(NotImplementedError, match="multiples of 64"):
+        BSA.kpage_prepare_layout(q2k, None, bs, nums, seqlen_q=seqlen_q, seqlen_k=700)
+    with pytest.raises(NotImplementedError, match="MHA only"):
+        BSA.block_sparse_attention_forward(q, k[:, :1], v[:, :1], q2k, None, bs, nums, kpage=True, sparse_block_size=BLOCK)
+    with pytest.raises(NotImplementedError, match="bwd_kv_groups"):
+        BSA.kpage_prepare_layout(q2k, None, bs, nums, seqlen_q=seqlen_q, seqlen_k=seqlen_k, bwd_kv_groups=2)

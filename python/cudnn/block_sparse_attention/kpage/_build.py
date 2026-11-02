@@ -667,6 +667,54 @@ def build_pair_walk_tables_blk64(
     return Blk64PairForwardTables(page_table=page_table, keep=keep, ranges=ranges.view(num_heads, n_pairs, 5))
 
 
+@dataclass
+class Blk64Refinement:
+    """blk128 metadata rewritten as the blk64 metadata of the same function (SM90 blk128 KPage).
+
+    Every 128-row block is split into its two 64-row halves; KV halves without valid rows are dropped from the lists
+    and Q halves without valid rows get count 0, so neither costs work in the blk64 forward and backward.
+    """
+
+    block_index: Tensor  # [1, H, 2 * nQ, 2 * cap] int32
+    block_count: Tensor  # [1, H, 2 * nQ] int32
+    block_sizes: Tensor  # [2 * nKV] int32
+
+
+def refine_blk128_to_blk64(
+    q2k_block_index: Tensor,  # [1, H, nQ, cap] int32, sparse_block_size 128
+    q2k_block_nums: Tensor,  # [1, H, nQ] int32
+    q_sizes: Tensor,  # [nQ] int32 valid rows per 128-row Q block
+    kv_sizes: Tensor,  # [nKV] int32 valid rows per 128-row KV block
+    seqlen_q: int,
+    seqlen_k: int,
+) -> Blk64Refinement:
+    """The halves past a sequence that ends 64 rows into its final block are left out (as blk64 metadata of that length has them)."""
+    from ._build_kernels import current_stream, refine_blk128_to_blk64 as refine_cute
+
+    batch, num_heads, n_q_blocks, cap = q2k_block_index.shape
+    assert batch == 1, "kpage runs a batch as independent heads; batch must be 1"
+    dev = q2k_block_index.device
+    index64 = torch.zeros((num_heads * n_q_blocks * 2, 2 * cap), dtype=torch.int32, device=dev)
+    count64 = torch.empty((num_heads * n_q_blocks * 2,), dtype=torch.int32, device=dev)
+    refine_cute(
+        q2k_block_index.view(num_heads * n_q_blocks, cap),
+        q2k_block_nums.view(num_heads * n_q_blocks),
+        q_sizes,
+        kv_sizes,
+        index64,
+        count64,
+        current_stream(),
+    )
+    half = BLOCK // 2
+    sizes64 = torch.stack((kv_sizes.clamp(0, half), (kv_sizes.clamp(0, BLOCK) - half).clamp(min=0)), dim=-1).reshape(-1)
+    index64 = index64.view(1, num_heads, 2 * n_q_blocks, 2 * cap)
+    count64 = count64.view(1, num_heads, 2 * n_q_blocks)
+    n_q64, n_kv64 = (seqlen_q + half - 1) // half, (seqlen_k + half - 1) // half
+    if n_q64 < 2 * n_q_blocks:  # the dropped half has no valid Q row (count 0)
+        index64, count64 = index64[:, :, :n_q64].contiguous(), count64[:, :, :n_q64].contiguous()
+    return Blk64Refinement(block_index=index64, block_count=count64, block_sizes=sizes64[:n_kv64].contiguous())
+
+
 # ---------------------------------------------------------------------------
 # padding rows
 # ---------------------------------------------------------------------------
