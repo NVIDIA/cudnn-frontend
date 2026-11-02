@@ -901,6 +901,12 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     seq_len_q_list = cfg.seq_len_q if hasattr(cfg, 'seq_len_q') and cfg.seq_len_q else []
     seq_len_kv_list = cfg.seq_len_kv if hasattr(cfg, 'seq_len_kv') and cfg.seq_len_kv else []
 
+    # Paged/dense KV has no packed capacity or ragged offsets. Keep this
+    # optional state explicit before conditional allocation and binding.
+    max_t_kv = None
+    k_ragged_offset_gpu = None
+    v_ragged_offset_gpu = None
+
     if is_ragged:
         seq_len_q_gpu = torch.tensor(seq_len_q_list, dtype=torch.int32, device="cuda").view(-1)
         seq_len_kv_gpu = torch.tensor(seq_len_kv_list, dtype=torch.int32, device="cuda").view(-1)
