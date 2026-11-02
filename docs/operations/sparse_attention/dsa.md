@@ -279,11 +279,11 @@ the caller-owned output/workspace path is CUDA Graph capturable. Replay keeps
 the declared tensor shapes and addresses fixed while allowing tensor contents,
 including `topk_idxs` and `topk_length`, to change.
 On the target L20X sweep (BF16 H64 D576/Dv512, KV=65536, top-k 2048), C16
-measured 1.50--1.57x the non-deterministic latency with 1.13--1.26 GiB of
-workspace and remains the conservative default. C32 measured 1.37--1.40x
+measured 1.47--1.54x the non-deterministic latency with 1.13--1.26 GiB of
+workspace and remains the conservative default. C32 measured 1.34--1.37x
 with 0.57--0.70 GiB, the best time/memory point in that workload. C64 reduced
 workspace further to 0.29--0.41 GiB, but four sequential physical phases
-raised latency to 2.38--2.46x non-deterministic. C32 and C64 are therefore
+raised latency to 2.30--2.37x non-deterministic. C32 and C64 are therefore
 explicit workload-specific choices rather than the automatic default; the
 full table and environment are recorded in `benchmark/dsa/README.md`.
 
