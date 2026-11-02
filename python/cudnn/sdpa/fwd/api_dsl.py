@@ -5785,6 +5785,11 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
     per-Q-head attention-sink logits; and THD (ragged / fully packed
     variable-length) batches, compiled at plan time with runtime token totals.
 
+    Additive ``sample_bias`` is served on dense exact D128 FP16/BF16,
+    unsplit, unpacked prefill (tile_m 64 / 128). Bias is FP32 or the input
+    dtype with shape (1|B, 1|H_q, S_q, S_kv), contiguous keys and 16-byte
+    outer pitches; ``execute(bias_tensor=...)`` binds its declared storage.
+
     Half and per-tensor FP8 THD and zero-copy dense plans use a
     prepared pointer entry: pointers, sequence lengths and Int64 strides bind
     at execute without tensor reconstruction. Head geometry and scheduler
@@ -5984,6 +5989,37 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         if self.tile_m is None and not any(m == self.q_tile for m, _ in self._tile_domain):
             self.q_tile = max(m for m, _ in self._tile_domain)
         decode_tile = _sm120_is_decode_tile(int(self.q_tile))
+        if self.bias_desc is not None:
+            from cudnn.sdpa.fwd.config_sm120 import bias_decline
+
+            why = bias_decline(
+                int(d_q),
+                int(d_v),
+                thd=self.thd,
+                paged=self.paged,
+                split_kv=self.split_kv,
+                pack_gqa=self.pack_gqa,
+                tile_m=self.q_tile,
+                bottom_right=self.causal_bottom_right,
+            )
+            self._not_implemented_error_if(why is not None or self._fp8, why or "SM120 additive bias requires FP16/BF16 Q/K/V")
+            self._not_implemented_error_if(
+                self.score_max_desc is not None or self.score_sum_exp_desc is not None,
+                "SM120 additive bias does not support score side outputs",
+            )
+            self._check_dtype(self.bias_desc, [torch.float32, self.dtype], name="bias")
+            bd, bs = tuple(self.bias_desc.shape), tuple(self.bias_desc.stride)
+            self._value_error_if(
+                len(bd) != 4 or bd[2:] != (s_q, s_kv) or bd[0] not in (1, b) or bd[1] not in (1, h_q),
+                f"bias must have shape (1|{b}, 1|{h_q}, {s_q}, {s_kv}); got {bd}",
+            )
+            elem = 4 if self.bias_desc.dtype == torch.float32 else 2
+            self._value_error_if(
+                bs[3] != 1 or any(n > 1 and (st * elem) % 16 for n, st in zip(bd[:3], bs[:3])),
+                "SM120 bias requires contiguous keys and 16-byte aligned outer pitches",
+            )
+            self._value_error_if(self.bias_desc.device != self.q_desc.device, "bias must be on the Q tensor's CUDA device")
+        self._not_implemented_error_if(self.kv_mask_desc is not None, "SM120 per-key kv_mask is not supported")
         if decode_tile:
             self._not_implemented_error_if(self._fp8, "the SM120 decode tile (tile_m 16 / 32) serves FP16/BF16 only")
             self._not_implemented_error_if(self.thd, "the SM120 decode tile (tile_m 16 / 32) is dense-only (THD keeps the prefill templates)")
@@ -6249,6 +6285,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 if (self._prepared_fp8 or self._prepared_mxfp8)
                 else {}
             ),
+            **({"bias_dtype": "float32" if self.bias_desc.dtype == torch.float32 else "io"} if self.bias_desc is not None else {}),
             persistent_ctas=self._persistent_ctas(self.q_desc.device) if self.flavor == _SM120_D512_FLAVOR else 0,
         )
         if self.thd:
@@ -6283,6 +6320,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         sf_k: Optional[torch.Tensor] = None,
         sf_v: Optional[torch.Tensor] = None,
         sf_o: Optional[torch.Tensor] = None,
+        bias_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         """Execute tensors matching the compiled specialization.
 
@@ -6326,6 +6364,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             self.lse_desc is None and lse_tensor is not None,
             "this specialization was compiled without an LSE output; construct the API with sample_lse",
         )
+        self._value_error_if(self.bias_desc is not None and bias_tensor is None, "bias_tensor is required by this compiled specialization")
+        self._value_error_if(self.bias_desc is None and bias_tensor is not None, "this specialization was compiled without a bias")
         scale_val = self.scale_softmax if scale_softmax is None else float(scale_softmax)
         self._value_error_if(scale_val == 0, _ZERO_SCALE_UNSUPPORTED)
         self._value_error_if((scale_val < 0) != self._score_negated, "attn_scale sign must match the compiled plan's (#1435)")
@@ -6367,6 +6407,23 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             self._logger.debug("execute (SM120 MXFP8) completed" if mxfp8 else "execute (SM120 FP8 per-tensor) completed")
             return
         scale_softmax_log2 = scale_val * math.log2(math.e)
+        if self.bias_desc is not None:
+            from cudnn.sdpa.fwd.prepared import bind_dense, facts_of_tensor
+
+            spec = self._dense_spec
+            with device_context(q_tensor.device):
+                _ensure_current_context(int(current_stream), q_tensor.device.index)
+                facts = {
+                    name: facts_of_tensor(tensor)
+                    for name, tensor in zip(
+                        ("q", "k", "v", "o", "lse", "sinks", "seq_kv_lens", "seq_q_lens", "bias"),
+                        (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, sinks, seq_kv_lens, seq_q_lens, bias_tensor),
+                    )
+                }
+                frame = bind_dense(spec, facts, current_stream, int(current_stream))
+                frame[spec.index["scale_softmax"]] = scale_val
+                spec.fn(*frame)
+            return
         if self._dense_spec is not None:
             from cudnn.sdpa.fwd.prepared import execute_native_dense_tensors, facts_of_tensor
 
