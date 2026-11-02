@@ -451,21 +451,17 @@ def _emit_block_quant(
     """Generate block-quantized data and scale stores."""
     if quant.axis == 1:
         return _emit_block_quant_col(quant, quant_idx, source_var, output_dtype, out_var, scale_tap_idx, chain, batch_index_expr, vsize, row_pred)
-    lines = _emit_block_quant_row(quant, quant_idx, source_var, output_dtype, out_var, scale_tap_idx, chain, batch_index_expr, vsize, row_pred)
-    swapped = isinstance(chain.moe, MoeSwapAbSpec)
-    if not _f8_128x4_k_padding(quant, swapped):
-        return lines
-    # The shared row emitter stores only real blocks; pad behind its scale stores, under their predicate.
     p, bs = f"_q{quant_idx}", quant.block_size
-    for k in range(vsize // bs):
-        pad = _emit_f8_128x4_k_pad_zero(quant, f"{p}_scol{k}", f"(N // {bs})", f"{p}_sidx{k}", scale_tap_idx)
-        if row_pred is None:
-            lines.extend(pad)
-        else:
-            width, col_bound = ((k + 1) * bs, "group_end") if swapped else (vsize, "N")
-            lines.append(f"if ({row_pred}) & (col_j + {width} <= {col_bound}):")
-            lines.extend(f"    {line}" for line in pad)
-    return lines
+
+    def pad(k: int) -> list[str]:
+        return _emit_f8_128x4_k_pad_zero(quant, f"{p}_scol{k}", f"(N // {bs})", f"{p}_sidx{k}", scale_tap_idx)
+
+    # The shared row emitter stores only real blocks; pad behind each scalar scale store, under its predicate and in
+    # its scope (the vector path defines blocks 1-3's indices only in its scalar fallback).
+    padding = pad if _f8_128x4_k_padding(quant, isinstance(chain.moe, MoeSwapAbSpec)) else None
+    return _emit_block_quant_row(
+        quant, quant_idx, source_var, output_dtype, out_var, scale_tap_idx, chain, batch_index_expr, vsize, row_pred, after_scale_store=padding
+    )
 
 
 def _tap_fake_shape(tap, chain: FusionChain | None = None) -> str:
