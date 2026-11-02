@@ -947,6 +947,8 @@ def generate_mainloop(chain: FusionChain, operand: str = "a") -> str:
         return f"{out_var} = cutlass.Vector({cvt}, dtype={ab_dtype})"
     needs_coordinates = any(op.op == "gen_index" or op.operand_access is not None for op in ops)
     lines: list[str] = []
+    index_coordinates: dict[Axis, str] = {}
+    index_valid: str | None = None
     if needs_coordinates:
         lines, index_coordinates, index_valid = _prepare_mainloop_coordinates(chain, operand)
     result_var: dict[int, str] = {-1: vec_var}
