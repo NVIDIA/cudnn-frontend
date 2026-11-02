@@ -375,6 +375,14 @@ TEST_CASE("Plan metadata separates scalar reads empty shapes aliases and dumps",
     base["tensors"].push_back(json(end_alias));
     std::vector<std::pair<int64_t, std::pair<int64_t, int64_t>>> chain{{1, {2, 0}}, {2, {3, 0}}};
     REQUIRE_NOTHROW(md::validate_owned_spans(md::parse(base), chain));
+    // A PBV vector consumes one scalar, even when its declared tensor span is
+    // larger than the scalar owner. This distinguishes read width from span.
+    auto vector_alias = empty_alias;
+    vector_alias.set_dim({2});
+    auto vector_payload       = base;
+    vector_payload["tensors"] = json::array({json(scalar), json(vector_alias)});
+    std::vector<std::pair<int64_t, std::pair<int64_t, int64_t>>> vector_chain{{1, {2, 0}}};
+    REQUIRE_NOTHROW(md::validate_owned_spans(md::parse(vector_payload), vector_chain));
     base["tensors"][2]["data_type"] = "DOUBLE";
     REQUIRE_THROWS_AS(md::validate_owned_spans(md::parse(base), chain), std::exception);
     // A raw PBV vector still owns a scalar argument read even when its shape is
