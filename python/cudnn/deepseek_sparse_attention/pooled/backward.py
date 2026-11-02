@@ -427,3 +427,36 @@ def pooled_sparse_attention_backward_with_teacher(
     )
     target.div_(target.sum(dim=-1, keepdim=True).clamp(min=1e-12))
     return TupleDict(dq=dq, dkv=dkv, d_sink=d_sink, target=target, token_ids=token_ids, topk_length=topk_length)
+
+
+def pooled_indexer_select(
+    index_q: torch.Tensor,
+    pooled: torch.Tensor,
+    weights: torch.Tensor,
+    k_pools: int,
+    pool_size: int = 4,
+    sm_scale: float = 1.0,
+    deterministic: bool = False,
+    stream=None,
+) -> TupleDict:
+    """Select the top pools and return their softmax in one launch. Returns ``{'pool_ids' (B, S, K) INT32 local, 'predict' (B, S, K) FP32, 'logits'}``.
+
+    The ratio-causal rule of the compressed indexer forward with ``ratio = pool_size``
+    is the pooled eligibility rule; ``predict`` feeds ``pooled_indexer_backward``
+    directly, so the backward needs no predict recompute.
+    """
+    from cudnn.deepseek_sparse_attention.indexer_forward.api import indexer_forward_top_k_wrapper
+
+    result = indexer_forward_top_k_wrapper(
+        index_q,
+        pooled.unsqueeze(2),
+        weights,
+        top_k=k_pools,
+        ratio=pool_size,
+        sm_scale=sm_scale,
+        return_softmax=True,
+        topk_indices_global=False,
+        deterministic=deterministic,
+        stream=stream,
+    )
+    return TupleDict(pool_ids=result["indices"], predict=result["softmax"], logits=result["logits"])

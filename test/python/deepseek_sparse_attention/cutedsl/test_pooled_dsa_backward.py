@@ -201,3 +201,53 @@ def test_attention_backward_with_teacher_matches_separate_kernels(seqlen, k_pool
     assert (fused["target"][~has_pool] == 0).all()
     assert _rel(fused["target"], teacher) < 5e-3
     assert (fused["target"] - teacher).abs().max().item() < 2e-3
+
+
+def test_pooled_indexer_select_feeds_backward_without_predict_recompute():
+    from cudnn.deepseek_sparse_attention.score_recompute.api import sparse_indexer_score_recompute_wrapper
+
+    c = R.make_case(1, 2048, torch.device("cuda"), topk_tokens=512, seed=17)
+    pool_size, k_pools = 4, 128
+    pooled = PB.pooled_keys_forward(c["keys"], c["gates"], c["ape"], pool_size)["pooled"]
+    sel = PB.pooled_indexer_select(c["index_q"], pooled, c["weights"], k_pools, pool_size)
+    pool_ids, predict = sel["pool_ids"], sel["predict"]
+    assert pool_ids.shape == (1, 2048, k_pools) and pool_ids.dtype == torch.int32
+    # valid ids first, then -1 padding; the valid count is min(K, eligible pools)
+    valid = pool_ids >= 0
+    counts = valid.sum(-1)
+    slot = torch.arange(k_pools, device="cuda").view(1, 1, -1)
+    assert torch.equal(valid, slot < counts.unsqueeze(-1))
+    eligible = ((c["positions"] + 1) // pool_size).clamp(max=k_pools)
+    assert torch.equal(counts, eligible.to(counts.dtype))
+    # the selected set matches the dense reference up to ties at the k-th score
+    scores = R.pooled_dense_scores(c["index_q"], c["weights"], pooled, 1.0).masked_fill(
+        ~R.eligible_pools(c["positions"], pooled.shape[1], pool_size), float("-inf")
+    )
+    ref_ids = R.select_pools(scores, torch.isfinite(scores), k_pools)
+    kth = scores.topk(k_pools, dim=-1).values[..., -1:].clamp(min=-1e30)
+    got_sorted = torch.where(pool_ids >= 0, pool_ids, torch.full_like(pool_ids, 2**30)).sort(-1).values
+    ref_sorted = torch.where(ref_ids >= 0, ref_ids, torch.full_like(ref_ids, 2**30)).sort(-1).values
+    rows_differ = (got_sorted != ref_sorted).any(-1)
+    if rows_differ.any():
+        picked = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, pool_ids.clamp(min=0).long(), valid)
+        margin = (scores - kth).abs()
+        # every pool the kernel picked that the reference did not (or vice versa) lies within a tie band of the k-th score
+        ref_picked = torch.zeros_like(picked).scatter_(-1, ref_ids.clamp(min=0).long(), ref_ids >= 0)
+        diff = picked ^ ref_picked
+        assert (margin[diff] < 2e-3 * scores[torch.isfinite(scores)].abs().max()).all()
+    recomputed = sparse_indexer_score_recompute_wrapper(c["index_q"], pooled, c["weights"], pool_ids)["predict"]
+    assert _rel(predict, recomputed) < 1e-3
+    # backward with the forward's softmax instead of a recompute
+    token_ids, length = R.expand_pools_compact(pool_ids, c["positions"], pool_size)
+    softmax_scale = c["q_attn"].shape[-1] ** -0.5
+    lse = _dense_causal_lse(c["q_attn"], c["k_attn"], softmax_scale)
+    target = PB.pooled_indexer_target(
+        ref_sparse_attn_score_recompute(c["q_attn"], c["k_attn"], lse, token_ids, softmax_scale, topk_length=length), pool_ids, pool_size
+    )["target"]
+    grad_loss = torch.ones((), dtype=torch.float32, device="cuda")
+    got = PB.pooled_indexer_backward(
+        c["index_q"], c["weights"], c["keys"], c["gates"], c["ape"], pool_ids, target.clone(), grad_loss, pool_size, 1.0, 1.0, pooled=pooled, predict=predict
+    )
+    ref = R.oracle_pooled_indexer_backward(c["index_q"], c["weights"], c["keys"], c["gates"], c["ape"], pool_ids, target, 1.0, 1.0, pool_size)
+    for name, r in zip(("d_index_q", "d_weights", "d_keys", "d_gates", "d_ape"), ref):
+        assert _rel(got[name], r) < 1e-2, name

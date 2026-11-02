@@ -141,6 +141,23 @@ def cudnn_indexer_chain(c, timer, grad_loss):
         return PB.pooled_indexer_backward(c["index_q"], c["weights"], c["keys"], c["gates"], c["ape"], c["pool_ids"], work, grad_loss, pool_size, 1.0, 1.0)
 
     stages["chain_total_us"] = timer(full)
+
+    def select():
+        return PB.pooled_indexer_select(c["index_q"], c["pooled"], c["weights"], c["k_pools"], pool_size)
+
+    stages["indexer_select_fwd_us"] = timer(select)
+    sel = select()
+    stages["select_predict_vs_recompute_rel_diff"] = (
+        (sel["predict"] - sparse_indexer_score_recompute_wrapper(c["index_q"], c["pooled"], c["weights"], sel["pool_ids"])["predict"]).norm() / pred.norm()
+    ).item()
+
+    def full_predict_from_forward():
+        work.copy_(target)
+        return PB.pooled_indexer_backward(
+            c["index_q"], c["weights"], c["keys"], c["gates"], c["ape"], c["pool_ids"], work, grad_loss, pool_size, 1.0, 1.0, predict=pred
+        )
+
+    stages["chain_predict_from_forward_us"] = timer(full_predict_from_forward)
     stages["chain_with_teacher_us"] = stages["chain_total_us"] + stages["teacher_recompute_us"] + stages["pool_target_us"]
     stages["chain_with_fused_teacher_us"] = stages["chain_total_us"] + stages["teacher_fused_us"]
     return stages
