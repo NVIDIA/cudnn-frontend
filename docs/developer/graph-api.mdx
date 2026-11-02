@@ -1083,12 +1083,12 @@ When you use dynamic-shape operation graphs with runtime-compiled (RTC) kernels,
 
 When the default kernel cache is used, **one** default cache exists per CUDA device (by device ordinal). All plans and handles on the same device share that cache. Each device has its own separate cache. Cached kernels are not shared across devices.
 
-cuDNN uses a per-device deafult kernel cache if both the following conditions are met:
+cuDNN uses a per-device default kernel cache if both the following conditions are met:
 
 - The `graph.set_kernel_cache(kernel_cache)` function is not called in the frontend to set a kernel cache on your execution plan.
-- The `CUDNN_ENABLE_DEFAULT_KERNEL_CACHE` environemnt variable hasn't been set to 0 to turn off the default kernel cache.
+- The `CUDNN_ENABLE_DEFAULT_KERNEL_CACHE` environment variable hasn't been set to 0 to turn off the default kernel cache.
 
-To set the maximum size of the default kernel cache on a device, set the `CUDNN_KERNEL_CACHE_SIZE_MB` environment  varaible to the desired size in MB. When the cache reaches this size, cuDNN uses LRU eviction to remove the least-recently-used entries. The default maximum cache size is 100 MB.
+To set the maximum size of the default kernel cache on a device, set the `CUDNN_KERNEL_CACHE_SIZE_MB` environment variable to the desired size in MB. When the cache reaches this size, cuDNN uses LRU eviction to remove the least-recently-used entries. The default maximum cache size is 100 MB.
 
 #### Cache Keys and Dynamic Shapes
 
