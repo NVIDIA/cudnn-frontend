@@ -318,6 +318,39 @@ def test_execute_allocates_nothing_and_never_synchronizes(dk_dtype, compile_allo
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("heads", [32, 128], ids=["h32", "h128"])
+@torch_fork_set_rng(seed=0)
+def test_DSA_dense_indexer_backward_rejects_unsupported_heads(heads):
+    """Both dense kernels are built for H64 only (H96 is no legal TCGEN05 M and
+    H128 exceeds the SM100 launch resources; SM90 WGMMA M is 64), so
+    check_support declines other head counts before any score buffer moves."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    major = torch.cuda.get_device_capability()[0]
+    if major != 9 and major < 10:
+        pytest.skip("DenseIndexerBackward requires SM90 or SM100+")
+
+    cfg = dict(b=1, s_q=8, s_kv=128, head_dim=128, qhead_per_kv_head=heads)
+    index_q, weights, index_k, attn_score, attn_l1norm, index_score, index_lse = _allocate(cfg, sm_scale=1.0, ratio=1, q_causal_offsets=None)
+    attn_before, index_before = attn_score.clone(), index_score.clone()
+    with pytest.raises(ValueError, match="requires heads == 64"):
+        DSA.dense_indexer_backward_wrapper(
+            index_q,
+            weights,
+            index_k,
+            attn_score,
+            attn_l1norm,
+            index_score,
+            index_lse,
+            grad_loss=torch.ones((), dtype=torch.float32, device="cuda"),
+        )
+    assert torch.equal(attn_score, attn_before)
+    assert torch.equal(index_score, index_before)
+
+
+@pytest.mark.L0
 def test_dense_plan_rejects_cross_tensor_shape_mismatch():
     """A directly built plan validates its descriptors against each other in
     ``check_support`` (the wrapper's ``_dense_shapes`` contract): the kernel sizes

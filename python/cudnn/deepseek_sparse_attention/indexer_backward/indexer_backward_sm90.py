@@ -64,7 +64,7 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
     torch_stream_context as _torch_stream_context,
 )
 from cudnn.deepseek_sparse_attention.utils.seqlen import seqlen_info as _seqlen_info
-from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
+from cudnn.deepseek_sparse_attention.utils.tensor_conversion import fake_cute_tensor
 from cudnn.deepseek_sparse_attention.utils.sm90.mma import (
     gemm,
     make_smem_layout,
@@ -1485,6 +1485,21 @@ class ScoreGradSm90:
                 mAttnScore[seq_idx, pos, batch_idx] = g_i - predict * sum_grad
 
 
+def _compile_score_grad(topk: int):
+    """Compile (or reuse) kernel 1 for one top-k width, from fake operands (R11)."""
+    if topk not in _score_grad_cute_cache:
+        _score_grad_cute_cache[topk] = cute.compile(
+            ScoreGradSm90(topk=topk),
+            fake_cute_tensor(cutlass.Float32, 3),
+            fake_cute_tensor(cutlass.Float32, 3),
+            fake_cute_tensor(cutlass.Float32, 1),
+            cutlass.Float32(1.0),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+            options=compile_options(),
+        )
+    return _score_grad_cute_cache[topk]
+
+
 def _score_grad_inplace_cute(
     AttnScore,
     IndexScore,
@@ -1498,21 +1513,9 @@ def _score_grad_inplace_cute(
         GradLoss = GradLoss.reshape(1)
 
     _, _, topk = AttnScore.shape
-    compile_key = topk
+    compiled = _compile_score_grad(topk)
     s = _resolve_stream(current_stream)
-    if compile_key not in _score_grad_cute_cache:
-        kernel_obj = ScoreGradSm90(topk=topk)
-        _score_grad_cute_cache[compile_key] = cute.compile(
-            kernel_obj,
-            to_cute_tensor(AttnScore),
-            to_cute_tensor(IndexScore),
-            to_cute_tensor(GradLoss),
-            cutlass.Float32(float(grad_scale)),
-            s,
-            options=compile_options(),
-        )
-
-    _score_grad_cute_cache[compile_key](
+    compiled(
         AttnScore,
         IndexScore,
         GradLoss,
@@ -1593,34 +1596,15 @@ def _build_cute_dsl_kernel(
     # sparse path).
     compile_key = (heads, dim, topk, block_I, topk_indices_global)
 
-    def _ensure_compiled(
-        IndexQ,
-        Weights,
-        IndexK,
-        dIndexQ,
-        dWeights,
-        dIndexK_f32,
-        GradSignal,
-        TopkIndices,
-        current_stream=None,
-    ):
-        """Lazy-compile the GEMM kernel (kernel 2) on first execute (needs real tensors)."""
-        s = _resolve_stream(current_stream)
-        if compile_key not in _compile_cache:
-            cute_args = [
-                to_cute_tensor(t)
-                for t in [
-                    IndexQ,
-                    Weights,
-                    IndexK,
-                    dIndexQ,
-                    dWeights,
-                    dIndexK_f32,
-                    GradSignal,
-                    TopkIndices,
-                ]
-            ]
+    def _ensure_compiled():
+        """Compile (or reuse) the GEMM (kernel 2) from fake operands (R11).
 
+        Operands: Q/dQ (B, S_q, H, D), W/dW (B, S_q, H) and K (B, S_k, D) in
+        BF16; the FP32 dK accumulator (B, S_k, D) and grad_signal
+        (B, S_q, topk); INT32 top-k (B, S_q, topk).
+        """
+        if compile_key not in _compile_cache:
+            bf16, f32 = cutlass.BFloat16, cutlass.Float32
             # Pass dummy Int32 values for max_seqlen_q/k: the kernel's __call__
             # signature declares these as ``Int32 = None`` and the JIT cannot
             # cast ``None`` to ``Int32`` (raises DSLRuntimeError). They are
@@ -1628,9 +1612,16 @@ def _build_cute_dsl_kernel(
             # values here are unused but must be valid Int32.
             _compile_cache[compile_key] = cute.compile(
                 kernel_obj,
-                *cute_args,
+                fake_cute_tensor(bf16, 4),
+                fake_cute_tensor(bf16, 3),
+                fake_cute_tensor(bf16, 3),
+                fake_cute_tensor(bf16, 4),
+                fake_cute_tensor(bf16, 3),
+                fake_cute_tensor(f32, 3),
+                fake_cute_tensor(f32, 3),
+                fake_cute_tensor(cutlass.Int32, 3),
                 cutlass.Float32(sm_scale),
-                s,
+                cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
                 None,
                 None,
                 cutlass.Int32(seqlen),
@@ -1651,17 +1642,7 @@ def _build_cute_dsl_kernel(
     ):
         """Run only kernel 2 (GEMM). Caller must have run kernel 1 and zeroed dIndexK_f32."""
         s = _resolve_stream(current_stream)
-        _ensure_compiled(
-            IndexQ,
-            Weights,
-            IndexK,
-            dIndexQ,
-            dWeights,
-            dIndexK_f32,
-            GradSignal,
-            TopkIndices,
-            current_stream=current_stream,
-        )
+        _ensure_compiled()
         _compile_cache[compile_key](
             IndexQ,
             Weights,
@@ -1732,6 +1713,12 @@ def _build_cute_dsl_kernel(
             with _torch_stream_context(current_stream):
                 dIndexK.copy_(dIndexK_f32)
 
+    def _precompile(d_index_k_dtype: torch.dtype):
+        """Compile every kernel ``_run`` launches; dK always accumulates in FP32."""
+        _compile_score_grad(topk)
+        _ensure_compiled()
+
     _run.gemm_only = _run_gemm_only
+    _run.precompile = _precompile
 
     return _run

@@ -416,7 +416,7 @@ class DenseIndexerBackward2QGemmSm100:
         self.heads = heads
         self.block_I = block_I
         self.ratio = ratio
-        assert heads >= 64
+        assert heads == 64, "the dense SM100 kernel is built for H=64 only"
 
         self.head_dim_padded = int(math.ceil(head_dim / 16) * 16)
         self.heads_padded = int(math.ceil(heads / 8) * 8)

@@ -135,6 +135,7 @@ from .deterministic_dk_sm100 import (
     deterministic_dk_producer_ctas,
     deterministic_dk_planes_bytes,
     deterministic_dk_workspace_bytes,
+    compile_reduce_deterministic_dk,
     reduce_deterministic_dk,
     validate_deterministic_dk_plane_policy,
 )
@@ -468,7 +469,12 @@ class IndexerBackwardSm100:
         # False, mTopkIdx carries local-per-batch ids and the kernel adds
         # ``batch_idx * S_k_per_batch`` to convert. Const_expr-branched.
         self.topk_indices_global = topk_indices_global
+        # IndexerBackward.check_support enforces these; the asserts guard direct
+        # factory callers, since the STMatrix epilogues and TMEM maps are
+        # specialized for the M64 x I128 x D128 tile.
         assert heads in (32, 64), "supported head counts are H=32 and H=64"
+        assert head_dim == 128, "the kernel serves D=128 only"
+        assert block_I == 128, "the kernel serves block_I=128 only"
         assert topk > 0
         assert topk % block_I == 0
         self.num_topk_blocks = topk // block_I
@@ -482,15 +488,12 @@ class IndexerBackwardSm100:
         # zero-fills only the upper half of the internal Q/dS tiles; no H64
         # global tensors or caller-side padding traffic is needed.
         self.heads_padded = 64
-        # Half-dS publication is specialized for the production TopK=512,
-        # H64 x I128 fragment map. Larger TopK values retain the full-dS drain
+        # Half-dS publication is specialized for the production TopK=512
+        # fragment map. Larger TopK values retain the full-dS drain
         # order because the additional barrier traffic regresses them.
-        self.use_ds_half = topk == 512 and self.heads_padded == 64 and block_I == 128
+        self.use_ds_half = topk == 512
         self.use_persistent = self.deterministic or (
             topk in (128, 256, 384, 512)
-            and self.heads_padded == 64
-            and self.head_dim_padded == 128
-            and block_I == 128
             # For the new short-row variants, at most one row per resident CTA
             # leaves nothing to amortize and is 1-5% slower.  Preserve the
             # established TopK=512 dispatch policy unchanged.
@@ -905,7 +908,6 @@ class IndexerBackwardSm100:
             self._run_persistent_cross_row(
                 mQ,
                 mW,
-                mK,
                 mdQ,
                 mdW,
                 mdK_f32,
@@ -1161,10 +1163,7 @@ class IndexerBackwardSm100:
                 sGradSignal,
                 sW,
                 sdS_store,
-                sdS,
                 sdQ_epi_slice,
-                s_acc_shape,
-                dq_acc_shape,
                 tStS_0,
                 tStS_1,
                 tDqDq,
@@ -1195,8 +1194,6 @@ class IndexerBackwardSm100:
         elif warp_idx in self.k_load_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_kload)
             self._k_load_warpgroup(
-                mK,
-                sK,
                 sK_raw_ptr,
                 sTopkIdxs,
                 mTopkIdx,
@@ -1249,7 +1246,6 @@ class IndexerBackwardSm100:
                 self._run_persistent_row_serial(
                     mQ,
                     mW,
-                    mK,
                     mdQ,
                     mdW,
                     mdK_f32,
@@ -1278,9 +1274,7 @@ class IndexerBackwardSm100:
                     tma_atom_Q,
                     tma_atom_K_gather,
                     tma_atom_dQ,
-                    s_acc_shape,
                     s_acc_layout,
-                    dq_acc_shape,
                     dq_acc_layout,
                     dk_acc_shape,
                     dk_acc_layout,
@@ -1336,7 +1330,6 @@ class IndexerBackwardSm100:
         self,
         mQ,
         mW,
-        mK,
         mdQ,
         mdW,
         mdK_f32,
@@ -1712,10 +1705,7 @@ class IndexerBackwardSm100:
                     sGrad_row,
                     sW_row,
                     sdS_store,
-                    sdS,
                     sdQ_epi_slice,
-                    s_acc_shape,
-                    dq_acc_shape,
                     tStS_0,
                     tStS_1,
                     tDqDq_0,
@@ -1766,8 +1756,6 @@ class IndexerBackwardSm100:
                     cute.make_layout((self.topk,), stride=(1,)),
                 )
                 self._k_load_warpgroup(
-                    mK,
-                    sK,
                     sK_raw_ptr,
                     sTopk_row,
                     mTopkIdx,
@@ -1843,7 +1831,6 @@ class IndexerBackwardSm100:
         self,
         mQ,
         mW,
-        mK,
         mdQ,
         mdW,
         mdK_f32,
@@ -1872,9 +1859,7 @@ class IndexerBackwardSm100:
         tma_atom_Q,
         tma_atom_K_gather,
         tma_atom_dQ,
-        s_acc_shape,
         s_acc_layout,
-        dq_acc_shape,
         dq_acc_layout,
         dk_acc_shape,
         dk_acc_layout,
@@ -2040,10 +2025,7 @@ class IndexerBackwardSm100:
                 sGradSignal,
                 sW,
                 sdS_store,
-                sdS,
                 sdQ_epi_slice,
-                s_acc_shape,
-                dq_acc_shape,
                 tStS_0,
                 tStS_1,
                 tDqDq,
@@ -2070,8 +2052,6 @@ class IndexerBackwardSm100:
         elif warp_idx in self.k_load_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_kload)
             self._k_load_warpgroup(
-                mK,
-                sK,
                 sK_raw_ptr,
                 sTopkIdxs,
                 mTopkIdx,
@@ -2649,10 +2629,7 @@ class IndexerBackwardSm100:
         sGradSignal,
         sW,
         sdS_store,
-        sdS,
         sdQ_epi_slice,
-        s_acc_shape,
-        dq_acc_shape,
         tStS_0,
         tStS_1,
         tDqDq,
@@ -2694,89 +2671,51 @@ class IndexerBackwardSm100:
 
         # The STMatrix epilogue below uses the logical [H, I] ROW_MAJOR view
         # required by GEMM3's K-major A operand.  The same bytes are GEMM2's
-        # transposed [I, H] MN-major A operand.  Other legal factory shapes
-        # retain the original coordinate store because this ownership mapping
-        # is specialized for the production H64 x I128 tile.
-        use_stmatrix_ds = const_expr(
-            self.heads_padded == 64 and self.block_I == 128,
+        # transposed [I, H] MN-major A operand.  This ownership mapping is
+        # specialized for the M64 x I128 tile, the only one the kernel builds.
+        # --- TMEM readback (canonical 2D epilogue view) ---
+        tStS_epi_0 = tStS_0[((None, None), 0, 0)]
+        tiled_tmem_load_s_0 = tcgen05.make_tmem_copy(
+            tmem_load_atom,
+            tStS_epi_0,
         )
-        if const_expr(use_stmatrix_ds):
-            # --- TMEM readback (canonical 2D epilogue view) ---
-            tStS_epi_0 = tStS_0[((None, None), 0, 0)]
-            tiled_tmem_load_s_0 = tcgen05.make_tmem_copy(
-                tmem_load_atom,
-                tStS_epi_0,
-            )
-            thr_tmem_load_s_0 = tiled_tmem_load_s_0.get_slice(wg_tidx)
-            tStS_t2r_0 = thr_tmem_load_s_0.partition_S(tStS_epi_0)
+        thr_tmem_load_s_0 = tiled_tmem_load_s_0.get_slice(wg_tidx)
+        tStS_t2r_0 = thr_tmem_load_s_0.partition_S(tStS_epi_0)
 
-            tStS_epi_1 = tStS_1[((None, None), 0, 0)]
-            tiled_tmem_load_s_1 = tcgen05.make_tmem_copy(
-                tmem_load_atom,
-                tStS_epi_1,
-            )
-            thr_tmem_load_s_1 = tiled_tmem_load_s_1.get_slice(wg_tidx)
-            tStS_t2r_1 = thr_tmem_load_s_1.partition_S(tStS_epi_1)
+        tStS_epi_1 = tStS_1[((None, None), 0, 0)]
+        tiled_tmem_load_s_1 = tcgen05.make_tmem_copy(
+            tmem_load_atom,
+            tStS_epi_1,
+        )
+        thr_tmem_load_s_1 = tiled_tmem_load_s_1.get_slice(wg_tidx)
+        tStS_t2r_1 = thr_tmem_load_s_1.partition_S(tStS_epi_1)
 
-            # Derive R2S ownership from the TMEM-load ownership.  This selects
-            # STSM and preserves each register element's logical coordinate.
-            smem_store_atom = sm100_utils_basic.get_smem_store_op(
-                LayoutEnum.ROW_MAJOR,
-                self.q_dtype,
-                self.acc_dtype,
-                tiled_tmem_load_s_0,
-            )
-            tiled_smem_store = cute.make_tiled_copy_D(
-                smem_store_atom,
-                tiled_tmem_load_s_0,
-            )
-            thr_smem_store = tiled_smem_store.get_slice(wg_tidx)
-            tRS_sdS = thr_smem_store.partition_D(sdS_store)
+        # Derive R2S ownership from the TMEM-load ownership.  This selects
+        # STSM and preserves each register element's logical coordinate.
+        smem_store_atom = sm100_utils_basic.get_smem_store_op(
+            LayoutEnum.ROW_MAJOR,
+            self.q_dtype,
+            self.acc_dtype,
+            tiled_tmem_load_s_0,
+        )
+        tiled_smem_store = cute.make_tiled_copy_D(
+            smem_store_atom,
+            tiled_tmem_load_s_0,
+        )
+        thr_smem_store = tiled_smem_store.get_slice(wg_tidx)
+        tRS_sdS = thr_smem_store.partition_D(sdS_store)
 
-            cS = cute.make_identity_tensor(
-                (self.heads_padded, self.block_I),
-            )
-            tCcS = thr_tmem_load_s_0.partition_D(cS)
-        else:
-            # General-shape fallback: preserve the MMA accumulator's complete
-            # coordinate hierarchy and write through its native sdS view.
-            tiled_tmem_load_s_0 = tcgen05.make_tmem_copy(
-                tmem_load_atom,
-                tStS_0,
-            )
-            thr_tmem_load_s_0 = tiled_tmem_load_s_0.get_slice(wg_tidx)
-            tStS_t2r_0 = thr_tmem_load_s_0.partition_S(tStS_0)
-
-            tiled_tmem_load_s_1 = tcgen05.make_tmem_copy(
-                tmem_load_atom,
-                tStS_1,
-            )
-            thr_tmem_load_s_1 = tiled_tmem_load_s_1.get_slice(wg_tidx)
-            tStS_t2r_1 = thr_tmem_load_s_1.partition_S(tStS_1)
-
-            sdS_gemm_view_0 = cute.composition(
-                sdS[None, None, None, 0],
-                cute.make_layout((self.heads_padded, self.block_I)),
-            )
-            sdS_gemm_view_1 = cute.composition(
-                sdS[None, None, None, 1],
-                cute.make_layout((self.heads_padded, self.block_I)),
-            )
-            cS = cute.make_identity_tensor(s_acc_shape)
-            tCcS = thr_tmem_load_s_0.partition_D(cS)
+        cS = cute.make_identity_tensor(
+            (self.heads_padded, self.block_I),
+        )
+        tCcS = thr_tmem_load_s_0.partition_D(cS)
         tSrS_shape = tCcS.shape
 
-        # Use the canonical 2-D accumulator view when CuTe can lower dQ
-        # staging to STMatrix; other legal shapes use coordinate stores.
-        use_stmatrix_dq = const_expr(self.heads_padded == 64 and self.head_dim_padded == 128)
-        if const_expr(use_stmatrix_dq):
-            tDqDq_load_view = tDqDq[((None, None), 0, 0)]
-            if const_expr(self.use_cross_row_persistent):
-                tDqDq_p1_load_view = tDqDq_p1[((None, None), 0, 0)]
-        else:
-            tDqDq_load_view = tDqDq
-            if const_expr(self.use_cross_row_persistent):
-                tDqDq_p1_load_view = tDqDq_p1
+        # Use the canonical 2-D accumulator view so CuTe lowers dQ staging to
+        # STMatrix.
+        tDqDq_load_view = tDqDq[((None, None), 0, 0)]
+        if const_expr(self.use_cross_row_persistent):
+            tDqDq_p1_load_view = tDqDq_p1[((None, None), 0, 0)]
         tiled_tmem_load_dq = tcgen05.make_tmem_copy(
             tmem_load_atom,
             tDqDq_load_view,
@@ -2792,27 +2731,23 @@ class IndexerBackwardSm100:
             tDqDq_p1_t2r = thr_tmem_load_dq_p1.partition_S(
                 tDqDq_p1_load_view,
             )
-        if const_expr(use_stmatrix_dq):
-            cDQ = cute.make_identity_tensor(
-                (self.heads_padded, self.head_dim_padded),
-            )
-        else:
-            cDQ = cute.make_identity_tensor(dq_acc_shape)
+        cDQ = cute.make_identity_tensor(
+            (self.heads_padded, self.head_dim_padded),
+        )
         tCcDQ = thr_tmem_load_dq.partition_D(cDQ)
         tDQrDQ_shape = tCcDQ.shape
-        if const_expr(use_stmatrix_dq):
-            smem_store_atom_dq = sm100_utils_basic.get_smem_store_op(
-                LayoutEnum.ROW_MAJOR,
-                self.q_dtype,
-                self.acc_dtype,
-                tiled_tmem_load_dq,
-            )
-            tiled_smem_store_dq = cute.make_tiled_copy_D(
-                smem_store_atom_dq,
-                tiled_tmem_load_dq,
-            )
-            thr_smem_store_dq = tiled_smem_store_dq.get_slice(wg_tidx)
-            tRDQ_sdQ = thr_smem_store_dq.partition_D(sdQ_epi_slice)
+        smem_store_atom_dq = sm100_utils_basic.get_smem_store_op(
+            LayoutEnum.ROW_MAJOR,
+            self.q_dtype,
+            self.acc_dtype,
+            tiled_tmem_load_dq,
+        )
+        tiled_smem_store_dq = cute.make_tiled_copy_D(
+            smem_store_atom_dq,
+            tiled_tmem_load_dq,
+        )
+        thr_smem_store_dq = tiled_smem_store_dq.get_slice(wg_tidx)
+        tRDQ_sdQ = thr_smem_store_dq.partition_D(sdQ_epi_slice)
 
         # ---- Wait for W loaded by load warp ----
         cute.arch.mbarrier_wait(
@@ -2840,17 +2775,16 @@ class IndexerBackwardSm100:
         # sm_scale is folded into the dS weights (one BF16 rounding of the
         # scaled dS), so dK and dQ leave their GEMMs
         # already scaled and the per-tile dK drain needs no FP32 multiplies.
-        if const_expr(use_stmatrix_ds):
-            h_base = warp_id_in_wg * 16 + lane_id // 4
-            weight_lo = Float32(sW[h_base]) * Float32(sm_scale)
-            weight_hi = Float32(sW[h_base + 8]) * Float32(sm_scale)
+        h_base = warp_id_in_wg * 16 + lane_id // 4
+        weight_lo = Float32(sW[h_base]) * Float32(sm_scale)
+        weight_hi = Float32(sW[h_base + 8]) * Float32(sm_scale)
 
         # Compact H32 runs the M64 tile with heads 32..63 zero-filled. The two
         # compute warps that own only those heads skip the TMEM readback and
         # dS math; they still store the zero dS tile and keep the barrier
         # protocol.
         skip_padded_heads = False
-        if const_expr(use_stmatrix_ds and self.heads == 32):
+        if const_expr(self.heads == 32):
             skip_padded_heads = warp_id_in_wg >= 2
 
         for bi in cutlass.range(0, self.num_topk_blocks):
@@ -2878,16 +2812,8 @@ class IndexerBackwardSm100:
 
                 # Phase 1: Compute dS (→ tSrS), accumulate dW — paired f32x2.
                 for ei in cutlass.range(0, cute.size(tSrS), 2):
-                    if const_expr(use_stmatrix_ds):
-                        h0 = cute.get(tCcS[ei], mode=[0])
-                        n0 = cute.get(tCcS[ei], mode=[1])
-                        h1 = cute.get(tCcS[ei + 1], mode=[0])
-                        n1 = cute.get(tCcS[ei + 1], mode=[1])
-                    else:
-                        h0 = cute.get(tCcS[ei], mode=[0, 0])
-                        n0 = cute.get(tCcS[ei], mode=[0, 1])
-                        h1 = cute.get(tCcS[ei + 1], mode=[0, 0])
-                        n1 = cute.get(tCcS[ei + 1], mode=[0, 1])
+                    n0 = cute.get(tCcS[ei], mode=[1])
+                    n1 = cute.get(tCcS[ei + 1], mode=[1])
 
                     tSrS[ei], tSrS[ei + 1] = mul_packed_f32x2(
                         (tSrS[ei], tSrS[ei + 1]),
@@ -2896,15 +2822,11 @@ class IndexerBackwardSm100:
                     s0 = tSrS[ei]
                     s1 = tSrS[ei + 1]
 
-                    if const_expr(use_stmatrix_ds):
-                        # Pairs alternate between the thread's low/high head;
-                        # both elements in one pair share that head.
-                        pair_weight = weight_lo if (ei // 2) % 2 == 0 else weight_hi
-                        w0 = pair_weight
-                        w1 = pair_weight
-                    else:
-                        w0 = Float32(sW[h0]) * Float32(sm_scale)
-                        w1 = Float32(sW[h1]) * Float32(sm_scale)
+                    # Pairs alternate between the thread's low/high head;
+                    # both elements in one pair share that head.
+                    pair_weight = weight_lo if (ei // 2) % 2 == 0 else weight_hi
+                    w0 = pair_weight
+                    w1 = pair_weight
                     gs0 = sGradSignal[i_st + n0]
                     gs1 = sGradSignal[i_st + n1]
 
@@ -2928,73 +2850,60 @@ class IndexerBackwardSm100:
 
                 cute.arch.fence_view_async_tmem_load()
 
-                # Phase 2: Convert dS f32→bf16, then use STSM on the production
-                # tile or the native-layout coordinate fallback on other shapes.
+                # Phase 2: Convert dS f32→bf16, then store it with STSM.
                 for ei in cutlass.range(cute.size(tSrS), unroll_full=True):
                     tSrS_f16[ei] = self.q_dtype(tSrS[ei])
 
-            if const_expr(use_stmatrix_ds):
-                tRS_rdS = tiled_smem_store.retile(tSrS_f16)
-                if const_expr(self.use_ds_half):
-                    # The final retiled-copy mode is the two 64-column
-                    # repetitions. Publish columns 0..63 first so MMA can
-                    # issue the first half of dQ while this warpgroup stores
-                    # columns 64..127; DS_READY still covers the full tile.
-                    if bi % 2 == 0:
-                        cute.copy(
-                            tiled_smem_store,
-                            tRS_rdS[(None, None, 0)],
-                            tRS_sdS[(None, None, 0, 0)],
-                        )
-                    else:
-                        cute.copy(
-                            tiled_smem_store,
-                            tRS_rdS[(None, None, 0)],
-                            tRS_sdS[(None, None, 0, 1)],
-                        )
-                    cute.arch.fence_proxy("async.shared", space="cta")
-                    _tcgen05_fence_before_thread_sync()
-                    if bi % 2 == 0:
-                        cute.arch.mbarrier_arrive(mbar + MBAR_DS_HALF_0)
-                    else:
-                        cute.arch.mbarrier_arrive(mbar + MBAR_DS_HALF_1)
-
-                    if bi % 2 == 0:
-                        cute.copy(
-                            tiled_smem_store,
-                            tRS_rdS[(None, None, 1)],
-                            tRS_sdS[(None, None, 1, 0)],
-                        )
-                    else:
-                        cute.copy(
-                            tiled_smem_store,
-                            tRS_rdS[(None, None, 1)],
-                            tRS_sdS[(None, None, 1, 1)],
-                        )
+            tRS_rdS = tiled_smem_store.retile(tSrS_f16)
+            if const_expr(self.use_ds_half):
+                # The final retiled-copy mode is the two 64-column
+                # repetitions. Publish columns 0..63 first so MMA can
+                # issue the first half of dQ while this warpgroup stores
+                # columns 64..127; DS_READY still covers the full tile.
+                if bi % 2 == 0:
+                    cute.copy(
+                        tiled_smem_store,
+                        tRS_rdS[(None, None, 0)],
+                        tRS_sdS[(None, None, 0, 0)],
+                    )
                 else:
-                    if bi % 2 == 0:
-                        cute.copy(
-                            tiled_smem_store,
-                            tRS_rdS,
-                            tRS_sdS[(None, None, None, 0)],
-                        )
-                    else:
-                        cute.copy(
-                            tiled_smem_store,
-                            tRS_rdS,
-                            tRS_sdS[(None, None, None, 1)],
-                        )
+                    cute.copy(
+                        tiled_smem_store,
+                        tRS_rdS[(None, None, 0)],
+                        tRS_sdS[(None, None, 0, 1)],
+                    )
+                cute.arch.fence_proxy("async.shared", space="cta")
+                _tcgen05_fence_before_thread_sync()
+                if bi % 2 == 0:
+                    cute.arch.mbarrier_arrive(mbar + MBAR_DS_HALF_0)
+                else:
+                    cute.arch.mbarrier_arrive(mbar + MBAR_DS_HALF_1)
+
+                if bi % 2 == 0:
+                    cute.copy(
+                        tiled_smem_store,
+                        tRS_rdS[(None, None, 1)],
+                        tRS_sdS[(None, None, 1, 0)],
+                    )
+                else:
+                    cute.copy(
+                        tiled_smem_store,
+                        tRS_rdS[(None, None, 1)],
+                        tRS_sdS[(None, None, 1, 1)],
+                    )
             else:
                 if bi % 2 == 0:
-                    for ei in cutlass.range_constexpr(cute.size(tSrS_f16)):
-                        h = cute.get(tCcS[ei], mode=[0, 0])
-                        n = cute.get(tCcS[ei], mode=[0, 1])
-                        sdS_gemm_view_0[h, n] = tSrS_f16[ei]
+                    cute.copy(
+                        tiled_smem_store,
+                        tRS_rdS,
+                        tRS_sdS[(None, None, None, 0)],
+                    )
                 else:
-                    for ei in cutlass.range_constexpr(cute.size(tSrS_f16)):
-                        h = cute.get(tCcS[ei], mode=[0, 0])
-                        n = cute.get(tCcS[ei], mode=[0, 1])
-                        sdS_gemm_view_1[h, n] = tSrS_f16[ei]
+                    cute.copy(
+                        tiled_smem_store,
+                        tRS_rdS,
+                        tRS_sdS[(None, None, None, 1)],
+                    )
 
             cute.arch.fence_proxy("async.shared", space="cta")
             _tcgen05_fence_before_thread_sync()
@@ -3046,19 +2955,8 @@ class IndexerBackwardSm100:
                 dQ_store_pipeline.producer_acquire()
             self.compute_sync_barrier.arrive_and_wait()
 
-        if const_expr(use_stmatrix_dq):
-            tRDQ_rdQ = tiled_smem_store_dq.retile(tDQrDQ_bf16)
-            cute.copy(tiled_smem_store_dq, tRDQ_rdQ, tRDQ_sdQ)
-        else:
-            # General-shape dQ staging via coordinate writes.
-            sdQ_gemm_view = cute.composition(
-                sdQ_epi_slice,
-                cute.make_layout((self.heads_padded, self.head_dim_padded)),
-            )
-            for ei in cutlass.range_constexpr(cute.size(tDQrDQ_bf16)):
-                h = cute.get(tCcDQ[ei], mode=[0, 0])
-                d = cute.get(tCcDQ[ei], mode=[0, 1])
-                sdQ_gemm_view[h, d] = tDQrDQ_bf16[ei]
+        tRDQ_rdQ = tiled_smem_store_dq.retile(tDQrDQ_bf16)
+        cute.copy(tiled_smem_store_dq, tRDQ_rdQ, tRDQ_sdQ)
 
         self.compute_sync_barrier.arrive_and_wait()
         cute.arch.fence_proxy("async.shared", space="cta")
@@ -3070,48 +2968,31 @@ class IndexerBackwardSm100:
             cute.copy(tma_atom_dQ, tdQsdQ, tdQgdQ_mkl)
             dQ_store_pipeline.producer_commit()
 
-        if const_expr(use_stmatrix_ds):
-            # 16dp256b8x gives each thread two heads, selected by pair bit 0;
-            # the four lanes sharing lane//4 cover disjoint columns for those
-            # same heads.  Reduce only that 4-lane subgroup instead of doing
-            # 16 full-warp reductions and repeatedly scanning all 64 values.
-            sum_low = Float32(0.0)
-            sum_high = Float32(0.0)
-            for ei in cutlass.range(cute.size(dw_accum), unroll_full=True):
-                if (ei // 2) % 2 == 0:
-                    sum_low = sum_low + dw_accum[ei]
-                else:
-                    sum_high = sum_high + dw_accum[ei]
-            sum_low = cute.arch.warp_reduction_sum(
-                sum_low,
-                threads_in_group=4,
-            )
-            sum_high = cute.arch.warp_reduction_sum(
-                sum_high,
-                threads_in_group=4,
-            )
-            if lane_id % 4 == 0:
-                h0 = warp_id_in_wg * 16 + lane_id // 4
-                if h0 < self.heads:
-                    mdW[seq_idx, h0, batch_idx] = self.q_dtype(sum_low)
-                if h0 + 8 < self.heads:
-                    mdW[seq_idx, h0 + 8, batch_idx] = self.q_dtype(sum_high)
-        else:
-            HEADS_PER_WARP = const_expr(self.heads_padded // 4)
-            warp_base_h = warp_id_in_wg * Int32(HEADS_PER_WARP)
-            for h_local in cutlass.range_constexpr(HEADS_PER_WARP):
-                h = warp_base_h + h_local
-                my_partial = Float32(0.0)
-                for ei in cutlass.range(cute.size(dw_accum), unroll_full=True):
-                    if const_expr(use_stmatrix_ds):
-                        elem_h = cute.get(tCcS[ei], mode=[0])
-                    else:
-                        elem_h = cute.get(tCcS[ei], mode=[0, 0])
-                    if elem_h == h:
-                        my_partial = my_partial + dw_accum[ei]
-                total = cute.arch.warp_reduction_sum(my_partial)
-                if lane_id == 0 and h < self.heads:
-                    mdW[seq_idx, h, batch_idx] = self.q_dtype(total)
+        # 16dp256b8x gives each thread two heads, selected by pair bit 0;
+        # the four lanes sharing lane//4 cover disjoint columns for those
+        # same heads.  Reduce only that 4-lane subgroup instead of doing
+        # 16 full-warp reductions and repeatedly scanning all 64 values.
+        sum_low = Float32(0.0)
+        sum_high = Float32(0.0)
+        for ei in cutlass.range(cute.size(dw_accum), unroll_full=True):
+            if (ei // 2) % 2 == 0:
+                sum_low = sum_low + dw_accum[ei]
+            else:
+                sum_high = sum_high + dw_accum[ei]
+        sum_low = cute.arch.warp_reduction_sum(
+            sum_low,
+            threads_in_group=4,
+        )
+        sum_high = cute.arch.warp_reduction_sum(
+            sum_high,
+            threads_in_group=4,
+        )
+        if lane_id % 4 == 0:
+            h0 = warp_id_in_wg * 16 + lane_id // 4
+            if h0 < self.heads:
+                mdW[seq_idx, h0, batch_idx] = self.q_dtype(sum_low)
+            if h0 + 8 < self.heads:
+                mdW[seq_idx, h0 + 8, batch_idx] = self.q_dtype(sum_high)
 
     # =========================================================================
     # Warps 12-15: Reduce warpgroup (wide dK T2R + FP32 global reduce, 2-stage)
@@ -3300,8 +3181,6 @@ class IndexerBackwardSm100:
     @cute.jit
     def _k_load_warpgroup(
         self,
-        mK,
-        sK,
         sK_raw_ptr,
         sTopkIdxs,
         mTopkIdx,
@@ -3747,6 +3626,33 @@ class ScoreGradSm100:
                 )
 
 
+def _compile_score_grad(topk: int, zero_dk_f32: bool):
+    """Compile (or reuse) kernel 1 for one top-k width, from fake operands only (R11)."""
+    compile_key = (topk, zero_dk_f32)
+    if compile_key not in _score_grad_cute_cache:
+        from cudnn.deepseek_sparse_attention.utils.tensor_conversion import fake_cute_tensor
+
+        kernel_obj = ScoreGradSm100(
+            topk=topk,
+            zero_dk_f32=zero_dk_f32,
+        )
+        # The unused dummy (a second GradLoss-shaped operand) keeps the two
+        # specializations on one kernel signature; const_expr removes every
+        # access in score-only mode.
+        dk_arg = fake_cute_tensor(cutlass.Float32, 3) if zero_dk_f32 else fake_cute_tensor(cutlass.Float32, 1)
+        _score_grad_cute_cache[compile_key] = cute.compile(
+            kernel_obj,
+            fake_cute_tensor(cutlass.Float32, 3),
+            fake_cute_tensor(cutlass.Float32, 3),
+            fake_cute_tensor(cutlass.Float32, 1),
+            dk_arg,
+            cutlass.Float32(1.0),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+            options=compile_options("--opt-level 2"),
+        )
+    return _score_grad_cute_cache[compile_key]
+
+
 def _score_grad_inplace_cute(
     AttnScore,
     IndexScore,
@@ -3755,8 +3661,6 @@ def _score_grad_inplace_cute(
     dIndexK_f32=None,
     current_stream=None,
 ):
-    from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
-
     # Kernel reads ``mGradLoss[0]`` so it must be at least 1-D. ``to_cute_tensor``
     # defaults ``leading_dim = ndim - 1`` which collapses to -1 for a 0-D scalar
     # and trips cute's layout validator. The public wrapper reshapes upstream;
@@ -3766,29 +3670,10 @@ def _score_grad_inplace_cute(
 
     _, _, topk = AttnScore.shape
     zero_dk_f32 = dIndexK_f32 is not None
-    compile_key = (topk, zero_dk_f32)
+    compiled = _compile_score_grad(topk, zero_dk_f32)
     s = _resolve_stream(current_stream)
-    if compile_key not in _score_grad_cute_cache:
-        kernel_obj = ScoreGradSm100(
-            topk=topk,
-            zero_dk_f32=zero_dk_f32,
-        )
-        # The unused dummy keeps the two specializations on one kernel
-        # signature; const_expr removes every access in score-only mode.
-        dk_arg = dIndexK_f32 if zero_dk_f32 else GradLoss
-        _score_grad_cute_cache[compile_key] = cute.compile(
-            kernel_obj,
-            to_cute_tensor(AttnScore),
-            to_cute_tensor(IndexScore),
-            to_cute_tensor(GradLoss),
-            to_cute_tensor(dk_arg),
-            cutlass.Float32(float(grad_scale)),
-            s,
-            options=compile_options("--opt-level 2"),
-        )
-
     dk_arg = dIndexK_f32 if zero_dk_f32 else GradLoss
-    _score_grad_cute_cache[compile_key](
+    compiled(
         AttnScore,
         IndexScore,
         GradLoss,
@@ -3866,8 +3751,13 @@ def _build_cute_dsl_kernel(
     deterministic: bool = False,
     deterministic_dk_planes: int = DEFAULT_DK_PLANES,
 ):
-    """Create lazily compiled score/GEMM runners for one launch policy."""
-    from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
+    """Create score/GEMM runners for one launch policy.
+
+    ``_run.precompile(d_index_k_dtype)`` compiles every kernel ``_run`` launches
+    for that output dtype from fake operands (R11), so plan compile does the
+    build; a direct ``gemm_only`` caller still compiles on first use.
+    """
+    from cudnn.deepseek_sparse_attention.utils.tensor_conversion import fake_cute_tensor
 
     persistent_grid_size = None
     if deterministic:
@@ -3915,19 +3805,28 @@ def _build_cute_dsl_kernel(
         deterministic_dk_planes,
     )
 
-    def _ensure_compiled(
-        IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, AttnScore, TopkIndices, enable_score_pdl: bool, dk_column_permuted: bool, current_stream=None
-    ):
-        """Lazy-compile the GEMM kernel (kernel 2)."""
+    def _ensure_compiled(enable_score_pdl: bool, dk_column_permuted: bool):
+        """Compile (or reuse) one GEMM (kernel 2) variant from fake operands (R11).
+
+        Operands: Q/dQ (B, S_q, H, D), W/dW (B, S_q, H) and K (B, S_k, D) in
+        BF16; the FP32 dK target (natural, permuted scratch, or deterministic
+        planes) and grad_signal (B, S_q, topk); INT32 top-k (B, S_q, topk).
+        """
         compile_key = (*compile_key_base, enable_score_pdl, dk_column_permuted)
         if compile_key not in _compile_cache:
-            s = _resolve_stream(current_stream)
-            cute_args = [to_cute_tensor(t) for t in [IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, AttnScore, TopkIndices]]
+            bf16, f32 = cutlass.BFloat16, cutlass.Float32
             _compile_cache[compile_key] = cute.compile(
                 kernel_objects[(enable_score_pdl, dk_column_permuted)],
-                *cute_args,
+                fake_cute_tensor(bf16, 4),
+                fake_cute_tensor(bf16, 3),
+                fake_cute_tensor(bf16, 3),
+                fake_cute_tensor(bf16, 4),
+                fake_cute_tensor(bf16, 3),
+                fake_cute_tensor(f32, 3),
+                fake_cute_tensor(f32, 3),
+                fake_cute_tensor(cutlass.Int32, 3),
                 cutlass.Float32(sm_scale),
-                s,
+                cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
                 options=compile_options("--opt-level 2"),
             )
 
@@ -3948,19 +3847,7 @@ def _build_cute_dsl_kernel(
         if dk_column_permuted and not use_permuted_scratch:
             raise ValueError("dk_column_permuted requires deterministic=False")
         compile_key = (*compile_key_base, enable_score_pdl, dk_column_permuted)
-        _ensure_compiled(
-            IndexQ,
-            Weights,
-            IndexK,
-            dIndexQ,
-            dWeights,
-            dIndexK_f32,
-            GradSignal,
-            TopkIndices,
-            enable_score_pdl,
-            dk_column_permuted,
-            current_stream=current_stream,
-        )
+        _ensure_compiled(enable_score_pdl, dk_column_permuted)
         with torch.cuda.nvtx.range("indexer_backward_dsl_gemm"):
             _compile_cache[compile_key](
                 IndexQ,
@@ -4128,7 +4015,20 @@ def _build_cute_dsl_kernel(
             with _torch_stream_context(current_stream):
                 dk_column_permuted_view(dIndexK).copy_(dIndexK_f32.view(*dIndexK.shape[:-1], 8, 4, 2, 2))
 
+    def _precompile(d_index_k_dtype: torch.dtype):
+        """Compile every kernel ``_run`` launches for this ``d_index_k`` dtype."""
+        if deterministic:
+            _compile_score_grad(topk, False)
+            _ensure_compiled(True, False)
+            compile_reduce_deterministic_dk(dim, d_index_k_dtype, deterministic_dk_planes)
+        else:
+            # ScoreGrad clears the FP32 target; a BF16 output accumulates into
+            # the column-permuted private scratch.
+            _compile_score_grad(topk, True)
+            _ensure_compiled(True, d_index_k_dtype != torch.float32)
+
     _run.score_grad = _score_grad_inplace
     _run.gemm_only = _run_gemm_only
+    _run.precompile = _precompile
 
     return _run

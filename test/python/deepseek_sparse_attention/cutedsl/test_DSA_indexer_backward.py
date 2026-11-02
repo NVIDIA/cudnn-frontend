@@ -351,6 +351,85 @@ def test_DSA_indexer_backward_packed_shapes_reuse_compilation(monkeypatch):
             monkeypatch.setattr(cute, "compile", forbidden_compile)
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "deterministic,dk_dtype",
+    [(False, torch.bfloat16), (False, torch.float32), (True, torch.bfloat16)],
+    ids=["bf16_d_index_k", "fp32_d_index_k", "deterministic"],
+)
+@torch_fork_set_rng(seed=0)
+def test_DSA_indexer_backward_compile_builds_every_kernel(monkeypatch, deterministic, dk_dtype, compile_allocates_nothing):
+    """``compile()`` builds every kernel the plan launches, from fake operands and
+    without allocating (R11). ``execute()`` then never compiles, so a build
+    failure cannot surface after kernel 1 has overwritten ``attn_score``."""
+    try:
+        import cutlass.cute as cute
+        from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.indexer_backward import deterministic_dk_sm100, indexer_backward_sm100, indexer_backward_sm90
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    _require_indexer_backward_gpu()
+    if deterministic and torch.cuda.get_device_capability() not in deterministic_dk_sm100.INDEXER_BACKWARD_SM100_CAPABILITIES:
+        pytest.skip("deterministic IndexerBackward requires SM100/SM103")
+
+    # Fresh caches: the build must happen in this plan's compile(), not be
+    # inherited from an earlier test.
+    for module in (indexer_backward_sm100, indexer_backward_sm90):
+        monkeypatch.setattr(module, "_compile_cache", {})
+        monkeypatch.setattr(module, "_score_grad_cute_cache", {})
+    monkeypatch.setattr(deterministic_dk_sm100, "_compile_cache", {})
+    real_compile = cute.compile
+    compiles = []
+
+    def counting_compile(*args, **kwargs):
+        compiles.append(type(args[0]).__name__)
+        return real_compile(*args, **kwargs)
+
+    monkeypatch.setattr(cute, "compile", counting_compile)
+
+    cfg = dict(b=1, s_q=64, s_kv=512, head_dim=128, qhead_per_kv_head=64, topk=256)
+    index_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
+    outputs = (torch.empty_like(index_q), torch.empty_like(weights), torch.empty_like(index_k, dtype=dk_dtype))
+    plan = DSA.IndexerBackward(
+        sample_index_q=index_q,
+        sample_weights=weights,
+        sample_index_k=index_k,
+        sample_d_index_q=outputs[0],
+        sample_d_weights=outputs[1],
+        sample_d_index_k=outputs[2],
+        sample_attn_score=attn_score,
+        sample_index_score=index_score,
+        sample_topk_indices=topk_indices,
+        deterministic=deterministic,
+    )
+    assert plan.check_support()
+    ws_bytes = plan.scratch_workspace_bytes()
+    workspace = torch.empty(ws_bytes, dtype=torch.uint8, device="cuda") if ws_bytes else None
+    compile_allocates_nothing(plan)
+    expected = 3 if deterministic else 2
+    assert len(compiles) == expected, f"compile() built {compiles}, expected {expected} kernels"
+
+    def forbidden_compile(*args, **kwargs):
+        raise AssertionError(f"execute() compiled {type(args[0]).__name__}; compile() must have built it")
+
+    monkeypatch.setattr(cute, "compile", forbidden_compile)
+    plan.execute(
+        index_q,
+        weights,
+        index_k,
+        *outputs,
+        attn_score,
+        index_score,
+        topk_indices,
+        torch.ones((), dtype=torch.float32, device="cuda"),
+        loss_coeff=float(cfg["s_q"]),
+        workspace=workspace,
+    )
+    torch.cuda.synchronize()
+    for name, tensor in zip(("d_index_q", "d_weights", "d_index_k"), outputs):
+        assert torch.isfinite(tensor.float()).all(), f"{name} contains NaN/Inf"
+
+
 # ===========================================================================
 # Regression coverage for the output/plan-signature validation on the default
 # indexer backward (SM100/SM90):

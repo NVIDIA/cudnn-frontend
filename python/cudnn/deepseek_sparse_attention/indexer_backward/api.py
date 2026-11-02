@@ -509,11 +509,13 @@ class IndexerBackward(APIBase):
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
-        # The factories return a closure whose GEMM stage lazy-compiles on
-        # first call; ``grad_scale`` is a runtime argument of execute().
-        # Deterministic plans build under the plan's device (their capability
-        # gate read it); the ordinary path follows the current device, as the
-        # factories' own architecture checks do.
+        # The build happens here, not on the first execute: ``precompile``
+        # compiles every kernel the plan launches from fake operands (R11), so
+        # a compile failure can never surface after kernel 1 has overwritten
+        # ``attn_score``. ``grad_scale`` and ``sm_scale`` stay runtime
+        # arguments. Deterministic plans build under the plan's device (their
+        # capability gate read it); the ordinary path follows the current
+        # device, as the factories' own architecture checks do.
         if self.deterministic:
             kernel_factory, extra, device_scope = (
                 indexer_backward_sm100,
@@ -536,6 +538,7 @@ class IndexerBackward(APIBase):
                 topk_indices_global=self.topk_indices_global,
                 **extra,
             )
+            self._compiled_kernel.precompile(self.dik_desc.dtype)
 
     def scratch_workspace_bytes(self) -> int:
         """Return caller-owned scratch bytes for the selected dK policy.
@@ -739,7 +742,10 @@ class DenseIndexerBackward(APIBase):
         self._check_dtype(self.idx_lse_desc, torch.float32, name="index_lse")
         self._value_error_if(self.block_I <= 0, f"block_I must be positive, got {self.block_I}")
         self._value_error_if(self.ratio < 1, f"ratio must be >= 1, got {self.ratio}")
-        self._value_error_if(self.heads < 64, f"DenseIndexerBackward requires heads >= 64, got {self.heads}")
+        # Both dense kernels use the head count as the MMA M and are built for
+        # H64 only (SM100: H96 is no legal TCGEN05 M, H128 exceeds the launch
+        # resources; SM90: WGMMA M is 64).
+        self._value_error_if(self.heads != 64, f"DenseIndexerBackward requires heads == 64, got {self.heads}")
         # Cross-tensor shape contract (the wrapper's ``_dense_shapes``, restated on the
         # descriptors): a directly built plan may pair tensors that each match their own
         # descriptor yet disagree with each other, and the kernel sizes its grid and the
