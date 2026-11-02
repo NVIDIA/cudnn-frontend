@@ -4398,6 +4398,62 @@ def test_splitk_epilogue_reduction():
     assert out_am.flatten()[0] == ref.abs().amax()
 
 
+@pytest.mark.parametrize(
+    "mode,dim",
+    [("AMAX", "scalar"), ("ADD", "per_row"), ("MAX", "per_col")],
+    ids=("amax", "row_add", "col_max"),
+)
+def test_splitk_reduction_only_outputs(mode, dim):
+    """A chain whose only outputs are reductions (no dense tensor) under split-K. The main kernel stores fp32
+    partials through output 0's TMA slot and the reducer renders the reductions; the SM100 main-kernel epilogue
+    used to look the reduction's tap up anyway and raised KeyError: 0 at compile time, also for the automatic
+    pick (matmul -> relu -> AMAX at 256x256x16384 listed SPLIT_K_SLC=4)."""
+    M, N, K = 256, 256, 4096
+    red_dim = {"scalar": [1, 1, 1], "per_row": [1, M, 1], "per_col": [1, 1, N]}[dim]
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    R = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="r")
+    red = g.reduction(input=R, mode=getattr(cudnn.reduction_mode, mode), name="red")
+    red.set_dim(red_dim).set_stride([red_dim[1] * red_dim[2], red_dim[2], 1])
+    red.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    compiled = _jit_splitk(g, 8, base_cfg=_splitk_cfg(_SPLITK_EPI_CFG))
+    a, b, _, _ = _splitk_data(1, M, N, K)
+    out = torch.zeros(red_dim, dtype=torch.float32, device="cuda")
+    _run_splitk(compiled, _vp(compiled, a, b, [out]))
+    # Integer data: every product, sum and partial is exact in fp32, so the atomic order cannot matter.
+    ref = torch.relu(torch.einsum("bmk,bnk->bmn", a.float(), b.float()))
+    expected = {"AMAX": lambda t: t.abs().amax(), "ADD": lambda t: t.sum(dim=2, keepdim=True), "MAX": lambda t: t.amax(dim=1, keepdim=True)}[mode](ref)
+    torch.testing.assert_close(out, expected.reshape(red_dim), atol=0, rtol=0)
+
+
+@requires_sm100
+def test_frost_gemm_builds_its_split_k_pick_for_a_reduction_only_chain(monkeypatch):
+    """The engine path of test_splitk_reduction_only_outputs: a small output grid with a deep K makes the automatic
+    pick split K, and the listed FROST plan for matmul -> relu -> AMAX must build and run."""
+    monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+    M, N, K = 256, 256, 16384
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    a, b, _, _ = _splitk_data(1, M, N, K)
+    A, B = g.tensor_like(a), g.tensor_like(b.transpose(1, 2))
+    amax = g.reduction(input=g.relu(input=g.matmul(A=A, B=B)), mode=cudnn.reduction_mode.AMAX)
+    amax.set_dim([1, 1, 1]).set_stride([1, 1, 1]).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A])
+    names = [g.get_plan_name_at_index(i) for i in range(g.get_execution_plan_count())]
+    index = next((i for i, name in enumerate(names) if name.startswith("frost_gemm")), None)
+    assert index is not None, names
+    if "SPLIT_K_SLC=1," in names[index]:
+        pytest.skip(f"the automatic pick does not split K on this device: {names[index]}")
+    g.build_plan_at_index(index)
+    workspace = torch.empty(max(1, g.get_workspace_size_plan_at_index(index)), dtype=torch.uint8, device="cuda")
+    out = torch.zeros(1, 1, 1, dtype=torch.float32, device="cuda")
+    g.execute_plan_at_index({A: a, B: b.transpose(1, 2), amax: out}, workspace, index)
+    torch.cuda.synchronize()
+    assert out.item() == torch.relu(torch.einsum("bmk,bnk->bmn", a.float(), b.float())).amax().item()
+
+
 def _splitk_tile_reduction_graph(batch, mode):
     """relu + one fp32 reduction over all of M and N (per batch when ``batch`` > 1)."""
     M, N, K = 256, 256, 4096
