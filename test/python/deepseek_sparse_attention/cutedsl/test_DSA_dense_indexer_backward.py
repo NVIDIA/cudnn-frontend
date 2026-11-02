@@ -318,24 +318,37 @@ def test_execute_allocates_nothing_and_never_synchronizes(dk_dtype, compile_allo
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("heads", [32, 128], ids=["h32", "h128"])
+@pytest.mark.parametrize(
+    "capability,heads,head_dim,block_I,match",
+    [
+        pytest.param((10, 0), 32, 128, 128, "requires heads == 64", id="sm100-h32"),
+        pytest.param((10, 0), 128, 128, 128, "requires heads == 64", id="sm100-h128"),
+        pytest.param((10, 0), 64, 96, 128, r"SM100 DenseIndexerBackward requires D in \(64, 128\)", id="sm100-d96"),
+        pytest.param((10, 0), 64, 128, 256, r"SM100 DenseIndexerBackward requires block_I in \(64, 128\)", id="sm100-block_i256"),
+        pytest.param((9, 0), 128, 128, 128, "requires heads == 64", id="sm90-h128"),
+        pytest.param((9, 0), 64, 64, 128, "SM90 DenseIndexerBackward requires D=128 and block_I=128", id="sm90-d64"),
+        pytest.param((9, 0), 64, 128, 64, "SM90 DenseIndexerBackward requires D=128 and block_I=128", id="sm90-block_i64"),
+    ],
+)
 @torch_fork_set_rng(seed=0)
-def test_DSA_dense_indexer_backward_rejects_unsupported_heads(heads):
-    """Both dense kernels are built for H64 only (H96 is no legal TCGEN05 M and
-    H128 exceeds the SM100 launch resources; SM90 WGMMA M is 64), so
-    check_support declines other head counts before any score buffer moves."""
+def test_DSA_dense_indexer_backward_rejects_unsupported_plans(monkeypatch, capability, heads, head_dim, block_I, match):
+    """check_support admits only the tiles each dense kernel serves: H64 on both
+    arches (H96 is no legal TCGEN05 M and H128 exceeds the SM100 launch
+    resources; SM90 WGMMA M is 64), D and block_I in {64, 128} on SM100 (TCGEN05
+    M), and the validated D128 x I128 tile on SM90. Declines happen before any
+    score buffer moves."""
     try:
         from cudnn import DSA
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    major = torch.cuda.get_device_capability()[0]
-    if major != 9 and major < 10:
-        pytest.skip("DenseIndexerBackward requires SM90 or SM100+")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required to build DenseIndexerBackward tensor descriptors")
 
-    cfg = dict(b=1, s_q=8, s_kv=128, head_dim=128, qhead_per_kv_head=heads)
+    cfg = dict(b=1, s_q=8, s_kv=128, head_dim=head_dim, qhead_per_kv_head=heads)
     index_q, weights, index_k, attn_score, attn_l1norm, index_score, index_lse = _allocate(cfg, sm_scale=1.0, ratio=1, q_causal_offsets=None)
     attn_before, index_before = attn_score.clone(), index_score.clone()
-    with pytest.raises(ValueError, match="requires heads == 64"):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+    with pytest.raises(ValueError, match=match):
         DSA.dense_indexer_backward_wrapper(
             index_q,
             weights,
@@ -345,6 +358,7 @@ def test_DSA_dense_indexer_backward_rejects_unsupported_heads(heads):
             index_score,
             index_lse,
             grad_loss=torch.ones((), dtype=torch.float32, device="cuda"),
+            block_I=block_I,
         )
     assert torch.equal(attn_score, attn_before)
     assert torch.equal(index_score, index_before)

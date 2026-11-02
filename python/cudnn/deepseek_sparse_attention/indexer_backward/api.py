@@ -740,7 +740,23 @@ class DenseIndexerBackward(APIBase):
         self._check_dtype(self.attn_denom_desc, torch.float32, name="attn_l1norm")
         self._check_dtype(self.idx_score_desc, torch.float32, name="index_score")
         self._check_dtype(self.idx_lse_desc, torch.float32, name="index_lse")
-        self._value_error_if(self.block_I <= 0, f"block_I must be positive, got {self.block_I}")
+        if major == 9:
+            # Only the D128 x I128 tile is validated on SM90.
+            self._value_error_if(
+                self.head_dim != 128 or self.block_I != 128,
+                f"SM90 DenseIndexerBackward requires D=128 and block_I=128, got D={self.head_dim}, block_I={self.block_I}",
+            )
+        else:
+            # TCGEN05 takes M in {64, 128} (block_I is the dK GEMM's M); D64
+            # and block_I=64 run through the kernel's coordinate-store paths.
+            self._value_error_if(
+                self.head_dim not in (64, 128),
+                f"SM100 DenseIndexerBackward requires D in (64, 128), got D={self.head_dim}",
+            )
+            self._value_error_if(
+                self.block_I not in (64, 128),
+                f"SM100 DenseIndexerBackward requires block_I in (64, 128), got block_I={self.block_I}",
+            )
         self._value_error_if(self.ratio < 1, f"ratio must be >= 1, got {self.ratio}")
         # Both dense kernels use the head count as the MMA M and are built for
         # H64 only (SM100: H96 is no legal TCGEN05 M, H128 exceeds the launch
