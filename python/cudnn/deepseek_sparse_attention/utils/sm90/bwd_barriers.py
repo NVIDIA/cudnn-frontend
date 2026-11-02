@@ -36,7 +36,7 @@ id for two different logical barriers).
 
 
 class NamedBarrierBwd:
-    # ---- Group A: FA bwd dS / dQ warp-split kernel (ids 1..7) -------- #
+    # ---- Group A: FA bwd dS / dQ warp-split kernel (ids 1..10) ------- #
     sP_ready = 1  # WG0 -> WG1: sP R2S done
     sdS_ready = 2  # WG0 -> WG1: sdS R2S done
     sP_consumed = 3  # WG1 -> WG0: all GEMM3 read sP done (PdS_stage==1)
@@ -44,6 +44,7 @@ class NamedBarrierBwd:
     G4_half_ready = 5  # WG1 -> WG0: WG1 G4_half committed, WG0 can issue G4_half
     Epilogue_WG0 = 6  # WG0 internal sync (epilogue_dQ R2S)
     Epilogue_WG1 = 7  # WG1 internal sync (epilogue_dQ R2S)
+    DKVRelay = 10  # WG1 internal sync around deterministic GPU-scope dKV relay publication
 
     # ---- Group B: bwd sparse score 2-WG kernel (ids 8..13) ----------- #
     WG0_producer_sync = 8  # WG0 internal sync — warp0 TMA KV done, all 128 threads can proceed

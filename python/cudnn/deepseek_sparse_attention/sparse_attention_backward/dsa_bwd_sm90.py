@@ -12,7 +12,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_basic
-from cutlass import Boolean, Float32, Int32, const_expr
+from cutlass import Boolean, Float32, Int32, Uint32, const_expr
 from cutlass._mlir.dialects import arith
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cudnn._cutlass_compat import LayoutEnum, SmemAllocator
@@ -50,6 +50,21 @@ from cudnn.deepseek_sparse_attention.utils.sm90.primitives import (
     transpose_view,
     warp_reduce,
 )
+
+
+@cute.jit
+def _wait_lower_relay_ranks(mask_ptr, lower_rank_mask: Uint32):
+    """Acquire every lower relay rank that owns the same KV row."""
+    current = cute.arch.load(mask_ptr, Uint32, sem="relaxed", scope="gpu")
+    loop = cutlass.while_generate([current], lambda value: (value & lower_rank_mask) != Uint32(0))
+    with loop as [value]:
+        value = cute.arch.load(mask_ptr, Uint32, sem="relaxed", scope="gpu")
+        cutlass.yield_out([value])
+    acquired = cute.arch.load(mask_ptr, Uint32, sem="acquire", scope="gpu")
+    acquire_loop = cutlass.while_generate([acquired], lambda value: (value & lower_rank_mask) != Uint32(0))
+    with acquire_loop as [value]:
+        value = cute.arch.load(mask_ptr, Uint32, sem="acquire", scope="gpu")
+        cutlass.yield_out([value])
 
 
 @cute.jit
@@ -448,6 +463,86 @@ class _FlashAttentionDSABackwardDSinkSm90:
             mdSink[head_idx] = acc
 
 
+class _FlashAttentionDSABackwardRelayMasksSm90:
+    """Build packed per-wave row ownership masks for the SM90 dKV relay."""
+
+    def __init__(
+        self,
+        *,
+        relay_cluster_size: int,
+        q_wave_ctas: int,
+        num_head_tiles: int,
+        num_waves: int,
+        seqlen_kv: int,
+        padded_seqlen_kv: int,
+        padded_head_dim: int,
+    ):
+        self.relay_cluster_size = relay_cluster_size
+        self.q_wave_ctas = q_wave_ctas
+        self.num_head_tiles = num_head_tiles
+        self.num_waves = num_waves
+        self.seqlen_kv = seqlen_kv
+        self.padded_seqlen_kv = padded_seqlen_kv
+        self.padded_head_dim = padded_head_dim
+        self.mask_rows_per_word = 32 // relay_cluster_size
+        self.words_per_phase = padded_seqlen_kv // self.mask_rows_per_word
+        self.data_plane_elems = padded_seqlen_kv * padded_head_dim
+
+    @cute.jit
+    def __call__(
+        self,
+        mdKVaccum: cute.Tensor,
+        mTopkIdxs: cute.Tensor,
+        mTopkLength: Optional[cute.Tensor],
+        stream: cuda.CUstream,
+    ):
+        self.kernel(mdKVaccum, mTopkIdxs, mTopkLength).launch(
+            grid=[mTopkIdxs.shape[1], 1, mTopkIdxs.shape[0]],
+            block=[256, 1, 1],
+            stream=stream,
+        )
+
+    @cute.jit
+    def _mask_word_ptr(
+        self,
+        mdKVaccum: cute.Tensor,
+        query_idx: Int32,
+        head_tile: Int32,
+        kv_row: Int32,
+        batch_idx: Int32,
+    ):
+        plane_idx = (query_idx % self.q_wave_ctas) // self.relay_cluster_size
+        wave_idx = query_idx // self.q_wave_ctas
+        phase_idx = head_tile * self.num_waves + wave_idx
+        word_offset = phase_idx * self.words_per_phase + kv_row // self.mask_rows_per_word
+        plane = mdKVaccum[batch_idx, plane_idx, None]
+        return cute.recast_ptr(plane.iterator + self.data_plane_elems + word_offset, dtype=Uint32)
+
+    @cute.kernel
+    def kernel(
+        self,
+        mdKVaccum: cute.Tensor,
+        mTopkIdxs: cute.Tensor,
+        mTopkLength: Optional[cute.Tensor],
+    ):
+        query_idx, _, batch_idx = cute.arch.block_idx()
+        tidx, _, _ = cute.arch.thread_idx()
+        topk = mTopkIdxs.shape[2]
+        if cutlass.const_expr(mTopkLength is not None):
+            topk = mTopkLength[batch_idx, query_idx]
+        topk = min(max(topk, Int32(0)), mTopkIdxs.shape[2])
+        rank = query_idx % self.relay_cluster_size
+        rank_bit = Uint32(1) << Uint32(rank)
+        for slot in cutlass.range(tidx, topk, 256):
+            kv_row = mTopkIdxs[batch_idx, query_idx, slot]
+            if kv_row >= 0 and kv_row < self.seqlen_kv:
+                row_shift = Uint32((kv_row % self.mask_rows_per_word) * self.relay_cluster_size)
+                bit = rank_bit << row_shift
+                for head_tile in cutlass.range_constexpr(self.num_head_tiles):
+                    mask_ptr = self._mask_word_ptr(mdKVaccum, query_idx, head_tile, kv_row, batch_idx)
+                    cute.arch.atomic_or(mask_ptr.llvm_ptr, bit, sem="relaxed", scope="gpu")
+
+
 class FlashAttentionDSABackwardSm90:
     arch = 90
     # TMA L2 cache hint (CUTLASS CacheHintSm90::EVICT_FIRST).
@@ -471,6 +566,11 @@ class FlashAttentionDSABackwardSm90:
         max_topk: int = 0,
         deterministic: bool = False,
         num_dkv_shards: int = 1,
+        relay_cluster_size: int = 1,
+        q_wave_ctas: int = 1,
+        num_waves: int = 1,
+        padded_seqlen_kv: int = 0,
+        padded_head_dim: int = 0,
     ):
         self.dtype = dtype
         hdim_multiple_of = 16
@@ -498,7 +598,15 @@ class FlashAttentionDSABackwardSm90:
         self.max_topk = max_topk
         self.deterministic = deterministic
         self.num_dkv_shards = num_dkv_shards
-        assert not deterministic or num_dkv_shards in (32, 64, 128)
+        self.relay_cluster_size = relay_cluster_size
+        self.q_wave_ctas = q_wave_ctas
+        self.num_waves = num_waves
+        self.padded_seqlen_kv = padded_seqlen_kv
+        self.padded_head_dim = padded_head_dim
+        self.mask_rows_per_word = 32 // relay_cluster_size
+        self.words_per_phase = padded_seqlen_kv // self.mask_rows_per_word if deterministic else 0
+        self.data_plane_elems = padded_seqlen_kv * padded_head_dim
+        assert not deterministic or (relay_cluster_size == 8 and q_wave_ctas == 128 and num_dkv_shards == q_wave_ctas // relay_cluster_size)
         # wg0 is consumer and producer, wg1 is consumer
         self.num_mma_warp_groups = self.num_threads // 128
 
@@ -829,7 +937,7 @@ class FlashAttentionDSABackwardSm90:
         softmax_scale_log2 = softmax_scale * LOG2_E
         total_q = cute.size(mQ.shape[3])
         total_head_tiles = cute.size(mQ.shape[2]) * self.qhead_tiles
-        q_wave_size = self.num_dkv_shards if cutlass.const_expr(self.deterministic) else total_q
+        q_wave_size = self.q_wave_ctas if cutlass.const_expr(self.deterministic) else total_q
         head_tiles_per_launch = 1 if cutlass.const_expr(self.deterministic) else total_head_tiles
         head_phases = total_head_tiles if cutlass.const_expr(self.deterministic) else 1
         tile_sched_args = TileSchedulerArguments(
@@ -893,6 +1001,7 @@ class FlashAttentionDSABackwardSm90:
                 ).launch(
                     grid=self.grid_dim,
                     block=[self.num_threads, 1, 1],
+                    cluster=[self.relay_cluster_size, 1, 1],
                     smem=self.shared_storage.size_in_bytes(),
                     stream=stream,
                     min_blocks_per_mp=1,
@@ -1076,6 +1185,88 @@ class FlashAttentionDSABackwardSm90:
                 head_offset,
                 TileSchedulerCls,
             )
+
+    @cute.jit
+    def _relay_mask_word_ptr(
+        self,
+        mdKVaccum: cute.Tensor,
+        m_block: Int32,
+        head_idx: Int32,
+        batch_idx: Int32,
+        kv_row: Int32,
+    ):
+        plane_idx = (m_block % self.q_wave_ctas) // self.relay_cluster_size
+        wave_idx = m_block // self.q_wave_ctas
+        phase_idx = head_idx * self.num_waves + wave_idx
+        word_offset = phase_idx * self.words_per_phase + kv_row // self.mask_rows_per_word
+        plane = mdKVaccum[None, plane_idx, batch_idx]
+        return cute.recast_ptr(plane.iterator + self.data_plane_elems + word_offset, dtype=Uint32)
+
+    @cute.jit
+    def acquire_dkv_relay(
+        self,
+        mdKVaccum: cute.Tensor,
+        mTopkIdxs_cur: cute.Tensor,
+        n_block: Int32,
+        topk: Int32,
+        max_seqlen_kv: Int32,
+        m_block: Int32,
+        head_idx: Int32,
+        batch_idx: Int32,
+        wg_tidx: Int32,
+    ):
+        """Import lower-rank releases before this CTA updates a sparse KV tile."""
+        rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        lower_rank_bits = (Uint32(1) << Uint32(rank)) - Uint32(1)
+        if wg_tidx < self.tile_n and rank > 0:
+            slot = n_block * self.tile_n + wg_tidx
+            if slot < topk:
+                kv_row = mTopkIdxs_cur[slot]
+                if kv_row >= 0 and kv_row < max_seqlen_kv:
+                    row_shift = Uint32((kv_row % self.mask_rows_per_word) * self.relay_cluster_size)
+                    lower_rank_mask = lower_rank_bits << row_shift
+                    mask_ptr = self._relay_mask_word_ptr(mdKVaccum, m_block, head_idx, batch_idx, kv_row)
+                    _wait_lower_relay_ranks(mask_ptr, lower_rank_mask)
+        if rank > 0:
+            cute.arch.barrier(
+                barrier_id=int(NamedBarrierBwd.DKVRelay),
+                number_of_threads=self.num_threads_per_warp_group,
+            )
+
+    @cute.jit
+    def release_dkv_relay(
+        self,
+        mdKVaccum: cute.Tensor,
+        mTopkIdxs_cur: cute.Tensor,
+        n_block: Int32,
+        topk: Int32,
+        max_seqlen_kv: Int32,
+        m_block: Int32,
+        head_idx: Int32,
+        batch_idx: Int32,
+        wg_tidx: Int32,
+    ):
+        """Publish this CTA's dKV updates before a later relay rank acquires them."""
+        rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        if rank < self.relay_cluster_size - 1:
+            cute.arch.barrier(
+                barrier_id=int(NamedBarrierBwd.DKVRelay),
+                number_of_threads=self.num_threads_per_warp_group,
+            )
+        if wg_tidx < self.tile_n and rank < self.relay_cluster_size - 1:
+            slot = n_block * self.tile_n + wg_tidx
+            if slot < topk:
+                kv_row = mTopkIdxs_cur[slot]
+                if kv_row >= 0 and kv_row < max_seqlen_kv:
+                    row_shift = Uint32((kv_row % self.mask_rows_per_word) * self.relay_cluster_size)
+                    bit_shift = row_shift + Uint32(rank)
+                    mask_ptr = self._relay_mask_word_ptr(mdKVaccum, m_block, head_idx, batch_idx, kv_row)
+                    word = cute.arch.load(mask_ptr, Uint32, sem="relaxed", scope="gpu")
+                    row_mask = (word >> row_shift) & Uint32((1 << self.relay_cluster_size) - 1)
+                    current_bit = Uint32(1) << Uint32(rank)
+                    if (row_mask & ~current_bit) != Uint32(0):
+                        keep_mask = ~(Uint32(1) << bit_shift)
+                        cute.arch.atomic_and(mask_ptr.llvm_ptr, keep_mask, sem="release", scope="gpu")
 
     @cute.jit
     def mma_wg0(
@@ -1809,7 +2000,7 @@ class FlashAttentionDSABackwardSm90:
             n_block_max = (topK + self.tile_n - 1) // self.tile_n
 
             # scatter AtomicAdd — flat gmem dKVaccum for per-row addressing
-            accumulator_idx = m_block % self.num_dkv_shards if cutlass.const_expr(self.deterministic) else head_idx_kv
+            accumulator_idx = (m_block % self.q_wave_ctas) // self.relay_cluster_size if cutlass.const_expr(self.deterministic) else head_idx_kv
             mdKVaccum_cur = mdKVaccum[None, accumulator_idx, batch_idx]
             mTopkIdxs_cur = mTopkIdxs[batch_idx, seq_idx, None]
 
@@ -1817,6 +2008,19 @@ class FlashAttentionDSABackwardSm90:
             first_iter = True
             while n_block >= 0:
                 smem_idx_PdS = 0  # PdS_stage=1
+
+                if cutlass.const_expr(self.deterministic):
+                    self.acquire_dkv_relay(
+                        mdKVaccum,
+                        mTopkIdxs_cur,
+                        n_block,
+                        topK,
+                        max_seqlen_kv,
+                        m_block,
+                        head_idx,
+                        batch_idx,
+                        wg_tidx,
+                    )
 
                 # ===== 9-chunk 2-stage dKV pipeline (hdim_chunk=64, 576-dim) =====
                 # c0-c7: GEMM3(P^T@dO) + GEMM5(dS^T@Q), dO has 8 chunks (512/64)
@@ -2121,6 +2325,19 @@ class FlashAttentionDSABackwardSm90:
                         tidx,
                     )
 
+                if cutlass.const_expr(self.deterministic):
+                    self.release_dkv_relay(
+                        mdKVaccum,
+                        mTopkIdxs_cur,
+                        n_block,
+                        topK,
+                        max_seqlen_kv,
+                        m_block,
+                        head_idx,
+                        batch_idx,
+                        wg_tidx,
+                    )
+
                 n_block -= 1
                 first_iter = False
 
@@ -2350,8 +2567,7 @@ class _FlashAttentionDSABackwardPostprocessSm90:
     ):
         num_head_kv = mdKV.shape[2]
         num_batch = mdKVaccum.shape[0]
-        seqlen_k_rounded = mdKVaccum.shape[2] // self.head_dim_rounded
-        num_n_blocks = cute.ceil_div(seqlen_k_rounded, self.tile_n)
+        num_n_blocks = cute.ceil_div(mdKV.shape[1], self.tile_n)
         num_blocks = num_n_blocks * self.N_hdim_chunks
 
         smem_bytes = self.tile_n * self.hdim_chunk * (self.dtype.width // 8)

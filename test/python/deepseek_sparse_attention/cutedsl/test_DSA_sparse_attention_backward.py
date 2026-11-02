@@ -4987,8 +4987,12 @@ def test_DSA_sparse_attention_backward_sm90_scratch_workspace_bytes_formula():
     expected = 2 * ws_align(sq_r * num_heads * 4) + ws_align(sk_r * hd_r * 4)
     assert flash_attn_bwd_sm90_workspace_size(s_q, s_kv, head_dim, num_heads) == expected
     assert flash_attn_bwd_sm90_workspace_size(64, 64, 512, 16) == 2 * ws_align(64 * 16 * 4) + ws_align(64 * 512 * 4)
-    expected_deterministic = 2 * ws_align(sq_r * num_heads * 4) + ws_align(32 * sk_r * hd_r * 4)
+    # One packed rank-mask row follows each of the sixteen cluster-8 planes.
+    expected_deterministic = 2 * ws_align(sq_r * num_heads * 4) + ws_align(16 * (sk_r + 1) * hd_r * 4)
     assert flash_attn_bwd_sm90_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True) == expected_deterministic
+    large_stats = ws_align(1088 * 128 * 4)
+    expected_large_relay = 2 * large_stats + ws_align(16 * (1088 + 9) * 576 * 4)
+    assert flash_attn_bwd_sm90_workspace_size(1025, 1025, 576, 128, deterministic=True) == expected_large_relay
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
         return
@@ -5025,8 +5029,9 @@ def test_DSA_sparse_attention_backward_sm90_execute_allocates_nothing_and_never_
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=92)
-def test_DSA_sparse_attention_backward_sm90_deterministic_bounded_waves():
-    """Hopper dQ, dKV, and dSink stay bitwise stable across a shard boundary."""
+@pytest.mark.parametrize("has_topk_length", [False, True], ids=["compact", "lengths"])
+def test_DSA_sparse_attention_backward_sm90_deterministic_relay(has_topk_length):
+    """Hopper relay ranks, head phases, and query waves stay bitwise stable."""
     try:
         from cuda.bindings import driver as cuda
     except ImportError:
@@ -5036,10 +5041,10 @@ def test_DSA_sparse_attention_backward_sm90_deterministic_bounded_waves():
     plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
         96,
         576,
-        64,
-        s_q=33,
+        128,
+        s_q=129,
         s_kv=256,
-        has_topk_length=True,
+        has_topk_length=has_topk_length,
         deterministic=True,
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
