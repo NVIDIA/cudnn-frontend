@@ -176,7 +176,7 @@ def native_components(inputs, backward_inputs, args):
     backward_ids, backward_counts = _metadata.compact(*compact_args, arch, stream)
     result["backward_compact_with_allocation"] = timed(lambda: _metadata.compact(*compact_args, arch, stream))
     result["warm_backward_compact_compile_lookup"] = host_timed(lambda: _metadata.compile_kernel(arch))
-    plan = engine.plan_for(q.shape[0], q.device, k.shape[1], engine.SEQ_ORIGIN, num_seqs=min(q.shape[0], first.shape[0]))
+    plan = engine.plan_for(q.shape[0], q.device, k.shape[1], engine.SEQ_ORIGIN, num_seqs=min(q.shape[0], first.shape[0]), gq=q.shape[1] // k.shape[1])
     fns = engine.compile_kernels(plan)
     result["warm_bprop_compile_lookup"] = host_timed(lambda: engine.compile_kernels(plan))
     workspace = torch.empty(plan.workspace_bytes(), dtype=torch.uint8, device=q.device)

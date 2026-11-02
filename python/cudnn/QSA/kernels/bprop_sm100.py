@@ -31,7 +31,9 @@ I32 = cutlass.Int32
 F32 = cutlass.Float32
 BF16 = cutlass.BFloat16
 
-# Geometry: GQ query heads per KV head, HKV in (1, 2) KV heads. The kernels take HKV as a compile-time parameter.
+# Geometry: GQ head rows per query in the MMA tiles, HKV in (1, 2) KV heads. The kernels take HKV and GH, the real
+# query heads per KV head (12, or 6 for the four-way tensor-parallel shard), as compile-time parameters: with GH < GQ
+# the tile rows past GH read zero Q / dO, lse = +inf and delta = 0, so their P and dS are zero and dQ skips them.
 GQ = 12
 D = 256
 SPARSE_CAP = 513  # blocks per query past the dense prefix: top-512 complete blocks and the causal tail block
@@ -194,13 +196,33 @@ def _prefetch_block(tmap, tok, PAIR: cutlass.Constexpr[bool]):
 
 
 @cute.jit
-def _load_lse4(lse: cute.Tensor, flat: I32, HQ: cutlass.Constexpr[int]):
-    # four heads of one query from the native [Hq, T] LSE
-    qi = flat // HQ
-    head = flat % HQ
+def _lse_rows(lse: cute.Tensor, qi, h0, GH: cutlass.Constexpr[int]):
+    # the GQ head rows of one query from the native [Hq, T] LSE, from head h0; rows past the GH real heads read +inf
     values = []
-    for i in cutlass.range_constexpr(4):
-        values.append(lse[head + i, qi])
+    for i in cutlass.range_constexpr(GQ):
+        if cutlass.const_expr(i < GH):
+            values.append(lse[h0 + i, qi])
+        else:
+            values.append(F32(float("inf")))
+    return cutlass.Vector.from_elements(values, F32)
+
+
+@cute.jit
+def _delta_rows(p_delta, base, GH: cutlass.Constexpr[int]):
+    # the GQ head rows of one query's delta from flat index base (16-byte aligned when every row is a real head);
+    # rows past the GH real heads read 0
+    values = []
+    if cutlass.const_expr(GH == GQ):
+        for c in cutlass.range_constexpr(GQ // 4):
+            v4 = (p_delta + base + c * 4).load(count=4, alignment=16)
+            for i in cutlass.range_constexpr(4):
+                values.append(v4[i])
+    else:
+        for i in cutlass.range_constexpr(GQ):
+            if cutlass.const_expr(i < GH):
+                values.append((p_delta + base + i).load())
+            else:
+                values.append(F32(0.0))
     return cutlass.Vector.from_elements(values, F32)
 
 
@@ -225,10 +247,11 @@ def qsa_bwd_sparse_query_kernel(
     NP: I32,
     scale: F32,
     HKV: cutlass.Constexpr[int],
+    GH: cutlass.Constexpr[int],
 ):
     # An item is one sparse query (two KV heads) or two consecutive ones of the compacted list (one KV head), see the
     # SMEM layout note.
-    HQ = GQ * HKV
+    HQ = GH * HKV
     PAIR = HKV == 1
     QSTEP = 2 if PAIR else 1
     REC_W = _rec_w(HKV)
@@ -346,7 +369,7 @@ def qsa_bwd_sparse_query_kernel(
                             if cutlass.const_expr(PAIR):
                                 if j + 1 < nsq:
                                     nqq = I32(2)
-                            prims.mbarrier_arrive_expect_tx(b_qf, nqq * (8 * Q_BOX_BYTES // QSTEP))
+                            prims.mbarrier_arrive_expect_tx(b_qf, nqq * (2 * 4 * GH * HKV * 128))
                             for h in cutlass.range_constexpr(QSTEP):
                                 if h < nqq:
                                     qh = (p_sparse_queries + (j + h)).load()
@@ -630,10 +653,10 @@ def qsa_bwd_sparse_query_kernel(
                         if jr >= nsq:
                             jr = j
                     qr = (p_sparse_queries + jr).load()
-                    if cutlass.const_expr(PAIR):
-                        lbase = qr * HQ
-                    else:
-                        lbase = qr * HQ + hrow * GQ
+                    h0 = I32(0)
+                    if cutlass.const_expr(not PAIR):
+                        h0 = hrow * GH
+                    lbase = qr * HQ + h0
                     # the inclusive key bounds of the query: a block's tokens outside them have zero P / dS
                     lo_q = (p_lo + qr).load()
                     hi_q = (p_hi + qr).load()
@@ -648,47 +671,10 @@ def qsa_bwd_sparse_query_kernel(
                         mpf = I32(0)
                     pnx = (prow_pp + mpf).load()
                     tnx = (trow_pp + mpf).load()
-                    lse_a = _load_lse4(g_lse, lbase, HQ)
-                    lse_b = _load_lse4(g_lse, lbase + 4, HQ)
-                    lse_c = _load_lse4(g_lse, lbase + 8, HQ)
-                    del_a = (p_delta + lbase).load(count=4, alignment=16)
-                    del_b = (p_delta + lbase + 4).load(count=4, alignment=16)
-                    del_c = (p_delta + lbase + 8).load(count=4, alignment=16)
-                    # The 12-head softmax state stays at vector level across the chunks, built once per query.
-                    lse_v = cutlass.Vector.from_elements(
-                        [
-                            lse_a[0],
-                            lse_a[1],
-                            lse_a[2],
-                            lse_a[3],
-                            lse_b[0],
-                            lse_b[1],
-                            lse_b[2],
-                            lse_b[3],
-                            lse_c[0],
-                            lse_c[1],
-                            lse_c[2],
-                            lse_c[3],
-                        ],
-                        F32,
-                    )
-                    del_v = cutlass.Vector.from_elements(
-                        [
-                            del_a[0],
-                            del_a[1],
-                            del_a[2],
-                            del_a[3],
-                            del_b[0],
-                            del_b[1],
-                            del_b[2],
-                            del_b[3],
-                            del_c[0],
-                            del_c[1],
-                            del_c[2],
-                            del_c[3],
-                        ],
-                        F32,
-                    )
+                    # The 12-head softmax state stays at vector level across the chunks, built once per query; the rows
+                    # past the GH real heads carry lse = +inf and delta = 0, so their P and dS are zero.
+                    lse_v = _lse_rows(g_lse, qr, h0, GH)
+                    del_v = _delta_rows(p_delta, lbase, GH)
                     zero12 = cutlass.Vector.from_elements([F32(0.0)] * GQ, F32)
                     for c in cutlass.range(nchunks, unroll=1):
                         cgc = gc + c
@@ -821,10 +807,10 @@ def qsa_bwd_sparse_query_kernel(
                                 dim = hh * 128 + qd * 32 + lane
                                 qb = p_dq + (qrow * (HQ * D) + dim)
                                 if o0_h == 0:
-                                    for n in cutlass.range_constexpr(GQ if PAIR else HQ):
+                                    for n in cutlass.range_constexpr(GH if PAIR else HQ):
                                         (qb + n * D).store(dqv[hh][h * GQ + n])
                                 else:
-                                    for n in cutlass.range_constexpr(GQ if PAIR else HQ):
+                                    for n in cutlass.range_constexpr(GH if PAIR else HQ):
                                         prims.red(
                                             prims.ReductionOp.ADD,
                                             prims.ReductionType.F32,
@@ -986,10 +972,11 @@ def _sparse_query_host(
     NP: I32,
     scale: F32,
     HKV: cutlass.Constexpr[int],
+    GH: cutlass.Constexpr[int],
     stream: cuda_driver.CUstream,
 ):
     T = q.shape[0]
-    qbox = (1, GQ * HKV, 64)
+    qbox = (1, GH * HKV, 64)
     tma_q = cuda.create_tensor_map_tiled_from_view(q, box_dims=qbox, stride_order=(2, 1, 0), swizzle=cuda.TensorMapSwizzle.s128b)
     tma_do = cuda.create_tensor_map_tiled_from_view(do, box_dims=qbox, stride_order=(2, 1, 0), swizzle=cuda.TensorMapSwizzle.s128b)
     if cutlass.const_expr(HKV == 1):
@@ -1028,6 +1015,7 @@ def _sparse_query_host(
         NP,
         scale,
         HKV,
+        GH,
     ).launch(grid=(nctas, 1, 1), block=(NTHREADS, 1, 1), stream=stream)
 
 
@@ -1046,7 +1034,7 @@ PB_THREADS = 256  # w0 producer, w1 MMA, w2-3 record expansion, w4-7 dK/dV drain
 class _PbLayout:
     """Shared memory layout of the key-major kernel for one geometry (bytes from a 1024-aligned base)."""
 
-    def __init__(self, hkv):
+    def __init__(self, hkv, gh=GQ):
         self.qps = 4 // hkv  # queries per stage
         self.rec_w = _rec_w(hkv)
         if hkv == 2:
@@ -1071,7 +1059,7 @@ class _PbLayout:
         self.box_w = 4 * hkv * 32  # words per staging box
         self.st_w = 4 * self.box_w
         self.smem = self.off_st + 4 * self.st_w * 4
-        self.tx_per_query = 2 * (self.q_bytes // self.qps) + self.rec_w * 4
+        self.tx_per_query = 2 * 4 * gh * hkv * 128 + self.rec_w * 4  # the real head rows of Q and dO, plus the record
 
 
 @cute.jit
@@ -1098,8 +1086,9 @@ def qsa_bwd_sparse_key_kernel(
     KR: I32,
     SK: cutlass.Constexpr[int],
     HKV: cutlass.Constexpr[int],
+    GH: cutlass.Constexpr[int],
 ):
-    PB = _PbLayout(HKV)
+    PB = _PbLayout(HKV, GH)
     # the items: the keys with at least one record, compacted by the index scan
     n0 = g_active_count.iterator.raw_ptr().load()
     Ktot = n0 + (g_active_count.iterator.raw_ptr() + 1).load()
@@ -1220,13 +1209,22 @@ def qsa_bwd_sparse_key_kernel(
                                         prims.cp_async_bulk_tensor_shared_cta_global(
                                             sb + (PB.off_do + s * PB.slab + i * 3072) // 4, tma_do.get_ptr(), (s * 64, 0, qids[i]), b_full.subview(slot)
                                         )
-                                else:
+                                elif cutlass.const_expr(GH == GQ):
                                     prims.cp_async_bulk_tensor_shared_cta_global(
                                         sb + (PB.off_q + i * 4 * PB.slab) // 4, tma_q.get_ptr(), (0, 0, 0, qids[i]), b_full.subview(slot)
                                     )
                                     prims.cp_async_bulk_tensor_shared_cta_global(
                                         sb + (PB.off_do + i * 4 * PB.slab) // 4, tma_do.get_ptr(), (0, 0, 0, qids[i]), b_full.subview(slot)
                                     )
+                                else:
+                                    # GH rows per slab into the 12-row slab slots (the rows past GH stay zero)
+                                    for s in cutlass.range_constexpr(4):
+                                        prims.cp_async_bulk_tensor_shared_cta_global(
+                                            sb + (PB.off_q + (i * 4 + s) * PB.slab) // 4, tma_q.get_ptr(), (0, 0, s, qids[i]), b_full.subview(slot)
+                                        )
+                                        prims.cp_async_bulk_tensor_shared_cta_global(
+                                            sb + (PB.off_do + (i * 4 + s) * PB.slab) // 4, tma_do.get_ptr(), (0, 0, s, qids[i]), b_full.subview(slot)
+                                        )
                         prims.cp_async_bulk_shared_cluster_global(
                             sb + PB.off_rec // 4,
                             p_pair_records + cutlass.Int64(o + qb + j2) * REC_W,
@@ -1528,6 +1526,7 @@ def _sparse_key_host(
     KR: I32,
     SK: cutlass.Constexpr[int],
     HKV: cutlass.Constexpr[int],
+    GH: cutlass.Constexpr[int],
     stream: cuda_driver.CUstream,
 ):
     T = q.shape[0]
@@ -1536,12 +1535,16 @@ def _sparse_key_host(
         tma_do = cuda.create_tensor_map_tiled_from_view(do, box_dims=(1, 24, 64), stride_order=(2, 1, 0), swizzle=cuda.TensorMapSwizzle.s128b)
     else:
         # a query's 12 head rows of all 4 slabs in one box, slab-major in SMEM
-        q_layout = cute.make_layout((T, GQ, 4, 64), stride=(GQ * D, D, 64, 1))
+        q_layout = cute.make_layout((T, GH, 4, 64), stride=(GH * D, D, 64, 1))
+        if cutlass.const_expr(GH == GQ):
+            qbox4 = (1, GH, 4, 64)
+        else:
+            qbox4 = (1, GH, 1, 64)  # one box per slab into the 12-row slab slots
         tma_q = cuda.create_tensor_map_tiled_from_view(
-            cute.make_tensor(q.iterator, q_layout), box_dims=(1, GQ, 4, 64), stride_order=(3, 1, 2, 0), swizzle=cuda.TensorMapSwizzle.s128b
+            cute.make_tensor(q.iterator, q_layout), box_dims=qbox4, stride_order=(3, 1, 2, 0), swizzle=cuda.TensorMapSwizzle.s128b
         )
         tma_do = cuda.create_tensor_map_tiled_from_view(
-            cute.make_tensor(do.iterator, q_layout), box_dims=(1, GQ, 4, 64), stride_order=(3, 1, 2, 0), swizzle=cuda.TensorMapSwizzle.s128b
+            cute.make_tensor(do.iterator, q_layout), box_dims=qbox4, stride_order=(3, 1, 2, 0), swizzle=cuda.TensorMapSwizzle.s128b
         )
     TP = sparse_dk_acc.shape[0] // (HKV * D)
     tma_rk = cuda.create_tensor_map_tiled_from_view(
@@ -1557,7 +1560,7 @@ def _sparse_key_host(
         swizzle=cuda.TensorMapSwizzle.none,
     )
     qsa_bwd_sparse_key_kernel(
-        tma_q, tma_do, tma_rk, tma_rv, pair_records, key_slot_offsets, key_pair_counts, slot_queries, active_keys, active_count, KR, SK, HKV
+        tma_q, tma_do, tma_rk, tma_rv, pair_records, key_slot_offsets, key_pair_counts, slot_queries, active_keys, active_count, KR, SK, HKV, GH
     ).launch(grid=(nctas, 1, 1), block=(PB_THREADS, 1, 1), stream=stream)
 
 
@@ -1585,8 +1588,9 @@ def qsa_bwd_prep_kernel(
     n_key_pair_counts: I32,
     n_dense_dkv: I32,
     HKV: cutlass.Constexpr[int],
+    GH: cutlass.Constexpr[int],
 ):
-    HQ = GQ * HKV
+    HQ = GH * HKV
     # Delta and the zero fill of every accumulator share one launch.
     tidx, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
@@ -1596,7 +1600,7 @@ def qsa_bwd_prep_kernel(
     p_o = g_o.iterator.raw_ptr()
     p_do = g_do.iterator.raw_ptr()
     p_delta = g_delta.iterator.raw_ptr()
-    nrows = T * (GQ * HKV)
+    nrows = T * HQ
     nwarps = nb * (PREP_THREADS // 32)
     for r0 in cutlass.range(bid * (PREP_THREADS // 32) + wib, nrows, nwarps * PREP_ROWS, unroll=1):
         o_vecs = []
@@ -1664,6 +1668,7 @@ def _prep_host(
     dense_hi: cute.Tensor,
     nblocks: I32,
     HKV: cutlass.Constexpr[int],
+    GH: cutlass.Constexpr[int],
     stream: cuda_driver.CUstream,
 ):
     T = o.shape[0]
@@ -1686,6 +1691,7 @@ def _prep_host(
         I32(key_pair_counts.shape[0]),
         I32(dense_dk_acc.shape[0]),
         HKV,
+        GH,
     ).launch(grid=(nblocks, 1, 1), block=(PREP_THREADS, 1, 1), stream=stream)
 
 
@@ -2029,11 +2035,12 @@ def qsa_bwd_partition_kernel(
     NP: I32,
     KR: I32,
     HKV: cutlass.Constexpr[int],
+    GH: cutlass.Constexpr[int],
 ):
     # per-query block lists split by KV pass, plus the per-key pair counts of the inverted index, whose key is the
     # block's first token within the query's range. An empty row only needs its dQ zeroed. A row past SPARSE_CAP
     # blocks exceeds the slot budget of a range: it contributes nothing and its dQ is NaN.
-    HQ = GQ * HKV
+    HQ = GH * HKV
     tidx, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
     lane = tidx % 32
@@ -2110,6 +2117,7 @@ def _part_host(
     NP: I32,
     KR: I32,
     HKV: cutlass.Constexpr[int],
+    GH: cutlass.Constexpr[int],
     stream: cuda_driver.CUstream,
 ):
     cap = ids.shape[1]
@@ -2128,6 +2136,7 @@ def _part_host(
         NP,
         KR,
         HKV,
+        GH,
     ).launch(grid=((nsq_cap + 7) // 8, 1, 1), block=(256, 1, 1), stream=stream)
 
 
@@ -2393,8 +2402,9 @@ def qsa_bwd_finalize_kernel(
     T: I32,
     HAS_SPARSE: cutlass.Constexpr[int],
     HKV: cutlass.Constexpr[int],
+    GH: cutlass.Constexpr[int],
 ):
-    HQ = GQ * HKV
+    HQ = GH * HKV
     tidx, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
     nb, _, _ = cute.arch.grid_dim()
@@ -2437,10 +2447,11 @@ def _fin_host(
     nblocks: I32,
     HAS_SPARSE: cutlass.Constexpr[int],
     HKV: cutlass.Constexpr[int],
+    GH: cutlass.Constexpr[int],
     stream: cuda_driver.CUstream,
 ):
     T = dk.shape[0]
-    qsa_bwd_finalize_kernel(sparse_dk_acc, sparse_dv_acc, dense_dk_acc, dense_dv_acc, dq_acc, dk, dv, dq, I32(T), HAS_SPARSE, HKV).launch(
+    qsa_bwd_finalize_kernel(sparse_dk_acc, sparse_dv_acc, dense_dk_acc, dense_dv_acc, dq_acc, dk, dv, dq, I32(T), HAS_SPARSE, HKV, GH).launch(
         grid=(nblocks, 1, 1), block=(FIN_THREADS, 1, 1), stream=stream
     )
 
@@ -2496,6 +2507,17 @@ DP_TM_KV = 256
 DP_TM_PA = (48, 56, 112)  # P^T / dS^T slices reuse the TMEM columns left free after S^T (0-47) and dQ^T (64-111)
 
 
+@cute.jit
+def _dense_rows_load(dst, tmap, s, hk, g, bar, GH: cutlass.Constexpr[int]):
+    # slab s of the group's DP_G queries: one box of GQ head rows per query, or one GH-row box per query into its
+    # 12-row slot when the tile has more rows than the geometry has heads
+    if cutlass.const_expr(GH == GQ):
+        prims.cp_async_bulk_tensor_shared_cta_global(dst, tmap.get_ptr(), (s * 64, hk * GQ, g * DP_G), bar)
+    else:
+        for qq in cutlass.range_constexpr(DP_G):
+            prims.cp_async_bulk_tensor_shared_cta_global(dst + (qq * GQ * 128) // 4, tmap.get_ptr(), (s * 64, hk * GH, g * DP_G + qq), bar)
+
+
 @cute.kernel
 def qsa_bwd_dense_pair_kernel(
     tma_kd: cutlass.GridConstant[cuda.TensorMap],
@@ -2522,8 +2544,9 @@ def qsa_bwd_dense_pair_kernel(
     scale: F32,
     PDL: cutlass.Constexpr[int],
     HKV: cutlass.Constexpr[int],
+    GH: cutlass.Constexpr[int],
 ):
-    HQ = GQ * HKV
+    HQ = GH * HKV
     tidx, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
     warp = cute.arch.warp_idx()
@@ -2599,6 +2622,11 @@ def qsa_bwd_dense_pair_kernel(
         tmem_slot = cutlass.Array(I32, 1, space=cutlass.AddressSpace.smem, alignment=4)
 
         sbase = smem.data_ptr()
+        if cutlass.const_expr(GH < GQ):
+            # the tile rows the GH-row boxes never write must read as zero Q / dO
+            zq = cutlass.Vector.from_elements([I32(0), I32(0), I32(0), I32(0)], I32)
+            for it in cutlass.range(tidx, (DP_OFF_P - DP_OFF_E) // 16, DP_THREADS, unroll=1):
+                (sbase + DP_OFF_E // 4 + it * 4).store(zq, alignment=16)
         if warp == 0:
             if prims.elect_sync():
                 prims.prefetch_tensormap(tma_kd.get_ptr())
@@ -2661,32 +2689,24 @@ def qsa_bwd_dense_pair_kernel(
                 se = k % DP_NE
                 _wait(b_ee.subview(se), ((k // DP_NE) & 1) ^ 1)
                 if prims.elect_sync():
-                    prims.mbarrier_arrive_expect_tx(b_ef.subview(se), DP_HS)
+                    prims.mbarrier_arrive_expect_tx(b_ef.subview(se), 4 * DP_G * GH * 128)
                     for s in cutlass.range_constexpr(4):
                         if rank == 0:
-                            prims.cp_async_bulk_tensor_shared_cta_global(
-                                sbase + (DP_OFF_E + se * DP_HS + s * DP_QSLAB) // 4, tma_qd.get_ptr(), (s * 64, hk * GQ, g * DP_G), b_ef.subview(se)
-                            )
+                            _dense_rows_load(sbase + (DP_OFF_E + se * DP_HS + s * DP_QSLAB) // 4, tma_qd, s, hk, g, b_ef.subview(se), GH)
                         else:
-                            prims.cp_async_bulk_tensor_shared_cta_global(
-                                sbase + (DP_OFF_E + se * DP_HS + s * DP_QSLAB) // 4, tma_dod.get_ptr(), (s * 64, hk * GQ, g * DP_G), b_ef.subview(se)
-                            )
+                            _dense_rows_load(sbase + (DP_OFF_E + se * DP_HS + s * DP_QSLAB) // 4, tma_dod, s, hk, g, b_ef.subview(se), GH)
         elif warp == 3:
             for k in cutlass.range(nk, unroll=1):
                 g = g_top - 1 - _rot(k, off, nk)
                 sl = k % DP_NL
                 _wait(b_le.subview(sl), ((k // DP_NL) & 1) ^ 1)
                 if prims.elect_sync():
-                    prims.mbarrier_arrive_expect_tx(b_lf.subview(sl), DP_HS)
+                    prims.mbarrier_arrive_expect_tx(b_lf.subview(sl), 4 * DP_G * GH * 128)
                     for s in cutlass.range_constexpr(4):
                         if rank == 0:
-                            prims.cp_async_bulk_tensor_shared_cta_global(
-                                sbase + (DP_OFF_L + sl * DP_HS + s * DP_QSLAB) // 4, tma_dod.get_ptr(), (s * 64, hk * GQ, g * DP_G), b_lf.subview(sl)
-                            )
+                            _dense_rows_load(sbase + (DP_OFF_L + sl * DP_HS + s * DP_QSLAB) // 4, tma_dod, s, hk, g, b_lf.subview(sl), GH)
                         else:
-                            prims.cp_async_bulk_tensor_shared_cta_global(
-                                sbase + (DP_OFF_L + sl * DP_HS + s * DP_QSLAB) // 4, tma_qd.get_ptr(), (s * 64, hk * GQ, g * DP_G), b_lf.subview(sl)
-                            )
+                            _dense_rows_load(sbase + (DP_OFF_L + sl * DP_HS + s * DP_QSLAB) // 4, tma_qd, s, hk, g, b_lf.subview(sl), GH)
         elif warp == 1:
             idesc_s = prims.Tcgen05InstrDesc.build(c_dtype=F32, a_dtype=BF16, b_dtype=BF16, n_dim=DP_N, m_dim=128, a_major=0, b_major=0)
             idesc_q = prims.Tcgen05InstrDesc.build(c_dtype=F32, a_dtype=BF16, b_dtype=BF16, n_dim=DP_N, m_dim=128, a_major=1, b_major=1)
@@ -2859,14 +2879,8 @@ def qsa_bwd_dense_pair_kernel(
                     sw_j, bq_j = _dense_sel(p_dense_block_bitmap, p_seq_start, qc, tok, NW)
                     sw_n.append(sw_j)
                     bq_n.append(bq_j)
-                    ab = qc * HQ + hk * GQ
-                    av_n.append(
-                        [
-                            _load_lse4(g_lse, ab, HQ),
-                            _load_lse4(g_lse, ab + 4, HQ),
-                            _load_lse4(g_lse, ab + 8, HQ),
-                        ]
-                    )
+                    ab = qc * HQ + hk * GH
+                    av_n.append(_lse_rows(g_lse, qc, hk * GH, GH))
                 for k in cutlass.range(nk, unroll=1):
                     g = g_top - 1 - _rot(k, off, nk)
                     sw = sw_n
@@ -2886,14 +2900,8 @@ def qsa_bwd_dense_pair_kernel(
                         sw_j, bq_j = _dense_sel(p_dense_block_bitmap, p_seq_start, qc, tok, NW)
                         sw_n.append(sw_j)
                         bq_n.append(bq_j)
-                        ab = qc * HQ + hk * GQ
-                        av_n.append(
-                            [
-                                _load_lse4(g_lse, ab, HQ),
-                                _load_lse4(g_lse, ab + 4, HQ),
-                                _load_lse4(g_lse, ab + 8, HQ),
-                            ]
-                        )
+                        ab = qc * HQ + hk * GH
+                        av_n.append(_lse_rows(g_lse, qc, hk * GH, GH))
                     _wait(b_sf, k & 1)
                     prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
                     xv0 = prims.tcgen05_ld("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, scol).as_ptr(F32), num=16)
@@ -2913,7 +2921,7 @@ def qsa_bwd_dense_pair_kernel(
                         ow = []
                         for hh in cutlass.range_constexpr(GQ):
                             n = jj * GQ + hh
-                            a = av[jj][hh // 4][hh % 4]
+                            a = av[jj][hh]
                             if cutlass.const_expr(n < 16):
                                 x = xv0[n]
                             else:
@@ -2957,14 +2965,8 @@ def qsa_bwd_dense_pair_kernel(
                     qc = g_n * DP_G + hf * 2 + jj
                     if qc >= T:
                         qc = T - 1
-                    ab = qc * HQ + hk * GQ
-                    av_n.append(
-                        [
-                            (p_delta + ab).load(count=4, alignment=16),
-                            (p_delta + ab + 4).load(count=4, alignment=16),
-                            (p_delta + ab + 8).load(count=4, alignment=16),
-                        ]
-                    )
+                    ab = qc * HQ + hk * GH
+                    av_n.append(_delta_rows(p_delta, ab, GH))
                 for k in cutlass.range(nk, unroll=1):
                     av = av_n
                     kn = k + 1
@@ -2976,14 +2978,8 @@ def qsa_bwd_dense_pair_kernel(
                         qc = g_n * DP_G + hf * 2 + jj
                         if qc >= T:
                             qc = T - 1
-                        ab = qc * HQ + hk * GQ
-                        av_n.append(
-                            [
-                                (p_delta + ab).load(count=4, alignment=16),
-                                (p_delta + ab + 4).load(count=4, alignment=16),
-                                (p_delta + ab + 8).load(count=4, alignment=16),
-                            ]
-                        )
+                        ab = qc * HQ + hk * GH
+                        av_n.append(_delta_rows(p_delta, ab, GH))
                     _wait(b_sf, k & 1)
                     prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
                     xv0 = prims.tcgen05_ld("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, scol).as_ptr(F32), num=16)
@@ -3010,7 +3006,7 @@ def qsa_bwd_dense_pair_kernel(
                         dw = []
                         for hh in cutlass.range_constexpr(GQ):
                             n = jj * GQ + hh
-                            a = av[jj][hh // 4][hh % 4]
+                            a = av[jj][hh]
                             if cutlass.const_expr(n < 16):
                                 x = xv0[n]
                             else:
@@ -3130,7 +3126,14 @@ def qsa_bwd_dense_pair_kernel(
                 prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
                 prims.bar_warp_sync(0xFFFFFFFF)
                 if lane == 0:
-                    prims.cp_async_bulk_tensor_reduce(tma_dq.get_ptr(), stg, prims.TMARedux.ADD, [rank * 128 + qd * 32, hk * GQ, g * DP_G])
+                    if cutlass.const_expr(GH == GQ):
+                        prims.cp_async_bulk_tensor_reduce(tma_dq.get_ptr(), stg, prims.TMARedux.ADD, [rank * 128 + qd * 32, hk * GQ, g * DP_G])
+                    else:
+                        # the GH real head rows of every query of the group
+                        for qq in cutlass.range_constexpr(DP_G):
+                            prims.cp_async_bulk_tensor_reduce(
+                                tma_dq.get_ptr(), stg + qq * GQ * 32, prims.TMARedux.ADD, [rank * 128 + qd * 32, hk * GH, g * DP_G + qq]
+                            )
                 prims.cp_async_bulk_commit_group()
             prims.cp_async_bulk_wait_group(0)
 
@@ -3179,16 +3182,23 @@ def _dpair_host(
     scale: F32,
     PDL: cutlass.Constexpr[int],
     HKV: cutlass.Constexpr[int],
+    GH: cutlass.Constexpr[int],
     stream: cuda_driver.CUstream,
 ):
-    HQ = GQ * HKV
+    HQ = GH * HKV
     T = k.shape[0]
     tma_kd = cuda.create_tensor_map_tiled_from_view(k, box_dims=(DP_TT, 1, 64), stride_order=(2, 1, 0), swizzle=cuda.TensorMapSwizzle.s128b)
-    tma_qd = cuda.create_tensor_map_tiled_from_view(q, box_dims=(DP_G, GQ, 64), stride_order=(2, 1, 0), swizzle=cuda.TensorMapSwizzle.s128b)
-    tma_dod = cuda.create_tensor_map_tiled_from_view(do, box_dims=(DP_G, GQ, 64), stride_order=(2, 1, 0), swizzle=cuda.TensorMapSwizzle.s128b)
+    if cutlass.const_expr(GH == GQ):
+        qbox = (DP_G, GQ, 64)
+        dqbox = (DP_G, GQ, 32)
+    else:
+        qbox = (1, GH, 64)  # one box per query into its 12-row slot
+        dqbox = (1, GH, 32)
+    tma_qd = cuda.create_tensor_map_tiled_from_view(q, box_dims=qbox, stride_order=(2, 1, 0), swizzle=cuda.TensorMapSwizzle.s128b)
+    tma_dod = cuda.create_tensor_map_tiled_from_view(do, box_dims=qbox, stride_order=(2, 1, 0), swizzle=cuda.TensorMapSwizzle.s128b)
     tma_dq = cuda.create_tensor_map_tiled_from_view(
         cute.make_tensor(dq_acc.iterator, cute.make_layout((T, HQ, D), stride=(HQ * D, D, 1))),
-        box_dims=(DP_G, GQ, 32),
+        box_dims=dqbox,
         stride_order=(2, 1, 0),
         swizzle=cuda.TensorMapSwizzle.none,
     )
@@ -3217,6 +3227,7 @@ def _dpair_host(
         scale,
         PDL,
         HKV,
+        GH,
     ).launch(grid=(nparts * ntiles * 2 * HKV, 1, 1), block=(DP_THREADS, 1, 1), cluster=(2, 1, 1), stream=stream, use_pdl=(PDL == 1))
 
 
@@ -3259,15 +3270,19 @@ class LaunchPlan:
     them). The per-sequence dense / sparse split is decided on the device.
     """
 
-    def __init__(self, seq_len: int, num_sms: int, hkv: int, seq_mode: int, num_seqs: int = 1, max_seq_len: Optional[int] = None, arch: int = 100):
+    def __init__(
+        self, seq_len: int, num_sms: int, hkv: int, seq_mode: int, num_seqs: int = 1, max_seq_len: Optional[int] = None, arch: int = 100, gq: int = GQ
+    ):
         T = int(seq_len)
         assert hkv in (1, 2), f"{hkv} KV heads"
+        assert gq == GQ or (gq == 6 and hkv == 1), f"{gq} query heads per KV head with {hkv} KV heads"
         assert 1 <= T <= max_packed_len(hkv), f"sequence length {T} outside [1, {max_packed_len(hkv)}]"
         HKV = hkv
-        HQ = GQ * hkv
+        HQ = gq * hkv
         REC_W = _rec_w(hkv)
         PAD = _pad(hkv)
         self.hkv = hkv
+        self.gq = gq
         self.arch = int(arch)
         self.seq_len = T
         self.seq_mode = seq_mode
@@ -3370,13 +3385,13 @@ class LaunchPlan:
 _PLANS: dict = {}
 
 
-def plan_for(seq_len: int, device: torch.device, hkv: int, seq_mode: int, num_seqs: int = 1) -> LaunchPlan:
+def plan_for(seq_len: int, device: torch.device, hkv: int, seq_mode: int, num_seqs: int = 1, gq: int = GQ) -> LaunchPlan:
     """The plan of a geometry, built once per process."""
-    key = (int(seq_len), hkv, seq_mode, int(num_seqs), device.index)
+    key = (int(seq_len), hkv, seq_mode, int(num_seqs), device.index, int(gq))
     plan = _PLANS.get(key)
     if plan is None:
         cc = torch.cuda.get_device_capability(device)
-        plan = LaunchPlan(seq_len, torch.cuda.get_device_properties(device).multi_processor_count, hkv, seq_mode, num_seqs, arch=cc[0] * 10 + cc[1])
+        plan = LaunchPlan(seq_len, torch.cuda.get_device_properties(device).multi_processor_count, hkv, seq_mode, num_seqs, arch=cc[0] * 10 + cc[1], gq=gq)
         _PLANS[key] = plan
     return plan
 
@@ -3401,8 +3416,9 @@ def compile_kernels(plan: LaunchPlan) -> dict:
     else:
         names += ["dense", "fin"]
     hkv = plan.hkv
-    HQ = GQ * hkv
-    cache = _COMPILED.setdefault((hkv, plan.arch), {})
+    gq = plan.gq
+    HQ = gq * hkv
+    cache = _COMPILED.setdefault((hkv, gq, plan.arch), {})
     missing = [name for name in names if name not in cache]
     if missing:
         sym_t = cute.sym_int64()
@@ -3469,11 +3485,12 @@ def compile_kernels(plan: LaunchPlan) -> dict:
                 f_i(),
                 I32(1),
                 hkv,
+                gq,
                 stream,
             ),
             "bitmap": lambda: (_bitmap_host, f_ids(), f_c(), f_c(), f_c(), f_c(), f_i(), f_i(), f_i(), I32(1), stream),
             "window": lambda: (_window_host, f_i(), f_i(), f_i(), I32(0), I32(1), stream),
-            "part": lambda: (_part_host, f_ids(), f_c(), f_c(), f_dq_acc, f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), I32(1), I32(1), hkv, stream),
+            "part": lambda: (_part_host, f_ids(), f_c(), f_c(), f_dq_acc, f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), I32(1), I32(1), hkv, gq, stream),
             "scan": lambda: (_scan_host, f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), stream),
             "fill": lambda: (_fill_host, f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), I32(1), stream),
             "query": lambda: (
@@ -3497,12 +3514,13 @@ def compile_kernels(plan: LaunchPlan) -> dict:
                 I32(1),
                 F32(1),
                 hkv,
+                gq,
                 stream,
             ),
-            "dense": lambda: (_dpair_host, *dense_fakes, 0, hkv, stream),
-            "dense_pdl": lambda: (_dpair_host, *dense_fakes, 1, hkv, stream),
-            "fin": lambda: (_fin_host, *fin_fakes, 0, hkv, stream),
-            "fin_sparse": lambda: (_fin_host, *fin_fakes, 1, hkv, stream),
+            "dense": lambda: (_dpair_host, *dense_fakes, 0, hkv, gq, stream),
+            "dense_pdl": lambda: (_dpair_host, *dense_fakes, 1, hkv, gq, stream),
+            "fin": lambda: (_fin_host, *fin_fakes, 0, hkv, gq, stream),
+            "fin_sparse": lambda: (_fin_host, *fin_fakes, 1, hkv, gq, stream),
         }
         for skip in (0, 1):
             builders[f"key_skip{skip}"] = lambda skip=skip: (
@@ -3521,6 +3539,7 @@ def compile_kernels(plan: LaunchPlan) -> dict:
                 I32(1),
                 skip,
                 hkv,
+                gq,
                 stream,
             )
         for name in missing:
@@ -3714,14 +3733,14 @@ def backward(grad_out, q, k, v, out_fp32, lse, sel_blocks, lo, hi, tok_base, blo
 
     total, hkv = q.shape[0], k.shape[1]
     if hkv == 1 and dsl_cuda_major() < 13:
-        # the 12Q/1KV key-major kernel crashes the CUDA 12 DSL compiler
+        # the one-KV-head key-major kernel crashes the CUDA 12 DSL compiler
         raise NotImplementedError(
-            "12Q/1KV QSA backward requires the CUDA 13 build of CuTe DSL: install 'nvidia-cutlass-dsl[cu13]>=4.7.0' with a CUDA 13 compatible driver"
+            "QSA backward with one KV head requires the CUDA 13 build of CuTe DSL: install 'nvidia-cutlass-dsl[cu13]>=4.7.0' with a CUDA 13 compatible driver"
         )
     stream = cuda_driver.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     ids, counts = _metadata.compact(sel_blocks, lo, hi, block_first, block_last, arch, stream)
     # the sequences come from tok_base on the device; there are at most as many as blocks
-    plan = plan_for(total, q.device, hkv, SEQ_ORIGIN, num_seqs=min(total, block_first.shape[0]))
+    plan = plan_for(total, q.device, hkv, SEQ_ORIGIN, num_seqs=min(total, block_first.shape[0]), gq=q.shape[1] // hkv)
     fns = compile_kernels(plan)
     workspace = torch.empty(plan.workspace_bytes(), dtype=torch.uint8, device=q.device)
     scratch = plan.carve(WorkspaceCarver(workspace, plan.workspace_bytes(), "qsa_backward"))

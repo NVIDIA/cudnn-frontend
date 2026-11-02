@@ -61,7 +61,7 @@ def test_indexed_six_query_heads(supported_gpu, lengths):
     indices = indices_for(inputs)
     check_case(inputs, indices)
     plan = _plan(inputs["q"].shape[0], indices.shape[1], inputs["q"].device, "bprop", 0, 6)
-    assert plan.hq == 6 and dict((name, shape) for name, shape, _ in plan.layouts)["ids"] == (inputs["q"].shape[0], indices.shape[1])
+    assert plan.hq == 6 and dict((name, shape) for name, shape, _ in plan.layouts)["ids"] == (inputs["q"].shape[0], indices.shape[1] // 4)
 
 
 def test_indexed_changed_values_replay(supported_gpu):

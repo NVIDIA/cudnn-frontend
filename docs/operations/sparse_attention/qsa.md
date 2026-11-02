@@ -94,7 +94,9 @@ windows (about 2.7 GiB of scratch at 128K for 12Q/1KV, 5.1 GiB for 24Q/2KV).
 Blocks may start anywhere and the key bounds may cut them. A query past the
 dense prefix holds at most 513 selected blocks (top-512 and the causal tail);
 a longer list contributes nothing and leaves that query's dQ NaN. The one-KV-head
-flavors (12Q/1KV and 6Q/1KV) need the CUDA 13 build of CuTe DSL. The bitmap entry reads the sequences from `tok_base`;
+flavors (12Q/1KV and 6Q/1KV) need the CUDA 13 build of CuTe DSL; 6Q/1KV runs the
+same kernels with six real head rows in the 12-row query tiles, so it costs as much as 12Q/1KV.
+The bitmap entry reads the sequences from `tok_base`;
 `qsa_indexed_backward` describes packed documents through
 `selection_mode="causal_topk"` with `cu_seqlens` ([details](/operations/sparse_attention/qsa/qsa_indexed#complete-blocks-and-causal-tails))
 and otherwise treats the rows as one sequence, which stays exact for packed
