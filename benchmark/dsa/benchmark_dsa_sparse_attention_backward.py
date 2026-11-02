@@ -196,13 +196,15 @@ def setup_case(seqlen_q, seqlen_kv, topk, deterministic, args):
         sample_topk_length=topk_length,
         softmax_scale=softmax_scale,
         deterministic=deterministic,
+        deterministic_relay_cluster_size=args.deterministic_relay_cluster_size if deterministic else None,
     )
     if not plan.check_support():
         raise RuntimeError(
             "Unsupported DSA backward benchmark case: "
             f"seqlen_q={seqlen_q}, seqlen_kv={seqlen_kv}, topk={topk}, "
             f"nheads={args.nheads}, head_dim={args.head_dim}, head_dim_v={args.head_dim_v}, "
-            f"dtype={args.dtype}, deterministic={deterministic}"
+            f"dtype={args.dtype}, deterministic={deterministic}, "
+            f"deterministic_relay_cluster_size={args.deterministic_relay_cluster_size if deterministic else None}"
         )
     plan.compile()
     workspace_bytes = plan.scratch_workspace_bytes()
@@ -273,6 +275,7 @@ def run_benchmark_suite(args):
         f"nheads={args.nheads}, d_qk={args.head_dim}, d_v={args.head_dim_v}, dtype={args.dtype}, "
         f"attn_sink={not args.no_attn_sink}, topk_length={not args.no_topk_length}, "
         f"sorted_topk={args.sorted_topk}, segment_lengths_kv={args.segment_lengths_kv}, "
+        f"deterministic_relay_cluster_size={args.deterministic_relay_cluster_size}, "
         f"warmup={args.warmup}, repeat={args.repeat}"
     )
     print(sep)
@@ -299,6 +302,7 @@ def run_benchmark_suite(args):
                             "head_dim": args.head_dim,
                             "head_dim_v": args.head_dim_v,
                             "deterministic": deterministic,
+                            "deterministic_relay_cluster_size": args.deterministic_relay_cluster_size if deterministic else None,
                             "bwd_ms": round(bwd_ms, 4),
                             "bwd_tflops": round(bwd_tf, 2),
                             "workspace_gib": round(workspace_gib, 4),
@@ -347,6 +351,7 @@ def run_profile(args):
             f"Profile run done: seqlen_q={seqlen_q}, seqlen_kv={seqlen_kv}, topk={topk}, "
             f"nheads={args.nheads}, d_qk={args.head_dim}, d_v={args.head_dim_v}, dtype={args.dtype}, "
             f"deterministic={deterministic}, sorted_topk={args.sorted_topk}, "
+            f"deterministic_relay_cluster_size={args.deterministic_relay_cluster_size if deterministic else None}, "
             f"segment_lengths_q={proportional_query_segments(seqlen_q, args.segment_lengths_kv) if args.segment_lengths_kv else None}, "
             f"segment_lengths_kv={args.segment_lengths_kv}, workspace={workspace_bytes / 2**30:.3f} GiB"
         )
@@ -405,6 +410,13 @@ def parse_args():
         help="benchmark deterministic execution off, on, or both (default: off)",
     )
     p.add_argument(
+        "--deterministic-relay-cluster-size",
+        type=int,
+        choices=(4, 8, 16, 32, 64),
+        default=None,
+        help="force the deterministic large-context relay to 4, 8, 16, 32, or 64 logical CTAs per group (default: automatic)",
+    )
+    p.add_argument(
         "--sorted-topk",
         action="store_true",
         help="sort each row of generated Top-K indices (default: dispersed order)",
@@ -428,6 +440,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.deterministic_relay_cluster_size is not None and args.deterministic == "off":
+        raise ValueError("--deterministic-relay-cluster-size requires --deterministic on or both")
     args.head_dim_v = 512 if args.head_dim == 576 else args.head_dim  # matches the kernel-side derivation
 
     if args.segment_lengths_kv:
