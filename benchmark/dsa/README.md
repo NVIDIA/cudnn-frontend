@@ -391,6 +391,39 @@ supported DSL.
 |     8192 |      8192 | 1024 |  4.538 |     605.76 |
 |     8192 |      8192 | 2048 |  8.562 |     642.06 |
 
+##### SM90 deterministic relay scheduling (2026-11-02)
+
+Measured on NVIDIA L20X (SM90) with BF16 H64/Dqk576/Dv512, KV=65536,
+top-k 2048, full runtime lengths, synthetic forward statistics, five warm-ups,
+and 20 allocation-free calls. The environment used PyTorch 2.12.1+cu130,
+CuTe DSL 4.7.1, and cuDNN 9.20.0. Each explicit relay width was run in a
+separate process with `--deterministic both`; the small non-deterministic
+variation between rows is measurement noise.
+
+| Q | Logical relay | Non-det ms | Det ms | Det / non-det | Non-det workspace GiB | Det workspace GiB |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | C4  | 3.993 | 7.735 | 1.937x | 0.141 | 4.508 |
+| 1024 | C8  | 4.000 | 6.819 | 1.705x | 0.141 | 2.258 |
+| 1024 | C16 | 3.973 | 6.245 | 1.572x | 0.141 | 1.133 |
+| 1024 | C32 | 3.976 | **5.559** | **1.398x** | 0.141 | 0.571 |
+| 1024 | C64 | 3.989 | 9.506 | 2.383x | 0.141 | **0.290** |
+| 4096 | C4  | 15.367 | 24.131 | 1.570x | 0.143 | 4.533 |
+| 4096 | C8  | 15.348 | 23.840 | 1.553x | 0.143 | 2.283 |
+| 4096 | C16 | 15.328 | 23.060 | 1.504x | 0.143 | 1.158 |
+| 4096 | C32 | 15.345 | **21.045** | **1.371x** | 0.143 | 0.596 |
+| 4096 | C64 | 15.372 | 37.181 | 2.419x | 0.143 | **0.314** |
+| 16384 | C4  | 59.996 | 89.713 | 1.495x | 0.148 | 4.633 |
+| 16384 | C8  | 59.835 | 91.608 | 1.531x | 0.148 | 2.383 |
+| 16384 | C16 | 60.069 | 90.354 | 1.504x | 0.148 | 1.258 |
+| 16384 | C32 | 60.111 | **82.803** | **1.378x** | 0.148 | 0.695 |
+| 16384 | C64 | 60.054 | 147.662 | 2.459x | 0.148 | **0.414** |
+
+C32 is the best time/memory point in this workload: it lowers deterministic
+overhead to 1.37--1.40x while using about half the C16 workspace. C64 is the
+memory-first endpoint, but its four serialized physical C16 phases raise the
+overhead to 2.38--2.46x. C16 remains the conservative SM90 default; C32/C64
+are explicit plan-time choices.
+
 ##### SM100 deterministic relay scheduling (2026-10-30)
 
 Against merged commit `1dea4471a6e6c05e29d3bf281281fd156d345a84`, the

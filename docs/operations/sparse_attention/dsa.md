@@ -278,12 +278,14 @@ After one eager execution populates the SM90 concrete-tensor compile caches,
 the caller-owned output/workspace path is CUDA Graph capturable. Replay keeps
 the declared tensor shapes and addresses fixed while allowing tensor contents,
 including `topk_idxs` and `topk_length`, to change.
-On the target L20X sweep (BF16 H64 D576/Dv512, top-k 2048), cluster-16
-reduced deterministic latency by 2.8% to 9.6% versus cluster-8 across
-Q=1024..16384 while approximately halving relay workspace, so it is the
-default. C32 and C64 further reduce relay workspace to four and two planes,
-respectively, at the cost of additional sequential launch phases; they are
-explicit memory-first choices rather than the automatic default.
+On the target L20X sweep (BF16 H64 D576/Dv512, KV=65536, top-k 2048), C16
+measured 1.50--1.57x the non-deterministic latency with 1.13--1.26 GiB of
+workspace and remains the conservative default. C32 measured 1.37--1.40x
+with 0.57--0.70 GiB, the best time/memory point in that workload. C64 reduced
+workspace further to 0.29--0.41 GiB, but four sequential physical phases
+raised latency to 2.38--2.46x non-deterministic. C32 and C64 are therefore
+explicit workload-specific choices rather than the automatic default; the
+full table and environment are recorded in `benchmark/dsa/README.md`.
 
 On SM100/SM103, `deterministic=True` retains the two-CTA Tensor Core kernels
 for the supported BF16 H128/D512 and H128/D576 envelopes above. Queries run in
