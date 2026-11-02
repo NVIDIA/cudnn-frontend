@@ -1524,19 +1524,24 @@ def test_DSA_indexer_backward_sm100_score_grad_pdl_full_pipeline_matches_serial(
 )
 @pytest.mark.parametrize("seqlen_q", [17, 151])
 @pytest.mark.parametrize("dk_column_permuted", [False, True], ids=["dk-natural", "dk-permuted"])
-def test_DSA_indexer_backward_sm100_gemm_matches_reference(
+def test_DSA_indexer_backward_gemm_matches_reference(
     dk_column_permuted,
     seqlen_q,
     topk,
     topk_indices_global,
 ):
-    """Check persistent and one-row-per-CTA grids, invalid and duplicate IDs,
-    and both dK accumulation layouts against the reference."""
-    if torch.cuda.get_device_capability()[0] < 10:
-        pytest.skip("SM100+ required")
+    """Run kernel 2 (GEMM) alone on a given grad signal and check it against an
+    independent reference: invalid, out-of-range and duplicate IDs, local and
+    global IDs, and SM100's persistent and one-row-per-CTA grids plus both dK
+    accumulation layouts (SM90 has only the natural layout)."""
+    _require_indexer_backward_gpu()
+    is_sm90 = torch.cuda.get_device_capability()[0] == 9
+    if is_sm90 and dk_column_permuted:
+        pytest.skip("the column-permuted dK layout is SM100-only")
 
     try:
         from cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm100 import dk_column_permuted_view, indexer_backward_sm100
+        from cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm90 import indexer_backward_sm90
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
@@ -1566,7 +1571,8 @@ def test_DSA_indexer_backward_sm100_gemm_matches_reference(
     d_index_q = torch.empty_like(index_q)
     d_weights = torch.empty_like(weights)
     d_index_k = torch.zeros_like(index_k, dtype=torch.float32)
-    kernel = indexer_backward_sm100(
+    factory = indexer_backward_sm90 if is_sm90 else indexer_backward_sm100
+    kernel = factory(
         batch,
         seqlen_q,
         seqlen_k,
@@ -1577,7 +1583,8 @@ def test_DSA_indexer_backward_sm100_gemm_matches_reference(
         block_I=128,
         topk_indices_global=topk_indices_global,
     )
-    kernel.gemm_only(index_q, weights, index_k, d_index_q, d_weights, d_index_k, grad_signal, kernel_ids, dk_column_permuted=dk_column_permuted)
+    layout = {} if is_sm90 else dict(dk_column_permuted=dk_column_permuted)
+    kernel.gemm_only(index_q, weights, index_k, d_index_q, d_weights, d_index_k, grad_signal, kernel_ids, **layout)
     torch.cuda.synchronize()
     if dk_column_permuted:
         d_index_k_natural = torch.empty_like(d_index_k)
