@@ -582,9 +582,11 @@ which never microbatch, for one full launch.
 Paged K (`block_table` + `kv_lens`, the §3 contract) serves BSHD and THD
 queries with BF16 Q/K in one launch and returns local key ids
 (`topk_indices_global=False`), which is what serving engines consume before
-mapping ids to physical cache rows. THD capture preallocates through
-`compress_topk_cand_buffer_size_thd(cu_seqlens_q, None, ratio, q_causal_offsets)`,
-since a paged pool has no key prefix. No explicit microbatching and no MXFP8
+mapping ids to physical cache rows. Caller-owned candidate buffers are sized
+with `compress_topk_cand_buffer_size(..., paged=True)` for BSHD and
+`compress_topk_cand_buffer_size_thd(cu_seqlens_q, None, ratio, q_causal_offsets)`
+for THD: both return the single-launch size, and the THD call takes no key
+prefix because a paged pool has none. No explicit microbatching and no MXFP8
 yet.
 
 Global versus local ids is primarily an interoperability and allocation
