@@ -263,6 +263,16 @@ def test_kpage_rejects_unsupported_configurations():
         BSA.block_sparse_attention_forward(q, k, v, q2k, 2, bs, kv_splits=2, kpage=True, sparse_block_size=BLOCK)
     with pytest.raises(TypeError, match="kpage must be"):
         BSA.block_sparse_attention_forward(q, k, v, q2k, 2, bs, kpage="yes", sparse_block_size=BLOCK)
+    if _is_sm90():
+        # SM90 runs blk128 KPage on 64-row halves: MHA, sequences that are multiples of 64, no bwd_kv_groups
+        with pytest.raises(NotImplementedError, match="multiples of 64"):
+            BSA.block_sparse_attention_forward(q[:, :, :500].contiguous(), k, v, q2k, 2, bs, kpage=True, sparse_block_size=BLOCK)
+        with pytest.raises(NotImplementedError, match="multiples of 64"):
+            BSA.kpage_prepare_layout(q2k, 2, bs, seqlen_k=500)
+        with pytest.raises(NotImplementedError, match="MHA only"):
+            BSA.block_sparse_attention_forward(q, k[:, :1].contiguous(), v[:, :1].contiguous(), q2k, 2, bs, kpage=True, sparse_block_size=BLOCK)
+        with pytest.raises(NotImplementedError, match="bwd_kv_groups"):
+            BSA.kpage_prepare_layout(q2k, 2, bs, bwd_kv_groups=2)
 
     # metadata contract: duplicate ids, out-of-range ids, empty rows, bad block_sizes
     dup = torch.tensor([1, 1], dtype=torch.int32, device="cuda").view(1, 1, 1, 2).expand(1, heads, num_blocks, 2).contiguous()
@@ -331,24 +341,32 @@ def test_kpage_bshd_layout_matches_bhsd():
 @pytest.mark.L0
 @torch_fork_set_rng(seed=20)
 @pytest.mark.parametrize("with_block_sizes", [False, True])
-@pytest.mark.parametrize("seqlen_q", [1000, 1050])  # 7 * 128 + 104 rows (M128 tail); 8 * 128 + 26 rows (the tail takes the M64 x N256 route)
-def test_kpage_seqlen_not_multiple_of_128(with_block_sizes, seqlen_q):
+@pytest.mark.parametrize(
+    "seqlen_q, seqlen_k",
+    [
+        (1000, 700),  # 7 * 128 + 104 query rows (M128 tail); 5 * 128 + 60 key rows
+        (1050, 700),  # 8 * 128 + 26 query rows (the tail takes the M64 x N256 route)
+        (960, 704),  # 7 * 128 + 64 / 5 * 128 + 64: the tails SM90 takes (its 64-row halves end with the sequence)
+    ],
+)
+def test_kpage_seqlen_not_multiple_of_128(with_block_sizes, seqlen_q, seqlen_k):
     """Rows past seqlen_q / seqlen_k are padding of the final block, with or without block_sizes.
 
     The base path needs block_sizes for a partial final KV block (its contract); kpage derives the tail itself.
     With several heads, a tail of at most 64 rows on the query side makes the M64 work IDs (stride 2 * num_q_blocks)
-    differ from ceil(seqlen_q / 64) unless the scheduler takes the stride from the metadata.
+    differ from ceil(seqlen_q / 64) unless the scheduler takes the stride from the metadata.  SM90 runs blk128 KPage on
+    the metadata's 64-row halves and takes sequences that are multiples of 64 only.
     """
     BSA = import_kpage_bsa("the blk128 KPage path runs on SM90 and SM100/SM103")
-    if _is_sm90():
-        pytest.skip("SM90 KPage takes sequences that are multiples of 64 (test_kpage_sm90_sequences_of_64_row_multiples)")
-    heads, seqlen_k = 2, 700  # 5 + 60 rows on the key side
+    if _is_sm90() and (seqlen_q % 64 or seqlen_k % 64):
+        pytest.skip("SM90 KPage takes sequences that are multiples of 64 (rejection checked in test_kpage_rejects_unsupported_configurations)")
+    heads = 2
     nq, nk = (seqlen_q + BLOCK - 1) // BLOCK, (seqlen_k + BLOCK - 1) // BLOCK
     q, do = (torch.randn((1, heads, seqlen_q, 128), device="cuda", dtype=torch.bfloat16) for _ in range(2))
     k, v = (torch.randn((1, heads, seqlen_k, 128), device="cuda", dtype=torch.bfloat16) for _ in range(2))
     q2k = torch.stack([torch.randperm(nk, device="cuda")[:3] for _ in range(heads * nq)]).view(1, heads, nq, 3).to(torch.int32)
     nums = torch.randint(1, 4, (1, heads, nq), device="cuda", dtype=torch.int32)
-    bs = torch.tensor([128, 40, 128, 128, 128, 128], dtype=torch.int32, device="cuda") if with_block_sizes else None  # last entry exceeds the 60-row tail
+    bs = torch.tensor([128, 40, 128, 128, 128, 128], dtype=torch.int32, device="cuda") if with_block_sizes else None  # last entry exceeds the tail
     bs_eff = torch.full((nk,), BLOCK, dtype=torch.int32, device="cuda") if bs is None else bs.clone()
     bs_eff[-1] = min(int(bs_eff[-1]), seqlen_k % BLOCK)
     kv_valid = valid_rows(bs_eff, BLOCK)[:seqlen_k]
@@ -555,7 +573,7 @@ def test_kpage_gqa_forward_backward(batch, heads_kv):
     """GQA/MQA: the q heads of one kv head read the same K/V pages and sum into one dK/dV."""
     BSA = import_kpage_bsa("the blk128 KPage path runs on SM90 and SM100/SM103")
     if _is_sm90():
-        pytest.skip("SM90 KPage is MHA only (test_kpage_sm90_sequences_of_64_row_multiples checks the error)")
+        pytest.skip("SM90 KPage is MHA only (test_kpage_rejects_unsupported_configurations checks the error)")
     heads, num_blocks = 4, 6
     seqlen = num_blocks * BLOCK
     bs = torch.tensor([128, 40, 128, 7, 90, 64], dtype=torch.int32, device="cuda")
@@ -585,50 +603,3 @@ def test_kpage_gqa_forward_backward(batch, heads_kv):
         _check(backward["dq_tensor"][sl], dq_ref, valid, tol=3e-2)
         _check(backward["dk_tensor"][sl], dk_ref, valid, tol=3e-2)
         _check(backward["dv_tensor"][sl], dv_ref, valid, tol=3e-2)
-
-
-@pytest.mark.L0
-@torch_fork_set_rng(seed=21)
-@pytest.mark.parametrize("with_block_sizes", [False, True])
-def test_kpage_sm90_sequences_of_64_row_multiples(with_block_sizes):
-    """SM90 runs blk128 KPage on the metadata's 64-row halves: a sequence may end halfway into its final block.
-
-    Sequences that are not multiples of 64 and GQA are rejected on SM90.
-    """
-    BSA = import_kpage_bsa("the blk128 KPage path runs on SM90 and SM100/SM103")
-    if not _is_sm90():
-        pytest.skip("SM90-specific contract")
-    heads, seqlen_q, seqlen_k = 2, 960, 704  # 7 blocks + 64 rows; 5 blocks + 64 rows
-    nq, nk = (seqlen_q + BLOCK - 1) // BLOCK, (seqlen_k + BLOCK - 1) // BLOCK
-    q, do = (torch.randn((1, heads, seqlen_q, 128), device="cuda", dtype=torch.bfloat16) for _ in range(2))
-    k, v = (torch.randn((1, heads, seqlen_k, 128), device="cuda", dtype=torch.bfloat16) for _ in range(2))
-    q2k = torch.stack([torch.randperm(nk, device="cuda")[:3] for _ in range(heads * nq)]).view(1, heads, nq, 3).to(torch.int32)
-    nums = torch.randint(1, 4, (1, heads, nq), device="cuda", dtype=torch.int32)
-    bs = torch.tensor([128, 40, 128, 7, 128, 128], dtype=torch.int32, device="cuda") if with_block_sizes else None  # last entry exceeds the 64-row tail
-    bs_eff = torch.full((nk,), BLOCK, dtype=torch.int32, device="cuda") if bs is None else bs.clone()
-    bs_eff[-1] = min(int(bs_eff[-1]), seqlen_k % BLOCK)
-    kv_valid = valid_rows(bs_eff, BLOCK)[:seqlen_k]
-    k[0, :, ~kv_valid] = v[0, :, ~kv_valid] = 1000.0
-
-    mask = block_sparse_mask(q2k, 0, bs_eff, seqlen_q, seqlen_k, BLOCK, q2k_block_nums=nums)
-    o_ref, lse_ref, dq_ref, dk_ref, dv_ref = attention_backward_reference(q, k, v, do, mask)
-    forward = BSA.block_sparse_attention_forward(q, k, v, q2k, None, bs, nums, kpage=True, sparse_block_size=BLOCK)
-    torch.testing.assert_close(forward["o_tensor"].float(), o_ref, atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(forward["lse_tensor"], lse_ref, atol=1e-3, rtol=1e-3)
-    layout = BSA.kpage_prepare_layout(q2k, None, bs, nums, seqlen_q=seqlen_q, seqlen_k=seqlen_k)
-    backward = BSA.block_sparse_attention_backward(
-        do, q, k, v, forward["o_tensor"], forward["lse_tensor"], q2k, None, bs, nums, kpage=layout, sparse_block_size=BLOCK
-    )
-    torch.testing.assert_close(backward["dq_tensor"].float(), dq_ref, atol=3e-2, rtol=3e-2)
-    _check(backward["dk_tensor"], dk_ref, kv_valid, tol=3e-2)
-    _check(backward["dv_tensor"], dv_ref, kv_valid, tol=3e-2)
-
-    with pytest.raises(NotImplementedError, match="multiples of 64"):
-        q_1000 = torch.randn((1, heads, 1000, 128), device="cuda", dtype=torch.bfloat16)  # the same 8 query blocks
-        BSA.block_sparse_attention_forward(q_1000, k, v, q2k, None, bs, nums, kpage=True, sparse_block_size=BLOCK)
-    with pytest.raises(NotImplementedError, match="multiples of 64"):
-        BSA.kpage_prepare_layout(q2k, None, bs, nums, seqlen_q=seqlen_q, seqlen_k=700)
-    with pytest.raises(NotImplementedError, match="MHA only"):
-        BSA.block_sparse_attention_forward(q, k[:, :1], v[:, :1], q2k, None, bs, nums, kpage=True, sparse_block_size=BLOCK)
-    with pytest.raises(NotImplementedError, match="bwd_kv_groups"):
-        BSA.kpage_prepare_layout(q2k, None, bs, nums, seqlen_q=seqlen_q, seqlen_k=seqlen_k, bwd_kv_groups=2)
